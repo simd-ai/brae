@@ -1274,5 +1274,95 @@ label correctFluxesUnrefine(
 }
 
 
+
+// ----------------------------------------------------------------------------------------------
+// The dynamicRefineFvMeshCoeffs reader. See the header for where each entry lives and which are
+// mandatory; the refusals below are OpenFOAM's own three FatalErrors, kept word for word in substance.
+
+RefineControls readRefineControls(
+    const FoamDict& dynamicMeshDict)
+{
+    const char* WHO = "brae dynamicRefineFvMesh: ";
+    // dynamicRefineFvMesh.C:181 and :1292 -- the sub-dictionary when there is one, else this dict
+    const FoamDict& d = *dynamicMeshDict.optionalSubDict("dynamicRefineFvMeshCoeffs");
+
+    auto mustLabel = [&](const char* key) -> label
+    {
+        if (!d.found(key))
+            throw std::runtime_error(std::string(WHO) + "constant/dynamicMeshDict has no `" + key
+                                     + "`. OpenFOAM reads it with get<label>, which stops when it is "
+                                       "absent; defaulting it would run a different case.");
+        return static_cast<label>(d.intOr(key, 0));
+    };
+    auto mustScalar = [&](const char* key) -> scalar
+    {
+        if (!d.found(key))
+            throw std::runtime_error(std::string(WHO) + "constant/dynamicMeshDict has no `" + key
+                                     + "`. OpenFOAM reads it with get<scalar>, which stops when it is "
+                                       "absent; defaulting it would run a different case.");
+        return d.scalarOr(key, scalar(0));
+    };
+
+    RefineControls c;
+    c.refineInterval = mustLabel("refineInterval");
+    // dynamicRefineFvMesh.C:1305-1311
+    if (c.refineInterval < 0)
+        throw std::runtime_error(std::string(WHO) + "illegal refineInterval "
+                                 + std::to_string(c.refineInterval)
+                                 + ". The refineInterval setting in the dynamicMeshDict should be >= 1.");
+
+    c.maxCells = mustLabel("maxCells");
+    // :1321-1328
+    if (c.maxCells <= 0)
+        throw std::runtime_error(std::string(WHO) + "illegal maximum number of cells "
+                                 + std::to_string(c.maxCells)
+                                 + ". The maxCells setting in the dynamicMeshDict should be > 0.");
+
+    c.maxRefinement = mustLabel("maxRefinement");
+    // :1330-1338
+    if (c.maxRefinement <= 0)
+        throw std::runtime_error(std::string(WHO) + "illegal maximum refinement level "
+                                 + std::to_string(c.maxRefinement)
+                                 + ". The maxRefinement setting in the dynamicMeshDict should be > 0.");
+
+    if (!d.found("field"))
+        throw std::runtime_error(std::string(WHO) + "constant/dynamicMeshDict has no `field`. It names "
+                                 "the volScalarField the refinement criterion is taken from.");
+    c.field = d.wordOr("field", std::string());
+
+    c.lowerRefineLevel = mustScalar("lowerRefineLevel");
+    c.upperRefineLevel = mustScalar("upperRefineLevel");
+    // :1350-1354 -- the ONLY optional one, and its default is GREAT. RAS/motorBike omits it.
+    c.unrefineLevel    = d.scalarOr("unrefineLevel", scalar(1.0e+15));
+    c.nBufferLayers    = mustLabel("nBufferLayers");
+
+    // :184-191 -- `List<Pair<word>>`, read at construction and inserted into a HashTable keyed on the
+    // flux name. The tokens arrive with the parentheses stripped, so they are consumed in pairs.
+    if (!d.found("correctFluxes"))
+        throw std::runtime_error(std::string(WHO) + "constant/dynamicMeshDict has no `correctFluxes`. "
+                                 "It is read with get<List<Pair<word>>> at construction, and it is what "
+                                 "says which surface fields are corrected across a mesh change.");
+    {
+        const std::vector<std::string> toks = d.wordListOr("correctFluxes", {});
+        if (toks.size() % 2 != 0)
+            throw std::runtime_error(std::string(WHO) + "`correctFluxes` has " + std::to_string(toks.size())
+                                     + " words, which is not a whole number of (flux velocity) pairs.");
+        for (std::size_t i = 0; i + 1 < toks.size(); i += 2)
+        {
+            c.correctFluxes.emplace_back(toks[i], toks[i + 1]);
+        }
+    }
+
+    // :193 -- readEntry, so mandatory
+    if (!d.found("dumpLevel"))
+        throw std::runtime_error(std::string(WHO) + "constant/dynamicMeshDict has no `dumpLevel`. "
+                                 "OpenFOAM reads it with readEntry, which stops when it is absent.");
+    {
+        const std::string v = d.wordOr("dumpLevel", "false");
+        c.dumpLevel = (v == "true" || v == "yes" || v == "on" || v == "1");
+    }
+    return c;
+}
+
 }   // namespace dynamicRefine
 }   // namespace brae

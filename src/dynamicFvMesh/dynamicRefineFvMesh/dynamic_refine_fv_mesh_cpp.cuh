@@ -24,14 +24,65 @@
 #pragma once
 
 #include "cf_types.cuh"
+#include "foam_dict.cuh"
 #include "fv_patch.cuh"
 #include "map_poly_mesh_cpp.cuh"
 #include "primitive_mesh.cuh"
+#include <string>
 #include <utility>
 #include <vector>
 
 namespace brae {
+
+
 namespace dynamicRefine {
+
+// ----------------------------------------------------------------------------------------------
+// THE dynamicRefineFvMeshCoeffs READER. Until this existed the whole decision side above was fed by
+// hand from a test -- `refineInterval` and `dumpLevel` appeared NOWHERE in src/, and the rest only as
+// C++ parameters -- so no case could drive it.
+//
+// WHERE THE ENTRIES LIVE. `dynamicRefineFvMesh.C:181` and `:1292` both read
+// `IOdictionary(dynamicMeshDict).optionalSubDict(typeName + "Coeffs")`, i.e. the
+// `dynamicRefineFvMeshCoeffs` sub-dictionary WHEN THERE IS ONE and the dictionary itself otherwise.
+// All three shipped AMR tutorials are needed to see that: laminar/damBreakWithObstacle writes the
+// entries FLAT, laminar/oscillatingBox writes them flat BESIDE a `solvers { VF { ... } }` sub-dict for
+// its motion solver, and RAS/motorBike WRAPS them in `dynamicRefineFvMeshCoeffs`. Reading only the
+// sub-dictionary would miss two of the three; reading only the top level would miss the third.
+//
+// WHAT IS MANDATORY AND WHAT IS NOT, from the reads themselves (:1295-1356):
+//   refineInterval    get<label>        MANDATORY.  == 0 means "never refine"; < 0 is FATAL
+//   maxCells          get<label>        MANDATORY.  <= 0 is FATAL
+//   maxRefinement     get<label>        MANDATORY.  <= 0 is FATAL
+//   field             get<word>         MANDATORY
+//   lowerRefineLevel  get<scalar>       MANDATORY
+//   upperRefineLevel  get<scalar>       MANDATORY
+//   nBufferLayers     get<label>        MANDATORY
+//   unrefineLevel     getOrDefault      OPTIONAL, default GREAT = 1.0e+15 (doubleScalar.H:58).
+//                                       RAS/motorBike omits it, which is why the default is not a
+//                                       detail: reading 0 there would unrefine the whole mesh.
+//   correctFluxes     get<List<Pair<word>>>  MANDATORY (:184, read at CONSTRUCTION)
+//   dumpLevel         readEntry<bool>   MANDATORY (:193, read at construction)
+//
+// A MANDATORY entry that is absent must THROW and name itself -- OpenFOAM's `get<>` does, and a default
+// quietly standing in for the case's own setting is the defect this project keeps finding.
+struct RefineControls
+{
+    label                                            refineInterval = 0;
+    std::string                                      field;
+    scalar                                           lowerRefineLevel = 0;
+    scalar                                           upperRefineLevel = 0;
+    scalar                                           unrefineLevel = scalar(1.0e+15);   // GREAT
+    label                                            nBufferLayers = 0;
+    label                                            maxRefinement = 0;
+    label                                            maxCells = 0;
+    std::vector<std::pair<std::string, std::string>> correctFluxes;   // (flux, velocity) pairs
+    bool                                             dumpLevel = false;
+};
+
+// `dynamicMeshDict` is the parsed constant/dynamicMeshDict. Throws on a missing mandatory entry and on
+// each of OpenFOAM's three FatalErrors.
+RefineControls readRefineControls(const FoamDict& dynamicMeshDict);
 
 // dynamicRefineFvMesh.C:754-771. UNWEIGHTED arithmetic mean of the cell values over each point's
 // cells -- no volume, no distance, no inverse-distance weighting -- accumulated in pointCells order

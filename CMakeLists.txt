@@ -110,6 +110,7 @@ add_library(brae_core STATIC
     src/meshTools/cellDist/patchWave/patch_wave_cpp.cu
     src/OpenFOAM/meshes/primitiveMesh/edges/mesh_edges_cpp.cu
     src/OpenFOAM/meshes/polyMesh/mapPolyMesh/map_poly_mesh_cpp.cu
+    src/OpenFOAM/meshes/polyMesh/polyTopoChange/poly_topo_change_cpp.cu
     src/dynamicFvMesh/dynamicRefineFvMesh/dynamic_refine_fv_mesh_cpp.cu
     src/dynamicMesh/pointPatchDist/point_patch_dist_cpp.cu
     src/rigidBodyDynamics/rigid_body_motion_cpp.cu
@@ -3766,6 +3767,27 @@ target_link_libraries(test_refine_candidates_vs_openfoam PRIVATE brae_core)
 add_test(NAME refine_candidates_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/refine_candidates_vs_openfoam.sh)
 set_tests_properties(refine_candidates_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# brae's polyTopoChange FACE ORDERING against OpenFOAM's own mesh numbering -- unit 1 of
+# dynamicRefineFvMesh's producing half. The oracle is the mesh itself: a written OpenFOAM mesh is
+# already in this order, so it must come back the identity. The script carries the controls.
+add_executable(test_poly_topo_change_order tests/test_poly_topo_change_order.cu)
+target_include_directories(test_poly_topo_change_order PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_poly_topo_change_order PRIVATE brae_core)
+add_test(NAME poly_topo_change_order_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/poly_topo_change_order_vs_openfoam.sh)
+set_tests_properties(poly_topo_change_order_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# brae's dynamicRefineFvMeshCoeffs reader against the three shipped AMR tutorials' own dictionaries --
+# flat, flat-beside-a-subdict, and wrapped. The oracle is the dictionary; the script says why all three.
+add_executable(test_refine_controls tests/test_refine_controls.cu)
+target_include_directories(test_refine_controls PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_refine_controls PRIVATE brae_core)
+add_test(NAME refine_controls_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/refine_controls_vs_openfoam.sh)
+set_tests_properties(refine_controls_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
 # brae's pointPatchDist and the rigidBodyMeshMotion scale against real OpenFOAM, on the mesh
 # RAS/floatingObject builds. The script carries the measurements and the controls.
