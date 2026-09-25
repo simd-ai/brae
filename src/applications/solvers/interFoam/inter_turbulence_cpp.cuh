@@ -62,6 +62,7 @@
 #include "fv_patch.cuh"
 #include "fvc.cuh"   // SurfaceScalarField
 #include "geometric_field.cuh"
+#include "limitedSchemes_cpp.cuh"   // EqnDivScheme
 #include "inter_linear_solve.cuh"
 #include "inter_solve_record.cuh"
 #include "kepsilon_coeffs.cuh"
@@ -133,9 +134,13 @@ struct InterTurbulence
     InterRasModel model = InterRasModel::KEpsilon;
     // `density variable` -- see the header
     bool variableDensity = false;
-    // div(<flux>,k) and div(<flux>,<second field>): `Gauss upwind` or `Gauss limitedLinear <k>`.
-    bool   closureLimitedLinear = false;
-    scalar closureLimiterCoeff  = 1;
+    // div(<flux>,k) and div(<flux>,<second field>): `Gauss upwind` or `Gauss limitedLinear <k>`, ONE
+    // PER EQUATION. `fvm::div(phi, psi)` resolves the entry by the FIELD's name, so the two need not
+    // agree and OpenFOAM assembles two different matrices; this carried a single pair and the reader
+    // refused a mismatch. The host closures take k's positionally and the second through EqnDivScheme;
+    // the DEVICE closure carries one scheme for both equations in its kernels and still refuses.
+    cpu::EqnDivScheme kDiv;
+    cpu::EqnDivScheme secondDiv;
     KEpsilonCoeffs coeffs;
     GeometricField<scalar> k;
     // kEpsilon's second scalar; empty under kOmegaSST
@@ -149,6 +154,10 @@ struct InterTurbulence
     // to refuse anything but 1 there.
     std::vector<scalar> yCell;
     label wallDistUpdateInterval = 1;
+    // fvSchemes' `wallDist { correctWalls }`, default true (meshWavePatchDistMethod.C:59). False leaves
+    // the wall-adjacent cells on the wave's face-CENTRE distance instead of the exact distance to the
+    // face polygon (patchWave.C:203), which is what OpenFOAM does and what brae used to refuse.
+    bool wallDistCorrectWalls = true;
     // THE PATCHES y IS MEASURED FROM. Empty: kOmegaSST's own wallDist, every `wall` patch. Non-empty: the
     // wallDist the motion solver's inverseDistance diffusivity registered first -- MeshObject::New finds
     // an object by its TYPE name alone (MeshObject.C), the motion solver is built before the turbulence

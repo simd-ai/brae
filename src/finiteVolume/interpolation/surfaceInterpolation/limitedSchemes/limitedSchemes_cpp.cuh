@@ -47,6 +47,30 @@
 
 namespace brae {
 namespace cpu {
+
+// ONE EQUATION'S CONVECTION SCHEME, as `fvSchemes { divSchemes }` gives it.
+//
+// WHY IT EXISTS: `fvm::div(phi, psi)` resolves `div(phi,<psi>)` by the FIELD's name, so a case may write
+// `div(phi,k) Gauss upwind;` beside `div(phi,epsilon) Gauss limitedLinear 1;` and OpenFOAM assembles two
+// different matrices. brae's kEpsilon and kOmegaSST references took ONE scheme for both equations, and
+// every caller refused a mismatch rather than substitute -- honestly, but the case was then unrunnable.
+// A closure takes k's positionally, as it always has, and this for the second equation.
+//
+// `bounded` belongs here too: boundedConvectionScheme WRAPS the Gauss operator and subtracts
+// Sp(div(phi), psi), so it is part of the same fvm::div object and is per-entry in exactly the same way.
+// `linearUpwind`/`luGradK` are carried by the kEpsilon closure only; the kOmegaSST one does not assemble
+// that scheme and refuses it, so they stay false there.
+struct EqnDivScheme
+{
+    bool   bounded       = false;
+    bool   limitedLinear = false;
+    // the RAW k of `limitedLinear <k>` -- limitedLinearWeights computes twoByk itself
+    scalar limiterCoeff  = 1.0;
+    bool   linearUpwind  = false;
+    // the cellLimited k of the gradient linearUpwind NAMES, which is not grad(<field>)'s
+    scalar luGradK       = 0.0;
+};
+
 namespace limitedSchemes {
 
 // THE LIMITER MATH ITSELF, exposed rather than kept private to the .cu, because it is needed in TWO

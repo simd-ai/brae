@@ -125,9 +125,21 @@ int main(
     // (kEpsilon.C:182-183) is the only thing in the run that touches either field
     const bool frozenFloored = (profile == "frozenFloored");
     const bool frozenSST = (profile == "frozenSST");
-    const char* secondName = (sst || frozenSST) ? "omega" : "epsilon";
+    // `splitSolve*`: the second equation carries its OWN `<field>Final` solver entry, which
+    // fvMatrix::solve() looks up by FIELD name. The closure took k's for both until this profile.
+    const bool splitSolveSST = (profile == "splitSolveSST");
+    const bool splitSolve = (profile == "splitSolve") || splitSolveSST;
+    // `splitDiv*`: the two equations carry DIFFERENT convection schemes, which fvm::div resolves by the
+    // FIELD's name. The closure took k's for both until this profile; the device still refuses.
+    const bool splitDivSST = (profile == "splitDivSST");
+    const bool splitDiv = (profile == "splitDiv") || splitDivSST;
+    const char* secondName = (sst || frozenSST || splitSolveSST || splitDivSST) ? "omega" : "epsilon";
     std::printf("  profile: %s\n",
-                frozenFloored ? "frozenFloored -- turbulence off, with floors above the case's own fields"
+                splitDivSST ? "splitDivSST -- div(phi,omega) limitedLinear beside div(phi,k) upwind"
+              : splitDiv ? "splitDiv -- div(phi,epsilon) limitedLinear beside div(phi,k) upwind"
+              : splitSolveSST ? "splitSolveSST -- omegaFinal its own entry, tolerance 1e-12 and 2 sweeps"
+              : splitSolve ? "splitSolve -- epsilonFinal its own entry, tolerance 1e-12 and 2 sweeps"
+              : frozenFloored ? "frozenFloored -- turbulence off, with floors above the case's own fields"
               : frozenSST ? "frozenSST -- kOmegaSST with turbulence off"
               : frozen ? "frozen -- turbulence off: constructed, validated, never corrected"
               : outer ? "outer -- variable, with nOuterCorrectors 2"
@@ -168,6 +180,35 @@ int main(
         check("...and minIter 1 at tolerance 0.5",
               t.kSolveFinal.minIter == 1 && t.kSolveFinal.tol == scalar(0.5)
            && t.epsSolveFinal.minIter == 1);
+    }
+
+    if (splitSolve)
+    {
+        const InterTurbulence& t = fin.turbulence;
+        const SmoothLinearSolve& ks = t.kSolveFinal;
+        const SmoothLinearSolve& es = splitSolveSST ? t.omegaSolveFinal : t.epsSolveFinal;
+        std::printf("  SPLIT: kFinal tol %.3g nSweeps %d   |   %sFinal tol %.3g nSweeps %d\n",
+                    (double)ks.tol, ks.nSweeps, secondName, (double)es.tol, es.nSweeps);
+        // THE PROFILE IS NOT GATING ONE SETTING TWICE. Without this the arm would pass on a brae that
+        // resolved BOTH names through the case's `"(U|k|epsilon).*"` regex and never saw the literal.
+        check("brae read the case's own entry for kFinal", ks.tol == scalar(1e-06) && ks.nSweeps == 1);
+        check("...and the second field's SEPARATE entry, which the regex beside it also matches",
+              es.tol == scalar(1e-12) && es.nSweeps == 2);
+        check("...so the two differ, which is what this profile exists to run",
+              ks.tol != es.tol && ks.nSweeps != es.nSweeps);
+    }
+
+    if (splitDiv)
+    {
+        const InterTurbulence& t = fin.turbulence;
+        std::printf("  SPLIT DIV: k limitedLinear %d coeff %.3g   |   %s limitedLinear %d coeff %.3g\n",
+                    (int)t.kDiv.limitedLinear, (double)t.kDiv.limiterCoeff, secondName,
+                    (int)t.secondDiv.limitedLinear, (double)t.secondDiv.limiterCoeff);
+        // THE PROFILE IS NOT CHANGING BOTH. k keeps the case's own `Gauss upwind`, so exactly one
+        // equation's matrix moves and the arm measures one difference.
+        check("brae read div(phi,k) as the case's own Gauss upwind", !t.kDiv.limitedLinear);
+        check("...and the second field's as Gauss limitedLinear 1",
+              t.secondDiv.limitedLinear && t.secondDiv.limiterCoeff == scalar(1));
     }
 
     auto readCells = [&](const std::string& path)
@@ -230,7 +271,7 @@ int main(
     // seat takes 1 of 5 iteration counts and leaves final residuals 100% out.
     if (!frozen)
     {
-        failures += brae::gatecheck::compareSolves("host", (sst || frozenSST) ? r.omegaSolves : r.epsilonSolves,
+        failures += brae::gatecheck::compareSolves("host", (sst || frozenSST || splitSolveSST || splitDivSST) ? r.omegaSolves : r.epsilonSolves,
                                                    ofE, nSteps, secondName,
                                                    scalar(1e-10), scalar(1e-10), scalar(1e-5));
         failures += brae::gatecheck::compareSolves("host", r.kSolves, ofK, nSteps, "k",
@@ -242,7 +283,7 @@ int main(
     failures += brae::gatecheck::nonFinite("brae p_rgh", fin.p_rgh.internal);
     failures += brae::gatecheck::nonFinite("brae U", fin.U.internal);
     failures += brae::gatecheck::nonFinite("brae k", fin.turbulence.k.internal);
-    const std::vector<scalar>& braeSecond = (sst || frozenSST) ? fin.turbulence.omega.internal
+    const std::vector<scalar>& braeSecond = (sst || frozenSST || splitSolveSST || splitDivSST) ? fin.turbulence.omega.internal
                                                 : fin.turbulence.epsilon.internal;
     failures += brae::gatecheck::nonFinite("brae second field", braeSecond);
     // THE FAIL-PROOF. `braeSecond` selects omega or epsilon by profile, and the other of the two is
@@ -374,7 +415,12 @@ int main(
     // MEASURED for nutAtmosphere against plain uniform: U 2.7e-03, nut 4.7e-02 -- 20 of the atmosphere's
     // 46 faces take air IN at t = 0.005, where the inletValue stands in for the cell's nut
     // ...and the second outer corrector against one: MEASURED U 4.6e-02 at t = 0.005
-    check(frozenFloored ? "...and the FLOORS alone move it by more than 1%, against the same case frozen "
+    check(splitDiv ? "...and limitedLinear on the second equation alone moves OpenFOAM's U against upwind "
+                     "on both -- a different matrix, not a different stopping point"
+          : splitSolve ? "...and the second equation's own solver entry moves OpenFOAM's U at all against "
+                       "one entry for both -- it is a stopping point, so the move is small and the "
+                       "ITERATION COUNTS above are what this profile really gates"
+          : frozenFloored ? "...and the FLOORS alone move it by more than 1%, against the same case frozen "
                           "at the default floors -- so the constructor's bound is visible here"
           : frozenSST ? "...and switching kOmegaSST off moves it by more than 10%"
           : frozen ? "...and switching kEpsilon off moves it by more than 10%"
@@ -383,6 +429,13 @@ int main(
           : custom ? "...and the custom settings move it by more than 1%"
                    : "...and the lineage moves it by more than 10%, so `density` is live on this fixture",
           dOtherU.rel() > (nutAtmosphere ? scalar(1e-3)
+                         // MEASURED: kEpsilon 1.5e-04 of U (nut 4.5e-03), kOmegaSST 2.4e-05 (nut
+                         // 2.2e-04) -- the SST closure's omega is far less sensitive to its convection
+                         // scheme here than kEpsilon's epsilon is. brae is 1.3e-14 and 1.1e-12 from
+                         // OpenFOAM on the two, so both bounds keep at least four orders of margin.
+                         : splitDivSST ? scalar(1e-5)
+                         : splitDiv ? scalar(1e-4)
+                         : splitSolve ? scalar(1e-9)
                          : (custom || outer || frozenFloored) ? scalar(0.01) : scalar(0.1)));
 
     // THE DEVICE LOOP, against OpenFOAM directly and at the case's own tolerances -- what
@@ -397,6 +450,33 @@ int main(
     {
         std::printf("  (no CUDA device: the device arm is skipped)\n");
     }
+    else if (splitSolve || splitDiv)
+    {
+        // THE DEVICE ARM MUST REFUSE, and by name. Its closure carries ONE tolerance, sweep count and
+        // iteration cap for both equations in the kernels themselves (device_inter_turbulence's
+        // `kin`/`sin` each hold a single `tol`/`maxIter`/`minIter`/`nSweepsKE`), so the per-equation
+        // setting the host now honours is not ported there. Refused rather than run under k's entry --
+        // which is what the numbers above show a substituted setting costs: OpenFOAM's own iteration
+        // counts for the second field change with it.
+        InterFields dev;
+        bool named = false;
+        try
+        {
+            runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
+            std::printf("  FAIL the device arm RAN a case whose two closure equations name different\n"
+                        "       solver settings, which its kernels cannot carry\n");
+            ++failures;
+        }
+        catch (const std::exception& e)
+        {
+            const std::string w = e.what();
+            named = w.find(splitDiv ? "different convection schemes" : "different solver settings")
+                    != std::string::npos;
+            std::printf("  device refusal: %s\n", e.what());
+        }
+        check(splitDiv ? "the device arm refuses the split convection scheme under its own name"
+                       : "the device arm refuses the split solver entry under its own name", named);
+    }
     else
     {
         InterFields dev;
@@ -410,7 +490,7 @@ int main(
         failures += brae::gatecheck::nonFinite("device p_rgh", dev.p_rgh.internal);
         failures += brae::gatecheck::nonFinite("device U", dev.U.internal);
         failures += brae::gatecheck::nonFinite("device k", dev.turbulence.k.internal);
-        const std::vector<scalar>& devSecond = (sst || frozenSST) ? dev.turbulence.omega.internal
+        const std::vector<scalar>& devSecond = (sst || frozenSST || splitSolveSST || splitDivSST) ? dev.turbulence.omega.internal
                                                    : dev.turbulence.epsilon.internal;
         failures += brae::gatecheck::nonFinite("device second field", devSecond);
         failures += brae::gatecheck::nonFinite("device nut", dev.turbulence.nut.internal);
@@ -434,7 +514,7 @@ int main(
         }
         else
         {
-            failures += brae::gatecheck::compareSolves("device", (sst || frozenSST) ? rd.omegaSolves : rd.epsilonSolves,
+            failures += brae::gatecheck::compareSolves("device", (sst || frozenSST || splitSolveSST || splitDivSST) ? rd.omegaSolves : rd.epsilonSolves,
                                                        ofE, nSteps, secondName, scalar(1e-10), scalar(1e-10),
                                                        scalar(1e-5));
             failures += brae::gatecheck::compareSolves("device", rd.kSolves, ofK, nSteps, "k",
@@ -477,7 +557,7 @@ int main(
         unsetenv("BRAE_INTER_HOST_CLOSURE");
         check("the mixed run took the HOST closure", !rm.turbulenceOnDevice && rm.steps == nSteps);
         failures += brae::gatecheck::nonFinite("mixed k", mix.turbulence.k.internal);
-        const std::vector<scalar>& mixSecond = (sst || frozenSST) ? mix.turbulence.omega.internal
+        const std::vector<scalar>& mixSecond = (sst || frozenSST || splitSolveSST || splitDivSST) ? mix.turbulence.omega.internal
                                                    : mix.turbulence.epsilon.internal;
         failures += brae::gatecheck::nonFinite("mixed second field", mixSecond);
         failures += brae::gatecheck::nonFinite("mixed nut", mix.turbulence.nut.internal);
@@ -502,8 +582,8 @@ int main(
         // the two closures took the same sweeps, solve for solve
         std::size_t sameE = 0;
         std::size_t sameK = 0;
-        const std::vector<LinearSolveRecord>& devSecondSolves = (sst || frozenSST) ? rd.omegaSolves : rd.epsilonSolves;
-        const std::vector<LinearSolveRecord>& mixSecondSolves = (sst || frozenSST) ? rm.omegaSolves : rm.epsilonSolves;
+        const std::vector<LinearSolveRecord>& devSecondSolves = (sst || frozenSST || splitSolveSST || splitDivSST) ? rd.omegaSolves : rd.epsilonSolves;
+        const std::vector<LinearSolveRecord>& mixSecondSolves = (sst || frozenSST || splitSolveSST || splitDivSST) ? rm.omegaSolves : rm.epsilonSolves;
         for (std::size_t q = 0; q < devSecondSolves.size() && q < mixSecondSolves.size(); ++q)
         {
             if (devSecondSolves[q].nIterations == mixSecondSolves[q].nIterations)

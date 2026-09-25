@@ -259,7 +259,9 @@ void correct(
     const NutWallSelection* nutSel,
     bool   linearUpwind,
     scalar luGradK,
-    const LinearSolverChoice* which)
+    const LinearSolverChoice* which,
+    const EqnSolveSetting* epsSolve,
+    const EqnDivScheme* epsDiv)
 {
     if (linearUpwind && limitedLinear)
         throw std::runtime_error(
@@ -307,19 +309,49 @@ void correct(
 
     // the flux inletOutlet and its relatives look up -- see Compressible::bcPhi
     const SurfaceScalarField& patchFlux = (comp && comp->bcPhi) ? *comp->bcPhi : phi;
-    // the case's linear solver for both equations -- see the `which` parameter
+    // EPSILON'S OWN CONVECTION SCHEME, resolved ONCE so the assembly, the `bounded` term and the stage
+    // capture cannot read different answers. Absent it, epsilon's is k's -- which is what every caller
+    // that still refuses a mismatch means.
+    EqnDivScheme kDiv;
+    kDiv.bounded = bounded;
+    kDiv.limitedLinear = limitedLinear;
+    kDiv.limiterCoeff = limiterCoeff;
+    kDiv.linearUpwind = linearUpwind;
+    kDiv.luGradK = luGradK;
+    const EqnDivScheme eDiv = epsDiv ? *epsDiv : kDiv;
+
+    // THE CASE'S LINEAR SOLVER, PER EQUATION. `fvMatrix::solve()` looks the dictionary up by FIELD name,
+    // so `kFinal` and `epsilonFinal` may differ in every entry. `which`/`tol`/... are k's, as they always
+    // were; `epsSolve` is epsilon's, and null means the caller has one setting for both.
+    auto solveWith = [&](const FvScalarMatrix&      A,
+                         std::vector<scalar>&       psi,
+                         const LinearSolverChoice*  w,
+                         scalar                     t,
+                         scalar                     rt,
+                         int                        mx,
+                         int                        mn)
+    {
+        if (w && w->smoothSolver)
+        {
+            return smoothSolver(A, psi, m, patches, w->symmetric, t, rt, mx, mn, w->nSweeps);
+        }
+        if (w && w->pbicgDILU)
+        {
+            return pbicgDILU(A, psi, m, patches, t, rt, mx, mn);
+        }
+        return pbicgstab(A, psi, m, patches, t, rt, mx, mn);
+    };
     auto solveScalar = [&](const FvScalarMatrix& A, std::vector<scalar>& psi)
     {
-        if (which && which->smoothSolver)
-        {
-            return smoothSolver(A, psi, m, patches, which->symmetric, tol, relTol, maxIter, minIter,
-                                which->nSweeps);
-        }
-        if (which && which->pbicgDILU)
-        {
-            return pbicgDILU(A, psi, m, patches, tol, relTol, maxIter, minIter);
-        }
-        return pbicgstab(A, psi, m, patches, tol, relTol, maxIter, minIter);
+        return solveWith(A, psi, which, tol, relTol, maxIter, minIter);
+    };
+    // epsilon's. OpenFOAM solves epsilon FIRST and k second (kEpsilon.C:301 then :331), so this is the
+    // first solve of the two, not the last.
+    auto solveSecond = [&](const FvScalarMatrix& A, std::vector<scalar>& psi)
+    {
+        return epsSolve ? solveWith(A, psi, &epsSolve->which, epsSolve->tol, epsSolve->relTol,
+                                    epsSolve->maxIter, epsSolve->minIter)
+                        : solveWith(A, psi, which, tol, relTol, maxIter, minIter);
     };
 
     // alpha*rho on a cell: 1 in the incompressible lineage.
@@ -511,8 +543,9 @@ void correct(
             epsilon.boundary[pi]->updateFromFlux(patchFlux.boundary[pi]);
         }
 
-        FvScalarMatrix M = divWithScheme(phi, epsilon, limitedLinear, limiterCoeff, co.gradKLimitK,
-                                         m, g, patches, linearUpwind, luGradK, co.gradKLeastSq);
+        FvScalarMatrix M = divWithScheme(phi, epsilon, eDiv.limitedLinear, eDiv.limiterCoeff,
+                                         co.gradKLimitK, m, g, patches, eDiv.linearUpwind, eDiv.luGradK,
+                                         co.gradKLeastSq);
         if (res && res->captureStages)
         {
             captureSystem(M, patches, res->epsDivD, res->epsDivSrc, &res->epsDivUpper, &res->epsDivLower);
@@ -520,7 +553,7 @@ void correct(
             // subtracts fvm::Sp(surfaceIntegrate(phi), vf). OpenFOAM's fvm::div returns the wrapped
             // matrix, so the capture has to include the bounded term to be the same object -- brae adds
             // it a few lines below, on the combined matrix.
-            if (bounded)
+            if (eDiv.bounded)
                 for (label c = 0; c < nC; ++c) res->epsDivD[c] -= divPhi[c] * g.V()[c];
             res->gammaEpsFace = Df.internal;
         }
@@ -572,7 +605,7 @@ void correct(
             // `bounded`: - Sp(div(phi), epsilon). Vanishes where phi is conservative, so it cannot move
             // a converged state -- which is exactly why it needs its own measurement rather than being
             // assumed harmless.
-            if (bounded) M.diag[c] -= divPhi[c] * V;
+            if (eDiv.bounded) M.diag[c] -= divPhi[c] * V;
         }
 
         // fvm::ddt(alpha, rho, epsilon_) under CrankNicolson: "ddt0(rho,epsilon)" is the equation's own
@@ -699,7 +732,7 @@ void correct(
         {
             captureSystem(M, patches, res->epsD, res->epsSrc, &res->epsUpper, &res->epsLower);
         }
-        const SolverPerformance p = solveScalar(M, epsilon.internal);
+        const SolverPerformance p = solveSecond(M, epsilon.internal);
         if (res)
         {
             res->epsilon = p.initialResidual;

@@ -94,7 +94,7 @@ stage()
     case "$profile" in
         laminar)
             sed -i 's/^simulationType .*/simulationType laminar;/' "$C/constant/turbulenceProperties" ;;
-        uniform|custom|nutAtmosphere|sst|frozen|frozenFloored|frozenSST)
+        uniform|custom|nutAtmosphere|sst|frozen|frozenFloored|frozenSST|splitSolve|splitSolveSST|splitDiv|splitDivSST)
             sed -i '/^density /d' "$C/constant/turbulenceProperties"
             sed -i 's/^\( *\)div(rhoPhi,k) .*/\1div(phi,k)      Gauss upwind;/; s/^\( *\)div(rhoPhi,epsilon) .*/\1div(phi,epsilon) Gauss upwind;/' \
                 "$C/system/fvSchemes"
@@ -116,7 +116,8 @@ PYEOF
     # `sst`: the same tutorial made kOmegaSST -- omega from its epsilon file with omegaWallFunction, the
     # closure's own div entries, the solver entry renamed, and fvSchemes' mandatory wallDist method.
     # RAS/damBreak's nut atmosphere is `calculated`, which is what lets the DEVICE closure run it.
-    if [ "$profile" = sst ] || [ "$profile" = frozenSST ]; then
+    if [ "$profile" = sst ] || [ "$profile" = frozenSST ] || [ "$profile" = splitSolveSST ] \
+       || [ "$profile" = splitDivSST ]; then
         python3 - "$C" <<'SSTEOF' || { echo "FAIL: the sst profile was not staged"; return 1; }
 import os, re, sys
 d = sys.argv[1]
@@ -168,6 +169,70 @@ SSTEOF
             "$C/constant/turbulenceProperties"
         grep -q "kMin            0.5;" "$C/constant/turbulenceProperties" \
             || { echo "FAIL: the floors were not staged"; return 1; }
+    fi
+    # `splitSolve*`: the SECOND equation gets its OWN solver entry. `fvMatrix::solve()` looks the solver
+    # dictionary up BY FIELD NAME, so `kFinal` and `epsilonFinal` (or `omegaFinal`) need not agree and
+    # OpenFOAM honours each; brae's closures took k's for both and REFUSED a mismatch. Every shipped
+    # tutorial writes the pair as one regex key -- `"(U|k|epsilon).*"` here -- which is why no tutorial
+    # reaches it and the profile has to be staged.
+    #
+    # THE SPLIT IS A LITERAL KEY BESIDE THE REGEX. OpenFOAM's dictionary searches hashedEntries_ before
+    # patterns, so an explicit `epsilonFinal` wins over the regex that also matches it; brae's reader does
+    # the same (foam_dict.cuh:74-90). k keeps the case's own entry, which is what makes this a SPLIT
+    # rather than two new settings.
+    #
+    # WHAT MAKES IT VISIBLE: tolerance 1e-12 against the case's 1e-06, and TWO smoother sweeps against
+    # one. Both change the second field's iteration count and final residual in OpenFOAM's own log, which
+    # this gate already compares solve for solve -- so a brae that used k's settings for epsilon fails on
+    # the counts, not merely on the fields.
+    if [ "$profile" = splitSolve ] || [ "$profile" = splitSolveSST ]; then
+        SEC=epsilonFinal
+        [ "$profile" = splitSolveSST ] && SEC=omegaFinal
+        SEC="$SEC" python3 - "$C" <<'PYEOF' || { echo "FAIL: the splitSolve profile was not staged"; return 1; }
+import os, re, sys
+d = sys.argv[1]
+sec = os.environ["SEC"]
+q = d + "/system/fvSolution"
+t = open(q).read()
+# the regex entry must still be there, or k is not keeping the case's own setting
+key = '"(U|k|omega)' if sec == "omegaFinal" else '"(U|k|epsilon)'
+assert key in t, "the regex solver entry is not where this profile expects it"
+block = ("\n    %s\n    {\n        solver          smoothSolver;\n"
+         "        smoother        symGaussSeidel;\n        tolerance       1e-12;\n"
+         "        relTol          0;\n        minIter         1;\n        nSweeps         2;\n    }\n" % sec)
+t, n = re.subn(r"\n\}\s*\n\s*PIMPLE", block + "}\n\nPIMPLE", t, count=1)
+assert n == 1, "could not place the entry inside the solvers dictionary"
+open(q, "w").write(t)
+PYEOF
+        grep -q "$SEC" "$C/system/fvSolution" || { echo "FAIL: $SEC was not written"; return 1; }
+    fi
+    # `splitDiv*`: the two closure equations get DIFFERENT convection schemes. `fvm::div(phi, psi)`
+    # resolves `div(phi,<psi>)` by the FIELD's name, so `div(phi,k) Gauss upwind` beside
+    # `div(phi,epsilon) Gauss limitedLinear 1` is two different MATRICES in OpenFOAM -- not a looser
+    # tolerance. brae's closures carried one scheme for the pair and the reader refused a mismatch.
+    #
+    # k KEEPS the case's own `Gauss upwind` and only the second field changes, so the arm measures one
+    # difference. limitedLinear against upwind on the second equation is a large move, which is why this
+    # one shows in the FIELDS as well as in the iteration counts -- unlike `splitSolve`, where a
+    # tolerance only moved the stopping point.
+    if [ "$profile" = splitDiv ] || [ "$profile" = splitDivSST ]; then
+        SECF=epsilon
+        [ "$profile" = splitDivSST ] && SECF=omega
+        SECF="$SECF" python3 - "$C" <<'DIVEOF' || { echo "FAIL: the splitDiv profile was not staged"; return 1; }
+import os, re, sys
+d = sys.argv[1]
+sec = os.environ["SECF"]
+q = d + "/system/fvSchemes"
+t = open(q).read()
+pat = r"div\(phi,%s\)\s+Gauss upwind;" % sec
+assert re.search(pat, t), "div(phi,%s) Gauss upwind is not where this profile expects it" % sec
+t = re.sub(pat, "div(phi,%s) Gauss limitedLinear 1;" % sec, t, count=1)
+# k MUST still be upwind, or the profile is changing both and measuring nothing
+assert re.search(r"div\(phi,k\)\s+Gauss upwind;", t), "div(phi,k) is no longer upwind"
+open(q, "w").write(t)
+DIVEOF
+        grep -q "div(phi,$SECF) Gauss limitedLinear 1;" "$C/system/fvSchemes" \
+            || { echo "FAIL: the second field's div entry was not changed"; return 1; }
     fi
     # `outer`: the shipped case with nOuterCorrectors 2 -- the second pass starts from the first pass's
     # alpha, U and phi, and every once-per-step update must stay once per step. The DEVICE alpha step
@@ -241,7 +306,7 @@ PYEOF
 }
 
 rc=0
-for p in laminar variable uniform custom nutAtmosphere sst outer frozen frozenFloored frozenSST; do
+for p in laminar variable uniform custom nutAtmosphere sst outer frozen frozenFloored frozenSST splitSolve splitSolveSST splitDiv splitDivSST; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_ras_dambreak_vs_openfoam: staging failed"; exit 1; }
@@ -271,6 +336,19 @@ done
        frozenFloored uniform "$W/laminar/$END" "$W/frozen/$END" || rc=1
 "$BIN" "$W/frozenSST" "$W/frozenSST/0" "$W/frozenSST/$END" "$STEPS" "$W/frozenSST/log.interFoam" \
        frozenSST uniform "$W/laminar/$END" "$W/sst/$END" || rc=1
+
+# THE SPLIT-SOLVER ARMS. The control is the same case with ONE entry for both equations -- `uniform` for
+# kEpsilon, `sst` for kOmegaSST -- so the only difference is the second field's solver setting.
+"$BIN" "$W/splitSolve" "$W/splitSolve/0" "$W/splitSolve/$END" "$STEPS" "$W/splitSolve/log.interFoam" \
+       splitSolve uniform "$W/laminar/$END" "$W/uniform/$END" || rc=1
+"$BIN" "$W/splitSolveSST" "$W/splitSolveSST/0" "$W/splitSolveSST/$END" "$STEPS" "$W/splitSolveSST/log.interFoam" \
+       splitSolveSST uniform "$W/laminar/$END" "$W/sst/$END" || rc=1
+
+# THE SPLIT-SCHEME ARMS. The control is the same case with ONE scheme for both equations.
+"$BIN" "$W/splitDiv" "$W/splitDiv/0" "$W/splitDiv/$END" "$STEPS" "$W/splitDiv/log.interFoam" \
+       splitDiv uniform "$W/laminar/$END" "$W/uniform/$END" || rc=1
+"$BIN" "$W/splitDivSST" "$W/splitDivSST/0" "$W/splitDivSST/$END" "$STEPS" "$W/splitDivSST/log.interFoam" \
+       splitDivSST uniform "$W/laminar/$END" "$W/sst/$END" || rc=1
 
 echo "interfoam_ras_dambreak_vs_openfoam: rc $rc"
 exit $rc

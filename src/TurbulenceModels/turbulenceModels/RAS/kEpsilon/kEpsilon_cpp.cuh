@@ -52,6 +52,7 @@
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
+#include "limitedSchemes_cpp.cuh"   // EqnDivScheme
 #include "ldu_matrix.cuh"
 #include "fvm.cuh"
 #include "fvc.cuh"
@@ -296,7 +297,20 @@ void correct(
     // interFoam ran; interFoam's tutorials name `smoothSolver; symGaussSeidel;` for k and epsilon, and
     // a substituted solver at the same tolerance stops somewhere else (measured three times in the
     // interFoam port: p_rgh, alpha, U). Last, so no positional caller moves.
-    const LinearSolverChoice* which = nullptr);
+    const LinearSolverChoice* which = nullptr,
+    // THE SECOND EQUATION'S OWN SOLVER SETTING -- epsilon's here. `fvMatrix::solve()` looks the solver
+    // dictionary up BY FIELD NAME, so `kFinal` and `epsilonFinal` may name different tolerances, sweep
+    // counts or different solvers outright, and OpenFOAM honours each. This reference took k's for both
+    // and every caller refused a mismatch rather than substitute. Null keeps exactly that: the caller
+    // has ONE setting and says so, which is true of every caller that still carries the refusal. Last,
+    // so no positional caller moves.
+    const EqnSolveSetting* epsSolve = nullptr,
+    // THE SECOND EQUATION'S OWN CONVECTION SCHEME -- epsilon's here. `fvm::div(phi, psi)` resolves
+    // `div(phi,<psi>)` by the FIELD's name, so `div(phi,k)` and `div(phi,epsilon)` may name different
+    // schemes and OpenFOAM assembles two different matrices. `bounded`/`limitedLinear`/`limiterCoeff`/
+    // `linearUpwind`/`luGradK` above are k's, as they always were; null here means the caller has ONE
+    // scheme for both and says so, which is true of every caller that still carries the refusal.
+    const EqnDivScheme* epsDiv = nullptr);
 
 } // namespace kEpsilonRef
 } // namespace cpu

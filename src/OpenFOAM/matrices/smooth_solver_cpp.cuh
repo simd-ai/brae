@@ -57,6 +57,22 @@ struct LinearSolverChoice
     int nSweeps = 1;
 };
 
+// ONE EQUATION'S WHOLE LINEAR-SOLVER SETTING, solver choice and stopping criteria together.
+//
+// WHY IT EXISTS: `fvMatrix::solve()` looks the solver dictionary up BY FIELD NAME, so a case may give
+// `kFinal` and `epsilonFinal` (or `omegaFinal`) different tolerances, sweep counts, or different solvers
+// outright, and OpenFOAM honours each. brae's kEpsilon and kOmegaSST references took ONE set for both
+// equations, and every caller refused a mismatch rather than substitute -- honestly, but the case was
+// then unrunnable. A closure takes k's positionally, as it always has, and this for the second equation.
+struct EqnSolveSetting
+{
+    LinearSolverChoice which;
+    scalar tol    = 0;
+    scalar relTol = 0;
+    int    maxIter = 0;
+    int    minIter = 0;
+};
+
 // ownerStartAddr: for cell c, the internal faces it owns are [ownStart[c], ownStart[c+1]). Throws if
 // the internal faces are not in OpenFOAM's upper-triangular order (sorted by owner, owner < neighbour),
 // because both smoothers are only the ones OpenFOAM runs on a mesh ordered that way.

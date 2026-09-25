@@ -48,6 +48,7 @@
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
+#include "limitedSchemes_cpp.cuh"   // EqnDivScheme
 #include "ldu_matrix.cuh"
 #include "fvm.cuh"
 #include "fvc.cuh"
@@ -297,7 +298,17 @@ void correct(
     // which every caller before interFoam ran; interFoam's waterChannel names `smoothSolver;
     // symGaussSeidel;` for k and omega, and a substituted solver at the same tolerance stops somewhere
     // else. Last, so no positional caller moves.
-    const LinearSolverChoice*      which = nullptr);
+    const LinearSolverChoice*      which = nullptr,
+    // OMEGA'S OWN SOLVER SETTING. `fvMatrix::solve()` looks the dictionary up BY FIELD NAME, so
+    // `kFinal` and `omegaFinal` may name different tolerances, sweep counts or different solvers
+    // outright, and OpenFOAM honours each. This reference took k's for both and the caller refused a
+    // mismatch rather than substitute. Null keeps that: the caller has ONE setting and says so.
+    const EqnSolveSetting*         omegaSolve = nullptr,
+    // OMEGA'S OWN CONVECTION SCHEME. `fvm::div(phi, psi)` resolves `div(phi,<psi>)` by the FIELD's name,
+    // so `div(phi,k)` and `div(phi,omega)` may name different schemes. `bounded`/`limitedLinear`/
+    // `limiterCoeff` above are k's; null here means ONE scheme for both. This closure does not assemble
+    // `linearUpwind` at all and refuses it, so that half of EqnDivScheme stays false here.
+    const EqnDivScheme*            omegaDiv = nullptr);
 
 } // namespace kOmegaSST
 } // namespace cpu

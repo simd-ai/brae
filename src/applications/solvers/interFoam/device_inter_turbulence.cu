@@ -217,6 +217,17 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
             const int nwk = (pi < t.nutWallKind.size()) ? t.nutWallKind[pi] : -1;
             kind.push_back(nwk >= 0 ? nwk : static_cast<int>(NutWall::Nutk));
             if (!isWF) continue;
+            // A PATCH beta1 IS NOT PORTED HERE. omegaWallFunction reads its own `beta1` from the patch
+            // dictionary (omegaWallFunctionFvPatchScalarField.C:404-409) and the HOST closure uses it
+            // (kOmegaSST_cpp.cu's omega wall loop); this closure's kernel takes beta1 as one scalar for
+            // the whole field (device_komega_sst.cu:371), so a patch's own would be silently replaced by
+            // the model's. Refused rather than run the wrong beta1 at the wall.
+            if (!les && ec.beta1 != t.sstCoeffs.beta1)
+                throw std::runtime_error(
+                    "brae interFoam (device): omega patch `" + patches[pi].name + "` names `beta1 "
+                    + std::to_string(ec.beta1) + "`, its own omegaWallFunction coefficient. The device "
+                    "closure carries one beta1 for the whole field; the host honours the patch's. "
+                    "Refused rather than run the model's value at the wall.");
             eCmu25.push_back(std::pow(ec.Cmu, 0.25));
             eCmu75.push_back(std::pow(ec.Cmu, 0.75));
             eKappa.push_back(ec.kappa);
@@ -632,8 +643,16 @@ void deviceCorrectInterTurbulence(
         // twice. `limGradK`/`limGradLeastSq` are the gradient the LIMITER takes (the host hands
         // divWithScheme co.gradKLimitK/gradKLeastSq); they are the same fvSchemes entry as
         // co.gradKLimitK below, and the closure refuses the two disagreeing.
-        sin.limitedLinear   = t.closureLimitedLinear;
-        sin.limiterCoeff    = t.closureLimiterCoeff;
+        // ONE SCHEME FOR BOTH EQUATIONS is what this closure's kernels carry, so a case whose two
+        // div entries differ is refused rather than run under k's -- the host honours it per equation
+        // (tests/interfoam_ras_dambreak_vs_openfoam.sh `splitDiv`).
+        if (t.kDiv.limitedLinear != t.secondDiv.limitedLinear
+         || (t.kDiv.limitedLinear && t.kDiv.limiterCoeff != t.secondDiv.limiterCoeff))
+            throw std::runtime_error(
+                "brae interFoam (device): fvSchemes gives div(phi,k) and div(phi,omega) different "
+                "convection schemes; this closure carries one scheme for both equations.");
+        sin.limitedLinear   = t.kDiv.limitedLinear;
+        sin.limiterCoeff    = t.kDiv.limiterCoeff;
         // ...and the CONVECTION scheme, which this arm now RUNS. It was refused by name, and the
         // refusal was for want of a gate rather than for a measured defect: the only case that names
         // the scheme -- RAS/waterChannel `limitedLinear` -- cannot witness it on fields, because it
@@ -736,8 +755,14 @@ void deviceCorrectInterTurbulence(
     kin.cycPhiByRho = in.cycPhi;
     kin.bcPhiBnd = in.phiBnd;
     // ...and the same for kEpsilon's device closure.
-    kin.limitedLinear  = t.closureLimitedLinear;
-    kin.limiterCoeff   = t.closureLimiterCoeff;
+    // as the SST branch above: one scheme for both equations in the kernels, so a mismatch is refused
+    if (t.kDiv.limitedLinear != t.secondDiv.limitedLinear
+     || (t.kDiv.limitedLinear && t.kDiv.limiterCoeff != t.secondDiv.limiterCoeff))
+        throw std::runtime_error(
+            "brae interFoam (device): fvSchemes gives div(phi,k) and div(phi,epsilon) different "
+            "convection schemes; this closure carries one scheme for both equations.");
+    kin.limitedLinear  = t.kDiv.limitedLinear;
+    kin.limiterCoeff   = t.kDiv.limiterCoeff;
     // ...and the same for kEpsilon's device closure, which RUNS it now too. It was refused as
     // "ungated", and that is what it was: the kOmegaSST half was lifted on its assembled system and
     // this half had no oracle at all, because tools/dumpKEpsilon registered only the compressible

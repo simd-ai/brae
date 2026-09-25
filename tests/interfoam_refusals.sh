@@ -374,22 +374,30 @@ arm sst_noOmega             refused "does not exist"          "" "$SSTBASE; rm 0
 # kOmegaSST's own wallDist reads `method` with no default (patchDistMethod.C): OpenFOAM stops without it
 arm sst_noWallDist          refused "wallDist { method ...; }" "" "$SSTBASE; sed -i '/^wallDist/d' system/fvSchemes"
 arm sst_wallDistPoisson     refused "wallDist { method Poisson; }" "" "$SSTBASE; sed -i 's/^wallDist .*/wallDist { method Poisson; }/' system/fvSchemes"
-arm sst_wallDistNoCorrect   refused "correctWalls false"     "" "$SSTBASE; sed -i 's/^wallDist .*/wallDist { method meshWave; correctWalls false; }/' system/fvSchemes"
+arm sst_wallDistNoCorrect   runs    -                        "" "$SSTBASE; sed -i 's/^wallDist .*/wallDist { method meshWave; correctWalls false; }/' system/fvSchemes"
 arm sst_decayControl        refused "decayControl"            "" "$SSTBASE; sed -i 's/RASModel .*/&\\n    kOmegaSSTCoeffs { decayControl yes; kInf 1e-5; omegaInf 1; }/' constant/turbulenceProperties"
 arm sst_F3                  refused "F3"                      "" "$SSTBASE; sed -i 's/RASModel .*/&\\n    kOmegaSSTCoeffs { F3 yes; }/' constant/turbulenceProperties"
 arm sst_blending            refused "blending stepwise"       "" "$SSTBASE; sed -i '0,/omegaWallFunction;/ s/omegaWallFunction;/omegaWallFunction;\\n        blending        stepwise;/' 0/omega"
 arm sst_nutU                refused "nutUWallFunction"        "" "$SSTBASE; sed -i '0,/nutkWallFunction/ s/nutkWallFunction/nutUWallFunction/' 0/nut"
 arm sst_wallWithoutOmegaWF  refused "omegaWallFunction"       "" "$SSTBASE; sed -i '0,/omegaWallFunction;/ s/omegaWallFunction;/zeroGradient;/' 0/omega"
 arm sst_linearUpwindOmega   refused "div(phi,omega)"          "" "$SSTBASE; sed -i 's/div(phi,omega) .*/div(phi,omega) Gauss linearUpwind grad(omega);/' system/fvSchemes"
-# TWO REFUSALS A SPELLING WALKED PAST until every switch went through FoamDict::switchOr. `decayControl`
+# `correctWalls no|0|n` RUNS now -- brae skips patchWave's wall-cell override as OpenFOAM does,
+# gated on RAS/waterChannel `correctWallsOff`. `decayControl` is still refused: it adds two terms
+# the closure does not carry.
+# ONE REFUSAL A SPELLING WALKED PAST until every switch went through FoamDict::switchOr. `decayControl`
 # tested {yes,on,true}, so `1` -- true to OpenFOAM (Switch.C:100) -- RAN, silently dropping
 # beta*sqr(omegaInf) and betaStar*omegaInf*kInf. `correctWalls` tested {false,no,off}, so `0` RAN brae's
 # always-correcting meshWave against OpenFOAM's uncorrected one. Both are refusals now.
 arm sst_decayControlOne     refused "beta*sqr(omegaInf)"      "" "$SSTBASE; sed -i 's/RASModel .*/&\n    kOmegaSSTCoeffs { decayControl 1; }/' constant/turbulenceProperties"
 arm sst_decayControlAny     refused "beta*sqr(omegaInf)"      "" "$SSTBASE; sed -i 's/RASModel .*/&\n    kOmegaSSTCoeffs { decayControl any; }/' constant/turbulenceProperties"
-arm sst_correctWallsZero    refused "corrects the near-wall cells" "" "$SSTBASE; sed -i 's/wallDist { method meshWave; }/wallDist { method meshWave; correctWalls 0; }/' system/fvSchemes"
-arm sst_correctWallsN       refused "corrects the near-wall cells" "" "$SSTBASE; sed -i 's/wallDist { method meshWave; }/wallDist { method meshWave; correctWalls n; }/' system/fvSchemes"
+arm sst_correctWallsZero    runs    -                             "" "$SSTBASE; sed -i 's/wallDist { method meshWave; }/wallDist { method meshWave; correctWalls 0; }/' system/fvSchemes"
+arm sst_correctWallsN       runs    -                             "" "$SSTBASE; sed -i 's/wallDist { method meshWave; }/wallDist { method meshWave; correctWalls n; }/' system/fvSchemes"
 arm sst_switchTypo          refused "Unknown switch perhaps"  "" "$SSTBASE; sed -i 's/wallDist { method meshWave; }/wallDist { method meshWave; correctWalls perhaps; }/' system/fvSchemes"
+# BOTH closures honour two different convection schemes now. The kOmegaSST arm was refused until the
+# 6.6e-09 it read on its FIRST omega solve was localised: omegaWallFunction's omegaVis was computed as
+# (beta1*y)*y where OpenFOAM writes beta1*sqr(y) -- one ulp on 5 of 2268 cells -- and that ulp decided
+# limitedLinear's 0/0 ratio on one face. Gated on `splitDiv` and `splitDivSST`, fields at 1e-13.
+arm sst_splitDiv            runs    -                        "" "$SSTBASE; sed -i 's/div(phi,omega)  *Gauss upwind;/div(phi,omega) Gauss limitedLinear 1;/' system/fvSchemes"
 arm ras_LES                 refused "LES"                     "" "sed -i 's/^simulationType .*/simulationType LES;/' constant/turbulenceProperties"
 # `turbulence off` RUNS now: the model is constructed, bounded and validated and then never corrected
 # (kEpsilon.C:216-219). On THIS base the lineage is `density variable`, which does NOT call validate()
@@ -411,10 +419,12 @@ arm ras_densityBad          refused "density mixture"         "" "sed -i 's/^den
 arm ras_uniform_noDivPhiK   refused "div(phi,k)"              "" "sed -i 's/^density .*/density uniform;/' constant/turbulenceProperties"
 arm ras_uniform             runs    -                        "" "sed -i 's/^density .*/density uniform;/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,k) /div(phi,k) /; s/div(rhoPhi,epsilon) /div(phi,epsilon) /' system/fvSchemes"
 # `Gauss limitedLinear <k>` RUNS on the host closure now (gated on RAS/waterChannel `limitedLinear`,
-# fields at 7.2e-12). What is refused is ONE equation limited and the other not -- the closure carries
-# a single flag for the pair, as `bounded` does -- and the scheme on the DEVICE closure, which reads
-# omega 1.7822e-04 where the host reads 7.2e-12.
-arm ras_limitedLinearOne    refused "different convection schemes" "" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss limitedLinear 1;/' system/fvSchemes"
+# fields at 7.2e-12), and so does ONE equation limited with the other not: `fvm::div(phi, psi)` resolves
+# the entry by the FIELD's name, so the two are two different matrices and the kEpsilon closure assembles
+# each (gated on RAS/damBreak `splitDiv`, fields at 1e-15). The kOmegaSST twin still refuses that
+# (`sst_splitDiv` above, with the measurement), and so does the DEVICE closure, whose kernels carry one
+# scheme for both equations and which reads omega 1.7822e-04 where the host reads 7.2e-12.
+arm ras_limitedLinearOne    runs    -                        "" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss limitedLinear 1;/' system/fvSchemes"
 arm ras_limitedLinearBoth   runs    -                        "" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss limitedLinear 1;/; s/div(rhoPhi,epsilon) .*/div(rhoPhi,epsilon) Gauss limitedLinear 1;/' system/fvSchemes"
 arm ras_nutSpalding         refused "nutUSpaldingWallFunction" "" "sed -i 's/nutkWallFunction/nutUSpaldingWallFunction/' 0/nut"
 arm ras_nutCalculatedWall   refused "no nut wall function"    "" "sed -i '/leftWall/,/}/ s/nutkWallFunction/calculated/' 0/nut"
@@ -750,6 +760,12 @@ if [ $HAVE_GPU = 1 ]; then
     # read as TRUE ran the whole flow where OpenFOAM skips it (interFoam.C:163-166), and a `runs` arm
     # could not tell that apart from a correct frozen run. Here a false spelling MUST reach the refusal.
     arm device_frozenFlow_n refused "solveFlow no" "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 1;\n    solveFlow       n;/' system/fvSolution"
+    # the HOST honours a per-equation `<field>Final` solver entry now (tests/interfoam_ras_dambreak_vs_openfoam.sh
+    # `splitSolve`, `splitSolveSST`); the DEVICE closure carries one tolerance, sweep count and iteration
+    # cap for both equations inside its kernels, so it refuses rather than run epsilon under kFinal's.
+    BASE="$BR"
+    arm device_splitSolve   refused "different solver settings" "-device" "python3 -c \"import re; p='system/fvSolution'; t=open(p).read(); t=re.sub(r'\\n\\}\\s*\\n\\s*PIMPLE', '\\n    epsilonFinal\\n    {\\n        solver smoothSolver;\\n        smoother symGaussSeidel;\\n        tolerance 1e-12;\\n        relTol 0;\\n        minIter 1;\\n        nSweeps 2;\\n    }\\n}\\n\\nPIMPLE', t, count=1); open(p,'w').write(t)\""
+    BASE="$B"
     # the device pressure step runs the non-orthogonal loop (laminar/damBreak `nonorth` holds it)
     arm device_nNonOrth1    runs    -                        "-device" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"
     arm device_mesh_dynamic refused "dynamicRefineFvMesh"     "-device" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"

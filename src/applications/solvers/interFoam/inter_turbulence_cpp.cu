@@ -116,17 +116,12 @@ void readClosureDivScheme(
         throw std::runtime_error(
             std::string(WHO) + "fvSchemes `div(" + fluxName + "," + field + ")` is neither `Gauss "
             "upwind` nor `Gauss limitedLinear <k>`, the two the closure carries.");
-    if (first)
-    {
-        t.closureLimitedLinear = fs.limited;
-        t.closureLimiterCoeff  = fs.limited ? fs.coeff : scalar(1);
-        return;
-    }
-    if (fs.limited != t.closureLimitedLinear
-     || (fs.limited && fs.coeff != t.closureLimiterCoeff))
-        throw std::runtime_error(
-            std::string(WHO) + "fvSchemes gives the closure's two equations different convection "
-            "schemes. This closure carries one flag for the pair, as `bounded` does.");
+    // ONE PER EQUATION. `fvm::div(phi, psi)` resolves `div(<flux>,<psi>)` by the FIELD's name, so
+    // `div(phi,k) Gauss upwind` beside `div(phi,epsilon) Gauss limitedLinear 1` is two different
+    // matrices in OpenFOAM. This used to set one pair and refuse a mismatch.
+    cpu::EqnDivScheme& d = first ? t.kDiv : t.secondDiv;
+    d.limitedLinear = fs.limited;
+    d.limiterCoeff  = fs.limited ? fs.coeff : scalar(1);
 }
 
 // grad(U), which the production GbyNu takes (kEpsilon.C:237, kOmegaSSTBase.C:520)
@@ -270,14 +265,13 @@ void requireSstWalls(
         if (!wall) continue;
         for (const PatchFieldData<scalar>* b : {nb, ob})
         {
-            const bool coeffsDiffer = (b->hasWfCmu && b->wfCmu != co.CmuWall)
-                                   || (b->hasWfKappa && b->wfKappa != co.kappa)
-                                   || (b->hasWfE && b->wfE != co.E);
-            if (coeffsDiffer)
-                throw std::runtime_error(
-                    std::string(WHO) + "wall patch `" + p.name + "` names wall-function coefficients "
-                    "other than Cmu 0.09, kappa 0.41, E 9.8. The kOmegaSST closure carries one set for "
-                    "every wall and this reader does not thread a patch's own through.");
+            // A PATCH'S OWN Cmu/kappa/E/beta1 ARE HONOURED NOW. OpenFOAM constructs
+            // `wallFunctionCoefficients` from the PATCH dictionary in every wall function
+            // (wallFunctionCoefficients.C:68-80), deriving yPlusLam from that patch's kappa and E, and
+            // omegaWallFunction reads its own beta1 there (omegaWallFunctionFvPatchScalarField.C:408).
+            // None of them is the model's. This refusal was OVER-STRICT: it stopped on a case OpenFOAM
+            // runs, while the reader already parsed the values, the patch fields already carried them
+            // and the kEpsilon closure already used them per patch.
             // THE TWO WALL FUNCTIONS HAVE DIFFERENT DEFAULTS, and this loop used to hold both to
             // omega's. nutkWallFunction is STEPWISE with n = 4
             // (nutkWallFunctionFvPatchScalarField.C:216); omegaWallFunction is BINOMIAL with n = 2
@@ -550,13 +544,12 @@ InterTurbulence readInterTurbulence(
                     "wall distance is ported as meshWave (patchDistMethods/meshWave) only.");
             // ...and the same again: {false,no,off} let `correctWalls 0;` through, and brae then ran
             // its always-correcting meshWave against OpenFOAM's uncorrected one with no message.
-            if (!wd->switchOr("correctWalls", true))
-                throw std::runtime_error(
-                    std::string(WHO) + "fvSchemes sets `wallDist { correctWalls "
-                    + wd->wordOr("correctWalls", "false") + "; }`; brae's meshWave always corrects the "
-                    "near-wall cells.");
+            // meshWavePatchDistMethod.C:59, default true. `false` skips patchWave's wall-cell override
+            // (patchWave.C:203), so those cells keep the wave's face-CENTRE distance. Refused until now.
+            t.wallDistCorrectWalls = wd->switchOr("correctWalls", true);
             t.wallDistUpdateInterval = static_cast<label>(wd->scalarOr("updateInterval", 1));
-            t.yCell = cellWallDist(*mesh, *geometry, patches);
+            t.yCell = cellWallDist(*mesh, *geometry, patches, nullptr, nullptr,
+                                   t.wallDistCorrectWalls);
         }
 
         // ...and PBiCG for k and omega too: the SST closure runs it now, as kEpsilon's has since
@@ -623,6 +616,27 @@ InterTurbulence readInterTurbulence(
     t.on = true;
     return t;
 }
+
+
+// ONE BUILDER for the second equation's solver setting, so the SST and kEpsilon branches cannot drift.
+// The closure takes k's positionally and this for epsilon/omega, because fvMatrix::solve() looks the
+// dictionary up by FIELD name and `kFinal` and `epsilonFinal` need not agree.
+namespace {
+EqnSolveSetting secondEqnSolve(
+    const SmoothLinearSolve& s)
+{
+    EqnSolveSetting e;
+    e.which.pbicgDILU = s.pbicgDILU();
+    e.which.smoothSolver = !e.which.pbicgDILU;
+    e.which.symmetric = (s.smoother == "symGaussSeidel");
+    e.which.nSweeps = s.nSweeps;
+    e.tol = s.tol;
+    e.relTol = s.relTol;
+    e.maxIter = s.maxIter;
+    e.minIter = s.minIter;
+    return e;
+}
+}   // namespace
 
 
 void validateInterTurbulence(
@@ -755,7 +769,7 @@ void moveInterTurbulence(
             std::string(WHO) + "fvSchemes sets `wallDist { updateInterval "
             + std::to_string(t.wallDistUpdateInterval) + "; }` on a moving mesh; only 1, the default, "
             "is ported.");
-    t.yCell = cellWallDist(m, g, patches);
+    t.yCell = cellWallDist(m, g, patches, nullptr, nullptr, t.wallDistCorrectWalls);
 }
 
 
@@ -836,13 +850,10 @@ void correctInterTurbulence(
             sstComp.omegaOO = &t.cn.epsOO;
         }
         const SmoothLinearSolve& ks = t.kSolveFinal;
-        const SmoothLinearSolve& os = t.omegaSolveFinal;
-        if (ks.solver != os.solver || ks.preconditioner != os.preconditioner
-         || ks.smoother != os.smoother || ks.tol != os.tol || ks.relTol != os.relTol
-         || ks.maxIter != os.maxIter || ks.minIter != os.minIter || ks.nSweeps != os.nSweeps)
-            throw std::runtime_error(
-                std::string(WHO) + "fvSolution gives kFinal and omegaFinal different solver settings; "
-                "the closure takes one set for both equations.");
+        // omegaFinal NEED NOT MATCH kFinal. fvMatrix::solve() looks the solver dictionary up by FIELD
+        // name, so OpenFOAM honours each; the closure takes k's positionally and omega's through
+        // EqnSolveSetting. This used to refuse the pair outright.
+        const EqnSolveSetting omegaSolve = secondEqnSolve(t.omegaSolveFinal);
         // THE SOLVER THE CASE NAMES. This said `smoothSolver = true` whatever fvSolution gave, so a
         // case naming PBiCG ran symGaussSeidel sweeps under PBiCG's tolerance -- the substitution the
         // kEpsilon branch below was fixed for, in the twin nobody looked at.
@@ -859,10 +870,11 @@ void correctInterTurbulence(
         res.captureStages = (std::getenv("BRAE_SST_DUMP_DIR") != nullptr);
         kOmegaSST::correct(*in.U, t.k, t.omega, t.nut, *in.phi, t.yCell, scalar(0), m, g, patches,
                            t.omegaRelaxFinal.factor, t.kRelaxFinal.factor, ks.tol, ks.relTol, ks.maxIter,
-                           t.sstCoeffs, &res, /*bounded=*/false, t.closureLimitedLinear,
-                           t.closureLimiterCoeff, /*linearUpwind=*/false,
+                           t.sstCoeffs, &res, /*bounded=*/false, t.kDiv.limitedLinear,
+                           t.kDiv.limiterCoeff, /*linearUpwind=*/false,
                            t.coeffs.correctedLaplacian, t.coeffs.snGradLimitCoeff, /*lm=*/nullptr,
-                           &sstComp, ks.minIter, t.omegaRelaxFinal.on, t.kRelaxFinal.on, &which);
+                           &sstComp, ks.minIter, t.omegaRelaxFinal.on, t.kRelaxFinal.on, &which,
+                           &omegaSolve, &t.secondDiv);
         // The assembled systems are WRITTEN BY THE CLOSURE (kOmegaSST_cpp.cu), at the call its stage
         // dump latched. This site wrote them on every call instead, so the files held the LAST
         // closure call while every other column in the directory held the first.
@@ -926,16 +938,11 @@ void correctInterTurbulence(
     sel.kind = &t.nutWallKind;
     sel.U = in.U;
 
-    // ONE solver entry for both equations is what kEpsilonRef::correct takes; the two Final entries
-    // are read separately and must agree. Every tutorial writes them as one regex key.
+    // epsilonFinal NEED NOT MATCH kFinal -- see the SST branch. Every shipped tutorial writes the two as
+    // one regex key, which is why the old refusal was never reached by a tutorial and why the profile
+    // that gates this one is staged.
     const SmoothLinearSolve& ks = t.kSolveFinal;
-    const SmoothLinearSolve& es = t.epsSolveFinal;
-    if (ks.solver != es.solver || ks.preconditioner != es.preconditioner
-     || ks.smoother != es.smoother || ks.tol != es.tol || ks.relTol != es.relTol
-     || ks.maxIter != es.maxIter || ks.minIter != es.minIter || ks.nSweeps != es.nSweeps)
-        throw std::runtime_error(
-            std::string(WHO) + "fvSolution gives kFinal and epsilonFinal different solver settings; "
-            "the closure takes one set for both equations.");
+    const EqnSolveSetting epsSolve = secondEqnSolve(t.epsSolveFinal);
     LinearSolverChoice which;
     which.pbicgDILU = ks.pbicgDILU();
     which.smoothSolver = !which.pbicgDILU;
@@ -982,8 +989,9 @@ void correctInterTurbulence(
                          // the limiter's gradient limiter is `t.coeffs.gradKLimitK`, which the closure
                          // reads from the coeffs it was handed -- this site used to pass a literal 0
                          // here and limited nothing (1.9e-01 off OpenFOAM, gated on RAS/damBreak)
-                         t.closureLimitedLinear, t.closureLimiterCoeff,
-                         ks.minIter, &sel, /*linearUpwind=*/false, /*luGradK=*/scalar(0), &which);
+                         t.kDiv.limitedLinear, t.kDiv.limiterCoeff,
+                         ks.minIter, &sel, /*linearUpwind=*/false, /*luGradK=*/scalar(0), &which,
+                         &epsSolve, &t.secondDiv);
     if (kd.on)
     {
         kd.scalars("epsD", res.epsD);     kd.scalars("epsSrc", res.epsSrc);

@@ -433,24 +433,56 @@ void correct(
     int                            minIter,
     bool                           relaxEquationOmega,
     bool                           relaxEquationK,
-    const LinearSolverChoice*      which)
+    const LinearSolverChoice*      which,
+    const EqnSolveSetting*         omegaSolve,
+    const EqnDivScheme*            omegaDiv)
 {
-    // the case's linear solver for both equations -- see the `which` parameter
-    auto solveScalar = [&](const FvScalarMatrix& A, std::vector<scalar>& psi)
+    // OMEGA'S OWN CONVECTION SCHEME, resolved ONCE so the assembly and the `bounded` term cannot read
+    // different answers. Absent it, omega's is k's -- what a caller that still refuses a mismatch means.
+    EqnDivScheme kDivS;
+    kDivS.bounded = bounded;
+    kDivS.limitedLinear = limitedLinear;
+    kDivS.limiterCoeff = limiterCoeff;
+    // EXPLICITLY FALSE, not left to the default: this closure does not assemble `Gauss linearUpwind`
+    // at all and refuses it by name, so there is no parameter to copy from. The kEpsilon twin builds
+    // the same struct from five parameters, and a reader of two builders that fill different subsets
+    // cannot tell "not applicable here" from "forgotten" -- which is what the defaults audit flagged.
+    kDivS.linearUpwind = false;
+    kDivS.luGradK = 0.0;
+    const EqnDivScheme oDiv = omegaDiv ? *omegaDiv : kDivS;
+    // THE CASE'S LINEAR SOLVER, PER EQUATION -- `which`/`tol`/... are k's, `omegaSolve` is omega's, and
+    // null means the caller has one setting for both. See the `omegaSolve` parameter.
+    auto solveWith = [&](const FvScalarMatrix&      A,
+                         std::vector<scalar>&       psi,
+                         const LinearSolverChoice*  w,
+                         scalar                     t,
+                         scalar                     rt,
+                         int                        mx,
+                         int                        mn)
     {
-        if (which && which->smoothSolver)
+        if (w && w->smoothSolver)
         {
-            return smoothSolver(A, psi, m, patches, which->symmetric, tol, relTol, maxIter, minIter,
-                                which->nSweeps);
+            return smoothSolver(A, psi, m, patches, w->symmetric, t, rt, mx, mn, w->nSweeps);
         }
         // `solver PBiCG; preconditioner DILU;` -- OpenFOAM's PBiCG, not PBiCGStab, which is a
         // different recurrence and stops somewhere else at the same tolerance. The kEpsilon twin has
         // carried this branch since waves/mangroveInteraction; this one fell through to PBiCGStab.
-        if (which && which->pbicgDILU)
+        if (w && w->pbicgDILU)
         {
-            return pbicgDILU(A, psi, m, patches, tol, relTol, maxIter, minIter);
+            return pbicgDILU(A, psi, m, patches, t, rt, mx, mn);
         }
-        return pbicgstab(A, psi, m, patches, tol, relTol, maxIter, minIter);
+        return pbicgstab(A, psi, m, patches, t, rt, mx, mn);
+    };
+    auto solveScalar = [&](const FvScalarMatrix& A, std::vector<scalar>& psi)
+    {
+        return solveWith(A, psi, which, tol, relTol, maxIter, minIter);
+    };
+    // omega's. kOmegaSSTBase solves omega FIRST and k second (kOmegaSSTBase.C:572 then :602).
+    auto solveSecond = [&](const FvScalarMatrix& A, std::vector<scalar>& psi)
+    {
+        return omegaSolve ? solveWith(A, psi, &omegaSolve->which, omegaSolve->tol, omegaSolve->relTol,
+                                      omegaSolve->maxIter, omegaSolve->minIter)
+                          : solveWith(A, psi, which, tol, relTol, maxIter, minIter);
     };
     if (co.F3)
         throw std::runtime_error(
@@ -647,15 +679,36 @@ void correct(
         const std::vector<scalar>& nutw = nutField.boundary[pi]->value();
         // mag(Uw.snGrad()), the wall patch's own (omegaWallFunctionFvPatchScalarField.C:253)
         const std::vector<vector> snUw = U.boundary[pi]->snGrad(U.internal);
+        // THIS PATCH'S OWN COEFFICIENTS. `wallFunctionCoefficients` is constructed from the PATCH
+        // dictionary in every wall function (wallFunctionCoefficients.C:68-80), with yPlusLam derived
+        // from that patch's kappa and E, and omegaWallFunction reads its own `beta1` there too
+        // (omegaWallFunctionFvPatchScalarField.C:404-409). None of them comes from the model dict. This
+        // loop used the model-wide values and the interFoam reader REFUSED any patch that named its own
+        // -- refusing a case OpenFOAM runs. The kEpsilon twin has read them per patch all along
+        // (kEpsilon_cpp.cu:443).
+        const WallFunctionCoeffs& owc = omega.boundary[pi]->wallCoeffs();
+        const scalar oCmu25 = std::pow(owc.Cmu, 0.25);
         for (label i = 0; i < wp.size; ++i)
         {
             const label c = wp.faceCells[i];
             const scalar w = 1.0 / nw[c], kc = k.internal[c];
-            const scalar omegaVis = 6.0*nuFace[i]/(co.beta1*yw[i]*yw[i]);
-            const scalar omegaLog = std::sqrt(kc)/(Cmu25*co.kappa*yw[i]);
+            // THE PARENTHESES ARE LOAD-BEARING. OpenFOAM is `6.0*nuw[facei]/(beta1_*sqr(y[facei]))`
+            // (omegaWallFunctionFvPatchScalarField.C:218-225), i.e. beta1*(y*y); brae had (beta1*y)*y,
+            // which is one ulp different on 5 of this fixture's 2268 cells. Reconstructed from
+            // OpenFOAM's own dumped y and nu over the 154 single-wall-face cells: beta1*(y*y) reproduces
+            // OpenFOAM on 154/154, (beta1*y)*y on 149/154. That ulp reaches the answer because the
+            // pinned wall omega feeds limitedLinear's r = gradcf/gradf, and at call one the two cells of
+            // one face are 3 and 4 ulp from equal, so the ratio is 0/0 in all but name: the limiter went
+            // 0.295 against OpenFOAM's clipped 1.0 on face 2405 and moved that row's diagonal by
+            // 2.3e-08. It showed up as 6.6e-09 of the first omega solve's normFactor -- the residual
+            // itself agreed to 4.1e-15 -- and only at `writePrecision 17`; at the tutorial's 15 the two
+            // omega values parse as identical.
+            const scalar omegaVis = 6.0*nuFace[i]/(owc.beta1*(yw[i]*yw[i]));
+            const scalar omegaLog = std::sqrt(kc)/(oCmu25*owc.kappa*yw[i]);
             const scalar magGradUw = mag(snUw[i]);
             om0[c] += w * std::sqrt(omegaVis*omegaVis + omegaLog*omegaLog);
-            G0[c]  += w * (nutw[i] + nuFace[i]) * magGradUw * Cmu25 * std::sqrt(kc) / (co.kappa * yw[i]);
+            G0[c]  += w * (nutw[i] + nuFace[i]) * magGradUw * oCmu25 * std::sqrt(kc)
+                        / (owc.kappa * yw[i]);
         }
     }
     std::vector<label> wallCells;
@@ -814,7 +867,7 @@ void correct(
                        ls::limitedLinearWeights(phi.internal, omega, go, limiterCoeff, m, g));
             sd.scalars("phiAsm", phi.internal);
         }
-        FvScalarMatrix M = divWithScheme(phi, omega, limitedLinear, limiterCoeff, m, g, patches,
+        FvScalarMatrix M = divWithScheme(phi, omega, oDiv.limitedLinear, oDiv.limiterCoeff, m, g, patches,
                                          co.gradKLimitK, co.gradKLeastSq, &sd, "omega");
         {
             // The laplacian with BOTH halves of `corrected`, then subtracted from the equation. The
@@ -860,7 +913,7 @@ void correct(
             M.source[c] -= V * std::fmin(sp2, 0.0) * omega.internal[c];
             // `bounded`: - Sp(fvc::div(phi), omega). Vanishes where phi is conservative, so it cannot
             // move a converged answer -- it is there to keep the transported scalar bounded on the way.
-            if (bounded) M.diag[c] -= divPhi[c] * V;
+            if (oDiv.bounded) M.diag[c] -= divPhi[c] * V;
         }
         // fvm::ddt(alpha, rho, omega_) under CrankNicolson: "ddt0(rho,omega)" is the equation's own
         if (cn)
@@ -925,7 +978,7 @@ void correct(
             sd.scalars("omIfc", res->omIfc);
             sd.scalars("omD0", res->omD0);     sd.scalars("omSrc0", res->omSrc0);
         }
-        const SolverPerformance po = solveScalar(M, omega.internal);
+        const SolverPerformance po = solveSecond(M, omega.internal);
         if (res)
         {
             res->omega = po.initialResidual;
@@ -1113,11 +1166,14 @@ void correctNutField(
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         if (patches[pi].type != "wall") continue;
+        // nutkWallFunction's own coefficients, from the nut PATCH's dictionary -- as the kEpsilon twin
+        // reads them (kEpsilon_cpp.cu:912)
+        const WallFunctionCoeffs& nwc = nutField.boundary[pi]->wallCoeffs();
         nutField.boundary[pi]->setValue(
             nutkWallFunction(patches[pi], yWall[pi], k.internal,
                              comp && comp->nuBnd ? (*comp->nuBnd)[pi]
                                                  : std::vector<scalar>(patches[pi].size, nu),
-                             co.CmuWall, co.kappa, co.E));
+                             nwc.Cmu, nwc.kappa, nwc.E));
     }
 
     // OpenFOAM assigns nut_ as a FIELD -- nut_ = a1*k/max(a1*omega, b1*F23*sqrt(S2)) -- and a field
