@@ -199,6 +199,36 @@ echo "== brae interFoam: what it refuses, and what it must not =="
 
 arm baseline                runs    -                        "" true
 
+# FROZEN PER-STEP BOUNDARY CONDITIONS. The shared factory ACCEPTS fixedMean, fanPressure,
+# codedFixedValue and codedMixed on the strength of a per-step update its own comment promises, and
+# interFoam maintains NONE of them -- no collectFixedMean, no collectFanPressure, no setupCodedBCs
+# anywhere in its tree. So such a patch was built from the file `value` and never touched again while
+# OpenFOAM's fixedMean rescales patchInternalField at every updateCoeffs
+# (fixedMeanFvPatchField.C) -- a SILENT frozen boundary, which is the defect class this project keeps
+# finding. simpleFoam and rhoSimpleFoam have called refuseFrozenPerStepBC at their read sites all
+# along; interFoam was the driver that did not. Each field's read site is guarded, so there is an arm
+# per field, and `baseline` above is the must-run opposite.
+arm frozen_fixedMean_alpha  refused "fixedMean"   "" "sed -i '0,/type  *zeroGradient;/s//type fixedMean; meanValue 0.5; value uniform 0.5;/' 0/alpha.water"
+arm frozen_fixedMean_U      refused "fixedMean"   "" "sed -i '0,/type  *noSlip;/s//type fixedMean; meanValue (0 0 0); value uniform (0 0 0);/' 0/U"
+arm frozen_fanPressure      refused "fanPressure" "" "sed -i '0,/type  *fixedFluxPressure;/s//type fanPressure; value uniform 0;/' 0/p_rgh"
+arm frozen_codedFixedValue  refused "codedFixedValue" "" "sed -i '0,/type  *zeroGradient;/s//type codedFixedValue; name f; value uniform 0.5;/' 0/alpha.water"
+
+# interpolationSchemes. interFoam NEVER READ THIS BLOCK -- zero references in its tree -- so brae
+# interpolated `linear` whatever the case named, with no throw and no notice. All 44 shipped tutorials
+# happen to say `linear`, which is why nothing ever showed it. `interp_linear` is the must-run opposite.
+arm interp_cubic            refused "interpolationSchemes"  "" "sed -i 's/^    default  *linear;/    default         cubic;/' system/fvSchemes"
+arm interp_midPoint         refused "interpolationSchemes"  "" "sed -i '/^interpolationSchemes/,/^}/s/default  *linear;/default         midPoint;/' system/fvSchemes"
+arm interp_linear           runs    -                       "" true
+
+# `phi <name>` ON A CLASS THAT DOES NOT READ ONE. fixedFluxPressure has NO phiName_ member in v2412
+# (its constructor reads the gradient and value entries and nothing else), so `phi phiAbs;` beside it is
+# dead text OpenFOAM ignores -- and three shipped tutorials write exactly that
+# (damBreakWithObstacle, oscillatingBox, motorBike). brae recorded the name for every patch field and
+# resolved it for every patch, refusing those cases over an entry OpenFOAM never reads. The opposite arm
+# is a class that DOES read one: inletOutlet carries phiName_, so a bad flux there must still refuse.
+arm flux_fixedFluxPressure_ignored runs    -      "" "sed -i '0,/type  *fixedFluxPressure;/s//type fixedFluxPressure; phi phiAbs;/' 0/p_rgh"
+arm flux_named_on_reader           refused "phiAbs" "" "sed -i '0,/type  *inletOutlet;/s//type inletOutlet; phi phiAbs;/' 0/alpha.water"
+
 # the mesh
 arm mesh_dynamicRefine      refused "dynamicRefineFvMesh"     "" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
 # dynamicMotionSolverFvMesh IS ported for a solidBody motion of the whole mesh; without a motionSolver

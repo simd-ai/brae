@@ -2911,7 +2911,18 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     if (f)
     {
         f->setWallCoeffs(WallFunctionCoeffs{d.wfCmu, d.wfKappa, d.wfE});
-        f->setFluxName(d.phiName);
+        // ...AND THE FLUX NAME ONLY FOR A CLASS THAT READS ONE. `fixedFluxPressure` has NO `phiName_`
+        // member at all in v2412: its dictionary constructor reads the gradient and value entries and
+        // nothing else (fixedFluxPressureFvPatchScalarField.C -- `readGradientEntry` / `readValueEntry`,
+        // and there is no `phiName` anywhere in its .H or .C). So a `phi <name>;` beside it is DEAD TEXT
+        // that OpenFOAM silently ignores, and three shipped tutorials write exactly that --
+        // laminar/damBreakWithObstacle, laminar/oscillatingBox and RAS/motorBike all carry
+        // `phi phiAbs;` on a fixedFluxPressure patch.
+        // brae recorded it for EVERY patch field and then resolved it for every patch, so
+        // `namedPatchFlux` refused those cases by name over an entry OpenFOAM never reads. That is
+        // brae refusing a case OpenFOAM runs, which is the mirror image of a silent substitution and
+        // just as wrong.
+        if (d.type != "fixedFluxPressure") f->setFluxName(d.phiName);
     }
     return f;
 }

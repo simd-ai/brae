@@ -1,6 +1,8 @@
 // interFoam's createFields -- see inter_case_cpp.cuh for the provenance and for the four things the
 // order of this file encodes.
 #include "inter_case_cpp.cuh"
+#include "frozen_bc_guard.cuh"
+#include <sstream>
 #include "crank_nicolson_ddt_scheme_cpp.cuh"
 #include "inter_peqn_cpp.cuh"
 #include "brae_notice.cuh"
@@ -419,6 +421,46 @@ void refuseUncorrectedOnSkewMesh(
 // normal's `nHat`), then `default`. Any other shape (cellMDLimited, faceLimited, pointCellsLeastSquares,
 // fourth, ...) is refused, because a gradient the case asks for and brae does not take is a different
 // discretisation that converges.
+// interpolationSchemes. interFoam NEVER READ THIS BLOCK -- zero references anywhere in its tree -- so
+// brae interpolated `linear` whatever the case named, with no throw and no notice. All 44 shipped
+// tutorials happen to say `linear`, which is why nothing ever showed; a case asking for `cubic`,
+// `midPoint`, `pointLinear` or a limited interpolation would have run a different scheme silently.
+// That is the defect class this project keeps finding, so it is a refusal and not a notice.
+// OpenFOAM's `fvc::interpolate` looks the entry up per field and falls back to `default`
+// (surfaceInterpolationScheme::New); brae implements `linear` alone.
+void refuseUnportedInterpolationSchemes(const std::string& fvSchemesText)
+{
+    const std::string blk = fvSchemesBlock(fvSchemesText, "interpolationSchemes");
+    if (blk.empty()) return;                    // absent is fine: OpenFOAM's own default is linear
+    std::istringstream is(blk);
+    std::string line;
+    while (std::getline(is, line))
+    {
+        // strip a trailing comment and the ';'
+        const std::size_t c = line.find("//");
+        if (c != std::string::npos) line = line.substr(0, c);
+        std::istringstream ls(line);
+        std::string key;
+        if (!(ls >> key)) continue;
+        if (key == "{" || key == "}" || key == "interpolationSchemes") continue;
+        std::string rest;
+        std::getline(ls, rest);
+        // the scheme is everything after the key, minus the semicolon and surrounding space
+        std::string sch;
+        for (char ch : rest) { if (ch != ';') sch += ch; }
+        const std::size_t b = sch.find_first_not_of(" \t");
+        const std::size_t e = sch.find_last_not_of(" \t");
+        if (b == std::string::npos) continue;
+        sch = sch.substr(b, e - b + 1);
+        if (sch.empty() || sch == "linear") continue;
+        throw std::runtime_error(
+            "brae interFoam: fvSchemes `interpolationSchemes` names `" + key + " " + sch
+            + "`. interFoam interpolates `linear` and nothing else; running this case would apply a "
+              "different interpolation from the one it asks for, silently. Refusing rather than "
+              "substituting.");
+    }
+}
+
 void refuseUnportedGradSchemes(const std::string& fvSchemesText)
 {
     const std::string blk = fvSchemesBlock(fvSchemesText, "gradSchemes");
@@ -723,6 +765,7 @@ InterFields buildInterFields(const std::string&          caseDir,
         f.snGradScheme = readNonOrthScheme(all, "snGradSchemes");
         refuseUncorrectedOnSkewMesh(f.laplacianScheme, f.snGradScheme, m, g);
         refuseUnportedGradSchemes(all);
+        refuseUnportedInterpolationSchemes(all);
         // each gradient by the name its call site asks for (fvc::grad(vf) -> `grad(<vf.name()>)`)
         auto choiceOf = [](const FieldGradScheme& s)
         {
@@ -1019,6 +1062,18 @@ InterFields buildInterFields(const std::string&          caseDir,
     // else: the shared factory refuses both type names, so no other solver can build one frozen.
     FieldData<scalar> alphaData = readField<scalar>(startDir + "/" + f.alphaName);
     FieldData<vector> UData = readField<vector>(startDir + "/U");
+    // THE FROZEN-BC GUARD, which interFoam did not have. The shared factory ACCEPTS fixedMean,
+    // fanPressure, codedFixedValue and codedMixed on the strength of a per-step update its own comment
+    // promises, and only some drivers keep that promise -- gpuPimpleFoam maintains all four,
+    // gpuSimpleFoam the coded pair. interFoam maintains NONE of them (no collectFixedMean, no
+    // collectFanPressure, no setupCodedBCs anywhere in this tree), so such a patch was built from the
+    // file `value` and never touched again: OpenFOAM's fixedMean rescales patchInternalField every
+    // updateCoeffs to hold the prescribed mean (fixedMeanFvPatchField.C), and brae held the file's
+    // value for the whole run with nothing said. simpleFoam and rhoSimpleFoam have called this guard
+    // at their read sites for exactly this reason; interFoam was the driver that did not.
+    // `codedMaintained = false`: interFoam has no NVRTC coded path of its own.
+    refuseFrozenPerStepBC(alphaData, f.alphaName, "interFoam", /*codedMaintained=*/false);
+    refuseFrozenPerStepBC(UData, "U", "interFoam", /*codedMaintained=*/false);
     f.waves = readInterWaves(caseDir, startDir, alphaData, UData, patches, f.g, f.alphaName);
     f.alpha1 = buildField<scalar>(alphaData, patches, nC);
     f.U = buildField<vector>(UData, patches, nC);
@@ -1031,7 +1086,9 @@ InterFields buildInterFields(const std::string&          caseDir,
             f.movingWallVelocityPatch[pi] = 1;
         }
     }
-    f.p_rgh  = buildField<scalar>(readField<scalar>(startDir + "/p_rgh"),          patches, nC);
+    const FieldData<scalar> prghData = readField<scalar>(startDir + "/p_rgh");
+    refuseFrozenPerStepBC(prghData, "p_rgh", "interFoam", /*codedMaintained=*/false);
+    f.p_rgh  = buildField<scalar>(prghData, patches, nC);
     f.alpha1.evaluateBoundary();
     f.U.evaluateBoundary();
     f.p_rgh.evaluateBoundary();
