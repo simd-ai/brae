@@ -856,12 +856,17 @@ int main(
         }
         else
         {
-            // `esd` again carries its own, and this one is stranger than the p_rgh number: 8.3271e-14
-            // against a wall reaching 8.0012e-02, i.e. 1.04e-12 relative -- just over the shared 1e-12.
-            // It is BIT-IDENTICAL across three stagings whose pressure fields differ (as shipped,
-            // solves pinned, gradient limiter off), so it does not follow the flux and is not solver
-            // noise; and brae's moved points are OpenFOAM's exactly (0.000e+00 of the mesh extent).
-            // NOT LOCALISED. movingWallVelocity on a rigid translation is the shape of it.
+            // `esd` CARRIES ITS OWN, and the cause is NAMED rather than open: movingWallVelocity
+            // subtracts two centres computed by DIFFERENT algorithms -- `face::centre` (face.C) for the
+            // OLD points and `primitiveMeshTools::makeFaceCentresAndAreas` (what `pp.faceCentres()`
+            // returns) for the CURRENT ones -- and those do not cancel even for a rigid translation,
+            // which is why OpenFOAM's Up here is -8.00119972000634672e-02 and not -0.08. brae computes
+            // BOTH with face::centre, so its difference cancels exactly: 8.3271e-14 on a wall reaching
+            // 8.0012e-02, i.e. 1.04e-12 relative, just over the shared 1e-12.
+            // THE FIX IS WRITTEN AND HELD BACK (inter_driver_cpp.cu says why): with the geometry's Cf in
+            // place this reads EXACTLY 0 on all 3792 faces at both steps and 20 of the 27 moving arms are
+            // unchanged or better -- but laminar/sloshingCylinder then goes from 1.3x to 7.5x its own
+            // measured one-ulp floor, so a second defect it was compensating has to be found first.
             const scalar wallFactor = (profile.rfind("esd", 0) == 0) ? scalar(2e-12) : scalar(1e-12);
             check("the moving walls carry OpenFOAM's velocity",
                   nWall > 0 && dWall <= wallFactor*wallScale);

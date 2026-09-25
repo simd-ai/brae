@@ -23,7 +23,19 @@ namespace {
 // that type, assigned as the patch's fixed value.
 //
 //     oldFc = face::centre(oldPoints)                 -- face::centre, not the mesh's Cf
-//     Up    = (faceCentres - oldFc)/deltaT            -- the new face::centre
+//     Up    = (pp.faceCentres() - oldFc)/deltaT       -- and the CURRENT one is the MESH's Cf, which is
+//                                                        a DIFFERENT algorithm from face::centre
+//
+// THOSE TWO CENTRES DO NOT CANCEL, not even for a rigid translation, and OpenFOAM's Up is not the
+// prescribed wall velocity because of it. `face::centre` (face.C) seeds its centroid at Zero and adds
+// every point, takes its triangle area from `(thisPoint - centre) ^ (nextPoint - centre)`, and ends in
+// `sumAc/(3*sumA)`; `primitiveMeshTools::makeFaceCentresAndAreas` seeds at `p[f[0]]`, takes the area
+// from `(nextPoint - thisPoint) ^ (fCentre - thisPoint)`, and ends in `(1/3)*sumAc/sumA`. Computing the
+// current centre with face::centre instead makes the difference cancel EXACTLY, which is the one thing
+// OpenFOAM does not do: MEASURED on RAS/electrostaticDeposition's metalSheet, brae's wall read
+// (0, 0, -8.00119971999802e-02) against OpenFOAM's (-8.7e-16, 0, -8.00119972000634e-02) -- 8.3271e-14
+// apart, TANGENTIAL to the face normal (so not the flux term), identical at step one and step two and
+// bit-identical across three stagings whose pressure fields differ.
 //     Un    = meshPhi_p/(magSf + VSMALL)
 //     Uwall = Up + n*(Un - (n & Up))
 //
@@ -49,6 +61,15 @@ void updateMovingWallVelocity(
         {
             const label facei = q.start + i;
             const vector oldFc = faceCentreOfPoints(m, facei, dyn.oldPoints());
+            // THE CURRENT CENTRE SHOULD BE g.Cf()[facei] -- see the header above -- and is not, yet.
+            // MEASURED with `g.Cf()[facei]` in its place: RAS/electrostaticDeposition's metalSheet goes
+            // from 8.3271e-14 to EXACTLY 0 on all 3792 faces at both steps, and of the 27 moving-gate
+            // arms 20 are unchanged or better and the wall is 0 or ~1e-16 on every one. It is HELD BACK
+            // because laminar/sloshingCylinder then reads alpha 1.5769e-09 where it read 2.7674e-10,
+            // against that case's OWN one-ulp control of 2.0913e-10 (OpenFOAM against itself, ten steps)
+            // -- 1.3x its noise floor before, 7.5x after. g.Cf() is NOT stale (probed: bit-identical to
+            // a freshly recomputed mesh-algorithm centre on every face), so the cylinder is a SECOND
+            // defect this one was compensating, and it has to be found before the faithful form lands.
             const vector newFc = faceCentreOfPoints(m, facei, m.points());
             const vector Up = (newFc - oldFc)/deltaT;
             const vector n = g.Sf()[facei]/q.magSf[i];
