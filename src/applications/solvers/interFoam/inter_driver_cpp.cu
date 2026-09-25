@@ -857,11 +857,19 @@ RunReport runInterFoam(
                     // never missed. Measured on damBreak with the atmosphere naming rhoPhi on U:
                     // alpha 2.5e-09 and U 2.2e-05 from OpenFOAM, from step two; on p_rgh alone 4.7e-10.
                     pushFluxToPatches(f, patches);
-                    // ...and the boundary with it. Dropping this was tried together with the reset in
-                    // alphaEqnStep: damBreak's alpha went thirty times further from OpenFOAM and
-                    // capillaryRise did not move, so the extra evaluations are load-bearing rather
-                    // than spurious.
-                    f.alpha1.evaluateBoundary();
+                    // ...and NOT the boundary. OpenFOAM's alphaEqnSubCycle.H ends at
+                    // `rho == alpha1*rho1 + alpha2*rho2` and evaluates alpha nowhere: the patch values
+                    // it leaves are whichever of the two things alphaEqn.H last did to them -- MULES's
+                    // own trailing correctBoundaryConditions (CMULESTemplates.C, mirrored at
+                    // mules_cpp.cu:750) when the relaxation did not run, and the relaxation's
+                    // ASSIGNMENT when it did. Evaluating here overwrote the second case, which made
+                    // the faithful assignment in alpha_eqn_cpp.cu inert: MEASURED on
+                    // RAS/electrostaticDeposition at step two, brae's patch value sat exactly on
+                    // OpenFOAM's own owner cell, 5.1256e-10 from the value OpenFOAM wrote, while the
+                    // CELLS agreed to 4.6e-16.
+                    // Dropping this was tried before and rejected, but BUNDLED with the reset in
+                    // alphaEqnStep and before the relaxation assigned: that experiment does not bear on
+                    // this line alone.
                     // ...and the conditions that look alpha up read the values THIS evaluate left
                     pushAlphaToPatches(f, patches);
                     break;

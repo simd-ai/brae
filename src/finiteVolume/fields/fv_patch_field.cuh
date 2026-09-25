@@ -56,8 +56,10 @@ public:
     virtual bool fixesValue() const = 0;
 
     // OpenFOAM fvPatchField::assignable() -- "may this patch's value be OVERWRITTEN by an assignment to
-    // the field?". Defaults true; false for the fixedValue, mixed and transform families
-    // (fvPatchField.H, fixedValueFvPatchField.H:169, mixed/, transform/).
+    // the field?". Defaults true; false for the fixedValue and mixed families
+    // (fvPatchField.H:193, fixedValueFvPatchField.H:169, mixedFvPatchField.H:200). NOT for the
+    // transform family: transformFvPatchField.H:120 answers TRUE, and symmetry, wedge and partialSlip
+    // inherit that. brae answers false on a symmetry plane and a wedge anyway -- see those classes.
     //
     // This is NOT the same question as fixesValue(), and conflating them is a silent error:
     //   * slip / partialSlip are NOT assignable but do NOT fix a value;
@@ -66,6 +68,24 @@ public:
     // constrainHbyA (simpleFoam/pEqn.H:3) branches on assignable(); adjustPhi (pEqn.H:6) branches on
     // fixesValue(). Using one for the other changes which patches keep U's boundary value in HbyA.
     virtual bool assignable() const { return true; }
+    // A DIFFERENT question from assignable(), and the one a whole-field ASSIGNMENT actually asks:
+    // does OpenFOAM's `operator=` write this patch's value? `alpha1 = 0.5*alpha1 + 0.5*alpha10`
+    // (VoF/alphaEqn.H:202) reaches each patch through its own VIRTUAL operator=:
+    // GeometricBoundaryField::operator= forwards to FieldField::operator=, which assigns element by
+    // element, and nothing on that path consults assignable() (GeometricBoundaryField.C). So what
+    // decides is whether the type inherits the EMPTY operator= of fixedValueFvPatchField.H:202-204 or
+    // mixedFvPatchField.H:303-305 -- a patch that does keeps whatever its last evaluate() left.
+    //
+    // Keying that on assignable() instead is wrong in both directions: a symmetry plane and a wedge
+    // answer false here in brae (deliberately -- see those classes) where OpenFOAM assigns them, and
+    // inletOutlet answers true while OpenFOAM's operator= is a re-blend rather than a copy
+    // (inletOutletFvPatchField.C:143-152; exact as a copy only because its valueFraction is
+    // 1 - pos0(phip), so 0 or 1). MEASURED on RAS/damBreakLeakage's host arm: keyed on assignable(),
+    // the faithful assignment skips the two symmetry patches entirely -- they take neither the average
+    // nor an evaluate -- and reads alpha 5.5577e-09 / U 4.5723e-06, the SAME number whichever patches
+    // are named, because that skip is common to every arm. Keyed here, the same case reads alpha
+    // 3.4528e-13 / U 4.9734e-12, which is the gate's own floor.
+    virtual bool ofAssignmentWritesValue() const { return true; }
     // constrainPressure's dispatch (OF: isA<updateablePatchTypes::updateableSnGrad>, constrainPressure.C:62).
     // Only fixedFluxPressure overrides; the setter on anything else is a wiring error, not a no-op.
     // alphaContactAngle: theta0 in DEGREES, or < 0 on any other patch. interfaceProperties'
@@ -435,6 +455,8 @@ public:
     }
     bool fixesValue() const override { return true; }
     bool assignable() const override { return false; }   // OF fixedValueFvPatchField.H:169
+    // OF fixedValueFvPatchField.H:202-204 -- operator= is declared and EMPTY
+    bool ofAssignmentWritesValue() const override { return false; }
     int  bcCategory() const override { return 1; }
 
     std::vector<T> gradientInternalCoeffs() const override        // -deltaCoeffs
@@ -1094,6 +1116,8 @@ class NoSlipPatchField : public fvPatchField<T>
 {
 public:
     bool assignable() const override { return false; }   // OF fixedValueFvPatchField.H:169
+    // OF noSlip derives fixedValue, whose operator= is EMPTY (fixedValueFvPatchField.H:202-204)
+    bool ofAssignmentWritesValue() const override { return false; }
     explicit NoSlipPatchField(const FvPatch& p) : fvPatchField<T>(p) {}
     // fixedValue's evaluate does NOT re-establish the value -- the field IS the value. Zeroing here
     // would discard whatever correctBoundaryVelocity just wrote.
@@ -1548,6 +1572,13 @@ class MixedPatchField : public ExtrapolatedValuePatchField<T>     // value() = r
 {
 public:
     bool assignable() const override { return false; }   // OF: mixed
+    // OF mixedFvPatchField.H:303-305 -- operator= is declared and EMPTY. INHERITED by outletInlet and
+    // by variableHeightFlowRate, which is the one alpha BC in the interFoam tutorials where this
+    // differs from an evaluate: on an outflow face its valueFraction is 0, so mixed's evaluate would
+    // return the cell value, and OpenFOAM instead keeps the POST-MULES one.
+    // inletOutlet overrides assignable() back to true AND overrides operator= (a re-blend that is a
+    // copy for a 0/1 valueFraction), so it does NOT inherit this false -- see its own class.
+    bool ofAssignmentWritesValue() const override { return false; }
     MixedPatchField(
         const FvPatch& p,
         bool uniform,
@@ -1857,6 +1888,10 @@ private:
 class PermeableAlphaPressureInletOutletVelocityPatchField : public MixedPatchField<vector>
 {
 public:
+    // OpenFOAM OVERRIDES operator= here too, so this does not inherit mixed's false
+    // (pressurePermeableAlphaInletOutletVelocityFvPatchVectorField.C): the assigned value is
+    // lerp(rhs, n*(n & rhs), valueFraction()) -- the normal component alone where the fraction is 1.
+    bool ofAssignmentWritesValue() const override { return true; }
     PermeableAlphaPressureInletOutletVelocityPatchField(
         const FvPatch& p,
         std::string alphaName,
@@ -2007,6 +2042,11 @@ template <typename T>
 class InletOutletPatchField : public MixedPatchField<T>   // value()/refValue = inletValue
 {
 public:
+    // OpenFOAM OVERRIDES operator= here, so this does NOT inherit mixed's false
+    // (inletOutletFvPatchField.C:143-152): value = valueFraction*refValue + (1-valueFraction)*rhs.
+    // That is a plain copy of the right-hand side exactly when valueFraction is 0 or 1, which it
+    // always is -- updateCoeffs sets it to 1 - pos0(phip). A fractional one would need the blend.
+    bool ofAssignmentWritesValue() const override { return true; }
     // TRUE, and this is NOT an oversight in OpenFOAM. mixedFvPatchField::assignable() is false
     // (mixedFvPatchField.H:200), but inletOutletFvPatchField OVERRIDES it back to true
     // (inletOutletFvPatchField.H:163-164) -- "True: this patch field is altered by assignment".
