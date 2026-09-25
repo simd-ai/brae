@@ -71,6 +71,25 @@ struct EqnDivScheme
     scalar luGradK       = 0.0;
 };
 
+// ONE EQUATION'S GRADIENT SCHEME, as `fvSchemes { gradSchemes }` gives it.
+//
+// `fvc::grad(vf)` resolves `grad(<vf>)` by the FIELD's name, so `grad(k) Gauss linear` beside
+// `grad(epsilon) cellLimited Gauss linear 1` are two different gradients and OpenFOAM computes each. The
+// kEpsilon and kOmegaSST references carried ONE pair of flags for both equations and every caller refused
+// a mismatch. `KEpsilonCoeffs::gradKLeastSq`/`gradKLimitK` remain K's, as they always were, and this is
+// the second equation's -- so no positional caller moves and no site can silently read the other field's.
+//
+// WHERE IT IS READ: the corrected laplacian's deferred correction takes grad(<field>) for the field it is
+// differencing; limitedLinear's limiter takes grad(<field>) of the field it limits; and under kOmegaSST
+// CDkOmega takes grad(k) AND grad(omega) in ONE expression (kOmegaSSTBase.C:548), which is why the two
+// have to be resolved separately rather than by one flag chosen per call.
+struct EqnGradScheme
+{
+    bool   leastSquares = false;
+    // the cellLimited coefficient, 0 meaning unlimited
+    scalar cellLimitK   = 0;
+};
+
 namespace limitedSchemes {
 
 // THE LIMITER MATH ITSELF, exposed rather than kept private to the .cu, because it is needed in TWO

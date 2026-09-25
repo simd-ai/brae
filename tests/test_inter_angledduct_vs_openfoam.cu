@@ -132,9 +132,12 @@ int main(
     const std::string logPath = argv[5];
     const std::string inactiveDir = argv[6];
     const bool water = (std::string(argv[7]) == "porousWater");
-    const bool porous = (std::string(argv[7]) == "porous") || water;
+    // `splitGrad`: grad(k) and grad(epsilon) name different schemes, which `fvc::grad` resolves by the
+    // FIELD's name. It is the shipped `porous` case plus those two entries, so it takes porous's bounds.
+    const bool splitGrad = (std::string(argv[7]) == "splitGrad");
+    const bool porous = (std::string(argv[7]) == "porous") || water || splitGrad;
     const Bounds& B = water ? POROUS_WATER : (porous ? POROUS : INACTIVE);
-    std::printf("  arm: %s\n", water ? "porousWater -- the duct started full of water, so rho is 1000 in the porous zone" : porous ? "porous -- as shipped" : "inactive -- the option switched off in both codes");
+    std::printf("  arm: %s\n", splitGrad ? "splitGrad -- grad(epsilon) leastSquares beside grad(k) Gauss linear" : water ? "porousWater -- the duct started full of water, so rho is 1000 in the porous zone" : porous ? "porous -- as shipped" : "inactive -- the option switched off in both codes");
 
     PrimitiveMesh m;
     m.read(caseDir + "/constant/polyMesh");
@@ -148,6 +151,19 @@ int main(
     check("brae ran the same number of steps", r.steps == nSteps);
     // THE PATH, not only the answer: a laminar run of this case also reaches the end
     check("brae ran the case turbulent", fin.turbulence.on);
+    if (splitGrad)
+    {
+        // WHAT WAS READ, per equation. Without this the arm would pass on a brae that resolved BOTH names
+        // through `default` and never saw the two literal keys -- which is exactly the collapse it holds.
+        std::printf("  SPLIT GRAD: k leastSquares %d limitK %.3g   |   epsilon leastSquares %d limitK %.3g\n",
+                    (int)fin.turbulence.kGrad.leastSquares, (double)fin.turbulence.kGrad.cellLimitK,
+                    (int)fin.turbulence.secondGrad.leastSquares, (double)fin.turbulence.secondGrad.cellLimitK);
+        check("brae read grad(k) as the case's own Gauss linear",
+              !fin.turbulence.kGrad.leastSquares && fin.turbulence.kGrad.cellLimitK == scalar(0));
+        check("...and grad(epsilon) as leastSquares", fin.turbulence.secondGrad.leastSquares);
+        check("...so the two differ, which is what this profile exists to run",
+              fin.turbulence.kGrad.leastSquares != fin.turbulence.secondGrad.leastSquares);
+    }
     check("...under kEpsilon, in the uniform lineage",
           fin.turbulence.model == InterRasModel::KEpsilon && !fin.turbulence.variableDensity);
     // THE PATH: one active option, a DarcyForchheimer on a proper part of the mesh
@@ -302,9 +318,16 @@ int main(
     const Diff dOffP = compare(readCells(inactiveDir + "/p_rgh"), ofPrgh);
     std::printf("  CONTROL: OpenFOAM with the option inactive against OpenFOAM with it, U relative %.4e, "
                 "p_rgh %.4e\n", (double)dOffU.rel(), (double)dOffP.rel());
-    check(porous ? "the porosity moves OpenFOAM's own U far more than brae is from it"
-                 : "...and so does switching it back on",
-          dOffU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)) && dOffU.rel() > scalar(1e-3));
+    check(splitGrad ? "the GRADIENT SPLIT moves OpenFOAM's own U far more than brae is from it -- `argv[6]` "
+                      "is the `porous` run, which is this same case with one `default` for both gradients, "
+                      "so the only difference between them is grad(epsilon)'s scheme. MEASURED: epsilon "
+                      "6.795e-03 over 27,870 of 28,000 cells, nut 8.547e-03, U 6.451e-04. On RAS/damBreak "
+                      "the same profile reads EXACTLY ZERO -- that case ships `Gauss linear orthogonal` and "
+                      "`upwind`, so no turbulence gradient is ever read -- which is why the fixture is here"
+          : porous ? "the porosity moves OpenFOAM's own U far more than brae is from it"
+                   : "...and so does switching it back on",
+          dOffU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14))
+       && dOffU.rel() > (splitGrad ? scalar(1e-5) : scalar(1e-3)));
 
     // THE DEVICE LOOP RUNS IT, at the same bounds
     int nDev = 0;
@@ -316,6 +339,26 @@ int main(
     if (nDev <= 0)
     {
         std::printf("  (no CUDA device: the device arm is not exercised)\n");
+    }
+    else if (splitGrad)
+    {
+        // THE DEVICE REFUSES A GRADIENT SPLIT, by name. Its closure carries ONE pair of gradient flags in
+        // the kernels (`sin.co`/`kin.co` are the model coefficients, whose gradKLeastSq/gradKLimitK are
+        // k's), so grad(epsilon) would be computed with grad(k)'s scheme. The host honours each.
+        InterFields dev;
+        bool named = false;
+        try
+        {
+            runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
+            std::printf("  FAIL the device arm RAN a case whose two turbulence gradients differ\n");
+            ++failures;
+        }
+        catch (const std::exception& e)
+        {
+            named = std::string(e.what()).find("one gradient for both equations") != std::string::npos;
+            std::printf("  device refusal: %s\n", e.what());
+        }
+        check("the device arm refuses the gradient split under its own name", named);
     }
     else
     {

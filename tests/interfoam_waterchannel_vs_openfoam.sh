@@ -232,6 +232,31 @@ PYEOF
     # of them comes from the model dictionary. brae's kOmegaSST closure used model-wide values and the
     # reader REFUSED any patch that named its own -- refusing a case OpenFOAM runs. Its control is the
     # `sst` run, which is the same case at the defaults.
+    # `splitGrad`: grad(k) and grad(omega) name DIFFERENT schemes. Under kOmegaSST this is the only arm
+    # that exercises CDkOmega, which is `(2*alphaOmega2)*(fvc::grad(k) & fvc::grad(omega))/omega`
+    # (kOmegaSSTBase.C:555-558) -- TWO independent lookups in ONE expression, which is why a single flag
+    # chosen per call cannot serve. This case also ships a `corrected` laplacian on a 13.7 deg
+    # non-orthogonal mesh, so the deferred non-orthogonal correction reads the gradients too.
+    #
+    # grad(k) is written explicitly as the case`s own `Gauss linear`, so one thing changes. MEASURED,
+    # OpenFOAM against OpenFOAM at this gate`s own end: omega 9.414e-02 over all 28,000 cells, nut
+    # 8.695e-02, k 6.269e-03; and the mirror direction omega 9.741e-02. The control is the `sst` run.
+    if [ "$profile" = splitGrad ]; then
+        python3 - "$C" <<'WGEOF' || { echo "FAIL: the splitGrad profile was not staged"; return 1; }
+import re, sys
+q = sys.argv[1] + "/system/fvSchemes"
+t = open(q).read()
+m = re.search(r"gradSchemes\s*\{([^}]*)\}", t)
+assert m, "no gradSchemes block"
+assert "grad(k)" not in m.group(1), "the tutorial names grad(k) already"
+t = t[:m.end(1)] + "    grad(k)         Gauss linear;\n    grad(omega)     leastSquares;\n" + t[m.end(1):]
+open(q, "w").write(t)
+WGEOF
+        grep -q "grad(omega)     leastSquares;" "$C/system/fvSchemes" \
+            && grep -q "grad(k)         Gauss linear;" "$C/system/fvSchemes" \
+            && grep -q "default         Gauss linear;" "$C/system/fvSchemes" \
+            || { echo "FAIL: the gradient split was not staged, or it changed the default too"; return 1; }
+    fi
     if [ "$profile" = wallCoeffs ]; then
         python3 - "$C" <<'WCEOF' || { echo "FAIL: the wallCoeffs profile was not staged"; return 1; }
 import re, sys
@@ -348,7 +373,7 @@ PYEOF
 
 rc=0
 for p in laminar sst nutPatches nutInletZeroGrad nutInletZero oneCorrector oneCorrectorLaminar \
-         limitedLinear pbicg correctWallsOff wallCoeffs; do
+         limitedLinear pbicg correctWallsOff wallCoeffs splitGrad; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_waterchannel_vs_openfoam: staging failed"; exit 1; }
@@ -388,6 +413,9 @@ grep -q "Solving for omega" "$W/laminar/log.interFoam" \
 # ...and the wall patch's OWN Cmu/kappa/E/beta1, whose control is the `sst` run at the defaults.
 "$BIN" "$W/wallCoeffs" "$W/wallCoeffs/0" "$W/wallCoeffs/$END" "$STEPS" \
        "$W/wallCoeffs/log.interFoam" "$W/laminar/$END" "$W/sst/$END" || rc=1
+# ...and the GRADIENT SPLIT, the only arm that exercises CDkOmega. Control: the `sst` run.
+"$BIN" "$W/splitGrad" "$W/splitGrad/0" "$W/splitGrad/$END" "$STEPS" \
+       "$W/splitGrad/log.interFoam" "$W/laminar/$END" "$W/sst/$END" || rc=1
 "$BIN" "$W/nutPatches" "$W/nutPatches/0" "$W/nutPatches/$END" "$STEPS" "$W/nutPatches/log.interFoam" \
        "$W/laminar/$END" "$W/sst/$END" || rc=1
 # the control is OpenFOAM's answer with the patch pinned at 0: nut 1.4e-05 away, a floor of 1e-6 (six

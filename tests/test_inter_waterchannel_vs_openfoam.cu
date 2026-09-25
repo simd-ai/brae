@@ -314,6 +314,19 @@ int main(
             patchBeta1Differs = true;
         }
     }
+    // ...and does it split the two turbulence gradients? Read from brae's own structs, so the assertion
+    // fires on exactly the cases that have the feature.
+    const bool gradSplit = fin.turbulence.kGrad.leastSquares != fin.turbulence.secondGrad.leastSquares
+                        || fin.turbulence.kGrad.cellLimitK   != fin.turbulence.secondGrad.cellLimitK;
+    if (gradSplit)
+    {
+        std::printf("  SPLIT GRAD: k leastSquares %d limitK %.3g   |   omega leastSquares %d limitK %.3g\n",
+                    (int)fin.turbulence.kGrad.leastSquares, (double)fin.turbulence.kGrad.cellLimitK,
+                    (int)fin.turbulence.secondGrad.leastSquares, (double)fin.turbulence.secondGrad.cellLimitK);
+        check("brae read grad(k) as the case's own Gauss linear",
+              !fin.turbulence.kGrad.leastSquares && fin.turbulence.kGrad.cellLimitK == scalar(0));
+        check("...and grad(omega) as leastSquares", fin.turbulence.secondGrad.leastSquares);
+    }
     if (patchBeta1Differs)
     {
         std::printf("  this case's omega wall patch names its OWN beta1 -- the host honours it, the "
@@ -331,7 +344,7 @@ int main(
     {
         std::printf("  (no CUDA device: the device refusal is not exercised)\n");
     }
-    else if (patchBeta1Differs)
+    else if (patchBeta1Differs || gradSplit)
     {
         // THE DEVICE REFUSES A PATCH `beta1`, and the condition is read from the CASE rather than passed
         // as a profile name: omegaWallFunction reads its own beta1 from the patch dictionary
@@ -343,15 +356,18 @@ int main(
         try
         {
             runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
-            std::printf("  FAIL the device arm RAN a case whose omega patch names its own beta1\n");
+            std::printf("  FAIL the device arm RAN a case it carries one setting for\n");
             ++failures;
         }
         catch (const std::exception& e)
         {
-            named = std::string(e.what()).find("its own omegaWallFunction coefficient") != std::string::npos;
+            const std::string w = e.what();
+            named = w.find(gradSplit ? "one gradient for both equations"
+                                     : "its own omegaWallFunction coefficient") != std::string::npos;
             std::printf("  device refusal: %s\n", e.what());
         }
-        check("the device arm refuses a patch beta1 under its own name", named);
+        check(gradSplit ? "the device arm refuses the gradient split under its own name"
+                        : "the device arm refuses a patch beta1 under its own name", named);
     }
     else
     {

@@ -435,7 +435,8 @@ void correct(
     bool                           relaxEquationK,
     const LinearSolverChoice*      which,
     const EqnSolveSetting*         omegaSolve,
-    const EqnDivScheme*            omegaDiv)
+    const EqnDivScheme*            omegaDiv,
+    const EqnGradScheme*           omegaGrad)
 {
     // OMEGA'S OWN CONVECTION SCHEME, resolved ONCE so the assembly and the `bounded` term cannot read
     // different answers. Absent it, omega's is k's -- what a caller that still refuses a mismatch means.
@@ -450,6 +451,13 @@ void correct(
     kDivS.linearUpwind = false;
     kDivS.luGradK = 0.0;
     const EqnDivScheme oDiv = omegaDiv ? *omegaDiv : kDivS;
+    // OMEGA'S OWN GRADIENT SCHEME; `co.gradKLeastSq`/`gradKLimitK` are k's. CDkOmega takes grad(k) AND
+    // grad(omega) in one expression (kOmegaSSTBase.C:548), so the two are resolved here, once, and every
+    // site below reads the one for the field it differentiates.
+    EqnGradScheme kGradS;
+    kGradS.leastSquares = co.gradKLeastSq;
+    kGradS.cellLimitK   = co.gradKLimitK;
+    const EqnGradScheme oGrad = omegaGrad ? *omegaGrad : kGradS;
     // THE CASE'S LINEAR SOLVER, PER EQUATION -- `which`/`tol`/... are k's, `omegaSolve` is omega's, and
     // null means the caller has one setting for both. See the `omegaSolve` parameter.
     auto solveWith = [&](const FvScalarMatrix&      A,
@@ -759,12 +767,16 @@ void correct(
     }
     std::vector<vector> gradK  = co.gradKLeastSq ? fvc::leastSquaresGrad(k.internal, kbv, m, g, patches)
                                                  : fvc::gaussGrad(k.internal, kbv, m, g, patches);
-    std::vector<vector> gradOm = co.gradKLeastSq ? fvc::leastSquaresGrad(omega.internal, obv, m, g, patches)
+    std::vector<vector> gradOm = oGrad.leastSquares ? fvc::leastSquaresGrad(omega.internal, obv, m, g, patches)
                                                  : fvc::gaussGrad(omega.internal, obv, m, g, patches);
+    // EACH FIELD BY ITS OWN SCHEME: this block limited both with k's coefficient.
     if (co.gradKLimitK > 0.0)
     {
         cellLimitGrad(gradK,  k,     co.gradKLimitK, m, g, patches);
-        cellLimitGrad(gradOm, omega, co.gradKLimitK, m, g, patches);
+    }
+    if (oGrad.cellLimitK > 0.0)
+    {
+        cellLimitGrad(gradOm, omega, oGrad.cellLimitK, m, g, patches);
     }
     // THE LIMITER'S OWN GRADIENT, dumped. CDkOmega is grad(k) & grad(omega) and grad(k) is exactly
     // zero while k is uniform, so CD matching says nothing about grad(omega) -- and grad(omega) is
@@ -860,7 +872,7 @@ void correct(
         {
             std::vector<std::vector<scalar>> ob(patches.size());
             for (std::size_t pi = 0; pi < patches.size(); ++pi) ob[pi] = omega.boundary[pi]->value();
-            const std::vector<vector> go = co.gradKLeastSq
+            const std::vector<vector> go = oGrad.leastSquares
                 ? fvc::leastSquaresGrad(omega.internal, ob, m, g, patches)
                 : fvc::gaussGrad(omega.internal, ob, m, g, patches);
             sd.scalars("omegaLimW",
@@ -868,7 +880,7 @@ void correct(
             sd.scalars("phiAsm", phi.internal);
         }
         FvScalarMatrix M = divWithScheme(phi, omega, oDiv.limitedLinear, oDiv.limiterCoeff, m, g, patches,
-                                         co.gradKLimitK, co.gradKLeastSq, &sd, "omega");
+                                         oGrad.cellLimitK, oGrad.leastSquares, &sd, "omega");
         {
             // The laplacian with BOTH halves of `corrected`, then subtracted from the equation. The
             // explicit correction goes into the LAPLACIAN's own source first, so the -1.0 below carries
@@ -878,9 +890,9 @@ void correct(
             {
                 std::vector<std::vector<scalar>> vb(patches.size());
                 for (std::size_t pi = 0; pi < patches.size(); ++pi) vb[pi] = omega.boundary[pi]->value();
-                std::vector<vector> gradVf = co.gradKLeastSq ? fvc::leastSquaresGrad(omega.internal, vb, m, g, patches)
+                std::vector<vector> gradVf = oGrad.leastSquares ? fvc::leastSquaresGrad(omega.internal, vb, m, g, patches)
                                                              : fvc::gaussGrad(omega.internal, vb, m, g, patches);   // grad(omega)'s own scheme
-                if (co.gradKLimitK > 0.0) cellLimitGrad(gradVf, omega.internal, vb, co.gradKLimitK, m, g, patches);
+                if (oGrad.cellLimitK > 0.0) cellLimitGrad(gradVf, omega.internal, vb, oGrad.cellLimitK, m, g, patches);
                 const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
                     Df, omega, gradVf, m, g, patches, snGradLimitCoeff);
                 for (label c = 0; c < nC; ++c) L.source[c] -= corr[c];
@@ -929,7 +941,7 @@ void correct(
             for (std::size_t pi = 0; pi < patches.size(); ++pi) ob[pi] = omega.boundary[pi]->value();
             std::vector<vector> gradVf = fvc::gaussGrad(omega.internal, ob, m, g, patches);
             // The gradient linearUpwind NAMES, where the caller resolved it (see luGradLimitK).
-            const scalar luK = (co.luGradLimitK >= 0.0) ? co.luGradLimitK : co.gradKLimitK;
+            const scalar luK = (co.luGradLimitK >= 0.0) ? co.luGradLimitK : oGrad.cellLimitK;
             if (luK > 0.0) cellLimitGrad(gradVf, omega.internal, ob, luK, m, g, patches);
             const std::vector<scalar> corr =
                 fvm::linearUpwindCorrection<scalar, vector>(phi.internal, gradVf, m, g);

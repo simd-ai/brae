@@ -651,6 +651,16 @@ void deviceCorrectInterTurbulence(
             throw std::runtime_error(
                 "brae interFoam (device): fvSchemes gives div(phi,k) and div(phi,omega) different "
                 "convection schemes; this closure carries one scheme for both equations.");
+        // ...and the GRADIENT of each equation, which this closure also carries as ONE pair: `sin.co` is
+        // t.sstCoeffs, whose gradKLeastSq/gradKLimitK are k's. The host honours grad(k) and grad(omega)
+        // separately (measured on RAS/waterChannel: giving grad(omega) its own scheme moves OpenFOAM's
+        // own omega 9.4e-02 over all 28,000 cells), so a mismatch is refused here rather than run under
+        // k's gradient.
+        if (t.kGrad.leastSquares != t.secondGrad.leastSquares
+         || t.kGrad.cellLimitK != t.secondGrad.cellLimitK)
+            throw std::runtime_error(
+                "brae interFoam (device): fvSchemes gives grad(k) and grad(omega) different schemes; "
+                "this closure carries one gradient for both equations.");
         sin.limitedLinear   = t.kDiv.limitedLinear;
         sin.limiterCoeff    = t.kDiv.limiterCoeff;
         // ...and the CONVECTION scheme, which this arm now RUNS. It was refused by name, and the
@@ -761,6 +771,12 @@ void deviceCorrectInterTurbulence(
         throw std::runtime_error(
             "brae interFoam (device): fvSchemes gives div(phi,k) and div(phi,epsilon) different "
             "convection schemes; this closure carries one scheme for both equations.");
+    // ...and the gradients, as the SST branch above: one pair in the kernels, so a mismatch is refused
+    if (t.kGrad.leastSquares != t.secondGrad.leastSquares
+     || t.kGrad.cellLimitK != t.secondGrad.cellLimitK)
+        throw std::runtime_error(
+            "brae interFoam (device): fvSchemes gives grad(k) and grad(epsilon) different schemes; "
+            "this closure carries one gradient for both equations.");
     kin.limitedLinear  = t.kDiv.limitedLinear;
     kin.limiterCoeff   = t.kDiv.limiterCoeff;
     // ...and the same for kEpsilon's device closure, which RUNS it now too. It was refused as

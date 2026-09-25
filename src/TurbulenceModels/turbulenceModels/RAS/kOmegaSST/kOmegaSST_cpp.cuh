@@ -308,7 +308,9 @@ void correct(
     // so `div(phi,k)` and `div(phi,omega)` may name different schemes. `bounded`/`limitedLinear`/
     // `limiterCoeff` above are k's; null here means ONE scheme for both. This closure does not assemble
     // `linearUpwind` at all and refuses it, so that half of EqnDivScheme stays false here.
-    const EqnDivScheme*            omegaDiv = nullptr);
+    const EqnDivScheme*            omegaDiv = nullptr,
+    // OMEGA'S OWN GRADIENT SCHEME; `co.gradKLeastSq`/`gradKLimitK` are k's. Null means ONE for both.
+    const EqnGradScheme*           omegaGrad = nullptr);
 
 } // namespace kOmegaSST
 } // namespace cpu

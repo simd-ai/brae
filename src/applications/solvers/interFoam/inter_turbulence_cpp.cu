@@ -145,7 +145,11 @@ template <class Coeffs>
 void readGradK(
     const std::string& caseDir,
     const std::string& second,
-    Coeffs& co)
+    Coeffs& co,
+    // K's too, filled here rather than re-derived: the DEVICE closure compares the two to decide whether
+    // it can run, and a comparison against a default-constructed struct is not a comparison.
+    cpu::EqnGradScheme& outK,
+    cpu::EqnGradScheme& outSecond)
 {
     const FieldGradScheme gk = parseFieldGradScheme(caseDir, "k");
     const FieldGradScheme ge = parseFieldGradScheme(caseDir, second);
@@ -156,12 +160,14 @@ void readGradK(
                 std::string(WHO) + "fvSchemes resolves a turbulence gradient to `" + q->raw
                 + "`, which the closure does not compute.");
     }
-    if (gk.leastSquares != ge.leastSquares || gk.cellLimitK != ge.cellLimitK)
-        throw std::runtime_error(
-            std::string(WHO) + "fvSchemes names different schemes for grad(k) (`" + gk.raw
-            + "`) and grad(" + second + ") (`" + ge.raw + "`); the closure carries one for both.");
+    // ONE PER EQUATION, and `co` keeps K's -- the closures take K positionally, as they always have, and
+    // the second field's through EqnGradScheme. This used to refuse a mismatch.
     co.gradKLeastSq = gk.leastSquares;
     co.gradKLimitK = gk.cellLimitK;
+    outK.leastSquares      = gk.leastSquares;
+    outK.cellLimitK        = gk.cellLimitK;
+    outSecond.leastSquares = ge.leastSquares;
+    outSecond.cellLimitK   = ge.cellLimitK;
 }
 
 // Which nut wall function each patch carries, read where the dictionary TYPE still exists, and held
@@ -490,7 +496,7 @@ InterTurbulence readInterTurbulence(
                 std::string(WHO) + file + " sets `F3 yes`. kOmegaSSTBase multiplies F23 by F3, which "
                 "changes the eddy-viscosity limiter and the production limiter; not ported.");
         readGradU(caseDir, t.sstCoeffs);
-        readGradK(caseDir, "omega", t.sstCoeffs);
+        readGradK(caseDir, "omega", t.sstCoeffs, t.kGrad, t.secondGrad);
         readClosureDivScheme(caseDir, "k", "phi", t, /*first=*/true);
         readClosureDivScheme(caseDir, "omega", "phi", t, /*first=*/false);
 
@@ -575,7 +581,7 @@ InterTurbulence readInterTurbulence(
     scalar omegaMinUnused = 0;
     readTurbulenceMinima(ras, t.coeffs.kMin, t.coeffs.epsilonMin, omegaMinUnused);
     readGradU(caseDir, t.coeffs);
-    readGradK(caseDir, "epsilon", t.coeffs);
+    readGradK(caseDir, "epsilon", t.coeffs, t.kGrad, t.secondGrad);
 
     // THE KEY CARRIES THE FLUX'S NAME: div(rhoPhi,k) in the variable lineage, div(phi,k) in the other
     const std::string flux = t.variableDensity ? "rhoPhi" : "phi";
@@ -910,7 +916,7 @@ void correctInterTurbulence(
                            t.kDiv.limiterCoeff, /*linearUpwind=*/false,
                            t.coeffs.correctedLaplacian, t.coeffs.snGradLimitCoeff, /*lm=*/nullptr,
                            &sstComp, ks.minIter, t.omegaRelaxFinal.on, t.kRelaxFinal.on, &which,
-                           &omegaSolve, &t.secondDiv);
+                           &omegaSolve, &t.secondDiv, &t.secondGrad);
         // The assembled systems are WRITTEN BY THE CLOSURE (kOmegaSST_cpp.cu), at the call its stage
         // dump latched. This site wrote them on every call instead, so the files held the LAST
         // closure call while every other column in the directory held the first.
@@ -1027,7 +1033,7 @@ void correctInterTurbulence(
                          // here and limited nothing (1.9e-01 off OpenFOAM, gated on RAS/damBreak)
                          t.kDiv.limitedLinear, t.kDiv.limiterCoeff,
                          ks.minIter, &sel, /*linearUpwind=*/false, /*luGradK=*/scalar(0), &which,
-                         &epsSolve, &t.secondDiv);
+                         &epsSolve, &t.secondDiv, &t.secondGrad);
     if (kd.on)
     {
         kd.scalars("epsD", res.epsD);     kd.scalars("epsSrc", res.epsSrc);

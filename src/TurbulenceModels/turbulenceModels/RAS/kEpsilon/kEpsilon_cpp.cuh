@@ -310,7 +310,11 @@ void correct(
     // schemes and OpenFOAM assembles two different matrices. `bounded`/`limitedLinear`/`limiterCoeff`/
     // `linearUpwind`/`luGradK` above are k's, as they always were; null here means the caller has ONE
     // scheme for both and says so, which is true of every caller that still carries the refusal.
-    const EqnDivScheme* epsDiv = nullptr);
+    const EqnDivScheme* epsDiv = nullptr,
+    // THE SECOND EQUATION'S OWN GRADIENT SCHEME -- epsilon's here. `fvc::grad(vf)` resolves `grad(<vf>)`
+    // by the FIELD's name, so `grad(k)` and `grad(epsilon)` need not agree. `co.gradKLeastSq` and
+    // `co.gradKLimitK` are K's; null here means the caller has ONE gradient for both and says so.
+    const EqnGradScheme* epsGrad = nullptr);
 
 } // namespace kEpsilonRef
 } // namespace cpu

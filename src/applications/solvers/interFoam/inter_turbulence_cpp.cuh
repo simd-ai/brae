@@ -141,6 +141,13 @@ struct InterTurbulence
     // the DEVICE closure carries one scheme for both equations in its kernels and still refuses.
     cpu::EqnDivScheme kDiv;
     cpu::EqnDivScheme secondDiv;
+    // grad(k) and grad(<second field>), ONE PER EQUATION. `fvc::grad(vf)` resolves `grad(<vf>)` by the
+    // FIELD's name, so the two need not agree; the closures carried one pair of flags and the reader
+    // refused a mismatch. Measured on RAS/angledDuct (44.5 deg non-orthogonal, `corrected` laplacian):
+    // giving grad(epsilon) leastSquares where grad(k) keeps Gauss linear moves OpenFOAM's own epsilon
+    // 6.8e-03 over 27,870 of 28,000 cells, and the mirror direction moves k 4.5e-02.
+    cpu::EqnGradScheme kGrad;
+    cpu::EqnGradScheme secondGrad;
     KEpsilonCoeffs coeffs;
     GeometricField<scalar> k;
     // kEpsilon's second scalar; empty under kOmegaSST

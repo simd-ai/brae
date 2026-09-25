@@ -261,7 +261,8 @@ void correct(
     scalar luGradK,
     const LinearSolverChoice* which,
     const EqnSolveSetting* epsSolve,
-    const EqnDivScheme* epsDiv)
+    const EqnDivScheme* epsDiv,
+    const EqnGradScheme* epsGrad)
 {
     if (linearUpwind && limitedLinear)
         throw std::runtime_error(
@@ -319,6 +320,12 @@ void correct(
     kDiv.linearUpwind = linearUpwind;
     kDiv.luGradK = luGradK;
     const EqnDivScheme eDiv = epsDiv ? *epsDiv : kDiv;
+    // EPSILON'S OWN GRADIENT SCHEME. `co.gradKLeastSq`/`gradKLimitK` are k's; absent a second spec they
+    // are epsilon's too, which is what every caller that still refuses a mismatch means.
+    EqnGradScheme kGrad;
+    kGrad.leastSquares = co.gradKLeastSq;
+    kGrad.cellLimitK   = co.gradKLimitK;
+    const EqnGradScheme eGrad = epsGrad ? *epsGrad : kGrad;
 
     // THE CASE'S LINEAR SOLVER, PER EQUATION. `fvMatrix::solve()` looks the dictionary up by FIELD name,
     // so `kFinal` and `epsilonFinal` may differ in every entry. `which`/`tol`/... are k's, as they always
@@ -544,8 +551,8 @@ void correct(
         }
 
         FvScalarMatrix M = divWithScheme(phi, epsilon, eDiv.limitedLinear, eDiv.limiterCoeff,
-                                         co.gradKLimitK, m, g, patches, eDiv.linearUpwind, eDiv.luGradK,
-                                         co.gradKLeastSq);
+                                         eGrad.cellLimitK, m, g, patches, eDiv.linearUpwind, eDiv.luGradK,
+                                         eGrad.leastSquares);
         if (res && res->captureStages)
         {
             captureSystem(M, patches, res->epsDivD, res->epsDivSrc, &res->epsDivUpper, &res->epsDivLower);
@@ -570,9 +577,9 @@ void correct(
                 std::vector<std::vector<scalar>> vb(patches.size());
                 for (std::size_t pi = 0; pi < patches.size(); ++pi) vb[pi] = epsilon.boundary[pi]->value();
                 // correctedSnGrad's correction takes grad(epsilon)'s own scheme (correctedSnGrad.C:52-55).
-                std::vector<vector> gradVf = co.gradKLeastSq ? fvc::leastSquaresGrad(epsilon.internal, vb, m, g, patches)
+                std::vector<vector> gradVf = eGrad.leastSquares ? fvc::leastSquaresGrad(epsilon.internal, vb, m, g, patches)
                                                              : fvc::gaussGrad(epsilon.internal, vb, m, g, patches);   // grad(epsilon)'s own scheme
-                if (co.gradKLimitK > 0.0) cellLimitGrad(gradVf, epsilon.internal, vb, co.gradKLimitK, m, g, patches);
+                if (eGrad.cellLimitK > 0.0) cellLimitGrad(gradVf, epsilon.internal, vb, eGrad.cellLimitK, m, g, patches);
                 const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
                     Df, epsilon, gradVf, m, g, patches, co.snGradLimitCoeff);
                 for (label c = 0; c < nC; ++c) L.source[c] -= corr[c];

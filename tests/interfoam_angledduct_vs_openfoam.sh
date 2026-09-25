@@ -114,6 +114,38 @@ stage()
         || { echo "FAIL: the tutorial no longer carries an explicitPorositySource"; return 1; }
     grep -q "type  *DarcyForchheimer;" "$C/constant/fvOptions" \
         || { echo "FAIL: the tutorial's porosity model is no longer DarcyForchheimer"; return 1; }
+    # `splitGrad`: grad(k) and grad(epsilon) name DIFFERENT schemes. `fvc::grad(vf)` resolves
+    # `grad(<vf>)` by the FIELD`s name, so the two are two different gradients and OpenFOAM computes each;
+    # brae`s closures carried ONE pair of flags and the reader REFUSED a mismatch.
+    #
+    # THIS TUTORIAL IS THE FIXTURE because of its MESH and its LAPLACIAN. The turbulence gradient is read
+    # on three paths: the corrected laplacian`s deferred non-orthogonal correction, limitedLinear`s limiter
+    # gradient, and (under kOmegaSST) CDkOmega. angledDuct ships `corrected` and its mesh is 44.5 deg
+    # non-orthogonal, so the first path is LIVE. RAS/damBreak ships `Gauss linear orthogonal` and `upwind`,
+    # so all three paths are dead there and the same profile reads EXACTLY ZERO on every field at every
+    # step -- measured, 0 of 2268 cells. Shearing damBreak does not help: `corrected()` is never requested.
+    #
+    # grad(k) IS WRITTEN EXPLICITLY, equal to the case`s own `default`, so the profile changes exactly one
+    # thing. MEASURED, OpenFOAM against OpenFOAM at this gate`s own end time: epsilon 6.795e-03 over
+    # 27,870 of 28,000 cells, nut 8.547e-03, k 5.024e-03, U 6.451e-04; and the MIRROR direction (k taking
+    # epsilon`s scheme) k 4.485e-02, epsilon 6.081e-02. The control is the `porous` run, which is this case
+    # with one `default` for both.
+    if [ "$profile" = splitGrad ]; then
+        python3 - "$C" <<'GRADEOF' || { echo "FAIL: the splitGrad profile was not staged"; return 1; }
+import re, sys
+q = sys.argv[1] + "/system/fvSchemes"
+t = open(q).read()
+m = re.search(r"gradSchemes\s*\{([^}]*)\}", t)
+assert m, "no gradSchemes block"
+assert "grad(k)" not in m.group(1), "the tutorial names grad(k) already"
+t = t[:m.end(1)] + "    grad(k)         Gauss linear;\n    grad(epsilon)   leastSquares;\n" + t[m.end(1):]
+open(q, "w").write(t)
+GRADEOF
+        grep -q "grad(epsilon)   leastSquares;" "$C/system/fvSchemes" \
+            && grep -q "grad(k)         Gauss linear;" "$C/system/fvSchemes" \
+            && grep -q "default         Gauss linear;" "$C/system/fvSchemes" \
+            || { echo "FAIL: the gradient split was not staged, or it changed the default too"; return 1; }
+    fi
     if [ "$profile" = inactive ] || [ "$profile" = inactiveWater ]; then
         sed -i 's/type  *explicitPorositySource;/&\n    active          no;/' "$C/constant/fvOptions"
         grep -q "active  *no;" "$C/constant/fvOptions" || { echo "FAIL: the option was not switched off"; return 1; }
@@ -151,7 +183,7 @@ PYEOF
 }
 
 rc=0
-for p in inactive porous inactiveWater porousWater; do
+for p in inactive porous inactiveWater porousWater splitGrad; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_angledduct_vs_openfoam: staging failed"; exit 1; }
@@ -168,6 +200,10 @@ grep -q "Porosity region porosity1" "$W/porous/log.interFoam" \
        "$W/inactive/$END" porous || rc=1
 "$BIN" "$W/porousWater" "$W/porousWater/0" "$W/porousWater/$END" "$STEPS" "$W/porousWater/log.interFoam" \
        "$W/inactiveWater/$END" porousWater || rc=1
+
+# ...and the GRADIENT SPLIT, whose control is the `porous` run: the same case with one `default` for both.
+"$BIN" "$W/splitGrad" "$W/splitGrad/0" "$W/splitGrad/$END" "$STEPS" "$W/splitGrad/log.interFoam" \
+       "$W/porous/$END" splitGrad || rc=1
 
 echo "interfoam_angledduct_vs_openfoam: rc $rc"
 exit $rc
