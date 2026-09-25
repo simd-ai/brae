@@ -9,19 +9,25 @@
 #include "device_amg_coarse.cuh"   // deviceCoarsePCG/JacobiSingleBlock internal decls (match defs here)
 #include "device_ldu.cuh"
 #include <cuda_runtime.h>
+#ifndef BRAE_ACPP
 #include <cooperative_groups.h>
+namespace cg = cooperative_groups;
+#endif
 #include <mutex>
 #include <cstddef>
-
-namespace cg = cooperative_groups;
+#include <cstdlib>
 
 namespace brae {
 
 namespace {
+#ifndef BRAE_ACPP
 // All nSweeps of coarse weighted-Jacobi in ONE cluster kernel. The coarse vector is held in distributed shared
 // memory: block 'rank' owns cells [rank*cpb, rank*cpb+myCount); a cell's SpMV reads neighbour values from the
 // owning sibling block via cluster.map_shared_rank. Ping-pong (rd/wr) gives proper Jacobi (all-old-x per sweep);
 // cluster.sync() between sweeps makes every block's update visible. Same arithmetic/order as deviceAmul+smoothK.
+//
+// Excluded from the ACPP build: thread-block clusters + DSM are Hopper/Blackwell-only, no PCUDA equivalent.
+// deviceCoarseFitsCluster() always returns false under ACPP, so vcycleAt never dispatches here.
 __global__
 void coarseJacobiFusedKernel(
     int nC,
@@ -87,11 +93,12 @@ void coarseJacobiFusedKernel(
         xc[base + i] = rd[i];
 #endif
 }
+#endif // !BRAE_ACPP
 
 // SINGLE-BLOCK coarsest Jacobi: the whole (tiny) coarse vector lives in shared memory, nSweeps of ping-pong Jacobi
 // with cheap __syncthreads() between them (NOT cluster.sync, the latter's per-sweep cost dominates at the high
 // sweep counts a well-solved coarsest needs). Same arithmetic as deviceAmul+smoothK. Used for nC <= SB_MAX.
-__global__
+__device__
 void coarseJacobiSingleBlockKernel(
     int nC,
     int nSweeps,
@@ -146,7 +153,7 @@ void coarseJacobiSingleBlockKernel(
 // whose error depends on the right-hand side, so M^-1 is no longer a fixed linear operator and the outer
 // Krylov method loses the premise it is built on. That the twin was converged and this one still counted
 // was the remainder of item 80. `nIters` is the CAP.
-__global__
+__device__
 void coarsePCGKernel(
     int nC,
     int nIters,
@@ -424,12 +431,26 @@ void coarseLUFactorKernel(
                 const scalar v = fabs(A[i*n + k]);
                 if (v > bv) { bv = v; bi = i; }
             }
+#ifdef BRAE_ACPP
+            // No warp-shuffle under PCUDA (see device_amg_detail.cuh's blockDot): the same argmax as a
+            // shared-memory tree reduction over the 32 lanes instead.
+            __shared__ scalar redV[32]; __shared__ int redI[32];
+            redV[tid] = bv; redI[tid] = bi;
+            __syncwarp();
+            for (int off = 16; off > 0; off >>= 1)
+            {
+                if (tid < off && redV[tid + off] > redV[tid]) { redV[tid] = redV[tid + off]; redI[tid] = redI[tid + off]; }
+                __syncwarp();
+            }
+            bv = redV[0]; bi = redI[0];
+#else
             for (int off = 16; off > 0; off >>= 1)
             {
                 const scalar ov = __shfl_down_sync(0xffffffffu, bv, off);
                 const int oi = __shfl_down_sync(0xffffffffu, bi, off);
                 if (ov > bv) { bv = ov; bi = oi; }
             }
+#endif
             if (tid == 0)
             {
                 shRow = bi;
@@ -534,6 +555,10 @@ void coarseLUSolveKernel(
 
 bool deviceCoarseFitsCluster(int nCoarse)
 {
+#ifdef BRAE_ACPP
+    (void)nCoarse;
+    return false;   // no thread-block-cluster support under ACPP (see the Phase 0 portability audit)
+#else
     static const bool clusterOK = []()
     {
         int v = 0, dev = 0;
@@ -544,8 +569,17 @@ bool deviceCoarseFitsCluster(int nCoarse)
     if (!clusterOK) return false;                                            // pre-Hopper: no cluster launch -> global-mem Jacobi fallback
     const int cpb = (nCoarse + CCL - 1) / CCL;
     return 2 * static_cast<std::size_t>(cpb) * sizeof(scalar) <= 99 * 1024;   // GB10 opt-in DSM/block
+#endif
 }
 
+#ifdef BRAE_ACPP
+void deviceCoarseJacobiFused(const DeviceLduView&, const DeviceBuffer<scalar>&, DeviceBuffer<scalar>&, int)
+{
+    // Unreachable under ACPP: deviceCoarseFitsCluster() always returns false above, so vcycleAt's dispatch
+    // never calls this. Exists only to satisfy the linker (see the BRAE_ACPP guard on coarseJacobiFusedKernel).
+    std::abort();
+}
+#else
 void deviceCoarseJacobiFused(
     const DeviceLduView& cv,
     const DeviceBuffer<scalar>& rc,
@@ -580,6 +614,7 @@ void deviceCoarseJacobiFused(
         "coarseJacobiFused");
     cudaCheck(cudaGetLastError(), "coarseJacobiFused launch");
 }
+#endif // !BRAE_ACPP
 
 // Single-block coarsest solve (nC <= SB_MAX): nSweeps of in-shared-memory ping-pong Jacobi, cheap __syncthreads.
 void deviceCoarseJacobiSingleBlock(
@@ -590,8 +625,16 @@ void deviceCoarseJacobiSingleBlock(
 {
     const int nC = cv.nCells;
     const std::size_t shBytes = 2 * static_cast<std::size_t>(nC) * sizeof(scalar);
-    coarseJacobiSingleBlockKernel<<<1, TPB, shBytes, cudaStreamPerThread>>>(nC, nSweeps, OMEGA,
-        rc.data(), cv.diag, cv.ownerStart, cv.nei, cv.upper, cv.losortStart, cv.losort, cv.owner, cv.lower, xc.data());
+    {
+        const int nSw = nSweeps; const scalar omega = OMEGA;
+        const scalar* rcd = rc.data(); const scalar* diag = cv.diag;
+        const label* ownerStart = cv.ownerStart; const label* nei = cv.nei; const scalar* upper = cv.upper;
+        const label* losortStart = cv.losortStart; const label* losort = cv.losort; const label* owner = cv.owner;
+        const scalar* lower = cv.lower; scalar* xcd = xc.data();
+        pcudaParallelFor(dim3(1), dim3(TPB), shBytes, cudaStreamPerThread, [=] __device__ () {
+            coarseJacobiSingleBlockKernel(nC, nSw, omega, rcd, diag, ownerStart, nei, upper,
+                                           losortStart, losort, owner, lower, xcd); });
+    }
     cudaCheck(cudaGetLastError(), "coarseJacobiSingleBlock launch");
 }
 
@@ -606,9 +649,22 @@ void deviceCoarsePCG(
 {
     const int nC = cv.nCells;
     const int bs = nC >= TPB ? TPB : ((nC + 31) / 32) * 32;     // warp-rounded, in [32, TPB]
+#ifdef BRAE_ACPP
+    // ACPP's blockDot (device_amg_detail.cuh) reduces across the WHOLE block via red[], not per-warp (no
+    // warp-shuffle under PCUDA), so it needs bs slots, not just bs/32.
+    const std::size_t shBytes = (5 * static_cast<std::size_t>(nC) + static_cast<std::size_t>(bs)) * sizeof(scalar);
+#else
     const std::size_t shBytes = (5 * static_cast<std::size_t>(nC) + 32) * sizeof(scalar);   // red[] needs <= bs/32 slots
-    coarsePCGKernel<<<1, bs, shBytes, cudaStreamPerThread>>>(nC, nIters,
-        rc.data(), cv.diag, cv.ownerStart, cv.nei, cv.upper, cv.losortStart, cv.losort, cv.owner, cv.lower, xc.data());
+#endif
+    {
+        const int nIt = nIters;
+        const scalar* rcd = rc.data(); const scalar* diag = cv.diag;
+        const label* ownerStart = cv.ownerStart; const label* nei = cv.nei; const scalar* upper = cv.upper;
+        const label* losortStart = cv.losortStart; const label* losort = cv.losort; const label* owner = cv.owner;
+        const scalar* lower = cv.lower; scalar* xcd = xc.data();
+        pcudaParallelFor(dim3(1), dim3(bs), shBytes, cudaStreamPerThread, [=] __device__ () {
+            coarsePCGKernel(nC, nIt, rcd, diag, ownerStart, nei, upper, losortStart, losort, owner, lower, xcd); });
+    }
     cudaCheck(cudaGetLastError(), "coarsePCG launch");
 }
 
@@ -684,7 +740,7 @@ void deviceCoarseJacobiLoop(
     for (int s = 0; s < nSweeps; ++s)
     {
         deviceAmul(cv, xc, Axc);
-        smoothT<scalar><<<nBlocks(nC),TPB>>>(nC, rc.data(), Axc.data(), cv.diag, xc.data());
+        smoothTLaunch<scalar>(nC, rc.data(), Axc.data(), cv.diag, xc.data());
     }
 }
 

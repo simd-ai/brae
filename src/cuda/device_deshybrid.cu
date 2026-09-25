@@ -3,13 +3,14 @@
 // deferred correction against brae's upwind matrix.
 #include "device_deshybrid.cuh"
 #include "device_scalar_transport.cuh"   // nBlocks/TPB (shared launch geometry)
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 
 namespace brae {
 
 namespace {
 
-__global__
+__device__
 void desSigmaKernel(
     int nC, const scalar* __restrict__ gradU, const scalar* __restrict__ V,
     const scalar* __restrict__ nut, scalar nu, DesHybridCoeffs co,
@@ -58,7 +59,7 @@ void desSigmaKernel(
 // weighted by bf = interpolate(sigma).
 //   linear      : linear_face - upwind_face = (w - pos0(phi))*(field[own] - field[nbr])
 //   linearUpwind: grad[upwind] . (Cf - C[upwind])
-__global__
+__device__
 void desFaceCorrKernel(
     int nIf, const label* __restrict__ own, const label* __restrict__ nei,
     const scalar* __restrict__ phi, const scalar* __restrict__ w, const scalar* __restrict__ sigma,
@@ -86,7 +87,7 @@ void desFaceCorrKernel(
     fc[f] = (scalar(1) - bf)*lin + bf*lu;
 }
 
-__global__
+__device__
 void desDivKernel(
     int nC, const label* __restrict__ ownerStart, const label* __restrict__ losort,
     const label* __restrict__ losortStart, const scalar* __restrict__ phi,
@@ -110,9 +111,14 @@ void deviceDesHybridSigma(int nC, const DeviceBuffer<scalar>& gradU, const Devic
 {
     sigma.resize(nC);
     if (nC == 0) return;
-    desSigmaKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), V.data(),
-                                         nut.size() ? nut.data() : nullptr, nu, co,
-                                         (delta && delta->size()) ? delta->data() : nullptr, sigma.data());
+    const scalar* gradUd = gradU.data();
+    const scalar* Vd = V.data();
+    const scalar* nutd = nut.size() ? nut.data() : nullptr;
+    const scalar* deltad = (delta && delta->size()) ? delta->data() : nullptr;
+    scalar* sigmad = sigma.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+        desSigmaKernel(nC, gradUd, Vd, nutd, nu, co, deltad, sigmad);
+    });
     cudaCheck(cudaGetLastError(), "desHybridSigma");
 }
 
@@ -126,13 +132,26 @@ void deviceDesHybridCorr(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiIn
     corr.resize(dm.nCells);
     if (dm.nCells == 0) return;
     DeviceBuffer<scalar> fc(nIf);
+    const scalar* phiIntd = phiInt.data();
+    scalar* fcd = fc.data();
     if (nIf > 0)
-        desFaceCorrKernel<<<nBlocks(nIf), TPB>>>(nIf, dm.owner.data(), dm.nei.data(), phiInt.data(),
-            dm.w.data(), sigma.data(), field.data(), gx.data(), gy.data(), gz.data(),
-            dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
-            dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(), fc.data());
-    desDivKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.ownerStart.data(), dm.losort.data(),
-        dm.losortStart.data(), phiInt.data(), fc.data(), corr.data());
+    {
+        const label* ownerd = dm.owner.data(); const label* neid = dm.nei.data();
+        const scalar* wd = dm.w.data(); const scalar* sigmad = sigma.data(); const scalar* fieldd = field.data();
+        const scalar* gxd = gx.data(); const scalar* gyd = gy.data(); const scalar* gzd = gz.data();
+        const scalar* dOwnXd = dm.dOwnX.data(); const scalar* dOwnYd = dm.dOwnY.data(); const scalar* dOwnZd = dm.dOwnZ.data();
+        const scalar* dNeiXd = dm.dNeiX.data(); const scalar* dNeiYd = dm.dNeiY.data(); const scalar* dNeiZd = dm.dNeiZ.data();
+        pcudaParallelFor(nBlocks(nIf), TPB, [=] __device__ () {
+            desFaceCorrKernel(nIf, ownerd, neid, phiIntd, wd, sigmad, fieldd, gxd, gyd, gzd,
+                              dOwnXd, dOwnYd, dOwnZd, dNeiXd, dNeiYd, dNeiZd, fcd);
+        });
+    }
+    const int nCells = dm.nCells;
+    const label* ownerStartd = dm.ownerStart.data(); const label* losortd = dm.losort.data(); const label* losortStartd = dm.losortStart.data();
+    scalar* corrd = corr.data();
+    pcudaParallelFor(nBlocks(nCells), TPB, [=] __device__ () {
+        desDivKernel(nCells, ownerStartd, losortd, losortStartd, phiIntd, fcd, corrd);
+    });
     cudaCheck(cudaGetLastError(), "desHybridCorr");
 }
 

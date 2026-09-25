@@ -19,8 +19,11 @@
 // This does NOT make brae bit-reproducible on its own. There are ~68 other atomicAdd sites, most of them
 // scatter-accumulates into per-cell arrays (out[own[f]] += ...), which are order-dependent for the same reason.
 // What this fixes is the reduction that the convergence test reads.
+//
+// Kernels' static __shared__ arrays work the same as __device__ functions here as they did as __global__.
 #include <map>
 #include "device_blas.cuh"
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 #include <atomic>
 #include <chrono>
@@ -61,7 +64,7 @@ inline void ensureRedScratch()
 }
 
 
-__global__
+__device__
 void dotKernel(const scalar* __restrict__ x, const scalar* __restrict__ y, scalar* result, int n)
 {
     __shared__ scalar sdata[TPB];
@@ -78,7 +81,7 @@ void dotKernel(const scalar* __restrict__ x, const scalar* __restrict__ y, scala
 }
 
 
-__global__
+__device__
 void sumMagKernel(const scalar* __restrict__ x, scalar* result, int n)
 {
     __shared__ scalar sdata[TPB];
@@ -206,7 +209,10 @@ scalar deviceDot(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y)
 {
     const int n = static_cast<int>(x.size());
     ensureRedScratch();
-    reduceInto([&](int nb, scalar* part){ dotKernel<<<nb, TPB>>>(x.data(), y.data(), part, n); }, n, g_redDev);
+    reduceInto([&](int nb, scalar* part){
+        const scalar* xd = x.data(); const scalar* yd = y.data();
+        pcudaParallelFor(nb, TPB, [=] __device__ () { dotKernel(xd, yd, part, n); });
+    }, n, g_redDev);
     cudaCheck(cudaGetLastError(), "dot");
     cudaCheck(cudaMemcpy(g_redPinned, g_redDev, sizeof(scalar), cudaMemcpyDeviceToHost), "dot result");
     return *g_redPinned;
@@ -217,7 +223,7 @@ scalar deviceDot(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y)
 // sum and dot already exist, but the Courant NUMBER is a maximum, and a maximum cannot be assembled
 // from them. Kept as ratio-of-two-arrays rather than max(x) so the division happens in the same pass
 // and no per-cell ratio array is ever materialised.
-__global__
+__device__
 void maxRatioKernel(const scalar* __restrict__ x, const scalar* __restrict__ y, scalar* result, int n)
 {
     __shared__ scalar sdata[TPB];
@@ -239,7 +245,10 @@ scalar deviceMaxRatio(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>&
     if (n == 0 || (int)y.size() < n) return 0;
     ensureRedScratch();
     cudaCheck(cudaMemsetAsync(g_redDev, 0, sizeof(scalar), cudaStreamPerThread), "maxratio zero");
-    maxRatioKernel<<<nBlocks(n), TPB>>>(x.data(), y.data(), g_redDev, n);
+    const scalar* xd = x.data();
+    const scalar* yd = y.data();
+    scalar* result = g_redDev;
+    pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { maxRatioKernel(xd, yd, result, n); });
     cudaCheck(cudaGetLastError(), "maxratio");
     cudaCheck(cudaMemcpy(g_redPinned, g_redDev, sizeof(scalar), cudaMemcpyDeviceToHost), "maxratio result");
     return *g_redPinned;
@@ -250,7 +259,10 @@ scalar deviceSumMag(const DeviceBuffer<scalar>& x)
 {
     const int n = static_cast<int>(x.size());
     ensureRedScratch();
-    reduceInto([&](int nb, scalar* part){ sumMagKernel<<<nb, TPB>>>(x.data(), part, n); }, n, g_redDev);
+    reduceInto([&](int nb, scalar* part){
+        const scalar* xd = x.data();
+        pcudaParallelFor(nb, TPB, [=] __device__ () { sumMagKernel(xd, part, n); });
+    }, n, g_redDev);
     cudaCheck(cudaGetLastError(), "summag");
     cudaCheck(cudaMemcpy(g_redPinned, g_redDev, sizeof(scalar), cudaMemcpyDeviceToHost), "summag result");
     return *g_redPinned;
@@ -261,7 +273,10 @@ scalar deviceSumMag(const DeviceBuffer<scalar>& x)
 void deviceDotInto(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y, scalar* dResult)
 {
     const int n = static_cast<int>(x.size());
-    reduceInto([&](int nb, scalar* part){ dotKernel<<<nb, TPB>>>(x.data(), y.data(), part, n); }, n, dResult);
+    reduceInto([&](int nb, scalar* part){
+        const scalar* xd = x.data(); const scalar* yd = y.data();
+        pcudaParallelFor(nb, TPB, [=] __device__ () { dotKernel(xd, yd, part, n); });
+    }, n, dResult);
     cudaCheck(cudaGetLastError(), "dotInto");
 }
 
@@ -330,7 +345,10 @@ void deviceMinMaxMeanInto(const DeviceBuffer<scalar>& x, scalar* dOut3)
 void deviceSumMagInto(const DeviceBuffer<scalar>& x, scalar* dResult)
 {
     const int n = static_cast<int>(x.size());
-    reduceInto([&](int nb, scalar* part){ sumMagKernel<<<nb, TPB>>>(x.data(), part, n); }, n, dResult);
+    reduceInto([&](int nb, scalar* part){
+        const scalar* xd = x.data();
+        pcudaParallelFor(nb, TPB, [=] __device__ () { sumMagKernel(xd, part, n); });
+    }, n, dResult);
     cudaCheck(cudaGetLastError(), "summagInto");
 }
 
@@ -450,6 +468,7 @@ void publishValuesKernel(
 // same rule the other device caches here follow). thread_local rather than one global because the stream
 // it publishes on is cudaStreamPerThread -- one mailbox per stream is what keeps two host threads' reads
 // from overwriting each other's values and sequence number.
+#ifndef BRAE_ACPP
 ValueMailbox* valueMailbox(ValueMailbox** devPtr)
 {
     thread_local ValueMailbox* box = nullptr;
@@ -469,7 +488,9 @@ ValueMailbox* valueMailbox(ValueMailbox** devPtr)
     *devPtr = boxDev;
     return box;
 }
+#endif // !BRAE_ACPP
 
+#ifndef BRAE_ACPP
 // The spin, bounded. Past two seconds it falls back to the stream sync and, if the number still has not
 // arrived, throws: a wedge is reported, never waited on forever. Same bound as the momentum mailbox.
 // `what` names the caller, so the message says which read gave up.
@@ -497,6 +518,7 @@ void waitForMailboxSequence(
     // reads of value[] after its read of seq (the host is an aarch64 here, which reorders loads).
     std::atomic_thread_fence(std::memory_order_acquire);
 }
+#endif // !BRAE_ACPP
 
 // BRAE_READ_SCALAR_SYNC=1 restores the blocking copies: an escape hatch for measuring the two against
 // each other and for a machine whose host spin behaves badly. Both paths return the same bits.
@@ -510,6 +532,9 @@ bool readScalarSync()
 // on. That machine takes the blocking copy and is told why, rather than failing to allocate.
 bool readScalarUsesMailbox()
 {
+#ifdef BRAE_ACPP
+    return false;   // mapped-pinned-memory host spin has no PCUDA equivalent; always the blocking copy
+#else
     static const bool on = []()
     {
         if (readScalarSync()) return false;
@@ -520,6 +545,7 @@ bool readScalarUsesMailbox()
         return canMap != 0;
     }();
     return on;
+#endif
 }
 
 void announceReadScalarMode()
@@ -572,6 +598,9 @@ void readValues(
         cudaCheck(cudaStreamSynchronize(cudaStreamPerThread), "readValues sync");
         return;
     }
+#ifndef BRAE_ACPP
+    // readScalarUsesMailbox() is always false under ACPP (see above), so everything past this point is
+    // unreachable there -- mapped-pinned-memory host spin + stream-capture query, neither PCUDA-supported.
     // A capture cannot be spun on: the publish kernel would be recorded into the graph instead of run, so
     // the host would wait out the two seconds for a number nobody is going to write. The blocking copy
     // this replaced failed outright under capture, so naming the situation here loses nothing.
@@ -612,6 +641,7 @@ void readValues(
             std::memcpy(values[i].hDst, &bits, sizeof(scalar));
         }
     }
+#endif // !BRAE_ACPP
 }
 
 } // namespace
@@ -639,12 +669,17 @@ scalar deviceReadScalar(const scalar* dSrc)
 
 void deviceReadScalarWaitProbe()
 {
+#ifdef BRAE_ACPP
+    throw std::runtime_error("brae: deviceReadScalarWaitProbe is a mailbox-timeout diagnostic with no "
+                              "PCUDA equivalent (mapped-pinned-memory host spin); not available under ACPP.");
+#else
     ValueMailbox* boxDev = nullptr;
     ValueMailbox* box = valueMailbox(&boxDev);
     (void)boxDev;
     // A number no publish kernel will ever carry, and none is launched: the wait has to give up on the
     // clock, not on the queue. The read counter is untouched, so reads after this one still work.
     waitForMailboxSequence(box, ~0ull, "deviceReadScalar");
+#endif
 }
 
 } // namespace brae

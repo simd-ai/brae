@@ -7,13 +7,14 @@
 // Incompressible (tr(D)=div(U)->0): nut = Ck*sqrt(2*Ck/Ce)*delta^2*sqrt(S:S), the classic Cs~0.168 Smagorinsky.
 #include "device_smagorinsky.cuh"
 #include "device_scalar_transport.cuh"  // nBlocks/TPB (shared launch geometry)
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 
 namespace brae {
 
 namespace {
 
-__global__
+__device__
 void smagorinskyNutKernel(
     int nC, const scalar* __restrict__ gradU, const scalar* __restrict__ V,
     SmagorinskyCoeffs co, const scalar* __restrict__ dOpt, scalar* __restrict__ nut)
@@ -54,7 +55,7 @@ namespace {
 //     nut       = Ck*delta*sqrt(k)
 // gradU is packed q = 3i + j = d(U_j)/d(x_i), which is OF's own tensor layout, so (A & B)[i][j] is
 // sum_k A[i][k]*B[k][j] on the same indices.
-__global__
+__device__
 void waleNutKernel(
     int nC, const scalar* __restrict__ gradU, const scalar* __restrict__ V,
     WaleCoeffs co, const scalar* __restrict__ dOpt, scalar* __restrict__ nut)
@@ -101,8 +102,11 @@ void deviceWaleNut(int nC, const DeviceBuffer<scalar>& gradU, const DeviceBuffer
 {
     nut.resize(nC);
     if (nC == 0) return;
-    waleNutKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), V.data(), co,
-        (delta && delta->size()) ? delta->data() : nullptr, nut.data());
+    const scalar* gradUd = gradU.data();
+    const scalar* Vd = V.data();
+    const scalar* deltad = (delta && delta->size()) ? delta->data() : nullptr;
+    scalar* nutd = nut.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { waleNutKernel(nC, gradUd, Vd, co, deltad, nutd); });
     cudaCheck(cudaGetLastError(), "deviceWaleNut");
 }
 
@@ -113,8 +117,11 @@ void deviceSmagorinskyNut(int nC, const DeviceBuffer<scalar>& gradU, const Devic
 {
     nut.resize(nC);
     if (nC == 0) return;
-    smagorinskyNutKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), V.data(), co,
-        (delta && delta->size()) ? delta->data() : nullptr, nut.data());
+    const scalar* gradUd = gradU.data();
+    const scalar* Vd = V.data();
+    const scalar* deltad = (delta && delta->size()) ? delta->data() : nullptr;
+    scalar* nutd = nut.data();
+    pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { smagorinskyNutKernel(nC, gradUd, Vd, co, deltad, nutd); });
     cudaCheck(cudaGetLastError(), "deviceSmagorinskyNut");
 }
 

@@ -19,7 +19,9 @@
 #include <vector>
 
 #include <chrono>
-#include <nvtx3/nvToolsExt.h>
+#ifndef BRAE_ACPP
+#include <nvtx3/nvToolsExt.h>   // profiling only (BRAE_PHASE_NVTX); no PCUDA equivalent, see phaseRange()
+#endif
 namespace brae {
 namespace gpu {
 namespace rhoSimple {
@@ -470,6 +472,9 @@ bool phaseNvtxOn()
 int g_nvtxDepth = 0;
 void phaseRange(const char* name)
 {
+#ifdef BRAE_ACPP
+    (void)name;   // NVTX has no PCUDA equivalent; BRAE_PHASE_NVTX is a no-op under ACPP
+#else
     if (!phaseNvtxOn()) return;
     if (g_nvtxDepth > 0)
     {
@@ -481,6 +486,7 @@ void phaseRange(const char* name)
         nvtxRangePushA(name);
         ++g_nvtxDepth;
     }
+#endif
 }
 // charge the time since the last mark to `slot` (null = start the clock), then restart it
 void phaseMark(double* slot)
@@ -918,9 +924,14 @@ Residuals rhoSimpleStep(
     // is not a property anyone has guaranteed. The key below covers every pointer this file can SEE;
     // it cannot cover the ones inside assembleUEqn. So the correctness evidence is end-to-end
     // bit-identity, and the production version needs the workspace.
+#ifdef BRAE_ACPP
+    const bool captureAsm = false;   // CUDA-graph capture has no PCUDA equivalent; always the direct path
+#else
     static const bool captureAsm = std::getenv("BRAE_CAPTURE_ASSEMBLY") != nullptr;
+#endif
     if (captureAsm)
     {
+#ifndef BRAE_ACPP
         struct AsmGraph
         {
             cudaGraph_t g = nullptr;
@@ -983,6 +994,9 @@ Residuals rhoSimpleStep(
                 }
             }
         }
+#else
+        assembleUEqn(UEqn, dm, dbU, f.Ux, f.Uy, f.Uz, uin);   // unreachable: captureAsm is always false above
+#endif
     }
     else
     {

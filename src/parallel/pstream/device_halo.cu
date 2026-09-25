@@ -1,6 +1,7 @@
 // brae DeviceHalo, NVSHMEM on-stream halo exchange (see device_halo.cuh). Pack/scatter are plain CUDA
 // kernels; the transfer is the host on-stream put + barrier, so no relocatable device code is needed.
 #include "device_halo.cuh"
+#include "pcuda_compat.cuh"
 #ifdef BRAE_WITH_NVSHMEM
 #include <nvshmem_host.h>
 #endif
@@ -10,7 +11,7 @@ namespace {
 constexpr int TPB = 128;
 
 // sendRegion[f] = psi[faceCells[f]]  (gather the interface's own boundary values)
-__global__
+__device__
 void packKernel(
     const scalar* __restrict__ psi,
     const label*  __restrict__ faceCells,
@@ -24,7 +25,7 @@ void packKernel(
 // result[faceCells[f]] -= coeff[f] * recvRegion[f]  (the coupled-interface off-diagonal, OF A.psi convention).
 // atomicAdd because a cell may own several faces on the SAME interface (multiple cut faces to one neighbour),
 // so distinct threads can target the same result cell -- exactly like device_spmv's cyclicAmulKernel.
-__global__
+__device__
 void scatterKernel(
     scalar*       __restrict__ result,
     const label*  __restrict__ faceCells,
@@ -38,7 +39,7 @@ void scatterKernel(
 
 // bvalOut[f] = w[f]*psi[faceCells[f]] + (1 - w[f])*recvRegion[f]  (the coupled processor-face boundary value).
 // bvalOut points at bval + procStart[i], so each interface writes its slice of the flattened boundary array.
-__global__
+__device__
 void bvalKernel(
     const scalar* __restrict__ psi,
     const label*  __restrict__ faceCells,
@@ -102,11 +103,14 @@ void DeviceHalo::postExchange(
     const int nI = static_cast<int>(nbr_.size());
     for (int i = 0; i < nI; ++i)
         if (size_[i] > 0)
-            packKernel<<<(size_[i] + TPB - 1) / TPB, TPB, 0, stream>>>(
-                psi_d,
-                faceCellsD_[i].data(),
-                sendBuf_.data() + recvOffset_[i],
-                static_cast<int>(size_[i]));
+        {
+            const label* fc = faceCellsD_[i].data();
+            scalar* sb = sendBuf_.data() + recvOffset_[i];
+            const int n = static_cast<int>(size_[i]);
+            pcudaParallelFor((n + TPB - 1) / TPB, TPB, 0, stream, [=] __device__ () {
+                packKernel(psi_d, fc, sb, n);
+            });
+        }
 #ifdef BRAE_WITH_NVSHMEM
     for (int i = 0; i < nI; ++i)
         if (size_[i] > 0)
@@ -143,12 +147,14 @@ void DeviceHalo::updateInterfaceMatrix(
     cudaStream_t stream)
 {
     if (size_[i] > 0)
-        scatterKernel<<<(size_[i] + TPB - 1) / TPB, TPB, 0, stream>>>(
-            result_d,
-            faceCellsD_[i].data(),
-            coeff_d,
-            recvBuf_.data() + recvOffset_[i],
-            static_cast<int>(size_[i]));
+    {
+        const label* fc = faceCellsD_[i].data();
+        const scalar* rb = recvBuf_.data() + recvOffset_[i];
+        const int n = static_cast<int>(size_[i]);
+        pcudaParallelFor((n + TPB - 1) / TPB, TPB, 0, stream, [=] __device__ () {
+            scatterKernel(result_d, fc, coeff_d, rb, n);
+        });
+    }
 }
 
 void DeviceHalo::scatterBoundaryValues(
@@ -162,13 +168,14 @@ void DeviceHalo::scatterBoundaryValues(
     for (int i = 0; i < nI; ++i)
     {
         if (size_[i] <= 0) continue;
-        bvalKernel<<<(size_[i] + TPB - 1) / TPB, TPB, 0, stream>>>(
-            psi_d,
-            faceCellsD_[i].data(),
-            weights[i].data(),
-            recvBuf_.data() + recvOffset_[i],
-            bval_d + procStart[i],
-            static_cast<int>(size_[i]));
+        const label* fc = faceCellsD_[i].data();
+        const scalar* wd = weights[i].data();
+        const scalar* rb = recvBuf_.data() + recvOffset_[i];
+        scalar* bo = bval_d + procStart[i];
+        const int n = static_cast<int>(size_[i]);
+        pcudaParallelFor((n + TPB - 1) / TPB, TPB, 0, stream, [=] __device__ () {
+            bvalKernel(psi_d, fc, wd, rb, bo, n);
+        });
     }
 }
 

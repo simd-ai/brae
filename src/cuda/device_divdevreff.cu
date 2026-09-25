@@ -3,6 +3,7 @@
 #include "device_kepsilon.cuh"   // deviceCellLimitGradU (the named grad(U) scheme)
 #include "stage_dump.cuh"   // sigma comparison against OF (ACMI trace)
 #include "device_blas.cuh"
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -13,7 +14,7 @@ inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 
 
 // sigma = nuEff * dev2(transpose(gradU)) per cell. T(gradU)_ij = g[j][i]; dev2 subtracts (2/3)tr on diag.
-__global__
+__device__
 void sigmaKernel(
     int n,
     const scalar* __restrict__ gradU,
@@ -65,7 +66,7 @@ struct BndSnGradView
 // 1/2 (fixedValue/calculated) keep the base formula, which is what OF uses for them. 5 is mixed. 8 is
 // COUPLED, and OF's correction skips coupled patches outright (`if (!coupled())`), so the face keeps the
 // extrapolated cell gradient.
-__global__
+__device__
 void gradBKernel(
     int nB,
     const label* __restrict__ fc,
@@ -146,7 +147,7 @@ inline BndSnGradView snGradView(const DeviceBoundary& db)
 
 
 // tensor divergence gathered per cell: divSig_j = (1/V)[ sum_faces (Sf & sigma_face)_j ].
-__global__
+__device__
 void tensorDivKernel(
     int nC,
     const label* __restrict__ ownerStart,
@@ -249,11 +250,18 @@ void deviceBoundaryGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
             deviceBCValue(dbU.comp[i], *Uc[i], *ub[i]);
     }
     gradB.resize(static_cast<std::size_t>(9) * nB);
-    gradBKernel<<<nBlocks(nB), TPB>>>(nB, dm.bndCell.data(), dm.bndGFace.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
-                                      gradU.data(), nC, uxb.data(), uyb.data(), uzb.data(), Ux.data(), Uy.data(), Uz.data(),
-                                      dbU.comp[0].deltaCoeffs.data(),
-                                      snGradView(dbU.comp[0]), snGradView(dbU.comp[1]), snGradView(dbU.comp[2]),
-                                      gradB.data());
+    {
+        const label *bndCelld = dm.bndCell.data(), *bndGFaced = dm.bndGFace.data();
+        const scalar *Sfxd = dm.Sfx.data(), *Sfyd = dm.Sfy.data(), *Sfzd = dm.Sfz.data();
+        const scalar *gradUd = gradU.data(), *uxbd = uxb.data(), *uybd = uyb.data(), *uzbd = uzb.data();
+        const scalar *Uxd = Ux.data(), *Uyd = Uy.data(), *Uzd = Uz.data(), *dcd = dbU.comp[0].deltaCoeffs.data();
+        const BndSnGradView bx = snGradView(dbU.comp[0]), by = snGradView(dbU.comp[1]), bz = snGradView(dbU.comp[2]);
+        scalar* gradBd = gradB.data();
+        pcudaParallelFor(nBlocks(nB), TPB, [=] __device__ () {
+            gradBKernel(nB, bndCelld, bndGFaced, Sfxd, Sfyd, Sfzd, gradUd, nC, uxbd, uybd, uzbd, Uxd, Uyd, Uzd, dcd,
+                        bx, by, bz, gradBd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "boundaryGradU");
 }
 
@@ -266,10 +274,19 @@ void deviceTensorDivSource(const DeviceMesh& dm,
     srcX.resize(nC);
     srcY.resize(nC);
     srcZ.resize(nC);
-    tensorDivKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), dm.owner.data(),
-                                          dm.nei.data(), dm.w.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
-                                          dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndGFace.data(), dm.bndIsEmpty.data(),
-                                          Tcell.data(), Tbnd.data(), nB, dm.V.data(), srcX.data(), srcY.data(), srcZ.data());
+    {
+        const label *ownerStart = dm.ownerStart.data(), *losort = dm.losort.data(), *losortStart = dm.losortStart.data();
+        const label *own = dm.owner.data(), *nei = dm.nei.data();
+        const scalar *wd = dm.w.data(), *Sfxd = dm.Sfx.data(), *Sfyd = dm.Sfy.data(), *Sfzd = dm.Sfz.data();
+        const label *bndCellStart = dm.bndCellStart.data(), *bndPerm = dm.bndPerm.data();
+        const label *bndGFace = dm.bndGFace.data(), *bndIsEmpty = dm.bndIsEmpty.data();
+        const scalar *Tcelld = Tcell.data(), *Tbndd = Tbnd.data(), *Vd = dm.V.data();
+        scalar *srcXd = srcX.data(), *srcYd = srcY.data(), *srcZd = srcZ.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            tensorDivKernel(nC, ownerStart, losort, losortStart, own, nei, wd, Sfxd, Sfyd, Sfzd,
+                            bndCellStart, bndPerm, bndGFace, bndIsEmpty, Tcelld, Tbndd, nB, Vd, srcXd, srcYd, srcZd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "tensorDivSource");
     if (cyc) interfaceAddTensorDiv(*cyc, Tcell, nC, srcX, srcY, srcZ);
     if (ami) interfaceAddTensorDiv(*ami, Tcell, nC, srcX, srcY, srcZ);
@@ -418,21 +435,34 @@ void deviceDivDevReff(
     // sigma cell
     DeviceBuffer<scalar>& sigmaC = ws.sigmaC;
     sigmaC.resize(static_cast<std::size_t>(9) * nC);
-    sigmaKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), nuCell.data(), sigmaC.data());
+    {
+        const scalar *gradUd = gradU.data(), *nuCelld = nuCell.data(); scalar* sigmaCd = sigmaC.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () { sigmaKernel(nC, gradUd, nuCelld, sigmaCd); });
+    }
     cudaCheck(cudaGetLastError(), "ddr sigmaC");
 
     // boundary gradient + sigma boundary
     DeviceBuffer<scalar>& gradB = ws.gradB;
     gradB.resize(static_cast<std::size_t>(9) * nB);
-    gradBKernel<<<nBlocks(nB), TPB>>>(nB, dm.bndCell.data(), dm.bndGFace.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
-                                      gradU.data(), nC, uxb.data(), uyb.data(), uzb.data(), Ux.data(), Uy.data(), Uz.data(),
-                                      /* bnd deltaCoeffs */ dbU.comp[0].deltaCoeffs.data(),
-                                      snGradView(dbU.comp[0]), snGradView(dbU.comp[1]), snGradView(dbU.comp[2]),
-                                      gradB.data());
+    {
+        const label *bndCelld = dm.bndCell.data(), *bndGFaced = dm.bndGFace.data();
+        const scalar *Sfxd = dm.Sfx.data(), *Sfyd = dm.Sfy.data(), *Sfzd = dm.Sfz.data();
+        const scalar *gradUd = gradU.data(), *uxbd = uxb.data(), *uybd = uyb.data(), *uzbd = uzb.data();
+        const scalar *Uxd = Ux.data(), *Uyd = Uy.data(), *Uzd = Uz.data(), *dcd = dbU.comp[0].deltaCoeffs.data();
+        const BndSnGradView bx = snGradView(dbU.comp[0]), by = snGradView(dbU.comp[1]), bz = snGradView(dbU.comp[2]);
+        scalar* gradBd = gradB.data();
+        pcudaParallelFor(nBlocks(nB), TPB, [=] __device__ () {
+            gradBKernel(nB, bndCelld, bndGFaced, Sfxd, Sfyd, Sfzd, gradUd, nC, uxbd, uybd, uzbd, Uxd, Uyd, Uzd, dcd,
+                        bx, by, bz, gradBd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "ddr gradB");
     DeviceBuffer<scalar>& sigmaB = ws.sigmaB;
     sigmaB.resize(static_cast<std::size_t>(9) * nB);
-    sigmaKernel<<<nBlocks(nB), TPB>>>(nB, gradB.data(), nuBnd.data(), sigmaB.data());
+    {
+        const scalar *gradBd = gradB.data(), *nuBndd = nuBnd.data(); scalar* sigmaBd = sigmaB.data();
+        pcudaParallelFor(nBlocks(nB), TPB, [=] __device__ () { sigmaKernel(nB, gradBd, nuBndd, sigmaBd); });
+    }
     cudaCheck(cudaGetLastError(), "ddr sigmaB");
 
     // Processor faces: OVERWRITE the sigmaB just computed from dev2(T(gradB)). A cut face is interior to the
@@ -472,10 +502,19 @@ void deviceDivDevReff(
     srcX.resize(nC);
     srcY.resize(nC);
     srcZ.resize(nC);
-    tensorDivKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), dm.owner.data(),
-                                          dm.nei.data(), dm.w.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
-                                          dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndGFace.data(), dm.bndIsEmpty.data(),
-                                          sigmaC.data(), sigmaB.data(), nB, dm.V.data(), srcX.data(), srcY.data(), srcZ.data());
+    {
+        const label *ownerStart = dm.ownerStart.data(), *losort = dm.losort.data(), *losortStart = dm.losortStart.data();
+        const label *own = dm.owner.data(), *nei = dm.nei.data();
+        const scalar *wd = dm.w.data(), *Sfxd = dm.Sfx.data(), *Sfyd = dm.Sfy.data(), *Sfzd = dm.Sfz.data();
+        const label *bndCellStart = dm.bndCellStart.data(), *bndPerm = dm.bndPerm.data();
+        const label *bndGFace = dm.bndGFace.data(), *bndIsEmpty = dm.bndIsEmpty.data();
+        const scalar *sigmaCd = sigmaC.data(), *sigmaBd = sigmaB.data(), *Vd = dm.V.data();
+        scalar *srcXd = srcX.data(), *srcYd = srcY.data(), *srcZd = srcZ.data();
+        pcudaParallelFor(nBlocks(nC), TPB, [=] __device__ () {
+            tensorDivKernel(nC, ownerStart, losort, losortStart, own, nei, wd, Sfxd, Sfyd, Sfzd,
+                            bndCellStart, bndPerm, bndGFace, bndIsEmpty, sigmaCd, sigmaBd, nB, Vd, srcXd, srcYd, srcZd);
+        });
+    }
     cudaCheck(cudaGetLastError(), "ddr tensorDiv");
     if (cyc) interfaceAddTensorDiv(*cyc, sigmaC, nC, srcX, srcY, srcZ);   // + cyclic-face stress flux (V*fvc::div)
     if (ami) interfaceAddTensorDiv(*ami, sigmaC, nC, srcX, srcY, srcZ);      // + AMI-face stress flux

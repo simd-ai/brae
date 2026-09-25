@@ -4,6 +4,7 @@
 // Sign convention matches device_fvm.cu: off-diagonal ifCoeff is added in Amul as Apsi[own]+=ifCoeff*psi[nbr];
 // diag[own] -= ifCoeff (Laplacian) / += max(phi,0) (upwind convection).
 #include "device_cyclic.cuh"
+#include "pcuda_compat.cuh"
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -12,7 +13,7 @@ constexpr int TPB = 256;
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 
 
-__global__
+__device__
 void laplKernel(
     int n,
     const label* __restrict__ own,
@@ -35,7 +36,7 @@ void laplKernel(
 }
 
 
-__global__
+__device__
 void convKernel(
     int n,
     const label* __restrict__ own,
@@ -55,7 +56,7 @@ void convKernel(
 }
 
 
-__global__
+__device__
 void momKernel(
     int n,
     const label* __restrict__ own,
@@ -84,7 +85,7 @@ void momKernel(
 }
 
 
-__global__
+__device__
 void addHKernel(
     int n,
     const label* __restrict__ own,
@@ -101,7 +102,7 @@ void addHKernel(
 }
 
 
-__global__
+__device__
 void offSumKernel(
     int n,
     const label* __restrict__ own,
@@ -115,7 +116,7 @@ void offSumKernel(
 }
 
 
-__global__
+__device__
 void fluxKernel(
     int n,
     const label* __restrict__ own,
@@ -139,7 +140,7 @@ void fluxKernel(
 }
 
 
-__global__
+__device__
 void divAddKernel(
     int n,
     const label* __restrict__ own,
@@ -154,7 +155,7 @@ void divAddKernel(
 }
 
 
-__global__
+__device__
 void fluxCorrKernel(
     int n,
     const label* __restrict__ own,
@@ -170,7 +171,7 @@ void fluxCorrKernel(
 }
 
 
-__global__
+__device__
 void cycTensorDivKernel(
     int n,
     const label* __restrict__ own,
@@ -238,7 +239,7 @@ void cycTensorDivKernel(
 }
 
 
-__global__
+__device__
 void gradAddKernel(
     int n,
     const label* __restrict__ own,
@@ -275,7 +276,7 @@ void rotNbr(const scalar* fT, int n, int j, scalar vx, scalar vy, scalar vz,
 }
 
 
-__global__
+__device__
 void scaleImplicitKernel(
     int n,
     const scalar* __restrict__ ifc,
@@ -293,7 +294,7 @@ void scaleImplicitKernel(
 }
 
 
-__global__
+__device__
 void fluxRotKernel(
     int n,
     const label* __restrict__ own,
@@ -320,7 +321,7 @@ void fluxRotKernel(
 }
 
 
-__global__
+__device__
 void addHRotKernel(
     int n,
     const label* __restrict__ own,
@@ -348,7 +349,7 @@ void addHRotKernel(
 }
 
 
-__global__
+__device__
 void gradRotKernel(
     int n,
     const label* __restrict__ own,
@@ -382,7 +383,7 @@ void gradRotKernel(
 }
 
 
-__global__
+__device__
 void deferredRotKernel(
     int n,
     const label* __restrict__ own,
@@ -408,7 +409,7 @@ void deferredRotKernel(
 }
 
 
-__global__
+__device__
 void addHDiagKernel(
     int n,
     const label* __restrict__ own,
@@ -433,8 +434,14 @@ void deviceCyclicAssembleLaplacian(
     bool addToDiag)
 {
     if (cyc.n == 0) return;
-    laplKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), gammaCell.data(),
-        cyc.deltaCoeffs.data(), cyc.weights.data(), cyc.magSf.data(), cyc.ifCoeff.data(), diag.data(), addToDiag ? 1 : 0);
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const label* nbr = cyc.nbrCell.data();
+        const scalar* gamma = gammaCell.data(); const scalar* dc = cyc.deltaCoeffs.data();
+        const scalar* w = cyc.weights.data(); const scalar* magSf = cyc.magSf.data();
+        scalar* ifc = cyc.ifCoeff.data(); scalar* diagd = diag.data(); const int addD = addToDiag ? 1 : 0;
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            laplKernel(n, own, nbr, gamma, dc, w, magSf, ifc, diagd, addD); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicLapl");
 }
 
@@ -442,9 +449,12 @@ void deviceCyclicAssembleLaplacian(
 void deviceCyclicAddConvection(DeviceCyclic& cyc, DeviceBuffer<scalar>& diag, const DeviceBuffer<scalar>* wsch)
 {
     if (cyc.n == 0) return;
-    convKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.phi.data(),
-        (wsch && (label)wsch->size() == cyc.n) ? wsch->data() : nullptr,
-        cyc.ifCoeff.data(), diag.data());
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const scalar* phi = cyc.phi.data();
+        const scalar* wschd = (wsch && (label)wsch->size() == cyc.n) ? wsch->data() : nullptr;
+        scalar* ifc = cyc.ifCoeff.data(); scalar* diagd = diag.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { convKernel(n, own, phi, wschd, ifc, diagd); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicConv");
 }
 
@@ -453,10 +463,15 @@ void deviceCyclicAssembleMomentum(DeviceCyclic& cyc, const DeviceBuffer<scalar>&
                                   const DeviceBuffer<scalar>* wsch)
 {
     if (cyc.n == 0) return;
-    momKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), nuEffCell.data(),
-        cyc.deltaCoeffs.data(), cyc.weights.data(), cyc.magSf.data(), cyc.phi.data(),
-        (wsch && (label)wsch->size() == cyc.n) ? wsch->data() : nullptr,
-        cyc.ifCoeff.data(), diag.data());
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const label* nbr = cyc.nbrCell.data();
+        const scalar* nu = nuEffCell.data(); const scalar* dc = cyc.deltaCoeffs.data();
+        const scalar* w = cyc.weights.data(); const scalar* magSf = cyc.magSf.data(); const scalar* phi = cyc.phi.data();
+        const scalar* wschd = (wsch && (label)wsch->size() == cyc.n) ? wsch->data() : nullptr;
+        scalar* ifc = cyc.ifCoeff.data(); scalar* diagd = diag.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            momKernel(n, own, nbr, nu, dc, w, magSf, phi, wschd, ifc, diagd); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicMom");
 }
 
@@ -468,8 +483,12 @@ void deviceCyclicAddH(
     DeviceBuffer<scalar>& H)
 {
     if (cyc.n == 0) return;
-    addHKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.ifCoeff.data(),
-        psi.data(), V.data(), H.data());
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const label* nbr = cyc.nbrCell.data();
+        const scalar* ifc = cyc.ifCoeff.data(); const scalar* psid = psi.data(); const scalar* Vd = V.data();
+        scalar* Hd = H.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { addHKernel(n, own, nbr, ifc, psid, Vd, Hd); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicAddH");
 }
 
@@ -477,7 +496,11 @@ void deviceCyclicAddH(
 void deviceCyclicOffDiagSum(const DeviceCyclic& cyc, DeviceBuffer<scalar>& sumOff)
 {
     if (cyc.n == 0) return;
-    offSumKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.ifCoeff.data(), sumOff.data());
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const scalar* ifc = cyc.ifCoeff.data();
+        scalar* sumOffd = sumOff.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { offSumKernel(n, own, ifc, sumOffd); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicOffSum");
 }
 
@@ -489,8 +512,15 @@ void deviceCyclicFlux(
     const DeviceBuffer<scalar>& Hz)
 {
     if (cyc.n == 0) return;
-    fluxKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.weights.data(),
-        Hx.data(), Hy.data(), Hz.data(), cyc.Sfx.data(), cyc.Sfy.data(), cyc.Sfz.data(), cyc.phi.data());
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const label* nbr = cyc.nbrCell.data();
+        const scalar* w = cyc.weights.data();
+        const scalar* Hxd = Hx.data(); const scalar* Hyd = Hy.data(); const scalar* Hzd = Hz.data();
+        const scalar* sfx = cyc.Sfx.data(); const scalar* sfy = cyc.Sfy.data(); const scalar* sfz = cyc.Sfz.data();
+        scalar* phid = cyc.phi.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            fluxKernel(n, own, nbr, w, Hxd, Hyd, Hzd, sfx, sfy, sfz, phid); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicFlux");
 }
 
@@ -498,13 +528,17 @@ void deviceCyclicFlux(
 void deviceCyclicAddDiv(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& div)
 {
     if (cyc.n == 0) return;
-    divAddKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.phi.data(), V.data(), div.data());
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const scalar* phi = cyc.phi.data();
+        const scalar* Vd = V.data(); scalar* divd = div.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { divAddKernel(n, own, phi, Vd, divd); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicDiv");
 }
 
 
 namespace {
-__global__
+__device__
 void cycZeroWallKernel(int n, const label* __restrict__ own, const label* __restrict__ isW, scalar* __restrict__ ifc)
 {
     const int j = blockIdx.x*blockDim.x+threadIdx.x;
@@ -517,7 +551,11 @@ void cycZeroWallKernel(int n, const label* __restrict__ own, const label* __rest
 void deviceCyclicZeroWallIfCoeff(DeviceCyclic& cyc, const DeviceBuffer<label>& isWallCell)
 {
     if (cyc.n == 0) return;
-    cycZeroWallKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), isWallCell.data(), cyc.ifCoeff.data());
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const label* isW = isWallCell.data();
+        scalar* ifc = cyc.ifCoeff.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { cycZeroWallKernel(n, own, isW, ifc); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicZeroWall");
 }
 
@@ -525,8 +563,11 @@ void deviceCyclicZeroWallIfCoeff(DeviceCyclic& cyc, const DeviceBuffer<label>& i
 void deviceCyclicCorrectFlux(DeviceCyclic& cyc, const DeviceBuffer<scalar>& p)
 {
     if (cyc.n == 0) return;
-    fluxCorrKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.ifCoeff.data(),
-        p.data(), cyc.phi.data());
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const label* nbr = cyc.nbrCell.data();
+        const scalar* ifc = cyc.ifCoeff.data(); const scalar* pd = p.data(); scalar* phid = cyc.phi.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () { fluxCorrKernel(n, own, nbr, ifc, pd, phid); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicFluxCorr");
 }
 
@@ -534,7 +575,7 @@ void deviceCyclicCorrectFlux(DeviceCyclic& cyc, const DeviceBuffer<scalar>& p)
 namespace {
 // face value of a CELL field on a cyclic face: w*psi[own] + (1-w)*psi[nbr] -- fvc::interpolate on a
 // coupled patch, the 1:1 counterpart of deviceAmiFaceValue.
-__global__
+__device__
 void cyclicFaceValueKernel(int n, const label* __restrict__ own, const label* __restrict__ nbr,
                            const scalar* __restrict__ w, const scalar* __restrict__ cell,
                            scalar* __restrict__ out)
@@ -549,7 +590,7 @@ namespace {
 // The RAW periodic-neighbour value per cyclic face -- OF's patchNeighbourField(), not a face
 // interpolation. cellLimitedGrad needs it to fold the coupled neighbour into a cell's min/max range.
 // Rotational: the neighbour vector is rotated by forwardT first, so component `comp` mixes all three.
-__global__
+__device__
 void cyclicNbrValueKernel(int n, const label* __restrict__ nbr, const scalar* __restrict__ cell,
                           const scalar* __restrict__ c0, const scalar* __restrict__ c1,
                           const scalar* __restrict__ c2, const scalar* __restrict__ fT,
@@ -570,9 +611,15 @@ void deviceCyclicNbrValue(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& c
     out.resize(cyc.n);
     if (cyc.n == 0) return;
     const bool rot = cyc.rotational && c0.size() && c1.size() && c2.size();
-    cyclicNbrValueKernel<<<nBlocks(cyc.n),TPB>>>(cyc.n, cyc.nbrCell.data(), cell.data(),
-        rot ? c0.data() : nullptr, rot ? c1.data() : nullptr, rot ? c2.data() : nullptr,
-        cyc.rotational ? cyc.fT.data() : nullptr, cyc.rotational ? 1 : 0, comp, out.data());
+    {
+        const int n = cyc.n; const label* nbr = cyc.nbrCell.data(); const scalar* celld = cell.data();
+        const scalar* c0d = rot ? c0.data() : nullptr; const scalar* c1d = rot ? c1.data() : nullptr;
+        const scalar* c2d = rot ? c2.data() : nullptr;
+        const scalar* fT = cyc.rotational ? cyc.fT.data() : nullptr; const int rotD = cyc.rotational ? 1 : 0;
+        const int compD = comp; scalar* outd = out.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            cyclicNbrValueKernel(n, nbr, celld, c0d, c1d, c2d, fT, rotD, compD, outd); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicNbrValue");
 }
 
@@ -581,8 +628,12 @@ void deviceCyclicFaceValue(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& 
 {
     out.resize(cyc.n);
     if (cyc.n == 0) return;
-    cyclicFaceValueKernel<<<nBlocks(cyc.n),TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(),
-                                                  cyc.weights.data(), cell.data(), out.data());
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const label* nbr = cyc.nbrCell.data();
+        const scalar* w = cyc.weights.data(); const scalar* celld = cell.data(); scalar* outd = out.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            cyclicFaceValueKernel(n, own, nbr, w, celld, outd); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicFaceValue");
 }
 
@@ -596,8 +647,14 @@ void deviceCyclicAddGrad(
     DeviceBuffer<scalar>& gz)
 {
     if (cyc.n == 0) return;
-    gradAddKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.weights.data(),
-        psi.data(), cyc.Sfx.data(), cyc.Sfy.data(), cyc.Sfz.data(), V.data(), gx.data(), gy.data(), gz.data());
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const label* nbr = cyc.nbrCell.data();
+        const scalar* w = cyc.weights.data(); const scalar* psid = psi.data();
+        const scalar* sfx = cyc.Sfx.data(); const scalar* sfy = cyc.Sfy.data(); const scalar* sfz = cyc.Sfz.data();
+        const scalar* Vd = V.data(); scalar* gxd = gx.data(); scalar* gyd = gy.data(); scalar* gzd = gz.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            gradAddKernel(n, own, nbr, w, psid, sfx, sfy, sfz, Vd, gxd, gyd, gzd); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicGrad");
 }
 
@@ -605,8 +662,12 @@ void deviceCyclicAddGrad(
 void deviceCyclicScaleImplicit(DeviceCyclic& cyc)
 {
     if (cyc.n == 0) return;
-    scaleImplicitKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ifCoeff.data(), cyc.fT.data(),
-        cyc.ifCoeffC[0].data(), cyc.ifCoeffC[1].data(), cyc.ifCoeffC[2].data());
+    {
+        const int n = cyc.n; const scalar* ifc = cyc.ifCoeff.data(); const scalar* fT = cyc.fT.data();
+        scalar* ic0 = cyc.ifCoeffC[0].data(); scalar* ic1 = cyc.ifCoeffC[1].data(); scalar* ic2 = cyc.ifCoeffC[2].data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            scaleImplicitKernel(n, ifc, fT, ic0, ic1, ic2); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicScaleImplicit");
 }
 
@@ -618,8 +679,16 @@ void deviceCyclicFluxRot(
     const DeviceBuffer<scalar>& Hz)
 {
     if (cyc.n == 0) return;
-    fluxRotKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.weights.data(),
-        Hx.data(), Hy.data(), Hz.data(), cyc.fT.data(), cyc.Sfx.data(), cyc.Sfy.data(), cyc.Sfz.data(), cyc.phi.data());
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const label* nbr = cyc.nbrCell.data();
+        const scalar* w = cyc.weights.data();
+        const scalar* Hxd = Hx.data(); const scalar* Hyd = Hy.data(); const scalar* Hzd = Hz.data();
+        const scalar* fT = cyc.fT.data();
+        const scalar* sfx = cyc.Sfx.data(); const scalar* sfy = cyc.Sfy.data(); const scalar* sfz = cyc.Sfz.data();
+        scalar* phid = cyc.phi.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            fluxRotKernel(n, own, nbr, w, Hxd, Hyd, Hzd, fT, sfx, sfy, sfz, phid); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicFluxRot");
 }
 
@@ -635,8 +704,14 @@ void deviceCyclicAddHRot(
     DeviceBuffer<scalar>& Hz)
 {
     if (cyc.n == 0) return;
-    addHRotKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.ifCoeff.data(),
-        cyc.fT.data(), Ux.data(), Uy.data(), Uz.data(), V.data(), Hx.data(), Hy.data(), Hz.data());
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const label* nbr = cyc.nbrCell.data();
+        const scalar* ifc = cyc.ifCoeff.data(); const scalar* fT = cyc.fT.data();
+        const scalar* Uxd = Ux.data(); const scalar* Uyd = Uy.data(); const scalar* Uzd = Uz.data();
+        const scalar* Vd = V.data(); scalar* Hxd = Hx.data(); scalar* Hyd = Hy.data(); scalar* Hzd = Hz.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            addHRotKernel(n, own, nbr, ifc, fT, Uxd, Uyd, Uzd, Vd, Hxd, Hyd, Hzd); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicAddHRot");
 }
 
@@ -653,9 +728,15 @@ void deviceCyclicAddGradRot(
     DeviceBuffer<scalar>& gz)
 {
     if (cyc.n == 0) return;
-    gradRotKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.weights.data(),
-        cyc.fT.data(), comp, Ux.data(), Uy.data(), Uz.data(), cyc.Sfx.data(), cyc.Sfy.data(), cyc.Sfz.data(),
-        V.data(), gx.data(), gy.data(), gz.data());
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const label* nbr = cyc.nbrCell.data();
+        const scalar* w = cyc.weights.data(); const scalar* fT = cyc.fT.data(); const int compD = comp;
+        const scalar* Uxd = Ux.data(); const scalar* Uyd = Uy.data(); const scalar* Uzd = Uz.data();
+        const scalar* sfx = cyc.Sfx.data(); const scalar* sfy = cyc.Sfy.data(); const scalar* sfz = cyc.Sfz.data();
+        const scalar* Vd = V.data(); scalar* gxd = gx.data(); scalar* gyd = gy.data(); scalar* gzd = gz.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            gradRotKernel(n, own, nbr, w, fT, compD, Uxd, Uyd, Uzd, sfx, sfy, sfz, Vd, gxd, gyd, gzd); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicGradRot");
 }
 
@@ -669,8 +750,14 @@ void deviceCyclicAddDeferredRot(
     DeviceBuffer<scalar>& src)
 {
     if (cyc.n == 0) return;
-    deferredRotKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.ifCoeff.data(),
-        cyc.fT.data(), comp, Ux.data(), Uy.data(), Uz.data(), src.data());
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const label* nbr = cyc.nbrCell.data();
+        const scalar* ifc = cyc.ifCoeff.data(); const scalar* fT = cyc.fT.data(); const int compD = comp;
+        const scalar* Uxd = Ux.data(); const scalar* Uyd = Uy.data(); const scalar* Uzd = Uz.data();
+        scalar* srcd = src.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            deferredRotKernel(n, own, nbr, ifc, fT, compD, Uxd, Uyd, Uzd, srcd); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicDeferredRot");
 }
 
@@ -683,13 +770,18 @@ void deviceCyclicAddHDiag(
     DeviceBuffer<scalar>& H)
 {
     if (cyc.n == 0) return;
-    addHDiagKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.ifCoeffC[comp].data(),
-        psi.data(), V.data(), H.data());
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const label* nbr = cyc.nbrCell.data();
+        const scalar* ifcC = cyc.ifCoeffC[comp].data();
+        const scalar* psid = psi.data(); const scalar* Vd = V.data(); scalar* Hd = H.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            addHDiagKernel(n, own, nbr, ifcC, psid, Vd, Hd); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicAddHDiag");
 }
 
 
-__global__
+__device__
 void cycLinUpwindKernel(
     int n,
     const label* __restrict__ own,
@@ -749,11 +841,20 @@ void deviceCyclicAddLinUpwindCorr(
     DeviceBuffer<scalar>& corr)
 {
     if (cyc.n == 0) return;
-    cycLinUpwindKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.phi.data(),
-        gUx[0].data(), gUy[0].data(), gUz[0].data(), gUx[1].data(), gUy[1].data(), gUz[1].data(),
-        gUx[2].data(), gUy[2].data(), gUz[2].data(),
-        cyc.dOwnX.data(), cyc.dOwnY.data(), cyc.dOwnZ.data(), cyc.dNbrX.data(), cyc.dNbrY.data(), cyc.dNbrZ.data(),
-        cyc.rotational ? cyc.fT.data() : nullptr, cyc.rotational ? 1 : 0, comp, corr.data());
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const label* nbr = cyc.nbrCell.data();
+        const scalar* phi = cyc.phi.data();
+        const scalar* gx0 = gUx[0].data(); const scalar* gy0 = gUy[0].data(); const scalar* gz0 = gUz[0].data();
+        const scalar* gx1 = gUx[1].data(); const scalar* gy1 = gUy[1].data(); const scalar* gz1 = gUz[1].data();
+        const scalar* gx2 = gUx[2].data(); const scalar* gy2 = gUy[2].data(); const scalar* gz2 = gUz[2].data();
+        const scalar* dox = cyc.dOwnX.data(); const scalar* doy = cyc.dOwnY.data(); const scalar* doz = cyc.dOwnZ.data();
+        const scalar* dnx = cyc.dNbrX.data(); const scalar* dny = cyc.dNbrY.data(); const scalar* dnz = cyc.dNbrZ.data();
+        const scalar* fT = cyc.rotational ? cyc.fT.data() : nullptr; const int rot = cyc.rotational ? 1 : 0;
+        const int compD = comp; scalar* corrd = corr.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            cycLinUpwindKernel(n, own, nbr, phi, gx0, gy0, gz0, gx1, gy1, gz1, gx2, gy2, gz2,
+                                dox, doy, doz, dnx, dny, dnz, fT, rot, compD, corrd); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicLinUpwind");
 }
 
@@ -766,15 +867,22 @@ void deviceCyclicAddLinUpwindCorr(
     DeviceBuffer<scalar>& corr)
 {
     if (cyc.n == 0) return;
-    cycLinUpwindKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.phi.data(),
-        gx.data(), gy.data(), gz.data(), gx.data(), gy.data(), gz.data(), gx.data(), gy.data(), gz.data(),
-        cyc.dOwnX.data(), cyc.dOwnY.data(), cyc.dOwnZ.data(), cyc.dNbrX.data(), cyc.dNbrY.data(), cyc.dNbrZ.data(),
-        nullptr, 0, 0, corr.data());
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const label* nbr = cyc.nbrCell.data();
+        const scalar* phi = cyc.phi.data();
+        const scalar* gxd = gx.data(); const scalar* gyd = gy.data(); const scalar* gzd = gz.data();
+        const scalar* dox = cyc.dOwnX.data(); const scalar* doy = cyc.dOwnY.data(); const scalar* doz = cyc.dOwnZ.data();
+        const scalar* dnx = cyc.dNbrX.data(); const scalar* dny = cyc.dNbrY.data(); const scalar* dnz = cyc.dNbrZ.data();
+        scalar* corrd = corr.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            cycLinUpwindKernel(n, own, nbr, phi, gxd, gyd, gzd, gxd, gyd, gzd, gxd, gyd, gzd,
+                                dox, doy, doz, dnx, dny, dnz, nullptr, 0, 0, corrd); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicLinUpwindScalar");
 }
 
 
-__global__
+__device__
 void cycLapCorrKernel(
     int n,
     const label* __restrict__ own,
@@ -843,11 +951,19 @@ void deviceCyclicAddLapCorr(
     DeviceBuffer<scalar>& corr)
 {
     if (cyc.n == 0) return;
-    cycLapCorrKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), gammaCell.data(),
-        cyc.weights.data(), cyc.magSf.data(), cyc.corrVecX.data(), cyc.corrVecY.data(), cyc.corrVecZ.data(),
-        gUx[0].data(), gUy[0].data(), gUz[0].data(), gUx[1].data(), gUy[1].data(), gUz[1].data(),
-        gUx[2].data(), gUy[2].data(), gUz[2].data(),
-        cyc.rotational ? cyc.fT.data() : nullptr, cyc.rotational ? 1 : 0, comp, corr.data());
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const label* nbr = cyc.nbrCell.data();
+        const scalar* nu = gammaCell.data(); const scalar* w = cyc.weights.data(); const scalar* magSf = cyc.magSf.data();
+        const scalar* cvx = cyc.corrVecX.data(); const scalar* cvy = cyc.corrVecY.data(); const scalar* cvz = cyc.corrVecZ.data();
+        const scalar* gx0 = gUx[0].data(); const scalar* gy0 = gUy[0].data(); const scalar* gz0 = gUz[0].data();
+        const scalar* gx1 = gUx[1].data(); const scalar* gy1 = gUy[1].data(); const scalar* gz1 = gUz[1].data();
+        const scalar* gx2 = gUx[2].data(); const scalar* gy2 = gUy[2].data(); const scalar* gz2 = gUz[2].data();
+        const scalar* fT = cyc.rotational ? cyc.fT.data() : nullptr; const int rot = cyc.rotational ? 1 : 0;
+        const int compD = comp; scalar* srcd = corr.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            cycLapCorrKernel(n, own, nbr, nu, w, magSf, cvx, cvy, cvz,
+                              gx0, gy0, gz0, gx1, gy1, gz1, gx2, gy2, gz2, fT, rot, compD, srcd); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicLapCorr");
 }
 
@@ -860,15 +976,21 @@ void deviceCyclicAddLapCorr(
     DeviceBuffer<scalar>& corr)
 {
     if (cyc.n == 0) return;
-    cycLapCorrKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), gammaCell.data(),
-        cyc.weights.data(), cyc.magSf.data(), cyc.corrVecX.data(), cyc.corrVecY.data(), cyc.corrVecZ.data(),
-        gx.data(), gy.data(), gz.data(), gx.data(), gy.data(), gz.data(), gx.data(), gy.data(), gz.data(),
-        nullptr, 0, 0, corr.data());
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const label* nbr = cyc.nbrCell.data();
+        const scalar* nu = gammaCell.data(); const scalar* w = cyc.weights.data(); const scalar* magSf = cyc.magSf.data();
+        const scalar* cvx = cyc.corrVecX.data(); const scalar* cvy = cyc.corrVecY.data(); const scalar* cvz = cyc.corrVecZ.data();
+        const scalar* gxd = gx.data(); const scalar* gyd = gy.data(); const scalar* gzd = gz.data();
+        scalar* srcd = corr.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            cycLapCorrKernel(n, own, nbr, nu, w, magSf, cvx, cvy, cvz,
+                              gxd, gyd, gzd, gxd, gyd, gzd, gxd, gyd, gzd, nullptr, 0, 0, srcd); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicLapCorrScalar");
 }
 
 
-__global__
+__device__
 void cycLapCorrScalarKernel(
     int n,
     const label* __restrict__ own,
@@ -909,9 +1031,15 @@ void deviceCyclicLapCorrP(
 {
     if (cyc.n == 0) return;
     ffcOut.resize(cyc.n);
-    cycLapCorrScalarKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), gammaCell.data(),
-        cyc.weights.data(), cyc.magSf.data(), cyc.corrVecX.data(), cyc.corrVecY.data(), cyc.corrVecZ.data(),
-        gx.data(), gy.data(), gz.data(), bp.data(), ffcOut.data());
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const label* nbr = cyc.nbrCell.data();
+        const scalar* gamma = gammaCell.data(); const scalar* w = cyc.weights.data(); const scalar* magSf = cyc.magSf.data();
+        const scalar* cvx = cyc.corrVecX.data(); const scalar* cvy = cyc.corrVecY.data(); const scalar* cvz = cyc.corrVecZ.data();
+        const scalar* gxd = gx.data(); const scalar* gyd = gy.data(); const scalar* gzd = gz.data();
+        scalar* bpd = bp.data(); scalar* ffcOutd = ffcOut.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            cycLapCorrScalarKernel(n, own, nbr, gamma, w, magSf, cvx, cvy, cvz, gxd, gyd, gzd, bpd, ffcOutd); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicLapCorrP");
 }
 
@@ -925,10 +1053,16 @@ void deviceCyclicAddTensorDiv(
     DeviceBuffer<scalar>& srcZ)
 {
     if (cyc.n == 0) return;
-    const scalar* fT = cyc.rotational ? cyc.fT.data() : nullptr;
-    cycTensorDivKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(), cyc.weights.data(),
-        cyc.Sfx.data(), cyc.Sfy.data(), cyc.Sfz.data(), sigmaC.data(), nC, fT, cyc.rotational ? 1 : 0,
-        srcX.data(), srcY.data(), srcZ.data());
+    {
+        const int n = cyc.n; const label* own = cyc.ownCell.data(); const label* nbr = cyc.nbrCell.data();
+        const scalar* w = cyc.weights.data();
+        const scalar* sfx = cyc.Sfx.data(); const scalar* sfy = cyc.Sfy.data(); const scalar* sfz = cyc.Sfz.data();
+        const scalar* sigmaCd = sigmaC.data(); const int nCd = nC;
+        const scalar* fT = cyc.rotational ? cyc.fT.data() : nullptr; const int rot = cyc.rotational ? 1 : 0;
+        scalar* dXd = srcX.data(); scalar* dYd = srcY.data(); scalar* dZd = srcZ.data();
+        pcudaParallelFor(nBlocks(n), TPB, [=] __device__ () {
+            cycTensorDivKernel(n, own, nbr, w, sfx, sfy, sfz, sigmaCd, nCd, fT, rot, dXd, dYd, dZd); });
+    }
     cudaCheck(cudaGetLastError(), "cyclicTensorDiv");
 }
 
