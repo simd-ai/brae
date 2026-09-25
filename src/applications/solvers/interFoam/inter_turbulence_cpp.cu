@@ -278,14 +278,33 @@ void requireSstWalls(
                     std::string(WHO) + "wall patch `" + p.name + "` names wall-function coefficients "
                     "other than Cmu 0.09, kappa 0.41, E 9.8. The kOmegaSST closure carries one set for "
                     "every wall and this reader does not thread a patch's own through.");
+            // THE TWO WALL FUNCTIONS HAVE DIFFERENT DEFAULTS, and this loop used to hold both to
+            // omega's. nutkWallFunction is STEPWISE with n = 4
+            // (nutkWallFunctionFvPatchScalarField.C:216); omegaWallFunction is BINOMIAL with n = 2
+            // (omegaWallFunctionFvPatchScalarField.C:405). The tutorial files omit `blending`, so the
+            // defaults applied and nothing showed -- but OpenFOAM WRITES the resolved word, so a restart
+            // from its own output carries `blending stepwise` on nut, and checking that against omega's
+            // rule made brae REFUSE A CASE OPENFOAM RUNS (found on a restart of
+            // RAS/electrostaticDeposition at t = 0.001). brae computes the stepwise form for nut
+            // (nut_wall_function.cuh:4, a hard switch at yPlusLam) and the binomial one for omega, so
+            // each default IS what it implements.
+            // `n` is STEPWISE's unused parameter -- OpenFOAM passes 4 and the switch never reads it --
+            // so it is not checked on the nut entry.
+            const bool isNut = (b == nb);
             const bool blendOther = !b->wfBlending.empty()
-                                 && (b->wfBlending != "binomial" || (b->hasWfBlendN && b->wfBlendN != 2));
+                                 && (isNut
+                                     ? (b->wfBlending != "stepwise")
+                                     : (b->wfBlending != "binomial"
+                                        || (b->hasWfBlendN && b->wfBlendN != 2)));
             if (blendOther)
                 throw std::runtime_error(
-                    std::string(WHO) + "wall patch `" + p.name + "` names `blending " + b->wfBlending
-                    + "`. The kOmegaSST closure blends omega's viscous and log values binomially with "
-                    "n = 2, OpenFOAM's default (omegaWallFunctionFvPatchScalarField.C:445), and "
-                    "nothing else.");
+                    std::string(WHO) + (isNut ? "nut" : "omega") + " patch `" + p.name
+                    + "` names `blending " + b->wfBlending + "`. brae blends "
+                    + (isNut ? "nut's viscous and log values STEPWISE at yPlusLam, OpenFOAM's own "
+                               "nutkWallFunction default (nutkWallFunctionFvPatchScalarField.C:216)"
+                             : "omega's viscous and log values BINOMIALLY with n = 2, OpenFOAM's own "
+                               "omegaWallFunction default (omegaWallFunctionFvPatchScalarField.C:405)")
+                    + ", and nothing else.");
         }
     }
     if (!anyWall)

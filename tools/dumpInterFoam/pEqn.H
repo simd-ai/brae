@@ -73,10 +73,36 @@
 
     while (pimple.correctNonOrthogonal())
     {
+        // ---- INSTRUMENTATION: writes only --------------------------------------------------------
+        // THE FLUX p_rgh's OWN PATCHES LOOK UP. fvm::laplacian below constructs the matrix, and that
+        // constructor runs every p_rgh patch's updateCoeffs -- totalPressure's reads `phi` AT THIS
+        // MOMENT and switches its dynamic term on with neg(phip). Nothing written at the end of a step
+        // can show which flux it saw: by then phi has been corrected again and made relative.
+        // Paired with p_rgh's boundary AFTER the construction, so the value that updateCoeffs left is
+        // on disk beside the flux that produced it.
+        const Foam::word sfxA =
+            (pimple.corrPISO() <= 1) ? Foam::word() : ("c" + Foam::name(pimple.corrPISO()));
+        const bool dumpHere =
+            getenv("BRAE_DUMP_ITER") && runTime.timeIndex() == atoi(getenv("BRAE_DUMP_ITER"));
+        if (dumpHere)
+        {
+            surfaceScalarField("phiAtPrghAssembly" + sfxA + ".dump", phi).write();
+        }
+        // ------------------------------------------------------------------------------------------
+
         fvScalarMatrix p_rghEqn
         (
             fvm::laplacian(rAUf, p_rgh) == fvc::div(phiHbyA)
         );
+
+        // ---- INSTRUMENTATION: writes only --------------------------------------------------------
+        if (dumpHere)
+        {
+            volScalarField("prghAfterAssembly" + sfxA + ".dump", p_rgh).write();
+            Info<< "[brae] dumped the p_rgh assembly at timeIndex " << runTime.timeIndex()
+                << " corrector " << pimple.corrPISO() << endl;
+        }
+        // ------------------------------------------------------------------------------------------
 
         p_rghEqn.setReference(pRefCell, getRefCellValue(p_rgh, pRefCell));
 

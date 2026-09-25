@@ -1061,6 +1061,30 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
     {
         correctUf(*in.Uf, U, phi, m, g, patches);
         makeRelativeFlux(phi, *in.meshPhi);
+        // ...AND THE PRESSURE PATCHES ARE TOLD THE RELATIVE FLUX, because that is the one OpenFOAM's
+        // LOOK UP. pEqn.H is included once per PISO corrector and each invocation ENDS here, so the
+        // next corrector's `fvm::laplacian(rAUf, p_rgh)` -- whose constructor runs every p_rgh patch's
+        // updateCoeffs -- reads a phi that has already been made relative. brae's patches are TOLD
+        // instead, and were told only inside the corrector where phi is still ABSOLUTE, so they kept the
+        // absolute flux for the rest of the step. U's patches are NOT re-told here and must not be:
+        // OpenFOAM evaluates them at `U.correctBoundaryConditions()` INSIDE the corrector, where phi is
+        // still absolute (see the push site above).
+        //
+        // MEASURED on RAS/electrostaticDeposition, step one, `side-02` (totalPressure, 225 faces), at
+        // the second and third correctors' assemblies -- tools/dumpInterFoam's phiAtPrghAssembly against
+        // the same instant in brae:
+        //   OpenFOAM  phi [+3.554986e-04, +3.555726e-04]   inflow faces 0     p_rgh uniform 0
+        //   brae      phi [-7.468970e-08, -7.384048e-10]   inflow faces 225   p_rgh [-1.708e-10, ...]
+        // The two differ by exactly meshPhi (0.08 m/s x a 4.44e-03 face = 3.55e-04), so `neg(phip)`
+        // took the opposite branch on every face and totalPressure added 0.5*rho*|U_b|^2 where OpenFOAM
+        // added nothing. phiHbyA's boundary was NOT the cause: brae's matches OpenFOAM's to every digit
+        // there ([-4.463313e-10, -5.922619e-12] at corrector two on both sides).
+        for (std::size_t pi = 0; pi < patches.size() && pi < phi.boundary.size(); ++pi)
+        {
+            if (patches[pi].size == 0) continue;
+            p_rgh.boundary[pi]->updateFromFlux(
+                namedPatchFlux(p_rgh.boundary[pi]->fluxName(), pi, patches[pi].name, phi, in.rhoPhi));
+        }
     }
 
     // p == p_rgh + rho*gh, then the reference shift if p_rgh needs one -- and BOTH fields move.
