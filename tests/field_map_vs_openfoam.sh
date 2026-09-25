@@ -38,21 +38,33 @@
 # are 1/8 to within an ulp, printing as 0.125000000000000083, so hardcoding 1.0/8.0 is one ulp per
 # child out.
 #
-# NOT COVERED, each stated rather than implied -- a green run here does NOT mean "field mapping works":
-#   * the V0 correction (dynamicRefineFvMesh.C:204-252): a split or merged cell takes the CURRENT
-#     volume, not the mapped old one, or the next ddt is wrong by the split ratio. The oracle dumps V0
-#     and it is visibly reset; brae does not compute it and this gate does not compare it.
-#   * the flux correction over faceMap (`correctFluxes`, :256-424) and `mapNewInternalFaces`. Only
-#     volFields are registered here, so the surface half is inert in these runs.
+# THE FLUX HALF runs here too, in test_flux_map_vs_openfoam, on the same two dumps: THREE correction
+# sites, not one -- mapFields' four write sites (:257-422), mapNewInternalFaces on the ORIENTED branch
+# (:424-437), and the site only unrefinement has (:610-689). MEASURED: the first overwrites 2,156 faces
+# on the refine step and ZERO on the unrefine step, where the third overwrites 158. A port that finds
+# only the first is green on every refinement and silently wrong on every unrefinement.
+#
+# NOT COVERED, each stated rather than implied -- a green run here does NOT mean "mapping works":
+#   * the FACE MAPPER itself. Its direct() predicate and addressing build are their own unit; step one
+#     is taken from OpenFOAM's own addressing in the dump, and the boundary half of step one goes
+#     through faceMap rather than fvPatchMapper, which the oracle does not dump. Enough on both arms
+#     here; not enough on a mesh where a patch's own faces are split.
+#   * `phi[facei] = phiU[facei]` at :362 for an INJECTED internal face. The oriented round trip's final
+#     whole-field assignment overwrites it, so its value is provably discarded and no oracle can witness
+#     whether a port wrote it. Median relative difference from the final value: 9.6e-01.
+#   * the `NaN` branch (:329-336) and the absent-entry warning (:312-324), unreachable on this fixture.
+#   * old-time fields, surface fields other than phi and Uf, and anything parallel.
 #   * old-time fields, the boundary half, and anything parallel.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_field_map_vs_openfoam"
+FLUXBIN="${BUILD:-$ROOT/build}/test_flux_map_vs_openfoam"
 OFBASHRC=${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
 TUT=${BRAE_OF_TUTORIALS:-/usr/lib/openfoam/openfoam2412/tutorials}
 SRC="$TUT/multiphase/interFoam/laminar/damBreakWithObstacle"
 
 [ -x "$BIN" ]      || { echo "SKIP: $BIN not built"; exit 77; }
+[ -x "$FLUXBIN" ]  || { echo "SKIP: $FLUXBIN not built"; exit 77; }
 [ -d "$SRC" ]      || { echo "SKIP: damBreakWithObstacle tutorial not found at $SRC"; exit 77; }
 [ -f "$OFBASHRC" ] || { echo "SKIP: real OpenFOAM not available"; exit 77; }
 
@@ -95,6 +107,15 @@ t, k = re.subn(r'(volScalarFieldValue alpha\.water 1)',
                r'\1\n                volVectorFieldValue U (2 0 0)', t)
 assert k == 1, 'the setFields water block was not found'
 open(f, 'w').write(t)
+# ...and the FLUX correction's interpolating branch, which is unreachable as the tutorial ships: all
+# four interFoam AMR tutorials set every correctFluxes entry to `none`, so `phi` is never recreated on
+# a new face. Naming U instead makes the branch live. MEASURED: the refine and unrefine cell counts are
+# unchanged by it, which the two asserts below check.
+m = d + '/constant/dynamicMeshDict'
+u = open(m).read()
+assert '(phi none)' in u, 'the tutorial no longer says `(phi none)`'
+u = u.replace('(phi none)', '(phi U)', 1)
+open(m, 'w').write(u)
 PYEOF
 
 ( cd "$C" && cp -r 0.orig 0 && blockMesh > log.blockMesh 2>&1 && topoSet > log.topoSet 2>&1 \
@@ -123,6 +144,7 @@ arm()
              grep -m2 "phase" "$dump"; rc=1; return; }
     echo "--- $name (t = $t, $phase)"
     "$BIN" "$dump" "$phase" || rc=1
+    "$FLUXBIN" "$dump" "$phase" || rc=1
 }
 
 arm refine   0.002 refine

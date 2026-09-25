@@ -17,6 +17,7 @@
 // differ on 13,774 of 24,815 cells, by up to 3.12e-01. The oracle prints the post-MAP values.
 //
 // usage: test_field_map_vs_openfoam <oracleDump> <expected phase: refine|unrefine>
+#include "dynamic_refine_fv_mesh_cpp.cuh"
 #include "map_poly_mesh_cpp.cuh"
 #include <cmath>
 #include <cstdio>
@@ -71,7 +72,7 @@ Fields readFields(const std::string& path)
         }
         // a patch row carries two indices, not one -- skip it, this unit is internal values only
         if (tag.size() > 5 && tag.compare(tag.size() - 5, 5, "Patch") == 0) continue;
-        if (tag == "cellLevel" || tag == "pointLevel" || tag == "V" || tag == "V0"
+        if (tag == "cellLevel" || tag == "pointLevel"
          || tag == "nPoints" || tag == "nFaces" || tag == "nInternalFaces") continue;
         label celli = 0;
         if (!(is >> celli)) continue;
@@ -182,6 +183,10 @@ int main(int argc, char** argv)
         const auto post = f.post.find(name);
         if (post == f.post.end()) continue;
         if (entry.second.size() != static_cast<std::size_t>(f.preCells)) continue;
+        // V and V0 are GEOMETRY, not mapped solution fields: V is recomputed from the new mesh and V0
+        // is the mapped value with the correction applied on top. They are compared in their own block
+        // below, not through the cell mapper.
+        if (name == "V" || name == "V0") continue;
         anyField = true;
         const std::vector<std::vector<scalar>> mine =
             mapComponentwise(entry.second, mapper, static_cast<std::size_t>(f.postCells));
@@ -192,6 +197,55 @@ int main(int argc, char** argv)
               d.worst == scalar(0));
     }
     check("the oracle carried a field to map", anyField);
+
+    // THE OLD-TIME VOLUMES. `mapFields` maps V0 with the same cell mapper and then OVERWRITES it on
+    // every cell the change touched, with that cell's CURRENT volume. A gate on mapped field values
+    // cannot see this at all -- and getting it wrong leaves every field exactly right while the first
+    // ddt after a refinement is out by the split ratio.
+    {
+        const auto postV = f.post.find("V");
+        const auto postV0 = f.post.find("V0");
+        if (postV != f.post.end() && postV0 != f.post.end() && mpm.hasOldCellVolumes())
+        {
+            // V0 as the mapper leaves it: the OLD volumes the map carried, mapped
+            std::vector<scalar> mappedV0;
+            mapCellField(mappedV0, mpm.oldCellVolumes, mapper);
+            std::vector<scalar> V(static_cast<std::size_t>(f.postCells), scalar(0));
+            for (std::size_t i = 0; i < V.size() && i < postV->second.size(); ++i)
+            {
+                if (!postV->second[i].empty()) V[i] = postV->second[i][0];
+            }
+            const std::vector<scalar> mine = dynamicRefine::correctOldVolumes(mpm, mappedV0, V);
+
+            std::vector<std::vector<scalar>> mineRows(mine.size());
+            for (std::size_t i = 0; i < mine.size(); ++i) mineRows[i] = {mine[i]};
+            const Diff d = compare(mineRows, postV0->second);
+            // ...and how much work the correction did, so a green arm cannot be a green no-op
+            std::size_t nMoved = 0;
+            for (std::size_t i = 0; i < mine.size() && i < mappedV0.size(); ++i)
+            {
+                if (mine[i] != mappedV0[i]) ++nMoved;
+            }
+            std::printf("  V0 correction: worst %.4e of %.4e (%zu cells differ); it moved %zu cells "
+                        "off the mapped value\n",
+                        (double)d.worst, (double)d.refMax, d.nAbove, nMoved);
+            check("brae's corrected old-time volumes are OpenFOAM's, cell for cell",
+                  d.worst == scalar(0));
+            check("...and the correction actually moved cells, so this arm is not a no-op", nMoved > 0);
+
+            // CONTROL: the correction skipped entirely. If the mapped V0 already equalled OpenFOAM's
+            // corrected one there would be nothing here to measure.
+            const Diff du = compare([&]{
+                std::vector<std::vector<scalar>> r(mappedV0.size());
+                for (std::size_t i = 0; i < mappedV0.size(); ++i) r[i] = {mappedV0[i]};
+                return r;
+            }(), postV0->second);
+            std::printf("  CONTROL: the MAPPED V0 with no correction: worst %.4e of %.4e (%zu cells "
+                        "differ)\n", (double)du.worst, (double)du.refMax, du.nAbove);
+            check("...is a different answer, so the correction is what this arm measures",
+                  du.worst > scalar(0));
+        }
+    }
 
     // CONTROL 1: the identity map. Under REFINEMENT the mapper is a pure gather and the mesh is mostly
     // cells it does not move -- and on a refined VoF field the eight children of an interface cell all

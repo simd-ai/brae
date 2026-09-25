@@ -2,6 +2,7 @@
 
 #include <fstream>
 #include <sstream>
+#include <utility>
 #include <stdexcept>
 
 namespace brae {
@@ -66,6 +67,61 @@ MapPolyMesh readMapPolyMesh(const std::string& path)
             std::string v;
             is >> v;
             mpm.openfoamSaysDirect = (v == "true");
+        }
+        else if (tag == "reverseCellMap")
+        {
+            label i = 0, v = 0;
+            is >> i >> v;
+            if (static_cast<std::size_t>(i) >= mpm.reverseCellMap.size())
+            {
+                mpm.reverseCellMap.resize(static_cast<std::size_t>(i) + 1, label(-1));
+            }
+            mpm.reverseCellMap[static_cast<std::size_t>(i)] = v;
+        }
+        else if (tag == "faceMap" || tag == "reverseFaceMap" || tag == "reversePointMap"
+               || tag == "faceDirectAddressing")
+        {
+            std::vector<label>& dst = (tag == "faceMap")            ? mpm.faceMap
+                                    : (tag == "reverseFaceMap")     ? mpm.reverseFaceMap
+                                    : (tag == "reversePointMap")    ? mpm.reversePointMap
+                                                                    : mpm.faceDirectAddressing;
+            label i = 0, v = 0;
+            is >> i >> v;
+            if (static_cast<std::size_t>(i) >= dst.size())
+            {
+                dst.resize(static_cast<std::size_t>(i) + 1, label(-1));
+            }
+            dst[static_cast<std::size_t>(i)] = v;
+        }
+        else if (tag == "faceMapperDirect")
+        {
+            std::string v;
+            is >> v;
+            mpm.faceMapperDirect = (v == "true");
+        }
+        else if (tag == "faceAddressing")
+        {
+            label facei = 0, n = 0;
+            is >> facei >> n;
+            std::vector<label> a(static_cast<std::size_t>(n));
+            for (label& x : a) is >> x;
+            if (static_cast<std::size_t>(facei) >= mpm.faceAddressing.size())
+            {
+                mpm.faceAddressing.resize(static_cast<std::size_t>(facei) + 1);
+            }
+            mpm.faceAddressing[static_cast<std::size_t>(facei)] = std::move(a);
+        }
+        else if (tag == "faceWeights")
+        {
+            label facei = 0, n = 0;
+            is >> facei >> n;
+            std::vector<scalar> w(static_cast<std::size_t>(n));
+            for (scalar& x : w) is >> x;
+            if (static_cast<std::size_t>(facei) >= mpm.faceWeights.size())
+            {
+                mpm.faceWeights.resize(static_cast<std::size_t>(facei) + 1);
+            }
+            mpm.faceWeights[static_cast<std::size_t>(facei)] = std::move(w);
         }
         else if (tag == "cellMap")
         {

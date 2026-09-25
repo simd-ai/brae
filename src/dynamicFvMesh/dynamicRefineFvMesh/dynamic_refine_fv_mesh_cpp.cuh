@@ -25,7 +25,9 @@
 
 #include "cf_types.cuh"
 #include "fv_patch.cuh"
+#include "map_poly_mesh_cpp.cuh"
 #include "primitive_mesh.cuh"
+#include <utility>
 #include <vector>
 
 namespace brae {
@@ -304,6 +306,130 @@ std::vector<label> selectUnrefinePoints(
     const std::vector<std::vector<label>>& pointCells,
     const PrimitiveMesh&                   m,
     const std::vector<FvPatch>&            patches);
+
+// ---------------------------------------------------------------------------------------------
+// UNIT 6: the OLD-TIME VOLUMES, after a mesh change.
+//
+// OF v2412: src/dynamicFvMesh/dynamicRefineFvMesh/dynamicRefineFvMesh.C:203-254
+//
+// The cell mapper has already MAPPED V0 by the time this runs -- `mapFields` chains to
+// `fvMesh::mapFields` first (:200) -- so this starts from the mapped old volumes and then OVERWRITES
+// them on the cells the change touched, with the cell's CURRENT volume:
+//
+//   * a cell whose old cell contributed EXACTLY EIGHT new cells was split, so every one of those eight
+//     takes its own new V (:229-238). The count is over cells whose old cell still exists
+//     (`reverseCellMap[oldCelli] >= 0`), which is what makes it a split rather than a renumber.
+//   * a cell in `cellsFromCellsMap` was MERGED, and takes its own new V too (:240-251). OpenFOAM's own
+//     comment there wonders whether the old volumes should be summed instead; they are not.
+//
+// WHY IT MATTERS, and why a gate on mapped cell VALUES cannot see it: V0 is the volume the old-time
+// field was stored in, and `ddt` divides by the change between V0 and V. A split cell whose V0 is the
+// PARENT's volume reads a volume change of eight to one that never happened, so the first ddt after a
+// refinement is wrong by the split ratio while every mapped field is exactly right.
+//
+// Takes the NEW mesh's volumes as an argument rather than computing them: brae's own FvGeometry::V is
+// validated against OpenFOAM's but is FP-conditioning-limited rather than bit-exact, and putting it
+// inside this would make a defect here indistinguishable from that.
+std::vector<scalar> correctOldVolumes(
+    const MapPolyMesh&         mpm,
+    const std::vector<scalar>& mappedV0,
+    const std::vector<scalar>& V);
+
+// ---------------------------------------------------------------------------------------------
+// UNIT 6b: the FLUX corrections. There are THREE sites, not one, and a port that finds only the first
+// is green on every refinement and silently wrong on every unrefinement.
+//
+// OF v2412: src/dynamicFvMesh/dynamicRefineFvMesh/dynamicRefineFvMesh.C
+//   mapFields, modified/added faces  :257-422   -- FOUR write sites
+//   mapFields, injected faces        :424-437   -> mapNewInternalFaces
+//   unrefine's OWN correction        :610-689   -- keyed on faceToSplitPoint and reversePointMap
+//   dynamicRefineFvMeshTemplates.C   :32-183    -- the hull average and the oriented round trip
+//
+// MEASURED on damBreakWithObstacle with `correctFluxes ((phi U))`: the mapFields correction overwrites
+// 2,156 faces on the refine step and **ZERO** on the unrefine step, where the second site overwrites
+// 158. The first site's own count of split faces reads 269 and 0.
+
+// What the corrections read off the NEW mesh. Taken as arguments because brae's own geometry is not
+// bit-exactly OpenFOAM's (see the cell mapper's note on oldCellVolumes) and a defect here must not be
+// confused with that.
+struct FluxMeshView
+{
+    label                           nInternalFaces = 0;
+    std::vector<label>              patchStart;
+    std::vector<label>              patchSize;
+    std::vector<label>              owner;
+    std::vector<label>              neighbour;
+    std::vector<std::vector<label>> cells;      // each cell's faces, owner-then-neighbour ascending
+};
+
+// :268-291. OpenFOAM's `masterFaces` is a bitSet LOCAL to mapFields: it dies with the block and
+// nothing on the mapPolyMesh or the mesh carries it, so it is derived here exactly as OpenFOAM derives
+// it. Its count is cross-checkable -- OpenFOAM prints `Found <n> split faces` at :295 under its own
+// debug switch, and the derivation reads 269 and 0 against that.
+//
+// A face that maps from an old face whose reverse map is NEGATIVE is a face removed during refinement,
+// which OpenFOAM treats as impossible and aborts on (:280-284). That is kept as a refusal.
+std::vector<char> masterFaces(
+    const MapPolyMesh& mpm,
+    label              nNewFaces);
+
+// :345-420. FOUR write sites: an inflated/appended internal face, an internal face from a master face,
+// the same two on the boundary, and then every master face -- which dispatches on whether the face is
+// internal and converts back through the patch it belongs to. Returns how many faces it wrote, so a
+// gate can refuse a silent no-op.
+label correctFluxes(
+    std::vector<scalar>&                    phi,
+    std::vector<std::vector<scalar>>&       phiBnd,
+    const std::vector<scalar>&              phiU,
+    const std::vector<std::vector<scalar>>& phiUBnd,
+    const MapPolyMesh&                      mpm,
+    const std::vector<char>&                masterFace,
+    const FluxMeshView&                     m);
+
+// Templates:32-98. For every INJECTED internal face (faceMap == -1), the average of the already-mapped
+// faces of its owner and neighbour cells -- the "hull". A face with no mapped hull face is left alone
+// (`counter > 0`), which is not the same as being set to zero.
+//
+// The accumulation order is the cell's own face order: all owner faces ascending, then all neighbour
+// faces ascending (primitiveMeshCells.C:82-97), NOT globally ascending.
+template <typename T>
+void mapNewInternalFacesFlat(
+    std::vector<T>&                    sFld,
+    const std::vector<std::vector<T>>& sBnd,
+    const MapPolyMesh&                 mpm,
+    const FluxMeshView&                m);
+
+// Templates:158-176, the ORIENTED branch -- which `phi` takes and `Uf` does not, decided by the
+// `oriented` entry in the field FILE and not by the field's name. Converts the flux to an intensive
+// vector (`sFld*Sf/sqr(magSf)`), maps that, and converts back with `sFld = (fFld & Sf)`.
+//
+// THAT LAST STEP IS A WHOLE-FIELD ASSIGNMENT and it is not the identity in floating point: it moves
+// 1,083 faces on the refine step and 1,278 on the unrefine step that no correction touched, by about
+// one ulp. It also DISCARDS the value :362 wrote on every injected internal face -- so that one line
+// of OpenFOAM is unobservable from outside, and a port may implement or omit it with no oracle able to
+// tell. Said here rather than left as a silent choice.
+void mapNewInternalFacesOriented(
+    std::vector<scalar>&                    phi,
+    std::vector<std::vector<scalar>>&       phiBnd,
+    const std::vector<vector>&              Sf,
+    const std::vector<std::vector<vector>>& SfBnd,
+    const std::vector<scalar>&              magSf,
+    const std::vector<std::vector<scalar>>& magSfBnd,
+    const MapPolyMesh&                      mpm,
+    const FluxMeshView&                     m);
+
+// :610-689, the site only unrefinement has. `faceToSplitPoint` maps each OLD face around a split point
+// to that point, and is built from the PRE-change mesh (:555-574); a face whose midpoint was removed
+// (`reversePointMap[oldPointi] < 0`) and which still exists takes the interpolated flux. There is no
+// `NaN` branch here, unlike the first site.
+label correctFluxesUnrefine(
+    std::vector<scalar>&                          phi,
+    std::vector<std::vector<scalar>>&             phiBnd,
+    const std::vector<scalar>&                    phiU,
+    const std::vector<std::vector<scalar>>&       phiUBnd,
+    const std::vector<std::pair<label, label>>&   faceToSplitPoint,
+    const MapPolyMesh&                            mpm,
+    const FluxMeshView&                           m);
 
 }   // namespace dynamicRefine
 }   // namespace brae

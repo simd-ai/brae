@@ -47,6 +47,20 @@ struct MapPolyMesh
     // (tests/test_mesh_geometry.cu), and feeding it in here would put brae's volume round-off into the
     // gate's floor and make a mapper defect indistinguishable from it.
     std::vector<scalar>                               oldCellVolumes;
+    // the FACE and POINT maps. faceMap/reverseFaceMap are what the flux correction keys on;
+    // reversePointMap is what unrefine's own second correction keys on, and nothing else reads it.
+    std::vector<label>                                faceMap;
+    std::vector<label>                                reverseFaceMap;
+    std::vector<label>                                reversePointMap;
+    // The FACE mapper's addressing as OpenFOAM built it. brae does not construct a faceMapper: its
+    // `direct()` predicate and addressing build are their own unit, and taking them from the oracle
+    // here gates the CORRECTIONS on top of OpenFOAM's own step-one mapping rather than conflating the
+    // two. Said in the gate rather than left to be inferred.
+    bool                                              faceMapperDirect = false;
+    std::vector<label>                                faceDirectAddressing;
+    std::vector<std::vector<label>>                   faceAddressing;
+    std::vector<std::vector<scalar>>                  faceWeights;
+
     // what OpenFOAM itself said about this map, for the gate to check brae's own predicate against
     // rather than assume it: `refine` or `unrefine`, and whether ITS cellMapper came out direct
     std::string                                       phase;
@@ -100,6 +114,43 @@ private:
 // Field.C:318-333 and :370-379, in OpenFOAM's own operand and accumulation order. The direct branch
 // leaves a cell whose address is negative UNTOUCHED (there are none after the mapper forces them to
 // 0); the interpolative branch starts each cell at zero and accumulates in addressing order.
+// Field.C:318-333 and :370-379, taking the addressing directly so that both a brae-built CellMapper
+// and a mapper whose addressing was read from the oracle drive the same arithmetic.
+template <typename T>
+void mapFieldWith(
+    std::vector<T>&                         f,
+    const std::vector<T>&                   oldF,
+    bool                                    direct,
+    const std::vector<label>&               directAddr,
+    const std::vector<std::vector<label>>&  addr,
+    const std::vector<std::vector<scalar>>& wght)
+{
+    if (direct)
+    {
+        f.assign(directAddr.size(), T{});
+        if (oldF.empty()) return;
+        for (std::size_t i = 0; i < directAddr.size(); ++i)
+        {
+            const label mapI = directAddr[i];
+            if (mapI >= 0)
+            {
+                f[i] = oldF[static_cast<std::size_t>(mapI)];
+            }
+        }
+        return;
+    }
+    f.assign(addr.size(), T{});
+    for (std::size_t i = 0; i < addr.size(); ++i)
+    {
+        T v{};
+        for (std::size_t j = 0; j < addr[i].size(); ++j)
+        {
+            v = v + wght[i][j]*oldF[static_cast<std::size_t>(addr[i][j])];
+        }
+        f[i] = v;
+    }
+}
+
 template <typename T>
 void mapCellField(
     std::vector<T>&       f,

@@ -3743,6 +3743,12 @@ add_test(NAME rigid_body_transform_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rigid_body_transform_vs_openfoam.sh)
 set_tests_properties(rigid_body_transform_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
+# brae's three flux corrections against real OpenFOAM's own.
+add_executable(test_flux_map_vs_openfoam tests/test_flux_map_vs_openfoam.cu)
+target_include_directories(test_flux_map_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_flux_map_vs_openfoam PRIVATE brae_core)
+
 # brae's cell mapper against real OpenFOAM's own, through a refinement and an unrefinement step.
 add_executable(test_field_map_vs_openfoam tests/test_field_map_vs_openfoam.cu)
 target_include_directories(test_field_map_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}

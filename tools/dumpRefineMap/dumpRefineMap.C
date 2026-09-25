@@ -2,12 +2,18 @@
     brae instrument, not an OpenFOAM application.
 
     The FIELD MAPPING half of OpenFOAM's dynamicRefineFvMesh: the mapPolyMesh
-    that a refine or an unrefine step produces, and the cell values every
-    registered field carries once fvMesh::mapFields has run against it.
+    that a refine or an unrefine step produces, and the cell AND face values
+    every registered field carries once fvMesh::mapFields, the V0 correction,
+    the correctFluxes_ correction and mapNewInternalFaces have run against it.
 
         dynamicRefineFvMesh::refine      dynamicRefineFvMesh.C:442-535
         dynamicRefineFvMesh::unrefine    dynamicRefineFvMesh.C:537-716
-        dynamicRefineFvMesh::mapFields   dynamicRefineFvMesh.C:197-440
+        dynamicRefineFvMesh::mapFields   dynamicRefineFvMesh.C:197-438
+          the V0 correction               :203-254
+          the flux correction             :256-422
+          mapNewInternalFaces             :424-437
+        dynamicRefineFvMesh::mapNewInternalFaces
+                                         dynamicRefineFvMeshTemplates.C:32-183
         fvMesh::updateMesh               fvMesh.C:1012-1091
         fvMesh::mapFields                fvMesh.C:838-940
 
@@ -39,8 +45,9 @@
 
     No OpenFOAM file is edited, and no OpenFOAM class is copied.
 
-    TWO TRAPS IN THE SETUP, both of which make update() silently do nothing or
-    abort, and neither of which is visible in the answer.
+    FOUR TRAPS IN THE SETUP, each of which makes update() silently do nothing,
+    abort, or take a branch other than the one being measured, and none of which
+    is visible in the answer.
 
     1. dynamicRefineFvMesh::updateTopology() refines only when
            time().timeIndex() > 0 && time().timeIndex() % refineInterval == 0
@@ -66,6 +73,26 @@
        left alone, because moving it would send the mesh reader to the next
        directory.
 
+    3. The flux correction walks the mesh's own objectRegistry
+       (dynamicRefineFvMesh.C:298-301, and mapNewInternalFaces
+       dynamicRefineFvMeshTemplates.C:109), so a surfaceScalarField that is not
+       registered BEFORE update() is not corrected, not warned about and not
+       visible. phi and Uf are therefore constructed here, on the mesh, before
+       the update; hasPhi/hasUf say whether each one was found, so a run cannot
+       quietly measure a correction that had nothing to correct.
+
+    4. Which BRANCH of mapNewInternalFaces a surface field takes is decided by
+       is_oriented() (dynamicRefineFvMeshTemplates.C:118,158), and the oriented
+       flag is a FILE entry: DimensionedField reads the optional "oriented"
+       keyword on construction (DimensionedFieldIO.C:48-51) and writes it only
+       when the field is ORIENTED (orientedType.C:123-133). interFoam's phi
+       carries `oriented oriented;` and its Uf does not, so phi takes the
+       oriented branch -- fFld = phi*Sf/sqr(magSf), map, then `sFld = (fFld &
+       Sf)` (:169-175), a whole-field assignment whose round trip is NOT the
+       identity in floating point and moves every internal AND boundary face by
+       of order one ulp -- while Uf takes the plain branch and only injected
+       internal faces move. isOriented is printed per field for that reason.
+
     The state read at <t> is therefore the state the solver held when it called
     update() for the step that FOLLOWS <t>: -time 0.002 measures the mesh change
     the log reports under "Time = 0.003".
@@ -85,12 +112,18 @@
         [brae] timeIndexAtUpdate <n>             what updateTopology tests
         [brae] refineInterval <n>
         [brae] field <name>
-        [brae] hasU|hasP_rgh <true|false>
+        [brae] hasU|hasP_rgh|hasPhi|hasUf <true|false>
+        [brae] correctFluxes <fluxName> <UName>      in the dict's own order
+        [brae] nCorrectFluxes <n>
+        [brae] isOriented <fieldName> <true|false>
+        [brae] phiUFrom <fluxName> <UName>
         [brae] pre  nCells|nPoints|nFaces|nInternalFaces <n>
         [brae] pre  cellLevel|pointLevel <i> <level>
         [brae] pre  V <celli> <value>
         [brae] pre  <fieldName> <celli> <value...>
         [brae] pre  <fieldName>Patch <patchi> <facei> <value...>
+        [brae] pre  <surfName> <facei> <value...>            internal faces
+        [brae] pre  <surfName>Patch <patchi> <facei> <value...>
         [brae] updateReturn <0|1>
         [brae] nCaptured <n>
         [brae] map <k> phase <refine|unrefine>
@@ -117,13 +150,102 @@
         [brae] map <k> cellWeights <newi> <n> <w...>        (interp only)
         [brae] map <k> cellInserted <newi>
         [brae] map <k> nCellInserted <n>
+        [brae] map <k> faceMapperDirect <true|false>
+        [brae] map <k> faceMapperSize|faceMapperSizeBeforeMapping <n>
+        [brae] map <k> faceMapperHasUnmapped <true|false>
+        [brae] map <k> faceDirectAddressing <newi> <oldi>   (direct only)
+        [brae] map <k> faceAddressing <newi> <n> <old...>   (interp only)
+        [brae] map <k> faceWeights <newi> <n> <w...>        (interp only)
+        [brae] map <k> faceInserted <newi>
+        [brae] map <k> nFaceInserted <n>
+      derived rows -- transcriptions of the correction's own loops, NOT captured:
+        [brae] map <k> masterFace <facei>
+        [brae] map <k> nMasterFace <n>
+        [brae] map <k> nMasterFaceNegative <n>
+        [brae] map <k> fluxInflated <facei>
+        [brae] map <k> nFluxInflated <n>
+        [brae] map <k> fluxFromMaster <facei>
+        [brae] map <k> nFluxFromMaster <n>
+        [brae] map <k> nFluxOverwritten <n>
+        [brae] map <k> newInternalFaceHull <facei> <n> <hullFace...>
+        [brae] map <k> nNewInternalFaceHull <n>
+        [brae] map <k> nNewInternalFaceNoHull <n>
+      unrefine only -- the SECOND correction site:
+        [brae] map <k> splitPoint <pointi>            captured (the argument)
+        [brae] map <k> nSplitPoint <n>
+        [brae] map <k> faceToSplitPoint <oldFacei> <oldPointi>
+        [brae] map <k> nFaceToSplitPoint <n>
+        [brae] map <k> unrefineFluxFace <facei>
+        [brae] map <k> nUnrefineFluxFace <n>
         [brae] post nCells|nPoints|nFaces|nInternalFaces <n>
         [brae] post cellLevel|pointLevel <i> <level>
         [brae] post V <celli> <value>
         [brae] post V0 <celli> <value>
         [brae] post <fieldName> <celli> <value...>
         [brae] post <fieldName>Patch <patchi> <facei> <value...>
+        [brae] post <surfName> <facei> <value...>
+        [brae] post <surfName>Patch <patchi> <facei> <value...>
+        [brae] post faceOwner|faceNeighbour <facei> <celli>
+        [brae] post patchStart|patchSize <patchi> <n>
+        [brae] post cellFaces <celli> <n> <facei...>
+        [brae] post Sf <facei> <x> <y> <z>       and SfPatch
+        [brae] post magSf <facei> <value>        and magSfPatch
+        [brae] post phiU <facei> <value>         and phiUPatch  (reproduced)
         [brae] END
+
+    THERE ARE TWO FLUX CORRECTIONS, not one, and they do not share a criterion.
+
+      * mapFields :256-422, reached by both phases, keyed on faceMap /
+        reverseFaceMap / masterFaces. MEASURED to be a complete no-op on the
+        unrefine step of damBreakWithObstacle: nFluxInflated, nFluxFromMaster
+        and nMasterFace are all 0 there, and OpenFOAM's own debug print agrees
+        ("Found 0 split faces").
+      * unrefine :610-689, reached by the unrefine phase ONLY, keyed on
+        faceToSplitPoint and reversePointMap, and run AFTER mapFields --
+        so after mapNewInternalFaces. It has a `none` branch but NO `NaN`
+        branch, and it is the only flux correction an unrefine actually
+        performs on this case.
+
+    WHAT THE FLUX CORRECTION READS, and which of it is CAPTURED here.
+
+    Captured (read off OpenFOAM's own objects after its own code has run):
+    faceMap and reverseFaceMap, the pre and post values of phi and Uf on both
+    halves of the field, the post mesh's Sf/magSf/faceOwner/faceNeighbour/cells,
+    and fvSurfaceMapper -- the addressing fvMesh::mapFields mapped phi's
+    internal field through, built here as a second read-only instance of the
+    same class on the same map (fvMeshMapper.H:97 surfaceMap_(mesh, faceMap_)).
+
+    DERIVED (recomputed here, so a defect in the transcription would be shared
+    by oracle and port and neither would see it):
+
+      * masterFaces. OpenFOAM does NOT expose it. It is a bitSet declared local
+        to mapFields (:268) and destroyed with the block; nothing on mapPolyMesh
+        or on the mesh carries it. It is derived here from faceMap and
+        reverseFaceMap by the loop at :270-291. The count is cross-checkable
+        against OpenFOAM's own: `-debug-switch dynamicRefineFvMesh=1` makes
+        :293-296 print "Found <n> split faces", and that number must equal
+        nMasterFace.
+      * fluxInflated and fluxFromMaster, the two inline conditions of the
+        internal loop (:359, :364) and the boundary loop (:386, :391).
+      * newInternalFaceHull, the already-mapped owner-plus-neighbour face list
+        that mapNewInternalFaces averages (Templates:72-90). Its ORDER is the
+        summation order, and it is cells()'s order, which is not ascending
+        face index: primitiveMesh::calcCells fills every cell's owner faces
+        first and its neighbour faces second, each ascending
+        (primitiveMeshCells.C:82-97).
+      * faceToSplitPoint and unrefineFluxFace, the second site's key. The table
+        is a Map local to unrefine() (:555) built from the PRE-change mesh's
+        pointEdges/edges/pointFaces, so it is rebuilt in the unrefine override
+        before the base call; splitPoints_ beside it IS captured, being the
+        argument.
+      * phiU. The correction's `fvc::interpolate(U) & Sf()` (:345-352), rebuilt
+        here after update() returns with the same expression on the same fields.
+        It reproduces the in-step value rather than capturing it, and it does so
+        exactly: mapFields clears the interpolation weights at :306 and the
+        rebuild that follows is cached on the post-change mesh, U is not touched
+        again by mapFields, and the scheme is the case's own
+        `interpolate(U)` entry (surfaceInterpolate.C:256 builds that name,
+        schemesLookup.C:221-225 resolves it).
 \*---------------------------------------------------------------------------*/
 
 #include "argList.H"
@@ -133,7 +255,13 @@
 #include "IOdictionary.H"
 #include "Switch.H"
 #include "volFields.H"
+#include "surfaceFields.H"
+#include "surfaceInterpolate.H"
 #include "cellMapper.H"
+#include "faceMapper.H"
+#include "fvSurfaceMapper.H"
+#include "bitSet.H"
+#include "Pair.H"
 #include "mapPolyMesh.H"
 #include "objectMap.H"
 #include "dynamicRefineFvMesh.H"
@@ -246,6 +374,75 @@ static void writeGeometricField
 }
 
 
+// The face values and then the patch values of one surface field, in the same
+// two row shapes writeGeometricField uses for a volField, so a reader needs one
+// parser for both halves of both kinds. The name is a parameter rather than
+// fld.name() because Sf() and magSf() are the mesh's own fields and are named
+// "S" and "magSf" (fvMeshGeometry.C:58, :95), which would make the row for the
+// face areas read "post S".
+template<class Type>
+static void writeSurfaceField
+(
+    const std::string& prefix,
+    const word& name,
+    const GeometricField<Type, fvsPatchField, surfaceMesh>& fld
+)
+{
+    const label nCmpt = pTraits<Type>::nComponents;
+
+    forAll(fld, facei)
+    {
+        Info<< "[brae] " << prefix.c_str() << ' ' << name << ' ' << facei;
+
+        for (label cmpt = 0; cmpt < nCmpt; ++cmpt)
+        {
+            Info<< ' ' << component(fld[facei], cmpt);
+        }
+
+        Info<< nl;
+    }
+
+    const auto& bf = fld.boundaryField();
+
+    forAll(bf, patchi)
+    {
+        forAll(bf[patchi], facei)
+        {
+            Info<< "[brae] " << prefix.c_str() << ' ' << name
+                << "Patch " << patchi << ' ' << facei;
+
+            for (label cmpt = 0; cmpt < nCmpt; ++cmpt)
+            {
+                Info<< ' ' << component(bf[patchi][facei], cmpt);
+            }
+
+            Info<< nl;
+        }
+    }
+}
+
+
+// One row per set member plus a count row, for a set that is EMPTY on one of
+// the two phases. Without the count a reader cannot tell empty from unprinted,
+// and on an unrefine step every one of these is empty.
+static void writeFaceSet
+(
+    const std::string& prefix,
+    const char* const name,
+    const char* const countName,
+    const bitSet& set
+)
+{
+    for (const label facei : set)
+    {
+        Info<< "[brae] " << prefix.c_str() << ' ' << name << ' ' << facei << nl;
+    }
+
+    Info<< "[brae] " << prefix.c_str() << ' ' << countName << ' '
+        << set.count() << nl;
+}
+
+
 // * * * * * * * * * * * * * * * * the mesh * * * * * * * * * * * * * * * * * //
 
 class refineMapProbeFvMesh
@@ -257,6 +454,16 @@ class refineMapProbeFvMesh
         //- How many maps have been seen in this update()
         label nCaptured_;
 
+        //- The splitPoints unrefine() was called with. Captured: it is the
+        //  argument, and unrefine's own flux correction is keyed on it.
+        labelList splitPoints_;
+
+        //- old face -> the split point on it, DERIVED from the PRE-change mesh
+        //  by the loop at dynamicRefineFvMesh.C:555-574. It has to be built
+        //  before the base call, because it reads pointEdges/edges/pointFaces
+        //  of the mesh unrefine is about to change.
+        Map<label> faceToSplitPoint_;
+
 
     // Private Member Functions
 
@@ -264,6 +471,16 @@ class refineMapProbeFvMesh
         //  fvMesh::mapFields derived from it. Read-only on the mesh and on
         //  the map; the only thing it writes is its own capture counter.
         void report(const word& phase, const mapPolyMesh& map);
+
+        //- The face sets the flux correction overwrites and the hull
+        //  mapNewInternalFaces averages, derived from the map by the
+        //  correction's own loops. Read-only on the mesh and on the map.
+        void reportFluxFaces
+        (
+            const std::string& m,
+            const word& phase,
+            const mapPolyMesh& map
+        );
 
 
 public:
@@ -306,8 +523,37 @@ protected:
 
     //- OpenFOAM's unrefine, then a read of the map it returns. updateTopology
     //  discards this map (:1440); it is the only copy there is.
+    //
+    //  unrefine() carries a SECOND flux correction of its own (:610-689),
+    //  separate from the one in mapFields and keyed on faceToSplitPoint rather
+    //  than on masterFaces. That table is local to unrefine and is read off the
+    //  PRE-change mesh, so it is rebuilt here before the base call. This is the
+    //  one place the instrument does work ahead of OpenFOAM's, and it is
+    //  read-only on the mesh: pointEdges(), edges() and pointFaces() are
+    //  demand-driven addressing the base call is about to ask for anyway.
     virtual autoPtr<mapPolyMesh> unrefine(const labelList& splitPoints)
     {
+        splitPoints_ = splitPoints;
+
+        faceToSplitPoint_ = Map<label>(3*splitPoints.size());
+
+        for (const label pointi : splitPoints)
+        {
+            const labelList& pEdges = pointEdges()[pointi];
+
+            for (const label edgei : pEdges)
+            {
+                const label otherPointi = edges()[edgei].otherVertex(pointi);
+
+                const labelList& pFaces = pointFaces()[otherPointi];
+
+                for (const label facei : pFaces)
+                {
+                    faceToSplitPoint_.insert(facei, otherPointi);
+                }
+            }
+        }
+
         autoPtr<mapPolyMesh> map
         (
             dynamicRefineFvMesh::unrefine(splitPoints)
@@ -447,7 +693,277 @@ void refineMapProbeFvMesh::report
     Info<< "[brae] " << mc << " nCellInserted "
         << cellMap.insertedObjectLabels().size() << nl;
 
+    // The face addressing the SURFACE half of fvMesh::mapFields mapped through
+    // (fvMesh.C:825-837 MapGeometricFields over fvsPatchField/surfaceMesh), as
+    // fvMeshMapper builds it: a faceMapper off the map, then an fvSurfaceMapper
+    // off the mesh and that faceMapper (fvMeshMapper.H:95,97). fvSurfaceMapper
+    // is the INTERNAL half only -- size() is nInternalFaces (fvSurfaceMapper.H:
+    // 117-120) -- and phi's patch values map through fvPatchMapper instead.
+    const faceMapper faceMapper_(map);
+    const fvSurfaceMapper surfMap(*this, faceMapper_);
+
+    Info<< "[brae] " << mc << " faceMapperDirect "
+        << Switch(surfMap.direct()) << nl
+        << "[brae] " << mc << " faceMapperSize " << surfMap.size() << nl
+        << "[brae] " << mc << " faceMapperSizeBeforeMapping "
+        << surfMap.sizeBeforeMapping() << nl
+        << "[brae] " << mc << " faceMapperHasUnmapped "
+        << Switch(surfMap.hasUnmapped()) << nl;
+
+    if (surfMap.direct())
+    {
+        writeLabels(m + " faceDirectAddressing", surfMap.directAddressing());
+    }
+    else
+    {
+        const labelListList& addr = surfMap.addressing();
+        const scalarListList& w = surfMap.weights();
+
+        forAll(addr, facei)
+        {
+            Info<< "[brae] " << mc << " faceAddressing " << facei << ' '
+                << addr[facei].size();
+
+            for (const label a : addr[facei])
+            {
+                Info<< ' ' << a;
+            }
+
+            Info<< nl;
+
+            Info<< "[brae] " << mc << " faceWeights " << facei << ' '
+                << w[facei].size();
+
+            for (const scalar s : w[facei])
+            {
+                Info<< ' ' << s;
+            }
+
+            Info<< nl;
+        }
+    }
+
+    writeLabels(m + " faceInserted", surfMap.insertedObjectLabels());
+    Info<< "[brae] " << mc << " nFaceInserted "
+        << surfMap.insertedObjectLabels().size() << nl;
+
+    reportFluxFaces(m, phase, map);
+
     Info<< flush;
+}
+
+
+// The three face sets the flux correction overwrites, and the hull
+// mapNewInternalFaces averages. Every row here is DERIVED: see the header. The
+// mesh is the POST-change mesh, which is the mesh the correction ran against.
+void refineMapProbeFvMesh::reportFluxFaces
+(
+    const std::string& m,
+    const word& phase,
+    const mapPolyMesh& map
+)
+{
+    const char* const mc = m.c_str();
+
+    const labelList& faceMap = map.faceMap();
+    const labelList& reverseFaceMap = map.reverseFaceMap();
+
+    // dynamicRefineFvMesh.C:268-291, with one difference stated rather than
+    // hidden: OpenFOAM aborts on a negative masterFacei (:278-285, "should not
+    // have removed faces when refining"). An instrument that aborted there
+    // would destroy the dump it exists to produce, so the count is printed
+    // instead and it must be 0 for the derivation to mean what OpenFOAM means.
+    bitSet masterFaces(nFaces());
+    label nNegative = 0;
+
+    forAll(faceMap, facei)
+    {
+        const label oldFacei = faceMap[facei];
+
+        if (oldFacei >= 0)
+        {
+            const label masterFacei = reverseFaceMap[oldFacei];
+
+            if (masterFacei < 0)
+            {
+                ++nNegative;
+            }
+            else if (masterFacei != facei)
+            {
+                masterFaces.set(masterFacei);
+            }
+        }
+    }
+
+    // The two inline conditions, split apart so a gate can see WHICH of them
+    // claimed a face. The internal loop (:355-369) and the boundary loop
+    // (:374-399) test the same pair, so they are walked in OpenFOAM's order and
+    // recorded in one pair of sets indexed by mesh face.
+    bitSet inflated(nFaces());
+    bitSet fromMaster(nFaces());
+
+    for (label facei = 0; facei < nInternalFaces(); ++facei)
+    {
+        const label oldFacei = faceMap[facei];
+
+        if (oldFacei == -1)
+        {
+            inflated.set(facei);
+        }
+        else if (reverseFaceMap[oldFacei] != facei)
+        {
+            fromMaster.set(facei);
+        }
+    }
+
+    forAll(boundary(), patchi)
+    {
+        label facei = boundary()[patchi].start();
+
+        forAll(boundary()[patchi], i)
+        {
+            const label oldFacei = faceMap[facei];
+
+            if (oldFacei == -1)
+            {
+                inflated.set(facei);
+            }
+            else if (reverseFaceMap[oldFacei] != facei)
+            {
+                fromMaster.set(facei);
+            }
+
+            ++facei;
+        }
+    }
+
+    writeFaceSet(m, "masterFace", "nMasterFace", masterFaces);
+    Info<< "[brae] " << mc << " nMasterFaceNegative " << nNegative << nl;
+
+    writeFaceSet(m, "fluxInflated", "nFluxInflated", inflated);
+    writeFaceSet(m, "fluxFromMaster", "nFluxFromMaster", fromMaster);
+
+    // The union, because the three sets overlap: the siblings of a split face
+    // are fromMaster and their master is masterFace, so a port that counted the
+    // three separately would over-count the faces that actually changed.
+    bitSet overwritten(masterFaces);
+    overwritten |= inflated;
+    overwritten |= fromMaster;
+
+    Info<< "[brae] " << mc << " nFluxOverwritten "
+        << overwritten.count() << nl;
+
+    // dynamicRefineFvMeshTemplates.C:59-97. cells() order is the summation
+    // order and it is owner faces then neighbour faces, each ascending
+    // (primitiveMeshCells.C:82-97), so the list is printed rather than left for
+    // a port to guess.
+    const labelUList& own = faceOwner();
+    const labelUList& nei = faceNeighbour();
+    const cellList& cs = cells();
+
+    label nHull = 0;
+    label nNoHull = 0;
+
+    for (label facei = 0; facei < nInternalFaces(); ++facei)
+    {
+        if (faceMap[facei] != -1)
+        {
+            continue;
+        }
+
+        DynamicList<label> hull;
+
+        for (const label ownFacei : cs[own[facei]])
+        {
+            if (faceMap[ownFacei] != -1)
+            {
+                hull.append(ownFacei);
+            }
+        }
+
+        for (const label neiFacei : cs[nei[facei]])
+        {
+            if (faceMap[neiFacei] != -1)
+            {
+                hull.append(neiFacei);
+            }
+        }
+
+        Info<< "[brae] " << mc << " newInternalFaceHull " << facei << ' '
+            << hull.size();
+
+        for (const label h : hull)
+        {
+            Info<< ' ' << h;
+        }
+
+        Info<< nl;
+
+        if (hull.empty())
+        {
+            // counter == 0 leaves the face alone (Templates:92-95), which is
+            // the one case where an injected face keeps its mapped value
+            ++nNoHull;
+        }
+        else
+        {
+            ++nHull;
+        }
+    }
+
+    Info<< "[brae] " << mc << " nNewInternalFaceHull " << nHull << nl
+        << "[brae] " << mc << " nNewInternalFaceNoHull " << nNoHull << nl;
+
+    if (phase != "unrefine")
+    {
+        return;
+    }
+
+    // THE SECOND CORRECTION SITE (:610-689), which lives in unrefine() and not
+    // in mapFields, runs AFTER mapFields has finished, and is keyed on a face's
+    // split point rather than on masterFaces. On this case the mapFields
+    // correction is a complete no-op on an unrefine step -- all three sets
+    // above are empty -- so this is the only flux correction an unrefine
+    // performs, and a port that implemented only the mapFields half would be
+    // green on the refine arm and silently wrong here.
+    writeLabels(m + " splitPoint", splitPoints_);
+    Info<< "[brae] " << mc << " nSplitPoint " << splitPoints_.size() << nl;
+
+    const labelList oldFaces(faceToSplitPoint_.sortedToc());
+
+    for (const label oldFacei : oldFaces)
+    {
+        Info<< "[brae] " << mc << " faceToSplitPoint " << oldFacei << ' '
+            << faceToSplitPoint_[oldFacei] << nl;
+    }
+
+    Info<< "[brae] " << mc << " nFaceToSplitPoint " << oldFaces.size() << nl;
+
+    // The faces :659-687 writes phiU onto: an old face whose split point is
+    // gone (reversePointMap < 0) and which still exists (reverseFaceMap >= 0).
+    // Printed sorted by NEW face so the row order does not inherit the hash
+    // table's.
+    const labelList& reversePointMap = map.reversePointMap();
+    const labelList& reverseFaceMap2 = map.reverseFaceMap();
+
+    bitSet unrefineFlux(nFaces());
+
+    for (const label oldFacei : oldFaces)
+    {
+        const label oldPointi = faceToSplitPoint_[oldFacei];
+
+        if (reversePointMap[oldPointi] < 0)
+        {
+            const label facei = reverseFaceMap2[oldFacei];
+
+            if (facei >= 0)
+            {
+                unrefineFlux.set(facei);
+            }
+        }
+    }
+
+    writeFaceSet(m, "unrefineFluxFace", "nUnrefineFluxFace", unrefineFlux);
 }
 
 
@@ -622,6 +1138,45 @@ int main(int argc, char *argv[])
         }
     }
 
+    // ...and the two SURFACE fields the flux correction and
+    // mapNewInternalFaces act on. They have to exist before update() or none of
+    // the three passes can see them: the correction takes its list from the
+    // registry (:298-301) and so does mapNewInternalFaces (Templates:109).
+    // Trap 4 in the header: which branch phi takes is decided by the "oriented"
+    // entry in the FILE, so these must be read, never rebuilt from U.
+    autoPtr<surfaceScalarField> phiPtr;
+    autoPtr<surfaceVectorField> UfPtr;
+
+    {
+        IOobject phiio
+        (
+            "phi",
+            runTime.timeName(),
+            mesh,
+            IOobject::MUST_READ,
+            IOobject::NO_WRITE
+        );
+
+        if (phiio.typeHeaderOk<surfaceScalarField>(true))
+        {
+            phiPtr.reset(new surfaceScalarField(phiio, mesh));
+        }
+
+        IOobject Ufio
+        (
+            "Uf",
+            runTime.timeName(),
+            mesh,
+            IOobject::MUST_READ,
+            IOobject::NO_WRITE
+        );
+
+        if (Ufio.typeHeaderOk<surfaceVectorField>(true))
+        {
+            UfPtr.reset(new surfaceVectorField(Ufio, mesh));
+        }
+    }
+
     Info<< "[brae] time " << runTime.timeName() << nl
         << "[brae] timeDirIndex " << stepIndex << nl
         << "[brae] timeIndexAtConstruction " << constructionIndex << nl
@@ -629,7 +1184,41 @@ int main(int argc, char *argv[])
         << "[brae] refineInterval " << refineInterval << nl
         << "[brae] field " << fieldName << nl
         << "[brae] hasU " << Switch(bool(UPtr)) << nl
-        << "[brae] hasP_rgh " << Switch(bool(pRghPtr)) << nl;
+        << "[brae] hasP_rgh " << Switch(bool(pRghPtr)) << nl
+        << "[brae] hasPhi " << Switch(bool(phiPtr)) << nl
+        << "[brae] hasUf " << Switch(bool(UfPtr)) << nl;
+
+    // The correctFluxes table in the dict's OWN order. readDict reworks this
+    // list into a HashTable (:184-191) whose iteration order is the table's, so
+    // the list is the only ordered authority on it. It is printed whole because
+    // an entry this instrument does not register is still an entry a port has to
+    // honour, and because "none" and an ABSENT name are different code paths
+    // (:312-328): absent warns and skips, "none" skips silently.
+    {
+        const auto fluxVelocities
+        (
+            refineDict.get<List<Pair<word>>>("correctFluxes")
+        );
+
+        for (const auto& pr : fluxVelocities)
+        {
+            Info<< "[brae] correctFluxes " << pr.first() << ' '
+                << pr.second() << nl;
+        }
+
+        Info<< "[brae] nCorrectFluxes " << fluxVelocities.size() << nl;
+    }
+
+    if (phiPtr)
+    {
+        Info<< "[brae] isOriented phi "
+            << Switch(phiPtr().is_oriented()) << nl;
+    }
+    if (UfPtr)
+    {
+        Info<< "[brae] isOriented Uf "
+            << Switch(UfPtr().is_oriented()) << nl;
+    }
 
     // PRE-update state.
     Info<< "[brae] pre nCells " << mesh.nCells() << nl
@@ -654,6 +1243,14 @@ int main(int argc, char *argv[])
     if (pRghPtr)
     {
         writeGeometricField("pre", pRghPtr());
+    }
+    if (phiPtr)
+    {
+        writeSurfaceField("pre", "phi", phiPtr());
+    }
+    if (UfPtr)
+    {
+        writeSurfaceField("pre", "Uf", UfPtr());
     }
 
     // The runTime++ that precedes mesh.update() in the solver, with the time
@@ -703,6 +1300,101 @@ int main(int argc, char *argv[])
     if (pRghPtr)
     {
         writeGeometricField("post", pRghPtr());
+    }
+    if (phiPtr)
+    {
+        writeSurfaceField("post", "phi", phiPtr());
+    }
+    if (UfPtr)
+    {
+        writeSurfaceField("post", "Uf", UfPtr());
+    }
+
+    // The post-change mesh the correction ran against. owner/neighbour and
+    // cells() are here because mapNewInternalFaces walks the hull through them
+    // and the ORDER of cells()[celli] is the order it sums in; Sf and magSf
+    // because phiU is `... & Sf()` (:351) and because the oriented branch
+    // divides by sqr(magSf) (Templates:169).
+    writeLabels("post faceOwner", mesh.faceOwner());
+    writeLabels("post faceNeighbour", mesh.faceNeighbour());
+
+    // The boundary loop of the correction walks patch().start() upwards
+    // (:380,:397) and the masterFace loop converts the other way with
+    // whichPatch() and start() (:410-411), so the POST-change patch starts are
+    // what turns a (patchi, i) row into a mesh face and back. map <k>
+    // oldPatchStarts is the OLD mesh's and cannot do it.
+    forAll(mesh.boundary(), patchi)
+    {
+        Info<< "[brae] post patchStart " << patchi << ' '
+            << mesh.boundary()[patchi].start() << nl
+            << "[brae] post patchSize " << patchi << ' '
+            << mesh.boundary()[patchi].size() << nl;
+    }
+
+    {
+        const cellList& cs = mesh.cells();
+
+        forAll(cs, celli)
+        {
+            Info<< "[brae] post cellFaces " << celli << ' ' << cs[celli].size();
+
+            for (const label facei : cs[celli])
+            {
+                Info<< ' ' << facei;
+            }
+
+            Info<< nl;
+        }
+    }
+
+    writeSurfaceField("post", "Sf", mesh.Sf());
+    writeSurfaceField("post", "magSf", mesh.magSf());
+
+    // phiU, REPRODUCED and not captured: the correction's own expression
+    // (:345-352) evaluated after update() returned, on the same U and the same
+    // post-change weights. It is printed for the flux named FIRST in
+    // correctFluxes that this instrument actually holds and whose velocity is
+    // neither "none" nor "NaN", and the pairing is printed with it so a reader
+    // never has to assume which flux and which velocity it belongs to.
+    if (phiPtr)
+    {
+        word UName(word::null);
+
+        for (const auto& pr : refineDict.get<List<Pair<word>>>("correctFluxes"))
+        {
+            if (pr.first() == "phi")
+            {
+                UName = pr.second();
+            }
+        }
+
+        if (UName.empty() || UName == "none" || UName == "NaN")
+        {
+            // Not a defect and not a substitution: it is the case telling the
+            // correction to leave phi alone, and the reader has to be able to
+            // see that the interpolating branch did not run.
+            Info<< "[brae] phiUFrom phi " << (UName.empty() ? "absent" : UName)
+                << nl;
+        }
+        else if (!mesh.foundObject<volVectorField>(UName))
+        {
+            Info<< "[brae] phiUFrom phi " << UName << "-unregistered" << nl;
+        }
+        else
+        {
+            Info<< "[brae] phiUFrom phi " << UName << nl;
+
+            const surfaceScalarField phiU
+            (
+                fvc::interpolate
+                (
+                    mesh.lookupObject<volVectorField>(UName)
+                )
+              & mesh.Sf()
+            );
+
+            writeSurfaceField("post", "phiU", phiU);
+        }
     }
 
     Info<< "[brae] END" << nl;

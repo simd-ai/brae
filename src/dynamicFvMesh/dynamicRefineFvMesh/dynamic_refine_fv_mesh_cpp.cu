@@ -920,5 +920,359 @@ std::vector<label> selectUnrefinePoints(
 }
 
 
+std::vector<scalar> correctOldVolumes(
+    const MapPolyMesh&         mpm,
+    const std::vector<scalar>& mappedV0,
+    const std::vector<scalar>& V)
+{
+    const std::size_t nNew = mpm.cellMap.size();
+    if (mappedV0.size() != nNew || V.size() != nNew)
+    {
+        throw std::runtime_error(
+            std::string(WHO) + "the old-time volume correction was handed " + std::to_string(mappedV0.size())
+            + " mapped old volumes and " + std::to_string(V.size()) + " new ones where the map spans "
+            + std::to_string(nNew) + " cells.");
+    }
+    // The reverse map is sized for all old AND ADDED cells (mapPolyMesh.H:535), so it is longer than
+    // the old mesh on a refinement -- 24,815 entries for 24,185 old cells on the measured step. Only
+    // the old-cell range is indexed here, which is what OpenFOAM does at :217.
+    if (static_cast<label>(mpm.reverseCellMap.size()) < mpm.nOldCells)
+    {
+        throw std::runtime_error(
+            std::string(WHO) + "the correction needs the reverse cell map -- it is what tells a SPLIT "
+            "from a renumber (dynamicRefineFvMesh.C:217) -- and the map carries only "
+            + std::to_string(mpm.reverseCellMap.size()) + " entries for " + std::to_string(mpm.nOldCells)
+            + " old cells.");
+    }
+
+    // :212-222. Count only the new cells whose old cell still exists, so a renumber does not look like
+    // a split.
+    std::vector<label> nSubCells(static_cast<std::size_t>(mpm.nOldCells), 0);
+    for (std::size_t celli = 0; celli < nNew; ++celli)
+    {
+        const label oldCelli = mpm.cellMap[celli];
+        if (oldCelli >= 0 && mpm.reverseCellMap[static_cast<std::size_t>(oldCelli)] >= 0)
+        {
+            ++nSubCells[static_cast<std::size_t>(oldCelli)];
+        }
+    }
+
+    // :225 -- start from the MAPPED old volumes, not from the raw ones
+    std::vector<scalar> corrected = mappedV0;
+
+    // :229-238 -- a split cell takes its own new volume
+    for (std::size_t celli = 0; celli < nNew; ++celli)
+    {
+        const label oldCelli = mpm.cellMap[celli];
+        if (oldCelli >= 0 && nSubCells[static_cast<std::size_t>(oldCelli)] == 8)
+        {
+            corrected[celli] = V[celli];
+        }
+    }
+
+    // :240-251 -- and so does a merged one. OpenFOAM does NOT sum the old volumes here, and its own
+    // comment asks whether it should.
+    for (const auto& s : mpm.cellsFromCells)
+    {
+        corrected[static_cast<std::size_t>(s.first)] = V[static_cast<std::size_t>(s.first)];
+    }
+    return corrected;
+}
+
+
+namespace {
+
+// `tmpValue/counter` as OpenFOAM writes it: a division per component, not a multiply by the reciprocal
+inline scalar divideByCount(scalar v, scalar n)
+{
+    return v/n;
+}
+
+inline vector divideByCount(const vector& v, scalar n)
+{
+    return vector{v.x/n, v.y/n, v.z/n};
+}
+
+// which patch a boundary face belongs to, and its index within it -- OpenFOAM's
+// boundaryMesh().whichPatch(facei) followed by facei - patch.start()
+bool locateBoundaryFace(
+    const FluxMeshView& m,
+    label               facei,
+    std::size_t&        patchi,
+    std::size_t&        i)
+{
+    for (std::size_t p = 0; p < m.patchStart.size(); ++p)
+    {
+        const label s = m.patchStart[p];
+        const label n = m.patchSize[p];
+        if (facei >= s && facei < s + n)
+        {
+            patchi = p;
+            i = static_cast<std::size_t>(facei - s);
+            return true;
+        }
+    }
+    return false;
+}
+
+}   // namespace
+
+
+std::vector<char> masterFaces(
+    const MapPolyMesh& mpm,
+    label              nNewFaces)
+{
+    std::vector<char> master(static_cast<std::size_t>(nNewFaces), 0);
+    for (std::size_t facei = 0; facei < mpm.faceMap.size(); ++facei)
+    {
+        const label oldFacei = mpm.faceMap[facei];
+        if (oldFacei < 0) continue;
+        const label masterFacei = mpm.reverseFaceMap[static_cast<std::size_t>(oldFacei)];
+        if (masterFacei < 0)
+        {
+            // :280-284 -- OpenFOAM aborts here: refinement must not remove faces
+            throw std::runtime_error(
+                std::string(WHO) + "face " + std::to_string(facei) + " maps from old face "
+                + std::to_string(oldFacei) + ", which the reverse map says was REMOVED. OpenFOAM "
+                "aborts on this (dynamicRefineFvMesh.C:280-284): refinement does not remove faces.");
+        }
+        if (masterFacei != static_cast<label>(facei))
+        {
+            master[static_cast<std::size_t>(masterFacei)] = 1;
+        }
+    }
+    return master;
+}
+
+
+label correctFluxes(
+    std::vector<scalar>&                    phi,
+    std::vector<std::vector<scalar>>&       phiBnd,
+    const std::vector<scalar>&              phiU,
+    const std::vector<std::vector<scalar>>& phiUBnd,
+    const MapPolyMesh&                      mpm,
+    const std::vector<char>&                masterFace,
+    const FluxMeshView&                     m)
+{
+    label nWritten = 0;
+    std::vector<char> written(mpm.faceMap.size(), 0);
+    auto note = [&](label facei)
+    {
+        if (!written[static_cast<std::size_t>(facei)])
+        {
+            written[static_cast<std::size_t>(facei)] = 1;
+            ++nWritten;
+        }
+    };
+
+    // :355-369 -- new INTERNAL faces
+    for (label facei = 0; facei < m.nInternalFaces; ++facei)
+    {
+        const label oldFacei = mpm.faceMap[static_cast<std::size_t>(facei)];
+        if (oldFacei == -1
+         || mpm.reverseFaceMap[static_cast<std::size_t>(oldFacei)] != facei)
+        {
+            phi[static_cast<std::size_t>(facei)] = phiU[static_cast<std::size_t>(facei)];
+            note(facei);
+        }
+    }
+
+    // :372-399 -- and new BOUNDARY faces, walked patch by patch with a running face index
+    for (std::size_t patchi = 0; patchi < phiBnd.size(); ++patchi)
+    {
+        label facei = m.patchStart[patchi];
+        for (std::size_t i = 0; i < phiBnd[patchi].size(); ++i, ++facei)
+        {
+            const label oldFacei = mpm.faceMap[static_cast<std::size_t>(facei)];
+            if (oldFacei == -1
+             || mpm.reverseFaceMap[static_cast<std::size_t>(oldFacei)] != facei)
+            {
+                phiBnd[patchi][i] = phiUBnd[patchi][i];
+                note(facei);
+            }
+        }
+    }
+
+    // :402-420 -- then every MASTER face, internal or boundary
+    for (std::size_t facei = 0; facei < masterFace.size(); ++facei)
+    {
+        if (!masterFace[facei]) continue;
+        const label f = static_cast<label>(facei);
+        if (f < m.nInternalFaces)
+        {
+            phi[facei] = phiU[facei];
+            note(f);
+        }
+        else
+        {
+            std::size_t patchi = 0, i = 0;
+            if (!locateBoundaryFace(m, f, patchi, i))
+            {
+                throw std::runtime_error(
+                    std::string(WHO) + "master face " + std::to_string(f) + " is neither internal nor "
+                    "on any patch of the new mesh.");
+            }
+            phiBnd[patchi][i] = phiUBnd[patchi][i];
+            note(f);
+        }
+    }
+    return nWritten;
+}
+
+
+template <typename T>
+void mapNewInternalFacesFlat(
+    std::vector<T>&                    sFld,
+    const std::vector<std::vector<T>>& sBnd,
+    const MapPolyMesh&                 mpm,
+    const FluxMeshView&                m)
+{
+    // Templates:42-53 -- one flat field over every face, internal then boundary in patch order
+    std::vector<T> flat(mpm.faceMap.size(), T{});
+    for (label facei = 0; facei < m.nInternalFaces; ++facei)
+    {
+        flat[static_cast<std::size_t>(facei)] = sFld[static_cast<std::size_t>(facei)];
+    }
+    for (std::size_t patchi = 0; patchi < sBnd.size(); ++patchi)
+    {
+        label facei = m.patchStart[patchi];
+        for (const T& v : sBnd[patchi])
+        {
+            flat[static_cast<std::size_t>(facei++)] = v;
+        }
+    }
+
+    // Templates:59-97 -- the hull of already-mapped faces, in the cell's OWN face order
+    for (label facei = 0; facei < m.nInternalFaces; ++facei)
+    {
+        if (mpm.faceMap[static_cast<std::size_t>(facei)] != -1) continue;
+        T tmpValue{};
+        label counter = 0;
+        for (const label side : {m.owner[static_cast<std::size_t>(facei)],
+                                 m.neighbour[static_cast<std::size_t>(facei)]})
+        {
+            for (const label f : m.cells[static_cast<std::size_t>(side)])
+            {
+                if (mpm.faceMap[static_cast<std::size_t>(f)] != -1)
+                {
+                    tmpValue = tmpValue + flat[static_cast<std::size_t>(f)];
+                    ++counter;
+                }
+            }
+        }
+        // :92-95 -- a face with NO mapped hull face is left alone, which is not the same as zeroed
+        if (counter > 0)
+        {
+            // Templates:94 is `tmpValue/counter` -- a DIVISION. Multiplying by the reciprocal instead
+            // rounds differently: measured at 1.08e-19 on 398 of 76,039 faces on the refine arm, which
+            // was the whole of its residue.
+            sFld[static_cast<std::size_t>(facei)] =
+                divideByCount(tmpValue, static_cast<scalar>(counter));
+        }
+    }
+}
+
+template void mapNewInternalFacesFlat<scalar>(
+    std::vector<scalar>&, const std::vector<std::vector<scalar>>&, const MapPolyMesh&,
+    const FluxMeshView&);
+template void mapNewInternalFacesFlat<vector>(
+    std::vector<vector>&, const std::vector<std::vector<vector>>&, const MapPolyMesh&,
+    const FluxMeshView&);
+
+
+void mapNewInternalFacesOriented(
+    std::vector<scalar>&                    phi,
+    std::vector<std::vector<scalar>>&       phiBnd,
+    const std::vector<vector>&              Sf,
+    const std::vector<std::vector<vector>>& SfBnd,
+    const std::vector<scalar>&              magSf,
+    const std::vector<std::vector<scalar>>& magSfBnd,
+    const MapPolyMesh&                      mpm,
+    const FluxMeshView&                     m)
+{
+    // Templates:169 -- to intensive and non-oriented: fFld = sFld*Sf/sqr(magSf)
+    std::vector<vector> fFld(static_cast<std::size_t>(m.nInternalFaces), vector{0, 0, 0});
+    for (std::size_t i = 0; i < fFld.size(); ++i)
+    {
+        // Templates:169 is `sFld*Sf/sqr(magSf)`: the field expression multiplies FIRST and divides
+        // second. Dividing first and then scaling rounds differently -- measured at 1.08e-19 on 398
+        // of 76,039 faces, which is the whole of the refine arm's residue.
+        const scalar d = magSf[i]*magSf[i];
+        fFld[i] = (phi[i]*Sf[i])/d;
+    }
+    std::vector<std::vector<vector>> fBnd(SfBnd.size());
+    for (std::size_t p = 0; p < SfBnd.size(); ++p)
+    {
+        fBnd[p].assign(SfBnd[p].size(), vector{0, 0, 0});
+        for (std::size_t i = 0; i < SfBnd[p].size(); ++i)
+        {
+            const scalar d = magSfBnd[p][i]*magSfBnd[p][i];
+            fBnd[p][i] = (phiBnd[p][i]*SfBnd[p][i])/d;
+        }
+    }
+
+    // :172 -- map the intensive field
+    mapNewInternalFacesFlat<vector>(fFld, fBnd, mpm, m);
+
+    // :175 -- and back, `sFld = (fFld & Sf)`. A WHOLE-FIELD assignment: every face is rewritten, not
+    // only the injected ones, and the round trip is not the identity in floating point.
+    for (std::size_t i = 0; i < fFld.size(); ++i)
+    {
+        phi[i] = dot(fFld[i], Sf[i]);
+    }
+    for (std::size_t p = 0; p < fBnd.size(); ++p)
+    {
+        for (std::size_t i = 0; i < fBnd[p].size(); ++i)
+        {
+            phiBnd[p][i] = dot(fBnd[p][i], SfBnd[p][i]);
+        }
+    }
+}
+
+
+label correctFluxesUnrefine(
+    std::vector<scalar>&                        phi,
+    std::vector<std::vector<scalar>>&           phiBnd,
+    const std::vector<scalar>&                  phiU,
+    const std::vector<std::vector<scalar>>&     phiUBnd,
+    const std::vector<std::pair<label, label>>& faceToSplitPoint,
+    const MapPolyMesh&                          mpm,
+    const FluxMeshView&                         m)
+{
+    label nWritten = 0;
+    std::vector<char> written(mpm.faceMap.size(), 0);
+    // :659-687. Each entry writes the same value to the same face, so the iteration order of
+    // OpenFOAM's Map does not reach the answer.
+    for (const auto& entry : faceToSplitPoint)
+    {
+        const label oldFacei = entry.first;
+        const label oldPointi = entry.second;
+        if (static_cast<std::size_t>(oldPointi) >= mpm.reversePointMap.size()) continue;
+        if (mpm.reversePointMap[static_cast<std::size_t>(oldPointi)] >= 0) continue;
+        const label facei = mpm.reverseFaceMap[static_cast<std::size_t>(oldFacei)];
+        if (facei < 0) continue;
+        if (written[static_cast<std::size_t>(facei)]) continue;
+        written[static_cast<std::size_t>(facei)] = 1;
+        ++nWritten;
+        if (facei < m.nInternalFaces)
+        {
+            phi[static_cast<std::size_t>(facei)] = phiU[static_cast<std::size_t>(facei)];
+        }
+        else
+        {
+            std::size_t patchi = 0, i = 0;
+            if (!locateBoundaryFace(m, facei, patchi, i))
+            {
+                throw std::runtime_error(
+                    std::string(WHO) + "the unrefinement flux correction met face "
+                    + std::to_string(facei) + ", which is neither internal nor on any patch.");
+            }
+            phiBnd[patchi][i] = phiUBnd[patchi][i];
+        }
+    }
+    return nWritten;
+}
+
+
 }   // namespace dynamicRefine
 }   // namespace brae
