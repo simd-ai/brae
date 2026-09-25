@@ -109,6 +109,7 @@ add_library(brae_core STATIC
     src/OpenFOAM/meshes/primitiveMesh/PrimitivePatch/primitive_patch_cpp.cu
     src/meshTools/cellDist/patchWave/patch_wave_cpp.cu
     src/OpenFOAM/meshes/primitiveMesh/edges/mesh_edges_cpp.cu
+    src/OpenFOAM/meshes/polyMesh/mapPolyMesh/map_poly_mesh_cpp.cu
     src/dynamicFvMesh/dynamicRefineFvMesh/dynamic_refine_fv_mesh_cpp.cu
     src/dynamicMesh/pointPatchDist/point_patch_dist_cpp.cu
     src/rigidBodyDynamics/rigid_body_motion_cpp.cu
@@ -3741,6 +3742,15 @@ target_link_libraries(test_rigid_body_transform_vs_openfoam PRIVATE brae_core)
 add_test(NAME rigid_body_transform_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rigid_body_transform_vs_openfoam.sh)
 set_tests_properties(rigid_body_transform_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# brae's cell mapper against real OpenFOAM's own, through a refinement and an unrefinement step.
+add_executable(test_field_map_vs_openfoam tests/test_field_map_vs_openfoam.cu)
+target_include_directories(test_field_map_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_field_map_vs_openfoam PRIVATE brae_core)
+add_test(NAME field_map_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/field_map_vs_openfoam.sh)
+set_tests_properties(field_map_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
 # brae's refinement candidate selection against real OpenFOAM's own dynamicRefineFvMesh members.
 add_executable(test_refine_candidates_vs_openfoam tests/test_refine_candidates_vs_openfoam.cu)
