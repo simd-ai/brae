@@ -83,6 +83,41 @@
 #                                              (`cylinder` cannot see this one: its pcorr is PCG and
 #                                              its motion is solid-body, so p_rgh builds the only
 #                                              hierarchy there whether it shares or not)
+#   esd            RAS/electrostaticDeposition, TWO STEPS of 1e-3, and it is here for ALPHA'S PATCH
+#                  VALUES -- the only thing this harness compares on a boundary rather than in a cell,
+#                  and the only interFoam tutorial where OpenFOAM's under-relaxed alpha corrector is
+#                  DISTINGUISHABLE from an evaluate. `alpha1 = 0.5*alpha1 + 0.5*alpha10`
+#                  (VoF/alphaEqn.H:202) is a whole-field ASSIGNMENT, and its boundary half reaches each
+#                  patch through that patch's own VIRTUAL operator= -- nothing on the path consults
+#                  assignable(). A `variableHeightFlowRate` patch is mixed and overrides no operator=,
+#                  so mixedFvPatchField.H:303-305 leaves its value ALONE; on an OUTFLOW face, where its
+#                  valueFraction is 0, an evaluate would write the owner cell there instead.
+#                  ITS MESH MOVES, which is why it belongs here: `solidBody tabulated6DoFMotion`, a
+#                  RIGID translation at -0.08 m/s, so V == V0 and the volume weights are blind to it.
+#                  54,390 cells (blockMesh 9,000 + snappyHexMesh), and the tutorial SHIPS its own
+#                  surface (constant/triSurface/metalSheet.stl.gz), so the staging must not copy one
+#                  from resources/. Its Allrun.pre also rotates the mesh AFTER setFields.
+#                  MEASURED at step two, on side-03..side-06 (600 faces each; side-01 sits at the clamp
+#                  and carries nothing): the CELLS agree to 4.6e-16 while OpenFOAM's own written patch
+#                  value sits 5.1256e-10 off its own owner cell on 240 of the 2,625 faces -- six orders
+#                  apart, so nothing else on the case can be responsible. brae reads 4.4409e-16.
+#                  BEFORE THE FIX brae's patch value sat EXACTLY on OpenFOAM's owner cell: the two
+#                  differences were the same 5.1256e-10 to five digits, which is what "brae evaluates
+#                  where OpenFOAM assigns" looks like measured. It took BOTH sites -- the relaxation in
+#                  alpha_eqn_cpp.cu and a second evaluate after the sub-cycle in inter_driver_cpp.cu,
+#                  which had been making the first inert.
+#                  TWO STEPS AND NOT TEN: this case also carries the OPEN `cellLimited leastSquares`
+#                  grad(alpha) item, whose cell gap passes the patch difference from step five (2.2e-09
+#                  at five, 2.9e-08 at ten). Those step counts measure the gradient item, not this one.
+#                  THE ORACLE IS ASSERTED TO HAVE TAKEN THE PATH -- at least 200 of its own written
+#                  faces must be off its own cells -- because an oracle whose patch value equals its
+#                  owner cell agrees with a re-evaluating brae by accident.
+#   esdNoCorr      THE CONTROL: the same case with `MULESCorr no`, one dictionary entry, so the
+#                  relaxation branch never runs. OpenFOAM's patch value goes back ON its owner cell: 0
+#                  faces stale, worst 7.1054e-15, brae 1.9451e-16. As a control on the FIELDS it moves
+#                  OpenFOAM's own alpha 8.1858e-09 and U 2.9337e-04 relative -- eleven orders above
+#                  brae's own distance. THE DEVICE ARM REFUSES this case, on the cellLimited gradient,
+#                  and the gate asserts the refusal rather than trusting it.
 #   closedDamBreak laminar/damBreak with its atmosphere WALLED OFF (U fixedValue 0, p_rgh
 #                  fixedFluxPressure, alpha zeroGradient) and `pRefPoint (0.292 0.292 0.0073);
 #                  pRefValue 0;` -- the pressure reference on a mesh that does not move, twenty of the
@@ -398,6 +433,31 @@ if profile.endswith('CN'):
 
 q = os.path.join(d, 'system/fvSolution')
 t = open(q).read()
+if profile.startswith('esd'):
+    # the tutorial's own alpha settings are what make the relaxation branch reachable at all
+    assert 'MULESCorr       yes' in t or re.search(r'MULESCorr\s+yes', t), 'esd no longer sets MULESCorr yes'
+    m = re.search(r'nAlphaCorr\s+(\d+)', t)
+    assert m and int(m.group(1)) >= 2, 'esd no longer sets nAlphaCorr >= 2'
+    # ...and CONVERGED PRESSURE SOLVES, as `solitaryCN`, `piston` and `flap` have. The tutorial ships
+    # `p_rgh tolerance 5e-8 relTol 0.01`, and p_rgh's own maximum here is 0.809 while `p` reaches
+    # 6.6e+03 -- the field is a near-total cancellation of the hydrostatic head, so its RELATIVE measure
+    # is taken against a scale a thousand times smaller than the pressure it came from. MEASURED as
+    # shipped: p_rgh 1.5144e-07 relative, all 12 iteration counts OpenFOAM's and the final residuals
+    # agreeing to 5.8e-09 -- the same system stopped at the same place, so that number is the KRYLOV
+    # STOPPING POINT and not the discretisation. `p` carries the SAME absolute difference (1.2e-07) and
+    # reads 1.8539e-11 against its own scale. Pinning the solves is what measures the port instead of
+    # the stopping point; the bounds stay the shared ones.
+    for old_s, new_s in [(r'tolerance\s+5e-8;', 'tolerance       1e-13;')]:
+        t, k = re.subn(old_s, new_s, t)
+        assert k >= 1, 'esd: the p_rgh tolerance was not tightened'
+    m = re.search(r'\n    p_rgh\s*\{[^}]*\}', t)
+    assert m, 'esd: no p_rgh entry'
+    t = t.replace(m.group(0), m.group(0).replace('relTol          0.01;', 'relTol          0;'))
+    if profile == 'esdNoCorr':
+        # THE CONTROL: MULESCorr off, so `alpha1 = 0.5*alpha1 + 0.5*alpha10` never runs and there is no
+        # assigned patch value to keep. OpenFOAM's own written value goes back onto its owner cell.
+        t, k = re.subn(r'MULESCorr\s+yes;', 'MULESCorr       no;', t)
+        assert k == 1, 'the MULESCorr entry was not turned off'
 if profile.startswith('mixer') or profile.startswith('sloshing') or profile.startswith('cylinder'):
     # the staging change the header declares
     m = re.search(r'p_rghFinal\s*\{.*?\n    \}', t, flags=re.S)
@@ -514,6 +574,13 @@ if not profile.startswith('closedDamBreak'):
     if profile.startswith('piston') or profile.startswith('flap') or profile.startswith('multi'):
         assert re.search(r'div\(phirb,alpha\)\s+Gauss interfaceCompression;', t), \
             'div(phirb,alpha) is no longer Gauss interfaceCompression'
+    elif profile.startswith('esd'):
+        # esd names its own, and two of them are what the profile is for: `Gauss vanLeer` on alpha (so
+        # the limiter is live at the outflow patches) and a `cellLimited leastSquares` gradient, which
+        # is the OPEN item that takes over this case from step five and the reason it is gated at TWO.
+        assert re.search(r'div\(rhoPhi,U\)\s+Gauss upwind;', t), 'esd: div(rhoPhi,U) is no longer Gauss upwind'
+        assert re.search(r'div\(phi,alpha\)\s+Gauss vanLeer;', t), 'esd: div(phi,alpha) is no longer Gauss vanLeer'
+        assert re.search(r'default\s+cellLimited leastSquares 1;', t), 'esd: the gradient is no longer cellLimited leastSquares 1'
     elif not profile.startswith('solitary'):
         assert re.search(r'div\(rhoPhi,U\)\s+Gauss vanLeerV;', t), 'div(rhoPhi,U) is no longer Gauss vanLeerV'
     if profile.startswith('floating'):
@@ -692,7 +759,12 @@ PYEOF
     ( cd "$C" && blockMesh > log.blockMesh 2>&1 ) || { echo "FAIL: blockMesh [$name]"; tail -20 "$C/log.blockMesh"; return 1; }
     if [ -f "$C/system/snappyHexMeshDict" ]; then
         mkdir -p "$C/constant/triSurface"
-        cp -f "$TUT/resources/geometry/$tutorial.obj.gz" "$C/constant/triSurface/" || { echo "FAIL: no surface for $tutorial"; return 1; }
+        # ...unless the TUTORIAL SHIPS ITS OWN surface, as RAS/electrostaticDeposition does
+        # (constant/triSurface/metalSheet.stl.gz). The resources copy would fail on it, and copying a
+        # differently-named .obj.gz over it would mesh a different geometry.
+        if [ -z "$(ls -A "$C/constant/triSurface" 2>/dev/null)" ]; then
+            cp -f "$TUT/resources/geometry/$tutorial.obj.gz" "$C/constant/triSurface/" || { echo "FAIL: no surface for $tutorial"; return 1; }
+        fi
         ( cd "$C" && snappyHexMesh -overwrite > log.snappyHexMesh 2>&1 ) || { echo "FAIL: snappyHexMesh [$name]"; tail -20 "$C/log.snappyHexMesh"; return 1; }
     fi
     # floatingObject's mesh is blockMesh MINUS the body: topoSet selects the cells outside it and
@@ -706,6 +778,14 @@ PYEOF
         ;;
     esac
     ( cd "$C" && setFields > log.setFields 2>&1 ) || { echo "FAIL: setFields [$name]"; tail -20 "$C/log.setFields"; return 1; }
+    # esd's Allrun.pre rotates the meshed case AFTER setFields, so the water column is filled in the
+    # unrotated frame and gravity then acts along the rotated axis. Doing it before setFields, or not at
+    # all, is a different case.
+    case "$profile" in esd*)
+        ( cd "$C" && transformPoints -rotate-y -90 > log.transformPoints 2>&1 ) \
+            || { echo "FAIL: transformPoints [$name]"; tail -20 "$C/log.transformPoints"; return 1; }
+        ;;
+    esac
     ( cd "$C" && interFoam > log.interFoam 2>&1 ) || { echo "FAIL: interFoam [$name]"; tail -30 "$C/log.interFoam"; return 1; }
     [ -d "$C/$end" ] || { echo "FAIL: OpenFOAM wrote no $end directory [$name]"; ls "$C"; return 1; }
     oracleStore "$C" "$key"
@@ -850,6 +930,18 @@ stage floating       ../RAS/floatingObject 5e-3 10 floating       || rc=1
 stage closedRef1e5   damBreak/damBreak 0.001 20 closedDamBreakRef || rc=1
 stage closedDamBreak damBreak/damBreak 0.001 20 closedDamBreak    || rc=1
 stage closedDamBreakInitU damBreak/damBreak 0.001 20 closedDamBreakInitU || rc=1
+# RAS/electrostaticDeposition, TWO STEPS, for one thing no other arm here can see: alpha's PATCH values
+# under the under-relaxed corrector. It belongs in this harness because its mesh moves -- `solidBody`
+# `tabulated6DoFMotion`, a RIGID translation at -0.08 m/s, so V == V0 and the volume weights are blind --
+# and it is the only interFoam tutorial whose alpha carries a `variableHeightFlowRate` AND reaches the
+# relaxation branch (`MULESCorr yes`, `nAlphaCorr 2`). DTCHull and DTCHullMoving carry it too and neither
+# runs: four features away (localEuler/LTS, outletPhaseMeanVelocity, `linearUpwind limitedGrad` in the
+# closure, nutkRoughWallFunction). weirOverflow carries it with `nAlphaCorr 1`, so its own gate's header
+# already records that the condition has no control there.
+# TWO STEPS AND NOT TEN: this case also carries the OPEN `cellLimited` grad(alpha) item, whose cell gap
+# passes the patch difference from step five. The test binary's header carries the per-step table.
+stage esdNoCorr ../RAS/electrostaticDeposition 1e-3 2 esdNoCorr || rc=1
+stage esd       ../RAS/electrostaticDeposition 1e-3 2 esd       || rc=1
 [ $rc = 0 ] || { echo "interfoam_moving_vs_openfoam: staging failed"; exit 1; }
 
 # the oracle took the path
@@ -914,6 +1006,9 @@ gate multiFlap      0.01  30 multiFlap      multiFlapStatic   || rc=1
 gate floating       5e-3  10 floating       floatingStatic || rc=1
 gate closedDamBreak 0.001 20 closedDamBreak closedRef1e5 || rc=1
 gate closedDamBreakInitU 0.001 20 closedDamBreakInitU closedDamBreak || rc=1
+# ...and its own control is the MULESCorr-off staging, where OpenFOAM's patch value is back on its cell
+gate esdNoCorr 1e-3 2 esdNoCorr esd       || rc=1
+gate esd       1e-3 2 esd       esdNoCorr || rc=1
 
 runQueue
 
