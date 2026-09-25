@@ -553,7 +553,18 @@ InterTurbulence readInterTurbulence(
             // meshWavePatchDistMethod.C:59, default true. `false` skips patchWave's wall-cell override
             // (patchWave.C:203), so those cells keep the wave's face-CENTRE distance. Refused until now.
             t.wallDistCorrectWalls = wd->switchOr("correctWalls", true);
-            t.wallDistUpdateInterval = static_cast<label>(wd->scalarOr("updateInterval", 1));
+            // wallDist.C:127 reads it as a LABEL (`getOrDefault<label>`), so `2.5` is an IO error in
+            // OpenFOAM rather than a truncation to 2. scalarOr would have silently truncated it.
+            t.wallDistUpdateInterval = static_cast<label>(wd->intOr("updateInterval", 1));
+            {
+                const std::string raw = wd->wordOr("updateInterval", "1");
+                if (raw.find('.') != std::string::npos || raw.find('e') != std::string::npos
+                                                       || raw.find('E') != std::string::npos)
+                    throw std::runtime_error(
+                        std::string(WHO) + "fvSchemes sets `wallDist { updateInterval " + raw
+                        + "; }`. OpenFOAM reads it as a label (wallDist.C:127) and stops on a "
+                          "non-integer; brae will not truncate it.");
+            }
             t.yCell = cellWallDist(*mesh, *geometry, patches, nullptr, nullptr,
                                    t.wallDistCorrectWalls);
         }
@@ -787,7 +798,8 @@ void moveInterTurbulence(
     InterTurbulence&            t,
     const PrimitiveMesh&        m,
     const FvGeometry&           g,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    label                       timeIndex)
 {
     if (!t.on) return;
     if (t.model == InterRasModel::KEqnLES)
@@ -802,15 +814,48 @@ void moveInterTurbulence(
     if (t.model != InterRasModel::KOmegaSST) return;
     if (!t.wallDistPatchIDs.empty())
     {
+        // UNCONDITIONAL ON PURPOSE. This is the wallDist object inverseDistanceDiffusivity registered,
+        // whose dictionary is fvSchemes' `patchDist` (wallDist.C:96-102 builds it from
+        // patchTypeName & "Dist", and that object's patchTypeName is "patch"), NOT `wallDist`. So the
+        // `wallDist { updateInterval }` this function honours below is not its interval and must not be
+        // applied to it -- the motion solver's own reader is where that one belongs.
         t.yCell = patchWave(m, g, patches, t.wallDistPatchIDs, true).distance;
         return;
     }
-    // updateInterval N recomputes on every Nth time index only, and keeps the stale distance between
+    // wallDist::movePoints's SCHEDULE, transcribed (wallDist.C:193-221) rather than reduced to a modulo:
+    //
+    //     if (updateInterval_ > 0 && (timeIndex % updateInterval_) == 0) requireUpdate_ = true;
+    //     if (requireUpdate_ && pdm_->movePoints()) { requireUpdate_ = false; return pdm_->correct(y_); }
+    //
+    // `patchDistMethod::movePoints()` is the base `return true` for meshWave, so the second test is the
+    // latch alone. Three consequences the bare modulo would get wrong: the flag starts TRUE, so the first
+    // move after start-up recomputes whatever the interval is; a step the interval does not divide keeps
+    // the STALE distance rather than recomputing a fresh one; and `updateInterval <= 0` never sets the
+    // flag again, so y is frozen at the start-up value for the whole run instead of updating every step.
+    // THE INTERVAL ITSELF IS STILL REFUSED, for want of a fixture and not for want of the code. The
+    // schedule below is transcribed and exercised at interval 1 (where the latch is set every step), but
+    // NO interFoam tutorial can gate a value other than 1: a rigid solid-body motion leaves every
+    // wall-to-cell distance invariant, so testTubeMixer / sloshing* / cylinder / esd cannot witness it at
+    // all, and the one DEFORMING case whose closure owns its wallDist -- RAS/floatingObject made
+    // kOmegaSST -- has an INERT closure at those settings: MEASURED, OpenFOAM laminar against OpenFOAM
+    // with kOmegaSST is U 9.34e-12, so the model moves that case by nothing and the interval can move it
+    // by less. A profile was built and withdrawn on exactly that number. Under displacementLaplacian the
+    // closure does not own the object at all (its dict is `patchDist`), which rules the rest out.
     if (t.wallDistUpdateInterval != 1)
         throw std::runtime_error(
             std::string(WHO) + "fvSchemes sets `wallDist { updateInterval "
-            + std::to_string(t.wallDistUpdateInterval) + "; }` on a moving mesh; only 1, the default, "
-            "is ported.");
+            + std::to_string(t.wallDistUpdateInterval) + "; }` on a moving mesh. The schedule is ported "
+            "(wallDist.C:193-221, the latch below) but no shipped tutorial can gate a value other than 1 "
+            "-- see the comment above. Refused rather than run ungated.");
+    if (t.wallDistUpdateInterval > 0 && (timeIndex % t.wallDistUpdateInterval) == 0)
+    {
+        t.wallDistRequireUpdate = true;
+    }
+    if (!t.wallDistRequireUpdate)
+    {
+        return;
+    }
+    t.wallDistRequireUpdate = false;
     t.yCell = cellWallDist(m, g, patches, nullptr, nullptr, t.wallDistCorrectWalls);
 }
 

@@ -181,6 +181,11 @@ void correctTurbulence(
         // disagrees with this arm's HOST reference on bound(), the nut boundary and the wall-function
         // family. kOmegaSST.cuh has the measurement.
         kOmegaSSTRAS::KOmegaSSTInput sstIn;
+        // EXPLICITLY null, not left to the default: this driver reads ONE solver entry for both closure
+        // equations and refuses a mismatch, so omega takes k's -- which is exactly what null means
+        // (kOmegaSST.cuh's omegaSolve). Said here because a reader of two builders that fill different
+        // subsets cannot tell "one entry by design" from "forgotten", and the defaults audit agrees.
+        sstIn.omegaSolve = nullptr;
         sstIn.phiInt = kin.phiInt;   sstIn.phiBnd = kin.phiBnd;
         sstIn.phiByRhoInt = kin.phiByRhoInt;   sstIn.phiByRhoBnd = kin.phiByRhoBnd;
         sstIn.rhoCell = kin.rhoCell;           sstIn.rhoBndFace = kin.rhoBndFace;

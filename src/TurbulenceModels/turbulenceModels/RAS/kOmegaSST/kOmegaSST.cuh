@@ -27,6 +27,7 @@
 // HOST arm on all four. Measured on validation/rhoSST at 20 iterations, the two lineages sit the same
 // distance from OpenFOAM (legacy k 3.54e-04, mirror host 4.13e-04) but 6.44e-04 from EACH OTHER -- so
 // the legacy SST is not wrong, it is a different code, and an arm must agree with its own reference.
+#include "turbulence_transport.cuh"   // turbulence::SolveControls
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
@@ -161,6 +162,13 @@ struct KOmegaSSTInput
     // gsOmega UNCONDITIONALLY, so a case naming PBiCG ran symGaussSeidel sweeps under PBiCG's
     // tolerance and said nothing -- the same silent substitution, in the twin that was not looked at.
     bool   pbicgKE = false;
+    // THE SECOND EQUATION'S OWN SOLVER SETTING. `fvMatrix::solve()` looks the solver dictionary up by
+    // FIELD name (fvMatrix.C:1536-1542), so `omegaFinal` may name different tolerances, sweep counts or a
+    // different solver from `kFinal` and OpenFOAM honours each (kEpsilon.C:268 / kOmegaSSTBase.C:593 solve
+    // the second equation, :288 / :618 solve k). This closure took k's for both and the driver refused a
+    // mismatch. Null keeps that: the caller has ONE setting and says so. The host twin is
+    // kOmegaSST_cpp.cu's EqnSolveSetting.
+    const turbulence::SolveControls* omegaSolve = nullptr;
     // FP-1: sweep the honoured smoothSolver in COLOUR order over `colouring` (SolveControls::gsColour).
     bool   gsColour = false;
     const DeviceCellColouring* colouring = nullptr;

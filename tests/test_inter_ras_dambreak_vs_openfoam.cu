@@ -469,14 +469,13 @@ int main(
     {
         std::printf("  (no CUDA device: the device arm is skipped)\n");
     }
-    else if (splitSolve || splitDiv)
+    else if (splitDiv)
     {
-        // THE DEVICE ARM MUST REFUSE, and by name. Its closure carries ONE tolerance, sweep count and
-        // iteration cap for both equations in the kernels themselves (device_inter_turbulence's
-        // `kin`/`sin` each hold a single `tol`/`maxIter`/`minIter`/`nSweepsKE`), so the per-equation
-        // setting the host now honours is not ported there. Refused rather than run under k's entry --
-        // which is what the numbers above show a substituted setting costs: OpenFOAM's own iteration
-        // counts for the second field change with it.
+        // THE DEVICE ARM MUST REFUSE THE CONVECTION SPLIT, and by name: `kin`/`sin` carry ONE
+        // `limitedLinear`/`limiterCoeff` for both equations in the kernels. The SOLVER split it used to
+        // refuse alongside this one it now RUNS -- the closures take the second equation's own
+        // SolveControls (KEpsilonInput::epsSolve, KOmegaSSTInput::omegaSolve) -- so `splitSolve` and
+        // `splitSolveSST` fall through to the ordinary device arm below and are held to its bounds.
         InterFields dev;
         bool named = false;
         try
@@ -563,9 +562,9 @@ int main(
         // 8e-16 / 3.7e-14 (the arm below). The device loop's U is about 5e-11 from OpenFOAM on the
         // kEpsilon profiles too; under kOmegaSST nut carries it through k/omega and F2, which is the
         // 1.9e-10. Bounds at about 30x the measurement.
-        check("...its k", eK.rel() < (sst ? scalar(2e-10) : scalar(1e-11)));
-        check("...its second closure field", eE.rel() < (sst ? scalar(1e-9) : scalar(1e-11)));
-        check("...and its nut", eN.rel() < (sst ? scalar(5e-9) : scalar(2e-11)));
+        check("...its k", eK.rel() < ((sst || splitSolveSST) ? scalar(2e-10) : scalar(1e-11)));
+        check("...its second closure field", eE.rel() < ((sst || splitSolveSST) ? scalar(1e-9) : scalar(1e-11)));
+        check("...and its nut", eN.rel() < ((sst || splitSolveSST) ? scalar(5e-9) : scalar(2e-11)));
 
         // THE SAME DEVICE LOOP WITH THE HOST CLOSURE IN THE DEVICE ONE'S PLACE -- the `_cpp` reference
         // as the in-repo oracle, with everything around it held fixed. Against OpenFOAM a disagreement
@@ -594,10 +593,10 @@ int main(
         // case's own tolerances: U 8.6e-13, k 1.2e-13, omega 6.6e-14, nut 9.5e-13, and with every solve
         // tightened 1.4e-13 / 5.3e-15 / 7.8e-16 / 3.7e-14 -- round-off between two implementations that
         // share no kernel. kEpsilon's are 3.3e-14 / 1.1e-15 / 1.6e-15 / 1.9e-15. Bounds at about 30x.
-        check("the device closure agrees with the host closure in U", mU.rel() < (sst ? scalar(3e-11) : scalar(1e-12)));
-        check("...in k", mK.rel() < (sst ? scalar(5e-12) : scalar(5e-14)));
-        check("...in the second closure field", mE.rel() < (sst ? scalar(5e-12) : scalar(5e-14)));
-        check("...and in nut", mN.rel() < (sst ? scalar(5e-11) : scalar(5e-14)));
+        check("the device closure agrees with the host closure in U", mU.rel() < ((sst || splitSolveSST) ? scalar(3e-11) : scalar(1e-12)));
+        check("...in k", mK.rel() < ((sst || splitSolveSST) ? scalar(5e-12) : scalar(5e-14)));
+        check("...in the second closure field", mE.rel() < ((sst || splitSolveSST) ? scalar(5e-12) : scalar(5e-14)));
+        check("...and in nut", mN.rel() < ((sst || splitSolveSST) ? scalar(5e-11) : scalar(5e-14)));
         // the two closures took the same sweeps, solve for solve
         std::size_t sameE = 0;
         std::size_t sameK = 0;

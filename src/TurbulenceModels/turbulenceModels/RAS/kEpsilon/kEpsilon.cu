@@ -1087,7 +1087,12 @@ void finishAndSolve(
     scalar&                     residualOut,
     const std::string&          dumpPrefix,
     bool gs,
-    DeviceSolverPerf* perfOut)
+    DeviceSolverPerf* perfOut,
+    // THIS EQUATION'S OWN SOLVER SETTING, or null for k's. `fvMatrix::solve()` looks the dictionary up by
+    // FIELD name (fvMatrix.C:1536-1542), so epsilonFinal need not match kFinal -- kEpsilon.C:268 solves
+    // epsilon and :288 solves k, each selecting its own entry. ONE builder below still fills `sv` from
+    // `in`; the override replaces it wholesale rather than field by field, so the two cannot half-mix.
+    const turbulence::SolveControls* ovr = nullptr)
 {
     turbulence::SolveControls sv;
     sv.tol         = in.tol;
@@ -1102,7 +1107,7 @@ void finishAndSolve(
     sv.colouring   = in.colouring;
     sv.pbicg       = in.pbicgKE;
     turbulence::solveScalarEqn(M, field, dm, relaxEquation, alpha, fvoMask, fvoVal, wallMask, wallVal,
-                               sv, residualOut, dumpPrefix, gs, perfOut, in.cyc);
+                               ovr ? *ovr : sv, residualOut, dumpPrefix, gs, perfOut, in.cyc);
 }
 
 } // namespace
@@ -1245,7 +1250,8 @@ void correct(
         finishAndSolve(E, epsilon, dm, in.relaxEquationEps, in.relaxEps,
                        in.fvoEpsMask, in.fvoEpsVal,
                        &st.isWallCell, &epsilon, in, st.epsResidual,
-                       dumpDir.empty() ? std::string() : dumpDir + "eps", in.gsEps, &st.epsPerf);
+                       dumpDir.empty() ? std::string() : dumpDir + "eps", in.gsEps, &st.epsPerf,
+                       in.epsSolve);
 
         boundField(epsilon, dm, dbEps, in.co.epsilonMin, "epsilon");
     }
@@ -1269,7 +1275,8 @@ void correct(
         finishAndSolve(K, k, dm, in.relaxEquationK, in.relaxK,
                        in.fvoKMask, in.fvoKVal,
                        nullptr, nullptr, in, st.kResidual,
-                       dumpDir.empty() ? std::string() : dumpDir + "k", in.gsK, &st.kPerf);
+                       dumpDir.empty() ? std::string() : dumpDir + "k", in.gsK, &st.kPerf,
+                       /*ovr=*/nullptr);   // k always takes kFinal, which `in` carries
 
         boundField(k, dm, dbK, in.co.kMin, "k");
     }

@@ -760,11 +760,12 @@ if [ $HAVE_GPU = 1 ]; then
     # read as TRUE ran the whole flow where OpenFOAM skips it (interFoam.C:163-166), and a `runs` arm
     # could not tell that apart from a correct frozen run. Here a false spelling MUST reach the refusal.
     arm device_frozenFlow_n refused "solveFlow no" "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 1;\n    solveFlow       n;/' system/fvSolution"
-    # the HOST honours a per-equation `<field>Final` solver entry now (tests/interfoam_ras_dambreak_vs_openfoam.sh
-    # `splitSolve`, `splitSolveSST`); the DEVICE closure carries one tolerance, sweep count and iteration
-    # cap for both equations inside its kernels, so it refuses rather than run epsilon under kFinal's.
-    BASE="$BR"
-    arm device_splitSolve   refused "different solver settings" "-device" "python3 -c \"import re; p='system/fvSolution'; t=open(p).read(); t=re.sub(r'\\n\\}\\s*\\n\\s*PIMPLE', '\\n    epsilonFinal\\n    {\\n        solver smoothSolver;\\n        smoother symGaussSeidel;\\n        tolerance 1e-12;\\n        relTol 0;\\n        minIter 1;\\n        nSweeps 2;\\n    }\\n}\\n\\nPIMPLE', t, count=1); open(p,'w').write(t)\""
+    # BOTH ARMS honour a per-equation `<field>Final` solver entry now: the device closures take the
+    # second equation's own SolveControls (KEpsilonInput::epsSolve, KOmegaSSTInput::omegaSolve) where they
+    # used to compare all eight fields and refuse any difference. Gated on `splitSolve`/`splitSolveSST`,
+    # whose device arm now RUNS and is held to the device's own bounds. What the device still refuses is
+    # the second equation naming a solver FAMILY it does not run -- see epsilonFinal/omegaFinal below.
+    arm device_splitSolve   runs    -                        "-device" "python3 -c \"import re; p='system/fvSolution'; t=open(p).read(); t=re.sub(r'\\n\\}\\s*\\n\\s*PIMPLE', '\\n    epsilonFinal\\n    {\\n        solver smoothSolver;\\n        smoother symGaussSeidel;\\n        tolerance 1e-12;\\n        relTol 0;\\n        minIter 1;\\n        nSweeps 2;\\n    }\\n}\\n\\nPIMPLE', t, count=1); open(p,'w').write(t)\""
     BASE="$B"
     # the device pressure step runs the non-orthogonal loop (laminar/damBreak `nonorth` holds it)
     arm device_nNonOrth1    runs    -                        "-device" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"

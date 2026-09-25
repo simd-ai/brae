@@ -70,7 +70,10 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
     // PBiCG's preconditioner needs the mesh's level schedule, once (see DeviceInterTurbulence::dilu)
     // ...for EITHER closure. Keyed on kEpsilon alone, the SST branch below would have found no
     // schedule and refused a case it can run.
-    if (t.kSolveFinal.pbicgDILU())
+    // ANY of the four entries may name PBiCG now that the two equations take their own. Built from
+    // kFinal alone, a case where only the SECOND equation names `solver PBiCG; preconditioner DILU;`
+    // would reach the solve with no schedule and throw -- a hole the per-equation lift would have opened.
+    if (t.kSolveFinal.pbicgDILU() || t.epsSolveFinal.pbicgDILU() || t.omegaSolveFinal.pbicgDILU())
     {
         d.dilu = buildDeviceDilu(m.owner(), m.neighbour(), m.nCells());
     }
@@ -699,12 +702,45 @@ void deviceCorrectInterTurbulence(
         sin.relaxK = t.kRelaxFinal.factor;
         const cpu::interFoam::SmoothLinearSolve& ks = t.kSolveFinal;
         const cpu::interFoam::SmoothLinearSolve& os = t.omegaSolveFinal;
-        if (ks.solver != os.solver || ks.preconditioner != os.preconditioner
-         || ks.smoother != os.smoother || ks.tol != os.tol || ks.relTol != os.relTol
-         || ks.maxIter != os.maxIter || ks.minIter != os.minIter || ks.nSweeps != os.nSweeps)
+        // omegaFinal NEED NOT MATCH kFinal: fvMatrix::solve() looks the dictionary up by FIELD name
+        // (fvMatrix.C:1536-1542) and kOmegaSSTBase.C:593 solves omega with its own entry, :618 k with
+        // kFinal's. This branch compared all eight fields and refused any difference; the host has
+        // honoured the pair since the per-equation solver unit, and the closure now takes omega's own
+        // through KOmegaSSTInput::omegaSolve.
+        gpu::turbulence::SolveControls svOmega;
+    // NON-DICTIONARY FIELDS COME FROM k's, not from a default. The closure's own builder fills
+    // colouring/gsColour/polyDeg/precon from `sin` (kEpsilon.cu's finishAndSolve, kOmegaSST.cu's solveOf),
+    // and only the eight the SOLVER ENTRY decides differ per equation. Leaving them default here ran the
+    // second equation with a different colouring and polynomial degree from k's -- which the defaults
+    // audit flagged as three fields set at one of the sites and not the other.
+    svOmega.gsColour  = sin.gsColour;
+    svOmega.colouring = sin.colouring;
+    svOmega.polyDeg   = sin.polyDeg;
+        svOmega.tol         = os.tol;
+        svOmega.relTol      = os.relTol;
+        svOmega.maxIter     = os.maxIter;
+        svOmega.minIter     = os.minIter;
+        svOmega.nSweeps     = os.nSweeps;
+        svOmega.gsSymmetric = (os.smoother == "symGaussSeidel");
+        svOmega.pbicg       = os.pbicgDILU();
+        // THE FAMILY IS STILL CHECKED, per equation. Without this a second equation naming PBiCGStab or
+        // GAMG would fall through to BiCGStab silently -- the substitution the kFinal message below
+        // exists to prevent, which the lift would otherwise have reopened for omega alone.
+        if (!os.gaussSeidel() && !os.pbicgDILU())
             throw std::runtime_error(
-                "brae interFoam (device): fvSolution gives kFinal and omegaFinal different solver "
-                "settings; the closure takes one set for both equations.");
+                "brae interFoam (device): `solvers/omegaFinal` names `solver " + os.solver
+                + "; smoother " + os.smoother + "; preconditioner " + os.preconditioner + ";`, which the "
+                  "device kOmegaSST does not run: a Gauss-Seidel smoothSolver, or PBiCG with DILU, and "
+                  "nothing else. A substituted solver at the same tolerance stops somewhere else.");
+        if (os.pbicgDILU())
+        {
+            if (!d.dilu.valid)
+                throw std::runtime_error(
+                    "brae interFoam (device): omegaFinal names PBiCG with DILU and the SST closure was "
+                    "built with no DILU schedule for this mesh.");
+            svOmega.precon = &d.dilu;
+        }
+        sin.omegaSolve = &svOmega;
         // THE SOLVER THE CASE NAMES, and only that -- the kEpsilon branch below has read it since
         // waves/mangroveInteraction, and this one did not: it set gsK and gsOmega unconditionally, so
         // `solver PBiCG; preconditioner DILU;` on kFinal and omegaFinal ran symGaussSeidel sweeps
@@ -846,12 +882,38 @@ void deviceCorrectInterTurbulence(
     kin.relaxK = t.kRelaxFinal.factor;
     const cpu::interFoam::SmoothLinearSolve& ks = t.kSolveFinal;
     const cpu::interFoam::SmoothLinearSolve& es = t.epsSolveFinal;
-    if (ks.solver != es.solver || ks.preconditioner != es.preconditioner
-     || ks.smoother != es.smoother || ks.tol != es.tol || ks.relTol != es.relTol
-     || ks.maxIter != es.maxIter || ks.minIter != es.minIter || ks.nSweeps != es.nSweeps)
+    // epsilonFinal NEED NOT MATCH kFinal -- see the SST branch above. kEpsilon.C:268 solves epsilon with
+    // its own entry and :288 solves k with kFinal's.
+    gpu::turbulence::SolveControls svEps;
+    // NON-DICTIONARY FIELDS COME FROM k's, not from a default. The closure's own builder fills
+    // colouring/gsColour/polyDeg/precon from `kin` (kEpsilon.cu's finishAndSolve, kOmegaSST.cu's solveOf),
+    // and only the eight the SOLVER ENTRY decides differ per equation. Leaving them default here ran the
+    // second equation with a different colouring and polynomial degree from k's -- which the defaults
+    // audit flagged as three fields set at one of the sites and not the other.
+    svEps.gsColour  = kin.gsColour;
+    svEps.colouring = kin.colouring;
+    svEps.polyDeg   = kin.polyDeg;
+    svEps.tol         = es.tol;
+    svEps.relTol      = es.relTol;
+    svEps.maxIter     = es.maxIter;
+    svEps.minIter     = es.minIter;
+    svEps.nSweeps     = es.nSweeps;
+    svEps.gsSymmetric = (es.smoother == "symGaussSeidel");
+    svEps.pbicg       = es.pbicgDILU();
+    if (!es.gaussSeidel() && !es.pbicgDILU())
         throw std::runtime_error(
-            "brae interFoam (device): fvSolution gives kFinal and epsilonFinal different solver "
-            "settings; the closure takes one set for both equations.");
+            "brae interFoam (device): `solvers/epsilonFinal` names `solver " + es.solver + "; smoother "
+            + es.smoother + "; preconditioner " + es.preconditioner + ";`, which the device kEpsilon does "
+              "not run: a Gauss-Seidel smoothSolver, or PBiCG with DILU, and nothing else.");
+    if (es.pbicgDILU())
+    {
+        if (!d.dilu.valid)
+            throw std::runtime_error(
+                "brae interFoam (device): epsilonFinal names PBiCG with DILU and the closure was built "
+                "with no DILU schedule for this mesh.");
+        svEps.precon = &d.dilu;
+    }
+    kin.epsSolve = &svEps;
     // THE SOLVER THE CASE NAMES, and only that. The host reader admits two for kEpsilon: a
     // Gauss-Seidel smoothSolver and PBiCG with DILU. This branch set the first unconditionally, so a
     // case naming PBiCG -- waves/mangroveInteraction -- would have run symGaussSeidel sweeps under

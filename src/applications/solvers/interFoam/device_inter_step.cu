@@ -442,8 +442,14 @@ void deviceInterStep(
             }
             else
             {
+                // minIter REACHES THIS BRANCH TOO. `deviceJacobiBiCGStab` has taken it on both overloads
+                // all along (device_pcg.cuh:128-138, `int minIter = 0`), and this site simply never passed
+                // it -- so the refusal added beside it in the momentum-minIter unit, which said the
+                // branch "takes no iteration floor", was wrong about its own code. `checkEvery` keeps its
+                // default 1, which is what the argument before minIter is.
                 perf = deviceJacobiBiCGStab(Ak, b, *Uk[k], dNf.data(), ctl.momentum.tol,
-                                            ctl.momentum.relTol, ctl.momentum.maxIter);
+                                            ctl.momentum.relTol, ctl.momentum.maxIter,
+                                            /*checkEvery=*/1, ctl.momentum.minIter);
             }
             if (ctl.momentumSolveLog)
             {

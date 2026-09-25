@@ -54,6 +54,7 @@
 //   substituted by the time it arrives), coupled patches, unported fvOptions, a div scheme other than
 //   upwind, a turbulence wall function on a non-`wall` patch, and a case that bounds one of the two
 //   convection terms but not the other.
+#include "turbulence_transport.cuh"   // turbulence::SolveControls
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
@@ -146,6 +147,13 @@ struct KEpsilonInput
     // ...or `solver PBiCG; preconditioner DILU;` for BOTH equations (device_pbicg.cuh): NOT PBiCGStab,
     // and it needs `precon` below to carry the mesh's DILU schedule. waves/mangroveInteraction names it.
     bool   pbicgKE = false;
+    // THE SECOND EQUATION'S OWN SOLVER SETTING. `fvMatrix::solve()` looks the solver dictionary up by
+    // FIELD name (fvMatrix.C:1536-1542), so `epsilonFinal` may name different tolerances, sweep counts or a
+    // different solver from `kFinal` and OpenFOAM honours each (kEpsilon.C:268 / kOmegaSSTBase.C:593 solve
+    // the second equation, :288 / :618 solve k). This closure took k's for both and the driver refused a
+    // mismatch. Null keeps that: the caller has ONE setting and says so. The host twin is
+    // kEpsilon_cpp.cu's EqnSolveSetting.
+    const turbulence::SolveControls* epsSolve = nullptr;
     // ...or CrankNicolson's fvm::ddt in Euler's place (device_crank_nicolson_ddt.cuh), transcribed from
     // the host closure: the scheme's clock, the two equations' OWN ddt0 fields kept by the caller across
     // steps, rho.oldTime().oldTime() (the ones vector in the incompressible lineage, as rhoCell is) and

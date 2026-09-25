@@ -161,6 +161,12 @@ struct InterTurbulence
     // to refuse anything but 1 there.
     std::vector<scalar> yCell;
     label wallDistUpdateInterval = 1;
+    // wallDist::movePoints's OWN LATCH (wallDist.C:193-221), and it is NOT a bare modulo. The interval
+    // SETS `requireUpdate_`; the recompute then CLEARS it. So a step whose index the interval does not
+    // divide keeps the stale distance, and the flag starts TRUE (the constructor's), which is why the
+    // first move after start-up recomputes whatever the interval is. `<= 0` never sets it again, so y is
+    // frozen at the start-up value for the whole run.
+    bool wallDistRequireUpdate = true;
     // fvSchemes' `wallDist { correctWalls }`, default true (meshWavePatchDistMethod.C:59). False leaves
     // the wall-adjacent cells on the wave's face-CENTRE distance instead of the exact distance to the
     // face polygon (patchWave.C:203), which is what OpenFOAM does and what brae used to refuse.
@@ -278,7 +284,10 @@ void moveInterTurbulence(
     InterTurbulence&            t,
     const PrimitiveMesh&        m,
     const FvGeometry&           g,
-    const std::vector<FvPatch>& patches);
+    const std::vector<FvPatch>& patches,
+    // mesh_.time().timeIndex(), the index of the step being taken -- wallDist.C:198 tests it modulo the
+    // interval. Threaded in rather than derived, because the closure has no clock of its own.
+    label                       timeIndex);
 
 void correctInterTurbulence(
     InterTurbulence& t,

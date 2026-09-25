@@ -1534,14 +1534,11 @@ RunReport runInterFoamDevice(
         C.momentum.relTol = us.relTol;
         C.momentum.maxIter = us.maxIter;
         C.momentum.minIter = us.minIter;
-        // minIter reaches the device's Gauss-Seidel sweep; deviceJacobiBiCGStab takes no minIter, so
-        // naming one beside a solver that is not smoothSolver would stop a sweep short and say nothing.
-        if (us.minIter > 0 && !us.gaussSeidel())
-            throw std::runtime_error(
-                "brae interFoam (device): the U solver names `minIter " + std::to_string(us.minIter)
-                + "` beside `solver " + us.solver + "`. The device momentum solve honours minIter on its "
-                  "Gauss-Seidel branch only; BiCGStab there takes no iteration floor. Refused rather "
-                  "than stop a sweep earlier than OpenFOAM does.");
+        // minIter reaches BOTH device branches: deviceSymGaussSeidel takes it, and
+        // deviceJacobiBiCGStab has taken it on both overloads all along (device_pcg.cuh:128-138) --
+        // device_inter_step.cu simply never passed it. The refusal that stood here claimed that branch
+        // had no iteration floor; it was wrong about brae's own code, and the fix was to pass the
+        // argument rather than to refuse the case.
         C.momentum.smoothSolver = us.gaussSeidel();
         C.momentum.symmetric = (us.smoother == "symGaussSeidel");
         C.momentum.nSweeps = us.nSweeps;
@@ -2017,7 +2014,7 @@ RunReport runInterFoamDevice(
                 // method on the moved points -- and the device arrays follow it.
                 if (f.turbulence.on)
                 {
-                    moveInterTurbulence(f.turbulence, m, g, fvp);
+                    moveInterTurbulence(f.turbulence, m, g, fvp, stepIndex);
                     if (deviceClosure)
                     {
                         refreshDeviceInterTurbulenceGeometry(dTurb, f.turbulence, f.U, m, g, fvp);

@@ -255,7 +255,7 @@ void interMeshUpdate(
     }
     const SurfaceScalarField& meshPhiU = fvcMeshPhi(*dyn, f);
     // ...and fvMesh::movePoints moves the mesh objects with it: kOmegaSST's wall distance
-    moveInterTurbulence(f.turbulence, m, g, patches);
+    moveInterTurbulence(f.turbulence, m, g, patches, timeIndex);
     // cyclicAMIPolyPatch::initMovePoints marks the AMI out of date, and the next AMI()
     // recomputes it on the moved points: before anything below interpolates across it
     if (amiPairs && !amiPairs->empty())

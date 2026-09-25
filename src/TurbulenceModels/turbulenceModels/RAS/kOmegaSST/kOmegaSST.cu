@@ -723,6 +723,8 @@ void correct(
 
     const turbulence::TransportScheme sc = schemeOf(in);
     const turbulence::SolveControls   sv = solveOf(in);
+    // omega's own, absent which it is k's -- which is what a caller that still refuses a mismatch means.
+    const turbulence::SolveControls   svOmega = in.omegaSolve ? *in.omegaSolve : sv;
 
     // ---- the omega equation -------------------------------------------------------------------
     // Solved FIRST, and the k equation below reads the omega this solve produced. That lag is
@@ -825,7 +827,7 @@ void correct(
                                    // 18,511 faces in the report that were only the host's setValues
                                    // zeroing a pinned row. Same point, same convention, directly
                                    // diffable.
-                                   sv, res.omega, sd.on ? sd.dir + "/omegaSys" : std::string(),
+                                   svOmega, res.omega, sd.on ? sd.dir + "/omegaSys" : std::string(),
                                    in.gsOmega, &res.omegaPerf,
                                    // ...and the pair's off-diagonal, which deviceAmul applies as
                                    // Apsi[own] += ifCoeff*psi[nbr]: without it the solve runs a
