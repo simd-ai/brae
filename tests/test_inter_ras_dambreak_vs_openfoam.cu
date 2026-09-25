@@ -117,9 +117,20 @@ int main(
     // device through device_inter_turbulence's SST branch
     const bool sst = (profile == "sst");
     const bool outer = (profile == "outer");
-    const char* secondName = sst ? "omega" : "epsilon";
+    // `frozen*`: `RAS { turbulence off; }` -- a model that is CONSTRUCTED and VALIDATED and then never
+    // corrected again (kEpsilon.C:216-219 gates correct() alone; eddyViscosity.C:119-122 is
+    // `correctNut();` with no turbulence_ test). NOT laminar and NOT "keep the file's nut".
+    const bool frozen = (profile.rfind("frozen", 0) == 0);
+    // ...with kMin and epsilonMin set ABOVE the case's own 0.1, so the CONSTRUCTOR's bound
+    // (kEpsilon.C:182-183) is the only thing in the run that touches either field
+    const bool frozenFloored = (profile == "frozenFloored");
+    const bool frozenSST = (profile == "frozenSST");
+    const char* secondName = (sst || frozenSST) ? "omega" : "epsilon";
     std::printf("  profile: %s\n",
-                outer ? "outer -- variable, with nOuterCorrectors 2"
+                frozenFloored ? "frozenFloored -- turbulence off, with floors above the case's own fields"
+              : frozenSST ? "frozenSST -- kOmegaSST with turbulence off"
+              : frozen ? "frozen -- turbulence off: constructed, validated, never corrected"
+              : outer ? "outer -- variable, with nOuterCorrectors 2"
               : nutAtmosphere ? "nutAtmosphere -- uniform, the atmosphere's nut an inletOutlet"
               : custom ? "custom -- its own coefficients, relaxation 0.7, and minIter forcing each sweep"
               : variable ? "variable -- `density variable`, as the tutorial ships"
@@ -138,6 +149,10 @@ int main(
     // THE PATH, not only the answer: a laminar run of this case also reaches the end
     check("brae ran the case turbulent", fin.turbulence.on);
     check("...in the lineage this profile names", fin.turbulence.variableDensity == variable);
+    // `on` STAYS TRUE under `turbulence off` -- nuEff is still nut + nu. `frozen` is the flag, and a
+    // brae that read the switch as laminar would fail the first of these, not the second.
+    check(frozen ? "...with the model FROZEN by `turbulence off`, which is not laminar"
+                 : "...with the model live", fin.turbulence.frozen == frozen);
     if (custom)
     {
         // what was READ, beside the answer it produces: the oracle control below says the three
@@ -190,8 +205,21 @@ int main(
     const std::vector<LinearSolveRecord> ofE = brae::gatecheck::readOfSolves(logPath, secondName);
     const std::vector<LinearSolveRecord> ofK = brae::gatecheck::readOfSolves(logPath, "k");
     // the FAIL-PROOF: nothing in compareSolves can pass on an empty parse
-    check("OpenFOAM's log gave one solve of the closure's second field and one k solve per step",
-          ofE.size() == static_cast<std::size_t>(nSteps) && ofK.size() == ofE.size());
+    if (frozen)
+    {
+        // THE DIRECT EVIDENCE that correct() never ran, in OpenFOAM's own log: a frozen model prints no
+        // `Solving for k` line at all. This is the one assertion here that an empty parse passes, so it
+        // is paired with the pressure and alpha solves below, which must still be nSteps long.
+        check("OpenFOAM solved NEITHER closure field -- correct() returned immediately every step",
+              ofE.empty() && ofK.empty());
+        check("...and brae solved neither either",
+              r.kSolves.empty() && r.epsilonSolves.empty() && r.omegaSolves.empty());
+    }
+    else
+    {
+        check("OpenFOAM's log gave one solve of the closure's second field and one k solve per step",
+              ofE.size() == static_cast<std::size_t>(nSteps) && ofK.size() == ofE.size());
+    }
     failures += brae::gatecheck::compareSolves("host", r.pSolves, ofP, nSteps);
     failures += brae::gatecheck::compareSolves("host", r.alphaSolves, ofA, nSteps, fin.alphaName.c_str(),
                                                scalar(1e-10), scalar(1e-9));
@@ -200,19 +228,29 @@ int main(
     // the solver: it is step one's k solve, which ends at 4.140e-10, and the two codes are 3.6e-16
     // apart there -- a few units in the last place of a normalised residual. PBiCGStab in the same
     // seat takes 1 of 5 iteration counts and leaves final residuals 100% out.
-    failures += brae::gatecheck::compareSolves("host", sst ? r.omegaSolves : r.epsilonSolves, ofE, nSteps,
-                                               secondName, scalar(1e-10), scalar(1e-10), scalar(1e-5));
-    failures += brae::gatecheck::compareSolves("host", r.kSolves, ofK, nSteps, "k",
-                                               scalar(1e-10), scalar(1e-10), scalar(1e-5));
+    if (!frozen)
+    {
+        failures += brae::gatecheck::compareSolves("host", (sst || frozenSST) ? r.omegaSolves : r.epsilonSolves,
+                                                   ofE, nSteps, secondName,
+                                                   scalar(1e-10), scalar(1e-10), scalar(1e-5));
+        failures += brae::gatecheck::compareSolves("host", r.kSolves, ofK, nSteps, "k",
+                                                   scalar(1e-10), scalar(1e-10), scalar(1e-5));
+    }
 
     // BEFORE any fmax: std::fmax drops a NaN -- see tests/device_gate_finite.cuh
     failures += brae::gatecheck::nonFinite("brae alpha", fin.alpha1.internal);
     failures += brae::gatecheck::nonFinite("brae p_rgh", fin.p_rgh.internal);
     failures += brae::gatecheck::nonFinite("brae U", fin.U.internal);
     failures += brae::gatecheck::nonFinite("brae k", fin.turbulence.k.internal);
-    const std::vector<scalar>& braeSecond = sst ? fin.turbulence.omega.internal
+    const std::vector<scalar>& braeSecond = (sst || frozenSST) ? fin.turbulence.omega.internal
                                                 : fin.turbulence.epsilon.internal;
     failures += brae::gatecheck::nonFinite("brae second field", braeSecond);
+    // THE FAIL-PROOF. `braeSecond` selects omega or epsilon by profile, and the other of the two is
+    // EMPTY -- compare() of an empty field reads Linf 0 and refMax 0, so it passes every bound and every
+    // "is exactly the start value" assertion below. frozenSST selected epsilon under kOmegaSST once and
+    // five assertions passed on nothing at all.
+    check("brae's second closure field has one value per cell -- not the other model's empty one",
+          braeSecond.size() == static_cast<std::size_t>(nC));
     failures += brae::gatecheck::nonFinite("brae nut", fin.turbulence.nut.internal);
 
     const std::vector<scalar> ofAlpha = readCells(ofDir + "/alpha.water");
@@ -224,6 +262,74 @@ int main(
     check("OpenFOAM's fields have one value per cell",
           ofAlpha.size() == static_cast<std::size_t>(nC) && ofKf.size() == ofAlpha.size()
        && ofNut.size() == ofAlpha.size());
+
+    if (frozen)
+    {
+        // WHAT `turbulence off` MEANS, asserted term by term rather than only as agreement with the
+        // oracle -- because OpenFOAM and a brae that froze the wrong quantity could still both be
+        // "unchanged" and differ in which quantity that was.
+        const std::vector<scalar> k0 = readCells(startDir + "/k");
+        const std::vector<scalar> e0 = readCells(startDir + "/" + std::string(secondName));
+        const std::vector<scalar> n0 = readCells(startDir + "/nut");
+        const Diff fK = compare(fin.turbulence.k.internal, k0);
+        const Diff fE = compare(braeSecond, e0);
+        // the two transported scalars never move: no solve touched them, and with the floors below the
+        // case's own values the constructor's bound did not fire either
+        std::printf("  FROZEN: k against the start directory's %.4e, %s %.4e\n",
+                    (double)fK.linf, secondName, (double)fE.linf);
+        if (!frozenFloored)
+        {
+            check("k is EXACTLY the start directory's -- nothing solved it", fK.linf == scalar(0));
+            check("...and so is the second field", fE.linf == scalar(0));
+            // OpenFOAM's own, the same way: the oracle has to agree that the fields are frozen, or this
+            // arm is measuring brae against a run that did advance them
+            check("OpenFOAM's k is EXACTLY its start value too", compare(ofKf, k0).linf == scalar(0));
+            check("...and OpenFOAM's second field is too", compare(ofEf, e0).linf == scalar(0));
+        }
+        else
+        {
+            // the FLOORS, and they are the only thing that touched either field. bound() replaces a
+            // NEGATIVE cell by its neighbours' average and merely FLOORS a small one (bound.C:48-58);
+            // 0.1 is small and positive, so both fields come out at the floor exactly.
+            const scalar floorV = scalar(0.5);
+            scalar kMin = fin.turbulence.k.internal[0];
+            scalar eMin = braeSecond[0];
+            for (const scalar v : fin.turbulence.k.internal) kMin = std::fmin(kMin, v);
+            for (const scalar v : braeSecond) eMin = std::fmin(eMin, v);
+            std::printf("  FROZEN+FLOORED: brae min(k) %.17g, min(%s) %.17g   (floor %.17g)\n",
+                        (double)kMin, secondName, (double)eMin, (double)floorV);
+            // THE WITNESS for the constructor's bound: without it k stays at the case's 0.1, which is
+            // 5x below the floor, and nut comes out 0.009 instead of 0.045.
+            check("the CONSTRUCTOR's bound floored k -- brae's interFoam reader did this in its LES "
+                  "branch only until this arm", kMin == floorV);
+            check("...and the second field", eMin == floorV);
+            check("...and it is NOT the case's own 0.1", k0[0] == scalar(0.1) && kMin != k0[0]);
+            check("OpenFOAM floored both the same way", compare(ofKf, fin.turbulence.k.internal).linf == scalar(0)
+               && compare(ofEf, braeSecond).linf == scalar(0));
+        }
+        // AND THE DISCRIMINATOR BETWEEN THE THREE READINGS OF THE SWITCH. The case ships nut uniform 0.
+        // laminar leaves it 0; "keep the file's nut" leaves it 0; validate() rebuilds it. So a non-zero
+        // nut is the whole of the evidence that validate() is not gated on turbulence_.
+        scalar nutMax = 0;
+        for (const scalar v : ofNut) nutMax = std::fmax(nutMax, std::fabs(v));
+        std::printf("  FROZEN: the start directory's nut was %.17g, OpenFOAM's is up to %.17g\n",
+                    (double)n0[0], (double)nutMax);
+        check("the start directory's nut is 0, so this fixture can tell the readings apart",
+              n0[0] == scalar(0));
+        check("OpenFOAM's nut is NOT 0 -- validate() ran although `turbulence` is off",
+              nutMax > scalar(1e-6));
+        if (!frozenSST)
+        {
+            // kEpsilon::correctNut is Cmu*sqr(k)/epsilon exactly (kEpsilon.C:75), and with both fields
+            // frozen it is one number over the whole field: 0.09*0.01/0.1 = 0.009 unfloored,
+            // 0.09*0.25/0.5 = 0.045 floored. Asserting the VALUE, not just that it moved.
+            const scalar kv = frozenFloored ? scalar(0.5) : scalar(0.1);
+            const scalar want = scalar(0.09) * kv * kv / kv;
+            std::printf("  FROZEN: Cmu*k^2/epsilon = %.17g\n", (double)want);
+            check("...and it is exactly Cmu*k^2/epsilon at the frozen fields",
+                  std::fabs(nutMax - want) < scalar(1e-14) * want);
+        }
+    }
 
     const Diff dA = compare(fin.alpha1.internal, ofAlpha);
     const Diff dP = compare(fin.p_rgh.internal, ofPrgh);
@@ -260,15 +366,24 @@ int main(
                 "%.4e, nut %.4e\n", (double)dOtherU.rel(), (double)dOtherNut.rel());
     // MEASURED 1.33 (laminar), 0.29 (the other lineage) and 3.7e-02 (custom against plain uniform),
     // beside a U bound of 5e-10
-    check("turbulence moves OpenFOAM's own U by more than 10%", dLamU.rel() > scalar(0.1));
+    check(frozen ? "the FROZEN nut moves OpenFOAM's own U more than 10% from its laminar answer -- so a "
+                   "brae that read `turbulence off` as laminar, or as `keep the file's nut`, would be "
+                   "this far out and could not pass the field bounds above"
+                 : "turbulence moves OpenFOAM's own U by more than 10%",
+          dLamU.rel() > scalar(0.1));
     // MEASURED for nutAtmosphere against plain uniform: U 2.7e-03, nut 4.7e-02 -- 20 of the atmosphere's
     // 46 faces take air IN at t = 0.005, where the inletValue stands in for the cell's nut
     // ...and the second outer corrector against one: MEASURED U 4.6e-02 at t = 0.005
-    check(outer ? "...and the second outer corrector moves it by more than 1%"
+    check(frozenFloored ? "...and the FLOORS alone move it by more than 1%, against the same case frozen "
+                          "at the default floors -- so the constructor's bound is visible here"
+          : frozenSST ? "...and switching kOmegaSST off moves it by more than 10%"
+          : frozen ? "...and switching kEpsilon off moves it by more than 10%"
+          : outer ? "...and the second outer corrector moves it by more than 1%"
           : nutAtmosphere ? "...and the atmosphere's inletOutlet nut moves it by more than 1e-3"
           : custom ? "...and the custom settings move it by more than 1%"
                    : "...and the lineage moves it by more than 10%, so `density` is live on this fixture",
-          dOtherU.rel() > (nutAtmosphere ? scalar(1e-3) : (custom || outer) ? scalar(0.01) : scalar(0.1)));
+          dOtherU.rel() > (nutAtmosphere ? scalar(1e-3)
+                         : (custom || outer || frozenFloored) ? scalar(0.01) : scalar(0.1)));
 
     // THE DEVICE LOOP, against OpenFOAM directly and at the case's own tolerances -- what
     // `brae_interFoam -device` runs on this tutorial.
@@ -295,7 +410,7 @@ int main(
         failures += brae::gatecheck::nonFinite("device p_rgh", dev.p_rgh.internal);
         failures += brae::gatecheck::nonFinite("device U", dev.U.internal);
         failures += brae::gatecheck::nonFinite("device k", dev.turbulence.k.internal);
-        const std::vector<scalar>& devSecond = sst ? dev.turbulence.omega.internal
+        const std::vector<scalar>& devSecond = (sst || frozenSST) ? dev.turbulence.omega.internal
                                                    : dev.turbulence.epsilon.internal;
         failures += brae::gatecheck::nonFinite("device second field", devSecond);
         failures += brae::gatecheck::nonFinite("device nut", dev.turbulence.nut.internal);
@@ -310,11 +425,21 @@ int main(
         // THE CONTROL IS ON `custom`: with the wall laplacian coefficient left out of relax() -- what
         // the device closure did until this gate -- epsilon's fields do not move (9.8e-14) and its
         // initial residuals are 1.1e-04 out in every step. 1e-10 is six orders inside that.
-        failures += brae::gatecheck::compareSolves("device", sst ? rd.omegaSolves : rd.epsilonSolves, ofE,
-                                                   nSteps, secondName, scalar(1e-10), scalar(1e-10),
-                                                   scalar(1e-5));
-        failures += brae::gatecheck::compareSolves("device", rd.kSolves, ofK, nSteps, "k",
-                                                   scalar(1e-10), scalar(1e-10), scalar(1e-5));
+        if (frozen)
+        {
+            // the device closure is BUILT (turbulenceOnDevice above) and advances nothing, so there is
+            // no solve to compare -- the assertion is that it ran none, the same one the host arm makes
+            check("the DEVICE closure solved neither field either -- it took the same early return",
+                  rd.kSolves.empty() && rd.epsilonSolves.empty() && rd.omegaSolves.empty());
+        }
+        else
+        {
+            failures += brae::gatecheck::compareSolves("device", (sst || frozenSST) ? rd.omegaSolves : rd.epsilonSolves,
+                                                       ofE, nSteps, secondName, scalar(1e-10), scalar(1e-10),
+                                                       scalar(1e-5));
+            failures += brae::gatecheck::compareSolves("device", rd.kSolves, ofK, nSteps, "k",
+                                                       scalar(1e-10), scalar(1e-10), scalar(1e-5));
+        }
         const Diff eA = compare(dev.alpha1.internal, ofAlpha);
         const Diff eP = compare(dev.p_rgh.internal, ofPrgh);
         const Diff eU = compare(dev.U.internal, ofU);
@@ -352,7 +477,7 @@ int main(
         unsetenv("BRAE_INTER_HOST_CLOSURE");
         check("the mixed run took the HOST closure", !rm.turbulenceOnDevice && rm.steps == nSteps);
         failures += brae::gatecheck::nonFinite("mixed k", mix.turbulence.k.internal);
-        const std::vector<scalar>& mixSecond = sst ? mix.turbulence.omega.internal
+        const std::vector<scalar>& mixSecond = (sst || frozenSST) ? mix.turbulence.omega.internal
                                                    : mix.turbulence.epsilon.internal;
         failures += brae::gatecheck::nonFinite("mixed second field", mixSecond);
         failures += brae::gatecheck::nonFinite("mixed nut", mix.turbulence.nut.internal);
@@ -377,8 +502,8 @@ int main(
         // the two closures took the same sweeps, solve for solve
         std::size_t sameE = 0;
         std::size_t sameK = 0;
-        const std::vector<LinearSolveRecord>& devSecondSolves = sst ? rd.omegaSolves : rd.epsilonSolves;
-        const std::vector<LinearSolveRecord>& mixSecondSolves = sst ? rm.omegaSolves : rm.epsilonSolves;
+        const std::vector<LinearSolveRecord>& devSecondSolves = (sst || frozenSST) ? rd.omegaSolves : rd.epsilonSolves;
+        const std::vector<LinearSolveRecord>& mixSecondSolves = (sst || frozenSST) ? rm.omegaSolves : rm.epsilonSolves;
         for (std::size_t q = 0; q < devSecondSolves.size() && q < mixSecondSolves.size(); ++q)
         {
             if (devSecondSolves[q].nIterations == mixSecondSolves[q].nIterations)
@@ -393,8 +518,12 @@ int main(
                 ++sameK;
             }
         }
-        check("...and took the host closure's sweep counts, solve for solve",
-              sameE == static_cast<std::size_t>(nSteps) && sameK == static_cast<std::size_t>(nSteps));
+        check(frozen ? "...and BOTH closures took no sweep at all, the model being frozen"
+                     : "...and took the host closure's sweep counts, solve for solve",
+              frozen ? (devSecondSolves.empty() && mixSecondSolves.empty()
+                        && rd.kSolves.empty() && rm.kSolves.empty())
+                     : (sameE == static_cast<std::size_t>(nSteps)
+                        && sameK == static_cast<std::size_t>(nSteps)));
     }
 
     std::printf("test_inter_ras_dambreak_vs_openfoam: %d failures\n", failures);

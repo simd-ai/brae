@@ -132,7 +132,7 @@
 // nOuterCorrectors above 1 -- which is why the list is machine-checked rather than described.
 //
 // BEGIN DEVICE REFUSALS
-//   device_closed device_frozenFlow device_gamg_smootherDILU device_gradLsq
+//   device_closed device_frozenFlow device_frozenFlow_n device_gamg_smootherDILU device_gradLsq
 //   device_gradNHat device_leak_explicit device_mesh_dynamic
 //   device_permeable_moving device_ras_otherModel device_sheared_uncorrected device_Uflux_rhoPhi
 // END DEVICE REFUSALS

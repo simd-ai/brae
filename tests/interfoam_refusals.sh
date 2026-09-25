@@ -330,6 +330,10 @@ BASE="$B"
 # (tests/interfoam_dambreak_vs_openfoam.sh `alphaminiter`, compared on the host AND the device arm), so
 # this arm asserts the case RUNS rather than that either loop refuses it.
 arm alpha_minIter           runs    -                        "" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       yes;\\n\\1minIter 1;/' system/fvSolution"
+# `MULESCorr any;` is TRUE to OpenFOAM (Switch.C:114). alphaEqn's own switch helper covered six spellings
+# each way and THREW on `any` and `none`; it is FoamDict::switchOr now, so this runs.
+arm alpha_MULESCorrAny      runs    -                        "" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       any;/' system/fvSolution"
+arm alpha_MULESCorrTypo     refused "Unknown switch sure"    "" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       sure;/' system/fvSolution"
 
 # the non-orthogonal correction: damBreak says `corrected`, brae assembles orthogonal. SHEAR holds the
 # edit that makes that matter -- the upper blocks' top edge moved 0.4 in x, six degrees.
@@ -377,8 +381,31 @@ arm sst_blending            refused "blending stepwise"       "" "$SSTBASE; sed 
 arm sst_nutU                refused "nutUWallFunction"        "" "$SSTBASE; sed -i '0,/nutkWallFunction/ s/nutkWallFunction/nutUWallFunction/' 0/nut"
 arm sst_wallWithoutOmegaWF  refused "omegaWallFunction"       "" "$SSTBASE; sed -i '0,/omegaWallFunction;/ s/omegaWallFunction;/zeroGradient;/' 0/omega"
 arm sst_linearUpwindOmega   refused "div(phi,omega)"          "" "$SSTBASE; sed -i 's/div(phi,omega) .*/div(phi,omega) Gauss linearUpwind grad(omega);/' system/fvSchemes"
+# TWO REFUSALS A SPELLING WALKED PAST until every switch went through FoamDict::switchOr. `decayControl`
+# tested {yes,on,true}, so `1` -- true to OpenFOAM (Switch.C:100) -- RAN, silently dropping
+# beta*sqr(omegaInf) and betaStar*omegaInf*kInf. `correctWalls` tested {false,no,off}, so `0` RAN brae's
+# always-correcting meshWave against OpenFOAM's uncorrected one. Both are refusals now.
+arm sst_decayControlOne     refused "beta*sqr(omegaInf)"      "" "$SSTBASE; sed -i 's/RASModel .*/&\n    kOmegaSSTCoeffs { decayControl 1; }/' constant/turbulenceProperties"
+arm sst_decayControlAny     refused "beta*sqr(omegaInf)"      "" "$SSTBASE; sed -i 's/RASModel .*/&\n    kOmegaSSTCoeffs { decayControl any; }/' constant/turbulenceProperties"
+arm sst_correctWallsZero    refused "corrects the near-wall cells" "" "$SSTBASE; sed -i 's/wallDist { method meshWave; }/wallDist { method meshWave; correctWalls 0; }/' system/fvSchemes"
+arm sst_correctWallsN       refused "corrects the near-wall cells" "" "$SSTBASE; sed -i 's/wallDist { method meshWave; }/wallDist { method meshWave; correctWalls n; }/' system/fvSchemes"
+arm sst_switchTypo          refused "Unknown switch perhaps"  "" "$SSTBASE; sed -i 's/wallDist { method meshWave; }/wallDist { method meshWave; correctWalls perhaps; }/' system/fvSchemes"
 arm ras_LES                 refused "LES"                     "" "sed -i 's/^simulationType .*/simulationType LES;/' constant/turbulenceProperties"
-arm ras_turbulenceOff       refused "turbulence off"          "" "sed -i 's/turbulence  *on;/turbulence      off;/' constant/turbulenceProperties"
+# `turbulence off` RUNS now: the model is constructed, bounded and validated and then never corrected
+# (kEpsilon.C:216-219). On THIS base the lineage is `density variable`, which does NOT call validate()
+# (incompressibleInterPhaseTransportModel.C:99-109), so nut keeps the file's value here -- the uniform
+# lineage's rebuilt nut is gated in tests/interfoam_ras_dambreak_vs_openfoam.sh (`frozen`).
+arm ras_turbulenceOff       runs    -                         "" "sed -i 's/turbulence  *on;/turbulence      off;/' constant/turbulenceProperties"
+# ...and EVERY spelling OpenFOAM's Switch accepts means the same thing. `none`, `n` and `0` are false
+# (Switch.C:94-121); the hand-rolled test this reader replaced accepted only {off,no,false} and read the
+# other four as TRUE, running the closure on a case that had switched it off.
+arm ras_turbulenceNone      runs    -                         "" "sed -i 's/turbulence  *on;/turbulence      none;/' constant/turbulenceProperties"
+arm ras_turbulenceN         runs    -                         "" "sed -i 's/turbulence  *on;/turbulence      n;/' constant/turbulenceProperties"
+arm ras_turbulenceZero      runs    -                         "" "sed -i 's/turbulence  *on;/turbulence      0;/' constant/turbulenceProperties"
+# ...and an UNKNOWN word is OpenFOAM's own FatalError (Switch.C:130-136), not a silent `true`. `of` is
+# the typo the old test read as `turbulence on`.
+arm ras_turbulenceTypo      refused "Unknown switch of"       "" "sed -i 's/turbulence  *on;/turbulence      of;/' constant/turbulenceProperties"
+arm ras_turbulenceCapital   refused "Unknown switch On"       "" "sed -i 's/turbulence  *on;/turbulence      On;/' constant/turbulenceProperties"
 arm ras_densityBad          refused "density mixture"         "" "sed -i 's/^density .*/density mixture;/' constant/turbulenceProperties"
 # `density uniform` looks up div(phi,k), which this tutorial does not carry: OpenFOAM stops there too
 arm ras_uniform_noDivPhiK   refused "div(phi,k)"              "" "sed -i 's/^density .*/density uniform;/' constant/turbulenceProperties"
@@ -523,6 +550,12 @@ arm baffle_noJump           refused "has no \`jump\` entry"             "" "sed 
 # refuses it, asserted in that gate rather than here.
 arm baffle_GAMG             runs    -                                 "" "python3 -c \"import re; p='system/fvSolution'; t=open(p).read(); t=re.sub(r'(\\n    p_rgh\\s*\\{\\s*solver\\s+)PCG;\\s*preconditioner\\s+DIC;', r'\\1GAMG; smoother DIC;', t); open(p,'w').write(t)\""
 arm baffle_momentumPredictor refused "a momentum predictor across the coupled patch" "" "sed -i 's/momentumPredictor  *no;/momentumPredictor   yes;/; /^ *minIter  *1;/d' system/fvSolution"
+# ...and the SPELLINGS of the same switch, on the one base where `momentumPredictor yes` is refused: `n`
+# and `none` are FALSE to OpenFOAM, so they must RUN. The hand-rolled test read both as yes and this base
+# refused them; a typo must still refuse, naming OpenFOAM's own message.
+arm baffle_mompred_n        runs    -                        "" "sed -i 's/momentumPredictor  *no;/momentumPredictor   n;/' system/fvSolution"
+arm baffle_mompred_none     runs    -                        "" "sed -i 's/momentumPredictor  *no;/momentumPredictor   none;/' system/fvSolution"
+arm baffle_mompred_typo     refused "Unknown switch maybe"   "" "sed -i 's/momentumPredictor  *no;/momentumPredictor   maybe;/' system/fvSolution"
 # `cellLimited grad(U)` ACROSS A CYCLIC RUNS on the host now: the refusal said cellLimitedGrad's
 # coupled range was gated across a cyclicAMI only, which was true until validation/interFoamCyclic
 # `sstLimU` held it on a translational pair (host U 8.8697e-13). A blanket refusal coming back
@@ -554,6 +587,10 @@ arm les_noMaxDeltaRatio     refused "no \`maxDeltaRatio\`"            "" "python
 arm les_densityVariable     refused "pairs \`density variable\` with LES" "" "sed -i 's/^simulationType .*/simulationType LES;\\ndensity variable;/' $TP"
 arm les_linearUpwindK       refused "neither \`Gauss upwind\` nor"     "" "sed -i 's/div(phi,k)  *Gauss limitedLinear 1;/div(phi,k) Gauss linearUpwind grad(k);/' system/fvSchemes"
 arm les_cellLimitedGradU    refused "the LES closure computes plain \`Gauss linear\` only" "" "sed -i 's/^\\( *default  *\\)Gauss linear;/\\1cellLimited Gauss linear 1;/' system/fvSchemes"
+# LES `turbulence off`: kEqn.C:141-144 gates correct() alone, and LESModel::correct() corrects the filter
+# width BEFORE that gate (LESModel.C:251) -- which nothing reads again once the model is frozen.
+arm les_turbulenceOff       runs    -                                  "" "sed -i 's/^\\( *\\)turbulence  *on;/\\1turbulence      off;/' $TP"
+arm les_turbulenceTypo      refused "Unknown switch nope"              "" "sed -i 's/^\\( *\\)turbulence  *on;/\\1turbulence      nope;/' $TP"
 BASE="$B"
 
 # the mangrove fvOptions: they run under kEpsilon with PBiCG; each coefficient OpenFOAM reads with
@@ -709,6 +746,10 @@ if [ $HAVE_GPU = 1 ]; then
     # still refused is frozenFlow, which skips the momentum, the pressure AND the turbulence corrector
     arm device_nOuter2      runs    -                        "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' system/fvSolution"
     arm device_frozenFlow   refused "solveFlow no"           "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 1;\n    solveFlow       no;/' system/fvSolution"
+    # ...and the SPELLINGS of it. The device refusal is the witness the host path cannot be: `solveFlow n`
+    # read as TRUE ran the whole flow where OpenFOAM skips it (interFoam.C:163-166), and a `runs` arm
+    # could not tell that apart from a correct frozen run. Here a false spelling MUST reach the refusal.
+    arm device_frozenFlow_n refused "solveFlow no" "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 1;\n    solveFlow       n;/' system/fvSolution"
     # the device pressure step runs the non-orthogonal loop (laminar/damBreak `nonorth` holds it)
     arm device_nNonOrth1    runs    -                        "-device" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"
     arm device_mesh_dynamic refused "dynamicRefineFvMesh"     "-device" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"

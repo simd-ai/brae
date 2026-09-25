@@ -812,25 +812,24 @@ InterFields buildInterFields(const std::string&          caseDir,
         f.pimple.nCorrectors      = static_cast<label>(pim->scalarOr("nCorrectors", scalar(1)));
         f.nNonOrthogonalCorrectors =
             static_cast<label>(pim->scalarOr("nNonOrthogonalCorrectors", scalar(0)));
-        const std::string mp = pim->wordOr("momentumPredictor", "yes");
-        f.momentumPredictorOn = !(mp == "no" || mp == "false" || mp == "off" || mp == "0");
+        // EVERY SWITCH HERE GOES THROUGH FoamDict::switchOr, which is Foam::Switch transcribed
+        // (Switch.C:92-137). The hand-rolled tests these replaced accepted {no,false,off,0} and read
+        // `none`, `f` and `n` -- all three of them false to OpenFOAM -- as TRUE, and read an unknown
+        // word as TRUE where OpenFOAM stops with `Unknown switch`.
+        f.momentumPredictorOn = pim->switchOr("momentumPredictor", true);
         // pimple.frozenFlow() is !solveFlow_, and solveFlow is `solveFlow` in the PIMPLE dict with a
         // default of TRUE (pimpleControl.C:47). interFoam.C:163-166 uses it to `continue` past the
         // momentum, the pressure AND the turbulence corrector for the whole outer iteration. This was
         // hardcoded false, so a case asking for it was run with the flow solved -- the silent
         // substitution this port refuses everywhere else.
-        const std::string sf = pim->wordOr("solveFlow", "yes");
-        f.pimple.frozenFlow = (sf == "no" || sf == "false" || sf == "off" || sf == "0");
+        // ...and THIS one is the one that mattered most: `solveFlow n;` read as true left brae solving
+        // the momentum, the pressure and the turbulence that interFoam.C:163-166 skips entirely.
+        f.pimple.frozenFlow = !pim->switchOr("solveFlow", true);
         // pimpleControl.C:51-52
-        const std::string tf = pim->wordOr("turbOnFinalIterOnly", "yes");
-        f.pimple.turbOnFinalIterOnly = !(tf == "no" || tf == "false" || tf == "off" || tf == "0");
+        f.pimple.turbOnFinalIterOnly = pim->switchOr("turbOnFinalIterOnly", true);
 
         // createDyMControls.H: `correctPhi` defaults to mesh.dynamic(), the other two to false
-        auto switchOr = [&](const char* key, bool def)
-        {
-            const std::string w = pim->wordOr(key, def ? "yes" : "no");
-            return !(w == "no" || w == "false" || w == "off" || w == "0" || w == "n" || w == "f");
-        };
+        auto switchOr = [&](const char* key, bool def) { return pim->switchOr(key, def); };
         f.dynamicMesh = DynamicMotionSolverFvMesh::New(caseDir, startDir);
         const bool dynamic = f.dynamicMesh != nullptr;
         f.correctPhi = switchOr("correctPhi", dynamic);

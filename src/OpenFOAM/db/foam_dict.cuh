@@ -12,6 +12,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -136,6 +137,26 @@ struct FoamDict
     {
         const auto* v = find(name);
         return (v && !v->empty()) ? v->front() : def;
+    }
+    // Foam::Switch, transcribed from Switch.C:92-137 -- ALL of it, because the three forms brae read by
+    // hand each accepted a different subset. The single characters are real (Switch.C:94-104) and so are
+    // `none`/`any`, and an UNKNOWN word is OpenFOAM's `Unknown switch <str>` FatalError (Switch.C:130-136),
+    // NOT false and not true. brae's hand-rolled tests read every unknown word -- a typo `of`, a stray
+    // `On;` with a capital -- as TRUE, which is a silent substitution in front of a case setting.
+    bool switchOr(const std::string& name, bool def) const
+    {
+        const auto* v = find(name);
+        if (!v || v->empty()) return def;
+        const std::string& w = v->front();
+        if (w == "false" || w == "no" || w == "off" || w == "none" || w == "0" || w == "f" || w == "n")
+        {
+            return false;
+        }
+        if (w == "true" || w == "yes" || w == "on" || w == "any" || w == "1" || w == "t" || w == "y")
+        {
+            return true;
+        }
+        throw std::runtime_error("Unknown switch " + w + " for entry `" + name + "`");
     }
     // List entries (e.g. liftDir (0 1 0); patches (upperWall lowerWall);). Parens are stripped; scalars are the
     // numeric tokens, words are the non-empty bare tokens. Returns def when the key is absent/empty.

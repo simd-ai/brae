@@ -94,7 +94,7 @@ stage()
     case "$profile" in
         laminar)
             sed -i 's/^simulationType .*/simulationType laminar;/' "$C/constant/turbulenceProperties" ;;
-        uniform|custom|nutAtmosphere|sst)
+        uniform|custom|nutAtmosphere|sst|frozen|frozenFloored|frozenSST)
             sed -i '/^density /d' "$C/constant/turbulenceProperties"
             sed -i 's/^\( *\)div(rhoPhi,k) .*/\1div(phi,k)      Gauss upwind;/; s/^\( *\)div(rhoPhi,epsilon) .*/\1div(phi,epsilon) Gauss upwind;/' \
                 "$C/system/fvSchemes"
@@ -116,7 +116,7 @@ PYEOF
     # `sst`: the same tutorial made kOmegaSST -- omega from its epsilon file with omegaWallFunction, the
     # closure's own div entries, the solver entry renamed, and fvSchemes' mandatory wallDist method.
     # RAS/damBreak's nut atmosphere is `calculated`, which is what lets the DEVICE closure run it.
-    if [ "$profile" = sst ]; then
+    if [ "$profile" = sst ] || [ "$profile" = frozenSST ]; then
         python3 - "$C" <<'SSTEOF' || { echo "FAIL: the sst profile was not staged"; return 1; }
 import os, re, sys
 d = sys.argv[1]
@@ -142,6 +142,32 @@ e = re.sub(r'object\s+epsilon;', 'object      omega;', e)
 e = e.replace('[0 2 -3 0 0 0 0]', '[0 0 -1 0 0 0 0]')
 open(os.path.join(d, '0/omega'), 'w').write(e)
 SSTEOF
+    fi
+    # `frozen*`: `RAS { turbulence off; }` -- a model that is CONSTRUCTED and VALIDATED and then never
+    # corrected again. It is neither laminar nor "keep the file's nut", and THIS FIXTURE SEPARATES THE
+    # THREE READINGS because the case ships nut uniform 0 with k and epsilon both 0.1:
+    #   laminar                nut stays 0            (no model at all)
+    #   "keep the file's nut"  nut stays 0            (the reading brae's old refusal called possible)
+    #   OpenFOAM               nut = Cmu*k^2/epsilon  = 0.09*0.01/0.1 = 0.009
+    # eddyViscosity.C:119-122 is `correctNut();` with no turbulence_ test, and the uniform lineage calls
+    # validate() (incompressibleInterPhaseTransportModel.C:105), so OpenFOAM takes the third. 0.009
+    # against a water nu of 1e-6 is a 9000x eddy viscosity, which is why the laminar control is decisive
+    # here rather than marginal.
+    case "$profile" in
+        frozen|frozenFloored|frozenSST)
+            sed -i 's/^\( *\)turbulence  *on;/\1turbulence      off;/' "$C/constant/turbulenceProperties"
+            grep -q "turbulence      off;" "$C/constant/turbulenceProperties" \
+                || { echo "FAIL: the tutorial no longer ships 'turbulence on', so [$profile] staged nothing"; return 1; } ;;
+    esac
+    # `frozenFloored`: floors ABOVE the case's own k and epsilon, both 0.1. With correct() gated out, the
+    # CONSTRUCTOR's bound (kEpsilon.C:182-183) is then the ONLY thing in the entire run that touches
+    # either field -- k and epsilon come out at 0.5 and nut at 0.09*0.25/0.5 = 0.045, not 0.009. brae's
+    # interFoam reader had that bound in its LES branch alone, so this arm is the one that witnesses it.
+    if [ "$profile" = frozenFloored ]; then
+        sed -i 's/^\( *\)turbulence      off;/\1turbulence      off;\n\1kMin            0.5;\n\1epsilonMin      0.5;/' \
+            "$C/constant/turbulenceProperties"
+        grep -q "kMin            0.5;" "$C/constant/turbulenceProperties" \
+            || { echo "FAIL: the floors were not staged"; return 1; }
     fi
     # `outer`: the shipped case with nOuterCorrectors 2 -- the second pass starts from the first pass's
     # alpha, U and phi, and every once-per-step update must stay once per step. The DEVICE alpha step
@@ -215,7 +241,7 @@ PYEOF
 }
 
 rc=0
-for p in laminar variable uniform custom nutAtmosphere sst outer; do
+for p in laminar variable uniform custom nutAtmosphere sst outer frozen frozenFloored frozenSST; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_ras_dambreak_vs_openfoam: staging failed"; exit 1; }
@@ -233,6 +259,18 @@ done
        sst uniform "$W/laminar/$END" "$W/uniform/$END" || rc=1
 "$BIN" "$W/outer" "$W/outer/0" "$W/outer/$END" "$STEPS" "$W/outer/log.interFoam" \
        outer variable "$W/laminar/$END" "$W/variable/$END" || rc=1
+
+# THE FROZEN ARMS. The control is the SAME case with turbulence on -- `uniform` -- so the one setting
+# between them is the switch, and `laminar` is the second control: it is the answer a brae that read
+# `turbulence off` as "no model" or as "keep the file's nut" would produce, since both leave nut at 0.
+"$BIN" "$W/frozen" "$W/frozen/0" "$W/frozen/$END" "$STEPS" "$W/frozen/log.interFoam" \
+       frozen uniform "$W/laminar/$END" "$W/uniform/$END" || rc=1
+# ...and this one's control is the UNFLOORED frozen run: the floors are the only difference, so any gap
+# between the two is the constructor's bound and nothing else.
+"$BIN" "$W/frozenFloored" "$W/frozenFloored/0" "$W/frozenFloored/$END" "$STEPS" "$W/frozenFloored/log.interFoam" \
+       frozenFloored uniform "$W/laminar/$END" "$W/frozen/$END" || rc=1
+"$BIN" "$W/frozenSST" "$W/frozenSST/0" "$W/frozenSST/$END" "$STEPS" "$W/frozenSST/log.interFoam" \
+       frozenSST uniform "$W/laminar/$END" "$W/sst/$END" || rc=1
 
 echo "interfoam_ras_dambreak_vs_openfoam: rc $rc"
 exit $rc

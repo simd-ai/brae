@@ -117,6 +117,18 @@ struct InterTurbulence
 {
     // simulationType RAS. False is laminar: no fields, nuEff = nu, correct() does nothing.
     bool on = false;
+    // `RAS { turbulence off; }` / `LES { turbulence off; }` -- a model that is CONSTRUCTED and
+    // VALIDATED and then never corrected again. It is NOT laminar and it is NOT "keep the file's nut":
+    //   * the constructor still bounds the two transported scalars (kEpsilon.C:182-183,
+    //     kOmegaSSTBase.C:438-439, kEqn's bound(k_, kMin_))
+    //   * validate() is NOT gated on turbulence_ (eddyViscosity.C:119-122 is `correctNut();` alone) and
+    //     interFoam's uniform-density lineage calls it
+    //     (incompressibleInterPhaseTransportModel.C:105), so nut is REBUILT from the bounded file
+    //     fields by the model's own formula
+    //   * only correct() returns early (kEpsilon.C:216-219, kOmegaSSTBase.C:502-505, kEqn.C:141-144),
+    //     so k, the second scalar and nut all hold that one value for the whole run
+    // `on` therefore stays TRUE: nuEff is still nut + nu, and the nut it adds is validate()'s.
+    bool frozen = false;
     InterTurbulenceCrankNicolson cn;
     InterRasModel model = InterRasModel::KEpsilon;
     // `density variable` -- see the header

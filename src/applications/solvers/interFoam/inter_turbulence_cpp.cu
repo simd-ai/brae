@@ -376,11 +376,11 @@ InterTurbulence readInterTurbulence(
                 std::string(WHO) + file + " asks for LESModel `" + lesModel + "`. kEqn is the LES model "
                 "wired into interFoam (LES/nozzleFlow2D); Smagorinsky, WALE, dynamicKEqn and the rest "
                 "are different models and are not substituted.");
-        const std::string lsw = les->wordOr("turbulence", "on");
-        if (lsw == "off" || lsw == "no" || lsw == "false")
-            throw std::runtime_error(
-                std::string(WHO) + file + " has `LES { turbulence off; }`, which no gate holds against "
-                "OpenFOAM yet.");
+        // LESModel.C:70 reads it as a Switch defaulting true. LESModel::correct() then calls
+        // delta_().correct() BEFORE kEqn's gate (LESModel.C:251, kEqn.C:141), so a frozen LES model on a
+        // MOVING mesh still recomputes its filter width every step -- brae recomputes it in
+        // moveInterTurbulence, the same steps, and nothing reads it again once correct() is gated out.
+        t.frozen = !les->switchOr("turbulence", true);
         if (!eulerDdt)
             throw std::runtime_error(
                 std::string(WHO) + "kEqn takes fvm::ddt(k) through ddtSchemes (kEqn.C:162) and the "
@@ -451,12 +451,10 @@ InterTurbulence readInterTurbulence(
             "the models wired into interFoam (16 of the 17 turbulent tutorials name one of them); "
             "refusing rather than running it under another model's name.");
     t.model = (model == "kOmegaSST") ? InterRasModel::KOmegaSST : InterRasModel::KEpsilon;
-    const std::string sw = ras->wordOr("turbulence", "on");
-    if (sw == "off" || sw == "no" || sw == "false")
-        throw std::runtime_error(
-            std::string(WHO) + file + " has `RAS { turbulence off; }`. The frozen model keeps the nut "
-            "its construction left -- validate()'s in one lineage, the case file's in the other -- "
-            "and no gate holds that against OpenFOAM yet. Refused rather than run ungated.");
+    // RASModel.C:70, a Switch defaulting true. The open question the old refusal named is settled:
+    // validate() is NOT gated on it (eddyViscosity.C:119-122), so the uniform lineage rebuilds nut from
+    // the BOUNDED file fields and freezes there -- see InterTurbulence::frozen.
+    t.frozen = !ras->switchOr("turbulence", true);
     // kEpsilon carries CrankNicolson too (InterTurbulenceStepInput::cn); kOmegaSST does not, and the
     // case reader has already said so by name where the two meet
     // EVERY CLOSURE TAKES CrankNicolson NOW -- kEpsilon always did; kOmegaSST's two equations and
@@ -484,10 +482,13 @@ InterTurbulence readInterTurbulence(
         // kOmegaSSTBase.C:408-461. With it the two equations gain beta*sqr(omegaInf) and
         // betaStar*omegaInf*kInf and the closure here carries neither term.
         const FoamDict* sstDict = ras->optionalSubDict("kOmegaSSTCoeffs");
-        const std::string decay = (sstDict ? sstDict : ras)->wordOr("decayControl", "no");
-        if (decay == "yes" || decay == "on" || decay == "true")
+        // A REFUSAL A SPELLING COULD WALK PAST: this tested {yes,on,true} and let `decayControl 1;`
+        // (and `any`, `t`, `y`) through, so the run silently omitted both decay terms.
+        const bool decay = (sstDict ? sstDict : ras)->switchOr("decayControl", false);
+        if (decay)
             throw std::runtime_error(
-                std::string(WHO) + file + " sets `decayControl " + decay + "`. It adds "
+                std::string(WHO) + file + " sets `decayControl "
+                + (sstDict ? sstDict : ras)->wordOr("decayControl", "yes") + "`. It adds "
                 "beta*sqr(omegaInf) to the omega equation and betaStar*omegaInf*kInf to k's "
                 "(kOmegaSSTBase.C:574, :594), and kOmegaSST_cpp carries neither.");
         if (t.sstCoeffs.F3)
@@ -502,6 +503,12 @@ InterTurbulence readInterTurbulence(
         t.k = readTurbulenceField(startDir, "k", patches, nCells);
         t.omega = readTurbulenceField(startDir, "omega", patches, nCells);
         t.nut = readTurbulenceField(startDir, "nut", patches, nCells);
+        // kOmegaSSTBase.C:438-439, THE CONSTRUCTOR's bound -- k first, omega second. It runs whether or
+        // not `turbulence` is on, and validate() then builds the first momentum equation's nut from the
+        // BOUNDED fields. interFoam's reader had it in the LES branch alone; the same hole in the
+        // single-phase drivers is gated by tests/bound_at_construction_vs_openfoam.sh.
+        bound(t.k, t.sstCoeffs.kMin, *mesh, *geometry, patches, "k");
+        bound(t.omega, t.sstCoeffs.omegaMin, *mesh, *geometry, patches, "omega");
         requireSstWalls(startDir, t.sstCoeffs, patches);
         t.nutWallKind.assign(patches.size(), -1);
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
@@ -541,11 +548,13 @@ InterTurbulence readInterTurbulence(
                 throw std::runtime_error(
                     std::string(WHO) + "fvSchemes names `wallDist { method " + method + "; }`. kOmegaSST's "
                     "wall distance is ported as meshWave (patchDistMethods/meshWave) only.");
-            const std::string cw = wd->wordOr("correctWalls", "true");
-            if (cw == "false" || cw == "no" || cw == "off")
+            // ...and the same again: {false,no,off} let `correctWalls 0;` through, and brae then ran
+            // its always-correcting meshWave against OpenFOAM's uncorrected one with no message.
+            if (!wd->switchOr("correctWalls", true))
                 throw std::runtime_error(
-                    std::string(WHO) + "fvSchemes sets `wallDist { correctWalls " + cw + "; }`; brae's "
-                    "meshWave always corrects the near-wall cells.");
+                    std::string(WHO) + "fvSchemes sets `wallDist { correctWalls "
+                    + wd->wordOr("correctWalls", "false") + "; }`; brae's meshWave always corrects the "
+                    "near-wall cells.");
             t.wallDistUpdateInterval = static_cast<label>(wd->scalarOr("updateInterval", 1));
             t.yCell = cellWallDist(*mesh, *geometry, patches);
         }
@@ -583,6 +592,16 @@ InterTurbulence readInterTurbulence(
     t.k = readTurbulenceField(startDir, "k", patches, nCells);
     t.epsilon = readTurbulenceField(startDir, "epsilon", patches, nCells);
     t.nut = readTurbulenceField(startDir, "nut", patches, nCells);
+    // kEpsilon.C:182-183, the constructor's bound: k first, epsilon second. See the SST branch.
+    // A REFUSAL RATHER THAN A GUARD: `if (mesh && geometry)` here would silently skip the bound for a
+    // caller that passed neither, and frozenFloored is the only arm that could ever notice. The SST
+    // branch already throws on the same condition (for its wall distance), so this matches it.
+    if (!mesh || !geometry)
+        throw std::runtime_error(
+            std::string(WHO) + "kEpsilon needs the mesh for the constructor's bound(k)/bound(epsilon) "
+            "and this caller handed readInterTurbulence none.");
+    bound(t.k, t.coeffs.kMin, *mesh, *geometry, patches, "k");
+    bound(t.epsilon, t.coeffs.epsilonMin, *mesh, *geometry, patches, "epsilon");
     t.nutWallKind = readNutWallKinds(startDir, t.epsilon, patches);
     // the closure tells k's and epsilon's flux-conditional patches the volumetric phi and nothing else
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
@@ -748,6 +767,10 @@ void correctInterTurbulence(
     const std::vector<FvPatch>& patches)
 {
     if (!t.on) return;
+    // `turbulence off`: kEpsilon.C:216-219, kOmegaSSTBase.C:502-505 and kEqn.C:141-144 each open
+    // correct() with `if (!this->turbulence_) { return; }`. Nothing else in the model is gated -- the
+    // constructor bound and validate()'s correctNut have already run -- so this is the whole of it.
+    if (t.frozen) return;
     if (!in.U || !in.phi || !in.rhoPhi || !in.rho || !in.rhoBnd || !in.rhoOld || !in.nu || !in.nuBnd)
         throw std::runtime_error(std::string(WHO) + "correctInterTurbulence needs every input field.");
     if (!(in.deltaT > 0))

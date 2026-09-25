@@ -22,16 +22,12 @@ namespace {
 // treated as off. `MULESCorr` selects the semi-implicit path, and a case that misspells it into silence
 // runs the explicit limiter while its fvSolution says otherwise -- a difference in the solution, not in
 // a diagnostic. Switch::find FatalErrors on a bad token too.
+// ...and it is FoamDict::switchOr's, shared with every other switch in the solver. This helper had the
+// right SHAPE -- throw on an unknown token -- and two spellings short of the table: `none` is false to
+// OpenFOAM and `any` is true (Switch.C:112-121), and both landed in the throw here.
 bool switchOr(const FoamDict& d, const std::string& key, bool def)
 {
-    const std::string v = d.wordOr(key, "");
-    if (v.empty())                                                   return def;
-    if (v == "yes" || v == "true"  || v == "on"  || v == "y" || v == "t" || v == "1") return true;
-    if (v == "no"  || v == "false" || v == "off" || v == "n" || v == "f" || v == "0") return false;
-    throw std::runtime_error(
-        "brae interFoam alphaEqn: `" + key + " " + v + ";` is not a Switch. OpenFOAM accepts "
-        "yes/no, true/false, on/off, y/n, t/f, 1/0 and FatalErrors on anything else; defaulting an "
-        "unrecognised value to off would change which alpha solver runs without saying so.");
+    return d.switchOr(key, def);
 }
 
 }   // namespace

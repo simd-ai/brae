@@ -442,6 +442,11 @@ void deviceCorrectInterTurbulence(
     const DeviceVectorBoundary& dbU)
 {
     if (!t.on) return;
+    // `turbulence off` -- the same early return the host closure takes, and OpenFOAM's own
+    // (kEpsilon.C:216-219, kOmegaSSTBase.C:502-505, kEqn.C:141-144). The device closure is still BUILT,
+    // because the model is still constructed and validated; it simply has nothing to advance, and the
+    // nut it built from validate() is the nut nuEff keeps for the whole run.
+    if (t.frozen) return;
     if (!in.Ux || !in.Uy || !in.Uz || !in.phiInt || !in.phiBnd || !in.rhoPhiInt || !in.rhoPhiBnd
      || !in.rho || !in.rhoBnd || !in.rhoOld || !in.nu || !in.nuBnd)
         throw std::runtime_error("brae interFoam (device): deviceCorrectInterTurbulence needs every input.");
