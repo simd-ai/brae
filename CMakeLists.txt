@@ -3790,6 +3790,16 @@ add_test(NAME topo_change_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/topo_change_vs_openfoam.sh)
 set_tests_properties(topo_change_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
+# UNIT 5a: faceEdges / edgeFaces / cellEdges -- the primitiveMesh addressing hexRef8::setRefinement reads,
+# against OpenFOAM's own (tools/dumpMeshEdges dumps BOTH of OpenFOAM's two forms of each).
+add_executable(test_mesh_edges_addressing_vs_openfoam tests/test_mesh_edges_addressing_vs_openfoam.cu)
+target_include_directories(test_mesh_edges_addressing_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_mesh_edges_addressing_vs_openfoam PRIVATE brae_core)
+add_test(NAME mesh_edges_addressing_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mesh_edges_addressing_vs_openfoam.sh)
+set_tests_properties(mesh_edges_addressing_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
 # brae's dynamicRefineFvMeshCoeffs reader against the three shipped AMR tutorials' own dictionaries --
 # flat, flat-beside-a-subdict, and wrapped. The oracle is the dictionary; the script says why all three.
 add_executable(test_refine_controls tests/test_refine_controls.cu)

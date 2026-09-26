@@ -99,23 +99,21 @@ MeshEdges buildMeshEdges(const PrimitiveMesh& m)
     const label nPoints = m.nPoints();
     label nIntPts = -1;
     // WHICH BRANCH calcEdges TAKES. On a mesh whose points are ORDERED -- every point used only by
-    // internal faces before every point on a boundary face -- OpenFOAM numbers the edges in four
-    // blocks (both points internal, one internal, both on the boundary, then the external edges),
-    // and the wave that walks them would visit them in that order. No mesh in this tree is ordered:
-    // blockMesh numbers points geometrically, subsetMesh and renumberMesh leave the point order
-    // alone, and every fixture measured here reports nInternalPoints -1. So that branch is refused
-    // rather than transcribed and left untested -- an edge numbering nothing can check is a wrong
-    // answer waiting for the first ordered mesh.
-    if (calcPointOrder(m, nIntPts))
-    {
-        throw std::runtime_error(
-            "brae buildMeshEdges: this mesh's points are ORDERED (" + std::to_string((long)nIntPts) +
-            " of " + std::to_string((long)nPoints) + " used only by internal faces, and numbered "
-            "first). OpenFOAM then sorts the edges into four blocks with the external edges last "
-            "(primitiveMeshEdges.C:230-330), and PointEdgeWave's answer depends on that order. Only "
-            "the unordered branch is ported.");
-    }
-    out.nInternalPoints = -1;
+    // internal faces coming before every point on a boundary face -- OpenFOAM numbers the edges in FOUR
+    // BLOCKS: both points internal, one internal, both on the boundary, then the external edges last
+    // (primitiveMeshEdges.C:286-410). Otherwise it is one upper-triangular block.
+    //
+    // THIS BRANCH USED TO BE REFUSED HERE, on the stated grounds that "no mesh in this tree is ordered:
+    // blockMesh numbers points geometrically ... and every fixture measured here reports nInternalPoints
+    // -1". THAT WAS WRONG, and unit 5a's gate found it: `calcPointOrder` counts a point as a BOUNDARY
+    // point if any boundary face uses it, and a 2D case's `empty` front and back patches cover the whole
+    // domain -- so EVERY point is a boundary point, nBoundaryPoints == nPoints, nInternalPoints == 0, and
+    // the second loop finds no unnumbered point at all, leaving `ordered` TRUE. MEASURED: laminar/damBreak
+    // reports 0 of 4746 and LES/nozzleFlow2D 0 of 15276. The refused branch is the one every 2D fixture
+    // in this tree takes, and the old comment had confused "nInternalPoints is -1" (the unordered
+    // SENTINEL) with "there are no internal points" (0, which is ordered).
+    const bool ordered = calcPointOrder(m, nIntPts);
+    out.nInternalPoints = ordered ? nIntPts : label(-1);
 
     std::vector<std::vector<label>> pe(static_cast<std::size_t>(nPoints));
     std::vector<label> esStart;
@@ -134,17 +132,71 @@ MeshEdges buildMeshEdges(const PrimitiveMesh& m)
         }
     };
 
-    for (label facei = 0; facei < m.nFaces(); ++facei)
+    // THE CREATION ORDER IS PART OF THE ANSWER on the ordered branch, because the sort below asks
+    // `edgeI < nExtEdges` to decide whether an edge is external -- and that is a PRE-SORT index. So
+    // OpenFOAM does the BOUNDARY faces first (:182-205), which puts every external edge in 0..nExtEdges,
+    // and only then the internal faces (:206-250), counting how many internal edges have 0 and 1
+    // boundary points as it goes. The unordered branch needs none of that and walks faces in index
+    // order, which is what this did for every mesh before.
+    label nExtEdges = 0;
+    label nInternal0Edges = 0;
+    label nInt1Edges = 0;
+    if (ordered)
     {
-        walkFace(facei);
+        for (label facei = m.nInternalFaces(); facei < m.nFaces(); ++facei)
+        {
+            walkFace(facei);
+        }
+        nExtEdges = static_cast<label>(esStart.size());
+        for (label facei = 0; facei < m.nInternalFaces(); ++facei)
+        {
+            const label b = m.faceOffsets()[facei];
+            const label n = m.faceSize(facei);
+            for (label fp = 0; fp < n; ++fp)
+            {
+                const label pointi = m.faceVerts()[b + fp];
+                const label nextPointi = m.faceVerts()[b + ((fp + 1) % n)];
+                const std::size_t before = esStart.size();
+                getEdge(pe, esStart, esEnd, pointi, nextPointi);
+                if (esStart.size() > before)
+                {
+                    // a NEW internal edge: classify it by how many of its two points are internal
+                    if (pointi < nIntPts)
+                    {
+                        if (nextPointi < nIntPts) ++nInternal0Edges;
+                        else                      ++nInt1Edges;
+                    }
+                    else if (nextPointi < nIntPts)
+                    {
+                        ++nInt1Edges;
+                    }
+                    // else: an internal edge with BOTH points on the boundary, counted by neither
+                }
+            }
+        }
+    }
+    else
+    {
+        for (label facei = 0; facei < m.nFaces(); ++facei)
+        {
+            walkFace(facei);
+        }
     }
 
     const label nEdges = static_cast<label>(esStart.size());
+    // :252-256
+    const label nInternalEdges = nEdges - nExtEdges;
+    const label nInternal1Edges = nInternal0Edges + nInt1Edges;
 
     // Like faces, sort the edges in order of increasing neighbouring point -- one
     // upper-triangular block, which is the branch an unordered mesh takes.
     std::vector<label> oldToNew(static_cast<std::size_t>(nEdges), label(-1));
+    // FOUR RUNNING COUNTERS on the ordered branch (:291-302), one on the other. Their starts are what
+    // put the blocks in OpenFOAM's order; the per-point upper-triangular walk below is shared.
     label internal0EdgeI = 0;
+    label internal1EdgeI = nInternal0Edges;
+    label internal2EdgeI = nInternal1Edges;
+    label externalEdgeI = nInternalEdges;
 
     std::vector<label> nbrPoints;
     std::vector<label> order;
@@ -171,7 +223,42 @@ MeshEdges buildMeshEdges(const PrimitiveMesh& m)
         {
             const std::size_t oi = static_cast<std::size_t>(order[i]);
             if (nbrPoints[oi] == -1) continue;
-            oldToNew[static_cast<std::size_t>(pEdges[oi])] = internal0EdgeI++;
+            const label edgeI = pEdges[oi];
+            if (!ordered)
+            {
+                oldToNew[static_cast<std::size_t>(edgeI)] = internal0EdgeI++;
+                continue;
+            }
+            // :318-408. The EXTERNAL test comes first and is on the PRE-SORT index; only then does the
+            // neighbour's own internal/boundary status choose between the two internal blocks. The two
+            // halves of OpenFOAM's `pointi < nInternalPoints_` split are the SAME four lines except that
+            // the boundary-point half FatalErrors on `nbrPointi < nInternalPoints_` -- which cannot
+            // happen, because an edge from a boundary point to an internal point would have been found
+            // from the internal point first, where it is the upper-triangular one. Kept as one branch
+            // with that impossibility thrown rather than duplicated.
+            if (edgeI < nExtEdges)
+            {
+                oldToNew[static_cast<std::size_t>(edgeI)] = externalEdgeI++;
+            }
+            else if (nbrPoints[oi] < nIntPts)
+            {
+                if (pointi >= nIntPts)
+                    throw std::runtime_error(
+                        "brae buildMeshEdges: internal edge " + std::to_string((long)edgeI)
+                        + " runs from boundary point " + std::to_string((long)pointi)
+                        + " to internal point " + std::to_string((long)nbrPoints[oi])
+                        + ". OpenFOAM calls this \"Not possible!\" (primitiveMeshEdges.C:389-394): the "
+                        "edge would have been reached from the internal point first.");
+                oldToNew[static_cast<std::size_t>(edgeI)] = internal0EdgeI++;
+            }
+            else if (pointi < nIntPts)
+            {
+                oldToNew[static_cast<std::size_t>(edgeI)] = internal1EdgeI++;
+            }
+            else
+            {
+                oldToNew[static_cast<std::size_t>(edgeI)] = internal2EdgeI++;
+            }
         }
     }
 
@@ -198,5 +285,107 @@ MeshEdges buildMeshEdges(const PrimitiveMesh& m)
     }
     return out;
 }
+
+
+// ----------------------------------------------------------------------------------------------
+// UNIT 5a: faceEdges, edgeFaces, cellEdges. See the header for which of the three orders is the answer
+// and which two are inert, both read off hexRef8's own call sites.
+
+std::vector<std::vector<label>> buildFaceEdges(
+    const PrimitiveMesh& m,
+    const MeshEdges&     me)
+{
+    const label nFaces = m.nFaces();
+    std::vector<std::vector<label>> out(static_cast<std::size_t>(nFaces));
+    for (label facei = 0; facei < nFaces; ++facei)
+    {
+        const label b = m.faceOffsets()[facei];
+        const label e = m.faceOffsets()[facei + 1];
+        const label n = e - b;
+        std::vector<label>& fe = out[static_cast<std::size_t>(facei)];
+        fe.assign(static_cast<std::size_t>(n), label(-1));
+        for (label fp = 0; fp < n; ++fp)
+        {
+            // f.fcIndex(fp): the next vertex, wrapping
+            const label pointi = m.faceVerts()[b + fp];
+            const label nextPointi = m.faceVerts()[b + ((fp + 1) % n)];
+            // primitiveMeshEdges.C:562-574 -- scan the point's edges for the one whose OTHER vertex is
+            // the next point, and take the FIRST such. There is exactly one on a valid mesh.
+            for (const label edgei : me.pointEdges[static_cast<std::size_t>(pointi)])
+            {
+                const label s = me.start[static_cast<std::size_t>(edgei)];
+                const label t = me.end[static_cast<std::size_t>(edgei)];
+                const label other = (s == pointi) ? t : s;
+                if (other == nextPointi)
+                {
+                    fe[static_cast<std::size_t>(fp)] = edgei;
+                    break;
+                }
+            }
+            if (fe[static_cast<std::size_t>(fp)] < 0)
+                throw std::runtime_error(
+                    "brae faceEdges: face " + std::to_string(facei) + " position "
+                    + std::to_string(fp) + " has no edge between points " + std::to_string(pointi)
+                    + " and " + std::to_string(nextPointi) + ". The edge list and the face list "
+                    "disagree about the mesh.");
+        }
+    }
+    return out;
+}
+
+
+std::vector<std::vector<label>> buildEdgeFaces(
+    const PrimitiveMesh&                   m,
+    const std::vector<std::vector<label>>& faceEdges)
+{
+    // invertManyToMany over faceEdges: walk the faces in INCREASING order and append, so every edge's
+    // list comes out in ascending face index -- which is what the cached form gives and what the
+    // on-demand form's comment relies on (primitiveMeshEdgeFaces.C:35-70, :72-110).
+    std::size_t nEdges = 0;
+    for (const auto& fe : faceEdges)
+    {
+        for (const label e : fe) nEdges = std::max(nEdges, static_cast<std::size_t>(e) + 1);
+    }
+    std::vector<std::vector<label>> out(nEdges);
+    std::vector<label> count(nEdges, label(0));
+    for (const auto& fe : faceEdges)
+    {
+        for (const label e : fe) ++count[static_cast<std::size_t>(e)];
+    }
+    for (std::size_t e = 0; e < nEdges; ++e) out[e].reserve(static_cast<std::size_t>(count[e]));
+    for (std::size_t facei = 0; facei < faceEdges.size(); ++facei)
+    {
+        for (const label e : faceEdges[facei])
+        {
+            out[static_cast<std::size_t>(e)].push_back(static_cast<label>(facei));
+        }
+    }
+    (void)m;
+    return out;
+}
+
+
+std::vector<std::vector<label>> buildCellEdges(
+    const std::vector<std::vector<label>>& cells,
+    const std::vector<std::vector<label>>& faceEdges)
+{
+    std::vector<std::vector<label>> out(cells.size());
+    for (std::size_t celli = 0; celli < cells.size(); ++celli)
+    {
+        std::vector<label>& ce = out[celli];
+        for (const label facei : cells[celli])
+        {
+            const std::vector<label>& fe = faceEdges[static_cast<std::size_t>(facei)];
+            ce.insert(ce.end(), fe.begin(), fe.end());
+        }
+        // SORTED and uniqued. OpenFOAM's on-demand form walks a labelHashSet instead, so its order is
+        // bucket order; the only consumer MARKS per edge (hexRef8.C:3415-3433) and cannot tell. See the
+        // header -- this is a deliberate departure with a measured reason, not a transcription.
+        std::sort(ce.begin(), ce.end());
+        ce.erase(std::unique(ce.begin(), ce.end()), ce.end());
+    }
+    return out;
+}
+
 
 } // namespace brae

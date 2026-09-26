@@ -44,13 +44,20 @@
 # neighbour and region the mesh's, nothing retired and nothing inflated. That is unit 3 checked on its
 # own, and it is the only thing about the action surface that OpenFOAM cannot be asked about directly.
 #
-# WHAT THESE ARMS CANNOT SEE, and it is the ADD path. A legal 8-way hex split is 1 cell-centre point, 6
-# face midpoints, 12 edge midpoints, 7 cells and their faces -- authoring one by hand IS writing
-# hexRef8::setRefinement, which is unit 5. So facesFromEdgesMap, facesFromPointsMap, cellsFromPointsMap,
-# cellsFromEdgesMap and cellsFromFacesMap are EMPTY in all three arms, and the gate asserts they are
-# empty on BOTH sides rather than skipping them -- an empty comparison that is empty for a stated reason
-# is not the same as one nobody looked at. changeMesh REFUSES a non-empty one by name, so unit 5 has to
-# lift the refusal and gate what it lifts.
+# WHAT THESE ARMS CANNOT SEE is the 8-way hex split itself -- authoring one by hand IS writing
+# hexRef8::setRefinement, which is unit 5. But NOT the inflation maps, and that was written wrongly here
+# at first: `setRefinement` NEVER FILLS THEM. Its four action sites pass, measured in hexRef8.C:
+#   polyAddPoint  a POINT master (the edge's first vertex, :3484-3494)
+#   polyAddCell   a CELL master (:3838-3846)
+#   addFace       a FACE master (:2790-2840)
+#   addInternalFace  NO master at all, in BOTH branches -- OpenFOAM's own comment is "For now create out
+#                 of nothing" (:2880-2930), so the face simply is not mapped
+# CONFIRMED against a real refinement step of laminar/damBreakWithObstacle (tools/dumpRefineMap, 24,185 ->
+# 24,815 cells): ncellsFromCells, ncellsFromFaces, ncellsFromEdges, ncellsFromPoints, nfacesFromFaces,
+# nfacesFromEdges, nfacesFromPoints and npointsFromPoints are ALL ZERO. So changeMesh's inflation refusal
+# guards a path OpenFOAM does not take on refinement -- it is a correct refusal, not a deferred one, and
+# unit 5 does not lift it. The gate asserts the five lists are empty on BOTH sides rather than skipping
+# them: an empty comparison that is empty for a measured reason is not one nobody looked at.
 #
 # ALSO REFUSED by changeMesh, each for want of a fixture and not for difficulty: a coupled patch
 # (reorderCoupledFaces is a parallel exchange), zones (resetZones, 369 lines), `inflate == true`, and
