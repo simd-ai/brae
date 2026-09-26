@@ -206,6 +206,39 @@ open(p, 'w').write(s.replace(a, a + '    grad(pcorr)     leastSquares;\n'))
 PYEOF
         grep -q "grad(pcorr)     leastSquares;" "$C/system/fvSchemes" || { echo "FAIL: grad(pcorr) not staged"; return 1; }
     fi
+    if [ "$profile" = uncorrected ] || [ "$profile" = orthogonalLes ]; then
+        # THE COEFFICIENT CHOICE. laplacianSchemes and snGradSchemes `default`, the two words OpenFOAM
+        # distinguishes and brae had collapsed: uncorrectedSnGrad.H:113-119 returns nonOrthDeltaCoeffs
+        # exactly as correctedSnGrad.H:108-114 does, and only orthogonalSnGrad.H:113-119 returns
+        # deltaCoeffs. `orthogonalLes` is what brae COMPUTED under the name `uncorrected`, so it is the
+        # control; the shipped `corrected` run cannot be, because `corrected` takes nonOrthDeltaCoeffs
+        # both before and after the split and is blind to it by construction.
+        #
+        # THIS FIXTURE WITNESSES, and the wedge worry does not apply: only INTERNAL faces take the
+        # scheme's coefficients (gaussLaplacianScheme.C branches on pvf.coupled()), and ALL 41,031 of
+        # this mesh's 41,031 internal faces are non-orthogonal -- max 40.3798 deg, mean 3.968, 450 above
+        # 10 deg, coefficient ratio 1/max(cos a, 0.05) up to 1.3127. checkMesh's figure is internal faces
+        # only (primitiveMeshTools.C:501-527 sizes its result nInternalFaces() and loops faceNeighbour).
+        w=orthogonal
+        [ "$profile" = uncorrected ] && w=uncorrected
+        grep -q "default         Gauss linear corrected;" "$C/system/fvSchemes" \
+            && grep -q "default         corrected;" "$C/system/fvSchemes" \
+            || { echo "FAIL: the tutorial no longer ships 'corrected' on both scheme blocks"; return 1; }
+        python3 - "$C/system/fvSchemes" "$w" <<'SNEOF' || { echo "FAIL: staging $profile"; return 1; }
+import re, sys
+q, w = sys.argv[1], sys.argv[2]
+t = open(q).read()
+for block, val in (("laplacianSchemes", "Gauss linear " + w), ("snGradSchemes", w)):
+    m = re.search(r"(%s\s*\{[^}]*?default\s+)([^;]+)(;)" % block, t, re.S)
+    assert m, block
+    assert m.group(2).strip().endswith("corrected"), (block, m.group(2))
+    t = t[:m.start(2)] + val + t[m.end(2):]
+open(q, "w").write(t)
+SNEOF
+        grep -q "default         Gauss linear $w;" "$C/system/fvSchemes" \
+            && grep -q "default         $w;" "$C/system/fvSchemes" \
+            || { echo "FAIL: $profile's schemes were not staged"; return 1; }
+    fi
     if [ "$profile" = pbicg ]; then
         # k SOLVED BY PBiCG WITH DILU instead of the tutorial's smoothSolver. The pattern "(U|k)" covers
         # both fields, so it is narrowed to U and k is given entries of its own -- no reliance on a
@@ -284,7 +317,7 @@ PYEOF
 }
 
 rc=0
-for p in delta delta3d laminar les pcorrGrad pbicg; do
+for p in delta delta3d laminar les pcorrGrad pbicg orthogonalLes uncorrected; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_les_vs_openfoam: staging failed"; exit 1; }
@@ -320,6 +353,41 @@ grep -q "smoothSolver:  Solving for k" "$W/pbicg/log.interFoam" \
     && { echo "FAIL: OpenFOAM still solved k with the smoothSolver somewhere"; rc=1; }
 "$BIN" "$W/pbicg" "$W/pbicg/0" "$W/pbicg/$END" "$STEPS" "$W/pbicg/log.interFoam" "$W/laminar/$END" \
        "$W/delta/0" "$W/delta3d" || rc=1
+
+
+# uncorrected: OpenFOAM's `orthogonal` has to be FAR from its `uncorrected` on the fields the wired line
+# feeds, or the arm tests nothing. This is the one control that can witness the split -- see the staging
+# note. MEASURED here, 100 steps of 1e-9: U 2.944e-03 and k 1.742e-03, over all 20,603 cells; and one ulp
+# of this case's own chaos reaches only 7.2e-08 in U / 1.5e-07 in k, so the signal is four orders clear of
+# the amplifier the script header warns about.
+python3 - "$W/uncorrected/$END" "$W/orthogonalLes/$END" <<'NOEOF' || rc=1
+import re, sys
+def cells(path, vector):
+    s = open(path).read()
+    kind = "vector" if vector else "scalar"
+    m = re.search(r"internalField\s+nonuniform List<%s>\s*(\d+)\s*\((.*?)\n\)\s*;" % kind, s, re.S)
+    if m is None:
+        u = re.search(r"internalField\s+uniform\s+([^;]+);", s)
+        raise SystemExit("FAIL: %s is uniform (%s), so it cannot witness" % (path, u and u.group(1)))
+    if vector:
+        return [tuple(float(x) for x in v.split()) for v in re.findall(r"\(([^()]*)\)", m.group(2))]
+    return [(float(x),) for x in m.group(2).split()]
+bad = 0
+for fld, vec, floor in (("U", True, 1e-4), ("k", False, 1e-4)):
+    a = cells(sys.argv[1] + "/" + fld, vec)
+    b = cells(sys.argv[2] + "/" + fld, vec)
+    assert len(a) == len(b) and len(a) > 0, ("empty or mismatched", fld, len(a), len(b))
+    d = max(max(abs(p - q) for p, q in zip(u, v)) for u, v in zip(a, b))
+    ref = max(max(abs(x) for x in u) for u in a)
+    n = sum(1 for u, v in zip(a, b) if any(p != q for p, q in zip(u, v)))
+    print("  uncorrected CONTROL: OpenFOAM `orthogonal` against OpenFOAM `uncorrected`, %s %.3e "
+          "over %d of %d cells (floor %.0e)" % (fld, d / ref, n, len(a), floor))
+    if not d / ref > floor:
+        bad = 1
+sys.exit(bad)
+NOEOF
+"$BIN" "$W/uncorrected" "$W/uncorrected/0" "$W/uncorrected/$END" "$STEPS" "$W/uncorrected/log.interFoam" \
+       "$W/laminar/$END" "$W/delta/0" "$W/delta3d" uncorrected || rc=1
 
 echo "interfoam_les_vs_openfoam: rc $rc"
 exit $rc

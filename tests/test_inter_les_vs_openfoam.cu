@@ -91,7 +91,7 @@ int main(
     std::printf("== brae interFoam vs OpenFOAM interFoam: LES/nozzleFlow2D (LES kEqn, smooth delta, wedge) ==\n");
     if (argc < 8)
     {
-        std::printf("  SKIP: usage: %s <caseDir> <startDir> <ofTimeDir> <nSteps> <log> <laminarOfTimeDir> <ofDeltaDir> [<ofDelta3dCase>]\n",
+        std::printf("  SKIP: usage: %s <caseDir> <startDir> <ofTimeDir> <nSteps> <log> <laminarOfTimeDir> <ofDeltaDir> [<ofDelta3dCase>] [<profile>]\n",
                     argv[0]);
         return 77;
     }
@@ -102,6 +102,14 @@ int main(
     const std::string logPath = argv[5];
     const std::string laminarDir = argv[6];
     const std::string deltaDir = argv[7];
+    // THE PROFILE, last and optional so the three existing calls are untouched. `uncorrected` stages the
+    // case's laplacianSchemes and snGradSchemes `default` as `uncorrected`, which takes nonOrthDeltaCoeffs
+    // with the correction flux left off -- what brae ran as `orthogonal` until the flag was split.
+    const std::string profile = (argc > 9) ? argv[9] : "les";
+    const bool uncorrected = (profile == "uncorrected");
+    std::printf("  arm: %s\n", uncorrected
+                ? "uncorrected -- nonOrthDeltaCoeffs, no correction flux, on every laplacian AND the LES k one"
+                : profile.c_str());
 
     PrimitiveMesh m;
     m.read(caseDir + "/constant/polyMesh");
@@ -136,6 +144,32 @@ int main(
         check("...and the smoothing wave raised it somewhere, so the wave is exercised", raised > 0);
         check("the k convection scheme is limitedLinear 1, as the case names",
               fin.turbulence.lesCoeffs.limitedLinear && fin.turbulence.lesCoeffs.limitedLinearCoeff == scalar(1));
+    }
+    // WHAT WAS READ, and specifically that it REACHED THE LES CLOSURE. Guarded on the profile because the
+    // other three calls ship `corrected`, where `nonOrthCoeffs` is dead by construction: fvm.cuh reads
+    // `(corrected || nonOrthCoeffs) ? nonOrthDeltaCoeffs : deltaCoeffs`, so a `corrected` arm cannot
+    // witness the split at all -- which is why tools/default_audit.py and not a gate found the LES line
+    // (device_les_keqn.cu built its TransportScheme from the correction flag alone).
+    if (uncorrected)
+    {
+        std::printf("  SCHEME READ: laplacian `%s` corrected %d nonOrthCoeffs %d   |   snGrad `%s` "
+                    "corrected %d nonOrthCoeffs %d   |   LES kEqn coeffs corrected %d nonOrthCoeffs %d\n",
+                    fin.laplacianScheme.raw.c_str(), (int)fin.laplacianScheme.corrected,
+                    (int)fin.laplacianScheme.nonOrthCoeffs, fin.snGradScheme.raw.c_str(),
+                    (int)fin.snGradScheme.corrected, (int)fin.snGradScheme.nonOrthCoeffs,
+                    (int)fin.turbulence.lesCoeffs.correctedLaplacian,
+                    (int)fin.turbulence.lesCoeffs.nonOrthCoeffs);
+        check("brae reads the laplacian's coefficients as nonOrthDeltaCoeffs",
+              fin.laplacianScheme.nonOrthCoeffs);
+        check("...and adds NO correction flux", !fin.laplacianScheme.corrected);
+        check("...and the snGrad's the same way", fin.snGradScheme.nonOrthCoeffs);
+        check("...with no correction there either", !fin.snGradScheme.corrected);
+        // THE LINE THIS ARM EXISTS FOR: the case's choice has to reach the LES closure's own coefficients,
+        // which is what feeds les_kEqn_cpp.cu's fvm::laplacian(DkEff, k) and device_les_keqn.cu's
+        // TransportScheme. The scheme key OpenFOAM asks for is `laplacian(DkEff,k)`, resolved through
+        // `default` here (measured: this case names five laplacian entries and no more).
+        check("...and the LES closure's coefficients are the case's, not the correction flag's",
+              fin.turbulence.lesCoeffs.nonOrthCoeffs && !fin.turbulence.lesCoeffs.correctedLaplacian);
     }
 
     auto readCells = [&](const std::string& path)
