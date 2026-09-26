@@ -115,6 +115,7 @@ struct MomentumInput
     // deferred correction to the source (gaussLaplacianScheme.C). OpenFOAM's default when the word is
     // absent, so most real cases set it.
     bool   correctedLaplacian = false;
+    bool   nonOrthCoeffs = false;   // nonOrthDeltaCoeffs with no correction -- solver_controls.cuh:226
     scalar snGradLimitCoeff = 0.0;               // `limited <k> corrected` (OF limitedSnGrad)
     bool   hasMRF = false;                                       // present in the case -> must refuse
     bool   hasFvOptions = false;                                 // an UNIMPLEMENTED option -> must refuse

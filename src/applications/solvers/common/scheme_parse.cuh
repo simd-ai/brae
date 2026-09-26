@@ -971,28 +971,50 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                 // entry builds its snGrad through the same snGradScheme<Type>::New the snGradSchemes
                 // block uses (laplacianScheme.H:134-138). What differs is only which pair of flags the
                 // answer lands in, which is exactly what was collapsed.
-                auto readSnGrad = [&](const std::string& ln, bool& corrected, scalar& limit)
+                // THREE SCHEMES, TWO FACTS: whether the correction flux is added (`corrected`) and which
+                // delta coefficients the implicit half takes (`nonOrthCoeffs`). `uncorrected` shares the
+                // SECOND with `corrected` -- uncorrectedSnGrad.H:113-119 and correctedSnGrad.H:108-114
+                // both return mesh().nonOrthDeltaCoeffs() and differ only in corrected(); only
+                // orthogonalSnGrad.H:113-119 returns deltaCoeffs(). `hasWord` is word-boundaried, so the
+                // word `uncorrected` matched NEITHER test below and the flag kept its default: brae ran
+                // ORTHOGONAL under the case's own name `uncorrected`, with nothing to say so.
+                auto readSnGrad = [&](const std::string& ln, bool& corrected, scalar& limit,
+                                      bool& nonOrthCoeffs)
                 {
-                    if (hasWord(ln, "corrected")) corrected = true;       // unlimited non-orth correction (psi = 1)
+                    if (hasWord(ln, "corrected")) { corrected = true; nonOrthCoeffs = true; }   // unlimited non-orth correction (psi = 1)
+                    // ...and the one that takes those coefficients with NO correction flux
+                    if (hasWord(ln, "uncorrected")) nonOrthCoeffs = true;
+                    // `orthogonal` leaves both clear, which is the only scheme that takes deltaCoeffs()
                     // OF fv::limitedSnGrad "limited [<correctedScheme>] <psi>" (psi in [0,1]): non-orth correction
                     // capped per-face. hasWord avoids matching "unlimited" and "limitedLinear" (a div scheme); the coeff
                     // is the next numeric token after "limited" (skip an optional scheme word like "corrected").
                     if (hasWord(ln, "limited"))
                     {
+                        // limitedSnGrad DERIVES from correctedSnGrad, so its coefficients are
+                        // nonOrthDeltaCoeffs whatever the limiter (limitedSnGrad.H:165-172) -- including
+                        // at psi = 0, where limitedSnGrad.C:48-58 makes the limiter identically zero.
                         corrected = true;
+                        nonOrthCoeffs = true;
                         scalar psi = 1.0;
                         const char* c = ln.c_str() + ln.find("limited") + 7;
                         while (*c && !(std::isdigit((unsigned char)*c) || *c == '.')) ++c;   // skip to the coefficient
                         if (std::sscanf(c, "%lf", &psi) == 1) limit = psi;
                     }
                 };
-                if (inLap)    readSnGrad(ln, ctl.nonOrth, ctl.nonOrthLimit);
+                if (inLap)    readSnGrad(ln, ctl.nonOrth, ctl.nonOrthLimit, ctl.nonOrthCoeffs);
                 if (inSnGrad)
                 {
                     // The block IS present, so its default is the file's, not OpenFOAM's `corrected`
-                    // fallback. Cleared first because the fallback is the initial value of the flag.
-                    if (!sawSnGradBlock) { sawSnGradBlock = true; ctl.snGradCorrected = false; ctl.snGradLimit = 1.0; }
-                    readSnGrad(ln, ctl.snGradCorrected, ctl.snGradLimit);
+                    // fallback. Cleared first because the fallback is the initial value of the flag --
+                    // BOTH flags, since the fallback `corrected` sets the coefficient choice too.
+                    if (!sawSnGradBlock)
+                    {
+                        sawSnGradBlock = true;
+                        ctl.snGradCorrected = false;
+                        ctl.snGradNonOrthCoeffs = false;
+                        ctl.snGradLimit = 1.0;
+                    }
+                    readSnGrad(ln, ctl.snGradCorrected, ctl.snGradLimit, ctl.snGradNonOrthCoeffs);
                 }
             }
             // No explicit div(phi,K|Ekp): OF would fall through to the divSchemes `default`. brae keeps its

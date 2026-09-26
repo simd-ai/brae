@@ -185,6 +185,12 @@ KOmegaSSTInput sstIn omegaOldIn  # same site, same reason
 # false is what it runs today. THIS LINE LEAVES when that parser is split and gated -- it records a known
 # substitution, not a justified default, and PORT.md's item 10 carries the site list.
 KOmegaSSTInput sstIn nonOrthCoeffs  # rhoSimpleFoam's parser does not distinguish `uncorrected` yet -- item 10's blast radius
+
+# interFoam builds a gpu::PressureInput only for gpu::pressurePredictor (device_inter_step.cu:483), and
+# NEITHER reader of this field is on that path: pEqn.cu:237 sits inside `if (in.consistent)` -- SIMPLEC,
+# which interFoam never sets -- and pEqn.cu:310 is assemblePEqn, which interFoam does not call at all
+# (it has deviceInterAssemblePEqn, with its own nonOrthCoeffs parameter). The two V2 sites fill it.
+gpu::PressureInput pin nonOrthCoeffs  # interFoam reaches neither reader: one is SIMPLEC-only, one is a function it does not call
 kOmegaSST::Compressible comp phiByRho  # the same omission at the kOmegaSST site, for the reason above
 kOmegaSST::Compressible sstComp rho  # ARM sst_variableDensity. kOmegaSST + `density variable` is REFUSED by name -- "pairs `density variable` with kOmegaSST ... Refused rather than run ungated" (inter_turbulence_cpp.cu:427-433) -- so this site is the uniform lineage only
 kOmegaSST::Compressible sstComp rhoBnd  # same refusal

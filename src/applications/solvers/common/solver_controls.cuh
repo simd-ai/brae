@@ -213,7 +213,17 @@ struct DeviceSimpleControls
     // THE LAPLACIAN'S OWN snGrad SCHEME, from laplacianSchemes ONLY. An `fvm::laplacian` entry carries
     // its own snGrad scheme, built from that entry's Istream (laplacianScheme.H:121-141), so
     // `Gauss linear corrected` governs every laplacian in the solver and nothing else.
+    // NAMED FOR THE COEFFICIENTS BUT MEANING THE CORRECTION -- read `nonOrthCoeffs` below before using it.
     bool   nonOrth = false;      // laplacianSchemes "corrected"|"limited": nonOrthDeltaCoeffs implicit + explicit corrVec.grad correction.
+    // ...AND THE COEFFICIENT CHOICE, WHICH IS A SECOND FACT. `uncorrected` takes nonOrthDeltaCoeffs with
+    // the correction flux left off: uncorrectedSnGrad.H:113-119 returns mesh().nonOrthDeltaCoeffs()
+    // exactly as correctedSnGrad.H:108-114 does, and only orthogonalSnGrad.H:113-119 returns
+    // deltaCoeffs(). With `nonOrth` alone -- which `hasWord(ln, "corrected")` leaves FALSE for the word
+    // `uncorrected`, since it is word-boundaried -- brae ran ORTHOGONAL under the name `uncorrected`,
+    // indistinguishable from the case having said `orthogonal`. Every consumer that picks coefficients
+    // must read `nonOrth || nonOrthCoeffs`; every consumer that decides whether to ADD the correction
+    // flux must read `nonOrth` alone.
+    bool   nonOrthCoeffs = false;
     scalar nonOrthLimit = 1.0;   // that entry's "limited <psi>" coeff (OF fv::limitedSnGrad); 1.0 = "corrected" (unlimited).
     // fvc::snGrad's scheme, from snGradSchemes ONLY -- A DIFFERENT OPERATOR WITH A DIFFERENT ENTRY.
     // fvcSnGrad.C:56-64 looks the field up in snGradSchemes (schemesLookup.C:249-253); the laplacian
@@ -228,6 +238,13 @@ struct DeviceSimpleControls
     // fixture with the blocks disagreeing (rhoCtl, rhoPM) is a perfect box, where corrected ==
     // orthogonal. validation/rhoSnGrad is the fixture that can see it.
     bool   snGradCorrected = true;   // snGradSchemes "corrected"|"limited"; OF's default when the block is absent
+    // the snGrad block's own coefficient choice -- see nonOrthCoeffs above. TRUE with snGradCorrected
+    // because OpenFOAM's absent-block default is `corrected`, which takes nonOrthDeltaCoeffs.
+    // PARSED BUT NOT YET READ: the only consumer of this block's pair is rhoSimpleFoam's
+    // `correctedFvcSnGrad` (rhoSimpleFoamDriver_cpp.cu:221), which is threaded in its own gated unit
+    // against validation/rhoSnGrad. Stored here because the one reader answers both blocks at once; it is
+    // a fact with no consumer yet, NOT a field that consumers leave unset.
+    bool   snGradNonOrthCoeffs = true;
     scalar snGradLimit     = 1.0;    // snGradSchemes "limited <psi>" coeff; 1.0 = uncapped
     int    nNonOrth = 0;         // SIMPLE.nNonOrthogonalCorrectors: extra pressure-correction passes (pEqn re-solved nNonOrth+1 times). Set from fvSolution.
     scalar gradULimitK = 0.0;    // grad(U) "cellLimited Gauss linear <k>" coeff (OF cellLimitedGrad<minmod>); 0 = unlimited. Set from fvSchemes.

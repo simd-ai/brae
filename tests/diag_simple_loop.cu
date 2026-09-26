@@ -200,6 +200,8 @@ int main(int argc, char** argv)
     // EVERY scheme flag comes from the one parse, for all three host columns. Setting them per column by
     // hand is what produced five false findings earlier in this investigation.
     cin.correctedLaplacian = dctl.nonOrth;
+    // ...and the coefficient choice, which `uncorrected` sets without setting the correction
+    cin.nonOrthCoeffs = dctl.nonOrthCoeffs;
     cin.bounded = dctl.bounded;
     cin.linearUpwind = dctl.linearUpwind;
     // The GPU column takes the SAME two flags, and takes them HERE rather than where the rest of `gin` is
@@ -207,6 +209,7 @@ int main(int argc, char** argv)
     // device path the struct defaults and the CUDA column reproduced the uncorrected answer exactly.
     gin.bounded = cin.bounded;
     gin.correctedLaplacian = cin.correctedLaplacian;
+    gin.nonOrthCoeffs = cin.nonOrthCoeffs;
     gin.linearUpwind = cin.linearUpwind;
     oc.bounded  = dctl.bounded;
     std::printf("  _cpp correctedLaplacian = %d\n", (int)cin.correctedLaplacian);

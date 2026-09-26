@@ -1500,7 +1500,7 @@ void amgFineCoeffKernel(
             deviceScale(mLo,   DeviceSimpleControls::lustUpwindFrac);  deviceAxpy(DeviceSimpleControls::lustCentralFrac, cL, mLo);
         }
         else                 deviceDivUpwindCoeffs(dm, phiInt_, mDiag, mUp, mLo);
-        deviceLaplacianCoeffs(dm, nuEff_f, lD, lU, lL, ctl_.nonOrth);
+        deviceLaplacianCoeffs(dm, nuEff_f, lD, lU, lL, ctl_.nonOrth || ctl_.nonOrthCoeffs);
         deviceAxpy(-1.0,lD,mDiag);
         deviceAxpy(-1.0,lU,mUp);
         deviceAxpy(-1.0,lL,mLo);
@@ -2366,7 +2366,7 @@ void amgFineCoeffKernel(
             DeviceBuffer<scalar> drAtUf;
             deviceInterpolate(dm, drAtUFlux_, drAtUf);   // rho*(rAtU-rAU) when compressible
             DeviceBuffer<scalar> ld, lu, ll;
-            deviceLaplacianCoeffs(dm, drAtUf, ld, lu, ll, ctl_.nonOrth);   // over-relaxed nonOrthDeltaCoeffs to match OF's corrected snGrad(p) (was orthogonal dc -> cos(theta) too small on non-orth meshes)
+            deviceLaplacianCoeffs(dm, drAtUf, ld, lu, ll, ctl_.nonOrth || ctl_.nonOrthCoeffs);   // over-relaxed nonOrthDeltaCoeffs to match OF's corrected snGrad(p) (was orthogonal dc -> cos(theta) too small on non-orth meshes)
             DeviceBuffer<scalar> fInt;
             deviceMatrixFluxInternal(deviceLduView(dm, ld, lu, ll), dp_, fInt);
             deviceAxpy(1.0, fInt, phiHi);
@@ -2547,7 +2547,7 @@ void amgFineCoeffKernel(
                 if (hasCyclic_) interfaceAddGrad(cyc_, dp_, dm.V, gx, gy, gz);
                 if (hasAMI_)    interfaceAddGrad(ami_, dp_, dm.V, gx, gy, gz);
             }
-            deviceLaplacianCoeffs(dm, rAUf, pD_, pU_, pL_, ctl_.nonOrth);
+            deviceLaplacianCoeffs(dm, rAUf, pD_, pU_, pL_, ctl_.nonOrth || ctl_.nonOrthCoeffs);
             // OF: `- fvm::laplacian(rhorAtU, p)` with `rhorAtU = rho*rAtU` (pcEqn.H:13), and an fvMatrix's
             // internalCoeffs/boundaryCoeffs are built from the SAME diffusivity as its internal
             // coefficients. brae passed the unweighted rAtU here while the internal coefficients used
@@ -3231,7 +3231,7 @@ void amgFineCoeffKernel(
         for (int pass = 0; pass < nPasses; ++pass)
         {
             DeviceBuffer<scalar> pcD, pcU, pcL, pcIC, pcBC, diagC, b, divPhi, ffc;
-            deviceLaplacianCoeffs(dm, onesF, pcD, pcU, pcL, ctl_.nonOrth);
+            deviceLaplacianCoeffs(dm, onesF, pcD, pcU, pcL, ctl_.nonOrth || ctl_.nonOrthCoeffs);
             deviceBCLaplacianCoeffs(dbPcorr_, onesC, pcIC, pcBC);
             deviceDiv(dm, phiInt_, phiBnd_, divPhi);
             if (hasCyclic_) interfaceAddDiv(cyc_, dm.V, divPhi);

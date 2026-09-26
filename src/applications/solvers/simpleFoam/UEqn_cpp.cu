@@ -234,8 +234,14 @@ FvVectorMatrix assembleUEqn(
 
     // turbulence->divDevReff(U): implicit -laplacian(nuEff,U) into the matrix AND the explicit
     // -div(nuEff*dev2(T(grad U))) into the source. Both halves, one call, so they cannot drift apart.
+    // gradULimitK and gradULeastSq ARE WRITTEN OUT AT THEIR CURRENT EFFECTIVE VALUES, not forwarded
+    // from `in`: this call has always dropped them (9 of 12 arguments), so `grad(U) cellLimited Gauss
+    // linear <k>` has never reached the viscous term on this path even though StepInput carries it
+    // (simpleFoam_cpp.cuh:124). That is a SEPARATE defect and fixing it here would change answers no
+    // fixture measures; writing the values out makes the omission visible instead of implicit.
     addDivDevReff(M, U, *in.nuEff, *in.nuEffBnd, m, g, patches, in.correctedLaplacian,
-                  in.snGradLimitCoeff);
+                  in.snGradLimitCoeff, /*gradULimitK=*/scalar(0), /*gradULeastSq=*/false,
+                  in.nonOrthCoeffs);
 
     // == fvOptions(U). BEFORE relax, as UEqn.H has it: the source is part of the matrix relaxation then
     // acts on. The double negation (`eqn -= porosityEqn` inside, `UEqn == fvOptions(U)` outside) cancels,
