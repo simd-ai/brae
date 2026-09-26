@@ -15,8 +15,9 @@
 # TWO STAGES, and both now run on the refinement arms:
 #   5b-1  cellAddedCells, cellLevel, pointLevel, and the point and cell counts. No face work needed.
 #   5b-2  the mapPolyMesh and the new mesh, from section 9's faces.
-# The unrefinement arms still skip TWO checks by name -- removeFaces' compatibleRemoves and its
-# setRefinement -- and the harness prints the skip count so it cannot quietly become zero coverage.
+# The unrefinement arms still skip ONE check by name -- removeFaces::setRefinement, the mesh an
+# unrefinement produces -- and the harness prints the skip count so it cannot quietly become zero
+# coverage.
 #
 # SEVEN ARMS on laminar/damBreak's own blockMesh (2268 cells, 9176 faces, 4746 points):
 #   one       cell 0 alone. One 8-way split: 2268 -> 2275 cells, 4746 -> 4765 points (1 cell centre + 6
@@ -114,8 +115,47 @@
 # because refinementHistory's other callers (compact, and a partial free) do read those slots
 # positionally; a fixture that reaches one of them would tell them apart, and none of these seven does.
 # So unit 6 now holds BOTH halves: the history's production on seven arms and its remapping on three, and
-# unit 6b-1 holds setUnrefinement's levels and history. What is still skipped, by name, is removeFaces --
-# the faces and the mesh an unrefinement produces (units 6b-2 and 6b-3).
+# unit 6b-1 holds setUnrefinement's levels and history.
+# UNIT 6b-2: removeFaces::compatibleRemoves, which answers WHICH CELLS MERGE with which. Its three
+# outputs and its return value are compared on the three unrefinement arms, and TWICE each:
+#   the full set     the faces hexRef8 itself asks about -- every face at a split point. The list is
+#                    handed over in OpenFOAM'S OWN ORDER (labelHashSet::toc, dumped as `splitFacesToc`),
+#                    because region 0 is whichever region the FIRST face created: cellRegion's values and
+#                    cellRegionMaster's indices are a function of that order and brae has no HashSet.
+#                    Nothing in the resulting MESH depends on it -- hexRef8 overwrites every region's
+#                    master with its own and removeFaces walks regions rather than region labels -- but a
+#                    comparison of cellRegion does, so it is data and it is dumped.
+#   a reduced set    the same faces with the LOWEST-NUMBERED face of each block dropped. This exists
+#                    because the recount cannot otherwise be told from returning its input: the twelve
+#                    faces at a split point ARE the twelve internal faces of its 2x2x2 block, and hexRef8
+#                    FatalErrors if the recount returns any other number at all (hexRef8.C:5686-5710).
+#                    MEASURED: 1152 faces in and 1152 out on `unrefine`, the same SET; with one face per
+#                    block dropped, 1056 in and 1152 out, so the walk has to find 96 faces nobody asked
+#                    for. The block stays connected through its other eleven faces, so the regions are
+#                    unchanged and only the face list moves.
+# EIGHT FAIL-PROOFS, all three arms alike -- there is no arm-dependence here, which is itself the finding:
+# a merge of two regions happens on every one (1 freed region on `unrefine`, 0 on `unrefine3`, 133 on
+# `unrefineTwice`, and `unrefine3`'s reduced set frees one).
+#   a new region's master is the NEIGHBOUR, not the owner              throws: brae's own transcribed
+#   joining an owner to a region does not take min() of the master     check fires, "the master is not
+#   changeCellRegion changes one cell instead of the component        the lowest-numbered cell" / "region
+#                                                                     N has only 1 cell". Caught, but as
+#                                                                     a crash and not a wrong number --
+#                                                                     the weaker demonstration, recorded
+#                                                                     as such
+#   the merge keeps the HIGHER-numbered region       4 / 2 / 4 failures, first at cellRegion
+#   the freed region's master is left standing       4 / 2 / 4 failures, first at cellRegionMaster
+#   the recount returns its input                    3 failures on all three -- and it fails on the FULL
+#                                                    set too, because the input is in hash order and the
+#                                                    recount's answer is ASCENDING
+#   the recount returns its input SORTED             2 failures, and ONLY on the reduced set: that is the
+#                                                    one comparison that can see a face being ADDED
+#   each cellCells row walked BACKWARDS              GREEN on all three, and that is the measurement
+#                                                    behind porting OpenFOAM's recursion as an explicit
+#                                                    stack: the flood assigns one region to a connected
+#                                                    component, so no traversal order can change it
+# What is still skipped, by name, is removeFaces::setRefinement -- the faces and the mesh an unrefinement
+# produces (unit 6b-3).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_hex_ref8_vs_openfoam"

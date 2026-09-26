@@ -15,6 +15,8 @@
 // so it cannot quietly become zero-coverage.
 #include "primitive_mesh.cuh"
 #include "hex_ref8_cpp.cuh"
+#include "mesh_cell_cells_cpp.cuh"
+#include "remove_faces_cpp.cuh"
 #include "mesh_edges_cpp.cuh"
 #include "primitive_patch_cpp.cuh"
 #include "poly_topo_change_cpp.cuh"
@@ -297,7 +299,37 @@ int main(int argc, char** argv)
             compareList("the history's visibleCells after changeMesh", uh2.visibleCells, d,
                         "historyVisibleCells");
         }
-        skip("removeFaces::compatibleRemoves -- cellRegion / cellRegionMaster / facesToRemove, unit 6b-2");
+        // UNIT 6b-2: removeFaces::compatibleRemoves, on OpenFOAM's own face set and on a reduced one.
+        // The face list is handed over in THE ORDER OpenFOAM passed it (labelHashSet::toc), because
+        // region 0 is the region the first face created -- see the tool's own note. brae has no
+        // labelHashSet and the numbering is what is being compared, so the order is data, not a detail.
+        {
+            const std::vector<std::vector<label>> ucc = buildCellCells(um);
+            std::vector<label> cr, crm, ftr;
+            const label nUsed = removeFaces::compatibleRemoves(
+                um, ucc, d.lists.at("splitFacesToc"), cr, crm, ftr);
+            compareList("cellRegion", cr, d, "cellRegion");
+            compareList("cellRegionMaster", crm, d, "cellRegionMaster");
+            compareList("facesToRemove", ftr, d, "facesToRemove");
+            check("compatibleRemoves returns OpenFOAM's used-region count",
+                  nUsed == d.scalars.at("nUsedRegions"));
+            // ...AND THE REDUCED SET, which is the only arm where the recount does anything: on
+            // hexRef8's own set the twelve faces at a split point ARE its block's twelve internal
+            // faces, so the walk over the internal faces returns the input unchanged (measured:
+            // the same LIST, not merely the same size, on all three arms). With the lowest-numbered
+            // face of each block dropped the region is unchanged and the recount must put it back.
+            std::vector<label> dcr, dcrm, dftr;
+            const label nUsedD = removeFaces::compatibleRemoves(
+                um, ucc, d.lists.at("splitFacesDropped"), dcr, dcrm, dftr);
+            compareList("cellRegion on the reduced set", dcr, d, "cellRegionDropped");
+            compareList("cellRegionMaster on the reduced set", dcrm, d, "cellRegionMasterDropped");
+            compareList("facesToRemove on the reduced set -- THE RECOUNT", dftr, d,
+                        "facesToRemoveDropped");
+            check("...and the recount really added faces, so this comparison is not the input",
+                  dftr.size() > d.lists.at("splitFacesDropped").size());
+            check("compatibleRemoves returns OpenFOAM's used-region count on the reduced set",
+                  nUsedD == d.scalars.at("nUsedRegionsDropped"));
+        }
         skip("removeFaces::setRefinement -- the map and the mesh, unit 6b-3");
         std::printf("test_hex_ref8_vs_openfoam: %d failures, %d skipped\n", failures, skipped);
         return failures == 0 ? 0 : 1;

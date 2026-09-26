@@ -290,8 +290,57 @@ int main(int argc, char *argv[])
         {
             splitFaces.insert(mesh.pointFaces()[pointi]);
         }
+        // THE ORDER THE SET IS PASSED IN IS PART OF THE ANSWER, so it is dumped rather than left to be
+        // guessed: region 0 is the region the FIRST face of this list created, so cellRegion's values
+        // and cellRegionMaster's indices follow labelHashSet's iteration order. hexRef8 itself passes
+        // splitFaces.toc() (hexRef8.C:5673), and brae has no labelHashSet, so the gate hands brae THIS
+        // list and compares the numbering exactly. Nothing in the final mesh depends on it -- hexRef8
+        // overwrites each region's master with its own, and removeFaces walks regions, not region
+        // labels -- but a comparison of cellRegion does.
+        const labelList splitFacesToc(splitFaces.toc());
         labelList cellRegion, cellRegionMaster, facesToRemove;
-        faceRemover.compatibleRemoves(splitFaces.toc(), cellRegion, cellRegionMaster, facesToRemove);
+        const label nUsedRegions = faceRemover.compatibleRemoves
+        (
+            splitFacesToc, cellRegion, cellRegionMaster, facesToRemove
+        );
+
+        // ...AND A SECOND CALL ON A DELIBERATELY REDUCED SET, because on hexRef8's own set the recount
+        // finds nothing new: the twelve faces at a split point ARE the twelve internal faces of its
+        // block, and hexRef8 FatalErrors if the recount returns any other number (hexRef8.C:5686-5710,
+        // "can be more (but never less) than splitFaces provided"). So the walk over the internal faces
+        // is indistinguishable from `newFacesToRemove = facesToRemove` on every arm this tool can build
+        // through setUnrefinement. Dropping the lowest-numbered face of each block gives it something to
+        // find: the block stays connected through the other eleven, so the region is unchanged and the
+        // recount must put the dropped face back. Not fed to setUnrefinement -- it is a direct call on
+        // OpenFOAM's own function, which is what makes it a usable oracle.
+        labelList droppedFaces;
+        labelList dCellRegion, dCellRegionMaster, dFacesToRemove;
+        label nUsedRegionsDropped = 0;
+        {
+            labelHashSet drop(splitPoints.size());
+            for (const label pointi : splitPoints)
+            {
+                label lowest = -1;
+                for (const label facei : mesh.pointFaces()[pointi])
+                {
+                    if (splitFaces.found(facei) && (lowest == -1 || facei < lowest)) lowest = facei;
+                }
+                if (lowest != -1) drop.insert(lowest);
+            }
+            DynamicList<label> kept(splitFacesToc.size());
+            for (const label facei : splitFacesToc)
+            {
+                if (!drop.found(facei)) kept.append(facei);
+            }
+            droppedFaces.transfer(kept);
+            nUsedRegionsDropped = faceRemover.compatibleRemoves
+            (
+                droppedFaces, dCellRegion, dCellRegionMaster, dFacesToRemove
+            );
+            Info<< "compatibleRemoves on a reduced set: " << droppedFaces.size() << " faces in, "
+                << dFacesToRemove.size() << " out (the full set gives " << splitFacesToc.size()
+                << " in, " << facesToRemove.size() << " out)" << endl;
+        }
 
         polyTopoChange uMod(mesh);
         meshCutter.setUnrefinement(splitPoints, uMod);
@@ -332,9 +381,16 @@ int main(int argc, char *argv[])
         writeLabels(uos, "allSplitPoints", allSplit);
         writeLabels(uos, "splitPoints", splitPoints);
         writeLabels(uos, "splitFaces", splitFaces.sortedToc());
+        writeLabels(uos, "splitFacesToc", splitFacesToc);
         writeLabels(uos, "cellRegion", cellRegion);
         writeLabels(uos, "cellRegionMaster", cellRegionMaster);
         writeLabels(uos, "facesToRemove", facesToRemove);
+        uos << "nUsedRegions " << nUsedRegions << nl;
+        writeLabels(uos, "splitFacesDropped", droppedFaces);
+        writeLabels(uos, "cellRegionDropped", dCellRegion);
+        writeLabels(uos, "cellRegionMasterDropped", dCellRegionMaster);
+        writeLabels(uos, "facesToRemoveDropped", dFacesToRemove);
+        uos << "nUsedRegionsDropped " << nUsedRegionsDropped << nl;
         writeLabels(uos, "cellLevelAfterSet", uCellLevelAfterSet);
         writeLabels(uos, "pointLevelAfterSet", uPointLevelAfterSet);
         writeLabels(uos, "historyVisibleCellsAfterSet", uHistVisible);

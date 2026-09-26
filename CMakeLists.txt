@@ -111,6 +111,8 @@ add_library(brae_core STATIC
     src/OpenFOAM/meshes/primitiveMesh/edges/mesh_edges_cpp.cu
     src/OpenFOAM/meshes/polyMesh/mapPolyMesh/map_poly_mesh_cpp.cu
     src/OpenFOAM/meshes/polyMesh/polyTopoChange/poly_topo_change_cpp.cu
+    src/OpenFOAM/meshes/primitiveMesh/cellCells/mesh_cell_cells_cpp.cu
+    src/dynamicMesh/polyTopoChange/removeFaces/remove_faces_cpp.cu
     src/dynamicMesh/polyTopoChange/hexRef8/hex_ref8_cpp.cu
     src/dynamicFvMesh/dynamicRefineFvMesh/dynamic_refine_fv_mesh_cpp.cu
     src/dynamicMesh/pointPatchDist/point_patch_dist_cpp.cu
