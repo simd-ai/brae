@@ -20,13 +20,16 @@
 // primitiveMesh::calcEdges does and a later caller (faceEdges, an edge-addressed field) would depend
 // on it; nothing here claims a measurement for it.
 //
-// THE BRANCH THAT IS NOT PORTED. primitiveMesh::reset asks calcPointOrder whether the mesh's points
-// are ORDERED -- every point used only by internal faces coming before every point on a boundary face.
-// When they are, OpenFOAM sorts the edges into four blocks with the external edges last; when they are
-// not, into one upper-triangular block. No mesh in this tree is ordered (blockMesh numbers points
-// geometrically; subsetMesh and renumberMesh leave the point order alone; every fixture measured here
-// reports nInternalPoints -1), so the four-block branch is REFUSED by name rather than transcribed and
-// left with nothing to check it.
+// BOTH BRANCHES ARE PORTED. primitiveMesh::reset asks calcPointOrder whether the mesh's points are
+// ORDERED -- every point used only by internal faces coming before every point on a boundary face. When
+// they are, OpenFOAM sorts the edges into four blocks with the external edges last; when they are not,
+// into one upper-triangular block. The four-block branch USED TO BE REFUSED here on the stated grounds
+// that no mesh in this tree is ordered -- and that premise was false: a 2D case's `empty` front and back
+// patches put EVERY point on a boundary face, so calcPointOrder's second loop finds no unnumbered point
+// and returns ordered TRUE with nInternalPoints 0. MEASURED: laminar/damBreak reports 0 of 4746 and
+// LES/nozzleFlow2D 0 of 15276, so the refused branch was the one every 2D fixture in this tree takes.
+// The old comment had confused "nInternalPoints is -1" (the unordered SENTINEL) with "there are no
+// internal points" (0, which is ordered). See mesh_edges_cpp.cu:106-116.
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"
 #include <vector>
