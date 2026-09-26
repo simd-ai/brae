@@ -111,6 +111,7 @@ add_library(brae_core STATIC
     src/OpenFOAM/meshes/primitiveMesh/edges/mesh_edges_cpp.cu
     src/OpenFOAM/meshes/polyMesh/mapPolyMesh/map_poly_mesh_cpp.cu
     src/OpenFOAM/meshes/polyMesh/polyTopoChange/poly_topo_change_cpp.cu
+    src/dynamicMesh/polyTopoChange/hexRef8/hex_ref8_cpp.cu
     src/dynamicFvMesh/dynamicRefineFvMesh/dynamic_refine_fv_mesh_cpp.cu
     src/dynamicMesh/pointPatchDist/point_patch_dist_cpp.cu
     src/rigidBodyDynamics/rigid_body_motion_cpp.cu
@@ -3799,6 +3800,16 @@ target_link_libraries(test_mesh_edges_addressing_vs_openfoam PRIVATE brae_core)
 add_test(NAME mesh_edges_addressing_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mesh_edges_addressing_vs_openfoam.sh)
 set_tests_properties(mesh_edges_addressing_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# UNIT 5b: hexRef8::setRefinement, against OpenFOAM's own (tools/dumpHexRef8 dumps cellAddedCells, the
+# levels, the map and the mesh). Stage 5b-1 holds the points, the cells and the levels.
+add_executable(test_hex_ref8_vs_openfoam tests/test_hex_ref8_vs_openfoam.cu)
+target_include_directories(test_hex_ref8_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_hex_ref8_vs_openfoam PRIVATE brae_core)
+add_test(NAME hex_ref8_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/hex_ref8_vs_openfoam.sh)
+set_tests_properties(hex_ref8_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
 # brae's dynamicRefineFvMeshCoeffs reader against the three shipped AMR tutorials' own dictionaries --
 # flat, flat-beside-a-subdict, and wrapped. The oracle is the dictionary; the script says why all three.
