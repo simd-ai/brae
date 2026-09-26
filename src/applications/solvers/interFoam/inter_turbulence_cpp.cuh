@@ -107,11 +107,10 @@ struct InterTurbulenceCrankNicolson
 {
     fv::CrankNicolsonDdt0<scalar> ddt0K;
     fv::CrankNicolsonDdt0<scalar> ddt0Eps;
-    std::vector<scalar> kEntry;
-    std::vector<scalar> epsEntry;
+    // the OLD-OLD level, which only CrankNicolson reads. The old-TIME level it used to sit beside is now
+    // InterTurbulence::kOldStep, because every ddt scheme needs it -- see there.
     std::vector<scalar> kOO;
     std::vector<scalar> epsOO;
-    label timeIndex = -1;
 };
 
 struct InterTurbulence
@@ -131,6 +130,23 @@ struct InterTurbulence
     // `on` therefore stays TRUE: nuEff is still nut + nu, and the nut it adds is validate()'s.
     bool frozen = false;
     InterTurbulenceCrankNicolson cn;
+    // psi.oldTime() FOR THE CLOSURE, kept per TIME INDEX and not per call.
+    //
+    // OpenFOAM's is the field at the step's FIRST non-const access: GeometricField::storeOldTimes() is
+    // guarded on `timeIndex_ != time().timeIndex()` (GeometricField.C:904-917, and the const oldTime()
+    // accessor calls it at :976), so the first access in a step stores the old level and every later one
+    // in the same index is a no-op. With `turbOnFinalIterOnly no` and more than one outer corrector the
+    // closure runs MORE THAN ONCE in a step, and corrector 2's fvm::ddt must still read the PREVIOUS
+    // STEP's k -- not corrector 1's solved-and-bounded k.
+    //
+    // Every closure arm used to recapture it per CALL (`const std::vector<scalar> kOld = k.internal;`),
+    // which is identical while the closure runs once per step and first order in dt wrong as soon as it
+    // does not. These three were `cn.kEntry`/`cn.epsEntry`/`cn.timeIndex`, filled only when the scheme was
+    // CrankNicolson; they are the snapshot every scheme needs, so they live here and are advanced
+    // unconditionally.
+    std::vector<scalar> kOldStep;
+    std::vector<scalar> epsOldStep;
+    label oldStepTimeIndex = -1;
     InterRasModel model = InterRasModel::KEpsilon;
     // `density variable` -- see the header
     bool variableDensity = false;
@@ -195,6 +211,20 @@ struct InterTurbulence
     // default true) that is the only corrector the closure runs on. `turbOnFinalIterOnly no` with
     // more than one outer corrector is refused: no tutorial sets it, and the second call inside a
     // time step needs k.oldTime(), which is not the field at entry.
+    // BOTH SETS. fvMatrix::solve() selects `<field>Final` only when isFinalIteration()
+    // (fvMatrix.C:1536-1542) and fvMatrix::relax() the same (:1249-1263), so correctors 1..N-1 of a step
+    // use `solvers/k`. With `turbOnFinalIterOnly` at its default the closure only ever runs on the final
+    // corrector and the non-Final SOLVER entries are never consulted -- which is why they are required
+    // only when `!turbOnFinalIterOnly && nOuterCorrectors > 1` (solution::solverDict is FATAL when the
+    // name is absent, solution.C:474-478). The non-Final RELAXATION entries are never required:
+    // solution::relaxEquation returns false when neither the name nor `default` resolves and relax() is
+    // then SKIPPED ENTIRELY, which is not the same as relaxing with 1.
+    SmoothLinearSolve kSolve;
+    SmoothLinearSolve epsSolve;
+    SmoothLinearSolve omegaSolve;
+    EquationRelax     kRelax;
+    EquationRelax     epsRelax;
+    EquationRelax     omegaRelax;
     SmoothLinearSolve kSolveFinal;
     SmoothLinearSolve epsSolveFinal;
     SmoothLinearSolve omegaSolveFinal;
@@ -212,15 +242,23 @@ InterTurbulence readInterTurbulence(
     const FoamDict& fvSolution,
     bool eulerDdt,
     bool laplacianCorrected,
+    // ...and WHICH delta coefficients: `uncorrected`/`limited 0` take nonOrthDeltaCoeffs with no
+    // correction (uncorrectedSnGrad.H:113-119). Beside the flag it belongs to, not appended.
+    bool laplacianNonOrth,
     scalar laplacianLimitCoeff,
     const std::vector<FvPatch>& patches,
     label nCells,
     // kOmegaSST's cell wall distance needs the mesh; null is a caller that can only run kEpsilon
-    const PrimitiveMesh* mesh = nullptr,
-    const FvGeometry* geometry = nullptr,
+    const PrimitiveMesh* mesh,
+    const FvGeometry* geometry,
     // the patches of a wallDist the motion solver registered first (InterTurbulence::wallDistPatchIDs);
     // null or empty: kOmegaSST builds its own over the `wall` patches
-    const std::vector<label>* sharedWallDistPatches = nullptr);
+    const std::vector<label>* sharedWallDistPatches,
+    // PIMPLE's two facts the closure's reader needs: OpenFOAM looks the non-Final SOLVER entries up only
+    // when the closure runs on a NON-final corrector, i.e. when `turbOnFinalIterOnly no` and there is more
+    // than one. ONE place computes that rule so the three model branches cannot drift.
+    label nOuterCorrectors,
+    bool  turbOnFinalIterOnly);
 
 // turbulence->validate(), which incompressibleInterPhaseTransportModel's constructor calls in the
 // UNIFORM lineage only. Does nothing in the variable one, and nothing when laminar.
@@ -273,6 +311,12 @@ struct InterTurbulenceStepInput
     // (InterTurbulence::cn). Null runs the closure's fvm::ddt as Euler, which is what every other
     // scheme entry the reader admits is.
     const fv::CrankNicolsonClock* cn = nullptr;
+    // THE STEP'S INDEX and WHETHER THIS IS THE FINAL OUTER CORRECTOR, both with unset sentinels: the
+    // closure keys its old-time snapshot on the first and picks <field>Final against <field> by the
+    // second (fvMatrix.C:1536-1542), and a default that stood in for either would be a silent
+    // substitution of the case's own corrector. correctInterTurbulence throws when they are unset.
+    label timeIndex = -1;
+    int   finalIter = -1;
     const std::vector<scalar>* rhoOO = nullptr;
 };
 

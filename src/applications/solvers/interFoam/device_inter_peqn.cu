@@ -512,14 +512,15 @@ void deviceInterAssemblePEqn(
     DeviceCyclic*               cyc,
     const DeviceBuffer<scalar>* rAUCell,
     const DeviceBuffer<scalar>* phiHbyAIf,
-    DeviceBuffer<scalar>*       divTapOut)
+    DeviceBuffer<scalar>*       divTapOut,
+    bool                        nonOrthCoeffs)
 {
     const int nC = dm.nCells;
 
     // fvm::laplacian(rAUf, p_rgh) under the case's laplacianSchemes, as the host's pressureCorrector
     // (inter_peqn_cpp.cu) assembles it: nonOrthDeltaCoeffs on the internal faces when `corrected`.
     // (This said pEqn passes corrected=false; the host takes the case's scheme, and so does this.)
-    deviceLaplacianCoeffs(dm, rAUfInt, P.diag, P.upper, P.lower, corrected);
+    deviceLaplacianCoeffs(dm, rAUfInt, P.diag, P.upper, P.lower, corrected || nonOrthCoeffs);
 
     // the source, in the host's order: the laplacian's own (zero), then `source -= corr` -- the
     // explicit non-orthogonal correction -- then `source += div*V`
@@ -572,7 +573,7 @@ void deviceInterAssemblePEqn(
                 "not handed over as a cell field. interpolate(rAU) on a coupled patch is the two cells' "
                 "rAU interpolated; there is nothing on the patch to read instead.");
         }
-        deviceCyclicAssembleLaplacian(*cyc, *rAUCell, P.diag, /*addToDiag=*/true, corrected);
+        deviceCyclicAssembleLaplacian(*cyc, *rAUCell, P.diag, /*addToDiag=*/true, corrected || nonOrthCoeffs);
     }
 
     if (needReference)

@@ -384,8 +384,8 @@ void correct(
                 "which brae does not carry.");
     }
     const scalar rDeltaT = (comp && !cn) ? comp->rDeltaT : scalar(0);
-    const std::vector<scalar> kOld   = k.internal;
-    const std::vector<scalar> epsOld = epsilon.internal;
+    const std::vector<scalar> kOld   = (comp && comp->kOldIn)   ? *comp->kOldIn   : k.internal;
+    const std::vector<scalar> epsOld = (comp && comp->epsOldIn) ? *comp->epsOldIn : epsilon.internal;
     auto rhoOldAt = [&](label c) { return (comp && comp->rhoOld) ? (*comp->rhoOld)[c] : rhoAt(c); };
 
     std::vector<scalar> G(nC);
@@ -571,7 +571,7 @@ void correct(
             // instead is a silent scheme substitution -- the case asked for `corrected` -- and on this
             // near-orthogonal mesh it moved the off-diagonals by only 2.2e-06 while moving epsilon by
             // 6.5e-06, small enough to look like round-off and large enough not to be.
-            FvScalarMatrix L = fvm::laplacian(Df, epsilon, m, g, patches, co.correctedLaplacian);
+            FvScalarMatrix L = fvm::laplacian(Df, epsilon, m, g, patches, co.correctedLaplacian, co.nonOrthCoeffs);
             if (co.correctedLaplacian)
             {
                 std::vector<std::vector<scalar>> vb(patches.size());
@@ -793,7 +793,7 @@ void correct(
             // instead is a silent scheme substitution -- the case asked for `corrected` -- and on this
             // near-orthogonal mesh it moved the off-diagonals by only 2.2e-06 while moving epsilon by
             // 6.5e-06, small enough to look like round-off and large enough not to be.
-            FvScalarMatrix L = fvm::laplacian(Df, k, m, g, patches, co.correctedLaplacian);
+            FvScalarMatrix L = fvm::laplacian(Df, k, m, g, patches, co.correctedLaplacian, co.nonOrthCoeffs);
             if (co.correctedLaplacian)
             {
                 std::vector<std::vector<scalar>> vb(patches.size());

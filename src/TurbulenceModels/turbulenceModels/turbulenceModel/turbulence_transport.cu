@@ -290,14 +290,14 @@ void assembleScalarTransport(
             }
         }
         deviceCyclicAssembleMomentum(*sc.cyc, *sc.gammaCell, M.diag, wsch,
-                                     sc.correctedLaplacian, sc.cycPhi);
+                                     sc.correctedLaplacian || sc.nonOrthCoeffs, sc.cycPhi);
 
     }
 
     // - fvm::laplacian(gamma, field).
     {
         DeviceBuffer<scalar> lDiag, lUp, lLo, lIC, lBC, lapSrc;
-        deviceLaplacianCoeffs(dm, gammaFace, lDiag, lUp, lLo, sc.correctedLaplacian);
+        deviceLaplacianCoeffs(dm, gammaFace, lDiag, lUp, lLo, sc.correctedLaplacian || sc.nonOrthCoeffs);
         deviceBCLaplacianCoeffsFace(db, gammaBnd, lIC, lBC);
         // FP-2: the five `axpy(-1, l, M)` subtractions in one launch (subtractLaplacianKernel above),
         // the same `y += a*x` statement per array, so the same doubles.

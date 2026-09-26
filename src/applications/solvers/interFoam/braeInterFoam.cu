@@ -57,11 +57,12 @@
 //
 // AND THE CASE'S NON-ORTHOGONAL CORRECTIONS, on the host: `corrected` and `limited` laplacians and
 // snGrads on a mesh that is not orthogonal (the tanks' 44 degrees), through the pressure equation,
-// the viscous term and the three snGrads. `uncorrected` on such a mesh is refused, and so is every
-// gradSchemes entry but `Gauss linear` -- gradSchemes were not read at all before. `-device` RUNS the
-// corrections (device_sheared_corrected) and refuses the same two: `uncorrected` on a sheared mesh
-// (device_sheared_uncorrected) and a leastSquares or cellLimited gradient (device_gradLsq,
-// device_gradNHat).
+// the viscous term and the three snGrads -- AND `uncorrected` and `limited 0`, which take those same
+// nonOrthDeltaCoeffs with the correction flux left off (uncorrectedSnGrad.H:113-119). Both used to run
+// ORTHOGONAL: `uncorrected` behind a refusal, `limited 0` behind nothing at all. What is still refused
+// is every gradSchemes entry but `Gauss linear` -- gradSchemes were not read at all before. `-device`
+// RUNS all of it (device_sheared_corrected, device_sheared_uncorrected) and refuses a leastSquares or
+// cellLimited gradient (device_gradLsq, device_gradNHat).
 //
 // AND div(rhoPhi,U) AS THE CASE NAMES IT, on both paths: upwind, linear, linearUpwind, linearUpwindV,
 // limitedLinearV, LUST and vanLeerV -- the last the V-limited vanLeer the closed-tank tutorials use.
@@ -134,8 +135,7 @@
 // BEGIN DEVICE REFUSALS
 //   device_closed device_frozenFlow device_frozenFlow_n device_gamg_smootherDILU device_gradLsq
 //   device_gradNHat device_leak_explicit device_mesh_dynamic
-//   device_permeable_moving device_ras_otherModel device_sheared_uncorrected
-//   device_Uflux_rhoPhi
+//   device_permeable_moving device_ras_otherModel device_Uflux_rhoPhi
 // END DEVICE REFUSALS
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"

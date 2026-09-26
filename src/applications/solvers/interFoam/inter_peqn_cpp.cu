@@ -860,7 +860,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
             }
             in.taps->jumpHistory.push_back(flatJump);
         }
-        FvScalarMatrix pe = fvm::laplacian<scalar>(rAUfField, p_rgh, m, g, patches, sc.correctedLaplacian);
+        FvScalarMatrix pe = fvm::laplacian<scalar>(rAUfField, p_rgh, m, g, patches, sc.correctedLaplacian, sc.nonOrthCoeffs);
         // corrector 0 on BOTH arms: the device copies its pressure taps there, and a dump that
         // compares different correctors reads as a defect in whichever term moves between them.
         if (in.taps && corr == 0 && in.correctorIndex <= 0)

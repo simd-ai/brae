@@ -250,7 +250,10 @@ void deviceInterAssemblePEqn(
     // the pair's phiHbyA: fvc::div(phiHbyA) is the pressure equation's SOURCE and sums a coupled face
     const DeviceBuffer<scalar>* phiHbyAIf = nullptr,
     // fvc::div(phiHbyA) before the multiply by V, for a gate comparing this source against the host's
-    DeviceBuffer<scalar>*       divTapOut = nullptr);
+    DeviceBuffer<scalar>*       divTapOut = nullptr,
+    // `uncorrected`/`limited 0`: nonOrthDeltaCoeffs with NO correction (uncorrectedSnGrad.H:113-119).
+    // Last, so no positional caller moves; `corrected` above still gates the correction itself.
+    bool                        nonOrthCoeffs = false);
 
 // pEqn.H:74-83, after p = p_rgh + rho*gh: shift p so that p[pRefCell] is pRefValue, and REBUILD p_rgh
 // from the shifted p (applyPressureReference, inter_peqn_cpp.cu:179-196). Both fields move.

@@ -49,6 +49,7 @@ struct Coeffs
     scalar limitedLinearCoeff = 1;
     // laplacianSchemes and snGradSchemes, as the caller resolves them for every equation
     bool correctedLaplacian = false;
+    bool nonOrthCoeffs = false;   // nonOrthDeltaCoeffs without the correction -- inter_ueqn_cpp.cuh:181
     scalar snGradLimitCoeff = 0;
 };
 
@@ -69,6 +70,10 @@ struct Solve
     // fvMatrix::relax() for kFinal: `on` false means OpenFOAM does not call relax at all
     bool relaxOn = false;
     scalar relax = 1;
+    // k.oldTime(): the field at this TIME INDEX's first correct(), not the field at entry. See the RAS
+    // twins -- once `turbOnFinalIterOnly no` runs the closure on every outer corrector, the field at entry
+    // is the previous CORRECTOR's and OpenFOAM's is the previous STEP's (GeometricField.C:904-917).
+    const std::vector<scalar>* kOld = nullptr;
 };
 
 // The stages tools/dumpKEqn writes from OpenFOAM's own kEqn, for a gate to compare one by one: G and

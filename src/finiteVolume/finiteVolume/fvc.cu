@@ -750,12 +750,16 @@ SurfaceScalarField snGrad(
     bool                          corrected,
     bool                          leastSquares,
     scalar                        cellLimitK,
-    scalar                        limitCoeff)
+    scalar                        limitCoeff,
+    // `uncorrected` and `limited 0` take nonOrthDeltaCoeffs WITHOUT the correction -- see the note on
+    // fvm::laplacian's identical parameter. Defaulted in the declaration, so no caller moves.
+    bool                          nonOrthCoeffs)
 {
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
     const std::vector<label>& nei = m.neighbour();
-    const std::vector<scalar>& dc = corrected ? g.nonOrthDeltaCoeffs() : g.deltaCoeffs();
+    const std::vector<scalar>& dc = (corrected || nonOrthCoeffs) ? g.nonOrthDeltaCoeffs()
+                                                                 : g.deltaCoeffs();
 
     SurfaceScalarField sf;
     sf.internal.resize(nIf);

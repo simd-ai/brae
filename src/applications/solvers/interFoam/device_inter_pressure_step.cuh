@@ -175,6 +175,7 @@ struct DeviceInterPressureInput
     // Gauss linear, the only gradSchemes entry the device takes -- and keeps its face flux for
     // p_rghEqn.flux().
     bool correctedLaplacian = false;
+    bool nonOrthCoeffs = false;   // nonOrthDeltaCoeffs without the correction -- inter_ueqn_cpp.cuh:181
     scalar snGradLimitCoeff = 0;
 };
 

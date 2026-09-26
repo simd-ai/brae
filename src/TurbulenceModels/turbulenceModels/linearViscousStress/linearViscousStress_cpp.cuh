@@ -122,7 +122,11 @@ void addDivDevReff(
     // coefficient above applies on top of either). divDevRhoReff's explicit term is the largest in the
     // momentum equation, so a `default leastSquares` that reached the closure and the pressure gradient
     // but not this one left validation/rhoSST at omega 5.6e-04 restarted from OpenFOAM's iteration 5.
-    bool                          gradULeastSq = false);
+    bool                          gradULeastSq = false,
+    // `uncorrected`/`limited 0`: nonOrthDeltaCoeffs on the IMPLICIT half with no explicit correction --
+    // uncorrectedSnGrad.H:113-119 returns nonOrthDeltaCoeffs, only orthogonalSnGrad.H:113-119 returns
+    // deltaCoeffs. Last, so no positional caller of the eight above moves.
+    bool                          nonOrthCoeffs = false);
 
 } // namespace cpu
 } // namespace brae

@@ -68,8 +68,16 @@ namespace interFoam {
 // What the case's laplacianSchemes and snGradSchemes `default` say about the NON-ORTHOGONAL part.
 struct NonOrthScheme
 {
-    // `corrected`, or `limited` with a coefficient above 0
+    // WHETHER THE EXPLICIT CORRECTION IS ADDED: `corrected`, or `limited` with a coefficient above 0.
     bool corrected = false;
+    // WHICH DELTA COEFFICIENTS, which is a SEPARATE fact and was conflated with the one above.
+    // correctedSnGrad and uncorrectedSnGrad BOTH take `nonOrthDeltaCoeffs` (correctedSnGrad.H:108-114,
+    // uncorrectedSnGrad.H:113-119); only orthogonalSnGrad takes `deltaCoeffs` (orthogonalSnGrad.H:113-119).
+    // They differ in `corrected()`: true for the first, false for the other two. So `uncorrected` is
+    // "corrected's coefficients WITHOUT the correction flux" -- and brae, having one flag, ran ORTHOGONAL
+    // under that name, with the wrong face coefficient on every non-orthogonal face. `limited 0` is the
+    // same scheme as `uncorrected` (limitedSnGrad.H:98-124) and had the same fate.
+    bool nonOrthCoeffs = false;
     // `limited <c>` with 0 < c < 1; 0 is "not limited", brae's convention throughout fvm/fvc
     scalar limitCoeff = 0;
     std::string raw;
@@ -145,9 +153,11 @@ struct InterFields
     // fvm::ddt(rho, U), fvm::ddt(k) and ddtCorr. 1 is OpenFOAM's when the entry names none.
     scalar                       ddtAlphaOcCoeff = 1;
     scalar                       ddtOcCoeff      = 1;
-    // laplacianSchemes and snGradSchemes `default`. brae's interFoam assembles orthogonal, so these
-    // exist to REFUSE a corrected scheme on a mesh where the correction is not zero -- see
-    // refuseUncorrectedOnSkewMesh -- and to hand the turbulence closure the case's own.
+    // laplacianSchemes and snGradSchemes `default`, as TWO facts: whether the correction flux is added
+    // (`corrected`) and which delta coefficients the implicit half takes (`nonOrthCoeffs`). OpenFOAM
+    // separates them -- uncorrectedSnGrad.H:113-119 returns nonOrthDeltaCoeffs exactly as
+    // correctedSnGrad.H:108-114 does, and only orthogonalSnGrad.H:113-119 returns deltaCoeffs -- so one
+    // flag ran ORTHOGONAL under the names `uncorrected` AND `limited 0`.
     NonOrthScheme laplacianScheme;
     // the `k` of `grad(U) cellLimited Gauss linear <k>`, 0 unlimited: the gradient the momentum
     // equation's linearUpwind, its viscous term and that term's non-orthogonal correction all take

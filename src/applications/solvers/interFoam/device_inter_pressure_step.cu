@@ -247,7 +247,8 @@ scalar deviceInterPressureStep(
                                 in.needReference, in.pRefCell, &p_rgh, P,
                                 in.correctedLaplacian, in.correctedLaplacian ? &corrSource : nullptr,
                                 in.cyc, &rAU, havePair ? &phiHbyAIfAll : nullptr,
-                                (taps && pass == 0) ? &taps->divPhiHbyA : nullptr);
+                                (taps && pass == 0) ? &taps->divPhiHbyA : nullptr,
+                                in.nonOrthCoeffs);
 
         if (taps && pass == 0)
         {

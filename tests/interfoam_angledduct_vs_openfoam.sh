@@ -146,6 +146,44 @@ GRADEOF
             && grep -q "default         Gauss linear;" "$C/system/fvSchemes" \
             || { echo "FAIL: the gradient split was not staged, or it changed the default too"; return 1; }
     fi
+    # `orthogonal` / `uncorrected` / `limited0`: the case's laplacianSchemes and snGradSchemes `default`.
+    # THREE SCHEMES, TWO FACTS. OpenFOAM's correctedSnGrad.H:108-114 and uncorrectedSnGrad.H:113-119 BOTH
+    # return mesh().nonOrthDeltaCoeffs(); they differ only in corrected(). Only orthogonalSnGrad.H:113-119
+    # returns mesh().deltaCoeffs(). limitedSnGrad.H:165-172 returns nonOrthDeltaCoeffs and :176-178 says
+    # corrected() whatever the limiter, and limitedSnGrad.C:48-58's limiter is identically 0 at k = 0 --
+    # so `limited 0` IS `uncorrected`, which this gate asserts of OpenFOAM's own output below.
+    #
+    # brae carried ONE flag, so `uncorrected` ran ORTHOGONAL (behind a mesh refusal) and `limited 0` ran
+    # ORTHOGONAL behind nothing at all. The control is therefore the `orthogonal` run, NOT the shipped
+    # `corrected` one: orthogonal is precisely what brae was computing under both names.
+    #
+    # THIS TUTORIAL IS THE FIXTURE: 28,000 cells, max non-orthogonality 44.5185 degrees over 18,575 of
+    # them, 1/cos = 1.4025. MEASURED, OpenFOAM against OpenFOAM at this gate's end time, `uncorrected`
+    # against `orthogonal` -- what brae ran against what it should have: alpha 1.261e-05, p_rgh 4.552e-05,
+    # U 2.142e-03, k 2.998e-02, epsilon 6.430e-02, nut 4.805e-02, all 28,000 of 28,000 cells differing.
+    # Against the POROUS bounds this arm is held to, the smallest margin is p_rgh at 2.3e4x.
+    if [ "$profile" = orthogonal ] || [ "$profile" = uncorrected ] || [ "$profile" = limited0 ]; then
+        lap="Gauss linear orthogonal"; sng="orthogonal"
+        [ "$profile" = uncorrected ] && { lap="Gauss linear uncorrected"; sng="uncorrected"; }
+        [ "$profile" = limited0 ] && { lap="Gauss linear limited 0"; sng="limited 0"; }
+        grep -q "default         Gauss linear corrected;" "$C/system/fvSchemes" \
+            && grep -q "default         corrected;" "$C/system/fvSchemes" \
+            || { echo "FAIL: the tutorial no longer ships 'corrected' on both blocks"; return 1; }
+        python3 - "$C/system/fvSchemes" "$lap" "$sng" <<'SNEOF' || { echo "FAIL: staging $profile"; return 1; }
+import re, sys
+q, lap, sng = sys.argv[1], sys.argv[2], sys.argv[3]
+t = open(q).read()
+for block, val in (("laplacianSchemes", lap), ("snGradSchemes", sng)):
+    m = re.search(r"(%s\s*\{[^}]*?default\s+)([^;]+)(;)" % block, t, re.S)
+    assert m, block
+    assert m.group(2).strip().endswith("corrected"), (block, m.group(2))
+    t = t[:m.start(2)] + val + t[m.end(2):]
+open(q, "w").write(t)
+SNEOF
+        grep -q "default         $lap;" "$C/system/fvSchemes" \
+            && grep -q "default         $sng;" "$C/system/fvSchemes" \
+            || { echo "FAIL: $profile's schemes were not staged"; return 1; }
+    fi
     if [ "$profile" = inactive ] || [ "$profile" = inactiveWater ]; then
         sed -i 's/type  *explicitPorositySource;/&\n    active          no;/' "$C/constant/fvOptions"
         grep -q "active  *no;" "$C/constant/fvOptions" || { echo "FAIL: the option was not switched off"; return 1; }
@@ -183,7 +221,7 @@ PYEOF
 }
 
 rc=0
-for p in inactive porous inactiveWater porousWater splitGrad; do
+for p in inactive porous inactiveWater porousWater splitGrad orthogonal uncorrected limited0; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_angledduct_vs_openfoam: staging failed"; exit 1; }
@@ -204,6 +242,21 @@ grep -q "Porosity region porosity1" "$W/porous/log.interFoam" \
 # ...and the GRADIENT SPLIT, whose control is the `porous` run: the same case with one `default` for both.
 "$BIN" "$W/splitGrad" "$W/splitGrad/0" "$W/splitGrad/$END" "$STEPS" "$W/splitGrad/log.interFoam" \
        "$W/porous/$END" splitGrad || rc=1
+
+# OPENFOAM'S OWN CLAIM, CHECKED: limitedSnGrad at k = 0 is uncorrectedSnGrad, so these two runs must agree
+# to the last written digit. If they ever diverge, the `limited0` arm below is measuring something else.
+for fld in alpha.water p_rgh U k epsilon nut; do
+    cmp -s "$W/uncorrected/$END/$fld" "$W/limited0/$END/$fld" \
+        || { echo "FAIL: OpenFOAM's 'limited 0' and 'uncorrected' differ in $fld"; rc=1; }
+done
+[ $rc = 0 ] && echo "OpenFOAM's 'limited 0' is bitwise 'uncorrected' on all six fields"
+
+# ...and the COEFFICIENT CHOICE, whose control is the `orthogonal` run -- which is what brae ran under
+# both of these names. `limited0` is the same solve reached through the limited parse.
+"$BIN" "$W/uncorrected" "$W/uncorrected/0" "$W/uncorrected/$END" "$STEPS" "$W/uncorrected/log.interFoam" \
+       "$W/orthogonal/$END" uncorrected || rc=1
+"$BIN" "$W/limited0" "$W/limited0/0" "$W/limited0/$END" "$STEPS" "$W/limited0/log.interFoam" \
+       "$W/orthogonal/$END" limited0 || rc=1
 
 echo "interfoam_angledduct_vs_openfoam: rc $rc"
 exit $rc

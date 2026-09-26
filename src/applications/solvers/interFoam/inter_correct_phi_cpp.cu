@@ -21,6 +21,7 @@ CorrectPhiControls correctPhiControlsOf(
     c.pcorrFinal = &f.pcorrSolveFinal;
     c.gamgCache = &gamgCache;
     c.correctedLaplacian = f.laplacianScheme.corrected;
+    c.nonOrthCoeffs = f.laplacianScheme.nonOrthCoeffs;
     c.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
     c.gradPcorr = f.gradPcorr;
     c.nNonOrthogonalCorrectors = f.nNonOrthogonalCorrectors;
@@ -183,7 +184,7 @@ void correctPhi(
         const bool finalIter = (corr == c.nNonOrthogonalCorrectors);
 
         // fvm::laplacian(rAUf, pcorr) == fvc::div(phi) - divU, divU a geometricZeroField
-        FvScalarMatrix pe = fvm::laplacian<scalar>(*in.rAUf, pcorr, m, g, patches, c.correctedLaplacian);
+        FvScalarMatrix pe = fvm::laplacian<scalar>(*in.rAUf, pcorr, m, g, patches, c.correctedLaplacian, c.nonOrthCoeffs);
         if (c.correctedLaplacian)
         {
             // the fluxRequired branch of gaussLaplacianSchemes.C: CorrectPhi.C:73 sets it for pcorr

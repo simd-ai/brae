@@ -89,11 +89,14 @@ struct DeviceInterTurbulence
     // the old-old level of each field, rotated once per time index as storeOldTimes does
     DeviceCnDdt0 cnDdt0K;
     DeviceCnDdt0 cnDdt0Eps;
-    DeviceBuffer<scalar> cnKEntry;
-    DeviceBuffer<scalar> cnEpsEntry;
+    // psi.oldTime() FOR THE CLOSURE, per TIME INDEX -- the device twin of InterTurbulence::kOldStep. These
+    // were cnKEntry/cnEpsEntry, filled only under CrankNicolson; every ddt scheme reads the old-TIME level
+    // and only the old-OLD level (cnKOO/cnEpsOO) is CN's, so they are advanced unconditionally now.
+    DeviceBuffer<scalar> kOldStep;
+    DeviceBuffer<scalar> epsOldStep;
     DeviceBuffer<scalar> cnKOO;
     DeviceBuffer<scalar> cnEpsOO;
-    label cnTimeIndex = -1;
+    label oldStepTimeIndex = -1;
 
     // kOmegaSST's own, when the case names it: the CELL wall distance F1 and F2 read (wallDist::New's y,
     // not the wall functions' near-wall face distance), the faces where F1 is 1 by construction, and
@@ -199,6 +202,10 @@ struct DeviceInterTurbulenceStepInput
     // with U the closure's own -- OpenFOAM looks `U` up when the equation is built. Under kEpsilon
     // only; the case reader refuses the option under any other closure. Null = no such option.
     const DeviceMangroves* mangroves = nullptr;
+    // THE STEP'S INDEX and WHETHER THIS IS THE FINAL OUTER CORRECTOR, unset sentinels that the entry
+    // refuses -- the closure keys its old-time snapshot on the first and picks <field>Final by the second.
+    label timeIndex = -1;
+    int   finalIter = -1;
 };
 
 // turbulence->correct(), interFoam.C:171.

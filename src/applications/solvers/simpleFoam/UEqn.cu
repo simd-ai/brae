@@ -207,7 +207,7 @@ void assembleUEqn(
     // faces carry the patch value (nut_wall on a wall function), not the owner cell's.
     {
         DeviceBuffer<scalar> lD, lU, lL;
-        deviceLaplacianCoeffs(dm, *in.nuEffFace, lD, lU, lL, in.correctedLaplacian);
+        deviceLaplacianCoeffs(dm, *in.nuEffFace, lD, lU, lL, in.correctedLaplacian || in.nonOrthCoeffs);
         deviceAxpy(-1.0, lD, M.diag);
         deviceAxpy(-1.0, lU, M.upper);
         deviceAxpy(-1.0, lL, M.lower);
@@ -482,7 +482,8 @@ void assembleUEqn(
     // coefficient, because relax reads the diagonal it leaves.
     if (in.cyc && in.cyc->n > 0)
     {
-        deviceCyclicAssembleMomentum(*in.cyc, *in.nuEffCell, M.diag, nullptr, in.cycCorrected,
+        deviceCyclicAssembleMomentum(*in.cyc, *in.nuEffCell, M.diag, nullptr,
+                                     in.cycCorrected || in.cycNonOrth,
                                      in.cycConvFlux);
         // ...and kept, because the next assembly on this pair overwrites cyc.ifCoeff -- see the note
         // on MomentumMatrix::cycIfCoeff.

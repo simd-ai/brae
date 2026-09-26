@@ -51,6 +51,7 @@ struct CorrectPhiControls
     GamgAgglomerationCache* gamgCache = nullptr;
     // laplacianSchemes' default, for fvm::laplacian(rAUf, pcorr)
     bool correctedLaplacian = false;
+    bool nonOrthCoeffs = false;   // nonOrthDeltaCoeffs without the correction -- inter_ueqn_cpp.cuh:181
     scalar snGradLimitCoeff = 0;
     // grad(pcorr)'s gradSchemes entry, which the laplacian's correction takes
     GradChoice gradPcorr;

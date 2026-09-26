@@ -147,6 +147,11 @@ struct KEpsilonInput
     // ...or `solver PBiCG; preconditioner DILU;` for BOTH equations (device_pbicg.cuh): NOT PBiCGStab,
     // and it needs `precon` below to carry the mesh's DILU schedule. waves/mangroveInteraction names it.
     bool   pbicgKE = false;
+    // psi.oldTime(): the PREVIOUS STEP's field, which the caller supplies once `turbOnFinalIterOnly no`
+    // makes the closure run on every outer corrector. Null keeps the field at entry -- identical while the
+    // closure runs once per step (GeometricField.C:904-917; the host twins carry the same note).
+    const DeviceBuffer<scalar>* kOldIn = nullptr;
+    const DeviceBuffer<scalar>* epsOldIn = nullptr;
     // THE SECOND EQUATION'S OWN SOLVER SETTING. `fvMatrix::solve()` looks the solver dictionary up by
     // FIELD name (fvMatrix.C:1536-1542), so `epsilonFinal` may name different tolerances, sweep counts or a
     // different solver from `kFinal` and OpenFOAM honours each (kEpsilon.C:268 / kOmegaSSTBase.C:593 solve
@@ -187,6 +192,7 @@ struct KEpsilonInput
                                   // so a case that bounds one and not the other is refused here rather
                                   // than quietly bounded twice or not at all.
     bool   correctedLaplacian = false;   // BOTH halves: the implicit coefficient AND the explicit source
+    bool   nonOrthCoeffs = false;   // nonOrthDeltaCoeffs without the correction -- inter_ueqn_cpp.cuh:181
     scalar snGradLimitCoeff   = 0.0;
 
     // --- relaxation. relax(1.0) is NOT the identity: fvMatrix::relax early-returns only on alpha <= 0,

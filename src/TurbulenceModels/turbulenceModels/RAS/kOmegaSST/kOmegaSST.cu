@@ -118,6 +118,7 @@ turbulence::TransportScheme schemeOf(const KOmegaSSTInput& in)
     sc.linearUpwind       = in.linearUpwind;
     sc.luGradK            = in.luGradK;
     sc.correctedLaplacian = in.correctedLaplacian;
+    sc.nonOrthCoeffs = in.nonOrthCoeffs;
     sc.gradFieldLimitK    = in.co.gradKLimitK;
     sc.gradFieldLeastSq   = in.co.gradKLeastSq;
     sc.snGradLimitCoeff   = in.snGradLimitCoeff;
@@ -434,8 +435,8 @@ void correct(
     DeviceBuffer<scalar> kOld, omegaOld;
     if (in.rDeltaT > scalar(0))
     {
-        deviceCopy(kOld, k);
-        deviceCopy(omegaOld, omega);
+        deviceCopy(kOld, in.kOldIn ? *in.kOldIn : k);
+        deviceCopy(omegaOld, in.omegaOldIn ? *in.omegaOldIn : omega);
     }
     // the moved mesh's old volumes, null on a static one -- see ddtKernel
     const scalar* v0P = (in.V0 && in.V0->size() == static_cast<std::size_t>(nC)) ? in.V0->data() : nullptr;

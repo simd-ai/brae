@@ -156,6 +156,35 @@ kEpsilonRef::Compressible comp rhoBnd  # same
 kEpsilonRef::Compressible comp rhoOld  # same: the ddt's rho.oldTime() is 1 in the uniform lineage
 kOmegaSST::Compressible comp rhoOld  # the same omission at the kOmegaSST site, for the reason above
 kEpsilonRef::Compressible comp phiByRho  # the VOLUMETRIC flux for divU: in the uniform lineage the equation already convects with phi, so the separate field is the variable lineage's
+
+# ---- the closures' per-step old time (kOldIn / epsOldIn / omegaOldIn) --------------------------------
+# NULL MEANS "recapture psi.oldTime() at this call", which is the same field wherever a site makes at
+# most ONE closure call per time index. interFoam's PIMPLE is the exception that created these inputs:
+# with nOuterCorrectors > 1 it calls the closure several times inside one step and OpenFOAM's
+# storeOldTimes is guarded on timeIndex (GeometricField.C:904-917), so the old time must be handed in.
+# Every site below is either a correctNutField call -- eddyViscosity::validate, which assembles no
+# equation and so has no ddt to read an old time for -- or a SIMPLE iteration, where the time index
+# advances once per closure call and recapturing gives that same field.
+# NOTE the tool keys on the VARIABLE name, so one line covers every site spelling it the same way.
+kOmegaSST::Compressible sstComp kOldIn  # inter_turbulence_cpp.cu:792, validateTurbulence -> correctNutField: nut only, no k equation
+kOmegaSST::Compressible sstComp omegaOldIn  # same site, same reason
+kEpsilonRef::Compressible comp kOldIn  # the correctNutField sites (inter_turbulence_cpp.cu:801, rhoCreateFields_cpp.cu:1080) and rhoSimpleFoam_cpp.cu:1367, one closure call per SIMPLE iteration
+kEpsilonRef::Compressible comp epsOldIn  # same sites, same reason
+kOmegaSST::Compressible comp kOldIn  # rhoCreateFields_cpp.cu:1106, validate()'s correctNutField
+kOmegaSST::Compressible comp omegaOldIn  # same site, same reason
+kOmegaSST::Compressible sc kOldIn  # rhoSimpleFoam_cpp.cu:1240, the live SST call: one per SIMPLE iteration, so oldTime() is this step's
+kOmegaSST::Compressible sc omegaOldIn  # same site, same reason
+KOmegaSSTInput sstIn kOldIn  # rhoTurbulenceHook.cu:183, the device mirror's SST: one call per SIMPLE iteration
+KOmegaSSTInput sstIn omegaOldIn  # same site, same reason
+
+# ---- `uncorrected` / `limited 0` outside interFoam (item 10's blast radius) ---------------------------
+# interFoam now carries the coefficient choice separately from the correction flux, because OpenFOAM's
+# uncorrectedSnGrad.H:113-119 returns nonOrthDeltaCoeffs exactly as correctedSnGrad.H:108-114 does and
+# only orthogonalSnGrad.H:113-119 returns deltaCoeffs. The SHARED parser the other solvers read
+# (scheme_parse.cuh readSnGrad) still collapses the two, so rhoSimpleFoam has no second flag to pass and
+# false is what it runs today. THIS LINE LEAVES when that parser is split and gated -- it records a known
+# substitution, not a justified default, and PORT.md's item 10 carries the site list.
+KOmegaSSTInput sstIn nonOrthCoeffs  # rhoSimpleFoam's parser does not distinguish `uncorrected` yet -- item 10's blast radius
 kOmegaSST::Compressible comp phiByRho  # the same omission at the kOmegaSST site, for the reason above
 kOmegaSST::Compressible sstComp rho  # ARM sst_variableDensity. kOmegaSST + `density variable` is REFUSED by name -- "pairs `density variable` with kOmegaSST ... Refused rather than run ungated" (inter_turbulence_cpp.cu:427-433) -- so this site is the uniform lineage only
 kOmegaSST::Compressible sstComp rhoBnd  # same refusal

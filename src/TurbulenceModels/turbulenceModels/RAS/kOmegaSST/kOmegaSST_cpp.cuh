@@ -222,6 +222,14 @@ struct Compressible
     const std::vector<scalar>*              rhoOO       = nullptr;
     const std::vector<scalar>*              omegaOO     = nullptr;
     const std::vector<scalar>*              kOO         = nullptr;
+    // psi.oldTime(): the field at this TIME INDEX's first correct(), which is NOT the field at entry once
+    // `turbOnFinalIterOnly no` makes the closure run on every outer corrector. OpenFOAM's
+    // GeometricField::storeOldTimes() is guarded on `timeIndex_ != time().timeIndex()`
+    // (GeometricField.C:904-917), so the old level is the PREVIOUS STEP's for every corrector of a step.
+    // Null keeps the old behaviour -- the field at entry -- which is identical while the closure runs once
+    // per step and first order in dt wrong as soon as it does not.
+    const std::vector<scalar>*              kOldIn      = nullptr;
+    const std::vector<scalar>*              omegaOldIn  = nullptr;
 };
 
 // kOmegaSSTLM's three virtual overrides of this model, supplied by the DERIVED model rather than
@@ -310,7 +318,10 @@ void correct(
     // `linearUpwind` at all and refuses it, so that half of EqnDivScheme stays false here.
     const EqnDivScheme*            omegaDiv = nullptr,
     // OMEGA'S OWN GRADIENT SCHEME; `co.gradKLeastSq`/`gradKLimitK` are k's. Null means ONE for both.
-    const EqnGradScheme*           omegaGrad = nullptr);
+    const EqnGradScheme*           omegaGrad = nullptr,
+    // `uncorrected`/`limited 0` on BOTH equations' laplacians: nonOrthDeltaCoeffs with no correction
+    // (uncorrectedSnGrad.H:113-119). Last, for the same positional reason as everything above it.
+    bool                           nonOrthCoeffs = false);
 
 } // namespace kOmegaSST
 } // namespace cpu

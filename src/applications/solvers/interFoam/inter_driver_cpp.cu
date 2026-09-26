@@ -965,11 +965,15 @@ RunReport runInterFoam(
                     // not orthogonal, through the fields' own Gauss linear gradients
                     const bool snCorr = f.snGradScheme.corrected;
                     const scalar snLim = f.snGradScheme.limitCoeff;
+                    // ...and WHICH delta coefficients, which `uncorrected` and `limited 0` do not
+                    // share with `orthogonal` (uncorrectedSnGrad.H:113-119)
+                    const bool snNonOrth = f.snGradScheme.nonOrthCoeffs;
                     // each correction takes grad(<field>)'s own entry (correctedSnGrad.C:52-55)
                     const SurfaceScalarField snRho = fvc::snGrad(rhoF, m, g, patches, snCorr, f.gradRho.leastSquares,
-                                                                 f.gradRho.cellLimitK, snLim);
+                                                                 f.gradRho.cellLimitK, snLim, snNonOrth);
                     const SurfaceScalarField snA = fvc::snGrad(f.alpha1, m, g, patches, snCorr,
-                                                               f.gradAlpha1.leastSquares, f.gradAlpha1.cellLimitK, snLim);
+                                                               f.gradAlpha1.leastSquares, f.gradAlpha1.cellLimitK, snLim,
+                                                               snNonOrth);
 
                     SurfaceScalarField stf;
                     stf.internal.resize(static_cast<std::size_t>(m.nInternalFaces()));
@@ -1006,7 +1010,7 @@ RunReport runInterFoam(
                             std::vector<scalar>(static_cast<std::size_t>(patches[pi].size), scalar(0)));
                     }
                     const SurfaceScalarField snP = fvc::snGrad(f.p_rgh, m, g, patches, snCorr, f.gradPrgh.leastSquares,
-                                                               f.gradPrgh.cellLimitK, snLim);
+                                                               f.gradPrgh.cellLimitK, snLim, snNonOrth);
 
                     SurfaceScalarField force;
                     {
@@ -1070,6 +1074,7 @@ RunReport runInterFoam(
                     mi.relaxEquationU = f.relaxEquationU; mi.relaxU = f.relaxU;
                     // laplacianSchemes' default, for the viscous term's fvm::laplacian(rho*nuEff, U)
                     mi.correctedLaplacian = f.laplacianScheme.corrected;
+                    mi.nonOrthCoeffs = f.laplacianScheme.nonOrthCoeffs;
                     mi.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
                     // gradSchemes' grad(U): cellLimited or not, for linearUpwind and the viscous term
                     mi.gradULimitK = f.gradULimitK;
@@ -1203,6 +1208,7 @@ RunReport runInterFoam(
                     psc.nCorrectors = lc.nCorrectors;
                     psc.nNonOrthogonalCorrectors = f.nNonOrthogonalCorrectors;
                     psc.correctedLaplacian = f.laplacianScheme.corrected;
+                    psc.nonOrthCoeffs = f.laplacianScheme.nonOrthCoeffs;
                     psc.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
                     psc.gradPrgh = f.gradPrgh;
                     // p_rgh.needReference() and setRefCell, read with the case -- see InterFields::pRef
@@ -1271,6 +1277,13 @@ RunReport runInterFoam(
                     ti.nu = &f.nu;
                     ti.nuBnd = &f.nuBnd;
                     ti.deltaT = rep.deltaT;
+                    // THE STEP'S INDEX -- the same value Stage::advanceTime gives cnClock.timeIndex, so the
+                    // closure's old-time snapshot and CrankNicolson's clock agree on what a step is.
+                    ti.timeIndex = rep.steps;
+                    // ...and WHICH OUTER CORRECTOR this is. With `turbOnFinalIterOnly no` the closure runs
+                    // on every one and fvMatrix::solve() selects `<field>Final` only on the last
+                    // (fvMatrix.C:1536-1542); the same flag the momentum solve already picks by at :1084.
+                    ti.finalIter = (outerIndex >= lc.nOuterCorrectors - 1) ? 1 : 0;
                     // a moving mesh's old volumes and mesh flux, for the closure's ddt and divU
                     if (dyn && dyn->moving())
                     {

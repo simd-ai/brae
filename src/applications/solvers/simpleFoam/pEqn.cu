@@ -234,7 +234,7 @@ void pressurePredictor(
         deviceInterpolate(dm, drAtU, drAtUf);
         {
             DeviceBuffer<scalar> ld, lu, ll, fInt;
-            deviceLaplacianCoeffs(dm, drAtUf, ld, lu, ll, in.correctedLaplacian);
+            deviceLaplacianCoeffs(dm, drAtUf, ld, lu, ll, in.correctedLaplacian || in.nonOrthCoeffs);
             deviceMatrixFluxInternal(deviceLduView(dm, ld, lu, ll), *p, fInt);
             deviceAxpy(1.0, fInt, st.phiHbyAInt);
         }
@@ -307,7 +307,7 @@ void assemblePEqn(
     // fvm::laplacian(rAU, p). The boundary diffusivity is rAU's own boundary value, which for the
     // extrapolatedCalculated field fvMatrix::A() produces IS the owner cell's -- hence the cell-gamma
     // kernel here rather than the face variant used for nuEff.
-    deviceLaplacianCoeffs(dm, rAUface, P.diag, P.upper, P.lower, in.correctedLaplacian);
+    deviceLaplacianCoeffs(dm, rAUface, P.diag, P.upper, P.lower, in.correctedLaplacian || in.nonOrthCoeffs);
     deviceBCLaplacianCoeffs(dbP, st.rAtU, P.iC, P.bC);
 
     // == fvc::div(phiHbyA), extensive: source = V*div(phiHbyA).

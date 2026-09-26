@@ -178,6 +178,10 @@ struct InterMomentumInput
     scalar    relaxU             = 1.0;
 
     bool      correctedLaplacian = false;
+    // `uncorrected` and `limited 0` take nonOrthDeltaCoeffs WITHOUT the correction: uncorrectedSnGrad.H:113-119
+    // returns mesh().nonOrthDeltaCoeffs() exactly as correctedSnGrad.H:108-114 does, and only
+    // orthogonalSnGrad.H:113-119 returns deltaCoeffs. With the one flag above, both names ran ORTHOGONAL.
+    bool      nonOrthCoeffs = false;
     scalar    snGradLimitCoeff   = 0.0;
 
     // MRF.DDt(rho, U), UEqn.H:6. The case's ACTIVE zones, resolved; null or empty is a case without

@@ -64,6 +64,24 @@ const Bounds POROUS{5e-13, 2e-9, 2e-9, 2e-10, 2e-10, 2e-10, 5e-9, 3e-8};
 //              kinematic form changes NO digit). MEASURED: alpha 6.6e-13, p_rgh 4.6e-12, U 2.8e-12, k
 //              9.5e-14, epsilon 1.8e-13, nut 1.1e-13, p_rgh initial residuals within 6.1e-11.
 const Bounds POROUS_WATER{2e-11, 2e-10, 1e-10, 3e-12, 6e-12, 3e-12, 1e-9, 2e-9};
+//   uncorrected / limited0  the case's laplacianSchemes and snGradSchemes `default` take
+//              nonOrthDeltaCoeffs with the correction flux left off. THE FIELD BOUNDS ARE POROUS's,
+//              unchanged and met with room: MEASURED host p_rgh 1.20e-11, U 4.56e-11, k 2.55e-12,
+//              epsilon 5.36e-12, nut 1.94e-12; device p_rgh 3.93e-11, U 3.84e-11, k 3.63e-12,
+//              epsilon 5.69e-12, nut 2.90e-12. Against a control -- OpenFOAM's own `orthogonal` run --
+//              of U 2.142e-03 and k 2.998e-02, which is what brae computed under both names.
+//
+//              ONLY THE p_rgh RESIDUAL BOUND DIFFERS, and its DENOMINATOR is why. compareSolves holds a
+//              RELATIVE difference, and this arm's third corrector of step one starts already converged:
+//              OpenFOAM's own log reads `Initial residual = 1.84022270527491e-07` there, against
+//              1.03816627673642e-05 for the same corrector under `corrected`. The worst relative
+//              difference is 1.363e-07 of 1.840e-07, which is 2.5e-14 ABSOLUTE; the `porous` arm's
+//              1.472e-10 of 1.038e-05 is 1.5e-15 absolute. The two arms agree in absolute terms to
+//              within an order -- both are round-off on p_rgh's normalisation -- and differ 56x in what
+//              they are divided by. Every one of the 30 iteration counts is OpenFOAM's on BOTH arms and
+//              both codes, which a wrong operator on a 44-degree mesh does not leave intact: the device
+//              arm before these lines took 27 of 30.
+const Bounds NONORTH{5e-13, 2e-9, 2e-9, 2e-10, 2e-10, 2e-10, 3e-7, 3e-7};
 
 namespace {
 int failures = 0;
@@ -121,7 +139,7 @@ int main(
     std::printf("== brae interFoam vs OpenFOAM interFoam: RAS/angledDuct (explicitPorositySource) ==\n");
     if (argc < 8)
     {
-        std::printf("  SKIP: usage: %s <caseDir> <startDir> <ofTimeDir> <nSteps> <log> <otherOfTimeDir> <porous|inactive>\n",
+        std::printf("  SKIP: usage: %s <caseDir> <startDir> <ofTimeDir> <nSteps> <log> <otherOfTimeDir> <porous|uncorrected|limited0|inactive>\n",
                     argv[0]);
         return 77;
     }
@@ -135,9 +153,18 @@ int main(
     // `splitGrad`: grad(k) and grad(epsilon) name different schemes, which `fvc::grad` resolves by the
     // FIELD's name. It is the shipped `porous` case plus those two entries, so it takes porous's bounds.
     const bool splitGrad = (std::string(argv[7]) == "splitGrad");
-    const bool porous = (std::string(argv[7]) == "porous") || water || splitGrad;
-    const Bounds& B = water ? POROUS_WATER : (porous ? POROUS : INACTIVE);
-    std::printf("  arm: %s\n", splitGrad ? "splitGrad -- grad(epsilon) leastSquares beside grad(k) Gauss linear" : water ? "porousWater -- the duct started full of water, so rho is 1000 in the porous zone" : porous ? "porous -- as shipped" : "inactive -- the option switched off in both codes");
+    // `uncorrected` / `limited0`: the case's laplacianSchemes and snGradSchemes `default`, which take
+    // nonOrthDeltaCoeffs WITHOUT the correction flux. Both are the shipped `porous` case with those two
+    // entries changed, so both take porous's bounds; `argv[6]` is the `orthogonal` run, which is what
+    // brae computed under both of these names.
+    const bool uncorrected = (std::string(argv[7]) == "uncorrected");
+    const bool limited0 = (std::string(argv[7]) == "limited0");
+    const bool nonOrthArm = uncorrected || limited0;
+    const bool porous = (std::string(argv[7]) == "porous") || water || splitGrad || nonOrthArm;
+    const Bounds& B = water ? POROUS_WATER : (nonOrthArm ? NONORTH : (porous ? POROUS : INACTIVE));
+    std::printf("  arm: %s\n", uncorrected ? "uncorrected -- nonOrthDeltaCoeffs, no correction flux"
+                : limited0 ? "limited0 -- the same scheme reached through limitedSnGrad at k = 0"
+                : splitGrad ? "splitGrad -- grad(epsilon) leastSquares beside grad(k) Gauss linear" : water ? "porousWater -- the duct started full of water, so rho is 1000 in the porous zone" : porous ? "porous -- as shipped" : "inactive -- the option switched off in both codes");
 
     PrimitiveMesh m;
     m.read(caseDir + "/constant/polyMesh");
@@ -163,6 +190,29 @@ int main(
         check("...and grad(epsilon) as leastSquares", fin.turbulence.secondGrad.leastSquares);
         check("...so the two differ, which is what this profile exists to run",
               fin.turbulence.kGrad.leastSquares != fin.turbulence.secondGrad.leastSquares);
+    }
+    if (nonOrthArm)
+    {
+        // WHAT WAS READ. Without this the arm would pass on a brae that resolved the entry to `corrected`
+        // or to `orthogonal` and happened to land inside the bounds -- and `orthogonal` is exactly what it
+        // used to resolve to. THE TWO FACTS ARE SEPARATE: nonOrthDeltaCoeffs on the implicit half, and no
+        // correction flux. uncorrectedSnGrad.H:113-119 returns nonOrthDeltaCoeffs exactly as
+        // correctedSnGrad.H:108-114 does; only orthogonalSnGrad.H:113-119 returns deltaCoeffs.
+        std::printf("  SCHEME READ: laplacian `%s` corrected %d nonOrthCoeffs %d limit %.3g   |   "
+                    "snGrad `%s` corrected %d nonOrthCoeffs %d limit %.3g\n",
+                    fin.laplacianScheme.raw.c_str(), (int)fin.laplacianScheme.corrected,
+                    (int)fin.laplacianScheme.nonOrthCoeffs, (double)fin.laplacianScheme.limitCoeff,
+                    fin.snGradScheme.raw.c_str(), (int)fin.snGradScheme.corrected,
+                    (int)fin.snGradScheme.nonOrthCoeffs, (double)fin.snGradScheme.limitCoeff);
+        check("brae reads the laplacian's coefficients as nonOrthDeltaCoeffs",
+              fin.laplacianScheme.nonOrthCoeffs);
+        check("...and adds NO correction flux to it", !fin.laplacianScheme.corrected);
+        check("...and the snGrad's coefficients the same way", fin.snGradScheme.nonOrthCoeffs);
+        check("...with no correction there either", !fin.snGradScheme.corrected);
+        // `limited 0`'s limiter is identically zero (limitedSnGrad.C:48-58), so it must not survive as a
+        // cap the correction path would read -- the two profiles must reach ONE state.
+        check("...and no surviving limiter coefficient, so `limited 0` and `uncorrected` are one state",
+              fin.laplacianScheme.limitCoeff == scalar(0) && fin.snGradScheme.limitCoeff == scalar(0));
     }
     check("...under kEpsilon, in the uniform lineage",
           fin.turbulence.model == InterRasModel::KEpsilon && !fin.turbulence.variableDensity);
@@ -316,14 +366,25 @@ int main(
     // THE CONTROL, on the oracle
     const Diff dOffU = compare(readVectorCells(inactiveDir + "/U"), ofU);
     const Diff dOffP = compare(readCells(inactiveDir + "/p_rgh"), ofPrgh);
-    std::printf("  CONTROL: OpenFOAM with the option inactive against OpenFOAM with it, U relative %.4e, "
-                "p_rgh %.4e\n", (double)dOffU.rel(), (double)dOffP.rel());
+    std::printf("  CONTROL: %s, U relative %.4e, p_rgh %.4e\n",
+                nonOrthArm ? "OpenFOAM's `orthogonal` against OpenFOAM's own run of this arm -- what brae "
+                             "computed under this name against what it should have"
+                           : "OpenFOAM with the option inactive against OpenFOAM with it",
+                (double)dOffU.rel(), (double)dOffP.rel());
     check(splitGrad ? "the GRADIENT SPLIT moves OpenFOAM's own U far more than brae is from it -- `argv[6]` "
                       "is the `porous` run, which is this same case with one `default` for both gradients, "
                       "so the only difference between them is grad(epsilon)'s scheme. MEASURED: epsilon "
                       "6.795e-03 over 27,870 of 28,000 cells, nut 8.547e-03, U 6.451e-04. On RAS/damBreak "
                       "the same profile reads EXACTLY ZERO -- that case ships `Gauss linear orthogonal` and "
                       "`upwind`, so no turbulence gradient is ever read -- which is why the fixture is here"
+          : nonOrthArm ? "THE COEFFICIENT CHOICE moves OpenFOAM's own U far more than brae is from it. "
+                         "`argv[6]` is this same case under `Gauss linear orthogonal`/`orthogonal` -- "
+                         "deltaCoeffs where this arm takes nonOrthDeltaCoeffs -- and orthogonal is what "
+                         "brae ran under BOTH `uncorrected` (behind a mesh refusal) and `limited 0` "
+                         "(behind nothing). MEASURED, OpenFOAM against OpenFOAM: alpha 1.261e-05, p_rgh "
+                         "4.552e-05, U 2.142e-03, k 2.998e-02, epsilon 6.430e-02, nut 4.805e-02, all "
+                         "28,000 of 28,000 cells. The mesh is 44.5185 degrees non-orthogonal on 18,575 "
+                         "of them, 1/cos = 1.4025, which is why the fixture is here"
           : porous ? "the porosity moves OpenFOAM's own U far more than brae is from it"
                    : "...and so does switching it back on",
           dOffU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14))
@@ -371,7 +432,13 @@ int main(
         // ...and the DEVICE's own p_rgh solves against OpenFOAM's log, as the host arm above is held:
         // the case names GAMG with a GaussSeidel smoother and PCG with one on pcorr, so a substituted
         // solver shows here before it shows in a field.
-        failures += brae::gatecheck::compareSolves("device", rd.pSolves, ofP, nSteps);
+        // the nonOrth arms' p_rgh residuals are held to the SAME bound as their host half, for the same
+        // reason: a relative difference on an initial residual of 1.84e-07. Every other arm keeps the
+        // default 1e-10/1e-5, which they meet.
+        failures += nonOrthArm
+            ? brae::gatecheck::compareSolves("device", rd.pSolves, ofP, nSteps, "p_rgh",
+                                             B.pResidualStepOne, B.pResidualRun)
+            : brae::gatecheck::compareSolves("device", rd.pSolves, ofP, nSteps);
         failures += brae::gatecheck::nonFinite("device alpha", dev.alpha1.internal);
         failures += brae::gatecheck::nonFinite("device U", dev.U.internal);
         const Diff eA = compare(dev.alpha1.internal, ofAlpha);
@@ -389,7 +456,10 @@ int main(
         check("...its k", eK.rel() < B.k);
         check("...its epsilon", eE.rel() < B.epsilon);
         check("...and its nut", eN.rel() < B.nut);
-        check("the porosity moves OpenFOAM's own U far more than the DEVICE is from it",
+        check(nonOrthArm ? "the coefficient choice moves OpenFOAM's own U far more than the DEVICE is "
+                           "from it -- the device arm took nonOrthDeltaCoeffs too, and its refusal of "
+                           "`uncorrected` on a sheared mesh is lifted by these lines"
+                         : "the porosity moves OpenFOAM's own U far more than the DEVICE is from it",
               dOffU.rel() > scalar(1000)*std::fmax(eU.rel(), scalar(1e-14)) && dOffU.rel() > scalar(1e-3));
     }
 

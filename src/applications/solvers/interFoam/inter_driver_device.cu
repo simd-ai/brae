@@ -909,8 +909,12 @@ RunReport runInterFoamDevice(
         // silent substitution, and the three calls here are what lifts it.
         const bool snCorr = f.snGradScheme.corrected;
         const scalar snLim = f.snGradScheme.limitCoeff;
+        // ...and WHICH delta coefficients: `uncorrected` and `limited 0` take nonOrthDeltaCoeffs
+        // without the correction (uncorrectedSnGrad.H:113-119), which `orthogonal` does not
+        const bool snNonOrth = f.snGradScheme.nonOrthCoeffs;
         const SurfaceScalarField snA = fvc::snGrad(f.alpha1, m, g, fvp, snCorr,
-                                                   f.gradAlpha1.leastSquares, f.gradAlpha1.cellLimitK, snLim);
+                                                   f.gradAlpha1.leastSquares, f.gradAlpha1.cellLimitK, snLim,
+                                                   snNonOrth);
         SurfaceScalarField t;
         t.internal.resize(static_cast<std::size_t>(nIf));
         for (label i = 0; i < nIf; ++i) t.internal[i] = sKf.internal[i]*snA.internal[i];
@@ -963,7 +967,7 @@ RunReport runInterFoamDevice(
         }
         const GeometricField<scalar> rhoF = rhoWithPatchValues(f.rho, rb, fvp);
         const SurfaceScalarField snRhoF = fvc::snGrad(rhoF, m, g, fvp, snCorr, f.gradRho.leastSquares,
-                                                      f.gradRho.cellLimitK, snLim);
+                                                      f.gradRho.cellLimitK, snLim, snNonOrth);
         snRho.copyFrom(fullFace(snRhoF, fvp));
         if (!cyclics.empty()) dSnRhoIf.copyFrom(coupledFace(snRhoF, cyclics));
 
@@ -1030,7 +1034,7 @@ RunReport runInterFoamDevice(
             }
             snP.copyFrom(fullFace(fvc::snGrad(f.p_rgh, m, g, fvp, f.snGradScheme.corrected,
                                               f.gradPrgh.leastSquares, f.gradPrgh.cellLimitK,
-                                              f.snGradScheme.limitCoeff), fvp));
+                                              f.snGradScheme.limitCoeff, f.snGradScheme.nonOrthCoeffs), fvp));
         }
         else snP.resize(0);
     };
@@ -1468,6 +1472,7 @@ RunReport runInterFoamDevice(
     C.gradULimitK       = f.gradULimitK;
     C.gradUSchemeLimitK = f.gradULimitK;
     C.correctedLaplacian = f.laplacianScheme.corrected;
+    C.nonOrthCoeffs = f.laplacianScheme.nonOrthCoeffs;
     C.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
     C.momentumPredictor = f.momentumPredictorOn;
     C.relaxU = f.relaxU;
@@ -2123,6 +2128,10 @@ RunReport runInterFoamDevice(
                 ti.nu = &dStepNu;
                 ti.nuBnd = &dStepNuBnd;
                 ti.deltaT = rep.deltaT;
+                // the step's index and the corrector, as the host loop supplies them -- `s + 1` is the
+                // expression the CrankNicolson block already uses for this step's index
+                ti.timeIndex = s + 1;
+                ti.finalIter = finalOuter ? 1 : 0;
                 // A MOVING MESH's two terms, the pair the HOST closure has always taken
                 // (InterTurbulenceStepInput::V0/meshPhi at inter_driver_cpp.cu): the volumes the cells
                 // had BEFORE this step's move -- dV0 above, filled from dm.V before interMeshUpdate
@@ -2207,6 +2216,10 @@ RunReport runInterFoamDevice(
                 ti.nu = &f.nu;
                 ti.nuBnd = &f.nuBnd;
                 ti.deltaT = rep.deltaT;
+                // the step's index and the corrector, as the host loop supplies them -- `s + 1` is the
+                // expression the CrankNicolson block already uses for this step's index
+                ti.timeIndex = s + 1;
+                ti.finalIter = finalOuter ? 1 : 0;
                 // fvOptions(k) and fvOptions(epsilon), as the host loop hands them (inter_driver_cpp.cu):
                 // without this the instrument ran the mangroves' case with no turbulence source at all
                 ti.fvOptions = f.fvOptions.empty() ? nullptr : &f.fvOptions;

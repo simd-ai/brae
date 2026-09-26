@@ -1,4 +1,5 @@
 SOURCE = \
 kOmegaSSTDumpModels.C \
+kOmegaSSTDumpIncompressibleModels.C \
 
 # sources

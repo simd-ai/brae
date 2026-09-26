@@ -328,7 +328,7 @@ FvVectorMatrix assembleUEqn(
         muEffBnd = &muEffBndOwned;
     }
     addDivDevReff(M, U, *muEff, *muEffBnd, m, g, patches, in.correctedLaplacian, in.snGradLimitCoeff,
-                  in.gradULimitK, in.gradULeastSq);
+                  in.gradULimitK, in.gradULeastSq, in.nonOrthCoeffs);
 
     stage.vectors("ueqnSrcDev", M.source);
     // ...and the three things divDevRhoReff's explicit half is built from, because that half is where

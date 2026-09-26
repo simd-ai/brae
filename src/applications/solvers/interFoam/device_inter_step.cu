@@ -316,6 +316,7 @@ void deviceInterStep(
     // addDivDevReff (inter_ueqn_cpp.cu): nonOrthDeltaCoeffs and the deferred correction when `corrected`,
     // capped per face under `limited`. The shared assembler carries both; interFoam's step left them off.
     uin.correctedLaplacian = ctl.correctedLaplacian;
+    uin.nonOrthCoeffs = ctl.nonOrthCoeffs;
     uin.snGradLimitCoeff   = ctl.snGradLimitCoeff;
     uin.gradUSchemeLimitK = ctl.gradUSchemeLimitK;
     uin.relaxU        = ctl.relaxU;
@@ -359,6 +360,7 @@ void deviceInterStep(
     }
     uin.cyc          = ctl.cyc;
     uin.cycCorrected = ctl.correctedLaplacian;
+    uin.cycNonOrth = ctl.nonOrthCoeffs;
     // fvm::div(rhoPhi, U) on the pair too -- the MASS flux, as uin.phiInt above is
     uin.cycConvFlux  = ctl.rhoPhiIf;
     uin.mrf    = ctl.mrf;
@@ -623,6 +625,7 @@ void deviceInterStep(
         pi.gamgInner = ctl.pressureGamg;
         pi.pcgGamgInner = ctl.pressurePcgGamg;
         pi.correctedLaplacian = ctl.correctedLaplacian;
+        pi.nonOrthCoeffs = ctl.nonOrthCoeffs;
         pi.snGradLimitCoeff = ctl.snGradLimitCoeff;
 
         DevicePressureTaps pt;

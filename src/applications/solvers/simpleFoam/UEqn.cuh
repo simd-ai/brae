@@ -145,6 +145,7 @@ struct MomentumInput
     // `corrected` laplacianSchemes: switches the implicit coefficient to nonOrthDeltaCoeffs AND adds the
     // explicit deferred correction. Both halves, as in the reference -- see UEqn_cpp.cuh.
     bool   correctedLaplacian = false;
+    bool   nonOrthCoeffs = false;   // nonOrthDeltaCoeffs without the correction -- inter_ueqn_cpp.cuh:181
     // `limited <k> corrected` (OF limitedSnGrad). 0 = uncapped, which is what `corrected` means.
     scalar snGradLimitCoeff = 0.0;
     bool   hasMRF = false;
@@ -165,6 +166,7 @@ struct MomentumInput
     // periodic mesh relaxes against a diagonal it does not have. `cyc.phi` must hold the pair's CURRENT
     // flux before this is called. Null = a mesh with no pair, which is every case that had one before.
     DeviceCyclic* cyc = nullptr;
+    bool cycNonOrth = false;   // nonOrthDeltaCoeffs without the correction -- inter_ueqn_cpp.cuh:181
     bool cycCorrected = true;          // the diffusion half's delta coefficients, as the laplacian's
     // ...and the flux the CONVECTION half uses on the pair, when it is not the pair's own phi.
     // interFoam's UEqn is fvm::div(rhoPhi, U) and cyc.phi is the volumetric flux; see

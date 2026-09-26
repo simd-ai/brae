@@ -94,12 +94,13 @@ void addDivDevReff(
     bool                          correctedLaplacian,
     scalar                        snGradLimitCoeff,
     scalar                        gradULimitK,
-    bool                          gradULeastSq)
+    bool                          gradULeastSq,
+    bool                          nonOrthCoeffs)
 {
     // Implicit half: OpenFOAM writes `- fvm::laplacian(nuEff, U)` inside divDevReff, and UEqn.H adds
     // divDevReff to the equation -- so the laplacian enters with coefficient -1.
     const SurfaceScalarField gammaf = effectiveFaceViscosity(nuEff, nuEffBnd, m, g, patches);
-    addEqual(UEqn, fvm::laplacian<vector>(gammaf, U, m, g, patches, correctedLaplacian), -1.0);
+    addEqual(UEqn, fvm::laplacian<vector>(gammaf, U, m, g, patches, correctedLaplacian, nonOrthCoeffs), -1.0);
 
     // ...and, when `corrected`, its explicit deferred correction.
     //

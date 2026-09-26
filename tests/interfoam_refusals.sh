@@ -344,7 +344,7 @@ ORTHO="sed -i '/^laplacianSchemes/,/^}/ s/default .*/default         Gauss linea
 UNCORR="sed -i '/^laplacianSchemes/,/^}/ s/default .*/default         Gauss linear uncorrected;/; /^snGradSchemes/,/^}/ s/default .*/default         uncorrected;/' system/fvSchemes"
 arm mesh_sheared_corrected  runs    -                        "" "$SHEAR"
 arm mesh_sheared_orthogonal runs    -                        "" "$SHEAR && $ORTHO"
-arm mesh_sheared_uncorrected refused "uncorrected"           "" "$SHEAR && $UNCORR"
+arm mesh_sheared_uncorrected runs    -                        "" "$SHEAR && $UNCORR"
 arm mesh_square_uncorrected runs    -                        "" "$UNCORR"
 arm mesh_square_corrected   runs    -                        "" true
 # the host takes every gradient by its own entry -- Gauss linear, leastSquares, cellLimited over either
@@ -774,7 +774,7 @@ if [ $HAVE_GPU = 1 ]; then
     # the non-orthogonal correction runs on the device now (tests/interfoam_dambreak_vs_openfoam.sh
     # `sheared` holds it to OpenFOAM); `uncorrected` on a mesh that is not orthogonal is still refused
     arm device_sheared_corrected runs    -                        "-device" "$SHEAR"
-    arm device_sheared_uncorrected refused "uncorrected"          "-device" "$SHEAR && $UNCORR"
+    arm device_sheared_uncorrected runs    -                        "-device" "$SHEAR && $UNCORR"
     # the device loop moves no mesh and pins no pressure reference; both are refused by name there
     BASE="$BM"
     # the reason is now the SPECIFIC one -- the mesh-update stage is on the host loop only -- because

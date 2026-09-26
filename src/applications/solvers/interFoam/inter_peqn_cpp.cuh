@@ -239,6 +239,7 @@ struct PressureSolveControls
     // sets fluxRequired for p_rgh); `limited <c>` caps it. The non-orthogonal corrector loop below
     // rebuilds the matrix each pass on the p_rgh the last one left.
     bool correctedLaplacian = false;
+    bool nonOrthCoeffs = false;   // nonOrthDeltaCoeffs without the correction -- inter_ueqn_cpp.cuh:181
     scalar snGradLimitCoeff = 0;
     // grad(p_rgh)'s gradSchemes entry, which the laplacian's correction takes
     GradChoice gradPrgh;

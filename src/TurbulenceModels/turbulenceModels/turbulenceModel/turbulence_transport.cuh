@@ -83,6 +83,7 @@ struct TransportScheme
     // the implicit half moves the SOURCE while leaving the DIAGONAL exact, which no gate comparing D()
     // can see.
     bool   correctedLaplacian = false;
+    bool   nonOrthCoeffs = false;   // nonOrthDeltaCoeffs without the correction -- inter_ueqn_cpp.cuh:181
     // The field's OWN grad scheme, which correctedSnGrad's correction takes (correctedSnGrad.C:52-55).
     // A DIFFERENT lookup from limGradK above, even though both come from gradSchemes.
     scalar gradFieldLimitK    = 0.0;

@@ -337,6 +337,9 @@ InterTurbulence readInterTurbulence(
     const FoamDict& fvSolution,
     bool eulerDdt,
     bool laplacianCorrected,
+    // ...and WHICH delta coefficients: `uncorrected`/`limited 0` take nonOrthDeltaCoeffs with no
+    // correction (uncorrectedSnGrad.H:113-119). Beside the flag it belongs to, not appended.
+    bool laplacianNonOrth,
     scalar laplacianLimitCoeff,
     const std::vector<FvPatch>& patches,
     label nCells,
@@ -416,6 +419,7 @@ InterTurbulence readInterTurbulence(
         t.lesCoeffs.Ce = les->scalarOr("Ce", t.lesCoeffs.Ce);
         t.lesCoeffs.kMin = les->scalarOr("kMin", t.lesCoeffs.kMin);
         t.lesCoeffs.correctedLaplacian = laplacianCorrected;
+        t.lesCoeffs.nonOrthCoeffs = laplacianNonOrth;
         t.lesCoeffs.snGradLimitCoeff = laplacianLimitCoeff;
         t.deltaSpec = LESdelta::read(*les, file);
         {
@@ -488,6 +492,7 @@ InterTurbulence readInterTurbulence(
     // now carries the scheme's own term with the Euler line left inert. Gated on
     // validation/interFoamCyclic (`sstCN`, `lesCN`), both arms, against real OpenFOAM.
     t.coeffs.correctedLaplacian = laplacianCorrected;
+    t.coeffs.nonOrthCoeffs = laplacianNonOrth;
     t.coeffs.snGradLimitCoeff = laplacianLimitCoeff;
 
     if (t.model == InterRasModel::KOmegaSST)
@@ -1046,7 +1051,7 @@ void correctInterTurbulence(
                            t.kDiv.limiterCoeff, /*linearUpwind=*/false,
                            t.coeffs.correctedLaplacian, t.coeffs.snGradLimitCoeff, /*lm=*/nullptr,
                            &sstComp, ks.minIter, pk.relaxSecond->on, pk.relaxFirst->on, &which,
-                           &omegaSolve, &t.secondDiv, &t.secondGrad);
+                           &omegaSolve, &t.secondDiv, &t.secondGrad, t.coeffs.nonOrthCoeffs);
         // The assembled systems are WRITTEN BY THE CLOSURE (kOmegaSST_cpp.cu), at the call its stage
         // dump latched. This site wrote them on every call instead, so the files held the LAST
         // closure call while every other column in the directory held the first.

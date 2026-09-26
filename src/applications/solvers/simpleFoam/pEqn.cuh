@@ -41,6 +41,7 @@ struct PressureInput
     scalar pRefValue = 0.0;
     bool   consistent = false;           // SIMPLEC -- implemented (pEqn.H:8-16)
     bool   correctedLaplacian = false;
+    bool   nonOrthCoeffs = false;   // nonOrthDeltaCoeffs without the correction -- inter_ueqn_cpp.cuh:181
     scalar snGradLimitCoeff = 0.0;   // `limited <k> corrected` (OF limitedSnGrad)   // `corrected` laplacianSchemes
     bool   hasMRF = false;       // refused
     bool   hasFvOptions = false; // refused

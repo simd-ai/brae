@@ -149,7 +149,11 @@ SurfaceScalarField snGrad(
     // `limited <psi>` in snGradSchemes (OF fv::limitedSnGrad): the same per-face cap fvm::laplacian's
     // own snGrad takes, min(psi*|orth|/((1 - psi)*|corr| + SMALL), 1). 0 = uncapped, as elsewhere.
     // The block's coefficient, NOT laplacianSchemes' -- these are two entries for two operators.
-    scalar                        limitCoeff   = 0.0);
+    scalar                        limitCoeff   = 0.0,
+    // `uncorrected` and `limited 0` take nonOrthDeltaCoeffs WITHOUT the correction: OpenFOAM's
+    // uncorrectedSnGrad returns nonOrthDeltaCoeffs with corrected() false (uncorrectedSnGrad.H:113-126),
+    // and only orthogonalSnGrad returns deltaCoeffs. One flag ran orthogonal under both names.
+    bool                          nonOrthCoeffs = false);
 
 // fvc::interpolate of a vector field with its own patch values: linear on the internal faces, the
 // patch value on a boundary face -- what createUfIfPresent.H and fvc::correctUf build Uf from.

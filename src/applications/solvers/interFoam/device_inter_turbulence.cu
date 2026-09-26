@@ -34,25 +34,27 @@ std::vector<scalar> patchValuesOf(
 // rotated ONCE per time index, and at the first step oldTime().oldTime() is a copy of oldTime() --
 // OpenFOAM creates the missing level lazily. `second` is false under LES kEqn, which solves k alone.
 // One function for all three closures so they cannot drift on when the rotation happens.
-void rotateCnOldOld(
+// storeOldTimes for the device closure's transported scalars: ONCE per TIME INDEX, whatever the scheme and
+// however many outer correctors run. The host twin is advanceTurbulenceOldTime.
+void advanceDeviceTurbulenceOldTime(
     DeviceInterTurbulence& d,
-    const cpu::fv::CrankNicolsonClock& cn,
+    label timeIndex,
     bool second)
 {
-    if (d.cnTimeIndex == cn.timeIndex) return;
-    if (d.cnKEntry.size() == 0)
+    if (d.oldStepTimeIndex == timeIndex) return;
+    if (d.kOldStep.size() == 0)
     {
         deviceCopy(d.cnKOO, d.k);
         if (second) deviceCopy(d.cnEpsOO, d.epsilon);
     }
     else
     {
-        deviceCopy(d.cnKOO, d.cnKEntry);
-        if (second) deviceCopy(d.cnEpsOO, d.cnEpsEntry);
+        deviceCopy(d.cnKOO, d.kOldStep);
+        if (second) deviceCopy(d.cnEpsOO, d.epsOldStep);
     }
-    deviceCopy(d.cnKEntry, d.k);
-    if (second) deviceCopy(d.cnEpsEntry, d.epsilon);
-    d.cnTimeIndex = cn.timeIndex;
+    deviceCopy(d.kOldStep, d.k);
+    if (second) deviceCopy(d.epsOldStep, d.epsilon);
+    d.oldStepTimeIndex = timeIndex;
 }
 
 } // namespace
@@ -73,7 +75,8 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
     // ANY of the four entries may name PBiCG now that the two equations take their own. Built from
     // kFinal alone, a case where only the SECOND equation names `solver PBiCG; preconditioner DILU;`
     // would reach the solve with no schedule and throw -- a hole the per-equation lift would have opened.
-    if (t.kSolveFinal.pbicgDILU() || t.epsSolveFinal.pbicgDILU() || t.omegaSolveFinal.pbicgDILU())
+    if (t.kSolveFinal.pbicgDILU() || t.epsSolveFinal.pbicgDILU() || t.omegaSolveFinal.pbicgDILU()
+     || t.kSolve.pbicgDILU() || t.epsSolve.pbicgDILU() || t.omegaSolve.pbicgDILU())
     {
         d.dilu = buildDeviceDilu(m.owner(), m.neighbour(), m.nCells());
     }
@@ -461,6 +464,13 @@ void deviceCorrectInterTurbulence(
     // because the model is still constructed and validated; it simply has nothing to advance, and the
     // nut it built from validate() is the nut nuEff keeps for the whole run.
     if (t.frozen) return;
+    // the sentinels, refused rather than defaulted -- see the host twin
+    if (in.timeIndex < 0 || in.finalIter < 0)
+        throw std::runtime_error(
+            "brae interFoam (device): deviceCorrectInterTurbulence needs the step's timeIndex and "
+            "finalIter; the caller supplied " + std::to_string(in.timeIndex) + " and "
+            + std::to_string(in.finalIter) + ".");
+    advanceDeviceTurbulenceOldTime(d, in.timeIndex, /*second=*/t.model != cpu::interFoam::InterRasModel::KEqnLES);
     if (!in.Ux || !in.Uy || !in.Uz || !in.phiInt || !in.phiBnd || !in.rhoPhiInt || !in.rhoPhiBnd
      || !in.rho || !in.rhoBnd || !in.rhoOld || !in.nu || !in.nuBnd)
         throw std::runtime_error("brae interFoam (device): deviceCorrectInterTurbulence needs every input.");
@@ -523,13 +533,17 @@ void deviceCorrectInterTurbulence(
         // alpha = rho = 1 in this lineage, so there is no rho old-old to carry.
         if (in.cn)
         {
-            rotateCnOldOld(d, *in.cn, /*second=*/false);
             d.cnDdt0K.name = "ddt0(k)";
             lin.cn      = in.cn;
             lin.cnDdt0K = &d.cnDdt0K;
             lin.kOO     = &d.cnKOO;
         }
-        const cpu::interFoam::SmoothLinearSolve& ks = t.kSolveFinal;
+        // WHICH DICTIONARY THIS CORRECTOR USES, the same rule the host loop applies: `<field>Final` on
+        // the final outer corrector and `<field>` on the others (fvMatrix.C:1536-1542 for solve(),
+        // :1249-1263 for relax()). With `turbOnFinalIterOnly no` the closure runs on EVERY corrector,
+        // so this is not always the Final entry.
+        const bool fin = (in.finalIter != 0);
+        const cpu::interFoam::SmoothLinearSolve& ks = fin ? t.kSolveFinal : t.kSolve;
         // the case's own solver for k, as the two RAS branches read it
         if (ks.pbicgDILU())
         {
@@ -546,12 +560,11 @@ void deviceCorrectInterTurbulence(
         lin.relTol = ks.relTol;
         lin.maxIter = ks.maxIter;
         lin.minIter = ks.minIter;
-        lin.relaxOn = t.kRelaxFinal.on;
-        lin.relax = t.kRelaxFinal.factor;
-        // k.oldTime(): the field as it enters this call, which is what fvm::ddt reads
-        DeviceBuffer<scalar> kOld;
-        deviceCopy(kOld, d.k);
-        lin.kOld = &kOld;
+        lin.relaxOn = fin ? t.kRelaxFinal.on : t.kRelax.on;
+        lin.relax = fin ? t.kRelaxFinal.factor : t.kRelax.factor;
+        // k.oldTime(): the PREVIOUS STEP's field, advanced once per time index above -- not the field as
+        // it enters this call, which is the previous CORRECTOR's once the closure runs on every one.
+        lin.kOld = &d.kOldStep;
         const DeviceSolverPerf p = gpu::LESkEqn::correct(dm, d.dbK, dbU, d.k, d.nut, lin);
         if (in.kLog)
         {
@@ -592,7 +605,6 @@ void deviceCorrectInterTurbulence(
         // slots -- d.epsilon, d.cnEpsOO, d.cnDdt0Eps -- as every other slot on this branch does.
         if (in.cn)
         {
-            rotateCnOldOld(d, *in.cn, /*second=*/true);
             d.cnDdt0K.name   = "ddt0(k)";
             d.cnDdt0Eps.name = "ddt0(omega)";
             sin.cn          = in.cn;
@@ -616,6 +628,9 @@ void deviceCorrectInterTurbulence(
             sin.turbInletOmegaLen  = &d.turbInletEpsLen;
         }
         sin.rDeltaT = scalar(1) / in.deltaT;
+        // psi.oldTime(), per STEP -- see DeviceInterTurbulence::kOldStep
+        sin.kOldIn = &d.kOldStep;
+        sin.omegaOldIn = &d.epsOldStep;
         // the moved mesh's old volumes and its flux -- see DeviceInterTurbulenceStepInput::V0
         sin.V0         = in.V0;
         sin.meshPhiInt = in.meshPhiInt;
@@ -693,15 +708,18 @@ void deviceCorrectInterTurbulence(
         // `sstLimU`). The second field is gone; `sin.co = t.sstCoeffs` above carries the entry once.
 
         sin.correctedLaplacian = t.coeffs.correctedLaplacian;
+        sin.nonOrthCoeffs = t.coeffs.nonOrthCoeffs;
         sin.snGradLimitCoeff = t.coeffs.snGradLimitCoeff;
         // the Final entries, as the kEpsilon branch below takes them: one outer corrector, so that one
         // is the final one
-        sin.relaxEquationOmega = t.omegaRelaxFinal.on;
-        sin.relaxOmega = t.omegaRelaxFinal.factor;
-        sin.relaxEquationK = t.kRelaxFinal.on;
-        sin.relaxK = t.kRelaxFinal.factor;
-        const cpu::interFoam::SmoothLinearSolve& ks = t.kSolveFinal;
-        const cpu::interFoam::SmoothLinearSolve& os = t.omegaSolveFinal;
+        // the corrector's own entries -- see the LES branch above for the rule
+        const bool fin = (in.finalIter != 0);
+        sin.relaxEquationOmega = fin ? t.omegaRelaxFinal.on : t.omegaRelax.on;
+        sin.relaxOmega = fin ? t.omegaRelaxFinal.factor : t.omegaRelax.factor;
+        sin.relaxEquationK = fin ? t.kRelaxFinal.on : t.kRelax.on;
+        sin.relaxK = fin ? t.kRelaxFinal.factor : t.kRelax.factor;
+        const cpu::interFoam::SmoothLinearSolve& ks = fin ? t.kSolveFinal : t.kSolve;
+        const cpu::interFoam::SmoothLinearSolve& os = fin ? t.omegaSolveFinal : t.omegaSolve;
         // omegaFinal NEED NOT MATCH kFinal: fvMatrix::solve() looks the dictionary up by FIELD name
         // (fvMatrix.C:1536-1542) and kOmegaSSTBase.C:593 solves omega with its own entry, :618 k with
         // kFinal's. This branch compared all eight fields and refused any difference; the host has
@@ -847,6 +865,9 @@ void deviceCorrectInterTurbulence(
         kin.rhoOldCell = &d.onesCell;
     }
     kin.rDeltaT = scalar(1) / in.deltaT;
+    // psi.oldTime(), per STEP -- see DeviceInterTurbulence::kOldStep
+    kin.kOldIn = &d.kOldStep;
+    kin.epsOldIn = &d.epsOldStep;
     kin.nuCell = in.nu;
     kin.nuBndFace = in.nuBnd;
     kin.nuWallFace = &d.nuWall;
@@ -864,6 +885,7 @@ void deviceCorrectInterTurbulence(
     kin.Uz = in.Uz;
     kin.co = t.coeffs;
     kin.correctedLaplacian = t.coeffs.correctedLaplacian;
+    kin.nonOrthCoeffs = t.coeffs.nonOrthCoeffs;
     kin.snGradLimitCoeff = t.coeffs.snGradLimitCoeff;
     // the Final entries: the device loop runs one outer corrector, and that one is the final one
     // The turbulent inlets, as rhoSimpleFoam's hook passes them (rhoTurbulenceHook.cu:128-136):
@@ -876,12 +898,14 @@ void deviceCorrectInterTurbulence(
         kin.turbInletEpsMask = &d.turbInletEpsMask;
         kin.turbInletEpsLen  = &d.turbInletEpsLen;
     }
-    kin.relaxEquationEps = t.epsRelaxFinal.on;
-    kin.relaxEps = t.epsRelaxFinal.factor;
-    kin.relaxEquationK = t.kRelaxFinal.on;
-    kin.relaxK = t.kRelaxFinal.factor;
-    const cpu::interFoam::SmoothLinearSolve& ks = t.kSolveFinal;
-    const cpu::interFoam::SmoothLinearSolve& es = t.epsSolveFinal;
+    // the corrector's own entries -- see the LES branch above for the rule
+    const bool fin = (in.finalIter != 0);
+    kin.relaxEquationEps = fin ? t.epsRelaxFinal.on : t.epsRelax.on;
+    kin.relaxEps = fin ? t.epsRelaxFinal.factor : t.epsRelax.factor;
+    kin.relaxEquationK = fin ? t.kRelaxFinal.on : t.kRelax.on;
+    kin.relaxK = fin ? t.kRelaxFinal.factor : t.kRelax.factor;
+    const cpu::interFoam::SmoothLinearSolve& ks = fin ? t.kSolveFinal : t.kSolve;
+    const cpu::interFoam::SmoothLinearSolve& es = fin ? t.epsSolveFinal : t.epsSolve;
     // epsilonFinal NEED NOT MATCH kFinal -- see the SST branch above. kEpsilon.C:268 solves epsilon with
     // its own entry and :288 solves k with kFinal's.
     gpu::turbulence::SolveControls svEps;
@@ -975,7 +999,6 @@ void deviceCorrectInterTurbulence(
     // -- and hand the closure its two ddt0 fields
     if (in.cn)
     {
-        rotateCnOldOld(d, *in.cn, /*second=*/true);
         d.cnDdt0K.name = t.variableDensity ? "ddt0(rho,k)" : "ddt0(k)";
         d.cnDdt0Eps.name = t.variableDensity ? "ddt0(rho,epsilon)" : "ddt0(epsilon)";
         kin.cn = in.cn;

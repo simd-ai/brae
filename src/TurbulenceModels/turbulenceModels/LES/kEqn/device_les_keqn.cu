@@ -184,6 +184,7 @@ DeviceSolverPerf correct(
     sc.limitedLinear      = in.co.limitedLinear;
     sc.limiterCoeff       = in.co.limitedLinearCoeff;
     sc.correctedLaplacian = in.co.correctedLaplacian;
+    sc.nonOrthCoeffs      = in.co.nonOrthCoeffs;
     sc.snGradLimitCoeff   = in.co.snGradLimitCoeff;
     // THE PAIR: its off-diagonal, the flux k convects with there, and the diffusivity as a CELL
     // field -- a coupled face takes surfaceInterpolationScheme's pLambda*patchInternalField +

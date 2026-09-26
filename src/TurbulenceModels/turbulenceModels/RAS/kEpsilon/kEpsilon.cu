@@ -743,6 +743,7 @@ void assembleTransport(
     sc.linearUpwind       = in.linearUpwind;
     sc.luGradK            = in.luGradK;
     sc.correctedLaplacian = in.correctedLaplacian;
+    sc.nonOrthCoeffs = in.nonOrthCoeffs;
     sc.gradFieldLimitK    = in.co.gradKLimitK;
     sc.gradFieldLeastSq   = in.co.gradKLeastSq;
     sc.snGradLimitCoeff   = in.snGradLimitCoeff;
@@ -1185,8 +1186,8 @@ void correct(
     DeviceBuffer<scalar> kOld, epsOld;
     if (in.rDeltaT > scalar(0))
     {
-        deviceCopy(kOld, k);
-        deviceCopy(epsOld, epsilon);
+        deviceCopy(kOld, in.kOldIn ? *in.kOldIn : k);
+        deviceCopy(epsOld, in.epsOldIn ? *in.epsOldIn : epsilon);
     }
 
     production(st, dm, dbU, nut, in);

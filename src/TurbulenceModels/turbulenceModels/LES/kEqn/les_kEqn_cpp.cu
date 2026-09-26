@@ -81,7 +81,7 @@ SolverPerformance correct(
     }
     const label nC = m.nCells();
     const std::vector<scalar>& V = g.V();
-    const std::vector<scalar> kOld = k.internal;
+    const std::vector<scalar> kOld = solve.kOld ? *solve.kOld : k.internal;
 
     // divU = fvc::div(fvc::absolute(phi, U)) = fvc::div(phi + mesh.phi()). On a mesh that does not
     // move meshPhi is null and the absolute flux IS phi; on one that does, adding it face by face
@@ -169,7 +169,7 @@ SolverPerformance correct(
         {
             taps->DkEfff = Df.internal;
         }
-        FvScalarMatrix L = fvm::laplacian(Df, k, m, g, patches, co.correctedLaplacian);
+        FvScalarMatrix L = fvm::laplacian(Df, k, m, g, patches, co.correctedLaplacian, co.nonOrthCoeffs);
         if (co.correctedLaplacian)
         {
             std::vector<std::vector<scalar>> kb(patches.size());

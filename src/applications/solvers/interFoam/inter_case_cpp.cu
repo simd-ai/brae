@@ -397,35 +397,6 @@ NonOrthScheme readNonOrthScheme(
 }
 
 
-// interFoam's pressure laplacian, its three snGrads and the momentum laplacian take the case's
-// `corrected` and `limited` schemes now (fvm::laplacian's corrected form, fvc::snGrad's). What is NOT
-// theirs is `uncorrected`: OpenFOAM's uncorrectedSnGrad takes nonOrthDeltaCoeffs where orthogonalSnGrad
-// takes deltaCoeffs (uncorrectedSnGrad.H:91, orthogonalSnGrad.H:91), and brae's orthogonal assembly
-// takes the latter -- the same number on a mesh of rectangles, where the two coefficients coincide.
-// On a mesh of rectangles that is not a substitution: the correction vector n - d/(n.d) is zero, so
-// `corrected` and `orthogonal` are one scheme, which is why damBreak and capillaryRise agree with
-// OpenFOAM to 1e-12 under `Gauss linear corrected`. On any other mesh it IS one, it was silent, and
-// the only thing that kept it from running was that every such tutorial was refused for something else.
-void refuseUncorrectedOnSkewMesh(
-    const NonOrthScheme& laplacian,
-    const NonOrthScheme& snGrad,
-    const PrimitiveMesh& m,
-    const FvGeometry& g)
-{
-    const bool uncorrected =
-        schemeHasWord(laplacian.raw, "uncorrected") || schemeHasWord(snGrad.raw, "uncorrected");
-    if (!uncorrected) return;
-    const scalar worst = maxNonOrthogonality(m, g);
-    // round-off on a mesh of rectangles is 1e-16; one degree is 1.5e-04
-    if (worst < scalar(1e-10)) return;
-    const scalar degrees = std::acos(scalar(1) - worst) * scalar(180) / scalar(3.14159265358979323846);
-    throw std::runtime_error(
-        "brae interFoam: fvSchemes asks for `uncorrected` (laplacianSchemes `" + laplacian.raw
-        + "`, snGradSchemes `" + snGrad.raw + "`) and the mesh is non-orthogonal by up to "
-        + std::to_string(degrees) + " degrees. OpenFOAM's uncorrectedSnGrad divides by the "
-        "non-orthogonal delta coefficient where brae's orthogonal assembly divides by |d|; the two "
-        "differ on this mesh. Refused rather than run `orthogonal` under the name `uncorrected`.");
-}
 
 // gradSchemes. Every entry must be one of the four shapes the host operators take -- `Gauss linear`,
 // `leastSquares`, or `cellLimited` over either -- and each gradient interFoam takes is resolved by the
@@ -782,7 +753,6 @@ InterFields buildInterFields(const std::string&          caseDir,
 
         f.laplacianScheme = readNonOrthScheme(all, "laplacianSchemes");
         f.snGradScheme = readNonOrthScheme(all, "snGradSchemes");
-        refuseUncorrectedOnSkewMesh(f.laplacianScheme, f.snGradScheme, m, g);
         refuseUnportedGradSchemes(all);
         refuseUnportedInterpolationSchemes(all);
         // each gradient by the name its call site asks for (fvc::grad(vf) -> `grad(<vf.name()>)`)
@@ -1160,7 +1130,8 @@ InterFields buildInterFields(const std::string&          caseDir,
     }
     f.turbulence = readInterTurbulence(caseDir, startDir, fvSolution,
                                        f.ddtU == DdtScheme::Euler || f.ddtU == DdtScheme::CrankNicolson,
-                                       f.laplacianScheme.corrected, f.laplacianScheme.limitCoeff,
+                                       f.laplacianScheme.corrected, f.laplacianScheme.nonOrthCoeffs,
+                                       f.laplacianScheme.limitCoeff,
                                        patches, nC, &m, &g, &sharedWallDist,
                                        f.pimple.nOuterCorrectors, f.pimple.turbOnFinalIterOnly);
     // `turbOnFinalIterOnly no` WITH MORE THAN ONE OUTER CORRECTOR RUNS NOW, on both arms. Two halves:

@@ -307,6 +307,7 @@ struct DeviceInterStepControls
     // coefficient, 0 = unlimited) for the p_rgh laplacian -- see DeviceInterPressureInput
     int    nNonOrthogonalCorrectors = 0;
     bool   correctedLaplacian = false;
+    bool   nonOrthCoeffs = false;   // nonOrthDeltaCoeffs without the correction -- inter_ueqn_cpp.cuh:181
     scalar snGradLimitCoeff = 0;
     bool   momentumPredictor = true;         // damBreak sets this OFF
     scalar relaxU            = 1;

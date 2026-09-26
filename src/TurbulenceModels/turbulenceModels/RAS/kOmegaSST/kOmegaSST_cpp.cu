@@ -436,7 +436,8 @@ void correct(
     const LinearSolverChoice*      which,
     const EqnSolveSetting*         omegaSolve,
     const EqnDivScheme*            omegaDiv,
-    const EqnGradScheme*           omegaGrad)
+    const EqnGradScheme*           omegaGrad,
+    bool                           nonOrthCoeffs)
 {
     // OMEGA'S OWN CONVECTION SCHEME, resolved ONCE so the assembly and the `bounded` term cannot read
     // different answers. Absent it, omega's is k's -- what a caller that still refuses a mismatch means.
@@ -565,8 +566,8 @@ void correct(
                 "branch, which brae does not carry.");
     }
     const scalar rDeltaT = (comp && !cn) ? comp->rDeltaT : scalar(0);
-    const std::vector<scalar> kOld     = k.internal;
-    const std::vector<scalar> omegaOld = omega.internal;
+    const std::vector<scalar> kOld     = (comp && comp->kOldIn)     ? *comp->kOldIn     : k.internal;
+    const std::vector<scalar> omegaOld = (comp && comp->omegaOldIn) ? *comp->omegaOldIn : omega.internal;
     auto rhoOldAt = [&](label cc) { return (comp && comp->rhoOld) ? (*comp->rhoOld)[cc] : rhoAt(cc); };
     // this->nu() varies with temperature in the compressible lineage; the incompressible one has a
     // single constant.
@@ -885,7 +886,7 @@ void correct(
             // The laplacian with BOTH halves of `corrected`, then subtracted from the equation. The
             // explicit correction goes into the LAPLACIAN's own source first, so the -1.0 below carries
             // it into the transport equation with the right sign.
-            FvScalarMatrix L = fvm::laplacian(Df, omega, m, g, patches, correctedLaplacian);
+            FvScalarMatrix L = fvm::laplacian(Df, omega, m, g, patches, correctedLaplacian, nonOrthCoeffs);
             if (correctedLaplacian)
             {
                 std::vector<std::vector<scalar>> vb(patches.size());
@@ -1047,7 +1048,7 @@ void correct(
             // The laplacian with BOTH halves of `corrected`, then subtracted from the equation. The
             // explicit correction goes into the LAPLACIAN's own source first, so the -1.0 below carries
             // it into the transport equation with the right sign.
-            FvScalarMatrix L = fvm::laplacian(Df, k, m, g, patches, correctedLaplacian);
+            FvScalarMatrix L = fvm::laplacian(Df, k, m, g, patches, correctedLaplacian, nonOrthCoeffs);
             if (correctedLaplacian)
             {
                 std::vector<std::vector<scalar>> vb(patches.size());

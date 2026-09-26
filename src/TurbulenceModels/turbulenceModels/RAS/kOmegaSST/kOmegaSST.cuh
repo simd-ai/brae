@@ -138,6 +138,7 @@ struct KOmegaSSTInput
     bool   linearUpwind  = false;      // `Gauss linearUpwind <name>` on the pair (TransportScheme)
     scalar luGradK       = 0.0;        // ...the cellLimited coefficient of the gradient it NAMES
     bool   correctedLaplacian = false;
+    bool   nonOrthCoeffs = false;   // nonOrthDeltaCoeffs without the correction -- inter_ueqn_cpp.cuh:181
     scalar snGradLimitCoeff   = 0.0;
     // grad(U)'s cellLimited coefficient lives in `co` and NOWHERE ELSE. It used to be here as well --
     // one fvSchemes entry in two fields of one struct -- and interFoam's site filled the coeffs half
@@ -162,6 +163,11 @@ struct KOmegaSSTInput
     // gsOmega UNCONDITIONALLY, so a case naming PBiCG ran symGaussSeidel sweeps under PBiCG's
     // tolerance and said nothing -- the same silent substitution, in the twin that was not looked at.
     bool   pbicgKE = false;
+    // psi.oldTime(): the PREVIOUS STEP's field, which the caller supplies once `turbOnFinalIterOnly no`
+    // makes the closure run on every outer corrector. Null keeps the field at entry -- identical while the
+    // closure runs once per step (GeometricField.C:904-917; the host twins carry the same note).
+    const DeviceBuffer<scalar>* kOldIn = nullptr;
+    const DeviceBuffer<scalar>* omegaOldIn = nullptr;
     // THE SECOND EQUATION'S OWN SOLVER SETTING. `fvMatrix::solve()` looks the solver dictionary up by
     // FIELD name (fvMatrix.C:1536-1542), so `omegaFinal` may name different tolerances, sweep counts or a
     // different solver from `kFinal` and OpenFOAM honours each (kEpsilon.C:268 / kOmegaSSTBase.C:593 solve

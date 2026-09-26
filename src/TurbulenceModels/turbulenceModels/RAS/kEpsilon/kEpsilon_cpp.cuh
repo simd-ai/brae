@@ -169,6 +169,14 @@ struct Compressible
     const std::vector<scalar>*              rhoOO    = nullptr;
     const std::vector<scalar>*              epsOO    = nullptr;
     const std::vector<scalar>*              kOO      = nullptr;
+    // psi.oldTime(): the field at this TIME INDEX's first correct(), which is NOT the field at entry once
+    // `turbOnFinalIterOnly no` makes the closure run on every outer corrector. OpenFOAM's
+    // GeometricField::storeOldTimes() is guarded on `timeIndex_ != time().timeIndex()`
+    // (GeometricField.C:904-917), so the old level is the PREVIOUS STEP's for every corrector of a step.
+    // Null keeps the old behaviour -- the field at entry -- which is identical while the closure runs once
+    // per step and first order in dt wrong as soon as it does not.
+    const std::vector<scalar>*              kOldIn   = nullptr;
+    const std::vector<scalar>*              epsOldIn = nullptr;
     // A MOVING MESH (EulerDdtScheme::fvmDdt under mesh().moving()): the source takes the old volumes,
     // rDeltaT*psi.oldTime()*V0, where the diagonal keeps V; and divU is the divergence of the ABSOLUTE
     // flux, fvc::div(fvc::absolute(phi, U)) = div(phi + mesh.phi()) (kEpsilon.C:232-235). Null on a

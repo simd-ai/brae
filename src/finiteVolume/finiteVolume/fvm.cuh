@@ -58,13 +58,22 @@ FvMatrix<T> laplacian(
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& patches,
-    bool corrected)
+    bool corrected,
+    // `uncorrected` and `limited 0` TAKE nonOrthDeltaCoeffs WITHOUT the correction. OpenFOAM separates
+    // the coefficient choice from whether the correction is added: correctedSnGrad and uncorrectedSnGrad
+    // BOTH return nonOrthDeltaCoeffs (correctedSnGrad.H:108-114, uncorrectedSnGrad.H:113-119) and differ
+    // only in corrected(); orthogonalSnGrad is the one that returns deltaCoeffs
+    // (orthogonalSnGrad.H:113-119). With ONE flag this ran ORTHOGONAL under the name `uncorrected`, and
+    // under `limited 0` as well, which no refusal covered. Appended LAST and defaulted false, so not one
+    // of the 96 fvm::laplacian or 32 fvc::snGrad call sites moves.
+    bool nonOrthCoeffs = false)
 {
     const label nC  = m.nCells();
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
     const std::vector<label>& nei = m.neighbour();
-    const std::vector<scalar>& dc    = corrected ? g.nonOrthDeltaCoeffs() : g.deltaCoeffs();
+    const std::vector<scalar>& dc    = (corrected || nonOrthCoeffs) ? g.nonOrthDeltaCoeffs()
+                                                                    : g.deltaCoeffs();
     const std::vector<scalar>& magSf = g.magSf();
 
     FvMatrix<T> M;
