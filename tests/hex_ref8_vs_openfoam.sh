@@ -12,12 +12,13 @@
 # held against OpenFOAM without instrumenting anything. If a later disagreement will not localise, THEN
 # copy the class and add writes (the of-instrument pattern); not before.
 #
-# TWO STAGES, and today the gate runs the first:
+# TWO STAGES, and both now run on the refinement arms:
 #   5b-1  cellAddedCells, cellLevel, pointLevel, and the point and cell counts. No face work needed.
-#   5b-2  the mapPolyMesh and the new mesh. SKIPPED by name until section 9 exists, and the harness
-#         prints the skip count so it cannot quietly become zero coverage.
+#   5b-2  the mapPolyMesh and the new mesh, from section 9's faces.
+# The unrefinement arms still skip TWO checks by name -- removeFaces' compatibleRemoves and its
+# setRefinement -- and the harness prints the skip count so it cannot quietly become zero coverage.
 #
-# THREE ARMS on laminar/damBreak's own blockMesh (2268 cells, 9176 faces, 4746 points):
+# SEVEN ARMS on laminar/damBreak's own blockMesh (2268 cells, 9176 faces, 4746 points):
 #   one       cell 0 alone. One 8-way split: 2268 -> 2275 cells, 4746 -> 4765 points (1 cell centre + 6
 #             face mids + 12 edge mids), 9176 -> 9206 faces (12 internal + 6 faces becoming 4).
 #   block     96 cells in a box -- a CONTIGUOUS block, so refined cells share faces, edges and points
@@ -31,6 +32,10 @@
 #             arm exists. The tool refines once, writes the resulting mesh, puts its cellLevel and
 #             pointLevel in the dump, and refines the children: the levels are then non-uniform, the 2:1
 #             closure adds cells of its own (768 requested -> 800 consistent) and the arithmetic is live.
+#   unrefine, unrefine3, unrefineTwice
+#             the arms that REMOVE cells, each described at its own call site below. They are what gate
+#             setUnrefinement and unit 6's remapping half, and each exists because the one before it was
+#             measured to be blind to something.
 # FOUR FAIL-PROOFS, and the whole point is WHICH ARM SEES THEM. Every one is blind on `one`, `block` and
 # `scattered` -- the level-0 arms -- and caught on `twice`:
 #   the face mid point's level taken as its master's +1, not faceAnchorLevel+1
@@ -77,15 +82,40 @@
 #                                     alive again below since is addedCells[0]", so the clear is overwritten
 #   historyUpdateMesh keeps the old cell index instead of renumbering
 #   updateLevels does not remap at all
-#                                     both green, and this is the one that matters: MEASURED from
-#                                     OpenFOAM's own dumps, a pure refinement leaves reverseCellMap AND
-#                                     reversePointMap the IDENTITY (2275/4765 on `one`, 8540/12929 on
-#                                     `twice`), because the compaction only renumbers when cells are
-#                                     REMOVED. So unit 6's REMAPPING half cannot be witnessed by any
-#                                     refinement arm; the unrefinement arm is what turns it on.
-# So what unit 6 holds today is the history's PRODUCTION -- visibleCells, parent and addedCells against
-# OpenFOAM's on four arms, with addedCells' fail-proof red on all of them -- and the levels after
-# changeMesh. Its remapping half is carried but ungated, and that is stated rather than implied.
+#                                     green on every REFINEMENT arm, and that is a property of the
+#                                     fixture and not of the code: MEASURED from OpenFOAM's own dumps, a
+#                                     pure refinement leaves reverseCellMap AND reversePointMap the
+#                                     IDENTITY (2275/4765 on `one`, 8540/12929 on `twice`), because the
+#                                     compaction only renumbers when cells are REMOVED. The three
+#                                     unrefinement arms are what turn them on -- see unit 6b-1 below.
+# UNIT 6b-1's FAIL-PROOFS -- setUnrefinement's levels and history, and unit 6's remapping half with them.
+# Every one is green on `one` and `twice` (a refinement removes nothing), and the interesting column is
+# WHICH unrefinement arm sees it:
+#                                                             unrefine unrefine3 unrefineTwice
+#   combineCells takes the master's own index as the parent       3 F      3 F        3 F
+#   setUnrefinementLevels does not decrement the cell level       2 F      2 F        2 F
+#   the master cell is the MAX of the eight, not the min          2 F      2 F        2 F
+#   combineCells reads the parent index AFTER freeing the
+#     children (OpenFOAM's own ordering, :1652-1673)              3 F      3 F        3 F
+#   the parent's addedCells is left as it stands, not cleared    throw    throw      throw
+#   historyUpdateMesh keeps the old cell index                   GREEN     1 F        1 F
+#   updateLevels does not remap the CELL levels                  GREEN     1 F        1 F
+#   updateLevels does not remap the POINT levels                 GREEN    GREEN       1 F
+#   freeSplitCell ERASES the child instead of writing -1 in its
+#     positional slot                                            GREEN    GREEN      GREEN
+# Two of those need saying rather than leaving. The `unrefine` column is green on the three remapping
+# lines because undoing EVERY split puts the mesh back exactly and every survivor keeps its own index --
+# that measurement is why `unrefine3` exists. `unrefine3` is green on the POINT remap because a
+# once-refined mesh's new points are one uniform level-1 block and removals only shuffle within it, so a
+# resize reproduces OpenFOAM's pointLevelFinal exactly -- that measurement is why `unrefineTwice` exists,
+# and there 558 of 6054 renumbered points land in a slot that held a different level. The last line is
+# NOT witnessed by any arm and will not be: setUnrefinement frees eight SIBLINGS, whose parent's
+# addedCells is then cleared outright, so the positional -1 is overwritten either way. It is transcribed
+# because refinementHistory's other callers (compact, and a partial free) do read those slots
+# positionally; a fixture that reaches one of them would tell them apart, and none of these seven does.
+# So unit 6 now holds BOTH halves: the history's production on seven arms and its remapping on three, and
+# unit 6b-1 holds setUnrefinement's levels and history. What is still skipped, by name, is removeFaces --
+# the faces and the mesh an unrefinement produces (units 6b-2 and 6b-3).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_hex_ref8_vs_openfoam"
@@ -151,6 +181,29 @@ arm scattered -cells "$W/scattered.cells"      || rc=1
 # apart; fail-proofs on each stayed GREEN on all three. This one refines the block, hands brae the
 # resulting mesh AND its levels, and refines the children.
 arm twice     -box '(0.1 0.0 -1) (0.2 0.1 1)' -times 2 -meshOut . || rc=1
+# ...AND THE UNREFINE ARM, which is the only one that REMOVES cells. A refinement leaves reverseCellMap and
+# reversePointMap the IDENTITY (measured: 2275/4765 on `one`, 8540/12929 on `twice`), so unit 6's remapping
+# half was carried but could not be witnessed by any arm above. Here the maps have 2940 and 5787 entries and
+# neither is the identity, and cellsFromCellsMap carries 96 merge sets. MEASURED: 2940 -> 2268 cells,
+# 11540 -> 9176 faces, 5787 -> 4746 points -- the block refined and then put back.
+arm unrefine  -box '(0.1 0.0 -1) (0.2 0.1 1)' -unrefine -meshOut . || rc=1
+# ...AND A PARTIAL ONE, because `unrefine` above is still not enough. Undoing EVERY split puts the mesh back
+# exactly, and then every surviving cell keeps its own index -- the children that go were appended at the
+# end -- so reverseCellMap is the IDENTITY on its live part and the remap cannot be told from a truncation.
+# MEASURED: fail-proofs on updateLevels' remap and historyUpdateMesh's renumber stayed GREEN on `unrefine`.
+# Undoing every THIRD split leaves the removed cells INTERLEAVED with survivors: 2940 -> 2716 cells, and
+# 448 cells and 905 points are genuinely RENUMBERED. That is the arm that gates unit 6's remapping half.
+arm unrefine3 -box '(0.1 0.0 -1) (0.2 0.1 1)' -unrefine -unrefineStride 3 -meshOut . || rc=1
+# ...AND ONE MORE, because `unrefine3` still cannot witness the POINT half of the remap. MEASURED off
+# OpenFOAM's own maps: on unrefine3 all 905 renumbered points are level 1 and every slot they move into
+# held level 1 too, so a resize that keeps the old ordering gives OpenFOAM's pointLevelFinal exactly --
+# a once-refined mesh appends all its new points in one uniform-level block, and removals only shuffle
+# within it. Refine TWICE first and the split points span both levels (level-1 splits left by the 2:1
+# closure and level-2 splits), so removals sit in the level-1 block too and level-2 survivors shift
+# across the boundary: 8540 -> 6748 cells, 12929 -> 11844 points, 6054 points and 3787 cells renumbered,
+# of which 558 points and 1435 cells land in a slot that held a DIFFERENT level. That is what turns the
+# pointLevel remap on.
+arm unrefineTwice -box '(0.1 0.0 -1) (0.2 0.1 1)' -times 2 -unrefine -unrefineStride 3 -meshOut . || rc=1
 
 echo "hex_ref8_vs_openfoam: rc $rc"
 exit $rc

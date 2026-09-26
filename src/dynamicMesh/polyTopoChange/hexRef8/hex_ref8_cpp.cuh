@@ -273,6 +273,49 @@ void storeRefinementHistory(
     const std::vector<std::vector<label>>& cellAddedCells,
     label                                  nCellsAfterSplit);
 
+// ----------------------------------------------------------------------------------------------
+// UNIT 6b: UNREFINEMENT. hexRef8::setUnrefinement is 198 lines, but almost all of its topology is
+// delegated to a `removeFaces` engine -- `compatibleRemoves` (178 lines) and that class's own
+// `setRefinement` (759) -- so the real dependency is about 1,150 lines. Split where the oracle is, and
+// both of removeFaces' entry points are PUBLIC, which is what makes the middle piece gateable alone:
+//   6b-1  setUnrefinement's own half: the cell LEVELS come down and the HISTORY is combined.
+//         Oracle: cellLevel and the history after setUnrefinement, which hexRef8 exposes.
+//   6b-2  removeFaces::compatibleRemoves -- which cells merge into which region and which faces go.
+//         Oracle: its three outputs, dumped directly because the function is public.
+//   6b-3  removeFaces::setRefinement (759). Oracle: the map and the mesh.
+//
+// AND THIS IS THE ARM THAT GATES UNIT 6's REMAPPING HALF. A refinement leaves reverseCellMap and
+// reversePointMap the IDENTITY -- measured -- so `updateLevels` and `historyUpdateMesh` were carried but
+// unwitnessed. An unrefinement REMOVES cells: on the gate's own fixture the maps have 2940 and 5787
+// entries and neither is the identity, and cellsFromCellsMap carries 96 merge sets.
+
+// refinementHistory::freeSplitCell (:1607-1648). Detaches the entry from its parent -- which is why the
+// parent's addedCells gets a -1 rather than shrinking -- marks it free with parent -2, and pushes it onto
+// the free list. That push is what allocateSplitCell later pops from the BACK.
+void freeSplitCell(
+    History& h,
+    label    index);
+
+// refinementHistory::combineCells (:1652-1673). The eight children go away and their PARENT becomes live
+// again at the master cell. The parent's addedCells pointer is reset, not cleared entry by entry.
+void combineCells(
+    History&                  h,
+    label                     masterCelli,
+    const std::vector<label>& combinedCells);
+
+// hexRef8::setUnrefinement's own half (:5780-5797): for every split point, the eight cells around it drop
+// one refinement level and the history combines them into their master -- which is `min(pointCells)`.
+// POINT levels are untouched, and OpenFOAM says why: the points "either get removed or stay at the same
+// position".
+//
+// The topology -- which faces go and which cells merge -- is removeFaces' and is NOT here. This function
+// therefore does not touch `a`; it is the level and history half alone, which is what 6b-1 gates.
+void setUnrefinementLevels(
+    const MeshView&           v,
+    Levels&                   lv,
+    History&                  h,
+    const std::vector<label>& splitPointLabels);
+
 }   // namespace hexRef8
 }   // namespace cpu
 }   // namespace brae

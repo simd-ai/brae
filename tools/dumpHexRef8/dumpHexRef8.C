@@ -33,6 +33,8 @@
 #include "polyMesh.H"
 #include "hexRef8.H"
 #include "refinementHistory.H"
+#include "removeFaces.H"
+#include "unitConversion.H"
 #include "polyTopoChange.H"
 #include "mapPolyMesh.H"
 #include "OFstream.H"
@@ -88,6 +90,9 @@ int main(int argc, char *argv[])
     argList::addOption("cellsOut", "file", "where to write the consistent set (default hexRef8.cells)");
     argList::addOption("times", "int", "how many refinements to run; the dump describes the LAST");
     argList::addOption("meshOut", "dir", "write the mesh as it stood BEFORE the last refinement here");
+    argList::addBoolOption("unrefine", "after the refinements, UNREFINE the split points and dump that");
+    argList::addOption("unrefineStride", "int",
+                       "unrefine only every Nth split point, so survivors are RENUMBERED");
 
     #include "setRootCase.H"
     #include "createTime.H"
@@ -211,6 +216,171 @@ int main(int argc, char *argv[])
     const label nPreCells = mesh.nCells();
     const label nPreFaces = mesh.nFaces();
     const label nPrePoints = mesh.nPoints();
+
+    // ---- THE UNREFINEMENT ARM ---------------------------------------------------------------------
+    // Refine first (the passes above have already run), then unrefine the split points -- which is the
+    // only way to reach a change that REMOVES cells, and so the only way the reverse maps stop being the
+    // identity. A refinement leaves them the identity, measured, so unit 6's remapping half cannot be
+    // gated without this.
+    if (args.found("unrefine"))
+    {
+        // one refinement first, so there is something to undo
+        {
+            polyTopoChange mod(mesh);
+            meshCutter.setRefinement(cellsToRefine, mod);
+            autoPtr<mapPolyMesh> m2(mod.changeMesh(mesh, false));
+            mesh.updateMesh(*m2);
+            meshCutter.updateMesh(*m2);
+        }
+        if (args.found("meshOut"))
+        {
+            mesh.setInstance("constant");
+            mesh.polyMesh::write();
+            Info<< "wrote the pre-unrefinement mesh: " << mesh.nCells() << " cells" << endl;
+        }
+        const labelList uPreCellLevel(meshCutter.cellLevel());
+        const labelList uPrePointLevel(meshCutter.pointLevel());
+        labelList uPreHistVisible(meshCutter.history().visibleCells());
+        labelList uPreHistParent(meshCutter.history().splitCells().size());
+        labelListList uPreHistAdded(meshCutter.history().splitCells().size());
+        forAll(meshCutter.history().splitCells(), i)
+        {
+            const auto& sc = meshCutter.history().splitCells()[i];
+            uPreHistParent[i] = sc.parent_;
+            if (sc.addedCellsPtr_)
+            {
+                uPreHistAdded[i].setSize(8);
+                forAll(sc.addedCellsPtr_(), j) uPreHistAdded[i][j] = sc.addedCellsPtr_()[j];
+            }
+        }
+        const label uNOldCells = mesh.nCells();
+        const label uNOldFaces = mesh.nFaces();
+        const label uNOldPoints = mesh.nPoints();
+
+        // which points can be unsplit, through OpenFOAM's own two steps -- both already ported in brae
+        // and gated elsewhere, so this arm is about setUnrefinement and not about the selection
+        labelList allSplit(meshCutter.getSplitPoints());
+        // UNREFINING EVERY SPLIT POINT PUTS THE MESH BACK EXACTLY, and then every surviving cell keeps its
+        // own index: the children that go are the ones appended at the end, so reverseCellMap is the
+        // IDENTITY on its live part and the remap is indistinguishable from a truncation. MEASURED --
+        // fail-proofs on updateLevels' remap and historyUpdateMesh's renumber both stayed green on such an
+        // arm. Unrefining only every Nth split point leaves removed cells INTERLEAVED with survivors, and
+        // then the survivors really are renumbered.
+        const label stride = args.getOrDefault<label>("unrefineStride", 1);
+        if (stride > 1)
+        {
+            DynamicList<label> some;
+            forAll(allSplit, i)
+            {
+                if ((i % stride) == 0) some.append(allSplit[i]);
+            }
+            Info<< "unrefineStride " << stride << ": " << some.size() << " of "
+                << allSplit.size() << " split points" << endl;
+            allSplit = some;
+        }
+        const labelList splitPoints(meshCutter.consistentUnrefinement(allSplit, false));
+        Info<< "unrefine: " << allSplit.size() << " split points, "
+            << splitPoints.size() << " consistent" << endl;
+
+        // compatibleRemoves is PUBLIC on removeFaces, so its three outputs can be dumped and gated on
+        // their own rather than only through the mesh they produce
+        removeFaces faceRemover(mesh, Foam::cos(degToRad(45.0)));
+        labelHashSet splitFaces(12*splitPoints.size());
+        for (const label pointi : splitPoints)
+        {
+            splitFaces.insert(mesh.pointFaces()[pointi]);
+        }
+        labelList cellRegion, cellRegionMaster, facesToRemove;
+        faceRemover.compatibleRemoves(splitFaces.toc(), cellRegion, cellRegionMaster, facesToRemove);
+
+        polyTopoChange uMod(mesh);
+        meshCutter.setUnrefinement(splitPoints, uMod);
+        const labelList uCellLevelAfterSet(meshCutter.cellLevel());
+        const labelList uPointLevelAfterSet(meshCutter.pointLevel());
+        labelList uHistVisible(meshCutter.history().visibleCells());
+        labelList uHistParent(meshCutter.history().splitCells().size());
+        labelListList uHistAdded(meshCutter.history().splitCells().size());
+        forAll(meshCutter.history().splitCells(), i)
+        {
+            const auto& sc = meshCutter.history().splitCells()[i];
+            uHistParent[i] = sc.parent_;
+            if (sc.addedCellsPtr_)
+            {
+                uHistAdded[i].setSize(8);
+                forAll(sc.addedCellsPtr_(), j) uHistAdded[i][j] = sc.addedCellsPtr_()[j];
+            }
+        }
+        autoPtr<mapPolyMesh> uMapPtr(uMod.changeMesh(mesh, false));
+        const mapPolyMesh& uMap = uMapPtr();
+        meshCutter.updateMesh(uMap);
+
+        OFstream uos(outFile);
+        uos.precision(17);
+        uos << "mode unrefine" << nl;
+        uos << "nOldPoints " << uNOldPoints << nl;
+        uos << "nOldFaces " << uNOldFaces << nl;
+        uos << "nOldCells " << uNOldCells << nl;
+        uos << "nPoints " << mesh.nPoints() << nl;
+        uos << "nFaces " << mesh.nFaces() << nl;
+        uos << "nInternalFaces " << mesh.nInternalFaces() << nl;
+        uos << "nCells " << mesh.nCells() << nl;
+        writeLabels(uos, "preCellLevel", uPreCellLevel);
+        writeLabels(uos, "prePointLevel", uPrePointLevel);
+        writeLabels(uos, "preHistoryVisibleCells", uPreHistVisible);
+        writeLabels(uos, "preHistoryParent", uPreHistParent);
+        writeListList(uos, "preHistoryAddedCells", uPreHistAdded);
+        writeLabels(uos, "allSplitPoints", allSplit);
+        writeLabels(uos, "splitPoints", splitPoints);
+        writeLabels(uos, "splitFaces", splitFaces.sortedToc());
+        writeLabels(uos, "cellRegion", cellRegion);
+        writeLabels(uos, "cellRegionMaster", cellRegionMaster);
+        writeLabels(uos, "facesToRemove", facesToRemove);
+        writeLabels(uos, "cellLevelAfterSet", uCellLevelAfterSet);
+        writeLabels(uos, "pointLevelAfterSet", uPointLevelAfterSet);
+        writeLabels(uos, "historyVisibleCellsAfterSet", uHistVisible);
+        writeLabels(uos, "historyParentAfterSet", uHistParent);
+        writeListList(uos, "historyAddedCellsAfterSet", uHistAdded);
+        writeLabels(uos, "pointMap", uMap.pointMap());
+        writeLabels(uos, "faceMap", uMap.faceMap());
+        writeLabels(uos, "cellMap", uMap.cellMap());
+        writeLabels(uos, "reversePointMap", uMap.reversePointMap());
+        writeLabels(uos, "reverseFaceMap", uMap.reverseFaceMap());
+        writeLabels(uos, "reverseCellMap", uMap.reverseCellMap());
+        {
+            labelList flips(uMap.flipFaceFlux().sortedToc());
+            writeLabels(uos, "flipFaceFlux", flips);
+        }
+        writeObjectMaps(uos, "cellsFromCellsMap", uMap.cellsFromCellsMap());
+        writeObjectMaps(uos, "facesFromFacesMap", uMap.facesFromFacesMap());
+        writeObjectMaps(uos, "pointsFromPointsMap", uMap.pointsFromPointsMap());
+        writeLabels(uos, "cellLevelFinal", meshCutter.cellLevel());
+        writeLabels(uos, "pointLevelFinal", meshCutter.pointLevel());
+        {
+            const refinementHistory& h = meshCutter.history();
+            uos << "historyActive " << (h.active() ? 1 : 0) << nl;
+            writeLabels(uos, "historyVisibleCells", h.visibleCells());
+            uos << "historyParent " << h.splitCells().size();
+            for (const auto& sc : h.splitCells()) uos << ' ' << sc.parent_;
+            uos << nl;
+            uos << "historyAddedCells " << h.splitCells().size() << nl;
+            for (const auto& sc : h.splitCells())
+            {
+                if (sc.addedCellsPtr_)
+                {
+                    uos << "  8";
+                    for (const label v : sc.addedCellsPtr_()) uos << ' ' << v;
+                }
+                else { uos << "  0"; }
+                uos << nl;
+            }
+        }
+        Info<< "wrote " << outFile << nl
+            << "cells " << uNOldCells << " -> " << mesh.nCells()
+            << ", faces " << uNOldFaces << " -> " << mesh.nFaces()
+            << ", points " << uNOldPoints << " -> " << mesh.nPoints() << endl;
+        Info<< "End" << nl << endl;
+        return 0;
+    }
 
     // ---- OpenFOAM's own refinement ----------------------------------------------------------------
     polyTopoChange meshMod(mesh);

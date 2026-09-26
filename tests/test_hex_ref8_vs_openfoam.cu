@@ -60,51 +60,14 @@ Dump readDump(const std::string& path)
     Dump d;
     std::ifstream is(path);
     if (!is) { std::printf("  FAIL: cannot open %s\n", path.c_str()); ++failures; return d; }
-    const char* blocks[] = {"cellAddedCells", "pointsFromPointsMap", "facesFromPointsMap",
-                            "facesFromEdgesMap", "facesFromFacesMap", "cellsFromPointsMap",
-                            "cellsFromEdgesMap", "cellsFromFacesMap", "cellsFromCellsMap",
-                            "points", "faces", "patches", "historyAddedCells", "preHistoryAddedCells"};
-    // 5b-2 reads the mesh the refinement produced, so the face and patch blocks are parsed now
-    (void)0;
     std::string line;
     while (std::getline(is, line))
     {
         std::istringstream ls(line);
         std::string key;
         if (!(ls >> key)) continue;
-        bool isBlock = false;
-        for (const char* b : blocks) if (key == b) isBlock = true;
         label n = 0;
         if (!(ls >> n)) continue;
-        if (isBlock)
-        {
-            // one entry per following line; only cellAddedCells is read back as labels here, the
-            // others are 5b-2's and are consumed as raw lines
-            std::vector<std::vector<label>> v;
-            v.reserve(static_cast<std::size_t>(n));
-            for (label i = 0; i < n; ++i)
-            {
-                std::getline(is, line);
-                std::istringstream rs(line);
-                if (key == "cellAddedCells" || key == "faces" || key == "historyAddedCells" || key == "preHistoryAddedCells")
-                {
-                    label k = 0;
-                    rs >> k;
-                    std::vector<label> e(static_cast<std::size_t>(k));
-                    for (label j = 0; j < k; ++j) rs >> e[static_cast<std::size_t>(j)];
-                    v.push_back(e);
-                }
-                else if (key == "patches")
-                {
-                    std::string nm; label st = 0, sz = 0;
-                    rs >> nm >> st >> sz;
-                    v.push_back({st, sz});
-                }
-            }
-            if (key == "cellAddedCells" || key == "faces" || key == "patches"
-             || key == "historyAddedCells" || key == "preHistoryAddedCells") d.listLists[key] = v;
-            continue;
-        }
         if ((key.rfind('n', 0) == 0 && key.size() > 1
           && std::isupper(static_cast<unsigned char>(key[1])))
          || key == "historyActive")
@@ -112,9 +75,78 @@ Dump readDump(const std::string& path)
             d.scalars[key] = n;
             continue;
         }
-        std::vector<label> v(static_cast<std::size_t>(n));
-        for (label i = 0; i < n; ++i) ls >> v[static_cast<std::size_t>(i)];
-        d.lists[key] = v;
+        // BLOCK OR FLAT LIST, decided by the dump's own SHAPE and not by a list of key names. The tool
+        // writes a flat list as `name N v0 v1 ...` on one line and a block as `name N` followed by N
+        // lines. So: nothing left on the line after N means a block.
+        //
+        // IT USED TO BE A LIST OF NAMES, and that cost two rounds of the same bug: a block whose key was
+        // not in the list was read as a flat list and silently dropped, and the comparison that wanted it
+        // then reported "the dump has no ..." or, worse, a size mismatch that looked like a port defect.
+        // `historyAddedCellsAfterSet` was the second one. A structural test cannot be forgotten.
+        std::string rest;
+        std::getline(ls, rest);
+        const bool isBlock = (rest.find_first_not_of(" \t\r") == std::string::npos);
+        if (!isBlock)
+        {
+            std::vector<label> v(static_cast<std::size_t>(n));
+            std::istringstream vs(line);
+            std::string k2; label n2 = 0;
+            vs >> k2 >> n2;
+            for (label i = 0; i < n; ++i) vs >> v[static_cast<std::size_t>(i)];
+            d.lists[key] = v;
+            continue;
+        }
+        // ONE GENUINE AMBIGUITY: a FLAT list with zero entries (`flipFaceFlux 0`) is written exactly like
+        // a BLOCK with zero entries, and no structural test can separate them. So a zero-length one is
+        // stored as BOTH -- an empty flat list and an empty block -- which is correct for either reader.
+        // Measured: `flipFaceFlux` is empty on every refinement arm, and treating it as a block alone made
+        // all four report "the dump has no flipFaceFlux".
+        if (n == 0)
+        {
+            d.lists[key] = std::vector<label>();
+            d.listLists[key] = std::vector<std::vector<label>>();
+            continue;
+        }
+        // an objectMap block is `index k v...` per line; every one of their names carries `From`
+        const bool isObjectMap = (key.find("From") != std::string::npos);
+        std::vector<std::vector<label>> v;
+        v.reserve(static_cast<std::size_t>(n));
+        for (label i = 0; i < n; ++i)
+        {
+            if (!std::getline(is, line)) break;
+            std::istringstream rs(line);
+            if (isObjectMap)
+            {
+                label idx = 0, k = 0;
+                rs >> idx >> k;
+                std::vector<label> e;
+                e.reserve(static_cast<std::size_t>(k) + 1);
+                e.push_back(idx);
+                for (label j = 0; j < k; ++j) { label q = 0; rs >> q; e.push_back(q); }
+                v.push_back(e);
+            }
+            else if (key == "patches")
+            {
+                std::string nm; label st = 0, sz = 0;
+                rs >> nm >> st >> sz;
+                v.push_back({st, sz});
+            }
+            else if (key == "points")
+            {
+                // three scalars per line; not compared by this harness, so the line is consumed and
+                // dropped rather than parsed into labels
+                v.push_back({});
+            }
+            else
+            {
+                label k = 0;
+                rs >> k;
+                std::vector<label> e(static_cast<std::size_t>(k));
+                for (label j = 0; j < k; ++j) rs >> e[static_cast<std::size_t>(j)];
+                v.push_back(e);
+            }
+        }
+        d.listLists[key] = v;
     }
     return d;
 }
@@ -181,6 +213,95 @@ int main(int argc, char** argv)
         }
     }
     const Dump d = readDump(dumpPath);
+    // THE UNREFINE ARM is a different dump and a different comparison: it removes cells, so the reverse
+    // maps stop being the identity and unit 6's remapping half is witnessed for the first time. Only the
+    // pieces brae has are compared; removeFaces (6b-2 and 6b-3) is what turns the rest on.
+    const bool unrefine = (d.lists.count("splitPoints") != 0);
+    if (unrefine)
+    {
+        std::printf("  UNREFINE arm: %zu split points\n", d.lists.at("splitPoints").size());
+        PrimitiveMesh um;
+        um.read(caseDir + "/constant/polyMesh");
+        const MeshEdges ume = buildMeshEdges(um);
+        const std::vector<std::vector<label>> ucells = meshCells(um);
+        const std::vector<std::vector<label>> uptCells = pointCellsFromCells(um, ucells);
+        const std::vector<std::vector<label>> ufEdges = buildFaceEdges(um, ume);
+        MeshView uv;
+        uv.m = &um; uv.edges = &ume; uv.faceEdges = &ufEdges;
+        const std::vector<std::vector<label>> ueFaces = buildEdgeFaces(um, ufEdges);
+        const std::vector<std::vector<label>> ucellPts = cellPointsFromCells(um, ucells);
+        const std::vector<std::vector<label>> ucellEdg = buildCellEdges(ucells, ufEdges);
+        FvGeometry ug;
+        ug.build(um);
+        uv.edgeFaces = &ueFaces; uv.cells = &ucells; uv.cellPoints = &ucellPts;
+        uv.pointCells = &uptCells; uv.cellEdges = &ucellEdg;
+        uv.cellCentres = &ug.C(); uv.faceCentres = &ug.Cf();
+
+        check("the pre-unrefinement mesh is the one OpenFOAM unrefined",
+              um.nCells() == d.scalars.at("nOldCells") && um.nFaces() == d.scalars.at("nOldFaces"));
+        Levels ulv;
+        ulv.cellLevel = d.lists.at("preCellLevel");
+        ulv.pointLevel = d.lists.at("prePointLevel");
+        History uh;
+        uh.visibleCells = d.lists.at("preHistoryVisibleCells");
+        uh.parent = d.lists.at("preHistoryParent");
+        uh.addedCells = d.listLists.at("preHistoryAddedCells");
+        uh.active = !uh.visibleCells.empty();
+        check("...and its levels and history are OpenFOAM's, handed over",
+              (label)ulv.cellLevel.size() == um.nCells() && uh.active);
+
+        setUnrefinementLevels(uv, ulv, uh, d.lists.at("splitPoints"));
+        compareList("cellLevel after setUnrefinement", ulv.cellLevel, d, "cellLevelAfterSet");
+        compareList("pointLevel after setUnrefinement (untouched)", ulv.pointLevel, d, "pointLevelAfterSet");
+        compareList("the history's visibleCells after setUnrefinement", uh.visibleCells, d,
+                    "historyVisibleCellsAfterSet");
+        compareList("the history's parent list after setUnrefinement", uh.parent, d,
+                    "historyParentAfterSet");
+        {
+            const auto it = d.listLists.find("historyAddedCellsAfterSet");
+            bool ok = (it != d.listLists.end()) && (uh.addedCells.size() == it->second.size());
+            std::size_t firstBad = uh.addedCells.size();
+            for (std::size_t i = 0; ok && i < uh.addedCells.size(); ++i)
+            {
+                if (uh.addedCells[i] != it->second[i]) { ok = false; firstBad = i; }
+            }
+            if (!ok && firstBad < uh.addedCells.size())
+            {
+                std::printf("  FAIL: the history's addedCells after setUnrefinement differs at split "
+                            "cell %zu (brae %zu entries)\n", firstBad, uh.addedCells[firstBad].size());
+                ++failures;
+            }
+            else
+            {
+                check("the history's addedCells after setUnrefinement is OpenFOAM's", ok);
+            }
+        }
+        // UNIT 6's REMAPPING HALF, witnessed at last: these maps are NOT the identity here
+        {
+            const std::vector<label>& rcm = d.lists.at("reverseCellMap");
+            const std::vector<label>& rpm = d.lists.at("reversePointMap");
+            bool cIdent = true, pIdent = true;
+            for (std::size_t i = 0; i < rcm.size(); ++i) if (rcm[i] != (label)i) cIdent = false;
+            for (std::size_t i = 0; i < rpm.size(); ++i) if (rpm[i] != (label)i) pIdent = false;
+            check("the reverse maps are NOT the identity here -- which is the whole point of this arm",
+                  !cIdent && !pIdent);
+            Levels uafter = ulv;
+            History uh2 = uh;
+            updateLevels(uafter, rcm, rpm, d.lists.at("cellMap"), d.lists.at("pointMap"),
+                         d.scalars.at("nCells"), d.scalars.at("nPoints"));
+            historyUpdateMesh(uh2, rcm, d.scalars.at("nCells"));
+            compareList("cellLevel after changeMesh (the remap, now witnessed)", uafter.cellLevel, d,
+                        "cellLevelFinal");
+            compareList("pointLevel after changeMesh (the remap, now witnessed)", uafter.pointLevel, d,
+                        "pointLevelFinal");
+            compareList("the history's visibleCells after changeMesh", uh2.visibleCells, d,
+                        "historyVisibleCells");
+        }
+        skip("removeFaces::compatibleRemoves -- cellRegion / cellRegionMaster / facesToRemove, unit 6b-2");
+        skip("removeFaces::setRefinement -- the map and the mesh, unit 6b-3");
+        std::printf("test_hex_ref8_vs_openfoam: %d failures, %d skipped\n", failures, skipped);
+        return failures == 0 ? 0 : 1;
+    }
     std::printf("  refining %zu cells\n", cellsToRefine.size());
     check("the cell set was read and is not empty", !cellsToRefine.empty());
     check("...and it is the set OpenFOAM refined",

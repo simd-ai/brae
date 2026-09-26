@@ -1249,6 +1249,89 @@ void storeRefinementHistory(
     }
 }
 
+
+// ----------------------------------------------------------------------------------------------
+// UNIT 6b-1: setUnrefinement's level and history half. See the header for the three-way split and for
+// why this is the arm that finally gates unit 6's remapping.
+
+void freeSplitCell(
+    History& h,
+    label    index)
+{
+    // :1607-1648
+    const label parent = h.parent[static_cast<std::size_t>(index)];
+    if (parent >= 0)
+    {
+        std::vector<label>& sub = h.addedCells[static_cast<std::size_t>(parent)];
+        if (!sub.empty())
+        {
+            const auto it = std::find(sub.begin(), sub.end(), index);
+            if (it == sub.end())
+                throw std::runtime_error(
+                    std::string(WHO) + "split cell " + std::to_string(index) + " is not among its "
+                    "parent " + std::to_string(parent) + "'s children. OpenFOAM warns here too "
+                    "(refinementHistory.C:1626-1635).");
+            // a -1 IN PLACE, not an erase: the eight slots are positional and the position is the child
+            // index storeSplit wrote it at
+            *it = -1;
+        }
+    }
+    h.parent[static_cast<std::size_t>(index)] = -2;      // the free marker, distinct from -1
+    h.freeSplitCells.push_back(index);
+}
+
+
+void combineCells(
+    History&                  h,
+    label                     masterCelli,
+    const std::vector<label>& combinedCells)
+{
+    // :1652-1673. The parent index is read BEFORE the children are freed, because freeing them rewrites
+    // the parent's own addedCells.
+    const label parentIndex =
+        h.parent[static_cast<std::size_t>(h.visibleCells[static_cast<std::size_t>(masterCelli)])];
+    for (const label celli : combinedCells)
+    {
+        freeSplitCell(h, h.visibleCells[static_cast<std::size_t>(celli)]);
+        h.visibleCells[static_cast<std::size_t>(celli)] = -1;
+    }
+    // the parent's children pointer is RESET, which is an empty list here and not eight -1s
+    h.addedCells[static_cast<std::size_t>(parentIndex)].clear();
+    h.visibleCells[static_cast<std::size_t>(masterCelli)] = parentIndex;
+}
+
+
+void setUnrefinementLevels(
+    const MeshView&           v,
+    Levels&                   lv,
+    History&                  h,
+    const std::vector<label>& splitPointLabels)
+{
+    requireView(v);
+    if (!h.active)
+        throw std::runtime_error(
+            std::string(WHO) + "setUnrefinement on a mesh with no active refinement history. OpenFOAM "
+            "FatalErrors here too (hexRef8.C:5613-5620): without the history there is nothing recording "
+            "which eight cells came from which parent.");
+    for (const label pointi : splitPointLabels)
+    {
+        const std::vector<label>& pCells = (*v.pointCells)[static_cast<std::size_t>(pointi)];
+        if (pCells.size() != 8)
+            throw std::runtime_error(
+                std::string(WHO) + "split point " + std::to_string(pointi) + " has "
+                + std::to_string(pCells.size()) + " cells, not 8. OpenFOAM FatalErrors here too "
+                "(:5712-5722): a point that can be unsplit is the centre of exactly one split.");
+        const label masterCelli = *std::min_element(pCells.begin(), pCells.end());
+        for (const label celli : pCells)
+        {
+            --lv.cellLevel[static_cast<std::size_t>(celli)];
+        }
+        combineCells(h, masterCelli, pCells);
+    }
+    // POINT LEVELS ARE UNTOUCHED, and that is OpenFOAM's own note at :5781-5783: the points "either get
+    // removed or stay at the same position", so a surviving point's level is still the level it had.
+}
+
 }   // namespace hexRef8
 }   // namespace cpu
 }   // namespace brae
