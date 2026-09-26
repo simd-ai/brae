@@ -188,6 +188,7 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
     std::vector<scalar> nE;
     std::vector<scalar> nYpl;
     std::vector<scalar> eCmu25;
+    std::vector<scalar> eLowRe;
     std::vector<scalar> eCmu75;
     std::vector<scalar> eKappa;
     std::vector<scalar> eE;
@@ -239,6 +240,9 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
             eKappa.push_back(ec.kappa);
             eE.push_back(ec.E);
             eYpl.push_back(ec.yPlusLam());
+            // the patch's OWN lowReCorrection. `ec` is this patch's WallFunctionCoeffs, so a case
+            // setting the switch on one wall and not another lands two different values here.
+            eLowRe.push_back(ec.lowRe > 0 ? scalar(1) : scalar(0));
             wallFaceOfBnd.push_back(thisBnd);
         }
     }
@@ -259,6 +263,7 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
     d.wall.wfKappa.copyFrom(eKappa);
     d.wall.wfE.copyFrom(eE);
     d.wall.wfYplLam.copyFrom(eYpl);
+    d.wall.wfLowRe.copyFrom(eLowRe);
     d.nWallFaces = static_cast<int>(wallFaceOfBnd.size());
     if (d.nWallFaces > 0)
     {

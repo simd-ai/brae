@@ -94,7 +94,7 @@ stage()
     case "$profile" in
         laminar)
             sed -i 's/^simulationType .*/simulationType laminar;/' "$C/constant/turbulenceProperties" ;;
-        uniform|custom|nutAtmosphere|sst|frozen|frozenFloored|frozenSST|splitSolve|splitSolveSST|splitDiv|splitDivSST|lowRe|lowReOff|outerUniform|turbOuter|turbOuterSplit|flowFrozen|flowSolved)
+        uniform|custom|nutAtmosphere|sst|frozen|frozenFloored|frozenSST|splitSolve|splitSolveSST|splitDiv|splitDivSST|lowRe|lowReOff|lowReSplit|outerUniform|turbOuter|turbOuterSplit|flowFrozen|flowSolved)
             sed -i '/^density /d' "$C/constant/turbulenceProperties"
             sed -i 's/^\( *\)div(rhoPhi,k) .*/\1div(phi,k)      Gauss upwind;/; s/^\( *\)div(rhoPhi,epsilon) .*/\1div(phi,epsilon) Gauss upwind;/' \
                 "$C/system/fvSchemes"
@@ -245,9 +245,12 @@ DIVEOF
     # OpenFOAM against itself, 0.0000e+00 on every field. At 1e-2 the wall is resolved and it moves
     # OpenFOAM`s own epsilon on all 2268 cells, worst relative 7.8e+00. The twin is the control, because
     # the raised nu means no other profile is comparable.
-    if [ "$profile" = lowRe ] || [ "$profile" = lowReOff ]; then
+    if [ "$profile" = lowRe ] || [ "$profile" = lowReOff ] || [ "$profile" = lowReSplit ]; then
+        # 0 = none (the log law everywhere), 1 = all three walls, 2 = lowerWall ALONE. The third is a
+        # genuinely different answer from both, which is what makes it gateable -- see the invocation.
         LOWRE_ON=0
         [ "$profile" = lowRe ] && LOWRE_ON=1
+        [ "$profile" = lowReSplit ] && LOWRE_ON=2
         LOWRE_ON="$LOWRE_ON" python3 - "$C" <<'LOWEOF' || { echo "FAIL: the $profile profile was not staged"; return 1; }
 import os, re, sys
 d = sys.argv[1]
@@ -258,13 +261,22 @@ if n == 0:
     t, n = re.subn(r"nu\s+1e-06;", "nu              1e-2;", t, count=1)
 assert n >= 1, "could not raise the water viscosity"
 open(q, "w").write(t)
-if os.environ["LOWRE_ON"] == "1":
+mode = os.environ["LOWRE_ON"]
+if mode in ("1", "2"):
     q = d + "/0/epsilon"
     t = open(q).read()
-    t, n = re.subn(r"(type\s+epsilonWallFunction;\n)", r"\1        lowReCorrection true;\n", t)
-    assert n >= 1, "no epsilonWallFunction entry in 0/epsilon"
+    if mode == "1":
+        t, n = re.subn(r"(type\s+epsilonWallFunction;\n)", r"\1        lowReCorrection true;\n", t)
+        assert n == 3, ("expected three epsilonWallFunction patches, found %d" % n)
+    else:
+        # lowerWall ALONE. OpenFOAM reads `lowReCorrection` from each patch dictionary
+        # (epsilonWallFunctionFvPatchScalarField.C:414), so the other two stay in the log law and the run
+        # is a THIRD answer, not a blend of the other two.
+        t, n = re.subn(r"(lowerWall\s*\{\s*\n\s*type\s+epsilonWallFunction;\n)",
+                       r"\1        lowReCorrection true;\n", t)
+        assert n == 1, ("lowerWall's epsilonWallFunction entry was not matched (%d)" % n)
     open(q, "w").write(t)
-    print("  epsilon: lowReCorrection set on %d wall patch(es), water nu raised to 1e-2" % n)
+    print("  epsilon: lowReCorrection set on %d of 3 wall patch(es), water nu raised to 1e-2" % n)
 else:
     print("  water nu raised to 1e-2, lowReCorrection left off (the control)")
 LOWEOF
@@ -432,7 +444,7 @@ PYEOF
 }
 
 rc=0
-for p in laminar variable uniform custom nutAtmosphere sst outer frozen frozenFloored frozenSST splitSolve splitSolveSST splitDiv splitDivSST lowReOff lowRe outerUniform turbOuter turbOuterSplit flowSolved flowFrozen; do
+for p in laminar variable uniform custom nutAtmosphere sst outer frozen frozenFloored frozenSST splitSolve splitSolveSST splitDiv splitDivSST lowReOff lowRe lowReSplit outerUniform turbOuter turbOuterSplit flowSolved flowFrozen; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_ras_dambreak_vs_openfoam: staging failed"; exit 1; }
@@ -497,6 +509,15 @@ done
 # all 2268 cells.
 "$BIN" "$W/flowFrozen" "$W/flowFrozen/0" "$W/flowFrozen/$END" "$STEPS" "$W/flowFrozen/log.interFoam" \
        flowFrozen uniform "$W/flowSolved/$END" "$W/flowSolved/$END" || rc=1
+
+# ...and the SPLIT: `lowReCorrection` on lowerWall ALONE, the other two walls left in the log law.
+# BOTH ARGUMENTS ARE CONTROLS HERE, one per direction the collapse could go: argv[8] is the ALL-THREE run
+# (what brae did when it carried one flag for every wall) and argv[9] is the ALL-OFF run (what it did
+# before the switch was read at all). MEASURED, OpenFOAM against OpenFOAM: against all-three epsilon
+# 6.2419e-01, k 8.1491e-01, nut 4.9848e-01, U 1.5369e-02; against all-off epsilon 7.8874e-01,
+# k 1.2715e+00, nut 5.3356e-01, U 3.0646e-02 -- all 2268 of 2268 cells in every field.
+"$BIN" "$W/lowReSplit" "$W/lowReSplit/0" "$W/lowReSplit/$END" "$STEPS" "$W/lowReSplit/log.interFoam" \
+       lowReSplit uniform "$W/lowRe/$END" "$W/lowReOff/$END" || rc=1
 
 echo "interfoam_ras_dambreak_vs_openfoam: rc $rc"
 exit $rc

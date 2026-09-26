@@ -130,6 +130,11 @@ int main(
     // with it. Here the model is live and the whole outer iteration's momentum, pressure and
     // turbulence corrector are skipped instead (interFoam.C:156-158).
     const bool flowFrozen = (profile == "flowFrozen");
+    // `lowReSplit`: `lowReCorrection` on lowerWall ALONE. OpenFOAM reads the switch from each patch
+    // dictionary (epsilonWallFunctionFvPatchScalarField.C:414) and it gates two things per face -- the
+    // viscous epsilon (:242) and whether the wall production is dropped at all (:338) -- so three
+    // walls with two different flags are two different wall treatments in one run.
+    const bool lowReSplit = (profile == "lowReSplit");
     // `splitSolve*`: the second equation carries its OWN `<field>Final` solver entry, which
     // fvMatrix::solve() looks up by FIELD name. The closure took k's for both until this profile.
     const bool splitSolveSST = (profile == "splitSolveSST");
@@ -165,6 +170,7 @@ int main(
               : splitSolve ? "splitSolve -- epsilonFinal its own entry, tolerance 1e-12 and 2 sweeps"
               : frozenFloored ? "frozenFloored -- turbulence off, with floors above the case's own fields"
               : frozenSST ? "frozenSST -- kOmegaSST with turbulence off"
+              : lowReSplit ? "lowReSplit -- lowReCorrection on lowerWall alone, the other two walls in the log law"
               : flowFrozen ? "flowFrozen -- `frozenFlow yes`: alpha advances, nothing else is solved"
               : frozen ? "frozen -- turbulence off: constructed, validated, never corrected"
               : outer ? "outer -- variable, with nOuterCorrectors 2"
@@ -386,6 +392,25 @@ int main(
           ofAlpha.size() == static_cast<std::size_t>(nC) && ofKf.size() == ofAlpha.size()
        && ofNut.size() == ofAlpha.size());
 
+    if (lowReSplit)
+    {
+        // WHAT WAS READ, PER PATCH. Without this the arm could pass on a brae that happened to land inside
+        // the bounds while carrying one flag for every wall -- and one flag for every wall is exactly what
+        // it carried. The assertion is that the three epsilonWallFunction patches do NOT agree.
+        std::size_t nOn = 0, nOff = 0, nWallFn = 0;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (!fin.turbulence.epsilon.boundary[pi]->isTurbulenceWallFunction()) continue;
+            ++nWallFn;
+            if (fin.turbulence.epsilon.boundary[pi]->wallCoeffs().lowRe > 0) ++nOn; else ++nOff;
+        }
+        std::printf("  LOW-RE SPLIT: %zu epsilonWallFunction patches, %zu with lowReCorrection and %zu "
+                    "without\n", nWallFn, nOn, nOff);
+        check("brae read three epsilonWallFunction patches", nWallFn == 3);
+        check("...one of them with `lowReCorrection`", nOn == 1);
+        check("...and two without -- so the closure is running two wall treatments, not one",
+              nOff == 2);
+    }
     if (flowFrozen)
     {
         // WHAT `frozenFlow yes` MEANS, asserted term by term. Agreement with the oracle alone would not
@@ -539,7 +564,11 @@ int main(
                 "%.4e, nut %.4e\n", (double)dOtherU.rel(), (double)dOtherNut.rel());
     // MEASURED 1.33 (laminar), 0.29 (the other lineage) and 3.7e-02 (custom against plain uniform),
     // beside a U bound of 5e-10
-    check(flowFrozen ? "solving the flow moves OpenFOAM's own U more than 10% against freezing it -- "
+    check(lowReSplit ? "`lowReCorrection` on ALL THREE walls moves OpenFOAM's own U against having it on "
+                       "lowerWall alone -- `argv[8]` is the all-three run, which is what brae computed "
+                       "while it carried one flag for every wall. MEASURED: epsilon 6.2419e-01, "
+                       "k 8.1491e-01, nut 4.9848e-01, U 1.5369e-02, all 2268 cells"
+          : flowFrozen ? "solving the flow moves OpenFOAM's own U more than 10% against freezing it -- "
                        "`argv[8]` is the same developed start WITHOUT `frozenFlow yes`, so the one thing "
                        "between the two runs is that entry. MEASURED: U 3.2493e-01, p_rgh 9.0768e-02, "
                        "epsilon 1.4379e-01, alpha 1.4387e-02, over all 2268 cells"
@@ -547,7 +576,7 @@ int main(
                    "brae that read `turbulence off` as laminar, or as `keep the file's nut`, would be "
                    "this far out and could not pass the field bounds above"
                  : "turbulence moves OpenFOAM's own U by more than 10%",
-          dLamU.rel() > scalar(0.1));
+          dLamU.rel() > (lowReSplit ? scalar(1e-2) : scalar(0.1)));
     // MEASURED for nutAtmosphere against plain uniform: U 2.7e-03, nut 4.7e-02 -- 20 of the atmosphere's
     // 46 faces take air IN at t = 0.005, where the inletValue stands in for the cell's nut
     // ...and the second outer corrector against one: MEASURED U 4.6e-02 at t = 0.005
@@ -567,6 +596,9 @@ int main(
           : frozenFloored ? "...and the FLOORS alone move it by more than 1%, against the same case frozen "
                           "at the default floors -- so the constructor's bound is visible here"
           : frozenSST ? "...and switching kOmegaSST off moves it by more than 10%"
+          : lowReSplit ? "...and the ALL-OFF run moves it too, which is the OTHER direction the collapse "
+                         "could go: a brae that never read the switch lands there. MEASURED: epsilon "
+                         "7.8874e-01, k 1.2715e+00, nut 5.3356e-01, U 3.0646e-02"
           : flowFrozen ? "...and the same run again as the second control: there is only one setting "
                          "between frozen and solved, so both controls are the same run by design"
           : frozen ? "...and switching kEpsilon off moves it by more than 10%"
@@ -574,7 +606,8 @@ int main(
           : nutAtmosphere ? "...and the atmosphere's inletOutlet nut moves it by more than 1e-3"
           : custom ? "...and the custom settings move it by more than 1%"
                    : "...and the lineage moves it by more than 10%, so `density` is live on this fixture",
-          dOtherU.rel() > (flowFrozen ? scalar(0.1)
+          dOtherU.rel() > (lowReSplit ? scalar(1e-2)
+                         : flowFrozen ? scalar(0.1)
                          : turbOuterSplit ? scalar(1e-7)
                          : turbOuter ? scalar(0.01)
                          : lowRe ? scalar(0.01)

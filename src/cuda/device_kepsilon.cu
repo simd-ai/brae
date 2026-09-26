@@ -187,7 +187,10 @@ void wallFnKernel(
     const scalar* __restrict__ wfCmu75,
     const scalar* __restrict__ wfKappa,
     const scalar* __restrict__ wfE,
-    const scalar* __restrict__ wfYplLam)
+    const scalar* __restrict__ wfYplLam,
+    // the PATCH's own lowReCorrection per wall face; null -> the scalar `lowReCorrection` above,
+    // which is one flag for every wall
+    const scalar* __restrict__ wfLowRe)
 {
     // One thread per wall CELL, summing that cell's wall faces in ascending face index and writing once.
     // The per-face form needed atomicAdd here, and a cell with more than one wall face then depended on
@@ -210,12 +213,13 @@ void wallFnKernel(
         const scalar kappa  = wfKappa  ? wfKappa[wf]  : kappaD;
         const scalar E      = wfE      ? wfE[wf]      : ED;
         const scalar yplLam = wfYplLam ? wfYplLam[wf] : yplLamD;
+        const bool   lowRe  = wfLowRe  ? (wfLowRe[wf] != scalar(0)) : lowReCorrection;
         // epsilonWallFunction, STEPWISE blender (its default). `lowReCorrection` switches a face whose
         // y+ is below yPlusLam to the VISCOUS epsilon and drops its wall production ENTIRELY --
         // epsilonWallFunctionFvPatchScalarField.C:242 and :338, where the G guard is
         // `if (!lowReCorrection_ || (yPlus > yPlusLam))`. Mirrors kEpsilon_cpp's reference branch.
         const scalar yPlus = Cmu25 * y * sqrt(kc) / nuw;
-        const bool   resolved = lowReCorrection && (yPlus < yplLam);
+        const bool   resolved = lowRe && (yPlus < yplLam);
         if (!resolved)
         {
             if (nutwStored)
@@ -912,7 +916,8 @@ void deviceWallEpsG0(
                                               w.wfCmu75.size()  ? w.wfCmu75.data()  : nullptr,
                                               w.wfKappa.size()  ? w.wfKappa.data()  : nullptr,
                                               w.wfE.size()      ? w.wfE.data()      : nullptr,
-                                              w.wfYplLam.size() ? w.wfYplLam.data() : nullptr);
+                                              w.wfYplLam.size() ? w.wfYplLam.data() : nullptr,
+                                              w.wfLowRe.size()  ? w.wfLowRe.data()  : nullptr);
     cudaCheck(cudaGetLastError(), "wallFn");
 }
 

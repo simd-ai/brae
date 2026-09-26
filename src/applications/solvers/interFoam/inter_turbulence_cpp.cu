@@ -668,21 +668,11 @@ InterTurbulence readInterTurbulence(
                 t.coeffs.epsLowRe = true;
             }
         }
-        // ONE FLAG FOR EVERY WALL is what the closure carries (KEpsilonCoeffs::epsLowRe), while OpenFOAM
-        // reads it per patch. A case that sets it on some walls and not others would run it on all of
-        // them here, so that is refused rather than approximated.
-        if (t.coeffs.epsLowRe)
-        {
-            for (const auto& pb : epsRaw.boundary)
-            {
-                if (pb.type != "epsilonWallFunction" || pb.epsLowRe) continue;
-                throw std::runtime_error(
-                    std::string(WHO) + "epsilon patch `" + pb.name + "` is an epsilonWallFunction WITHOUT "
-                    "`lowReCorrection` while another wall has it. OpenFOAM reads the switch per patch; "
-                    "this closure carries one flag for every wall, so running it would apply the "
-                    "resolved-sublayer branch on a wall the case left in the log law.");
-            }
-        }
+        // PER PATCH ON BOTH ARMS NOW, so a case that sets the switch on some walls and not others runs
+        // two different branches as OpenFOAM does. `t.coeffs.epsLowRe` above stays as "any wall has it"
+        // and is the FALLBACK only: the host closure reads the patch's own
+        // WallFunctionCoeffs::lowRe (kEpsilon_cpp.cu) and the device kernel reads DeviceWallData::wfLowRe
+        // per wall face, each falling back to this flag when a driver has not filled them.
     }
     // the closure tells k's and epsilon's flux-conditional patches the volumetric phi and nothing else
     for (std::size_t pi = 0; pi < patches.size(); ++pi)

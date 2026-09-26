@@ -172,6 +172,10 @@ struct DeviceWallData
     // epsilon patch's entry, WallFunctionCoeffs; item 16h-port). Empty -> the kernels use the
     // model-wide KEpsilonCoeffs values, which is what the legacy drivers still hand them.
     DeviceBuffer<scalar> wfCmu25, wfCmu75, wfKappa, wfE, wfYplLam;
+    // epsilonWallFunction's OWN `lowReCorrection` per wall face, 1 or 0. EMPTY means the driver
+    // filling this struct still carries one flag for every wall, and the kernel falls back to the
+    // scalar it is passed -- the same nullable convention as the five above.
+    DeviceBuffer<scalar> wfLowRe;
 };
 // The predicate the wall set is built on, in one place so the DeviceWallData faces and the wall-face ->
 // boundary-face map below cannot drift apart.

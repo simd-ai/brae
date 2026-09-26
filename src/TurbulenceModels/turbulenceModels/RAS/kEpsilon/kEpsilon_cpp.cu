@@ -464,7 +464,12 @@ void correct(
             // blenderType::STEPWISE, 2)). Without lowReCorrection the log branch is taken on every face,
             // which is what this did unconditionally before.
             const scalar yPlus = Cmu25 * yw[i] * std::sqrt(kc) / nuAtFace(i);
-            const bool   resolved = co.epsLowRe && (yPlus < yPlusLam);
+            // THE PATCH'S OWN `lowReCorrection`, not one flag for every wall: OpenFOAM reads it from
+            // each patch dictionary, so a case setting it on one wall and not another runs two
+            // different branches. wc.lowRe < 0 means this driver has not filled it and the model-wide
+            // flag is the answer -- see WallFunctionCoeffs::lowRe.
+            const bool   lowRe = (wc.lowRe >= 0) ? (wc.lowRe != 0) : co.epsLowRe;
+            const bool   resolved = lowRe && (yPlus < yPlusLam);
             eps0[c] += resolved ? w * 2.0 * kc * nuAtFace(i) / (yw[i] * yw[i])               // epsilonVis
                                 : w * Cmu75 * std::pow(kc, 1.5) / (kappa * yw[i]);           // epsilonLog
             // ...and the production override is SKIPPED ENTIRELY on a resolved face -- OF's guard is

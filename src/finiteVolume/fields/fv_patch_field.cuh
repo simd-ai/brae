@@ -36,6 +36,19 @@ struct WallFunctionCoeffs
     // `kOmegaSSTCoeffs { beta1 0.08; }` changes the EQUATION's blend and leaves the wall at 0.075, and
     // brae used the model's at the wall -- a silent substitution on any case that sets it.
     scalar beta1 = 0.075;
+    // epsilonWallFunction's OWN `lowReCorrection`, read from the PATCH dictionary with its own
+    // default (epsilonWallFunctionFvPatchScalarField.C:414,
+    // `lowReCorrection_(dict.getOrDefault("lowReCorrection", false))`). It gates TWO things per face,
+    // both on the patch's own flag: epsilon0 takes the VISCOUS branch where y+ < yPlusLam (:242), and
+    // the wall production G0 is dropped ENTIRELY on such a face (:338, `!lowReCorrection_ ||
+    // (yPlus > yPlusLam)`) rather than scaled.
+    //
+    // TRI-STATE, and deliberately: -1 means "this patch's flag was not filled, fall back to the
+    // model-wide KEpsilonCoeffs::epsLowRe". Only the drivers that resolve it PER PATCH set 0 or 1;
+    // the drivers that still collapse the switch to one flag for every wall leave it -1 and keep
+    // exactly the answer they had. One field rather than a value plus a `set` bool, so the two
+    // cannot disagree.
+    signed char lowRe = -1;
     // wallFunctionCoefficients.C:40-52: ten fixed-point iterations of ypl = log(max(E ypl, 1))/kappa from 11.
     scalar yPlusLam() const
     {
@@ -2916,7 +2929,11 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
     std::unique_ptr<fvPatchField<T>> f = makePatchFieldImpl<T>(p, d);
     if (f)
     {
-        f->setWallCoeffs(WallFunctionCoeffs{d.wfCmu, d.wfKappa, d.wfE, d.wfBeta1});
+        // ...and the patch's own `lowReCorrection`, 0 or 1 rather than -1: the reader HAS the patch
+        // dictionary here, so the flag is always known at this point. -1 is for the drivers that
+        // never consult it -- see WallFunctionCoeffs::lowRe.
+        f->setWallCoeffs(WallFunctionCoeffs{d.wfCmu, d.wfKappa, d.wfE, d.wfBeta1,
+                                           static_cast<signed char>(d.epsLowRe ? 1 : 0)});
         // ...AND THE FLUX NAME ONLY FOR A CLASS THAT READS ONE. `fixedFluxPressure` has NO `phiName_`
         // member at all in v2412: its dictionary constructor reads the gradient and value entries and
         // nothing else (fixedFluxPressureFvPatchScalarField.C -- `readGradientEntry` / `readValueEntry`,
