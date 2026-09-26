@@ -43,6 +43,9 @@
 #include <string>
 
 namespace brae {
+// One equation's fvSchemes div and grad entries (cpu/limitedSchemes_cpp.cuh). Forward-declared: this
+// header holds only POINTERS, and the .cu that dereferences them includes the definition.
+namespace cpu { struct EqnDivScheme; struct EqnGradScheme; }
 namespace gpu {
 namespace kOmegaSSTRAS {
 
@@ -131,8 +134,17 @@ struct KOmegaSSTInput
     const DeviceBuffer<scalar>* yCell = nullptr;         // wall distance per CELL, for F1/F2
 
     // --- schemes and solver, per field, from the case ---
+    // SEPARATE fvSchemes entries, and the kernels have taken them separately all along (:782 reads
+    // boundedOmega, :897 boundedK). The refusal that stood in front of this pair was guarding code
+    // that already worked, on a reason that expired when the HOST split landed.
     bool   boundedK     = false;
     bool   boundedOmega = false;
+    // OMEGA'S OWN div and grad entries; null means "omega takes k's", which is what a case with one
+    // `default` means and what every caller got before these existed. `fvc::grad(vf)` resolves
+    // `grad(<vf>)` by the FIELD's name, and CDkOmega reads grad(k) AND grad(omega) in ONE expression
+    // (kOmegaSSTBase.C:548), so the two must be resolved separately rather than by one flag per call.
+    const cpu::EqnDivScheme*  omegaDiv  = nullptr;
+    const cpu::EqnGradScheme* omegaGrad = nullptr;
     bool   limitedLinear = false;      // ONE flag for the pair, as the host closure carries
     scalar limiterCoeff  = 1.0;        // RAW k; the transport helper converts to 2/max(k,SMALL)
     bool   linearUpwind  = false;      // `Gauss linearUpwind <name>` on the pair (TransportScheme)

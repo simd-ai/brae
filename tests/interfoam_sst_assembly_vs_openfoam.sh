@@ -141,8 +141,18 @@ import os, re, sys
 d, scheme = sys.argv[1], os.environ['SCHEME']
 p = os.path.join(d, 'system/fvSchemes')
 s = open(p).read()
-s, k = re.subn(r'^(\s*"div\\\(phi,\(k\|omega\)\\\)"\s+).*$',
-               lambda m: m.group(1) + 'Gauss ' + scheme + ';', s, flags=re.M)
+pat = r'^(\s*)"div\\\(phi,\(k\|omega\)\\\)"(\s+).*$'
+if scheme == 'split':
+    # ONE PATTERN KEY BECOMES TWO LITERAL ENTRIES. `fvm::div(phi, psi)` resolves its entry by the FIELD's
+    # name, and a literal beats a pattern in OpenFOAM's lookup, so writing both literals is what makes the
+    # two equations two schemes. k keeps the tutorial's upwind; omega takes limitedLinear.
+    s, k = re.subn(pat,
+                   lambda m: m.group(1) + 'div(phi,k)' + m.group(2) + 'Gauss upwind;\n'
+                           + m.group(1) + 'div(phi,omega)' + m.group(2) + 'Gauss limitedLinear 1;', s,
+                   flags=re.M)
+else:
+    s, k = re.subn(pat, lambda m: m.group(1) + '"div\\(phi,(k|omega)\\)"' + m.group(2)
+                                  + 'Gauss ' + scheme + ';', s, flags=re.M)
 assert k == 1, 'the tutorial no longer carries one div(phi,(k|omega)) entry'
 open(p, 'w').write(s)
 
@@ -158,8 +168,15 @@ for key, val in [('adjustTimeStep', 'no'), ('deltaT', '0.1'), ('endTime', '0.1')
 s = re.sub(r'^writeCompression\s.*', 'writeCompression off;', s, flags=re.M)
 open(c, 'w').write(s)
 PYEOF
-    grep -q "Gauss $scheme;" "$C/system/fvSchemes" \
-        || { echo "FAIL: \`Gauss $scheme\` did not reach div(phi,(k|omega)) [$name]"; return 1; }
+    if [ "$scheme" = split ]; then
+        grep -q "div(phi,k)" "$C/system/fvSchemes" && grep -q "div(phi,omega)" "$C/system/fvSchemes" \
+            && grep -q "Gauss limitedLinear 1;" "$C/system/fvSchemes" \
+            && grep -q "Gauss upwind;" "$C/system/fvSchemes" \
+            || { echo "FAIL: the split entries did not reach fvSchemes [$name]"; return 1; }
+    else
+        grep -q "Gauss $scheme;" "$C/system/fvSchemes" \
+            || { echo "FAIL: \`Gauss $scheme\` did not reach div(phi,(k|omega)) [$name]"; return 1; }
+    fi
 
     ( cd "$C" && blockMesh > log.blockMesh 2>&1 ) || { echo "FAIL: blockMesh [$name]"; tail -20 "$C/log.blockMesh"; return 1; }
     local i
@@ -197,6 +214,14 @@ PYEOF
 
 stage limitedLinear "limitedLinear 1" || { echo "interfoam_sst_assembly_vs_openfoam: staging failed"; exit 1; }
 stage upwind        "upwind"          || { echo "interfoam_sst_assembly_vs_openfoam: staging failed"; exit 1; }
+# THE SPLIT: div(phi,k) upwind beside div(phi,omega) limitedLinear 1. Two schemes in one closure call,
+# which the device arm refused until KOmegaSSTInput::omegaDiv/omegaGrad carried the second equation's
+# entries into schemeOf(). The assembled system is the right oracle here for the same reason the
+# whole gate exists: at the first call omega is uniform, so limitedLinear's limiter is a 0/0 ratio
+# and no FIELD bound can separate the scheme from the last bit (the RAS/damBreak `splitDivSST` device
+# arm reads omega 1.275e-07 on that first solve's initial residual where its fields are at the SST
+# device floor, and the host reads 2.742e-15 -- the same coin-flip, landing the other way).
+stage split         "split"           || { echo "interfoam_sst_assembly_vs_openfoam: staging failed"; exit 1; }
 
 # runBrae <case> <arm: host|device> -- writes <case>/dump/<host|cuda>/... at the first closure call
 runBrae()
@@ -235,6 +260,8 @@ runBrae limitedLinear host   || rc=1
 runBrae limitedLinear device || rc=1
 runBrae upwind       host    || rc=1
 runBrae upwind       device  || rc=1
+runBrae split        host    || rc=1
+runBrae split        device  || rc=1
 
 if [ $rc = 0 ]; then
     compare limitedLinear limitedLinear host   match  "A host  limitedLinear vs OpenFOAM's own" \
@@ -256,6 +283,26 @@ if [ $rc = 0 ]; then
     compare limitedLinear upwind device differ "E DEVICE upwind vs OpenFOAM's limitedLinear" \
         && pass "CONTROL: ...and the other way round" \
         || fail "CONTROL: ...and the other way round"
+
+    # THE SPLIT, host and device, and TWO controls. F/G hold each arm's assembled system against
+    # OpenFOAM's own for the same split; H and I are what make F/G mean the SPLIT rather than either
+    # uniform scheme -- a device arm that silently ran ONE scheme for both equations would match one of
+    # them instead of the split, which is exactly what this arm was refused for.
+    compare split split host   match  "F host  SPLIT vs OpenFOAM's own split" \
+        && pass "the HOST's split assembled system is OpenFOAM's" \
+        || fail "the HOST's split assembled system is OpenFOAM's"
+
+    compare split split device match  "G DEVICE SPLIT vs OpenFOAM's own split" \
+        && pass "...and the DEVICE's is, which is what its refusal was waiting for" \
+        || fail "...and the DEVICE's is, which is what its refusal was waiting for"
+
+    compare limitedLinear split device differ "H DEVICE SPLIT vs OpenFOAM's BOTH-limitedLinear" \
+        && pass "CONTROL: the split is not both equations limited -- k really took upwind" \
+        || fail "CONTROL: the split is not both equations limited -- k really took upwind"
+
+    compare upwind split device differ "I DEVICE SPLIT vs OpenFOAM's BOTH-upwind" \
+        && pass "CONTROL: ...and not both upwind either -- omega really took the limiter" \
+        || fail "CONTROL: ...and not both upwind either -- omega really took the limiter"
 fi
 
 echo "interfoam_sst_assembly_vs_openfoam: rc $rc"

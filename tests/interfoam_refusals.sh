@@ -421,9 +421,10 @@ arm ras_uniform             runs    -                        "" "sed -i 's/^dens
 # `Gauss limitedLinear <k>` RUNS on the host closure now (gated on RAS/waterChannel `limitedLinear`,
 # fields at 7.2e-12), and so does ONE equation limited with the other not: `fvm::div(phi, psi)` resolves
 # the entry by the FIELD's name, so the two are two different matrices and the kEpsilon closure assembles
-# each (gated on RAS/damBreak `splitDiv`, fields at 1e-15). The kOmegaSST twin still refuses that
-# (`sst_splitDiv` above, with the measurement), and so does the DEVICE closure, whose kernels carry one
-# scheme for both equations and which reads omega 1.7822e-04 where the host reads 7.2e-12.
+# each (gated on RAS/damBreak `splitDiv`, fields at 1e-15). The kOmegaSST twin runs it too
+# (`sst_splitDiv` above), and so does the DEVICE closure now: each equation's div entry reaches the
+# assembly through KEpsilonInput::epsDiv / KOmegaSSTInput::omegaDiv, and `splitDiv`/`splitDivSST` are held
+# to the ordinary device bounds rather than asserting a refusal.
 arm ras_limitedLinearOne    runs    -                        "" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss limitedLinear 1;/' system/fvSchemes"
 arm ras_limitedLinearBoth   runs    -                        "" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss limitedLinear 1;/; s/div(rhoPhi,epsilon) .*/div(rhoPhi,epsilon) Gauss limitedLinear 1;/' system/fvSchemes"
 arm ras_nutSpalding         refused "nutUSpaldingWallFunction" "" "sed -i 's/nutkWallFunction/nutUSpaldingWallFunction/' 0/nut"

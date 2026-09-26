@@ -188,6 +188,18 @@ KOmegaSSTInput sstIn omegaOldIn  # same site, same reason
 # at one face and is vacuous at its own gate's bound). Wiring it here would be an ungated behaviour change.
 KOmegaSSTInput sstIn nonOrthCoeffs  # the closure half: no turbulent rho fixture can witness it yet -- see above
 
+# ---- the closures' PER-EQUATION div and grad entries (#28) --------------------------------------------
+# The kOmegaSST and kEpsilon device closures take the second equation's own fvSchemes entries now
+# (KOmegaSSTInput::omegaDiv/omegaGrad, KEpsilonInput::epsDiv/epsGrad), gated for interFoam on
+# RAS/damBreak `splitDiv`/`splitDivSST` and on the assembled system in
+# tests/interfoam_sst_assembly_vs_openfoam.sh (arms F-I). rhoSimpleFoam leaves them NULL and that is
+# honest rather than an omission: its HOST reference carries one scheme for both equations, and its driver
+# REFUSES a case whose two entries disagree (rhoSimpleFoamDriver_cpp.cu:424, `turbDivUnsupported`), so a
+# split cannot reach this site at all. THIS LINE LEAVES when rhoSimpleFoam's own host half is split and
+# that refusal is lifted against a fixture -- the device closure is ready for it already.
+KOmegaSSTInput sstIn omegaDiv  # rhoSimpleFoam refuses a split upstream and its host carries one scheme
+KOmegaSSTInput sstIn omegaGrad  # same site, same reason
+
 # interFoam builds a gpu::PressureInput only for gpu::pressurePredictor (device_inter_step.cu:483), and
 # NEITHER reader of this field is on that path: pEqn.cu:237 sits inside `if (in.consistent)` -- SIMPLEC,
 # which interFoam never sets -- and pEqn.cu:310 is assemblePEqn, which interFoam does not call at all

@@ -7,6 +7,7 @@
 // substitution this module refuses, a new kernel is written and the reason is recorded above it.
 #include "turbulence_transport.cuh"   // assembleScalarTransport: shared by every transported scalar
 #include "kEpsilon.cuh"
+#include "limitedSchemes_cpp.cuh"   // EqnDivScheme / EqnGradScheme, dereferenced below
 #include <array>
 #include <map>
 #include <string>
@@ -551,12 +552,22 @@ void refuseUnported(const KEpsilonInput& in)
             "nearWallDist only fills y on `wall` patches, so the wall treatment would divide by an "
             "unset distance.");
     }
+    // THE `bounded` SPLIT IS STILL REFUSED, and the reason it used to give was WRONG rather than the
+    // refusal being wrong. It said "the host reference carries ONE `bounded` flag for both": the host has
+    // honoured it per equation since the convection split (kEpsilon_cpp.cu:563/:615 read eDiv.bounded,
+    // :834 k's), and these kernels have taken it per equation all along (:811 passes boundedEps, :864
+    // boundedK). So the code on both sides is ready and this throw guards nothing real.
+    //
+    // IT STAYS until its own unit, because lifting it is not free: tests/test_rho_kepsilon_cuda.cu's
+    // refusal table asserts it, and that arm has to become a NUMBERS arm -- bound one equation, not the
+    // other, and show the answer differs from both `bounded` and neither -- before the throw comes out.
+    // Removing the throw and leaving that arm expecting it turns a green gate red for no measured reason.
     if (in.boundedK != in.boundedEps)
     {
         throw std::runtime_error(
-            "kEpsilon(cuda): the case bounds one of div(phi,k) / div(phi,epsilon) and not the other. "
-            "The host reference carries ONE `bounded` flag for both, so honouring the split here would "
-            "compare against a reference that cannot express it.");
+            "kEpsilon(cuda): the case bounds one of div(phi,k) / div(phi,epsilon) and not the other. The "
+            "kernels and the host reference both carry it per equation; this throw is waiting for the gate "
+            "arm that would hold the split, not for the code.");
     }
     if (!in.phiInt || !in.phiBnd || !in.phiByRhoInt || !in.phiByRhoBnd)
     {
@@ -705,7 +716,11 @@ void assembleTransport(
     scalar                      sigma,
     const KEpsilonInput&        in,
     const DeviceBuffer<scalar>* bndValues = nullptr,
-    const char*                 stageTag  = nullptr)
+    const char*                 stageTag  = nullptr,
+    // THIS EQUATION'S OWN entries, or null for "take k's" -- see KEpsilonInput::epsDiv. Last and
+    // defaulted, so the k call below is unchanged and reads k's as it always did.
+    const cpu::EqnDivScheme*    eqnDiv    = nullptr,
+    const cpu::EqnGradScheme*   eqnGrad   = nullptr)
 {
     const int nC = dm.nCells;
     const int nB = db.n;
@@ -730,22 +745,22 @@ void assembleTransport(
     turbulence::TransportScheme sc;
     sc.phiInt             = in.phiInt;
     sc.phiBnd             = in.phiBnd;
-    sc.limitedLinear      = in.limitedLinear;
-    sc.limiterCoeff       = in.limiterCoeff;
+    sc.limitedLinear      = eqnDiv ? eqnDiv->limitedLinear : in.limitedLinear;
+    sc.limiterCoeff       = eqnDiv ? eqnDiv->limiterCoeff  : in.limiterCoeff;
     // the LIMITER's gradient: the case's grad(<field>) entry, which lives in `co` and only there.
     // It used to be a second pair of fields on this input struct, and interFoam's site filled
     // neither -- so a case naming `grad(k) cellLimited` limited nothing (1.9e-01 off OpenFOAM's
     // assembled system on RAS/damBreak). Same entry as gradFieldLimitK below: OpenFOAM resolves the
     // limiter's gradient (LimitedScheme.C:56-59) and correctedSnGrad's (correctedSnGrad.C:52-55)
     // through the same gradSchemes lookup.
-    sc.limGradK           = in.co.gradKLimitK;
-    sc.limGradLeastSq     = in.co.gradKLeastSq;
-    sc.linearUpwind       = in.linearUpwind;
-    sc.luGradK            = in.luGradK;
+    sc.limGradK           = eqnGrad ? eqnGrad->cellLimitK   : in.co.gradKLimitK;
+    sc.limGradLeastSq     = eqnGrad ? eqnGrad->leastSquares  : in.co.gradKLeastSq;
+    sc.linearUpwind       = eqnDiv  ? eqnDiv->linearUpwind   : in.linearUpwind;
+    sc.luGradK            = eqnDiv  ? eqnDiv->luGradK        : in.luGradK;
     sc.correctedLaplacian = in.correctedLaplacian;
     sc.nonOrthCoeffs = in.nonOrthCoeffs;
-    sc.gradFieldLimitK    = in.co.gradKLimitK;
-    sc.gradFieldLeastSq   = in.co.gradKLeastSq;
+    sc.gradFieldLimitK    = eqnGrad ? eqnGrad->cellLimitK  : in.co.gradKLimitK;
+    sc.gradFieldLeastSq   = eqnGrad ? eqnGrad->leastSquares : in.co.gradKLeastSq;
     sc.snGradLimitCoeff   = in.snGradLimitCoeff;
     sc.bndValues          = bndValues;
     sc.stageTag           = stageTag;
@@ -802,8 +817,9 @@ void assembleEpsEqn(
     }
     deviceUpdateInletOutlet(dbEps, in.bcPhiBnd ? *in.bcPhiBnd : *in.phiBnd);
 
+    // EPSILON'S OWN entries reach the assembly here; k's call below passes none and so reads k's.
     assembleTransport(E, st.DepsilonEff, st.gammaEpsFace, st.gammaEpsBnd, dm, dbEps, epsilon, nut,
-                      in.co.sigmaEps, in, epsBndValues, /*stageTag=*/"eps");
+                      in.co.sigmaEps, in, epsBndValues, /*stageTag=*/"eps", in.epsDiv, in.epsGrad);
 
     epsReactionKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), in.rhoCell->data(), st.gByNu.data(), k.data(),
                                          epsilon.data(), st.divU.data(), st.divPhi.data(),

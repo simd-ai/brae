@@ -69,6 +69,10 @@
 #include <vector>
 
 namespace brae {
+// `fvSchemes` div and grad entries for ONE equation (cpu/limitedSchemes_cpp.cuh). Forward-declared
+// because this header only holds POINTERS to them; the .cu that dereferences them includes the
+// definition. Keeps a host scheme header out of every device translation unit that sees this one.
+namespace cpu { struct EqnDivScheme; struct EqnGradScheme; }
 namespace gpu {
 namespace kEpsilonRAS {
 
@@ -187,10 +191,20 @@ struct KEpsilonInput
     // SolveControls::gsColour); the driver announces the order per field.
     bool   gsColour = false;
     const DeviceCellColouring* colouring = nullptr;
+    // SEPARATE fvSchemes entries, and the kernels have always taken them separately (the `bounded`
+    // argument of the two assembly kernels, filled from boundedEps at the epsilon call and boundedK at
+    // k's). The refusal that used to stand in front of this pair was guarding code that already worked.
     bool   boundedK   = false;
-    bool   boundedEps = false;    // separate fvSchemes entries; the reference carries ONE bool for both,
-                                  // so a case that bounds one and not the other is refused here rather
-                                  // than quietly bounded twice or not at all.
+    bool   boundedEps = false;
+    // EPSILON'S OWN div and grad entries. `fvc::grad(vf)` resolves `grad(<vf>)` by the FIELD's name and
+    // `fvm::div(phi, vf)` its entry likewise, so `div(phi,k)` and `div(phi,epsilon)` are two schemes and
+    // OpenFOAM assembles each; the same for the gradients the limiter and the corrected laplacian take.
+    // NULL means "epsilon takes k's", which is what every caller got before these existed and what a
+    // case with one `default` still means -- so no positional caller moves and nothing silently reads
+    // the other field's entry. K's stay where they always were: `limitedLinear`/`limiterCoeff`/
+    // `linearUpwind`/`luGradK` here and `co.gradKLeastSq`/`co.gradKLimitK` on the coefficients.
+    const cpu::EqnDivScheme*  epsDiv  = nullptr;
+    const cpu::EqnGradScheme* epsGrad = nullptr;
     bool   correctedLaplacian = false;   // BOTH halves: the implicit coefficient AND the explicit source
     bool   nonOrthCoeffs = false;   // nonOrthDeltaCoeffs without the correction -- inter_ueqn_cpp.cuh:181
     scalar snGradLimitCoeff   = 0.0;

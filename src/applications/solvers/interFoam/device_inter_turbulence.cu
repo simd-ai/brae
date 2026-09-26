@@ -664,21 +664,21 @@ void deviceCorrectInterTurbulence(
         // ONE SCHEME FOR BOTH EQUATIONS is what this closure's kernels carry, so a case whose two
         // div entries differ is refused rather than run under k's -- the host honours it per equation
         // (tests/interfoam_ras_dambreak_vs_openfoam.sh `splitDiv`).
-        if (t.kDiv.limitedLinear != t.secondDiv.limitedLinear
-         || (t.kDiv.limitedLinear && t.kDiv.limiterCoeff != t.secondDiv.limiterCoeff))
-            throw std::runtime_error(
-                "brae interFoam (device): fvSchemes gives div(phi,k) and div(phi,omega) different "
-                "convection schemes; this closure carries one scheme for both equations.");
+        // PER-EQUATION NOW, on this arm as on the host: omega's div entry goes over as
+        // KOmegaSSTInput::omegaDiv and k's stays where it was. The refusal here said "this closure
+        // carries one scheme for both equations", which stopped being true when schemeOf() started
+        // taking the equation's own entries.
         // ...and the GRADIENT of each equation, which this closure also carries as ONE pair: `sin.co` is
         // t.sstCoeffs, whose gradKLeastSq/gradKLimitK are k's. The host honours grad(k) and grad(omega)
         // separately (measured on RAS/waterChannel: giving grad(omega) its own scheme moves OpenFOAM's
         // own omega 9.4e-02 over all 28,000 cells), so a mismatch is refused here rather than run under
         // k's gradient.
-        if (t.kGrad.leastSquares != t.secondGrad.leastSquares
-         || t.kGrad.cellLimitK != t.secondGrad.cellLimitK)
-            throw std::runtime_error(
-                "brae interFoam (device): fvSchemes gives grad(k) and grad(omega) different schemes; "
-                "this closure carries one gradient for both equations.");
+        // ...and the GRADIENTS likewise, through KOmegaSSTInput::omegaGrad. Two places read them:
+        // the assembly's limiter and corrected-laplacian gradients (schemeOf), and CDkOmega, which takes
+        // grad(k) AND grad(omega) in one expression (kOmegaSSTBase.C:548) and so must resolve each by
+        // its own field's name.
+        sin.omegaDiv  = &t.secondDiv;
+        sin.omegaGrad = &t.secondGrad;
         sin.limitedLinear   = t.kDiv.limitedLinear;
         sin.limiterCoeff    = t.kDiv.limiterCoeff;
         // ...and the CONVECTION scheme, which this arm now RUNS. It was refused by name, and the
@@ -820,17 +820,11 @@ void deviceCorrectInterTurbulence(
     kin.bcPhiBnd = in.phiBnd;
     // ...and the same for kEpsilon's device closure.
     // as the SST branch above: one scheme for both equations in the kernels, so a mismatch is refused
-    if (t.kDiv.limitedLinear != t.secondDiv.limitedLinear
-     || (t.kDiv.limitedLinear && t.kDiv.limiterCoeff != t.secondDiv.limiterCoeff))
-        throw std::runtime_error(
-            "brae interFoam (device): fvSchemes gives div(phi,k) and div(phi,epsilon) different "
-            "convection schemes; this closure carries one scheme for both equations.");
+    // PER-EQUATION NOW, as in the SST branch above and as the host does: epsilon's entries go over
+    // as KEpsilonInput::epsDiv/epsGrad, k's stay where they were.
     // ...and the gradients, as the SST branch above: one pair in the kernels, so a mismatch is refused
-    if (t.kGrad.leastSquares != t.secondGrad.leastSquares
-     || t.kGrad.cellLimitK != t.secondGrad.cellLimitK)
-        throw std::runtime_error(
-            "brae interFoam (device): fvSchemes gives grad(k) and grad(epsilon) different schemes; "
-            "this closure carries one gradient for both equations.");
+    kin.epsDiv  = &t.secondDiv;
+    kin.epsGrad = &t.secondGrad;
     kin.limitedLinear  = t.kDiv.limitedLinear;
     kin.limiterCoeff   = t.kDiv.limiterCoeff;
     // ...and the same for kEpsilon's device closure, which RUNS it now too. It was refused as

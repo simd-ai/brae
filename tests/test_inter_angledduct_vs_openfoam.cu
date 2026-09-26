@@ -401,26 +401,6 @@ int main(
     {
         std::printf("  (no CUDA device: the device arm is not exercised)\n");
     }
-    else if (splitGrad)
-    {
-        // THE DEVICE REFUSES A GRADIENT SPLIT, by name. Its closure carries ONE pair of gradient flags in
-        // the kernels (`sin.co`/`kin.co` are the model coefficients, whose gradKLeastSq/gradKLimitK are
-        // k's), so grad(epsilon) would be computed with grad(k)'s scheme. The host honours each.
-        InterFields dev;
-        bool named = false;
-        try
-        {
-            runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, false, &dev);
-            std::printf("  FAIL the device arm RAN a case whose two turbulence gradients differ\n");
-            ++failures;
-        }
-        catch (const std::exception& e)
-        {
-            named = std::string(e.what()).find("one gradient for both equations") != std::string::npos;
-            std::printf("  device refusal: %s\n", e.what());
-        }
-        check("the device arm refuses the gradient split under its own name", named);
-    }
     else
     {
         // fvOptions' explicitPorositySource/DarcyForchheimer in the device UEqn, and the massFlowRate
@@ -456,11 +436,18 @@ int main(
         check("...its k", eK.rel() < B.k);
         check("...its epsilon", eE.rel() < B.epsilon);
         check("...and its nut", eN.rel() < B.nut);
+        // THE FLOOR IS THE PROFILE'S, as the host half's is: `splitGrad`'s control moves OpenFOAM's own U
+        // by 1.939e-04, so a hardcoded 1e-3 would fail an arm that is correct. The device arm runs the
+        // gradient split now -- its closure takes each equation's own entry through
+        // KEpsilonInput::epsGrad / KOmegaSSTInput::omegaGrad.
         check(nonOrthArm ? "the coefficient choice moves OpenFOAM's own U far more than the DEVICE is "
                            "from it -- the device arm took nonOrthDeltaCoeffs too, and its refusal of "
                            "`uncorrected` on a sheared mesh is lifted by these lines"
-                         : "the porosity moves OpenFOAM's own U far more than the DEVICE is from it",
-              dOffU.rel() > scalar(1000)*std::fmax(eU.rel(), scalar(1e-14)) && dOffU.rel() > scalar(1e-3));
+              : splitGrad ? "THE GRADIENT SPLIT moves OpenFOAM's own U far more than the DEVICE is from "
+                            "it -- the device closure resolves grad(k) and grad(epsilon) separately now"
+                          : "the porosity moves OpenFOAM's own U far more than the DEVICE is from it",
+              dOffU.rel() > scalar(1000)*std::fmax(eU.rel(), scalar(1e-14))
+           && dOffU.rel() > (splitGrad ? scalar(1e-5) : scalar(1e-3)));
     }
 
     std::printf("test_inter_angledduct_vs_openfoam: %d failures\n", failures);

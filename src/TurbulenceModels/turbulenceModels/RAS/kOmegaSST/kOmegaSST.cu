@@ -1,6 +1,7 @@
 // The OF-mirror kOmegaSST on the device. See kOmegaSST.cuh for why this exists alongside the legacy
 // deviceKOmegaSSTCorrect, and kOmegaSST_cpp.cu for the host twin this must agree with.
 #include "kOmegaSST.cuh"
+#include "limitedSchemes_cpp.cuh"   // EqnDivScheme / EqnGradScheme, dereferenced below
 #include "sst_stage_dump.cuh"
 #include "turbulence_transport.cuh"   // assembleScalarTransport / solveScalarEqn -- shared with kEpsilon
 #include "kEpsilon.cuh"               // boundField: Foam::bound, the mirror's area-weighted form
@@ -88,11 +89,15 @@ void refuseUnsupported(const KOmegaSSTInput& in)
             "kOmegaSST(cuda): a turbulence wall function sits on a patch that is not of type `wall`. "
             "nearWallDist only fills y on `wall` patches, so the wall treatment would divide by an "
             "unset distance.");
+    // THE `bounded` SPLIT IS STILL REFUSED -- see the kEpsilon twin for why the code is ready and the
+    // throw stays anyway. What this used to claim ("this closure carries one flag for both") was never
+    // true of the kernels: :782 reads in.boundedOmega and :897 in.boundedK, and the host honours it per
+    // equation too (kOmegaSST_cpp.cu:929 reads oDiv.bounded, :1094 k's).
     if (in.boundedK != in.boundedOmega)
         throw std::runtime_error(
-            "kOmegaSST(cuda): `bounded` is set on one of div(phi,k)/div(phi,omega) and not the other. "
-            "This closure carries one flag for both; refusing rather than bounding an equation the case "
-            "did not ask to bound.");
+            "kOmegaSST(cuda): `bounded` is set on one of div(phi,k)/div(phi,omega) and not the other. The "
+            "kernels and the host reference both carry it per equation; this throw is waiting for the gate "
+            "arm that would hold the split, not for the code.");
     if (!in.nuCell || !in.nuBndFace)
         throw std::runtime_error(
             "kOmegaSST(cuda): the compressible closure needs nu = mu(T)/rho per cell AND per boundary "
@@ -100,27 +105,31 @@ void refuseUnsupported(const KOmegaSSTInput& in)
 }
 
 // The scheme block every transported scalar here shares -- one place, so k and omega cannot drift.
-turbulence::TransportScheme schemeOf(const KOmegaSSTInput& in)
+// `eqnDiv`/`eqnGrad` are THIS equation's entries, or null for "take k's" -- see
+// KOmegaSSTInput::omegaDiv. Defaulted, so a caller that wants k's keeps its one-argument call.
+turbulence::TransportScheme schemeOf(const KOmegaSSTInput& in,
+                                    const cpu::EqnDivScheme*  eqnDiv  = nullptr,
+                                    const cpu::EqnGradScheme* eqnGrad = nullptr)
 {
     turbulence::TransportScheme sc;
     sc.phiInt             = in.phiInt;
     sc.phiBnd             = in.phiBnd;
-    sc.limitedLinear      = in.limitedLinear;
-    sc.limiterCoeff       = in.limiterCoeff;
+    sc.limitedLinear      = eqnDiv ? eqnDiv->limitedLinear : in.limitedLinear;
+    sc.limiterCoeff       = eqnDiv ? eqnDiv->limiterCoeff  : in.limiterCoeff;
     // the LIMITER's gradient: the case's grad(<field>) entry, which lives in `co` and only there.
     // It used to be a second pair of fields on this input struct, and interFoam's site filled
     // neither -- so a case naming `grad(k) cellLimited` limited nothing (1.9e-01 off OpenFOAM's
     // assembled system on RAS/damBreak). Same entry as gradFieldLimitK below: OpenFOAM resolves the
     // limiter's gradient (LimitedScheme.C:56-59) and correctedSnGrad's (correctedSnGrad.C:52-55)
     // through the same gradSchemes lookup.
-    sc.limGradK           = in.co.gradKLimitK;
-    sc.limGradLeastSq     = in.co.gradKLeastSq;
-    sc.linearUpwind       = in.linearUpwind;
-    sc.luGradK            = in.luGradK;
+    sc.limGradK           = eqnGrad ? eqnGrad->cellLimitK  : in.co.gradKLimitK;
+    sc.limGradLeastSq     = eqnGrad ? eqnGrad->leastSquares : in.co.gradKLeastSq;
+    sc.linearUpwind       = eqnDiv  ? eqnDiv->linearUpwind  : in.linearUpwind;
+    sc.luGradK            = eqnDiv  ? eqnDiv->luGradK       : in.luGradK;
     sc.correctedLaplacian = in.correctedLaplacian;
     sc.nonOrthCoeffs = in.nonOrthCoeffs;
-    sc.gradFieldLimitK    = in.co.gradKLimitK;
-    sc.gradFieldLeastSq   = in.co.gradKLeastSq;
+    sc.gradFieldLimitK    = eqnGrad ? eqnGrad->cellLimitK  : in.co.gradKLimitK;
+    sc.gradFieldLeastSq   = eqnGrad ? eqnGrad->leastSquares : in.co.gradKLeastSq;
     sc.snGradLimitCoeff   = in.snGradLimitCoeff;
     // THE PAIR and the flux those equations convect with on its faces. `gammaCell` is NOT set here:
     // it is the equation's own effective diffusivity as a CELL field and differs between omega and k,
@@ -632,10 +641,15 @@ void correct(
     }
     if (omegaBndLast.size()) deviceCopy(obv, omegaBndLast);
     else                     deviceBCValue(dbOmega, omega, obv);
-    if (in.co.gradKLeastSq) deviceLeastSquaresGrad(dm, omega, obv, ogx, ogy, ogz, in.cyc);
-    else                    deviceGaussGrad(dm, omega, obv, ogx, ogy, ogz);
-    if (pair && !in.co.gradKLeastSq) deviceCyclicAddGrad(*in.cyc, omega, dm.V, ogx, ogy, ogz);   // as for k
-    if (in.co.gradKLimitK > scalar(0))
+    // OMEGA'S OWN gradient entry. CDkOmega is grad(k) & grad(omega) in one expression
+    // (kOmegaSSTBase.C:548) and OpenFOAM resolves each by ITS field's name, so this half cannot read
+    // grad(k)'s scheme. Null omegaGrad means the case gave one `default`, which is k's.
+    const bool  oLeastSq = in.omegaGrad ? in.omegaGrad->leastSquares : in.co.gradKLeastSq;
+    const scalar oLimitK = in.omegaGrad ? in.omegaGrad->cellLimitK   : in.co.gradKLimitK;
+    if (oLeastSq) deviceLeastSquaresGrad(dm, omega, obv, ogx, ogy, ogz, in.cyc);
+    else          deviceGaussGrad(dm, omega, obv, ogx, ogy, ogz);
+    if (pair && !oLeastSq) deviceCyclicAddGrad(*in.cyc, omega, dm.V, ogx, ogy, ogz);   // as for k
+    if (oLimitK > scalar(0))
     {
         if (pair)
         {
@@ -643,7 +657,7 @@ void correct(
             oIfs[nOIfs++] = { in.cyc->n, in.cyc->ownCell.data(), cycONbr.data(),
                               in.cyc->dOwnX.data(), in.cyc->dOwnY.data(), in.cyc->dOwnZ.data() };
         }
-        deviceCellLimitGrad(dm, omega, obv, ogx, ogy, ogz, in.co.gradKLimitK, oIfs, nOIfs);
+        deviceCellLimitGrad(dm, omega, obv, ogx, ogy, ogz, oLimitK, oIfs, nOIfs);
     }
     // F1/F2 blend on the KINEMATIC laminar viscosity, per cell -- the compressible lineage has no
     // case-constant nu, and arg1/arg2 are written in nu, not mu. FP-2: CDkOmega, F1 and F2 in one launch
@@ -761,7 +775,8 @@ void correct(
             { flat[c*3+0]=hx[c]; flat[c*3+1]=hy[c]; flat[c*3+2]=hz[c]; }
             sd.components("gradOmega", flat, 3);
         }
-        turbulence::TransportScheme scOmega = sc;
+        // OMEGA'S OWN entries, not a copy of k's. `sc` above is k's and the k block below still takes it.
+        turbulence::TransportScheme scOmega = schemeOf(in, in.omegaDiv, in.omegaGrad);
         scOmega.bndValues = omegaBndLast.size() ? &omegaBndLast : nullptr;
         // ...and the assembly's OWN limiter weights, beside the recomputed pair above: the two are
         // the same number only if the gradient the limiter uses is the gradient CDkOmega built.

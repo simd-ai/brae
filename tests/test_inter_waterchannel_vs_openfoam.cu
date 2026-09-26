@@ -344,7 +344,7 @@ int main(
     {
         std::printf("  (no CUDA device: the device refusal is not exercised)\n");
     }
-    else if (patchBeta1Differs || gradSplit)
+    else if (patchBeta1Differs)
     {
         // THE DEVICE REFUSES A PATCH `beta1`, and the condition is read from the CASE rather than passed
         // as a profile name: omegaWallFunction reads its own beta1 from the patch dictionary
@@ -362,12 +362,10 @@ int main(
         catch (const std::exception& e)
         {
             const std::string w = e.what();
-            named = w.find(gradSplit ? "one gradient for both equations"
-                                     : "its own omegaWallFunction coefficient") != std::string::npos;
+            named = w.find("its own omegaWallFunction coefficient") != std::string::npos;
             std::printf("  device refusal: %s\n", e.what());
         }
-        check(gradSplit ? "the device arm refuses the gradient split under its own name"
-                        : "the device arm refuses a patch beta1 under its own name", named);
+        check("the device arm refuses a patch beta1 under its own name", named);
     }
     else
     {
