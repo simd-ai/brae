@@ -3780,6 +3780,16 @@ add_test(NAME poly_topo_change_order_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/poly_topo_change_order_vs_openfoam.sh)
 set_tests_properties(poly_topo_change_order_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
+# UNITS 3 AND 4 of the dynamicRefineFvMesh port: the action surface and changeMesh, against OpenFOAM's
+# own mapPolyMesh for a scripted action list both codes read from the same file (tools/dumpTopoChange).
+add_executable(test_topo_change_vs_openfoam tests/test_topo_change_vs_openfoam.cu)
+target_include_directories(test_topo_change_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_topo_change_vs_openfoam PRIVATE brae_core)
+add_test(NAME topo_change_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/topo_change_vs_openfoam.sh)
+set_tests_properties(topo_change_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
 # brae's dynamicRefineFvMeshCoeffs reader against the three shipped AMR tutorials' own dictionaries --
 # flat, flat-beside-a-subdict, and wrapped. The oracle is the dictionary; the script says why all three.
 add_executable(test_refine_controls tests/test_refine_controls.cu)
