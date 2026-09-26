@@ -64,6 +64,8 @@ Dump readDump(const std::string& path)
                             "facesFromEdgesMap", "facesFromFacesMap", "cellsFromPointsMap",
                             "cellsFromEdgesMap", "cellsFromFacesMap", "cellsFromCellsMap",
                             "points", "faces", "patches"};
+    // 5b-2 reads the mesh the refinement produced, so the face and patch blocks are parsed now
+    (void)0;
     std::string line;
     while (std::getline(is, line))
     {
@@ -84,7 +86,7 @@ Dump readDump(const std::string& path)
             {
                 std::getline(is, line);
                 std::istringstream rs(line);
-                if (key == "cellAddedCells")
+                if (key == "cellAddedCells" || key == "faces")
                 {
                     label k = 0;
                     rs >> k;
@@ -92,8 +94,14 @@ Dump readDump(const std::string& path)
                     for (label j = 0; j < k; ++j) rs >> e[static_cast<std::size_t>(j)];
                     v.push_back(e);
                 }
+                else if (key == "patches")
+                {
+                    std::string nm; label st = 0, sz = 0;
+                    rs >> nm >> st >> sz;
+                    v.push_back({st, sz});
+                }
             }
-            if (key == "cellAddedCells") d.listLists[key] = v;
+            if (key == "cellAddedCells" || key == "faces" || key == "patches") d.listLists[key] = v;
             continue;
         }
         if (key.rfind('n', 0) == 0 && key.size() > 1
@@ -184,7 +192,9 @@ int main(int argc, char** argv)
     const std::vector<std::vector<label>> cells = meshCells(m);
     const std::vector<std::vector<label>> cellPts = cellPointsFromCells(m, cells);
     const std::vector<std::vector<label>> ptCells = pointCellsFromCells(m, cells);
-    const std::vector<std::vector<label>> cellEdg = buildCellEdges(cells, buildFaceEdges(m, me));
+    const std::vector<std::vector<label>> fEdges = buildFaceEdges(m, me);
+    const std::vector<std::vector<label>> eFaces = buildEdgeFaces(m, fEdges);
+    const std::vector<std::vector<label>> cellEdg = buildCellEdges(cells, fEdges);
 
     Levels lv;
     // THE LEVELS ARE THE DUMP'S, not assumed zero. A mesh straight out of blockMesh has every level 0 --
@@ -216,6 +226,8 @@ int main(int argc, char** argv)
     v.cellPoints = &cellPts;
     v.pointCells = &ptCells;
     v.cellEdges = &cellEdg;
+    v.faceEdges = &fEdges;
+    v.edgeFaces = &eFaces;
     v.cellCentres = &g.C();
     v.faceCentres = &g.Cf();
 
@@ -274,9 +286,65 @@ int main(int argc, char** argv)
     compareList("cellLevel after setRefinement", marks.newCellLevel, d, "cellLevelAfterSet");
     compareList("pointLevel after setRefinement", marks.newPointLevel, d, "pointLevelAfterSet");
 
-    // ---- what unit 5b-2 turns on -----------------------------------------------------------------
-    skip("the mapPolyMesh -- needs section 9 (the faces), which is unit 5b-2");
-    skip("the new mesh's faces, owner, neighbour and patch slicing -- likewise");
+    // ---- SECTION 9: THE FACES, and then the mesh and the map (unit 5b-2) --------------------------
+    setRefinementFaces(v, lv, marks, a);
+    std::printf("  after the faces: %zu faces accumulated\n", a.state.faces.size());
+
+    polyTopoChange::ChangeMeshInput ci;
+    ci.nOldPoints = (label)m.points().size();
+    ci.nOldFaces = m.nFaces();
+    ci.nOldCells = m.nCells();
+    ci.oldPatchStarts = starts;
+    ci.oldPatchSizes = sizes;
+    ci.oldPatchNMeshPoints.assign(starts.size(), label(0));
+    ci.patchTypes = types;
+    ci.nZones = 0;
+    polyTopoChange::ChangedMesh out;
+    polyTopoChange::TopoChangeMap map;
+    polyTopoChange::changeMesh(a, ci, out, map);
+    std::printf("  brae's mesh: %zu points, %zu faces (%d internal), %d cells\n",
+                out.points.size(), out.faces.size(), (int)out.nInternalFaces, (int)out.nCells);
+
+    check("the mesh has OpenFOAM's face and internal-face counts",
+          (label)out.faces.size() == d.scalars.at("nFaces")
+       && out.nInternalFaces == d.scalars.at("nInternalFaces"));
+    compareList("owner", out.faceOwner, d, "owner");
+    compareList("neighbour", out.faceNeighbour, d, "neighbour");
+    compareList("pointMap", map.pointMap, d, "pointMap");
+    compareList("faceMap", map.faceMap, d, "faceMap");
+    compareList("cellMap", map.cellMap, d, "cellMap");
+    compareList("reversePointMap", map.reversePointMap, d, "reversePointMap");
+    compareList("reverseFaceMap", map.reverseFaceMap, d, "reverseFaceMap");
+    compareList("reverseCellMap", map.reverseCellMap, d, "reverseCellMap");
+    compareList("flipFaceFlux", map.flipFaceFlux, d, "flipFaceFlux");
+    {
+        const auto it = d.listLists.find("faces");
+        bool ok = (it != d.listLists.end()) && (out.faces.size() == it->second.size());
+        std::size_t firstBad = out.faces.size();
+        for (std::size_t i = 0; ok && i < out.faces.size(); ++i)
+        {
+            if (out.faces[i] != it->second[i]) { ok = false; firstBad = i; }
+        }
+        if (!ok && firstBad < out.faces.size())
+        {
+            std::printf("  FAIL: face %zu differs -- brae %zu vertices, OpenFOAM %zu\n",
+                        firstBad, out.faces[firstBad].size(), it->second[firstBad].size());
+            ++failures;
+        }
+        else
+        {
+            check("every face's vertex list is OpenFOAM's", ok);
+        }
+    }
+    {
+        const auto it = d.listLists.find("patches");
+        bool ok = (it != d.listLists.end()) && (out.patchStarts.size() == it->second.size());
+        for (std::size_t i = 0; ok && i < out.patchStarts.size(); ++i)
+        {
+            ok = (out.patchStarts[i] == it->second[i][0]) && (out.patchSizes[i] == it->second[i][1]);
+        }
+        check("the patch slicing is OpenFOAM's", ok);
+    }
     skip("cellLevelFinal / pointLevelFinal after changeMesh -- needs hexRef8::updateMesh, unit 6");
 
     std::printf("test_hex_ref8_vs_openfoam: %d failures, %d skipped\n", failures, skipped);

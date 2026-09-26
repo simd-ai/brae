@@ -45,6 +45,21 @@
 #                                     which is the weaker of the two demonstrations. Recorded as such.
 # That is the measurement that justifies the `twice` arm existing, and it is why the other three are not
 # enough on their own even though they are the realistic configurations.
+# UNIT 5b-2's FAIL-PROOFS, on the faces. Unlike 5b-1's these bite on EVERY arm, because a face is a face
+# whatever the levels are:
+#   case 1 ADDS all four split faces instead of modifying the original and adding three
+#                                     7 failures on all four arms, starting with the face count
+#   addFace/modFace do not reverse the face when the neighbour is the lower cell
+#                                     1 failure on all four: face 6 / 53 / 6 / 62
+#   storeMidPointInfo does not flip the new internal face when the anchors swap
+#                                     1 failure on all four: face 4441 / 4816 / 4777 / 7612
+#   case 2 picks the face's MAX-level point as the anchor instead of the min
+#                                     GREEN on all four -- NOT WITNESSED
+# The last one is not witnessed and that is said rather than left: a face that does not split but has a
+# split edge sits on the edge of the refined region, and on these fixtures it carries exactly ONE anchor
+# of each split cell -- so min and max pick the same point and getAnchorCell returns the same child. A
+# configuration where such a face has two anchors of one split cell would tell them apart; none of these
+# four produces one.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_hex_ref8_vs_openfoam"

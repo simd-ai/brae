@@ -5,6 +5,8 @@
 
 #include <algorithm>
 #include <limits>
+#include <map>
+#include <utility>
 #include <stdexcept>
 #include <string>
 
@@ -18,6 +20,34 @@ using polyTopoChange::addCell;
 namespace {
 
 constexpr const char* WHO = "brae hexRef8::setRefinement: ";
+
+// EVERY view pointer, named. This was a plain `if (!a || !b || ...) throw "incomplete"` over the eight
+// the first stage needed, and unit 5b-2 added two more (faceEdges, edgeFaces) that it did not cover --
+// so the second stage dereferenced a null and SEGFAULTED where a message would have named the field in
+// one line. Found by gdb on the first run of the faces (of-debug: backtrace first).
+void requireView(const MeshView& v)
+{
+    const std::pair<const void*, const char*> needed[] =
+    {
+        {static_cast<const void*>(v.m), "the mesh"},
+        {static_cast<const void*>(v.edges), "edges()"},
+        {static_cast<const void*>(v.faceEdges), "faceEdges()"},
+        {static_cast<const void*>(v.edgeFaces), "edgeFaces()"},
+        {static_cast<const void*>(v.cells), "cells()"},
+        {static_cast<const void*>(v.cellPoints), "cellPoints()"},
+        {static_cast<const void*>(v.pointCells), "pointCells()"},
+        {static_cast<const void*>(v.cellEdges), "cellEdges()"},
+        {static_cast<const void*>(v.cellCentres), "cellCentres()"},
+        {static_cast<const void*>(v.faceCentres), "faceCentres()"},
+    };
+    for (const auto& n : needed)
+    {
+        if (!n.first)
+            throw std::runtime_error(
+                std::string(WHO) + "the mesh view has no " + n.second + ". Every field is required: a "
+                "missing one is a caller that has not built that addressing.");
+    }
+}
 
 // DynamicList's `operator()(label)` GROWS the list and returns a reference, which is how OpenFOAM writes
 // `newPointLevel(addedPointi) = ...` for a point that does not exist yet (hexRef8.C:3364 and friends).
@@ -105,9 +135,7 @@ std::vector<std::vector<label>> setRefinementPointsAndCells(
     TopoActions&                    a,
     RefinementMarks&                marks)
 {
-    if (!v.m || !v.edges || !v.cells || !v.cellPoints || !v.pointCells || !v.cellEdges
-     || !v.cellCentres || !v.faceCentres)
-        throw std::runtime_error(std::string(WHO) + "the mesh view is incomplete.");
+    requireView(v);
 
     // THE REFUSAL, before anything is added. Every sync in setRefinement is a max or an or across a
     // coupled patch, and in serial with none they are identities -- so they are skipped, and the case
@@ -312,6 +340,710 @@ std::vector<std::vector<label>> setRefinementPointsAndCells(
         refinedCells[i] = marks.cellAddedCells[static_cast<std::size_t>(cellsToRefine[i])];
     }
     return refinedCells;
+}
+
+
+// ----------------------------------------------------------------------------------------------
+// UNIT 5b-2: SECTION 9, THE FACES. See the header for the four kinds and why their order matters.
+
+namespace {
+
+// face::fcIndex / rcIndex -- the next and previous position, wrapping
+inline label fcIndex(label fp, std::size_t n) { return static_cast<label>((static_cast<std::size_t>(fp) + 1) % n); }
+inline label rcIndex(label fp, std::size_t n) { return static_cast<label>((static_cast<std::size_t>(fp) + n - 1) % n); }
+
+// face::flip() (face.H): the FIRST vertex stays and the rest reverse -- not a plain reverse. Every
+// owner/neighbour swap below reorients the face this way, and getting it wrong inverts a flux.
+void flipFace(std::vector<label>& f)
+{
+    if (f.size() > 2) std::reverse(f.begin() + 1, f.end());
+}
+
+std::vector<label> reverseFace(const std::vector<label>& f)
+{
+    std::vector<label> out(f);
+    flipFace(out);
+    return out;
+}
+
+// meshTools::findEdge(mesh, p0, p1): the edge between two points, or -1. Found through pointEdges, which
+// is what OpenFOAM's own does.
+label findEdge(
+    const MeshEdges& me,
+    label            p0,
+    label            p1)
+{
+    for (const label edgei : me.pointEdges[static_cast<std::size_t>(p0)])
+    {
+        const label s = me.start[static_cast<std::size_t>(edgei)];
+        const label t = me.end[static_cast<std::size_t>(edgei)];
+        if ((s == p0 && t == p1) || (s == p1 && t == p0)) return edgei;
+    }
+    return -1;
+}
+
+// getFaceInfo (:104-129) reduced to what a zone-free mesh needs: the patch, or -1 inside. Zones are
+// refused at changeMesh, so zoneID is -1 and zoneFlip false at every call -- which is why neither is
+// carried here rather than being passed as constants through six functions.
+label facePatch(
+    const MeshView& v,
+    label           facei)
+{
+    if (facei < v.m->nInternalFaces()) return -1;
+    label acc = 0;
+    for (std::size_t pi = 0; pi < v.m->patches().size(); ++pi)
+    {
+        const auto& p = v.m->patches()[pi];
+        if (facei >= p.start && facei < p.start + p.size) return static_cast<label>(pi);
+        ++acc;
+    }
+    (void)acc;
+    throw std::runtime_error(
+        std::string(WHO) + "boundary face " + std::to_string(facei) + " is in no patch.");
+}
+
+// hexRef8::addFace (:133-189). The face is added with the ORIGINAL as its master face, and owner and
+// neighbour are ordered -- a boundary face (nei == -1) or own < nei goes as given, otherwise the pair is
+// swapped AND the face reversed.
+label addSplitFace(
+    const MeshView&           v,
+    TopoActions&              a,
+    label                     facei,
+    const std::vector<label>& newFace,
+    label                     own,
+    label                     nei)
+{
+    const label patchID = facePatch(v, facei);
+    if (nei == -1 || own < nei)
+    {
+        return polyTopoChange::addFace(a, newFace, own, nei, -1, -1, /*masterFaceID=*/facei,
+                                       /*flipFaceFlux=*/false, patchID);
+    }
+    return polyTopoChange::addFace(a, reverseFace(newFace), nei, own, -1, -1, facei, false, patchID);
+}
+
+// hexRef8::addInternalFace (:198-290). BOTH branches of OpenFOAM's are the same call -- its own comment
+// on the boundary one is "For now create out of nothing", with the inflate-from-point alternative left
+// commented out -- so the face carries NO master and is not mapped. That is what keeps changeMesh's
+// inflation refusal out of reach on the refinement path.
+label addNewInternalFace(
+    TopoActions&              a,
+    const std::vector<label>& newFace,
+    label                     own,
+    label                     nei)
+{
+    return polyTopoChange::addFace(a, newFace, own, nei, -1, -1, -1, false, -1);
+}
+
+// hexRef8::modFace (:294-354). Does NOTHING unless the owner, the neighbour or the vertex list actually
+// changed -- so an untouched face produces no action at all, and the same owner/neighbour ordering rule
+// as addFace applies when it does.
+void modifySplitFace(
+    const MeshView&           v,
+    TopoActions&              a,
+    label                     facei,
+    const std::vector<label>& newFace,
+    label                     own,
+    label                     nei)
+{
+    const PrimitiveMesh& m = *v.m;
+    const bool internal = (facei < m.nInternalFaces());
+    const label b = m.faceOffsets()[facei];
+    const label e = m.faceOffsets()[facei + 1];
+    const bool sameVerts = (static_cast<label>(newFace.size()) == e - b)
+        && std::equal(newFace.begin(), newFace.end(), m.faceVerts().begin() + b);
+    if (own == m.owner()[facei]
+     && (!internal || nei == m.neighbour()[facei])
+     && sameVerts)
+    {
+        return;
+    }
+    const label patchID = facePatch(v, facei);
+    if (nei == -1 || own < nei)
+    {
+        polyTopoChange::modifyFace(a, newFace, facei, own, nei, /*flipFaceFlux=*/false, patchID);
+    }
+    else
+    {
+        polyTopoChange::modifyFace(a, reverseFace(newFace), facei, nei, own, false, patchID);
+    }
+}
+
+}   // namespace
+
+
+label findLevel(
+    const MeshView&           v,
+    const Levels&             lv,
+    label                     facei,
+    const std::vector<label>& f,
+    label                     startFp,
+    bool                      searchForward,
+    label                     wantedLevel)
+{
+    // :697-740
+    label fp = startFp;
+    for (std::size_t i = 0; i < f.size(); ++i)
+    {
+        const label pointi = f[static_cast<std::size_t>(fp)];
+        if (lv.pointLevel[static_cast<std::size_t>(pointi)] < wantedLevel)
+        {
+            throw std::runtime_error(
+                std::string(WHO) + "walking face " + std::to_string(facei) + " for level "
+                + std::to_string(wantedLevel) + " met point " + std::to_string(pointi) + " at level "
+                + std::to_string(lv.pointLevel[static_cast<std::size_t>(pointi)])
+                + ", which is BELOW it. OpenFOAM FatalErrors here too (:712-724): the face is not the "
+                "shape the caller assumed.");
+        }
+        if (lv.pointLevel[static_cast<std::size_t>(pointi)] == wantedLevel) return fp;
+        fp = searchForward ? fcIndex(fp, f.size()) : rcIndex(fp, f.size());
+    }
+    throw std::runtime_error(
+        std::string(WHO) + "face " + std::to_string(facei) + " has no point at level "
+        + std::to_string(wantedLevel) + ". OpenFOAM FatalErrors here too (:737-739).");
+}
+
+
+label findMinLevel(
+    const Levels&             lv,
+    const std::vector<label>& f)
+{
+    // :745-759. STRICTLY less, so the FIRST vertex at the minimum wins.
+    label minLevel = std::numeric_limits<label>::max();
+    label minFp = -1;
+    for (std::size_t fp = 0; fp < f.size(); ++fp)
+    {
+        const label level = lv.pointLevel[static_cast<std::size_t>(f[fp])];
+        if (level < minLevel)
+        {
+            minLevel = level;
+            minFp = static_cast<label>(fp);
+        }
+    }
+    return minFp;
+}
+
+
+label getAnchorCell(
+    const MeshView&                        v,
+    const std::vector<std::vector<label>>& cellAnchorPoints,
+    const std::vector<std::vector<label>>& cellAddedCells,
+    label                                  celli,
+    label                                  facei,
+    label                                  pointi)
+{
+    // :540-593
+    const std::vector<label>& anchors = cellAnchorPoints[static_cast<std::size_t>(celli)];
+    if (anchors.empty()) return celli;                    // the cell was not split: it is its own child
+    {
+        const auto it = std::find(anchors.begin(), anchors.end(), pointi);
+        if (it != anchors.end())
+        {
+            return cellAddedCells[static_cast<std::size_t>(celli)]
+                   [static_cast<std::size_t>(it - anchors.begin())];
+        }
+    }
+    // `pointi` is not one of the eight. An ALREADY-REFINED face reaches here, and OpenFOAM then looks for
+    // any of the face's own vertices among the anchors instead (:557-567).
+    const PrimitiveMesh& m = *v.m;
+    for (label k = m.faceOffsets()[facei]; k < m.faceOffsets()[facei + 1]; ++k)
+    {
+        const auto it = std::find(anchors.begin(), anchors.end(), m.faceVerts()[k]);
+        if (it != anchors.end())
+        {
+            return cellAddedCells[static_cast<std::size_t>(celli)]
+                   [static_cast<std::size_t>(it - anchors.begin())];
+        }
+    }
+    throw std::runtime_error(
+        std::string(WHO) + "no anchor of split cell " + std::to_string(celli) + " is on face "
+        + std::to_string(facei) + " (looking for point " + std::to_string(pointi)
+        + "). OpenFOAM FatalErrors here too (:578-590).");
+}
+
+
+namespace {
+
+// walkFaceToMid (:1464-1502). From an anchor at `startFp`, collect the one or two vertices up to where the
+// face splits. Three exits: the next vertex is another anchor (the split point on the edge has already
+// been appended), it is the mid level, or it is two levels up and the walk continues.
+void walkFaceToMid(
+    const MeshView&           v,
+    const Levels&             lv,
+    const std::vector<label>& edgeMidPoint,
+    label                     cLevel,
+    label                     facei,
+    label                     startFp,
+    std::vector<label>&       faceVerts)
+{
+    const PrimitiveMesh& m = *v.m;
+    const label b = m.faceOffsets()[facei];
+    const std::size_t n = static_cast<std::size_t>(m.faceOffsets()[facei + 1] - b);
+    const std::vector<label>& fEdges = (*v.faceEdges)[static_cast<std::size_t>(facei)];
+    label fp = startFp;
+    while (true)
+    {
+        if (edgeMidPoint[static_cast<std::size_t>(fEdges[static_cast<std::size_t>(fp)])] >= 0)
+        {
+            faceVerts.push_back(edgeMidPoint[static_cast<std::size_t>(fEdges[static_cast<std::size_t>(fp)])]);
+        }
+        fp = fcIndex(fp, n);
+        const label pointi = m.faceVerts()[b + fp];
+        const label pl = lv.pointLevel[static_cast<std::size_t>(pointi)];
+        if (pl <= cLevel) return;                       // next anchor
+        if (pl == cLevel + 1) { faceVerts.push_back(pointi); return; }   // the mid
+        if (pl == cLevel + 2) faceVerts.push_back(pointi);               // and keep going
+    }
+}
+
+// walkFaceFromMid (:1513-1563). The same walk BACKWARD to the mid, then forward again from there
+// collecting -- so the vertices come out in face order on the far side of the anchor.
+void walkFaceFromMid(
+    const MeshView&           v,
+    const Levels&             lv,
+    const std::vector<label>& edgeMidPoint,
+    label                     cLevel,
+    label                     facei,
+    label                     startFp,
+    std::vector<label>&       faceVerts)
+{
+    const PrimitiveMesh& m = *v.m;
+    const label b = m.faceOffsets()[facei];
+    const std::size_t n = static_cast<std::size_t>(m.faceOffsets()[facei + 1] - b);
+    const std::vector<label>& fEdges = (*v.faceEdges)[static_cast<std::size_t>(facei)];
+    label fp = rcIndex(startFp, n);
+    while (true)
+    {
+        const label pl = lv.pointLevel[static_cast<std::size_t>(m.faceVerts()[b + fp])];
+        if (pl <= cLevel) break;                                                   // anchor
+        if (pl == cLevel + 1) { faceVerts.push_back(m.faceVerts()[b + fp]); break; }  // the mid
+        // cLevel+2: keep walking back
+        fp = rcIndex(fp, n);
+    }
+    while (true)
+    {
+        if (edgeMidPoint[static_cast<std::size_t>(fEdges[static_cast<std::size_t>(fp)])] >= 0)
+        {
+            faceVerts.push_back(edgeMidPoint[static_cast<std::size_t>(fEdges[static_cast<std::size_t>(fp)])]);
+        }
+        fp = fcIndex(fp, n);
+        if (fp == startFp) break;
+        faceVerts.push_back(m.faceVerts()[b + fp]);
+    }
+}
+
+// insertEdgeSplit (:1568-1585). If the two points are both ORIGINAL points and the edge between them is
+// being split, put the split point in. The `p < nPoints` guard is OpenFOAM's: a mid point added by this
+// very refinement has no edge in the old mesh.
+void insertEdgeSplit(
+    const MeshView&           v,
+    const std::vector<label>& edgeMidPoint,
+    label                     p0,
+    label                     p1,
+    std::vector<label>&       verts)
+{
+    if (p0 < v.m->nPoints() && p1 < v.m->nPoints())
+    {
+        const label edgeI = findEdge(*v.edges, p0, p1);
+        if (edgeI != -1 && edgeMidPoint[static_cast<std::size_t>(edgeI)] != -1)
+        {
+            verts.push_back(edgeMidPoint[static_cast<std::size_t>(edgeI)]);
+        }
+    }
+}
+
+// the two Map<edge> tables storeMidPointInfo accumulates into. std::map where OpenFOAM has a hash: only
+// looked up and written by key, never iterated, so the order cannot reach the answer.
+using MidEdgeMap = std::map<label, std::pair<label, label>>;
+
+label otherVertex(const std::pair<label, label>& e, label v)
+{
+    return (e.first == v) ? e.second : e.first;
+}
+
+// storeMidPointInfo (:952-1178). ONE INTERNAL FACE PER EDGE between anchor points, and this is called
+// from two to four times per such edge -- twice for two unrefined faces, up to four times for refined
+// ones. Each call stores what it knows about the edge mid point: which anchor it sits between and which
+// face mid points. THE CALL THAT COMPLETES THE PICTURE -- two anchors and two face mids, and which itself
+// changed something -- builds the face. Every other call returns -1.
+label storeMidPointInfo(
+    const MeshView&                        v,
+    const Levels&                          lv,
+    const std::vector<std::vector<label>>& cellAnchorPoints,
+    const std::vector<std::vector<label>>& cellAddedCells,
+    const std::vector<label>&              cellMidPoint,
+    const std::vector<label>&              edgeMidPoint,
+    label                                  celli,
+    label                                  facei,
+    bool                                   faceOrder,
+    label                                  edgeMidPointi,
+    label                                  anchorPointi,
+    label                                  faceMidPointi,
+    MidEdgeMap&                            midPointToAnchors,
+    MidEdgeMap&                            midPointToFaceMids,
+    TopoActions&                           a)
+{
+    bool changed = false;
+    bool haveTwoAnchors = false;
+    {
+        const auto it = midPointToAnchors.find(edgeMidPointi);
+        if (it == midPointToAnchors.end())
+        {
+            // the FIRST insert does not count as a change: nothing is complete yet
+            midPointToAnchors[edgeMidPointi] = {anchorPointi, label(-1)};
+        }
+        else
+        {
+            std::pair<label, label>& e = it->second;
+            if (anchorPointi != e.first && e.second == -1)
+            {
+                e.second = anchorPointi;
+                changed = true;
+            }
+            if (e.first != -1 && e.second != -1) haveTwoAnchors = true;
+        }
+    }
+    bool haveTwoFaceMids = false;
+    {
+        const auto it = midPointToFaceMids.find(edgeMidPointi);
+        if (it == midPointToFaceMids.end())
+        {
+            midPointToFaceMids[edgeMidPointi] = {faceMidPointi, label(-1)};
+        }
+        else
+        {
+            std::pair<label, label>& e = it->second;
+            if (faceMidPointi != e.first && e.second == -1)
+            {
+                e.second = faceMidPointi;
+                changed = true;
+            }
+            if (e.first != -1 && e.second != -1) haveTwoFaceMids = true;
+        }
+    }
+    if (!(changed && haveTwoAnchors && haveTwoFaceMids)) return -1;
+
+    const std::pair<label, label> anchors = midPointToAnchors[edgeMidPointi];
+    const std::pair<label, label> faceMids = midPointToFaceMids[edgeMidPointi];
+    const label otherFaceMidPointi = otherVertex(faceMids, faceMidPointi);
+
+    // the face is built so that `anchorPointi`'s child is the OWNER, and the two edges between the edge
+    // mid and the face mids may themselves be split -- but never between the cell mid and a face mid,
+    // which is why insertEdgeSplit is called on those two pairs only (:1035-1078).
+    std::vector<label> newFaceVerts;
+    newFaceVerts.reserve(6);
+    if (faceOrder == (v.m->owner()[facei] == celli))
+    {
+        newFaceVerts.push_back(faceMidPointi);
+        insertEdgeSplit(v, edgeMidPoint, faceMidPointi, edgeMidPointi, newFaceVerts);
+        newFaceVerts.push_back(edgeMidPointi);
+        insertEdgeSplit(v, edgeMidPoint, edgeMidPointi, otherFaceMidPointi, newFaceVerts);
+        newFaceVerts.push_back(otherFaceMidPointi);
+        newFaceVerts.push_back(cellMidPoint[static_cast<std::size_t>(celli)]);
+    }
+    else
+    {
+        newFaceVerts.push_back(otherFaceMidPointi);
+        insertEdgeSplit(v, edgeMidPoint, otherFaceMidPointi, edgeMidPointi, newFaceVerts);
+        newFaceVerts.push_back(edgeMidPointi);
+        insertEdgeSplit(v, edgeMidPoint, edgeMidPointi, faceMidPointi, newFaceVerts);
+        newFaceVerts.push_back(faceMidPointi);
+        newFaceVerts.push_back(cellMidPoint[static_cast<std::size_t>(celli)]);
+    }
+
+    const label anchorCell0 = getAnchorCell(v, cellAnchorPoints, cellAddedCells, celli, facei, anchorPointi);
+    const label anchorCell1 = getAnchorCell(v, cellAnchorPoints, cellAddedCells, celli, facei,
+                                            otherVertex(anchors, anchorPointi));
+    label own = 0, nei = 0;
+    if (anchorCell0 < anchorCell1)
+    {
+        own = anchorCell0;
+        nei = anchorCell1;
+    }
+    else
+    {
+        own = anchorCell1;
+        nei = anchorCell0;
+        flipFace(newFaceVerts);
+    }
+    (void)lv;
+    return addNewInternalFace(a, newFaceVerts, own, nei);
+}
+
+}   // namespace
+
+
+namespace {
+
+// createInternalFaces (:1182-1461). The TWELVE faces inside one split cell -- one per edge between two of
+// its eight anchor points. It cannot build them directly, because those edges may themselves have been
+// split; instead it walks each of the cell's faces, finds the cLevel+1 points and the anchors, and hands
+// each (anchor, edge mid) pair to storeMidPointInfo, which builds a face once it has seen both sides.
+void createInternalFaces(
+    const MeshView&                        v,
+    const Levels&                          lv,
+    const std::vector<std::vector<label>>& cellAnchorPoints,
+    const std::vector<std::vector<label>>& cellAddedCells,
+    const std::vector<label>&              cellMidPoint,
+    const std::vector<label>&              faceMidPoint,
+    const std::vector<label>&              edgeMidPoint,
+    label                                  celli,
+    TopoActions&                           a)
+{
+    const PrimitiveMesh& m = *v.m;
+    const std::vector<label>& cFaces = (*v.cells)[static_cast<std::size_t>(celli)];
+    const label cLevel = lv.cellLevel[static_cast<std::size_t>(celli)];
+    MidEdgeMap midPointToAnchors;
+    MidEdgeMap midPointToFaceMids;
+    label nFacesAdded = 0;
+
+    for (const label facei : cFaces)
+    {
+        const label b = m.faceOffsets()[facei];
+        const std::size_t n = static_cast<std::size_t>(m.faceOffsets()[facei + 1] - b);
+        const std::vector<label> f(m.faceVerts().begin() + b, m.faceVerts().begin() + b + n);
+        const std::vector<label>& fEdges = (*v.faceEdges)[static_cast<std::size_t>(facei)];
+
+        // this cell's side of the face has either ONE anchor -- the other side was already split with
+        // cLevel+1 and cLevel+2 points -- or FOUR, and nothing else is a hex (:1215-1277)
+        label faceMidPointi = -1;
+        const label nAnchors = countAnchors(lv, f, cLevel);
+        if (nAnchors == 1)
+        {
+            label anchorFp = -1;
+            for (std::size_t fp = 0; fp < n; ++fp)
+            {
+                if (lv.pointLevel[static_cast<std::size_t>(f[fp])] <= cLevel)
+                {
+                    anchorFp = static_cast<label>(fp);
+                    break;
+                }
+            }
+            // the face mid is the SECOND cLevel+1 point walking forward from the anchor
+            const label edgeMid = findLevel(v, lv, facei, f, fcIndex(anchorFp, n), true, cLevel + 1);
+            const label faceMid = findLevel(v, lv, facei, f, fcIndex(edgeMid, n), true, cLevel + 1);
+            faceMidPointi = f[static_cast<std::size_t>(faceMid)];
+        }
+        else if (nAnchors == 4)
+        {
+            // no mid point on the face YET -- it is the one this refinement is about to add
+            faceMidPointi = faceMidPoint[static_cast<std::size_t>(facei)];
+        }
+        else
+        {
+            throw std::runtime_error(
+                std::string(WHO) + "face " + std::to_string(facei) + " of split cell "
+                + std::to_string(celli) + " has " + std::to_string(nAnchors) + " anchor points at level "
+                + std::to_string(cLevel) + ", not 1 or 4. OpenFOAM FatalErrors here too (:1271-1277).");
+        }
+
+        // every anchor of this face, forward then backward, into storeMidPointInfo
+        for (std::size_t fp0 = 0; fp0 < n; ++fp0)
+        {
+            const label point0 = f[fp0];
+            if (lv.pointLevel[static_cast<std::size_t>(point0)] > cLevel) continue;
+
+            // ---- forward: to the cLevel+1 point, or the split of this level's own edge
+            label edgeMidPointi = -1;
+            const label fp1 = fcIndex(static_cast<label>(fp0), n);
+            if (lv.pointLevel[static_cast<std::size_t>(f[static_cast<std::size_t>(fp1)])] <= cLevel)
+            {
+                // two anchors in a row: the edge between them is the one being split
+                edgeMidPointi = edgeMidPoint[static_cast<std::size_t>(fEdges[fp0])];
+                if (edgeMidPointi == -1)
+                    throw std::runtime_error(
+                        std::string(WHO) + "the edge between two anchors of cell " + std::to_string(celli)
+                        + " on face " + std::to_string(facei) + " was not split. OpenFOAM FatalErrors "
+                        "here too (:1302-1315).");
+            }
+            else
+            {
+                const label edgeMid = findLevel(v, lv, facei, f, fp1, true, cLevel + 1);
+                edgeMidPointi = f[static_cast<std::size_t>(edgeMid)];
+            }
+            if (storeMidPointInfo(v, lv, cellAnchorPoints, cellAddedCells, cellMidPoint, edgeMidPoint,
+                                  celli, facei, /*faceOrder=*/true, edgeMidPointi, point0, faceMidPointi,
+                                  midPointToAnchors, midPointToFaceMids, a) != -1)
+            {
+                if (++nFacesAdded == 12) break;
+            }
+
+            // ---- backward: the same, the other way round the anchor
+            const label fpMin1 = rcIndex(static_cast<label>(fp0), n);
+            if (lv.pointLevel[static_cast<std::size_t>(f[static_cast<std::size_t>(fpMin1)])] <= cLevel)
+            {
+                edgeMidPointi = edgeMidPoint[static_cast<std::size_t>(fEdges[static_cast<std::size_t>(fpMin1)])];
+                if (edgeMidPointi == -1)
+                    throw std::runtime_error(
+                        std::string(WHO) + "the edge between two anchors of cell " + std::to_string(celli)
+                        + " on face " + std::to_string(facei) + " was not split (walking back). OpenFOAM "
+                        "FatalErrors here too (:1377-1390).");
+            }
+            else
+            {
+                const label edgeMid = findLevel(v, lv, facei, f, fpMin1, false, cLevel + 1);
+                edgeMidPointi = f[static_cast<std::size_t>(edgeMid)];
+            }
+            if (storeMidPointInfo(v, lv, cellAnchorPoints, cellAddedCells, cellMidPoint, edgeMidPoint,
+                                  celli, facei, /*faceOrder=*/false, edgeMidPointi, point0, faceMidPointi,
+                                  midPointToAnchors, midPointToFaceMids, a) != -1)
+            {
+                if (++nFacesAdded == 12) break;
+            }
+        }
+        if (nFacesAdded == 12) break;
+    }
+}
+
+// getFaceNeighbours (:598-632): the owner's child and, on an internal face, the neighbour's child that
+// own `pointi`. A boundary face has no neighbour.
+void getFaceNeighbours(
+    const MeshView&                        v,
+    const std::vector<std::vector<label>>& cellAnchorPoints,
+    const std::vector<std::vector<label>>& cellAddedCells,
+    label                                  facei,
+    label                                  pointi,
+    label&                                 own,
+    label&                                 nei)
+{
+    own = getAnchorCell(v, cellAnchorPoints, cellAddedCells, v.m->owner()[facei], facei, pointi);
+    nei = (facei < v.m->nInternalFaces())
+        ? getAnchorCell(v, cellAnchorPoints, cellAddedCells, v.m->neighbour()[facei], facei, pointi)
+        : label(-1);
+}
+
+}   // namespace
+
+
+void setRefinementFaces(
+    const MeshView&        v,
+    const Levels&          lv,
+    const RefinementMarks& marks,
+    TopoActions&           a)
+{
+    requireView(v);
+    const PrimitiveMesh& m = *v.m;
+    const label nFaces = m.nFaces();
+    const label nCells = m.nCells();
+    const std::vector<label>& cellMidPoint = marks.cellMidPoint;
+    const std::vector<label>& edgeMidPoint = marks.edgeMidPoint;
+    const std::vector<label>& faceMidPoint = marks.faceMidPoint;
+
+    // ---- the bookkeeping (:3867-3896) -------------------------------------------------------------
+    // every face of a split cell, every face being split, and every face on a split edge. Case 3 below
+    // is whatever is still set after cases 1 and 2 clear their own, which is why the order matters.
+    std::vector<char> affectedFace(static_cast<std::size_t>(nFaces), char(0));
+    for (label celli = 0; celli < nCells; ++celli)
+    {
+        if (cellMidPoint[static_cast<std::size_t>(celli)] < 0) continue;
+        for (const label facei : (*v.cells)[static_cast<std::size_t>(celli)])
+        {
+            affectedFace[static_cast<std::size_t>(facei)] = 1;
+        }
+    }
+    for (label facei = 0; facei < nFaces; ++facei)
+    {
+        if (faceMidPoint[static_cast<std::size_t>(facei)] >= 0) affectedFace[static_cast<std::size_t>(facei)] = 1;
+    }
+    for (std::size_t edgeI = 0; edgeI < edgeMidPoint.size(); ++edgeI)
+    {
+        if (edgeMidPoint[edgeI] < 0) continue;
+        for (const label facei : (*v.edgeFaces)[edgeI]) affectedFace[static_cast<std::size_t>(facei)] = 1;
+    }
+
+    // ---- 1. faces that GET SPLIT, into one per anchor (:3908-4010) --------------------------------
+    for (label facei = 0; facei < nFaces; ++facei)
+    {
+        if (faceMidPoint[static_cast<std::size_t>(facei)] < 0
+         || !affectedFace[static_cast<std::size_t>(facei)]) continue;
+        const label b = m.faceOffsets()[facei];
+        const std::size_t n = static_cast<std::size_t>(m.faceOffsets()[facei + 1] - b);
+        const std::vector<label> f(m.faceVerts().begin() + b, m.faceVerts().begin() + b + n);
+        const label anchorLevel = marks.faceAnchorLevel[static_cast<std::size_t>(facei)];
+        // the ORIGINAL face is MODIFIED for the first anchor and three more are ADDED -- not four added
+        bool modifiedFace = false;
+        for (std::size_t fp = 0; fp < n; ++fp)
+        {
+            const label pointi = f[fp];
+            if (lv.pointLevel[static_cast<std::size_t>(pointi)] > anchorLevel) continue;
+            std::vector<label> faceVerts;
+            faceVerts.reserve(6);
+            faceVerts.push_back(pointi);
+            walkFaceToMid(v, lv, edgeMidPoint, anchorLevel, facei, static_cast<label>(fp), faceVerts);
+            faceVerts.push_back(faceMidPoint[static_cast<std::size_t>(facei)]);
+            walkFaceFromMid(v, lv, edgeMidPoint, anchorLevel, facei, static_cast<label>(fp), faceVerts);
+            label own = 0, nei = 0;
+            getFaceNeighbours(v, marks.cellAnchorPoints, marks.cellAddedCells, facei, pointi, own, nei);
+            if (!modifiedFace)
+            {
+                modifiedFace = true;
+                modifySplitFace(v, a, facei, faceVerts, own, nei);
+            }
+            else
+            {
+                addSplitFace(v, a, facei, faceVerts, own, nei);
+            }
+        }
+        affectedFace[static_cast<std::size_t>(facei)] = 0;
+    }
+
+    // ---- 2. faces that do NOT split but whose EDGES do (:4014-4142) -------------------------------
+    // Walked per SPLIT EDGE and then over that edge's faces, which is OpenFOAM's order and not a walk
+    // over faces -- so a face on two split edges is reached twice and the second visit finds it cleared.
+    for (std::size_t edgeI = 0; edgeI < edgeMidPoint.size(); ++edgeI)
+    {
+        if (edgeMidPoint[edgeI] < 0) continue;
+        for (const label facei : (*v.edgeFaces)[edgeI])
+        {
+            if (faceMidPoint[static_cast<std::size_t>(facei)] >= 0
+             || !affectedFace[static_cast<std::size_t>(facei)]) continue;
+            const label b = m.faceOffsets()[facei];
+            const std::size_t n = static_cast<std::size_t>(m.faceOffsets()[facei + 1] - b);
+            const std::vector<label> f(m.faceVerts().begin() + b, m.faceVerts().begin() + b + n);
+            const std::vector<label>& fEdges = (*v.faceEdges)[static_cast<std::size_t>(facei)];
+            std::vector<label> newFaceVerts;
+            newFaceVerts.reserve(2*n);
+            for (std::size_t fp = 0; fp < n; ++fp)
+            {
+                newFaceVerts.push_back(f[fp]);
+                const label e = fEdges[fp];
+                if (edgeMidPoint[static_cast<std::size_t>(e)] >= 0)
+                {
+                    newFaceVerts.push_back(edgeMidPoint[static_cast<std::size_t>(e)]);
+                }
+            }
+            // the LOWEST-level point is an anchor of the neighbouring cells, so it names the new owner
+            const label anchorFp = findMinLevel(lv, f);
+            label own = 0, nei = 0;
+            getFaceNeighbours(v, marks.cellAnchorPoints, marks.cellAddedCells, facei,
+                              f[static_cast<std::size_t>(anchorFp)], own, nei);
+            modifySplitFace(v, a, facei, newFaceVerts, own, nei);
+            affectedFace[static_cast<std::size_t>(facei)] = 0;
+        }
+    }
+
+    // ---- 3. faces that do not change shape but change OWNER or NEIGHBOUR (:4146-4172) -------------
+    for (label facei = 0; facei < nFaces; ++facei)
+    {
+        if (!affectedFace[static_cast<std::size_t>(facei)]) continue;
+        const label b = m.faceOffsets()[facei];
+        const std::size_t n = static_cast<std::size_t>(m.faceOffsets()[facei + 1] - b);
+        const std::vector<label> f(m.faceVerts().begin() + b, m.faceVerts().begin() + b + n);
+        const label anchorFp = findMinLevel(lv, f);
+        label own = 0, nei = 0;
+        getFaceNeighbours(v, marks.cellAnchorPoints, marks.cellAddedCells, facei,
+                          f[static_cast<std::size_t>(anchorFp)], own, nei);
+        modifySplitFace(v, a, facei, f, own, nei);
+        affectedFace[static_cast<std::size_t>(facei)] = 0;
+    }
+
+    // ---- 4. the twelve new internal faces of every split cell (:4176-4218) ------------------------
+    for (label celli = 0; celli < nCells; ++celli)
+    {
+        if (cellMidPoint[static_cast<std::size_t>(celli)] < 0) continue;
+        createInternalFaces(v, lv, marks.cellAnchorPoints, marks.cellAddedCells, cellMidPoint,
+                            faceMidPoint, edgeMidPoint, celli, a);
+    }
 }
 
 }   // namespace hexRef8
