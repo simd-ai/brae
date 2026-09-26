@@ -297,7 +297,7 @@ FvScalarMatrix assemblePEqn(
     // nNonOrthogonalCorrectors, which controls how many times the pressure equation is re-solved and
     // not whether the correction exists. Added before the sign flip below so it is negated with the
     // rest of the term.
-    FvScalarMatrix M = fvm::laplacian<scalar>(st.rhorAUf, p, m, g, patches, in.correctedLaplacian);
+    FvScalarMatrix M = fvm::laplacian<scalar>(st.rhorAUf, p, m, g, patches, in.correctedLaplacian, in.nonOrthCoeffs);
     if (in.correctedLaplacian)
     {
         std::vector<std::vector<scalar>> pb(patches.size());

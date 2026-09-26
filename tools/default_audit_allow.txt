@@ -177,14 +177,16 @@ kOmegaSST::Compressible sc omegaOldIn  # same site, same reason
 KOmegaSSTInput sstIn kOldIn  # rhoTurbulenceHook.cu:183, the device mirror's SST: one call per SIMPLE iteration
 KOmegaSSTInput sstIn omegaOldIn  # same site, same reason
 
-# ---- `uncorrected` / `limited 0` outside interFoam (item 10's blast radius) ---------------------------
-# interFoam now carries the coefficient choice separately from the correction flux, because OpenFOAM's
-# uncorrectedSnGrad.H:113-119 returns nonOrthDeltaCoeffs exactly as correctedSnGrad.H:108-114 does and
-# only orthogonalSnGrad.H:113-119 returns deltaCoeffs. The SHARED parser the other solvers read
-# (scheme_parse.cuh readSnGrad) still collapses the two, so rhoSimpleFoam has no second flag to pass and
-# false is what it runs today. THIS LINE LEAVES when that parser is split and gated -- it records a known
-# substitution, not a justified default, and PORT.md's item 10 carries the site list.
-KOmegaSSTInput sstIn nonOrthCoeffs  # rhoSimpleFoam's parser does not distinguish `uncorrected` yet -- item 10's blast radius
+# ---- `uncorrected` in the turbulence closures (item 10's blast radius) --------------------------------
+# THE REASON THIS LINE GIVES HAS CHANGED, so it is rewritten rather than left carrying a false one. The
+# shared parser DOES distinguish `uncorrected` now (scheme_parse.cuh readSnGrad, gated on
+# validation/shearedChannel), and rhoSimpleFoam's laminar path takes the choice through every laplacian
+# and its SIMPLEC fvc::snGrad (gated on validation/rhoSnGrad, both arms). What remains unwired is the
+# CLOSURE half: kOmegaSST::correct takes the choice as its last parameter, but no fixture can witness it,
+# because validation/rhoSnGrad is laminar and no committed turbulent rho fixture has a mesh whose AVERAGE
+# non-orthogonality is large enough (the average is the predictor, not the max: airFoil2D reaches 41.6 deg
+# at one face and is vacuous at its own gate's bound). Wiring it here would be an ungated behaviour change.
+KOmegaSSTInput sstIn nonOrthCoeffs  # the closure half: no turbulent rho fixture can witness it yet -- see above
 
 # interFoam builds a gpu::PressureInput only for gpu::pressurePredictor (device_inter_step.cu:483), and
 # NEITHER reader of this field is on that path: pEqn.cu:237 sits inside `if (in.consistent)` -- SIMPLEC,

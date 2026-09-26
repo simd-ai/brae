@@ -151,12 +151,17 @@ struct StepInput
     scalar    gradKELimitK     = 0.0;
     // The LAPLACIAN entry's own snGrad scheme (laplacianScheme.H:121-141): every fvm::laplacian.
     bool      correctedLaplacian = false;
+    // ...and WHICH delta coefficients: `uncorrected` takes nonOrthDeltaCoeffs with no correction
+    // flux (uncorrectedSnGrad.H:113-119). See solver_controls.cuh:226.
+    bool      nonOrthCoeffs = false;
     scalar    snGradLimitCoeff   = 0.0;
     // fvc::snGrad's scheme, the snGradSchemes block -- a DIFFERENT operator (fvcSnGrad.C:56-64 ->
     // schemesLookup.C:249). Read by the SIMPLEC flux correction alone (pcEqn.H:27,64), and TRUE by
     // default because OpenFOAM's own default for an absent snGradSchemes block is `corrected`
     // (schemesLookup.C:82). These two shared one flag until 2026-09-15.
     bool      correctedFvcSnGrad  = true;
+    // ...and the snGrad block's own coefficient choice -- same two facts, other block.
+    bool      fvcSnGradNonOrthCoeffs = true;
     scalar    fvcSnGradLimitCoeff = 0.0;
 
     // --- relaxation ---

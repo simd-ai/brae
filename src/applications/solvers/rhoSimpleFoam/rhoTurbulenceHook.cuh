@@ -66,6 +66,12 @@ struct TurbulenceHookOptions
     scalar         Prt = 1.0;
     bool           bounded = false;
     bool           correctedLaplacian = false;
+    // NO nonOrthCoeffs SIBLING HERE, deliberately. The closure this struct feeds is only reached on
+    // a turbulent case, and validation/rhoSnGrad -- the fixture where the coefficient choice is
+    // measurable -- is laminar (constant/turbulenceProperties: simulationType laminar). A field no
+    // site fills is an unset sentinel that tools/default_audit.py cannot even see, because it flags
+    // asymmetry between fillers and there would be none. It arrives with a turbulent fixture whose
+    // mesh has a large AVERAGE non-orthogonality; none exists today.
     std::string    divSchemeUnsupported;   // non-empty -> the closure refuses by name
     // `Gauss limitedLinear <k>` on div(phi,k) and div(phi,epsilon|omega). ONE flag and ONE coefficient
     // for both, matching the closures; limGradK is the cellLimited coefficient of the case's

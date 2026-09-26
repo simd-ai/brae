@@ -328,7 +328,7 @@ FvScalarMatrix assembleEEqn(
     {
         const SurfaceScalarField gammaf =
             effectiveFaceViscosity(*in.alphaEff, *in.alphaEffBnd, m, g, patches);
-        FvScalarMatrix L = fvm::laplacian<scalar>(gammaf, he, m, g, patches, in.correctedLaplacian);
+        FvScalarMatrix L = fvm::laplacian<scalar>(gammaf, he, m, g, patches, in.correctedLaplacian, in.nonOrthCoeffs);
         if (in.correctedLaplacian)
         {
             std::vector<std::vector<scalar>> vb(patches.size());

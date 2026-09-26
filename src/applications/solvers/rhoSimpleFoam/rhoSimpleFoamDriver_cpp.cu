@@ -208,6 +208,7 @@ StepInput buildStepInput(
                 "represents only those two and the capped `limited <psi>`; refusing rather than running "
                 "one of them under the case's name.");
         in.correctedLaplacian = sctl.nonOrth;
+        in.nonOrthCoeffs = sctl.nonOrthCoeffs;
         in.snGradLimitCoeff   = (sctl.nonOrth && sctl.nonOrthLimit < 1.0) ? sctl.nonOrthLimit : 0.0;
         // snGradSchemes, the OTHER block, for fvc::snGrad alone. Same three regimes and the same
         // refusal: `limited 0` is nonOrthDeltaCoeffs with the explicit correction zeroed, which
@@ -219,6 +220,7 @@ StepInput buildStepInput(
                 "correction, which is neither `orthogonal` nor `corrected`; fvc::snGrad here carries one "
                 "flag for both halves. Refusing rather than running a neighbour under the case's name.");
         in.correctedFvcSnGrad  = sctl.snGradCorrected;
+        in.fvcSnGradNonOrthCoeffs = sctl.snGradNonOrthCoeffs;
         in.fvcSnGradLimitCoeff = (sctl.snGradCorrected && sctl.snGradLimit < 1.0) ? sctl.snGradLimit : 0.0;
         in.gradULimitK        = sctl.gradULimitK;
         in.gradKLimitK        = sctl.gradKLimitK;

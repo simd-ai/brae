@@ -265,7 +265,9 @@ RhoStepInput buildDeviceStepInput(
     in.schemeKE  = hin.schemeKE;
     in.schemeCoeffU = hin.schemeCoeffU;
     in.correctedLaplacian  = hin.correctedLaplacian;
+    in.nonOrthCoeffs = hin.nonOrthCoeffs;
     in.correctedFvcSnGrad  = hin.correctedFvcSnGrad;    // snGradSchemes, for the SIMPLEC fvc::snGrad(p)
+    in.fvcSnGradNonOrthCoeffs = hin.fvcSnGradNonOrthCoeffs;
     in.fvcSnGradLimitCoeff = hin.fvcSnGradLimitCoeff;
     in.ddtEuler           = hin.ddtEuler;   // firstIteration is set per step by the loop below
     in.snGradLimitCoeff   = hin.snGradLimitCoeff;

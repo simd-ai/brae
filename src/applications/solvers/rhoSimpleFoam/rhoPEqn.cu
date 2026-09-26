@@ -394,7 +394,7 @@ void assemblePEqn(
     // Implementing only the implicit half is the defect this port already paid for on the energy and
     // pressure equations on the host side -- it moves the source while leaving the diagonal exact, so
     // every gate that compared D() passed. See PORT.md.
-    deviceLaplacianCoeffs(dm, st.rhorAUf, P.diag, P.upper, P.lower, in.correctedLaplacian);
+    deviceLaplacianCoeffs(dm, st.rhorAUf, P.diag, P.upper, P.lower, in.correctedLaplacian || in.nonOrthCoeffs);
     zeroed(P.source, nC);
     // The FACE variant, not the cell one the incompressible module uses: rhorAUf's boundary is rho's
     // PATCH value times rAU's owner-cell value, which is not any single cell's field.
