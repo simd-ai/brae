@@ -310,6 +310,11 @@ struct DeviceInterStepControls
     bool   nonOrthCoeffs = false;   // nonOrthDeltaCoeffs without the correction -- inter_ueqn_cpp.cuh:181
     scalar snGradLimitCoeff = 0;
     bool   momentumPredictor = true;         // damBreak sets this OFF
+    // `frozenFlow yes` in the PIMPLE dict: OpenFOAM `continue`s past the momentum, the pressure AND
+    // the turbulence corrector for the whole outer iteration (interFoam.C:156-158). The ALPHA
+    // equation and mixture.correct() still run -- they are above that branch, at :152 and :154 --
+    // so alpha keeps advancing on a velocity field nothing touches.
+    bool   frozenFlow        = false;
     scalar relaxU            = 1;
     bool   relaxEquationU    = false;        // the case NAMES a factor -- see gpu::MomentumInput
     bool   needReference     = false;

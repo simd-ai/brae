@@ -238,6 +238,15 @@ void deviceInterStep(
     probe("snGradRho", snGradRho);
     probe("nuEffCell", nuEffCell);
 
+    // FROZEN FLOW STOPS HERE. Stages 1 and 2 above are OpenFOAM's alpha equation and the interface
+    // properties mixture.correct() leaves, both of which sit BEFORE `if (pimple.frozenFlow())` at
+    // interFoam.C:156; everything below is UEqn.H (:161) and the pEqn.H corrector loop (:164-167),
+    // which the `continue` skips whole. The U boundary replay at the end of the pressure corrector
+    // goes with them: with no momentum and no pressure solve there is no new flux to switch an
+    // inletOutlet face on, and OpenFOAM leaves those patches exactly as the last solved step did.
+
+    if (ctl.frozenFlow) return;
+
     // 3. THE MOMENTUM MATRIX
     DeviceBuffer<scalar> ub[3];
     hooks.updateUBoundary(UX, UY, UZ, dbU, ub, DeviceUBoundaryCall::assembly);

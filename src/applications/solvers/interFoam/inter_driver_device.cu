@@ -519,13 +519,9 @@ RunReport runInterFoamDevice(
     // nOuterCorrectors IS the loop below now, transcribed from the host's runTimeStep
     // (inter_solve_cpp.cu:111-131). frozenFlow is not: pimple.frozenFlow() makes OpenFOAM `continue`
     // past the momentum, the pressure AND the turbulence corrector, and this loop has no such branch.
-    if (f.pimple.frozenFlow)
-    {
-        throw std::runtime_error(
-            "brae interFoam (device): `solveFlow no` skips the momentum, the pressure and the "
-            "turbulence corrector for the whole outer iteration (interFoam.C:163-166), and the device "
-            "loop has no branch for it. The host path (no -device) does.");
-    }
+    // frozenFlow RUNS on this arm now: DeviceInterStepControls::frozenFlow returns out of
+    // deviceInterStep after the alpha equation and the interface properties, and the turbulence
+    // corrector below is guarded by the same flag -- the three things OpenFOAM's `continue` skips.
 
     // ...AND A VELOCITY CONDITION THAT NAMES A FLUX OTHER THAN phi. p_rgh's and alpha's conditions are
     // evaluated on the host, which hands each the flux its `phi` entry names (namedPatchFlux, through
@@ -1471,6 +1467,7 @@ RunReport runInterFoamDevice(
     // it made unreachable: the refusal-in-front-of-a-substitution shape again.
     C.gradULimitK       = f.gradULimitK;
     C.gradUSchemeLimitK = f.gradULimitK;
+    C.frozenFlow = f.pimple.frozenFlow;
     C.correctedLaplacian = f.laplacianScheme.corrected;
     C.nonOrthCoeffs = f.laplacianScheme.nonOrthCoeffs;
     C.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
@@ -2107,7 +2104,10 @@ RunReport runInterFoamDevice(
             // pimple.turbCorr(): with turbOnFinalIterOnly -- OpenFOAM's default -- the closure
             // advances ONCE per time step, on the final outer corrector. Running it on every one
             // would advance k and epsilon nOuterCorrectors times per physical step.
-            if (!f.pimple.turbOnFinalIterOnly || finalOuter)
+            // ...and frozenFlow skips the closure too: the `continue` at interFoam.C:158 jumps past
+            // turbulence->correct() at :171, not only past the momentum and the pressure. A port that
+            // guarded UEqn and pEqn alone would keep advancing k and epsilon on a frozen velocity.
+            if (!f.pimple.frozenFlow && (!f.pimple.turbOnFinalIterOnly || finalOuter))
             {
             if (deviceClosure)
             {

@@ -125,6 +125,11 @@ int main(
     // (kEpsilon.C:182-183) is the only thing in the run that touches either field
     const bool frozenFloored = (profile == "frozenFloored");
     const bool frozenSST = (profile == "frozenSST");
+    // `flowFrozen`: `frozenFlow yes` in the PIMPLE dict. NOT a `frozen*` profile -- those switch the
+    // turbulence MODEL off and `frozen` matches by prefix, so the name deliberately does not start
+    // with it. Here the model is live and the whole outer iteration's momentum, pressure and
+    // turbulence corrector are skipped instead (interFoam.C:156-158).
+    const bool flowFrozen = (profile == "flowFrozen");
     // `splitSolve*`: the second equation carries its OWN `<field>Final` solver entry, which
     // fvMatrix::solve() looks up by FIELD name. The closure took k's for both until this profile.
     const bool splitSolveSST = (profile == "splitSolveSST");
@@ -160,6 +165,7 @@ int main(
               : splitSolve ? "splitSolve -- epsilonFinal its own entry, tolerance 1e-12 and 2 sweeps"
               : frozenFloored ? "frozenFloored -- turbulence off, with floors above the case's own fields"
               : frozenSST ? "frozenSST -- kOmegaSST with turbulence off"
+              : flowFrozen ? "flowFrozen -- `frozenFlow yes`: alpha advances, nothing else is solved"
               : frozen ? "frozen -- turbulence off: constructed, validated, never corrected"
               : outer ? "outer -- variable, with nOuterCorrectors 2"
               : nutAtmosphere ? "nutAtmosphere -- uniform, the atmosphere's nut an inletOutlet"
@@ -318,9 +324,26 @@ int main(
         // ...and with `turbOnFinalIterOnly no` that is one per CORRECTOR, not one per step: a brae still
         // running the closure once per step logs half as many and compareSolves mismatches on length.
         check("OpenFOAM's log gave one solve of the closure's second field and one k solve per corrector",
-              ofE.size() == static_cast<std::size_t>(nSteps*closurePerStep) && ofK.size() == ofE.size());
+              flowFrozen ? (ofE.empty() && ofK.empty())
+                         : (ofE.size() == static_cast<std::size_t>(nSteps*closurePerStep)
+                            && ofK.size() == ofE.size()));
     }
-    failures += brae::gatecheck::compareSolves("host", r.pSolves, ofP, nSteps);
+    if (flowFrozen)
+    {
+        // MEASURED in OpenFOAM's own log: 0 lines of `Solving for p_rgh`, `for k` or `for epsilon`, and 5
+        // of `Solving for alpha.water` -- one per step. So the assertion is not a count comparison but an
+        // EMPTINESS, which is the stronger statement and the one the `continue` actually makes.
+        check("brae solved NO p_rgh -- the pressure corrector loop never ran", r.pSolves.empty());
+        check("...and no k", r.kSolves.empty());
+        check("...and no second closure field", r.epsilonSolves.empty() && r.omegaSolves.empty());
+        check("OpenFOAM logged none either", ofP.empty() && ofK.empty() && ofE.empty());
+        check("...and both still solved alpha once per step",
+              r.alphaSolves.size() == static_cast<std::size_t>(nSteps) && ofA.size() == r.alphaSolves.size());
+    }
+    else
+    {
+        failures += brae::gatecheck::compareSolves("host", r.pSolves, ofP, nSteps);
+    }
     failures += brae::gatecheck::compareSolves("host", r.alphaSolves, ofA, nSteps, fin.alphaName.c_str(),
                                                scalar(1e-10), scalar(1e-9));
     // MEASURED: initial residuals 1.8e-13 (epsilon) and 1.3e-13 (k) from OpenFOAM's over the run, so
@@ -328,7 +351,7 @@ int main(
     // the solver: it is step one's k solve, which ends at 4.140e-10, and the two codes are 3.6e-16
     // apart there -- a few units in the last place of a normalised residual. PBiCGStab in the same
     // seat takes 1 of 5 iteration counts and leaves final residuals 100% out.
-    if (!frozen)
+    if (!frozen && !flowFrozen)
     {
         failures += brae::gatecheck::compareSolves("host", (sst || frozenSST || splitSolveSST || splitDivSST) ? r.omegaSolves : r.epsilonSolves,
                                                    ofE, nSteps*closurePerStep, secondName,
@@ -363,6 +386,56 @@ int main(
           ofAlpha.size() == static_cast<std::size_t>(nC) && ofKf.size() == ofAlpha.size()
        && ofNut.size() == ofAlpha.size());
 
+    if (flowFrozen)
+    {
+        // WHAT `frozenFlow yes` MEANS, asserted term by term. Agreement with the oracle alone would not
+        // say WHICH quantities were frozen, and the case as shipped cannot say it at all: from rest every
+        // field stays put and a brae that skipped the alpha equation too would read the same numbers. The
+        // start directory here is a DEVELOPED state (max|U| 0.7926), so the two halves separate.
+        check("brae read `frozenFlow` from the PIMPLE dict", fin.pimple.frozenFlow);
+        const std::vector<vector> u0 = readVectorCells(startDir + "/U");
+        const std::vector<scalar> p0 = readCells(startDir + "/p_rgh");
+        const std::vector<scalar> k0 = readCells(startDir + "/k");
+        const std::vector<scalar> e0 = readCells(startDir + "/" + std::string(secondName));
+        const std::vector<scalar> n0 = readCells(startDir + "/nut");
+        const std::vector<scalar> a0 = readCells(startDir + "/" + fin.alphaName);
+        const Diff fU = compare(fin.U.internal, u0);
+        const Diff fP = compare(fin.p_rgh.internal, p0);
+        const Diff fK = compare(fin.turbulence.k.internal, k0);
+        const Diff fE = compare(braeSecond, e0);
+        const Diff fN = compare(fin.turbulence.nut.internal, n0);
+        const Diff fA = compare(fin.alpha1.internal, a0);
+        std::printf("  FROZEN FLOW: against the start directory -- U %.4e, p_rgh %.4e, k %.4e, %s %.4e, "
+                    "nut %.4e, and alpha MOVED %.4e\n", (double)fU.linf, (double)fP.linf, (double)fK.linf,
+                    secondName, (double)fE.linf, (double)fN.linf, (double)fA.linf);
+        // THE THREE THINGS THE `continue` SKIPS, one assertion each, absolute rather than bounded
+        check("U is EXACTLY the start directory's -- no momentum and no pressure solve touched it",
+              fU.linf == scalar(0));
+        check("...and p_rgh is", fP.linf == scalar(0));
+        check("...and k is -- the `continue` skips turbulence->correct() too, not only UEqn and pEqn",
+              fK.linf == scalar(0));
+        check("...and the second closure field is", fE.linf == scalar(0));
+        // nut IS THE ONE FIELD THAT IS NOT BIT-IDENTICAL, on EITHER side, and it is held at round-off
+        // rather than at zero for that reason. MEASURED on this arm: brae 1.1449e-16 from the start
+        // directory, OpenFOAM 9.2e-16, brae against OpenFOAM 9.2404e-16, on a nut of order 9.4e-03. Both
+        // codes re-form nut from k and epsilon rather than keeping the stored field, and since k and
+        // epsilon are EXACTLY unchanged (asserted above) the re-formed value can only differ in the last
+        // bits. It is the four TRANSPORTED quantities that carry this profile's claim, and those are
+        // exact. A standalone run of the same case read 0.0 here, which this gate does not reproduce and
+        // which is NOT chased: an assertion of exactness that cannot be explained is not one to ship.
+        check("...and nut is the start value to round-off -- both codes re-form it from k and epsilon",
+              fN.linf < scalar(1e-14));
+        check("...and OpenFOAM's nut is too, by the same amount", compare(ofNut, n0).linf < scalar(1e-14));
+        // ...AND THE ONE IT DOES NOT. Without this the arm passes on a brae that skips the whole step.
+        check("alpha DID advance on the frozen velocity field -- the alpha equation is above the "
+              "`continue` (interFoam.C:152) and must still run", fA.linf > scalar(1e-3));
+        // OpenFOAM's own answer has to agree on both halves, or brae is being held against a run that
+        // did not freeze what this profile is about
+        check("OpenFOAM's U is EXACTLY its start value too",
+              compare(ofU, u0).linf == scalar(0));
+        check("...and OpenFOAM's second field is", compare(ofEf, e0).linf == scalar(0));
+        check("...and OpenFOAM's alpha advanced as well", compare(ofAlpha, a0).linf > scalar(1e-3));
+    }
     if (frozen)
     {
         // WHAT `turbulence off` MEANS, asserted term by term rather than only as agreement with the
@@ -466,7 +539,11 @@ int main(
                 "%.4e, nut %.4e\n", (double)dOtherU.rel(), (double)dOtherNut.rel());
     // MEASURED 1.33 (laminar), 0.29 (the other lineage) and 3.7e-02 (custom against plain uniform),
     // beside a U bound of 5e-10
-    check(frozen ? "the FROZEN nut moves OpenFOAM's own U more than 10% from its laminar answer -- so a "
+    check(flowFrozen ? "solving the flow moves OpenFOAM's own U more than 10% against freezing it -- "
+                       "`argv[8]` is the same developed start WITHOUT `frozenFlow yes`, so the one thing "
+                       "between the two runs is that entry. MEASURED: U 3.2493e-01, p_rgh 9.0768e-02, "
+                       "epsilon 1.4379e-01, alpha 1.4387e-02, over all 2268 cells"
+          : frozen ? "the FROZEN nut moves OpenFOAM's own U more than 10% from its laminar answer -- so a "
                    "brae that read `turbulence off` as laminar, or as `keep the file's nut`, would be "
                    "this far out and could not pass the field bounds above"
                  : "turbulence moves OpenFOAM's own U by more than 10%",
@@ -490,12 +567,15 @@ int main(
           : frozenFloored ? "...and the FLOORS alone move it by more than 1%, against the same case frozen "
                           "at the default floors -- so the constructor's bound is visible here"
           : frozenSST ? "...and switching kOmegaSST off moves it by more than 10%"
+          : flowFrozen ? "...and the same run again as the second control: there is only one setting "
+                         "between frozen and solved, so both controls are the same run by design"
           : frozen ? "...and switching kEpsilon off moves it by more than 10%"
           : outer ? "...and the second outer corrector moves it by more than 1%"
           : nutAtmosphere ? "...and the atmosphere's inletOutlet nut moves it by more than 1e-3"
           : custom ? "...and the custom settings move it by more than 1%"
                    : "...and the lineage moves it by more than 10%, so `density` is live on this fixture",
-          dOtherU.rel() > (turbOuterSplit ? scalar(1e-7)
+          dOtherU.rel() > (flowFrozen ? scalar(0.1)
+                         : turbOuterSplit ? scalar(1e-7)
                          : turbOuter ? scalar(0.01)
                          : lowRe ? scalar(0.01)
                          : nutAtmosphere ? scalar(1e-3)
@@ -541,7 +621,21 @@ int main(
                                                    : dev.turbulence.epsilon.internal;
         failures += brae::gatecheck::nonFinite("device second field", devSecond);
         failures += brae::gatecheck::nonFinite("device nut", dev.turbulence.nut.internal);
-        failures += brae::gatecheck::compareSolves("device", rd.pSolves, ofP, nSteps);
+        if (flowFrozen)
+        {
+            // as the host half: OpenFOAM logs no p_rgh, k or second-field solve at all under
+            // `frozenFlow yes`, so emptiness is the assertion and it is the stronger one
+            check("the DEVICE solved no p_rgh either", rd.pSolves.empty());
+            check("...and no k", rd.kSolves.empty());
+            check("...and no second closure field",
+                  rd.epsilonSolves.empty() && rd.omegaSolves.empty());
+            check("...and still solved alpha once per step",
+                  rd.alphaSolves.size() == static_cast<std::size_t>(nSteps));
+        }
+        else
+        {
+            failures += brae::gatecheck::compareSolves("device", rd.pSolves, ofP, nSteps);
+        }
         // `outer`: the second pass's alpha pre-solve starts from the first pass's alpha and its initial
         // residual is 1e-5 of the normFactor, so the device's 1e-12 in phi (its VoF floor) reads as
         // 1e-07 relative there -- see tests/test_inter_cn_vs_openfoam.cu, where it was measured
@@ -552,7 +646,7 @@ int main(
         // THE CONTROL IS ON `custom`: with the wall laplacian coefficient left out of relax() -- what
         // the device closure did until this gate -- epsilon's fields do not move (9.8e-14) and its
         // initial residuals are 1.1e-04 out in every step. 1e-10 is six orders inside that.
-        if (frozen)
+        if (frozen || flowFrozen)   // no closure solve to compare: the model is off, or the `continue` skipped it
         {
             // the device closure is BUILT (turbulenceOnDevice above) and advances nothing, so there is
             // no solve to compare -- the assertion is that it ran none, the same one the host arm makes
@@ -661,9 +755,11 @@ int main(
                 ++sameK;
             }
         }
-        check(frozen ? "...and BOTH closures took no sweep at all, the model being frozen"
+        // `flowFrozen` reaches the same emptiness as `frozen`, by a different route: there the MODEL is
+        // off, here the `continue` skips turbulence->correct() whole. Either way neither closure solves.
+        check((frozen || flowFrozen) ? "...and BOTH closures took no sweep at all"
                      : "...and took the host closure's sweep counts, solve for solve",
-              frozen ? (devSecondSolves.empty() && mixSecondSolves.empty()
+              (frozen || flowFrozen) ? (devSecondSolves.empty() && mixSecondSolves.empty()
                         && rd.kSolves.empty() && rm.kSolves.empty())
                      // one per CORRECTOR the closure runs on, not one per step
                      : (sameE == static_cast<std::size_t>(nSteps*closurePerStep)

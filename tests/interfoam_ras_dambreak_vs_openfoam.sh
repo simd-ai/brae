@@ -94,7 +94,7 @@ stage()
     case "$profile" in
         laminar)
             sed -i 's/^simulationType .*/simulationType laminar;/' "$C/constant/turbulenceProperties" ;;
-        uniform|custom|nutAtmosphere|sst|frozen|frozenFloored|frozenSST|splitSolve|splitSolveSST|splitDiv|splitDivSST|lowRe|lowReOff|outerUniform|turbOuter|turbOuterSplit)
+        uniform|custom|nutAtmosphere|sst|frozen|frozenFloored|frozenSST|splitSolve|splitSolveSST|splitDiv|splitDivSST|lowRe|lowReOff|outerUniform|turbOuter|turbOuterSplit|flowFrozen|flowSolved)
             sed -i '/^density /d' "$C/constant/turbulenceProperties"
             sed -i 's/^\( *\)div(rhoPhi,k) .*/\1div(phi,k)      Gauss upwind;/; s/^\( *\)div(rhoPhi,epsilon) .*/\1div(phi,epsilon) Gauss upwind;/' \
                 "$C/system/fvSchemes"
@@ -380,6 +380,37 @@ open(c, 'w').write(s)
 PYEOF
     ( cd "$C" && blockMesh > log.blockMesh 2>&1 ) || { echo "FAIL: blockMesh [$profile]"; tail -20 "$C/log.blockMesh"; return 1; }
     ( cd "$C" && setFields > log.setFields 2>&1 ) || { echo "FAIL: setFields [$profile]"; tail -20 "$C/log.setFields"; return 1; }
+    # `flowFrozen` / `flowSolved`: DEVELOP FIRST, then restart. THE CASE AS SHIPPED CANNOT WITNESS
+    # frozenFlow AT ALL, and that is measured: damBreak starts from rest, so with the momentum and the
+    # pressure skipped U stays uniform (0 0 0), there is no flux, and alpha does not move either --
+    # OpenFOAM's own frozen run reads 0 of 2268 cells changed in EVERY field, so a brae that also skipped
+    # the alpha equation would pass. Developing 20 steps first gives max|U| = 0.7926, and then the frozen
+    # run advances alpha over 2266 of 2268 cells while U, p_rgh, k, epsilon and nut stay EXACTLY put.
+    # `flowSolved` is the same developed start without the entry, and is this profile's control.
+    if [ "$profile" = flowFrozen ] || [ "$profile" = flowSolved ]; then
+        sed -i 's/^endTime .*/endTime         0.02;/' "$C/system/controlDict"
+        ( cd "$C" && interFoam > log.develop 2>&1 ) \
+            || { echo "FAIL: the develop pass [$profile]"; tail -20 "$C/log.develop"; return 1; }
+        [ -d "$C/0.02" ] || { echo "FAIL: the develop pass wrote no 0.02 [$profile]"; ls "$C"; return 1; }
+        rm -rf "$C/0"; mv "$C/0.02" "$C/0"; rm -rf "$C"/0/uniform "$C"/0.0*
+        python3 - "$C" <<'DEVEOF' || { echo "FAIL: restaging after the develop pass"; return 1; }
+import re, sys
+c = sys.argv[1] + '/system/controlDict'
+s = open(c).read()
+s = re.sub(r'^startTime .*', 'startTime       0;', s, flags=re.M)
+s = re.sub(r'^endTime .*', 'endTime         0.005;', s, flags=re.M)
+open(c, 'w').write(s)
+DEVEOF
+        # the entry goes on AFTER the develop pass, or the developed state would be frozen too
+        if [ "$profile" = flowFrozen ]; then
+            sed -i 's/^\( *\)nOuterCorrectors  *1;/\1nOuterCorrectors 1;\n\1frozenFlow      yes;/' \
+                "$C/system/fvSolution"
+            grep -q "frozenFlow      yes;" "$C/system/fvSolution" \
+                || { echo "FAIL: frozenFlow was not staged"; return 1; }
+        fi
+        grep -q "^internalField  *nonuniform" "$C/0/U" \
+            || { echo "FAIL: the developed start has a uniform U, so frozenFlow cannot witness"; return 1; }
+    fi
     ( cd "$C" && interFoam > log.interFoam 2>&1 ) || { echo "FAIL: interFoam [$profile]"; tail -30 "$C/log.interFoam"; return 1; }
     [ -d "$C/$END" ] || { echo "FAIL: OpenFOAM wrote no $END directory [$profile]"; ls "$C"; return 1; }
     echo "OpenFOAM ran $STEPS steps of deltaT $DT to t = $END   [$profile]"
@@ -401,7 +432,7 @@ PYEOF
 }
 
 rc=0
-for p in laminar variable uniform custom nutAtmosphere sst outer frozen frozenFloored frozenSST splitSolve splitSolveSST splitDiv splitDivSST lowReOff lowRe outerUniform turbOuter turbOuterSplit; do
+for p in laminar variable uniform custom nutAtmosphere sst outer frozen frozenFloored frozenSST splitSolve splitSolveSST splitDiv splitDivSST lowReOff lowRe outerUniform turbOuter turbOuterSplit flowSolved flowFrozen; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_ras_dambreak_vs_openfoam: staging failed"; exit 1; }
@@ -457,6 +488,15 @@ done
        turbOuter uniform "$W/laminar/$END" "$W/outerUniform/$END" || rc=1
 "$BIN" "$W/turbOuterSplit" "$W/turbOuterSplit/0" "$W/turbOuterSplit/$END" "$STEPS" \
        "$W/turbOuterSplit/log.interFoam" turbOuterSplit uniform "$W/laminar/$END" "$W/turbOuter/$END" || rc=1
+
+# frozenFlow: OpenFOAM `continue`s past UEqn.H, the pEqn.H corrector loop AND turbulence->correct()
+# (interFoam.C:156-158 against :161, :164-167 and :171) while the alpha equation at :152 and
+# mixture.correct() at :154 still run. BOTH CONTROLS ARE THE SAME `flowSolved` RUN -- the same developed
+# start without the entry -- because there is only one setting between them. MEASURED, OpenFOAM against
+# OpenFOAM: U 3.2493e-01, p_rgh 9.0768e-02, epsilon 1.4379e-01, nut 7.1339e-02, alpha 1.4387e-02, over
+# all 2268 cells.
+"$BIN" "$W/flowFrozen" "$W/flowFrozen/0" "$W/flowFrozen/$END" "$STEPS" "$W/flowFrozen/log.interFoam" \
+       flowFrozen uniform "$W/flowSolved/$END" "$W/flowSolved/$END" || rc=1
 
 echo "interfoam_ras_dambreak_vs_openfoam: rc $rc"
 exit $rc

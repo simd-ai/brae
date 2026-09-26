@@ -753,14 +753,21 @@ if [ $HAVE_GPU = 1 ]; then
     # it to OpenFOAM on both profiles); this arm is here because it was a blanket refusal
     arm device_permeable    runs    -                        "-device" "${PERMU/PHI /}; ${PERMP/PENTRY/p uniform 0;}"
     # nOuterCorrectors IS the device loop now (tests/interfoam_cyclic_vs_openfoam.sh's `outer`
-    # profile measures it against OpenFOAM, with the one-corrector answer as its control); what is
-    # still refused is frozenFlow, which skips the momentum, the pressure AND the turbulence corrector
+    # profile measures it against OpenFOAM, with the one-corrector answer as its control), and so is
+    # frozenFlow -- gated on RAS/damBreak `flowFrozen`, both arms, where U, p_rgh, k and epsilon are
+    # EXACTLY the start values and alpha advances over 2266 of 2268 cells.
     arm device_nOuter2      runs    -                        "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' system/fvSolution"
-    arm device_frozenFlow   refused "solveFlow no"           "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 1;\n    solveFlow       no;/' system/fvSolution"
-    # ...and the SPELLINGS of it. The device refusal is the witness the host path cannot be: `solveFlow n`
-    # read as TRUE ran the whole flow where OpenFOAM skips it (interFoam.C:163-166), and a `runs` arm
-    # could not tell that apart from a correct frozen run. Here a false spelling MUST reach the refusal.
-    arm device_frozenFlow_n refused "solveFlow no" "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 1;\n    solveFlow       n;/' system/fvSolution"
+    # THE KEY IS `frozenFlow`, AND THESE ARMS USED TO WRITE `solveFlow`. interFoam.C:156 asks
+    # pimple.frozenFlow(), which pimpleControl does not override, so it is solutionControl.C:52's
+    # `frozenFlow` in the PIMPLE dict. `solveFlow` (pimpleControl.C:47, same dict) is read by exactly one
+    # solver in OpenFOAM v2412 -- sprayFoam.C:90 -- and interFoam never looks at it. So a `solveFlow no`
+    # arm tested a key that changes nothing on either code, and brae was ACTING on it.
+    arm device_frozenFlow   runs    -                        "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 1;\n    frozenFlow      yes;/' system/fvSolution"
+    # ...and its SPELLINGS, now on the right key: `y` is TRUE to Foam::Switch (Switch.C:92-137) and a
+    # hand-rolled test that accepted only {yes,true,on,1} would read it as false and solve the flow.
+    arm device_frozenFlow_y runs    -                        "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 1;\n    frozenFlow      y;/' system/fvSolution"
+    # ...and `solveFlow no` must now be a NO-OP on both codes rather than freezing brae's flow
+    arm device_solveFlowNoop runs   -                        "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 1;\n    solveFlow       no;/' system/fvSolution"
     # BOTH ARMS honour a per-equation `<field>Final` solver entry now: the device closures take the
     # second equation's own SolveControls (KEpsilonInput::epsSolve, KOmegaSSTInput::omegaSolve) where they
     # used to compare all eight fields and refuse any difference. Gated on `splitSolve`/`splitSolveSST`,

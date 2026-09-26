@@ -806,14 +806,23 @@ InterFields buildInterFields(const std::string&          caseDir,
         // `none`, `f` and `n` -- all three of them false to OpenFOAM -- as TRUE, and read an unknown
         // word as TRUE where OpenFOAM stops with `Unknown switch`.
         f.momentumPredictorOn = pim->switchOr("momentumPredictor", true);
-        // pimple.frozenFlow() is !solveFlow_, and solveFlow is `solveFlow` in the PIMPLE dict with a
-        // default of TRUE (pimpleControl.C:47). interFoam.C:163-166 uses it to `continue` past the
-        // momentum, the pressure AND the turbulence corrector for the whole outer iteration. This was
-        // hardcoded false, so a case asking for it was run with the flow solved -- the silent
-        // substitution this port refuses everywhere else.
-        // ...and THIS one is the one that mattered most: `solveFlow n;` read as true left brae solving
-        // the momentum, the pressure and the turbulence that interFoam.C:163-166 skips entirely.
-        f.pimple.frozenFlow = !pim->switchOr("solveFlow", true);
+        // THE KEY IS `frozenFlow`, NOT `solveFlow`, AND THIS READ THE WRONG ONE.
+        //
+        // interFoam.C:156 asks `pimple.frozenFlow()`. pimpleControl does NOT override frozenFlow(), so
+        // that is solutionControl::frozenFlow_, read at solutionControl.C:52 as
+        // `solutionDict.getOrDefault("frozenFlow", false)` with solutionDict =
+        // mesh_.solutionDict().subOrEmptyDict(algorithmName_) (solutionControl.C:300) -- the PIMPLE
+        // sub-dict, the same one momentumPredictor and nNonOrthogonalCorrectors come from.
+        //
+        // `solveFlow` is a DIFFERENT flag, read at pimpleControl.C:47 from the same dict, and in all of
+        // OpenFOAM v2412 exactly ONE solver reads it: sprayFoam.C:90. interFoam never does. So the
+        // previous line was wrong in both directions -- a case writing `frozenFlow yes` was run with the
+        // flow solved, and a case writing `solveFlow no` had its flow FROZEN where OpenFOAM solves it.
+        //
+        // `solveFlow` is deliberately not read here and deliberately not refused: OpenFOAM's interFoam
+        // accepts the entry and ignores it, so ignoring it is what matching OpenFOAM means. Refusing
+        // would reject a case OpenFOAM runs.
+        f.pimple.frozenFlow = pim->switchOr("frozenFlow", false);
         // pimpleControl.C:51-52
         f.pimple.turbOnFinalIterOnly = pim->switchOr("turbOnFinalIterOnly", true);
 
