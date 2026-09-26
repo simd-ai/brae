@@ -159,6 +159,23 @@ if not p.startswith('euler'):
     t, k = re.subn(r'(ddtSchemes\s*\{[^}]*default\s+)Euler;', r'\1CrankNicolson %s;' % oc, t)
     assert k == 1, 'the ddtSchemes default was not replaced'
     open(q, 'w').write(t)
+# `ddt(alpha)` NAMED SEPARATELY FROM THE DEFAULT. alphaEqn.H:242-259 branches on `ddt(rho,U)` while
+# ocCoeff comes from `ddt(alpha)` (alphaEqn.H:6-56), so the mixed cases are well-defined runs rather than
+# something OpenFOAM rejects -- it is brae that used to refuse them for want of a gate.
+if p == 'cnAlphaEuler':
+    q = os.path.join(d, 'system/fvSchemes')
+    t = open(q).read()
+    t, k = re.subn(r'(ddtSchemes\s*\{\s*\n\s*default\s+CrankNicolson 0\.5;\n)',
+                   r'\1    ddt(alpha)      Euler;\n', t)
+    assert k == 1, 'ddt(alpha) Euler was not inserted beside a CrankNicolson default'
+    open(q, 'w').write(t)
+if p == 'eulerAlphaCN':
+    q = os.path.join(d, 'system/fvSchemes')
+    t = open(q).read()
+    t, k = re.subn(r'(ddtSchemes\s*\{\s*\n\s*default\s+Euler;\n)',
+                   r'\1    ddt(alpha)      CrankNicolson 0.5;\n', t)
+    assert k == 1, 'ddt(alpha) CrankNicolson was not inserted beside an Euler default'
+    open(q, 'w').write(t)
 if p in ('cnSST', 'cnLES', 'eulerSST', 'eulerLES'):
     # THE OTHER TWO CLOSURES UNDER THE SCHEME. kEpsilon carried CrankNicolson from the start; this
     # stages the tutorial's own damBreak with kOmegaSST and with LES kEqn in its place, so the
@@ -241,7 +258,7 @@ PYEOF
 }
 
 rc=0
-for p in euler cn cnOuter cnFull eulerSST cnSST eulerLES cnLES; do
+for p in euler cn cnOuter cnFull eulerSST cnSST eulerLES cnLES cnAlphaEuler eulerAlphaCN; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_cn_vs_openfoam: staging failed"; exit 1; }
@@ -255,6 +272,50 @@ done
 # alpha flux across a COUPLED PAIR is a separate thing this loop does not carry.
 for p in cnSST cnLES; do
     "$BIN" "$W/$p" "$W/$p/0" "$W/$p/$END" "$STEPS" "$W/$p/log.interFoam" "$W/euler${p#cn}/$END" "$p" || rc=1
+done
+
+# ...and `ddt(alpha)` NAMED SEPARATELY FROM THE DEFAULT, both directions. BOTH take the BOTH-CrankNicolson
+# run as their control, because that is the answer brae produced while it ran "the two under one scheme":
+# MEASURED, OpenFOAM against OpenFOAM at this gate's own 20 steps, cnAlphaEuler against cn reads U
+# 3.4565e-02 / alpha 1.5801e-03 / epsilon 7.5480e-02, and eulerAlphaCN against cn reads U 3.1624e-02 /
+# alpha 8.9971e-03. Against the ALL-EULER run, cnAlphaEuler reads U 3.5786e-02 / alpha 1.0577e-02.
+#
+# ONE OF THE TWO IS A NO-OP IN OPENFOAM ITSELF, and it is asserted rather than assumed -- see below.
+python3 - "$W/eulerAlphaCN/$END" "$W/euler/$END" <<'NOOPEOF' || rc=1
+import re, sys
+def cells(path, vector):
+    t = open(path).read()
+    kind = "vector" if vector else "scalar"
+    m = re.search(r"internalField\s+nonuniform List<%s>\s*(\d+)\s*\((.*?)\n\)\s*;" % kind, t, re.S)
+    if m is None:
+        raise SystemExit("FAIL: %s is uniform" % path)
+    if vector:
+        return [tuple(float(x) for x in v.split()) for v in re.findall(r"\(([^()]*)\)", m.group(2))]
+    return [(float(x),) for x in m.group(2).split()]
+bad = 0
+for fld, vec in (("alpha.water", False), ("U", True)):
+    a = cells(sys.argv[1] + "/" + fld, vec)
+    b = cells(sys.argv[2] + "/" + fld, vec)
+    assert len(a) == len(b) and a
+    d = max(max(abs(x - y) for x, y in zip(u, v)) for u, v in zip(a, b))
+    ref = max(max(abs(x) for x in u) for u in a) or 1e-300
+    n = sum(1 for u, v in zip(a, b) if any(x != y for x, y in zip(u, v)))
+    print("  PROPERTY: OpenFOAM `ddt(alpha) CrankNicolson` under an EULER default equals plain Euler, "
+          "%s %.4e over %d of %d cells" % (fld, d / ref, n, len(a)))
+    # `phiCN` is cnCoeff*phi + (1 - cnCoeff)*phi.oldTime(), storeOldTimes copies the previous step's final
+    # flux at the top of the step, and nothing touches phi before the alpha equation -- so the two fields
+    # hold the same values and the blend is the identity. ddt(alpha)'s off-centring reaches the answer only
+    # through the un-blend in the non-Euler momentum branch. At `CrankNicolson 1` this is EXACTLY 0; at 0.5
+    # it is round-off on 2/3 + 1/3, which is why the bound is 1e-13 and not zero.
+    if d / ref > 1e-13:
+        print("  FAIL: it does not -- the blend is reaching the answer, so the mixed arm below means "
+              "something different from what its comment says")
+        bad = 1
+sys.exit(bad)
+NOOPEOF
+
+for p in cnAlphaEuler eulerAlphaCN; do
+    "$BIN" "$W/$p" "$W/$p/0" "$W/$p/$END" "$STEPS" "$W/$p/log.interFoam" "$W/cn/$END" "$p" || rc=1
 done
 
 echo "interfoam_cn_vs_openfoam: rc $rc"

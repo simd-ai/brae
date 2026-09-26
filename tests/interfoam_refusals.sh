@@ -300,7 +300,12 @@ arm ddt_cnFull              runs    -                        "" "sed -i '/^ddtSc
 arm ddt_cnBare              runs    -                        "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson;/' system/fvSchemes"
 arm ddt_cnRamp              refused "Function1 of time"      "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson ocCoeff { type scale; scale linearRamp; duration 0.01; value 0.9; };/' system/fvSchemes"
 arm ddt_cnOutOfRange        refused "should be >= 0 and <= 1" "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson 1.5;/' system/fvSchemes"
-arm ddt_cnAlphaOnly         refused "mixed case"              "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         Euler;\n    ddt(alpha)      CrankNicolson 0.5;/' system/fvSchemes"
+# `ddt(alpha)` NEED NOT AGREE WITH THE DEFAULT, in either direction. alphaEqn.H:242-259 branches on
+# `ddt(rho,U)` while ocCoeff comes from `ddt(alpha)` (alphaEqn.H:6-56), so all four combinations are runs
+# OpenFOAM makes. Their NUMBERS are held by tests/interfoam_cn_vs_openfoam.sh profiles `cnAlphaEuler` and
+# `eulerAlphaCN`, each against OpenFOAM's both-CrankNicolson answer -- the one brae used to produce.
+arm ddt_cnAlphaOnly         runs    -                        "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         Euler;\n    ddt(alpha)      CrankNicolson 0.5;/' system/fvSchemes"
+arm ddt_alphaEulerOnly      runs    -                        "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson 0.5;\n    ddt(alpha)      Euler;/' system/fvSchemes"
 arm ddt_cnSubCycles         refused "nAlphaSubCycles > 1"    "" "$CNSET; sed -i 's/nAlphaSubCycles  *1;/nAlphaSubCycles 2;/' system/fvSolution"
 arm ddt_cnDdt0Present       refused "ddt0(rho,U)"             "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class volVectorField; object ddt0(rho,U); }\ndimensions [1 -2 -2 0 0 0 0];\ninternalField uniform (0 0 0);\nboundaryField { \".*\" { type calculated; value uniform (0 0 0); } }\n' > '0/ddt0(rho,U)'"
 arm ddt_cnAlphaPhi0Present  refused "alphaPhi0"               "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class surfaceScalarField; object alphaPhi0.water; }\ndimensions [0 3 -1 0 0 0 0];\ninternalField uniform 0;\nboundaryField { \".*\" { type calculated; value uniform 0; } }\n' > 0/alphaPhi0.water"

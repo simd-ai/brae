@@ -741,15 +741,25 @@ InterFields buildInterFields(const std::string&          caseDir,
         {
             f.ddtAlphaOcCoeff = fv::readOcCoeff(ddtEntry("ddt(alpha)", dflt));
         }
-        // ...and the two must agree on the SCHEME: alphaEqn.H:236-262 forms rhoPhi one way when
-        // ddt(rho,U) is Euler and another when it is not, and the CrankNicolson blend of alpha's flux
-        // is what that other way un-blends. A case naming CrankNicolson for one and Euler for the
-        // other runs in OpenFOAM; no gate holds it.
-        if ((f.ddtU == DdtScheme::CrankNicolson) != (f.ddtAlpha == AlphaDdt::CrankNicolson))
-            throw std::runtime_error(
-                "brae interFoam: ddtSchemes names `" + dflt + "` for the default and `"
-                + ddtEntry("ddt(alpha)", dflt) + "` for ddt(alpha). brae runs the two under one scheme "
-                "(both Euler, or both CrankNicolson); the mixed case is not gated.");
+        // THE TWO NEED NOT AGREE, and both mixed cases run now. alphaEqn.H:242-259 branches on
+        // `ddt(rho,U)` -- the MOMENTUM entry -- while ocCoeff and cnCoeff come from `ddt(alpha)`
+        // (alphaEqn.H:6-56), so the four combinations are four well-defined runs and brae's two arms
+        // already formed each: the host keys the un-blend on `cnDdt` (the momentum scheme) with
+        // `ocAlpha > 0` (alpha's) inside it, and the device does the same through
+        // DeviceInterStepControls::cn and cnCoeffUnblend. The refusal here said "no gate holds it",
+        // which was true and is what this unit fixed rather than any arithmetic.
+        //
+        // MEASURED, and one of the two mixed cases is a NO-OP IN OPENFOAM ITSELF: with an Euler
+        // momentum, `ddt(alpha) CrankNicolson 1` is BIT-IDENTICAL to `ddt(alpha) Euler` -- 0 of 2268
+        // cells on RAS/damBreak over 20 steps. The reason is the ordering, not the scheme: `phiCN` is
+        // `cnCoeff*phi + (1 - cnCoeff)*phi.oldTime()`, storeOldTimes copies the previous step's final
+        // flux into phi.oldTime() at the top of the step, and NOTHING touches phi before the alpha
+        // equation runs -- so the two fields hold the same values and the blend is algebraically the
+        // identity. At `CrankNicolson 0.5` it reads 9.99e-15 instead of exactly 0, which is the same
+        // fact in the coefficients: 0.5 + 0.5 is exact in floating point and 2/3 + 1/3 is not.
+        // ddt(alpha)'s off-centring reaches the answer ONLY through the un-blend, i.e. only when the
+        // momentum scheme is not Euler. Gated on tests/interfoam_cn_vs_openfoam.sh, profiles
+        // `cnAlphaEuler` and `eulerAlphaCN`, both arms.
 
         f.laplacianScheme = readNonOrthScheme(all, "laplacianSchemes");
         f.snGradScheme = readNonOrthScheme(all, "snGradSchemes");

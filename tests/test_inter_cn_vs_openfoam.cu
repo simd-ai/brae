@@ -195,10 +195,19 @@ int main(
     // `density variable` is refused under either, so the staging takes it out.
     const bool sst = (profile == "cnSST");
     const bool les = (profile == "cnLES");
+    // `ddt(alpha)` NAMED SEPARATELY FROM THE ddtSchemes DEFAULT, one profile per direction.
+    // alphaEqn.H:242-259 branches on `ddt(rho,U)` and takes ocCoeff/cnCoeff from `ddt(alpha)`, so the
+    // two entries are two independent facts and the four combinations are four runs.
+    const bool cnAlphaEuler = (profile == "cnAlphaEuler");   // momentum CrankNicolson, alpha Euler
+    const bool eulerAlphaCN = (profile == "eulerAlphaCN");   // momentum Euler, alpha CrankNicolson
+    const bool mixedDdt = cnAlphaEuler || eulerAlphaCN;
     const char* secondName = les ? nullptr : (sst ? "omega" : "epsilon");
     const Bounds& HB = outer ? H_OUTER : full ? H_FULL : (sst ? H_SST : les ? H_LES : H_CN);
     const Bounds& DB = outer ? D_OUTER : full ? D_FULL : (sst ? D_SST : les ? D_LES : D_CN);
-    std::printf("  profile: %s\n", outer ? "cnOuter -- CrankNicolson 0.5 with nOuterCorrectors 2"
+    std::printf("  profile: %s\n",
+                cnAlphaEuler ? "cnAlphaEuler -- default CrankNicolson 0.5, ddt(alpha) Euler"
+                : eulerAlphaCN ? "eulerAlphaCN -- default Euler, ddt(alpha) CrankNicolson 0.5"
+                : outer ? "cnOuter -- CrankNicolson 0.5 with nOuterCorrectors 2"
                                  : full ? "cnFull -- CrankNicolson 1, the un-off-centred scheme"
                                  : sst ? "cnSST -- CrankNicolson 0.5 under kOmegaSST"
                                  : les ? "cnLES -- CrankNicolson 0.5 under LES kEqn"
@@ -214,12 +223,24 @@ int main(
     InterFields fin;
     const RunReport r = runInterFoam(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/false, &fin);
     check("brae ran the same number of steps", r.steps == nSteps);
-    // THE PATH: the scheme was read as itself, with the case's coefficient, for both operand sets
-    check("brae read ddtSchemes as CrankNicolson for U and for alpha",
-          fin.ddtU == DdtScheme::CrankNicolson && fin.ddtAlpha == AlphaDdt::CrankNicolson);
-    check("...with the case's off-centring coefficient",
-          std::fabs(fin.ddtOcCoeff - (full ? scalar(1) : scalar(0.5))) == scalar(0)
-       && std::fabs(fin.ddtAlphaOcCoeff - (full ? scalar(1) : scalar(0.5))) == scalar(0));
+    // THE PATH: the scheme was read as itself, with the case's coefficient, for both operand sets.
+    // The mixed profiles assert the same thing per ENTRY instead, further down -- they exist precisely
+    // because the two need not agree, so this pair does not apply to them.
+    if (!mixedDdt)
+    {
+        check("brae read ddtSchemes as CrankNicolson for U and for alpha",
+              fin.ddtU == DdtScheme::CrankNicolson && fin.ddtAlpha == AlphaDdt::CrankNicolson);
+        check("...with the case's off-centring coefficient",
+              std::fabs(fin.ddtOcCoeff - (full ? scalar(1) : scalar(0.5))) == scalar(0)
+           && std::fabs(fin.ddtAlphaOcCoeff - (full ? scalar(1) : scalar(0.5))) == scalar(0));
+    }
+    else
+    {
+        // the coefficient belongs to whichever entry NAMED CrankNicolson; the other has none to read
+        check("the CrankNicolson entry carried the case's off-centring coefficient",
+              std::fabs((cnAlphaEuler ? fin.ddtOcCoeff : fin.ddtAlphaOcCoeff) - scalar(0.5))
+              == scalar(0));
+    }
     check("brae ran the case turbulent, under the profile's own closure and lineage",
           fin.turbulence.on
        && fin.turbulence.model == (sst ? InterRasModel::KOmegaSST
@@ -230,9 +251,20 @@ int main(
     // (start index 1) and evaluated once per step since
     // ...and the closure kept its OWN ddt0 field for k, under every model: this is the term the two
     // new profiles add, so a run that formed Euler instead would leave it unborn.
-    check("the closure's k ddt0 field exists, born on step one and advanced on the last",
-          fin.turbulence.cn.ddt0K.exists && fin.turbulence.cn.ddt0K.startTimeIndex == 1
-       && fin.turbulence.cn.ddt0K.timeIndex == nSteps);
+    // ...and under `eulerAlphaCN` it must NOT exist: the closure's fvm::ddt comes through the
+    // ddtSchemes DEFAULT, which that profile leaves Euler, so a run that formed CrankNicolson there
+    // would be reading the wrong entry for the closure. The assertion is inverted rather than skipped.
+    if (eulerAlphaCN)
+    {
+        check("the closure kept NO ddt0 field -- its fvm::ddt takes the DEFAULT, which is Euler here",
+              !fin.turbulence.cn.ddt0K.exists);
+    }
+    else
+    {
+        check("the closure's k ddt0 field exists, born on step one and advanced on the last",
+              fin.turbulence.cn.ddt0K.exists && fin.turbulence.cn.ddt0K.startTimeIndex == 1
+           && fin.turbulence.cn.ddt0K.timeIndex == nSteps);
+    }
 
     auto readCells = [&](const std::string& path)
     {
@@ -297,10 +329,27 @@ int main(
           ofAlpha.size() == static_cast<std::size_t>(nC) && ofKf.size() == ofAlpha.size()
        && (!secondName || ofEf.size() == ofAlpha.size()) && ofNut.size() == ofAlpha.size());
 
+    if (mixedDdt)
+    {
+        // WHAT WAS READ, BOTH ENTRIES. Without this the arm could pass on a brae that resolved both
+        // names through the `default` and never saw the literal `ddt(alpha)` key -- which is what the
+        // refusal these profiles replace was guarding against.
+        const bool momCN = (fin.ddtU == cpu::interFoam::DdtScheme::CrankNicolson);
+        const bool alfCN = (fin.ddtAlpha == cpu::interFoam::AlphaDdt::CrankNicolson);
+        std::printf("  MIXED ddt: momentum %s, ddt(alpha) %s\n",
+                    momCN ? "CrankNicolson" : "Euler", alfCN ? "CrankNicolson" : "Euler");
+        check("brae read the momentum ddt as this profile names it", momCN == cnAlphaEuler);
+        check("...and ddt(alpha) as its OWN entry, not through the default", alfCN == eulerAlphaCN);
+        check("...so the two disagree, which is the whole profile", momCN != alfCN);
+    }
+
     // THE CONTROL, on the oracle: OpenFOAM under Euler against OpenFOAM under CrankNicolson
     const Diff dCtlU = compare(readVectorCells(eulerDir + "/U"), ofU);
     const Diff dCtlA = compare(readCells(eulerDir + "/alpha.water"), ofAlpha);
-    std::printf("  CONTROL: OpenFOAM under Euler against OpenFOAM under CrankNicolson, U relative %.4e, alpha %.4e\n",
+    std::printf("  CONTROL: %s, U relative %.4e, alpha %.4e\n",
+                mixedDdt ? "OpenFOAM with BOTH entries CrankNicolson against OpenFOAM with them mixed -- "
+                           "the answer brae gave while it ran the two under one scheme"
+                         : "OpenFOAM under Euler against OpenFOAM under CrankNicolson",
                 (double)dCtlU.rel(), (double)dCtlA.linf);
 
     Diff dUHost;
