@@ -317,6 +317,44 @@ void requireAlphaName(
 }
 
 
+namespace {
+
+// dictionary::merge (dictionary.C:806-848) on brae's dictionary: every entry of the override REPLACES the
+// one it finds and adds the one it does not, and a sub-dictionary present in both merges RECURSIVELY.
+// Applied to a COPY of the stored dictionary, so the base is what was read off disk and the override is
+// the case's. Local to this file because waveModel is the ONE class in interFoam's tree that merges two
+// dictionaries; a general FoamDict::merge would be a shared-code change with no second caller.
+void mergeInto(
+    FoamDict& base,
+    const FoamDict& over)
+{
+    for (const auto& l : over.leaves)
+    {
+        bool replaced = false;
+        for (auto& b : base.leaves)
+        {
+            if (b.first != l.first) continue;
+            b.second = l.second;
+            replaced = true;
+        }
+        if (!replaced) base.leaves.push_back(l);
+    }
+    for (const auto& s : over.subs)
+    {
+        bool merged = false;
+        for (auto& b : base.subs)
+        {
+            if (b.first != s.first) continue;
+            mergeInto(b.second, s.second);
+            merged = true;
+        }
+        if (!merged) base.subs.push_back(s);
+    }
+}
+
+}   // namespace
+
+
 std::unique_ptr<WaveModel> WaveModel::New(
     const FoamDict& waveProperties,
     const FvPatch& patch,
@@ -324,7 +362,8 @@ std::unique_ptr<WaveModel> WaveModel::New(
     const FvGeometry& g,
     const vector& gravity,
     const std::string& alphaName,
-    const std::vector<scalar>& alphaInternal)
+    const std::vector<scalar>& alphaInternal,
+    const FoamDict* stored)
 {
     const FoamDict* pd = waveProperties.subDict(patch.name);
     if (!pd)
@@ -364,7 +403,24 @@ std::unique_ptr<WaveModel> WaveModel::New(
     }
     w->mesh_ = &m;
     w->geometry_ = &g;
-    w->readDict(*pd, alphaInternal);
+    // A RESTART: the model IS an IOdictionary at <startTime>/uniform/waveProperties.<patch>, and
+    // readDict READS IT FIRST -- readOpt(READ_IF_PRESENT) then regIOobject::read() when the header is
+    // there (waveModel.C:294-300) -- before merging the case's own sub-dictionary on top
+    // (:302, dictionary::merge at dictionary.C:806-848, where the override REPLACES what it finds). So
+    // the stored keys the case does not name survive, and for every wave model that is exactly
+    // `waterDepthRef`: the one key OpenFOAM `add`s to itself (:342) so the run can be resumed.
+    // The model TYPE is not part of this: waveModelNew.C reads `waveModel` out of the case's sub-dict
+    // alone, which is why the selection above happens before the merge, as OpenFOAM has it.
+    if (stored)
+    {
+        FoamDict eff = *stored;
+        mergeInto(eff, *pd);
+        w->readDict(eff, alphaInternal);
+    }
+    else
+    {
+        w->readDict(*pd, alphaInternal);
+    }
     return w;
 }
 

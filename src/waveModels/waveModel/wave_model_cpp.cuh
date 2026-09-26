@@ -62,6 +62,11 @@ public:
     // waveModel::New for one patch: the patch's sub-dictionary of constant/<waveDict>, the model it
     // names, and readDict -- which needs alpha, because a case that names no reference depth takes
     // it from the water standing against the patch AT THAT MOMENT.
+    // `stored` is what <startTime>/uniform/waveProperties.<patch> held, or null on a cold start:
+    // readDict reads that file FIRST and merges the case's sub-dictionary over it (waveModel.C:294-302),
+    // so the stored keys the case does not name survive -- `waterDepthRef` above all, which is the one key
+    // OpenFOAM adds to itself so a run can be resumed (:342). The model TYPE still comes from the case's
+    // sub-dictionary alone (waveModelNew.C), which is why the selection does not see `stored`.
     static std::unique_ptr<WaveModel> New(
         const FoamDict& waveProperties,
         const FvPatch& patch,
@@ -69,7 +74,8 @@ public:
         const FvGeometry& g,
         const vector& gravity,
         const std::string& alphaName,
-        const std::vector<scalar>& alphaInternal);
+        const std::vector<scalar>& alphaInternal,
+        const FoamDict* stored = nullptr);
 
     // waveModel::correct(t). Does nothing when `timeIndex` is the one it last ran at. Returns
     // whether it ran, which is what OpenFOAM's "Updating ..." log line reports.

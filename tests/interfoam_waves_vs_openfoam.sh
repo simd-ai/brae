@@ -43,6 +43,25 @@
 #   mompred   trough with `momentumPredictor yes`, which no wave tutorial sets. The tutorial names
 #             PBiCG for U; the staging names smoothSolver with symGaussSeidel, which both codes run.
 #             It is here for what it found -- see below.
+# ...AND A RESTART, `restart`: the `trough` run's own twenty steps, then twenty MORE resumed from the state
+# it wrote. The wave model IS an IOdictionary at <startTime>/uniform/waveProperties.<patch>, and OpenFOAM
+# reads it back before merging the case's own entries over it -- so the one key it contributes is
+# `waterDepthRef`, which OpenFOAM adds to itself precisely so a run can be resumed. Recomputing it instead
+# takes the reference depth against a water level the wave has already moved: the stored
+# 0.600000000000001 against a recomputed 0.592198129937198 at the inlet, and alpha 2.87e-01 / U 6.43e-01 of
+# the answer twenty steps later. THE ORACLE is OpenFOAM's warm restart; THE CONTROL is OpenFOAM's COLD one
+# -- not the still tank, because what is under test here is the stored depth and not the wave.
+# MEASURED with the changed waveHeight: host alpha 6.0627e-12, p_rgh 2.5892e-12, U 1.2416e-10; device
+# 5.4097e-12, 3.2622e-12, 1.4309e-10 -- the ordinary tolerance ball, with all 40 p_rgh counts OpenFOAM's
+# and the model's own patch values to 2.8e-16. (Without the height change, 3.3138e-12 / 3.3613e-12 /
+# 2.0851e-10.) Control: U 6.3710e-01, alpha 2.7795e-01.
+# BROKEN THREE WAYS, each red on BOTH arms, and each a different number:
+#   the stored dictionary not read at all (the pre-port behaviour)  U 6.3710e-01, 19 failures
+#   `waterDepthRef` alone dropped from what was read                U 6.3710e-01, 18 failures
+#   the merge REVERSED, so the stored file wins over the case       U 5.2874e-01, 17 failures
+# The first two land on the SAME number, which is the measurement that says `waterDepthRef` is the whole of
+# what the file contributes here -- nothing else in it reaches the answer. The third is a different number
+# only because the fixture gives the case its own waveHeight; without that it would be silent.
 #
 # THE PRESSURE SOLVER IS THE TUTORIAL'S OWN, which for eight of the nine is GAMG on the last corrector.
 # IT WAS NOT, until brae had OpenFOAM's GAMG on both loops (tests/interfoam_gamg_vs_openfoam.sh): every
@@ -94,7 +113,11 @@ SRC="$WAVES/stokesI"
 [ -d "$SRC" ]      || { echo "SKIP: waves/stokesI tutorial not found at $SRC"; exit 77; }
 [ -f "$OFBASHRC" ] || { echo "SKIP: real OpenFOAM not available"; exit 77; }
 
-W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+# KEEP_W=<dir> keeps the staged cases and the oracle runs, which is what makes a fail-proof on one
+# arm cheap: stage once, then call $BIN on that arm alone. The other interFoam gates do the same.
+W=${KEEP_W:-$(mktemp -d)}
+[ -n "${KEEP_W:-}" ] || trap 'rm -rf "$W"' EXIT
+mkdir -p "$W"
 
 set +u
 # shellcheck disable=SC1091
@@ -197,6 +220,88 @@ PYEOF
     echo "OpenFOAM ran $n steps of deltaT $dt to t = $end   [$name]"
 }
 
+# restartFrom <profile> <end> <mode>: OpenFOAM again, from <profile>'s own <end> directory, with the wave
+# model's stored dictionary either kept (`warm` -- THE ORACLE) or removed (`cold` -- THE CONTROL). The
+# staged case is a copy, so the first run's output stays intact, and `adjustTimeStep no` is already set by
+# stage(), which is what makes the restart's deltaT the same number as OpenFOAM's (Time::setControls reads
+# deltaT back out of <start>/uniform/time only under adjustTimeStep, and brae does not read that file).
+#
+# WHAT THE STORED DICTIONARY IS. waveModel IS an IOdictionary at <startTime>/uniform/waveProperties.<patch>
+# (waveModel.C:250-261) and readDict reads it BEFORE merging the case's own sub-dictionary over it
+# (:294-302, dictionary::merge at dictionary.C:806-848, where the override replaces what it finds). So the
+# only key the file contributes is the one OpenFOAM `add`s to itself to make a resume possible --
+# `waterDepthRef` (:342) -- and the `cold` arm removes it. MEASURED on this fixture: the stored
+# 0.600000000000001 at the inlet against a recomputed 0.592198129937198, because a recomputed reference
+# depth is taken against the water level the wave has already moved. That is worth alpha 2.87e-01 and
+# U 6.43e-01 of the answer twenty steps later, over 7489 of 7500 cells.
+#
+# AND THE MERGE DIRECTION IS WITNESSED, which it would not be by a plain resume: the first run's stored
+# file repeats every key the case names, so letting the STORED file win would read the same numbers. The
+# restart's own case therefore names a DIFFERENT waveHeight (0.07 where the first run had 0.05), asserted
+# against the stored file's old value -- so the case's key must win and the stored `waterDepthRef`, which
+# the case does not name, must survive. Both halves of merge(), one fixture.
+restartFrom()
+{
+    local profile="$1" end="$2" mode="$3"
+    local B="$W/$profile" C="$W/restart_$mode"
+    rm -rf "$C"
+    cp -r "$B" "$C" || return 1
+    rm -f "$C"/log.interFoam
+    python3 - "$C" "$end" "$mode" <<'RSTEOF' || { echo "FAIL: staging restart_$mode"; return 1; }
+import os, re, sys
+d, end, mode = sys.argv[1], sys.argv[2], sys.argv[3]
+c = os.path.join(d, 'system/controlDict')
+s = open(c).read()
+s = re.sub(r'^startFrom .*', 'startFrom       startTime;', s, flags=re.M)
+s = re.sub(r'^startTime .*',  'startTime       %s;' % end,  s, flags=re.M)
+s = re.sub(r'^endTime .*',    'endTime         %.10g;' % (2*float(end)), s, flags=re.M)
+open(c, 'w').write(s)
+u = os.path.join(d, end, 'uniform')
+# WHAT OPENFOAM WROTE, asserted rather than assumed: one wave dictionary per wave patch. The cold arm
+# removes exactly those two and NOTHING ELSE in uniform/ -- `time` and `cumulativeContErr` are other
+# solvers' restart state and taking them out would make the arm about more than the wave model.
+got = sorted(os.listdir(u)) if os.path.isdir(u) else []
+want = ['waveProperties.inlet', 'waveProperties.outlet']
+assert all(w in got for w in want), 'OpenFOAM wrote %s in %s/uniform, without %s' % (got, end, want)
+
+# THE MERGE DIRECTION, made witnessable. The stored file is the first run's merged dictionary, so every
+# key the case names it names identically -- and a brae that let the STORED file win would read the same
+# numbers and pass. So the restart's own case gets a DIFFERENT waveHeight, which only the case has: the
+# override must win on it (dictionary::merge replaces what it finds) while `waterDepthRef`, which only the
+# stored file has, must survive. One fixture, both halves of the merge.
+w = os.path.join(d, 'constant/waveProperties')
+t = open(w).read()
+t, k = re.subn(r'waveHeight\s+0\.05;', 'waveHeight      0.07;', t)
+assert k == 1, 'the trough profile no longer ships waveHeight 0.05'
+open(w, 'w').write(t)
+stored = open(os.path.join(u, 'waveProperties.inlet')).read()
+assert re.search(r'waveHeight\s+0\.05;', stored), \
+    'the stored dictionary does not hold the OLD waveHeight, so the merge direction is not witnessed'
+assert re.search(r'waterDepthRef\s+', stored), 'the stored dictionary holds no waterDepthRef'
+
+if mode == 'cold':
+    for w in want:
+        os.remove(os.path.join(u, w))
+RSTEOF
+    ( cd "$C" && interFoam > log.interFoam 2>&1 ) \
+        || { echo "FAIL: interFoam [restart_$mode]"; tail -30 "$C/log.interFoam"; return 1; }
+    local rend
+    rend=$(python3 -c "print('%.10g' % (2*float('$end')))")
+    [ -d "$C/$rend" ] || { echo "FAIL: OpenFOAM wrote no $rend directory [restart_$mode]"; ls "$C"; return 1; }
+    # THE ARM TOOK THE PATH ITS NAME CLAIMS: the reference depth the model reports is the stored one on
+    # `warm` and a recomputed one on `cold`. Read out of OpenFOAM's own log, so it is OpenFOAM saying so.
+    local depth
+    depth=$(grep -m1 "Reference water depth" "$C/log.interFoam" | awk '{print $NF}')
+    if [ "$mode" = warm ]; then
+        [ "$depth" = "0.600000000000001" ] \
+            || { echo "FAIL: the WARM restart reports a reference depth of $depth, not the stored 0.600000000000001"; return 1; }
+    else
+        [ "$depth" != "0.600000000000001" ] \
+            || { echo "FAIL: the COLD restart reports the stored reference depth $depth -- it cannot have recomputed one"; return 1; }
+    fi
+    echo "OpenFOAM restarted to t = $rend, reference water depth $depth   [restart_$mode]"
+}
+
 # gate <name> <deltaT> <nSteps> <profile> <still-water oracle>
 gate()
 {
@@ -237,6 +342,12 @@ for entry in "${MODELS[@]}"; do
 done
 [ $rc = 0 ] || { echo "interfoam_waves_vs_openfoam: staging failed"; exit 1; }
 
+# A RESTART from OpenFOAM's own state, off the `trough` run's own twenty steps
+for mode in warm cold; do
+    restartFrom trough 0.2 "$mode" || { rc=1; break; }
+done
+[ $rc = 0 ] || { echo "interfoam_waves_vs_openfoam: restart staging failed"; exit 1; }
+
 # the oracle took the path: a log with no model update in it cannot gate one
 grep -q "Updating StokesI wave model for patch inlet" "$W/trough/log.interFoam" \
     || { echo "FAIL: OpenFOAM's log has no StokesI update"; exit 1; }
@@ -253,6 +364,11 @@ for entry in "${MODELS[@]}"; do
     IFS='|' read -r tutorial mesh steps <<< "$entry"
     gate "$tutorial" 0.01 "$steps" "$tutorial" "${tutorial}Still" || rc=1
 done
+
+# ...and the RESTART, whose oracle is OpenFOAM's warm restart and whose control is its COLD one -- the
+# run that recomputes the reference depth, which is what brae did while this was refused.
+"$BIN" "$W/restart_warm" "$W/restart_warm/0.2" "$W/restart_warm/0.4" 20 \
+       "$W/restart_warm/log.interFoam" restart "$W/restart_cold/0.4" || rc=1
 
 echo "interfoam_waves_vs_openfoam: rc $rc"
 exit $rc

@@ -88,6 +88,11 @@ struct InterWaves
     std::vector<char> UPatch;
     // per patch, null until the first update that asks for it -- waveModel::lookupOrCreate
     std::vector<std::shared_ptr<waveModels::WaveModel>> model;
+    // ...and, per patch, what <startDir>/uniform/waveProperties.<patch> held, or null where it held
+    // nothing. Read at SETUP and kept, because the model itself is built lazily at the first update and
+    // OpenFOAM's readDict reads the file at construction. A restart's contribution is `waterDepthRef`:
+    // recomputed instead, the reference depth is taken against a water level the wave has already moved.
+    std::vector<std::shared_ptr<FoamDict>> stored;
     vector gravity{0, 0, 0};
     std::string alphaName;
     // every update that RAN, in order, as "<patch>@<timeIndex>": OpenFOAM's "Updating ..." lines
@@ -95,8 +100,9 @@ struct InterWaves
 };
 
 // Rewrites `waveAlpha` / `waveVelocity` to fixedValue on the caller's copy of the file data and
-// records the patches. Reads constant/waveProperties when there is one to read. Refuses a `waveDict`
-// other than the default, and a restart (<startDir>/uniform/waveProperties.<patch>).
+// records the patches. Reads constant/waveProperties when there is one to read, and -- on a RESTART --
+// <startDir>/uniform/waveProperties.<patch> beside it, which the model merges under the case's own
+// entries. Refuses a `waveDict` other than the default.
 InterWaves readInterWaves(
     const std::string& caseDir,
     const std::string& startDir,

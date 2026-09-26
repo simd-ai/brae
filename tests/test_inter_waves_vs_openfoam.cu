@@ -157,6 +157,11 @@ int main(
     // `tight`: both codes' p_rgh solves at 1e-13 with no relTol, which takes the stopping point out of
     // the comparison. Every other profile runs the case's own tolerances.
     const bool tight = (profile == "tight");
+    // `restart`: the same tank resumed from OpenFOAM's own written state, where the wave model's stored
+    // `waterDepthRef` is read back instead of recomputed against a water level the wave has already
+    // moved. Its CONTROL is not the still tank -- it is OpenFOAM's own COLD restart, the run that
+    // recomputes the depth, which is the answer brae gave while it started the model fresh.
+    const bool restart = (profile == "restart");
     std::printf("  profile: %s\n", profile.c_str());
 
     PrimitiveMesh m;
@@ -240,6 +245,26 @@ int main(
         }
         std::printf("\n");
         check("the wave models updated in OpenFOAM's ORDER, update for update", mine == ofw.updates);
+    }
+
+    // WHAT WAS READ, on `restart`: the stored dictionary must have reached the model. Every derived
+    // constant is already held against OpenFOAM's log above -- which is where the reference depth is
+    // checked to its last digit -- so this asserts the PATH: the file was found and kept for each wave
+    // patch. Without it the arm could pass on a brae that recomputed a depth which happened to agree.
+    if (restart)
+    {
+        std::size_t found = 0;
+        std::size_t wavePatches = 0;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (!fin.waves.alphaPatch[pi] && !fin.waves.UPatch[pi]) continue;
+            ++wavePatches;
+            if (fin.waves.stored[pi]) ++found;
+        }
+        std::printf("  RESTART: brae read the stored wave dictionary on %zu of %zu wave patches\n",
+                    found, wavePatches);
+        check("brae read <startDir>/uniform/waveProperties.<patch> on every wave patch",
+              wavePatches > 0 && found == wavePatches);
     }
 
     failures += brae::gatecheck::nonFinite("brae alpha", fin.alpha1.internal);
@@ -400,12 +425,17 @@ int main(
     check("p_rgh agrees with OpenFOAM's relatively", dP.rel() < pBound);
     check("U agrees with OpenFOAM's relatively", dU.rel() < uBound);
 
-    // THE CONTROL, on the oracle: OpenFOAM's own answer for the same tank with NO wave
+    // THE CONTROL, on the oracle: OpenFOAM's own answer for the same tank with NO wave -- or, on
+    // `restart`, OpenFOAM's own COLD restart of the same tank
     const Diff dStillU = compare(vectorCells(readField<vector>(stillDir + "/U")), ofU);
     const Diff dStillA = compare(cells(readField<scalar>(stillDir + "/" + fin.alphaName)), ofAlpha);
-    std::printf("  CONTROL: OpenFOAM with no wave against OpenFOAM with it, U relative %.4e, alpha %.4e\n",
+    std::printf("  CONTROL: %s, U relative %.4e, alpha %.4e\n",
+                restart ? "OpenFOAM's COLD restart against its WARM one -- the answer brae gave while it "
+                          "recomputed the reference depth"
+                        : "OpenFOAM with no wave against OpenFOAM with it",
                 (double)dStillU.rel(), (double)dStillA.linf);
-    check("the wave moves OpenFOAM's own U far more than brae is from it",
+    check(restart ? "the stored reference depth moves OpenFOAM's own U far more than brae is from it"
+                  : "the wave moves OpenFOAM's own U far more than brae is from it",
           dStillU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)));
 
     // THE DEVICE LOOP, against OpenFOAM directly and at the case's own tolerances -- what

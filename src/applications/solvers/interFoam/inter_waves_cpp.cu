@@ -1,5 +1,6 @@
 // interFoam's wave boundary conditions. See inter_waves_cpp.cuh.
 #include "inter_waves_cpp.cuh"
+#include <memory>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -79,7 +80,7 @@ std::shared_ptr<waveModels::WaveModel> lookupOrCreate(
     if (!w.model[pi])
     {
         w.model[pi] = waveModels::WaveModel::New(w.waveProperties, patches[pi], m, g, w.gravity,
-                                                 w.alphaName, alphaInternal);
+                                                 w.alphaName, alphaInternal, w.stored[pi].get());
     }
     return w.model[pi];
 }
@@ -121,16 +122,25 @@ InterWaves readInterWaves(
             std::string(WHO) + "the case has wave boundary conditions and no constant/waveProperties. "
             "OpenFOAM reads it MUST_READ when the first of them updates.");
     w.waveProperties = readDict(path);
+    w.stored.assign(patches.size(), nullptr);
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         if (!w.alphaPatch[pi] && !w.UPatch[pi]) continue;
-        // waveModel is an IOdictionary at <startTime>/uniform/waveProperties.<patch>, READ_IF_PRESENT:
-        // a restart takes the reference depth the first run stored there
-        const std::string stored = startDir + "/uniform/waveProperties." + patches[pi].name;
-        if (std::filesystem::exists(stored))
-            throw std::runtime_error(
-                std::string(WHO) + stored + " exists: this is a restart, and OpenFOAM re-reads the "
-                "wave model's stored reference depth from it. brae does not.");
+        // A RESTART IS READ NOW. The model IS an IOdictionary at
+        // <startTime>/uniform/waveProperties.<patch> (waveModel.C:250-261), and readDict reads it before
+        // merging the case's own sub-dictionary over it (:294-302) -- so the one key the stored file
+        // contributes is the one OpenFOAM adds to itself to make a restart possible, `waterDepthRef`
+        // (:342). Recomputing it instead takes the reference depth against the water level the wave has
+        // already moved: MEASURED on laminar/waves/stokesI restarted at t = 0.2, OpenFOAM's own stored
+        // 0.600000000000001 against a recomputed 0.592198129937198 at the inlet, which is alpha 2.8676e-01
+        // and U 6.5751e-01 of the answer over 7489 of 7500 cells.
+        // brae WRITES no time directory for this solver, so there is no other half to this: the contract
+        // is reading what OpenFOAM wrote.
+        const std::string storedPath = startDir + "/uniform/waveProperties." + patches[pi].name;
+        if (std::filesystem::exists(storedPath))
+        {
+            w.stored[pi] = std::make_shared<FoamDict>(readDict(storedPath));
+        }
         if (!w.waveProperties.subDict(patches[pi].name))
             throw std::runtime_error(
                 std::string(WHO) + "constant/waveProperties has no entry for patch `"

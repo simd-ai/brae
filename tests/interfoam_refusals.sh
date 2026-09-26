@@ -487,7 +487,14 @@ arm waves_noProperties      refused "no constant/waveProperties" "" "rm constant
 arm waves_otherAlpha        refused "alpha.oil"               "" "sed -i '0,/alpha  *alpha.water;/s//alpha           alpha.oil;/' constant/waveProperties"
 arm waves_noRampTime        refused "rampTime"                "" "sed -i '/rampTime/d' constant/waveProperties"
 arm waves_noActiveAbsorption refused "activeAbsorption"       "" "sed -i '/activeAbsorption/d' constant/waveProperties"
-arm waves_restart           refused "this is a restart"       "" "mkdir -p 0/uniform; printf '%s\nwaterDepthRef 0.6;\n' '$HDR' > 0/uniform/waveProperties.inlet"
+# A RESTART IS READ NOW, not refused. The model IS an IOdictionary at
+# <startTime>/uniform/waveProperties.<patch> and OpenFOAM reads it back before merging the case's own
+# entries over it (waveModel.C:294-302), so the key the file contributes is `waterDepthRef` -- the one
+# OpenFOAM adds to itself to make a resume possible. This arm says the reader takes the PATH; the numbers
+# are held by tests/interfoam_waves_vs_openfoam.sh's `restart` profile, whose control is OpenFOAM's own
+# COLD restart. `waterDepthRef` ALONE in the file is enough, because the case supplies everything else --
+# which is what merge() means, and what the arm below asserts by leaving nothing else in it.
+arm waves_restart           runs    -                         "" "mkdir -p 0/uniform; printf '%s\nwaterDepthRef 0.6;\n' '$HDR' > 0/uniform/waveProperties.inlet"
 arm waves_otherWaveDict     refused "waveDict"                "" "sed -i '0,/type  *waveVelocity;/s//type            waveVelocity;\n        waveDict        otherWaves;/' 0/U"
 
 # p_rghFinal NAMES GAMG in this tutorial as shipped, and waves_baseline above ran it. What else the
