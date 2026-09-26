@@ -1046,6 +1046,209 @@ void setRefinementFaces(
     }
 }
 
+
+// ----------------------------------------------------------------------------------------------
+// UNIT 6: hexRef8::updateMesh and the refinement history's producing side. See the header for which
+// branch updateMesh takes and why the history is active even on an unrefined mesh.
+
+namespace {
+
+// hexRef8::reorder (:76-99): scatter `elems` through `map` into a list of `len`, filling the untouched
+// entries with `null`. A target index at or beyond `len` is OpenFOAM's own FatalError.
+void scatterThroughMap(
+    const std::vector<label>& map,
+    label                     len,
+    label                     null,
+    std::vector<label>&       elems)
+{
+    std::vector<label> out(static_cast<std::size_t>(len), null);
+    for (std::size_t i = 0; i < elems.size(); ++i)
+    {
+        const label newI = map[i];
+        if (newI >= len)
+            throw std::runtime_error(
+                std::string(WHO) + "remapping past the end: entry " + std::to_string(i) + " maps to "
+                + std::to_string(newI) + " but the new list is " + std::to_string(len)
+                + " long. OpenFOAM FatalErrors here too (hexRef8.C:86-93).");
+        if (newI >= 0) out[static_cast<std::size_t>(newI)] = elems[i];
+    }
+    elems.swap(out);
+}
+
+}   // namespace
+
+
+History freshHistory(label nCells)
+{
+    // refinementHistory.C:392-412
+    History h;
+    h.visibleCells.resize(static_cast<std::size_t>(nCells));
+    h.parent.assign(static_cast<std::size_t>(nCells), label(-1));
+    h.addedCells.assign(static_cast<std::size_t>(nCells), std::vector<label>());
+    for (label c = 0; c < nCells; ++c) h.visibleCells[static_cast<std::size_t>(c)] = c;
+    // active_ = returnReduceOr(visibleCells_.size()) -- true for any non-empty mesh, which is why an
+    // unrefined mesh still carries a live history
+    h.active = (nCells > 0);
+    return h;
+}
+
+
+void resizeHistory(
+    History& h,
+    label    size)
+{
+    // :1043-1060 -- the ADDITIONAL entries are -1, i.e. not visible, and the existing ones are untouched
+    const std::size_t oldSize = h.visibleCells.size();
+    h.visibleCells.resize(static_cast<std::size_t>(size));
+    for (std::size_t i = oldSize; i < h.visibleCells.size(); ++i) h.visibleCells[i] = -1;
+}
+
+
+label allocateSplitCell(
+    History& h,
+    label    parent,
+    label    i)
+{
+    // :940-985. THE FREE LIST IS USED FROM THE BACK, and that is not a detail: it decides which index a
+    // new split cell gets, and every `parent` and `visibleCells` entry is written in terms of indices.
+    label index = -1;
+    if (!h.freeSplitCells.empty())
+    {
+        index = h.freeSplitCells.back();
+        h.freeSplitCells.pop_back();
+        h.parent[static_cast<std::size_t>(index)] = parent;
+        h.addedCells[static_cast<std::size_t>(index)].clear();
+    }
+    else
+    {
+        index = static_cast<label>(h.parent.size());
+        h.parent.push_back(parent);
+        h.addedCells.emplace_back();
+    }
+    if (parent >= 0)
+    {
+        std::vector<label>& pAdded = h.addedCells[static_cast<std::size_t>(parent)];
+        if (pAdded.empty()) pAdded.assign(8, label(-1));   // FixedList<label,8>(-1) on first use
+        pAdded[static_cast<std::size_t>(i)] = index;
+    }
+    return index;
+}
+
+
+void storeSplit(
+    History&                  h,
+    label                     celli,
+    const std::vector<label>& addedCells)
+{
+    // :1000-1038
+    label parentIndex = -1;
+    if (h.visibleCells[static_cast<std::size_t>(celli)] != -1)
+    {
+        // it was live: its own split cell becomes the parent, and it stops being live -- then becomes
+        // live again below as addedCells[0], which is how the original cell keeps its index
+        parentIndex = h.visibleCells[static_cast<std::size_t>(celli)];
+        h.visibleCells[static_cast<std::size_t>(celli)] = -1;
+    }
+    else
+    {
+        // a 0th-level entry, whose own parent is -1
+        parentIndex = allocateSplitCell(h, -1, -1);
+    }
+    for (std::size_t i = 0; i < addedCells.size(); ++i)
+    {
+        h.visibleCells[static_cast<std::size_t>(addedCells[i])] =
+            allocateSplitCell(h, parentIndex, static_cast<label>(i));
+    }
+}
+
+
+void historyUpdateMesh(
+    History&                  h,
+    const std::vector<label>& reverseCellMap,
+    label                     nNewCells)
+{
+    // :1063-1120. Only the LIVE cells are renumbered; a cell whose split entry already has children
+    // being live is an inconsistency OpenFOAM stops on.
+    if (!h.active) return;
+    std::vector<label> newVisible(static_cast<std::size_t>(nNewCells), label(-1));
+    for (std::size_t celli = 0; celli < h.visibleCells.size(); ++celli)
+    {
+        if (h.visibleCells[celli] == -1) continue;
+        const label index = h.visibleCells[celli];
+        if (!h.addedCells[static_cast<std::size_t>(index)].empty())
+            throw std::runtime_error(
+                std::string(WHO) + "live cell " + std::to_string(celli) + " has split entry "
+                + std::to_string(index) + ", which already has children. OpenFOAM FatalErrors here too "
+                "(refinementHistory.C:1080-1090).");
+        const label newCelli = reverseCellMap[celli];
+        if (newCelli >= 0) newVisible[static_cast<std::size_t>(newCelli)] = index;
+    }
+    h.visibleCells.swap(newVisible);
+}
+
+
+void updateLevels(
+    Levels&                   lv,
+    const std::vector<label>& reverseCellMap,
+    const std::vector<label>& reversePointMap,
+    const std::vector<label>& cellMap,
+    const std::vector<label>& pointMap,
+    label                     nNewCells,
+    label                     nNewPoints)
+{
+    // :4370-4400 and :4455-4485, the two halves being the same shape. The REORDER branch is the one a
+    // hexRef8 refinement takes -- see the header on why the sizes match -- and OpenFOAM's reason for
+    // preferring it is in its own comment: gathering through cellMap would give a cell created from a
+    // cell the level of the cell it was created from, which is a level too low.
+    if (reverseCellMap.size() == lv.cellLevel.size())
+    {
+        scatterThroughMap(reverseCellMap, nNewCells, -1, lv.cellLevel);
+    }
+    else
+    {
+        std::vector<label> out(cellMap.size(), label(-1));
+        for (std::size_t newCelli = 0; newCelli < cellMap.size(); ++newCelli)
+        {
+            const label oldCelli = cellMap[newCelli];
+            out[newCelli] = (oldCelli == -1) ? label(-1)
+                                             : lv.cellLevel[static_cast<std::size_t>(oldCelli)];
+        }
+        lv.cellLevel.swap(out);
+    }
+    if (reversePointMap.size() == lv.pointLevel.size())
+    {
+        scatterThroughMap(reversePointMap, nNewPoints, -1, lv.pointLevel);
+    }
+    else
+    {
+        std::vector<label> out(pointMap.size(), label(-1));
+        for (std::size_t newPointi = 0; newPointi < pointMap.size(); ++newPointi)
+        {
+            const label oldPointi = pointMap[newPointi];
+            out[newPointi] = (oldPointi == -1) ? label(-1)
+                                               : lv.pointLevel[static_cast<std::size_t>(oldPointi)];
+        }
+        lv.pointLevel.swap(out);
+    }
+}
+
+
+void storeRefinementHistory(
+    History&                               h,
+    const std::vector<std::vector<label>>& cellAddedCells,
+    label                                  nCellsAfterSplit)
+{
+    // :4274-4300. The resize comes FIRST, over the cells the split added, because storeSplit writes
+    // visibleCells at the added cells' own indices.
+    if (!h.active) return;
+    resizeHistory(h, nCellsAfterSplit);
+    for (std::size_t celli = 0; celli < cellAddedCells.size(); ++celli)
+    {
+        if (cellAddedCells[celli].empty()) continue;
+        storeSplit(h, static_cast<label>(celli), cellAddedCells[celli]);
+    }
+}
+
 }   // namespace hexRef8
 }   // namespace cpu
 }   // namespace brae

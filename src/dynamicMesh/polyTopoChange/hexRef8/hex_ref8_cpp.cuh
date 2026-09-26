@@ -187,6 +187,92 @@ void setRefinementFaces(
     const RefinementMarks& marks,
     TopoActions&           a);
 
+// ----------------------------------------------------------------------------------------------
+// UNIT 6: hexRef8::updateMesh, and the REFINEMENT HISTORY's producing side.
+//
+// provenance:
+//   openfoam: hexRef8.C:4346-4351 (the one-argument form dynamicRefineFvMesh calls), :4357-4543 (the
+//               four-argument one it forwards to)
+//             refinementHistory.C -- resize, storeSplit, allocateSplitCell, updateMesh
+//             hexRef8.C:4274-4300 (setRefinement's section 11, which drives storeSplit)
+//
+// WHICH BRANCH updateMesh TAKES, and it is not the one the comment first suggests. Both halves ask
+// `reverseCellMap.size() == cellLevel_.size()` and, when it holds, REORDER through the reverse map rather
+// than gathering through `cellMap` -- with the reason in OpenFOAM's own words: "We cannot use cellMap
+// since then cells created from cells would get cellLevel_ of cell they were created from."
+//
+// The equality holds for a hexRef8 refinement, and the arithmetic of why is worth writing down:
+// polyTopoChange's `reverseCellMap_` is APPENDED TO by every addCell, so after setRefinement it is sized
+// nOldCells + nAdded -- 2275 on the gate's one-cell arm, not 2268 -- and `cellLevel_` is the same size
+// because section 10 extended it over the added cells. So the reorder branch is the live one and the
+// gather branch is for a change that was not hexRef8's.
+//
+// THE HISTORY IS ACTIVE EVEN ON A MESH THAT HAS NEVER BEEN REFINED, which decides whether any of this can
+// be gated: refinementHistory's constructor sets `visibleCells_` to the identity when there is no file to
+// read, and then `active_ = returnReduceOr(visibleCells_.size())` -- true for any non-empty mesh. So
+// section 11 and this updateMesh both run on the gate's own fixtures.
+
+// splitCell8 (refinementHistory.H:110-135) and the three lists refinementHistory keeps. brae's reader
+// already carried `parent` and `visibleCells`, which is all getSplitPoints needs; PRODUCING a history
+// needs the other two.
+struct History
+{
+    std::vector<label>                parent;         // splitCells_[i].parent_, -1 at the top level
+    std::vector<std::vector<label>>   addedCells;     // splitCells_[i].addedCellsPtr_, empty when null
+    std::vector<label>                visibleCells;   // per CURRENT cell: -1, or an index into parent
+    std::vector<label>                freeSplitCells; // the free list, used BACK first (LIFO)
+    bool                              active = false;
+};
+
+// refinementHistory's constructor with no file to read (refinementHistory.C:392-412): every cell visible
+// and its own top-level split entry, and `active` true for any non-empty mesh.
+History freshHistory(label nCells);
+
+// refinementHistory::resize (:1043-1060): grow visibleCells, the new entries NOT visible.
+void resizeHistory(
+    History& h,
+    label    size);
+
+// refinementHistory::allocateSplitCell (:940-985). Reuses the free list from the BACK, else appends. The
+// LIFO order is part of the answer: it decides the INDEX a new split cell gets, and the indices are what
+// `parent` and `visibleCells` are written in terms of.
+label allocateSplitCell(
+    History& h,
+    label    parent,
+    label    i);
+
+// refinementHistory::storeSplit (:1000-1038). The cell that was live becomes the PARENT of its eight
+// children and stops being live -- and then becomes live again as `addedCells[0]`, which is why the
+// original cell keeps its own index through a refinement.
+void storeSplit(
+    History&                  h,
+    label                     celli,
+    const std::vector<label>& addedCells);
+
+// refinementHistory::updateMesh (:1063-1120): renumber visibleCells through the change. Only the LIVE
+// cells need renumbering, and a cell whose splitCell already has children is an error OpenFOAM stops on.
+void historyUpdateMesh(
+    History&                  h,
+    const std::vector<label>& reverseCellMap,
+    label                     nNewCells);
+
+// hexRef8::updateMesh's own work: the two level lists remapped through the change. `nNewCells` and
+// `nNewPoints` are the mesh AFTER it.
+void updateLevels(
+    Levels&                   lv,
+    const std::vector<label>& reverseCellMap,
+    const std::vector<label>& reversePointMap,
+    const std::vector<label>& cellMap,
+    const std::vector<label>& pointMap,
+    label                     nNewCells,
+    label                     nNewPoints);
+
+// setRefinement's section 11 (:4274-4300): extend the history over the new cells and record every split.
+void storeRefinementHistory(
+    History&                               h,
+    const std::vector<std::vector<label>>& cellAddedCells,
+    label                                  nCellsAfterSplit);
+
 }   // namespace hexRef8
 }   // namespace cpu
 }   // namespace brae

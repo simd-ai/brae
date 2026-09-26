@@ -63,7 +63,7 @@ Dump readDump(const std::string& path)
     const char* blocks[] = {"cellAddedCells", "pointsFromPointsMap", "facesFromPointsMap",
                             "facesFromEdgesMap", "facesFromFacesMap", "cellsFromPointsMap",
                             "cellsFromEdgesMap", "cellsFromFacesMap", "cellsFromCellsMap",
-                            "points", "faces", "patches"};
+                            "points", "faces", "patches", "historyAddedCells", "preHistoryAddedCells"};
     // 5b-2 reads the mesh the refinement produced, so the face and patch blocks are parsed now
     (void)0;
     std::string line;
@@ -86,7 +86,7 @@ Dump readDump(const std::string& path)
             {
                 std::getline(is, line);
                 std::istringstream rs(line);
-                if (key == "cellAddedCells" || key == "faces")
+                if (key == "cellAddedCells" || key == "faces" || key == "historyAddedCells" || key == "preHistoryAddedCells")
                 {
                     label k = 0;
                     rs >> k;
@@ -101,11 +101,13 @@ Dump readDump(const std::string& path)
                     v.push_back({st, sz});
                 }
             }
-            if (key == "cellAddedCells" || key == "faces" || key == "patches") d.listLists[key] = v;
+            if (key == "cellAddedCells" || key == "faces" || key == "patches"
+             || key == "historyAddedCells" || key == "preHistoryAddedCells") d.listLists[key] = v;
             continue;
         }
-        if (key.rfind('n', 0) == 0 && key.size() > 1
-         && std::isupper(static_cast<unsigned char>(key[1])))
+        if ((key.rfind('n', 0) == 0 && key.size() > 1
+          && std::isupper(static_cast<unsigned char>(key[1])))
+         || key == "historyActive")
         {
             d.scalars[key] = n;
             continue;
@@ -345,7 +347,62 @@ int main(int argc, char** argv)
         }
         check("the patch slicing is OpenFOAM's", ok);
     }
-    skip("cellLevelFinal / pointLevelFinal after changeMesh -- needs hexRef8::updateMesh, unit 6");
+    // ---- UNIT 6: hexRef8::updateMesh and the refinement history --------------------------------
+    // the history is built BEFORE updateMesh remaps the levels, because section 11 runs inside
+    // setRefinement and this harness calls the two stages in OpenFOAM's own order
+    // THE HISTORY IS THE DUMP'S when the dump carries one -- for the same reason the levels are: after an
+    // earlier refinement it is NOT the fresh identity, and brae cannot reconstruct it from the mesh. The
+    // `twice` arm caught this: starting fresh there gave 9340 split cells where OpenFOAM has 9436, short
+    // by exactly the 96 cells pass 1 had refined.
+    History h;
+    if (d.lists.count("preHistoryVisibleCells") && d.lists.count("preHistoryParent"))
+    {
+        h.visibleCells = d.lists.at("preHistoryVisibleCells");
+        h.parent = d.lists.at("preHistoryParent");
+        h.addedCells = d.listLists.count("preHistoryAddedCells")
+                     ? d.listLists.at("preHistoryAddedCells")
+                     : std::vector<std::vector<label>>(h.parent.size());
+        h.active = !h.visibleCells.empty();
+    }
+    else
+    {
+        h = freshHistory(m.nCells());
+    }
+    check("the history is active -- as OpenFOAM's is, even on a mesh never refined",
+          h.active && d.scalars.count("historyActive") && d.scalars.at("historyActive") == 1);
+    storeRefinementHistory(h, marks.cellAddedCells, (label)marks.newCellLevel.size());
+
+    Levels after;
+    after.cellLevel = marks.newCellLevel;
+    after.pointLevel = marks.newPointLevel;
+    updateLevels(after, map.reverseCellMap, map.reversePointMap, map.cellMap, map.pointMap,
+                 out.nCells, (label)out.points.size());
+    historyUpdateMesh(h, map.reverseCellMap, out.nCells);
+
+    compareList("cellLevel after changeMesh", after.cellLevel, d, "cellLevelFinal");
+    compareList("pointLevel after changeMesh", after.pointLevel, d, "pointLevelFinal");
+    compareList("the history's visibleCells", h.visibleCells, d, "historyVisibleCells");
+    compareList("the history's parent list", h.parent, d, "historyParent");
+    {
+        const auto it = d.listLists.find("historyAddedCells");
+        bool ok = (it != d.listLists.end()) && (h.addedCells.size() == it->second.size());
+        std::size_t firstBad = h.addedCells.size();
+        for (std::size_t i = 0; ok && i < h.addedCells.size(); ++i)
+        {
+            if (h.addedCells[i] != it->second[i]) { ok = false; firstBad = i; }
+        }
+        if (!ok && firstBad < h.addedCells.size())
+        {
+            std::printf("  FAIL: the history's addedCells differs at split cell %zu "
+                        "(brae %zu entries, OpenFOAM %zu)\n", firstBad, h.addedCells[firstBad].size(),
+                        firstBad < it->second.size() ? it->second[firstBad].size() : 0);
+            ++failures;
+        }
+        else
+        {
+            check("the history's addedCells is OpenFOAM's, split cell for split cell", ok);
+        }
+    }
 
     std::printf("test_hex_ref8_vs_openfoam: %d failures, %d skipped\n", failures, skipped);
     return failures == 0 ? 0 : 1;

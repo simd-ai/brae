@@ -32,6 +32,7 @@
 #include "Time.H"
 #include "polyMesh.H"
 #include "hexRef8.H"
+#include "refinementHistory.H"
 #include "polyTopoChange.H"
 #include "mapPolyMesh.H"
 #include "OFstream.H"
@@ -192,6 +193,21 @@ int main(int argc, char *argv[])
     // brae's side already parses this file.
     const labelList preCellLevel(meshCutter.cellLevel());
     const labelList prePointLevel(meshCutter.pointLevel());
+    // ...and the HISTORY as it stood, for the same reason the levels are dumped: after an earlier
+    // refinement it is NOT the fresh identity, and brae cannot reconstruct it from the mesh alone.
+    labelList preHistoryVisible(meshCutter.history().visibleCells());
+    labelList preHistoryParent(meshCutter.history().splitCells().size());
+    labelListList preHistoryAdded(meshCutter.history().splitCells().size());
+    forAll(meshCutter.history().splitCells(), i)
+    {
+        const auto& sc = meshCutter.history().splitCells()[i];
+        preHistoryParent[i] = sc.parent_;
+        if (sc.addedCellsPtr_)
+        {
+            preHistoryAdded[i].setSize(8);
+            forAll(sc.addedCellsPtr_(), j) preHistoryAdded[i][j] = sc.addedCellsPtr_()[j];
+        }
+    }
     const label nPreCells = mesh.nCells();
     const label nPreFaces = mesh.nFaces();
     const label nPrePoints = mesh.nPoints();
@@ -221,6 +237,9 @@ int main(int argc, char *argv[])
 
     writeLabels(os, "preCellLevel", preCellLevel);
     writeLabels(os, "prePointLevel", prePointLevel);
+    writeLabels(os, "preHistoryVisibleCells", preHistoryVisible);
+    writeLabels(os, "preHistoryParent", preHistoryParent);
+    writeListList(os, "preHistoryAddedCells", preHistoryAdded);
     writeLabels(os, "cellsToRefine", cellsToRefine);
     writeListList(os, "cellAddedCells", cellAddedCells);
     writeLabels(os, "cellLevelAfterSet", cellLevelAfterSet);
@@ -271,6 +290,31 @@ int main(int argc, char *argv[])
     // ...and the levels of the mesh that now exists, which is what hexRef8::updateMesh leaves behind
     writeLabels(os, "cellLevelFinal", meshCutter.cellLevel());
     writeLabels(os, "pointLevelFinal", meshCutter.pointLevel());
+    // ...and the REFINEMENT HISTORY, which is active even on a mesh that was never refined: its
+    // constructor makes visibleCells the identity when there is no file, and active_ follows from that.
+    // `parent` is splitCells_[i].parent_ and `addedCells` its eight children (empty where it has none).
+    {
+        const refinementHistory& h = meshCutter.history();
+        os << "historyActive " << (h.active() ? 1 : 0) << nl;
+        writeLabels(os, "historyVisibleCells", h.visibleCells());
+        os << "historyParent " << h.splitCells().size();
+        for (const auto& sc : h.splitCells()) os << ' ' << sc.parent_;
+        os << nl;
+        os << "historyAddedCells " << h.splitCells().size() << nl;
+        for (const auto& sc : h.splitCells())
+        {
+            if (sc.addedCellsPtr_)
+            {
+                os << "  8";
+                for (const label v : sc.addedCellsPtr_()) os << ' ' << v;
+            }
+            else
+            {
+                os << "  0";
+            }
+            os << nl;
+        }
+    }
 
     Info<< "wrote " << outFile << nl
         << "cells " << nOldCells << " -> " << mesh.nCells()

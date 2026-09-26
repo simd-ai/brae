@@ -60,6 +60,32 @@
 # of each split cell -- so min and max pick the same point and getAnchorCell returns the same child. A
 # configuration where such a face has two anchors of one split cell would tell them apart; none of these
 # four produces one.
+# UNIT 6's FAIL-PROOFS -- and only ONE of six is witnessed by a refinement, each for a reason read off
+# OpenFOAM rather than guessed:
+#   allocateSplitCell does not register the child on its parent
+#                                     RED on all four arms: the history's addedCells at split cell 0/8/0/7
+#   updateLevels takes the GATHER branch (cellMap) instead of the reorder
+#                                     green -- and OpenFOAM's own warning about it does not apply here:
+#                                     section 10 already set the level to +1 at BOTH the original cell and
+#                                     its seven added ones, so gathering the master's level gives the same
+#                                     number. The warning is about a caller that is not hexRef8.
+#   allocateSplitCell pops the free list from the FRONT
+#                                     green -- a refinement FREES no split cell, so the list is always
+#                                     empty and the branch is unreachable
+#   storeSplit does not clear the parent's own visibleCells
+#                                     green -- and OpenFOAM says why in its own comment: the cell "gets
+#                                     alive again below since is addedCells[0]", so the clear is overwritten
+#   historyUpdateMesh keeps the old cell index instead of renumbering
+#   updateLevels does not remap at all
+#                                     both green, and this is the one that matters: MEASURED from
+#                                     OpenFOAM's own dumps, a pure refinement leaves reverseCellMap AND
+#                                     reversePointMap the IDENTITY (2275/4765 on `one`, 8540/12929 on
+#                                     `twice`), because the compaction only renumbers when cells are
+#                                     REMOVED. So unit 6's REMAPPING half cannot be witnessed by any
+#                                     refinement arm; the unrefinement arm is what turns it on.
+# So what unit 6 holds today is the history's PRODUCTION -- visibleCells, parent and addedCells against
+# OpenFOAM's on four arms, with addedCells' fail-proof red on all of them -- and the levels after
+# changeMesh. Its remapping half is carried but ungated, and that is stated rather than implied.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_hex_ref8_vs_openfoam"
