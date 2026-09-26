@@ -64,16 +64,21 @@ GeometricField<scalar> readTurbulenceField(
 }
 
 // The solver entry fvMatrix::solve() selects on the final outer corrector.
-SmoothLinearSolve readFinalSolve(
+// The solver entry for ONE name -- `k` or `kFinal`. `required` is false for the non-Final entries of a
+// case whose closure only ever runs on the final corrector: OpenFOAM never looks them up there, so
+// demanding them would refuse a case it runs.
+SmoothLinearSolve readClosureSolve(
     const FoamDict& fvSolution,
-    const std::string& field,
+    const std::string& entry,
+    bool required,
     // the kEpsilon, kOmegaSST and LES kEqn closures all run PBiCG with DILU (pbicg.cuh) as well as
     // the smoothSolver; a caller that passes false still refuses it
     bool allowPBiCG = false)
 {
-    const std::string name = field + "Final";
+    const std::string name = entry;
     const FoamDict* sv = fvSolution.subDict("solvers");
     const FoamDict* d = sv ? sv->subDict(name) : nullptr;
+    if (!d && !required) return SmoothLinearSolve{};
     if (!d)
         throw std::runtime_error(
             std::string(WHO) + "fvSolution has no `solvers/" + name + "` entry. turbulence->correct() "
@@ -88,6 +93,16 @@ SmoothLinearSolve readFinalSolve(
             "turbulent tutorial names -- and, under kEpsilon, kOmegaSST and the LES kEqn, PBiCG with "
             "DILU; nothing else: a substituted solver at the same tolerance stops somewhere else.");
     return s;
+}
+
+// ...and the Final entry, which is always required: the closure runs on the final corrector whatever
+// `turbOnFinalIterOnly` says.
+SmoothLinearSolve readFinalSolve(
+    const FoamDict& fvSolution,
+    const std::string& field,
+    bool allowPBiCG = false)
+{
+    return readClosureSolve(fvSolution, field + "Final", /*required=*/true, allowPBiCG);
 }
 
 // div(<flux>,<field>) for a RAS closure: `Gauss upwind` or `Gauss limitedLinear <k>`. Both arms of
@@ -327,9 +342,18 @@ InterTurbulence readInterTurbulence(
     label nCells,
     const PrimitiveMesh* mesh,
     const FvGeometry* geometry,
-    const std::vector<label>* sharedWallDistPatches)
+    const std::vector<label>* sharedWallDistPatches,
+    // PIMPLE's two facts the closure's reader needs: OpenFOAM looks the non-Final SOLVER entries up only
+    // when the closure runs on a NON-final corrector, i.e. when `turbOnFinalIterOnly no` and there is more
+    // than one. ONE place computes that rule so the three model branches cannot drift.
+    label nOuterCorrectors,
+    bool  turbOnFinalIterOnly)
 {
     InterTurbulence t;
+    // See the parameters: OpenFOAM looks the non-Final solver entries up only on a NON-final corrector,
+    // and solution::solverDict is FATAL when the name is absent (solution.C:474-478) -- so they are
+    // required exactly there and nowhere else. ONE place computes the rule.
+    const bool nonFinalRequired = (!turbOnFinalIterOnly && nOuterCorrectors > 1);
     const std::string path = caseDir + "/constant/momentumTransport";
     const std::string alt = caseDir + "/constant/turbulenceProperties";
     const std::string p = std::filesystem::exists(path) ? path
@@ -439,6 +463,8 @@ InterTurbulence readInterTurbulence(
         bound(t.k, t.lesCoeffs.kMin, *mesh, *geometry, patches);
         t.kSolveFinal = readFinalSolve(fvSolution, "k", /*allowPBiCG=*/true);
         t.kRelaxFinal = EquationRelax::read(eqAll, "kFinal");
+        t.kSolve = readClosureSolve(fvSolution, "k", nonFinalRequired, /*allowPBiCG=*/true);
+        t.kRelax = EquationRelax::read(eqAll, "k");
         t.on = true;
         return t;
     }
@@ -575,6 +601,10 @@ InterTurbulence readInterTurbulence(
         t.omegaSolveFinal = readFinalSolve(fvSolution, "omega", /*allowPBiCG=*/true);
         t.kRelaxFinal = EquationRelax::read(eqAll, "kFinal");
         t.omegaRelaxFinal = EquationRelax::read(eqAll, "omegaFinal");
+        t.kSolve = readClosureSolve(fvSolution, "k", nonFinalRequired, /*allowPBiCG=*/true);
+        t.omegaSolve = readClosureSolve(fvSolution, "omega", nonFinalRequired, /*allowPBiCG=*/true);
+        t.kRelax = EquationRelax::read(eqAll, "k");
+        t.omegaRelax = EquationRelax::read(eqAll, "omega");
         t.on = true;
         return t;
     }
@@ -665,6 +695,10 @@ InterTurbulence readInterTurbulence(
     t.epsSolveFinal = readFinalSolve(fvSolution, "epsilon", /*allowPBiCG=*/true);
     t.kRelaxFinal = EquationRelax::read(eqAll, "kFinal");
     t.epsRelaxFinal = EquationRelax::read(eqAll, "epsilonFinal");
+    t.kSolve = readClosureSolve(fvSolution, "k", nonFinalRequired, /*allowPBiCG=*/true);
+    t.epsSolve = readClosureSolve(fvSolution, "epsilon", nonFinalRequired, /*allowPBiCG=*/true);
+    t.kRelax = EquationRelax::read(eqAll, "k");
+    t.epsRelax = EquationRelax::read(eqAll, "epsilon");
 
     t.on = true;
     return t;
@@ -675,6 +709,34 @@ InterTurbulence readInterTurbulence(
 // The closure takes k's positionally and this for epsilon/omega, because fvMatrix::solve() looks the
 // dictionary up by FIELD name and `kFinal` and `epsilonFinal` need not agree.
 namespace {
+// WHICH DICTIONARY THIS CORRECTOR USES. fvMatrix::solve() and fvMatrix::relax() both select
+// `<field>Final` when isFinalIteration() and `<field>` otherwise (fvMatrix.C:1536-1542, :1249-1263), so
+// the pick is the same for the solver and the relaxation, and it is made in ONE place for all three
+// closures rather than three times over.
+struct ClosurePick
+{
+    const SmoothLinearSolve* first  = nullptr;   // k's
+    const SmoothLinearSolve* second = nullptr;   // epsilon's or omega's; null under LES kEqn, which solves k alone
+    const EquationRelax*     relaxFirst  = nullptr;
+    const EquationRelax*     relaxSecond = nullptr;
+};
+
+ClosurePick pickClosure(
+    const InterTurbulence& t,
+    bool                   finalIter)
+{
+    const bool sst = (t.model == InterRasModel::KOmegaSST);
+    ClosurePick p;
+    p.first      = finalIter ? &t.kSolveFinal : &t.kSolve;
+    p.relaxFirst = finalIter ? &t.kRelaxFinal : &t.kRelax;
+    if (t.model == InterRasModel::KEqnLES) return p;
+    p.second      = sst ? (finalIter ? &t.omegaSolveFinal : &t.omegaSolve)
+                        : (finalIter ? &t.epsSolveFinal   : &t.epsSolve);
+    p.relaxSecond = sst ? (finalIter ? &t.omegaRelaxFinal : &t.omegaRelax)
+                        : (finalIter ? &t.epsRelaxFinal   : &t.epsRelax);
+    return p;
+}
+
 EqnSolveSetting secondEqnSolve(
     const SmoothLinearSolve& s)
 {
@@ -774,23 +836,27 @@ void interNuEff(
 // as a copy of oldTime() -- the scheme does not read it that step. `second` is false under LES kEqn,
 // which solves k alone. One function for all three closures so they cannot drift on when it happens.
 namespace {
-void rotateCnOldOld(
+// storeOldTimes for the closure's transported scalars: ONCE per TIME INDEX, whatever the ddt scheme and
+// however many outer correctors run. Keyed on the step index rather than on the CrankNicolson clock,
+// because the old-TIME level is what every scheme reads and only the old-OLD level is CN's.
+void advanceTurbulenceOldTime(
     InterTurbulence&                   t,
-    const fv::CrankNicolsonClock&      cn,
+    label                              timeIndex,
     bool                               second)
 {
-    InterTurbulenceCrankNicolson& c = t.cn;
-    if (c.timeIndex == cn.timeIndex) return;
-    c.kOO = c.kEntry.empty() ? t.k.internal : c.kEntry;
-    c.kEntry = t.k.internal;
+    if (t.oldStepTimeIndex == timeIndex) return;
+    // the old-old level rotates off the outgoing old-time level, as OpenFOAM's oldTime().oldTime() does;
+    // at a cold start it is created as a copy of oldTime() and the scheme does not read it that step
+    t.cn.kOO = t.kOldStep.empty() ? t.k.internal : t.kOldStep;
+    t.kOldStep = t.k.internal;
     if (second)
     {
         const std::vector<scalar>& sec = (t.model == InterRasModel::KOmegaSST) ? t.omega.internal
                                                                                : t.epsilon.internal;
-        c.epsOO = c.epsEntry.empty() ? sec : c.epsEntry;
-        c.epsEntry = sec;
+        t.cn.epsOO = t.epsOldStep.empty() ? sec : t.epsOldStep;
+        t.epsOldStep = sec;
     }
-    c.timeIndex = cn.timeIndex;
+    t.oldStepTimeIndex = timeIndex;
 }
 }
 
@@ -876,10 +942,24 @@ void correctInterTurbulence(
         throw std::runtime_error(std::string(WHO) + "correctInterTurbulence needs every input field.");
     if (!(in.deltaT > 0))
         throw std::runtime_error(std::string(WHO) + "correctInterTurbulence needs a positive deltaT.");
+    // THE SENTINELS, refused rather than defaulted: the old-time snapshot is keyed on the step index and
+    // the solver dictionary is picked by the corrector, so a caller that supplied neither would silently
+    // get step -1 and a non-final corrector.
+    if (in.timeIndex < 0 || in.finalIter < 0)
+        throw std::runtime_error(
+            std::string(WHO) + "correctInterTurbulence needs the step's timeIndex and finalIter; the "
+            "caller supplied " + std::to_string(in.timeIndex) + " and " + std::to_string(in.finalIter)
+            + ". The closure keys psi.oldTime() on the first and selects <field>Final by the second.");
+    // storeOldTimes, ONCE per step whatever the scheme and however many correctors run. LES kEqn solves k
+    // alone, so it has no second scalar to rotate.
+    advanceTurbulenceOldTime(t, in.timeIndex, /*second=*/t.model != InterRasModel::KEqnLES);
 
     if (t.model == InterRasModel::KEqnLES)
     {
-        const SmoothLinearSolve& ks = t.kSolveFinal;
+        // WHICH DICTIONARY THIS CORRECTOR USES -- Final on the last outer corrector, the plain entry on the
+        // others (fvMatrix.C:1536-1542 for solve(), :1249-1263 for relax()).
+        const ClosurePick pk = pickClosure(t, in.finalIter != 0);
+        const SmoothLinearSolve& ks = *pk.first;
         LESkEqn::Solve sv;
         // the case's own solver, as both RAS branches take it -- PBiCG with DILU where it names one
         sv.which.pbicgDILU = ks.pbicgDILU();
@@ -890,15 +970,15 @@ void correctInterTurbulence(
         sv.relTol = ks.relTol;
         sv.maxIter = ks.maxIter;
         sv.minIter = ks.minIter;
-        sv.relaxOn = t.kRelaxFinal.on;
-        sv.relax = t.kRelaxFinal.factor;
+        sv.relaxOn = pk.relaxFirst->on;
+        sv.relax = pk.relaxFirst->factor;
         // fvm::ddt(k) under CrankNicolson, with k's old-old level rotated once per time index. This
         // lineage is the uniform one, so there is no density at any level.
         if (in.cn)
         {
-            rotateCnOldOld(t, *in.cn, /*second=*/false);
             t.cn.ddt0K.name = "ddt0(k)";
         }
+        sv.kOld = &t.kOldStep;   // psi.oldTime(), per STEP -- see InterTurbulence::kOldStep
         const SolverPerformance p = LESkEqn::correct(*in.U, t.k, t.nut, *in.phi, *in.nu, *in.nuBnd, t.delta,
                                                      in.deltaT, t.lesCoeffs, sv, m, g, patches, t.lesTaps,
                                                      in.cn, in.cn ? &t.cn.ddt0K : nullptr,
@@ -919,6 +999,9 @@ void correctInterTurbulence(
         sstComp.nu = in.nu;
         sstComp.nuBnd = in.nuBnd;
         sstComp.rDeltaT = scalar(1) / in.deltaT;
+        // psi.oldTime(), per STEP -- see InterTurbulence::kOldStep
+        sstComp.kOldIn = &t.kOldStep;
+        sstComp.omegaOldIn = &t.epsOldStep;
         sstComp.nutPhi = in.phi;
         sstComp.V0 = in.V0;
         sstComp.meshPhi = in.meshPhi;
@@ -927,7 +1010,6 @@ void correctInterTurbulence(
         // CrankNicolson block, as every other per-model slot on this branch does.
         if (in.cn)
         {
-            rotateCnOldOld(t, *in.cn, /*second=*/true);
             t.cn.ddt0K.name = "ddt0(k)";
             t.cn.ddt0Eps.name = "ddt0(omega)";
             sstComp.cn = in.cn;
@@ -936,11 +1018,14 @@ void correctInterTurbulence(
             sstComp.kOO = &t.cn.kOO;
             sstComp.omegaOO = &t.cn.epsOO;
         }
-        const SmoothLinearSolve& ks = t.kSolveFinal;
+        // WHICH DICTIONARY THIS CORRECTOR USES -- Final on the last outer corrector, the plain entry on the
+        // others (fvMatrix.C:1536-1542 for solve(), :1249-1263 for relax()).
+        const ClosurePick pk = pickClosure(t, in.finalIter != 0);
+        const SmoothLinearSolve& ks = *pk.first;
         // omegaFinal NEED NOT MATCH kFinal. fvMatrix::solve() looks the solver dictionary up by FIELD
         // name, so OpenFOAM honours each; the closure takes k's positionally and omega's through
         // EqnSolveSetting. This used to refuse the pair outright.
-        const EqnSolveSetting omegaSolve = secondEqnSolve(t.omegaSolveFinal);
+        const EqnSolveSetting omegaSolve = secondEqnSolve(*pk.second);
         // THE SOLVER THE CASE NAMES. This said `smoothSolver = true` whatever fvSolution gave, so a
         // case naming PBiCG ran symGaussSeidel sweeps under PBiCG's tolerance -- the substitution the
         // kEpsilon branch below was fixed for, in the twin nobody looked at.
@@ -956,11 +1041,11 @@ void correctInterTurbulence(
         // carried the same capture since its own port (rhoSimpleFoam_cpp.cu:1316).
         res.captureStages = (std::getenv("BRAE_SST_DUMP_DIR") != nullptr);
         kOmegaSST::correct(*in.U, t.k, t.omega, t.nut, *in.phi, t.yCell, scalar(0), m, g, patches,
-                           t.omegaRelaxFinal.factor, t.kRelaxFinal.factor, ks.tol, ks.relTol, ks.maxIter,
+                           pk.relaxSecond->factor, pk.relaxFirst->factor, ks.tol, ks.relTol, ks.maxIter,
                            t.sstCoeffs, &res, /*bounded=*/false, t.kDiv.limitedLinear,
                            t.kDiv.limiterCoeff, /*linearUpwind=*/false,
                            t.coeffs.correctedLaplacian, t.coeffs.snGradLimitCoeff, /*lm=*/nullptr,
-                           &sstComp, ks.minIter, t.omegaRelaxFinal.on, t.kRelaxFinal.on, &which,
+                           &sstComp, ks.minIter, pk.relaxSecond->on, pk.relaxFirst->on, &which,
                            &omegaSolve, &t.secondDiv, &t.secondGrad);
         // The assembled systems are WRITTEN BY THE CLOSURE (kOmegaSST_cpp.cu), at the call its stage
         // dump latched. This site wrote them on every call instead, so the files held the LAST
@@ -989,7 +1074,6 @@ void correctInterTurbulence(
         // index, on the first access of the step. At the first step of a cold start oldTime().oldTime()
         // is created as a copy of oldTime(), and the scheme does not read it that step.
         InterTurbulenceCrankNicolson& c = t.cn;
-        rotateCnOldOld(t, *in.cn, /*second=*/true);
         c.ddt0K.name = t.variableDensity ? "ddt0(rho,k)" : "ddt0(k)";
         c.ddt0Eps.name = t.variableDensity ? "ddt0(rho,epsilon)" : "ddt0(epsilon)";
         comp.cn = in.cn;
@@ -1020,6 +1104,16 @@ void correctInterTurbulence(
         comp.bcPhi = in.phi;
         eqnFlux = in.rhoPhi;
     }
+    // psi.oldTime(), per STEP -- BOTH lineages. These two were mis-indented INSIDE the
+    // `if (t.variableDensity)` block above, so on the uniform lineage they stayed null and
+    // kEpsilon_cpp.cu:387-388 fell back to the CURRENT field. Localised with tools/dumpKEpsilon against
+    // OpenFOAM's own six numbers: with the per-call capture, corrector 2 of step 1 reads epsilon's initial
+    // residual 0.00271633 where OpenFOAM reads 0.01414477 (relative 0.808) and k's 0.38632 where OpenFOAM
+    // reads 0.03982068 (relative 8.702), with both final residuals and both iteration counts reproduced --
+    // brae's reported 8.080e-01 and 8.702e+00 to three and four digits. The two sibling closures set these
+    // unconditionally and the DEVICE arm was already correct, which is why only this lineage was wrong.
+    comp.kOldIn = &t.kOldStep;
+    comp.epsOldIn = &t.epsOldStep;
 
     kEpsilonRef::NutWallSelection sel;
     sel.kind = &t.nutWallKind;
@@ -1028,8 +1122,11 @@ void correctInterTurbulence(
     // epsilonFinal NEED NOT MATCH kFinal -- see the SST branch. Every shipped tutorial writes the two as
     // one regex key, which is why the old refusal was never reached by a tutorial and why the profile
     // that gates this one is staged.
-    const SmoothLinearSolve& ks = t.kSolveFinal;
-    const EqnSolveSetting epsSolve = secondEqnSolve(t.epsSolveFinal);
+    // WHICH DICTIONARY THIS CORRECTOR USES -- Final on the last outer corrector, the plain entry on the
+    // others (fvMatrix.C:1536-1542 for solve(), :1249-1263 for relax()).
+    const ClosurePick pk = pickClosure(t, in.finalIter != 0);
+    const SmoothLinearSolve& ks = *pk.first;
+    const EqnSolveSetting epsSolve = secondEqnSolve(*pk.second);
     LinearSolverChoice which;
     which.pbicgDILU = ks.pbicgDILU();
     which.smoothSolver = !which.pbicgDILU;
@@ -1070,9 +1167,9 @@ void correctInterTurbulence(
     }
     res.captureStages = kd.on;
     kEpsilonRef::correct(*in.U, t.k, t.epsilon, t.nut, *eqnFlux, scalar(0), m, g, patches,
-                         t.epsRelaxFinal.factor, t.kRelaxFinal.factor, ks.tol, ks.relTol, ks.maxIter,
+                         pk.relaxSecond->factor, pk.relaxFirst->factor, ks.tol, ks.relTol, ks.maxIter,
                          t.coeffs, &res, /*bounded=*/false, /*dropTerm=*/0, &comp, in.fvOptions,
-                         t.epsRelaxFinal.on, t.kRelaxFinal.on, /*constrainBeforeWall=*/true,
+                         pk.relaxSecond->on, pk.relaxFirst->on, /*constrainBeforeWall=*/true,
                          // the limiter's gradient limiter is `t.coeffs.gradKLimitK`, which the closure
                          // reads from the coeffs it was handed -- this site used to pass a literal 0
                          // here and limited nothing (1.9e-01 off OpenFOAM, gated on RAS/damBreak)

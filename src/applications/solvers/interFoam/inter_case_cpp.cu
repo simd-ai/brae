@@ -371,14 +371,26 @@ NonOrthScheme readNonOrthScheme(
                 "scheme with no coefficient in [0,1].");
         s.corrected = (c > 0);
         s.limitCoeff = (c < 1) ? static_cast<scalar>(c) : scalar(0);
+        // limitedSnGrad wraps correctedSnGrad, so the COEFFICIENTS are nonOrthDeltaCoeffs whatever the
+        // limiter is -- including at 0, where the correction vanishes and the scheme IS `uncorrected`.
+        s.nonOrthCoeffs = true;
         return s;
     }
     if (schemeHasWord(s.raw, "corrected"))
     {
         s.corrected = true;
+        s.nonOrthCoeffs = true;
         return s;
     }
-    if (schemeHasWord(s.raw, "uncorrected") || schemeHasWord(s.raw, "orthogonal")) return s;
+    // `uncorrected` TAKES nonOrthDeltaCoeffs -- it is corrected's coefficients without the correction
+    // flux (uncorrectedSnGrad.H:113-124). Only `orthogonal` takes deltaCoeffs. These two used to share
+    // this line, so brae ran orthogonal under both names.
+    if (schemeHasWord(s.raw, "uncorrected"))
+    {
+        s.nonOrthCoeffs = true;
+        return s;
+    }
+    if (schemeHasWord(s.raw, "orthogonal")) return s;
     throw std::runtime_error(
         "brae interFoam: fvSchemes `" + block + "` default is `" + s.raw + "`, which names none of "
         "corrected, uncorrected, orthogonal or limited.");
@@ -1149,13 +1161,26 @@ InterFields buildInterFields(const std::string&          caseDir,
     f.turbulence = readInterTurbulence(caseDir, startDir, fvSolution,
                                        f.ddtU == DdtScheme::Euler || f.ddtU == DdtScheme::CrankNicolson,
                                        f.laplacianScheme.corrected, f.laplacianScheme.limitCoeff,
-                                       patches, nC, &m, &g, &sharedWallDist);
-    if (f.turbulence.on && !f.pimple.turbOnFinalIterOnly && f.pimple.nOuterCorrectors > 1)
-        throw std::runtime_error(
-            "brae interFoam: `turbOnFinalIterOnly no` with nOuterCorrectors "
-            + std::to_string(f.pimple.nOuterCorrectors) + " runs turbulence->correct() more than once "
-            "inside a time step. The second call needs k.oldTime() and the non-Final solver entries, "
-            "which this port does not carry; no shipped tutorial sets it.");
+                                       patches, nC, &m, &g, &sharedWallDist,
+                                       f.pimple.nOuterCorrectors, f.pimple.turbOnFinalIterOnly);
+    // `turbOnFinalIterOnly no` WITH MORE THAN ONE OUTER CORRECTOR RUNS NOW, on both arms. Two halves:
+    //   * psi.oldTime() is kept per TIME INDEX rather than recaptured per call
+    //     (InterTurbulence::kOldStep, advanceTurbulenceOldTime). OpenFOAM's storeOldTimes is guarded on
+    //     `timeIndex_ != time().timeIndex()` (GeometricField.C:904-917), so every corrector of a step
+    //     reads the PREVIOUS STEP's field -- not the previous corrector's solved-and-bounded one.
+    //   * both the Final and the non-Final solver and relaxation entries are read and the corrector picks
+    //     between them (pickClosure), because fvMatrix::solve() and fvMatrix::relax() select
+    //     `<field>Final` only on the final corrector (fvMatrix.C:1536-1542, :1249-1263). The non-Final
+    //     SOLVER entries are required exactly when the closure runs on a non-final corrector, since
+    //     solution::solverDict is fatal when the name is absent.
+    //
+    // ONE MIS-INDENTED PAIR OF LINES cost a day here: `comp.kOldIn`/`comp.epsOldIn` sat inside
+    // `if (t.variableDensity)`, so the uniform lineage fell back to the CURRENT field and corrector 2 read
+    // epsilon's initial residual 0.808 and k's 8.702 relative from OpenFOAM's. It was localised with
+    // tools/dumpKEpsilon by rebuilding OpenFOAM's whole path offline and substituting ONE term: the ddt
+    // source. See the note at that site. A measurement that toggled the per-call/per-step switch looked
+    // like it REFUTED the old-time hypothesis -- it changed nothing because the per-step store was not
+    // reaching the closure either way. The measurement refuted the fix, not the cause.
     validateInterTurbulence(f.turbulence, f.U, f.nu, f.nuBnd, f.phi, m, g, patches);
 
     // createMRF.H -> IOMRFZoneList (READ_IF_PRESENT); a zone is active unless it says otherwise

@@ -94,7 +94,7 @@ stage()
     case "$profile" in
         laminar)
             sed -i 's/^simulationType .*/simulationType laminar;/' "$C/constant/turbulenceProperties" ;;
-        uniform|custom|nutAtmosphere|sst|frozen|frozenFloored|frozenSST|splitSolve|splitSolveSST|splitDiv|splitDivSST|lowRe|lowReOff)
+        uniform|custom|nutAtmosphere|sst|frozen|frozenFloored|frozenSST|splitSolve|splitSolveSST|splitDiv|splitDivSST|lowRe|lowReOff|outerUniform|turbOuter|turbOuterSplit)
             sed -i '/^density /d' "$C/constant/turbulenceProperties"
             sed -i 's/^\( *\)div(rhoPhi,k) .*/\1div(phi,k)      Gauss upwind;/; s/^\( *\)div(rhoPhi,epsilon) .*/\1div(phi,epsilon) Gauss upwind;/' \
                 "$C/system/fvSchemes"
@@ -271,6 +271,64 @@ LOWEOF
         grep -q "1e-2;" "$C/constant/transportProperties" \
             || { echo "FAIL: the viscosity was not raised"; return 1; }
     fi
+    # `outerUniform` / `turbOuter` / `turbOuterSplit`: THREE profiles, each one setting from the last.
+    #
+    #   outerUniform    the uniform lineage with nOuterCorrectors 2 and turbOnFinalIterOnly at its default
+    #                   (yes) -- the closure runs ONCE per step, on the final corrector. The control.
+    #   turbOuter       + `turbOnFinalIterOnly no`: pimpleControlI.H:142 then returns true on EVERY outer
+    #                   corrector, so the closure runs TWICE per step. This is the half that needs
+    #                   psi.oldTime() kept per TIME INDEX: corrector 2 must still read the PREVIOUS STEP`s
+    #                   k, not corrector 1`s solved-and-bounded k (GeometricField.C:904-917). MEASURED,
+    #                   OpenFOAM vs OpenFOAM: epsilon 7.669e-02, nut 1.417e-01, k 2.821e-02, U 3.356e-02.
+    #   turbOuterSplit  + literal `kFinal`/`epsilonFinal` naming `solver PBiCG; preconditioner DILU;`
+    #                   beside the case`s own `"(U|k|epsilon).*"` regex, which keeps answering for the
+    #                   NON-Final `k`/`epsilon`. fvMatrix::solve() selects Final only on the last corrector
+    #                   (fvMatrix.C:1535-1542), so corrector 1 runs the smoothSolver and corrector 2 runs
+    #                   PBiCG. ITS WITNESS IS CATEGORICAL, not a bound: OpenFOAM prints the solver NAME on
+    #                   the solve line, so the log reads
+    #                       PIMPLE: iteration 1
+    #                       smoothSolver:  Solving for k, ... No Iterations 5
+    #                       PIMPLE: iteration 2
+    #                       DILUPBiCG:  Solving for k, ... No Iterations 2
+    #                   -- one of each per step, with different sweep counts. A brae that reused the
+    #                   non-Final entry on corrector 2 fails on the counts this gate already compares
+    #                   solve for solve, without having to clear a field bound. MEASURED against
+    #                   turbOuter: epsilon 8.272e-06, nut 4.476e-05, k 1.434e-06, U 8.762e-07.
+    #
+    # A RELAXATION-name split was measured and NOT staged: `UEqn.relax()` is called unconditionally
+    # (interFoam/UEqn.H:12) before the momentumPredictor test, so naming `k 0.5; epsilon 0.5;` without a
+    # `".*"` also drops relaxation from the MOMENTUM matrix on the last corrector -- U 2.253e-04, five
+    # orders above the floor. A failure there could not be attributed to the closure. Its own profile,
+    # with `UFinal 1;` added to isolate it, is the way to gate that lookup.
+    case "$profile" in
+        outerUniform|turbOuter|turbOuterSplit)
+            sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' "$C/system/fvSolution"
+            grep -q "nOuterCorrectors 2;" "$C/system/fvSolution" \
+                || { echo "FAIL: nOuterCorrectors 1 was not found to replace"; return 1; } ;;
+    esac
+    case "$profile" in
+        turbOuter|turbOuterSplit)
+            sed -i 's/^\( *\)nOuterCorrectors 2;/\1nOuterCorrectors 2;\n\1turbOnFinalIterOnly no;/' \
+                "$C/system/fvSolution"
+            grep -q "turbOnFinalIterOnly no;" "$C/system/fvSolution" \
+                || { echo "FAIL: turbOnFinalIterOnly was not added"; return 1; } ;;
+    esac
+    if [ "$profile" = turbOuterSplit ]; then
+        python3 - "$C/system/fvSolution" <<'TOEOF' || { echo "FAIL: the Final solver entries were not staged"; return 1; }
+import sys
+p = sys.argv[1]
+t = open(p).read()
+assert '"(U|k|epsilon).*"' in t, "the regex solver entry is not where this profile expects it"
+blk = "".join("    %s\n    {\n        solver          PBiCG;\n"
+              "        preconditioner  DILU;\n        tolerance       1e-06;\n"
+              "        relTol          0;\n    }\n\n" % f for f in ("kFinal", "epsilonFinal"))
+i = t.index('"(U|k|epsilon).*"')
+j = t.index("}", t.index("}", t.index("{", i)) + 1)
+open(p, "w").write(t[:j] + blk + t[j:])
+TOEOF
+        grep -q "kFinal" "$C/system/fvSolution" && grep -q '"(U|k|epsilon).\*"' "$C/system/fvSolution" \
+            || { echo "FAIL: the Final entries did not land, or the regex was lost"; return 1; }
+    fi
     # `outer`: the shipped case with nOuterCorrectors 2 -- the second pass starts from the first pass's
     # alpha, U and phi, and every once-per-step update must stay once per step. The DEVICE alpha step
     # reset alpha1 to its old time at the start of every pass until this profile measured it: the
@@ -343,7 +401,7 @@ PYEOF
 }
 
 rc=0
-for p in laminar variable uniform custom nutAtmosphere sst outer frozen frozenFloored frozenSST splitSolve splitSolveSST splitDiv splitDivSST lowReOff lowRe; do
+for p in laminar variable uniform custom nutAtmosphere sst outer frozen frozenFloored frozenSST splitSolve splitSolveSST splitDiv splitDivSST lowReOff lowRe outerUniform turbOuter turbOuterSplit; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_ras_dambreak_vs_openfoam: staging failed"; exit 1; }
@@ -389,6 +447,16 @@ done
 # ...and epsilonWallFunction's `lowReCorrection`, whose control is the `uniform` run in the log law.
 "$BIN" "$W/lowRe" "$W/lowRe/0" "$W/lowRe/$END" "$STEPS" "$W/lowRe/log.interFoam" \
        lowRe uniform "$W/laminar/$END" "$W/lowReOff/$END" || rc=1
+
+# THE turbOnFinalIterOnly ARMS. `turbOuter`'s control is `outerUniform` -- the same case with the switch
+# at its default -- and `turbOuterSplit`'s is `turbOuter`, so each differs from its control in ONE setting.
+# MEASURED, OpenFOAM against OpenFOAM: running the closure on every corrector moves its own epsilon
+# 7.669e-02 and nut 1.417e-01; the solver-family split then moves epsilon 8.272e-06 and prints
+# `smoothSolver:` on corrector one against `DILUPBiCG:` on corrector two, one of each per step.
+"$BIN" "$W/turbOuter" "$W/turbOuter/0" "$W/turbOuter/$END" "$STEPS" "$W/turbOuter/log.interFoam" \
+       turbOuter uniform "$W/laminar/$END" "$W/outerUniform/$END" || rc=1
+"$BIN" "$W/turbOuterSplit" "$W/turbOuterSplit/0" "$W/turbOuterSplit/$END" "$STEPS" \
+       "$W/turbOuterSplit/log.interFoam" turbOuterSplit uniform "$W/laminar/$END" "$W/turbOuter/$END" || rc=1
 
 echo "interfoam_ras_dambreak_vs_openfoam: rc $rc"
 exit $rc

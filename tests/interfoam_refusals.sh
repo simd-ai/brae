@@ -432,7 +432,7 @@ arm ras_nutCalculatedWall   refused "no nut wall function"    "" "sed -i '/leftW
 arm ras_wallFnOnPatch       refused "must be a \`wall\`"       "" "sed -i '/leftWall/,/}/ s/type  *wall;/type            patch;/' constant/polyMesh/boundary"
 arm ras_noKFinal            refused "kFinal"                  "" "sed -i 's/\"(U|k|epsilon)\.\*\"/\"(U|k|epsilon)\"/' system/fvSolution"
 arm ras_PBiCGStab           refused "smoothSolver"            "" "sed -i '/(U|k|epsilon)/,/}/ s/solver  *smoothSolver;/solver          PBiCGStab;/' system/fvSolution"
-arm ras_everyOuter          refused "turbOnFinalIterOnly"     "" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;\\n    turbOnFinalIterOnly no;/' system/fvSolution"
+arm ras_everyOuter          runs    -                         "" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;\\n    turbOnFinalIterOnly no;/' system/fvSolution"
 # ...and the form of it that changes nothing: one outer corrector IS the final one
 arm ras_everyOuter_single   runs    -                        "" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 1;\\n    turbOnFinalIterOnly no;/' system/fvSolution"
 BASE="$B"

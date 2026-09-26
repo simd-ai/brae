@@ -137,6 +137,13 @@ int main(
     // resolved form on faces with y+ < yPlusLam and drops their wall production. Parsed by brae's reader
     // all along and read by nothing under interFoam.
     const bool lowRe = (profile == "lowRe") || (profile == "lowReOff");
+    // `turbOuter*`: `turbOnFinalIterOnly no` with nOuterCorrectors 2, so the closure runs on EVERY outer
+    // corrector -- TWICE per step. `turbOuterSplit` adds literal kFinal/epsilonFinal naming PBiCG beside
+    // the case's regex, so corrector 1 runs the smoothSolver and corrector 2 runs PBiCG.
+    const bool turbOuterSplit = (profile == "turbOuterSplit");
+    const bool turbOuter = (profile == "turbOuter") || turbOuterSplit;
+    // how many closure solves OpenFOAM logs per STEP: one per corrector the closure runs on
+    const label closurePerStep = turbOuter ? 2 : 1;
     const bool lowReOn = (profile == "lowRe");
     const char* secondName = (sst || frozenSST || splitSolveSST || splitDivSST) ? "omega" : "epsilon";
     std::printf("  profile: %s\n",
@@ -226,6 +233,35 @@ int main(
               fin.turbulence.coeffs.epsLowRe == lowReOn);
     }
 
+    if (turbOuter)
+    {
+        const InterTurbulence& t = fin.turbulence;
+        std::printf("  TURB EVERY CORRECTOR: kFinal solver `%s`/`%s`, k solver `%s`/`%s`\n",
+                    t.kSolveFinal.solver.c_str(), t.kSolveFinal.preconditioner.c_str(),
+                    t.kSolve.solver.c_str(), t.kSolve.preconditioner.c_str());
+        check("brae read the case's NON-Final closure solver entry", !t.kSolve.solver.empty());
+        if (turbOuterSplit)
+        {
+            // THE TWO ENTRIES MUST DIFFER IN BRAE'S OWN STRUCTS, or the arm would pass on a brae that
+            // resolved both names through the case's regex and never saw the literal kFinal.
+            check("...and the Final entry is the PBiCG the profile names, the non-Final the regex's "
+                  "smoothSolver", t.kSolveFinal.pbicgDILU() && t.kSolve.gaussSeidel());
+            // ...and OpenFOAM's own log carries one of each per step, which is this arm's categorical
+            // witness: the solver NAME is printed on the solve line (SolverPerformance.C:99).
+            std::size_t gs = 0, pb = 0;
+            std::ifstream lf(logPath);
+            for (std::string ln; std::getline(lf, ln); )
+            {
+                if (ln.find("Solving for k,") == std::string::npos) continue;
+                gs += (ln.find("smoothSolver:") != std::string::npos) ? 1 : 0;
+                pb += (ln.find("DILUPBiCG:") != std::string::npos) ? 1 : 0;
+            }
+            std::printf("  OpenFOAM logged %zu smoothSolver and %zu DILUPBiCG k solves\n", gs, pb);
+            check("OpenFOAM ran the smoothSolver on one corrector and PBiCG on the other, every step",
+                  gs == static_cast<std::size_t>(nSteps) && pb == static_cast<std::size_t>(nSteps));
+        }
+    }
+
     auto readCells = [&](const std::string& path)
     {
         const FieldData<scalar> fd = readField<scalar>(path);
@@ -273,8 +309,10 @@ int main(
     }
     else
     {
-        check("OpenFOAM's log gave one solve of the closure's second field and one k solve per step",
-              ofE.size() == static_cast<std::size_t>(nSteps) && ofK.size() == ofE.size());
+        // ...and with `turbOnFinalIterOnly no` that is one per CORRECTOR, not one per step: a brae still
+        // running the closure once per step logs half as many and compareSolves mismatches on length.
+        check("OpenFOAM's log gave one solve of the closure's second field and one k solve per corrector",
+              ofE.size() == static_cast<std::size_t>(nSteps*closurePerStep) && ofK.size() == ofE.size());
     }
     failures += brae::gatecheck::compareSolves("host", r.pSolves, ofP, nSteps);
     failures += brae::gatecheck::compareSolves("host", r.alphaSolves, ofA, nSteps, fin.alphaName.c_str(),
@@ -287,9 +325,9 @@ int main(
     if (!frozen)
     {
         failures += brae::gatecheck::compareSolves("host", (sst || frozenSST || splitSolveSST || splitDivSST) ? r.omegaSolves : r.epsilonSolves,
-                                                   ofE, nSteps, secondName,
+                                                   ofE, nSteps*closurePerStep, secondName,
                                                    scalar(1e-10), scalar(1e-10), scalar(1e-5));
-        failures += brae::gatecheck::compareSolves("host", r.kSolves, ofK, nSteps, "k",
+        failures += brae::gatecheck::compareSolves("host", r.kSolves, ofK, nSteps*closurePerStep, "k",
                                                    scalar(1e-10), scalar(1e-10), scalar(1e-5));
     }
 
@@ -430,7 +468,12 @@ int main(
     // MEASURED for nutAtmosphere against plain uniform: U 2.7e-03, nut 4.7e-02 -- 20 of the atmosphere's
     // 46 faces take air IN at t = 0.005, where the inletValue stands in for the cell's nut
     // ...and the second outer corrector against one: MEASURED U 4.6e-02 at t = 0.005
-    check(lowRe ? "...and `lowReCorrection` moves OpenFOAM's own U by more than 1% against the log law. At "
+    check(turbOuterSplit ? "...and the Final solver entry alone moves OpenFOAM's own U -- small, because it "
+                           "is a stopping point; the SOLVER NAMES and sweep counts above are what this arm "
+                           "really gates"
+          : turbOuter ? "...and running the closure on every outer corrector moves OpenFOAM's own U by more "
+                        "than 1% against running it once per step"
+          : lowRe ? "...and `lowReCorrection` moves OpenFOAM's own U by more than 1% against the log law. At "
                   "the tutorial's own nu = 1e-6 it moves it by EXACTLY ZERO -- no face has y+ under "
                   "yPlusLam -- which is why this profile raises the water viscosity to 1e-2"
           : splitDiv ? "...and limitedLinear on the second equation alone moves OpenFOAM's U against upwind "
@@ -446,7 +489,9 @@ int main(
           : nutAtmosphere ? "...and the atmosphere's inletOutlet nut moves it by more than 1e-3"
           : custom ? "...and the custom settings move it by more than 1%"
                    : "...and the lineage moves it by more than 10%, so `density` is live on this fixture",
-          dOtherU.rel() > (lowRe ? scalar(0.01)
+          dOtherU.rel() > (turbOuterSplit ? scalar(1e-7)
+                         : turbOuter ? scalar(0.01)
+                         : lowRe ? scalar(0.01)
                          : nutAtmosphere ? scalar(1e-3)
                          // MEASURED: kEpsilon 1.5e-04 of U (nut 4.5e-03), kOmegaSST 2.4e-05 (nut
                          // 2.2e-04) -- the SST closure's omega is far less sensitive to its convection
@@ -533,9 +578,9 @@ int main(
         else
         {
             failures += brae::gatecheck::compareSolves("device", (sst || frozenSST || splitSolveSST || splitDivSST) ? rd.omegaSolves : rd.epsilonSolves,
-                                                       ofE, nSteps, secondName, scalar(1e-10), scalar(1e-10),
+                                                       ofE, nSteps*closurePerStep, secondName, scalar(1e-10), scalar(1e-10),
                                                        scalar(1e-5));
-            failures += brae::gatecheck::compareSolves("device", rd.kSolves, ofK, nSteps, "k",
+            failures += brae::gatecheck::compareSolves("device", rd.kSolves, ofK, nSteps*closurePerStep, "k",
                                                        scalar(1e-10), scalar(1e-10), scalar(1e-5));
         }
         const Diff eA = compare(dev.alpha1.internal, ofAlpha);
@@ -620,8 +665,9 @@ int main(
                      : "...and took the host closure's sweep counts, solve for solve",
               frozen ? (devSecondSolves.empty() && mixSecondSolves.empty()
                         && rd.kSolves.empty() && rm.kSolves.empty())
-                     : (sameE == static_cast<std::size_t>(nSteps)
-                        && sameK == static_cast<std::size_t>(nSteps)));
+                     // one per CORRECTOR the closure runs on, not one per step
+                     : (sameE == static_cast<std::size_t>(nSteps*closurePerStep)
+                        && sameK == static_cast<std::size_t>(nSteps*closurePerStep)));
     }
 
     std::printf("test_inter_ras_dambreak_vs_openfoam: %d failures\n", failures);
