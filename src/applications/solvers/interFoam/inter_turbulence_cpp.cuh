@@ -54,6 +54,7 @@
 // wall-function blending other than the default binomial n = 2, wall-function coefficients other than
 // the defaults, and a moving mesh (y is taken once). The device loop runs kEpsilon's device twin,
 // device_inter_turbulence.cuh, and refuses kOmegaSST by name.
+#include "inter_cn_restart.cuh"
 #include "fvOptions_cpp.cuh"
 #include "crank_nicolson_ddt_scheme_cpp.cuh"
 #include "cf_types.cuh"
@@ -111,6 +112,12 @@ struct InterTurbulenceCrankNicolson
     // InterTurbulence::kOldStep, because every ddt scheme needs it -- see there.
     std::vector<scalar> kOO;
     std::vector<scalar> epsOO;
+    // A RESTART: where OpenFOAM would look these two fields up (inter_cn_restart.cuh). The names are the
+    // OPERANDS' -- "ddt0(rho,k)" under the variable lineage, "ddt0(k)" under the uniform one,
+    // "ddt0(omega)" under kOmegaSST -- so they are known only once the model branch has run, which is
+    // why the seed is done there and not at construction. Once per run.
+    InterCnRestart restart;
+    bool           restartSeeded = false;
 };
 
 struct InterTurbulence
@@ -332,6 +339,31 @@ void moveInterTurbulence(
     // mesh_.time().timeIndex(), the index of the step being taken -- wallDist.C:198 tests it modulo the
     // interval. Threaded in rather than derived, because the closure has no clock of its own.
     label                       timeIndex);
+
+// The registry names OpenFOAM gives the closure's two CrankNicolson ddt0 fields: the OPERANDS' names,
+// so the model's and the density lineage's ("ddt0(rho,k)" / "ddt0(k)", "ddt0(rho,epsilon)" /
+// "ddt0(epsilon)" / "ddt0(omega)", and nothing second under LES kEqn). ONE place, because a RESTART
+// looks the fields up BY NAME in the start directory (inter_cn_restart.cuh) and the device arm must
+// look up the same two -- three branches spelling their own names is how the two would drift.
+void closureCnDdt0Names(
+    const InterTurbulence& t,
+    std::string& kName,
+    std::string& secondName);
+
+// The closure's OLD-TIME snapshots as a restart directory holds them: k_0 and epsilon_0/omega_0, read
+// into the caller's vectors. Both or neither -- a directory with one is not a directory OpenFOAM wrote,
+// and it throws saying so. False and nothing touched on a cold start. Shared by the two arms.
+bool readClosureCnOldTime(
+    const InterTurbulence& t,
+    std::vector<scalar>& kOld,
+    std::vector<scalar>& secondOld);
+
+// ...the seed itself, once per run: the two ddt0 fields AND the old-time snapshot each field's own
+// <field>_0 holds. Call it ABOVE advanceTurbulenceOldTime -- the first rotation moves the snapshot into
+// the old-old level, so a seed after it arrives one step late.
+void seedClosureCnRestart(
+    InterTurbulence& t,
+    const std::vector<FvPatch>& patches);
 
 void correctInterTurbulence(
     InterTurbulence& t,

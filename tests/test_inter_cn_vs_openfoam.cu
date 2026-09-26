@@ -16,6 +16,7 @@
 #include "device_gate_finite.cuh"
 #include "inter_solve_log.cuh"
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -62,6 +63,18 @@ const Bounds D_FULL{1e-12, 2e-11, 3e-9, 1e-10, 1e-11, 1.2e-10, 2e-8};
 //   cnLES  host  alpha 7.3e-15, p_rgh 5.6e-15, U 2.7e-14, k 4.4e-15,                nut 9.5e-15
 //          device      6.2e-15,       3.9e-15,   8.4e-13,   3.2e-15,                     8.5e-15
 // against a control -- OpenFOAM's own Euler answer -- of U 4.8e-02 and alpha 1.2e-02.
+// ...and A RESTART from a directory OpenFOAM wrote under CrankNicolson (profile `cnRestart`): 20 steps
+// to t = 0.02, then 20 more from there with the scheme's whole state on disk -- the three ddt0 fields,
+// the <field>_0 old-time levels and alphaPhi0. THE ORACLE is OpenFOAM's own warm restart; THE CONTROL is
+// OpenFOAM's COLD one -- the same restart with all of that removed -- which OpenFOAM itself puts
+// U 5.2796e-03, alpha 7.2856e-03, p_rgh 1.5853e-03, k 8.0025e-03 and epsilon 2.4517e-02 away, over
+// 2264 to 2268 of 2268 cells. MEASURED, 20 restarted steps:
+//   host    alpha 7.5495e-15, p_rgh 6.4745e-15, U 1.2975e-14, k 4.5200e-15, epsilon 6.8282e-15,
+//           nut 4.5588e-15; 60 of 60 p_rgh counts, every initial residual EXACTLY OpenFOAM's
+//   device  alpha 7.1054e-15, p_rgh 4.6584e-15, U 3.6293e-12, k 4.8213e-14, epsilon 5.9473e-14,
+//           nut 9.9635e-14; 60 of 60 counts, residuals within 4.018e-11
+const Bounds H_RESTART{2e-13, 2e-13, 4e-13, 1.5e-13, 2e-13, 1.5e-13, 1e-10};
+const Bounds D_RESTART{2e-13, 1.5e-13, 1e-10, 1.5e-12, 2e-12, 3e-12, 1.2e-9};
 const Bounds H_SST{3e-14, 3e-14, 3e-13, 5e-14, 3e-14, 4e-12, 1e-9};
 const Bounds H_LES{3e-14, 3e-14, 3e-13, 3e-14, 1e-12, 1e-13, 1e-9};
 const Bounds D_SST{3e-14, 3e-14, 1e-11, 3e-13, 3e-14, 5e-12, 2e-9};
@@ -162,7 +175,7 @@ void holdArm(
     if (!ofE.empty()) check("the closure's second field agrees with OpenFOAM's relatively",
                             dE.rel() < B.epsilon);
     check("nut agrees with OpenFOAM's relatively", dN.rel() < B.nut);
-    check("CrankNicolson moves OpenFOAM's own U far more than this arm is from it",
+    check("the control moves OpenFOAM's own U far more than this arm is from it",
           controlU > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)) && controlU > scalar(1e-3));
     dUOut = dU;
 }
@@ -201,12 +214,19 @@ int main(
     const bool cnAlphaEuler = (profile == "cnAlphaEuler");   // momentum CrankNicolson, alpha Euler
     const bool eulerAlphaCN = (profile == "eulerAlphaCN");   // momentum Euler, alpha CrankNicolson
     const bool mixedDdt = cnAlphaEuler || eulerAlphaCN;
+    // A RESTART from OpenFOAM's own CrankNicolson state: the ddt0 fields, the <field>_0 old-old levels
+    // and alphaPhi0 are all on disk, and OpenFOAM is CrankNicolson from the first step rather than Euler
+    // for one and Euler-estimated for the next. Its control is OpenFOAM's COLD restart, not its Euler run.
+    const bool restart = (profile == "cnRestart");
     const char* secondName = les ? nullptr : (sst ? "omega" : "epsilon");
-    const Bounds& HB = outer ? H_OUTER : full ? H_FULL : (sst ? H_SST : les ? H_LES : H_CN);
-    const Bounds& DB = outer ? D_OUTER : full ? D_FULL : (sst ? D_SST : les ? D_LES : D_CN);
+    const Bounds& HB = outer ? H_OUTER : full ? H_FULL
+                     : (sst ? H_SST : les ? H_LES : restart ? H_RESTART : H_CN);
+    const Bounds& DB = outer ? D_OUTER : full ? D_FULL
+                     : (sst ? D_SST : les ? D_LES : restart ? D_RESTART : D_CN);
     std::printf("  profile: %s\n",
                 cnAlphaEuler ? "cnAlphaEuler -- default CrankNicolson 0.5, ddt(alpha) Euler"
                 : eulerAlphaCN ? "eulerAlphaCN -- default Euler, ddt(alpha) CrankNicolson 0.5"
+                : restart ? "cnRestart -- CrankNicolson 0.5, RESTARTED from OpenFOAM's own state at t = 0.02"
                 : outer ? "cnOuter -- CrankNicolson 0.5 with nOuterCorrectors 2"
                                  : full ? "cnFull -- CrankNicolson 1, the un-off-centred scheme"
                                  : sst ? "cnSST -- CrankNicolson 0.5 under kOmegaSST"
@@ -258,6 +278,26 @@ int main(
     {
         check("the closure kept NO ddt0 field -- its fvm::ddt takes the DEFAULT, which is Euler here",
               !fin.turbulence.cn.ddt0K.exists);
+    }
+    else if (restart)
+    {
+        // WHAT WAS READ, not only what came out. DDt0Field's READING constructor sets startTimeIndex_
+        // to -2 -- "this field is for a restart and thus correct" (CrankNicolsonDdtScheme.C:49-64) --
+        // so both coefficients are 1 + oc on the first step. A seed that came out of lookupOrCreate
+        // instead would carry startTimeIndex 1 and pass every numeric check for the first step by
+        // accident only if the scheme happened to be cold-equivalent, which it is not.
+        check("the closure's k ddt0 field was READ from the restart directory, at startTimeIndex -2",
+              fin.turbulence.cn.ddt0K.exists && fin.turbulence.cn.ddt0K.startTimeIndex == -2
+           && fin.turbulence.cn.ddt0K.timeIndex == nSteps);
+        check("...and it holds a nonzero previous-step ddt, so the file's numbers reached the field",
+              std::any_of(fin.turbulence.cn.ddt0K.internal.begin(),
+                          fin.turbulence.cn.ddt0K.internal.end(),
+                          [](scalar v){ return v != scalar(0); }));
+        // ...and alphaPhi0, whose VALUES are inert (the gate script asserts that against OpenFOAM
+        // itself) but whose PRESENCE makes ddt(alpha)'s off-centring live on the first step
+        check("brae saw alphaPhi0 in the restart directory -- alphaRestart", fin.cnAlphaRestart);
+        check("...and remembered where to look for the rest of the state",
+              fin.cnRestart.dir == startDir);
     }
     else
     {
@@ -349,7 +389,9 @@ int main(
     std::printf("  CONTROL: %s, U relative %.4e, alpha %.4e\n",
                 mixedDdt ? "OpenFOAM with BOTH entries CrankNicolson against OpenFOAM with them mixed -- "
                            "the answer brae gave while it ran the two under one scheme"
-                         : "OpenFOAM under Euler against OpenFOAM under CrankNicolson",
+                : restart ? "OpenFOAM's WARM restart against OpenFOAM's COLD one -- the answer brae gave "
+                            "while it started the scheme cold from OpenFOAM's own state"
+                          : "OpenFOAM under Euler against OpenFOAM under CrankNicolson",
                 (double)dCtlU.rel(), (double)dCtlA.linf);
 
     Diff dUHost;

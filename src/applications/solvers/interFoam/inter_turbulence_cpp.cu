@@ -331,6 +331,67 @@ void requireSstWalls(
 } // namespace
 
 
+void closureCnDdt0Names(
+    const InterTurbulence& t,
+    std::string& kName,
+    std::string& secondName)
+{
+    // fvm::ddt(rho, vf) under the variable lineage and fvm::ddt(vf) under the uniform one, and
+    // CrankNicolsonDdtScheme.C builds the registry name out of the operands it was handed
+    // (:503, :600 for the two-argument form, :408 for the one-argument): "ddt0(rho,k)" or "ddt0(k)".
+    kName = t.variableDensity ? "ddt0(rho,k)" : "ddt0(k)";
+    // ...and the second equation's field is omega under kOmegaSST (kOmegaSSTBase.C:602), epsilon under
+    // kEpsilon (kEpsilon.C:255), and LES kEqn has no second equation at all. `density variable` is
+    // refused under both kOmegaSST and LES at the reader, so the rho form of either cannot arise.
+    if (t.model == InterRasModel::KEqnLES) { secondName.clear(); return; }
+    secondName = t.model == InterRasModel::KOmegaSST
+               ? "ddt0(omega)"
+               : (t.variableDensity ? "ddt0(rho,epsilon)" : "ddt0(epsilon)");
+}
+
+
+bool readClosureCnOldTime(
+    const InterTurbulence& t,
+    std::vector<scalar>& kOld,
+    std::vector<scalar>& secondOld)
+{
+    const std::size_t nCells = t.k.internal.size();
+    const bool haveK = readCnOldOld(t.cn.restart, "k_0", nCells, kOld);
+    const bool second = (t.model != InterRasModel::KEqnLES);
+    const char* secondFile = (t.model == InterRasModel::KOmegaSST) ? "omega_0" : "epsilon_0";
+    const bool haveS = second && readCnOldOld(t.cn.restart, secondFile, nCells, secondOld);
+    // BOTH OR NEITHER. OpenFOAM writes an old-time level for each field that has an old-old one, and
+    // under this scheme both equations do -- so a directory with one and not the other is not a
+    // directory OpenFOAM wrote. The device's rotation keys "is there a level yet" on k's alone, so a
+    // half-filled pair there would read k's from disk and its partner's from nowhere.
+    if (second && haveK != haveS)
+        throw std::runtime_error(
+            std::string(WHO) + "the restart directory holds `" + (haveK ? "k_0" : secondFile)
+            + "` but not `" + (haveK ? secondFile : "k_0") + "`. OpenFOAM writes the old-time level of "
+            "both closure fields under CrankNicolson or of neither (GeometricField.C:922-939), so this "
+            "is not a state OpenFOAM wrote. Refused rather than restart one equation warm and one cold.");
+    return haveK;
+}
+
+
+void seedClosureCnRestart(
+    InterTurbulence& t,
+    const std::vector<FvPatch>& patches)
+{
+    InterTurbulenceCrankNicolson& c = t.cn;
+    if (c.restartSeeded) return;
+    c.restartSeeded = true;
+    const std::size_t nCells = t.k.internal.size();
+    seedCnDdt0(c.ddt0K, c.restart, nCells, patches);
+    seedCnDdt0(c.ddt0Eps, c.restart, nCells, patches);
+    // ...and the OLD-TIME snapshot, from <field>_0: OpenFOAM's reading constructor reads that level back
+    // (inter_cn_restart.cuh), so the first rotation moves IT into oldTime().oldTime() rather than a copy
+    // of the field at the start time. advanceTurbulenceOldTime keys "no level yet" on the snapshot being
+    // empty, which is the same test.
+    readClosureCnOldTime(t, t.kOldStep, t.epsOldStep);
+}
+
+
 InterTurbulence readInterTurbulence(
     const std::string& caseDir,
     const std::string& startDir,
@@ -353,6 +414,10 @@ InterTurbulence readInterTurbulence(
     bool  turbOnFinalIterOnly)
 {
     InterTurbulence t;
+    // WHERE A RESTART'S ddt0 FIELDS WOULD BE. Set unconditionally: only a run that was CrankNicolson
+    // wrote any, and only a CrankNicolson run names the fields that would be looked up. See
+    // inter_cn_restart.cuh.
+    t.cn.restart.dir = startDir;
     // See the parameters: OpenFOAM looks the non-Final solver entries up only on a NON-final corrector,
     // and solution::solverDict is FATAL when the name is absent (solution.C:474-478) -- so they are
     // required exactly there and nowhere else. ONE place computes the rule.
@@ -947,6 +1012,17 @@ void correctInterTurbulence(
             + ". The closure keys psi.oldTime() on the first and selects <field>Final by the second.");
     // storeOldTimes, ONCE per step whatever the scheme and however many correctors run. LES kEqn solves k
     // alone, so it has no second scalar to rotate.
+    // The ddt0 fields' registry names, and a RESTART's seed off disk, ONCE -- both are the model's and
+    // the lineage's, not the corrector's, and the three model branches below used to spell the names
+    // themselves. closureCnDdt0Names is the one place, because a restart looks the fields up BY NAME and
+    // the device arm must look up the same two.
+    // ABOVE advanceTurbulenceOldTime, not below it: the seed fills the OLD-TIME snapshot with the level
+    // the restart directory holds, and it is that snapshot the first rotation moves into the old-old one.
+    if (in.cn)
+    {
+        closureCnDdt0Names(t, t.cn.ddt0K.name, t.cn.ddt0Eps.name);
+        seedClosureCnRestart(t, patches);
+    }
     advanceTurbulenceOldTime(t, in.timeIndex, /*second=*/t.model != InterRasModel::KEqnLES);
 
     if (t.model == InterRasModel::KEqnLES)
@@ -969,10 +1045,6 @@ void correctInterTurbulence(
         sv.relax = pk.relaxFirst->factor;
         // fvm::ddt(k) under CrankNicolson, with k's old-old level rotated once per time index. This
         // lineage is the uniform one, so there is no density at any level.
-        if (in.cn)
-        {
-            t.cn.ddt0K.name = "ddt0(k)";
-        }
         sv.kOld = &t.kOldStep;   // psi.oldTime(), per STEP -- see InterTurbulence::kOldStep
         const SolverPerformance p = LESkEqn::correct(*in.U, t.k, t.nut, *in.phi, *in.nu, *in.nuBnd, t.delta,
                                                      in.deltaT, t.lesCoeffs, sv, m, g, patches, t.lesTaps,
@@ -1005,8 +1077,6 @@ void correctInterTurbulence(
         // CrankNicolson block, as every other per-model slot on this branch does.
         if (in.cn)
         {
-            t.cn.ddt0K.name = "ddt0(k)";
-            t.cn.ddt0Eps.name = "ddt0(omega)";
             sstComp.cn = in.cn;
             sstComp.cnDdt0K = &t.cn.ddt0K;
             sstComp.cnDdt0Omega = &t.cn.ddt0Eps;
@@ -1069,8 +1139,6 @@ void correctInterTurbulence(
         // index, on the first access of the step. At the first step of a cold start oldTime().oldTime()
         // is created as a copy of oldTime(), and the scheme does not read it that step.
         InterTurbulenceCrankNicolson& c = t.cn;
-        c.ddt0K.name = t.variableDensity ? "ddt0(rho,k)" : "ddt0(k)";
-        c.ddt0Eps.name = t.variableDensity ? "ddt0(rho,epsilon)" : "ddt0(epsilon)";
         comp.cn = in.cn;
         comp.cnDdt0K = &c.ddt0K;
         comp.cnDdt0Eps = &c.ddt0Eps;

@@ -344,6 +344,25 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
         d.f1OneMask.copyFrom(f1One);
         d.nutCalcMask.copyFrom(nutCalc);
     }
+    // CrankNicolson's two ddt0 fields: NAMED here, from the model and the density lineage, by the same
+    // function the host closure names its pair with -- the names are the operands' and a RESTART looks
+    // the fields up BY NAME, so one place decides them for both arms.
+    closureCnDdt0Names(t, d.cnDdt0K.name, d.cnDdt0Eps.name);
+    // ...and SEEDED off disk when the start directory holds the state OpenFOAM would read there: the two
+    // ddt0 fields with startTimeIndex -2, and the old-time snapshot each field's own <field>_0 holds,
+    // which the first rotation moves into the old-old level. See inter_cn_restart.cuh. A cold start reads
+    // no file and nothing here fires. The boundary size is 0 because deviceCnFvmDdt keeps none.
+    {
+        const std::size_t nCells = t.k.internal.size();
+        seedCnDdt0(d.cnDdt0K, t.cn.restart, 1, nCells, 0, patches);
+        seedCnDdt0(d.cnDdt0Eps, t.cn.restart, 1, nCells, 0, patches);
+        std::vector<scalar> kOld, secondOld;
+        if (cpu::interFoam::readClosureCnOldTime(t, kOld, secondOld))
+        {
+            d.kOldStep.copyFrom(kOld);
+            if (!secondOld.empty()) d.epsOldStep.copyFrom(secondOld);
+        }
+    }
     return d;
 }
 
@@ -538,7 +557,6 @@ void deviceCorrectInterTurbulence(
         // alpha = rho = 1 in this lineage, so there is no rho old-old to carry.
         if (in.cn)
         {
-            d.cnDdt0K.name = "ddt0(k)";
             lin.cn      = in.cn;
             lin.cnDdt0K = &d.cnDdt0K;
             lin.kOO     = &d.cnKOO;
@@ -610,8 +628,6 @@ void deviceCorrectInterTurbulence(
         // slots -- d.epsilon, d.cnEpsOO, d.cnDdt0Eps -- as every other slot on this branch does.
         if (in.cn)
         {
-            d.cnDdt0K.name   = "ddt0(k)";
-            d.cnDdt0Eps.name = "ddt0(omega)";
             sin.cn          = in.cn;
             sin.cnDdt0K     = &d.cnDdt0K;
             sin.cnDdt0Omega = &d.cnDdt0Eps;
@@ -998,8 +1014,6 @@ void deviceCorrectInterTurbulence(
     // -- and hand the closure its two ddt0 fields
     if (in.cn)
     {
-        d.cnDdt0K.name = t.variableDensity ? "ddt0(rho,k)" : "ddt0(k)";
-        d.cnDdt0Eps.name = t.variableDensity ? "ddt0(rho,epsilon)" : "ddt0(epsilon)";
         kin.cn = in.cn;
         kin.cnDdt0K = &d.cnDdt0K;
         kin.cnDdt0Eps = &d.cnDdt0Eps;

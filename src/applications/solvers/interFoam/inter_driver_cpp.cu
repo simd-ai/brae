@@ -641,6 +641,28 @@ RunReport runInterFoam(
     bool UfOOExists = false;
     fv::CrankNicolsonDdt0<vector> cnDdtCorrUf;
     cnDdtCorrUf.name = "ddtCorrDdt0(Uf)";
+    // A RESTART from a directory OpenFOAM wrote under CrankNicolson: each ddt0 field OpenFOAM would
+    // find there, with startTimeIndex -2 so the scheme is WARM on the first step rather than Euler for
+    // one step and Euler-estimated for the next. inter_cn_restart.cuh carries the two facts; the
+    // objects are the driver's, so the seeding is. `ddtCorrDdt0(Uf)` is not among them -- a moving mesh
+    // is refused at the case reader for want of a fixture that could witness a seed.
+    seedCnDdt0(cnDdt0RhoU, f.cnRestart, static_cast<std::size_t>(nC), patches);
+    seedCnDdt0(cnDdtCorrU, f.cnRestart, static_cast<std::size_t>(nC), patches);
+    seedCnDdt0(cnDdtCorrPhi, f.cnRestart, static_cast<std::size_t>(m.nInternalFaces()), patches);
+    // ...AND THE OLD-OLD LEVELS, which the scheme reads and which OpenFOAM reads back off disk as
+    // <field>_0 (inter_cn_restart.cuh): the level the restart directory holds is the one that rotates
+    // into oldTime().oldTime() on the first step, while oldTime() becomes the field at the start time --
+    // the value already in UOld/phiOld here. Without them a restart's first ddt0 estimate is
+    // rDtCoef0*(x - x) = 0 where OpenFOAM's is a real difference. rho_0 and alpha.water_0 are never
+    // written, so those two levels stay the copies OpenFOAM starts them as.
+    readCnOldOld(f.cnRestart, "U_0", static_cast<std::size_t>(nC), patches, UOO, UOOBnd);
+    phiOOExists = readCnOldOldSurface(f.cnRestart, "phi_0", m.nInternalFaces(), patches, phiOO);
+    // ...and phi.oldTime() then EXISTS from the first step, so alphaEqn's blend reads the level rather
+    // than the flux beside it. NUMERICALLY A NO-OP HERE, measured: with this line removed the restart
+    // gate reads the same digits on both arms, because the first step's storeOldTimes rotates the level
+    // to phi at the start time before the blend and that is the flux beside it. Kept because it is the
+    // state OpenFOAM is in, and because a case that wrote phi between the two would part here.
+    if (phiOOExists) phiOldRequested = true;
 
     SurfaceScalarField prevCorr;                 // alphaApplyPrevCorr's cache
     // cyclicACMIPolyPatch::updateAreas runs once per time index (prevTimeIndex_)
@@ -730,8 +752,12 @@ RunReport runInterFoam(
                     // CrankNicolson (timeIndex > startTimeIndex + 1 is false), the scheme's own after
                     // -- and the blended flux phiCN = cnCoeff*phi + (1 - cnCoeff)*phi.oldTime(), which
                     // IS phi when ocCoeff is 0
+                    // ...and alphaRestart ORed into the warm-up test (alphaEqn.H:36-45): a start
+                    // directory that holds alphaPhi0 off-centres from the FIRST step. Only the file's
+                    // presence reaches the answer -- see fact (2) in inter_cn_restart.cuh.
                     const scalar ocAlpha = offCentringCoeff(f.ddtAlpha, f.alphaCtl.nAlphaSubCycles,
-                                                            f.ddtAlphaOcCoeff, rep.steps > 1);
+                                                            f.ddtAlphaOcCoeff,
+                                                            f.cnAlphaRestart || rep.steps > 1);
                     const scalar cnAlpha = blendingCoeff(ocAlpha);
                     SurfaceScalarField phiCN;
                     // WHICH phi.oldTime() -- and whether there IS one yet. GeometricField::oldTime()

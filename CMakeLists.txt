@@ -158,6 +158,7 @@ add_library(brae_core STATIC
     src/applications/solvers/simpleFoam/createFields_cpp.cu
     src/applications/solvers/interFoam/inter_driver_cpp.cu
     src/applications/solvers/interFoam/inter_case_cpp.cu
+    src/applications/solvers/interFoam/inter_cn_restart.cu
     src/applications/solvers/interFoam/inter_turbulence_cpp.cu
     src/applications/solvers/interFoam/inter_waves_cpp.cu
     src/waveModels/waveModel/wave_model_cpp.cu

@@ -1354,6 +1354,35 @@ RunReport runInterFoamDevice(
     dCn.ddt0RhoU.name = "ddt0(rho,U)";
     dCn.ddtCorrU.name = "ddtCorrDdt0(U)";
     dCn.ddtCorrPhi.name = "ddtCorrDdt0(phi)";
+    dCn.ddtCorrUf.name = "ddtCorrDdt0(Uf)";
+    // A RESTART from a directory OpenFOAM wrote under CrankNicolson, the host driver's seed on the
+    // device (inter_cn_restart.cuh): each ddt0 field with startTimeIndex -2, so the scheme is WARM on the
+    // first step. deviceCnFvmDdt keeps no boundary for the momentum's field and deviceCnDdtCorr keeps one
+    // over the non-coupled faces for its two, which is what the sizes below say.
+    seedCnDdt0(dCn.ddt0RhoU, f.cnRestart, 3, static_cast<std::size_t>(nC), 0, fvp);
+    seedCnDdt0(dCn.ddtCorrU, f.cnRestart, 3, static_cast<std::size_t>(nC),
+               static_cast<std::size_t>(dm.nBndFaces), fvp);
+    seedCnDdt0(dCn.ddtCorrPhi, f.cnRestart, 1, static_cast<std::size_t>(nIf),
+               static_cast<std::size_t>(dm.nBndFaces), fvp);
+    // ...AND phi's OLD-TIME LEVEL, out of phi_0. The loop keeps it as the host vectors it rotates from,
+    // so the seed fills those and says the level exists: the first step then takes phi.oldTime().oldTime()
+    // from the file rather than creating it as a copy of the flux beside it. `phiOldRequested` follows,
+    // because on a restart the level is there before anything asks for it.
+    {
+        SurfaceScalarField phiOldFile;
+        if (readCnOldOldSurface(f.cnRestart, "phi_0", nIf, fvp, phiOldFile))
+        {
+            phiOldPrevI = phiOldFile.internal;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                phiOldPrevB.insert(phiOldPrevB.end(),
+                                   phiOldFile.boundary[pi].begin(), phiOldFile.boundary[pi].end());
+            }
+            phiOOExists = true;
+            phiOldRequested = true;
+        }
+    }
     DeviceBuffer<scalar> dAlphaPhiEndI, dAlphaPhiEndB, dAlphaPhiOldI, dAlphaPhiOldB, dAlphaPhiOutI, dAlphaPhiOutB;
     bool alphaPhiOldExists = false;
     label alphaPhiOldIndex = -1;
@@ -1568,6 +1597,32 @@ RunReport runInterFoamDevice(
     // U.oldTime()'s PATCH values, snapshotted with the cells below: ddtCorr's boundary half
     // interpolates the STORED patch value on an uncoupled patch, not the face cell
     DeviceBuffer<scalar> dUobx, dUoby, dUobz;
+    // A RESTART: the OLD-TIME level OpenFOAM reads back out of U_0, cells and patch values (see
+    // inter_cn_restart.cuh). It goes into the OLD level and not the old-old one BECAUSE the rotation at
+    // the top of this loop's first step moves it there -- U_0_0 = U_0 = the file, then U_0 = U at the
+    // start time -- which is exactly what OpenFOAM's storeOldTime does on that step. Seeding the old-old
+    // level directly would be overwritten by that rotation.
+    if (cnDdt)
+    {
+        std::vector<vector> uOO;
+        std::vector<std::vector<vector>> uOOBnd;
+        if (readCnOldOld(f.cnRestart, "U_0", static_cast<std::size_t>(nC), fvp, uOO, uOOBnd))
+        {
+            std::vector<scalar> cx(nC), cy(nC), cz(nC), bx, by, bz;
+            for (label c = 0; c < nC; ++c)
+            { cx[c] = uOO[c].x; cy[c] = uOO[c].y; cz[c] = uOO[c].z; }
+            dUox.copyFrom(cx); dUoy.copyFrom(cy); dUoz.copyFrom(cz);
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                for (const vector& v : uOOBnd[pi])
+                {
+                    bx.push_back(v.x); by.push_back(v.y); bz.push_back(v.z);
+                }
+            }
+            dUobx.copyFrom(bx); dUoby.copyFrom(by); dUobz.copyFrom(bz);
+        }
+    }
     DeviceBuffer<scalar> dPhiI(f.phi.internal);
     DeviceBuffer<scalar> dPrgh(f.p_rgh.internal), dP;
     DeviceBuffer<scalar> dNH(f.nHatf.internal), dNHB(flattenPatches(f.nHatf.boundary, fvp));
@@ -1873,8 +1928,10 @@ RunReport runInterFoamDevice(
             // alphaEqn.H:18-56: the off-centring the scheme constructed for ddt(alpha) gives on this
             // step -- 0 before the scheme is warm -- and alphaPhi10.oldTime(), created by the first
             // un-blend as a copy of the current flux, then the flux the previous step ended on
+            // ...with alphaRestart ORed into the warm-up test (alphaEqn.H:36-45), as the host loop has
+            // it: a start directory that holds alphaPhi0 off-centres from the FIRST step
             dCn.ocAlpha = offCentringCoeff(f.ddtAlpha, f.alphaCtl.nAlphaSubCycles, f.ddtAlphaOcCoeff,
-                                           thisIndex > 1);
+                                           f.cnAlphaRestart || thisIndex > 1);
             dCn.cnAlpha = blendingCoeff(dCn.ocAlpha);
             // ...and whether phi HAS an old-time level for that blend to use. On a MOVING mesh
             // ddtCorr is fvcDdtUfCorr and reads Uf.oldTime(), so nothing requests phi.oldTime()

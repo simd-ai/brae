@@ -293,7 +293,13 @@ arm nonNewtonian            refused "CrossPowerLaw"           "" "sed -i '0,/tra
 # by name: a Function1 ocCoeff (the ramp form), a coefficient outside [0, 1], the scheme on one of the two
 # operand sets and Euler on the other, beside a mangrove source (whose
 # added mass takes fvm::ddt(U) under the case's scheme), with alpha
-# sub-cycling (OpenFOAM's own FatalError), and a restart directory that holds the ddt0 fields or alphaPhi0
+# sub-cycling (OpenFOAM's own FatalError), a restart directory that holds a MOVING mesh's ddt0 fields, and
+# a restart of a case with a COUPLED PAIR.
+# A RESTART FROM OPENFOAM'S OWN STATE RUNS now, on both loops: the three static-mesh ddt0 fields are read
+# back with startTimeIndex -2, every field's <field>_0 old-time level with them, and alphaPhi0's presence
+# makes ddt(alpha)'s off-centring live from the first step (inter_cn_restart.cuh).
+# tests/interfoam_cn_vs_openfoam.sh's `cnRestart` profile holds it against OpenFOAM's own warm restart,
+# with OpenFOAM's COLD restart as the control.
 CNSET="sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson 0.5;/' system/fvSchemes"
 arm ddt_CrankNicolson       runs    -                        "" "$CNSET"
 arm ddt_cnFull              runs    -                        "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson 1;/' system/fvSchemes"
@@ -307,8 +313,25 @@ arm ddt_cnOutOfRange        refused "should be >= 0 and <= 1" "" "sed -i '/^ddtS
 arm ddt_cnAlphaOnly         runs    -                        "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         Euler;\n    ddt(alpha)      CrankNicolson 0.5;/' system/fvSchemes"
 arm ddt_alphaEulerOnly      runs    -                        "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson 0.5;\n    ddt(alpha)      Euler;/' system/fvSchemes"
 arm ddt_cnSubCycles         refused "nAlphaSubCycles > 1"    "" "$CNSET; sed -i 's/nAlphaSubCycles  *1;/nAlphaSubCycles 2;/' system/fvSolution"
-arm ddt_cnDdt0Present       refused "ddt0(rho,U)"             "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class volVectorField; object ddt0(rho,U); }\ndimensions [1 -2 -2 0 0 0 0];\ninternalField uniform (0 0 0);\nboundaryField { \".*\" { type calculated; value uniform (0 0 0); } }\n' > '0/ddt0(rho,U)'"
-arm ddt_cnAlphaPhi0Present  refused "alphaPhi0"               "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class surfaceScalarField; object alphaPhi0.water; }\ndimensions [0 3 -1 0 0 0 0];\ninternalField uniform 0;\nboundaryField { \".*\" { type calculated; value uniform 0; } }\n' > 0/alphaPhi0.water"
+# THE RESTART STATE IS READ, not refused: these two arms RUN now. What they say is that the reader takes
+# the path -- a state file in the start directory no longer stops the case -- while the NUMBERS live in
+# the cn gate's `cnRestart` profile, where OpenFOAM's own warm restart is the oracle.
+arm ddt_cnDdt0Present       runs    -                         "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class volVectorField; object ddt0(rho,U); }\ndimensions [1 -2 -2 0 0 0 0];\ninternalField uniform (0 0 0);\nboundaryField { \".*\" { type calculated; value uniform (0 0 0); } }\n' > '0/ddt0(rho,U)'"
+arm ddt_cnAlphaPhi0Present  runs    -                         "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class surfaceScalarField; object alphaPhi0.water; }\ndimensions [0 3 -1 0 0 0 0];\ninternalField uniform 0;\nboundaryField { \".*\" { type calculated; value uniform 0; } }\n' > 0/alphaPhi0.water"
+# ...and the TWO A MOVING MESH WRITES are still refused, for want of a fixture that restarts one: the one
+# shipped interFoam tutorial that names CrankNicolson moves its mesh under rigidBodyMotion, which brae
+# refuses before it gets here, so a seed for either would be ungated.
+arm ddt_cnUfDdt0Present     refused "ddtCorrDdt0(Uf)"         "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class surfaceVectorField; object ddtCorrDdt0(Uf); }\ndimensions [0 1 -2 0 0 0 0];\ninternalField uniform (0 0 0);\nboundaryField { \".*\" { type calculated; value uniform (0 0 0); } }\n' > '0/ddtCorrDdt0(Uf)'"
+arm ddt_cnMeshPhi0Present   refused "meshPhiCN_0"             "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class surfaceScalarField; object meshPhiCN_0; }\ndimensions [0 3 -1 0 0 0 0];\ninternalField uniform 0;\nboundaryField { \".*\" { type calculated; value uniform 0; } }\n' > '0/meshPhiCN_0'"
+# ...and a RESTART ACROSS A COUPLED PAIR, on the leakage base, whose baffles are cyclicACMI. The pair's
+# own old-old flux and ddtCorr ddt0 live in arrays the boundary-face seed does not reach
+# (inter_driver_device.cu, dPhiOOIf beside dPhiOOI), so half of one field would start cold. The PAIR
+# ARM BELOW IT is the control: the same base under the same scheme with no state file runs, so this
+# refusal is the restart's and not the mesh's.
+BASE="$BK"
+arm ddt_cnRestartCoupled    refused "a coupled pair"          "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class volVectorField; object ddt0(rho,U); }\ndimensions [1 -2 -2 0 0 0 0];\ninternalField uniform (0 0 0);\nboundaryField { \".*\" { type calculated; value uniform (0 0 0); } }\n' > '0/ddt0(rho,U)'"
+arm ddt_cnCoupledCold       runs    -                         "" "$CNSET"
+BASE="$B"
 arm ddt_localEuler          refused "localEuler"              "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         localEuler;/' system/fvSchemes"
 arm ddt_backward            refused "backward"                "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         backward;/' system/fvSchemes"
 BASE="$BM"

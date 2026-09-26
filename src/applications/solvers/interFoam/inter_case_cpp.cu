@@ -1286,27 +1286,63 @@ InterFields buildInterFields(const std::string&          caseDir,
         // term with its Euler line left inert and keeps its own ddt0 field. Gated on
         // validation/interFoamCyclic, profiles `sstCN` and `lesCN`, whose control is the SAME case
         // under Euler -- on both arms.
-        // a restart from a directory OpenFOAM wrote under CrankNicolson: the ddt0 fields and alphaPhi0
-        // are read back there (ddt0_ with startTimeIndex -2, createAlphaFluxes.H's alphaRestart), and
-        // the scheme is CrankNicolson from the first step. brae reads neither.
-        for (const char* name : {"ddt0(rho,U)", "ddtCorrDdt0(U)", "ddtCorrDdt0(phi)", "ddtCorrDdt0(Uf)",
-                                 "meshPhiCN_0", "ddt0(rho,k)",
-                                 "ddt0(k)", "ddt0(rho,epsilon)", "ddt0(epsilon)"})
+        // A RESTART from a directory OpenFOAM wrote under CrankNicolson IS PORTED NOW: the ddt0 fields
+        // are read back with startTimeIndex -2 so the scheme is warm from the first step, and
+        // alphaPhi0's presence makes ddt(alpha)'s off-centring live there too. inter_cn_restart.cuh
+        // carries the two facts and which of the two is only a presence; the drivers do the seeding,
+        // because the ddt0 objects are theirs. Held by tests/interfoam_cn_vs_openfoam.sh's `cnRestart`
+        // profile, whose oracle is OpenFOAM's own warm restart and whose control is the same restart
+        // with the state removed -- U 5.2796e-03 apart in U and 7.2856e-03 in alpha over 2264 of 2268
+        // cells, against which both arms sit at the round-off floor (host U 1.2975e-14, device 3.6293e-12).
+        f.cnRestart.dir = startDir;
+        f.cnAlphaRestart =
+            std::filesystem::exists(startDir + "/alphaPhi0." + f.alphaName.substr(f.alphaName.find('.') + 1))
+         || std::filesystem::exists(startDir + "/alphaPhi0");
+        // ...AND NOT ACROSS A COUPLED PAIR. The device loop keeps the coupled faces' flux in arrays of
+        // their own -- dPhiOOIf beside dPhiOOI, ddtCorrPhiIf beside ddtCorrPhi (inter_driver_device.cu) --
+        // because a cyclic patch is not in the boundary-face array; the seed above fills the boundary
+        // arrays and leaves those cold, so a restart of a coupled case would run one half of one field
+        // warm. No shipped tutorial restarts a coupled interFoam case under this scheme and
+        // validation/interFoamCyclic's CrankNicolson profiles start from t = 0, so there is nothing that
+        // could witness the other half. Keyed on a state file actually being there, so a coupled case that
+        // starts cold under this scheme still runs.
+        {
+            bool anyState = f.cnAlphaRestart;
+            for (const char* nm : {"ddt0(rho,U)", "ddtCorrDdt0(U)", "ddtCorrDdt0(phi)", "phi_0", "U_0"})
+            {
+                anyState = anyState || std::filesystem::exists(startDir + "/" + nm);
+            }
+            if (anyState)
+            {
+                for (const FvPatch& q : patches)
+                {
+                    if (!isCoupledInterfaceType(q.type)) continue;
+                    throw std::runtime_error(
+                        "brae interFoam: ddtSchemes names CrankNicolson, the start directory holds the "
+                        "scheme's state, and patch `" + q.name + "` is `" + q.type + "` -- a coupled pair. "
+                        "The old-old flux and the ddtCorr ddt0 across a pair live in arrays of their own "
+                        "that this restart does not seed, so one half of one field would start cold. No "
+                        "fixture restarts a coupled case under this scheme. Refused rather than run half "
+                        "of it warm.");
+                }
+            }
+        }
+        // ...EXCEPT THE TWO A MOVING MESH WRITES. ddtCorrDdt0(Uf) is fvcDdtUfCorr's surface-vector ddt0
+        // and meshPhiCN_0 is the off-centred mesh flux's; the one shipped interFoam tutorial that names
+        // CrankNicolson moves its mesh under rigidBodyMotion, which brae refuses before this line, so
+        // there is no fixture that could witness a seed for either. A seed nothing measures is worth
+        // less than a refusal.
+        for (const char* name : {"ddtCorrDdt0(Uf)", "meshPhiCN_0"})
         {
             if (std::filesystem::exists(startDir + "/" + name))
                 throw std::runtime_error(
                     "brae interFoam: ddtSchemes names CrankNicolson and the start directory holds `"
-                    + std::string(name) + "`, which OpenFOAM reads back as the scheme's previous-step "
-                    "ddt and runs CrankNicolson from the first step. brae starts the scheme cold. Refused "
-                    "rather than run a different first step.");
+                    + std::string(name) + "`, which OpenFOAM reads back as a MOVING mesh's previous-step "
+                    "ddt (ddt0_ with startTimeIndex -2) and runs CrankNicolson from the first step. brae "
+                    "reads the static-mesh state and starts these two cold; no shipped tutorial restarts a "
+                    "moving interFoam case under this scheme, so no gate could hold a seed. Refused rather "
+                    "than run a different first step.");
         }
-        if (std::filesystem::exists(startDir + "/alphaPhi0." + f.alphaName.substr(f.alphaName.find('.') + 1))
-         || std::filesystem::exists(startDir + "/alphaPhi0"))
-            throw std::runtime_error(
-                "brae interFoam: ddtSchemes names CrankNicolson and the start directory holds alphaPhi0, "
-                "which OpenFOAM reads back (createAlphaFluxes.H, alphaRestart) and then off-centres "
-                "alpha's flux from the first step. brae starts cold. Refused rather than run a different "
-                "first step.");
     }
     if (!f.mrfZones.empty() && f.dynamicMesh)
         throw std::runtime_error(

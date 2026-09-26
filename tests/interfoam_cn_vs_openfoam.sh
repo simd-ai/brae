@@ -37,6 +37,22 @@
 # MEASURED, host and device: see the .cu's bounds, each with its number. Both arms sit at the round-off
 # floor on every profile (U 1.5e-14 host, 1.9e-12 device on `cn`), against a control of 3.2e-02.
 #
+# ...AND A RESTART, `cnRestart`: 20 steps to t = 0.02, then 20 MORE from there with the scheme's whole
+# state on disk. THAT IS A DIFFERENT RUN, not a continuation of the same one: OpenFOAM reads the three
+# ddt0 fields back with startTimeIndex -2 ("this field is for a restart and thus correct",
+# CrankNicolsonDdtScheme.C:49-64), reads every field's own <field>_0 old-time level back
+# (GeometricField.C:130-168), and finds alphaPhi0, which makes ddt(alpha)'s off-centring live from the
+# first step (alphaEqn.H:36-45) -- so it is CrankNicolson from step one instead of Euler for one step and
+# Euler-estimated for the next. THE ORACLE is OpenFOAM's own warm restart and THE CONTROL is OpenFOAM's
+# COLD one, the same restart with all of that state removed: OpenFOAM's two answers are U 5.2796e-03 and
+# alpha 7.2856e-03 apart over 2264+ of 2268 cells, and both arms sit at the round-off floor inside that.
+# ...and one PROPERTY asserted against OpenFOAM itself, because brae's port depends on it: alphaPhi0's
+# VALUES are inert. alphaEqn.H assigns alphaPhi10 (:131 or :208) before anything reads its old time, and
+# the un-blend's alphaPhi10.oldTime() (:256) then creates the level from the value just assigned -- so the
+# file's numbers are overwritten before anything can read them, and only its PRESENCE reaches the answer.
+# The gate runs OpenFOAM's warm restart a third time with those numbers replaced by zeros and requires
+# the result to be BITWISE the oracle. MEASURED: 0.0e+00 on every field, 0 of 2268 cells different.
+#
 # ...AND TWO MORE, one per closure, because the closure's fvm::ddt comes through ddtSchemes like every
 # other term and kEpsilon was the only one that took CrankNicolson:
 #   cnSST     the same tutorial with kOmegaSST in kEpsilon's place (and the UNIFORM lineage, which is
@@ -257,11 +273,84 @@ PYEOF
     echo "OpenFOAM ran $STEPS steps of deltaT $DT to t = $END   [$profile]"
 }
 
+# restartFrom <profile> <mode>: OpenFOAM again, from <profile>'s own END directory, with the scheme's
+# state either kept (`warm` -- THE ORACLE), removed (`cold` -- THE CONTROL) or kept with alphaPhi0's
+# numbers zeroed (`zeroAlphaPhi` -- the PROPERTY). The staged case is a copy, so the first run's output
+# stays intact. `adjustTimeStep no` is already set by stage(), which is what makes the restart's deltaT0
+# the same number as OpenFOAM's: Time::setControls reads deltaT back out of <start>/uniform/time ONLY
+# under adjustTimeStep, and brae does not read that file at all.
+restartFrom()
+{
+    local profile="$1" mode="$2"
+    local B="$W/$profile" C="$W/restart_$mode"
+    rm -rf "$C"
+    cp -r "$B" "$C" || return 1
+    rm -f "$C"/log.interFoam
+    END="$END" MODE="$mode" python3 - "$C" <<'RSTEOF' || { echo "FAIL: staging restart_$mode"; return 1; }
+import glob, os, re, sys
+d = sys.argv[1]
+t = os.path.join(d, os.environ['END'])
+mode = os.environ['MODE']
+c = os.path.join(d, 'system/controlDict')
+s = open(c).read()
+s = re.sub(r'^startFrom .*', 'startFrom       startTime;', s, flags=re.M)
+s = re.sub(r'^startTime .*',  'startTime       %s;' % os.environ['END'], s, flags=re.M)
+s = re.sub(r'^endTime .*',    'endTime         %.10g;' % (2*float(os.environ['END'])), s, flags=re.M)
+open(c, 'w').write(s)
+# WHAT OPENFOAM WROTE of the scheme's state, asserted rather than assumed: three ddt0 fields, four
+# <field>_0 old-time levels and alphaPhi0. The cold arm removes exactly this set, so if OpenFOAM ever
+# writes a different one the arm stops meaning what its name says and this assertion says so.
+state = sorted(os.path.basename(f) for f in
+               glob.glob(t + '/ddt0*') + glob.glob(t + '/ddtCorr*') + glob.glob(t + '/alphaPhi0*')
+             + glob.glob(t + '/*_0'))
+want = sorted(['U_0', 'alphaPhi0.water', 'ddt0(rho,U)', 'ddt0(rho,epsilon)', 'ddt0(rho,k)',
+               'ddtCorrDdt0(U)', 'ddtCorrDdt0(phi)', 'epsilon_0', 'k_0', 'phi_0'])
+assert state == want, 'OpenFOAM wrote %s of the scheme state, not %s' % (state, want)
+if mode == 'cold':
+    for f in state:
+        os.remove(os.path.join(t, f))
+if mode == 'zeroAlphaPhi':
+    p = os.path.join(t, 'alphaPhi0.water')
+    s = open(p).read()
+    s, k = re.subn(r'internalField\s+nonuniform List<scalar>\s*\d+\s*\(.*?\n\)\s*;',
+                   'internalField   uniform 0;', s, flags=re.S)
+    assert k == 1, 'alphaPhi0 internalField was not a nonuniform list'
+    s = re.sub(r'value\s+nonuniform List<scalar>\s*\d+\s*\(.*?\n\)\s*;', 'value           uniform 0;',
+               s, flags=re.S)
+    open(p, 'w').write(s)
+RSTEOF
+    local key
+    key=$(oracleKey "$C" "interfoam_cn" "restart_$mode" "$STEPS" "$DT")
+    if oracleRestore "$C" "$key" "$REND"; then
+        echo "OpenFOAM's restart to t = $REND reused from the oracle cache   [restart_$mode]"
+        return 0
+    fi
+    ( cd "$C" && interFoam > log.interFoam 2>&1 ) \
+        || { echo "FAIL: interFoam [restart_$mode]"; tail -30 "$C/log.interFoam"; return 1; }
+    [ -d "$C/$REND" ] || { echo "FAIL: OpenFOAM wrote no $REND directory [restart_$mode]"; ls "$C"; return 1; }
+    # the arm took the path its name claims: alphaRestart is announced, and only where the file is there
+    if [ "$mode" = cold ]; then
+        ! grep -q "Restarting alpha" "$C/log.interFoam" \
+            || { echo "FAIL: the COLD restart still found alphaPhi0"; return 1; }
+    else
+        grep -q "Restarting alpha" "$C/log.interFoam" \
+            || { echo "FAIL: OpenFOAM did not announce alphaRestart [restart_$mode]"; return 1; }
+    fi
+    oracleStore "$C" "$key"
+    echo "OpenFOAM restarted $STEPS steps to t = $REND   [restart_$mode]"
+}
+
 rc=0
 for p in euler cn cnOuter cnFull eulerSST cnSST eulerLES cnLES cnAlphaEuler eulerAlphaCN; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_cn_vs_openfoam: staging failed"; exit 1; }
+
+REND=$(python3 -c "print('%.10g' % (2*float('$END')))")
+for mode in warm cold zeroAlphaPhi; do
+    restartFrom cn "$mode" || { rc=1; break; }
+done
+[ $rc = 0 ] || { echo "interfoam_cn_vs_openfoam: restart staging failed"; exit 1; }
 
 for p in cn cnOuter cnFull; do
     "$BIN" "$W/$p" "$W/$p/0" "$W/$p/$END" "$STEPS" "$W/$p/log.interFoam" "$W/euler/$END" "$p" || rc=1
@@ -317,6 +406,42 @@ NOOPEOF
 for p in cnAlphaEuler eulerAlphaCN; do
     "$BIN" "$W/$p" "$W/$p/0" "$W/$p/$END" "$STEPS" "$W/$p/log.interFoam" "$W/cn/$END" "$p" || rc=1
 done
+
+
+# A RESTART from OpenFOAM's own CrankNicolson state. ORACLE: OpenFOAM's warm restart. CONTROL: its COLD
+# one. And FIRST the property brae's port rests on -- alphaPhi0's VALUES are inert, only its presence is
+# not -- asserted against OpenFOAM against itself, BITWISE, because a port that read those numbers would
+# pass the arm below just as well and be wrong about which fact it is honouring.
+python3 - "$W/restart_warm/$REND" "$W/restart_zeroAlphaPhi/$REND" <<'ALPHAEOF' || rc=1
+import re, sys
+def cells(path, vector):
+    t = open(path).read()
+    kind = "vector" if vector else "scalar"
+    m = re.search(r"internalField\s+nonuniform List<%s>\s*(\d+)\s*\((.*?)\n\)\s*;" % kind, t, re.S)
+    if m is None:
+        raise SystemExit("FAIL: %s is uniform" % path)
+    if vector:
+        return [tuple(float(x) for x in v.split()) for v in re.findall(r"\(([^()]*)\)", m.group(2))]
+    return [(float(x),) for x in m.group(2).split()]
+bad = 0
+for fld, vec in (("alpha.water", False), ("p_rgh", False), ("U", True), ("k", False), ("epsilon", False)):
+    a = cells(sys.argv[1] + "/" + fld, vec)
+    b = cells(sys.argv[2] + "/" + fld, vec)
+    assert len(a) == len(b) and a
+    n = sum(1 for u, v in zip(a, b) if any(x != y for x, y in zip(u, v)))
+    d = max(max(abs(x - y) for x, y in zip(u, v)) for u, v in zip(a, b))
+    ref = max(max(abs(x) for x in u) for u in a) or 1e-300
+    print("  PROPERTY: alphaPhi0's VALUES are inert on a restart -- OpenFOAM with them zeroed, "
+          "%s %.4e over %d of %d cells" % (fld, d / ref, n, len(a)))
+    if n:
+        print("  FAIL: they are not -- the file's numbers reach the answer, so brae must read them and "
+              "not only test whether the file is there")
+        bad = 1
+sys.exit(bad)
+ALPHAEOF
+
+"$BIN" "$W/restart_warm" "$W/restart_warm/$END" "$W/restart_warm/$REND" "$STEPS" \
+       "$W/restart_warm/log.interFoam" "$W/restart_cold/$REND" cnRestart || rc=1
 
 echo "interfoam_cn_vs_openfoam: rc $rc"
 exit $rc

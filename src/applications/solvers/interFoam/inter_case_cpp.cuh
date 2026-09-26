@@ -35,6 +35,7 @@
 //   4. gh and ghf need g AND hRef, and ghRef carries g's SIGN (inter_create_fields_cpp.cuh).
 //      p = p_rgh + rho*gh is written and never solved.
 #include "fvOptions_cpp.cuh"
+#include "inter_cn_restart.cuh"
 #include "MRF_cpp.cuh"
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
@@ -153,6 +154,13 @@ struct InterFields
     // fvm::ddt(rho, U), fvm::ddt(k) and ddtCorr. 1 is OpenFOAM's when the entry names none.
     scalar                       ddtAlphaOcCoeff = 1;
     scalar                       ddtOcCoeff      = 1;
+    // ...and what the START DIRECTORY holds of the scheme's state, when it holds any: OpenFOAM reads the
+    // ddt0 fields back and is CrankNicolson from the first step. See inter_cn_restart.cuh.
+    InterCnRestart               cnRestart;
+    // ...and whether alphaPhi0 was there: createAlphaFluxes.H's alphaRestart, which alphaEqn.H:36-45 ORs
+    // with the warm-up test so ddt(alpha)'s off-centring is live on the FIRST step. Only the file's
+    // presence reaches the answer -- see fact (2) in inter_cn_restart.cuh.
+    bool                         cnAlphaRestart  = false;
     // laplacianSchemes and snGradSchemes `default`, as TWO facts: whether the correction flux is added
     // (`corrected`) and which delta coefficients the implicit half takes (`nonOrthCoeffs`). OpenFOAM
     // separates them -- uncorrectedSnGrad.H:113-119 returns nonOrthDeltaCoeffs exactly as
