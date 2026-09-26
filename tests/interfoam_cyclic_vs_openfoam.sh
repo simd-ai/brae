@@ -207,6 +207,51 @@ stage()
     cp -r "$C/0.orig" "$C/0"
     grep -q "type cyclic; neighbourPatch right;" "$C/system/blockMeshDict" \
         || { echo "FAIL: the fixture's left patch is no longer the cyclic this gate stages"; return 1; }
+    if [ "$profile" = skewNonOrth ] || [ "$profile" = skewOrthogonal ]; then
+        # THE COUPLED PATCH'S OWN DELTA COEFFICIENTS. fvm::laplacian and fvc::snGrad each choose the
+        # scheme's coefficients TWICE -- once for the interior and once inside the `fp.coupled` branch --
+        # and after the corrected/nonOrthCoeffs split landed, the coupled branch still read `corrected`
+        # alone. OpenFOAM hands the coupled side the SCHEME's deltaCoeffs (snGradScheme.C's
+        # pvf.coupled() branch), which for `uncorrected` are nonOrthDeltaCoeffs exactly as for
+        # `corrected` (uncorrectedSnGrad.H:113-119 against correctedSnGrad.H:108-114).
+        #
+        # THE SHIPPED MESH CANNOT WITNESS IT: this fixture's box reads `Mesh non-orthogonality Max: 0
+        # average: 0`, so nonOrthDeltaCoeffs == deltaCoeffs everywhere and the branch is inert. The block
+        # is therefore SHEARED, x' = x + 0.5*y, which leaves the pair translationally congruent -- checkMesh
+        # reports `Coupled point location match (average 5.9e-17) OK` -- and makes every face skew:
+        # `Max: 26.565051177079 average: 26.565051177078`, and max == average forces ALL 1540 internal faces
+        # to that one angle, with a coefficient ratio 1/cos = 1.1180 and nowhere for it to cancel.
+        #
+        # MEASURED, OpenFOAM against OpenFOAM on the sheared mesh at this gate's own 10 steps of 0.002:
+        # `uncorrected` against `orthogonal` -- what brae ran under the name against what it should have --
+        # is alpha 1.8136e-02 over 794 of 800 cells, p_rgh 5.2143e-02 and U 7.8932e-02 over all 800.
+        # Against B_ALPHA 6e-12 / B_PRGH 3e-10 / B_U 2e-11 that is 3.0e+09x, 1.7e+08x and 3.9e+09x.
+        w=orthogonal
+        [ "$profile" = skewNonOrth ] && w=uncorrected
+        python3 - "$C" "$w" <<'SKEOF' || { echo "FAIL: staging $profile"; return 1; }
+import re, sys
+d, w = sys.argv[1], sys.argv[2]
+q = d + '/system/blockMeshDict'
+t = open(q).read()
+a = 'vertices ( (0 0 0)(1 0 0)(1 0.5 0)(0 0.5 0) (0 0 0.05)(1 0 0.05)(1 0.5 0.05)(0 0.5 0.05) );'
+b = 'vertices ( (0 0 0)(1 0 0)(1.25 0.5 0)(0.25 0.5 0) (0 0 0.05)(1 0 0.05)(1.25 0.5 0.05)(0.25 0.5 0.05) );'
+assert t.count(a) == 1, 'the fixture no longer carries the unsheared block'
+open(q, 'w').write(t.replace(a, b))
+q = d + '/system/fvSchemes'
+t = open(q).read()
+t, n = re.subn(r'(laplacianSchemes\s*\{\s*default\s+)Gauss linear corrected', r'\g<1>Gauss linear ' + w, t)
+assert n == 1, 'laplacianSchemes'
+t, n = re.subn(r'(snGradSchemes\s*\{\s*default\s+)corrected', r'\g<1>' + w, t)
+assert n == 1, 'snGradSchemes'
+open(q, 'w').write(t)
+SKEOF
+        # this fixture writes its blocks on one line with single spaces, not the tutorials' column
+        # alignment, so the check is spacing-agnostic
+        grep -q "(1.25 0.5 0)" "$C/system/blockMeshDict" \
+            && grep -qE "default +Gauss linear $w;" "$C/system/fvSchemes" \
+            && grep -qE "default +$w;" "$C/system/fvSchemes" \
+            || { echo "FAIL: $profile was not staged"; return 1; }
+    fi
     if [ "$profile" = explicitMules ] || [ "$profile" = explicitWalls ]; then
         # THE EXPLICIT MULES BRANCH. Without MULESCorr there is no implicit pre-solve and no
         # mixture.correct() before the correctors, so the FIRST corrector's phir reads the nHatf the
@@ -466,7 +511,8 @@ PYEOF
 
 for p in cyclic walls explicitMules explicitWalls jump outer outerControl \
          sst sstWalls les lesWalls sstCN lesCN sstLim sstLimWalls sstLimU sstLimUWalls \
-         sstLimDiv sstLimDivWalls sstLsq sstLsqWalls sstLimUpw sstLimUpwWalls gamg gamgWalls; do
+         sstLimDiv sstLimDivWalls sstLsq sstLsqWalls sstLimUpw sstLimUpwWalls gamg gamgWalls \
+         skewOrthogonal skewNonOrth; do
     stage "$p" || { echo "interfoam_cyclic_vs_openfoam: staging failed"; exit 1; }
 done
 
@@ -613,6 +659,28 @@ if [ "$HAVE_GPU" = 1 ]; then
 else
     echo "  (no GPU: the assembled-system arm is not exercised)"
 fi
+
+
+# skewNonOrth: the SHEARED mesh has to be non-orthogonal in OpenFOAM's own eyes and its pair still
+# congruent, or the arm measures nothing. Both come straight out of checkMesh.
+( set +u; . "$OFBASHRC" > /dev/null 2>&1; cd "$W/skewNonOrth" && checkMesh > log.checkMesh 2>&1 ) || true
+python3 - "$W/skewNonOrth/log.checkMesh" <<'CKEOF' || rc=1
+import re, sys
+t = open(sys.argv[1]).read()
+m = re.search(r"Mesh non-orthogonality Max: ([0-9.eE+-]+) average: ([0-9.eE+-]+)", t)
+if not m:
+    raise SystemExit("FAIL: checkMesh printed no non-orthogonality line")
+mx, av = float(m.group(1)), float(m.group(2))
+ok = re.search(r"Coupled point location match .* OK", t) is not None
+print("  skewNonOrth MESH: non-orthogonality max %.6f average %.6f, coupled point match %s"
+      % (mx, av, "OK" if ok else "NOT REPORTED"))
+if mx < 1.0:
+    raise SystemExit("FAIL: the sheared mesh is orthogonal (max %g deg), so the coupled branch is inert" % mx)
+if not ok:
+    raise SystemExit("FAIL: checkMesh does not report the periodic pair as matching after the shear")
+CKEOF
+"$BIN" "$W/skewNonOrth" "$W/skewNonOrth/0" "$W/skewNonOrth/$END" "$STEPS" \
+       "$W/skewNonOrth/log.interFoam" "$W/skewOrthogonal/$END" skewNonOrth || rc=1
 
 echo "interfoam_cyclic_vs_openfoam: rc $rc"
 exit $rc

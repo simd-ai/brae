@@ -65,7 +65,8 @@ FvMatrix<T> laplacian(
     // only in corrected(); orthogonalSnGrad is the one that returns deltaCoeffs
     // (orthogonalSnGrad.H:113-119). With ONE flag this ran ORTHOGONAL under the name `uncorrected`, and
     // under `limited 0` as well, which no refusal covered. Appended LAST and defaulted false, so not one
-    // of the 96 fvm::laplacian or 32 fvc::snGrad call sites moves.
+    // of the 33 fvm::laplacian or 9 fvc::snGrad call sites moves. (Those two counts are measured, with
+    // comments stripped, not estimated: an earlier revision of this comment said 96 and 32.)
     bool nonOrthCoeffs = false)
 {
     const label nC  = m.nCells();
@@ -115,7 +116,10 @@ FvMatrix<T> laplacian(
             for (label i = 0; i < fp.size; ++i)
             {
                 const scalar pGamma = gammaf.boundary[pi][i] * magSf[fp.start + i];
-                const scalar dcb = corrected ? fp.nonOrthDeltaCoeffs[i] : fp.deltaCoeffs[i];
+                // the SCHEME's deltaCoeffs, which `uncorrected` shares with `corrected` -- see the
+                // note on the interior choice above
+                const scalar dcb = (corrected || nonOrthCoeffs) ? fp.nonOrthDeltaCoeffs[i]
+                                                                : fp.deltaCoeffs[i];
                 M.internalCoeffs[pi][i] = (-(pGamma * dcb)) * tUniform<T>(1);
                 M.boundaryCoeffs[pi][i] = (-(pGamma * dcb)) * tUniform<T>(1);
             }

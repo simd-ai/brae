@@ -807,13 +807,15 @@ SurfaceScalarField snGrad(
         if (fp.coupled)
         {
             // snGradScheme.C, the pvf.coupled() branch: pvf.snGrad(deltaCoeffs) = dc*(pnf - pif), with
-            // the SCHEME's deltaCoeffs -- nonOrthDeltaCoeffs under `corrected` -- and, there, the
+            // the SCHEME's deltaCoeffs -- nonOrthDeltaCoeffs under `corrected` AND under `uncorrected`,
+            // which return the same coefficients and differ only in corrected() -- and, there, the
             // correction too: nonOrthCorrectionVectors is not zero on a coupled patch. pnf comes from
             // the patch field, because a jump cyclic's is the neighbour cell LESS the jump.
             const std::vector<scalar> pnf = vf.boundary[pi]->patchNeighbourField(vf.internal);
             for (label i = 0; i < fp.size; ++i)
             {
-                const scalar dcb = corrected ? fp.nonOrthDeltaCoeffs[i] : fp.deltaCoeffs[i];
+                const scalar dcb = (corrected || nonOrthCoeffs) ? fp.nonOrthDeltaCoeffs[i]
+                                                                : fp.deltaCoeffs[i];
                 scalar v = dcb * (pnf[i] - vf.internal[fp.faceCells[i]]);
                 if (corrected)
                 {

@@ -148,6 +148,12 @@ int main(
     const std::string wallsDir = argv[6];
     const std::string profile = (argc > 7) ? argv[7] : "MULESCorr";
     const bool jumpProfile = (profile == "jump");
+    // `skewNonOrth`: the fixture SHEARED (x' = x + 0.5*y, every face at 26.5651 deg) and read under
+    // `uncorrected`, so the coupled patch's own delta coefficients are exercised. fvm::laplacian and
+    // fvc::snGrad each make the scheme's choice twice -- interior and `fp.coupled` -- and the coupled
+    // one read the correction flag alone until this arm existed. The shipped box reads
+    // `non-orthogonality Max: 0`, so it cannot witness the branch at all.
+    const bool skewProfile = (profile == "skewNonOrth");
     const bool outerProfile = (profile == "outer");
     // A CLOSURE ACROSS THE PAIR. `sst` is kOmegaSST with the wall-function family on the walls,
     // `les` is kEqn with the filter width the fixture's uniform cells give. The closure is what is
@@ -213,6 +219,31 @@ int main(
     }
     std::printf("  mesh: %d cells, %zu coupled faces\n", (int)nC, nCoupled);
     check("the mesh carries a periodic pair at all", nCoupled > 0);
+    if (skewProfile)
+    {
+        // THE BRANCH UNDER TEST IS LIVE IN BRAE'S OWN GEOMETRY, not merely in checkMesh's report: on a
+        // coupled face the two coefficient sets must actually differ, or `(corrected || nonOrthCoeffs)`
+        // and `corrected` pick the same number there and the arm is vacuous whatever it reads.
+        scalar worstRatio = 1;
+        std::size_t nSkewCoupled = 0;
+        for (const FvPatch& q : patches)
+        {
+            if (!q.coupled) continue;
+            for (label i = 0; i < q.size; ++i)
+            {
+                const scalar dc = q.deltaCoeffs[i];
+                const scalar nd = q.nonOrthDeltaCoeffs[i];
+                if (dc <= scalar(0)) continue;
+                const scalar ratio = nd/dc;
+                if (std::fabs(ratio - scalar(1)) > scalar(1e-10)) ++nSkewCoupled;
+                worstRatio = std::fmax(worstRatio, ratio);
+            }
+        }
+        std::printf("  COUPLED SKEW: %zu of %zu coupled faces have nonOrthDeltaCoeffs != deltaCoeffs, "
+                    "worst ratio %.6f\n", nSkewCoupled, nCoupled, (double)worstRatio);
+        check("the pair's own faces are non-orthogonal, so the coupled branch is not inert",
+              nSkewCoupled == nCoupled && worstRatio > scalar(1.01));
+    }
     if (!nCoupled)
     {
         std::printf("test_inter_cyclic_vs_openfoam [%s]: %d failures\n", profile.c_str(), failures);
@@ -222,6 +253,21 @@ int main(
     InterFields fin;
     const RunReport r = runInterFoam(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/true, &fin);
     check("brae ran the same number of steps", r.steps == nSteps);
+    if (skewProfile)
+    {
+        // WHAT WAS READ. Without this the arm passes on a brae that resolved the entry to `corrected`
+        // (which also takes nonOrthDeltaCoeffs, so the coupled branch would be right by accident) or to
+        // `orthogonal` (which is the defect).
+        std::printf("  SCHEME READ: laplacian `%s` corrected %d nonOrthCoeffs %d   |   snGrad `%s` "
+                    "corrected %d nonOrthCoeffs %d\n",
+                    fin.laplacianScheme.raw.c_str(), (int)fin.laplacianScheme.corrected,
+                    (int)fin.laplacianScheme.nonOrthCoeffs, fin.snGradScheme.raw.c_str(),
+                    (int)fin.snGradScheme.corrected, (int)fin.snGradScheme.nonOrthCoeffs);
+        check("brae reads the laplacian's coefficients as nonOrthDeltaCoeffs with no correction",
+              fin.laplacianScheme.nonOrthCoeffs && !fin.laplacianScheme.corrected);
+        check("...and the snGrad's the same way",
+              fin.snGradScheme.nonOrthCoeffs && !fin.snGradScheme.corrected);
+    }
 
     auto readCells = [&](const std::string& path)
     {
@@ -352,12 +398,20 @@ int main(
     std::printf("  CONTROL: OpenFOAM with %s: alpha %.4e, U relative %.4e\n",
                 outerProfile ? "nOuterCorrectors 1 (this case has 3)"
                 : (cnProfile ? "the Euler ddt (this case runs CrankNicolson 0.9)"
-                : (jumpProfile ? "the pair a PLAIN CYCLIC (no jump)" : "the pair two WALLS")),
+                : (jumpProfile ? "the pair a PLAIN CYCLIC (no jump)"
+                : (skewProfile ? "`orthogonal` on the same sheared mesh -- deltaCoeffs where this arm "
+                                 "takes nonOrthDeltaCoeffs, which is what brae computed under the name "
+                                 "`uncorrected` on the coupled patch"
+                               : "the pair two WALLS"))),
                 (double)cA.linf, (double)cU.rel());
     check(outerProfile ? "the OUTER CORRECTORS move OpenFOAM's own alpha far more than brae is from it"
           : (cnProfile ? "CRANKNICOLSON moves OpenFOAM's own alpha far more than brae is from it"
           : (jumpProfile ? "the JUMP moves OpenFOAM's own alpha far more than brae is from it"
-                         : "walling the pair moves OpenFOAM's own alpha far more than brae is from it")),
+          : (skewProfile ? "THE COEFFICIENT CHOICE moves OpenFOAM's own alpha far more than brae is from "
+                           "it. MEASURED, OpenFOAM against OpenFOAM on the sheared mesh at this gate's "
+                           "own 10 steps: alpha 1.8136e-02 over 794 of 800 cells, p_rgh 5.2143e-02 and "
+                           "U 7.8932e-02 over all 800 -- 3.0e+09x, 1.7e+08x and 3.9e+09x the bounds"
+                         : "walling the pair moves OpenFOAM's own alpha far more than brae is from it"))),
           cA.linf > scalar(1000)*std::fmax(dA.linf, scalar(1e-16)));
     check("...and its U", cU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-16)));
 
