@@ -1,3 +1,4 @@
 dumpHexRef8.C
+removeFacesDump.C
 
 EXE = $(FOAM_USER_APPBIN)/dumpHexRef8

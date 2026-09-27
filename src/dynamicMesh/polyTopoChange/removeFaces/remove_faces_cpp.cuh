@@ -38,6 +38,7 @@
 // A REGION OF ONE CELL IS AN ERROR, not a no-op: it would mean a face was requested whose two sides
 // ended up in different regions, which cannot happen through the loop above. Transcribed as a throw.
 #include "cf_types.cuh"
+#include "mesh_edges_cpp.cuh"
 #include "primitive_mesh.cuh"
 #include <vector>
 
@@ -59,6 +60,62 @@ label compatibleRemoves(
     std::vector<label>&                    cellRegion,
     std::vector<label>&                    regionMaster,
     std::vector<label>&                    newFacesToRemove);
+
+// ----------------------------------------------------------------------------------------------
+// removeFaces::setRefinement, unit 6b-3a: THE DECISIONS. Which edges go, which faces merge with which,
+// which points go, and which faces are touched at all.
+//
+// provenance:
+//   openfoam: removeFaces.C:762-1400 of setRefinement, plus changeFaceRegion (:81-131) and
+//             getFacesAffected (:142-196)
+//   oracle:   tools/dumpHexRef8/removeFacesDump.C -- a copy of OpenFOAM's own class with WRITES ONLY,
+//             because every one of these is a LOCAL of setRefinement (the of-instrument pattern)
+//
+// WHY THE EDGE COUNT DECIDES EVERYTHING. `nFacesPerEdge` starts at -1 and is counted DOWN from
+// edgeFaces().size()-1 once per face being removed, so after the two loops an edge carries the number of
+// faces that will still use it: 0 means nothing uses the edge any more, 2 means the two survivors are
+// coplanar halves of one face and must be MERGED, and 3 or more means the edge stays. -1 is the "not
+// touched, and only two faces use it" case, which is an interior edge of a face and is left alone.
+//
+// AND THE THREE PLACES A 2 IS PUT BACK TO 3, which is the whole subtlety of the function:
+//   two boundary faces of DIFFERENT patches      never merged across a patch boundary
+//   two boundary faces at an angle below minCos   OpenFOAM's own feature-angle guard
+//   two internal faces between DIFFERENT cell pairs, as UNORDERED pairs of regions (Foam::edge
+//     comparison is symmetric, edgeI.H:499 -> PairI.H) -- merging those would put two faces between one
+//     cell pair, which is what OpenFOAM's comment calls an upper-triangular ordering problem
+struct RemoveFacesView
+{
+    const PrimitiveMesh*                   m = nullptr;
+    const MeshEdges*                       edges = nullptr;        // edges() and pointEdges()
+    const std::vector<std::vector<label>>* faceEdges = nullptr;
+    const std::vector<std::vector<label>>* edgeFaces = nullptr;
+    const std::vector<std::vector<label>>* cells = nullptr;        // getFacesAffected's cell faces
+    const std::vector<std::vector<label>>* pointFaces = nullptr;   // ...and its point faces
+    // polyPatch::faceNormals(), which is the face AREA VECTOR normalised -- only the minCos filter
+    // reads it, and only for an edge whose two survivors are both on the boundary
+    const std::vector<vector>*             faceAreas = nullptr;
+};
+
+struct RemoveFacesDecisions
+{
+    // per edge, the number of faces that will still use it, after the filter puts some 2s back to 3
+    std::vector<label> nFacesPerEdge;
+    std::vector<label> edgesToRemove;                  // ascending
+    // per face: -1 removed or unvisited, -2 a region of ONE face (so nothing to merge), else its region
+    std::vector<label> faceRegion;
+    label              nFaceRegions = 0;
+    std::vector<label> pointsToRemove;                 // ascending
+    std::vector<char>  affectedFace;
+    // invertOneToMany(nFaceRegions, faceRegion): each region's faces in ASCENDING face order
+    std::vector<std::vector<label>> regionToFaces;
+};
+
+RemoveFacesDecisions setRefinementDecisions(
+    const RemoveFacesView&    v,
+    const std::vector<label>& facesToRemove,
+    const std::vector<label>& cellRegion,
+    const std::vector<label>& cellRegionMaster,
+    scalar                    minCos);
 
 } // namespace removeFaces
 } // namespace cpu

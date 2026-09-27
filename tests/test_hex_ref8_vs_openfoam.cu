@@ -22,6 +22,7 @@
 #include "poly_topo_change_cpp.cuh"
 #include "fv_geometry.cuh"
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <fstream>
 #include <map>
@@ -70,9 +71,18 @@ Dump readDump(const std::string& path)
         if (!(ls >> key)) continue;
         label n = 0;
         if (!(ls >> n)) continue;
-        if ((key.rfind('n', 0) == 0 && key.size() > 1
-          && std::isupper(static_cast<unsigned char>(key[1])))
-         || key == "historyActive")
+        std::string tail;
+        std::getline(ls, tail);
+        const bool nothingAfterN = (tail.find_first_not_of(" \t\r") == std::string::npos);
+        // A SCALAR IS `name value` AND NOTHING ELSE. The name test alone was a trap: removeFaces'
+        // `nFacesPerEdge` is a LIST of 14,386 entries whose name begins with n and a capital, and the
+        // name rule swallowed it as the scalar 14386 -- silently, because the comparison that wanted the
+        // list then said "the dump has no nFacesPerEdge". So the shape decides first and the name only
+        // separates a scalar from a one-line BLOCK, which have the same shape.
+        if (nothingAfterN
+         && ((key.rfind('n', 0) == 0 && key.size() > 1
+           && std::isupper(static_cast<unsigned char>(key[1])))
+          || key == "historyActive"))
         {
             d.scalars[key] = n;
             continue;
@@ -85,9 +95,7 @@ Dump readDump(const std::string& path)
         // not in the list was read as a flat list and silently dropped, and the comparison that wanted it
         // then reported "the dump has no ..." or, worse, a size mismatch that looked like a port defect.
         // `historyAddedCellsAfterSet` was the second one. A structural test cannot be forgotten.
-        std::string rest;
-        std::getline(ls, rest);
-        const bool isBlock = (rest.find_first_not_of(" \t\r") == std::string::npos);
+        const bool isBlock = nothingAfterN;
         if (!isBlock)
         {
             std::vector<label> v(static_cast<std::size_t>(n));
@@ -182,6 +190,33 @@ void compareList(const char* name, const std::vector<label>& mine, const Dump& d
 
 }   // namespace
 
+
+void compareListList(
+    const char* name,
+    const std::vector<std::vector<label>>& mine,
+    const Dump& d,
+    const char* key)
+{
+    const auto it = d.listLists.find(key);
+    if (it == d.listLists.end()) { std::printf("  FAIL: the dump has no `%s`\n", key); ++failures; return; }
+    if (mine.size() != it->second.size())
+    {
+        std::printf("  FAIL: %s has %zu entries, OpenFOAM %zu\n", name, mine.size(), it->second.size());
+        ++failures;
+        return;
+    }
+    for (std::size_t i = 0; i < mine.size(); ++i)
+    {
+        if (mine[i] != it->second[i])
+        {
+            std::printf("  FAIL: %s differs at %zu (brae %zu entries, OpenFOAM %zu)\n", name, i,
+                        mine[i].size(), it->second[i].size());
+            ++failures;
+            return;
+        }
+    }
+    std::printf("  ok:   %s is OpenFOAM's (%zu entries)\n", name, mine.size());
+}
 
 int main(int argc, char** argv)
 {
@@ -330,7 +365,60 @@ int main(int argc, char** argv)
             check("compatibleRemoves returns OpenFOAM's used-region count on the reduced set",
                   nUsedD == d.scalars.at("nUsedRegionsDropped"));
         }
-        skip("removeFaces::setRefinement -- the map and the mesh, unit 6b-3");
+        // UNIT 6b-3a: removeFaces::setRefinement's DECISIONS -- which edges go, which faces merge with
+        // which, which points go, which faces are touched. Every one is a LOCAL of OpenFOAM's function,
+        // so the oracle is a copy of its own class with writes added (tools/dumpHexRef8/
+        // removeFacesDump.C), called on the same three inputs hexRef8 hands it -- the ones just compared
+        // above. Run TWICE, because minCos decides whether a whole branch executes:
+        //   GREAT      what hexRef8 constructs its own faceRemover with (hexRef8.C:1967), where
+        //              `minCos_ < 1` is false and the feature-angle guard never runs
+        //   cos(45deg) a configuration hexRef8 never asks for, but removeFaces has other callers, so the
+        //              guard is transcribed and this arm is what holds it against OpenFOAM
+        {
+            const std::vector<std::vector<label>> upointFaces = meshPointFaces(um);
+            removeFaces::RemoveFacesView rv;
+            rv.m = &um;
+            rv.edges = &ume;
+            rv.faceEdges = &ufEdges;
+            rv.edgeFaces = &ueFaces;
+            rv.cells = &ucells;
+            rv.pointFaces = &upointFaces;
+            rv.faceAreas = &ug.Sf();
+            const std::vector<label>& ftr = d.lists.at("facesToRemove");
+            const std::vector<label>& crg = d.lists.at("cellRegion");
+            const std::vector<label>& crm2 = d.lists.at("cellRegionMaster");
+            // OpenFOAM's GREAT (1e15), which is hexRef8's own minCos_
+            const std::pair<const char*, scalar> profiles[] = {
+                {".removeFaces",   scalar(1e15)},
+                {".removeFaces45", std::cos(scalar(45.0)*scalar(M_PI)/scalar(180.0))},
+            };
+            for (const auto& prof : profiles)
+            {
+                const Dump rf = readDump(dumpPath + prof.first);
+                if (rf.lists.find("nFacesPerEdge") == rf.lists.end())
+                {
+                    std::printf("  FAIL: %s has no nFacesPerEdge -- the oracle did not write it\n",
+                                prof.first);
+                    ++failures;
+                    continue;
+                }
+                const removeFaces::RemoveFacesDecisions dec =
+                    removeFaces::setRefinementDecisions(rv, ftr, crg, crm2, prof.second);
+                std::printf("  -- removeFaces::setRefinement's decisions at minCos %g (%s)\n",
+                            (double)prof.second, prof.first);
+                compareList("nFacesPerEdge", dec.nFacesPerEdge, rf, "nFacesPerEdge");
+                compareList("edgesToRemove", dec.edgesToRemove, rf, "edgesToRemove");
+                compareList("faceRegion", dec.faceRegion, rf, "faceRegion");
+                check("the number of face regions is OpenFOAM's",
+                      dec.nFaceRegions == rf.scalars.at("nFaceRegions"));
+                compareList("pointsToRemove", dec.pointsToRemove, rf, "pointsToRemove");
+                std::vector<label> aff(dec.affectedFace.size());
+                for (std::size_t i = 0; i < aff.size(); ++i) aff[i] = dec.affectedFace[i] ? 1 : 0;
+                compareList("affectedFace", aff, rf, "affectedFace");
+                compareListList("regionToFaces", dec.regionToFaces, rf, "regionToFaces");
+            }
+        }
+        skip("removeFaces::setRefinement -- the actions, the map and the mesh, unit 6b-3b");
         std::printf("test_hex_ref8_vs_openfoam: %d failures, %d skipped\n", failures, skipped);
         return failures == 0 ? 0 : 1;
     }

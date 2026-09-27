@@ -154,8 +154,53 @@
 #                                                    behind porting OpenFOAM's recursion as an explicit
 #                                                    stack: the flood assigns one region to a connected
 #                                                    component, so no traversal order can change it
-# What is still skipped, by name, is removeFaces::setRefinement -- the faces and the mesh an unrefinement
-# produces (unit 6b-3).
+# UNIT 6b-3a: removeFaces::setRefinement's DECISIONS -- which edges go, which faces merge with which,
+# which points go, which faces are touched at all. Every one of those is a LOCAL of OpenFOAM's function,
+# so the oracle is the of-instrument pattern: tools/dumpHexRef8/removeFacesDump.C is a COPY of
+# OpenFOAM's own class with WRITES ONLY, called on the three inputs hexRef8 hands it -- compatibleRemoves'
+# outputs, which the arms above already compare. It writes to <dump>.removeFaces.
+# TWO PROFILES, and the reason is a constant nobody would guess: hexRef8 constructs its faceRemover with
+# GREAT, not an angle (hexRef8.C:1967, "merge boundary faces wherever possible"), so `minCos_ < 1` is
+# FALSE and setRefinement's feature-angle guard never runs on the unrefinement path at all.
+#   GREAT      what hexRef8 itself does. The guard is unreachable.
+#   cos(45deg) a configuration hexRef8 never asks for. removeFaces has other callers and brae has to
+#              transcribe the guard, so this arm is what holds it against OpenFOAM: <dump>.removeFaces45.
+# On these fixtures the two profiles produce the SAME answer -- OpenFOAM's own log prints zero "not
+# merging faces" warnings on every arm -- because every pair of boundary faces that merges here is
+# coplanar. What the second profile gates is that the guard is REACHED and compares the right way round.
+# NINE FAIL-PROOFS:
+#                                                             unrefine unrefine3 unrefineTwice
+#   the edge count starts at edgeFaces().size(), not size()-1     throws   throws     throws
+#   an untouched edge with exactly 2 faces is set to 2 instead
+#     of being left at -1                                          8 F      8 F        8 F
+#   a single-face region is left at -1 instead of marked -2       HANGS    HANGS      HANGS
+#   a point with 2 remaining edges is kept                         4 F      4 F        4 F
+#   the face walk also crosses edges left at -1                    6 F      6 F        6 F
+#   the feature-angle guard's comparison is reversed             7 F on the cos45 profile ONLY, all three
+#                                                               arms, and GREEN on the GREAT profile --
+#                                                               which is how the two profiles are proved
+#                                                               to run different code
+#   the two internal survivors' region pairs compared as
+#     ORDERED pairs (Foam::edge equality is SYMMETRIC)            12 F     GREEN      12 F
+#   getFacesAffected marks the region MASTER's faces too         GREEN      2 F        2 F
+#   two boundary survivors on DIFFERENT patches are merged
+#     anyway                                                     GREEN    GREEN      GREEN
+# Four of those want saying rather than leaving:
+#   The -2 one HANGS instead of failing: without the marker the walk finds the same unvisited face again
+#   and never advances. So it IS caught, and as the worst kind of catch. That the branch is live is read
+#   off OpenFOAM's own dump instead: 8,772 faces marked -2 on `unrefine`, 10,848 on `unrefine3` and
+#   24,681 on `unrefineTwice`.
+#   The ORDERED-pair one is green on `unrefine3` because its merge regions are ISOLATED -- every third
+#   split point -- so no two internal faces run between the same pair of regions in opposite senses.
+#   getFacesAffected's master test is green on `unrefine` because there every face of a region master is
+#   also a face of a sibling being removed, or touches a removed edge or point, so marking it changes
+#   nothing; with survivors interleaved it does.
+#   The patch-boundary one is NOT WITNESSED on any arm, and OpenFOAM says why: it logs zero "not merging"
+#   warnings. An edge whose two survivors lie on DIFFERENT patches is never reduced to 2 faces by a
+#   hexRef8 unrefinement -- the edges that are reduced are interior to one parent face. Transcribed
+#   because removeFaces has other callers; recorded as unwitnessed rather than counted.
+# What is still skipped, by name, is the rest of removeFaces::setRefinement -- the ACTIONS it plays into
+# the polyTopoChange, mergeFaces' own choice of master face, and the mesh that comes out (unit 6b-3b).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_hex_ref8_vs_openfoam"

@@ -32,6 +32,7 @@
 #include "Time.H"
 #include "polyMesh.H"
 #include "hexRef8.H"
+#include "removeFacesDump.H"
 #include "refinementHistory.H"
 #include "removeFaces.H"
 #include "unitConversion.H"
@@ -284,7 +285,10 @@ int main(int argc, char *argv[])
 
         // compatibleRemoves is PUBLIC on removeFaces, so its three outputs can be dumped and gated on
         // their own rather than only through the mesh they produce
-        removeFaces faceRemover(mesh, Foam::cos(degToRad(45.0)));
+        // GREAT is what hexRef8 constructs ITS faceRemover with (hexRef8.C:1967, "merge boundary faces
+        // wherever possible"), so that is what this probe uses. compatibleRemoves does not read minCos_
+        // at all; setRefinement does, and the value decides whether its feature-angle guard runs.
+        removeFaces faceRemover(mesh, GREAT);
         labelHashSet splitFaces(12*splitPoints.size());
         for (const label pointi : splitPoints)
         {
@@ -340,6 +344,40 @@ int main(int argc, char *argv[])
             Info<< "compatibleRemoves on a reduced set: " << droppedFaces.size() << " faces in, "
                 << dFacesToRemove.size() << " out (the full set gives " << splitFacesToc.size()
                 << " in, " << facesToRemove.size() << " out)" << endl;
+        }
+
+        // UNIT 6b-3's ORACLE. removeFaces::setRefinement decides which EDGES go, which FACES merge into
+        // which, which POINTS go and which faces are affected -- and every one of those is a LOCAL. So a
+        // second, INSTRUMENTED copy of OpenFOAM's own class (removeFacesDump.C, writes only) is called on
+        // the SAME inputs hexRef8 hands it: compatibleRemoves' three outputs, unchanged. hexRef8's "Redo
+        // the region master" block is a CHECK and not a change -- it FatalErrors unless the master
+        // already is min(pointCells) -- so there is nothing between compatibleRemoves and setRefinement
+        // for this call to miss.
+        //
+        // It writes into a polyTopoChange of ITS OWN and that change is never played: the resulting mesh
+        // comes from the real path below, which is what brae's actions are compared against end to end.
+        {
+            OFstream rfos(outFile + ".removeFaces");
+            rfos.precision(17);
+            rfDump::os = &rfos;
+            removeFacesDump instrumented(mesh, GREAT);
+            polyTopoChange rfMod(mesh);
+            instrumented.setRefinement(facesToRemove, cellRegion, cellRegionMaster, rfMod);
+            rfDump::os = nullptr;
+            // ...AND A SECOND CALL AT cos(45 deg), because at GREAT the feature-angle guard is
+            // UNREACHABLE: `minCos_ < 1 && minCos_ > -1` (removeFaces.C:997) is false at 1e15, so the
+            // only thing that stops a boundary merge on hexRef8's own path is a patch boundary. brae has
+            // to transcribe the guard all the same -- removeFaces has other callers -- and this arm is
+            // what holds it against OpenFOAM. Written to its own file; never played.
+            OFstream rfos45(outFile + ".removeFaces45");
+            rfos45.precision(17);
+            rfDump::os = &rfos45;
+            removeFacesDump instrumented45(mesh, Foam::cos(degToRad(45.0)));
+            polyTopoChange rfMod45(mesh);
+            instrumented45.setRefinement(facesToRemove, cellRegion, cellRegionMaster, rfMod45);
+            rfDump::os = nullptr;
+            Info<< "wrote " << outFile << ".removeFaces (removeFaces::setRefinement's own decisions)"
+                << endl;
         }
 
         polyTopoChange uMod(mesh);
@@ -409,6 +447,27 @@ int main(int argc, char *argv[])
         writeObjectMaps(uos, "cellsFromCellsMap", uMap.cellsFromCellsMap());
         writeObjectMaps(uos, "facesFromFacesMap", uMap.facesFromFacesMap());
         writeObjectMaps(uos, "pointsFromPointsMap", uMap.pointsFromPointsMap());
+        // ...AND THE MESH ITSELF, which the refinement branch already dumps and this one did not: unit
+        // 6b-3's answer IS the mesh an unrefinement leaves, so the comparison needs it.
+        uos << "points " << mesh.points().size() << nl;
+        for (const point& pt : mesh.points())
+        {
+            uos << "  " << pt.x() << ' ' << pt.y() << ' ' << pt.z() << nl;
+        }
+        uos << "faces " << mesh.faces().size() << nl;
+        for (const face& f : mesh.faces())
+        {
+            uos << "  " << f.size();
+            for (const label v : f) uos << ' ' << v;
+            uos << nl;
+        }
+        writeLabels(uos, "owner", mesh.faceOwner());
+        writeLabels(uos, "neighbour", mesh.faceNeighbour());
+        uos << "patches " << mesh.boundaryMesh().size() << nl;
+        for (const polyPatch& pp : mesh.boundaryMesh())
+        {
+            uos << "  " << pp.name() << ' ' << pp.start() << ' ' << pp.size() << nl;
+        }
         writeLabels(uos, "cellLevelFinal", meshCutter.cellLevel());
         writeLabels(uos, "pointLevelFinal", meshCutter.pointLevel());
         {
