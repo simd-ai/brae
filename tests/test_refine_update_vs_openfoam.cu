@@ -183,7 +183,7 @@ std::map<std::string, std::vector<scalar>> readScalars(const std::string& path, 
          || key == "casePrghRefValue" || key == "casePrghValueFraction"
          || key == "casePrghGradient" || key == "casePrghP0"
          || key == "braeNutBnd" || key == "braeOmegaBnd" || key == "braeKqBnd"
-         || key == "braeUwallBnd"
+         || key == "braeUwallBnd" || key == "braeUfBnd"
          || key == "braeNutRefValue" || key == "braeNutValueFraction"
          || key == "braeNutGradient" || key == "braeNutP0"
          || key == "braeOmegaRefValue" || key == "braeOmegaValueFraction"
@@ -211,7 +211,7 @@ std::map<std::string, std::vector<scalar>> readScalars(const std::string& path, 
             continue;
         }
         if (key != "braeScalar" && key != "braeFresh" && key != "braeVector" && key != "V0" && key != "V"
-         && key != "braePhi" && key != "braePhiFlat" && key != "braePhiU"
+         && key != "braePhi" && key != "braePhiFlat" && key != "braePhiU" && key != "braeUf"
          && key != "refinePhiU" && key != "unrefinePhiU"
          && key != "refineOldCellVolumes" && key != "unrefineOldCellVolumes")
         {
@@ -219,7 +219,7 @@ std::map<std::string, std::vector<scalar>> readScalars(const std::string& path, 
         }
         label n = 0;
         ls >> n;
-        const label nRead = (key == "braeVector") ? 3*n : n;
+        const label nRead = (key == "braeVector" || key == "braeUf") ? 3*n : n;
         std::vector<scalar> v(static_cast<std::size_t>(nRead));
         for (label i = 0; i < nRead; ++i) ls >> v[static_cast<std::size_t>(i)];
         out[std::to_string(step) + "/" + key] = v;
@@ -451,6 +451,38 @@ int main(int argc, char** argv)
         };
         s.surfaceScalarVelocity.push_back(velocityFor("braePhi"));
         s.surfaceScalarVelocity.push_back(velocityFor("braePhiFlat"));
+
+        // ...AND A SURFACE VECTOR, the one surface path this gate did not cover and the one Uf takes. The
+        // two surface branches are different code: a surface SCALAR's hull average sums one component, a
+        // surface VECTOR's sums three. UNORIENTED, because Uf is a velocity and not a flux, so it is not
+        // negated on a flipped face.
+        //
+        // WHY: the restart profile of tests/interfoam_amr_levels_vs_openfoam.sh reads alpha exactly and Uf
+        // 2.3274e-10 relative -- 16x what the same case reads with the change switched OFF -- diffuse over
+        // about a thousand faces. Every other adaptive fixture's FIRST change happens from rest, where a
+        // surface field is zero and a refined cell's hull average is exactly 0 in both codes, so none of
+        // them exercises this path at all. This arm is what tells the MAP from the rebuild that follows it.
+        dynamicRefine::RefineUpdateState::CarriedSurfaceVectorField uf;
+        uf.oriented = false;
+        uf.field.resize(static_cast<std::size_t>(s.m.nInternalFaces()));
+        for (label f = 0; f < s.m.nInternalFaces(); ++f)
+        {
+            uf.field[static_cast<std::size_t>(f)] =
+                vector{scalar(f), scalar(2*f), scalar(3*f)};
+        }
+        uf.bnd.resize(s.patches.size());
+        for (std::size_t pi = 0; pi < s.patches.size(); ++pi)
+        {
+            const FvPatch& pp = s.patches[pi];
+            uf.bnd[pi].resize(static_cast<std::size_t>(pp.size));
+            for (label i = 0; i < pp.size; ++i)
+            {
+                const label g = pp.start + i;
+                uf.bnd[pi][static_cast<std::size_t>(i)] =
+                    vector{scalar(g), scalar(2*g), scalar(3*g)};
+            }
+        }
+        s.surfaceVectors.push_back(uf);
         std::printf("  the carried flux's velocity: `%s`\n",
                     s.surfaceScalarVelocity.at(0).empty() ? "(not in the table)"
                                                           : s.surfaceScalarVelocity.at(0).c_str());
@@ -860,6 +892,37 @@ int main(int argc, char** argv)
                 }
                 compareScalars((what + ", boundary").c_str(), flat, sc,
                                std::to_string(step) + "/" + names[k] + "Bnd", bounds[k]);
+            }
+
+            // ...AND THE SURFACE VECTOR. Flattened x,y,z per face, which is the order the dump writes, so a
+            // mapper that carried the wrong component or summed the three in a different order reads here
+            // and not as a magnitude that happens to agree.
+            if (!s.surfaceVectors.empty())
+            {
+                const auto& uf = s.surfaceVectors.at(0);
+                std::vector<scalar> flatUf;
+                flatUf.reserve(3*uf.field.size());
+                for (const vector& v : uf.field)
+                {
+                    flatUf.push_back(v.x);
+                    flatUf.push_back(v.y);
+                    flatUf.push_back(v.z);
+                }
+                compareScalars("the mapped surface VECTOR `braeUf`, internal", flatUf, sc,
+                               std::to_string(step) + "/braeUf", scalar(0));
+                std::vector<scalar> flatUfB;
+                for (std::size_t pi = 0; pi < uf.bnd.size(); ++pi)
+                {
+                    if (pi < s.patches.size() && s.patches[pi].type == "empty") continue;
+                    for (const vector& v : uf.bnd[pi])
+                    {
+                        flatUfB.push_back(v.x);
+                        flatUfB.push_back(v.y);
+                        flatUfB.push_back(v.z);
+                    }
+                }
+                compareScalars("the mapped surface VECTOR `braeUf`, boundary", flatUfB, sc,
+                               std::to_string(step) + "/braeUfBnd", scalar(0));
             }
         }
     }

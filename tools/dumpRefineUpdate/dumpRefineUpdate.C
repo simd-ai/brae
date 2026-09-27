@@ -307,6 +307,40 @@ int main(int argc, char *argv[])
         forAll(pf, i) pf[i] = scalar(start + i);
     }
 
+    // ...AND A SURFACE VECTOR, which is the one surface path this gate did not cover and the one Uf takes.
+    // It matters because the two surface branches are different code: a surface SCALAR's hull average sums
+    // one component, a surface VECTOR's sums three, and an UNORIENTED field is not negated on a flipped
+    // face. Uf is unoriented (a velocity, not a flux), so `oriented` is left off here.
+    //
+    // WHY IT WAS ADDED: the restart profile of tests/interfoam_amr_levels_vs_openfoam.sh reads alpha exactly
+    // and Uf 2.3274e-10 relative -- 16x what the same case reads with the change switched off -- and that
+    // residual is diffuse over about a thousand faces. Every other adaptive fixture's FIRST change happens
+    // from rest, where a surface field is zero and a refined cell's hull average is exactly 0 in both codes,
+    // so none of them can see this path at all. This field is how the MAP is told from the rebuild.
+    //
+    // Set to the face index times (1, 2, 3), so every component differs and a mapper that carried the wrong
+    // component, or summed the three in the wrong order, reads here.
+    surfaceVectorField passiveUf
+    (
+        IOobject("braeUf", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+        mesh,
+        dimensionedVector(dimVelocity, Foam::zero{}),
+        fvsPatchFieldBase::calculatedType()
+    );
+    forAll(passiveUf, facei)
+    {
+        passiveUf[facei] = vector(scalar(facei), scalar(2*facei), scalar(3*facei));
+    }
+    forAll(passiveUf.boundaryFieldRef(), patchi)
+    {
+        fvsPatchVectorField& pf = passiveUf.boundaryFieldRef()[patchi];
+        const label start = mesh.boundaryMesh()[patchi].start();
+        forAll(pf, i)
+        {
+            pf[i] = vector(scalar(start + i), scalar(2*(start + i)), scalar(3*(start + i)));
+        }
+    }
+
     // the velocity the flux correction interpolates, where the dictionary names one
     volVectorField passiveU
     (
@@ -495,6 +529,23 @@ int main(int argc, char *argv[])
             const fvsPatchScalarField& pf = passivePhiFlat.boundaryField()[patchi];
             os << "  " << pf.size();
             forAll(pf, i) os << ' ' << pf[i];
+            os << nl;
+        }
+        // ...AND THE SURFACE VECTOR, internal faces and each patch, as OpenFOAM's own mapping left it
+        os << "braeUf " << passiveUf.size();
+        forAll(passiveUf, facei)
+        {
+            os << ' ' << passiveUf[facei].x() << ' ' << passiveUf[facei].y() << ' ' << passiveUf[facei].z();
+        }
+        os << nl;
+        os << "braeUfBnd " << passiveUf.boundaryField().size() << nl;
+        forAll(passiveUf.boundaryField(), patchi)
+        {
+            const fvsPatchVectorField& pf = passiveUf.boundaryField()[patchi];
+            // 3*size, which is this dump's convention for a per-patch VECTOR block (see caseUBnd): the
+            // reader's count is the number of SCALARS, so it needs no per-key special case.
+            os << "  " << 3*pf.size();
+            forAll(pf, i) os << ' ' << pf[i].x() << ' ' << pf[i].y() << ' ' << pf[i].z();
             os << nl;
         }
         os << "braePhiBnd " << passivePhi.boundaryField().size() << nl;
