@@ -838,8 +838,19 @@ InterFields buildInterFields(const std::string&          caseDir,
 
         // createDyMControls.H: `correctPhi` defaults to mesh.dynamic(), the other two to false
         auto switchOr = [&](const char* key, bool def) { return pim->switchOr(key, def); };
-        f.dynamicMesh = DynamicMotionSolverFvMesh::New(caseDir, startDir);
-        const bool dynamic = f.dynamicMesh != nullptr;
+        // AN ADAPTIVE MESH IS NOT A MOVING ONE, and the motion factory REFUSES it by name -- rightly, for
+        // every driver that cannot carry a topology change. interFoam can (inter_amr_cpp.cuh), so the
+        // dictionary is read here first and the factory is only asked about the cases it is the authority
+        // for. A driver without this branch still gets the refusal, which is what keeps the capability
+        // honest: see the note on shared capability notices in the project's own history.
+        const std::string dmd = caseDir + "/constant/dynamicMeshDict";
+        const bool adaptive = std::filesystem::exists(dmd)
+                           && readDict(dmd).wordOr("dynamicFvMesh", "") == "dynamicRefineFvMesh";
+        f.dynamicMesh = adaptive ? nullptr : DynamicMotionSolverFvMesh::New(caseDir, startDir);
+        // `dynamic` is OpenFOAM's mesh.dynamic(): moving OR topo-changing. It is what correctPhi defaults
+        // to, and a REFINING mesh is dynamic -- measured on damBreakWithObstacle, where OpenFOAM writes a
+        // Uf and an rAU beside every time directory and solves pcorr at every step.
+        const bool dynamic = (f.dynamicMesh != nullptr) || adaptive;
         f.correctPhi = switchOr("correctPhi", dynamic);
         f.checkMeshCourantNo = switchOr("checkMeshCourantNo", false);
         f.moveMeshOuterCorrectors = switchOr("moveMeshOuterCorrectors", false);

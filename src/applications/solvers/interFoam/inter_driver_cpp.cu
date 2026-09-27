@@ -2,6 +2,7 @@
 // the four old-time fields that are its actual content.
 #include <filesystem>
 #include "inter_driver_cpp.cuh"
+#include "inter_amr_cpp.cuh"
 #include "inter_correct_phi_cpp.cuh"
 #include "inter_solve_cpp.cuh"
 #include "inter_peqn_cpp.cuh"
@@ -393,6 +394,25 @@ RunReport runInterFoam(
 
     // A MESH THAT MOVES is attached to the caller's mutable objects -- the ones the fields were just
     // built against, checked by address -- and moved in place at every mesh update below.
+    // AN ADAPTIVE MESH, built against the same objects the fields were: its own copy of the mesh is what
+    // refineUpdate advances, and the caller's mutable mesh is what every field and patch reads.
+    if (!f.amr)
+    {
+        f.amr = std::make_shared<InterAmr>(readInterAmr(caseDir, m, patches, g));
+    }
+    if (verbose)
+    {
+        std::printf("  adaptive mesh: %s\n", f.amr->active ? "yes" : "no");
+    }
+    if (f.amr->active && !mutableMesh)
+    {
+        throw std::runtime_error(
+            "brae interFoam: the case asks for `dynamicFvMesh dynamicRefineFvMesh` and the driver was "
+            "handed no mutable mesh. A refinement replaces the mesh, its geometry and its patches, and "
+            "every field and patch field reads those -- running it on a copy they cannot see would solve a "
+            "different problem at every step.");
+    }
+
     DynamicMotionSolverFvMesh* dyn = f.dynamicMesh.get();
     if (dyn)
     {
@@ -737,6 +757,43 @@ RunReport runInterFoam(
                     interMeshUpdate(dyn, f, m, g, patches, mutableMesh, amiPairs, gamgCache, cpc,
                                     rep, rep.time, rep.steps, outerOfStep, lc.nOuterCorrectors,
                                     cnDdt ? &cnClock : nullptr);
+                    // ...and the ADAPTIVE mesh, which is the same line of interFoam.C for a different
+                    // dynamicFvMesh: mesh.update() selects, refines, unrefines and maps, and everything
+                    // the solver rebuilds afterwards is what `changed` gates. Only on the FIRST outer
+                    // corrector unless the case asks otherwise, exactly as the motion branch is.
+                    // outerOfStep is ZERO on the first corrector of a step: it starts at -1 and is reset
+                    // to -1 at advanceTime, and this stage increments it. Comparing it against 1 ran the
+                    // adaptive branch on no corrector at all -- the case ran to completion, printed
+                    // nothing, and refined nothing.
+                    if (f.amr && f.amr->active
+                     && (outerOfStep == 0 || f.moveMeshOuterCorrectors))
+                    {
+                        // the old-time levels the ddt terms read, which OpenFOAM maps as registered
+                        // fields and brae keeps as locals of this loop -- see InterAmrOldTime
+                        InterAmrOldTime oldT;
+                        oldT.alphaOld = &alphaOld;
+                        oldT.UOld = &UOld;
+                        oldT.UOldBnd = &UOldBnd;
+                        oldT.rhoOld = &rhoOld;
+                        oldT.UOO = &UOO;
+                        oldT.UOOBnd = &UOOBnd;
+                        oldT.rhoOO = &rhoOO;
+                        oldT.phiOld = &phiOld;
+                        const bool changed =
+                            interAmrUpdate(*f.amr, f, *mutableMesh, rep.steps, oldT);
+                        if (changed)
+                        {
+                            interAfterMeshChange(f, *mutableMesh, gamgCache, rep);
+                        }
+                        // OpenFOAM prints "Refined from N to M cells." at every change; this is the same
+                        // line, and a run that silently refines nothing is what it exists to show.
+                        if (verbose)
+                        {
+                            std::printf("    mesh: %d cells refined, %d split points unrefined, "
+                                        "now %d cells\n", (int)f.amr->nRefined, (int)f.amr->nUnrefined,
+                                        (int)mutableMesh->m->nCells());
+                        }
+                    }
                     break;
                 }
 

@@ -74,16 +74,49 @@ InterAmr readInterAmr(
     const std::vector<FvPatch>& patches,
     const FvGeometry&           g);
 
+// THE OLD-TIME LEVELS, which are NOT in InterFields: the driver keeps them as locals of its time loop, and
+// OpenFOAM keeps them as REGISTERED FIELDS -- which is why its own output carries `alpha.water_0` and
+// `U_0` beside every time directory. They are MAPPED, never re-captured: re-capturing them from the new
+// field would make every ddt zero on the step that refined.
+//
+// MEASURED, and it is how this struct came to exist: without them the first refinement of
+// damBreakWithObstacle ran to "UEqn: ddt field lengths disagree" -- 42,266 cells against old-time levels
+// still 32,256 long.
+struct InterAmrOldTime
+{
+    std::vector<scalar>*                    alphaOld = nullptr;
+    std::vector<vector>*                    UOld     = nullptr;
+    std::vector<std::vector<vector>>*       UOldBnd  = nullptr;
+    std::vector<scalar>*                    rhoOld   = nullptr;
+    std::vector<vector>*                    UOO      = nullptr;
+    std::vector<std::vector<vector>>*       UOOBnd   = nullptr;
+    std::vector<scalar>*                    rhoOO    = nullptr;
+    SurfaceScalarField*                     phiOld   = nullptr;
+};
+
 // One mesh.update() for an adaptive mesh, at the top of an outer corrector. Returns true when the mesh
 // changed -- which is what interFoam.C branches on to rebuild gh, the MRF and the mixture.
 //
 // The mesh, its geometry and its patches are updated THROUGH `mm`: the patch objects are assigned in
 // place, because every patch field holds a reference into that vector (see updatePatchesInPlace).
 bool interAmrUpdate(
-    InterAmr&           amr,
+    InterAmr&              amr,
+    InterFields&           f,
+    const MutableMesh&     mm,
+    label                  timeIndex,
+    const InterAmrOldTime& old = InterAmrOldTime{});
+
+// interFoam.C:139-147: what the solver rebuilds once the mesh HAS changed, which is everything the
+// inventory calls RECOMPUTED. Every one of these ASSIGNS its result rather than writing into a vector at
+// the old size -- which is what the mesh change makes load-bearing, because the old size is wrong now.
+//
+// The GAMG agglomeration is CLEARED here and not rebuilt: it is keyed on the mesh it was built for, and a
+// refined mesh is a different one. Keeping it would solve the pressure equation on the old coarse levels.
+void interAfterMeshChange(
     InterFields&        f,
     const MutableMesh&  mm,
-    label               timeIndex);
+    GamgAgglomerationCache& gamgCache,
+    RunReport&          rep);
 
 } // namespace interFoam
 } // namespace cpu

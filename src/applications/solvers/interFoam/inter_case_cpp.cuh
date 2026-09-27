@@ -194,6 +194,13 @@ struct InterFields
     // and calls update() where interFoam.C:120 calls mesh.update(). Shared, because InterFields is
     // copied by value into a gate's `fieldsOut`.
     std::shared_ptr<DynamicMotionSolverFvMesh> dynamicMesh;
+    // constant/dynamicMeshDict naming `dynamicRefineFvMesh`: adaptive refinement, whose state (the mesh,
+    // the levels, the history and the protected cells) lives here for the same reason the motion solver
+    // does -- the driver's mesh-update stage owns it and InterFields is copied by value into a gate's
+    // `fieldsOut`. Null on every case that does not ask for it, which is all but three of the tutorials.
+    // The type is opaque here (inter_amr_cpp.cuh has it) so that this header does not pull the dynamic
+    // mesh in.
+    std::shared_ptr<struct InterAmr> amr;
     // createMRF.H: every ACTIVE zone of constant/MRFProperties, resolved against the mesh. Empty is a
     // case without MRF. UEqn.H and pEqn.H reach it in four places -- see inter_ueqn_cpp.cuh and
     // inter_peqn_cpp.cuh.

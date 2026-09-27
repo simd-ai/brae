@@ -90,10 +90,11 @@ InterAmr readInterAmr(
 }
 
 bool interAmrUpdate(
-    InterAmr&           amr,
-    InterFields&        f,
-    const MutableMesh&  mm,
-    label               timeIndex)
+    InterAmr&              amr,
+    InterFields&           f,
+    const MutableMesh&     mm,
+    label                  timeIndex,
+    const InterAmrOldTime& old)
 {
     if (!amr.active) return false;
     if (!mm.m || !mm.g || !mm.patches)
@@ -146,13 +147,48 @@ bool interAmrUpdate(
     const bool carryRAU = !f.rAU.empty();
     if (carryRAU) amr.state.cellScalars.push_back(f.rAU);
 
+    // THE OLD-TIME LEVELS, mapped like any other field. The cell ones go through the cell mapper; the
+    // per-patch value lists go through the patch mapping, which is what a patch field's own autoMap uses
+    // -- they are the same numbers without the object around them.
+    const std::size_t scalarsBefore = amr.state.cellScalars.size();
+    const std::size_t vectorsBefore = amr.state.cellVectors.size();
+    if (old.alphaOld) amr.state.cellScalars.push_back(*old.alphaOld);
+    if (old.rhoOld)   amr.state.cellScalars.push_back(*old.rhoOld);
+    if (old.rhoOO)    amr.state.cellScalars.push_back(*old.rhoOO);
+    if (old.UOld)     amr.state.cellVectors.push_back(*old.UOld);
+    if (old.UOO)      amr.state.cellVectors.push_back(*old.UOO);
+    const bool carryPhiOld = old.phiOld != nullptr;
+    if (carryPhiOld)
+    {
+        dynamicRefine::RefineUpdateState::CarriedSurfaceField c;
+        c.field = old.phiOld->internal;
+        c.bnd = old.phiOld->boundary;
+        c.oriented = true;                    // phi.oldTime() is a flux like phi
+        amr.state.surfaceScalars.push_back(std::move(c));
+        amr.state.surfaceScalarVelocity.push_back(std::string());
+    }
+    // ...and U's old-time PATCH values, which ddtCorr's boundary half reads. They are boundary lists
+    // without a surface field around them, so they ride in as surface VECTORS whose internal half is
+    // empty: the patch mapping is the same addressing either way, and leaving them unmapped left ddtCorr
+    // reading the OLD patch sizes.
+    const std::size_t surfVecBefore = amr.state.surfaceVectors.size();
+    const auto pushBoundaryOnly = [&](const std::vector<std::vector<vector>>& b)
+    {
+        dynamicRefine::RefineUpdateState::CarriedSurfaceVectorField c;
+        c.bnd = b;
+        c.oriented = false;
+        amr.state.surfaceVectors.push_back(std::move(c));
+    };
+    if (old.UOldBnd) pushBoundaryOnly(*old.UOldBnd);
+    if (old.UOOBnd)  pushBoundaryOnly(*old.UOOBnd);
+
     const dynamicRefine::RefineUpdateStep step =
         dynamicRefine::refineUpdate(amr.state, amr.controls, f.alpha1.internal, timeIndex);
     amr.nRefined = static_cast<label>(step.cellsToRefine.size());
     amr.nUnrefined = static_cast<label>(step.pointsToUnrefine.size());
     if (!step.hasChanged) return false;
 
-    if (amr.state.surfaceScalars.size() != 3)
+    if (amr.state.surfaceScalars.size() != (carryPhiOld ? 4u : 3u))
         throw std::runtime_error(
             std::string(WHO) + "the change carried " + std::to_string(amr.state.surfaceScalars.size())
             + " surface scalars where three went in (phi, rhoPhi, nHatf). Reading them back by index "
@@ -171,6 +207,23 @@ bool interAmrUpdate(
         f.Uf.boundary = amr.state.surfaceVectors[0].bnd;
     }
     if (carryRAU) f.rAU = amr.state.cellScalars.at(0);
+    {
+        std::size_t si = scalarsBefore;
+        std::size_t vi = vectorsBefore;
+        if (old.alphaOld) *old.alphaOld = amr.state.cellScalars.at(si++);
+        if (old.rhoOld)   *old.rhoOld   = amr.state.cellScalars.at(si++);
+        if (old.rhoOO)    *old.rhoOO    = amr.state.cellScalars.at(si++);
+        if (old.UOld)     *old.UOld     = amr.state.cellVectors.at(vi++);
+        if (old.UOO)      *old.UOO      = amr.state.cellVectors.at(vi++);
+        if (carryPhiOld)
+        {
+            old.phiOld->internal = amr.state.surfaceScalars.at(3).field;
+            old.phiOld->boundary = amr.state.surfaceScalars.at(3).bnd;
+        }
+        std::size_t bi = surfVecBefore;
+        if (old.UOldBnd) *old.UOldBnd = amr.state.surfaceVectors.at(bi++).bnd;
+        if (old.UOOBnd)  *old.UOOBnd  = amr.state.surfaceVectors.at(bi++).bnd;
+    }
 
     // ...and the mesh the caller's fields reference. The patches are assigned IN PLACE by the driver, so
     // `*mm.patches` is already the new one; the mesh and geometry are copied into the caller's objects for
@@ -185,6 +238,56 @@ bool interAmrUpdate(
     //   and the curvature -- from the mapped alpha1.
     // The driver's own post-change stage does that work; this returns `true` so it runs.
     return true;
+}
+
+void interAfterMeshChange(
+    InterFields&            f,
+    const MutableMesh&      mm,
+    GamgAgglomerationCache& gamgCache,
+    RunReport&              rep)
+{
+    const PrimitiveMesh& m = *mm.m;
+    const FvGeometry& g = *mm.g;
+    const std::vector<FvPatch>& patches = *mm.patches;
+    const std::size_t nC = static_cast<std::size_t>(m.nCells());
+
+    // the agglomeration was built for the old mesh
+    gamgCache = GamgAgglomerationCache{};
+
+    // gh and ghf off the NEW centres (interFoam.C:130-131), assigned rather than written into
+    ghField(f.g, f.ghRefValue, g.C(), f.gh);
+    {
+        std::vector<vector> Cf(g.Cf().begin(), g.Cf().begin() + m.nInternalFaces());
+        ghField(f.g, f.ghRefValue, Cf, f.ghfInternal);
+        f.ghfBoundary.assign(patches.size(), std::vector<scalar>());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const FvPatch& q = patches[pi];
+            std::vector<vector> bCf(g.Cf().begin() + q.start, g.Cf().begin() + q.start + q.size);
+            ghField(f.g, f.ghRefValue, bCf, f.ghfBoundary[pi]);
+        }
+    }
+
+    // the mixture from the MAPPED alpha1 (mixture.correct()), every one of these assigning its own result
+    f.alpha2.assign(nC, scalar(0));
+    for (std::size_t c = 0; c < nC; ++c) f.alpha2[c] = scalar(1) - f.alpha1.internal[c];
+    cpu::twoPhase::mixtureRho(f.alpha1.internal, f.alpha2, f.mixture.phases, f.rho);
+    cpu::twoPhase::mixtureMu(f.alpha1.internal, f.mixture.phases, f.mu);
+    cpu::twoPhase::mixtureNu(f.alpha1.internal, f.mu, f.mixture.phases, f.nu);
+    updateMixtureBoundary(f, patches);
+
+    // p = p_rgh + rho*gh (createFields.H:88), on the new mesh
+    f.p.assign(nC, scalar(0));
+    for (std::size_t c = 0; c < nC; ++c)
+    {
+        f.p[c] = f.p_rgh.internal[c] + f.rho[c]*f.gh[c];
+    }
+
+    // ...and the interface: nHatf and K are mapped, and then rebuilt on the new geometry, which is what
+    // mixture.correct() does last
+    interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, f.nHatf, f.K);
+
+    (void)rep;
 }
 
 } // namespace interFoam
