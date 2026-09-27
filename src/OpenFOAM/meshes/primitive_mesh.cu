@@ -224,9 +224,16 @@ static std::vector<label> readLabelColumn(const std::string& path)
     return v;
 }
 
-static std::vector<label> readLabelFile(const std::string& path)
+// ...and the same two branches, EXPORTED, because cellLevel and pointLevel need them too and a second copy
+// of a format switch is how the cellZones reader came to be ASCII-only on a binary mesh.
+std::vector<label> readLabelListFile(const std::string& path)
 {
     return (foamFormat(path) == "binary") ? readBinaryLabelList(path) : readLabelColumn(path);
+}
+
+static std::vector<label> readLabelFile(const std::string& path)
+{
+    return readLabelListFile(path);
 }
 
 void PrimitiveMesh::readOwner(const std::string& dir)     { owner_     = readLabelFile(dir + "/owner"); }

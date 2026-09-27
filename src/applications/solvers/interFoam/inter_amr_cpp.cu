@@ -234,9 +234,38 @@ InterAmr readInterAmr(
     // what refinementHistory's own constructor leaves (see the note in hex_ref8_cpp.cuh).
     amr.state.m = m;
     amr.state.patches = patches;
+    // THE REFINEMENT STATE STARTS AT ZERO, which is OpenFOAM's own fallback and not a placeholder:
+    // cellLevel and pointLevel are READ_IF_PRESENT with `labelList(n, Zero)` behind them, and a history
+    // with no file is still ACTIVE with every cell visible and no parents (hexRef8.C:1908-1990). Every
+    // blockMesh case takes exactly this path.
     amr.state.levels.cellLevel.assign(static_cast<std::size_t>(m.nCells()), label(0));
     amr.state.levels.pointLevel.assign(static_cast<std::size_t>(m.nPoints()), label(0));
     amr.state.history = cpu::hexRef8::freshHistory(m.nCells());
+    // ...AND THEN OFF DISK, where the mesh carries it. A snappyHexMesh mesh is at levels 1 to 3 and a
+    // resumed refined one at whatever it reached, and `cellLevel[celli] < maxRefinement`
+    // (dynamicRefineFvMesh.C:861) means something different in the two codes until this is read. brae looks
+    // in constant/polyMesh because that is where it reads the mesh from; OpenFOAM looks in
+    // mesh_.facesInstance(), which for a latestTime restart is the time directory -- an instance resolution
+    // brae does not have, and one this does not pretend to.
+    {
+        const bool blind = std::getenv("BRAE_CONTROL_AMR_NO_LEVELS") != nullptr;
+        if (blind)
+        {
+            // A GATE'S CONTROL, and the strongest kind: it restores exactly what brae SHIPPED before this
+            // unit -- level 0 everywhere, whatever the files say -- which is also what OpenFOAM does when
+            // they are absent. So the control is a real port rather than an invented one.
+            std::printf("  *** CONTROL MODE: the mesh's cellLevel, pointLevel and refinementHistory are NOT "
+                        "read; every cell is taken as level 0. This run is deliberately wrong. ***\n");
+        }
+        else if (cpu::hexRef8::readRefinementState(caseDir + "/constant/polyMesh", m.nCells(), m.nPoints(),
+                                                   amr.state.levels, amr.state.history))
+        {
+            label mx = 0;
+            for (const label l : amr.state.levels.cellLevel) mx = (l > mx) ? l : mx;
+            std::printf("  the mesh carries a refinement state: cellLevel up to %ld, %zu split cell(s) in "
+                        "its history\n", (long)mx, amr.state.history.parent.size());
+        }
+    }
     const std::vector<std::vector<label>> cells = meshCells(m);
     const std::vector<std::vector<label>> pointCells = pointCellsFromCells(m, cells);
     // THE ZONES THE MESH CARRIES, counted from the polyMesh directory -- the only place they exist, since

@@ -228,6 +228,35 @@ struct History
 // and its own top-level split entry, and `active` true for any non-empty mesh.
 History freshHistory(label nCells);
 
+// THE REFINEMENT STATE OFF DISK, which is what a mesh that is ALREADY REFINED carries and what brae assumed
+// away. OpenFOAM reads it in hexRef8's constructor (hexRef8.C:1908-1990) and the exact terms matter:
+//
+//   cellLevel   labelList from mesh_.facesInstance()/polyMesh, READ_IF_PRESENT, fallback
+//               labelList(nCells, Zero)                                      (:1912-1925)
+//   pointLevel  the same, fallback labelList(nPoints, Zero)                  (:1926-1937)
+//   refinementHistory  READ_IF_PRESENT via typeHeaderOk, and then a FATAL check that
+//               visibleCells().size() == nCells                              (:1953-1990)
+//
+// SO ALL-ZEROS IS NOT A PLACEHOLDER -- it is OpenFOAM's own answer when the files are absent, which is the
+// case for every blockMesh. What was missing is the branch where they are PRESENT: a snappyHexMesh mesh
+// carries levels 1 to 3, and `cellLevel[celli] < maxRefinement` (dynamicRefineFvMesh.C:861) then means
+// something different in the two codes.
+//
+// level0Edge IS DELIBERATELY NOT READ. It is READ_IF_PRESENT with a computed fallback (hexRef8.C:1939-1951)
+// and hexRef8 uses level0EdgeLength() in exactly ONE place -- consistentSlowRefinement2 (:2784) -- which
+// dynamicRefineFvMesh never calls: it calls consistentRefinement (dynamicRefineFvMesh.C:895) and rolls its
+// own buffer layers (:1415). Every other caller is snappyHexMesh. Reading it would be work that no decision
+// of this solver's consumes.
+//
+// Returns false when NO file was found (so the caller keeps its zero-filled state and knows it did), true
+// when at least one was read. Throws by name on a file that is present and inconsistent with the mesh.
+bool readRefinementState(
+    const std::string& polyMeshDir,
+    label              nCells,
+    label              nPoints,
+    Levels&            levels,
+    History&           history);
+
 // refinementHistory::resize (:1043-1060): grow visibleCells, the new entries NOT visible.
 void resizeHistory(
     History& h,

@@ -2,8 +2,12 @@
 #include "hex_ref8_cpp.cuh"
 
 #include "foam_dict.cuh"   // isCoupledInterfaceType
+#include "foam_token_reader.cuh"   // readLabelListFile, foamFormat: the refinement state off disk
 
 #include <algorithm>
+#include <cctype>
+#include <fstream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <utility>
@@ -1090,6 +1094,217 @@ History freshHistory(label nCells)
     // unrefined mesh still carries a live history
     h.active = (nCells > 0);
     return h;
+}
+
+
+namespace {
+
+// The splitCells list of a refinementHistory file: `N ( parent nChildren(children...) ... )`, one entry per
+// split cell, with `0()` for a leaf. splitCell8's own operator>> is `is >> sc.parent_ >> addedCells` and a
+// null child pointer when the list is empty (refinementHistory.C:204-215), so an empty vector here is that
+// null rather than a zero-length array.
+void readSplitCells(
+    const std::string&                text,
+    std::size_t&                      i,
+    std::vector<label>&               parent,
+    std::vector<std::vector<label>>&  addedCells)
+{
+    const auto skipSpace = [&]()
+    {
+        while (i < text.size() && (std::isspace(static_cast<unsigned char>(text[i])) || text[i] == '/'))
+        {
+            if (text[i] == '/')
+            {
+                // a `// splitCells` marker line
+                while (i < text.size() && text[i] != '\n') ++i;
+            }
+            else
+            {
+                ++i;
+            }
+        }
+    };
+    const auto nextLong = [&]() -> long
+    {
+        skipSpace();
+        while (i < text.size() && (text[i] == '(' || text[i] == ')')) { ++i; skipSpace(); }
+        const std::size_t b = i;
+        while (i < text.size() && (std::isdigit(static_cast<unsigned char>(text[i])) || text[i] == '-')) ++i;
+        if (i == b)
+        {
+            throw std::runtime_error(
+                "brae refinementHistory: expected a number in the splitCells list at offset "
+                + std::to_string(b));
+        }
+        return std::stol(text.substr(b, i - b));
+    };
+
+    const long n = nextLong();
+    if (n < 0)
+    {
+        throw std::runtime_error("brae refinementHistory: negative splitCells count " + std::to_string(n));
+    }
+    parent.resize(static_cast<std::size_t>(n));
+    addedCells.assign(static_cast<std::size_t>(n), std::vector<label>());
+    for (long e = 0; e < n; ++e)
+    {
+        parent[static_cast<std::size_t>(e)] = static_cast<label>(nextLong());
+        const long k = nextLong();
+        if (k != 0 && k != 8)
+        {
+            throw std::runtime_error(
+                "brae refinementHistory: splitCell " + std::to_string(e) + " has " + std::to_string(k)
+                + " children. hexRef8 splits a cell into EIGHT and a leaf carries none, so any other count "
+                "is a file this reader does not understand (refinementHistory.H:110-135).");
+        }
+        std::vector<label>& kids = addedCells[static_cast<std::size_t>(e)];
+        kids.resize(static_cast<std::size_t>(k));
+        for (long c = 0; c < k; ++c) kids[static_cast<std::size_t>(c)] = static_cast<label>(nextLong());
+    }
+}
+
+} // namespace
+
+
+bool readRefinementState(
+    const std::string& polyMeshDir,
+    label              nCells,
+    label              nPoints,
+    Levels&            levels,
+    History&           history)
+{
+    const std::string dir = polyMeshDir.empty() ? std::string() : (polyMeshDir + "/");
+    bool any = false;
+
+    // READ_IF_PRESENT, twice, and the ABSENT case leaves the caller's zero-filled state alone: that is
+    // OpenFOAM's `labelList(nCells, Zero)` fallback and not a gap.
+    const auto exists = [](const std::string& path)
+    {
+        std::ifstream probe(path);
+        return probe.good();
+    };
+    if (exists(dir + "cellLevel"))
+    {
+        std::vector<label> v = readLabelListFile(dir + "cellLevel");
+        if (static_cast<label>(v.size()) != nCells)
+        {
+            throw std::runtime_error(
+                "brae hexRef8: " + dir + "cellLevel holds " + std::to_string(v.size())
+                + " entries and the mesh has " + std::to_string(nCells) + " cells. A level list that is not "
+                "the mesh's is read per cell by the refinement cap and the 2:1 constraint.");
+        }
+        levels.cellLevel = std::move(v);
+        any = true;
+    }
+    if (exists(dir + "pointLevel"))
+    {
+        std::vector<label> v = readLabelListFile(dir + "pointLevel");
+        if (static_cast<label>(v.size()) != nPoints)
+        {
+            throw std::runtime_error(
+                "brae hexRef8: " + dir + "pointLevel holds " + std::to_string(v.size())
+                + " entries and the mesh has " + std::to_string(nPoints) + " points. It is read per point by "
+                "the protected-cell test (dynamicRefineFvMesh.C:1055).");
+        }
+        levels.pointLevel = std::move(v);
+        any = true;
+    }
+
+    // ...AND THE HISTORY, whose absence is not the same as an empty one: with no file OpenFOAM still builds
+    // an ACTIVE history with every cell visible and no parents (the caller's freshHistory), so cells refined
+    // during the run can be unrefined and the mesh's original cells cannot. motorBike's Allrun.pre DELETES
+    // the file snappyHexMesh wrote for exactly that reason -- it makes snappy's own refinement permanent.
+    if (exists(dir + "refinementHistory"))
+    {
+        std::ifstream in(dir + "refinementHistory");
+        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (foamFormat(dir + "refinementHistory") == "binary")
+        {
+            throw std::runtime_error(
+                "brae hexRef8: " + dir + "refinementHistory is in BINARY format, which this reader does not "
+                "parse. Its splitCells entries are a compound (parent, FixedList<label,8>) whose binary "
+                "layout is not the flat blob readBinaryLabelList handles. Refused rather than mis-read.");
+        }
+        std::size_t i = text.find('}');                 // past the FoamFile block
+        i = (i == std::string::npos) ? 0 : i + 1;
+        readSplitCells(text, i, history.parent, history.addedCells);
+        const std::size_t vis = text.find("// visibleCells", i);
+        if (vis == std::string::npos)
+        {
+            throw std::runtime_error(
+                "brae hexRef8: " + dir + "refinementHistory has a splitCells list and no visibleCells list. "
+                "operator>> reads both (refinementHistory.C:1724-1735).");
+        }
+        // the visibleCells list is a plain labelList: skip the marker line, then count then values
+        {
+            std::size_t j = vis;
+            while (j < text.size() && text[j] != '\n') ++j;
+            const auto nextLong = [&]() -> long
+            {
+                while (j < text.size()
+                       && !(std::isdigit(static_cast<unsigned char>(text[j])) || text[j] == '-'))
+                {
+                    ++j;
+                }
+                const std::size_t b0 = j;
+                while (j < text.size()
+                       && (std::isdigit(static_cast<unsigned char>(text[j])) || text[j] == '-'))
+                {
+                    ++j;
+                }
+                if (j == b0)
+                {
+                    throw std::runtime_error(
+                        "brae refinementHistory: the visibleCells list ended early at offset "
+                        + std::to_string(b0));
+                }
+                return std::stol(text.substr(b0, j - b0));
+            };
+            const long n = nextLong();
+            if (n != static_cast<long>(nCells))
+            {
+                throw std::runtime_error(
+                    "brae hexRef8: " + dir + "refinementHistory has " + std::to_string(n)
+                    + " visibleCells and the mesh has " + std::to_string(nCells)
+                    + " cells. OpenFOAM stops on this too (hexRef8.C:1982-1990).");
+            }
+            history.visibleCells.resize(static_cast<std::size_t>(n));
+            for (long c = 0; c < n; ++c)
+            {
+                history.visibleCells[static_cast<std::size_t>(c)] = static_cast<label>(nextLong());
+            }
+        }
+        // THE FREE LIST IS EMPTY AFTER A READ, and that is the file's own invariant rather than an omission:
+        // operator>> calls freeSplitCells_.clearStorage() (refinementHistory.C:1726) and operator<< calls
+        // compact() before writing (:1739), so a written history has no holes to free.
+        history.freeSplitCells.clear();
+        history.active = (nCells > 0);
+        // refinementHistory::checkIndices' own consistency, transcribed: every visible cell names a split
+        // cell that exists, and every parent index is in range.
+        for (std::size_t c = 0; c < history.visibleCells.size(); ++c)
+        {
+            const label sc = history.visibleCells[c];
+            if (sc >= static_cast<label>(history.parent.size()))
+            {
+                throw std::runtime_error(
+                    "brae hexRef8: cell " + std::to_string(c) + " is visible through split cell "
+                    + std::to_string(sc) + " and the file holds only "
+                    + std::to_string(history.parent.size()) + " of them.");
+            }
+        }
+        for (const label pr : history.parent)
+        {
+            if (pr >= static_cast<label>(history.parent.size()))
+            {
+                throw std::runtime_error(
+                    "brae hexRef8: a splitCell names parent " + std::to_string(pr) + " and the file holds "
+                    + std::to_string(history.parent.size()) + " split cells.");
+            }
+        }
+        any = true;
+    }
+
+    return any;
 }
 
 
