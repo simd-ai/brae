@@ -1928,10 +1928,17 @@ void mapCarriedFields(
     const CellMapping cm = cellMapping(map, nNewCells, oldCellVolumes);
     for (std::vector<scalar>& f : s.cellScalars) f = mapCellField(f, cm);
     for (std::vector<vector>& f : s.cellVectors) f = mapCellField(f, cm);
+    // the whole fields' cell halves, mapped BEFORE their patch fields -- which is OpenFOAM's order
+    // (MapGeometricFields maps the internal field, then the boundary) and load-bearing, because a patch
+    // field's unmapped faces are filled from the internal field it reads here
+    for (GeometricField<scalar>* f : s.carriedScalarFields) f->internal = mapCellField(f->internal, cm);
+    for (GeometricField<vector>* f : s.carriedVectorFields) f->internal = mapCellField(f->internal, cm);
 
     // ...and every carried surface field, through the face mapper sliced to the internal faces and to
     // each patch. The new mesh is already in place when this runs, which is what gives the patch starts.
-    if (!s.surfaceScalars.empty())
+    // the face mapping serves BOTH the carried patch fields (unit 8a) and the carried surface fields
+    // (7b-2), so it is built whenever there is either
+    if (!s.surfaceScalars.empty() || !s.carriedScalarFields.empty() || !s.carriedVectorFields.empty())
     {
         const FaceMapping fm = faceMapping(map, s.m.nFaces());
         const FaceMapping sm = surfaceMapping(fm, s.m.nInternalFaces(), nOldInternalFaces);
@@ -1974,7 +1981,45 @@ void mapCarriedFields(
                                 gNew.magSf().begin() + patches[pi].start + patches[pi].size);
         }
 
-        // STEP ONE: the addressing, and the flip on an oriented field.
+        // UNIT 8a: whole fields, cells and patch fields together. The cell half went through the cell
+        // mapper above; here each patch field is mapped by its OWN autoMap, which is what fills an
+        // unmapped face from the internal field and what maps the type's own state.
+        for (GeometricField<scalar>* f : s.carriedScalarFields)
+        {
+            if (f->boundary.size() != patches.size())
+                throw std::runtime_error(
+                    "brae dynamicRefineFvMesh: a carried field has " + std::to_string(f->boundary.size())
+                    + " patch fields and the mesh " + std::to_string(patches.size()) + " patches. A "
+                    "change that alters the patch count would leave every patch field reading another "
+                    "patch's data.");
+            for (std::size_t p = 0; p < patches.size(); ++p)
+            {
+                if (!f->boundary[p]->autoMapComplete())
+                    throw std::runtime_error(
+                        "brae dynamicRefineFvMesh: patch `" + patches[p].name + "` of a carried scalar "
+                        "field has no autoMap yet, so a mesh change would leave its per-face state stale "
+                        "or short. Ported types are named in fv_patch_field.cuh; this one is not one.");
+                f->boundary[p]->autoMap(pm[p], f->internal);
+            }
+        }
+        for (GeometricField<vector>* f : s.carriedVectorFields)
+        {
+            if (f->boundary.size() != patches.size())
+                throw std::runtime_error(
+                    "brae dynamicRefineFvMesh: a carried vector field has "
+                    + std::to_string(f->boundary.size()) + " patch fields and the mesh "
+                    + std::to_string(patches.size()) + " patches.");
+            for (std::size_t p = 0; p < patches.size(); ++p)
+            {
+                if (!f->boundary[p]->autoMapComplete())
+                    throw std::runtime_error(
+                        "brae dynamicRefineFvMesh: patch `" + patches[p].name + "` of a carried vector "
+                        "field has no autoMap yet.");
+                f->boundary[p]->autoMap(pm[p], f->internal);
+            }
+        }
+
+        // STEP ONE for the surface fields: the addressing, and the flip on an oriented one.
         for (RefineUpdateState::CarriedSurfaceField& f : s.surfaceScalars)
         {
             f.field = mapSurfaceField(f.field, sm, f.oriented, map.flipFaceFlux);
@@ -2044,6 +2089,28 @@ void mapCarriedFields(
     }
 }
 
+
+// THE PATCH OBJECTS ARE ASSIGNED ELEMENT BY ELEMENT, NOT REPLACED, and that is not a style choice: every
+// patch field holds a `const FvPatch&` into this vector, and `patches = buildPatches(...)` is a MOVE
+// assignment -- it steals the new buffer and frees the old one, so every one of those references dangles.
+// MEASURED: with the vector moved, the first two changes of the gate's own fixture read freed memory and
+// happened to work, and the third segfaulted in strlen on the patch's NAME. Assigning the elements keeps
+// the storage, so the references stay valid and now see the new patch.
+void updatePatchesInPlace(
+    std::vector<FvPatch>& patches,
+    std::vector<FvPatch>  fresh)
+{
+    if (fresh.size() != patches.size())
+        throw std::runtime_error(
+            "brae dynamicRefineFvMesh: the change left " + std::to_string(fresh.size()) + " patches where "
+            "the mesh had " + std::to_string(patches.size()) + ". hexRef8 splits faces WITHIN a patch and "
+            "never adds or removes one; a change that did would dangle every patch field's reference.");
+    for (std::size_t p = 0; p < patches.size(); ++p)
+    {
+        patches[p] = std::move(fresh[p]);
+    }
+}
+
 }   // namespace
 
 RefineUpdateStep refineUpdate(
@@ -2081,7 +2148,8 @@ RefineUpdateStep refineUpdate(
 
     StepAddressing a;
     buildAddressing(s.m, a);
-    s.patches = buildPatches(s.m, a.g);
+    if (s.patches.empty()) s.patches = buildPatches(s.m, a.g);
+    else updatePatchesInPlace(s.patches, buildPatches(s.m, a.g));
 
     // :1357-1367. A fresh marker every step, marked from the field alone.
     std::vector<char> refineCell(static_cast<std::size_t>(s.m.nCells()), char(0));
@@ -2155,7 +2223,7 @@ RefineUpdateStep refineUpdate(
             s.injectedPhiUBnd = s.injectedPhiURefineBnd;
             s.m = rebuiltMesh(s.m, out);
             buildAddressing(s.m, a);
-            s.patches = buildPatches(s.m, a.g);
+            updatePatchesInPlace(s.patches, buildPatches(s.m, a.g));
             mapCarriedFields(s, r.refineMap, oldV, out.nCells, a.g.V(), nOldInternalFaces);
 
             // :1391-1411. refineCell REBUILT THROUGH THE MAP: a cell stays marked if it is new, if it is
@@ -2281,7 +2349,7 @@ RefineUpdateStep refineUpdate(
             s.injectedPhiUBnd = s.injectedPhiUUnrefineBnd;
             s.m = rebuiltMesh(s.m, out);
             buildAddressing(s.m, a);
-            s.patches = buildPatches(s.m, a.g);
+            updatePatchesInPlace(s.patches, buildPatches(s.m, a.g));
             mapCarriedFields(s, r.unrefineMap, oldV, out.nCells, a.g.V(), nOldInternalFaces);
             // ...and then unrefine's second correction, which runs AFTER updateMesh and so after the
             // hull average (:610-689)

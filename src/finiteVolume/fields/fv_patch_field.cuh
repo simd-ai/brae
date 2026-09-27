@@ -6,6 +6,7 @@
 #include "cf_types.cuh"
 #include "planar_interpolation.cuh"
 #include "fv_patch.cuh"
+#include "fv_patch_field_mapper.cuh"
 #include "wedge_patch.cuh"   // the axisymmetric constraint patch's rotation tensors
 #include "foam_field_reader.cuh"
 #include "cf_pstream.cuh"
@@ -376,6 +377,22 @@ public:
     virtual const std::vector<T>* refGradPtr() const { return nullptr; }
 
     const std::vector<T>& value() const { return value_; }
+    // THE STATE A MESH CHANGE HAS TO MAP, for a gate to compare against OpenFOAM's own. Empty where the
+    // type does not carry it, which is how OpenFOAM's dump writes a patch whose isA<> test misses -- so
+    // an empty list here and there means the same thing rather than hiding a missing comparison.
+    virtual std::vector<T> mappedRefValues() const { return {}; }
+    virtual std::vector<scalar> mappedValueFraction() const { return {}; }
+    virtual std::vector<T> mappedGradient() const { return {}; }
+    virtual std::vector<T> mappedP0() const { return {}; }
+    // ...and the setters a GATE needs. Everything a case writes for these is `uniform`, so a comparison
+    // of the mapped state against OpenFOAM's passes whatever the mapping does -- measured: the
+    // fail-proofs on mixed's valueFraction and totalPressure's p0 were both GREEN until the gate wrote a
+    // per-face pattern into both sides first. These exist for that, and do nothing where the type has no
+    // such state.
+    virtual void setMappedRefValues(const std::vector<T>&) {}
+    virtual void setMappedValueFraction(const std::vector<scalar>&) {}
+    virtual void setMappedGradient(const std::vector<T>&) {}
+    virtual void setMappedP0(const std::vector<T>&) {}
     void setValue(const std::vector<T>& v) { value_ = v; }   // e.g. nutkWallFunction writing nut at walls
 
     // Replace the value the patch HOLDS, not merely the one it currently exposes. OF's operator==(...)
@@ -431,6 +448,55 @@ public:
         for (label i = 0; i < patch_.size; ++i)
             pif[i] = internal[patch_.faceCells[i]];
         return pif;
+    }
+
+    // fvPatchField<Type>::autoMap (fvPatchField.C:244-300). What a patch field does when the mesh under
+    // it changes: map every face that has a source, and fill the ones that do NOT from the patch's own
+    // internal field -- a zero-gradient fill, which is what fvPatchMapper's -1 entries get.
+    //
+    // A PATCH THAT WAS EMPTY takes the internal field outright (:250-257), without consulting the
+    // addressing at all.
+    //
+    // `internal` is the field's NEW cell values, already mapped: OpenFOAM maps the internal field first
+    // (MapGeometricFields does the internal field, then the boundary), so patchInternalField here reads
+    // the new mesh's values through the new patch's faceCells.
+    //
+    // EVERY OVERRIDE BELOW CALLS THIS FIRST and then maps its own per-face state, exactly as OpenFOAM's
+    // do -- and the state is mapped by mapFieldThrough, NOT by this, because only the VALUE gets the
+    // zero-gradient fill (mixedFvPatchField.C:180-190 against fvPatchField.C:244).
+    // IS THIS TYPE'S autoMap WRITTEN? False in the base, and true only where the class has been read
+    // against OpenFOAM's own autoMap and its per-face state mapped with it. A mesh change over a patch
+    // field that answers false is REFUSED by name rather than run with a stale or short state vector --
+    // which is the defect this project keeps finding, and the reason the base cannot just map `value_`
+    // and hope: every brae patch field that reads a member vector in its evaluate() needs that vector
+    // mapped too, and OpenFOAM's own class is the authority for which ones those are.
+    virtual bool autoMapComplete() const { return false; }
+
+    virtual void autoMap(
+        const FvPatchFieldMapping& pm,
+        const std::vector<T>&      internal)
+    {
+        if (value_.empty())
+        {
+            value_.assign(static_cast<std::size_t>(patch_.size), T{});
+            if (patch_.size) value_ = patchInternalField(internal);
+            return;
+        }
+        mapFieldThrough(value_, pm, T{});
+        if (!pm.hasUnmapped()) return;
+        const std::vector<T> pif = patchInternalField(internal);
+        if (pm.direct)
+        {
+            for (std::size_t i = 0; i < pm.directAddressing.size() && i < value_.size(); ++i)
+            {
+                if (pm.directAddressing[i] < 0) value_[i] = pif[i];
+            }
+            return;
+        }
+        for (std::size_t i = 0; i < pm.addressing.size() && i < value_.size(); ++i)
+        {
+            if (pm.addressing[i].empty()) value_[i] = pif[i];
+        }
     }
 
 protected:
@@ -500,6 +566,16 @@ public:
             r[i] = uniform_ ? uniformValue_ : values_[i];
         return r;
     }
+    // OpenFOAM's fixedValue needs no autoMap of its own -- its VALUE is the field. brae keeps the file's
+    // per-face list apart from the evaluated value, so the list is mapped here too or evaluate() reads a
+    // stale one.
+    bool autoMapComplete() const override { return true; }
+    void autoMap(const FvPatchFieldMapping& pm, const std::vector<T>& internal) override
+    {
+        fvPatchField<T>::autoMap(pm, internal);
+        if (!uniform_) mapFieldThrough(values_, pm, T{});
+    }
+
 private:
     bool           uniform_;
     T              uniformValue_;
@@ -611,6 +687,21 @@ public:
             this->setStoredValues(std::move(v));
         }
     }
+
+    // totalPressureFvPatchScalarField::autoMap (:161-168): the fixedValue base, then `p0_`. `phi_` is not
+    // mapped by OpenFOAM and is not state: updateFromFlux overwrites it from the live flux at every
+    // updateCoeffs, so it is only RESIZED here.
+    bool autoMapComplete() const override { return true; }
+    void autoMap(const FvPatchFieldMapping& pm, const std::vector<T>& internal) override
+    {
+        FixedValuePatchField<T>::autoMap(pm, internal);
+        mapFieldThrough(p0_, pm, T{});
+        phi_.assign(static_cast<std::size_t>(this->patch_.size), scalar(0));
+    }
+
+    std::vector<T> mappedP0() const override { return p0_; }
+
+    void setMappedP0(const std::vector<T>& v) override { p0_ = v; }
 
 private:
     std::vector<T>      p0_;
@@ -904,6 +995,9 @@ public:
     {
         return std::vector<T>(static_cast<std::size_t>(this->patch_.size), T{});
     }
+    // no per-face state: the base's map and its zero-gradient fill are the whole of it
+    bool autoMapComplete() const override { return true; }
+
 };
 
 // epsilonWallFunction: a zeroGradient boundary value, with the near-wall CELL constrained separately by
@@ -982,6 +1076,20 @@ public:
 
 protected:
     std::vector<T> grad_;   // writable by fixedFluxPressure's updateSnGrad
+
+    // fixedGradientFvPatchField::autoMap (:106-113) maps the base and then `gradient_`. brae holds the
+    // gradient twice -- the live one and the file's -- and both are read by evaluate().
+    bool autoMapComplete() const override { return true; }
+    void autoMap(const FvPatchFieldMapping& pm, const std::vector<T>& internal) override
+    {
+        fvPatchField<T>::autoMap(pm, internal);
+        mapFieldThrough(grad_, pm, T{});
+        if (!gValues_.empty()) mapFieldThrough(gValues_, pm, T{});
+    }
+
+    std::vector<T> mappedGradient() const override { return grad_; }
+
+    void setMappedGradient(const std::vector<T>& v) override { grad_ = v; gValues_ = v; }
 
 private:
     bool uniform_;
@@ -1543,6 +1651,14 @@ protected:
 public:
     // OF writes `this->refValue() = ...`; the turbulent inlets do it every updateCoeffs.
     void setRefValues(std::vector<T> v) { uniform_ = false; values_ = std::move(v); }
+    // `values_` is what evaluate() writes the boundary from, so it is mapped beside the value. A UNIFORM
+    // patch has none and needs none.
+    bool autoMapComplete() const override { return true; }
+    void autoMap(const FvPatchFieldMapping& pm, const std::vector<T>& internal) override
+    {
+        fvPatchField<T>::autoMap(pm, internal);
+        if (!uniform_) mapFieldThrough(values_, pm, T{});
+    }
     void setStoredValues(std::vector<T> v) override
     {
         setRefValues(std::move(v));
@@ -1735,6 +1851,22 @@ protected:
     // Read-only view of vfUpdated_ for the flux-conditional patches' construction-time extrapolation,
     // which must not overwrite a value once a real blend exists.
     bool valueFractionComputed() const { return vfUpdated_; }
+
+    // mixedFvPatchField<Type>::autoMap (:180-190): the base, then refValue, refGrad and valueFraction.
+    // brae's refValue lives in the ExtrapolatedValue base's `values_`, which that class maps.
+    bool autoMapComplete() const override { return true; }
+    void autoMap(const FvPatchFieldMapping& pm, const std::vector<T>& internal) override
+    {
+        ExtrapolatedValuePatchField<T>::autoMap(pm, internal);
+        mapFieldThrough(vf_, pm, scalar(0));
+        if (!refGrad_.empty()) mapFieldThrough(refGrad_, pm, T{});
+    }
+
+    std::vector<T> mappedRefValues() const override { return this->refValues(); }
+    std::vector<scalar> mappedValueFraction() const override { return vf_; }
+
+    void setMappedRefValues(const std::vector<T>& v) override { this->setRefValues(v); }
+    void setMappedValueFraction(const std::vector<scalar>& v) override { vf_ = v; }
 
 private:
     bool                velocitySign_;  // true: vf=0.5-0.5 U.n/|U| (velocity); false: 0.5+0.5 ... (pressure)
@@ -2141,6 +2273,10 @@ public:
     }
     int bcCategory() const override { return 3; }                  // inletOutlet (device: per-face fixedValue|zeroGradient)
 
+    // inletOutlet holds nothing per-face beyond mixed's three, and OpenFOAM gives it no autoMap of its
+    // own for the same reason
+    bool autoMapComplete() const override { return true; }
+
 private:
     bool extrapolatePending_ = false;
 };
@@ -2524,6 +2660,19 @@ public:
             }
             this->setStoredValues(std::move(v));
         }
+    }
+
+    // pressureInletOutletVelocityFvPatchVectorField::autoMap (:160-170) maps directionMixed's refValue,
+    // refGrad and valueFraction and then tangentialVelocity -- and brae stores none of those: its
+    // refValue and refGrad are identically zero (a tangentialVelocity is refused at construction) and its
+    // valueFraction is rebuilt from the flux at every updateCoeffs. `phi_` and `pif_` are that per-step
+    // input and the patch's internal field, both overwritten before they are read, so they are resized.
+    bool autoMapComplete() const override { return true; }
+    void autoMap(const FvPatchFieldMapping& pm, const std::vector<T>& internal) override
+    {
+        ExtrapolatedValuePatchField<T>::autoMap(pm, internal);
+        phi_.assign(static_cast<std::size_t>(this->patch_.size), scalar(0));
+        pif_ = this->patchInternalField(internal);
     }
 
 private:

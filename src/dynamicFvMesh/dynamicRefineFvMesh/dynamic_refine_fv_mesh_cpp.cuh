@@ -28,6 +28,8 @@
 #include "fv_patch.cuh"
 #include "hex_ref8_cpp.cuh"
 #include "poly_topo_change_cpp.cuh"
+#include "fv_patch_field_mapper.cuh"
+#include "geometric_field.cuh"
 #include "map_poly_mesh_cpp.cuh"
 #include "primitive_mesh.cuh"
 #include <string>
@@ -598,14 +600,10 @@ std::vector<scalar> mapOldVolumes(
 //
 // THEN AN ORIENTED FIELD IS NEGATED on every face in flipFaceFlux (MapFvSurfaceField.H:83-93), which is
 // what a flux is and `Uf` is not -- the flag comes from the field FILE's `oriented` entry, not its name.
-struct FaceMapping
-{
-    bool                             direct = false;
-    std::vector<label>               directAddressing;   // faceMap sliced to nNewFaces, negatives -> 0
-    std::vector<std::vector<label>>  addressing;
-    std::vector<std::vector<scalar>> weights;
-    std::vector<label>               insertedFaces;
-};
+// The addressing itself is FvPatchFieldMapping, declared beside the patch fields that consume it
+// (fv_patch_field_mapper.cuh) so that a patch field can be mapped without depending on the dynamic mesh.
+// This name is kept because the three builders below are OpenFOAM's three MAPPERS, not one mapping.
+using FaceMapping = FvPatchFieldMapping;
 
 FaceMapping faceMapping(
     const cpu::polyTopoChange::TopoChangeMap& map,
@@ -684,6 +682,19 @@ struct RefineUpdateState
     // it does, the four write sites of mapFields' own correction run on it, and so does unrefine's second
     // one. Empty or "none" means the field is only mapped -- which is what every interFoam tutorial with
     // an adaptive mesh asks for, all three of them.
+    // UNIT 8a. Whole fields -- cells AND patch fields -- carried through every change: the internal field
+    // through the cell mapper, then each patch field's own autoMap. Held by POINTER because a
+    // GeometricField owns its patch-field objects and is not copyable, and because the solver's fields
+    // live in its own state rather than here.
+    //
+    // THE PATCH OBJECTS MUST BE UPDATED IN PLACE. Every patch field holds a `const FvPatch&` into the
+    // driver's patch vector, so that vector is ASSIGNED rather than rebuilt, and the patch count is
+    // checked: a change that added or removed a patch would leave every patch field pointing at another
+    // patch's data, which is silent. hexRef8 never changes the patch count -- it splits faces within a
+    // patch -- and that is checked rather than assumed.
+    std::vector<GeometricField<scalar>*> carriedScalarFields;
+    std::vector<GeometricField<vector>*> carriedVectorFields;
+
     std::vector<std::string>         surfaceScalarVelocity;
     // The interpolated flux the correction writes, on the NEW mesh, per change. Injected by the gate so
     // that brae's own surface interpolation is not in the way of the correction's logic; empty means the

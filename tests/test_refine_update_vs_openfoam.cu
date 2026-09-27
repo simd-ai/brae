@@ -19,6 +19,7 @@
 #include "foam_dict.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
+#include "geometric_field.cuh"
 #include "hex_ref8_cpp.cuh"
 #include "mesh_edges_cpp.cuh"
 #include "primitive_mesh.cuh"
@@ -175,7 +176,12 @@ std::map<std::string, std::vector<scalar>> readScalars(const std::string& path, 
         // the per-patch blocks: `name <nPatches>` and then one line per patch, `<n> v v ...`. Stored
         // FLATTENED in patch order, which is how the comparison flattens brae's side.
         if (key == "braePhiBnd" || key == "braePhiUBnd" || key == "braePhiFlatBnd"
-         || key == "refinePhiUBnd" || key == "unrefinePhiUBnd")
+         || key == "refinePhiUBnd" || key == "unrefinePhiUBnd"
+         || key == "caseAlphaBnd" || key == "caseUBnd" || key == "casePrghBnd"
+         || key == "caseAlphaRefValue" || key == "caseAlphaValueFraction"
+         || key == "caseAlphaGradient" || key == "caseAlphaP0"
+         || key == "casePrghRefValue" || key == "casePrghValueFraction"
+         || key == "casePrghGradient" || key == "casePrghP0")
         {
             label nPatches = 0;
             ls >> nPatches;
@@ -441,6 +447,77 @@ int main(int argc, char** argv)
                     s.surfaceScalarVelocity.at(0).empty() ? "(not in the table)"
                                                           : s.surfaceScalarVelocity.at(0).c_str());
     }
+    // UNIT 8a: the case's own fields, with the patch TYPES the case wrote -- inletOutlet and zeroGradient
+    // on alpha, pressureInletOutletVelocity and uniformFixedValue on U, totalPressure and
+    // fixedFluxPressure on p_rgh. They are read and then only MAPPED, so every boundary value and every
+    // piece of per-face state below is brae's autoMap against OpenFOAM's.
+    GeometricField<scalar> caseAlpha =
+        buildField(readField<scalar>(caseDir + "/0/alpha.water"), s.patches, s.m.nCells());
+    GeometricField<vector> caseU =
+        buildField(readField<vector>(caseDir + "/0/U"), s.patches, s.m.nCells());
+    GeometricField<scalar> casePrgh =
+        buildField(readField<scalar>(caseDir + "/0/p_rgh"), s.patches, s.m.nCells());
+    // OpenFOAM's own field-from-file has its boundary EVALUATED at construction, so a zeroGradient patch
+    // holds the cell values and not zeros before anything is mapped. brae's buildField leaves value_ at
+    // whatever the constructor set, so it is evaluated once here -- otherwise the comparison measures the
+    // starting state and not the mapping. MEASURED: without this, `walls` (zeroGradient on alpha) read 0
+    // where OpenFOAM read 1, from the first face of the second patch onwards.
+    // OpenFOAM's own field-from-file has its boundary EVALUATED at construction, so a zeroGradient patch
+    // holds the cell values and not zeros before anything is mapped. MEASURED: without this, `walls`
+    // (zeroGradient on alpha) read 0 where OpenFOAM read 1, from the first face of the second patch on.
+    //
+    // AND IT COMES BEFORE THE STATE PATTERN BELOW, not after: the oracle writes the pattern into an
+    // already-constructed field and does NOT re-evaluate, so a fixedGradient patch keeps the file's value
+    // beside a gradient that no longer produced it. Evaluating after the pattern instead read p_rgh's last
+    // wall face as 1561.98 against OpenFOAM's 0 -- the value the new gradient WOULD give.
+    caseAlpha.evaluateBoundary();
+    caseU.evaluateBoundary();
+    casePrgh.evaluateBoundary();
+
+    // THE SAME PER-FACE PATTERN THE ORACLE WRITES, for the same reason: the case's own state is uniform,
+    // so a comparison of it cannot tell a mapping from a re-assignment. See the note in
+    // fv_patch_field.cuh.
+    for (std::size_t pi = 0; pi < s.patches.size(); ++pi)
+    {
+        const label start = s.patches[pi].start;
+        const label n = s.patches[pi].size;
+        std::vector<scalar> ramp(static_cast<std::size_t>(n));
+        std::vector<scalar> frac(static_cast<std::size_t>(n));
+        for (label i = 0; i < n; ++i)
+        {
+            ramp[static_cast<std::size_t>(i)] = scalar(start + i);
+            frac[static_cast<std::size_t>(i)] =
+                scalar(0.25) + scalar(0.5)*scalar(i % 3)/scalar(3);
+        }
+        // A PATTERN IN THE VALUES TOO WAS TRIED AND TAKEN BACK OUT. It would make the base's own value
+        // mapping discriminating -- the fail-proof on it is GREEN as things stand, because alpha and p_rgh
+        // are 0 over most of the boundary and a resize that keeps the old values and zero-fills the new
+        // faces gives the same answer as mapping them. Writing a per-face ramp into the values needs the
+        // two sides to agree on what they wrote, and they did not: OpenFOAM's went in through the Field
+        // base while brae's went through assignValue, and U's walls patch came out 299901 against
+        // OpenFOAM's own number. Recorded as unwitnessed rather than left as a green line with a broken
+        // arm behind it; the STATE comparisons below carry the pattern and are discriminating.
+        if (!caseAlpha.boundary[pi]->mappedRefValues().empty())
+        {
+            caseAlpha.boundary[pi]->setMappedRefValues(ramp);
+            caseAlpha.boundary[pi]->setMappedValueFraction(frac);
+        }
+        if (!casePrgh.boundary[pi]->mappedGradient().empty())
+        {
+            casePrgh.boundary[pi]->setMappedGradient(ramp);
+        }
+        if (!casePrgh.boundary[pi]->mappedP0().empty())
+        {
+            casePrgh.boundary[pi]->setMappedP0(ramp);
+        }
+    }
+
+    s.carriedScalarFields.push_back(&caseAlpha);
+    s.carriedScalarFields.push_back(&casePrgh);
+    s.carriedVectorFields.push_back(&caseU);
+    std::printf("  carried whole fields: alpha.water, p_rgh (scalar) and U (vector), %zu patches each\n",
+                s.patches.size());
+
     // ...and OpenFOAM's OWN old cell volumes, injected per change. brae's FvGeometry::V() agrees with
     // OpenFOAM's to round-off but not bit-for-bit, and a volume-weighted mean carries that into every
     // merged value -- so injecting them is what makes a MAPPER defect separable from brae's volumes.
@@ -623,6 +700,63 @@ int main(int argc, char** argv)
                            scalar(1e-12));
             // UNIT 7b-2: the oriented surface field, internal and boundary. Pure addressing and a sign,
             // so the bound is ZERO on both arms.
+            // UNIT 8a: the typed patch fields. Pure addressing and a zero-gradient fill, so bound 0.
+            {
+                const auto flatScalarBnd = [](const GeometricField<scalar>& f)
+                {
+                    std::vector<scalar> out;
+                    for (const auto& b : f.boundary)
+                    {
+                        const std::vector<scalar> v = b->value();
+                        out.insert(out.end(), v.begin(), v.end());
+                    }
+                    return out;
+                };
+                compareScalars("alpha.water's patch values", flatScalarBnd(caseAlpha), sc,
+                               std::to_string(step) + "/caseAlphaBnd", scalar(0));
+                compareScalars("p_rgh's patch values", flatScalarBnd(casePrgh), sc,
+                               std::to_string(step) + "/casePrghBnd", scalar(0));
+                std::vector<scalar> flatU;
+                for (const auto& b : caseU.boundary)
+                {
+                    for (const vector& v : b->value())
+                    {
+                        flatU.push_back(v.x);
+                        flatU.push_back(v.y);
+                        flatU.push_back(v.z);
+                    }
+                }
+                compareScalars("U's patch values", flatU, sc, std::to_string(step) + "/caseUBnd",
+                               scalar(0));
+                // ...and the per-face STATE each type carries, which is what the overrides map: a mixed
+                // patch's refValue and valueFraction, a fixedGradient's gradient, a totalPressure's p0.
+                // A patch of another type writes an empty list on OpenFOAM's side, so the comparison is
+                // over the patches that HAVE the state, in patch order.
+                std::vector<scalar> refV, vFrac, grad, p0;
+                for (const auto& b : caseAlpha.boundary)
+                {
+                    const std::vector<scalar> r = b->mappedRefValues();
+                    refV.insert(refV.end(), r.begin(), r.end());
+                    const std::vector<scalar> v = b->mappedValueFraction();
+                    vFrac.insert(vFrac.end(), v.begin(), v.end());
+                }
+                compareScalars("alpha.water's inletOutlet refValue", refV, sc,
+                               std::to_string(step) + "/caseAlphaRefValue", scalar(0));
+                compareScalars("alpha.water's inletOutlet valueFraction", vFrac, sc,
+                               std::to_string(step) + "/caseAlphaValueFraction", scalar(0));
+                for (const auto& b : casePrgh.boundary)
+                {
+                    const std::vector<scalar> g = b->mappedGradient();
+                    grad.insert(grad.end(), g.begin(), g.end());
+                    const std::vector<scalar> q = b->mappedP0();
+                    p0.insert(p0.end(), q.begin(), q.end());
+                }
+                compareScalars("p_rgh's fixedFluxPressure gradient", grad, sc,
+                               std::to_string(step) + "/casePrghGradient", scalar(0));
+                compareScalars("p_rgh's totalPressure p0", p0, sc,
+                               std::to_string(step) + "/casePrghP0", scalar(0));
+            }
+
             // ORIENTED: the hull average's round trip through an intensive vector puts brae's own Sf
             // into the answer, so this one is held at 1e-12 and the worst is printed. UNORIENTED: pure
             // addressing and an average of the values themselves, so bound 0.

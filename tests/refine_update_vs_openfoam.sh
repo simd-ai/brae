@@ -153,6 +153,39 @@
 #                                                  is EMPTY on every one of them
 #   patchMapping writes 0 instead of -1 for an
 #     out-of-patch source                          GREEN -- every patch face's source is in its own patch
+# UNIT 8a: fvPatchField<T>::autoMap -- what a patch field does when the mesh under it changes, which is
+# the prerequisite for running a SOLVER on an adaptive mesh. Three of the case's own fields are carried
+# with the patch TYPES the case wrote:
+#   alpha.water  inletOutlet (a mixed patch: refValue and valueFraction) + zeroGradient
+#   p_rgh        totalPressure (p0) + fixedFluxPressure (a fixedGradient: gradient)
+#   U            pressureInletOutletVelocity + uniformFixedValue
+# and compared per patch: every VALUE, and every piece of per-face STATE the type carries.
+#
+# THE STATE CARRIES A PER-FACE PATTERN, written into BOTH sides before the run. Everything the case writes
+# is `uniform`, so mapping the state and re-assigning the same constant give the same answer: MEASURED,
+# the fail-proofs on mixed's valueFraction and totalPressure's p0 were both GREEN until the pattern was
+# there. With it they are red.
+# FIVE FAIL-PROOFS:
+#   mixed's valueFraction is not mapped                3 F on both dictionaries
+#   totalPressure's p0 is not mapped                   3 F
+#   fixedGradient's gradient is not mapped             3 F
+#   the base maps nothing (value_ only resized)        GREEN, and said rather than left: alpha and p_rgh
+#                                                     are 0 over most of the boundary, so keeping the old
+#                                                     values and zero-filling the new faces gives the same
+#                                                     answer as mapping them. A per-face pattern in the
+#                                                     VALUES would separate them; it was tried, the two
+#                                                     sides disagreed on what they had written (U's walls
+#                                                     patch read 299901), and it was taken back out rather
+#                                                     than left as a broken arm.
+#   a patch field with no autoMap is run anyway        GREEN -- every type on this fixture HAS one. The
+#                                                     refusal is for the ones that do not, which is most
+#                                                     of the 66 classes in the tree.
+# AND ONE THING A FAIL-PROOF CANNOT SHOW. The patch objects are assigned ELEMENT BY ELEMENT rather than
+# replaced, because every patch field holds a `const FvPatch&` into that vector and `patches = build(...)`
+# is a MOVE that frees the old buffer. That was MEASURED as a segfault in strlen on the patch's own name,
+# on the third change of this fixture -- the first two read freed memory and happened to work. Putting the
+# move back does NOT reliably fail, because reading freed memory is undefined rather than wrong, so the
+# evidence is the crash and not a red arm.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_refine_update_vs_openfoam"

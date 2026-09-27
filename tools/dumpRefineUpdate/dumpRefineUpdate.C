@@ -27,6 +27,9 @@
 #include "volFields.H"
 #include "surfaceFields.H"
 #include "surfaceInterpolate.H"
+#include "mixedFvPatchField.H"
+#include "fixedGradientFvPatchField.H"
+#include "totalPressureFvPatchScalarField.H"
 #include "OFstream.H"
 #include "dynamicRefineFvMeshDump.H"
 #include "hexRef8.H"
@@ -69,6 +72,84 @@ void writeMesh(Ostream& os, const polyMesh& mesh, const word& prefix)
     for (const polyPatch& pp : mesh.boundaryMesh())
     {
         os << "  " << pp.name() << ' ' << pp.start() << ' ' << pp.size() << nl;
+    }
+}
+
+// one block per patch: the values, and then the state the type carries. The keys are suffixed by what
+// they hold so a comparison cannot silently read the wrong one.
+void writeTypedBoundary(Ostream& os, const word& name, const volScalarField& fld)
+{
+    os << name << "Bnd " << fld.boundaryField().size() << nl;
+    forAll(fld.boundaryField(), patchi)
+    {
+        const fvPatchScalarField& pf = fld.boundaryField()[patchi];
+        os << "  " << pf.size();
+        forAll(pf, i) os << ' ' << pf[i];
+        os << nl;
+    }
+    os << name << "RefValue " << fld.boundaryField().size() << nl;
+    forAll(fld.boundaryField(), patchi)
+    {
+        const fvPatchScalarField& pf = fld.boundaryField()[patchi];
+        const auto* mp = dynamic_cast<const mixedFvPatchField<scalar>*>(&pf);
+        if (mp)
+        {
+            os << "  " << mp->refValue().size();
+            forAll(mp->refValue(), i) os << ' ' << mp->refValue()[i];
+        }
+        else
+        {
+            os << "  0";
+        }
+        os << nl;
+    }
+    os << name << "ValueFraction " << fld.boundaryField().size() << nl;
+    forAll(fld.boundaryField(), patchi)
+    {
+        const fvPatchScalarField& pf = fld.boundaryField()[patchi];
+        const auto* mp = dynamic_cast<const mixedFvPatchField<scalar>*>(&pf);
+        if (mp)
+        {
+            os << "  " << mp->valueFraction().size();
+            forAll(mp->valueFraction(), i) os << ' ' << mp->valueFraction()[i];
+        }
+        else
+        {
+            os << "  0";
+        }
+        os << nl;
+    }
+    os << name << "Gradient " << fld.boundaryField().size() << nl;
+    forAll(fld.boundaryField(), patchi)
+    {
+        const fvPatchScalarField& pf = fld.boundaryField()[patchi];
+        const auto* gp = dynamic_cast<const fixedGradientFvPatchField<scalar>*>(&pf);
+        if (gp)
+        {
+            os << "  " << gp->gradient().size();
+            forAll(gp->gradient(), i) os << ' ' << gp->gradient()[i];
+        }
+        else
+        {
+            os << "  0";
+        }
+        os << nl;
+    }
+    os << name << "P0 " << fld.boundaryField().size() << nl;
+    forAll(fld.boundaryField(), patchi)
+    {
+        const fvPatchScalarField& pf = fld.boundaryField()[patchi];
+        const auto* tp = dynamic_cast<const totalPressureFvPatchScalarField*>(&pf);
+        if (tp)
+        {
+            os << "  " << tp->p0().size();
+            forAll(tp->p0(), i) os << ' ' << tp->p0()[i];
+        }
+        else
+        {
+            os << "  0";
+        }
+        os << nl;
     }
 }
 
@@ -240,6 +321,60 @@ int main(int argc, char *argv[])
         passiveU[celli] = vector(c.x(), 2*c.y(), 3*c.z());
     }
 
+    // THE CASE'S OWN FIELDS, with the patch TYPES the case wrote -- which is what unit 8a is about. They
+    // are read and then never touched: every boundary value and every piece of per-face state below is
+    // OpenFOAM's own autoMap, mapped across each change. alpha.water is the driver's field as well, so
+    // its INTERNAL values are overwritten by the sphere; its boundary is not.
+    // A COPY OF THE DRIVER'S FIELD UNDER ANOTHER NAME, not a second read of the same file: two registered
+    // fields cannot share a name, and a second `alpha.water` is not checked in -- so it is never mapped,
+    // and its boundary sits at the OLD size while the mesh refines. MEASURED before this was fixed: 6400
+    // boundary values on every step where brae had 6409, 6424 and 6445. The copy keeps the file's patch
+    // TYPES, which is what unit 8a is about, and its values are the file's because this runs before the
+    // first step overwrites the driver's field.
+    volScalarField caseAlpha
+    (
+        IOobject("caseAlpha", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+        fld
+    );
+    volVectorField caseU
+    (
+        IOobject("U", runTime.timeName(), mesh, IOobject::MUST_READ, IOobject::NO_WRITE),
+        mesh
+    );
+    volScalarField casePrgh
+    (
+        IOobject("p_rgh", runTime.timeName(), mesh, IOobject::MUST_READ, IOobject::NO_WRITE),
+        mesh
+    );
+
+    // A PER-FACE PATTERN IN THE STATE, on both sides, BEFORE anything moves. Everything the case writes
+    // is `uniform`, so mapping the state and re-assigning the same constant give the same answer -- the
+    // comparison would pass whatever the mapping did. MEASURED: with the file's own uniform state, the
+    // fail-proofs on mixed's valueFraction and totalPressure's p0 were both GREEN. Written as the face
+    // index, the mapping has something to get wrong.
+    forAll(caseAlpha.boundaryFieldRef(), patchi)
+    {
+        fvPatchScalarField& pf = caseAlpha.boundaryFieldRef()[patchi];
+        auto* mp = dynamic_cast<mixedFvPatchField<scalar>*>(&pf);
+        if (!mp) continue;
+        const label start = mesh.boundaryMesh()[patchi].start();
+        forAll(mp->refValue(), i)      mp->refValue()[i] = scalar(start + i);
+        forAll(mp->valueFraction(), i) mp->valueFraction()[i] = scalar(0.25) + scalar(0.5)*scalar(i%3)/3;
+    }
+    forAll(casePrgh.boundaryFieldRef(), patchi)
+    {
+        fvPatchScalarField& pf = casePrgh.boundaryFieldRef()[patchi];
+        const label start = mesh.boundaryMesh()[patchi].start();
+        if (auto* gp = dynamic_cast<fixedGradientFvPatchField<scalar>*>(&pf))
+        {
+            forAll(gp->gradient(), i) gp->gradient()[i] = scalar(start + i);
+        }
+        if (auto* tp = dynamic_cast<totalPressureFvPatchScalarField*>(&pf))
+        {
+            forAll(tp->p0(), i) tp->p0()[i] = scalar(start + i);
+        }
+    }
+
     OFstream os(outFile);
     os.precision(17);
     os << "mode refineUpdate" << nl;
@@ -360,6 +495,20 @@ int main(int argc, char *argv[])
                 const fvsPatchScalarField& pf = phiU.boundaryField()[patchi];
                 os << "  " << pf.size();
                 forAll(pf, i) os << ' ' << pf[i];
+                os << nl;
+            }
+        }
+        // ...and the typed patch fields, value by value, plus whatever state the type carries and makes
+        // public: mixed's refValue and valueFraction, fixedGradient's gradient, totalPressure's p0
+        writeTypedBoundary(os, "caseAlpha", caseAlpha);
+        writeTypedBoundary(os, "casePrgh", casePrgh);
+        {
+            os << "caseUBnd " << caseU.boundaryField().size() << nl;
+            forAll(caseU.boundaryField(), patchi)
+            {
+                const fvPatchVectorField& pf = caseU.boundaryField()[patchi];
+                os << "  " << 3*pf.size();
+                forAll(pf, i) os << ' ' << pf[i].x() << ' ' << pf[i].y() << ' ' << pf[i].z();
                 os << nl;
             }
         }
