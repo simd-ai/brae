@@ -1252,6 +1252,18 @@ public:
     bool fixesValue() const override { return true; }
     int  bcCategory() const override { return 1; }
 
+    // NEITHER noSlip NOR fixedValue OVERRIDES autoMap in OpenFOAM: noSlipFvPatchVectorField.H and
+    // fixedValueFvPatchField.H declare none, so both take fvPatchField<Type>::autoMap
+    // (fvPatchField.C:242-297) -- map the faces the mapper addresses, then fill the UNMAPPED ones with
+    // the internal value. The value is all zeros here, so a split face's children are zero either way;
+    // the fill only differs on a face with no old counterpart at all, which a refinement never makes.
+    // The base does exactly that, so this only has to say the class is complete -- it holds no per-face
+    // state beyond `value_`.
+    //
+    // WITHOUT IT EVERY 2-D damBreak-SHAPED ADAPTIVE CASE WAS REFUSED at `leftWall`, which is what a
+    // must-run arm for the refinement refusal found.
+    bool autoMapComplete() const override { return true; }
+
     std::vector<T> gradientInternalCoeffs() const override        // -deltaCoeffs
     {
         std::vector<T> r(this->patch_.size);
@@ -1282,6 +1294,24 @@ public:
         this->value_ = this->patchInternalField(internal);
     }
     bool fixesValue() const override { return false; }
+
+    // emptyFvPatchField::autoMap IS AN EMPTY BODY (emptyFvPatchField.H:140-144) because OpenFOAM's empty
+    // patch field is constructed ZERO-SIZED on a patch that has faces (emptyFvPatchField.C:41): there is
+    // nothing to carry. brae's is not zero-sized -- the base sizes value_ to the patch and evaluate()
+    // fills it from the face cells, and both loops index it per face (the device's boundary builder reads
+    // refValues()[i] for every face of every non-coupled patch). So what is complete HERE is the base's
+    // own map, which keeps value_ at the new patch size.
+    //
+    // MEASURED, with an override that cleared value_ instead, as OpenFOAM's empty body suggests: the HOST
+    // arm ran 2-D damBreak adaptively and agreed with OpenFOAM, because every host site guards on the
+    // patch TYPE -- and the device arm SEGFAULTED in buildDeviceVectorBoundary, reading val[i] of a
+    // 4,536-face patch whose value list was empty. The invariant is brae's, not OpenFOAM's, and it is the
+    // one this class has to keep.
+    //
+    // WITHOUT COMPLETENESS AT ALL, every 2-D adaptive case was refused: damBreak's `defaultFaces` is an
+    // empty patch, so a refining 2-D case stopped at "patch `defaultFaces` of a carried scalar field has
+    // no autoMap yet". The 3-D fixture that gated unit 8e has no empty patch, which is why nothing saw it.
+    bool autoMapComplete() const override { return true; }
 };
 
 // symmetryPlane / symmetry: a slip plane. For a SCALAR (p,k,epsilon,nut) the normal gradient is zero, so the
