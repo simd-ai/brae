@@ -652,6 +652,13 @@ struct RefineUpdateState
     // Empty means nothing is protected.
     std::vector<char>    protectedCell;
     label                nRefinementIterations = 0;
+    // HOW MANY ZONES THE MESH CARRIES -- pointZones + faceZones + cellZones. It is here because brae's
+    // PrimitiveMesh does not carry zones and changeMesh's refusal of them could therefore never fire:
+    // changeInput hardcoded 0, so a case with a cellZone ran with the zone silently unrenumbered. The
+    // caller that READ the zones is the only one that knows, so it says so here. resetZones
+    // (polyTopoChange.C:1600-1968) is what would renumber them; until it is ported, a non-zero count is
+    // refused by name inside changeMesh.
+    label                nZones = 0;
 
     // UNIT 7b. Fields the driver carries through every change, as OpenFOAM's registry does: each one is
     // mapped at each change and nothing else is done to it.

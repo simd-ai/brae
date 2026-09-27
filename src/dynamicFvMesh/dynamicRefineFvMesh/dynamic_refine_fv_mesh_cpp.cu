@@ -1942,7 +1942,9 @@ cpu::polyTopoChange::TopoActions actionsFromMesh(const PrimitiveMesh& m)
     return a;
 }
 
-cpu::polyTopoChange::ChangeMeshInput changeInput(const PrimitiveMesh& m)
+cpu::polyTopoChange::ChangeMeshInput changeInput(
+    const PrimitiveMesh& m,
+    label                nZones)
 {
     cpu::polyTopoChange::ChangeMeshInput ci;
     ci.nOldPoints = static_cast<label>(m.points().size());
@@ -1955,7 +1957,10 @@ cpu::polyTopoChange::ChangeMeshInput changeInput(const PrimitiveMesh& m)
         ci.patchTypes.push_back(p.type);
     }
     ci.oldPatchNMeshPoints.assign(ci.oldPatchStarts.size(), label(0));
-    ci.nZones = 0;
+    // THE CALLER'S COUNT, not zero. This was hardcoded to 0, which made changeMesh's zone refusal
+    // unreachable from every caller -- a refusal standing in front of a silent substitution, the class
+    // this project keeps finding. A mesh with a cellZone, faceZone or pointZone now stops by name.
+    ci.nZones = nZones;
     return ci;
 }
 
@@ -2276,7 +2281,7 @@ RefineUpdateStep refineUpdate(
                                                  static_cast<label>(marks.newCellLevel.size()));
 
             cpu::polyTopoChange::ChangedMesh out;
-            cpu::polyTopoChange::changeMesh(act, changeInput(s.m), out, r.refineMap);
+            cpu::polyTopoChange::changeMesh(act, changeInput(s.m, s.nZones), out, r.refineMap);
 
             // hexRef8::updateMesh -- the levels and the history through the change
             s.levels.cellLevel = marks.newCellLevel;
@@ -2399,7 +2404,7 @@ RefineUpdateStep refineUpdate(
                                                    act);
 
             cpu::polyTopoChange::ChangedMesh out;
-            cpu::polyTopoChange::changeMesh(act, changeInput(s.m), out, r.unrefineMap);
+            cpu::polyTopoChange::changeMesh(act, changeInput(s.m, s.nZones), out, r.unrefineMap);
 
             cpu::hexRef8::updateLevels(s.levels, r.unrefineMap.reverseCellMap,
                                        r.unrefineMap.reversePointMap, r.unrefineMap.cellMap,
