@@ -149,6 +149,44 @@ int main(int argc, char *argv[])
         // does maxCellField -- so the boundary is left as read.
     };
 
+    // THE PASSIVE FIELDS, which is what unit 7b is about. They are set ONCE, before the first step, to a
+    // value that says which cell each value came from -- the cell INDEX -- and then never touched again:
+    // every later value is OpenFOAM's own mapping of them, accumulated over the steps. A refinement
+    // copies a parent's value to its children; an unrefinement averages the children, VOLUME-WEIGHTED
+    // where the map carries old cell volumes (cellMapper.C:104-160), which is exactly the behaviour a
+    // 0/1 driving field cannot show.
+    volScalarField passiveScalar
+    (
+        IOobject("braeScalar", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+        mesh,
+        dimensionedScalar(dimless, Foam::zero{}),
+        fvPatchFieldBase::calculatedType()
+    );
+    // ...AND A THIRD, RE-SET AT THE START OF EVERY STEP. The two above are set once, which is what tests
+    // a mapping COMPOSED over three steps -- but it also makes the merge averaging invisible: a
+    // refinement copies a parent's value to all eight children, so by the time they are merged back they
+    // all hold the same number and their weighted mean equals any one of them. This one is written fresh
+    // each step, so the cells a merge combines hold EIGHT DIFFERENT values and the average is a real one.
+    volScalarField passiveFresh
+    (
+        IOobject("braeFresh", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+        mesh,
+        dimensionedScalar(dimless, Foam::zero{}),
+        fvPatchFieldBase::calculatedType()
+    );
+    volVectorField passiveVector
+    (
+        IOobject("braeVector", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+        mesh,
+        dimensionedVector(dimless, Foam::zero{}),
+        fvPatchFieldBase::calculatedType()
+    );
+    forAll(passiveScalar, celli)
+    {
+        passiveScalar[celli] = scalar(celli);
+        passiveVector[celli] = vector(scalar(celli), scalar(2*celli), scalar(3*celli));
+    }
+
     OFstream os(outFile);
     os.precision(17);
     os << "mode refineUpdate" << nl;
@@ -168,6 +206,7 @@ int main(int argc, char *argv[])
         ++runTime;
         // the field is set BEFORE the update, on this step's mesh, at this step's centre
         setField(centre + scalar(step)*velocity);
+        forAll(passiveFresh, celli) passiveFresh[celli] = scalar(celli);
         os << "step " << step << nl;
         os << "timeIndex " << runTime.timeIndex() << nl;
         writeLabels(os, "fieldOne", labelList());   // placeholder, kept so the reader sees the key
@@ -205,6 +244,32 @@ int main(int argc, char *argv[])
                 else { os << "  0"; }
                 os << nl;
             }
+        }
+        // ...and the passive fields as OpenFOAM's own mapping left them, plus the old-time volumes,
+        // which fvMesh::mapFields maps by a rule of their OWN (gather + inject the merged cells,
+        // fvMesh.C:851-891) and dynamicRefineFvMesh::mapFields then corrects on split and merged cells
+        os << "braeScalar " << passiveScalar.size();
+        forAll(passiveScalar, celli) os << ' ' << passiveScalar[celli];
+        os << nl;
+        os << "braeFresh " << passiveFresh.size();
+        forAll(passiveFresh, celli) os << ' ' << passiveFresh[celli];
+        os << nl;
+        os << "braeVector " << passiveVector.size();
+        forAll(passiveVector, celli)
+        {
+            os << ' ' << passiveVector[celli].x() << ' ' << passiveVector[celli].y()
+               << ' ' << passiveVector[celli].z();
+        }
+        os << nl;
+        {
+            const scalarField& V0 = mesh.V0();
+            os << "V0 " << V0.size();
+            for (const scalar v : V0) os << ' ' << v;
+            os << nl;
+            const scalarField& V = mesh.V();
+            os << "V " << V.size();
+            for (const scalar v : V) os << ' ' << v;
+            os << nl;
         }
         writeMesh(os, mesh, "step");
         Info<< "step " << step << ": " << mesh.nCells() << " cells, changed " << changed << endl;

@@ -76,13 +76,53 @@
 # So the renumbering of protectedCell through each change is carried and ungated. A prism or a
 # snappyHexMesh case would fill it; this one does not, and that is said rather than left.
 #
-# WHAT THIS GATE DOES NOT COVER. The FIELD MAPPING -- mapFields, the old-time volumes and the flux
-# correction -- is unit 7b. It cannot change the topology, which is why the driver can be gated without
-# it. Two things were measured while building this and belong in 7b rather than here:
-#   * a merged cell's field value is a VOLUME-WEIGHTED average of the cells it came from, not a plain one,
-#     whenever the map carries old cell volumes (cellMapper.C:104-160) -- and it does here;
-#   * damBreakWithObstacle's own correctFluxes maps EVERY flux to `none`, so the case cannot witness the
-#     flux correction at all. 7b needs another case for that half.
+# UNIT 7b-1: THE FIELD MAPPING, on three fields the oracle carries and on the old-time volumes.
+#   braeScalar   set ONCE, before the first step, to the cell index -- so after three steps it holds
+#                THREE MAPPINGS COMPOSED, and each value still says which original cell it came from
+#   braeVector   the same, as (i, 2i, 3i), which is the vector path through the same mapper
+#   braeFresh    re-set to the cell index at the START OF EVERY STEP. This one exists because the carried
+#                fields cannot witness the merge AVERAGING: a refinement copies a parent's value to all
+#                eight children, so by the time they are merged back they all hold the same number and
+#                their weighted mean equals any one of them. Written fresh, the cells a merge combines
+#                hold eight DIFFERENT values.
+#   V0           mapped by a rule of its OWN (gather, then ADD each merged part into the master,
+#                fvMesh.C:851-891) and then corrected on split and merged cells (correctOldVolumes)
+# TWO ARMS, and the difference is which cell volumes weight a merge:
+#   OpenFOAM's, injected   the default. The mapping is then arithmetic on identical inputs, so the bound
+#                          is ZERO and anything but exactness is a defect. MEASURED: the mapped fields
+#                          agree EXACTLY on all three steps.
+#   brae's own V           `BRAE_REFINE_UPDATE_OWN_V=1`, which is what the shipped path does. Bound 1e-12.
+# V0 is held at 1e-12 on both arms because brae's own V is what overwrites it on split and merged cells;
+# MEASURED worst 2.4e-15.
+# FIVE FAIL-PROOFS:
+#   correctOldVolumes is not applied                      3 F on BOTH arms, V0 out by a factor 8
+#                                                         (7.000e+00 relative) -- which is the number
+#                                                         unit 6's header predicted for a split cell
+#                                                         keeping its parent's volume
+#   the mapper is always DIRECT (a merged cell takes its
+#     master's value instead of the mean)                  4 F injected / 2 F own, on braeFresh -- and
+#                                                         GREEN on braeScalar, which is exactly why
+#                                                         braeFresh exists
+#   the merge weights are UNIFORM, not volume-weighted     3 F on the INJECTED arm only, at 2.1e-16.
+#                                                         MEASURED off OpenFOAM's own dumped volumes:
+#                                                         the eight cells of a merge set have volumes
+#                                                         equal to within 1.2e-15, so on this uniform
+#                                                         mesh the two weightings differ by round-off
+#                                                         and only the exact arm can see it. A graded
+#                                                         mesh would separate them by more.
+#   V0's merged parts are not injected into the master    GREEN on both -- correctOldVolumes OVERWRITES
+#                                                         every merged cell's V0 with its own new V, so
+#                                                         the injection is invisible behind it. OpenFOAM
+#                                                         does it anyway and so does brae.
+#   an inserted cell reads nothing instead of cell 0      GREEN -- neither a refinement nor an
+#                                                         unrefinement produces a cell with cellMap -1,
+#                                                         so cellMapper's inserted-object branch is
+#                                                         unreachable from here
+#
+# WHAT THIS GATE STILL DOES NOT COVER: the SURFACE fields and the FLUX correction (unit 7b-2). And the
+# reason that needs its own fixture is worth stating: ALL THREE interFoam tutorials with adaptive meshes
+# -- damBreakWithObstacle, oscillatingBox and RAS/motorBike -- map EVERY flux to `none` in their own
+# correctFluxes, so the flux correction is unreachable from any of them.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_refine_update_vs_openfoam"
@@ -141,7 +181,10 @@ grep -E "^(Refined|Unrefined) from" "$C/log.dru" | sed 's/^/  OpenFOAM: /'
 grep -q "^Unrefined from" "$C/log.dru" \
     || { echo "FAIL: OpenFOAM unrefined nothing, so half of the driver is not being measured"; exit 1; }
 
-"$BIN" "$C" "$C/d.dump"
-rc=$?
+rc=0
+echo "--- arm: OpenFOAM's own old cell volumes injected, so the mapping must be EXACT"
+"$BIN" "$C" "$C/d.dump" || rc=1
+echo "--- arm: brae's own FvGeometry::V() weights the merges, which is what the shipped path does"
+BRAE_REFINE_UPDATE_OWN_V=1 "$BIN" "$C" "$C/d.dump" || rc=1
 echo "refine_update_vs_openfoam: rc $rc"
 exit $rc

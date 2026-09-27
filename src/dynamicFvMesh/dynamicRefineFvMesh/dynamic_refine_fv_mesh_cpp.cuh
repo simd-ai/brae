@@ -511,6 +511,68 @@ label correctFluxesUnrefine(
 // correction -- is unit 7b. It cannot change the topology (OpenFOAM maps fields after the mesh is
 // already built), so the driver is gated without it, and the gate's field is analytic and recomputed on
 // the new cell centres at every step for exactly that reason.
+// ----------------------------------------------------------------------------------------------
+// UNIT 7b: THE FIELD MAPPING. What happens to a field when the mesh under it changes.
+//
+// provenance:
+//   openfoam: src/OpenFOAM/lnInclude/cellMapper.C:28-60 (the direct branch), :62-230 (the
+//                 interpolative one, including the VOLUME weighting), and cellMapper.C's constructor
+//                 (:233-260) for the `direct()` predicate
+//             src/OpenFOAM/fields/Fields/Field/Field.C:372-399 (the direct map), :456-470 (the weighted
+//                 one, accumulated from Zero in the addressing order)
+//             src/finiteVolume/fvMesh/fvMesh.C:851-891 (V0's OWN mapping rule, which is not the
+//                 mapper's), :1020-1024 (when V0 exists at all)
+//   tests:    tests/refine_update_vs_openfoam.sh, on two passive fields and the old-time volumes
+//
+// THE MAPPER HAS TWO BRANCHES AND A REFINEMENT AND AN UNREFINEMENT TAKE DIFFERENT ONES:
+//   direct         when every cellsFrom* map is EMPTY, which is what a refinement leaves (measured: 0
+//                  entries on every refinement arm of the hexRef8 gate). Each new cell takes the value
+//                  of `cellMap[celli]`, and an INSERTED cell (cellMap -1) takes cell 0's value, because
+//                  cellMapper rewrites its addressing entry to 0 and records it as inserted.
+//   interpolative  when a merge happened. Each merged cell's value is a weighted sum over the old cells
+//                  it came from -- and the weights are the OLD CELL VOLUMES, normalised, whenever the
+//                  map carries them, uniform 1/n only when it does not or when the volumes sum to
+//                  nothing. MEASURED: every change's map on the gate's fixture DOES carry them.
+//
+// WHAT THE WEIGHTING IS WORTH ON A UNIFORM MESH, measured off OpenFOAM's own dumped volumes rather than
+// argued: the eight cells of a merge set have volumes equal to within 1.2e-15 of each other, so the
+// volume weights are 1/8 to round-off and the weighted mean and the plain mean differ by about 2e-16.
+// Replacing the weights with uniform ones is caught only by the gate arm that demands EXACTNESS (the one
+// fed OpenFOAM's own volumes, bound 0); the arm that uses brae's own V cannot see it. A graded mesh would
+// separate them by more; this fixture does not, and that is said rather than left.
+//
+// AND V0 IS MAPPED BY A RULE OF ITS OWN, not the mapper's: gather through cellMap with 0 where there is
+// no old cell, then for every old cell whose reverseCellMap is a MERGE marker (< -1, meaning
+// -master-2) ADD its old volume into the master's new cell. So a merged cell's V0 is the SUM of its
+// parts, while its mapped field value is their weighted MEAN. dynamicRefineFvMesh::mapFields then
+// overwrites V0 with the cell's own new V on split and merged cells (correctOldVolumes, above).
+struct CellMapping
+{
+    bool                             direct = false;
+    std::vector<label>               directAddressing;   // cellMap, with every negative rewritten to 0
+    std::vector<std::vector<label>>  addressing;         // the interpolative branch
+    std::vector<std::vector<scalar>> weights;
+    std::vector<label>               insertedCells;      // ascending, for the record
+};
+
+// cellMapper's constructor and calcAddressing, from brae's own change map. `oldCellVolumes` empty means
+// the map carried none and the merge weights stay uniform.
+CellMapping cellMapping(
+    const cpu::polyTopoChange::TopoChangeMap& map,
+    label                                     nNewCells,
+    const std::vector<scalar>&                oldCellVolumes);
+
+// Field<Type>::autoMap through that mapping. The weighted branch accumulates from ZERO in the
+// addressing order, which is the order cellMapper wrote it in.
+std::vector<scalar> mapCellField(const std::vector<scalar>& oldField, const CellMapping& cm);
+std::vector<vector> mapCellField(const std::vector<vector>& oldField, const CellMapping& cm);
+
+// fvMesh::mapFields' own V0 rule (:851-891). `V0` is the OLD mesh's old-time volumes.
+std::vector<scalar> mapOldVolumes(
+    const std::vector<scalar>&                V0,
+    const cpu::polyTopoChange::TopoChangeMap& map,
+    label                                     nNewCells);
+
 struct RefineUpdateState
 {
     PrimitiveMesh        m;
@@ -521,6 +583,23 @@ struct RefineUpdateState
     // Empty means nothing is protected.
     std::vector<char>    protectedCell;
     label                nRefinementIterations = 0;
+
+    // UNIT 7b. Fields the driver carries through every change, as OpenFOAM's registry does: each one is
+    // mapped at each change and nothing else is done to it.
+    std::vector<std::vector<scalar>> cellScalars;
+    std::vector<std::vector<vector>> cellVectors;
+    // the old-time volumes. EMPTY until the first change, which is when OpenFOAM's own V0 comes into
+    // existence (fvMesh.C:1020-1024: updateMesh only stores them when the CURRENT volumes already
+    // exist), and from then on mapped and corrected at every change.
+    std::vector<scalar>              V0;
+    // The old cell volumes each of a step's two changes is weighted with. Left empty, brae uses its own
+    // FvGeometry::V() of the pre-change mesh -- which is what the shipped path must do. The gate injects
+    // OpenFOAM's instead, so that a mapper defect and brae's own volume round-off are SEPARABLE: brae's V
+    // is validated against OpenFOAM's but is FP-conditioning-limited, not bit-exact
+    // (tests/test_mesh_geometry.cu), and a weighted mean carries that round-off into every merged value.
+    // Two entries because a step can refine AND unrefine, from two different meshes.
+    std::vector<scalar>              injectedRefineOldV;
+    std::vector<scalar>              injectedUnrefineOldV;
 };
 
 struct RefineUpdateStep

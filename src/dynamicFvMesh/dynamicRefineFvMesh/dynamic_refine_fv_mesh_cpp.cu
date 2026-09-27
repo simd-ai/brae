@@ -1370,6 +1370,193 @@ RefineControls readRefineControls(
 }
 
 // ----------------------------------------------------------------------------------------------
+// UNIT 7b: the field mapping. See the header.
+
+CellMapping cellMapping(
+    const cpu::polyTopoChange::TopoChangeMap& map,
+    label                                     nNewCells,
+    const std::vector<scalar>&                oldCellVolumes)
+{
+    CellMapping cm;
+    // cellMapper's constructor (:233-249): direct unless SOMETHING was inflated or merged
+    cm.direct = map.cellsFromPoints.empty() && map.cellsFromEdges.empty()
+             && map.cellsFromFaces.empty() && map.cellsFromCells.empty();
+    if (nNewCells == 0) cm.direct = true;
+
+    if (cm.direct)
+    {
+        // :36-60. The addressing IS cellMap, with each negative rewritten to 0 and recorded as inserted.
+        cm.directAddressing.assign(map.cellMap.begin(),
+                                   map.cellMap.begin() + static_cast<std::size_t>(nNewCells));
+        for (std::size_t i = 0; i < cm.directAddressing.size(); ++i)
+        {
+            if (cm.directAddressing[i] < 0)
+            {
+                cm.directAddressing[i] = 0;
+                cm.insertedCells.push_back(static_cast<label>(i));
+            }
+        }
+        return cm;
+    }
+
+    // :62-230, the interpolative branch.
+    cm.addressing.resize(static_cast<std::size_t>(nNewCells));
+    cm.weights.resize(static_cast<std::size_t>(nNewCells));
+    const auto setAddrWeights = [&](const std::vector<cpu::polyTopoChange::ObjectMap>& maps)
+    {
+        for (const cpu::polyTopoChange::ObjectMap& m : maps)
+        {
+            if (m.masterObjects.empty()) continue;
+            const std::size_t celli = static_cast<std::size_t>(m.index);
+            if (!cm.addressing[celli].empty())
+                throw std::runtime_error(
+                    "brae cellMapper: cell " + std::to_string(m.index) + " is mapped twice. OpenFOAM "
+                    "FatalErrors here too (cellMapper.C:124-131).");
+            cm.addressing[celli] = m.masterObjects;
+            cm.weights[celli].assign(m.masterObjects.size(),
+                                     scalar(1)/static_cast<scalar>(m.masterObjects.size()));
+        }
+    };
+    // the order is OpenFOAM's: points, edges, faces, then cells
+    setAddrWeights(map.cellsFromPoints);
+    setAddrWeights(map.cellsFromEdges);
+    setAddrWeights(map.cellsFromFaces);
+    setAddrWeights(map.cellsFromCells);
+
+    // :150-195. VOLUME-WEIGHTED where the map carries the old volumes, and only for cellsFromCells: the
+    // uniform weights set above are overwritten in place, and a zero total falls back to uniform.
+    if (!oldCellVolumes.empty())
+    {
+        if (static_cast<label>(oldCellVolumes.size()) != map.nOldCells)
+            throw std::runtime_error(
+                "brae cellMapper: " + std::to_string(oldCellVolumes.size()) + " old cell volumes for a "
+                "map with " + std::to_string(map.nOldCells) + " old cells. OpenFOAM FatalErrors here too "
+                "(cellMapper.C:160-170).");
+        for (const cpu::polyTopoChange::ObjectMap& m : map.cellsFromCells)
+        {
+            if (m.masterObjects.empty()) continue;
+            std::vector<scalar>& w = cm.weights[static_cast<std::size_t>(m.index)];
+            scalar sumV = 0;
+            for (std::size_t ci = 0; ci < m.masterObjects.size(); ++ci)
+            {
+                w[ci] = oldCellVolumes[static_cast<std::size_t>(m.masterObjects[ci])];
+                sumV += w[ci];
+            }
+            if (sumV > scalar(1e-300))      // OF: VSMALL
+            {
+                for (scalar& wi : w) wi /= sumV;
+            }
+            else
+            {
+                const scalar uniform = scalar(1)/static_cast<scalar>(m.masterObjects.size());
+                for (scalar& wi : w) wi = uniform;
+            }
+        }
+    }
+
+    // :198-215. Then the cells that came from ONE cell, where nothing has been set yet.
+    for (label celli = 0; celli < nNewCells; ++celli)
+    {
+        const label mapped = map.cellMap[static_cast<std::size_t>(celli)];
+        if (mapped >= 0 && cm.addressing[static_cast<std::size_t>(celli)].empty())
+        {
+            cm.addressing[static_cast<std::size_t>(celli)] = {mapped};
+            cm.weights[static_cast<std::size_t>(celli)] = {scalar(1)};
+        }
+    }
+    // :218-260. Whatever is still empty is INSERTED and reads cell 0.
+    for (label celli = 0; celli < nNewCells; ++celli)
+    {
+        if (cm.addressing[static_cast<std::size_t>(celli)].empty())
+        {
+            cm.addressing[static_cast<std::size_t>(celli)] = {label(0)};
+            cm.weights[static_cast<std::size_t>(celli)] = {scalar(1)};
+            cm.insertedCells.push_back(celli);
+        }
+    }
+    return cm;
+}
+
+namespace {
+
+template<class T>
+std::vector<T> mapCellFieldT(
+    const std::vector<T>& oldField,
+    const CellMapping&    cm,
+    const T&              zero)
+{
+    if (cm.direct)
+    {
+        // Field<Type>::map(mapF, mapAddressing) (:372-399): a negative entry leaves the value alone, and
+        // cellMapper has already rewritten every negative to 0, so there are none here.
+        std::vector<T> out(cm.directAddressing.size(), zero);
+        if (!oldField.empty())
+        {
+            for (std::size_t i = 0; i < out.size(); ++i)
+            {
+                out[i] = oldField[static_cast<std::size_t>(cm.directAddressing[i])];
+            }
+        }
+        return out;
+    }
+    // :456-470. From ZERO, in the addressing order.
+    std::vector<T> out(cm.addressing.size(), zero);
+    for (std::size_t i = 0; i < out.size(); ++i)
+    {
+        T v = zero;
+        for (std::size_t j = 0; j < cm.addressing[i].size(); ++j)
+        {
+            v = v + cm.weights[i][j]*oldField[static_cast<std::size_t>(cm.addressing[i][j])];
+        }
+        out[i] = v;
+    }
+    return out;
+}
+
+}   // namespace
+
+std::vector<scalar> mapCellField(
+    const std::vector<scalar>& oldField,
+    const CellMapping&         cm)
+{
+    return mapCellFieldT<scalar>(oldField, cm, scalar(0));
+}
+
+std::vector<vector> mapCellField(
+    const std::vector<vector>& oldField,
+    const CellMapping&         cm)
+{
+    return mapCellFieldT<vector>(oldField, cm, vector{0, 0, 0});
+}
+
+std::vector<scalar> mapOldVolumes(
+    const std::vector<scalar>&                V0,
+    const cpu::polyTopoChange::TopoChangeMap& map,
+    label                                     nNewCells)
+{
+    // fvMesh.C:851-891. The gather is `cellMap[i] > -1`, so an inserted cell gets 0 and not cell 0's
+    // volume -- which is NOT what the cell mapper does, and the difference is OpenFOAM's.
+    std::vector<scalar> out(static_cast<std::size_t>(nNewCells), scalar(0));
+    for (label celli = 0; celli < nNewCells; ++celli)
+    {
+        const label oldCelli = map.cellMap[static_cast<std::size_t>(celli)];
+        if (oldCelli > -1) out[static_cast<std::size_t>(celli)] = V0[static_cast<std::size_t>(oldCelli)];
+    }
+    // ...and then every MERGED old cell's volume is ADDED into the master's new cell, so a merged cell's
+    // V0 is the SUM of its parts where its mapped field value is their weighted mean.
+    for (std::size_t oldCelli = 0; oldCelli < map.reverseCellMap.size(); ++oldCelli)
+    {
+        const label index = map.reverseCellMap[oldCelli];
+        if (index < -1)
+        {
+            const label celli = -index - 2;
+            out[static_cast<std::size_t>(celli)] += V0[oldCelli];
+        }
+    }
+    return out;
+}
+
+// ----------------------------------------------------------------------------------------------
 // UNIT 7: the driver. See the header.
 
 namespace {
@@ -1506,6 +1693,40 @@ void renumberProtectedCells(
     protectedCell.swap(next);
 }
 
+// fvMesh::updateMesh + dynamicRefineFvMesh::mapFields, on the state the driver carries: every cell field
+// through the cell mapper, the old-time volumes through their own rule and then corrected.
+void mapCarriedFields(
+    RefineUpdateState&                        s,
+    const cpu::polyTopoChange::TopoChangeMap& map,
+    const std::vector<scalar>&                oldCellVolumes,
+    label                                     nNewCells,
+    const std::vector<scalar>&                newV)
+{
+    const CellMapping cm = cellMapping(map, nNewCells, oldCellVolumes);
+    for (std::vector<scalar>& f : s.cellScalars) f = mapCellField(f, cm);
+    for (std::vector<vector>& f : s.cellVectors) f = mapCellField(f, cm);
+
+    // V0 comes into existence at the FIRST change and not before -- fvMesh::updateMesh only stores old
+    // volumes when the current ones already exist, and what it stores is the OLD mesh's volumes.
+    if (s.V0.empty())
+    {
+        s.V0 = oldCellVolumes;
+    }
+    if (!s.V0.empty())
+    {
+        MapPolyMesh mpm;
+        mpm.nOldCells = map.nOldCells;
+        mpm.cellMap = map.cellMap;
+        mpm.reverseCellMap = map.reverseCellMap;
+        for (const cpu::polyTopoChange::ObjectMap& m : map.cellsFromCells)
+        {
+            mpm.cellsFromCells.emplace_back(m.index, m.masterObjects);
+        }
+        mpm.oldCellVolumes = oldCellVolumes;
+        s.V0 = correctOldVolumes(mpm, mapOldVolumes(s.V0, map, nNewCells), newV);
+    }
+}
+
 }   // namespace
 
 RefineUpdateStep refineUpdate(
@@ -1610,9 +1831,12 @@ RefineUpdateStep refineUpdate(
             }
 
             renumberProtectedCells(s.protectedCell, r.refineMap.cellMap, out.nCells);
+            const std::vector<scalar> oldV =
+                s.injectedRefineOldV.empty() ? a.g.V() : s.injectedRefineOldV;
             s.m = rebuiltMesh(s.m, out);
             buildAddressing(s.m, a);
             s.patches = buildPatches(s.m, a.g);
+            mapCarriedFields(s, r.refineMap, oldV, out.nCells, a.g.V());
 
             // :1391-1411. refineCell REBUILT THROUGH THE MAP: a cell stays marked if it is new, if it is
             // not its old cell's master, or if its old cell was marked. That is what keeps every child of
@@ -1705,7 +1929,12 @@ RefineUpdateStep refineUpdate(
                                        static_cast<label>(out.points.size()));
             cpu::hexRef8::historyUpdateMesh(s.history, r.unrefineMap.reverseCellMap, out.nCells);
             renumberProtectedCells(s.protectedCell, r.unrefineMap.cellMap, out.nCells);
+            const std::vector<scalar> oldV =
+                s.injectedUnrefineOldV.empty() ? a.g.V() : s.injectedUnrefineOldV;
             s.m = rebuiltMesh(s.m, out);
+            buildAddressing(s.m, a);
+            s.patches = buildPatches(s.m, a.g);
+            mapCarriedFields(s, r.unrefineMap, oldV, out.nCells, a.g.V());
 
             r.unrefined = true;
             r.hasChanged = true;

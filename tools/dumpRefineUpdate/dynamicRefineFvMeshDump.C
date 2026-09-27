@@ -1423,6 +1423,18 @@ bool Foam::dynamicRefineFvMeshDump::updateTopology()
             {
                 // Refine/update mesh and map fields
                 autoPtr<mapPolyMesh> map = refine(cellsToRefine);
+                if (druDump::os)
+                {
+                    *druDump::os << "refineHasOldCellVolumes "
+                                 << (map().hasOldCellVolumes() ? 1 : 0) << nl;
+                    if (map().hasOldCellVolumes())
+                    {
+                        const scalarField& V = map().oldCellVolumes();
+                        *druDump::os << "refineOldCellVolumes " << V.size();
+                        for (const scalar v : V) *druDump::os << ' ' << v;
+                        *druDump::os << nl;
+                    }
+                }
                 druDump::writeLabels("refinePointMap", map().pointMap());
                 druDump::writeLabels("refineFaceMap", map().faceMap());
                 druDump::writeLabels("refineCellMap", map().cellMap());
@@ -1487,6 +1499,25 @@ bool Foam::dynamicRefineFvMeshDump::updateTopology()
             {
                 // Refine/update mesh
                 autoPtr<mapPolyMesh> umap = unrefine(pointsToUnrefine);
+                if (druDump::os)
+                {
+                    *druDump::os << "unrefineHasOldCellVolumes "
+                                 << (umap().hasOldCellVolumes() ? 1 : 0) << nl;
+                    if (umap().hasOldCellVolumes())
+                    {
+                        const scalarField& V = umap().oldCellVolumes();
+                        *druDump::os << "unrefineOldCellVolumes " << V.size();
+                        for (const scalar v : V) *druDump::os << ' ' << v;
+                        *druDump::os << nl;
+                    }
+                    *druDump::os << "unrefineCellsFromCells " << umap().cellsFromCellsMap().size() << nl;
+                    for (const objectMap& m : umap().cellsFromCellsMap())
+                    {
+                        *druDump::os << "  " << m.index() << ' ' << m.masterObjects().size();
+                        for (const label v : m.masterObjects()) *druDump::os << ' ' << v;
+                        *druDump::os << nl;
+                    }
+                }
                 druDump::writeLabels("unrefinePointMap", umap().pointMap());
                 druDump::writeLabels("unrefineFaceMap", umap().faceMap());
                 druDump::writeLabels("unrefineCellMap", umap().cellMap());
