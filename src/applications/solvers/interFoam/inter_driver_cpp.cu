@@ -810,6 +810,26 @@ RunReport runInterFoam(
                             cnState.alphaPhiEnd = &alphaPhi10End;
                             cnState.alphaPhiOld = &alphaPhi10Old;
                         }
+                        if (cnDdt && std::getenv("BRAE_AMR_TRACE"))
+                        {
+                            const auto amx = [](const std::vector<scalar>& v)
+                            { scalar m = 0; for (scalar x : v) m = std::fmax(m, std::fabs(x)); return m; };
+                            const auto amxv = [](const std::vector<vector>& v)
+                            { scalar m = 0; for (const vector& x : v) m = std::fmax(m, mag(x)); return m; };
+                            std::printf("  TRACE host   step %ld: ddt0RhoU %.9g/%d/%ld ddtCorrU %.9g "
+                                        "ddtCorrUf %.9g alphaOO %.9g UOO %.9g phiOO %.9g UfOO %.9g "
+                                        "aPhiEnd %.9g aPhiOld %.9g aOld %.9g UOld %.9g phiOld %.9g "
+                                        "UfOld %.9g\n",
+                                        (long)rep.steps, (double)amxv(cnDdt0RhoU.internal),
+                                        (int)cnDdt0RhoU.exists, (long)cnDdt0RhoU.startTimeIndex,
+                                        (double)amxv(cnDdtCorrU.internal),
+                                        (double)amxv(cnDdtCorrUf.internal), (double)0.0,
+                                        (double)amxv(UOO), (double)amx(phiOO.internal),
+                                        (double)amxv(UfOO.internal), (double)amx(alphaPhi10End.internal),
+                                        (double)amx(alphaPhi10Old.internal), (double)amx(alphaOld),
+                                        (double)amxv(UOld), (double)amx(phiOld.internal),
+                                        (double)amxv(UfOld.internal));
+                        }
                         const bool changed =
                             interAmrUpdate(*f.amr, f, *mutableMesh, rep.steps, oldT, cnState);
                         if (changed)

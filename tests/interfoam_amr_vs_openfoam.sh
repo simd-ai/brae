@@ -262,8 +262,13 @@ PYCLOSE" || rc=1
 # throws and the run completes. MEASURED: alpha 1.0688e-02, U 3.2622e-01 relative. It discriminates even
 # though ddt0(rho,U) itself is still zero at the only change that maps it, because the state it drops also
 # holds Uf's old-old level, phi's, and the alpha flux's two blend levels, and none of those is zero there.
-# The DEVICE arm refuses CrankNicolson beside refinement by name -- its levels are device buffers -- and
-# this profile asserts that refusal instead of running it.
+# THE DEVICE ARM RUNS IT TOO (unit 13): its ddt0 levels live in device buffers where the host keeps them in
+# locals, so the adaptive round trip grew a CN half -- each level down component by component, through the
+# SAME mapper, and back up. MEASURED: alpha 2.1982e-14 from OpenFOAM and 2.2714e-14 from the host arm,
+# p_rgh 2.0e-14, U 8.8e-13, phi 4.3e-13. What it found: `if (!dyn) phiOldRequested = true;` where the host
+# asks f.meshIsDynamic -- the EIGHTH site of that rule in this port -- which made the alpha equation's
+# off-centred blend live ONE STEP EARLY on an adaptive case (max(alpha) 1.00008757 against 1.00000006 at
+# t = 0.002, measured before any momentum or pressure of that step).
 #
 # AND WHAT THIS PROFILE CANNOT WITNESS, measured: the mapping of a NON-ZERO ddt0 level. A level created at
 # step k is zero for the whole of step k (DDt0Field::evaluate is false on the step it is born), and this

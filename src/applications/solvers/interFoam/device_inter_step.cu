@@ -527,17 +527,23 @@ void deviceInterStep(
         {
             const DeviceBuffer<scalar>* uo[3] = {&UOldX, &UOldY, &UOldZ};
             const DeviceBuffer<scalar>* uob[3] = {&UOldBndX, &UOldBndY, &UOldBndZ};
-            // ON A MOVING MESH the scheme resolves ddtCorr(U, Uf) to fvcDdtUfCorr, a DIFFERENT member
+            // ON A DYNAMIC MESH the scheme resolves ddtCorr(U, Uf) to fvcDdtUfCorr, a DIFFERENT member
             // function from the static ddtCorr(U, phi) (CrankNicolsonDdtScheme.C:1201-1257) -- the
             // same distinction the Euler branch below makes with phiUfOldInt, and the host arm with
             // `in.UfOld` (inter_peqn_cpp.cu:231). Uf's two old levels come from the driver.
-            if (ctl.V0)
+            //
+            // THE TEST IS THOSE LEVELS, NOT V0. fvcDdt.C:219 routes on mesh.dynamic() -- moving OR
+            // topo-changing -- while V0 is given only on a mesh that MOVES, so a REFINING mesh took the
+            // phi branch here and created ddtCorrDdt0(phi), a level OpenFOAM never makes on such a case
+            // and the host arm does not have. The driver sets these levels on f.meshIsDynamic, exactly as
+            // it sets phiUfOldInt for the Euler branch, so asking for them is asking mesh.dynamic().
+            if (ctl.cn->UfOld[0])
             {
-                if (!ctl.cn->UfOld[0] || !ctl.cn->UfOO[0] || !ctl.cn->UfOldBnd[0] || !ctl.cn->UfOOBnd[0])
+                if (!ctl.cn->UfOO[0] || !ctl.cn->UfOldBnd[0] || !ctl.cn->UfOOBnd[0])
                     throw std::runtime_error(
-                        "brae interFoam device step: CrankNicolson's ddtCorr on a moving mesh is "
+                        "brae interFoam device step: CrankNicolson's ddtCorr on a dynamic mesh is "
                         "fvcDdtUfCorr, which needs Uf.oldTime() and Uf.oldTime().oldTime() on the "
-                        "internal and the boundary faces; the caller gave fewer.");
+                        "internal and the boundary faces, three components each; the caller gave fewer.");
                 deviceCnDdtUfCorr(dm, *ctl.cn->clock, ctl.cn->ddtCorrU, ctl.cn->ddtCorrUf,
                                   uo, ctl.cn->UOO, uob, ctl.cn->UOOBnd,
                                   ctl.cn->UfOld, ctl.cn->UfOldBnd, ctl.cn->UfOO, ctl.cn->UfOOBnd,

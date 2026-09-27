@@ -248,16 +248,15 @@ arm mesh_static             runs    -                        "" "printf '%s\ndyn
 # OpenFOAM did (1,000 -> 2,400 -> 8,000 cells) and read max|U| 1.2e-04 m/s against OpenFOAM's 2.7330361.
 # 100% out, in silence, behind a refusal. The refusal now reads the DICTIONARY's own `solvers` entry.
 #
-# THE ARMS DISCRIMINATE BY THEIR NEEDLE, not by running. This gate's base is laminar/damBreak, which is
-# 2-D, and a 2-D adaptive case is refused for its `empty` patch -- measured, alpha 5.2e-03 from OpenFOAM at
-# the first change that maps a non-trivial state (inter_amr_cpp.cu says the whole measurement). So all three
-# arms below are refused, and what each one proves is WHICH refusal fires: the empty patch for a dictionary
-# with no motion, and the MOTION SOLVER for one with it -- including past an EMPTY `solvers {}`, which
-# OpenFOAM builds no motion solver from (dynamicMotionSolverListFvMesh.C:98-133 with `mandatory` false).
-# A refusal keyed on the word `solvers` rather than on a motion solver being there would fail the middle arm.
+# THE OPPOSITE ARMS ARE THE POINT. This gate's base is laminar/damBreak, which is 2-D, and a 2-D adaptive
+# case RUNS: its mapper is gated exactly by the third arm of tests/refine_update_vs_openfoam.sh, which is
+# the arm that found the hull average putting an `empty` patch's stored values into the average where
+# OpenFOAM has zeros. What the third arm below proves is that the MOTION refusal keys on a motion solver
+# being there -- including past an EMPTY `solvers {}`, which OpenFOAM builds no motion solver from
+# (dynamicMotionSolverListFvMesh.C:98-133 with `mandatory` false) and brae must therefore run.
 REFDICT="printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\nrefineInterval 1;\nfield alpha.water;\nlowerRefineLevel 0.001;\nupperRefineLevel 0.999;\nunrefineLevel 10;\nnBufferLayers 1;\nmaxRefinement 1;\nmaxCells 100000;\ncorrectFluxes ((phi none) (rhoPhi none) (nHatf none));\ndumpLevel true;\n%s\n' '\$HDR'"
-arm mesh_refine_only        refused "is \`empty\`"          "" "$REFDICT '' > constant/dynamicMeshDict"
-arm mesh_refine_emptySolvers refused "is \`empty\`"         "" "$REFDICT 'solvers { }' > constant/dynamicMeshDict"
+arm mesh_refine_only        runs    -                        "" "$REFDICT '' > constant/dynamicMeshDict"
+arm mesh_refine_emptySolvers runs   -                        "" "$REFDICT 'solvers { }' > constant/dynamicMeshDict"
 arm mesh_refine_motion      refused "motion solver"          "" "$REFDICT 'solvers { VF { motionSolverLibs (fvMotionSolvers); motionSolver solidBody; solidBodyMotionFunction oscillatingLinearMotion; amplitude (0.1 0 0); omega 6.283185307179586; } }' > constant/dynamicMeshDict"
 
 # MRF
@@ -265,15 +264,15 @@ arm mesh_refine_motion      refused "motion solver"          "" "$REFDICT 'solve
 # What is refused is what no gate holds, each by name. ZONE writes a 100-cell `rotor` cellZone into
 # damBreak, so the arms below reach the refusal they name and not "no such zone".
 ZONE="python3 -c \"open('constant/polyMesh/cellZones','w').write('FoamFile { version 2.0; format ascii; class regIOobject; location \\\"constant/polyMesh\\\"; object cellZones; }\\n1\\n(\\nrotor\\n{\\n    type cellZone;\\n    cellLabels List<label> 100(' + ' '.join(str(i) for i in range(100)) + ');\\n}\\n)\\n')\""
+# ...and the ZONE refusal, which this gate CAN reach now that a 2-D adaptive case runs: changeMesh is
+# reached at the first change.
+arm mesh_refine_zone        refused "zone(s)"                "" "$REFDICT '' > constant/dynamicMeshDict && $ZONE"
 # A ZONE THROUGH A TOPOLOGY CHANGE is refused by changeMesh, which renumbers none of the three kinds
 # (OpenFOAM's resetZones, polyTopoChange.C:1600-1968, does). THE REFUSAL WAS UNREACHABLE until this
 # session: changeInput hardcoded the zone count to 0, so a case carrying a cellZone refined with the zone
 # still in the OLD numbering -- and an MRF zone or an fvOption's cellZone would then apply itself to
 # whatever those labels now name. The count comes from the polyMesh directory now, by ENTRY COUNT and not
 # by the file's existence (subsetMesh writes all three files for every mesh it makes, each holding `0()`).
-# NO ARM HERE CAN REACH IT: changeMesh runs at the first change, and this gate's base is 2-D, where the
-# `empty`-patch refusal fires first in readInterAmr. It wants a 3-D adaptive base, which this gate does not
-# stage.
 
 MRFD="printf '%s\nMRF1 { cellZone rotor; origin (0 0 0); axis (0 0 1); OMEGA }\n' '$HDR' > constant/MRFProperties"
 arm mrf_noSuchZone          refused "is not in constant/polyMesh/cellZones" "" "printf '%s\nMRF1 { cellZone all; origin (0 0 0); axis (0 0 1); omega 10; }\n' '$HDR' > constant/MRFProperties"
@@ -850,7 +849,7 @@ if [ $HAVE_GPU = 1 ]; then
     # gate's base is 2-D, so what the arms below show is that the refusals fire in the right ORDER on it:
     # the missing mandatory entries first, then the empty patch, then the motion solver.
     arm device_mesh_dynamic refused "dynamicRefineFvMesh"     "-device" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
-    arm device_refine_empty refused "is \`empty\`"           "-device" "$REFDICT '' > constant/dynamicMeshDict"
+    arm device_refine_runs  runs    -                         "-device" "$REFDICT '' > constant/dynamicMeshDict"
     arm device_refine_motion refused "motion solver"          "-device" "$REFDICT 'solvers { VF { motionSolverLibs (fvMotionSolvers); motionSolver solidBody; solidBodyMotionFunction oscillatingLinearMotion; amplitude (0.1 0 0); omega 6.283185307179586; } }' > constant/dynamicMeshDict"
     # ...nor a non-orthogonal correction where it is not zero
     # the non-orthogonal correction runs on the device now (tests/interfoam_dambreak_vs_openfoam.sh

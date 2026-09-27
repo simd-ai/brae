@@ -97,6 +97,10 @@ struct InterAmrOldTime
     std::vector<vector>*                    UOO      = nullptr;
     std::vector<std::vector<vector>>*       UOOBnd   = nullptr;
     std::vector<scalar>*                    rhoOO    = nullptr;
+    // ...and ALPHA's old-old level, which is the DEVICE arm's representation of the same fact: its closure
+    // rebuilds rho.oldTime().oldTime() from alpha1.oldTime().oldTime() (dCn.alpha1OO) where the host loop
+    // keeps rhoOO directly. Null on the host arm, which has no such field.
+    std::vector<scalar>*                    alphaOO  = nullptr;
     SurfaceScalarField*                     phiOld   = nullptr;
     // ...and Uf.oldTime(), which is what ddtCorr reads in phi.oldTime()'s place on a DYNAMIC mesh --
     // and a refining mesh is dynamic (fvcDdt.C:219-228 branches on mesh.dynamic(), not moving()). Left

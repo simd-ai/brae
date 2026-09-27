@@ -180,36 +180,21 @@ InterAmr readInterAmr(
     amr.active = true;
     amr.controls = dynamicRefine::readRefineControls(d);
 
-    // AN `empty` PATCH ON A REFINING MESH IS REFUSED, and the number is why. A 2-D adaptive case agrees
-    // with OpenFOAM while the fields it maps are TRIVIAL and parts from it the moment they are not:
+    // A 2-D CASE RUNS, and it did not for a while. Porting autoMap for the `empty` and `noSlip` patch
+    // fields let one through, and it agreed with OpenFOAM only while the fields it mapped were trivial:
+    // with every solve pinned to 1e-14 relTol 0, the first change that mapped a NON-TRIVIAL state read
+    // alpha 5.2e-03 and U 3.7e-01 from OpenFOAM (laminar/damBreak), where the 3-D fixture is exact.
     //
-    //   laminar/damBreak, adaptive (maxRefinement 1, refineInterval 2 so the only change is at step 2),
-    //   every solve pinned to tolerance 1e-14 relTol 0 so the comparison is not the Krylov stopping point:
-    //     step 1, no change                 alpha 0.0e+00, U 4.2e-12, phi 6.3e-12   -- the floor
-    //     step 2, ONE change                alpha 5.2e-03, U 3.7e-01, phi 1.8e-01, rAU 4.7e-01
-    //   and the same case with CrankNicolson reads the same numbers, so the scheme is not the cause; the
-    //   3-D fixture (laminar/damBreakWithObstacle, no empty patch) maps a non-trivial state at ITS second
-    //   change and is exact to 1.9e-15. The first change of a 2-D case maps a zero Uf, a uniform rAU and
-    //   an alpha of 0 and 1, which every mapper gets right -- which is why a two-step 2-D run agreed on
-    //   every iteration count and hid this.
-    //
-    // WHAT IS NOT YET KNOWN is whether the defect is in the MAPPER or in the solver's post-change rebuild:
-    // the empty patch's own mapped value is NOT it (measured -- re-evaluating it from the face cells after
-    // the map changes no digit). tools/dumpRefineUpdate is the oracle that will name it, and it needs its
-    // typed fields generalised past damBreakWithObstacle's patch names first.
-    //
-    // The three shipped adaptive tutorials are 3-D, so this refusal costs none of them.
-    for (const FvPatch& q : patches)
-    {
-        if (q.type != "empty") continue;
-        throw std::runtime_error(
-            std::string(WHO) + "patch `" + q.name + "` is `empty`, and a 2-D adaptive case is not carried: "
-            "measured on laminar/damBreak with every solve pinned to 1e-14, the first change that maps a "
-            "NON-TRIVIAL state reads alpha 5.2e-03 and U 3.7e-01 from OpenFOAM, where the 3-D fixture is "
-            "exact to 1.9e-15. The first change of such a case maps a zero Uf and a uniform rAU, which is "
-            "why a shorter run agrees. Refused until the cause is named.");
-    }
-
+    // THE CAUSE was the hull average, and OpenFOAM's own dynamicRefineFvMesh named it in one run
+    // (tools/dumpRefineUpdate on a 2-D mesh, now the third arm of tests/refine_update_vs_openfoam.sh):
+    // a refined 2-D mesh has INTERNAL faces in the EMPTY direction -- the mesh is one cell thick, so its
+    // only z-normal faces are the empty patch's, and hexRef8 splits each cell into eight, including
+    // across z -- and those faces are INJECTED, with no old face to map from. OpenFOAM averages the hull
+    // out of a flat array it fills from each patch field in turn, and an emptyFvPatchField is
+    // ZERO-SIZED on a patch that has faces, so its faces keep the zero and still count. brae's is sized,
+    // and its values were going into the average: braePhi 161.0 where OpenFOAM had -6.8e-30.
+    // FluxMeshView::patchHoldsNoValues carries the distinction now, and the 2-D case reads alpha
+    // 1.8e-15 and U 4.5e-12 at that same step.
 
     // the mesh this run starts from, and the state that goes with it. A mesh that has never been refined
     // carries no cellLevel on disk and starts at level 0 everywhere; its history is the identity, which is
@@ -336,6 +321,7 @@ bool interAmrUpdate(
     if (old.alphaOld) amr.state.cellScalars.push_back(*old.alphaOld);
     if (old.rhoOld)   amr.state.cellScalars.push_back(*old.rhoOld);
     if (old.rhoOO)    amr.state.cellScalars.push_back(*old.rhoOO);
+    if (old.alphaOO)  amr.state.cellScalars.push_back(*old.alphaOO);
     if (old.UOld)     amr.state.cellVectors.push_back(*old.UOld);
     if (old.UOO)      amr.state.cellVectors.push_back(*old.UOO);
     const bool carryPhiOld = old.phiOld != nullptr;
@@ -547,6 +533,7 @@ bool interAmrUpdate(
     if (carryRAU) f.rAU = amr.state.cellScalars.at(0);
     if (amr.state.cellScalars.size() != scalarsBefore
         + (old.alphaOld ? 1u : 0u) + (old.rhoOld ? 1u : 0u) + (old.rhoOO ? 1u : 0u)
+        + (old.alphaOO ? 1u : 0u)
      || amr.state.cellVectors.size() != vectorsBefore
         + (old.UOld ? 1u : 0u) + (old.UOO ? 1u : 0u)
         + (cnRhoU ? 1u : 0u) + (cnCorrU ? 1u : 0u))
@@ -559,6 +546,7 @@ bool interAmrUpdate(
         if (old.alphaOld) *old.alphaOld = amr.state.cellScalars.at(si++);
         if (old.rhoOld)   *old.rhoOld   = amr.state.cellScalars.at(si++);
         if (old.rhoOO)    *old.rhoOO    = amr.state.cellScalars.at(si++);
+        if (old.alphaOO)  *old.alphaOO  = amr.state.cellScalars.at(si++);
         if (old.UOld)     *old.UOld     = amr.state.cellVectors.at(vi++);
         if (old.UOO)      *old.UOO      = amr.state.cellVectors.at(vi++);
         if (carryPhiOld)
@@ -634,6 +622,7 @@ bool interAmrUpdate(
             if (old.alphaOld) *old.alphaOld = f.alpha1.internal;
             if (old.UOld)     *old.UOld     = f.U.internal;
             if (old.UOO)      *old.UOO      = f.U.internal;
+            if (old.alphaOO)  *old.alphaOO  = f.alpha1.internal;
             if (old.phiOld)   *old.phiOld   = f.phi;
             if (old.UfOld)    *old.UfOld    = f.Uf;
             const auto patchValues = [&]()

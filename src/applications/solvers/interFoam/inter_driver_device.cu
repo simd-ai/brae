@@ -1921,10 +1921,15 @@ RunReport runInterFoamDevice(
             phiOldPrevB = pob;
             dCn.phiOOInt = &dPhiOOI;
             dCn.phiOOBnd = &dPhiOOB;
-            // ...and ON A MOVING MESH the Uf pair fvcDdtUfCorr takes in phi's place, with the same
+            // ...and ON A DYNAMIC MESH the Uf pair fvcDdtUfCorr takes in phi's place, with the same
             // lazy creation (the host driver's UfOOExists): the level is CREATED, as a copy of
             // Uf.oldTime(), on the step whose first ddtCorr evaluates dUfdt0 and so asks for it.
-            if (dyn)
+            //
+            // DYNAMIC, not moving: fvcDdt.C:219 routes ddtCorr(U, phi, Uf) on mesh.dynamic(), and a
+            // REFINING mesh is dynamic. Asking `dyn` here left an adaptive case's CN ddtCorr on the PHI
+            // branch, which CREATES ddtCorrDdt0(phi) -- a level OpenFOAM never makes on such a case, and
+            // the level the host arm does not have either. The adaptive branch's own check caught it.
+            if (f.meshIsDynamic)
             {
                 if (!UfOOExists && dCn.ddtCorrUf.exists && dCn.ddtCorrUf.timeIndex != thisIndex)
                 {
@@ -1967,9 +1972,21 @@ RunReport runInterFoamDevice(
             // the blend inert for that one step (see the host driver's note at offCentredFlux).
             dCn.phiOldExists = phiOldRequested;
             if (dCn.ocAlpha > scalar(0)) phiOldRequested = true;
-            // ...and on a STATIC mesh the pressure corrector's own ddtCorr (fvcDdtPhiCorr) asks for
-            // phi.oldTime() later in this same step, so the level exists from the next one
-            if (!dyn) phiOldRequested = true;
+            // ...and on a mesh that is NOT DYNAMIC the pressure corrector's own ddtCorr (fvcDdtPhiCorr)
+            // asks for phi.oldTime() later in this same step, so the level exists from the next one.
+            //
+            // DYNAMIC, NOT MOVING, and this is the EIGHTH site of that rule in this port. An ADAPTIVE mesh
+            // has no motion solver, so `dyn` is null and this said "nothing else will ask" -- where the
+            // host asks f.meshIsDynamic (inter_driver_cpp.cu) and does not. The consequence is one step of
+            // the ALPHA equation: at step 2, the first step whose ocAlpha is non-zero, the device convected
+            // with (1-cn)*phi.oldTime() + cn*phi where OpenFOAM's level is BORN there, as a copy of the
+            // flux beside it, so the blend is inert for that one step. MEASURED on damBreakWithObstacle
+            // under CrankNicolson with a change at step 2: max(alpha) 1.00008757432554 against the host's
+            // 1.00000006354563, and alpha 6.9e-04 from OpenFOAM by the end. It hides everywhere else --
+            // with no change that step, `phi` at that line already IS phi.oldTime() and the blend is inert
+            // either way; under Euler ocAlpha is 0 and it never runs. The value is unchanged for a static
+            // mesh (both predicates true) and for a moving one (both false).
+            if (!f.meshIsDynamic) phiOldRequested = true;
             dCn.alphaPhiOldInt = nullptr;
             dCn.alphaPhiOldBnd = nullptr;
             if (dCn.ocAlpha > scalar(0))
@@ -2146,15 +2163,6 @@ RunReport runInterFoamDevice(
             // DeviceMesh itself and with it every schedule cache that keys on its addressingId.
             else if (f.amr && f.amr->active && (outer == 0 || f.moveMeshOuterCorrectors))
             {
-                // CrankNicolson beside refinement is carried on the HOST arm (InterAmrCn) and not here:
-                // this loop keeps its ddt0 levels in DEVICE buffers (dUfOld, dUfOO, dAlphaPhiOld and the
-                // component arrays beside them), and mapping those means a second round trip this unit
-                // does not do. Refused by name rather than run with levels at the old face count.
-                if (cnDdt)
-                    throw std::runtime_error(
-                        "brae interFoam (device): the case runs CrankNicolson AND refinement. The scheme's "
-                        "ddt0 levels are device buffers on this arm and are not carried through a topology "
-                        "change; the host loop carries them. Run without -device.");
                 // ---- DOWN: the state the mapper carries, as the device holds it now.
                 //
                 // A BUFFER THIS LOOP HAS NOT WRITTEN YET IS EMPTY, and then the HOST's copy is the one
@@ -2255,8 +2263,154 @@ RunReport runInterFoamDevice(
                 oldT.UOldBnd = &uOldBndH;
                 oldT.phiOld = &phiOldH;
                 oldT.UfOld = &UfOld;
+
+                // ---- AND THE CrankNicolson STATE, which on THIS arm lives in device buffers where the
+                // host loop keeps it in locals. Every level is a registered field in OpenFOAM and is
+                // autoMapped with the rest (DDt0Field), so the same InterAmrCn carries them: they come
+                // down component by component, go through the mapper as host objects, and go back up.
+                //
+                // `exists`, `startTimeIndex` and `timeIndex` travel WITH each level and are not re-seeded:
+                // they are the field's own state in OpenFOAM too, and re-seeding them restarts the scheme
+                // as Euler at each change -- which is exactly what the gate's control does on purpose.
+                fv::CrankNicolsonDdt0<vector> hRhoU, hCorrU, hCorrUf;
+                std::vector<scalar> alphaOOH;
+                std::vector<vector> uOOH;
+                std::vector<std::vector<vector>> uOOBndH(fvp.size());
+                SurfaceScalarField phiOOH, alphaPhiEndH, alphaPhiOldH;
+                InterAmrCn cnState;
+                const auto downComponents = [&](const DeviceBuffer<scalar>* comp[3],
+                                                std::vector<vector>& out,
+                                                label n)
+                {
+                    std::vector<scalar> c[3];
+                    for (int k = 0; k < 3; ++k) comp[k]->copyTo(c[k]);
+                    out.assign(static_cast<std::size_t>(n), vector{0, 0, 0});
+                    for (label i = 0; i < n; ++i)
+                    {
+                        const std::size_t ii = static_cast<std::size_t>(i);
+                        out[ii] = vector{c[0][ii], c[1][ii], c[2][ii]};
+                    }
+                };
+                const auto splitPatches = [&](const std::vector<vector>& flat,
+                                              std::vector<std::vector<vector>>& out)
+                {
+                    out.assign(fvp.size(), std::vector<vector>());
+                    std::size_t off = 0;
+                    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                    {
+                        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                        const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+                        if (off + n > flat.size()) break;
+                        out[pi].assign(flat.begin() + off, flat.begin() + off + n);
+                        off += n;
+                    }
+                };
+                const auto downDdt0 = [&](const DeviceCnDdt0& d,
+                                          fv::CrankNicolsonDdt0<vector>& h,
+                                          label nInternal)
+                {
+                    h.name = d.name;
+                    h.exists = d.exists;
+                    h.startTimeIndex = d.startTimeIndex;
+                    h.timeIndex = d.timeIndex;
+                    h.internal.clear();
+                    h.boundary.clear();
+                    if (!d.exists) return;
+                    const DeviceBuffer<scalar>* ci[3] = {&d.internal[0], &d.internal[1], &d.internal[2]};
+                    if (ready((h.name + "'s cells").c_str(), d.internal[0].size(), nInternal))
+                    {
+                        downComponents(ci, h.internal, nInternal);
+                    }
+                    // a level created by the fvmDdt path carries NO boundary at all, which is brae's own
+                    // shape and not a shortcut (crank_nicolson_ddt_scheme_cpp.cu:91 against :257 and :406)
+                    if (d.boundary[0].size() == 0) return;
+                    if (!ready((h.name + "'s patches").c_str(), d.boundary[0].size(), nBf)) return;
+                    const DeviceBuffer<scalar>* cb[3] = {&d.boundary[0], &d.boundary[1], &d.boundary[2]};
+                    std::vector<vector> flat;
+                    downComponents(cb, flat, nBf);
+                    splitPatches(flat, h.boundary);
+                };
+                if (cnDdt)
+                {
+                    downDdt0(dCn.ddt0RhoU, hRhoU, nC);
+                    downDdt0(dCn.ddtCorrU, hCorrU, nC);
+                    downDdt0(dCn.ddtCorrUf, hCorrUf, nIf);
+                    if (ready("alpha.oldTime().oldTime()", dAOO.size(), nC)) dAOO.copyTo(alphaOOH);
+                    {
+                        const DeviceBuffer<scalar>* ci[3] = {&dUoox, &dUooy, &dUooz};
+                        if (ready("U.oldTime().oldTime()", dUoox.size(), nC))
+                        {
+                            downComponents(ci, uOOH, nC);
+                        }
+                        const DeviceBuffer<scalar>* cb[3] = {&dUoobx, &dUooby, &dUoobz};
+                        if (dUoobx.size() && ready("U.oldTime().oldTime()'s patches", dUoobx.size(), nBf))
+                        {
+                            std::vector<vector> flat;
+                            downComponents(cb, flat, nBf);
+                            splitPatches(flat, uOOBndH);
+                        }
+                    }
+                    // phi's old-old LEVEL is the device buffer, NOT the host vector beside it.
+                    // `phiOldPrevI` is this loop's bookkeeping for the NEXT step's level and has ALREADY
+                    // been advanced to this step's phiOld by the time this branch runs, so reading it here
+                    // carried phi(end of k-1) where the level holds phi(end of k-2). MEASURED by the trace:
+                    // at step 3 it gave phiOO 7.40256964e-05 against the host arm's 0.000325582339, which
+                    // is phiOld and not the old-old level at all.
+                    if (ready("phi.oldTime().oldTime()", dPhiOOI.size(), nIf))
+                    {
+                        dPhiOOI.copyTo(phiOOH.internal);
+                        phiOOH.boundary.assign(fvp.size(), std::vector<scalar>());
+                        if (dPhiOOB.size()) unflatten(dPhiOOB, phiOOH.boundary);
+                    }
+                    const auto downFlux = [&](const DeviceBuffer<scalar>& di,
+                                              const DeviceBuffer<scalar>& db,
+                                              SurfaceScalarField& out,
+                                              const char* what)
+                    {
+                        if (!ready(what, di.size(), nIf)) return;
+                        di.copyTo(out.internal);
+                        out.boundary.assign(fvp.size(), std::vector<scalar>());
+                        if (db.size()) unflatten(db, out.boundary);
+                    };
+                    downFlux(dAlphaPhiEndI, dAlphaPhiEndB, alphaPhiEndH, "alphaPhi10 at the step's end");
+                    downFlux(dAlphaPhiOldI, dAlphaPhiOldB, alphaPhiOldH, "alphaPhi10.oldTime()");
+
+                    cnState.ddt0RhoU = &hRhoU;
+                    cnState.ddtCorrU = &hCorrU;
+                    cnState.ddtCorrUf = &hCorrUf;
+                    cnState.ddtCorrPhi = nullptr;   // never created on a dynamic mesh; dCn's is checked below
+                    cnState.UfOO = &UfOO;
+                    cnState.phiOO = phiOOH.internal.empty() ? nullptr : &phiOOH;
+                    cnState.alphaPhiEnd = alphaPhiEndH.internal.empty() ? nullptr : &alphaPhiEndH;
+                    cnState.alphaPhiOld = alphaPhiOldH.internal.empty() ? nullptr : &alphaPhiOldH;
+                    oldT.alphaOO = alphaOOH.empty() ? nullptr : &alphaOOH;
+                    oldT.UOO = uOOH.empty() ? nullptr : &uOOH;
+                    oldT.UOOBnd = uOOBndH[0].empty() && uOOBndH.size() ? nullptr : &uOOBndH;
+                    if (dCn.ddtCorrPhi.exists)
+                        throw std::runtime_error(
+                            "brae interFoam (device, adaptive mesh): ddtCorrDdt0(phi) exists. ddtCorr takes "
+                            "the Uf branch on a dynamic mesh (fvcDdt.C:219), so this level should never have "
+                            "been created -- and nothing here maps it.");
+                }
+                if (cnDdt && std::getenv("BRAE_AMR_TRACE"))
+                {
+                    const auto amx = [](const std::vector<scalar>& v)
+                    { scalar m = 0; for (scalar x : v) m = std::fmax(m, std::fabs(x)); return m; };
+                    const auto amxv = [](const std::vector<vector>& v)
+                    { scalar m = 0; for (const vector& x : v) m = std::fmax(m, mag(x)); return m; };
+                    std::printf("  TRACE device step %ld: ddt0RhoU %.9g/%d/%ld ddtCorrU %.9g ddtCorrUf %.9g "
+                                "alphaOO %.9g UOO %.9g phiOO %.9g UfOO %.9g aPhiEnd %.9g aPhiOld %.9g "
+                                "aOld %.9g UOld %.9g phiOld %.9g UfOld %.9g\n",
+                                (long)stepIndex, (double)amxv(hRhoU.internal), (int)hRhoU.exists,
+                                (long)hRhoU.startTimeIndex, (double)amxv(hCorrU.internal),
+                                (double)amxv(hCorrUf.internal), (double)amx(alphaOOH), (double)amxv(uOOH),
+                                (double)amx(phiOOH.internal), (double)amxv(UfOO.internal),
+                                (double)amx(alphaPhiEndH.internal), (double)amx(alphaPhiOldH.internal),
+                                (double)amx(aOldH), (double)amxv(uOldH), (double)amx(phiOldH.internal),
+                                (double)amxv(UfOld.internal));
+                }
                 const bool changed =
-                    interAmrUpdate(*f.amr, f, *mutableMesh, stepIndex, oldT);
+                    interAmrUpdate(*f.amr, f, *mutableMesh, stepIndex, oldT, cnState);
                 if (changed)
                 {
                     // the solver's own rebuild, interFoam.C:118-142: gh and ghf, the flux from Sf & Uf
@@ -2361,6 +2515,105 @@ RunReport runInterFoamDevice(
                     // (device_inter_alpha_step.cu:224 tests its size against nIf).
                     dPrevCorrI.copyFrom(std::vector<scalar>());
                     dPrevCorrB.copyFrom(std::vector<scalar>());
+
+                    // ---- AND THE CrankNicolson STATE BACK UP, each level into the buffers it came from,
+                    // at the NEW counts. The scalars ride with it untouched.
+                    if (cnDdt)
+                    {
+                        const auto upComponents = [&](const std::vector<vector>& src,
+                                                      DeviceBuffer<scalar>* comp[3])
+                        {
+                            std::vector<scalar> c[3];
+                            for (int k = 0; k < 3; ++k) c[k].resize(src.size());
+                            for (std::size_t i = 0; i < src.size(); ++i)
+                            {
+                                c[0][i] = src[i].x; c[1][i] = src[i].y; c[2][i] = src[i].z;
+                            }
+                            for (int k = 0; k < 3; ++k) comp[k]->copyFrom(c[k]);
+                        };
+                        const auto flatPatches = [&](const std::vector<std::vector<vector>>& b)
+                        {
+                            std::vector<vector> flat;
+                            for (std::size_t pi = 0; pi < fvp.size() && pi < b.size(); ++pi)
+                            {
+                                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                                flat.insert(flat.end(), b[pi].begin(), b[pi].end());
+                            }
+                            return flat;
+                        };
+                        const auto upDdt0 = [&](const fv::CrankNicolsonDdt0<vector>& h, DeviceCnDdt0& d)
+                        {
+                            if (!h.exists) return;
+                            DeviceBuffer<scalar>* ci[3] = {&d.internal[0], &d.internal[1], &d.internal[2]};
+                            upComponents(h.internal, ci);
+                            if (h.boundary.empty()) return;
+                            DeviceBuffer<scalar>* cb[3] = {&d.boundary[0], &d.boundary[1], &d.boundary[2]};
+                            upComponents(flatPatches(h.boundary), cb);
+                        };
+                        upDdt0(hRhoU, dCn.ddt0RhoU);
+                        upDdt0(hCorrU, dCn.ddtCorrU);
+                        upDdt0(hCorrUf, dCn.ddtCorrUf);
+                        // ...and the Uf pair, which is uploaded at the TOP of a step from the host copies
+                        // the mapper has just rewritten: without this the rest of THIS step reads the old
+                        // face count, exactly as phi's old-old level would.
+                        uploadSurfaceVector(UfOld, fvp, dUfOld, dUfOldB);
+                        uploadSurfaceVector(UfOO, fvp, dUfOO, dUfOOB);
+                        if (!alphaOOH.empty()) dAOO.copyFrom(alphaOOH);
+                        if (!uOOH.empty())
+                        {
+                            DeviceBuffer<scalar>* ci[3] = {&dUoox, &dUooy, &dUooz};
+                            upComponents(uOOH, ci);
+                        }
+                        if (dUoobx.size())
+                        {
+                            DeviceBuffer<scalar>* cb[3] = {&dUoobx, &dUooby, &dUoobz};
+                            upComponents(flatPatches(uOOBndH), cb);
+                        }
+                        if (!phiOOH.internal.empty())
+                        {
+                            // the LEVEL back into its own buffer, which the rest of THIS step reads: it is
+                            // uploaded at the TOP of a step, so after a change in the middle of one it
+                            // would still be the old face count -- what the ddtCorr size check caught.
+                            if (dPhiOOI.size()) dPhiOOI.copyFrom(phiOOH.internal);
+                            if (dPhiOOB.size()) dPhiOOB.copyFrom(flattenPatches(phiOOH.boundary, fvp));
+                        }
+                        // ...and the loop's bookkeeping for the NEXT step's level, which holds THIS step's
+                        // phiOld and is mapped with it.
+                        if (!phiOldPrevI.empty())
+                        {
+                            phiOldPrevI = phiOldH.internal;
+                            phiOldPrevB = flattenPatches(phiOldH.boundary, fvp);
+                        }
+                        if (!alphaPhiEndH.internal.empty())
+                        {
+                            dAlphaPhiEndI.copyFrom(alphaPhiEndH.internal);
+                            if (dAlphaPhiEndB.size())
+                                dAlphaPhiEndB.copyFrom(flattenPatches(alphaPhiEndH.boundary, fvp));
+                        }
+                        if (!alphaPhiOldH.internal.empty())
+                        {
+                            dAlphaPhiOldI.copyFrom(alphaPhiOldH.internal);
+                            if (dAlphaPhiOldB.size())
+                                dAlphaPhiOldB.copyFrom(flattenPatches(alphaPhiOldH.boundary, fvp));
+                        }
+                    }
+                }
+                if (changed && cnDdt && std::getenv("BRAE_AMR_TRACE"))
+                {
+                    std::printf("  TRACE sizes after the change: nC %ld nIf %ld nBf %ld | ddt0RhoU %zu/%zu "
+                                "ddtCorrU %zu/%zu ddtCorrUf %zu/%zu | dAOO %zu dUoox %zu dUoobx %zu "
+                                "dPhiOO %zu/%zu aPhiEnd %zu/%zu aPhiOld %zu/%zu dUfOld %zu/%zu "
+                                "dUfOO %zu/%zu\n",
+                                (long)nC, (long)nIf, (long)nBf,
+                                dCn.ddt0RhoU.internal[0].size(), dCn.ddt0RhoU.boundary[0].size(),
+                                dCn.ddtCorrU.internal[0].size(), dCn.ddtCorrU.boundary[0].size(),
+                                dCn.ddtCorrUf.internal[0].size(), dCn.ddtCorrUf.boundary[0].size(),
+                                dAOO.size(), dUoox.size(), dUoobx.size(),
+                                dPhiOOI.size(), dPhiOOB.size(),
+                                dAlphaPhiEndI.size(), dAlphaPhiEndB.size(),
+                                dAlphaPhiOldI.size(), dAlphaPhiOldB.size(),
+                                dUfOld[0].size(), dUfOldB[0].size(),
+                                dUfOO[0].size(), dUfOOB[0].size());
                 }
                 if (verbose)
                 {

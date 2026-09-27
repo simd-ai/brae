@@ -252,15 +252,24 @@ int main(
     struct Bounds
     {
         scalar alpha, pRgh, u, p, rAU, phi, Uf, contErr, devAlpha, devPhi, hostDevAlpha, hostDevPhi;
+        // the device arm's own floor on alpha and p_rgh, which is a little above the host's under
+        // CrankNicolson: the two arms run the same scheme on the same mapped state and differ only by the
+        // order their reductions sum in.
+        scalar devPRgh, hostDevPRgh;
     };
     //   cn      7.7716e-15 alpha, 7.3e-15 p_rgh, 4.5e-13 U, 2.7e-14 p, 6.9e-12 rAU, 1.2e-13 phi
+    //   and the cn profile's DEVICE arm: alpha 2.1982e-14 from OpenFOAM and 2.2714e-14 from the host,
+    //   p_rgh 2.0474e-14 and 1.9853e-14, U 8.8e-13, phi 4.3e-13
     const bool closed = (profile == "closed");
     const bool cn = (profile == "cn");
     const Bounds B = closed
-        ? Bounds{5e-14, 1e-14, 1e-12, 1e-13, 1e-11, 5e-12, 1e-12, 1e-9, 5e-14, 1e-12, 1e-14, 5e-12}
+        ? Bounds{5e-14, 1e-14, 1e-12, 1e-13, 1e-11, 5e-12, 1e-12, 1e-9, 5e-14, 1e-12, 1e-14, 5e-12,
+                 1e-14, 1e-14}
         : cn
-        ? Bounds{1e-14, 1e-14, 1e-12, 1e-13, 1e-11, 1e-12, 1e-12, 1e-9, 1e-14, 1e-12, 1e-14, 1e-12}
-        : Bounds{5e-15, 1e-14, 1e-12, 1e-13, 1e-11, 1e-12, 1e-12, 1e-9, 5e-15, 1e-12, 5e-15, 1e-12};
+        ? Bounds{1e-14, 1e-14, 1e-12, 1e-13, 1e-11, 1e-12, 1e-12, 1e-9, 5e-14, 1e-12, 5e-14, 1e-12,
+                 5e-14, 5e-14}
+        : Bounds{5e-15, 1e-14, 1e-12, 1e-13, 1e-11, 1e-12, 1e-12, 1e-9, 5e-15, 1e-12, 5e-15, 1e-12,
+                 1e-14, 1e-14};
 
     Arm A;
     runArm(A, caseDir, startDir, nSteps);
@@ -580,27 +589,6 @@ int main(
     // integer maps -- so what this measures is the round trip: every mesh-sized buffer down to the
     // host, the change, and every one of them back up on a DeviceMesh rebuilt from scratch. A buffer
     // left at the old size, or a schedule cache replaying the old addressing, lands here.
-    if (cn)
-    {
-        // CrankNicolson beside refinement is REFUSED on the device arm: its ddt0 levels are device
-        // buffers, and mapping them is a unit of its own. A refusal that stops firing is how a port
-        // surfaces, so the gate asserts it here rather than leaving the arm out.
-        bool refused = false;
-        std::string what;
-        try
-        {
-            Arm D;
-            runArm(D, caseDir, startDir, nSteps, /*onDevice=*/true);
-        }
-        catch (const std::exception& e)
-        {
-            refused = true;
-            what = e.what();
-        }
-        check("the device arm refuses CrankNicolson beside refinement", refused);
-        check("...and names the scheme", what.find("CrankNicolson") != std::string::npos);
-    }
-    else
     {
         Arm D;
         runArm(D, caseDir, startDir, nSteps, /*onDevice=*/true);
@@ -625,14 +613,15 @@ int main(
             // The bounds are the two arms' own floor on this case, measured; the host arm is held to
             // OpenFOAM above, so a device number is the device's own distance.
             check("the device's alpha is at this profile's floor from OpenFOAM's", dvA.linf < B.devAlpha);
-            check("the device's p_rgh is within 1e-14 relative", dvP.rel() < scalar(1e-14));
+            check("the device's p_rgh is at this profile's floor, relative", dvP.rel() < B.devPRgh);
             check("the device's U is within 1e-12 relative", dvU.rel() < scalar(1e-12));
             check("the device's phi is at this profile's floor, relative", dvPhi.rel() < B.devPhi);
             // ...and against the HOST arm, which is the sharper of the two: both loops run the same
             // host mapper and the same host pcorr, so what is left between them is the device's own
             // arithmetic on the mapped fields.
             check("the device is at this profile's floor from the host arm's alpha", hvA.linf < B.hostDevAlpha);
-            check("the device is within 1e-14 of the host arm's p_rgh", hvP.rel() < scalar(1e-14));
+            check("the device is at this profile's floor from the host arm's p_rgh",
+                  hvP.rel() < B.hostDevPRgh);
             check("the device is within 1e-12 of the host arm's U", hvU.rel() < scalar(1e-12));
             check("the device is at this profile's floor from the host arm's phi", hvPhi.rel() < B.hostDevPhi);
         }
