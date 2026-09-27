@@ -3822,6 +3822,21 @@ add_test(NAME hex_ref8_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/hex_ref8_vs_openfoam.sh)
 set_tests_properties(hex_ref8_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
+# UNIT 8e: brae's interFoam on an ADAPTIVE mesh against real OpenFOAM's -- the whole chain through the
+# solver, on the mesh OpenFOAM itself refined, with a control for each half (the flux rebuild and the
+# old-time mapping). The script says what the two steps exercise and what this fixture cannot witness.
+add_executable(test_inter_amr_vs_openfoam tests/test_inter_amr_vs_openfoam.cu)
+target_include_directories(test_inter_amr_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_amr_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_amr_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_amr_vs_openfoam.sh)
+set_tests_properties(interfoam_amr_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_inter_amr_vs_openfoam
+                     TIMEOUT 900)
+
 # brae's dynamicRefineFvMeshCoeffs reader against the three shipped AMR tutorials' own dictionaries --
 # flat, flat-beside-a-subdict, and wrapped. The oracle is the dictionary; the script says why all three.
 add_executable(test_refine_controls tests/test_refine_controls.cu)

@@ -201,6 +201,13 @@ struct InterFields
     // The type is opaque here (inter_amr_cpp.cuh has it) so that this header does not pull the dynamic
     // mesh in.
     std::shared_ptr<struct InterAmr> amr;
+    // OpenFOAM's mesh.dynamic(): MOVING or TOPO-CHANGING. ONE field, because it is the predicate five
+    // different things ask -- `correctPhi`'s default, whether Uf exists at all (createUfIfPresent.H:38),
+    // whether fvc::correctUf runs (fvcMeshPhi.C:224) and which branch fvc::ddtCorr takes (fvcDdt.C:219).
+    // Deriving it per site from `dynamicMesh != nullptr` made an ADAPTIVE case answer no to all of them:
+    // Uf was never built, so the field the AMR adapter lists as mapped was never mapped, and ddtCorr ran
+    // the phi.oldTime() form where OpenFOAM runs the Uf.oldTime() one.
+    bool meshIsDynamic = false;
     // createMRF.H: every ACTIVE zone of constant/MRFProperties, resolved against the mesh. Empty is a
     // case without MRF. UEqn.H and pEqn.H reach it in four places -- see inter_ueqn_cpp.cuh and
     // inter_peqn_cpp.cuh.

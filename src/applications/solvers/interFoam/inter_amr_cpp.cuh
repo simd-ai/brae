@@ -97,6 +97,10 @@ struct InterAmrOldTime
     std::vector<std::vector<vector>>*       UOOBnd   = nullptr;
     std::vector<scalar>*                    rhoOO    = nullptr;
     SurfaceScalarField*                     phiOld   = nullptr;
+    // ...and Uf.oldTime(), which is what ddtCorr reads in phi.oldTime()'s place on a DYNAMIC mesh --
+    // and a refining mesh is dynamic (fvcDdt.C:219-228 branches on mesh.dynamic(), not moving()). Left
+    // unmapped it is the old face count at the next ddt term, which throws before it can be wrong.
+    SurfaceVectorField*                     UfOld    = nullptr;
 };
 
 // One mesh.update() for an adaptive mesh, at the top of an outer corrector. Returns true when the mesh
@@ -118,10 +122,11 @@ bool interAmrUpdate(
 // The GAMG agglomeration is CLEARED here and not rebuilt: it is keyed on the mesh it was built for, and a
 // refined mesh is a different one. Keeping it would solve the pressure equation on the old coarse levels.
 void interAfterMeshChange(
-    InterFields&        f,
-    const MutableMesh&  mm,
-    GamgAgglomerationCache& gamgCache,
-    RunReport&          rep);
+    InterFields&              f,
+    const MutableMesh&        mm,
+    GamgAgglomerationCache&   gamgCache,
+    const CorrectPhiControls& cpc,
+    RunReport&                rep);
 
 } // namespace interFoam
 } // namespace cpu

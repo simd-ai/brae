@@ -390,7 +390,17 @@ RunReport runInterFoam(
     AlphaTaps* alphaTaps)
 {
     InterFields f = buildInterFields(caseDir, startDir, m, g, patches);
-    const label nC = m.nCells();
+    // THE CELL COUNT IS READ LIVE, NOT CAPTURED. `m` is the caller's mutable mesh, which an adaptive step
+    // REPLACES in place -- so a cached count makes every per-cell reduction after a refinement run over
+    // the pre-refinement cells only. MEASURED from OpenFOAM's own written phi on this case: the Courant
+    // number over the whole 42,266-cell mesh is 0.08797028, which is OpenFOAM's logged 0.0879703, and over
+    // the first 32,256 cells alone it is 0.04125969 -- which is exactly what brae reported. The refined
+    // children are the smallest cells, where Co is largest, so a stale count hides them. With
+    // `adjustTimeStep yes` that reading would go into setDeltaTVoF and pick a step twice too large.
+    //
+    // `nCAtStart` is kept for the two PRE-LOOP calls below only, which seed the CrankNicolson levels
+    // against the mesh as read.
+    const label nCAtStart = m.nCells();
 
     // A MESH THAT MOVES is attached to the caller's mutable objects -- the ones the fields were just
     // built against, checked by address -- and moved in place at every mesh update below.
@@ -666,8 +676,8 @@ RunReport runInterFoam(
     // one step and Euler-estimated for the next. inter_cn_restart.cuh carries the two facts; the
     // objects are the driver's, so the seeding is. `ddtCorrDdt0(Uf)` is not among them -- a moving mesh
     // is refused at the case reader for want of a fixture that could witness a seed.
-    seedCnDdt0(cnDdt0RhoU, f.cnRestart, static_cast<std::size_t>(nC), patches);
-    seedCnDdt0(cnDdtCorrU, f.cnRestart, static_cast<std::size_t>(nC), patches);
+    seedCnDdt0(cnDdt0RhoU, f.cnRestart, static_cast<std::size_t>(nCAtStart), patches);
+    seedCnDdt0(cnDdtCorrU, f.cnRestart, static_cast<std::size_t>(nCAtStart), patches);
     seedCnDdt0(cnDdtCorrPhi, f.cnRestart, static_cast<std::size_t>(m.nInternalFaces()), patches);
     // ...AND THE OLD-OLD LEVELS, which the scheme reads and which OpenFOAM reads back off disk as
     // <field>_0 (inter_cn_restart.cuh): the level the restart directory holds is the one that rotates
@@ -675,7 +685,7 @@ RunReport runInterFoam(
     // the value already in UOld/phiOld here. Without them a restart's first ddt0 estimate is
     // rDtCoef0*(x - x) = 0 where OpenFOAM's is a real difference. rho_0 and alpha.water_0 are never
     // written, so those two levels stay the copies OpenFOAM starts them as.
-    readCnOldOld(f.cnRestart, "U_0", static_cast<std::size_t>(nC), patches, UOO, UOOBnd);
+    readCnOldOld(f.cnRestart, "U_0", static_cast<std::size_t>(nCAtStart), patches, UOO, UOOBnd);
     phiOOExists = readCnOldOldSurface(f.cnRestart, "phi_0", m.nInternalFaces(), patches, phiOO);
     // ...and phi.oldTime() then EXISTS from the first step, so alphaEqn's blend reads the level rather
     // than the flux beside it. NUMERICALLY A NO-OP HERE, measured: with this line removed the restart
@@ -721,7 +731,7 @@ RunReport runInterFoam(
                         [&]{ std::vector<scalar> b;
                              for (const auto& p : f.phi.boundary) b.insert(b.end(), p.begin(), p.end());
                              return b; }(),
-                        nC, m.nInternalFaces());
+                        m.nCells(), m.nInternalFaces());
                     rep.CoNum = courantNo(sumPhi, g.V(), rep.deltaT).CoNum;
                     // alphaCourantNo needs the same sumPhi, so it is cached on the report rather than
                     // recomputed -- OpenFOAM's two #includes build it twice, which is the one place
@@ -779,11 +789,18 @@ RunReport runInterFoam(
                         oldT.UOOBnd = &UOOBnd;
                         oldT.rhoOO = &rhoOO;
                         oldT.phiOld = &phiOld;
+                        oldT.UfOld = &UfOld;
                         const bool changed =
                             interAmrUpdate(*f.amr, f, *mutableMesh, rep.steps, oldT);
                         if (changed)
                         {
-                            interAfterMeshChange(f, *mutableMesh, gamgCache, rep);
+                            // interFoam.C:118-123, FIRST of everything the change triggers: the previous
+                            // step's MULES correction flux is DROPPED when the topology changed --
+                            // talphaPhi1Corr0.clear(). It is a flux on faces that no longer exist.
+                            // Empty is how alphaEqnStep is told there is none (alpha_eqn_cpp.cu:552).
+                            prevCorr.internal.clear();
+                            prevCorr.boundary.clear();
+                            interAfterMeshChange(f, *mutableMesh, gamgCache, cpc, rep);
                         }
                         // OpenFOAM prints "Refined from N to M cells." at every change; this is the same
                         // line, and a run that silently refines nothing is what it exists to show.
@@ -992,7 +1009,11 @@ RunReport runInterFoam(
                     // rho == alpha1*rho1 + alpha2*rho2 (alphaEqnSubCycle.H:36), and the viscosities
                     // with it. rho.oldTime() is NOT touched: fvm::ddt's source needs the value from
                     // the start of the step, and this is where it would be lost.
-                    for (label c = 0; c < nC; ++c) f.alpha2[c] = scalar(1) - f.alpha1.internal[c];
+                    f.alpha2.resize(static_cast<std::size_t>(m.nCells()));
+                    for (label c = 0; c < m.nCells(); ++c)
+                    {
+                        f.alpha2[c] = scalar(1) - f.alpha1.internal[c];
+                    }
                     cpu::twoPhase::mixtureRho(f.alpha1.internal, f.alpha2, f.mixture.phases, f.rho);
                     cpu::twoPhase::mixtureMu (f.alpha1.internal, f.mixture.phases, f.mu);
                     cpu::twoPhase::mixtureNu (f.alpha1.internal, f.mu, f.mixture.phases, f.nu);
@@ -1249,9 +1270,9 @@ RunReport runInterFoam(
                         dc.UOO = &UOO;
                         dc.UOOBnd = &UOOBnd;
                         dc.phiOO = &phiOO;
-                        // ...and on a MOVING mesh the Uf pair, which fvcDdtUfCorr takes in phi's
+                        // ...and on a DYNAMIC mesh the Uf pair, which fvcDdtUfCorr takes in phi's
                         // place. Same lazy creation as phiOO above.
-                        if (dyn)
+                        if (f.meshIsDynamic)
                         {
                             if (!UfOOExists && cnDdtCorrUf.exists && cnDdtCorrUf.timeIndex != rep.steps)
                             {
@@ -1266,11 +1287,14 @@ RunReport runInterFoam(
                             dc.UfOO = &UfOO;
                         }
                     }
-                    // ddtCorr(U, phi, Uf) is ddtCorr(U, Uf) when the mesh is dynamic
-                    dc.UfOld = dyn ? &UfOld : nullptr;
+                    // ddtCorr(U, phi, Uf) is ddtCorr(U, Uf) when the mesh is DYNAMIC -- fvcDdt.C:219
+                    // asks mesh.dynamic(), which is moving OR topo-changing, so a REFINING mesh takes
+                    // the Uf branch as a moving one does. Asking dyn instead sent an adaptive case down
+                    // the phi branch, where OpenFOAM's own run of it writes a Uf at every step.
+                    dc.UfOld = f.meshIsDynamic ? &UfOld : nullptr;
                     // ...and the static form READS phi.oldTime(), which creates the level: from here
                     // on the alpha step's blend has one to use (see phiOldRequested)
-                    if (!dyn) phiOldRequested = true;
+                    if (!f.meshIsDynamic) phiOldRequested = true;
 
                     PressureStepInput pin;
                     pin.UEqn = &UEqn; pin.rho = &f.rho; pin.gh = &f.gh; pin.ghf = &f.ghfInternal;
@@ -1283,7 +1307,8 @@ RunReport runInterFoam(
                     pin.solveLog = &rep.pSolves;
                     pin.mrf = f.mrfZones.empty() ? nullptr : &f.mrfZones;
                     pin.meshPhi = dyn ? &fvcMeshPhi(*dyn, f) : nullptr;
-                    pin.Uf = dyn ? &f.Uf : nullptr;
+                    // fvc::correctUf runs on a DYNAMIC mesh (fvcMeshPhi.C:224), which a refining one is
+                    pin.Uf = f.meshIsDynamic ? &f.Uf : nullptr;
                     // pEqn.H:4, rAU.ref() = 1/UEqn.A(): kept for the next mesh update's CorrectPhi
                     pin.rAUOut = &f.rAU;
 
@@ -1410,7 +1435,7 @@ RunReport runInterFoam(
         if (verbose)
         {
             scalar aMin = f.alpha1.internal[0], aMax = f.alpha1.internal[0], mass = 0, maxU = 0;
-            for (label c = 0; c < nC; ++c)
+            for (label c = 0; c < m.nCells(); ++c)
             {
                 aMin = std::fmin(aMin, f.alpha1.internal[c]);
                 aMax = std::fmax(aMax, f.alpha1.internal[c]);
@@ -1434,7 +1459,7 @@ RunReport runInterFoam(
     rep.alphaMax = f.alpha1.internal[0];
     rep.alphaMass = 0;
     rep.maxU = 0;
-    for (label c = 0; c < nC; ++c)
+    for (label c = 0; c < m.nCells(); ++c)
     {
         rep.alphaMin = std::fmin(rep.alphaMin, f.alpha1.internal[c]);
         rep.alphaMax = std::fmax(rep.alphaMax, f.alpha1.internal[c]);

@@ -52,6 +52,18 @@
 // pressure solves converged, and the two multi-paddle ones approximating p_rgh under a notice, since
 // their `p_rgh { $pcorr; }` names a pattern-keyed entry brae's dictionary expansion does not resolve.
 //
+// AND AN ADAPTIVE MESH, on the host: dynamicRefineFvMesh refining and unrefining on the case's own
+// driving field, through hexRef8 and removeFaces, with every field the change invalidates mapped --
+// alpha1, U and p_rgh with their patch fields, phi, rhoPhi, nHatf, Uf, rAU, alpha2's patch values and
+// every old-time level -- and the solver's own rebuild after it: gh, ghf, the mixture, the curvature,
+// `phi = Sf & Uf` and the pcorr solve that makes the mapped flux divergence-free again.
+// tests/interfoam_amr_vs_openfoam.sh holds laminar/damBreakWithObstacle against OpenFOAM's own two
+// steps: the same mesh cell for cell, alpha 1.9e-15, U 2.4e-13 relative, and all nine pressure solves
+// on OpenFOAM's iteration count and residual. Still refused BY NAME: a moving mesh beside refinement,
+// turbulence, waves, MRF, fvOptions, CrankNicolson, a pressure reference, a CN restart directory,
+// `correctPhi no`, a `correctFluxes` entry naming a velocity or NaN, and a coupled patch on a refining
+// mesh. `-device` refuses the whole thing (device_mesh_dynamic).
+//
 // AND `Gauss interfaceCompression` on the alpha fluxes, on BOTH paths: the PhiScheme four waveMakers
 // name for div(phirb,alpha) -- two cell values and no gradient, so it carries onto the device whole.
 //

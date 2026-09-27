@@ -849,7 +849,8 @@ InterFields buildInterFields(const std::string&          caseDir,
         // `dynamic` is OpenFOAM's mesh.dynamic(): moving OR topo-changing. It is what correctPhi defaults
         // to, and a REFINING mesh is dynamic -- measured on damBreakWithObstacle, where OpenFOAM writes a
         // Uf and an rAU beside every time directory and solves pcorr at every step.
-        const bool dynamic = (f.dynamicMesh != nullptr) || adaptive;
+        f.meshIsDynamic = (f.dynamicMesh != nullptr) || adaptive;
+        const bool dynamic = f.meshIsDynamic;
         f.correctPhi = switchOr("correctPhi", dynamic);
         f.checkMeshCourantNo = switchOr("checkMeshCourantNo", false);
         f.moveMeshOuterCorrectors = switchOr("moveMeshOuterCorrectors", false);
@@ -1545,7 +1546,11 @@ InterFields buildInterFields(const std::string&          caseDir,
     // createUfIfPresent.H: the face velocity of a moving mesh, interpolate(U) to begin with. A
     // `Uf` file in the start directory is a restart's, and a restart of a moving mesh is refused
     // where the mesh is read.
-    if (f.dynamicMesh)
+    // createUfIfPresent.H:38-58 builds Uf `if (mesh.dynamic())`, which is MOVING OR TOPO-CHANGING -- not
+    // "has a motion solver". MEASURED: OpenFOAM's own run of laminar/damBreakWithObstacle, a refine-only
+    // case, writes a Uf beside every time directory. Built on f.dynamicMesh instead, an adaptive case had
+    // no Uf at all, so the flux rebuild a mesh change needs (phi = Sf & Uf) would have read zeros.
+    if (f.meshIsDynamic)
     {
         std::vector<std::vector<vector>> Ub(patches.size());
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
