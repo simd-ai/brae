@@ -287,6 +287,47 @@ if grep -q "Cannot find surfaceScalarField braePhi" "$CB/log.dru"; then
     echo "FAIL: braePhi is NOT in the second case's flux table, so the correction never ran"; exit 1
 fi
 
+# ...AND A THIRD CASE, 2-D: laminar/damBreak, which has an `empty` patch. That is not a variation for its
+# own sake -- it is the only shape in which a refined mesh has INTERNAL FACES IN THE EMPTY DIRECTION. The
+# mesh is one cell thick, so its only z-normal faces are the empty patch's; hexRef8 splits each cell into
+# EIGHT, including across z, so the mid-plane faces become internal and INJECTED, with no old face to map
+# from -- which is exactly what the hull average is for.
+#
+# IT CAUGHT A DEFECT THE 3-D CASE CANNOT SEE. OpenFOAM's hull average reads a FLAT array over every face,
+# zero-initialised, which it fills from each patch field in turn (dynamicRefineFvMeshTemplates.C:42-53):
+# an emptyFvPatchField is constructed ZERO-SIZED on a patch that HAS faces, so its faces keep the zero --
+# and still count in the denominator. brae's own empty patch field is sized, and its values were going into
+# the average. MEASURED here before the fix: braePhi 160.99999999999926 on an injected internal face where
+# OpenFOAM has -6.8369774502318468e-30, and braePhiFlat 3285.8333333333335 against 880.5. After it, every
+# arm is exact.
+#
+# AND IT CLOSED THE END-TO-END 2-D DEFECT: adaptive 2-D damBreak read alpha 5.2e-03 and U 3.7e-01 from
+# OpenFOAM at the first change that maps a non-trivial state (with every solve pinned to 1e-14 so the
+# comparison is not the Krylov stopping point) and reads alpha 1.8e-15 and U 4.5e-12 after it. The cell
+# counts, which diverged at the third change, now match at every step.
+C2="$W/case2D"
+rm -rf "$C2"
+cp -r "$TUT/multiphase/interFoam/laminar/damBreak/damBreak" "$C2" || exit 1
+rm -rf "$C2"/0 "$C2"/processor* "$C2"/log.*
+cp -r "$C2/0.orig" "$C2/0"
+HDR='FoamFile { version 2.0; format ascii; class dictionary; object dynamicMeshDict; }'
+printf '%s\ndynamicFvMesh dynamicRefineFvMeshDump;\nrefineInterval 1;\nfield alpha.water;\nlowerRefineLevel 0.001;\nupperRefineLevel 0.999;\nunrefineLevel 10;\nnBufferLayers 1;\nmaxRefinement 2;\nmaxCells 100000;\ncorrectFluxes ((phi none) (rhoPhi none) (nHatf none) (braePhi none) (braePhiFlat none) (alphaPhi0.water none) (ghf none) (alphaPhiUn none));\ndumpLevel true;\n' "$HDR" > "$C2/constant/dynamicMeshDict"
+( cd "$C2" && blockMesh > log.blockMesh 2>&1 && setFields > log.setFields 2>&1 ) \
+    || { echo "FAIL: preparing the 2-D case"; tail -20 "$C2"/log.*; exit 1; }
+NC2=$(awk '/nCells:/{print $2; exit}' "$C2/log.blockMesh")
+[ -n "$NC2" ] || { echo "FAIL: could not read the 2-D cell count from blockMesh's log"; exit 1; }
+python3 "$(dirname "$0")/refine_update_typed_fields.py" "$C2" "$NC2" \
+    || { echo "FAIL: could not write the 2-D typed fields"; exit 1; }
+grep -q "defaultFaces:empty" <(python3 "$(dirname "$0")/refine_update_typed_fields.py" "$C2" "$NC2") \
+    || { echo "FAIL: the 2-D case has no empty patch, so the injected faces this arm exists for do not"
+         echo "      exist either"; exit 1; }
+( cd "$C2" && dumpRefineUpdate -case . -steps 3 -radius 0.05 -centre '(0.28 0.28 0.0073)' \
+                               -velocity '(0.05 0 0)' -out d.dump > log.dru 2>&1 ) \
+    || { echo "FAIL: dumpRefineUpdate in $C2"; tail -25 "$C2/log.dru"; exit 1; }
+grep -E "^(Refined|Unrefined) from" "$C2/log.dru" | sed 's/^/  OpenFOAM 2-D: /'
+grep -q "^Unrefined from" "$C2/log.dru" \
+    || { echo "FAIL: OpenFOAM unrefined nothing on the 2-D case either"; exit 1; }
+
 rc=0
 echo "--- arm: the tutorial's own correctFluxes (nothing for braePhi), OpenFOAM's volumes injected"
 "$BIN" "$C" "$C/d.dump" || rc=1
@@ -294,5 +335,7 @@ echo "--- arm: the same, with brae's own FvGeometry::V() weighting the merges (t
 BRAE_REFINE_UPDATE_OWN_V=1 "$BIN" "$C" "$C/d.dump" || rc=1
 echo "--- arm: correctFluxes ((braePhi braeU)) -- the flux CORRECTION, which no tutorial reaches"
 "$BIN" "$CB" "$CB/d.dump" || rc=1
+echo "--- arm: 2-D (laminar/damBreak), where a refined cell makes internal faces in the EMPTY direction"
+"$BIN" "$C2" "$C2/d.dump" || rc=1
 echo "refine_update_vs_openfoam: rc $rc"
 exit $rc

@@ -740,12 +740,23 @@ int main(int argc, char** argv)
             // so the bound is ZERO on both arms.
             // UNIT 8a: the typed patch fields. Pure addressing and a zero-gradient fill, so bound 0.
             {
-                const auto flatScalarBnd = [](const GeometricField<scalar>& f)
+                // AN `empty` PATCH CONTRIBUTES NOTHING TO OpenFOAM'S ARRAY, and that is not a detail of
+                // the dump: emptyFvPatchField is constructed ZERO-SIZED on a patch that has faces
+                // (emptyFvPatchField.C:41), so OpenFOAM writes no value for any of them. brae's own
+                // empty patch field IS sized -- both loops index it per face -- so a flat comparison has
+                // to skip those patches or it compares 5,434 values against 208 on a 2-D mesh, which is
+                // what pointing this harness at laminar/damBreak first read.
+                const auto skipPatch = [&](std::size_t pi)
+                {
+                    return pi < s.patches.size() && s.patches[pi].type == "empty";
+                };
+                const auto flatScalarBnd = [&](const GeometricField<scalar>& f)
                 {
                     std::vector<scalar> out;
-                    for (const auto& b : f.boundary)
+                    for (std::size_t pi = 0; pi < f.boundary.size(); ++pi)
                     {
-                        const std::vector<scalar> v = b->value();
+                        if (skipPatch(pi)) continue;
+                        const std::vector<scalar> v = f.boundary[pi]->value();
                         out.insert(out.end(), v.begin(), v.end());
                     }
                     return out;
@@ -755,9 +766,10 @@ int main(int argc, char** argv)
                 compareScalars("p_rgh's patch values", flatScalarBnd(casePrgh), sc,
                                std::to_string(step) + "/casePrghBnd", scalar(0));
                 std::vector<scalar> flatU;
-                for (const auto& b : caseU.boundary)
+                for (std::size_t pi = 0; pi < caseU.boundary.size(); ++pi)
                 {
-                    for (const vector& v : b->value())
+                    if (skipPatch(pi)) continue;
+                    for (const vector& v : caseU.boundary[pi]->value())
                     {
                         flatU.push_back(v.x);
                         flatU.push_back(v.y);
@@ -771,22 +783,24 @@ int main(int argc, char** argv)
                 // A patch of another type writes an empty list on OpenFOAM's side, so the comparison is
                 // over the patches that HAVE the state, in patch order.
                 std::vector<scalar> refV, vFrac, grad, p0;
-                for (const auto& b : caseAlpha.boundary)
+                for (std::size_t pi = 0; pi < caseAlpha.boundary.size(); ++pi)
                 {
-                    const std::vector<scalar> r = b->mappedRefValues();
+                    if (skipPatch(pi)) continue;
+                    const std::vector<scalar> r = caseAlpha.boundary[pi]->mappedRefValues();
                     refV.insert(refV.end(), r.begin(), r.end());
-                    const std::vector<scalar> v = b->mappedValueFraction();
+                    const std::vector<scalar> v = caseAlpha.boundary[pi]->mappedValueFraction();
                     vFrac.insert(vFrac.end(), v.begin(), v.end());
                 }
                 compareScalars("alpha.water's inletOutlet refValue", refV, sc,
                                std::to_string(step) + "/caseAlphaRefValue", scalar(0));
                 compareScalars("alpha.water's inletOutlet valueFraction", vFrac, sc,
                                std::to_string(step) + "/caseAlphaValueFraction", scalar(0));
-                for (const auto& b : casePrgh.boundary)
+                for (std::size_t pi = 0; pi < casePrgh.boundary.size(); ++pi)
                 {
-                    const std::vector<scalar> g = b->mappedGradient();
+                    if (skipPatch(pi)) continue;
+                    const std::vector<scalar> g = casePrgh.boundary[pi]->mappedGradient();
                     grad.insert(grad.end(), g.begin(), g.end());
-                    const std::vector<scalar> q = b->mappedP0();
+                    const std::vector<scalar> q = casePrgh.boundary[pi]->mappedP0();
                     p0.insert(p0.end(), q.begin(), q.end());
                 }
                 compareScalars("p_rgh's fixedFluxPressure gradient", grad, sc,
@@ -801,9 +815,10 @@ int main(int argc, char** argv)
             for (const auto& e : typedScalars)
             {
                 std::vector<scalar> flat;
-                for (const auto& b : e.second->boundary)
+                for (std::size_t pi = 0; pi < e.second->boundary.size(); ++pi)
                 {
-                    const std::vector<scalar>& v = b->value();
+                    if (pi < s.patches.size() && s.patches[pi].type == "empty") continue;
+                    const std::vector<scalar>& v = e.second->boundary[pi]->value();
                     flat.insert(flat.end(), v.begin(), v.end());
                 }
                 compareScalars((e.first + "'s patch values").c_str(), flat, sc,
@@ -812,9 +827,10 @@ int main(int argc, char** argv)
             for (const auto& e : typedVectors)
             {
                 std::vector<scalar> flat;
-                for (const auto& b : e.second->boundary)
+                for (std::size_t pi = 0; pi < e.second->boundary.size(); ++pi)
                 {
-                    for (const vector& v : b->value())
+                    if (pi < s.patches.size() && s.patches[pi].type == "empty") continue;
+                    for (const vector& v : e.second->boundary[pi]->value())
                     {
                         flat.push_back(v.x);
                         flat.push_back(v.y);
@@ -836,8 +852,10 @@ int main(int argc, char** argv)
                 compareScalars((what + ", internal").c_str(), s.surfaceScalars.at(k).field, sc,
                                std::to_string(step) + "/" + names[k], bounds[k]);
                 std::vector<scalar> flat;
-                for (const std::vector<scalar>& pf : s.surfaceScalars.at(k).bnd)
+                for (std::size_t pi = 0; pi < s.surfaceScalars.at(k).bnd.size(); ++pi)
                 {
+                    if (pi < s.patches.size() && s.patches[pi].type == "empty") continue;
+                    const std::vector<scalar>& pf = s.surfaceScalars.at(k).bnd[pi];
                     flat.insert(flat.end(), pf.begin(), pf.end());
                 }
                 compareScalars((what + ", boundary").c_str(), flat, sc,

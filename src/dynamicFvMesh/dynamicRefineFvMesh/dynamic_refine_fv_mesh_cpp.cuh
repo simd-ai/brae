@@ -415,6 +415,15 @@ struct FluxMeshView
     std::vector<label>              owner;
     std::vector<label>              neighbour;
     std::vector<std::vector<label>> cells;      // each cell's faces, owner-then-neighbour ascending
+    // ...and WHICH PATCHES HOLD NO VALUES IN OpenFOAM, which is only `empty` today. It matters because
+    // the hull average reads a FLAT array over every face, zero-initialised, that OpenFOAM fills from
+    // each patch field in turn (dynamicRefineFvMeshTemplates.C:42-53): an emptyFvPatchField is
+    // constructed ZERO-SIZED on a patch that has faces, so its faces keep the ZERO -- and still COUNT in
+    // the average's denominator. brae's own empty patch field is sized, so without this the hull average
+    // adds values OpenFOAM does not have. MEASURED on 2-D damBreak against tools/dumpRefineUpdate:
+    // braePhi 160.99999999999926 on an injected internal face where OpenFOAM has -6.8369774502318468e-30,
+    // and braePhiFlat 3285.8333333333335 against 880.5.
+    std::vector<char>               patchHoldsNoValues;
 };
 
 // :268-291. OpenFOAM's `masterFaces` is a bitSet LOCAL to mapFields: it dies with the block and

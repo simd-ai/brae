@@ -1140,6 +1140,9 @@ void mapNewInternalFacesFlat(
     }
     for (std::size_t patchi = 0; patchi < sBnd.size(); ++patchi)
     {
+        // A PATCH WHOSE FIELD OpenFOAM HOLDS NOTHING FOR leaves its faces at the ZERO the array was
+        // built with -- see FluxMeshView::patchHoldsNoValues for the measurement. They still count.
+        if (patchi < m.patchHoldsNoValues.size() && m.patchHoldsNoValues[patchi]) continue;
         label facei = m.patchStart[patchi];
         for (const T& v : sBnd[patchi])
         {
@@ -2054,6 +2057,7 @@ void mapCarriedFields(
         {
             fv.patchStart.push_back(pp.start);
             fv.patchSize.push_back(pp.size);
+            fv.patchHoldsNoValues.push_back(pp.type == "empty" ? char(1) : char(0));
         }
         fv.owner = s.m.owner();
         fv.neighbour = s.m.neighbour();
@@ -2457,6 +2461,7 @@ RefineUpdateStep refineUpdate(
                 {
                     fvU.patchStart.push_back(pp.start);
                     fvU.patchSize.push_back(pp.size);
+                    fvU.patchHoldsNoValues.push_back(pp.type == "empty" ? char(1) : char(0));
                 }
                 fvU.owner = s.m.owner();
                 fvU.neighbour = s.m.neighbour();
