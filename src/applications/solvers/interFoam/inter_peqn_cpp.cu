@@ -584,8 +584,12 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
     }
     SurfaceScalarField phiHbyA = fvc::flux(HbyA, HbyAb, m, g, patches);
 
-    if ((in.meshPhi == nullptr) != (in.Uf == nullptr))
-        throw std::runtime_error("brae interFoam pEqn: a moving mesh needs both meshPhi and Uf, or neither.");
+    // Uf WITHOUT meshPhi IS A DYNAMIC MESH THAT DOES NOT MOVE -- a refining one. OpenFOAM creates Uf on
+    // mesh.dynamic() (createUfIfPresent.H) and computes a mesh flux only on mesh.moving(), so the pair is
+    // not symmetric: Uf is the wider condition. meshPhi without Uf is not reachable in OpenFOAM, because
+    // moving implies dynamic, and is refused rather than run with a Uf nobody corrects.
+    if (in.meshPhi != nullptr && in.Uf == nullptr)
+        throw std::runtime_error("brae interFoam pEqn: a moving mesh has a mesh flux and no Uf.");
     if (in.ddt)
     {
         std::vector<scalar> rhoRAU;
@@ -1057,9 +1061,14 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
     // normal component replaced by the ABSOLUTE flux's, Uf += n*(phi/magSf - (n & Uf)) -- and then
     // phi is made relative to the motion. The flux that leaves here is the RELATIVE one, which the
     // next alpha equation convects with.
+    if (in.Uf)
+    {
+        // fvcMeshPhi.C:224 gates correctUf on mesh.DYNAMIC(), so it runs on a refining mesh too -- and
+        // there the flux is already absolute, so nothing is made relative afterwards.
+        correctUf(*in.Uf, U, phi, m, g, patches);
+    }
     if (in.meshPhi)
     {
-        correctUf(*in.Uf, U, phi, m, g, patches);
         makeRelativeFlux(phi, *in.meshPhi);
         // ...AND THE PRESSURE PATCHES ARE TOLD THE RELATIVE FLUX, because that is the one OpenFOAM's
         // LOOK UP. pEqn.H is included once per PISO corrector and each invocation ENDS here, so the
