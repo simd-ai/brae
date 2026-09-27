@@ -345,14 +345,12 @@ RunReport runInterFoamDevice(
     // MEASURED: tests/interfoam_refusals.sh's `device_mesh_dynamic` arm caught it -- "expected refused
     // naming `dynamicRefineFvMesh`, got runs". A capability claimed where it is not implemented is the
     // defect this project keeps finding; the refusal lives here, beside the loop that lacks it.
-    if (caseAsksForAdaptiveMesh(caseDir))
-    {
-        throw std::runtime_error(
-            "brae interFoam (device): the case asks for `dynamicFvMesh dynamicRefineFvMesh`. Adaptive "
-            "refinement is ported on the HOST loop only (inter_amr_cpp.cuh): this loop uploads the mesh "
-            "once and has no path that re-uploads it, so running the case here would solve every step "
-            "after the first on a mesh the device never saw.");
-    }
+    // THIS LOOP NOW RE-UPLOADS THE MESH. The refusal that stood here said "this loop uploads the mesh
+    // once and has no path that re-uploads it", which was true until the branch below `if (dyn)` was
+    // written; the refusals gate's `device_mesh_dynamic` arm is a `runs` arm now, and every refusal an
+    // adaptive case still has -- turbulence, a motion solver, MRF, fvOptions, CrankNicolson, a pressure
+    // reference, `correctPhi no`, a coupled patch -- is raised by the SHARED case build and the shared
+    // adapter (inter_case_cpp.cu, inter_amr_cpp.cu), so it fires on this arm without a copy here.
 
     DynamicMotionSolverFvMesh* dyn = f.dynamicMesh.get();
     // A cyclicACMI PAIR WHOSE `scale` MOVES WITH TIME is rescaled at every step, in place, on the
@@ -527,8 +525,11 @@ RunReport runInterFoamDevice(
                 "device pressure step carries neither. The host loop does. Run without -device.");
         }
     }
-    const label nC = m.nCells(), nIf = m.nInternalFaces();
-    const label nFaces = static_cast<label>(g.magSf().size());
+    // NOT CONST: a topology change moves all four, and the branch that takes one re-reads them from the
+    // mesh. Ten sites below index device arrays with them, and a cached count is how the host arm's own
+    // Courant number came out at half OpenFOAM's (inter_driver_cpp.cu's nCAtStart note).
+    label nC = m.nCells(), nIf = m.nInternalFaces();
+    label nFaces = static_cast<label>(g.magSf().size());
     label nBf = 0;
     for (const FvPatch& q : fvp) nBf += q.size;
 
@@ -584,24 +585,30 @@ RunReport runInterFoamDevice(
 
     DeviceMesh dm = buildDeviceMesh(m, g, fvp);
 
-    // the masks the device needs that the mesh does not carry
+    // the masks the device needs that the mesh does not carry. IN A LAMBDA because a topology change
+    // re-runs it: they are per boundary FACE, and hexRef8 splits boundary faces within their patch.
     std::vector<int> aFixes, aFlag, takeU, uFixes;
-    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    const auto buildBoundaryMasks = [&]()
     {
-        // EVERY DEVICE BOUNDARY ARRAY IS [non-coupled patches, in patch order] (device_mesh.cuh:41-44).
-        // A loop over all of fvp here makes the mask longer than the device's boundary-face count and
-        // shifts every patch after the pair onto the wrong faces.
-        if (isCoupledInterfaceType(fvp[pi].type)) continue;
-        const int fx = f.alpha1.boundary[pi]->fixesValue() ? 1 : 0;
-        const int fl = (fvp[pi].type == "empty") ? 1 : ((fvp[pi].type == "wedge") ? 2 : 0);
-        for (label i = 0; i < fvp[pi].size; ++i)
+        aFixes.clear(); aFlag.clear(); takeU.clear(); uFixes.clear();
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            aFixes.push_back(fx);
-            aFlag.push_back(fl);
-            takeU.push_back(f.U.boundary[pi]->assignable() ? 0 : 1);
-            uFixes.push_back(f.U.boundary[pi]->fixesValue() ? 1 : 0);
+            // EVERY DEVICE BOUNDARY ARRAY IS [non-coupled patches, in patch order] (device_mesh.cuh:41-44).
+            // A loop over all of fvp here makes the mask longer than the device's boundary-face count and
+            // shifts every patch after the pair onto the wrong faces.
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            const int fx = f.alpha1.boundary[pi]->fixesValue() ? 1 : 0;
+            const int fl = (fvp[pi].type == "empty") ? 1 : ((fvp[pi].type == "wedge") ? 2 : 0);
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                aFixes.push_back(fx);
+                aFlag.push_back(fl);
+                takeU.push_back(f.U.boundary[pi]->assignable() ? 0 : 1);
+                uFixes.push_back(f.U.boundary[pi]->fixesValue() ? 1 : 0);
+            }
         }
-    }
+    };
+    buildBoundaryMasks();
     DeviceBuffer<int> dAFixes(aFixes), dAFlag(aFlag), dTakeU(takeU), dUFixes(uFixes);
     // ...and one of them is NOT a property of the patch but of the face and the instant. alpha's
     // variableHeightFlowRate is a MIXED condition whose rebuild() sets valueFraction to 1 on an INFLOW
@@ -1793,7 +1800,12 @@ RunReport runInterFoamDevice(
         // Uf.oldTime(), snapshotted where the host driver snapshots it (inter_driver_cpp.cu:897,
         // alongside UOld and phiOld). The FLUX off it is built after this step's move, below: the
         // field is the step's, the geometry it is dotted with is the mesh's as it stands then.
-        if (dyn)
+        // ON A DYNAMIC MESH, which is moving OR topo-changing: Uf exists whenever mesh.dynamic() does
+        // (createUfIfPresent.H) and ddtCorr reads its old level on the same condition (fvcDdt.C:219).
+        // Asking `dyn` here left an ADAPTIVE case's UfOld at the field Uf started the run as, for the
+        // whole run -- alpha was exact (2.2e-15) and p_rgh 1.5e-02, U 2.2e-01 and phi 3.6e-01 out,
+        // measured against the host arm on damBreakWithObstacle. The rotation is the whole fix.
+        if (f.meshIsDynamic)
         {
             // storeOldTime rotates the level that EXISTS, before the old one is overwritten -- the
             // host driver does it at the end of the step, which is the same place: between the last
@@ -1807,9 +1819,9 @@ RunReport runInterFoamDevice(
             if (UfOld.internal.size() != static_cast<std::size_t>(nIf))
             {
                 throw std::runtime_error(
-                    "brae interFoam -device: the case moves its mesh but Uf has " +
+                    "brae interFoam -device: the case has a dynamic mesh but Uf has " +
                     std::to_string(UfOld.internal.size()) + " internal faces, not " +
-                    std::to_string(nIf) + ". ddtCorr reads (Sf & Uf.oldTime()) off it on a moving "
+                    std::to_string(nIf) + ". ddtCorr reads (Sf & Uf.oldTime()) off it on a dynamic "
                     "mesh (EulerDdtScheme's fvcDdtUfCorr); refusing rather than reading past it.");
             }
         }
@@ -2118,25 +2130,268 @@ RunReport runInterFoamDevice(
                 // relative to (fvc::makeRelative, pEqn.H:73). Over the full face array, as phi is.
                 dMeshPhi.copyFrom(fullFace(fvcMeshPhi(*dyn, f), fvp));
                 C.meshPhiAll = &dMeshPhi;
+            }
+            // ...AND THE ADAPTIVE MESH, which is the same line of interFoam.C for a different
+            // dynamicFvMesh: mesh.update() selects, refines, unrefines and MAPS EVERY FIELD, and
+            // everything the solver rebuilds afterwards is what `changed` gates. `dyn` is null here --
+            // buildInterFields hands an adaptive case to no motion factory, and a case that asks for
+            // both is refused by name in readInterAmr -- so the two branches are exclusive.
+            //
+            // THE CHANGE IS HOST WORK ON EITHER ARM, exactly as the motion solve and CorrectPhi are:
+            // topology surgery, six integer maps and one autoMap per patch field, none of it per-cell
+            // arithmetic (manifest interFoam_dynamicRefine, HOST_ONLY). What this loop owes is the
+            // round trip -- the fields the mapper carries come down, the change happens, and every
+            // mesh-sized buffer goes back up. The moving branch above owes only the GEOMETRY, because
+            // a move keeps the addressing; a topology change keeps nothing, so this rebuilds the
+            // DeviceMesh itself and with it every schedule cache that keys on its addressingId.
+            else if (f.amr && f.amr->active && (outer == 0 || f.moveMeshOuterCorrectors))
+            {
+                // CrankNicolson beside refinement is carried on the HOST arm (InterAmrCn) and not here:
+                // this loop keeps its ddt0 levels in DEVICE buffers (dUfOld, dUfOO, dAlphaPhiOld and the
+                // component arrays beside them), and mapping those means a second round trip this unit
+                // does not do. Refused by name rather than run with levels at the old face count.
+                if (cnDdt)
+                    throw std::runtime_error(
+                        "brae interFoam (device): the case runs CrankNicolson AND refinement. The scheme's "
+                        "ddt0 levels are device buffers on this arm and are not carried through a topology "
+                        "change; the host loop carries them. Run without -device.");
+                // ---- DOWN: the state the mapper carries, as the device holds it now.
+                //
+                // A BUFFER THIS LOOP HAS NOT WRITTEN YET IS EMPTY, and then the HOST's copy is the one
+                // both arms hold -- buildInterFields wrote it and nothing has touched it. rhoPhi's is
+                // the case: the alpha step writes it, and at the first change no alpha step has run.
+                // Reading it anyway walked off the end of the array (SIGSEGV in unflatten, frame one a
+                // memcpy). Any size that is neither empty nor the mesh's is a defect and says so.
+                const auto ready = [&](const char* what, std::size_t have, label want) -> bool
+                {
+                    if (have == 0) return false;
+                    if (have != static_cast<std::size_t>(want))
+                        throw std::runtime_error(
+                            std::string("brae interFoam (device, adaptive mesh): ") + what + " is "
+                            + std::to_string(have) + " long where the mesh has " + std::to_string(want)
+                            + ". A buffer at another mesh's size cannot be mapped.");
+                    return true;
+                };
+                if (ready("alpha", dA.size(), nC))          dA.copyTo(f.alpha1.internal);
+                if (ready("p_rgh", dPrgh.size(), nC))       dPrgh.copyTo(f.p_rgh.internal);
+                if (ready("nHatf", dNH.size(), nIf))        dNH.copyTo(f.nHatf.internal);
+                if (ready("K", dK.size(), nC))              dK.copyTo(f.K);
+                if (ready("rhoPhi", dRpI.size(), nIf))      dRpI.copyTo(f.rhoPhi.internal);
+                if (ready("phi", dPhiI.size(), nIf))        dPhiI.copyTo(f.phi.internal);
+                if (ready("phi's patches", dPhiB.size(), nBf))     unflatten(dPhiB, f.phi.boundary);
+                if (ready("nHatf's patches", dNHB.size(), nBf))    unflatten(dNHB, f.nHatf.boundary);
+                if (ready("rhoPhi's patches", dRpB.size(), nBf))   unflatten(dRpB, f.rhoPhi.boundary);
+                {
+                    std::vector<scalar> cx, cy, cz;
+                    dUx.copyTo(cx); dUy.copyTo(cy); dUz.copyTo(cz);
+                    for (label c = 0; c < nC; ++c)
+                    {
+                        f.U.internal[static_cast<std::size_t>(c)] =
+                            vector{cx[static_cast<std::size_t>(c)], cy[static_cast<std::size_t>(c)],
+                                   cz[static_cast<std::size_t>(c)]};
+                    }
+                    f.U.evaluateBoundary();
+                }
+                // alpha's PATCH VALUES are the device's too, and they are what alpha's own patch field
+                // maps -- setValue writes value_ alone, which is the only part that was ever uploaded.
+                if (ready("alpha's patches", dABnd.size(), nBf))
+                {
+                    std::vector<std::vector<scalar>> ab;
+                    unflatten(dABnd, ab);
+                    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                    {
+                        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                        f.alpha1.boundary[pi]->setValue(ab[pi]);
+                    }
+                }
+                // ...and THE OLD-TIME LEVELS, which this loop keeps in device buffers where the host
+                // loop keeps them as locals. They go through the mapper as host vectors and come back
+                // mapped. At this point in the step they are bit-copies of their own fields -- the
+                // snapshot above the outer loop has just stored them -- which is why the host gate's
+                // re-capture control reads 0.0e+00; they are mapped anyway, because relying on that
+                // equality is how the next change (moveMeshOuterCorrectors) would go wrong in silence.
+                std::vector<scalar> aOldH = f.alpha1.internal;
+                if (ready("alpha.oldTime", dAOld.size(), nC)) dAOld.copyTo(aOldH);
+                std::vector<vector> uOldH = f.U.internal;
+                if (ready("U.oldTime", dUox.size(), nC))
+                {
+                    std::vector<scalar> ox, oy, oz;
+                    dUox.copyTo(ox); dUoy.copyTo(oy); dUoz.copyTo(oz);
+                    for (label c = 0; c < nC; ++c)
+                    {
+                        uOldH[static_cast<std::size_t>(c)] =
+                            vector{ox[static_cast<std::size_t>(c)], oy[static_cast<std::size_t>(c)],
+                                   oz[static_cast<std::size_t>(c)]};
+                    }
+                }
+                std::vector<std::vector<vector>> uOldBndH(fvp.size());
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi) uOldBndH[pi] = f.U.boundary[pi]->value();
+                if (ready("U.oldTime's patches", dUobx.size(), nBf))
+                {
+                    std::vector<scalar> bx, by, bz;
+                    dUobx.copyTo(bx); dUoby.copyTo(by); dUobz.copyTo(bz);
+                    std::size_t off = 0;
+                    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                    {
+                        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                        const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+                        if (off + n > bx.size()) break;
+                        uOldBndH[pi].resize(n);
+                        for (std::size_t i = 0; i < n; ++i)
+                        {
+                            uOldBndH[pi][i] = vector{bx[off + i], by[off + i], bz[off + i]};
+                        }
+                        off += n;
+                    }
+                }
+                SurfaceScalarField phiOldH = f.phi;
+                if (ready("phi.oldTime", dPhiOI.size(), nIf)) dPhiOI.copyTo(phiOldH.internal);
+                if (ready("phi.oldTime's patches", dPhiOB.size(), nBf))
+                    unflatten(dPhiOB, phiOldH.boundary);
+
+                InterAmrOldTime oldT;
+                oldT.alphaOld = &aOldH;
+                oldT.UOld = &uOldH;
+                oldT.UOldBnd = &uOldBndH;
+                oldT.phiOld = &phiOldH;
+                oldT.UfOld = &UfOld;
+                const bool changed =
+                    interAmrUpdate(*f.amr, f, *mutableMesh, stepIndex, oldT);
+                if (changed)
+                {
+                    // the solver's own rebuild, interFoam.C:118-142: gh and ghf, the flux from Sf & Uf
+                    // and its pcorr solve, the mixture and the curvature. One copy, shared with the
+                    // host loop, and the GAMG hierarchy un-built inside it.
+                    interAfterMeshChange(f, *mutableMesh, meshAgglomeration, meshCpc, rep);
+
+                    // ---- the counts every array below is sized by
+                    nC = m.nCells();
+                    nIf = m.nInternalFaces();
+                    nFaces = static_cast<label>(g.magSf().size());
+                    nBf = 0;
+                    for (const FvPatch& q : fvp) nBf += q.size;
+
+                    // ---- A FRESH DeviceMesh, not a geometry refresh. refreshDeviceMeshGeometry
+                    // THROWS on a changed count on purpose (device_mesh.cuh:237), and it would be the
+                    // wrong call anyway: buildDeviceMesh stamps a new addressingId, and every schedule
+                    // cache in the tree -- the Gauss-Seidel colourings, the AMG hierarchies, the PCG
+                    // and V-cycle workspaces, the coarse-level ids -- keys its validity on that id
+                    // (tools/cache_key_audit.py). Rebuilding the mesh is what invalidates all of them.
+                    dm = buildDeviceMesh(m, g, fvp);
+                    dic = buildDeviceDilu(m.owner(), m.neighbour(), nC);
+                    C.dic = &dic;
+                    // ...and the GAMG upload, whose key is the HOST hierarchy's build count. That count
+                    // is monotone across the change (inter_amr_cpp.cu un-builds the cache without
+                    // resetting it), so this would be correct without the line; it is set because an
+                    // upload from the old mesh must not survive on the strength of an argument.
+                    gamgCache.uploaded = false;
+                    gamgCache.uploadedBuild = -1;
+
+                    // ---- the masks and the boundary geometry, per boundary FACE
+                    buildBoundaryMasks();
+                    dAFixes.copyFrom(aFixes);
+                    dAFlag.copyFrom(aFlag);
+                    dTakeU.copyFrom(takeU);
+                    dUFixes.copyFrom(uFixes);
+                    dbU = buildDeviceVectorBoundary(f.U, fvp, g);
+                    deviceUpdateInletOutlet(dbU, dPhiB);
+
+                    // ---- UP: every mesh-sized buffer the step READS, from the mapped host fields
+                    dA.copyFrom(f.alpha1.internal);
+                    dAOld.copyFrom(aOldH);
+                    {
+                        std::vector<scalar> cx(static_cast<std::size_t>(nC)),
+                                           cy(static_cast<std::size_t>(nC)),
+                                           cz(static_cast<std::size_t>(nC));
+                        for (label c = 0; c < nC; ++c)
+                        {
+                            const vector& u = f.U.internal[static_cast<std::size_t>(c)];
+                            cx[static_cast<std::size_t>(c)] = u.x;
+                            cy[static_cast<std::size_t>(c)] = u.y;
+                            cz[static_cast<std::size_t>(c)] = u.z;
+                        }
+                        dUx.copyFrom(cx); dUy.copyFrom(cy); dUz.copyFrom(cz);
+                        for (label c = 0; c < nC; ++c)
+                        {
+                            const vector& u = uOldH[static_cast<std::size_t>(c)];
+                            cx[static_cast<std::size_t>(c)] = u.x;
+                            cy[static_cast<std::size_t>(c)] = u.y;
+                            cz[static_cast<std::size_t>(c)] = u.z;
+                        }
+                        dUox.copyFrom(cx); dUoy.copyFrom(cy); dUoz.copyFrom(cz);
+                    }
+                    {
+                        std::vector<scalar> bx, by, bz;
+                        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                        {
+                            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                            for (const vector& v : uOldBndH[pi])
+                            {
+                                bx.push_back(v.x); by.push_back(v.y); bz.push_back(v.z);
+                            }
+                        }
+                            if (dUobx.size()) { dUobx.copyFrom(bx); dUoby.copyFrom(by); dUobz.copyFrom(bz); }
+                    }
+                    dPhiI.copyFrom(f.phi.internal);
+                    dPhiB.copyFrom(flattenPatches(f.phi.boundary, fvp));
+                    if (dPhiOI.size()) dPhiOI.copyFrom(phiOldH.internal);
+                    if (dPhiOB.size()) dPhiOB.copyFrom(flattenPatches(phiOldH.boundary, fvp));
+                    dPrgh.copyFrom(f.p_rgh.internal);
+                    dNH.copyFrom(f.nHatf.internal);
+                    dNHB.copyFrom(flattenPatches(f.nHatf.boundary, fvp));
+                    dABnd.copyFrom(patchValues(f.alpha1, fvp));
+                    dK.copyFrom(f.K);
+                    if (dRpI.size()) dRpI.copyFrom(f.rhoPhi.internal);
+                    if (dRpB.size()) dRpB.copyFrom(flattenPatches(f.rhoPhi.boundary, fvp));
+                    dGh.copyFrom(f.gh);
+                    {
+                        SurfaceScalarField gf;
+                        gf.internal = f.ghfInternal;
+                        gf.boundary = f.ghfBoundary;
+                        dGhf.copyFrom(fullFace(gf, fvp));
+                    }
+                    dMagSf.copyFrom(magSfAll());
+                    dRAU.copyFrom(f.rAU);
+                    // rho, mu, nu and p are NOT uploaded: the step resizes and rewrites all four from
+                    // the mapped alpha before anything reads them (device_inter_alpha_step.cu:112-117),
+                    // and interAfterMeshChange has just recomputed the host's for its own pcorr solve.
+
+                    // ---- and the MULES correction flux is DROPPED, interFoam.C:118-123: it is a flux
+                    // on faces that no longer exist. Empty is how the alpha step is told there is none
+                    // (device_inter_alpha_step.cu:224 tests its size against nIf).
+                    dPrevCorrI.copyFrom(std::vector<scalar>());
+                    dPrevCorrB.copyFrom(std::vector<scalar>());
+                }
+                if (verbose)
+                {
+                    std::printf("    mesh: %ld cells refined, %ld split points unrefined, now %ld cells\n",
+                                (long)f.amr->nRefined, (long)f.amr->nUnrefined, (long)m.nCells());
+                }
+            }
+
+            // (Sf & Uf.oldTime()), the flux ddtCorr takes in phi.oldTime()'s place ON A DYNAMIC MESH --
+            // fvcDdt.C:219 asks mesh.dynamic(), which is moving OR topo-changing, so a REFINING mesh
+            // takes this branch as a moving one does. Built HERE, after either mesh update: fvcDdtUfCorr
+            // dots the STORED old Uf with mesh().Sf() (EulerDdtScheme.C:527-531), which a move or a
+            // change has just rewritten. Built before it, the error is INVISIBLE in step one -- Uf starts
+            // at zero and so does the flux, whatever the geometry -- and by step two it is 13% of |U| on
+            // testTubeMixer (measured: |U| 4.8e-01 of 3.6e+00 against the host arm, alpha still 6e-13;
+            // step one 1.6e-11).
+            if (f.meshIsDynamic)
+            {
+                // the ABSOLUTE flux fvc::correctUf reads at the end of the corrector, and rAU for the
+                // NEXT mesh update's CorrectPhi. Both are wanted on a refining mesh exactly as on a
+                // moving one, and both were set inside the moving branch until this block existed.
                 C.phiAbsIntOut = &dPhiAbsI;
                 C.phiAbsBndOut = &dPhiAbsB;
                 C.rAUOut       = &dRAU;
-                // ...and (Sf & Uf.oldTime()), the flux ddtCorr takes in phi.oldTime()'s place, on
-                // the mesh AS IT STANDS NOW. fvcDdtUfCorr dots the STORED old Uf with mesh().Sf()
-                // (EulerDdtScheme.C:527-531), which the move above has just changed, so this cannot
-                // be built before it. Built before it, the error is INVISIBLE in step one -- Uf
-                // starts at zero and so does the flux, whatever the geometry -- and by step two it
-                // is 13% of |U| on testTubeMixer (measured: |U| 4.8e-01 of 3.6e+00 against the host
-                // arm, alpha still 6e-13; step one 1.6e-11).
+                std::vector<scalar> pu(static_cast<std::size_t>(nIf));
+                for (label fc = 0; fc < nIf; ++fc)
                 {
-                    std::vector<scalar> pu(static_cast<std::size_t>(nIf));
-                    for (label fc = 0; fc < nIf; ++fc)
-                    {
-                        pu[static_cast<std::size_t>(fc)] = dot(g.Sf()[fc], UfOld.internal[fc]);
-                    }
-                    dPhiUfOld.copyFrom(pu);
-                    C.phiUfOldInt = &dPhiUfOld;
+                    pu[static_cast<std::size_t>(fc)] = dot(g.Sf()[fc], UfOld.internal[fc]);
                 }
+                dPhiUfOld.copyFrom(pu);
+                C.phiUfOldInt = &dPhiUfOld;
             }
 
             deviceInterStep(dm, rep.deltaT, C, props, H, dGh, dGhf, dMagSf,
@@ -2305,10 +2560,11 @@ RunReport runInterFoamDevice(
             }   // pimple.turbCorr()
 
             // fvc::correctUf(Uf, U, phi), pEqn.H:70-72 -- the END of the pressure corrector on a
-            // moving mesh. Uf is a HOST field (next step's ddtCorr reads (Sf & Uf.oldTime()) off it),
-            // so the device's U and phi come back for it. One copy of the arithmetic, shared with the
-            // host loop (correctUf, inter_peqn_cpp.cu).
-            if (dyn)
+            // DYNAMIC mesh, which fvcMeshPhi.C:224 gates on mesh.dynamic() and a refining mesh is. Uf is
+            // a HOST field (next step's ddtCorr reads (Sf & Uf.oldTime()) off it), so the device's U and
+            // phi come back for it. One copy of the arithmetic, shared with the host loop (correctUf,
+            // inter_peqn_cpp.cu). rAU comes back with it, for the next change's CorrectPhi.
+            if (f.meshIsDynamic)
             {
                 { std::vector<scalar> ux, uy, uz;
                   dUx.copyTo(ux); dUy.copyTo(uy); dUz.copyTo(uz);

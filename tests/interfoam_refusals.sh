@@ -237,11 +237,44 @@ arm mesh_motionSolver       refused "motionSolver"             "" "printf '%s\nd
 arm mesh_noType             refused "no \`dynamicFvMesh\` entry" "" "printf '%s\n' '$HDR' > constant/dynamicMeshDict"
 arm mesh_static             runs    -                        "" "printf '%s\ndynamicFvMesh staticFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
 
+# REFINEMENT BESIDE MOTION. In v2412 dynamicRefineFvMesh IS a dynamicMotionSolverListFvMesh
+# (dynamicRefineFvMesh.H:56-58): its init reads a `solvers` SUB-DICTIONARY and builds one motionSolver per
+# sub-dictionary in it, with `mandatory` false so ZERO of them is legal (dynamicRefineFvMesh.C:1106), and
+# update() refines FIRST and then moves (:1468-1474).
+#
+# brae carries the topology change and NOT the motion, and the refusal that named this case tested
+# `f.dynamicMesh` -- a pointer buildInterFields sets to null for every adaptive case, so it could never
+# fire. MEASURED on laminar/oscillatingBox before the fix, two steps of 5e-4: brae refined exactly as
+# OpenFOAM did (1,000 -> 2,400 -> 8,000 cells) and read max|U| 1.2e-04 m/s against OpenFOAM's 2.7330361.
+# 100% out, in silence, behind a refusal. The refusal now reads the DICTIONARY's own `solvers` entry.
+#
+# THE ARMS DISCRIMINATE BY THEIR NEEDLE, not by running. This gate's base is laminar/damBreak, which is
+# 2-D, and a 2-D adaptive case is refused for its `empty` patch -- measured, alpha 5.2e-03 from OpenFOAM at
+# the first change that maps a non-trivial state (inter_amr_cpp.cu says the whole measurement). So all three
+# arms below are refused, and what each one proves is WHICH refusal fires: the empty patch for a dictionary
+# with no motion, and the MOTION SOLVER for one with it -- including past an EMPTY `solvers {}`, which
+# OpenFOAM builds no motion solver from (dynamicMotionSolverListFvMesh.C:98-133 with `mandatory` false).
+# A refusal keyed on the word `solvers` rather than on a motion solver being there would fail the middle arm.
+REFDICT="printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\nrefineInterval 1;\nfield alpha.water;\nlowerRefineLevel 0.001;\nupperRefineLevel 0.999;\nunrefineLevel 10;\nnBufferLayers 1;\nmaxRefinement 1;\nmaxCells 100000;\ncorrectFluxes ((phi none) (rhoPhi none) (nHatf none));\ndumpLevel true;\n%s\n' '\$HDR'"
+arm mesh_refine_only        refused "is \`empty\`"          "" "$REFDICT '' > constant/dynamicMeshDict"
+arm mesh_refine_emptySolvers refused "is \`empty\`"         "" "$REFDICT 'solvers { }' > constant/dynamicMeshDict"
+arm mesh_refine_motion      refused "motion solver"          "" "$REFDICT 'solvers { VF { motionSolverLibs (fvMotionSolvers); motionSolver solidBody; solidBodyMotionFunction oscillatingLinearMotion; amplitude (0.1 0 0); omega 6.283185307179586; } }' > constant/dynamicMeshDict"
+
 # MRF
 # MRF IS PORTED on the host (tests/interfoam_mrf_vs_openfoam.sh holds laminar/mixerVessel2D to OpenFOAM).
 # What is refused is what no gate holds, each by name. ZONE writes a 100-cell `rotor` cellZone into
 # damBreak, so the arms below reach the refusal they name and not "no such zone".
 ZONE="python3 -c \"open('constant/polyMesh/cellZones','w').write('FoamFile { version 2.0; format ascii; class regIOobject; location \\\"constant/polyMesh\\\"; object cellZones; }\\n1\\n(\\nrotor\\n{\\n    type cellZone;\\n    cellLabels List<label> 100(' + ' '.join(str(i) for i in range(100)) + ');\\n}\\n)\\n')\""
+# A ZONE THROUGH A TOPOLOGY CHANGE is refused by changeMesh, which renumbers none of the three kinds
+# (OpenFOAM's resetZones, polyTopoChange.C:1600-1968, does). THE REFUSAL WAS UNREACHABLE until this
+# session: changeInput hardcoded the zone count to 0, so a case carrying a cellZone refined with the zone
+# still in the OLD numbering -- and an MRF zone or an fvOption's cellZone would then apply itself to
+# whatever those labels now name. The count comes from the polyMesh directory now, by ENTRY COUNT and not
+# by the file's existence (subsetMesh writes all three files for every mesh it makes, each holding `0()`).
+# NO ARM HERE CAN REACH IT: changeMesh runs at the first change, and this gate's base is 2-D, where the
+# `empty`-patch refusal fires first in readInterAmr. It wants a 3-D adaptive base, which this gate does not
+# stage.
+
 MRFD="printf '%s\nMRF1 { cellZone rotor; origin (0 0 0); axis (0 0 1); OMEGA }\n' '$HDR' > constant/MRFProperties"
 arm mrf_noSuchZone          refused "is not in constant/polyMesh/cellZones" "" "printf '%s\nMRF1 { cellZone all; origin (0 0 0); axis (0 0 1); omega 10; }\n' '$HDR' > constant/MRFProperties"
 # damBreak's walls are fixedFluxPressure, where constrainPressure takes MRF.relative(Sf & U_b)
@@ -812,7 +845,13 @@ if [ $HAVE_GPU = 1 ]; then
     BASE="$B"
     # the device pressure step runs the non-orthogonal loop (laminar/damBreak `nonorth` holds it)
     arm device_nNonOrth1    runs    -                        "-device" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"
+    # THE DEVICE ARM RUNS AN ADAPTIVE MESH NOW (tests/interfoam_amr_vs_openfoam.sh holds it to OpenFOAM
+    # at the floating-point floor: alpha 2.2e-15, p_rgh 6.1e-15 relative, U 3.2e-13) -- on a 3-D case. This
+    # gate's base is 2-D, so what the arms below show is that the refusals fire in the right ORDER on it:
+    # the missing mandatory entries first, then the empty patch, then the motion solver.
     arm device_mesh_dynamic refused "dynamicRefineFvMesh"     "-device" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
+    arm device_refine_empty refused "is \`empty\`"           "-device" "$REFDICT '' > constant/dynamicMeshDict"
+    arm device_refine_motion refused "motion solver"          "-device" "$REFDICT 'solvers { VF { motionSolverLibs (fvMotionSolvers); motionSolver solidBody; solidBodyMotionFunction oscillatingLinearMotion; amplitude (0.1 0 0); omega 6.283185307179586; } }' > constant/dynamicMeshDict"
     # ...nor a non-orthogonal correction where it is not zero
     # the non-orthogonal correction runs on the device now (tests/interfoam_dambreak_vs_openfoam.sh
     # `sheared` holds it to OpenFOAM); `uncorrected` on a mesh that is not orthogonal is still refused

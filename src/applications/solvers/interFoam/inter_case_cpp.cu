@@ -846,6 +846,20 @@ InterFields buildInterFields(const std::string&          caseDir,
         // honest: see the note on shared capability notices in the project's own history.
         const bool adaptive = caseAsksForAdaptiveMesh(caseDir);
         f.dynamicMesh = adaptive ? nullptr : DynamicMotionSolverFvMesh::New(caseDir, startDir);
+        // ...AND THE ADAPTIVE MESH ITSELF, BUILT HERE AND NOWHERE ELSE. It used to be built by the HOST
+        // driver, which is why the device arm ran an adaptive case with no InterAmr at all: its branch
+        // asks `f.amr && f.amr->active`, and a null pointer answered no. MEASURED on
+        // damBreakWithObstacle, two steps: the device arm reached `End:` having refined NOTHING, on
+        // 32,256 cells, reporting Courant 0.044 against the host arm's 0.088 -- the same silent half
+        // the host's own cached cell count produced, from a different cause.
+        //
+        // One builder for both drivers is the rule this project keeps relearning: a capability read at
+        // one call site and not the other is a substitution waiting for the second caller.
+        // ALWAYS, and inactive on a static mesh: readInterAmr returns before it touches the mesh when
+        // there is no dynamicMeshDict or it names another dynamicFvMesh, so this costs a static case one
+        // file test. Building it only for an adaptive case left every static one with a null pointer,
+        // which the host driver then refused -- 92 arms of tests/interfoam_refusals.sh at once.
+        f.amr = std::make_shared<InterAmr>(readInterAmr(caseDir, m, patches, g));
         // `dynamic` is OpenFOAM's mesh.dynamic(): moving OR topo-changing. It is what correctPhi defaults
         // to, and a REFINING mesh is dynamic -- measured on damBreakWithObstacle, where OpenFOAM writes a
         // Uf and an rAU beside every time directory and solves pcorr at every step.

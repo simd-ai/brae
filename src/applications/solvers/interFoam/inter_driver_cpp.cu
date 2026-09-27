@@ -406,9 +406,14 @@ RunReport runInterFoam(
     // built against, checked by address -- and moved in place at every mesh update below.
     // AN ADAPTIVE MESH, built against the same objects the fields were: its own copy of the mesh is what
     // refineUpdate advances, and the caller's mutable mesh is what every field and patch reads.
+    // BUILT BY buildInterFields, on both arms. A driver that built its own would be the only one that
+    // had it -- which is exactly what happened to the device arm.
     if (!f.amr)
     {
-        f.amr = std::make_shared<InterAmr>(readInterAmr(caseDir, m, patches, g));
+        throw std::runtime_error(
+            "brae interFoam: the case build handed this driver no InterAmr. buildInterFields makes one "
+            "for every case (inactive on a static mesh), and a caller that skipped it would run an "
+            "adaptive case as a static one.");
     }
     if (verbose)
     {
@@ -790,8 +795,23 @@ RunReport runInterFoam(
                         oldT.rhoOO = &rhoOO;
                         oldT.phiOld = &phiOld;
                         oldT.UfOld = &UfOld;
+                        // ...and the CrankNicolson levels, which are FIELDS in OpenFOAM's registry and
+                        // are autoMapped with everything else. Only the ones that exist are carried; on
+                        // an Euler case every `exists` is false and nothing rides.
+                        InterAmrCn cnState;
+                        if (cnDdt)
+                        {
+                            cnState.ddt0RhoU = &cnDdt0RhoU;
+                            cnState.ddtCorrU = &cnDdtCorrU;
+                            cnState.ddtCorrUf = &cnDdtCorrUf;
+                            cnState.ddtCorrPhi = &cnDdtCorrPhi;
+                            cnState.UfOO = &UfOO;
+                            cnState.phiOO = &phiOO;
+                            cnState.alphaPhiEnd = &alphaPhi10End;
+                            cnState.alphaPhiOld = &alphaPhi10Old;
+                        }
                         const bool changed =
-                            interAmrUpdate(*f.amr, f, *mutableMesh, rep.steps, oldT);
+                            interAmrUpdate(*f.amr, f, *mutableMesh, rep.steps, oldT, cnState);
                         if (changed)
                         {
                             // interFoam.C:118-123, FIRST of everything the change triggers: the previous

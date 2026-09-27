@@ -62,7 +62,14 @@
 // on OpenFOAM's iteration count and residual. Still refused BY NAME: a moving mesh beside refinement,
 // turbulence, waves, MRF, fvOptions, CrankNicolson, a pressure reference, a CN restart directory,
 // `correctPhi no`, a `correctFluxes` entry naming a velocity or NaN, and a coupled patch on a refining
-// mesh. `-device` refuses the whole thing (device_mesh_dynamic).
+// mesh. `-device` RUNS IT TOO: the change is host work on either loop -- topology surgery and six
+// integer maps -- and the device branch owes the round trip, every mesh-sized buffer down to the host
+// and back up onto a DeviceMesh rebuilt from scratch, which is what invalidates every schedule cache
+// keyed on its addressingId. Gated in the same test: alpha 2.2e-15 from OpenFOAM, p_rgh 6.1e-15
+// relative, U 3.2e-13, and the arm run TWICE in one process bit-identical (the detector for a cache
+// keyed on a recycled pointer). Both arms refuse refinement beside MOTION (device_refine_motion) and a
+// 2-D case, by its `empty` patch (device_refine_empty): a 2-D adaptive run agrees with OpenFOAM while
+// the fields it maps are trivial and reads alpha 5.2e-03 at the first change that maps a real state.
 //
 // AND `Gauss interfaceCompression` on the alpha fluxes, on BOTH paths: the PhiScheme four waveMakers
 // name for div(phirb,alpha) -- two cell values and no gradient, so it carries onto the device whole.
@@ -147,7 +154,8 @@
 // BEGIN DEVICE REFUSALS
 //   device_closed device_gamg_smootherDILU device_gradLsq
 //   device_gradNHat device_leak_explicit device_mesh_dynamic
-//   device_permeable_moving device_ras_otherModel device_Uflux_rhoPhi
+//   device_permeable_moving device_ras_otherModel device_refine_empty
+//   device_refine_motion device_Uflux_rhoPhi
 // END DEVICE REFUSALS
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"

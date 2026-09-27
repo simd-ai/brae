@@ -46,6 +46,7 @@
 #include "cf_types.cuh"
 #include "dynamic_refine_fv_mesh_cpp.cuh"
 #include "inter_case_cpp.cuh"
+#include "crank_nicolson_ddt_scheme_cpp.cuh"   // CrankNicolsonDdt0, the levels a change maps
 #include "inter_driver_cpp.cuh"
 #include <string>
 
@@ -103,6 +104,35 @@ struct InterAmrOldTime
     SurfaceVectorField*                     UfOld    = nullptr;
 };
 
+// THE CrankNicolson SCHEME'S OWN FIELDS, which are fields and not scheme state. Each ddt0 level is a
+// registered GeometricField in OpenFOAM's mesh registry (CrankNicolsonDdtScheme's DDt0Field, REGISTER +
+// AUTO_WRITE), so MapGeometricFields autoMaps its internal field AND every patch field with no help from
+// the scheme -- there is no topoChanging branch in CrankNicolsonDdtScheme.C at all. brae keeps them as
+// locals of its time loop, so the driver hands them here.
+//
+// WHICH ONES EXIST on a REFINING interFoam case, from OpenFOAM's own dispatch:
+//   ddt0(rho,U)         volVectorField      UEqn.H's fvm::ddt(rho, U)
+//   ddtCorrDdt0(U)      volVectorField      fvcDdtUfCorr
+//   ddtCorrDdt0(Uf)     surfaceVectorField  fvcDdtUfCorr -- the Uf branch, because ddtCorr(U, phi, Uf)
+//                                           routes on mesh.dynamic() and a refining mesh IS dynamic
+// and two that do NOT: ddtCorrDdt0(phi) (the phi branch is never taken) and meshPhiCN_0 (only
+// fvc::meshPhi creates it, and a refine-only mesh has no mesh flux). ddt(alpha) creates none at all --
+// alphaEqn.H builds a throwaway CN scheme to read ocCoeff() and solves alpha with Euler.
+//
+// Beside them ride the old-OLD levels and the alpha flux's blend state, which are the driver's own:
+// UfOO (a surface vector), phiOO (an oriented flux) and alphaPhi10End/alphaPhi10Old (oriented fluxes).
+struct InterAmrCn
+{
+    fv::CrankNicolsonDdt0<vector>*  ddt0RhoU    = nullptr;
+    fv::CrankNicolsonDdt0<vector>*  ddtCorrU    = nullptr;
+    fv::CrankNicolsonDdt0<vector>*  ddtCorrUf   = nullptr;
+    fv::CrankNicolsonDdt0<scalar>*  ddtCorrPhi  = nullptr;   // never created here; checked, not mapped
+    SurfaceVectorField*             UfOO        = nullptr;
+    SurfaceScalarField*             phiOO       = nullptr;
+    SurfaceScalarField*             alphaPhiEnd = nullptr;
+    SurfaceScalarField*             alphaPhiOld = nullptr;
+};
+
 // One mesh.update() for an adaptive mesh, at the top of an outer corrector. Returns true when the mesh
 // changed -- which is what interFoam.C branches on to rebuild gh, the MRF and the mixture.
 //
@@ -113,7 +143,8 @@ bool interAmrUpdate(
     InterFields&           f,
     const MutableMesh&     mm,
     label                  timeIndex,
-    const InterAmrOldTime& old = InterAmrOldTime{});
+    const InterAmrOldTime& old = InterAmrOldTime{},
+    const InterAmrCn&      cn = InterAmrCn{});
 
 // interFoam.C:139-147: what the solver rebuilds once the mesh HAS changed, which is everything the
 // inventory calls RECOMPUTED. Every one of these ASSIGNS its result rather than writing into a vector at

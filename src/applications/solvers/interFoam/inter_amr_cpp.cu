@@ -3,8 +3,12 @@
 #include "foam_dict.cuh"
 #include "mesh_cell_cells_cpp.cuh"
 #include "primitive_patch_cpp.cuh"
+#include "mrf_read.cuh"   // readCellZones: the only place brae holds a mesh's zones
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -38,29 +42,46 @@ void refuseUnmappedState(const InterFields& f)
         throw std::runtime_error(
             std::string(WHO) + "the case has active fvOptions, whose cell sets are resolved against the "
             "OLD numbering.");
+    // A SECOND LINE OF DEFENCE ONLY. buildInterFields sets f.dynamicMesh to null for every adaptive case
+    // (inter_case_cpp.cu), so this cannot fire on the case it names; the refusal that does is in
+    // readInterAmr, which reads the dictionary's own `solvers` entry. Kept because a future caller that
+    // builds an adaptive case WITH a motion solver object must still be stopped.
     if (f.dynamicMesh)
         throw std::runtime_error(
             std::string(WHO) + "the case asks for a motion solver AND refinement. The mesh would both "
             "move and change topology in one step, and brae carries neither Uf nor the mesh flux through "
             "a topology change yet. laminar/oscillatingBox is the case that needs it.");
-    if (f.ddtAlpha == AlphaDdt::CrankNicolson || f.ddtU == DdtScheme::CrankNicolson)
-        throw std::runtime_error(
-            std::string(WHO) + "the case runs CrankNicolson, whose ddt0 levels are fields of their own and "
-            "are not carried through a mesh change yet.");
-    if (f.pRef.needReference)
-        throw std::runtime_error(
-            std::string(WHO) + "the case needs a pressure reference, and pRefCell is a CELL INDEX: after a "
-            "change it names a different cell. Renumbering it through the map is its own unit.");
     if (!f.correctPhi)
         throw std::runtime_error(
             std::string(WHO) + "the case sets correctPhi off. interFoam.C:130-142 puts mixture.correct() "
             "INSIDE the correctPhi branch, so with it off OpenFOAM keeps the MAPPED rho, mu, nu, nHatf and "
             "curvature rather than recomputing them -- and brae carries neither the curvature nor the "
             "mixture through a change, so it would recompute what OpenFOAM mapped.");
+    // CrankNicolson ITSELF is carried (see InterAmrCn), but a RESTART that SEEDS the levels from disk is
+    // not gated: those fields are read on the START mesh with startTimeIndex -2, and whether the levels a
+    // change then maps are the ones OpenFOAM would have is a question no fixture here asks.
+    //
+    // THE TEST IS THE FILES, NOT THE DIRECTORY NAME. `cnRestart.dir` is set to the start directory for
+    // EVERY CrankNicolson case -- it is where the seeder looks, not a statement that anything is there --
+    // so a test on it being non-empty refused every CN case, restart or not. Measured: it refused the
+    // gate's own three-step `cn` profile, which starts from 0 and has no ddt0 field anywhere.
     if (!f.cnRestart.dir.empty())
-        throw std::runtime_error(
-            std::string(WHO) + "the start directory holds CrankNicolson ddt0 fields, which are not carried "
-            "through a mesh change.");
+    {
+        std::string present;
+        for (const char* nm : {"ddt0(rho,U)", "ddtCorrDdt0(U)", "ddtCorrDdt0(Uf)", "ddtCorrDdt0(phi)"})
+        {
+            if (std::filesystem::exists(f.cnRestart.dir + "/" + nm)
+             || std::filesystem::exists(f.cnRestart.dir + "/" + nm + ".gz"))
+            {
+                present += (present.empty() ? "" : ", ") + std::string(nm);
+            }
+        }
+        if (!present.empty())
+            throw std::runtime_error(
+                std::string(WHO) + "the start directory holds the CrankNicolson level(s) " + present
+                + ". The scheme's levels are carried through a change, but a RESTART that seeds them from "
+                "disk and then refines is gated by nothing, so it is refused rather than run blind.");
+    }
 }
 
 // dynamicRefineFvMesh.C:309-336: WHICH carried flux gets the mapFields correction is the CASE's own
@@ -119,8 +140,76 @@ InterAmr readInterAmr(
     const FoamDict d = readDict(path);
     if (d.wordOr("dynamicFvMesh", "") != "dynamicRefineFvMesh") return amr;
 
+    // REFINEMENT AND MOTION ARE ONE CLASS IN v2412, and this is where that is refused -- not in
+    // refuseUnmappedState, which cannot see it. dynamicRefineFvMesh derives from
+    // dynamicMotionSolverListFvMesh (dynamicRefineFvMesh.H:56-58), whose init reads a `solvers`
+    // SUB-DICTIONARY and builds one motionSolver per sub-dictionary inside it
+    // (dynamicMotionSolverListFvMesh.C:98-127), with `mandatory` false so zero of them is legal
+    // (dynamicRefineFvMesh.C:1106). update() then runs updateTopology() FIRST and the motion after it
+    // (dynamicRefineFvMesh.C:1468-1474).
+    //
+    // WHY IT IS REFUSED HERE. refuseUnmappedState tests `f.dynamicMesh`, and buildInterFields sets that
+    // pointer to NULL for every adaptive case on purpose -- so the refusal for this very case could never
+    // fire. MEASURED on laminar/oscillatingBox, two steps of 5e-4: brae refined exactly as OpenFOAM did
+    // (1,000 -> 2,400 -> 8,000 cells, identical counts) and reported max|U| 1.2e-04 m/s where OpenFOAM
+    // reads 2.7330361190972860. The motion was dropped in silence, behind a refusal that named the case.
+    // That is the shape this project keeps finding: a refusal standing in front of a substitution, made
+    // unreachable by the very branch that enabled the feature.
+    {
+        const FoamDict* solvers = d.subDict("solvers");
+        std::size_t nMotion = 0;
+        std::string names;
+        if (solvers)
+        {
+            for (const std::pair<std::string, FoamDict>& sub : solvers->subs)
+            {
+                ++nMotion;
+                names += (names.empty() ? "" : ", ") + sub.first;
+            }
+        }
+        if (nMotion > 0)
+            throw std::runtime_error(
+                std::string(WHO) + "constant/dynamicMeshDict asks for refinement AND " +
+                std::to_string(nMotion) + " motion solver(s) (" + names + "): in OpenFOAM v2412 "
+                "dynamicRefineFvMesh IS a dynamicMotionSolverListFvMesh, and its update() moves the mesh "
+                "after it refines it. brae carries neither the moved points nor points0 nor the mesh flux "
+                "through a topology change, so it would refine correctly and never move -- which is what "
+                "it did on laminar/oscillatingBox, reading max|U| 1.2e-04 where OpenFOAM reads 2.73.");
+    }
+
     amr.active = true;
     amr.controls = dynamicRefine::readRefineControls(d);
+
+    // AN `empty` PATCH ON A REFINING MESH IS REFUSED, and the number is why. A 2-D adaptive case agrees
+    // with OpenFOAM while the fields it maps are TRIVIAL and parts from it the moment they are not:
+    //
+    //   laminar/damBreak, adaptive (maxRefinement 1, refineInterval 2 so the only change is at step 2),
+    //   every solve pinned to tolerance 1e-14 relTol 0 so the comparison is not the Krylov stopping point:
+    //     step 1, no change                 alpha 0.0e+00, U 4.2e-12, phi 6.3e-12   -- the floor
+    //     step 2, ONE change                alpha 5.2e-03, U 3.7e-01, phi 1.8e-01, rAU 4.7e-01
+    //   and the same case with CrankNicolson reads the same numbers, so the scheme is not the cause; the
+    //   3-D fixture (laminar/damBreakWithObstacle, no empty patch) maps a non-trivial state at ITS second
+    //   change and is exact to 1.9e-15. The first change of a 2-D case maps a zero Uf, a uniform rAU and
+    //   an alpha of 0 and 1, which every mapper gets right -- which is why a two-step 2-D run agreed on
+    //   every iteration count and hid this.
+    //
+    // WHAT IS NOT YET KNOWN is whether the defect is in the MAPPER or in the solver's post-change rebuild:
+    // the empty patch's own mapped value is NOT it (measured -- re-evaluating it from the face cells after
+    // the map changes no digit). tools/dumpRefineUpdate is the oracle that will name it, and it needs its
+    // typed fields generalised past damBreakWithObstacle's patch names first.
+    //
+    // The three shipped adaptive tutorials are 3-D, so this refusal costs none of them.
+    for (const FvPatch& q : patches)
+    {
+        if (q.type != "empty") continue;
+        throw std::runtime_error(
+            std::string(WHO) + "patch `" + q.name + "` is `empty`, and a 2-D adaptive case is not carried: "
+            "measured on laminar/damBreak with every solve pinned to 1e-14, the first change that maps a "
+            "NON-TRIVIAL state reads alpha 5.2e-03 and U 3.7e-01 from OpenFOAM, where the 3-D fixture is "
+            "exact to 1.9e-15. The first change of such a case maps a zero Uf and a uniform rAU, which is "
+            "why a shorter run agrees. Refused until the cause is named.");
+    }
+
 
     // the mesh this run starts from, and the state that goes with it. A mesh that has never been refined
     // carries no cellLevel on disk and starts at level 0 everywhere; its history is the identity, which is
@@ -132,6 +221,32 @@ InterAmr readInterAmr(
     amr.state.history = cpu::hexRef8::freshHistory(m.nCells());
     const std::vector<std::vector<label>> cells = meshCells(m);
     const std::vector<std::vector<label>> pointCells = pointCellsFromCells(m, cells);
+    // THE ZONES THE MESH CARRIES, counted from the polyMesh directory -- the only place they exist, since
+    // brae's PrimitiveMesh does not hold them. It makes changeMesh's own refusal reachable: resetZones
+    // renumbers all three kinds through a change and is not ported, so a case with any of them stops by
+    // name instead of running with the zone still in the old numbering (which an MRF zone or an
+    // fvOption's cellZone would then apply itself to).
+    {
+        const std::string pm = caseDir + "/constant/polyMesh/";
+        label nZ = static_cast<label>(readCellZones(pm).size());
+        // ...and the other two kinds by their own ENTRY COUNT, not by the file being there: subsetMesh
+        // writes cellZones, faceZones and pointZones for every mesh it makes, each holding `0()`, so a
+        // test on the file's existence counted two zones on a case that has none and refused it.
+        for (const char* other : {"faceZones", "pointZones"})
+        {
+            std::ifstream in(pm + other);
+            if (!in) continue;
+            std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            // the list count is the integer before the first '(' AFTER the FoamFile block
+            const std::size_t hdr = text.find('}');
+            std::size_t i = (hdr == std::string::npos) ? 0 : hdr + 1;
+            while (i < text.size() && !std::isdigit(static_cast<unsigned char>(text[i]))) ++i;
+            std::size_t j = i;
+            while (j < text.size() && std::isdigit(static_cast<unsigned char>(text[j]))) ++j;
+            if (j > i) nZ += static_cast<label>(std::stol(text.substr(i, j - i)));
+        }
+        amr.state.nZones = nZ;
+    }
     amr.state.protectedCell = dynamicRefine::initProtectedCells(
         amr.state.levels.cellLevel, amr.state.levels.pointLevel, pointCells, cells, m, patches);
     (void)g;
@@ -143,7 +258,8 @@ bool interAmrUpdate(
     InterFields&           f,
     const MutableMesh&     mm,
     label                  timeIndex,
-    const InterAmrOldTime& old)
+    const InterAmrOldTime& old,
+    const InterAmrCn&      cn)
 {
     if (!amr.active) return false;
     if (!mm.m || !mm.g || !mm.patches)
@@ -287,6 +403,97 @@ bool interAmrUpdate(
         preU = f.U.internal;
     }
 
+    // THE CrankNicolson LEVELS, each through the mapper its own type uses. They are REGISTERED fields in
+    // OpenFOAM and are autoMapped like any other; the cell ones carry a patch list beside them, which
+    // rides through the patch mapping as U's old-time patch values do. startTimeIndex and timeIndex are
+    // the FIELD's state in OpenFOAM too (DDt0Field's only extra member), so they are not touched here --
+    // re-seeding them would restart the scheme as Euler at every change, which is what this unit's
+    // control does on purpose.
+    const std::size_t cnVecBefore = amr.state.cellVectors.size();
+    const std::size_t cnSurfVecBefore = amr.state.surfaceVectors.size();
+    const std::size_t cnSurfBefore = amr.state.surfaceScalars.size();
+    // A ddt0 LEVEL'S BOUNDARY IS OPTIONAL, and that is brae's own shape rather than a shortcut: the
+    // fvmDdt path creates its level with NO patch lists (crank_nicolson_ddt_scheme_cpp.cu:91 -- the
+    // matrix reads cell values only), while the two ddtCorr paths create theirs with one list per patch
+    // (:257, :406-407). So each level says for itself whether a boundary rides with it; a count that is
+    // neither zero nor the mesh's is a defect in the caller and throws.
+    const auto ddt0Formed = [&](const fv::CrankNicolsonDdt0<vector>* d, const char* what) -> bool
+    {
+        if (!d || !d->exists) return false;
+        if (!d->boundary.empty() && d->boundary.size() != mm.patches->size())
+            throw std::runtime_error(
+                std::string(WHO) + "the CrankNicolson level " + what + " has "
+                + std::to_string(d->boundary.size()) + " patch lists where the mesh has "
+                + std::to_string(mm.patches->size()) + ". Half a field cannot be mapped.");
+        return true;
+    };
+    const bool cnRhoU = ddt0Formed(cn.ddt0RhoU, "ddt0(rho,U)");
+    const bool cnCorrU = ddt0Formed(cn.ddtCorrU, "ddtCorrDdt0(U)");
+    if (cnRhoU) amr.state.cellVectors.push_back(cn.ddt0RhoU->internal);
+    if (cnCorrU) amr.state.cellVectors.push_back(cn.ddtCorrU->internal);
+    const bool cnRhoUBnd = cnRhoU && !cn.ddt0RhoU->boundary.empty();
+    const bool cnCorrUBnd = cnCorrU && !cn.ddtCorrU->boundary.empty();
+    const std::size_t cnBndBefore = amr.state.surfaceVectors.size();
+    if (cnRhoUBnd) pushBoundaryOnly(cn.ddt0RhoU->boundary);
+    if (cnCorrUBnd) pushBoundaryOnly(cn.ddtCorrU->boundary);
+    // ...and the two surface VECTORS: the Uf ddt0 level and Uf's old-old level. Neither is oriented -- a
+    // face velocity is not a flux.
+    const bool cnCorrUf = ddt0Formed(cn.ddtCorrUf, "ddtCorrDdt0(Uf)")
+                      && !cn.ddtCorrUf->internal.empty();
+    const std::size_t cnUfDdt0Index = amr.state.surfaceVectors.size();
+    if (cnCorrUf)
+    {
+        dynamicRefine::RefineUpdateState::CarriedSurfaceVectorField c;
+        c.field = cn.ddtCorrUf->internal;
+        c.bnd = cn.ddtCorrUf->boundary;
+        c.oriented = false;
+        amr.state.surfaceVectors.push_back(std::move(c));
+    }
+    const bool cnUfOO = cn.UfOO && !cn.UfOO->internal.empty()
+                    && cn.UfOO->boundary.size() == mm.patches->size();
+    const std::size_t cnUfOOIndex = amr.state.surfaceVectors.size();
+    if (cnUfOO) pushSurfaceVector(*cn.UfOO);
+    // ...and the ORIENTED fluxes: phi's old-old level and the alpha flux's two blend levels.
+    // A HALF-FORMED FIELD IS NOT CARRIED, and it is not guessed at either: the mapper walks every patch
+    // of the new mesh and reads the field's own list for it, so a field with an internal half and no
+    // boundary lists runs off the end of that vector (a SIGSEGV in mapCarriedFields, which is how this
+    // was found). A level the driver has not built yet has BOTH halves empty; anything in between is a
+    // defect in the caller and says so.
+    const auto fluxFormed = [&](const SurfaceScalarField* fl, const char* what) -> bool
+    {
+        if (!fl || (fl->internal.empty() && fl->boundary.empty())) return false;
+        if (fl->internal.empty() || fl->boundary.size() != mm.patches->size())
+            throw std::runtime_error(
+                std::string(WHO) + "the CrankNicolson flux " + what + " has "
+                + std::to_string(fl->internal.size()) + " internal faces and "
+                + std::to_string(fl->boundary.size()) + " patch lists where the mesh has "
+                + std::to_string(mm.patches->size()) + ". Half a field cannot be mapped.");
+        return true;
+    };
+    const bool cnPhiOO = fluxFormed(cn.phiOO, "phi.oldTime().oldTime()");
+    const bool cnAPhiEnd = fluxFormed(cn.alphaPhiEnd, "alphaPhi10 at the end of the step");
+    const bool cnAPhiOld = fluxFormed(cn.alphaPhiOld, "alphaPhi10.oldTime()");
+    const auto pushFlux = [&](const SurfaceScalarField& fl)
+    {
+        dynamicRefine::RefineUpdateState::CarriedSurfaceField c;
+        c.field = fl.internal;
+        c.bnd = fl.boundary;
+        c.oriented = true;
+        amr.state.surfaceScalars.push_back(std::move(c));
+        amr.state.surfaceScalarVelocity.push_back(std::string());
+    };
+    if (cnPhiOO) pushFlux(*cn.phiOO);
+    if (cnAPhiEnd) pushFlux(*cn.alphaPhiEnd);
+    if (cnAPhiOld) pushFlux(*cn.alphaPhiOld);
+    // ddtCorrDdt0(phi) is never created on this path: ddtCorr(U, phi, Uf) takes the Uf branch on a
+    // dynamic mesh (fvcDdt.C:219). If it ever exists here, the routing has changed and mapping nothing
+    // would be silent.
+    if (cn.ddtCorrPhi && cn.ddtCorrPhi->exists)
+        throw std::runtime_error(
+            std::string(WHO) + "the CrankNicolson level `" + cn.ddtCorrPhi->name + "` exists on a refining "
+            "mesh. ddtCorr(U, phi, Uf) takes the Uf branch when the mesh is dynamic, so this level should "
+            "never have been created -- and nothing here maps it.");
+
     const dynamicRefine::RefineUpdateStep step =
         dynamicRefine::refineUpdate(amr.state, amr.controls, f.alpha1.internal, timeIndex);
     amr.nRefined = static_cast<label>(step.cellsToRefine.size());
@@ -294,7 +501,8 @@ bool interAmrUpdate(
     if (!step.hasChanged) return false;
 
     {
-        const std::size_t want = 3u + (carryPhiOld ? 1u : 0u) + (carryAlpha2Bnd ? 1u : 0u);
+        const std::size_t want = 3u + (carryPhiOld ? 1u : 0u) + (carryAlpha2Bnd ? 1u : 0u)
+                               + (cnPhiOO ? 1u : 0u) + (cnAPhiEnd ? 1u : 0u) + (cnAPhiOld ? 1u : 0u);
         if (amr.state.surfaceScalars.size() != want)
             throw std::runtime_error(
                 std::string(WHO) + "the change carried " + std::to_string(amr.state.surfaceScalars.size())
@@ -316,6 +524,8 @@ bool interAmrUpdate(
     {
         const std::size_t want =
             (carryUf ? 1u : 0u) + (carryUfOld ? 1u : 0u)
+          + (cnRhoUBnd ? 1u : 0u) + (cnCorrUBnd ? 1u : 0u)
+          + (cnCorrUf ? 1u : 0u) + (cnUfOO ? 1u : 0u)
           + (old.UOldBnd ? 1u : 0u) + (old.UOOBnd ? 1u : 0u);
         if (amr.state.surfaceVectors.size() != want)
             throw std::runtime_error(
@@ -338,7 +548,8 @@ bool interAmrUpdate(
     if (amr.state.cellScalars.size() != scalarsBefore
         + (old.alphaOld ? 1u : 0u) + (old.rhoOld ? 1u : 0u) + (old.rhoOO ? 1u : 0u)
      || amr.state.cellVectors.size() != vectorsBefore
-        + (old.UOld ? 1u : 0u) + (old.UOO ? 1u : 0u))
+        + (old.UOld ? 1u : 0u) + (old.UOO ? 1u : 0u)
+        + (cnRhoU ? 1u : 0u) + (cnCorrU ? 1u : 0u))
         throw std::runtime_error(
             std::string(WHO) + "the change carried a different number of cell fields than went in, so the "
             "old-time levels below would be read from another field's slot.");
@@ -358,6 +569,54 @@ bool interAmrUpdate(
         std::size_t bi = surfVecBefore;
         if (old.UOldBnd) *old.UOldBnd = amr.state.surfaceVectors.at(bi++).bnd;
         if (old.UOOBnd)  *old.UOOBnd  = amr.state.surfaceVectors.at(bi++).bnd;
+
+        // ...and the CrankNicolson levels, each out of the slot it went into. `exists`,
+        // `startTimeIndex` and `timeIndex` are NOT touched: they are the field's own state in OpenFOAM
+        // too, and re-seeding them restarts the scheme.
+        std::size_t cvi = cnVecBefore;
+        if (cnRhoU)  cn.ddt0RhoU->internal = amr.state.cellVectors.at(cvi++);
+        if (cnCorrU) cn.ddtCorrU->internal = amr.state.cellVectors.at(cvi++);
+        std::size_t cbi = cnBndBefore;
+        if (cnRhoUBnd)  cn.ddt0RhoU->boundary = amr.state.surfaceVectors.at(cbi++).bnd;
+        if (cnCorrUBnd) cn.ddtCorrU->boundary = amr.state.surfaceVectors.at(cbi++).bnd;
+        if (cnCorrUf)
+        {
+            cn.ddtCorrUf->internal = amr.state.surfaceVectors.at(cnUfDdt0Index).field;
+            cn.ddtCorrUf->boundary = amr.state.surfaceVectors.at(cnUfDdt0Index).bnd;
+        }
+        if (cnUfOO)
+        {
+            cn.UfOO->internal = amr.state.surfaceVectors.at(cnUfOOIndex).field;
+            cn.UfOO->boundary = amr.state.surfaceVectors.at(cnUfOOIndex).bnd;
+        }
+        std::size_t csi = cnSurfBefore;
+        const auto takeFlux = [&](SurfaceScalarField& fl)
+        {
+            fl.internal = amr.state.surfaceScalars.at(csi).field;
+            fl.boundary = amr.state.surfaceScalars.at(csi).bnd;
+            ++csi;
+        };
+        if (cnPhiOO)   takeFlux(*cn.phiOO);
+        if (cnAPhiEnd) takeFlux(*cn.alphaPhiEnd);
+        if (cnAPhiOld) takeFlux(*cn.alphaPhiOld);
+
+        // A GATE'S CONTROL: throw the mapped CrankNicolson state away and let the scheme re-create each
+        // level at the new size. That is the plausible wrong port -- every field is the right SIZE,
+        // nothing throws, the run completes, and the scheme silently RESTARTS (a level created at step k
+        // is zero for the whole of step k, and its startTimeIndex becomes k, so coef and coef0 fall back
+        // to 1 and the step is Euler).
+        if (std::getenv("BRAE_CONTROL_AMR_NO_CN_MAP"))
+        {
+            std::printf("  *** CONTROL MODE: the CrankNicolson levels are dropped and re-created at the new "
+                        "size, not mapped. This run is deliberately wrong. ***\n");
+            if (cn.ddt0RhoU)  cn.ddt0RhoU->exists = false;
+            if (cn.ddtCorrU)  cn.ddtCorrU->exists = false;
+            if (cn.ddtCorrUf) cn.ddtCorrUf->exists = false;
+            if (cnUfOO)    *cn.UfOO = f.Uf;
+            if (cnPhiOO)   *cn.phiOO = f.phi;
+            if (cnAPhiEnd) cn.alphaPhiEnd->internal.assign(f.phi.internal.size(), scalar(0));
+            if (cnAPhiOld) cn.alphaPhiOld->internal.assign(f.phi.internal.size(), scalar(0));
+        }
 
         // A GATE'S CONTROL, announced every change it is on (see BRAE_CONTROL_PREVCORR_PHICN in
         // inter_driver_cpp.cu). It throws the MAPPED old-time levels away and re-captures them from the
@@ -397,6 +656,52 @@ bool interAmrUpdate(
         f.alpha1.internal = preAlpha;
         f.p_rgh.internal = prePrgh;
         f.U.internal = preU;
+    }
+
+    // TWO GATE CONTROLS FOR THE PRESSURE REFERENCE, and the first one MEASURES ITS OWN VACUITY.
+    //
+    // BRAE_CONTROL_PREF_RENUMBER follows the reference cell through the change's own reverseCellMap,
+    // which is the plausible wrong thing and what a refusal calling the index "stale" implies is needed.
+    // UNDER PURE REFINEMENT IT IS THE IDENTITY: hexRef8 MODIFIES the parent cell in place and ADDS the
+    // other seven children (hexRef8.C's setRefinement), so every retained cell keeps its own index and
+    // reverseCellMap[c] == c. Measured on the closed damBreakWithObstacle profile: 16400 -> 16400, and
+    // the run reads p 1.9964e-14 relative -- the gate's own number. So on a refine-only fixture this
+    // control cannot witness anything, which is also WHY the unit is a range check and nothing more.
+    //
+    // BRAE_CONTROL_PREF_ANOTHER_CELL is the one that discriminates: it pins the LAST child of the old
+    // reference cell instead of the master. That is what any renumbering which did not reproduce
+    // hexRef8's master-in-place numbering would land on, and it proves the gate sees WHICH cell is
+    // pinned -- pEqn adds (pRefValue - p[pRefCell]) to the whole field, so the two choices differ by the
+    // difference between those two cells' pressures.
+    if (f.pRef.needReference && f.pRef.pRefCell >= 0)
+    {
+        const cpu::polyTopoChange::TopoChangeMap& map =
+            step.refined ? step.refineMap : step.unrefineMap;
+        if (std::getenv("BRAE_CONTROL_PREF_RENUMBER")
+            && f.pRef.pRefCell < static_cast<label>(map.reverseCellMap.size()))
+        {
+            const label moved = map.reverseCellMap[static_cast<std::size_t>(f.pRef.pRefCell)];
+            // -master-2 where merged, -1 where removed: the master cell either way
+            const label newCell = (moved >= 0) ? moved : (moved < -1 ? -moved - 2 : f.pRef.pRefCell);
+            std::printf("  *** CONTROL MODE: the pressure reference is renumbered %ld -> %ld through the "
+                        "cell map. OpenFOAM keeps the index. This run is deliberately wrong. ***\n",
+                        (long)f.pRef.pRefCell, (long)newCell);
+            f.pRef.pRefCell = newCell;
+        }
+        // ...and the one that proves the gate SEES which cell is pinned: the last cell of the new mesh,
+        // which is a child the change added. A child of the reference cell's OWN parent would be the
+        // narrower control, and there is none: the reference point of this fixture is in the AIR, far
+        // from the interface, so its cell is never selected for refinement -- measured, the child search
+        // returned the cell itself. pEqn adds (pRefValue - p[pRefCell]) to the whole field, so any other
+        // cell is a whole-field offset.
+        if (std::getenv("BRAE_CONTROL_PREF_ANOTHER_CELL"))
+        {
+            const label last = amr.state.m.nCells() - 1;
+            std::printf("  *** CONTROL MODE: the pressure reference is moved %ld -> %ld, a cell the change "
+                        "added. This run is deliberately wrong. ***\n",
+                        (long)f.pRef.pRefCell, (long)last);
+            f.pRef.pRefCell = last;
+        }
     }
 
     // ...and the mesh the caller's fields reference. The patches are assigned IN PLACE by the driver, so
@@ -440,8 +745,25 @@ void interAfterMeshChange(
     const std::vector<FvPatch>& patches = *mm.patches;
     const std::size_t nC = static_cast<std::size_t>(m.nCells());
 
-    // the agglomeration was built for the old mesh
-    gamgCache = GamgAgglomerationCache{};
+    // THE AGGLOMERATION WAS BUILT FOR THE OLD MESH, and it is UN-BUILT rather than replaced. The whole-
+    // object reset zeroed two members that must survive:
+    //
+    //   `buildCount` is MONOTONE ON PURPOSE. It is what a copy of the hierarchy elsewhere -- the device's
+    //   upload -- keys its validity on, precisely because `built` cannot say: the host's own pcorr GAMG
+    //   solve a few lines below rebuilds the hierarchy and leaves it built, so a device upload keyed on
+    //   `built` alone is kept across the change. Zeroing the count made the rebuilt hierarchy's count 1
+    //   again, which is what the stale upload was stamped with -- the same defect
+    //   gamg_solver_cpp.cuh:97-107 records, where it showed up as heap corruption in a coarsest-level
+    //   solve. damBreakWithObstacle solves BOTH pcorr and p_rgh with GAMG, so it is on that path.
+    //
+    //   `forward` is pairGAMGAgglomeration's STATIC pairing direction (pair_gamg_agglomeration_cpp.cu),
+    //   which in OpenFOAM outlives every object and every mesh. Restoring it to true at each change is a
+    //   substitution, not a reset.
+    //
+    // This is the same line dynamic_motion_solver_fv_mesh_cpp.cu:382 uses after a move, and for the same
+    // reason: OpenFOAM's GAMGAgglomeration::movePoints sets requireUpdate_ and the next New() rebuilds
+    // from wherever the static direction was left.
+    gamgCache.built = false;
 
     // gh and ghf off the NEW centres (interFoam.C:130-131), assigned rather than written into
     ghField(f.g, f.ghRefValue, g.C(), f.gh);
@@ -526,6 +848,24 @@ void interAfterMeshChange(
     {
         f.p[c] = f.p_rgh.internal[c] + f.rho[c]*f.gh[c];
     }
+
+    // THE PRESSURE REFERENCE IS KEPT, NOT RENUMBERED, and that is OpenFOAM's behaviour rather than a
+    // convenience. setRefCell runs ONCE, in createFields.H:104-113, and no solver in the tree re-runs it
+    // on a mesh change (the only two other calls are potentialFoam's -writep output, at the END of a
+    // run); pRefCell is a plain `label` local of main() that every pEqn then indexes. So after a
+    // refinement OpenFOAM pins the SAME INDEX, which on a refined mesh is a different cell -- and
+    // reproducing OpenFOAM is the requirement. Renumbering it through the cell map would be the silent
+    // substitution here, and the refusal that used to stand in inter_amr_cpp.cu said so in reverse.
+    //
+    // WHAT IS REFUSED instead is the one case OpenFOAM cannot survive either: an index past the end.
+    // findRefCell range-checks at construction and nothing checks again, so an UNREFINEMENT that shrinks
+    // the mesh past pRefCell reads out of bounds in OpenFOAM's own Release build. brae says so by name.
+    if (f.pRef.needReference && f.pRef.pRefCell >= m.nCells())
+        throw std::runtime_error(
+            std::string(WHO) + "the case's pressure reference is cell " + std::to_string(f.pRef.pRefCell)
+            + " and the change left " + std::to_string(m.nCells()) + " cells. OpenFOAM keeps the index it "
+            "found in createFields and never re-checks it, so this is where it would read past the end of "
+            "its own p field.");
 
     // ...and the interface: nHatf and K are mapped, and then rebuilt on the new geometry, which is what
     // mixture.correct() does last
