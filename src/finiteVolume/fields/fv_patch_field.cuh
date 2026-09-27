@@ -1889,6 +1889,15 @@ private:
 class VariableHeightFlowRatePatchField : public MixedPatchField<scalar>
 {
 public:
+    // autoMapComplete IS NOT INHERITED HERE. MixedPatchField answers true, and this class holds per-face
+    // state of its own that mixed's autoMap does not touch (phi_ and pif_). Those are TOLD values: brae's
+    // patches cannot look a flux or an alpha up, so a mesh change would leave them short -- and each
+    // updateCoeffs guards its own length and RETURNS, keeping the mapped refValue and valueFraction of the
+    // previous mesh under this condition's own name. That is a silent wrong answer, so the change is
+    // refused by name instead. Mapping them is a unit of its own; nothing needs it yet, because every
+    // case that uses this patch has a static mesh.
+    bool autoMapComplete() const override { return false; }
+
     VariableHeightFlowRatePatchField(
         const FvPatch& p,
         scalar lowerBound,
@@ -2039,6 +2048,15 @@ private:
 class PermeableAlphaPressureInletOutletVelocityPatchField : public MixedPatchField<vector>
 {
 public:
+    // autoMapComplete IS NOT INHERITED HERE. MixedPatchField answers true, and this class holds per-face
+    // state of its own that mixed's autoMap does not touch (phi_ and alpha_). Those are TOLD values: brae's
+    // patches cannot look a flux or an alpha up, so a mesh change would leave them short -- and each
+    // updateCoeffs guards its own length and RETURNS, keeping the mapped refValue and valueFraction of the
+    // previous mesh under this condition's own name. That is a silent wrong answer, so the change is
+    // refused by name instead. Mapping them is a unit of its own; nothing needs it yet, because every
+    // case that uses this patch has a static mesh.
+    bool autoMapComplete() const override { return false; }
+
     // OpenFOAM OVERRIDES operator= here too, so this does not inherit mixed's false
     // (pressurePermeableAlphaInletOutletVelocityFvPatchVectorField.C): the assigned value is
     // lerp(rhs, n*(n & rhs), valueFraction()) -- the normal component alone where the fraction is 1.
@@ -2116,6 +2134,15 @@ private:
 class PrghPermeableAlphaTotalPressurePatchField : public MixedPatchField<scalar>
 {
 public:
+    // autoMapComplete IS NOT INHERITED HERE. MixedPatchField answers true, and this class holds per-face
+    // state of its own that mixed's autoMap does not touch (alpha_). Those are TOLD values: brae's
+    // patches cannot look a flux or an alpha up, so a mesh change would leave them short -- and each
+    // updateCoeffs guards its own length and RETURNS, keeping the mapped refValue and valueFraction of the
+    // previous mesh under this condition's own name. That is a silent wrong answer, so the change is
+    // refused by name instead. Mapping them is a unit of its own; nothing needs it yet, because every
+    // case that uses this patch has a static mesh.
+    bool autoMapComplete() const override { return false; }
+
     PrghPermeableAlphaTotalPressurePatchField(
         const FvPatch& p,
         scalar p0,
