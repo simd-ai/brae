@@ -180,6 +180,19 @@
 #   a patch field with no autoMap is run anyway        GREEN -- every type on this fixture HAS one. The
 #                                                     refusal is for the ones that do not, which is most
 #                                                     of the 66 classes in the tree.
+# UNIT 8b: the patch types the OTHER two adaptive cases need, on four fields this script writes --
+# nutkWallFunction, omegaWallFunction, kqRWallFunction and movingWallVelocity. brae maps each onto a class
+# that unit 8a already covers (a wall function onto ZeroGradient or Calculated, movingWallVelocity onto
+# FixedValue), so what 8b adds is the MEASUREMENT that the inheritance is right rather than the assumption:
+# all four agree with OpenFOAM face by face on every step.
+# AND THEY CLOSED 8a's OWN GAP. Their internal fields are the CELL INDEX, so a wall function's patch value
+# differs face by face -- and the fail-proof 8a had to record as unwitnessed, `the base maps nothing
+# (value_ only resized)`, is now 6 F. The types that carry no state of their own are what made the base's
+# own mapping visible.
+# WHAT IS STILL REFUSED, and oscillatingBox needs it: `nutkRoughWallFunction`. brae's factory has no row
+# for it, so the case stops at load with "unsupported BC type". Accepting it as the smooth nutkWallFunction
+# would run a rough wall as a smooth one -- a silent substitution of exactly the kind this project keeps
+# finding -- so it stays refused until the roughness reaches the nut the closure writes.
 # AND ONE THING A FAIL-PROOF CANNOT SHOW. The patch objects are assigned ELEMENT BY ELEMENT rather than
 # replaced, because every patch field holds a `const FvPatch&` into that vector and `patches = build(...)`
 # is a MOVE that frees the old buffer. That was MEASURED as a segfault in strlen on the patch's own name,
@@ -235,6 +248,18 @@ sed -i 's/^dynamicFvMesh   dynamicRefineFvMesh;/dynamicFvMesh   dynamicRefineFvM
     "$C/constant/dynamicMeshDict"
 grep -q "dynamicRefineFvMeshDump" "$C/constant/dynamicMeshDict" \
     || { echo "FAIL: could not select the instrumented mesh class"; exit 1; }
+
+# ...and the UNIT 8b FIELDS, written into the case by tests/refine_update_typed_fields.py: four fields
+# carrying the patch types the other two adaptive cases need -- nutkWallFunction, omegaWallFunction,
+# kqRWallFunction and movingWallVelocity -- whose internal fields are the CELL INDEX, so a wall function's
+# patch value (its cell's value) differs face by face and a comparison of it cannot pass on a constant.
+# That is also what finally makes the BASE's own value mapping measurable: with these fields the
+# fail-proof on it is 6 F, where unit 8a had to record it as unwitnessed.
+NCELLS=$(awk '/^Subset/{print $2; exit}' "$C/log.subsetMesh")
+[ -n "$NCELLS" ] || { echo "FAIL: could not read the cell count from subsetMesh's log"; exit 1; }
+python3 "$(dirname "$0")/refine_update_typed_fields.py" "$C" "$NCELLS" \
+    || { echo "FAIL: could not write the typed fields"; exit 1; }
+[ -f "$C/0/braeNut" ] || { echo "FAIL: the typed fields were not written"; exit 1; }
 
 # ...and a SECOND case, identical but for its correctFluxes: `(braePhi braeU)` in place of the nothing
 # every tutorial says. That turns the flux CORRECTION on -- the four write sites of mapFields and

@@ -375,6 +375,29 @@ int main(int argc, char *argv[])
         }
     }
 
+    // UNIT 8b: the patch TYPES the other two adaptive cases need, on fields the gate writes for them --
+    // nutkWallFunction, omegaWallFunction, kqRWallFunction and movingWallVelocity. Their internal fields
+    // are the CELL INDEX, so a wall function's patch value (which is its cell's value) differs face by
+    // face and a comparison of it cannot pass on a constant. Read here only if the files are there, so the
+    // tool still runs on a case without them.
+    PtrList<volScalarField> typedScalars;
+    PtrList<volVectorField> typedVectors;
+    for (const word& nm : {word("braeNut"), word("braeOmega"), word("braeKq")})
+    {
+        IOobject io(nm, runTime.timeName(), mesh, IOobject::MUST_READ, IOobject::NO_WRITE);
+        if (!io.typeHeaderOk<volScalarField>(false)) continue;
+        typedScalars.append(new volScalarField(io, mesh));
+    }
+    {
+        IOobject io("braeUwall", runTime.timeName(), mesh, IOobject::MUST_READ, IOobject::NO_WRITE);
+        if (io.typeHeaderOk<volVectorField>(false))
+        {
+            typedVectors.append(new volVectorField(io, mesh));
+        }
+    }
+    Info<< "typed fields read: " << typedScalars.size() << " scalar, " << typedVectors.size()
+        << " vector" << endl;
+
     OFstream os(outFile);
     os.precision(17);
     os << "mode refineUpdate" << nl;
@@ -507,6 +530,22 @@ int main(int argc, char *argv[])
             forAll(caseU.boundaryField(), patchi)
             {
                 const fvPatchVectorField& pf = caseU.boundaryField()[patchi];
+                os << "  " << 3*pf.size();
+                forAll(pf, i) os << ' ' << pf[i].x() << ' ' << pf[i].y() << ' ' << pf[i].z();
+                os << nl;
+            }
+        }
+        // ...and the 8b fields, per patch
+        for (const volScalarField& f : typedScalars)
+        {
+            writeTypedBoundary(os, f.name(), f);
+        }
+        for (const volVectorField& f : typedVectors)
+        {
+            os << f.name() << "Bnd " << f.boundaryField().size() << nl;
+            forAll(f.boundaryField(), patchi)
+            {
+                const fvPatchVectorField& pf = f.boundaryField()[patchi];
                 os << "  " << 3*pf.size();
                 forAll(pf, i) os << ' ' << pf[i].x() << ' ' << pf[i].y() << ' ' << pf[i].z();
                 os << nl;

@@ -181,7 +181,15 @@ std::map<std::string, std::vector<scalar>> readScalars(const std::string& path, 
          || key == "caseAlphaRefValue" || key == "caseAlphaValueFraction"
          || key == "caseAlphaGradient" || key == "caseAlphaP0"
          || key == "casePrghRefValue" || key == "casePrghValueFraction"
-         || key == "casePrghGradient" || key == "casePrghP0")
+         || key == "casePrghGradient" || key == "casePrghP0"
+         || key == "braeNutBnd" || key == "braeOmegaBnd" || key == "braeKqBnd"
+         || key == "braeUwallBnd"
+         || key == "braeNutRefValue" || key == "braeNutValueFraction"
+         || key == "braeNutGradient" || key == "braeNutP0"
+         || key == "braeOmegaRefValue" || key == "braeOmegaValueFraction"
+         || key == "braeOmegaGradient" || key == "braeOmegaP0"
+         || key == "braeKqRefValue" || key == "braeKqValueFraction"
+         || key == "braeKqGradient" || key == "braeKqP0")
         {
             label nPatches = 0;
             ls >> nPatches;
@@ -518,6 +526,36 @@ int main(int argc, char** argv)
     std::printf("  carried whole fields: alpha.water, p_rgh (scalar) and U (vector), %zu patches each\n",
                 s.patches.size());
 
+    // UNIT 8b: the patch types the other two adaptive cases need, on fields the gate writes for them.
+    // Read only if the files are there, so the gate still runs on a case without them.
+    std::vector<std::pair<std::string, GeometricField<scalar>*>> typedScalars;
+    std::vector<std::pair<std::string, GeometricField<vector>*>> typedVectors;
+    GeometricField<scalar> braeNut, braeOmega, braeKq;
+    GeometricField<vector> braeUwall;
+    {
+        const std::pair<const char*, GeometricField<scalar>*> sc3[3] =
+            {{"braeNut", &braeNut}, {"braeOmega", &braeOmega}, {"braeKq", &braeKq}};
+        for (const auto& e : sc3)
+        {
+            const std::string path = caseDir + "/0/" + e.first;
+            if (!std::ifstream(path)) continue;
+            *e.second = buildField(readField<scalar>(path), s.patches, s.m.nCells());
+            e.second->evaluateBoundary();
+            typedScalars.emplace_back(e.first, e.second);
+            s.carriedScalarFields.push_back(e.second);
+        }
+        const std::string up = caseDir + "/0/braeUwall";
+        if (std::ifstream(up))
+        {
+            braeUwall = buildField(readField<vector>(up), s.patches, s.m.nCells());
+            braeUwall.evaluateBoundary();
+            typedVectors.emplace_back("braeUwall", &braeUwall);
+            s.carriedVectorFields.push_back(&braeUwall);
+        }
+        std::printf("  unit 8b typed fields: %zu scalar, %zu vector\n", typedScalars.size(),
+                    typedVectors.size());
+    }
+
     // ...and OpenFOAM's OWN old cell volumes, injected per change. brae's FvGeometry::V() agrees with
     // OpenFOAM's to round-off but not bit-for-bit, and a volume-weighted mean carries that into every
     // merged value -- so injecting them is what makes a MAPPER defect separable from brae's volumes.
@@ -755,6 +793,36 @@ int main(int argc, char** argv)
                                std::to_string(step) + "/casePrghGradient", scalar(0));
                 compareScalars("p_rgh's totalPressure p0", p0, sc,
                                std::to_string(step) + "/casePrghP0", scalar(0));
+            }
+
+            // UNIT 8b: the wall-function and movingWallVelocity patches. Their internal fields are the
+            // cell index, so a wall function's patch value differs face by face and the comparison cannot
+            // pass on a constant.
+            for (const auto& e : typedScalars)
+            {
+                std::vector<scalar> flat;
+                for (const auto& b : e.second->boundary)
+                {
+                    const std::vector<scalar>& v = b->value();
+                    flat.insert(flat.end(), v.begin(), v.end());
+                }
+                compareScalars((e.first + "'s patch values").c_str(), flat, sc,
+                               std::to_string(step) + "/" + e.first + "Bnd", scalar(0));
+            }
+            for (const auto& e : typedVectors)
+            {
+                std::vector<scalar> flat;
+                for (const auto& b : e.second->boundary)
+                {
+                    for (const vector& v : b->value())
+                    {
+                        flat.push_back(v.x);
+                        flat.push_back(v.y);
+                        flat.push_back(v.z);
+                    }
+                }
+                compareScalars((e.first + "'s patch values").c_str(), flat, sc,
+                               std::to_string(step) + "/" + e.first + "Bnd", scalar(0));
             }
 
             // ORIENTED: the hull average's round trip through an intensive vector puts brae's own Sf
