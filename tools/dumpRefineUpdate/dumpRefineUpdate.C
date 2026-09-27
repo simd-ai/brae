@@ -25,6 +25,8 @@
 #include "Time.H"
 #include "dynamicFvMesh.H"
 #include "volFields.H"
+#include "surfaceFields.H"
+#include "surfaceInterpolate.H"
 #include "OFstream.H"
 #include "dynamicRefineFvMeshDump.H"
 #include "hexRef8.H"
@@ -187,6 +189,57 @@ int main(int argc, char *argv[])
         passiveVector[celli] = vector(scalar(celli), scalar(2*celli), scalar(3*celli));
     }
 
+    // ...AND AN ORIENTED SURFACE FIELD, which is what unit 7b-2 is about: a flux, mapped by the FACE
+    // mapper sliced to the internal faces and to each patch, then negated wherever the change reversed a
+    // face's sense. Set once, to the face index, and then only mapped -- and CORRECTED too, when the
+    // case's own correctFluxes names a velocity for it. The gate runs both settings.
+    surfaceScalarField passivePhi
+    (
+        IOobject("braePhi", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+        mesh,
+        dimensionedScalar(dimVolume/dimTime, Foam::zero{}),
+        fvsPatchFieldBase::calculatedType()
+    );
+    // ORIENTED, which is what a real phi is (its file carries `oriented yes`): it is negated on a flipped
+    // face and hull-averaged as an intensive VECTOR. braePhiFlat below is the same field without the flag,
+    // which is the branch every other surface field takes -- and the two are different code.
+    passivePhi.setOriented(true);
+    forAll(passivePhi, facei) passivePhi[facei] = scalar(facei);
+    forAll(passivePhi.boundaryFieldRef(), patchi)
+    {
+        fvsPatchScalarField& pf = passivePhi.boundaryFieldRef()[patchi];
+        const label start = mesh.boundaryMesh()[patchi].start();
+        forAll(pf, i) pf[i] = scalar(start + i);
+    }
+    surfaceScalarField passivePhiFlat
+    (
+        IOobject("braePhiFlat", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+        mesh,
+        dimensionedScalar(dimless, Foam::zero{}),
+        fvsPatchFieldBase::calculatedType()
+    );
+    forAll(passivePhiFlat, facei) passivePhiFlat[facei] = scalar(facei);
+    forAll(passivePhiFlat.boundaryFieldRef(), patchi)
+    {
+        fvsPatchScalarField& pf = passivePhiFlat.boundaryFieldRef()[patchi];
+        const label start = mesh.boundaryMesh()[patchi].start();
+        forAll(pf, i) pf[i] = scalar(start + i);
+    }
+
+    // the velocity the flux correction interpolates, where the dictionary names one
+    volVectorField passiveU
+    (
+        IOobject("braeU", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+        mesh,
+        dimensionedVector(dimVelocity, Foam::zero{}),
+        fvPatchFieldBase::calculatedType()
+    );
+    forAll(passiveU, celli)
+    {
+        const point& c = mesh.C()[celli];
+        passiveU[celli] = vector(c.x(), 2*c.y(), 3*c.z());
+    }
+
     OFstream os(outFile);
     os.precision(17);
     os << "mode refineUpdate" << nl;
@@ -270,6 +323,45 @@ int main(int argc, char *argv[])
             os << "V " << V.size();
             for (const scalar v : V) os << ' ' << v;
             os << nl;
+        }
+        // the flux as OpenFOAM's mapping (and, where the dictionary asks, its correction) left it
+        os << "braePhi " << passivePhi.size();
+        forAll(passivePhi, facei) os << ' ' << passivePhi[facei];
+        os << nl;
+        os << "braePhiFlat " << passivePhiFlat.size();
+        forAll(passivePhiFlat, facei) os << ' ' << passivePhiFlat[facei];
+        os << nl;
+        os << "braePhiFlatBnd " << passivePhiFlat.boundaryField().size() << nl;
+        forAll(passivePhiFlat.boundaryField(), patchi)
+        {
+            const fvsPatchScalarField& pf = passivePhiFlat.boundaryField()[patchi];
+            os << "  " << pf.size();
+            forAll(pf, i) os << ' ' << pf[i];
+            os << nl;
+        }
+        os << "braePhiBnd " << passivePhi.boundaryField().size() << nl;
+        forAll(passivePhi.boundaryField(), patchi)
+        {
+            const fvsPatchScalarField& pf = passivePhi.boundaryField()[patchi];
+            os << "  " << pf.size();
+            forAll(pf, i) os << ' ' << pf[i];
+            os << nl;
+        }
+        // ...and the interpolated flux the correction is built from, so that brae's own interpolation
+        // round-off is separable from the correction's logic
+        {
+            const surfaceScalarField phiU(fvc::interpolate(passiveU) & mesh.Sf());
+            os << "braePhiU " << phiU.size();
+            forAll(phiU, facei) os << ' ' << phiU[facei];
+            os << nl;
+            os << "braePhiUBnd " << phiU.boundaryField().size() << nl;
+            forAll(phiU.boundaryField(), patchi)
+            {
+                const fvsPatchScalarField& pf = phiU.boundaryField()[patchi];
+                os << "  " << pf.size();
+                forAll(pf, i) os << ' ' << pf[i];
+                os << nl;
+            }
         }
         writeMesh(os, mesh, "step");
         Info<< "step " << step << ": " << mesh.nCells() << " cells, changed " << changed << endl;

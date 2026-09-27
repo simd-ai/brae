@@ -172,7 +172,33 @@ std::map<std::string, std::vector<scalar>> readScalars(const std::string& path, 
         std::string key;
         if (!(ls >> key)) continue;
         if (key == "step") { ls >> step; continue; }
+        // the per-patch blocks: `name <nPatches>` and then one line per patch, `<n> v v ...`. Stored
+        // FLATTENED in patch order, which is how the comparison flattens brae's side.
+        if (key == "braePhiBnd" || key == "braePhiUBnd" || key == "braePhiFlatBnd"
+         || key == "refinePhiUBnd" || key == "unrefinePhiUBnd")
+        {
+            label nPatches = 0;
+            ls >> nPatches;
+            std::vector<scalar> flat;
+            for (label p = 0; p < nPatches; ++p)
+            {
+                if (!std::getline(is, line)) break;
+                std::istringstream ps(line);
+                label n = 0;
+                ps >> n;
+                for (label i = 0; i < n; ++i)
+                {
+                    scalar v = 0;
+                    ps >> v;
+                    flat.push_back(v);
+                }
+            }
+            out[std::to_string(step) + "/" + key] = flat;
+            continue;
+        }
         if (key != "braeScalar" && key != "braeFresh" && key != "braeVector" && key != "V0" && key != "V"
+         && key != "braePhi" && key != "braePhiFlat" && key != "braePhiU"
+         && key != "refinePhiU" && key != "unrefinePhiU"
          && key != "refineOldCellVolumes" && key != "unrefineOldCellVolumes")
         {
             continue;
@@ -372,6 +398,48 @@ int main(int argc, char** argv)
         s.cellScalars.push_back(ps);        // carried across all three steps
         s.cellScalars.push_back(ps);        // ...and re-set at the start of every step, below
         s.cellVectors.push_back(pv);
+        // UNIT 7b-2: the oriented surface field, set to the face index -- internal faces by their own
+        // label, each patch face by its MESH label, which is what the oracle writes
+        RefineUpdateState::CarriedSurfaceField phi;
+        phi.oriented = true;
+        phi.field.resize(static_cast<std::size_t>(s.m.nInternalFaces()));
+        for (label f = 0; f < s.m.nInternalFaces(); ++f)
+        {
+            phi.field[static_cast<std::size_t>(f)] = scalar(f);
+        }
+        phi.bnd.resize(s.m.patches().size());
+        for (std::size_t pi = 0; pi < s.m.patches().size(); ++pi)
+        {
+            const PatchInfo& pp = s.m.patches()[pi];
+            phi.bnd[pi].resize(static_cast<std::size_t>(pp.size));
+            for (label i = 0; i < pp.size; ++i)
+            {
+                phi.bnd[pi][static_cast<std::size_t>(i)] = scalar(pp.start + i);
+            }
+        }
+        s.surfaceScalars.push_back(phi);        // ORIENTED: negated on a flip, averaged as a vector
+        phi.oriented = false;
+        s.surfaceScalars.push_back(phi);        // ...and the same field without the flag
+        // whether the case's correctFluxes names a velocity for each. The dictionary is the authority:
+        // `braePhi` gets a correction only where the gate's own arm B puts `(braePhi braeU)` in it, which
+        // no tutorial does.
+        for (const auto& pair : controls.correctFluxes)
+        {
+            std::printf("  correctFluxes: (%s %s)\n", pair.first.c_str(), pair.second.c_str());
+        }
+        const auto velocityFor = [&](const std::string& name)
+        {
+            for (const auto& pair : controls.correctFluxes)
+            {
+                if (pair.first == name) return pair.second;
+            }
+            return std::string();
+        };
+        s.surfaceScalarVelocity.push_back(velocityFor("braePhi"));
+        s.surfaceScalarVelocity.push_back(velocityFor("braePhiFlat"));
+        std::printf("  the carried flux's velocity: `%s`\n",
+                    s.surfaceScalarVelocity.at(0).empty() ? "(not in the table)"
+                                                          : s.surfaceScalarVelocity.at(0).c_str());
     }
     // ...and OpenFOAM's OWN old cell volumes, injected per change. brae's FvGeometry::V() agrees with
     // OpenFOAM's to round-off but not bit-for-bit, and a volume-weighted mean carries that into every
@@ -425,6 +493,42 @@ int main(int argc, char** argv)
             }
         }
 
+        // OpenFOAM's own interpolated flux, PER CHANGE, on the mesh that change produced -- which is the
+        // field mapFields itself used, computed from the already-mapped braeU. Injected so that brae's
+        // surface interpolation is not in the way of the correction's logic. The driver is handed the
+        // refine's before the step and the unrefine's is picked up inside it, so both changes of a step
+        // get the right one.
+        const bool correcting = !s.surfaceScalarVelocity.empty()
+                             && !s.surfaceScalarVelocity.at(0).empty()
+                             && s.surfaceScalarVelocity.at(0) != "none";
+        const auto loadPhiU = [&](const std::string& key)
+        {
+            const auto pu = sc.find(std::to_string(step) + "/" + key);
+            const auto pb = sc.find(std::to_string(step) + "/" + key + "Bnd");
+            s.injectedPhiU = (pu == sc.end()) ? std::vector<scalar>() : pu->second;
+            s.injectedPhiUBnd.clear();
+            if (pb == sc.end()) return;
+            // the patch sizes here are the POST-change ones, which the dump's own mesh block carries
+            std::size_t at = 0;
+            const auto it = d.listLists.find("patches");
+            if (it == d.listLists.end()) return;
+            for (const std::vector<label>& pp : it->second)
+            {
+                std::vector<scalar> one;
+                for (label i = 0; i < pp[1] && at < pb->second.size(); ++i, ++at)
+                {
+                    one.push_back(pb->second[at]);
+                }
+                s.injectedPhiUBnd.push_back(one);
+            }
+        };
+        if (correcting) loadPhiU("refinePhiU");
+        s.injectedPhiURefine = s.injectedPhiU;
+        s.injectedPhiURefineBnd = s.injectedPhiUBnd;
+        if (correcting) loadPhiU("unrefinePhiU");
+        s.injectedPhiUUnrefine = s.injectedPhiU;
+        s.injectedPhiUUnrefineBnd = s.injectedPhiUBnd;
+
         const label timeIndex = d.scalars.at("timeIndex");
         const RefineUpdateStep r = refineUpdate(s, controls, field, timeIndex);
 
@@ -445,6 +549,11 @@ int main(int argc, char** argv)
             compareFlags("refineCell after the buffer layers", r.refineCellAfterBuffer, d,
                          "refineCellAfterBuffer");
         }
+        // flipFaceFlux, which is what an ORIENTED field is negated on. MEASURED: it is EMPTY on every
+        // change of this fixture, so the flip is carried and cannot be witnessed here -- which is said
+        // rather than left, and is why the fail-proof on it is green.
+        if (r.refined) compareList("the refinement's flipFaceFlux", r.refineMap.flipFaceFlux, d,
+                                   "refineFlipFaceFlux");
         compareList("pointsToUnrefine", r.pointsToUnrefine, d, "pointsToUnrefine");
         if (r.unrefined)
         {
@@ -457,6 +566,8 @@ int main(int argc, char** argv)
                         "unrefineReverseFaceMap");
             compareList("the unrefinement's reverseCellMap", r.unrefineMap.reverseCellMap, d,
                         "unrefineReverseCellMap");
+            compareList("the unrefinement's flipFaceFlux", r.unrefineMap.flipFaceFlux, d,
+                        "unrefineFlipFaceFlux");
         }
 
         // the state the step leaves: the mesh, the levels and the history
@@ -510,6 +621,26 @@ int main(int argc, char** argv)
             // this one is held at 1e-12 on both arms and the worst is printed.
             compareScalars("the old-time volumes V0", s.V0, sc, std::to_string(step) + "/V0",
                            scalar(1e-12));
+            // UNIT 7b-2: the oriented surface field, internal and boundary. Pure addressing and a sign,
+            // so the bound is ZERO on both arms.
+            // ORIENTED: the hull average's round trip through an intensive vector puts brae's own Sf
+            // into the answer, so this one is held at 1e-12 and the worst is printed. UNORIENTED: pure
+            // addressing and an average of the values themselves, so bound 0.
+            const char* names[2] = {"braePhi", "braePhiFlat"};
+            const scalar bounds[2] = {scalar(1e-12), scalar(0)};
+            for (int k = 0; k < 2; ++k)
+            {
+                const std::string what = std::string("the mapped surface field `") + names[k] + "`";
+                compareScalars((what + ", internal").c_str(), s.surfaceScalars.at(k).field, sc,
+                               std::to_string(step) + "/" + names[k], bounds[k]);
+                std::vector<scalar> flat;
+                for (const std::vector<scalar>& pf : s.surfaceScalars.at(k).bnd)
+                {
+                    flat.insert(flat.end(), pf.begin(), pf.end());
+                }
+                compareScalars((what + ", boundary").c_str(), flat, sc,
+                               std::to_string(step) + "/" + names[k] + "Bnd", bounds[k]);
+            }
         }
     }
 

@@ -88,9 +88,11 @@ namespace Foam
 // THE INSTRUMENT'S SINK. Set druDump::os to an open stream before calling update() and every write added
 // to dynamicRefineFvMeshDump.C fires; leave it null and the class behaves exactly as OpenFOAM's.
 class OFstream;
+class fvMesh;
 namespace druDump
 {
     extern Foam::OFstream* os;
+    void writeInterpolatedFlux(const fvMesh& mesh, const char* name);
 }
 
 

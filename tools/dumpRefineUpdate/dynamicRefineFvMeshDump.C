@@ -29,6 +29,7 @@ License
 #include "dynamicRefineFvMeshDump.H"
 #include "addToRunTimeSelectionTable.H"
 #include "OFstream.H"
+#include "surfaceInterpolate.H"
 
 // ---------------------------------------------------------------------------------------------------
 // THE ONLY CHANGE TO OpenFOAM'S OWN SOURCE: writes. Nothing alters an equation, a selection or an order
@@ -62,6 +63,25 @@ namespace druDump
     {
         if (!os) return;
         *os << name << ' ' << v << nl;
+    }
+
+    void writeInterpolatedFlux(const fvMesh& mesh, const char* name)
+    {
+        if (!os) return;
+        if (!mesh.foundObject<volVectorField>("braeU")) return;
+        const volVectorField& U = mesh.lookupObject<volVectorField>("braeU");
+        const surfaceScalarField phiU(fvc::interpolate(U) & mesh.Sf());
+        *os << name << ' ' << phiU.size();
+        forAll(phiU, facei) *os << ' ' << phiU[facei];
+        *os << nl;
+        *os << name << "Bnd " << phiU.boundaryField().size() << nl;
+        forAll(phiU.boundaryField(), patchi)
+        {
+            const fvsPatchScalarField& pf = phiU.boundaryField()[patchi];
+            *os << "  " << pf.size();
+            forAll(pf, i) *os << ' ' << pf[i];
+            *os << nl;
+        }
     }
 }
 }
@@ -1435,6 +1455,8 @@ bool Foam::dynamicRefineFvMeshDump::updateTopology()
                         *druDump::os << nl;
                     }
                 }
+                druDump::writeLabels("refineFlipFaceFlux", map().flipFaceFlux().sortedToc());
+                druDump::writeInterpolatedFlux(*this, "refinePhiU");
                 druDump::writeLabels("refinePointMap", map().pointMap());
                 druDump::writeLabels("refineFaceMap", map().faceMap());
                 druDump::writeLabels("refineCellMap", map().cellMap());
@@ -1518,6 +1540,8 @@ bool Foam::dynamicRefineFvMeshDump::updateTopology()
                         *druDump::os << nl;
                     }
                 }
+                druDump::writeLabels("unrefineFlipFaceFlux", umap().flipFaceFlux().sortedToc());
+                druDump::writeInterpolatedFlux(*this, "unrefinePhiU");
                 druDump::writeLabels("unrefinePointMap", umap().pointMap());
                 druDump::writeLabels("unrefineFaceMap", umap().faceMap());
                 druDump::writeLabels("unrefineCellMap", umap().cellMap());

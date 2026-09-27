@@ -1557,6 +1557,228 @@ std::vector<scalar> mapOldVolumes(
 }
 
 // ----------------------------------------------------------------------------------------------
+// UNIT 7b-2: the surface field mapping. See the header.
+
+FaceMapping faceMapping(
+    const cpu::polyTopoChange::TopoChangeMap& map,
+    label                                     nNewFaces)
+{
+    FaceMapping fm;
+    // faceMapper's constructor (:233-247): no volume weighting here, unlike the cell mapper
+    fm.direct = map.facesFromPoints.empty() && map.facesFromEdges.empty() && map.facesFromFaces.empty();
+
+    if (fm.direct)
+    {
+        fm.directAddressing.assign(map.faceMap.begin(),
+                                   map.faceMap.begin() + static_cast<std::size_t>(nNewFaces));
+        for (std::size_t i = 0; i < fm.directAddressing.size(); ++i)
+        {
+            if (fm.directAddressing[i] < 0)
+            {
+                fm.directAddressing[i] = 0;
+                fm.insertedFaces.push_back(static_cast<label>(i));
+            }
+        }
+        return fm;
+    }
+
+    fm.addressing.resize(static_cast<std::size_t>(nNewFaces));
+    fm.weights.resize(static_cast<std::size_t>(nNewFaces));
+    const auto setAddrWeights = [&](const std::vector<cpu::polyTopoChange::ObjectMap>& maps)
+    {
+        for (const cpu::polyTopoChange::ObjectMap& m : maps)
+        {
+            if (m.masterObjects.empty()) continue;
+            const std::size_t facei = static_cast<std::size_t>(m.index);
+            if (!fm.addressing[facei].empty())
+                throw std::runtime_error(
+                    "brae faceMapper: face " + std::to_string(m.index) + " is mapped twice. OpenFOAM "
+                    "FatalErrors here too (faceMapper.C:118-126).");
+            fm.addressing[facei] = m.masterObjects;
+            fm.weights[facei].assign(m.masterObjects.size(),
+                                     scalar(1)/static_cast<scalar>(m.masterObjects.size()));
+        }
+    };
+    setAddrWeights(map.facesFromPoints);
+    setAddrWeights(map.facesFromEdges);
+    setAddrWeights(map.facesFromFaces);
+
+    for (label facei = 0; facei < nNewFaces; ++facei)
+    {
+        const label mapped = map.faceMap[static_cast<std::size_t>(facei)];
+        if (mapped >= 0 && fm.addressing[static_cast<std::size_t>(facei)].empty())
+        {
+            fm.addressing[static_cast<std::size_t>(facei)] = {mapped};
+            fm.weights[static_cast<std::size_t>(facei)] = {scalar(1)};
+        }
+    }
+    for (label facei = 0; facei < nNewFaces; ++facei)
+    {
+        if (fm.addressing[static_cast<std::size_t>(facei)].empty())
+        {
+            fm.addressing[static_cast<std::size_t>(facei)] = {label(0)};
+            fm.weights[static_cast<std::size_t>(facei)] = {scalar(1)};
+            fm.insertedFaces.push_back(facei);
+        }
+    }
+    return fm;
+}
+
+FaceMapping surfaceMapping(
+    const FaceMapping& fm,
+    label              nNewInternalFaces,
+    label              nOldInternalFaces)
+{
+    FaceMapping sm;
+    sm.direct = fm.direct;
+    const std::size_t n = static_cast<std::size_t>(nNewInternalFaces);
+    if (sm.direct)
+    {
+        sm.directAddressing.assign(fm.directAddressing.begin(), fm.directAddressing.begin() + n);
+        for (std::size_t facei = 0; facei < n; ++facei)
+        {
+            // :55-60, and the test is STRICTLY greater -- see the header on the asymmetry
+            if (sm.directAddressing[facei] > nOldInternalFaces) sm.directAddressing[facei] = 0;
+        }
+    }
+    else
+    {
+        sm.addressing.assign(fm.addressing.begin(), fm.addressing.begin() + n);
+        sm.weights.assign(fm.weights.begin(), fm.weights.begin() + n);
+        for (std::size_t facei = 0; facei < n; ++facei)
+        {
+            label mx = -1;
+            for (const label a : sm.addressing[facei]) { if (a > mx) mx = a; }
+            // :74-79, and this one is >=
+            if (mx >= nOldInternalFaces)
+            {
+                sm.addressing[facei] = {label(0)};
+                sm.weights[facei] = {scalar(1)};
+            }
+        }
+    }
+    for (const label facei : fm.insertedFaces)
+    {
+        if (facei < nNewInternalFaces) sm.insertedFaces.push_back(facei);
+    }
+    return sm;
+}
+
+FaceMapping patchMapping(
+    const FaceMapping& fm,
+    label              newPatchStart,
+    label              newPatchSize,
+    label              oldPatchStart,
+    label              oldPatchSize)
+{
+    const label oldPatchEnd = oldPatchStart + oldPatchSize;
+    FaceMapping pm;
+    pm.direct = fm.direct;
+    const std::size_t b = static_cast<std::size_t>(newPatchStart);
+    const std::size_t n = static_cast<std::size_t>(newPatchSize);
+    if (pm.direct)
+    {
+        pm.directAddressing.assign(fm.directAddressing.begin() + b, fm.directAddressing.begin() + b + n);
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const label a = pm.directAddressing[i];
+            if (a >= oldPatchStart && a < oldPatchEnd)
+            {
+                pm.directAddressing[i] = a - oldPatchStart;
+            }
+            else
+            {
+                // OpenFOAM's own commented-out `= 0` is right above this line: it writes -1 instead, and
+                // Field::map then leaves the value ALONE, so such a face keeps whatever the resized
+                // field held. Transcribed as written.
+                pm.directAddressing[i] = -1;
+            }
+        }
+        return pm;
+    }
+    pm.addressing.assign(fm.addressing.begin() + b, fm.addressing.begin() + b + n);
+    pm.weights.assign(fm.weights.begin() + b, fm.weights.begin() + b + n);
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        std::vector<label>& addr = pm.addressing[i];
+        std::vector<scalar>& w = pm.weights[i];
+        label mn = addr.empty() ? label(-1) : addr[0];
+        label mx = mn;
+        for (const label a : addr) { if (a < mn) mn = a; if (a > mx) mx = a; }
+        if (mn >= oldPatchStart && mx < oldPatchEnd)
+        {
+            for (label& a : addr) a -= oldPatchStart;
+            continue;
+        }
+        // :170-205. Keep only the sources inside this patch and RE-SCALE their weights.
+        std::size_t nActive = 0;
+        scalar sumWeight = 0;
+        for (std::size_t j = 0; j < addr.size(); ++j)
+        {
+            if (addr[j] >= oldPatchStart && addr[j] < oldPatchEnd)
+            {
+                addr[nActive] = addr[j] - oldPatchStart;
+                w[nActive] = w[j];
+                sumWeight += w[j];
+                ++nActive;
+            }
+        }
+        addr.resize(nActive);
+        w.resize(nActive);
+        if (nActive)
+        {
+            for (scalar& wi : w) wi /= sumWeight;
+        }
+    }
+    return pm;
+}
+
+std::vector<scalar> mapSurfaceField(
+    const std::vector<scalar>& oldField,
+    const FaceMapping&         sm,
+    bool                       oriented,
+    const std::vector<label>&  flipFaceFlux)
+{
+    std::vector<scalar> out;
+    if (sm.direct)
+    {
+        out.assign(sm.directAddressing.size(), scalar(0));
+        if (!oldField.empty())
+        {
+            for (std::size_t i = 0; i < out.size(); ++i)
+            {
+                // a NEGATIVE entry leaves the value alone (Field::map, :386-396) -- which for a patch
+                // face out of its own patch means it keeps the zero this vector was sized with
+                const label a = sm.directAddressing[i];
+                if (a >= 0) out[i] = oldField[static_cast<std::size_t>(a)];
+            }
+        }
+    }
+    else
+    {
+        out.assign(sm.addressing.size(), scalar(0));
+        for (std::size_t i = 0; i < out.size(); ++i)
+        {
+            scalar v = 0;
+            for (std::size_t j = 0; j < sm.addressing[i].size(); ++j)
+            {
+                v += sm.weights[i][j]*oldField[static_cast<std::size_t>(sm.addressing[i][j])];
+            }
+            out[i] = v;
+        }
+    }
+    if (oriented)
+    {
+        // MapFvSurfaceField.H:83-93. Only the faces inside this field's own size.
+        for (const label facei : flipFaceFlux)
+        {
+            if (facei < static_cast<label>(out.size())) out[static_cast<std::size_t>(facei)] *= scalar(-1);
+        }
+    }
+    return out;
+}
+
+// ----------------------------------------------------------------------------------------------
 // UNIT 7: the driver. See the header.
 
 namespace {
@@ -1700,11 +1922,106 @@ void mapCarriedFields(
     const cpu::polyTopoChange::TopoChangeMap& map,
     const std::vector<scalar>&                oldCellVolumes,
     label                                     nNewCells,
-    const std::vector<scalar>&                newV)
+    const std::vector<scalar>&                newV,
+    label                                     nOldInternalFaces)
 {
     const CellMapping cm = cellMapping(map, nNewCells, oldCellVolumes);
     for (std::vector<scalar>& f : s.cellScalars) f = mapCellField(f, cm);
     for (std::vector<vector>& f : s.cellVectors) f = mapCellField(f, cm);
+
+    // ...and every carried surface field, through the face mapper sliced to the internal faces and to
+    // each patch. The new mesh is already in place when this runs, which is what gives the patch starts.
+    if (!s.surfaceScalars.empty())
+    {
+        const FaceMapping fm = faceMapping(map, s.m.nFaces());
+        const FaceMapping sm = surfaceMapping(fm, s.m.nInternalFaces(), nOldInternalFaces);
+        const std::vector<PatchInfo>& patches = s.m.patches();
+        std::vector<FaceMapping> pm;
+        pm.reserve(patches.size());
+        for (std::size_t p = 0; p < patches.size(); ++p)
+        {
+            pm.push_back(patchMapping(fm, patches[p].start, patches[p].size, map.oldPatchStarts[p],
+                                      map.oldPatchSizes[p]));
+        }
+
+        // what the hull average reads off the NEW mesh, built once for all the fields
+        MapPolyMesh mpmF;
+        mpmF.nOldCells = map.nOldCells;
+        mpmF.cellMap = map.cellMap;
+        mpmF.reverseCellMap = map.reverseCellMap;
+        mpmF.faceMap = map.faceMap;
+        mpmF.reverseFaceMap = map.reverseFaceMap;
+        mpmF.reversePointMap = map.reversePointMap;
+        FluxMeshView fv;
+        fv.nInternalFaces = s.m.nInternalFaces();
+        for (const PatchInfo& pp : patches)
+        {
+            fv.patchStart.push_back(pp.start);
+            fv.patchSize.push_back(pp.size);
+        }
+        fv.owner = s.m.owner();
+        fv.neighbour = s.m.neighbour();
+        fv.cells = meshCells(s.m);
+        FvGeometry gNew;
+        gNew.build(s.m);
+        std::vector<std::vector<vector>> SfBnd(patches.size());
+        std::vector<std::vector<scalar>> magSfBnd(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            SfBnd[pi].assign(gNew.Sf().begin() + patches[pi].start,
+                             gNew.Sf().begin() + patches[pi].start + patches[pi].size);
+            magSfBnd[pi].assign(gNew.magSf().begin() + patches[pi].start,
+                                gNew.magSf().begin() + patches[pi].start + patches[pi].size);
+        }
+
+        // STEP ONE: the addressing, and the flip on an oriented field.
+        for (RefineUpdateState::CarriedSurfaceField& f : s.surfaceScalars)
+        {
+            f.field = mapSurfaceField(f.field, sm, f.oriented, map.flipFaceFlux);
+            std::vector<std::vector<scalar>> bnd(patches.size());
+            for (std::size_t p = 0; p < patches.size(); ++p)
+            {
+                // a patch field's own values are indexed within the patch, which is what fvPatchMapper
+                // rebased onto; flipFaceFlux carries internal faces only, so nothing is flipped here
+                bnd[p] = mapSurfaceField(f.bnd[p], pm[p], false, std::vector<label>());
+            }
+            f.bnd.swap(bnd);
+        }
+
+        // THEN THE PER-FLUX CORRECTION, on the fields the dictionary names a velocity for -- and only
+        // those. It runs BEFORE the hull average, which is OpenFOAM's order (:345-420 then :424-437) and
+        // not a detail: the correction writes injected internal faces too, and the hull average writes
+        // over them.
+        if (!s.injectedPhiU.empty())
+        {
+            const std::vector<char> mf = masterFaces(mpmF, s.m.nFaces());
+            for (std::size_t k = 0; k < s.surfaceScalars.size(); ++k)
+            {
+                const std::string& U = (k < s.surfaceScalarVelocity.size())
+                                     ? s.surfaceScalarVelocity[k] : std::string();
+                if (U.empty() || U == "none") continue;
+                correctFluxes(s.surfaceScalars[k].field, s.surfaceScalars[k].bnd, s.injectedPhiU,
+                              s.injectedPhiUBnd, mpmF, mf, fv);
+            }
+        }
+
+        // ...AND THE HULL AVERAGE LAST, over the injected internal faces, on EVERY surface field in the
+        // registry and not only on the ones correctFluxes names: mapFields calls mapNewInternalFaces
+        // outside the per-flux loop. MEASURED: without it brae wrote face 0's value (0) on new internal
+        // face 6293 where OpenFOAM had 5232.5, the mean of the two old faces of its hull.
+        for (RefineUpdateState::CarriedSurfaceField& f : s.surfaceScalars)
+        {
+            if (f.oriented)
+            {
+                mapNewInternalFacesOriented(f.field, f.bnd, gNew.Sf(), SfBnd, gNew.magSf(), magSfBnd,
+                                            mpmF, fv);
+            }
+            else
+            {
+                mapNewInternalFacesFlat(f.field, f.bnd, mpmF, fv);
+            }
+        }
+    }
 
     // V0 comes into existence at the FIRST change and not before -- fvMesh::updateMesh only stores old
     // volumes when the current ones already exist, and what it stores is the OLD mesh's volumes.
@@ -1833,10 +2150,13 @@ RefineUpdateStep refineUpdate(
             renumberProtectedCells(s.protectedCell, r.refineMap.cellMap, out.nCells);
             const std::vector<scalar> oldV =
                 s.injectedRefineOldV.empty() ? a.g.V() : s.injectedRefineOldV;
+            const label nOldInternalFaces = s.m.nInternalFaces();
+            s.injectedPhiU = s.injectedPhiURefine;
+            s.injectedPhiUBnd = s.injectedPhiURefineBnd;
             s.m = rebuiltMesh(s.m, out);
             buildAddressing(s.m, a);
             s.patches = buildPatches(s.m, a.g);
-            mapCarriedFields(s, r.refineMap, oldV, out.nCells, a.g.V());
+            mapCarriedFields(s, r.refineMap, oldV, out.nCells, a.g.V(), nOldInternalFaces);
 
             // :1391-1411. refineCell REBUILT THROUGH THE MAP: a cell stays marked if it is new, if it is
             // not its old cell's master, or if its old cell was marked. That is what keeps every child of
@@ -1931,10 +2251,69 @@ RefineUpdateStep refineUpdate(
             renumberProtectedCells(s.protectedCell, r.unrefineMap.cellMap, out.nCells);
             const std::vector<scalar> oldV =
                 s.injectedUnrefineOldV.empty() ? a.g.V() : s.injectedUnrefineOldV;
+            const label nOldInternalFaces = s.m.nInternalFaces();
+            // unrefine's OWN flux correction is keyed on faceToSplitPoint, which is built from the
+            // PRE-change mesh (:555-574): for every split point, every face at the other end of one of
+            // its edges, paired with that other point. Built here, before the mesh is replaced.
+            std::vector<std::pair<label, label>> faceToSplitPoint;
+            if (!s.injectedPhiU.empty())
+            {
+                std::vector<char> seenFace(static_cast<std::size_t>(s.m.nFaces()), char(0));
+                for (const label pointi : r.pointsToUnrefine)
+                {
+                    for (const label edgei : a.edges.pointEdges[static_cast<std::size_t>(pointi)])
+                    {
+                        const label otherPointi =
+                            (a.edges.start[static_cast<std::size_t>(edgei)] == pointi)
+                          ? a.edges.end[static_cast<std::size_t>(edgei)]
+                          : a.edges.start[static_cast<std::size_t>(edgei)];
+                        for (const label facei : a.pointFaces[static_cast<std::size_t>(otherPointi)])
+                        {
+                            // a Map<label>::insert keeps the FIRST value written for a key
+                            if (seenFace[static_cast<std::size_t>(facei)]) continue;
+                            seenFace[static_cast<std::size_t>(facei)] = 1;
+                            faceToSplitPoint.emplace_back(facei, otherPointi);
+                        }
+                    }
+                }
+            }
+            s.injectedPhiU = s.injectedPhiUUnrefine;
+            s.injectedPhiUBnd = s.injectedPhiUUnrefineBnd;
             s.m = rebuiltMesh(s.m, out);
             buildAddressing(s.m, a);
             s.patches = buildPatches(s.m, a.g);
-            mapCarriedFields(s, r.unrefineMap, oldV, out.nCells, a.g.V());
+            mapCarriedFields(s, r.unrefineMap, oldV, out.nCells, a.g.V(), nOldInternalFaces);
+            // ...and then unrefine's second correction, which runs AFTER updateMesh and so after the
+            // hull average (:610-689)
+            if (!s.injectedPhiU.empty() && !faceToSplitPoint.empty())
+            {
+                MapPolyMesh mpmU;
+                mpmU.nOldCells = r.unrefineMap.nOldCells;
+                mpmU.cellMap = r.unrefineMap.cellMap;
+                mpmU.reverseCellMap = r.unrefineMap.reverseCellMap;
+                mpmU.faceMap = r.unrefineMap.faceMap;
+                mpmU.reverseFaceMap = r.unrefineMap.reverseFaceMap;
+                mpmU.reversePointMap = r.unrefineMap.reversePointMap;
+                FluxMeshView fvU;
+                fvU.nInternalFaces = s.m.nInternalFaces();
+                for (const PatchInfo& pp : s.m.patches())
+                {
+                    fvU.patchStart.push_back(pp.start);
+                    fvU.patchSize.push_back(pp.size);
+                }
+                fvU.owner = s.m.owner();
+                fvU.neighbour = s.m.neighbour();
+                fvU.cells = a.cells;
+                for (std::size_t k = 0; k < s.surfaceScalars.size(); ++k)
+                {
+                    const std::string& U = (k < s.surfaceScalarVelocity.size())
+                                         ? s.surfaceScalarVelocity[k] : std::string();
+                    if (U.empty() || U == "none") continue;
+                    correctFluxesUnrefine(s.surfaceScalars[k].field, s.surfaceScalars[k].bnd,
+                                          s.injectedPhiU, s.injectedPhiUBnd, faceToSplitPoint, mpmU,
+                                          fvU);
+                }
+            }
 
             r.unrefined = true;
             r.hasChanged = true;

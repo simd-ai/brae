@@ -573,6 +573,68 @@ std::vector<scalar> mapOldVolumes(
     const cpu::polyTopoChange::TopoChangeMap& map,
     label                                     nNewCells);
 
+// ----------------------------------------------------------------------------------------------
+// UNIT 7b-2: THE SURFACE FIELD MAPPING. What happens to a FLUX when the mesh under it changes -- step
+// one, before any of the corrections above.
+//
+// provenance:
+//   openfoam: src/OpenFOAM/lnInclude/faceMapper.C:28-190 (both branches), :233-247 (the predicate)
+//             src/finiteVolume/lnInclude/fvSurfaceMapper.C:32-120 (the slice to the internal faces and
+//                 the boundary-source reset)
+//             src/finiteVolume/lnInclude/fvPatchMapper.C:60-215 (the slice to one patch)
+//             src/finiteVolume/lnInclude/MapFvSurfaceField.H:60-95 (the ORIENTED flip after the map)
+//   tests:    tests/refine_update_vs_openfoam.sh, on an oriented surface field carried over three steps
+//
+// THE INTERNAL FIELD IS THE FACE MAPPING SLICED, AND THE SLICE IS NOT INNOCENT. fvSurfaceMapper takes
+// faceMapper's addressing, cuts it to the new mesh's INTERNAL faces, and then resets any entry whose
+// source was a BOUNDARY face to read face 0 -- because an internal face that came from a boundary face
+// has no flux to inherit.
+//
+// AND THE TWO BRANCHES DISAGREE BY ONE. The direct branch resets on `addr > oldNInternal` and the
+// interpolative one on `max(addr) >= oldNInternal` (fvSurfaceMapper.C:57 against :76) -- so a face whose
+// source is EXACTLY the first old boundary face is reset by one branch and kept by the other. That is
+// OpenFOAM's own asymmetry, transcribed rather than tidied, and it is why both branches are written out
+// here instead of being folded into one.
+//
+// THEN AN ORIENTED FIELD IS NEGATED on every face in flipFaceFlux (MapFvSurfaceField.H:83-93), which is
+// what a flux is and `Uf` is not -- the flag comes from the field FILE's `oriented` entry, not its name.
+struct FaceMapping
+{
+    bool                             direct = false;
+    std::vector<label>               directAddressing;   // faceMap sliced to nNewFaces, negatives -> 0
+    std::vector<std::vector<label>>  addressing;
+    std::vector<std::vector<scalar>> weights;
+    std::vector<label>               insertedFaces;
+};
+
+FaceMapping faceMapping(
+    const cpu::polyTopoChange::TopoChangeMap& map,
+    label                                     nNewFaces);
+
+// fvSurfaceMapper: the same addressing cut to the internal faces, with every boundary source reset.
+FaceMapping surfaceMapping(
+    const FaceMapping& fm,
+    label              nNewInternalFaces,
+    label              nOldInternalFaces);
+
+// fvPatchMapper: cut to one patch, with each source rebased onto the OLD patch and anything from
+// elsewhere dropped -- a -1 on the direct branch (which Field::map then leaves ALONE, keeping whatever
+// the resized field held) and a re-scaled weight set on the other.
+FaceMapping patchMapping(
+    const FaceMapping& fm,
+    label              newPatchStart,
+    label              newPatchSize,
+    label              oldPatchStart,
+    label              oldPatchSize);
+
+// Field<Type>::autoMap through one of those, then the ORIENTED flip. `flipFaceFlux` is the map's own
+// list of new faces whose sense reversed; only the entries below the field's size are flipped.
+std::vector<scalar> mapSurfaceField(
+    const std::vector<scalar>& oldField,
+    const FaceMapping&         sm,
+    bool                       oriented,
+    const std::vector<label>&  flipFaceFlux);
+
 struct RefineUpdateState
 {
     PrimitiveMesh        m;
@@ -600,6 +662,40 @@ struct RefineUpdateState
     // Two entries because a step can refine AND unrefine, from two different meshes.
     std::vector<scalar>              injectedRefineOldV;
     std::vector<scalar>              injectedUnrefineOldV;
+
+    // UNIT 7b-2. Surface fields carried the same way: an internal field and one list per patch, mapped at
+    // every change, flipped where the map says a face's sense reversed, and then hull-averaged on the
+    // injected internal faces.
+    //
+    // `oriented` IS THE WHOLE DIFFERENCE and it comes from the field FILE's own `oriented` entry, not
+    // from its name: an oriented field (a flux) is negated on a flipped face and hull-averaged as an
+    // INTENSIVE VECTOR (phi*Sf/sqr(magSf), averaged, then dotted back with Sf); an unoriented one (Uf, or
+    // any other surface field) is negated nowhere and averaged as itself. OpenFOAM's own comment on the
+    // oriented branch is "Untested."
+    struct CarriedSurfaceField
+    {
+        std::vector<scalar>              field;
+        std::vector<std::vector<scalar>> bnd;
+        bool                             oriented = true;
+    };
+    std::vector<CarriedSurfaceField> surfaceScalars;
+
+    // ...and, per carried surface field, whether the case's correctFluxes names a VELOCITY for it. Where
+    // it does, the four write sites of mapFields' own correction run on it, and so does unrefine's second
+    // one. Empty or "none" means the field is only mapped -- which is what every interFoam tutorial with
+    // an adaptive mesh asks for, all three of them.
+    std::vector<std::string>         surfaceScalarVelocity;
+    // The interpolated flux the correction writes, on the NEW mesh, per change. Injected by the gate so
+    // that brae's own surface interpolation is not in the way of the correction's logic; empty means the
+    // correction is not run at all.
+    // one per change, because a step's refine and its unrefine happen on different meshes
+    std::vector<scalar>              injectedPhiURefine;
+    std::vector<std::vector<scalar>> injectedPhiURefineBnd;
+    std::vector<scalar>              injectedPhiUUnrefine;
+    std::vector<std::vector<scalar>> injectedPhiUUnrefineBnd;
+    // ...and the one the change being played reads, set by the driver at each site
+    std::vector<scalar>              injectedPhiU;
+    std::vector<std::vector<scalar>> injectedPhiUBnd;
 };
 
 struct RefineUpdateStep

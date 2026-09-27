@@ -119,10 +119,40 @@
 #                                                         so cellMapper's inserted-object branch is
 #                                                         unreachable from here
 #
-# WHAT THIS GATE STILL DOES NOT COVER: the SURFACE fields and the FLUX correction (unit 7b-2). And the
-# reason that needs its own fixture is worth stating: ALL THREE interFoam tutorials with adaptive meshes
-# -- damBreakWithObstacle, oscillatingBox and RAS/motorBike -- map EVERY flux to `none` in their own
-# correctFluxes, so the flux correction is unreachable from any of them.
+# UNIT 7b-2: THE SURFACE FIELDS, and the FLUX CORRECTION. Two more carried fields and a third arm:
+#   braePhi      set to the face index and marked ORIENTED, which is what a real flux is (its file says
+#                `oriented yes`): it is NEGATED on a face the change flipped, and its hull average goes
+#                through an intensive VECTOR -- phi*Sf/sqr(magSf), averaged, then dotted back with Sf.
+#   braePhiFlat  the same values with the flag off, which is the branch every other surface field takes
+#                and is DIFFERENT CODE. Both are compared internal and boundary, at bound 0.
+# THE HULL AVERAGE RUNS ON EVERY SURFACE FIELD, not only on the ones correctFluxes names: mapFields calls
+# mapNewInternalFaces outside the per-flux loop (:424-437). MEASURED, and it is how this was found: with
+# it left out brae wrote face 0's value (0) on new internal face 6293 where OpenFOAM had 5232.5, the mean
+# of the two old faces of that face's hull.
+# THE THIRD ARM IS A DICTIONARY NO TUTORIAL WRITES. All three interFoam cases with adaptive meshes --
+# damBreakWithObstacle, oscillatingBox and RAS/motorBike -- map EVERY flux to `none`, so the flux
+# CORRECTION is unreachable from any of them. The third case here is the first one with `(braePhi braeU)`
+# in it, and the script checks OpenFOAM's own warning to prove the two dictionaries really do differ:
+# the first case must warn that braePhi is not in the table and the second must not.
+# The interpolated flux the correction writes is INJECTED from the oracle, PER CHANGE (a step's refine and
+# its unrefine happen on different meshes), so that brae's own surface interpolation is not in the way of
+# the correction's logic.
+# SEVEN MORE FAIL-PROOFS:
+#   correctFluxes is skipped                       6 F on the correction arm, GREEN on the other two --
+#                                                  which is what proves the arms are different runs
+#   unrefine's own second correction is skipped    2 F on the correction arm only
+#   the hull average is skipped                    6 F on ALL arms
+#   the oriented field takes the FLAT hull average 3 F on all arms
+#   the surface mapping does not reset a BOUNDARY
+#     source to face 0                             GREEN -- no new internal face here comes from an old
+#                                                  boundary face, so fvSurfaceMapper's reset (and the
+#                                                  one-off between its two branches, `> nOldInternal`
+#                                                  against `>= nOldInternal`) is unreachable
+#   the ORIENTED flip is not applied               GREEN, and measured rather than guessed: the gate now
+#                                                  compares flipFaceFlux on both changes and OpenFOAM's
+#                                                  is EMPTY on every one of them
+#   patchMapping writes 0 instead of -1 for an
+#     out-of-patch source                          GREEN -- every patch face's source is in its own patch
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_refine_update_vs_openfoam"
@@ -173,18 +203,38 @@ sed -i 's/^dynamicFvMesh   dynamicRefineFvMesh;/dynamicFvMesh   dynamicRefineFvM
 grep -q "dynamicRefineFvMeshDump" "$C/constant/dynamicMeshDict" \
     || { echo "FAIL: could not select the instrumented mesh class"; exit 1; }
 
+# ...and a SECOND case, identical but for its correctFluxes: `(braePhi braeU)` in place of the nothing
+# every tutorial says. That turns the flux CORRECTION on -- the four write sites of mapFields and
+# unrefine's own fifth -- which no interFoam tutorial can reach, all three mapping every flux to `none`.
+CB="$W/caseB"
+rm -rf "$CB"
+cp -r "$C" "$CB" || exit 1
+sed -i 's/^    (phi none);*/    (braePhi braeU)\n    (braePhiFlat none)\n    (phi none)/' \
+    "$CB/constant/dynamicMeshDict"
+grep -q "(braePhi braeU)" "$CB/constant/dynamicMeshDict" \
+    || { echo "FAIL: could not turn the flux correction on"; exit 1; }
+
 # the sphere: small enough that the gate runs in seconds, moving a cell or so per step
-( cd "$C" && dumpRefineUpdate -case . -steps 3 -radius 0.06 -centre '(0.28 0.28 0.14)' \
-                              -velocity '(0.05 0 0)' -out d.dump > log.dru 2>&1 ) \
-    || { echo "FAIL: dumpRefineUpdate"; tail -25 "$C/log.dru"; exit 1; }
-grep -E "^(Refined|Unrefined) from" "$C/log.dru" | sed 's/^/  OpenFOAM: /'
+for D in "$C" "$CB"; do
+    ( cd "$D" && dumpRefineUpdate -case . -steps 3 -radius 0.06 -centre '(0.28 0.28 0.14)' \
+                                  -velocity '(0.05 0 0)' -out d.dump > log.dru 2>&1 ) \
+        || { echo "FAIL: dumpRefineUpdate in $D"; tail -25 "$D/log.dru"; exit 1; }
+done
+grep -E "^(Refined|Unrefined) from" "$C/log.dru" | sed 's/^/  OpenFOAM: /' 
 grep -q "^Unrefined from" "$C/log.dru" \
     || { echo "FAIL: OpenFOAM unrefined nothing, so half of the driver is not being measured"; exit 1; }
+grep -q "Cannot find surfaceScalarField braePhi" "$C/log.dru" \
+    || { echo "FAIL: braePhi is in the first case's flux table, so the two arms are not different"; exit 1; }
+if grep -q "Cannot find surfaceScalarField braePhi" "$CB/log.dru"; then
+    echo "FAIL: braePhi is NOT in the second case's flux table, so the correction never ran"; exit 1
+fi
 
 rc=0
-echo "--- arm: OpenFOAM's own old cell volumes injected, so the mapping must be EXACT"
+echo "--- arm: the tutorial's own correctFluxes (nothing for braePhi), OpenFOAM's volumes injected"
 "$BIN" "$C" "$C/d.dump" || rc=1
-echo "--- arm: brae's own FvGeometry::V() weights the merges, which is what the shipped path does"
+echo "--- arm: the same, with brae's own FvGeometry::V() weighting the merges (the shipped path)"
 BRAE_REFINE_UPDATE_OWN_V=1 "$BIN" "$C" "$C/d.dump" || rc=1
+echo "--- arm: correctFluxes ((braePhi braeU)) -- the flux CORRECTION, which no tutorial reaches"
+"$BIN" "$CB" "$CB/d.dump" || rc=1
 echo "refine_update_vs_openfoam: rc $rc"
 exit $rc
