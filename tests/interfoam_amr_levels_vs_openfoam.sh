@@ -364,5 +364,80 @@ if [ $rc -eq 0 ]; then
     "$BIN" "$B" "$B/0" "$G/$END" "$N" "$G/log.interFoam" levelsBinary "$U2/$END" || rc=1
 fi
 
+# ---- THE restart PROFILE: the SAME fixture with the written state KEPT, which is what the two profiles above
+# deliberately omit. createUfIfPresent.H builds Uf with IOobject::READ_IF_PRESENT and AUTO_WRITE, so every
+# time directory a REFINING case writes carries one, and `phi = mesh.Sf() & Uf()` (interFoam.C:131) consumes
+# it directly at the change while fvc::ddtCorr reads its oldTime. brae interpolated it unconditionally.
+#
+# MEASURED, the control against the port on this very case: alpha 8.8625e-02 -> 5.6049e-10, p_rgh 8.9647e-02
+# -> 2.7323e-09, U 1.2349e+00 -> 4.2657e-08, rAU 8.0261e-01 -> 1.2132e-08, phi 5.0101e-01 -> 1.6414e-08,
+# Uf 1.2746e+00 -> 7.4911e-08. Eight orders.
+#
+# alphaPhi0.water IS ALSO READ_IF_PRESENT (createAlphaFluxes.H:1-8) and brae reads only its PRESENCE, not its
+# values -- and this fixture CANNOT witness that, which is measured rather than assumed: interFoam.C:120-123
+# is `if (mesh.topoChanging()) { talphaPhi1Corr0.clear(); }` with OpenFOAM's own comment "Do not apply
+# previous time-step mesh compression flux if the mesh topology changed", so on a case whose first change is
+# at step 1 the value is discarded before anything reads it. Omitting the file from the earlier profiles
+# changed nothing to five figures, which is that. It stays an open finding for a NON-adaptive restart.
+R="$W/restart"
+rm -rf "$R"
+cp -r "$SRC" "$R" || exit 1
+rm -rf "$R"/0 "$R"/processor* "$R"/log.* "$R"/0.[0-9]* "$R"/constant/polyMesh
+cp "$REFSRC/constant/dynamicMeshDict" "$R/constant/dynamicMeshDict" || exit 1
+cp -r "$S/$SEEDEND/polyMesh" "$R/constant/polyMesh" || exit 1
+mkdir -p "$R/0" || exit 1
+# EVERYTHING the seed wrote, this time: Uf, phi and alphaPhi0 included.
+for f in "$S/$SEEDEND"/*; do
+    b=$(basename "$f")
+    [ "$b" = polyMesh ] && continue
+    [ "$b" = uniform ] && continue
+    cp -r "$f" "$R/0/$b" || exit 1
+done
+dicts "$R" "$END" || exit 1
+[ -f "$R/0/Uf" ] \
+    || { echo "FAIL: the seed wrote no Uf, so this profile cannot witness the read it exists for"; exit 1; }
+
+RKEY=$(oracleKey "$R" "interfoam_amr_levels" "restart" "$DT" "$N")
+if oracleRestore "$R" "$RKEY" "$END"; then
+    echo "[restart] OpenFOAM's $N steps from the full written state reused from the oracle cache"
+else
+    ( cd "$R" && interFoam > log.interFoam 2>&1 ) \
+        || { echo "FAIL: interFoam (the restart profile)"; tail -30 "$R/log.interFoam"; exit 1; }
+    [ -d "$R/$END" ] || { echo "FAIL: OpenFOAM wrote no $END directory (restart)"; exit 1; }
+    oracleStore "$R" "$RKEY"
+fi
+grep -qE "Refined from|Unrefined from" "$R/log.interFoam" \
+    || { echo "FAIL: the restart profile changes no cells"; rc=1; }
+
+# ...and its own one-ulp twin, because its bounds are 1e-08 for the same reason the others' are.
+UR="$W/restartUlp"
+rm -rf "$UR"
+cp -r "$R" "$UR" || exit 1
+rm -rf "$UR"/0.[0-9]* "$UR"/log.interFoam
+python3 - "$UR" <<'PYEOF' || exit 1
+import sys, math
+C = sys.argv[1]
+p = C + '/0/alpha.water'
+t = open(p).read()
+i = t.find('internalField'); j = t.find('(', i); k = t.find('\n)', j)
+vals = t[j + 1:k].split()
+idx = next(q for q, v in enumerate(vals) if float(v) == 1.0)
+vals[idx] = repr(math.nextafter(1.0, 0.0))
+open(p, 'w').write(t[:j + 1] + '\n' + '\n'.join(vals) + '\n' + t[k:])
+print('  one ulp on cell %d of the restart profile\'s initial alpha.water' % idx)
+PYEOF
+URKEY=$(oracleKey "$UR" "interfoam_amr_levels" "restartUlp" "$DT" "$N")
+if oracleRestore "$UR" "$URKEY" "$END"; then
+    echo "[restartUlp] reused from the oracle cache"
+else
+    ( cd "$UR" && interFoam > log.interFoam 2>&1 ) \
+        || { echo "FAIL: interFoam (the restart one-ulp twin)"; tail -20 "$UR/log.interFoam"; exit 1; }
+    oracleStore "$UR" "$URKEY"
+fi
+
+if [ $rc -eq 0 ]; then
+    "$BIN" "$R" "$R/0" "$R/$END" "$N" "$R/log.interFoam" restart "$UR/$END" || rc=1
+fi
+
 echo "interfoam_amr_levels_vs_openfoam: rc $rc"
 exit $rc

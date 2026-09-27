@@ -1578,13 +1578,23 @@ InterFields buildInterFields(const std::string&          caseDir,
         f.p_rgh.evaluateBoundary();
     }
 
-    // createUfIfPresent.H: the face velocity of a moving mesh, interpolate(U) to begin with. A
-    // `Uf` file in the start directory is a restart's, and a restart of a moving mesh is refused
-    // where the mesh is read.
     // createUfIfPresent.H:38-58 builds Uf `if (mesh.dynamic())`, which is MOVING OR TOPO-CHANGING -- not
     // "has a motion solver". MEASURED: OpenFOAM's own run of laminar/damBreakWithObstacle, a refine-only
     // case, writes a Uf beside every time directory. Built on f.dynamicMesh instead, an adaptive case had
     // no Uf at all, so the flux rebuild a mesh change needs (phi = Sf & Uf) would have read zeros.
+    //
+    // ...AND IT IS READ_IF_PRESENT, which this port had as an unconditional interpolation behind a comment
+    // that said "a `Uf` file in the start directory is a restart's, and a restart of a moving mesh is
+    // refused where the mesh is read". True of a MOVING mesh and FALSE of a refining one: the two lines
+    // above are the reason -- a refining mesh is dynamic, so it is AUTO_WRITE and every time directory it
+    // writes carries a Uf, and a run resumed from one of those must read it. The IOobject is
+    // `READ_IF_PRESENT` with `fvc::interpolate(U)` only as the fallback, exactly as createPhi.H is for phi
+    // (which this port already read).
+    //
+    // MEASURED, on a case resumed from a refined mesh (tests/interfoam_amr_levels_vs_openfoam.sh's fixture,
+    // with the file left in place): the mesh and EVERY CELL LEVEL came out exactly OpenFOAM's while alpha
+    // read 8.8625e-02, p_rgh 8.9647e-02 and U 1.2349e+00 -- because `phi = mesh.Sf() & Uf()`
+    // (interFoam.C:131) consumes it directly at the change and fvc::ddtCorr reads its oldTime.
     if (f.meshIsDynamic)
     {
         std::vector<std::vector<vector>> Ub(patches.size());
@@ -1592,7 +1602,20 @@ InterFields buildInterFields(const std::string&          caseDir,
         {
             Ub[pi] = f.U.boundary[pi]->value();
         }
-        f.Uf = fvc::interpolate(f.U.internal, Ub, m, g, patches);
+        if (std::getenv("BRAE_CONTROL_NO_UF_READ"))
+        {
+            // A GATE'S CONTROL: interpolate unconditionally, which is what this port did. It is the shipped
+            // behaviour rather than an invented one, and on a case with no Uf file it is also OpenFOAM's.
+            std::printf("  *** CONTROL MODE: Uf is interpolated from U, not read from the start directory. "
+                        "This run is deliberately wrong on a case that has one. ***\n");
+            f.Uf = fvc::interpolate(f.U.internal, Ub, m, g, patches);
+            f.UfWasRead = false;
+        }
+        else
+        {
+            f.Uf = readUfIfPresent(startDir, patches, m.nInternalFaces(),
+                                   fvc::interpolate(f.U.internal, Ub, m, g, patches), &f.UfWasRead);
+        }
     }
 
     // interfaceProperties' CONSTRUCTOR calls calculateK (interfaceProperties.C:196-210). That first

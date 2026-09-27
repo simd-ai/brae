@@ -347,6 +347,10 @@ struct InterFields
     scalar  deltaT = 0;
     std::string alphaName;                 // "alpha." + phase1Name
     bool    phiWasRead = false;            // see note 3
+    // ...and the same question for Uf, which createUfIfPresent.H also builds READ_IF_PRESENT. A gate needs
+    // this to assert its fixture actually CARRIES one: an arm comparing Uf would otherwise pass on a case
+    // that has no file, where both codes interpolate and agree by construction.
+    bool    UfWasRead = false;
 };
 
 // rho AS OpenFOAM HOLDS IT: the cell values plus CALCULATED patch values, for fvc::snGrad(rho).
