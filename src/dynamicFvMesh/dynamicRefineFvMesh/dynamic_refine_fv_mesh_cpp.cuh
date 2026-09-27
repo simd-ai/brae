@@ -633,6 +633,15 @@ std::vector<scalar> mapSurfaceField(
     bool                       oriented,
     const std::vector<label>&  flipFaceFlux);
 
+// ...and the same for a surface VECTOR, which is what Uf is. An unoriented field takes no flip, and
+// OpenFOAM only negates ORIENTED fields (MapFvSurfaceField.H:83) -- so the flag is carried rather than
+// assumed from the type.
+std::vector<vector> mapSurfaceField(
+    const std::vector<vector>& oldField,
+    const FaceMapping&         sm,
+    bool                       oriented,
+    const std::vector<label>&  flipFaceFlux);
+
 struct RefineUpdateState
 {
     PrimitiveMesh        m;
@@ -677,6 +686,18 @@ struct RefineUpdateState
         bool                             oriented = true;
     };
     std::vector<CarriedSurfaceField> surfaceScalars;
+
+    // ...and the surface VECTORS, which on this solver is Uf -- the face velocity a moving or adaptive
+    // mesh's ddtCorr reads. MEASURED on damBreakWithObstacle: OpenFOAM writes a Uf beside every time
+    // directory of that case, because `correctPhi` defaults to mesh.dynamic() and a refining mesh IS
+    // dynamic -- so a refine-only case needs Uf carried just as a moving one does.
+    struct CarriedSurfaceVectorField
+    {
+        std::vector<vector>              field;
+        std::vector<std::vector<vector>> bnd;
+        bool                             oriented = false;
+    };
+    std::vector<CarriedSurfaceVectorField> surfaceVectors;
 
     // ...and, per carried surface field, whether the case's correctFluxes names a VELOCITY for it. Where
     // it does, the four write sites of mapFields' own correction run on it, and so does unrefine's second

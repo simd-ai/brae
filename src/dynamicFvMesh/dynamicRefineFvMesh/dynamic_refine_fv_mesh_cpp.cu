@@ -1733,6 +1733,67 @@ FaceMapping patchMapping(
     return pm;
 }
 
+namespace {
+
+// one body for both element types: the addressing is the same and only the zero differs
+template <typename T>
+std::vector<T> mapSurfaceFieldT(
+    const std::vector<T>&      oldField,
+    const FaceMapping&         sm,
+    bool                       oriented,
+    const std::vector<label>&  flipFaceFlux,
+    const T&                   zero)
+{
+    std::vector<T> out;
+    if (sm.direct)
+    {
+        out.assign(sm.directAddressing.size(), zero);
+        if (!oldField.empty())
+        {
+            for (std::size_t i = 0; i < out.size(); ++i)
+            {
+                const label a = sm.directAddressing[i];
+                if (a >= 0) out[i] = oldField[static_cast<std::size_t>(a)];
+            }
+        }
+    }
+    else
+    {
+        out.assign(sm.addressing.size(), zero);
+        for (std::size_t i = 0; i < out.size(); ++i)
+        {
+            T v = zero;
+            for (std::size_t j = 0; j < sm.addressing[i].size(); ++j)
+            {
+                v = v + sm.weights[i][j]*oldField[static_cast<std::size_t>(sm.addressing[i][j])];
+            }
+            out[i] = v;
+        }
+    }
+    if (oriented)
+    {
+        for (const label facei : flipFaceFlux)
+        {
+            if (facei < static_cast<label>(out.size()))
+            {
+                out[static_cast<std::size_t>(facei)] = scalar(-1)*out[static_cast<std::size_t>(facei)];
+            }
+        }
+    }
+    return out;
+}
+
+}   // namespace
+
+std::vector<vector> mapSurfaceField(
+    const std::vector<vector>& oldField,
+    const FaceMapping&         sm,
+    bool                       oriented,
+    const std::vector<label>&  flipFaceFlux)
+{
+    return mapSurfaceFieldT<vector>(oldField, sm, oriented, flipFaceFlux, vector{0, 0, 0});
+}
+
 std::vector<scalar> mapSurfaceField(
     const std::vector<scalar>& oldField,
     const FaceMapping&         sm,
@@ -1938,7 +1999,8 @@ void mapCarriedFields(
     // each patch. The new mesh is already in place when this runs, which is what gives the patch starts.
     // the face mapping serves BOTH the carried patch fields (unit 8a) and the carried surface fields
     // (7b-2), so it is built whenever there is either
-    if (!s.surfaceScalars.empty() || !s.carriedScalarFields.empty() || !s.carriedVectorFields.empty())
+    if (!s.surfaceScalars.empty() || !s.surfaceVectors.empty()
+     || !s.carriedScalarFields.empty() || !s.carriedVectorFields.empty())
     {
         const FaceMapping fm = faceMapping(map, s.m.nFaces());
         const FaceMapping sm = surfaceMapping(fm, s.m.nInternalFaces(), nOldInternalFaces);
@@ -2048,6 +2110,20 @@ void mapCarriedFields(
                 correctFluxes(s.surfaceScalars[k].field, s.surfaceScalars[k].bnd, s.injectedPhiU,
                               s.injectedPhiUBnd, mpmF, mf, fv);
             }
+        }
+
+        // the surface VECTORS -- Uf -- through the same addressing, and then the FLAT hull average,
+        // because an unoriented field is averaged as itself
+        for (RefineUpdateState::CarriedSurfaceVectorField& f : s.surfaceVectors)
+        {
+            f.field = mapSurfaceField(f.field, sm, f.oriented, map.flipFaceFlux);
+            std::vector<std::vector<vector>> bnd(patches.size());
+            for (std::size_t p = 0; p < patches.size(); ++p)
+            {
+                bnd[p] = mapSurfaceField(f.bnd[p], pm[p], false, std::vector<label>());
+            }
+            f.bnd.swap(bnd);
+            mapNewInternalFacesFlat(f.field, f.bnd, mpmF, fv);
         }
 
         // ...AND THE HULL AVERAGE LAST, over the injected internal faces, on EVERY surface field in the

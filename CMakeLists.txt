@@ -115,6 +115,7 @@ add_library(brae_core STATIC
     src/dynamicMesh/polyTopoChange/removeFaces/remove_faces_cpp.cu
     src/dynamicMesh/polyTopoChange/hexRef8/hex_ref8_cpp.cu
     src/dynamicFvMesh/dynamicRefineFvMesh/dynamic_refine_fv_mesh_cpp.cu
+    src/applications/solvers/interFoam/inter_amr_cpp.cu
     src/dynamicMesh/pointPatchDist/point_patch_dist_cpp.cu
     src/rigidBodyDynamics/rigid_body_motion_cpp.cu
     src/rigidBodyMeshMotion/rigid_body_mesh_motion_cpp.cu
