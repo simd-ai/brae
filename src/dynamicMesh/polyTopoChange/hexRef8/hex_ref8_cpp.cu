@@ -1332,6 +1332,91 @@ void setUnrefinementLevels(
     // removed or stay at the same position", so a surviving point's level is still the level it had.
 }
 
+// refinementHistory::compact. See the header.
+
+namespace {
+
+// markSplit (:1553-1585). Depth-first, parent before children, and each entry is appended the FIRST time
+// it is reached -- which is what fixes the compacted numbering.
+void markSplit(
+    const History&            h,
+    label                     index,
+    std::vector<label>&       oldToNew,
+    std::vector<label>&       newParent,
+    std::vector<std::vector<label>>& newAdded,
+    std::vector<label>&       newFromOld)
+{
+    if (oldToNew[static_cast<std::size_t>(index)] != -1) return;
+    oldToNew[static_cast<std::size_t>(index)] = static_cast<label>(newParent.size());
+    newParent.push_back(h.parent[static_cast<std::size_t>(index)]);
+    newAdded.push_back(h.addedCells[static_cast<std::size_t>(index)]);
+    newFromOld.push_back(index);
+    const label parent = h.parent[static_cast<std::size_t>(index)];
+    if (parent >= 0)
+    {
+        markSplit(h, parent, oldToNew, newParent, newAdded, newFromOld);
+    }
+    for (const label child : h.addedCells[static_cast<std::size_t>(index)])
+    {
+        if (child >= 0)
+        {
+            markSplit(h, child, oldToNew, newParent, newAdded, newFromOld);
+        }
+    }
+}
+
+}   // namespace
+
+void compactHistory(History& h)
+{
+    const std::size_t nOld = h.parent.size();
+    std::vector<label> oldToNew(nOld, label(-1));
+    std::vector<label> newParent;
+    std::vector<std::vector<label>> newAdded;
+    std::vector<label> newFromOld;
+    newParent.reserve(nOld);
+    newAdded.reserve(nOld);
+
+    // :1722-1742. From visibleCells, and only where the entry has a parent or children.
+    for (const label index : h.visibleCells)
+    {
+        if (index < 0) continue;
+        if (h.parent[static_cast<std::size_t>(index)] != -1
+         || !h.addedCells[static_cast<std::size_t>(index)].empty())
+        {
+            markSplit(h, index, oldToNew, newParent, newAdded, newFromOld);
+        }
+    }
+    // :1745-1766. Then from the split cells: a freed entry (-2) and a recombined one (no parent, no
+    // children) are skipped -- either may already have been marked through someone else.
+    for (std::size_t index = 0; index < nOld; ++index)
+    {
+        if (h.parent[index] == -2) continue;
+        if (h.parent[index] == -1 && h.addedCells[index].empty()) continue;
+        markSplit(h, static_cast<label>(index), oldToNew, newParent, newAdded, newFromOld);
+    }
+
+    // :1772-1792. Renumber the compacted entries' own parent and children through oldToNew.
+    for (std::size_t i = 0; i < newParent.size(); ++i)
+    {
+        if (newParent[i] >= 0) newParent[i] = oldToNew[static_cast<std::size_t>(newParent[i])];
+        for (label& child : newAdded[i])
+        {
+            if (child >= 0) child = oldToNew[static_cast<std::size_t>(child)];
+        }
+    }
+
+    h.parent = std::move(newParent);
+    h.addedCells = std::move(newAdded);
+    h.freeSplitCells.clear();
+
+    // :1825-1839. And visibleCells. oldToNew can be -1, which RESETS the entry -- OpenFOAM's own note.
+    for (label& index : h.visibleCells)
+    {
+        if (index >= 0) index = oldToNew[static_cast<std::size_t>(index)];
+    }
+}
+
 }   // namespace hexRef8
 }   // namespace cpu
 }   // namespace brae

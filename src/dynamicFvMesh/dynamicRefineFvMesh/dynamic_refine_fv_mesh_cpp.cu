@@ -1,6 +1,11 @@
 #include "dynamic_refine_fv_mesh_cpp.cuh"
 
 #include "foam_token_reader.cuh"
+#include "fv_geometry.cuh"
+#include "mesh_cell_cells_cpp.cuh"
+#include "mesh_edges_cpp.cuh"
+#include "primitive_patch_cpp.cuh"
+#include "remove_faces_cpp.cuh"
 #include <algorithm>
 #include <filesystem>
 #include <cmath>
@@ -1362,6 +1367,360 @@ RefineControls readRefineControls(
         c.dumpLevel = (v == "true" || v == "yes" || v == "on" || v == "1");
     }
     return c;
+}
+
+// ----------------------------------------------------------------------------------------------
+// UNIT 7: the driver. See the header.
+
+namespace {
+
+// A ChangedMesh back into a PrimitiveMesh, keeping the old patches' NAMES and TYPES: changeMesh returns
+// starts and sizes, and every walk below asks the patches for their type.
+PrimitiveMesh rebuiltMesh(
+    const PrimitiveMesh&                     old,
+    const cpu::polyTopoChange::ChangedMesh&  out)
+{
+    std::vector<label> faceVerts;
+    std::vector<label> faceOffsets;
+    faceOffsets.reserve(out.faces.size() + 1);
+    faceOffsets.push_back(0);
+    for (const std::vector<label>& f : out.faces)
+    {
+        faceVerts.insert(faceVerts.end(), f.begin(), f.end());
+        faceOffsets.push_back(static_cast<label>(faceVerts.size()));
+    }
+    std::vector<label> nbr(out.faceNeighbour.begin(),
+                           out.faceNeighbour.begin() + static_cast<std::size_t>(out.nInternalFaces));
+    std::vector<PatchInfo> patches = old.patches();
+    for (std::size_t p = 0; p < patches.size(); ++p)
+    {
+        patches[p].start = out.patchStarts[p];
+        patches[p].size = out.patchSizes[p];
+    }
+    PrimitiveMesh m;
+    m.assign(out.points, std::move(faceVerts), std::move(faceOffsets), out.faceOwner, std::move(nbr),
+             std::move(patches), out.nCells);
+    return m;
+}
+
+// the addressing every stage of a step reads, rebuilt after each change
+struct StepAddressing
+{
+    FvGeometry                      g;
+    std::vector<std::vector<label>> cells;
+    std::vector<std::vector<label>> pointCells;
+    std::vector<std::vector<label>> cellPoints;
+    MeshEdges                       edges;
+    std::vector<std::vector<label>> faceEdges;
+    std::vector<std::vector<label>> edgeFaces;
+    std::vector<std::vector<label>> cellEdges;
+    std::vector<std::vector<label>> cellCells;
+    std::vector<std::vector<label>> pointFaces;
+};
+
+void buildAddressing(
+    const PrimitiveMesh& m,
+    StepAddressing&      a)
+{
+    a.g.build(m);
+    a.cells = meshCells(m);
+    // pointCells through the CELLS branch, which is the one dynamicRefineFvMesh meets -- measured, and
+    // the three branches sum differently
+    a.pointCells = pointCellsFromCells(m, a.cells);
+    a.cellPoints = cellPointsFromCells(m, a.cells);
+    a.edges = buildMeshEdges(m);
+    a.faceEdges = buildFaceEdges(m, a.edges);
+    a.edgeFaces = buildEdgeFaces(m, a.faceEdges);
+    a.cellEdges = buildCellEdges(a.cells, a.faceEdges);
+    a.cellCells = buildCellCells(m);
+    a.pointFaces = meshPointFaces(m);
+}
+
+cpu::hexRef8::MeshView hexView(
+    const PrimitiveMesh&  m,
+    const StepAddressing& a)
+{
+    cpu::hexRef8::MeshView v;
+    v.m = &m;
+    v.edges = &a.edges;
+    v.faceEdges = &a.faceEdges;
+    v.edgeFaces = &a.edgeFaces;
+    v.cells = &a.cells;
+    v.cellPoints = &a.cellPoints;
+    v.pointCells = &a.pointCells;
+    v.cellEdges = &a.cellEdges;
+    v.cellCentres = &a.g.C();
+    v.faceCentres = &a.g.Cf();
+    return v;
+}
+
+cpu::polyTopoChange::TopoActions actionsFromMesh(const PrimitiveMesh& m)
+{
+    std::vector<label> starts, sizes;
+    for (const PatchInfo& p : m.patches()) { starts.push_back(p.start); sizes.push_back(p.size); }
+    std::vector<std::vector<label>> faces(static_cast<std::size_t>(m.nFaces()));
+    for (label f = 0; f < m.nFaces(); ++f)
+    {
+        faces[static_cast<std::size_t>(f)].assign(
+            m.faceVerts().begin() + m.faceOffsets()[static_cast<std::size_t>(f)],
+            m.faceVerts().begin() + m.faceOffsets()[static_cast<std::size_t>(f) + 1]);
+    }
+    std::vector<label> nbr(static_cast<std::size_t>(m.nFaces()), label(-1));
+    for (label f = 0; f < m.nInternalFaces(); ++f) nbr[static_cast<std::size_t>(f)] = m.neighbour()[f];
+    cpu::polyTopoChange::TopoActions a;
+    cpu::polyTopoChange::addMesh(a, m.points(), faces, m.owner(), nbr, m.nCells(), starts, sizes);
+    return a;
+}
+
+cpu::polyTopoChange::ChangeMeshInput changeInput(const PrimitiveMesh& m)
+{
+    cpu::polyTopoChange::ChangeMeshInput ci;
+    ci.nOldPoints = static_cast<label>(m.points().size());
+    ci.nOldFaces = m.nFaces();
+    ci.nOldCells = m.nCells();
+    for (const PatchInfo& p : m.patches())
+    {
+        ci.oldPatchStarts.push_back(p.start);
+        ci.oldPatchSizes.push_back(p.size);
+        ci.patchTypes.push_back(p.type);
+    }
+    ci.oldPatchNMeshPoints.assign(ci.oldPatchStarts.size(), label(0));
+    ci.nZones = 0;
+    return ci;
+}
+
+// protectedCell_ renumbered through a change (:518-530 and :700-712, the same block twice): the new cell
+// is protected when the cell it came from was. A new cell with cellMap -1 is NOT protected.
+void renumberProtectedCells(
+    std::vector<char>&        protectedCell,
+    const std::vector<label>& cellMap,
+    label                     nNewCells)
+{
+    if (protectedCell.empty()) return;
+    std::vector<char> next(static_cast<std::size_t>(nNewCells), char(0));
+    for (label celli = 0; celli < nNewCells; ++celli)
+    {
+        const label oldCelli = cellMap[static_cast<std::size_t>(celli)];
+        if (oldCelli >= 0 && protectedCell[static_cast<std::size_t>(oldCelli)]) next[static_cast<std::size_t>(celli)] = 1;
+    }
+    protectedCell.swap(next);
+}
+
+}   // namespace
+
+RefineUpdateStep refineUpdate(
+    RefineUpdateState&         s,
+    const RefineControls&      c,
+    const std::vector<scalar>& field,
+    label                      timeIndex)
+{
+    RefineUpdateStep r;
+
+    // :1295-1312. refineInterval 0 switches the whole thing off; a negative one is an error.
+    if (c.refineInterval == 0) return r;
+    if (c.refineInterval < 0)
+        throw std::runtime_error(
+            "brae dynamicRefineFvMesh::updateTopology: refineInterval " + std::to_string(c.refineInterval)
+            + " is illegal; it must be >= 1. OpenFOAM FatalErrors here too (:1307-1312).");
+
+    // :1320. NOT at time 0: there is no V0 yet because the mesh has not moved. OpenFOAM's own comment.
+    if (!(timeIndex > 0 && (timeIndex % c.refineInterval) == 0)) return r;
+
+    if (c.maxCells <= 0)
+        throw std::runtime_error(
+            "brae dynamicRefineFvMesh::updateTopology: maxCells " + std::to_string(c.maxCells)
+            + " is illegal; it must be > 0. OpenFOAM FatalErrors here too (:1326-1332).");
+    if (c.maxRefinement <= 0)
+        throw std::runtime_error(
+            "brae dynamicRefineFvMesh::updateTopology: maxRefinement " + std::to_string(c.maxRefinement)
+            + " is illegal; it must be > 0. OpenFOAM FatalErrors here too (:1336-1342).");
+
+    if (static_cast<label>(field.size()) != s.m.nCells())
+        throw std::runtime_error(
+            "brae dynamicRefineFvMesh::updateTopology: the driving field has "
+            + std::to_string(field.size()) + " values and the mesh " + std::to_string(s.m.nCells())
+            + " cells. The field must be the one on the CURRENT mesh.");
+
+    StepAddressing a;
+    buildAddressing(s.m, a);
+    s.patches = buildPatches(s.m, a.g);
+
+    // :1357-1367. A fresh marker every step, marked from the field alone.
+    std::vector<char> refineCell(static_cast<std::size_t>(s.m.nCells()), char(0));
+    selectRefineCandidates(c.lowerRefineLevel, c.upperRefineLevel, field, a.pointCells, s.m.nCells(),
+                           refineCell);
+
+    // the field as the step will see it after a refinement -- see below
+    std::vector<scalar> stepField = field;
+
+    // :1369-1416. Only if the mesh is still under maxCells.
+    if (s.m.nCells() < c.maxCells)
+    {
+        r.cellsToRefine = selectRefineCells(c.maxCells, c.maxRefinement, refineCell, s.levels.cellLevel,
+                                           s.protectedCell, s.m.nCells(), s.m, s.patches);
+        if (!r.cellsToRefine.empty())
+        {
+            // ---- refine (:442-535) ----------------------------------------------------------------
+            cpu::polyTopoChange::TopoActions act = actionsFromMesh(s.m);
+            const cpu::hexRef8::MeshView v = hexView(s.m, a);
+            std::vector<std::string> patchTypes;
+            for (const PatchInfo& p : s.m.patches()) patchTypes.push_back(p.type);
+            cpu::hexRef8::RefinementMarks marks;
+            (void)cpu::hexRef8::setRefinementPointsAndCells(v, s.levels, r.cellsToRefine, patchTypes,
+                                                            act, marks);
+            cpu::hexRef8::setRefinementFaces(v, s.levels, marks, act);
+            // marks.cellAddedCells, NOT the RETURN value: section 11 indexes cellAddedCells BY CELL
+            // (hexRef8.C:4295), and what setRefinement returns is the COMPACTED per-requested-cell form
+            // it builds afterwards. Passing the compacted one hands storeSplit the request INDEX as a
+            // cell label -- which still agreed with OpenFOAM on a first refinement, because a fresh
+            // history's visibleCells is the identity so any index reuses "its own" entry, and the
+            // compaction then dropped the difference. It came apart on the SECOND refinement: 470
+            // splits allocated 470 new parents where OpenFOAM allocated 64 and reused 406.
+            cpu::hexRef8::storeRefinementHistory(s.history, marks.cellAddedCells,
+                                                 static_cast<label>(marks.newCellLevel.size()));
+
+            cpu::polyTopoChange::ChangedMesh out;
+            cpu::polyTopoChange::changeMesh(act, changeInput(s.m), out, r.refineMap);
+
+            // hexRef8::updateMesh -- the levels and the history through the change
+            s.levels.cellLevel = marks.newCellLevel;
+            s.levels.pointLevel = marks.newPointLevel;
+            cpu::hexRef8::updateLevels(s.levels, r.refineMap.reverseCellMap, r.refineMap.reversePointMap,
+                                       r.refineMap.cellMap, r.refineMap.pointMap, out.nCells,
+                                       static_cast<label>(out.points.size()));
+            cpu::hexRef8::historyUpdateMesh(s.history, r.refineMap.reverseCellMap, out.nCells);
+
+            // THE DRIVING FIELD IS MAPPED THROUGH cellMap, and that is OpenFOAM's rule and not a
+            // simplification: a refinement leaves every cellsFrom* map EMPTY (measured -- 0 entries on
+            // every refinement arm of hex_ref8_vs_openfoam), so cellMapper takes its DIRECT branch
+            // (cellMapper.C:36-60) and each new cell takes the value of the cell it came from. The
+            // interpolative branch -- which is VOLUME-WEIGHTED over the masters when the map carries old
+            // cell volumes -- is only reached by a merge, and that is unit 7b's.
+            {
+                std::vector<scalar> mapped(static_cast<std::size_t>(out.nCells), scalar(0));
+                for (label celli = 0; celli < out.nCells; ++celli)
+                {
+                    const label oldCelli = r.refineMap.cellMap[static_cast<std::size_t>(celli)];
+                    // an inserted cell (cellMap -1) takes cell 0's value, as cellMapper's own
+                    // inserted-object handling does
+                    mapped[static_cast<std::size_t>(celli)] =
+                        stepField[static_cast<std::size_t>(oldCelli >= 0 ? oldCelli : 0)];
+                }
+                stepField.swap(mapped);
+            }
+
+            renumberProtectedCells(s.protectedCell, r.refineMap.cellMap, out.nCells);
+            s.m = rebuiltMesh(s.m, out);
+            buildAddressing(s.m, a);
+            s.patches = buildPatches(s.m, a.g);
+
+            // :1391-1411. refineCell REBUILT THROUGH THE MAP: a cell stays marked if it is new, if it is
+            // not its old cell's master, or if its old cell was marked. That is what keeps every child of
+            // a refined cell marked, so the unrefinement below cannot undo this refinement.
+            {
+                std::vector<char> next(static_cast<std::size_t>(out.nCells), char(0));
+                for (label celli = 0; celli < out.nCells; ++celli)
+                {
+                    const label oldCelli = r.refineMap.cellMap[static_cast<std::size_t>(celli)];
+                    if (oldCelli < 0
+                     || r.refineMap.reverseCellMap[static_cast<std::size_t>(oldCelli)] != celli
+                     || refineCell[static_cast<std::size_t>(oldCelli)])
+                    {
+                        next[static_cast<std::size_t>(celli)] = 1;
+                    }
+                }
+                refineCell.swap(next);
+            }
+            r.refineCellAfterMap = refineCell;
+
+            for (label i = 0; i < c.nBufferLayers; ++i)
+            {
+                extendMarkedCells(s.m, s.patches, a.cells, refineCell);
+            }
+            r.refineCellAfterBuffer = refineCell;
+
+            r.refined = true;
+            r.hasChanged = true;
+        }
+    }
+
+    // :1419-1440. The unrefinement, which runs whether or not anything was refined.
+    {
+        RefinementHistory hv;
+        hv.parent = s.history.parent;
+        hv.visibleCells = s.history.visibleCells;
+        hv.active = s.history.active;
+        const std::vector<label> splitPoints =
+            getSplitPoints(hv, s.levels.cellLevel, a.pointCells, a.cellPoints, s.m);
+        const std::vector<scalar> pFld = maxCellField(stepField, a.pointCells);
+        r.pointsToUnrefine = selectUnrefinePoints(c.unrefineLevel, refineCell, pFld, splitPoints,
+                                                  s.protectedCell, s.levels.cellLevel, a.pointCells,
+                                                  s.m, s.patches);
+        if (!r.pointsToUnrefine.empty())
+        {
+            // ---- unrefine (:537-716) ---------------------------------------------------------------
+            cpu::polyTopoChange::TopoActions act = actionsFromMesh(s.m);
+            const cpu::hexRef8::MeshView v = hexView(s.m, a);
+            cpu::hexRef8::setUnrefinementLevels(v, s.levels, s.history, r.pointsToUnrefine);
+
+            // the faces around the split points, which is what removeFaces is asked to remove
+            std::vector<char> seen(static_cast<std::size_t>(s.m.nFaces()), char(0));
+            std::vector<label> splitFaces;
+            for (const label pointi : r.pointsToUnrefine)
+            {
+                for (const label facei : a.pointFaces[static_cast<std::size_t>(pointi)])
+                {
+                    if (!seen[static_cast<std::size_t>(facei)])
+                    {
+                        seen[static_cast<std::size_t>(facei)] = 1;
+                        splitFaces.push_back(facei);
+                    }
+                }
+            }
+            cpu::removeFaces::RemoveFacesView rv;
+            rv.m = &s.m;
+            rv.edges = &a.edges;
+            rv.faceEdges = &a.faceEdges;
+            rv.edgeFaces = &a.edgeFaces;
+            rv.cells = &a.cells;
+            rv.pointFaces = &a.pointFaces;
+            rv.faceAreas = &a.g.Sf();
+            std::vector<label> cellRegion, cellRegionMaster, facesToRemove;
+            cpu::removeFaces::compatibleRemoves(s.m, a.cellCells, splitFaces, cellRegion,
+                                                cellRegionMaster, facesToRemove);
+            // hexRef8 builds its faceRemover with GREAT, so the feature-angle guard never runs
+            // (hexRef8.C:1967)
+            const cpu::removeFaces::RemoveFacesDecisions dec =
+                cpu::removeFaces::setRefinementDecisions(rv, facesToRemove, cellRegion, cellRegionMaster,
+                                                         scalar(1.0e+15));
+            cpu::removeFaces::setRefinementActions(rv, dec, facesToRemove, cellRegion, cellRegionMaster,
+                                                   act);
+
+            cpu::polyTopoChange::ChangedMesh out;
+            cpu::polyTopoChange::changeMesh(act, changeInput(s.m), out, r.unrefineMap);
+
+            cpu::hexRef8::updateLevels(s.levels, r.unrefineMap.reverseCellMap,
+                                       r.unrefineMap.reversePointMap, r.unrefineMap.cellMap,
+                                       r.unrefineMap.pointMap, out.nCells,
+                                       static_cast<label>(out.points.size()));
+            cpu::hexRef8::historyUpdateMesh(s.history, r.unrefineMap.reverseCellMap, out.nCells);
+            renumberProtectedCells(s.protectedCell, r.unrefineMap.cellMap, out.nCells);
+            s.m = rebuiltMesh(s.m, out);
+
+            r.unrefined = true;
+            r.hasChanged = true;
+        }
+    }
+
+    // :1443-1450. Every tenth iteration, and the counter starts at 0 -- so the FIRST step compacts.
+    if ((s.nRefinementIterations % 10) == 0)
+    {
+        cpu::hexRef8::compactHistory(s.history);
+        r.compacted = true;
+    }
+    ++s.nRefinementIterations;
+
+    return r;
 }
 
 }   // namespace dynamicRefine

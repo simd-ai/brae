@@ -267,6 +267,21 @@ void updateLevels(
     label                     nNewCells,
     label                     nNewPoints);
 
+// refinementHistory::compact (:1677-1810) + markSplit (:1553-1585). Unrefinement leaves HOLES in the
+// split-cell list -- freed entries with parent_ -2 and recombined ones with no parent and no children --
+// and dynamicRefineFvMesh calls this every tenth refinement iteration to close them up.
+//
+// THE MARKING ORDER IS THE ANSWER, not book-keeping: markSplit is DEPTH-FIRST and writes each entry's new
+// index the first time it is reached, parent before children, so the compacted numbering is the order the
+// walk reaches things in. Every `parent` and `visibleCells` entry is then renumbered through it. The walk
+// is transcribed as recursion because that is what decides the numbering; the refinement depth bounds it.
+//
+// TWO PASSES MARK, and they are not the same test. From visibleCells: an entry is kept only if it HAS a
+// parent or HAS children (a lone split cell with neither is dead). Then from the split cells themselves,
+// where a freed entry (-2) is skipped and a recombined one (parent -1 and no children) is skipped -- but
+// either can still be marked if the first pass reached it through someone else.
+void compactHistory(History& h);
+
 // setRefinement's section 11 (:4274-4300): extend the history over the new cells and record every split.
 void storeRefinementHistory(
     History&                               h,

@@ -26,6 +26,8 @@
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
 #include "fv_patch.cuh"
+#include "hex_ref8_cpp.cuh"
+#include "poly_topo_change_cpp.cuh"
 #include "map_poly_mesh_cpp.cuh"
 #include "primitive_mesh.cuh"
 #include <string>
@@ -481,6 +483,71 @@ label correctFluxesUnrefine(
     const std::vector<std::pair<label, label>>&   faceToSplitPoint,
     const MapPolyMesh&                            mpm,
     const FluxMeshView&                           m);
+
+// ----------------------------------------------------------------------------------------------
+// UNIT 7: THE DRIVER. dynamicRefineFvMesh::updateTopology() and the refine()/unrefine() it calls --
+// the sequence that turns the pieces above into one adaptive step.
+//
+// provenance:
+//   openfoam: dynamicRefineFvMesh.C:1274-1466 (updateTopology), :442-535 (refine), :537-716 (unrefine)
+//   oracle:   tools/dumpRefineUpdate -- a copy of OpenFOAM's own class with WRITES ONLY (of-instrument),
+//             stepped over an ANALYTIC field so what is compared is the driver and not a solve
+//   tests:    tests/refine_update_vs_openfoam.sh
+//
+// THE ORDER IS THE PORT, and it is not the order the pieces were written in:
+//   1  the candidates, from the field alone (selectRefineCandidates)
+//   2  IF the mesh is under maxCells, the cells to refine (selectRefineCells), then refine
+//   3  refineCell is REBUILT THROUGH THE MAP -- and this is the subtle one: a cell is marked again if
+//      it is NEW (cellMap < 0), if it is not its old cell's master (reverseCellMap[old] != new) or if
+//      its old cell was marked. So every child of a refined cell stays marked, which is what stops the
+//      unrefinement below undoing the refinement just done.
+//   4  nBufferLayers passes of extendMarkedCells
+//   5  the points to unrefine (selectUnrefinePoints), then unrefine
+//   6  the history is COMPACTED every tenth iteration -- and the counter starts at 0, so the FIRST step
+//      compacts (`(0 % 10) == 0`).
+// A step can refine, unrefine, both or neither, and `hasChanged` is the or of the two.
+//
+// WHAT THIS UNIT DOES NOT DO. The FIELD MAPPING -- mapFields, the old-time volumes and the flux
+// correction -- is unit 7b. It cannot change the topology (OpenFOAM maps fields after the mesh is
+// already built), so the driver is gated without it, and the gate's field is analytic and recomputed on
+// the new cell centres at every step for exactly that reason.
+struct RefineUpdateState
+{
+    PrimitiveMesh        m;
+    std::vector<FvPatch> patches;
+    cpu::hexRef8::Levels levels;
+    cpu::hexRef8::History history;
+    // dynamicRefineFvMesh's own protectedCell_, which SURVIVES a step and is renumbered by each change.
+    // Empty means nothing is protected.
+    std::vector<char>    protectedCell;
+    label                nRefinementIterations = 0;
+};
+
+struct RefineUpdateStep
+{
+    bool                          hasChanged = false;
+    bool                          refined = false;
+    bool                          unrefined = false;
+    std::vector<label>            cellsToRefine;
+    std::vector<label>            pointsToUnrefine;
+    // refineCell as it stands after the map rebuild and after the buffer layers -- the two states
+    // OpenFOAM's own bitSet passes through
+    std::vector<char>             refineCellAfterMap;
+    std::vector<char>             refineCellAfterBuffer;
+    cpu::polyTopoChange::TopoChangeMap refineMap;
+    cpu::polyTopoChange::TopoChangeMap unrefineMap;
+    bool                          compacted = false;
+};
+
+// One update() step. `field` is the driving field on the CURRENT mesh, `timeIndex` OpenFOAM's own time
+// index -- the step is a no-op at 0 and whenever timeIndex % refineInterval != 0, exactly as
+// updateTopology's guard says. The state's mesh, levels, history and protectedCell are left as the step
+// leaves them, so the caller loops.
+RefineUpdateStep refineUpdate(
+    RefineUpdateState&         s,
+    const RefineControls&      c,
+    const std::vector<scalar>& field,
+    label                      timeIndex);
 
 }   // namespace dynamicRefine
 }   // namespace brae

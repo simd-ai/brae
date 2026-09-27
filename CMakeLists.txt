@@ -3805,6 +3805,14 @@ set_tests_properties(mesh_edges_addressing_vs_openfoam PROPERTIES SKIP_RETURN_CO
 
 # UNIT 5b: hexRef8::setRefinement, against OpenFOAM's own (tools/dumpHexRef8 dumps cellAddedCells, the
 # levels, the map and the mesh). Stage 5b-1 holds the points, the cells and the levels.
+add_executable(test_refine_update_vs_openfoam tests/test_refine_update_vs_openfoam.cu)
+target_include_directories(test_refine_update_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_refine_update_vs_openfoam PRIVATE brae_core)
+add_test(NAME refine_update_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/refine_update_vs_openfoam.sh)
+set_tests_properties(refine_update_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(test_hex_ref8_vs_openfoam tests/test_hex_ref8_vs_openfoam.cu)
 target_include_directories(test_hex_ref8_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
