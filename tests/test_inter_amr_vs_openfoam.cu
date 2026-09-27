@@ -118,6 +118,34 @@ std::vector<label> readOfRefinedTo(const std::string& logPath)
     return out;
 }
 
+// OpenFOAM's `- selected N cell(s) with volume V` lines, in order: cellSetOption::setVol prints one
+// whenever the selection has been re-run (cellSetOption.C:167-168, forced by V_ = -GREAT at every
+// topology change). The LAST one is the selection the run ends with.
+struct Selected
+{
+    label  n = -1;
+    scalar V = 0;
+};
+
+std::vector<Selected> readOfSelections(const std::string& logPath)
+{
+    std::vector<Selected> out;
+    std::ifstream in(logPath);
+    std::string line;
+    const std::string kSel = "- selected ", kVol = " cell(s) with volume ";
+    while (std::getline(in, line))
+    {
+        const std::size_t a = line.find(kSel);
+        const std::size_t b = line.find(kVol);
+        if (a == std::string::npos || b == std::string::npos || b < a) continue;
+        Selected s;
+        s.n = static_cast<label>(std::atol(line.c_str() + a + kSel.size()));
+        s.V = static_cast<scalar>(std::atof(line.c_str() + b + kVol.size()));
+        out.push_back(s);
+    }
+    return out;
+}
+
 // ...and its continuityErrs.H lines: dt*|div(phi)| weighted-averaged over the cell volumes, which is
 // what says the flux the step ENDS with is divergence-free on the new mesh. The last one of the run is
 // the one this gate reads, because that is the flux `fieldsOut` hands back.
@@ -256,20 +284,34 @@ int main(
         // CrankNicolson: the two arms run the same scheme on the same mapped state and differ only by the
         // order their reductions sum in.
         scalar devPRgh, hostDevPRgh;
+        // the PATCH U floor, relative, which is per profile because the relative measure divides by the
+        // worst patch's OWN largest value and that is not the field's: on the porosity profile the worst
+        // patch's U reaches 1.78e-04, so an absolute 4.0145e-16 -- a smaller absolute than the interior
+        // 2.3205e-13 the same run passes on -- reads 2.2560e-12 relative. On the open profile the same
+        // patch reaches 1.7e-03 and the same class of round-off reads 8.3203e-14.
+        scalar patchU;
     };
     //   cn      7.7716e-15 alpha, 7.3e-15 p_rgh, 4.5e-13 U, 2.7e-14 p, 6.9e-12 rAU, 1.2e-13 phi
     //   and the cn profile's DEVICE arm: alpha 2.1982e-14 from OpenFOAM and 2.2714e-14 from the host,
     //   p_rgh 2.0474e-14 and 1.9853e-14, U 8.8e-13, phi 4.3e-13
     const bool closed = (profile == "closed");
     const bool cn = (profile == "cn");
+    const bool porosity = (profile == "porosity");
+    //   porosity 1.5190e-14 alpha, 1.2e-14 p_rgh, 3.1e-13 U, 7.5e-15 p, 1.5e-11 rAU, 2.2e-13 phi,
+    //   2.3e-13 Uf, 2.5e-11 contErr -- three steps with an explicitPorositySource over a cellZone, whose
+    //   re-selection is what this profile exists to measure; and its DEVICE arm: alpha 1.6986e-14 from
+    //   OpenFOAM and 2.2773e-14 from the host, p_rgh 1.3737e-14 and 1.8231e-14, U 3.5e-13, phi 2.9e-13
     const Bounds B = closed
         ? Bounds{5e-14, 1e-14, 1e-12, 1e-13, 1e-11, 5e-12, 1e-12, 1e-9, 5e-14, 1e-12, 1e-14, 5e-12,
-                 1e-14, 1e-14}
+                 1e-14, 1e-14, 1e-12}
         : cn
         ? Bounds{1e-14, 1e-14, 1e-12, 1e-13, 1e-11, 1e-12, 1e-12, 1e-9, 5e-14, 1e-12, 5e-14, 1e-12,
-                 5e-14, 5e-14}
+                 5e-14, 5e-14, 1e-12}
+        : porosity
+        ? Bounds{5e-14, 5e-14, 1e-12, 1e-13, 5e-11, 1e-12, 1e-12, 1e-9, 5e-14, 1e-12, 5e-14, 1e-12,
+                 5e-14, 5e-14, 5e-12}
         : Bounds{5e-15, 1e-14, 1e-12, 1e-13, 1e-11, 1e-12, 1e-12, 1e-9, 5e-15, 1e-12, 5e-15, 1e-12,
-                 1e-14, 1e-14};
+                 1e-14, 1e-14, 1e-12};
 
     Arm A;
     runArm(A, caseDir, startDir, nSteps);
@@ -397,10 +439,11 @@ int main(
                 if (d.linf > worstP.linf) worstP = d;
             }
         }
-        std::printf("  patch values: alpha %.4e   U %.4e   p_rgh %.4e\n",
-                    (double)worstA.linf, (double)worstU.linf, (double)worstP.linf);
+        std::printf("  patch values: alpha %.4e   U %.4e (rel %.4e)   p_rgh %.4e (rel %.4e)\n",
+                    (double)worstA.linf, (double)worstU.linf, (double)worstU.rel(),
+                    (double)worstP.linf, (double)worstP.rel());
         check("every patch's alpha is at this profile's floor", worstA.linf < B.alpha);
-        check("every patch's U is within 1e-12 relative", worstU.rel() < scalar(1e-12));
+        check("every patch's U is at this profile's floor, relative", worstU.rel() < B.patchU);
         check("every patch's p_rgh is within 1e-14 relative", worstP.rel() < scalar(1e-14));
     }
 
@@ -583,6 +626,54 @@ int main(
         // 1.07e-02 and U 3.1e-01 from the gate's own arm, twelve orders above its distance from OpenFOAM.
         check("...and is caught: its alpha is more than a million times further out than the gate's",
               cA.linf > scalar(1e6)*std::fmax(dAlpha.linf, scalar(1e-300)));
+    }
+
+    // ---- THE fvOPTIONS SELECTION, on the porosity profile. OpenFOAM re-runs the selection at every
+    // topology change and prints what it got; brae must have the same cells, and the volume is the
+    // sharper half of the comparison because it is INVARIANT -- the count grows eightfold on the refined
+    // part of the zone while the volume does not move a digit.
+    if (profile == "porosity")
+    {
+        const std::vector<Selected> ofSel = readOfSelections(logPath);
+        check("OpenFOAM's log carries a selection line to compare against", !ofSel.empty());
+        check("the case has an fvOption to re-select", !A.f.fvOptions.empty());
+        if (!ofSel.empty() && !A.f.fvOptions.empty())
+        {
+            const Selected& want = ofSel.back();
+            const std::vector<label>& cells = A.f.fvOptions.options.front().cells;
+            scalar V = 0;
+            for (const label c : cells)
+            {
+                if (c >= 0 && c < nC) V += A.g.V()[static_cast<std::size_t>(c)];
+            }
+            std::printf("  the selection: OpenFOAM %ld cells of volume %.12g, brae %ld of %.12g "
+                        "(it started at %ld)\n", (long)want.n, (double)want.V, (long)cells.size(),
+                        (double)V, (long)ofSel.front().n);
+            check("the zone GREW through the change, so this profile can witness the re-selection",
+                  want.n > ofSel.front().n);
+            check("brae re-selected OpenFOAM's own cell count", static_cast<label>(cells.size()) == want.n);
+            check("...and its volume, which the refinement does not change",
+                  std::fabs(V - want.V) < scalar(1e-10)*std::fmax(want.V, scalar(1e-300)));
+            // THE CONTROL: keep the labels instead of resolving the selection again.
+            setenv("BRAE_CONTROL_AMR_NO_RESELECT", "1", 1);
+            Arm K;
+            runArm(K, caseDir, startDir, nSteps);
+            unsetenv("BRAE_CONTROL_AMR_NO_RESELECT");
+            const std::vector<label>& kept = K.f.fvOptions.options.front().cells;
+            scalar kV = 0;
+            for (const label c : kept)
+            {
+                if (c >= 0 && c < static_cast<label>(K.g.V().size())) kV += K.g.V()[static_cast<std::size_t>(c)];
+            }
+            const Diff cU = compare(K.f.U.internal, ofU);
+            std::printf("  CONTROL (the selections kept, not resolved again): %ld cells of volume %.12g, "
+                        "U rel %.4e\n", (long)kept.size(), (double)kV, (double)cU.rel());
+            check("...the control ran every step", K.r.steps == nSteps);
+            check("...and is caught on the selection: fewer cells and a smaller volume than OpenFOAM's",
+                  static_cast<label>(kept.size()) < want.n && kV < scalar(0.99)*want.V);
+            check("...and on the answer: U further from OpenFOAM than the gate's own distance",
+                  cU.rel() > scalar(1e3)*std::fmax(dU.rel(), scalar(1e-300)));
+        }
     }
 
     // ---- THE DEVICE ARM. The mesh change is HOST work on either loop -- topology surgery and six

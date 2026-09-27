@@ -105,6 +105,48 @@ tensor transformDiag(const vector& diag, const vector& e1in, const vector& e2in)
 } // namespace
 
 
+void reselect(
+    OptionList&                                      list,
+    const std::map<std::string, std::vector<label>>& zones,
+    const std::string&                               polyMeshDir)
+{
+    for (Option& o : list.options)
+    {
+        // OpenFOAM's isActive() short-circuits before the refresh, so an inactive option is not
+        // re-selected -- and an option whose type this port does not implement is refused elsewhere.
+        if (!o.active || !o.unsupported.empty()) continue;
+        if (o.selectionMode.empty() || o.selectionMode == "all")
+        {
+            o.allCells = true;
+            o.cells.clear();
+            continue;
+        }
+        const CellSelection sel =
+            resolveCellSelection(polyMeshDir, o.selectionMode, o.selectionName, zones);
+        if (!sel.ok)
+            throw std::runtime_error(
+                "brae fvOptions: the mesh changed and `" + o.name + "`'s selection could not be resolved "
+                "again on the new mesh: " + sel.reason + ". OpenFOAM re-selects at every topology change "
+                "(cellSetOption.C:383-396), so a selection that resolved once has to resolve again.");
+        o.cells = sel.cells;
+        o.allCells = sel.all;
+    }
+    // ...and the MANGROVE regions, whose selection is a cellZone name each and nothing else
+    for (Option& o : list.options)
+    {
+        if (!o.active || o.mangroves == Option::Mangroves::none) continue;
+        for (Option::MangroveRegion& r : o.mangroveRegions)
+        {
+            const auto it = zones.find(r.name);
+            if (it == zones.end())
+                throw std::runtime_error(
+                    "brae fvOptions: the mesh changed and mangrove region `" + r.name + "` is no longer a "
+                    "cellZone of it.");
+            r.cells = it->second;
+        }
+    }
+}
+
 std::string OptionList::firstUnsupported(const std::vector<std::string>& implementedByCaller) const
 {
     for (const Option& o : options)
@@ -132,6 +174,18 @@ std::string OptionList::firstUnsupported(const std::vector<std::string>& impleme
     return "";
 }
 
+
+// The selection a dictionary names, recorded on the option so a topology change can resolve it AGAIN.
+// One helper for all three sites, because three copies of a two-line read is how they drift.
+namespace {
+void recordSelection(
+    Option&          o,
+    const FoamDict&  where)
+{
+    o.selectionMode = where.wordOr("selectionMode", "all");
+    o.selectionName = where.wordOr("cellZone", where.wordOr("cellSet", ""));
+}
+}   // namespace
 
 OptionList read(const std::string& caseDir, const PrimitiveMesh& m)
 {
@@ -204,6 +258,7 @@ OptionList read(const std::string& caseDir, const PrimitiveMesh& m)
                 list.options.push_back(o);
                 continue;
             }
+            recordSelection(o, cs);
             o.cells    = csel.cells;
             o.allCells = csel.all;
 
@@ -342,6 +397,7 @@ OptionList read(const std::string& caseDir, const PrimitiveMesh& m)
                 list.options.push_back(o);
                 continue;
             }
+            recordSelection(o, src);
             o.cells    = fsel.cells;
             o.allCells = fsel.all;
 
@@ -385,6 +441,7 @@ OptionList read(const std::string& caseDir, const PrimitiveMesh& m)
             list.options.push_back(o);
             continue;
         }
+        recordSelection(o, src);
         o.cells = sel.cells;
         o.allCells = sel.all;
 

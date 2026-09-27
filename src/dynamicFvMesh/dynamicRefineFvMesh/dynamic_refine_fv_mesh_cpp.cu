@@ -1967,6 +1967,7 @@ cpu::polyTopoChange::ChangeMeshInput changeInput(
     return ci;
 }
 
+
 // protectedCell_ renumbered through a change (:518-530 and :700-712, the same block twice): the new cell
 // is protected when the cell it came from was. A new cell with cellMap -1 is NOT protected.
 void renumberProtectedCells(
@@ -2211,6 +2212,32 @@ void updatePatchesInPlace(
 }
 
 }   // namespace
+// See the header: polyTopoChange's cell half of resetZones, reduced to one zone.
+void renumberCellZones(
+    std::map<std::string, std::vector<label>>& zones,
+    const std::vector<label>&                  cellMap,
+    label                                      nOldCells)
+{
+    for (std::pair<const std::string, std::vector<label>>& z : zones)
+    {
+        std::vector<char> inOldZone(static_cast<std::size_t>(nOldCells), char(0));
+        for (const label c : z.second)
+        {
+            if (c >= 0 && c < nOldCells) inOldZone[static_cast<std::size_t>(c)] = char(1);
+        }
+        std::vector<label> out;
+        out.reserve(z.second.size());
+        // ASCENDING, which is the order OpenFOAM's walk produces and the order its stableSort keeps
+        for (std::size_t nc = 0; nc < cellMap.size(); ++nc)
+        {
+            const label old = cellMap[nc];
+            if (old < 0 || old >= nOldCells) continue;
+            if (inOldZone[static_cast<std::size_t>(old)]) out.push_back(static_cast<label>(nc));
+        }
+        z.second.swap(out);
+    }
+}
+
 
 RefineUpdateStep refineUpdate(
     RefineUpdateState&         s,
@@ -2315,6 +2342,7 @@ RefineUpdateStep refineUpdate(
             }
 
             renumberProtectedCells(s.protectedCell, r.refineMap.cellMap, out.nCells);
+            renumberCellZones(s.cellZones, r.refineMap.cellMap, r.refineMap.nOldCells);
             const std::vector<scalar> oldV =
                 s.injectedRefineOldV.empty() ? a.g.V() : s.injectedRefineOldV;
             const label nOldInternalFaces = s.m.nInternalFaces();
@@ -2416,6 +2444,7 @@ RefineUpdateStep refineUpdate(
                                        static_cast<label>(out.points.size()));
             cpu::hexRef8::historyUpdateMesh(s.history, r.unrefineMap.reverseCellMap, out.nCells);
             renumberProtectedCells(s.protectedCell, r.unrefineMap.cellMap, out.nCells);
+            renumberCellZones(s.cellZones, r.unrefineMap.cellMap, r.unrefineMap.nOldCells);
             const std::vector<scalar> oldV =
                 s.injectedUnrefineOldV.empty() ? a.g.V() : s.injectedUnrefineOldV;
             const label nOldInternalFaces = s.m.nInternalFaces();

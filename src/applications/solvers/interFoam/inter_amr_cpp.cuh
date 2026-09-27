@@ -64,6 +64,9 @@ struct InterAmr
     // what the last step did, for the driver's report and for a gate to read
     label                                nRefined = 0;
     label                                nUnrefined = 0;
+    // ...and the polyMesh directory, which the `cellSet` selection mode re-reads at every change -- as
+    // OpenFOAM does, from the file, in the ORIGINAL numbering (cellSetOption.C:269-276)
+    std::string                          polyMeshDir;
 };
 
 // Does the case ask for an adaptive mesh at all? ONE function, asked by everything that needs to know --

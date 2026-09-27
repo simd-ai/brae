@@ -40,6 +40,7 @@
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
 #include "ldu_matrix.cuh"
+#include <map>
 #include <string>
 #include <vector>
 
@@ -61,6 +62,15 @@ struct Option
     bool               active = true;
     std::vector<label> cells;                 // resolved by cellSetOption's rules; empty => all cells
     bool               allCells = false;
+    // ...AND THE SELECTION ITSELF, kept because OpenFOAM RE-SELECTS rather than maps. cellSetOption::
+    // isActive() re-runs setCellSelection() whenever the mesh is topoChanging (cellSetOption.C:383-396),
+    // so after a topology change the cells come from the selection again and not from the labels it gave
+    // last time: a cellZone resolves against the LIVE, renumbered zone (:278-300), where the labels
+    // themselves would name a fraction of it -- a split zone cell gains its seven children.
+    // `cellSet` is the one mode where re-selecting and keeping are the same numbers, and that too is
+    // OpenFOAM's own behaviour: it reads the set from disk again (:269-276), in the ORIGINAL numbering.
+    std::string        selectionMode;         // all | cellZone | cellSet, as the dictionary spells it
+    std::string        selectionName;         // the zone or set it names
     std::string        unsupported;           // non-empty => this option's type is not implemented
 
     // DarcyForchheimer, already transformed into the global frame with the 0.5 folded into F.
@@ -131,6 +141,16 @@ struct OptionList
 
 // Read system/fvOptions or constant/fvOptions (OpenFOAM looks in both). Absent file => empty list.
 OptionList read(const std::string& caseDir, const PrimitiveMesh& m);
+
+// ...and the SAME resolution again on the mesh as it stands now, which is what OpenFOAM does at every
+// topology change. `zones` is the LIVE cellZone map -- the caller's, carried through the change -- and
+// `polyMeshDir` is only read by the cellSet mode, which is the one OpenFOAM re-reads from disk too.
+// Every ACTIVE option is re-selected; an inactive one is left alone, as OpenFOAM's isActive() short-
+// circuits before the refresh.
+void reselect(
+    OptionList&                                      list,
+    const std::map<std::string, std::vector<label>>& zones,
+    const std::string&                               polyMeshDir);
 
 // UEqn.H's `== fvOptions(U)`, for a KINEMATIC momentum equation (nu, not mu -- DarcyForchheimer.C
 // dispatches on UEqn.dimensions() and takes the `one`/nu branch when the equation is not in force units).

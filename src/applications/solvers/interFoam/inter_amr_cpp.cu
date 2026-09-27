@@ -38,10 +38,6 @@ void refuseUnmappedState(const InterFields& f)
         throw std::runtime_error(
             std::string(WHO) + "the case has " + std::to_string(f.mrfZones.size()) + " MRF zone(s), each "
             "resolved against the OLD cell numbering. A change would leave them naming other cells.");
-    if (!f.fvOptions.empty())
-        throw std::runtime_error(
-            std::string(WHO) + "the case has active fvOptions, whose cell sets are resolved against the "
-            "OLD numbering.");
     // A SECOND LINE OF DEFENCE ONLY. buildInterFields sets f.dynamicMesh to null for every adaptive case
     // (inter_case_cpp.cu), so this cannot fire on the case it names; the refusal that does is in
     // readInterAmr, which reads the dictionary's own `solvers` entry. Kept because a future caller that
@@ -213,8 +209,9 @@ InterAmr readInterAmr(
     // fvOption's cellZone would then apply itself to).
     {
         const std::string pm = caseDir + "/constant/polyMesh/";
-        label nZ = static_cast<label>(readCellZones(pm).size());
-        // ...and the other two kinds by their own ENTRY COUNT, not by the file being there: subsetMesh
+        // cellZones ARE CARRIED (dynamicRefine::renumberCellZones), so they are NOT counted here.
+        label nZ = 0;
+        // ...the other two kinds by their own ENTRY COUNT, not by the file being there: subsetMesh
         // writes cellZones, faceZones and pointZones for every mesh it makes, each holding `0()`, so a
         // test on the file's existence counted two zones on a case that has none and refused it.
         for (const char* other : {"faceZones", "pointZones"})
@@ -693,6 +690,9 @@ bool interAmrUpdate(
         }
     }
 
+    // THE RENUMBERED ZONES BACK TO THE CALLER, before anything resolves a selection against them.
+    f.cellZones = amr.state.cellZones;
+
     // ...and the mesh the caller's fields reference. The patches are assigned IN PLACE by the driver, so
     // `*mm.patches` is already the new one; the mesh and geometry are copied into the caller's objects for
     // the same reason -- every FvPatch, every patch field and every operator reads those.
@@ -729,6 +729,8 @@ void interAfterMeshChange(
     const CorrectPhiControls& cpc,
     RunReport&                rep)
 {
+    // the mesh's own sets, for the one selection mode that re-reads a file
+    const std::string polyMeshDir = f.amr ? f.amr->polyMeshDir : std::string();
     const PrimitiveMesh& m = *mm.m;
     const FvGeometry& g = *mm.g;
     const std::vector<FvPatch>& patches = *mm.patches;
@@ -765,6 +767,34 @@ void interAfterMeshChange(
             const FvPatch& q = patches[pi];
             std::vector<vector> bCf(g.Cf().begin() + q.start, g.Cf().begin() + q.start + q.size);
             ghField(f.g, f.ghRefValue, bCf, f.ghfBoundary[pi]);
+        }
+    }
+
+    // THE fvOPTIONS ARE RE-SELECTED, not renumbered, and that is OpenFOAM's own rule rather than a
+    // convenience: cellSetOption::isActive() re-runs setCellSelection() whenever the mesh is topoChanging
+    // (cellSetOption.C:383-396) and forces the volume to be printed again. A cellZone selection therefore
+    // resolves against the LIVE zone -- which the change has just renumbered, so a split zone cell's seven
+    // children are IN -- where keeping the labels would leave the source on an eighth of the zone it names.
+    //
+    // It sits here because OpenFOAM's refresh is LAZY, at the first fvOptions(...) of the step after the
+    // change (fvOptionListTemplates.C:43-80 calls isActive() immediately before addSup), and every point
+    // between the change and UEqn is arithmetically the same. That makes the placement a choice; it is
+    // stated rather than left to be read off.
+    if (!f.fvOptions.empty())
+    {
+        // A GATE'S CONTROL: keep the labels each selection gave last time instead of resolving it again.
+        // That is the plausible wrong port -- nothing throws, every index is in range, and the source
+        // lands on an EIGHTH of the zone it names wherever the zone was refined. OpenFOAM's own log says
+        // so in one line per change: `- selected 7398 cell(s) with volume 0.08349609375` where keeping
+        // the labels leaves 2736 cells and a volume eight times smaller on the refined part.
+        if (std::getenv("BRAE_CONTROL_AMR_NO_RESELECT"))
+        {
+            std::printf("  *** CONTROL MODE: the fvOptions selections are KEPT, not resolved again on the "
+                        "new mesh. This run is deliberately wrong. ***\n");
+        }
+        else
+        {
+            fvOptions::reselect(f.fvOptions, f.cellZones, polyMeshDir);
         }
     }
 

@@ -59,6 +59,7 @@
 #include "dynamic_motion_solver_fv_mesh_cpp.cuh"
 #include "mules_cpp.cuh"
 #include <memory>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -216,6 +217,11 @@ struct InterFields
     // U)), :14 (constrain) and :31 plus pEqn.H:65 (correct). ONE is ported, explicitPorositySource with
     // DarcyForchheimer, which only the first of those reaches; everything else is refused by name.
     fvOptions::OptionList fvOptions;
+    // THE MESH'S cellZones, ONE COPY, live. brae's PrimitiveMesh holds none, and this was read from the
+    // file twice and discarded twice -- once for MRF, once inside fvOptions::read. A topology change
+    // RENUMBERS them (a split zone cell gains its seven children), and OpenFOAM's own consumers resolve
+    // against the renumbered zone at every change, so there has to be exactly one to renumber.
+    std::map<std::string, std::vector<label>> cellZones;
     // createDyMControls.H / readDyMControls.H: PIMPLE's `correctPhi` (default mesh.dynamic()),
     // `checkMeshCourantNo` and `moveMeshOuterCorrectors` (default false)
     bool correctPhi = false;

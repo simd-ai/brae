@@ -375,7 +375,7 @@ struct ChangeMeshInput
     std::vector<label>       oldPatchSizes;
     std::vector<label>       oldPatchNMeshPoints;   // patch.meshPoints().size() per patch
     std::vector<std::string> patchTypes;
-    label                    nZones = 0;            // pointZones + faceZones + cellZones
+    label                    nZones = 0;            // pointZones + faceZones; cellZones are CARRIED
 };
 
 // polyTopoChange::changeMesh on the path above. Consumes `a` (OpenFOAM's members are invalid after it

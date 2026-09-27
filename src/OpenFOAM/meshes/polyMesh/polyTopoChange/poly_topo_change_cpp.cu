@@ -741,12 +741,15 @@ void changeMesh(
                 "polyTopoChange.C:2012-2141), which in the general case is a parallel exchange. No "
                 "adaptive interFoam tutorial has a coupled patch, so a port here would be ungated.");
     }
+    // cellZones ARE CARRIED (dynamicRefine::renumberCellZones, which is resetZones' cell half reduced to
+    // one zone). What is left is the other two kinds: resetZones renumbers pointZones and faceZones
+    // through the change as well (polyTopoChange.C:1600-1855), and a faceZone additionally carries a FLIP
+    // MAP per face, which nothing here derives. No adaptive interFoam tutorial has either.
     if (in.nZones != 0)
         throw std::runtime_error(
-            std::string(WHO4) + "the mesh carries " + std::to_string(in.nZones) + " zone(s). "
-            "resetZones (polyTopoChange.C:1600-1968) renumbers pointZones, faceZones and cellZones "
-            "through the change; damBreakWithObstacle, oscillatingBox and motorBike have none, so it "
-            "is refused rather than written blind.");
+            std::string(WHO4) + "the mesh carries " + std::to_string(in.nZones) + " pointZone(s) and/or "
+            "faceZone(s). resetZones renumbers both through the change, and a faceZone carries a per-face "
+            "flip map besides; cellZones ARE carried. Refused rather than written blind.");
     if (!a.faceFromPoint.empty() || !a.faceFromEdge.empty())
         throw std::runtime_error(
             std::string(WHO4) + "a face was added from a POINT or an EDGE master. Answering that needs "

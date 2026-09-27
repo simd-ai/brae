@@ -102,9 +102,9 @@
 #   * THE CHOICE OF REFERENCE CELL under refinement: the reference point of this fixture is in the AIR,
 #     far from the interface, so its own cell is never selected for refinement -- a control pinning
 #     another child of its parent found no child. The arm that discriminates pins a cell the change added.
-#   * A MOVING mesh beside refinement, turbulence, MRF, fvOptions, CrankNicolson, `correctPhi no` and a
-#     CN restart directory: each is REFUSED by name (tests/interfoam_refusals.sh), so no arm here can
-#     silently stand in for one.
+#   * A MOVING mesh beside refinement, turbulence, MRF, `correctPhi no` and a CN restart directory: each
+#     is REFUSED by name (tests/interfoam_refusals.sh), so no arm here can silently stand in for one.
+#     CrankNicolson and fvOptions were on that list until the cn and porosity profiles below gated them.
 #   * UNREFINEMENT ON THE DEVICE: the device arm runs the same two refining steps, so its unrefinement
 #     path is exercised by nothing here either.
 set -u
@@ -139,10 +139,16 @@ done
 
 DT=0.001
 
-# gate <profile> <nSteps> <staging edit run inside the case dir>
+# gate <profile> <nSteps> <staging edit> [<post-prep edit>]
+#
+# The STAGING edit runs on the case as copied, before the oracle key is taken, so everything it writes is
+# in the hash. The POST-PREP edit runs after blockMesh/topoSet/subsetMesh/setFields and before interFoam,
+# for a file that can only be written once the MESH and the initial FIELDS exist -- a cellZone of the water
+# cells is one. It is not in the hash and does not need to be: it is a pure function of what is, and on a
+# cache hit the archive already carries what it wrote.
 gate()
 {
-local profile="$1" N="$2"; shift 2
+local profile="$1" N="$2" postPrep="${4:-true}"; shift 2
 local END
 END=$(python3 -c "print('%.10g' % ($N*float('$DT')))")
 local C="$W/$profile"
@@ -150,7 +156,7 @@ rm -rf "$C"
 cp -r "$SRC" "$C" || return 1
 rm -rf "$C"/0 "$C"/processor* "$C"/log.*
 cp -r "$C/0.orig" "$C/0"
-( cd "$C" && eval "$@" ) || { echo "FAIL: the staging edit for $profile"; return 1; }
+( cd "$C" && eval "$1" ) || { echo "FAIL: the staging edit for $profile"; return 1; }
 
 # The case's own controlDict, with only what an oracle needs changed: fixed steps, every step written,
 # and `writePrecision 18` -- at the tutorial's own 6 the comparison floor is the FILE. MEASURED: p_rgh
@@ -188,6 +194,8 @@ else
         || { echo "FAIL: damBreakWithObstacle is no longer 32256 cells, so the counts above are stale"; return 1; }
     [ ! -e "$C/constant/polyMesh/cellLevel" ] \
         || { echo "FAIL: the fresh mesh already carries a cellLevel, so it does not start from level 0"; return 1; }
+    ( cd "$C" && eval "$postPrep" ) \
+        || { echo "FAIL: the post-prep edit for $profile"; return 1; }
     ( cd "$C" && interFoam > log.interFoam 2>&1 ) \
         || { echo "FAIL: interFoam"; tail -30 "$C/log.interFoam"; return 1; }
     [ -d "$C/$END" ] || { echo "FAIL: OpenFOAM wrote no $END directory"; ls "$C"; return 1; }
@@ -287,5 +295,54 @@ s, n = re.subn(r'nAlphaSubCycles\s+3;', 'nAlphaSubCycles 1;', s, count=1)
 assert n == 1, 'nAlphaSubCycles 3 was not there to replace'
 open('system/fvSolution', 'w').write(s)
 PYCN" || rc=1
+# ...AND fvOPTIONS, three steps. OpenFOAM RE-SELECTS an option's cells at every topology change rather
+# than mapping the labels it gave last time: cellSetOption::isActive() calls setCellSelection() whenever
+# the mesh is topoChanging and forces the volume to be printed again (cellSetOption.C:383-396), and a
+# cellZone selection then resolves against the LIVE zone -- which the change has renumbered, so a split
+# zone cell's seven children are in.
+#
+# ITS OWN LOG IS THE ORACLE, one line per change, and no other unit in this set has one that sharp:
+#     - selected 2736 cell(s) with volume 0.08349609375     (at construction)
+#     - selected 7398 cell(s) with volume 0.08349609375     (after the first change)
+# The count grows by the refined part of the zone and the VOLUME IS IDENTICAL TO EVERY DIGIT. A port that
+# kept the labels would print 2736 and a volume eight times smaller on that part, which is the control.
+#
+# THE ZONE IS THE WATER, not an arbitrary index range: the refinement band sits on the edge of the water
+# body, so a zone of the water cells is guaranteed to have cells split. A zone chosen by index might not.
+#
+# MEASURED, every arm green: alpha 1.5190e-14, p_rgh 1.2499e-14 relative, U 3.1351e-13, p 7.5454e-15,
+# rAU 1.4562e-11, phi 2.1747e-13, Uf 2.3252e-13, the 9 p_rgh and 3 pcorr solves on OpenFOAM's own
+# iteration counts and initial residuals, continuity 8.327100e-09 against OpenFOAM's 8.327100e-09 -- and
+# brae's last selection 26711 cells of volume 0.08349609375, OpenFOAM's own to every digit, from 2736.
+#   THE CONTROL, BRAE_CONTROL_AMR_NO_RESELECT: the selections are KEPT rather than resolved again on the
+#   new mesh. It reads 2736 cells of volume 0.0657119750977 -- the zone's unrefined part alone -- and U
+#   9.5948e-02 relative, nine orders above the gate's own distance.
+#   THE DEVICE ARM found the same defect on its own half, and nothing else here could: the porosity cell
+#   list was uploaded ONCE before the time loop, so the device applied the resistance to an eighth of the
+#   zone OpenFOAM applies it to. It read alpha 1.4218e-02 and U 9.5948e-02 from the host arm -- the
+#   control's own number, to every digit, which is what named the stale upload rather than a wrong one.
+gate porosity 3 true "python3 - <<'PYFVO'
+txt = open('0/alpha.water').read()
+i = txt.find('internalField')
+j = txt.find('(', i)
+k = txt.find(')', j)
+vals = [float(x) for x in txt[j + 1:k].split()]
+cells = [n for n, v in enumerate(vals) if v > 0.5]
+assert cells, 'setFields left no water, so the zone would be empty'
+open('constant/polyMesh/cellZones', 'w').write(
+    'FoamFile { version 2.0; format ascii; class regIOobject; location \"constant/polyMesh\";'
+    ' object cellZones; }\n'
+    '1\n(\nporousZone\n{\n    type cellZone;\n    cellLabels List<label> %d(%s);\n}\n)\n'
+    % (len(cells), ' '.join(str(c) for c in cells)))
+open('constant/fvOptions', 'w').write(
+    'FoamFile { version 2.0; format ascii; class dictionary; object fvOptions; }\n'
+    'porous\n{\n    type            explicitPorositySource;\n    active          yes;\n'
+    '    explicitPorositySourceCoeffs\n    {\n        selectionMode   cellZone;\n'
+    '        cellZone        porousZone;\n        type            DarcyForchheimer;\n'
+    '        d               (5e6 -1000 -1000);\n        f               (0 0 0);\n'
+    '        coordinateSystem\n        {\n            origin  (0 0 0);\n'
+    '            e1      (1 0 0);\n            e2      (0 1 0);\n        }\n    }\n}\n')
+PYFVO" || rc=1
+
 echo "interfoam_amr_vs_openfoam: rc $rc"
 exit $rc

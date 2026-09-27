@@ -32,6 +32,7 @@
 #include "geometric_field.cuh"
 #include "map_poly_mesh_cpp.cuh"
 #include "primitive_mesh.cuh"
+#include <map>
 #include <string>
 #include <utility>
 #include <vector>
@@ -87,6 +88,25 @@ struct RefineControls
 // `dynamicMeshDict` is the parsed constant/dynamicMeshDict. Throws on a missing mandatory entry and on
 // each of OpenFOAM's three FatalErrors.
 RefineControls readRefineControls(const FoamDict& dynamicMeshDict);
+
+// THE cellZones THROUGH A CHANGE, which is polyTopoChange's cell half of resetZones reduced to one zone.
+//
+// OpenFOAM carries zone membership as a PER-CELL array indexed by the new cell (polyTopoChange.C:3547,
+// :3555, :3573 write it; removeCell sets -1), seeded from the old mesh, and resetZones then walks it in
+// ASCENDING cell order and appends each cell to its zone (:1900-1925, with a stableSort that is a no-op
+// on an ascending walk). hexRef8 gives each of the seven children it adds the PARENT's zone
+// (`mesh_.cellZones().whichZone(celli)` at hexRef8.C:3832-3845) and polyTopoChange sets that child's
+// cellMap to the parent, so the whole rule is:
+//
+//     newZone = ascending { newCell : cellMap[newCell] >= 0 and cellMap[newCell] was in the zone }
+//
+// A SPLIT ZONE CELL THEREFORE GAINS ITS SEVEN CHILDREN -- the zone grows eightfold wherever it is refined
+// -- and a cell removed by an unrefinement drops out, its merge master keeping whatever it already had.
+// Neither is a special case here: both fall out of `cellMap[newCell] >= 0`.
+void renumberCellZones(
+    std::map<std::string, std::vector<label>>& zones,
+    const std::vector<label>&                  cellMap,
+    label                                      nOldCells);
 
 // dynamicRefineFvMesh.C:754-771. UNWEIGHTED arithmetic mean of the cell values over each point's
 // cells -- no volume, no distance, no inverse-distance weighting -- accumulated in pointCells order
@@ -661,7 +681,13 @@ struct RefineUpdateState
     // Empty means nothing is protected.
     std::vector<char>    protectedCell;
     label                nRefinementIterations = 0;
-    // HOW MANY ZONES THE MESH CARRIES -- pointZones + faceZones + cellZones. It is here because brae's
+    // THE MESH'S cellZones, CARRIED THROUGH EVERY CHANGE. brae's PrimitiveMesh holds no zones, so they
+    // live here for the duration of the change and the caller reads them back: an MRF zone and an
+    // fvOption's cellZone selection both resolve against them, and OpenFOAM resolves against the LIVE,
+    // renumbered ones (cellSetOption.C:278-300 reads mesh_.cellZones() at every re-selection).
+    std::map<std::string, std::vector<label>> cellZones;
+
+    // HOW MANY ZONES THE MESH CARRIES THAT ARE NOT cellZones -- pointZones + faceZones. It is here because brae's
     // PrimitiveMesh does not carry zones and changeMesh's refusal of them could therefore never fire:
     // changeInput hardcoded 0, so a case with a cellZone ran with the zone silently unrenumbered. The
     // caller that READ the zones is the only one that knows, so it says so here. resetZones

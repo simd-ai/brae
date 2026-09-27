@@ -1266,33 +1266,45 @@ RunReport runInterFoamDevice(
     // rotates e1 by 45 degrees, so D and F have off-diagonal entries and the diagonal d/f form the other
     // device solvers use (and refuse a rotated system for) cannot carry them.
     DevicePorosity dPorosity;
-    for (const fvOptions::Option& o : f.fvOptions.options)
+    // IN A LAMBDA because a topology change re-runs it: OpenFOAM RE-SELECTS an option's cells at every
+    // change (cellSetOption.C:383-396) and the host adapter does the same, so this list is a different
+    // list afterwards -- 26,711 cells where it was 2,736 on the gate's porosity profile, the zone having
+    // gained the seven children of every cell of it that was split. Uploaded once, the device applied the
+    // resistance to an EIGHTH of the zone OpenFOAM applies it to: alpha 1.4218e-02 and U 9.5948e-02 from
+    // the host arm, which is the same number as the host's own keep-the-labels control.
+    const auto buildPorosity = [&]()
     {
-        if (!o.active || !o.unsupported.empty() || o.fixedCoeff) continue;
-        if (o.type != "explicitPorositySource") continue;
-        if (dPorosity.active)
+        bool seen = false;
+        for (const fvOptions::Option& o : f.fvOptions.options)
         {
-            throw std::runtime_error(
-                "brae interFoam (device): more than one active explicitPorositySource. The device step "
-                "carries one zone. The host loop carries them all.");
+            if (!o.active || !o.unsupported.empty() || o.fixedCoeff) continue;
+            if (o.type != "explicitPorositySource") continue;
+            if (seen)
+            {
+                throw std::runtime_error(
+                    "brae interFoam (device): more than one active explicitPorositySource. The device step "
+                    "carries one zone. The host loop carries them all.");
+            }
+            seen = true;
+            std::vector<label> cells = o.cells;
+            if (o.allCells)
+            {
+                cells.resize(static_cast<std::size_t>(m.nCells()));
+                for (label c = 0; c < m.nCells(); ++c) cells[static_cast<std::size_t>(c)] = c;
+            }
+            dPorosity.active = true;
+            dPorosity.tensorForm = true;
+            dPorosity.cells.copyFrom(cells);
+            const scalar* D = &o.D.xx;
+            const scalar* F = &o.F.xx;
+            for (int k = 0; k < 9; ++k)
+            {
+                dPorosity.dT[k] = D[k];
+                dPorosity.fT[k] = F[k];
+            }
         }
-        std::vector<label> cells = o.cells;
-        if (o.allCells)
-        {
-            cells.resize(static_cast<std::size_t>(m.nCells()));
-            for (label c = 0; c < m.nCells(); ++c) cells[static_cast<std::size_t>(c)] = c;
-        }
-        dPorosity.active = true;
-        dPorosity.tensorForm = true;
-        dPorosity.cells.copyFrom(cells);
-        const scalar* D = &o.D.xx;
-        const scalar* F = &o.F.xx;
-        for (int k = 0; k < 9; ++k)
-        {
-            dPorosity.dT[k] = D[k];
-            dPorosity.fT[k] = F[k];
-        }
-    }
+    };
+    buildPorosity();
 
     // THE MANGROVE PAIR, from the HOST OptionList's own regions: each coefficient without its |U|, per
     // cell, in the host reference's multiplication order -- zero everywhere, then each region's cells
@@ -2442,6 +2454,8 @@ RunReport runInterFoamDevice(
                     gamgCache.uploadedBuild = -1;
 
                     // ---- the masks and the boundary geometry, per boundary FACE
+                    // ...the porosity's cell list, which interAfterMeshChange has just RE-SELECTED
+                    buildPorosity();
                     buildBoundaryMasks();
                     dAFixes.copyFrom(aFixes);
                     dAFlag.copyFrom(aFlag);

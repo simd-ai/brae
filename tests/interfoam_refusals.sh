@@ -264,15 +264,29 @@ arm mesh_refine_motion      refused "motion solver"          "" "$REFDICT 'solve
 # What is refused is what no gate holds, each by name. ZONE writes a 100-cell `rotor` cellZone into
 # damBreak, so the arms below reach the refusal they name and not "no such zone".
 ZONE="python3 -c \"open('constant/polyMesh/cellZones','w').write('FoamFile { version 2.0; format ascii; class regIOobject; location \\\"constant/polyMesh\\\"; object cellZones; }\\n1\\n(\\nrotor\\n{\\n    type cellZone;\\n    cellLabels List<label> 100(' + ' '.join(str(i) for i in range(100)) + ');\\n}\\n)\\n')\""
-# ...and the ZONE refusal, which this gate CAN reach now that a 2-D adaptive case runs: changeMesh is
-# reached at the first change.
-arm mesh_refine_zone        refused "zone(s)"                "" "$REFDICT '' > constant/dynamicMeshDict && $ZONE"
-# A ZONE THROUGH A TOPOLOGY CHANGE is refused by changeMesh, which renumbers none of the three kinds
-# (OpenFOAM's resetZones, polyTopoChange.C:1600-1968, does). THE REFUSAL WAS UNREACHABLE until this
-# session: changeInput hardcoded the zone count to 0, so a case carrying a cellZone refined with the zone
-# still in the OLD numbering -- and an MRF zone or an fvOption's cellZone would then apply itself to
-# whatever those labels now name. The count comes from the polyMesh directory now, by ENTRY COUNT and not
-# by the file's existence (subsetMesh writes all three files for every mesh it makes, each holding `0()`).
+# ...and the ZONE arms, which this gate CAN reach now that a 2-D adaptive case runs: changeMesh is
+# reached at the first change. A cellZone is CARRIED through it (dynamicRefine::renumberCellZones -- each
+# child takes its parent's zone id, ascending, which is what polyTopoChange.C:1900-1925 does), so it RUNS;
+# a faceZone or a pointZone is not ported and is still refused BY NAME. The opposite pair is the point:
+# with both refused, the cellZone carry that tests/interfoam_amr_vs_openfoam.sh's `porosity` profile gates
+# was unreachable, and an fvOption or an MRF zone would have applied itself to the old numbering.
+arm mesh_refine_cellZone    runs    -                        "" "$REFDICT '' > constant/dynamicMeshDict && $ZONE"
+FZONE="python3 -c \"open('constant/polyMesh/faceZones','w').write('FoamFile { version 2.0; format ascii; class regIOobject; location \\\"constant/polyMesh\\\"; object faceZones; }\\n1\\n(\\nband\\n{\\n    type faceZone;\\n    faceLabels List<label> 10(' + ' '.join(str(i) for i in range(10)) + ');\\n    flipMap List<bool> 10(' + ' '.join('0' for i in range(10)) + ');\\n}\\n)\\n')\""
+arm mesh_refine_faceZone    refused "faceZone(s)"                "" "$REFDICT '' > constant/dynamicMeshDict && $FZONE"
+# AN fvOPTION BESIDE REFINEMENT RUNS, and this arm is the refusal's replacement rather than its removal:
+# OpenFOAM RE-SELECTS an option's cells at every change (cellSetOption.C:383-396) and brae does the same, so
+# the option is carried instead of being stood in for. The numbers are gated by the `porosity` profile of
+# tests/interfoam_amr_vs_openfoam.sh -- 26711 cells of volume 0.08349609375, OpenFOAM's own to every digit.
+DARCY="printf '%s\nsrc { type explicitPorositySource; explicitPorositySourceCoeffs { selectionMode cellZone; cellZone rotor; type DarcyForchheimer; d (1e5 1e5 1e5); f (0 0 0); coordinateSystem { origin (0 0 0); e1 (1 0 0); e2 (0 1 0); } } }\n' '$HDR' > constant/fvOptions"
+arm mesh_refine_fvOptions   runs    -                        "" "$REFDICT '' > constant/dynamicMeshDict && $ZONE && $DARCY"
+
+# A pointZone or a faceZone THROUGH A TOPOLOGY CHANGE is still refused by changeMesh, which renumbers
+# neither (OpenFOAM's resetZones, polyTopoChange.C:1600-1968, does all three). THE REFUSAL WAS UNREACHABLE
+# until this session: changeInput hardcoded the zone count to 0, so a case carrying a cellZone refined with
+# the zone still in the OLD numbering -- and an MRF zone or an fvOption's cellZone would then apply itself
+# to whatever those labels now name. The count comes from the polyMesh directory now, by ENTRY COUNT and
+# not by the file's existence (subsetMesh writes all three files for every mesh it makes, each `0()`), and
+# cellZones are no longer counted at all because they are carried.
 
 MRFD="printf '%s\nMRF1 { cellZone rotor; origin (0 0 0); axis (0 0 1); OMEGA }\n' '$HDR' > constant/MRFProperties"
 arm mrf_noSuchZone          refused "is not in constant/polyMesh/cellZones" "" "printf '%s\nMRF1 { cellZone all; origin (0 0 0); axis (0 0 1); omega 10; }\n' '$HDR' > constant/MRFProperties"
