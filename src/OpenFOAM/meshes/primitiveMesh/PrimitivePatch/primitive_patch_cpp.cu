@@ -1,4 +1,6 @@
 #include "primitive_patch_cpp.cuh"
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 
 namespace brae {
@@ -187,6 +189,191 @@ std::vector<label> faceRange(
         f[static_cast<std::size_t>(i)] = start + i;
     }
     return f;
+}
+
+} // namespace brae
+
+// ----------------------------------------------------------------------------------------------
+// The patch's edge addressing and its edge loops. See the header.
+
+namespace brae {
+
+PatchEdgeAddressing patchEdges(const PrimitivePatchAddressing& p)
+{
+    const std::size_t nFaces = p.localFaces.size();
+    PatchEdgeAddressing out;
+    out.faceEdges.resize(nFaces);
+    // face::edges(): edge i of a face runs from f[i] to f[i+1], cyclically (faceI.H) -- so the edge
+    // order is the face's own vertex order, which is what faceEdges is indexed by
+    std::vector<std::vector<std::pair<label, label>>> faceIntoEdges(nFaces);
+    for (std::size_t facei = 0; facei < nFaces; ++facei)
+    {
+        const std::vector<label>& f = p.localFaces[facei];
+        faceIntoEdges[facei].resize(f.size());
+        for (std::size_t i = 0; i < f.size(); ++i)
+        {
+            faceIntoEdges[facei][i] = {f[i], f[(i + 1) % f.size()]};
+        }
+        out.faceEdges[facei].assign(f.size(), label(-1));
+    }
+
+    const auto sameEdge = [](const std::pair<label, label>& a, const std::pair<label, label>& b)
+    {
+        return (a.first == b.first && a.second == b.second)
+            || (a.first == b.second && a.second == b.first);
+    };
+
+    std::vector<std::pair<label, label>> edges;
+    std::vector<std::vector<label>> edgeFaces;
+
+    // :106-230. The INTERNAL edges: for each face, each of its not-yet-assigned edges is looked for
+    // among the faces at its start point that have a HIGHER label, and the ones found are its
+    // neighbours. Multiple connectivity is allowed, so a list per edge.
+    for (std::size_t facei = 0; facei < nFaces; ++facei)
+    {
+        const std::vector<std::pair<label, label>>& curEdges = faceIntoEdges[facei];
+        std::vector<std::vector<label>> neiFaces(curEdges.size());
+        std::vector<std::vector<label>> edgeOfNeiFace(curEdges.size());
+        label nNeighbours = 0;
+        for (std::size_t edgeI = 0; edgeI < curEdges.size(); ++edgeI)
+        {
+            if (out.faceEdges[facei][edgeI] >= 0) continue;
+            const std::pair<label, label>& e = curEdges[edgeI];
+            bool found = false;
+            for (const label curNei : p.pointFaces[static_cast<std::size_t>(e.first)])
+            {
+                // only the higher-numbered neighbour looks for the match, so each internal edge is
+                // registered once, by its lower face
+                if (curNei <= static_cast<label>(facei)) continue;
+                const std::vector<std::pair<label, label>>& searchEdges =
+                    faceIntoEdges[static_cast<std::size_t>(curNei)];
+                for (std::size_t neiEdgeI = 0; neiEdgeI < searchEdges.size(); ++neiEdgeI)
+                {
+                    if (sameEdge(searchEdges[neiEdgeI], e))
+                    {
+                        found = true;
+                        neiFaces[edgeI].push_back(curNei);
+                        edgeOfNeiFace[edgeI].push_back(static_cast<label>(neiEdgeI));
+                        // and keep searching: a multiply connected surface has more
+                    }
+                }
+            }
+            if (found) ++nNeighbours;
+        }
+        // :232-290. The face's internal edges are numbered in increasing order of their LOWEST
+        // neighbour face, not in the face's own edge order.
+        for (label neiSearch = 0; neiSearch < nNeighbours; ++neiSearch)
+        {
+            label nextNei = -1;
+            label minNei = static_cast<label>(nFaces);
+            for (std::size_t nfI = 0; nfI < neiFaces.size(); ++nfI)
+            {
+                if (!neiFaces[nfI].empty() && neiFaces[nfI][0] < minNei)
+                {
+                    nextNei = static_cast<label>(nfI);
+                    minNei = neiFaces[nfI][0];
+                }
+            }
+            if (nextNei < 0)
+                throw std::runtime_error(
+                    "brae PrimitivePatch::calcAddressing: internal edge insertion failed on face "
+                    + std::to_string(facei) + ". OpenFOAM FatalErrors here too (:285-289).");
+            const std::size_t ne = edges.size();
+            edges.push_back(curEdges[static_cast<std::size_t>(nextNei)]);
+            out.faceEdges[facei][static_cast<std::size_t>(nextNei)] = static_cast<label>(ne);
+            std::vector<label>& cnf = neiFaces[static_cast<std::size_t>(nextNei)];
+            std::vector<label>& eonf = edgeOfNeiFace[static_cast<std::size_t>(nextNei)];
+            std::vector<label> curEf;
+            curEf.reserve(cnf.size() + 1);
+            curEf.push_back(static_cast<label>(facei));
+            for (std::size_t i = 0; i < cnf.size(); ++i)
+            {
+                out.faceEdges[static_cast<std::size_t>(cnf[i])][static_cast<std::size_t>(eonf[i])] =
+                    static_cast<label>(ne);
+                curEf.push_back(cnf[i]);
+            }
+            edgeFaces.push_back(curEf);
+            cnf.clear();
+            eonf.clear();
+        }
+    }
+    out.nInternalEdges = static_cast<label>(edges.size());
+
+    // :296-312. Everything still unassigned is a boundary edge, in face-then-edge order.
+    for (std::size_t facei = 0; facei < nFaces; ++facei)
+    {
+        for (std::size_t edgeI = 0; edgeI < out.faceEdges[facei].size(); ++edgeI)
+        {
+            if (out.faceEdges[facei][edgeI] >= 0) continue;
+            const std::size_t ne = edges.size();
+            edges.push_back(faceIntoEdges[facei][edgeI]);
+            out.faceEdges[facei][edgeI] = static_cast<label>(ne);
+            edgeFaces.push_back({static_cast<label>(facei)});
+        }
+    }
+
+    out.start.resize(edges.size());
+    out.end.resize(edges.size());
+    for (std::size_t e = 0; e < edges.size(); ++e)
+    {
+        out.start[e] = edges[e].first;
+        out.end[e] = edges[e].second;
+    }
+    out.edgeFaces = std::move(edgeFaces);
+
+    // calcPointEdges: invertManyToMany over the edges, so each point's edges come out ASCENDING
+    out.pointEdges.resize(p.meshPoints.size());
+    for (std::size_t e = 0; e < out.start.size(); ++e)
+    {
+        out.pointEdges[static_cast<std::size_t>(out.start[e])].push_back(static_cast<label>(e));
+        out.pointEdges[static_cast<std::size_t>(out.end[e])].push_back(static_cast<label>(e));
+    }
+    return out;
+}
+
+std::vector<std::vector<label>> patchEdgeLoops(const PatchEdgeAddressing& pe)
+{
+    // PrimitivePatchEdgeLoops.C:50-130. Walk point-edge-point over the BOUNDARY edges only, starting
+    // from the first unvisited one and stepping to the first unvisited boundary edge at each vertex.
+    const label nIntEdges = pe.nInternalEdges;
+    const label nEdges = static_cast<label>(pe.start.size());
+    const label nBdryEdges = nEdges - nIntEdges;
+    std::vector<std::vector<label>> loops;
+    if (nBdryEdges == 0) return loops;
+    std::vector<char> unvisited(static_cast<std::size_t>(nBdryEdges), char(1));
+    std::size_t searchFrom = 0;
+    while (true)
+    {
+        // unvisited.find(true), which scans from the START each time -- but the scan can only ever
+        // move forwards, so a cursor gives the same answer for less work
+        while (searchFrom < unvisited.size() && !unvisited[searchFrom]) ++searchFrom;
+        if (searchFrom == unvisited.size()) break;
+        label currentEdgei = static_cast<label>(searchFrom) + nIntEdges;
+        // the loop starts at the edge's FIRST vertex, which is what fixes the loop's direction
+        label currentVerti = pe.start[static_cast<std::size_t>(currentEdgei)];
+        std::vector<label> loop;
+        do
+        {
+            loop.push_back(currentVerti);
+            unvisited[static_cast<std::size_t>(currentEdgei - nIntEdges)] = 0;
+            // edge::otherVertex
+            currentVerti = (pe.start[static_cast<std::size_t>(currentEdgei)] == currentVerti)
+                         ? pe.end[static_cast<std::size_t>(currentEdgei)]
+                         : pe.start[static_cast<std::size_t>(currentEdgei)];
+            currentEdgei = -1;
+            for (const label edgei : pe.pointEdges[static_cast<std::size_t>(currentVerti)])
+            {
+                if (edgei >= nIntEdges && unvisited[static_cast<std::size_t>(edgei - nIntEdges)])
+                {
+                    currentEdgei = edgei;
+                    break;
+                }
+            }
+        }
+        while (currentEdgei != -1);
+        loops.push_back(std::move(loop));
+    }
+    return loops;
 }
 
 } // namespace brae

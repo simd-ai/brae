@@ -39,6 +39,8 @@
 // ended up in different regions, which cannot happen through the loop above. Transcribed as a throw.
 #include "cf_types.cuh"
 #include "mesh_edges_cpp.cuh"
+#include "poly_topo_change_cpp.cuh"
+#include "primitive_patch_cpp.cuh"
 #include "primitive_mesh.cuh"
 #include <vector>
 
@@ -116,6 +118,45 @@ RemoveFacesDecisions setRefinementDecisions(
     const std::vector<label>& cellRegion,
     const std::vector<label>& cellRegionMaster,
     scalar                    minCos);
+
+// ----------------------------------------------------------------------------------------------
+// removeFaces::setRefinement, unit 6b-3b: THE ACTIONS. What the decisions above are played into a
+// polyTopoChange as.
+//
+// provenance:
+//   openfoam: removeFaces.C:1402-1521 (the removals, the merge loop and the remaining affected faces),
+//             mergeFaces (:235-405), getFaceInfo (:416-441), filterFace (:446-471), modFace (:475-560)
+//   brae:     the patch edge loops mergeFaces reads are in
+//             src/OpenFOAM/meshes/primitiveMesh/PrimitivePatch/primitive_patch_cpp.cuh
+//
+// THE MASTER OF A MERGE IS CHOSEN BY THE LOOP, not by the face labels. mergeFaces builds a patch out of
+// the region's faces, asks it for the single closed loop of its outside vertices, and then looks for the
+// face that uses the loop's first two vertices CONSECUTIVELY: that face becomes the master and the
+// direction it uses them in decides whether the merged face is the loop or its reverse. So the answer
+// depends on the patch's own edge NUMBERING (internal edges first, then boundary edges in face order) and
+// on the order of each point's edges -- which is why that addressing is ported rather than approximated.
+//
+// AND modFace REVERSES. OpenFOAM's wrapper writes the face as it stands when there is no neighbour or the
+// owner is the lower cell, and otherwise writes the REVERSED face with owner and neighbour swapped
+// (:475-560) -- because a polyMesh face must be owned by the lower-numbered of its two cells.
+struct MergeRecord
+{
+    label              masterFace = -1;     // the mesh face that becomes the merged one
+    label              masterIndex = -1;    // ...and its index within the region's own face list
+    bool               reverseLoop = false;
+    std::vector<label> mergedFace;          // MESH point labels, after the removed points are dropped
+};
+
+// Plays every action of setRefinement into `a`, in OpenFOAM's order: the removed faces, the removed
+// points, the removed cells, then one merge per face region, then every remaining affected face. Returns
+// one record per face region, in region order, which is what the gate holds against the instrument.
+std::vector<MergeRecord> setRefinementActions(
+    const RemoveFacesView&       v,
+    const RemoveFacesDecisions&  dec,
+    const std::vector<label>&    facesToRemove,
+    const std::vector<label>&    cellRegion,
+    const std::vector<label>&    cellRegionMaster,
+    polyTopoChange::TopoActions&  a);
 
 } // namespace removeFaces
 } // namespace cpu

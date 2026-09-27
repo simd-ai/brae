@@ -15,9 +15,8 @@
 # TWO STAGES, and both now run on the refinement arms:
 #   5b-1  cellAddedCells, cellLevel, pointLevel, and the point and cell counts. No face work needed.
 #   5b-2  the mapPolyMesh and the new mesh, from section 9's faces.
-# The unrefinement arms still skip ONE check by name -- removeFaces::setRefinement, the mesh an
-# unrefinement produces -- and the harness prints the skip count so it cannot quietly become zero
-# coverage.
+# NOTHING IS SKIPPED on any arm any more, and the harness still prints the skip count so that cannot
+# quietly stop being true.
 #
 # SEVEN ARMS on laminar/damBreak's own blockMesh (2268 cells, 9176 faces, 4746 points):
 #   one       cell 0 alone. One 8-way split: 2268 -> 2275 cells, 4746 -> 4765 points (1 cell centre + 6
@@ -199,8 +198,46 @@
 #   warnings. An edge whose two survivors lie on DIFFERENT patches is never reduced to 2 faces by a
 #   hexRef8 unrefinement -- the edges that are reduced are interior to one parent face. Transcribed
 #   because removeFaces has other callers; recorded as unwitnessed rather than counted.
-# What is still skipped, by name, is the rest of removeFaces::setRefinement -- the ACTIONS it plays into
-# the polyTopoChange, mergeFaces' own choice of master face, and the mesh that comes out (unit 6b-3b).
+# UNIT 6b-3b: the ACTIONS, and NOTHING IS SKIPPED ANY MORE. The decisions above are played into brae's own
+# polyTopoChange -- the removed faces, the removed points, the removed cells, one merge per face region,
+# then every remaining affected face -- and then through changeMesh, and the MESH and the MAP are compared
+# against the real unrefinement OpenFOAM ran on the same fixture: point, face, internal-face and cell
+# counts, owner, neighbour, every face's vertex list, all six maps and flipFaceFlux.
+# The merge itself is also compared line for line against the instrument: the master face, its index
+# within the region, the loop direction and the merged vertex list, for every region (404 / 77 / 521).
+# WHAT A MERGE LOOKS LIKE HERE, measured: every face region is exactly 4 faces -- a parent face split
+# into four children. On `unrefine` every merged face comes back to 4 vertices, because the whole block
+# goes and its mid points go with it. On `unrefine3` and `unrefineTwice` they come out with 5 to 8,
+# because a mid point another still-refined cell needs is KEPT: the merged face is a polygon with hanging
+# nodes, which is the case that matters and the one those two arms add.
+# ELEVEN FAIL-PROOFS. Five are red on all three arms:
+#   modFace never reverses the face                    flipFaceFlux 192 / 235 / 1557 entries against
+#                                                      OpenFOAM's 0 -- a face whose new owner is the
+#                                                      HIGHER cell must be written reversed
+#   the removed points are not dropped from the loop   merge 0's vertex list
+#   a cell is removed with no merge target             reverseCellMap, first at the block's first child
+#   the own/nei are not remapped onto the region
+#     master                                           brae's own upper-triangular check throws
+#   the loop starts at the edge's END vertex            merge 0's loop direction, and the mesh with it
+# Six are GREEN, and each for a reason that is measured rather than assumed:
+#   the merged loop is not reversed                     OpenFOAM does not reverse ANY of the 1,002 merges
+#   the loop is reversed keeping vertex 0                 on these arms, so neither branch is reachable
+#   the master is the region's FIRST face               OpenFOAM's masterIndex is 0 on all 1,002 merges:
+#                                                      the region's faces arrive in ascending label order
+#                                                      and face 0 always has a boundary edge, so the loop
+#                                                      starts on face 0's own edge in face 0's direction
+#   filterFace keeps the removed points                the remaining-affected pass handles 99 / 424 / 3172
+#                                                      faces and NONE of them contains a removed point --
+#                                                      every face that loses a point is inside a merge
+#                                                      region. The pass itself is gated: the own/nei
+#                                                      fail-proof above goes through it.
+#   the internal edges are numbered in the face's own   calcEdgeLoops reads only the BOUNDARY block, and
+#     order rather than by lowest neighbour             that block starts after every internal edge
+#                                                      whatever order they are in. The sort is
+#                                                      transcribed for faithfulness; this caller cannot
+#                                                      see it.
+#   each point's edges DESCENDING                      a 4-face region gives each vertex too few edges
+#                                                      for "the first unvisited boundary edge" to differ
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_hex_ref8_vs_openfoam"

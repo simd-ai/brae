@@ -135,6 +135,16 @@ Dump readDump(const std::string& path)
                 for (label j = 0; j < k; ++j) { label q = 0; rs >> q; e.push_back(q); }
                 v.push_back(e);
             }
+            else if (key == "merges")
+            {
+                // the instrument writes `masterFace masterIndex reversed nVerts v...`, so the FIRST
+                // number is not a count. Stored as masterFace, masterIndex, reversed, then the vertices.
+                label mf = 0, mi = 0, rev = 0, nv = 0;
+                rs >> mf >> mi >> rev >> nv;
+                std::vector<label> e{mf, mi, rev};
+                for (label j = 0; j < nv; ++j) { label q = 0; rs >> q; e.push_back(q); }
+                v.push_back(e);
+            }
             else if (key == "patches")
             {
                 std::string nm; label st = 0, sz = 0;
@@ -417,8 +427,126 @@ int main(int argc, char** argv)
                 compareList("affectedFace", aff, rf, "affectedFace");
                 compareListList("regionToFaces", dec.regionToFaces, rf, "regionToFaces");
             }
+
+            // UNIT 6b-3b: the ACTIONS, and then the mesh. Played at hexRef8's own minCos (GREAT), which
+            // is the profile the real unrefinement below was run at -- the cos45 decisions above are a
+            // second reading of the same mesh and are not carried any further.
+            {
+                const Dump rf = readDump(dumpPath + ".removeFaces");
+                const removeFaces::RemoveFacesDecisions dec =
+                    removeFaces::setRefinementDecisions(rv, ftr, crg, crm2, scalar(1e15));
+                std::vector<label> ustarts, usizes;
+                std::vector<std::string> utypes;
+                for (const auto& p : um.patches())
+                {
+                    ustarts.push_back(p.start);
+                    usizes.push_back(p.size);
+                    utypes.push_back(p.type);
+                }
+                std::vector<std::vector<label>> ufaces(static_cast<std::size_t>(um.nFaces()));
+                for (label f = 0; f < um.nFaces(); ++f)
+                {
+                    ufaces[static_cast<std::size_t>(f)].assign(
+                        um.faceVerts().begin() + um.faceOffsets()[f],
+                        um.faceVerts().begin() + um.faceOffsets()[f + 1]);
+                }
+                std::vector<label> unbr(static_cast<std::size_t>(um.nFaces()), label(-1));
+                for (label f = 0; f < um.nInternalFaces(); ++f)
+                {
+                    unbr[static_cast<std::size_t>(f)] = um.neighbour()[f];
+                }
+                polyTopoChange::TopoActions ua;
+                polyTopoChange::addMesh(ua, um.points(), ufaces, um.owner(), unbr, um.nCells(),
+                                        ustarts, usizes);
+                const std::vector<removeFaces::MergeRecord> merges =
+                    removeFaces::setRefinementActions(rv, dec, ftr, crg, crm2, ua);
+
+                // THE MERGES, against the instrument's own line per merge: the master face, its index
+                // within the region, the loop direction and the merged vertex list. All four are
+                // functions of the patch edge numbering and the edge loop, so this is what gates those.
+                {
+                    const auto it = rf.listLists.find("merges");
+                    bool ok = (it != rf.listLists.end()) && (merges.size() == it->second.size());
+                    if (!ok)
+                    {
+                        std::printf("  FAIL: brae made %zu merges, OpenFOAM %zu\n", merges.size(),
+                                    (it == rf.listLists.end()) ? 0 : it->second.size());
+                        ++failures;
+                    }
+                    else
+                    {
+                        std::size_t firstBad = merges.size();
+                        const char* what = "";
+                        for (std::size_t i = 0; i < merges.size() && firstBad == merges.size(); ++i)
+                        {
+                            const std::vector<label>& o = it->second[i];
+                            if (o.size() < 3) { firstBad = i; what = "the oracle line is short"; break; }
+                            if (o[0] != merges[i].masterFace) { firstBad = i; what = "master face"; }
+                            else if (o[1] != merges[i].masterIndex) { firstBad = i; what = "master index"; }
+                            else if ((o[2] != 0) != merges[i].reverseLoop)
+                            { firstBad = i; what = "loop direction"; }
+                            else
+                            {
+                                std::vector<label> verts(o.begin() + 3, o.end());
+                                if (verts != merges[i].mergedFace) { firstBad = i; what = "merged face"; }
+                            }
+                        }
+                        if (firstBad < merges.size())
+                        {
+                            std::printf("  FAIL: merge %zu differs in its %s (brae master %d, index %d, "
+                                        "reversed %d, %zu vertices)\n", firstBad, what,
+                                        (int)merges[firstBad].masterFace,
+                                        (int)merges[firstBad].masterIndex,
+                                        (int)merges[firstBad].reverseLoop,
+                                        merges[firstBad].mergedFace.size());
+                            ++failures;
+                        }
+                        else
+                        {
+                            std::printf("  ok:   every merge is OpenFOAM's -- master face, master index, "
+                                        "loop direction and merged vertex list (%zu merges)\n",
+                                        merges.size());
+                        }
+                    }
+                }
+
+                // ...AND THE MESH THE ACTIONS PRODUCE, against the real unrefinement's
+                polyTopoChange::ChangeMeshInput uci;
+                uci.nOldPoints = (label)um.points().size();
+                uci.nOldFaces = um.nFaces();
+                uci.nOldCells = um.nCells();
+                uci.oldPatchStarts = ustarts;
+                uci.oldPatchSizes = usizes;
+                uci.oldPatchNMeshPoints.assign(ustarts.size(), label(0));
+                uci.patchTypes = utypes;
+                uci.nZones = 0;
+                polyTopoChange::ChangedMesh uout;
+                polyTopoChange::TopoChangeMap umap;
+                polyTopoChange::changeMesh(ua, uci, uout, umap);
+                std::printf("  brae's unrefined mesh: %zu points, %zu faces (%d internal), %d cells\n",
+                            uout.points.size(), uout.faces.size(), (int)uout.nInternalFaces,
+                            (int)uout.nCells);
+                check("the unrefined mesh has OpenFOAM's counts",
+                      (label)uout.points.size() == d.scalars.at("nPoints")
+                   && (label)uout.faces.size() == d.scalars.at("nFaces")
+                   && uout.nInternalFaces == d.scalars.at("nInternalFaces")
+                   && uout.nCells == d.scalars.at("nCells"));
+                compareList("owner after the unrefinement", uout.faceOwner, d, "owner");
+                compareList("neighbour after the unrefinement", uout.faceNeighbour, d, "neighbour");
+                compareListList("every face's vertex list after the unrefinement", uout.faces, d,
+                                "faces");
+                compareList("pointMap of the unrefinement", umap.pointMap, d, "pointMap");
+                compareList("faceMap of the unrefinement", umap.faceMap, d, "faceMap");
+                compareList("cellMap of the unrefinement", umap.cellMap, d, "cellMap");
+                compareList("reversePointMap of the unrefinement", umap.reversePointMap, d,
+                            "reversePointMap");
+                compareList("reverseFaceMap of the unrefinement", umap.reverseFaceMap, d,
+                            "reverseFaceMap");
+                compareList("reverseCellMap of the unrefinement", umap.reverseCellMap, d,
+                            "reverseCellMap");
+                compareList("flipFaceFlux of the unrefinement", umap.flipFaceFlux, d, "flipFaceFlux");
+            }
         }
-        skip("removeFaces::setRefinement -- the actions, the map and the mesh, unit 6b-3b");
         std::printf("test_hex_ref8_vs_openfoam: %d failures, %d skipped\n", failures, skipped);
         return failures == 0 ? 0 : 1;
     }

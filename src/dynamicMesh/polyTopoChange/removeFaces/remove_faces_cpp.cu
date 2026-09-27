@@ -588,6 +588,244 @@ RemoveFacesDecisions setRefinementDecisions(
     return out;
 }
 
+// ----------------------------------------------------------------------------------------------
+// setRefinement's actions. See remove_faces_cpp.cuh.
+
+namespace {
+
+// removeFaces::getFaceInfo (:416-441). Zones are refused at changeMesh, and a mesh with none answers
+// zoneID -1 and zoneFlip false for every face -- which is what the actions carry.
+label facePatch(
+    const PrimitiveMesh& m,
+    label                facei)
+{
+    return (facei < m.nInternalFaces()) ? label(-1) : whichPatch(m, facei);
+}
+
+// removeFaces::filterFace (:446-471). The face with every removed point dropped, in face order.
+std::vector<label> filterFace(
+    const PrimitiveMesh&     m,
+    const std::vector<char>& removedPoint,
+    label                    facei)
+{
+    const label n = m.faceSize(facei);
+    const label off = m.faceOffsets()[static_cast<std::size_t>(facei)];
+    std::vector<label> out;
+    out.reserve(static_cast<std::size_t>(n));
+    for (label i = 0; i < n; ++i)
+    {
+        const label v = m.faceVerts()[static_cast<std::size_t>(off + i)];
+        if (!removedPoint[static_cast<std::size_t>(v)]) out.push_back(v);
+    }
+    return out;
+}
+
+// removeFaces::modFace (:475-560). A polyMesh face is owned by the LOWER of its two cells, so a face
+// whose new owner is the higher one is written REVERSED with the pair swapped.
+void modFace(
+    polyTopoChange::TopoActions& a,
+    const std::vector<label>&    f,
+    label                        masterFaceID,
+    label                        own,
+    label                        nei,
+    bool                         flipFaceFlux,
+    label                        newPatchID)
+{
+    if (nei == -1 || own < nei)
+    {
+        polyTopoChange::modifyFace(a, f, masterFaceID, own, nei, flipFaceFlux, newPatchID);
+    }
+    else
+    {
+        // face::reverseFace: the first vertex stays and the rest run backwards
+        std::vector<label> r(f.size());
+        if (!f.empty())
+        {
+            r[0] = f[0];
+            for (std::size_t i = 1; i < f.size(); ++i) r[i] = f[f.size() - i];
+        }
+        polyTopoChange::modifyFace(a, r, masterFaceID, nei, own, flipFaceFlux, newPatchID);
+    }
+}
+
+// the cell a face's side becomes: its region's master where it has a region, itself otherwise
+label mergedCell(
+    const std::vector<label>& cellRegion,
+    const std::vector<label>& cellRegionMaster,
+    label                     celli)
+{
+    const label region = cellRegion[static_cast<std::size_t>(celli)];
+    return (region == -1) ? celli : cellRegionMaster[static_cast<std::size_t>(region)];
+}
+
+}   // namespace
+
+std::vector<MergeRecord> setRefinementActions(
+    const RemoveFacesView&       v,
+    const RemoveFacesDecisions&  dec,
+    const std::vector<label>&    facesToRemove,
+    const std::vector<label>&    cellRegion,
+    const std::vector<label>&    cellRegionMaster,
+    polyTopoChange::TopoActions& a)
+{
+    requireView(v);
+    const PrimitiveMesh& m = *v.m;
+
+    // affectedFace is CONSUMED as OpenFOAM consumes it: each pass clears the faces it has dealt with,
+    // and the last pass picks up whatever is left. So it is a local copy, not the decisions' own.
+    std::vector<char> affected = dec.affectedFace;
+    std::vector<char> removedPoint(static_cast<std::size_t>(m.nPoints()), char(0));
+    for (const label pointi : dec.pointsToRemove) removedPoint[static_cast<std::size_t>(pointi)] = 1;
+
+    // :1385-1400. The split faces. OpenFOAM's own comment says the test is never false and is there to
+    // be consistent with the passes below.
+    for (const label facei : facesToRemove)
+    {
+        if (affected[static_cast<std::size_t>(facei)])
+        {
+            affected[static_cast<std::size_t>(facei)] = 0;
+            polyTopoChange::removeFace(a, facei, -1);
+        }
+    }
+
+    // :1404-1408
+    for (const label pointi : dec.pointsToRemove)
+    {
+        polyTopoChange::removePoint(a, pointi, -1);
+    }
+
+    // :1411-1421. Every cell of a region except its master is removed INTO the master, which is what
+    // makes the eight children one cell again.
+    for (std::size_t celli = 0; celli < cellRegion.size(); ++celli)
+    {
+        const label region = cellRegion[celli];
+        if (region == -1) continue;
+        const label master = cellRegionMaster[static_cast<std::size_t>(region)];
+        if (static_cast<label>(celli) != master)
+        {
+            polyTopoChange::removeCell(a, static_cast<label>(celli), master);
+        }
+    }
+
+    // :1425-1470. One merge per face region, in region order.
+    std::vector<MergeRecord> merges;
+    merges.reserve(dec.regionToFaces.size());
+    for (const std::vector<label>& rFaces : dec.regionToFaces)
+    {
+        // mergeFaces (:235-405). The patch is built over the region's faces IN THEIR OWN ORDER, which
+        // is ascending face label, and every index below is an index into it.
+        const PrimitivePatchAddressing fp = primitivePatch(m, rFaces);
+        const PatchEdgeAddressing fpe = patchEdges(fp);
+        const std::vector<std::vector<label>> loops = patchEdgeLoops(fpe);
+        if (loops.size() != 1)
+            throw std::runtime_error(
+                std::string(WHOSET) + "the " + std::to_string(rFaces.size()) + " faces of a region do "
+                "not have a single outside loop -- " + std::to_string(loops.size()) + " loops. OpenFOAM "
+                "FatalErrors here too (mergeFaces, :259-267): they cannot be merged into one face.");
+        const std::vector<label>& edgeLoop = loops[0];
+        if (edgeLoop.size() < 2)
+            throw std::runtime_error(
+                std::string(WHOSET) + "a region's outside loop has " + std::to_string(edgeLoop.size())
+                + " vertices. mergeFaces reads its first two to pick the master face.");
+
+        // :273-307. The master is the face that uses the loop's first two vertices CONSECUTIVELY, and
+        // the direction it uses them in decides whether the merged face is the loop or its reverse.
+        label masterIndex = -1;
+        bool reverseLoop = false;
+        for (const label facei : fp.pointFaces[static_cast<std::size_t>(edgeLoop[0])])
+        {
+            const std::vector<label>& f = fp.localFaces[static_cast<std::size_t>(facei)];
+            const auto it1 = std::find(f.begin(), f.end(), edgeLoop[1]);
+            if (it1 == f.end()) continue;
+            const auto it0 = std::find(f.begin(), f.end(), edgeLoop[0]);
+            if (it0 == f.end()) continue;
+            const std::size_t i0 = static_cast<std::size_t>(it0 - f.begin());
+            const std::size_t i1 = static_cast<std::size_t>(it1 - f.begin());
+            if (i1 == (i0 + 1) % f.size())              // face::fcIndex
+            {
+                masterIndex = facei;
+                reverseLoop = false;
+                break;
+            }
+            if (i1 == (i0 + f.size() - 1) % f.size())   // face::rcIndex
+            {
+                masterIndex = facei;
+                reverseLoop = true;
+                break;
+            }
+        }
+        if (masterIndex == -1)
+            throw std::runtime_error(
+                std::string(WHOSET) + "no face of a merged region uses the first two vertices of its "
+                "outside loop consecutively, so there is no master face. OpenFOAM FatalErrors here too "
+                "(:310-316).");
+
+        const label facei = rFaces[static_cast<std::size_t>(masterIndex)];
+        const label own = mergedCell(cellRegion, cellRegionMaster, m.owner()[static_cast<std::size_t>(facei)]);
+        const label patchID = facePatch(m, facei);
+        label nei = -1;
+        if (facei < m.nInternalFaces())
+        {
+            nei = mergedCell(cellRegion, cellRegionMaster,
+                             m.neighbour()[static_cast<std::size_t>(facei)]);
+        }
+
+        // :348-380. The loop in MESH point labels with the removed points dropped, reversed if the
+        // master ran the loop backwards.
+        std::vector<label> mergedFace;
+        mergedFace.reserve(edgeLoop.size());
+        for (const label localPt : edgeLoop)
+        {
+            const label pointi = fp.meshPoints[static_cast<std::size_t>(localPt)];
+            if (!removedPoint[static_cast<std::size_t>(pointi)]) mergedFace.push_back(pointi);
+        }
+        if (reverseLoop)
+        {
+            // Foam::reverse(face) reverses the WHOLE list, unlike face::reverseFace which keeps [0]
+            std::reverse(mergedFace.begin(), mergedFace.end());
+        }
+
+        modFace(a, mergedFace, facei, own, nei, false, patchID);
+
+        // :400-404. Every other face of the region is removed INTO the master.
+        for (std::size_t i = 0; i < rFaces.size(); ++i)
+        {
+            if (static_cast<label>(i) != masterIndex)
+            {
+                polyTopoChange::removeFace(a, rFaces[i], facei);
+            }
+        }
+        for (const label rf : rFaces) affected[static_cast<std::size_t>(rf)] = 0;
+
+        MergeRecord rec;
+        rec.masterFace = facei;
+        rec.masterIndex = masterIndex;
+        rec.reverseLoop = reverseLoop;
+        rec.mergedFace = mergedFace;
+        merges.push_back(std::move(rec));
+    }
+
+    // :1476-1519. Whatever is left: a face that keeps its identity but has lost points, or whose owner
+    // or neighbour has been merged away.
+    for (std::size_t facei = 0; facei < affected.size(); ++facei)
+    {
+        if (!affected[facei]) continue;
+        affected[facei] = 0;
+        const std::vector<label> f = filterFace(m, removedPoint, static_cast<label>(facei));
+        const label own =
+            mergedCell(cellRegion, cellRegionMaster, m.owner()[facei]);
+        const label patchID = facePatch(m, static_cast<label>(facei));
+        label nei = -1;
+        if (static_cast<label>(facei) < m.nInternalFaces())
+        {
+            nei = mergedCell(cellRegion, cellRegionMaster, m.neighbour()[facei]);
+        }
+        modFace(a, f, static_cast<label>(facei), own, nei, false, patchID);
+    }
+
+    return merges;
+}
+
 } // namespace removeFaces
 } // namespace cpu
 } // namespace brae

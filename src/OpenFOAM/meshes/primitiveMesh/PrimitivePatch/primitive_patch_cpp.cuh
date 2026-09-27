@@ -80,4 +80,43 @@ std::vector<label> faceRange(
     label start,
     label size);
 
+// ----------------------------------------------------------------------------------------------
+// A PrimitivePatch's EDGE addressing and its edgeLoops() -- what removeFaces::mergeFaces reads to
+// decide which of the faces it is merging becomes the master and in which direction the merged face
+// runs.
+//
+// provenance:
+//   openfoam: PrimitivePatchAddressing.C:47-272 (calcAddressing), PrimitivePatchPointAddressing.C
+//             (calcPointEdges, which is invertManyToMany over the edges), PrimitivePatchEdgeLoops.C:
+//             39-130 (calcEdgeLoops)
+//   tests:    tests/hex_ref8_vs_openfoam.sh, through the merged face of every one of an unrefinement's
+//             face regions -- the master face, the loop direction and the vertex list are all functions
+//             of this numbering, so the numbering is what is being tested
+//
+// THE EDGE NUMBERING IS TWO BLOCKS. Internal edges (shared by two or more of the patch's faces) come
+// first, in the order the face-by-face walk finds them, and for one face they are added in increasing
+// order of the NEIGHBOUR face's label rather than in the face's own edge order. Boundary edges follow,
+// in face-then-edge order. calcEdgeLoops walks only the second block, which is why the split matters and
+// not just the set.
+struct PatchEdgeAddressing
+{
+    // edges(): patch-local point pairs, internal edges first
+    std::vector<label> start;
+    std::vector<label> end;
+    label              nInternalEdges = 0;
+    // faceEdges(): per local face, its edge labels in the face's own edge order
+    std::vector<std::vector<label>> faceEdges;
+    // edgeFaces(): per edge, the owning face first and then its neighbours in the order found
+    std::vector<std::vector<label>> edgeFaces;
+    // pointEdges(): per local point, its edges ASCENDING (invertManyToMany)
+    std::vector<std::vector<label>> pointEdges;
+};
+
+PatchEdgeAddressing patchEdges(const PrimitivePatchAddressing& p);
+
+// PrimitivePatch::edgeLoops(): each closed loop of the patch's OUTSIDE vertices, in patch-local point
+// labels. OpenFOAM's own note is that it "goes wrong on multiply connected edges (loops will be
+// unclosed)" -- the caller checks the loop count instead, and mergeFaces refuses anything but one loop.
+std::vector<std::vector<label>> patchEdgeLoops(const PatchEdgeAddressing& pe);
+
 } // namespace brae
