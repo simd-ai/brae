@@ -545,6 +545,45 @@ int main(
                     "remainder is not localised, so no bound is claimed for them)\n");
     }
 
+    // HOW DIFFUSE the Uf difference is, for the levels/restart profiles. It reports the worst face and how
+    // many faces are within a hundredth of it, and it does NOT claim to say whether those faces are ones the
+    // change ADDED: a face index would say that for CELLS, where hexRef8 modifies the parent in place and
+    // appends the seven children, but polyTopoChange renumbers FACES wholesale, so a low face index means
+    // only "early in the new numbering". That distinction was worth writing down because the first reading
+    // of this line drew the wrong conclusion from it. What it does establish is the SHAPE: on the restart
+    // profile 1,611 of 12,487 faces sit within a hundredth of the worst, so the difference is spread across
+    // the mesh rather than sitting on one site -- which is what rules out a single mis-mapped face and
+    // points at the surface-field mapping as a whole. On a first change from REST every surface field is zero
+    // and the hull average is exactly 0 in both codes, which is why no other profile can see this at all.
+    if (levelsProfile)
+    {
+        const auto worstAt = [](const std::vector<vector>& mine, const std::vector<vector>& of)
+        {
+            std::size_t at = 0;
+            scalar worst = 0;
+            for (std::size_t i = 0; i < mine.size() && i < of.size(); ++i)
+            {
+                const scalar d = std::fmax(std::fmax(std::fabs(mine[i].x - of[i].x),
+                                                     std::fabs(mine[i].y - of[i].y)),
+                                           std::fabs(mine[i].z - of[i].z));
+                if (d > worst) { worst = d; at = i; }
+            }
+            return std::pair<std::size_t, scalar>{at, worst};
+        };
+        const auto wUf = worstAt(A.f.Uf.internal, ofUf);
+        std::size_t above = 0;
+        for (std::size_t i = 0; i < A.f.Uf.internal.size() && i < ofUf.size(); ++i)
+        {
+            const scalar d = std::fmax(std::fmax(std::fabs(A.f.Uf.internal[i].x - ofUf[i].x),
+                                                 std::fabs(A.f.Uf.internal[i].y - ofUf[i].y)),
+                                       std::fabs(A.f.Uf.internal[i].z - ofUf[i].z));
+            if (d > scalar(0.01)*wUf.second) ++above;
+        }
+        std::printf("  Uf's difference is spread over %zu of %ld internal faces (within a hundredth of the "
+                    "worst, which is face %zu -- an index in the NEW numbering, not a claim about which "
+                    "faces the change added)\n", above, (long)nIF, wUf.first);
+    }
+
     // ...and the PATCH values, which are the patch fields' own autoMap: a mapped patch field whose
     // unmapped faces were left at zero reads exactly here and nowhere else.
     {
