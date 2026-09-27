@@ -840,7 +840,7 @@ RunReport runInterFoam(
                             // Empty is how alphaEqnStep is told there is none (alpha_eqn_cpp.cu:552).
                             prevCorr.internal.clear();
                             prevCorr.boundary.clear();
-                            interAfterMeshChange(f, *mutableMesh, gamgCache, cpc, rep);
+                            interAfterMeshChange(f, *mutableMesh, gamgCache, cpc, rep, rep.steps);
                         }
                         // OpenFOAM prints "Refined from N to M cells." at every change; this is the same
                         // line, and a run that silently refines nothing is what it exists to show.

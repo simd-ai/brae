@@ -25,11 +25,44 @@ constexpr const char* WHO = "brae interFoam (adaptive mesh): ";
 // unit has mapped yet, so it throws and names itself rather than surviving into the next step.
 void refuseUnmappedState(const InterFields& f)
 {
-    if (f.turbulence.on)
+    // TURBULENCE IS CARRIED NOW -- k, the second scalar and nut through the cell and patch mappers like
+    // any other field, their per-step old times as raw cell arrays, and the two WALL DISTANCES recomputed
+    // rather than mapped because that is what OpenFOAM does (see updateMeshInterTurbulence). What is
+    // refused is the state no fixture holds:
+    //
+    //   * THE CLOSURE UNDER CrankNicolson. Its ddt0 levels (ddt0K, ddt0Eps) and old-OLD levels (kOO,
+    //     epsOO) are registered DDt0Fields that MapGeometricFields autoMaps in OpenFOAM, exactly as the
+    //     solver's are -- and the solver's took two units of their own (11 host, 13 device). No adaptive
+    //     tutorial runs CrankNicolson on a turbulent case, so this is refused rather than carried blind.
+    //   * LES. kEqn's filter WIDTH is a function of the cell volume and is recomputed on a changing mesh
+    //     (cubeRootVolDelta.C:128-134), which updateMeshInterTurbulence does -- but the only LES fixture
+    //     in the tree is LES/nozzleFlow2D, which is not adaptive, so nothing would hold it.
+    if (f.turbulence.on && f.ddtU == DdtScheme::CrankNicolson)
         throw std::runtime_error(
-            std::string(WHO) + "the case runs a turbulence model, whose fields (k, omega or epsilon, nut "
-            "and their old times) are not carried through a mesh change yet. RAS/motorBike is the case "
-            "that needs it.");
+            std::string(WHO) + "the case runs a turbulence model AND ddtSchemes names CrankNicolson. The "
+            "closure's own ddt0 levels (ddt0K, ddt0Eps) and old-old levels are registered fields OpenFOAM "
+            "autoMaps, and no adaptive tutorial pairs the two, so nothing would hold the carry. The "
+            "SOLVER's CrankNicolson state IS carried (InterAmrCn).");
+    // ...and a SECOND LINE OF DEFENCE on the state itself rather than on the scheme, because a `ddt(k)`
+    // entry could form these levels under a default this port read as Euler.
+    //
+    // IT TESTS THE ddt0 LEVELS AND NOT kOO/epsOO, and that distinction is measured rather than assumed:
+    // advanceTurbulenceOldTime rotates kOO and epsOO at EVERY step under EVERY scheme
+    // (inter_turbulence_cpp.cu:902-919), mirroring OpenFOAM's oldTime().oldTime(), and only CrankNicolson
+    // READS them. A first cut of this refusal tested them for emptiness and fired on the Euler fixture at
+    // its second change, with `kOO 2814` -- a refusal that named CrankNicolson on a case that does not run
+    // it. They are ordinary mesh-sized arrays and are carried with the rest.
+    if (f.turbulence.on && (f.turbulence.cn.ddt0K.exists || f.turbulence.cn.ddt0Eps.exists))
+        throw std::runtime_error(
+            std::string(WHO) + "the turbulence closure has formed a CrankNicolson ddt0 level (ddt0K "
+            + std::string(f.turbulence.cn.ddt0K.exists ? "exists" : "absent") + ", ddt0Eps "
+            + std::string(f.turbulence.cn.ddt0Eps.exists ? "exists" : "absent")
+            + "), which a change does not carry.");
+    if (f.turbulence.on && f.turbulence.model == InterRasModel::KEqnLES)
+        throw std::runtime_error(
+            std::string(WHO) + "the case runs the LES kEqn closure. Its filter width IS recomputed on a "
+            "changing mesh and this adapter does that, but the only LES fixture in the tree "
+            "(LES/nozzleFlow2D) is not adaptive, so no gate would hold it.");
     if (f.waves.any)
         throw std::runtime_error(
             std::string(WHO) + "the case has wave boundary conditions, whose per-patch models hold their "
@@ -317,12 +350,40 @@ bool interAmrUpdate(
     // THE OLD-TIME LEVELS, mapped like any other field. The cell ones go through the cell mapper; the
     // per-patch value lists go through the patch mapping, which is what a patch field's own autoMap uses
     // -- they are the same numbers without the object around them.
+    // THE TURBULENCE FIELDS, whole -- cells AND patch fields, so every wall function's own value list
+    // goes through the patch mapper with it. They are pushed here rather than beside alpha1 so the
+    // read-back indices of the three solver fields do not move.
+    const bool carryTurb = f.turbulence.on;
+    if (carryTurb)
+    {
+        amr.state.carriedScalarFields.push_back(&f.turbulence.k);
+        amr.state.carriedScalarFields.push_back(
+            f.turbulence.model == InterRasModel::KOmegaSST ? &f.turbulence.omega
+                                                           : &f.turbulence.epsilon);
+        amr.state.carriedScalarFields.push_back(&f.turbulence.nut);
+    }
+
     const std::size_t scalarsBefore = amr.state.cellScalars.size();
     const std::size_t vectorsBefore = amr.state.cellVectors.size();
     if (old.alphaOld) amr.state.cellScalars.push_back(*old.alphaOld);
     if (old.rhoOld)   amr.state.cellScalars.push_back(*old.rhoOld);
     if (old.rhoOO)    amr.state.cellScalars.push_back(*old.rhoOO);
     if (old.alphaOO)  amr.state.cellScalars.push_back(*old.alphaOO);
+    // THE CLOSURE'S PER-STEP OLD TIMES. brae keeps these per TIME INDEX rather than per call
+    // (InterTurbulence::kOldStep), which is what makes them state a change has to carry: OpenFOAM's are
+    // the registered fields' own oldTime() levels, autoMapped with the fields. Pushed only when they have
+    // been captured -- at the FIRST change of a run no closure correct() has run and they are empty.
+    const bool carryKOld = carryTurb && !f.turbulence.kOldStep.empty();
+    const bool carrySecondOld = carryTurb && !f.turbulence.epsOldStep.empty();
+    // ...and the old-OLD levels, which rotate at every step under every scheme and are read only by
+    // CrankNicolson. Carried anyway: they are mesh-sized, and leaving them at the old count would be a
+    // buffer of the wrong length waiting for the one scheme that reads it.
+    const bool carryKOO = carryTurb && !f.turbulence.cn.kOO.empty();
+    const bool carrySecondOO = carryTurb && !f.turbulence.cn.epsOO.empty();
+    if (carryKOld)      amr.state.cellScalars.push_back(f.turbulence.kOldStep);
+    if (carrySecondOld) amr.state.cellScalars.push_back(f.turbulence.epsOldStep);
+    if (carryKOO)       amr.state.cellScalars.push_back(f.turbulence.cn.kOO);
+    if (carrySecondOO)  amr.state.cellScalars.push_back(f.turbulence.cn.epsOO);
     if (old.UOld)     amr.state.cellVectors.push_back(*old.UOld);
     if (old.UOO)      amr.state.cellVectors.push_back(*old.UOO);
     const bool carryPhiOld = old.phiOld != nullptr;
@@ -534,7 +595,8 @@ bool interAmrUpdate(
     if (carryRAU) f.rAU = amr.state.cellScalars.at(0);
     if (amr.state.cellScalars.size() != scalarsBefore
         + (old.alphaOld ? 1u : 0u) + (old.rhoOld ? 1u : 0u) + (old.rhoOO ? 1u : 0u)
-        + (old.alphaOO ? 1u : 0u)
+        + (old.alphaOO ? 1u : 0u) + (carryKOld ? 1u : 0u) + (carrySecondOld ? 1u : 0u)
+        + (carryKOO ? 1u : 0u) + (carrySecondOO ? 1u : 0u)
      || amr.state.cellVectors.size() != vectorsBefore
         + (old.UOld ? 1u : 0u) + (old.UOO ? 1u : 0u)
         + (cnRhoU ? 1u : 0u) + (cnCorrU ? 1u : 0u))
@@ -548,6 +610,11 @@ bool interAmrUpdate(
         if (old.rhoOld)   *old.rhoOld   = amr.state.cellScalars.at(si++);
         if (old.rhoOO)    *old.rhoOO    = amr.state.cellScalars.at(si++);
         if (old.alphaOO)  *old.alphaOO  = amr.state.cellScalars.at(si++);
+        // ...the closure's per-step old times, out of the slots they went into
+        if (carryKOld)      f.turbulence.kOldStep   = amr.state.cellScalars.at(si++);
+        if (carrySecondOld) f.turbulence.epsOldStep = amr.state.cellScalars.at(si++);
+        if (carryKOO)       f.turbulence.cn.kOO     = amr.state.cellScalars.at(si++);
+        if (carrySecondOO)  f.turbulence.cn.epsOO   = amr.state.cellScalars.at(si++);
         if (old.UOld)     *old.UOld     = amr.state.cellVectors.at(vi++);
         if (old.UOO)      *old.UOO      = amr.state.cellVectors.at(vi++);
         if (carryPhiOld)
@@ -731,7 +798,8 @@ void interAfterMeshChange(
     const MutableMesh&        mm,
     GamgAgglomerationCache&   gamgCache,
     const CorrectPhiControls& cpc,
-    RunReport&                rep)
+    RunReport&                rep,
+    label                     timeIndex)
 {
     // the mesh's own sets, for the one selection mode that re-reads a file
     const std::string polyMeshDir = f.amr ? f.amr->polyMeshDir : std::string();
@@ -860,6 +928,30 @@ void interAfterMeshChange(
         else
         {
             MRF::update(f.mrfZones, f.mrfSpecs, f.cellZones, m, patches);
+        }
+    }
+
+    // THE TURBULENCE CLOSURE'S MESH-DEPENDENT STATE. The FIELDS were mapped by interAmrUpdate; what is
+    // left is what OpenFOAM recomputes rather than maps -- the cell wall distance kOmegaSST's F1 and F2
+    // blend on, whose MeshObject forces its own latch on a topology change, and the LES filter width.
+    // A control is not offered here because the two halves have separate ones already: the RESIZE_NOT_MAP
+    // control covers the fields, and the recompute is what this call IS -- skipping it leaves yCell at the
+    // OLD CELL COUNT, which the closure's next correct() reads past the end of rather than reading wrongly.
+    if (f.turbulence.on)
+    {
+        // A GATE'S CONTROL: do not recompute them. That is the plausible wrong port -- treat the wall
+        // distance and the filter width as state the change carries rather than state it invalidates, which
+        // is what a reader would assume from the fact that every OTHER field here is mapped. OpenFOAM's
+        // wallDist is a MeshObject and its updateMesh FORCES a recompute (wallDist.C:224-234), so there is
+        // nothing to carry.
+        if (std::getenv("BRAE_CONTROL_AMR_NO_TURB_UPDATE"))
+        {
+            std::printf("  *** CONTROL MODE: the turbulence closure's wall distance and filter width are "
+                        "NOT recomputed after the change. This run is deliberately wrong. ***\n");
+        }
+        else
+        {
+            updateMeshInterTurbulence(f.turbulence, m, g, patches, timeIndex);
         }
     }
 

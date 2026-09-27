@@ -326,6 +326,19 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
     {
         // wallDist::New(mesh).y(), as the host block resolved it (InterTurbulence::yCell -- the
         // diffusivity's patch set when a motion solver registered one)
+        // SIZED BY THE MESH, so it is checked against it. The LES branch above already throws on a
+        // mismatch and this one did not -- an asymmetry that stopped being harmless when the adaptive
+        // branch began calling this builder MID-RUN: a yCell left at the old cell count would be uploaded
+        // without complaint and read per cell by F1 and F2. The message names updateMeshInterTurbulence
+        // because that is what fills it after a change (and moveInterTurbulence after a move).
+        if (t.yCell.size() != t.k.internal.size())
+        {
+            throw std::runtime_error(
+                "brae interFoam (device): kOmegaSST's cell wall distance is " + std::to_string(t.yCell.size())
+                + " cells where the closure's fields are " + std::to_string(t.k.internal.size())
+                + ". updateMeshInterTurbulence (after a topology change) or moveInterTurbulence (after a "
+                "move) did not run on this mesh, and F1 and F2 read it per cell.");
+        }
         d.yCell.copyFrom(t.yCell);
         // ...and the two per-face masks the closure takes, as rhoCreateFields builds them: F1 is 1 by
         // construction on a wall or empty patch, and nut's field assignment reaches a `calculated`
@@ -1089,6 +1102,20 @@ void downloadDeviceInterTurbulence(
         t.nut.boundary[pi]->setValue(std::vector<scalar>(nb.begin() + off, nb.begin() + off + n));
         off += n;
     }
+    // ...AND THE OLD-TIME LEVELS, which this loop advances in DEVICE buffers
+    // (advanceDeviceTurbulenceOldTime) where the host loop advances the host ones. Without them the host
+    // copy of the closure's state is incomplete, and a TOPOLOGY CHANGE maps the host copy -- so an
+    // adaptive device run would hand the mapper the arrays the last host correct() left, which on this arm
+    // is never. They cost four copies at the end of a run, where nothing reads them, and they are the
+    // difference between a mapped old time and a stale one at every change.
+    if (d.kOldStep.size())  d.kOldStep.copyTo(t.kOldStep);
+    if (d.cnKOO.size())     d.cnKOO.copyTo(t.cn.kOO);
+    if (t.model != cpu::interFoam::InterRasModel::KEqnLES)
+    {
+        if (d.epsOldStep.size()) d.epsOldStep.copyTo(t.epsOldStep);
+        if (d.cnEpsOO.size())    d.cnEpsOO.copyTo(t.cn.epsOO);
+    }
+    t.oldStepTimeIndex = d.oldStepTimeIndex;
 }
 
 } // namespace brae

@@ -339,6 +339,13 @@ int main(
         // amplifies: the mrf profile reads 4.0190e-09 and 5.7751e-09, both INSIDE the envelope OpenFOAM's
         // own one-ulp twin draws (8.6395e-09), and a hardcoded bound cannot say that.
         scalar devU, hostDevU;
+        // THE TURBULENCE FIELDS, on the ras profile: k, the second scalar and nut, each relative, and the
+        // device's own. Zero on every other profile, where there is no closure to compare.
+        scalar k, second, nut, devK, devSecond, devNut;
+        // the PATCH p_rgh floor, relative, per profile for the same reason patchU is: it was a hardcoded
+        // 1e-14 and the ras profile reads 1.0349e-14 at an ABSOLUTE 2.9104e-11 on a field reaching 2.8e+03,
+        // which is round-off rather than a defect.
+        scalar patchP;
     };
     //   cn      7.7716e-15 alpha, 7.3e-15 p_rgh, 4.5e-13 U, 2.7e-14 p, 6.9e-12 rAU, 1.2e-13 phi
     //   and the cn profile's DEVICE arm: alpha 2.1982e-14 from OpenFOAM and 2.2714e-14 from the host,
@@ -347,24 +354,55 @@ int main(
     const bool cn = (profile == "cn");
     const bool porosity = (profile == "porosity");
     const bool mrf = (profile == "mrf");
+    // the two turbulent profiles of tests/interfoam_amr_ras_vs_openfoam.sh: `ke` as shipped and `sst` the
+    // same case made kOmegaSST. They share every bound; what differs is that only kOmegaSST builds a CELL
+    // wall distance, which is the half of that unit `ke` cannot witness.
+    const bool ras = (profile == "ke" || profile == "sst");
+    // ...AND THE DEVICE LOOP'S kOmegaSST FLOOR, which is not this unit's and is not a loosening. The static
+    // RAS gate names it once and holds every SST profile to it (tests/test_inter_ras_dambreak_vs_openfoam.cu
+    // :146-151): "nut carries the device loop's U difference through k, omega and F2, so an SST profile sits
+    // three orders above a kEpsilon one", with its own `sst` profile reading omega 3.09e-11. This one reads
+    // 1.1299e-10 through two topology changes, the same order. The HOST arm is at 1e-14 on both profiles,
+    // which is what says the floor is the device closure's and not the carry's.
+    const bool sstProfile = (profile == "sst");
     //   porosity 1.5190e-14 alpha, 1.2e-14 p_rgh, 3.1e-13 U, 7.5e-15 p, 1.5e-11 rAU, 2.2e-13 phi,
     //   2.3e-13 Uf, 2.5e-11 contErr -- three steps with an explicitPorositySource over a cellZone, whose
     //   re-selection is what this profile exists to measure; and its DEVICE arm: alpha 1.6986e-14 from
     //   OpenFOAM and 2.2773e-14 from the host, p_rgh 1.3737e-14 and 1.8231e-14, U 3.5e-13, phi 2.9e-13
     const Bounds B = closed
         ? Bounds{5e-14, 1e-14, 1e-12, 1e-13, 1e-11, 5e-12, 1e-12, 1e-9, 5e-14, 1e-12, 1e-14, 5e-12,
-                 1e-14, 1e-14, 1e-12, 0, 1e-12, 1e-12}
+                 1e-14, 1e-14, 1e-12, 0, 1e-12, 1e-12, 0, 0, 0, 0, 0, 0, 1e-14}
         : cn
         ? Bounds{1e-14, 1e-14, 1e-12, 1e-13, 1e-11, 1e-12, 1e-12, 1e-9, 5e-14, 1e-12, 5e-14, 1e-12,
-                 5e-14, 5e-14, 1e-12, 0, 1e-12, 1e-12}
+                 5e-14, 5e-14, 1e-12, 0, 1e-12, 1e-12, 0, 0, 0, 0, 0, 0, 1e-14}
         : porosity
         ? Bounds{5e-14, 5e-14, 1e-12, 1e-13, 5e-11, 1e-12, 1e-12, 1e-9, 5e-14, 1e-12, 5e-14, 1e-12,
-                 5e-14, 5e-14, 5e-12, 0, 1e-12, 1e-12}
+                 5e-14, 5e-14, 5e-12, 0, 1e-12, 1e-12, 0, 0, 0, 0, 0, 0, 1e-14}
+        : sstProfile
+        ? Bounds{5e-14, 1e-13, 1e-12, 1e-13, 1e-12, 5e-12, 1e-12, 1e-9, 5e-14, 5e-10, 5e-14, 5e-10,
+                 1e-13, 1e-13, 1e-13, 1e-13, 5e-10, 5e-10,
+                 // host k 1.9062e-14, omega 5.1909e-15, nut 1.8203e-14; DEVICE k 7.4632e-11,
+                 // omega 1.1299e-10, nut 1.0470e-10, with alpha 5.1070e-15 and p_rgh 6.7935e-14 -- the
+                 // device SST floor above, reached through the closure and not through the mapping.
+                 1e-13, 1e-13, 1e-13, 5e-10, 5e-10, 5e-10, 1e-13}
+        : ras
+        ? Bounds{5e-14, 1e-13, 1e-12, 1e-13, 1e-12, 5e-12, 1e-12, 1e-9, 5e-14, 5e-12, 5e-14, 5e-12,
+                 1e-13, 1e-13, 1e-13, 1e-13, 5e-12, 5e-12,
+                 // k, the second scalar and nut, host then device. MEASURED with every solve pinned:
+                 //   host    k 2.2516e-14   epsilon 2.0314e-14   nut 3.7415e-14
+                 //   device  k 2.1519e-13   epsilon 6.1862e-13   nut 9.1907e-14, and alpha 2.7756e-14,
+                 //           p_rgh 2.2903e-14, U 1.7083e-12, phi 2.7135e-12 from OpenFOAM
+                 // The device's floor is an order above the host's on the two transported scalars, which is
+                 // the device closure's own distance on this case and not the change's: the static RAS gate
+                 // reads the same shape (tests/interfoam_ras_dambreak_vs_openfoam.sh).
+                 // The continuity floor is ABSOLUTE (1e-13): both codes end at 2.44e-15, where the relative
+                 // difference is 9.5e-05 and measures their last digits.
+                 1e-13, 1e-13, 1e-13, 1e-12, 1e-12, 1e-12, 1e-13}
         : mrf
         ? Bounds{1e-10, 5e-09, 1e-08, 5e-09, 5e-10, 1e-09, 1e-08, 0, 1e-10, 1e-09, 1e-10, 1e-09,
-                 1e-08, 1e-08, 1e-12, 1e-15, 1e-08, 1e-08}
+                 1e-08, 1e-08, 1e-12, 1e-15, 1e-08, 1e-08, 0, 0, 0, 0, 0, 0, 1e-14}
         : Bounds{5e-15, 1e-14, 1e-12, 1e-13, 1e-11, 1e-12, 1e-12, 1e-9, 5e-15, 1e-12, 5e-15, 1e-12,
-                 1e-14, 1e-14, 1e-12, 0, 1e-12, 1e-12};
+                 1e-14, 1e-14, 1e-12, 0, 1e-12, 1e-12, 0, 0, 0, 0, 0, 0, 1e-14};
 
     Arm A;
     runArm(A, caseDir, startDir, nSteps);
@@ -497,7 +535,7 @@ int main(
                     (double)worstP.linf, (double)worstP.rel());
         check("every patch's alpha is at this profile's floor", worstA.linf < B.alpha);
         check("every patch's U is at this profile's floor, relative", worstU.rel() < B.patchU);
-        check("every patch's p_rgh is within 1e-14 relative", worstP.rel() < scalar(1e-14));
+        check("every patch's p_rgh is at this profile's floor, relative", worstP.rel() < B.patchP);
     }
 
     // ---- THE SOLVES, which is the arm that says the two codes solved the same systems. A pcorr solve
@@ -738,6 +776,114 @@ int main(
         }
     }
 
+    // ---- THE TURBULENCE FIELDS, on the ras profile, which is the whole point of that unit: k, the
+    // second transported scalar and nut are registered AUTO_WRITE fields that MapGeometricFields autoMaps
+    // in OpenFOAM, so brae maps them through the same cell and patch mappers as alpha1 -- and OpenFOAM
+    // writes all three beside every time directory, so the oracle is its own fields rather than a residual.
+    if (ras)
+    {
+        const bool sst = (A.f.turbulence.model == cpu::interFoam::InterRasModel::KOmegaSST);
+        const std::string secondName = sst ? "omega" : "epsilon";
+        check("the case was recognised as turbulent", A.f.turbulence.on);
+        const std::vector<scalar> ofK = cellValues(readField<scalar>(ofDir + "/k"), nC);
+        const std::vector<scalar> ofS = cellValues(readField<scalar>(ofDir + "/" + secondName), nC);
+        const std::vector<scalar> ofNut = cellValues(readField<scalar>(ofDir + "/nut"), nC);
+        const Diff dK = compare(A.f.turbulence.k.internal, ofK);
+        const Diff dS = compare(sst ? A.f.turbulence.omega.internal : A.f.turbulence.epsilon.internal, ofS);
+        const Diff dNut = compare(A.f.turbulence.nut.internal, ofNut);
+        std::printf("  k %.4e (rel %.4e)   %s %.4e (rel %.4e)   nut %.4e (rel %.4e)\n",
+                    (double)dK.linf, (double)dK.rel(), secondName.c_str(),
+                    (double)dS.linf, (double)dS.rel(), (double)dNut.linf, (double)dNut.rel());
+        check("k is at this profile's floor, relative", dK.rel() < B.k);
+        check("the second transported scalar is at this profile's floor, relative", dS.rel() < B.second);
+        check("nut is at this profile's floor, relative", dNut.rel() < B.nut);
+
+        // THE FIXTURE MUST BE ABLE TO WITNESS, and for a MAPPER that means the fields must not be uniform
+        // at the moment of the change: a uniform field is mapped correctly by a broken mapper. This case
+        // ships k and epsilon uniform 0.1 and nut uniform 0, and they develop in ONE step -- measured from
+        // OpenFOAM's own written fields, epsilon spans 0.0998 to 8.449 at t = 0.001, so the SECOND change
+        // maps a developed field. The spread is asserted rather than trusted.
+        const auto spread = [](const std::vector<scalar>& v)
+        {
+            scalar lo = v.empty() ? scalar(0) : v[0], hi = lo;
+            for (const scalar x : v) { lo = std::fmin(lo, x); hi = std::fmax(hi, x); }
+            return hi - lo;
+        };
+        std::printf("  the mapped fields' spread: k %.4g, %s %.4g, nut %.4g (a UNIFORM field would be "
+                    "mapped correctly by a broken mapper)\n", (double)spread(ofK), secondName.c_str(),
+                    (double)spread(ofS), (double)spread(ofNut));
+        check("k varies across the mesh, so its mapping can be witnessed", spread(ofK) > scalar(1e-6));
+        check("...and the second scalar's", spread(ofS) > scalar(1e-6));
+        check("...and nut's", spread(ofNut) > scalar(1e-9));
+
+        // ...AND THE WALL FUNCTIONS' OWN FACES, which is the other half. A wall function's y and its face
+        // cell change when a wall face is SPLIT, so a refinement that never touches a wall patch would
+        // leave that half unwitnessed. MEASURED on this fixture from OpenFOAM's own written meshes:
+        // leftWall 50 -> 56 -> 68 faces and lowerWall 62 -> 68 -> 80, while rightWall stays at 50 because
+        // the water has not reached it -- so the split wall faces are real and one wall is a control.
+        // The per-patch counts need no comparison of their own: the arms above already hold every face's
+        // owner and every internal face's neighbour to OpenFOAM's, which pins the boundary layout with them.
+        label wallFaces = 0, wallPatches = 0;
+        for (const FvPatch& q : A.patches)
+        {
+            if (q.type != "wall") continue;
+            wallFaces += q.size;
+            ++wallPatches;
+        }
+        std::printf("  wall-function faces: %ld over %ld wall patch(es)\n",
+                    (long)wallFaces, (long)wallPatches);
+        check("the mesh has wall-function faces at all, so the wall treatment is exercised", wallFaces > 0);
+
+        // THE CONTROL: do not recompute the wall distance and the filter width. It is a TEST on the sst
+        // profile and a STATEMENT ABOUT THE FIXTURE on the ke one, and the gate asserts which rather than
+        // running the same switch twice and reporting one number -- the same shape as the old-time control
+        // above, which is vacuous under Euler and live under CrankNicolson.
+        //
+        // kEpsilon BUILDS NO CELL WALL DISTANCE (only kOmegaSST's F1 and F2 blend on one), and its filter
+        // width is LES's, so on `ke` there is nothing for this switch to leave stale. MEASURED: identical
+        // to the last digit -- alpha 1.1425e-14 and k 2.2516e-14 either way. On `sst` it is caught by
+        // twelve orders: alpha 2.0796e-03 against 2.8866e-15, p_rgh 2.3079e-02, U 1.1012e-01.
+        setenv("BRAE_CONTROL_AMR_NO_TURB_UPDATE", "1", 1);
+        Arm T;
+        runArm(T, caseDir, startDir, nSteps);
+        unsetenv("BRAE_CONTROL_AMR_NO_TURB_UPDATE");
+        const Diff tA = compare(T.f.alpha1.internal, ofAlpha);
+        const Diff tU = compare(T.f.U.internal, ofU);
+        const Diff tSelfA = compare(T.f.alpha1.internal, A.f.alpha1.internal);
+        std::printf("  CONTROL (the wall distance and filter width NOT recomputed): alpha %.4e, U rel "
+                    "%.4e, and %.4e from the gate's own arm\n",
+                    (double)tA.linf, (double)tU.rel(), (double)tSelfA.linf);
+        check("...the control ran every step", T.r.steps == nSteps);
+        if (sstProfile)
+        {
+            check("...and is caught: kOmegaSST blends F1 and F2 on the cell wall distance, so leaving it "
+                  "at the old mesh's is a million times further out than the gate",
+                  tA.linf > scalar(1e6)*std::fmax(dAlpha.linf, scalar(1e-300)));
+        }
+        else
+        {
+            check("...and it changes NOTHING on this profile, because kEpsilon builds no cell wall "
+                  "distance -- so this profile does not test that recompute and says so",
+                  tSelfA.linf == scalar(0));
+        }
+
+        // THE TURBULENCE SOLVES, against OpenFOAM's own log. A field at 1e-14 could still be a solver that
+        // stopped somewhere else; an iteration count cannot.
+        const std::vector<LinearSolveRecord> ofKs = gatecheck::readOfSolves(logPath, "k");
+        const std::vector<LinearSolveRecord> ofSs = gatecheck::readOfSolves(logPath, secondName.c_str());
+        check("OpenFOAM's log carries k solves to compare against", !ofKs.empty());
+        if (!ofKs.empty())
+        {
+            failures += gatecheck::compareSolves("k", A.r.kSolves, ofKs, nSteps, "k");
+        }
+        if (!ofSs.empty())
+        {
+            failures += gatecheck::compareSolves(
+                secondName.c_str(), sst ? A.r.omegaSolves : A.r.epsilonSolves, ofSs, nSteps,
+                secondName.c_str());
+        }
+    }
+
     // ---- MRF THROUGH A CHANGE, on the mrf profile. TWO ORACLES, and the first is the sharper of the
     // two because it does not go through a solve at all: a topoChanging mesh writes its polyMesh into
     // every time directory, cellZones among them, so OpenFOAM's OWN RENUMBERED ZONE is on disk and the
@@ -945,6 +1091,27 @@ int main(
                   hvP.rel() < B.hostDevPRgh);
             check("the device is at this profile's floor from the host arm's U", hvU.rel() < B.hostDevU);
             check("the device is at this profile's floor from the host arm's phi", hvPhi.rel() < B.hostDevPhi);
+            // ...AND THE CLOSURE'S OWN FIELDS on the device arm, which is what the ras unit ported there.
+            // They are compared SEPARATELY from U and p_rgh because the two halves fail differently: nut
+            // reaches the momentum equation through nuEff, so a wrong nut shows up as U and p_rgh while
+            // alpha stays near the floor -- which is exactly how this unit's first device attempt read.
+            if (ras && D.f.turbulence.on)
+            {
+                const bool dsst = (D.f.turbulence.model == cpu::interFoam::InterRasModel::KOmegaSST);
+                const std::string dsn = dsst ? "omega" : "epsilon";
+                const std::vector<scalar> ofKd = cellValues(readField<scalar>(ofDir + "/k"), nC);
+                const std::vector<scalar> ofSd = cellValues(readField<scalar>(ofDir + "/" + dsn), nC);
+                const std::vector<scalar> ofNd = cellValues(readField<scalar>(ofDir + "/nut"), nC);
+                const Diff dvK = compare(D.f.turbulence.k.internal, ofKd);
+                const Diff dvS = compare(dsst ? D.f.turbulence.omega.internal
+                                              : D.f.turbulence.epsilon.internal, ofSd);
+                const Diff dvNut = compare(D.f.turbulence.nut.internal, ofNd);
+                std::printf("  device vs OpenFOAM: k %.4e   %s %.4e   nut %.4e (relative)\n",
+                            (double)dvK.rel(), dsn.c_str(), (double)dvS.rel(), (double)dvNut.rel());
+                check("the device's k is at this profile's floor, relative", dvK.rel() < B.devK);
+                check("...its second transported scalar", dvS.rel() < B.devSecond);
+                check("...and its nut, which is what reaches the momentum equation", dvNut.rel() < B.devNut);
+            }
         }
         // ...AND THE SAME ARM TWICE IN ONE PROCESS, which is the detector for a cache keyed on a
         // recycled pointer: the device pool hands the second run the first run's blocks, so a schedule

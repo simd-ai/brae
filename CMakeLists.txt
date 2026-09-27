@@ -3837,6 +3837,19 @@ set_tests_properties(interfoam_amr_vs_openfoam PROPERTIES
                      DEPENDS test_inter_amr_vs_openfoam
                      TIMEOUT 900)
 
+# ...and a RAS TURBULENCE MODEL on a refining mesh, which is what RAS/motorBike needs before it can be
+# attempted. Its own script for the same reason the MRF one is: it stages RAS/damBreak (already turbulent,
+# already held statically by interfoam_ras_dambreak_vs_openfoam) plus one injected dynamicMeshDict, in two
+# profiles -- kEpsilon as shipped and the same case made kOmegaSST, which is the only one of the two that
+# builds a CELL wall distance.
+add_test(NAME interfoam_amr_ras_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_amr_ras_vs_openfoam.sh)
+set_tests_properties(interfoam_amr_ras_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_inter_amr_vs_openfoam
+                     TIMEOUT 1800)
+
 # ...and MRF on a refining mesh, which needs a DIFFERENT case and therefore its own script: the four
 # profiles above stage damBreakWithObstacle, whose fixedFluxPressure walls brae refuses MRF beside. It runs
 # the same test binary on laminar/mixerVessel2D with the `mrf` profile, and runs OpenFOAM TWICE -- the

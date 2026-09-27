@@ -986,6 +986,53 @@ void moveInterTurbulence(
 }
 
 
+void updateMeshInterTurbulence(
+    InterTurbulence&            t,
+    const PrimitiveMesh&        m,
+    const FvGeometry&           g,
+    const std::vector<FvPatch>& patches,
+    label                       timeIndex)
+{
+    if (!t.on) return;
+    // A TOPOLOGY CHANGE IS NOT A MOVE, and the difference is one line of OpenFOAM's. wallDist is a
+    // MeshObject<fvMesh, UpdateableMeshObject, wallDist> (wallDist.H:76-78), so a change calls its
+    // updateMesh(mapPolyMesh), which is
+    //
+    //     pdm_->updateMesh(mpm);
+    //     requireUpdate_ = true;      // "Force update if performing topology change"
+    //     movePoints();
+    //
+    // (wallDist.C:224-234). So the latch is FORCED before the schedule runs, where a plain move only sets
+    // it when the interval divides the step. With `updateInterval 2` and a change on an odd step OpenFOAM
+    // recomputes and a port that reused the move path alone would keep the STALE distance. The interval
+    // itself is still refused for want of a fixture (see moveInterTurbulence), so this line cannot be
+    // witnessed today -- it is transcribed because it is what the source says, and named here so the
+    // refusal above is the only thing standing between it and a gate.
+    t.wallDistRequireUpdate = true;
+    // ...and then exactly the move path, because everything else a change stales is the same thing a move
+    // stales: the LES filter width is a function of the cell volume, and the cell wall distance is a
+    // function of the geometry. What a change ALSO does -- resize them -- falls out of recomputing them
+    // from the new mesh rather than mapping them.
+    moveInterTurbulence(t, m, g, patches, timeIndex);
+
+    // THE NEAR-WALL DISTANCE the wall functions divide by needs NOTHING here, and that is worth stating
+    // rather than leaving as an absence. OpenFOAM keeps it as turbulenceModel::y_, a nearWallDist (a
+    // volScalarField::Boundary, NOT a MeshObject), and re-corrects it inside turbulenceModel::correct():
+    //
+    //     void Foam::turbulenceModel::correct()
+    //     {
+    //         if (mesh_.changing()) { y_.correct(); }
+    //     }
+    //
+    // (turbulenceModel.C:94-100). `changing()` is moving() OR topoChanging(), so a REFINING mesh
+    // re-corrects it -- the same dynamic()-is-not-moving() distinction that decided the Uf, correctUf and
+    // ddtCorr branches of this port. brae's host closures call nearWallDist(m, g, patches) fresh at every
+    // correct() (kEpsilon_cpp.cu:420, realizableKE_cpp.cu:142), which is that statement unconditionally,
+    // so nothing here has to resize or recompute it. THE DEVICE ARM CACHES IT (DeviceInterTurbulence::
+    // wallYBndFace) and does have to rebuild it -- see the device driver's change branch.
+}
+
+
 void correctInterTurbulence(
     InterTurbulence& t,
     const InterTurbulenceStepInput& in,

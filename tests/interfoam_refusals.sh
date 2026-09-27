@@ -307,6 +307,14 @@ arm mrf_empty               runs    -                        "" "printf '%s\n' '
 # refusals, so MRF + refinement + a fixedFluxPressure wall must still be refused by name.
 PRGHZG="python3 -c \"import re; p='0/p_rgh'; t=open(p).read(); t=t.replace('fixedFluxPressure','zeroGradient'); open(p,'w').write(t)\""
 arm mrf_refine              runs    -                        "" "$REFDICT '' > constant/dynamicMeshDict && $ZONE && $PRGHZG && ${MRFD/OMEGA/omega 10;}"
+# TURBULENCE BESIDE REFINEMENT RUNS NOW -- k, the second scalar and nut mapped, the two wall distances
+# recomputed -- and it is NOT armed here. This gate's base is laminar damBreak, and making it turbulent
+# needs 0/k, 0/epsilon, 0/nut, the closure's div entries and its solver entries: the whole recipe
+# tests/interfoam_amr_ras_vs_openfoam.sh already stages onto a case that ships them. That gate runs the
+# composition end to end on both arms and would fail loudly if the refusal came back, so an arm here would
+# duplicate its staging to assert less. What is still refused beside a change -- the closure under
+# CrankNicolson, and LES -- is refused on the SCHEME and on the STATE in inter_amr_cpp.cu, and the same
+# applies: a turbulent base is needed to reach either.
 arm mrf_refine_fixedFlux    refused "is a fixedFluxPressure"  "" "$REFDICT '' > constant/dynamicMeshDict && $ZONE && ${MRFD/OMEGA/omega 10;}"
 
 # THE PERMEABLE WALL is ported (tests/interfoam_permeable_vs_openfoam.sh). What it refuses, by name:

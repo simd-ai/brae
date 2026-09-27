@@ -340,6 +340,20 @@ void moveInterTurbulence(
     // interval. Threaded in rather than derived, because the closure has no clock of its own.
     label                       timeIndex);
 
+// ...AND THE MESH'S TOPOLOGY CHANGED, which is not the same call. wallDist is an UpdateableMeshObject, so
+// a change reaches wallDist::updateMesh (wallDist.C:224-234) and that FORCES its latch -- "Force update if
+// performing topology change" -- before running movePoints' schedule. So this sets requireUpdate and then
+// does the move path's work. The NEAR-WALL distance the wall functions use needs nothing on the host: it is
+// a nearWallDist that turbulenceModel::correct() re-corrects whenever mesh_.changing()
+// (turbulenceModel.C:94-100), and brae's host closures recompute it at every correct() unconditionally. The
+// fields themselves (k, the second scalar, nut and their old times) are mapped by the AMR adapter, not here.
+void updateMeshInterTurbulence(
+    InterTurbulence&            t,
+    const PrimitiveMesh&        m,
+    const FvGeometry&           g,
+    const std::vector<FvPatch>& patches,
+    label                       timeIndex);
+
 // The registry names OpenFOAM gives the closure's two CrankNicolson ddt0 fields: the OPERANDS' names,
 // so the model's and the density lineage's ("ddt0(rho,k)" / "ddt0(k)", "ddt0(rho,epsilon)" /
 // "ddt0(epsilon)" / "ddt0(omega)", and nothing second under LES kEqn). ONE place, because a RESTART

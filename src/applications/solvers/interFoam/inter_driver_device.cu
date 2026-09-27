@@ -2206,6 +2206,31 @@ RunReport runInterFoamDevice(
                             + ". A buffer at another mesh's size cannot be mapped.");
                     return true;
                 };
+                // THE TURBULENCE STATE FIRST, whole. On this arm the closure lives in device buffers and
+                // the HOST copy is whatever the build uploaded -- never updated, because nothing on this
+                // loop calls the host correct(). The mapper maps the HOST copy, so without this download a
+                // change would map the initial fields and hand them back as the step's. It brings k, the
+                // second scalar, nut, their patch values and the four old-time arrays.
+                if (f.turbulence.on && ready("turbulence k", dTurb.k.size(), nC))
+                {
+                    downloadDeviceInterTurbulence(dTurb, f.turbulence, fvp);
+                }
+                if (f.turbulence.on && std::getenv("BRAE_AMR_TRACE"))
+                {
+                    const auto mnmx = [](const std::vector<scalar>& v)
+                    {
+                        scalar lo = v.empty() ? scalar(0) : v[0], hi = lo;
+                        for (const scalar x : v) { lo = std::fmin(lo, x); hi = std::fmax(hi, x); }
+                        return std::pair<scalar, scalar>{lo, hi};
+                    };
+                    const auto kk = mnmx(f.turbulence.k.internal);
+                    const auto nn = mnmx(f.turbulence.nut.internal);
+                    std::printf("  [trace] DOWNLOADED before the change: k %zu [%.6g, %.6g]  nut %zu "
+                                "[%.6g, %.6g]  dTurb.k %zu  kOldStep %zu\n",
+                                f.turbulence.k.internal.size(), (double)kk.first, (double)kk.second,
+                                f.turbulence.nut.internal.size(), (double)nn.first, (double)nn.second,
+                                (std::size_t)dTurb.k.size(), f.turbulence.kOldStep.size());
+                }
                 if (ready("alpha", dA.size(), nC))          dA.copyTo(f.alpha1.internal);
                 if (ready("p_rgh", dPrgh.size(), nC))       dPrgh.copyTo(f.p_rgh.internal);
                 if (ready("nHatf", dNH.size(), nIf))        dNH.copyTo(f.nHatf.internal);
@@ -2283,12 +2308,31 @@ RunReport runInterFoamDevice(
                 if (ready("phi.oldTime's patches", dPhiOB.size(), nBf))
                     unflatten(dPhiOB, phiOldH.boundary);
 
+                // rho.oldTime() FOR THE CLOSURE, and it is the defect this unit's gate found. dRhoOld is
+                // captured at the TOP of the step from the previous step's dRho (above), i.e. BEFORE the
+                // change -- so after one it is still at the old cell count while every other closure input
+                // is at the new one. Nothing else reads it: the laminar path has no ddt(rho, k), so the
+                // buffer stayed at 2268 against a mesh of 2814 for as long as an adaptive turbulent case
+                // was refused. MEASURED, before this was carried: EVERY ONE of the 546 cells the change
+                // added (78 refined x 7 children) came out of the closure's first solve with k collapsed
+                // to 1.2e-12 where OpenFOAM's minimum is 0.0922, and nut followed it to 3.8e-25 against
+                // 9.06e-05 -- because the kernel read past the end of rhoOld for exactly those cells.
+                // It is CARRIED rather than recomputed from the mapped alpha.oldTime(), because OpenFOAM's
+                // rho.oldTime() is an autoMapped old-time level of a registered field and that is what the
+                // host arm hands the mapper too.
+                std::vector<scalar> rhoOldH;
+                if (deviceClosure && ready("rho.oldTime", dRhoOld.size(), nC))
+                {
+                    dRhoOld.copyTo(rhoOldH);
+                }
+
                 InterAmrOldTime oldT;
                 oldT.alphaOld = &aOldH;
                 oldT.UOld = &uOldH;
                 oldT.UOldBnd = &uOldBndH;
                 oldT.phiOld = &phiOldH;
                 oldT.UfOld = &UfOld;
+                oldT.rhoOld = rhoOldH.empty() ? nullptr : &rhoOldH;
 
                 // ---- AND THE CrankNicolson STATE, which on THIS arm lives in device buffers where the
                 // host loop keeps it in locals. Every level is a registered field in OpenFOAM and is
@@ -2442,7 +2486,7 @@ RunReport runInterFoamDevice(
                     // the solver's own rebuild, interFoam.C:118-142: gh and ghf, the flux from Sf & Uf
                     // and its pcorr solve, the mixture and the curvature. One copy, shared with the
                     // host loop, and the GAMG hierarchy un-built inside it.
-                    interAfterMeshChange(f, *mutableMesh, meshAgglomeration, meshCpc, rep);
+                    interAfterMeshChange(f, *mutableMesh, meshAgglomeration, meshCpc, rep, stepIndex);
 
                     // ---- the counts every array below is sized by
                     nC = m.nCells();
@@ -2472,6 +2516,63 @@ RunReport runInterFoamDevice(
                     buildPorosity();
                     // ...and the MRF zones, whose host face lists it has just REBUILT
                     buildMrf();
+                    // ...and the TURBULENCE closure, which is a FULL rebuild rather than the moving-mesh
+                    // refresh: refreshDeviceInterTurbulenceGeometry refuses a changed boundary-face count
+                    // by name ("A move keeps the topology fixed; this is a topology change"), and every
+                    // buffer here -- the fields, the wall-function masks, the per-face coefficients, the
+                    // two wall distances, the DILU level schedule -- is sized by the mesh. What a fresh
+                    // build does NOT carry is the closure's own old-time state, so it is restored from the
+                    // host arrays the mapper has just mapped, and oldStepTimeIndex with it: a fresh build
+                    // leaves that at -1, which would make the next step's advance take the COLD-START
+                    // branch and copy k into the old-old level mid-run.
+                    if (f.turbulence.on)
+                    {
+                        dTurb = buildDeviceInterTurbulence(f.turbulence, f.U, m, g, fvp);
+                        // THE OLD-TIME LEVELS ARE SET UNCONDITIONALLY, empty included, and that is not
+                        // tidiness. buildDeviceInterTurbulence does ONCE-PER-RUN RESTART WORK -- it calls
+                        // seedCnDdt0 twice and readClosureCnOldTime, which seed kOldStep and epsOldStep
+                        // from the START directory's `<field>_0` files (device_inter_turbulence.cu:355-365)
+                        // -- and it is being called MID-RUN here. Written as `if (!host.empty()) copyFrom`,
+                        // the result would depend on the ORDER of those two writes: correct only because
+                        // the restore happens to come second, and wrong at the FIRST change of a restarted
+                        // case, where the host array is empty and the seed is not. A start directory
+                        // holding `k_0` means a CrankNicolson restart, which is refused beside a change
+                        // twice over -- so this is unreachable today, and an invariant that rests on the
+                        // order of two lines is the kind this port keeps finding broken.
+                        dTurb.kOldStep.copyFrom(f.turbulence.kOldStep);
+                        dTurb.epsOldStep.copyFrom(f.turbulence.epsOldStep);
+                        dTurb.cnKOO.copyFrom(f.turbulence.cn.kOO);
+                        dTurb.cnEpsOO.copyFrom(f.turbulence.cn.epsOO);
+                        dTurb.oldStepTimeIndex = f.turbulence.oldStepTimeIndex;
+                        // ...and rho.oldTime(), which the mapper has just mapped through rhoOldH
+                        if (!rhoOldH.empty()) dRhoOld.copyFrom(rhoOldH);
+                        if (std::getenv("BRAE_AMR_TRACE"))
+                        {
+                            const auto mnmx = [](const std::vector<scalar>& v)
+                            {
+                                scalar lo = v.empty() ? scalar(0) : v[0], hi = lo;
+                                for (const scalar x : v) { lo = std::fmin(lo, x); hi = std::fmax(hi, x); }
+                                return std::pair<scalar, scalar>{lo, hi};
+                            };
+                            const auto kk = mnmx(f.turbulence.k.internal);
+                            const auto nn = mnmx(f.turbulence.nut.internal);
+                            std::vector<scalar> dk, dn;
+                            dTurb.k.copyTo(dk);
+                            dTurb.nut.copyTo(dn);
+                            const auto dkk = mnmx(dk);
+                            const auto dnn = mnmx(dn);
+                            std::printf("  [trace] ...and the DEVICE buffers after the rebuild: k %zu "
+                                        "[%.6g, %.6g]  nut %zu [%.6g, %.6g]\n",
+                                        dk.size(), (double)dkk.first, (double)dkk.second,
+                                        dn.size(), (double)dnn.first, (double)dnn.second);
+                            std::printf("  [trace] REBUILT after the change: host k %zu [%.6g, %.6g]  nut "
+                                        "%zu [%.6g, %.6g]  dTurb.k %zu nut %zu yCell %zu\n",
+                                        f.turbulence.k.internal.size(), (double)kk.first, (double)kk.second,
+                                        f.turbulence.nut.internal.size(), (double)nn.first, (double)nn.second,
+                                        (std::size_t)dTurb.k.size(), (std::size_t)dTurb.nut.size(),
+                                        f.turbulence.yCell.size());
+                        }
+                    }
                     buildBoundaryMasks();
                     dAFixes.copyFrom(aFixes);
                     dAFlag.copyFrom(aFlag);
@@ -2769,7 +2870,35 @@ RunReport runInterFoamDevice(
                     ti.cn = &cnClock;
                     ti.rhoOO = &dRhoOO;
                 }
+                if (std::getenv("BRAE_AMR_TRACE"))
+                {
+                    // EVERY MESH-SIZED INPUT THE CLOSURE IS HANDED, BY SIZE, and this line is what named
+                    // the rho.oldTime() defect above: one entry read 2268 where every other read 2814, and
+                    // 546 of 2814 cells -- every cell the change had added -- came out of the solve with k
+                    // collapsed. A buffer left at the old count looks like nothing else from inside a
+                    // kernel, and it is cheaper to print the sizes than to bisect the arithmetic.
+                    const auto sz = [](const DeviceBuffer<scalar>* b) { return b ? (long)b->size() : -1L; };
+                    std::printf("  [trace] closure inputs at step %ld (nC %ld nIf %ld nBf %ld): Ux %ld "
+                                "phiInt %ld phiBnd %ld rhoPhiInt %ld rho %ld rhoBnd %ld rhoOld %ld nu %ld "
+                                "nuBnd %ld k %ld eps %ld nut %ld nutBnd %ld\n",
+                                (long)stepIndex, (long)nC, (long)nIf, (long)nBf,
+                                sz(ti.Ux), sz(ti.phiInt), sz(ti.phiBnd), sz(ti.rhoPhiInt), sz(ti.rho),
+                                sz(ti.rhoBnd), sz(ti.rhoOld), sz(ti.nu), sz(ti.nuBnd),
+                                (long)dTurb.k.size(), (long)dTurb.epsilon.size(),
+                                (long)dTurb.nut.size(), (long)dTurb.nutBnd.size());
+                }
                 deviceCorrectInterTurbulence(dTurb, f.turbulence, ti, dm, dbU);
+                if (std::getenv("BRAE_AMR_TRACE"))
+                {
+                    std::vector<scalar> tk, tn;
+                    dTurb.k.copyTo(tk);
+                    dTurb.nut.copyTo(tn);
+                    scalar klo = tk.empty() ? 0 : tk[0], khi = klo, nlo = tn.empty() ? 0 : tn[0], nhi = nlo;
+                    for (const scalar x : tk) { klo = std::fmin(klo, x); khi = std::fmax(khi, x); }
+                    for (const scalar x : tn) { nlo = std::fmin(nlo, x); nhi = std::fmax(nhi, x); }
+                    std::printf("  [trace] after correct() at step %ld: k [%.6g, %.6g]  nut [%.6g, %.6g]\n",
+                                (long)stepIndex, (double)klo, (double)khi, (double)nlo, (double)nhi);
+                }
             }
             // ...or THE HOST CLOSURE in the same loop. f.U is current (the step's last updateUBoundary
             // wrote it, patches included) and so are f.rho, f.nu and f.nuBnd (the hooks'); phi's interior

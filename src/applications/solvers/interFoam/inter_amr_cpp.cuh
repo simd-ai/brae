@@ -164,7 +164,12 @@ void interAfterMeshChange(
     const MutableMesh&        mm,
     GamgAgglomerationCache&   gamgCache,
     const CorrectPhiControls& cpc,
-    RunReport&                rep);
+    RunReport&                rep,
+    // the step being taken, which the TURBULENCE recompute needs: wallDist's schedule tests it modulo the
+    // interval (wallDist.C:198). REQUIRED rather than defaulted or stashed on the AMR state -- a stashed
+    // index is right only while every caller runs interAmrUpdate immediately before this, and that is the
+    // kind of invariant this port keeps finding broken.
+    label                     timeIndex);
 
 } // namespace interFoam
 } // namespace cpu
