@@ -298,6 +298,16 @@ arm mrf_omegaTable          refused "Function1 of type \`table\`" "" "$ZONE; ${M
 arm mrf_noOmega             refused "has no \`omega\` entry"  "" "$ZONE; ${MRFD/OMEGA/}"
 arm mrf_inactive            runs    -                        "" "printf '%s\nMRF1 { cellZone all; active no; origin (0 0 0); axis (0 0 1); omega 10; }\n' '$HDR' > constant/MRFProperties"
 arm mrf_empty               runs    -                        "" "printf '%s\n' '$HDR' > constant/MRFProperties"
+# MRF BESIDE REFINEMENT, both directions. The zone's face lists are REBUILT through a change now
+# (MRF::update, mirroring MRFZone::update -> setMRFFaces), gated end to end by
+# tests/interfoam_amr_mrf_vs_openfoam.sh on mixerVessel2D -- so the refusal that named this case is gone
+# and the arm that replaces it is a `runs`. damBreak's own p_rgh walls are fixedFluxPressure, which brae
+# refuses MRF beside for a reason of its own, so the running arm has to take those out; and the SECOND arm
+# is the composition risk that matters -- a refinement path must not become a way AROUND the other MRF
+# refusals, so MRF + refinement + a fixedFluxPressure wall must still be refused by name.
+PRGHZG="python3 -c \"import re; p='0/p_rgh'; t=open(p).read(); t=t.replace('fixedFluxPressure','zeroGradient'); open(p,'w').write(t)\""
+arm mrf_refine              runs    -                        "" "$REFDICT '' > constant/dynamicMeshDict && $ZONE && $PRGHZG && ${MRFD/OMEGA/omega 10;}"
+arm mrf_refine_fixedFlux    refused "is a fixedFluxPressure"  "" "$REFDICT '' > constant/dynamicMeshDict && $ZONE && ${MRFD/OMEGA/omega 10;}"
 
 # THE PERMEABLE WALL is ported (tests/interfoam_permeable_vs_openfoam.sh). What it refuses, by name:
 PERMU="python3 -c \"import re; p='0/U'; t=open(p).read(); t=re.sub(r'rightWall\\s*\\{[^}]*\\}', 'rightWall { type permeableAlphaPressureInletOutletVelocity; alpha alpha.water; alphaMin 0.01; PHI value uniform (0 0 0); }', t, count=1); open(p,'w').write(t)\""

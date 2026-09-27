@@ -9,7 +9,9 @@
 // THE CONTROL is OpenFOAM's own answer with the zone `active no` at the same instant: the fluid then
 // never moves, so a brae that ignored MRFProperties -- which it once did, silently -- sits on it.
 //
-// THE DEVICE LOOP MUST REFUSE the case, naming MRF.
+// THE DEVICE LOOP RUNS the case -- all four MRF calls are ported there (see the script's header for the
+// measured bounds and the five broken-once figures). It said "MUST REFUSE, naming MRF" until that landed,
+// while this very file already called runInterFoamDevice.
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"

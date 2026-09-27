@@ -30,8 +30,11 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <exception>
 #include <fstream>
+#include <iterator>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -143,6 +146,35 @@ std::vector<Selected> readOfSelections(const std::string& logPath)
         s.V = static_cast<scalar>(std::atof(line.c_str() + b + kVol.size()));
         out.push_back(s);
     }
+    return out;
+}
+
+// OPENFOAM'S OWN RENUMBERED cellZone, which is the sharpest oracle in this whole gate and exists only
+// because a topoChanging mesh writes its polyMesh into every time directory -- cellZones with it. So the
+// zone a change produced is not inferred from a printed count, as the fvOptions profile has to do: it is
+// read back cell by cell from the file OpenFOAM wrote. `name` empty takes the FIRST zone.
+std::vector<label> readOfCellZone(const std::string& polyMeshDir, const std::string& name)
+{
+    std::vector<label> out;
+    std::ifstream in(polyMeshDir + "/cellZones");
+    if (!in) return out;
+    std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    // past the FoamFile block, then the named sub-dictionary, then its cellLabels list
+    std::size_t i = text.find('}');
+    i = (i == std::string::npos) ? 0 : i + 1;
+    if (!name.empty())
+    {
+        i = text.find(name, i);
+        if (i == std::string::npos) return out;
+    }
+    const std::size_t k = text.find("cellLabels", i);
+    if (k == std::string::npos) return out;
+    const std::size_t lp = text.find('(', k);
+    const std::size_t rp = text.find(')', lp);
+    if (lp == std::string::npos || rp == std::string::npos) return out;
+    std::istringstream body(text.substr(lp + 1, rp - lp - 1));
+    label c = 0;
+    while (body >> c) out.push_back(c);
     return out;
 }
 
@@ -264,6 +296,10 @@ int main(
     const label nSteps = static_cast<label>(std::atol(argv[4]));
     const std::string logPath = argv[5];
     const std::string profile = argv[6];
+    // OPTIONAL: the time directory of a SECOND OpenFOAM run of the same case with ONE VALUE of the initial
+    // state perturbed by ONE ULP. It is not a comparison arm -- it is how a bound gets a justification on
+    // a case that AMPLIFIES, and this one does: see the mrf block below.
+    const std::string ulpDir = (argc > 7) ? argv[7] : std::string();
     std::printf("  profile: %s\n", profile.c_str());
 
     // THE BOUNDS ARE PER PROFILE AND ARE THE MEASURED AGREEMENT, each a little above what the run reads.
@@ -290,6 +326,19 @@ int main(
         // 2.3205e-13 the same run passes on -- reads 2.2560e-12 relative. On the open profile the same
         // patch reaches 1.7e-03 and the same class of round-off reads 8.3203e-14.
         scalar patchU;
+        // THE CONTINUITY ERROR AS AN ABSOLUTE FLOOR, where 0 keeps the relative comparison. A relative
+        // comparison of two numbers that are both at the CANCELLATION FLOOR measures nothing: with every
+        // solve pinned to 1e-14 the mrf profile's pcorr drives sum-local continuity to 5.736483e-18 in
+        // brae and 5.687700e-18 in OpenFOAM, whose relative difference is 8.6e-03 and says only that two
+        // numbers eighteen orders below the field disagree in their last digits. The statement worth
+        // asserting there is the absolute one -- both codes end divergence-free -- so the profile sets
+        // this and the relative is printed beside it.
+        scalar contErrAbs;
+        // the DEVICE arm's U floor, relative, against OpenFOAM and against the host arm. These were a
+        // hardcoded 1e-12, which is right for a case at the floating-point floor and wrong for one that
+        // amplifies: the mrf profile reads 4.0190e-09 and 5.7751e-09, both INSIDE the envelope OpenFOAM's
+        // own one-ulp twin draws (8.6395e-09), and a hardcoded bound cannot say that.
+        scalar devU, hostDevU;
     };
     //   cn      7.7716e-15 alpha, 7.3e-15 p_rgh, 4.5e-13 U, 2.7e-14 p, 6.9e-12 rAU, 1.2e-13 phi
     //   and the cn profile's DEVICE arm: alpha 2.1982e-14 from OpenFOAM and 2.2714e-14 from the host,
@@ -297,21 +346,25 @@ int main(
     const bool closed = (profile == "closed");
     const bool cn = (profile == "cn");
     const bool porosity = (profile == "porosity");
+    const bool mrf = (profile == "mrf");
     //   porosity 1.5190e-14 alpha, 1.2e-14 p_rgh, 3.1e-13 U, 7.5e-15 p, 1.5e-11 rAU, 2.2e-13 phi,
     //   2.3e-13 Uf, 2.5e-11 contErr -- three steps with an explicitPorositySource over a cellZone, whose
     //   re-selection is what this profile exists to measure; and its DEVICE arm: alpha 1.6986e-14 from
     //   OpenFOAM and 2.2773e-14 from the host, p_rgh 1.3737e-14 and 1.8231e-14, U 3.5e-13, phi 2.9e-13
     const Bounds B = closed
         ? Bounds{5e-14, 1e-14, 1e-12, 1e-13, 1e-11, 5e-12, 1e-12, 1e-9, 5e-14, 1e-12, 1e-14, 5e-12,
-                 1e-14, 1e-14, 1e-12}
+                 1e-14, 1e-14, 1e-12, 0, 1e-12, 1e-12}
         : cn
         ? Bounds{1e-14, 1e-14, 1e-12, 1e-13, 1e-11, 1e-12, 1e-12, 1e-9, 5e-14, 1e-12, 5e-14, 1e-12,
-                 5e-14, 5e-14, 1e-12}
+                 5e-14, 5e-14, 1e-12, 0, 1e-12, 1e-12}
         : porosity
         ? Bounds{5e-14, 5e-14, 1e-12, 1e-13, 5e-11, 1e-12, 1e-12, 1e-9, 5e-14, 1e-12, 5e-14, 1e-12,
-                 5e-14, 5e-14, 5e-12}
+                 5e-14, 5e-14, 5e-12, 0, 1e-12, 1e-12}
+        : mrf
+        ? Bounds{1e-10, 5e-09, 1e-08, 5e-09, 5e-10, 1e-09, 1e-08, 0, 1e-10, 1e-09, 1e-10, 1e-09,
+                 1e-08, 1e-08, 1e-12, 1e-15, 1e-08, 1e-08}
         : Bounds{5e-15, 1e-14, 1e-12, 1e-13, 1e-11, 1e-12, 1e-12, 1e-9, 5e-15, 1e-12, 5e-15, 1e-12,
-                 1e-14, 1e-14, 1e-12};
+                 1e-14, 1e-14, 1e-12, 0, 1e-12, 1e-12};
 
     Arm A;
     runArm(A, caseDir, startDir, nSteps);
@@ -477,8 +530,17 @@ int main(
         {
             const scalar rel = std::fabs(ce.sumLocal - ofCe.back())/std::fmax(ofCe.back(), scalar(1e-300));
             std::printf("  ...relative difference %.4e\n", (double)rel);
-            check("the final flux carries OpenFOAM's own continuity error to 1e-9 relative",
-                  rel < B.contErr);
+            if (B.contErrAbs > scalar(0))
+            {
+                check("BOTH codes end divergence-free to this profile's absolute floor, which is the only "
+                      "statement a relative comparison of two cancellation-floor numbers could not make",
+                      std::fabs(ce.sumLocal) < B.contErrAbs && std::fabs(ofCe.back()) < B.contErrAbs);
+            }
+            else
+            {
+                check("the final flux carries OpenFOAM's own continuity error to 1e-9 relative",
+                      rel < B.contErr);
+            }
         }
     }
 
@@ -676,6 +738,174 @@ int main(
         }
     }
 
+    // ---- MRF THROUGH A CHANGE, on the mrf profile. TWO ORACLES, and the first is the sharper of the
+    // two because it does not go through a solve at all: a topoChanging mesh writes its polyMesh into
+    // every time directory, cellZones among them, so OpenFOAM's OWN RENUMBERED ZONE is on disk and the
+    // comparison is cell by cell. The fvOptions profile had to read a printed count off a log line;
+    // MRFZone prints nothing at all (it has no Info<< of its own), and this is better than one anyway.
+    if (mrf)
+    {
+        const std::vector<label> ofZone = readOfCellZone(ofDir + "/polyMesh", "");
+        const std::vector<label> ofZone0 = readOfCellZone(caseDir + "/constant/polyMesh", "");
+        check("OpenFOAM wrote a cellZone into its time directory to compare against", !ofZone.empty());
+        check("the case carries a cellZone at construction", !ofZone0.empty());
+        check("brae kept a zone of that name", !A.f.cellZones.empty());
+        if (!ofZone.empty() && !A.f.cellZones.empty())
+        {
+            const std::vector<label>& mine = A.f.cellZones.begin()->second;
+            std::printf("  the zone `%s`: OpenFOAM %ld cells at t = %.10g, brae %ld (it started at %ld "
+                        "on %ld cells, and the mesh is %ld now)\n",
+                        A.f.cellZones.begin()->first.c_str(), (long)ofZone.size(), (double)A.r.time,
+                        (long)mine.size(), (long)ofZone0.size(),
+                        (long)readOfCellZone(caseDir + "/constant/polyMesh", "").size(), (long)nC);
+            // THE FIXTURE MUST BE ABLE TO WITNESS, and for this unit that is not "the mesh refined" but
+            // "the MRF ZONE ITSELF refined". A zone away from the refinement band would be carried by
+            // doing nothing, and the control below would pass.
+            check("the MRF zone GREW through the change, so this profile can witness the carry",
+                  ofZone.size() > ofZone0.size());
+            check("brae's zone has OpenFOAM's own cell count", mine.size() == ofZone.size());
+            if (mine.size() == ofZone.size())
+            {
+                std::size_t wrong = 0;
+                label firstWrong = -1;
+                for (std::size_t i = 0; i < mine.size(); ++i)
+                {
+                    if (mine[i] == ofZone[i]) continue;
+                    if (!wrong) firstWrong = static_cast<label>(i);
+                    ++wrong;
+                }
+                if (wrong)
+                {
+                    std::printf("  ...%ld of %ld labels differ, first at %ld (brae %ld, OpenFOAM %ld)\n",
+                                (long)wrong, (long)mine.size(), (long)firstWrong,
+                                (long)mine[static_cast<std::size_t>(firstWrong)],
+                                (long)ofZone[static_cast<std::size_t>(firstWrong)]);
+                }
+                check("...and EVERY ONE of its labels, cell by cell, is OpenFOAM's", wrong == 0);
+            }
+            // resetZones walks the per-cell zone id ASCENDING (polyTopoChange.C:1900-1925), so the list
+            // OpenFOAM writes is sorted -- and a port that appended each parent's children after the
+            // parent would match the COUNT and not the order.
+            check("OpenFOAM's own carried zone is ascending, which is what makes the order comparable",
+                  std::is_sorted(ofZone.begin(), ofZone.end()));
+            check("...and brae's is too", std::is_sorted(mine.begin(), mine.end()));
+        }
+        // THE MRF FACE LISTS the zone rebuild exists for, printed so the arm says what it covers: a zone
+        // carried with the right cells but stale face lists is exactly what the control below is.
+        if (!A.f.mrfZones.empty())
+        {
+            const cpu::MRF::Zone& z = A.f.mrfZones.front();
+            std::size_t inc = 0, exc = 0;
+            for (const std::vector<label>& v : z.includedFaces) inc += v.size();
+            for (const std::vector<label>& v : z.excludedFaces) exc += v.size();
+            std::printf("  the rebuilt face lists: %ld internal, %ld included, %ld excluded on %ld cells "
+                        "(the mesh has %ld internal faces)\n", (long)z.internalFaces.size(), (long)inc,
+                        (long)exc, (long)z.cells.size(), (long)nIF);
+            check("the zone's internal-face list is inside the NEW mesh's face range",
+                  z.internalFaces.empty() || z.internalFaces.back() < nIF);
+            check("the zone moves faces with the frame, so makeRelative and zeroFilter have work to do",
+                  !z.internalFaces.empty() && inc > 0);
+        }
+        // THE CONTROL: keep the face lists the zone was built with, which is the port that does not throw.
+        setenv("BRAE_CONTROL_AMR_NO_MRF_UPDATE", "1", 1);
+        Arm K;
+        runArm(K, caseDir, startDir, nSteps);
+        unsetenv("BRAE_CONTROL_AMR_NO_MRF_UPDATE");
+        const Diff cA = compare(K.f.alpha1.internal, ofAlpha);
+        const Diff cU = compare(K.f.U.internal, ofU);
+        const Diff cP = compare(K.f.p_rgh.internal, ofPrgh);
+        std::printf("  CONTROL (the MRF face lists kept, not rebuilt): alpha %.4e, U rel %.4e, "
+                    "p_rgh rel %.4e\n", (double)cA.linf, (double)cU.rel(), (double)cP.rel());
+        check("...the control ran every step", K.r.steps == nSteps);
+        check("...and is caught: its alpha is a million times further out than the gate's",
+              cA.linf > scalar(1e6)*std::fmax(dAlpha.linf, scalar(1e-300)));
+        check("...and its U, which is what the frame drives", cU.rel() > scalar(1e6)*std::fmax(dU.rel(), scalar(1e-300)));
+        // ...AND THE SAME CONTROL ON THE DEVICE ARM, which is a separate rebuild and needs its own
+        // fail-proof. The host control alone would leave the device half covered by nothing but a
+        // device-vs-host bound -- and a device that never rebuilt its zones would still track a host that
+        // never rebuilt its own, so that bound cannot witness the thing this unit ported. The device zones
+        // are built from the host zones, so this control reaches both, and the arm says which one it is.
+        setenv("BRAE_CONTROL_AMR_NO_MRF_UPDATE", "1", 1);
+        Arm KD;
+        runArm(KD, caseDir, startDir, nSteps, /*onDevice=*/true);
+        unsetenv("BRAE_CONTROL_AMR_NO_MRF_UPDATE");
+        const Diff cdA = compare(KD.f.alpha1.internal, ofAlpha);
+        const Diff cdU = compare(KD.f.U.internal, ofU);
+        std::printf("  CONTROL on the DEVICE arm: alpha %.4e, U rel %.4e\n",
+                    (double)cdA.linf, (double)cdU.rel());
+        check("...the device control ran every step", KD.r.steps == nSteps);
+        check("...and the DEVICE arm is caught on it too, so its rebuild is proven and not inferred",
+              cdA.linf > scalar(1e6)*std::fmax(dAlpha.linf, scalar(1e-300)));
+    }
+
+    // ---- WHAT THE BOUNDS ABOVE ARE, on a case that AMPLIFIES. The mrf profile's bounds are 1e-09, not
+    // 1e-14, and a bound that loose has to be justified by something other than the code that has to meet
+    // it. So the gate is handed a SECOND OpenFOAM run of the same case with ONE cell of the initial
+    // alpha.water perturbed by ONE ULP, and compares OpenFOAM to ITSELF.
+    //
+    // MEASURED on the mrf profile, OpenFOAM against itself at one ulp (1.11e-16 on one cell):
+    //     t        alpha       p_rgh rel    U rel        phi rel      Uf rel
+    //     1 step   1.11e-16    0.00e+00     0.00e+00     0.00e+00     0.00e+00
+    //     2 steps  1.11e-16    2.13e-14     8.80e-15     1.29e-15     5.73e-15
+    //     3 steps  1.11e-15    6.10e-10     2.32e-10     2.80e-11     2.50e-10
+    //     4 steps  1.85e-12    3.96e-09     2.29e-09     2.99e-10     2.66e-09
+    // -- four orders between step 2 and step 3, which is the step whose change first gives pcorr real
+    // work (183 iterations at initial residual 1, where the first two solve nothing). brae at four steps
+    // reads p_rgh 2.58e-09 against that 3.96e-09: CLOSER TO OPENFOAM THAN OPENFOAM'S OWN ONE-ULP TWIN.
+    // ...AND IT IS MANDATORY ON THE mrf PROFILE, because that profile's bounds are five orders looser than
+    // every other one's ON THE STRENGTH OF THIS ARM. With the argument optional, six arguments asserted
+    // 1e-09 with nothing behind it and the whole gate went green.
+    check("the mrf profile was handed its one-ulp twin, which is the only thing justifying its bounds",
+          !mrf || !ulpDir.empty());
+    if (!ulpDir.empty())
+    {
+        const std::vector<scalar> uA = cellValues(readField<scalar>(ulpDir + "/" + A.f.alphaName), nC);
+        const std::vector<scalar> uP = cellValues(readField<scalar>(ulpDir + "/p_rgh"), nC);
+        const std::vector<vector> uU = cellValues(readField<vector>(ulpDir + "/U"), nC);
+        const bool sized = uA.size() == ofAlpha.size() && uP.size() == ofPrgh.size()
+                        && uU.size() == ofU.size();
+        check("the one-ulp twin is on the same mesh as the oracle", sized);
+        if (sized)
+        {
+            const Diff eA = compare(uA, ofAlpha);
+            const Diff eP = compare(uP, ofPrgh);
+            const Diff eU = compare(uU, ofU);
+            std::printf("  OpenFOAM against ITSELF at one ulp: alpha %.4e   p_rgh rel %.4e   U rel %.4e\n",
+                        (double)eA.linf, (double)eP.rel(), (double)eU.rel());
+            std::printf("  ...brae is %.2fx that on alpha, %.2fx on p_rgh, %.2fx on U\n",
+                        (double)(dAlpha.linf/std::fmax(eA.linf, scalar(1e-300))),
+                        (double)(dPrgh.rel()/std::fmax(eP.rel(), scalar(1e-300))),
+                        (double)(dU.rel()/std::fmax(eU.rel(), scalar(1e-300))));
+            // THE FIXTURE MUST BE ABLE TO WITNESS ITS OWN BOUND. If one ulp did NOT amplify here, these
+            // bounds would be slack rather than the case's conditioning, and this arm says which.
+            check("the case AMPLIFIES: one ulp of OpenFOAM's own input moves its p_rgh by more than 1e-10, "
+                  "so this profile's bounds are the case's conditioning and not slack",
+                  eP.rel() > scalar(1e-10));
+            // ...and the statement the bound is worth: brae is INSIDE the envelope OpenFOAM's own
+            // round-off draws, asserted at 1x rather than at a factor, because a factor would be a
+            // tolerance and this is a comparison.
+            //
+            // IT IS ASSERTED ON p_rgh AND U AND NOT ON alpha, and that is measured rather than chosen. The
+            // two curves CROSS: brae's distance starts at its own 160-iteration PCG floor and the twin's
+            // starts at one ulp in one cell, so the twin is BELOW brae early and overtakes it as the case
+            // amplifies. Measured on this fixture, brae as a multiple of the twin:
+            //     steps   alpha   p_rgh    U
+            //     1       0.00x   18.15x   242.06x
+            //     2       4.34x   0.82x    0.86x
+            //     3       0.58x   0.68x    0.83x
+            //     4       0.69x   0.48x    0.64x
+            // The amplification assertion above pins the regime -- at one step the twin's p_rgh is 1.78e-14
+            // and that check fails, which is the correct answer, because there the 1e-09 bounds WOULD be
+            // slack. Inside the regime p_rgh and U are below 1x at every step; alpha is NOT (4.34x at two
+            // steps, and non-monotone because brae's own alpha is exactly 0 at one step). So alpha is held
+            // by its ABSOLUTE bound instead (1e-10, measured 7.87e-11) and its ratio is printed, not
+            // asserted -- an assertion that happens to hold at the step count someone picked is not one.
+            check("brae is no further from OpenFOAM than OpenFOAM's own one-ulp twin, on p_rgh",
+                  dPrgh.rel() <= eP.rel());
+            check("...and on U", dU.rel() <= eU.rel());
+        }
+    }
+
     // ---- THE DEVICE ARM. The mesh change is HOST work on either loop -- topology surgery and six
     // integer maps -- so what this measures is the round trip: every mesh-sized buffer down to the
     // host, the change, and every one of them back up on a DeviceMesh rebuilt from scratch. A buffer
@@ -705,7 +935,7 @@ int main(
             // OpenFOAM above, so a device number is the device's own distance.
             check("the device's alpha is at this profile's floor from OpenFOAM's", dvA.linf < B.devAlpha);
             check("the device's p_rgh is at this profile's floor, relative", dvP.rel() < B.devPRgh);
-            check("the device's U is within 1e-12 relative", dvU.rel() < scalar(1e-12));
+            check("the device's U is at this profile's floor, relative", dvU.rel() < B.devU);
             check("the device's phi is at this profile's floor, relative", dvPhi.rel() < B.devPhi);
             // ...and against the HOST arm, which is the sharper of the two: both loops run the same
             // host mapper and the same host pcorr, so what is left between them is the device's own
@@ -713,7 +943,7 @@ int main(
             check("the device is at this profile's floor from the host arm's alpha", hvA.linf < B.hostDevAlpha);
             check("the device is at this profile's floor from the host arm's p_rgh",
                   hvP.rel() < B.hostDevPRgh);
-            check("the device is within 1e-12 of the host arm's U", hvU.rel() < scalar(1e-12));
+            check("the device is at this profile's floor from the host arm's U", hvU.rel() < B.hostDevU);
             check("the device is at this profile's floor from the host arm's phi", hvPhi.rel() < B.hostDevPhi);
         }
         // ...AND THE SAME ARM TWICE IN ONE PROCESS, which is the detector for a cache keyed on a

@@ -1,3 +1,5 @@
+#include <stdexcept>
+#include <string>
 #include "device_MRF.cuh"
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -129,6 +131,29 @@ DeviceMRFZone buildDeviceMRFZone(
     return d;
 }
 
+namespace {
+
+// A ZONE WHOSE ARRAYS ARE NOT THE CURRENT MESH'S IS A MISSED REBUILD, and it must say so rather than
+// half-apply itself. deviceMrfMakeRelative used to carry `if (nB && nB == phiBnd.size())` -- a SILENT SKIP
+// of the boundary half, with the internal half launched unguarded beside it -- so a zone left over from
+// before a topology change would subtract the frame flux on the wrong internal faces and do nothing at all
+// on the boundary, with no message. That is the same shape as the porosity cell list uploaded once before
+// the time loop, which cost a measured alpha 1.4218e-02 before it was found by comparing against a control.
+// FAIL-PROOF, 2026-09-27: with buildMrf() taken out of interFoam's device change branch, the mrf profile's
+// device arm now stops at the FIRST change with "deviceMrfCoriolisZone: this MRF zone's per-cell mask is
+// 3072 where the field is 3660" instead of running to completion on the wrong faces.
+void requireCurrent(const char* who, const char* what, std::size_t have, std::size_t want)
+{
+    if (have == want) return;
+    throw std::runtime_error(
+        std::string("brae ") + who + ": this MRF zone's " + what + " is " + std::to_string(have)
+        + " where the field is " + std::to_string(want) + ". The zone was built for a different mesh, so a "
+        "topology change did not rebuild it (buildDeviceMRFZone from the host zone MRF::update rebuilt). "
+        "Refused rather than apply the frame to the wrong faces.");
+}
+
+} // namespace
+
 void deviceMrfCoriolisZone(
     const std::vector<DeviceMRFZone>& zones,
     const DeviceBuffer<scalar>&       V,
@@ -143,6 +168,7 @@ void deviceMrfCoriolisZone(
         if (!z.active) continue;
         const int n = static_cast<int>(z.zoneCell.size());
         if (!n) continue;
+        requireCurrent("deviceMrfCoriolisZone", "per-cell mask", z.zoneCell.size(), V.size());
         mrfCoriolisKernel<<<nBlocks(n), TPB>>>(n, z.zoneCell.data(), V.data(),
                                                Ux.data(), Uy.data(), Uz.data(),
                                                z.Omega.x, z.Omega.y, z.Omega.z, cmpt, src.data());
@@ -160,6 +186,8 @@ void deviceMrfZeroFilter(
         if (!z.active) continue;
         const int nIf = static_cast<int>(z.filterInt.size());
         const int nBf = static_cast<int>(z.filterBnd.size());
+        requireCurrent("deviceMrfZeroFilter", "internal filter", z.filterInt.size(), phiInt.size());
+        requireCurrent("deviceMrfZeroFilter", "boundary filter", z.filterBnd.size(), phiBnd.size());
         if (nIf) mrfZeroKernel<<<nBlocks(nIf), TPB>>>(nIf, z.filterInt.data(), phiInt.data());
         if (nBf) mrfZeroKernel<<<nBlocks(nBf), TPB>>>(nBf, z.filterBnd.data(), phiBnd.data());
     }
@@ -175,11 +203,13 @@ void deviceMrfMakeRelative(
         if (!z.active) continue;
         const int nIf = static_cast<int>(z.frameFluxInt.size());
         const int nB  = static_cast<int>(z.frameFluxBnd.size());
+        requireCurrent("deviceMrfMakeRelative", "internal frame flux", z.frameFluxInt.size(), phiInt.size());
+        requireCurrent("deviceMrfMakeRelative", "boundary frame flux", z.frameFluxBnd.size(), phiBnd.size());
         if (nIf)
         {
             mrfSubtractKernel<<<nBlocks(nIf), TPB>>>(nIf, z.frameFluxInt.data(), phiInt.data());
         }
-        if (nB && nB == static_cast<int>(phiBnd.size()))
+        if (nB)
         {
             mrfBoundaryKernel<<<nBlocks(nB), TPB>>>(nB, z.frameFluxBnd.data(), z.zeroBnd.data(),
                                                     phiBnd.data());

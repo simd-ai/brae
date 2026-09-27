@@ -34,10 +34,14 @@ void refuseUnmappedState(const InterFields& f)
         throw std::runtime_error(
             std::string(WHO) + "the case has wave boundary conditions, whose per-patch models hold their "
             "own state and are not carried through a mesh change.");
-    if (!f.mrfZones.empty())
+    // MRF IS CARRIED NOW (interAfterMeshChange calls MRF::update), so the refusal that stood here is
+    // gone. What remains is the one thing the carry cannot supply: a zone whose spec was not kept, which
+    // would leave the rebuild nothing to rebuild from and is a caller error rather than a case's.
+    if (f.mrfZones.size() != f.mrfSpecs.size())
         throw std::runtime_error(
-            std::string(WHO) + "the case has " + std::to_string(f.mrfZones.size()) + " MRF zone(s), each "
-            "resolved against the OLD cell numbering. A change would leave them naming other cells.");
+            std::string(WHO) + "the case has " + std::to_string(f.mrfZones.size()) + " MRF zone(s) but "
+            + std::to_string(f.mrfSpecs.size()) + " kept spec(s). A change rebuilds each zone's face "
+            "lists from its own spec (MRFZone::update, MRFZone.C:598-604) and cannot do it from none.");
     // A SECOND LINE OF DEFENCE ONLY. buildInterFields sets f.dynamicMesh to null for every adaptive case
     // (inter_case_cpp.cu), so this cannot fire on the case it names; the refusal that does is in
     // readInterAmr, which reads the dictionary's own `solvers` entry. Kept because a future caller that
@@ -795,6 +799,67 @@ void interAfterMeshChange(
         else
         {
             fvOptions::reselect(f.fvOptions, f.cellZones, polyMeshDir);
+        }
+    }
+
+    // THE MRF ZONES ARE REBUILT, for the same reason and from the same live cellZones. OpenFOAM's
+    // MRFZoneList::update() is guarded on mesh.topoChanging() and calls each zone's update(), which calls
+    // setMRFFaces() AND NOTHING ELSE (MRFZoneList.C:441-450, MRFZone.C:598-604) -- so the dictionary is
+    // not re-read, omega is not re-evaluated and cellZoneID_ is not re-found. Everything buildZone
+    // computes past the spec's three scalars IS setMRFFaces, so a rebuild from the kept spec against the
+    // renumbered zone is that function, exactly.
+    //
+    // IT HAS TO SIT AFTER THE PATCHES ARE ASSIGNED IN PLACE (above), not merely after the zones are
+    // renumbered: setMRFFaces reads each patch's faceCells and size to sort the boundary faces into the
+    // included and excluded lists, and a refined patch has more faces than the one the zone was built on.
+    if (!f.mrfZones.empty())
+    {
+        // A GATE'S CONTROL: keep the face lists the zone was built with. That is the plausible wrong port
+        // -- nothing throws, every index is in range, and the frame's flux is removed from an EIGHTH of
+        // the zone's faces wherever the zone was refined, while the Coriolis source lands on an eighth of
+        // its cells.
+        if (std::getenv("BRAE_CONTROL_AMR_NO_MRF_UPDATE"))
+        {
+            // A CONTROL MAY BE WRONG; IT MAY NOT BE UNDEFINED. The kept lists hold the OLD mesh's cell
+            // and face indices, and the consumers walk those lists rather than the mesh -- inter_peqn_cpp's
+            // makeRelative over z.internalFaces, correctBoundaryVelocity over z.includedFaces[pi],
+            // addCoriolis over z.cells -- so on a mesh that only GREW every index is still in range and the
+            // control is merely wrong, which is what it is for. On a mesh that SHRANK it is a read past the
+            // end, and this fixture does shrink at the tutorial's own deltaT (6390 -> 6362 cells). So the
+            // test is not which direction the count moved: it is whether any kept index is now out of
+            // range, per list, which also catches a patch that shrank inside a mesh that grew.
+            for (const cpu::MRF::Zone& kz : f.mrfZones)
+            {
+                const bool cellsOut = !kz.cells.empty() && kz.cells.back() >= m.nCells();
+                const bool facesOut = !kz.internalFaces.empty()
+                                   && kz.internalFaces.back() >= m.nInternalFaces();
+                bool patchOut = false;
+                for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                {
+                    for (const std::vector<std::vector<label>>* l : {&kz.includedFaces, &kz.excludedFaces})
+                    {
+                        if (pi >= l->size() || (*l)[pi].empty()) continue;
+                        patchOut = patchOut || (*l)[pi].back() >= patches[pi].size;
+                    }
+                }
+                if (cellsOut || facesOut || patchOut)
+                {
+                    throw std::runtime_error(
+                        std::string(WHO) + "BRAE_CONTROL_AMR_NO_MRF_UPDATE is set and the change left the "
+                        "kept zone naming indices the new mesh does not have (cells past the end: "
+                        + std::string(cellsOut ? "yes" : "no") + ", internal faces: "
+                        + std::string(facesOut ? "yes" : "no") + ", patch faces: "
+                        + std::string(patchOut ? "yes" : "no") + "). The control keeps the stale lists on "
+                        "purpose, and reading past the end is undefined rather than wrong. Run it on a "
+                        "change that does not remove cells or faces.");
+                }
+            }
+            std::printf("  *** CONTROL MODE: the MRF zones keep the face lists they were built with, not "
+                        "rebuilt on the new mesh. This run is deliberately wrong. ***\n");
+        }
+        else
+        {
+            MRF::update(f.mrfZones, f.mrfSpecs, f.cellZones, m, patches);
         }
     }
 

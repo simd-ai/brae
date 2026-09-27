@@ -213,6 +213,11 @@ struct InterFields
     // case without MRF. UEqn.H and pEqn.H reach it in four places -- see inter_ueqn_cpp.cuh and
     // inter_peqn_cpp.cuh.
     std::vector<MRF::Zone> mrfZones;
+    // ...and the SPECS they were built from, one per zone, in build order. A topology change rebuilds each
+    // zone's face lists from its own spec against the renumbered cellZone, which is what
+    // MRFZone::update() does (MRFZone.C:598-603). They were read and discarded before this unit, so the
+    // rebuild had nothing to rebuild from and MRF beside refinement was refused instead.
+    std::vector<MRF::ZoneSpec> mrfSpecs;
     // createFvOptions.H: the case's ACTIVE options. interFoam applies them in UEqn.H:9 (== fvOptions(rho,
     // U)), :14 (constrain) and :31 plus pEqn.H:65 (correct). ONE is ported, explicitPorositySource with
     // DarcyForchheimer, which only the first of those reaches; everything else is refused by name.

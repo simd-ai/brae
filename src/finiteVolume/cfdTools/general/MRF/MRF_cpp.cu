@@ -149,6 +149,32 @@ Zone buildZone(
         }
     }
 
+    // EVERY nonRotatingPatches ENTRY MUST BE A PLAIN EXISTING PATCH NAME, or this refuses by name.
+    // OpenFOAM's excludedPatchNames_ is a `wordRes` (MRFZone.H:92) resolved with
+    // boundaryMesh().indices(matcher, useGroups = true) (MRFZone.C:578-579), so it matches REGEXES and
+    // PATCH GROUPS; isExcludedPatch below compares exact strings. The two disagree in the worst direction:
+    // a patch OpenFOAM matches by regex is EXCLUDED there (the frame flux is subtracted on its faces) and
+    // would be INCLUDED here (its flux zeroed outright), silently. No shipped tutorial writes one -- every
+    // MRF case in the tree has `nonRotatingPatches ()` or plain names -- so this is refused rather than
+    // ported, and it is checked here because buildZone is what a topology change re-runs.
+    for (const std::string& n : spec.nonRotatingPatches)
+    {
+        bool found = false;
+        for (const FvPatch& p : patches)
+        {
+            found = found || p.name == n;
+        }
+        if (!found)
+        {
+            throw std::runtime_error(
+                "brae MRF: nonRotatingPatches names `" + n + "`, which is not a patch of this mesh. "
+                "OpenFOAM would match it as a wordRes -- a regex or a patch GROUP -- and exclude every "
+                "patch it matched (MRFZone.H:92, MRFZone.C:578-579, polyBoundaryMesh::indices with "
+                "useGroups); this port compares exact names, so such an entry would be INCLUDED here and "
+                "EXCLUDED there. Refused rather than run the opposite treatment.");
+        }
+    }
+
     z.includedFaces.resize(patches.size());
     z.excludedFaces.resize(patches.size());
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
@@ -173,6 +199,40 @@ Zone buildZone(
         }
     }
     return z;
+}
+
+void update(
+    std::vector<Zone>&                                zones,
+    const std::vector<ZoneSpec>&                      specs,
+    const std::map<std::string, std::vector<label>>&  cellZones,
+    const PrimitiveMesh&                              m,
+    const std::vector<FvPatch>&                       patches)
+{
+    // The caller keeps one spec per zone, in build order, and OpenFOAM's own update walks the list the
+    // same way. A mismatch means a caller built the zones from somewhere else, and rebuilding the wrong
+    // spec onto a zone would be silent -- the counts are the only thing that can say so.
+    if (zones.size() != specs.size())
+    {
+        throw std::runtime_error(
+            "brae MRF::update: " + std::to_string(zones.size()) + " zone(s) against "
+            + std::to_string(specs.size()) + " spec(s). Each zone is rebuilt from the spec it was built "
+            "from, so the two lists must stay parallel.");
+    }
+    for (std::size_t i = 0; i < zones.size(); ++i)
+    {
+        // OpenFOAM keeps cellZoneID_ and indexes the live cellZones with it; resetZones rebuilds every
+        // zone in order through a change, so the INDEX survives and only the labels move. brae keys by
+        // name, which is the same statement on a list whose order is its file's.
+        const auto it = cellZones.find(specs[i].cellZone);
+        if (it == cellZones.end())
+        {
+            throw std::runtime_error(
+                "brae MRF::update: cellZone `" + specs[i].cellZone + "` is not in the mesh's zones after "
+                "the change. OpenFOAM stops on a missing MRF cellZone (MRFZone.C:583-590, the "
+                "FatalErrorInFunction at :587).");
+        }
+        zones[i] = buildZone(specs[i], it->second, m, patches);
+    }
 }
 
 void correctBoundaryVelocity(

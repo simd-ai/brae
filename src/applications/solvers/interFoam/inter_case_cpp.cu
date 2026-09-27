@@ -1217,8 +1217,11 @@ InterFields buildInterFields(const std::string&          caseDir,
                 if (it == zoneMap.end())
                     throw std::runtime_error(
                         "brae interFoam: MRF cellZone `" + sp.cellZone + "` is not in "
-                        "constant/polyMesh/cellZones. OpenFOAM stops on this (MRFZone.C:258-266).");
+                        "constant/polyMesh/cellZones. OpenFOAM stops on this (MRFZone.C:583-590, the "
+                        "FatalErrorInFunction at :587; :258-266 is addCoriolis and was the wrong line).");
                 f.mrfZones.push_back(MRF::buildZone(sp, it->second, m, patches));
+                // KEPT, not discarded: a topology change rebuilds the zone from its own spec.
+                f.mrfSpecs.push_back(sp);
             }
         }
     }
@@ -1466,8 +1469,22 @@ InterFields buildInterFields(const std::string&          caseDir,
             }
             if (f.dynamicMesh && !allRecoupled)
                 throw std::runtime_error(who + "a moving mesh. The pair's weights and deltas are taken once.");
+            // ...AND THE MECHANISM, which this refusal did not name until the MRF-beside-refinement unit
+            // went looking for what setMRFFaces does that buildZone does not. Its last statement is
+            // syncTools::syncFaceList(mesh_, faceType, maxEqOp<label>()) (MRFZone.C:123), and that
+            // function's cyclic half is OUTSIDE the parRun block that closes at syncToolsTemplates.C:1222
+            // -- "Do the cyclics." at :1224 runs IN SERIAL TOO. So a cyclic face takes the MAX of its own
+            // and its partner's faceType: a face whose own cell is outside the zone but whose PARTNER's
+            // cell is inside it is type 2 in OpenFOAM, and lands in excludedFaces_. brae's buildZone has no
+            // sync, so that face is type 0 and lands in neither list. VERIFIED that this refusal reaches
+            // such a case: validation/interFoamCyclic with a 100-cell cellZone and an MRFProperties on it
+            // stops here by name -- once the p_rgh fixedFluxPressure is taken out, because THAT refusal
+            // fires first and hid this one on the fixture.
             if (!f.mrfZones.empty())
-                throw std::runtime_error(who + "an active MRF zone. MRF's face lists do not carry coupled faces here.");
+                throw std::runtime_error(who + "an active MRF zone. MRF's face lists do not carry coupled faces here: "
+                    "setMRFFaces ends in syncTools::syncFaceList with maxEqOp (MRFZone.C:123), whose cyclic half runs "
+                    "in serial too (syncToolsTemplates.C:1224), so a face whose PARTNER's cell is in the zone is "
+                    "excluded in OpenFOAM and in neither list here.");
             if (anyFvOption)
                 throw std::runtime_error(who + "an active fvOption. Nothing holds the two together against OpenFOAM.");
             if (f.waves.any)

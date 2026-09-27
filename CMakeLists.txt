@@ -3837,6 +3837,18 @@ set_tests_properties(interfoam_amr_vs_openfoam PROPERTIES
                      DEPENDS test_inter_amr_vs_openfoam
                      TIMEOUT 900)
 
+# ...and MRF on a refining mesh, which needs a DIFFERENT case and therefore its own script: the four
+# profiles above stage damBreakWithObstacle, whose fixedFluxPressure walls brae refuses MRF beside. It runs
+# the same test binary on laminar/mixerVessel2D with the `mrf` profile, and runs OpenFOAM TWICE -- the
+# oracle and a one-ulp twin, which is where its bounds come from. Both are cached.
+add_test(NAME interfoam_amr_mrf_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_amr_mrf_vs_openfoam.sh)
+set_tests_properties(interfoam_amr_mrf_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_inter_amr_vs_openfoam
+                     TIMEOUT 1800)
+
 # brae's dynamicRefineFvMeshCoeffs reader against the three shipped AMR tutorials' own dictionaries --
 # flat, flat-beside-a-subdict, and wrapped. The oracle is the dictionary; the script says why all three.
 add_executable(test_refine_controls tests/test_refine_controls.cu)

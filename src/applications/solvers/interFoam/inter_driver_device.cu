@@ -350,7 +350,11 @@ RunReport runInterFoamDevice(
     // written; the refusals gate's `device_mesh_dynamic` arm is a `runs` arm now, and every refusal an
     // adaptive case still has -- turbulence, a motion solver, MRF, fvOptions, CrankNicolson, a pressure
     // reference, `correctPhi no`, a coupled patch -- is raised by the SHARED case build and the shared
-    // adapter (inter_case_cpp.cu, inter_amr_cpp.cu), so it fires on this arm without a copy here.
+    // adapter (inter_case_cpp.cu, inter_amr_cpp.cu), so it fires on this arm without a copy here. The
+    // list has shrunk twice since: fvOptions are RE-SELECTED through a change and MRF's face lists are
+    // REBUILT, both on this arm too (buildPorosity and buildMrf are re-run inside the branch below), so
+    // what an adaptive case still has refused is turbulence, a motion solver, `correctPhi no`, a CN
+    // restart directory and a coupled patch.
 
     DynamicMotionSolverFvMesh* dyn = f.dynamicMesh.get();
     // A cyclicACMI PAIR WHOSE `scale` MOVES WITH TIME is rescaled at every step, in place, on the
@@ -1356,11 +1360,21 @@ RunReport runInterFoamDevice(
         }
     }
 
+    // IN A LAMBDA for the same reason buildPorosity is: a topology change rebuilds every host zone's face
+    // lists (MRF::update, mirroring MRFZone::update -> setMRFFaces) and every buffer here is derived from
+    // them AND from the new geometry -- frameFluxInt and frameFluxBnd are Omega x (Cf - origin) dotted
+    // with Sf, face by face, and a refined face has a new centre and a quarter of the area. The vector
+    // itself is refilled rather than replaced, because C.mrf holds its address for the whole run.
     std::vector<DeviceMRFZone> dMrf;
-    for (const cpu::MRF::Zone& z : f.mrfZones)
+    const auto buildMrf = [&]()
     {
-        dMrf.push_back(buildDeviceMRFZone(z, m, g, fvp));
-    }
+        dMrf.clear();
+        for (const cpu::MRF::Zone& z : f.mrfZones)
+        {
+            dMrf.push_back(buildDeviceMRFZone(z, m, g, fvp));
+        }
+    };
+    buildMrf();
 
     // ---- controls --------------------------------------------------------------------------------
     // CRANKNICOLSON's state, the host driver's set on the device (inter_driver_cpp.cu, `cnDdt`): the
@@ -2456,6 +2470,8 @@ RunReport runInterFoamDevice(
                     // ---- the masks and the boundary geometry, per boundary FACE
                     // ...the porosity's cell list, which interAfterMeshChange has just RE-SELECTED
                     buildPorosity();
+                    // ...and the MRF zones, whose host face lists it has just REBUILT
+                    buildMrf();
                     buildBoundaryMasks();
                     dAFixes.copyFrom(aFixes);
                     dAFlag.copyFrom(aFlag);

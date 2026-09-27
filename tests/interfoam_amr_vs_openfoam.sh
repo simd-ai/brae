@@ -282,8 +282,11 @@ PYCLOSE" || rc=1
 # step k is zero for the whole of step k (DDt0Field::evaluate is false on the step it is born), and this
 # case refines at steps 1 and 2 and then NEVER again -- 0 cells selected at steps 3, 4, 5 and 6 -- so the
 # last change maps a level that is still zero. laminar/damBreak with maxRefinement 3 changes at every step
-# and would witness it; it is 2-D, and a 2-D adaptive case is refused for its `empty` patch (see the
-# measurement in inter_amr_cpp.cu). That refusal is what this profile's coverage stops at.
+# and would witness it. IT IS 2-D, AND THAT IS NO LONGER A REFUSAL: the `empty` patch refusal was lifted
+# when the hull average stopped counting a zero-sized patch field's faces in its denominator, and a 2-D
+# adaptive case is gated by the third arm of tests/refine_update_vs_openfoam.sh and run end to end by
+# tests/interfoam_amr_mrf_vs_openfoam.sh (mixerVessel2D, 2-D, front and back `empty`). So what stops this
+# profile's coverage is only that nobody has staged that case HERE, not a refusal.
 gate cn 3 "python3 - <<'PYCN'
 import re
 s = open('system/fvSchemes').read()
