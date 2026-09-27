@@ -65,6 +65,11 @@ struct InterAmr
     label                                nUnrefined = 0;
 };
 
+// Does the case ask for an adaptive mesh at all? ONE function, asked by everything that needs to know --
+// buildInterFields (to keep the case away from the MOTION factory), the host loop (to build the state) and
+// the DEVICE loop (to refuse it). Three inline dictionary reads would be three chances to disagree.
+bool caseAsksForAdaptiveMesh(const std::string& caseDir);
+
 // constant/dynamicMeshDict, and the initial state: the levels a fresh mesh starts at, the identity
 // history, and dynamicRefineFvMesh::init's own protected-cell scan. Inactive when the dictionary names
 // another mesh type, which is what leaves a static case untouched.

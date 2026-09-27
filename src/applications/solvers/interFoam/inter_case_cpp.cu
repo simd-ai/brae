@@ -1,6 +1,7 @@
 // interFoam's createFields -- see inter_case_cpp.cuh for the provenance and for the four things the
 // order of this file encodes.
 #include "inter_case_cpp.cuh"
+#include "inter_amr_cpp.cuh"
 #include "frozen_bc_guard.cuh"
 #include <sstream>
 #include "crank_nicolson_ddt_scheme_cpp.cuh"
@@ -843,9 +844,7 @@ InterFields buildInterFields(const std::string&          caseDir,
         // dictionary is read here first and the factory is only asked about the cases it is the authority
         // for. A driver without this branch still gets the refusal, which is what keeps the capability
         // honest: see the note on shared capability notices in the project's own history.
-        const std::string dmd = caseDir + "/constant/dynamicMeshDict";
-        const bool adaptive = std::filesystem::exists(dmd)
-                           && readDict(dmd).wordOr("dynamicFvMesh", "") == "dynamicRefineFvMesh";
+        const bool adaptive = caseAsksForAdaptiveMesh(caseDir);
         f.dynamicMesh = adaptive ? nullptr : DynamicMotionSolverFvMesh::New(caseDir, startDir);
         // `dynamic` is OpenFOAM's mesh.dynamic(): moving OR topo-changing. It is what correctPhi defaults
         // to, and a REFINING mesh is dynamic -- measured on damBreakWithObstacle, where OpenFOAM writes a

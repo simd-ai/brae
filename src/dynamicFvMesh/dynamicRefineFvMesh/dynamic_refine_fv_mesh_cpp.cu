@@ -1976,6 +1976,34 @@ void renumberProtectedCells(
     protectedCell.swap(next);
 }
 
+// ONE BUILDER for the MapPolyMesh the corrections read, because there are three call sites and each used to
+// fill a different subset -- so a field one site set was silently defaulted at another. tools/default_audit
+// reported exactly that (5 unlisted omissions over 3 sites), and this is the fix the of-defaults skill
+// prescribes: one builder, every field it can fill, filled.
+//
+// What it CANNOT fill is the faceMapper addressing (`faceMapperDirect`, `faceDirectAddressing`,
+// `faceAddressing`, `faceWeights`) and the oracle's own notes (`phase`, `mapCarriedOldVolumes`,
+// `openfoamSaysDirect`): those exist for the unit-6 gates, which take them from OpenFOAM. They stay at
+// their defaults HERE, in one place, rather than at three.
+MapPolyMesh mapPolyMeshFrom(
+    const cpu::polyTopoChange::TopoChangeMap& map,
+    const std::vector<scalar>&                oldCellVolumes)
+{
+    MapPolyMesh mpm;
+    mpm.nOldCells = map.nOldCells;
+    mpm.cellMap = map.cellMap;
+    mpm.reverseCellMap = map.reverseCellMap;
+    for (const cpu::polyTopoChange::ObjectMap& m : map.cellsFromCells)
+    {
+        mpm.cellsFromCells.emplace_back(m.index, m.masterObjects);
+    }
+    mpm.oldCellVolumes = oldCellVolumes;
+    mpm.faceMap = map.faceMap;
+    mpm.reverseFaceMap = map.reverseFaceMap;
+    mpm.reversePointMap = map.reversePointMap;
+    return mpm;
+}
+
 // fvMesh::updateMesh + dynamicRefineFvMesh::mapFields, on the state the driver carries: every cell field
 // through the cell mapper, the old-time volumes through their own rule and then corrected.
 void mapCarriedFields(
@@ -2014,13 +2042,7 @@ void mapCarriedFields(
         }
 
         // what the hull average reads off the NEW mesh, built once for all the fields
-        MapPolyMesh mpmF;
-        mpmF.nOldCells = map.nOldCells;
-        mpmF.cellMap = map.cellMap;
-        mpmF.reverseCellMap = map.reverseCellMap;
-        mpmF.faceMap = map.faceMap;
-        mpmF.reverseFaceMap = map.reverseFaceMap;
-        mpmF.reversePointMap = map.reversePointMap;
+        const MapPolyMesh mpmF = mapPolyMeshFrom(map, oldCellVolumes);
         FluxMeshView fv;
         fv.nInternalFaces = s.m.nInternalFaces();
         for (const PatchInfo& pp : patches)
@@ -2152,15 +2174,7 @@ void mapCarriedFields(
     }
     if (!s.V0.empty())
     {
-        MapPolyMesh mpm;
-        mpm.nOldCells = map.nOldCells;
-        mpm.cellMap = map.cellMap;
-        mpm.reverseCellMap = map.reverseCellMap;
-        for (const cpu::polyTopoChange::ObjectMap& m : map.cellsFromCells)
-        {
-            mpm.cellsFromCells.emplace_back(m.index, m.masterObjects);
-        }
-        mpm.oldCellVolumes = oldCellVolumes;
+        const MapPolyMesh mpm = mapPolyMeshFrom(map, oldCellVolumes);
         s.V0 = correctOldVolumes(mpm, mapOldVolumes(s.V0, map, nNewCells), newV);
     }
 }
@@ -2431,13 +2445,7 @@ RefineUpdateStep refineUpdate(
             // hull average (:610-689)
             if (!s.injectedPhiU.empty() && !faceToSplitPoint.empty())
             {
-                MapPolyMesh mpmU;
-                mpmU.nOldCells = r.unrefineMap.nOldCells;
-                mpmU.cellMap = r.unrefineMap.cellMap;
-                mpmU.reverseCellMap = r.unrefineMap.reverseCellMap;
-                mpmU.faceMap = r.unrefineMap.faceMap;
-                mpmU.reverseFaceMap = r.unrefineMap.reverseFaceMap;
-                mpmU.reversePointMap = r.unrefineMap.reversePointMap;
+                const MapPolyMesh mpmU = mapPolyMeshFrom(r.unrefineMap, oldV);
                 FluxMeshView fvU;
                 fvU.nInternalFaces = s.m.nInternalFaces();
                 for (const PatchInfo& pp : s.m.patches())

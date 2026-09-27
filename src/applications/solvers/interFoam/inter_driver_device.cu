@@ -4,6 +4,7 @@
 // is separately landed and separately gated; what this file owns is the wiring, and that wiring is
 // what tests/test_device_inter_dambreak_alpha.cu measures against the host driver on damBreak.
 #include "inter_driver_cpp.cuh"
+#include "inter_amr_cpp.cuh"
 #include "inter_correct_phi_cpp.cuh"
 #include "inter_case_cpp.cuh"
 #include "inter_peqn_cpp.cuh"
@@ -338,6 +339,21 @@ RunReport runInterFoamDevice(
     // motion solver is a Laplacian on the point field, and brae has one host implementation of it --
     // so the device loop moves the mesh exactly as the host loop does (inter_driver_cpp.cu's
     // Stage::meshUpdate) and then refreshes the buffers it had uploaded from the geometry.
+    // AN ADAPTIVE MESH IS A HOST CAPABILITY AND THIS ARM REFUSES IT BY NAME. buildInterFields is shared
+    // with the host loop, and the moment it stopped handing an adaptive case to the motion factory (so the
+    // host could carry a topology change) THIS loop started running such a case as if it were static.
+    // MEASURED: tests/interfoam_refusals.sh's `device_mesh_dynamic` arm caught it -- "expected refused
+    // naming `dynamicRefineFvMesh`, got runs". A capability claimed where it is not implemented is the
+    // defect this project keeps finding; the refusal lives here, beside the loop that lacks it.
+    if (caseAsksForAdaptiveMesh(caseDir))
+    {
+        throw std::runtime_error(
+            "brae interFoam (device): the case asks for `dynamicFvMesh dynamicRefineFvMesh`. Adaptive "
+            "refinement is ported on the HOST loop only (inter_amr_cpp.cuh): this loop uploads the mesh "
+            "once and has no path that re-uploads it, so running the case here would solve every step "
+            "after the first on a mesh the device never saw.");
+    }
+
     DynamicMotionSolverFvMesh* dyn = f.dynamicMesh.get();
     // A cyclicACMI PAIR WHOSE `scale` MOVES WITH TIME is rescaled at every step, in place, on the
     // caller's mutable objects -- the host loop's guards, transcribed (inter_driver_cpp.cu:256-302),

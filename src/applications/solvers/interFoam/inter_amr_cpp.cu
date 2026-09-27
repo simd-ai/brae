@@ -57,6 +57,13 @@ void refuseUnmappedState(const InterFields& f)
 
 }   // namespace
 
+bool caseAsksForAdaptiveMesh(const std::string& caseDir)
+{
+    const std::string path = caseDir + "/constant/dynamicMeshDict";
+    if (!std::filesystem::exists(path)) return false;
+    return readDict(path).wordOr("dynamicFvMesh", "") == "dynamicRefineFvMesh";
+}
+
 InterAmr readInterAmr(
     const std::string&          caseDir,
     const PrimitiveMesh&        m,
@@ -67,8 +74,7 @@ InterAmr readInterAmr(
     const std::string path = caseDir + "/constant/dynamicMeshDict";
     if (!std::filesystem::exists(path)) return amr;
     const FoamDict d = readDict(path);
-    const std::string meshType = d.wordOr("dynamicFvMesh", "");
-    if (meshType != "dynamicRefineFvMesh") return amr;
+    if (d.wordOr("dynamicFvMesh", "") != "dynamicRefineFvMesh") return amr;
 
     amr.active = true;
     amr.controls = dynamicRefine::readRefineControls(d);
