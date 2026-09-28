@@ -716,7 +716,8 @@ RunReport runInterFoam(
     rep.deltaT = f.deltaT;
 
     // A GATE'S CONTROL, never set by a solver: ONE localEuler consumer -- `alpha` (the pre-solve's ddt and
-    // MULES), `ueqn` (fvm::ddt(rho, U)) or `ddtcorr` -- reads the global 1/deltaT in the local rDeltaT's
+    // MULES), `ueqn` (fvm::ddt(rho, U)), `ddtcorr` or `turbulence` (kOmegaSST's fvm::ddt(omega) and
+    // fvm::ddt(k)) -- reads the global 1/deltaT in the local rDeltaT's
     // place, which is what a port that left that consumer on the Euler form runs. It makes the answer
     // WRONG; tests/interfoam_dtchull_vs_openfoam.sh asserts that each one fails.
     std::string ltsScalarControl;
@@ -724,10 +725,11 @@ RunReport runInterFoam(
     if (const char* e = std::getenv("BRAE_CONTROL_LTS_SCALAR"))
     {
         ltsScalarControl = e;
-        if (ltsScalarControl != "alpha" && ltsScalarControl != "ueqn" && ltsScalarControl != "ddtcorr")
+        if (ltsScalarControl != "alpha" && ltsScalarControl != "ueqn" && ltsScalarControl != "ddtcorr"
+         && ltsScalarControl != "turbulence")
             throw std::runtime_error(
-                "brae interFoam: BRAE_CONTROL_LTS_SCALAR is `" + ltsScalarControl + "`; it takes alpha, ueqn "
-                "or ddtcorr, and an unknown name would make the control vacuous.");
+                "brae interFoam: BRAE_CONTROL_LTS_SCALAR is `" + ltsScalarControl + "`; it takes alpha, ueqn, "
+                "ddtcorr or turbulence, and an unknown name would make the control vacuous.");
         rDeltaTGlobal.assign(static_cast<std::size_t>(m.nCells()), scalar(1)/f.deltaT);
         std::printf("  *** CONTROL MODE: the localEuler consumer `%s` reads 1/deltaT, not the local rDeltaT. "
                     "This run is deliberately wrong. ***\n", ltsScalarControl.c_str());
@@ -1565,6 +1567,7 @@ RunReport runInterFoam(
                     ti.nu = &f.nu;
                     ti.nuBnd = &f.nuBnd;
                     ti.deltaT = rep.deltaT;
+                    ti.rDeltaT = rDeltaTFor("turbulence");
                     // THE STEP'S INDEX -- the same value Stage::advanceTime gives cnClock.timeIndex, so the
                     // closure's old-time snapshot and CrankNicolson's clock agree on what a step is.
                     ti.timeIndex = rep.steps;

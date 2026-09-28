@@ -1477,10 +1477,14 @@ InterFields buildInterFields(const std::string&          caseDir,
         throw std::runtime_error(
             "brae interFoam: ddtSchemes `default` is localEuler and the case has MRF zones. No fixture holds "
             "MRF under a local time step.");
-    if (f.lts && f.turbulence.on)
+    // kOmegaSST in the uniform lineage takes the local step (kOmegaSST::Compressible::rDeltaTCells); the
+    // other closures do not yet
+    if (f.lts && f.turbulence.on
+     && !(f.turbulence.model == InterRasModel::KOmegaSST && !f.turbulence.variableDensity))
         throw std::runtime_error(
-            "brae interFoam: ddtSchemes `default` is localEuler and the case is turbulent. The closure's "
-            "fvm::ddt under localEuler (localEulerDdtScheme.C:253-341) is not ported yet.");
+            "brae interFoam: ddtSchemes `default` is localEuler and the closure is not kOmegaSST in the uniform "
+            "lineage. Its fvm::ddt under localEuler (localEulerDdtScheme.C:225-341, by the closure's alpha and "
+            "rho) is ported for kOmegaSST's fvmDdt(vf) (:225-249) only.");
     if (f.lts && f.alphaCtl.nAlphaSubCycles > 1)
         throw std::runtime_error(
             "brae interFoam: ddtSchemes `default` is localEuler and nAlphaSubCycles is "

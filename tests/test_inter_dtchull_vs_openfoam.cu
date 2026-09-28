@@ -13,6 +13,7 @@
 #include "foam_field_reader.cuh"
 #include "inter_driver_cpp.cuh"
 #include "inter_solve_log.cuh"
+#include "device_gate_finite.cuh"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -60,6 +61,16 @@ void bound(
 // 3.4e-12, alpha 2.6e-10, p_rgh 6.1e-10, U 6.4e-13, the p_rgh initial residuals 4.5e-11 -- each bound about
 // three times its measurement. OpenFOAM against itself with one interface cell's alpha moved by one ulp
 // reads alpha 8.8e-11, p_rgh 1.2e-10 and U 3.7e-13 after the same ten steps; see the script.
+// ...and the `ras` profile's, ten kOmegaSST steps: k 3.7e-12, omega 1.0e-11, nut 2.8e-11, U 1.6e-12 (the
+// laminar profile's U bound stays its own). OpenFOAM against itself with one ulp reads k 1.0e-12, omega
+// 1.0e-12, nut 5.3e-12, U 1.2e-13 there; at the FIRST step, before anything amplifies, U is 7.9e-13 on the
+// laminar profile as well, so that floor is not the closure's, and omega and nut follow it (4e-13).
+constexpr scalar BOUND_K = 1e-11;
+constexpr scalar BOUND_OMEGA = 3e-11;
+constexpr scalar BOUND_NUT = 1e-10;
+constexpr scalar BOUND_U_LAMINAR = 3e-12;
+constexpr scalar BOUND_U_RAS = 5e-12;
+
 struct Diff
 {
     scalar linf = 0;
@@ -247,6 +258,12 @@ int main(
         bound("rDeltaT at step " + std::to_string(k) + ", relative", d.rel(), 1e-11);
     }
 
+    // BEFORE any fmax: std::fmax drops a NaN, so a non-finite field would read as a match
+    failures += brae::gatecheck::nonFinite("brae alpha", fin.alpha1.internal);
+    failures += brae::gatecheck::nonFinite("brae p_rgh", fin.p_rgh.internal);
+    failures += brae::gatecheck::nonFinite("brae U", fin.U.internal);
+    failures += brae::gatecheck::nonFinite("brae rDeltaT", fin.rDeltaT);
+
     // the fields at the last step
     const std::string last = ofCase + "/" + std::to_string(nSteps);
     const Diff dA = compare(fin.alpha1.internal, readCells<scalar>(last + "/alpha.water", nC));
@@ -255,7 +272,34 @@ int main(
     std::printf("  cells more than 1e-12 apart: alpha %ld, p_rgh %ld, U %ld\n", dA.nOff, dP.nOff, dU.nOff);
     bound("alpha, relative to its largest value", dA.rel(), 1e-9);
     bound("p_rgh, relative", dP.rel(), 2e-9);
-    bound("U, relative", dU.rel(), 3e-12);
+    bound("U, relative", dU.rel(), fin.turbulence.on ? BOUND_U_RAS : BOUND_U_LAMINAR);
+
+    // THE CLOSURE, on the `ras` profile: kOmegaSST's fvm::ddt(omega) and fvm::ddt(k) under the local step
+    if (fin.turbulence.on)
+    {
+        check("...under kOmegaSST, in the uniform lineage",
+              fin.turbulence.model == InterRasModel::KOmegaSST && !fin.turbulence.variableDensity);
+        failures += brae::gatecheck::nonFinite("brae k", fin.turbulence.k.internal);
+        failures += brae::gatecheck::nonFinite("brae omega", fin.turbulence.omega.internal);
+        failures += brae::gatecheck::nonFinite("brae nut", fin.turbulence.nut.internal);
+        const Diff dK = compare(fin.turbulence.k.internal, readCells<scalar>(last + "/k", nC));
+        const Diff dO = compare(fin.turbulence.omega.internal, readCells<scalar>(last + "/omega", nC));
+        const Diff dN = compare(fin.turbulence.nut.internal, readCells<scalar>(last + "/nut", nC));
+        std::printf("  cells more than 1e-12 apart: k %ld, omega %ld, nut %ld\n", dK.nOff, dO.nOff, dN.nOff);
+        bound("k, relative", dK.rel(), BOUND_K);
+        bound("omega, relative", dO.rel(), BOUND_OMEGA);
+        bound("nut, relative", dN.rel(), BOUND_NUT);
+        const std::vector<LinearSolveRecord> ofO = brae::gatecheck::readOfSolves(logPath, "omega");
+        const std::vector<LinearSolveRecord> ofK = brae::gatecheck::readOfSolves(logPath, "k");
+        check("OpenFOAM's log gave the omega and k solves",
+              ofO.size() >= static_cast<std::size_t>(nSteps) && ofK.size() >= static_cast<std::size_t>(nSteps));
+        failures += brae::gatecheck::compareSolves("host", r.omegaSolves, ofO, nSteps, "omega",
+                                                   scalar(1e-10), scalar(1e-10), scalar(1e-5), nullptr,
+                                                   !measureOnly);
+        failures += brae::gatecheck::compareSolves("host", r.kSolves, ofK, nSteps, "k",
+                                                   scalar(1e-10), scalar(1e-10), scalar(1e-5), nullptr,
+                                                   !measureOnly);
+    }
 
     // the solves
     const std::vector<LinearSolveRecord> ofP = brae::gatecheck::readOfPressureSolves(logPath);

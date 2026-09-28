@@ -19,6 +19,7 @@ InterTurbulenceStepInput ti V0      # a RAS closure on a moving mesh is refused 
 InterTurbulenceStepInput ti meshPhi # same refusal -- ARM device_moving_SST
 InterTurbulenceStepInput ti cn      # BRAE_INTER_HOST_CLOSURE under CrankNicolson is refused
 InterTurbulenceStepInput ti rhoOO   # same refusal
+InterTurbulenceStepInput ti rDeltaT # localEuler's per-cell step: the device loop refuses localEuler by name ("ddtSchemes `default` is localEuler ... ported on the host loop only") -- ARM device_localEuler
 
 # RunReport is an OUTPUT the drivers fill as they go, not a control read from the case
 RunReport rep alphaSolves
@@ -168,12 +169,15 @@ kEpsilonRef::Compressible comp phiByRho  # the VOLUMETRIC flux for divU: in the 
 # NOTE the tool keys on the VARIABLE name, so one line covers every site spelling it the same way.
 kOmegaSST::Compressible sstComp kOldIn  # inter_turbulence_cpp.cu:792, validateTurbulence -> correctNutField: nut only, no k equation
 kOmegaSST::Compressible sstComp omegaOldIn  # same site, same reason
+kOmegaSST::Compressible sstComp rDeltaTCells  # same site: correctNutField forms no fvm::ddt; the field is read only by correct()'s two ddt lines
 kEpsilonRef::Compressible comp kOldIn  # the correctNutField sites (inter_turbulence_cpp.cu:801, rhoCreateFields_cpp.cu:1080) and rhoSimpleFoam_cpp.cu:1367, one closure call per SIMPLE iteration
 kEpsilonRef::Compressible comp epsOldIn  # same sites, same reason
 kOmegaSST::Compressible comp kOldIn  # rhoCreateFields_cpp.cu:1106, validate()'s correctNutField
 kOmegaSST::Compressible comp omegaOldIn  # same site, same reason
+kOmegaSST::Compressible comp rDeltaTCells  # same site: correctNutField forms no fvm::ddt; the field is read only by correct()'s two ddt lines
 kOmegaSST::Compressible sc kOldIn  # rhoSimpleFoam_cpp.cu:1240, the live SST call: one per SIMPLE iteration, so oldTime() is this step's
 kOmegaSST::Compressible sc omegaOldIn  # same site, same reason
+kOmegaSST::Compressible sc rDeltaTCells  # rhoSimpleFoam never runs localEuler: parseDdtScheme refuses every ddtSchemes default but steadyState and Euler ("fvSchemes ddtSchemes default is `...`. The turbulence closures take fvm::ddt through it") -- scheme_parse.cuh
 KOmegaSSTInput sstIn kOldIn  # rhoTurbulenceHook.cu:183, the device mirror's SST: one call per SIMPLE iteration
 KOmegaSSTInput sstIn omegaOldIn  # same site, same reason
 

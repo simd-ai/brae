@@ -2992,13 +2992,20 @@ COMPONENTS = {
                         "p_rgh and 10 alpha counts OpenFOAM's; OpenFOAM against itself with one interface cell's "
                         "alpha moved by one ulp reads 8.8e-11, 1.2e-10, 3.7e-13 after the same ten steps. CONTROLS, "
                         "one consumer at a time on the global 1/deltaT: the alpha pre-solve and CMULES (alpha "
-                        "2.1e+02), fvm::ddt(rho, U) (U 5.3e+01), ddtCorr (rDeltaT 3.0e-01 at step 3). NOT CLAIMED: "
-                        "the turbulent closure's ddt (refused), a moving mesh, sub-cycling (localRSubDeltaT), "
-                        "explicit MULES, fvOptions and MRF (all refused).",
-             note="Four consumers on DTCHull: the alpha pre-solve (alphaEqn.H:105-109 names the scheme directly), "
+                        "2.1e+02), fvm::ddt(rho, U) (U 5.3e+01), ddtCorr (rDeltaT 3.0e-01 at step 3). The `ras` "
+                        "profile runs the tutorial's kOmegaSST (div(phi,k|omega) upwind, nut hull nutkWallFunction "
+                        "staged): alpha 1.6e-10, p_rgh 3.4e-10, U 1.6e-12, k 3.7e-12, omega 1.0e-11, nut 2.8e-11, "
+                        "every omega and k count and final residual OpenFOAM's; one ulp gives k 1.0e-12, omega "
+                        "1.0e-12, nut 5.3e-12. Its control, kOmegaSST's two ddts on 1/deltaT: k 1.1e+01, omega "
+                        "1.1e+00. NOT CLAIMED: kEpsilon and LES under localEuler, a moving mesh, sub-cycling "
+                        "(localRSubDeltaT), explicit MULES, fvOptions and MRF (all refused).",
+             note="Five consumers on DTCHull: the alpha pre-solve (alphaEqn.H:105-109 names the scheme directly), "
                   "CMULES correct and limiterCorr (localRDeltaT per cell, CMULESTemplates.C:103-176), "
                   "fvm::ddt(rho, U) as diag=(rDT*rho)*V, source=((rDT*rho0)*U0)*V in that order, and ddtCorr on "
-                  "fvc::interpolate(rDT). brae's EULER U source is ((rDT*rho0)*V)*U0 -- a different association, "
+                  "fvc::interpolate(rDT), and kOmegaSST's fvm::ddt(alpha, rho, omega|k), which with geometricOneField "
+                  "alpha and rho is fvm::ddt(psi) (fvmDdt.C:127-137): rDT*V and (rDT*psi0)*V, bitwise the Euler "
+                  "lines' (rDT*rho)*V and ((rDT*rhoOld)*psi0)*V at rho == 1 (kOmegaSST::Compressible::rDeltaTCells). "
+                  "brae's EULER U source is ((rDT*rho0)*V)*U0 -- a different association, "
                   "left on the ledger; the localEuler one is OpenFOAM's."),
         dict(name="interFoam_variableHeightFlowRate", of_symbol="variableHeightFlowRateInletVelocityFvPatchVectorField",
              of_file="src/finiteVolume/fields/fvPatchFields/derived/variableHeightFlowRateInletVelocity/"

@@ -508,14 +508,17 @@ arm ras_otherModel          refused "realizableKE"            "" "sed -i 's/RASM
 # there is refused. `ddt(k)` is a name that lineage never looks up, dead text OpenFOAM ignores -- it runs.
 arm ddt_closureSplit        refused 'the closure'"'"'s `ddt(rho,k)` to `CrankNicolson 0.5`' "" "ddtblock 'default Euler;' 'ddt(rho,k) CrankNicolson 0.5;'"
 arm ddt_closureDeadName     runs    -                         "" "ddtblock 'default Euler;' 'ddt(k) CrankNicolson 0.5;'"
-# ...and a turbulent case under localEuler: the closure's fvm::ddt does not take the local step yet
-arm ddt_localEulerRAS       refused "the case is turbulent"   "" "$LTSSET; $LTSZERO"
+# ...and a turbulent case under localEuler: kOmegaSST in the uniform lineage takes the local step
+# (ddt_localEulerSST below, and tests/interfoam_dtchull_vs_openfoam.sh's `ras` profile); this base is
+# kEpsilon under `density variable`, whose fvm::ddt under localEuler is not ported
+arm ddt_localEulerRAS       refused "is not kOmegaSST in the uniform lineage" "" "$LTSSET; $LTSZERO"
 # kOmegaSST IS ported, in the uniform lineage (tests/interfoam_waterchannel_vs_openfoam.sh holds it to
 # OpenFOAM). RAS/damBreak made kOmegaSST: `density variable` with it is refused, and so is each thing
 # the closure does not carry -- on a base that RUNS, so a refusal is the one edit's.
 arm sst_variableDensity     refused "density variable"        "" "sed -i 's/RASModel .*/RASModel        kOmegaSST;/' constant/turbulenceProperties"
 SSTBASE="sed -i 's/RASModel .*/RASModel        kOmegaSST;/; /^density /d' constant/turbulenceProperties; sed -i 's/div(rhoPhi,k) .*/div(phi,k) Gauss upwind;/; s/div(rhoPhi,epsilon) .*/div(phi,omega) Gauss upwind;/' system/fvSchemes; sed -i 's/(U|k|epsilon)/(U|k|omega)/' system/fvSolution; sed 's/epsilonWallFunction/omegaWallFunction/; s/object  *epsilon;/object      omega;/; s/\\[0 2 -3 0 0 0 0\\]/[0 0 -1 0 0 0 0]/' 0/epsilon > 0/omega; printf '\\nwallDist { method meshWave; }\\n' >> system/fvSchemes"
 arm sst_baseline            runs    -                        "" "$SSTBASE"
+arm ddt_localEulerSST       runs    -                        "" "$SSTBASE; $LTSSET; $LTSZERO"
 arm sst_noOmega             refused "does not exist"          "" "$SSTBASE; rm 0/omega"
 # kOmegaSST's own wallDist reads `method` with no default (patchDistMethod.C): OpenFOAM stops without it
 arm sst_noWallDist          refused "wallDist { method ...; }" "" "$SSTBASE; sed -i '/^wallDist/d' system/fvSchemes"

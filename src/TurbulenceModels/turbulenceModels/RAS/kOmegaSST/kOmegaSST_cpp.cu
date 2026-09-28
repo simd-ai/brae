@@ -566,6 +566,18 @@ void correct(
                 "branch, which brae does not carry.");
     }
     const scalar rDeltaT = (comp && !cn) ? comp->rDeltaT : scalar(0);
+    // localEuler: the per-cell rDeltaT in the scalar's place (Compressible::rDeltaTCells)
+    const std::vector<scalar>* rDeltaTCells = comp ? comp->rDeltaTCells : nullptr;
+    if (rDeltaTCells)
+    {
+        if (cn || comp->V0)
+            throw std::runtime_error(
+                "brae kOmegaSST: a local time step (localEuler) beside CrankNicolson, or on a moving mesh, "
+                "is not ported.");
+        if (static_cast<label>(rDeltaTCells->size()) != nC)
+            throw std::runtime_error("brae kOmegaSST: the local rDeltaT is not the mesh's cells.");
+    }
+    auto rDeltaTAt = [&](label cc) { return rDeltaTCells ? (*rDeltaTCells)[cc] : rDeltaT; };
     const std::vector<scalar> kOld     = (comp && comp->kOldIn)     ? *comp->kOldIn     : k.internal;
     const std::vector<scalar> omegaOld = (comp && comp->omegaOldIn) ? *comp->omegaOldIn : omega.internal;
     auto rhoOldAt = [&](label cc) { return (comp && comp->rhoOld) ? (*comp->rhoOld)[cc] : rhoAt(cc); };
@@ -915,10 +927,11 @@ void correct(
             M.source[c] -= V * std::fmin(sp1, 0.0) * omega.internal[c];
             // - Sp(beta*omega, omega)
             M.diag[c]   += rc * beta * omega.internal[c] * V;
-            if (rDeltaT > 0.0)   // fvm::ddt(alpha, rho, omega_), kOmegaSSTBase.C:572
+            const scalar rDTo = rDeltaTAt(c);
+            if (rDTo > 0.0)   // fvm::ddt(alpha, rho, omega_), kOmegaSSTBase.C:572
             {
-                M.diag[c]   += rDeltaT * rc * V;
-                M.source[c] += rDeltaT * rhoOldAt(c) * omegaOld[c] * ((comp && comp->V0) ? (*comp->V0)[c] : V);
+                M.diag[c]   += rDTo * rc * V;
+                M.source[c] += rDTo * rhoOldAt(c) * omegaOld[c] * ((comp && comp->V0) ? (*comp->V0)[c] : V);
             }
             // - SuSp((F1 - 1)*CDkOmega/omega, omega)
             const scalar sp2 = rc * (f1[c] - 1.0) * CD[c] / omega.internal[c];
@@ -1086,10 +1099,11 @@ void correct(
                 ebk *= (ge < 0.1 ? 0.1 : (ge > 1.0 ? 1.0 : ge));
             }
             M.diag[c]   += rc * ebk * V;
-            if (rDeltaT > 0.0)   // fvm::ddt(alpha, rho, k_), kOmegaSSTBase.C:602
+            const scalar rDTk = rDeltaTAt(c);
+            if (rDTk > 0.0)   // fvm::ddt(alpha, rho, k_), kOmegaSSTBase.C:602
             {
-                M.diag[c]   += rDeltaT * rc * V;
-                M.source[c] += rDeltaT * rhoOldAt(c) * kOld[c] * ((comp && comp->V0) ? (*comp->V0)[c] : V);
+                M.diag[c]   += rDTk * rc * V;
+                M.source[c] += rDTk * rhoOldAt(c) * kOld[c] * ((comp && comp->V0) ? (*comp->V0)[c] : V);
             }
             if (bounded) M.diag[c] -= divPhi[c] * V;                 // - Sp(fvc::div(alphaRhoPhi), k)
         }

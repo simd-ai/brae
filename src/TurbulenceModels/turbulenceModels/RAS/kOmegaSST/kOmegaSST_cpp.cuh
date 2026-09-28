@@ -198,6 +198,12 @@ struct Compressible
     // steadyState. rhoOld is rho.oldTime() -- StepInput::firstIteration says which rho; psi.oldTime() is
     // the field at entry. The same term the kEpsilon port carries (kEpsilon_cpp.cuh Compressible).
     scalar                                  rDeltaT  = 0.0;
+    // ...or, under LOCALEULER, the per-cell rDeltaT in the scalar's place: kOmegaSSTBase.C:572 and :602
+    // take fvm::ddt(alpha, rho, psi), which with geometricOneField alpha and rho is fvm::ddt(psi)
+    // (fvmDdt.C:127-137) under the name `ddt(omega)`/`ddt(k)`, and localEulerDdtScheme::fvmDdt is
+    // diag = rDeltaT*V, source = (rDeltaT*psi.oldTime())*V (localEulerDdtScheme.C:243-246) -- the Euler
+    // lines below with rDeltaT read per cell. Null == the scalar; refused with `cn` or a moving mesh.
+    const std::vector<scalar>*              rDeltaTCells = nullptr;
     const std::vector<scalar>*              rhoOld   = nullptr;
     // THE FLUX nut's flux-conditional patches read (inletOutlet's phiName, `phi` by default). After the
     // field assignment OpenFOAM's nut.correctBoundaryConditions() evaluates such a patch: valueFraction =

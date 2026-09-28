@@ -1049,6 +1049,10 @@ void correctInterTurbulence(
         throw std::runtime_error(std::string(WHO) + "correctInterTurbulence needs every input field.");
     if (!(in.deltaT > 0))
         throw std::runtime_error(std::string(WHO) + "correctInterTurbulence needs a positive deltaT.");
+    if (in.rDeltaT && t.model != InterRasModel::KOmegaSST)
+        throw std::runtime_error(
+            std::string(WHO) + "a local time step (localEuler) reached a closure other than kOmegaSST, whose "
+            "fvm::ddt under it is not ported.");
     // THE SENTINELS, refused rather than defaulted: the old-time snapshot is keyed on the step index and
     // the solver dictionary is picked by the corrector, so a caller that supplied neither would silently
     // get step -1 and a non-final corrector.
@@ -1113,6 +1117,8 @@ void correctInterTurbulence(
         sstComp.nu = in.nu;
         sstComp.nuBnd = in.nuBnd;
         sstComp.rDeltaT = scalar(1) / in.deltaT;
+        // ...or, under localEuler, the local one per cell, in fvm::ddt(omega) and fvm::ddt(k)
+        sstComp.rDeltaTCells = in.rDeltaT;
         // psi.oldTime(), per STEP -- see InterTurbulence::kOldStep
         sstComp.kOldIn = &t.kOldStep;
         sstComp.omegaOldIn = &t.epsOldStep;

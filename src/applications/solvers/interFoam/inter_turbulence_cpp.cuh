@@ -301,6 +301,10 @@ struct InterTurbulenceStepInput
     const std::vector<scalar>* nu = nullptr;
     const std::vector<std::vector<scalar>>* nuBnd = nullptr;
     scalar deltaT = 0;
+    // LOCALEULER: the per-cell rDeltaT setRDeltaT.H formed this step, which the closure's fvm::ddt takes in
+    // the scalar's place (kOmegaSST::Compressible::rDeltaTCells). kOmegaSST only; the other closures
+    // refuse it. Null == 1/deltaT.
+    const std::vector<scalar>* rDeltaT = nullptr;
     // A MOVING MESH: the old volumes and the mesh flux (see kEpsilonRef::Compressible). Null on a
     // static mesh.
     const std::vector<scalar>* V0 = nullptr;
