@@ -47,6 +47,7 @@
 #include "cf_types.cuh"
 #include "displacement_laplacian_fv_motion_solver_cpp.cuh"
 #include "face_cpp.cuh"
+#include "foam_dict.cuh"
 #include "gamg_solver_cpp.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -91,6 +92,18 @@ public:
         const std::string& caseDir,
         const std::string& startDir);
 
+    // ...AND THE MOTION OF A REFINING MESH: dynamicRefineFvMesh IS a dynamicMotionSolverListFvMesh
+    // (dynamicRefineFvMesh.H:92-95), which builds one motionSolver per sub-dictionary of `solvers`
+    // (dynamicMotionSolverListFvMesh.C:98-127) with `mandatory` false (dynamicRefineFvMesh.C:1107), so no
+    // `solvers`, or an empty one, is no motion and returns null. What is ported is ONE solidBody motion of
+    // the WHOLE mesh; everything else is refused by name: more than one solver (their displacements are
+    // summed, :176-183), any other motionSolver (a displacement field or a rigid body's blend would have
+    // to be carried through every change), and a cellZone or cellSet (zoneMotion has no updateMesh, so
+    // OpenFOAM itself moves stale point labels after a change). The mesh then moves in the LIST form.
+    static std::unique_ptr<DynamicMotionSolverFvMesh> NewForRefine(
+        const std::string& caseDir,
+        const std::string& startDir);
+
     // The mesh, its geometry and its patches this motion MOVES IN PLACE: the caller's, which must
     // outlive this object. Takes points0 from the mesh as it stands.
     void attach(
@@ -115,6 +128,27 @@ public:
         bool finalIteration = false,
         GamgAgglomerationCache* agglomeration = nullptr,
         const BodyLoad* load = nullptr);
+
+    // fvMesh::updateMesh AS THE MOTION SEES IT, after a topology change at `timeIndex` and before the move
+    // (dynamicRefineFvMesh::update: updateTopology() first, the motion second, dynamicRefineFvMesh.C:1468-1474).
+    // points0 has already been mapped -- the refiner carries it (RefineUpdateState::points0) -- and `V0` is
+    // the change's: the old mesh's volumes stored once per time index, mapped, and corrected for split and
+    // merged cells (fvMesh.C:1026, dynamicRefineFvMesh.C:203-253). The mesh flux is recreated as ZERO on the
+    // new faces with no old-time level (fvMesh.C:1057-1077). curTimeIndex_ is set so the move that follows
+    // does not store V0 again (fvMesh.C:942-945); curMotionTimeIndex_ is left, so the move takes oldPoints
+    // from the REFINED points, overwriting the mapped ones (polyMesh.C:1194-1213).
+    void topoChanged(
+        std::vector<scalar> V0,
+        label               timeIndex);
+    // the carried points0, for the refiner to map in place
+    std::vector<vector>& points0Ref()
+    {
+        return points0_;
+    }
+    bool listForm() const
+    {
+        return listForm_;
+    }
 
     // polyMesh::moving(): false until the first update
     bool moving() const
@@ -186,6 +220,11 @@ public:
 
 private:
     DynamicMotionSolverFvMesh() = default;
+    static std::unique_ptr<DynamicMotionSolverFvMesh> fromMotionDict(
+        const FoamDict&    d,
+        const std::string& caseDir,
+        const std::string& startDir,
+        bool               listForm);
 
     PrimitiveMesh* m_ = nullptr;
     FvGeometry* g_ = nullptr;
@@ -204,6 +243,9 @@ private:
     bool                V00Exists_ = false;
     SurfaceScalarField meshPhi_;
     bool moving_ = false;
+    // dynamicMotionSolverListFvMesh::update moves to points() + (newPoints() - points())
+    // (dynamicMotionSolverListFvMesh.C:176-183) where dynamicMotionSolverFvMesh moves to newPoints()
+    bool listForm_ = false;
     // fvMesh::curTimeIndex_ and polyMesh::curMotionTimeIndex_
     label curTimeIndex_ = -1;
     label curMotionTimeIndex_ = -1;

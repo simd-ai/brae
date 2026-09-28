@@ -65,36 +65,28 @@ scalar faceSweptVolume(
     return sv;
 }
 
-std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::New(
+// motionSolver::New(mesh, dict) on ONE motion dictionary: the whole dynamicMeshDict for
+// dynamicMotionSolverFvMesh, or one sub-dictionary of `solvers` for a list (listForm).
+std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::fromMotionDict(
+    const FoamDict&    d,
     const std::string& caseDir,
-    const std::string& startDir)
+    const std::string& startDir,
+    bool               listForm)
 {
-    const std::string path = caseDir + "/constant/dynamicMeshDict";
-    // dynamicFvMeshNew.C: no dictionary, a static mesh
-    if (!std::filesystem::exists(path)) return nullptr;
-    const FoamDict d = readDict(path);
-    const std::string meshType = d.wordOr("dynamicFvMesh", "");
-    if (meshType.empty())
-    {
-        throw std::runtime_error(
-            std::string(WHO) + "constant/dynamicMeshDict has no `dynamicFvMesh` entry. OpenFOAM reads it "
-            "with get<word> and stops without one.");
-    }
-    if (meshType == "staticFvMesh") return nullptr;
-    if (meshType != "dynamicMotionSolverFvMesh")
-    {
-        throw std::runtime_error(
-            std::string(WHO) + "constant/dynamicMeshDict asks for `dynamicFvMesh " + meshType + "`. Only "
-            "dynamicMotionSolverFvMesh is ported (and staticFvMesh, which is no motion): a mesh that "
-            "refines or changes topology is a different mesh at every step, and running the case on "
-            "the mesh as written would solve a different problem.");
-    }
-
+    std::unique_ptr<DynamicMotionSolverFvMesh> mesh(new DynamicMotionSolverFvMesh());
     // motionSolver::New reads the name with getCompat<word>("motionSolver", {{"solver", -1612}})
     std::string solver = d.wordOr("motionSolver", "");
     if (solver.empty())
     {
         solver = d.wordOr("solver", "");
+    }
+    // ...and under refinement, ONE solidBody motion of the whole mesh (see NewForRefine)
+    if (listForm && solver != "solidBody")
+    {
+        throw std::runtime_error(
+            std::string(WHO) + "a refining mesh asks for `motionSolver " + solver + "`. Only solidBody is "
+            "ported beside refinement: a displacement solver's point field, or a rigid body's blend, would "
+            "have to be carried through every topology change.");
     }
     if (solver != "solidBody" && solver != "displacementLaplacian" && solver != "rigidBodyMotion")
     {
@@ -118,6 +110,14 @@ std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::New(
             name.clear();
         }
         if (name.empty()) continue;
+        if (listForm)
+        {
+            throw std::runtime_error(
+                std::string(WHO) + "a refining mesh's solidBody motion names `" + key + " " + name + "`. "
+                "zoneMotion builds its point list once, in its constructor, and has no updateMesh "
+                "(zoneMotion.H:76-105), so after a topology change OpenFOAM itself moves stale point labels; "
+                "only a motion of the whole mesh is ported beside refinement.");
+        }
         if (std::string(key) == "cellSet" || solver != "solidBody")
         {
             throw std::runtime_error(
@@ -158,7 +158,6 @@ std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::New(
             "beside them; brae reads the mesh from constant/polyMesh only.");
     }
 
-    std::unique_ptr<DynamicMotionSolverFvMesh> mesh(new DynamicMotionSolverFvMesh());
     if (solver == "displacementLaplacian")
     {
         mesh->displacement_ = DisplacementLaplacianFvMotionSolver::New(coeffs, caseDir, startDir);
@@ -186,7 +185,66 @@ std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::New(
     }
     mesh->SBMF_ = SolidBodyMotionFunction::New(coeffs, caseDir);
     mesh->motionType_ = mesh->SBMF_->type();
+    mesh->listForm_ = listForm;
     return mesh;
+}
+
+std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::New(
+    const std::string& caseDir,
+    const std::string& startDir)
+{
+    const std::string path = caseDir + "/constant/dynamicMeshDict";
+    // dynamicFvMeshNew.C: no dictionary, a static mesh
+    if (!std::filesystem::exists(path)) return nullptr;
+    const FoamDict d = readDict(path);
+    const std::string meshType = d.wordOr("dynamicFvMesh", "");
+    if (meshType.empty())
+    {
+        throw std::runtime_error(
+            std::string(WHO) + "constant/dynamicMeshDict has no `dynamicFvMesh` entry. OpenFOAM reads it "
+            "with get<word> and stops without one.");
+    }
+    if (meshType == "staticFvMesh") return nullptr;
+    if (meshType != "dynamicMotionSolverFvMesh")
+    {
+        throw std::runtime_error(
+            std::string(WHO) + "constant/dynamicMeshDict asks for `dynamicFvMesh " + meshType + "`. Only "
+            "dynamicMotionSolverFvMesh is ported (and staticFvMesh, which is no motion): a mesh that "
+            "refines or changes topology is a different mesh at every step, and running the case on "
+            "the mesh as written would solve a different problem.");
+    }
+
+    return fromMotionDict(d, caseDir, startDir, false);
+}
+
+std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::NewForRefine(
+    const std::string& caseDir,
+    const std::string& startDir)
+{
+    const std::string path = caseDir + "/constant/dynamicMeshDict";
+    if (!std::filesystem::exists(path)) return nullptr;
+    const FoamDict d = readDict(path);
+    if (d.wordOr("dynamicFvMesh", "") != "dynamicRefineFvMesh")
+    {
+        throw std::runtime_error(
+            std::string(WHO) + "NewForRefine is the motion of a dynamicRefineFvMesh; this dictionary asks for `"
+            + d.wordOr("dynamicFvMesh", "") + "`.");
+    }
+    const FoamDict* solvers = d.subDict("solvers");
+    if (!solvers || solvers->subs.empty()) return nullptr;
+    if (solvers->subs.size() > 1)
+    {
+        std::string names;
+        for (const std::pair<std::string, FoamDict>& sub : solvers->subs)
+        {
+            names += (names.empty() ? "" : ", ") + sub.first;
+        }
+        throw std::runtime_error(
+            std::string(WHO) + "constant/dynamicMeshDict names " + std::to_string(solvers->subs.size())
+            + " motion solvers under refinement (" + names + "). dynamicMotionSolverListFvMesh sums their "
+            "displacements (dynamicMotionSolverListFvMesh.C:176-183); one is ported.");
+    }
+    return fromMotionDict(solvers->subs.front().second, caseDir, startDir, true);
 }
 
 void DynamicMotionSolverFvMesh::attach(
@@ -261,6 +319,19 @@ void DynamicMotionSolverFvMesh::update(
     }
     PrimitiveMesh& m = *m_;
     FvGeometry& g = *g_;
+    // THE SIZES A TOPOLOGY CHANGE MUST HAVE CARRIED. The swept-volume loops below index meshPhi_ and the
+    // new points by the mesh's CURRENT face and point counts, and movePoints' own size check comes after
+    // them -- so a change this object was not told about (topoChanged) would write past the end first.
+    if (points0_.size() != m.points().size()
+     || meshPhi_.internal.size() != static_cast<std::size_t>(m.nInternalFaces())
+     || meshPhi_.boundary.size() != patches_->size())
+    {
+        throw std::runtime_error(
+            std::string(WHO) + "the mesh has " + std::to_string(m.points().size()) + " points and "
+            + std::to_string(m.nInternalFaces()) + " internal faces; points0 has "
+            + std::to_string(points0_.size()) + " and the mesh flux " + std::to_string(meshPhi_.internal.size())
+            + ". A topology change reached the mesh without reaching its motion (topoChanged).");
+    }
 
     // motionSolver::newPoints(), evaluated before fvMesh::movePoints is entered: on the mesh as it
     // stands. A displacement solver's GAMG hierarchy is the MESH's, shared with every other GAMG solve
@@ -308,6 +379,19 @@ void DynamicMotionSolverFvMesh::update(
             {
                 newPoints[static_cast<std::size_t>(pointIDs_[i])] = moved[i];
             }
+        }
+    }
+
+    // dynamicMotionSolverListFvMesh::update (:176-183): the list sums each solver's displacement from
+    // the CURRENT points and moves to points() + disp -- fl(p + fl(q - p)), not q. The two agree whenever
+    // q - p is exact, and differ by an ulp near zero; every step of a refining mesh with a motion takes
+    // this form, and the swept volumes below are taken to THESE points.
+    if (listForm_)
+    {
+        const std::vector<vector>& p = m.points();
+        for (std::size_t i = 0; i < newPoints.size(); ++i)
+        {
+            newPoints[i] = p[i] + (newPoints[i] - p[i]);
         }
     }
 
@@ -381,6 +465,41 @@ void DynamicMotionSolverFvMesh::update(
     {
         agglomeration->built = false;
     }
+}
+
+void DynamicMotionSolverFvMesh::topoChanged(
+    std::vector<scalar> V0,
+    label               timeIndex)
+{
+    if (!attached())
+    {
+        throw std::runtime_error(std::string(WHO) + "topoChanged() before attach(): no mesh.");
+    }
+    const PrimitiveMesh& m = *m_;
+    if (V0.size() != static_cast<std::size_t>(m.nCells()) || points0_.size() != m.points().size())
+    {
+        throw std::runtime_error(
+            std::string(WHO) + "after the topology change the mesh has " + std::to_string(m.nCells())
+            + " cells and " + std::to_string(m.points().size()) + " points; the change's V0 has "
+            + std::to_string(V0.size()) + " and points0 " + std::to_string(points0_.size())
+            + ". The refiner carries both (RefineUpdateState::V0, ::points0).");
+    }
+    // fvMesh::updateMesh: storeOldVol (once per index), then the mapped and corrected V0
+    V0_ = std::move(V0);
+    curTimeIndex_ = timeIndex;
+    haveTimeIndex_ = true;
+    // meshPhi recreated as zero on the new mesh, with no old-time level (fvMesh.C:1057-1077)
+    meshPhi_.internal.assign(static_cast<std::size_t>(m.nInternalFaces()), scalar(0));
+    meshPhi_.boundary.resize(patches_->size());
+    for (std::size_t pi = 0; pi < patches_->size(); ++pi)
+    {
+        meshPhi_.boundary[pi].assign(static_cast<std::size_t>((*patches_)[pi].size), scalar(0));
+    }
+    // polyMesh::updateMesh maps oldPoints, and the move that follows overwrites them from the refined
+    // points (curMotionTimeIndex_ != timeIndex): sized here only so nothing reads a stale length
+    oldPoints_ = m.points();
+    // dynamicRefineFvMesh::refine/unrefine and updateTopology: moving(false) at a change (:460, :1461)
+    moving_ = false;
 }
 
 std::vector<scalar> DynamicMotionSolverFvMesh::Vsc(const SubCycleTimeState& ts) const
