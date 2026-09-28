@@ -38,10 +38,24 @@ for cd_ in $(find "$TUT" -name controlDict -path '*/system/*' | sort); do
     # variable (the `|` stays literal), which silently selected nothing at all.
     [ -z "$ONLY" ] || printf '%s\n' "$rel" | grep -qE "$ONLY" || continue
     src="$TUT/$rel"
+    # ...AND ONLY THE CASES THAT ARE interFoam. This tree holds two that are not: the vofToLagrangian
+    # workflow STARTS with an interFoam run (eulerianInjection) and then HANDS OVER to sprayFoam, so
+    # lagrangianParticleInjection and lagrangianDistributionInjection carry `application sprayFoam` and
+    # `startFrom latestTime` -- they continue from the first run's output. Globbing every controlDict under
+    # the tree reported those two as interFoam REFUSALS, which counts a solver brae does not claim against
+    # the one it does. OpenFOAM's own `application` entry decides.
+    app=$(sed -n 's/^application  *\([A-Za-z0-9_]*\).*/\1/p' "$src/system/controlDict" | head -1)
+    if [ -n "$app" ] && [ "$app" != "interFoam" ]; then
+        printf '%-46s %-10s %s\n' "$rel" "-" "NOT interFoam (application $app)"
+        continue
+    fi
     # snappyHexMesh cases: the mesh alone outruns this sweep's budget, and a sweep that silently
-    # dropped them would read as coverage it does not have.
-    if [ -f "$src/system/snappyHexMeshDict" ]; then
-        printf '%-46s %-10s %s\n' "$rel" "-" "SKIPPED (snappyHexMesh: mesh cost outside this sweep)"
+    # dropped them would read as coverage it does not have. SNAPPY=1 lifts the skip and meshes them --
+    # measured on RAS/motorBike, SERIAL snappyHexMesh is 1.53 s for 8655 cells (maxLocalCells is the
+    # global cap in serial), so the blanket skip is not the budget it was taken for; the DTCHull pair is
+    # what MESH_TIMEOUT is really for.
+    if [ -f "$src/system/snappyHexMeshDict" ] && [ -z "${SNAPPY:-}" ]; then
+        printf '%-46s %-10s %s\n' "$rel" "-" "SKIPPED (snappyHexMesh: set SNAPPY=1 to mesh and run them)"
         continue
     fi
     c="$W/$(echo "$rel" | tr / _)"
@@ -59,7 +73,19 @@ for cd_ in $(find "$TUT" -name controlDict -path '*/system/*' | sort); do
         if [ -x ./Allrun.pre ]; then
             timeout "$MESH_TIMEOUT" ./Allrun.pre > log.allrunpre 2>&1
         fi
-        [ -f system/blockMeshDict ] || [ -f constant/polyMesh/blockMeshDict ] && [ ! -f constant/polyMesh/owner ] && timeout "$MESH_TIMEOUT" blockMesh > log.blockMesh 2>&1
+        # ...AND restore0Dir AFTER IT, because that is where the tutorials put it. RAS/mixerVesselAMI's
+        # Allrun.pre ENDS WITH `rm -rf 0` and leaves restore0Dir and setFields to its Allrun, so a sweep that
+        # copies 0.orig only BEFORE the prep has no fields at all afterwards -- brae then says "cannot open
+        # <case>/0/alpha.water", correctly, and it reads as a brae gap. This runs before the setFields below,
+        # which is the order Allrun uses.
+        [ -d 0.orig ] && [ ! -d 0 ] && cp -r 0.orig 0
+        # ...AND `owner.gz` COUNTS AS A MESH HERE TOO. A case with `writeCompression on` -- sloshingCylinder
+        # is one -- has its Allrun.pre leave a GZIPPED mesh, so a guard that tests only the plain file finds
+        # none and re-runs blockMesh, OVERWRITING the snappy mesh its own Allrun.pre just built. The fields
+        # stay at the snappy count and brae then refuses the pair by name: "field internalField has 33568
+        # values but the mesh has 4900 cells", which reads as a brae gap and is this line. The same .gz blind
+        # spot was already found once for the NO MESH check below; this guard was left behind.
+        [ -f system/blockMeshDict ] || [ -f constant/polyMesh/blockMeshDict ] && [ ! -f constant/polyMesh/owner ] && [ ! -f constant/polyMesh/owner.gz ] && timeout "$MESH_TIMEOUT" blockMesh > log.blockMesh 2>&1
         [ -f system/extrudeMeshDict ]   && timeout "$MESH_TIMEOUT" extrudeMesh    > log.extrude 2>&1
         [ -f system/topoSetDict ]       && timeout "$MESH_TIMEOUT" topoSet        > log.topoSet 2>&1
         [ -f system/createBafflesDict ] && timeout "$MESH_TIMEOUT" createBaffles -overwrite > log.baffles 2>&1
