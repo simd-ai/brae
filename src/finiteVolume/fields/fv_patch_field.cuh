@@ -3365,6 +3365,27 @@ public:
     {
         this->value_ = wallVelocity(p, origin, axis, omega);
     }
+
+    // ...AND THE FORM THAT STARTS FROM THE FILE'S OWN `value`, which is what OpenFOAM does when the entry is
+    // there: `if (!this->readValueEntry(dict)) { updateCoeffs(); }`
+    // (rotatingWallVelocityFvPatchVectorField.C:62-68) -- it reads the written value and does NOT compute, so
+    // that value stands until the first updateCoeffs of the run. brae puts updateCoeffs in evaluate() below,
+    // so seeding the base here and letting the first evaluate replace it is the same sequence. A written
+    // value used to be REFUSED by name, which stopped RAS/mixerVesselAMI, whose `shaft` patch has one.
+    RotatingWallVelocityPatchField(
+        const FvPatch& p,
+        const vector& origin,
+        const vector& axis,
+        scalar omega,
+        bool fileUniform,
+        const vector& fileUniformValue,
+        std::vector<vector> fileValues)
+        : FixedValuePatchField<vector>(p, fileUniform, fileUniformValue, std::move(fileValues)),
+          origin_(origin),
+          axis_(axis),
+          omega_(omega)
+    {
+    }
     void evaluate(const std::vector<vector>& internal) override
     {
         // setStoredValues stores the new values and then evaluates, which lands back here: the inner
@@ -4104,15 +4125,15 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
                     "brae: rotatingWallVelocity on patch " + p.name + " needs `origin`, a non-zero `axis` and "
                     "`omega` (rotatingWallVelocityFvPatchVectorField.C:52-54).");
             }
-            // OpenFOAM keeps a written `value` until the condition's first updateCoeffs; brae's host
-            // evaluates where that value would still stand, so a written value is refused rather than
-            // replaced early
+            // A WRITTEN `value` IS HONOURED, as OpenFOAM honours it: readValueEntry succeeds, updateCoeffs is
+            // NOT called, and the file's value stands until the first updateCoeffs of the run
+            // (rotatingWallVelocityFvPatchVectorField.C:62-68). brae's evaluate() is that updateCoeffs, so the
+            // value is seeded here and replaced there. It used to be refused, which stopped
+            // RAS/mixerVesselAMI on both arms -- its `shaft` patch writes one.
             if (d.hasValue)
             {
-                throw std::runtime_error(
-                    "brae: rotatingWallVelocity on patch " + p.name + " carries a written `value`. OpenFOAM "
-                    "keeps it until the condition's first updateCoeffs; brae would recompute it at once. "
-                    "Refused rather than start from a different wall velocity.");
+                return std::make_unique<RotatingWallVelocityPatchField>(
+                    p, d.rwOrigin, d.rwAxis, d.rwOmega, d.valueUniform, d.uniformValue, d.values);
             }
             return std::make_unique<RotatingWallVelocityPatchField>(p, d.rwOrigin, d.rwAxis, d.rwOmega);
         }
