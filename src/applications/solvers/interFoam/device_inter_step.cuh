@@ -307,6 +307,10 @@ struct DeviceInterStepControls
     // coefficient, 0 = unlimited) for the p_rgh laplacian -- see DeviceInterPressureInput
     int    nNonOrthogonalCorrectors = 0;
     bool   correctedLaplacian = false;
+    // ...and grad(p_rgh)'s own gradSchemes entry, which that correction is built from: the two numbers a
+    // GradChoice holds, forwarded to DeviceInterPressureInput below and taken there by deviceGradOf.
+    bool   prghGradLeastSquares = false;
+    scalar prghGradCellLimitK = 0;
     bool   nonOrthCoeffs = false;   // nonOrthDeltaCoeffs without the correction -- inter_ueqn_cpp.cuh:181
     scalar snGradLimitCoeff = 0;
     bool   momentumPredictor = true;         // damBreak sets this OFF
@@ -332,6 +336,7 @@ struct DeviceInterStepControls
     // takes. On interFoam's tutorials they are the same word twice, but they are separate lookups.
     scalar gradULimitK             = 0;
     scalar gradUSchemeLimitK       = 0;
+    bool   gradUSchemeLeastSq      = false;   // that entry's base scheme; see gpu::MomentumInput
 
     // polyMesh::solutionD() -- which coordinate directions the vector equation is SOLVED in. On a 2-D
     // case the empty direction is knocked out, and fvMatrix::H()'s validComponents block skips it. This

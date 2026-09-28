@@ -93,6 +93,18 @@ struct DeviceAlphaStepInput
 
     DeviceAlphaScheme alphaScheme  = DeviceAlphaScheme::vanLeer;
     DeviceAlphaScheme alpharScheme = DeviceAlphaScheme::linear;
+    // THE GRADIENT EACH LIMITER READS, by the case's own gradSchemes entry -- the two numbers a GradChoice
+    // holds (grad_choice.cuh), one pair per field because the host takes them that way: fluxWithScheme is
+    // handed gradAlpha1 for alpha1 and gradAlpha2 for alpha2 (alpha_eqn_cpp.cu:324-356). A limited scheme's
+    // limiter calls fvc::grad on its own field, so the entry that governs it is that field's.
+    bool   gradAlpha1LeastSquares = false;
+    scalar gradAlpha1CellLimitK   = 0;
+    bool   gradAlpha2LeastSquares = false;
+    scalar gradAlpha2CellLimitK   = 0;
+    // ...and the interface normal's, which is NOT alpha1's entry: interfaceProperties.C:117 asks
+    // fvc::grad(alpha1_, "nHat"), so the gradSchemes entry named nHat governs it (InterfaceCoeffs::nHatGrad).
+    bool   nHatGradLeastSquares = false;
+    scalar nHatGradCellLimitK   = 0;
 
     // THE SEMI-IMPLICIT PATH, `MULESCorr yes` -- 13 of the 44 shipped tutorials, damBreak among them
     // (nAlphaCorr 2, nLimiterIter 5). The caller runs deviceAlphaPreSolve ONCE per sub-cycle before
@@ -143,6 +155,11 @@ struct DeviceAlphaBoundary
     // phi_b*psi_b -- so the correction is no longer zero there. Null on a case with no such patch, and
     // then nothing below changes by a bit. See inter_waves_cpp.cuh for what was and was not measured.
     std::function<void(const DeviceBuffer<scalar>& alpha1)> updateModelled;
+    // OUT, optional: alpha1 as MULES left it on a corrector that RELAXES (MULESCorr, every corrector but
+    // the first), copied before the average. OpenFOAM's MULES::correct ends in
+    // psi.correctBoundaryConditions() on THESE cells, and the relaxation then ASSIGNS the patch values
+    // rather than evaluating them (alpha_eqn_cpp.cuh relaxAlphaBoundary), so the caller needs both.
+    DeviceBuffer<scalar>* alphaPostMules = nullptr;
 };
 
 // ONE corrector of alphaEqn.H:157-220 -- the flux and the MULES solve, and NOT mixture.correct().

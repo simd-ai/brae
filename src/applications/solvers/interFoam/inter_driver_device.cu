@@ -547,6 +547,24 @@ RunReport runInterFoamDevice(
     // ...AND A VELOCITY CONDITION THAT NAMES A FLUX OTHER THAN phi. p_rgh's and alpha's conditions are
     // evaluated on the host, which hands each the flux its `phi` entry names (namedPatchFlux, through
     // pushFlux below). U's pressureInletOutletVelocity switch runs ON THE DEVICE and reads phi.
+    //
+    // WHAT THIS REFUSAL IS WORTH, MEASURED -- so the next attempt starts here instead of repeating one.
+    // laminar/damBreak with `phi rhoPhi;` added to U's pressureInletOutletVelocity, five fixed steps at
+    // 1e-3 with the solvers pinned, against a real OpenFOAM run of the same case:
+    //     host arm vs OpenFOAM          alpha 3.6637e-15, p_rgh 1.2278e-11, U 6.1586e-14   -- the floor
+    //     device arm vs the host arm    alpha 4.8898e-13, p_rgh 1.9327e-07, U 2.6075e-07
+    //     the same case WITHOUT the entry, device vs host                  U 4.7210e-14
+    // so the entry alone moves the device 2.6e-07 from OpenFOAM, and this is what stops it.
+    //
+    // AND SUBSTITUTING rhoPhiBnd FOR phiBnd AT THE DEVICE'S U SWITCHES DOES NOT CLOSE IT. That was tried:
+    // the six switch sites in deviceInterStep and the two here, fed from one buffer with the mass flux
+    // copied in per patch. It changed NOTHING, to every digit, and a probe said why -- on damBreak's
+    // atmosphere the device's rhoPhiBnd EQUALS its phiBnd on all 46 faces at every step, worst difference
+    // 0.0 and zero sign flips, which is what `rhoPhi = alphaPhi*(rho1 - rho2) + phiCN*rho2` gives where
+    // alpha is 0 and rho2 is 1. The host's rhoPhi and phi do NOT agree at the corrector sites, so the two
+    // arms are not reading the same pair of quantities: the gap is WHEN each flux is taken, not which array
+    // the switch is handed. Whoever takes this next should compare the device's rhoPhiBnd against the host's
+    // rhoPhi boundary at each switch site before changing anything.
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         const std::string& name = f.U.boundary[pi]->fluxName();
@@ -764,6 +782,42 @@ RunReport runInterFoamDevice(
         f.alpha1.evaluateBoundary();
         aBnd.copyFrom(patchValues(f.alpha1, fvp));
     };
+    // A RELAXED CORRECTOR'S BOUNDARY, as the host corrector takes it (alpha_eqn_cpp.cu): MULES's own
+    // evaluate on the cells it left, then the relaxation's assignment through each patch's operator=.
+    // f.alpha1's patch values on entry are alpha10's -- the last mixture.correct() left them, contact
+    // angle included, and `volScalarField alpha10("alpha10", alpha1)` (VoF/alphaEqn.H:181) copies
+    // exactly that.
+    H.alpha.relaxBoundary =
+        [&](const DeviceBuffer<scalar>& postMules, const DeviceBuffer<scalar>& relaxed,
+            DeviceBuffer<scalar>& aBnd)
+    {
+        pushFlux();
+        std::vector<std::vector<scalar>> alpha10B(f.alpha1.boundary.size());
+        for (std::size_t pi = 0; pi < f.alpha1.boundary.size(); ++pi)
+        {
+            alpha10B[pi] = f.alpha1.boundary[pi]->value();
+        }
+        postMules.copyTo(f.alpha1.internal);
+        f.alpha1.evaluateBoundary();
+        relaxed.copyTo(f.alpha1.internal);
+        cpu::interFoam::relaxAlphaBoundary(f.alpha1, alpha10B);
+        aBnd.copyFrom(patchValues(f.alpha1, fvp));
+    };
+    // ...and updateBoundary's mixture.correct() WITHOUT its evaluate, which would overwrite that
+    // assignment with the relaxed cells' evaluate
+    H.alpha.mixtureCorrect =
+        [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& aBnd, DeviceBuffer<scalar>& nBnd)
+    {
+        pushFlux();
+        a.copyTo(f.alpha1.internal);
+        aBnd.copyFrom(patchValues(f.alpha1, fvp));
+        updateMixtureBoundary(f, fvp);
+        refreshAlphaFixes();
+        SurfaceScalarField nHb;
+        std::vector<scalar> Kb;
+        interfaceProps::calculateK(f.alpha1, f.interface, m, g, fvp, false, nHb, Kb);
+        nBnd.copyFrom(flattenPatches(nHb.boundary, fvp));
+    };
     if (f.waves.any)
     {
         H.alpha.updateModelledBoundary =
@@ -916,8 +970,13 @@ RunReport runInterFoamDevice(
             DeviceBuffer<scalar>& stf, DeviceBuffer<scalar>& snRho,
             DeviceBuffer<scalar>& nuC, DeviceBuffer<scalar>& nuB, DeviceBuffer<scalar>& snP)
     {
+        // ...and NOT alpha's boundary: alphaEqnSubCycle.H evaluates alpha nowhere after the sub-cycle,
+        // and the alpha step's last hook left f.alpha1's patch values as OpenFOAM's stand -- after a
+        // relaxed corrector that is an ASSIGNMENT, which an evaluate here overwrote (the host driver
+        // dropped the same line, inter_driver_cpp.cu's alphaSubCycle stage). MEASURED on
+        // RAS/electrostaticDeposition at step two: 240 variableHeightFlowRate faces 5.1256e-10 from the
+        // value OpenFOAM wrote, exactly on its owner cell.
         a.copyTo(f.alpha1.internal);
-        f.alpha1.evaluateBoundary();
         Kd.copyTo(f.K);
         rd.copyTo(f.rho);
 
@@ -1451,23 +1510,38 @@ RunReport runInterFoamDevice(
     C.alpha.alphaApplyPrevCorr = f.alphaCtl.alphaApplyPrevCorr;
     C.alpha.prevCorrInt = &dPrevCorrI;
     C.alpha.prevCorrBnd = &dPrevCorrB;
-    // gradSchemes: the device operators take Gauss linear and unlimited on THESE fields; grad(U),
-    // grad(k) and grad(omega) carry cellLimited. The host takes leastSquares and cellLimited on every
-    // gradient. NOT grad(pcorr):
-    // CorrectPhi runs on the host on both arms (correctPhi, inter_correct_phi_cpp.cu) and takes the entry
-    // through correctPhiControlsOf -- gated on LES/nozzleFlow2D `pcorrGrad`, grad(pcorr) leastSquares on
-    // a mesh non-orthogonal to 40 degrees with one non-orthogonal pass, where the entry moves OpenFOAM's
-    // own U by 1.7e-05.
-    for (const GradChoice* gc : {&f.gradAlpha1, &f.gradAlpha2, &f.gradPrgh, &f.gradRho,
-                                 &f.interface.nHatGrad})
-    {
-        if (!gc->gaussLinear() || f.gradULeastSq)
-            throw std::runtime_error(
-                "brae interFoam (device): fvSchemes gradSchemes names a leastSquares or cellLimited "
-                "gradient for alpha, p_rgh, rho, U or nHat. The host loop takes each by its own entry "
-                "(gated on laminar/damBreak `gradLsqLimited`); the device operators are Gauss linear. "
-                "Refused rather than run another gradient.");
-    }
+    // gradSchemes: every scalar gradient on this arm takes the case's own entry. grad(p_rgh) goes through
+    // deviceGradOf at the corrected laplacian's explicit correction; alpha1's and alpha2's limiter
+    // gradients through the alpha step (DeviceAlphaStepInput::gradAlpha1LeastSquares and its siblings);
+    // nHat through deviceInterfaceCorrect (DeviceAlphaStepInput::nHatGradLeastSquares); grad(rho)'s one
+    // consumer is snGrad(rho), which the interfaceForces hook takes on the HOST with f.gradRho. NOT
+    // grad(pcorr): CorrectPhi runs on the host on both arms (correctPhi, inter_correct_phi_cpp.cu) and
+    // takes the entry through correctPhiControlsOf -- gated on LES/nozzleFlow2D `pcorrGrad`, grad(pcorr)
+    // leastSquares on a mesh non-orthogonal to 40 degrees with one non-orthogonal pass, where the entry
+    // moves OpenFOAM's own U by 1.7e-05.
+    //
+    // RAS/electrostaticDeposition is the case that needs them: `gradSchemes { default cellLimited
+    // leastSquares 1; }`, host arm RUNS. It is the only device refusal in this port that a stock
+    // tutorial reaches, which is why the sites were lifted at all.
+    C.alphaInput.nHatGradLeastSquares = f.interface.nHatGrad.leastSquares;
+    C.alphaInput.nHatGradCellLimitK   = f.interface.nHatGrad.cellLimitK;
+    // deviceInterfaceCorrect takes grad(alpha1) unsmoothed; the host's calculateK smooths a copy first
+    // (interfaceProperties.C:119-131), and the boundary hook above runs THAT one, so without this the
+    // two halves of one nHatf would come from two different fields
+    if (f.interface.nAlphaSmoothCurvature > 0)
+        throw std::runtime_error(
+            "brae interFoam (device): nAlphaSmoothCurvature is not ported to the device curvature "
+            "(deviceInterfaceCorrect). The host arm runs it. Refused rather than take the unsmoothed "
+            "gradient.");
+    // grad(U) under leastSquares: the momentum's dev2 term takes it (gpu::MomentumInput::
+    // gradUSchemeLeastSq, which refuses it beside any site still Gauss), and so do the kEpsilon and
+    // kOmegaSST closures (co.gradULeastSq, inter_turbulence_cpp.cu readGradU). The LES kEqn closure
+    // does not: device_les_keqn.cu builds its production from deviceGradU alone.
+    if (f.gradULeastSq && f.turbulence.model == cpu::interFoam::InterRasModel::KEqnLES)
+        throw std::runtime_error(
+            "brae interFoam (device): fvSchemes grad(U) resolves to leastSquares under LES kEqn, whose "
+            "device closure takes grad(U) Gauss (device_les_keqn.cu). The host arm runs it. Refused "
+            "rather than run another gradient.");
     C.alpha.preSolve.minIter = f.aSolve.minIter;   // gated on laminar/damBreak `alphaminiter`
     C.alpha.preSolve.tol = f.aSolve.tol;
     C.alpha.preSolve.relTol = f.aSolve.relTol;
@@ -1500,6 +1574,12 @@ RunReport runInterFoamDevice(
     };
     C.alphaInput.alphaScheme  = alphaScheme(f.divPhiAlpha, "div(phi,alpha)");
     C.alphaInput.alpharScheme = alphaScheme(f.divPhirbAlpha, "div(phirb,alpha)");
+    // ...and the gradient each limiter reads, by the field's OWN gradSchemes entry, as the host hands
+    // fluxWithScheme gradAlpha1 for alpha1 and gradAlpha2 for alpha2 (alpha_eqn_cpp.cu:324-356)
+    C.alphaInput.gradAlpha1LeastSquares = f.gradAlpha1.leastSquares;
+    C.alphaInput.gradAlpha1CellLimitK   = f.gradAlpha1.cellLimitK;
+    C.alphaInput.gradAlpha2LeastSquares = f.gradAlpha2.leastSquares;
+    C.alphaInput.gradAlpha2CellLimitK   = f.gradAlpha2.cellLimitK;
     // EVERY SCHEME NAMED, NO default: this switch used to end in `default: upwind`, and interFoam's
     // `linear` -- which its own enum carries and three shipped tutorials name -- fell through it, so
     // a -device run of such a case would have convected upwind under the name `linear`.
@@ -1545,8 +1625,13 @@ RunReport runInterFoamDevice(
     // it made unreachable: the refusal-in-front-of-a-substitution shape again.
     C.gradULimitK       = f.gradULimitK;
     C.gradUSchemeLimitK = f.gradULimitK;
+    C.gradUSchemeLeastSq = f.gradULeastSq;
     C.frozenFlow = f.pimple.frozenFlow;
     C.correctedLaplacian = f.laplacianScheme.corrected;
+    // ...and grad(p_rgh)'s own gradSchemes entry, which the corrected laplacian's explicit correction is
+    // built from. The host takes it through gradOf; the device now takes the same two numbers.
+    C.prghGradLeastSquares = f.gradPrgh.leastSquares;
+    C.prghGradCellLimitK   = f.gradPrgh.cellLimitK;
     C.nonOrthCoeffs = f.laplacianScheme.nonOrthCoeffs;
     C.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
     C.momentumPredictor = f.momentumPredictorOn;
@@ -3053,9 +3138,10 @@ RunReport runInterFoamDevice(
         }
     }
 
-    // hand the device's answer back through the host fields, so a caller compares the same objects
+    // hand the device's answer back through the host fields, so a caller compares the same objects.
+    // alpha's patch values are the ones the last alpha step's hooks left, not re-evaluated: see the
+    // interfaceForces hook.
     dA.copyTo(f.alpha1.internal);
-    f.alpha1.evaluateBoundary();
     { std::vector<scalar> x, y, z;
       dUx.copyTo(x); dUy.copyTo(y); dUz.copyTo(z);
       for (label c = 0; c < nC; ++c) f.U.internal[c] = vector{x[c], y[c], z[c]};

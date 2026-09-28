@@ -88,6 +88,9 @@ void deviceInterfaceCorrect(
     const DeviceBuffer<scalar>& alpha1Bnd,      // the patch values the host has just evaluated
     const DeviceBuffer<scalar>& nHatfBnd,       // contact angle already applied, where there is one
     scalar                      deltaN,
+    // the gradSchemes entry NAMED nHat (interfaceProperties.C:117), as a GradChoice's two numbers
+    bool                        gradLeastSquares,
+    scalar                      gradCellLimitK,
     DeviceBuffer<scalar>&       nHatfInt,
     DeviceBuffer<scalar>&       K,
     // THE PAIR: its faces carry an interface normal like any other, and the curvature's divergence sums

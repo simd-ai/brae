@@ -34,8 +34,17 @@
 // PRECONDITIONER, which six of the seven solid-body tutorials name. Every GAMG control whose branch is not
 // ported is refused by name: mergeLevels above 1, another agglomerator, updateInterval,
 // cacheAgglomeration no, interpolateCorrection, directSolveCoarsest, a coarsestLevelCorr dictionary,
-// a processorAgglomerator, and any smoother but DIC, DICGaussSeidel, GaussSeidel and symGaussSeidel
-// -- on `-device`, any smoother but DIC. Any OTHER solver for p_rgh still substitutes, under a notice.
+// a processorAgglomerator, and any smoother but DIC, DICGaussSeidel, GaussSeidel and symGaussSeidel --
+// the device's GAMG runs those same four. Any OTHER solver for p_rgh still substitutes, under a notice.
+//
+// AND THE SMOOTHER REFUSALS SAY WHICH KIND THEY ARE, because two of them are not gaps. OpenFOAM selects a
+// smoother from the SYMMETRIC table when the matrix is symmetric and the ASYMMETRIC one otherwise
+// (lduMatrixSmoother.C:29-57), and the registrations split: DIC/DICGaussSeidel/FDIC are symmetric-only,
+// DILU/DILUGaussSeidel asymmetric-only, the Gauss-Seidels both. brae's gamgSolve refuses an asymmetric
+// matrix outright, so `smoother DILU` on p_rgh is invalid IN OPENFOAM TOO -- measured on
+// laminar/waves/stokesI, where real OpenFOAM stops with "Unknown symmetric matrix smoother type DILU".
+// Porting it would accept a case OpenFOAM rejects, so neither path ever should; FDIC and
+// nonBlockingGaussSeidel are the two that really are missing work, and the refusal names the difference.
 //
 // AND A MOVING MESH, on the host: dynamicMotionSolverFvMesh with the solidBody solver moving the
 // whole mesh under any of OpenFOAM's motion functions but drivenLinearMotion
@@ -79,10 +88,15 @@
 // snGrads on a mesh that is not orthogonal (the tanks' 44 degrees), through the pressure equation,
 // the viscous term and the three snGrads -- AND `uncorrected` and `limited 0`, which take those same
 // nonOrthDeltaCoeffs with the correction flux left off (uncorrectedSnGrad.H:113-119). Both used to run
-// ORTHOGONAL: `uncorrected` behind a refusal, `limited 0` behind nothing at all. What is still refused
-// is every gradSchemes entry but `Gauss linear` -- gradSchemes were not read at all before. `-device`
-// RUNS all of it (device_sheared_corrected, device_sheared_uncorrected) and refuses a leastSquares or
-// cellLimited gradient (device_gradLsq, device_gradNHat).
+// ORTHOGONAL: `uncorrected` behind a refusal, `limited 0` behind nothing at all. `-device` RUNS all of it
+// (device_sheared_corrected, device_sheared_uncorrected).
+//
+// AND EVERY gradSchemes ENTRY by the name its call site asks for -- `Gauss linear`, `leastSquares` and
+// `cellLimited` over either -- on the host (laminar/damBreak `gradLsqLimited`, `nHatLimited`) and on the
+// device, whose scalar gradients and grad(U)'s dev2 term take them: RAS/electrostaticDeposition
+// (`default cellLimited leastSquares 1`) runs on both arms (tests/interfoam_moving_vs_openfoam.sh
+// `esd`). What the device still refuses is a leastSquares grad(U) beside a site its momentum assembly
+// builds Gauss: a deferred correction, a V-scheme limiter or a corrected laplacian (device_gradLsq).
 //
 // AND div(rhoPhi,U) AS THE CASE NAMES IT, on both paths: upwind, linear, linearUpwind, linearUpwindV,
 // limitedLinearV, LUST and vanLeerV -- the last the V-limited vanLeer the closed-tank tutorials use.
@@ -154,7 +168,7 @@
 //
 // BEGIN DEVICE REFUSALS
 //   device_closed device_gamg_smootherDILU device_gradLsq
-//   device_gradNHat device_leak_explicit device_mesh_dynamic
+//   device_leak_explicit device_mesh_dynamic
 //   device_permeable_moving device_ras_otherModel device_refine_motion
 //   device_Uflux_rhoPhi
 // END DEVICE REFUSALS

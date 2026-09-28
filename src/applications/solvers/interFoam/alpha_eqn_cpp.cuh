@@ -298,6 +298,13 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
                   std::vector<scalar>&                    K,
                   SurfaceScalarField*                     prevCorr = nullptr);
 
+// The BOUNDARY half of `alpha1 = 0.5*alpha1 + 0.5*alpha10` (VoF/alphaEqn.H:197-201). `alpha1` arrives
+// with its RELAXED cells and the patch values MULES's trailing correctBoundaryConditions left;
+// `alpha10B` is every patch's value when alpha10 was copied, before MULES. One function for both arms:
+// the host's corrector and the device loop's relaxBoundary hook.
+void relaxAlphaBoundary(GeometricField<scalar>&                  alpha1,
+                        const std::vector<std::vector<scalar>>&  alpha10B);
+
 } // namespace interFoam
 } // namespace cpu
 } // namespace brae

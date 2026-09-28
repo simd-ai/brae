@@ -66,6 +66,29 @@ struct DeviceInterAlphaHooks
         const DeviceBuffer<scalar>& alpha1,
         DeviceBuffer<scalar>& alpha1Bnd)> refreshBoundary;
 
+    // THE RELAXED CORRECTOR'S BOUNDARY, and the mixture.correct() after it with no evaluate in front.
+    // Both or neither; when absent a relaxed corrector falls back to updateBoundary.
+    //
+    // updateBoundary's evaluate stands in for MULES's trailing correctBoundaryConditions, which is
+    // right after a solve and WRONG after `alpha1 = 0.5*alpha1 + 0.5*alpha10` (VoF/alphaEqn.H:197-201):
+    // that is an assignment, and a mixed-family patch keeps its post-MULES value through it. So:
+    //   relaxBoundary  -- evaluate on the POST-MULES cells, then relaxAlphaBoundary (alpha_eqn_cpp.cuh)
+    //                     on the relaxed ones, leaving alpha1Bnd what OpenFOAM's alpha1 carries;
+    //   mixtureCorrect -- updateBoundary's mixture boundary and curvature pass, from alpha's patch
+    //                     values AS THEY STAND. mixture.correct() evaluates no alpha patch but a
+    //                     contact-angle one (interfaceProperties.C:97), which the curvature pass does.
+    // MEASURED on RAS/electrostaticDeposition at step two, before these existed: the device's
+    // variableHeightFlowRate faces sat EXACTLY on OpenFOAM's owner cell, 5.1256e-10 from the value
+    // OpenFOAM wrote -- the host's pre-fix signature -- and U 1.17e-07 against the host's 4.8e-10.
+    std::function<void(
+        const DeviceBuffer<scalar>& alphaPostMules,
+        const DeviceBuffer<scalar>& alphaRelaxed,
+        DeviceBuffer<scalar>&       alpha1Bnd)> relaxBoundary;
+    std::function<void(
+        const DeviceBuffer<scalar>& alpha1,
+        DeviceBuffer<scalar>&       alpha1Bnd,
+        DeviceBuffer<scalar>&       nHatfBnd)> mixtureCorrect;
+
     // fvm::div(phiCN, alpha1)'s internalCoeffs and boundaryCoeffs, flattened in boundary-face order.
     // Only reached when MULESCorr is on; a case without it never needs them and passing none is fine.
     // `phiCNBnd` is phiCN on the boundary faces, in the device's layout: the flux the coefficients

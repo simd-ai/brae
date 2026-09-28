@@ -645,41 +645,7 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
             {
                 for (label c = 0; c < nC; ++c)
                     alpha1.internal[c] = scalar(0.5)*alpha1.internal[c] + scalar(0.5)*alpha10[c];
-                // THE BOUNDARY HALF IS AN ASSIGNMENT, NOT AN EVALUATE. Each patch field takes it
-                // through its own virtual operator= (GeometricBoundaryField::operator= ->
-                // FieldField::operator=), so there are three behaviours and not one:
-                //   * a COUPLED patch is evaluated on the RELAXED internal field, because every
-                //     field-algebra result calls correctLocalBoundaryConditions()
-                //     (GeometricFieldFunctionsM.C:50 and ~14 more sites) and
-                //     coupledFvPatchField::evaluateLocal IS evaluate (coupledFvPatchField.H:188-205),
-                //     so the right-hand side arrives already carrying that evaluate;
-                //   * a patch whose type inherits fixedValue's or mixed's EMPTY operator= keeps the
-                //     value its last evaluate left -- the POST-MULES one, since MULES::correct ends in
-                //     psi.correctBoundaryConditions() (CMULESTemplates.C) as correctLimited does
-                //     (mules_cpp.cu:750);
-                //   * every other patch takes the averaged value.
-                // MEASURED on RAS/damBreakLeakage, host arm: alpha 3.4528e-13, p_rgh 1.5162e-13,
-                // U 4.9734e-12 -- the gate's own floor, and identical to evaluating every patch,
-                // because on that case every type's evaluate commutes with the 0.5/0.5 average. The
-                // case it is NOT identical on is a mixed-family alpha patch on an outflow face, which
-                // is RAS/DTCHull's and RAS/electrostaticDeposition's `variableHeightFlowRate`.
-                for (std::size_t pi = 0; pi < alpha1.boundary.size(); ++pi)
-                {
-                    if (alpha1.boundary[pi]->coupled()) continue;
-                    if (!alpha1.boundary[pi]->ofAssignmentWritesValue()) continue;
-                    std::vector<scalar> v = alpha1.boundary[pi]->value();
-                    for (std::size_t i = 0; i < v.size() && i < alpha10B[pi].size(); ++i)
-                        v[i] = scalar(0.5)*v[i] + scalar(0.5)*alpha10B[pi][i];
-                    alpha1.boundary[pi]->setValue(v);
-                }
-                // ...and the coupled patches in evaluateBoundary's own order (geometric_field.cuh:25).
-                for (std::size_t pi = 0; pi < alpha1.boundary.size(); ++pi)
-                    if (alpha1.boundary[pi]->coupled())
-                        alpha1.boundary[pi]->initEvaluate(alpha1.internal);
-                Pstream::waitAll();
-                for (std::size_t pi = 0; pi < alpha1.boundary.size(); ++pi)
-                    if (alpha1.boundary[pi]->coupled())
-                        alpha1.boundary[pi]->evaluate(alpha1.internal);
+                relaxAlphaBoundary(alpha1, alpha10B);
             }
             for (std::size_t f = 0; f < corr.internal.size(); ++f)
                 alphaPhi10.internal[f] += w * corr.internal[f];
@@ -747,6 +713,44 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
     // rhoPhi = alphaPhi10*(rho1 - rho2) + phiCN*rho2, alphaEqn.H:248. The Euler branch multiplies
     // rho2 by phiCN; the CrankNicolson one by phi, and they are the same field only when ocCoeff is 0.
     massFlux(alphaPhi10, *in.phiCN, in.rho1, in.rho2, rhoPhi);
+}
+
+void relaxAlphaBoundary(GeometricField<scalar>&                  alpha1,
+                        const std::vector<std::vector<scalar>>&  alpha10B)
+{
+    // THE BOUNDARY HALF IS AN ASSIGNMENT, NOT AN EVALUATE. Each patch field takes it through its own
+    // virtual operator= (GeometricBoundaryField::operator= -> FieldField::operator=), so there are three
+    // behaviours and not one:
+    //   * a COUPLED patch is evaluated on the RELAXED internal field, because every field-algebra result
+    //     calls correctLocalBoundaryConditions() (GeometricFieldFunctionsM.C:50 and ~14 more sites) and
+    //     coupledFvPatchField::evaluateLocal IS evaluate (coupledFvPatchField.H:188-205), so the
+    //     right-hand side arrives already carrying that evaluate;
+    //   * a patch whose type inherits fixedValue's or mixed's EMPTY operator= keeps the value its last
+    //     evaluate left -- the POST-MULES one, since MULES::correct ends in
+    //     psi.correctBoundaryConditions() (CMULESTemplates.C) as correctLimited does (mules_cpp.cu:750);
+    //   * every other patch takes the averaged value.
+    // MEASURED on RAS/damBreakLeakage, host arm: alpha 3.4528e-13, p_rgh 1.5162e-13, U 4.9734e-12 --
+    // the gate's own floor, and identical to evaluating every patch, because on that case every type's
+    // evaluate commutes with the 0.5/0.5 average. The case it is NOT identical on is a mixed-family
+    // alpha patch on an outflow face, which is RAS/DTCHull's and RAS/electrostaticDeposition's
+    // `variableHeightFlowRate`.
+    for (std::size_t pi = 0; pi < alpha1.boundary.size(); ++pi)
+    {
+        if (alpha1.boundary[pi]->coupled()) continue;
+        if (!alpha1.boundary[pi]->ofAssignmentWritesValue()) continue;
+        std::vector<scalar> v = alpha1.boundary[pi]->value();
+        for (std::size_t i = 0; i < v.size() && i < alpha10B[pi].size(); ++i)
+            v[i] = scalar(0.5)*v[i] + scalar(0.5)*alpha10B[pi][i];
+        alpha1.boundary[pi]->setValue(v);
+    }
+    // ...and the coupled patches in evaluateBoundary's own order (geometric_field.cuh:25).
+    for (std::size_t pi = 0; pi < alpha1.boundary.size(); ++pi)
+        if (alpha1.boundary[pi]->coupled())
+            alpha1.boundary[pi]->initEvaluate(alpha1.internal);
+    Pstream::waitAll();
+    for (std::size_t pi = 0; pi < alpha1.boundary.size(); ++pi)
+        if (alpha1.boundary[pi]->coupled())
+            alpha1.boundary[pi]->evaluate(alpha1.internal);
 }
 
 } // namespace interFoam

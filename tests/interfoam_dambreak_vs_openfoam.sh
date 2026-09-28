@@ -124,6 +124,9 @@
 # the surface-tension snGrad(alpha)'s 3.4e-04.
 #   `nHatLimited` is `nHat cellLimited Gauss linear 1` alone, at the SMALL step: alpha 5.6e-13, p_rgh
 # 1.1e-10 and U 2.5e-10 relative (the entry moves OpenFOAM's alpha 6.3e-05; the limiter dropped, 6.3e-05).
+# THE DEVICE RUNS IT TOO (deviceInterfaceCorrect takes the entry): alpha 3.0e-13, p_rgh 8.7e-11, U 1.6e-10;
+# its limiter dropped reads alpha 6.3017e-05. `gradLsqLimited` stays refused on the device, in its
+# momentum assembly: leastSquares grad(U) beside the linearUpwind correction and corrected laplacian.
 # At the big step it is 2.7e-09 after five steps and cannot be held to round-off, for a reason that is not
 # a defect: brae's limited K computed from OpenFOAM's own post-MULES alpha (dumped at 17 digits) agrees
 # with OpenFOAM's to 3e-16 relative, but MULES leaves alpha 1 +- 1e-7 in the bulk, where the limiter

@@ -190,16 +190,27 @@ void deviceInterfaceCorrect(
     const DeviceBuffer<scalar>& alpha1Bnd,
     const DeviceBuffer<scalar>& nHatfBnd,
     scalar                      deltaN,
+    bool                        gradLeastSquares,
+    scalar                      gradCellLimitK,
     DeviceBuffer<scalar>&       nHatfInt,
     DeviceBuffer<scalar>&       K,
     DeviceCyclic*               cyc,
     DeviceBuffer<scalar>*       nHatfIf)
 {
+    const bool pair = cyc && cyc->n > 0;
+    // a limiter that cannot see the pair's faces: see deviceAlphaCorrector's refusal of the same
+    if (pair && gradCellLimitK > scalar(0))
+        throw std::runtime_error(
+            "brae interfaceProperties (device): fvSchemes names a cellLimited nHat gradient on a mesh "
+            "with a periodic pair. The limiter would not see the pair's faces. Refused rather than "
+            "limit a gradient without them.");
     DeviceBuffer<scalar> gx, gy, gz;
-    deviceGaussGrad(dm, alpha1, alpha1Bnd, gx, gy, gz);
-    // THE PAIR's own contribution to grad(alpha) first: nHatf is built from that gradient, and a
-    // gradient without the pair is the gradient of a mesh with a wall there.
-    if (cyc && cyc->n > 0)
+    // fvc::grad(alpha1_, "nHat") by the case's own entry: a leastSquares fit takes the pair inside it
+    deviceGradOf(dm, alpha1, alpha1Bnd, gradLeastSquares, gradCellLimitK, gx, gy, gz,
+                 (gradLeastSquares && pair) ? cyc : nullptr);
+    // THE PAIR's own contribution to a Gauss grad(alpha) first: nHatf is built from that gradient, and
+    // a gradient without the pair is the gradient of a mesh with a wall there.
+    if (!gradLeastSquares && pair)
     {
         deviceCyclicAddGrad(*cyc, alpha1, dm.V, gx, gy, gz);
     }

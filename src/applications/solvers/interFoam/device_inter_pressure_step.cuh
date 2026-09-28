@@ -171,10 +171,14 @@ struct DeviceInterPressureInput
     const GamgControls* gamgInner = nullptr;
     const GamgPreconditionerControls* pcgGamgInner = nullptr;
     // the case's laplacianSchemes for the p_rgh laplacian: `corrected` and a `limited` coefficient
-    // (0 = unlimited). Under `corrected` each pass adds the explicit correction from grad(p_rgh) --
-    // Gauss linear, the only gradSchemes entry the device takes -- and keeps its face flux for
-    // p_rghEqn.flux().
+    // (0 = unlimited). Under `corrected` each pass adds the explicit correction from grad(p_rgh) and
+    // keeps its face flux for p_rghEqn.flux().
     bool correctedLaplacian = false;
+    // ...and THAT gradient's own gradSchemes entry, which is no longer Gauss linear only: the two numbers
+    // a GradChoice holds (grad_choice.cuh), passed to deviceGradOf. RAS/electrostaticDeposition asks for
+    // `cellLimited leastSquares 1` on every gradient, and its host arm runs while its device arm refused.
+    bool   prghGradLeastSquares = false;
+    scalar prghGradCellLimitK = 0;
     bool nonOrthCoeffs = false;   // nonOrthDeltaCoeffs without the correction -- inter_ueqn_cpp.cuh:181
     scalar snGradLimitCoeff = 0;
 };

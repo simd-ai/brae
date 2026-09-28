@@ -120,11 +120,15 @@ int main(int argc, char** argv)
     // orthogonal and refuses it.
     const bool sheared = profileName == "sheared";
     // `gradLsqLimited`: every gradient `cellLimited leastSquares 1` but nHat, which names `leastSquares`,
-    // on the sheared mesh with the predictor on. The device's operators are Gauss linear and refuse it.
+    // on the sheared mesh with the predictor on. The device REFUSES it, in its momentum assembly: grad(U)
+    // leastSquares beside damBreak's `linearUpwind grad(U)` correction and corrected laplacian, which
+    // that assembly builds Gauss. Its scalar gradients are gated on RAS/electrostaticDeposition
+    // (tests/interfoam_moving_vs_openfoam.sh `esd`), which names upwind and an orthogonal laplacian.
     const bool gradLsqLimited = profileName == "gradLsqLimited";
     // `nHatLimited`: the interface normal alone `cellLimited Gauss linear 1`, at the SMALL step -- the
     // big step's MULES leaves alpha 1 +- 1e-7 in the bulk, where the limiter turns round-off into
-    // 1e-06 of p_rgh (see the script). The device refuses it.
+    // 1e-06 of p_rgh (see the script). The device RUNS it now (deviceInterfaceCorrect takes the entry)
+    // and is held to the host's bounds below.
     const bool nHatLimited = profileName == "nHatLimited";
     const bool pimpleProfile = nOuter || nonOrth || momPred || namedFlux || vanLeerV || linear || compression
                             || alphaMinIter || momMinIter || gradLsqLimited;
@@ -136,8 +140,7 @@ int main(int argc, char** argv)
     // (inter_driver_device.cu), measured against OpenFOAM on validation/interFoamCyclic's `outer`
     // profile with the one-corrector answer as its control. It is compared here like any other
     // profile, on a case whose every other control the device already runs.
-    const bool deviceRefuses = namedFlux || gradLsqLimited
-                            || nHatLimited;
+    const bool deviceRefuses = namedFlux || gradLsqLimited;
     const bool bigStep = (argc > 7 && std::string(argv[7]) == "bigstep") || prevCorr || pimpleProfile || sheared;
     // `inflow`: the atmosphere's inletValue set to 1, so water enters over air cells and rho's patch
     // value differs from the cell's on a patch where p_rgh fixes a value. It is the only fixture here
@@ -585,7 +588,7 @@ int main(int argc, char** argv)
                     why = e.what();
                 }
                 const char* named = nonOrth ? "nNonOrthogonalCorrectors"
-                                  : (gradLsqLimited || nHatLimited) ? "cellLimited"
+                                  : gradLsqLimited ? "grad(U) resolves to leastSquares"
                                             : "names the flux";
                 std::printf("  DEVICE: %s\n", threw ? why.substr(0, 140).c_str() : "RAN -- it must not");
                 check("the DEVICE refuses this case rather than run it at a smaller count",

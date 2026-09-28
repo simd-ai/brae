@@ -835,9 +835,12 @@ if [ $HAVE_GPU = 1 ]; then
     # UNCOUPLED is still refused by name, and test_inter_baffle_vs_openfoam.cu holds that refusal.
     arm device_baffle       runs    -                        "-device" true
     BASE="$B"
-    # the device's gradient operators are Gauss linear; a limited or least-squares one is refused
-    arm device_gradLsq      refused "leastSquares or cellLimited" "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         leastSquares;/' system/fvSchemes"
-    arm device_gradNHat     refused "leastSquares or cellLimited" "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    nHat            cellLimited Gauss linear 1;/' system/fvSchemes"
+    # every scalar gradient takes the case's entry on the device now, and so does grad(U)'s dev2 term
+    # (RAS/electrostaticDeposition, tests/interfoam_moving_vs_openfoam.sh `esd`). What is still refused
+    # is a leastSquares grad(U) BESIDE a site the momentum assembly builds Gauss -- damBreak's
+    # `linearUpwind grad(U)` correction and its corrected laplacian both are.
+    arm device_gradLsq      refused "grad(U) resolves to leastSquares" "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         leastSquares;/' system/fvSchemes"
+    arm device_gradNHat     runs    -                        "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    nHat            cellLimited Gauss linear 1;/' system/fvSchemes"
     arm device_baseline     runs    -                        "-device" true
     # CrankNicolson RUNS on the device loop (tests/interfoam_cn_vs_openfoam.sh holds RAS/damBreak under it
     # on both arms); a coupled pair under it is refused by name there, where the host loop carries it
@@ -929,7 +932,12 @@ if [ $HAVE_GPU = 1 ]; then
     # Gauss-Seidel profiles have device arms); a smoother NONE of them names is still refused there
     arm device_gamg_GaussSeidel runs    -                        "-device" "sed -i '/p_rghFinal/,/}/ s/smoother  *DIC;/smoother        GaussSeidel;/' system/fvSolution"
     arm device_gamg_symGaussSeidel runs -                        "-device" "sed -i '/p_rghFinal/,/}/ s/smoother  *DIC;/smoother        symGaussSeidel;/' system/fvSolution"
-    arm device_gamg_smootherDILU refused "smoother DILU"         "-device" "sed -i '/p_rghFinal/,/}/ s/smoother  *DIC;/smoother        DILU;/' system/fvSolution"
+    # ...and DILU is NOT one of the smoothers missing from the device. OpenFOAM registers it for an
+    # ASYMMETRIC matrix only (addasymMatrixConstructorToTable, DILUSmoother.C:40) and p_rgh's is symmetric,
+    # so its own lookup goes to the symmetric table and stops. NO SHIPPED TUTORIAL NAMES IT -- this arm
+    # mutates the entry, as every arm on this page does -- and the refusal now says which kind of refusal it
+    # is rather than "not ported", which read as an invitation to port something OpenFOAM rejects.
+    arm device_gamg_smootherDILU refused "ASYMMETRIC matrix only" "-device" "sed -i '/p_rghFinal/,/}/ s/smoother  *DIC;/smoother        DILU;/' system/fvSolution"
     arm device_gamg_sweeps  runs    -                        "-device" "${GE}nPreSweeps 2; nFinestSweeps 3;/' system/fvSolution"
     # a p_rgh or alpha condition that names rhoPhi is evaluated on the host and handed rhoPhi; U's
     # pressureInletOutletVelocity switch runs ON the device and reads phi, so there the name is refused

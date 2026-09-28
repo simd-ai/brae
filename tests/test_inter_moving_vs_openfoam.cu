@@ -249,7 +249,8 @@ int main(
                          || profile == "piston" || profile == "flap"
                          || profile == "pistonSST" || profile == "pistonLES"
                          || profile == "multiPiston" || profile == "multiFlap"
-                         || profile == "sloshing2DCN" || profile == "solitaryCN");
+                         || profile == "sloshing2DCN" || profile == "solitaryCN"
+                         || profile == "esd" || profile == "esdNoCorr");
     PrimitiveMesh mD;
     FvGeometry gD;
     std::vector<FvPatch> patchesD;
@@ -358,6 +359,7 @@ int main(
         std::size_t nStale = 0;
         std::size_t nFaces = 0;
         scalar dPatch = 0;
+        scalar dPatchD = 0;
         scalar dStale = 0;
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
@@ -368,10 +370,15 @@ int main(
                   b != nullptr && b->hasValue);
             if (b == nullptr || !b->hasValue) continue;
             const std::vector<scalar> braeV = fin.alpha1.boundary[pi]->value();
+            // ...and the DEVICE arm's, which keeps its alpha on the device and takes the patch from
+            // the host hook: the same assignment-not-evaluate has to hold there
+            const std::vector<scalar> braeVD = deviceArm ? finD.alpha1.boundary[pi]->value()
+                                                         : std::vector<scalar>();
             for (std::size_t k = 0; k < braeV.size(); ++k)
             {
                 const scalar ofV = b->valueUniform ? b->uniformValue : b->values[k];
                 dPatch = std::fmax(dPatch, std::fabs(braeV[k] - ofV));
+                if (deviceArm) dPatchD = std::fmax(dPatchD, std::fabs(braeVD[k] - ofV));
                 // ...against OpenFOAM's OWN owner cell, which is what an evaluate would have written
                 const scalar cell = ofAlphaCells[static_cast<std::size_t>(patches[pi].faceCells[k])];
                 const scalar st = std::fabs(ofV - cell);
@@ -381,8 +388,8 @@ int main(
             }
         }
         std::printf("  alpha patches: %zu variableHeightFlowRate, %zu faces   brae-vs-OF %.4e"
-                    "   OF-vs-its-own-cell %.4e   (%zu faces stale)\n",
-                    nVh, nFaces, (double)dPatch, (double)dStale, nStale);
+                    "   device-vs-OF %.4e   OF-vs-its-own-cell %.4e   (%zu faces stale)\n",
+                    nVh, nFaces, (double)dPatch, (double)dPatchD, (double)dStale, nStale);
         // the tutorial's own five: side-01 (at the clamp, carries nothing) and side-03..side-06
         check("brae built all five variableHeightFlowRate patches", nVh == 5);
         check("...over the tutorial's own 2,625 faces", nFaces == 2625);
@@ -392,6 +399,7 @@ int main(
             check("OpenFOAM's own written patch value LEFT its owner cell, so the arm can witness this",
                   nStale >= 200 && dStale > scalar(1e-11));
             check("brae's alpha patch values are the ones OpenFOAM WROTE", dPatch < scalar(1e-13));
+            check("...on the DEVICE arm too", dPatchD < scalar(1e-13));
         }
         else
         {
@@ -399,50 +407,9 @@ int main(
             check("with MULESCorr off OpenFOAM's patch value is back ON its owner cell",
                   nStale == 0 && dStale < scalar(1e-13));
             check("...and brae agrees there too", dPatch < scalar(1e-13));
+            check("...on the DEVICE arm too", dPatchD < scalar(1e-13));
         }
     }
-    // THE DEVICE ARM ON esd MUST REFUSE, and name why. It reached neither of the two sites above, so if
-    // it ran it would be evaluating where OpenFOAM assigns with nothing saying so. It refuses earlier
-    // than that, on the case's `cellLimited` gradients -- which is a refusal that must keep firing.
-    if (profile == "esd")
-    {
-        int nDev = 0;
-        if (cudaGetDeviceCount(&nDev) != cudaSuccess) { cudaGetLastError(); nDev = 0; }
-        if (nDev <= 0)
-        {
-            std::printf("  (no CUDA device, so the device arm's refusal is not exercised here)\n");
-        }
-        else
-        {
-            PrimitiveMesh mR;
-            mR.read(caseDir + "/constant/polyMesh");
-            FvGeometry gR;
-            gR.build(mR);
-            std::vector<FvPatch> patchesR = buildPatches(mR, gR);
-            MutableMesh mutableR;
-            mutableR.m = &mR;
-            mutableR.g = &gR;
-            mutableR.patches = &patchesR;
-            std::string msg;
-            bool threw = false;
-            try
-            {
-                InterFields finR;
-                runInterFoamDevice(caseDir, startDir, mR, gR, patchesR, 1, /*verbose=*/false, &finR,
-                                   scalar(1.0e300), nullptr, &mutableR);
-            }
-            catch (const std::exception& e)
-            {
-                threw = true;
-                msg = e.what();
-            }
-            std::printf("  the device arm: %s\n", threw ? msg.substr(0, 110).c_str() : "IT RAN");
-            check("the device arm refuses this case", threw);
-            check("...and names the gradient in saying so",
-                  msg.find("cellLimited") != std::string::npos);
-        }
-    }
-
     // `closed*`: a closed tank whose mesh does NOT move -- the pressure reference alone
     const bool moving = profile.rfind("closed", 0) != 0;
     check("brae ran the same number of steps", r.steps == nSteps);

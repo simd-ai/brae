@@ -94,7 +94,9 @@ void schemeWeights(const DeviceMesh&           dm,
                    const DeviceBuffer<scalar>& field,
                    const DeviceBuffer<scalar>& fieldBnd,
                    DeviceBuffer<scalar>&       w,
-                   const DeviceCyclic*         cyc)
+                   const DeviceCyclic*         cyc,
+                   bool                        gradLeastSquares,
+                   scalar                      gradCellLimitK)
 {
     const int nIf = dm.nInternalFaces;
     switch (scheme)
@@ -127,14 +129,16 @@ void schemeWeights(const DeviceMesh&           dm,
         default:
         {
             DeviceBuffer<scalar> gx, gy, gz;
-            deviceGaussGrad(dm, field, fieldBnd, gx, gy, gz);
+            deviceGradOf(dm, field, fieldBnd, gradLeastSquares, gradCellLimitK, gx, gy, gz,
+                         (gradLeastSquares && cyc && cyc->n > 0) ? cyc : nullptr);
             // ...WITH THE PAIR IN IT. These are the INTERNAL faces' weights, but the limiter reads the
             // cell gradient, and a cell on a periodic boundary has one of its faces in the pair. A
             // gradient built without it is wrong in every such cell, so the limiter on that cell's
             // ordinary faces is wrong too. MEASURED on validation/interFoamCyclic: alpha 7.8e-02 from
             // the host at step two, all of it in the pair's own cells, with every gradient the pair's
-            // OWN flux uses already carrying it.
-            if (cyc && cyc->n > 0)
+            // OWN flux uses already carrying it. A leastSquares fit took the pair inside it above, so
+            // adding the pair's Gauss faces again would count them twice.
+            if (!gradLeastSquares && cyc && cyc->n > 0)
             {
                 deviceCyclicAddGrad(*cyc, field, dm.V, gx, gy, gz);
             }
@@ -155,10 +159,12 @@ void fluxWithScheme(const DeviceMesh&           dm,
                     const DeviceBuffer<scalar>& fieldBnd,
                     DeviceBuffer<scalar>&       outInt,
                     DeviceBuffer<scalar>&       outBnd,
-                    const DeviceCyclic*         cyc)
+                    const DeviceCyclic*         cyc,
+                    bool                        gradLeastSquares,
+                    scalar                      gradCellLimitK)
 {
     DeviceBuffer<scalar> w;
-    schemeWeights(dm, scheme, psiInt, field, fieldBnd, w, cyc);
+    schemeWeights(dm, scheme, psiInt, field, fieldBnd, w, cyc, gradLeastSquares, gradCellLimitK);
     deviceAlphaFaceFlux(dm, dm.nInternalFaces, psiInt, w, field, outInt);
     deviceMultiplyFaces(dm.nBndFaces, psiBnd, fieldBnd, outBnd);
 }
@@ -185,6 +191,15 @@ void deviceAlphaCorrector(
             "fixesValue mask and the patch-type flags are all required. They are evaluated on the "
             "host -- see device_alpha_step.cuh for why -- and passing null would silently run the "
             "step with a boundary of zeros.");
+    // A LIMITED gradient across a periodic pair: deviceCellLimitGrad takes the pair's faces only as a
+    // CellLimitInterface list, which no caller here builds, and a Gauss gradient has the pair added
+    // AFTER deviceGradOf has already limited it -- so both orders are wrong in every cell on the pair.
+    if (in.cyc && in.cyc->n > 0
+     && (in.gradAlpha1CellLimitK > scalar(0) || in.gradAlpha2CellLimitK > scalar(0)))
+        throw std::runtime_error(
+            "brae interFoam device alphaEqn: fvSchemes names a cellLimited gradient for alpha1 or alpha2 "
+            "on a mesh with a periodic pair. The limiter would not see the pair's faces. Refused rather "
+            "than limit a gradient without them.");
     const int nC  = dm.nCells;
     const int nIf = dm.nInternalFaces;
     const int nBf = dm.nBndFaces;
@@ -259,25 +274,28 @@ void deviceAlphaCorrector(
     //     fvc::flux(-fvc::flux(-phir, alpha2, alpharScheme), alpha1, alpharScheme)
     // and each negation changes which cell the interpolation reads, not just the result's sign.
     fluxWithScheme(dm, in.alphaScheme, *in.phiInt, *in.phiBnd, alpha1, *bnd.alpha1, advInt, advBnd,
-                   in.cyc);
+                   in.cyc, in.gradAlpha1LeastSquares, in.gradAlpha1CellLimitK);
     // ...and on the pair, where the scheme's own weight applies as on an internal face. The limiter
     // reads fvc::grad(alpha), which must carry the pair itself -- see device_alpha_flux.cuh.
     DeviceBuffer<scalar> advIf;
     if (in.cyc && in.cyc->n > 0)
     {
         DeviceBuffer<scalar> gx, gy, gz;
-        deviceGaussGrad(dm, alpha1, *bnd.alpha1, gx, gy, gz);
-        deviceCyclicAddGrad(*in.cyc, alpha1, dm.V, gx, gy, gz);
+        // the pair's own limiter gradient, under the SAME entry as the internal one above: a leastSquares
+        // fit takes the pair inside it, a Gauss one has the pair's faces added after (deviceCyclicAddGrad)
+        deviceGradOf(dm, alpha1, *bnd.alpha1, in.gradAlpha1LeastSquares, in.gradAlpha1CellLimitK,
+                     gx, gy, gz, in.gradAlpha1LeastSquares ? in.cyc : nullptr);
+        if (!in.gradAlpha1LeastSquares) deviceCyclicAddGrad(*in.cyc, alpha1, dm.V, gx, gy, gz);
         deviceAlphaCyclicFlux(*in.cyc, static_cast<int>(in.alphaScheme), alpha1, gx, gy, gz, advIf);
     }
     deviceNegateFaces(nIf, phirInt, negPhirInt);
     deviceNegateFaces(nBf, phirBnd, negPhirBnd);
     fluxWithScheme(dm, in.alpharScheme, negPhirInt, negPhirBnd, alpha2, alpha2Bnd,
-                   innerInt, innerBnd, in.cyc);
+                   innerInt, innerBnd, in.cyc, in.gradAlpha2LeastSquares, in.gradAlpha2CellLimitK);
     deviceNegateFaces(nIf, innerInt, negInnerInt);              // the OUTER minus
     deviceNegateFaces(nBf, innerBnd, negInnerBnd);
     fluxWithScheme(dm, in.alpharScheme, negInnerInt, negInnerBnd, alpha1, *bnd.alpha1,
-                   compInt, compBnd, in.cyc);
+                   compInt, compBnd, in.cyc, in.gradAlpha1LeastSquares, in.gradAlpha1CellLimitK);
     addFaces(nIf, advInt, compInt, unInt);
     addFaces(nBf, advBnd, compBnd, unBnd);
     // ...and the pair's own compressive half, the same two nested negations: each changes which cell
@@ -286,15 +304,17 @@ void deviceAlphaCorrector(
     if (in.cyc && in.cyc->n > 0)
     {
         DeviceBuffer<scalar> a2gx, a2gy, a2gz, negPhirIf, innerIf, negInnerIf, compIf;
-        deviceGaussGrad(dm, alpha2, alpha2Bnd, a2gx, a2gy, a2gz);
-        deviceCyclicAddGrad(*in.cyc, alpha2, dm.V, a2gx, a2gy, a2gz);
+        deviceGradOf(dm, alpha2, alpha2Bnd, in.gradAlpha2LeastSquares, in.gradAlpha2CellLimitK,
+                     a2gx, a2gy, a2gz, in.gradAlpha2LeastSquares ? in.cyc : nullptr);
+        if (!in.gradAlpha2LeastSquares) deviceCyclicAddGrad(*in.cyc, alpha2, dm.V, a2gx, a2gy, a2gz);
         deviceNegateFaces(in.cyc->n, phirIf, negPhirIf);
         deviceAlphaCyclicFluxWith(*in.cyc, negPhirIf, static_cast<int>(in.alpharScheme), alpha2,
                                   a2gx, a2gy, a2gz, innerIf);
         deviceNegateFaces(in.cyc->n, innerIf, negInnerIf);
         DeviceBuffer<scalar> a1gx, a1gy, a1gz;
-        deviceGaussGrad(dm, alpha1, *bnd.alpha1, a1gx, a1gy, a1gz);
-        deviceCyclicAddGrad(*in.cyc, alpha1, dm.V, a1gx, a1gy, a1gz);
+        deviceGradOf(dm, alpha1, *bnd.alpha1, in.gradAlpha1LeastSquares, in.gradAlpha1CellLimitK,
+                     a1gx, a1gy, a1gz, in.gradAlpha1LeastSquares ? in.cyc : nullptr);
+        if (!in.gradAlpha1LeastSquares) deviceCyclicAddGrad(*in.cyc, alpha1, dm.V, a1gx, a1gy, a1gz);
         deviceAlphaCyclicFluxWith(*in.cyc, negInnerIf, static_cast<int>(in.alpharScheme), alpha1,
                                   a1gx, a1gy, a1gz, compIf);
         addFaces(in.cyc->n, advIf, compIf, unIf);
@@ -351,6 +371,10 @@ void deviceAlphaCorrector(
         const scalar w = (in.aCorr == 0) ? scalar(1) : scalar(0.5);
         if (in.aCorr != 0)
         {
+            if (bnd.alphaPostMules)
+            {
+                deviceCopy(*bnd.alphaPostMules, alpha1);
+            }
             relaxKernel<<<nBlocks(nC), TPB>>>(alpha10.data(), nC, alpha1.data());
             ckS(cudaGetLastError(), "corrector relaxation");
         }

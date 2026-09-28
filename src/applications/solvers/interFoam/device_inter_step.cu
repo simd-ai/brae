@@ -328,6 +328,7 @@ void deviceInterStep(
     uin.nonOrthCoeffs = ctl.nonOrthCoeffs;
     uin.snGradLimitCoeff   = ctl.snGradLimitCoeff;
     uin.gradUSchemeLimitK = ctl.gradUSchemeLimitK;
+    uin.gradUSchemeLeastSq = ctl.gradUSchemeLeastSq;
     uin.relaxU        = ctl.relaxU;
     uin.relaxEquation = ctl.relaxEquationU;
     uin.ddtRho        = &rho;
@@ -640,6 +641,8 @@ void deviceInterStep(
         pi.gamgInner = ctl.pressureGamg;
         pi.pcgGamgInner = ctl.pressurePcgGamg;
         pi.correctedLaplacian = ctl.correctedLaplacian;
+        pi.prghGradLeastSquares = ctl.prghGradLeastSquares;
+        pi.prghGradCellLimitK   = ctl.prghGradCellLimitK;
         pi.nonOrthCoeffs = ctl.nonOrthCoeffs;
         pi.snGradLimitCoeff = ctl.snGradLimitCoeff;
 

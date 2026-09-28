@@ -58,6 +58,10 @@ void deviceInterAlphaStep(
                 "updateBoundary would buy them with a curvature pass OpenFOAM does not take there.");
         }
     }
+    if (static_cast<bool>(hooks.relaxBoundary) != static_cast<bool>(hooks.mixtureCorrect))
+        throw std::runtime_error(
+            "brae interFoam device alpha step: relaxBoundary and mixtureCorrect come as a pair. The "
+            "first assigns the relaxed patch values and the second must not evaluate them away.");
     if (!hooks.updateBoundary)
         throw std::runtime_error(
             "brae interFoam device alpha step: the boundary hook is required. alpha's patch values are "
@@ -93,11 +97,23 @@ void deviceInterAlphaStep(
     // mixture.correct() at the BOTTOM of a corrector: the interface normal from alpha's new field, then
     // the mixture properties from it. interfaceProperties reads mu and nu right after, which is why the
     // two are one call and not two.
+    // whether the LAST corrector run relaxed, for the mixture.correct() after the whole sub-cycle
+    bool lastRelaxed = false;
+    // `patchesCurrent`: alpha1Bnd already holds what OpenFOAM's alpha1 carries (a relaxed corrector's
+    // assignment), so the pass must not evaluate in front -- see DeviceInterAlphaHooks::relaxBoundary.
     auto correctMixture = [&](
         const DeviceBuffer<scalar>& a,
-        bool assignsAlpha2)
+        bool assignsAlpha2,
+        bool patchesCurrent)
     {
-        hooks.updateBoundary(a, alpha1Bnd, nHatfBnd);
+        if (patchesCurrent)
+        {
+            hooks.mixtureCorrect(a, alpha1Bnd, nHatfBnd);
+        }
+        else
+        {
+            hooks.updateBoundary(a, alpha1Bnd, nHatfBnd);
+        }
         // alpha1Bnd is alpha1's patch as MULES's correctBoundaryConditions left it and BEFORE the
         // curvature pass below moves it -- which is the state `alpha2 = 1.0 - alpha1` reads.
         if (assignsAlpha2 && ctl.alpha2BndOut && nBf > 0)
@@ -107,7 +123,8 @@ void deviceInterAlphaStep(
                                  ctl.alpha2BndOut->data(), nullptr, nullptr, nullptr);
         }
         // ...and nHatf ON THE PAIR from the same pass, which is where phir gets its normal there
-        deviceInterfaceCorrect(dm, a, alpha1Bnd, nHatfBnd, in.deltaN, nHatfInt, K,
+        deviceInterfaceCorrect(dm, a, alpha1Bnd, nHatfBnd, in.deltaN,
+                               in.nHatGradLeastSquares, in.nHatGradCellLimitK, nHatfInt, K,
                                in.cyc, in.cyc ? &nHatfIfBuf : nullptr);
         alpha2.resize(static_cast<std::size_t>(nC));
         rho.resize(static_cast<std::size_t>(nC));
@@ -244,7 +261,7 @@ void deviceInterAlphaStep(
                 }
             }
 
-            correctMixture(alpha, true);                        // alphaEqn.H:151-153
+            correctMixture(alpha, true, false);                 // alphaEqn.H:151-153
 
             // Cache the upwind-flux (alphaEqn.H:150), to be turned into the correction once the
             // correctors below have run. Held in the cache buffers themselves, as OpenFOAM holds it
@@ -271,9 +288,19 @@ void deviceInterAlphaStep(
                     hooks.updateModelledBoundary(subCycle, a, alpha1Bnd);
                 };
             }
+            // every corrector but the first RELAXES on this path, and its boundary half is an
+            // assignment -- see DeviceInterAlphaHooks::relaxBoundary
+            const bool relaxes = ctl.MULESCorr && aCorr != 0 && static_cast<bool>(hooks.relaxBoundary);
+            DeviceBuffer<scalar> postMules;
+            db.alphaPostMules = relaxes ? &postMules : nullptr;
             deviceAlphaCorrector(dm, alpha, subOld, li, db, mulesCtl, nHatfInt,
                                  alphaPhiInt, alphaPhiBnd);
-            correctMixture(alpha, true);                        // alphaEqn.H:223-225
+            if (relaxes)
+            {
+                hooks.relaxBoundary(postMules, alpha, alpha1Bnd);
+            }
+            correctMixture(alpha, true, relaxes);               // alphaEqn.H:223-225
+            lastRelaxed = relaxes;
         }
 
         // alphaEqn.H:228-236: talphaPhi1Corr0 = alphaPhi10 - talphaPhi1Corr0, i.e. the compression the
@@ -358,7 +385,9 @@ void deviceInterAlphaStep(
     // ...and mixture.correct() ONCE MORE after the whole sub-cycle (alphaEqnSubCycle.H:36-38), so that
     // the momentum equation is built on the NEW density. Skipping it builds UEqn on the density the
     // step started with, which at a water/air interface is wrong by a factor of 1000 and converges.
-    correctMixture(alpha1, false);
+    // alphaEqnSubCycle.H evaluates alpha nowhere after the sub-cycle, so the patch values stand as the
+    // last corrector left them -- an assignment, where it relaxed
+    correctMixture(alpha1, false, lastRelaxed);
 }
 
 } // namespace brae

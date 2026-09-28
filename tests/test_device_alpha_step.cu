@@ -278,7 +278,8 @@ int main()
             std::vector<scalar> Kb;
             ip::calculateK(work, ic, m, g, fvp, false, nHb, Kb);
             dNHatfBnd.copyFrom(flatten(nHb.boundary));
-            deviceInterfaceCorrect(dm, dA, dABnd, dNHatfBnd, li.deltaN, dNHatf, dK);
+            deviceInterfaceCorrect(dm, dA, dABnd, dNHatfBnd, li.deltaN,
+                                   li.nHatGradLeastSquares, li.nHatGradCellLimitK, dNHatf, dK);
         };
 
         for (int s = 0; s < steps; ++s)

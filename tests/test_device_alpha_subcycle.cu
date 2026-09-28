@@ -195,7 +195,8 @@ int main()
             std::vector<scalar> Kb;
             ip::calculateK(work, ic, m, g, fvp, false, nHb, Kb);
             dNHatfBnd.copyFrom(flatten(nHb.boundary));
-            deviceInterfaceCorrect(dm, alpha, dABnd, dNHatfBnd, li.deltaN, dNHatf, dK);
+            deviceInterfaceCorrect(dm, alpha, dABnd, dNHatfBnd, li.deltaN,
+                                   li.nHatGradLeastSquares, li.nHatGradCellLimitK, dNHatf, dK);
         }
         deviceMassFlux(nIf, aPhiInt, dPhiInt, rho1, rho2, rhoPhiInt);
         deviceMassFlux(nBf, aPhiBnd, dPhiBnd, rho1, rho2, rhoPhiBnd);

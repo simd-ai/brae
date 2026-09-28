@@ -222,13 +222,40 @@ scalar deviceInterPressureStep(
         {
             DeviceBuffer<scalar> bval, gx, gy, gz;
             hooks.boundaryValues(bval);
-            deviceGaussGrad(dm, p_rgh, bval, gx, gy, gz);
+            // THE CASE'S OWN gradSchemes ENTRY, through deviceGradOf. A leastSquares fit takes the pair
+            // INSIDE it (deviceLeastSquaresGrad's `cyc` argument, leastSquaresVectors.C:131-140) where the
+            // Gauss path adds the pair's faces AFTERWARDS -- so the two are wired differently below, and a
+            // JUMP cyclic under leastSquares is refused by name rather than fitted without its jump.
+            if (in.prghGradLeastSquares && havePair && haveJump)
+            {
+                throw std::runtime_error(
+                    "brae interFoam (device): grad(p_rgh) is `leastSquares` and the mesh carries a JUMP "
+                    "cyclic. The least-squares fit takes the neighbour cell's value directly, and there is "
+                    "no place in it for the pair's jump, which the Gauss path subtracts face by face. "
+                    "Refused rather than fit across the pair without its jump.");
+            }
+            deviceGradOf(dm, p_rgh, bval, in.prghGradLeastSquares, in.prghGradCellLimitK, gx, gy, gz,
+                         (in.prghGradLeastSquares && havePair) ? in.cyc : nullptr);
             // ...and the PAIR's faces, which fvc::grad sums like any other patch's. On a jump cyclic
             // the neighbour value is the cell across LESS the jump, as everywhere else it appears.
-            if (havePair)
+            // ONLY ON THE GAUSS PATH: the least-squares fit above already took the pair through its own
+            // argument, so adding it again here would count those faces twice.
+            if (havePair && !in.prghGradLeastSquares)
             {
                 deviceCyclicAddGrad(*in.cyc, p_rgh, dm.V, gx, gy, gz,
                                     haveJump ? &cycJump : nullptr);
+            }
+            // ...and the LIMITER across a pair, which deviceGradOf cannot do: cellLimitedGrad needs the
+            // pair's faces as a CellLimitInterface list (device_mesh.cuh) and deviceGradOf calls the
+            // no-interface overload, so a limited gradient on a cell touching the pair would be limited
+            // against its own cells only. Refused by name rather than limited on a partial neighbourhood.
+            if (havePair && in.prghGradCellLimitK > scalar(0))
+            {
+                throw std::runtime_error(
+                    "brae interFoam (device): grad(p_rgh) is `cellLimited` and the mesh carries a cyclic "
+                    "pair. The limiter needs the pair's faces in its neighbourhood (CellLimitInterface) "
+                    "and this site limits without them. Refused rather than limit against a partial "
+                    "neighbourhood.");
             }
             // `limited <k>` for 0 < k < 1 (fvm.cuh laplacianCorrFlux); otherwise the correction unlimited
             if (in.snGradLimitCoeff > scalar(0) && in.snGradLimitCoeff < scalar(1))

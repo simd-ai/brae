@@ -109,6 +109,16 @@
 #                  TWO STEPS AND NOT TEN: this case also carries the OPEN `cellLimited leastSquares`
 #                  grad(alpha) item, whose cell gap passes the patch difference from step five (2.2e-09
 #                  at five, 2.9e-08 at ten). Those step counts measure the gradient item, not this one.
+#                  THE DEVICE ARM RUNS IT (it refused the case's gradients until #28's device_gradLsq)
+#                  and reads the host's own numbers, alpha 6.7e-16, p_rgh 1.2411e-07, U 4.8105e-10, and
+#                  its patch values 4.4e-16. It took the relaxation's boundary half on that arm too
+#                  (DeviceInterAlphaHooks::relaxBoundary) and dropping the evaluate in its
+#                  interfaceForces hook: with neither, U 1.17e-07 and the patch on the owner cell
+#                  (5.1256e-10); with the first alone the fields matched and the patch did not.
+#                  BROKEN ONCE EACH on the device (the site handed Gauss linear): alpha's limiter
+#                  gradient alpha 2.3e-09 / U 2.9e-07, nHat's p_rgh 1.8e+00 / U 2.9e-02, grad(U)'s dev2
+#                  term p_rgh 9.4e-05 / U 1.5e-04. grad(p_rgh) and grad(rho) are inert here -- the
+#                  laplacian is `orthogonal` and momentumPredictor is off.
 #                  THE ORACLE IS ASSERTED TO HAVE TAKEN THE PATH -- at least 200 of its own written
 #                  faces must be off its own cells -- because an oracle whose patch value equals its
 #                  owner cell agrees with a re-evaluating brae by accident.
