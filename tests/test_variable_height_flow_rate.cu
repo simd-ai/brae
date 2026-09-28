@@ -166,6 +166,47 @@ int main()
         check("LEG 8  a dry inlet is refused by name", named);
     }
 
+    // LEG 9  A MESH CHANGE MAPS THE TOLD FLUX, and the direction that catches it is COARSENING.
+    //
+    // This condition is handed its flux (brae's patches cannot look one up) and stores it, so a mesh change
+    // used to be refused by name here -- autoMapComplete returned false. The map is now
+    // `mapFieldThrough(phi_, pm, 0)` plus a recompute of the patch internal field, which is what OpenFOAM
+    // gets for free by looking both up in updateCoeffs (.C:128-165).
+    //
+    // A REFINEMENT CANNOT WITNESS IT: a grown patch leaves the stored flux SHORT, rebuild()'s own
+    // `size() < n` guard returns, and the mapped refValue and valueFraction stand -- wrong, but not
+    // obviously so. A COARSENED patch is the silent one: the stale vector is still long enough, the guard
+    // passes, and the flux is read at OLD face indices. So this leg maps 6 faces down to 3 and takes them
+    // from the far END of the patch, where the flux has the OPPOSITE sign to the faces those indices would
+    // have named. MEASURED without the map: valueFraction 1 on all three, i.e. every face read as inflow
+    // when the flux it was handed is outward.
+    {
+        FvPatch six = makePatch(6);
+        VariableHeightFlowRatePatchField f(six, lower, upper, std::vector<scalar>(6, scalar(0.25)));
+        const std::vector<scalar> flux = {-1, -1, -1, 1, 1, 1};
+        f.updateFromFlux(flux);
+        f.evaluate(std::vector<scalar>(6, scalar(0.4)));
+
+        FvPatchFieldMapping pm;
+        pm.direct = true;
+        pm.directAddressing = {5, 4, 3};        // the three OUTFLOW faces, in reverse
+        FvPatch three = makePatch(3);
+        six = three;                            // the field holds a reference: this is the coarsened patch
+        f.autoMap(pm, std::vector<scalar>(3, scalar(0.4)));
+        f.evaluate(std::vector<scalar>(3, scalar(0.4)));
+
+        const std::vector<scalar>* vf = f.valueFractionPtr();
+        bool allOutflow = vf && vf->size() == 3;
+        for (std::size_t i = 0; vf && i < vf->size(); ++i)
+        {
+            allOutflow = allOutflow && (*vf)[i] == scalar(0);
+        }
+        std::printf("  coarsened valueFraction:");
+        for (std::size_t i = 0; vf && i < vf->size(); ++i) std::printf(" %g", (double)(*vf)[i]);
+        std::printf("   (the mapped flux is outward on all three, so 0 0 0)\n");
+        check("LEG 9  a coarsened patch reads the flux at its NEW face indices", allOutflow);
+    }
+
     std::printf("test_variable_height_flow_rate: %d failures\n", failures);
     return failures == 0 ? 0 : 1;
 }

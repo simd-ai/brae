@@ -3998,7 +3998,18 @@ COMPONENTS = {
                   "refused, and updateMixtureBoundary reads it behind a per-face length guard that silently blends "
                   "one face's alpha1 with another's alpha2; and three patch fields inherited "
                   "autoMapComplete() == true from MixedPatchField while leaving their own TOLD per-face state out of "
-                  "autoMap, which is the flag that decides whether a change is REFUSED."),
+                  "autoMap, which is the flag that decides whether a change is REFUSED. EVERY PATCH TYPE HAS SINCE "
+                  "BEEN RESOLVED: of the 33 classes in fv_patch_field.cuh, 28 answer true and 5 answer false, and "
+                  "each of the five names its own reason -- the base (the safety net), processor (parallel, not "
+                  "worked on), and cyclic/coupledCyclic/porousBafflePressure, whose blocker is on the MESH side, "
+                  "since faceConsistentRefinement refuses any coupled patch before a field is ever mapped. TWO "
+                  "ANSWERED TRUE WRONGLY: timeVaryingMappedFixedValue retained nothing, so a refinement handed each "
+                  "child its parent's sampled value instead of the table read at the child's own centre "
+                  "(MappedFile.C:228-248 resets the interpolator for exactly this), and surfaceNormalFixedValue kept "
+                  "only refValue*nf, which cannot be re-formed against a normal that has changed. THE THREE TOLD-STATE "
+                  "REFUSALS ARE NOW MAPS, and coarsening was the direction nothing guarded: every length guard is "
+                  "`size() < n`, so a SHRINKING patch left a stale vector long enough to pass and read the flux and "
+                  "the phase fraction at old face indices."),
         dict(name="interFoam_dynamicMesh", of_symbol="mesh.update",
              of_file="applications/solvers/multiphase/interFoam/interFoam.C",
              classification="GPU_REQUIRED", status="REIMPLEMENT",

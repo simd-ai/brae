@@ -143,6 +143,97 @@ int main()
         check(axisComponents == 1, "vacuity guard: exactly one component (the axis) has d = 0");
     }
 
+    // ---- Leg 7: a mesh change carries the cached patch internal field -------------------------------
+    // OpenFOAM's wedgeFvPatchField holds nothing: its coefficient methods call patchInternalField() on the
+    // spot. brae's take no arguments and read a cache filled at evaluate(), so the map has to refill it --
+    // which it does by RECOMPUTING from the `internal` it is handed, already the new mapped cell field.
+    // Without that, a REFINED wedge is caught by the coefficient guard and aborts with "before it was ever
+    // evaluated" -- misleading, since it had been evaluated, on the old mesh. The same applies to
+    // symmetryPlane, whose cache has no guard at all: it reads a silent zero past the end instead.
+    {
+        FvPatch p = wedgePatch(th);
+        WedgePatchField<vector> f(p, w.faceT, w.cellT);
+        const vector u{3.0, -1.0, 0.5};
+        f.evaluate(std::vector<vector>{u});
+
+        FvPatchFieldMapping pm;
+        pm.direct = true;
+        pm.directAddressing = {0, 0};          // one face refined into two coplanar children
+        FvPatch two = wedgePatch(th);
+        two.size = 2;
+        two.faceCells = {0, 1};
+        two.deltaCoeffs = {2.0, 2.0};
+        two.nf.push_back(two.nf[0]);
+        two.magSf = {0.5, 0.5};
+        two.Cf.push_back(two.Cf[0]);
+        p = two;                                // the field holds a reference
+        const vector u2{-2.0, 4.0, 1.25};
+        f.autoMap(pm, std::vector<vector>{u, u2});
+        bool threw = false;
+        std::vector<vector> gbc;
+        try { gbc = f.gradientBoundaryCoeffs(); } catch (const std::exception&) { threw = true; }
+        check(!threw, "a refined wedge can still be asked for its boundary coefficients");
+        check(!threw && gbc.size() == 2, "...one per new face");
+        // the second face's cell is u2, so its coefficient must be built from u2 and not from a zero or
+        // from face 0's cell: snGrad - gradientInternalCoeffs*pif, per component
+        const vector r2 = rotate(w.cellT, u2);
+        const vector sn2{0.5*2.0*(r2.x - u2.x), 0.5*2.0*(r2.y - u2.y), 0.5*2.0*(r2.z - u2.z)};
+        const scalar dd[3] = {0.5*(1.0 - w.cellT.xx), 0.5*(1.0 - w.cellT.yy), 0.5*(1.0 - w.cellT.zz)};
+        const vector want2{sn2.x + dd[0]*2.0*u2.x, sn2.y + dd[1]*2.0*u2.y, sn2.z + dd[2]*2.0*u2.z};
+        check(!threw && gbc.size() == 2 && mag(gbc[1] - want2) < 1e-13,
+              "...and the ADDED face's coefficient is built from its OWN cell");
+        check(mag(want2) > 1e-4, "vacuity guard: the added face's coefficient is not zero anyway");
+    }
+
+    // ---- Leg 8: symmetryPlane's cache under the same change, where the failure is SILENT ------------
+    // The wedge aborts on a short cache (leg 7). symmetryPlane reads it through pifAt, which returns a
+    // static zero past the end -- so a grown patch would build every ADDED face's coefficients against a
+    // cell value of zero and say nothing. Its map recomputes the cache for the same reason.
+    // MEASURED without the recompute: the added face's gradientBoundaryCoeffs read (0 0 0).
+    {
+        FvPatch p;
+        p.name = "sym";
+        p.type = "symmetryPlane";
+        p.size = 1;
+        p.faceCells = {0};
+        p.deltaCoeffs = {2.0};
+        // TILTED on purpose: on an axis-aligned plane the two terms of the coefficient cancel exactly
+        // (-dc*n_k*(n.pif) against -(-dc*|n_k|)*pif_k), so an axis-aligned arm reads zero whatever the
+        // cache holds and cannot witness anything.
+        p.nf = { vector{0, 0.6, 0.8} };
+        p.magSf = {1.0};
+        p.Cf = { vector{0, 0, 0} };
+        SymmetryPlanePatchField<vector> f(p);
+        const vector u{3.0, -1.0, 0.5};
+        f.evaluate(std::vector<vector>{u});
+
+        FvPatchFieldMapping pm;
+        pm.direct = true;
+        pm.directAddressing = {0, 0};
+        FvPatch two = p;
+        two.size = 2;
+        two.faceCells = {0, 1};
+        two.deltaCoeffs = {2.0, 2.0};
+        two.nf.push_back(two.nf[0]);
+        two.magSf = {0.5, 0.5};
+        two.Cf.push_back(two.Cf[0]);
+        p = two;
+        const vector u2{-2.0, 4.0, 1.25};
+        f.autoMap(pm, std::vector<vector>{u, u2});
+        const std::vector<vector> gbc = f.gradientBoundaryCoeffs();
+        // -n(n.pif)*deltaCoeffs, minus gradientInternalCoeffs*pif per component
+        const vector n2 = p.nf[1];
+        const scalar nd = n2.x*u2.x + n2.y*u2.y + n2.z*u2.z;
+        const vector sn{-nd*n2.x*2.0, -nd*n2.y*2.0, -nd*n2.z*2.0};
+        const vector want2{sn.x + 2.0*std::fabs(n2.x)*u2.x,
+                           sn.y + 2.0*std::fabs(n2.y)*u2.y,
+                           sn.z + 2.0*std::fabs(n2.z)*u2.z};
+        check(gbc.size() == 2, "a refined symmetryPlane gives one coefficient per new face");
+        check(gbc.size() == 2 && mag(gbc[1] - want2) < 1e-13,
+              "...and the ADDED face's is built from its OWN cell, not a silent zero");
+        check(mag(want2) > 1e-4, "vacuity guard: it is not zero anyway");
+    }
+
     // ---- Leg 6: the degeneracies OF refuses --------------------------------------------------------
     {
         bool threw = false;

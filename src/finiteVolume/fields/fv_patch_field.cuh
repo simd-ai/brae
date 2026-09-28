@@ -592,6 +592,8 @@ template <typename T>
 class UniformFixedValueExprPatchField : public FixedValuePatchField<T>
 {
 public:
+    // autoMap: TRUE from FixedValuePatchField, correctly. The expression is per-PATCH; the per-face result
+    // it writes is values_, which that base maps.
     UniformFixedValueExprPatchField(
         const FvPatch& p,
         bool uniform,
@@ -720,8 +722,65 @@ public:
         bool uniform,
         scalar uval,
         std::vector<scalar> vals)
-        : FixedValuePatchField<vector>(p, false, vector{}, build(p, uniform, uval, vals)) {}
+        : FixedValuePatchField<vector>(p, false, vector{}, build(p, uniform, uval, vals)),
+          refValue_(expand(p, uniform, uval, vals)) {}
+
+    // THE PER-FACE SCALAR IS KEPT. OpenFOAM stores `refValue_` (a scalarField) and re-forms the vector as
+    // `refValue_*patch().nf()` at EVERY updateCoeffs (surfaceNormalFixedValueFvPatchVectorField.C:155-166),
+    // so its autoMap maps the SCALAR (`refValue_.autoMap(mapper)`, .C:131-135) and the normals come from
+    // the patch as it then is.
+    //
+    // THIS CLASS USED TO DISCARD IT: build() multiplied by p.nf once at construction and kept only the
+    // product, so the value could never be re-formed against a normal that had changed. Be exact about what
+    // that costs, because the easy claim is the wrong one -- hexRef8 splits a boundary face into COPLANAR
+    // children with the identical unit normal, so under pure refinement the mapped product and a re-formed
+    // one are the same number and no refinement fixture can witness the difference. What the discarded
+    // scalar cost is any change that MOVES the patch: a mesh whose points move gives every face a new nf,
+    // and nothing here could rebuild the value from it. The evaluate() below is where OpenFOAM's
+    // per-assembly re-form now lives, and that is what makes keeping the scalar worth anything.
+    void evaluate(const std::vector<vector>& internal) override
+    {
+        // setStoredValues evaluates, which lands back here; the inner call is the fixedValue's own
+        if (storing_)
+        {
+            FixedValuePatchField<vector>::evaluate(internal);
+            return;
+        }
+        storing_ = true;
+        this->setStoredValues(form());
+        storing_ = false;
+    }
+    bool autoMapComplete() const override { return true; }
+    void autoMap(const FvPatchFieldMapping& pm, const std::vector<vector>& internal) override
+    {
+        FixedValuePatchField<vector>::autoMap(pm, internal);
+        // ZERO on an unmapped face, which is OpenFOAM's own choice rather than this port's: its mapping
+        // constructor sets `refValue_(ptf.refValue_, mapper, pTraits<scalar>::zero)` (.C:70-95, with its own
+        // comment on why), so such a face ends at 0*nf = 0 -- NOT at the internal value the base map would
+        // otherwise leave. hexRef8 refinement is a direct map with no unmapped faces, so this branch is
+        // reached only by another kind of change.
+        mapFieldThrough(refValue_, pm, scalar(0));
+        // AND NOTHING ELSE. The value is NOT re-formed here, because OpenFOAM does not re-form it here:
+        // its autoMap maps value_ and refValue_ and stops, and the product is rebuilt at the next
+        // updateCoeffs -- which is the evaluate() above. Re-forming inside the map would make brae's
+        // post-map state differ from OpenFOAM's in exactly the window a mapper gate reads.
+    }
+
 private:
+    static std::vector<scalar> expand(
+        const FvPatch& p,
+        bool uniform,
+        scalar uval,
+        const std::vector<scalar>& vals)
+    {
+        std::vector<scalar> r(static_cast<std::size_t>(p.size));
+        for (label i = 0; i < p.size; ++i)
+        {
+            r[static_cast<std::size_t>(i)] =
+                uniform ? uval : (i < (label)vals.size() ? vals[static_cast<std::size_t>(i)] : scalar(0));
+        }
+        return r;
+    }
     static std::vector<vector> build(
         const FvPatch& p,
         bool uniform,
@@ -733,6 +792,20 @@ private:
             v[i] = (uniform ? uval : (i < (label)vals.size() ? vals[i] : scalar(0))) * p.nf[i];
         return v;
     }
+
+    std::vector<vector> form() const
+    {
+        std::vector<vector> v(static_cast<std::size_t>(this->patch_.size));
+        for (label i = 0; i < this->patch_.size; ++i)
+        {
+            const std::size_t k = static_cast<std::size_t>(i);
+            v[k] = this->patch_.nf[k] * ((k < refValue_.size()) ? refValue_[k] : scalar(0));
+        }
+        return v;
+    }
+
+    bool storing_ = false;
+    std::vector<scalar> refValue_;   // per face, as OpenFOAM keeps it
 };
 
 // flowRateInletVelocity (OF flowRateInletVelocityFvPatchVectorField). The default (extrapolateProfile
@@ -750,6 +823,10 @@ private:
 class FlowRateInletVelocityPatchField : public FixedValuePatchField<vector>
 {
 public:
+    // autoMap: TRUE from FixedValuePatchField, correctly, and OpenFOAM overrides none either -- its members
+    // are five per-patch numbers and words. The per-face profile is rebuilt from the rate, magSf and nf at
+    // every assembly (flowRateInletVelocityFvPatchVectorField.C:196), and the density it needs is an
+    // argument this class throws on rather than a told value it keeps.
     // The patch VALUE starts as the case's own `value` entry, exactly as OF does. OF's
     // flowRateInletVelocity is a fixedValue whose value is only replaced when updateCoeffs() first runs --
     // which happens when the momentum equation is assembled, i.e. AFTER createFields.H has already built
@@ -926,7 +1003,51 @@ public:
         : FixedValuePatchField<T>(p, false, T{},
                                   applyOffset(nearest ? mapNearest(p, pts, vals)
                                                       : mapPlanar(p, pts, vals),
-                                              hasOffset, offset)) {}
+                                              hasOffset, offset)),
+          pts_(pts),
+          vals_(vals),
+          nearest_(nearest),
+          hasOffset_(hasOffset),
+          offset_(offset) {}
+
+    // THE SAMPLE TABLE IS KEPT so the profile can be re-interpolated at the CHILDREN's face centres,
+    // which is what OpenFOAM's own autoMap achieves by throwing the interpolator away:
+    // MappedFile<Type>::autoMap (MappedFile.C:228-248) maps the sample values and then
+    // `filterFieldPtr_.reset(nullptr); mapperPtr_.reset(nullptr); sampleIndex_ = labelPair(-1,-1);`,
+    // so the NEXT value() rebuilds pointToPointPlanarInterpolation against the patch as it then is.
+    //
+    // THIS CLASS USED TO RETAIN NOTHING. It interpolated once in the constructor, kept only the result,
+    // and answered TRUE by inheriting FixedValuePatchField's autoMapComplete -- so a refinement gave each
+    // child its parent's sampled value, a staircase of the parent's faces instead of the profile read at
+    // the child's own centre. On a graded inlet profile (pitzDailyExptInlet is 35 y-stations) that is a
+    // first-order error in exactly the direction refinement was asked to remove.
+    // The re-interpolation is DEFERRED to the next evaluate, not done in the map, because that is where
+    // OpenFOAM does it: autoMap resets the interpolator and the next value() -- reached from updateCoeffs --
+    // rebuilds it. Doing it inside the map would make brae's post-map state differ from OpenFOAM's, which is
+    // what a mapper gate reads. This flag is brae's mapperPtr_.
+    bool autoMapComplete() const override { return true; }
+    void autoMap(const FvPatchFieldMapping& pm, const std::vector<T>& internal) override
+    {
+        FixedValuePatchField<T>::autoMap(pm, internal);
+        interpDirty_ = true;
+    }
+    void evaluate(const std::vector<T>& internal) override
+    {
+        if (interpDirty_)
+        {
+            interpDirty_ = false;
+            // both helpers read patch_.Cf, which is already the children's: the refine driver assigns the
+            // new patch geometry before it maps the carried fields
+            this->setStoredValues(
+                applyOffset(nearest_ ? mapNearest(this->patch_, pts_, vals_)
+                                     : mapPlanar(this->patch_, pts_, vals_),
+                            hasOffset_,
+                            offset_));
+            return;   // setStoredValues evaluated already
+        }
+        FixedValuePatchField<T>::evaluate(internal);
+    }
+
 private:
     static std::vector<T> applyOffset(std::vector<T> v, bool has, const T& off)
     {
@@ -976,6 +1097,14 @@ private:
         }
         return v;
     }
+
+    // the boundaryData sample table, kept for the re-interpolation above
+    bool                interpDirty_ = false;
+    std::vector<vector> pts_;
+    std::vector<T>      vals_;
+    bool                nearest_;
+    bool                hasOffset_;
+    T                   offset_;
 };
 
 // zeroGradient: boundary value == adjacent internal cell value.
@@ -1007,6 +1136,8 @@ template <typename T>
 class EpsilonWallFunctionPatchField : public ZeroGradientPatchField<T>
 {
 public:
+    // autoMap: TRUE from ZeroGradientPatchField, correctly -- this class adds a marker, no state. The
+    // near-wall CELL constraint it stands for lives in the turbulence model, not the patch field.
     explicit EpsilonWallFunctionPatchField(const FvPatch& p) : ZeroGradientPatchField<T>(p) {}
     bool isTurbulenceWallFunction() const override { return true; }
 };
@@ -1130,6 +1261,8 @@ private:
 class ConstantAlphaContactAnglePatchField : public FixedGradientPatchField<scalar>
 {
 public:
+    // autoMap: TRUE from FixedGradientPatchField, correctly. theta0 is per-patch; the gradient the contact
+    // angle produces is written into that base's per-face grad_, which it maps.
     enum class Limit { none, gradient, zeroGradient, alpha };
 
     ConstantAlphaContactAnglePatchField(const FvPatch& p, scalar theta0Deg, const std::string& limitWord,
@@ -1191,6 +1324,9 @@ private:
 class FixedFluxPressurePatchField : public FixedGradientPatchField<scalar>
 {
 public:
+    // autoMap: TRUE from FixedGradientPatchField, correctly. The gradient is TOLD here (constrainPressure
+    // hands it over), but it is stored in the base's grad_ and mapped there, and constrainPressure re-tells
+    // it at every pressure assembly before anything reads it.
     using FixedGradientPatchField<scalar>::FixedGradientPatchField;
     bool updateableSnGrad() const override { return true; }
     void updateSnGrad(const std::vector<scalar>& g) override
@@ -1480,6 +1616,23 @@ public:
     bool fixesValue() const override { return false; }
     bool isSymmetry() const override { return true; }
 
+    // OpenFOAM's symmetry/symmetryPlane chain (basicSymmetry -> transform -> fvPatchField) overrides no
+    // autoMap and holds no per-face data: every normal is fetched live (basicSymmetryFvPatchField.C:106-115
+    // calls patch().nf() on the spot), so fvPatchField<Type>::autoMap -- the value, plus a zero-gradient
+    // fill on unmapped faces -- is the whole of it. brae's base map is that same code.
+    //
+    // pif_ is brae's own: OpenFOAM's coefficient methods call patchInternalField() themselves, brae's take
+    // no arguments and read this cache. It is RECOMPUTED rather than mapped, because `internal` here is
+    // already the new mapped cell field and patch_ the new patch, so the recompute is exact where a map
+    // would zero-fill. Without it a grown patch reads its tail through pifAt's silent zero -- the
+    // coefficients would be built against pif = 0 on every added face and nothing would say so.
+    bool autoMapComplete() const override { return true; }
+    void autoMap(const FvPatchFieldMapping& pm, const std::vector<T>& internal) override
+    {
+        fvPatchField<T>::autoMap(pm, internal);
+        pif_ = this->patchInternalField(internal);
+    }
+
 private:
     // which of the three BCs this is: `slip` alone is not assignable (see the class note)
     bool slip_ = false;
@@ -1539,6 +1692,31 @@ public:
     std::vector<T> valueBoundaryCoeffs() const override { return fvPatchField<T>::valueBoundaryCoeffs(); }
     std::vector<T> gradientInternalCoeffs() const override { return fvPatchField<T>::gradientInternalCoeffs(); }
     std::vector<T> gradientBoundaryCoeffs() const override { return fvPatchField<T>::gradientBoundaryCoeffs(); }
+
+    // OpenFOAM's wedgeFvPatchField overrides no autoMap and holds NO member data at all: it re-fetches
+    // the rotations off the polyPatch on every call (wedgeFvPatchField.C:127,144,153), so
+    // fvPatchField<Type>::autoMap -- the value plus the zero-gradient fill -- is the whole of it.
+    //
+    // THE BASE MAP MUST RUN. The vector evaluate() below writes value_[i] for i < patch_.size without
+    // resizing, and buildDeviceVectorBoundary reads one value per face; an override that left value_ short
+    // would reproduce the empty-patch overrun above. The base map is what keeps it sized.
+    //
+    // pif_ is recomputed for the same reason as symmetry's, and here the stale-cache failure is LOUD in one
+    // direction and silent in the other: the boundary-coefficient guards throw when pif_.size() !=
+    // patch_.size (a grown patch), but pass on stale cell values when the size happens to be unchanged.
+    //
+    // faceT_/cellT_ are NOT re-derived. They are per-PATCH rotations taken from the normalised average of
+    // patch_.nf, and hexRef8 splits a boundary face into coplanar children with the identical unit normal,
+    // so refinement leaves that average unchanged. A mesh that MOVES its points is a different matter and
+    // this snapshot would go stale there -- wedgePolyPatch::calcGeometry recomputes where brae holds a copy.
+    // Re-deriving here is not the fix: wedgeGeometry throws on a degenerate patch, which would turn a
+    // geometry surprise into an exception inside the mapper.
+    bool autoMapComplete() const override { return true; }
+    void autoMap(const FvPatchFieldMapping& pm, const std::vector<T>& internal) override
+    {
+        fvPatchField<T>::autoMap(pm, internal);
+        pif_ = this->patchInternalField(internal);
+    }
 
 protected:
     tensor faceT_, cellT_;
@@ -1706,6 +1884,10 @@ template <typename T>
 class CalculatedPatchField : public ExtrapolatedValuePatchField<T>
 {
 public:
+    // autoMap: TRUE from ExtrapolatedValuePatchField, correctly. OpenFOAM's calculated has no data at all --
+    // its value IS the field -- so mapping the value is the whole of it; brae maps values_ as well because it
+    // keeps the file's per-face list apart from the evaluated value. This is the type every re-read of a
+    // brae-written derived field comes back as, so it is the restart path's map, not the refine loop's.
     using ExtrapolatedValuePatchField<T>::ExtrapolatedValuePatchField;   // read-and-hold value(); OF calculatedFvPatchField
     int bcCategory() const override { return 2; }
 };
@@ -1717,6 +1899,8 @@ template <typename T>
 class NutUSpaldingPatchField : public CalculatedPatchField<T>
 {
 public:
+    // autoMap: TRUE from ExtrapolatedValuePatchField via CalculatedPatchField, correctly: the Spalding
+    // inversion is recomputed from U and y at every correct(), nothing per-face is kept here.
     using CalculatedPatchField<T>::CalculatedPatchField;
     bool isNutUSpalding() const override { return true; }
 };
@@ -1919,14 +2103,35 @@ private:
 class VariableHeightFlowRatePatchField : public MixedPatchField<scalar>
 {
 public:
-    // autoMapComplete IS NOT INHERITED HERE. MixedPatchField answers true, and this class holds per-face
-    // state of its own that mixed's autoMap does not touch (phi_ and pif_). Those are TOLD values: brae's
-    // patches cannot look a flux or an alpha up, so a mesh change would leave them short -- and each
-    // updateCoeffs guards its own length and RETURNS, keeping the mapped refValue and valueFraction of the
-    // previous mesh under this condition's own name. That is a silent wrong answer, so the change is
-    // refused by name instead. Mapping them is a unit of its own; nothing needs it yet, because every
-    // case that uses this patch has a static mesh.
-    bool autoMapComplete() const override { return false; }
+    // THE TOLD STATE IS MAPPED, and that is what makes this class complete. The three told-state patches
+    // (this one, permeable-alpha U and prghPermeableAlpha p) each hold per-face values brae is HANDED
+    // rather than able to look up, and each used to refuse a mesh change by name because a short one made
+    // rebuild() return, leaving the mapped refValue and valueFraction of the PREVIOUS mesh standing under
+    // this condition's own name.
+    //
+    // OpenFOAM has nothing to map here -- variableHeightFlowRateFvPatchField overrides no autoMap, because
+    // its updateCoeffs LOOKS the flux and the cell up on the spot (.C:128-165) and so always has the new
+    // mesh's. brae's equivalent is to map the told flux through the SAME addressing the phi field's own
+    // patch arrays go through (mapSurfaceField, dynamic_refine_fv_mesh_cpp.cu:2119-2129: a direct copy with
+    // a zero on an unmapped face), which is mapFieldThrough face for face, and to RECOMPUTE pif_ from the
+    // `internal` handed here, which is already the new mapped cell field.
+    //
+    // A CLEAR WOULD BE WORSE THAN A MAP, not safer: it trips rebuild()'s own length guard and freezes the
+    // mapped coefficients until the next push, which the driver does not guarantee before the next alpha
+    // equation (the post-change pushFluxToPatches sits inside `if (f.correctPhi && !skipCorrectPhi)`).
+    //
+    // COARSENING was the direction nothing guarded: every guard is `size() < n`, so a SHRINKING patch left
+    // a long stale vector that passed and decided refValue per face at old face indices with no diagnostic.
+    bool autoMapComplete() const override { return true; }
+    void autoMap(const FvPatchFieldMapping& pm, const std::vector<scalar>& internal) override
+    {
+        MixedPatchField<scalar>::autoMap(pm, internal);
+        mapFieldThrough(phi_, pm, scalar(0));
+        pif_ = this->patchInternalField(internal);
+        // NO rebuild() HERE. OpenFOAM's post-map state is the MAPPED refValue and valueFraction -- its
+        // updateCoeffs runs at the next assembly, on the flux as it is THEN. Recomputing here would make
+        // brae's mapped state differ from OpenFOAM's in exactly the window a mapper gate reads.
+    }
 
     VariableHeightFlowRatePatchField(
         const FvPatch& p,
@@ -2006,6 +2211,10 @@ private:
 class VariableHeightFlowRateInletVelocityPatchField : public FixedValuePatchField<vector>
 {
 public:
+    // autoMap: TRUE from FixedValuePatchField, correctly -- and note the contrast with the SCALAR patch of
+    // nearly the same name above, which needed its own map. This one DISCARDS the alpha it is handed (it is
+    // a by-value argument, and a short one throws) and rebuilds the whole profile at every assembly;
+    // the scalar one STORES its flux, which is what had to be mapped.
     VariableHeightFlowRateInletVelocityPatchField(
         const FvPatch& p,
         Function1 flowRate,
@@ -2078,14 +2287,26 @@ private:
 class PermeableAlphaPressureInletOutletVelocityPatchField : public MixedPatchField<vector>
 {
 public:
-    // autoMapComplete IS NOT INHERITED HERE. MixedPatchField answers true, and this class holds per-face
-    // state of its own that mixed's autoMap does not touch (phi_ and alpha_). Those are TOLD values: brae's
-    // patches cannot look a flux or an alpha up, so a mesh change would leave them short -- and each
-    // updateCoeffs guards its own length and RETURNS, keeping the mapped refValue and valueFraction of the
-    // previous mesh under this condition's own name. That is a silent wrong answer, so the change is
-    // refused by name instead. Mapping them is a unit of its own; nothing needs it yet, because every
-    // case that uses this patch has a static mesh.
-    bool autoMapComplete() const override { return false; }
+    // THE TOLD STATE IS MAPPED -- see the note on variableHeightFlowRate above, which this follows. Both
+    // the flux and the phase fraction go through the mapper the fields they came from go through: phi's
+    // patch arrays by mapSurfaceField and alpha1's patch field by this same FvPatchFieldMapping, in the
+    // scalar loop that runs BEFORE this vector one (dynamic_refine_fv_mesh_cpp.cu:2089-2113).
+    //
+    // OpenFOAM's pressurePermeableAlphaInletOutletVelocity overrides no autoMap either: its members are
+    // four words and scalars (.H:107-116) and its updateCoeffs looks phi and alpha up every call
+    // (.C:135,163-165). mixedFvPatchField::autoMap (mixedFvPatchField.C:198-209) is all it inherits.
+    //
+    // correctUphiBCs DOES NOT COVER THIS PATCH, so it is not re-told before the change is seen: it skips
+    // `!Up.fixesValue()` (inter_correct_phi_cpp.cu:114) and a mixed field fixes no value.
+    bool autoMapComplete() const override { return true; }
+    void autoMap(const FvPatchFieldMapping& pm, const std::vector<vector>& internal) override
+    {
+        MixedPatchField<vector>::autoMap(pm, internal);
+        mapFieldThrough(phi_, pm, scalar(0));
+        if (!alpha_.empty()) mapFieldThrough(alpha_, pm, scalar(0));
+        // NO rebuild() HERE, for the reason given on variableHeightFlowRate: OpenFOAM's post-map
+        // coefficients are the mapped ones, and its updateCoeffs runs at the next assembly.
+    }
 
     // OpenFOAM OVERRIDES operator= here too, so this does not inherit mixed's false
     // (pressurePermeableAlphaInletOutletVelocityFvPatchVectorField.C): the assigned value is
@@ -2164,14 +2385,27 @@ private:
 class PrghPermeableAlphaTotalPressurePatchField : public MixedPatchField<scalar>
 {
 public:
-    // autoMapComplete IS NOT INHERITED HERE. MixedPatchField answers true, and this class holds per-face
-    // state of its own that mixed's autoMap does not touch (alpha_). Those are TOLD values: brae's
-    // patches cannot look a flux or an alpha up, so a mesh change would leave them short -- and each
-    // updateCoeffs guards its own length and RETURNS, keeping the mapped refValue and valueFraction of the
-    // previous mesh under this condition's own name. That is a silent wrong answer, so the change is
-    // refused by name instead. Mapping them is a unit of its own; nothing needs it yet, because every
-    // case that uses this patch has a static mesh.
-    bool autoMapComplete() const override { return false; }
+    // THE TOLD STATE IS MAPPED, and this is the one of the three where OpenFOAM DOES override autoMap:
+    // prghPermeableAlphaTotalPressureFvPatchScalarField::autoMap (.C:142-153) is
+    // `mixedFvPatchField<scalar>::autoMap(m); if (p0_) p0_->autoMap(m);` -- the one extra member being a
+    // PatchFunction1 for p0, which brae holds as a uniform scalar, so brae has nothing there to map. What
+    // brae must map instead is alpha_, standing in for the lookup OpenFOAM's updateCoeffs does itself.
+    //
+    // NO rebuild() CALL: unlike the other two, refValue/refGrad/valueFraction here are re-told at every
+    // pressure corrector (updatePermeableTotalPressure + updateSnGrad from the pEqn), and that path THROWS
+    // by name on a short input rather than returning -- so refinement already failed closed. The hole this
+    // closes is COARSENING, where a long stale alpha_ passed the length test and decided valueFraction per
+    // face at old face indices.
+    //
+    // everUpdated_ SURVIVES THE MAP. MixedPatchField::autoMap maps a real refGrad_, so clearing the latch
+    // would mark a genuine gradient as never-set; OpenFOAM leaves its own analogue curTimeIndex_ (.H:135)
+    // untouched in autoMap for the same reason.
+    bool autoMapComplete() const override { return true; }
+    void autoMap(const FvPatchFieldMapping& pm, const std::vector<scalar>& internal) override
+    {
+        MixedPatchField<scalar>::autoMap(pm, internal);
+        if (!alpha_.empty()) mapFieldThrough(alpha_, pm, scalar(0));
+    }
 
     PrghPermeableAlphaTotalPressurePatchField(
         const FvPatch& p,
@@ -2364,6 +2598,11 @@ template <typename T>
 class TurbulentInletPatchField : public InletOutletPatchField<T>
 {
 public:
+    // autoMap: TRUE from InletOutletPatchField -> MixedPatchField, correctly. All three OpenFOAM inlets this
+    // serves hold per-patch scalars only and override no autoMap; refValue is rebuilt from U or k and
+    // valueFraction from the flux at every assembly, and a short input throws. (OpenFOAM's OTHER
+    // turbulentInlet -- the random-fluctuation one -- is a different class, unported, and it DOES need its
+    // own map: turbulentInletFvPatchField.C:121-129 maps referenceField_ and leaves the RNG state alone.)
     enum Kind { intensityK, mixingLengthEpsilon, mixingLengthOmega };
 
     TurbulentInletPatchField(
@@ -2455,6 +2694,9 @@ template <typename T>
 class OutletInletPatchField : public MixedPatchField<T>   // value()/refValue = outletValue (= freestreamValue)
 {
 public:
+    // autoMap: TRUE from MixedPatchField, correctly, and OpenFOAM derives it the same way (its only member
+    // is phiName_). valueFraction comes from the flux at every assembly and the flux is not stored;
+    // outletValue is the dictionary's, so it must be carried, and refValue is where the base carries it.
     // FALSE, and unlike inletOutlet this one really does inherit it: outletInletFvPatchField declares no
     // assignable() of its own, so mixedFvPatchField's false stands (mixedFvPatchField.H:200).
     bool assignable() const override { return false; }   // OF: outletInlet does NOT override mixed
@@ -2723,12 +2965,20 @@ public:
     // refGrad and valueFraction and then tangentialVelocity -- and brae stores none of those: its
     // refValue and refGrad are identically zero (a tangentialVelocity is refused at construction) and its
     // valueFraction is rebuilt from the flux at every updateCoeffs. `phi_` and `pif_` are that per-step
-    // input and the patch's internal field, both overwritten before they are read, so they are resized.
+    // input and the patch's internal field.
+    //
+    // phi_ IS MAPPED, NOT ZEROED. It used to be resized to zeros on the argument that the next
+    // updateFromFlux overwrites it first -- true on the interFoam path, where correctUphiBCs tells every
+    // value-fixing U patch its flux before evaluating, but a call-ordering invariant nothing states. A
+    // zeroed flux is not neutral: snGrad and transformDiag read `phi_[i] < 0` for inflow, so every face
+    // would read as OUTFLOW (full zeroGradient, a zero transform diagonal) until the next tell. The map is
+    // the same direct copy the phi field's own patch arrays take, so there is no window in which the two
+    // disagree.
     bool autoMapComplete() const override { return true; }
     void autoMap(const FvPatchFieldMapping& pm, const std::vector<T>& internal) override
     {
         ExtrapolatedValuePatchField<T>::autoMap(pm, internal);
-        phi_.assign(static_cast<std::size_t>(this->patch_.size), scalar(0));
+        mapFieldThrough(phi_, pm, scalar(0));
         pif_ = this->patchInternalField(internal);
     }
 
@@ -2780,6 +3030,12 @@ public:
     std::vector<T> valueBoundaryCoeffs()    const override { return std::vector<T>(this->patch_.size, T{}); }
     std::vector<T> gradientInternalCoeffs() const override { return std::vector<T>(this->patch_.size, T{}); }
     std::vector<T> gradientBoundaryCoeffs() const override { return std::vector<T>(this->patch_.size, T{}); }
+
+    // FALSE, inherited from the base, and named here so it is not read as an oversight: a processor patch
+    // is PARALLEL, which this project does not work on until asked for by name. Nothing on the carried-field
+    // path can build one (the factory has no processor branch), so this is a refusal that cannot be reached
+    // rather than a gap in the port.
+    bool autoMapComplete() const override { return false; }
 
     void initEvaluate(const std::vector<T>& internal) override
     {
@@ -2837,6 +3093,16 @@ public:
         forwardT_ = fT;
         hasTransform_ = true;
     }
+
+    // FALSE, and the reason is on the MESH side, not the field's. OpenFOAM's cyclicFvPatchField overrides no
+    // autoMap -- everything a cyclic reads (the neighbour addressing, the weights, the transform) lives on
+    // the patch, which the mesh rebuilds -- so mapping the value would be the whole of it here too. What
+    // brae cannot do is re-attach the coupling: nbrFaceCells_ is CELL addressing, which a per-face patch
+    // mapper cannot carry, and weights_ is the geometry as of attachCyclicCoupling, which nothing re-runs
+    // after a change. The refinement path refuses any coupled patch before a field is ever mapped
+    // (dynamic_refine_fv_mesh_cpp.cu, faceConsistentRefinement: the 2:1 closure swaps cell levels across a
+    // coupled patch), so answering true here would be both dead and a lie about the patch side.
+    bool autoMapComplete() const override { return false; }
 
     std::vector<T> valueInternalCoeffs()    const override { return std::vector<T>(this->patch_.size, T{}); }
     std::vector<T> valueBoundaryCoeffs()    const override { return std::vector<T>(this->patch_.size, T{}); }
@@ -2899,6 +3165,13 @@ public:
 
     bool coupled() const override { return true; }
     bool fixesValue() const override { return false; }
+
+    // FALSE for the same mesh-side reason as CyclicFvPatchField above. The FIELD half would be one line --
+    // OpenFOAM's fixedJumpFvPatchField::autoMap (fixedJumpFvPatchField.C:217-225) is its base's map plus
+    // `jump_.autoMap(m)` and brae has the same jump_ -- but everything evaluate() reads (patch_.weights,
+    // patch_.deltaCoeffs, patch_.faceCells, patch_.owner) comes from attachCyclicCoupling, and a coupled
+    // patch on a refining mesh is refused before any field is mapped.
+    bool autoMapComplete() const override { return false; }
 
     std::vector<T> patchNeighbourField(const std::vector<T>& internal) const override
     {
@@ -2997,6 +3270,10 @@ public:
     }
 
     bool isPorousBafflePressure() const override { return true; }
+    // FALSE inherited from CoupledCyclicPatchField, deliberately: the blocker is that base's coupling, not
+    // this class's own state. D_/I_/length_/uniformJump_ are per-patch dictionary numbers and jump_ is the
+    // base's, so there would be nothing extra to map even once a cyclic can be mapped at all.
+    bool autoMapComplete() const override { return false; }
 
     std::vector<scalar> porousBaffleJump(
         const std::vector<scalar>& phip,
@@ -3073,6 +3350,9 @@ inline InletOrValue<T> inletOrValue(const PatchFieldData<T>& d)
 class RotatingWallVelocityPatchField : public FixedValuePatchField<vector>
 {
 public:
+    // autoMap: TRUE from FixedValuePatchField, correctly. The origin, axis and omega are per-patch; the
+    // per-face velocity is recomputed from the CURRENT face centres and normals at every evaluate() below
+    // (which is where brae puts what OpenFOAM does in updateCoeffs), so nothing per-face is carried.
     RotatingWallVelocityPatchField(
         const FvPatch& p,
         const vector& origin,

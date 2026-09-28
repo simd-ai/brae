@@ -147,6 +147,75 @@ int main()
         check("LEG 6  `alpha none`: valueFraction stays 0, every face takes the gradient", allGradient);
     }
 
+    // LEG 8 and LEG 9  A MESH CHANGE MAPS THE TOLD STATE, and COARSENING is the direction that catches it.
+    //
+    // Both halves of this wall are handed their flux and their phase fraction; both stored them and both
+    // used to refuse a mesh change by name. The map is now the same addressing the fields they came from
+    // go through, and the silent direction is a patch that SHRINKS: the stale vector is still long enough
+    // for every length guard, so the flux and the phase fraction are read at OLD face indices. Each leg
+    // coarsens 5 faces to 2 and takes them from the WET end, where a stale read would find the dry faces.
+    // MEASURED without the maps: U (3 1 0) on the outflow face where it must hold 0, and p_rgh 3007 1507
+    // where it must read 307.5 410 -- the total pressure of a dry face on a wet one.
+    std::printf("== the told state under a mesh change ==\n");
+    {
+        FvPatch five = makePatch(5);
+        PermeableAlphaPressureInletOutletVelocityPatchField u(five, "alpha.water", alphaMin,
+                                                             std::vector<vector>(5, zero));
+        u.updateFromAlphaValues(alphap);
+        u.updateFromFlux(phip);
+        u.evaluate(cells);
+
+        FvPatchFieldMapping pm;
+        pm.direct = true;
+        pm.directAddressing = {3, 2};       // wet+inflow and wet+outflow
+        FvPatch two = makePatch(2);
+        five = two;                         // the field holds a reference: this is the coarsened patch
+        u.autoMap(pm, std::vector<vector>(2, vector{3, 1, 0}));
+        // the driver re-tells the flux after a change (pushFluxToPatches) and that is what re-runs
+        // rebuild(); the phase fraction is the input it does NOT re-tell before the alpha equation, so a
+        // stale one is read here and would make the outflow face DRY -- a zeroGradient in place of a hold
+        u.updateFromFlux(std::vector<scalar>{-0.2, 0.2});
+        u.evaluate(std::vector<vector>(2, vector{3, 1, 0}));
+        std::printf("  coarsened U: (%g %g %g) (%g %g %g)   (both faces are WET, so both hold 0)\n",
+                    (double)u.value()[0].x, (double)u.value()[0].y, (double)u.value()[0].z,
+                    (double)u.value()[1].x, (double)u.value()[1].y, (double)u.value()[1].z);
+        check("LEG 8  a coarsened patch reads flux and alpha at its NEW face indices",
+              u.value().size() == 2 && same(u.value()[0], zero) && same(u.value()[1], zero));
+    }
+    {
+        const std::vector<scalar> rhop = {1.0, 1.0, 1000.0, 1000.0, 1.0};
+        const std::vector<scalar> ghp = {-1.0, -2.0, -3.0, -4.0, -5.0};
+        const std::vector<vector> Up(5, vector{2, 1, 0});
+        const std::vector<scalar> sn = {10.0, 20.0, 30.0, 40.0, 50.0};
+        const std::vector<scalar> pc = {100.0, 200.0, 300.0, 400.0, 500.0};
+        const scalar p0 = 7.0;
+
+        FvPatch five = makePatch(5);
+        PrghPermeableAlphaTotalPressurePatchField q(five, p0, "alpha.water", alphaMin, {});
+        q.updateFromAlphaValues(alphap);
+        q.updatePermeableTotalPressure(rhop, phip, Up, ghp);
+        q.updateSnGrad(sn);
+        q.evaluate(pc);
+
+        FvPatchFieldMapping pm;
+        pm.direct = true;
+        pm.directAddressing = {2, 3};       // the two wet faces
+        FvPatch two = makePatch(2);
+        five = two;
+        q.autoMap(pm, std::vector<scalar>{300.0, 400.0});
+        // the pressure corrector re-tells everything it can look up; alpha is the one it cannot
+        q.updatePermeableTotalPressure({1000.0, 1000.0}, {0.2, -0.2}, {vector{2,1,0}, vector{2,1,0}},
+                                       {-3.0, -4.0});
+        q.updateSnGrad({30.0, 40.0});
+        q.evaluate(std::vector<scalar>{300.0, 400.0});
+        std::printf("  coarsened p_rgh: %g %g   (both WET, so cell + snGradp/deltaCoeffs)\n",
+                    (double)q.value()[0], (double)q.value()[1]);
+        check("LEG 9  a coarsened patch reads alpha at its NEW face indices",
+              q.value().size() == 2
+              && q.value()[0] == scalar(300.0) + scalar(30.0)/scalar(4)
+              && q.value()[1] == scalar(400.0) + scalar(40.0)/scalar(4));
+    }
+
     std::printf("test_permeable_wall_conditions: %d failures\n", failures);
     return failures == 0 ? 0 : 1;
 }
