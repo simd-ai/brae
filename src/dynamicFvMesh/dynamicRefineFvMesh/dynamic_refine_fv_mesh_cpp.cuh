@@ -703,6 +703,17 @@ struct RefineUpdateState
     // existence (fvMesh.C:1020-1024: updateMesh only stores them when the CURRENT volumes already
     // exist), and from then on mapped and corrected at every change.
     std::vector<scalar>              V0;
+    // ...STORED ONCE PER TIME INDEX, at the first change of that index (storeOldVol runs only while
+    // curTimeIndex_ < timeIndex, fvMesh.C:166 and :1026), and only mapped at a second change of the same
+    // index. It was stored at the first change of the RUN and mapped ever after -- the same numbers to
+    // round-off on a mesh that does not move, where nothing reads V0, and a different ddt term on one
+    // that does. -1 = never stored.
+    label                            V0TimeIndex = -1;
+    // THE MOTION SOLVER'S points0, CARRIED THROUGH EVERY CHANGE when the mesh also moves: dynamicRefineFvMesh
+    // is a dynamicMotionSolverListFvMesh, and its mapFields calls each motion solver's updateMesh
+    // (dynamicMotionSolverListFvMesh.C:156-168), which maps points0 by points0MotionSolver.C:152-218 --
+    // see mapPoints0. Null on a mesh that only refines.
+    std::vector<vector>*             points0 = nullptr;
     // The old cell volumes each of a step's two changes is weighted with. Left empty, brae uses its own
     // FvGeometry::V() of the pre-change mesh -- which is what the shipped path must do. The gate injects
     // OpenFOAM's instead, so that a mapper defect and brae's own volume round-off are SEPARABLE: brae's V
@@ -787,6 +798,19 @@ struct RefineUpdateStep
     cpu::polyTopoChange::TopoChangeMap unrefineMap;
     bool                          compacted = false;
 };
+
+// points0MotionSolver::updateMesh (points0MotionSolver.C:152-218): points0 through one topology change.
+// `points` are the mesh's points AFTER the change and before any motion -- a change made without
+// inflation hands no preMotionPoints (polyTopoChange.C:3894-3907, :4026). A point that survives keeps its
+// points0; one the change ADDS takes its master's points0 plus its own offset from the master on the
+// current mesh, scaled component by component by span(points0)/span(points):
+//     points0[old] + cmptMultiply(span0/span, points[new] - points[master])
+// with master = reversePointMap[pointMap[new]]. twoDCorrectPoints follows in OpenFOAM and is a no-op on a
+// 3-D mesh; a 2-D mesh is refused where the motion is built.
+std::vector<vector> mapPoints0(
+    const std::vector<vector>&                points0,
+    const cpu::polyTopoChange::TopoChangeMap& map,
+    const std::vector<vector>&                points);
 
 // One update() step. `field` is the driving field on the CURRENT mesh, `timeIndex` OpenFOAM's own time
 // index -- the step is a no-op at 0 and whenever timeIndex % refineInterval != 0, exactly as

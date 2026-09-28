@@ -1762,7 +1762,13 @@ std::vector<T> mapSurfaceFieldT(
             }
         }
     }
-    else
+    // ...AND THE SAME EMPTY-FIELD RULE on the interpolative branch: a boundary-only carry (U's old-time
+    // patch values, inter_amr_cpp.cu's pushBoundaryOnly) has no internal half, and an unrefinement's merged
+    // faces make the internal mapping interpolative. This branch indexed the empty list regardless --
+    // MEASURED, a segfault at the first unrefinement inside a solver run (dynamic_refine_fv_mesh_cpp.cu,
+    // oldField of length 0 against 50,088 addressed faces), which laminar/oscillatingBox reaches at step 55
+    // as shipped and no gated profile had reached.
+    else if (!oldField.empty())
     {
         out.assign(sm.addressing.size(), zero);
         for (std::size_t i = 0; i < out.size(); ++i)
@@ -1774,6 +1780,10 @@ std::vector<T> mapSurfaceFieldT(
             }
             out[i] = v;
         }
+    }
+    else
+    {
+        out.assign(sm.addressing.size(), zero);
     }
     if (oriented)
     {
@@ -1820,7 +1830,8 @@ std::vector<scalar> mapSurfaceField(
             }
         }
     }
-    else
+    // the empty-field rule on the interpolative branch too -- see mapSurfaceFieldT
+    else if (!oldField.empty())
     {
         out.assign(sm.addressing.size(), scalar(0));
         for (std::size_t i = 0; i < out.size(); ++i)
@@ -1832,6 +1843,10 @@ std::vector<scalar> mapSurfaceField(
             }
             out[i] = v;
         }
+    }
+    else
+    {
+        out.assign(sm.addressing.size(), scalar(0));
     }
     if (oriented)
     {
@@ -2017,13 +2032,67 @@ MapPolyMesh mapPolyMeshFrom(
 
 // fvMesh::updateMesh + dynamicRefineFvMesh::mapFields, on the state the driver carries: every cell field
 // through the cell mapper, the old-time volumes through their own rule and then corrected.
+std::vector<vector> mapPoints0(
+    const std::vector<vector>&                points0,
+    const cpu::polyTopoChange::TopoChangeMap& map,
+    const std::vector<vector>&                points)
+{
+    // boundBox(points0_).span() and boundBox(points).span() -- max minus min, component by component
+    auto span = [](const std::vector<vector>& pts) -> vector
+    {
+        if (pts.empty()) return vector{0, 0, 0};
+        vector lo = pts[0];
+        vector hi = pts[0];
+        for (const vector& q : pts)
+        {
+            lo = vector{std::fmin(lo.x, q.x), std::fmin(lo.y, q.y), std::fmin(lo.z, q.z)};
+            hi = vector{std::fmax(hi.x, q.x), std::fmax(hi.y, q.y), std::fmax(hi.z, q.z)};
+        }
+        return hi - lo;
+    };
+    const vector span0 = span(points0);
+    const vector span1 = span(points);
+    const vector scaleFactors{span0.x/span1.x, span0.y/span1.y, span0.z/span1.z};
+
+    const std::size_t nNew = map.pointMap.size();
+    if (points.size() != nNew)
+        throw std::runtime_error(
+            "brae points0 map: the change has " + std::to_string(nNew) + " points and the mesh after it "
+            + std::to_string(points.size()) + ".");
+    std::vector<vector> newPoints0(nNew);
+    for (std::size_t pointi = 0; pointi < nNew; ++pointi)
+    {
+        const label oldPointi = map.pointMap[pointi];
+        if (oldPointi < 0)
+            throw std::runtime_error(
+                "brae points0 map: Cannot determine co-ordinates of introduced vertices. New vertex "
+                + std::to_string(pointi) + " at coordinate (" + std::to_string(points[pointi].x) + " "
+                + std::to_string(points[pointi].y) + " " + std::to_string(points[pointi].z) + ").");
+        const label masterPointi = map.reversePointMap[static_cast<std::size_t>(oldPointi)];
+        if (masterPointi == static_cast<label>(pointi))
+        {
+            newPoints0[pointi] = points0[static_cast<std::size_t>(oldPointi)];
+        }
+        else
+        {
+            // New point - assume motion is scaling
+            const vector d = points[pointi] - points[static_cast<std::size_t>(masterPointi)];
+            newPoints0[pointi] = points0[static_cast<std::size_t>(oldPointi)]
+                               + vector{scaleFactors.x*d.x, scaleFactors.y*d.y, scaleFactors.z*d.z};
+        }
+    }
+    return newPoints0;
+}
+
+
 void mapCarriedFields(
     RefineUpdateState&                        s,
     const cpu::polyTopoChange::TopoChangeMap& map,
     const std::vector<scalar>&                oldCellVolumes,
     label                                     nNewCells,
     const std::vector<scalar>&                newV,
-    label                                     nOldInternalFaces)
+    label                                     nOldInternalFaces,
+    label                                     timeIndex)
 {
     const CellMapping cm = cellMapping(map, nNewCells, oldCellVolumes);
     for (std::vector<scalar>& f : s.cellScalars) f = mapCellField(f, cm);
@@ -2115,6 +2184,47 @@ void mapCarriedFields(
             }
         }
 
+        // A CARRIED SURFACE FIELD MUST BE ON THE MESH THE CHANGE STARTS FROM: its internal list the old
+        // internal-face count and each patch list the old patch's size. The mapping below reads it through
+        // the old addressing, so a list left at another length is read past its end -- a segfault in
+        // mapSurfaceField rather than an error that names the field. An EMPTY internal list is legitimate:
+        // it is a boundary-only carry (U's old-time patch values ride as surface vectors with no internal
+        // half, inter_amr_cpp.cu's pushBoundaryOnly).
+        auto checkOld = [&](const char* kind, std::size_t k, std::size_t nInt,
+                            const std::vector<std::size_t>& bndSizes)
+        {
+            bool bad = (nInt != 0 && nInt != static_cast<std::size_t>(nOldInternalFaces))
+                    || bndSizes.size() != patches.size();
+            for (std::size_t p = 0; !bad && p < bndSizes.size(); ++p)
+            {
+                bad = bndSizes[p] != static_cast<std::size_t>(map.oldPatchSizes[p]);
+            }
+            if (!bad) return;
+            std::string sizes;
+            for (std::size_t p = 0; p < bndSizes.size() && p < patches.size(); ++p)
+            {
+                sizes += " " + patches[p].name + " " + std::to_string(bndSizes[p]) + "/"
+                       + std::to_string(map.oldPatchSizes[p]);
+            }
+            throw std::runtime_error(
+                std::string("brae dynamicRefineFvMesh: carried surface ") + kind + " " + std::to_string(k)
+                + " is not on the mesh this change starts from: internal " + std::to_string(nInt) + "/"
+                + std::to_string(nOldInternalFaces) + ", " + std::to_string(bndSizes.size()) + "/"
+                + std::to_string(patches.size()) + " patch lists, per patch (held/old):" + sizes + ".");
+        };
+        for (std::size_t k = 0; k < s.surfaceScalars.size(); ++k)
+        {
+            std::vector<std::size_t> bs;
+            for (const std::vector<scalar>& b : s.surfaceScalars[k].bnd) bs.push_back(b.size());
+            checkOld("scalar", k, s.surfaceScalars[k].field.size(), bs);
+        }
+        for (std::size_t k = 0; k < s.surfaceVectors.size(); ++k)
+        {
+            std::vector<std::size_t> bs;
+            for (const std::vector<vector>& b : s.surfaceVectors[k].bnd) bs.push_back(b.size());
+            checkOld("vector", k, s.surfaceVectors[k].field.size(), bs);
+        }
+
         // STEP ONE for the surface fields: the addressing, and the flip on an oriented one.
         for (RefineUpdateState::CarriedSurfaceField& f : s.surfaceScalars)
         {
@@ -2179,15 +2289,24 @@ void mapCarriedFields(
     }
 
     // V0 comes into existence at the FIRST change and not before -- fvMesh::updateMesh only stores old
-    // volumes when the current ones already exist, and what it stores is the OLD mesh's volumes.
-    if (s.V0.empty())
+    // volumes when the current ones already exist, and what it stores is the OLD mesh's volumes -- and it
+    // is stored again at the first change of every later time index (see RefineUpdateState::V0TimeIndex)
+    if (s.V0.empty() || s.V0TimeIndex != timeIndex)
     {
         s.V0 = oldCellVolumes;
+        s.V0TimeIndex = timeIndex;
     }
     if (!s.V0.empty())
     {
         const MapPolyMesh mpm = mapPolyMeshFrom(map, oldCellVolumes);
         s.V0 = correctOldVolumes(mpm, mapOldVolumes(s.V0, map, nNewCells), newV);
+    }
+
+    // dynamicMotionSolverListFvMesh::mapFields -> each motion solver's updateMesh, on the mesh as the
+    // change left it: this function runs with the new mesh already in place
+    if (s.points0)
+    {
+        *s.points0 = mapPoints0(*s.points0, map, s.m.points());
     }
 }
 
@@ -2353,7 +2472,7 @@ RefineUpdateStep refineUpdate(
             s.m = rebuiltMesh(s.m, out);
             buildAddressing(s.m, a);
             updatePatchesInPlace(s.patches, buildPatches(s.m, a.g));
-            mapCarriedFields(s, r.refineMap, oldV, out.nCells, a.g.V(), nOldInternalFaces);
+            mapCarriedFields(s, r.refineMap, oldV, out.nCells, a.g.V(), nOldInternalFaces, timeIndex);
 
             // :1391-1411. refineCell REBUILT THROUGH THE MAP: a cell stays marked if it is new, if it is
             // not its old cell's master, or if its old cell was marked. That is what keeps every child of
@@ -2480,7 +2599,7 @@ RefineUpdateStep refineUpdate(
             s.m = rebuiltMesh(s.m, out);
             buildAddressing(s.m, a);
             updatePatchesInPlace(s.patches, buildPatches(s.m, a.g));
-            mapCarriedFields(s, r.unrefineMap, oldV, out.nCells, a.g.V(), nOldInternalFaces);
+            mapCarriedFields(s, r.unrefineMap, oldV, out.nCells, a.g.V(), nOldInternalFaces, timeIndex);
             // ...and then unrefine's second correction, which runs AFTER updateMesh and so after the
             // hull average (:610-689)
             if (!s.injectedPhiU.empty() && !faceToSplitPoint.empty())
