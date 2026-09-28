@@ -418,20 +418,19 @@ bool adjustPhi(
             }
         }
     }
-    // the total flux in the domain, used for normalisation: VSMALL + sum(mag(phi))
-    scalar totalFlux = scalar(1e-300);
+    // totalFlux = VSMALL + sum(mag(phi)) (adjustPhi.C:91) -- and Foam::sum() of a GeometricField is
+    // gSum(f1.primitiveField()) (GeometricFieldFunctions.C:470-497): the INTERNAL faces only, summed
+    // from zero, VSMALL added after. This used to add every non-empty boundary patch too, which moved
+    // all three relative tests below; on test_adjust_phi_guards' straddle (massIn 1, fixed outflow
+    // 1 + 2e-8, internal flux 1) OpenFOAM stops and the inflated normaliser (3) let the run continue.
+    // The simpleFoam and rhoSimpleFoam twins were corrected for the same thing; this one is shared by
+    // the pressure corrector and CorrectPhi, on both arms.
+    scalar sumMagPhi = 0;
     for (const scalar v : phi.internal)
     {
-        totalFlux += std::fabs(v);
+        sumMagPhi += std::fabs(v);
     }
-    for (std::size_t pi = 0; pi < patches.size(); ++pi)
-    {
-        if (patches[pi].type == "empty") continue;
-        for (const scalar v : phi.boundary[pi])
-        {
-            totalFlux += std::fabs(v);
-        }
-    }
+    const scalar totalFlux = scalar(1e-300) + sumMagPhi;
     scalar massCorr = 1;
     const scalar magAdjustableMassOut = std::fabs(adjustableMassOut);
     // VSMALL, SMALL
@@ -441,11 +440,19 @@ bool adjustPhi(
     }
     else if (std::fabs(fixedMassOut - massIn)/totalFlux > scalar(1e-8))
     {
+        // OpenFOAM's FatalError (adjustPhi.C:108-119), in its words and with its four numbers. They are
+        // printed %.6e: std::to_string's %f wrote every flux on damBreak as 0.000000.
+        char nums[256];
+        std::snprintf(nums, sizeof(nums),
+                      "Total flux              : %.6e\n"
+                      "Specified mass inflow   : %.6e\n"
+                      "Specified mass outflow  : %.6e\n"
+                      "Adjustable mass outflow : %.6e",
+                      (double)totalFlux, (double)massIn, (double)fixedMassOut, (double)adjustableMassOut);
         throw std::runtime_error(
-            "brae interFoam adjustPhi: continuity error cannot be removed by adjusting the outflow. "
-            "OpenFOAM stops here (adjustPhi.C:106). Total flux " + std::to_string(totalFlux)
-            + ", specified mass inflow " + std::to_string(massIn) + ", specified mass outflow "
-            + std::to_string(fixedMassOut) + ", adjustable mass outflow " + std::to_string(adjustableMassOut));
+            std::string("brae interFoam adjustPhi: Continuity error cannot be removed by adjusting the "
+                        "outflow.\nPlease check the velocity boundary conditions and/or run potentialFoam "
+                        "to initialise the outflow.\n") + nums);
     }
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
@@ -683,7 +690,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
         MRF::makeRelative(phiHbyA, *in.mrf, g, patches);
     }
 
-    // pEqn.H:19-24: on a closed case the boundary flux is balanced by adjustPhi, and on a moving mesh
+    // pEqn.H:21-26: on a closed case the boundary flux is balanced by adjustPhi, and on a moving mesh
     // it is the RELATIVE flux that is balanced -- makeRelative around it, makeAbsolute after
     if (sc.needReference)
     {

@@ -190,8 +190,10 @@ struct DdtCorrInput
 };
 
 // adjustPhi(phi, U, p): on a case that needs a pressure reference, scale the OUTFLOW of the patches
-// whose velocity is not fixed so that the boundary flux balances (adjustPhi.C:36-137). Returns what
-// OpenFOAM returns. Throws where OpenFOAM stops: an imbalance no adjustable outflow can remove.
+// whose velocity is not fixed so that the boundary flux balances (adjustPhi.C:36-150). Returns what
+// OpenFOAM returns. Throws where OpenFOAM stops, in its words: an imbalance no adjustable outflow can
+// remove. ONE COPY: the host pressure corrector, CorrectPhi on both arms, and the device pressure step's
+// adjustPhi hook all call this.
 bool adjustPhi(
     SurfaceScalarField& phi,
     const GeometricField<vector>& U,
@@ -399,7 +401,7 @@ struct PressureStepInput
     // relative to the frame. Null or empty is a case without MRF.
     const std::vector<MRF::Zone>* mrf = nullptr;
     // A MOVING MESH: its mesh-motion flux and the face velocity Uf, both non-null or both null.
-    // pEqn.H:19-24 makes phiHbyA relative around adjustPhi; :70-73 correct Uf from the new phi and
+    // pEqn.H:21-26 makes phiHbyA relative around adjustPhi; :70-73 correct Uf from the new phi and
     // make phi relative to the motion, so the phi that leaves the corrector is the RELATIVE flux.
     const SurfaceScalarField* meshPhi = nullptr;
     SurfaceVectorField* Uf = nullptr;

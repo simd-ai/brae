@@ -36,6 +36,7 @@
 #include "fv_patch_field.cuh"
 #include "geometric_field.cuh"
 #include "rhoPEqn_cpp.cuh"
+#include "inter_peqn_cpp.cuh"
 #include <cmath>
 #include <cstdio>
 #include <fstream>
@@ -236,6 +237,85 @@ int main()
 
             check("host: a 2e-8 relative error against the INTERNAL flux refuses", hostRun(2.0e-8));
             check("host: ...and 5e-9 does not", !hostRun(5.0e-9));
+        }
+    }
+
+    // ---- 9. interFoam's host copy, cpu::interFoam::adjustPhi -- the one the interFoam pressure
+    // corrector, CorrectPhi on both arms and the device pressure step's adjustPhi hook all call. It
+    // summed the boundary into totalFlux after the other two had been corrected; on arm 7's straddle it
+    // did not stop where OpenFOAM does. Same mesh, same hand-set fluxes as arm 8.
+    std::printf("  9. interFoam's host copy normalises the same way, and stops in OpenFOAM's words\n");
+    {
+        std::string root = "validation/rhoBox";
+        if (!std::ifstream(root + "/constant/polyMesh/boundary").good()) root = "../" + root;
+        if (!std::ifstream(root + "/constant/polyMesh/boundary").good())
+        {
+            check("validation/rhoBox mesh reachable for the interFoam arm", false);
+        }
+        else
+        {
+            PrimitiveMesh m;
+            m.read(root + "/constant/polyMesh");
+            FvGeometry g;
+            g.build(m);
+            const std::vector<FvPatch> fvp = buildPatches(m, g);
+
+            // inlet: face 0 inflow 1, face 1 fixed outflow 1 + d; outlet (zeroGradient U) adjustable,
+            // its first face carrying `adj`
+            struct InterRun { bool threw = false; std::string msg; scalar outFace = 0; };
+            auto interRun = [&](scalar d, scalar adj) -> InterRun
+            {
+                GeometricField<vector> U;
+                SurfaceScalarField     phi;
+                U.internal.assign(static_cast<std::size_t>(m.nCells()), vector{});
+                phi.internal.assign(static_cast<std::size_t>(m.nInternalFaces()), 0.0);
+                phi.internal[0] = 1.0;   // totalFlux's internal half = 1
+                std::size_t outlet = fvp.size();
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                {
+                    const FvPatch& q = fvp[pi];
+                    if (q.name == "outlet")
+                    {
+                        outlet = pi;
+                        U.boundary.push_back(std::make_unique<ZeroGradientPatchField<vector>>(q));
+                    }
+                    else
+                    {
+                        U.boundary.push_back(std::make_unique<FixedValuePatchField<vector>>(
+                            q, true, vector{}, std::vector<vector>{}));
+                    }
+                    phi.boundary.emplace_back(static_cast<std::size_t>(q.size), 0.0);
+                }
+                phi.boundary[0][0] = -1.0;       // massIn = 1
+                phi.boundary[0][1] = 1.0 + d;    // fixedMassOut = 1 + d
+                if (outlet < fvp.size()) phi.boundary[outlet][0] = adj;
+                InterRun r;
+                try { cpu::interFoam::adjustPhi(phi, U, true, fvp); }
+                catch (const std::exception& e) { r.threw = true; r.msg = e.what(); }
+                if (outlet < fvp.size()) r.outFace = phi.boundary[outlet][0];
+                return r;
+            };
+
+            const InterRun hot  = interRun(2.0e-8, 0.0);
+            const InterRun cool = interRun(5.0e-9, 0.0);
+            check("interFoam: a 2e-8 relative error against the INTERNAL flux stops", hot.threw);
+            check("interFoam: ...and 5e-9 does not", !cool.threw);
+            check("interFoam: ...in OpenFOAM's words",
+                  hot.msg.find("Continuity error cannot be removed by adjusting the outflow")
+                  != std::string::npos);
+            // the four numbers as OpenFOAM prints them, %.6e: std::to_string's %f wrote all four as
+            // 0.000000 on damBreak. Total flux is 1 -- VSMALL + the internal face alone -- and would be 3
+            // under the old normaliser, which is the number this arm's straddle is about.
+            check("interFoam: ...with its four numbers, the normaliser internal-only",
+                  hot.msg.find("Total flux              : 1.000000e+00") != std::string::npos
+                  && hot.msg.find("Specified mass inflow   : 1.000000e+00") != std::string::npos
+                  && hot.msg.find("Specified mass outflow  : 1.000000e+00") != std::string::npos
+                  && hot.msg.find("Adjustable mass outflow : 0.000000e+00") != std::string::npos);
+            // THE NEGATIVE CONTROL: an adjustable outflow scales, to (massIn - fixed)/adj, not 1
+            const InterRun scaled = interRun(-0.5, 0.25);
+            check("interFoam: an adjustable outflow is scaled, not refused", !scaled.threw);
+            check("interFoam: ...to (massIn - fixedMassOut)/adjustableMassOut of itself",
+                  std::fabs((double)scaled.outFace - 0.25*((1.0 - 0.5)/0.25)) < 1e-15);
         }
     }
 
