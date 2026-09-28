@@ -2773,11 +2773,11 @@ COMPONENTS = {
                   "spread of only 1.5e-02 about it. What this fixture CANNOT discriminate is the value setReference "
                   "pins at -- g is (0 0 0) there, so p == p_rgh and the cell's own p_rgh IS pRefValue to the last "
                   "digit of every field and every iteration count; test_device_inter_peqn.cu asserts that one "
-                  "bit-level with the old behaviour as its control. STILL REFUSED on the device: a case that needs a "
-                  "reference and has a boundary patch adjustPhi would weigh -- anything but a wall fixing its flux. "
-                  "OpenFOAM either scales the adjustable outflow or aborts when the fixed fluxes do not balance "
-                  "(adjustPhi.C:106), and the device step carries neither; damBreak with its atmosphere turned into "
-                  "a fixedFluxPressure ran to a worst |div(phi)| of 5.2e-02 before that refusal was narrowed to it."),
+                  "bit-level with the old behaviour as its control. adjustPhi (pEqn.H:21-26) runs on the device "
+                  "too now, through the host's own cpu::interFoam::adjustPhi and with the makeRelative/makeAbsolute "
+                  "round trip on a moving mesh: every face of this vessel fixes its flux, so it cannot witness it; "
+                  "tests/interfoam_moving_vs_openfoam.sh's closedAdjZG, closedAdjIO and mixerTop do, and "
+                  "tests/interfoam_refusals.sh's closed_abort_* hold both arms to OpenFOAM's own abort."),
         dict(name="interFoam_fvOptions", of_symbol="fv::options",
              of_file="src/finiteVolume/cfdTools/general/fvOptions/fvOptions.C",
              classification="GPU_REQUIRED", status="REIMPLEMENT",

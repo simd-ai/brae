@@ -330,11 +330,6 @@ RunReport runInterFoamDevice(
     // that is a Function1 of time, which this driver takes as one number for the whole run -- the patch
     // itself throws on that (flowRateValue) -- and the variableHeight form, which reads the phase field.
 
-    // NOT ON THE DEVICE YET, refused rather than run on the mesh as it started or on a singular
-    // pressure system: a mesh that moves (the host loop has it, inter_driver_cpp.cu), and a closed
-    // case -- one whose p_rgh fixes its value on no patch -- whose pressure reference the device
-    // step pins at pRefValue where OpenFOAM pins it at the cell's current p_rgh, with neither the
-    // level shift of p nor adjustPhi.
     // A MESH THAT MOVES. The motion solve itself is a host operation on both arms -- OpenFOAM's
     // motion solver is a Laplacian on the point field, and brae has one host implementation of it --
     // so the device loop moves the mesh exactly as the host loop does (inter_driver_cpp.cu's
@@ -497,38 +492,13 @@ RunReport runInterFoamDevice(
     // the viscous laplacian (the shared assembler, handed the case's flags in device_inter_step.cu), the
     // three snGrads above, CorrectPhi's pcorr (host operators, cpc.correctedLaplacian) and the closure's
     // k and epsilon (DeviceInterTurbulence). Gated end to end on laminar/damBreak `sheared`.
-    // A CASE THAT NEEDS A PRESSURE REFERENCE RUNS ON THE DEVICE NOW: setReference pins the cell at its
-    // CURRENT p_rgh (pEqn.H:47) and the level shift of p with p_rgh rebuilt from it (pEqn.H:74-83) are
-    // both in the device pressure step, transcribed from the host's own lines. What is NOT there is
-    // adjustPhi (pEqn.H:21-26), which scales the ADJUSTABLE outflow to balance continuity. On a case
-    // whose every boundary face has its flux fixed by U there is nothing for it to scale -- OpenFOAM's
-    // adjustableMassOut is then zero, its guard fails and massCorr stays 1 (adjustPhi.C:96-106), so the
-    // device matches by doing nothing. Anywhere else it is refused by name rather than skipped.
-    if (f.pRef.needReference)
-    {
-        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-        {
-            if (fvp[pi].type == "empty" || isCoupledInterfaceType(fvp[pi].type)) continue;
-            // adjustPhi's own predicate, as the host arm has it (inter_peqn_cpp.cu:371) and as OpenFOAM
-            // writes it: a fixed outflow is not adjustable, an inletOutlet's is. mixedFvPatchField and
-            // directionMixedFvPatchField BOTH return fixesValue() = true (mixedFvPatchField.H:197,
-            // directionMixedFvPatchField.H:130), so a pressureInletOutletVelocity is a fixed outflow to
-            // adjustPhi -- brae's piov reports the same, and that is not a defect.
-            const bool fixed = f.U.boundary[pi]->fixesValue() && !f.U.boundary[pi]->isInletOutlet();
-            // ...but a patch the PRESSURE drives still leaves adjustPhi something to weigh: with nothing
-            // adjustable, OpenFOAM tests whether the FIXED fluxes balance and aborts when they do not
-            // (adjustPhi.C:106), and the device step carries neither the scaling nor that test. MEASURED
-            // on damBreak with its atmosphere turned into a fixedFluxPressure (interfoam_refusals
-            // `device_closed`): the device ran it to a worst |div(phi)| of 5.2e-02.
-            const bool pressureDriven = f.U.boundary[pi]->bcCategory() == 6;
-            if (fixed && !pressureDriven) continue;
-            throw std::runtime_error(
-                "brae interFoam -device: p_rgh needs a reference cell and U patch `" + fvp[pi].name
-                + "` is not a wall that fixes its flux, so pEqn.H:21-26 has adjustPhi weigh it -- "
-                "scaling the adjustable outflow, or aborting if the fixed fluxes do not balance. The "
-                "device pressure step carries neither. The host loop does. Run without -device.");
-        }
-    }
+    // A CASE THAT NEEDS A PRESSURE REFERENCE RUNS ON THE DEVICE: setReference pins the cell at its
+    // CURRENT p_rgh (pEqn.H:47), the level shift of p rebuilds p_rgh from it (pEqn.H:74-83), and
+    // adjustPhi (pEqn.H:21-26) is the pressure step's adjustPhi hook -- the host's own function, below.
+    // It was refused here wherever a U patch could leave adjustPhi something to weigh -- damBreak with a
+    // fixedFluxPressure atmosphere among them, which OpenFOAM itself aborts at step one's third corrector
+    // (tests/interfoam_refusals.sh `closed_abort_device`) -- and silently skipped on every other closed
+    // case, the balance test OpenFOAM stops on (adjustPhi.C:108) included.
     // NOT CONST: a topology change moves all four, and the branch that takes one re-reads them from the
     // mesh. Ten sites below index device arrays with them, and a cached count is how the host arm's own
     // Courant number came out at half OpenFOAM's (inter_driver_cpp.cu's nCAtStart note).
@@ -1292,6 +1262,18 @@ RunReport runInterFoamDevice(
             flat.insert(flat.end(), v.begin(), v.end());
         }
         bval.copyFrom(flat);
+    };
+    // adjustPhi(phiHbyA, U, p_rgh) through the host's own function, on the boundary flux the device
+    // step hands over: U's patch TYPES decide which faces are adjustable (adjustPhi reads no U values),
+    // and those live on the host. Coupled patches are not in the device array and stay empty here, which
+    // adjustPhi.C:57 skips anyway.
+    H.pressure.adjustPhi = [&](const DeviceBuffer<scalar>& phiHI, DeviceBuffer<scalar>& phiHB)
+    {
+        SurfaceScalarField ph;
+        phiHI.copyTo(ph.internal);
+        unflatten(phiHB, ph.boundary);
+        cpu::interFoam::adjustPhi(ph, f.U, true, fvp);
+        phiHB.copyFrom(flattenPatches(ph.boundary, fvp));
     };
     H.pressure.updateBoundary = [&](const DeviceBuffer<scalar>& pr)
     {

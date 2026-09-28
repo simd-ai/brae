@@ -25,6 +25,7 @@
 #include "interface_properties_cpp.cuh"
 #include "two_phase_mixture_cpp.cuh"
 #include "device_inter_step.cuh"
+#include "inter_peqn_cpp.cuh"
 #include "device_mesh.cuh"
 #include <algorithm>
 #include <cmath>
@@ -272,6 +273,29 @@ int main()
             { i2.push_back(pe.internalCoeffs[pi][i]); b2.push_back(pe.boundaryCoeffs[pi][i]); }
         iC.copyFrom(i2);
         bC.copyFrom(b2);
+    };
+
+    // pEqn.H:21-26 through the host's own adjustPhi, as the driver hands it over. Every patch here fixes
+    // U, so it takes the balance test and nothing scales; it is required because the fixture needs a
+    // reference.
+    hooks.pressure.adjustPhi = [&](const DeviceBuffer<scalar>& phiHI, DeviceBuffer<scalar>& phiHB)
+    {
+        SurfaceScalarField ph;
+        phiHI.copyTo(ph.internal);
+        std::vector<scalar> flat;
+        phiHB.copyTo(flat);
+        ph.boundary.resize(fvp.size());
+        std::size_t off = 0;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+            ph.boundary[pi].assign(flat.begin() + off, flat.begin() + off + n);
+            off += n;
+        }
+        brae::cpu::interFoam::adjustPhi(ph, Uh, true, fvp);
+        flat.clear();
+        for (const std::vector<scalar>& b : ph.boundary) flat.insert(flat.end(), b.begin(), b.end());
+        phiHB.copyFrom(flat);
     };
 
     // ---- run one step ----------------------------------------------------------------------------

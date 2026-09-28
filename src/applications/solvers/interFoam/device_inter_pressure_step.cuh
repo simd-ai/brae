@@ -80,6 +80,15 @@ struct DeviceInterPressureHooks
     // -- what the host's gradOf(p_rgh) reads for the corrected laplacian's non-orthogonal correction
     // (inter_peqn_cpp.cu). Required when DeviceInterPressureInput::correctedLaplacian is set.
     std::function<void(DeviceBuffer<scalar>& bval)> boundaryValues;
+
+    // adjustPhi(phiHbyA, U, p_rgh), pEqn.H:24, on a case whose p_rgh needs a reference: scales the
+    // adjustable OUTFLOW of phiHbyABnd in place, or throws where OpenFOAM stops (adjustPhi.C:108-119).
+    // Handed phiHbyA as pEqn.H:23 leaves it -- ddtCorr, MRF.makeRelative and, on a moving mesh,
+    // fvc::makeRelative applied, phig not; phiHbyAInt is read for totalFlux only. The driver's
+    // implementation IS the host's cpu::interFoam::adjustPhi, so the two arms cannot differ by a bit.
+    // Required when DeviceInterPressureInput::needReference is set.
+    std::function<void(const DeviceBuffer<scalar>& phiHbyAInt,
+                       DeviceBuffer<scalar>&       phiHbyABnd)> adjustPhi;
 };
 
 struct DeviceInterPressureInput

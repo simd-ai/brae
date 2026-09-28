@@ -727,6 +727,40 @@ arm leak_timeIndex          refused "did not compile"        "" "sed -i 's/this-
 arm leak_noNonOverlap       refused "nonOverlapPatch"        "" "sed -i '0,/nonOverlapPatch wall_block;/s///' constant/polyMesh/boundary"
 BASE="$B"
 
+# A CASE OPENFOAM ITSELF STOPS: damBreak's atmosphere turned fixedFluxPressure under a pressure reference.
+# Its U is pressureInletOutletVelocity, which adjustPhi counts as FIXED (directionMixed fixesValue,
+# adjustPhi.C:59), so nothing is adjustable and the balance test decides -- and real OpenFOAM v2412 aborts
+# at step one's third corrector, imbalance 2.7e-4 of totalFlux against 1e-8:
+#     Total flux              : 1.19704e-08
+#     Specified mass inflow   : 3.30162e-12
+#     Specified mass outflow  : 5.25542e-14
+#     Adjustable mass outflow : 0
+# This was the DEVICE's refusal (`device_closed`) until adjustPhi ran on the device; now BOTH arms stop
+# where OpenFOAM does, in its words, and abortedWhereOpenFOAMDoes holds each to those NUMBERS -- which is
+# what pins the step and the corrector, since the text alone would pass an abort anywhere. The runs that
+# witness the scaling half are tests/interfoam_moving_vs_openfoam.sh's `closedAdjZG`, `closedAdjIO` and
+# `mixerTop`. The host arm needs no GPU, so it stands outside the device block.
+CLOSED="sed -i '/atmosphere/,/}/ s/type  *totalPressure;/type            fixedFluxPressure;/' 0/p_rgh; sed -i '/nNonOrthogonalCorrectors/a\    pRefPoint (0.292 0.292 0.0073);\n    pRefValue 0;' system/fvSolution"
+abortedWhereOpenFOAMDoes()
+{
+    local name="$1" flags="$2" out
+    # shellcheck disable=SC2086
+    out=$("$BIN" -case "$W/$name" $flags 2>&1)
+    # OpenFOAM prints six significant digits and brae seven; five pin the corrector
+    if echo "$out" | grep -qF "Total flux              : 1.1970" \
+       && echo "$out" | grep -qF "Specified mass inflow   : 3.3016" \
+       && echo "$out" | grep -qF "Specified mass outflow  : 5.2554" \
+       && echo "$out" | grep -qF "Adjustable mass outflow : 0.000000e+00"; then
+        printf "  ok:   %-34s %s\n" "$name" "stops on OpenFOAM's four numbers"
+    else
+        printf "  FAIL: %-34s does not stop on OpenFOAM's numbers: %s\n" "$name" \
+               "$(echo "$out" | grep -E 'Total flux|mass inflow' | tr '\n' ' ' | cut -c1-140)"
+        fails=$((fails+1))
+    fi
+}
+arm closed_abort_host   refused "Continuity error cannot be removed by adjusting the outflow" ""        "$CLOSED"
+abortedWhereOpenFOAMDoes closed_abort_host ""
+
 if [ $HAVE_GPU = 1 ]; then
     BASE="$BL"
     # LES kEqn RUNS on the device now, on a WEDGE mesh (tests/interfoam_les_vs_openfoam.sh holds the
@@ -911,10 +945,9 @@ if [ $HAVE_GPU = 1 ]; then
     # than the host loop. On a static mesh the pair runs -- device_permeable, below, on the base case.
         arm device_permeable_moving refused "and the mesh moves" "-device" "$PERMUW; $PERMPW"
     BASE="$B"
-    # a case that needs a pressure reference RUNS on the device now (gated on laminar/mixerVessel2D,
-    # where every patch is a wall); this one keeps a pressure-driven atmosphere, which is what adjustPhi
-    # would have to weigh, so it stays refused -- by that name now, not by the reference's
-    arm device_closed       refused "adjustPhi"               "-device" "sed -i '/atmosphere/,/}/ s/type  *totalPressure;/type            fixedFluxPressure;/' 0/p_rgh; sed -i '/nNonOrthogonalCorrectors/a\    pRefPoint (0.292 0.292 0.0073);\n    pRefValue 0;' system/fvSolution"
+    # ...and the closed tank OpenFOAM itself stops, on the DEVICE -- see `closed_abort_host` above
+    arm closed_abort_device refused "Continuity error cannot be removed by adjusting the outflow" "-device" "$CLOSED"
+    abortedWhereOpenFOAMDoes closed_abort_device "-device"
     BASE="$B"
     # the device loop carries the kEpsilon closure now, in both lineages
     # the device loop drives the wave conditions through its alpha and velocity hooks

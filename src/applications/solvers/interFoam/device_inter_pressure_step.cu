@@ -32,7 +32,8 @@ __global__ void subKernel(const scalar* __restrict__ a, const scalar* __restrict
     if (i < n) out[i] = a[i] - b[i];
 }
 
-// phiHbyA += phig on the pair's faces, the interface twin of addPhigBoundaryKernel.
+// phiHbyA += phig on the pair's faces, the interface twin of addPhigBoundaryKernel -- and `a += b` on any
+// face array, which is all fvc::makeAbsolute is.
 __global__ void addPhigIfKernel(const scalar* __restrict__ phig, int n, scalar* __restrict__ phiHbyA)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -158,10 +159,76 @@ scalar deviceInterPressureStep(
 
     DeviceBuffer<scalar> zeroIf(static_cast<std::size_t>(nIf));
     if (nIf > 0) ckS(cudaMemset(zeroIf.data(), 0, sizeof(scalar)*nIf), "zero");
+    // pEqn.H:13-19: + interpolate(rho*rAU)*ddtCorr, then MRF.makeRelative
+    deviceInterAddDdtCorrTerms(dm, rhoRAUf,
+                               in.ddtCorrInt ? *in.ddtCorrInt : zeroIf, in.ddtCorrInt != nullptr,
+                               phiHbyAInt, phiHbyABnd, in.mrf,
+                               in.ddtCorrBnd, in.rhoBndFace, &rAU, in.bndUFixesValue);
+
+    // pEqn.H:21-26 -- `if (p_rgh.needReference()) { fvc::makeRelative(phiHbyA, U);
+    // adjustPhi(phiHbyA, U, p_rgh); fvc::makeAbsolute(phiHbyA, U); }` -- transcribed from the host's
+    // pressureCorrector, the round trip included: fvc::makeRelative/makeAbsolute act on a MOVING mesh
+    // only, on every face (fvcMeshPhi.C:76-86, :115-125), and (a - m) + m is not a no-op in floating
+    // point, so it runs even where adjustPhi finds nothing to scale. This used to be REFUSED by name
+    // wherever a U patch could leave adjustPhi something to weigh, and silently skipped elsewhere --
+    // the balance test OpenFOAM aborts on (adjustPhi.C:108) included.
+    // NOT DISCRIMINATED: this block's place BEFORE phig. On every fixture that reaches it phig is exactly
+    // zero on the boundary faces adjustPhi sums (their alpha is zeroGradient, or inletOutlet over pure
+    // air), and phiHbyAInt enters only totalFlux, orders from its thresholds -- so a block moved after
+    // deviceInterAddPhig would pass them all. The order is OpenFOAM's (pEqn.H:21-26, then :36) and the
+    // host's (inter_peqn_cpp.cu).
+    if (in.needReference)
+    {
+        if (!hooks.adjustPhi)
+            throw std::runtime_error(
+                "brae interFoam device pEqn: p_rgh needs a reference and no adjustPhi hook was handed in. "
+                "pEqn.H:21-26 balances the boundary flux there, or stops the run where it cannot.");
+        const int nFaceAll = nIf + nBf;
+        if (in.meshPhiAll && static_cast<int>(in.meshPhiAll->size()) != nFaceAll)
+            throw std::runtime_error(
+                "brae interFoam device pEqn: the mesh flux must cover the mesh's FULL face array "
+                "(internal faces then the boundary patches in order), as phiHbyA does.");
+        // the pair's phiHbyA would need the round trip too; a moving mesh with a pair is refused by the
+        // driver, so this only states where that stops
+        if (in.meshPhiAll && havePair)
+            throw std::runtime_error(
+                "brae interFoam device pEqn: a moving mesh with a periodic pair under a pressure "
+                "reference -- the pair's phiHbyA takes no makeRelative/makeAbsolute round trip here.");
+        if (in.meshPhiAll)
+        {
+            if (nIf > 0)
+            {
+                subKernel<<<nBlocks(nIf), TPB>>>(phiHbyAInt.data(), in.meshPhiAll->data(), nIf,
+                                                 phiHbyAInt.data());
+                ckS(cudaGetLastError(), "makeRelative(phiHbyA), internal");
+            }
+            if (nBf > 0)
+            {
+                subKernel<<<nBlocks(nBf), TPB>>>(phiHbyABnd.data(), in.meshPhiAll->data() + nIf, nBf,
+                                                 phiHbyABnd.data());
+                ckS(cudaGetLastError(), "makeRelative(phiHbyA), boundary");
+            }
+        }
+        hooks.adjustPhi(phiHbyAInt, phiHbyABnd);
+        if (in.meshPhiAll)
+        {
+            if (nIf > 0)
+            {
+                addPhigIfKernel<<<nBlocks(nIf), TPB>>>(in.meshPhiAll->data(), nIf, phiHbyAInt.data());
+                ckS(cudaGetLastError(), "makeAbsolute(phiHbyA), internal");
+            }
+            if (nBf > 0)
+            {
+                addPhigIfKernel<<<nBlocks(nBf), TPB>>>(in.meshPhiAll->data() + nIf, nBf,
+                                                       phiHbyABnd.data());
+                ckS(cudaGetLastError(), "makeAbsolute(phiHbyA), boundary");
+            }
+        }
+    }
+
     // phiHbyA BEFORE phig, which is where the host reference's tap is taken (PressureTaps::phiHbyA,
-    // "BEFORE `phiHbyA += phig`"). The tap below this call is AFTER it, and comparing the two across
-    // arms compares different quantities -- it read 2.3534e+01 of a 3.5419e-05 field before this was
-    // separated out.
+    // "BEFORE `phiHbyA += phig`") -- after ddtCorr, MRF and adjustPhi, as the host's is. It was taken
+    // before ddtCorr here, so the two taps compared different quantities on any step past the first.
     if (taps)
     {
         deviceCopy(taps->phigIntTap, phigInt);
@@ -175,11 +242,8 @@ scalar deviceInterPressureStep(
         // a moving mesh the wall flux is not zero, the wall moves.
         deviceCopy(taps->phiHbyABndPrePhig, phiHbyABnd);
     }
-    deviceInterAddPhiHbyATerms(dm, rhoRAUf,
-                               in.ddtCorrInt ? *in.ddtCorrInt : zeroIf,
-                               phigInt, phigBnd, in.ddtCorrInt != nullptr,
-                               phiHbyAInt, phiHbyABnd, in.mrf,
-                               in.ddtCorrBnd, in.rhoBndFace, &rAU, in.bndUFixesValue);
+    // pEqn.H:36
+    deviceInterAddPhig(dm, phigInt, phigBnd, phiHbyAInt, phiHbyABnd);
 
     // rAUf on the internal faces -- the head of the full array the caller passed.
     DeviceBuffer<scalar> rAUfInt(static_cast<std::size_t>(nIf));

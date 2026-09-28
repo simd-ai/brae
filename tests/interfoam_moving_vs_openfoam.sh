@@ -134,7 +134,26 @@
 #                  tutorial's own steps of 0.001
 #   closedDamBreakInitU  the same tank STARTED MOVING, U (0.1 0 0) in every cell against walls at rest:
 #                  the phi createFields builds is not divergence-free, so initCorrectPhi's pcorr solve
-#                  has work to do (79 iterations in both codes); the control is the tank at rest
+#                  has work to do (79 iterations in both codes); the control is the tank at rest.
+#                  BOTH closed tanks run on the DEVICE arm too (U 5.5e-14 and 2.3e-12, the host's own).
+#   closedAdjZG    adjustPhi's SCALING half (pEqn.H:21-26): the same dam with its atmosphere left OPEN
+#   closedAdjIO    to an outflow adjustPhi can scale -- p_rgh zeroGradient, so it still needs the
+#                  reference, and U zeroGradient (adjustable because fixesValue is false) or inletOutlet
+#                  (fixesValue true, adjustable because isA<inletOutlet>): the two halves of
+#                  adjustPhi.C:59, each the other's control. NO SHIPPED TUTORIAL can witness the scaling:
+#                  every interFoam case that needs a reference has walls only, where adjustPhi is a
+#                  balance check. MEASURED, host / device against OpenFOAM: U 3.5e-14 / 4.2e-14 and
+#                  7.9e-14 / 8.4e-14; OpenFOAM's walled tank against ZG U 2.5e-03, ZG against IO 9.1e-04.
+#                  BROKEN ONCE EACH: the device hook a no-op, U 7.0e-06 and 4.6e-05; the shared mask
+#                  counting inletOutlet as fixed stops IO in adjustPhi (ZG unchanged), the mask counting
+#                  ONLY inletOutlet as adjustable stops ZG (IO unchanged). NOT DISCRIMINATED: adjustPhi's
+#                  place before phig -- phig is exactly zero on every boundary face these fixtures sum.
+#   mixerTop       testTubeMixer with its top face made an open patch (U inletOutlet, p_rgh and alpha
+#                  zeroGradient): the makeRelative/makeAbsolute ROUND TRIP around adjustPhi on a moving
+#                  mesh. The top's relative flux is 3.3e-06 each way beside the walls' mesh flux of
+#                  1.4e-03. MEASURED U host 2.9e-11, device 1.1e-11; control, the shipped closed tube, U
+#                  2.0e-01. BROKEN ONCE EACH on the device: the hook a no-op U 8.4e-02, adjustPhi handed
+#                  the ABSOLUTE flux U 2.1e-02.
 #   floating       RAS/floatingObject: the first fixture here whose mesh is moved by the FLUID and not
 #                  by a prescribed function -- rigidBodyMeshMotion integrating a cuboid on a
 #                  `composite (Py Ry)` joint from the pressure and shear on its own patches, with
@@ -571,13 +590,13 @@ elif profile.startswith('floating'):
     m = re.search(r'\n    p_rgh\s*\{[^}]*\}', t)
     assert m, 'no p_rgh entry to give `log 2`'
     t = t.replace(m.group(0), m.group(0).replace('}', '    log             2;\n    }'))
-elif profile.startswith('closedDamBreak'):
+elif profile.startswith('closed'):
     ref = '1e5' if profile == 'closedDamBreakRef' else '0'
     t, k = re.subn(r'(nNonOrthogonalCorrectors\s+0;)', r'\1\n    pRefPoint       (0.292 0.292 0.0073);\n    pRefValue       %s;' % ref, t)
     assert k == 1, 'PIMPLE block not found'
 open(q, 'w').write(t)
 
-if not profile.startswith('closedDamBreak'):
+if not profile.startswith('closed'):
     # the three tanks name vanLeerV, run as shipped; the `*Static` controls hold the mesh still
     f = os.path.join(d, 'system/fvSchemes')
     t = open(f).read()
@@ -632,10 +651,20 @@ if not profile.startswith('closedDamBreak'):
     open(p, 'w').write(t)
 else:
     # the atmosphere walled off: no patch fixes p_rgh, so it needs the reference
-    for fld, body in [('U', 'type            fixedValue;\n        value           uniform (0 0 0);'),
-                      ('p_rgh', 'type            fixedFluxPressure;\n        value           uniform 0;'),
-                      ('alpha.water.orig', 'type            zeroGradient;'),
-                      ('alpha.water', 'type            zeroGradient;')]:
+    ATM = [('U', 'type            fixedValue;\n        value           uniform (0 0 0);'),
+           ('p_rgh', 'type            fixedFluxPressure;\n        value           uniform 0;'),
+           ('alpha.water.orig', 'type            zeroGradient;'),
+           ('alpha.water', 'type            zeroGradient;')]
+    # ...or left OPEN to an outflow adjustPhi can SCALE: p_rgh zeroGradient still fixes no value, and U
+    # zeroGradient (fixesValue false) or inletOutlet (fixesValue true, but isA<inletOutlet>) is the
+    # adjustable kind (adjustPhi.C:59). alpha keeps the tutorial's inletOutlet.
+    if profile == 'closedAdjZG':
+        ATM = [('U', 'type            zeroGradient;'), ('p_rgh', 'type            zeroGradient;')]
+    elif profile == 'closedAdjIO':
+        ATM = [('U', 'type            inletOutlet;\n        inletValue      uniform (0 0 0);\n'
+                     '        value           uniform (0 0 0);'),
+               ('p_rgh', 'type            zeroGradient;')]
+    for fld, body in ATM:
         p = os.path.join(d, '0', fld)
         if not os.path.exists(p):
             continue
@@ -648,6 +677,31 @@ else:
             t, k = re.subn(r'internalField\s+uniform\s*\(0 0 0\);', 'internalField   uniform (0.1 0 0);', t)
             assert k == 1, 'U internalField not found'
         open(p, 'w').write(t)
+
+# THE TUBE WITH AN OPEN TOP: its `(3 7 6 2)` face taken out of `walls` into a patch of its own, with U
+# inletOutlet, p_rgh zeroGradient -- so the tube still needs a reference -- and alpha zeroGradient. The one
+# fixture here that makes pEqn.H:21-26's makeRelative/makeAbsolute around adjustPhi matter: the top's
+# relative in- and outflow are 3.3e-06 each while the walls' MESH flux is 1.4e-03 each way, so balancing
+# the absolute flux instead would change the top's by order one. alpha inletOutlet there puts a jump in
+# rho across the inflow faces and OpenFOAM itself then leaves 1e-7 of continuity in the reference cell.
+if profile == 'mixerTop':
+    bm = os.path.join(d, 'system/blockMeshDict')
+    b = open(bm).read()
+    b, k = re.subn(r'\n\s*\(3 7 6 2\)', '', b)
+    assert k == 1, 'mixerTop: the top face is not in walls'
+    b, k = re.subn(r'(boundary\s*\(\s*walls\s*\{.*?\n    \}\n)',
+                   r'\1    top\n    {\n        type patch;\n        faces ( (3 7 6 2) );\n    }\n', b, flags=re.S)
+    assert k == 1, 'mixerTop: the boundary list was not found'
+    open(bm, 'w').write(b)
+    for fld, body in [('U', 'type            inletOutlet;\n        inletValue      uniform (0 0 0);\n'
+                            '        value           uniform (0 0 0);'),
+                      ('p_rgh', 'type            zeroGradient;'),
+                      ('alpha.water', 'type            zeroGradient;')]:
+        fp = os.path.join(d, '0', fld)
+        u = open(fp).read()
+        u, k = re.subn(r'(boundaryField\s*\{)', r'\1\n    top\n    {\n        %s\n    }' % body, u)
+        assert k == 1, 'mixerTop: no boundaryField in ' + fld
+        open(fp, 'w').write(u)
 
 # THE PERMEABLE-WALL PAIR ON A MOVING MESH: the same tube with its `walls` given
 # permeableAlphaPressureInletOutletVelocity and prghPermeableAlphaTotalPressure. Both rebuild their
@@ -867,6 +921,7 @@ runQueue()
 rc=0
 stage mixerStatic    testTubeMixer 2e-4  10 mixerStatic    || rc=1
 stage mixer          testTubeMixer 2e-4  10 mixer          || rc=1
+stage mixerTop       testTubeMixer 2e-4  10 mixerTop       || rc=1
 stage mixerCorr      testTubeMixer 2e-4  10 mixerCorr      || rc=1
 stage mixerOuter     testTubeMixer 2e-4  10 mixerOuter     || rc=1
 stage mixerOuterOnce testTubeMixer 2e-4  10 mixerOuterOnce || rc=1
@@ -940,6 +995,8 @@ stage floating       ../RAS/floatingObject 5e-3 10 floating       || rc=1
 stage closedRef1e5   damBreak/damBreak 0.001 20 closedDamBreakRef || rc=1
 stage closedDamBreak damBreak/damBreak 0.001 20 closedDamBreak    || rc=1
 stage closedDamBreakInitU damBreak/damBreak 0.001 20 closedDamBreakInitU || rc=1
+stage closedAdjZG     damBreak/damBreak 0.001 20 closedAdjZG     || rc=1
+stage closedAdjIO     damBreak/damBreak 0.001 20 closedAdjIO     || rc=1
 # RAS/electrostaticDeposition, TWO STEPS, for one thing no other arm here can see: alpha's PATCH values
 # under the under-relaxed corrector. It belongs in this harness because its mesh moves -- `solidBody`
 # `tabulated6DoFMotion`, a RIGID translation at -0.08 m/s, so V == V0 and the volume weights are blind --
@@ -1016,6 +1073,13 @@ gate multiFlap      0.01  30 multiFlap      multiFlapStatic   || rc=1
 gate floating       5e-3  10 floating       floatingStatic || rc=1
 gate closedDamBreak 0.001 20 closedDamBreak closedRef1e5 || rc=1
 gate closedDamBreakInitU 0.001 20 closedDamBreakInitU closedDamBreak || rc=1
+# adjustPhi's SCALING half, on both arms: the dam's atmosphere left open to an adjustable outflow under
+# a pressure reference. zeroGradient U is adjustable by fixesValue, inletOutlet by isA -- the two halves
+# of adjustPhi.C:59 -- so each is the other's control, and the walled tank is the first one's.
+gate closedAdjZG    0.001 20 closedAdjZG    closedDamBreak || rc=1
+gate closedAdjIO    0.001 20 closedAdjIO    closedAdjZG    || rc=1
+# ...and around it, on a MOVING mesh, the relative-flux round trip; its control is the shipped tube
+gate mixerTop       2e-4  10 mixerTop       mixer          || rc=1
 # ...and its own control is the MULESCorr-off staging, where OpenFOAM's patch value is back on its cell
 gate esdNoCorr 1e-3 2 esdNoCorr esd       || rc=1
 gate esd       1e-3 2 esd       esdNoCorr || rc=1

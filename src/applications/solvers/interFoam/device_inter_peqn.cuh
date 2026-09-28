@@ -184,12 +184,12 @@ struct DevicePressureMatrix
 // capillaryRise, where momentumPredictor is off, the pressure corrector is the ONLY route surface
 // tension has into the solution at all.
 //
-// ddtCorr HAS NO BOUNDARY HALF HERE, AND OpenFOAM'S DOES. This comment used to say fvc::interpolate
-// builds interpolate(rho*rAU) on the internal faces only; it builds the patch values too, and
-// fvcDdtPhiCoeff zeroes the coupling coefficient only where U FIXES A VALUE (ddtScheme.C). On a patch
-// that does not -- RAS/weirOverflow's `U zeroGradient` outlet -- the correction is live, and the host
-// reference carries it since that case's gate found it missing (inter_peqn_cpp.cu). The device loop
-// REFUSES a case with such an open patch (inter_driver_device.cu) until this kernel is taught the same.
+// ddtCorr's BOUNDARY half is here too (ddtCorrBnd below): fvcDdtPhiCoeff zeroes the coupling
+// coefficient only where U FIXES A VALUE (ddtScheme.C), so on RAS/weirOverflow's `U zeroGradient` outlet
+// the correction is live.
+//
+// ONE CALL FOR BOTH HALVES, kept for its callers; the pressure step itself calls the two halves below,
+// because adjustPhi (pEqn.H:21-26) sits between them.
 void deviceInterAddPhiHbyATerms(
     const DeviceMesh&           dm,
     const DeviceBuffer<scalar>& rhoRAUfInt,     // interpolate(rho*rAU)
@@ -210,6 +210,29 @@ void deviceInterAddPhiHbyATerms(
     const DeviceBuffer<scalar>* rAU = nullptr,
     // ...and U's per-face fixesValue mask, because the host skips such a patch outright
     const DeviceBuffer<int>*    uFixesValue = nullptr);
+
+// ...THE FIRST HALF: pEqn.H:13-19, interpolate(rho*rAU)*ddtCorr on the internal faces, MRF.makeRelative,
+// and ddtCorr's boundary half. What pEqn.H:21-26 hands adjustPhi.
+void deviceInterAddDdtCorrTerms(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& rhoRAUfInt,
+    const DeviceBuffer<scalar>& ddtCorrInt,
+    bool                        haveDdtCorr,
+    DeviceBuffer<scalar>&       phiHbyAInt,
+    DeviceBuffer<scalar>&       phiHbyABnd,
+    const std::vector<DeviceMRFZone>* mrf,
+    const DeviceBuffer<scalar>* ddtCorrBnd,
+    const DeviceBuffer<scalar>* rhoBnd,
+    const DeviceBuffer<scalar>* rAU,
+    const DeviceBuffer<int>*    uFixesValue);
+
+// ...AND THE SECOND: pEqn.H:36, phiHbyA += phig on the internal faces and the boundary.
+void deviceInterAddPhig(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& phigInt,
+    const DeviceBuffer<scalar>& phigBnd,
+    DeviceBuffer<scalar>&       phiHbyAInt,
+    DeviceBuffer<scalar>&       phiHbyABnd);
 
 // phi = phiHbyA - p_rghEqn.flux(), pEqn.H:56. fvMatrix::flux() is
 //     internal  upper*p[nei] - lower*p[own]

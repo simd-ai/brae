@@ -250,7 +250,10 @@ int main(
                          || profile == "pistonSST" || profile == "pistonLES"
                          || profile == "multiPiston" || profile == "multiFlap"
                          || profile == "sloshing2DCN" || profile == "solitaryCN"
-                         || profile == "esd" || profile == "esdNoCorr");
+                         || profile == "esd" || profile == "esdNoCorr"
+                         || profile == "closedDamBreak" || profile == "closedDamBreakInitU"
+                         || profile == "closedAdjZG" || profile == "closedAdjIO"
+                         || profile == "mixerTop");
     PrimitiveMesh mD;
     FvGeometry gD;
     std::vector<FvPatch> patchesD;
@@ -1083,28 +1086,46 @@ int main(
         // control would be answering for the motion instead. MEASURED, two steps, OpenFOAM against
         // itself: alpha 8.1858e-09 and U 2.9337e-04 relative -- eleven orders above brae's own distance.
         const bool esd = (profile.rfind("esd", 0) == 0);
+        // ...and under `mixerTop` it is the SHIPPED tube, closed: what opening the top -- and adjustPhi
+        // balancing its relative flux -- is worth, measured on OpenFOAM against itself.
+        const bool top = (profile == "mixerTop");
         const char* controlIs = sst ? "laminar"
                                     : (cn ? "under Euler"
                                           : (perm ? "with movingWallVelocity"
-                                                  : (esd ? "with MULESCorr flipped" : "with a static mesh")));
+                                                  : (esd ? "with MULESCorr flipped"
+                                                         : (top ? "with the top closed" : "with a static mesh"))));
         const char* againstIs = sst ? "with kOmegaSST"
                                     : (cn ? "under CrankNicolson"
                                           : (perm ? "with the permeable pair"
-                                                  : (esd ? "as the tutorial ships it" : "with the motion")));
+                                                  : (esd ? "as the tutorial ships it"
+                                                         : (top ? "with it open" : "with the motion"))));
         std::printf("  CONTROL: OpenFOAM %s against OpenFOAM %s, U relative %.4e, alpha %.4e\n",
                     controlIs, againstIs, (double)cU.rel(), (double)cA.linf);
         check(sst ? "the closure moves OpenFOAM's own U far more than brae is from it"
                   : (cn ? "the ddt scheme moves OpenFOAM's own U far more than brae is from it"
                         : (perm ? "the permeable pair moves OpenFOAM's own U far more than brae is from it"
                                 : (esd ? "MULESCorr moves OpenFOAM's own U far more than brae is from it"
-                                       : "the motion moves OpenFOAM's own U far more than brae is from it"))),
+                                       : (top ? "opening the top moves OpenFOAM's own U far more than brae is from it"
+                                              : "the motion moves OpenFOAM's own U far more than brae is from it")))),
               cU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)));
     }
     else
     {
         const Diff cP = compare(cellValues(readField<scalar>(staticDir + "/p"), nC), ofP2);
         const Diff cU = compare(cellValues(readField<vector>(staticDir + "/U"), nC), ofU);
-        if (profile == "closedDamBreakInitU")
+        if (profile == "closedAdjZG" || profile == "closedAdjIO")
+        {
+            // the tank walled off (closedAdjZG's control), or the other adjustable kind (closedAdjIO's):
+            // what adjustPhi's scaling of the open atmosphere is worth, measured on OpenFOAM against
+            // itself -- zeroGradient against inletOutlet is the two halves of adjustPhi.C:59
+            std::printf("  CONTROL: OpenFOAM %s against OpenFOAM with this atmosphere, U relative %.4e, "
+                        "p relative %.4e\n",
+                        profile == "closedAdjZG" ? "walled off" : "with a zeroGradient U atmosphere",
+                        (double)cU.rel(), (double)cP.rel());
+            check("the adjustable atmosphere moves OpenFOAM's own U far more than brae is from it",
+                  cU.rel() > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)));
+        }
+        else if (profile == "closedDamBreakInitU")
         {
             // the same closed tank STARTED AT REST: what the initial motion, and the start-up
             // CorrectPhi that makes its flux divergence-free, are worth

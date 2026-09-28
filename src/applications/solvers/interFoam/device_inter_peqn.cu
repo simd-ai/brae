@@ -157,19 +157,10 @@ __global__ void gatherBoundaryKernel(const label* __restrict__ bndCell, const sc
     if (b < nBf) out[b] = vf[bndCell[b]];
 }
 
-__global__ void addPhiHbyATermsKernel(
-    const scalar* __restrict__ rhoRAUf, const scalar* __restrict__ ddtCorr,
-    const scalar* __restrict__ phig, int n, int haveDdt, scalar* __restrict__ phiHbyA)
-{
-    const int f = blockIdx.x * blockDim.x + threadIdx.x;
-    if (f >= n) return;
-    if (haveDdt) phiHbyA[f] += rhoRAUf[f]*ddtCorr[f];
-    phiHbyA[f] += phig[f];
-}
-
-// The same two adds, SEPARATED, because MRF.makeRelative(phiHbyA) runs between them: pEqn.H:14-36 builds
-// phiHbyA from flux(HbyA) and the ddtCorr term, makes it relative, and only then adds phig. The
-// arithmetic is unchanged -- (phiHbyA + rhoRAUf*ddtCorr) + phig in that order either way.
+// phiHbyA's two interFoam terms, SEPARATED, because MRF.makeRelative and adjustPhi run between them:
+// pEqn.H:13-36 builds phiHbyA from flux(HbyA) and the ddtCorr term, makes it relative, adjusts it, and
+// only then adds phig. They were one fused kernel on a case with neither; the arithmetic is the same --
+// (phiHbyA + rhoRAUf*ddtCorr) + phig in that order either way.
 __global__ void addDdtCorrTermKernel(
     const scalar* __restrict__ rhoRAUf, const scalar* __restrict__ ddtCorr,
     int n, scalar* __restrict__ phiHbyA)
@@ -614,12 +605,10 @@ void deviceInterPressureReference(
 }
 
 
-void deviceInterAddPhiHbyATerms(
+void deviceInterAddDdtCorrTerms(
     const DeviceMesh&           dm,
     const DeviceBuffer<scalar>& rhoRAUfInt,
     const DeviceBuffer<scalar>& ddtCorrInt,
-    const DeviceBuffer<scalar>& phigInt,
-    const DeviceBuffer<scalar>& phigBnd,
     bool                        haveDdtCorr,
     DeviceBuffer<scalar>&       phiHbyAInt,
     DeviceBuffer<scalar>&       phiHbyABnd,
@@ -635,43 +624,69 @@ void deviceInterAddPhiHbyATerms(
             "brae interFoam device pEqn: phiHbyA must already hold fvc::flux(HbyA) on BOTH sides. The "
             "boundary half is not decoration -- fvc::div(phiHbyA) sums it, so it is how a wall's "
             "buoyancy and surface tension reach the pressure equation's source.");
-    // MRF.makeRelative(phiHbyA) sits BETWEEN the two adds (pEqn.H:19, before phig at :36), so with a zone
-    // the ddtCorr term goes in on its own first. Without one the fused kernel stands, unchanged.
+    // The same `phiHbyA += rhoRAUf*ddtCorr` the fused kernel ran, as its own statement: it was already
+    // split this way on the MRF path, and the addition order on each face is unchanged.
+    if (nIf > 0 && haveDdtCorr)
+    {
+        addDdtCorrTermKernel<<<nBlocks(nIf), TPB>>>(
+            rhoRAUfInt.data(), ddtCorrInt.data(), nIf, phiHbyAInt.data());
+        ckP(cudaGetLastError(), "phiHbyA += rhoRAUf*ddtCorr");
+    }
+    // MRF.makeRelative(phiHbyA), pEqn.H:19. zeroFilter has zeroed ddtCorr on every face the zone
+    // touches, so taking the boundary ddtCorr after it rather than before adds the same zeros.
     if (mrf && !mrf->empty())
     {
-        if (nIf > 0 && haveDdtCorr)
-        {
-            addDdtCorrTermKernel<<<nBlocks(nIf), TPB>>>(
-                rhoRAUfInt.data(), ddtCorrInt.data(), nIf, phiHbyAInt.data());
-            ckP(cudaGetLastError(), "phiHbyA += rhoRAUf*ddtCorr");
-        }
         deviceMrfMakeRelative(*mrf, phiHbyAInt, phiHbyABnd);
-        if (nIf > 0)
-        {
-            addPhigInternalKernel<<<nBlocks(nIf), TPB>>>(phigInt.data(), nIf, phiHbyAInt.data());
-            ckP(cudaGetLastError(), "phiHbyA += phig");
-        }
     }
-    else if (nIf > 0)
+    if (nBf > 0 && ddtCorrBnd && rhoBnd && rAU && uFixesValue)
     {
-        addPhiHbyATermsKernel<<<nBlocks(nIf), TPB>>>(
-            rhoRAUfInt.data(), haveDdtCorr ? ddtCorrInt.data() : nullptr, phigInt.data(),
-            nIf, haveDdtCorr ? 1 : 0, phiHbyAInt.data());
-        ckP(cudaGetLastError(), "phiHbyA += rhoRAUf*ddtCorr + phig");
+        addDdtCorrBoundaryKernel<<<nBlocks(nBf), TPB>>>(
+            rhoBnd->data(), rAU->data(), dm.bndCell.data(), ddtCorrBnd->data(),
+            uFixesValue->data(), nBf, phiHbyABnd.data());
+        ckP(cudaGetLastError(), "phiHbyA += rho_b*rAU*ddtCorr, boundary");
+    }
+}
+
+
+void deviceInterAddPhig(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& phigInt,
+    const DeviceBuffer<scalar>& phigBnd,
+    DeviceBuffer<scalar>&       phiHbyAInt,
+    DeviceBuffer<scalar>&       phiHbyABnd)
+{
+    const int nIf = dm.nInternalFaces, nBf = dm.nBndFaces;
+    if (nIf > 0)
+    {
+        addPhigInternalKernel<<<nBlocks(nIf), TPB>>>(phigInt.data(), nIf, phiHbyAInt.data());
+        ckP(cudaGetLastError(), "phiHbyA += phig");
     }
     if (nBf > 0)
     {
-        // the ddtCorr term goes in BEFORE phig on the boundary too, in the host's order
-        if (ddtCorrBnd && rhoBnd && rAU && uFixesValue)
-        {
-            addDdtCorrBoundaryKernel<<<nBlocks(nBf), TPB>>>(
-                rhoBnd->data(), rAU->data(), dm.bndCell.data(), ddtCorrBnd->data(),
-                uFixesValue->data(), nBf, phiHbyABnd.data());
-            ckP(cudaGetLastError(), "phiHbyA += rho_b*rAU*ddtCorr, boundary");
-        }
         addPhigBoundaryKernel<<<nBlocks(nBf), TPB>>>(phigBnd.data(), nBf, phiHbyABnd.data());
         ckP(cudaGetLastError(), "phiHbyA += phig, boundary");
     }
+}
+
+
+void deviceInterAddPhiHbyATerms(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& rhoRAUfInt,
+    const DeviceBuffer<scalar>& ddtCorrInt,
+    const DeviceBuffer<scalar>& phigInt,
+    const DeviceBuffer<scalar>& phigBnd,
+    bool                        haveDdtCorr,
+    DeviceBuffer<scalar>&       phiHbyAInt,
+    DeviceBuffer<scalar>&       phiHbyABnd,
+    const std::vector<DeviceMRFZone>* mrf,
+    const DeviceBuffer<scalar>* ddtCorrBnd,
+    const DeviceBuffer<scalar>* rhoBnd,
+    const DeviceBuffer<scalar>* rAU,
+    const DeviceBuffer<int>*    uFixesValue)
+{
+    deviceInterAddDdtCorrTerms(dm, rhoRAUfInt, ddtCorrInt, haveDdtCorr, phiHbyAInt, phiHbyABnd,
+                               mrf, ddtCorrBnd, rhoBnd, rAU, uFixesValue);
+    deviceInterAddPhig(dm, phigInt, phigBnd, phiHbyAInt, phiHbyABnd);
 }
 
 

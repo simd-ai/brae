@@ -54,8 +54,9 @@
 // read them; CorrectPhi after every update under `correctPhi` (the default on a moving mesh) and at
 // the start of EVERY case (initCorrectPhi.H); a wave absorber on a moving mesh; and a CLOSED tank's
 // pressure reference (pRefCell or pRefPoint, pRefValue, adjustPhi). `-device` RUNS the moving mesh too
-// (device_moving, device_moving_gamg, device_moving_SST) and refuses the closed tank (device_closed)
-// and a permeable wall on a moving mesh (device_permeable_moving). Still refused by name: a cellZone or cellSet, every other motionSolver, a
+// (device_moving, device_moving_gamg, device_moving_SST) and the closed tank, adjustPhi included on
+// both arms -- stopping where OpenFOAM stops (closed_abort_host, closed_abort_device) -- and refuses a
+// permeable wall on a moving mesh (device_permeable_moving). Still refused by name: a cellZone or cellSet, every other motionSolver, a
 // turbulent case on a moving mesh, points0, and a restart of a moved mesh. testTubeMixer, the five
 // sloshing tanks and the five waveMakers run -- waveMakerPiston and waveMakerFlap gated with their
 // pressure solves converged, and the two multi-paddle ones approximating p_rgh under a notice, since
@@ -167,7 +168,7 @@
 // nOuterCorrectors above 1 -- which is why the list is machine-checked rather than described.
 //
 // BEGIN DEVICE REFUSALS
-//   device_closed device_gamg_smootherDILU device_gradLsq
+//   device_gamg_smootherDILU device_gradLsq
 //   device_leak_explicit device_mesh_dynamic
 //   device_permeable_moving device_ras_otherModel device_refine_motion
 //   device_Uflux_rhoPhi

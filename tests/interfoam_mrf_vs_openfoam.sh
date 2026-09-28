@@ -55,9 +55,9 @@
 # NOT DISCRIMINATED: the value setReference pins at -- g is (0 0 0) here, so p == p_rgh and the cell's own
 # p_rgh IS pRefValue, to the last digit of every field and every iteration count. test_device_inter_peqn.cu
 # asserts that one bit-level, with the old behaviour as its control.
-# STILL REFUSED on the device: a case that needs a reference AND has an adjustable boundary face, because
-# adjustPhi (pEqn.H:21-26) is not on the device. Every face of this closed vessel has its flux fixed by U,
-# where OpenFOAM's own massCorr stays 1, so the device matches it by doing nothing.
+# adjustPhi (pEqn.H:21-26) runs on the device now, through the host's own function. Every face of this
+# closed vessel has its flux fixed by U, so OpenFOAM's own massCorr stays 1 here and this gate cannot
+# witness it; tests/interfoam_moving_vs_openfoam.sh's `closedAdjZG`, `closedAdjIO` and `mixerTop` do.
 #
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
