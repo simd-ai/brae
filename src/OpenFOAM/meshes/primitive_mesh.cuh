@@ -85,8 +85,17 @@ inline void propagateACMIScale(std::vector<PatchInfo>& patches)
 class PrimitiveMesh
 {
 public:
-    // Read points/faces/owner/neighbour/boundary from a constant/polyMesh directory.
-    void read(const std::string& polyMeshDir);
+    // Read points/faces/owner/neighbour/boundary from ONE polyMesh directory.
+    void read(const std::string& polyMeshDir) { read(polyMeshDir, polyMeshDir, polyMeshDir); }
+
+    // ...and from the THREE polyMesh's own instance resolution can give, because it resolves each file
+    // separately and a moving mesh really does split them: `points` in every time directory, `faces` left
+    // in constant (polyMesh.C:175-245, and cpu::timePaths::meshInstances mirrors it). owner and neighbour
+    // are read beside the FACES, which is where polyMesh reads them from (faces_.instance()).
+    void read(
+        const std::string& pointsDir,
+        const std::string& facesDir,
+        const std::string& boundaryDir);
 
     // Construct in memory (e.g. a decomposePar local mesh). Faces must be ordered internal-first
     // (upper-triangular by owner) then boundary faces grouped by patch, exactly as read().

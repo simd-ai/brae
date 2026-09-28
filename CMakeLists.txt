@@ -3851,6 +3851,21 @@ set_tests_properties(interfoam_amr_levels_vs_openfoam PROPERTIES
                      DEPENDS test_inter_amr_vs_openfoam
                      TIMEOUT 1800)
 
+# ...and a GENUINE RESTART, where nothing is moved into constant/polyMesh: the seed leaves an ORIGINAL mesh
+# there and a REFINED one in the time directory, and both codes continue from the time directory. That is the
+# instance resolution the levels gate above explicitly did not claim -- OpenFOAM SEARCHES for points, faces
+# and boundary separately (polyMesh.C:175-295 over Time::findInstance), and brae read constant/polyMesh in
+# four places. It also covers `startFrom latestTime`, which braeInterFoam read and then dropped. Runs
+# OpenFOAM three times (a seed, the continuation and a one-ulp twin), all cached, and the shipped solver
+# twice -- once as written and once under the control that pins every instance to constant/.
+add_test(NAME interfoam_restart_instance_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_restart_instance_vs_openfoam.sh)
+set_tests_properties(interfoam_restart_instance_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_inter_amr_vs_openfoam
+                     TIMEOUT 1800)
+
 # ...and a RAS TURBULENCE MODEL on a refining mesh, which is what RAS/motorBike needs before it can be
 # attempted. Its own script for the same reason the MRF one is: it stages RAS/damBreak (already turbulent,
 # already held statically by interfoam_ras_dambreak_vs_openfoam) plus one injected dynamicMeshDict, in two

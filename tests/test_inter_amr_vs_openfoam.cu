@@ -27,6 +27,7 @@
 #include "patch_entry_lookup.cuh"
 #include "inter_solve_log.cuh"
 #include "inter_amr_cpp.cuh"
+#include "time_instances.cuh"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -261,7 +262,11 @@ void runArm(
     label              nSteps,
     bool               onDevice = false)
 {
-    a.m.read(caseDir + "/constant/polyMesh");
+    // THE SAME INSTANCE RESOLUTION THE SHIPPED SOLVER DOES, not constant/polyMesh: on every profile but
+    // the restart-instance one the two are the same directory, and on that one they are not. A harness that
+    // resolved differently from braeInterFoam.cu would be testing a mesh the solver never reads.
+    const cpu::timePaths::MeshInstances mi = cpu::timePaths::meshInstancesForStartDir(caseDir, startDir);
+    a.m.read(mi.pointsDir(caseDir), mi.facesDir(caseDir), mi.boundaryDir(caseDir));
     a.g.build(a.m);
     a.patches = buildPatches(a.m, a.g);
     MutableMesh mm;
@@ -381,7 +386,13 @@ int main(
     // `restart` is the same fixture with the WRITTEN STATE KEPT -- Uf, phi and alphaPhi0 all present -- which
     // the two levels profiles deliberately omit. It shares their bounds and adds the Uf read's own control.
     const bool restartProfile = (profile == "restart");
-    const bool levelsProfile = (profile == "levels" || profile == "levelsBinary" || restartProfile);
+    // `restartInstance` is a GENUINE restart: nothing is moved, so the refined mesh is in the time directory
+    // and constant/polyMesh still holds the one blockMesh made. It shares the levels family's bounds and
+    // arms; what it adds is that the mesh, its levels and its zones are found by RESOLVING the instance
+    // (cpu::timePaths, mirroring polyMesh.C:175-295) rather than by being put where brae used to look.
+    const bool instanceProfile = (profile == "restartInstance");
+    const bool levelsProfile = (profile == "levels" || profile == "levelsBinary" || restartProfile
+                             || instanceProfile);
     const bool levelsBinary = (profile == "levelsBinary");
     //   porosity 1.5190e-14 alpha, 1.2e-14 p_rgh, 3.1e-13 U, 7.5e-15 p, 1.5e-11 rAU, 2.2e-13 phi,
     //   2.3e-13 Uf, 2.5e-11 contErr -- three steps with an explicitPorositySource over a cellZone, whose
@@ -396,6 +407,19 @@ int main(
         : porosity
         ? Bounds{5e-14, 5e-14, 1e-12, 1e-13, 5e-11, 1e-12, 1e-12, 1e-9, 5e-14, 1e-12, 5e-14, 1e-12,
                  5e-14, 5e-14, 5e-12, 0, 1e-12, 1e-12, 0, 0, 0, 0, 0, 0, 1e-14, 0}
+        // restartInstance HAS ITS OWN FLOOR, and it is the fixture's conditioning rather than a relaxation:
+        // the continuation runs at maxRefinement 3 and ends on 18,921 cells, where the levels fixture stays
+        // at 4,998 and level 2. MEASURED over its two steps -- alpha 4.3982e-11, p_rgh 8.6504e-08,
+        // U 2.3084e-07, p 2.1872e-07, rAU 7.2071e-11, phi 1.9542e-07, Uf 2.9374e-07, patch U 1.4499e-10 and
+        // patch p_rgh 3.7771e-08; the DEVICE arm alpha 4.2145e-11, p_rgh 8.6506e-08, U 2.3084e-07,
+        // phi 1.9541e-07, and against the host arm alpha 3.1286e-11, p_rgh 9.0766e-11, U 1.4583e-09,
+        // phi 2.1037e-10 -- and every one of the 6 p_rgh and 3 pcorr solves takes OpenFOAM's iteration count.
+        // WHAT JUSTIFIES IT is the interface one-ulp twin: OpenFOAM against itself moves p_rgh 1.7991e-05 and
+        // U 7.6190e-05 here, so brae sits at 0.005x and 0.003x of its own oracle's round-off, and ulpFactor
+        // is 1 rather than the levels profile's 2.
+        : instanceProfile
+        ? Bounds{5e-10, 5e-07, 5e-07, 5e-07, 5e-10, 5e-07, 5e-07, 1e-9, 5e-10, 5e-07, 5e-10, 5e-09,
+                 5e-07, 5e-09, 5e-09, 1e-13, 5e-07, 5e-08, 0, 0, 0, 0, 0, 0, 5e-07, 1}
         : levelsProfile
         ? Bounds{5e-09, 5e-08, 5e-07, 5e-08, 5e-07, 5e-07, 5e-07, 1e-9, 5e-09, 5e-07, 5e-09, 5e-07,
                  5e-08, 5e-08, 5e-07, 1e-13, 5e-07, 5e-07, 0, 0, 0, 0, 0, 0, 5e-08, 2}
@@ -438,8 +462,22 @@ int main(
     check("the mesh is dynamic, so Uf exists", A.f.meshIsDynamic && !A.f.Uf.internal.empty());
 
     // ---- THE MESH, first: a field comparison is only a field comparison if the cells are the same
+    //
+    // THE ORACLE'S MESH IS RESOLVED, NOT ASSUMED, and that is not a convenience -- OpenFOAM does not write a
+    // full polyMesh into every time directory. On the restartInstance fixture the continuation changes no
+    // topology, so 0.003 and 0.004 carry cellLevel, pointLevel, level0Edge and refinementHistory and NO
+    // faces or points; the mesh they are on is 0.002's. Reading `<ofDir>/polyMesh` blind threw
+    // "cannot open .../0.004/polyMesh/points" there, which is the same instance resolution this unit is
+    // about, applied to the oracle side.
     PrimitiveMesh ofM;
-    ofM.read(ofDir + "/polyMesh");
+    {
+        std::string ofCase = ofDir;
+        const std::size_t slash = ofCase.find_last_of('/');
+        if (slash != std::string::npos) ofCase = ofCase.substr(0, slash);
+        const cpu::timePaths::MeshInstances om =
+            cpu::timePaths::meshInstancesForStartDir(ofCase, ofDir);
+        ofM.read(om.pointsDir(ofCase), om.facesDir(ofCase), om.boundaryDir(ofCase));
+    }
     std::printf("  OpenFOAM's %s: %ld cells, %ld faces (%ld internal), %ld points\n", ofDir.c_str(),
                 (long)ofM.nCells(), (long)ofM.nFaces(), (long)ofM.nInternalFaces(), (long)ofM.nPoints());
     check("the same cell count", ofM.nCells() == nC);

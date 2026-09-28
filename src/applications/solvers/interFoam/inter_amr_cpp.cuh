@@ -79,6 +79,10 @@ bool caseAsksForAdaptiveMesh(const std::string& caseDir);
 // another mesh type, which is what leaves a static case untouched.
 InterAmr readInterAmr(
     const std::string&          caseDir,
+    // the polyMesh directory of the FACES instance, which is where cellLevel, pointLevel,
+    // refinementHistory and the three zone lists live -- polyMesh reads every one of them at
+    // faces_.instance(), so on a restart of a refined case they are NOT under constant/
+    const std::string&          facesPolyMeshDir,
     const PrimitiveMesh&        m,
     const std::vector<FvPatch>& patches,
     const FvGeometry&           g);

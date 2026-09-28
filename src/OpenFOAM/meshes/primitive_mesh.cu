@@ -487,28 +487,39 @@ void PrimitiveMesh::readBoundary(const std::string& dir)
     propagateACMIScale(patches_);
 }
 
-void PrimitiveMesh::read(const std::string& polyMeshDir)
+void PrimitiveMesh::read(
+    const std::string& pointsDir,
+    const std::string& facesDir,
+    const std::string& boundaryDir)
 {
-    // BRAE_MESH_CACHE: skip the (slow) ASCII parse on a warm run by reloading a binary blob, provided it is newer than
-    // the polyMesh/owner file (so an edited/regenerated mesh auto-invalidates the cache). Same idea as OF reusing
-    // decomposePar's processor* dirs, one cold parse, then fast warm starts.
-    const std::string cachePath = polyMeshDir + "/.brae_meshcache";
-    {   // AUTO warm-load if a valid cache is present (newer than owner), no env needed, so a `-partition` run makes
-        // the subsequent solve warm automatically. Stale/foreign caches are rejected (mtime + magic) -> cold parse.
+    // THE INSTANCES CAN DIFFER, and when they do neither half of the mesh cache applies: the cache holds one
+    // mesh keyed on ONE directory, so a warm load would hand back the faces directory's points instead of
+    // the points instance's, and a write would leave that for the next run.
+    const bool splitInstances = (pointsDir != facesDir) || (boundaryDir != facesDir);
+
+    // BRAE_MESH_CACHE: skip the (slow) ASCII parse on a warm run by reloading a binary blob, provided it is
+    // newer than the polyMesh/owner file (so an edited/regenerated mesh auto-invalidates the cache). Same
+    // idea as OF reusing decomposePar's processor* dirs, one cold parse, then fast warm starts. It is keyed
+    // on the FACES directory, which is where `owner` lives.
+    const std::string cachePath = facesDir + "/.brae_meshcache";
+    if (!splitInstances)
+    {   // AUTO warm-load if a valid cache is present (newer than owner), no env needed, so a `-partition`
+        // run makes the subsequent solve warm automatically. Stale/foreign caches are rejected (mtime +
+        // magic) -> cold parse.
         std::error_code ec;
         namespace fs = std::filesystem;
-        const std::string ownerPath = polyMeshDir + "/owner";
+        const std::string ownerPath = facesDir + "/owner";
         if (fs::exists(cachePath, ec) && fs::exists(ownerPath, ec)
             && fs::last_write_time(cachePath, ec) >= fs::last_write_time(ownerPath, ec)
             && loadBinary(cachePath))
             return;                                          // warm: reloaded from cache
     }
-    const bool writeCache = std::getenv("BRAE_MESH_CACHE") != nullptr;   // write only when asked (-partition / env)
-    readPoints(polyMeshDir);
-    readFaces(polyMeshDir);
-    readOwner(polyMeshDir);
-    readNeighbour(polyMeshDir);
-    readBoundary(polyMeshDir);
+    const bool writeCache = std::getenv("BRAE_MESH_CACHE") != nullptr;   // write only when asked
+    readPoints(pointsDir);
+    readFaces(facesDir);
+    readOwner(facesDir);
+    readNeighbour(facesDir);
+    readBoundary(boundaryDir);
 
     // nCells = max cell index referenced by owner/neighbour, + 1.
     label maxCell = -1;
@@ -516,7 +527,7 @@ void PrimitiveMesh::read(const std::string& polyMeshDir)
     for (const label c : neighbour_) maxCell = std::max(maxCell, c);
     nCells_ = maxCell + 1;
 
-    if (writeCache) writeBinary(cachePath);                  // cold: write the cache for next time
+    if (writeCache && !splitInstances) writeBinary(cachePath);   // cold: write the cache for next time
 }
 
 } // namespace brae

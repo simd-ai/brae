@@ -39,10 +39,21 @@ def labelList(path):
 
 case = sys.argv[1]
 field = sys.argv[2] if len(sys.argv) > 2 else 'alpha.water'
-own = labelList(case + '/constant/polyMesh/owner')
-nei = labelList(case + '/constant/polyMesh/neighbour')
+# the time directory the field lives in, which for a genuine restart is not `0`
+timeDir = sys.argv[3] if len(sys.argv) > 3 else '0'
 
-p = case + '/0/' + field
+# THE MESH THE FIELD IS ON, which is the addressing this has to use: a case continued from a refined mesh
+# carries the mesh in the time directory and the one it STARTED from in constant/, and pairing the field with
+# the wrong one would index a cell that is not the neighbour of anything it names. polyMesh resolves each
+# file for itself; here one directory is enough, because the field and its mesh are written together.
+import os
+meshDir = case + '/' + timeDir + '/polyMesh'
+if not os.path.exists(meshDir + '/faces'):
+    meshDir = case + '/constant/polyMesh'
+own = labelList(meshDir + '/owner')
+nei = labelList(meshDir + '/neighbour')
+
+p = case + '/' + timeDir + '/' + field
 t = open(p).read()
 i = t.find('internalField')
 j = t.find('(', i)
@@ -63,5 +74,5 @@ if cell is None:
 before = x[cell]
 vals[cell] = repr(math.nextafter(before, 0.0) if before != 0.0 else math.nextafter(0.0, 1.0))
 open(p, 'w').write(t[:j + 1] + '\n' + '\n'.join(vals) + '\n' + t[k:])
-print('  one ulp on cell %d of the initial %s, AT THE INTERFACE: %g -> %s'
-      % (cell, field, before, vals[cell]))
+print('  one ulp on cell %d of %s/%s, AT THE INTERFACE: %g -> %s'
+      % (cell, timeDir, field, before, vals[cell]))

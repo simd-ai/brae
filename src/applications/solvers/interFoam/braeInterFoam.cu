@@ -163,6 +163,8 @@
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "inter_driver_cpp.cuh"
+#include "start_time.cuh"
+#include "time_instances.cuh"
 #include "foam_dict.cuh"
 #include <cstdio>
 #include <cstring>
@@ -199,11 +201,31 @@ int main(int argc, char** argv)
         const scalar endTime  = controlDict.scalarOr("endTime",  scalar(0));
         const scalar deltaT0  = controlDict.scalarOr("deltaT",   scalar(1e-3));
         const std::string startFrom = controlDict.wordOr("startFrom", "startTime");
-        const scalar startTime = (startFrom == "startTime")
-                               ? controlDict.scalarOr("startTime", scalar(0)) : scalar(0);
+        // `startFrom latestTime` IS HONOURED, and it used to be read and then thrown away: anything other
+        // than `startTime` fell to 0, so the standard way to CONTINUE a run silently restarted it from the
+        // beginning. resolveStartTime is the resolution the other drivers already shared; the probe is
+        // alpha.water rather than U, because interFoam's own restart is a phase field and a mesh-only
+        // directory written by snappyHexMesh carries neither.
+        char startBuf[64];
+        std::snprintf(startBuf, sizeof startBuf, "%g",
+                      (double)controlDict.scalarOr("startTime", scalar(0)));
+        const std::string startName =
+            resolveStartTime(caseDir, startFrom, startBuf, "alpha.water");
+        const scalar startTime = static_cast<scalar>(std::strtod(startName.c_str(), nullptr));
 
+        // WHICH TIME DIRECTORY THE MESH COMES FROM, which is a search and not a path: a run that refined or
+        // moved its mesh wrote a newer one into a time directory, and polyMesh resolves points, faces and
+        // boundary separately (cpu::timePaths::meshInstances, mirroring polyMesh.C:175-245). This used to be
+        // `constant/polyMesh` in four places, so a genuine restart read the mesh the case STARTED from.
+        const cpu::timePaths::MeshInstances mi =
+            cpu::timePaths::meshInstancesForStartDir(caseDir, caseDir + "/" + startName);
+        if (mi.points != "constant" || mi.faces != "constant")
+        {
+            std::fprintf(stderr, "brae: mesh instances -- points '%s', faces '%s', boundary '%s'\n",
+                         mi.points.c_str(), mi.faces.c_str(), mi.boundary.c_str());
+        }
         PrimitiveMesh m;
-        m.read(caseDir + "/constant/polyMesh");
+        m.read(mi.pointsDir(caseDir), mi.facesDir(caseDir), mi.boundaryDir(caseDir));
         FvGeometry g;
         g.build(m);
         // mirrorACMI: this loop couples a coincident cyclicACMI pair itself; the device loop, handed the
@@ -227,7 +249,9 @@ int main(int argc, char** argv)
         {
             // a cyclicAMI is the host's only: the device loop is handed it uncoupled, which is what
             // the case-build refusal keys on, by name
-            amiPairs = cpu::cyclicAMIFvPatch::setup(caseDir + "/constant/polyMesh", m, g, patches);
+            // the BOUNDARY instance: the AMI entries are read from polyMesh/boundary, which polyMesh
+            // resolves separately from the faces and never older than them
+            amiPairs = cpu::cyclicAMIFvPatch::setup(mi.boundaryDir(caseDir), m, g, patches);
         }
         // ...handed to the host loop mutable as well, for a case whose mesh moves (MutableMesh)
         MutableMesh mutableMesh;
@@ -237,11 +261,10 @@ int main(int argc, char** argv)
         mutableMesh.acmi = &acmi;
         mutableMesh.ami = &amiPairs;
 
-        // The start directory OpenFOAM would use. `0` is written as `0` and not `0.000000`, which is
-        // what every tutorial ships.
-        char buf[64];
-        std::snprintf(buf, sizeof buf, "%g", (double)startTime);
-        const std::string startDir = caseDir + "/" + buf;
+        // The start directory OpenFOAM would use. `0` is written as `0` and not `0.000000`, which is what
+        // every tutorial ships -- and under `startFrom latestTime` it is the directory resolveStartTime
+        // found, whose NAME is what OpenFOAM's timeName() would be (so `0.002` and not `0.0020000`).
+        const std::string startDir = caseDir + "/" + startName;
 
         // An upper bound on the steps, and endTime below is the REAL bound. A fixed-step case needs
         // exactly (end-start)/dt; an adjustTimeStep case cannot be counted ahead of time, because
@@ -258,7 +281,7 @@ int main(int argc, char** argv)
                 std::to_string((double)endTime) + ", deltaT " + std::to_string((double)deltaT0) + ").");
 
         std::printf("brae interFoam (OF-mirror): %ld cells, start %s, endTime %g\n",
-                    (long)m.nCells(), buf, (double)endTime);
+                    (long)m.nCells(), startName.c_str(), (double)endTime);
 
         // ONE case translation and ONE time loop per path, both the ones the gates call. A private
         // copy here would be the defect this file's header names.

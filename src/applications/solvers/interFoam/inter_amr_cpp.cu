@@ -206,6 +206,7 @@ bool caseAsksForAdaptiveMesh(const std::string& caseDir)
 
 InterAmr readInterAmr(
     const std::string&          caseDir,
+    const std::string&          facesPolyMeshDir,
     const PrimitiveMesh&        m,
     const std::vector<FvPatch>& patches,
     const FvGeometry&           g)
@@ -286,10 +287,10 @@ InterAmr readInterAmr(
     amr.state.history = cpu::hexRef8::freshHistory(m.nCells());
     // ...AND THEN OFF DISK, where the mesh carries it. A snappyHexMesh mesh is at levels 1 to 3 and a
     // resumed refined one at whatever it reached, and `cellLevel[celli] < maxRefinement`
-    // (dynamicRefineFvMesh.C:861) means something different in the two codes until this is read. brae looks
-    // in constant/polyMesh because that is where it reads the mesh from; OpenFOAM looks in
-    // mesh_.facesInstance(), which for a latestTime restart is the time directory -- an instance resolution
-    // brae does not have, and one this does not pretend to.
+    // (dynamicRefineFvMesh.C:861) means something different in the two codes until this is read. THE
+    // DIRECTORY IS THE FACES INSTANCE'S, which is where OpenFOAM reads them from (mesh_.facesInstance(),
+    // hexRef8.C:1912-1990) and which for a genuine restart is the time directory and not constant/ --
+    // cpu::timePaths resolves it, and this used to hard-code constant/polyMesh.
     {
         const bool blind = std::getenv("BRAE_CONTROL_AMR_NO_LEVELS") != nullptr;
         if (blind)
@@ -300,7 +301,7 @@ InterAmr readInterAmr(
             std::printf("  *** CONTROL MODE: the mesh's cellLevel, pointLevel and refinementHistory are NOT "
                         "read; every cell is taken as level 0. This run is deliberately wrong. ***\n");
         }
-        else if (cpu::hexRef8::readRefinementState(caseDir + "/constant/polyMesh", m.nCells(), m.nPoints(),
+        else if (cpu::hexRef8::readRefinementState(facesPolyMeshDir, m.nCells(), m.nPoints(),
                                                    amr.state.levels, amr.state.history))
         {
             label mx = 0;
@@ -317,7 +318,7 @@ InterAmr readInterAmr(
     // name instead of running with the zone still in the old numbering (which an MRF zone or an
     // fvOption's cellZone would then apply itself to).
     {
-        const std::string pm = caseDir + "/constant/polyMesh/";
+        const std::string pm = facesPolyMeshDir + "/";
         // cellZones ARE CARRIED (dynamicRefine::renumberCellZones), so they are NOT counted here.
         label nZ = 0;
         // ...the other two kinds by their own ENTRY COUNT, not by the file being there: subsetMesh

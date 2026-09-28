@@ -1,6 +1,7 @@
 // interFoam's createFields -- see inter_case_cpp.cuh for the provenance and for the four things the
 // order of this file encodes.
 #include "inter_case_cpp.cuh"
+#include "time_instances.cuh"
 #include "inter_amr_cpp.cuh"
 #include "frozen_bc_guard.cuh"
 #include <sstream>
@@ -859,12 +860,20 @@ InterFields buildInterFields(const std::string&          caseDir,
         // there is no dynamicMeshDict or it names another dynamicFvMesh, so this costs a static case one
         // file test. Building it only for an adaptive case left every static one with a null pointer,
         // which the host driver then refused -- 92 arms of tests/interfoam_refusals.sh at once.
-        f.cellZones = readCellZones(caseDir + "/constant/polyMesh");
-        f.amr = std::make_shared<InterAmr>(readInterAmr(caseDir, m, patches, g));
+        // THE ZONES AND THE REFINEMENT STATE COME FROM THE FACES INSTANCE, not from constant/. polyMesh
+        // reads pointZones, faceZones and cellZones at faces_.instance() (polyMesh.C:250-295, all three
+        // READ_IF_PRESENT), and hexRef8 reads cellLevel/pointLevel/refinementHistory there too. On a case
+        // that starts from rest the two are the same directory; on a genuine restart of a refined or moved
+        // mesh they are not, and reading constant/ then gives the START mesh's zones for the mesh the run
+        // is actually on -- or none at all.
+        const cpu::timePaths::MeshInstances mi = cpu::timePaths::meshInstancesForStartDir(caseDir, startDir);
+        const std::string facesPolyMeshDir = mi.facesDir(caseDir);
+        f.cellZones = readCellZones(facesPolyMeshDir);
+        f.amr = std::make_shared<InterAmr>(readInterAmr(caseDir, facesPolyMeshDir, m, patches, g));
         // ...and the change carries them: it renumbers this copy, and the driver reads it back so the
         // fvOptions selection and the MRF zones resolve against the mesh as it stands.
         f.amr->state.cellZones = f.cellZones;
-        f.amr->polyMeshDir = caseDir + "/constant/polyMesh";
+        f.amr->polyMeshDir = facesPolyMeshDir;
         // `dynamic` is OpenFOAM's mesh.dynamic(): moving OR topo-changing. It is what correctPhi defaults
         // to, and a REFINING mesh is dynamic -- measured on damBreakWithObstacle, where OpenFOAM writes a
         // Uf and an rAU beside every time directory and solves pcorr at every step.
