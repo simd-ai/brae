@@ -312,6 +312,65 @@ inline DdtSchemeEntry parseDdtScheme(const std::string& caseDir)
     return d;
 }
 
+// fvSchemes::ddtScheme(name) -- the entry a call site's ddt NAME resolves to, as schemesLookupDetail.C
+// resolves it: the entry named for that call site when the dictionary has one (a literal key, else the last
+// regex key that matches -- FoamDict::find is dictionary::found's REGEX search), else `default` -- unless
+// there is no `default` or it is `default none`, and then the lookup of the name itself is fatal
+// (:79-89, :110-122). The names are the CALL SITE's, built from its operands: fvm::ddt(rho, U) asks for
+// `ddt(rho,U)` and fvc::ddtCorr(U, phi, Uf) for `ddt(U)` (fvmDdt.C:83, fvcDdt.C:180). Returns the entry's
+// tokens joined by single spaces, so two spellings of one scheme compare equal.
+inline std::string ddtSchemeFor(const std::string& caseDir, const std::string& name)
+{
+    const FoamDict fvs = readDict(caseDir + "/system/fvSchemes");
+    const FoamDict* d = fvs.subDict("ddtSchemes");
+    if (!d)
+        throw std::runtime_error("brae: system/fvSchemes has no ddtSchemes dictionary, and the case asks for `"
+                                 + name + "`.");
+    auto join = [](const std::vector<std::string>& v)
+    {
+        std::string out;
+        for (const std::string& t : v) out += (out.empty() ? "" : " ") + t;
+        return out;
+    };
+    // The LITERAL key is found in the text, not through FoamDict: FoamDict's tokenizer splits an unquoted
+    // `ddt(rho,U)` into a key `ddt` and value tokens `( rho,U )`, so find() never sees it (measured: a case
+    // with `default Euler; ddt(rho,U) CrankNicolson 0.5;` resolved to Euler). OpenFOAM reads the key as one
+    // word. A quoted key is a regex in OpenFOAM and parses whole in FoamDict, so find() still owns those.
+    const std::string blk = fvSchemesBlock(readFvSchemesText(caseDir), "ddtSchemes");
+    for (std::size_t q = blk.find(name); q != std::string::npos; q = blk.find(name, q + 1))
+    {
+        const bool startOk = (q == 0) || std::isspace((unsigned char)blk[q - 1]) || blk[q - 1] == '{'
+                          || blk[q - 1] == ';';
+        const std::size_t e = q + name.size();
+        const bool endOk = (e < blk.size()) && std::isspace((unsigned char)blk[e]);
+        if (!startOk || !endOk)
+        {
+            continue;
+        }
+        const std::size_t semi = blk.find(';', e);
+        std::istringstream in(blk.substr(e, semi == std::string::npos ? std::string::npos : semi - e));
+        std::vector<std::string> v;
+        for (std::string t; in >> t; )
+        {
+            v.push_back(t);
+        }
+        if (!v.empty())
+        {
+            return join(v);
+        }
+    }
+    if (const std::vector<std::string>* v = d->find(name))
+    {
+        if (!v->empty()) return join(*v);
+    }
+    const std::vector<std::string>* dv = d->find("default");
+    if (!dv || dv->empty() || dv->front() == "none")
+        throw std::runtime_error(
+            "brae: fvSchemes ddtSchemes has no `" + name + "` and no default to fall back to (it is absent or "
+            "`none`). OpenFOAM's lookup of that name then fails (schemesLookupDetail.C:79-89).");
+    return join(*dv);
+}
+
 // mesh.gradScheme(<name>) for an ARBITRARY name -- the one a scheme READS rather than grad(<field>):
 // linearUpwind's `limited`, say. schemesLookup::lookupDetail::lookup is named-then-default
 // (schemesLookupDetail.C:76-89): the entry of that name if the gradSchemes dictionary has one, else

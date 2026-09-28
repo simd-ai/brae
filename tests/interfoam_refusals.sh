@@ -195,6 +195,13 @@ arm()
     fi
 }
 
+# ddtblock <line>... -- replace the ddtSchemes block with these entries, one per line. A function rather
+# than a sed so a regex key's backslashes and quotes reach the file as written.
+ddtblock()
+{
+    python3 -c "import re, sys; p = 'system/fvSchemes'; t = open(p).read(); body = 'ddtSchemes\n{\n' + ''.join('    ' + a + '\n' for a in sys.argv[1:]) + '}'; t2 = re.sub(r'ddtSchemes\s*\{[^}]*\}', lambda m: body, t, count=1); assert t2 != t; open(p, 'w').write(t2)" "$@"
+}
+
 echo "== brae interFoam: what it refuses, and what it must not =="
 
 arm baseline                runs    -                        "" true
@@ -404,6 +411,18 @@ arm ddt_cnCoupledCold       runs    -                         "" "$CNSET"
 BASE="$B"
 arm ddt_localEuler          refused "localEuler"              "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         localEuler;/' system/fvSchemes"
 arm ddt_backward            refused "backward"                "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         backward;/' system/fvSchemes"
+# EACH ddt BY ITS CALL SITE'S NAME (schemesLookupDetail.C:79-89): fvm::ddt(rho, U) asks for `ddt(rho,U)`,
+# ddtCorr and meshPhi for `ddt(U)`, alphaEqn.H for `ddt(alpha)`, each named-then-default. brae read
+# `default` alone, by a text search, so `ddt_splitRhoU` REACHED End: as Euler momentum (measured on the
+# old binary). One U scheme is carried, so a split is refused in either direction; the same scheme
+# spelled out, or reached through a regex key under `default none`, runs; a name that resolves to
+# nothing is OpenFOAM's own fatal; and the scheme is its FIRST word, so `bounded Euler` is not Euler.
+arm ddt_splitRhoU           refused 'resolves `ddt(rho,U)` (the momentum matrix, UEqn.H) to `CrankNicolson 0.5`' "" "ddtblock 'default Euler;' 'ddt(rho,U) CrankNicolson 0.5;'"
+arm ddt_splitU              refused 'and `ddt(U)` (ddtCorr and the mesh flux, pEqn.H) to `CrankNicolson 0.5`'    "" "ddtblock 'default Euler;' 'ddt(U) CrankNicolson 0.5;'"
+arm ddt_namedSame           runs    -                         "" "ddtblock 'default CrankNicolson 0.5;' 'ddt(rho,U) Euler;' 'ddt(U) Euler;' 'ddt(alpha) Euler;'"
+arm ddt_regexKey            runs    -                         "" "ddtblock 'default none;' '\"ddt\\(.*\\)\" Euler;'"
+arm ddt_noneUnnamed         refused 'has no `ddt(rho,U)` and no default to fall back to' "" "ddtblock 'default none;' 'ddt(alpha) Euler;'"
+arm ddt_bounded             refused 'whose scheme `bounded` is not one brae reads' "" "ddtblock 'default bounded Euler;'"
 BASE="$BM"
 # ...on the MOVING base, which is the arm that says the moving branches are reachable and not refused.
 # testTubeMixer names nAlphaSubCycles 3, and CrankNicolson with sub-cycling is OpenFOAM's own
@@ -462,6 +481,11 @@ BASE="$BR"
 arm ras_baseline            runs    -                        "" true
 arm mrf_RAS                 refused "MRF zone AND is turbulent" "" "$ZONE; ${MRFD/OMEGA/omega 10;}"
 arm ras_otherModel          refused "realizableKE"            "" "sed -i 's/RASModel .*/RASModel        realizableKE;/' constant/turbulenceProperties"
+# THE CLOSURE'S ddt NAMES. RAS/damBreak is `density variable`, so kEpsilon's fvm::ddt(alpha, rho, k) asks
+# for `ddt(rho,k)` and `ddt(rho,epsilon)` (fvmDdt.C:128-150); the closure carries U's scheme, so a split
+# there is refused. `ddt(k)` is a name that lineage never looks up, dead text OpenFOAM ignores -- it runs.
+arm ddt_closureSplit        refused 'the closure'"'"'s `ddt(rho,k)` to `CrankNicolson 0.5`' "" "ddtblock 'default Euler;' 'ddt(rho,k) CrankNicolson 0.5;'"
+arm ddt_closureDeadName     runs    -                         "" "ddtblock 'default Euler;' 'ddt(k) CrankNicolson 0.5;'"
 # kOmegaSST IS ported, in the uniform lineage (tests/interfoam_waterchannel_vs_openfoam.sh holds it to
 # OpenFOAM). RAS/damBreak made kOmegaSST: `density variable` with it is refused, and so is each thing
 # the closure does not carry -- on a base that RUNS, so a refusal is the one edit's.

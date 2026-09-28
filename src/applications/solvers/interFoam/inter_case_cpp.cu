@@ -296,9 +296,11 @@ AlphaFluxScheme parseAlphaDiv(const std::string& entry, const char* key)
 
 AlphaDdt parseAlphaDdt(const std::string& entry)
 {
-    if (entry.find("CrankNicolson") != std::string::npos) return AlphaDdt::CrankNicolson;
-    if (entry.find("localEuler")    != std::string::npos) return AlphaDdt::localEuler;
-    if (entry.find("Euler")         != std::string::npos) return AlphaDdt::Euler;
+    // by the FIRST word, exactly: `bounded Euler` contains the word Euler and is not Euler
+    const std::string w = entry.substr(0, entry.find_first_of(" \t"));
+    if (w == "CrankNicolson") return AlphaDdt::CrankNicolson;
+    if (w == "localEuler")    return AlphaDdt::localEuler;
+    if (w == "Euler")         return AlphaDdt::Euler;
     return AlphaDdt::other;                              // refused by offCentringCoeff, by name
 }
 
@@ -705,26 +707,40 @@ InterFields buildInterFields(const std::string&          caseDir,
         f.divPhiAlpha  = parseAlphaDiv(entry("div(phi,alpha)",   "Gauss vanLeer"), "div(phi,alpha)");
         f.divPhirbAlpha= parseAlphaDiv(entry("div(phirb,alpha)", "Gauss linear"),  "div(phirb,alpha)");
 
-        const std::string ddtBlock = fvSchemesBlock(all, "ddtSchemes");
-        auto ddtEntry = [&](const std::string& key, const std::string& dflt)
+        // EACH ddt BY THE NAME ITS CALL SITE ASKS FOR (ddtSchemeFor, schemesLookupDetail.C): OpenFOAM has no
+        // "U scheme". fvm::ddt(rho, U) in UEqn.H looks up `ddt(rho,U)` (fvmDdt.C:83); fvc::ddtCorr(U, phi, Uf)
+        // in pEqn.H and fvc::meshPhi(U) look up `ddt(U)` (fvcDdt.C:180, fvcMeshPhi.C:43); alphaEqn.H asks for
+        // the literal `ddt(alpha)`; the closure's are resolved after it is read, below. brae read `default`
+        // alone for every one of them, by a text search of the block, so a case writing
+        // `ddt(rho,U) CrankNicolson 0.5;` beside `default Euler;` ran its momentum as Euler with nothing said
+        // -- MEASURED, it reached End: -- and a missing default was read as Euler where OpenFOAM stops.
+        const std::string ddtRhoU = ddtSchemeFor(caseDir, "ddt(rho,U)");
+        const std::string ddtUCorr = ddtSchemeFor(caseDir, "ddt(U)");
+        // brae carries ONE time scheme for U, and its CrankNicolson state -- the ddt0 levels, the off-centred
+        // mesh flux -- is built on it, so the momentum and ddtCorr/meshPhi must resolve to the same entry.
+        // OpenFOAM would run a split as two schemes; that is refused here, on both arms, rather than run as one.
+        if (ddtRhoU != ddtUCorr)
+            throw std::runtime_error(
+                "brae interFoam: ddtSchemes resolves `ddt(rho,U)` (the momentum matrix, UEqn.H) to `" + ddtRhoU
+                + "` and `ddt(U)` (ddtCorr and the mesh flux, pEqn.H) to `" + ddtUCorr + "`. brae carries one "
+                "time scheme for U; refusing rather than running both under the first.");
+        // the scheme by its FIRST word, exactly -- `bounded Euler` used to read as Euler because the text
+        // contained the word, and `bounded` is not ported
+        auto ddtKind = [](const std::string& entry) -> DdtScheme
         {
-            const std::size_t k = ddtBlock.find(key);
-            if (k == std::string::npos) return dflt;
-            const std::size_t e = ddtBlock.find(';', k);
-            std::string st = ddtBlock.substr(k + key.size(),
-                                             e == std::string::npos ? std::string::npos : e - k - key.size());
-            std::size_t b = st.find_first_not_of(" \t\n\r");
-            std::size_t f2 = st.find_last_not_of(" \t\n\r");
-            return (b == std::string::npos) ? dflt : st.substr(b, f2 - b + 1);
+            const std::string w = entry.substr(0, entry.find(' '));
+            if (w == "Euler")         return DdtScheme::Euler;
+            if (w == "CrankNicolson") return DdtScheme::CrankNicolson;
+            if (w == "localEuler")    return DdtScheme::localEuler;
+            if (w == "backward")      return DdtScheme::backward;
+            if (w == "steadyState")   return DdtScheme::steadyState;
+            throw std::runtime_error(
+                "brae interFoam: ddtSchemes names `" + entry + "`, whose scheme `" + w + "` is not one brae "
+                "reads (Euler, CrankNicolson, localEuler, backward, steadyState); refusing rather than guess.");
         };
-        const std::string dflt = ddtEntry("default", "Euler");
-        f.ddtAlpha = parseAlphaDdt(ddtEntry("ddt(alpha)", dflt));
-        f.ddtU     = (dflt.find("Euler") != std::string::npos && dflt.find("localEuler") == std::string::npos)
-                   ? DdtScheme::Euler
-                   : (dflt.find("CrankNicolson") != std::string::npos ? DdtScheme::CrankNicolson
-                   : (dflt.find("localEuler")    != std::string::npos ? DdtScheme::localEuler
-                   : (dflt.find("backward")      != std::string::npos ? DdtScheme::backward
-                                                                      : DdtScheme::steadyState)));
+        f.ddtU = ddtKind(ddtRhoU);
+        const std::string ddtAlphaEntry = ddtSchemeFor(caseDir, "ddt(alpha)");
+        f.ddtAlpha = parseAlphaDdt(ddtAlphaEntry);
         // READ AND THEN NEVER USED: neither driver handed ddtU to the momentum equation, whose
         // input defaults to Euler, so `CrankNicolson 0.5` (RAS/floatingObject) and `localEuler`
         // (RAS/DTCHull) would have run as Euler. Both tutorials were being stopped for other reasons.
@@ -732,17 +748,19 @@ InterFields buildInterFields(const std::string&          caseDir,
         // (crank_nicolson_ddt_scheme_cpp.cuh), and alphaEqn.H's own blend follows ddt(alpha).
         if (f.ddtU != DdtScheme::Euler && f.ddtU != DdtScheme::CrankNicolson)
             throw std::runtime_error(
-                "brae interFoam: ddtSchemes default is `" + dflt + "`. The momentum equation, the "
-                "ddt flux correction in pEqn and the turbulence closure carry Euler and CrankNicolson; "
+                "brae interFoam: ddtSchemes resolves `ddt(rho,U)` to `" + ddtRhoU + "`. The momentum equation, "
+                "the ddt flux correction in pEqn and the turbulence closure carry Euler and CrankNicolson; "
                 "refusing rather than running Euler under another scheme's name.");
         if (f.ddtU == DdtScheme::CrankNicolson)
         {
-            f.ddtOcCoeff = fv::readOcCoeff(dflt);
+            f.ddtOcCoeff = fv::readOcCoeff(ddtRhoU);
         }
         if (f.ddtAlpha == AlphaDdt::CrankNicolson)
         {
-            f.ddtAlphaOcCoeff = fv::readOcCoeff(ddtEntry("ddt(alpha)", dflt));
+            f.ddtAlphaOcCoeff = fv::readOcCoeff(ddtAlphaEntry);
         }
+        // kept for the closure's check, after the turbulence is read
+        f.ddtRhoUEntry = ddtRhoU;
         // THE TWO NEED NOT AGREE, and both mixed cases run now. alphaEqn.H:242-259 branches on
         // `ddt(rho,U)` -- the MOMENTUM entry -- while ocCoeff and cnCoeff come from `ddt(alpha)`
         // (alphaEqn.H:6-56), so the four combinations are four well-defined runs and brae's two arms
@@ -1195,6 +1213,25 @@ InterFields buildInterFields(const std::string&          caseDir,
                                        f.laplacianScheme.limitCoeff,
                                        patches, nC, &m, &g, &sharedWallDist,
                                        f.pimple.nOuterCorrectors, f.pimple.turbOnFinalIterOnly);
+    // ...AND THE CLOSURE'S OWN ddt NAMES, which it carries under U's scheme. The model calls
+    // fvm::ddt(alpha, rho, k) with geometricOneField alpha, so the name is `ddt(k)` in the uniform lineage and
+    // `ddt(rho,k)` under `density variable` (fvmDdt.C:128-150), and likewise for epsilon or omega.
+    if (f.turbulence.on)
+    {
+        std::vector<std::string> fields{"k"};
+        if (f.turbulence.model == InterRasModel::KEpsilon) fields.push_back("epsilon");
+        if (f.turbulence.model == InterRasModel::KOmegaSST) fields.push_back("omega");
+        for (const std::string& fld : fields)
+        {
+            const std::string name = f.turbulence.variableDensity ? "ddt(rho," + fld + ")" : "ddt(" + fld + ")";
+            const std::string entry = ddtSchemeFor(caseDir, name);
+            if (entry != f.ddtRhoUEntry)
+                throw std::runtime_error(
+                    "brae interFoam: ddtSchemes resolves the closure's `" + name + "` to `" + entry
+                    + "` and the momentum's `ddt(rho,U)` to `" + f.ddtRhoUEntry + "`. The closure carries "
+                    "U's time scheme; refusing rather than running it under the momentum's.");
+        }
+    }
     // `turbOnFinalIterOnly no` WITH MORE THAN ONE OUTER CORRECTOR RUNS NOW, on both arms. Two halves:
     //   * psi.oldTime() is kept per TIME INDEX rather than recaptured per call
     //     (InterTurbulence::kOldStep, advanceTurbulenceOldTime). OpenFOAM's storeOldTimes is guarded on

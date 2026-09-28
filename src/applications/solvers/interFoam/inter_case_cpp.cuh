@@ -150,6 +150,9 @@ struct InterFields
     AlphaFluxScheme              divPhirbAlpha  = AlphaFluxScheme::linear;
     AlphaDdt                     ddtAlpha       = AlphaDdt::Euler;
     DdtScheme                    ddtU           = DdtScheme::Euler;
+    // the entry `ddt(rho,U)` resolved to (fvSchemes::ddtScheme), which ddtU classifies and which the
+    // closure's own ddt names must resolve to as well
+    std::string                  ddtRhoUEntry;
     // CrankNicolson's off-centring coefficient, from the entry each operand set resolves to: `ddt(alpha)`
     // for alphaEqn.H's own blend (it asks the scheme it constructs for ddt(alpha)), `default` for
     // fvm::ddt(rho, U), fvm::ddt(k) and ddtCorr. 1 is OpenFOAM's when the entry names none.
