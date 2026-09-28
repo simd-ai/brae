@@ -22,6 +22,7 @@
 #include "time_controls.cuh"
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -515,33 +516,21 @@ RunReport runInterFoamDevice(
 
     // ...AND A VELOCITY CONDITION THAT NAMES A FLUX OTHER THAN phi. p_rgh's and alpha's conditions are
     // evaluated on the host, which hands each the flux its `phi` entry names (namedPatchFlux, through
-    // pushFlux below). U's pressureInletOutletVelocity switch runs ON THE DEVICE and reads phi.
-    //
-    // WHAT THIS REFUSAL IS WORTH, MEASURED -- so the next attempt starts here instead of repeating one.
-    // laminar/damBreak with `phi rhoPhi;` added to U's pressureInletOutletVelocity, five fixed steps at
-    // 1e-3 with the solvers pinned, against a real OpenFOAM run of the same case:
-    //     host arm vs OpenFOAM          alpha 3.6637e-15, p_rgh 1.2278e-11, U 6.1586e-14   -- the floor
-    //     device arm vs the host arm    alpha 4.8898e-13, p_rgh 1.9327e-07, U 2.6075e-07
-    //     the same case WITHOUT the entry, device vs host                  U 4.7210e-14
-    // so the entry alone moves the device 2.6e-07 from OpenFOAM, and this is what stops it.
-    //
-    // AND SUBSTITUTING rhoPhiBnd FOR phiBnd AT THE DEVICE'S U SWITCHES DOES NOT CLOSE IT. That was tried:
-    // the six switch sites in deviceInterStep and the two here, fed from one buffer with the mass flux
-    // copied in per patch. It changed NOTHING, to every digit, and a probe said why -- on damBreak's
-    // atmosphere the device's rhoPhiBnd EQUALS its phiBnd on all 46 faces at every step, worst difference
-    // 0.0 and zero sign flips, which is what `rhoPhi = alphaPhi*(rho1 - rho2) + phiCN*rho2` gives where
-    // alpha is 0 and rho2 is 1. The host's rhoPhi and phi do NOT agree at the corrector sites, so the two
-    // arms are not reading the same pair of quantities: the gap is WHEN each flux is taken, not which array
-    // the switch is handed. Whoever takes this next should compare the device's rhoPhiBnd against the host's
-    // rhoPhi boundary at each switch site before changing anything.
+    // pushFlux below) -- U's included, since U's patches are evaluated on the host by the updateUBoundary
+    // hook. U's inletOutlet and pressureInletOutletVelocity switches that run ON THE DEVICE read the flux
+    // each patch names too: rhoPhi where it says `phi rhoPhi;`, per face (DeviceInterStepControls::
+    // uFluxIsRhoPhi). This case was REFUSED at U 2.6e-07 from the host, and the cause was not the switch:
+    // namesRhoPhi (below) asked p_rgh and alpha only, so with U ALONE naming rhoPhi the host's rhoPhi was
+    // never refreshed from the device and the host-evaluated U read the run's starting mass flux.
+    // MEASURED on tests/interfoam_dambreak_vs_openfoam.sh `rhophiU`: device U 8.5e-12 from OpenFOAM, and
+    // 4.8e-05 with U left out of namesRhoPhi. Any other name is refused by name.
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         const std::string& name = f.U.boundary[pi]->fluxName();
-        if (name == "phi") continue;
+        if (name == "phi" || name == "rhoPhi") continue;
         throw std::runtime_error(
             "brae interFoam (device): U's patch `" + fvp[pi].name + "` names the flux `" + name
-            + "` in its `phi` entry, and the device loop's velocity switch reads phi. The host path "
-            "(no -device) hands each patch the flux it names.");
+            + "` in its `phi` entry; the device loop's velocity switches read phi or rhoPhi.");
     }
 
     // THE MESH'S GAMG HIERARCHY, one for the whole run, as OpenFOAM keeps one GAMGAgglomeration per
@@ -578,10 +567,10 @@ RunReport runInterFoamDevice(
 
     // the masks the device needs that the mesh does not carry. IN A LAMBDA because a topology change
     // re-runs it: they are per boundary FACE, and hexRef8 splits boundary faces within their patch.
-    std::vector<int> aFixes, aFlag, takeU, uFixes;
+    std::vector<int> aFixes, aFlag, takeU, uFixes, uNamesRhoPhi;
     const auto buildBoundaryMasks = [&]()
     {
-        aFixes.clear(); aFlag.clear(); takeU.clear(); uFixes.clear();
+        aFixes.clear(); aFlag.clear(); takeU.clear(); uFixes.clear(); uNamesRhoPhi.clear();
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
             // EVERY DEVICE BOUNDARY ARRAY IS [non-coupled patches, in patch order] (device_mesh.cuh:41-44).
@@ -596,11 +585,35 @@ RunReport runInterFoamDevice(
                 aFlag.push_back(fl);
                 takeU.push_back(f.U.boundary[pi]->assignable() ? 0 : 1);
                 uFixes.push_back(f.U.boundary[pi]->fixesValue() ? 1 : 0);
+                uNamesRhoPhi.push_back(f.U.boundary[pi]->fluxName() == "rhoPhi" ? 1 : 0);
             }
         }
     };
     buildBoundaryMasks();
-    DeviceBuffer<int> dAFixes(aFixes), dAFlag(aFlag), dTakeU(takeU), dUFixes(uFixes);
+    DeviceBuffer<int> dAFixes(aFixes), dAFlag(aFlag), dTakeU(takeU), dUFixes(uFixes), dUNamesRhoPhi(uNamesRhoPhi);
+    // ...and whether any U patch names rhoPhi at all, which is what selects the named switch flux
+    const bool uNamesRhoPhiAny =
+        std::find(uNamesRhoPhi.begin(), uNamesRhoPhi.end(), 1) != uNamesRhoPhi.end();
+    // the flux U's switches read at the two driver-level sites, from the HOST fields: the named one per
+    // patch, as the step builds it on the device (DeviceInterStepControls::uFluxIsRhoPhi). phi's own
+    // device array is passed through untouched when no patch names rhoPhi.
+    const auto uSwitchFlux = [&](const DeviceBuffer<scalar>& phiB) -> DeviceBuffer<scalar>
+    {
+        std::vector<scalar> v;
+        if (!uNamesRhoPhiAny || f.rhoPhi.boundary.size() != fvp.size())
+        {
+            phiB.copyTo(v);
+            return DeviceBuffer<scalar>(v);
+        }
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            const std::vector<scalar>& src = (f.U.boundary[pi]->fluxName() == "rhoPhi")
+                                           ? f.rhoPhi.boundary[pi] : f.phi.boundary[pi];
+            v.insert(v.end(), src.begin(), src.end());
+        }
+        return DeviceBuffer<scalar>(v);
+    };
     // ...and one of them is NOT a property of the patch but of the face and the instant. alpha's
     // variableHeightFlowRate is a MIXED condition whose rebuild() sets valueFraction to 1 on an INFLOW
     // face and 0 on the rest (fv_patch_field.cuh: `if (!(phi < -SMALL)) continue`), so a mask taken once
@@ -642,10 +655,15 @@ RunReport runInterFoamDevice(
     // the only current copy. Empty until the first alpha step, when the host's -- built at rest by
     // buildInterFields -- is the field.
     DeviceBuffer<scalar> dRpI, dRpB;
+    // ...U's among them. U's patches are EVALUATED on the host too (the updateUBoundary hook), told their
+    // flux by pushFlux -- and with U the only one naming rhoPhi, this used to leave the host's rhoPhi at the
+    // value it started the run with: MEASURED on laminar/damBreak with U alone naming it, device U 2.6e-07
+    // from the host, which the refusal of this case recorded and attributed to the device's switch.
     bool namesRhoPhi = false;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        if (f.p_rgh.boundary[pi]->fluxName() == "rhoPhi" || f.alpha1.boundary[pi]->fluxName() == "rhoPhi")
+        if (f.p_rgh.boundary[pi]->fluxName() == "rhoPhi" || f.alpha1.boundary[pi]->fluxName() == "rhoPhi"
+         || f.U.boundary[pi]->fluxName() == "rhoPhi")
         {
             namesRhoPhi = true;
         }
@@ -1691,6 +1709,7 @@ RunReport runInterFoamDevice(
     };
     setMomentumSolve(true);
     C.takeUAtBoundary = &dTakeU;
+    C.uFluxIsRhoPhi = uNamesRhoPhiAny ? &dUNamesRhoPhi : nullptr;
     if (deviceClosure)
     {
         C.nutCell = &dTurb.nut;
@@ -1779,7 +1798,8 @@ RunReport runInterFoamDevice(
     // own build (rhoSimpleFoam.cu:391): anything that reads dbU before the first momentum assembly --
     // correctPhi's constrainHbyA, the alpha step's gradients -- would otherwise see an inletOutlet as a
     // fixedValue wall at its inletValue.
-    deviceUpdateInletOutlet(dbU, dPhiB);
+    if (uNamesRhoPhiAny) deviceUpdateInletOutlet(dbU, uSwitchFlux(dPhiB));
+    else                 deviceUpdateInletOutlet(dbU, dPhiB);
 
     // THE MESH UPDATE'S OWN OBJECTS, as the host driver keeps them (inter_driver_cpp.cu): the mesh's
     // GAMG hierarchy, which the motion solve builds and the run keeps, and the case's CorrectPhi
@@ -2645,8 +2665,10 @@ RunReport runInterFoamDevice(
                     dAFlag.copyFrom(aFlag);
                     dTakeU.copyFrom(takeU);
                     dUFixes.copyFrom(uFixes);
+                    dUNamesRhoPhi.copyFrom(uNamesRhoPhi);
                     dbU = buildDeviceVectorBoundary(f.U, fvp, g);
-                    deviceUpdateInletOutlet(dbU, dPhiB);
+                    if (uNamesRhoPhiAny) deviceUpdateInletOutlet(dbU, uSwitchFlux(dPhiB));
+                    else                 deviceUpdateInletOutlet(dbU, dPhiB);
 
                     // ---- UP: every mesh-sized buffer the step READS, from the mapped host fields
                     dA.copyFrom(f.alpha1.internal);

@@ -96,7 +96,8 @@ int main(int argc, char** argv)
     const bool momPred = profileName == "mompred" || momMinIter;
     // `rhophi`: the atmosphere's three flux-conditional conditions all name `phi rhoPhi;`. The device
     // runs U's switch itself and reads phi there, so it refuses the case.
-    const bool namedFlux = profileName == "rhophi";
+    // `rhophiU` is the same with U's atmosphere ALONE naming rhoPhi (the device's old refusal)
+    const bool namedFlux = profileName == "rhophi" || profileName == "rhophiU";
     // `vanleerv` and `linear`: div(rhoPhi,U) as two schemes the tutorial does not name -- the V-limited
     // vanLeer that the closed-tank tutorials use, and central differencing, which the device mapped to
     // upwind through a switch's `default` until this profile existed. Both run on both paths.
@@ -140,7 +141,9 @@ int main(int argc, char** argv)
     // (inter_driver_device.cu), measured against OpenFOAM on validation/interFoamCyclic's `outer`
     // profile with the one-corrector answer as its control. It is compared here like any other
     // profile, on a case whose every other control the device already runs.
-    const bool deviceRefuses = namedFlux || gradLsqLimited;
+    // `rhophi` RUNS on the device now: U's switches read the flux each patch names
+    // (DeviceInterStepControls::uFluxIsRhoPhi), and the arm below holds it to OpenFOAM at the host's bounds
+    const bool deviceRefuses = gradLsqLimited;
     const bool bigStep = (argc > 7 && std::string(argv[7]) == "bigstep") || prevCorr || pimpleProfile || sheared;
     // `inflow`: the atmosphere's inletValue set to 1, so water enters over air cells and rho's patch
     // value differs from the cell's on a patch where p_rgh fixes a value. It is the only fixture here
@@ -476,6 +479,27 @@ int main(int argc, char** argv)
                         differ, onSolves.size());
             check("...so the sweep counts brae is held to can tell minIter from its absence",
                   !onSolves.empty() && offSolves.size() == onSolves.size() && differ > 0);
+        }
+        else if (argc > 8 && profileName == "rhophiU")
+        {
+            // U ALONE naming rhoPhi acts on U's switch and moves OpenFOAM's own alpha only 2.6e-10 here, so
+            // the witness is U: MEASURED 5.08e-07 relative, against brae's 8.5e-12 from OpenFOAM with it
+            const FieldData<vector> offUfd = readField<vector>(std::string(argv[8]) + "/U");
+            std::vector<vector> offU;
+            if (offUfd.internalUniform) offU.assign(static_cast<std::size_t>(nC), offUfd.internalUniformValue);
+            else                        offU = offUfd.internalField;
+            scalar moved = 0;
+            for (label c = 0; c < nC && static_cast<std::size_t>(c) < offU.size(); ++c)
+            {
+                const vector d = offU[c] - ofU[c];
+                moved = std::fmax(moved, std::sqrt(d.x*d.x + d.y*d.y + d.z*d.z));
+            }
+            const scalar movedRel = moved/std::fmax(uRef, scalar(1e-30));
+            const scalar braeRel = uLinf/std::fmax(uRef, scalar(1e-30));
+            std::printf("  CONTROL: `%s` on U alone moves OpenFOAM's own U by %.4e relative; brae is %.4e "
+                        "from OpenFOAM with it\n", what, (double)movedRel, (double)braeRel);
+            check("...which is more than 1000x brae's distance from the oracle",
+                  movedRel > scalar(1000)*braeRel && movedRel > scalar(1e-8));
         }
         else if (argc > 8)
         {

@@ -990,7 +990,9 @@ if [ $HAVE_GPU = 1 ]; then
     # pressureInletOutletVelocity switch runs ON the device and reads phi, so there the name is refused
     BASE="$B"
     arm device_flux_rhoPhi  runs    -                        "-device" "sed -i '/totalPressure/a\        phi             rhoPhi;' 0/p_rgh"
-    arm device_Uflux_rhoPhi refused "names the flux"          "-device" "sed -i '/pressureInletOutletVelocity/a\        phi             rhoPhi;' 0/U"
+    # ...and U naming rhoPhi RUNS on the device too: the host's rhoPhi is refreshed for U's patches as it
+    # is for p_rgh's and alpha's (tests/interfoam_dambreak_vs_openfoam.sh `rhophiU`, device U 8.5e-12)
+    arm device_Uflux_rhoPhi runs    -                        "-device" "sed -i '/pressureInletOutletVelocity/a\        phi             rhoPhi;' 0/U"
     arm host_Uflux_rhoPhi   runs    -                        "" "sed -i '/pressureInletOutletVelocity/a\        phi             rhoPhi;' 0/U"
     BASE="$BR"
     arm device_ras          runs    -                        "-device" true

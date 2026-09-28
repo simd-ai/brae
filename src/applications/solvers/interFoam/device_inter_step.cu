@@ -15,6 +15,18 @@
 namespace brae {
 namespace {
 
+// the flux U's switches read, face by face: rhoPhi where the patch names it, phi elsewhere
+__global__ void namedUFluxKernel(
+    const int*    __restrict__ isRhoPhi,
+    const scalar* __restrict__ rhoPhi,
+    const scalar* __restrict__ phi,
+    int                        n,
+    scalar*       __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = isRhoPhi[i] ? rhoPhi[i] : phi[i];
+}
+
 // A STAGE PROBE, off unless BRAE_INTER_STEP_CHECK is set. One whole step is a dozen operators and a
 // field that has gone non-finite at the first of them looks exactly like one that went at the last; a
 // gate downstream sees only the end. This names the first stage whose output is not finite, which is
@@ -259,13 +271,36 @@ void deviceInterStep(
     // iteration's cell velocity. The hook rebuilds dbU from the host patches, and buildDeviceVectorBoundary
     // seeds an inletOutlet as fixedValue at its inletValue on EVERY face (device_boundary.cuh, category 3),
     // so without this the patch is a wall at the inlet value for the whole run.
-    deviceUpdateInletOutlet(dbU, phiBnd);
+    // ...THE FLUX EACH PATCH NAMES, not phi: see DeviceInterStepControls::uFluxIsRhoPhi. Built into its
+    // own buffer at each switch, because phi moves with every corrector and rhoPhi does not.
+    DeviceBuffer<scalar> uNamedFlux;
+    auto namedUFlux = [&](const DeviceBuffer<scalar>& phiB) -> const DeviceBuffer<scalar>&
+    {
+        if (!ctl.uFluxIsRhoPhi) return phiB;
+        const int n = static_cast<int>(phiB.size());
+        if (static_cast<int>(ctl.uFluxIsRhoPhi->size()) != n || static_cast<int>(rhoPhiBnd.size()) != n)
+            throw std::runtime_error(
+                "brae interFoam device step: a U patch names rhoPhi and the mask or the mass flux is not one "
+                "value per boundary face.");
+        uNamedFlux.resize(static_cast<std::size_t>(n));
+        if (n > 0)
+        {
+            namedUFluxKernel<<<(n + 255)/256, 256>>>(ctl.uFluxIsRhoPhi->data(), rhoPhiBnd.data(), phiB.data(),
+                                                     n, uNamedFlux.data());
+            const cudaError_t e = cudaGetLastError();
+            if (e != cudaSuccess)
+                throw std::runtime_error(std::string("brae interFoam device step: the named U flux: ")
+                                         + cudaGetErrorString(e));
+        }
+        return uNamedFlux;
+    };
+    deviceUpdateInletOutlet(dbU, namedUFlux(phiBnd));
     // ...and the flux that switch read, kept for the first corrector of a pass with no predictor: the
     // patch is still updated() there and its evaluate keeps THIS valueFraction (the corrector loop
     // below has the rule and the measurement).
     DeviceBuffer<scalar> phiBndAtUpdateCoeffs;
-    deviceCopy(phiBndAtUpdateCoeffs, phiBnd);
-    deviceUpdatePressureInletOutletVelocity(dbU, phiBnd, UX, UY, UZ, /*directionMixed=*/true);
+    deviceCopy(phiBndAtUpdateCoeffs, namedUFlux(phiBnd));
+    deviceUpdatePressureInletOutletVelocity(dbU, namedUFlux(phiBnd), UX, UY, UZ, /*directionMixed=*/true);
     // ...and symmetry's, which is the same sequence's third step (rhoUEqn.cuh:76-78): a symmetry or slip
     // patch's refValue is U - n(n & U) at THIS iteration's cell velocity, and the builder seeded it from
     // the host field's last evaluate. MEASURED on RAS/angledDuct, whose `porosityWall` is a slip patch
@@ -470,8 +505,8 @@ void deviceInterStep(
         }
         // the predictor's solve ends in U.correctBoundaryConditions(), which clears updated()
         hooks.updateUBoundary(UX, UY, UZ, dbU, ub, DeviceUBoundaryCall::evaluate);
-        deviceUpdateInletOutlet(dbU, phiBnd);
-        deviceUpdatePressureInletOutletVelocity(dbU, phiBnd, UX, UY, UZ, /*directionMixed=*/true);
+        deviceUpdateInletOutlet(dbU, namedUFlux(phiBnd));
+        deviceUpdatePressureInletOutletVelocity(dbU, namedUFlux(phiBnd), UX, UY, UZ, /*directionMixed=*/true);
         deviceUpdateSymmetry(dbU, UX, UY, UZ);
         deviceUpdateWedge(dbU, UX, UY, UZ);
         (void)A;
@@ -713,8 +748,8 @@ void deviceInterStep(
         // device kOmegaSST closure reads U's outlet through dbU for its grad(U) (device_komega_sst.cu),
         // where OpenFOAM's tgradU reads the stored, lagged value. pressureInletOutletVelocity is
         // exempt, as on the host: its updateCoeffs ends in evaluate() and clears the flag.
-        deviceUpdateInletOutlet(dbU, stillUpdated ? phiBndAtUpdateCoeffs : phiBnd);
-        deviceUpdatePressureInletOutletVelocity(dbU, phiBnd, UX, UY, UZ, /*directionMixed=*/true);
+        deviceUpdateInletOutlet(dbU, stillUpdated ? phiBndAtUpdateCoeffs : namedUFlux(phiBnd));
+        deviceUpdatePressureInletOutletVelocity(dbU, namedUFlux(phiBnd), UX, UY, UZ, /*directionMixed=*/true);
         deviceUpdateSymmetry(dbU, UX, UY, UZ);
         deviceUpdateWedge(dbU, UX, UY, UZ);
     }

@@ -74,8 +74,14 @@
 # flux up BY NAME, three shipped tutorials name rhoPhi on a totalPressure top, and brae's reader kept
 # no `phi` entry at all (tests/interfoam_waves_vs_openfoam.sh found it, on the two solitary-wave cases
 # that write it). Those cases put the name on p_rgh only; this profile puts it on all three, so the
-# velocity's and alpha's switches are held against OpenFOAM too. The DEVICE runs U's switch itself and
-# reads phi there, so it REFUSES this profile, and the test asserts the refusal.
+# velocity's and alpha's switches are held against OpenFOAM too. THE DEVICE RUNS IT: alpha 9.1e-14, p_rgh
+# 5.1e-14, U 8.5e-12 from OpenFOAM, where it used to refuse it.
+# AND `rhophiU`: U's atmosphere ALONE names rhoPhi, the device's old refusal. OpenFOAM's own U moves 5.08e-07
+# with the entry (alpha only 2.6e-10, so the control is taken on U). Device alpha 5.6e-14, p_rgh 3.1e-14,
+# U 8.5e-12. BROKEN ONCE: the device refreshing the host's rhoPhi only for p_rgh's and alpha's conditions,
+# as it did -- so U's host-evaluated switch read the run's starting mass flux -- reads U 4.8e-05. NOT
+# DISCRIMINATED by either profile: the device's OWN U switches reading the named flux (uFluxIsRhoPhi);
+# withheld, both profiles are bitwise unchanged, for the reason device_inter_step.cuh gives.
 # AND TWO MOMENTUM SCHEMES the tutorial does not name, `vanleerv` and `linear`, each on div(rhoPhi,U)
 # at the big step with the big-step run as the control: `Gauss vanLeerV`, the V-limited vanLeer every
 # closed-tank tutorial names (one limiter per face from the vector difference, vanLeer's unclamped
@@ -175,6 +181,15 @@ run_at()
         sed -i 's/inletValue *uniform 0;/inletValue      uniform 1;/' "$C/0/alpha.water"
         grep -q "inletValue *uniform 1;" "$C/0/alpha.water" \
             || { echo "FAIL: the inflow fixture's inletValue was not rewritten"; return 1; }
+    fi
+    # `rhophiU`: U's atmosphere ALONE names rhoPhi -- tests/interfoam_refusals.sh's device_Uflux_rhoPhi
+    # case. With p_rgh or alpha naming it too the device refreshed the host's rhoPhi for them and U rode
+    # along; with U alone it did not, and the host-evaluated U read the run's starting mass flux.
+    if [ "$profile" = rhophiU ]; then
+        sed -i '/^ *atmosphere/,/}/ s/^\( *\)type\( .*\)$/\1type\2\n\1phi             rhoPhi;/' "$C/0/U"
+        grep -q "phi  *rhoPhi;" "$C/0/U" || { echo "FAIL: U's atmosphere was not given phi rhoPhi"; return 1; }
+        ! grep -q "phi  *rhoPhi;" "$C/0/p_rgh" "$C/0/alpha.water" \
+            || { echo "FAIL: rhophiU named rhoPhi on more than U"; return 1; }
     fi
     if [ "$profile" = rhophi ]; then
         for fld in U p_rgh alpha.water; do
@@ -385,7 +400,7 @@ PYEOF
     # ...and the sub-cycled one reads the un-sub-cycled one: the sub-cycle count has to be live too
     [ "$profile" = prevcorrsub ] && std="$W/prevcorr/$end"
     # ...and the three PIMPLE profiles read the big-step run without their setting
-    case "$profile" in nouter|nonorth|mompred|rhophi|vanleerv|linear|compression|alphaminiter) std="$W/bigstep/$end" ;; esac
+    case "$profile" in nouter|nonorth|mompred|rhophi|rhophiU|vanleerv|linear|compression|alphaminiter) std="$W/bigstep/$end" ;; esac
     # ...and the momentum minIter reads the SAME case with the predictor on and no minIter: the
     # only difference is the iteration floor, so any gap between them is the floor's
     [ "$profile" = momminiter ] && std="$W/mompred/$end"
@@ -479,6 +494,7 @@ run_at "$DT_BIG" nouter || rc=1
 run_at "$DT_BIG" nonorth || rc=1
 run_at "$DT_BIG" mompred || rc=1
 run_at "$DT_BIG" rhophi || rc=1
+run_at "$DT_BIG" rhophiU || rc=1
 run_at "$DT_BIG" vanleerv || rc=1
 run_at "$DT_BIG" linear || rc=1
 run_at "$DT_BIG" compression || rc=1

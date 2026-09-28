@@ -355,6 +355,20 @@ struct DeviceInterStepControls
     // assignable() is NOT fixesValue(): slip and inletOutlet are non-assignable without fixing one,
     // and damBreak's atmosphere is pressureInletOutletVelocity.
     const DeviceBuffer<int>*  takeUAtBoundary = nullptr;
+    // THE FLUX U's SWITCHES READ, per boundary face: 1 where U's patch names `phi rhoPhi`. OpenFOAM's
+    // inletOutlet and pressureInletOutletVelocity LOOK UP the field their `phi` entry names at every
+    // updateCoeffs (lookupPatchField<surfaceScalarField>(phiName_)), and rhoPhi is written by the alpha
+    // step alone -- so every U evaluate of a step reads the alpha step's mass flux while phi moves with
+    // each corrector. MEASURED on laminar/damBreak with the atmosphere naming rhoPhi: at step one's three
+    // correctors the two disagree in SIGN on 46, 46 and 19 of the 46 atmosphere faces (rhoPhi is zero at
+    // rest, phi is inflow). Null = no U patch names rhoPhi, and every switch reads phi as before.
+    // NOT DISCRIMINATED by the damBreak gate: the one switch whose result reaches the fields there is the
+    // assembly's, where rhoPhi and phi agree in sign (both the alpha step's flux), and the corrector-site
+    // switches that disagree are re-switched at the next assembly before anything reads them -- withholding
+    // this mask leaves `rhophi` and `rhophiU` bitwise unchanged. It is here because OpenFOAM reads the named
+    // flux at every one of those updateCoeffs, and a momentum predictor or a U-reading closure between the
+    // correctors would read the difference.
+    const DeviceBuffer<int>*  uFluxIsRhoPhi = nullptr;
 };
 
 // Every field is in and out: this is a time step, and the next one starts from what this leaves.
