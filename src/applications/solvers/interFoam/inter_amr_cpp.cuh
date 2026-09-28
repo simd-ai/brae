@@ -32,7 +32,11 @@
 //               is per PATCH, and the patch count cannot change (checked where the patches are assigned)
 //   REFUSED     the turbulence fields, the wave models, the MRF zones, the fvOptions cell sets, the
 //               CrankNicolson ddt0 levels (both the solver's and the closure's), a pressure-reference
-//               CELL INDEX, and a motion solver beside the refinement
+//               CELL INDEX, and a motion solver beside the refinement on a 2-D mesh (twoDCorrectPoints) or
+//               under CrankNicolson or moveMeshOuterCorrectors. A 3-D solidBody motion of the whole mesh
+//               RUNS: its points0 is carried (RefineUpdateState::points0), its V0 is the change's
+//               (DynamicMotionSolverFvMesh::topoChanged), and the move follows the change
+//               (tests/interfoam_amr_motion_vs_openfoam.sh, laminar/oscillatingBox)
 //
 // UF AND rAU ARE NOT MOVING-MESH EXTRAS HERE, and that was measured rather than assumed: `correctPhi`
 // defaults to mesh.dynamic() and a REFINING mesh is dynamic, so OpenFOAM's own run of
@@ -70,7 +74,7 @@ struct InterAmr
 };
 
 // Does the case ask for an adaptive mesh at all? ONE function, asked by everything that needs to know --
-// buildInterFields (to keep the case away from the MOTION factory), the host loop (to build the state) and
+// buildInterFields (to build its motion with the LIST factory), the host loop (to build the state) and
 // the DEVICE loop (to refuse it). Three inline dictionary reads would be three chances to disagree.
 bool caseAsksForAdaptiveMesh(const std::string& caseDir);
 
@@ -173,7 +177,14 @@ void interAfterMeshChange(
     // interval (wallDist.C:198). REQUIRED rather than defaulted or stashed on the AMR state -- a stashed
     // index is right only while every caller runs interAmrUpdate immediately before this, and that is the
     // kind of invariant this port keeps finding broken.
-    label                     timeIndex);
+    label                     timeIndex,
+    // THE MESH ALSO MOVES THIS STEP, right after the change (dynamicRefineFvMesh::update: topology first,
+    // motion second). interFoam.C:112-148 is ONE block after mesh.update(): gh/ghf, MRF, and under
+    // correctPhi `phi = Sf & Uf`, CorrectPhi, makeRelative and mixture.correct() -- all on the MOVED mesh.
+    // The motion's own block (interMeshUpdate) runs that, with the mesh flux, so here only the
+    // topology-only rebuild runs: a CorrectPhi here as well would solve pcorr twice, the first time
+    // without the mesh flux, and a curvature pass here would be one OpenFOAM does not take.
+    bool                      motionFollows);
 
 } // namespace interFoam
 } // namespace cpu

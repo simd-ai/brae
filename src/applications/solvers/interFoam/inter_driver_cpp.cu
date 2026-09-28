@@ -337,35 +337,44 @@ void interMeshUpdate(
     // interFoam.C:136-146 under `correctPhi`: the ABSOLUTE flux rebuilt from the face
     // velocity on the moved mesh, CorrectPhi against it with the last corrector's rAU,
     // the result made relative, and the mixture corrected on the new geometry --
-    // which moves nHatf, and nHatf is what the alpha step compresses along
+    // which moves nHatf, and nHatf is what the alpha step compresses along.
+    // THE AMR GATE'S "mapped flux left alone" CONTROL reaches here on a mesh that refines AND moves,
+    // because on that mesh this block is the only one after a change (interAfterMeshChange's own is
+    // skipped, see its motionFollows): no Sf & Uf rebuild, no pcorr and no makeRelative, the mapped flux
+    // kept. The mixture and the curvature below still run -- the adapter carries neither through a change.
+    const bool amrNoCorrectPhi = f.amr && f.amr->active
+                              && std::getenv("BRAE_CONTROL_AMR_NO_CORRECTPHI") != nullptr;
     if (f.correctPhi)
     {
-        // phi = mesh.Sf() & Uf()
-        for (label face = 0; face < m.nInternalFaces(); ++face)
+        if (!amrNoCorrectPhi)
         {
-            f.phi.internal[face] = dot(g.Sf()[face], f.Uf.internal[face]);
-        }
-        for (std::size_t pi = 0; pi < patches.size(); ++pi)
-        {
-            const FvPatch& q = patches[pi];
-            if (q.type == "empty") continue;
-            for (label i = 0; i < q.size; ++i)
+            // phi = mesh.Sf() & Uf()
+            for (label face = 0; face < m.nInternalFaces(); ++face)
             {
-                f.phi.boundary[pi][i] = dot(g.Sf()[q.start + i], f.Uf.boundary[pi][i]);
+                f.phi.internal[face] = dot(g.Sf()[face], f.Uf.internal[face]);
             }
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                const FvPatch& q = patches[pi];
+                if (q.type == "empty") continue;
+                for (label i = 0; i < q.size; ++i)
+                {
+                    f.phi.boundary[pi][i] = dot(g.Sf()[q.start + i], f.Uf.boundary[pi][i]);
+                }
+            }
+            // correctPhi.H: CorrectPhi(U, phi, p_rgh, interpolate(rAU), 0, pimple)
+            const SurfaceScalarField rAUf = fvc::interpolate(f.rAU, m, g, patches);
+            CorrectPhiInput cin;
+            cin.rAUf = &rAUf;
+            cin.meshChanging = true;
+            cin.meshPhi = &meshPhiU;
+            cin.rhoPhi = &f.rhoPhi;
+            cin.solveLog = &rep.pcorrSolves;
+            correctPhi(f.U, f.phi, f.p_rgh, cin, cpc, m, g, patches);
+            // fvc::makeRelative(phi, U)
+            makeRelativeFlux(f.phi, meshPhiU);
+            pushFluxToPatches(f, patches);
         }
-        // correctPhi.H: CorrectPhi(U, phi, p_rgh, interpolate(rAU), 0, pimple)
-        const SurfaceScalarField rAUf = fvc::interpolate(f.rAU, m, g, patches);
-        CorrectPhiInput cin;
-        cin.rAUf = &rAUf;
-        cin.meshChanging = true;
-        cin.meshPhi = &meshPhiU;
-        cin.rhoPhi = &f.rhoPhi;
-        cin.solveLog = &rep.pcorrSolves;
-        correctPhi(f.U, f.phi, f.p_rgh, cin, cpc, m, g, patches);
-        // fvc::makeRelative(phi, U)
-        makeRelativeFlux(f.phi, meshPhiU);
-        pushFluxToPatches(f, patches);
         // mixture.correct(): calcNu, whose values alpha has not moved, then
         // interfaceProperties::correct() on the moved mesh
         cpu::twoPhase::mixtureMu(f.alpha1.internal, f.mixture.phases, f.mu);
@@ -769,10 +778,18 @@ RunReport runInterFoam(
                 case Stage::meshUpdate:
                 {
                     ++outerOfStep;
+                    // A MESH THAT REFINES AND MOVES (laminar/oscillatingBox): dynamicRefineFvMesh::update
+                    // changes the topology FIRST and moves the points AFTER (dynamicRefineFvMesh.C:1468-1474),
+                    // and interFoam.C:112-148 then runs one block on the moved mesh. So the move waits for
+                    // the change here; a mesh that only moves, or only refines, is unchanged.
+                    const bool refineAndMove = dyn && f.amr && f.amr->active;
                     // interFoam.C:112-149, one copy shared with the device loop: see interMeshUpdate.
-                    interMeshUpdate(dyn, f, m, g, patches, mutableMesh, amiPairs, gamgCache, cpc,
-                                    rep, rep.time, rep.steps, outerOfStep, lc.nOuterCorrectors,
-                                    cnDdt ? &cnClock : nullptr);
+                    if (!refineAndMove)
+                    {
+                        interMeshUpdate(dyn, f, m, g, patches, mutableMesh, amiPairs, gamgCache, cpc,
+                                        rep, rep.time, rep.steps, outerOfStep, lc.nOuterCorrectors,
+                                        cnDdt ? &cnClock : nullptr);
+                    }
                     // ...and the ADAPTIVE mesh, which is the same line of interFoam.C for a different
                     // dynamicFvMesh: mesh.update() selects, refines, unrefines and maps, and everything
                     // the solver rebuilds afterwards is what `changed` gates. Only on the FIRST outer
@@ -784,6 +801,16 @@ RunReport runInterFoam(
                     if (f.amr && f.amr->active
                      && (outerOfStep == 0 || f.moveMeshOuterCorrectors))
                     {
+                        if (refineAndMove)
+                        {
+                            // hexRef8 lays its new points out on the LIVE mesh (hexRef8.C:3362, :3462,
+                            // :3650); the adapter's copy was last written at the previous change, so it is
+                            // given the points the motion has moved it to since. Without this the change
+                            // would hand the mesh back at its old position.
+                            f.amr->state.m.movePoints(mutableMesh->m->points());
+                            // ...and the motion's points0, which each change maps (RefineUpdateState::points0)
+                            f.amr->state.points0 = &dyn->points0Ref();
+                        }
                         // the old-time levels the ddt terms read, which OpenFOAM maps as registered
                         // fields and brae keeps as locals of this loop -- see InterAmrOldTime
                         InterAmrOldTime oldT;
@@ -841,7 +868,14 @@ RunReport runInterFoam(
                             // Empty is how alphaEqnStep is told there is none (alpha_eqn_cpp.cu:552).
                             prevCorr.internal.clear();
                             prevCorr.boundary.clear();
-                            interAfterMeshChange(f, *mutableMesh, gamgCache, cpc, rep, rep.steps);
+                            // fvMesh::updateMesh as the motion sees it: the change's V0, the mesh flux
+                            // recreated on the new faces (see DynamicMotionSolverFvMesh::topoChanged)
+                            if (refineAndMove)
+                            {
+                                dyn->topoChanged(f.amr->state.V0, rep.steps);
+                            }
+                            interAfterMeshChange(f, *mutableMesh, gamgCache, cpc, rep, rep.steps,
+                                                 refineAndMove);
                         }
                         // OpenFOAM prints "Refined from N to M cells." at every change; this is the same
                         // line, and a run that silently refines nothing is what it exists to show.
@@ -851,6 +885,15 @@ RunReport runInterFoam(
                                         "now %d cells\n", (int)f.amr->nRefined, (int)f.amr->nUnrefined,
                                         (int)mutableMesh->m->nCells());
                         }
+                    }
+                    // ...and THEN the move, with the block interFoam.C:112-148 runs after mesh.update():
+                    // the moving walls, gh/ghf, `phi = Sf & Uf`, CorrectPhi with the mesh flux,
+                    // makeRelative and the mixture -- once, on the moved mesh
+                    if (refineAndMove)
+                    {
+                        interMeshUpdate(dyn, f, m, g, patches, mutableMesh, amiPairs, gamgCache, cpc,
+                                        rep, rep.time, rep.steps, outerOfStep, lc.nOuterCorrectors,
+                                        cnDdt ? &cnClock : nullptr);
                     }
                     break;
                 }

@@ -247,11 +247,12 @@ arm mesh_static             runs    -                        "" "printf '%s\ndyn
 # sub-dictionary in it, with `mandatory` false so ZERO of them is legal (dynamicRefineFvMesh.C:1106), and
 # update() refines FIRST and then moves (:1468-1474).
 #
-# brae carries the topology change and NOT the motion, and the refusal that named this case tested
-# `f.dynamicMesh` -- a pointer buildInterFields sets to null for every adaptive case, so it could never
-# fire. MEASURED on laminar/oscillatingBox before the fix, two steps of 5e-4: brae refined exactly as
-# OpenFOAM did (1,000 -> 2,400 -> 8,000 cells) and read max|U| 1.2e-04 m/s against OpenFOAM's 2.7330361.
-# 100% out, in silence, behind a refusal. The refusal now reads the DICTIONARY's own `solvers` entry.
+# brae carried the topology change and NOT the motion, behind a refusal that could never fire: MEASURED on
+# laminar/oscillatingBox, brae refined exactly as OpenFOAM did and read max|U| 1.2e-04 m/s where OpenFOAM
+# reads 2.2. BOTH RUN NOW, on a 3-D mesh: tests/interfoam_amr_motion_vs_openfoam.sh holds oscillatingBox to
+# OpenFOAM, its points and points0 bitwise. What is refused is a motion beside refinement on a 2-D mesh --
+# OpenFOAM corrects an added point back onto the mesh's planes (twoDCorrectPoints) and that is not ported --
+# and this gate's base IS 2-D, so the motion arms below hold that refusal by its own words.
 #
 # THE OPPOSITE ARMS ARE THE POINT. This gate's base is laminar/damBreak, which is 2-D, and a 2-D adaptive
 # case RUNS: its mapper is gated exactly by the third arm of tests/refine_update_vs_openfoam.sh, which is
@@ -262,7 +263,7 @@ arm mesh_static             runs    -                        "" "printf '%s\ndyn
 REFDICT="printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\nrefineInterval 1;\nfield alpha.water;\nlowerRefineLevel 0.001;\nupperRefineLevel 0.999;\nunrefineLevel 10;\nnBufferLayers 1;\nmaxRefinement 1;\nmaxCells 100000;\ncorrectFluxes ((phi none) (rhoPhi none) (nHatf none));\ndumpLevel true;\n%s\n' '\$HDR'"
 arm mesh_refine_only        runs    -                        "" "$REFDICT '' > constant/dynamicMeshDict"
 arm mesh_refine_emptySolvers runs   -                        "" "$REFDICT 'solvers { }' > constant/dynamicMeshDict"
-arm mesh_refine_motion      refused "motion solver"          "" "$REFDICT 'solvers { VF { motionSolverLibs (fvMotionSolvers); motionSolver solidBody; solidBodyMotionFunction oscillatingLinearMotion; amplitude (0.1 0 0); omega 6.283185307179586; } }' > constant/dynamicMeshDict"
+arm mesh_refine_motion      refused "a motion solver on a 2-D mesh" "" "$REFDICT 'solvers { VF { motionSolverLibs (fvMotionSolvers); motionSolver solidBody; solidBodyMotionFunction oscillatingLinearMotion; amplitude (0.1 0 0); omega 6.283185307179586; } }' > constant/dynamicMeshDict"
 
 # MRF
 # MRF IS PORTED on the host (tests/interfoam_mrf_vs_openfoam.sh holds laminar/mixerVessel2D to OpenFOAM).
@@ -921,12 +922,14 @@ if [ $HAVE_GPU = 1 ]; then
     # THE DEVICE ARM RUNS AN ADAPTIVE MESH NOW (tests/interfoam_amr_vs_openfoam.sh holds it to OpenFOAM
     # at the floating-point floor: alpha 2.2e-15, p_rgh 6.1e-15 relative, U 3.2e-13) -- on a 3-D case. This
     # gate's base is 2-D, so what the arms below show is that the refusals fire in the right ORDER on it:
-    # the missing mandatory entries first, then the empty patch, then the motion solver.
+    # the missing mandatory entries first, then the empty patch, then the motion solver -- on a 2-D base
+    # the shared twoDCorrectPoints refusal; the device's OWN refusal of a 3-D mesh that refines and moves is
+    # held by tests/interfoam_amr_motion_vs_openfoam.sh's device arm until the device loop composes the two.
     # ...and the bare dictionary on the DEVICE, which is OpenFOAM's own stop and not a device refusal:
     # this was `device_mesh_dynamic` in the ledger long after the device loop ran a refining mesh
     arm mesh_dynamicRefine_device refused "Entry 'correctFluxes' not found in dictionary" "-device" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
     arm device_refine_runs  runs    -                         "-device" "$REFDICT '' > constant/dynamicMeshDict"
-    arm device_refine_motion refused "motion solver"          "-device" "$REFDICT 'solvers { VF { motionSolverLibs (fvMotionSolvers); motionSolver solidBody; solidBodyMotionFunction oscillatingLinearMotion; amplitude (0.1 0 0); omega 6.283185307179586; } }' > constant/dynamicMeshDict"
+    arm device_refine_motion refused "a motion solver on a 2-D mesh" "-device" "$REFDICT 'solvers { VF { motionSolverLibs (fvMotionSolvers); motionSolver solidBody; solidBodyMotionFunction oscillatingLinearMotion; amplitude (0.1 0 0); omega 6.283185307179586; } }' > constant/dynamicMeshDict"
     # ...nor a non-orthogonal correction where it is not zero
     # the non-orthogonal correction runs on the device now (tests/interfoam_dambreak_vs_openfoam.sh
     # `sheared` holds it to OpenFOAM); `uncorrected` on a mesh that is not orthogonal is still refused

@@ -353,6 +353,15 @@ RunReport runInterFoamDevice(
     // restart directory and a coupled patch.
 
     DynamicMotionSolverFvMesh* dyn = f.dynamicMesh.get();
+    // A MESH THAT REFINES AND MOVES (laminar/oscillatingBox) runs on the HOST arm: the change first, then
+    // the move, points0 carried through the change (inter_driver_cpp.cu's meshUpdate stage). This loop's
+    // two branches -- the topology re-upload and the motion refresh -- are an if/else-if, so it would take
+    // the motion and never refine. Refused by name until they are composed in OpenFOAM's order.
+    if (dyn && f.amr && f.amr->active)
+        throw std::runtime_error(
+            "brae interFoam (device): the mesh refines AND a motion solver moves it. The host arm runs it "
+            "(the change, then the move); this loop's topology and motion branches are not yet composed in "
+            "that order. Run without -device.");
     // A cyclicACMI PAIR WHOSE `scale` MOVES WITH TIME is rescaled at every step, in place, on the
     // caller's mutable objects -- the host loop's guards, transcribed (inter_driver_cpp.cu:256-302),
     // because the rescale point this loop carries is the one that loop gates and no other.
@@ -2554,7 +2563,8 @@ RunReport runInterFoamDevice(
                     // the solver's own rebuild, interFoam.C:118-142: gh and ghf, the flux from Sf & Uf
                     // and its pcorr solve, the mixture and the curvature. One copy, shared with the
                     // host loop, and the GAMG hierarchy un-built inside it.
-                    interAfterMeshChange(f, *mutableMesh, meshAgglomeration, meshCpc, rep, stepIndex);
+                    interAfterMeshChange(f, *mutableMesh, meshAgglomeration, meshCpc, rep, stepIndex,
+                                         /*motionFollows=*/false);
 
                     // ---- the counts every array below is sized by
                     nC = m.nCells();

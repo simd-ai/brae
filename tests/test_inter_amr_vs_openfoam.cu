@@ -35,6 +35,7 @@
 #include <exception>
 #include <fstream>
 #include <iterator>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -114,7 +115,9 @@ std::vector<label> readOfRefinedTo(const std::string& logPath)
     const std::string kTo = " to ";
     while (std::getline(in, line))
     {
-        if (line.rfind("Refined from ", 0) != 0) continue;
+        // ...and "Unrefined from N to M cells." (dynamicRefineFvMesh.C:587), because the last change
+        // of a run can be an unrefinement and the mesh then ends on ITS count
+        if (line.rfind("Refined from ", 0) != 0 && line.rfind("Unrefined from ", 0) != 0) continue;
         const std::size_t a = line.find(kTo);
         if (a == std::string::npos) continue;
         out.push_back(static_cast<label>(std::atol(line.c_str() + a + kTo.size())));
@@ -242,6 +245,57 @@ ContErr continuityErrs(
     e.sumLocal = deltaT*e.sumLocal/sumV;
     e.global = deltaT*e.global/sumV;
     return e;
+}
+
+// A polyMesh point list -- `points` or points0MotionSolver's `points0`, which share the format -- as
+// OpenFOAM wrote it, at full precision
+std::vector<vector> readPointsFile(const std::string& path)
+{
+    std::ifstream in(path);
+    std::stringstream buffer;
+    buffer << in.rdbuf();
+    const std::string text = buffer.str();
+    static const std::regex head(R"(\n\s*([0-9]+)\s*\n?\()");
+    std::smatch mh;
+    std::vector<vector> out;
+    if (!std::regex_search(text, mh, head)) return out;
+    const std::size_t n = static_cast<std::size_t>(std::atol(mh[1].str().c_str()));
+    const char* p = text.c_str() + mh.position(0) + mh.length(0);
+    out.reserve(n);
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        while (*p && *p != '(')
+        {
+            ++p;
+        }
+        if (!*p) break;
+        ++p;
+        char* end = nullptr;
+        vector v;
+        v.x = std::strtod(p, &end);
+        p = end;
+        v.y = std::strtod(p, &end);
+        p = end;
+        v.z = std::strtod(p, &end);
+        p = end;
+        out.push_back(v);
+    }
+    return out;
+}
+
+// the largest |a - b| over two point lists, or -1 when their lengths differ
+scalar worstPointGap(
+    const std::vector<vector>& a,
+    const std::vector<vector>& b)
+{
+    if (a.size() != b.size()) return scalar(-1);
+    scalar w = 0;
+    for (std::size_t i = 0; i < a.size(); ++i)
+    {
+        w = std::fmax(w, std::fmax(std::fabs(a[i].x - b[i].x),
+                                   std::fmax(std::fabs(a[i].y - b[i].y), std::fabs(a[i].z - b[i].z))));
+    }
+    return w;
 }
 
 // One arm: the whole run on a mesh of its own, so a control does not inherit the mesh the last arm
@@ -401,6 +455,15 @@ int main(
     const bool levelsProfile = (profile == "levels" || profile == "levelsBinary" || restartProfile
                              || instanceProfile);
     const bool levelsBinary = (profile == "levelsBinary");
+    // `box` is laminar/oscillatingBox AS SHIPPED at fixed steps: a mesh that REFINES AND MOVES in every
+    // step -- dynamicRefineFvMesh on alpha.water plus a solidBody oscillatingLinearMotion of the whole mesh
+    // (tests/interfoam_amr_motion_vs_openfoam.sh). What it adds is the motion's own state through each
+    // change: points0 mapped by points0MotionSolver::updateMesh, V0 the change's, the mesh flux recreated
+    // and then swept by the move that follows the change.
+    // `boxUnrefine` is the same staging run to sixty steps, where OpenFOAM UNREFINES (9540 -> 9400 cells at
+    // step 57): points0 through point REMOVAL, the merged cells' V0, and the mapping of a boundary-only
+    // carry through merged faces -- which segfaulted until this unit (mapSurfaceField's interpolative branch).
+    const bool boxProfile = (profile == "box" || profile == "boxUnrefine");
     //   porosity 1.5190e-14 alpha, 1.2e-14 p_rgh, 3.1e-13 U, 7.5e-15 p, 1.5e-11 rAU, 2.2e-13 phi,
     //   2.3e-13 Uf, 2.5e-11 contErr -- three steps with an explicitPorositySource over a cellZone, whose
     //   re-selection is what this profile exists to measure; and its DEVICE arm: alpha 1.6986e-14 from
@@ -469,6 +532,17 @@ int main(
                  // The continuity floor is ABSOLUTE (1e-13): both codes end at 2.44e-15, where the relative
                  // difference is 9.5e-05 and measures their last digits.
                  1e-13, 1e-13, 1e-13, 1e-12, 1e-12, 1e-12, 1e-13, 0}
+        // MEASURED over twenty fixed steps with every solve pinned (1000 -> 8700 cells, the mesh moving at
+        // every step): alpha 6.9944e-15, p_rgh 1.2620e-14, U 4.7340e-14, p 1.4906e-14, rAU 8.4167e-13,
+        // phi 5.6936e-15, Uf 3.2490e-14, patch U 6.4190e-13, patch p_rgh 1.2620e-14; points, points0 and
+        // the mesh flux exactly OpenFOAM's; all 60 p_rgh and 21 pcorr solves at OpenFOAM's iteration counts
+        // from its initial residuals. The continuity floor is ABSOLUTE: both codes end at the cancellation
+        // floor (brae 1.10e-15, OpenFOAM 8.64e-16). The case does not amplify -- one ulp on one alpha cell
+        // moves OpenFOAM's own alpha 5.7e-15 by step 20 -- so these are round-off floors and need no twin.
+        // The device slots are the host's until the device arm runs the case (it refuses it by name).
+        : boxProfile
+        ? Bounds{1e-14, 5e-14, 1e-13, 5e-14, 5e-12, 5e-14, 1e-13, 1e-9, 1e-14, 5e-14, 1e-14, 5e-14,
+                 5e-14, 5e-14, 5e-12, 1e-14, 1e-13, 1e-13, 0, 0, 0, 0, 0, 0, 5e-14, 0}
         : mrf
         ? Bounds{1e-10, 5e-09, 1e-08, 5e-09, 5e-10, 1e-09, 1e-08, 0, 1e-10, 1e-09, 1e-10, 1e-09,
                  1e-08, 1e-08, 1e-12, 1e-15, 1e-08, 1e-08, 0, 0, 0, 0, 0, 0, 1e-14, 1}
@@ -541,10 +615,10 @@ int main(
     // ...and that the changes happened at the same steps, on the same counts
     {
         const std::vector<label> ofTo = readOfRefinedTo(logPath);
-        std::printf("  OpenFOAM refined %zu times, last to %ld cells\n", ofTo.size(),
+        std::printf("  OpenFOAM changed the mesh %zu times, last to %ld cells\n", ofTo.size(),
                     ofTo.empty() ? 0L : (long)ofTo.back());
         check("OpenFOAM's log shows a refinement at all (the fixture can witness one)", !ofTo.empty());
-        check("brae's last refinement ended on OpenFOAM's cell count",
+        check("brae's last change ended on OpenFOAM's cell count",
               !ofTo.empty() && ofTo.back() == nC);
     }
 
@@ -575,6 +649,35 @@ int main(
     std::printf("  p      %.4e (rel %.4e)   rAU   %.4e (rel %.4e)   phi %.4e (rel %.4e)   Uf %.4e (rel %.4e)\n",
                 (double)dP.linf, (double)dP.rel(), (double)dRAU.linf, (double)dRAU.rel(),
                 (double)dPhi.linf, (double)dPhi.rel(), (double)dUf.linf, (double)dUf.rel());
+
+    // ---- THE MOTION THROUGH THE CHANGES, on the box profile: the points, points0 and the mesh flux as
+    // OpenFOAM WROTE them into the last time directory (points0 is AUTO_WRITE at the time of the last
+    // change, points0MotionSolver.C:213-217; meshPhi by fvMesh::writeObject). points and points0 are held
+    // BITWISE: points = transform(points0) is exact arithmetic on the same inputs, and the added points'
+    // points0 differ from the unmoved lattice by at most an ulp (measured on OpenFOAM's own files: 4122 of
+    // 10255 at step two, by up to 4.4e-16), so only a bitwise arm can see that formula at all.
+    if (boxProfile)
+    {
+        const DynamicMotionSolverFvMesh* dm = A.f.dynamicMesh.get();
+        check("the refining mesh also MOVES: its motion was built as a list member",
+              dm != nullptr && dm->listForm());
+        if (dm)
+        {
+            const std::vector<vector> ofPts = readPointsFile(ofDir + "/polyMesh/points");
+            const std::vector<vector> ofPts0 = readPointsFile(ofDir + "/polyMesh/points0");
+            const scalar gPts = worstPointGap(A.m.points(), ofPts);
+            const scalar gPts0 = worstPointGap(dm->points0(), ofPts0);
+            const std::vector<scalar> ofMeshPhi = cellValues(readField<scalar>(ofDir + "/meshPhi"), nIF);
+            const Diff dMeshPhi = compare(dm->meshPhi().internal, ofMeshPhi);
+            std::printf("  motion: points %zu (OpenFOAM %zu) worst %.4e   points0 %zu (OpenFOAM %zu) worst %.4e   "
+                        "meshPhi %.4e (rel %.4e)\n",
+                        A.m.points().size(), ofPts.size(), (double)gPts, dm->points0().size(), ofPts0.size(),
+                        (double)gPts0, (double)dMeshPhi.linf, (double)dMeshPhi.rel());
+            check("the moved points are OpenFOAM's, to the bit", gPts == scalar(0));
+            check("...and so is points0, carried through every change", gPts0 == scalar(0));
+            check("the mesh flux is OpenFOAM's", dMeshPhi.rel() < B.phi);
+        }
+    }
 
     // THE BOUNDS ARE THE MEASURED AGREEMENT, each a little above what the run actually reads, and
     // interfoam_amr_vs_openfoam.sh records those numbers. They are floating-point floors and not
@@ -794,29 +897,49 @@ int main(
     {
         setenv("BRAE_CONTROL_AMR_RESIZE_NOT_MAP", "1", 1);
         Arm C;
-        runArm(C, caseDir, startDir, nSteps);
-        unsetenv("BRAE_CONTROL_AMR_RESIZE_NOT_MAP");
-        const Diff cA = compare(C.f.alpha1.internal, ofAlpha);
-        const Diff cU = compare(C.f.U.internal, ofU);
-        std::printf("  CONTROL (the cell fields resized, not mapped): alpha %.4e, U rel %.4e\n",
-                    (double)cA.linf, (double)cU.rel());
-        check("...the control ran every step", C.r.steps == nSteps);
-        if (motorBikeProfile)
+        // A DELIBERATELY WRONG RUN THAT CANNOT FINISH IS CAUGHT, not a harness crash: on boxUnrefine the
+        // resized state reaches an asymmetric p_rgh matrix by the time the mesh unrefines, which the GAMG
+        // port refuses by name
+        std::string controlThrew;
+        try
         {
-            // ON THIS FIXTURE ALPHA CANNOT WITNESS IT, which is measured and not assumed: the cells this
-            // case refines are deep in the air, where alpha is 0, so RESIZING a cell field zero-fills them
-            // with the value mapping would have given -- the control reads alpha 2.9724e-11 against the
-            // gate's 3.0414e-15, under the million. U is where it shows, at 3.2311e-02 against 2.2091e-13,
-            // eleven orders. The arm asserts on the field that can see it rather than on the field the
-            // other profiles use.
-            check("...and is caught on U: 3.2e-02 against the gate's 2.2e-13, where alpha cannot see it "
-                  "because this case refines into air",
-                  cU.rel() > scalar(1e6)*std::fmax(dU.rel(), scalar(1e-300)));
+            runArm(C, caseDir, startDir, nSteps);
+        }
+        catch (const std::exception& e)
+        {
+            controlThrew = e.what();
+        }
+        unsetenv("BRAE_CONTROL_AMR_RESIZE_NOT_MAP");
+        if (!controlThrew.empty())
+        {
+            std::printf("  CONTROL (the cell fields resized, not mapped): stopped -- %s\n",
+                        controlThrew.substr(0, 100).c_str());
+            check("...and is caught: the deliberately wrong run does not reach the end", true);
         }
         else
         {
-            check("...and is caught: its alpha is more than a million times further out than the gate's",
-                  cA.linf > scalar(1e6)*std::fmax(dAlpha.linf, scalar(1e-300)));
+            const Diff cA = compare(C.f.alpha1.internal, ofAlpha);
+            const Diff cU = compare(C.f.U.internal, ofU);
+            std::printf("  CONTROL (the cell fields resized, not mapped): alpha %.4e, U rel %.4e\n",
+                        (double)cA.linf, (double)cU.rel());
+            check("...the control ran every step", C.r.steps == nSteps);
+            if (motorBikeProfile)
+            {
+                // ON THIS FIXTURE ALPHA CANNOT WITNESS IT, which is measured and not assumed: the cells this
+                // case refines are deep in the air, where alpha is 0, so RESIZING a cell field zero-fills them
+                // with the value mapping would have given -- the control reads alpha 2.9724e-11 against the
+                // gate's 3.0414e-15, under the million. U is where it shows, at 3.2311e-02 against 2.2091e-13,
+                // eleven orders. The arm asserts on the field that can see it rather than on the field the
+                // other profiles use.
+                check("...and is caught on U: 3.2e-02 against the gate's 2.2e-13, where alpha cannot see it "
+                      "because this case refines into air",
+                      cU.rel() > scalar(1e6)*std::fmax(dU.rel(), scalar(1e-300)));
+            }
+            else
+            {
+                check("...and is caught: its alpha is more than a million times further out than the gate's",
+                      cA.linf > scalar(1e6)*std::fmax(dAlpha.linf, scalar(1e-300)));
+            }
         }
     }
     // ...AND THE ONE THAT CANNOT WITNESS, measured rather than assumed. At the top of a step every
@@ -1358,6 +1481,25 @@ int main(
     // integer maps -- so what this measures is the round trip: every mesh-sized buffer down to the
     // host, the change, and every one of them back up on a DeviceMesh rebuilt from scratch. A buffer
     // left at the old size, or a schedule cache replaying the old addressing, lands here.
+    // ...EXCEPT on the box profile, where the device loop REFUSES by name: its topology and motion
+    // branches are not yet composed in OpenFOAM's order, and a refusal nobody runs stops firing.
+    if (boxProfile)
+    {
+        std::string msg;
+        try
+        {
+            Arm D;
+            runArm(D, caseDir, startDir, nSteps, /*onDevice=*/true);
+        }
+        catch (const std::exception& e)
+        {
+            msg = e.what();
+        }
+        std::printf("  device: %s\n", msg.empty() ? "RAN" : msg.substr(0, 120).c_str());
+        check("the device refuses a mesh that refines and moves, by name",
+              msg.find("refines AND a motion solver") != std::string::npos);
+    }
+    else
     {
         Arm D;
         runArm(D, caseDir, startDir, nSteps, /*onDevice=*/true);

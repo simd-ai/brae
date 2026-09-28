@@ -846,7 +846,10 @@ InterFields buildInterFields(const std::string&          caseDir,
         // for. A driver without this branch still gets the refusal, which is what keeps the capability
         // honest: see the note on shared capability notices in the project's own history.
         const bool adaptive = caseAsksForAdaptiveMesh(caseDir);
-        f.dynamicMesh = adaptive ? nullptr : DynamicMotionSolverFvMesh::New(caseDir, startDir);
+        // ...and an adaptive mesh's OWN motion, when its `solvers` list names one: the refinement is
+        // InterAmr's below, the motion this object's, and the driver runs the change and then the move
+        f.dynamicMesh = adaptive ? DynamicMotionSolverFvMesh::NewForRefine(caseDir, startDir)
+                                 : DynamicMotionSolverFvMesh::New(caseDir, startDir);
         // ...AND THE ADAPTIVE MESH ITSELF, BUILT HERE AND NOWHERE ELSE. It used to be built by the HOST
         // driver, which is why the device arm ran an adaptive case with no InterAmr at all: its branch
         // asks `f.amr && f.amr->active`, and a null pointer answered no. MEASURED on

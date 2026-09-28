@@ -118,15 +118,32 @@ void refuseUnmappedState(const InterFields& f)
             std::string(WHO) + "the case has " + std::to_string(f.mrfZones.size()) + " MRF zone(s) but "
             + std::to_string(f.mrfSpecs.size()) + " kept spec(s). A change rebuilds each zone's face "
             "lists from its own spec (MRFZone::update, MRFZone.C:598-604) and cannot do it from none.");
-    // A SECOND LINE OF DEFENCE ONLY. buildInterFields sets f.dynamicMesh to null for every adaptive case
-    // (inter_case_cpp.cu), so this cannot fire on the case it names; the refusal that does is in
-    // readInterAmr, which reads the dictionary's own `solvers` entry. Kept because a future caller that
-    // builds an adaptive case WITH a motion solver object must still be stopped.
+    // REFINEMENT AND MOTION IN ONE STEP (laminar/oscillatingBox): points0 is carried through the change
+    // (RefineUpdateState::points0), V0 is the change's (DynamicMotionSolverFvMesh::topoChanged), and the
+    // move follows the change in OpenFOAM's order. What is NOT carried is refused by name:
     if (f.dynamicMesh)
-        throw std::runtime_error(
-            std::string(WHO) + "the case asks for a motion solver AND refinement. The mesh would both "
-            "move and change topology in one step, and brae carries neither Uf nor the mesh flux through "
-            "a topology change yet. laminar/oscillatingBox is the case that needs it.");
+    {
+        // the motion the list factory built -- anything else reaching here is a caller's error
+        if (!f.dynamicMesh->listForm())
+            throw std::runtime_error(
+                std::string(WHO) + "the refining mesh carries a motion that was not built as a "
+                "dynamicMotionSolverListFvMesh member (DynamicMotionSolverFvMesh::NewForRefine).");
+        //   * CrankNicolson: its moving branch reads V00 and the mesh flux's old-time level, and a change
+        //     maps the first (fvMesh.C:896-925) and DROPS the second (fvMesh.C:1056) -- neither is ported
+        if (f.ddtU == DdtScheme::CrankNicolson)
+            throw std::runtime_error(
+                std::string(WHO) + "the refining mesh also moves (a motion solver) under CrankNicolson. The "
+                "scheme's moving branch reads V00 and the mesh flux's old-time level; a topology change maps "
+                "the first and drops the second, and neither is carried here.");
+        //   * moveMeshOuterCorrectors: a second update in the same time index can refine AGAIN, with
+        //     storeOldVol and the oldPoints store both skipped and the mixed-time oldPoints of the first
+        //     change feeding the mesh flux (polyMeshUpdate.C:67-118)
+        if (f.moveMeshOuterCorrectors)
+            throw std::runtime_error(
+                std::string(WHO) + "the refining mesh also moves (a motion solver) with "
+                "moveMeshOuterCorrectors. A second mesh update in one time index can refine again against "
+                "the mixed-time old points the first change left, which is not carried here.");
+    }
     if (!f.correctPhi)
         throw std::runtime_error(
             std::string(WHO) + "the case sets correctPhi off. interFoam.C:130-142 puts mixture.correct() "
@@ -217,41 +234,33 @@ InterAmr readInterAmr(
     const FoamDict d = readDict(path);
     if (d.wordOr("dynamicFvMesh", "") != "dynamicRefineFvMesh") return amr;
 
-    // REFINEMENT AND MOTION ARE ONE CLASS IN v2412, and this is where that is refused -- not in
-    // refuseUnmappedState, which cannot see it. dynamicRefineFvMesh derives from
-    // dynamicMotionSolverListFvMesh (dynamicRefineFvMesh.H:56-58), whose init reads a `solvers`
+    // REFINEMENT AND MOTION ARE ONE CLASS IN v2412: dynamicRefineFvMesh derives from
+    // dynamicMotionSolverListFvMesh (dynamicRefineFvMesh.H:92-95), whose init reads a `solvers`
     // SUB-DICTIONARY and builds one motionSolver per sub-dictionary inside it
     // (dynamicMotionSolverListFvMesh.C:98-127), with `mandatory` false so zero of them is legal
-    // (dynamicRefineFvMesh.C:1106). update() then runs updateTopology() FIRST and the motion after it
-    // (dynamicRefineFvMesh.C:1468-1474).
+    // (dynamicRefineFvMesh.C:1107). update() runs updateTopology() FIRST and the motion after it
+    // (dynamicRefineFvMesh.C:1468-1474). The motion is built by DynamicMotionSolverFvMesh::NewForRefine and
+    // carried through each change; the driver runs the change and then the move.
     //
-    // WHY IT IS REFUSED HERE. refuseUnmappedState tests `f.dynamicMesh`, and buildInterFields sets that
-    // pointer to NULL for every adaptive case on purpose -- so the refusal for this very case could never
-    // fire. MEASURED on laminar/oscillatingBox, two steps of 5e-4: brae refined exactly as OpenFOAM did
-    // (1,000 -> 2,400 -> 8,000 cells, identical counts) and reported max|U| 1.2e-04 m/s where OpenFOAM
-    // reads 2.7330361190972860. The motion was dropped in silence, behind a refusal that named the case.
-    // That is the shape this project keeps finding: a refusal standing in front of a substitution, made
-    // unreachable by the very branch that enabled the feature.
+    // IT WAS REFUSED HERE, and before that it was DROPPED: MEASURED on laminar/oscillatingBox, brae refined
+    // exactly as OpenFOAM did and reported max|U| 1.2e-04 m/s where OpenFOAM reads 2.73 -- the motion lost
+    // in silence behind a refusal that could not fire. What is still refused here is a 2-D mesh:
+    // points0MotionSolver::updateMesh ends in twoDCorrectPoints (points0MotionSolver.C:209), which puts an
+    // added point back on the mesh's two planes, and it is not ported. oscillatingBox is 3-D.
     {
         const FoamDict* solvers = d.subDict("solvers");
-        std::size_t nMotion = 0;
-        std::string names;
-        if (solvers)
+        const bool moves = solvers && !solvers->subs.empty();
+        bool twoD = false;
+        for (const FvPatch& q : patches)
         {
-            for (const std::pair<std::string, FoamDict>& sub : solvers->subs)
-            {
-                ++nMotion;
-                names += (names.empty() ? "" : ", ") + sub.first;
-            }
+            twoD = twoD || q.type == "empty" || q.type == "wedge";
         }
-        if (nMotion > 0)
+        if (moves && twoD)
             throw std::runtime_error(
-                std::string(WHO) + "constant/dynamicMeshDict asks for refinement AND " +
-                std::to_string(nMotion) + " motion solver(s) (" + names + "): in OpenFOAM v2412 "
-                "dynamicRefineFvMesh IS a dynamicMotionSolverListFvMesh, and its update() moves the mesh "
-                "after it refines it. brae carries neither the moved points nor points0 nor the mesh flux "
-                "through a topology change, so it would refine correctly and never move -- which is what "
-                "it did on laminar/oscillatingBox, reading max|U| 1.2e-04 where OpenFOAM reads 2.73.");
+                std::string(WHO) + "constant/dynamicMeshDict asks for refinement AND a motion solver on a "
+                "2-D mesh. points0 is carried through each topology change, but OpenFOAM then corrects an "
+                "added point back onto the mesh's planes (twoDCorrectPoints, points0MotionSolver.C:209), "
+                "and that is not ported; a 3-D mesh runs (laminar/oscillatingBox).");
     }
 
     amr.active = true;
@@ -893,7 +902,8 @@ void interAfterMeshChange(
     GamgAgglomerationCache&   gamgCache,
     const CorrectPhiControls& cpc,
     RunReport&                rep,
-    label                     timeIndex)
+    label                     timeIndex,
+    bool                      motionFollows)
 {
     // the mesh's own sets, for the one selection mode that re-reads a file
     const std::string polyMeshDir = f.amr ? f.amr->polyMeshDir : std::string();
@@ -1071,7 +1081,7 @@ void interAfterMeshChange(
         std::printf("  *** CONTROL MODE: the flux is left as the mapper wrote it -- no Sf & Uf rebuild "
                     "and no pcorr solve. This run is deliberately wrong. ***\n");
     const AmrStageDump asd = openAmrStageDump();
-    if (f.correctPhi && !skipCorrectPhi)
+    if (f.correctPhi && !skipCorrectPhi && !motionFollows)
     {
         asd.vectors("UfIn", f.Uf.internal);
         if (f.Uf.internal.size() != static_cast<std::size_t>(m.nInternalFaces()))
@@ -1143,8 +1153,11 @@ void interAfterMeshChange(
             "its own p field.");
 
     // ...and the interface: nHatf and K are mapped, and then rebuilt on the new geometry, which is what
-    // mixture.correct() does last
-    interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, f.nHatf, f.K);
+    // mixture.correct() does last -- on the MOVED mesh, by the motion's block, when one follows
+    if (!motionFollows)
+    {
+        interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, f.nHatf, f.K);
+    }
     // ...and what it leaves for the pressure corrector, which is where the restart profile's difference
     // first appears: the surface tension force is interpolate(sigma*K)*snGrad(alpha1), so K, nHatf and the
     // alpha calculateK saw are the three inputs behind it.
