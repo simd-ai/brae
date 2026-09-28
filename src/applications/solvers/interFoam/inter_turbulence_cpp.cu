@@ -295,21 +295,24 @@ void requireSstWalls(
         const bool wall = (p.type == "wall");
         anyWall = anyWall || wall;
         const bool nutIsWallFn = nutType.rfind("nut", 0) == 0 || nutType.rfind("atmNut", 0) == 0;
-        if (nutIsWallFn && nutType != "nutkWallFunction")
+        // nutkRoughWallFunction is carried too (kOmegaSST_cpp.cu correctNutField dispatches on the patch's
+        // class, nut_wall_function.cu transcribes its calcNut); RAS/DTCHull names it on the hull
+        const bool nutCarried = (nutType == "nutkWallFunction" || nutType == "nutkRoughWallFunction");
+        if (nutIsWallFn && !nutCarried)
             throw std::runtime_error(
                 std::string(WHO) + "nut patch `" + p.name + "` carries `" + nutType + "`. The "
-                "kOmegaSST closure has nutkWallFunction; the rest of the family are different "
-                "functions of different inputs and are not substituted.");
+                "kOmegaSST closure has nutkWallFunction and nutkRoughWallFunction; the rest of the family "
+                "are different functions of different inputs and are not substituted.");
         if (nutIsWallFn && !wall)
             throw std::runtime_error(
                 std::string(WHO) + "nut patch `" + p.name + "` carries `" + nutType + "` and its patch "
                 "type is `" + p.type + "`. A nut wall function's patch must be a `wall`; OpenFOAM stops "
                 "on this at construction (nutWallFunction checkType).");
-        if (wall && (nutType != "nutkWallFunction" || omegaType != "omegaWallFunction"))
+        if (wall && (!nutCarried || omegaType != "omegaWallFunction"))
             throw std::runtime_error(
                 std::string(WHO) + "wall patch `" + p.name + "` carries nut `" + nutType + "` and omega `"
-                + omegaType + "`. The kOmegaSST closure evaluates nutkWallFunction and "
-                "omegaWallFunction on every `wall` patch; a wall without them would get values "
+                + omegaType + "`. The kOmegaSST closure evaluates nutkWallFunction (or nutkRoughWallFunction) "
+                "and omegaWallFunction on every `wall` patch; a wall without them would get values "
                 "OpenFOAM does not compute there.");
         if (!wall && omegaType == "omegaWallFunction")
             throw std::runtime_error(
@@ -338,6 +341,20 @@ void requireSstWalls(
             // `n` is STEPWISE's unused parameter -- OpenFOAM passes 4 and the switch never reads it --
             // so it is not checked on the nut entry.
             const bool isNut = (b == nb);
+            // nutkRoughWallFunction's constructor reads and VALIDATES `blending` through nutkWallFunction's
+            // (nutkWallFunctionFvPatchScalarField.C:216) and its calcNut never consults it: any of OpenFOAM's
+            // five words runs, an unknown one is OpenFOAM's FatalIOError (wallFunctionBlenders.C:40-46)
+            if (isNut && nutType == "nutkRoughWallFunction")
+            {
+                const std::string& w = b->wfBlending;
+                if (!w.empty() && w != "stepwise" && w != "max" && w != "binomial" && w != "exponential"
+                 && w != "tanh")
+                    throw std::runtime_error(
+                        std::string(WHO) + "nut patch `" + p.name + "` names `blending " + w + "`, which is not "
+                        "one of OpenFOAM's blenders (stepwise, max, binomial, exponential, tanh); OpenFOAM "
+                        "stops on it too.");
+                continue;
+            }
             const bool blendOther = !b->wfBlending.empty()
                                  && (isNut
                                      ? (b->wfBlending != "stepwise")
@@ -668,7 +685,9 @@ InterTurbulence readInterTurbulence(
         {
             if (patches[pi].type == "wall")
             {
-                t.nutWallKind[pi] = static_cast<int>(NutWall::Nutk);
+                // the kind the DEVICE closure reads; a rough wall is marked so that closure can refuse it
+                t.nutWallKind[pi] = t.nut.boundary[pi]->nutkRoughKs() ? static_cast<int>(NutWall::NutkRough)
+                                                                       : static_cast<int>(NutWall::Nutk);
             }
             for (const std::string* name : {&t.k.boundary[pi]->fluxName(), &t.omega.boundary[pi]->fluxName()})
             {

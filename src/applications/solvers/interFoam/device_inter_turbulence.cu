@@ -222,6 +222,14 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
             // kEqn case has no such patch (it refuses a `nut*` type under that model), so the list is
             // empty there and indexing it walked off the end.
             const int nwk = (pi < t.nutWallKind.size()) ? t.nutWallKind[pi] : -1;
+            // nutkRoughWallFunction carries HISTORY (a limiter against the previous wall nut) that the
+            // device wall kernels do not keep -- they recompute nutw from k (wallProductionG0, the
+            // wall-nut dispatch) -- so a rough wall is refused by name here rather than run as smooth
+            if (nwk == static_cast<int>(NutWall::NutkRough))
+                throw std::runtime_error(
+                    "brae interFoam (device): nut patch `" + patches[pi].name + "` is nutkRoughWallFunction. The "
+                    "host closure carries it; the device closure has no rough wall function. Run without "
+                    "-device.");
             kind.push_back(nwk >= 0 ? nwk : static_cast<int>(NutWall::Nutk));
             if (!isWF) continue;
             // A PATCH beta1 IS NOT PORTED HERE. omegaWallFunction reads its own `beta1` from the patch

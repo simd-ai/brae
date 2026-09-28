@@ -262,6 +262,10 @@ public:
     // from Spalding's law, and for SpalartAllmaras (nuTilda fixedValue 0 at a wall) the assignment would
     // otherwise leave the wall with NO eddy viscosity at all.
     virtual bool isNutUSpalding() const { return false; }
+    // Is this nut patch a nutkRoughWallFunction? Its per-face Ks and Cs when it is, null otherwise: the
+    // model's correctNut reads them, and the patch's own PREVIOUS value, to form the new wall nut.
+    virtual const std::vector<scalar>* nutkRoughKs() const { return nullptr; }
+    virtual const std::vector<scalar>* nutkRoughCs() const { return nullptr; }
     // The wall-function coefficients THIS patch carries (see WallFunctionCoeffs): set from the patch's
     // own dictionary by makePatchField, read by the model's wall treatment for the field it belongs to.
     const WallFunctionCoeffs& wallCoeffs() const { return wallCoeffs_; }
@@ -1903,6 +1907,43 @@ public:
     // inversion is recomputed from U and y at every correct(), nothing per-face is kept here.
     using CalculatedPatchField<T>::CalculatedPatchField;
     bool isNutUSpalding() const override { return true; }
+};
+
+// nutkRoughWallFunction: a wall nut the model writes (setValue) at every correctNut, like nutkWallFunction,
+// but one that CARRIES HISTORY -- calcNut limits the new value to [0.5, 2]*max(the previous value, nu_w)
+// (nutkRoughWallFunctionFvPatchScalarField.C:101-114), and the first call reads the case file's `value`.
+// So evaluate() keeps value_ rather than re-reading the file, as OpenFOAM's fixedValue-derived class does
+// (its evaluate changes no value; only updateCoeffs' operator== does): an evaluate between two correctNuts
+// must not reset the history. autoMap is NOT complete -- Ks, Cs and the history would need mapping, which
+// OpenFOAM does (.C:211-235) and nothing here does -- so a refining mesh refuses it by name.
+template <typename T>
+class NutkRoughPatchField : public CalculatedPatchField<T>
+{
+public:
+    NutkRoughPatchField(
+        const FvPatch& p,
+        bool uniform,
+        T uval,
+        std::vector<T> vals,
+        std::vector<scalar> Ks,
+        std::vector<scalar> Cs)
+        : CalculatedPatchField<T>(p, uniform, uval, std::move(vals)), Ks_(std::move(Ks)), Cs_(std::move(Cs))
+    {}
+    void evaluate(const std::vector<T>&) override {}
+    // the base setter writes the file list and then evaluate()s it into value_; with evaluate() keeping
+    // value_ that would store nothing, so the value is written here directly
+    void setStoredValues(std::vector<T> v) override
+    {
+        this->setRefValues(v);
+        this->value_ = std::move(v);
+    }
+    bool autoMapComplete() const override { return false; }
+    const std::vector<scalar>* nutkRoughKs() const override { return &Ks_; }
+    const std::vector<scalar>* nutkRoughCs() const override { return &Cs_; }
+
+private:
+    std::vector<scalar> Ks_;
+    std::vector<scalar> Cs_;
 };
 
 // mixed (Robin) BC, OF mixedFvPatchField (refGrad = 0). value = (1-vf)*internal + vf*refValue; the per-face
@@ -3956,6 +3997,45 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
     // faces at all -- no wall nut, so the wall shear and everything downstream of it were wrong.
     if (d.type == "omegaWallFunction")    return std::make_unique<EpsilonWallFunctionPatchField<T>>(p);
     if (d.type == "nutkWallFunction")     return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
+    // nutkRoughWallFunction: Ks, Cs and `value` are all MUST_READ (Field.C:271-305; fixedValueFvPatchField.H
+    // :105 via nutWallFunctionFvPatchScalarField.C:122), and `value` is load-bearing here -- it is the
+    // previous nut the first calcNut limits against. A zero-face patch reads no Ks or Cs (Field.C:280-283).
+    if (d.type == "nutkRoughWallFunction")
+    {
+        if constexpr (std::is_same<T, scalar>::value)
+        {
+            const std::string who = "brae: nutkRoughWallFunction on patch " + p.name + ": ";
+            if (!d.hasValue)
+                throw std::runtime_error(who + "Required entry 'value' : missing -- OpenFOAM requires it, and it "
+                                         "is the previous nut the first calcNut limits against.");
+            if (!d.roughFormError.empty())
+                throw std::runtime_error(who + "`" + d.roughFormError + "` -- Ks and Cs are scalarFields, "
+                                         "`uniform <v>` or `nonuniform List<scalar> N (...)`; OpenFOAM stops on "
+                                         "any other form (Field.C:213-268).");
+            const std::size_t n = static_cast<std::size_t>(p.size);
+            auto perFace = [&](bool has, bool uni, scalar uval, const std::vector<scalar>& vals, const char* key)
+            {
+                if (!has)
+                {
+                    if (n == 0) return std::vector<scalar>{};
+                    throw std::runtime_error(who + "Required entry '" + std::string(key) + "' : missing.");
+                }
+                if (uni) return std::vector<scalar>(n, uval);
+                if (vals.size() != n)
+                    throw std::runtime_error(who + "`" + std::string(key) + "` has " + std::to_string(vals.size())
+                                             + " values for " + std::to_string(n) + " faces.");
+                return vals;
+            };
+            return std::make_unique<NutkRoughPatchField<T>>(
+                p, d.valueUniform, d.uniformValue, d.values,
+                perFace(d.hasRoughKs, d.roughKsUniform, d.roughKsUniformValue, d.roughKsValues, "Ks"),
+                perFace(d.hasRoughCs, d.roughCsUniform, d.roughCsUniformValue, d.roughCsValues, "Cs"));
+        }
+        else
+        {
+            throw std::runtime_error("brae: nutkRoughWallFunction on patch " + p.name + " of a non-scalar field.");
+        }
+    }
     // alphatWallFunction: alphat_w = rho_w*nut_w/Prt, i.e. the SAME expression deviceAlphat applies in the
     // cells. Nothing is prescribed at the patch, so it is `calculated` exactly like the nut wall functions
     // -- the model writes the value. Without this row a real OF compressible case is refused at load,

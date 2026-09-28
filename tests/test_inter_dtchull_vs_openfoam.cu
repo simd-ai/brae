@@ -14,6 +14,7 @@
 #include "inter_driver_cpp.cuh"
 #include "inter_solve_log.cuh"
 #include "device_gate_finite.cuh"
+#include "patch_entry_lookup.cuh"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -71,6 +72,10 @@ constexpr scalar BOUND_OMEGA = 3e-11;
 constexpr scalar BOUND_NUT = 1e-10;
 constexpr scalar BOUND_U_LAMINAR = 3e-12;
 constexpr scalar BOUND_U_RAS = 5e-12;
+// ...and the hull's wall nut, face by face, under nutkRoughWallFunction: 6.2e-11 after ten steps (1.7e-12 at
+// the first), OpenFOAM's one-ulp floor 7.9e-12. Its controls -- the smooth wall function, the history
+// dropped -- read 1.0e+00 and 4.6e-01.
+constexpr scalar BOUND_NUT_WALL = 2e-10;
 
 struct Diff
 {
@@ -290,6 +295,37 @@ int main(
         bound("k, relative", dK.rel(), BOUND_K);
         bound("omega, relative", dO.rel(), BOUND_OMEGA);
         bound("nut, relative", dN.rel(), BOUND_NUT);
+        // THE WALL nut, face by face. nutkRoughWallFunction carries history -- a limiter against the patch's
+        // previous value -- so the patch is its own witness, and OpenFOAM writes it at every step
+        {
+            const FieldData<scalar> ofNut = readField<scalar>(last + "/nut");
+            scalar dWall = 0;
+            scalar wallMax = 0;
+            int nRoughOf = 0;
+            int nRoughBrae = 0;
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                if (patches[pi].type != "wall") continue;
+                const PatchFieldData<scalar>* b = findPatchEntry(ofNut.boundary, patches[pi]);
+                if (!b) continue;
+                nRoughOf += (b->type == "nutkRoughWallFunction") ? 1 : 0;
+                nRoughBrae += fin.turbulence.nut.boundary[pi]->nutkRoughKs() ? 1 : 0;
+                const std::size_t n = static_cast<std::size_t>(patches[pi].size);
+                const std::vector<scalar> ofv = b->valueUniform ? std::vector<scalar>(n, b->uniformValue) : b->values;
+                const std::vector<scalar>& bv = fin.turbulence.nut.boundary[pi]->value();
+                failures += brae::gatecheck::nonFinite(("brae wall nut on " + patches[pi].name).c_str(), bv);
+                for (std::size_t i = 0; i < n && i < ofv.size() && i < bv.size(); ++i)
+                {
+                    dWall = std::fmax(dWall, std::fabs(bv[i] - ofv[i]));
+                    wallMax = std::fmax(wallMax, std::fabs(ofv[i]));
+                }
+            }
+            std::printf("  wall nut: %d nutkRoughWallFunction patch(es) in OpenFOAM's file, %d in brae's\n",
+                        nRoughOf, nRoughBrae);
+            check("...brae built a rough wall wherever OpenFOAM has one", nRoughOf == nRoughBrae);
+            bound("wall nut, face by face, relative to its largest", dWall/std::fmax(wallMax, scalar(1e-300)),
+                  BOUND_NUT_WALL);
+        }
         const std::vector<LinearSolveRecord> ofO = brae::gatecheck::readOfSolves(logPath, "omega");
         const std::vector<LinearSolveRecord> ofK = brae::gatecheck::readOfSolves(logPath, "k");
         check("OpenFOAM's log gave the omega and k solves",

@@ -56,7 +56,8 @@ inline bool isNutWallFnType(const std::string& t)
 {
     return t == "nutkWallFunction"      || t == "nutUSpaldingWallFunction"
         || t == "nutLowReWallFunction"  || t == "nutUBlendedWallFunction"
-        || t == "nutUWallFunction"      || t == "atmNutkWallFunction";
+        || t == "nutUWallFunction"      || t == "atmNutkWallFunction"
+        || t == "nutkRoughWallFunction";
 }
 
 inline void selectNutWall(
@@ -81,6 +82,17 @@ inline void selectNutWall(
                 for (const FvPatch* q : resolved)
                     if (q->type == "wall") { onWall = true; break; }
                 if (!onWall) continue;
+                // nutkRoughWallFunction: the interFoam HOST kOmegaSST closure carries it (its calcNut limits
+                // against the PREVIOUS wall nut, nutkRoughWallFunctionFvPatchScalarField.C:101-114); these
+                // drivers' closures recompute the wall nut from k with no history, so it is refused by name
+                // rather than run as nutk -- which it silently was, once the factory stopped refusing the type
+                if (pb.type == "nutkRoughWallFunction")
+                {
+                    throw std::runtime_error(
+                        "brae: nut patch '" + pb.name + "' is nutkRoughWallFunction, which the " + modelName
+                        + " closure of this driver does not carry (the interFoam host kOmegaSST closure does). "
+                        "Refusing rather than run it as nutkWallFunction.");
+                }
                 if (pb.type == "nutUSpaldingWallFunction") { nutWall = NutWall::Spalding; }
                 else if (pb.type == "nutUBlendedWallFunction") { nutWall = NutWall::Blended; }
                 // nutUWallFunction: OF's default blender is STEPWISE (nutUWallFunctionFvPatchScalarField.C:259,
@@ -615,7 +627,8 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
         auto guardWallFn = [&](const FieldData<scalar>& fd, const std::string& field) {
             auto isWF = [](const std::string& t) {
                 return t == "nutkWallFunction" || t == "nutUSpaldingWallFunction" || t == "nutLowReWallFunction"
-                    || t == "nutUBlendedWallFunction" || t == "atmNutkWallFunction" || t == "epsilonWallFunction" || t == "omegaWallFunction";
+                    || t == "nutUBlendedWallFunction" || t == "atmNutkWallFunction" || t == "epsilonWallFunction" || t == "omegaWallFunction"
+                    || t == "nutkRoughWallFunction";
             };
             for (const auto& pb : fd.boundary)
             {

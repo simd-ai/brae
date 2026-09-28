@@ -3013,6 +3013,26 @@ COMPONENTS = {
                   "lines' (rDT*rho)*V and ((rDT*rhoOld)*psi0)*V at rho == 1 (kOmegaSST::Compressible::rDeltaTCells). "
                   "brae's EULER U source is ((rDT*rho0)*V)*U0 -- a different association, "
                   "left on the ledger; the localEuler one is OpenFOAM's."),
+        dict(name="interFoam_nutkRoughWallFunction", of_symbol="nutkRoughWallFunctionFvPatchScalarField",
+             of_file="src/TurbulenceModels/turbulenceModels/derivedFvPatchFields/wallFunctions/nutWallFunctions/nutkRoughWallFunction/nutkRoughWallFunctionFvPatchScalarField.C",
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/TurbulenceModels/turbulenceModels/derivedFvPatchFields/wallFunctions/nut_wall_function.cu",
+             validation="tests/interfoam_dtchull_vs_openfoam.sh `ras`, RAS/DTCHull's hull as shipped (Ks 1e-4, Cs 0.5) "
+                        "under kOmegaSST and localEuler, HOST ONLY: the hull's wall nut face by face 6.2e-11 after ten "
+                        "steps (1.7e-12 at the first; OpenFOAM's one-ulp floor 7.9e-12), k 2.8e-12, omega 8.9e-12, U "
+                        "4.4e-13, every count OpenFOAM's. Witness, OpenFOAM against itself rough vs smooth: nut "
+                        "2.3e-01 and U 7.0e-04 at the first step. By the last step 5,605 of 27,438 hull faces are in "
+                        "fnRough's 2.25 < KsPlus < 90 regime. CONTROLS: run as nutkWallFunction, wall nut 1.0e+00 and "
+                        "U 4.0e-03; the history dropped (limited against nu_w), wall nut 4.6e-01. NOT CLAIMED: the "
+                        "KsPlus >= 90 regime (no face reaches it), kEpsilon, a refining mesh, the device (refused).",
+             note="A wall nut WITH HISTORY: calcNut clamps the log-law value to [0.5, 2]*max(the patch's previous value, "
+                  "nu_w), and the first call -- validate() -- reads the case file's `value`, which is therefore "
+                  "MUST_READ and load-bearing; Ks and Cs are MUST_READ per-face scalarFields, not PatchFunction1s. "
+                  "It has no yPlusLam branch and keeps the log law's `- 1`; its association is not nutk's "
+                  "(uStar*y/nu, sqrt(sqrt(Cmu))). brae's NutkRoughPatchField keeps value_ across evaluate(), as "
+                  "OpenFOAM's fixedValue-derived class does, and correctNutField dispatches on the patch's class. "
+                  "The device closures recompute the wall nut from k with no history and refuse it by name, as do "
+                  "the legacy drivers' selectNutWall and interFoam's kEpsilon reader."),
         dict(name="interFoam_variableHeightFlowRate", of_symbol="variableHeightFlowRateInletVelocityFvPatchVectorField",
              of_file="src/finiteVolume/fields/fvPatchFields/derived/variableHeightFlowRateInletVelocity/"
                      "variableHeightFlowRateInletVelocityFvPatchVectorField.C",

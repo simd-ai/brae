@@ -1199,6 +1199,37 @@ void correctNutField(
         // nutkWallFunction's own coefficients, from the nut PATCH's dictionary -- as the kEpsilon twin
         // reads them (kEpsilon_cpp.cu:912)
         const WallFunctionCoeffs& nwc = nutField.boundary[pi]->wallCoeffs();
+        // nutkRoughWallFunction dispatches on the PATCH's class, as OpenFOAM's virtual calcNut does. It reads
+        // the patch's current value -- the previous correctNut's, or the file's before the first -- because
+        // its limiter is relative to it; the stored value is never reset between calls (the fixedValue
+        // operator= is empty, so the field assignment above does not touch it).
+        const std::vector<scalar>* Ks = nutField.boundary[pi]->nutkRoughKs();
+        // A GATE'S CONTROL, reachable only on a rough patch: run it as nutkWallFunction. WRONG.
+        if (Ks && std::getenv("BRAE_CONTROL_NUTK_SMOOTH"))
+        {
+            std::printf("  *** CONTROL MODE: nutkRoughWallFunction on `%s` runs as nutkWallFunction. This run is "
+                        "deliberately wrong. ***\n", patches[pi].name.c_str());
+            Ks = nullptr;
+        }
+        if (Ks)
+        {
+            std::vector<scalar> nutPrev = nutField.boundary[pi]->value();
+            // A GATE'S CONTROL: the limiter against nu_w alone -- the history dropped. WRONG.
+            if (std::getenv("BRAE_CONTROL_NUTKROUGH_NOHISTORY"))
+            {
+                std::printf("  *** CONTROL MODE: nutkRoughWallFunction on `%s` limits against nu_w, not its "
+                            "previous value. This run is deliberately wrong. ***\n", patches[pi].name.c_str());
+                std::fill(nutPrev.begin(), nutPrev.end(), scalar(0));
+            }
+            nutField.boundary[pi]->setValue(
+                nutkRoughWallFunction(patches[pi], yWall[pi], k.internal,
+                                      comp && comp->nuBnd ? (*comp->nuBnd)[pi]
+                                                          : std::vector<scalar>(patches[pi].size, nu),
+                                      nutPrev, *Ks,
+                                      *nutField.boundary[pi]->nutkRoughCs(),
+                                      nwc.Cmu, nwc.kappa, nwc.E));
+            continue;
+        }
         nutField.boundary[pi]->setValue(
             nutkWallFunction(patches[pi], yWall[pi], k.internal,
                              comp && comp->nuBnd ? (*comp->nuBnd)[pi]

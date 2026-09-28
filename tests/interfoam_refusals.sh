@@ -514,6 +514,8 @@ arm ddt_closureDeadName     runs    -                         "" "ddtblock 'defa
 arm ddt_localEulerRAS       refused "is not kOmegaSST in the uniform lineage" "" "$LTSSET; $LTSZERO"
 # ...and kEpsilon's linearUpwind, which its closure call does not carry: the reader keeps the refusal
 arm ras_linearUpwindKEpsilon refused "neither \`Gauss upwind\` nor" "" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss linearUpwind grad(k);/' system/fvSchemes"
+# ...and kEpsilon's wall nut, which carries nutk, nutU and nutLowRe and refuses the rough class by name
+arm ras_nutkRough           refused "carries \`nutkRoughWallFunction\`. The kEpsilon" "" "sed -i '0,/type  *nutkWallFunction;/ s//type nutkRoughWallFunction; Ks uniform 1e-4; Cs uniform 0.5;/' 0/nut"
 # kOmegaSST IS ported, in the uniform lineage (tests/interfoam_waterchannel_vs_openfoam.sh holds it to
 # OpenFOAM). RAS/damBreak made kOmegaSST: `density variable` with it is refused, and so is each thing
 # the closure does not carry -- on a base that RUNS, so a refusal is the one edit's.
@@ -548,6 +550,19 @@ arm sst_linearUpwindLsq     refused "resolves to \`leastSquares\`" "" "$SSTBASE;
 # reader's refusal of `cellLimited<` stays behind it for a caller that skips that check
 arm sst_linearUpwindCubic   refused "cellLimited<cubic> 1.5 Gauss linear 1\` is not ported" "" "$SSTBASE; ${LUGRAD/LIMGRAD/cellLimited<cubic> 1.5 Gauss linear 1}; $LUBOTH"
 arm sst_linearUpwindK2      refused "outside [0, 1]"          "" "$SSTBASE; ${LUGRAD/LIMGRAD/cellLimited Gauss linear 2}; $LUBOTH"
+# nutkRoughWallFunction -- RAS/DTCHull's hull -- RUNS on the host kOmegaSST closure (gated by
+# tests/interfoam_dtchull_vs_openfoam.sh `ras`, face by face on the hull). Its Ks, Cs and value are all
+# MUST_READ in OpenFOAM, and `value` is live here -- the previous nut its first calcNut limits against --
+# so each is refused missing; a bare-number Ks is OpenFOAM's own stop (Field.C:213-268). `blending` is read,
+# validated and never used by the class, so any of OpenFOAM's words runs and an unknown one is refused.
+# kEpsilon's closure refuses the type (ras_nutkRough) and so does the device (device_sstNutkRough).
+ROUGHNUT="sed -i '0,/type  *nutkWallFunction;/ s//type nutkRoughWallFunction; RSPEC/' 0/nut"
+arm sst_nutkRough           runs    -                        "" "$SSTBASE; ${ROUGHNUT/RSPEC/Ks uniform 1e-4; Cs uniform 0.5;}"
+arm sst_nutkRoughBlendMax   runs    -                        "" "$SSTBASE; ${ROUGHNUT/RSPEC/Ks uniform 1e-4; Cs uniform 0.5; blending max;}"
+arm sst_nutkRoughNoKs       refused "Required entry 'Ks' : missing" "" "$SSTBASE; ${ROUGHNUT/RSPEC/Cs uniform 0.5;}"
+arm sst_nutkRoughBareKs     refused "Ks 1e-4\` -- Ks and Cs are scalarFields" "" "$SSTBASE; ${ROUGHNUT/RSPEC/Ks 1e-4; Cs uniform 0.5;}"
+arm sst_nutkRoughBlendBad   refused "not one of OpenFOAM's blenders" "" "$SSTBASE; ${ROUGHNUT/RSPEC/Ks uniform 1e-4; Cs uniform 0.5; blending sideways;}"
+arm sst_nutkRoughNoValue    refused "Required entry 'value' : missing" "" "$SSTBASE; python3 -c \"import re; p='0/nut'; t=open(p).read(); t=re.sub(r'leftWall\\s*\\{[^}]*\\}', 'leftWall { type nutkRoughWallFunction; Ks uniform 1e-4; Cs uniform 0.5; }', t, count=1); open(p,'w').write(t)\""
 # `correctWalls no|0|n` RUNS now -- brae skips patchWave's wall-cell override as OpenFOAM does,
 # gated on RAS/waterChannel `correctWallsOff`. `decayControl` is still refused: it adds two terms
 # the closure does not carry.
@@ -925,6 +940,8 @@ if [ $HAVE_GPU = 1 ]; then
     # not wired for it and refuses by name -- RAS/DTCHullMoving, an Euler case, would reach it
     BASE="$BR"
     arm device_sstLinearUpwind refused "the device closure is not wired" "-device" "$SSTBASE; ${LUGRAD/LIMGRAD/cellLimited Gauss linear 1}; $LUBOTH"
+    # nutkRoughWallFunction carries history the device wall kernels do not keep: refused by name
+    arm device_sstNutkRough refused "has no rough wall function" "-device" "$SSTBASE; ${ROUGHNUT/RSPEC/Ks uniform 1e-4; Cs uniform 0.5;}"
     BASE="$B"
     BASE="$B"
     # the device's alpha pre-solve honours the case's minIter now, as the host's always has

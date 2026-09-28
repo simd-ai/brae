@@ -15,7 +15,9 @@ namespace brae {
 // than in solver_controls.cuh so the turbulence closures can dispatch without pulling in a solver
 // header -- and so the host closure, the device kernel and the legacy drivers cannot drift apart about
 // what a case asked for. The integer values match wallProductionG0's existing `nutWall` codes.
-enum class NutWall { Nutk = 0, Spalding = 1, Blended = 2, NutU = 3, LowRe = 4 };
+// NutkRough is appended so the existing codes keep their values. Only the HOST kOmegaSST closure carries it
+// (kOmegaSST_cpp.cu correctNutField); every device consumer of a kind refuses it by name.
+enum class NutWall { Nutk = 0, Spalding = 1, Blended = 2, NutU = 3, LowRe = 4, NutkRough = 5 };
 
 // Single source of truth for the OF nutkWallFunction value (the log-law wall viscosity, 0 in the viscous sublayer).
 // Shared by the host nutkWallFunction below AND the device wall kernels (kEpsilon wallFnKernel/boundaryNutKernel,
@@ -202,5 +204,23 @@ std::vector<scalar> nutkWallFunction(
     scalar Cmu = 0.09,
     scalar kappa = 0.41,
     scalar E = 9.8);
+
+// nutkRoughWallFunction::calcNut (nutkRoughWallFunctionFvPatchScalarField.C:58-127), HOST. NOT nutk with a
+// modified E: it has no yPlusLam branch, it keeps the log law's `- 1` (the turbulent part only), and it is
+// clamped to [0.5*L, 2*L] with L = max(the patch's PREVIOUS value, nuw) -- so it carries history, and the
+// first call (validate) reads the case file's `value`. Every expression in OpenFOAM's order, which is not
+// nutk's: yPlus is (uStar*y)/nuw with uStar = Cmu25*sqrt(k), where yPlusWall is ((Cmu25*y)*sqrt(k))/nu, and
+// Cmu25 is pow025 = sqrt(sqrt(Cmu)) (Scalar.H:368-371). Ks and Cs are the patch's per-face fields.
+std::vector<scalar> nutkRoughWallFunction(
+    const FvPatch& wall,
+    const std::vector<scalar>& y,
+    const std::vector<scalar>& kInternal,
+    const std::vector<scalar>& nuFace,
+    const std::vector<scalar>& nutPrev,
+    const std::vector<scalar>& Ks,
+    const std::vector<scalar>& Cs,
+    scalar Cmu,
+    scalar kappa,
+    scalar E);
 
 } // namespace brae

@@ -149,6 +149,20 @@ struct PatchFieldData
     std::string    wfBlending;                 // the `blending` word as written, empty when absent
     scalar         wfBlendN = 0.0;
     bool           hasWfBlendN = false;
+    // nutkRoughWallFunction's roughness height and constant, per face. Both are MUST_READ scalarFields --
+    // `uniform <v>` or `nonuniform List<scalar> N (...)`, anything else OpenFOAM's FatalIOError
+    // (nutkRoughWallFunctionFvPatchScalarField.C:179-180, Field.C:213-268) -- and constant in time: not
+    // PatchFunction1s. A form the reader cannot take is named in roughFormError and refused by the factory
+    // row, which alone knows the type needs them.
+    bool           hasRoughKs = false;
+    bool           roughKsUniform = false;
+    scalar         roughKsUniformValue = 0;
+    std::vector<scalar> roughKsValues;
+    bool           hasRoughCs = false;
+    bool           roughCsUniform = false;
+    scalar         roughCsUniformValue = 0;
+    std::vector<scalar> roughCsValues;
+    std::string    roughFormError;
     bool           vfUniform        = false;
     scalar         vfUniformValue   = 0;
     std::vector<scalar> vfValues;
@@ -1479,6 +1493,52 @@ inline FieldData<T> readField(const std::string& path)
                         }
                         p.hasValueFraction = true;
                         ts.expect(";");
+                    }
+                    else if (key == "Ks" || key == "Cs")    // nutkRoughWallFunction's per-face scalarFields
+                    {
+                        const bool isKs = (key == "Ks");
+                        const std::string w = ts.peek();
+                        bool uni = false;
+                        scalar uval = 0;
+                        std::vector<scalar> vals;
+                        if (w == "uniform")
+                        {
+                            ts.next();
+                            uni = true;
+                            uval = std::stod(ts.next());
+                            ts.expect(";");
+                        }
+                        else if (w == "nonuniform")
+                        {
+                            ts.next();
+                            if (ts.peek() == "List<scalar>") ts.next();
+                            const int n = std::stoi(ts.next());
+                            ts.expect("(");
+                            vals.resize(static_cast<std::size_t>(n));
+                            for (int i = 0; i < n; ++i) vals[static_cast<std::size_t>(i)] = std::stod(ts.next());
+                            ts.expect(")");
+                            ts.expect(";");
+                        }
+                        else
+                        {
+                            // a bare number, or anything else: OpenFOAM's Field::assign stops on it
+                            p.roughFormError = key + " " + w;
+                            if (!skipToSemicolon(ts)) ts.expect(";");
+                        }
+                        if (isKs)
+                        {
+                            p.hasRoughKs = true;
+                            p.roughKsUniform = uni;
+                            p.roughKsUniformValue = uval;
+                            p.roughKsValues = std::move(vals);
+                        }
+                        else
+                        {
+                            p.hasRoughCs = true;
+                            p.roughCsUniform = uni;
+                            p.roughCsUniformValue = uval;
+                            p.roughCsValues = std::move(vals);
+                        }
                     }
                     else if (key == "tangentialVelocity")   // pressureInletOutletVelocity, optional
                     {

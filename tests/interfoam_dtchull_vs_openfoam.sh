@@ -24,18 +24,19 @@
 #   functions removed        the forces function object writes, and changes no field
 #   write every step, ascii  the oracle
 #   laminar                  (`laminar` only) the flow's consumers without the closure
-#   nut hull nutkWall...     (`ras`) nutkRoughWallFunction is not ported (refused); its Ks and Cs go
 #
 # MEASURED, ten steps, OpenFOAM's one-ulp floor beside each (the same run with ONE interface cell's alpha
 # moved by one ulp, OpenFOAM against OpenFOAM):
 #   laminar  rDeltaT 1.6e-16 at step 1, <= 3.4e-12 after; alpha 2.6e-10 (8.8e-11), p_rgh 6.1e-10
 #            (1.2e-10), U 6.4e-13 (3.7e-13); all 20 p_rgh and 10 alpha counts OpenFOAM's
-#   ras      rDeltaT <= 5.3e-12; alpha 1.6e-10 (5.5e-11), p_rgh 3.4e-10 (1.1e-10), U 1.5e-12 (1.2e-13),
-#            k 3.4e-12 (2.8e-13), omega 9.0e-12 (4.7e-13), nut 2.8e-11 (6.2e-12); every p_rgh, alpha,
-#            omega and k count and final residual OpenFOAM's. With the closure staged UPWIND the same
-#            fields read k 3.7e-12, omega 1.0e-11, nut 2.8e-11 -- so linearUpwind, which moves OpenFOAM's
-#            own k, omega and nut by 5e-02 over these ten steps, adds nothing to brae's gap; the gap is the
-#            flow's (U 7.9e-13 at the FIRST step on the laminar profile too), carried into omega and nut.
+#   ras      rDeltaT <= 3.9e-12; alpha 3.9e-10 (1.6e-10), p_rgh 7.8e-10 (4.2e-10), U 4.4e-13 (1.3e-13),
+#            k 2.8e-12 (4.9e-13), omega 8.9e-12 (1.1e-12), nut 2.4e-11 (6.0e-12), and the HULL's wall nut
+#            face by face 6.2e-11 (7.9e-12); every p_rgh, alpha, omega and k count and final residual
+#            OpenFOAM's. The tutorial's own schemes and wall functions: linearUpwind limitedGrad (which
+#            moves OpenFOAM's own k, omega and nut by 5e-02 over these steps) and nutkRoughWallFunction
+#            (rough against smooth: OpenFOAM's own nut 2.3e-01 at the first step). The rough wall's history
+#            limiter is live from validate on, and by the last step 5,605 of the 27,438 hull faces sit in
+#            fnRough's 2.25 < KsPlus < 90 regime (none reaches 90).
 # At the FIRST step, before anything amplifies, U is 7.9e-13 on BOTH profiles, so that floor is not the
 # closure's; omega and nut follow it through the production term (4e-13). From step 2 all but 165 of the
 # 845,536 cells sit above the floor 1/maxDeltaT = 1, so the local step is live almost everywhere.
@@ -54,9 +55,15 @@
 #                                             difference to the digit
 #            BRAE_CONTROL_SST_LU_UNLIMITED    the named gradient unlimited (grad(k)'s `default Gauss linear`)
 #                                             k 2.3e-02, omega 2.6e-01
+#            BRAE_CONTROL_NUTK_SMOOTH         the hull's nutkRoughWallFunction run as nutkWallFunction
+#                                             wall nut 1.0e+00, U 4.0e-03 -- OpenFOAM's own rough-vs-smooth
+#            BRAE_CONTROL_NUTKROUGH_NOHISTORY the rough limiter taken against nu_w, not the previous wall nut
+#                                             wall nut 4.6e-01, U 3.2e-04
 #
-# NOT CLAIMED: outletPhaseMeanVelocity and nutkRoughWallFunction (refused; later units), linearUpwind for k
-# and omega naming different gradients or on a coupled mesh (refused), and on the device (refused), fvc::spread and fvc::sweep (refused: DTCHull sets both iteration counts to 0),
+# NOT CLAIMED: outletPhaseMeanVelocity (refused; a later unit), linearUpwind for k and omega naming
+# different gradients or on a coupled mesh (refused), nutkRoughWallFunction's KsPlus >= 90 regime (no hull
+# face reaches it in ten steps; 5,605 of 27,438 are in the 2.25-90 regime by the last), a rough wall on a
+# refining mesh or under kEpsilon (refused), and both on the device (refused), fvc::spread and fvc::sweep (refused: DTCHull sets both iteration counts to 0),
 # a restart (setRDeltaT damps from the third step of EVERY run, and a restart's rhoPhi is rebuilt as
 # interpolate(rho)*phi -- not a continuation of the continuous run), kEpsilon and LES under localEuler
 # (refused), the device loop (refused by name), and anything after ten steps.
@@ -158,13 +165,8 @@ if profile == 'ras':
     t = open(fs).read()
     assert re.search(r'div\(phi,k\)\s+Gauss\s+linearUpwind\s+limitedGrad;', t), 'the tutorial names linearUpwind'
     assert re.search(r'limitedGrad\s+cellLimited\s+Gauss\s+linear\s+1;', t), 'the tutorial names cellLimited'
-    nf = os.path.join(d, '0/nut')
-    t = open(nf).read()
-    t, k = re.subn(r'hull\s*\{[^}]*nutkRoughWallFunction[^}]*\}',
-                   'hull\n    {\n        type            nutkWallFunction;\n        value           $internalField;\n    }',
-                   t, count=1)
-    assert k == 1, 'the nut hull'
-    open(nf, 'w').write(t)
+    assert re.search(r'type\s+nutkRoughWallFunction;', open(os.path.join(d, '0/nut')).read()), \
+        'the tutorial names nutkRoughWallFunction on the hull'
 PYEOF2
     ( cd "$C" && interFoam > log.interFoam 2>&1 ) || { echo "FAIL: interFoam [$profile]"; tail -30 "$C/log.interFoam"; return 1; }
     [ -d "$C/$STEPS" ] || { echo "FAIL: OpenFOAM wrote no $STEPS directory [$profile]"; ls "$C"; return 1; }
@@ -205,7 +207,8 @@ for ctl in BRAE_CONTROL_LTS_NOSMOOTH=1 BRAE_CONTROL_LTS_NODAMP=1 BRAE_CONTROL_LT
 do
     control laminar "$ctl" || rc=1
 done
-for ctl in BRAE_CONTROL_LTS_SCALAR=turbulence BRAE_CONTROL_SST_LU_OFF=1 BRAE_CONTROL_SST_LU_UNLIMITED=1
+for ctl in BRAE_CONTROL_LTS_SCALAR=turbulence BRAE_CONTROL_SST_LU_OFF=1 BRAE_CONTROL_SST_LU_UNLIMITED=1 \
+           BRAE_CONTROL_NUTK_SMOOTH=1 BRAE_CONTROL_NUTKROUGH_NOHISTORY=1
 do
     control ras "$ctl" || rc=1
 done
