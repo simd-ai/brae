@@ -38,7 +38,10 @@
 #                  tutorial's own movingWallVelocity. mesh.update() ends in
 #                  U.correctBoundaryConditions() and phi is RELATIVE there and ABSOLUTE at pEqn's;
 #                  brae read the absolute one at both and left U 1.33e-01 from OpenFOAM after two
-#                  steps, 8.66e-11 with it fixed
+#                  steps, 8.66e-11 with it fixed. THE DEVICE ARM RUNS IT (it was refused as unmeasured):
+#                  alpha 3.9e-15, p_rgh 3.4e-14, U 4.5e-11 against the host's 2.6e-15 / 5.8e-14 /
+#                  3.7e-11. BROKEN ONCE on the device -- prghPermeableAlphaTotalPressure handed the
+#                  ABSOLUTE flux at constrainPressure, the refusal's own worry -- it reads U 9.0e-04
 #   mixerPred      momentumPredictor yes: U solved on the moving mesh (smoothSolver GaussSeidel, the
 #                  tutorial's own U entry), with UFinal added because the tutorial names none
 #   sloshing2D     laminar/sloshingTank2D AS SHIPPED: the SDA roll-sway-heave of a

@@ -295,24 +295,13 @@ RunReport runInterFoamDevice(
     // THE PERMEABLE-WALL PAIR runs here too: both halves are host patches, told the flux and the phase
     // field's patch values by pushFlux at every hook, the pressure half rebuilt inside the pressure
     // hook's constrainPressure, and the velocity half kept off the new flux in the one corrector
-    // OpenFOAM keeps it off (DeviceInterStepHooks::updateUBoundary). What is still refused is the pair
-    // on a MOVING mesh: prghPermeableAlphaTotalPressure reads phi as it stands at constrainPressure,
-    // and on a moving mesh that is a flux this loop makes relative at a different point from the host
-    // loop. No tutorial ships the combination and neither arm has measured it.
-    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-    {
-        const bool permeable = f.U.boundary[pi]->needsAlphaPatchValues()
-                            || f.p_rgh.boundary[pi]->needsAlphaPatchValues()
-                            || f.p_rgh.boundary[pi]->isPrghPermeableAlphaTotalPressure();
-        if (permeable && f.dynamicMesh)
-            throw std::runtime_error(
-                "brae interFoam (device): patch `" + fvp[pi].name + "` carries a permeable-wall condition "
-                "(permeableAlphaPressureInletOutletVelocity or prghPermeableAlphaTotalPressure) and the "
-                "mesh moves. The pressure half reads the flux as it stands when constrainPressure runs, "
-                "and the device loop has not been measured against OpenFOAM on a moving mesh with that "
-                "condition. Refused rather than run an unmeasured flux; a static mesh runs (gated on "
-                "laminar/damBreakPermeable).");
-    }
+    // OpenFOAM keeps it off (DeviceInterStepHooks::updateUBoundary) -- AND ON A MOVING MESH, where it was
+    // refused as unmeasured: the pressure half reads phi as it stands at constrainPressure, and on a
+    // moving mesh that must be the RELATIVE flux (pEqn.H:70 made it so, and the post-move CorrectPhi block
+    // ends in makeRelative), which is what pushFlux hands it here. MEASURED on
+    // tests/interfoam_moving_vs_openfoam.sh `mixerPermeable` (testTubeMixer with the pair on its walls):
+    // device alpha 3.9e-15, p_rgh 3.4e-14, U 4.5e-11 from OpenFOAM, the host's own level; handed the
+    // ABSOLUTE flux instead, U 9.0e-04.
     // `grad(U) cellLimited` RUNS on this loop, and what the refusal here hid was not the momentum:
     // the shared assembler limits divDevReff's dev2 gradient through deviceCellLimitGradU, WITH the
     // pair (device_komega_sst.cu:838-846). What was actually wrong sat in the TURBULENCE closure --

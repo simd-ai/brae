@@ -417,8 +417,8 @@ PERMPW="python3 -c \"import re; p='0/p_rgh'; t=open(p).read(); t=re.sub(r'walls\
 # RELATIVE flux the previous step's pEqn left, and interMeshUpdate evaluated the pair with the
 # ABSOLUTE one it was last told. Gated field by field against real OpenFOAM by the `mixerPermeable`
 # profile of tests/interfoam_moving_vs_openfoam.sh, whose control is the same motion under
-# movingWallVelocity; this arm only holds that no refusal has come back. The DEVICE loop still refuses
-# it -- device_permeable_moving, below. The pair on a STATIC mesh runs -- permeable_runs, above.
+# movingWallVelocity; this arm only holds that no refusal has come back. The DEVICE loop runs it too --
+# device_permeable_moving, below. The pair on a STATIC mesh runs -- permeable_runs, above.
 arm permeable_moving        runs    -                         "" "$PERMUW; $PERMPW"
 BASE="$BG"
 arm ddt_cnMangroves         refused "multiphaseMangrovesSource" "" "$CNSET"
@@ -950,10 +950,11 @@ if [ $HAVE_GPU = 1 ]; then
     # so that BOTH device GAMG entry points are held on a moving mesh (the hierarchy is the mesh's and
     # is rebuilt on every move for either)
     arm device_moving_gamg  runs    -                      "-device" "python3 '$W/setSolver.py' p_rghFinal '        solver          GAMG;\n        smoother        DIC;\n        tolerance       2e-09;\n        relTol          0;\n'"
-    # ...and the PERMEABLE-WALL pair on it is refused, by name: the pressure half reads the flux as it
-    # stands at constrainPressure, which on a moving mesh this loop makes relative at another point
-    # than the host loop. On a static mesh the pair runs -- device_permeable, below, on the base case.
-        arm device_permeable_moving refused "and the mesh moves" "-device" "$PERMUW; $PERMPW"
+    # ...and the PERMEABLE-WALL pair on it RUNS: it was refused as unmeasured, and
+    # tests/interfoam_moving_vs_openfoam.sh `mixerPermeable` now holds the device to OpenFOAM at the host's
+    # level (U 4.5e-11), with the absolute-flux fail-proof at U 9.0e-04. On a static mesh the pair runs
+    # too -- device_permeable, below, on the base case.
+        arm device_permeable_moving runs    -                  "-device" "$PERMUW; $PERMPW"
     BASE="$B"
     # ...and the closed tank OpenFOAM itself stops, on the DEVICE -- see `closed_abort_host` above
     arm closed_abort_device refused "Continuity error cannot be removed by adjusting the outflow" "-device" "$CLOSED"
