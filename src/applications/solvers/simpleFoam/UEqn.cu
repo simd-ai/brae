@@ -41,6 +41,26 @@ void refuseUnsupported(const MomentumInput& in)
             "UEqn(cuda): the case declares fvOptions, which UEqn.H applies as fvOptions(U), "
             "fvOptions.constrain(UEqn) and fvOptions.correct(U) (simpleFoam/UEqn.H:11,17,23). Not "
             "implemented on this path; refusing rather than silently solving a different equation.");
+    // A leastSquares grad(U) reaches divDevReff's dev2 term only. The deferred corrections, the
+    // V-schemes' limiter and the corrected laplacian's explicit half all read deviceGradUShared, a
+    // Gauss gradient, and each resolves the same grad(U) entry in OpenFOAM (correctedSnGrad's
+    // fullGradCorrection, and the gradient linearUpwind/LUST/the V-schemes name on interFoam's cases).
+    if (in.gradUSchemeLeastSq)
+    {
+        const bool readsSharedGrad = in.correctedLaplacian
+                                  || in.linearUpwind
+                                  || in.scheme == cpu::DivScheme::linearUpwind
+                                  || in.scheme == cpu::DivScheme::linearUpwindV
+                                  || in.scheme == cpu::DivScheme::LUST
+                                  || in.scheme == cpu::DivScheme::limitedLinearV
+                                  || in.scheme == cpu::DivScheme::vanLeerV;
+        if (readsSharedGrad)
+            throw std::runtime_error(
+                "UEqn(cuda): grad(U) resolves to leastSquares and this assembly also takes grad(U) for "
+                "a deferred correction, a V-scheme limiter or a corrected laplacian, all of which it "
+                "builds Gauss (deviceGradUShared). Only the dev2 term takes leastSquares here. Refusing "
+                "rather than run a second gradient.");
+    }
 }
 
 } // namespace
@@ -255,7 +275,8 @@ void assembleUEqn(
                      // resolves. These five arguments fell through to their defaults, so the case's
                      // limiter never reached the dev2 term on this driver -- the legacy one has passed
                      // it since device_simple_foam.cu.
-                     in.gradUSchemeLimitK);
+                     in.gradUSchemeLimitK,
+                     in.gradUSchemeLeastSq);
 
     // ---- explicit non-orthogonal correction --------------------------------------------------
     // AFTER divDevReff, which ASSIGNS the source (device_divdevreff.cu: `dX[c] = d[0]`) rather than

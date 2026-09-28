@@ -537,6 +537,32 @@ void deviceLeastSquaresGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vo
 }
 
 
+// See device_mesh.cuh. The ORDER is the host's: the scheme, then the limiter -- cellLimitedGrad wraps a
+// base scheme and limits what it returns (OF cellLimitedGrad<minmod>::calcGrad calls basicGradScheme_
+// first), so limiting a Gauss gradient where the case asked for a limited leastSquares one is a different
+// gradient, not a rounding difference.
+void deviceGradOf(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol, const DeviceBuffer<scalar>& bval,
+                  bool leastSquares, scalar cellLimitK,
+                  DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz,
+                  const DeviceCyclic* cyc)
+{
+    if (leastSquares)
+    {
+        deviceLeastSquaresGrad(dm, vol, bval, gx, gy, gz, cyc);
+    }
+    else
+    {
+        deviceGaussGrad(dm, vol, bval, gx, gy, gz);
+    }
+    if (cellLimitK > scalar(0))
+    {
+        // the interface-carrying overload is the caller's job where a pair exists: deviceCellLimitGrad
+        // takes a CellLimitInterface list, and a cyclic pair's faces are in neither of the arrays above
+        deviceCellLimitGrad(dm, vol, bval, gx, gy, gz, cellLimitK);
+    }
+}
+
+
 void deviceLeastSquaresGradFusedRaw(const DeviceMesh& dm, int n,
                                     const scalar* const* vol, const scalar* const* bval,
                                     scalar* const* gx, scalar* const* gy, scalar* const* gz)

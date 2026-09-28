@@ -298,6 +298,23 @@ void deviceLeastSquaresGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vo
                             DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz,
                             const struct DeviceCyclic* cyc = nullptr);
 
+// fvc::grad UNDER THE CASE'S OWN gradSchemes ENTRY, which is two steps and not one: the scheme itself
+// (leastSquares or Gauss linear) and then cellLimited when its k is above zero. It is the device twin of
+// the host's gradOf (grad_choice.cuh:34-48) and takes the same pair of numbers a GradChoice holds, so a
+// call site switches on the case's entry and nothing else -- which is what deviceLeastSquaresGrad's own
+// note above anticipated.
+//
+// SPLIT INTO TWO NUMBERS rather than taking GradChoice, because that type lives in the host tree beside
+// fvc and this header is included by device translation units that must not pull it in.
+//
+// RAS/electrostaticDeposition is the shipped case that needs it: `gradSchemes { default cellLimited
+// leastSquares 1; }`, so every gradient of that case is both. Its host arm RUNS and its device arm
+// refused, which is the only device refusal in brae's interFoam port that a stock tutorial reaches.
+void deviceGradOf(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol, const DeviceBuffer<scalar>& bval,
+                  bool leastSquares, scalar cellLimitK,
+                  DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz,
+                  const struct DeviceCyclic* cyc = nullptr);
+
 void deviceGaussGradFused(const DeviceMesh& dm, int n,
                           const DeviceBuffer<scalar>* const* vol, const DeviceBuffer<scalar>* const* bval,
                           DeviceBuffer<scalar>* gx, DeviceBuffer<scalar>* gy, DeviceBuffer<scalar>* gz,

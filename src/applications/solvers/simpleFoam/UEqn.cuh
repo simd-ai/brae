@@ -138,6 +138,10 @@ struct MomentumInput
     // (linearViscousStress.C:114); it was left at the parameter's default, so the dev2 term ran the
     // plain Gauss gradient on every case that named a limiter.
     scalar gradUSchemeLimitK = 0.0;
+    // ...and that entry's BASE scheme when it resolves to leastSquares (cellLimitedGrad wraps either).
+    // Only divDevReff's dev2 term takes it: every other grad(U) this assembly builds comes from
+    // deviceGradUShared, which is Gauss, so the assembly refuses the flag beside any of them.
+    bool   gradUSchemeLeastSq = false;
     // The div(phi,U) scheme, shared with the reference (cpu::DivScheme). Each scheme is weights only, a
     // deferred correction only, or both; the assembly branches on that, not on a name.
     cpu::DivScheme scheme = cpu::DivScheme::upwind;
