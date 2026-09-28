@@ -105,11 +105,20 @@ SmoothLinearSolve readFinalSolve(
     return readClosureSolve(fvSolution, field + "Final", /*required=*/true, allowPBiCG);
 }
 
-// div(<flux>,<field>) for a RAS closure: `Gauss upwind` or `Gauss limitedLinear <k>`. Both arms of
-// both closures carry the second and no interFoam tutorial names it, so it is gated by a staged
-// profile (tests/interfoam_waterchannel_vs_openfoam.sh `limitedLinear`). `bounded` and `linearUpwind`
-// stay refused: nothing holds either here. Both equations must name the SAME scheme -- the closures
-// carry one flag for the pair, as `bounded` does.
+// div(<flux>,<field>) for a RAS closure: `Gauss upwind`, `Gauss limitedLinear <k>`, and -- for kOmegaSST
+// only, `allowLinearUpwind` -- `Gauss linearUpwind <grad>`. limitedLinear is carried by both arms of both
+// closures and no interFoam tutorial names it, so it is gated by a staged profile
+// (tests/interfoam_waterchannel_vs_openfoam.sh `limitedLinear`). `bounded` stays refused.
+//
+// LINEARUPWIND is RAS/DTCHull's (`Gauss linearUpwind limitedGrad` on k and omega, gradSchemes
+// `limitedGrad cellLimited Gauss linear 1`). OpenFOAM's scheme is upwind's matrix plus an explicit
+// correction, `fvm += fvc::surfaceIntegrate(phi*((Cf - C[up]) & grad[up]))` with the upwind cell by
+// phi > 0 (gaussConvectionScheme.C:111-114, linearUpwind.C:70-93), and the gradient is the NAMED
+// gradSchemes entry, named-then-default -- not grad(k)'s (linearUpwind.C:70-82). The kOmegaSST closure
+// carries it (kOmegaSST_cpp.cu, gated on rhoSimpleFoam's squareBendLiq) over `Gauss linear`, optionally
+// `cellLimited` minmod, with ONE flag and ONE limiter coefficient for the pair -- so the pair must agree,
+// and the named gradient must be one of those two. kEpsilon's closure call does not carry it and keeps
+// the refusal.
 //
 // THE PROFILE GATES FIELDS AND NOT MATRIX COEFFICIENTS, and the reason is in the scheme. Where the
 // two cells of a face hold the same value, `gradf = phiN - phiP` is EXACTLY zero, OpenFOAM takes
@@ -119,15 +128,16 @@ SmoothLinearSolve readFinalSolve(
 // and 5.7e-15, and the limiter still lands on the other side on 2 of 79,800 faces, each worth an
 // O(1) coefficient. OpenFOAM's own answer there is arbitrary at the bit level. The FIELDS are not:
 // host omega 7.2e-12, k 5.9e-11, U 4.2e-12.
-void readClosureDivScheme(
+FieldDivScheme readClosureDivScheme(
     const std::string&  caseDir,
     const std::string&  field,
     const std::string&  fluxName,
     InterTurbulence&    t,
-    bool                first)
+    bool                first,
+    bool                allowLinearUpwind = false)
 {
     const FieldDivScheme fs = parseFieldDivScheme(caseDir, field, false, fluxName);
-    if (fs.bounded || fs.linearUpwind)
+    if (fs.bounded || (fs.linearUpwind && !allowLinearUpwind))
         throw std::runtime_error(
             std::string(WHO) + "fvSchemes `div(" + fluxName + "," + field + ")` is neither `Gauss "
             "upwind` nor `Gauss limitedLinear <k>`, the two the closure carries.");
@@ -137,6 +147,28 @@ void readClosureDivScheme(
     cpu::EqnDivScheme& d = first ? t.kDiv : t.secondDiv;
     d.limitedLinear = fs.limited;
     d.limiterCoeff  = fs.limited ? fs.coeff : scalar(1);
+    if (fs.linearUpwind)
+    {
+        // the NAMED gradient, as rhoSimpleFoam's driver resolves it (rhoSimpleFoamDriver_cpp.cu). A
+        // `cellLimited<Venkatakrishnan>` or `cellLimited<cubic>` is a different limiter OpenFOAM
+        // registers (cellLimitedGrads.C:71-72) that the shared classifier would read as minmod, and a
+        // coefficient outside [0, 1] is OpenFOAM's own FatalIOError (cellLimitedGrad.H:114-120).
+        const FieldGradScheme gl = parseNamedGradScheme(caseDir, fs.luGradName);
+        const bool variantLimiter = gl.raw.find("cellLimited<") != std::string::npos;
+        if (!gl.gaussLinear || gl.leastSquares || !gl.unsupportedLimiter.empty() || variantLimiter)
+            throw std::runtime_error(
+                std::string(WHO) + "fvSchemes `div(" + fluxName + "," + field + ") Gauss linearUpwind "
+                + fs.luGradName + "` takes its gradient through gradSchemes `" + fs.luGradName + "`, which "
+                "resolves to `" + gl.raw + "`. The closure's linearUpwind carries `Gauss linear`, optionally "
+                "`cellLimited` (minmod), and nothing else.");
+        if (gl.cellLimitK < scalar(0) || gl.cellLimitK > scalar(1))
+            throw std::runtime_error(
+                std::string(WHO) + "gradSchemes `" + fs.luGradName + " " + gl.raw + "` has a cellLimited "
+                "coefficient outside [0, 1]; OpenFOAM stops there too (cellLimitedGrad.H:114-120).");
+        d.linearUpwind = true;
+        d.luGradK = gl.cellLimitK;
+    }
+    return fs;
 }
 
 // grad(U), which the production GbyNu takes (kEpsilon.C:237, kOmegaSSTBase.C:520)
@@ -593,8 +625,33 @@ InterTurbulence readInterTurbulence(
                 "changes the eddy-viscosity limiter and the production limiter; not ported.");
         readGradU(caseDir, t.sstCoeffs);
         readGradK(caseDir, "omega", t.sstCoeffs, t.kGrad, t.secondGrad);
-        readClosureDivScheme(caseDir, "k", "phi", t, /*first=*/true);
-        readClosureDivScheme(caseDir, "omega", "phi", t, /*first=*/false);
+        const FieldDivScheme dK = readClosureDivScheme(caseDir, "k", "phi", t, /*first=*/true,
+                                                       /*allowLinearUpwind=*/true);
+        const FieldDivScheme dO = readClosureDivScheme(caseDir, "omega", "phi", t, /*first=*/false,
+                                                       /*allowLinearUpwind=*/true);
+        // ONE linearUpwind FLAG AND ONE LIMITER COEFFICIENT FOR THE PAIR in the closure
+        // (kOmegaSST::correct's `linearUpwind` and KOmegaSSTCoeffs::luGradLimitK), so the two entries
+        // must agree on the scheme and on the gradient it names -- as rhoSimpleFoam's driver requires.
+        // OpenFOAM would run a split; no fixture holds one.
+        if (dK.linearUpwind != dO.linearUpwind || (dK.linearUpwind && dK.luGradName != dO.luGradName))
+            throw std::runtime_error(
+                std::string(WHO) + "fvSchemes `div(phi,k)` and `div(phi,omega)` differ in `Gauss linearUpwind "
+                "<grad>` or in the gradient it names. The kOmegaSST closure carries one linearUpwind flag and "
+                "one limiter coefficient for the pair; refusing the split rather than run both under one.");
+        // ...and the correction's COUPLED half, which OpenFOAM adds on a coupled patch
+        // (linearUpwind.C:98-137) and the kOmegaSST closure does not (kEpsilon's does)
+        if (dK.linearUpwind)
+        {
+            for (const FvPatch& q : patches)
+            {
+                if (q.coupled || q.type == "cyclic" || q.type == "cyclicAMI" || q.type == "cyclicACMI"
+                 || q.type == "processor")
+                    throw std::runtime_error(
+                        std::string(WHO) + "kOmegaSST's `Gauss linearUpwind` on a mesh with the coupled patch '"
+                        + q.name + "'. OpenFOAM adds the correction across coupled faces (linearUpwind.C:98-137); "
+                        "the kOmegaSST closure's linearUpwind does not, so it is refused.");
+            }
+        }
 
         t.k = readTurbulenceField(startDir, "k", patches, nCells);
         t.omega = readTurbulenceField(startDir, "omega", patches, nCells);
@@ -1158,10 +1215,32 @@ void correctInterTurbulence(
         // same variable the stage dump uses, and OFF unless it is set -- rhoSimpleFoam's SST site has
         // carried the same capture since its own port (rhoSimpleFoam_cpp.cu:1316).
         res.captureStages = (std::getenv("BRAE_SST_DUMP_DIR") != nullptr);
+        // `Gauss linearUpwind <grad>` on the pair (readClosureDivScheme requires both or neither, over
+        // one gradient): the closure's flag, and the NAMED gradient's cellLimited coefficient through
+        // luGradLimitK -- a local copy, so the case's one entry stays one field (kDiv.luGradK). Left at
+        // its -1 the closure would take grad(k)'s entry instead, which on RAS/DTCHull is the unlimited
+        // `default Gauss linear` where the case names `cellLimited Gauss linear 1`.
+        KOmegaSSTCoeffs sco = t.sstCoeffs;
+        bool luOn = t.kDiv.linearUpwind;
+        sco.luGradLimitK = luOn ? t.kDiv.luGradK : scalar(-1);
+        if (luOn && std::getenv("BRAE_CONTROL_SST_LU_OFF"))
+        {
+            // A GATE'S CONTROL: the closure's convection upwind, the correction dropped. WRONG.
+            std::printf("  *** CONTROL MODE: kOmegaSST's linearUpwind correction is off. This run is "
+                        "deliberately wrong. ***\n");
+            luOn = false;
+        }
+        if (luOn && std::getenv("BRAE_CONTROL_SST_LU_UNLIMITED"))
+        {
+            // A GATE'S CONTROL: the named gradient unlimited, as grad(k)'s default would be. WRONG.
+            std::printf("  *** CONTROL MODE: kOmegaSST's linearUpwind gradient is unlimited. This run is "
+                        "deliberately wrong. ***\n");
+            sco.luGradLimitK = scalar(0);
+        }
         kOmegaSST::correct(*in.U, t.k, t.omega, t.nut, *in.phi, t.yCell, scalar(0), m, g, patches,
                            pk.relaxSecond->factor, pk.relaxFirst->factor, ks.tol, ks.relTol, ks.maxIter,
-                           t.sstCoeffs, &res, /*bounded=*/false, t.kDiv.limitedLinear,
-                           t.kDiv.limiterCoeff, /*linearUpwind=*/false,
+                           sco, &res, /*bounded=*/false, t.kDiv.limitedLinear,
+                           t.kDiv.limiterCoeff, /*linearUpwind=*/luOn,
                            t.coeffs.correctedLaplacian, t.coeffs.snGradLimitCoeff, /*lm=*/nullptr,
                            &sstComp, ks.minIter, pk.relaxSecond->on, pk.relaxFirst->on, &which,
                            &omegaSolve, &t.secondDiv, &t.secondGrad, t.coeffs.nonOrthCoeffs);

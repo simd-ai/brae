@@ -13,7 +13,8 @@
 #
 # TWO PROFILES, one mesh. `laminar` isolates the four localEuler consumers of the flow (the alpha
 # pre-solve, CMULES, fvm::ddt(rho, U), ddtCorr); `ras` is the tutorial's kOmegaSST, whose fvm::ddt(omega)
-# and fvm::ddt(k) take the local step as well.
+# and fvm::ddt(k) take the local step as well, under the tutorial's own `div(phi,k|omega) Gauss
+# linearUpwind limitedGrad` over `limitedGrad cellLimited Gauss linear 1`.
 #
 # STAGED, on both codes, and why:
 #   U outlet inletOutlet     outletPhaseMeanVelocity is not ported (refused by name); inletOutlet with
@@ -23,16 +24,18 @@
 #   functions removed        the forces function object writes, and changes no field
 #   write every step, ascii  the oracle
 #   laminar                  (`laminar` only) the flow's consumers without the closure
-#   div(phi,k|omega) upwind  (`ras`) the closure's `linearUpwind limitedGrad` is not ported (refused)
 #   nut hull nutkWall...     (`ras`) nutkRoughWallFunction is not ported (refused); its Ks and Cs go
 #
 # MEASURED, ten steps, OpenFOAM's one-ulp floor beside each (the same run with ONE interface cell's alpha
 # moved by one ulp, OpenFOAM against OpenFOAM):
 #   laminar  rDeltaT 1.6e-16 at step 1, <= 3.4e-12 after; alpha 2.6e-10 (8.8e-11), p_rgh 6.1e-10
 #            (1.2e-10), U 6.4e-13 (3.7e-13); all 20 p_rgh and 10 alpha counts OpenFOAM's
-#   ras      rDeltaT <= 5.9e-12; alpha 1.6e-10 (5.0e-11), p_rgh 3.4e-10 (1.0e-10), U 1.6e-12 (1.2e-13),
-#            k 3.7e-12 (1.0e-12), omega 1.0e-11 (1.0e-12), nut 2.8e-11 (5.3e-12); every p_rgh, alpha,
-#            omega and k count and final residual OpenFOAM's
+#   ras      rDeltaT <= 5.3e-12; alpha 1.6e-10 (5.5e-11), p_rgh 3.4e-10 (1.1e-10), U 1.5e-12 (1.2e-13),
+#            k 3.4e-12 (2.8e-13), omega 9.0e-12 (4.7e-13), nut 2.8e-11 (6.2e-12); every p_rgh, alpha,
+#            omega and k count and final residual OpenFOAM's. With the closure staged UPWIND the same
+#            fields read k 3.7e-12, omega 1.0e-11, nut 2.8e-11 -- so linearUpwind, which moves OpenFOAM's
+#            own k, omega and nut by 5e-02 over these ten steps, adds nothing to brae's gap; the gap is the
+#            flow's (U 7.9e-13 at the FIRST step on the laminar profile too), carried into omega and nut.
 # At the FIRST step, before anything amplifies, U is 7.9e-13 on BOTH profiles, so that floor is not the
 # closure's; omega and nut follow it through the production term (4e-13). From step 2 all but 165 of the
 # 845,536 cells sit above the floor 1/maxDeltaT = 1, so the local step is live almost everywhere.
@@ -46,9 +49,14 @@
 #            BRAE_CONTROL_RHOPHI_ALPHAFLUX    the initial rhoPhi as the alpha flux's mass flux (what brae
 #                                             built)                      rDeltaT at step 1 5.4e-01
 #   ras      BRAE_CONTROL_LTS_SCALAR=turbulence  kOmegaSST's two ddts on 1/deltaT  k 1.1e+01, omega 1.1e+00
+#            BRAE_CONTROL_SST_LU_OFF          linearUpwind's correction dropped (upwind)
+#                                             k 9.6e-03, omega 1.7e-02 -- OpenFOAM's own upwind-vs-linearUpwind
+#                                             difference to the digit
+#            BRAE_CONTROL_SST_LU_UNLIMITED    the named gradient unlimited (grad(k)'s `default Gauss linear`)
+#                                             k 2.3e-02, omega 2.6e-01
 #
-# NOT CLAIMED: outletPhaseMeanVelocity, nutkRoughWallFunction and the closure's linearUpwind limitedGrad
-# (refused; later units), fvc::spread and fvc::sweep (refused: DTCHull sets both iteration counts to 0),
+# NOT CLAIMED: outletPhaseMeanVelocity and nutkRoughWallFunction (refused; later units), linearUpwind for k
+# and omega naming different gradients or on a coupled mesh (refused), and on the device (refused), fvc::spread and fvc::sweep (refused: DTCHull sets both iteration counts to 0),
 # a restart (setRDeltaT damps from the third step of EVERY run, and a restart's rhoPhi is rebuilt as
 # interpolate(rho)*phi -- not a continuation of the continuous run), kEpsilon and LES under localEuler
 # (refused), the device loop (refused by name), and anything after ten steps.
@@ -148,10 +156,8 @@ if profile == 'laminar':
 if profile == 'ras':
     fs = os.path.join(d, 'system/fvSchemes')
     t = open(fs).read()
-    t, k1 = re.subn(r'div\(phi,k\)\s+[^;]*;', 'div(phi,k)      Gauss upwind;', t)
-    t, k2 = re.subn(r'div\(phi,omega\)\s+[^;]*;', 'div(phi,omega)  Gauss upwind;', t)
-    assert k1 == 1 and k2 == 1, 'the closure schemes'
-    open(fs, 'w').write(t)
+    assert re.search(r'div\(phi,k\)\s+Gauss\s+linearUpwind\s+limitedGrad;', t), 'the tutorial names linearUpwind'
+    assert re.search(r'limitedGrad\s+cellLimited\s+Gauss\s+linear\s+1;', t), 'the tutorial names cellLimited'
     nf = os.path.join(d, '0/nut')
     t = open(nf).read()
     t, k = re.subn(r'hull\s*\{[^}]*nutkRoughWallFunction[^}]*\}',
@@ -199,7 +205,10 @@ for ctl in BRAE_CONTROL_LTS_NOSMOOTH=1 BRAE_CONTROL_LTS_NODAMP=1 BRAE_CONTROL_LT
 do
     control laminar "$ctl" || rc=1
 done
-control ras BRAE_CONTROL_LTS_SCALAR=turbulence || rc=1
+for ctl in BRAE_CONTROL_LTS_SCALAR=turbulence BRAE_CONTROL_SST_LU_OFF=1 BRAE_CONTROL_SST_LU_UNLIMITED=1
+do
+    control ras "$ctl" || rc=1
+done
 
 echo "interfoam_dtchull_vs_openfoam: rc $rc"
 exit $rc

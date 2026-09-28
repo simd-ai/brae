@@ -2515,7 +2515,13 @@ COMPONENTS = {
              of_file="src/TurbulenceModels/turbulenceModels/Base/kOmegaSST/kOmegaSSTBase.C",
              classification="GPU_REQUIRED", status="REIMPLEMENT",
              brae_reference="src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/kOmegaSST_cpp.cuh",
-             validation="tests/interfoam_waterchannel_vs_openfoam.sh, real OpenFOAM on RAS/waterChannel AS SHIPPED "
+             validation="tests/interfoam_dtchull_vs_openfoam.sh `ras` holds the closure's `Gauss linearUpwind "
+                        "limitedGrad` on k and omega over the NAMED `limitedGrad cellLimited Gauss linear 1` "
+                        "(RAS/DTCHull's own schemes, under localEuler): k 3.4e-12, omega 9.0e-12, nut 2.8e-11 after "
+                        "ten steps, every omega and k count OpenFOAM's; controls: the correction dropped k 9.6e-03, "
+                        "omega 1.7e-02 (OpenFOAM's own upwind-vs-linearUpwind difference to the digit), the named "
+                        "gradient unlimited k 2.3e-02, omega 2.6e-01. "
+                        "tests/interfoam_waterchannel_vs_openfoam.sh, real OpenFOAM on RAS/waterChannel AS SHIPPED "
                         "(its own 28000-cell blockMesh + two extrudeMesh passes, non-orthogonal to 13.7 degrees), "
                         "ten fixed steps of the tutorial's deltaT 0.1. MEASURED: all 20 p_rgh, 10 alpha, 10 omega and "
                         "10 k iteration counts OpenFOAM's, initial residuals within 9.3e-13; alpha 7.9e-13, p_rgh "

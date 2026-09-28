@@ -61,10 +61,11 @@ void bound(
 // 3.4e-12, alpha 2.6e-10, p_rgh 6.1e-10, U 6.4e-13, the p_rgh initial residuals 4.5e-11 -- each bound about
 // three times its measurement. OpenFOAM against itself with one interface cell's alpha moved by one ulp
 // reads alpha 8.8e-11, p_rgh 1.2e-10 and U 3.7e-13 after the same ten steps; see the script.
-// ...and the `ras` profile's, ten kOmegaSST steps: k 3.7e-12, omega 1.0e-11, nut 2.8e-11, U 1.6e-12 (the
-// laminar profile's U bound stays its own). OpenFOAM against itself with one ulp reads k 1.0e-12, omega
-// 1.0e-12, nut 5.3e-12, U 1.2e-13 there; at the FIRST step, before anything amplifies, U is 7.9e-13 on the
-// laminar profile as well, so that floor is not the closure's, and omega and nut follow it (4e-13).
+// ...and the `ras` profile's, ten kOmegaSST steps under the tutorial's `linearUpwind limitedGrad`: k
+// 3.4e-12, omega 9.0e-12, nut 2.8e-11, U 1.5e-12 (the laminar profile's U bound stays its own). OpenFOAM
+// against itself with one ulp reads k 2.8e-13, omega 4.7e-13, nut 6.2e-12, U 1.2e-13 there; at the FIRST
+// step, before anything amplifies, U is 7.9e-13 on the laminar profile as well, so that gap is not the
+// closure's, and omega and nut follow it (4e-13). Staged upwind, the same fields read within 10% of these.
 constexpr scalar BOUND_K = 1e-11;
 constexpr scalar BOUND_OMEGA = 3e-11;
 constexpr scalar BOUND_NUT = 1e-10;

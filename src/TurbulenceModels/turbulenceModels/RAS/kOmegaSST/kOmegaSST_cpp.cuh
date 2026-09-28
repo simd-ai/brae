@@ -320,8 +320,9 @@ void correct(
     const EqnSolveSetting*         omegaSolve = nullptr,
     // OMEGA'S OWN CONVECTION SCHEME. `fvm::div(phi, psi)` resolves `div(phi,<psi>)` by the FIELD's name,
     // so `div(phi,k)` and `div(phi,omega)` may name different schemes. `bounded`/`limitedLinear`/
-    // `limiterCoeff` above are k's; null here means ONE scheme for both. This closure does not assemble
-    // `linearUpwind` at all and refuses it, so that half of EqnDivScheme stays false here.
+    // `limiterCoeff` above are k's; null here means ONE scheme for both. `linearUpwind` is NOT read from
+    // here: the positional flag and co.luGradLimitK carry it for both equations, and the callers refuse a
+    // pair that disagrees.
     const EqnDivScheme*            omegaDiv = nullptr,
     // OMEGA'S OWN GRADIENT SCHEME; `co.gradKLeastSq`/`gradKLimitK` are k's. Null means ONE for both.
     const EqnGradScheme*           omegaGrad = nullptr,

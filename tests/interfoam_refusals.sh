@@ -512,6 +512,8 @@ arm ddt_closureDeadName     runs    -                         "" "ddtblock 'defa
 # (ddt_localEulerSST below, and tests/interfoam_dtchull_vs_openfoam.sh's `ras` profile); this base is
 # kEpsilon under `density variable`, whose fvm::ddt under localEuler is not ported
 arm ddt_localEulerRAS       refused "is not kOmegaSST in the uniform lineage" "" "$LTSSET; $LTSZERO"
+# ...and kEpsilon's linearUpwind, which its closure call does not carry: the reader keeps the refusal
+arm ras_linearUpwindKEpsilon refused "neither \`Gauss upwind\` nor" "" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss linearUpwind grad(k);/' system/fvSchemes"
 # kOmegaSST IS ported, in the uniform lineage (tests/interfoam_waterchannel_vs_openfoam.sh holds it to
 # OpenFOAM). RAS/damBreak made kOmegaSST: `density variable` with it is refused, and so is each thing
 # the closure does not carry -- on a base that RUNS, so a refusal is the one edit's.
@@ -530,6 +532,22 @@ arm sst_blending            refused "blending stepwise"       "" "$SSTBASE; sed 
 arm sst_nutU                refused "nutUWallFunction"        "" "$SSTBASE; sed -i '0,/nutkWallFunction/ s/nutkWallFunction/nutUWallFunction/' 0/nut"
 arm sst_wallWithoutOmegaWF  refused "omegaWallFunction"       "" "$SSTBASE; sed -i '0,/omegaWallFunction;/ s/omegaWallFunction;/zeroGradient;/' 0/omega"
 arm sst_linearUpwindOmega   refused "div(phi,omega)"          "" "$SSTBASE; sed -i 's/div(phi,omega) .*/div(phi,omega) Gauss linearUpwind grad(omega);/' system/fvSchemes"
+# THE CLOSURE'S linearUpwind -- RAS/DTCHull's `Gauss linearUpwind limitedGrad` over a NAMED
+# `cellLimited Gauss linear 1` -- RUNS for kOmegaSST on the pair, gated by
+# tests/interfoam_dtchull_vs_openfoam.sh `ras`. sst_linearUpwindOmega above names it for omega alone:
+# the closure carries one flag and one limiter coefficient for the pair, so that split is refused. Also
+# refused: a named gradient the closure's linearUpwind does not carry (leastSquares, and
+# cellLimited<cubic>, which the shared classifier would read as minmod), a coefficient OpenFOAM itself
+# rejects, kEpsilon's linearUpwind (ras_linearUpwindKEpsilon), a coupled mesh (sst_linearUpwindCoupled,
+# beside BSST in the device block) and the device loop (device_sstLinearUpwind).
+LUGRAD="sed -i '/^gradSchemes/,/^}/ s/default .*/&\\n    limitedGrad     LIMGRAD;/' system/fvSchemes"
+LUBOTH="sed -i 's/div(phi,k) .*/div(phi,k) Gauss linearUpwind limitedGrad;/; s/div(phi,omega) .*/div(phi,omega) Gauss linearUpwind limitedGrad;/' system/fvSchemes"
+arm sst_linearUpwind        runs    -                        "" "$SSTBASE; ${LUGRAD/LIMGRAD/cellLimited Gauss linear 1}; $LUBOTH"
+arm sst_linearUpwindLsq     refused "resolves to \`leastSquares\`" "" "$SSTBASE; ${LUGRAD/LIMGRAD/leastSquares}; $LUBOTH"
+# ...cellLimited<cubic> is stopped BEFORE the closure's reader, by the case's own gradSchemes check; the
+# reader's refusal of `cellLimited<` stays behind it for a caller that skips that check
+arm sst_linearUpwindCubic   refused "cellLimited<cubic> 1.5 Gauss linear 1\` is not ported" "" "$SSTBASE; ${LUGRAD/LIMGRAD/cellLimited<cubic> 1.5 Gauss linear 1}; $LUBOTH"
+arm sst_linearUpwindK2      refused "outside [0, 1]"          "" "$SSTBASE; ${LUGRAD/LIMGRAD/cellLimited Gauss linear 2}; $LUBOTH"
 # `correctWalls no|0|n` RUNS now -- brae skips patchWave's wall-cell override as OpenFOAM does,
 # gated on RAS/waterChannel `correctWallsOff`. `decayControl` is still refused: it adds two terms
 # the closure does not carry.
@@ -849,6 +867,10 @@ if [ $HAVE_GPU = 1 ]; then
     # each equation's gammaCell, the solve's interface, and CDkOmega's two gradients), gated on
     # validation/interFoamCyclic `sst`. A blanket refusal coming back fails this arm.
     arm device_baffle_SST   runs    -                              "-device" "$BSST"
+    # ...and, on the HOST, kOmegaSST's linearUpwind across the pair: OpenFOAM adds the correction on
+    # coupled faces (linearUpwind.C:98-137), the kOmegaSST closure does not, so the reader refuses it.
+    # Here because BSST is.
+    arm sst_linearUpwindCoupled refused "coupled patch"            "" "$BSST; sed -i 's/div(phi,k) .*/div(phi,k) Gauss linearUpwind grad(k);/; s/div(phi,omega) .*/div(phi,omega) Gauss linearUpwind grad(k);/' system/fvSchemes"
     # LES kEqn across a COUPLED PAIR: the case reader refuses any model but kEpsilon with a pair, on
     # both arms (inter_case_cpp.cu:1285), and BEHIND that the device LES closure has its own refusal --
     # LESkEqnInput carries no interface, so k would convect and diffuse across the periodic faces as if
@@ -899,6 +921,11 @@ if [ $HAVE_GPU = 1 ]; then
     # localEuler runs on the HOST loop only (ddt_localEuler above); the device loop refuses it by name
     # rather than run every ddt at controlDict's deltaT
     arm device_localEuler   refused "ported on the host loop only" "-device" "$LTSSET; $LTSZERO"
+    # kOmegaSST's linearUpwind runs on the HOST closure (sst_linearUpwind above); the device closure is
+    # not wired for it and refuses by name -- RAS/DTCHullMoving, an Euler case, would reach it
+    BASE="$BR"
+    arm device_sstLinearUpwind refused "the device closure is not wired" "-device" "$SSTBASE; ${LUGRAD/LIMGRAD/cellLimited Gauss linear 1}; $LUBOTH"
+    BASE="$B"
     BASE="$B"
     # the device's alpha pre-solve honours the case's minIter now, as the host's always has
     # (DeviceAlphaSolverControls::minIter; tests/interfoam_dambreak_vs_openfoam.sh `alphaminiter` holds

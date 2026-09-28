@@ -445,10 +445,13 @@ void correct(
     kDivS.bounded = bounded;
     kDivS.limitedLinear = limitedLinear;
     kDivS.limiterCoeff = limiterCoeff;
-    // EXPLICITLY FALSE, not left to the default: this closure does not assemble `Gauss linearUpwind`
-    // at all and refuses it by name, so there is no parameter to copy from. The kEpsilon twin builds
-    // the same struct from five parameters, and a reader of two builders that fill different subsets
-    // cannot tell "not applicable here" from "forgotten" -- which is what the defaults audit flagged.
+    // EXPLICITLY FALSE, not left to the default: this closure assembles `Gauss linearUpwind` through
+    // the positional `linearUpwind` flag and co.luGradLimitK, for BOTH equations -- its callers require
+    // k's and omega's entries to agree (rhoSimpleFoam's driver, interFoam's readClosureDivScheme) --
+    // and never through EqnDivScheme, so that half of the struct is not read here. The kEpsilon twin
+    // builds the same struct from five parameters, and a reader of two builders that fill different
+    // subsets cannot tell "not applicable here" from "forgotten" -- which is what the defaults audit
+    // flagged.
     kDivS.linearUpwind = false;
     kDivS.luGradK = 0.0;
     const EqnDivScheme oDiv = omegaDiv ? *omegaDiv : kDivS;

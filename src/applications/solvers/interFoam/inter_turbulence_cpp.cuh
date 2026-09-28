@@ -160,8 +160,10 @@ struct InterTurbulence
     // div(<flux>,k) and div(<flux>,<second field>): `Gauss upwind` or `Gauss limitedLinear <k>`, ONE
     // PER EQUATION. `fvm::div(phi, psi)` resolves the entry by the FIELD's name, so the two need not
     // agree and OpenFOAM assembles two different matrices; this carried a single pair and the reader
-    // refused a mismatch. The host closures take k's positionally and the second through EqnDivScheme;
-    // the DEVICE closure carries one scheme for both equations in its kernels and still refuses.
+    // refused a mismatch. The host closures take k's positionally and the second through EqnDivScheme.
+    // kOmegaSST also takes `Gauss linearUpwind <grad>` -- on the pair, which must agree (one flag and one
+    // limiter coefficient in its closure) -- with luGradK the NAMED gradient's cellLimited coefficient;
+    // the device closure refuses it (device_inter_turbulence.cu).
     cpu::EqnDivScheme kDiv;
     cpu::EqnDivScheme secondDiv;
     // grad(k) and grad(<second field>), ONE PER EQUATION. `fvc::grad(vf)` resolves `grad(<vf>)` by the

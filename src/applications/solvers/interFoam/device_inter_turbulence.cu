@@ -711,6 +711,15 @@ void deviceCorrectInterTurbulence(
         // the assembly's limiter and corrected-laplacian gradients (schemeOf), and CDkOmega, which takes
         // grad(k) AND grad(omega) in one expression (kOmegaSSTBase.C:548) and so must resolve each by
         // its own field's name.
+        // `Gauss linearUpwind <grad>` is carried by the HOST closure (inter_turbulence_cpp.cu reads it for
+        // kOmegaSST, gated on RAS/DTCHull); this arm hands only limitedLinear over, so a case naming it
+        // would run k and omega upwind here. Refused by name until the device transport's own
+        // linearUpwind is wired and gated -- RAS/DTCHullMoving, an Euler case, reaches this.
+        if (t.kDiv.linearUpwind || t.secondDiv.linearUpwind)
+            throw std::runtime_error(
+                "brae interFoam (device): fvSchemes names `Gauss linearUpwind <grad>` for kOmegaSST's k and "
+                "omega. The host closure carries it; the device closure is not wired for it yet. Run "
+                "without -device.");
         sin.omegaDiv  = &t.secondDiv;
         sin.omegaGrad = &t.secondGrad;
         sin.limitedLinear   = t.kDiv.limitedLinear;
