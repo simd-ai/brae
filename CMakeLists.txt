@@ -3851,6 +3851,19 @@ set_tests_properties(interfoam_amr_levels_vs_openfoam PROPERTIES
                      DEPENDS test_inter_amr_vs_openfoam
                      TIMEOUT 1800)
 
+# ...and RAS/motorBike ITSELF, which is what the levels, instance, RAS and autoMap units were each built for:
+# a snappyHexMesh mesh at levels 1 to 3 with BINARY cellLevel/pointLevel and no refinementHistory, 61 patches,
+# and kOmegaSST on a mesh that changes under it. The mesh is an INPUT, produced once by real OpenFOAM's own
+# SERIAL snappyHexMesh -- the path Allrun.pre ships commented out, 1.53 s for 8655 cells -- because snappy is
+# a mesher and brae's subject is interFoam. Nothing in this gate is parallel.
+add_test(NAME interfoam_motorbike_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_motorbike_vs_openfoam.sh)
+set_tests_properties(interfoam_motorbike_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_inter_amr_vs_openfoam
+                     TIMEOUT 1200)
+
 # ...and a GENUINE RESTART, where nothing is moved into constant/polyMesh: the seed leaves an ORIGINAL mesh
 # there and a REFINED one in the time directory, and both codes continue from the time directory. That is the
 # instance resolution the levels gate above explicitly did not claim -- OpenFOAM SEARCHES for points, faces

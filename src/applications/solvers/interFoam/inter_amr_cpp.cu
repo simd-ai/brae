@@ -306,8 +306,14 @@ InterAmr readInterAmr(
         {
             label mx = 0;
             for (const label l : amr.state.levels.cellLevel) mx = (l > mx) ? l : mx;
+            // THE SPLIT CELLS ARE THE ENTRIES WITH A PARENT, not the length of the list: `parent` has one
+            // entry per cell of the history (refinementHistory.C:392-412 sizes it to nCells and fills it
+            // with -1), so printing its SIZE called every cell of a mesh with no history a split cell --
+            // motorBike, whose Allrun.pre removes the history, reported "8655 split cell(s)" on 8655 cells.
+            std::size_t nSplit = 0;
+            for (const label pr : amr.state.history.parent) { if (pr >= 0) ++nSplit; }
             std::printf("  the mesh carries a refinement state: cellLevel up to %ld, %zu split cell(s) in "
-                        "its history\n", (long)mx, amr.state.history.parent.size());
+                        "its history\n", (long)mx, nSplit);
         }
     }
     const std::vector<std::vector<label>> cells = meshCells(m);
@@ -321,21 +327,36 @@ InterAmr readInterAmr(
         const std::string pm = facesPolyMeshDir + "/";
         // cellZones ARE CARRIED (dynamicRefine::renumberCellZones), so they are NOT counted here.
         label nZ = 0;
-        // ...the other two kinds by their own ENTRY COUNT, not by the file being there: subsetMesh
-        // writes cellZones, faceZones and pointZones for every mesh it makes, each holding `0()`, so a
-        // test on the file's existence counted two zones on a case that has none and refused it.
+        // ...the other two kinds by their MEMBERS, and not by the file being there NOR by the number of
+        // zone ENTRIES. Two narrowings, each measured on a real mesh:
+        //
+        //   * subsetMesh writes cellZones, faceZones and pointZones for every mesh it makes, each holding
+        //     `0()`, so a test on the file's EXISTENCE counted two zones on a case that has none.
+        //   * snappyHexMesh writes a pointZone `frozenPoints` with `pointLabels List<label> 0` -- an entry
+        //     with NO POINTS IN IT -- so a test on the ENTRY COUNT refused motorBike, whose mesh is exactly
+        //     that. An empty zone has nothing to renumber: resetZones sizes the new addressing from the
+        //     zone's own membership (polyTopoChange.C:1612-1700), so a zone with no members comes out of the
+        //     change empty, with its name and type, whatever the map says. What the refusal is FOR is a zone
+        //     that HAS members, whose labels the change must renumber and whose faceZone flip map goes with
+        //     them -- so that is what is counted.
         for (const char* other : {"faceZones", "pointZones"})
         {
             std::ifstream in(pm + other);
             if (!in) continue;
             std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-            // the list count is the integer before the first '(' AFTER the FoamFile block
-            const std::size_t hdr = text.find('}');
-            std::size_t i = (hdr == std::string::npos) ? 0 : hdr + 1;
-            while (i < text.size() && !std::isdigit(static_cast<unsigned char>(text[i]))) ++i;
-            std::size_t j = i;
-            while (j < text.size() && std::isdigit(static_cast<unsigned char>(text[j]))) ++j;
-            if (j > i) nZ += static_cast<label>(std::stol(text.substr(i, j - i)));
+            // Each zone entry carries its members under a `...Labels` key, whose count is the next integer
+            // (`pointLabels List<label> 0;` as well as `faceLabels 3(1 2 3);`). A faceZone's `flipMap` has a
+            // count of its own and is NOT one of these keys, so it is not counted twice.
+            std::size_t at = 0;
+            while ((at = text.find("Labels", at)) != std::string::npos)
+            {
+                at += 6;
+                std::size_t i = at;
+                while (i < text.size() && !std::isdigit(static_cast<unsigned char>(text[i]))) ++i;
+                std::size_t j = i;
+                while (j < text.size() && std::isdigit(static_cast<unsigned char>(text[j]))) ++j;
+                if (j > i && std::stol(text.substr(i, j - i)) > 0) ++nZ;
+            }
         }
         amr.state.nZones = nZ;
     }

@@ -369,7 +369,7 @@ int main(
     // the two turbulent profiles of tests/interfoam_amr_ras_vs_openfoam.sh: `ke` as shipped and `sst` the
     // same case made kOmegaSST. They share every bound; what differs is that only kOmegaSST builds a CELL
     // wall distance, which is the half of that unit `ke` cannot witness.
-    const bool ras = (profile == "ke" || profile == "sst");
+    const bool ras = (profile == "ke" || profile == "sst" || profile == "motorBike");
     // ...AND THE DEVICE LOOP'S kOmegaSST FLOOR, which is not this unit's and is not a loosening. The static
     // RAS gate names it once and holds every SST profile to it (tests/test_inter_ras_dambreak_vs_openfoam.cu
     // :146-151): "nut carries the device loop's U difference through k, omega and F2, so an SST profile sits
@@ -377,6 +377,13 @@ int main(
     // 1.1299e-10 through two topology changes, the same order. The HOST arm is at 1e-14 on both profiles,
     // which is what says the floor is the device closure's and not the carry's.
     const bool sstProfile = (profile == "sst");
+    // `motorBike` is RAS/motorBike itself: a snappyHexMesh mesh at levels 0 to 3, its cellLevel and
+    // pointLevel BINARY, no refinementHistory (Allrun.pre removes it), 61 patches and kOmegaSST. It is what
+    // the levels, instance, RAS and autoMap units were built for, and it needed no further port -- only two
+    // narrowings the case itself found: an empty pointZone was refused, and the split-cell count printed the
+    // length of a list. Its mesh is produced ONCE by real OpenFOAM's own serial snappyHexMesh, the path its
+    // Allrun.pre ships commented out; snappy is not ported and is not going to be.
+    const bool motorBikeProfile = (profile == "motorBike");
     // `levels`: the mesh STARTS ALREADY REFINED, from a seed real OpenFOAM produced, so this is the only
     // profile whose FIRST change maps a developed state. Its sharpest arm is not a field at all -- it is
     // `every cell's refinement level is OpenFOAM's`, because the levels are the state the NEXT change reads.
@@ -423,6 +430,25 @@ int main(
         : levelsProfile
         ? Bounds{5e-09, 5e-08, 5e-07, 5e-08, 5e-07, 5e-07, 5e-07, 1e-9, 5e-09, 5e-07, 5e-09, 5e-07,
                  5e-08, 5e-08, 5e-07, 1e-13, 5e-07, 5e-07, 0, 0, 0, 0, 0, 0, 5e-08, 2}
+        // MEASURED over two fixed steps on the serial snappy mesh (8655 cells, refining to 11,693 and then
+        // 21,297 -- OpenFOAM's own counts to the cell): alpha 3.0414e-15, p_rgh 9.2875e-15, U 2.2091e-13,
+        // p 2.0284e-13, rAU 2.5635e-12, phi 9.1492e-14, Uf 2.7228e-13, patch U 1.0487e-13, patch p_rgh
+        // 6.5477e-15, k 8.2588e-15, omega 5.7939e-14, nut 1.3239e-12; both continuity errors 2.58e-15; and
+        // all 12 p_rgh and 6 pcorr solves take OpenFOAM's iteration count from OpenFOAM's initial residuals.
+        // These are the FLOATING-POINT FLOOR and not an amplified envelope -- Co is 0.026 over two steps --
+        // which is why this profile needs no one-ulp twin to justify them and has ulpFactor 0.
+        //
+        // THE DEVICE ARM'S TURBULENCE IS THE ONE LOOSE SLOT, and it is recorded rather than hidden: k
+        // 1.0896e-10, omega 7.4032e-09, nut 6.6811e-08 relative, where the `sst` profile's device closure
+        // reads 7.4632e-11 / 1.1299e-10 / 1.0470e-10 on its own fixture -- 66x and 640x on omega and nut.
+        // The HOST arm is at 5.7939e-14 and 1.3239e-12 here, so it is the DEVICE closure and not the carry
+        // through the change; and it does not reach the solution at two steps, where the device's alpha is
+        // 2.8727e-15 and its U 2.5973e-12. Whether that is this case's y+ spread over 60 wall patches or a
+        // device gap the other fixture cannot see is its own question, named in PORT.md and not settled here.
+        : motorBikeProfile
+        ? Bounds{1e-14, 5e-14, 1e-12, 1e-12, 1e-11, 5e-13, 1e-12, 1e-9, 1e-14, 1e-11, 1e-14, 1e-11,
+                 5e-14, 5e-14, 5e-13, 1e-13, 1e-11, 1e-11,
+                 5e-14, 5e-13, 1e-11, 5e-10, 5e-08, 5e-07, 5e-14, 0}
         : sstProfile
         ? Bounds{5e-14, 1e-13, 1e-12, 1e-13, 1e-12, 5e-12, 1e-12, 1e-9, 5e-14, 5e-10, 5e-14, 5e-10,
                  1e-13, 1e-13, 1e-13, 1e-13, 5e-10, 5e-10,
@@ -775,8 +801,23 @@ int main(
         std::printf("  CONTROL (the cell fields resized, not mapped): alpha %.4e, U rel %.4e\n",
                     (double)cA.linf, (double)cU.rel());
         check("...the control ran every step", C.r.steps == nSteps);
-        check("...and is caught: its alpha is more than a million times further out than the gate's",
-              cA.linf > scalar(1e6)*std::fmax(dAlpha.linf, scalar(1e-300)));
+        if (motorBikeProfile)
+        {
+            // ON THIS FIXTURE ALPHA CANNOT WITNESS IT, which is measured and not assumed: the cells this
+            // case refines are deep in the air, where alpha is 0, so RESIZING a cell field zero-fills them
+            // with the value mapping would have given -- the control reads alpha 2.9724e-11 against the
+            // gate's 3.0414e-15, under the million. U is where it shows, at 3.2311e-02 against 2.2091e-13,
+            // eleven orders. The arm asserts on the field that can see it rather than on the field the
+            // other profiles use.
+            check("...and is caught on U: 3.2e-02 against the gate's 2.2e-13, where alpha cannot see it "
+                  "because this case refines into air",
+                  cU.rel() > scalar(1e6)*std::fmax(dU.rel(), scalar(1e-300)));
+        }
+        else
+        {
+            check("...and is caught: its alpha is more than a million times further out than the gate's",
+                  cA.linf > scalar(1e6)*std::fmax(dAlpha.linf, scalar(1e-300)));
+        }
     }
     // ...AND THE ONE THAT CANNOT WITNESS, measured rather than assumed. At the top of a step every
     // old-time level is a copy of its own field -- OpenFOAM's storeOldTimes runs on the step's first
@@ -1103,7 +1144,17 @@ int main(
                     "%.4e, and %.4e from the gate's own arm\n",
                     (double)tA.linf, (double)tU.rel(), (double)tSelfA.linf);
         check("...the control ran every step", T.r.steps == nSteps);
-        if (sstProfile)
+        if (motorBikeProfile)
+        {
+            // AND HERE IT IS ALPHA THAT IS BLIND, again measured: the control leaves alpha BIT-IDENTICAL to
+            // the gate's own arm (0.0000e+00 between them) because two steps at Co 0.026 do not carry a
+            // nut difference into the phase fraction. It moves U to 4.6894e-03 against the gate's
+            // 2.2091e-13, ten orders, so that is what this profile asserts.
+            check("...and is caught on U: kOmegaSST blends F1 and F2 on the cell wall distance, and leaving "
+                  "it at the old mesh's puts U ten orders out where alpha does not move at all",
+                  tU.rel() > scalar(1e6)*std::fmax(dU.rel(), scalar(1e-300)));
+        }
+        else if (sstProfile)
         {
             check("...and is caught: kOmegaSST blends F1 and F2 on the cell wall distance, so leaving it "
                   "at the old mesh's is a million times further out than the gate",
