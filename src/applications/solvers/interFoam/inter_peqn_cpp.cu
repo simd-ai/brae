@@ -4,6 +4,8 @@
 #include "fvc_reconstruct_cpp.cuh"
 #include <cmath>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <cstdio>
 #include "fvm.cuh"
 #include "fv_matrix_ops.cuh"
@@ -710,6 +712,44 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
         in.taps->phiHbyA = phiHbyA.internal;
         in.taps->stf = in.stf->internal;
         in.taps->snGradRho = in.snGradRho->internal;
+    }
+    // Instrument: BRAE_STAGE_DUMP_DIR=<dir> (+ BRAE_STAGE_DUMP_ITER=n, default 1) writes the
+    // momentum-to-pressure hand-off at the nth step's FIRST corrector, under the names
+    // tools/dumpInterFoam writes OpenFOAM's -- rAU, HbyA, rAUf, phig, phiHbyA, stf, snGradRho. It goes
+    // here rather than at the end of the step because every one of these feeds the next: ddtCorr reads
+    // Uf.oldTime() and correctUf writes Uf back from U, so a field written at the end of a step cannot
+    // say which of them moved first.
+    {
+        static int firstCorrectors = 0;
+        const char* dd = std::getenv("BRAE_STAGE_DUMP_DIR");
+        const bool countHere = (in.correctorIndex <= 0);
+        if (countHere) ++firstCorrectors;
+        const char* it = std::getenv("BRAE_STAGE_DUMP_ITER");
+        if (dd && countHere && firstCorrectors == (it && *it ? std::atoi(it) : 1))
+        {
+            std::error_code ec;
+            std::filesystem::create_directories(dd, ec);
+            const std::string dir(dd);
+            const auto wS = [&dir](const char* n, const std::vector<scalar>& v)
+            {
+                std::ofstream o(dir + "/" + n);
+                o.precision(17);
+                for (const scalar x : v) o << x << "\n";
+            };
+            const auto wV = [&dir](const char* n, const std::vector<vector>& v)
+            {
+                std::ofstream o(dir + "/" + n);
+                o.precision(17);
+                for (const vector& x : v) o << x.x << " " << x.y << " " << x.z << "\n";
+            };
+            wS("peqnRAU", rAU);
+            wV("peqnHbyA", HbyA);
+            wS("peqnRAUf", rAUfField.internal);
+            wS("peqnPhig", phig);
+            wS("peqnPhiHbyA", phiHbyA.internal);
+            wS("peqnStf", in.stf->internal);
+            wS("peqnSnGradRho", in.snGradRho->internal);
+        }
     }
     for (label f = 0; f < nIf; ++f) phiHbyA.internal[f] += phig[f];
 

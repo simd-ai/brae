@@ -516,19 +516,31 @@ int main(
     // interfoam_amr_vs_openfoam.sh records those numbers. They are floating-point floors and not
     // tolerances: this solver reproduces OpenFOAM's own arithmetic on this case, so alpha lands at
     // 1.9e-15 on 82,264 cells and every one of the nine solves matches OpenFOAM's residual to the bit.
-    // THE FIELD BOUNDS ARE REPORTED AND NOT ASSERTED ON THE restart PROFILE, and that is deliberate rather
-    // than a relaxation. Its numbers are alpha 5.6049e-10, p_rgh 2.7323e-09, U 4.2657e-08 -- and OpenFOAM's
-    // OWN one-ulp twin on that fixture reads about 2.8e-11 / 8.5e-11 / 1.7e-09, so brae sits 20x to 32x the
-    // envelope rather than inside it. Unlike the levels profile (1.35x) that is NOT the case's conditioning,
-    // and the remaining difference is NOT localised: alphaPhi0's value was the obvious candidate and was
-    // measured NOT to be it (identical to five figures with the file removed, which interFoam.C:120-123
-    // explains -- talphaPhi1Corr0.clear() discards it when the topology changes). Rounding the bound up to
-    // fit would be exactly the defect-not-yet-found this project's rules name, so the arms this profile does
-    // assert are the ones it can justify: the mesh, every cell LEVEL, the Uf read itself, and its CONTROL,
-    // which is caught by eight orders. The fields are printed beside them and named in PORT.md as the next
-    // thing to localise.
-    const bool assertFields = !restartProfile;
-    if (assertFields)
+    // THE restart PROFILE'S FIELDS ARE NOW ASSERTED, on the levels profile's own bounds and with nothing
+    // widened, and what changed is the CONTROL rather than the code.
+    //
+    // It used to read 20x to 32x OpenFOAM's own one-ulp twin -- alpha 5.6049e-10, p_rgh 2.7323e-09,
+    // U 4.2657e-08 against a twin at about 2.8e-11 / 8.5e-11 / 1.7e-09 -- and the difference was recorded
+    // here as not localised. IT WAS THE TWIN. That twin perturbed the first cell whose alpha is exactly 1,
+    // which on a developed damBreak is deep in the water: every neighbour is 1 as well, and the curvature is
+    // a function of alpha's GRADIENT, so the perturbation never reaches it. Measured with
+    // tools/dumpInterFoam on both runs: it moves 12 of 12,487 faces of the surface tension force, by
+    // 3.5e-21, and its p_rgh after three steps moves 8.5e-11 -- under the 1e-10 the amplification arm below
+    // asks for. tests/interfoam_amr_ulp_cell.py now perturbs a cell AT THE INTERFACE -- the owner of the
+    // first internal face whose alpha differs either side, cell 2268 on this fixture -- and against that
+    // twin the gate reads, with nothing else changed:
+    //     levels        0.98x alpha   0.85x p_rgh   1.03x U   (twin 1.0750e-09 / 5.3029e-09 / 3.5029e-08)
+    //     restart       0.86x alpha   0.95x p_rgh   0.78x U   (twin 6.5006e-10 / 2.8660e-09 / 5.4635e-08)
+    // The 20x was the control's and not the port's.
+    //
+    // THE STAGE TRACE IS WHAT SETTLED IT, at the first change and the first corrector, brae against
+    // OpenFOAM's own dumps (BRAE_STAGE_DUMP_DIR against tools/dumpInterFoam's BRAE_DUMP_ITER):
+    //     Uf as mapped, phi = Sf & Uf, alpha at calculateK, and the post-refinement Sf, C, V, weights and
+    //     deltaCoeffs are ALL BIT-IDENTICAL; pcorr's phi 1.1199e-15; UEqn's source 2.7943e-16 and its
+    //     diagonal 3.7501e-16; rAU 1.9391e-13; HbyA 2.3941e-15; phiHbyA 1.9645e-15.
+    // The three operations this unit set out to separate -- the Sf & Uf rebuild, the pcorr solve and
+    // correctUf -- are therefore not where the difference is born; the interface chain (nHatf 1.42x the
+    // interface twin, sigmaK 0.07x, stf 2.88x) is where it lives, and it is round-off there.
     {
         check("alpha is at this profile's floor from OpenFOAM's", dAlpha.linf < B.alpha);
         check("p_rgh is at this profile's floor, relative", dPrgh.rel() < B.pRgh);
@@ -537,12 +549,6 @@ int main(
         check("rAU is at this profile's floor, relative", dRAU.rel() < B.rAU);
         check("phi is at this profile's floor, relative", dPhi.rel() < B.phi);
         check("Uf is at this profile's floor, relative", dUf.rel() < B.Uf);
-    }
-    else
-    {
-        std::printf("  (the field distances above are REPORTED, not asserted, on this profile -- see the "
-                    "comment in this test: brae is 20x to 32x OpenFOAM's own one-ulp envelope here and the "
-                    "remainder is not localised, so no bound is claimed for them)\n");
     }
 
     // HOW DIFFUSE the Uf difference is, for the levels/restart profiles. It reports the worst face and how
@@ -1230,13 +1236,9 @@ int main(
                         (double)(dU.rel()/std::fmax(eU.rel(), scalar(1e-300))));
             // THE FIXTURE MUST BE ABLE TO WITNESS ITS OWN BOUND. If one ulp did NOT amplify here, these
             // bounds would be slack rather than the case's conditioning, and this arm says which.
-            if (!assertFields)
-            {
-                std::printf("  (the envelope arms are reported only on this profile, for the same reason)\n");
-            }
             check("the case AMPLIFIES: one ulp of OpenFOAM's own input moves its p_rgh by more than 1e-10, "
                   "so this profile's bounds are the case's conditioning and not slack",
-                  !assertFields || eP.rel() > scalar(1e-10));
+                  eP.rel() > scalar(1e-10));
             // ...and the statement the bound is worth: brae is INSIDE the envelope OpenFOAM's own
             // round-off draws, asserted at 1x rather than at a factor, because a factor would be a
             // tolerance and this is a comparison.
@@ -1257,9 +1259,9 @@ int main(
             // by its ABSOLUTE bound instead (1e-10, measured 7.87e-11) and its ratio is printed, not
             // asserted -- an assertion that happens to hold at the step count someone picked is not one.
             check("brae is within this profile's measured multiple of OpenFOAM's own one-ulp twin, on p_rgh",
-                  !assertFields || (B.ulpFactor > scalar(0) && dPrgh.rel() <= B.ulpFactor*eP.rel()));
+                  B.ulpFactor > scalar(0) && dPrgh.rel() <= B.ulpFactor*eP.rel());
             check("...and on U",
-                  !assertFields || (B.ulpFactor > scalar(0) && dU.rel() <= B.ulpFactor*eU.rel()));
+                  B.ulpFactor > scalar(0) && dU.rel() <= B.ulpFactor*eU.rel());
         }
     }
 

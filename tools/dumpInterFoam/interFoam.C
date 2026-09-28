@@ -164,7 +164,13 @@ int main(int argc, char *argv[])
                             surfaceScalarField("phiAbsPre.dump", phi).write();
                             surfaceScalarField("rAUfCorr.dump",
                                                fvc::interpolate(rAU())()).write();
-                            surfaceScalarField("meshPhiU.dump", fvc::meshPhi(U)()).write();
+                            // ...only where there IS one. fvMesh::phi() is a FATAL ERROR on a mesh that
+                            // changes topology without moving its points (fvMeshGeometry.C:421, "mesh flux
+                            // field does not exist"), and this block runs for a REFINING mesh too.
+                            if (mesh.moving())
+                            {
+                                surfaceScalarField("meshPhiU.dump", fvc::meshPhi(U)()).write();
+                            }
                             surfaceVectorField("UfIn.dump", Uf()).write();
                         }
                         // ----------------------------------------------------------------------

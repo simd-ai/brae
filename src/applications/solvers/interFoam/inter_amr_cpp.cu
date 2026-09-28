@@ -21,6 +21,49 @@ namespace {
 
 constexpr const char* WHO = "brae interFoam (adaptive mesh): ";
 
+// Instrument: BRAE_STAGE_DUMP_DIR=<dir> (+ BRAE_STAGE_DUMP_ITER=n, default 1) writes the mesh-change
+// block's THREE flux stages, one value per line, under the names tools/dumpInterFoam writes OpenFOAM's --
+// UfIn, phiAbsPre, phiAbsPost. That is the split this unit needs: the mapped Uf that goes in, the
+// `phi = Sf & Uf` rebuild (interFoam.C:134) and the pcorr solve, in the one place where the restart
+// profile's difference could be born. The end-of-step fields cannot separate them, because pEqn's
+// ddtCorr reads Uf.oldTime() and correctUf writes Uf from U, so every stage feeds the next.
+struct AmrStageDump
+{
+    std::string dir;
+    bool on = false;
+
+    void vectors(const char* name, const std::vector<vector>& v) const
+    {
+        if (!on) return;
+        std::ofstream o(dir + "/" + name);
+        o.precision(17);
+        for (const vector& x : v) o << x.x << " " << x.y << " " << x.z << "\n";
+    }
+
+    void scalars(const char* name, const std::vector<scalar>& v) const
+    {
+        if (!on) return;
+        std::ofstream o(dir + "/" + name);
+        o.precision(17);
+        for (const scalar x : v) o << x << "\n";
+    }
+};
+
+AmrStageDump openAmrStageDump()
+{
+    AmrStageDump d;
+    const char* dd = std::getenv("BRAE_STAGE_DUMP_DIR");
+    if (!dd) return d;
+    static int changes = 0;
+    const char* it = std::getenv("BRAE_STAGE_DUMP_ITER");
+    if (++changes != (it && *it ? std::atoi(it) : 1)) return d;
+    std::error_code ec;
+    std::filesystem::create_directories(dd, ec);
+    d.dir = dd;
+    d.on = !ec;
+    return d;
+}
+
 // A solver carries more than fields. Each of these is state a topology change invalidates and that no
 // unit has mapped yet, so it throws and names itself rather than surviving into the next step.
 void refuseUnmappedState(const InterFields& f)
@@ -1005,8 +1048,10 @@ void interAfterMeshChange(
     if (skipCorrectPhi)
         std::printf("  *** CONTROL MODE: the flux is left as the mapper wrote it -- no Sf & Uf rebuild "
                     "and no pcorr solve. This run is deliberately wrong. ***\n");
+    const AmrStageDump asd = openAmrStageDump();
     if (f.correctPhi && !skipCorrectPhi)
     {
+        asd.vectors("UfIn", f.Uf.internal);
         if (f.Uf.internal.size() != static_cast<std::size_t>(m.nInternalFaces()))
             throw std::runtime_error(
                 std::string(WHO) + "correctPhi is on and Uf has " + std::to_string(f.Uf.internal.size())
@@ -1028,7 +1073,9 @@ void interAfterMeshChange(
                         f.Uf.boundary[pi][static_cast<std::size_t>(i)]);
             }
         }
+        asd.scalars("phiAbsPre", f.phi.internal);
         const SurfaceScalarField rAUf = fvc::interpolate(f.rAU, m, g, patches);
+        asd.scalars("rAUfCorr", rAUf.internal);
         CorrectPhiInput cin;
         cin.rAUf = &rAUf;
         cin.meshChanging = true;
@@ -1036,6 +1083,7 @@ void interAfterMeshChange(
         cin.rhoPhi = &f.rhoPhi;
         cin.solveLog = &rep.pcorrSolves;
         correctPhi(f.U, f.phi, f.p_rgh, cin, cpc, m, g, patches);
+        asd.scalars("phiAbsPost", f.phi.internal);
         pushFluxToPatches(f, patches);
     }
 
@@ -1075,6 +1123,25 @@ void interAfterMeshChange(
     // ...and the interface: nHatf and K are mapped, and then rebuilt on the new geometry, which is what
     // mixture.correct() does last
     interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, f.nHatf, f.K);
+    // ...and what it leaves for the pressure corrector, which is where the restart profile's difference
+    // first appears: the surface tension force is interpolate(sigma*K)*snGrad(alpha1), so K, nHatf and the
+    // alpha calculateK saw are the three inputs behind it.
+    asd.scalars("nHatf", f.nHatf.internal);
+    asd.scalars("K", f.K);
+    asd.scalars("alphaAtK", f.alpha1.internal);
+    // ...and the geometry those are a function of once alpha is fixed, because a refined mesh's face
+    // centres and areas are computed and not read: they are the only other input.
+    if (asd.on)
+    {
+        std::vector<vector> sf(g.Sf().begin(), g.Sf().begin() + m.nInternalFaces());
+        asd.vectors("Sf", sf);
+        asd.vectors("C", std::vector<vector>(g.C().begin(), g.C().begin() + m.nCells()));
+        asd.scalars("V", std::vector<scalar>(g.V().begin(), g.V().begin() + m.nCells()));
+        asd.scalars("weights", std::vector<scalar>(g.weights().begin(),
+                                                   g.weights().begin() + m.nInternalFaces()));
+        asd.scalars("deltaCoeffs", std::vector<scalar>(g.deltaCoeffs().begin(),
+                                                       g.deltaCoeffs().begin() + m.nInternalFaces()));
+    }
 
     (void)rep;
 }

@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <memory>
 
 namespace brae {
@@ -1071,6 +1072,31 @@ RunReport runInterFoam(
                     // sub-cycle and before UEqn, and interfaceProperties::correct() IS calculateK.
                     // Rebuilding only rho/mu/nu leaves UEqn's surface-tension force one pass behind.
                     interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, f.nHatf, f.K);
+                    // Instrument: BRAE_STAGE_DUMP_DIR=<dir> (+ BRAE_STAGE_DUMP_ITER=n, default 1) writes
+                    // what the alpha step leaves for the momentum, at the nth step, under the names
+                    // tools/dumpInterFoam writes OpenFOAM's -- nHatfA, sigmaKA (as K), alphaPostMULES.
+                    // The pEqn's surface-tension force is built from THIS curvature and not the one the
+                    // mesh-change block left, so the two have to be compared separately.
+                    if (const char* dd = std::getenv("BRAE_STAGE_DUMP_DIR"))
+                    {
+                        const char* it = std::getenv("BRAE_STAGE_DUMP_ITER");
+                        if (rep.steps == (it && *it ? std::atoi(it) : 1))
+                        {
+                            std::error_code ec;
+                            std::filesystem::create_directories(dd, ec);
+                            const std::string dir(dd);
+                            const auto wS = [&dir](const char* n, const std::vector<scalar>& v)
+                            {
+                                std::ofstream o(dir + "/" + n);
+                                o.precision(17);
+                                for (const scalar x : v) o << x << "\n";
+                            };
+                            wS("nHatfA", f.nHatf.internal);
+                            wS("KA", f.K);
+                            wS("alphaPostMULES", f.alpha1.internal);
+                            wS("rhoAfterAlpha", f.rho);
+                        }
+                    }
                     break;
                 }
 

@@ -273,24 +273,19 @@ grep -E "Refined from|Unrefined from" "$G/log.interFoam" | sed 's/^/  OpenFOAM: 
 # by one ulp and compared to ITSELF; the binary asserts that brae is no further from OpenFOAM than that twin
 # is, and that the twin itself is above 1e-10 so a fixture that stopped amplifying would fail here rather
 # than pass on a slack bound.
+#
+# THE PERTURBED CELL IS AT THE INTERFACE, and tests/interfoam_amr_ulp_cell.py says why: perturbing the first
+# cell that is exactly 1 puts it deep in the water, where every neighbour is 1 as well and the curvature --
+# a function of alpha's GRADIENT -- never sees it. That twin moved 12 of 12,487 faces of the surface tension
+# force and its p_rgh after three steps moved 8.5e-11, below the 1e-10 this gate asks of an amplifying case;
+# the restart profile read 20x to 32x against it and could assert nothing. Against a twin perturbed at the
+# interface the same brae runs read 0.98x/0.85x/1.03x on the levels profile and 0.86x/0.95x/0.78x on the
+# restart one (alpha/p_rgh/U), which is what lets the restart fields be asserted at all.
 U2="$W/levelsUlp"
 rm -rf "$U2"
 cp -r "$G" "$U2" || exit 1
 rm -rf "$U2"/0.[0-9]* "$U2"/log.interFoam
-python3 - "$U2" <<'PYEOF' || exit 1
-import sys, math
-C = sys.argv[1]
-p = C + '/0/alpha.water'
-t = open(p).read()
-i = t.find('internalField'); j = t.find('(', i); k = t.find('\n)', j)
-vals = t[j + 1:k].split()
-# the FIRST cell that is exactly 1, so the choice is reproducible, and one ulp of 1 is 1.11e-16 rather than
-# a denormal. A perturbation the answer absorbs would measure nothing.
-idx = next(q for q, v in enumerate(vals) if float(v) == 1.0)
-vals[idx] = repr(math.nextafter(1.0, 0.0))
-open(p, 'w').write(t[:j + 1] + '\n' + '\n'.join(vals) + '\n' + t[k:])
-print('  one ulp on cell %d of the initial alpha.water: 1 -> %s' % (idx, vals[idx]))
-PYEOF
+python3 "$(dirname "$0")/interfoam_amr_ulp_cell.py" "$U2" || exit 1
 UKEY=$(oracleKey "$U2" "interfoam_amr_levels" "ulp" "$DT" "$N")
 if oracleRestore "$U2" "$UKEY" "$END"; then
     echo "[ulp] OpenFOAM against itself reused from the oracle cache"
@@ -414,18 +409,7 @@ UR="$W/restartUlp"
 rm -rf "$UR"
 cp -r "$R" "$UR" || exit 1
 rm -rf "$UR"/0.[0-9]* "$UR"/log.interFoam
-python3 - "$UR" <<'PYEOF' || exit 1
-import sys, math
-C = sys.argv[1]
-p = C + '/0/alpha.water'
-t = open(p).read()
-i = t.find('internalField'); j = t.find('(', i); k = t.find('\n)', j)
-vals = t[j + 1:k].split()
-idx = next(q for q, v in enumerate(vals) if float(v) == 1.0)
-vals[idx] = repr(math.nextafter(1.0, 0.0))
-open(p, 'w').write(t[:j + 1] + '\n' + '\n'.join(vals) + '\n' + t[k:])
-print('  one ulp on cell %d of the restart profile\'s initial alpha.water' % idx)
-PYEOF
+python3 "$(dirname "$0")/interfoam_amr_ulp_cell.py" "$UR" || exit 1
 URKEY=$(oracleKey "$UR" "interfoam_amr_levels" "restartUlp" "$DT" "$N")
 if oracleRestore "$UR" "$URKEY" "$END"; then
     echo "[restartUlp] reused from the oracle cache"
