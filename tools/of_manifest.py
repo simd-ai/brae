@@ -3750,7 +3750,7 @@ COMPONENTS = {
                         "CLAIMED: the flux correction on the shipped path (every interFoam tutorial maps every flux "
                         "to `none`; a case that names a velocity or NaN is refused), unrefinement inside a solver run "
                         "(0 split points at both steps and at every step of a 60-step run of the same case), the "
-                        "old-time levels mapping, and the DEVICE arm (refused by name, device_mesh_dynamic). Refused "
+                        "old-time levels mapping. The DEVICE arm runs it (device_refine_runs; the AMR gates run both arms). Refused "
                         "beside it, each by name: a motion solver, wave conditions, a CN restart "
                         "directory, `correctPhi no`, and a coupled patch on a refining mesh. MRF was on that list "
                         "until tests/interfoam_amr_mrf_vs_openfoam.sh gated it on mixerVessel2D -- see "

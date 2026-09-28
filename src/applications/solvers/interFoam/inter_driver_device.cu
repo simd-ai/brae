@@ -342,7 +342,8 @@ RunReport runInterFoamDevice(
     // defect this project keeps finding; the refusal lives here, beside the loop that lacks it.
     // THIS LOOP NOW RE-UPLOADS THE MESH. The refusal that stood here said "this loop uploads the mesh
     // once and has no path that re-uploads it", which was true until the branch below `if (dyn)` was
-    // written; the refusals gate's `device_mesh_dynamic` arm is a `runs` arm now, and every refusal an
+    // written; the refusals gate's `device_refine_runs` arm holds it (the bare dictionary that
+    // `device_mesh_dynamic` staged is one OpenFOAM itself stops on, now `mesh_dynamicRefine_device`), and every refusal an
     // adaptive case still has -- turbulence, a motion solver, MRF, fvOptions, CrankNicolson, a pressure
     // reference, `correctPhi no`, a coupled patch -- is raised by the SHARED case build and the shared
     // adapter (inter_case_cpp.cu, inter_amr_cpp.cu), so it fires on this arm without a copy here. The

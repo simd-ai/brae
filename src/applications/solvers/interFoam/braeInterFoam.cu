@@ -169,7 +169,7 @@
 //
 // BEGIN DEVICE REFUSALS
 //   device_gamg_smootherDILU device_gradLsq
-//   device_leak_explicit device_mesh_dynamic
+//   device_leak_explicit
 //   device_permeable_moving device_ras_otherModel device_refine_motion
 //   device_Uflux_rhoPhi
 // END DEVICE REFUSALS

@@ -230,7 +230,12 @@ arm flux_fixedFluxPressure_ignored runs    -      "" "sed -i '0,/type  *fixedFlu
 arm flux_named_on_reader           refused "phiAbs" "" "sed -i '0,/type  *inletOutlet;/s//type inletOutlet; phi phiAbs;/' 0/alpha.water"
 
 # the mesh
-arm mesh_dynamicRefine      refused "dynamicRefineFvMesh"     "" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
+# A BARE dynamicRefineFvMesh, which OpenFOAM ITSELF stops on: its constructor's readDict() reads
+# correctFluxes first (dynamicRefineFvMesh.C:184), and real OpenFOAM v2412 on this staging stops with
+# "Entry 'correctFluxes' not found in dictionary". brae stops there too, in those words, on both arms
+# (mesh_dynamicRefine_device below); it named refineInterval until the reader took OpenFOAM's order.
+# The complete dictionary RUNS on both arms -- `mesh_refine_only` and `device_refine_runs`.
+arm mesh_dynamicRefine      refused "Entry 'correctFluxes' not found in dictionary" "" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
 # dynamicMotionSolverFvMesh IS ported for a solidBody motion of the whole mesh; without a motionSolver
 # it is refused by that name, and the moving arms below hold the rest
 arm mesh_motionSolver       refused "motionSolver"             "" "printf '%s\ndynamicFvMesh dynamicMotionSolverFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
@@ -917,7 +922,9 @@ if [ $HAVE_GPU = 1 ]; then
     # at the floating-point floor: alpha 2.2e-15, p_rgh 6.1e-15 relative, U 3.2e-13) -- on a 3-D case. This
     # gate's base is 2-D, so what the arms below show is that the refusals fire in the right ORDER on it:
     # the missing mandatory entries first, then the empty patch, then the motion solver.
-    arm device_mesh_dynamic refused "dynamicRefineFvMesh"     "-device" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
+    # ...and the bare dictionary on the DEVICE, which is OpenFOAM's own stop and not a device refusal:
+    # this was `device_mesh_dynamic` in the ledger long after the device loop ran a refining mesh
+    arm mesh_dynamicRefine_device refused "Entry 'correctFluxes' not found in dictionary" "-device" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
     arm device_refine_runs  runs    -                         "-device" "$REFDICT '' > constant/dynamicMeshDict"
     arm device_refine_motion refused "motion solver"          "-device" "$REFDICT 'solvers { VF { motionSolverLibs (fvMotionSolvers); motionSolver solidBody; solidBodyMotionFunction oscillatingLinearMotion; amplitude (0.1 0 0); omega 6.283185307179586; } }' > constant/dynamicMeshDict"
     # ...nor a non-orthogonal correction where it is not zero

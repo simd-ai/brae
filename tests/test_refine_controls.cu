@@ -144,6 +144,26 @@ int main(
               threwWith(sub("correctFluxes", "correctFluxesXX"), "correctFluxes", got));
         check("a missing dumpLevel is refused, naming it",
               threwWith(sub("dumpLevel       true;", ""), "dumpLevel", got));
+        // THE ORDER OpenFOAM STOPS IN, and its words: the constructor's readDict() reads correctFluxes, then
+        // dumpLevel (dynamicRefineFvMesh.C:184, :193); refineInterval comes at the first update() (:1295).
+        // A bare `dynamicFvMesh dynamicRefineFvMesh;` -- tests/interfoam_refusals.sh's mesh_dynamicRefine
+        // arms -- is what real OpenFOAM v2412 stops on with "Entry 'correctFluxes' not found in dictionary".
+        // brae read refineInterval first, so the same dictionary named a different entry.
+        {
+            const std::string bare =
+                "FoamFile { version 2.0; format ascii; class dictionary; object dynamicMeshDict; }\n"
+                "dynamicFvMesh dynamicRefineFvMesh;\n";
+            check("a bare dynamicRefineFvMesh stops on correctFluxes, in OpenFOAM's words",
+                  threwWith(bare, "Entry 'correctFluxes' not found in dictionary", got));
+            check("...with correctFluxes given it stops on dumpLevel, not refineInterval",
+                  threwWith(bare + "correctFluxes ((phi none));\n", "Entry 'dumpLevel' not found", got));
+            check("...and with both, on refineInterval",
+                  threwWith(bare + "correctFluxes ((phi none));\ndumpLevel true;\n",
+                            "Entry 'refineInterval' not found", got));
+        }
+        // dumpLevel is a bool readEntry: a token that is not a Switch word stops, not reads as false
+        check("a dumpLevel that is not a Switch word is refused",
+              threwWith(sub("dumpLevel       true;", "dumpLevel       maybe;"), "maybe", got));
         // ...and refineInterval 0 is NOT an error: it means "never refine" (dynamicRefineFvMesh.C:1299)
         {
             const std::string tmp = "/tmp/brae_refine_controls_zero.dict";
