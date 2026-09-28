@@ -116,6 +116,8 @@ enum class Stage
     courantNo,
     alphaCourantNo,
     setDeltaT,
+    // setRDeltaT.H, in the three stages' place under localEuler (interFoam.C:94-103)
+    setRDeltaT,
     advanceTime,
     // interFoam.C:118-148, at the top of every outer corrector: mesh.update() on the first (or on
     // every one under moveMeshOuterCorrectors), and what the solver rebuilds when the mesh changed.
@@ -146,6 +148,9 @@ struct LoopControls
     // turbOnFinalIterOnly is TRUE in OpenFOAM, and a port that advanced the closure every outer
     // corrector runs it nOuterCorrectors times per physical step.
     bool  turbOnFinalIterOnly = true;
+    // ddtSchemes `default` is localEuler (localEulerDdt::enabled): the step's time scale is setRDeltaT's
+    // local one, and CourantNo, alphaCourantNo and setDeltaT do not run
+    bool  lts = false;
 };
 
 // interFoam.C:91-176. Calls hooks.run(stage) in OpenFOAM's order; the mesh-motion branch is omitted

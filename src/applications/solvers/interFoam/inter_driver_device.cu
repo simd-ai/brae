@@ -152,6 +152,12 @@ RunReport runInterFoamDevice(
     const MutableMesh* mutableMesh)
 {
     InterFields f = buildInterFields(caseDir, startDir, m, g, fvp);
+    // LOCAL TIME STEPPING runs on the host loop only (inter_set_rdeltat_cpp.cuh and the localEuler
+    // consumers); this loop would run every ddt at controlDict's deltaT
+    if (f.lts)
+        throw std::runtime_error(
+            "brae interFoam (device): ddtSchemes `default` is localEuler. The local time step (setRDeltaT.H) "
+            "and its consumers are ported on the host loop only; run without -device.");
     // THE PAIR, built here and not at the device-mesh stage, because the hooks below fill its share of
     // the surface fields and they are defined before the DeviceCyclic is.
     // ...INCLUDING a cyclicACMI the caller has coupled as a coincident pair (cpu::cyclicACMI::setup):

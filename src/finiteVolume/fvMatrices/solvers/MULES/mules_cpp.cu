@@ -108,6 +108,12 @@ void limiter(Limiter&                      lambda,
              const FvGeometry&             g,
              const std::vector<FvPatch>&   patches)
 {
+    if (f.rDeltaT)
+    {
+        throw std::runtime_error(
+            "brae MULES: the explicit limiter under a local time step (MULESTemplates.C's localEulerDdt "
+            "branch) is not ported.");
+    }
     const label nC  = m.nCells();
     const label nIf = m.nInternalFaces();
     const std::vector<label>&  own = m.owner();
@@ -397,6 +403,12 @@ void explicitSolve(scalar                      rDeltaT,
                    const FvGeometry&           g,
                    const std::vector<FvPatch>& patches)
 {
+    if (f.rDeltaT)
+    {
+        throw std::runtime_error(
+            "brae MULES: explicitSolve under a local time step (MULESTemplates.C's localEulerDdt branch) "
+            "is not ported.");
+    }
     // fvc::surfaceIntegrate(phiPsi) -- the divergence, per unit volume, and the volume is Vsc
     const std::vector<scalar> divPhiPsi = f.Vsc ? fvc::div(phiPsi, m, patches, *f.Vsc)
                                                 : fvc::div(phiPsi, m, g, patches);
@@ -579,8 +591,10 @@ void limiterCorr(Limiter&                      lambda,
         const scalar rhoC = at(f.rho, ci, scalar(1));
         const scalar SpC  = at(f.Sp,  ci, scalar(0));
         const scalar SuC  = at(f.Su,  ci, scalar(0));
-        const scalar a = (rhoC*rDeltaT - SpC);
-        const scalar b = rhoC*psiIf[ci]*rDeltaT;
+        // the local rDeltaT under localEuler (Fields::rDeltaT), the scalar otherwise
+        const scalar rDT = f.rDeltaT ? (*f.rDeltaT)[static_cast<std::size_t>(ci)] : rDeltaT;
+        const scalar a = (rhoC*rDT - SpC);
+        const scalar b = rhoC*psiIf[ci]*rDT;
         const scalar mx = V[ci]*(a*psiMaxn[ci] - SuC - b);
         const scalar mn = V[ci]*(SuC - a*psiMinn[ci] + b);
         psiMaxn[ci] = mx;
@@ -727,8 +741,10 @@ void correct(scalar                      rDeltaT,
         // A: rho*psi, both CURRENT. explicitSolve's rho.oldTime()*psi.oldTime() would re-do the time
         // step from the old state carrying only the correction, discarding the implicit solve.
         const scalar rhoC = at(f.rho, ci, scalar(1));
-        const scalar num  = rhoC*psi[ci]*rDeltaT + at(f.Su, ci, scalar(0)) - divPhiCorr[ci];
-        const scalar den  = rhoC*rDeltaT - at(f.Sp, ci, scalar(0));
+        // the local rDeltaT under localEuler (Fields::rDeltaT), the scalar otherwise
+        const scalar rDT  = f.rDeltaT ? (*f.rDeltaT)[static_cast<std::size_t>(ci)] : rDeltaT;
+        const scalar num  = rhoC*psi[ci]*rDT + at(f.Su, ci, scalar(0)) - divPhiCorr[ci];
+        const scalar den  = rhoC*rDT - at(f.Sp, ci, scalar(0));
         psi[ci] = num / den;
     }
 }

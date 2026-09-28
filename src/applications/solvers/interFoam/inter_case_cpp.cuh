@@ -51,6 +51,7 @@
 #include "alpha_eqn_cpp.cuh"
 #include "inter_ueqn_cpp.cuh"
 #include "inter_solve_cpp.cuh"
+#include "inter_set_rdeltat_cpp.cuh"
 #include "inter_create_fields_cpp.cuh"
 #include "inter_linear_solve.cuh"
 #include "gamg_solver_cpp.cuh"
@@ -153,6 +154,14 @@ struct InterFields
     // the entry `ddt(rho,U)` resolved to (fvSchemes::ddtScheme), which ddtU classifies and which the
     // closure's own ddt names must resolve to as well
     std::string                  ddtRhoUEntry;
+    // LOCAL TIME STEPPING: ddtSchemes `default` is localEuler (localEulerDdt::enabled). setRDeltaT.H then
+    // replaces CourantNo/alphaCourantNo/setDeltaT, reading `ltsCtl` from fvSolution's PIMPLE, and every
+    // localEuler consumer reads the per-cell `rDeltaT` -- createRDeltaT.H's field, 1/s, 1 at the start
+    // (its READ_IF_PRESENT is inert, see inter_set_rdeltat_cpp.cuh). Cells only: its patch values are the
+    // face cells'.
+    bool                         lts = false;
+    LocalEulerControls           ltsCtl;
+    std::vector<scalar>          rDeltaT;
     // CrankNicolson's off-centring coefficient, from the entry each operand set resolves to: `ddt(alpha)`
     // for alphaEqn.H's own blend (it asks the scheme it constructs for ddt(alpha)), `default` for
     // fvm::ddt(rho, U), fvm::ddt(k) and ddtCorr. 1 is OpenFOAM's when the entry names none.

@@ -172,6 +172,23 @@ int main()
             check("the stages run in interFoam.C's order", seen == want);
         }
 
+        // (a2) localEuler: setRDeltaT.H in the three stages' place, before ++runTime, and NONE of them
+        //      beside it (interFoam.C:94-103) -- a loop that ran both would adjust a deltaT LTS ignores
+        {
+            LoopControls ctl;
+            ctl.nOuterCorrectors = 1;
+            ctl.nCorrectors      = 2;
+            ctl.lts              = true;
+            const std::vector<Stage> seen = record(ctl);
+            const std::vector<Stage> want{
+                Stage::setRDeltaT, Stage::advanceTime,
+                Stage::meshUpdate, Stage::alphaControls, Stage::alphaEqnSubCycle, Stage::mixtureCorrect,
+                Stage::UEqn, Stage::pEqn, Stage::pEqn, Stage::turbulenceCorrect,
+                Stage::write};
+            std::printf("  %s\n", join(seen).c_str());
+            check("under localEuler setRDeltaT replaces CourantNo, alphaCourantNo and setDeltaT", seen == want);
+        }
+
         // (b) THE ORDER THAT MATTERS: alpha moves BEFORE the momentum predictor, and the mixture is
         //     refreshed in between. UEqn must see the new rho, not last step's.
         {

@@ -2,6 +2,7 @@
 // in it that are interFoam's own.
 #include "inter_peqn_cpp.cuh"
 #include "fvc_reconstruct_cpp.cuh"
+#include "inter_set_rdeltat_cpp.cuh"   // interpolateRDeltaT: localEuler's face rDeltaT
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -251,6 +252,16 @@ void ddtCorr(const DdtCorrInput&           in,
     const std::vector<scalar>& w   = g.weights();
     const std::vector<vector>& Sf  = g.Sf();
     const scalar rDeltaT = scalar(1) / in.deltaT;
+    // localEuler's face rDeltaT (DdtCorrInput::rDeltaT); empty under Euler
+    SurfaceScalarField rDeltaTf;
+    if (in.rDeltaT)
+    {
+        if (in.UfOld || in.cn)
+            throw std::runtime_error(
+                "brae interFoam ddtCorr: a local time step on a moving mesh, or beside CrankNicolson, is not "
+                "ported.");
+        rDeltaTf = interpolateRDeltaT(*in.rDeltaT, m, g, patches);
+    }
     // OpenFOAM's SMALL IN A DOUBLE BUILD (doubleScalar.H:62). This was 1e-37, which is the FLOAT
     // build's VSMALL (floatScalar.H:64): the two differ where |phi| is at or below 1e-15, so the
     // limiter's ratio there was |phiCorr|/|phi| instead of |phiCorr|/1e-15.
@@ -279,7 +290,7 @@ void ddtCorr(const DdtCorrInput&           in,
                                   / (std::fabs(phiUf0) + kSmall), scalar(1))
             : in.ddtPhiCoeff;
 
-        out.internal[f] = coeff * rDeltaT * phiCorr;
+        out.internal[f] = coeff * (in.rDeltaT ? rDeltaTf.internal[static_cast<std::size_t>(f)] : rDeltaT) * phiCorr;
     }
 
     // note 2: zero on every patch where U fixes a value, and on every cyclicAMI patch
@@ -312,7 +323,8 @@ void ddtCorr(const DdtCorrInput&           in,
             const scalar coeff = (in.ddtPhiCoeff < scalar(0))
                 ? scalar(1) - std::fmin(std::fabs(phiCorr)/(std::fabs(pOld) + kSmall), scalar(1))
                 : in.ddtPhiCoeff;
-            out.boundary[pi][i] = coeff * rDeltaT * phiCorr;
+            const scalar rDT = in.rDeltaT ? rDeltaTf.boundary[pi][static_cast<std::size_t>(i)] : rDeltaT;
+            out.boundary[pi][i] = coeff * rDT * phiCorr;
         }
     }
 }

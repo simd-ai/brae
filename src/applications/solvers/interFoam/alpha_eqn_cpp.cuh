@@ -264,6 +264,11 @@ struct AlphaStepInput
     // source (EulerDdtScheme.C:383-392), and both go to MULES.
     const std::vector<scalar>* Vsc = nullptr;
     const std::vector<scalar>* Vsc0 = nullptr;
+    // LOCAL TIME STEPPING: the per-cell rDeltaT of a localEuler case, null otherwise. alphaEqn.H:105-109
+    // assembles the pre-solve with localEulerDdtScheme<scalar>(mesh).fvmDdt(alpha1) when LTS --
+    // diag = rDeltaT*Vsc, source = (rDeltaT*alpha1.oldTime())*Vsc (localEulerDdtScheme.C:245-246) --
+    // and both MULES::correct calls take it (MULES::Fields::rDeltaT). deltaT is then not read.
+    const std::vector<scalar>* rDeltaT = nullptr;
 
     // alpha1's boundaryField().updateCoeffs(), for the conditions whose value a MODEL supplies --
     // waveAlpha. Called where OpenFOAM's first one of the pass fires: at the pre-solve's matrix

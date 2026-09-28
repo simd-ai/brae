@@ -715,6 +715,29 @@ RunReport runInterFoam(
     GamgSolveLog gamgLog;
     rep.deltaT = f.deltaT;
 
+    // A GATE'S CONTROL, never set by a solver: ONE localEuler consumer -- `alpha` (the pre-solve's ddt and
+    // MULES), `ueqn` (fvm::ddt(rho, U)) or `ddtcorr` -- reads the global 1/deltaT in the local rDeltaT's
+    // place, which is what a port that left that consumer on the Euler form runs. It makes the answer
+    // WRONG; tests/interfoam_dtchull_vs_openfoam.sh asserts that each one fails.
+    std::string ltsScalarControl;
+    std::vector<scalar> rDeltaTGlobal;
+    if (const char* e = std::getenv("BRAE_CONTROL_LTS_SCALAR"))
+    {
+        ltsScalarControl = e;
+        if (ltsScalarControl != "alpha" && ltsScalarControl != "ueqn" && ltsScalarControl != "ddtcorr")
+            throw std::runtime_error(
+                "brae interFoam: BRAE_CONTROL_LTS_SCALAR is `" + ltsScalarControl + "`; it takes alpha, ueqn "
+                "or ddtcorr, and an unknown name would make the control vacuous.");
+        rDeltaTGlobal.assign(static_cast<std::size_t>(m.nCells()), scalar(1)/f.deltaT);
+        std::printf("  *** CONTROL MODE: the localEuler consumer `%s` reads 1/deltaT, not the local rDeltaT. "
+                    "This run is deliberately wrong. ***\n", ltsScalarControl.c_str());
+    }
+    auto rDeltaTFor = [&](const char* consumer) -> const std::vector<scalar>*
+    {
+        if (!f.lts) return nullptr;
+        return (ltsScalarControl == consumer) ? &rDeltaTGlobal : &f.rDeltaT;
+    };
+
     for (label step = 0; step < nSteps; ++step)
     {
         // Time::run() (Time.C:1000), and it sits HERE -- above CourantNo.H and setDeltaT.H -- so the
@@ -755,6 +778,50 @@ RunReport runInterFoam(
                     break;
                 }
                 case Stage::alphaCourantNo:  break;    // computed above, from the same sumPhi
+                case Stage::setRDeltaT:
+                {
+                    // setRDeltaT.H, before ++runTime: rhoPhi is the last alpha step's (or createFields'
+                    // at the first step), phi the last pressure corrector's, rho the last mixture's.
+                    // Damping from the third step of this run: timeIndex > startTimeIndex + 1 tested
+                    // before the time advances, and rep.steps counts the steps this run has completed.
+                    SetRDeltaTInput ri;
+                    ri.rhoPhi = &f.rhoPhi;
+                    ri.phi = &f.phi;
+                    ri.alpha1 = &f.alpha1;
+                    ri.rho = &f.rho;
+                    ri.damp = rep.steps > 1;
+                    if (std::getenv("BRAE_CONTROL_LTS_NODAMP"))
+                    {
+                        // A GATE'S CONTROL: never damp. It makes the answer WRONG from the third step.
+                        std::printf("  *** CONTROL MODE: setRDeltaT's damping is off. This run is "
+                                    "deliberately wrong. ***\n");
+                        ri.damp = false;
+                    }
+                    LocalEulerControls lec = f.ltsCtl;
+                    if (std::getenv("BRAE_CONTROL_LTS_NOSMOOTH"))
+                    {
+                        // A GATE'S CONTROL: no smoothing wave. It makes the answer WRONG.
+                        std::printf("  *** CONTROL MODE: setRDeltaT's smoothing is off. This run is "
+                                    "deliberately wrong. ***\n");
+                        lec.rDeltaTSmoothingCoeff = scalar(1);
+                    }
+                    const SetRDeltaTReport lr = setRDeltaT(f.rDeltaT, lec, ri, m, g, patches);
+                    rep.ltsLog.push_back(lr);
+                    rep.rDeltaTPerStep.push_back(f.rDeltaT);
+                    if (verbose)
+                    {
+                        std::printf("  Flow time scale min/max = %.17g, %.17g\n",
+                                    (double)lr.flowMin, (double)lr.flowMax);
+                        std::printf("  Smoothed flow time scale min/max = %.17g, %.17g\n",
+                                    (double)lr.smoothedMin, (double)lr.smoothedMax);
+                        if (lr.damped)
+                        {
+                            std::printf("  Damped flow time scale min/max = %.17g, %.17g\n",
+                                        (double)lr.dampedMin, (double)lr.dampedMax);
+                        }
+                    }
+                    break;
+                }
                 case Stage::setDeltaT:
                     // Time::adjustDeltaT measures from the start, value() - startTime_ (Time.C:1150)
                     rep.deltaT = setDeltaTVoF(rep.deltaT, rep.CoNum, rep.alphaCoNum, f.timeCtl,
@@ -945,6 +1012,8 @@ RunReport runInterFoam(
                     ai.alphaScheme  = f.divPhiAlpha;
                     ai.alpharScheme = f.divPhirbAlpha;
                     ai.MULESCorr = f.alphaCtl.MULESCorr;
+                    // localEuler: the pre-solve's ddt and both MULES::correct calls take the local rDeltaT
+                    ai.rDeltaT = rDeltaTFor("alpha");
                     ai.alphaApplyPrevCorr = f.alphaCtl.alphaApplyPrevCorr;
                     ai.alpha2BndOut = &f.alpha2Bnd;
                     // the case's own tolerances, where a struct default of 1e-8 used to stand
@@ -1282,6 +1351,7 @@ RunReport runInterFoam(
                     mi.nuEff = &nuEff;
                     mi.nuEffBnd = &nuEffB;
                     mi.deltaT = rep.deltaT;
+                    mi.rDeltaT = rDeltaTFor("ueqn");
                     mi.scheme = f.divRhoPhiU;
                     mi.schemeCoeff = f.divRhoPhiUCoeff;
                     mi.relaxEquationU = f.relaxEquationU; mi.relaxU = f.relaxU;
@@ -1358,6 +1428,7 @@ RunReport runInterFoam(
 
                     DdtCorrInput dc;
                     dc.phiOld = &phiOld; dc.UOld = &UOld; dc.deltaT = rep.deltaT;
+                    dc.rDeltaT = rDeltaTFor("ddtcorr");
                     dc.UOldBnd = &UOldBnd;
                     if (cnDdt)
                     {

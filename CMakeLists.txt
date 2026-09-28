@@ -181,6 +181,8 @@ add_library(brae_core STATIC
     src/transportModels/twoPhaseMixture/device_two_phase_mixture.cu
     src/transportModels/interfaceProperties/interface_properties_cpp.cu
     src/applications/solvers/interFoam/inter_solve_cpp.cu
+    src/applications/solvers/interFoam/inter_set_rdeltat_cpp.cu
+    src/finiteVolume/finiteVolume/fvc/fvcSmooth/fvc_smooth_cpp.cu
     src/applications/solvers/interFoam/inter_peqn_cpp.cu
     src/applications/solvers/interFoam/inter_correct_phi_cpp.cu
     src/finiteVolume/fvMatrices/solvers/MULES/mules_cpp.cu
@@ -3637,6 +3639,18 @@ add_test(NAME interfoam_angledduct_vs_openfoam
 # ...and the free-level inlet, on RAS/weirOverflow as shipped: variableHeightFlowRateInletVelocity on U
 # and variableHeightFlowRate on alpha. The controls are OpenFOAM with the inlet frozen at its file value
 # and with the alpha condition an inletOutlet of zero; the device loop must refuse by name.
+# ...and localEuler (LTS), on RAS/DTCHull meshed serially by real OpenFOAM: setRDeltaT.H's local time
+# step against the rDeltaT OpenFOAM writes at every step, and the fields it advances.
+add_executable(test_inter_dtchull_vs_openfoam tests/test_inter_dtchull_vs_openfoam.cu)
+target_include_directories(test_inter_dtchull_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_dtchull_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_dtchull_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_dtchull_vs_openfoam.sh)
+set_tests_properties(interfoam_dtchull_vs_openfoam PROPERTIES
+                     SKIP_RETURN_CODE 77
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+
 add_executable(test_inter_weiroverflow_vs_openfoam tests/test_inter_weiroverflow_vs_openfoam.cu)
 target_include_directories(test_inter_weiroverflow_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)

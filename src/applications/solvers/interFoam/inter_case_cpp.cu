@@ -741,16 +741,39 @@ InterFields buildInterFields(const std::string&          caseDir,
         f.ddtU = ddtKind(ddtRhoU);
         const std::string ddtAlphaEntry = ddtSchemeFor(caseDir, "ddt(alpha)");
         f.ddtAlpha = parseAlphaDdt(ddtAlphaEntry);
+        // LOCAL TIME STEPPING IS DECIDED BY `default` ALONE, not by any name a call site asks for:
+        // localEulerDdt::enabled is `word(mesh.ddtScheme("default")) == "localEuler"` (localEulerDdt.C:39-44),
+        // and createRDeltaT.H registers the rDeltaT field only then. So a case naming localEuler for
+        // `ddt(rho,U)` under `default Euler` has no field for the scheme to look up and OpenFOAM stops
+        // there (localEulerDdt.C:52-55) -- refused below in those terms -- while `default localEuler` with a
+        // named Euler entry would run setRDeltaT and an Euler momentum at controlDict's deltaT, a mixture
+        // refused below because no fixture holds it.
+        {
+            const std::string ddtDefault = ddtSchemeFor(caseDir, "default");
+            f.lts = (ddtDefault.substr(0, ddtDefault.find(' ')) == "localEuler");
+        }
+        if (!f.lts && f.ddtU == DdtScheme::localEuler)
+            throw std::runtime_error(
+                "brae interFoam: ddtSchemes resolves `ddt(rho,U)` to `" + ddtRhoU + "` under a `default` that "
+                "is not localEuler. OpenFOAM registers the rDeltaT field only when `default` is localEuler "
+                "(createRDeltaT.H, localEulerDdt::enabled), so the scheme's lookup of it fails "
+                "(localEulerDdt.C:52-55); refusing in the same place.");
+        if (f.lts && f.ddtU != DdtScheme::localEuler)
+            throw std::runtime_error(
+                "brae interFoam: ddtSchemes `default` is localEuler and `ddt(rho,U)` resolves to `" + ddtRhoU
+                + "`. That runs setRDeltaT's local time step beside a momentum equation at controlDict's "
+                "deltaT; no fixture holds the mixture, so it is refused rather than run.");
         // READ AND THEN NEVER USED: neither driver handed ddtU to the momentum equation, whose
         // input defaults to Euler, so `CrankNicolson 0.5` (RAS/floatingObject) and `localEuler`
         // (RAS/DTCHull) would have run as Euler. Both tutorials were being stopped for other reasons.
         // CrankNicolson runs now -- the momentum equation, ddtCorr and the k-epsilon closure carry it
-        // (crank_nicolson_ddt_scheme_cpp.cuh), and alphaEqn.H's own blend follows ddt(alpha).
-        if (f.ddtU != DdtScheme::Euler && f.ddtU != DdtScheme::CrankNicolson)
+        // (crank_nicolson_ddt_scheme_cpp.cuh), and alphaEqn.H's own blend follows ddt(alpha). localEuler
+        // runs on the host loop, with the local time step setRDeltaT.H forms (inter_set_rdeltat_cpp.cuh).
+        if (f.ddtU != DdtScheme::Euler && f.ddtU != DdtScheme::CrankNicolson && f.ddtU != DdtScheme::localEuler)
             throw std::runtime_error(
                 "brae interFoam: ddtSchemes resolves `ddt(rho,U)` to `" + ddtRhoU + "`. The momentum equation, "
-                "the ddt flux correction in pEqn and the turbulence closure carry Euler and CrankNicolson; "
-                "refusing rather than running Euler under another scheme's name.");
+                "the ddt flux correction in pEqn and the turbulence closure carry Euler, CrankNicolson and "
+                "localEuler; refusing rather than running Euler under another scheme's name.");
         if (f.ddtU == DdtScheme::CrankNicolson)
         {
             f.ddtOcCoeff = fv::readOcCoeff(ddtRhoU);
@@ -855,6 +878,8 @@ InterFields buildInterFields(const std::string&          caseDir,
         f.pimple.frozenFlow = pim->switchOr("frozenFlow", false);
         // pimpleControl.C:51-52
         f.pimple.turbOnFinalIterOnly = pim->switchOr("turbOnFinalIterOnly", true);
+        // ...and the loop's time step is the local one under localEuler, read from ddtSchemes above
+        f.pimple.lts = f.lts;
 
         // createDyMControls.H: `correctPhi` defaults to mesh.dynamic(), the other two to false
         auto switchOr = [&](const char* key, bool def) { return pim->switchOr(key, def); };
@@ -1232,6 +1257,16 @@ InterFields buildInterFields(const std::string&          caseDir,
                     "U's time scheme; refusing rather than running it under the momentum's.");
         }
     }
+    // LOCAL TIME STEPPING: setRDeltaT.H's controls from fvSolution's PIMPLE and the parts of it that are
+    // not ported. What the CASE carries beside it -- a moving mesh, options, zones, a closure, alpha's
+    // sub-cycles -- is refused further down, after all of those are read.
+    if (f.lts)
+    {
+        const FoamDict* pim = fvSolution.subDict("PIMPLE");
+        f.ltsCtl = readLocalEulerControls(*pim);
+        refuseUnportedLocalEuler(f.ltsCtl, patches);
+        f.rDeltaT.assign(static_cast<std::size_t>(nC), scalar(1));
+    }
     // `turbOnFinalIterOnly no` WITH MORE THAN ONE OUTER CORRECTOR RUNS NOW, on both arms. Two halves:
     //   * psi.oldTime() is kept per TIME INDEX rather than recaptured per call
     //     (InterTurbulence::kOldStep, advanceTurbulenceOldTime). OpenFOAM's storeOldTimes is guarded on
@@ -1425,6 +1460,42 @@ InterFields buildInterFields(const std::string&          caseDir,
                     "than run a different first step.");
         }
     }
+    // THE localEuler REFUSALS OF WHAT THE CASE CARRIES, after everything they test has been read. The
+    // first cut placed them with the controls above, before the options and the zones were read: those
+    // two could never fire, and ddt_localEulerMRF RAN -- to max|U| 1.3e+13 in two steps. One order, so
+    // each refusal arm reaches its own: the mesh, the options, the zones, the closure, then alpha's own.
+    if (f.lts && f.meshIsDynamic)
+        throw std::runtime_error(
+            "brae interFoam: ddtSchemes `default` is localEuler and the mesh is dynamic. localEulerDdtScheme's "
+            "moving-mesh terms (Vsc, meshPhi) and a local time step on a changing mesh are not ported.");
+    if (f.lts && !f.fvOptions.empty())
+        throw std::runtime_error(
+            "brae interFoam: ddtSchemes `default` is localEuler and fvOptions is not empty. An option's own "
+            "fvm::ddt (the mangroves' added mass) would take controlDict's deltaT where OpenFOAM's takes the "
+            "local one.");
+    if (f.lts && !f.mrfZones.empty())
+        throw std::runtime_error(
+            "brae interFoam: ddtSchemes `default` is localEuler and the case has MRF zones. No fixture holds "
+            "MRF under a local time step.");
+    if (f.lts && f.turbulence.on)
+        throw std::runtime_error(
+            "brae interFoam: ddtSchemes `default` is localEuler and the case is turbulent. The closure's "
+            "fvm::ddt under localEuler (localEulerDdtScheme.C:253-341) is not ported yet.");
+    if (f.lts && f.alphaCtl.nAlphaSubCycles > 1)
+        throw std::runtime_error(
+            "brae interFoam: ddtSchemes `default` is localEuler and nAlphaSubCycles is "
+            + std::to_string(f.alphaCtl.nAlphaSubCycles) + ". alphaEqnSubCycle.H:13-17 then runs alpha on "
+            "localRSubDeltaT (localEulerDdt.C:71-89), which is not ported.");
+    if (f.lts && !f.alphaCtl.MULESCorr)
+        throw std::runtime_error(
+            "brae interFoam: ddtSchemes `default` is localEuler and MULESCorr is off. The explicit MULES solve "
+            "then takes the local rDeltaT (MULESTemplates.C, localEulerDdt::enabled), which is not ported; "
+            "MULESCorr yes is.");
+    if (f.lts && f.ddtAlpha == AlphaDdt::CrankNicolson)
+        throw std::runtime_error(
+            "brae interFoam: ddtSchemes `default` is localEuler and `ddt(alpha)` names CrankNicolson. "
+            "alphaEqn.H's off-centred flux under a local time step is held by no fixture; refusing rather "
+            "than run.");
     if (!f.mrfZones.empty() && f.dynamicMesh)
         throw std::runtime_error(
             "brae interFoam: the case has an active MRF zone AND a moving mesh. MRF.update() rebuilds "
@@ -1671,12 +1742,57 @@ InterFields buildInterFields(const std::string&          caseDir,
     // pass is what leaves alpha's wall gradient non-zero for the second one to build on.
     interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, f.nHatf, f.K);
 
-    // rhoPhi starts at the mass flux implied by the read alpha and phi: alphaEqn overwrites it every
-    // step, but UEqn would read it on the very first outer iteration if it did not exist.
+    // rhoPhi AS createFields.H:59-71 BUILDS IT: fvc::interpolate(rho)*phi, from the phi as it was read --
+    // before initCorrectPhi -- and interpolate(rho) is linear through interpolationSchemes' default,
+    // lambda*(P - N) + N on an internal face and rho's own (calculated) patch value on a patch.
+    // alphaEqn overwrites it every step, but two things read it first: the patches that name it, at
+    // initCorrectPhi, and setRDeltaT.H's momentum Courant limit at the first step of a localEuler case.
+    // brae built it as the vanLeer alpha flux's mass flux, which is a different field; under Euler no
+    // gate could see it, and under localEuler it sets the first step's time scale.
+    if (std::getenv("BRAE_CONTROL_RHOPHI_ALPHAFLUX"))
     {
+        // A GATE'S CONTROL: the form this port used, the vanLeer alpha flux's mass flux. It is WRONG
+        // wherever the initial rhoPhi is read -- setRDeltaT's first step under localEuler.
+        std::printf("  *** CONTROL MODE: the initial rhoPhi is the alpha flux's mass flux, not "
+                    "interpolate(rho)*phi. This run is deliberately wrong. ***\n");
         SurfaceScalarField alphaPhi;
         fluxWithScheme(f.phi, f.alpha1, f.divPhiAlpha, m, g, patches, alphaPhi, f.gradAlpha1);
         massFlux(alphaPhi, f.phi, f.mixture.phases.rho1, f.mixture.phases.rho2, f.rhoPhi);
+    }
+    else
+    {
+        const label nIf = m.nInternalFaces();
+        const std::vector<label>& own = m.owner();
+        const std::vector<label>& nei = m.neighbour();
+        const std::vector<scalar>& w = g.weights();
+        f.rhoPhi.internal.resize(static_cast<std::size_t>(nIf));
+        for (label fi = 0; fi < nIf; ++fi)
+        {
+            const std::size_t ff = static_cast<std::size_t>(fi);
+            const scalar P = f.rho[static_cast<std::size_t>(own[ff])];
+            const scalar N = f.rho[static_cast<std::size_t>(nei[ff])];
+            f.rhoPhi.internal[ff] = (w[ff]*(P - N) + N)*f.phi.internal[ff];
+        }
+        f.rhoPhi.boundary.resize(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const std::size_t n = f.phi.boundary[pi].size();
+            if (patches[pi].type == "empty")
+            {
+                // a zero-sized fvsPatchField in OpenFOAM; brae keeps the list at phi's length
+                f.rhoPhi.boundary[pi].assign(n, scalar(0));
+                continue;
+            }
+            if (f.rhoBnd[pi].size() != n)
+                throw std::runtime_error(
+                    "brae interFoam: rho has no patch values on '" + patches[pi].name + "', which the initial "
+                    "rhoPhi = interpolate(rho)*phi reads.");
+            f.rhoPhi.boundary[pi].resize(n);
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                f.rhoPhi.boundary[pi][i] = f.rhoBnd[pi][i]*f.phi.boundary[pi][i];
+            }
+        }
     }
     // ...and now that rhoPhi exists, the patches that NAME it learn it
     pushFluxToPatches(f, patches);

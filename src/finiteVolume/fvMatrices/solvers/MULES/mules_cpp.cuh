@@ -107,6 +107,12 @@ struct Fields
     // surfaceIntegrate divides by Vsc (fvcSurfaceIntegrate.C:77). Both or neither.
     const std::vector<scalar>* Vsc = nullptr;
     const std::vector<scalar>* Vsc0 = nullptr;
+    // LOCAL TIME STEPPING: the per-cell rDeltaT of a localEuler case. CMULESTemplates.C:103-111 and
+    // :153-176 hand correct() and limiterCorr() fv::localEulerDdt::localRDeltaT(mesh) in the scalar's place
+    // whenever localEulerDdt::enabled, and the formulas are otherwise the same, so when this is set it is
+    // read cell by cell and the scalar argument is ignored. Null == the scalar 1/deltaT. Carried by
+    // correct/limitCorr/correctLimited only; the explicit solve refuses it.
+    const std::vector<scalar>* rDeltaT = nullptr;
 };
 
 // lambda, on every face of the mesh. Kept as one object because OpenFOAM's allLambda is one array

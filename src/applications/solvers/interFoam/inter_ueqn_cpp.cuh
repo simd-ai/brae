@@ -154,6 +154,9 @@ struct InterMomentumInput
 
     scalar    deltaT             = 0.0;          // > 0 always; interFoam has no steady path
     DdtScheme ddtScheme          = DdtScheme::Euler;
+    // localEuler: the per-cell rDeltaT setRDeltaT.H formed this step. Required when ddtScheme is
+    // localEuler, and deltaT is then not read by the ddt.
+    const std::vector<scalar>*      rDeltaT  = nullptr;
     // CrankNicolson: the scheme's clock, the equation's OWN ddt0 field ("ddt0(rho,U)", kept by the
     // driver across steps), and the old-old levels of rho and U it reads. Required together when
     // ddtScheme is CrankNicolson; refused otherwise.
@@ -271,6 +274,34 @@ inline void addEulerDdtRhoU(FvVectorMatrix&            M,
         M.source[c].x += w * UOld[c].x;
         M.source[c].y += w * UOld[c].y;
         M.source[c].z += w * UOld[c].z;
+    }
+}
+
+// fvm::ddt(rho, U), localEuler, on a fixed mesh (localEulerDdtScheme.C:282-308):
+//
+//     diag[c]   = (rDeltaT[c]*rho[c])*Vsc[c]
+//     source[c] = ((rDeltaT[c]*rhoOld[c])*UOld[c])*Vsc[c]
+//
+// in that association -- OpenFOAM multiplies the fields left to right, and the U component meets the
+// product BEFORE the volume, where addEulerDdtRhoU's source takes the volume first.
+inline void addLocalEulerDdtRhoU(FvVectorMatrix&            M,
+                                 const std::vector<scalar>& rho,
+                                 const std::vector<scalar>& rhoOld,
+                                 const std::vector<vector>& UOld,
+                                 const std::vector<scalar>& V,
+                                 const std::vector<scalar>& rDeltaT)
+{
+    const std::size_t nC = rho.size();
+    if (rhoOld.size() != nC || UOld.size() != nC || V.size() != nC || M.diag.size() != nC
+     || rDeltaT.size() != nC)
+        throw std::runtime_error("brae interFoam UEqn: localEuler ddt field lengths disagree.");
+    for (std::size_t c = 0; c < nC; ++c)
+    {
+        M.diag[c] += rDeltaT[c] * rho[c] * V[c];
+        const scalar w = rDeltaT[c] * rhoOld[c];
+        M.source[c].x += w * UOld[c].x * V[c];
+        M.source[c].y += w * UOld[c].y * V[c];
+        M.source[c].z += w * UOld[c].z * V[c];
     }
 }
 

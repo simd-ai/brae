@@ -409,7 +409,25 @@ BASE="$BK"
 arm ddt_cnRestartCoupled    refused "a coupled pair"          "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class volVectorField; object ddt0(rho,U); }\ndimensions [1 -2 -2 0 0 0 0];\ninternalField uniform (0 0 0);\nboundaryField { \".*\" { type calculated; value uniform (0 0 0); } }\n' > '0/ddt0(rho,U)'"
 arm ddt_cnCoupledCold       runs    -                         "" "$CNSET"
 BASE="$B"
-arm ddt_localEuler          refused "localEuler"              "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         localEuler;/' system/fvSchemes"
+# LOCALEULER RUNS on the host loop (tests/interfoam_dtchull_vs_openfoam.sh holds it to OpenFOAM on DTCHull),
+# with setRDeltaT.H's controls from fvSolution's PIMPLE and OpenFOAM's defaults for them -- and two of
+# those defaults are ON: nAlphaSpreadIter 1 and nAlphaSweepIter 5 call fvc::spread and fvc::sweep, which
+# are not ported. So damBreak under `default localEuler` alone is refused by the FIRST of them, the one
+# key a case must write to run, and runs once both are 0. The switch is `default` alone
+# (localEulerDdt::enabled): a named localEuler under `default Euler` is OpenFOAM's own stop (no rDeltaT
+# field exists), and `default localEuler` beside a named Euler momentum is refused as unheld. What the
+# local step does not carry yet is refused by name: sub-cycling, the explicit MULES, a moving mesh, a
+# turbulent closure, fvOptions and MRF -- the last three on their own bases below.
+LTSSET="sed -i '/^ddtSchemes/,/^}/ s/default .*/default         localEuler;/' system/fvSchemes"
+LTSZERO="sed -i 's/^\\( *\\)momentumPredictor .*/&\\n\\1nAlphaSpreadIter 0;\\n\\1nAlphaSweepIter 0;/' system/fvSolution"
+arm ddt_localEulerSpread    refused "nAlphaSpreadIter is 1"   "" "$LTSSET"
+arm ddt_localEulerSweep     refused "nAlphaSweepIter is 5"    "" "$LTSSET; sed -i 's/^\\( *\\)momentumPredictor .*/&\\n\\1nAlphaSpreadIter 0;/' system/fvSolution"
+arm ddt_localEuler          runs    -                         "" "$LTSSET; $LTSZERO"
+arm ddt_localEulerNamedEuler refused "no fixture holds the mixture" "" "$LTSZERO; ddtblock 'default localEuler;' 'ddt(rho,U) Euler;' 'ddt(U) Euler;'"
+arm ddt_localEulerUnderEuler refused "registers the rDeltaT field only when" "" "$LTSZERO; ddtblock 'default Euler;' 'ddt(rho,U) localEuler;' 'ddt(U) localEuler;'"
+arm ddt_localEulerSubCycles refused "localRSubDeltaT"         "" "$LTSSET; $LTSZERO; sed -i 's/nAlphaSubCycles  *[0-9]*;/nAlphaSubCycles 2;/' system/fvSolution"
+arm ddt_localEulerExplicit  refused "MULESCorr is off"        "" "$LTSSET; $LTSZERO; sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       no;/' system/fvSolution"
+arm ddt_localEulerMRF       refused "has MRF zones"           "" "$LTSSET; $LTSZERO; $ZONE && $PRGHZG && ${MRFD/OMEGA/omega 10;}"
 arm ddt_backward            refused "backward"                "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         backward;/' system/fvSchemes"
 # EACH ddt BY ITS CALL SITE'S NAME (schemesLookupDetail.C:79-89): fvm::ddt(rho, U) asks for `ddt(rho,U)`,
 # ddtCorr and meshPhi for `ddt(U)`, alphaEqn.H for `ddt(alpha)`, each named-then-default. brae read
@@ -429,6 +447,8 @@ BASE="$BM"
 # FatalError (ddt_cnSubCycles above holds that), so this arm sets 1 -- otherwise it reaches the
 # sub-cycle refusal and says nothing about the mesh.
 arm ddt_cnMoving            runs    -                         "" "$CNSET; sed -i 's/nAlphaSubCycles  *[0-9]*;/nAlphaSubCycles 1;/' system/fvSolution"
+# ...and localEuler on the moving base: localEulerDdtScheme's moving terms are not carried
+arm ddt_localEulerMoving    refused "the mesh is dynamic"     "" "$LTSSET; $LTSZERO"
 PERMUW="python3 -c \"import re; p='0/U'; t=open(p).read(); t=re.sub(r'walls\\s*\\{[^}]*\\}', 'walls { type permeableAlphaPressureInletOutletVelocity; alpha alpha.water; alphaMin 0.01; value uniform (0 0 0); }', t, count=1); open(p,'w').write(t)\""
 PERMPW="python3 -c \"import re; p='0/p_rgh'; t=open(p).read(); t=re.sub(r'walls\\s*\\{[^}]*\\}', 'walls { type prghPermeableAlphaTotalPressure; alpha alpha.water; alphaMin 0.01; p uniform 0; value uniform 0; }', t, count=1); open(p,'w').write(t)\""
 # THE PERMEABLE-WALL PAIR ON A MOVING MESH, on the same base. The host loop refused this and now RUNS
@@ -441,6 +461,8 @@ PERMPW="python3 -c \"import re; p='0/p_rgh'; t=open(p).read(); t=re.sub(r'walls\
 arm permeable_moving        runs    -                         "" "$PERMUW; $PERMPW"
 BASE="$BG"
 arm ddt_cnMangroves         refused "multiphaseMangrovesSource" "" "$CNSET"
+# ...and localEuler beside fvOptions: the mangroves' added mass takes its own fvm::ddt
+arm ddt_localEulerFvOptions refused "fvOptions is not empty"  "" "$LTSSET; $LTSZERO"
 BASE="$B"
 
 # a solver-entry floor the momentum predictor does not honour yet. BOTH alpha pre-solves honour it now
@@ -486,6 +508,8 @@ arm ras_otherModel          refused "realizableKE"            "" "sed -i 's/RASM
 # there is refused. `ddt(k)` is a name that lineage never looks up, dead text OpenFOAM ignores -- it runs.
 arm ddt_closureSplit        refused 'the closure'"'"'s `ddt(rho,k)` to `CrankNicolson 0.5`' "" "ddtblock 'default Euler;' 'ddt(rho,k) CrankNicolson 0.5;'"
 arm ddt_closureDeadName     runs    -                         "" "ddtblock 'default Euler;' 'ddt(k) CrankNicolson 0.5;'"
+# ...and a turbulent case under localEuler: the closure's fvm::ddt does not take the local step yet
+arm ddt_localEulerRAS       refused "the case is turbulent"   "" "$LTSSET; $LTSZERO"
 # kOmegaSST IS ported, in the uniform lineage (tests/interfoam_waterchannel_vs_openfoam.sh holds it to
 # OpenFOAM). RAS/damBreak made kOmegaSST: `density variable` with it is refused, and so is each thing
 # the closure does not carry -- on a base that RUNS, so a refusal is the one edit's.
@@ -869,6 +893,9 @@ if [ $HAVE_GPU = 1 ]; then
     arm device_limitedLinearTurb runs    -                          "-device" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss limitedLinear 1;/; s/div(rhoPhi,epsilon) .*/div(rhoPhi,epsilon) Gauss limitedLinear 1;/' system/fvSchemes"
     BASE="$B"
     arm device_gradULimited runs    -                           "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
+    # localEuler runs on the HOST loop only (ddt_localEuler above); the device loop refuses it by name
+    # rather than run every ddt at controlDict's deltaT
+    arm device_localEuler   refused "ported on the host loop only" "-device" "$LTSSET; $LTSZERO"
     BASE="$B"
     # the device's alpha pre-solve honours the case's minIter now, as the host's always has
     # (DeviceAlphaSolverControls::minIter; tests/interfoam_dambreak_vs_openfoam.sh `alphaminiter` holds

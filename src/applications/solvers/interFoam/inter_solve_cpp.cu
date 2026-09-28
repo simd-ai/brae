@@ -80,6 +80,7 @@ const char* stageName(Stage s)
         case Stage::courantNo:         return "CourantNo";
         case Stage::alphaCourantNo:    return "alphaCourantNo";
         case Stage::setDeltaT:         return "setDeltaT";
+        case Stage::setRDeltaT:        return "setRDeltaT";
         case Stage::advanceTime:       return "++runTime";
         case Stage::meshUpdate:        return "meshUpdate";
         case Stage::alphaControls:     return "alphaControls";
@@ -102,10 +103,18 @@ void runTimeStep(const LoopControls& ctl, const SolverHooks& hooks)
         throw std::runtime_error(
             "brae interFoam: nOuterCorrectors and nCorrectors must both be at least 1.");
 
-    // The step is chosen from the PREVIOUS step's fluxes, before the time advances (interFoam.C:93-105).
-    hooks.run(Stage::courantNo);
-    hooks.run(Stage::alphaCourantNo);
-    hooks.run(Stage::setDeltaT);
+    // The step is chosen from the PREVIOUS step's fluxes, before the time advances (interFoam.C:93-105)
+    // -- the local one under LTS, the global one otherwise, and never both.
+    if (ctl.lts)
+    {
+        hooks.run(Stage::setRDeltaT);
+    }
+    else
+    {
+        hooks.run(Stage::courantNo);
+        hooks.run(Stage::alphaCourantNo);
+        hooks.run(Stage::setDeltaT);
+    }
     hooks.run(Stage::advanceTime);
 
     for (label outer = 0; outer < ctl.nOuterCorrectors; ++outer)

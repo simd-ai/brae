@@ -177,6 +177,11 @@ struct DdtCorrInput
     // value is used verbatim as a constant coefficient.
     scalar ddtPhiCoeff = -1;
     scalar deltaT = 0;
+    // localEuler: the per-cell rDeltaT. localEulerDdtScheme::fvcDdtPhiCorr multiplies by
+    // fvc::interpolate(rDeltaT) -- linear, lambda*(P - N) + N, and the face cell's value on a patch
+    // (localEulerDdtScheme.C:385-404) -- where Euler multiplies by 1/deltaT. Null == Euler; refused with
+    // UfOld or cn.
+    const std::vector<scalar>* rDeltaT = nullptr;
     // CrankNicolson: the scheme's clock, the two ddt0 fields of this correction ("ddtCorrDdt0(U)" and
     // "ddtCorrDdt0(phi)", kept by the driver), and the old-old levels of U (cells and patches) and phi.
     // All or none; with `cn` set the correction is fvcDdtPhiCorr's CrankNicolson form

@@ -2965,6 +2965,41 @@ COMPONENTS = {
                   "driver (DeviceInterCrankNicolson) and the closure (DeviceInterTurbulence). Why RAS/damBreak and not "
                   "floatingObject: the one shipped tutorial naming CrankNicolson also moves its mesh under rigidBodyMotion "
                   "(rigidBodyDynamics, a Newmark solver), which brae does not carry; its refusal now names the body."),
+        dict(name="interFoam_setRDeltaT", of_symbol="setRDeltaT",
+             of_file="applications/solvers/multiphase/VoF/setRDeltaT.H",
+             classification="HOST_ONLY", status="REIMPLEMENT",
+             brae_reference="src/applications/solvers/interFoam/inter_set_rdeltat_cpp.cu",
+             validation="tests/interfoam_dtchull_vs_openfoam.sh, real OpenFOAM on RAS/DTCHull meshed serially "
+                        "(845,536 cells), staged laminar, ten localEuler steps: OpenFOAM WRITES rDeltaT "
+                        "(createRDeltaT.H, AUTO_WRITE), so the local time step is compared cell by cell at every "
+                        "step, with setRDeltaT.H's three Info lines. MEASURED: rDeltaT 1.6e-16 at step 1, 3.4e-12 "
+                        "or less after, the lines 3.4e-12. CONTROLS (three steps, each failing on a number): no "
+                        "fvc::smooth, rDeltaT 9.5e-01 at step 1; no damping, 5.1e-02 at step 3; the initial rhoPhi "
+                        "as the alpha flux's mass flux (what brae built), 5.4e-01 at step 1. NOT CLAIMED: fvc::spread "
+                        "and fvc::sweep (refused; DTCHull sets both counts to 0), coupled patches (refused), a restart.",
+             note="HOST_ONLY because fvc::smooth is a FaceCellWave -- serial and order-dependent through its 1% "
+                  "hysteresis (src/finiteVolume/finiteVolume/fvc/fvcSmooth/fvc_smooth_cpp.cu). The controls are "
+                  "fvSolution PIMPLE's, not controlDict's, with OpenFOAM's defaults: nAlphaSpreadIter 1 and "
+                  "nAlphaSweepIter 5 are ON unless the case writes 0, maxDeltaT is GREAT. Damping runs from the "
+                  "THIRD step of every run (timeIndex > startTimeIndex + 1, tested before ++runTime). The rDeltaT "
+                  "read on a restart is inert: S1 overwrites every cell and rDeltaT0 is read only by the damping."),
+        dict(name="interFoam_localEuler", of_symbol="localEulerDdtScheme",
+             of_file="src/finiteVolume/finiteVolume/ddtSchemes/localEulerDdtScheme/localEulerDdtScheme.C",
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/applications/solvers/interFoam/inter_ueqn_cpp.cuh",
+             validation="tests/interfoam_dtchull_vs_openfoam.sh, HOST ARM ONLY (the device loop refuses by name): "
+                        "ten laminar localEuler steps of RAS/DTCHull, alpha 2.6e-10, p_rgh 6.1e-10, U 6.4e-13, all 20 "
+                        "p_rgh and 10 alpha counts OpenFOAM's; OpenFOAM against itself with one interface cell's "
+                        "alpha moved by one ulp reads 8.8e-11, 1.2e-10, 3.7e-13 after the same ten steps. CONTROLS, "
+                        "one consumer at a time on the global 1/deltaT: the alpha pre-solve and CMULES (alpha "
+                        "2.1e+02), fvm::ddt(rho, U) (U 5.3e+01), ddtCorr (rDeltaT 3.0e-01 at step 3). NOT CLAIMED: "
+                        "the turbulent closure's ddt (refused), a moving mesh, sub-cycling (localRSubDeltaT), "
+                        "explicit MULES, fvOptions and MRF (all refused).",
+             note="Four consumers on DTCHull: the alpha pre-solve (alphaEqn.H:105-109 names the scheme directly), "
+                  "CMULES correct and limiterCorr (localRDeltaT per cell, CMULESTemplates.C:103-176), "
+                  "fvm::ddt(rho, U) as diag=(rDT*rho)*V, source=((rDT*rho0)*U0)*V in that order, and ddtCorr on "
+                  "fvc::interpolate(rDT). brae's EULER U source is ((rDT*rho0)*V)*U0 -- a different association, "
+                  "left on the ledger; the localEuler one is OpenFOAM's."),
         dict(name="interFoam_variableHeightFlowRate", of_symbol="variableHeightFlowRateInletVelocityFvPatchVectorField",
              of_file="src/finiteVolume/fields/fvPatchFields/derived/variableHeightFlowRateInletVelocity/"
                      "variableHeightFlowRateInletVelocityFvPatchVectorField.C",

@@ -17,7 +17,13 @@ namespace {
 
 void refuseUnsupported(const InterMomentumInput& in)
 {
-    if (in.ddtScheme != DdtScheme::Euler && in.ddtScheme != DdtScheme::CrankNicolson)
+    if (in.ddtScheme == DdtScheme::localEuler && (!in.rDeltaT || in.V0))
+        throw std::runtime_error(
+            "brae interFoam UEqn: ddtSchemes asks for localEuler, whose fvm::ddt(rho, U) reads the local "
+            "rDeltaT setRDeltaT.H forms (localEulerDdtScheme.C:282-308); the caller supplied none, or the "
+            "mesh moves, which the localEuler port does not carry.");
+    if (in.ddtScheme != DdtScheme::Euler && in.ddtScheme != DdtScheme::CrankNicolson
+     && in.ddtScheme != DdtScheme::localEuler)
     {
         const char* name = (in.ddtScheme == DdtScheme::backward)      ? "backward"
                          : (in.ddtScheme == DdtScheme::localEuler)    ? "localEuler"
@@ -286,6 +292,10 @@ FvVectorMatrix assembleUEqn(
         // and V00 and its source by V0, where the static one uses V throughout.
         fv::fvmDdt(*in.cn, *in.cnDdt0, in.rho, in.rhoOld, in.rhoOO, *in.UOld, *in.UOO, g.V(), M,
                    in.V0, in.V00);
+    }
+    else if (in.ddtScheme == DdtScheme::localEuler)
+    {
+        addLocalEulerDdtRhoU(M, *in.rho, *in.rhoOld, *in.UOld, g.V(), *in.rDeltaT);
     }
     else
     {

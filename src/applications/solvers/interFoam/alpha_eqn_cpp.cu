@@ -490,8 +490,20 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
         // fvm::ddt(alpha1), Euler, rho == 1: diag += V/dt, source += V*alpha.oldTime()/dt -- and on
         // a moving mesh the diagonal's V is Vsc and the source's is Vsc0 (EulerDdtScheme.C:383-392)
         const scalar rDeltaT = scalar(1) / in.deltaT;
+        if (in.rDeltaT && in.Vsc)
+            throw std::runtime_error(
+                "brae interFoam alphaEqn: a local time step on a moving mesh is not ported.");
         for (label c = 0; c < nC; ++c)
         {
+            if (in.rDeltaT)
+            {
+                // localEulerDdtScheme.C:245-246, fvm.diag() = rDeltaT*Vsc and
+                // fvm.source() = rDeltaT*vf.oldTime()*Vsc, in that order
+                const scalar rDT = (*in.rDeltaT)[static_cast<std::size_t>(c)];
+                M.diag[c]   += rDT * g.V()[c];
+                M.source[c] += rDT * alpha1Old[c] * g.V()[c];
+                continue;
+            }
             if (in.Vsc)
             {
                 M.diag[c]   += rDeltaT * (*in.Vsc)[c];
@@ -554,6 +566,7 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
             MULES::Fields mf0;
             mf0.Vsc = in.Vsc;
             mf0.Vsc0 = in.Vsc0;
+            mf0.rDeltaT = in.rDeltaT;
             MULES::correctLimited(rDeltaT, alpha1,
                                   in.controlPrevCorrOutletOnPhiCN ? *in.phiCN : alphaPhi10,
                                   *prevCorr, mf0, mulesCtl, m, g, patches);
@@ -616,6 +629,7 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
         MULES::Fields mf;                       // all null: rho == 1, Sp == Su == 0, bounds [0,1]
         mf.Vsc = in.Vsc;                        // ...and the volumes of a mesh that moves
         mf.Vsc0 = in.Vsc0;
+        mf.rDeltaT = in.rDeltaT;                // ...and the local time step of a localEuler case
         if (in.MULESCorr)
         {
             // alphaEqn.H:178-205. The correction is what the high-order flux adds to the upwind one
