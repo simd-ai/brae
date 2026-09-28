@@ -834,9 +834,40 @@ GamgControls readGamgControls(
     }
     if (!gamgSmootherPorted(c.smoother))
     {
+        // WHICH TABLE THE NAME IS MISSING FROM, because OpenFOAM's own selection is per MATRIX KIND and the
+        // two cases are not the same finding. lduMatrix::smoother::New consults symMatrixConstructorTable
+        // when the matrix is symmetric and asymMatrixConstructorTable otherwise (lduMatrixSmoother.C:29-57),
+        // and the registrations are split: DIC, DICGaussSeidel and FDIC are SYMMETRIC-ONLY; DILU and
+        // DILUGaussSeidel are ASYMMETRIC-ONLY; GaussSeidel, symGaussSeidel and nonBlockingGaussSeidel are in
+        // both. brae's gamgSolve refuses an asymmetric matrix outright, so every matrix reaching here is
+        // SYMMETRIC and the symmetric table is the only one that applies.
+        //
+        // SO AN ASYMMETRIC-ONLY NAME IS NOT A PORT GAP -- OpenFOAM refuses it too, and porting it would make
+        // brae accept a case OpenFOAM rejects. MEASURED on laminar/waves/stokesI with p_rghFinal's
+        // `smoother DIC` changed to DILU: real OpenFOAM stops with
+        //     --> FOAM FATAL IO ERROR: Unknown symmetric matrix smoother type DILU
+        //     Valid symmetric matrix smoother types : ...
+        // which is the same input brae was refusing as "not ported", inviting a port that must not happen.
+        const bool asymOnly = (c.smoother == "DILU" || c.smoother == "DILUGaussSeidel");
+        if (asymOnly)
+        {
+            throw std::runtime_error(
+                who + "asks for `smoother " + c.smoother + "`, which OpenFOAM registers for an ASYMMETRIC "
+                "matrix only (addasymMatrixConstructorToTable). This matrix is symmetric, so OpenFOAM's own "
+                "lookup goes to the symmetric table and stops: `Unknown symmetric matrix smoother type "
+                + c.smoother + "`. It is not a brae gap -- the entry is invalid for this equation in "
+                "OpenFOAM as well. The symmetric smoothers are DIC, DICGaussSeidel, FDIC, GaussSeidel, "
+                "symGaussSeidel and nonBlockingGaussSeidel.");
+        }
+        // ...and a name that IS a valid symmetric smoother, which is the half that is real work
+        const bool symmetricButMissing = (c.smoother == "FDIC" || c.smoother == "nonBlockingGaussSeidel");
         throw std::runtime_error(
             who + "asks for `smoother " + c.smoother + "`, which is not ported. brae's GAMG has DIC, "
-            "DICGaussSeidel, GaussSeidel and symGaussSeidel (gamg_solver_cpp.cuh).");
+            "DICGaussSeidel, GaussSeidel and symGaussSeidel (gamg_solver_cpp.cuh)."
+            + (symmetricButMissing
+                   ? std::string(" OpenFOAM DOES accept it on a symmetric matrix, so this one is a port "
+                                 "brae has not done rather than an invalid entry.")
+                   : std::string(" OpenFOAM has no smoother of that name either, in either table.")));
     }
     const std::string agglomerator = d.wordOr("agglomerator", "faceAreaPair");
     if (agglomerator != "faceAreaPair")
