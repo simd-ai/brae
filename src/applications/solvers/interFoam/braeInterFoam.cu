@@ -15,8 +15,9 @@
 // (inter_turbulence_cpp.cuh; device_inter_turbulence.cuh for what the device closure is handed).
 // And RAS kOmegaSST, host and `-device`, in the ordinary lineage: RAS/waterChannel, gated in
 // tests/interfoam_waterchannel_vs_openfoam.sh, and its ASSEMBLED SYSTEM against OpenFOAM's own in
-// tests/interfoam_sst_assembly_vs_openfoam.sh. Under `density variable` the SST is refused
-// (device_ras_otherModel), and the kEpsilon pair runs there WITH the mangrove turbulence option --
+// tests/interfoam_sst_assembly_vs_openfoam.sh. Under `density variable` the SST is refused on BOTH arms
+// (the case reader's; no shipped tutorial pairs the two -- all five SST cases run the default density),
+// and the kEpsilon pair runs there WITH the mangrove turbulence option --
 // -Sp(rho*coeff) rather than -Sp(coeff) -- gated by `densityVariable` in
 // tests/interfoam_mangrove_vs_openfoam.sh.
 // An earlier version of this header said interFoam's turbulence "is a MIXTURE model, not the
@@ -170,7 +171,7 @@
 // BEGIN DEVICE REFUSALS
 //   device_gamg_smootherDILU device_gradLsq
 //   device_leak_explicit
-//   device_ras_otherModel device_refine_motion
+//   device_refine_motion
 //   device_Uflux_rhoPhi
 // END DEVICE REFUSALS
 #include "cf_types.cuh"

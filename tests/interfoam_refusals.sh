@@ -992,7 +992,11 @@ if [ $HAVE_GPU = 1 ]; then
     BASE="$BR"
     arm device_ras          runs    -                        "-device" true
     arm device_ras_uniform  runs    -                        "-device" "sed -i 's/^density .*/density uniform;/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,k) /div(phi,k) /; s/div(rhoPhi,epsilon) /div(phi,epsilon) /' system/fvSchemes"
-    arm device_ras_otherModel refused "realizableKE"         "-device" "sed -i 's/RASModel .*/RASModel        realizableKE;/' constant/turbulenceProperties"
+    # ...and a RAS model that is neither, which is the SHARED case reader's refusal and not the device's:
+    # the host stops on it in the same words (ras_otherModel, above). It was `device_ras_otherModel` in
+    # the ledger. No shipped interFoam tutorial names another model -- 27 laminar, 11 kEpsilon, 5 kOmegaSST,
+    # 1 LES kEqn, every one of them run on both arms -- so it is left refused on both.
+    arm ras_otherModel_device refused "realizableKE"         "-device" "sed -i 's/RASModel .*/RASModel        realizableKE;/' constant/turbulenceProperties"
     # the device loop carries kOmegaSST too now (tests/interfoam_ras_dambreak_vs_openfoam.sh `sst`), and
     # an inletOutlet nut with it -- evaluated against the flux after the closure, as the host closure does
     # (tests/interfoam_ras_dambreak_vs_openfoam.sh `nutAtmosphere`, on both closures)
