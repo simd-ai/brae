@@ -857,8 +857,11 @@ if [ $HAVE_GPU = 1 ]; then
     BASE="$BK"
     arm device_leak         runs    -                       "-device" true
     # ...but only at the rescale point both loops gate -- `MULESCorr yes`, one alpha sub-cycle, no
-    # icAlpha or scAlpha -- so the explicit path is refused on the device as it is on the host
-    arm device_leak_explicit refused "MULESCorr"            "-device" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       no;/' system/fvSolution"
+    # icAlpha or scAlpha -- so the explicit path is refused on the device as it is on the host, by the
+    # SAME rule in the same words (inter_driver_cpp.cu and inter_driver_device.cu each hold it; the host's
+    # arm is leak_explicitMULES, above). It was `device_leak_explicit` in the ledger. The one interFoam
+    # tutorial with a cyclicACMI, damBreakLeakage, ships `MULESCorr yes` and runs on both arms.
+    arm leak_explicitMULES_device refused "MULESCorr no"     "-device" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       no;/' system/fvSolution"
     # the device momentum runs limitedLinear now -- one magSqr limiter per face, as OpenFOAM's, gated on
     # eulerianInjection in tests/interfoam_limitedlinear_vs_openfoam.sh. It was refused here while its
     # branch accumulated magSqr(U) into a buffer resize() had not zeroed

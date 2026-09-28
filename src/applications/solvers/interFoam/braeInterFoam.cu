@@ -133,7 +133,8 @@
 // AND a coincident cyclicACMI pair, on the host -- a createBaffles baffle whose `scale` (a constant, a
 // table or a coded per-face PatchFunction1) opens and shuts faces with time: RAS/damBreakLeakage, held by
 // tests/interfoam_leakage_vs_openfoam.sh, on both arms (device_leak). Its EXPLICIT MULES branch is
-// refused on the device (device_leak_explicit).
+// refused on BOTH arms by the same rule (leak_explicitMULES, leak_explicitMULES_device): the tutorial ships
+// `MULESCorr yes`, and the rescale point is gated there only.
 //
 // AND `Gauss limitedLinear` on div(rhoPhi,U), on the host: one magSqr limiter per face, as OpenFOAM's
 // vector form has it. tests/interfoam_limitedlinear_vs_openfoam.sh holds eulerianInjection against
@@ -170,7 +171,6 @@
 //
 // BEGIN DEVICE REFUSALS
 //   device_gamg_smootherDILU device_gradLsq
-//   device_leak_explicit
 //   device_refine_motion
 //   device_Uflux_rhoPhi
 // END DEVICE REFUSALS
