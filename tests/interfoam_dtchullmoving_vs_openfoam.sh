@@ -227,5 +227,92 @@ control notv "the entry stripped from brae's case" || rc=1
 control flip "the entry's sign flipped" || rc=1
 control tv "the refValue dropped from the inflow value" BRAE_CONTROL_PIOV_TV=value || rc=1
 
+# --- `moving`: THE TUTORIAL AS SHIPPED, the hull moving ------------------------------------------------------
+# rigidBodyMotion (Pz + Ry, linearDamper, sphericalAngularDamper), the symmetryPlane point constraints, the
+# atmosphere's tangentialVelocity, the cached grad(U) (inert on a changing mesh), adjustTimeStep. STAGED on both
+# codes: writeControl timeStep, write every step, ascii, functions {} -- the oracle. The tutorial's
+# `writeControl adjustable` makes Time::adjustDeltaT trim deltaT so a whole number of steps reaches the next
+# write (1/round(1/1.2e-4) = 1.2000480019e-4 at step one); measured AS SHIPPED over two steps, brae's deltaT and
+# body state equal OpenFOAM's to its last printed digit.
+#
+# SIX STEPS, BECAUSE AT THE EIGHTH OPENFOAM BRANCHES ON ITSELF: with ONE ulp moved in one alpha cell, its
+# p_rgh final residuals agree to 1e-11 through step seven, jump 1.2e-02 at step eight's first solve, and step
+# nine's first solve takes 9 iterations instead of 10; by step ten OpenFOAM against itself reads U 7.9e-06,
+# p_rgh 6.1e-06, nut 4.8e-05, the body's q 9.0e-09 -- and brae against OpenFOAM reads U 8.7e-06, p_rgh 1.3e-05,
+# nut 9.2e-05, q 2.3e-08 there, the same branch. Up to it brae is at machine precision (six steps: U 4.8e-13,
+# q 2.2e-15, the moved points 2.5e-17 of the extent -- bounds in the gate).
+#
+# CONTROL, asserted to fail on a number: brae with the dynamicMeshDict's `restraints` removed, against
+# OpenFOAM with them (measured at ten steps: q 8.4e-03, U 3.2e-02, nut 1.7e-01).
+MSTEPS=6
+MV="$W/moving"
+rm -rf "$MV"
+cp -r "$M" "$MV" || exit 1
+rm -f "$MV"/log.*
+MSTEPS="$MSTEPS" python3 - "$MV" <<'PYEOF' || { echo "FAIL: staging moving"; exit 1; }
+import os, re, sys
+d = sys.argv[1]
+n = int(os.environ['MSTEPS'])
+c = os.path.join(d, 'system/controlDict')
+s = open(c).read()
+dt = float(re.search(r'^deltaT\s+([^;]+);', s, flags=re.M).group(1))
+assert re.search(r'^adjustTimeStep\s+yes;', s, flags=re.M), 'the tutorial adjusts its time step'
+# Courant stays far below maxCo here, so each step is 1.2x the last; Time::run stops once
+# value >= endTime - 0.5*deltaT
+ts = []
+t = 0.0
+for _ in range(n):
+    dt *= 1.2
+    t += dt
+    ts.append((t, dt))
+end = ts[-1][0] + 0.1*ts[-1][1]
+assert ts[-2][0] < end - 0.5*ts[-2][1] and not ts[-1][0] < end - 0.5*ts[-1][1]
+s, k = re.subn(r'functions\s*\{.*\}\s*(?=//)', 'functions {}\n\n', s, flags=re.S)
+assert k == 1, 'functions'
+for key, val in [('endTime', '%.17g' % end), ('writeControl', 'timeStep'), ('writeInterval', '1'),
+                 ('writeFormat', 'ascii'), ('writePrecision', '18')]:
+    s, k = re.subn(r'^%s\s.*' % key, '%s %s;' % (key.ljust(15), val), s, flags=re.M)
+    assert k == 1, key
+open(c, 'w').write(s)
+m = open(os.path.join(d, 'constant/dynamicMeshDict')).read()
+assert re.search(r'^dynamicFvMesh\s+dynamicMotionSolverFvMesh;', m, flags=re.M), 'the hull moves'
+assert re.search(r'^motionSolver\s+rigidBodyMotion;', m, flags=re.M), 'rigidBodyMotion'
+PYEOF
+MNR="$W/movingNoRestraints"
+rm -rf "$MNR"
+cp -r "$MV" "$MNR" || exit 1
+python3 - "$MNR/constant/dynamicMeshDict" <<'PYEOF' || { echo "FAIL: staging the no-restraints control"; exit 1; }
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+s, k = re.subn(r'\nrestraints\s*\{(?:[^{}]|\{[^{}]*\})*\}', '\n', s)
+assert k == 1, 'restraints'
+open(p, 'w').write(s)
+PYEOF
+( cd "$MV" && interFoam > log.interFoam 2>&1 )
+grep -q "^End" "$MV/log.interFoam" || { echo "FAIL: interFoam [moving]"; tail -30 "$MV/log.interFoam"; exit 1; }
+grep -q "Selecting motion solver: rigidBodyMotion" "$MV/log.interFoam" \
+    || { echo "FAIL: OpenFOAM's moving profile did not select rigidBodyMotion"; exit 1; }
+MLAST=$(foamListTimes -case "$MV" 2>/dev/null | tail -1)
+[ "$(foamListTimes -case "$MV" 2>/dev/null | wc -l)" = "$MSTEPS" ] \
+    || { echo "FAIL: OpenFOAM ran $(foamListTimes -case "$MV" | wc -l) steps of the moving profile, not $MSTEPS"; exit 1; }
+echo "OpenFOAM ran $MSTEPS steps of DTCHullMoving as shipped (the hull moving); last $MLAST"
+# brae starts from the staged case, not from OpenFOAM's time directories
+MB="$W/movingBrae"
+rm -rf "$MB"
+mkdir -p "$MB"
+cp -r "$M/0" "$MB/"
+cp -r "$MV/constant" "$MV/system" "$MB/"
+echo "== [moving]"
+"$BIN" "$MB" "$MV" "$MSTEPS" "$MLAST" "$MV/log.interFoam" $MODE moving || rc=1
+"$BIN" "$MNR" "$MV" "$MSTEPS" "$MLAST" "$MV/log.interFoam" moving > "$W/control.log" 2>&1
+if [ $? -ne 0 ] && grep -qE 'FAIL: (the joint position|alpha,|p_rgh,|U,)' "$W/control.log"; then
+    echo "  ok:   control the restraints removed fails on a number: $(grep -m1 -E 'FAIL: (the joint position|alpha,|p_rgh,|U,)' "$W/control.log" | sed 's/^ *FAIL: //' | tr -s ' ')"
+else
+    echo "  FAIL: control the restraints removed passed the gate -- the gate cannot see the dampers"
+    tail -20 "$W/control.log"
+    rc=1
+fi
+
 echo "interfoam_dtchullmoving_vs_openfoam: rc $rc"
 exit $rc

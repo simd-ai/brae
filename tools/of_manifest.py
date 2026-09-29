@@ -3824,12 +3824,41 @@ COMPONENTS = {
                         "the dampers add exactly nothing; moving, restraints dropped 2.5e+00, each alone 2.1e+00 / "
                         "2.5e+00, the damper force left in the body frame 2.7e+00; Pz as Py 1.2e-01. Fail-proofs "
                         "(moving arm): restraints never applied, Pz on y, the damper reading v.w, no X0.T() "
-                        "transport -- 8, 7, 6 and 4 failures. NOT CLAIMED: DTCHullMoving end to end, and the "
-                        "device.",
+                        "transport -- 8, 7, 6 and 4 failures. END TO END, tests/interfoam_dtchullmoving_vs_openfoam.sh "
+                        "`moving`: RAS/DTCHullMoving AS SHIPPED (the hull moving, symmetryPlane point "
+                        "constraints, tangentialVelocity, the inert cached grad(U)), six steps: q 2.2e-15, qDot "
+                        "6.2e-15, qDdot 8.6e-15, the moved points 2.5e-17 of the extent, U 4.8e-13, p_rgh "
+                        "1.1e-12, nut 3.2e-12, every p_rgh and alpha count OpenFOAM's; control, the restraints "
+                        "removed, q 1.9e-03. Six because OpenFOAM branches on itself at the eighth: one ulp in "
+                        "one alpha cell reads U 7.9e-06 and q 9.0e-09 by the tenth, where brae reads U 8.7e-06 "
+                        "and q 2.3e-08. NOT CLAIMED: the device.",
              note="The body is integrated on the host: two degrees of freedom, once per step. The dictionary is "
                   "motionSolver::coeffDict() = optionalSubDict(rigidBodyMotionCoeffs) and the name getCompat("
                   "motionSolver, {solver}); the restraints read the model's CACHED v_/X0_, which "
                   "forwardDynamicsCorrection last wrote from the same q and qDot the solve starts from."),
+        dict(name="interFoam_pointConstraints", of_symbol="pointConstraints",
+             of_file="src/finiteVolume/interpolation/volPointInterpolation/pointConstraints.C",
+             classification="HOST_ONLY", status="REIMPLEMENT",
+             brae_reference="src/finiteVolume/interpolation/volPointInterpolation/point_constraints_cpp.cuh",
+             brae_target="",
+             validation="tests/point_constraints_vs_openfoam.sh, against tools/dumpPointConstraints (OpenFOAM's "
+                        "own class on the same staged input), BIT FOR BIT on three arms: RAS/DTCHullMoving's mesh "
+                        "(848,022 cells; its bottom and side normals carry 1e-18/1e-21 off-axis parts from "
+                        "gSum(faceAreas), matched to the bit; 1,750 constrained points, 1,664 one-plane and 86 "
+                        "two-plane), the same with its fixedValue patches pinned off zero, and a parallelepiped "
+                        "whose three tilted symmetry planes meet (45 one-plane, 24 two-plane, one three-plane "
+                        "point): every normal, every constrained point in OpenFOAM's order with its count and "
+                        "tensor, the field after correctBoundaryConditions and after constrainDisplacement. "
+                        "Controls: the symmetryPlane evaluate skipped, constrainCorners skipped, the pins "
+                        "written after the planes, the three-plane corner left free. Fail-proofs: the normal "
+                        "by a reciprocal multiply and the count-3 case are seen by the parallelepiped only.",
+             note="Built ONCE by the rigid-body mesh motion at attach: the patch kinds from the MESH patch "
+                  "types (pointPatchFieldNew.C:143-161; `patchType` refused), the symmetryPlane normals frozen "
+                  "from the construction-time face areas, the constrained points from every non-empty, "
+                  "non-coupled patch's boundary points in patch order. Refused: any other constraint patch, "
+                  "a 2-D mesh (twoDPointCorrector), a per-point fixedValue. OpenFOAM's own "
+                  "patchPatchPointConstraints() list is truncated without being compacted, so it does not line "
+                  "up with the points; the oracle reads the count off the tensor."),
         dict(name="interFoam_displacementLaplacian", of_symbol="displacementLaplacianFvMotionSolver",
              of_file="src/fvMotionSolver/fvMotionSolvers/displacement/laplacian/displacementLaplacianFvMotionSolver.C",
              classification="GPU_REQUIRED", status="REIMPLEMENT",
