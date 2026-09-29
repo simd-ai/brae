@@ -328,6 +328,18 @@ public:
     virtual bool isVariableHeightFlowRateInlet() const { return false; }
     virtual const std::string& alphaFieldName() const { static const std::string none; return none; }
     virtual void updateFromAlphaPatch(const std::vector<scalar>&, scalar) {}
+    // outletPhaseMeanVelocity: a mixed U condition whose updateCoeffs reads the phase field's STORED patch
+    // values and U's own face CELLS at that instant (outletPhaseMeanVelocityFvPatchVectorField.C:130-163).
+    // The driver calls it where OpenFOAM runs U's updateCoeffs; Sf and magSf are the mesh's whole arrays.
+    virtual bool isOutletPhaseMeanVelocity() const { return false; }
+    virtual void updatePhaseMean(
+        const std::vector<scalar>&,
+        const std::vector<T>&,
+        const std::vector<vector>&,
+        const std::vector<scalar>&)
+    {
+        throw std::runtime_error("brae: updatePhaseMean on a patch that is not an outletPhaseMeanVelocity.");
+    }
     // variableHeightFlowRate: a mixed condition whose refValue follows the face CELL, so no loop that
     // uploads refValue once can carry it
     virtual bool isVariableHeightFlowRate() const { return false; }
@@ -2249,6 +2261,94 @@ private:
 // that is. The constructor is fixedValue's: the file's `value`, mandatory, stands until the first
 // updateCoeffs. brae's patch cannot look alpha up; the driver hands it over where OpenFOAM's updateCoeffs
 // runs, the momentum assembly.
+// outletPhaseMeanVelocity (outletPhaseMeanVelocityFvPatchVectorField.C:130-163): a mixed U condition that
+// holds the outflow's PHASE-MEAN normal speed at Umean. Its updateCoeffs clips the named phase field's
+// stored patch values to [0, 1], forms Uzgmean = gSum(alpha*(Sf & Uzg))/gSum(alpha*magSf) from the face
+// cells Uzg AS THEY STAND, and sets ONE valueFraction for the patch:
+//     Uzgmean >= Umean:  refValue = 0,                    valueFraction = 1 - Umean/Uzgmean
+//     otherwise:         refValue = (Umean + Uzgmean)*nf, valueFraction = 1 - Uzgmean/Umean
+// then mixed's evaluate blends. Everything else is mixed's: fixesValue true, assignable false, operator=
+// empty. autoMap: TRUE from ExtrapolatedValuePatchField -- refValue and valueFraction are rebuilt at every
+// updateCoeffs from the fields, and the read value is mapped as the base maps it.
+class OutletPhaseMeanVelocityPatchField : public MixedPatchField<vector>
+{
+public:
+    OutletPhaseMeanVelocityPatchField(
+        const FvPatch& p,
+        scalar Umean,
+        std::string alphaName,
+        std::vector<vector> readValue)
+        : MixedPatchField<vector>(p, true, vector{0, 0, 0}, {}, /*velocitySign=*/false, /*freestream=*/false,
+                                  std::move(readValue)),
+          Umean_(Umean),
+          alphaName_(std::move(alphaName))
+    {}
+    bool isOutletPhaseMeanVelocity() const override { return true; }
+    const std::string& alphaFieldName() const override { return alphaName_; }
+
+    void updatePhaseMean(
+        const std::vector<scalar>& alphaPatch,
+        const std::vector<vector>& internal,
+        const std::vector<vector>& Sf,
+        const std::vector<scalar>& magSf) override
+    {
+        const label n = this->patch_.size;
+        if (n == 0) return;
+        if (alphaPatch.size() != static_cast<std::size_t>(n))
+            throw std::runtime_error(
+                "brae: outletPhaseMeanVelocity on patch " + this->patch_.name + ": the phase field `"
+                + alphaName_ + "` has no values on this patch.");
+        const std::vector<vector> Uzg = this->patchInternalField(internal);
+        // gSum in face order, of alphap*(Sf & Uzg) and alphap*magSf; alphap = min(max(alpha, 0), 1)
+        scalar sumFlux = 0;
+        scalar sumArea = 0;
+        for (label i = 0; i < n; ++i)
+        {
+            const std::size_t fi = static_cast<std::size_t>(this->patch_.start + i);
+            scalar a = alphaPatch[static_cast<std::size_t>(i)];
+            a = (a > scalar(0)) ? a : scalar(0);
+            a = (a < scalar(1)) ? a : scalar(1);
+            const vector& S = Sf[fi];
+            const vector& u = Uzg[static_cast<std::size_t>(i)];
+            sumFlux += a*(S.x*u.x + S.y*u.y + S.z*u.z);
+            sumArea += a*magSf[fi];
+        }
+        if (!(sumArea > scalar(0)))
+            throw std::runtime_error(
+                "brae: outletPhaseMeanVelocity on patch " + this->patch_.name + ": no `" + alphaName_ + "` on "
+                "the patch, so gSum(alpha*magSf) is 0 and OpenFOAM's phase mean is 0/0; refusing.");
+        const scalar Uzgmean = sumFlux/sumArea;
+        std::vector<vector> ref(static_cast<std::size_t>(n), vector{0, 0, 0});
+        scalar vf;
+        if (Uzgmean >= Umean_)
+        {
+            vf = 1.0 - Umean_/Uzgmean;
+        }
+        else
+        {
+            vf = 1.0 - Uzgmean/Umean_;
+            const scalar s = Umean_ + Uzgmean;
+            for (label i = 0; i < n; ++i)
+            {
+                // patch().nf() is Sf()/magSf(), formed here from the same arrays
+                const std::size_t fi = static_cast<std::size_t>(this->patch_.start + i);
+                const vector nf{Sf[fi].x/magSf[fi], Sf[fi].y/magSf[fi], Sf[fi].z/magSf[fi]};
+                ref[static_cast<std::size_t>(i)] = vector{s*nf.x, s*nf.y, s*nf.z};
+            }
+        }
+        if (!std::isfinite(vf))
+            throw std::runtime_error(
+                "brae: outletPhaseMeanVelocity on patch " + this->patch_.name + ": the valueFraction is not "
+                "finite (Umean " + std::to_string(Umean_) + ", phase mean " + std::to_string(Uzgmean) + ").");
+        this->setRefValues(std::move(ref));
+        this->setValueFraction(std::vector<scalar>(static_cast<std::size_t>(n), vf));
+    }
+
+private:
+    scalar      Umean_;
+    std::string alphaName_;
+};
+
 class VariableHeightFlowRateInletVelocityPatchField : public FixedValuePatchField<vector>
 {
 public:
@@ -3766,6 +3866,33 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
         {
             throw std::runtime_error("brae: prghPermeableAlphaTotalPressure on patch " + p.name +
                                      " is a PRESSURE condition and the field is not a scalar.");
+        }
+    }
+    if (d.type == "outletPhaseMeanVelocity")
+    {
+        if constexpr (std::is_same_v<T, vector>)
+        {
+            if (!d.hasOpmvUmean || d.vhAlphaName.empty())
+                throw std::runtime_error("brae: outletPhaseMeanVelocity on patch " + p.name +
+                    " needs both `Umean` and `alpha` (OpenFOAM reads both without a default, "
+                    "outletPhaseMeanVelocityFvPatchVectorField.C:74-75).");
+            // OpenFOAM extrapolates the face cells when `value` is absent (.C:83-86), which this factory,
+            // holding no cells, cannot; refused by name rather than started from zero
+            if (!d.hasValue)
+                throw std::runtime_error("brae: outletPhaseMeanVelocity on patch " + p.name +
+                    " has no `value`; OpenFOAM would start from the face cells, which brae's factory cannot.");
+            std::vector<vector> v = d.valueUniform ? std::vector<vector>(static_cast<std::size_t>(p.size), d.uniformValue)
+                                                   : d.values;
+            if (v.size() != static_cast<std::size_t>(p.size))
+                throw std::runtime_error("brae: outletPhaseMeanVelocity on patch " + p.name +
+                    ": its `value` has " + std::to_string(v.size()) + " entries for " + std::to_string(p.size)
+                    + " faces.");
+            return std::make_unique<OutletPhaseMeanVelocityPatchField>(p, d.opmvUmean, d.vhAlphaName, std::move(v));
+        }
+        else
+        {
+            throw std::runtime_error("brae: outletPhaseMeanVelocity on patch " + p.name +
+                                     " is a VELOCITY condition and the field is not a vector.");
         }
     }
     if (d.type == "variableHeightFlowRateInletVelocity")

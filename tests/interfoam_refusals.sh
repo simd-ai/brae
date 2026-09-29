@@ -468,6 +468,17 @@ BASE="$B"
 # a solver-entry floor the momentum predictor does not honour yet. BOTH alpha pre-solves honour it now
 # (tests/interfoam_dambreak_vs_openfoam.sh `alphaminiter`, compared on the host AND the device arm), so
 # this arm asserts the case RUNS rather than that either loop refuses it.
+# outletPhaseMeanVelocity -- RAS/DTCHull's U outlet -- RUNS on the host loop (gated by
+# tests/interfoam_dtchull_vs_openfoam.sh `ras`). Its Umean and alpha are MUST_READ; a missing `value` would
+# be extrapolated from the cells, which the factory cannot do; a phase field it names that is not the
+# case's is OpenFOAM's own stop; a DRY patch makes OpenFOAM's phase mean 0/0 (damBreak's atmosphere is air);
+# the device loop does not carry it (device_opmv).
+OPMV="python3 -c \"import re; p='0/U'; t=open(p).read(); t=re.sub(r'atmosphere\\s*\\{[^}]*\\}', 'atmosphere { type outletPhaseMeanVelocity; OPMVSPEC }', t, count=1); open(p,'w').write(t)\""
+arm opmv_noUmean            refused "needs both \`Umean\` and \`alpha\`" "" "${OPMV/OPMVSPEC/alpha alpha.water; value uniform (0 0 0);}"
+arm opmv_noValue            refused "has no \`value\`"           "" "${OPMV/OPMVSPEC/Umean 1; alpha alpha.water;}"
+arm opmv_otherAlpha         refused "OpenFOAM looks the named field up" "" "${OPMV/OPMVSPEC/Umean 1; alpha alpha.oil; value uniform (0 0 0);}"
+arm opmv_dry                refused "no \`alpha.water\` on the patch" "" "${OPMV/OPMVSPEC/Umean 1; alpha alpha.water; value uniform (0 0 0);}"
+
 arm alpha_minIter           runs    -                        "" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       yes;\\n\\1minIter 1;/' system/fvSolution"
 # `MULESCorr any;` is TRUE to OpenFOAM (Switch.C:114). alphaEqn's own switch helper covered six spellings
 # each way and THREW on `any` and `none`; it is FoamDict::switchOr now, so this runs.
@@ -942,6 +953,10 @@ if [ $HAVE_GPU = 1 ]; then
     arm device_sstLinearUpwind refused "the device closure is not wired" "-device" "$SSTBASE; ${LUGRAD/LIMGRAD/cellLimited Gauss linear 1}; $LUBOTH"
     # nutkRoughWallFunction carries history the device wall kernels do not keep: refused by name
     arm device_sstNutkRough refused "has no rough wall function" "-device" "$SSTBASE; ${ROUGHNUT/RSPEC/Ks uniform 1e-4; Cs uniform 0.5;}"
+    # outletPhaseMeanVelocity is updated from U's cells on the host loop only
+    BASE="$B"
+    arm device_opmv         refused "is outletPhaseMeanVelocity. The host" "-device" "${OPMV/OPMVSPEC/Umean 1; alpha alpha.water; value uniform (0 0 0);}"
+    BASE="$BR"
     BASE="$B"
     BASE="$B"
     # the device's alpha pre-solve honours the case's minIter now, as the host's always has

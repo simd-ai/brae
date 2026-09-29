@@ -734,6 +734,16 @@ RunReport runInterFoam(
         std::printf("  *** CONTROL MODE: the localEuler consumer `%s` reads 1/deltaT, not the local rDeltaT. "
                     "This run is deliberately wrong. ***\n", ltsScalarControl.c_str());
     }
+    // GATE CONTROLS for outletPhaseMeanVelocity, never set by a solver: FROZEN keeps the condition as read
+    // (no updateCoeffs at all), IGNORE_LAG updates it in the first corrector too. Both make the answer WRONG.
+    const bool opmvFrozen = std::getenv("BRAE_CONTROL_OPMV_FROZEN") != nullptr;
+    const bool opmvIgnoreLag = std::getenv("BRAE_CONTROL_OPMV_NOLAG") != nullptr;
+    if (opmvFrozen)
+        std::printf("  *** CONTROL MODE: outletPhaseMeanVelocity is never updated. This run is deliberately "
+                    "wrong. ***\n");
+    if (opmvIgnoreLag)
+        std::printf("  *** CONTROL MODE: outletPhaseMeanVelocity is updated in the lagged first corrector. "
+                    "This run is deliberately wrong. ***\n");
     auto rDeltaTFor = [&](const char* consumer) -> const std::vector<scalar>*
     {
         if (!f.lts) return nullptr;
@@ -1412,6 +1422,19 @@ RunReport runInterFoam(
                                     "without it.");
                             f.U.boundary[pi]->updateFromAlphaPatch(f.alpha1.boundary[pi]->value(), rep.time);
                         }
+                        // ...and an outletPhaseMeanVelocity, from the phase field's stored patch values and
+                        // U's face cells as they stand at the assembly (the step's starting U)
+                        if (f.U.boundary[pi]->isOutletPhaseMeanVelocity() && !opmvFrozen)
+                        {
+                            if (f.U.boundary[pi]->alphaFieldName() != f.alphaName)
+                                throw std::runtime_error(
+                                    "brae interFoam: U patch `" + patches[pi].name + "` is an "
+                                    "outletPhaseMeanVelocity naming `alpha " + f.U.boundary[pi]->alphaFieldName()
+                                    + "`, and this case's phase field is `" + f.alphaName + "`. OpenFOAM looks "
+                                    "the named field up and stops without it.");
+                            f.U.boundary[pi]->updatePhaseMean(f.alpha1.boundary[pi]->value(), f.U.internal,
+                                                              g.Sf(), g.magSf());
+                        }
                     }
                     if (!f.fvOptions.empty())
                     {
@@ -1479,6 +1502,19 @@ RunReport runInterFoam(
                     if (!f.meshIsDynamic) phiOldRequested = true;
 
                     PressureStepInput pin;
+                    // outletPhaseMeanVelocity's updateCoeffs inside U.correctBoundaryConditions(): the
+                    // corrected cells and the phase field's stored patch values
+                    pin.controlIgnoreUpdatedLag = opmvIgnoreLag;
+                    pin.uUpdateCoeffsFromCells = [&]()
+                    {
+                        if (opmvFrozen) return;
+                        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                        {
+                            if (!f.U.boundary[pi]->isOutletPhaseMeanVelocity()) continue;
+                            f.U.boundary[pi]->updatePhaseMean(f.alpha1.boundary[pi]->value(), f.U.internal,
+                                                              g.Sf(), g.magSf());
+                        }
+                    };
                     pin.UEqn = &UEqn; pin.rho = &f.rho; pin.gh = &f.gh; pin.ghf = &f.ghfInternal;
                     pin.ghfBnd = &f.ghfBoundary;
                     pin.stf = &stf; pin.snGradRho = &snRho; pin.ddt = &dc;

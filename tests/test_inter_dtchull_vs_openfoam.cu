@@ -76,6 +76,7 @@ constexpr scalar BOUND_U_RAS = 5e-12;
 // the first), OpenFOAM's one-ulp floor 7.9e-12. Its controls -- the smooth wall function, the history
 // dropped -- read 1.0e+00 and 4.6e-01.
 constexpr scalar BOUND_NUT_WALL = 2e-10;
+constexpr scalar BOUND_U_OUTLET = 2e-11;
 
 struct Diff
 {
@@ -338,13 +339,53 @@ int main(
                                                    !measureOnly);
     }
 
+    // THE OUTLET's U, face by face, where OpenFOAM's file names outletPhaseMeanVelocity: its value is the
+    // blend its updateCoeffs set, so the patch is its own witness
+    {
+        const FieldData<vector> ofU = readField<vector>(last + "/U");
+        scalar dOut = 0;
+        scalar outMax = 0;
+        int nOf = 0;
+        int nBrae = 0;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const PatchFieldData<vector>* b = findPatchEntry(ofU.boundary, patches[pi]);
+            if (!b || b->type != "outletPhaseMeanVelocity") continue;
+            ++nOf;
+            nBrae += fin.U.boundary[pi]->isOutletPhaseMeanVelocity() ? 1 : 0;
+            const std::size_t n = static_cast<std::size_t>(patches[pi].size);
+            const std::vector<vector> ofv = b->valueUniform ? std::vector<vector>(n, b->uniformValue) : b->values;
+            const std::vector<vector>& bv = fin.U.boundary[pi]->value();
+            failures += brae::gatecheck::nonFinite(("brae U on " + patches[pi].name).c_str(), bv);
+            for (std::size_t i = 0; i < n && i < ofv.size() && i < bv.size(); ++i)
+            {
+                const vector e{bv[i].x - ofv[i].x, bv[i].y - ofv[i].y, bv[i].z - ofv[i].z};
+                dOut = std::fmax(dOut, mag(e));
+                outMax = std::fmax(outMax, mag(ofv[i]));
+            }
+        }
+        if (nOf > 0)
+        {
+            check("brae built outletPhaseMeanVelocity wherever OpenFOAM's file has it", nOf == nBrae);
+            bound("outlet U, face by face, relative to its largest", dOut/std::fmax(outMax, scalar(1e-300)),
+                  BOUND_U_OUTLET);
+        }
+    }
+
     // the solves
     const std::vector<LinearSolveRecord> ofP = brae::gatecheck::readOfPressureSolves(logPath);
     const std::vector<LinearSolveRecord> ofA = brae::gatecheck::readOfSolves(logPath, fin.alphaName);
     check("OpenFOAM's log gave the p_rgh and alpha solves",
           !ofP.empty() && ofA.size() >= static_cast<std::size_t>(nSteps));
+    // p_rgh's initial residuals over the run. `ras` runs the tutorial's own outletPhaseMeanVelocity, and
+    // that profile is the more sensitive one: OpenFOAM against ITSELF with one interface cell's alpha moved
+    // by one ulp reads 4.9e-11 there, and brae 3.0e-10, 6x its floor -- the same ratio its fields sit at
+    // from the third step on, all of it growing from a U difference of 6e-13 at the FIRST step that the
+    // laminar profile has too (the outlet itself is 5.8e-12 face by face). It was 2e-10 while the profile
+    // staged the outlet as inletOutlet; laminar keeps that.
+    const scalar pRunBound = fin.turbulence.on ? scalar(6e-10) : scalar(2e-10);
     failures += brae::gatecheck::compareSolves("host", r.pSolves, ofP, nSteps, "p_rgh",
-                                               scalar(1e-10), scalar(2e-10), scalar(-1), nullptr,
+                                               scalar(1e-10), pRunBound, scalar(-1), nullptr,
                                                !measureOnly);
     failures += brae::gatecheck::compareSolves("host", r.alphaSolves, ofA, nSteps, fin.alphaName.c_str(),
                                                scalar(1e-10), scalar(1e-10), scalar(1e-5), nullptr,

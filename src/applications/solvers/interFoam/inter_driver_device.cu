@@ -158,6 +158,15 @@ RunReport runInterFoamDevice(
         throw std::runtime_error(
             "brae interFoam (device): ddtSchemes `default` is localEuler. The local time step (setRDeltaT.H) "
             "and its consumers are ported on the host loop only; run without -device.");
+    // outletPhaseMeanVelocity is updated from U's CELLS at the assembly and inside each corrector's
+    // U.correctBoundaryConditions() on the host loop (inter_driver_cpp.cu); this loop carries no such hook
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        if (f.U.boundary[pi]->isOutletPhaseMeanVelocity())
+            throw std::runtime_error(
+                "brae interFoam (device): U patch `" + fvp[pi].name + "` is outletPhaseMeanVelocity. The host "
+                "loop carries it; the device loop does not. Run without -device.");
+    }
     // THE PAIR, built here and not at the device-mesh stage, because the hooks below fill its share of
     // the surface fields and they are defined before the DeviceCyclic is.
     // ...INCLUDING a cyclicACMI the caller has coupled as a coincident pair (cpu::cyclicACMI::setup):

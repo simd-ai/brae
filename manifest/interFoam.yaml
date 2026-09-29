@@ -215,6 +215,16 @@ components:
     validation: "tests/interfoam_dtchull_vs_openfoam.sh `ras`, RAS/DTCHull's hull as shipped (Ks 1e-4, Cs 0.5) under kOmegaSST and localEuler, HOST ONLY: the hull's wall nut face by face 6.2e-11 after ten steps (1.7e-12 at the first; OpenFOAM's one-ulp floor 7.9e-12), k 2.8e-12, omega 8.9e-12, U 4.4e-13, every count OpenFOAM's. Witness, OpenFOAM against itself rough vs smooth: nut 2.3e-01 and U 7.0e-04 at the first step. By the last step 5,605 of 27,438 hull faces are in fnRough's 2.25 < KsPlus < 90 regime. CONTROLS: run as nutkWallFunction, wall nut 1.0e+00 and U 4.0e-03; the history dropped (limited against nu_w), wall nut 4.6e-01. NOT CLAIMED: the KsPlus >= 90 regime (no face reaches it), kEpsilon, a refining mesh, the device (refused)."
     note: "A wall nut WITH HISTORY: calcNut clamps the log-law value to [0.5, 2]*max(the patch's previous value, nu_w), and the first call -- validate() -- reads the case file's `value`, which is therefore MUST_READ and load-bearing; Ks and Cs are MUST_READ per-face scalarFields, not PatchFunction1s. It has no yPlusLam branch and keeps the log law's `- 1`; its association is not nutk's (uStar*y/nu, sqrt(sqrt(Cmu))). brae's NutkRoughPatchField keeps value_ across evaluate(), as OpenFOAM's fixedValue-derived class does, and correctNutField dispatches on the patch's class. The device closures recompute the wall nut from k with no history and refuse it by name, as do the legacy drivers' selectNutWall and interFoam's kEpsilon reader."
 
+  interFoam_outletPhaseMeanVelocity:
+    openfoam:
+      symbol: outletPhaseMeanVelocityFvPatchVectorField
+      file: src/finiteVolume/fields/fvPatchFields/derived/outletPhaseMeanVelocity/outletPhaseMeanVelocityFvPatchVectorField.C
+    classification: GPU_REQUIRED
+    brae_status: REIMPLEMENT
+    brae_reference: src/finiteVolume/fields/fv_patch_field.cuh
+    validation: "tests/interfoam_dtchull_vs_openfoam.sh, RAS/DTCHull's U outlet as shipped (Umean 1.668), both profiles, HOST ONLY: the outlet's U face by face 5.8e-12 (ras) and 3.2e-12 (laminar) after ten steps, every count OpenFOAM's. Witness, OpenFOAM against itself with an inletOutlet there: k 2.7e-02 at the first step, alpha 9.9e-04 at the last. CONTROLS: never updated, alpha 7.4e-02; updated in the first corrector too (ignoring the updated() lag), U 9.6e-05, k 9.8e-03. NOT CLAIMED: a dry patch (refused: OpenFOAM's phase mean is 0/0), a missing value (refused), the device (refused)."
+    note: "A mixed U condition with ONE valueFraction per patch: updateCoeffs clips the phase field's stored patch values to [0, 1], forms Uzgmean = gSum(alpha*(Sf & Uzg))/gSum(alpha*magSf) from U's face cells AS THEY STAND, and sets refValue 0, vf 1 - Umean/Uzgmean (Uzgmean >= Umean) or refValue (Umean + Uzgmean)*nf, vf 1 - Uzgmean/Umean. The instants are OpenFOAM's: the UEqn assembly (the step's starting cells) and each pressure corrector's U.correctBoundaryConditions() -- but NOT the first corrector after an unsolved assembly, where the patch is still updated() and blends with the assembly's coefficients (PressureStepInput::uUpdateCoeffsFromCells, uPatchesUpdatedAtEntry)."
+
   interFoam_variableHeightFlowRate:
     openfoam:
       symbol: variableHeightFlowRateInletVelocityFvPatchVectorField

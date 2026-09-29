@@ -3033,6 +3033,24 @@ COMPONENTS = {
                   "OpenFOAM's fixedValue-derived class does, and correctNutField dispatches on the patch's class. "
                   "The device closures recompute the wall nut from k with no history and refuse it by name, as do "
                   "the legacy drivers' selectNutWall and interFoam's kEpsilon reader."),
+        dict(name="interFoam_outletPhaseMeanVelocity", of_symbol="outletPhaseMeanVelocityFvPatchVectorField",
+             of_file="src/finiteVolume/fields/fvPatchFields/derived/outletPhaseMeanVelocity/outletPhaseMeanVelocityFvPatchVectorField.C",
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/finiteVolume/fields/fv_patch_field.cuh",
+             validation="tests/interfoam_dtchull_vs_openfoam.sh, RAS/DTCHull's U outlet as shipped (Umean 1.668), both "
+                        "profiles, HOST ONLY: the outlet's U face by face 5.8e-12 (ras) and 3.2e-12 (laminar) after ten "
+                        "steps, every count OpenFOAM's. Witness, OpenFOAM against itself with an inletOutlet there: k "
+                        "2.7e-02 at the first step, alpha 9.9e-04 at the last. CONTROLS: never updated, alpha 7.4e-02; "
+                        "updated in the first corrector too (ignoring the updated() lag), U 9.6e-05, k 9.8e-03. NOT "
+                        "CLAIMED: a dry patch (refused: OpenFOAM's phase mean is 0/0), a missing value (refused), the "
+                        "device (refused).",
+             note="A mixed U condition with ONE valueFraction per patch: updateCoeffs clips the phase field's stored "
+                  "patch values to [0, 1], forms Uzgmean = gSum(alpha*(Sf & Uzg))/gSum(alpha*magSf) from U's face "
+                  "cells AS THEY STAND, and sets refValue 0, vf 1 - Umean/Uzgmean (Uzgmean >= Umean) or refValue "
+                  "(Umean + Uzgmean)*nf, vf 1 - Uzgmean/Umean. The instants are OpenFOAM's: the UEqn assembly (the "
+                  "step's starting cells) and each pressure corrector's U.correctBoundaryConditions() -- but NOT the "
+                  "first corrector after an unsolved assembly, where the patch is still updated() and blends with "
+                  "the assembly's coefficients (PressureStepInput::uUpdateCoeffsFromCells, uPatchesUpdatedAtEntry)."),
         dict(name="interFoam_variableHeightFlowRate", of_symbol="variableHeightFlowRateInletVelocityFvPatchVectorField",
              of_file="src/finiteVolume/fields/fvPatchFields/derived/variableHeightFlowRateInletVelocity/"
                      "variableHeightFlowRateInletVelocityFvPatchVectorField.C",

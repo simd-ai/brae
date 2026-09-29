@@ -1,4 +1,5 @@
 #pragma once
+#include <functional>
 // interFoam's pressure corrector -- the host reference.
 //
 // provenance:
@@ -402,6 +403,13 @@ struct PressureStepInput
     // PER CLASS: a condition whose updateCoeffs ends in evaluate() clears the flag itself and is exempt
     // (fvPatchField::updateCoeffsEvaluates).
     bool uPatchesUpdatedAtEntry = false;
+    // U's patches whose updateCoeffs reads U's own CELLS (outletPhaseMeanVelocity): OpenFOAM runs it
+    // inside U.correctBoundaryConditions(), after the corrector's `U = HbyA + ...`, unless the patch is
+    // still updated() (above). The driver's hook updates them from the corrected cells; null == none.
+    std::function<void()> uUpdateCoeffsFromCells;
+    // A GATE'S CONTROL: run that hook on the lagged corrector too, as if the assembly had not left U's
+    // patches updated(). Never set by a solver.
+    bool controlIgnoreUpdatedLag = false;
     // MRF, pEqn.H:17-19: the ddtCorr flux is ZERO-FILTERED on the zone's faces and phiHbyA made
     // relative to the frame. Null or empty is a case without MRF.
     const std::vector<MRF::Zone>* mrf = nullptr;

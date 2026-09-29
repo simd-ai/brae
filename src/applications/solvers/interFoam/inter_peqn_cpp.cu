@@ -1097,6 +1097,12 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
             }
             if (tapHere) in.taps->ffBnd = ffB;
             correctVelocity(HbyA, rAU, faceFlux, rAUfField.internal, ffB, rB, m, g, patches, U.internal);
+            // U.correctBoundaryConditions()'s updateCoeffs, for the patches that read the cells just set
+            // -- skipped while they are still updated() from the assembly (uPatchesUpdatedAtEntry)
+            if (in.uUpdateCoeffsFromCells && (!in.uPatchesUpdatedAtEntry || in.controlIgnoreUpdatedLag))
+            {
+                in.uUpdateCoeffsFromCells();
+            }
             U.evaluateBoundary();
 
             // ...AND THE FLUX-CONDITIONAL VELOCITY PATCHES, which evaluateBoundary() alone does not

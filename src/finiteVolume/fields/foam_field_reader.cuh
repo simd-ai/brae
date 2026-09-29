@@ -154,6 +154,10 @@ struct PatchFieldData
     // (nutkRoughWallFunctionFvPatchScalarField.C:179-180, Field.C:213-268) -- and constant in time: not
     // PatchFunction1s. A form the reader cannot take is named in roughFormError and refused by the factory
     // row, which alone knows the type needs them.
+    // outletPhaseMeanVelocity's target phase-mean outflow speed, MUST_READ (dict.get<scalar>("Umean"),
+    // outletPhaseMeanVelocityFvPatchVectorField.C:74); its `alpha` goes to vhAlphaName
+    bool           hasOpmvUmean = false;
+    scalar         opmvUmean = 0;
     bool           hasRoughKs = false;
     bool           roughKsUniform = false;
     scalar         roughKsUniformValue = 0;
@@ -1272,6 +1276,12 @@ inline FieldData<T> readField(const std::string& path)
                                 "holding a time-varying rate fixed.");
                         p.hasVhFlowRate = true;
                         p.vhFlowRateFunction1 = Function1::constant(std::stod(w));
+                        ts.expect(";");
+                    }
+                    else if (key == "Umean")      // outletPhaseMeanVelocity's target mean speed
+                    {
+                        p.hasOpmvUmean = true;
+                        p.opmvUmean = std::stod(ts.next());
                         ts.expect(";");
                     }
                     else if (key == "alpha")      // ...and the phase field it weights the inlet by
