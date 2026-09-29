@@ -3651,6 +3651,20 @@ set_tests_properties(interfoam_dtchull_vs_openfoam PROPERTIES
                      SKIP_RETURN_CODE 77
                      ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 
+# ...and RAS/DTCHullMoving with its mesh FROZEN: the atmosphere's pressureInletOutletVelocity carries a
+# `tangentialVelocity`, which interFoam's host loop claims and hands to the patch field. The control is brae
+# with the entry stripped against OpenFOAM with it; OpenFOAM against itself without the entry is the proof the
+# window can see it. Meshes the tutorial serially, as the DTCHull gate does.
+add_executable(test_inter_dtchullmoving_vs_openfoam tests/test_inter_dtchullmoving_vs_openfoam.cu)
+target_include_directories(test_inter_dtchullmoving_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_dtchullmoving_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_dtchullmoving_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_dtchullmoving_vs_openfoam.sh)
+set_tests_properties(interfoam_dtchullmoving_vs_openfoam PROPERTIES
+                     SKIP_RETURN_CODE 77
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+
 add_executable(test_inter_weiroverflow_vs_openfoam tests/test_inter_weiroverflow_vs_openfoam.cu)
 target_include_directories(test_inter_weiroverflow_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)

@@ -402,6 +402,16 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
         // overridden on ProcessorFvPatchField, so it would otherwise report 0 (= zeroGradient) whose
         // valueInternalCoeffs is 1, DOUBLE-COUNTING the interface diagonal.
         const int cat = (fvp[pi].type == "processor") ? 8 : f.boundary[pi]->bcCategory();
+        // pressureInletOutletVelocity with a tangentialVelocity: every device evaluation of this category
+        // fixes the inflow tangential part to ZERO, so a patch carrying one would run a different boundary
+        // condition with nothing said. Only the host (interFoam) carries it.
+        if (f.boundary[pi]->tangentialVelocityPtr())
+        {
+            throw std::runtime_error(
+                "brae: patch " + fvp[pi].name + " is pressureInletOutletVelocity with a "
+                "`tangentialVelocity`; the device fixes the inflow tangential velocity to zero and does "
+                "not carry the entry. Run the host loop.");
+        }
         const bool sym = f.boundary[pi]->isSymmetry();
         // wedge: the patch field carries the two rotation tensors; the valueFraction comes from the
         // FULL-angle one and the per-step refValue from the HALF-angle one.

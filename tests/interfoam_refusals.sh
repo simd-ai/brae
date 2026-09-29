@@ -492,6 +492,14 @@ arm gradUCache_laminar      refused "U has changed since grad(U) was last formed
 arm gradUCache_otherField   refused "names \`grad(p_rgh)\`"  "" "${CACHE/CACHESPEC/    grad(U);\\n    grad(p_rgh);}"
 arm gradUCache_pattern      refused "a pattern key could match" "" "${CACHE/CACHESPEC/    \"grad(.*)\";}"
 arm gradUCache_inactive     runs    -                         "" "${CACHE/CACHESPEC/    active false;\\n    grad(U);\\n    grad(p_rgh);}"
+# pressureInletOutletVelocity's `tangentialVelocity` -- RAS/DTCHullMoving's atmosphere -- RUNS on the host
+# loop: interFoam claims the entry and hands it to the patch field (the shared factory still refuses it for
+# every other solver). The bare `(a b c)` form is OpenFOAM's own stop (Field.C), a refining mesh would have to
+# map the refValue, and the device loop fixes the inflow tangential velocity to zero (device_piovTangential).
+TANGV="sed -i '/atmosphere/,/}/ s/type  *pressureInletOutletVelocity;/type            pressureInletOutletVelocity;\\n        tangentialVelocity TVSPEC;/' 0/U"
+arm piov_tangential         runs    -                         "" "${TANGV/TVSPEC/uniform (0.1 0 0)}"
+arm piov_tangential_bare    refused "without \`uniform\` or \`nonuniform\`" "" "${TANGV/TVSPEC/(0.1 0 0)}"
+arm piov_tangential_refine  refused "tangentialVelocity\`, and the mesh refines" "" "$REFDICT '' > constant/dynamicMeshDict && ${TANGV/TVSPEC/uniform (0.1 0 0)}"
 # ...and linearUpwind's NAMED gradient: brae's momentum takes grad(U)'s entry and registry field, so a
 # case naming another was run as grad(U). All 25 shipped users of the family name grad(U).
 arm lu_momentumOtherGrad    refused "names the gradient \`limitedGrad\`" "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U) Gauss linearUpwind limitedGrad;/' system/fvSchemes; sed -i '/^gradSchemes/,/^}/ s/default .*/&\\n    limitedGrad     cellLimited Gauss linear 1;/' system/fvSchemes"
@@ -889,6 +897,9 @@ if [ $HAVE_GPU = 1 ]; then
     # numbers). It was refused twice -- for the closure, then for a momentum gap that turned out to be
     # three wedge defects -- so this arm is a `runs`, and a blanket refusal coming back fails it
     arm device_les          runs    -                      "-device" true
+    # ...and a pressureInletOutletVelocity `tangentialVelocity` is refused: every device evaluation of the
+    # patch fixes the inflow tangential velocity to zero (the host carries it, piov_tangential)
+    arm device_piovTangential refused "does not carry the entry" "-device" "${TANGV/TVSPEC/uniform (0.1 0 0)}"
     # the MANGROVE PAIR RUNS on the device now, with k and epsilon under the PBiCG/DILU the case names
     # (tests/interfoam_mangrove_vs_openfoam.sh holds both arms to OpenFOAM, solve by solve). It was a
     # refusal by the option's name, and behind that refusal the closure would have run a Gauss-Seidel

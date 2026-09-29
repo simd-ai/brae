@@ -118,11 +118,19 @@ struct PatchFieldData
     bool           hasPatchExpr = false;
     Function1      p0Function1;              // uniformTotalPressure p0(t); empty unless hasP0Function1
     bool           hasP0Function1 = false;
-    // pressureInletOutletVelocity's optional `tangentialVelocity`. OF sets
-    // refValue = tv - n*(n & tv) (pressureInletOutletVelocityFvPatchVectorField.C:135); brae leaves the
-    // tangential refValue at zero, so honouring the key would need per-face storage it does not have.
-    // Recorded so it can be refused instead of quietly changing the boundary condition.
+    // pressureInletOutletVelocity's optional `tangentialVelocity`, read as OpenFOAM reads it:
+    // vectorField("tangentialVelocity", dict, p.size()) (pressureInletOutletVelocityFvPatchVectorField.C:90),
+    // `uniform`, `nonuniform` or `$internalField`. OpenFOAM turns it into refValue = tv - n*(n & tv) once,
+    // at construction (:130-136). The shared factory still REFUSES the entry: only a solver that claims it
+    // and hands it to the patch field (interFoam, claimTangentialVelocity) runs it.
     bool           hasTangentialVelocity = false;
+    bool           tvUniform = false;
+    T              tvUniformValue{};
+    std::vector<T> tvValues;
+    // the entry was there and NOT parsed: written in the bare `(a b c)` form, or before `type`, or on a
+    // patch that is not pressureInletOutletVelocity -- see the reader branch and the claim
+    bool           tvBare = false;
+    bool           tvUnparsed = false;
     // fixedGradient (and the heat-flux BCs derived from it): the prescribed normal gradient.
     // Plain `mixed` (Robin) carries refValue + refGradient + valueFraction. refGradient shares the
     // gradient* slots below; these two are its own. Distinct from inletValue*, which inletOutlet and the
@@ -1553,7 +1561,37 @@ inline FieldData<T> readField(const std::string& path)
                     else if (key == "tangentialVelocity")   // pressureInletOutletVelocity, optional
                     {
                         p.hasTangentialVelocity = true;
-                        skipToSemicolon(ts);
+                        // PARSED ONLY FOR pressureInletOutletVelocity: swirlInletVelocity names the same key
+                        // as a Function1<scalar> (`tangentialVelocity constant 100;`, .H:56), and reading
+                        // that as a vectorField stopped the case on a parse error before the factory's
+                        // refusal of the type could name it. A key written before `type` is not parsed
+                        // either; the claim refuses it by name (tvUnparsed).
+                        if constexpr (std::is_same<T, vector>::value)
+                        {
+                            if (p.type != "pressureInletOutletVelocity")
+                            {
+                                p.tvUnparsed = true;
+                                skipToSemicolon(ts);
+                            }
+                            else if (ts.peek() == "(" || isFoamNumber(ts.peek()))
+                            {
+                                // Field.C:254-259: a bare `(a b c)` is a FatalIOError for a Field entry --
+                                // but only on a patch with faces (Field.C:216, `if (len)`), which this
+                                // reader cannot see; the claim refuses it where OpenFOAM would stop
+                                p.tvBare = true;
+                                skipToSemicolon(ts);
+                            }
+                            else
+                            {
+                                readValueOrInternal(ts, fd, p.tvUniform, p.tvUniformValue, p.tvValues);
+                                ts.expect(";");
+                            }
+                        }
+                        else
+                        {
+                            // not a vector field: no class of this type reads it
+                            skipToSemicolon(ts);
+                        }
                     }
                     else
                     {

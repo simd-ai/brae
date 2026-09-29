@@ -391,6 +391,9 @@ public:
     // fixedGradient's prescribed normal gradient; null for every other BC, so the device refGrad stays 0
     // and zeroGradient behaves exactly as before.
     virtual const std::vector<T>* refGradPtr() const { return nullptr; }
+    // pressureInletOutletVelocity's `tangentialVelocity` as the case gave it, once a solver has claimed
+    // it (null everywhere else): the device builder refuses a patch that carries one.
+    virtual const std::vector<T>* tangentialVelocityPtr() const { return nullptr; }
 
     const std::vector<T>& value() const { return value_; }
     // THE STATE A MESH CHANGE HAS TO MAP, for a gate to compare against OpenFOAM's own. Empty where the
@@ -2911,9 +2914,9 @@ private:
 // flux sign (valueFraction = neg(phi)*(I - n n); value = vf&refValue + (I-vf)&pif): outflow (phi>=0) -> zeroGradient
 // (full extrapolation); inflow (phi<0) -> the TANGENTIAL velocity is fixed to refValue (default 0) while the NORMAL
 // component is zeroGradient, so the pressure sets the inflow speed (value = n*(n.U_cell)). The DEVICE recomputes the
-// per-face inflow value each step (deviceUpdatePressureInletOutletVelocity); bcCategory()=6 marks it. Vector-only;
-// a non-zero `tangentialVelocity` field is NOT supported and is now REFUSED at construction (it was
-// only a comment before, so a case carrying one ran with the tangential component silently zeroed).
+// per-face inflow value each step (deviceUpdatePressureInletOutletVelocity); bcCategory()=6 marks it. Vector-only.
+// A `tangentialVelocity` entry is REFUSED by the factory for every solver; interFoam's host claims it and
+// hands it over with setTangentialVelocity, and the device builder refuses a patch that carries one.
 //
 // THE MATRIX SIDE. directionMixed is a transform patch field, and its coefficients are not the
 // zeroGradient ones this class used to inherit for every component: with
@@ -3055,8 +3058,16 @@ public:
                     continue;
                 }
                 const vector& nf = this->patch_.nf[i];
-                const scalar nd = nf.x*pif[i].x + nf.y*pif[i].y + nf.z*pif[i].z;
                 const scalar dc = this->patch_.deltaCoeffs[i];
+                if (!tangentialRef_.empty() && !controlDropRefFromSnGrad_)
+                {
+                    // directionMixedFvPatchField.C:139-153 with a refValue: refGrad is zero, so
+                    // pif + refGrad/deltaCoeffs is pif exactly
+                    const vector v = inflowValueWithRef(i, pif[i]);
+                    r[i] = vector{ (v.x - pif[i].x)*dc, (v.y - pif[i].y)*dc, (v.z - pif[i].z)*dc };
+                    continue;
+                }
+                const scalar nd = nf.x*pif[i].x + nf.y*pif[i].y + nf.z*pif[i].z;
                 r[i] = vector{ -(pif[i].x - nd*nf.x)*dc, -(pif[i].y - nd*nf.y)*dc, -(pif[i].z - nd*nf.z)*dc };
             }
             return r;
@@ -3087,9 +3098,11 @@ public:
 
     // OF pressureInletOutletVelocityFvPatchVectorField::updateCoeffs -- valueFraction = neg(phi)*(I - nn).
     // OUTFLOW (phi >= 0) has valueFraction 0 and extrapolates entirely. INFLOW fixes only the TANGENTIAL
-    // part to refValue, which is zero unless the case gives a tangentialVelocity (refused at
-    // construction), so the value becomes the NORMAL projection of the cell velocity, n*(n & U_cell) --
-    // the pressure sets the inflow speed and the tangential component is dropped.
+    // part to refValue. Without a tangentialVelocity refValue is zero and the value is the NORMAL
+    // projection of the cell velocity, n*(n & U_cell) -- the pressure sets the inflow speed and the
+    // tangential component is dropped. With one (claimed by interFoam, setTangentialVelocity) the value is
+    // directionMixed's evaluate term for term, (vf & refValue) + ((I - vf) & pif); the refValue-free
+    // arithmetic above is left exactly as it was, so no gated case without the entry moves.
     //
     // Written through setStoredValues rather than by overriding evaluate(), so this class behaves
     // EXACTLY as before for any caller that does not invoke the update. The incompressible lineage has
@@ -3109,6 +3122,11 @@ public:
             {
                 const bool inflow = i < (label)phi_.size() && phi_[i] < scalar(0);
                 if (!inflow) { v[i] = Ucell[i]; continue; }        // outflow: zeroGradient
+                if (!tangentialRef_.empty() && !controlDropRefFromValue_)
+                {
+                    v[i] = inflowValueWithRef(i, Ucell[i]);
+                    continue;
+                }
                 const vector& nf = this->patch_.nf[i];
                 const scalar nd = nf.x*Ucell[i].x + nf.y*Ucell[i].y + nf.z*Ucell[i].z;
                 v[i] = vector{ nd*nf.x, nd*nf.y, nd*nf.z };        // inflow: normal component only
@@ -3118,10 +3136,11 @@ public:
     }
 
     // pressureInletOutletVelocityFvPatchVectorField::autoMap (:160-170) maps directionMixed's refValue,
-    // refGrad and valueFraction and then tangentialVelocity -- and brae stores none of those: its
-    // refValue and refGrad are identically zero (a tangentialVelocity is refused at construction) and its
-    // valueFraction is rebuilt from the flux at every updateCoeffs. `phi_` and `pif_` are that per-step
-    // input and the patch's internal field.
+    // refGrad and valueFraction and then tangentialVelocity. Without a tangentialVelocity brae stores none
+    // of those: its refValue and refGrad are identically zero and its valueFraction is rebuilt from the
+    // flux at every updateCoeffs. `phi_` and `pif_` are that per-step input and the patch's internal
+    // field. WITH one the refValue and the tangentialVelocity would have to be mapped too, which is not
+    // ported: autoMapComplete() answers false and the topology change refuses.
     //
     // phi_ IS MAPPED, NOT ZEROED. It used to be resized to zeros on the argument that the next
     // updateFromFlux overwrites it first -- true on the interFoam path, where correctUphiBCs tells every
@@ -3130,7 +3149,7 @@ public:
     // would read as OUTFLOW (full zeroGradient, a zero transform diagonal) until the next tell. The map is
     // the same direct copy the phi field's own patch arrays take, so there is no window in which the two
     // disagree.
-    bool autoMapComplete() const override { return true; }
+    bool autoMapComplete() const override { return tangentialVelocity_.empty(); }
     void autoMap(const FvPatchFieldMapping& pm, const std::vector<T>& internal) override
     {
         ExtrapolatedValuePatchField<T>::autoMap(pm, internal);
@@ -3138,8 +3157,101 @@ public:
         pif_ = this->patchInternalField(internal);
     }
 
+    // pressureInletOutletVelocityFvPatchVectorField::setTangentialVelocity (:130-136), which the
+    // dictionary constructor calls (:86-92) and nothing else does: refValue = tv - n*(n & tv) with the
+    // patch normals AS THEY ARE NOW. It is never recomputed -- not by updateCoeffs, not by a mesh move --
+    // so on a moving mesh OpenFOAM keeps the construction-time projection, and so does this.
+    void setTangentialVelocity(std::vector<T> tv)
+    {
+        if constexpr (!std::is_same<T, vector>::value)
+        {
+            throw std::runtime_error(
+                "brae: patch " + this->patch_.name + ": tangentialVelocity is a vector entry; "
+                "pressureInletOutletVelocity is registered for fvPatchVectorField only (.C:220-224).");
+        }
+        else
+        {
+            const label n = this->patch_.size;
+            if (static_cast<label>(tv.size()) != n)
+            {
+                throw std::runtime_error(
+                    "brae: patch " + this->patch_.name + ": tangentialVelocity has "
+                    + std::to_string(tv.size()) + " values for " + std::to_string((long)n) + " faces.");
+            }
+            tangentialRef_.resize(static_cast<std::size_t>(n));
+            for (label i = 0; i < n; ++i)
+            {
+                const vector& nf = this->patch_.nf[i];
+                const vector& t = tv[static_cast<std::size_t>(i)];
+                // Vector::inner (VectorI.H:153-158), then n*s subtracted component by component
+                const scalar s = nf.x*t.x + nf.y*t.y + nf.z*t.z;
+                tangentialRef_[static_cast<std::size_t>(i)] =
+                    vector{ t.x - nf.x*s, t.y - nf.y*s, t.z - nf.z*s };
+            }
+            tangentialVelocity_ = std::move(tv);
+        }
+    }
+    const std::vector<T>* tangentialVelocityPtr() const override
+    {
+        return tangentialVelocity_.empty() ? nullptr : &tangentialVelocity_;
+    }
+    const std::vector<T>& tangentialRefValue() const { return tangentialRef_; }
+    // A GATE CONTROL, set only by interFoam's claim from BRAE_CONTROL_PIOV_TV: the refValue dropped from
+    // the stored inflow value (`value`) or from snGrad alone (`sngrad`), so the gate can say which half it
+    // witnesses. Never set on a normal run.
+    void setTangentialControl(
+        bool dropFromValue,
+        bool dropFromSnGrad)
+    {
+        controlDropRefFromValue_ = dropFromValue;
+        controlDropRefFromSnGrad_ = dropFromSnGrad;
+    }
+
 private:
     std::vector<scalar> phi_;
+    // the case's tangentialVelocity and OpenFOAM's refValue made from it at construction; both empty
+    // unless a solver claimed the entry
+    std::vector<T>      tangentialVelocity_;
+    std::vector<T>      tangentialRef_;
+    bool                controlDropRefFromValue_ = false;
+    bool                controlDropRefFromSnGrad_ = false;
+    // directionMixedFvPatchField.C:157-175 on an INFLOW face, with vf = neg(phi)*(I - sqr(nf)) as
+    // pressureInletOutletVelocityFvPatchVectorField.C:180 forms it (neg = 1 here):
+    //     (vf & refValue) + ((I - vf) & pif)
+    // sqr(n) = (nx*nx, nx*ny, nx*nz, ny*ny, ny*nz, nz*nz) (SymmTensorI.H:612-620), I - S negates the
+    // off-diagonals (:679-687), and symmTensor & vector is row by row (SymmTensorI.H:779-787).
+    vector inflowValueWithRef(label i, const T& pif) const
+    {
+        if constexpr (!std::is_same<T, vector>::value)
+        {
+            return vector{};
+        }
+        else
+        {
+            const vector& n = this->patch_.nf[i];
+            const vector& rv = tangentialRef_[static_cast<std::size_t>(i)];
+            const scalar one = scalar(1);
+            const scalar vxx = one*(one - n.x*n.x);
+            const scalar vxy = one*(-(n.x*n.y));
+            const scalar vxz = one*(-(n.x*n.z));
+            const scalar vyy = one*(one - n.y*n.y);
+            const scalar vyz = one*(-(n.y*n.z));
+            const scalar vzz = one*(one - n.z*n.z);
+            const scalar ixx = one - vxx;
+            const scalar ixy = -vxy;
+            const scalar ixz = -vxz;
+            const scalar iyy = one - vyy;
+            const scalar iyz = -vyz;
+            const scalar izz = one - vzz;
+            const vector a{ vxx*rv.x + vxy*rv.y + vxz*rv.z,
+                            vxy*rv.x + vyy*rv.y + vyz*rv.z,
+                            vxz*rv.x + vyz*rv.y + vzz*rv.z };
+            const vector b{ ixx*pif.x + ixy*pif.y + ixz*pif.z,
+                            ixy*pif.x + iyy*pif.y + iyz*pif.z,
+                            ixz*pif.x + iyz*pif.y + izz*pif.z };
+            return vector{ a.x + b.x, a.y + b.y, a.z + b.z };
+        }
+    }
     // The patch internal field, cached at evaluate() -- see SymmetryPlanePatchField for why.
     std::vector<T>      pif_;
     const T& pifAt(label i) const
@@ -3654,13 +3766,13 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
     if (d.type == "pressureInletOutletVelocity" && d.hasTangentialVelocity)
     {
         // OF: refValue = tangentialVelocity - n*(n & tangentialVelocity), i.e. the tangential component
-        // is DRIVEN, not free. brae's piov kernel sets the tangential refValue to zero, so running this
-        // would silently solve a different boundary condition (a swirl-free inlet where the case asked
-        // for swirl). The header claimed this was unsupported; nothing enforced it until now.
+        // is DRIVEN, not free. Every solver's piov path but interFoam's host fixes it to zero, so this
+        // refusal stays for all of them; interFoam claims the entry before the factory runs
+        // (inter_case_cpp.cu, claimTangentialVelocity) and hands it to the built patch field.
         throw std::runtime_error(
             "brae: patch " + p.name + " is pressureInletOutletVelocity with a `tangentialVelocity` entry, "
-            "which brae does not apply -- it would silently run with zero tangential velocity. Remove the "
-            "entry (if the tangential component really is zero) or use a BC that fixes the full vector.");
+            "which this solver does not apply -- it would silently run with zero tangential velocity. Only "
+            "interFoam's host loop carries it.");
     }
     // `table` is implemented (Function1::table + the solver's per-step p0 refresh), so it is not in
     // unsupportedFunction1 at all. Anything still recorded there -- polynomial, csvFile, expression --

@@ -13,6 +13,8 @@
 #include "read_surface_field.cuh"
 #include "scheme_parse.cuh"
 #include "patch_set.cuh"
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <utility>
 #include <map>
@@ -716,6 +718,92 @@ InterFields::PressureReference readPressureReference(
 // ONE `solver GAMG;` ENTRY. Everything GAMGSolver::readControls and GAMGAgglomeration read from it,
 // and a refusal for each control whose branch is not ported -- by name, because every one of them
 // changes where the solve stops and none of them changes a converged field.
+// pressureInletOutletVelocity's `tangentialVelocity`, CLAIMED on this reader's own copy of U's file
+// data, as the wave conditions are: the shared factory refuses the entry for every solver, and interFoam
+// takes it off the entry here, lets the factory build the patch, and hands the vectors to the built patch
+// field (setTangentialVelocity), which projects them onto the start-time normals once, as OpenFOAM's
+// dictionary constructor does (pressureInletOutletVelocityFvPatchVectorField.C:86-92, :130-136).
+struct ClaimedTangentialVelocity
+{
+    std::size_t         pi = 0;
+    std::vector<vector> tv;
+};
+
+std::vector<ClaimedTangentialVelocity> claimTangentialVelocity(
+    FieldData<vector>&          UData,
+    const std::vector<FvPatch>& patches,
+    const std::string&          caseDir)
+{
+    std::vector<ClaimedTangentialVelocity> claims;
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const PatchFieldData<vector>* entry = findPatchEntry(UData, patches[pi]);
+        if (!entry || entry->type != "pressureInletOutletVelocity" || !entry->hasTangentialVelocity)
+        {
+            continue;
+        }
+        // dynamicRefineFvMesh maps a patch field through autoMap; this class does not map the refValue
+        // or the tangentialVelocity, so the combination is refused before the first step rather than at
+        // the first refinement
+        if (caseAsksForAdaptiveMesh(caseDir))
+        {
+            throw std::runtime_error(
+                "brae interFoam: patch " + patches[pi].name + " is pressureInletOutletVelocity with a "
+                "`tangentialVelocity`, and the mesh refines: mapping its refValue and tangentialVelocity "
+                "through a topology change (.C:139-167) is not ported.");
+        }
+        ClaimedTangentialVelocity c;
+        c.pi = pi;
+        const std::size_t n = static_cast<std::size_t>(patches[pi].size);
+        // Field::assign reads nothing for a patch with no faces (Field.C:216, `if (len)`), so neither
+        // the entry's form nor its length can stop OpenFOAM there; the refValue it would make is empty
+        if (n == 0)
+        {
+            continue;
+        }
+        if (entry->tvUnparsed)
+        {
+            throw std::runtime_error(
+                "brae interFoam: patch " + patches[pi].name + " writes `tangentialVelocity` before its "
+                "`type`, and brae's reader parses the entry only once it knows the patch is "
+                "pressureInletOutletVelocity. Write `type` first.");
+        }
+        if (entry->tvBare)
+        {
+            throw std::runtime_error(
+                "brae interFoam: patch " + patches[pi].name + " writes `tangentialVelocity` without "
+                "`uniform` or `nonuniform`; OpenFOAM reads it as a vectorField and stops there "
+                "(Field.C:254-259).");
+        }
+        if (entry->tvUniform)
+        {
+            c.tv.assign(n, entry->tvUniformValue);
+        }
+        else
+        {
+            // vectorField(name, dict, p.size()) -- a list of another length is a FatalIOError (Field.C)
+            if (entry->tvValues.size() != n)
+            {
+                throw std::runtime_error(
+                    "brae interFoam: patch " + patches[pi].name + ": tangentialVelocity has "
+                    + std::to_string(entry->tvValues.size()) + " values for " + std::to_string(n)
+                    + " faces.");
+            }
+            c.tv = entry->tvValues;
+        }
+        claims.push_back(std::move(c));
+    }
+    for (PatchFieldData<vector>& b : UData.boundary)
+    {
+        if (b.type == "pressureInletOutletVelocity")
+        {
+            b.hasTangentialVelocity = false;
+        }
+    }
+    return claims;
+}
+
+
 }   // namespace
 
 
@@ -1264,8 +1352,34 @@ InterFields buildInterFields(const std::string&          caseDir,
     refuseFrozenPerStepBC(alphaData, f.alphaName, "interFoam", /*codedMaintained=*/false);
     refuseFrozenPerStepBC(UData, "U", "interFoam", /*codedMaintained=*/false);
     f.waves = readInterWaves(caseDir, startDir, alphaData, UData, patches, f.g, f.alphaName);
+    const std::vector<ClaimedTangentialVelocity> tvClaims = claimTangentialVelocity(UData, patches, caseDir);
     f.alpha1 = buildField<scalar>(alphaData, patches, nC);
     f.U = buildField<vector>(UData, patches, nC);
+    for (const ClaimedTangentialVelocity& c : tvClaims)
+    {
+        auto* piov = dynamic_cast<PressureInletOutletVelocityPatchField<vector>*>(f.U.boundary[c.pi].get());
+        if (!piov)
+        {
+            throw std::runtime_error(
+                "brae interFoam: patch " + patches[c.pi].name + " claimed a tangentialVelocity and was "
+                "not built as pressureInletOutletVelocity.");
+        }
+        piov->setTangentialVelocity(c.tv);
+        // tests/interfoam_dtchullmoving_vs_openfoam.sh's controls: which half of the patch field the gate
+        // witnesses, the stored inflow value or snGrad
+        if (const char* ctl = std::getenv("BRAE_CONTROL_PIOV_TV"))
+        {
+            const std::string mode(ctl);
+            if (mode != "value" && mode != "sngrad")
+            {
+                throw std::runtime_error(
+                    "brae interFoam: BRAE_CONTROL_PIOV_TV is `" + mode + "`; it takes `value` or `sngrad`.");
+            }
+            std::printf("brae interFoam: CONTROL MODE BRAE_CONTROL_PIOV_TV=%s on patch %s\n",
+                        mode.c_str(), patches[c.pi].name.c_str());
+            piov->setTangentialControl(mode == "value", mode == "sngrad");
+        }
+    }
     f.movingWallVelocityPatch.assign(patches.size(), 0);
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
