@@ -172,7 +172,7 @@
 // BEGIN DEVICE REFUSALS
 //   device_gamg_smootherDILU device_gradLsq
 //   device_refine_motion
-//   device_sstLinearUpwind device_sstNutkRough device_gradUCache
+//   device_sstNutkRough device_gradUCache
 // END DEVICE REFUSALS
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"

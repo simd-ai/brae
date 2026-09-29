@@ -725,16 +725,32 @@ void deviceCorrectInterTurbulence(
         // the assembly's limiter and corrected-laplacian gradients (schemeOf), and CDkOmega, which takes
         // grad(k) AND grad(omega) in one expression (kOmegaSSTBase.C:548) and so must resolve each by
         // its own field's name.
-        // `Gauss linearUpwind <grad>` is carried by the HOST closure (inter_turbulence_cpp.cu reads it for
-        // kOmegaSST, gated on RAS/DTCHull); this arm hands only limitedLinear over, so a case naming it
-        // would run k and omega upwind here. Refused by name until the device transport's own
-        // linearUpwind is wired and gated -- RAS/DTCHullMoving, an Euler case, reaches this.
-        if (t.kDiv.linearUpwind || t.secondDiv.linearUpwind)
-            throw std::runtime_error(
-                "brae interFoam (device): fvSchemes names `Gauss linearUpwind <grad>` for kOmegaSST's k and "
-                "omega. The host closure carries it; the device closure is not wired for it yet. Run "
-                "without -device.");
-        sin.omegaDiv  = &t.secondDiv;
+        // `Gauss linearUpwind <grad>` -- RAS/DTCHull's `linearUpwind limitedGrad` over a NAMED
+        // `cellLimited Gauss linear 1` -- through the device transport's own correction
+        // (turbulence_transport.cu: the named gradient's cellLimited Gauss linear, subtracted from the
+        // source on internal faces), k's entry here and omega's through omegaDiv, each with its own
+        // luGradK as the host reader resolved it. GATE CONTROLS, the host closure's two
+        // (inter_turbulence_cpp.cu), never set by a solver: LU_OFF drops the correction (upwind),
+        // LU_UNLIMITED takes the named gradient unlimited. Both WRONG.
+        cpu::EqnDivScheme kDiv = t.kDiv;
+        cpu::EqnDivScheme omegaDivCtl = t.secondDiv;
+        if ((kDiv.linearUpwind || omegaDivCtl.linearUpwind) && std::getenv("BRAE_CONTROL_SST_LU_OFF"))
+        {
+            std::printf("  *** CONTROL MODE: kOmegaSST's linearUpwind correction is off. This run is "
+                        "deliberately wrong. ***\n");
+            kDiv.linearUpwind = false;
+            omegaDivCtl.linearUpwind = false;
+        }
+        if ((kDiv.linearUpwind || omegaDivCtl.linearUpwind) && std::getenv("BRAE_CONTROL_SST_LU_UNLIMITED"))
+        {
+            std::printf("  *** CONTROL MODE: kOmegaSST's linearUpwind gradient is unlimited. This run is "
+                        "deliberately wrong. ***\n");
+            kDiv.luGradK = scalar(0);
+            omegaDivCtl.luGradK = scalar(0);
+        }
+        sin.linearUpwind = kDiv.linearUpwind;
+        sin.luGradK      = kDiv.luGradK;
+        sin.omegaDiv  = &omegaDivCtl;
         sin.omegaGrad = &t.secondGrad;
         sin.limitedLinear   = t.kDiv.limitedLinear;
         sin.limiterCoeff    = t.kDiv.limiterCoeff;

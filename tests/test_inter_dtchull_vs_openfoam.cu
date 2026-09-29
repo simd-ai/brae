@@ -98,11 +98,13 @@ constexpr scalar DEV_BOUND_U = 1e-8;
 constexpr scalar DEV_BOUND_P_RESIDUAL = 2e-6;
 constexpr scalar DEV_BOUND_ALPHA_RESIDUAL = 2e-8;
 constexpr scalar DEV_BOUND_U_OUTLET = 5e-8;
-// ...and on `rasDevice` (the `ras` profile with the closure's convection upwind, the hull's wall function
-// smooth and the cache stripped -- the three things the device loop does not carry yet), kOmegaSST taking
-// the local step on the GPU. ONE step, host bounds: k 6.7e-14, omega 4.0e-13, nut 4.4e-13, as the host arm.
-// TEN: alpha 9.5e-10, p_rgh 6.3e-09, U 4.1e-11, k 3.8e-10, omega 3.5e-10, nut 1.5e-10, the hull's wall nut
-// 4.2e-09, every count OpenFOAM's.
+// ...and on `rasDevice` (the `ras` profile with the hull's wall function smooth and the cache stripped --
+// the two things the device loop does not carry yet), kOmegaSST taking the local step on the GPU under the
+// tutorial's own `linearUpwind limitedGrad`. ONE step, host bounds: k 6.7e-14, omega 4.0e-13, nut 4.4e-13,
+// the host arm's digits (k starts uniform, so step one cannot see linearUpwind -- the controls can). TEN:
+// alpha 9.7e-10, p_rgh 6.3e-09, U 4.1e-11, k 3.6e-10, omega 3.5e-10, nut 1.5e-10, the hull's wall nut
+// 4.2e-09, every count OpenFOAM's -- the same as with the convection staged upwind, which is the device
+// loop's CMULES spread and not the closure's.
 constexpr scalar DEV_BOUND_K = 1e-9;
 constexpr scalar DEV_BOUND_OMEGA = 1e-9;
 constexpr scalar DEV_BOUND_NUT = 5e-10;

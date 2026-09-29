@@ -23,9 +23,9 @@
 #                            fvSolution's `cache { grad(U); }`: with no closure to form grad(U), the UEqn's
 #                            first request would form and store it, and brae refuses that (the order of
 #                            UEqn.H's operands is not modelled)
-#   rasDevice                (`rasDevice` only) `ras` with the three things the DEVICE loop does not carry
-#                            yet staged to what it does: div(phi,k|omega) `Gauss upwind`, the hull's nut
-#                            `nutkWallFunction`, the cache stripped. Each goes as its device unit lands.
+#   rasDevice                (`rasDevice` only) `ras` with the two things the DEVICE loop does not carry
+#                            yet staged to what it does: the hull's nut `nutkWallFunction`, the cache
+#                            stripped. Each goes as its device unit lands.
 #
 # MEASURED, ten steps, OpenFOAM's one-ulp floor beside each (the same run with ONE interface cell's alpha
 # moved by one ulp, OpenFOAM against OpenFOAM):
@@ -103,8 +103,7 @@
 # a restart (setRDeltaT damps from the third step of EVERY run, and a restart's rhoPhi is rebuilt as
 # interpolate(rho)*phi -- not a continuation of the continuous run), kEpsilon and LES under localEuler
 # (refused), and anything after ten steps. On the DEVICE loop:
-# the closure's linearUpwind, nutkRoughWallFunction and the cached grad(U) on a static mesh (all refused,
-# hence `rasDevice`), a device-side setRDeltaT (the host forms it -- its smoothing is a
+# nutkRoughWallFunction and the cached grad(U) on a static mesh (both refused, hence `rasDevice`), a device-side setRDeltaT (the host forms it -- its smoothing is a
 # FaceCellWave -- and the loop uploads it and interpolate(rDeltaT) each step).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -197,14 +196,8 @@ if profile == 'laminar':
     assert k == 1, 'simulationType'
     open(tp, 'w').write(t)
 if profile == 'rasDevice':
-    # the three things the device loop does not carry yet, each staged to what it does: the closure's
-    # convection upwind, the hull's wall function smooth, fvSolution's cache stripped
-    fs = os.path.join(d, 'system/fvSchemes')
-    t = open(fs).read()
-    t, k1 = re.subn(r'div\(phi,k\)\s+Gauss\s+linearUpwind\s+limitedGrad;', 'div(phi,k)      Gauss upwind;', t)
-    t, k2 = re.subn(r'div\(phi,omega\)\s+Gauss\s+linearUpwind\s+limitedGrad;', 'div(phi,omega)  Gauss upwind;', t)
-    assert k1 == 1 and k2 == 1, 'the closure convection'
-    open(fs, 'w').write(t)
+    # the two things the device loop does not carry yet, each staged to what it does: the hull's wall
+    # function smooth, fvSolution's cache stripped
     fv = os.path.join(d, 'system/fvSolution')
     t = open(fv).read()
     t, k = re.subn(r'\ncache\s*\{[^}]*\}\s*', '\n', t)
@@ -288,7 +281,10 @@ echo "== [rasDevice device]"
 awk '/^Flow time scale min\/max/ { if (++k > 1) exit } { print }' "$W/rasDevice/log.interFoam" > "$W/log.one"
 echo "== [rasDevice device, one step]"
 "$BIN" "$W/rasDevice" "$W/rasDevice" 1 "$W/log.one" $MODE device || rc=1
-control rasDevice BRAE_CONTROL_LTS_SCALAR=turbulence device || rc=1
+for ctl in BRAE_CONTROL_LTS_SCALAR=turbulence BRAE_CONTROL_SST_LU_OFF=1 BRAE_CONTROL_SST_LU_UNLIMITED=1
+do
+    control rasDevice "$ctl" device || rc=1
+done
 
 # ...and the device loop's own consumers, each switched off in turn: the same controls, the GPU loop
 for ctl in BRAE_CONTROL_LTS_NOSMOOTH=1 BRAE_CONTROL_LTS_NODAMP=1 BRAE_CONTROL_LTS_SCALAR=alpha \

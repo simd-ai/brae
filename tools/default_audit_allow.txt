@@ -68,8 +68,6 @@ KOmegaSSTInput sin alphatWallMask
 KOmegaSSTInput sin Prt
 KOmegaSSTInput sin boundedK
 KOmegaSSTInput sin boundedOmega
-KOmegaSSTInput sin linearUpwind
-KOmegaSSTInput sin luGradK
 KOmegaSSTInput sin hasNonUpwindDivScheme
 KOmegaSSTInput sin divSchemeUnsupported
 KOmegaSSTInput sin fvoKMask

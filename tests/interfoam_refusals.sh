@@ -969,10 +969,10 @@ if [ $HAVE_GPU = 1 ]; then
     BASE="$BR"
     arm device_localEulerSST runs   -                           "-device" "$SSTBASE; $LTSSET; $LTSZERO"
     BASE="$B"
-    # kOmegaSST's linearUpwind runs on the HOST closure (sst_linearUpwind above); the device closure is
-    # not wired for it and refuses by name -- RAS/DTCHullMoving, an Euler case, would reach it
+    # kOmegaSST's linearUpwind RUNS on the device closure too (the transport's own correction over the
+    # named cellLimited gradient; tests/interfoam_dtchull_vs_openfoam.sh `rasDevice device`)
     BASE="$BR"
-    arm device_sstLinearUpwind refused "the device closure is not wired" "-device" "$SSTBASE; ${LUGRAD/LIMGRAD/cellLimited Gauss linear 1}; $LUBOTH"
+    arm device_sstLinearUpwind runs  -                          "-device" "$SSTBASE; ${LUGRAD/LIMGRAD/cellLimited Gauss linear 1}; $LUBOTH"
     # nutkRoughWallFunction carries history the device wall kernels do not keep: refused by name
     arm device_sstNutkRough refused "has no rough wall function" "-device" "$SSTBASE; ${ROUGHNUT/RSPEC/Ks uniform 1e-4; Cs uniform 0.5;}"
     # outletPhaseMeanVelocity RUNS on the device loop (the U hook updates it at the host loop's instants;
