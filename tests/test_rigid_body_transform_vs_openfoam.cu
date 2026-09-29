@@ -15,6 +15,7 @@
 #include "primitive_mesh.cuh"
 #include "primitive_patch_cpp.cuh"
 #include "rigid_body_motion_cpp.cuh"
+#include "point_constraints_cpp.cuh"
 #include "septernion_cpp.cuh"
 #include <cmath>
 #include <cstdio>
@@ -132,7 +133,7 @@ int main(int argc, char** argv)
 
     // ...and the constraint rigidBodyMeshMotion::solve ends in, which pins every point a fixedValue
     // point patch owns -- the tank's own walls lie inside the body's outerDistance here
-    RBD::constrainPointDisplacement(caseDir + "/0/pointDisplacement", m, patches, disp);
+    PointConstraints::build(caseDir + "/0/pointDisplacement", m, patches, g.Sf()).constrainDisplacement(disp);
 
     const FieldData<vector> fd = readField<vector>(ofDir + "/pointDisplacement");
     const std::vector<vector> ofDisp = fd.internalUniform

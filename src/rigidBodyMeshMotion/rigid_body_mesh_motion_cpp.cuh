@@ -25,6 +25,7 @@
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
+#include "point_constraints_cpp.cuh"
 #include "primitive_mesh.cuh"
 #include "rigid_body_motion_cpp.cuh"
 #include <memory>
@@ -116,6 +117,9 @@ private:
     std::vector<label>   bodyPatches_;
     // the field file the point-patch TYPES are read from, for the constraint that ends every solve
     std::string          pointDisplacementPath_;
+    // pointConstraints::New(pointMesh): built ONCE at attach, from the construction-time face areas (the
+    // symmetryPlane normals are frozen there, symmetryPlanePolyPatch.C:48)
+    PointConstraints     pointConstraints_;
     vector               g_{0, 0, 0};
     RBD::SpatialVector   lastForce_;
     label                curTimeIndex_ = -1;

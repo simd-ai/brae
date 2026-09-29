@@ -360,54 +360,6 @@ std::vector<vector> Model::transformPoints(
 }
 
 
-void constrainPointDisplacement(
-    const std::string&          fieldPath,
-    const PrimitiveMesh&        m,
-    const std::vector<FvPatch>& patches,
-    std::vector<vector>&        displacement)
-{
-    const FieldData<vector> fd = readField<vector>(fieldPath);
-    for (const FvPatch& q : patches)
-    {
-        const PatchFieldData<vector>* entry = nullptr;
-        for (const PatchFieldData<vector>& b : fd.boundary)
-        {
-            if (b.name == q.name) entry = &b;
-        }
-        if (!entry)
-        {
-            throw std::runtime_error(
-                "brae RBD::constrainPointDisplacement: " + fieldPath + " has no entry for the patch `"
-                + q.name + "`.");
-        }
-        if (entry->type == "calculated")
-        {
-            // pointPatchField::evaluate is a no-op for it: the transform's value stands
-            continue;
-        }
-        if (entry->type != "fixedValue")
-        {
-            throw std::runtime_error(
-                "brae RBD::constrainPointDisplacement: the point patch `" + q.name + "` is `"
-                + entry->type + "`. Only fixedValue (which pins the points it owns) and calculated "
-                "(which does not evaluate) are ported; every other pointPatchField writes something "
-                "of its own into the shared point field and would move the mesh differently.");
-        }
-        if (!entry->valueUniform)
-        {
-            throw std::runtime_error(
-                "brae RBD::constrainPointDisplacement: the point patch `" + q.name + "` is a fixedValue "
-                "with a per-point value; only a uniform one is ported.");
-        }
-        const PrimitivePatchAddressing addr = primitivePatch(m, faceRange(q.start, q.size));
-        for (const label mp : addr.meshPoints)
-        {
-            displacement[static_cast<std::size_t>(mp)] = entry->uniformValue;
-        }
-    }
-}
-
-
 void newmarkSolve(
     const ModelState&    s0,
     const NewmarkCoeffs& c,

@@ -142,8 +142,8 @@ void RigidBodyMeshMotion::attach(
     const PointPatchDist pd = pointPatchDist(m, e, patches, bodyPatches_);
     weight_ = rigidBodyMeshMotionScale(pd.distance, spec_.innerDistance, spec_.outerDistance);
     pointDisplacement_.assign(points0_.size(), vector{0, 0, 0});
+    pointConstraints_ = PointConstraints::build(pointDisplacementPath_, m, patches, g.Sf());
     attached_ = true;
-    (void)g;
 }
 
 
@@ -236,7 +236,7 @@ std::vector<vector> RigidBodyMeshMotion::newPoints(
     {
         pointDisplacement_[i] = moved[i] - points0_[i];
     }
-    RBD::constrainPointDisplacement(pointDisplacementPath_, m, patches, pointDisplacement_);
+    pointConstraints_.constrainDisplacement(pointDisplacement_);
 
     // rigidBodyMeshMotion.C:219: curPoints() = points0 + pointDisplacement
     std::vector<vector> curPoints(points0_.size());

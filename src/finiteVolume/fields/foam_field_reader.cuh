@@ -131,6 +131,10 @@ struct PatchFieldData
     // patch that is not pressureInletOutletVelocity -- see the reader branch and the claim
     bool           tvBare = false;
     bool           tvUnparsed = false;
+    // `patchType`: OpenFOAM keeps an entry's own type on a constraint patch whose type it names instead of
+    // replacing it by the constraint (pointPatchFieldNew.C:143-161, fvPatchFieldNew.C). Recorded so the
+    // readers that honour the constraint can refuse it.
+    std::string    patchType;
     // fixedGradient (and the heat-flux BCs derived from it): the prescribed normal gradient.
     // Plain `mixed` (Robin) carries refValue + refGradient + valueFraction. refGradient shares the
     // gradient* slots below; these two are its own. Distinct from inletValue*, which inletOutlet and the
@@ -1557,6 +1561,11 @@ inline FieldData<T> readField(const std::string& path)
                             p.roughCsUniformValue = uval;
                             p.roughCsValues = std::move(vals);
                         }
+                    }
+                    else if (key == "patchType")
+                    {
+                        p.patchType = ts.next();
+                        ts.expect(";");
                     }
                     else if (key == "tangentialVelocity")   // pressureInletOutletVelocity, optional
                     {

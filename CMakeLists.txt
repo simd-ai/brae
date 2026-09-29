@@ -121,6 +121,7 @@ add_library(brae_core STATIC
     src/rigidBodyMeshMotion/rigid_body_mesh_motion_cpp.cu
     src/meshTools/twoDPointCorrector/two_d_point_corrector_cpp.cu
     src/finiteVolume/interpolation/volPointInterpolation/vol_point_interpolation_cpp.cu
+    src/finiteVolume/interpolation/volPointInterpolation/point_constraints_cpp.cu
     src/waveModels/derivedPointPatchFields/waveMaker/wave_maker_point_patch_vector_field_cpp.cu
     src/fvMotionSolver/fvMotionSolvers/displacement/laplacian/displacement_laplacian_fv_motion_solver_cpp.cu
     src/dynamicFvMesh/dynamicMotionSolverFvMesh/dynamic_motion_solver_fv_mesh_cpp.cu
@@ -3952,6 +3953,19 @@ target_link_libraries(test_refine_controls PRIVATE brae_core)
 add_test(NAME refine_controls_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/refine_controls_vs_openfoam.sh)
 set_tests_properties(refine_controls_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# pointConstraints::constrainDisplacement -- the symmetryPlane point patches and the corner constraints the
+# rigid-body mesh motion ends every solve with -- against OpenFOAM's own class on the same staged input
+# (tools/dumpPointConstraints): RAS/DTCHullMoving's mesh, its fixedValue patches pinned off zero, and a
+# parallelepiped whose three tilted symmetry planes meet at a corner.
+add_executable(test_point_constraints_vs_openfoam tests/test_point_constraints_vs_openfoam.cu)
+target_include_directories(test_point_constraints_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_point_constraints_vs_openfoam PRIVATE brae_core)
+add_test(NAME point_constraints_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/point_constraints_vs_openfoam.sh)
+set_tests_properties(point_constraints_vs_openfoam PROPERTIES
+                     SKIP_RETURN_CODE 77
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 
 # brae's pointPatchDist and the rigidBodyMeshMotion scale against real OpenFOAM, on the mesh
 # RAS/floatingObject builds. The script carries the measurements and the controls.

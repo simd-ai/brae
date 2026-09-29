@@ -268,21 +268,9 @@ struct MotionSpec
     bool report = false;
 };
 
-// pointConstraints::constrainDisplacement, which rigidBodyMeshMotion::solve runs on the displacement
-// it has just written: pf.correctBoundaryConditions() evaluates every POINT patch field, and a
-// valuePointPatchField's evaluate WRITES its value into the shared point field
-// (valuePointPatchField.C: setInInternalField). So a `fixedValue` point patch pins every point it
-// owns, including points the body's transform moved -- on RAS/floatingObject the tank's own walls sit
-// inside the body's outerDistance and OpenFOAM holds 291 of them at zero where the blend would have
-// moved them. Patches are evaluated in patch order, so a point on two of them takes the LAST one's.
-//
-// Reads the field file for the patch types. Refuses any point-patch type that is neither `fixedValue`
-// (which pins) nor `calculated` (which does not evaluate at all).
-void constrainPointDisplacement(
-    const std::string&          fieldPath,
-    const PrimitiveMesh&        m,
-    const std::vector<FvPatch>& patches,
-    std::vector<vector>&        displacement);
+// pointConstraints::constrainDisplacement, which rigidBodyMeshMotion::solve runs on the displacement it
+// has just written, is PointConstraints (src/finiteVolume/interpolation/volPointInterpolation/
+// point_constraints_cpp.cuh), built once by the mesh motion.
 
 // <time>/uniform/rigidBodyMotionState: `q 2 ( a b );` and the same for qDot and qDdot, then the two
 // scalars. rigidBodyModelState.C:46-71 reads every entry with readIfPresent, so a missing one is the
