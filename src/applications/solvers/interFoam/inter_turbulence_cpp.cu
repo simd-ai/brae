@@ -685,7 +685,8 @@ InterTurbulence readInterTurbulence(
         {
             if (patches[pi].type == "wall")
             {
-                // the kind the DEVICE closure reads; a rough wall is marked so that closure can refuse it
+                // the kind the DEVICE closure reads: its wall-nut dispatch runs a rough wall through
+                // nutkRoughWallValue (kOmegaSST.cu), as the host's correctNutField does
                 t.nutWallKind[pi] = t.nut.boundary[pi]->nutkRoughKs() ? static_cast<int>(NutWall::NutkRough)
                                                                        : static_cast<int>(NutWall::Nutk);
             }

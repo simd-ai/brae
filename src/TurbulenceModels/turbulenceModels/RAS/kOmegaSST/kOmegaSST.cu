@@ -327,6 +327,13 @@ void wallNutDispatchKernel(
     const scalar* __restrict__ wfYplLam,
     const scalar* __restrict__ Ucx, const scalar* __restrict__ Ucy, const scalar* __restrict__ Ucz,
     const scalar* __restrict__ Ubx, const scalar* __restrict__ Uby, const scalar* __restrict__ Ubz,
+    // nutkRoughWallFunction: the wall nut as correctNut was ENTERED (its limiter's history), the per-face Ks
+    // and Cs, and sqrt(sqrt(Cmu)); null when no face is rough. `noHistory` is the gate's control.
+    const scalar* __restrict__ nutPrev,
+    const scalar* __restrict__ roughKs,
+    const scalar* __restrict__ roughCs,
+    const scalar* __restrict__ roughCmu25,
+    int                        noHistory,
     scalar*       __restrict__ nutBnd)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -337,6 +344,13 @@ void wallNutDispatchKernel(
     const scalar yplLam = wfYplLam ? wfYplLam[i] : scalar(11.53);
     const int kind = wfKind ? static_cast<int>(wfKind[i]) : static_cast<int>(NutWall::Nutk);
     if (kind == static_cast<int>(NutWall::LowRe)) { nutBnd[i] = scalar(0); return; }
+    if (kind == static_cast<int>(NutWall::NutkRough))
+    {
+        // kOmegaSST_cpp.cu correctNutField's rough branch; the caller has refused a null history or Ks
+        nutBnd[i] = nutkRoughWallValue(roughCmu25[i], kCell[bndCell[i]], y[i], nuFace[i],
+                                       noHistory ? scalar(0) : nutPrev[i], roughKs[i], roughCs[i], kappa, E);
+        return;
+    }
     if (kind == static_cast<int>(NutWall::NutU) && Ucx && Ubx)
     {
         const int c = bndCell[i];
@@ -987,6 +1001,16 @@ void correct(
             // dispatch the kEpsilon closure makes, from the same per-face codes.
             if (in.wfBndMask && in.wallYBndFace)
             {
+                // a rough face limits against the wall nut as this call was entered, which nutBnd no longer
+                // holds -- deviceSSTNutBoundary has just written every calculated face -- so it reads the
+                // caller's entry snapshot, nutBndFace
+                const bool rough = in.nutWfKsBnd != nullptr;
+                if (rough && (!in.nutWfCsBnd || !in.nutWfRoughCmu25Bnd || !in.nutBndFace
+                           || static_cast<int>(in.nutBndFace->size()) != nB
+                           || static_cast<int>(in.nutWfKsBnd->size()) != nB))
+                    throw std::runtime_error(
+                        "kOmegaSST(cuda): a nutkRoughWallFunction face needs Ks, Cs, its Cmu25 and the wall nut as "
+                        "correctNut was entered (nutBndFace), one per boundary face; the caller supplied fewer.");
                 DeviceBuffer<scalar> uBx, uBy, uBz;
                 deviceBCValue(dbU.comp[0], *in.Ux, uBx);
                 deviceBCValue(dbU.comp[1], *in.Uy, uBy);
@@ -1000,7 +1024,13 @@ void correct(
                     in.nutWfEBnd      ? in.nutWfEBnd->data()      : nullptr,
                     in.nutWfYplLamBnd ? in.nutWfYplLamBnd->data() : nullptr,
                     in.Ux->data(), in.Uy->data(), in.Uz->data(),
-                    uBx.data(), uBy.data(), uBz.data(), nutBnd.data());
+                    uBx.data(), uBy.data(), uBz.data(),
+                    rough ? in.nutBndFace->data() : nullptr,
+                    rough ? in.nutWfKsBnd->data() : nullptr,
+                    rough ? in.nutWfCsBnd->data() : nullptr,
+                    rough ? in.nutWfRoughCmu25Bnd->data() : nullptr,
+                    in.nutkRoughNoHistory ? 1 : 0,
+                    nutBnd.data());
                 cudaCheck(cudaGetLastError(), "kOmegaSST wall nut");
             }
         }

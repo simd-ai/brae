@@ -193,6 +193,11 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
     std::vector<scalar> eKappa;
     std::vector<scalar> eE;
     std::vector<scalar> eYpl;
+    // nutkRoughWallFunction's per-face inputs, boundary-face order, zero off a rough patch
+    std::vector<scalar> roughKs, roughCs, roughCmu25;
+    bool anyRough = false;
+    const bool nutkSmoothControl = std::getenv("BRAE_CONTROL_NUTK_SMOOTH") != nullptr
+                                || std::getenv("BRAE_CONTROL_NUTK_SMOOTH_DEVICE") != nullptr;
     label bndIdx = 0;
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
@@ -221,15 +226,32 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
             // ...and nut's wall-function kind, which the host reader fills on the RAS path ONLY: a
             // kEqn case has no such patch (it refuses a `nut*` type under that model), so the list is
             // empty there and indexing it walked off the end.
-            const int nwk = (pi < t.nutWallKind.size()) ? t.nutWallKind[pi] : -1;
-            // nutkRoughWallFunction carries HISTORY (a limiter against the previous wall nut) that the
-            // device wall kernels do not keep -- they recompute nutw from k (wallProductionG0, the
-            // wall-nut dispatch) -- so a rough wall is refused by name here rather than run as smooth
-            if (nwk == static_cast<int>(NutWall::NutkRough))
+            int nwk = (pi < t.nutWallKind.size()) ? t.nutWallKind[pi] : -1;
+            // nutkRoughWallFunction: kOmegaSST's device wall-nut dispatch carries it (nutkRoughWallValue), its
+            // limiter's history being the wall nut as correctNut is entered (nutBndIn). Only kOmegaSST: the
+            // kEpsilon reader refuses a rough wall before this is built, and so does this, by name.
+            const bool rough = (nwk == static_cast<int>(NutWall::NutkRough));
+            if (rough && t.model != cpu::interFoam::InterRasModel::KOmegaSST)
                 throw std::runtime_error(
-                    "brae interFoam (device): nut patch `" + patches[pi].name + "` is nutkRoughWallFunction. The "
-                    "host closure carries it; the device closure has no rough wall function. Run without "
-                    "-device.");
+                    "brae interFoam (device): nut patch `" + patches[pi].name + "` is nutkRoughWallFunction under a "
+                    "closure other than kOmegaSST, which carries it on neither loop.");
+            // A GATE'S CONTROL, reachable only on a rough patch: run it as nutkWallFunction -- the host
+            // closure's BRAE_CONTROL_NUTK_SMOOTH (kOmegaSST_cpp.cu correctNutField), which the host validate()
+            // this loop is built from reads as well -- and BRAE_CONTROL_NUTK_SMOOTH_DEVICE, the same swap on
+            // THIS closure alone, so a gate can see that it is this kernel, not the validated start, that
+            // honours the kind. WRONG.
+            if (rough && nutkSmoothControl)
+            {
+                nwk = static_cast<int>(NutWall::Nutk);
+            }
+            anyRough = anyRough || (nwk == static_cast<int>(NutWall::NutkRough));
+            const std::vector<scalar>* rKs = (nwk == static_cast<int>(NutWall::NutkRough))
+                                           ? t.nut.boundary[pi]->nutkRoughKs() : nullptr;
+            const std::vector<scalar>* rCs = rKs ? t.nut.boundary[pi]->nutkRoughCs() : nullptr;
+            roughKs.push_back(rKs ? (*rKs)[static_cast<std::size_t>(i)] : scalar(0));
+            roughCs.push_back(rCs ? (*rCs)[static_cast<std::size_t>(i)] : scalar(0));
+            // pow025 (Scalar.H:368-371), as the host's nutkRoughWallFunction forms it
+            roughCmu25.push_back(std::sqrt(std::sqrt(nc.Cmu)));
             kind.push_back(nwk >= 0 ? nwk : static_cast<int>(NutWall::Nutk));
             if (!isWF) continue;
             // A PATCH beta1 IS NOT PORTED HERE. omegaWallFunction reads its own `beta1` from the patch
@@ -266,6 +288,21 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
     d.nutWfKappaBnd.copyFrom(nKappa);
     d.nutWfEBnd.copyFrom(nE);
     d.nutWfYplLamBnd.copyFrom(nYpl);
+    d.hasRoughWall = anyRough;
+    if (anyRough)
+    {
+        d.nutWfKsBnd.copyFrom(roughKs);
+        d.nutWfCsBnd.copyFrom(roughCs);
+        d.nutWfRoughCmu25Bnd.copyFrom(roughCmu25);
+    }
+    // the gate's controls on the rough wall, read once here and announced once
+    d.nutkRoughNoHistory = anyRough && std::getenv("BRAE_CONTROL_NUTKROUGH_NOHISTORY") != nullptr;
+    if (nutkSmoothControl)
+        std::printf("  *** CONTROL MODE: nutkRoughWallFunction runs as nutkWallFunction. This run is deliberately "
+                    "wrong. ***\n");
+    if (d.nutkRoughNoHistory)
+        std::printf("  *** CONTROL MODE: nutkRoughWallFunction limits against nu_w, not its previous value. This "
+                    "run is deliberately wrong. ***\n");
     d.wall.wfCmu25.copyFrom(eCmu25);
     d.wall.wfCmu75.copyFrom(eCmu75);
     d.wall.wfKappa.copyFrom(eKappa);
@@ -693,6 +730,11 @@ void deviceCorrectInterTurbulence(
         sin.f1OneMask = &d.f1OneMask;
         sin.nutCalcMask = &d.nutCalcMask;
         sin.nutWfKindBnd = &d.nutWfKindBnd;
+        // nutkRoughWallFunction's inputs; its history is nutBndFace, the entry snapshot set above
+        sin.nutWfKsBnd         = d.hasRoughWall ? &d.nutWfKsBnd : nullptr;
+        sin.nutWfCsBnd         = d.hasRoughWall ? &d.nutWfCsBnd : nullptr;
+        sin.nutWfRoughCmu25Bnd = d.hasRoughWall ? &d.nutWfRoughCmu25Bnd : nullptr;
+        sin.nutkRoughNoHistory = d.nutkRoughNoHistory;
         sin.nutWfCmu25Bnd = &d.nutWfCmu25Bnd;
         sin.nutWfKappaBnd = &d.nutWfKappaBnd;
         sin.nutWfEBnd = &d.nutWfEBnd;

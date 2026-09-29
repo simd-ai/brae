@@ -121,6 +121,13 @@ struct KOmegaSSTInput
     const DeviceBuffer<scalar>* nutWfEBnd      = nullptr;
     const DeviceBuffer<scalar>* nutWfYplLamBnd = nullptr;
     const DeviceBuffer<label>*  nutWfKindBnd   = nullptr;
+    // nutkRoughWallFunction's per-face Ks, Cs and sqrt(sqrt(Cmu)), in boundary-face order; null when no face is
+    // rough. Its limiter's history is nutBndFace (the wall nut as correctNut is entered), required with them.
+    // `nutkRoughNoHistory` is the gate's control (BRAE_CONTROL_NUTKROUGH_NOHISTORY): the limiter against nu_w.
+    const DeviceBuffer<scalar>* nutWfKsBnd         = nullptr;
+    const DeviceBuffer<scalar>* nutWfCsBnd         = nullptr;
+    const DeviceBuffer<scalar>* nutWfRoughCmu25Bnd = nullptr;
+    bool                        nutkRoughNoHistory = false;
     // Which boundary faces nut's own patch FILLS (a `calculated` nut), so correctNut writes those and
     // leaves a pinned fixedValue alone.
     const DeviceBuffer<label>*  nutCalcMask    = nullptr;

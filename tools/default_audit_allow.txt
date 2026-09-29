@@ -63,6 +63,10 @@ KEpsilonInput kin colouring
 KEpsilonInput kin gsColour
 KEpsilonInput kin polyDeg
 KOmegaSSTInput sstIn rDeltaTCells   # rhoTurbulenceHook.cu: rhoSimpleFoam is steady -- no ddtSchemes localEuler, so there is no per-cell step to take
+KOmegaSSTInput sstIn nutWfKsBnd     # rhoTurbulenceHook.cu: rhoSimpleFoam's reader refuses nutkRoughWallFunction by name (turbulence_setup.cuh:89, the shared refusal wall_blending_refusals.sh arm 11 asserts), so no face is rough
+KOmegaSSTInput sstIn nutWfCsBnd     # same site, same refusal
+KOmegaSSTInput sstIn nutWfRoughCmu25Bnd  # same site, same refusal
+KOmegaSSTInput sstIn nutkRoughNoHistory  # same site: a gate control, meaningful only on a rough face
 KOmegaSSTInput sin alphatPrtFace
 KOmegaSSTInput sin alphatWallMask
 KOmegaSSTInput sin Prt

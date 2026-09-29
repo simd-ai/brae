@@ -66,6 +66,13 @@ struct DeviceInterTurbulence
     DeviceBuffer<scalar> nutWfKappaBnd;
     DeviceBuffer<scalar> nutWfEBnd;
     DeviceBuffer<scalar> nutWfYplLamBnd;
+    // nutkRoughWallFunction's per-face Ks, Cs and sqrt(sqrt(Cmu)) (zero off a rough patch), uploaded only when
+    // a face is rough, and the gate's no-history control
+    bool hasRoughWall = false;
+    DeviceBuffer<scalar> nutWfKsBnd;
+    DeviceBuffer<scalar> nutWfCsBnd;
+    DeviceBuffer<scalar> nutWfRoughCmu25Bnd;
+    bool nutkRoughNoHistory = false;
     // wall-face order -> boundary-face index, the order buildDeviceWallData decided
     DeviceBuffer<label> wallFaceOfBnd;
     int nWallFaces = 0;

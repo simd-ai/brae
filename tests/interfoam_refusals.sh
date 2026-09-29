@@ -584,7 +584,8 @@ arm sst_linearUpwindK2      refused "outside [0, 1]"          "" "$SSTBASE; ${LU
 # MUST_READ in OpenFOAM, and `value` is live here -- the previous nut its first calcNut limits against --
 # so each is refused missing; a bare-number Ks is OpenFOAM's own stop (Field.C:213-268). `blending` is read,
 # validated and never used by the class, so any of OpenFOAM's words runs and an unknown one is refused.
-# kEpsilon's closure refuses the type (ras_nutkRough) and so does the device (device_sstNutkRough).
+# kEpsilon's closure refuses the type (ras_nutkRough); the device kOmegaSST closure RUNS it (device_sstNutkRough,
+# gated by tests/interfoam_dtchull_vs_openfoam.sh `rasDevice device`).
 ROUGHNUT="sed -i '0,/type  *nutkWallFunction;/ s//type nutkRoughWallFunction; RSPEC/' 0/nut"
 arm sst_nutkRough           runs    -                        "" "$SSTBASE; ${ROUGHNUT/RSPEC/Ks uniform 1e-4; Cs uniform 0.5;}"
 arm sst_nutkRoughBlendMax   runs    -                        "" "$SSTBASE; ${ROUGHNUT/RSPEC/Ks uniform 1e-4; Cs uniform 0.5; blending max;}"
@@ -973,8 +974,8 @@ if [ $HAVE_GPU = 1 ]; then
     # named cellLimited gradient; tests/interfoam_dtchull_vs_openfoam.sh `rasDevice device`)
     BASE="$BR"
     arm device_sstLinearUpwind runs  -                          "-device" "$SSTBASE; ${LUGRAD/LIMGRAD/cellLimited Gauss linear 1}; $LUBOTH"
-    # nutkRoughWallFunction carries history the device wall kernels do not keep: refused by name
-    arm device_sstNutkRough refused "has no rough wall function" "-device" "$SSTBASE; ${ROUGHNUT/RSPEC/Ks uniform 1e-4; Cs uniform 0.5;}"
+    # nutkRoughWallFunction RUNS on the device kOmegaSST closure, its history the wall nut as correctNut is entered
+    arm device_sstNutkRough runs    -                           "-device" "$SSTBASE; ${ROUGHNUT/RSPEC/Ks uniform 1e-4; Cs uniform 0.5;}"
     # outletPhaseMeanVelocity RUNS on the device loop (the U hook updates it at the host loop's instants;
     # tests/interfoam_dtchull_vs_openfoam.sh `laminar device`), here on damBreak's WET left wall -- the
     # atmosphere the refusal arms above use is dry, which the class itself refuses (opmv_dry)

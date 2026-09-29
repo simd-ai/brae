@@ -15,20 +15,71 @@ namespace brae {
 // than in solver_controls.cuh so the turbulence closures can dispatch without pulling in a solver
 // header -- and so the host closure, the device kernel and the legacy drivers cannot drift apart about
 // what a case asked for. The integer values match wallProductionG0's existing `nutWall` codes.
-// NutkRough is appended so the existing codes keep their values. Only the HOST kOmegaSST closure carries it
-// (kOmegaSST_cpp.cu correctNutField); every device consumer of a kind refuses it by name.
+// NutkRough is appended so the existing codes keep their values. The kOmegaSST closures carry it on both
+// loops -- the host's correctNutField (kOmegaSST_cpp.cu) and the device's wallNutDispatchKernel (kOmegaSST.cu,
+// through nutkRoughWallValue below); kEpsilon's reader refuses it before any closure is built.
 enum class NutWall { Nutk = 0, Spalding = 1, Blended = 2, NutU = 3, LowRe = 4, NutkRough = 5 };
 
 // Single source of truth for the OF nutkWallFunction value (the log-law wall viscosity, 0 in the viscous sublayer).
 // Shared by the host nutkWallFunction below AND the device wall kernels (kEpsilon wallFnKernel/boundaryNutKernel,
 // kOmegaSST wallOmegaG0Kernel) so the wall-nut physics has ONE definition, not four copies. BRAE_HD (__host__
-// __device__) so it compiles identically on both; log/fmax resolve to the device intrinsics on the GPU and libm on
-// the host (same result for double). yPlus = Cmu^0.25 * y * sqrt(k_nearWall) / nu (see yPlusWall).
+// __device__) so it compiles identically on both; log/fmax resolve to CUDA's libdevice on the GPU and glibc on the
+// host, and those are NOT the same function to the last bit: MEASURED on 2,000,000 arguments from
+// nutkRoughWallFunction's own range, the device differs from glibc in log on 972, sin on 114,965 and pow on
+// 491,803 (sm_121, CUDA 13.0). A device wall nut therefore carries a last-bit difference from the host's on some
+// faces, whatever its operand order. yPlus = Cmu^0.25 * y * sqrt(k_nearWall) / nu (see yPlusWall).
 BRAE_HD inline scalar nutkWallFunctionValue(scalar yPlus, scalar nu, scalar yplLam, scalar kappa, scalar E)
 {
     return (yPlus > yplLam) ? (nu * yPlus * kappa / log(fmax(E * yPlus, scalar(1.0 + 1e-4))) - nu) : scalar(0.0);
 }
 BRAE_HD inline scalar yPlusWall(scalar Cmu25, scalar y, scalar kNearWall, scalar nu) { return Cmu25 * y * sqrt(kNearWall) / nu; }
+
+// nutkRoughWallFunction's calcNut for ONE face (nutkRoughWallFunctionFvPatchScalarField.C:58-127), for the device
+// wall kernel, transcribed line by line from the gated HOST nutkRoughWallFunction (nut_wall_function.cu) -- NOT
+// built from yPlusWall or nutkWallFunctionValue: its yPlus rounds as (Cmu25*sqrt(k))*y/nu, it has no yPlusLam
+// switch, and its max/min are Foam::max/min's comparisons, which fmax is not on a NaN. Cs*KsPlus is ONE rounded
+// product before the branch, as the host computes it (its object code: fmul, then fadd); __dmul_rn keeps nvcc from
+// fusing it into the add that follows (unpinned, 3 of 37,750 synthetic faces in the KsPlus >= 90 regime differ
+// from the host; pinned, none). The pow/sin/log above are libdevice's (see nutkWallFunctionValue): against the host
+// on 400,000 synthetic faces, 580 differ, 579 of them in the 2.25-90 regime, worst 1.5e-13 relative -- a
+// cancellation in nu*(yPlus*kappa/log(m) - 1) scaling a last-bit difference. `nutPrev` is the patch's stored value
+// as correctNut is entered -- the
+// previous call's output, or the file's before the first -- which the limiter is relative to. `Cmu25` is
+// sqrt(sqrt(Cmu)), pow025 (Scalar.H:368-371), as the host forms it.
+BRAE_HD inline scalar nutkRoughWallValue(
+    scalar Cmu25,
+    scalar kNearWall,
+    scalar y,
+    scalar nu,
+    scalar nutPrev,
+    scalar Ks,
+    scalar Cs,
+    scalar kappa,
+    scalar E)
+{
+    const scalar uStar = Cmu25*sqrt(kNearWall);
+    const scalar yPlus = uStar*y/nu;
+    const scalar KsPlus = uStar*Ks/nu;
+    scalar Edash = E;
+    if (scalar(2.25) < KsPlus)
+    {
+#ifdef __CUDA_ARCH__
+        const scalar csk = __dmul_rn(Cs, KsPlus);
+#else
+        const scalar csk = Cs*KsPlus;
+#endif
+        const scalar fn = (KsPlus < scalar(90.0))
+            ? pow((KsPlus - scalar(2.25))/scalar(87.75) + csk, sin(scalar(0.4258)*(log(KsPlus) - scalar(0.811))))
+            : (scalar(1.0) + csk);
+        Edash /= fn;
+    }
+    const scalar limiting = (nutPrev > nu) ? nutPrev : nu;
+    const scalar a = Edash*yPlus;
+    const scalar m = (a > scalar(1+1e-4)) ? a : scalar(1+1e-4);
+    const scalar v = nu*(yPlus*kappa/log(m) - scalar(1));
+    const scalar lo = (v < 2*limiting) ? v : 2*limiting;
+    return (lo > scalar(0.5)*limiting) ? lo : scalar(0.5)*limiting;
+}
 
 // atmNutkWallFunction (OpenFOAM atmosphericModels): atmospheric ROUGH-wall nut using surface roughness length z0.
 // Same k-based friction velocity as nutk (yPlus = Cmu^0.25*sqrt(k)*y/nu) but the log uses the roughness blend
