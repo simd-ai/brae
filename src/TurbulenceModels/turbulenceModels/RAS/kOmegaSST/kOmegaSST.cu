@@ -178,6 +178,8 @@ void ddtKernel(
     const scalar* __restrict__ rhoOld,
     const scalar* __restrict__ psiOld,
     scalar                     rDeltaT,
+    // localEuler's per-cell rDeltaT, or null for the scalar -- the host's rDeltaTAt(c), same products
+    const scalar* __restrict__ rDeltaTCells,
     scalar* __restrict__       diag,
     scalar* __restrict__       source)
 {
@@ -185,8 +187,9 @@ void ddtKernel(
     if (c >= nC) return;
     const scalar r  = rho    ? rho[c]    : scalar(1);
     const scalar r0 = rhoOld ? rhoOld[c] : r;
-    diag[c]   += rDeltaT * r * V[c];
-    source[c] += rDeltaT * r0 * psiOld[c] * (V0 ? V0[c] : V[c]);
+    const scalar rDT = rDeltaTCells ? rDeltaTCells[c] : rDeltaT;
+    diag[c]   += rDT * r * V[c];
+    source[c] += rDT * r0 * psiOld[c] * (V0 ? V0[c] : V[c]);
 }
 
 
@@ -441,8 +444,13 @@ void correct(
     if (dbK.n) deviceBCValue(dbK, k, kBndLast);
     // psi.oldTime() for fvm::ddt under Euler: the fields as this call was entered, BEFORE the wall
     // override rewrites omega's wall cells -- where kOmegaSST_cpp.cu takes its kOld / omegaOld.
+    if (in.rDeltaTCells
+     && (in.cn || in.V0 || static_cast<int>(in.rDeltaTCells->size()) != nC))
+        throw std::runtime_error(
+            "brae kOmegaSST (device): a local time step (localEuler) beside CrankNicolson or on a moving mesh is "
+            "not ported, and the rDeltaT field must have one value per cell.");
     DeviceBuffer<scalar> kOld, omegaOld;
-    if (in.rDeltaT > scalar(0))
+    if (in.rDeltaT > scalar(0) || in.rDeltaTCells)
     {
         deviceCopy(kOld, in.kOldIn ? *in.kOldIn : k);
         deviceCopy(omegaOld, in.omegaOldIn ? *in.omegaOldIn : omega);
@@ -804,10 +812,11 @@ void correct(
                                 M.diag, M.source, in.rhoCell);
             // fvm::ddt(alpha, rho, omega_), kOmegaSSTBase.C:572 -- Euler, or nothing at all
             // under steadyState. CrankNicolson takes the branch below in its place.
-            if (in.rDeltaT > scalar(0) && !in.cn)
+            if ((in.rDeltaT > scalar(0) || in.rDeltaTCells) && !in.cn)
             {
                 ddtKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), v0P, in.rhoCell ? in.rhoCell->data() : nullptr,
                                              rhoOldP, omegaOld.data(), in.rDeltaT,
+                                             in.rDeltaTCells ? in.rDeltaTCells->data() : nullptr,
                                              M.diag.data(), M.source.data());
                 cudaCheck(cudaGetLastError(), "kOmegaSST omega ddt");
             }
@@ -919,10 +928,11 @@ void correct(
                                /*gammaIntEff=*/nullptr, /*FDES=*/nullptr, in.rhoCell);
             // fvm::ddt(alpha, rho, k_), kOmegaSSTBase.C:602 -- Euler, or nothing at all
             // under steadyState. CrankNicolson takes the branch below in its place.
-            if (in.rDeltaT > scalar(0) && !in.cn)
+            if ((in.rDeltaT > scalar(0) || in.rDeltaTCells) && !in.cn)
             {
                 ddtKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), v0P, in.rhoCell ? in.rhoCell->data() : nullptr,
                                              rhoOldP, kOld.data(), in.rDeltaT,
+                                             in.rDeltaTCells ? in.rDeltaTCells->data() : nullptr,
                                              M.diag.data(), M.source.data());
                 cudaCheck(cudaGetLastError(), "kOmegaSST k ddt");
             }

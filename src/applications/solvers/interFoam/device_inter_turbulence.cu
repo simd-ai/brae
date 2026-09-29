@@ -521,6 +521,10 @@ void deviceCorrectInterTurbulence(
         throw std::runtime_error("brae interFoam (device): deviceCorrectInterTurbulence needs every input.");
     if (!(in.deltaT > 0))
         throw std::runtime_error("brae interFoam (device): deviceCorrectInterTurbulence needs a positive deltaT.");
+    if (in.rDeltaT && t.model != cpu::interFoam::InterRasModel::KOmegaSST)
+        throw std::runtime_error(
+            "brae interFoam (device): a local time step reaches only kOmegaSST's closure; kEpsilon's and LES's "
+            "fvm::ddt under localEuler are not ported (the host loop refuses them too).");
 
     // nu on the WALL faces, and the ENTERING wall nut: OpenFOAM's G0 reads the stored nut patch value,
     // and nutBnd is also what correct() overwrites, so it is snapshotted rather than aliased
@@ -670,6 +674,8 @@ void deviceCorrectInterTurbulence(
             sin.turbInletOmegaLen  = &d.turbInletEpsLen;
         }
         sin.rDeltaT = scalar(1) / in.deltaT;
+        // ...or localEuler's per-cell one, as the host's Compressible::rDeltaTCells
+        sin.rDeltaTCells = in.rDeltaT;
         // psi.oldTime(), per STEP -- see DeviceInterTurbulence::kOldStep
         sin.kOldIn = &d.kOldStep;
         sin.omegaOldIn = &d.epsOldStep;

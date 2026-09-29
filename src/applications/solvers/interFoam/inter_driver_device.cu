@@ -156,16 +156,10 @@ RunReport runInterFoamDevice(
     InterFields f = buildInterFields(caseDir, startDir, m, g, fvp);
     // LOCAL TIME STEPPING. setRDeltaT.H runs on the HOST (inter_set_rdeltat_cpp: the smoothing is a
     // FaceCellWave) from this loop's fields, and each consumer -- the alpha pre-solve and CMULES,
-    // fvm::ddt(rho, U), ddtCorr -- reads the uploaded field. The gate's control switches consumers off by
-    // name (readLtsScalarControl), on this loop as on the host's.
+    // fvm::ddt(rho, U), ddtCorr, kOmegaSST's two fvm::ddts -- reads the uploaded field. The gate's control
+    // switches consumers off by name (readLtsScalarControl), on this loop as on the host's. kEpsilon and LES
+    // under localEuler are refused where the case is read, for both loops.
     const std::set<std::string> ltsScalar = readLtsScalarControl();
-    if (f.lts)
-    {
-        if (f.turbulence.on)
-            throw std::runtime_error(
-                "brae interFoam (device): localEuler with a turbulence closure. The closure's fvm::ddt under the "
-                "local time step is ported on the host loop only; run without -device.");
-    }
     // GATE CONTROLS for outletPhaseMeanVelocity, never set by a solver, the host loop's two: FROZEN never
     // updates it, NOLAG updates it in the still-updated first corrector too. Both make the answer WRONG.
     const bool opmvFrozen = std::getenv("BRAE_CONTROL_OPMV_FROZEN") != nullptr;
@@ -3045,6 +3039,9 @@ RunReport runInterFoamDevice(
                 ti.rhoOld = &dRhoOld;
                 ti.nu = &dStepNu;
                 ti.nuBnd = &dStepNuBnd;
+                // localEuler: the closure's two fvm::ddts take the local step (unless the gate's control
+                // switches the `turbulence` consumer off)
+                ti.rDeltaT = (f.lts && !ltsScalar.count("turbulence")) ? &dRDeltaT : nullptr;
                 ti.deltaT = rep.deltaT;
                 // the step's index and the corrector, as the host loop supplies them -- `s + 1` is the
                 // expression the CrankNicolson block already uses for this step's index
@@ -3162,6 +3159,8 @@ RunReport runInterFoamDevice(
                 ti.nu = &f.nu;
                 ti.nuBnd = &f.nuBnd;
                 ti.deltaT = rep.deltaT;
+                // localEuler: the host closure takes the host's field, as the host loop hands it
+                ti.rDeltaT = (f.lts && !ltsScalar.count("turbulence")) ? &f.rDeltaT : nullptr;
                 // the step's index and the corrector, as the host loop supplies them -- `s + 1` is the
                 // expression the CrankNicolson block already uses for this step's index
                 ti.timeIndex = s + 1;

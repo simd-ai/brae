@@ -23,6 +23,9 @@
 #                            fvSolution's `cache { grad(U); }`: with no closure to form grad(U), the UEqn's
 #                            first request would form and store it, and brae refuses that (the order of
 #                            UEqn.H's operands is not modelled)
+#   rasDevice                (`rasDevice` only) `ras` with the three things the DEVICE loop does not carry
+#                            yet staged to what it does: div(phi,k|omega) `Gauss upwind`, the hull's nut
+#                            `nutkWallFunction`, the cache stripped. Each goes as its device unit lands.
 #
 # MEASURED, ten steps, OpenFOAM's one-ulp floor beside each (the same run with ONE interface cell's alpha
 # moved by one ulp, OpenFOAM against OpenFOAM):
@@ -53,6 +56,11 @@
 #            2.8e-14 and the alpha step leaves 8.0e-12, whichever consumer is switched off on both loops);
 #            OpenFOAM against itself with every water cell one ulp off reads alpha 1.1e-10, p_rgh 2.8e-10 by
 #            the tenth. Bounds in the gate, DEV_BOUND_*.
+#   rasDevice DEVICE  kOmegaSST's two fvm::ddts on the local step, on the GPU. ONE step, the host arm's
+#            bounds: k 6.7e-14, omega 4.0e-13, nut 4.4e-13 (the host arm's own digits). TEN: alpha 9.5e-10,
+#            p_rgh 6.3e-09, U 4.1e-11, k 3.8e-10, omega 3.5e-10, nut 1.5e-10, the wall nut 4.2e-09, every
+#            count OpenFOAM's. The first k solve's initial residual is 1.0e-08 from OpenFOAM's on the device
+#            arm only: k starts uniform, so normFactor carries a pure round-off term (see the gate).
 #
 # THE CONTROLS, three steps each against the same oracle, each asserted to FAIL on a number:
 #   laminar  BRAE_CONTROL_LTS_NOSMOOTH        fvc::smooth skipped         rDeltaT at step 1 9.5e-01
@@ -82,6 +90,7 @@
 #                   to fail (a consumer switched off on one loop only reads alpha 1.3e+01, U 4.5e+00 and p_rgh
 #                   1.8e-01 after ONE step against the host arm; the outlet frozen, its outlet 2.7e-02, and
 #                   updated in the lagged corrector, U 1.5e-05, after three steps against a 6.3e-11 run)
+#   rasDevice DEVICE  BRAE_CONTROL_LTS_SCALAR=turbulence  k 1.1e+01, omega 1.1e+00 after three steps
 #
 # NOT CLAIMED: the cached grad(U) under a laminar, kEpsilon or LES closure, MRF, or with U changed since
 # the closure last formed it (refused: the UEqn would form it itself), on a refining mesh (refused: OpenFOAM
@@ -93,8 +102,9 @@
 # refining mesh or under kEpsilon (refused), and both on the device (refused), fvc::spread and fvc::sweep (refused: DTCHull sets both iteration counts to 0),
 # a restart (setRDeltaT damps from the third step of EVERY run, and a restart's rhoPhi is rebuilt as
 # interpolate(rho)*phi -- not a continuation of the continuous run), kEpsilon and LES under localEuler
-# (refused), and anything after ten steps. On the DEVICE loop: localEuler with any turbulence closure
-# (refused by name), the cached grad(U) on a static mesh (refused), a device-side setRDeltaT (the host forms it -- its smoothing is a
+# (refused), and anything after ten steps. On the DEVICE loop:
+# the closure's linearUpwind, nutkRoughWallFunction and the cached grad(U) on a static mesh (all refused,
+# hence `rasDevice`), a device-side setRDeltaT (the host forms it -- its smoothing is a
 # FaceCellWave -- and the loop uploads it and interpolate(rDeltaT) each step).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -186,6 +196,26 @@ if profile == 'laminar':
     t, k = re.subn(r'simulationType\s+RAS;', 'simulationType  laminar;', t)
     assert k == 1, 'simulationType'
     open(tp, 'w').write(t)
+if profile == 'rasDevice':
+    # the three things the device loop does not carry yet, each staged to what it does: the closure's
+    # convection upwind, the hull's wall function smooth, fvSolution's cache stripped
+    fs = os.path.join(d, 'system/fvSchemes')
+    t = open(fs).read()
+    t, k1 = re.subn(r'div\(phi,k\)\s+Gauss\s+linearUpwind\s+limitedGrad;', 'div(phi,k)      Gauss upwind;', t)
+    t, k2 = re.subn(r'div\(phi,omega\)\s+Gauss\s+linearUpwind\s+limitedGrad;', 'div(phi,omega)  Gauss upwind;', t)
+    assert k1 == 1 and k2 == 1, 'the closure convection'
+    open(fs, 'w').write(t)
+    fv = os.path.join(d, 'system/fvSolution')
+    t = open(fv).read()
+    t, k = re.subn(r'\ncache\s*\{[^}]*\}\s*', '\n', t)
+    assert k == 1, 'the cache block'
+    open(fv, 'w').write(t)
+    nf = os.path.join(d, '0/nut')
+    t = open(nf, encoding='latin-1').read()
+    t, k = re.subn(r'type\s+nutkRoughWallFunction;[^}]*?(value)', r'type            nutkWallFunction;\n        \1', t,
+                   count=1, flags=re.S)
+    assert k == 1, 'the hull wall function'
+    open(nf, 'w', encoding='latin-1').write(t)
 if profile == 'ras':
     fs = os.path.join(d, 'system/fvSchemes')
     t = open(fs).read()
@@ -229,6 +259,8 @@ do
     echo "== [$p]"
     "$BIN" "$W/$p" "$W/$p" "$STEPS" "$W/$p/log.interFoam" $MODE || rc=1
 done
+# `rasDevice` is the device arm's alone: the host arm is gated on `ras`, as the tutorial ships it
+stage rasDevice || { echo "interfoam_dtchull_vs_openfoam: staging failed"; exit 1; }
 # THE DEVICE ARM, on `laminar`: all STEPS steps at its own bounds, and ONE step at the host arm's --
 # every localEuler consumer and the outlet have run by then and nothing has amplified (DEV_BOUND_* in the gate)
 echo "== [laminar device]"
@@ -248,6 +280,15 @@ for ctl in BRAE_CONTROL_LTS_SCALAR=turbulence BRAE_CONTROL_SST_LU_OFF=1 BRAE_CON
 do
     control ras "$ctl" || rc=1
 done
+
+# ...and kOmegaSST under the local step on the GPU, on `rasDevice`: ten steps at the device bounds, one at
+# the host's (the closure's residuals keep DEV_BOUND_TURB_RESIDUAL there too -- see the gate)
+echo "== [rasDevice device]"
+"$BIN" "$W/rasDevice" "$W/rasDevice" "$STEPS" "$W/rasDevice/log.interFoam" $MODE device || rc=1
+awk '/^Flow time scale min\/max/ { if (++k > 1) exit } { print }' "$W/rasDevice/log.interFoam" > "$W/log.one"
+echo "== [rasDevice device, one step]"
+"$BIN" "$W/rasDevice" "$W/rasDevice" 1 "$W/log.one" $MODE device || rc=1
+control rasDevice BRAE_CONTROL_LTS_SCALAR=turbulence device || rc=1
 
 # ...and the device loop's own consumers, each switched off in turn: the same controls, the GPU loop
 for ctl in BRAE_CONTROL_LTS_NOSMOOTH=1 BRAE_CONTROL_LTS_NODAMP=1 BRAE_CONTROL_LTS_SCALAR=alpha \

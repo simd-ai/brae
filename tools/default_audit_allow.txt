@@ -19,7 +19,6 @@ InterTurbulenceStepInput ti V0      # a RAS closure on a moving mesh is refused 
 InterTurbulenceStepInput ti meshPhi # same refusal -- ARM device_moving_SST
 InterTurbulenceStepInput ti cn      # BRAE_INTER_HOST_CLOSURE under CrankNicolson is refused
 InterTurbulenceStepInput ti rhoOO   # same refusal
-InterTurbulenceStepInput ti rDeltaT # localEuler's per-cell step: the device loop refuses localEuler by name ("ddtSchemes `default` is localEuler ... ported on the host loop only") -- ARM device_localEuler
 
 # RunReport is an OUTPUT the drivers fill as they go, not a control read from the case
 RunReport rep alphaSolves
@@ -63,6 +62,7 @@ KEpsilonInput kin fvoEpsVal
 KEpsilonInput kin colouring
 KEpsilonInput kin gsColour
 KEpsilonInput kin polyDeg
+KOmegaSSTInput sstIn rDeltaTCells   # rhoTurbulenceHook.cu: rhoSimpleFoam is steady -- no ddtSchemes localEuler, so there is no per-cell step to take
 KOmegaSSTInput sin alphatPrtFace
 KOmegaSSTInput sin alphatWallMask
 KOmegaSSTInput sin Prt

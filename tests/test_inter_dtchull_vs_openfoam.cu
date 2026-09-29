@@ -98,6 +98,21 @@ constexpr scalar DEV_BOUND_U = 1e-8;
 constexpr scalar DEV_BOUND_P_RESIDUAL = 2e-6;
 constexpr scalar DEV_BOUND_ALPHA_RESIDUAL = 2e-8;
 constexpr scalar DEV_BOUND_U_OUTLET = 5e-8;
+// ...and on `rasDevice` (the `ras` profile with the closure's convection upwind, the hull's wall function
+// smooth and the cache stripped -- the three things the device loop does not carry yet), kOmegaSST taking
+// the local step on the GPU. ONE step, host bounds: k 6.7e-14, omega 4.0e-13, nut 4.4e-13, as the host arm.
+// TEN: alpha 9.5e-10, p_rgh 6.3e-09, U 4.1e-11, k 3.8e-10, omega 3.5e-10, nut 1.5e-10, the hull's wall nut
+// 4.2e-09, every count OpenFOAM's.
+constexpr scalar DEV_BOUND_K = 1e-9;
+constexpr scalar DEV_BOUND_OMEGA = 1e-9;
+constexpr scalar DEV_BOUND_NUT = 5e-10;
+constexpr scalar DEV_BOUND_NUT_WALL = 1.5e-8;
+// The closure's INITIAL RESIDUALS on the device arm, from the FIRST step. k starts `uniform 0.00015`, so
+// normFactor's sum|A*k - sumA*kRef| is PURE ROUND-OFF (k == kRef in every cell) and sits beside
+// sum|b - sumA*kRef|: OpenFOAM reports 1 - 1.0e-08 for the first k solve, the host arm -- which forms A*k in
+// OpenFOAM's order -- the same digits, and the device's own order 1 exactly. The solve it scales is the same:
+// k agrees to 6.7e-14 after it. A reported quantity at a cancellation floor, bounded, not a field.
+constexpr scalar DEV_BOUND_TURB_RESIDUAL = 3e-8;
 
 struct Diff
 {
@@ -335,9 +350,9 @@ int main(
         const Diff dO = compare(fin.turbulence.omega.internal, readCells<scalar>(last + "/omega", nC));
         const Diff dN = compare(fin.turbulence.nut.internal, readCells<scalar>(last + "/nut", nC));
         std::printf("  cells more than 1e-12 apart: k %ld, omega %ld, nut %ld\n", dK.nOff, dO.nOff, dN.nOff);
-        bound("k, relative", dK.rel(), BOUND_K);
-        bound("omega, relative", dO.rel(), BOUND_OMEGA);
-        bound("nut, relative", dN.rel(), BOUND_NUT);
+        bound("k, relative", dK.rel(), devLoose ? DEV_BOUND_K : BOUND_K);
+        bound("omega, relative", dO.rel(), devLoose ? DEV_BOUND_OMEGA : BOUND_OMEGA);
+        bound("nut, relative", dN.rel(), devLoose ? DEV_BOUND_NUT : BOUND_NUT);
         // THE WALL nut, face by face. nutkRoughWallFunction carries history -- a limiter against the patch's
         // previous value -- so the patch is its own witness, and OpenFOAM writes it at every step
         {
@@ -367,17 +382,18 @@ int main(
                         nRoughOf, nRoughBrae);
             check("...brae built a rough wall wherever OpenFOAM has one", nRoughOf == nRoughBrae);
             bound("wall nut, face by face, relative to its largest", dWall/std::fmax(wallMax, scalar(1e-300)),
-                  BOUND_NUT_WALL);
+                  devLoose ? DEV_BOUND_NUT_WALL : BOUND_NUT_WALL);
         }
         const std::vector<LinearSolveRecord> ofO = brae::gatecheck::readOfSolves(logPath, "omega");
         const std::vector<LinearSolveRecord> ofK = brae::gatecheck::readOfSolves(logPath, "k");
         check("OpenFOAM's log gave the omega and k solves",
               ofO.size() >= static_cast<std::size_t>(nSteps) && ofK.size() >= static_cast<std::size_t>(nSteps));
-        failures += brae::gatecheck::compareSolves("host", r.omegaSolves, ofO, nSteps, "omega",
-                                                   scalar(1e-10), scalar(1e-10), scalar(1e-5), nullptr,
+        const scalar turbRes = deviceArm ? DEV_BOUND_TURB_RESIDUAL : scalar(1e-10);
+        failures += brae::gatecheck::compareSolves(deviceArm ? "device" : "host", r.omegaSolves, ofO, nSteps,
+                                                   "omega", turbRes, turbRes, scalar(1e-5), nullptr,
                                                    !measureOnly);
-        failures += brae::gatecheck::compareSolves("host", r.kSolves, ofK, nSteps, "k",
-                                                   scalar(1e-10), scalar(1e-10), scalar(1e-5), nullptr,
+        failures += brae::gatecheck::compareSolves(deviceArm ? "device" : "host", r.kSolves, ofK, nSteps,
+                                                   "k", turbRes, turbRes, scalar(1e-5), nullptr,
                                                    !measureOnly);
     }
 

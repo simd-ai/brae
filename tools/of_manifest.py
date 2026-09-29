@@ -3014,7 +3014,11 @@ COMPONENTS = {
                         "alpha step leaves 8.0e-12); OpenFOAM with every water cell one ulp off reads alpha 1.1e-10, "
                         "p_rgh 2.8e-10. The five controls fail on the device arm as well. NOT CLAIMED: kEpsilon and LES "
                         "under localEuler, a moving mesh, sub-cycling (localRSubDeltaT), explicit MULES, fvOptions and "
-                        "MRF (all refused); on the device, any turbulence closure under localEuler (refused).",
+                        "MRF (all refused). DEVICE CLOSURE: kOmegaSST's two fvm::ddts on the local step "
+                        "(KOmegaSSTInput::rDeltaTCells), on `rasDevice` (ras with the closure's convection upwind, the "
+                        "hull smooth, the cache stripped -- what the device loop does not carry yet): one step k "
+                        "6.7e-14, omega 4.0e-13, nut 4.4e-13; ten k 3.8e-10, omega 3.5e-10, nut 1.5e-10; control k "
+                        "1.1e+01.",
              note="Five consumers on DTCHull: the alpha pre-solve (alphaEqn.H:105-109 names the scheme directly), "
                   "CMULES correct and limiterCorr (localRDeltaT per cell, CMULESTemplates.C:103-176), "
                   "fvm::ddt(rho, U) as diag=(rDT*rho)*V, source=((rDT*rho0)*U0)*V in that order, and ddtCorr on "

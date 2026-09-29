@@ -162,6 +162,9 @@ void refreshDeviceInterTurbulenceGeometry(
 
 struct DeviceInterTurbulenceStepInput
 {
+    // LOCALEULER: the per-cell rDeltaT, which kOmegaSST's two fvm::ddts take (KOmegaSSTInput::
+    // rDeltaTCells); the other closures refuse it. Null == 1/deltaT.
+    const DeviceBuffer<scalar>* rDeltaT = nullptr;
     const DeviceBuffer<scalar>* Ux = nullptr;
     const DeviceBuffer<scalar>* Uy = nullptr;
     const DeviceBuffer<scalar>* Uz = nullptr;

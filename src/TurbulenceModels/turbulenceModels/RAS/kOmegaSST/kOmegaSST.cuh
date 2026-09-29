@@ -69,6 +69,10 @@ struct KOmegaSSTInput
     // rhoOldCell is rho.oldTime() as the caller resolves it (RhoStepInput::firstIteration), null ->
     // rhoCell, the host closure's rhoOldAt. Same contract as KEpsilonInput's.
     scalar                      rDeltaT    = 0.0;
+    // LOCALEULER (interFoam): the per-cell rDeltaT setRDeltaT.H formed, which both fvm::ddts take in
+    // rDeltaT's place (localEulerDdtScheme.C; the host's Compressible::rDeltaTCells). Null == the scalar.
+    // Refused beside CrankNicolson or a moving mesh, as the host refuses it.
+    const DeviceBuffer<scalar>* rDeltaTCells = nullptr;
     const DeviceBuffer<scalar>* rhoOldCell = nullptr;
     // A MOVING MESH. `V0` is the volume the cells had BEFORE this step's move, which OpenFOAM's Euler
     // ddt takes in the SOURCE while the diagonal keeps V (EulerDdtScheme::fvmDdt under
