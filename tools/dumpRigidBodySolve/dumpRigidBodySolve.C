@@ -337,14 +337,19 @@ int main(int argc, char *argv[])
 
     // The cached body state X0_/v_ is only refreshed by forwardDynamicsCorrection,
     // which the constructor ran on the state it read and solve() runs at its end.
-    // After an override it is stale, so it is not printed: a stale number that
-    // greps like a live one is worse than no number.
-    if (!overridden)
+    // In a run it therefore always holds motionState_ when the next solve begins,
+    // and the RESTRAINTS read it (Newmark.C:85 -> linearDamper.C:73 reads v, and
+    // X0 carries the force out of the body frame). After an override it would
+    // hold the constructor's state instead, and a damper would act at that
+    // velocity -- so it is refreshed here from the overridden state, which is
+    // what a run that had reached this state would hold.
+    if (overridden)
     {
-        Info<< "[brae] preSolve.X0.E " << model.X0(bodyID).E() << endl;
-        Info<< "[brae] preSolve.X0.r " << model.X0(bodyID).r() << endl;
-        Info<< "[brae] preSolve.v " << model.v(bodyID, Zero) << endl;
+        model.forwardDynamicsCorrection(model.state());
     }
+    Info<< "[brae] preSolve.X0.E " << model.X0(bodyID).E() << endl;
+    Info<< "[brae] preSolve.X0.r " << model.X0(bodyID).r() << endl;
+    Info<< "[brae] preSolve.v " << model.v(bodyID, Zero) << endl;
 
     // rigidBodyMeshMotion::solve:252-256 -- once per time index, before the forces
     if (args.found("newTime"))

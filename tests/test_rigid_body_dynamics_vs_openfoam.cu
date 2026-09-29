@@ -111,7 +111,30 @@ int main(int argc, char** argv)
         }
         check("the oracle printed the body's 6x6 spatial inertia", haveRows);
         std::printf("  spatial inertia: worst %.4e of %.4e\n", (double)w, (double)ref);
-        check("brae's cuboid inertia is OpenFOAM's, all 36 components", haveRows && w == scalar(0));
+        check("brae's body inertia is OpenFOAM's, all 36 components", haveRows && w == scalar(0));
+
+        // CONTROL: a `rigidBody`'s `inertia` read in the diagonal-first order (xx yy zz xy yz xz)
+        // rather than OpenFOAM's symmTensor order (xx xy xz yy yz zz). Only a body that gives its own
+        // inertia can witness this; a cuboid builds its inertia from L and reads none.
+        const symmTensor& Ic = spec.model.links.back().inertia.Ic;
+        if (haveRows && spec.bodyType == "rigidBody")
+        {
+            RBD::RigidBodyInertia bad = spec.model.links.back().inertia;
+            bad.Ic = symmTensor{Ic.xx, Ic.yy, Ic.zz, Ic.xy, Ic.yz, Ic.xz};
+            const RBD::SpatialTensor B6 = RBD::inertiaTensor(bad);
+            scalar wb = 0;
+            for (int r = 0; r < 6; ++r)
+            {
+                const std::vector<scalar> row =
+                    oracleValues(log, "inertia " + std::to_string((int)nB[0] - 1) + " I row " + std::to_string(r));
+                for (int c = 0; c < 6; ++c)
+                {
+                    wb = std::fmax(wb, std::fabs(B6(r, c) - row[static_cast<std::size_t>(c)]));
+                }
+            }
+            std::printf("  CONTROL: inertia read diagonal-first: worst %.4e\n", (double)wb);
+            check("...the inertia is read in symmTensor order", wb > scalar(1e-3)*ref);
+        }
     }
 
     // THE COEFFICIENTS brae READ OUT OF THE SAME DICTIONARY. The dynamics can only be compared at
@@ -155,8 +178,10 @@ int main(int argc, char** argv)
         else g = vector{0, 0, scalar(-9.81)};
     }
 
-    // THE DYNAMICS, then the relaxation, then the integrator -- the three pieces of one solve
-    const std::vector<scalar> raw = spec.model.forwardDynamics(s0.q, s0.qDot, fx, g);
+    // THE RESTRAINTS onto a copy of fx (Newmark.C:81-85), THE DYNAMICS, then the relaxation, then the
+    // integrator -- the four pieces of one solve
+    const std::vector<RBD::SpatialVector> rfx = spec.model.applyRestraints(s0.q, s0.qDot, fx);
+    const std::vector<scalar> raw = spec.model.forwardDynamics(s0.q, s0.qDot, rfx, g);
     std::vector<scalar> qDdot = raw;
     const scalar aRelax = spec.accelerationRelaxation.value(tNew[0]);
     RBD::relaxAcceleration(qDdot, s0.qDdot, aRelax, spec.accelerationDamping);
@@ -228,13 +253,14 @@ int main(int argc, char** argv)
     // destabilising moment about the Ry axis -- but at q = 0 with the centre of mass on the axis it
     // contributes nothing, so this control is only live once the body has rotated. The arm says which.
     {
-        const std::vector<scalar> noG = spec.model.forwardDynamics(s0.q, s0.qDot, fx, vector{0, 0, 0});
+        const std::vector<scalar> noG = spec.model.forwardDynamics(s0.q, s0.qDot, rfx, vector{0, 0, 0});
         scalar w = 0, ref = 0;
         const scalar wg = worst(noG, raw, ref);
         w = wg;
         std::printf("  CONTROL: gravity dropped: qDdot moves by %.4e of %.4e (q1 = %.3e)\n",
                     (double)w, (double)ref, (double)s0.q[1]);
-        if (std::fabs(s0.q[1]) > scalar(1e-9))
+        // a joint sliding ALONG gravity (Pz) feels the weight at any rotation
+        if (std::fabs(s0.q[1]) > scalar(1e-9) || spec.model.links.front().joint == RBD::JointType::Pz)
         {
             check("...gravity is in the dynamics", w > scalar(1e-12)*std::fmax(ref, scalar(1e-300)));
         }
@@ -253,6 +279,7 @@ int main(int argc, char** argv)
     // not have said so: once the body has rotated, gravity's moment about the Ry axis is forty times
     // the fluid's contribution to it, and a "the fluid load dominates" control reads as a failure on
     // a state that is perfectly correct.
+    if (spec.model.links.front().joint == RBD::JointType::Py && spec.model.restraints.empty())
     {
         const std::vector<RBD::SpatialVector> none(fx.size());
         const std::vector<scalar> noF = spec.model.forwardDynamics(s0.q, s0.qDot, none, g);
@@ -276,12 +303,100 @@ int main(int argc, char** argv)
         std::vector<RBD::SpatialVector> swapped(fx.size());
         swapped.back().w = fx.back().l;
         swapped.back().l = fx.back().w;
-        const std::vector<scalar> sw = spec.model.forwardDynamics(s0.q, s0.qDot, swapped, g);
+        const std::vector<scalar> sw =
+            spec.model.forwardDynamics(s0.q, s0.qDot, spec.model.applyRestraints(s0.q, s0.qDot, swapped), g);
         scalar ref = 0;
         const scalar w = worst(sw, raw, ref);
         std::printf("  CONTROL: the moment and the force exchanged: qDdot moves by %.4e of %.4e\n",
                     (double)w, (double)ref);
-        check("...the spatial force is angular-first", w > scalar(1)*std::fmax(ref, scalar(1e-300)));
+        // MEASURED: floatingObject 9.2359e+00 of 1.7828e-01; DTCHullMoving, whose fluid load is
+        // almost all heave force, 1.2948e+01 of 1.2954e+01 -- swapping cannot exceed the answer there,
+        // it removes it
+        const scalar need = (spec.model.links.front().joint == RBD::JointType::Py) ? scalar(1) : scalar(0.5);
+        check("...the spatial force is angular-first", w > need*std::fmax(ref, scalar(1e-300)));
+    }
+
+    // THE FLUID LOAD on a model that has no Py identity to check it against: dropped whole, the
+    // acceleration must move by the load's own size
+    if (spec.model.links.front().joint != RBD::JointType::Py || !spec.model.restraints.empty())
+    {
+        const std::vector<RBD::SpatialVector> none(fx.size());
+        const std::vector<scalar> noF =
+            spec.model.forwardDynamics(s0.q, s0.qDot, spec.model.applyRestraints(s0.q, s0.qDot, none), g);
+        scalar ref = 0;
+        const scalar w = worst(noF, raw, ref);
+        std::printf("  CONTROL: the fluid load dropped: qDdot moves by %.4e of %.4e\n",
+                    (double)w, (double)ref);
+        check("...the fluid load is in the answer", w > scalar(1e-3)*std::fmax(ref, scalar(1e-300)));
+    }
+
+    // THE RESTRAINTS. At rest they read a zero velocity and must add EXACTLY nothing, bitwise; once
+    // the body moves each one must be live on its own, and the damper force must be carried out of
+    // the BODY frame by X0.T() -- applied as if it were already global, the hull's offset from the
+    // origin loses the moment that transport adds.
+    if (!spec.model.restraints.empty())
+    {
+        RBD::Model bare = spec.model;
+        bare.restraints.clear();
+        const std::vector<scalar> noR = bare.forwardDynamics(s0.q, s0.qDot, fx, g);
+        scalar ref = 0;
+        const scalar w = worst(noR, raw, ref);
+        bool moving = false;
+        for (scalar v : s0.qDot) moving = moving || v != scalar(0);
+        std::printf("  CONTROL: every restraint dropped: qDdot moves by %.4e of %.4e\n",
+                    (double)w, (double)ref);
+        if (!moving)
+        {
+            check("at rest the dampers add exactly nothing", w == scalar(0));
+        }
+        else
+        {
+            check("...the restraints are in the answer", w > scalar(1e-6)*std::fmax(ref, scalar(1e-300)));
+            for (std::size_t k = 0; k < spec.model.restraints.size(); ++k)
+            {
+                RBD::Model one = spec.model;
+                one.restraints.erase(one.restraints.begin() + static_cast<long>(k));
+                const std::vector<scalar> d =
+                    one.forwardDynamics(s0.q, s0.qDot, one.applyRestraints(s0.q, s0.qDot, fx), g);
+                scalar r1 = 0;
+                const scalar w1 = worst(d, raw, r1);
+                std::printf("  CONTROL: restraint `%s` dropped: qDdot moves by %.4e\n",
+                            spec.model.restraints[k].name.c_str(), (double)w1);
+                check("...that restraint is in the answer", w1 > scalar(1e-6)*std::fmax(r1, scalar(1e-300)));
+            }
+            // the damper force added in the frame it was computed in, without X0.T(): the transported
+            // sum g = (E^T f.w + r ^ E^T f.l, E^T f.l) undone to f = (E (g.w - r ^ g.l), E g.l)
+            std::vector<RBD::SpatialVector> untransported(fx);
+            {
+                const std::vector<RBD::SpatialVector> zero(fx.size());
+                const RBD::SpatialVector g6 = spec.model.applyRestraints(s0.q, s0.qDot, zero).back();
+                const RBD::SpatialTransform X =
+                    spec.model.X0(s0.q)[static_cast<std::size_t>(spec.model.bodyID())];
+                const vector fl = RBD::tdotv(X.E, g6.l);
+                const vector fw = RBD::tdotv(X.E, g6.w - cross(X.r, g6.l));
+                untransported.back() = untransported.back() + RBD::SpatialVector{fw, fl};
+            }
+            const std::vector<scalar> ut = spec.model.forwardDynamics(s0.q, s0.qDot, untransported, g);
+            scalar r2 = 0;
+            const scalar w2 = worst(ut, raw, r2);
+            std::printf("  CONTROL: the damper force left in the body frame: qDdot moves by %.4e\n",
+                        (double)w2);
+            check("...the damper force is carried out of the body frame", w2 > scalar(1e-6)*std::fmax(r2, scalar(1e-300)));
+        }
+    }
+
+    // THE JOINT: DTCHullMoving's heave read as a sway (Pz as Py). Weight then acts across the joint
+    // instead of along it.
+    if (spec.model.links.front().joint == RBD::JointType::Pz)
+    {
+        RBD::Model sway = spec.model;
+        sway.links.front().joint = RBD::JointType::Py;
+        const std::vector<scalar> d =
+            sway.forwardDynamics(s0.q, s0.qDot, sway.applyRestraints(s0.q, s0.qDot, fx), g);
+        scalar ref = 0;
+        const scalar w = worst(d, raw, ref);
+        std::printf("  CONTROL: Pz read as Py: qDdot moves by %.4e of %.4e\n", (double)w, (double)ref);
+        check("...the joint slides along z", w > scalar(1e-3)*std::fmax(ref, scalar(1e-300)));
     }
 
     std::printf("test_rigid_body_dynamics_vs_openfoam: %d failures\n", failures);

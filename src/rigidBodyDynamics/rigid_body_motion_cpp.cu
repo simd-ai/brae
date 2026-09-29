@@ -135,6 +135,34 @@ RigidBodyInertia cuboidInertia(scalar mass, const vector& centreOfMass, const ve
 }
 
 
+void jcalc(
+    JointType         joint,
+    scalar            q,
+    scalar            qDot,
+    SpatialTransform& JX,
+    SpatialVector&    JS1,
+    SpatialVector&    Jv)
+{
+    if (joint == JointType::Py || joint == JointType::Pz)
+    {
+        // Py.C:92-95, Pz.C:92-95 -- Xt(S_[0].l()*q), J.v = S_[0]*qDot. The translation is built by
+        // SCALING the axis: 0*q carries q's sign bit, which a literal 0 would not.
+        const vector axis = (joint == JointType::Py) ? vector{0, 1, 0} : vector{0, 0, 1};
+        JX = Xt(axis*q);
+        JS1 = SpatialVector{vector{0, 0, 0}, axis};
+        Jv = JS1*qDot;
+    }
+    else
+    {
+        // Ry.C:92-96 -- Xry(q), S_[0] = (0 1 0  0 0 0), and J.v is built by setting wy alone
+        JX = Xry(q);
+        JS1 = SpatialVector{vector{0, 1, 0}, vector{0, 0, 0}};
+        Jv = SpatialVector{};
+        Jv.w.y = qDot;
+    }
+}
+
+
 std::vector<scalar> Model::forwardDynamics(
     const std::vector<scalar>&        q,
     const std::vector<scalar>&        qDot,
@@ -165,23 +193,7 @@ std::vector<scalar> Model::forwardDynamics(
         SpatialTransform JX;
         SpatialVector JS1;
         SpatialVector Jv;
-        if (L.joint == JointType::Py)
-        {
-            // Py.C:92-95 -- Xt(S_[0].l()*q), S_[0] = (0 0 0  0 1 0), so the translation is (0, q, 0)
-            // built by SCALING the axis: 0*q carries q's sign bit, which a literal 0 would not.
-            const vector axis{0, 1, 0};
-            JX = Xt(axis*q[qi]);
-            JS1 = SpatialVector{vector{0, 0, 0}, axis};
-            Jv = JS1*qDot[qi];
-        }
-        else
-        {
-            // Ry.C:92-96 -- Xry(q), S_[0] = (0 1 0  0 0 0), and J.v is built by setting wy alone
-            JX = Xry(q[qi]);
-            JS1 = SpatialVector{vector{0, 1, 0}, vector{0, 0, 0}};
-            Jv = SpatialVector{};
-            Jv.w.y = qDot[qi];
-        }
+        jcalc(L.joint, q[qi], qDot[qi], JX, JS1, Jv);
         S1[i] = JS1;
         Xlambda[i] = JX & L.XT;
         const std::size_t lam = static_cast<std::size_t>(L.lambda);
@@ -244,21 +256,69 @@ std::vector<SpatialTransform> Model::X0(const std::vector<scalar>& q) const
     for (std::size_t i = 0; i < links.size(); ++i)
     {
         const Link& l = links[i];
-        // joint::jcalc -- J.X
+        // joint::jcalc -- J.X, which does not read qDot
         SpatialTransform JX;
-        if (l.joint == JointType::Py)
-        {
-            // Py.C:44: J.X = Xt(S_[0].l()*q), and S_[0].l() is (0 1 0)
-            JX = Xt(vector{0, q[static_cast<std::size_t>(l.qIndex)], 0});
-        }
-        else
-        {
-            JX = Xry(q[static_cast<std::size_t>(l.qIndex)]);
-        }
+        SpatialVector JS1;
+        SpatialVector Jv;
+        jcalc(l.joint, q[static_cast<std::size_t>(l.qIndex)], scalar(0), JX, JS1, Jv);
         const SpatialTransform Xlambda = JX & l.XT;
         x0[i + 1] = (l.lambda != 0) ? (Xlambda & x0[static_cast<std::size_t>(l.lambda)]) : Xlambda;
     }
     return x0;
+}
+
+
+std::vector<SpatialVector> Model::applyRestraints(
+    const std::vector<scalar>&        q,
+    const std::vector<scalar>&        qDot,
+    const std::vector<SpatialVector>& fx) const
+{
+    std::vector<SpatialVector> rfx(fx);
+    if (restraints.empty())
+    {
+        return rfx;
+    }
+    const std::size_t nB = links.size() + 1;
+    if (q.size() != static_cast<std::size_t>(nDoF()) || qDot.size() != q.size() || rfx.size() != nB)
+    {
+        throw std::runtime_error("brae RBD::applyRestraints: the joint state or fx is the wrong size.");
+    }
+    // forwardDynamicsCorrection.C's first pass (forwardDynamics.C:229-258), v and X0 only: neither
+    // reads qDdot, and they are the numbers the restraints read out of the model's cache
+    std::vector<SpatialTransform> X0v(nB);
+    std::vector<SpatialVector> vv(nB);
+    for (std::size_t i = 1; i < nB; ++i)
+    {
+        const Link& L = links[i - 1];
+        const std::size_t qi = static_cast<std::size_t>(L.qIndex);
+        SpatialTransform JX;
+        SpatialVector JS1;
+        SpatialVector Jv;
+        jcalc(L.joint, q[qi], qDot[qi], JX, JS1, Jv);
+        const SpatialTransform Xlambda = JX & L.XT;
+        const std::size_t lam = static_cast<std::size_t>(L.lambda);
+        X0v[i] = (lam != 0) ? (Xlambda & X0v[lam]) : Xlambda;
+        vv[i] = motionAction(Xlambda, vv[lam]) + Jv;
+    }
+    for (const Restraint& r : restraints)
+    {
+        const std::size_t b = static_cast<std::size_t>(r.bodyID);
+        SpatialVector f;
+        if (r.type == RestraintType::linearDamper)
+        {
+            // linearDamper.C:73: force = -coeff_*v.l(); fx += X0.T() & spatialVector(Zero, force)
+            const vector force = (-r.coeff)*vv[b].l;
+            f = SpatialVector{vector{0, 0, 0}, force};
+        }
+        else
+        {
+            // sphericalAngularDamper.C:73: moment = -coeff_*v.w(); fx += X0.T() & (moment, Zero)
+            const vector moment = (-r.coeff)*vv[b].w;
+            f = SpatialVector{moment, vector{0, 0, 0}};
+        }
+        rfx[b] = rfx[b] + transposeAction(X0v[b], f);
+    }
+    return rfx;
 }
 
 
@@ -428,11 +488,62 @@ MotionSpec readMotionSpec(const std::string& dictPath)
     // list-of-dictionaries is its own unit; this walks the tokens for the shape this one needs.
     // expandVars: the tutorial writes `mass #eval{ $rho*$Lx*$Ly*$Lz };`, and the tokeniser evaluates
     // it eagerly -- without the $-macros expanded first it stops on the `$`.
-    TokenStream ts(dictPath, /*expandVars=*/true);
     MotionSpec spec;
-    std::string motionSolver;
 
-    // walk to `rigidBodyMotionCoeffs {`
+    // THE TOP LEVEL, walked once for two facts. motionSolver::New reads the name with
+    // getCompat<word>("motionSolver", {{"solver", -1612}}) (motionSolver.C:114): `motionSolver` when it
+    // is there and the legacy `solver` only when it is not -- and in a file whose coefficients sit at
+    // the top level `solver` is the rigid-body INTEGRATOR's sub-dictionary, never a name (DTCHullMoving
+    // writes both; reading `solver {` as the name is how this reader first refused that case).
+    // motionSolver.C:91: coeffDict() is optionalSubDict("rigidBodyMotionCoeffs").
+    std::string motionSolver;
+    std::string legacySolver;
+    bool coeffsSubDict = false;
+    {
+        TokenStream top(dictPath, /*expandVars=*/true);
+        while (!top.eof())
+        {
+            const std::string key = top.next();
+            if (top.eof()) break;
+            if (top.peek() == "{")
+            {
+                if (key == "rigidBodyMotionCoeffs") coeffsSubDict = true;
+                label depth = 0;
+                do
+                {
+                    const std::string t = top.next();
+                    if (t == "{") ++depth;
+                    else if (t == "}") --depth;
+                } while (depth > 0 && !top.eof());
+                continue;
+            }
+            // a leaf: its first token is the value, and a list or a nested block ends at its own `;`
+            const std::string value = top.peek();
+            label depth = 0;
+            while (!top.eof())
+            {
+                const std::string t = top.next();
+                if (t == "(" || t == "{") ++depth;
+                else if (t == ")" || t == "}") --depth;
+                else if (t == ";" && depth == 0) break;
+            }
+            if (key == "motionSolver") motionSolver = value;
+            else if (key == "solver") legacySolver = value;
+        }
+    }
+    if (motionSolver.empty())
+    {
+        motionSolver = legacySolver;
+    }
+    if (motionSolver != "rigidBodyMotion")
+    {
+        throw std::runtime_error(
+            "brae RBD::readMotionSpec: " + dictPath + " asks for `motionSolver " + motionSolver +
+            "`; this reader carries rigidBodyMotion only.");
+    }
+
+    TokenStream ts(dictPath, /*expandVars=*/true);
+
     auto skipBlock = [&]()
     {
         label depth = 0;
@@ -444,27 +555,22 @@ MotionSpec readMotionSpec(const std::string& dictPath)
         } while (depth > 0 && !ts.eof());
     };
 
-    while (!ts.eof())
+    // Into `rigidBodyMotionCoeffs {` when there is one. Otherwise the walk below reads the whole file
+    // as the coefficients, which is optionalSubDict's other branch: the walk then ends at the end of
+    // the file rather than at a closing brace, and the top-level entries that are not coefficients
+    // (`dynamicFvMesh`, `motionSolverLibs`, `motionSolver`, FoamFile) fall to its skip-anything-else.
+    if (coeffsSubDict)
     {
-        const std::string key = ts.next();
-        if (key == "motionSolver" || key == "solver")
+        while (!ts.eof())
         {
-            motionSolver = ts.next();
-            if (ts.peek() == ";") ts.next();
-            continue;
+            const std::string key = ts.next();
+            if (key == "rigidBodyMotionCoeffs" && ts.peek() == "{")
+            {
+                ts.expect("{");
+                break;
+            }
+            if (ts.peek() == "{") { skipBlock(); continue; }
         }
-        if (key == "rigidBodyMotionCoeffs")
-        {
-            ts.expect("{");
-            break;
-        }
-        if (key == "{") { skipBlock(); continue; }
-    }
-    if (motionSolver != "rigidBodyMotion")
-    {
-        throw std::runtime_error(
-            "brae RBD::readMotionSpec: " + dictPath + " asks for `motionSolver " + motionSolver +
-            "`; this reader carries rigidBodyMotion only.");
     }
 
     auto readVectorParen = [&]()
@@ -487,8 +593,21 @@ MotionSpec readMotionSpec(const std::string& dictPath)
     vector bodyCofM{0, 0, 0};
     vector bodyL{0, 0, 0};
     bool haveL = false;
+    symmTensor bodyInertia{0, 0, 0, 0, 0, 0};
+    bool haveInertia = false;
+    // restraint name, type, body and coeff, in the dictionary's order; the body is resolved to its
+    // index once the chain exists
+    struct RestraintEntry
+    {
+        std::string name;
+        std::string type;
+        std::string body;
+        scalar coeff = 0;
+        bool haveCoeff = false;
+    };
+    std::vector<RestraintEntry> restraintEntries;
 
-    // inside rigidBodyMotionCoeffs
+    // inside rigidBodyMotionCoeffs, or at the top of a file whose coefficients are there
     label depth = 1;
     while (!ts.eof() && depth > 0)
     {
@@ -527,6 +646,54 @@ MotionSpec readMotionSpec(const std::string& dictPath)
         if (key == "mass")         { bodyMass = ts.nextScalar(); if (ts.peek() == ";") ts.next(); continue; }
         if (key == "centreOfMass") { bodyCofM = readVectorParen(); if (ts.peek() == ";") ts.next(); continue; }
         if (key == "L")            { bodyL = readVectorParen(); haveL = true; if (ts.peek() == ";") ts.next(); continue; }
+        if (key == "inertia")
+        {
+            // rigidBodyInertiaI.H:72 -- a symmTensor, written xx xy xz yy yz zz
+            ts.expect("(");
+            scalar e[6];
+            for (scalar& c : e) c = ts.nextScalar();
+            ts.expect(")");
+            bodyInertia = symmTensor{e[0], e[1], e[2], e[3], e[4], e[5]};
+            haveInertia = true;
+            if (ts.peek() == ";") ts.next();
+            continue;
+        }
+        if (key == "restraints")
+        {
+            // rigidBodyModel.C:84-116: every DICTIONARY entry is one restraint, in order
+            ts.expect("{");
+            while (!ts.eof() && ts.peek() != "}")
+            {
+                const std::string name = ts.next();
+                if (ts.peek() != "{")
+                {
+                    // a leaf in `restraints` is not a restraint (dEntry.isDict()), and is skipped
+                    while (!ts.eof() && ts.peek() != ";") ts.next();
+                    if (ts.peek() == ";") ts.next();
+                    continue;
+                }
+                ts.expect("{");
+                RestraintEntry r;
+                r.name = name;
+                while (!ts.eof() && ts.peek() != "}")
+                {
+                    const std::string k = ts.next();
+                    if (k == "type")       { r.type = ts.next(); }
+                    else if (k == "body")  { r.body = ts.next(); }
+                    else if (k == "coeff") { r.coeff = ts.nextScalar(); r.haveCoeff = true; }
+                    else if (ts.peek() == "{") { skipBlock(); continue; }
+                    else
+                    {
+                        while (!ts.eof() && ts.peek() != ";" && ts.peek() != "}") ts.next();
+                    }
+                    if (ts.peek() == ";") ts.next();
+                }
+                ts.expect("}");
+                restraintEntries.push_back(r);
+            }
+            ts.expect("}");
+            continue;
+        }
         if (key == "parent")
         {
             const std::string p = ts.next();
@@ -561,13 +728,14 @@ MotionSpec readMotionSpec(const std::string& dictPath)
                 }
                 ts.expect("}");
                 if (type == "Py") joints.push_back(JointType::Py);
+                else if (type == "Pz") joints.push_back(JointType::Pz);
                 else if (type == "Ry") joints.push_back(JointType::Ry);
                 else
                 {
                     throw std::runtime_error(
-                        "brae RBD::readMotionSpec: the joint `" + type + "` is not ported. This unit "
-                        "carries Py and Ry, which is what RAS/floatingObject's composite names; "
-                        "OpenFOAM has seventeen and each has its own jcalc.");
+                        "brae RBD::readMotionSpec: the joint `" + type + "` is not ported. This port "
+                        "carries Py, Pz and Ry, which is what RAS/floatingObject's and DTCHullMoving's "
+                        "composites name; OpenFOAM has seventeen and each has its own jcalc.");
                 }
             }
             ts.expect(")");
@@ -658,15 +826,14 @@ MotionSpec readMotionSpec(const std::string& dictPath)
             continue;
         }
         if (key == "ramp" || key == "cOfGdisplacement" || key == "bodyIdCofG" || key == "test"
-         || key == "nIter" || key == "restraints")
+         || key == "nIter")
         {
             throw std::runtime_error(
                 "brae RBD::readMotionSpec: `" + key + "` is set in " + dictPath + ", and this port "
                 "does not carry it. `ramp` scales BOTH gravity and the fluid spatial force; "
                 "`cOfGdisplacement` accumulates the body's travel into a registered field; `test` "
                 "runs the dynamics with no fluid force at all; `nIter` iterates the force and the "
-                "relaxation within one mesh update; `restraints` add their own forces inside the "
-                "solver. Each changes the answer and none is ported.");
+                "relaxation within one mesh update. Each changes the answer and none is ported.");
         }
         if (key == "joint")
         {
@@ -710,19 +877,38 @@ MotionSpec readMotionSpec(const std::string& dictPath)
             "single-joint body is a different chain (no jointBody is inserted) and is not ported.");
     }
 
-    if (bodyType != "cuboid")
+    if (bodyType != "cuboid" && bodyType != "rigidBody")
     {
         throw std::runtime_error(
             "brae RBD::readMotionSpec: body `" + spec.bodyName + "` is `" + bodyType + "`. Only "
-            "`cuboid` is ported -- each rigidBody type builds its own inertia about the centre of "
-            "mass (bodies/), and reading the wrong one gives a body of the right mass and the wrong "
-            "resistance to rotation.");
+            "`cuboid` and `rigidBody` are ported -- each rigidBody type builds its own inertia about "
+            "the centre of mass (bodies/), and reading the wrong one gives a body of the right mass "
+            "and the wrong resistance to rotation.");
     }
-    if (!haveL || bodyMass <= scalar(0))
+    if (bodyType == "cuboid" && (!haveL || bodyMass <= scalar(0)))
     {
         throw std::runtime_error(
             "brae RBD::readMotionSpec: body `" + spec.bodyName + "` gives no `L` or no positive "
             "`mass`; cuboid reads exactly L, mass and centreOfMass (cuboidI.H:65-77).");
+    }
+    if (bodyType == "rigidBody" && (!haveInertia || bodyMass <= scalar(0)))
+    {
+        throw std::runtime_error(
+            "brae RBD::readMotionSpec: body `" + spec.bodyName + "` gives no `inertia` or no "
+            "positive `mass`; rigidBody reads exactly mass, centreOfMass and inertia, the last ABOUT "
+            "THE CENTRE OF MASS (rigidBodyInertiaI.H:68-73).");
+    }
+    spec.bodyType = bodyType;
+    RigidBodyInertia bodyI;
+    if (bodyType == "cuboid")
+    {
+        bodyI = cuboidInertia(bodyMass, bodyCofM, bodyL);
+    }
+    else
+    {
+        bodyI.m = bodyMass;
+        bodyI.c = bodyCofM;
+        bodyI.Ic = bodyInertia;
     }
 
     // rigidBodyModel::join for a composite: a massless jointBody for every joint but the last, the
@@ -737,8 +923,40 @@ MotionSpec readMotionSpec(const std::string& dictPath)
         l.XT = (j == 0) ? bodyXT : SpatialTransform();
         // ...and the REAL body only on the last link: every one before it is a massless jointBody
         // (rigidBodyModel.C:279-290), which contributes a degree of freedom and no inertia.
-        l.inertia = (j + 1 == joints.size()) ? cuboidInertia(bodyMass, bodyCofM, bodyL)
-                                             : RigidBodyInertia();
+        l.inertia = (j + 1 == joints.size()) ? bodyI : RigidBodyInertia();
+    }
+
+    for (const RestraintEntry& r : restraintEntries)
+    {
+        Restraint out;
+        out.name = r.name;
+        if (r.type == "linearDamper") out.type = RestraintType::linearDamper;
+        else if (r.type == "sphericalAngularDamper") out.type = RestraintType::sphericalAngularDamper;
+        else
+        {
+            throw std::runtime_error(
+                "brae RBD::readMotionSpec: restraint `" + r.name + "` is `" + r.type + "`. Only "
+                "linearDamper and sphericalAngularDamper are ported (DTCHullMoving's two); the "
+                "springs, softWall, externalForce and prescribedRotation each add their own force "
+                "inside the solver (restraints/).");
+        }
+        // rigidBodyRestraint.C:53: model.bodyID(body), which is -1 -- and a FatalError downstream --
+        // for a name the model does not have
+        if (r.body != spec.bodyName)
+        {
+            throw std::runtime_error(
+                "brae RBD::readMotionSpec: restraint `" + r.name + "` names body `" + r.body + "`, "
+                "and the model's one body is `" + spec.bodyName + "`.");
+        }
+        if (!r.haveCoeff)
+        {
+            throw std::runtime_error(
+                "brae RBD::readMotionSpec: restraint `" + r.name + "` gives no `coeff`; " + r.type +
+                ".C:102 reads it with readEntry.");
+        }
+        out.bodyID = spec.model.bodyID();
+        out.coeff = r.coeff;
+        spec.model.restraints.push_back(out);
     }
     return spec;
 }

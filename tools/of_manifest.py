@@ -3783,6 +3783,27 @@ COMPONENTS = {
                   "divides by Vsc, not V. HOST_ONLY is a finished state: the motion is mesh topology and "
                   "geometry, computed once per step; what the DEVICE loop needs is the moved geometry uploaded, "
                   "which is interFoam_dynamicMesh's target."),
+        dict(name="interFoam_rigidBodyMotion", of_symbol="rigidBodyMeshMotion",
+             of_file="src/rigidBodyMeshMotion/rigidBodyMeshMotion/rigidBodyMeshMotion.C",
+             classification="HOST_ONLY", status="REIMPLEMENT",
+             brae_reference="src/rigidBodyMeshMotion/rigid_body_mesh_motion_cpp.cuh",
+             brae_target="",
+             validation="tests/rigid_body_dynamics_vs_openfoam.sh: OpenFOAM's own RBD::rigidBodyMotion::solve "
+                        "(tools/dumpRigidBodySolve) built from the case's dictionary, handed a state and a spatial "
+                        "force. RAS/floatingObject (cuboid, composite Py+Ry, coefficients in rigidBodyMotionCoeffs): "
+                        "three as-run states and a rotated one, qDdot within 1.6e-16 relative. RAS/DTCHullMoving "
+                        "(coefficients at the TOP LEVEL, rigidBody with its own inertia, composite Pz+Ry, a "
+                        "linearDamper and a sphericalAngularDamper): at rest and moving, qDdot, q, qDot, X0 and the "
+                        "36 inertia components 0.0 from OpenFOAM. Controls: inertia diagonal-first 9.2e+02; at rest "
+                        "the dampers add exactly nothing; moving, restraints dropped 2.5e+00, each alone 2.1e+00 / "
+                        "2.5e+00, the damper force left in the body frame 2.7e+00; Pz as Py 1.2e-01. Fail-proofs "
+                        "(moving arm): restraints never applied, Pz on y, the damper reading v.w, no X0.T() "
+                        "transport -- 8, 7, 6 and 4 failures. NOT CLAIMED: DTCHullMoving end to end, and the "
+                        "device.",
+             note="The body is integrated on the host: two degrees of freedom, once per step. The dictionary is "
+                  "motionSolver::coeffDict() = optionalSubDict(rigidBodyMotionCoeffs) and the name getCompat("
+                  "motionSolver, {solver}); the restraints read the model's CACHED v_/X0_, which "
+                  "forwardDynamicsCorrection last wrote from the same q and qDot the solve starts from."),
         dict(name="interFoam_displacementLaplacian", of_symbol="displacementLaplacianFvMotionSolver",
              of_file="src/fvMotionSolver/fvMotionSolvers/displacement/laplacian/displacementLaplacianFvMotionSolver.C",
              classification="GPU_REQUIRED", status="REIMPLEMENT",

@@ -205,8 +205,10 @@ std::vector<vector> RigidBodyMeshMotion::newPoints(
         state0_.t = time;
         state0_.deltaT = deltaT;
     }
+    // Newmark.C:81-85: the restraints are accumulated onto a COPY of fx, before the dynamics
+    const std::vector<RBD::SpatialVector> rfx = spec_.model.applyRestraints(state_.q, state_.qDot, fx);
     const std::vector<scalar> qDdotPrev = state_.qDdot;
-    state_.qDdot = spec_.model.forwardDynamics(state_.q, state_.qDot, fx, g_);
+    state_.qDdot = spec_.model.forwardDynamics(state_.q, state_.qDot, rfx, g_);
     RBD::relaxAcceleration(state_.qDdot, qDdotPrev, spec_.accelerationRelaxation.value(time),
                            spec_.accelerationDamping);
     RBD::newmarkSolve(state0_, spec_.newmark, state_);

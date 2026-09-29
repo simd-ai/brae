@@ -128,5 +128,60 @@ solve asRun.0.05  0.05  0.055
 solve rotated 0.05 0.055 -q '(0.05 0.3)' -qDot '(0.02 -0.1)' -qDdot '(-0.05 0.12)' \
       -t0 0.05 -deltaT0 "$DT"
 
+# --- DTCHullMoving: the body model a SHIPPED top-level dictionary names ---------------------------
+# The same oracle on RAS/DTCHullMoving's own constant/dynamicMeshDict, which is everything
+# floatingObject is not: the coefficients at the TOP LEVEL beside `motionSolver` (optionalSubDict's
+# other branch, with the integrator's `solver { type Newmark; }` sitting where the legacy name would),
+# a `rigidBody` body with its own `inertia` about the centre of mass, a composite of Pz and Ry, and
+# two RESTRAINTS -- a linearDamper and a sphericalAngularDamper -- which Newmark::solve adds to fx
+# before the dynamics. The dynamics does not need the fluid, so no mesh is built: the hull load is
+# handed over on the command line at the size a floating hull carries (its weight, 412.73*9.81, is
+# 4049 N).
+#   rest     q = qDot = 0: the dampers read a zero velocity and must add EXACTLY nothing.
+#   moving   heave 0.02 m and pitch -0.03 rad, both moving: the dampers are live, the pitch makes Xry
+#            live, and the body's offset (2.93, 0, 0.2) makes the X0.T() transport of the damper force
+#            carry a moment.
+DSRC="$TUT/multiphase/interFoam/RAS/DTCHullMoving"
+if [ -d "$DSRC" ]; then
+    grep -q "^motionSolver *rigidBodyMotion" "$DSRC/constant/dynamicMeshDict" \
+        || { echo "FAIL: DTCHullMoving no longer names motionSolver rigidBodyMotion"; exit 1; }
+    grep -q "rigidBodyMotionCoeffs" "$DSRC/constant/dynamicMeshDict" \
+        && { echo "FAIL: DTCHullMoving's coefficients are no longer at the top level"; exit 1; }
+    grep -q "linearDamper" "$DSRC/constant/dynamicMeshDict" \
+        || { echo "FAIL: DTCHullMoving no longer names a linearDamper"; exit 1; }
+    D="$W/dtchm"
+    rm -rf "$D"
+    mkdir -p "$D/constant" "$D/system" "$D/0"
+    cp "$DSRC/constant/dynamicMeshDict" "$DSRC/constant/g" "$D/constant/" || exit 1
+    cat > "$D/system/controlDict" <<'CDEOF'
+FoamFile { version 2.0; format ascii; class dictionary; object controlDict; }
+application interFoam;
+startFrom startTime;
+startTime 0;
+stopAt endTime;
+endTime 1;
+deltaT 1e-4;
+writeControl timeStep;
+writeInterval 1;
+CDEOF
+    DDT=1e-4
+    dsolve()
+    {
+        local label="$1"
+        shift
+        local ol="$W/oracle.$label"
+        dumpRigidBodySolve -case "$D" -time 0 -newTime -deltaT "$DDT" "$@" > "$ol" 2>&1 \
+            || { echo "FAIL: dumpRigidBodySolve on DTCHullMoving ($label)"; tail -20 "$ol"; rc=1; return; }
+        echo "--- DTCHullMoving $label"
+        "$BIN" "$D" "$ol" || rc=1
+    }
+    dsolve rest -q '(0 0)' -qDot '(0 0)' -qDdot '(0 0)' -t0 0 -deltaT0 "$DDT" -t 1e-4 \
+        -force '(-12.5 3.25 4100.75)' -moment '(1.5 -85.25 0.75)'
+    dsolve moving -q '(0.02 -0.03)' -qDot '(0.1 -0.2)' -qDdot '(0.3 0.5)' -t0 0.5 -deltaT0 "$DDT" \
+        -t 0.5001 -force '(-12.5 3.25 4100.75)' -moment '(1.5 -85.25 0.75)'
+else
+    echo "SKIP (arm): DTCHullMoving tutorial not found at $DSRC"
+fi
+
 echo "rigid_body_dynamics_vs_openfoam: rc $rc"
 exit $rc

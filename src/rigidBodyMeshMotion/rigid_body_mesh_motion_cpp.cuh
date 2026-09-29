@@ -13,9 +13,10 @@
 // step solves more than once, and the displacement the mesh is then moved by.
 //
 // NOT PORTED, refused by name where the dictionary is read (see RBD::readMotionSpec): `ramp` (it
-// scales gravity AND the fluid force), `test`, `nIter`, `cOfGdisplacement`, `bodyIdCofG`,
-// `restraints`, more than one body, a body that is not a `cuboid`, a joint other than Py or Ry, a
-// `mergeWith` body and a parent that is not `root`. Here, additionally: `rho rhoInf` (a reference
+// scales gravity AND the fluid force), `test`, `nIter`, `cOfGdisplacement`, `bodyIdCofG`, a
+// restraint other than linearDamper or sphericalAngularDamper, more than one body, a body that is
+// neither a `cuboid` nor a `rigidBody`, a joint other than Py, Pz or Ry, a `mergeWith` body and a
+// parent that is not `root`. Here, additionally: `rho rhoInf` (a reference
 // density in place of the live field) and a patch entry that is a regular expression.
 #pragma once
 

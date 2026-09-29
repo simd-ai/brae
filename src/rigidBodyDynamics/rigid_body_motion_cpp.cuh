@@ -57,13 +57,26 @@ vector transformPoint(const SpatialTransform& x, const vector& p);
 SpatialTransform Xt(const vector& r);
 SpatialTransform Xry(scalar omega);
 
-// The joints this unit carries. OpenFOAM has seventeen; the two RAS/floatingObject names are ported
-// and every other one is refused where the chain is built, by the name the dictionary gave it.
+// The joints this port carries. OpenFOAM has seventeen; RAS/floatingObject's Py and Ry and
+// DTCHullMoving's Pz are ported and every other one is refused where the chain is built, by the name
+// the dictionary gave it.
 enum class JointType
 {
     Py,     // prismatic along y:  X = Xt(S.l()*q), S = (0 0 0  0 1 0)
+    Pz,     // prismatic along z:  X = Xt(S.l()*q), S = (0 0 0  0 0 1)   (Pz.C:55-97)
     Ry      // revolute about y:   X = Xry(q),      S = (0 1 0  0 0 0)
 };
+
+// joint::jcalc for one ported joint (Py.C, Pz.C, Ry.C): the joint transform, its one motion subspace
+// column and its velocity. J.c is Zero for all three. ONE function, as OpenFOAM's jcalc is one
+// function, so the forward dynamics, the body transforms and the restraints read the same numbers.
+void jcalc(
+    JointType        joint,
+    scalar           q,
+    scalar           qDot,
+    SpatialTransform& JX,
+    SpatialVector&   JS1,
+    SpatialVector&   Jv);
 
 // THE FOUR ACTIONS a spatialTransform has, which are four different pieces of arithmetic and not one
 // with a flag (spatialTransformI.H). Reading a force through the motion action, or a motion through
@@ -119,10 +132,33 @@ struct Link
     RigidBodyInertia inertia;
 };
 
+// restraints/linearDamper and restraints/sphericalAngularDamper: a force (or a moment) of -coeff
+// times the body's own spatial velocity, linear (or angular) half, carried from the BODY frame to
+// the global one by X0.T() (linearDamper.C:66-80, sphericalAngularDamper.C:66-80). The others are
+// refused where the dictionary is read.
+enum class RestraintType
+{
+    linearDamper,
+    sphericalAngularDamper
+};
+
+struct Restraint
+{
+    std::string   name;
+    RestraintType type = RestraintType::linearDamper;
+    // the body index in the model (rigidBodyRestraint.C:53-54: bodyID and its master are the same
+    // for a body that is not merged, which is the only kind ported)
+    label         bodyID = 0;
+    scalar        coeff = 0;
+};
+
 struct Model
 {
     // links[i] is body i + 1; body 0 is the root, whose X0 is the identity
     std::vector<Link> links;
+    // rigidBodyModel::addRestraints (rigidBodyModel.C:84-116), in the dictionary's order: they are
+    // ACCUMULATED onto one fx entry, so the order is the rounding.
+    std::vector<Restraint> restraints;
     // the body the mesh motion moves -- the last link, which carries the real body
     label bodyID() const { return static_cast<label>(links.size()); }
     label nDoF() const { return static_cast<label>(links.size()); }
@@ -139,6 +175,16 @@ struct Model
         const std::vector<scalar>&       qDot,
         const std::vector<SpatialVector>& fx,
         const vector&                    g) const;
+
+    // rigidBodyModel::applyRestraints (forwardDynamics.C:34-53), called by Newmark::solve
+    // (Newmark.C:81-85) on a COPY of fx before the dynamics. Each restraint reads the model's CACHED
+    // v_ and X0_, which forwardDynamicsCorrection last wrote at the end of the previous solve (or in
+    // initialize()) from motionState_ -- the very q and qDot this solve hands forwardDynamics. So
+    // they are rebuilt here from (q, qDot) by the same first pass, which is the same arithmetic.
+    std::vector<SpatialVector> applyRestraints(
+        const std::vector<scalar>&        q,
+        const std::vector<scalar>&        qDot,
+        const std::vector<SpatialVector>& fx) const;
 
     // rigidBodyMotion::transformPoints(bodyID, weight, points0): the transform from the INITIAL state
     // in the global frame to the current one, applied whole where the weight is 1 and slerped where it
@@ -205,6 +251,8 @@ struct MotionSpec
 {
     Model model;
     std::string bodyName;
+    // `cuboid` (inertia built from L) or `rigidBody` (inertia read as given)
+    std::string bodyType;
     std::vector<std::string> patches;
     scalar innerDistance = 0;
     scalar outerDistance = 0;
@@ -243,9 +291,12 @@ void constrainPointDisplacement(
 std::vector<scalar> readJointStateList(const std::string& path, const char* key);
 scalar readJointStateScalar(const std::string& path, const char* key, scalar fallback);
 
-// Read constant/dynamicMeshDict. Refuses anything this unit does not carry, by name: a motionSolver
-// that is not rigidBodyMotion, more than one body, a joint other than Py or Ry, a `mergeWith` body,
-// and a parent that is not `root`.
+// Read constant/dynamicMeshDict. The coefficients are motionSolver::coeffDict(), which is
+// optionalSubDict("rigidBodyMotionCoeffs") (motionSolver.C:91): the sub-dictionary when there is one,
+// else the whole file -- DTCHullMoving writes them at the top level. Refuses anything this port does
+// not carry, by name: a motionSolver that is not rigidBodyMotion, more than one body, a joint other
+// than Py, Pz or Ry, a body type other than cuboid or rigidBody, a restraint other than linearDamper
+// or sphericalAngularDamper, a `mergeWith` body, and a parent that is not `root`.
 MotionSpec readMotionSpec(const std::string& dictPath);
 
 } // namespace RBD
