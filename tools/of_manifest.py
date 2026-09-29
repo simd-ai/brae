@@ -3093,7 +3093,7 @@ COMPONENTS = {
              brae_reference="src/finiteVolume/fields/fv_patch_field.cuh",
              validation="tests/interfoam_dtchullmoving_vs_openfoam.sh, RAS/DTCHullMoving's atmosphere as shipped "
                         "(`tangentialVelocity $internalField`, (-1.668 0 0)) with the mesh FROZEN and grad(U) "
-                        "UNCACHED on both codes (staged, and said there): ten Euler steps, alpha 3.0e-14, p_rgh "
+                        "UNCACHED on both codes (the frozen mesh makes the cache live; as shipped the moving mesh bypasses it): ten Euler steps, alpha 3.0e-14, p_rgh "
                         "1.3e-11, U 2.9e-13, k 3.2e-13, omega 6.2e-13, nut 7.7e-12, the atmosphere's U face by "
                         "face 3.9e-15 and its totalPressure p_rgh 0, every p_rgh and alpha count OpenFOAM's; "
                         "427 of 798 atmosphere faces inflow. Controls: the entry stripped U 3.9e-05, the "

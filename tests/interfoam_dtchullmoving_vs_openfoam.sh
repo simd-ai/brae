@@ -13,10 +13,14 @@
 #   dynamicFvMesh staticFvMesh   the rigid-body motion is the port's next units, not this one; the
 #                                atmosphere sits at z = 4, beyond the body's outerDistance 1, and does not
 #                                move in the shipped run either
-#   cache { active false; }      at the second outer corrector's UEqn the cached grad(U) is stale and
-#                                OpenFOAM's first request re-forms it, which brae refuses (the operand order
-#                                is not modelled) -- DTCHullMoving's next wall, with or without this entry.
-#                                BOTH codes run uncached, so the oracle stays OpenFOAM's own answer
+#   cache { active false; }      A CONSEQUENCE OF FREEZING THE MESH, not a wall of the shipped case. OpenFOAM
+#                                bypasses the cache on a changing mesh (gradScheme.C:99), and polyMesh sets
+#                                moving() at the first movePoints and never clears it (polyMesh.C:1191), so
+#                                under the shipped rigid-body motion the cache is inert in every corrector.
+#                                FROZEN it is live, and at the second outer corrector's UEqn the cached
+#                                grad(U) is stale (nOuterCorrectors 2, turbOnFinalIterOnly) and OpenFOAM's
+#                                first request re-forms it, which brae refuses (the operand order is not
+#                                modelled). BOTH codes run uncached, so the oracle stays OpenFOAM's own answer
 #   adjustTimeStep no, deltaT 1e-4, write every step, ascii, functions {}   the oracle
 #
 # THE WINDOW CAN SEE THE ENTRY (measured, OpenFOAM against itself, cached and uncached alike): with the entry
