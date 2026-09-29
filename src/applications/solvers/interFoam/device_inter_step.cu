@@ -505,7 +505,7 @@ void deviceInterStep(
             }
         }
         // the predictor's solve ends in U.correctBoundaryConditions(), which clears updated()
-        hooks.updateUBoundary(UX, UY, UZ, dbU, ub, DeviceUBoundaryCall::evaluate);
+        hooks.updateUBoundary(UX, UY, UZ, dbU, ub, DeviceUBoundaryCall::evaluateAfterPredictor);
         deviceUpdateInletOutlet(dbU, namedUFlux(phiBnd));
         deviceUpdatePressureInletOutletVelocity(dbU, namedUFlux(phiBnd), UX, UY, UZ, /*directionMixed=*/true);
         deviceUpdateSymmetry(dbU, UX, UY, UZ);

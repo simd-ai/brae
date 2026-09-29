@@ -61,7 +61,13 @@ enum class DeviceUBoundaryCall
     // the ASSEMBLY-TIME valueFraction (mixedFvPatchField.C). The hook must keep the new flux from
     // U's flux-conditional patches, as the host pEqn does (inter_peqn_cpp.cu, uPatchesUpdatedAtEntry,
     // with what it cost).
-    evaluateStillUpdated
+    evaluateStillUpdated,
+    // ...and the predictor solve's own U.correctBoundaryConditions() (fvMatrix::solve): the patches are
+    // STILL updated() from the assembly, so no updateCoeffs runs. phi has not moved since, so a
+    // flux-conditional patch reads the same either way and the hook treats this as `evaluate`; a patch
+    // that updates from U's CELLS -- outletPhaseMeanVelocity -- would not, and must skip it, as the host
+    // loop's momentumPredictor does (it updates only at the assembly and in the pressure correctors).
+    evaluateAfterPredictor
 };
 
 struct DeviceInterStepHooks

@@ -79,23 +79,25 @@ constexpr scalar BOUND_U_RAS = 5e-12;
 constexpr scalar BOUND_NUT_WALL = 2e-10;
 constexpr scalar BOUND_U_OUTLET = 2e-11;
 
-// THE DEVICE ARM over more than one step, `laminarIO` (the laminar profile with the outlet an
-// inletOutlet, which the device loop does not carry yet). Measured after ten steps: rDeltaT 4.6e-10 at
-// worst, the time-scale lines 1.8e-10, alpha 3.1e-09, p_rgh 3.6e-08, U 2.2e-09, the p_rgh initial
-// residuals 4.8e-07 and alpha's 4.6e-09, every count OpenFOAM's -- each bound about three times it. The
-// host arm on the same profile reads alpha 2.6e-10, p_rgh 6.1e-10, U 6.4e-13. WHY THE DEVICE IS WIDER,
-// localised by stage against the host arm: after ONE step every localEuler consumer has run and the two
-// loops agree to U 3.1e-14, p_rgh 3.0e-15, alpha 4.4e-16 (the one-step arm keeps the host's bounds); at the
+// THE DEVICE ARM over more than one step, on the `laminar` profile with the tutorial's own
+// outletPhaseMeanVelocity. Measured after ten steps: rDeltaT 5.2e-10 at worst, the time-scale lines 5.2e-10,
+// alpha 1.1e-09, p_rgh 2.3e-08, U 6.0e-10, the outlet's U face by face 1.4e-08, the p_rgh initial residuals
+// 3.1e-07 and alpha's 1.6e-09, every count OpenFOAM's -- each bound a few times it. The host arm on the same
+// profile reads alpha 3.6e-10, p_rgh 6.5e-10, U 5.1e-13. WHY THE DEVICE IS WIDER, localised by stage against
+// the host arm (on the profile with the outlet an inletOutlet, which reads the same class of numbers): after
+// ONE step every localEuler consumer and the outlet have run and the two loops agree to U 3.1e-14, p_rgh
+// 3.0e-15, alpha 4.4e-16 (the one-step arm keeps the host's bounds; the outlet reads 4.6e-15 there); at the
 // SECOND the alpha pre-solve still agrees to 2.8e-14 and CMULES' ten limiter passes take alpha to 8.0e-12,
-// with any one consumer switched off on both loops reading the same ~1e-11 -- it is the device loop's
-// arithmetic amplified, not a localEuler form. OpenFOAM against itself with every water cell one ulp off
-// grows 7.9e-13 by the second step and alpha 1.1e-10, p_rgh 2.8e-10 by the tenth.
+// with any one consumer switched off on both loops reading the same ~1e-11 -- the device loop's arithmetic
+// amplified, not a localEuler form. OpenFOAM against itself with every water cell one ulp off grows 7.9e-13
+// by the second step and alpha 1.1e-10, p_rgh 2.8e-10 by the tenth.
 constexpr scalar DEV_BOUND_RDELTAT = 2e-9;
 constexpr scalar DEV_BOUND_ALPHA = 1e-8;
 constexpr scalar DEV_BOUND_PRGH = 1e-7;
 constexpr scalar DEV_BOUND_U = 1e-8;
 constexpr scalar DEV_BOUND_P_RESIDUAL = 2e-6;
 constexpr scalar DEV_BOUND_ALPHA_RESIDUAL = 2e-8;
+constexpr scalar DEV_BOUND_U_OUTLET = 5e-8;
 
 struct Diff
 {
@@ -408,7 +410,7 @@ int main(
         {
             check("brae built outletPhaseMeanVelocity wherever OpenFOAM's file has it", nOf == nBrae);
             bound("outlet U, face by face, relative to its largest", dOut/std::fmax(outMax, scalar(1e-300)),
-                  BOUND_U_OUTLET);
+                  devLoose ? DEV_BOUND_U_OUTLET : BOUND_U_OUTLET);
         }
     }
 

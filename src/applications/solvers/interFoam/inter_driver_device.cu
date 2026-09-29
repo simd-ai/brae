@@ -166,15 +166,16 @@ RunReport runInterFoamDevice(
                 "brae interFoam (device): localEuler with a turbulence closure. The closure's fvm::ddt under the "
                 "local time step is ported on the host loop only; run without -device.");
     }
-    // outletPhaseMeanVelocity is updated from U's CELLS at the assembly and inside each corrector's
-    // U.correctBoundaryConditions() on the host loop (inter_driver_cpp.cu); this loop carries no such hook
-    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-    {
-        if (f.U.boundary[pi]->isOutletPhaseMeanVelocity())
-            throw std::runtime_error(
-                "brae interFoam (device): U patch `" + fvp[pi].name + "` is outletPhaseMeanVelocity. The host "
-                "loop carries it; the device loop does not. Run without -device.");
-    }
+    // GATE CONTROLS for outletPhaseMeanVelocity, never set by a solver, the host loop's two: FROZEN never
+    // updates it, NOLAG updates it in the still-updated first corrector too. Both make the answer WRONG.
+    const bool opmvFrozen = std::getenv("BRAE_CONTROL_OPMV_FROZEN") != nullptr;
+    const bool opmvIgnoreLag = std::getenv("BRAE_CONTROL_OPMV_NOLAG") != nullptr;
+    if (opmvFrozen)
+        std::printf("  *** CONTROL MODE: outletPhaseMeanVelocity is never updated. This run is deliberately "
+                    "wrong. ***\n");
+    if (opmvIgnoreLag)
+        std::printf("  *** CONTROL MODE: outletPhaseMeanVelocity is updated in the lagged first corrector. "
+                    "This run is deliberately wrong. ***\n");
     // fvSolution's `cache { grad(U); }`: the host loop reuses the closure's grad(U) at the next UEqn, as
     // OpenFOAM's registry does; this loop forms every one afresh, which is OpenFOAM's UNCACHED answer --
     // and OpenFOAM's answer outright on a motion-solver mesh, which is changing() from its first update on,
@@ -930,6 +931,26 @@ RunReport runInterFoamDevice(
         // fraction HAS, on a permeable wall: MEASURED on damBreakPermeable's staged wet wall, at the
         // step where the first face goes dry (81 of 140), U 1.3e-03 and p_rgh 1.5e-01 from the host
         // loop in that one step, from 2e-13 the step before.
+        // outletPhaseMeanVelocity's updateCoeffs, from the phase field's stored patch values and U's face
+        // cells as they stand (outletPhaseMeanVelocityFvPatchVectorField.C:130-163), at the host loop's
+        // instants: the assembly, and each pressure corrector's correctBoundaryConditions BEFORE its
+        // evaluate -- but not where the patch is still updated(): the first corrector of a pass with no
+        // predictor (PressureStepInput::uPatchesUpdatedAtEntry) and the predictor solve's own evaluate.
+        const bool opmvNow = call == DeviceUBoundaryCall::assembly || call == DeviceUBoundaryCall::evaluate
+                          || (call == DeviceUBoundaryCall::evaluateStillUpdated && opmvIgnoreLag);
+        if (opmvNow && !opmvFrozen)
+        {
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (!f.U.boundary[pi]->isOutletPhaseMeanVelocity()) continue;
+                if (f.U.boundary[pi]->alphaFieldName() != f.alphaName)
+                    throw std::runtime_error(
+                        "brae interFoam: U patch `" + fvp[pi].name + "` is an outletPhaseMeanVelocity naming "
+                        "`alpha " + f.U.boundary[pi]->alphaFieldName() + "`, and this case's phase field is `"
+                        + f.alphaName + "`. OpenFOAM looks the named field up and stops without it.");
+                f.U.boundary[pi]->updatePhaseMean(f.alpha1.boundary[pi]->value(), f.U.internal, g.Sf(), g.magSf());
+            }
+        }
         if (call != DeviceUBoundaryCall::assembly)
         {
             f.U.evaluateBoundary();
