@@ -68,6 +68,9 @@ struct RunReport
     // step ran with -- the rDeltaT OpenFOAM writes at that step's time
     std::vector<SetRDeltaTReport> ltsLog;
     std::vector<std::vector<scalar>> rDeltaTPerStep;
+    // fvSolution's cached grad(U): the momentum assemblies that took it (the device loop counts; the gate's
+    // witness that a cached run consumed the cache at all)
+    long gradUCacheConsumed = 0;
     // ...and, where p_rgh names GAMG, what OpenFOAM prints under its own debug switches: the
     // hierarchy (cells, faces and lduAddressing::band()'s profile per level, the mesh first) and the
     // coarsest-level solve of every V-cycle of every GAMG solve, in order

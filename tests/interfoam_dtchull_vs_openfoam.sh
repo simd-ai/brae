@@ -23,8 +23,6 @@
 #                            fvSolution's `cache { grad(U); }`: with no closure to form grad(U), the UEqn's
 #                            first request would form and store it, and brae refuses that (the order of
 #                            UEqn.H's operands is not modelled)
-#   rasDevice                (`rasDevice` only) `ras` with the one thing the DEVICE loop does not carry
-#                            yet staged to what it does: the cache stripped. It goes with that unit.
 #
 # MEASURED, ten steps, OpenFOAM's one-ulp floor beside each (the same run with ONE interface cell's alpha
 # moved by one ulp, OpenFOAM against OpenFOAM):
@@ -55,11 +53,14 @@
 #            2.8e-14 and the alpha step leaves 8.0e-12, whichever consumer is switched off on both loops);
 #            OpenFOAM against itself with every water cell one ulp off reads alpha 1.1e-10, p_rgh 2.8e-10 by
 #            the tenth. Bounds in the gate, DEV_BOUND_*.
-#   rasDevice DEVICE  kOmegaSST on the GPU with the local step, the tutorial's linearUpwind limitedGrad and
-#            its rough hull (nutkRoughWallValue, history = the wall nut as correctNut is entered). ONE step,
-#            the host arm's bounds and digits: k 6.7e-14, omega 4.0e-13, nut 4.7e-13, the hull's wall nut
-#            1.7e-12. TEN: alpha 4.3e-10, p_rgh 2.3e-08, U 4.5e-10, k 4.0e-10, omega 2.8e-10, nut 2.9e-10, the
-#            wall nut 3.7e-09, every count OpenFOAM's. The first k solve's initial residual is 1.0e-08 from
+#   ras DEVICE  THE TUTORIAL AS SHIPPED on the GPU: kOmegaSST with the local step, the closure's linearUpwind
+#            limitedGrad, the rough hull (nutkRoughWallValue, history = the wall nut as correctNut is entered),
+#            outletPhaseMeanVelocity and the cached grad(U) (DeviceGradUCache: validate()'s uploaded, then each
+#            correct's re-formed, consumed by every assembly -- counted, 10 of 10). ONE step, the host arm's
+#            bounds and digits against OpenFOAM's CACHED run: U 6.1e-13, k 6.7e-14, omega 4.0e-13, nut 4.7e-13,
+#            the hull's wall nut 1.7e-12 (OpenFOAM's own cached-vs-uncached gap is U 2.0e-06 there). TEN: alpha
+#            6.9e-10, p_rgh 2.3e-08, U 4.5e-10, k 4.0e-10, omega 2.8e-10, nut 2.9e-10, the wall nut 3.7e-09, the
+#            outlet 1.0e-08, every count OpenFOAM's. The first k solve's initial residual is 1.0e-08 from
 #            OpenFOAM's on the device arm only: k starts uniform, so normFactor carries a pure round-off term
 #            (see the gate). The rough formula is not bit-identical to the host's: libdevice's pow/sin/log are
 #            not glibc's (nut_wall_function.cuh has the measurement).
@@ -92,7 +93,7 @@
 #                   to fail (a consumer switched off on one loop only reads alpha 1.3e+01, U 4.5e+00 and p_rgh
 #                   1.8e-01 after ONE step against the host arm; the outlet frozen, its outlet 2.7e-02, and
 #                   updated in the lagged corrector, U 1.5e-05, after three steps against a 6.3e-11 run)
-#   rasDevice DEVICE  three steps against a run reading the wall nut 9.4e-11:
+#   ras DEVICE  three steps against a run reading the wall nut 9.4e-11, U 1.1e-10:
 #            BRAE_CONTROL_LTS_SCALAR=turbulence  k 1.1e+01, omega 1.1e+00
 #            BRAE_CONTROL_SST_LU_OFF / _UNLIMITED  k 9.6e-03 / 2.3e-02 (the host arm's digits)
 #            BRAE_CONTROL_NUTK_SMOOTH_DEVICE      the hull smooth on THIS closure only -- not the validate()
@@ -101,6 +102,14 @@
 #            BRAE_CONTROL_NUTKROUGH_NOHISTORY     wall nut 4.6e-01, U 3.2e-04 -- a DEVICE witness on DTCHull:
 #                                                 the file's hull nut 5e-07 is below nu_w, so validate()'s
 #                                                 limiter reads nu_w with or without the history
+#            BRAE_CONTROL_GRADU_UNCACHED          U 1.8e-05, k 2.6e-03, nut 2.3e-02 -- the host arm's digits --
+#                                                 and 0 of 3 assemblies took the cache
+#            BRAE_CONTROL_GRADU_STALE             the cache never re-formed after the closure, so every step
+#                                                 reuses validate()'s: U 5.6e-01, nut 6.1e-01, 3 of 3 took it --
+#                                                 the DEVICE-formed half, which step one never reads
+#            NOT WITNESSED, measured: BRAE_CONTROL_GRADU_BND_LIVE (the cached cells, the dev2 term's boundary
+#            rebuilt at the assembly) reads the plain run's numbers to 5e-04 of themselves (wall nut 9.3988e-11
+#            against 9.3941e-11) -- DTCHull cannot tell the boundary's instant, so it is not in the list below.
 #
 # NOT CLAIMED: the cached grad(U) under a laminar, kEpsilon or LES closure, MRF, or with U changed since
 # the closure last formed it (refused: the UEqn would form it itself), on a refining mesh (refused: OpenFOAM
@@ -112,9 +121,9 @@
 # refining mesh or under kEpsilon (refused), and both on the device (refused), fvc::spread and fvc::sweep (refused: DTCHull sets both iteration counts to 0),
 # a restart (setRDeltaT damps from the third step of EVERY run, and a restart's rhoPhi is rebuilt as
 # interpolate(rho)*phi -- not a continuation of the continuous run), kEpsilon and LES under localEuler
-# (refused), and anything after ten steps. On the DEVICE loop:
-# the cached grad(U) on a static mesh (refused, hence `rasDevice`), a device-side setRDeltaT (the host forms it -- its smoothing is a
-# FaceCellWave -- and the loop uploads it and interpolate(rDeltaT) each step).
+# (refused), and anything after ten steps. On the DEVICE loop: the cached grad(U) beside a limited or
+# least-squares grad(U) or a coupled pair on a static mesh (refused), a device-side setRDeltaT (the host forms
+# it -- its smoothing is a FaceCellWave -- and the loop uploads it and interpolate(rDeltaT) each step).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_dtchull_vs_openfoam"
@@ -205,13 +214,6 @@ if profile == 'laminar':
     t, k = re.subn(r'simulationType\s+RAS;', 'simulationType  laminar;', t)
     assert k == 1, 'simulationType'
     open(tp, 'w').write(t)
-if profile == 'rasDevice':
-    # the one thing the device loop does not carry yet, staged to what it does: fvSolution's cache stripped
-    fv = os.path.join(d, 'system/fvSolution')
-    t = open(fv).read()
-    t, k = re.subn(r'\ncache\s*\{[^}]*\}\s*', '\n', t)
-    assert k == 1, 'the cache block'
-    open(fv, 'w').write(t)
 if profile == 'ras':
     fs = os.path.join(d, 'system/fvSchemes')
     t = open(fs).read()
@@ -255,8 +257,6 @@ do
     echo "== [$p]"
     "$BIN" "$W/$p" "$W/$p" "$STEPS" "$W/$p/log.interFoam" $MODE || rc=1
 done
-# `rasDevice` is the device arm's alone: the host arm is gated on `ras`, as the tutorial ships it
-stage rasDevice || { echo "interfoam_dtchull_vs_openfoam: staging failed"; exit 1; }
 # THE DEVICE ARM, on `laminar`: all STEPS steps at its own bounds, and ONE step at the host arm's --
 # every localEuler consumer and the outlet have run by then and nothing has amplified (DEV_BOUND_* in the gate)
 echo "== [laminar device]"
@@ -277,17 +277,18 @@ do
     control ras "$ctl" || rc=1
 done
 
-# ...and kOmegaSST under the local step on the GPU, on `rasDevice`: ten steps at the device bounds, one at
-# the host's (the closure's residuals keep DEV_BOUND_TURB_RESIDUAL there too -- see the gate)
-echo "== [rasDevice device]"
-"$BIN" "$W/rasDevice" "$W/rasDevice" "$STEPS" "$W/rasDevice/log.interFoam" $MODE device || rc=1
-awk '/^Flow time scale min\/max/ { if (++k > 1) exit } { print }' "$W/rasDevice/log.interFoam" > "$W/log.one"
-echo "== [rasDevice device, one step]"
-"$BIN" "$W/rasDevice" "$W/rasDevice" 1 "$W/log.one" $MODE device || rc=1
+# ...and the tutorial AS SHIPPED on the GPU, `ras`: ten steps at the device bounds, one at the host's (the
+# closure's residuals keep DEV_BOUND_TURB_RESIDUAL there too -- see the gate)
+echo "== [ras device]"
+"$BIN" "$W/ras" "$W/ras" "$STEPS" "$W/ras/log.interFoam" $MODE device || rc=1
+awk '/^Flow time scale min\/max/ { if (++k > 1) exit } { print }' "$W/ras/log.interFoam" > "$W/log.one"
+echo "== [ras device, one step]"
+"$BIN" "$W/ras" "$W/ras" 1 "$W/log.one" $MODE device || rc=1
 for ctl in BRAE_CONTROL_LTS_SCALAR=turbulence BRAE_CONTROL_SST_LU_OFF=1 BRAE_CONTROL_SST_LU_UNLIMITED=1 \
-           BRAE_CONTROL_NUTK_SMOOTH_DEVICE=1 BRAE_CONTROL_NUTKROUGH_NOHISTORY=1
+           BRAE_CONTROL_NUTK_SMOOTH_DEVICE=1 BRAE_CONTROL_NUTKROUGH_NOHISTORY=1 BRAE_CONTROL_GRADU_UNCACHED=1 \
+           BRAE_CONTROL_GRADU_STALE=1
 do
-    control rasDevice "$ctl" device || rc=1
+    control ras "$ctl" device || rc=1
 done
 
 # ...and the device loop's own consumers, each switched off in turn: the same controls, the GPU loop

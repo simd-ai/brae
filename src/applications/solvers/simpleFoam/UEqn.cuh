@@ -41,6 +41,7 @@
 #include "UEqn_cpp.cuh"   // cpu::DivScheme -- one enum shared by both paths
 
 namespace brae {
+struct GradUMemo;   // device_kepsilon.cuh
 namespace gpu {
 
 // The device momentum matrix, in the reference's decomposition.
@@ -103,6 +104,16 @@ struct MomentumInput
     // values. They did not until laminar/damBreakPermeable, where a wall face going dry moves the
     // patch's coefficients at the assembly while its stored value stays a wall's.
     const DeviceBuffer<scalar>* const* UbStored = nullptr;
+    // fvSolution's `cache { grad(U); }` (interFoam): the registry's grad(U), formed EARLIER -- at the last
+    // closure call, or validate() -- which every site asking for the NAME grad(U) takes in place of forming
+    // one: linearUpwind's correction, the V schemes' limiter, the corrected laplacian's fullGradCorrection
+    // and the dev2 term (gradScheme.C:120-160; the host's InterMomentumInput::gradUCached). The memo form
+    // feeds the first three; the dev2 term takes the packed tensor and the boundary gaussGrad corrected when
+    // it was formed (deviceDivDevReff's gradUGiven/gradBGiven). All three or none; refused beside a pair or
+    // a limited or least-squares grad(U). Null forms each at its site, as every other caller does.
+    const GradUMemo*            gradUGivenMemo   = nullptr;
+    const DeviceBuffer<scalar>* gradUGivenTensor = nullptr;
+    const DeviceBuffer<scalar>* gradBGiven       = nullptr;
 
     const DeviceBuffer<scalar>* ddtRho    = nullptr;
     const DeviceBuffer<scalar>* ddtRhoOld = nullptr;

@@ -72,7 +72,17 @@ void deviceDivDevReff(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                       // OpenFOAM is 6.5e-07 either way, but at nu = 1e-3 -- the size of a turbulent nut --
                       // it is 4.7e-04 unlimited against 6.7e-08 limited. A factor of 7000.
                       scalar gradULimitK = 0.0,
-                      bool gradULeastSq = false);   // grad(U)'s base scheme (see device_divdevreff.cu)
+                      bool gradULeastSq = false,    // grad(U)'s base scheme (see device_divdevreff.cu)
+                      // A grad(U) formed EARLIER, in place of forming one here: fvSolution's
+                      // `cache { grad(U); }` makes fvc::grad(U) return the registry's field while U's eventNo
+                      // has not moved (gradScheme.C:120-160), cells AND the boundary gaussGrad corrected when
+                      // it was formed (gaussGrad.C:137-167) -- the host's divDevReffExplicit gradUGiven /
+                      // gradUBndGiven. gradUGiven is 9*nC in this function's packing ([(d*3+i)*nC + c], column
+                      // i = gaussGrad(U_i)), gradBGiven 9*nBndFaces in gradBKernel's. Both or neither; refused
+                      // beside a coupled interface, a limited or least-squares grad(U) (the given field already
+                      // carries whatever the scheme did). Null forms it here, as every other caller does.
+                      const DeviceBuffer<scalar>* gradUGiven = nullptr,
+                      const DeviceBuffer<scalar>* gradBGiven = nullptr);
 
 // Exported for the Maxwell model and for generalizedNewtonian's strainRate -- see the definitions in
 // device_divdevreff.cu. UbStored: U's STORED boundary values, one buffer per component, for a caller that

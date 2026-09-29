@@ -98,12 +98,12 @@ constexpr scalar DEV_BOUND_U = 1e-8;
 constexpr scalar DEV_BOUND_P_RESIDUAL = 2e-6;
 constexpr scalar DEV_BOUND_ALPHA_RESIDUAL = 2e-8;
 constexpr scalar DEV_BOUND_U_OUTLET = 5e-8;
-// ...and on `rasDevice` (the `ras` profile with the cache stripped -- the one thing the device loop does not
-// carry yet), kOmegaSST taking the local step on the GPU under the tutorial's own `linearUpwind limitedGrad`
-// and its rough hull. ONE step, host bounds: k 6.7e-14, omega 4.0e-13, nut 4.7e-13, the hull's wall nut
-// 1.7e-12 -- the host arm's digits (k starts uniform, so step one cannot see linearUpwind; the controls can).
-// TEN: alpha 4.3e-10, p_rgh 2.3e-08, U 4.5e-10, k 4.0e-10, omega 2.8e-10, nut 2.9e-10, the hull's wall nut
-// 3.7e-09, every count OpenFOAM's. The wall nut sat at 4.2e-09 with the hull staged SMOOTH as well, and
+// ...and on `ras`, THE TUTORIAL AS SHIPPED on the GPU -- kOmegaSST taking the local step under its own
+// `linearUpwind limitedGrad`, its rough hull, its outlet and its cached grad(U) -- against OpenFOAM's CACHED run.
+// ONE step, host bounds: U 6.1e-13, k 6.7e-14, omega 4.0e-13, nut 4.7e-13, the hull's wall nut 1.7e-12 -- the
+// host arm's digits (k starts uniform, so step one cannot see linearUpwind; the controls can). TEN: alpha
+// 6.9e-10, p_rgh 2.3e-08, U 4.5e-10, k 4.0e-10, omega 2.8e-10, nut 2.9e-10, the hull's wall nut 3.7e-09, every
+// count OpenFOAM's. The wall nut sat at 4.2e-09 with the hull staged SMOOTH as well, and
 // libdevice's pow/sin/log leave the rough formula at most 1.5e-13 per face from the host's: the spread is
 // the device loop's CMULES amplification, not the wall function's.
 constexpr scalar DEV_BOUND_K = 1e-9;
@@ -276,6 +276,18 @@ int main(
         ss << fs.rdbuf();
         const bool caseCaches = std::regex_search(ss.str(), std::regex(R"(\ncache\s*\{[^}]*grad\(U\);)"));
         check("brae caches grad(U) exactly where the case's fvSolution does", fin.gradUCache.on == caseCaches);
+        // ...and on the DEVICE arm, that its assemblies CONSUMED the cache: every one, or none under the gate's
+        // control. Without it a pass against OpenFOAM's cached oracle could come from a path that never read it.
+        if (deviceArm && caseCaches)
+        {
+            const bool uncachedControl = std::getenv("BRAE_CONTROL_GRADU_UNCACHED") != nullptr;
+            const long expected = uncachedControl ? 0L
+                                : static_cast<long>(r.steps) * static_cast<long>(fin.pimple.nOuterCorrectors);
+            std::printf("  device assemblies that took the cached grad(U): %ld of %ld\n", r.gradUCacheConsumed,
+                        static_cast<long>(r.steps) * static_cast<long>(fin.pimple.nOuterCorrectors));
+            check("...and the device arm's momentum assemblies consumed it, every one (none under the control)",
+                  r.gradUCacheConsumed == expected);
+        }
     }
 
     // setRDeltaT.H's Info lines against OpenFOAM's, step by step

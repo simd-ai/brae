@@ -170,16 +170,40 @@ RunReport runInterFoamDevice(
     if (opmvIgnoreLag)
         std::printf("  *** CONTROL MODE: outletPhaseMeanVelocity is updated in the lagged first corrector. "
                     "This run is deliberately wrong. ***\n");
-    // fvSolution's `cache { grad(U); }`: the host loop reuses the closure's grad(U) at the next UEqn, as
-    // OpenFOAM's registry does; this loop forms every one afresh, which is OpenFOAM's UNCACHED answer --
-    // and OpenFOAM's answer outright on a motion-solver mesh, which is changing() from its first update on,
-    // so gradScheme bypasses the registry at every step (RAS/electrostaticDeposition, gated on this loop by
-    // interfoam_moving_vs_openfoam `esd`). A static mesh, or a refining one, would reuse it: refused.
-    const bool cacheInert = f.dynamicMesh && !(f.amr && f.amr->active);
-    if (f.gradUCache.on && !cacheInert)
+    // fvSolution's `cache { grad(U); }`: this loop reuses the closure's grad(U) at the next UEqn as the host
+    // loop does (DeviceGradUCache, device_inter_step.cuh) -- uploaded from the host's validate() at the start,
+    // re-formed after each kOmegaSST correct, bypassed while the mesh changes. On a motion-solver mesh, changing()
+    // from its first update on, gradScheme bypasses the registry at every step (RAS/electrostaticDeposition,
+    // interfoam_moving_vs_openfoam `esd`). REFUSED: a refining mesh (the host loop's own refusal), and on a STATIC
+    // mesh, where the cache is live, a limited or least-squares grad(U) or a coupled pair -- the cached field is
+    // formed unlimited Gauss on an uncoupled mesh here, and the assembly's sites skip what it was formed without.
+    if (f.gradUCache.on && f.amr && f.amr->active)
         throw std::runtime_error(
-            "brae interFoam (device): fvSolution caches grad(U). The host loop carries OpenFOAM's reuse of it; "
-            "the device loop does not. Run without -device.");
+            "brae interFoam: fvSolution caches grad(U) on a refining mesh. OpenFOAM bypasses and deletes the "
+            "cached field on the steps the mesh changes (gradScheme.C:132-142) and reuses it on the others; "
+            "that is not ported.");
+    if (f.gradUCache.on && !f.dynamicMesh && (f.gradULimitK > 0 || f.gradULeastSq))
+        throw std::runtime_error(
+            "brae interFoam (device): fvSolution caches grad(U) and gradSchemes' grad(U) is limited or least-squares. "
+            "The device loop caches an unlimited Gauss grad(U) only; the host loop carries the rest. Run without "
+            "-device.");
+    // GATE CONTROL, the host loop's, never set by a solver: every grad(U) formed afresh -- OpenFOAM's UNCACHED
+    // answer. WRONG where the case caches it.
+    const bool gradUUncached = std::getenv("BRAE_CONTROL_GRADU_UNCACHED") != nullptr;
+    if (gradUUncached)
+        std::printf("  *** CONTROL MODE: fvSolution's cached grad(U) is formed afresh at every site. This run is "
+                    "deliberately wrong. ***\n");
+    // ...and two that isolate the DEVICE-formed half, which only steps 2 onward read: STALE never re-forms it after
+    // the closure (every step reuses validate()'s), BND_LIVE takes the cached cells but rebuilds the dev2 term's
+    // boundary at the assembly from the patches as they stand then. Both WRONG.
+    const bool gradUStale = std::getenv("BRAE_CONTROL_GRADU_STALE") != nullptr;
+    if (gradUStale)
+        std::printf("  *** CONTROL MODE: the cached grad(U) is never re-formed after the closure. This run is "
+                    "deliberately wrong. ***\n");
+    const bool gradUBndLive = std::getenv("BRAE_CONTROL_GRADU_BND_LIVE") != nullptr;
+    if (gradUBndLive)
+        std::printf("  *** CONTROL MODE: the cached grad(U)'s boundary is rebuilt at the assembly. This run is "
+                    "deliberately wrong. ***\n");
     // THE PAIR, built here and not at the device-mesh stage, because the hooks below fill its share of
     // the surface fields and they are defined before the DeviceCyclic is.
     // ...INCLUDING a cyclicACMI the caller has coupled as a coincident pair (cpu::cyclicACMI::setup):
@@ -187,6 +211,16 @@ RunReport runInterFoamDevice(
     // does not sync its limiter across it (CyclicInterface::ami).
     const std::vector<CyclicInterface> cyclics =
         buildCyclicInterfaces(m, g, fvp, /*includeCoupledACMI=*/true);
+    // ...ANY coupled patch -- a cyclic, a cyclicACMI or a cyclicAMI pair alike: the cached field is formed without
+    // the pair's contribution and the dev2 term's given boundary has no pair half
+    for (std::size_t pi = 0; pi < fvp.size() && f.gradUCache.on && !f.dynamicMesh; ++pi)
+    {
+        if (fvp[pi].coupled)
+            throw std::runtime_error(
+                "brae interFoam (device): fvSolution caches grad(U) on a mesh with the coupled patch `" + fvp[pi].name
+                + "`. The device loop caches grad(U) on an uncoupled mesh only; the host loop carries the pair. Run "
+                "without -device.");
+    }
     // A COUPLED PATCH THAT IS NOT IN THAT LIST WOULD BE IN NOTHING: the device mesh and every boundary
     // flatten skip the coupled types (device_mesh.cuh:41-44), so its faces would be neither boundary
     // nor interface, silently. A cyclicAMI coupled by a harness is the live case; refused by name.
@@ -686,6 +720,8 @@ RunReport runInterFoamDevice(
     // localEuler's per-cell rDeltaT, uploaded each step from the host setRDeltaT, and ddtCorr's face field
     // interpolate(rDeltaT) beside it; empty otherwise
     DeviceBuffer<scalar> dRDeltaT, dRDeltaTfI, dRDeltaTfB;
+    // fvSolution's cached grad(U) on this loop -- see DeviceGradUCache
+    DeviceGradUCache dGradUCache;
     // ...U's among them. U's patches are EVALUATED on the host too (the updateUBoundary hook), told their
     // flux by pushFlux -- and with U the only one naming rhoPhi, this used to leave the host's rhoPhi at the
     // value it started the run with: MEASURED on laminar/damBreak with U alone naming it, device U 2.6e-07
@@ -1628,6 +1664,41 @@ RunReport runInterFoamDevice(
     C.rDeltaTUEqn = (f.lts && !ltsScalar.count("ueqn")) ? &dRDeltaT : nullptr;
     C.rDeltaTfInt = (f.lts && !ltsScalar.count("ddtcorr")) ? &dRDeltaTfI : nullptr;
     C.rDeltaTfBnd = (f.lts && !ltsScalar.count("ddtcorr")) ? &dRDeltaTfB : nullptr;
+    // fvSolution's cached grad(U): the host's field packed for the device -- validate() ran on the host, so the
+    // registry the first assembly reuses is that one, and so is what the host-closure instrument leaves
+    auto uploadHostGradU = [&]()
+    {
+        const std::size_t n = static_cast<std::size_t>(nC);
+        std::vector<scalar> t9(9*n);
+        for (std::size_t c = 0; c < n; ++c)
+        {
+            const scalar* q = &f.gradUCache.cells[c].xx;
+            for (int k = 0; k < 9; ++k) t9[static_cast<std::size_t>(k)*n + c] = q[k];
+        }
+        std::size_t nB = 0;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            if (!isCoupledInterfaceType(fvp[pi].type)) nB += static_cast<std::size_t>(fvp[pi].size);
+        std::vector<scalar> b9(9*nB);
+        std::size_t b = 0;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            for (label i = 0; i < fvp[pi].size; ++i, ++b)
+            {
+                const scalar* q = &f.gradUCache.bnd[pi][static_cast<std::size_t>(i)].xx;
+                for (int k = 0; k < 9; ++k) b9[static_cast<std::size_t>(k)*nB + b] = q[k];
+            }
+        }
+        deviceSetGradU(dGradUCache, t9, b9, nC);
+    };
+    dGradUCache.on = f.gradUCache.on;
+    C.gradUCache = dGradUCache.on ? &dGradUCache : nullptr;
+    C.gradUUncachedControl = gradUUncached;
+    C.gradUBndLiveControl = gradUBndLive;
+    if (dGradUCache.on && f.gradUCache.valid)
+    {
+        uploadHostGradU();
+    }
     C.alphaInput.alphaScheme  = alphaScheme(f.divPhiAlpha, "div(phi,alpha)");
     C.alphaInput.alpharScheme = alphaScheme(f.divPhirbAlpha, "div(phirb,alpha)");
     // ...and the gradient each limiter reads, by the field's OWN gradSchemes entry, as the host hands
@@ -2978,6 +3049,8 @@ RunReport runInterFoamDevice(
                 C.phiUfOldInt = &dPhiUfOld;
             }
 
+            // mesh().changing() this step: the registry is bypassed and deleted (gradScheme.C:132-142)
+            C.gradUMeshChanging = dyn && dyn->moving();
             deviceInterStep(dm, rep.deltaT, C, props, H, dGh, dGhf, dMagSf,
                             dA, dAOld, dUx, dUy, dUz, dUox, dUoy, dUoz,
                             dUobx, dUoby, dUobz,
@@ -3091,6 +3164,33 @@ RunReport runInterFoamDevice(
                                 (long)dTurb.nut.size(), (long)dTurb.nutBnd.size());
                 }
                 deviceCorrectInterTurbulence(dTurb, f.turbulence, ti, dm, dbU);
+                // ...and "Updating grad(U)": kOmegaSST's correct forms it, and a caching case keeps it -- the host
+                // loop's re-formation after the closure (inter_turbulence_cpp.cu), from U as it stands and its
+                // STORED patch values (f.U's, which the step's last U hook wrote). Not on a changing mesh, where
+                // OpenFOAM forms and does not keep it.
+                if (dGradUCache.on && f.turbulence.model == cpu::interFoam::InterRasModel::KOmegaSST
+                 && !f.turbulence.frozen && !(dyn && dyn->moving()) && gradUStale)
+                {
+                    dGradUCache.valid = true;   // the control: validate()'s field, kept
+                }
+                else if (dGradUCache.on && f.turbulence.model == cpu::interFoam::InterRasModel::KOmegaSST
+                 && !f.turbulence.frozen && !(dyn && dyn->moving()))
+                {
+                    std::vector<scalar> bx, by, bz;
+                    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                    {
+                        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                        for (const vector& u : f.U.boundary[pi]->value())
+                        {
+                            bx.push_back(u.x);
+                            by.push_back(u.y);
+                            bz.push_back(u.z);
+                        }
+                    }
+                    DeviceBuffer<scalar> sbx(bx), sby(by), sbz(bz);
+                    const DeviceBuffer<scalar>* sb[3] = {&sbx, &sby, &sbz};
+                    deviceStoreGradU(dGradUCache, dm, dbU, dUx, dUy, dUz, sb);
+                }
                 if (std::getenv("BRAE_AMR_TRACE"))
                 {
                     std::vector<scalar> tk, tn;
@@ -3172,9 +3272,16 @@ RunReport runInterFoamDevice(
                 ti.omegaLog = &rep.omegaSolves;
                 ti.epsilonLog = &rep.epsilonSolves;
                 ti.kLog = &rep.kSolves;
-                // refused above when the case caches grad(U), so this registry is never live
+                // the host closure fills the host registry; the device assembly reads its own copy of it
                 ti.gradUCache = &f.gradUCache;
                 correctInterTurbulence(f.turbulence, ti, m, g, fvp);
+                // only when THIS call formed it: a frozen closure returns before its store, and the host flag
+                // still says valid from validate() -- this loop never clears it (review finding)
+                if (dGradUCache.on && f.turbulence.model == cpu::interFoam::InterRasModel::KOmegaSST
+                 && !f.turbulence.frozen && !(dyn && dyn->moving()))
+                {
+                    uploadHostGradU();
+                }
             }
             }   // pimple.turbCorr()
 
@@ -3314,6 +3421,7 @@ RunReport runInterFoamDevice(
     (void)nFaces;
     (void)nBf;
     if (fieldsOut) *fieldsOut = std::move(f);
+    rep.gradUCacheConsumed = dGradUCache.consumed;
     return rep;
 }
 

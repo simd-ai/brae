@@ -61,6 +61,17 @@ void refuseUnsupported(const MomentumInput& in)
                 "builds Gauss (deviceGradUShared). Only the dev2 term takes leastSquares here. Refusing "
                 "rather than run a second gradient.");
     }
+    // the registry's cached grad(U): all three forms or none, and only where the given field is what each site
+    // would have taken -- an uncoupled mesh and an unlimited Gauss grad(U), since the sites skip the pair's
+    // contribution and the limiter the field was formed without (MomentumInput::gradUGivenMemo)
+    const bool anyGiven = in.gradUGivenMemo || in.gradUGivenTensor || in.gradBGiven;
+    if (anyGiven && !(in.gradUGivenMemo && in.gradUGivenTensor && in.gradBGiven))
+        throw std::runtime_error(
+            "UEqn(cuda): a cached grad(U) needs its memo form, its packed tensor and its boundary; the caller gave "
+            "some of them.");
+    if (anyGiven && (in.cyc || in.gradULimitK > 0.0 || in.gradUSchemeLimitK > 0.0 || in.gradUSchemeLeastSq))
+        throw std::runtime_error(
+            "UEqn(cuda): a cached grad(U) is carried on an uncoupled mesh with an unlimited Gauss grad(U) only.");
 }
 
 } // namespace
@@ -154,7 +165,7 @@ void assembleUEqn(
             // the kernel selects by the sentinel (device_mesh.cuh, kVanLeerTwoByk).
             const DeviceBuffer<scalar>* Usrc[3] = {&Ux, &Uy, &Uz};
             DeviceBuffer<scalar> Uarr[3], gx[3], gy[3], gz[3];
-            const GradUMemo& gm = deviceGradUShared(dm, dbU, Ux, Uy, Uz, in.UbStored);   // grad(U) at this U, once (item 65)
+            const GradUMemo& gm = in.gradUGivenMemo ? *in.gradUGivenMemo : deviceGradUShared(dm, dbU, Ux, Uy, Uz, in.UbStored);   // grad(U) at this U, once (item 65)
             for (int k = 0; k < 3; ++k)
             {
                 deviceCopy(Uarr[k], *Usrc[k]);
@@ -276,7 +287,10 @@ void assembleUEqn(
                      // limiter never reached the dev2 term on this driver -- the legacy one has passed
                      // it since device_simple_foam.cu.
                      in.gradUSchemeLimitK,
-                     in.gradUSchemeLeastSq);
+                     in.gradUSchemeLeastSq,
+                     // ...or the registry's cached grad(U), cells and boundary (MomentumInput::gradBGiven)
+                     in.gradUGivenTensor,
+                     in.gradBGiven);
 
     // ---- explicit non-orthogonal correction --------------------------------------------------
     // AFTER divDevReff, which ASSIGNS the source (device_divdevreff.cu: `dX[c] = d[0]`) rather than
@@ -290,7 +304,7 @@ void assembleUEqn(
     {
         const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
         DeviceBuffer<scalar> gxc[3], gyc[3], gzc[3];
-        const GradUMemo& gm = deviceGradUShared(dm, dbU, Ux, Uy, Uz, in.UbStored);       // the same grad(U) as the sites below
+        const GradUMemo& gm = in.gradUGivenMemo ? *in.gradUGivenMemo : deviceGradUShared(dm, dbU, Ux, Uy, Uz, in.UbStored);       // the same grad(U) as the sites below
         for (int k = 0; k < 3; ++k)
         {
             deviceCopy(gxc[k], gm.gx[k]);
@@ -343,7 +357,7 @@ void assembleUEqn(
     {
         const DeviceBuffer<scalar>* Usrc[3] = {&Ux, &Uy, &Uz};
         DeviceBuffer<scalar> gx[3], gy[3], gz[3], cx, cy, cz;
-        const GradUMemo& gm = deviceGradUShared(dm, dbU, Ux, Uy, Uz, in.UbStored);
+        const GradUMemo& gm = in.gradUGivenMemo ? *in.gradUGivenMemo : deviceGradUShared(dm, dbU, Ux, Uy, Uz, in.UbStored);
         for (int k = 0; k < 3; ++k)
         {
             deviceCopy(gx[k], gm.gx[k]);
@@ -369,7 +383,7 @@ void assembleUEqn(
     if (corrFac != 0.0)
     {
         const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
-        const GradUMemo& gm = deviceGradUShared(dm, dbU, Ux, Uy, Uz, in.UbStored);
+        const GradUMemo& gm = in.gradUGivenMemo ? *in.gradUGivenMemo : deviceGradUShared(dm, dbU, Ux, Uy, Uz, in.UbStored);
         // ALL THREE components' gradients are built first, because the pair's correction reconstructs
         // the neighbour in the NEIGHBOUR's frame: on a rotational cyclic the component that comes back
         // is forwardT . (gradU[nbr] . dNbr), which mixes all three (device_cyclic.cuh). Per-component

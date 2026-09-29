@@ -40,6 +40,7 @@
 #include "device_inter_ueqn.cuh"
 #include "UEqn.cuh"
 #include "pEqn.cuh"
+#include "grad_u_memo.cuh"   // GradUMemo
 #include <functional>
 
 namespace brae {
@@ -211,6 +212,43 @@ struct DeviceInterCrankNicolson
     DeviceBuffer<scalar>*       alphaPhiCreatedIf = nullptr;
 };
 
+// fvSolution's `cache { grad(U); }` on the device loop -- the host's GradUCache (inter_turbulence_cpp.cuh), whose
+// comment has what OpenFOAM does and why it is not the uncached answer. The registry's grad(U) in the three forms
+// the assembly's sites read (MomentumInput::gradUGivenMemo): per component for linearUpwind's correction, the V
+// schemes' limiter and the corrected laplacian; packed for the dev2 term, with the boundary gaussGrad corrected
+// WHEN THE FIELD WAS FORMED. Filled at the host loop's instants -- validate() (uploaded from the host, which runs
+// it) and each kOmegaSST correct (deviceStoreGradU) -- and consumed at the assembly while `valid`.
+struct DeviceGradUCache
+{
+    bool on = false;
+    bool valid = false;
+    GradUMemo memo;
+    DeviceBuffer<scalar> tensor;   // 9*nC, deviceDivDevReff's packing [(d*3+i)*nC + c]
+    DeviceBuffer<scalar> bnd;      // 9*nBndFaces, gradBKernel's packing [q*nB + b]
+    // assemblies that took it: the gate's witness that the arm consumed the cache at all
+    long consumed = 0;
+};
+
+// Form the cache from U as it stands and U's STORED patch values -- the host's storeGradU after kOmegaSST's
+// correct: the unlimited Gauss gradient (deviceGaussGradFused, bit-identical to the assembly's own) and its
+// boundary through deviceBoundaryGradU against dbU's snGrad now. Sets `valid`.
+void deviceStoreGradU(
+    DeviceGradUCache& c,
+    const DeviceMesh& dm,
+    const DeviceVectorBoundary& dbU,
+    const DeviceBuffer<scalar>& Ux,
+    const DeviceBuffer<scalar>& Uy,
+    const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>* const* UbStored);
+
+// ...or take one formed on the HOST (validate() runs there on this loop): `tensor9` 9*nC and `bnd9` 9*nBndFaces,
+// both in the packings above. Sets `valid`.
+void deviceSetGradU(
+    DeviceGradUCache& c,
+    const std::vector<scalar>& tensor9,
+    const std::vector<scalar>& bnd9,
+    int nC);
+
 struct DeviceInterStepControls
 {
     // CrankNicolson, or null for Euler -- see DeviceInterCrankNicolson
@@ -221,6 +259,15 @@ struct DeviceInterStepControls
     // ...and ddtCorr's face field, interpolate(rDeltaT) on internal and boundary faces. Both or neither.
     const DeviceBuffer<scalar>* rDeltaTfInt = nullptr;
     const DeviceBuffer<scalar>* rDeltaTfBnd = nullptr;
+    // fvSolution's cached grad(U) (null when the case caches nothing), whether the mesh changes this step
+    // (gradScheme bypasses and deletes the registry field then, gradScheme.C:132-142), and the gate's control
+    // BRAE_CONTROL_GRADU_UNCACHED (every site forms its own, OpenFOAM's UNCACHED answer). The step consumes
+    // the cache at its assembly and invalidates it once U has changed (after the correctors).
+    DeviceGradUCache* gradUCache = nullptr;
+    bool gradUMeshChanging = false;
+    bool gradUUncachedControl = false;
+    // ...and BRAE_CONTROL_GRADU_BND_LIVE: the cached cells, the dev2 boundary rebuilt at the assembly. WRONG.
+    bool gradUBndLiveControl = false;
     // the cell volumes the mesh had BEFORE this step's move, for the ddt's old-time term
     // (OF EulerDdtScheme: rho.oldTime()*U.oldTime()*Vsc0()). Null on a static mesh.
     const DeviceBuffer<scalar>* V0 = nullptr;

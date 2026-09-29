@@ -483,8 +483,10 @@ arm opmv_dry                refused "no \`alpha.water\` on the patch" "" "${OPMV
 # below; gated by tests/interfoam_dtchull_vs_openfoam.sh `ras`): the closure's validate and correct form
 # grad(U) and the next UEqn reuses it, as OpenFOAM's registry does. REFUSED where the assembly would have
 # to form and store it itself -- laminar here, kEpsilon beside the RAS base -- because which of UEqn.H's
-# operands asks first is not modelled; any other cached name, and a pattern key, by name; the device loop
-# (device_gradUCache). An INACTIVE block is OpenFOAM's uncached run and must run whatever it names.
+# operands asks first is not modelled; any other cached name, and a pattern key, by name. The device loop
+# carries it too (device_sstGradUCache runs), with the same stale-cache refusal (device_gradUCache,
+# device_gradUCacheKEpsilon) and its own beside a limited grad(U) or a coupled pair on a static mesh. An INACTIVE
+# block is OpenFOAM's uncached run and must run whatever it names.
 CACHE="printf '\\ncache\\n{\\nCACHESPEC\\n}\\n' >> system/fvSolution"
 arm gradUCache_laminar      refused "U has changed since grad(U) was last formed" "" "${CACHE/CACHESPEC/    grad(U);}"
 arm gradUCache_otherField   refused "names \`grad(p_rgh)\`"  "" "${CACHE/CACHESPEC/    grad(U);\\n    grad(p_rgh);}"
@@ -585,7 +587,7 @@ arm sst_linearUpwindK2      refused "outside [0, 1]"          "" "$SSTBASE; ${LU
 # so each is refused missing; a bare-number Ks is OpenFOAM's own stop (Field.C:213-268). `blending` is read,
 # validated and never used by the class, so any of OpenFOAM's words runs and an unknown one is refused.
 # kEpsilon's closure refuses the type (ras_nutkRough); the device kOmegaSST closure RUNS it (device_sstNutkRough,
-# gated by tests/interfoam_dtchull_vs_openfoam.sh `rasDevice device`).
+# gated by tests/interfoam_dtchull_vs_openfoam.sh `ras device`, the tutorial as shipped).
 ROUGHNUT="sed -i '0,/type  *nutkWallFunction;/ s//type nutkRoughWallFunction; RSPEC/' 0/nut"
 arm sst_nutkRough           runs    -                        "" "$SSTBASE; ${ROUGHNUT/RSPEC/Ks uniform 1e-4; Cs uniform 0.5;}"
 arm sst_nutkRoughBlendMax   runs    -                        "" "$SSTBASE; ${ROUGHNUT/RSPEC/Ks uniform 1e-4; Cs uniform 0.5; blending max;}"
@@ -912,6 +914,9 @@ if [ $HAVE_GPU = 1 ]; then
     # each equation's gammaCell, the solve's interface, and CDkOmega's two gradients), gated on
     # validation/interFoamCyclic `sst`. A blanket refusal coming back fails this arm.
     arm device_baffle_SST   runs    -                              "-device" "$BSST"
+    # ...and the cached grad(U) across the pair is refused on this loop: the device cache is formed on an
+    # uncoupled mesh only
+    arm device_gradUCacheCoupled refused "on a mesh with the coupled patch" "-device" "$BSST; ${CACHE/CACHESPEC/    grad(U);}"
     # ...and, on the HOST, kOmegaSST's linearUpwind across the pair: OpenFOAM adds the correction on
     # coupled faces (linearUpwind.C:98-137), the kOmegaSST closure does not, so the reader refuses it.
     # Here because BSST is.
@@ -964,14 +969,14 @@ if [ $HAVE_GPU = 1 ]; then
     BASE="$B"
     arm device_gradULimited runs    -                           "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
     # localEuler RUNS on the device loop (tests/interfoam_dtchull_vs_openfoam.sh `laminar device`):
-    # setRDeltaT on the host, its consumers on the GPU -- kOmegaSST's two fvm::ddts included (`rasDevice
+    # setRDeltaT on the host, its consumers on the GPU -- kOmegaSST's two fvm::ddts included (`ras
     # device`); kEpsilon and LES under it are refused where the case is read, for both loops
     arm device_localEuler   runs    -                           "-device" "$LTSSET; $LTSZERO"
     BASE="$BR"
     arm device_localEulerSST runs   -                           "-device" "$SSTBASE; $LTSSET; $LTSZERO"
     BASE="$B"
     # kOmegaSST's linearUpwind RUNS on the device closure too (the transport's own correction over the
-    # named cellLimited gradient; tests/interfoam_dtchull_vs_openfoam.sh `rasDevice device`)
+    # named cellLimited gradient; tests/interfoam_dtchull_vs_openfoam.sh `ras device`)
     BASE="$BR"
     arm device_sstLinearUpwind runs  -                          "-device" "$SSTBASE; ${LUGRAD/LIMGRAD/cellLimited Gauss linear 1}; $LUBOTH"
     # nutkRoughWallFunction RUNS on the device kOmegaSST closure, its history the wall nut as correctNut is entered
@@ -981,8 +986,17 @@ if [ $HAVE_GPU = 1 ]; then
     # atmosphere the refusal arms above use is dry, which the class itself refuses (opmv_dry)
     BASE="$B"
     arm device_opmv         runs    -                           "-device" "python3 -c \"import re; p='0/U'; t=open(p).read(); t=re.sub(r'leftWall\\s*\\{[^}]*\\}', 'leftWall { type outletPhaseMeanVelocity; Umean 0.01; alpha alpha.water; value uniform (0 0 0); }', t, count=1); open(p,'w').write(t)\""
-    # the cached grad(U) is reused on the host loop only
-    arm device_gradUCache   refused "fvSolution caches grad(U). The host" "-device" "${CACHE/CACHESPEC/    grad(U);}"
+    # the cached grad(U) needs a closure that forms it: laminar is the stale-cache refusal on both loops
+    arm device_gradUCache   refused "U has changed since grad(U) was last formed" "-device" "${CACHE/CACHESPEC/    grad(U);}"
+    # ...kOmegaSST's validate forms it, so the RAS base made SST RUNS with the cache on this loop too, and kEpsilon's
+    # does not, so that is the same stale-cache refusal as the host loop's
+    BASE="$BR"
+    arm device_sstGradUCache runs   -                           "-device" "$SSTBASE; ${CACHE/CACHESPEC/    grad(U);}"
+    # ...but not beside a LIMITED grad(U) on a static mesh (the least-squares case is the same throw): the device
+    # cache is formed unlimited Gauss, and the host loop carries the rest
+    arm device_gradUCacheLimited refused "is limited or least-squares" "-device" "$SSTBASE; ${CACHE/CACHESPEC/    grad(U);}; sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
+    arm device_gradUCacheKEpsilon refused "U has changed since grad(U) was last formed" "-device" "${CACHE/CACHESPEC/    grad(U);}"
+    BASE="$B"
     BASE="$BR"
     BASE="$B"
     BASE="$B"

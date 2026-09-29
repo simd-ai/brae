@@ -5,6 +5,7 @@
 #include "device_ldu.cuh"
 #include "device_pcg.cuh"
 #include "device_amg.cuh"   // deviceSymGaussSeidel
+#include "device_divdevreff.cuh"   // deviceBoundaryGradU
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdio>
@@ -417,6 +418,40 @@ void deviceInterStep(
     probe("rhoOld", rhoOld);
     if (taps) deviceCopy(taps->ddtRhoOld, rhoOld);
 
+    // fvSolution's cached grad(U), at the host loop's rule (inter_driver_cpp.cu's UEqn stage): MRF's
+    // correctBoundaryVelocity moves U's eventNo (boundaryFieldRef), a changing mesh bypasses the registry, and
+    // where U has changed since the closure formed it OpenFOAM's first request of the assembly would form and
+    // store it for the others, in an operand order not modelled -- refused, in the host's own words.
+    if (ctl.gradUCache && ctl.gradUCache->on)
+    {
+        DeviceGradUCache& gc = *ctl.gradUCache;
+        if ((ctl.mrf && !ctl.mrf->empty()) || ctl.gradUMeshChanging)
+        {
+            gc.valid = false;
+        }
+        if (!ctl.gradUUncachedControl && !ctl.gradUMeshChanging)
+        {
+            if (!gc.valid)
+                throw std::runtime_error(
+                    "brae interFoam: fvSolution caches grad(U), and at this UEqn assembly U has "
+                    "changed since grad(U) was last formed (or nothing formed it: only kOmegaSST's "
+                    "validate and correct do). OpenFOAM's first request in the assembly would form "
+                    "and store it for the others, in an operand order brae does not model.");
+            uin.gradUGivenMemo   = &gc.memo;
+            uin.gradUGivenTensor = &gc.tensor;
+            uin.gradBGiven       = &gc.bnd;
+            ++gc.consumed;
+            if (ctl.gradUBndLiveControl)
+            {
+                // the gate's control: the boundary gaussGrad would give NOW, from the patches as the assembly
+                // left them, in place of the one formed with the field
+                static DeviceBuffer<scalar> liveB;
+                deviceBoundaryGradU(dm, dbU, UX, UY, UZ, gc.tensor, liveB, ubPtr);
+                uin.gradBGiven = &liveB;
+            }
+        }
+    }
+
     gpu::MomentumMatrix UEqn;
     gpu::assembleUEqn(UEqn, dm, dbU, UX, UY, UZ, uin);
     probe("UEqn.diag", UEqn.relaxed ? UEqn.relaxedDiag : UEqn.diag);
@@ -759,6 +794,78 @@ void deviceInterStep(
     probe("p_rgh", p_rgh);
     probe("phi", phiInt);
     probe("U.x", UX);
+    // the predictor's solve and every corrector's `U = HbyA + ...` moved U's eventNo: the cached grad(U) is out of
+    // date until the closure forms it again (the host loop invalidates at the same two points; nothing consumes
+    // in between)
+    if (ctl.gradUCache)
+    {
+        ctl.gradUCache->valid = false;
+    }
+}
+
+
+void deviceStoreGradU(
+    DeviceGradUCache& c,
+    const DeviceMesh& dm,
+    const DeviceVectorBoundary& dbU,
+    const DeviceBuffer<scalar>& Ux,
+    const DeviceBuffer<scalar>& Uy,
+    const DeviceBuffer<scalar>& Uz,
+    const DeviceBuffer<scalar>* const* UbStored)
+{
+    if (!c.on) return;
+    const int nC = dm.nCells;
+    const int nB = dm.nBndFaces;
+    for (int i = 0; i < 3; ++i)
+    {
+        if (!UbStored || !UbStored[i] || UbStored[i]->size() != static_cast<std::size_t>(nB))
+            throw std::runtime_error(
+                "brae interFoam (device): the cached grad(U) is formed from U's STORED patch values, as OpenFOAM's "
+                "fvc::grad(U) reads them; the caller supplied none for every boundary face.");
+    }
+    // the unlimited Gauss gradient, as the assembly's own sites form it (deviceDivDevReff's fused call)
+    const DeviceBuffer<scalar>* vol[3] = {&Ux, &Uy, &Uz};
+    deviceGaussGradFused(dm, 3, vol, UbStored, c.memo.gx, c.memo.gy, c.memo.gz);
+    c.memo.nC = nC;
+    c.tensor.resize(static_cast<std::size_t>(9) * nC);
+    for (int i = 0; i < 3; ++i)
+    {
+        const DeviceBuffer<scalar>* g[3] = {&c.memo.gx[i], &c.memo.gy[i], &c.memo.gz[i]};
+        for (int d = 0; d < 3; ++d)
+        {
+            cudaCheck(cudaMemcpyAsync(c.tensor.data() + static_cast<std::size_t>(d*3 + i)*nC, g[d]->data(),
+                                      nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread),
+                      "grad(U) cache pack");
+        }
+    }
+    // ...and its boundary, against the patches' snGrad NOW -- the host's fvc::gradUBoundary in storeGradU
+    deviceBoundaryGradU(dm, dbU, Ux, Uy, Uz, c.tensor, c.bnd, UbStored);
+    c.valid = true;
+}
+
+
+void deviceSetGradU(
+    DeviceGradUCache& c,
+    const std::vector<scalar>& tensor9,
+    const std::vector<scalar>& bnd9,
+    int nC)
+{
+    if (!c.on) return;
+    if (tensor9.size() != static_cast<std::size_t>(9) * nC || bnd9.size() % 9 != 0)
+        throw std::runtime_error("brae interFoam (device): a host grad(U) to cache has the wrong size.");
+    c.tensor.copyFrom(tensor9);
+    c.bnd.copyFrom(bnd9);
+    c.memo.nC = nC;
+    for (int i = 0; i < 3; ++i)
+    {
+        DeviceBuffer<scalar>* g[3] = {&c.memo.gx[i], &c.memo.gy[i], &c.memo.gz[i]};
+        for (int d = 0; d < 3; ++d)
+        {
+            g[d]->copyFrom(std::vector<scalar>(tensor9.begin() + static_cast<std::ptrdiff_t>(d*3 + i)*nC,
+                                               tensor9.begin() + static_cast<std::ptrdiff_t>(d*3 + i + 1)*nC));
+        }
+    }
+    c.valid = true;
 }
 
 } // namespace brae
