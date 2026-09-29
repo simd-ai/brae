@@ -28,10 +28,58 @@
 #include <cstring>
 #include <string>
 
+#include <cstdio>
+
+#include <cstdlib>
+
 namespace brae {
+
+// OPENFOAM'S ORDER, on request (BRAE_DEVICE_OF_REDUCE=1). OpenFOAM's serial sumProd and sumMag
+// (FieldFunctions.C, TFOR_ALL_S_OP_F_OP_F) are ONE loop over the cells in index order, `s += a*b` and
+// `s += mag(a)`; the two-stage tree above is the same sum in another order and another last bit, and every
+// Krylov solver takes its stopping decision from these. With this set, every dot and sum(|x|) below runs as a
+// single thread in index order -- the device then stops where OpenFOAM stops, and a device gate can hold its
+// iteration counts exactly. It is slow (one thread walks the whole field), so it is the GATES' mode, not the
+// default; a run reports it once.
+bool deviceOfOrderReductions()
+{
+    static const bool on = [] {
+        const bool v = std::getenv("BRAE_DEVICE_OF_REDUCE") != nullptr;
+        if (v)
+        {
+            std::printf("  device reductions: OpenFOAM's sequential order (BRAE_DEVICE_OF_REDUCE)\n");
+        }
+        return v;
+    }();
+    return on;
+}
 
 namespace {
 constexpr int TPB = 256;
+
+__global__
+void seqDotKernel(const scalar* __restrict__ x, const scalar* __restrict__ y, scalar* out, int n)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    scalar s = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        s += x[i]*y[i];
+    }
+    *out = s;
+}
+
+__global__
+void seqSumMagKernel(const scalar* __restrict__ x, scalar* out, int n)
+{
+    if (blockIdx.x != 0 || threadIdx.x != 0) return;
+    scalar s = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        s += fabs(x[i]);
+    }
+    *out = s;
+}
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 
 // Persistent reduction scratch (one-time alloc, process-lifetime): a device accumulator + a PINNED host mirror.
@@ -206,7 +254,10 @@ scalar deviceDot(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y)
 {
     const int n = static_cast<int>(x.size());
     ensureRedScratch();
-    reduceInto([&](int nb, scalar* part){ dotKernel<<<nb, TPB>>>(x.data(), y.data(), part, n); }, n, g_redDev);
+    if (deviceOfOrderReductions())
+        seqDotKernel<<<1, 1>>>(x.data(), y.data(), g_redDev, n);
+    else
+        reduceInto([&](int nb, scalar* part){ dotKernel<<<nb, TPB>>>(x.data(), y.data(), part, n); }, n, g_redDev);
     cudaCheck(cudaGetLastError(), "dot");
     cudaCheck(cudaMemcpy(g_redPinned, g_redDev, sizeof(scalar), cudaMemcpyDeviceToHost), "dot result");
     return *g_redPinned;
@@ -250,7 +301,10 @@ scalar deviceSumMag(const DeviceBuffer<scalar>& x)
 {
     const int n = static_cast<int>(x.size());
     ensureRedScratch();
-    reduceInto([&](int nb, scalar* part){ sumMagKernel<<<nb, TPB>>>(x.data(), part, n); }, n, g_redDev);
+    if (deviceOfOrderReductions())
+        seqSumMagKernel<<<1, 1>>>(x.data(), g_redDev, n);
+    else
+        reduceInto([&](int nb, scalar* part){ sumMagKernel<<<nb, TPB>>>(x.data(), part, n); }, n, g_redDev);
     cudaCheck(cudaGetLastError(), "summag");
     cudaCheck(cudaMemcpy(g_redPinned, g_redDev, sizeof(scalar), cudaMemcpyDeviceToHost), "summag result");
     return *g_redPinned;
@@ -261,7 +315,10 @@ scalar deviceSumMag(const DeviceBuffer<scalar>& x)
 void deviceDotInto(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y, scalar* dResult)
 {
     const int n = static_cast<int>(x.size());
-    reduceInto([&](int nb, scalar* part){ dotKernel<<<nb, TPB>>>(x.data(), y.data(), part, n); }, n, dResult);
+    if (deviceOfOrderReductions())
+        seqDotKernel<<<1, 1>>>(x.data(), y.data(), dResult, n);
+    else
+        reduceInto([&](int nb, scalar* part){ dotKernel<<<nb, TPB>>>(x.data(), y.data(), part, n); }, n, dResult);
     cudaCheck(cudaGetLastError(), "dotInto");
 }
 
@@ -330,7 +387,10 @@ void deviceMinMaxMeanInto(const DeviceBuffer<scalar>& x, scalar* dOut3)
 void deviceSumMagInto(const DeviceBuffer<scalar>& x, scalar* dResult)
 {
     const int n = static_cast<int>(x.size());
-    reduceInto([&](int nb, scalar* part){ sumMagKernel<<<nb, TPB>>>(x.data(), part, n); }, n, dResult);
+    if (deviceOfOrderReductions())
+        seqSumMagKernel<<<1, 1>>>(x.data(), dResult, n);
+    else
+        reduceInto([&](int nb, scalar* part){ sumMagKernel<<<nb, TPB>>>(x.data(), part, n); }, n, dResult);
     cudaCheck(cudaGetLastError(), "summagInto");
 }
 

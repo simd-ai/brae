@@ -55,15 +55,31 @@ __global__ void reconstructKernel(
     scalar Txx = 0, Txy = 0, Txz = 0, Tyx = 0, Tyy = 0, Tyz = 0, Tzx = 0, Tzy = 0, Tzz = 0;
     scalar vx = 0, vy = 0, vz = 0;
 
-    for (int k = ownerStart[c]; k < ownerStart[c + 1]; ++k)
-        accumulate(Sfx[k], Sfy[k], Sfz[k], ssfInt[k],
-                   Txx,Txy,Txz, Tyx,Tyy,Tyz, Tzx,Tzy,Tzz, vx,vy,vz);
-    // THE SAME SIGN on the neighbour side -- fvcSurfaceIntegrate.C:165-166. deviceDiv subtracts here.
-    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
+    // surfaceSum's face loop (fvcSurfaceIntegrate.C:163-167) adds each face to its owner AND its neighbour
+    // in FACE ORDER, so a cell takes its internal faces in increasing face index, owned and neighbouring
+    // interleaved -- the owner list (ascending) and the losort list (ascending) merged, as deviceDiv's
+    // gather is. THE SAME SIGN on both sides (:165-166); deviceDiv subtracts on the neighbour side.
     {
-        const int f = losort[k];
-        accumulate(Sfx[f], Sfy[f], Sfz[f], ssfInt[f],
-                   Txx,Txy,Txz, Tyx,Tyy,Tyz, Tzx,Tzy,Tzz, vx,vy,vz);
+        int fo = ownerStart[c];
+        const int foEnd = ownerStart[c + 1];
+        int kn = losortStart[c];
+        const int knEnd = losortStart[c + 1];
+        while (fo < foEnd || kn < knEnd)
+        {
+            int f = 0;
+            if ((kn >= knEnd) || (fo < foEnd && fo < losort[kn]))
+            {
+                f = fo;
+                ++fo;
+            }
+            else
+            {
+                f = losort[kn];
+                ++kn;
+            }
+            accumulate(Sfx[f], Sfy[f], Sfz[f], ssfInt[f],
+                       Txx,Txy,Txz, Tyx,Tyy,Tyz, Tzx,Tzy,Tzz, vx,vy,vz);
+        }
     }
     for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)
     {

@@ -261,35 +261,39 @@ void tensorDivKernel(
 
     scalar d[3] = { 0, 0, 0 };
 
-    // internal faces owned by c (+): sigma_face = w*own + (1-w)*nei
-    for (int fi = ownerStart[c]; fi < ownerStart[c + 1]; ++fi)
+    // The host reference's fvc::div(tensor) (fvc.cu), face for face and rounding for rounding:
+    //  - the internal faces in FACE order, a cell's owned (+) and neighboured (-) faces interleaved, as the
+    //    host's scatter reaches them -- this took every owned face and then every neighboured one -- then
+    //    the boundary faces in patch order;
+    //  - the contraction g++ makes of it (objdump -dl of the host object): the face value
+    //    fma(w, own, (1-w)*nei), and Sf & T as fma(Sz, T_zj, fma(Sx, T_xj, Sy*T_yj)) -- the y product
+    //    rounded -- on internal and boundary faces alike; the accumulations plain adds.
+    // MEASURED on mixerVessel2D's mesh with a smooth U (scratch parity harness, the host's sigma in):
+    // 38-58 per cent of cells off the host's sum in the last bit per component before, 0 after.
+    int fo = ownerStart[c];
+    const int u1 = ownerStart[c + 1];
+    int kn = losortStart[c];
+    const int l1 = losortStart[c + 1];
+    while (fo < u1 || kn < l1)
     {
+        const int fl = (kn < l1) ? losort[kn] : 0x7fffffff;
+        const bool owned = (fo < u1 && fo < fl);
+        const int fi = owned ? fo : fl;
         const int o = own[fi], n2 = nei[fi];
         const scalar wf = w[fi];
+        const scalar wn = 1.0 - wf;
         const scalar sx = Sfx[fi], sy = Sfy[fi], sz = Sfz[fi];
         for (int j = 0; j < 3; ++j)
         {
-            const scalar s0 = wf*sigmaC[(0*3+j)*nC+o] + (1.0-wf)*sigmaC[(0*3+j)*nC+n2];
-            const scalar s1 = wf*sigmaC[(1*3+j)*nC+o] + (1.0-wf)*sigmaC[(1*3+j)*nC+n2];
-            const scalar s2 = wf*sigmaC[(2*3+j)*nC+o] + (1.0-wf)*sigmaC[(2*3+j)*nC+n2];
-            d[j] += sx*s0 + sy*s1 + sz*s2;
+            const scalar s0 = fma(wf, sigmaC[(0*3+j)*nC+o], wn*sigmaC[(0*3+j)*nC+n2]);
+            const scalar s1 = fma(wf, sigmaC[(1*3+j)*nC+o], wn*sigmaC[(1*3+j)*nC+n2]);
+            const scalar s2 = fma(wf, sigmaC[(2*3+j)*nC+o], wn*sigmaC[(2*3+j)*nC+n2]);
+            const scalar r = fma(sz, s2, fma(sx, s0, sy*s1));
+            if (owned) d[j] += r;
+            else       d[j] -= r;
         }
-    }
-
-    // internal faces neighbouring c (-)
-    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
-    {
-        const int fi = losort[k];
-        const int o = own[fi], n2 = nei[fi];
-        const scalar wf = w[fi];
-        const scalar sx = Sfx[fi], sy = Sfy[fi], sz = Sfz[fi];
-        for (int j = 0; j < 3; ++j)
-        {
-            const scalar s0 = wf*sigmaC[(0*3+j)*nC+o] + (1.0-wf)*sigmaC[(0*3+j)*nC+n2];
-            const scalar s1 = wf*sigmaC[(1*3+j)*nC+o] + (1.0-wf)*sigmaC[(1*3+j)*nC+n2];
-            const scalar s2 = wf*sigmaC[(2*3+j)*nC+o] + (1.0-wf)*sigmaC[(2*3+j)*nC+n2];
-            d[j] -= sx*s0 + sy*s1 + sz*s2;
-        }
+        if (owned) ++fo;
+        else       ++kn;
     }
 
     // boundary faces (+): sigma_b at the boundary face (empty patches excluded, as in CPU fvc::div)
@@ -300,10 +304,12 @@ void tensorDivKernel(
         const int f = bndGFace[bi];
         const scalar sx = Sfx[f], sy = Sfy[f], sz = Sfz[f];
         for (int j = 0; j < 3; ++j)
-            d[j] += sx*sigmaB[(0*3+j)*nB+bi] + sy*sigmaB[(1*3+j)*nB+bi] + sz*sigmaB[(2*3+j)*nB+bi];
+            d[j] += fma(sz, sigmaB[(2*3+j)*nB+bi], fma(sx, sigmaB[(0*3+j)*nB+bi], sy*sigmaB[(1*3+j)*nB+bi]));
     }
 
-    // = V*fvc::div (the /V and *V cancel -> raw sum)
+    // the RAW sum. The legacy momentum order takes it as the source directly; the /V and *V do NOT cancel
+    // in floating point, and interFoam's order forms the host's fl(sum/V)*V from it (UEqn.cu,
+    // addStressAsHostKernel).
     dX[c] = d[0];
     dY[c] = d[1];
     dZ[c] = d[2];

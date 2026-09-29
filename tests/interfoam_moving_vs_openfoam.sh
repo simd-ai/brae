@@ -401,9 +401,29 @@ command -v interFoam > /dev/null 2>&1 || { echo "SKIP: interFoam not on PATH"; e
 HDR='FoamFile { version 2.0; format ascii; class dictionary; object dynamicMeshDict; }'
 
 # stage <name> <tutorial> <deltaT> <nSteps> <profile>
+# THE DEVICE ARMS RUN OPENFOAM'S SUMMATION ORDER (BRAE_DEVICE_OF_REDUCE, reductions.cu): every Krylov dot and
+# sum(|x|) as one sequential pass over the cells, as OpenFOAM's serial sumProd/sumMag are. The GPU's own tree
+# order is the same sum in another last bit, and on a solve that arrives already converged that bit decides the
+# stopping iteration: MEASURED on pistonOuterOnce, tree order 158 of 180 p_rgh counts OpenFOAM's and a 17-vs-18
+# on a short solve (initial residual 1.07e-12 against tolerance 1e-13); OpenFOAM's order 177 of 180, all within
+# the device rule, step one's initial residuals 8.2e-12 apart. It changes the device's reductions only -- the
+# host arm is untouched -- and it is slow, so production runs keep the tree.
+export BRAE_DEVICE_OF_REDUCE=1
+
+# MOVING_ONLY="a b c": stage and gate only the named profiles (and the controls they name) -- for measuring
+# one change without the whole queue. Unset, everything runs.
+selected()
+{
+    [ -z "${MOVING_ONLY:-}" ] && return 0
+    local x
+    for x in $MOVING_ONLY; do [ "$x" = "$1" ] && return 0; done
+    return 1
+}
+
 stage()
 {
     local name="$1" tutorial="$2" dt="$3" n="$4" profile="$5"
+    selected "$name" || return 0
     local C="$W/$name"
     # CLEAR IT FIRST: `cp -r src dst` copies INTO dst when dst exists, so a re-run under KEEP_W staged
     # the tutorial as a subdirectory and then edited the PREVIOUS run's already-staged files -- every
@@ -548,6 +568,12 @@ elif profile.startswith('solitary') or profile.startswith('multi'):
                           '        nCellsInCoarsestLevel 200;\n    }' % key)
         assert 'solver          GAMG' in t, 'the GAMG profile did not take' 
 elif profile.startswith('piston') or profile.startswith('flap'):
+    if profile in ('pistonOuter', 'pistonOuterOnce'):
+        # TWO OUTER CORRECTORS on a DEFORMING mesh, the device loop's move guard and its V0: `pistonOuter`
+        # moves the mesh at both (moveMeshOuterCorrectors yes), `pistonOuterOnce` at the first only
+        t, k = re.subn(r'nCorrectors\s+3;', 'nCorrectors     3;\n    nOuterCorrectors 2;'
+                       + ('\n    moveMeshOuterCorrectors yes;' if profile == 'pistonOuter' else ''), t)
+        assert k == 1, 'the piston nCorrectors 3 was not found'
     # the pressure solves converged: p_rgh, p_rghFinal and pcorr at tolerance 1e-13, relTol 0. As shipped
     # (p_rgh relTol 0.05, pcorr 1e-10) the piston's third corrector takes 135 PCG iterations and pcorr
     # 350 to 480, and last-bit differences ride those solves out to U 3.9e-07 and alpha 5.0e-09 after
@@ -878,6 +904,7 @@ JOBS=${MOVING_JOBS:-4}
 QUEUE=()
 gate()
 {
+    selected "$1" || return 0
     QUEUE+=("$1|$2|$3|$4|$5")
 }
 
@@ -987,6 +1014,8 @@ stage pistonStatic   waves/waveMakerPiston   0.01 30 pistonStatic   || rc=1
 stage piston         waves/waveMakerPiston   0.01 30 piston         || rc=1
 stage pistonSST      waves/waveMakerPiston   0.01 30 pistonSST      || rc=1
 stage pistonLES      waves/waveMakerPiston   0.01 30 pistonLES      || rc=1
+stage pistonOuter    waves/waveMakerPiston   0.01 30 pistonOuter    || rc=1
+stage pistonOuterOnce waves/waveMakerPiston  0.01 30 pistonOuterOnce || rc=1
 stage flapStatic     waves/waveMakerFlap     0.01 30 flapStatic     || rc=1
 stage flap           waves/waveMakerFlap     0.01 30 flap           || rc=1
 stage multiPistonStatic waves/waveMakerMultiPaddlePiston 0.01 30 multiPistonStatic || rc=1
@@ -1014,13 +1043,16 @@ stage esdNoCorr ../RAS/electrostaticDeposition 1e-3 2 esdNoCorr || rc=1
 stage esd       ../RAS/electrostaticDeposition 1e-3 2 esd       || rc=1
 [ $rc = 0 ] || { echo "interfoam_moving_vs_openfoam: staging failed"; exit 1; }
 
-# the oracle took the path
+# the oracle took the path (each check only where its profiles were staged: all of them unless MOVING_ONLY)
+if selected mixer && selected mixerStatic; then
 grep -q "Constructed SBMF 1 : rotatingBox of type oscillatingRotatingMotion" "$W/mixer/log.interFoam" \
     || { echo "FAIL: OpenFOAM's mixer log does not build the multiMotion"; exit 1; }
 grep -q "Selecting dynamicFvMesh staticFvMesh" "$W/mixerStatic/log.interFoam" \
     || { echo "FAIL: OpenFOAM's control did not hold the mesh still"; exit 1; }
 grep -q "^Courant Number mean: 0.0[1-9]" "$W/mixer/log.interFoam" \
     || { echo "FAIL: OpenFOAM's mixer never moved its fluid"; exit 1; }
+fi
+if selected floating && selected floatingStatic; then
 grep -q "Selecting motion solver: rigidBodyMotion" "$W/floating/log.interFoam" \
     || { echo "FAIL: OpenFOAM's floatingObject did not select rigidBodyMotion"; exit 1; }
 grep -q "Selecting dynamicFvMesh staticFvMesh" "$W/floatingStatic/log.interFoam" \
@@ -1036,8 +1068,10 @@ grep -q "{ 0 }" "$W/floating/0.05/uniform/rigidBodyMotionState" \
     && { echo "FAIL: OpenFOAM's body never moved -- the gate would be vacuous"; exit 1; }
 grep -q "floatingObject" "$W/floating/constant/polyMesh/boundary" \
     || { echo "FAIL: the staged mesh has no floatingObject patch for the force to act on"; exit 1; }
+fi
 
 for c in multiPiston multiFlap; do
+    selected "$c" || continue
     grep -q "^GAMG:  Solving for p_rgh" "$W/$c/log.interFoam" \
         || { echo "FAIL: OpenFOAM's $c log does not solve p_rgh with GAMG, the solver \$pcorr brings in"; exit 1; }
 done
@@ -1067,6 +1101,8 @@ gate pistonSST      0.01  30 pistonSST      piston         || rc=1
 # ...and the same paddle under LES kEqn, whose FILTER WIDTH moves with the cells. Control: the
 # laminar piston, as pistonSST's is.
 gate pistonLES      0.01  30 pistonLES      piston         || rc=1
+gate pistonOuter    0.01  30 pistonOuter    piston         || rc=1
+gate pistonOuterOnce 0.01 30 pistonOuterOnce piston        || rc=1
 gate flap           0.01  30 flap           flapStatic     || rc=1
 gate multiPiston    0.01  30 multiPiston    multiPistonStatic || rc=1
 gate multiFlap      0.01  30 multiFlap      multiFlapStatic   || rc=1
@@ -1088,6 +1124,33 @@ gate esdNoCorr 1e-3 2 esdNoCorr esd       || rc=1
 gate esd       1e-3 2 esd       esdNoCorr || rc=1
 
 runQueue
+
+# THE DEVICE MESH UPDATE'S TWO CONTROLS, each asserted to fail on a device number. The device loop's move block
+# used to run at every outer corrector and re-take V0 from the volumes before each update; with two outer
+# correctors both are live, and a gate on one corrector cannot see either.
+#   BRAE_CONTROL_DEVICE_MOVE_EVERY_OUTER on pistonOuterOnce: the block at the second corrector as well, whose
+#     correctPhi copies the host phi the host stage never rewrote there. MEASURED U 3.2e-06 (fixed 2.7e-08).
+#   BRAE_CONTROL_DEVICE_V0_FROM_V on pistonOuter: V0 from the volumes as they stand before each update, i.e.
+#     the first update's moved volumes at the second. MEASURED U 8.1e-04 (fixed 1.1e-10).
+deviceControl()
+{
+    local name="$1" ctl="$2"
+    selected "$name" || return 0
+    local out="$W/.control.$name.log"
+    env "$ctl" "$BIN" "$W/$name" "$W/$name/0" "$W/$name/0.3" 30 "$W/$name/log.interFoam" "$name" \
+        "$W/piston/0.3" > "$out" 2>&1
+    local crc=$?
+    local pat="FAIL: (the device's alpha|\.\.\.its p_rgh|\.\.\.and its U|\.\.\.and the device's Uf)"
+    if [ $crc -ne 0 ] && grep -q "CONTROL MODE" "$out" && grep -qE "$pat" "$out"; then
+        echo "  ok:   device control $ctl on $name fails on a number: $(grep -E 'DEVICE:  alpha' "$out" | tr -s ' ')"
+    else
+        echo "  FAIL: device control $ctl on $name did not fail -- the gate cannot see the defect it guards"
+        tail -15 "$out"
+        rc=1
+    fi
+}
+deviceControl pistonOuterOnce BRAE_CONTROL_DEVICE_MOVE_EVERY_OUTER=1
+deviceControl pistonOuter     BRAE_CONTROL_DEVICE_V0_FROM_V=1
 
 echo "interfoam_moving_vs_openfoam: rc $rc"
 exit $rc

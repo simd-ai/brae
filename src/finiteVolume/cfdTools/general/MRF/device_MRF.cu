@@ -31,12 +31,15 @@ void mrfCoriolisKernel(
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= n || !zoneCell[c]) return;
 
-    // (Omega x U), component cmpt
+    // (Omega x U), component cmpt, then src -= V*r -- with the host's contraction, read off the object code
+    // g++ makes of addCoriolis (MRF_cpp.cu:271 over cross(), cf_types.cuh; objdump -dl): x and y round their
+    // FIRST product and fuse the second, z rounds its SECOND and fuses the first, and src - V*r is one
+    // fmsub. Written as fma() so nvcc's own contraction choice cannot move it.
     scalar r;
-    if      (cmpt == 0) r = oy * Uz[c] - oz * Uy[c];
-    else if (cmpt == 1) r = oz * Ux[c] - ox * Uz[c];
-    else                r = ox * Uy[c] - oy * Ux[c];
-    src[c] -= V[c] * r;
+    if      (cmpt == 0) r = fma(-oz, Uy[c], oy * Uz[c]);
+    else if (cmpt == 1) r = fma(-ox, Uz[c], oz * Ux[c]);
+    else                r = fma(ox, Uy[c], -(oy * Ux[c]));
+    src[c] = fma(-V[c], r, src[c]);
 }
 
 __global__

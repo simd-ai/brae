@@ -751,7 +751,7 @@ void amgPermutedLayoutAmul(
     // serves both arrays and this diagnostic has no source of its own to gather.
     gsPermGatherT<scalar><<<nBlocks(n),TPB>>>(n, gc.cells.data(), psi.data(), psi.data(), gc.bP.data(), gc.psiP.data());
     permLayoutAmulT<scalar><<<nBlocks(n),TPB>>>(n, gc.cells.data(), gc.rowStart.data(), gc.rowNbr.data(),
-        gc.coeff.data(), gc.diagP.data(), gc.psiP.data(), Apsi.data());
+        gc.rowSrc.data(), gc.coeff.data(), gc.diagP.data(), gc.psiP.data(), Apsi.data());
     cudaCheck(cudaGetLastError(), "amg GS permuted layout matvec");
 }
 

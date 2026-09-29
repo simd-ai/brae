@@ -253,7 +253,8 @@ int main(
                          || profile == "esd" || profile == "esdNoCorr"
                          || profile == "closedDamBreak" || profile == "closedDamBreakInitU"
                          || profile == "closedAdjZG" || profile == "closedAdjIO"
-                         || profile == "mixerTop" || profile == "mixerPermeable");
+                         || profile == "mixerTop" || profile == "mixerPermeable"
+                         || profile == "pistonOuter" || profile == "pistonOuterOnce");
     PrimitiveMesh mD;
     FvGeometry gD;
     std::vector<FvPatch> patchesD;

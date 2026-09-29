@@ -64,9 +64,27 @@ void foldBoundaryDiagKernel(
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
-    scalar s = 0.0;
-    for (label k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k) s += icAv[bndPerm[k]];
-    D[c] += s;
+    // face by face INTO D, in patch order, as the host's A() folds it (fv_matrix_ops.cuh) -- summing a
+    // corner cell's faces first and adding the sum once rounds differently (pistonLES's four corners)
+    scalar d = D[c];
+    for (label k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k) d += icAv[bndPerm[k]];
+    D[c] = d;
+}
+
+// cmptAv(internalCoeffs) = (x + y + z)/3 (VectorSpaceI.H cmptAv: cmptSum/nComponents; cf_types.cuh). A
+// DIVISION: the scale by 1.0/3.0 this replaced multiplies by a rounded third, which is not the same
+// number on up to half the faces.
+__global__
+void cmptAvKernel(
+    int n,
+    const scalar* __restrict__ x,
+    const scalar* __restrict__ y,
+    const scalar* __restrict__ z,
+    scalar* __restrict__ av)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    av[i] = (x[i] + y[i] + z[i]) / 3.0;
 }
 
 } // namespace
@@ -93,10 +111,16 @@ void pressurePredictor(
 
     // cmptAv(internalCoeffs) -- shared by A() and by H()'s boundary-diagonal term.
     DeviceBuffer<scalar> icAv;
-    deviceCopy(icAv, UEqn.iC[0]);
-    deviceAxpy(1.0, UEqn.iC[1], icAv);
-    deviceAxpy(1.0, UEqn.iC[2], icAv);
-    deviceScale(icAv, 1.0 / 3.0);
+    {
+        const int nB = static_cast<int>(UEqn.iC[0].size());
+        icAv.resize(static_cast<std::size_t>(nB));
+        if (nB > 0)
+        {
+            cmptAvKernel<<<nBlocks(nB), TPB>>>(nB, UEqn.iC[0].data(), UEqn.iC[1].data(), UEqn.iC[2].data(),
+                                               icAv.data());
+            cudaCheck(cudaGetLastError(), "cmptAv");
+        }
+    }
 
     // ---- rAU = 1/A() -------------------------------------------------------------------------
     // A() = D/V with D = diag + cmptAv(internalCoeffs). `diag` here is the RELAXED diagonal when the

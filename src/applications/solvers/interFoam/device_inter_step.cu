@@ -1,5 +1,6 @@
 // One whole interFoam time step -- see device_inter_step.cuh for the loop order and what it decides.
 #include "device_inter_step.cuh"
+#include "inter_peqn_cpp.cuh"   // tapCorrectorWanted
 #include "device_alpha_flux.cuh"
 #include "device_blas.cuh"
 #include "device_ldu.cuh"
@@ -367,6 +368,7 @@ void deviceInterStep(
     uin.gradUSchemeLeastSq = ctl.gradUSchemeLeastSq;
     uin.relaxU        = ctl.relaxU;
     uin.relaxEquation = ctl.relaxEquationU;
+    uin.interOrder    = true;
     uin.ddtRho        = &rho;
     uin.ddtRhoOld     = &rhoOld;
     uin.ddtV0         = ctl.V0;
@@ -569,7 +571,7 @@ void deviceInterStep(
         pin.takeUAtBoundary = ctl.takeUAtBoundary;
         pin.cyc = ctl.cyc;
         for (int k = 0; k < 3; ++k) pin.solutionD[k] = ctl.solutionD[k];
-        if (taps && corr == 0)
+        if (taps && corr == cpu::interFoam::tapCorrectorWanted())
         {
             pin.hNoPairTap = &taps->HNoPairX;
             pin.hPairTap   = &taps->HPairX;
@@ -580,7 +582,7 @@ void deviceInterStep(
         if (ctl.rAUOut) deviceCopy(*ctl.rAUOut, st.rAU);
         probe("HbyA.x", st.HbyA[0]);
         probe("phiHbyA", st.phiHbyAInt);
-        if (taps && corr == 0)
+        if (taps && corr == cpu::interFoam::tapCorrectorWanted())
         {
             deviceCopy(taps->rAU, st.rAU);
             for (int k = 0; k < 3; ++k) deviceCopy(taps->HbyA[k], st.HbyA[k]);
@@ -734,10 +736,12 @@ void deviceInterStep(
             deviceCopy(taps->ffIf, pt.ffIf);
             deviceCopy(taps->phiIf, pt.phiIf);
             deviceCopy(taps->phiHbyAIfPrePhig, pt.phiHbyAIfPrePhig);
-            deviceCopy(taps->nonOrthSource, pt.nonOrthSource);
+            // not nonOrthSource: it is the selected corrector's, copied below. Copied here as well, the
+            // LAST corrector's overwrote it -- on pistonLES a converged p_rgh's 3.5e-08 against the host
+            // tap's corrector 0, where the hydrostatic start leaves the correction at 1e-300.
             deviceCopy(taps->cycJumpTap, pt.cycJumpTap);
         }
-        if (taps && corr == 0)
+        if (taps && corr == cpu::interFoam::tapCorrectorWanted())
         {
             // EVERY pressure tap from the SAME corrector. These were split across two blocks with
             // different guards -- pSource from corrector 0 and the rest from the last -- and on a case
@@ -760,7 +764,7 @@ void deviceInterStep(
             deviceCopy(taps->pSolved, p_rgh);
         }
 
-        if (taps && corr == 0)
+        if (taps && corr == cpu::interFoam::tapCorrectorWanted())
         {
             deviceCopy(taps->phiHbyAInt, st.phiHbyAInt);
             deviceCopy(taps->phiHbyABnd, st.phiHbyABnd);

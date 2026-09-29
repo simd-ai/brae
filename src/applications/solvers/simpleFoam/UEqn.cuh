@@ -90,6 +90,13 @@ struct MomentumInput
     // alpha == 1 would differ from OpenFOAM on every shipped interFoam tutorial. It defaults to false,
     // which leaves simpleFoam on the `0 < relaxU < 1` condition it has always used.
     bool   relaxEquation = false;
+    // The ORDER the terms go in, which changes only the rounding of their sums -- and so, on a case whose
+    // pressure solve arrives near its tolerance, the iteration count (pistonLES). True: interFoam's host
+    // reference (inter_ueqn_cpp.cu assembleUEqn) -- convection, its deferred correction, fvm::ddt, MRF, the
+    // laplacian, its non-orthogonal correction, the explicit stress as source -= expl*V. False: the legacy
+    // order simpleFoam's device arm was gated in -- stress assigned first, ddt last. simpleFoam's host puts
+    // MRF after the stress, so one order cannot serve both.
+    bool   interOrder = false;
 
     // interFoam's fvm::ddt(rho, U), Euler: rho on the DIAGONAL and rho.oldTime() in the SOURCE, which
     // at a VoF interface differ by a factor of 1000. Added BEFORE relax(), as the matrix constructor's

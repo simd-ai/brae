@@ -13,6 +13,37 @@ namespace gpu {
 
 namespace {
 
+// source += fl(sum/V)*V with ONE rounding for the multiply-add: the host's `UEqn.source -= expl*V`, expl =
+// -fvc::div(...) = -(sum/V) (linearViscousStress_cpp.cu:180-182), which g++ contracts to a single fmsub --
+// read off its object code, objdump -dl. The division is rounded on its own there and here. Written as
+// fma() so nvcc's own contraction choice cannot move it.
+__global__
+void addStressAsHostKernel(
+    int n,
+    const scalar* __restrict__ sum,
+    const scalar* __restrict__ V,
+    scalar* __restrict__ source)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    source[c] = fma(sum[c] / V[c], V[c], source[c]);
+}
+
+// source += rho*acc with ONE rounding: g++ contracts the host's `M.source[c].x += rho[c] * acc[c].x`
+// (inter_ueqn_cpp.cu:333-335) to one fmadd, read off its object code. Rounding the product first, as the
+// Hadamard-then-axpy this replaced did, is another number.
+__global__
+void addRhoAccKernel(
+    int n,
+    const scalar* __restrict__ rho,
+    const scalar* __restrict__ acc,
+    scalar* __restrict__ source)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    source[c] = fma(rho[c], acc[c], source[c]);
+}
+
 // resize() does NOT zero: DevicePool::take hands back a RECYCLED block, the same contract as cudaMalloc
 // (device_buffer.cuh:134-141). A buffer this file ACCUMULATES into rather than assigns must therefore be
 // memset first. The limitedLinear branch below did not, and read the pool's leavings as part of
@@ -148,6 +179,255 @@ void assembleUEqn(
         deviceCyclicAddGrad(*in.cyc, *UForGrad[k], dm.V, gx, gy, gz);
     };
 
+    // The terms that sit in a different place in the two assembly orders (MomentumInput::interOrder), as
+    // functions of the matrix so far, called once from whichever position the order puts them in.
+    //
+    // ---- explicit non-orthogonal correction --------------------------------------------------
+    // In the legacy order AFTER divDevReff, which ASSIGNS the source (device_divdevreff.cu: `dX[c] = d[0]`)
+    // rather than accumulating into it. Adding the correction first compiles and runs and is silently
+    // discarded. interFoam's order zeroes the source up front and accumulates the stress instead.
+    //
+    // deviceLaplacianCorr returns the LAPLACIAN's own source correction (-V*fvc::div(faceFluxCorr)).
+    // divDevReff carries MINUS the laplacian, so it enters the momentum source with the opposite sign --
+    // the bookkeeping the existing GPU driver does at device_simple_foam.cu:1423-1426, and the sign a
+    // measurement against real OpenFOAM had to settle on the reference side (backwards made U worse).
+    auto addLaplacianCorrection = [&]()
+    {
+        if (in.correctedLaplacian)
+        {
+            const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
+            DeviceBuffer<scalar> gxc[3], gyc[3], gzc[3];
+            const GradUMemo& gm = in.gradUGivenMemo ? *in.gradUGivenMemo : deviceGradUShared(dm, dbU, Ux, Uy, Uz, in.UbStored);       // the same grad(U) as the sites below
+            for (int k = 0; k < 3; ++k)
+            {
+                deviceCopy(gxc[k], gm.gx[k]);
+                deviceCopy(gyc[k], gm.gy[k]);
+                deviceCopy(gzc[k], gm.gz[k]);
+                addPairToGrad(k, gxc[k], gyc[k], gzc[k]);
+            }
+            if (in.snGradLimitCoeff > 0.0)
+            {
+                // `limited <k> corrected`. OF's limitedSnGrad takes mag() of the WHOLE snGrad and of the
+                // WHOLE correction, so all three components share one per-face limiter -- which is why this
+                // cannot be done inside the per-component loop above.
+                DeviceBuffer<scalar> ffc[3];
+                deviceLaplacianCorrFluxLimitedVec(dm, *in.nuEffFace, *U[0], *U[1], *U[2],
+                                                  gxc, gyc, gzc, in.snGradLimitCoeff, ffc);
+                for (int k = 0; k < 3; ++k)
+                {
+                    DeviceBuffer<scalar> lc;
+                    deviceFaceDivSource(dm, ffc[k], lc);
+                    deviceAxpy(-1.0, lc, M.source[k]);
+                }
+            }
+            else
+            {
+                for (int k = 0; k < 3; ++k)
+                {
+                    DeviceBuffer<scalar> lc;
+                    deviceLaplacianCorr(dm, *in.nuEffFace, gxc[k], gyc[k], gzc[k], lc);
+                    deviceAxpy(-1.0, lc, M.source[k]);
+                }
+            }
+        }
+    };
+
+    // ---- linearUpwind's deferred correction --------------------------------------------------
+    // In the legacy order AFTER divDevReff for the same reason as the block above: that call ASSIGNS the
+    // source.
+    //
+    // OpenFOAM applies this inside fvm::div. Its position among the other source contributions changes
+    // only the rounding of their sum -- which is why interFoam's order puts it straight after the
+    // convection, as the host does -- and it must be before relax(), which reads the source. SUBTRACTED, because `fvm += fvc::surfaceIntegrate(...)` on an
+    // fvMatrix means `source -= V*...` (fvMatrix.C:1855-1862).
+    //
+    // Per component with the SCALAR gradient of that component, which is what OpenFOAM's `vector`
+    // specialisation computes as one tensor grad: (d & grad(U))_j = d . grad(U_j) under OpenFOAM's
+    // grad(U)_ij = d(U_j)/d(x_i) convention. The two are the same field, not an approximation of it.
+    // How much of linearUpwind's correction this scheme carries: 1 for linearUpwind, 0.25 for LUST
+    // (LUST.H overrides correction() too), 0 otherwise.
+    // linearUpwindV: a DIFFERENT correction, limited across the three components at once, so it cannot
+    // be expressed as a factor on linearUpwind's.
+    auto addDeferredCorrection = [&]()
+    {
+        if (in.scheme == cpu::DivScheme::linearUpwindV)
+        {
+            const DeviceBuffer<scalar>* Usrc[3] = {&Ux, &Uy, &Uz};
+            DeviceBuffer<scalar> gx[3], gy[3], gz[3], cx, cy, cz;
+            const GradUMemo& gm = in.gradUGivenMemo ? *in.gradUGivenMemo : deviceGradUShared(dm, dbU, Ux, Uy, Uz, in.UbStored);
+            for (int k = 0; k < 3; ++k)
+            {
+                deviceCopy(gx[k], gm.gx[k]);
+                deviceCopy(gy[k], gm.gy[k]);
+                deviceCopy(gz[k], gm.gz[k]);
+                addPairToGrad(k, gx[k], gy[k], gz[k]);
+                if (in.gradULimitK > 0.0)
+                {
+                    CellLimitInterface ifs[1];
+                    DeviceBuffer<scalar> nbr;
+                    const int nIfs = pairLimitInterface(k, nbr, ifs);
+                    deviceCellLimitGrad(dm, *Usrc[k], gm.ub[k], gx[k], gy[k], gz[k], in.gradULimitK, ifs, nIfs);
+                }
+            }
+            deviceLinearUpwindVCorr(dm, *in.phiInt, gx, gy, gz, Ux, Uy, Uz, cx, cy, cz);
+            const DeviceBuffer<scalar>* cc[3] = {&cx, &cy, &cz};
+            for (int k = 0; k < 3; ++k) deviceAxpy(-1.0, *cc[k], M.source[k]);
+        }
+
+        const scalar corrFac = (in.scheme == cpu::DivScheme::linearUpwind || in.linearUpwind) ? 1.0
+                             : (in.scheme == cpu::DivScheme::LUST)                            ? 0.25
+                             : 0.0;
+        if (corrFac != 0.0)
+        {
+            const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
+            const GradUMemo& gm = in.gradUGivenMemo ? *in.gradUGivenMemo : deviceGradUShared(dm, dbU, Ux, Uy, Uz, in.UbStored);
+            // ALL THREE components' gradients are built first, because the pair's correction reconstructs
+            // the neighbour in the NEIGHBOUR's frame: on a rotational cyclic the component that comes back
+            // is forwardT . (gradU[nbr] . dNbr), which mixes all three (device_cyclic.cuh). Per-component
+            // buffers cannot express that, so they are hoisted out of the loop below.
+            DeviceBuffer<scalar> gxA[3], gyA[3], gzA[3];
+            for (int k = 0; k < 3; ++k)
+            {
+                deviceCopy(gxA[k], gm.gx[k]);
+                deviceCopy(gyA[k], gm.gy[k]);
+                deviceCopy(gzA[k], gm.gz[k]);
+                addPairToGrad(k, gxA[k], gyA[k], gzA[k]);
+                // `linearUpwind <name>` where <name> resolves to `cellLimited Gauss linear <k>`.
+                if (in.gradULimitK > 0.0)
+                {
+                    CellLimitInterface ifs[1];
+                    DeviceBuffer<scalar> nbr;
+                    const int nIfs = pairLimitInterface(k, nbr, ifs);
+                    deviceCellLimitGrad(dm, *U[k], gm.ub[k], gxA[k], gyA[k], gzA[k], in.gradULimitK, ifs, nIfs);
+                }
+            }
+            for (int k = 0; k < 3; ++k)
+            {
+                DeviceBuffer<scalar> lu;
+                deviceLinearUpwindCorr(dm, *in.phiInt, gxA[k], gyA[k], gzA[k], lu);
+                // ...and the PAIR's faces, which that kernel's internal-face loop does not reach. The host
+                // reference adds them (fvm::addLinearUpwindCorrectionCoupled, called from every interFoam
+                // UEqn assembly); this arm had the kernel for it since the legacy driver and never called
+                // it. It accumulates into the SAME buffer, so both halves leave through one axpy with the
+                // scheme's share -- 1 for linearUpwind, 0.25 for LUST.
+                if (in.cyc && in.cyc->n > 0)
+                {
+                    if (!in.cycConvFlux)
+                        throw std::runtime_error(
+                            "brae device UEqn: linearUpwind's deferred correction across a coupled patch "
+                            "must be weighted by the SAME flux the matrix was assembled with "
+                            "(MomentumInput::cycConvFlux). Refusing rather than weighting it with the "
+                            "interface's volumetric phi on an equation that convects with rhoPhi.");
+                    deviceCyclicAddLinUpwindCorr(*in.cyc, k, gxA, gyA, gzA, lu, in.cycConvFlux);
+                }
+                deviceAxpy(-corrFac, lu, M.source[k]);
+            }
+        }
+    };
+
+    // + MRF.DDt(U), UEqn.H:8. Part of the LHS expression, so it is in the matrix BEFORE relax -- the
+    // same slot fvOptions' source occupies. EXPLICIT in U: OpenFOAM builds a volVectorField of
+    // Omega x U from the current U rather than an implicit Coriolis operator, so it is lagged like any
+    // other deferred term and lands as source -= V*(Omega x U).
+    auto addMrf = [&]()
+    {
+        if (in.mrf && !in.mrf->empty())
+        {
+            for (int k = 0; k < 3; ++k)
+            {
+                if (!in.mrfRho)
+                {
+                    deviceMrfCoriolisZone(*in.mrf, dm.V, Ux, Uy, Uz, k, M.source[k]);
+                    continue;
+                }
+                // ...and rho*DDt(U) where the caller's equation is rho-weighted: the kernel writes
+                // -V*(Omega x U) into a zeroed accumulator, which is then multiplied by rho and added in one
+                // rounding, as the host's `source += rho*acc` (inter_ueqn_cpp.cu:333-335) compiles. It was
+                // multiplied, rounded and then added -- a claim of "the same bits" that the host's object
+                // code does not bear out, and the rho-weighted MRF is interFoam's alone.
+                // the accumulator is ACCUMULATED into, so it is memset first: DeviceBuffer's pool hands back
+                // a same-size block that still holds the last user's numbers (rhoUEqn.cu:28-43)
+                DeviceBuffer<scalar> acc;
+                acc.resize(static_cast<std::size_t>(dm.nCells));
+                if (dm.nCells > 0)
+                {
+                    cudaCheck(cudaMemsetAsync(acc.data(), 0,
+                                              static_cast<std::size_t>(dm.nCells)*sizeof(scalar),
+                                              cudaStreamPerThread),
+                              "UEqn MRF acc zero");
+                }
+                deviceMrfCoriolisZone(*in.mrf, dm.V, Ux, Uy, Uz, k, acc);
+                if (dm.nCells > 0)
+                {
+                    addRhoAccKernel<<<(dm.nCells + 255) / 256, 256>>>(
+                        dm.nCells, in.mrfRho->data(), acc.data(), M.source[k].data());
+                    cudaCheck(cudaGetLastError(), "UEqn MRF rho*acc");
+                }
+            }
+        }
+    };
+
+    // ---- fvm::ddt(rho, U), for a transient momentum equation --------------------------------
+    // BEFORE relax(), as the fvMatrix constructor's `+` puts it; straight after the convection in
+    // interFoam's order, after every other term in the legacy one. rho and rho.oldTime() are separate
+    // fields on purpose -- see device_inter_ueqn.cuh.
+    auto addDdt = [&]()
+    {
+        if (in.ddtRho)
+        {
+            if (!in.ddtRhoOld || !in.ddtUOld[0] || !in.ddtUOld[1] || !in.ddtUOld[2])
+                throw std::runtime_error(
+                    "brae momentum: a transient ddt needs rho, rho.oldTime() and all three components of "
+                    "U.oldTime(). rho.oldTime() is NOT rho at a VoF interface -- they differ by the density "
+                    "ratio -- so it is a separate argument and cannot be defaulted to the first.");
+            if (in.ddtCn && in.ddtRDeltaT)
+                throw std::runtime_error(
+                    "brae momentum (device): CrankNicolson and a local time step at once -- one ddt scheme.");
+            if (in.ddtCn)
+            {
+                // CrankNicolson, transcribed from the host reference (crank_nicolson_ddt_scheme_cpp.cu)
+                if (!in.ddtCnDdt0 || !in.ddtRhoOO || !in.ddtUOO[0] || !in.ddtUOO[1] || !in.ddtUOO[2])
+                    throw std::runtime_error(
+                        "brae momentum: CrankNicolson's fvm::ddt(rho, U) needs its ddt0 field, "
+                        "rho.oldTime().oldTime() and all three components of U.oldTime().oldTime().");
+                // THE MOVING BRANCH (CrankNicolsonDdtScheme.C:1029-1065): ddt0 weighted by V0 and V00
+                // and the source by V0. What is refused is HALF a moving mesh -- V0 without V00 means
+                // the caller never asked the mesh for its second old level, and the static branch would
+                // then run under the scheme's name on a mesh whose volumes changed.
+                if (in.ddtV0 && !in.ddtV00)
+                    throw std::runtime_error(
+                        "brae momentum (device): CrankNicolson's fvm::ddt on a moving mesh needs "
+                        "mesh().V00() as well as V0 -- the moving branch weights the two old levels by "
+                        "their own volumes. The caller gave V0 alone.");
+                DeviceBuffer<scalar>* src[3] = {&M.source[0], &M.source[1], &M.source[2]};
+                deviceCnFvmDdt(*in.ddtCn, *in.ddtCnDdt0, in.ddtRho, in.ddtRhoOld, in.ddtRhoOO, 3,
+                               in.ddtUOld, in.ddtUOO, dm.V, M.diag, src, in.ddtV0, in.ddtV00);
+            }
+            else if (in.ddtRDeltaT)
+            {
+                if (in.ddtV0)
+                    throw std::runtime_error(
+                        "brae momentum (device): a local time step on a moving mesh is not ported.");
+                deviceInterLocalEulerDdtRhoU(dm, *in.ddtRho, *in.ddtRhoOld,
+                                             *in.ddtUOld[0], *in.ddtUOld[1], *in.ddtUOld[2], *in.ddtRDeltaT,
+                                             M.diag, M.source[0], M.source[1], M.source[2]);
+            }
+            else
+            {
+                deviceInterEulerDdtRhoU(dm, *in.ddtRho, *in.ddtRhoOld,
+                                        *in.ddtUOld[0], *in.ddtUOld[1], *in.ddtUOld[2], in.ddtDeltaT,
+                                        M.diag, M.source[0], M.source[1], M.source[2], in.ddtV0);
+            }
+        }
+    };
+
+    // interFoam's order ACCUMULATES every source term from zero, so the source starts zeroed -- resize()
+    // recycles a pool block (see zeroBuffer). The legacy order needs none: divDevReff assigns it.
+    if (in.interOrder)
+    {
+        for (int k = 0; k < 3; ++k) zeroBuffer(M.source[k], dm.nCells);
+    }
+
     // ---- fvm::div(phi, U) -------------------------------------------------------------------
     // Upwind implicit weights, matching the reference's fvm::div. The weights of this operator are where
     // brae's LUST defect lived, which is why the CUDA-vs-reference test compares them coefficient by
@@ -233,6 +513,18 @@ void assembleUEqn(
             break;
     }
 
+    // interFoam's order (inter_ueqn_cpp.cu assembleUEqn): fvm::div's deferred correction, then fvm::ddt,
+    // then MRF, and only then divDevRhoReff. The DIAGONAL is where it shows first: (div + ddt) - lap and
+    // (div - lap) + ddt round differently. MEASURED on pistonLES, step 1, corrector 0: the UEqn diagonal
+    // off the host's in the last bit in 14,029 of 56,000 cells with ddt added last, 115 in this order --
+    // and the device's p_rgh counts OpenFOAM's in 89 of 90 solves before, 90 of 90 after.
+    if (in.interOrder)
+    {
+        addDeferredCorrection();
+        addDdt();
+        addMrf();
+    }
+
     // ---- - fvm::laplacian(nuEff, U) ---------------------------------------------------------
     // The implicit half of divDevReff. Face nuEff is passed in already interpolated, and the BOUNDARY
     // faces carry the patch value (nut_wall on a wall function), not the owner cell's.
@@ -270,200 +562,58 @@ void assembleUEqn(
         deviceAxpy(-1.0, t, M.diag);
     }
 
-    // ---- explicit divDevReff: -fvc::div(nuEff*dev2(T(grad U))) ------------------------------
-    // The kernel returns the EXTENSIVE V*div(sigma), which is exactly what the reference adds to `source`
-    // (it computes -div(sigma) per volume and then subtracts it times V). So this is the source, directly.
-    // ...WITH THE PAIR. divDevReff is an EXPLICIT term and a periodic face is in it twice: in the
-    // fvc::grad(U) the deviatoric stress is built from, and in the fvc::div of that stress. The
-    // function carries both already; this call handed it a null pair. It is identically zero on a case
-    // at rest -- grad(U) is zero -- and live from the second step: MEASURED on
-    // validation/interFoamCyclic, UEqn's source 2.4e-05 of 2.5e-01 from the host at step two, which is
-    // HbyA 5.3e-04 of 1.9e+00 at the pair's own cells and U 2.1e-04 by the end of the step.
-    deviceDivDevReff(dm, dbU, Ux, Uy, Uz, *in.nuEffCell, *in.nuEffBndFace,
-                     M.source[0], M.source[1], M.source[2],
-                     in.cyc, /*ami*/nullptr, /*proc*/nullptr, in.UbStored,
-                     // The gradSchemes `grad(U)` entry, which linearViscousStress.C:114's fvc::grad(U)
-                     // resolves. These five arguments fell through to their defaults, so the case's
-                     // limiter never reached the dev2 term on this driver -- the legacy one has passed
-                     // it since device_simple_foam.cu.
-                     in.gradUSchemeLimitK,
-                     in.gradUSchemeLeastSq,
-                     // ...or the registry's cached grad(U), cells and boundary (MomentumInput::gradBGiven)
-                     in.gradUGivenTensor,
-                     in.gradBGiven);
-
-    // ---- explicit non-orthogonal correction --------------------------------------------------
-    // AFTER divDevReff, which ASSIGNS the source (device_divdevreff.cu: `dX[c] = d[0]`) rather than
-    // accumulating into it. Adding the correction first compiles and runs and is silently discarded.
-    //
-    // deviceLaplacianCorr returns the LAPLACIAN's own source correction (-V*fvc::div(faceFluxCorr)).
-    // divDevReff carries MINUS the laplacian, so it enters the momentum source with the opposite sign --
-    // the bookkeeping the existing GPU driver does at device_simple_foam.cu:1423-1426, and the sign a
-    // measurement against real OpenFOAM had to settle on the reference side (backwards made U worse).
-    if (in.correctedLaplacian)
+    if (in.interOrder)
     {
-        const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
-        DeviceBuffer<scalar> gxc[3], gyc[3], gzc[3];
-        const GradUMemo& gm = in.gradUGivenMemo ? *in.gradUGivenMemo : deviceGradUShared(dm, dbU, Ux, Uy, Uz, in.UbStored);       // the same grad(U) as the sites below
+        addLaplacianCorrection();
+        // the explicit stress LAST and ACCUMULATED, where the legacy order below assigns it first. The
+        // kernel's raw face sum V*div(sigma) is not the host's source term: that is fl(sum/V)*V added in
+        // one rounding (addStressAsHostKernel), and the two differ in the last bit.
+        DeviceBuffer<scalar> t[3];
+        deviceDivDevReff(dm, dbU, Ux, Uy, Uz, *in.nuEffCell, *in.nuEffBndFace,
+                         t[0], t[1], t[2],
+                         in.cyc, /*ami*/nullptr, /*proc*/nullptr, in.UbStored,
+                         in.gradUSchemeLimitK,
+                         in.gradUSchemeLeastSq,
+                         in.gradUGivenTensor,
+                         in.gradBGiven);
         for (int k = 0; k < 3; ++k)
         {
-            deviceCopy(gxc[k], gm.gx[k]);
-            deviceCopy(gyc[k], gm.gy[k]);
-            deviceCopy(gzc[k], gm.gz[k]);
-            addPairToGrad(k, gxc[k], gyc[k], gzc[k]);
-        }
-        if (in.snGradLimitCoeff > 0.0)
-        {
-            // `limited <k> corrected`. OF's limitedSnGrad takes mag() of the WHOLE snGrad and of the
-            // WHOLE correction, so all three components share one per-face limiter -- which is why this
-            // cannot be done inside the per-component loop above.
-            DeviceBuffer<scalar> ffc[3];
-            deviceLaplacianCorrFluxLimitedVec(dm, *in.nuEffFace, *U[0], *U[1], *U[2],
-                                              gxc, gyc, gzc, in.snGradLimitCoeff, ffc);
-            for (int k = 0; k < 3; ++k)
-            {
-                DeviceBuffer<scalar> lc;
-                deviceFaceDivSource(dm, ffc[k], lc);
-                deviceAxpy(-1.0, lc, M.source[k]);
-            }
-        }
-        else
-        {
-            for (int k = 0; k < 3; ++k)
-            {
-                DeviceBuffer<scalar> lc;
-                deviceLaplacianCorr(dm, *in.nuEffFace, gxc[k], gyc[k], gzc[k], lc);
-                deviceAxpy(-1.0, lc, M.source[k]);
-            }
+            addStressAsHostKernel<<<(dm.nCells + 255) / 256, 256>>>(
+                dm.nCells, t[k].data(), dm.V.data(), M.source[k].data());
+            cudaCheck(cudaGetLastError(), "UEqn stress (interFoam order)");
         }
     }
-
-    // ---- linearUpwind's deferred correction --------------------------------------------------
-    // AFTER divDevReff for the same reason as the block above: that call ASSIGNS the source.
-    //
-    // OpenFOAM applies this inside fvm::div, but it only ever touches `source`, so its position among the
-    // other source contributions is free -- what is NOT free is being after the assignment and before
-    // relax(), which reads the source. SUBTRACTED, because `fvm += fvc::surfaceIntegrate(...)` on an
-    // fvMatrix means `source -= V*...` (fvMatrix.C:1855-1862).
-    //
-    // Per component with the SCALAR gradient of that component, which is what OpenFOAM's `vector`
-    // specialisation computes as one tensor grad: (d & grad(U))_j = d . grad(U_j) under OpenFOAM's
-    // grad(U)_ij = d(U_j)/d(x_i) convention. The two are the same field, not an approximation of it.
-    // How much of linearUpwind's correction this scheme carries: 1 for linearUpwind, 0.25 for LUST
-    // (LUST.H overrides correction() too), 0 otherwise.
-    // linearUpwindV: a DIFFERENT correction, limited across the three components at once, so it cannot
-    // be expressed as a factor on linearUpwind's.
-    if (in.scheme == cpu::DivScheme::linearUpwindV)
+    else
     {
-        const DeviceBuffer<scalar>* Usrc[3] = {&Ux, &Uy, &Uz};
-        DeviceBuffer<scalar> gx[3], gy[3], gz[3], cx, cy, cz;
-        const GradUMemo& gm = in.gradUGivenMemo ? *in.gradUGivenMemo : deviceGradUShared(dm, dbU, Ux, Uy, Uz, in.UbStored);
-        for (int k = 0; k < 3; ++k)
-        {
-            deviceCopy(gx[k], gm.gx[k]);
-            deviceCopy(gy[k], gm.gy[k]);
-            deviceCopy(gz[k], gm.gz[k]);
-            addPairToGrad(k, gx[k], gy[k], gz[k]);
-            if (in.gradULimitK > 0.0)
-            {
-                CellLimitInterface ifs[1];
-                DeviceBuffer<scalar> nbr;
-                const int nIfs = pairLimitInterface(k, nbr, ifs);
-                deviceCellLimitGrad(dm, *Usrc[k], gm.ub[k], gx[k], gy[k], gz[k], in.gradULimitK, ifs, nIfs);
-            }
-        }
-        deviceLinearUpwindVCorr(dm, *in.phiInt, gx, gy, gz, Ux, Uy, Uz, cx, cy, cz);
-        const DeviceBuffer<scalar>* cc[3] = {&cx, &cy, &cz};
-        for (int k = 0; k < 3; ++k) deviceAxpy(-1.0, *cc[k], M.source[k]);
-    }
-
-    const scalar corrFac = (in.scheme == cpu::DivScheme::linearUpwind || in.linearUpwind) ? 1.0
-                         : (in.scheme == cpu::DivScheme::LUST)                            ? 0.25
-                         : 0.0;
-    if (corrFac != 0.0)
-    {
-        const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
-        const GradUMemo& gm = in.gradUGivenMemo ? *in.gradUGivenMemo : deviceGradUShared(dm, dbU, Ux, Uy, Uz, in.UbStored);
-        // ALL THREE components' gradients are built first, because the pair's correction reconstructs
-        // the neighbour in the NEIGHBOUR's frame: on a rotational cyclic the component that comes back
-        // is forwardT . (gradU[nbr] . dNbr), which mixes all three (device_cyclic.cuh). Per-component
-        // buffers cannot express that, so they are hoisted out of the loop below.
-        DeviceBuffer<scalar> gxA[3], gyA[3], gzA[3];
-        for (int k = 0; k < 3; ++k)
-        {
-            deviceCopy(gxA[k], gm.gx[k]);
-            deviceCopy(gyA[k], gm.gy[k]);
-            deviceCopy(gzA[k], gm.gz[k]);
-            addPairToGrad(k, gxA[k], gyA[k], gzA[k]);
-            // `linearUpwind <name>` where <name> resolves to `cellLimited Gauss linear <k>`.
-            if (in.gradULimitK > 0.0)
-            {
-                CellLimitInterface ifs[1];
-                DeviceBuffer<scalar> nbr;
-                const int nIfs = pairLimitInterface(k, nbr, ifs);
-                deviceCellLimitGrad(dm, *U[k], gm.ub[k], gxA[k], gyA[k], gzA[k], in.gradULimitK, ifs, nIfs);
-            }
-        }
-        for (int k = 0; k < 3; ++k)
-        {
-            DeviceBuffer<scalar> lu;
-            deviceLinearUpwindCorr(dm, *in.phiInt, gxA[k], gyA[k], gzA[k], lu);
-            // ...and the PAIR's faces, which that kernel's internal-face loop does not reach. The host
-            // reference adds them (fvm::addLinearUpwindCorrectionCoupled, called from every interFoam
-            // UEqn assembly); this arm had the kernel for it since the legacy driver and never called
-            // it. It accumulates into the SAME buffer, so both halves leave through one axpy with the
-            // scheme's share -- 1 for linearUpwind, 0.25 for LUST.
-            if (in.cyc && in.cyc->n > 0)
-            {
-                if (!in.cycConvFlux)
-                    throw std::runtime_error(
-                        "brae device UEqn: linearUpwind's deferred correction across a coupled patch "
-                        "must be weighted by the SAME flux the matrix was assembled with "
-                        "(MomentumInput::cycConvFlux). Refusing rather than weighting it with the "
-                        "interface's volumetric phi on an equation that convects with rhoPhi.");
-                deviceCyclicAddLinUpwindCorr(*in.cyc, k, gxA, gyA, gzA, lu, in.cycConvFlux);
-            }
-            deviceAxpy(-corrFac, lu, M.source[k]);
-        }
+        // ---- explicit divDevReff: -fvc::div(nuEff*dev2(T(grad U))) ------------------------------
+        // The kernel returns the EXTENSIVE V*div(sigma), which is exactly what the reference adds to `source`
+        // (it computes -div(sigma) per volume and then subtracts it times V). So this is the source, directly.
+        // ...WITH THE PAIR. divDevReff is an EXPLICIT term and a periodic face is in it twice: in the
+        // fvc::grad(U) the deviatoric stress is built from, and in the fvc::div of that stress. The
+        // function carries both already; this call handed it a null pair. It is identically zero on a case
+        // at rest -- grad(U) is zero -- and live from the second step: MEASURED on
+        // validation/interFoamCyclic, UEqn's source 2.4e-05 of 2.5e-01 from the host at step two, which is
+        // HbyA 5.3e-04 of 1.9e+00 at the pair's own cells and U 2.1e-04 by the end of the step.
+        deviceDivDevReff(dm, dbU, Ux, Uy, Uz, *in.nuEffCell, *in.nuEffBndFace,
+                         M.source[0], M.source[1], M.source[2],
+                         in.cyc, /*ami*/nullptr, /*proc*/nullptr, in.UbStored,
+                         // The gradSchemes `grad(U)` entry, which linearViscousStress.C:114's fvc::grad(U)
+                         // resolves. These five arguments fell through to their defaults, so the case's
+                         // limiter never reached the dev2 term on this driver -- the legacy one has passed
+                         // it since device_simple_foam.cu.
+                         in.gradUSchemeLimitK,
+                         in.gradUSchemeLeastSq,
+                         // ...or the registry's cached grad(U), cells and boundary (MomentumInput::gradBGiven)
+                         in.gradUGivenTensor,
+                         in.gradBGiven);
+        addLaplacianCorrection();
+        addDeferredCorrection();
+        addMrf();
     }
 
     // ---- == fvOptions(U) ----------------------------------------------------------------------
     // BEFORE relax, as UEqn.H has it. The diagonal takes the isotropic part implicitly and the source
     // the anisotropic remainder, which is what keeps a 5e7 Darcy coefficient stable.
-    // + MRF.DDt(U), UEqn.H:8. Part of the LHS expression, so it is in the matrix BEFORE relax -- the
-    // same slot fvOptions' source occupies. EXPLICIT in U: OpenFOAM builds a volVectorField of
-    // Omega x U from the current U rather than an implicit Coriolis operator, so it is lagged like any
-    // other deferred term and lands as source -= V*(Omega x U).
-    if (in.mrf && !in.mrf->empty())
-    {
-        for (int k = 0; k < 3; ++k)
-        {
-            if (!in.mrfRho)
-            {
-                deviceMrfCoriolisZone(*in.mrf, dm.V, Ux, Uy, Uz, k, M.source[k]);
-                continue;
-            }
-            // ...and rho*DDt(U) where the caller's equation is rho-weighted, as rhoSimpleFoam's device
-            // arm forms it (rhoUEqn.cu:769-777): the kernel writes -V*(Omega x U) into a zeroed
-            // accumulator, which is then multiplied by rho and added. acc already carries the volume and
-            // the sign, and rho is a cell field, so rho*(a*V) == (rho*a)*V -- a rearrangement, not another
-            // term, and the same bits as the host's `source += rho*acc` (inter_ueqn_cpp.cu:210-220).
-            // the accumulator is ACCUMULATED into, so it is memset first: DeviceBuffer's pool hands back
-            // a same-size block that still holds the last user's numbers (rhoUEqn.cu:28-43)
-            DeviceBuffer<scalar> acc, t;
-            acc.resize(static_cast<std::size_t>(dm.nCells));
-            if (dm.nCells > 0)
-            {
-                cudaCheck(cudaMemsetAsync(acc.data(), 0,
-                                          static_cast<std::size_t>(dm.nCells)*sizeof(scalar),
-                                          cudaStreamPerThread),
-                          "UEqn MRF acc zero");
-            }
-            deviceMrfCoriolisZone(*in.mrf, dm.V, Ux, Uy, Uz, k, acc);
-            deviceHadamard(t, acc, *in.mrfRho);
-            deviceAxpy(1.0, t, M.source[k]);
-        }
-    }
 
     // == fvOptions(U): rotorDiskSource. Two operators, not one. addSup does `eqn -= force` with force
     // PER VOLUME, and fvMatrix::operator-=(DimensionedField) is `source() += V*su`, so the OPTION
@@ -525,55 +675,11 @@ void assembleUEqn(
         deviceCopy(M.cycIfCoeff, in.cyc->ifCoeff);
     }
 
-    // ---- fvm::ddt(rho, U), for a transient momentum equation --------------------------------
-    // BEFORE relax(), as the fvMatrix constructor's `+` puts it. rho and rho.oldTime() are separate
-    // fields on purpose -- see device_inter_ueqn.cuh.
-    if (in.ddtRho)
+    if (!in.interOrder)
     {
-        if (!in.ddtRhoOld || !in.ddtUOld[0] || !in.ddtUOld[1] || !in.ddtUOld[2])
-            throw std::runtime_error(
-                "brae momentum: a transient ddt needs rho, rho.oldTime() and all three components of "
-                "U.oldTime(). rho.oldTime() is NOT rho at a VoF interface -- they differ by the density "
-                "ratio -- so it is a separate argument and cannot be defaulted to the first.");
-        if (in.ddtCn && in.ddtRDeltaT)
-            throw std::runtime_error(
-                "brae momentum (device): CrankNicolson and a local time step at once -- one ddt scheme.");
-        if (in.ddtCn)
-        {
-            // CrankNicolson, transcribed from the host reference (crank_nicolson_ddt_scheme_cpp.cu)
-            if (!in.ddtCnDdt0 || !in.ddtRhoOO || !in.ddtUOO[0] || !in.ddtUOO[1] || !in.ddtUOO[2])
-                throw std::runtime_error(
-                    "brae momentum: CrankNicolson's fvm::ddt(rho, U) needs its ddt0 field, "
-                    "rho.oldTime().oldTime() and all three components of U.oldTime().oldTime().");
-            // THE MOVING BRANCH (CrankNicolsonDdtScheme.C:1029-1065): ddt0 weighted by V0 and V00
-            // and the source by V0. What is refused is HALF a moving mesh -- V0 without V00 means
-            // the caller never asked the mesh for its second old level, and the static branch would
-            // then run under the scheme's name on a mesh whose volumes changed.
-            if (in.ddtV0 && !in.ddtV00)
-                throw std::runtime_error(
-                    "brae momentum (device): CrankNicolson's fvm::ddt on a moving mesh needs "
-                    "mesh().V00() as well as V0 -- the moving branch weights the two old levels by "
-                    "their own volumes. The caller gave V0 alone.");
-            DeviceBuffer<scalar>* src[3] = {&M.source[0], &M.source[1], &M.source[2]};
-            deviceCnFvmDdt(*in.ddtCn, *in.ddtCnDdt0, in.ddtRho, in.ddtRhoOld, in.ddtRhoOO, 3,
-                           in.ddtUOld, in.ddtUOO, dm.V, M.diag, src, in.ddtV0, in.ddtV00);
-        }
-        else if (in.ddtRDeltaT)
-        {
-            if (in.ddtV0)
-                throw std::runtime_error(
-                    "brae momentum (device): a local time step on a moving mesh is not ported.");
-            deviceInterLocalEulerDdtRhoU(dm, *in.ddtRho, *in.ddtRhoOld,
-                                         *in.ddtUOld[0], *in.ddtUOld[1], *in.ddtUOld[2], *in.ddtRDeltaT,
-                                         M.diag, M.source[0], M.source[1], M.source[2]);
-        }
-        else
-        {
-            deviceInterEulerDdtRhoU(dm, *in.ddtRho, *in.ddtRhoOld,
-                                    *in.ddtUOld[0], *in.ddtUOld[1], *in.ddtUOld[2], in.ddtDeltaT,
-                                    M.diag, M.source[0], M.source[1], M.source[2], in.ddtV0);
-        }
+        addDdt();
     }
+
 
     // ---- UEqn.relax() -----------------------------------------------------------------------
     // OpenFOAM's fvMatrix::relax is ASYMMETRIC: it ADDS cmptMax(cmptMag(internalCoeffs)) to the diagonal

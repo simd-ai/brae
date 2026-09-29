@@ -1,5 +1,5 @@
-// cf GPU offload (G1): the device lduMatrix SpMV kernel (Amul). One thread per cell gathers the diagonal
-// plus the owner-ordered upper faces and the neighbour-sorted lower faces, race-free, deterministic.
+// cf GPU offload (G1): the device lduMatrix SpMV kernel (Amul). One thread per cell gathers the diagonal and
+// then its faces in increasing face order -- OpenFOAM's face loop's order per cell -- race-free, deterministic.
 #include "device_ldu.cuh"
 #include "device_halo.cuh"
 #include "distributed_ami.cuh"   // DistributedAMI + distributedAmiAmul: optional cyclicAMI coupling in the matvec
@@ -28,15 +28,31 @@ void amulKernel(
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
 
+    // lduMatrixATmul.C:121-135, the branch a solve takes (nothing calls lowerCSR(), so hasLowerCSR() is false):
+    // Apsi = diag*psi, then ONE loop over the faces in index order, each adding its lower term to the
+    // neighbour and its upper term to the owner. A cell therefore receives its contributions in increasing
+    // FACE order, owned and neighbouring faces interleaved -- not every owned face and then every
+    // neighbouring one, which is the same sum in another order and another last bit. Both lists are
+    // ascending in face index (ownerStart: faces are upper-triangular ordered; losort: stable by
+    // neighbour), so the walk below is a merge of the two by face index.
     scalar s = diag[c] * psi[c];
-    const int u0 = ownerStart[c], u1 = ownerStart[c + 1];
-    for (int f = u0; f < u1; ++f)
-        s += upper[f] * psi[nei[f]];          // faces owned by c
-    const int l0 = losortStart[c], l1 = losortStart[c + 1];
-    for (int k = l0; k < l1; ++k)
+    int f = ownerStart[c];
+    const int u1 = ownerStart[c + 1];
+    int k = losortStart[c];
+    const int l1 = losortStart[c + 1];
+    while (f < u1 || k < l1)
     {
-        const int f = losort[k];
-        s += lower[f] * psi[owner[f]];  // faces neighbouring c
+        const int fl = (k < l1) ? losort[k] : 0x7fffffff;
+        if (f < u1 && f < fl)
+        {
+            s += upper[f] * psi[nei[f]];      // c owns face f
+            ++f;
+        }
+        else
+        {
+            s += lower[fl] * psi[owner[fl]];  // c is face fl's neighbour
+            ++k;
+        }
     }
     Apsi[c] = s;
 }

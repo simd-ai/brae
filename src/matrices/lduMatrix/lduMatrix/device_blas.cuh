@@ -8,6 +8,8 @@ namespace brae {
 
 void   deviceAxpy(scalar a, const DeviceBuffer<scalar>& x, DeviceBuffer<scalar>& y);  // y += a*x
 void   deviceScale(DeviceBuffer<scalar>& x, scalar a);                                // x *= a
+// BRAE_DEVICE_OF_REDUCE=1: every dot and sum(|x|) below in OpenFOAM's sequential cell order (reductions.cu)
+bool deviceOfOrderReductions();
 scalar deviceDot(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y);       // x . y  (reduction)
 void   deviceCopy(DeviceBuffer<scalar>& dst, const DeviceBuffer<scalar>& src);        // dst = src (D2D)
 void   deviceJacobi(DeviceBuffer<scalar>& z, const DeviceBuffer<scalar>& r, const scalar* diag);  // z = r/diag

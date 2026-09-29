@@ -200,6 +200,19 @@ RunReport runInterFoamDevice(
     if (gradUStale)
         std::printf("  *** CONTROL MODE: the cached grad(U) is never re-formed after the closure. This run is "
                     "deliberately wrong. ***\n");
+    // ...and two for the mesh update on a moving mesh, each half of the defect the guard below removed:
+    // MOVE_EVERY_OUTER runs this loop's move block at every outer corrector whatever moveMeshOuterCorrectors says
+    // (the host stage still returns early there, so what runs is the refresh -- the host phi it did not rewrite
+    // copied over the device's under correctPhi); V0_FROM_V takes V0 from the volumes as they stand before each
+    // update instead of the mesh's once-per-step store. Both WRONG, together the old behaviour.
+    const bool moveEveryOuter = std::getenv("BRAE_CONTROL_DEVICE_MOVE_EVERY_OUTER") != nullptr;
+    if (moveEveryOuter)
+        std::printf("  *** CONTROL MODE: the mesh update runs at every outer corrector. This run is "
+                    "deliberately wrong. ***\n");
+    const bool v0FromV = std::getenv("BRAE_CONTROL_DEVICE_V0_FROM_V") != nullptr;
+    if (v0FromV)
+        std::printf("  *** CONTROL MODE: V0 is re-taken from the volumes before every mesh update. This run is "
+                    "deliberately wrong. ***\n");
     const bool gradUBndLive = std::getenv("BRAE_CONTROL_GRADU_BND_LIVE") != nullptr;
     if (gradUBndLive)
         std::printf("  *** CONTROL MODE: the cached grad(U)'s boundary is rebuilt at the assembly. This run is "
@@ -2370,16 +2383,31 @@ RunReport runInterFoamDevice(
             // operations on either arm; what this loop owes afterwards is the geometry it had
             // uploaded. A moving mesh with an AMI or a coupled pair is refused above, so the
             // interfaces below it do not move.
-            if (dyn)
+            // interFoam.C:112: `if (pimple.firstIter() || moveMeshOuterCorrectors)` -- the move, CorrectPhi and
+            // the geometry refresh below run on the first outer corrector only unless the case asks for more,
+            // as the host stage returns early (inter_driver_cpp.cu, interMeshUpdate) and the adaptive branch
+            // below is guarded. Unguarded, this block ran at every corrector: the host phi it copies under
+            // correctPhi is the one the host skipped rewriting (stale), and V0 was re-taken from the MOVED
+            // volumes -- neither seen by a gate while every device-arm moving profile ran one corrector.
+            if (dyn && (outer == 0 || f.moveMeshOuterCorrectors || moveEveryOuter))
             {
-                // storeOldVol BEFORE the geometry is recomputed -- OF fvMesh::movePoints:944. The
-                // ddt's old-time term belongs to the volume the old-time field was stored in.
-                dV0.copyFrom(dm.V.host());
-                C.V0 = &dV0;
+                if (v0FromV)
+                {
+                    dV0.copyFrom(dm.V.host());
+                }
                 interMeshUpdate(dyn, f, m, g, fvp, mutableMesh, /*amiPairs=*/nullptr,
                                 meshAgglomeration, meshCpc, rep, stepTime, stepIndex, outer,
                                 f.pimple.nOuterCorrectors,
                                 f.ddtU == DdtScheme::CrankNicolson ? &cnClock : nullptr);
+                // storeOldVol -- OF fvMesh::movePoints:944, the volumes the cells had when the TIME STEP
+                // began, stored ONCE per time index inside update() (dynamic_motion_solver_fv_mesh_cpp.cu).
+                // Not dm.V before the call: under moveMeshOuterCorrectors the second update's dm.V is the
+                // first update's moved volume.
+                if (!v0FromV)
+                {
+                    dV0.copyFrom(dyn->V0());
+                }
+                C.V0 = &dV0;
                 // ...and now every buffer this loop uploaded from the geometry. clearGeom +
                 // clearOut on the device side: the addressing is untouched, as the move keeps the
                 // topology fixed (device_mesh.cuh).
@@ -3122,8 +3150,8 @@ RunReport runInterFoamDevice(
                 ti.finalIter = finalOuter ? 1 : 0;
                 // A MOVING MESH's two terms, the pair the HOST closure has always taken
                 // (InterTurbulenceStepInput::V0/meshPhi at inter_driver_cpp.cu): the volumes the cells
-                // had BEFORE this step's move -- dV0 above, filled from dm.V before interMeshUpdate
-                // recomputes the geometry, which is OF fvMesh::movePoints:944's storeOldVol -- and the
+                // had BEFORE this step's move -- dV0 above, the mesh's own once-per-step store, which is OF
+                // fvMesh::movePoints:944's storeOldVol -- and the
                 // mesh flux, split back into the internal and boundary arrays the closure's deviceDiv
                 // takes (dMeshPhi is the FULL face array, as phi is).
                 DeviceBuffer<scalar> dMeshPhiI, dMeshPhiB;

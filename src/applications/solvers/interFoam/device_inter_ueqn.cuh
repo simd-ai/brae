@@ -42,8 +42,8 @@
 
 namespace brae {
 
-// fvm::ddt(rho, U), Euler, fixed mesh. Adds INTO an existing diagonal and source -- the div and stress
-// terms are assembled first, as they are on the host.
+// fvm::ddt(rho, U), Euler. Adds INTO an existing diagonal and source -- straight after the convection, as
+// the host adds it (MomentumInput::interOrder).
 //
 // `rho` and `rhoOld` are separate arguments on purpose; see note 1.
 void deviceInterEulerDdtRhoU(

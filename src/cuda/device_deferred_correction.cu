@@ -37,21 +37,42 @@ void linearUpwindCorrKernel(
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
+    // The host reference's fvm::linearUpwindCorrection (fvm.cuh), face for face and rounding for rounding:
+    //  - the faces in FACE order, a cell's owned (+) and neighboured (-) faces interleaved, as its scatter
+    //    reaches them -- this took every owned face and then every neighboured one;
+    //  - upwind on phi > 0, as linearUpwind.C:196 and the host have it (>= picked the owner at phi == 0);
+    //  - the contraction g++ makes of it (objdump -dl of the host object): the dot product
+    //    fma(dz, gz, fma(dx, gx, dy*gy)) -- the y product rounded, the x and z ones fused -- and phi*dot
+    //    fused into each accumulation, corr +- dot*phi in one rounding.
+    // MEASURED on mixerVessel2D's mesh with a smooth U (scratch parity harness, same inputs both arms):
+    // 80-88 per cent of cells off the host's in the last bit per component before, 0 after.
     scalar s = 0;
-    for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)                       // c is owner (+)
+    int f = ownerStart[c];
+    const int u1 = ownerStart[c + 1];
+    int k = losortStart[c];
+    const int l1 = losortStart[c + 1];
+    while (f < u1 || k < l1)
     {
-        const scalar pf = phi[f];
-        const int up = (pf >= 0) ? own[f] : nei[f];
-        const scalar dx = (pf >= 0) ? dOwnX[f] : dNeiX[f], dy = (pf >= 0) ? dOwnY[f] : dNeiY[f], dz = (pf >= 0) ? dOwnZ[f] : dNeiZ[f];
-        s += pf * (gx[up]*dx + gy[up]*dy + gz[up]*dz);
-    }
-    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)                     // c is neighbour (-)
-    {
-        const int f = losort[k];
-        const scalar pf = phi[f];
-        const int up = (pf >= 0) ? own[f] : nei[f];
-        const scalar dx = (pf >= 0) ? dOwnX[f] : dNeiX[f], dy = (pf >= 0) ? dOwnY[f] : dNeiY[f], dz = (pf >= 0) ? dOwnZ[f] : dNeiZ[f];
-        s -= pf * (gx[up]*dx + gy[up]*dy + gz[up]*dz);
+        const int fl = (k < l1) ? losort[k] : 0x7fffffff;
+        const bool owned = (f < u1 && f < fl);
+        const int face = owned ? f : fl;
+        const scalar pf = phi[face];
+        const bool fromOwner = (pf > 0);
+        const int up = fromOwner ? own[face] : nei[face];
+        const scalar dx = fromOwner ? dOwnX[face] : dNeiX[face];
+        const scalar dy = fromOwner ? dOwnY[face] : dNeiY[face];
+        const scalar dz = fromOwner ? dOwnZ[face] : dNeiZ[face];
+        const scalar dot = fma(dz, gz[up], fma(dx, gx[up], dy * gy[up]));
+        if (owned)
+        {
+            s = fma(dot, pf, s);
+            ++f;
+        }
+        else
+        {
+            s = fma(-dot, pf, s);
+            ++k;
+        }
     }
     corrSource[c] = s;
 }

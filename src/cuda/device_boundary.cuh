@@ -450,12 +450,15 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
             sm.push_back(sym ? 1 : 0);   // mixed / piov / symmetry masks
             const scalar seedVf = (cat == 5 && vfp) ? (*vfp)[i] : 0.0;
             {
+                // fvPatch::nf() = Sf()/magSf() (fvPatch.C:150-153), a DIVISION, as the host's patch.nf is
+                // (fv_patch.cu). It was Sf*(1/magSf): another last bit, and on a nearly axis-aligned face the
+                // pressureInletOutletVelocity transform diagonal sqrt(1 - n_k*n_k) cancels it up by ~1e4 --
+                // MEASURED on the piston's top patch as rAU 7.7e-11 from the host's on 40 cells at step one.
                 const vector Sf = g.Sf()[fvp[pi].start + i];
-                const scalar mg = g.magSf()[fvp[pi].start + i];   // unit face normal
-                const scalar inv = mg > 0 ? 1.0 / mg : 0.0;
-                nrm[0].push_back(Sf.x * inv);
-                nrm[1].push_back(Sf.y * inv);
-                nrm[2].push_back(Sf.z * inv);
+                const scalar mg = g.magSf()[fvp[pi].start + i];
+                nrm[0].push_back(mg > 0 ? Sf.x / mg : 0.0);
+                nrm[1].push_back(mg > 0 ? Sf.y / mg : 0.0);
+                nrm[2].push_back(mg > 0 ? Sf.z / mg : 0.0);
             }
             {
                 const vector gv = rgv ? (*rgv)[static_cast<std::size_t>(i)] : vector{0, 0, 0};

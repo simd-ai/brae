@@ -549,7 +549,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
     // OpenFOAM while the momentum matrix those are built from -- upper, lower, diag and source --
     // agrees to 1.5e-09, and rAU to 3.1e-10. tools/dumpInterFoam now suffixes its own per-corrector
     // writes for the same reason, so a bare `<name>.dump` is the first corrector on both sides.
-    const bool tapHere = (in.taps != nullptr) && (in.correctorIndex <= 0);
+    const bool tapHere = (in.taps != nullptr) && (std::max(in.correctorIndex, 0) == tapCorrectorWanted());
 
     // rAU = 1/UEqn.A(), rAUf = interpolate(rAU).
     const std::vector<scalar> A = matrixA(*in.UEqn, m, g, patches);
@@ -741,7 +741,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
     {
         static int firstCorrectors = 0;
         const char* dd = std::getenv("BRAE_STAGE_DUMP_DIR");
-        const bool countHere = (in.correctorIndex <= 0);
+        const bool countHere = (std::max(in.correctorIndex, 0) == tapCorrectorWanted());
         if (countHere) ++firstCorrectors;
         const char* it = std::getenv("BRAE_STAGE_DUMP_ITER");
         if (dd && countHere && firstCorrectors == (it && *it ? std::atoi(it) : 1))
@@ -926,7 +926,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
         FvScalarMatrix pe = fvm::laplacian<scalar>(rAUfField, p_rgh, m, g, patches, sc.correctedLaplacian, sc.nonOrthCoeffs);
         // corrector 0 on BOTH arms: the device copies its pressure taps there, and a dump that
         // compares different correctors reads as a defect in whichever term moves between them.
-        if (in.taps && corr == 0 && in.correctorIndex <= 0)
+        if (in.taps && corr == 0 && std::max(in.correctorIndex, 0) == tapCorrectorWanted())
         {
             in.taps->pLaplacianSource = pe.source;
             in.taps->tapCorrector = in.correctorIndex;
@@ -941,7 +941,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
             const std::vector<vector> gradP = gradOf(p_rgh, sc.gradPrgh, m, g, patches);
             const std::vector<scalar> corr = fvm::laplacianNonOrthSource<scalar, vector>(
                 rAUfField, p_rgh, gradP, m, g, patches, sc.snGradLimitCoeff);
-            if (in.taps && in.correctorIndex <= 0) in.taps->pNonOrthSource = corr;
+            if (in.taps && std::max(in.correctorIndex, 0) == tapCorrectorWanted()) in.taps->pNonOrthSource = corr;
             for (label c = 0; c < nC; ++c)
             {
                 pe.source[c] -= corr[c];
@@ -952,7 +952,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
                 rAUfField, gradP, g, patches, sc.snGradLimitCoeff, p_rgh);
         }
         const std::vector<scalar> div = fvc::div(phiHbyA, m, g, patches);
-        if (in.taps && corr == 0 && in.correctorIndex <= 0) in.taps->pDivPhiHbyA = div;
+        if (in.taps && corr == 0 && std::max(in.correctorIndex, 0) == tapCorrectorWanted()) in.taps->pDivPhiHbyA = div;
         for (label c = 0; c < nC; ++c) pe.source[c] += div[c] * g.V()[c];
 
         if (sc.needReference)
@@ -970,7 +970,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
 
         // the assembled system, at the device arm's tap point: after the source, before the solve,
         // and on the FIRST non-orthogonal pass only
-        if (in.taps && corr == 0 && in.correctorIndex <= 0)
+        if (in.taps && corr == 0 && std::max(in.correctorIndex, 0) == tapCorrectorWanted())
         {
             in.taps->pDiag = pe.diag;
             in.taps->pUpper = pe.upper;

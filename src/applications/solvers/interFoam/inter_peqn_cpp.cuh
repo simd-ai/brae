@@ -1,4 +1,5 @@
 #pragma once
+#include <cstdlib>
 #include <functional>
 // interFoam's pressure corrector -- the host reference.
 //
@@ -328,6 +329,17 @@ struct PressureTaps
     // disagreement in HbyA is a disagreement in one of these two.
     std::vector<scalar> hNoPairX, hPairX;
 };
+
+// WHICH PRESSURE CORRECTOR both arms tap: 0 unless BRAE_TAP_CORRECTOR names another. One selector for the
+// host's tap sites and the device's, so a comparison of the two can never read different correctors.
+inline int tapCorrectorWanted()
+{
+    static const int want = [] {
+        const char* e = std::getenv("BRAE_TAP_CORRECTOR");
+        return e ? std::atoi(e) : 0;
+    }();
+    return want;
+}
 
 // fvc::correctUf(Uf, U, phi), pEqn.H:70-72: Uf = interpolate(U) with its normal component replaced by
 // the flux's. Shared with the device loop, whose pressure step computes U and phi on the GPU and hands

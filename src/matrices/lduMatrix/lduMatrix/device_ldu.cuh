@@ -1,9 +1,11 @@
 #pragma once
-// cf GPU offload (G1): device lduMatrix + SpMV (Amul). Atomic-free, deterministic per-CELL gather,
-// exactly the OpenFOAM lduMatrix::Amul traversal:
-//   Apsi[c] = diag[c]*psi[c]
-//           + sum over faces OWNED by c    : upper[f]*psi[neighbour[f]]   (faces ordered by owner -> ownerStart)
-//           + sum over faces NEIGHBOURing c : lower[f]*psi[owner[f]]      (faces sorted by neighbour -> losort)
+// cf GPU offload (G1): device lduMatrix + SpMV (Amul). Atomic-free, deterministic per-CELL gather, in the
+// order OpenFOAM's lduMatrix::Amul face loop adds into each cell (lduMatrixATmul.C:121-135):
+//   Apsi[c] = diag[c]*psi[c], then every face of c in INCREASING FACE INDEX, adding
+//             upper[f]*psi[neighbour[f]] where c owns f and lower[f]*psi[owner[f]] where c neighbours it
+// (the owned faces come from ownerStart, the neighbouring ones from losort; the kernel merges the two). It
+// used to add every owned face and then every neighbouring one -- the same terms in another order, which
+// is another last bit, and on a solve whose residual is all cancellation another stopping iteration.
 // One thread per cell, no write races (the scatter is turned into a gather), reproducible order.
 #include "cf_types.cuh"
 #include "device_buffer.cuh"

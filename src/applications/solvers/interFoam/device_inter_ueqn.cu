@@ -28,7 +28,10 @@ __global__ void ddtRhoUKernel(
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
-    diag[c] += rDeltaT * rho[c] * V[c];
+    // fma() as g++ contracts the host's `M.diag[c] += rDeltaT * rho[c] * V[c]` (inter_ueqn_cpp.cuh:272,
+    // one fmadd in its object code) and the two source forms below (:277-279, :285) -- written out so
+    // nvcc's own contraction choice cannot move them.
+    diag[c] = fma(rDeltaT * rho[c], V[c], diag[c]);
     // rhoOld, NOT rho. At a VoF interface these differ by the density ratio.
     // ...and on a MOVING mesh the old-time term belongs to the volume the old-time field was stored
     // in: EulerDdtScheme's source is rDeltaT*rho.oldTime()*vf.oldTime()*mesh().Vsc0(), where V0 is the
@@ -38,15 +41,15 @@ __global__ void ddtRhoUKernel(
     if (V0)
     {
         const scalar w = rDeltaT * rhoOld[c];
-        sx[c] += w * uox[c] * V0[c];
-        sy[c] += w * uoy[c] * V0[c];
-        sz[c] += w * uoz[c] * V0[c];
+        sx[c] = fma(w * uox[c], V0[c], sx[c]);
+        sy[c] = fma(w * uoy[c], V0[c], sy[c]);
+        sz[c] = fma(w * uoz[c], V0[c], sz[c]);
         return;
     }
     const scalar w = rDeltaT * rhoOld[c] * V[c];
-    sx[c] += w * uox[c];
-    sy[c] += w * uoy[c];
-    sz[c] += w * uoz[c];
+    sx[c] = fma(w, uox[c], sx[c]);
+    sy[c] = fma(w, uoy[c], sy[c]);
+    sz[c] = fma(w, uoz[c], sz[c]);
 }
 
 // fvm::ddt(rho, U) under localEuler, static mesh (localEulerDdtScheme.C:282-308), in the host's order
@@ -61,11 +64,12 @@ __global__ void localEulerDdtRhoUKernel(
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
-    diag[c] += rDeltaT[c] * rho[c] * V[c];
+    // fma() as g++ contracts the host's addLocalEulerDdtRhoU (inter_ueqn_cpp.cuh:309-313)
+    diag[c] = fma(rDeltaT[c] * rho[c], V[c], diag[c]);
     const scalar w = rDeltaT[c] * rhoOld[c];
-    sx[c] += w * uox[c] * V[c];
-    sy[c] += w * uoy[c] * V[c];
-    sz[c] += w * uoz[c] * V[c];
+    sx[c] = fma(w * uox[c], V[c], sx[c]);
+    sy[c] = fma(w * uoy[c], V[c], sy[c]);
+    sz[c] = fma(w * uoz[c], V[c], sz[c]);
 }
 
 // source += V*R, componentwise. A PLUS -- see the header.

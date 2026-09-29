@@ -112,6 +112,24 @@ DeviceSolverPerf deviceDICPCG(
     return deviceJacobiPCG(S, b, psi, normFactor, tol, relTol, maxIter, minIter, &dic);
 }
 
+namespace
+{
+// lduMatrixSolver.C normFactor, the summand: mag(Apsi - tmpField) + mag(source - tmpField), per cell
+__global__ void normFactorSummandK(
+    int n,
+    const scalar* __restrict__ Apsi,
+    const scalar* __restrict__ b,
+    const scalar* __restrict__ tmp,
+    scalar* __restrict__ out)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n)
+    {
+        out[i] = fabs(Apsi[i] - tmp[i]) + fabs(b[i] - tmp[i]);
+    }
+}
+}   // namespace
+
 void deviceNormFactorInto(
     const DeviceLduView& A,
     const DeviceBuffer<scalar>& psi,
@@ -135,13 +153,15 @@ void deviceNormFactorInto(
     deviceScalarDivConst(dAvg.data(), (scalar)nC, dAvg.data());   // avgPsi = gAverage(psi) = (psi.ones)/nC
     deviceCopy(tmp, sumA);
     deviceScaleDev(dAvg.data(), tmp);      // tmp = sumA*avg(psi)
-    deviceCopy(t, Apsi);
-    deviceAxpy(-1.0, tmp, t);
-    deviceSumMagInto(t, dN1.data());   // n1 = |A*psi - tmp|
-    deviceCopy(t, b);
-    deviceAxpy(-1.0, tmp, t);
-    deviceSumMagInto(t, dN2.data());   // n2 = |b - tmp|
-    deviceScalarAdd2(dN1.data(), dN2.data(), 1e-20, dNorm.data());                    // n1 + n2 + 1e-20
+    // ONE sum, as lduMatrixSolver.C:
+    //     gSum((mag(Apsi - tmpField) + mag(source - tmpField))()) + solverPerformance::small_
+    // -- the two magnitudes added PER CELL and the pairs summed. It was sum|Apsi - tmp| + sum|b - tmp|: the
+    // same total in another association, another last bit, and the residual every stopping test divides by.
+    // The summand is >= 0, so sum(|x|) is the plain sum of it.
+    normFactorSummandK<<<(nC + 255)/256, 256>>>(nC, Apsi.data(), b.data(), tmp.data(), t.data());
+    deviceSumMagInto(t, dN1.data());
+    dN2.copyFrom(std::vector<scalar>{scalar(0)});
+    deviceScalarAdd2(dN1.data(), dN2.data(), 1e-20, dNorm.data());                    // sum + 0 + small
 }
 
 scalar deviceNormFactor(

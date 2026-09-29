@@ -229,9 +229,9 @@ void amgGSSweepIndirect(const DeviceLduView& A, const DeviceBuffer<scalar>& b, D
 
 // Apsi = A psi computed THROUGH the permuted layout (the gathered coefficients and row entries the
 // sweep reads), written back to the natural numbering. Its per-row summation is amulKernel's
-// (device_spmv.cu:31-40: the diagonal, then the owned faces' upper terms in face order, then the
-// neighboured faces' lower terms in losort order), so it is the same bits as deviceAmul on a sound
-// layout -- which is what makes it a test of the ADDRESSING. Throws as the sweep does. It writes the
+// (device_spmv.cu: the diagonal, then the faces in increasing face index, owned and neighboured
+// interleaved -- a merge of the row's two runs, which the sweep keeps in gsColorT's order), so it is the
+// same bits as deviceAmul on a sound layout -- which is what makes it a test of the ADDRESSING. Throws as the sweep does. It writes the
 // colouring's per-sweep scratch (bP/psiP), which every sweep rewrites anyway, so it must not be called
 // between a sweep's gather and its colour launches -- a diagnostic, not a solver call.
 void amgPermutedLayoutAmul(const GridColoring& gc, const DeviceLduView& A,
