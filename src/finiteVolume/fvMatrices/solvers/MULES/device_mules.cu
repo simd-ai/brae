@@ -379,7 +379,7 @@ __global__ void setupCorrKernel(
     const scalar* __restrict__ rho,
     const scalar* __restrict__ Sp,  const scalar* __restrict__ Su,
     const scalar* __restrict__ psiMaxF, const scalar* __restrict__ psiMinF,
-    scalar rDeltaT, scalar extremaCoeff, scalar boundaryDeltaExtremaCoeff, scalar smoothLimiter,
+    scalar rDeltaT, const scalar* __restrict__ rDeltaTCells, scalar extremaCoeff, scalar boundaryDeltaExtremaCoeff, scalar smoothLimiter,
     scalar* __restrict__ psiMaxn, scalar* __restrict__ psiMinn,
     scalar* __restrict__ sumPhip, scalar* __restrict__ mSumPhim)
 {
@@ -456,8 +456,10 @@ __global__ void setupCorrKernel(
     // A and B together (CMULESTemplates.C:400-412): rho and psi are the CURRENT ones, and nothing is
     // added for a donor step because there was not one.
     const scalar rhoC = at(rho, c, scalar(1));
-    const scalar a   = rhoC*rDeltaT - at(Sp, c, scalar(0));
-    const scalar b   = rhoC*psi[c]*rDeltaT;
+    // the local rDeltaT under localEuler, the scalar otherwise
+    const scalar rDT = rDeltaTCells ? rDeltaTCells[c] : rDeltaT;
+    const scalar a   = rhoC*rDT - at(Sp, c, scalar(0));
+    const scalar b   = rhoC*psi[c]*rDT;
     const scalar SuC = at(Su, c, scalar(0));
     psiMaxn[c]  = V[c]*(a*mx - SuC - b);
     psiMinn[c]  = V[c]*(SuC - a*mn + b);
@@ -513,13 +515,15 @@ __global__ void scaleKernel(const scalar* __restrict__ lam, int n, scalar* __res
 __global__ void correctKernel(
     const scalar* __restrict__ divPhiCorr,
     const scalar* __restrict__ rho, const scalar* __restrict__ Sp, const scalar* __restrict__ Su,
-    int nC, scalar rDeltaT, scalar* __restrict__ psi)
+    int nC, scalar rDeltaT, const scalar* __restrict__ rDeltaTCells, scalar* __restrict__ psi)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
     const scalar rhoC = at(rho, c, scalar(1));
-    const scalar num  = rhoC*psi[c]*rDeltaT + at(Su, c, scalar(0)) - divPhiCorr[c];
-    const scalar den  = rhoC*rDeltaT - at(Sp, c, scalar(0));
+    // the local rDeltaT under localEuler, the scalar otherwise
+    const scalar rDT  = rDeltaTCells ? rDeltaTCells[c] : rDeltaT;
+    const scalar num  = rhoC*psi[c]*rDT + at(Su, c, scalar(0)) - divPhiCorr[c];
+    const scalar den  = rhoC*rDT - at(Sp, c, scalar(0));
     psi[c] = num / den;
 }
 
@@ -579,6 +583,10 @@ void deviceMulesExplicitSolve(
         DeviceCyclic tmp;   // deviceCyclicAddDiv reads phi from the interface itself
         deviceCyclicAddDivFlux(*cyc, *phiPsiIf, f.Vsc ? *f.Vsc : dm.V, divPhiPsi);
     }
+    if (f.rDeltaT)
+        throw std::runtime_error(
+            "brae deviceMules: explicitSolve under a local time step (MULESTemplates.C's localEulerDdt branch) "
+            "is not ported; the host's refuses it too.");
     psi.resize(static_cast<std::size_t>(dm.nCells));
     explicitSolveKernel<<<nBlocks(dm.nCells), TPB>>>(
         psiOld.data(), divPhiPsi.data(), f.rho, f.rhoOld, f.Sp, f.Su,
@@ -689,6 +697,10 @@ void deviceMulesLimiter(
 
     DeviceBuffer<scalar> psiMaxn(nC), psiMinn(nC), sumPhip(nC), mSumPhim(nC), lambdam(nC), lambdap(nC);
 
+    if (f.rDeltaT)
+        throw std::runtime_error(
+            "brae deviceMules: the explicit limiter under a local time step (MULESTemplates.C's localEulerDdt "
+            "branch) is not ported; the host's refuses it too.");
     setupKernel<<<nBlocks(nC), TPB>>>(
         nC, dm.owner.data(), dm.nei.data(), dm.ownerStart.data(),
         dm.losort.data(), dm.losortStart.data(), dm.bndCellStart.data(), dm.bndPerm.data(),
@@ -815,7 +827,7 @@ void deviceMulesLimiterCorr(
         nIfC ? cyc->ifCellStart.data() : nullptr, nIfC ? cyc->ifPerm.data() : nullptr,
         nIfC ? cyc->nbrCell.data() : nullptr,     nIfC ? phiCorrIf->data() : nullptr,
         f.Vsc ? f.Vsc->data() : dm.V.data(), f.rho, f.Sp, f.Su, f.psiMax, f.psiMin,
-        rDeltaT, c.extremaCoeff, boundaryDelta, c.smoothLimiter,
+        rDeltaT, f.rDeltaT, c.extremaCoeff, boundaryDelta, c.smoothLimiter,
         psiMaxn.data(), psiMinn.data(), sumPhip.data(), mSumPhim.data());
     ckM(cudaGetLastError(), "CMULES setup");
 
@@ -942,7 +954,7 @@ void deviceMulesCorrect(
         deviceCyclicAddDivFlux(*cyc, *phiCorrIf, f.Vsc ? *f.Vsc : dm.V, divPhiCorr);
     }
     correctKernel<<<nBlocks(dm.nCells), TPB>>>(
-        divPhiCorr.data(), f.rho, f.Sp, f.Su, dm.nCells, rDeltaT, psi.data());
+        divPhiCorr.data(), f.rho, f.Sp, f.Su, dm.nCells, rDeltaT, f.rDeltaT, psi.data());
     ckM(cudaGetLastError(), "CMULES correct");
 }
 

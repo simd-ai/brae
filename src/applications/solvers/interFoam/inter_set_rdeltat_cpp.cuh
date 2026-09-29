@@ -53,6 +53,8 @@
 #include "geometric_field.cuh"
 #include "primitive_mesh.cuh"
 #include "fvc.cuh"
+#include <set>
+#include <string>
 #include <vector>
 
 namespace brae {
@@ -112,6 +114,20 @@ SetRDeltaTReport setRDeltaT(
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& patches);
+
+// A GATE'S CONTROL, never set by a solver: BRAE_CONTROL_LTS_SCALAR names the localEuler consumers -- any of
+// alpha, ueqn, ddtcorr, turbulence, comma-separated -- that read 1/deltaT instead of the local rDeltaT. Each
+// makes the answer WRONG. A LIST so a loop that carries only some consumers can be held against one that
+// carries all of them with the rest switched off: the device port took them one at a time that way. An
+// unknown name is refused, since it would make the control vacuous. Prints the CONTROL MODE line when set.
+std::set<std::string> readLtsScalarControl();
+
+// GATE CONTROLS on setRDeltaT itself, never set by a solver, both WRONG: BRAE_CONTROL_LTS_NODAMP never damps,
+// BRAE_CONTROL_LTS_NOSMOOTH skips the smoothing wave. Applied to a copy of the case's controls and the
+// step's damp flag; prints the CONTROL MODE line for each one set.
+void applySetRDeltaTControls(
+    LocalEulerControls& c,
+    bool& damp);
 
 // fvc::interpolate(rDeltaT) as localEulerDdtScheme forms it (localEulerDdtScheme.C:385): linear through
 // interpolationSchemes' default, lambda*(P - N) + N on an internal face, and the face cell's value on a

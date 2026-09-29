@@ -23,6 +23,9 @@
 #                            fvSolution's `cache { grad(U); }`: with no closure to form grad(U), the UEqn's
 #                            first request would form and store it, and brae refuses that (the order of
 #                            UEqn.H's operands is not modelled)
+#   laminarIO                (`laminarIO` only) `laminar` with the U outlet an inletOutlet
+#                            (inletValue 0): THE DEVICE ARM's profile, because the device loop does not
+#                            carry outletPhaseMeanVelocity yet. The host arm runs it too.
 #
 # MEASURED, ten steps, OpenFOAM's one-ulp floor beside each (the same run with ONE interface cell's alpha
 # moved by one ulp, OpenFOAM against OpenFOAM):
@@ -44,6 +47,14 @@
 # or neither -- so that is not the closure's, the wall's, the outlet's or the cache's; by the tenth step
 # brae sits 2x to 7x above OpenFOAM's one-ulp run. From step 2 all but 165 of the 845,536 cells sit above
 # the floor 1/maxDeltaT = 1, so the local step is live almost everywhere.
+#   laminarIO host    alpha 2.6e-10, p_rgh 6.1e-10, U 6.4e-13
+#   laminarIO device  setRDeltaT on the HOST from the loop's fields, the alpha pre-solve, CMULES,
+#            fvm::ddt(rho, U) and ddtCorr on the GPU. ONE step, at the host arm's bounds: alpha 1.6e-14,
+#            p_rgh 5.0e-15, U 7.7e-13. TEN steps: alpha 3.1e-09, p_rgh 3.6e-08, U 2.2e-09, rDeltaT 4.6e-10,
+#            every count OpenFOAM's -- the device loop's arithmetic amplified by CMULES' limiter (at the
+#            second step the pre-solve agrees with the host arm to 2.8e-14 and the alpha step leaves 8.0e-12,
+#            whichever consumer is switched off on both loops); OpenFOAM against itself with every water
+#            cell one ulp off reads alpha 1.1e-10, p_rgh 2.8e-10 by the tenth. Bounds in the gate, DEV_BOUND_*.
 #
 # THE CONTROLS, three steps each against the same oracle, each asserted to FAIL on a number:
 #   laminar  BRAE_CONTROL_LTS_NOSMOOTH        fvc::smooth skipped         rDeltaT at step 1 9.5e-01
@@ -69,6 +80,9 @@
 #                                             OpenFOAM's updated() flag skips   U 9.6e-05, k 9.8e-03
 #            BRAE_CONTROL_GRADU_UNCACHED      every grad(U) formed afresh, OpenFOAM's uncached answer
 #                                             U 1.8e-05, k 2.6e-03, nut 2.3e-02
+#   laminarIO device  the five localEuler controls above on the GPU loop, each asserted to fail the same way
+#                     (a consumer switched off on one loop only reads alpha 1.3e+01, U 4.5e+00 and p_rgh
+#                     1.8e-01 after ONE step for alpha, ueqn and ddtcorr against the host arm)
 #
 # NOT CLAIMED: the cached grad(U) under a laminar, kEpsilon or LES closure, MRF, or with U changed since
 # the closure last formed it (refused: the UEqn would form it itself), on a refining mesh (refused: OpenFOAM
@@ -80,7 +94,10 @@
 # refining mesh or under kEpsilon (refused), and both on the device (refused), fvc::spread and fvc::sweep (refused: DTCHull sets both iteration counts to 0),
 # a restart (setRDeltaT damps from the third step of EVERY run, and a restart's rhoPhi is rebuilt as
 # interpolate(rho)*phi -- not a continuation of the continuous run), kEpsilon and LES under localEuler
-# (refused), the device loop (refused by name), and anything after ten steps.
+# (refused), and anything after ten steps. On the DEVICE loop: localEuler with any turbulence closure
+# (refused by name), the tutorial's outletPhaseMeanVelocity (refused, hence `laminarIO`), the cached grad(U)
+# on a static mesh (refused), a device-side setRDeltaT (the host forms it -- its smoothing is a
+# FaceCellWave -- and the loop uploads it and interpolate(rDeltaT) each step).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_dtchull_vs_openfoam"
@@ -159,13 +176,21 @@ open(c, 'w').write(s)
 p = os.path.join(d, 'system/fvSolution')
 t = open(p).read()
 assert re.search(r'\ncache\s*\{\s*grad\(U\);\s*\}', t), 'the tutorial caches grad(U)'
-if profile == 'laminar':
+if profile in ('laminar', 'laminarIO'):
     t, k = re.subn(r'\ncache\s*\{[^}]*\}\s*', '\n', t)
     assert k == 1, 'the cache block'
     open(p, 'w').write(t)
 assert re.search(r'type\s+outletPhaseMeanVelocity;', open(os.path.join(d, '0/U')).read()), \
     'the tutorial names outletPhaseMeanVelocity on the U outlet'
-if profile == 'laminar':
+if profile == 'laminarIO':
+    u = os.path.join(d, '0/U')
+    t = open(u).read()
+    t, k = re.subn(r'outlet\s*\{[^}]*\}',
+                   'outlet\n    {\n        type            inletOutlet;\n        inletValue      uniform (0 0 0);\n'
+                   '        value           uniform (-1.668 0 0);\n    }', t, count=1)
+    assert k == 1, 'the U outlet'
+    open(u, 'w').write(t)
+if profile in ('laminar', 'laminarIO'):
     tp = os.path.join(d, 'constant/turbulenceProperties')
     t = open(tp).read()
     t, k = re.subn(r'simulationType\s+RAS;', 'simulationType  laminar;', t)
@@ -191,14 +216,16 @@ control()
 {
     local C="$W/$1"
     local ctl="$2"
+    local arm="${3:-}"
     awk -v n="$CSTEPS" '/^Flow time scale min\/max/ { if (++k > n) exit } { print }' \
         "$C/log.interFoam" > "$W/log.cut"
-    env "$ctl" "$BIN" "$C" "$C" "$CSTEPS" "$W/log.cut" > "$W/control.log" 2>&1
+    # shellcheck disable=SC2086
+    env "$ctl" "$BIN" "$C" "$C" "$CSTEPS" "$W/log.cut" $arm > "$W/control.log" 2>&1
     local crc=$?
     local pat='FAIL: (rDeltaT at step|time scale|alpha,|p_rgh,|U,|k,|omega,|nut,)'
     grep -q "CONTROL MODE" "$W/control.log" || { echo "  FAIL: [$1] control $ctl did not run as a control"; return 1; }
     if [ $crc -ne 0 ] && grep -qE "$pat" "$W/control.log"; then
-        echo "  ok:   [$1] control $ctl fails on a number: $(grep -m1 -E "$pat" "$W/control.log" | sed 's/^ *FAIL: //' | tr -s ' ')"
+        echo "  ok:   [$1${arm:+ $arm}] control $ctl fails on a number: $(grep -m1 -E "$pat" "$W/control.log" | sed 's/^ *FAIL: //' | tr -s ' ')"
         return 0
     fi
     echo "  FAIL: [$1] control $ctl passed the gate -- the gate cannot see what it breaks"
@@ -206,12 +233,19 @@ control()
 }
 
 rc=0
-for p in laminar ras
+for p in laminar ras laminarIO
 do
     stage "$p" || { echo "interfoam_dtchull_vs_openfoam: staging failed"; exit 1; }
     echo "== [$p]"
     "$BIN" "$W/$p" "$W/$p" "$STEPS" "$W/$p/log.interFoam" $MODE || rc=1
 done
+# THE DEVICE ARM, on `laminarIO`: all STEPS steps at its own bounds, and ONE step at the host arm's --
+# every localEuler consumer has run by then and nothing has amplified (see DEV_BOUND_* in the gate)
+echo "== [laminarIO device]"
+"$BIN" "$W/laminarIO" "$W/laminarIO" "$STEPS" "$W/laminarIO/log.interFoam" $MODE device || rc=1
+awk '/^Flow time scale min\/max/ { if (++k > 1) exit } { print }' "$W/laminarIO/log.interFoam" > "$W/log.one"
+echo "== [laminarIO device, one step]"
+"$BIN" "$W/laminarIO" "$W/laminarIO" 1 "$W/log.one" $MODE device || rc=1
 
 for ctl in BRAE_CONTROL_LTS_NOSMOOTH=1 BRAE_CONTROL_LTS_NODAMP=1 BRAE_CONTROL_LTS_SCALAR=alpha \
            BRAE_CONTROL_LTS_SCALAR=ueqn BRAE_CONTROL_LTS_SCALAR=ddtcorr BRAE_CONTROL_RHOPHI_ALPHAFLUX=1
@@ -223,6 +257,13 @@ for ctl in BRAE_CONTROL_LTS_SCALAR=turbulence BRAE_CONTROL_SST_LU_OFF=1 BRAE_CON
            BRAE_CONTROL_OPMV_NOLAG=1 BRAE_CONTROL_GRADU_UNCACHED=1
 do
     control ras "$ctl" || rc=1
+done
+
+# ...and the device loop's own consumers, each switched off in turn: the same controls, the GPU loop
+for ctl in BRAE_CONTROL_LTS_NOSMOOTH=1 BRAE_CONTROL_LTS_NODAMP=1 BRAE_CONTROL_LTS_SCALAR=alpha \
+           BRAE_CONTROL_LTS_SCALAR=ueqn BRAE_CONTROL_LTS_SCALAR=ddtcorr
+do
+    control laminarIO "$ctl" device || rc=1
 done
 
 echo "interfoam_dtchull_vs_openfoam: rc $rc"

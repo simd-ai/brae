@@ -64,7 +64,7 @@ __global__ void ddtCorrInternalKernel(
     const scalar* __restrict__ Sfx, const scalar* __restrict__ Sfy, const scalar* __restrict__ Sfz,
     const scalar* __restrict__ phiOld,
     const scalar* __restrict__ uox, const scalar* __restrict__ uoy, const scalar* __restrict__ uoz,
-    int nIf, scalar given, scalar rDeltaT, scalar* __restrict__ out)
+    int nIf, scalar given, scalar rDeltaT, const scalar* __restrict__ rDeltaTf, scalar* __restrict__ out)
 {
     const int f = blockIdx.x * blockDim.x + threadIdx.x;
     if (f >= nIf) return;
@@ -74,7 +74,8 @@ __global__ void ddtCorrInternalKernel(
     const scalar uy = wf*uoy[o] + wm*uoy[n];
     const scalar uz = wf*uoz[o] + wm*uoz[n];
     const scalar phiCorr = phiOld[f] - (ux*Sfx[f] + uy*Sfy[f] + uz*Sfz[f]);
-    out[f] = ddtCoeff(phiCorr, phiOld[f], given) * rDeltaT * phiCorr;
+    // localEuler: interpolate(rDeltaT) on the face (localEulerDdtScheme.C:385), the scalar otherwise
+    out[f] = ddtCoeff(phiCorr, phiOld[f], given) * (rDeltaTf ? rDeltaTf[f] : rDeltaT) * phiCorr;
 }
 
 // ...and on a PERIODIC PAIR, which is the internal kernel with the pair's own arrays: OpenFOAM's
@@ -107,7 +108,7 @@ __global__ void ddtCorrBoundaryKernel(
     const scalar* __restrict__ phiOldBnd,
     const scalar* __restrict__ uox, const scalar* __restrict__ uoy, const scalar* __restrict__ uoz,
     const scalar* __restrict__ uobx, const scalar* __restrict__ uoby, const scalar* __restrict__ uobz,
-    int nBf, scalar given, scalar rDeltaT, scalar* __restrict__ out)
+    int nBf, scalar given, scalar rDeltaT, const scalar* __restrict__ rDeltaTf, scalar* __restrict__ out)
 {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nBf) return;
@@ -127,7 +128,7 @@ __global__ void ddtCorrBoundaryKernel(
     const scalar interpFlux = uX*Sfx[gf] + uY*Sfy[gf] + uZ*Sfz[gf];
     const scalar pOld    = phiOldBnd[b];
     const scalar phiCorr = pOld - interpFlux;
-    out[b] = ddtCoeff(phiCorr, pOld, given) * rDeltaT * phiCorr;
+    out[b] = ddtCoeff(phiCorr, pOld, given) * (rDeltaTf ? rDeltaTf[b] : rDeltaT) * phiCorr;
 }
 
 // pe.source += fvc::div(phiHbyA)*V -- a PLUS, fvMatrix::operator== (fvMatrix.C:1855-1862).
@@ -375,12 +376,20 @@ void deviceDdtCorr(
     const DeviceBuffer<scalar>* UOldBndX,
     const DeviceBuffer<scalar>* UOldBndY,
     const DeviceBuffer<scalar>* UOldBndZ,
-    const DeviceBuffer<scalar>* phiUfOldInt)
+    const DeviceBuffer<scalar>* phiUfOldInt,
+    const DeviceBuffer<scalar>* rDeltaTfInt,
+    const DeviceBuffer<scalar>* rDeltaTfBnd)
 {
     if (deltaT <= scalar(0))
         throw std::runtime_error("brae interFoam device ddtCorr: deltaT must be positive.");
     const int nIf = dm.nInternalFaces, nBf = dm.nBndFaces;
     const scalar rDeltaT = scalar(1) / deltaT;
+    if ((rDeltaTfInt == nullptr) != (rDeltaTfBnd == nullptr)
+     || (rDeltaTfInt && (static_cast<int>(rDeltaTfInt->size()) != nIf
+                      || static_cast<int>(rDeltaTfBnd->size()) != nBf || phiUfOldInt)))
+        throw std::runtime_error(
+            "brae interFoam device ddtCorr: localEuler's face rDeltaT needs its internal AND boundary faces, "
+            "one per face, and is not ported on a moving mesh.");
 
     outInt.resize(static_cast<std::size_t>(nIf));
     if (nIf > 0)
@@ -393,7 +402,8 @@ void deviceDdtCorr(
             // OpenFOAM's fvcDdtUfCorr. The kernel is unchanged; only which array it is handed is.
             (phiUfOldInt && static_cast<int>(phiUfOldInt->size()) == nIf) ? phiUfOldInt->data()
                                                                          : phiOldInt.data(),
-            UOldX.data(), UOldY.data(), UOldZ.data(), nIf, ddtPhiCoeff, rDeltaT, outInt.data());
+            UOldX.data(), UOldY.data(), UOldZ.data(), nIf, ddtPhiCoeff, rDeltaT,
+            rDeltaTfInt ? rDeltaTfInt->data() : nullptr, outInt.data());
         ckP(cudaGetLastError(), "ddtCorr, internal");
     }
     outBnd.resize(static_cast<std::size_t>(nBf));
@@ -405,7 +415,8 @@ void deviceDdtCorr(
             UOldX.data(), UOldY.data(), UOldZ.data(),
             UOldBndX ? UOldBndX->data() : nullptr,
             UOldBndY ? UOldBndY->data() : nullptr,
-            UOldBndZ ? UOldBndZ->data() : nullptr, nBf, ddtPhiCoeff, rDeltaT, outBnd.data());
+            UOldBndZ ? UOldBndZ->data() : nullptr, nBf, ddtPhiCoeff, rDeltaT,
+            rDeltaTfBnd ? rDeltaTfBnd->data() : nullptr, outBnd.data());
         ckP(cudaGetLastError(), "ddtCorr, boundary");
     }
 }

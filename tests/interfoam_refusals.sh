@@ -962,9 +962,13 @@ if [ $HAVE_GPU = 1 ]; then
     arm device_limitedLinearTurb runs    -                          "-device" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss limitedLinear 1;/; s/div(rhoPhi,epsilon) .*/div(rhoPhi,epsilon) Gauss limitedLinear 1;/' system/fvSchemes"
     BASE="$B"
     arm device_gradULimited runs    -                           "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
-    # localEuler runs on the HOST loop only (ddt_localEuler above); the device loop refuses it by name
-    # rather than run every ddt at controlDict's deltaT
-    arm device_localEuler   refused "ported on the host loop only" "-device" "$LTSSET; $LTSZERO"
+    # localEuler RUNS on the device loop now, laminar (tests/interfoam_dtchull_vs_openfoam.sh `laminarIO
+    # device`): setRDeltaT on the host, its three consumers on the GPU. With a turbulence closure the
+    # closure's fvm::ddt under the local step is carried on the host loop only, and refused by name.
+    arm device_localEuler   runs    -                           "-device" "$LTSSET; $LTSZERO"
+    BASE="$BR"
+    arm device_localEulerSST refused "localEuler with a turbulence closure" "-device" "$SSTBASE; $LTSSET; $LTSZERO"
+    BASE="$B"
     # kOmegaSST's linearUpwind runs on the HOST closure (sst_linearUpwind above); the device closure is
     # not wired for it and refuses by name -- RAS/DTCHullMoving, an Euler case, would reach it
     BASE="$BR"

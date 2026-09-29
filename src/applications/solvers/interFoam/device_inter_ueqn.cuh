@@ -62,6 +62,21 @@ void deviceInterEulerDdtRhoU(
     // where OpenFOAM's Vsc0() is V and the reference takes its other branch
     const DeviceBuffer<scalar>* V0 = nullptr);
 
+// ...and under localEuler, with the per-cell rDeltaT setRDeltaT.H formed, on a static mesh: the host's
+// addLocalEulerDdtRhoU (inter_ueqn_cpp.cuh), in its multiplication order.
+void deviceInterLocalEulerDdtRhoU(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& rho,
+    const DeviceBuffer<scalar>& rhoOld,
+    const DeviceBuffer<scalar>& UOldX,
+    const DeviceBuffer<scalar>& UOldY,
+    const DeviceBuffer<scalar>& UOldZ,
+    const DeviceBuffer<scalar>& rDeltaT,
+    DeviceBuffer<scalar>&       diag,
+    DeviceBuffer<scalar>&       srcX,
+    DeviceBuffer<scalar>&       srcY,
+    DeviceBuffer<scalar>&       srcZ);
+
 // (surfaceTensionForce - ghf*snGrad(rho) - snGrad(p_rgh)) * magSf, per face.
 //
 // `magSf` is the MESH'S FULL face array -- internal faces first, then the boundary patches -- so the

@@ -2982,7 +2982,10 @@ COMPONENTS = {
                         "or less after, the lines 3.4e-12. CONTROLS (three steps, each failing on a number): no "
                         "fvc::smooth, rDeltaT 9.5e-01 at step 1; no damping, 5.1e-02 at step 3; the initial rhoPhi "
                         "as the alpha flux's mass flux (what brae built), 5.4e-01 at step 1. NOT CLAIMED: fvc::spread "
-                        "and fvc::sweep (refused; DTCHull sets both counts to 0), coupled patches (refused), a restart.",
+                        "and fvc::sweep (refused; DTCHull sets both counts to 0), coupled patches (refused), a restart. "
+                        "The DEVICE loop calls this same host function each step from its own fields (rhoPhi, phi, "
+                        "alpha1 and rho downloaded) and uploads rDeltaT and interpolate(rDeltaT): `laminarIO device`, "
+                        "rDeltaT 1.6e-16 at step 1 against OpenFOAM, and the two NOSMOOTH/NODAMP controls fail there too.",
              note="HOST_ONLY because fvc::smooth is a FaceCellWave -- serial and order-dependent through its 1% "
                   "hysteresis (src/finiteVolume/finiteVolume/fvc/fvcSmooth/fvc_smooth_cpp.cu). The controls are "
                   "fvSolution PIMPLE's, not controlDict's, with OpenFOAM's defaults: nAlphaSpreadIter 1 and "
@@ -2993,7 +2996,7 @@ COMPONENTS = {
              of_file="src/finiteVolume/finiteVolume/ddtSchemes/localEulerDdtScheme/localEulerDdtScheme.C",
              classification="GPU_REQUIRED", status="REIMPLEMENT",
              brae_reference="src/applications/solvers/interFoam/inter_ueqn_cpp.cuh",
-             validation="tests/interfoam_dtchull_vs_openfoam.sh, HOST ARM ONLY (the device loop refuses by name): "
+             validation="tests/interfoam_dtchull_vs_openfoam.sh. HOST ARM: "
                         "ten laminar localEuler steps of RAS/DTCHull, alpha 2.6e-10, p_rgh 6.1e-10, U 6.4e-13, all 20 "
                         "p_rgh and 10 alpha counts OpenFOAM's; OpenFOAM against itself with one interface cell's "
                         "alpha moved by one ulp reads 8.8e-11, 1.2e-10, 3.7e-13 after the same ten steps. CONTROLS, "
@@ -3003,8 +3006,16 @@ COMPONENTS = {
                         "staged): alpha 1.6e-10, p_rgh 3.4e-10, U 1.6e-12, k 3.7e-12, omega 1.0e-11, nut 2.8e-11, "
                         "every omega and k count and final residual OpenFOAM's; one ulp gives k 1.0e-12, omega "
                         "1.0e-12, nut 5.3e-12. Its control, kOmegaSST's two ddts on 1/deltaT: k 1.1e+01, omega "
-                        "1.1e+00. NOT CLAIMED: kEpsilon and LES under localEuler, a moving mesh, sub-cycling "
-                        "(localRSubDeltaT), explicit MULES, fvOptions and MRF (all refused).",
+                        "1.1e+00. DEVICE ARM, laminar with the outlet an inletOutlet (`laminarIO`; the device loop "
+                        "does not carry outletPhaseMeanVelocity): the alpha pre-solve, CMULES, fvm::ddt(rho, U) and "
+                        "ddtCorr on the GPU, ported one at a time against the host arm with the rest switched off on "
+                        "both. ONE step at the host's bounds: alpha 1.6e-14, p_rgh 5.0e-15, U 7.7e-13. TEN: alpha "
+                        "3.1e-09, p_rgh 3.6e-08, U 2.2e-09, every count OpenFOAM's -- the device's arithmetic amplified "
+                        "by CMULES' limiter (the second step's pre-solve agrees with the host arm to 2.8e-14 and its "
+                        "alpha step leaves 8.0e-12); OpenFOAM with every water cell one ulp off reads alpha 1.1e-10, "
+                        "p_rgh 2.8e-10. The five controls fail on the device arm as well. NOT CLAIMED: kEpsilon and LES "
+                        "under localEuler, a moving mesh, sub-cycling (localRSubDeltaT), explicit MULES, fvOptions and "
+                        "MRF (all refused); on the device, any turbulence closure under localEuler (refused).",
              note="Five consumers on DTCHull: the alpha pre-solve (alphaEqn.H:105-109 names the scheme directly), "
                   "CMULES correct and limiterCorr (localRDeltaT per cell, CMULESTemplates.C:103-176), "
                   "fvm::ddt(rho, U) as diag=(rDT*rho)*V, source=((rDT*rho0)*U0)*V in that order, and ddtCorr on "

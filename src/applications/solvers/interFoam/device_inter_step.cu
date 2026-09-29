@@ -374,6 +374,7 @@ void deviceInterStep(
     uin.ddtUOld[1]    = &UOldY;
     uin.ddtUOld[2]    = &UOldZ;
     uin.ddtDeltaT     = deltaT;
+    uin.ddtRDeltaT    = ctl.rDeltaTUEqn;
     if (ctl.cn)
     {
         uin.ddtCn = ctl.cn->clock;
@@ -608,7 +609,9 @@ void deviceInterStep(
                           /*ddtPhiCoeff=*/scalar(-1), deltaT, ddtCorrI, ddtCorrB,
                           &UOldBndX, &UOldBndY, &UOldBndZ,
                           // on a moving mesh (Sf & Uf.oldTime()) takes phi.oldTime()'s place
-                          ctl.phiUfOldInt);
+                          ctl.phiUfOldInt,
+                          // ...and under localEuler the face rDeltaT takes 1/deltaT's
+                          ctl.rDeltaTfInt, ctl.rDeltaTfBnd);
         }
 
         // MRF.zeroFilter(interpolate(rho*rAU)*fvc::ddtCorr(U, phi)), pEqn.H:18. MRFZone::zero sets the

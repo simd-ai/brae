@@ -108,6 +108,10 @@ scalar deviceAlphaPreSolve(
     // (EulerDdtScheme.C:383-392). Null == a mesh that does not move, where both are dm.V. Both or
     // neither, for the reason DeviceMulesFields gives.
     const DeviceBuffer<scalar>*   Vsc = nullptr,
-    const DeviceBuffer<scalar>*   Vsc0 = nullptr);
+    const DeviceBuffer<scalar>*   Vsc0 = nullptr,
+    // LOCALEULER: the per-cell rDeltaT, which localEulerDdtScheme's fvmDdt takes in 1/deltaT's place --
+    // diag = rDeltaT*V, source = rDeltaT*alpha.oldTime()*V, in that order (localEulerDdtScheme.C:245-246;
+    // alpha_eqn_cpp.cu). Null == Euler. Refused on a moving mesh, as the host refuses it.
+    const DeviceBuffer<scalar>*   rDeltaT = nullptr);
 
 } // namespace brae

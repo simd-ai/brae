@@ -521,6 +521,9 @@ void assembleUEqn(
                 "brae momentum: a transient ddt needs rho, rho.oldTime() and all three components of "
                 "U.oldTime(). rho.oldTime() is NOT rho at a VoF interface -- they differ by the density "
                 "ratio -- so it is a separate argument and cannot be defaulted to the first.");
+        if (in.ddtCn && in.ddtRDeltaT)
+            throw std::runtime_error(
+                "brae momentum (device): CrankNicolson and a local time step at once -- one ddt scheme.");
         if (in.ddtCn)
         {
             // CrankNicolson, transcribed from the host reference (crank_nicolson_ddt_scheme_cpp.cu)
@@ -540,6 +543,15 @@ void assembleUEqn(
             DeviceBuffer<scalar>* src[3] = {&M.source[0], &M.source[1], &M.source[2]};
             deviceCnFvmDdt(*in.ddtCn, *in.ddtCnDdt0, in.ddtRho, in.ddtRhoOld, in.ddtRhoOO, 3,
                            in.ddtUOld, in.ddtUOO, dm.V, M.diag, src, in.ddtV0, in.ddtV00);
+        }
+        else if (in.ddtRDeltaT)
+        {
+            if (in.ddtV0)
+                throw std::runtime_error(
+                    "brae momentum (device): a local time step on a moving mesh is not ported.");
+            deviceInterLocalEulerDdtRhoU(dm, *in.ddtRho, *in.ddtRhoOld,
+                                         *in.ddtUOld[0], *in.ddtUOld[1], *in.ddtUOld[2], *in.ddtRDeltaT,
+                                         M.diag, M.source[0], M.source[1], M.source[2]);
         }
         else
         {

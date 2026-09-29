@@ -49,6 +49,25 @@ __global__ void ddtRhoUKernel(
     sz[c] += w * uoz[c];
 }
 
+// fvm::ddt(rho, U) under localEuler, static mesh (localEulerDdtScheme.C:282-308), in the host's order
+// (inter_ueqn_cpp.cuh, addLocalEulerDdtRhoU): diag += rDeltaT*rho*V, source += ((rDeltaT*rhoOld)*UOld)*V --
+// the U component meets the product BEFORE the volume, where the Euler kernel above takes V first.
+__global__ void localEulerDdtRhoUKernel(
+    const scalar* __restrict__ rho, const scalar* __restrict__ rhoOld,
+    const scalar* __restrict__ uox, const scalar* __restrict__ uoy, const scalar* __restrict__ uoz,
+    const scalar* __restrict__ V, const scalar* __restrict__ rDeltaT, int nC,
+    scalar* __restrict__ diag,
+    scalar* __restrict__ sx, scalar* __restrict__ sy, scalar* __restrict__ sz)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    diag[c] += rDeltaT[c] * rho[c] * V[c];
+    const scalar w = rDeltaT[c] * rhoOld[c];
+    sx[c] += w * uox[c] * V[c];
+    sy[c] += w * uoy[c] * V[c];
+    sz[c] += w * uoz[c] * V[c];
+}
+
 // source += V*R, componentwise. A PLUS -- see the header.
 __global__ void addForceKernel(
     const scalar* __restrict__ rx, const scalar* __restrict__ ry, const scalar* __restrict__ rz,
@@ -121,6 +140,33 @@ void deviceInterEulerDdtRhoU(
         dm.V.data(), V0 ? V0->data() : nullptr, nC, scalar(1)/deltaT,
         diag.data(), srcX.data(), srcY.data(), srcZ.data());
     ckU(cudaGetLastError(), "ddt(rho, U)");
+}
+
+
+void deviceInterLocalEulerDdtRhoU(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& rho,
+    const DeviceBuffer<scalar>& rhoOld,
+    const DeviceBuffer<scalar>& UOldX,
+    const DeviceBuffer<scalar>& UOldY,
+    const DeviceBuffer<scalar>& UOldZ,
+    const DeviceBuffer<scalar>& rDeltaT,
+    DeviceBuffer<scalar>&       diag,
+    DeviceBuffer<scalar>&       srcX,
+    DeviceBuffer<scalar>&       srcY,
+    DeviceBuffer<scalar>&       srcZ)
+{
+    const int nC = dm.nCells;
+    if (static_cast<int>(diag.size()) != nC || static_cast<int>(srcX.size()) != nC
+     || static_cast<int>(rDeltaT.size()) != nC)
+        throw std::runtime_error(
+            "brae interFoam device UEqn: the localEuler ddt adds INTO an existing diagonal and source, and "
+            "takes one rDeltaT per cell; the sizes disagree.");
+    localEulerDdtRhoUKernel<<<nBlocks(nC), TPB>>>(
+        rho.data(), rhoOld.data(), UOldX.data(), UOldY.data(), UOldZ.data(),
+        dm.V.data(), rDeltaT.data(), nC,
+        diag.data(), srcX.data(), srcY.data(), srcZ.data());
+    ckU(cudaGetLastError(), "localEuler ddt(rho, U)");
 }
 
 

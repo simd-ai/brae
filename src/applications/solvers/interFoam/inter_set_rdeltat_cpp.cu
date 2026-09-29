@@ -2,6 +2,8 @@
 // what they look like.
 #include "inter_set_rdeltat_cpp.cuh"
 #include "fvc_smooth_cpp.cuh"
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -285,6 +287,51 @@ SetRDeltaTReport setRDeltaT(
         timeScaleRange(rDeltaT, rep.dampedMin, rep.dampedMax);
     }
     return rep;
+}
+
+
+void applySetRDeltaTControls(
+    LocalEulerControls& c,
+    bool& damp)
+{
+    if (std::getenv("BRAE_CONTROL_LTS_NODAMP"))
+    {
+        std::printf("  *** CONTROL MODE: setRDeltaT's damping is off. This run is deliberately wrong. ***\n");
+        damp = false;
+    }
+    if (std::getenv("BRAE_CONTROL_LTS_NOSMOOTH"))
+    {
+        std::printf("  *** CONTROL MODE: setRDeltaT's smoothing is off. This run is deliberately wrong. ***\n");
+        c.rDeltaTSmoothingCoeff = scalar(1);
+    }
+}
+
+
+std::set<std::string> readLtsScalarControl()
+{
+    std::set<std::string> names;
+    const char* e = std::getenv("BRAE_CONTROL_LTS_SCALAR");
+    if (!e)
+    {
+        return names;
+    }
+    const std::string all = e;
+    std::size_t b = 0;
+    while (b <= all.size())
+    {
+        std::size_t c = all.find(',', b);
+        if (c == std::string::npos) c = all.size();
+        const std::string n = all.substr(b, c - b);
+        if (n != "alpha" && n != "ueqn" && n != "ddtcorr" && n != "turbulence")
+            throw std::runtime_error(
+                "brae interFoam: BRAE_CONTROL_LTS_SCALAR names `" + n + "`; it takes alpha, ueqn, ddtcorr or "
+                "turbulence, comma-separated, and an unknown name would make the control vacuous.");
+        names.insert(n);
+        b = c + 1;
+    }
+    std::printf("  *** CONTROL MODE: the localEuler consumer(s) `%s` read 1/deltaT, not the local rDeltaT. "
+                "This run is deliberately wrong. ***\n", all.c_str());
+    return names;
 }
 
 

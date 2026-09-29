@@ -715,24 +715,16 @@ RunReport runInterFoam(
     GamgSolveLog gamgLog;
     rep.deltaT = f.deltaT;
 
-    // A GATE'S CONTROL, never set by a solver: ONE localEuler consumer -- `alpha` (the pre-solve's ddt and
-    // MULES), `ueqn` (fvm::ddt(rho, U)), `ddtcorr` or `turbulence` (kOmegaSST's fvm::ddt(omega) and
-    // fvm::ddt(k)) -- reads the global 1/deltaT in the local rDeltaT's
-    // place, which is what a port that left that consumer on the Euler form runs. It makes the answer
-    // WRONG; tests/interfoam_dtchull_vs_openfoam.sh asserts that each one fails.
-    std::string ltsScalarControl;
+    // A GATE'S CONTROL, never set by a solver: the named localEuler consumers -- `alpha` (the pre-solve's ddt
+    // and MULES), `ueqn` (fvm::ddt(rho, U)), `ddtcorr`, `turbulence` (kOmegaSST's fvm::ddt(omega) and
+    // fvm::ddt(k)) -- read the global 1/deltaT in the local rDeltaT's place, which is what a port that left
+    // them on the Euler form runs. WRONG; tests/interfoam_dtchull_vs_openfoam.sh asserts that each one
+    // fails. See readLtsScalarControl.
+    const std::set<std::string> ltsScalarControl = readLtsScalarControl();
     std::vector<scalar> rDeltaTGlobal;
-    if (const char* e = std::getenv("BRAE_CONTROL_LTS_SCALAR"))
+    if (!ltsScalarControl.empty())
     {
-        ltsScalarControl = e;
-        if (ltsScalarControl != "alpha" && ltsScalarControl != "ueqn" && ltsScalarControl != "ddtcorr"
-         && ltsScalarControl != "turbulence")
-            throw std::runtime_error(
-                "brae interFoam: BRAE_CONTROL_LTS_SCALAR is `" + ltsScalarControl + "`; it takes alpha, ueqn, "
-                "ddtcorr or turbulence, and an unknown name would make the control vacuous.");
         rDeltaTGlobal.assign(static_cast<std::size_t>(m.nCells()), scalar(1)/f.deltaT);
-        std::printf("  *** CONTROL MODE: the localEuler consumer `%s` reads 1/deltaT, not the local rDeltaT. "
-                    "This run is deliberately wrong. ***\n", ltsScalarControl.c_str());
     }
     // GATE CONTROLS for outletPhaseMeanVelocity, never set by a solver: FROZEN keeps the condition as read
     // (no updateCoeffs at all), IGNORE_LAG updates it in the first corrector too. Both make the answer WRONG.
@@ -764,7 +756,7 @@ RunReport runInterFoam(
     auto rDeltaTFor = [&](const char* consumer) -> const std::vector<scalar>*
     {
         if (!f.lts) return nullptr;
-        return (ltsScalarControl == consumer) ? &rDeltaTGlobal : &f.rDeltaT;
+        return ltsScalarControl.count(consumer) ? &rDeltaTGlobal : &f.rDeltaT;
     };
 
     for (label step = 0; step < nSteps; ++step)
@@ -819,21 +811,8 @@ RunReport runInterFoam(
                     ri.alpha1 = &f.alpha1;
                     ri.rho = &f.rho;
                     ri.damp = rep.steps > 1;
-                    if (std::getenv("BRAE_CONTROL_LTS_NODAMP"))
-                    {
-                        // A GATE'S CONTROL: never damp. It makes the answer WRONG from the third step.
-                        std::printf("  *** CONTROL MODE: setRDeltaT's damping is off. This run is "
-                                    "deliberately wrong. ***\n");
-                        ri.damp = false;
-                    }
                     LocalEulerControls lec = f.ltsCtl;
-                    if (std::getenv("BRAE_CONTROL_LTS_NOSMOOTH"))
-                    {
-                        // A GATE'S CONTROL: no smoothing wave. It makes the answer WRONG.
-                        std::printf("  *** CONTROL MODE: setRDeltaT's smoothing is off. This run is "
-                                    "deliberately wrong. ***\n");
-                        lec.rDeltaTSmoothingCoeff = scalar(1);
-                    }
+                    applySetRDeltaTControls(lec, ri.damp);
                     const SetRDeltaTReport lr = setRDeltaT(f.rDeltaT, lec, ri, m, g, patches);
                     rep.ltsLog.push_back(lr);
                     rep.rDeltaTPerStep.push_back(f.rDeltaT);

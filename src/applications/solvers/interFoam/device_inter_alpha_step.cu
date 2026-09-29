@@ -213,7 +213,7 @@ void deviceInterAlphaStep(
             DeviceSolverPerf pre;
             deviceAlphaPreSolve(dm, alpha, subOld, *li.phiCNInt, iC, bC, dtSub, ctl.preSolve,
                                 alphaPhiInt, alphaPhiBnd, &pre, li.cyc, li.alphaPhiIf,
-                                li.Vsc, li.Vsc0);
+                                li.Vsc, li.Vsc0, li.rDeltaT);
             if (ctl.preSolveLog)
             {
                 ctl.preSolveLog->push_back(pre);
@@ -247,7 +247,15 @@ void deviceInterAlphaStep(
                 // MULES::correct(one, alpha1, alphaPhi10, talphaPhi1Corr0.ref(), one, zero). The flux
                 // the outlet test reads is alphaPhi10 -- the ALPHA flux -- and the cached correction
                 // is limited IN PLACE, so what is added below is the limited one.
-                const DeviceMulesFields mf0;
+                // the host's mf0 (alpha_eqn_cpp.cu, MULES::correctLimited): the moving mesh's volumes and the
+                // local step. The volumes were MISSING here -- a moving mesh's prev-corr limited and solved
+                // with the static V -- which tools/default_audit.py found once this site set a field at all.
+                // No gated fixture witnesses it yet: the moving tutorials with alphaApplyPrevCorr are
+                // floatingObject and DTCHullMoving.
+                DeviceMulesFields mf0;
+                mf0.Vsc = li.Vsc;
+                mf0.Vsc0 = li.Vsc0;
+                mf0.rDeltaT = li.rDeltaT ? li.rDeltaT->data() : nullptr;
                 const scalar rDeltaT = scalar(1)/dtSub;
                 deviceMulesLimitCorr(dm, nIf, nBf, rDeltaT, alpha, alpha1Bnd, bndFixesValue, bndFlag,
                                      alphaPhiBnd, *ctl.prevCorrInt, *ctl.prevCorrBnd, mf0, mulesCtl);

@@ -48,6 +48,22 @@ __global__ void eulerDdtKernel(const scalar* __restrict__ V,      // mesh.Vsc()
     source[c] = rDeltaT * V[c] * psiOld[c];
 }
 
+// fvm::ddt(alpha1) under localEuler (localEulerDdtScheme.C:245-246), static mesh:
+//     diag   += rDeltaT*V
+//     source  = rDeltaT*alpha.oldTime()*V      -- the host's order, alpha_eqn_cpp.cu
+__global__ void localEulerDdtKernel(const scalar* __restrict__ V,
+                                    const scalar* __restrict__ psiOld,
+                                    const scalar* __restrict__ rDeltaT,
+                                    int nC,
+                                    scalar* __restrict__ diag, scalar* __restrict__ source)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    const scalar rDT = rDeltaT[c];
+    diag[c]  += rDT * V[c];
+    source[c] = rDT * psiOld[c] * V[c];
+}
+
 // alpha1Eqn.flux() at a BOUNDARY face: internalCoeffs*psi[faceCell] - boundaryCoeffs (fvMatrix.C:1688).
 // It reads the face cell's INTERNAL value, not the patch value -- the matrix's boundary coefficients
 // already carry everything the patch condition contributes.
@@ -78,7 +94,8 @@ scalar deviceAlphaPreSolve(
     DeviceCyclic*                 cyc,
     DeviceBuffer<scalar>*         alphaPhi10If,
     const DeviceBuffer<scalar>*   Vsc,
-    const DeviceBuffer<scalar>*   Vsc0)
+    const DeviceBuffer<scalar>*   Vsc0,
+    const DeviceBuffer<scalar>*   rDeltaT)
 {
     const int nC  = dm.nCells;
     const int nIf = dm.nInternalFaces;
@@ -105,11 +122,24 @@ scalar deviceAlphaPreSolve(
     }
 
     DeviceBuffer<scalar> source(static_cast<std::size_t>(nC));
-    eulerDdtKernel<<<nBlocks(nC), TPB>>>(Vsc ? Vsc->data() : dm.V.data(),
-                                         Vsc0 ? Vsc0->data() : nullptr,
-                                         alpha1Old.data(), nC, scalar(1)/deltaT,
-                                         rawDiag.data(), source.data());
-    ckP(cudaGetLastError(), "Euler ddt");
+    if (rDeltaT)
+    {
+        if (Vsc || static_cast<int>(rDeltaT->size()) != nC)
+            throw std::runtime_error(
+                "brae interFoam alpha pre-solve: a local time step on a moving mesh is not ported, and the "
+                "rDeltaT field must have one value per cell.");
+        localEulerDdtKernel<<<nBlocks(nC), TPB>>>(dm.V.data(), alpha1Old.data(), rDeltaT->data(), nC,
+                                                  rawDiag.data(), source.data());
+        ckP(cudaGetLastError(), "localEuler ddt");
+    }
+    else
+    {
+        eulerDdtKernel<<<nBlocks(nC), TPB>>>(Vsc ? Vsc->data() : dm.V.data(),
+                                             Vsc0 ? Vsc0->data() : nullptr,
+                                             alpha1Old.data(), nC, scalar(1)/deltaT,
+                                             rawDiag.data(), source.data());
+        ckP(cudaGetLastError(), "Euler ddt");
+    }
 
     // fvMatrix::solve's completion: the boundary internalCoeffs go onto the diagonal and the
     // boundaryCoeffs into the source, which is what makes the system square.

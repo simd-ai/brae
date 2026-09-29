@@ -79,6 +79,24 @@ constexpr scalar BOUND_U_RAS = 5e-12;
 constexpr scalar BOUND_NUT_WALL = 2e-10;
 constexpr scalar BOUND_U_OUTLET = 2e-11;
 
+// THE DEVICE ARM over more than one step, `laminarIO` (the laminar profile with the outlet an
+// inletOutlet, which the device loop does not carry yet). Measured after ten steps: rDeltaT 4.6e-10 at
+// worst, the time-scale lines 1.8e-10, alpha 3.1e-09, p_rgh 3.6e-08, U 2.2e-09, the p_rgh initial
+// residuals 4.8e-07 and alpha's 4.6e-09, every count OpenFOAM's -- each bound about three times it. The
+// host arm on the same profile reads alpha 2.6e-10, p_rgh 6.1e-10, U 6.4e-13. WHY THE DEVICE IS WIDER,
+// localised by stage against the host arm: after ONE step every localEuler consumer has run and the two
+// loops agree to U 3.1e-14, p_rgh 3.0e-15, alpha 4.4e-16 (the one-step arm keeps the host's bounds); at the
+// SECOND the alpha pre-solve still agrees to 2.8e-14 and CMULES' ten limiter passes take alpha to 8.0e-12,
+// with any one consumer switched off on both loops reading the same ~1e-11 -- it is the device loop's
+// arithmetic amplified, not a localEuler form. OpenFOAM against itself with every water cell one ulp off
+// grows 7.9e-13 by the second step and alpha 1.1e-10, p_rgh 2.8e-10 by the tenth.
+constexpr scalar DEV_BOUND_RDELTAT = 2e-9;
+constexpr scalar DEV_BOUND_ALPHA = 1e-8;
+constexpr scalar DEV_BOUND_PRGH = 1e-7;
+constexpr scalar DEV_BOUND_U = 1e-8;
+constexpr scalar DEV_BOUND_P_RESIDUAL = 2e-6;
+constexpr scalar DEV_BOUND_ALPHA_RESIDUAL = 2e-8;
+
 struct Diff
 {
     scalar linf = 0;
@@ -185,14 +203,23 @@ int main(
     std::printf("== brae interFoam vs OpenFOAM interFoam: RAS/DTCHull under localEuler ==\n");
     if (argc < 5)
     {
-        std::printf("  SKIP: usage: %s <caseDir> <ofCaseDir> <nSteps> <ofLog> [measure]\n", argv[0]);
+        std::printf("  SKIP: usage: %s <caseDir> <ofCaseDir> <nSteps> <ofLog> [measure] [device]\n", argv[0]);
         return 77;
     }
     const std::string caseDir = argv[1];
     const std::string ofCase = argv[2];
     const label nSteps = static_cast<label>(std::atol(argv[3]));
     const std::string logPath = argv[4];
-    measureOnly = (argc > 5 && std::string(argv[5]) == "measure");
+    // `device` runs the GPU loop in the host loop's place, against the same oracle
+    bool deviceArm = false;
+    for (int a = 5; a < argc; ++a)
+    {
+        measureOnly = measureOnly || std::string(argv[a]) == "measure";
+        deviceArm = deviceArm || std::string(argv[a]) == "device";
+    }
+    std::printf("  arm: %s\n", deviceArm ? "DEVICE" : "host");
+    // the device arm's own bounds past the first step (see DEV_BOUND_*); one step keeps the host's
+    const bool devLoose = deviceArm && nSteps > 1;
 
     PrimitiveMesh m;
     m.read(caseDir + "/constant/polyMesh");
@@ -203,7 +230,9 @@ int main(
     std::printf("  mesh: %d cells\n", (int)nC);
 
     InterFields fin;
-    const RunReport r = runInterFoam(caseDir, caseDir + "/0", m, g, patches, nSteps, /*verbose=*/true, &fin);
+    const RunReport r = deviceArm
+        ? runInterFoamDevice(caseDir, caseDir + "/0", m, g, patches, nSteps, /*verbose=*/true, &fin)
+        : runInterFoam(caseDir, caseDir + "/0", m, g, patches, nSteps, /*verbose=*/true, &fin);
 
     // THE PATH
     check("brae ran the same number of steps", r.steps == nSteps);
@@ -256,7 +285,7 @@ int main(
         dLines = std::fmax(dLines, relDiff(braeLines[i].lo, ofLines[i].lo));
         dLines = std::fmax(dLines, relDiff(braeLines[i].hi, ofLines[i].hi));
     }
-    bound("time scale min/max lines, largest relative", dLines, 1e-11);
+    bound("time scale min/max lines, largest relative", dLines, devLoose ? DEV_BOUND_RDELTAT : 1e-11);
 
     // the local time step each step ran with, against the rDeltaT OpenFOAM writes at that step's time
     for (label k = 1; k <= nSteps; ++k)
@@ -273,7 +302,7 @@ int main(
         }
         std::printf("  step %2d: rDeltaT %ld of %d cells above the floor 1/maxDeltaT, %ld differ\n",
                     (int)k, above, (int)nC, d.nOff);
-        bound("rDeltaT at step " + std::to_string(k) + ", relative", d.rel(), 1e-11);
+        bound("rDeltaT at step " + std::to_string(k) + ", relative", d.rel(), devLoose ? DEV_BOUND_RDELTAT : 1e-11);
     }
 
     // BEFORE any fmax: std::fmax drops a NaN, so a non-finite field would read as a match
@@ -288,9 +317,9 @@ int main(
     const Diff dP = compare(fin.p_rgh.internal, readCells<scalar>(last + "/p_rgh", nC));
     const Diff dU = compare(fin.U.internal, readCells<vector>(last + "/U", nC));
     std::printf("  cells more than 1e-12 apart: alpha %ld, p_rgh %ld, U %ld\n", dA.nOff, dP.nOff, dU.nOff);
-    bound("alpha, relative to its largest value", dA.rel(), 1e-9);
-    bound("p_rgh, relative", dP.rel(), 2e-9);
-    bound("U, relative", dU.rel(), fin.turbulence.on ? BOUND_U_RAS : BOUND_U_LAMINAR);
+    bound("alpha, relative to its largest value", dA.rel(), devLoose ? DEV_BOUND_ALPHA : 1e-9);
+    bound("p_rgh, relative", dP.rel(), devLoose ? DEV_BOUND_PRGH : 2e-9);
+    bound("U, relative", dU.rel(), devLoose ? DEV_BOUND_U : fin.turbulence.on ? BOUND_U_RAS : BOUND_U_LAMINAR);
 
     // THE CLOSURE, on the `ras` profile: kOmegaSST's fvm::ddt(omega) and fvm::ddt(k) under the local step
     if (fin.turbulence.on)
@@ -393,13 +422,15 @@ int main(
     // ulp, reads 2.1e-10 -- above laminar's bound -- where brae reads 9.4e-11. The figure is the
     // trajectory's, not a defect's: with the cache stripped the same floor is 4.9e-11 and brae 3.0e-10.
     // 2e-10 here would sit below OpenFOAM's own one-ulp floor; laminar keeps it.
-    const scalar pRunBound = fin.turbulence.on ? scalar(6e-10) : scalar(2e-10);
-    failures += brae::gatecheck::compareSolves("host", r.pSolves, ofP, nSteps, "p_rgh",
+    const scalar pRunBound = devLoose ? DEV_BOUND_P_RESIDUAL
+                           : fin.turbulence.on ? scalar(6e-10) : scalar(2e-10);
+    const char* armName = deviceArm ? "device" : "host";
+    failures += brae::gatecheck::compareSolves(armName, r.pSolves, ofP, nSteps, "p_rgh",
                                                scalar(1e-10), pRunBound, scalar(-1), nullptr,
                                                !measureOnly);
-    failures += brae::gatecheck::compareSolves("host", r.alphaSolves, ofA, nSteps, fin.alphaName.c_str(),
-                                               scalar(1e-10), scalar(1e-10), scalar(1e-5), nullptr,
-                                               !measureOnly);
+    failures += brae::gatecheck::compareSolves(armName, r.alphaSolves, ofA, nSteps, fin.alphaName.c_str(),
+                                               scalar(1e-10), devLoose ? DEV_BOUND_ALPHA_RESIDUAL : scalar(1e-10),
+                                               scalar(1e-5), nullptr, !measureOnly);
 
     std::printf("test_inter_dtchull_vs_openfoam: %d failure(s)\n", failures);
     return failures ? 1 : 0;

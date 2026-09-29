@@ -99,7 +99,11 @@ void deviceDdtCorr(
     //     phiCorr = phiUf0 - dotInterpolate(Sf, U.oldTime())
     //     result  = fvcDdtPhiCoeff(U.oldTime(), phiUf0, phiCorr)*rDeltaT*phiCorr
     // (EulerDdtScheme.C). Null on a static mesh, where phi.oldTime() is what OpenFOAM uses.
-    const DeviceBuffer<scalar>* phiUfOldInt = nullptr);
+    const DeviceBuffer<scalar>* phiUfOldInt = nullptr,
+    // LOCALEULER: fvc::interpolate(rDeltaT) per internal and boundary face (localEulerDdtScheme.C:385),
+    // in rDeltaT's place -- the host's interpolateRDeltaT, uploaded. Null == the scalar; both or neither.
+    const DeviceBuffer<scalar>* rDeltaTfInt = nullptr,
+    const DeviceBuffer<scalar>* rDeltaTfBnd = nullptr);
 
 // U = HbyA + rAU*fvc::reconstruct((phig - p_rghEqn.flux())/rAUf), pEqn.H:58. `faceFlux` is the
 // difference BEFORE the division; the division happens inside so the two operations cannot be

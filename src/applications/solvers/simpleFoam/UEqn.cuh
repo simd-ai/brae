@@ -111,6 +111,9 @@ struct MomentumInput
     const DeviceBuffer<scalar>* ddtV0 = nullptr;
     const DeviceBuffer<scalar>* ddtUOld[3] = {nullptr, nullptr, nullptr};
     scalar ddtDeltaT = 0;
+    // LOCALEULER (interFoam): the per-cell rDeltaT, which fvm::ddt(rho, U) takes in 1/ddtDeltaT's place
+    // (localEulerDdtScheme.C:282-308). Null == the scalar step; refused beside CrankNicolson or a moving mesh.
+    const DeviceBuffer<scalar>* ddtRDeltaT = nullptr;
     // ...or CrankNicolson's fvm::ddt(rho, U) in Euler's place (device_crank_nicolson_ddt.cuh): the
     // scheme's clock, the equation's OWN ddt0 field kept by the caller across steps, and the old-old
     // levels of rho and U. All or none.

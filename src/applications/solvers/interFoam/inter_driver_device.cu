@@ -4,6 +4,8 @@
 // is separately landed and separately gated; what this file owns is the wiring, and that wiring is
 // what tests/test_device_inter_dambreak_alpha.cu measures against the host driver on damBreak.
 #include "inter_driver_cpp.cuh"
+#include "inter_set_rdeltat_cpp.cuh"
+#include <set>
 #include "inter_amr_cpp.cuh"
 #include "inter_correct_phi_cpp.cuh"
 #include "inter_case_cpp.cuh"
@@ -152,12 +154,18 @@ RunReport runInterFoamDevice(
     const MutableMesh* mutableMesh)
 {
     InterFields f = buildInterFields(caseDir, startDir, m, g, fvp);
-    // LOCAL TIME STEPPING runs on the host loop only (inter_set_rdeltat_cpp.cuh and the localEuler
-    // consumers); this loop would run every ddt at controlDict's deltaT
+    // LOCAL TIME STEPPING. setRDeltaT.H runs on the HOST (inter_set_rdeltat_cpp: the smoothing is a
+    // FaceCellWave) from this loop's fields, and each consumer -- the alpha pre-solve and CMULES,
+    // fvm::ddt(rho, U), ddtCorr -- reads the uploaded field. The gate's control switches consumers off by
+    // name (readLtsScalarControl), on this loop as on the host's.
+    const std::set<std::string> ltsScalar = readLtsScalarControl();
     if (f.lts)
-        throw std::runtime_error(
-            "brae interFoam (device): ddtSchemes `default` is localEuler. The local time step (setRDeltaT.H) "
-            "and its consumers are ported on the host loop only; run without -device.");
+    {
+        if (f.turbulence.on)
+            throw std::runtime_error(
+                "brae interFoam (device): localEuler with a turbulence closure. The closure's fvm::ddt under the "
+                "local time step is ported on the host loop only; run without -device.");
+    }
     // outletPhaseMeanVelocity is updated from U's CELLS at the assembly and inside each corrector's
     // U.correctBoundaryConditions() on the host loop (inter_driver_cpp.cu); this loop carries no such hook
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
@@ -680,6 +688,9 @@ RunReport runInterFoamDevice(
     // the only current copy. Empty until the first alpha step, when the host's -- built at rest by
     // buildInterFields -- is the field.
     DeviceBuffer<scalar> dRpI, dRpB;
+    // localEuler's per-cell rDeltaT, uploaded each step from the host setRDeltaT, and ddtCorr's face field
+    // interpolate(rDeltaT) beside it; empty otherwise
+    DeviceBuffer<scalar> dRDeltaT, dRDeltaTfI, dRDeltaTfB;
     // ...U's among them. U's patches are EVALUATED on the host too (the updateUBoundary hook), told their
     // flux by pushFlux -- and with U the only one naming rhoPhi, this used to leave the host's rhoPhi at the
     // value it started the run with: MEASURED on laminar/damBreak with U alone naming it, device U 2.6e-07
@@ -1596,6 +1607,12 @@ RunReport runInterFoamDevice(
             std::string("brae interFoam -device: the case's ") + which + " scheme is not one this "
             "loop implements (linear, upwind, vanLeer, interfaceCompression).");
     };
+    // localEuler: the pre-solve's fvm::ddt and CMULES read the local step (unless the gate's control
+    // switches the consumer off, which is what the host loop's control does too)
+    C.alphaInput.rDeltaT = (f.lts && !ltsScalar.count("alpha")) ? &dRDeltaT : nullptr;
+    C.rDeltaTUEqn = (f.lts && !ltsScalar.count("ueqn")) ? &dRDeltaT : nullptr;
+    C.rDeltaTfInt = (f.lts && !ltsScalar.count("ddtcorr")) ? &dRDeltaTfI : nullptr;
+    C.rDeltaTfBnd = (f.lts && !ltsScalar.count("ddtcorr")) ? &dRDeltaTfB : nullptr;
     C.alphaInput.alphaScheme  = alphaScheme(f.divPhiAlpha, "div(phi,alpha)");
     C.alphaInput.alpharScheme = alphaScheme(f.divPhirbAlpha, "div(phirb,alpha)");
     // ...and the gradient each limiter reads, by the field's OWN gradSchemes entry, as the host hands
@@ -1929,10 +1946,64 @@ RunReport runInterFoamDevice(
         // OpenFOAM's two #includes each build their own surfaceSum(mag(phi)), and so do these two
         // calls. The host driver caches one and shares it, which is the single place it deliberately
         // differs from OpenFOAM; the device does not need to, so it does not.
-        rep.CoNum = deviceAlphaCourantNo(dm, dPhiI, dPhiB, nullptr, rep.deltaT).CoNum;
-        rep.alphaCoNum = deviceAlphaCourantNo(dm, dPhiI, dPhiB, &dA, rep.deltaT).CoNum;
-        rep.deltaT = setDeltaTVoF(rep.deltaT, rep.CoNum, rep.alphaCoNum, f.timeCtl,
-                                  rep.time - startTime, &f.writeCadence);
+        if (f.lts)
+        {
+            // setRDeltaT.H in the three includes' place (interFoam.C:94-103), before ++runTime, on the HOST
+            // from this loop's fields: rhoPhi is the last alpha step's -- the host's createFields one at the
+            // first step, before this loop has written any -- phi the last corrector's, rho the last
+            // mixture's, alpha1 the cells and its STORED patch values (the alpha hook keeps f.alpha1's).
+            // deltaT stays controlDict's: under localEuler it is 1 and no ddt reads it.
+            SurfaceScalarField phiH = f.phi;
+            dPhiI.copyTo(phiH.internal);
+            unflatten(dPhiB, phiH.boundary);
+            SurfaceScalarField rhoPhiH = f.rhoPhi;
+            if (dRpI.size() > 0)
+            {
+                dRpI.copyTo(rhoPhiH.internal);
+                unflatten(dRpB, rhoPhiH.boundary);
+            }
+            dA.copyTo(f.alpha1.internal);
+            std::vector<scalar> rhoH = f.rho;
+            if (dRho.size() == static_cast<std::size_t>(nC))
+            {
+                dRho.copyTo(rhoH);
+            }
+            SetRDeltaTInput ri;
+            ri.rhoPhi = &rhoPhiH;
+            ri.phi = &phiH;
+            ri.alpha1 = &f.alpha1;
+            ri.rho = &rhoH;
+            // timeIndex > startTimeIndex + 1, before ++runTime: `s` steps of this run are done
+            ri.damp = s > 1;
+            LocalEulerControls lec = f.ltsCtl;
+            applySetRDeltaTControls(lec, ri.damp);
+            const SetRDeltaTReport lr = setRDeltaT(f.rDeltaT, lec, ri, m, g, fvp);
+            rep.ltsLog.push_back(lr);
+            rep.rDeltaTPerStep.push_back(f.rDeltaT);
+            dRDeltaT.copyFrom(f.rDeltaT);
+            // ddtCorr's face field, by the host's own interpolation (patch faces take the face cell's)
+            const SurfaceScalarField rDeltaTf = interpolateRDeltaT(f.rDeltaT, m, g, fvp);
+            dRDeltaTfI.copyFrom(rDeltaTf.internal);
+            dRDeltaTfB.copyFrom(flattenPatches(rDeltaTf.boundary, fvp));
+            if (verbose)
+            {
+                std::printf("  Flow time scale min/max = %.17g, %.17g\n", (double)lr.flowMin, (double)lr.flowMax);
+                std::printf("  Smoothed flow time scale min/max = %.17g, %.17g\n",
+                            (double)lr.smoothedMin, (double)lr.smoothedMax);
+                if (lr.damped)
+                {
+                    std::printf("  Damped flow time scale min/max = %.17g, %.17g\n",
+                                (double)lr.dampedMin, (double)lr.dampedMax);
+                }
+            }
+        }
+        else
+        {
+            rep.CoNum = deviceAlphaCourantNo(dm, dPhiI, dPhiB, nullptr, rep.deltaT).CoNum;
+            rep.alphaCoNum = deviceAlphaCourantNo(dm, dPhiI, dPhiB, &dA, rep.deltaT).CoNum;
+            rep.deltaT = setDeltaTVoF(rep.deltaT, rep.CoNum, rep.alphaCoNum, f.timeCtl,
+                                      rep.time - startTime, &f.writeCadence);
+        }
 
         // Uf.oldTime(), snapshotted where the host driver snapshots it (inter_driver_cpp.cu:897,
         // alongside UOld and phiOld). The FLUX off it is built after this step's move, below: the

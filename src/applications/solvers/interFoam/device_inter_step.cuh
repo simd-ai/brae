@@ -209,6 +209,12 @@ struct DeviceInterStepControls
 {
     // CrankNicolson, or null for Euler -- see DeviceInterCrankNicolson
     DeviceInterCrankNicolson* cn = nullptr;
+    // LOCALEULER: the per-cell rDeltaT fvm::ddt(rho, U) reads (MomentumAssemblyInput::ddtRDeltaT). Null ==
+    // the scalar step. Separate from alphaInput's so a gate can switch one consumer off at a time.
+    const DeviceBuffer<scalar>* rDeltaTUEqn = nullptr;
+    // ...and ddtCorr's face field, interpolate(rDeltaT) on internal and boundary faces. Both or neither.
+    const DeviceBuffer<scalar>* rDeltaTfInt = nullptr;
+    const DeviceBuffer<scalar>* rDeltaTfBnd = nullptr;
     // the cell volumes the mesh had BEFORE this step's move, for the ddt's old-time term
     // (OF EulerDdtScheme: rho.oldTime()*U.oldTime()*Vsc0()). Null on a static mesh.
     const DeviceBuffer<scalar>* V0 = nullptr;

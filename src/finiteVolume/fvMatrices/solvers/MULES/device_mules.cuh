@@ -61,6 +61,12 @@ struct DeviceMulesFields
     // pair is a third scheme that is neither OpenFOAM's moving form nor its fixed one.
     const DeviceBuffer<scalar>* Vsc  = nullptr;   // null == dm.V
     const DeviceBuffer<scalar>* Vsc0 = nullptr;   // null == dm.V
+
+    // LOCALEULER: the per-cell rDeltaT setRDeltaT.H formed, which CMULES' limiterCorr and correct read in
+    // the scalar's place (CMULESTemplates.C:393-397 and :52-56, localEulerDdt branches) -- the host's
+    // MULES::Fields::rDeltaT. Null == the scalar. The explicit limiter and explicitSolve refuse it, as the
+    // host's do: MULESCorr is the only path a localEuler case runs here.
+    const scalar* rDeltaT = nullptr;
 };
 
 // phiBD = upwind(phi).flux(psi), with the boundary OVERWRITTEN by phiPsi on every non-coupled patch --

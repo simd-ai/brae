@@ -124,6 +124,10 @@ struct DeviceAlphaStepInput
     const DeviceBuffer<scalar>* Vsc  = nullptr;
     const DeviceBuffer<scalar>* Vsc0 = nullptr;
 
+    // LOCALEULER: the per-cell rDeltaT setRDeltaT.H formed this step, which the pre-solve's fvm::ddt and
+    // CMULES read in 1/deltaT's place (the host's AlphaStepInput::rDeltaT). Null == the scalar step.
+    const DeviceBuffer<scalar>* rDeltaT = nullptr;
+
     // phic FORMED BY THE CALLER, ahead of a geometry change inside the step. alphaEqn.H forms
     // phic = cAlpha*|phi/magSf| ONCE, at :59, before the pre-solve and before anything interpolates
     // across the mesh; with fixed geometry it is the same field wherever it is formed, which is why
