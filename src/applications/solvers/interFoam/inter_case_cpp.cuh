@@ -187,6 +187,8 @@ struct InterFields
     // ...its base scheme, and the other gradients' resolved entries (grad(alpha.<phase1>),
     // grad(alpha.<phase2>), grad(p_rgh), grad(pcorr), grad(rho)); interface.nHatGrad holds `nHat`'s
     bool gradULeastSq = false;
+    // fvSolution's `cache { grad(U); }` and the registry field it keeps -- see GradUCache
+    GradUCache gradUCache;
     GradChoice gradAlpha1;
     GradChoice gradAlpha2;
     GradChoice gradPrgh;

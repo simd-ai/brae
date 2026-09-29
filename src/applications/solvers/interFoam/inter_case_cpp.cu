@@ -207,6 +207,72 @@ scalar maxNonOrthogonality(
 
 namespace {
 
+// fvSolution's `cache` block: whether the case caches grad(U). solution.C:56-60 reads the sub-dictionary
+// and `active` (default true); solution::cache(name) is then `cache_.found(name)` (solution.C:297-305).
+// The KEYS are read from the text, not through FoamDict, whose tokenizer splits `grad(U)` into `grad`
+// and `( U )`. brae carries the cache for grad(U) alone: any other entry of an active block would name a
+// field whose reuse brae does not model, so it is refused by name; a pattern key is refused because it
+// could match names brae cannot enumerate.
+bool readCacheGradU(const std::string& caseDir, const FoamDict& fvSolution)
+{
+    const FoamDict* c = fvSolution.subDict("cache");
+    const std::string all = readFileExpanded(caseDir + "/system/fvSolution");
+    std::string body;
+    bool found = false;
+    int depth = 0;
+    for (std::size_t i = 0; i < all.size(); ++i)
+    {
+        const char ch = all[i];
+        if (ch == '{') { ++depth; continue; }
+        if (ch == '}') { --depth; continue; }
+        if (depth != 0 || all.compare(i, 5, "cache") != 0) continue;
+        const bool startOk = (i == 0) || std::isspace(static_cast<unsigned char>(all[i - 1]))
+                          || all[i - 1] == ';' || all[i - 1] == '}';
+        std::size_t j = i + 5;
+        while (j < all.size() && std::isspace(static_cast<unsigned char>(all[j]))) ++j;
+        if (!startOk || j >= all.size() || all[j] != '{') continue;
+        const std::size_t close = all.find('}', j + 1);
+        const std::size_t nested = all.find('{', j + 1);
+        if (close == std::string::npos || (nested != std::string::npos && nested < close))
+            throw std::runtime_error(
+                "brae interFoam: fvSolution's `cache` block holds a sub-dictionary or is unterminated. "
+                "OpenFOAM's cache entries are keys; brae reads keys only.");
+        body = all.substr(j + 1, close - j - 1);
+        found = true;
+        break;
+    }
+    if (found != (c != nullptr))
+        throw std::runtime_error(
+            "brae interFoam: fvSolution's `cache` block was found by one reader and not the other; refusing "
+            "rather than guess whether the case caches grad(U).");
+    if (!found) return false;
+    const bool active = c->switchOr("active", true);
+    bool gradU = false;
+    std::size_t b = 0;
+    while (b < body.size())
+    {
+        std::size_t e = body.find(';', b);
+        if (e == std::string::npos) e = body.size();
+        std::istringstream st(body.substr(b, e - b));
+        b = e + 1;
+        std::string key;
+        if (!(st >> key)) continue;
+        if (key == "active") continue;
+        if (key == "grad(U)")
+        {
+            gradU = true;
+            continue;
+        }
+        if (!active) continue;
+        throw std::runtime_error(
+            "brae interFoam: fvSolution's `cache` names `" + key + "`. brae carries OpenFOAM's registry reuse "
+            "for grad(U) only (" + (key.front() == '"' ? std::string("a pattern key could match fields it does "
+            "not model") : std::string("that field's reuse is not ported")) + "); refused rather than run the "
+            "gradient uncached, which OpenFOAM does not.");
+    }
+    return active && gradU;
+}
+
 // fvSchemes' divSchemes entry for div(rhoPhi,U). The shipped tutorials ask for `Gauss linearUpwind
 // grad(U)` (24), `Gauss vanLeerV` (8), `Gauss upwind` (6), `Gauss linear` (3) and
 // `Gauss limitedLinear 0.2` (1). Anything else is refused by name rather than run as something
@@ -230,6 +296,18 @@ DivScheme parseMomentumDiv(const std::string& entry, scalar& coeff)
     const std::string s = (tok.size() > 1) ? tok[1] : "";
     if (s == "upwind")        return DivScheme::upwind;
     if (s == "linear")        return DivScheme::linear;
+    // linearUpwind, linearUpwindV and LUST READ the name of their gradient (linearUpwind.H:95-104) and
+    // resolve it through gradSchemes and the registry under that name. brae's momentum takes grad(U)'s
+    // entry -- and, when fvSolution caches it, grad(U)'s registry field -- so any other name would be
+    // run as grad(U). All 25 shipped interFoam tutorials using the family write `grad(U)`.
+    if (s == "LUST" || s == "linearUpwind" || s == "linearUpwindV")
+    {
+        const std::string gradName = (tok.size() > 2) ? tok[2] : "";
+        if (gradName != "grad(U)")
+            throw std::runtime_error(
+                "brae interFoam: `div(rhoPhi,U) " + entry + "` names the gradient `" + gradName + "`. brae's "
+                "momentum takes grad(U)'s gradSchemes entry and registry field; another name is not ported.");
+    }
     if (s == "LUST")          return DivScheme::LUST;
     if (s == "linearUpwind")  return DivScheme::linearUpwind;
     if (s == "linearUpwindV") return DivScheme::linearUpwindV;
@@ -1285,7 +1363,9 @@ InterFields buildInterFields(const std::string&          caseDir,
     // source. See the note at that site. A measurement that toggled the per-call/per-step switch looked
     // like it REFUTED the old-time hypothesis -- it changed nothing because the per-step store was not
     // reaching the closure either way. The measurement refuted the fix, not the cause.
-    validateInterTurbulence(f.turbulence, f.U, f.nu, f.nuBnd, f.phi, m, g, patches);
+    // fvSolution's cache block, before validate(): kOmegaSST's validate is the first to form grad(U)
+    f.gradUCache.on = readCacheGradU(caseDir, fvSolution);
+    validateInterTurbulence(f.turbulence, f.U, f.nu, f.nuBnd, f.phi, m, g, patches, f.gradUCache);
 
     // createMRF.H -> IOMRFZoneList (READ_IF_PRESENT); a zone is active unless it says otherwise
     // (MRFZone.C:248, :553). createFields.H:129 constructs it AFTER everything above, and nothing here

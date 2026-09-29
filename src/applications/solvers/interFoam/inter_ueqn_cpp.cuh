@@ -172,6 +172,15 @@ struct InterMomentumInput
     // linearUpwind NAMES its own gradient (`linearUpwind grad(U)` -> gradSchemes entry `grad(U)`); -1
     // means the caller did not resolve one and gradULimitK stands in, as in rhoSimpleFoam.
     scalar    gradULULimitK      = -1.0;
+    // fvSolution's `cache { grad(U); }`: the registry's grad(U), cells and the boundary gaussGrad corrected
+    // when it was formed, which every site asking for the NAME grad(U) takes instead of forming one --
+    // linearUpwind's correction (and vanLeerV's/limitedLinearV's limiter), the dev2 term, and the corrected
+    // laplacian's fullGradCorrection. gradScheme::grad (gradScheme.C:120-160) reuses it while U's eventNo is
+    // unchanged, and the fvMatrix constructor RESTORES that eventNo around its updateCoeffs (fvMatrix.C:
+    // 394-397), so a pressureInletOutletVelocity's evaluate() at this assembly does not refresh it. Null
+    // when the case caches nothing: each site forms its own from U as it stands. Both or neither.
+    const std::vector<tensor>*              gradUCached    = nullptr;
+    const std::vector<std::vector<tensor>>* gradUBndCached = nullptr;
 
     // THE GUARD IS "THE CASE NAMES A FACTOR", NOT "THE FACTOR IS BELOW 1". damBreak's fvSolution says
     // `equations { ".*" 1; }`, which relaxEquation() FINDS (solution.C:330-334), and relax(1) still runs

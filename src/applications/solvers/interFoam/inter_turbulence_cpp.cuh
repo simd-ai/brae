@@ -120,6 +120,36 @@ struct InterTurbulenceCrankNicolson
     bool           restartSeeded = false;
 };
 
+// fvSolution's `cache { grad(U); }`: the grad(U) OpenFOAM keeps in the mesh registry. gradScheme::grad
+// (gradScheme.C:120-160) forms and stores it at the first request, then returns it -- "Reusing" -- while
+// U's eventNo is unchanged, and forms it again -- "Updating" -- at the first request after U changed.
+// On RAS/DTCHull (solution's DebugSwitch, measured) kOmegaSST's validate forms it, UEqn's three sites
+// reuse it at the first step, turbulence->correct updates it, and the next step's UEqn reuses THAT one.
+// It is not the uncached answer: the fvMatrix constructor restores U's eventNo around its updateCoeffs
+// (fvMatrix.C:394-397), so the atmosphere's pressureInletOutletVelocity, whose updateCoeffs ends in
+// evaluate(), moves U's patch values under a gradient that is not refreshed. OpenFOAM against itself,
+// cached against uncached: U 2.0e-06 at the first step, k 8.1e-03 and nut 2.6e-02 at the second.
+struct GradUCache
+{
+    // the case names grad(U) in an active cache block
+    bool on = false;
+    // formed since U last changed -- OpenFOAM's `pgGrad->upToDate(vsf)`
+    bool valid = false;
+    std::vector<tensor> cells;
+    // the boundary gaussGrad corrected when the gradient was formed (gaussGrad::correctBoundaryConditions,
+    // against U's patch values THEN), which the dev2 term reads
+    std::vector<std::vector<tensor>> bnd;
+};
+
+// Store a grad(U) just formed from U as it stands -- a no-op when the case caches nothing.
+void storeGradU(
+    GradUCache& cache,
+    const std::vector<tensor>& gradU,
+    const GeometricField<vector>& U,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches);
+
 struct InterTurbulence
 {
     // simulationType RAS. False is laminar: no fields, nuEff = nu, correct() does nothing.
@@ -279,7 +309,9 @@ void validateInterTurbulence(
     const SurfaceScalarField& phi,     // the flux nut's inletOutlet patches decide inflow by
     const PrimitiveMesh& m,
     const FvGeometry& g,
-    const std::vector<FvPatch>& patches);
+    const std::vector<FvPatch>& patches,
+    // kOmegaSST's validate forms grad(U) (kOmegaSSTBase.C:129-133), and a case caching it keeps that one
+    GradUCache& gradUCache);
 
 // nuEff = nut + nu on cells and on every patch (eddyViscosity::nuEff). Laminar returns nu.
 void interNuEff(
@@ -319,6 +351,9 @@ struct InterTurbulenceStepInput
     std::vector<LinearSolveRecord>* kLog = nullptr;
     // kOmegaSST's first solve, omega before k as kOmegaSSTBase.C:555-607 has them
     std::vector<LinearSolveRecord>* omegaLog = nullptr;
+    // kOmegaSST::correct forms grad(U) (kOmegaSSTBase.C:522); a case caching it keeps that one. Null is
+    // refused: every caller has the registry, caching or not.
+    GradUCache* gradUCache = nullptr;
     // CrankNicolson: the scheme's clock and rho.oldTime().oldTime() (the `density variable` lineage
     // reads it; null in the other). The closure keeps its own ddt0 fields and old-old levels
     // (InterTurbulence::cn). Null runs the closure's fvm::ddt as Euler, which is what every other

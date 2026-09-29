@@ -167,6 +167,16 @@ RunReport runInterFoamDevice(
                 "brae interFoam (device): U patch `" + fvp[pi].name + "` is outletPhaseMeanVelocity. The host "
                 "loop carries it; the device loop does not. Run without -device.");
     }
+    // fvSolution's `cache { grad(U); }`: the host loop reuses the closure's grad(U) at the next UEqn, as
+    // OpenFOAM's registry does; this loop forms every one afresh, which is OpenFOAM's UNCACHED answer --
+    // and OpenFOAM's answer outright on a motion-solver mesh, which is changing() from its first update on,
+    // so gradScheme bypasses the registry at every step (RAS/electrostaticDeposition, gated on this loop by
+    // interfoam_moving_vs_openfoam `esd`). A static mesh, or a refining one, would reuse it: refused.
+    const bool cacheInert = f.dynamicMesh && !(f.amr && f.amr->active);
+    if (f.gradUCache.on && !cacheInert)
+        throw std::runtime_error(
+            "brae interFoam (device): fvSolution caches grad(U). The host loop carries OpenFOAM's reuse of it; "
+            "the device loop does not. Run without -device.");
     // THE PAIR, built here and not at the device-mesh stage, because the hooks below fill its share of
     // the surface fields and they are defined before the DeviceCyclic is.
     // ...INCLUDING a cyclicACMI the caller has coupled as a coincident pair (cpu::cyclicACMI::setup):
@@ -3071,6 +3081,8 @@ RunReport runInterFoamDevice(
                 ti.omegaLog = &rep.omegaSolves;
                 ti.epsilonLog = &rep.epsilonSolves;
                 ti.kLog = &rep.kSolves;
+                // refused above when the case caches grad(U), so this registry is never live
+                ti.gradUCache = &f.gradUCache;
                 correctInterTurbulence(f.turbulence, ti, m, g, fvp);
             }
             }   // pimple.turbCorr()

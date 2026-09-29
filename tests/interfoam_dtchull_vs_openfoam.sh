@@ -17,27 +17,32 @@
 # linearUpwind limitedGrad` over `limitedGrad cellLimited Gauss linear 1`.
 #
 # STAGED, on both codes, and why:
-#   `cache` removed          brae does not read fvSolution's cache block
 #   functions removed        the forces function object writes, and changes no field
 #   write every step, ascii  the oracle
-#   laminar                  (`laminar` only) the flow's consumers without the closure
+#   laminar                  (`laminar` only) the flow's consumers without the closure, and without
+#                            fvSolution's `cache { grad(U); }`: with no closure to form grad(U), the UEqn's
+#                            first request would form and store it, and brae refuses that (the order of
+#                            UEqn.H's operands is not modelled)
 #
 # MEASURED, ten steps, OpenFOAM's one-ulp floor beside each (the same run with ONE interface cell's alpha
 # moved by one ulp, OpenFOAM against OpenFOAM):
 #   laminar  rDeltaT 1.6e-16 at step 1, small after; alpha 3.6e-10, p_rgh 6.5e-10, U 5.1e-13, the outlet's
 #            U face by face 3.2e-12; all p_rgh and alpha counts OpenFOAM's
-#   ras      alpha 6.1e-10 (1.5e-10), p_rgh 1.2e-09 (3.1e-10), U 4.2e-13 (2.3e-13), k 4.0e-12 (3.1e-13),
-#            omega 1.0e-11 (2.5e-13), nut 1.1e-11 (4.4e-12), the HULL's wall nut face by face 7.1e-11, the
-#            OUTLET's U face by face 5.8e-12; p_rgh initial residuals 3.0e-10 (4.9e-11); every p_rgh,
-#            alpha, omega and k count and final residual OpenFOAM's. The tutorial's own schemes, wall
-#            functions and outlet: linearUpwind limitedGrad (5e-02 of OpenFOAM's own k, omega and nut
-#            over these steps), nutkRoughWallFunction (rough against smooth: OpenFOAM's own nut 2.3e-01 at
-#            the first step; 5,605 of 27,438 hull faces in fnRough's 2.25-90 regime by the last) and
+#   ras      alpha 6.0e-10 (2.4e-10), p_rgh 1.1e-09 (5.0e-10), U 5.1e-13 (1.7e-13), k 3.3e-12 (5.7e-13),
+#            omega 9.4e-12 (1.3e-12), nut 1.0e-11 (3.4e-12), the HULL's wall nut face by face 6.6e-11, the
+#            OUTLET's U face by face 2.1e-12; p_rgh initial residuals 9.4e-11 (2.1e-10); every p_rgh,
+#            alpha, omega and k count and final residual OpenFOAM's. The tutorial AS SHIPPED but for the
+#            staging above: linearUpwind limitedGrad (5e-02 of OpenFOAM's own k, omega and nut over these
+#            steps), nutkRoughWallFunction (rough against smooth: OpenFOAM's own nut 2.3e-01 at the first
+#            step; 5,605 of 27,438 hull faces in fnRough's 2.25-90 regime by the last),
 #            outletPhaseMeanVelocity (against an inletOutlet: OpenFOAM's own k 2.7e-02 at the first step,
-#            alpha 9.9e-04 at the last).
-# At the FIRST step, before anything amplifies, U is 6e-13 to 8e-13 on BOTH profiles -- with the outlet
-# staged or not -- so that is not the closure's, the wall's or the outlet's; brae then sits a steady ~4x
-# above OpenFOAM's one-ulp run from the third step. From step 2 all but 165 of the 845,536 cells sit above
+#            alpha 9.9e-04 at the last) and the cached grad(U) (against the uncached run, OpenFOAM against
+#            itself: U 2.0e-06 at the first step, k 8.1e-03 and nut 2.6e-02 at the second -- the atmosphere's
+#            pressureInletOutletVelocity evaluates inside updateCoeffs, which fvMatrix does not let move U's
+#            eventNo, so the reused gradient never sees it).
+# At the FIRST step, before anything amplifies, U is 6e-13 on BOTH profiles -- with the outlet or the cache
+# or neither -- so that is not the closure's, the wall's, the outlet's or the cache's; by the tenth step
+# brae sits 2x to 7x above OpenFOAM's one-ulp run. From step 2 all but 165 of the 845,536 cells sit above
 # the floor 1/maxDeltaT = 1, so the local step is live almost everywhere.
 #
 # THE CONTROLS, three steps each against the same oracle, each asserted to FAIL on a number:
@@ -62,8 +67,14 @@
 #                                             alpha 7.4e-02, p_rgh 2.7e-01
 #            BRAE_CONTROL_OPMV_NOLAG          the outlet updated in the first corrector too, which
 #                                             OpenFOAM's updated() flag skips   U 9.6e-05, k 9.8e-03
+#            BRAE_CONTROL_GRADU_UNCACHED      every grad(U) formed afresh, OpenFOAM's uncached answer
+#                                             U 1.8e-05, k 2.6e-03, nut 2.3e-02
 #
-# NOT CLAIMED: linearUpwind for k and omega naming
+# NOT CLAIMED: the cached grad(U) under a laminar, kEpsilon or LES closure, MRF, or with U changed since
+# the closure last formed it (refused: the UEqn would form it itself), on a refining mesh (refused: OpenFOAM
+# bypasses the registry on the steps the mesh changes; a motion-solver mesh changes at every step, so there
+# the cache is inert and runs, interfoam_moving_vs_openfoam `esd`), and any other cached name (refused);
+# linearUpwind for k and omega naming
 # different gradients or on a coupled mesh (refused), nutkRoughWallFunction's KsPlus >= 90 regime (no hull
 # face reaches it in ten steps; 5,605 of 27,438 are in the 2.25-90 regime by the last), a rough wall on a
 # refining mesh or under kEpsilon (refused), and both on the device (refused), fvc::spread and fvc::sweep (refused: DTCHull sets both iteration counts to 0),
@@ -147,9 +158,11 @@ for key, val in [('endTime', str(n)), ('writeInterval', '1'), ('writeFormat', 'a
 open(c, 'w').write(s)
 p = os.path.join(d, 'system/fvSolution')
 t = open(p).read()
-t, k = re.subn(r'\ncache\s*\{[^}]*\}\s*', '\n', t)
-assert k == 1, 'the cache block'
-open(p, 'w').write(t)
+assert re.search(r'\ncache\s*\{\s*grad\(U\);\s*\}', t), 'the tutorial caches grad(U)'
+if profile == 'laminar':
+    t, k = re.subn(r'\ncache\s*\{[^}]*\}\s*', '\n', t)
+    assert k == 1, 'the cache block'
+    open(p, 'w').write(t)
 assert re.search(r'type\s+outletPhaseMeanVelocity;', open(os.path.join(d, '0/U')).read()), \
     'the tutorial names outletPhaseMeanVelocity on the U outlet'
 if profile == 'laminar':
@@ -207,7 +220,7 @@ do
 done
 for ctl in BRAE_CONTROL_LTS_SCALAR=turbulence BRAE_CONTROL_SST_LU_OFF=1 BRAE_CONTROL_SST_LU_UNLIMITED=1 \
            BRAE_CONTROL_NUTK_SMOOTH=1 BRAE_CONTROL_NUTKROUGH_NOHISTORY=1 BRAE_CONTROL_OPMV_FROZEN=1 \
-           BRAE_CONTROL_OPMV_NOLAG=1
+           BRAE_CONTROL_OPMV_NOLAG=1 BRAE_CONTROL_GRADU_UNCACHED=1
 do
     control ras "$ctl" || rc=1
 done

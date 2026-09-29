@@ -744,6 +744,23 @@ RunReport runInterFoam(
     if (opmvIgnoreLag)
         std::printf("  *** CONTROL MODE: outletPhaseMeanVelocity is updated in the lagged first corrector. "
                     "This run is deliberately wrong. ***\n");
+    // GATE CONTROL for fvSolution's `cache { grad(U); }`, never set by a solver: every grad(U) site forms
+    // its own from U as it stands, which is OpenFOAM's UNCACHED answer. WRONG where the case caches it.
+    const bool gradUUncached = std::getenv("BRAE_CONTROL_GRADU_UNCACHED") != nullptr;
+    if (gradUUncached)
+        std::printf("  *** CONTROL MODE: fvSolution's cached grad(U) is formed afresh at every site. This run is "
+                    "deliberately wrong. ***\n");
+    // gradScheme::grad bypasses the registry while mesh().changing() and deletes what it holds
+    // (gradScheme.C:132-142). A MOTION-SOLVER mesh is moving() from its first update on (polyMesh's flag is
+    // never reset), so from step one every request is formed afresh: the per-step bypass below.
+    // RAS/electrostaticDeposition ships the cache on a solid-body motion (interfoam_moving_vs_openfoam
+    // `esd`). A REFINING mesh changes on some steps only; the step after one that did not is what the stale
+    // refusal at the assembly would meet, but the refiner's own reset of the flag is not modelled here.
+    if (f.gradUCache.on && f.amr && f.amr->active)
+        throw std::runtime_error(
+            "brae interFoam: fvSolution caches grad(U) on a refining mesh. OpenFOAM bypasses and deletes the "
+            "cached field on the steps the mesh changes (gradScheme.C:132-142) and reuses it on the others; "
+            "that is not ported.");
     auto rDeltaTFor = [&](const char* consumer) -> const std::vector<scalar>*
     {
         if (!f.lts) return nullptr;
@@ -1446,10 +1463,40 @@ RunReport runInterFoam(
                     {
                         MRF::correctBoundaryVelocity(f.U, f.mrfZones, patches);
                         mi.mrf = &f.mrfZones;
+                        // ...through U.boundaryFieldRef(), which moves U's eventNo (GeometricField.C:
+                        // boundaryFieldRef -> setUpToDate), so a cached grad(U) is out of date from here
+                        f.gradUCache.valid = false;
+                    }
+                    // fvSolution's cached grad(U): the one the last closure call formed, while U has not
+                    // changed since. When it HAS, OpenFOAM's first grad(U) request of this assembly forms
+                    // and stores it and the others reuse that -- which of UEqn.H's operands asks first is
+                    // the compiler's operand order, and brae does not model it. That is a laminar or
+                    // kEpsilon case (no validate gradient), MRF, and any corrector U changed since.
+                    // mesh().changing(): the registry is bypassed and its field deleted
+                    const bool meshChanging = dyn && dyn->moving();
+                    if (meshChanging)
+                    {
+                        f.gradUCache.valid = false;
+                    }
+                    if (f.gradUCache.on && !gradUUncached && !meshChanging)
+                    {
+                        if (!f.gradUCache.valid)
+                            throw std::runtime_error(
+                                "brae interFoam: fvSolution caches grad(U), and at this UEqn assembly U has "
+                                "changed since grad(U) was last formed (or nothing formed it: only kOmegaSST's "
+                                "validate and correct do). OpenFOAM's first request in the assembly would form "
+                                "and store it for the others, in an operand order brae does not model.");
+                        mi.gradUCached = &f.gradUCache.cells;
+                        mi.gradUBndCached = &f.gradUCache.bnd;
                     }
                     FvVectorMatrix UEqn;
                     momentumPredictor(f.U, mi, force, msc, m, g, patches,
                                       f.momentumPredictorOn, UEqn);
+                    // the predictor's solve moves U's eventNo
+                    if (f.momentumPredictorOn)
+                    {
+                        f.gradUCache.valid = false;
+                    }
 
                     DdtCorrInput dc;
                     dc.phiOld = &phiOld; dc.UOld = &UOld; dc.deltaT = rep.deltaT;
@@ -1574,6 +1621,8 @@ RunReport runInterFoam(
                         pin.correctorIndex = c;
                         pressureCorrector(f.p_rgh, f.U, f.phi, f.p, pin, psc, m, g, patches);
                     }
+                    // `U = HbyA + ...; U.correctBoundaryConditions()` (pEqn.H) moved U's eventNo
+                    f.gradUCache.valid = false;
                     // alpha1's inletOutlet reads the flux the step ended on, at the next MULES pass;
                     // U's patches keep their coefficients until the next momentum assembly (the alpha
                     // stage's push, above), as OpenFOAM's do -- the turbulence correct below reads
@@ -1621,7 +1670,14 @@ RunReport runInterFoam(
                     ti.epsilonLog = &rep.epsilonSolves;
                     ti.omegaLog = &rep.omegaSolves;
                     ti.kLog = &rep.kSolves;
+                    // ...and "Updating grad(U)": kOmegaSST's correct forms it, and a caching case keeps it
+                    ti.gradUCache = &f.gradUCache;
                     correctInterTurbulence(f.turbulence, ti, m, g, patches);
+                    // ...unless the mesh is changing, where the closure's gradient is formed and not kept
+                    if (dyn && dyn->moving())
+                    {
+                        f.gradUCache.valid = false;
+                    }
                     break;
                 }
                 case Stage::write:            break;

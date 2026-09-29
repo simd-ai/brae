@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <regex>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -217,6 +218,16 @@ int main(
         dampOk = dampOk && (r.ltsLog[static_cast<std::size_t>(k)].damped == (k >= 2));
     }
     check("...damped from the third step on and never before", dampOk);
+    // fvSolution's `cache { grad(U); }`: `ras` keeps the tutorial's, `laminar` strips it (brae refuses it
+    // where the assembly would form the gradient itself). brae must cache exactly where the case does; the
+    // harness's BRAE_CONTROL_GRADU_UNCACHED shows the reuse reaches the answer.
+    {
+        std::ifstream fs(caseDir + "/system/fvSolution");
+        std::stringstream ss;
+        ss << fs.rdbuf();
+        const bool caseCaches = std::regex_search(ss.str(), std::regex(R"(\ncache\s*\{[^}]*grad\(U\);)"));
+        check("brae caches grad(U) exactly where the case's fvSolution does", fin.gradUCache.on == caseCaches);
+    }
 
     // setRDeltaT.H's Info lines against OpenFOAM's, step by step
     const std::vector<TimeScaleLine> ofLines = readTimeScaleLines(logPath);
@@ -377,12 +388,11 @@ int main(
     const std::vector<LinearSolveRecord> ofA = brae::gatecheck::readOfSolves(logPath, fin.alphaName);
     check("OpenFOAM's log gave the p_rgh and alpha solves",
           !ofP.empty() && ofA.size() >= static_cast<std::size_t>(nSteps));
-    // p_rgh's initial residuals over the run. `ras` runs the tutorial's own outletPhaseMeanVelocity, and
-    // that profile is the more sensitive one: OpenFOAM against ITSELF with one interface cell's alpha moved
-    // by one ulp reads 4.9e-11 there, and brae 3.0e-10, 6x its floor -- the same ratio its fields sit at
-    // from the third step on, all of it growing from a U difference of 6e-13 at the FIRST step that the
-    // laminar profile has too (the outlet itself is 5.8e-12 face by face). It was 2e-10 while the profile
-    // staged the outlet as inletOutlet; laminar keeps that.
+    // p_rgh's initial residuals over the run. `ras` runs the tutorial's own outletPhaseMeanVelocity and
+    // cached grad(U), and on that profile OpenFOAM against ITSELF, one interface cell's alpha moved by one
+    // ulp, reads 2.1e-10 -- above laminar's bound -- where brae reads 9.4e-11. The figure is the
+    // trajectory's, not a defect's: with the cache stripped the same floor is 4.9e-11 and brae 3.0e-10.
+    // 2e-10 here would sit below OpenFOAM's own one-ulp floor; laminar keeps it.
     const scalar pRunBound = fin.turbulence.on ? scalar(6e-10) : scalar(2e-10);
     failures += brae::gatecheck::compareSolves("host", r.pSolves, ofP, nSteps, "p_rgh",
                                                scalar(1e-10), pRunBound, scalar(-1), nullptr,

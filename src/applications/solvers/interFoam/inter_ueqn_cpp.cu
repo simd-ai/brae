@@ -17,6 +17,10 @@ namespace {
 
 void refuseUnsupported(const InterMomentumInput& in)
 {
+    if ((in.gradUCached == nullptr) != (in.gradUBndCached == nullptr))
+        throw std::runtime_error(
+            "brae interFoam UEqn: a cached grad(U) needs its cells AND the boundary gaussGrad corrected when "
+            "it was formed; the caller gave one without the other.");
     if (in.ddtScheme == DdtScheme::localEuler && (!in.rDeltaT || in.V0))
         throw std::runtime_error(
             "brae interFoam UEqn: ddtSchemes asks for localEuler, whose fvm::ddt(rho, U) reads the local "
@@ -78,6 +82,16 @@ std::vector<tensor> gradU(const GeometricField<vector>& U,
                           const FvGeometry&             g,
                           const std::vector<FvPatch>&   patches)
 {
+    if (in.gradUCached)
+    {
+        // the registry's field is grad(U)'s, formed through grad(U)'s own entry; a site whose gradient
+        // resolved to a different limiter would be asking for another name, which the reader refuses
+        if (limitK != in.gradULimitK)
+            throw std::runtime_error(
+                "brae interFoam UEqn: a cached grad(U) was offered to a site whose gradient resolves to "
+                "another entry. Only sites asking for the name grad(U) take the cache.");
+        return *in.gradUCached;
+    }
     std::vector<tensor> gU = in.gradULeastSq ? fvc::leastSquaresGrad(U, m, g, patches)
                                              : fvc::gaussGrad(U, m, g, patches);
     cellLimitGrad(gU, U, limitK, m, g, patches);
@@ -338,7 +352,7 @@ FvVectorMatrix assembleUEqn(
         muEffBnd = &muEffBndOwned;
     }
     addDivDevReff(M, U, *muEff, *muEffBnd, m, g, patches, in.correctedLaplacian, in.snGradLimitCoeff,
-                  in.gradULimitK, in.gradULeastSq, in.nonOrthCoeffs);
+                  in.gradULimitK, in.gradULeastSq, in.nonOrthCoeffs, in.gradUCached, in.gradUBndCached);
 
     stage.vectors("ueqnSrcDev", M.source);
     // ...and the three things divDevRhoReff's explicit half is built from, because that half is where
@@ -375,12 +389,13 @@ FvVectorMatrix assembleUEqn(
             stage.vectors("ueqnUbndRef", rv);
             stage.scalars("ueqnUbndVf", vf);
         }
-        stage.tensors("ueqnGradU", in.gradULeastSq
-                                       ? fvc::leastSquaresGrad(U, m, g, patches)
-                                       : fvc::gaussGrad(U, m, g, patches));
+        stage.tensors("ueqnGradU", in.gradUCached ? *in.gradUCached
+                                   : in.gradULeastSq ? fvc::leastSquaresGrad(U, m, g, patches)
+                                                     : fvc::gaussGrad(U, m, g, patches));
         stage.vectors("ueqnDivDevExpl",
                       divDevReffExplicit(U, *muEff, *muEffBnd, m, g, patches,
-                                         in.gradULimitK, in.gradULeastSq));
+                                         in.gradULimitK, in.gradULeastSq,
+                                         in.gradUCached, in.gradUBndCached));
     }
 
     // == fvOptions(rho, U), UEqn.H:9. explicitPorositySource builds a porosityEqn and does

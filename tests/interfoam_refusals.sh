@@ -479,6 +479,21 @@ arm opmv_noValue            refused "has no \`value\`"           "" "${OPMV/OPMV
 arm opmv_otherAlpha         refused "OpenFOAM looks the named field up" "" "${OPMV/OPMVSPEC/Umean 1; alpha alpha.oil; value uniform (0 0 0);}"
 arm opmv_dry                refused "no \`alpha.water\` on the patch" "" "${OPMV/OPMVSPEC/Umean 1; alpha alpha.water; value uniform (0 0 0);}"
 
+# fvSolution's `cache { grad(U); }` -- RAS/DTCHull's -- RUNS on the host loop for kOmegaSST (sst_gradUCache
+# below; gated by tests/interfoam_dtchull_vs_openfoam.sh `ras`): the closure's validate and correct form
+# grad(U) and the next UEqn reuses it, as OpenFOAM's registry does. REFUSED where the assembly would have
+# to form and store it itself -- laminar here, kEpsilon beside the RAS base -- because which of UEqn.H's
+# operands asks first is not modelled; any other cached name, and a pattern key, by name; the device loop
+# (device_gradUCache). An INACTIVE block is OpenFOAM's uncached run and must run whatever it names.
+CACHE="printf '\\ncache\\n{\\nCACHESPEC\\n}\\n' >> system/fvSolution"
+arm gradUCache_laminar      refused "U has changed since grad(U) was last formed" "" "${CACHE/CACHESPEC/    grad(U);}"
+arm gradUCache_otherField   refused "names \`grad(p_rgh)\`"  "" "${CACHE/CACHESPEC/    grad(U);\\n    grad(p_rgh);}"
+arm gradUCache_pattern      refused "a pattern key could match" "" "${CACHE/CACHESPEC/    \"grad(.*)\";}"
+arm gradUCache_inactive     runs    -                         "" "${CACHE/CACHESPEC/    active false;\\n    grad(U);\\n    grad(p_rgh);}"
+# ...and linearUpwind's NAMED gradient: brae's momentum takes grad(U)'s entry and registry field, so a
+# case naming another was run as grad(U). All 25 shipped users of the family name grad(U).
+arm lu_momentumOtherGrad    refused "names the gradient \`limitedGrad\`" "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U) Gauss linearUpwind limitedGrad;/' system/fvSchemes; sed -i '/^gradSchemes/,/^}/ s/default .*/&\\n    limitedGrad     cellLimited Gauss linear 1;/' system/fvSchemes"
+
 arm alpha_minIter           runs    -                        "" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       yes;\\n\\1minIter 1;/' system/fvSolution"
 # `MULESCorr any;` is TRUE to OpenFOAM (Switch.C:114). alphaEqn's own switch helper covered six spellings
 # each way and THREW on `any` and `none`; it is FoamDict::switchOr now, so this runs.
@@ -544,6 +559,9 @@ arm sst_F3                  refused "F3"                      "" "$SSTBASE; sed 
 arm sst_blending            refused "blending stepwise"       "" "$SSTBASE; sed -i '0,/omegaWallFunction;/ s/omegaWallFunction;/omegaWallFunction;\\n        blending        stepwise;/' 0/omega"
 arm sst_nutU                refused "nutUWallFunction"        "" "$SSTBASE; sed -i '0,/nutkWallFunction/ s/nutkWallFunction/nutUWallFunction/' 0/nut"
 arm sst_wallWithoutOmegaWF  refused "omegaWallFunction"       "" "$SSTBASE; sed -i '0,/omegaWallFunction;/ s/omegaWallFunction;/zeroGradient;/' 0/omega"
+# the cached grad(U) runs for kOmegaSST, whose validate forms it; kEpsilon's does not (see CACHE above)
+arm sst_gradUCache          runs    -                        "" "$SSTBASE; ${CACHE/CACHESPEC/    grad(U);}"
+arm ras_gradUCacheKEpsilon  refused "U has changed since grad(U) was last formed" "" "${CACHE/CACHESPEC/    grad(U);}"
 arm sst_linearUpwindOmega   refused "div(phi,omega)"          "" "$SSTBASE; sed -i 's/div(phi,omega) .*/div(phi,omega) Gauss linearUpwind grad(omega);/' system/fvSchemes"
 # THE CLOSURE'S linearUpwind -- RAS/DTCHull's `Gauss linearUpwind limitedGrad` over a NAMED
 # `cellLimited Gauss linear 1` -- RUNS for kOmegaSST on the pair, gated by
@@ -956,6 +974,8 @@ if [ $HAVE_GPU = 1 ]; then
     # outletPhaseMeanVelocity is updated from U's cells on the host loop only
     BASE="$B"
     arm device_opmv         refused "is outletPhaseMeanVelocity. The host" "-device" "${OPMV/OPMVSPEC/Umean 1; alpha alpha.water; value uniform (0 0 0);}"
+    # the cached grad(U) is reused on the host loop only
+    arm device_gradUCache   refused "fvSolution caches grad(U). The host" "-device" "${CACHE/CACHESPEC/    grad(U);}"
     BASE="$BR"
     BASE="$B"
     BASE="$B"

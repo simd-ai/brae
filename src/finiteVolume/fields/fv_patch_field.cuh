@@ -2055,6 +2055,13 @@ public:
         vf_ = std::move(f);
         vfUpdated_ = true;
     }
+    // A derived class's CONSTRUCTOR valueFraction -- OpenFOAM's `valueFraction() = 0` in its dictionary
+    // constructor -- which snGrad() and the matrix coefficients read before the first update. It does NOT
+    // license evaluate() to blend: OpenFOAM's constructors do not evaluate, so the value stays the file's.
+    void seedValueFraction(scalar f)
+    {
+        vf_.assign(vf_.size(), f);
+    }
     bool mixedVelocitySign() const override { return velocitySign_; }
     // OF mixed coeffs with refGrad = 0 (host correctness; the device blends the same way in its kernels):
     // OF mixedFvPatchField::snGrad() = lerp(refGrad, (refValue - patchInternalField)*deltaCoeffs,
@@ -2282,7 +2289,15 @@ public:
                                   std::move(readValue)),
           Umean_(Umean),
           alphaName_(std::move(alphaName))
-    {}
+    {
+        // outletPhaseMeanVelocityFvPatchVectorField.C, dictionary constructor: refValue 0, refGrad 0,
+        // valueFraction 0 -- so snGrad() is 0 until the first updateCoeffs. MixedPatchField seeds 0.5.
+        // MEASURED on RAS/DTCHull with `cache { grad(U); }`: kOmegaSST's validate forms grad(U) before that
+        // update, gaussGrad's boundary correction takes this snGrad(), and the first UEqn reuses the
+        // field; with 0.5 the outlet's boundary gradient was 1.7 off and p_rgh 5.5e-06, k 2.7e-02 against
+        // OpenFOAM at the first step. Uncached, nothing reads the coefficients before the update.
+        this->seedValueFraction(scalar(0));
+    }
     bool isOutletPhaseMeanVelocity() const override { return true; }
     const std::string& alphaFieldName() const override { return alphaName_; }
 

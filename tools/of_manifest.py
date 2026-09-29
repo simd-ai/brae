@@ -3039,7 +3039,8 @@ COMPONENTS = {
              brae_reference="src/finiteVolume/fields/fv_patch_field.cuh",
              validation="tests/interfoam_dtchull_vs_openfoam.sh, RAS/DTCHull's U outlet as shipped (Umean 1.668), both "
                         "profiles, HOST ONLY: the outlet's U face by face 5.8e-12 (ras) and 3.2e-12 (laminar) after ten "
-                        "steps, every count OpenFOAM's. Witness, OpenFOAM against itself with an inletOutlet there: k "
+                        "steps, every count OpenFOAM's (2.1e-12 on ras since the cached grad(U) ran). Witness, OpenFOAM "
+                        "against itself with an inletOutlet there: k "
                         "2.7e-02 at the first step, alpha 9.9e-04 at the last. CONTROLS: never updated, alpha 7.4e-02; "
                         "updated in the first corrector too (ignoring the updated() lag), U 9.6e-05, k 9.8e-03. NOT "
                         "CLAIMED: a dry patch (refused: OpenFOAM's phase mean is 0/0), a missing value (refused), the "
@@ -3050,7 +3051,32 @@ COMPONENTS = {
                   "(Umean + Uzgmean)*nf, vf 1 - Uzgmean/Umean. The instants are OpenFOAM's: the UEqn assembly (the "
                   "step's starting cells) and each pressure corrector's U.correctBoundaryConditions() -- but NOT the "
                   "first corrector after an unsolved assembly, where the patch is still updated() and blends with "
-                  "the assembly's coefficients (PressureStepInput::uUpdateCoeffsFromCells, uPatchesUpdatedAtEntry)."),
+                  "the assembly's coefficients (PressureStepInput::uUpdateCoeffsFromCells, uPatchesUpdatedAtEntry). "
+                  "The CONSTRUCTOR's coefficients are OpenFOAM's too: refValue 0, refGrad 0, valueFraction 0, so "
+                  "snGrad() is 0 before the first update -- which a cached grad(U) formed at validate reads."),
+        dict(name="interFoam_cacheGradU", of_symbol="fv::gradScheme::grad",
+             of_file="src/finiteVolume/finiteVolume/gradSchemes/gradScheme/gradScheme.C",
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/applications/solvers/interFoam/inter_turbulence_cpp.cuh",
+             validation="tests/interfoam_dtchull_vs_openfoam.sh `ras`, RAS/DTCHull's `cache { grad(U); }` as shipped, "
+                        "HOST ONLY, ten steps: alpha 6.0e-10, p_rgh 1.1e-09, U 5.1e-13, k 3.3e-12, omega 9.4e-12, "
+                        "nut 1.0e-11, every count OpenFOAM's; OpenFOAM's one-ulp floor 2.4e-10, 5.0e-10, 1.7e-13, "
+                        "5.7e-13, 1.3e-12, 3.4e-12. Witness, OpenFOAM cached against uncached: U 2.0e-06 at the first "
+                        "step, k 8.1e-03 and nut 2.6e-02 at the second. CONTROL: every grad(U) formed afresh, U 1.8e-05, "
+                        "k 2.6e-03, nut 2.3e-02. NOT CLAIMED: laminar, kEpsilon, LES, MRF or U changed since the "
+                        "closure formed it (refused), a refining mesh (refused), any other cached name (refused), the "
+                        "device on a static mesh (refused). On a motion-solver mesh OpenFOAM bypasses the registry at "
+                        "every step (changing() from the first update), so the cache is inert and both loops run it "
+                        "(interfoam_moving_vs_openfoam `esd`, RAS/electrostaticDeposition).",
+             note="gradScheme::grad keeps a registry field under the NAME grad(U) and returns it while U's eventNo "
+                  "is unchanged (solution's DebugSwitch prints Calculating/Reusing/Updating). On DTCHull kOmegaSST's "
+                  "validate forms it, the three UEqn sites asking for the name -- linearUpwind's correction, the "
+                  "dev2 term, the corrected laplacian's fullGradCorrection -- reuse it, and turbulence->correct "
+                  "updates it for the next step. It differs from the uncached answer because the fvMatrix "
+                  "constructor restores U's eventNo around updateCoeffs (fvMatrix.C:394-397), so a patch that "
+                  "evaluates there -- pressureInletOutletVelocity -- moves U's patch values under a gradient that is "
+                  "not refreshed; the cached field's boundary is gaussGrad's correction against the snGrad() of "
+                  "THAT moment, so the constructor-state coefficients of every mixed U patch are read."),
         dict(name="interFoam_variableHeightFlowRate", of_symbol="variableHeightFlowRateInletVelocityFvPatchVectorField",
              of_file="src/finiteVolume/fields/fvPatchFields/derived/variableHeightFlowRateInletVelocity/"
                      "variableHeightFlowRateInletVelocityFvPatchVectorField.C",

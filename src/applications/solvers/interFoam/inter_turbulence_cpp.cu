@@ -890,6 +890,21 @@ EqnSolveSetting secondEqnSolve(
 }   // namespace
 
 
+void storeGradU(
+    GradUCache& cache,
+    const std::vector<tensor>& gradU,
+    const GeometricField<vector>& U,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    if (!cache.on) return;
+    cache.cells = gradU;
+    cache.bnd = fvc::gradUBoundary(U, gradU, m, g, patches);
+    cache.valid = true;
+}
+
+
 void validateInterTurbulence(
     InterTurbulence& t,
     const GeometricField<vector>& U,
@@ -898,7 +913,8 @@ void validateInterTurbulence(
     const SurfaceScalarField& phi,
     const PrimitiveMesh& m,
     const FvGeometry& g,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    GradUCache& gradUCache)
 {
     if (!t.on) return;
     // incompressibleInterPhaseTransportModel.C:99-109: validate() sits in the `else` branch, so the
@@ -920,6 +936,7 @@ void validateInterTurbulence(
         {
             cpu::cellLimitGrad(gradU, U, t.sstCoeffs.gradULimitK, m, g, patches);
         }
+        storeGradU(gradUCache, gradU, U, m, g, patches);
         kOmegaSST::Compressible sstComp;
         sstComp.nu = &nu;
         sstComp.nuBnd = &nuBnd;
@@ -1116,6 +1133,10 @@ void correctInterTurbulence(
     const FvGeometry& g,
     const std::vector<FvPatch>& patches)
 {
+    if (!in.gradUCache)
+        throw std::runtime_error(
+            "brae interFoam: correctInterTurbulence was given no grad(U) registry. kOmegaSST::correct forms "
+            "grad(U), and a case caching it reuses that one at the next UEqn; pass the case's, caching or not.");
     if (!t.on) return;
     // `turbulence off`: kEpsilon.C:216-219, kOmegaSSTBase.C:502-505 and kEqn.C:141-144 each open
     // correct() with `if (!this->turbulence_) { return; }`. Nothing else in the model is gated -- the
@@ -1263,6 +1284,16 @@ void correctInterTurbulence(
                            t.coeffs.correctedLaplacian, t.coeffs.snGradLimitCoeff, /*lm=*/nullptr,
                            &sstComp, ks.minIter, pk.relaxSecond->on, pk.relaxFirst->on, &which,
                            &omegaSolve, &t.secondDiv, &t.secondGrad, t.coeffs.nonOrthCoeffs);
+        // ...and the grad(U) correct() formed, for a case that caches it: formed again here by the
+        // closure's own recipe (kOmegaSST_cpp.cu, the same three lines) from the same U, which the closure
+        // does not touch -- the same arithmetic on the same inputs, so the same bits.
+        if (in.gradUCache->on)
+        {
+            std::vector<tensor> gradU = sco.gradULeastSq ? fvc::leastSquaresGrad(*in.U, m, g, patches)
+                                                         : fvc::gaussGrad(*in.U, m, g, patches);
+            if (sco.gradULimitK > 0.0) cpu::cellLimitGrad(gradU, *in.U, sco.gradULimitK, m, g, patches);
+            storeGradU(*in.gradUCache, gradU, *in.U, m, g, patches);
+        }
         // The assembled systems are WRITTEN BY THE CLOSURE (kOmegaSST_cpp.cu), at the call its stage
         // dump latched. This site wrote them on every call instead, so the files held the LAST
         // closure call while every other column in the directory held the first.
