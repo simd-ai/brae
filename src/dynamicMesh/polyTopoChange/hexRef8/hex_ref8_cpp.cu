@@ -6,6 +6,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <cstdint>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -13,6 +16,7 @@
 #include <utility>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 
 namespace brae {
 namespace cpu {
@@ -1178,10 +1182,12 @@ bool readRefinementState(
 
     // READ_IF_PRESENT, twice, and the ABSENT case leaves the caller's zero-filled state alone: that is
     // OpenFOAM's `labelList(nCells, Zero)` fallback and not a gap.
+    // ...plain or .gz: a case written with `writeCompression on` holds polyMesh/cellLevel.gz and the rest,
+    // which OpenFOAM's lookup finds (POSIX.C:870-876). Probing the plain path alone started a restart of a
+    // compressed refined write at level 0 everywhere, with nothing said.
     const auto exists = [](const std::string& path)
     {
-        std::ifstream probe(path);
-        return probe.good();
+        return std::filesystem::exists(path) || std::filesystem::exists(path + ".gz");
     };
     if (exists(dir + "cellLevel"))
     {
@@ -1216,8 +1222,8 @@ bool readRefinementState(
     // the file snappyHexMesh wrote for exactly that reason -- it makes snappy's own refinement permanent.
     if (exists(dir + "refinementHistory"))
     {
-        std::ifstream in(dir + "refinementHistory");
-        std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        const std::vector<char> raw = gzSlurp(dir + "refinementHistory");
+        std::string text(raw.begin(), raw.end());
         if (foamFormat(dir + "refinementHistory") == "binary")
         {
             throw std::runtime_error(
@@ -1269,9 +1275,23 @@ bool readRefinementState(
                     + " cells. OpenFOAM stops on this too (hexRef8.C:1982-1990).");
             }
             history.visibleCells.resize(static_cast<std::size_t>(n));
-            for (long c = 0; c < n; ++c)
+            // `N{v}` -- UListIO.C:119-123's form for more than one equal entry, which a history written
+            // before any refinement holds (every cell -1 after compact) -- is one value for all N
+            while (j < text.size() && std::isspace(static_cast<unsigned char>(text[j])))
             {
-                history.visibleCells[static_cast<std::size_t>(c)] = static_cast<label>(nextLong());
+                ++j;
+            }
+            if (j < text.size() && text[j] == '{')
+            {
+                const label uniformValue = static_cast<label>(nextLong());
+                std::fill(history.visibleCells.begin(), history.visibleCells.end(), uniformValue);
+            }
+            else
+            {
+                for (long c = 0; c < n; ++c)
+                {
+                    history.visibleCells[static_cast<std::size_t>(c)] = static_cast<label>(nextLong());
+                }
             }
         }
         // THE FREE LIST IS EMPTY AFTER A READ, and that is the file's own invariant rather than an omission:
@@ -1631,6 +1651,137 @@ void compactHistory(History& h)
         if (index >= 0) index = oldToNew[static_cast<std::size_t>(index)];
     }
 }
+
+scalar level0EdgeLength(
+    const PrimitiveMesh& m,
+    const std::vector<label>& cellLevel)
+{
+    if (static_cast<label>(cellLevel.size()) != m.nCells())
+    {
+        throw std::runtime_error(
+            "brae hexRef8::level0EdgeLength: cellLevel has " + std::to_string(cellLevel.size())
+            + " entries and the mesh " + std::to_string(m.nCells()) + " cells (hexRef8.C, the same abort).");
+    }
+    // doubleScalarGREAT (doubleScalar.H) squared
+    constexpr scalar great2 = 1.0e+15*1.0e+15;
+    label nLevels = 0;
+    for (const label l : cellLevel)
+    {
+        nLevels = std::max(nLevels, l + 1);
+    }
+    // per edge: -1 unset, the one level of every cell that has it, or labelMax where they differ.
+    // An edge is the unordered vertex pair; a cell's edges are its faces' consecutive pairs.
+    constexpr label labelMax = std::numeric_limits<label>::max();
+    std::unordered_map<std::uint64_t, label> edgeLevel;
+    std::vector<scalar> maxEdgeLenSqr(static_cast<std::size_t>(nLevels), -great2);
+    const std::vector<vector>& pts = m.points();
+    const auto key = [](
+        label a,
+        label b)
+    {
+        const std::uint64_t lo = static_cast<std::uint32_t>(std::min(a, b));
+        const std::uint64_t hi = static_cast<std::uint32_t>(std::max(a, b));
+        return (hi << 32) | lo;
+    };
+    // edge.vec's magSqr: sqr(x) + sqr(y) + sqr(z), which is the same whichever end is the start
+    const auto lenSqr = [&](
+        label a,
+        label b)
+    {
+        const vector d = pts[static_cast<std::size_t>(b)] - pts[static_cast<std::size_t>(a)];
+        return d.x*d.x + d.y*d.y + d.z*d.z;
+    };
+    for (label f = 0; f < m.nFaces(); ++f)
+    {
+        const label n = m.faceSize(f);
+        const label own = m.owner()[static_cast<std::size_t>(f)];
+        const label nei = f < m.nInternalFaces() ? m.neighbour()[static_cast<std::size_t>(f)] : -1;
+        for (label k = 0; k < n; ++k)
+        {
+            const label a = m.faceVert(f, k);
+            const label b = m.faceVert(f, (k + 1) % n);
+            const std::uint64_t e = key(a, b);
+            const scalar l2 = lenSqr(a, b);
+            for (const label c : {own, nei})
+            {
+                if (c < 0)
+                {
+                    continue;
+                }
+                const label cLevel = cellLevel[static_cast<std::size_t>(c)];
+                auto it = edgeLevel.find(e);
+                if (it == edgeLevel.end())
+                {
+                    edgeLevel.emplace(e, cLevel);
+                }
+                else if (it->second != labelMax && it->second != cLevel)
+                {
+                    it->second = labelMax;
+                }
+                scalar& mx = maxEdgeLenSqr[static_cast<std::size_t>(cLevel)];
+                mx = std::max(mx, l2);
+            }
+        }
+    }
+    std::vector<scalar> typEdgeLenSqr(static_cast<std::size_t>(nLevels), great2);
+    for (label f = 0; f < m.nFaces(); ++f)
+    {
+        const label n = m.faceSize(f);
+        for (label k = 0; k < n; ++k)
+        {
+            const label a = m.faceVert(f, k);
+            const label b = m.faceVert(f, (k + 1) % n);
+            const label eLevel = edgeLevel.at(key(a, b));
+            if (eLevel >= 0 && eLevel < labelMax)
+            {
+                scalar& t = typEdgeLenSqr[static_cast<std::size_t>(eLevel)];
+                t = std::min(t, lenSqr(a, b));
+            }
+        }
+    }
+    for (std::size_t l = 0; l < typEdgeLenSqr.size(); ++l)
+    {
+        if (typEdgeLenSqr[l] == great2 && maxEdgeLenSqr[l] >= 0)
+        {
+            typEdgeLenSqr[l] = maxEdgeLenSqr[l];
+        }
+    }
+    for (std::size_t l = 0; l < typEdgeLenSqr.size(); ++l)
+    {
+        if (typEdgeLenSqr[l] < great2)
+        {
+            return std::sqrt(typEdgeLenSqr[l])*static_cast<scalar>(1 << l);
+        }
+    }
+    throw std::runtime_error("brae hexRef8::level0EdgeLength: no level has an edge length (hexRef8.C aborts too).");
+}
+
+
+scalar readLevel0Edge(
+    const std::string& polyMeshDir,
+    const PrimitiveMesh& m,
+    const std::vector<label>& cellLevel)
+{
+    const std::string dir = polyMeshDir.empty() || polyMeshDir.back() == '/' ? polyMeshDir : polyMeshDir + "/";
+    const std::string path = dir + "level0Edge";
+    namespace fs = std::filesystem;
+    if (!fs::exists(path) && !fs::exists(path + ".gz"))
+    {
+        return level0EdgeLength(m, cellLevel);
+    }
+    // `dimensions [0 1 0 0 0 0 0]; value v;` -- snappyHexMesh's binary-format file carries the value as text
+    // too (UniformDimensionedField.C:137-149 writes it with writeEntry), so one reader serves both
+    TokenStream ts(path);
+    while (!ts.eof())
+    {
+        if (ts.next() == "value")
+        {
+            return ts.nextScalar();
+        }
+    }
+    throw std::runtime_error("brae hexRef8: " + path + " has no `value` entry.");
+}
+
 
 }   // namespace hexRef8
 }   // namespace cpu

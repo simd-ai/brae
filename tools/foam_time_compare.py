@@ -15,7 +15,9 @@ worst |a - b| over every number in it, divided by the largest |a| in the referen
 scale; for uniform/time that is the time value).
 
 uniform/functionObjects/functionObjectProperties is compared as TEXT after the banner: its content is
-function-object state, and a case run with `functions {}` has none on either side.
+function-object state, and a case run with `functions {}` has none on either side. So is every polyMesh/
+file but points and points0 -- faces, owner, neighbour, boundary, the zones and hexRef8's levels and
+history are topology and labels, which match OpenFOAM exactly or not at all (a refining mesh writes them).
 
 Prints one line per file and a final `RESULT {json}` line: {"structure": <failures>, "files":
 {"<time>/<file>": {"structure": bool, "rel": x, "abs": |a - b|, "notes": [...]}}, "fileset": [...]}. Exit status is 1 when
@@ -237,7 +239,8 @@ def main():
                 read(os.path.join(da, f)),
                 read(os.path.join(db, f)),
                 tag,
-                f.endswith("functionObjectProperties"))
+                f.endswith("functionObjectProperties")
+                or (f.startswith("polyMesh/") and f not in ("polyMesh/points", "polyMesh/points0")))
             if not fc.structure:
                 result["structure"] += 1
             result["files"][tag] = {

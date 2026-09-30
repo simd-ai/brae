@@ -389,6 +389,66 @@ bool echoableToken(const std::string& t)
     return !std::regex_search(t, notNumber);
 }
 
+// UList::writeList for a label list (UListIO.C:82-178), the rule every labelList file goes by: more than one
+// entry, all equal, as `N{v}`; ten or fewer on one line, `N(a b c)`; otherwise a newline, the count, and one
+// entry per line between parentheses on lines of their own, ending in a newline.
+std::string labelListText(const std::vector<label>& v)
+{
+    const std::size_t n = v.size();
+    bool uniform = n > 1;
+    for (std::size_t i = 1; uniform && i < n; ++i)
+    {
+        uniform = v[i] == v[0];
+    }
+    std::ostringstream os;
+    if (uniform)
+    {
+        os << n << "{" << v[0] << "}";
+        return os.str();
+    }
+    if (n <= kShortList)
+    {
+        os << n << "(";
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            os << (i ? " " : "") << v[i];
+        }
+        os << ")";
+        return os.str();
+    }
+    os << "\n" << n << "\n(";
+    for (const label x : v)
+    {
+        os << "\n" << x;
+    }
+    os << "\n)\n";
+    return os.str();
+}
+
+// ...and a list of elements that are not contiguous (a face, a splitCell8): one line only when it holds at
+// most one, otherwise the multi-line form, each element as its own text
+std::string compoundListText(const std::vector<std::string>& elements)
+{
+    std::ostringstream os;
+    if (elements.size() <= 1)
+    {
+        os << elements.size() << "(";
+        for (const std::string& e : elements)
+        {
+            os << e;
+        }
+        os << ")";
+        return os.str();
+    }
+    os << "\n" << elements.size() << "\n(";
+    for (const std::string& e : elements)
+    {
+        os << "\n" << e;
+    }
+    os << "\n)\n";
+    return os.str();
+}
+
 // A scalar list as a dictionary entry holds it: dict.add streams UList::writeList's form into a primitive
 // entry, re-read as tokens (primitiveEntryTemplates.C:36-46) and written back joined by single spaces
 // (primitiveEntryIO.C:280-314). So `N ( a b )` on one line at any length, `0 ( )` when empty, and -- for
@@ -1465,6 +1525,19 @@ std::string InterWriter::header(
     const std::string& location,
     const std::string& object) const
 {
+    return header(className, location, object, "", "");
+}
+
+// ...with the two header entries a mesh file can carry (IOobjectWriteHeader.C:164-190): `note` between
+// arch and class (owner and neighbour: polyMeshInitMesh.C:96-105), `meta` after object (a ZoneMesh with
+// names: ZoneMesh.C:1058-1069, a dictionary re-emitted, so its list is `N ( a b )`).
+std::string InterWriter::header(
+    const std::string& className,
+    const std::string& location,
+    const std::string& object,
+    const std::string& note,
+    const std::string& metaNames) const
+{
     std::ostringstream os;
     os << "/*--------------------------------*- C++ -*----------------------------------*\\\n"
           "| =========                 |                                                 |\n"
@@ -1477,9 +1550,17 @@ std::string InterWriter::header(
           "    version     2.0;\n"
           "    format      ascii;\n"
           "    arch        \"LSB;label=32;scalar=64\";\n";
+    if (!note.empty())
+    {
+        os << "    note        \"" << note << "\";\n";
+    }
     os << "    class       " << className << ";\n";
     os << "    location    \"" << location << "\";\n";
     os << "    object      " << object << ";\n";
+    if (!metaNames.empty())
+    {
+        os << "    meta\n    {\n        names           " << metaNames << ";\n    }\n";
+    }
     os << "}\n// * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //\n\n";
     return os.str();
 }
@@ -2205,6 +2286,212 @@ void InterWriter::write(const InterWriteState& s)
         emit(dir + "/uniform/rigidBodyMotionState", ob.str(), true);
     }
 
+    // A refining mesh (dynamicRefineFvMesh, hexRef8). hexRef8's own files at EVERY write -- writeObject
+    // forces them to this instance and calls hexRef8::write whatever the mesh did (dynamicRefineFvMesh.C:
+    // 1478-1491, hexRef8.C:5808-5825): cellLevel and pointLevel (labelList), level0Edge
+    // (uniformDimensionedScalarField) and, while the history is active, refinementHistory -- which
+    // operator<< COMPACTS first (refinementHistory.C), done by the driver on the live history before this
+    // call. dumpLevel's volScalarField cellLevel beside them, every patch `calculated; value uniform 0`
+    // (dynamicRefineFvMesh.C:1494-1519). From the first topology change on, the mesh itself
+    // (polyMesh::updateMesh -> setInstance, AUTO_WRITE ever after): faces as a plain faceList in ascii
+    // (CompactIOList.C:165-200), owner and neighbour with their `note`, boundary from the live patches, the
+    // three zone lists, points, and a moving mesh's points0 (points0MotionSolver.C:152-218). Uf for a mesh
+    // that only refines (createUfIfPresent.H: a dynamic mesh has one); a moving one writes it with meshPhi.
+    if (refine_)
+    {
+        const InterAmr* amr = s.amr;
+        const PrimitiveMesh* m = s.mesh;
+        if (!amr || !m)
+        {
+            throw std::runtime_error("brae interFoam writer: a refining mesh handed no mesh or refinement state");
+        }
+        const std::string pm = name + "/polyMesh";
+        const std::string end = "\n\n// ************************************************************************* //\n";
+        const cpu::hexRef8::Levels& lv = amr->state.levels;
+        const cpu::hexRef8::History& hist = amr->state.history;
+        emit(dir + "/polyMesh/cellLevel", header("labelList", pm, "cellLevel") + labelListText(lv.cellLevel) + end,
+             true);
+        emit(dir + "/polyMesh/pointLevel", header("labelList", pm, "pointLevel") + labelListText(lv.pointLevel)
+             + end, true);
+        {
+            std::ostringstream os;
+            os << header("uniformDimensionedScalarField", pm, "level0Edge");
+            keyword(os, 0, "dimensions");
+            os << "[0 1 0 0 0 0 0];\n";
+            keyword(os, 0, "value");
+            os << fmt(amr->level0Edge, precision_) << ";\n\n" << end;
+            emit(dir + "/polyMesh/level0Edge", os.str(), true);
+        }
+        if (hist.active)
+        {
+            std::vector<std::string> split;
+            split.reserve(hist.parent.size());
+            for (std::size_t i = 0; i < hist.parent.size(); ++i)
+            {
+                if (hist.parent[i] < -1)
+                {
+                    throw std::runtime_error("brae interFoam writer: the refinement history holds a freed entry; "
+                                             "it must be compacted before it is written");
+                }
+                split.push_back(std::to_string(hist.parent[i]) + " " + labelListText(hist.addedCells[i]));
+            }
+            emit(dir + "/polyMesh/refinementHistory",
+                 header("refinementHistory", pm, "refinementHistory") + "// splitCells\n" + compoundListText(split)
+                 + "\n// visibleCells\n" + labelListText(hist.visibleCells) + end,
+                 true);
+        }
+        if (amr->controls.dumpLevel)
+        {
+            std::ostringstream os;
+            os << header("volScalarField", name, "cellLevel");
+            keyword(os, 0, "dimensions");
+            os << "[0 0 0 0 0 0 0];\n\n";
+            listEntry(os, 0, "internalField", std::vector<scalar>(lv.cellLevel.begin(), lv.cellLevel.end()),
+                      precision_);
+            os << "\nboundaryField\n{\n";
+            for (const FvPatch& p : patches_)
+            {
+                os << "    " << p.name << "\n    {\n";
+                wordEntry(os, 8, "type", "calculated");
+                listEntry(os, 8, "value", std::vector<scalar>(static_cast<std::size_t>(p.size), scalar(0)),
+                          precision_);
+                os << "    }\n";
+            }
+            os << "}\n" << end;
+            emit(dir + "/cellLevel", os.str(), true);
+        }
+        if (amr->topoChanged)
+        {
+            std::vector<std::string> faces;
+            faces.reserve(static_cast<std::size_t>(m->nFaces()));
+            for (label fi = 0; fi < m->nFaces(); ++fi)
+            {
+                std::vector<label> verts(static_cast<std::size_t>(m->faceSize(fi)));
+                for (label k = 0; k < m->faceSize(fi); ++k)
+                {
+                    verts[static_cast<std::size_t>(k)] = m->faceVert(fi, k);
+                }
+                faces.push_back(labelListText(verts));
+            }
+            emit(dir + "/polyMesh/faces", header("faceList", pm, "faces") + compoundListText(faces) + end, true);
+            std::ostringstream note;
+            note << "nPoints:" << m->nPoints() << "  nCells:" << m->nCells() << "  nFaces:" << m->nFaces()
+                 << "  nInternalFaces:" << m->nInternalFaces();
+            emit(dir + "/polyMesh/owner", header("labelList", pm, "owner", note.str(), "")
+                 + labelListText(m->owner()) + end, true);
+            emit(dir + "/polyMesh/neighbour", header("labelList", pm, "neighbour", note.str(), "")
+                 + labelListText(m->neighbour()) + end, true);
+            // polyBoundaryMesh::writeObject forces UNCOMPRESSED (polyBoundaryMesh.C)
+            {
+                std::ostringstream os;
+                os << header("polyBoundaryMesh", pm, "boundary") << patches_.size() << "\n(\n";
+                for (const FvPatch& p : patches_)
+                {
+                    os << "    " << p.name << "\n    {\n";
+                    wordEntry(os, 8, "type", p.type);
+                    // the read groups, and a wall's own type added to them (wallPolyPatch.C:57, addGroup)
+                    std::vector<std::string> groups = p.inGroups;
+                    if (p.type == "wall" && std::find(groups.begin(), groups.end(), "wall") == groups.end())
+                    {
+                        groups.push_back("wall");
+                    }
+                    if (!groups.empty())
+                    {
+                        // writeList(os, 0): flat, `N(a b)` (patchIdentifier.C:139-144)
+                        std::string g = std::to_string(groups.size()) + "(";
+                        for (std::size_t i = 0; i < groups.size(); ++i)
+                        {
+                            g += (i ? " " : "") + groups[i];
+                        }
+                        wordEntry(os, 8, "inGroups", g + ")");
+                    }
+                    wordEntry(os, 8, "nFaces", std::to_string(p.size));
+                    wordEntry(os, 8, "startFace", std::to_string(p.start));
+                    os << "    }\n";
+                }
+                os << ")" << end;
+                emit(dir + "/polyMesh/boundary", os.str(), false);
+            }
+            // the zone lists (ZoneMesh.C:1155-1180): `0()` when empty; motorBike's empty pointZone as
+            // N ( name { type; pointLabels List<label> 0(); } ), its names in the header's meta
+            {
+                const std::vector<std::pair<std::string, const std::vector<ZoneEntry>*>> kinds{
+                    {"cellZones", &amr->cellZoneEntries},
+                    {"faceZones", &amr->faceZoneEntries},
+                    {"pointZones", &amr->pointZoneEntries}};
+                for (const auto& kind : kinds)
+                {
+                    const std::vector<ZoneEntry>& zones = *kind.second;
+                    if (zones.empty())
+                    {
+                        emit(dir + "/polyMesh/" + kind.first, header("regIOobject", pm, kind.first) + "0()" + end,
+                             true);
+                        continue;
+                    }
+                    std::string names = std::to_string(zones.size()) + " (";
+                    std::ostringstream os;
+                    os << zones.size() << "\n(";
+                    for (const ZoneEntry& z : zones)
+                    {
+                        names += " " + z.name;
+                        os << z.name << "\n{\n";
+                        wordEntry(os, 4, "type", z.type);
+                        wordEntry(os, 4, "pointLabels", "List<label> 0()");
+                        os << "}\n";
+                    }
+                    os << ")";
+                    emit(dir + "/polyMesh/" + kind.first,
+                         header("regIOobject", pm, kind.first, "", names + " )") + os.str() + end, true);
+                }
+            }
+            if (!refineMoves_)
+            {
+                std::ostringstream os;
+                os << header("vectorField", pm, "points") << "\n";
+                os << m->nPoints() << "\n(\n";
+                for (const vector& x : m->points())
+                {
+                    os << fmt(x, precision_) << "\n";
+                }
+                os << ")\n" << end;
+                emit(dir + "/polyMesh/points", os.str(), true);
+            }
+            else
+            {
+                if (!s.points0)
+                {
+                    throw std::runtime_error("brae interFoam writer: a moving refining mesh handed no points0");
+                }
+                std::ostringstream os;
+                os << header("vectorField", pm, "points0") << "\n";
+                os << s.points0->size() << "\n(\n";
+                for (const vector& x : *s.points0)
+                {
+                    os << fmt(x, precision_) << "\n";
+                }
+                os << ")\n" << end;
+                emit(dir + "/polyMesh/points0", os.str(), true);
+            }
+        }
+        if (!refineMoves_)
+        {
+            if (!s.Uf)
+            {
+                throw std::runtime_error("brae interFoam writer: a refining mesh handed no Uf");
+            }
+            emit(
+                dir + "/Uf",
+                surfaceFieldText(
+                    header("surfaceVectorField", name, "Uf"),
+                    *s.Uf,
+                    "[0 1 -1 0 0 0 0]",
+                    false,
+                    patches_,
+                    precision_),
+                true);
+        }
+    }
+
     // rAU (initCorrectPhi.H:3-17): `rAU.ref() = 1.0/UEqn.A()` assigns the whole field (pEqn.H:4), and A()
     // is extrapolatedCalculated (fvMatrix.C:1314-1328), so every non-coupled patch holds its face cells'
     // values -- measured bit-exact on six cases. Constraint patches write their type alone.
@@ -2445,19 +2732,22 @@ void registerUnwritten(
         }
     }
     // a sub-cycled alpha's old time is AUTO_WRITE (GeometricField::storeOldTime gives the level the
-    // field's writeOpt once the sub-cycle has made it an old-old one, subCycle.H:76-84) -- at every write
-    // time, the first included. On a refining mesh OpenFOAM maps that level with the mesh, which a
-    // start-of-step copy is not.
+    // field's writeOpt once the sub-cycle has made it an old-old one, GeometricField.C:935-938) -- at every
+    // write time, the first included. On a refining mesh OpenFOAM maps that level with the mesh
+    // (MapGeometricFields: storeOldTimes, then the same cell mapper as alpha), so it is alpha as the mesh
+    // update left it: the driver takes the level's copy after the update, not at the step's start.
     if (f.alphaCtl.nAlphaSubCycles > 1)
     {
-        if (f.amr && f.amr->active)
+        w.writeAlphaOld();
+        // ...taken at the step's first mesh update. Under moveMeshOuterCorrectors a refining mesh updates again
+        // at every corrector, and each change maps the restored old level anew (MapGeometricFields at the same
+        // time index); that re-mapping is not carried, so the file is refused rather than written from the
+        // first update alone.
+        if (f.amr && f.amr->active && f.moveMeshOuterCorrectors)
         {
-            w.refuseAtFirstWrite(a + "_0", "a sub-cycled alpha's old time on a REFINING mesh, which OpenFOAM "
-                                           "maps with the topology change");
-        }
-        else
-        {
-            w.writeAlphaOld();
+            w.refuseAtFirstWrite(a + "_0", "a sub-cycled alpha's old time on a refining mesh updated at every "
+                                           "outer corrector (moveMeshOuterCorrectors), which OpenFOAM maps at "
+                                           "each change");
         }
         // a restart whose start directory holds alpha_0 gives OpenFOAM's old level that FILE's contact-angle
         // gradient (readGradientEntry, alphaContactAngleTwoPhaseFvPatchScalarField.C:73-77), which brae
@@ -2493,9 +2783,55 @@ void registerUnwritten(
     {
         if (f.amr && f.amr->active)
         {
-            w.refuseAtFirstWrite("polyMesh/{faces,owner,neighbour,boundary,points,cellLevel,pointLevel,level0Edge,"
-                                 "refinementHistory}, cellLevel, Uf, meshPhi",
-                                 "a refining mesh's topology and hexRef8 state (hexRef8.C, dynamicRefineFvMesh.C)");
+            // what the writer can echo, each alternative named here and not inside write(): the patch
+            // types whose polyPatch::write is type/inGroups/nFaces/startFace alone (coupled, cyclic,
+            // processor and generic add entries of their own, polyPatch.C:437-443), no physicalType (brae
+            // does not keep it), and the zone forms an oracle holds -- `0()`, and motorBike's empty
+            // pointZone. A zone with members, or a cell or face zone entry at all, is not written.
+            std::string why;
+            for (const FvPatch& p : w.patches())
+            {
+                if (p.type != "patch" && p.type != "wall")
+                {
+                    why = "patch `" + p.name + "` is `" + p.type + "`";
+                }
+            }
+            std::ifstream boundaryIn(f.amr->polyMeshDir + "/boundary");
+            const std::string boundaryText((std::istreambuf_iterator<char>(boundaryIn)),
+                                           std::istreambuf_iterator<char>());
+            if (boundaryText.find("physicalType") != std::string::npos)
+            {
+                why = "a patch sets physicalType";
+            }
+            if (!f.amr->cellZoneEntries.empty() || !f.amr->faceZoneEntries.empty())
+            {
+                why = "the mesh has cell or face zone entries";
+            }
+            for (const ZoneEntry& z : f.amr->pointZoneEntries)
+            {
+                if (z.type != "pointZone" || z.nMembers != 0 || z.extraKeys)
+                {
+                    why = "pointZone `" + z.name + "` has members or entries beyond its type";
+                }
+            }
+            if (!why.empty())
+            {
+                w.refuseAtFirstWrite("polyMesh/{boundary,cellZones,faceZones,pointZones}", why + ", which the "
+                                     "refining mesh's writer does not echo");
+            }
+            // the motion a refining mesh may also carry (dynamicRefineFvMesh is a
+            // dynamicMotionSolverListFvMesh): its points, meshPhi and Uf, and points0 after a change
+            const bool moves = f.dynamicMesh != nullptr;
+            if (moves && !f.dynamicMesh->solidBodyOnly())
+            {
+                w.refuseAtFirstWrite("the motion solver's own state", "a refining mesh moved by a solver other "
+                                     "than solidBody");
+            }
+            if (moves)
+            {
+                w.writeMeshMotion();
+            }
+            w.writeRefineMesh(moves);
         }
         else if (f.dynamicMesh && f.dynamicMesh->solidBodyOnly())
         {

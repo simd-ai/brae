@@ -220,7 +220,24 @@ static std::vector<label> readLabelColumn(const std::string& path)
     FastScan s(path);
     const label n = static_cast<label>(s.nextLong());   // count; '(' then the n ints ')' are parsed as delimiters
     std::vector<label> v(n);
-    for (label i = 0; i < n; ++i) v[i] = static_cast<label>(s.nextLong());
+    // UListIO.C:119-123 writes a list of more than one entry, all equal, as `N{v}` -- a cellLevel before
+    // any refinement is `1000{0}` -- and ListIO.C reads the one value into every entry. Scanned as a
+    // column it read the value once and then ran off the end: strtol there returns 0 without moving, so
+    // `8{2}` came back as one 2 and seven zeros, with nothing said.
+    while (s.p < s.end && std::isspace(static_cast<unsigned char>(*s.p)))
+    {
+        ++s.p;
+    }
+    if (s.p < s.end && *s.p == '{')
+    {
+        const label uniformValue = static_cast<label>(s.nextLong());
+        std::fill(v.begin(), v.end(), uniformValue);
+        return v;
+    }
+    for (label i = 0; i < n; ++i)
+    {
+        v[i] = static_cast<label>(s.nextLong());
+    }
     return v;
 }
 

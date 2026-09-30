@@ -242,11 +242,10 @@ History freshHistory(label nCells);
 // carries levels 1 to 3, and `cellLevel[celli] < maxRefinement` (dynamicRefineFvMesh.C:861) then means
 // something different in the two codes.
 //
-// level0Edge IS DELIBERATELY NOT READ. It is READ_IF_PRESENT with a computed fallback (hexRef8.C:1939-1951)
-// and hexRef8 uses level0EdgeLength() in exactly ONE place -- consistentSlowRefinement2 (:2784) -- which
-// dynamicRefineFvMesh never calls: it calls consistentRefinement (dynamicRefineFvMesh.C:895) and rolls its
-// own buffer layers (:1415). Every other caller is snappyHexMesh. Reading it would be work that no decision
-// of this solver's consumes.
+// level0Edge is not read HERE: hexRef8 uses level0EdgeLength() in exactly ONE place --
+// consistentSlowRefinement2 (:2784) -- which dynamicRefineFvMesh never calls, so no refinement decision
+// consumes it. But OpenFOAM WRITES it at every write time (hexRef8::write), so the writer needs it: see
+// readLevel0Edge below.
 //
 // Returns false when NO file was found (so the caller keeps its zero-filled state and knows it did), true
 // when at least one was read. Throws by name on a file that is present and inconsistent with the mesh.
@@ -310,6 +309,22 @@ void updateLevels(
 // where a freed entry (-2) is skipped and a recombined one (parent -1 and no children) is skipped -- but
 // either can still be marked if the first pass reached it through someone else.
 void compactHistory(History& h);
+
+// hexRef8::getLevel0EdgeLength (hexRef8.C): the smallest squared edge length per level over the edges whose
+// cells are all of that level, the largest per level as the fallback for a level with none, and
+// sqrt(lenSqr)*2^level at the lowest level present. A min and a max over the same set, so the answer does
+// not depend on the edge order and is reproduced bit for bit.
+scalar level0EdgeLength(
+    const PrimitiveMesh& m,
+    const std::vector<label>& cellLevel);
+
+// level0Edge as hexRef8's constructor holds it (hexRef8.C:1939-1951): READ_IF_PRESENT from
+// <polyMeshDir>/level0Edge (a uniformDimensionedScalarField, `value v;` -- snappyHexMesh writes one), the
+// computed length otherwise. Computed once, at construction, and never again: every write repeats it.
+scalar readLevel0Edge(
+    const std::string& polyMeshDir,
+    const PrimitiveMesh& m,
+    const std::vector<label>& cellLevel);
 
 // setRefinement's section 11 (:4274-4300): extend the history over the new cells and record every split.
 void storeRefinementHistory(

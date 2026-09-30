@@ -21,6 +21,71 @@ namespace {
 
 constexpr const char* WHO = "brae interFoam (adaptive mesh): ";
 
+// polyMesh/<kind>Zones as ZoneMesh writes it (ZoneMesh.C:1155-1180): `0()`, or N, `(`, then per zone its
+// name and a dictionary of `type`, its members (`cellLabels`/`faceLabels`/`pointLabels`, as
+// `List<label> N(...)` in ascii, `List<label> N` in binary) and a face zone's `flipMap`. A missing file is
+// an empty zone list -- OpenFOAM writes `0()` for it all the same (oscillatingBox has none in constant/).
+std::vector<ZoneEntry> readZoneEntries(const std::string& path)
+{
+    std::vector<ZoneEntry> out;
+    if (!std::filesystem::exists(path) && !std::filesystem::exists(path + ".gz"))
+    {
+        return out;
+    }
+    TokenStream ts(path);
+    const label n = ts.nextLabel();
+    ts.expect("(");
+    for (label z = 0; z < n; ++z)
+    {
+        ZoneEntry e;
+        e.name = ts.next();
+        ts.expect("{");
+        int depth = 1;
+        while (!ts.eof() && depth > 0)
+        {
+            const std::string k = ts.next();
+            if (k == "{")
+            {
+                ++depth;
+                continue;
+            }
+            if (k == "}")
+            {
+                --depth;
+                continue;
+            }
+            if (depth != 1 || k == ";")
+            {
+                continue;
+            }
+            if (k == "type")
+            {
+                e.type = ts.next();
+            }
+            else if (k == "cellLabels" || k == "faceLabels" || k == "pointLabels")
+            {
+                std::string t = ts.next();
+                if (t.rfind("List<", 0) == 0)
+                {
+                    t = ts.next();
+                }
+                e.nMembers = static_cast<label>(std::stol(t));
+            }
+            else
+            {
+                e.extraKeys = true;
+            }
+            // the rest of the entry, to its `;`
+            while (!ts.eof() && ts.peek() != ";" && ts.peek() != "}")
+            {
+                ts.next();
+            }
+        }
+        out.push_back(e);
+    }
+    return out;
+}
+
 // Instrument: BRAE_STAGE_DUMP_DIR=<dir> (+ BRAE_STAGE_DUMP_ITER=n, default 1) writes the mesh-change
 // block's THREE flux stages, one value per line, under the names tools/dumpInterFoam writes OpenFOAM's --
 // UfIn, phiAbsPre, phiAbsPost. That is the split this unit needs: the mapped Uf that goes in, the
@@ -350,9 +415,13 @@ InterAmr readInterAmr(
         //     them -- so that is what is counted.
         for (const char* other : {"faceZones", "pointZones"})
         {
-            std::ifstream in(pm + other);
-            if (!in) continue;
-            std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            // plain or .gz, as readZoneEntries below reads them
+            if (!std::filesystem::exists(pm + other) && !std::filesystem::exists(pm + other + ".gz"))
+            {
+                continue;
+            }
+            const std::vector<char> raw = gzSlurp(pm + other);
+            std::string text(raw.begin(), raw.end());
             // Each zone entry carries its members under a `...Labels` key, whose count is the next integer
             // (`pointLabels List<label> 0;` as well as `faceLabels 3(1 2 3);`). A faceZone's `flipMap` has a
             // count of its own and is NOT one of these keys, so it is not counted twice.
@@ -368,7 +437,11 @@ InterAmr readInterAmr(
             }
         }
         amr.state.nZones = nZ;
+        amr.cellZoneEntries = readZoneEntries(pm + "cellZones");
+        amr.faceZoneEntries = readZoneEntries(pm + "faceZones");
+        amr.pointZoneEntries = readZoneEntries(pm + "pointZones");
     }
+    amr.level0Edge = cpu::hexRef8::readLevel0Edge(facesPolyMeshDir, m, amr.state.levels.cellLevel);
     amr.state.protectedCell = dynamicRefine::initProtectedCells(
         amr.state.levels.cellLevel, amr.state.levels.pointLevel, pointCells, cells, m, patches);
     (void)g;
@@ -646,10 +719,11 @@ bool interAmrUpdate(
             "never have been created -- and nothing here maps it.");
 
     const dynamicRefine::RefineUpdateStep step =
-        dynamicRefine::refineUpdate(amr.state, amr.controls, f.alpha1.internal, timeIndex);
+        dynamicRefine::refineUpdate(amr.state, amr.controls, f.alpha1.internal, amr.startTimeIndex + timeIndex);
     amr.nRefined = static_cast<label>(step.cellsToRefine.size());
     amr.nUnrefined = static_cast<label>(step.pointsToUnrefine.size());
     if (!step.hasChanged) return false;
+    amr.topoChanged = true;
 
     {
         const std::size_t want = 3u + (carryPhiOld ? 1u : 0u) + (carryAlpha2Bnd ? 1u : 0u)

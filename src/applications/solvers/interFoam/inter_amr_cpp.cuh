@@ -53,10 +53,22 @@
 #include "crank_nicolson_ddt_scheme_cpp.cuh"   // CrankNicolsonDdt0, the levels a change maps
 #include "inter_driver_cpp.cuh"
 #include <string>
+#include <vector>
 
 namespace brae {
 namespace cpu {
 namespace interFoam {
+
+// One zone of a polyMesh/{cell,face,point}Zones file, as the writer echoes it: its name and type, and how many
+// members it has (a zone with members, or a face zone's flip map, is not written -- no oracle holds one).
+struct ZoneEntry
+{
+    std::string name;
+    std::string type;
+    label nMembers = 0;
+    // an entry key other than `type` and the members (inGroups, a flipMap): not echoed
+    bool extraKeys = false;
+};
 
 struct InterAmr
 {
@@ -71,6 +83,22 @@ struct InterAmr
     // ...and the polyMesh directory, which the `cellSet` selection mode re-reads at every change -- as
     // OpenFOAM does, from the file, in the ORIGINAL numbering (cellSetOption.C:269-276)
     std::string                          polyMeshDir;
+    // hexRef8's level0Edge (hexRef8.C:1939-1951): read if present, computed on the start mesh otherwise, and
+    // the same at every write
+    scalar level0Edge = 0;
+    // the mesh's zones in FILE order, which is the order OpenFOAM writes them in
+    std::vector<ZoneEntry> cellZoneEntries;
+    std::vector<ZoneEntry> faceZoneEntries;
+    std::vector<ZoneEntry> pointZoneEntries;
+    // true from the first topology change on: polyMesh::updateMesh makes the mesh files AUTO_WRITE at that
+    // instance (polyMeshUpdate.C:57-65) and nothing sets them back, so every later write carries them
+    bool topoChanged = false;
+    // the start directory's uniform/time `index` (0 without one): OpenFOAM's refine schedule tests the GLOBAL
+    // time index, `timeIndex % refineInterval` (dynamicRefineFvMesh.C:1320), which a restart continues from
+    // there. The driver's step count restarts at 1, so a restart with refineInterval > 1 refined on the wrong
+    // steps -- MEASURED: restarted from OpenFOAM's 0.001 with refineInterval 2, OpenFOAM refined 32256 to
+    // 42266 at step 2 and brae refined nothing, U 2.2e-01 off.
+    label startTimeIndex = 0;
 };
 
 // Does the case ask for an adaptive mesh at all? ONE function, asked by everything that needs to know --

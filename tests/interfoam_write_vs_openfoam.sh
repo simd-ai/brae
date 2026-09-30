@@ -35,6 +35,10 @@
 #          streamFunction): arm W's comparer is blind to the token form.
 #          Also a sized `10 ( ... )` list, an empty `extra;` entry, and a quoted string (refused by name),
 #          each against OpenFOAM; CONTROL: one token put back raw fails the byte check.
+#   ARM Y  a refining mesh beyond W: alpha.water_0 mapped with the mesh (rule, OpenFOAM and brae), controls
+#          BRAE_CONTROL_AMR_NO_WRITE_COMPACT=1 and BRAE_CONTROL_AMR_ALPHA0_START=1, sixty steps through an
+#          unrefinement, a write before any change with a restart from it (the global refine index), and a
+#          restart from a compressed refined write (the .gz lookups).
 #   ARM M  a moving mesh's cumulativeContErr is the absolute flux's (sloshingTank2D), with its control.
 #   ARM P  the mesh update's CorrectPhi continuity error counts (waveMakerPiston, loose pcorr), with its
 #          control BRAE_CONTROL_NO_CORRECTPHI_CONTERR=1.
@@ -125,9 +129,9 @@ s = re.sub(r'\nfunctions\s*\{.*?\n\}', '\nfunctions\n{\n}', s, flags=re.S)
 for k, v in [('endTime', end), ('writeControl', wc), ('writeInterval', wi), ('purgeWrite', pw),
              ('writePrecision', '17'), ('writeFormat', 'ascii'), ('writeCompression', 'off')] + extra:
     if re.search(r'^%s\s' % k, s, flags=re.M):
-        s = re.sub(r'^%s\s.*' % k, '%-16s%s;' % (k, v), s, flags=re.M)
+        s = re.sub(r'^%s\s.*' % k, '%s %s;' % (k.ljust(15), v), s, flags=re.M)
     else:
-        s = s.replace('\nfunctions\n', '\n%-16s%s;\nfunctions\n' % (k, v), 1)
+        s = s.replace('\nfunctions\n', '\n%s %s;\nfunctions\n' % (k.ljust(15), v), 1)
 open(c, 'w').write(s)
 PY
 }
@@ -490,8 +494,18 @@ stage_allrun()   # stage_allrun <src> <dir> <deltaT or ""> -- mesh as the Allrun
     cp -r "$src" "$d" || return 1
     rm -rf "$d"/[1-9]* "$d"/processor* "$d"/log.*
     # the Allrun without its solver, its decompose/reconstruct, and with runParallel run serially
+    # ...and its Allrun.pre the same way, where the meshing lives (RAS/motorBike: decomposePar, a parallel
+    # snappyHexMesh, the per-processor refinementHistory removal and restore0Dir -processor). Run as shipped
+    # it left processor directories and a written time the solver then started from.
+    # controlDict_nextWrite is motorBike's second run, a restart this staging does not take.
     sed -E -e '/decomposePar|reconstructPar|redistributePar/d' -e '/\$\(getApplication\)|runApplication +interFoam|runParallel +interFoam/d' \
-        -e 's/runParallel/runApplication/' "$d/Allrun" > "$d/Allrun.mesh"
+        -e '/controlDict_nextWrite/d' -e 's/runParallel/runApplication/' -e 's#^\./Allrun\.pre#bash ./Allrun.pre.mesh#' \
+        "$d/Allrun" > "$d/Allrun.mesh"
+    if [ -f "$d/Allrun.pre" ]; then
+        sed -E -e '/decomposePar|reconstructPar|redistributePar/d' -e 's/restore0Dir -processor/restore0Dir/' \
+            -e 's#^ls -d processor.*refinementHistory$#rm -f constant/polyMesh/refinementHistory#' \
+            -e 's/runParallel/runApplication/' "$d/Allrun.pre" > "$d/Allrun.pre.mesh"
+    fi
     ( cd "$d" && bash ./Allrun.mesh > log.allrunmesh 2>&1 ) || return 1
     [ -d "$d/0" ] || cp -r "$d/0.orig" "$d/0"
     python3 - "$d" "$dtOverride" <<'PY'
@@ -507,9 +521,9 @@ for k, v in [('deltaT', '%.12g' % dt), ('endTime', '%.12g' % (2*dt)), ('writeCon
              ('writeInterval', '1'), ('purgeWrite', '0'), ('adjustTimeStep', 'no'), ('writePrecision', '17'),
              ('writeFormat', 'ascii'), ('writeCompression', 'off')]:
     if re.search(r'^%s\s' % k, s, flags=re.M):
-        s = re.sub(r'^%s\s.*' % k, '%-16s%s;' % (k, v), s, flags=re.M)
+        s = re.sub(r'^%s\s.*' % k, '%s %s;' % (k.ljust(15), v), s, flags=re.M)
     else:
-        s = s.replace('\nfunctions\n', '\n%-16s%s;\nfunctions\n' % (k, v), 1)
+        s = s.replace('\nfunctions\n', '\n%s %s;\nfunctions\n' % (k.ljust(15), v), 1)
 open(c, 'w').write(s)
 q = d + '/system/fvSolution'
 t = open(q).read()
@@ -586,6 +600,9 @@ laminar/waves/waveMakerFlap::6e-09:3e-07
 laminar/waves/waveMakerMultiPaddleFlap::8e-11:1e-10
 laminar/waves/waveMakerMultiPaddlePiston::3e-10:3e-10
 RAS/DTCHullMoving::3e-10:-
+laminar/damBreakWithObstacle::2e-11:3e-11
+laminar/oscillatingBox::2e-10:-
+RAS/motorBike::9e-12:2e-11
 "
 # RAS/DTCHullMoving (rigidBodyMotion: pointDisplacement, uniform/rigidBodyMotionState, points, meshPhi, Uf,
 # rAU): host 2.4e-11, pointDisplacement at 0.0002 (1.1e-16 absolute on a 4.7e-06 largest); polyMesh/points
@@ -593,6 +610,12 @@ RAS/DTCHullMoving::3e-10:-
 # (inter_driver_device.cu, `moves its mesh with a rigidBodyMotion`), which arm W asserts in its place.
 # Arm Q's bounds: each rigidBodyMotionState entry against its own size -- DTCHullMoving's worst 3.4e-16
 # (0.0002/qDdot), floatingObject's 0 -- and floatingObject (Euler)'s fields, worst 8.7e-14 (0.02/phi).
+# The refining meshes (U5/U6: polyMesh/* after the first change -- compared as TEXT, exactly -- hexRef8's
+# cellLevel, pointLevel, level0Edge and refinementHistory at every write, the cellLevel field, Uf, and
+# oscillatingBox's meshPhi and points0; alpha.water_0 mapped with the mesh), 2026-09-30, worst field:
+# damBreakWithObstacle 1.5e-12 host / 2.1e-12 device; oscillatingBox 1.8e-11 host (its device loop refuses
+# a mesh that refines AND moves, by name: `-`); motorBike 8.8e-13 host / 1.0e-12 device (snappy's binary
+# levels and its level0Edge 0.5 read, the frozenPoints zone written with its meta).
 BOUND_RB_DTC=4e-15
 BOUND_FO=9e-13
 for entry in $W_CASES; do
@@ -610,11 +633,17 @@ for entry in $W_CASES; do
         d="$W/w_br_${key}_$arm"
         mkdir -p "$d"
         cp -r "$W/w_of_$key/0" "$W/w_of_$key/constant" "$W/w_of_$key/system" "$d/"
-        # a device bound of `-`: the device loop refuses the case at startup, by name -- assert that
-        # instead of a comparison, and that it wrote nothing
+        # a device bound of `-`: the device loop refuses the case at startup, by name -- assert THAT refusal,
+        # the case's own (several device refusals end in "Run without -device"), and that it wrote nothing
         if [ "$BOUND_W" = "-" ]; then
+            case $key in
+                DTCHullMoving) why="moves its mesh with a rigidBodyMotion" ;;
+                oscillatingBox) why="the mesh refines AND a motion solver moves it" ;;
+                *) why="" ;;
+            esac
+            [ -n "$why" ] || say "ARM W  [$arm] $key: a device bound of - with no expected refusal named" FAIL
             ( cd "$d" && "$BIN" -case . -device > log.brae 2>&1 ); rc=$?
-            [ $rc -ne 0 ] && grep -q "moves its mesh with a rigidBodyMotion" "$d/log.brae" && [ -z "$(timedirs "$d")" ] \
+            [ $rc -ne 0 ] && [ -n "$why" ] && grep -qF "$why" "$d/log.brae" && [ -z "$(timedirs "$d")" ] \
                 && say "ARM W  [$arm] $key: refused at startup, by name, nothing written" ok \
                 || { say "ARM W  [$arm] $key: refused at startup, by name, nothing written" FAIL; tail -3 "$d/log.brae" | sed 's/^/      /'; }
             continue
@@ -774,6 +803,171 @@ EOF_SZ
         && say "ARM V  [host] $v: OpenFOAM's run within $bound, every waveProperties file byte-identical" ok \
         || say "ARM V  [host] $v: OpenFOAM's run within $bound, every waveProperties file byte-identical" FAIL
 done
+
+# Y: a REFINING mesh (dynamicRefineFvMesh) beyond arm W's two steps.
+#   Y1  alpha.water_0 is alpha MAPPED with the mesh (MapGeometricFields, then subCycle's restore): at the second
+#       write its first nOld cells are the first write's alpha, and each refined parent's seven added cells
+#       copy the parent -- asserted of OpenFOAM's own output and of brae's, on every refining case and arm
+#       arm W ran. By rule and not by bytes: on oscillatingBox, which also moves, brae's alpha already
+#       differs from OpenFOAM's by 3.3e-16 and the mapped level carries that.
+#   Y2  CONTROLS on damBreakWithObstacle: BRAE_CONTROL_AMR_NO_WRITE_COMPACT=1 (the history written without the
+#       compaction refinementHistory's operator<< does) fails 0.002/polyMesh/refinementHistory;
+#       BRAE_CONTROL_AMR_ALPHA0_START=1 (alpha_0 as the start-of-step copy, on the old mesh) fails
+#       alpha.water_0.
+#   Y3  UNREFINEMENT, which no two-step write witnesses: laminar/oscillatingBox for sixty steps of 1e-3, where
+#       OpenFOAM unrefines 9540 -> 9400 at 0.057, every step written and compared -- merged cells, freed history
+#       entries compacted at the write, points0 losing points. MEASURED (2026-09-30): structure 0 over all
+#       sixty, brae unrefining the same 20 split points at 0.057, worst field 1.6e-12.
+#   Y4  A WRITE BEFORE THE FIRST CHANGE, then a restart from it: damBreakWithObstacle with refineInterval 2.
+#       Step 1 refines nothing, and OpenFOAM writes hexRef8's files alone, in the uniform forms `32256{0}`,
+#       `0()`, `32256{-1}`, and no polyMesh topology. Both codes then restart from OpenFOAM's 0.001 and refine
+#       at step 2. FAIL-PROOF (2026-09-30): brae's schedule tested the step count of the run, not the global
+#       time index (dynamicRefineFvMesh.C:1320), and refined nothing at step 2 -- U 2.2e-01 off. This restart
+#       does NOT read the uniform lists back: with no change the faces instance is constant/, which is where
+#       hexRef8 reads (hexRef8.C:1912-1990), so the N{v} readers are matched to ListIO.C in source only.
+amrule()   # amrule <case> -- Y1's mapping rule on a case's first two writes
+{
+    python3 - "$1" <<'EOF_Y1'
+import os, re, sys
+d = sys.argv[1]
+ts = sorted([t for t in os.listdir(d) if re.match(r'^[0-9.e+-]+$', t) and t != '0'], key=float)
+def cells(p):
+    t = open(p).read()
+    b = t[t.find('internalField'):t.find('boundaryField')]
+    m = re.search(r'List<scalar>\s*\n?(\d+)\s*\n\(\n(.*?)\n\)', b, re.S)
+    return m.group(2).split('\n') if m else None
+def level(p):
+    t = open(p).read()
+    t = t[t.find('// * * *'):]
+    m = re.search(r'\n(\d+)\n\((.*?)\n\)', t, re.S)
+    return [int(x) for x in m.group(2).split()]
+a1, a0 = cells('%s/%s/alpha.water' % (d, ts[0])), cells('%s/%s/alpha.water_0' % (d, ts[1]))
+l1, l2 = level('%s/%s/polyMesh/cellLevel' % (d, ts[0])), level('%s/%s/polyMesh/cellLevel' % (d, ts[1]))
+n = len(a1)
+parents = [c for c in range(n) if l2[c] > l1[c]]
+kept = a0[:n] == a1
+kids = len(a0) == n + 7 * len(parents) and all(a0[n + 7 * k + j] == a1[p] for k, p in enumerate(parents) for j in range(7))
+print('      %s: %d cells kept %s, %d parents with seven children each %s' % (d.rsplit('/', 1)[-1], n, kept, len(parents), kids))
+sys.exit(0 if kept and kids and parents else 1)
+EOF_Y1
+}
+for key in damBreakWithObstacle oscillatingBox motorBike; do
+    [ -d "$W/w_of_$key" ] || { say "ARM Y  $key did not run in arm W" FAIL; continue; }
+    amrule "$W/w_of_$key" && say "ARM Y  premise: OpenFOAM's $key alpha.water_0 is alpha mapped with the mesh" ok \
+                           || say "ARM Y  premise: OpenFOAM's $key alpha.water_0 is alpha mapped with the mesh" FAIL
+    for arm in $ARMS; do
+        d="$W/w_br_${key}_$arm"
+        [ -n "$(timedirs "$d")" ] || continue
+        amrule "$d" && say "ARM Y  [$arm] $key: brae's alpha.water_0 is alpha mapped with the mesh" ok \
+                    || say "ARM Y  [$arm] $key: brae's alpha.water_0 is alpha mapped with the mesh" FAIL
+    done
+done
+if [ -d "$W/w_of_damBreakWithObstacle" ]; then
+    for ctl in BRAE_CONTROL_AMR_NO_WRITE_COMPACT BRAE_CONTROL_AMR_ALPHA0_START; do
+        want=polyMesh/refinementHistory
+        [ $ctl = BRAE_CONTROL_AMR_ALPHA0_START ] && want=alpha.water_0
+        d="$W/y_ctl_$ctl"
+        mkdir -p "$d"
+        cp -r "$W/w_of_damBreakWithObstacle/0" "$W/w_of_damBreakWithObstacle/constant" "$W/w_of_damBreakWithObstacle/system" "$d/"
+        runbrae "$d" host "$ctl=1"
+        python3 "$CMP" "$W/w_of_damBreakWithObstacle" "$d" $(timedirs "$W/w_of_damBreakWithObstacle") > "$W/cmp_y_$ctl.txt" 2>&1
+        grep -qE "/$want +structure BAD" "$W/cmp_y_$ctl.txt" \
+            && say "CONTROL  $ctl=1 fails $want" ok \
+            || say "CONTROL  $ctl=1 fails $want" FAIL
+    done
+    # ...and Y1's rule itself goes red on the start-of-step copy
+    amrule "$W/y_ctl_BRAE_CONTROL_AMR_ALPHA0_START" > /dev/null \
+        && say "CONTROL  BRAE_CONTROL_AMR_ALPHA0_START=1 fails Y1's mapping rule" FAIL \
+        || say "CONTROL  BRAE_CONTROL_AMR_ALPHA0_START=1 fails Y1's mapping rule" ok
+fi
+OB="$TUT/multiphase/interFoam/laminar/oscillatingBox"
+if [ -d "$OB" ]; then
+    stage_allrun "$OB" "$W/y3_of" 0.001 || say "ARM Y3 oscillatingBox: meshing failed" FAIL
+    sed -i -E 's/^(endTime\s+)[^;]*;/\10.06;/' "$W/y3_of/system/controlDict"
+    d="$W/y3_br"
+    mkdir -p "$d"
+    cp -r "$W/y3_of/0" "$W/y3_of/constant" "$W/y3_of/system" "$d/"
+    runof "$W/y3_of"
+    grep -q "Unrefined from" "$W/y3_of/log.interFoam" \
+        && say "fixture witnesses: OpenFOAM unrefines within the sixty steps ($(grep -m1 'Unrefined from' "$W/y3_of/log.interFoam"))" ok \
+        || say "fixture witnesses: OpenFOAM unrefines within the sixty steps" FAIL
+    runbrae "$d" host
+    [ "$(timedirs "$d")" = "$(timedirs "$W/y3_of")" ] \
+        && say "ARM Y3 [host] sixty steps: exactly OpenFOAM's time directories" ok \
+        || say "ARM Y3 [host] sixty steps: exactly OpenFOAM's time directories" FAIL
+    python3 "$CMP" "$W/y3_of" "$d" $(timedirs "$W/y3_of") > "$W/cmp_y3.txt" 2>&1
+    judge "oscillatingBox unrefine host" "$W/cmp_y3.txt" 2e-11 "$W/y3_of/log.interFoam" \
+        && say "ARM Y3 [host] sixty steps through an unrefinement: every directory OpenFOAM's, every value within 2e-11" ok \
+        || { say "ARM Y3 [host] sixty steps through an unrefinement: every directory OpenFOAM's, every value within 2e-11" FAIL; grep -v RESULT "$W/cmp_y3.txt" | grep BAD | head -6; }
+fi
+if [ -d "$W/w_of_damBreakWithObstacle" ]; then
+    for side in of br; do
+        d="$W/y4_$side"
+        mkdir -p "$d"
+        cp -r "$W/w_of_damBreakWithObstacle/0" "$W/w_of_damBreakWithObstacle/constant" "$W/w_of_damBreakWithObstacle/system" "$d/"
+        sed -i -E 's/^(refineInterval\s+)[^;]*;/\12;/' "$d/constant/dynamicMeshDict"
+        first=$(timedirs "$W/w_of_damBreakWithObstacle" | awk '{print $1}')
+        sed -i -E "s/^(endTime\s+)[^;]*;/\1$first;/" "$d/system/controlDict"
+    done
+    grep -qE "^refineInterval +2;" "$W/y4_of/constant/dynamicMeshDict" || say "ARM Y4 refineInterval was not staged" FAIL
+    runof "$W/y4_of"
+    runbrae "$W/y4_br" host
+    first=$(timedirs "$W/y4_of" | awk '{print $1}')
+    [ ! -f "$W/y4_of/$first/polyMesh/faces" ] && grep -q "{0}" "$W/y4_of/$first/polyMesh/cellLevel" \
+        && say "fixture witnesses: OpenFOAM's write before any change holds no topology and uniform levels" ok \
+        || say "fixture witnesses: OpenFOAM's write before any change holds no topology and uniform levels" FAIL
+    python3 "$CMP" "$W/y4_of" "$W/y4_br" $first > "$W/cmp_y4a.txt" 2>&1
+    judge "damBreakWithObstacle before a change" "$W/cmp_y4a.txt" 2e-11 "$W/y4_of/log.interFoam" \
+        && say "ARM Y4 [host] a write before any change: OpenFOAM's file set, uniform levels and history" ok \
+        || say "ARM Y4 [host] a write before any change: OpenFOAM's file set, uniform levels and history" FAIL
+    second=$(python3 -c "print('%.10g' % (2*float('$first')))")
+    for side in of2 br2; do
+        d="$W/y4_$side"
+        mkdir -p "$d"
+        cp -r "$W/y4_of/constant" "$W/y4_of/system" "$W/y4_of/$first" "$d/"
+        sed -i -E "s/^(startFrom\s+)[^;]*;/\1latestTime;/; s/^(endTime\s+)[^;]*;/\1$second;/" "$d/system/controlDict"
+    done
+    runof "$W/y4_of2"
+    runbrae "$W/y4_br2" host
+    grep -q "Refined from" "$W/y4_of2/log.interFoam" \
+        && say "fixture witnesses: OpenFOAM refines at the restarted run's step 2 (global index 2)" ok \
+        || say "fixture witnesses: OpenFOAM refines at the restarted run's step 2 (global index 2)" FAIL
+    python3 "$CMP" "$W/y4_of2" "$W/y4_br2" $second > "$W/cmp_y4b.txt" 2>&1
+    judge "damBreakWithObstacle restart" "$W/cmp_y4b.txt" 2e-11 "$W/y4_of2/log.interFoam" \
+        && say "ARM Y4 [host] restarted from OpenFOAM's write, brae refines at the global index OpenFOAM does" ok \
+        || { say "ARM Y4 [host] restarted from OpenFOAM's write, brae refines at the global index OpenFOAM does" FAIL; grep -v RESULT "$W/cmp_y4b.txt" | grep BAD | head -4; }
+fi
+
+#   Y5  A RESTART FROM A COMPRESSED REFINED WRITE: damBreakWithObstacle with `writeCompression on` for one
+#       step (OpenFOAM writes polyMesh/*.gz, cellLevel.gz, refinementHistory.gz, Uf.gz beside a refined mesh),
+#       then both codes restart from OpenFOAM's directory. FAIL-PROOFS (2026-09-30): the refinement state
+#       probed on its plain path alone put cellLevel, pointLevel and refinementHistory off OpenFOAM's; Uf and
+#       phi probed the same way fell back to the interpolation and put U 3.2e-01 off -- a restart defect
+#       shared by every solver that reads its flux through read_surface_field.cuh.
+if [ -d "$W/w_of_damBreakWithObstacle" ]; then
+    d="$W/y5_of"
+    mkdir -p "$d"
+    cp -r "$W/w_of_damBreakWithObstacle/0" "$W/w_of_damBreakWithObstacle/constant" "$W/w_of_damBreakWithObstacle/system" "$d/"
+    first=$(timedirs "$W/w_of_damBreakWithObstacle" | awk '{print $1}')
+    second=$(python3 -c "print('%.10g' % (2*float('$first')))")
+    sed -i -E "s/^(writeCompression\s+)[^;]*;/\1on;/; s/^(endTime\s+)[^;]*;/\1$first;/" "$d/system/controlDict"
+    runof "$d"
+    [ -f "$d/$first/polyMesh/cellLevel.gz" ] && [ -f "$d/$first/Uf.gz" ] \
+        && say "fixture witnesses: OpenFOAM's compressed write holds cellLevel.gz and Uf.gz beside a refined mesh" ok \
+        || say "fixture witnesses: OpenFOAM's compressed write holds cellLevel.gz and Uf.gz beside a refined mesh" FAIL
+    for side in of2 br2; do
+        e="$W/y5_$side"
+        mkdir -p "$e"
+        cp -r "$d/constant" "$d/system" "$d/$first" "$e/"
+        sed -i -E "s/^(startFrom\s+)[^;]*;/\1latestTime;/; s/^(endTime\s+)[^;]*;/\1$second;/; s/^(writeCompression\s+)[^;]*;/\1off;/" "$e/system/controlDict"
+    done
+    runof "$W/y5_of2"
+    runbrae "$W/y5_br2" host
+    python3 "$CMP" "$W/y5_of2" "$W/y5_br2" $second > "$W/cmp_y5.txt" 2>&1
+    judge "damBreakWithObstacle compressed restart" "$W/cmp_y5.txt" 2e-11 "$W/y5_of2/log.interFoam" \
+        && say "ARM Y5 [host] restarted from a compressed refined write: OpenFOAM's levels, history and flux" ok \
+        || { say "ARM Y5 [host] restarted from a compressed refined write: OpenFOAM's levels, history and flux" FAIL; grep BAD "$W/cmp_y5.txt" | head -4; }
+fi
 
 # M: a moving mesh's continuity error is continuityErrs.H's on the ABSOLUTE flux (pEqn.H:64, before
 # makeRelative at :70). On a solidBody move it is the swept volumes' residue, which both codes compute from

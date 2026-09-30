@@ -2856,13 +2856,25 @@ RunReport runInterFoamDevice(
                 }
                 const bool changed =
                     interAmrUpdate(*f.amr, f, *mutableMesh, stepIndex, oldT, cnState);
+                // the sub-cycled old level on a refining mesh is alpha as this update left it (see the host
+                // loop): the host copy the change mapped. Without a change the start-of-step copy already is.
+                if (changed && writeNow && writer->writesAlphaOld())
+                {
+                    alphaOldWrite = f.alpha1.internal;
+                    alphaOldBndWrite.assign(f.alpha1.boundary.size(), std::vector<scalar>());
+                    for (std::size_t pi = 0; pi < f.alpha1.boundary.size(); ++pi)
+                    {
+                        alphaOldBndWrite[pi] = f.alpha1.boundary[pi]->value();
+                    }
+                }
                 if (changed)
                 {
                     // the solver's own rebuild, interFoam.C:118-142: gh and ghf, the flux from Sf & Uf
                     // and its pcorr solve, the mixture and the curvature. One copy, shared with the
                     // host loop, and the GAMG hierarchy un-built inside it.
-                    interAfterMeshChange(f, *mutableMesh, meshAgglomeration, meshCpc, rep, stepIndex,
-                                         /*motionFollows=*/false);
+                    // the GLOBAL time index, which the wall-distance schedule tests (wallDist.C:198)
+                    interAfterMeshChange(f, *mutableMesh, meshAgglomeration, meshCpc, rep,
+                                         f.amr->startTimeIndex + stepIndex, /*motionFollows=*/false);
 
                     // ---- the counts every array below is sized by
                     nC = m.nCells();
@@ -3557,6 +3569,14 @@ RunReport runInterFoamDevice(
             ws.displacement = f.dynamicMesh ? f.dynamicMesh->displacement() : nullptr;
             ws.rigidBody = f.dynamicMesh ? f.dynamicMesh->rigidBody() : nullptr;
             ws.rAU = &f.rAU;
+            if (f.amr && f.amr->active)
+            {
+                // the LIVE history compacted, as refinementHistory's operator<< does (see the host loop)
+                cpu::hexRef8::compactHistory(f.amr->state.history);
+                ws.mesh = &m;
+                ws.amr = &*f.amr;
+                ws.points0 = f.dynamicMesh ? &f.dynamicMesh->points0() : nullptr;
+            }
             writer->write(ws);
         }
 

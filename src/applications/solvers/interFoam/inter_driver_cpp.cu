@@ -991,6 +991,25 @@ RunReport runInterFoam(
                         }
                         const bool changed =
                             interAmrUpdate(*f.amr, f, *mutableMesh, rep.steps, oldT, cnState);
+                        // the sub-cycled old level on a refining mesh: MapGeometricFields maps alpha_0
+                        // with alpha by the same mapper, and subCycle's restore gives that mapped level
+                        // back (subCycle.H:75-101) -- alpha as this update left it, patch values
+                        // autoMapped and not re-evaluated. The start-of-step copy is on the old mesh.
+                        // BRAE_CONTROL_AMR_ALPHA0_START=1 keeps that start-of-step copy -- the write gate's
+                        // control for this rule.
+                        // At the step's FIRST update only: a later corrector's alpha is already this step's
+                        // solution, while OpenFOAM's level is the restored old one (subCycle.H:88-99) --
+                        // which a later change would map again, and that form is refused at start-up.
+                        if (writeNow && writer->writesAlphaOld() && outerOfStep == 0
+                            && std::getenv("BRAE_CONTROL_AMR_ALPHA0_START") == nullptr)
+                        {
+                            alphaOldWrite = f.alpha1.internal;
+                            alphaOldBndWrite.assign(f.alpha1.boundary.size(), std::vector<scalar>());
+                            for (std::size_t pi = 0; pi < f.alpha1.boundary.size(); ++pi)
+                            {
+                                alphaOldBndWrite[pi] = f.alpha1.boundary[pi]->value();
+                            }
+                        }
                         if (changed)
                         {
                             // interFoam.C:118-123, FIRST of everything the change triggers: the previous
@@ -1005,8 +1024,9 @@ RunReport runInterFoam(
                             {
                                 dyn->topoChanged(f.amr->state.V0, rep.steps);
                             }
-                            interAfterMeshChange(f, *mutableMesh, gamgCache, cpc, rep, rep.steps,
-                                                 refineAndMove);
+                            // the GLOBAL time index, which the wall-distance schedule tests (wallDist.C:198)
+                            interAfterMeshChange(f, *mutableMesh, gamgCache, cpc, rep,
+                                                 f.amr->startTimeIndex + rep.steps, refineAndMove);
                         }
                         // OpenFOAM prints "Refined from N to M cells." at every change; this is the same
                         // line, and a run that silently refines nothing is what it exists to show.
@@ -1793,6 +1813,20 @@ RunReport runInterFoam(
                         ws.displacement = f.dynamicMesh ? f.dynamicMesh->displacement() : nullptr;
                         ws.rigidBody = f.dynamicMesh ? f.dynamicMesh->rigidBody() : nullptr;
                         ws.rAU = &f.rAU;
+                        if (f.amr && f.amr->active)
+                        {
+                            // refinementHistory's operator<< compacts the LIVE history before it writes
+                            // (refinementHistory.C, a const_cast): the free list goes with it, so the
+                            // split-cell numbering of every later step follows from this write
+                            // BRAE_CONTROL_AMR_NO_WRITE_COMPACT=1 writes it uncompacted -- the gate's control
+                            if (std::getenv("BRAE_CONTROL_AMR_NO_WRITE_COMPACT") == nullptr)
+                            {
+                                cpu::hexRef8::compactHistory(f.amr->state.history);
+                            }
+                            ws.mesh = &m;
+                            ws.amr = &*f.amr;
+                            ws.points0 = f.dynamicMesh ? &f.dynamicMesh->points0() : nullptr;
+                        }
                         writer->write(ws);
                     }
                     break;

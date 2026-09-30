@@ -39,6 +39,7 @@ namespace interFoam {
 struct InterTurbulence;
 struct InterFields;
 struct InterWaves;
+struct InterAmr;
 }   // namespace interFoam
 }   // namespace cpu
 class DisplacementLaplacianFvMotionSolver;
@@ -91,6 +92,12 @@ struct InterWriteState
     const DisplacementLaplacianFvMotionSolver* displacement = nullptr;
     // a rigidBodyMotion's solver, whose pointDisplacement and uniform/rigidBodyMotionState are written
     const RigidBodyMeshMotion* rigidBody = nullptr;
+    // a refining mesh: the live mesh (its faces, owner, neighbour) and the adaptive-mesh state (hexRef8's
+    // levels and history, level0Edge, the zones, points0 when it also moves)
+    const PrimitiveMesh* mesh = nullptr;
+    const InterAmr* amr = nullptr;
+    // ...and, when it also moves, the motion solver's points0 as the changes have mapped it
+    const std::vector<vector>* points0 = nullptr;
     // correctPhi's rAU cells (initCorrectPhi.H), 1/UEqn.A() of the step's last corrector
     const std::vector<scalar>* rAU = nullptr;
 };
@@ -151,6 +158,13 @@ public:
     void writeDisplacement() { displacement_ = true; }
     // ...or a rigidBodyMotion's: pointDisplacement, uniform/rigidBodyMotionState
     void writeRigidBody() { rigidBody_ = true; }
+    // a refining mesh's own state: the polyMesh files after the first topology change, hexRef8's files and
+    // the cellLevel field at every write, and Uf -- which a mesh that also moves writes with writeMeshMotion
+    void writeRefineMesh(bool alsoMoves)
+    {
+        refine_ = true;
+        refineMoves_ = alsoMoves;
+    }
     // correctPhi's rAU (initCorrectPhi.H:3-17, AUTO_WRITE)
     void writeRAU() { rAU_ = true; }
     bool writesRAU() const { return rAU_; }
@@ -202,6 +216,12 @@ private:
         const std::string& className,
         const std::string& location,
         const std::string& object) const;
+    std::string header(
+        const std::string& className,
+        const std::string& location,
+        const std::string& object,
+        const std::string& note,
+        const std::string& metaNames) const;
     // emit() only queues a file; write() writes the queue once every file of the time is built, so a
     // refusal thrown half-way through leaves no partial time directory behind
     void emit(
@@ -237,6 +257,8 @@ private:
     bool meshMotion_ = false;
     bool displacement_ = false;
     bool rigidBody_ = false;
+    bool refine_ = false;
+    bool refineMoves_ = false;
     bool rAU_ = false;
     bool startHoldsAlphaOld_ = false;
     bool oldLevelNoted_ = false;

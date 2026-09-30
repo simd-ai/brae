@@ -101,7 +101,10 @@ inline SurfaceScalarField readPhiIfPresent(const std::string& fieldDir, const st
                                            bool* wasRead = nullptr)
 {
     const std::string phiPath = fieldDir + "/phi";
-    if (!std::filesystem::exists(phiPath))
+    // plain or .gz (writeCompression on): the reader opens either, and OpenFOAM's lookup finds either
+    // (POSIX.C:870-876). Probing the plain path alone fell back to the interpolated flux on a restart from a
+    // compressed write, with nothing said.
+    if (!std::filesystem::exists(phiPath) && !std::filesystem::exists(phiPath + ".gz"))
     {
         if (wasRead) *wasRead = false;
         return std::move(fallback);
@@ -118,7 +121,10 @@ inline SurfaceVectorField readUfIfPresent(const std::string& fieldDir, const std
                                           bool* wasRead = nullptr)
 {
     const std::string ufPath = fieldDir + "/Uf";
-    if (!std::filesystem::exists(ufPath))
+    // plain or .gz, as readPhiIfPresent above. MEASURED on laminar/damBreakWithObstacle restarted from a
+    // compressed refined write: the mesh and every level exactly OpenFOAM's, U 3.2e-01 off, because
+    // phi = Sf & Uf at the change read the interpolation instead of the stored Uf.
+    if (!std::filesystem::exists(ufPath) && !std::filesystem::exists(ufPath + ".gz"))
     {
         if (wasRead) *wasRead = false;
         return std::move(fallback);
