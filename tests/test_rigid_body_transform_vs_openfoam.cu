@@ -110,7 +110,8 @@ int main(int argc, char** argv)
     const std::vector<scalar> weight =
         rigidBodyMeshMotionScale(pd.distance, spec.innerDistance, spec.outerDistance);
 
-    const std::vector<scalar> q = RBD::readJointStateList(ofDir + "/uniform/rigidBodyMotionState", "q");
+    const std::string statePath = ofDir + "/uniform/rigidBodyMotionState";
+    const std::vector<scalar> q = RBD::readJointStateList(statePath, "q").value_or(std::vector<scalar>{});
     check("OpenFOAM's state file gives a q of the chain's size",
           q.size() == static_cast<std::size_t>(spec.model.nDoF()));
     if (q.size() != static_cast<std::size_t>(spec.model.nDoF()))

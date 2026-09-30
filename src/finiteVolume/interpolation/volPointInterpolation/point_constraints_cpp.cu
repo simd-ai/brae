@@ -132,6 +132,14 @@ PointConstraints PointConstraints::build(
                 throw std::runtime_error(
                     std::string(WHO) + fieldPath + " has no entry for the patch `" + q.name + "`.");
             }
+            // pointPatchFieldBase.C:100-103 reads `patchType` and pointPatchField.C:104-107 writes it back:
+            // the time directory could not echo it from the kind below, which does not keep it
+            if (!entry->patchType.empty())
+            {
+                throw std::runtime_error(
+                    std::string(WHO) + fieldPath + ": patch `" + q.name + "` names `patchType "
+                    + entry->patchType + "`. Not ported.");
+            }
             if (entry->type == "calculated")
             {
                 // pointPatchField::evaluate only toggles `updated` (pointPatchField.C:302-310)

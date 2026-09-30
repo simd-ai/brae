@@ -396,8 +396,9 @@ arm ddt_cnSubCycles         refused "nAlphaSubCycles > 1"    "" "$CNSET; sed -i 
 arm ddt_cnDdt0Present       runs    -                         "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class volVectorField; object ddt0(rho,U); }\ndimensions [1 -2 -2 0 0 0 0];\ninternalField uniform (0 0 0);\nboundaryField { \".*\" { type calculated; value uniform (0 0 0); } }\n' > '0/ddt0(rho,U)'"
 arm ddt_cnAlphaPhi0Present  runs    -                         "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class surfaceScalarField; object alphaPhi0.water; }\ndimensions [0 3 -1 0 0 0 0];\ninternalField uniform 0;\nboundaryField { \".*\" { type calculated; value uniform 0; } }\n' > 0/alphaPhi0.water"
 # ...and the TWO A MOVING MESH WRITES are still refused, for want of a fixture that restarts one: the one
-# shipped interFoam tutorial that names CrankNicolson moves its mesh under rigidBodyMotion, which brae
-# refuses before it gets here, so a seed for either would be ungated.
+# shipped interFoam tutorial that names CrankNicolson, RAS/floatingObject, moves its mesh under
+# rigidBodyMotion -- it runs, but brae neither writes its CrankNicolson state nor restarts a moved mesh --
+# so a seed for either would be ungated.
 arm ddt_cnUfDdt0Present     refused "ddtCorrDdt0(Uf)"         "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class surfaceVectorField; object ddtCorrDdt0(Uf); }\ndimensions [0 1 -2 0 0 0 0];\ninternalField uniform (0 0 0);\nboundaryField { \".*\" { type calculated; value uniform (0 0 0); } }\n' > '0/ddtCorrDdt0(Uf)'"
 arm ddt_cnMeshPhi0Present   refused "meshPhiCN_0"             "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class surfaceScalarField; object meshPhiCN_0; }\ndimensions [0 3 -1 0 0 0 0];\ninternalField uniform 0;\nboundaryField { \".*\" { type calculated; value uniform 0; } }\n' > '0/meshPhiCN_0'"
 # ...and a RESTART ACROSS A COUPLED PAIR, on the leakage base, whose baffles are cyclicACMI. The pair's

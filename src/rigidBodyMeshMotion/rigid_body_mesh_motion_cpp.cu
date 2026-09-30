@@ -7,6 +7,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <optional>
+#include <regex>
 #include <stdexcept>
 
 namespace brae {
@@ -14,6 +16,55 @@ namespace brae {
 namespace {
 
 const char* const WHO = "brae rigidBodyMotion: ";
+
+// The class a file's FoamFile header names, or "" when the file does not open with one -- read from the
+// raw bytes, since TokenStream drops the header. IOobject::readHeader takes the FIRST token, which must
+// be the word FoamFile, then the header dictionary (IOobjectReadHeader.C:104-125).
+std::string headerClass(const std::string& path)
+{
+    const std::vector<char> raw = gzSlurp(path);
+    std::string text;
+    text.reserve(raw.size());
+    // comments are whitespace to the tokenizer
+    for (std::size_t i = 0; i < raw.size(); ++i)
+    {
+        if (raw[i] == '/' && i + 1 < raw.size() && raw[i + 1] == '/')
+        {
+            while (i < raw.size() && raw[i] != '\n')
+            {
+                ++i;
+            }
+            text += ' ';
+            continue;
+        }
+        if (raw[i] == '/' && i + 1 < raw.size() && raw[i + 1] == '*')
+        {
+            i += 2;
+            while (i + 1 < raw.size() && !(raw[i] == '*' && raw[i + 1] == '/'))
+            {
+                ++i;
+            }
+            ++i;
+            text += ' ';
+            continue;
+        }
+        text += raw[i];
+    }
+    static const std::regex header(R"(^\s*FoamFile\s*\{([^}]*)\})");
+    std::smatch m;
+    if (!std::regex_search(text, m, header))
+    {
+        return "";
+    }
+    static const std::regex classEntry(R"((?:^|[\s;])class\s+([A-Za-z_][\w:<>,]*)\s*;)");
+    std::smatch c;
+    const std::string body = m[1].str();
+    if (!std::regex_search(body, c, classEntry))
+    {
+        return "";
+    }
+    return c[1].str();
+}
 
 }   // namespace
 
@@ -61,8 +112,10 @@ std::unique_ptr<RigidBodyMeshMotion> RigidBodyMeshMotion::New(
     }
     s->g_ = vector{gv[0], gv[1], gv[2]};
 
-    // rigidBodyMeshMotion.C:97-117: the state comes from <startTime>/uniform/rigidBodyMotionState if
-    // that file is there, and from the coeffs otherwise -- where the tutorial writes none, so rest.
+    // rigidBodyMeshMotion.C:93-118: the state comes from <startTime>/uniform/rigidBodyMotionState when
+    // typeHeaderOk<IOdictionary>(true) holds -- the file there, plain or .gz (POSIX.C:870-876, the plain
+    // one first as gzSlurp takes it), opening with a FoamFile header whose class is `dictionary`
+    // (IOobjectReadHeader.C:104-125, 218-232). Otherwise OpenFOAM warns and takes it from coeffDict().
     const std::string statePath = startDir + "/uniform/rigidBodyMotionState";
     const std::size_t nD = static_cast<std::size_t>(s->spec_.model.nDoF());
     s->state_.q.assign(nD, scalar(0));
@@ -70,32 +123,60 @@ std::unique_ptr<RigidBodyMeshMotion> RigidBodyMeshMotion::New(
     s->state_.qDdot.assign(nD, scalar(0));
     s->state_.t = scalar(-1);
     s->state_.deltaT = scalar(0);
-    if (std::filesystem::exists(statePath))
+    bool stateFromFile = false;
+    if (std::filesystem::exists(statePath) || std::filesystem::exists(statePath + ".gz"))
+    {
+        stateFromFile = (headerClass(statePath) == "dictionary");
+        if (!stateFromFile)
+        {
+            std::fprintf(stderr, "brae rigidBodyMeshMotion: %s has no FoamFile header of class `dictionary`; "
+                                 "as OpenFOAM does, it is not read and the state comes from the coeffs\n",
+                         statePath.c_str());
+        }
+    }
+    if (stateFromFile)
     {
         for (const auto& pair : {std::make_pair("q", &s->state_.q),
                                  std::make_pair("qDot", &s->state_.qDot),
                                  std::make_pair("qDdot", &s->state_.qDdot)})
         {
-            const std::vector<scalar> v = RBD::readJointStateList(statePath, pair.first);
-            if (v.empty()) continue;
-            if (v.size() != nD)
+            const std::optional<std::vector<scalar>> v = RBD::readJointStateList(statePath, pair.first);
+            if (!v)
+            {
+                continue;
+            }
+            // rigidBodyModelState.C:58-69: a present list of any other size, empty included, is fatal
+            if (v->size() != nD)
             {
                 throw std::runtime_error(
                     std::string(WHO) + statePath + " holds a `" + pair.first + "` of "
-                    + std::to_string(v.size()) + " where the chain has " + std::to_string(nD)
+                    + std::to_string(v->size()) + " where the chain has " + std::to_string(nD)
                     + " degrees of freedom.");
             }
-            *pair.second = v;
+            *pair.second = *v;
         }
         s->state_.t = RBD::readJointStateScalar(statePath, "t", s->state_.t);
         s->state_.deltaT = RBD::readJointStateScalar(statePath, "deltaT", s->state_.deltaT);
+    }
+    else if (!s->spec_.coeffStateKeys.empty())
+    {
+        std::string keys;
+        for (const std::string& k : s->spec_.coeffStateKeys)
+        {
+            keys += (keys.empty() ? "`" : ", `") + k + "`";
+        }
+        throw std::runtime_error(
+            std::string(WHO) + "the motion coeffs set " + keys + " and the start time holds no "
+            "rigidBodyMotionState, so OpenFOAM starts the body from them (rigidBodyMeshMotion.C:117, "
+            "rigidBodyModelState.C:51-55). Not ported: the body would start at rest instead.");
     }
     s->state0_ = s->state_;
 
     // displacementMotionSolver.C:50-61 reads pointDisplacement MUST_READ: the point patch TYPES are
     // the constraint that ends every solve, and they live in the start time's field.
     s->pointDisplacementPath_ = startDir + "/pointDisplacement";
-    if (!std::filesystem::exists(s->pointDisplacementPath_))
+    if (!std::filesystem::exists(s->pointDisplacementPath_)
+        && !std::filesystem::exists(s->pointDisplacementPath_ + ".gz"))
     {
         throw std::runtime_error(
             std::string(WHO) + "the start time has no pointDisplacement. OpenFOAM reads it MUST_READ "

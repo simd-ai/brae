@@ -365,9 +365,46 @@ std::string dictToken(
     const double v = std::strtod(t.c_str(), &end);
     if (end && end != t.c_str() && *end == '\0')
     {
+        // readScalar rounds |x| <= VSMALL to zero on the re-read (ISstream.C:782, Scalar.C:104-110)
+        if (v >= -1.0e-300 && v <= 1.0e-300)
+        {
+            return "0";
+        }
         return fmt(static_cast<scalar>(v), precision);
     }
     return t;
+}
+
+// A scalar list as a dictionary entry holds it: dict.add streams UList::writeList's form into a primitive
+// entry, re-read as tokens (primitiveEntryTemplates.C:36-46) and written back joined by single spaces
+// (primitiveEntryIO.C:280-314). So `N ( a b )` on one line at any length, `0 ( )` when empty, and -- for
+// more than one entry, all equal -- `N { v }` (UListIO.C:119-123), measured on floatingObject's body at
+// rest. Each number is a token re-emitted, so dictToken. BRAE_CONTROL_RBSTATE_PAREN=1 writes the uniform
+// list in the paren form instead, for the write gate's control.
+std::string dictScalarList(
+    const std::vector<scalar>& v,
+    int precision)
+{
+    bool uniform = v.size() > 1;
+    for (std::size_t i = 1; uniform && i < v.size(); ++i)
+    {
+        uniform = v[i] == v[0];
+    }
+    if (uniform && std::getenv("BRAE_CONTROL_RBSTATE_PAREN") != nullptr)
+    {
+        uniform = false;
+    }
+    std::string out = std::to_string(v.size());
+    if (uniform)
+    {
+        return out + " { " + dictToken(fmt(v[0], precision), precision) + " }";
+    }
+    out += " (";
+    for (const scalar x : v)
+    {
+        out += " " + dictToken(fmt(x, precision), precision);
+    }
+    return out + " )";
 }
 
 // The patch's entry in the template's boundaryField, matched as the reader and writeVolField match it:
@@ -1980,10 +2017,16 @@ void InterWriter::write(const InterWriteState& s)
             throw std::runtime_error("brae interFoam writer: the point patches do not follow the mesh's patches");
         }
         using PT = DisplacementLaplacianFvMotionSolver::PointPatchType;
+        // MUST_READ, so the dimensions are the start file's (displacementMotionSolver.C:50-61)
+        const Template& pdt = templateFor("pointDisplacement");
+        if (!pdt.present)
+        {
+            throw std::runtime_error("brae interFoam writer: the start time's pointDisplacement was not read");
+        }
         std::ostringstream os;
         os << header("pointVectorField", name, "pointDisplacement");
         keyword(os, 0, "dimensions");
-        os << "[0 1 0 0 0 0 0];\n\n";
+        os << pdt.dimensions << ";\n\n";
         listEntry(os, 0, "internalField", dm->pointDisplacement(), precision_);
         os << "\nboundaryField\n{\n";
         for (std::size_t pi = 0; pi < pps.size(); ++pi)
@@ -2066,6 +2109,86 @@ void InterWriter::write(const InterWriteState& s)
         }
         oc << "}\n\n\n// ************************************************************************* //\n";
         emit(dir + "/cellDisplacement", oc.str(), true);
+    }
+
+    // A rigidBodyMotion's own state. pointDisplacement: the same MUST_READ/AUTO_WRITE field
+    // (displacementMotionSolver.C:50-61), transformPoints(weight, points0) - points0 after
+    // constrainDisplacement (rigidBodyMeshMotion.C:360-389). Its patches write as their pointPatchFields do:
+    // fixedValue its stored value, which constrainDisplacement never changes (pointConstraints.C:395-429);
+    // calculated and symmetryPlane their type alone (calculatedPointPatchField.H:50-59,
+    // basicSymmetryPointPatchField.H:53-55). uniform/rigidBodyMotionState: rigidBodyMeshMotion::writeObject
+    // forces ASCII and writes model_.state() -- motionState_, the step's solved state, never motionState0_
+    // -- into an IOdictionary (rigidBodyMeshMotion.C:392-417): q, qDot, qDdot, t, deltaT
+    // (rigidBodyModelStateIO.C:33-40), compressed as the run's writeCompression says (regIOobjectWrite.C:
+    // 134-140). BRAE_CONTROL_RBSTATE_OLD=1 writes the state the step started from, for the gate's control.
+    if (rigidBody_)
+    {
+        const RigidBodyMeshMotion* rb = s.rigidBody;
+        if (!rb)
+        {
+            throw std::runtime_error("brae interFoam writer: a rigidBodyMotion mesh handed no motion solver");
+        }
+        const auto& pcs = rb->pointConstraints().patchConstraints();
+        if (pcs.size() != patches_.size())
+        {
+            throw std::runtime_error("brae interFoam writer: the point patches do not follow the mesh's patches");
+        }
+        using Kind = PointPatchConstraint::Kind;
+        // MUST_READ, so the dimensions are the start file's (displacementMotionSolver.C:50-61)
+        const Template& pdt = templateFor("pointDisplacement");
+        if (!pdt.present)
+        {
+            throw std::runtime_error("brae interFoam writer: the start time's pointDisplacement was not read");
+        }
+        std::ostringstream os;
+        os << header("pointVectorField", name, "pointDisplacement");
+        keyword(os, 0, "dimensions");
+        os << pdt.dimensions << ";\n\n";
+        listEntry(os, 0, "internalField", rb->pointDisplacement(), precision_);
+        os << "\nboundaryField\n{\n";
+        for (std::size_t pi = 0; pi < pcs.size(); ++pi)
+        {
+            const PointPatchConstraint& c = pcs[pi];
+            if (c.name != patches_[pi].name)
+            {
+                refuseWrite("pointDisplacement", patches_[pi], "the point patch order is not the mesh's");
+            }
+            os << "    " << c.name << "\n    {\n";
+            if (c.kind == Kind::fixedValue)
+            {
+                wordEntry(os, 8, "type", "fixedValue");
+                // the stored Field, one value per patch point: `uniform v`, or an empty list when the
+                // patch has no points (Field.C:727-748)
+                listEntry(os, 8, "value", std::vector<vector>(c.meshPoints.size(), c.value), precision_);
+            }
+            else
+            {
+                wordEntry(os, 8, "type", c.kind == Kind::symmetryPlane ? "symmetryPlane" : "calculated");
+            }
+            os << "    }\n";
+        }
+        os << "}\n\n\n// ************************************************************************* //\n";
+        emit(dir + "/pointDisplacement", os.str(), true);
+
+        const RBD::ModelState& st =
+            std::getenv("BRAE_CONTROL_RBSTATE_OLD") != nullptr ? rb->state0() : rb->state();
+        std::ostringstream ob;
+        ob << header("dictionary", name + "/uniform", "rigidBodyMotionState");
+        for (const auto& entry : {std::make_pair("q", &st.q),
+                                  std::make_pair("qDot", &st.qDot),
+                                  std::make_pair("qDdot", &st.qDdot)})
+        {
+            keyword(ob, 0, entry.first);
+            ob << dictScalarList(*entry.second, precision_) << ";\n\n";
+        }
+        // t and deltaT at writePrecision, as the tokens they are -- uniform/time writes the same double at
+        // the maximum precision (TimeIO.C:528), this file does not
+        keyword(ob, 0, "t");
+        ob << dictToken(fmt(st.t, precision_), precision_) << ";\n\n";
+        keyword(ob, 0, "deltaT");
+        ob << dictToken(fmt(st.deltaT, precision_), precision_) << ";\n\n";
+        ob << "\n// ************************************************************************* //\n";
+        emit(dir + "/uniform/rigidBodyMotionState", ob.str(), true);
     }
 
     // rAU (initCorrectPhi.H:3-17): `rAU.ref() = 1.0/UEqn.A()` assigns the whole field (pEqn.H:4), and A()
@@ -2365,10 +2488,15 @@ void registerUnwritten(
             w.writeMeshMotion();
             w.writeDisplacement();
         }
+        else if (f.dynamicMesh && f.dynamicMesh->rigidBody())
+        {
+            w.writeMeshMotion();
+            w.writeRigidBody();
+        }
         else
         {
-            w.refuseAtFirstWrite("pointDisplacement, uniform/rigidBodyMotionState",
-                                 "a rigid body's motion state (rigidBodyMeshMotion.C, rigidBodyMotionIO.C)");
+            w.refuseAtFirstWrite("the motion solver's own state",
+                                 "a dynamic mesh the writer does not know (dynamicMotionSolverFvMesh.C)");
         }
     }
     // correctPhi's rAU: written where every patch holds its face cells' value or is a type-only constraint

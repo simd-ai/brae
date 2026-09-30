@@ -124,7 +124,8 @@
 // closure under it, alphaEqn.H's own off-centred flux and end-of-step un-blend, on a mesh that does not
 // move: RAS/damBreak with `default CrankNicolson 0.5`, held by tests/interfoam_cn_vs_openfoam.sh. The one
 // shipped tutorial that names the scheme, RAS/floatingObject, also moves its mesh under rigidBodyMotion,
-// which neither loop carries: that is what it is refused for now.
+// which the host loop carries: it runs, and is refused at its first write time for CrankNicolson's
+// old-time fields (census 2026-09-30).
 //
 // AND the mangrove fvOptions, on BOTH loops -- multiphaseMangrovesSource on U, and
 // multiphaseMangrovesTurbulenceModel on k and epsilon under kEpsilon, whose k and epsilon may be solved

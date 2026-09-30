@@ -474,9 +474,9 @@ int main(
         {
             const RBD::ModelState& st = fin.dynamicMesh->rigidBody()->state();
             const std::string sp = ofDir + "/uniform/rigidBodyMotionState";
-            const std::vector<scalar> ofQ = RBD::readJointStateList(sp, "q");
-            const std::vector<scalar> ofV = RBD::readJointStateList(sp, "qDot");
-            const std::vector<scalar> ofA = RBD::readJointStateList(sp, "qDdot");
+            const std::vector<scalar> ofQ = RBD::readJointStateList(sp, "q").value_or(std::vector<scalar>{});
+            const std::vector<scalar> ofV = RBD::readJointStateList(sp, "qDot").value_or(std::vector<scalar>{});
+            const std::vector<scalar> ofA = RBD::readJointStateList(sp, "qDdot").value_or(std::vector<scalar>{});
             check("OpenFOAM wrote the joint state", ofQ.size() == st.q.size() && !ofQ.empty());
             scalar wq = 0, wv = 0, wa = 0, rq = 0, rv = 0, ra = 0;
             for (std::size_t i = 0; i < st.q.size() && i < ofQ.size(); ++i)

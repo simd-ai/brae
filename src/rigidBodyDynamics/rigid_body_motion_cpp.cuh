@@ -38,6 +38,7 @@
 #include "fv_patch.cuh"
 #include "primitive_mesh.cuh"
 #include <cmath>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -266,18 +267,27 @@ struct MotionSpec
     scalar accelerationDamping = 1;
     // `report` -- the status block the log carries, which is the cheapest oracle for a body's state
     bool report = false;
+    // q, qDot, qDdot, t, deltaT set in the coeffs: the start state OpenFOAM takes from coeffDict() when
+    // the start time holds no rigidBodyMotionState (rigidBodyMeshMotion.C:93-118)
+    std::vector<std::string> coeffStateKeys;
 };
 
 // pointConstraints::constrainDisplacement, which rigidBodyMeshMotion::solve runs on the displacement it
 // has just written, is PointConstraints (src/finiteVolume/interpolation/volPointInterpolation/
 // point_constraints_cpp.cuh), built once by the mesh motion.
 
-// <time>/uniform/rigidBodyMotionState: `q 2 ( a b );` and the same for qDot and qDdot, then the two
-// scalars. rigidBodyModelState.C:46-71 reads every entry with readIfPresent, so a missing one is the
-// default and NOT an error -- which is how a cold start from a coeffDict holding none of them works.
+// <time>/uniform/rigidBodyMotionState: `q 2 ( a b );` (or `2 { v }`) and the same for qDot and qDdot,
+// then the two scalars. rigidBodyModelState.C:46-71 reads every entry with getOrDefault, so a MISSING one
+// is the default and not an error (nullopt here) -- but a PRESENT list of the wrong size, empty included,
+// is fatal (rigidBodyModelState.C:58-69), so an empty list comes back empty for the caller to refuse.
 // One reader for the motion solver and for every gate that reads OpenFOAM's written state.
-std::vector<scalar> readJointStateList(const std::string& path, const char* key);
-scalar readJointStateScalar(const std::string& path, const char* key, scalar fallback);
+std::optional<std::vector<scalar>> readJointStateList(
+    const std::string& path,
+    const char* key);
+scalar readJointStateScalar(
+    const std::string& path,
+    const char* key,
+    scalar fallback);
 
 // Read constant/dynamicMeshDict. The coefficients are motionSolver::coeffDict(), which is
 // optionalSubDict("rigidBodyMotionCoeffs") (motionSolver.C:91): the sub-dictionary when there is one,

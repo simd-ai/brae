@@ -3555,6 +3555,7 @@ RunReport runInterFoamDevice(
             ws.meshPhi = f.dynamicMesh ? &f.dynamicMesh->meshPhi() : nullptr;
             ws.points = &m.points();
             ws.displacement = f.dynamicMesh ? f.dynamicMesh->displacement() : nullptr;
+            ws.rigidBody = f.dynamicMesh ? f.dynamicMesh->rigidBody() : nullptr;
             ws.rAU = &f.rAU;
             writer->write(ws);
         }

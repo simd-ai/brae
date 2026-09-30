@@ -42,6 +42,7 @@ struct InterWaves;
 }   // namespace interFoam
 }   // namespace cpu
 class DisplacementLaplacianFvMotionSolver;
+class RigidBodyMeshMotion;
 namespace cpu {
 namespace interFoam {
 
@@ -88,6 +89,8 @@ struct InterWriteState
     const std::vector<vector>* points = nullptr;
     // a displacementLaplacian motion's solver, whose pointDisplacement and cellDisplacement are written
     const DisplacementLaplacianFvMotionSolver* displacement = nullptr;
+    // a rigidBodyMotion's solver, whose pointDisplacement and uniform/rigidBodyMotionState are written
+    const RigidBodyMeshMotion* rigidBody = nullptr;
     // correctPhi's rAU cells (initCorrectPhi.H), 1/UEqn.A() of the step's last corrector
     const std::vector<scalar>* rAU = nullptr;
 };
@@ -146,6 +149,8 @@ public:
     void writeMeshMotion() { meshMotion_ = true; }
     // ...and a displacementLaplacian motion's own fields: pointDisplacement, cellDisplacement
     void writeDisplacement() { displacement_ = true; }
+    // ...or a rigidBodyMotion's: pointDisplacement, uniform/rigidBodyMotionState
+    void writeRigidBody() { rigidBody_ = true; }
     // correctPhi's rAU (initCorrectPhi.H:3-17, AUTO_WRITE)
     void writeRAU() { rAU_ = true; }
     bool writesRAU() const { return rAU_; }
@@ -231,6 +236,7 @@ private:
     bool rDeltaT_ = false;
     bool meshMotion_ = false;
     bool displacement_ = false;
+    bool rigidBody_ = false;
     bool rAU_ = false;
     bool startHoldsAlphaOld_ = false;
     bool oldLevelNoted_ = false;

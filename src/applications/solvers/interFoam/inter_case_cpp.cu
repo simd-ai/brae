@@ -1639,8 +1639,9 @@ InterFields buildInterFields(const std::string&          caseDir,
         }
         // ...EXCEPT THE TWO A MOVING MESH WRITES. ddtCorrDdt0(Uf) is fvcDdtUfCorr's surface-vector ddt0
         // and meshPhiCN_0 is the off-centred mesh flux's; the one shipped interFoam tutorial that names
-        // CrankNicolson moves its mesh under rigidBodyMotion, which brae refuses before this line, so
-        // there is no fixture that could witness a seed for either. A seed nothing measures is worth
+        // CrankNicolson, RAS/floatingObject, moves its mesh under rigidBodyMotion: it runs, but brae does
+        // not write its CrankNicolson state (the writer refuses it) and refuses a restart of a moved mesh,
+        // so there is no fixture that could witness a seed for either. A seed nothing measures is worth
         // less than a refusal.
         for (const char* name : {"ddtCorrDdt0(Uf)", "meshPhiCN_0"})
         {

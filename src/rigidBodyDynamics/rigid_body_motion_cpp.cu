@@ -3,7 +3,9 @@
 #include "foam_token_reader.cuh"
 #include "primitive_patch_cpp.cuh"
 #include "septernion_cpp.cuh"
+#include <algorithm>
 #include <cmath>
+#include <optional>
 #include <stdexcept>
 
 namespace brae {
@@ -402,30 +404,77 @@ void relaxAcceleration(
 }
 
 
-std::vector<scalar> readJointStateList(const std::string& path, const char* key)
+namespace
+{
+
+// ISstream reads a number with readScalar (ISstream.C:782), which rounds |x| <= VSMALL to zero
+// (Scalar.C:104-110, doubleScalarVSMALL 1e-300, doubleScalar.H:64)
+scalar readStateNumber(TokenStream& ts)
+{
+    const scalar x = ts.nextScalar();
+    constexpr scalar vSmall = 1.0e-300;
+    if (x >= -vSmall && x <= vSmall)
+    {
+        return scalar(0);
+    }
+    return x;
+}
+
+}   // namespace
+
+
+std::optional<std::vector<scalar>> readJointStateList(
+    const std::string& path,
+    const char* key)
 {
     TokenStream ts(path);
     while (!ts.eof())
     {
-        if (ts.next() != key) continue;
+        if (ts.next() != key)
+        {
+            continue;
+        }
         const label n = ts.nextLabel();
-        ts.expect("(");
         std::vector<scalar> v(static_cast<std::size_t>(n));
-        for (scalar& x : v) x = ts.nextScalar();
+        // ListIO.C:245-285: `N ( ... )` or, the form UListIO.C:119-123 writes for more than one equal
+        // entry, `N { v }` -- the state of a body at rest (RAS/floatingObject until t = 4 writes
+        // `q 2 { 0 }`). Either delimiter holds no value when N is 0.
+        if (ts.peek() == "{")
+        {
+            ts.expect("{");
+            if (n > 0)
+            {
+                const scalar uniformValue = readStateNumber(ts);
+                std::fill(v.begin(), v.end(), uniformValue);
+            }
+            ts.expect("}");
+            return v;
+        }
+        ts.expect("(");
+        for (scalar& x : v)
+        {
+            x = readStateNumber(ts);
+        }
         ts.expect(")");
         return v;
     }
-    return {};
+    return std::nullopt;
 }
 
 
-scalar readJointStateScalar(const std::string& path, const char* key, scalar fallback)
+scalar readJointStateScalar(
+    const std::string& path,
+    const char* key,
+    scalar fallback)
 {
     TokenStream ts(path);
     while (!ts.eof())
     {
-        if (ts.next() != key) continue;
-        return ts.nextScalar();
+        if (ts.next() != key)
+        {
+            continue;
+        }
+        return readStateNumber(ts);
     }
     return fallback;
 }
@@ -786,6 +835,11 @@ MotionSpec readMotionSpec(const std::string& dictPath)
                 "`cOfGdisplacement` accumulates the body's travel into a registered field; `test` "
                 "runs the dynamics with no fluid force at all; `nIter` iterates the force and the "
                 "relaxation within one mesh update. Each changes the answer and none is ported.");
+        }
+        if (key == "q" || key == "qDot" || key == "qDdot" || key == "t" || key == "deltaT")
+        {
+            // read by the mesh motion, which alone knows whether a state file takes precedence
+            spec.coeffStateKeys.push_back(key);
         }
         if (key == "joint")
         {

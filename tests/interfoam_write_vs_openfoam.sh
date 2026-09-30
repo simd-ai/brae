@@ -34,6 +34,9 @@
 #   ARM M  a moving mesh's cumulativeContErr is the absolute flux's (sloshingTank2D), with its control.
 #   ARM P  the mesh update's CorrectPhi continuity error counts (waveMakerPiston, loose pcorr), with its
 #          control BRAE_CONTROL_NO_CORRECTPHI_CONTERR=1.
+#   ARM Q  a rigid body's uniform/rigidBodyMotionState entry by entry and as text (DTCHullMoving moving,
+#          floatingObject under Euler at rest, `2 { 0 }`), with controls BRAE_CONTROL_RBSTATE_OLD=1 and
+#          BRAE_CONTROL_RBSTATE_PAREN=1; DTCHullMoving's files are arm W's, host only (the device refuses it).
 #   ARM R  a file brae cannot write yet (irregularMultiDirection's wave-model state, lists) is named at
 #          startup, and the run stops at its first write time with nothing written.
 #   Every arm runs on the host loop and on `-device` when a GPU is present.
@@ -574,7 +577,16 @@ laminar/waves/waveMakerPiston::2e-08:2e-08
 laminar/waves/waveMakerFlap::6e-09:3e-07
 laminar/waves/waveMakerMultiPaddleFlap::8e-11:1e-10
 laminar/waves/waveMakerMultiPaddlePiston::3e-10:3e-10
+RAS/DTCHullMoving::3e-10:-
 "
+# RAS/DTCHullMoving (rigidBodyMotion: pointDisplacement, uniform/rigidBodyMotionState, points, meshPhi, Uf,
+# rAU): host 2.4e-11, pointDisplacement at 0.0002 (1.1e-16 absolute on a 4.7e-06 largest); polyMesh/points
+# 4.3e-18 (2026-09-30). Its device bound is `-`: the device loop refuses a rigid body by name at startup
+# (inter_driver_device.cu, `moves its mesh with a rigidBodyMotion`), which arm W asserts in its place.
+# Arm Q's bounds: each rigidBodyMotionState entry against its own size -- DTCHullMoving's worst 3.4e-16
+# (0.0002/qDdot), floatingObject's 0 -- and floatingObject (Euler)'s fields, worst 8.7e-14 (0.02/phi).
+BOUND_RB_DTC=4e-15
+BOUND_FO=9e-13
 for entry in $W_CASES; do
     rel=${entry%%:*}; rest=${entry#*:}; dtw=${rest%%:*}; bounds=${rest#*:}; key=$(basename "$rel")
     BOUND_WH=${bounds%%:*}; BOUND_WD=${bounds#*:}
@@ -590,6 +602,15 @@ for entry in $W_CASES; do
         d="$W/w_br_${key}_$arm"
         mkdir -p "$d"
         cp -r "$W/w_of_$key/0" "$W/w_of_$key/constant" "$W/w_of_$key/system" "$d/"
+        # a device bound of `-`: the device loop refuses the case at startup, by name -- assert that
+        # instead of a comparison, and that it wrote nothing
+        if [ "$BOUND_W" = "-" ]; then
+            ( cd "$d" && "$BIN" -case . -device > log.brae 2>&1 ); rc=$?
+            [ $rc -ne 0 ] && grep -q "moves its mesh with a rigidBodyMotion" "$d/log.brae" && [ -z "$(timedirs "$d")" ] \
+                && say "ARM W  [$arm] $key: refused at startup, by name, nothing written" ok \
+                || { say "ARM W  [$arm] $key: refused at startup, by name, nothing written" FAIL; tail -3 "$d/log.brae" | sed 's/^/      /'; }
+            continue
+        fi
         runbrae "$d" "$arm"
         ok=1
         [ "$(timedirs "$d")" = "$ot" ] || ok=0
@@ -717,6 +738,255 @@ PY
         || say "CONTROL  BRAE_CONTROL_NO_CORRECTPHI_CONTERR=1 puts it off by more than half ($r)" FAIL
 else
     say "ARM P  waveMakerPiston did not run in arm W" FAIL
+fi
+
+# Q: a rigid body's uniform/rigidBodyMotionState (rigidBodyMeshMotion.C:392-417), entry by entry. Arm W's
+# comparer cannot hold this file: it is blind to whitespace, and one relative gap per file lets qDdot
+# (~499 at DTCHullMoving's 0.0002) set the scale for q (~1e-6). So each entry is held relative to its own
+# size, and the text with every number masked must be OpenFOAM's -- the list form included: `N ( a b )`,
+# and `N { v }` for a list of equal entries (UListIO.C:119-123), which a body at rest writes.
+#   DTCHullMoving (arm W's run, host): a body that moves, q/qDot/qDdot nonuniform.
+#   floatingObject with `ddtSchemes default Euler`: the shipped CrankNicolson writes old-time fields brae
+#     does not (U7); under Euler OpenFOAM writes none, and its accelerationRelaxation is 0 until t = 4, so
+#     the body stays at rest and writes `2 { 0 }`. The scheme is the staging's, stated; the file under test
+#     is the same.
+# CONTROLS: BRAE_CONTROL_RBSTATE_PAREN=1 (the uniform lists in the paren form) fails the text on
+# floatingObject; BRAE_CONTROL_RBSTATE_OLD=1 (motionState0_, the step's start, which OpenFOAM never writes)
+# fails DTCHullMoving's entries.
+rbstate()   # rbstate <OpenFOAM case> <brae case> <bound> -- prints the worst entry gap, fails text or bound
+{
+    python3 - "$@" <<'PY'
+import re, sys
+of, br, bound = sys.argv[1], sys.argv[2], float(sys.argv[3])
+num = re.compile(r'-?\d+(?:\.\d*)?(?:[eE][-+]?\d+)?')
+def body(p):
+    s = open(p).read()
+    return s[s.find('// * * *'):]
+def entries(s):
+    out = {}
+    for k, v in re.findall(r'^(\w+)\s+([^;]*);', s, re.M):
+        vals = [float(x) for x in num.findall(v)]
+        # a list's leading count is its size, not a value; `N { v }` stands for N copies of v
+        if '(' in v or '{' in v:
+            n, rest = int(vals[0]), vals[1:]
+            vals = rest * n if '{' in v else rest
+        out[k] = vals
+    return out
+bad, worst = 0, (0.0, '')
+times = sorted([t for t in __import__('os').listdir(of) if re.match(r'^[0-9.e+-]+$', t) and t != '0'], key=float)
+for t in times:
+    po, pb = '%s/%s/uniform/rigidBodyMotionState' % (of, t), '%s/%s/uniform/rigidBodyMotionState' % (br, t)
+    try:
+        so, sb = body(po), body(pb)
+    except OSError as e:
+        print('      %s: %s' % (t, e)); bad += 1; continue
+    if num.sub('#', so) != num.sub('#', sb):
+        print('      %s: the text with its numbers masked is not OpenFOAM\'s' % t); bad += 1
+    eo, eb = entries(so), entries(sb)
+    if list(eo) != ['q', 'qDot', 'qDdot', 't', 'deltaT'] or list(eb) != list(eo):
+        print('      %s: entries %s, OpenFOAM %s' % (t, list(eb), list(eo))); bad += 1; continue
+    for k in eo:
+        if len(eo[k]) != len(eb[k]):
+            print('      %s/%s: %d values, OpenFOAM %d' % (t, k, len(eb[k]), len(eo[k]))); bad += 1; continue
+        scale = max([abs(x) for x in eo[k]] + [0.0])
+        gap = max([abs(a - b) for a, b in zip(eo[k], eb[k])] + [0.0])
+        rel = gap / scale if scale > 0 else (0.0 if gap == 0 else float('inf'))
+        if rel > worst[0]:
+            worst = (rel, '%s/%s' % (t, k))
+        if rel > bound:
+            print('      %s/%s: %.3e over %.0e' % (t, k, rel, bound)); bad += 1
+print('      worst entry %s at %.3e (bound %.0e)' % (worst[1] or '-', worst[0], bound))
+sys.exit(1 if bad else 0)
+PY
+}
+if [ -d "$W/w_br_DTCHullMoving_host" ]; then
+    rbstate "$W/w_of_DTCHullMoving" "$W/w_br_DTCHullMoving_host" "$BOUND_RB_DTC" \
+        && say "ARM Q  [host] DTCHullMoving's rigidBodyMotionState: OpenFOAM's text, each entry within $BOUND_RB_DTC" ok \
+        || say "ARM Q  [host] DTCHullMoving's rigidBodyMotionState: OpenFOAM's text, each entry within $BOUND_RB_DTC" FAIL
+    python3 - "$W/w_of_DTCHullMoving" <<'PY' && say "fixture witnesses: OpenFOAM's DTCHullMoving body moves (paren lists, pointDisplacement non-zero)" ok \
+                                         || say "fixture witnesses: OpenFOAM's DTCHullMoving body moves (paren lists, pointDisplacement non-zero)" FAIL
+import os, re, sys
+d = sys.argv[1]
+last = sorted([t for t in os.listdir(d) if re.match(r'^[0-9.e+-]+$', t) and t != '0'], key=float)[-1]
+st = open('%s/%s/uniform/rigidBodyMotionState' % (d, last)).read()
+pd = open('%s/%s/pointDisplacement' % (d, last)).read()
+body = pd[pd.find('internalField'):pd.find('boundaryField')]
+dmax = max(abs(float(x)) for x in re.findall(r'-?\d+\.?\d*(?:[eE][-+]?\d+)?', body.split('(', 1)[1]))
+print('      %s: q lists %s, max|pointDisplacement| %.3e' % (last, 'paren' if re.search(r'^q\s+\d+ \(', st, re.M) else 'NOT paren', dmax))
+sys.exit(0 if re.search(r'^q\s+\d+ \(', st, re.M) and dmax > 1e-7 else 1)
+PY
+    d="$W/w_ctl_rbold"
+    mkdir -p "$d"
+    cp -r "$W/w_of_DTCHullMoving/0" "$W/w_of_DTCHullMoving/constant" "$W/w_of_DTCHullMoving/system" "$d/"
+    runbrae "$d" host BRAE_CONTROL_RBSTATE_OLD=1
+    # the VALUE check must be what trips: at 0.0001 the step's start is rest, `2 { 0 }`, which the text
+    # check alone would fail -- so the control is held to an entry over the bound at 0.0002, where both
+    # sides are paren lists
+    rbstate "$W/w_of_DTCHullMoving" "$d" "$BOUND_RB_DTC" > "$W/rbold.txt"
+    grep -qE "^ +0\.0002/(q|qDot|qDdot): .* over " "$W/rbold.txt" \
+        && { say "CONTROL  BRAE_CONTROL_RBSTATE_OLD=1 puts DTCHullMoving's 0.0002 entries over the bound" ok; grep -E "^ +0\.0002/" "$W/rbold.txt" | head -3; } \
+        || { say "CONTROL  BRAE_CONTROL_RBSTATE_OLD=1 puts DTCHullMoving's 0.0002 entries over the bound" FAIL; cat "$W/rbold.txt"; }
+else
+    say "ARM Q  DTCHullMoving did not run in arm W" FAIL
+fi
+FO="$TUT/multiphase/interFoam/RAS/floatingObject"
+if [ -d "$FO" ]; then
+    stage_allrun "$FO" "$W/q_of" "" || say "ARM Q  floatingObject: meshing failed (see $W/q_of/log.allrunmesh)" FAIL
+    sed -i -E 's/^(\s*default\s+)CrankNicolson[^;]*;/\1Euler;/' "$W/q_of/system/fvSchemes"
+    grep -qE '^\s*default\s+Euler;' "$W/q_of/system/fvSchemes" || say "ARM Q  floatingObject: the ddt scheme was not switched to Euler" FAIL
+    runof "$W/q_of"
+    grep -q "2 { 0 }" "$W/q_of/$(timedirs "$W/q_of" | awk '{print $1}')/uniform/rigidBodyMotionState" \
+        && say "fixture witnesses: OpenFOAM's floatingObject body at rest writes \`2 { 0 }\`" ok \
+        || say "fixture witnesses: OpenFOAM's floatingObject body at rest writes \`2 { 0 }\`" FAIL
+    d="$W/q_br"
+    mkdir -p "$d"
+    cp -r "$W/q_of/0" "$W/q_of/constant" "$W/q_of/system" "$d/"
+    runbrae "$d" host
+    ok=1
+    [ "$(timedirs "$d")" = "$(timedirs "$W/q_of")" ] || ok=0
+    for t in $(timedirs "$W/q_of"); do
+        [ "$(filesets "$W/q_of" $t)" = "$(filesets "$d" $t)" ] || ok=0
+    done
+    [ $ok -eq 1 ] && say "ARM Q  [host] floatingObject (Euler): OpenFOAM's directories and file sets" ok \
+                  || say "ARM Q  [host] floatingObject (Euler): OpenFOAM's directories and file sets" FAIL
+    python3 "$CMP" "$W/q_of" "$d" $(timedirs "$W/q_of") > "$W/cmp_q.txt" 2>&1
+    judge "floatingObject host" "$W/cmp_q.txt" "$BOUND_FO" "$W/q_of/log.interFoam" \
+        && say "ARM Q  [host] floatingObject (Euler): every file's structure is OpenFOAM's, every value within $BOUND_FO" ok \
+        || { say "ARM Q  [host] floatingObject (Euler): every file's structure is OpenFOAM's, every value within $BOUND_FO" FAIL; grep -v RESULT "$W/cmp_q.txt" | grep -B1 "^      " | head -12; }
+    rbstate "$W/q_of" "$d" "$BOUND_RB_DTC" \
+        && say "ARM Q  [host] floatingObject's rigidBodyMotionState at rest: OpenFOAM's text, \`2 { 0 }\` included" ok \
+        || say "ARM Q  [host] floatingObject's rigidBodyMotionState at rest: OpenFOAM's text, \`2 { 0 }\` included" FAIL
+    d="$W/q_ctl_paren"
+    mkdir -p "$d"
+    cp -r "$W/q_of/0" "$W/q_of/constant" "$W/q_of/system" "$d/"
+    runbrae "$d" host BRAE_CONTROL_RBSTATE_PAREN=1
+    rbstate "$W/q_of" "$d" "$BOUND_RB_DTC" > "$W/rbparen.txt" \
+        && { say "CONTROL  BRAE_CONTROL_RBSTATE_PAREN=1 fails floatingObject's state text" FAIL; cat "$W/rbparen.txt"; } \
+        || say "CONTROL  BRAE_CONTROL_RBSTATE_PAREN=1 fails floatingObject's state text" ok
+    # ...and READ back (rigidBodyMeshMotion.C:93-118): a 0/uniform/rigidBodyMotionState both codes start
+    # from -- a restart from a written time is refused before the reader, the moved points being there.
+    #   A  `q 2 { 0.01 }`, the form OpenFOAM writes for equal entries. FAIL-PROOF (2026-09-30): the reader
+    #      before this unit threw `expected '(' got '{'`.
+    #   B  `q 2 ( 0.01 0.02 )` as rigidBodyMotionState.gz, what `writeCompression on` leaves. FAIL-PROOF: the
+    #      plain-path lookup before this unit started the body from rest, pointDisplacement 1.0 off.
+    #   D  `qDdot 2 ( 1e-301 0 )`: readScalar rounds it to 0 (Scalar.C:104-110), so OpenFOAM writes `2 { 0 }`.
+    #      FAIL-PROOF (2026-09-30): with neither the reader's nor the writer's rounding, brae wrote
+    #      `qDdot 2 ( 1.0000000000000001e-301 0 )`. Either rounding alone passes it: the writer's re-read
+    #      hides the reader's, as OpenFOAM's own write would.
+    #   E  B's q with no FoamFile header: typeHeaderOk fails, OpenFOAM warns and starts from the coeffs --
+    #      rest (IOobjectReadHeader.C:104-125).
+    # MEASURED: fields 1.1e-13 (A), 8.6e-14 (B); the body displaced 1.0e-02 and 1.1e-02 at 0.01.
+    # And two inputs OpenFOAM refuses or brae cannot follow, each asserted on BOTH codes:
+    #   F  `q 0 ( )` on a 2-DoF chain: OpenFOAM stops (rigidBodyModelState.C:58-69); brae must too, by name.
+    #   G  `q (0.01 0.02)` in rigidBodyMotionCoeffs and no state file: OpenFOAM starts the body there
+    #      (rigidBodyMeshMotion.C:117); brae does not port it and must refuse by name.
+    rsfile()   # rsfile <path> <q> <qDdot> <header yes|no>
+    {
+        python3 - "$@" <<'EOF_RS'
+import sys
+path, q, qDdot, hdr = sys.argv[1:5]
+head = ('FoamFile\n{\n    version     2.0;\n    format      ascii;\n    class       dictionary;\n'
+        '    location    "0/uniform";\n    object      rigidBodyMotionState;\n}\n\n') if hdr == 'yes' else ''
+open(path, 'w').write(head + 'q               %s;\n\nqDot            2 { 0 };\n\nqDdot           %s;\n\n'
+                      't               0;\n\ndeltaT          0.01;\n' % (q, qDdot))
+EOF_RS
+    }
+    rscase()   # rscase <dir> -- floatingObject (Euler) from 0/, no state file yet
+    {
+        mkdir -p "$1/0/uniform"
+        cp -r "$W/q_of/0/." "$1/0/"
+        cp -r "$W/q_of/constant" "$W/q_of/system" "$1/"
+    }
+    for v in A B D E; do
+        q='2 ( 0.01 0.02 )'
+        qdd='2 { 0 }'
+        hdr=yes
+        [ $v = A ] && q='2 { 0.01 }'
+        [ $v = D ] && q='2 { 0 }' && qdd='2 ( 1e-301 0 )'
+        [ $v = E ] && hdr=no
+        for side in of br; do
+            d="$W/q_rs_${side}_$v"
+            rscase "$d"
+            rsfile "$d/0/uniform/rigidBodyMotionState" "$q" "$qdd" $hdr
+            [ $v = B ] && gzip "$d/0/uniform/rigidBodyMotionState"
+        done
+        label="$v: q $q, qDdot $qdd, header $hdr$([ $v = B ] && echo ', .gz')"
+        runof "$W/q_rs_of_$v"
+        runbrae "$W/q_rs_br_$v" host
+        python3 "$CMP" "$W/q_rs_of_$v" "$W/q_rs_br_$v" $(timedirs "$W/q_rs_of_$v") > "$W/cmp_q_rs_$v.txt" 2>&1
+        judge "floatingObject start state $v" "$W/cmp_q_rs_$v.txt" "$BOUND_FO" "$W/q_rs_of_$v/log.interFoam" \
+            && rbstate "$W/q_rs_of_$v" "$W/q_rs_br_$v" "$BOUND_RB_DTC" \
+            && say "ARM Q  [host] a start state read back ($label): OpenFOAM's run" ok \
+            || say "ARM Q  [host] a start state read back ($label): OpenFOAM's run" FAIL
+    done
+    for v in F G; do
+        for side in of br; do
+            d="$W/q_rs_${side}_$v"
+            rscase "$d"
+            if [ $v = F ]; then
+                rsfile "$d/0/uniform/rigidBodyMotionState" '0 ( )' '2 { 0 }' yes
+            else
+                python3 - "$d/constant/dynamicMeshDict" <<'EOF_G'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+s, n = re.subn(r'(\nrigidBodyMotionCoeffs\s*\n\{\n)', r'\1    q               (0.01 0.02);\n', s)
+open(p, 'w').write(s)
+sys.exit(0 if n == 1 else 1)
+EOF_G
+                [ $? -eq 0 ] || say "ARM Q  G: the coeffs' q was not staged in $d" FAIL
+            fi
+        done
+        ( cd "$W/q_rs_of_$v" && interFoam > log.interFoam 2>&1 )
+        orc=$?
+        ( cd "$W/q_rs_br_$v" && "$BIN" -case . > log.brae 2>&1 )
+        brc=$?
+        if [ $v = F ]; then
+            [ $orc -ne 0 ] && grep -q "do not have the same size" "$W/q_rs_of_F/log.interFoam" \
+                && [ $brc -ne 0 ] && grep -q "holds a \`q\` of 0 where the chain has 2" "$W/q_rs_br_F/log.brae" \
+                && say "ARM Q  F: an empty q stops OpenFOAM and brae alike, by name" ok \
+                || { say "ARM Q  F: an empty q stops OpenFOAM and brae alike, by name [OF rc $orc, brae rc $brc]" FAIL; tail -2 "$W/q_rs_br_F/log.brae" | sed 's/^/      /'; }
+        else
+            last=$(timedirs "$W/q_rs_of_G" | awk '{print $NF}')
+            [ $orc -eq 0 ] && [ -n "$last" ] && grep -qE "^q +2 \( ?0\.01" "$W/q_rs_of_G/$last/uniform/rigidBodyMotionState" \
+                && [ $brc -ne 0 ] && grep -q "the motion coeffs set \`q\`" "$W/q_rs_br_G/log.brae" \
+                && [ -z "$(timedirs "$W/q_rs_br_G")" ] \
+                && say "ARM Q  G: OpenFOAM starts from the coeffs' q; brae refuses it by name, nothing written" ok \
+                || { say "ARM Q  G: OpenFOAM starts from the coeffs' q; brae refuses it by name, nothing written [OF rc $orc, brae rc $brc]" FAIL; tail -2 "$W/q_rs_br_G/log.brae" | sed 's/^/      /'; }
+        fi
+    done
+    # C: t and deltaT are written at writePrecision, not at uniform/time's maximum (TimeIO.C:528) -- which
+    # writePrecision 17 cannot tell apart. At 6 over three steps of 0.01 the file must be OpenFOAM's byte for
+    # byte after the banner. FAIL-PROOF (2026-09-30): t written at 17 digits put `0.029999999999999999`
+    # where OpenFOAM writes `0.03`.
+    for side in of br; do
+        d="$W/q_p6_$side"
+        rscase "$d"
+        sed -i -E 's/^(writePrecision\s+)[^;]*;/\16;/; s/^(endTime\s+)[^;]*;/\10.03;/' "$d/system/controlDict"
+    done
+    runof "$W/q_p6_of"
+    runbrae "$W/q_p6_br" host
+    python3 - "$W/q_p6_of" "$W/q_p6_br" <<'EOF_P6' && say "ARM Q  [host] floatingObject at writePrecision 6: rigidBodyMotionState byte-identical after the banner" ok \
+                                              || say "ARM Q  [host] floatingObject at writePrecision 6: rigidBodyMotionState byte-identical after the banner" FAIL
+import os, re, sys
+of, br = sys.argv[1], sys.argv[2]
+times = sorted([t for t in os.listdir(of) if re.match(r'^[0-9.e+-]+$', t) and t != '0'], key=float)
+bad = len(times) != 3
+for t in times:
+    so = open('%s/%s/uniform/rigidBodyMotionState' % (of, t)).read()
+    so = so[so.find('// * * *'):]
+    try:
+        sb = open('%s/%s/uniform/rigidBodyMotionState' % (br, t)).read()
+        sb = sb[sb.find('// * * *'):]
+    except OSError:
+        sb = ''
+    tl = re.search(r'^t\s+(\S+);', so, re.M)
+    print('      %s: OpenFOAM t %s; %s' % (t, tl.group(1) if tl else '?', 'identical' if so == sb else 'DIFFERS'))
+    bad += so != sb
+sys.exit(1 if bad else 0)
+EOF_P6
+else
+    say "ARM Q  floatingObject tutorial missing" FAIL
 fi
 
 # ---------------------------------------------------------------------------------------------------

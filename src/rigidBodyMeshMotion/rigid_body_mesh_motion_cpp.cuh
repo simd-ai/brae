@@ -87,6 +87,18 @@ public:
     {
         return state_;
     }
+    // motionState0_: the state the step started from -- written by nothing in OpenFOAM, kept for the
+    // write gate's control
+    const RBD::ModelState& state0() const
+    {
+        return state0_;
+    }
+    // the point patches' kinds and fixed values, in mesh order: what pointDisplacement's boundaryField is
+    // written from
+    const PointConstraints& pointConstraints() const
+    {
+        return pointConstraints_;
+    }
     const std::vector<vector>& pointDisplacement() const
     {
         return pointDisplacement_;
