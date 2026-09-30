@@ -1126,6 +1126,14 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
     // normal component replaced by the ABSOLUTE flux's, Uf += n*(phi/magSf - (n & Uf)) -- and then
     // phi is made relative to the motion. The flux that leaves here is the RELATIVE one, which the
     // next alpha equation convects with.
+    // continuityErrs.H (pEqn.H:64), on the flux as it stands here -- absolute on a moving mesh, which the
+    // lines below make relative. Taken after the corrector instead, a rigid motion's error read 1e-19
+    // where OpenFOAM's swept volumes leave 7.0e-16 (sloshingTank2D), and a deforming mesh would lose
+    // its volume change.
+    if (in.continuityDivOut)
+    {
+        *in.continuityDivOut = fvc::div(phi, m, g, patches);
+    }
     if (in.Uf)
     {
         // fvcMeshPhi.C:224 gates correctUf on mesh.DYNAMIC(), so it runs on a refining mesh too -- and

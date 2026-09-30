@@ -3,6 +3,7 @@
 #include "inter_turbulence_cpp.cuh"
 #include "inter_case_cpp.cuh"
 #include "inter_amr_cpp.cuh"
+#include "inter_waves_cpp.cuh"
 #include "foam_token_reader.cuh"
 #include "brae_notice.cuh"
 #include <zlib.h>
@@ -328,6 +329,26 @@ int ofSwitchToken(const std::string& w)
         return 0;
     }
     return -1;
+}
+
+// One token of a dictionary OpenFOAM writes back as it holds it: a label as itself, any other number as a
+// scalar at writePrecision (`3.0` comes back `3`, `0.05` as 0.050000000000000003), a word unchanged.
+std::string dictToken(
+    const std::string& t,
+    int precision)
+{
+    static const std::regex label("^[+-]?[0-9]+$");
+    if (std::regex_match(t, label))
+    {
+        return t;
+    }
+    char* end = nullptr;
+    const double v = std::strtod(t.c_str(), &end);
+    if (end && end != t.c_str() && *end == '\0')
+    {
+        return fmt(static_cast<scalar>(v), precision);
+    }
+    return t;
 }
 
 // The patch's entry in the template's boundaryField, matched as the reader and writeVolField match it:
@@ -1525,28 +1546,34 @@ std::string volFieldText(
     return os.str();
 }
 
+// A surface field's file: phi and alphaPhi0 (fluxes, `oriented`, DimensionedFieldIO.C:160-163), meshPhi
+// (oriented too) and Uf (a surfaceVectorField, not oriented). Empty patches write their type alone
+// (emptyFvsPatchField.C); every other patch its constraint type or `calculated` and the value
+// (calculatedFvsPatchField.C, coupledFvsPatchField.C, wedgeFvsPatchField.C, symmetryPlaneFvsPatchField.C).
+template <typename Field>
 std::string surfaceFieldText(
     const std::string& head,
-    const SurfaceScalarField& f,
+    const Field& f,
+    const std::string& dimensions,
+    bool oriented,
     const std::vector<FvPatch>& patches,
     int precision)
 {
     std::ostringstream os;
     os << head;
     keyword(os, 0, "dimensions");
-    os << "[0 3 -1 0 0 0 0];\n\n";
-    // DimensionedFieldIO.C:160-163: a flux says it is oriented
-    keyword(os, 0, "oriented");
-    os << "oriented;\n\n";
+    os << dimensions << ";\n\n";
+    if (oriented)
+    {
+        keyword(os, 0, "oriented");
+        os << "oriented;\n\n";
+    }
     listEntry(os, 0, "internalField", f.internal, precision);
     os << "\nboundaryField\n{\n";
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const FvPatch& p = patches[pi];
         os << "    " << p.name << "\n    {\n";
-        // emptyFvsPatchField.C: the type alone; calculated/coupled/wedge/symmetryPlane: type and value
-        // (calculatedFvsPatchField.C, coupledFvsPatchField.C, wedgeFvsPatchField.C,
-        // symmetryPlaneFvsPatchField.C)
         if (p.type == "empty")
         {
             wordEntry(os, 8, "type", "empty");
@@ -1556,7 +1583,7 @@ std::string surfaceFieldText(
             const bool constraint = (p.type == "wedge" || p.type == "symmetryPlane" || p.type == "symmetry"
                                   || p.type == "cyclic" || p.type == "cyclicAMI" || p.type == "cyclicACMI");
             wordEntry(os, 8, "type", constraint ? p.type : std::string("calculated"));
-            const std::vector<scalar> none;
+            const std::vector<typename std::decay<decltype(f.internal[0])>::type> none;
             listEntry(os, 8, "value", pi < f.boundary.size() ? f.boundary[pi] : none, precision);
         }
         os << "    }\n";
@@ -1815,11 +1842,27 @@ void InterWriter::write(const InterWriteState& s)
             nullptr,
             nullptr),
         true);
-    emit(dir + "/phi", surfaceFieldText(header("surfaceScalarField", name, "phi"), *s.phi, patches_, precision_),
-         true);
+    emit(
+        dir + "/phi",
+        surfaceFieldText(
+            header("surfaceScalarField", name, "phi"),
+            *s.phi,
+            "[0 3 -1 0 0 0 0]",
+            true,
+            patches_,
+            precision_),
+        true);
     const std::string aPhiName = "alphaPhi0." + phase1_;
-    emit(dir + "/" + aPhiName,
-         surfaceFieldText(header("surfaceScalarField", name, aPhiName), *s.alphaPhi0, patches_, precision_), true);
+    emit(
+        dir + "/" + aPhiName,
+        surfaceFieldText(
+            header("surfaceScalarField", name, aPhiName),
+            *s.alphaPhi0,
+            "[0 3 -1 0 0 0 0]",
+            true,
+            patches_,
+            precision_),
+        true);
 
     if (s.turbulence && s.turbulence->on)
     {
@@ -1851,6 +1894,140 @@ void InterWriter::write(const InterWriteState& s)
                     nullptr),
                 true);
         }
+    }
+
+    // A solidBody-moved mesh. polyMesh/points: polyMesh::movePoints makes them AUTO_WRITE at the current
+    // instance (polyMesh.C:1215, :1232-1233), a pointIOField of class vectorField, the list alone. meshPhi:
+    // created at the first move (fvMesh.C:951-970) and written whenever it exists (fvMesh.C:1103-1105),
+    // the swept volumes of the step's move over deltaT. Uf: createUfIfPresent.H's AUTO_WRITE face velocity,
+    // correctUf's result after the last pressure corrector (pEqn.H:67).
+    if (meshMotion_)
+    {
+        if (!s.Uf || !s.meshPhi || !s.points)
+        {
+            throw std::runtime_error("brae interFoam writer: a moving mesh handed no Uf, meshPhi or points");
+        }
+        emit(
+            dir + "/Uf",
+            surfaceFieldText(
+                header("surfaceVectorField", name, "Uf"),
+                *s.Uf,
+                "[0 1 -1 0 0 0 0]",
+                false,
+                patches_,
+                precision_),
+            true);
+        emit(
+            dir + "/meshPhi",
+            surfaceFieldText(
+                header("surfaceScalarField", name, "meshPhi"),
+                *s.meshPhi,
+                "[0 3 -1 0 0 0 0]",
+                true,
+                patches_,
+                precision_),
+            true);
+        std::error_code ec;
+        fs::create_directories(dir + "/polyMesh", ec);
+        std::ostringstream os;
+        os << header("vectorField", name + "/polyMesh", "points") << "\n";
+        os << s.points->size() << "\n(\n";
+        for (const vector& x : *s.points)
+        {
+            os << fmt(x, precision_) << "\n";
+        }
+        os << ")\n\n\n// ************************************************************************* //\n";
+        emit(dir + "/polyMesh/points", os.str(), true);
+    }
+
+    // rDeltaT (createRDeltaT.H): AUTO_WRITE, 1/s, built on extrapolatedCalculated -- which the mesh's
+    // constraint patches replace with their own type (fvPatchFieldNew.C:57-64). extrapolatedCalculated
+    // writes calculated's type and value (calculatedFvPatchField.C:212-216), the face cells' values its
+    // evaluate extrapolates (extrapolatedCalculatedFvPatchField.C:81-92) once setRDeltaT's
+    // correctBoundaryConditions has run; a constraint patch writes as it does for any field.
+    if (rDeltaT_)
+    {
+        if (!s.rDeltaT || s.rDeltaT->empty())
+        {
+            throw std::runtime_error("brae interFoam writer: local time stepping handed no rDeltaT");
+        }
+        const std::vector<scalar>& r = *s.rDeltaT;
+        std::ostringstream os;
+        os << header("volScalarField", name, "rDeltaT");
+        keyword(os, 0, "dimensions");
+        os << "[0 0 -1 0 0 0 0];\n\n";
+        listEntry(os, 0, "internalField", r, precision_);
+        os << "\nboundaryField\n{\n";
+        for (const FvPatch& p : patches_)
+        {
+            os << "    " << p.name << "\n    {\n";
+            if (p.type == "empty" || p.type == "wedge" || p.type == "symmetryPlane" || p.type == "symmetry"
+                || p.type == "cyclic")
+            {
+                wordEntry(os, 8, "type", p.type);
+            }
+            else if (isConstraintType(p.type))
+            {
+                refuseWrite("rDeltaT", p, "its constraint type is not transcribed for rDeltaT");
+            }
+            else
+            {
+                std::vector<scalar> v(p.faceCells.size());
+                for (std::size_t i = 0; i < v.size(); ++i)
+                {
+                    v[i] = r[static_cast<std::size_t>(p.faceCells[i])];
+                }
+                wordEntry(os, 8, "type", "extrapolatedCalculated");
+                listEntry(os, 8, "value", v, precision_);
+            }
+            os << "    }\n";
+        }
+        os << "}\n\n\n// ************************************************************************* //\n";
+        emit(dir + "/rDeltaT", os.str(), true);
+    }
+
+    // uniform/waveProperties.<patch>: each wave model is an AUTO_WRITE IOdictionary (waveModel.C:252-263),
+    // written by regIOobject with the run's format and compression (regIOobjectWrite.C:134-137); its header
+    // class is the model's type (IOobjectWriteHeader.C:280-283). The body is the dictionary as the model
+    // holds it -- the case's sub-dictionary merged over a restart's stored file -- then the computed
+    // waterDepthRef when neither named it (waveModel.C:322-343). Only models that exist are written: one is
+    // created at the first update that looks it up (waveModelNew.C:85-104).
+    for (std::size_t pi = 0; waves_ && pi < waves_->model.size(); ++pi)
+    {
+        const waveModels::WaveModel* wm = waves_->model[pi].get();
+        if (!wm)
+        {
+            continue;
+        }
+        const FoamDict& d = wm->dict();
+        const std::string object = "waveProperties." + wm->patchName();
+        if (!d.subs.empty())
+        {
+            throw std::runtime_error(
+                "brae interFoam writer: " + object + " holds a sub-dictionary, which is not echoed");
+        }
+        std::ostringstream os;
+        os << header(wm->type(), name + "/uniform", object);
+        bool hasDepth = false;
+        for (const auto& leafEntry : d.leaves)
+        {
+            if (leafEntry.second.size() != 1)
+            {
+                throw std::runtime_error(
+                    "brae interFoam writer: " + object + "'s `" + leafEntry.first + "` is not one word or number, "
+                    "which is not echoed");
+            }
+            hasDepth = hasDepth || leafEntry.first == "waterDepthRef";
+            wordEntry(os, 0, leafEntry.first, dictToken(leafEntry.second[0], precision_));
+            os << "\n";
+        }
+        if (!hasDepth)
+        {
+            scalarEntry(os, 0, "waterDepthRef", wm->waterDepthRef(), precision_);
+            os << "\n";
+        }
+        os << "\n// ************************************************************************* //\n";
+        emit(dir + "/uniform/" + object, os.str(), true);
     }
 
     // uniform/cumulativeContErr (initContinuityErrs.H:40-52), and the function objects' state file,
@@ -1970,21 +2147,72 @@ void registerUnwritten(
     }
     if (f.lts || f.ddtU == DdtScheme::localEuler)
     {
-        w.refuseAtFirstWrite("rDeltaT", "local time stepping's field (createRDeltaT.H)");
+        w.writeRDeltaT();
     }
+    // a dynamic mesh's state, by what moves it. A solidBody motion writes the mesh itself -- points, meshPhi,
+    // Uf -- and nothing of its own. A refining mesh writes its topology and hexRef8's state too; the other
+    // motion solvers their own fields. Each is refused by name until it is written.
     if (f.meshIsDynamic)
     {
-        w.refuseAtFirstWrite("Uf, meshPhi, polyMesh/points (and a refining mesh's cellLevel, pointLevel, "
-                             "refinementHistory)",
-                             "a dynamic mesh's state (createUfIfPresent.H, fvMesh.C:1103-1114, polyMesh.C:1232)");
+        if (f.amr && f.amr->active)
+        {
+            w.refuseAtFirstWrite("polyMesh/{faces,owner,neighbour,boundary,points,cellLevel,pointLevel,level0Edge,"
+                                 "refinementHistory}, cellLevel, Uf, meshPhi",
+                                 "a refining mesh's topology and hexRef8 state (hexRef8.C, dynamicRefineFvMesh.C)");
+        }
+        else if (f.dynamicMesh && f.dynamicMesh->solidBodyOnly())
+        {
+            w.writeMeshMotion();
+        }
+        else
+        {
+            w.refuseAtFirstWrite("cellDisplacement, pointDisplacement, uniform/rigidBodyMotionState",
+                                 "the motion solver's own state (displacementLaplacian, rigidBodyMotion)");
+        }
     }
     if (f.correctPhi)
     {
         w.refuseAtFirstWrite("rAU", "correctPhi's field (initCorrectPhi.H:3-17)");
     }
+    // the wave models' state files: written when every model's entry is one the writer can echo -- plain
+    // words and numbers. irregularMultiDirectional's and streamFunction's list entries
+    // (irregularMultiDirectionalWaveModel.C:268-271, streamFunctionWaveModel.C:231-232) are not.
     if (f.waves.any)
     {
-        w.refuseAtFirstWrite("uniform/waveProperties.<patch>", "the wave models' state (waveModel.C:250-261)");
+        bool echoable = true;
+        for (std::size_t pi = 0; pi < f.waves.alphaPatch.size(); ++pi)
+        {
+            if (!f.waves.alphaPatch[pi] && !(pi < f.waves.UPatch.size() && f.waves.UPatch[pi]))
+            {
+                continue;
+            }
+            std::vector<const FoamDict*> dicts{f.waves.waveProperties.subDict(w.patches()[pi].name)};
+            if (pi < f.waves.stored.size() && f.waves.stored[pi])
+            {
+                dicts.push_back(f.waves.stored[pi].get());
+            }
+            for (const FoamDict* d : dicts)
+            {
+                if (!d)
+                {
+                    continue;
+                }
+                echoable = echoable && d->subs.empty();
+                for (const auto& leafEntry : d->leaves)
+                {
+                    echoable = echoable && leafEntry.second.size() == 1;
+                }
+            }
+        }
+        if (echoable)
+        {
+            w.writeWaveState(&f.waves);
+        }
+        else
+        {
+            w.refuseAtFirstWrite("uniform/waveProperties.<patch>", "a wave model's entry holds a list or a "
+                                 "sub-dictionary, which the writer does not echo");
+        }
     }
 }
 

@@ -169,10 +169,45 @@ def compare_file(ref_text, other_text, tag, as_text):
         if body_a != body_b:
             fc.bad("text differs after the banner")
         return fc
-    ea, _ = parse_block(tokens(ref_text) + ["}"], 0)
-    eb, _ = parse_block(tokens(other_text) + ["}"], 0)
+    ta = tokens(ref_text)
+    tb = tokens(other_text)
+    la = bare_list(ta)
+    lb = bare_list(tb)
+    if la is not None or lb is not None:
+        # a bare list after the header (polyMesh/points, a pointIOField): header exactly, count exactly,
+        # every value numerically
+        if la is None or lb is None:
+            fc.bad("a bare list on one side only")
+            return fc
+        ha, _ = parse_block(la[0] + ["}"], 0)
+        hb, _ = parse_block(lb[0] + ["}"], 0)
+        fc.entries("", ha, hb)
+        if la[1][0] != lb[1][0]:
+            fc.bad("list count %s vs %s" % (la[1][0], lb[1][0]))
+        fc.values("list", ["nonuniform", "List"] + la[1], ["nonuniform", "List"] + lb[1])
+        return fc
+    ea, _ = parse_block(ta + ["}"], 0)
+    eb, _ = parse_block(tb + ["}"], 0)
     fc.entries("", ea, eb)
     return fc
+
+
+def bare_list(toks):
+    """(header tokens, list tokens) when the body after FoamFile is `N ( ... )` alone, else None"""
+    if len(toks) < 3 or toks[0] != "FoamFile" or toks[1] != "{":
+        return None
+    depth = 0
+    for i in range(1, len(toks)):
+        if toks[i] == "{":
+            depth += 1
+        elif toks[i] == "}":
+            depth -= 1
+            if depth == 0:
+                rest = toks[i + 1:]
+                if len(rest) >= 2 and rest[0].isdigit() and rest[1] == "(":
+                    return toks[:i + 1], rest
+                return None
+    return None
 
 
 def main():

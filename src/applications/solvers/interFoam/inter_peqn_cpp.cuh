@@ -375,6 +375,9 @@ struct PressureStepInput
 {
     // the pressure corrector this call is, for stamping the taps above
     label correctorIndex = -1;
+    // fvc::div(phi) where continuityErrs.H takes it (pEqn.H:64): the ABSOLUTE flux, before correctUf and
+    // fvc::makeRelative (:67, :70). Null forms nothing.
+    std::vector<scalar>* continuityDivOut = nullptr;
 
     const FvVectorMatrix*      UEqn      = nullptr;   // the RELAXED momentum matrix, before the force
     const std::vector<scalar>* rho       = nullptr;

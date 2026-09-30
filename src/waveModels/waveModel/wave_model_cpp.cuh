@@ -90,6 +90,11 @@ public:
     const std::string& type() const { return type_; }
     const std::string& patchName() const { return patchName_; }
     scalar waterDepthRef() const { return waterDepthRef_; }
+    // The dictionary the model IS (waveModel.C:252-263, an AUTO_WRITE IOdictionary at
+    // <time>/uniform/waveProperties.<patch>): the stored file's entries with the case's sub-dictionary
+    // merged over them (:294-302), in order. `waterDepthRef` is in it only when one of the two named it;
+    // readDict adds the computed one otherwise (:342), which the writer appends.
+    const FoamDict& dict() const { return dict_; }
     bool activeAbsorption() const { return activeAbsorption_; }
     const tensor& Rlg() const { return Rlg_; }
     // waveModel::info, as far as it prints NUMBERS: each (label, value) pair is one line of the block
@@ -151,6 +156,7 @@ protected:
     scalar zMin0_ = 0;
     std::vector<label> faceToPaddle_;
     scalar waterDepthRef_ = 0;
+    FoamDict dict_;
     scalar initialDepth_ = 0;
     label currTimeIndex_ = -1;
     bool activeAbsorption_ = false;

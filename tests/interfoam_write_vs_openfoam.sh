@@ -30,8 +30,9 @@
 #   ARM W  eight tutorials whose conditions now write -- capillaryRise, weirOverflow, angledDuct,
 #          damBreakLeakage, damBreakPorousBaffle, damBreakPermeable, nozzleFlow2D, eulerianInjection --
 #          against OpenFOAM at pinned solves, host and device; the old level's restore rule witnessed.
-#   ARM R  a file brae cannot write yet (stokesI's wave-model state) is named at startup, and the run
-#          stops at its first write time with nothing written.
+#   ARM M  a moving mesh's cumulativeContErr is the absolute flux's (sloshingTank2D), with its control.
+#   ARM R  a file brae cannot write yet (irregularMultiDirection's wave-model state, lists) is named at
+#          startup, and the run stops at its first write time with nothing written.
 #   Every arm runs on the host loop and on `-device` when a GPU is present.
 #
 #   CONTROLS, each asserted red:
@@ -142,10 +143,11 @@ runbrae()  # runbrae <dir> <arm> [env...]
 # 3.6 eps for the cases whose fields agree to rounding; angledDuct (fields 1.3e-09) and damBreakLeakage
 # (2.4e-07, the column at rest) needed 8e+03 and 3.8e+06 eps, inside their field gaps. The floor this
 # replaced, 1e-14 of OpenFOAM's `sum local` total, was 1e-28 at pinned solves: below every rounding.
-# LIMIT, stated: where OpenFOAM's own value is itself at rounding (arms S and W at pinned solves) the floor
-# exceeds it, so a dropped accumulation would pass there. Arms D witness that class -- damBreak's 4.6e-04
-# and waterChannel's -2.3e-03 are compared relative, with no floor, and caught the missing initCorrectPhi
-# term (2.885e-10).
+# LIMIT, stated: the floor is at least twice OpenFOAM's summed `sum local` (see judge), which is at
+# least |OpenFOAM's own value| -- so in arms S and W this file is held to within the correctors' own
+# local error, and a dropped or sign-flipped accumulation would pass there. Arms D witness that class:
+# damBreak's 4.6e-04 and waterChannel's -2.3e-03 are compared relative, with no floor, and caught the
+# missing initCorrectPhi term (2.885e-10).
 judge()   # judge <label> <resultFile> <bound> [ofLog]
 {
     python3 - "$@" <<'PY'
@@ -161,7 +163,14 @@ if len(sys.argv) > 4:
         coScale += len(re.findall(r'sum local', chunk)) * 2.0 * (float(co.group(1)) if co else 0.0)
     fieldsRel = max([v['rel'] for k, v in r['files'].items()
                      if not k.endswith('cumulativeContErr') and 'functionObject' not in k] + [0.0])
-    floor = max(10 * 2.220446049250313e-16, fieldsRel) * coScale
+    # ...and the bound that holds for any two codes: a corrector's |global| is at most its `sum local`
+    # (|sum V*div| <= sum V*|div|), so two runs whose p_rgh solves stop at different residuals -- the
+    # device's linear solvers against OpenFOAM's -- differ by at most twice the total. MEASURED needing it:
+    # stokesI's device, 1.2e-13 against 1.4e-11 of `sum local` (the host, OpenFOAM's iteration for
+    # iteration, 1e-15); and DTCHull under localEuler, where OpenFOAM prints no Courant number
+    # (interFoam.C, `if (!LTS)`) and the flux-scale floor above is zero.
+    sumLocal = sum(float(x) for x in re.findall(r'sum local = (\S+),', log))
+    floor = max(max(10 * 2.220446049250313e-16, fieldsRel) * coScale, 2.0 * sumLocal)
 worst = max(r['files'].items(), key=lambda kv: kv[1]['rel'])
 over = [k for k, v in r['files'].items()
         if v['rel'] > bound and not (k.endswith('uniform/cumulativeContErr') and v['abs'] <= floor)]
@@ -495,6 +504,18 @@ PY
 # damBreakLeakage 3.6e-07, which is NOT a port gap: at step 2 its column stands at rest behind the shut
 # baffle and U is round-off on a near-zero scale (the leakage gate's own header; it compares after 520
 # steps, at 4.9e-12). The value check there is weak and says so; its structure check is not.
+# The wave tutorials (waveAlpha, waveVelocity, uniform/waveProperties.<patch>, alpha.water_0 over a
+# waveAlpha inlet): cnoidal 4.2e-10, solitary 1.7e-10, solitaryGrimshaw 1.7e-08, solitaryMcCowan
+# 1.5e-08, stokesI 9.2e-08, stokesII 1.5e-09, stokesV 1.6e-09 (the waves gate holds their values);
+# mangroveInteraction 8.1e-03, also NOT a port gap: the top inletOutlet's flux is +-1e-20 above water at
+# rest, so each code takes the inflow or outflow branch by the sign of round-off (6,705 of 9,800 faces
+# differ at 0.1) and k and epsilon follow -- its structure check (slip on k/epsilon/nut/p_rgh) is the point.
+# RAS/DTCHull (localEuler's rDeltaT, nutkRoughWallFunction, outletPhaseMeanVelocity, variableHeightFlowRate,
+# meshed by its Allrun's snappyHexMesh serially): 5.7e-13 host, 1.0e-11 device.
+# The solidBody-moved meshes (Uf, meshPhi, polyMesh/points): sloshingTank2D 9.1e-13, testTubeMixer 3.5e-11,
+# sloshingCylinder 9.4e-11 (through its as-shipped first move, which leaves OpenFOAM's own alpha in
+# [-1.11, 1.86]); electrostaticDeposition 1.8e-07 host but 1.7e-05 DEVICE -- the device's per-face
+# fixesValue mask for variableHeightFlowRate (PORT.md X3), which the bound admits and does not hide.
 W_CASES="
 laminar/capillaryRise::4e-13
 RAS/weirOverflow::3e-11
@@ -504,6 +525,19 @@ RAS/damBreakPorousBaffle::4e-11
 laminar/damBreakPermeable::2e-12
 LES/nozzleFlow2D:1e-9:2e-11
 laminar/vofToLagrangian/eulerianInjection::2e-12
+laminar/waves/cnoidal::5e-09
+laminar/waves/solitary::2e-09
+laminar/waves/solitaryGrimshaw::2e-07
+laminar/waves/solitaryMcCowan::2e-07
+laminar/waves/stokesI::1e-06
+laminar/waves/stokesII::2e-08
+laminar/waves/stokesV::2e-08
+laminar/waves/mangroveInteraction::1e-01
+RAS/DTCHull::1e-10
+laminar/sloshingTank2D::1e-11
+laminar/testTubeMixer::4e-10
+laminar/sloshingCylinder::1e-09
+RAS/electrostaticDeposition::2e-04
 "
 for entry in $W_CASES; do
     rel=${entry%%:*}; rest=${entry#*:}; dtw=${rest%%:*}; BOUND_W=${rest#*:}; key=$(basename "$rel")
@@ -531,6 +565,42 @@ for entry in $W_CASES; do
             || { say "ARM W  [$arm] $key: every file's structure is OpenFOAM's, every value within $BOUND_W" FAIL; grep -v RESULT "$W/cmp_w_${key}_$arm.txt" | grep -B1 "^      " | head -12; }
     done
 done
+# M: a moving mesh's continuity error is continuityErrs.H's on the ABSOLUTE flux (pEqn.H:64, before
+# makeRelative at :70). On a solidBody move it is the swept volumes' residue, which both codes compute from
+# the same points, so it agrees far below the floor judge() allows: sloshingTank2D 1.2e-03 (host) and
+# 1.3e-03 (device) relative, where the relative flux -- this writer's first form -- reads 100% off. Held
+# relative, with no floor, one decade above the measured worst. CONTROL: BRAE_CONTROL_CONTINUITY_RELATIVE=1.
+contrel()   # contrel <case dir> -- the worst relative cumulativeContErr gap against OpenFOAM
+{
+    python3 - "$W/w_of_sloshingTank2D" "$1" <<'PY'
+import re, sys
+worst = 0.0
+for t in ('0.01', '0.02'):
+    o = float(re.search(r'^value\s+(\S+);', open('%s/%s/uniform/cumulativeContErr' % (sys.argv[1], t)).read(), re.M).group(1))
+    b = float(re.search(r'^value\s+(\S+);', open('%s/%s/uniform/cumulativeContErr' % (sys.argv[2], t)).read(), re.M).group(1))
+    worst = max(worst, abs(b - o) / abs(o))
+print('%.3e' % worst)
+PY
+}
+if [ -d "$W/w_br_sloshingTank2D_host" ]; then
+    for arm in $ARMS; do
+        r=$(contrel "$W/w_br_sloshingTank2D_$arm")
+        python3 -c "import sys; sys.exit(0 if $r < 2e-2 else 1)" \
+            && say "ARM M  [$arm] sloshingTank2D's cumulativeContErr, the absolute flux's, within 2e-2 ($r)" ok \
+            || say "ARM M  [$arm] sloshingTank2D's cumulativeContErr, the absolute flux's, within 2e-2 ($r)" FAIL
+    done
+    d="$W/w_ctl_contrel"
+    mkdir -p "$d"
+    cp -r "$W/w_of_sloshingTank2D/0" "$W/w_of_sloshingTank2D/constant" "$W/w_of_sloshingTank2D/system" "$d/"
+    runbrae "$d" host BRAE_CONTROL_CONTINUITY_RELATIVE=1
+    r=$(contrel "$d")
+    python3 -c "import sys; sys.exit(0 if $r > 0.5 else 1)" \
+        && say "CONTROL  BRAE_CONTROL_CONTINUITY_RELATIVE=1 puts it off by more than half ($r)" ok \
+        || say "CONTROL  BRAE_CONTROL_CONTINUITY_RELATIVE=1 puts it off by more than half ($r)" FAIL
+else
+    say "ARM M  sloshingTank2D did not run in arm W" FAIL
+fi
+
 if [ -d "$W/w_of_weirOverflow" ]; then
     d="$W/w_ctl_weir"
     mkdir -p "$d"
@@ -543,12 +613,12 @@ if [ -d "$W/w_of_weirOverflow" ]; then
 fi
 
 # ---------------------------------------------------------------------------------------------------
-# R: a file brae cannot write yet -- laminar/waves/stokesI's wave-model state, uniform/waveProperties.<patch>
-# (waveModel.C:250-261) -- is named at startup, before the first step, and the run stops at its first write
-# time having written nothing. (Until the condition write()s landed this arm used capillaryRise's contact
-# angle; that one is written now.) CONTROL: the same case whose only write time lies past endTime runs to
+# R: a file brae cannot write yet -- laminar/waves/irregularMultiDirection's wave-model state, whose entry
+# holds lists (irregularMultiDirectionalWaveModel.C:268-271) the writer does not echo -- is named at
+# startup, before the first step, and the run stops at its first write time having written nothing. (The
+# arm moves as the writer grows: capillaryRise's contact angle, then stokesI's wave state, are written now.) CONTROL: the same case whose only write time lies past endTime runs to
 # its end: the refusal is of the OUTPUT, and a run that never reaches a write is not refused.
-STK="$TUT/multiphase/interFoam/laminar/waves/stokesI"
+STK="$TUT/multiphase/interFoam/laminar/waves/irregularMultiDirection"
 if [ -d "$STK" ]; then
     stage "$STK" "$W/stk" 0.05 timeStep 3 0 adjustTimeStep=no deltaT=0.01 || exit 1
     # line-buffered: the refusal goes to stderr, the steps to stdout, and only then is file order time order
@@ -573,7 +643,7 @@ PY
         && say "CONTROL  the same case with no write time before endTime runs to its end (exit 0)" ok \
         || { say "CONTROL  the same case with no write time before endTime runs to its end (exit 0)" FAIL; tail -3 "$W/stk_ctl/log.brae" | sed 's/^/      /'; }
 else
-    say "ARM R  stokesI tutorial missing" FAIL
+    say "ARM R  irregularMultiDirection tutorial missing" FAIL
 fi
 
 [ $fail -eq 0 ] && echo "PASS: brae_interFoam writes OpenFOAM's time directories, when OpenFOAM does, without moving the run"

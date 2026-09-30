@@ -38,6 +38,7 @@ namespace interFoam {
 
 struct InterTurbulence;
 struct InterFields;
+struct InterWaves;
 
 // What one write time hands the writer: the solver's own objects, read and never modified.
 struct InterWriteState
@@ -73,6 +74,13 @@ struct InterWriteState
     // ...and alpha's stored patch values as the step's LAST sub-cycle began, which the old level keeps on a
     // patch whose operator= is a no-op (the fixedValue and mixed families; see InterWriter::write)
     const std::vector<std::vector<scalar>>* alpha1SubCycleBoundary = nullptr;
+    // local time stepping's rDeltaT cells (createRDeltaT.H), empty on a case without it
+    const std::vector<scalar>* rDeltaT = nullptr;
+    // a moving mesh: Uf after the last corrector's correctUf, the mesh-motion flux of the step's move and
+    // the points after it (null on a mesh that does not move)
+    const SurfaceVectorField* Uf = nullptr;
+    const SurfaceScalarField* meshPhi = nullptr;
+    const std::vector<vector>* points = nullptr;
 };
 
 class InterWriter
@@ -118,8 +126,15 @@ public:
     // (readOldTimeIfPresent, GeometricField.C:120, :151-160), so its patches are the file's -- a contact
     // angle's gradient included (readGradientEntry), which brae does not read.
     bool startHoldsAlphaOld() const { return startHoldsAlphaOld_; }
+    const std::vector<FvPatch>& patches() const { return patches_; }
     // the start directory holds this file (plain or .gz)
     bool startHolds(const std::string& file) const;
+    // the wave models whose state is written, uniform/waveProperties.<patch> (null: a case without waves)
+    void writeWaveState(const InterWaves* waves) { waves_ = waves; }
+    // local time stepping's rDeltaT is written (createRDeltaT.H: READ_IF_PRESENT, AUTO_WRITE)
+    void writeRDeltaT() { rDeltaT_ = true; }
+    // a solidBody-moved mesh's state is written: polyMesh/points, meshPhi, Uf
+    void writeMeshMotion() { meshMotion_ = true; }
     // What the old level's patches keep from the moment OpenFOAM creates it -- the first alpha1.oldTime()
     // of the run, subCycleField's constructor (subCycle.H:78) ahead of the first alpha solve: each contact
     // angle's gradient, which later assignments never touch (values only, fvPatchField.C:407-413,
@@ -192,6 +207,9 @@ private:
     scalar deltaT0_ = 0;
     scalar cumulativeContErr_ = 0;
     bool alphaOld_ = false;
+    const InterWaves* waves_ = nullptr;
+    bool rDeltaT_ = false;
+    bool meshMotion_ = false;
     bool startHoldsAlphaOld_ = false;
     bool oldLevelNoted_ = false;
     std::vector<std::vector<scalar>> oldLevelGrad_;

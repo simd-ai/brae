@@ -1664,12 +1664,24 @@ RunReport runInterFoam(
                         // a predictor's solve ends in U.correctBoundaryConditions(), which clears the flag
                         pin.uPatchesUpdatedAtEntry = (c == 0) && !f.momentumPredictorOn;
                         pin.correctorIndex = c;
-                        pressureCorrector(f.p_rgh, f.U, f.phi, f.p, pin, psc, m, g, patches);
-                        // continuityErrs.H, included by pEqn.H after every corrector: only the written
+                        // continuityErrs.H, included by pEqn.H after every corrector, on the flux the
+                        // corrector holds there (PressureStepInput::continuityDivOut): only the written
                         // cumulativeContErr reads it, so it is formed only when there is a writer
+                        std::vector<scalar> continuityDiv;
+                        pin.continuityDivOut = writer ? &continuityDiv : nullptr;
+                        pressureCorrector(f.p_rgh, f.U, f.phi, f.p, pin, psc, m, g, patches);
                         if (writer)
                         {
-                            writer->addContinuityError(rep.deltaT, fvc::div(f.phi, m, g, patches), g.V());
+                            // BRAE_CONTROL_CONTINUITY_RELATIVE=1 takes the flux the corrector LEAVES --
+                            // relative on a moving mesh, this writer's first form, 100% off OpenFOAM's
+                            // cumulativeContErr on sloshingTank2D. The control
+                            // tests/interfoam_write_vs_openfoam.sh must go red on; never the default.
+                            const char* rel = std::getenv("BRAE_CONTROL_CONTINUITY_RELATIVE");
+                            if (rel && std::string(rel) == "1")
+                            {
+                                continuityDiv = fvc::div(f.phi, m, g, patches);
+                            }
+                            writer->addContinuityError(rep.deltaT, continuityDiv, g.V());
                         }
                     }
                     // `U = HbyA + ...; U.correctBoundaryConditions()` (pEqn.H) moved U's eventNo
@@ -1756,6 +1768,10 @@ RunReport runInterFoam(
                         ws.alpha1OldCells = &alphaOldWrite;
                         ws.alpha1OldBoundary = &alphaOldBndWrite;
                         ws.alpha1SubCycleBoundary = &alphaSubBndWrite;
+                        ws.rDeltaT = &f.rDeltaT;
+                        ws.Uf = &f.Uf;
+                        ws.meshPhi = f.dynamicMesh ? &f.dynamicMesh->meshPhi() : nullptr;
+                        ws.points = &m.points();
                         writer->write(ws);
                     }
                     break;

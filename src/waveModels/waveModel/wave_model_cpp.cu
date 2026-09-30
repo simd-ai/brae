@@ -415,10 +415,12 @@ std::unique_ptr<WaveModel> WaveModel::New(
     {
         FoamDict eff = *stored;
         mergeInto(eff, *pd);
+        w->dict_ = eff;
         w->readDict(eff, alphaInternal);
     }
     else
     {
+        w->dict_ = *pd;
         w->readDict(*pd, alphaInternal);
     }
     return w;

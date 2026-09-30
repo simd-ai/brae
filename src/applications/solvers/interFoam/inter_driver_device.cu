@@ -2067,8 +2067,15 @@ RunReport runInterFoamDevice(
             const DeviceBuffer<scalar>& phiInt,
             const DeviceBuffer<scalar>& phiBnd)
         {
+            // continuityErrs.H takes the ABSOLUTE flux (pEqn.H:64, before makeRelative at :70), which a
+            // moving mesh's step hands back in dPhiAbs* before making phi relative
+            const bool absolute = C.phiAbsIntOut && C.phiAbsBndOut;
             DeviceBuffer<scalar> divPhi;
-            deviceDiv(dm, phiInt, phiBnd, divPhi);
+            deviceDiv(
+                dm,
+                absolute ? *C.phiAbsIntOut : phiInt,
+                absolute ? *C.phiAbsBndOut : phiBnd,
+                divPhi);
             std::vector<scalar> dv;
             divPhi.copyTo(dv);
             writer->addContinuityError(rep.deltaT, dv, g.V());
@@ -3525,6 +3532,10 @@ RunReport runInterFoamDevice(
                 unflatten(dAlphaSubBndWrite, alphaSubBndWrite);
             }
             ws.alpha1SubCycleBoundary = &alphaSubBndWrite;
+            ws.rDeltaT = &f.rDeltaT;
+            ws.Uf = &f.Uf;
+            ws.meshPhi = f.dynamicMesh ? &f.dynamicMesh->meshPhi() : nullptr;
+            ws.points = &m.points();
             writer->write(ws);
         }
 

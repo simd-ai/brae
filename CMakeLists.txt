@@ -3284,12 +3284,13 @@ set_tests_properties(interfoam_dambreak_clock_vs_openfoam PROPERTIES
 
 # brae_interFoam's time directories against OpenFOAM's: when it writes, what -- every file's structure
 # exactly, every value at a measured bound -- that OpenFOAM restarts from them, and that writing every
-# step leaves the run byte-identical (laminar and RAS damBreak, RAS/waterChannel, capillaryRise's refusal)
+# step leaves the run byte-identical; arm W runs every tutorial whose conditions the writer transcribes
+# (the waves and DTCHull among them) against OpenFOAM, meshing each serially, hence the long timeout
 add_test(NAME interfoam_write_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_write_vs_openfoam.sh)
 set_tests_properties(interfoam_write_vs_openfoam PROPERTIES
                      SKIP_RETURN_CODE 77
-                     TIMEOUT 900
+                     TIMEOUT 5400
                      ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 add_dependencies(brae brae_interFoam)
 

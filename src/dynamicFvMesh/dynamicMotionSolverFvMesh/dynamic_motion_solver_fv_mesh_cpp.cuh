@@ -194,6 +194,13 @@ public:
     {
         return meshPhi_;
     }
+    // A solidBody motion and nothing else: the one whose written state is the mesh itself -- points,
+    // meshPhi, Uf -- with no motion solver field of its own (displacementLaplacian's cellDisplacement and
+    // pointDisplacement, a rigid body's pointDisplacement and uniform/rigidBodyMotionState)
+    bool solidBodyOnly() const
+    {
+        return SBMF_ != nullptr && !displacement_ && !rigidBody_;
+    }
     const SurfaceScalarField& meshPhi() const
     {
         return meshPhi_;
