@@ -31,14 +31,18 @@
 #          damBreakLeakage, damBreakPorousBaffle, damBreakPermeable, nozzleFlow2D, eulerianInjection --
 #          against OpenFOAM at pinned solves, host and device; the old level's restore rule witnessed.
 #   ARM E1 a refusal thrown inside write() leaves no time directory (BRAE_CONTROL_WRITE_REFUSE_LATE=1).
+#   ARM V  the list-entry wave models' waveProperties byte-identical to OpenFOAM's (irregularMultiDirection,
+#          streamFunction): arm W's comparer is blind to the token form.
+#          Also a sized `10 ( ... )` list, an empty `extra;` entry, and a quoted string (refused by name),
+#          each against OpenFOAM; CONTROL: one token put back raw fails the byte check.
 #   ARM M  a moving mesh's cumulativeContErr is the absolute flux's (sloshingTank2D), with its control.
 #   ARM P  the mesh update's CorrectPhi continuity error counts (waveMakerPiston, loose pcorr), with its
 #          control BRAE_CONTROL_NO_CORRECTPHI_CONTERR=1.
 #   ARM Q  a rigid body's uniform/rigidBodyMotionState entry by entry and as text (DTCHullMoving moving,
 #          floatingObject under Euler at rest, `2 { 0 }`), with controls BRAE_CONTROL_RBSTATE_OLD=1 and
 #          BRAE_CONTROL_RBSTATE_PAREN=1; DTCHullMoving's files are arm W's, host only (the device refuses it).
-#   ARM R  a file brae cannot write yet (irregularMultiDirection's wave-model state, lists) is named at
-#          startup, and the run stops at its first write time with nothing written.
+#   ARM R  a file brae cannot write yet (a wave model's entry holding a sub-dictionary, on stokesI) is named
+#          at startup, and the run stops at its first write time with nothing written.
 #   Every arm runs on the host loop and on `-device` when a GPU is present.
 #
 #   CONTROLS, each asserted red:
@@ -550,6 +554,8 @@ PY
 # branch's rewritten wavePeriod, waveAngle in radians -- cellDisplacement's cellMotion patches, and correctPhi's
 # rAU): waveMakerSolitary 7.1e-11, waveMakerPiston 1.8e-09, waveMakerFlap 5.7e-10 host and 2.3e-08 device,
 # waveMakerMultiPaddleFlap 7.3e-12, waveMakerMultiPaddlePiston 2.4e-11.
+# The list-entry wave models (waveProperties echoed token by token, byte-identical after the banner on both
+# arms): irregularMultiDirection 7.9e-10 host, 1.2e-09 device; streamFunction 2.5e-09 host, 2.7e-09 device.
 W_CASES="
 laminar/capillaryRise::4e-13:4e-13
 RAS/weirOverflow::5e-12:3e-11
@@ -566,6 +572,8 @@ laminar/waves/solitaryMcCowan::2e-07:2e-07
 laminar/waves/stokesI::5e-07:1e-06
 laminar/waves/stokesII::2e-08:2e-08
 laminar/waves/stokesV::2e-08:2e-08
+laminar/waves/irregularMultiDirection::8e-09:2e-08
+laminar/waves/streamFunction::3e-08:3e-08
 laminar/waves/mangroveInteraction::8e-02:1e-01
 RAS/DTCHull::6e-12:1e-10
 laminar/sloshingTank2D::1e-11:1e-11
@@ -625,6 +633,148 @@ for entry in $W_CASES; do
             || { say "ARM W  [$arm] $key: every file's structure is OpenFOAM's, every value within $BOUND_W" FAIL; grep -v RESULT "$W/cmp_w_${key}_$arm.txt" | grep -B1 "^      " | head -12; }
     done
 done
+# V: the wave models' list entries (irregularMultiDirection's 57-row wavePeriods/waveHeights/wavePhases/
+# waveDirs, streamFunction's Bjs/Ejs) are written as primitiveEntry writes them -- each token re-emitted at
+# writePrecision, joined by single spaces on one line. Arm W's comparer reads values and is blind to that
+# form (`15.367` and `15.367000000000001` are one number to it), so the files are held BYTE-identical to
+# OpenFOAM's after the banner, on every arm arm W ran. FAIL-PROOF (2026-09-30): the tokens joined raw, not
+# re-emitted, wrote irregularMultiDirection's `rampTime 18.0;` where OpenFOAM writes `18` -- 2 of 4 files red.
+for key in irregularMultiDirection streamFunction; do
+    for arm in $ARMS; do
+        d="$W/w_br_${key}_$arm"
+        [ -d "$d" ] || { say "ARM V  [$arm] $key did not run in arm W" FAIL; continue; }
+        python3 - "$W/w_of_$key" "$d" <<'EOF_V' && say "ARM V  [$arm] $key: every waveProperties file byte-identical to OpenFOAM's after the banner" ok \
+                                           || say "ARM V  [$arm] $key: every waveProperties file byte-identical to OpenFOAM's after the banner" FAIL
+import os, re, sys
+of, br = sys.argv[1], sys.argv[2]
+times = sorted([t for t in os.listdir(of) if re.match(r'^[0-9.e+-]+$', t) and t != '0'], key=float)
+n = bad = 0
+for t in times:
+    for f in sorted(os.listdir('%s/%s/uniform' % (of, t))):
+        if not f.startswith('waveProperties.'):
+            continue
+        n += 1
+        so = open('%s/%s/uniform/%s' % (of, t, f)).read()
+        try:
+            sb = open('%s/%s/uniform/%s' % (br, t, f)).read()
+        except OSError:
+            sb = ''
+        so, sb = so[so.find('// * * *'):], sb[sb.find('// * * *'):]
+        if so != sb:
+            bad += 1
+            i = next((k for k in range(min(len(so), len(sb))) if so[k] != sb[k]), min(len(so), len(sb)))
+            print('      %s/%s differs at byte %d: OpenFOAM %r, brae %r' % (t, f, i, so[i:i + 40], sb[i:i + 40]))
+print('      %d files, %d differ' % (n, bad))
+sys.exit(0 if n and not bad else 1)
+EOF_V
+    done
+done
+
+vbytes()   # vbytes <OpenFOAM case> <brae case> -- arm V's byte check on every waveProperties file
+{
+    python3 - "$1" "$2" <<'EOF_VB'
+import os, re, sys
+of, br = sys.argv[1], sys.argv[2]
+times = sorted([t for t in os.listdir(of) if re.match(r'^[0-9.e+-]+$', t) and t != '0'], key=float)
+n = bad = 0
+for t in times:
+    for f in sorted(os.listdir('%s/%s/uniform' % (of, t))):
+        if not f.startswith('waveProperties.'):
+            continue
+        n += 1
+        so = open('%s/%s/uniform/%s' % (of, t, f)).read()
+        try:
+            sb = open('%s/%s/uniform/%s' % (br, t, f)).read()
+        except OSError:
+            sb = ''
+        bad += so[so.find('// * * *'):] != sb[sb.find('// * * *'):]
+print('      %d files, %d differ' % (n, bad))
+sys.exit(0 if n and not bad else 1)
+EOF_VB
+}
+# CONTROL for V: brae's own irregularMultiDirection output with ONE token put back raw (`18` -> `18.0`,
+# what joining the tokens unre-emitted wrote) must fail the byte check
+if [ -d "$W/w_br_irregularMultiDirection_host" ]; then
+    d="$W/w_ctl_vraw"
+    rm -rf "$d"
+    cp -r "$W/w_br_irregularMultiDirection_host" "$d"
+    first=$(timedirs "$d" | awk '{print $1}')
+    sed -i -E 's/^(rampTime +)18;/\118.0;/' "$d/$first/uniform/waveProperties.inlet"
+    grep -q "^rampTime *18.0;" "$d/$first/uniform/waveProperties.inlet" || say "CONTROL  V: the raw token was not staged" FAIL
+    vbytes "$W/w_of_irregularMultiDirection" "$d" > /dev/null \
+        && say "CONTROL  one raw token (\`rampTime 18.0\`) fails arm V's byte check" FAIL \
+        || say "CONTROL  one raw token (\`rampTime 18.0\`) fails arm V's byte check" ok
+fi
+# ...and three inputs the list echo meets, each against OpenFOAM:
+#   sized    streamFunction's Bjs/Ejs as `10 ( ... )`: the prefix is a SIZE (ListIO.C:210-290). FAIL-PROOF
+#            (2026-09-30): the reader that took every number (scalarListOr) shifted every harmonic, U 1.48e+01.
+#   empty    `extra;` in stokesI's inlet: a legal zero-token entry OpenFOAM writes as `extra           ;`
+#            (primitiveEntryIO.C:126-131, 280-307) -- once refused late, inside write().
+#   quoted   `note "a b";`: OpenFOAM writes it back quoted; brae's tokenizer drops the quotes, so it is
+#            named at start-up and the run stops at its first write with nothing written.
+vin()   # vin <waveProperties> <line> -- a line at the top of the inlet entry
+{
+    python3 - "$1" "$2" <<'EOF_VI'
+import re, sys
+p, line = sys.argv[1], sys.argv[2]
+s = open(p).read()
+s, n = re.subn(r'(\ninlet\s*\n\{\n)', lambda m: m.group(1) + '    ' + line + '\n\n', s)
+open(p, 'w').write(s)
+sys.exit(0 if n == 1 else 1)
+EOF_VI
+}
+for v in sized empty quoted; do
+    src=stokesI
+    [ $v = sized ] && src=streamFunction
+    [ -d "$W/w_of_$src" ] || { say "ARM V  $v: $src did not run in arm W" FAIL; continue; }
+    for side in of br; do
+        d="$W/v_${side}_$v"
+        rm -rf "$d"
+        mkdir -p "$d"
+        cp -r "$W/w_of_$src/0" "$W/w_of_$src/constant" "$W/w_of_$src/system" "$d/"
+        wp="$d/constant/waveProperties"
+        case $v in
+            sized)
+                python3 - "$wp" <<'EOF_SZ'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+s, n = re.subn(r'(\n\s*(?:Bjs|Ejs)\s+)\(([^)]*)\);', lambda m: '%s%d (%s);' % (m.group(1), len(m.group(2).split()), m.group(2)), s)
+open(p, 'w').write(s)
+sys.exit(0 if n == 2 else 1)
+EOF_SZ
+                ;;
+            empty)
+                vin "$wp" 'extra;'
+                ;;
+            quoted)
+                vin "$wp" 'note            "a b";'
+                ;;
+        esac
+        [ $? -eq 0 ] || say "ARM V  $v: the input was not staged in $d" FAIL
+    done
+    runof "$W/v_of_$v"
+    if [ $v = quoted ]; then
+        first=$(timedirs "$W/v_of_$v" | awk '{print $1}')
+        ( cd "$W/v_br_$v" && "$BIN" -case . > log.brae 2>&1 )
+        rc=$?
+        grep -q '^note *"a b";' "$W/v_of_$v/$first/uniform/waveProperties.inlet" \
+            && [ $rc -ne 0 ] && grep -q "a quoted string" "$W/v_br_$v/log.brae" && [ -z "$(timedirs "$W/v_br_$v")" ] \
+            && say "ARM V  quoted: OpenFOAM writes the quotes back; brae names the file at start-up, nothing written" ok \
+            || { say "ARM V  quoted: OpenFOAM writes the quotes back; brae names the file at start-up, nothing written [rc $rc]" FAIL; tail -2 "$W/v_br_$v/log.brae" | sed 's/^/      /'; }
+        continue
+    fi
+    runbrae "$W/v_br_$v" host
+    python3 "$CMP" "$W/v_of_$v" "$W/v_br_$v" $(timedirs "$W/v_of_$v") > "$W/cmp_v_$v.txt" 2>&1
+    bound=3e-08
+    # the W host bounds: streamFunction 3e-08, stokesI 5e-07
+    [ $v = empty ] && bound=5e-07
+    judge "$v host" "$W/cmp_v_$v.txt" "$bound" "$W/v_of_$v/log.interFoam" \
+        && vbytes "$W/v_of_$v" "$W/v_br_$v" \
+        && say "ARM V  [host] $v: OpenFOAM's run within $bound, every waveProperties file byte-identical" ok \
+        || say "ARM V  [host] $v: OpenFOAM's run within $bound, every waveProperties file byte-identical" FAIL
+done
+
 # M: a moving mesh's continuity error is continuityErrs.H's on the ABSOLUTE flux (pEqn.H:64, before
 # makeRelative at :70). On a solidBody move it is the swept volumes' residue, which both codes compute from
 # the same points, so it agrees far below the floor judge() allows: sloshingTank2D 1.2e-03 (host) and
@@ -990,14 +1140,28 @@ else
 fi
 
 # ---------------------------------------------------------------------------------------------------
-# R: a file brae cannot write yet -- laminar/waves/irregularMultiDirection's wave-model state, whose entry
-# holds lists (irregularMultiDirectionalWaveModel.C:268-271) the writer does not echo -- is named at
-# startup, before the first step, and the run stops at its first write time having written nothing. (The
-# arm moves as the writer grows: capillaryRise's contact angle, then stokesI's wave state, are written now.) CONTROL: the same case whose only write time lies past endTime runs to
-# its end: the refusal is of the OUTPUT, and a run that never reaches a write is not refused.
-STK="$TUT/multiphase/interFoam/laminar/waves/irregularMultiDirection"
+# R: a file brae cannot write yet -- a wave model's entry holding a sub-dictionary, which OpenFOAM would
+# write back as a nested block and no shipped wave tutorial holds (staged here on laminar/waves/stokesI's
+# inlet) -- is named at startup, before the first step, and the run stops at its first write time having
+# written nothing. The arm moves as the writer grows: capillaryRise's contact angle, stokesI's wave state,
+# then irregularMultiDirection's lists are written now. CONTROL: the same case whose only write time lies
+# past endTime runs to its end: the refusal is of the OUTPUT, and a run that never reaches a write is not
+# refused.
+STK="$TUT/multiphase/interFoam/laminar/waves/stokesI"
+subdict()   # subdict <case> -- an `extra { note 1; }` entry in waveProperties' inlet
+{
+    python3 - "$1/constant/waveProperties" <<'EOF_SD'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+s, n = re.subn(r'(\ninlet\s*\n\{\n)', r'\1    extra\n    {\n        note            1;\n    }\n\n', s)
+open(p, 'w').write(s)
+sys.exit(0 if n == 1 else 1)
+EOF_SD
+}
 if [ -d "$STK" ]; then
     stage "$STK" "$W/stk" 0.05 timeStep 3 0 adjustTimeStep=no deltaT=0.01 || exit 1
+    subdict "$W/stk" || say "ARM R  the sub-dictionary was not staged in stokesI's waveProperties" FAIL
     # line-buffered: the refusal goes to stderr, the steps to stdout, and only then is file order time order
     ( cd "$W/stk" && stdbuf -oL -eL "$BIN" -case . > log.brae 2>&1 ); rc=$?
     python3 - "$W/stk/log.brae" "$rc" "$(timedirs "$W/stk")" <<'PY' && say "ARM R  an unwritten file is named before step 1; the run stops at its first write, nothing written" ok \
@@ -1015,12 +1179,13 @@ sys.exit(0 if rc != 0 and 0 <= named < (first.start() if first else -1) and step
               and stop > first.start() and not dirs else 1)
 PY
     stage "$STK" "$W/stk_ctl" 0.02 timeStep 1000 0 adjustTimeStep=no deltaT=0.01 || exit 1
+    subdict "$W/stk_ctl" || say "ARM R  the sub-dictionary was not staged in the control's waveProperties" FAIL
     ( cd "$W/stk_ctl" && "$BIN" -case . > log.brae 2>&1 ) \
         && [ -z "$(timedirs "$W/stk_ctl")" ] && grep -q "will not be written" "$W/stk_ctl/log.brae" \
         && say "CONTROL  the same case with no write time before endTime runs to its end (exit 0)" ok \
         || { say "CONTROL  the same case with no write time before endTime runs to its end (exit 0)" FAIL; tail -3 "$W/stk_ctl/log.brae" | sed 's/^/      /'; }
 else
-    say "ARM R  irregularMultiDirection tutorial missing" FAIL
+    say "ARM R  stokesI tutorial missing" FAIL
 fi
 
 [ $fail -eq 0 ] && echo "PASS: brae_interFoam writes OpenFOAM's time directories, when OpenFOAM does, without moving the run"

@@ -10,6 +10,7 @@
 // are mandatory. The wave length in particular is the dictionary's, NOT the dispersion relation's.
 #include "wave_generation_bases_cpp.cuh"
 #include <cmath>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -61,7 +62,63 @@ protected:
             throw std::runtime_error(
                 "brae waveModel: waveProperties entry for patch `" + patchName_ + "` has no `" + key
                 + "`. OpenFOAM reads it with readEntry and stops without it.");
-        return d.scalarListOr(key, {});
+        // readEntry reads a scalarList as List::readList does (ListIO.C:210-290): `( a b ... )`, or a
+        // size prefix -- `N ( ... )` holding exactly N values, `N { v }` N copies of v. The prefix is a
+        // SIZE: scalarListOr, which takes every number it sees, read `10 ( ... )` as eleven coefficients
+        // with the first one 10, every harmonic shifted by one and nothing said.
+        const std::vector<std::string>& t = *d.find(key);
+        auto refuse = [&]()
+        {
+            throw std::runtime_error(
+                "brae waveModel: `" + key + "` for patch `" + patchName_ + "` is not a scalar list "
+                "`( ... )`, `N ( ... )` or `N { v }`.");
+        };
+        auto number = [&](const std::string& s)
+        {
+            char* end = nullptr;
+            const double v = std::strtod(s.c_str(), &end);
+            if (s.empty() || !end || *end != '\0')
+            {
+                refuse();
+            }
+            return static_cast<scalar>(v);
+        };
+        std::size_t i = 0;
+        long size = -1;
+        if (t.size() > 1 && (t[1] == "(" || t[1] == "{"))
+        {
+            char* end = nullptr;
+            size = std::strtol(t[0].c_str(), &end, 10);
+            if (!end || *end != '\0' || size < 0)
+            {
+                refuse();
+            }
+            i = 1;
+        }
+        if (i < t.size() && t[i] == "{" && size >= 0)
+        {
+            if (t.size() != i + 3 || t[i + 2] != "}")
+            {
+                refuse();
+            }
+            return std::vector<scalar>(static_cast<std::size_t>(size), number(t[i + 1]));
+        }
+        if (i >= t.size() || t[i] != "(" || t.back() != ")")
+        {
+            refuse();
+        }
+        std::vector<scalar> v;
+        for (std::size_t k = i + 1; k + 1 < t.size(); ++k)
+        {
+            v.push_back(number(t[k]));
+        }
+        if (size >= 0 && static_cast<std::size_t>(size) != v.size())
+        {
+            throw std::runtime_error(
+                "brae waveModel: `" + key + "` for patch `" + patchName_ + "` has the size " + t[0] + " and "
+                + std::to_string(v.size()) + " values; OpenFOAM's List reader stops on it.");
+        }
+        return v;
     }
 
     scalar eta(

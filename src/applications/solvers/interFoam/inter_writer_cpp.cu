@@ -375,6 +375,20 @@ std::string dictToken(
     return t;
 }
 
+// Whether a dictionary token re-emits through dictToken as OpenFOAM re-emits it. ISstream makes each of
+// `[ ] , : = + * /` a punctuation token of its own (ISstream.C:577-594) where brae's tokenizer keeps it in
+// the word; `<` opens a compound (`List<scalar> N(...)`, ISstream.C:806-809); and strtod reads `0x10`,
+// `inf`, `nan` and `infinity` as numbers ISstream does not.
+bool echoableToken(const std::string& t)
+{
+    if (t.find_first_of("[],:=+*/<>") != std::string::npos)
+    {
+        return false;
+    }
+    static const std::regex notNumber("^-?(0[xX]|[iI][nN][fF]|[nN][aA][nN])");
+    return !std::regex_search(t, notNumber);
+}
+
 // A scalar list as a dictionary entry holds it: dict.add streams UList::writeList's form into a primitive
 // entry, re-read as tokens (primitiveEntryTemplates.C:36-46) and written back joined by single spaces
 // (primitiveEntryIO.C:280-314). So `N ( a b )` on one line at any length, `0 ( )` when empty, and -- for
@@ -2287,7 +2301,10 @@ void InterWriter::write(const InterWriteState& s)
     // class is the model's type (IOobjectWriteHeader.C:280-283). The body is the dictionary as the model
     // holds it -- the case's sub-dictionary merged over a restart's stored file -- then the computed
     // waterDepthRef when neither named it (waveModel.C:322-343). Only models that exist are written: one is
-    // created at the first update that looks it up (waveModelNew.C:85-104).
+    // created at the first update that looks it up (waveModelNew.C:85-104). The models only READ their
+    // lists (irregularMultiDirectionalWaveModel.C:268-271, streamFunctionWaveModel.C:231-232), so a list
+    // entry is written as primitiveEntry writes any entry: its tokens, each re-emitted, joined by single
+    // spaces on one line (primitiveEntryIO.C:280-314) -- `57 ( ( 15.367000000000001 ... ) ... )`.
     for (std::size_t pi = 0; waves_ && pi < waves_->model.size(); ++pi)
     {
         const waveModels::WaveModel* wm = waves_->model[pi].get();
@@ -2307,14 +2324,15 @@ void InterWriter::write(const InterWriteState& s)
         bool hasDepth = false;
         for (const auto& leafEntry : d.leaves)
         {
-            if (leafEntry.second.size() != 1)
-            {
-                throw std::runtime_error(
-                    "brae interFoam writer: " + object + "'s `" + leafEntry.first + "` is not one word or number, "
-                    "which is not echoed");
-            }
+            // an entry with no tokens (`key;`) is a legal primitiveEntry, written as the keyword and `;`
+            // (primitiveEntryIO.C:126-131, 280-307)
             hasDepth = hasDepth || leafEntry.first == "waterDepthRef";
-            wordEntry(os, 0, leafEntry.first, dictToken(leafEntry.second[0], precision_));
+            std::string value;
+            for (const std::string& token : leafEntry.second)
+            {
+                value += (value.empty() ? "" : " ") + dictToken(token, precision_);
+            }
+            wordEntry(os, 0, leafEntry.first, value);
             os << "\n";
         }
         if (!hasDepth)
@@ -2518,12 +2536,14 @@ void registerUnwritten(
             w.writeRAU();
         }
     }
-    // the wave models' state files: written when every model's entry is one the writer can echo -- plain
-    // words and numbers. irregularMultiDirectional's and streamFunction's list entries
-    // (irregularMultiDirectionalWaveModel.C:268-271, streamFunctionWaveModel.C:231-232) are not.
+    // the wave models' state files: written when every model's entry is one the writer can echo -- words,
+    // numbers and lists of them. Not echoed, each named here rather than at the write: a sub-dictionary
+    // (OpenFOAM writes a nested block, which no shipped wave tutorial holds and so nothing could gate), a
+    // quoted string (the tokenizer drops the quotes), a leaf the dictionary reader split at a `{` (a
+    // uniform list `N{v}`), and a token OpenFOAM tokenizes differently (echoableToken).
     if (f.waves.any)
     {
-        bool echoable = true;
+        bool echoable = !f.waves.quotedString;
         for (std::size_t pi = 0; pi < f.waves.alphaPatch.size(); ++pi)
         {
             if (!f.waves.alphaPatch[pi] && !(pi < f.waves.UPatch.size() && f.waves.UPatch[pi]))
@@ -2544,7 +2564,11 @@ void registerUnwritten(
                 echoable = echoable && d->subs.empty();
                 for (const auto& leafEntry : d->leaves)
                 {
-                    echoable = echoable && leafEntry.second.size() == 1;
+                    echoable = echoable && leafEntry.first != "{" && leafEntry.first != "}";
+                    for (const std::string& token : leafEntry.second)
+                    {
+                        echoable = echoable && echoableToken(token);
+                    }
                 }
             }
         }
@@ -2554,8 +2578,9 @@ void registerUnwritten(
         }
         else
         {
-            w.refuseAtFirstWrite("uniform/waveProperties.<patch>", "a wave model's entry holds a list or a "
-                                 "sub-dictionary, which the writer does not echo");
+            w.refuseAtFirstWrite("uniform/waveProperties.<patch>", "a wave model's entry holds a "
+                                 "sub-dictionary, a quoted string, a uniform `N{v}` list or a token OpenFOAM "
+                                 "splits, which the writer does not echo");
         }
     }
 }

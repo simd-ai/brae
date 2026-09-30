@@ -1,10 +1,12 @@
 // interFoam's wave boundary conditions. See inter_waves_cpp.cuh.
 #include "inter_waves_cpp.cuh"
+#include "foam_token_reader.cuh"
 #include <memory>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 
 namespace brae {
 namespace cpu {
@@ -13,6 +15,39 @@ namespace interFoam {
 namespace {
 
 const char* const WHO = "brae interFoam: ";
+
+// Whether the file holds a double-quoted string outside its comments, read from the raw bytes (the
+// tokenizer drops the quotes)
+bool holdsQuotedString(const std::string& path)
+{
+    const std::vector<char> raw = gzSlurp(path);
+    for (std::size_t i = 0; i < raw.size(); ++i)
+    {
+        if (raw[i] == '/' && i + 1 < raw.size() && raw[i + 1] == '/')
+        {
+            while (i < raw.size() && raw[i] != '\n')
+            {
+                ++i;
+            }
+            continue;
+        }
+        if (raw[i] == '/' && i + 1 < raw.size() && raw[i + 1] == '*')
+        {
+            i += 2;
+            while (i + 1 < raw.size() && !(raw[i] == '*' && raw[i + 1] == '/'))
+            {
+                ++i;
+            }
+            ++i;
+            continue;
+        }
+        if (raw[i] == '"')
+        {
+            return true;
+        }
+    }
+    return false;
+}
 
 // The boundary condition reads `waveDict` (default waveProperties) and brae's field reader does not
 // keep the key, so the file is searched for it. OpenFOAM WRITES the name back as `waveDictName`, which
@@ -122,6 +157,7 @@ InterWaves readInterWaves(
             std::string(WHO) + "the case has wave boundary conditions and no constant/waveProperties. "
             "OpenFOAM reads it MUST_READ when the first of them updates.");
     w.waveProperties = readDict(path);
+    w.quotedString = holdsQuotedString(path);
     w.stored.assign(patches.size(), nullptr);
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
@@ -140,6 +176,7 @@ InterWaves readInterWaves(
         if (std::filesystem::exists(storedPath) || std::filesystem::exists(storedPath + ".gz"))
         {
             w.stored[pi] = std::make_shared<FoamDict>(readDict(storedPath));
+            w.quotedString = w.quotedString || holdsQuotedString(storedPath);
         }
         if (!w.waveProperties.subDict(patches[pi].name))
             throw std::runtime_error(

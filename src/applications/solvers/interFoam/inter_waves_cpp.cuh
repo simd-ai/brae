@@ -93,6 +93,9 @@ struct InterWaves
     // OpenFOAM's readDict reads the file at construction. A restart's contribution is `waterDepthRef`:
     // recomputed instead, the reference depth is taken against a water level the wave has already moved.
     std::vector<std::shared_ptr<FoamDict>> stored;
+    // a double-quoted string in constant/waveProperties or a stored file: the tokenizer drops the quotes
+    // OpenFOAM keeps and writes back (tokenIO.C:236-238), so the writer cannot echo such a file
+    bool quotedString = false;
     vector gravity{0, 0, 0};
     std::string alphaName;
     // every update that RAN, in order, as "<patch>@<timeIndex>": OpenFOAM's "Updating ..." lines

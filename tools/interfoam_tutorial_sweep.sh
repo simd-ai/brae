@@ -77,6 +77,16 @@ for cd_ in $(find "$TUT" -name controlDict -path '*/system/*' | sort); do
         [ -f system/blockMeshDict.m4 ] && timeout "$MESH_TIMEOUT" m4 system/blockMeshDict.m4 > system/blockMeshDict 2> log.m4
         if [ -x ./Allrun.pre ]; then
             timeout "$MESH_TIMEOUT" ./Allrun.pre > log.allrunpre 2>&1
+        elif [ -f system/snappyHexMeshDict ] && [ -f ./Allrun ]; then
+            # ...and a snappy case whose meshing lives in its Allrun (RAS/DTCHull, DTCHullMoving: feature
+            # extraction, six topoSet.N/refineMesh rounds, then snappyHexMesh). The steps below alone left
+            # the background block with no hull, and brae refused it -- rightly -- for a kOmegaSST case with
+            # no wall patch, which read as a brae gap. The Allrun without its solver and with its parallel
+            # steps serial, as the write gate's stage_allrun runs it.
+            sed -E -e '/decomposePar|reconstructPar|redistributePar/d' \
+                   -e '/\$\(getApplication\)|runApplication +interFoam|runParallel +interFoam/d' \
+                   -e 's/runParallel/runApplication/' ./Allrun > Allrun.mesh
+            timeout "$MESH_TIMEOUT" bash ./Allrun.mesh > log.allrunmesh 2>&1
         fi
         # ...AND restore0Dir AFTER IT, because that is where the tutorials put it. RAS/mixerVesselAMI's
         # Allrun.pre ENDS WITH `rm -rf 0` and leaves restore0Dir and setFields to its Allrun, so a sweep that
@@ -124,8 +134,18 @@ s = re.sub(r'\nfunctions\s*\{.*\n\}\s*\n', '\n', s, flags=re.S)
 open(p, 'w').write(s)
 PY
 
+    # every arm starts from the SAME case: brae_interFoam writes time directories now, and under
+    # `startFrom latestTime` the device arm started from the host arm's last write -- "controlDict gives no
+    # steps to take" on eleven cases in the first sweep after the writer landed
+    start_dirs=$(cd "$c" && ls -d [0-9]* 2>/dev/null | grep -E '^[0-9.e+-]+$' | sort | tr '\n' ' ')
     for arm in $ARMS; do
         [ "$arm" = device ] && flag="-device" || flag=""
+        for t in $(cd "$c" && ls -d [0-9]* 2>/dev/null | grep -E '^[0-9.e+-]+$'); do
+            case " $start_dirs " in
+                *" $t "*) ;;
+                *) rm -rf "${c:?}/$t" ;;
+            esac
+        done
         out=$(cd "$c" && timeout "$CASE_TIMEOUT" "$BIN" -case "$c" $flag 2>&1)
         rc=$?
         if [ $rc -eq 0 ]; then
