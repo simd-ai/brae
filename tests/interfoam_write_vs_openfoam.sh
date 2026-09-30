@@ -30,7 +30,10 @@
 #   ARM W  eight tutorials whose conditions now write -- capillaryRise, weirOverflow, angledDuct,
 #          damBreakLeakage, damBreakPorousBaffle, damBreakPermeable, nozzleFlow2D, eulerianInjection --
 #          against OpenFOAM at pinned solves, host and device; the old level's restore rule witnessed.
+#   ARM E1 a refusal thrown inside write() leaves no time directory (BRAE_CONTROL_WRITE_REFUSE_LATE=1).
 #   ARM M  a moving mesh's cumulativeContErr is the absolute flux's (sloshingTank2D), with its control.
+#   ARM P  the mesh update's CorrectPhi continuity error counts (waveMakerPiston, loose pcorr), with its
+#          control BRAE_CONTROL_NO_CORRECTPHI_CONTERR=1.
 #   ARM R  a file brae cannot write yet (irregularMultiDirection's wave-model state, lists) is named at
 #          startup, and the run stops at its first write time with nothing written.
 #   Every arm runs on the host loop and on `-device` when a GPU is present.
@@ -362,6 +365,16 @@ restart_brae "$W/r0ctl" && [ "$(timedirs "$W/r0ctl")" = "0.1 0.15 " ] \
     && say "CONTROL  the same restart without U_0 runs to its end and writes 0.15" ok \
     || { say "CONTROL  the same restart without U_0 runs to its end and writes 0.15" FAIL; tail -3 "$W/r0ctl/log.brae" | sed 's/^/      /'; }
 
+# E1: a refusal thrown INSIDE write() leaves no time directory -- every file is built into a queue and
+# only then written. No case reaches such a refusal (the start-up check mirrors each one), so
+# BRAE_CONTROL_WRITE_REFUSE_LATE=1 injects it after the last file is built. The restart is E0's; its
+# control, which writes 0.15, is the one above. FAIL-PROOF (2026-09-30): with emit() writing at once,
+# the writer's form before the queue, this run left 0.15/ holding all 9 of its files.
+( export BRAE_CONTROL_WRITE_REFUSE_LATE=1; restart_brae "$W/r1" ); rc=$?
+[ $rc -ne 0 ] && grep -q "BRAE_CONTROL_WRITE_REFUSE_LATE refuses" "$W/r1/log.brae" && [ "$(timedirs "$W/r1")" = "0.1 " ] \
+    && say "ARM E1 a refusal inside write() leaves no time directory behind" ok \
+    || { say "ARM E1 a refusal inside write() leaves no time directory behind [$(timedirs "$W/r1")]" FAIL; tail -3 "$W/r1/log.brae" | sed 's/^/      /'; }
+
 # ---------------------------------------------------------------------------------------------------
 # F + H: `timeStep 1, purgeWrite 1` against `timeStep N`, to endTime 0.02 -- no trim under timeStep
 stage "$LAM" "$W/of_p" 0.02 timeStep 1 1 || exit 1
@@ -498,8 +511,22 @@ t = re.sub(r'(relTol\s+)[^;]+;', r'\g<1>0;', t)
 open(q, 'w').write(t)
 PY
 }
-# <tutorial>:<deltaT override>:<bound>. The bounds are one decade above the worst of host and device at
-# pinned solves (2026-09-30): capillaryRise 3.8e-14, weirOverflow 2.6e-12, damBreakPorousBaffle 3.5e-12,
+# <tutorial>:<deltaT override>:<host bound>:<device bound>. Each arm has its own bound, one decade above
+# that arm's worst: one bound for both let the host borrow the device's looser linear solvers, 100x on
+# electrostaticDeposition. The host reproduces run to run (waveMakerFlap 4.15e-10 in two runs of two
+# builds), so its bound is one decade above its measured worst, rounded up -- and above an earlier build's
+# figure where that was larger (waveMakerFlap 5.7e-10). The device's is one decade above the worst either
+# arm ever showed, since it does not reproduce: waveMakerFlap's device read 2.3e-08 in one run, 8.9e-10 in two.
+# HOST worst at pinned solves (U2 gate, 2026-09-30), every file but cumulativeContErr: capillaryRise 3.8e-14,
+# weirOverflow 4.3e-13, angledDuct 8.3e-10, damBreakLeakage 2.4e-07, damBreakPorousBaffle 4.3e-13,
+# damBreakPermeable 1.6e-13, nozzleFlow2D 1.1e-12, eulerianInjection 4.3e-14, cnoidal 3.6e-10, solitary
+# 1.5e-10, solitaryGrimshaw 1.1e-08, solitaryMcCowan 1.0e-08, stokesI 4.8e-08, stokesII 1.3e-09, stokesV
+# 1.4e-09, mangroveInteraction 7.9e-03, DTCHull 5.7e-13, sloshingTank2D 1.2e-12 (held at the 1e-11 it
+# already had, not loosened to 2e-11), testTubeMixer 3.5e-11, sloshingCylinder 9.4e-11,
+# electrostaticDeposition 1.8e-07, waveMakerSolitary 6.0e-11, waveMakerPiston 1.3e-09, waveMakerFlap
+# 5.7e-10, waveMakerMultiPaddleFlap 7.3e-12, waveMakerMultiPaddlePiston 2.2e-11.
+# The DEVICE bounds, and the notes on the cases, from the combined measurements (2026-09-30):
+# capillaryRise 3.8e-14, weirOverflow 2.6e-12, damBreakPorousBaffle 3.5e-12,
 # nozzleFlow2D 1.3e-12, eulerianInjection 1.1e-13, damBreakPermeable 1.6e-13, angledDuct 1.3e-09 -- and
 # damBreakLeakage 3.6e-07, which is NOT a port gap: at step 2 its column stands at rest behind the shut
 # baffle and U is round-off on a near-zero scale (the leakage gate's own header; it compares after 520
@@ -516,31 +543,41 @@ PY
 # sloshingCylinder 9.4e-11 (through its as-shipped first move, which leaves OpenFOAM's own alpha in
 # [-1.11, 1.86]); electrostaticDeposition 1.8e-07 host but 1.7e-05 DEVICE -- the device's per-face
 # fixesValue mask for variableHeightFlowRate (PORT.md X3), which the bound admits and does not hide.
+# The wave makers (displacementLaplacian: pointDisplacement with the waveMaker patch's write() -- the solitary
+# branch's rewritten wavePeriod, waveAngle in radians -- cellDisplacement's cellMotion patches, and correctPhi's
+# rAU): waveMakerSolitary 7.1e-11, waveMakerPiston 1.8e-09, waveMakerFlap 5.7e-10 host and 2.3e-08 device,
+# waveMakerMultiPaddleFlap 7.3e-12, waveMakerMultiPaddlePiston 2.4e-11.
 W_CASES="
-laminar/capillaryRise::4e-13
-RAS/weirOverflow::3e-11
-RAS/angledDuct::2e-08
-RAS/damBreakLeakage::4e-06
-RAS/damBreakPorousBaffle::4e-11
-laminar/damBreakPermeable::2e-12
-LES/nozzleFlow2D:1e-9:2e-11
-laminar/vofToLagrangian/eulerianInjection::2e-12
-laminar/waves/cnoidal::5e-09
-laminar/waves/solitary::2e-09
-laminar/waves/solitaryGrimshaw::2e-07
-laminar/waves/solitaryMcCowan::2e-07
-laminar/waves/stokesI::1e-06
-laminar/waves/stokesII::2e-08
-laminar/waves/stokesV::2e-08
-laminar/waves/mangroveInteraction::1e-01
-RAS/DTCHull::1e-10
-laminar/sloshingTank2D::1e-11
-laminar/testTubeMixer::4e-10
-laminar/sloshingCylinder::1e-09
-RAS/electrostaticDeposition::2e-04
+laminar/capillaryRise::4e-13:4e-13
+RAS/weirOverflow::5e-12:3e-11
+RAS/angledDuct::9e-09:2e-08
+RAS/damBreakLeakage::3e-06:4e-06
+RAS/damBreakPorousBaffle::5e-12:4e-11
+laminar/damBreakPermeable::2e-12:2e-12
+LES/nozzleFlow2D:1e-9:2e-11:2e-11
+laminar/vofToLagrangian/eulerianInjection::5e-13:2e-12
+laminar/waves/cnoidal::4e-09:5e-09
+laminar/waves/solitary::2e-09:2e-09
+laminar/waves/solitaryGrimshaw::2e-07:2e-07
+laminar/waves/solitaryMcCowan::2e-07:2e-07
+laminar/waves/stokesI::5e-07:1e-06
+laminar/waves/stokesII::2e-08:2e-08
+laminar/waves/stokesV::2e-08:2e-08
+laminar/waves/mangroveInteraction::8e-02:1e-01
+RAS/DTCHull::6e-12:1e-10
+laminar/sloshingTank2D::1e-11:1e-11
+laminar/testTubeMixer::4e-10:4e-10
+laminar/sloshingCylinder::1e-09:1e-09
+RAS/electrostaticDeposition::2e-06:2e-04
+laminar/waves/waveMakerSolitary::7e-10:1e-09
+laminar/waves/waveMakerPiston::2e-08:2e-08
+laminar/waves/waveMakerFlap::6e-09:3e-07
+laminar/waves/waveMakerMultiPaddleFlap::8e-11:1e-10
+laminar/waves/waveMakerMultiPaddlePiston::3e-10:3e-10
 "
 for entry in $W_CASES; do
-    rel=${entry%%:*}; rest=${entry#*:}; dtw=${rest%%:*}; BOUND_W=${rest#*:}; key=$(basename "$rel")
+    rel=${entry%%:*}; rest=${entry#*:}; dtw=${rest%%:*}; bounds=${rest#*:}; key=$(basename "$rel")
+    BOUND_WH=${bounds%%:*}; BOUND_WD=${bounds#*:}
     src="$TUT/multiphase/interFoam/$rel"
     [ -d "$src" ] || { say "ARM W  $key: tutorial missing" FAIL; continue; }
     stage_allrun "$src" "$W/w_of_$key" "$dtw" || { say "ARM W  $key: meshing failed (see $W/w_of_$key/log.allrunmesh)" FAIL; continue; }
@@ -548,6 +585,8 @@ for entry in $W_CASES; do
     ot=$(timedirs "$W/w_of_$key")
     [ "$(echo $ot | wc -w)" = 2 ] || { say "ARM W  $key: premise, OpenFOAM writes two steps [$ot]" FAIL; continue; }
     for arm in $ARMS; do
+        BOUND_W=$BOUND_WH
+        [ "$arm" = device ] && BOUND_W=$BOUND_WD
         d="$W/w_br_${key}_$arm"
         mkdir -p "$d"
         cp -r "$W/w_of_$key/0" "$W/w_of_$key/constant" "$W/w_of_$key/system" "$d/"
@@ -607,9 +646,77 @@ if [ -d "$W/w_of_weirOverflow" ]; then
     cp -r "$W/w_of_weirOverflow/0" "$W/w_of_weirOverflow/constant" "$W/w_of_weirOverflow/system" "$d/"
     runbrae "$d" host BRAE_CONTROL_ALPHA_OLD_START=1
     python3 "$CMP" "$W/w_of_weirOverflow" "$d" $(timedirs "$W/w_of_weirOverflow") > "$W/cmp_w_ctl.txt" 2>&1
-    judge "control start-only" "$W/cmp_w_ctl.txt" 3e-11 | grep -q "over the bound: .*alpha.water_0" \
+    # weirOverflow's host bound in W_CASES
+    judge "control start-only" "$W/cmp_w_ctl.txt" 5e-12 | grep -q "over the bound: .*alpha.water_0" \
         && say "CONTROL  BRAE_CONTROL_ALPHA_OLD_START=1 puts weirOverflow's alpha.water_0 over the bound" ok \
         || say "CONTROL  BRAE_CONTROL_ALPHA_OLD_START=1 puts weirOverflow's alpha.water_0 over the bound" FAIL
+fi
+
+# P: the continuity error of the mesh update's CorrectPhi (correctPhi.H:11) counts. correctPhi defaults
+# to mesh.dynamic() (createDyMControls.H:4-7) and the wave makers leave it on; sloshingTank2D, testTubeMixer
+# and sloshingCylinder switch it off, so arm M cannot see it. In arm W the pcorr is pinned to 1e-13 and
+# its term is 5.6e-21 against a cumulative of 8.2e-14 -- nothing can witness it there. So this arm pins
+# every solve but pcorr, which gets a loose tolerance (1e-4, relTol 0) and leaves a real error behind:
+# waveMakerPiston's second correctPhi puts 3.2e-11 into OpenFOAM's 3.04e-11 at 0.01. MEASURED
+# (2026-09-30), relative to OpenFOAM at 0.01: host 6.1e-05, device 5.2e-04 (the pcorr is host code on
+# both arms, the p_rgh solves are not); the bound is a decade above each. At 0.005 the term is 2.1e-13 of
+# 3.0e-13 and the device's p_rgh solves move the sum 6.0e-02, so only 0.01 is held.
+# CONTROL: BRAE_CONTROL_NO_CORRECTPHI_CONTERR=1 leaves the term out -- -1.9990e-12, 1.07 off. FAIL-PROOF:
+# the binary before this fix wrote -1.9989507883302306e-12, the control's value bit for bit.
+if [ -d "$W/w_of_waveMakerPiston" ]; then
+    stage_pcorr()   # stage_pcorr <dir> -- arm W's waveMakerPiston with a loose pcorr
+    {
+        mkdir -p "$1"
+        cp -r "$W/w_of_waveMakerPiston/0" "$W/w_of_waveMakerPiston/constant" "$W/w_of_waveMakerPiston/system" "$1/"
+        python3 - "$1/system/fvSolution" <<'PY'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+s, n = re.subn(r'("\(pcorr\|pcorrFinal\)"\s*\{[^}]*?tolerance\s+)[^;]+;', r'\g<1>1e-4;', s)
+open(p, 'w').write(s)
+sys.exit(0 if n == 1 else 1)
+PY
+    }
+    contp()   # contp <case dir> -- |brae - OpenFOAM| / |OpenFOAM| of cumulativeContErr at 0.01
+    {
+        python3 - "$W/p_of" "$1" <<'PY'
+import re, sys
+v = [float(re.search(r'^value\s+(\S+);', open('%s/0.01/uniform/cumulativeContErr' % d).read(), re.M).group(1))
+     for d in sys.argv[1:3]]
+print('%.3e' % (abs(v[1] - v[0]) / abs(v[0])))
+PY
+    }
+    stage_pcorr "$W/p_of" || say "ARM P  waveMakerPiston's pcorr entry was not found to loosen" FAIL
+    runof "$W/p_of"
+    python3 - "$W/p_of/log.interFoam" <<'PY' && say "fixture witnesses: OpenFOAM's correctPhi continuity error is most of its cumulative" ok \
+                                          || say "fixture witnesses: OpenFOAM's correctPhi continuity error is most of its cumulative" FAIL
+import re, sys
+log = open(sys.argv[1]).read()
+# the continuity line straight after each non-trivial pcorr solve is correctPhi.H:11's
+g = [float(x) for x in re.findall(r'Solving for pcorr, Initial residual = (?!0,)[^\n]*\n'
+                                   r'time step continuity errors : sum local = \S+, global = (\S+),', log)]
+cu = float(re.findall(r'cumulative = (\S+)', log)[-1])
+print('      correctPhi globals %s, final cumulative %.3e' % (' '.join('%.3e' % x for x in g), cu))
+sys.exit(0 if g and abs(sum(g)) > 0.5 * abs(cu) else 1)
+PY
+    for arm in $ARMS; do
+        bound=7e-4
+        [ "$arm" = device ] && bound=6e-3
+        stage_pcorr "$W/p_br_$arm"
+        runbrae "$W/p_br_$arm" "$arm"
+        r=$(contp "$W/p_br_$arm")
+        python3 -c "import sys; sys.exit(0 if $r < $bound else 1)" \
+            && say "ARM P  [$arm] waveMakerPiston's cumulativeContErr counts correctPhi's, within $bound ($r)" ok \
+            || say "ARM P  [$arm] waveMakerPiston's cumulativeContErr counts correctPhi's, within $bound ($r)" FAIL
+    done
+    stage_pcorr "$W/p_ctl"
+    runbrae "$W/p_ctl" host BRAE_CONTROL_NO_CORRECTPHI_CONTERR=1
+    r=$(contp "$W/p_ctl")
+    python3 -c "import sys; sys.exit(0 if $r > 0.5 else 1)" \
+        && say "CONTROL  BRAE_CONTROL_NO_CORRECTPHI_CONTERR=1 puts it off by more than half ($r)" ok \
+        || say "CONTROL  BRAE_CONTROL_NO_CORRECTPHI_CONTERR=1 puts it off by more than half ($r)" FAIL
+else
+    say "ARM P  waveMakerPiston did not run in arm W" FAIL
 fi
 
 # ---------------------------------------------------------------------------------------------------

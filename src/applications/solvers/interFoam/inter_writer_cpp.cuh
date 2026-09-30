@@ -39,6 +39,11 @@ namespace interFoam {
 struct InterTurbulence;
 struct InterFields;
 struct InterWaves;
+}   // namespace interFoam
+}   // namespace cpu
+class DisplacementLaplacianFvMotionSolver;
+namespace cpu {
+namespace interFoam {
 
 // What one write time hands the writer: the solver's own objects, read and never modified.
 struct InterWriteState
@@ -81,6 +86,10 @@ struct InterWriteState
     const SurfaceVectorField* Uf = nullptr;
     const SurfaceScalarField* meshPhi = nullptr;
     const std::vector<vector>* points = nullptr;
+    // a displacementLaplacian motion's solver, whose pointDisplacement and cellDisplacement are written
+    const DisplacementLaplacianFvMotionSolver* displacement = nullptr;
+    // correctPhi's rAU cells (initCorrectPhi.H), 1/UEqn.A() of the step's last corrector
+    const std::vector<scalar>* rAU = nullptr;
 };
 
 class InterWriter
@@ -135,6 +144,11 @@ public:
     void writeRDeltaT() { rDeltaT_ = true; }
     // a solidBody-moved mesh's state is written: polyMesh/points, meshPhi, Uf
     void writeMeshMotion() { meshMotion_ = true; }
+    // ...and a displacementLaplacian motion's own fields: pointDisplacement, cellDisplacement
+    void writeDisplacement() { displacement_ = true; }
+    // correctPhi's rAU (initCorrectPhi.H:3-17, AUTO_WRITE)
+    void writeRAU() { rAU_ = true; }
+    bool writesRAU() const { return rAU_; }
     // What the old level's patches keep from the moment OpenFOAM creates it -- the first alpha1.oldTime()
     // of the run, subCycleField's constructor (subCycle.H:78) ahead of the first alpha solve: each contact
     // angle's gradient, which later assignments never touch (values only, fvPatchField.C:407-413,
@@ -183,7 +197,13 @@ private:
         const std::string& className,
         const std::string& location,
         const std::string& object) const;
+    // emit() only queues a file; write() writes the queue once every file of the time is built, so a
+    // refusal thrown half-way through leaves no partial time directory behind
     void emit(
+        const std::string& path,
+        const std::string& text,
+        bool compressible) const;
+    void writeFile(
         const std::string& path,
         const std::string& text,
         bool compressible) const;
@@ -210,9 +230,19 @@ private:
     const InterWaves* waves_ = nullptr;
     bool rDeltaT_ = false;
     bool meshMotion_ = false;
+    bool displacement_ = false;
+    bool rAU_ = false;
     bool startHoldsAlphaOld_ = false;
     bool oldLevelNoted_ = false;
     std::vector<std::vector<scalar>> oldLevelGrad_;
+
+    struct PendingFile
+    {
+        std::string path;
+        std::string text;
+        bool compressible = false;
+    };
+    mutable std::vector<PendingFile> pending_;
 
     std::vector<std::pair<std::string, std::string>> refused_;
     std::map<std::string, Template> templates_;

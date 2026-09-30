@@ -201,6 +201,12 @@ public:
     {
         return SBMF_ != nullptr && !displacement_ && !rigidBody_;
     }
+    // the displacementLaplacian motion solver, or null: its pointDisplacement and cellDisplacement are
+    // written with the mesh (displacementMotionSolver.C:50-61, displacementLaplacianFvMotionSolver.C:71-84)
+    const DisplacementLaplacianFvMotionSolver* displacement() const
+    {
+        return displacement_.get();
+    }
     const SurfaceScalarField& meshPhi() const
     {
         return meshPhi_;

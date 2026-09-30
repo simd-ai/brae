@@ -4,14 +4,19 @@
 #include "inter_case_cpp.cuh"
 #include "inter_amr_cpp.cuh"
 #include "inter_waves_cpp.cuh"
+#include "displacement_laplacian_fv_motion_solver_cpp.cuh"
+#include "dynamic_motion_solver_fv_mesh_cpp.cuh"
 #include "foam_token_reader.cuh"
 #include "brae_notice.cuh"
 #include <zlib.h>
+#include <cerrno>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -331,16 +336,30 @@ int ofSwitchToken(const std::string& w)
     return -1;
 }
 
-// One token of a dictionary OpenFOAM writes back as it holds it: a label as itself, any other number as a
-// scalar at writePrecision (`3.0` comes back `3`, `0.05` as 0.050000000000000003), a word unchanged.
+// One token of a dictionary OpenFOAM writes back as it holds it (ISstream.C:712-790): a label as its
+// parsed value (`007` comes back `7`, `-0` as `0`), any other number as a scalar at writePrecision (`3.0`
+// comes back `3`, `0.05` as 0.050000000000000003, a label too big for int32 as a scalar), a word
+// unchanged. A leading `+` does not start a number there, so `+1` stays the word `+1`.
 std::string dictToken(
     const std::string& t,
     int precision)
 {
-    static const std::regex label("^[+-]?[0-9]+$");
-    if (std::regex_match(t, label))
+    if (t.empty() || t[0] == '+')
     {
         return t;
+    }
+    static const std::regex label("^-?[0-9]+$");
+    if (std::regex_match(t, label))
+    {
+        // int32IO.C:42-58: strtoimax base 10, then the int32 range
+        errno = 0;
+        const long long v = std::strtoll(t.c_str(), nullptr, 10);
+        if (errno == 0
+            && v >= std::numeric_limits<int32_t>::min()
+            && v <= std::numeric_limits<int32_t>::max())
+        {
+            return std::to_string(v);
+        }
     }
     char* end = nullptr;
     const double v = std::strtod(t.c_str(), &end);
@@ -1419,6 +1438,14 @@ void InterWriter::emit(
     const std::string& text,
     bool compressible) const
 {
+    pending_.push_back(PendingFile{path, text, compressible});
+}
+
+void InterWriter::writeFile(
+    const std::string& path,
+    const std::string& text,
+    bool compressible) const
+{
     // fstreamPointers.C:147-170: a compressed write goes to <file>.gz and removes the plain file, and the
     // other way round, so a directory never holds both
     const bool gz = compress_ && compressible;
@@ -1697,12 +1724,7 @@ void InterWriter::write(const InterWriteState& s)
     }
 
     const std::string dir = caseDir_ + "/" + name;
-    std::error_code ec;
-    fs::create_directories(dir + "/uniform/functionObjects", ec);
-    if (ec)
-    {
-        throw std::runtime_error("brae interFoam writer: cannot create " + dir + ": " + ec.message());
-    }
+    pending_.clear();
 
     // uniform/time first, always ascii and never compressed (TimeIO.C:508-539)
     {
@@ -1927,8 +1949,6 @@ void InterWriter::write(const InterWriteState& s)
                 patches_,
                 precision_),
             true);
-        std::error_code ec;
-        fs::create_directories(dir + "/polyMesh", ec);
         std::ostringstream os;
         os << header("vectorField", name + "/polyMesh", "points") << "\n";
         os << s.points->size() << "\n(\n";
@@ -1938,6 +1958,159 @@ void InterWriter::write(const InterWriteState& s)
         }
         os << ")\n\n\n// ************************************************************************* //\n";
         emit(dir + "/polyMesh/points", os.str(), true);
+    }
+
+    // A displacementLaplacian motion's own fields. pointDisplacement: MUST_READ/AUTO_WRITE
+    // (displacementMotionSolver.C:50-61), the total displacement from points0 after curPoints; its patches
+    // write as pointPatchFields do -- fixedValue its value, zeroGradient and empty their type, waveMaker
+    // every member and the value (waveMakerPointPatchVectorField.C:449-464). cellDisplacement:
+    // READ_IF_PRESENT/AUTO_WRITE (displacementLaplacianFvMotionSolver.C:71-84), this step's Laplace
+    // solution; a value-fixing point patch makes its patch cellMotion (cellMotionBoundaryTypes), type and
+    // value (cellMotionFvPatchField.C:126-131), the others keep their type.
+    if (displacement_)
+    {
+        const DisplacementLaplacianFvMotionSolver* dm = s.displacement;
+        if (!dm)
+        {
+            throw std::runtime_error("brae interFoam writer: a displacementLaplacian mesh handed no motion solver");
+        }
+        const auto& pps = dm->pointPatches();
+        if (pps.size() != patches_.size())
+        {
+            throw std::runtime_error("brae interFoam writer: the point patches do not follow the mesh's patches");
+        }
+        using PT = DisplacementLaplacianFvMotionSolver::PointPatchType;
+        std::ostringstream os;
+        os << header("pointVectorField", name, "pointDisplacement");
+        keyword(os, 0, "dimensions");
+        os << "[0 1 0 0 0 0 0];\n\n";
+        listEntry(os, 0, "internalField", dm->pointDisplacement(), precision_);
+        os << "\nboundaryField\n{\n";
+        for (std::size_t pi = 0; pi < pps.size(); ++pi)
+        {
+            const auto& pp = pps[pi];
+            if (pp.name != patches_[pi].name)
+            {
+                refuseWrite("pointDisplacement", patches_[pi], "the point patch order is not the mesh's");
+            }
+            if (pp.dict && (leaf(*pp.dict, "patchType") || setsUseImplicit(*pp.dict)))
+            {
+                refuseWrite("pointDisplacement", patches_[pi], "it sets patchType or useImplicit, not written");
+            }
+            os << "    " << pp.name << "\n    {\n";
+            if (pp.type == PT::fixedValue)
+            {
+                wordEntry(os, 8, "type", "fixedValue");
+                listEntry(os, 8, "value", pp.value, precision_);
+            }
+            else if (pp.type == PT::zeroGradient || pp.type == PT::empty)
+            {
+                wordEntry(os, 8, "type", pp.type == PT::empty ? "empty" : "zeroGradient");
+            }
+            else
+            {
+                const WaveMakerPointPatchVectorField* w = pp.waveMaker.get();
+                scalar wavePhase = 0;
+                if (!w || !pp.dict || !leafScalar(*pp.dict, "wavePhase", wavePhase))
+                {
+                    refuseWrite("pointDisplacement", patches_[pi], "a waveMaker without its model or wavePhase");
+                }
+                wordEntry(os, 8, "type", "waveMaker");
+                wordEntry(os, 8, "motionType", w->motionTypeName());
+                keyword(os, 8, "n");
+                os << fmt(w->n(), precision_) << ";\n";
+                scalarEntry(os, 8, "initialDepth", w->initialDepth(), precision_);
+                scalarEntry(os, 8, "wavePeriod", w->wavePeriod(), precision_);
+                scalarEntry(os, 8, "waveHeight", w->waveHeight(), precision_);
+                scalarEntry(os, 8, "wavePhase", wavePhase, precision_);
+                scalarEntry(os, 8, "waveAngle", w->waveAngle(), precision_);
+                scalarEntry(os, 8, "startTime", w->startTime(), precision_);
+                scalarEntry(os, 8, "rampTime", w->rampTime(), precision_);
+                // a bool is written as a label (bool.C:60-66)
+                keyword(os, 8, "secondOrder");
+                os << (w->secondOrder() ? 1 : 0) << ";\n";
+                keyword(os, 8, "nPaddle");
+                os << w->nPaddle() << ";\n";
+                listEntry(os, 8, "value", pp.value, precision_);
+            }
+            os << "    }\n";
+        }
+        os << "}\n\n\n// ************************************************************************* //\n";
+        emit(dir + "/pointDisplacement", os.str(), true);
+
+        std::ostringstream oc;
+        oc << header("volVectorField", name, "cellDisplacement");
+        keyword(oc, 0, "dimensions");
+        oc << "[0 1 0 0 0 0 0];\n\n";
+        listEntry(oc, 0, "internalField", dm->cellDisplacement(), precision_);
+        oc << "\nboundaryField\n{\n";
+        const auto& cb = dm->cellDisplacementBoundary();
+        for (std::size_t pi = 0; pi < pps.size(); ++pi)
+        {
+            const auto& pp = pps[pi];
+            oc << "    " << pp.name << "\n    {\n";
+            if (pp.fixesValue())
+            {
+                if (pi >= cb.size())
+                {
+                    refuseWrite("cellDisplacement", patches_[pi], "no cellMotion value for this patch");
+                }
+                wordEntry(oc, 8, "type", "cellMotion");
+                listEntry(oc, 8, "value", cb[pi], precision_);
+            }
+            else
+            {
+                wordEntry(oc, 8, "type", pp.type == PT::empty ? "empty" : "zeroGradient");
+            }
+            oc << "    }\n";
+        }
+        oc << "}\n\n\n// ************************************************************************* //\n";
+        emit(dir + "/cellDisplacement", oc.str(), true);
+    }
+
+    // rAU (initCorrectPhi.H:3-17): `rAU.ref() = 1.0/UEqn.A()` assigns the whole field (pEqn.H:4), and A()
+    // is extrapolatedCalculated (fvMatrix.C:1314-1328), so every non-coupled patch holds its face cells'
+    // values -- measured bit-exact on six cases. Constraint patches write their type alone.
+    if (rAU_)
+    {
+        if (!s.rAU || s.rAU->empty())
+        {
+            throw std::runtime_error("brae interFoam writer: correctPhi handed no rAU");
+        }
+        const std::vector<scalar>& r = *s.rAU;
+        std::ostringstream os;
+        os << header("volScalarField", name, "rAU");
+        keyword(os, 0, "dimensions");
+        os << "[-1 3 1 0 0 0 0];\n\n";
+        listEntry(os, 0, "internalField", r, precision_);
+        os << "\nboundaryField\n{\n";
+        for (const FvPatch& p : patches_)
+        {
+            os << "    " << p.name << "\n    {\n";
+            // cyclic writes its type alone (cyclicFvPatchField.C:244-247 overrides coupled's value entry)
+            if (p.type == "empty" || p.type == "wedge" || p.type == "symmetryPlane" || p.type == "symmetry"
+                || p.type == "cyclic")
+            {
+                wordEntry(os, 8, "type", p.type);
+            }
+            else if (isConstraintType(p.type))
+            {
+                refuseWrite("rAU", p, "a coupled patch's rAU is the coupled 1/A, which brae does not keep");
+            }
+            else
+            {
+                std::vector<scalar> v(p.faceCells.size());
+                for (std::size_t i = 0; i < v.size(); ++i)
+                {
+                    v[i] = r[static_cast<std::size_t>(p.faceCells[i])];
+                }
+                wordEntry(os, 8, "type", "calculated");
+                listEntry(os, 8, "value", v, precision_);
+            }
+            os << "    }\n";
+        }
+        os << "}\n\n\n// ************************************************************************* //\n";
+        emit(dir + "/rAU", os.str(), true);
     }
 
     // rDeltaT (createRDeltaT.H): AUTO_WRITE, 1/s, built on extrapolatedCalculated -- which the mesh's
@@ -2047,6 +2220,29 @@ void InterWriter::write(const InterWriteState& s)
         os << "\n\n// ************************************************************************* //\n";
         emit(dir + "/uniform/functionObjects/functionObjectProperties", os.str(), true);
     }
+
+    // BRAE_CONTROL_WRITE_REFUSE_LATE=1 refuses here, with every file built and none written -- the write
+    // gate asserts it leaves no time directory. A case cannot reach this point refused: the start-up check
+    // (refuseAtFirstWrite) mirrors every refusal above, so without the control the queue goes unwitnessed.
+    if (std::getenv("BRAE_CONTROL_WRITE_REFUSE_LATE") != nullptr)
+    {
+        throw std::runtime_error("brae interFoam writer: BRAE_CONTROL_WRITE_REFUSE_LATE refuses " + dir
+                                 + " after building its " + std::to_string(pending_.size()) + " files");
+    }
+
+    // every file is built: only now does the time directory appear
+    for (const PendingFile& pf : pending_)
+    {
+        std::error_code ec;
+        fs::create_directories(fs::path(pf.path).parent_path(), ec);
+        if (ec)
+        {
+            throw std::runtime_error("brae interFoam writer: cannot create the directory of " + pf.path + ": "
+                                     + ec.message());
+        }
+        writeFile(pf.path, pf.text, pf.compressible);
+    }
+    pending_.clear();
 
     // purgeWrite (TimeIO.C:559-582): the directories this run wrote, oldest removed past the limit; the
     // start directory and anything from before the run are never touched
@@ -2164,15 +2360,35 @@ void registerUnwritten(
         {
             w.writeMeshMotion();
         }
+        else if (f.dynamicMesh && f.dynamicMesh->displacement())
+        {
+            w.writeMeshMotion();
+            w.writeDisplacement();
+        }
         else
         {
-            w.refuseAtFirstWrite("cellDisplacement, pointDisplacement, uniform/rigidBodyMotionState",
-                                 "the motion solver's own state (displacementLaplacian, rigidBodyMotion)");
+            w.refuseAtFirstWrite("pointDisplacement, uniform/rigidBodyMotionState",
+                                 "a rigid body's motion state (rigidBodyMeshMotion.C, rigidBodyMotionIO.C)");
         }
     }
+    // correctPhi's rAU: written where every patch holds its face cells' value or is a type-only constraint
+    // (cyclic included); another coupled patch's value is the coupled 1/A (cyclicAMI: 1/(w*A_P + (1-w)*A_N)), which brae does not keep
     if (f.correctPhi)
     {
-        w.refuseAtFirstWrite("rAU", "correctPhi's field (initCorrectPhi.H:3-17)");
+        bool coupled = false;
+        for (const FvPatch& p : w.patches())
+        {
+            coupled = coupled || (p.type != "empty" && p.type != "wedge" && p.type != "symmetryPlane"
+                                  && p.type != "symmetry" && p.type != "cyclic" && isConstraintType(p.type));
+        }
+        if (coupled)
+        {
+            w.refuseAtFirstWrite("rAU", "correctPhi's field on a coupled patch (the coupled 1/A)");
+        }
+        else
+        {
+            w.writeRAU();
+        }
     }
     // the wave models' state files: written when every model's entry is one the writer can echo -- plain
     // words and numbers. irregularMultiDirectional's and streamFunction's list entries

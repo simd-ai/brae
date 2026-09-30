@@ -134,10 +134,10 @@ InterWaves readInterWaves(
         // already moved: MEASURED on laminar/waves/stokesI restarted at t = 0.2, OpenFOAM's own stored
         // 0.600000000000001 against a recomputed 0.592198129937198 at the inlet, which is alpha 2.8676e-01
         // and U 6.5751e-01 of the answer over 7489 of 7500 cells.
-        // brae WRITES no time directory for this solver, so there is no other half to this: the contract
-        // is reading what OpenFOAM wrote.
+        // A case written with `writeCompression on` holds it as waveProperties.<patch>.gz (OpenFOAM's and
+        // brae's writer alike); readDict's reader opens either.
         const std::string storedPath = startDir + "/uniform/waveProperties." + patches[pi].name;
-        if (std::filesystem::exists(storedPath))
+        if (std::filesystem::exists(storedPath) || std::filesystem::exists(storedPath + ".gz"))
         {
             w.stored[pi] = std::make_shared<FoamDict>(readDict(storedPath));
         }

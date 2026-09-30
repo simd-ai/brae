@@ -2467,10 +2467,17 @@ RunReport runInterFoamDevice(
                 {
                     dV0.copyFrom(dm.V.host());
                 }
+                std::vector<scalar> cpDiv;
                 interMeshUpdate(dyn, f, m, g, fvp, mutableMesh, /*amiPairs=*/nullptr,
                                 meshAgglomeration, meshCpc, rep, stepTime, stepIndex, outer,
                                 f.pimple.nOuterCorrectors,
-                                f.ddtU == DdtScheme::CrankNicolson ? &cnClock : nullptr);
+                                f.ddtU == DdtScheme::CrankNicolson ? &cnClock : nullptr,
+                                writer ? &cpDiv : nullptr);
+                // correctPhi.H:11 -- the mesh update's CorrectPhi is host code on this arm too
+                if (writer && !cpDiv.empty())
+                {
+                    writer->addContinuityError(rep.deltaT, cpDiv, g.V());
+                }
                 // storeOldVol -- OF fvMesh::movePoints:944, the volumes the cells had when the TIME STEP
                 // began, stored ONCE per time index inside update() (dynamic_motion_solver_fv_mesh_cpp.cu).
                 // Not dm.V before the call: under moveMeshOuterCorrectors the second update's dm.V is the
@@ -3132,6 +3139,13 @@ RunReport runInterFoamDevice(
             // at zero and so does the flux, whatever the geometry -- and by step two it is 13% of |U| on
             // testTubeMixer (measured: |U| 4.8e-01 of 3.6e+00 against the host arm, alpha still 6e-13;
             // step one 1.6e-11).
+            // correctPhi on a mesh that does NOT move: rAU is still AUTO_WRITE and 1/UEqn.A()
+            // (initCorrectPhi.H:3-17, pEqn.H:4), and nothing in this loop reads it, so it is taken back
+            // on a write step only. Without it the device wrote the start value (1 on a cold start).
+            if (!f.meshIsDynamic)
+            {
+                C.rAUOut = (writer && writeNow && writer->writesRAU()) ? &dRAU : nullptr;
+            }
             if (f.meshIsDynamic)
             {
                 // the ABSOLUTE flux fvc::correctUf reads at the end of the corrector, and rAU for the
@@ -3421,6 +3435,10 @@ RunReport runInterFoamDevice(
                 // and step two is 2.3e-02 of |U| on waveMakerSolitary.
                 if (dRAU.size()) dRAU.copyTo(f.rAU);
             }
+            if (!f.meshIsDynamic && C.rAUOut && dRAU.size())
+            {
+                dRAU.copyTo(f.rAU);
+            }
         }   // the outer corrector loop
 
         rep.steps = s + 1;
@@ -3536,6 +3554,8 @@ RunReport runInterFoamDevice(
             ws.Uf = &f.Uf;
             ws.meshPhi = f.dynamicMesh ? &f.dynamicMesh->meshPhi() : nullptr;
             ws.points = &m.points();
+            ws.displacement = f.dynamicMesh ? f.dynamicMesh->displacement() : nullptr;
+            ws.rAU = &f.rAU;
             writer->write(ws);
         }
 

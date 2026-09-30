@@ -122,7 +122,7 @@ public:
         return lastSolve_;
     }
 
-private:
+public:
     DisplacementLaplacianFvMotionSolver() = default;
 
     enum class PointPatchType
@@ -149,6 +149,14 @@ private:
             return type == PointPatchType::fixedValue || type == PointPatchType::waveMaker;
         }
     };
+    // the point patches, in the mesh's patch order: what the writer echoes into pointDisplacement and
+    // which cellDisplacement patches are cellMotion
+    const std::vector<PointPatch>& pointPatches() const
+    {
+        return pointPatches_;
+    }
+
+private:
 
     void diffusivityCorrect(
         const PrimitiveMesh& m,

@@ -369,6 +369,20 @@ void DisplacementLaplacianFvMotionSolver::attach(
             throw std::runtime_error(
                 std::string(WHO) + "patch `" + p.name + "` is empty and its point condition is not.");
         }
+        // pointPatchField::New (pointPatchFieldNew.C:144-165, the dictionary constructor): on a
+        // constraint patch the patch's own constraint type replaces the dictionary's unless `patchType`
+        // names the patch's type, so a zeroGradient written on a symmetryPlane runs as symmetryPlane (a
+        // slip, plus pointConstraints at its corners) -- neither of which is ported. Running the
+        // dictionary's type would move the mesh differently from OpenFOAM and write the wrong type.
+        if (p.type == "symmetryPlane" || p.type == "symmetry" || p.type == "wedge"
+            || p.type == "cyclic" || p.type == "cyclicSlip" || p.type == "cyclicAMI"
+            || p.type == "cyclicACMI" || p.type == "nonuniformTransformCyclic")
+        {
+            throw std::runtime_error(
+                std::string(WHO) + "patch `" + p.name + "` is " + p.type + ", a constraint patch whose "
+                "point condition OpenFOAM replaces with its own " + p.type + " type; that point "
+                "constraint is not ported.");
+        }
     }
 
     // the cell displacement: zero, and zero on every patch (GeometricField's `boundaryField_ == value`)

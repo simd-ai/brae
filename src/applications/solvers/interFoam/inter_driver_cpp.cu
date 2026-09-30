@@ -153,7 +153,8 @@ void interMeshUpdate(
     label                                  timeIndex,
     label                                  outerOfStep,
     label                                  nOuterCorrectors,
-    const fv::CrankNicolsonClock*          cn)
+    const fv::CrankNicolsonClock*          cn,
+    std::vector<scalar>*                   correctPhiDivOut)
 {
     if (!dyn) return;
     // interFoam.C:118: on the first outer corrector, or on every one under
@@ -371,6 +372,13 @@ void interMeshUpdate(
             cin.rhoPhi = &f.rhoPhi;
             cin.solveLog = &rep.pcorrSolves;
             correctPhi(f.U, f.phi, f.p_rgh, cin, cpc, m, g, patches);
+            // correctPhi.H:11, #include "continuityErrs.H" on the absolute flux.
+            // BRAE_CONTROL_NO_CORRECTPHI_CONTERR=1 leaves it uncounted, the writer's form before F2 -- the
+            // write gate's arm P asserts that this moves the cumulative continuity error off OpenFOAM's.
+            if (correctPhiDivOut && std::getenv("BRAE_CONTROL_NO_CORRECTPHI_CONTERR") == nullptr)
+            {
+                *correctPhiDivOut = fvc::div(f.phi, m, g, patches);
+            }
             // fvc::makeRelative(phi, U)
             makeRelativeFlux(f.phi, meshPhiU);
             pushFluxToPatches(f, patches);
@@ -904,9 +912,14 @@ RunReport runInterFoam(
                     // interFoam.C:112-149, one copy shared with the device loop: see interMeshUpdate.
                     if (!refineAndMove)
                     {
+                        std::vector<scalar> cpDiv;
                         interMeshUpdate(dyn, f, m, g, patches, mutableMesh, amiPairs, gamgCache, cpc,
                                         rep, rep.time, rep.steps, outerOfStep, lc.nOuterCorrectors,
-                                        cnDdt ? &cnClock : nullptr);
+                                        cnDdt ? &cnClock : nullptr, writer ? &cpDiv : nullptr);
+                        if (writer && !cpDiv.empty())
+                        {
+                            writer->addContinuityError(rep.deltaT, cpDiv, g.V());
+                        }
                     }
                     // ...and the ADAPTIVE mesh, which is the same line of interFoam.C for a different
                     // dynamicFvMesh: mesh.update() selects, refines, unrefines and maps, and everything
@@ -1009,9 +1022,14 @@ RunReport runInterFoam(
                     // makeRelative and the mixture -- once, on the moved mesh
                     if (refineAndMove)
                     {
+                        std::vector<scalar> cpDiv;
                         interMeshUpdate(dyn, f, m, g, patches, mutableMesh, amiPairs, gamgCache, cpc,
                                         rep, rep.time, rep.steps, outerOfStep, lc.nOuterCorrectors,
-                                        cnDdt ? &cnClock : nullptr);
+                                        cnDdt ? &cnClock : nullptr, writer ? &cpDiv : nullptr);
+                        if (writer && !cpDiv.empty())
+                        {
+                            writer->addContinuityError(rep.deltaT, cpDiv, g.V());
+                        }
                     }
                     break;
                 }
@@ -1772,6 +1790,8 @@ RunReport runInterFoam(
                         ws.Uf = &f.Uf;
                         ws.meshPhi = f.dynamicMesh ? &f.dynamicMesh->meshPhi() : nullptr;
                         ws.points = &m.points();
+                        ws.displacement = f.dynamicMesh ? f.dynamicMesh->displacement() : nullptr;
+                        ws.rAU = &f.rAU;
                         writer->write(ws);
                     }
                     break;

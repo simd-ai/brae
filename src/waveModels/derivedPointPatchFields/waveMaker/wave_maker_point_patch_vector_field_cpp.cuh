@@ -50,6 +50,23 @@ public:
         return hadValue_;
     }
 
+    // what waveMakerPointPatchVectorField::write echoes (:449-464): the members as they stand -- waveAngle
+    // in RADIANS (converted at construction, :209) and the solitary branch's wavePeriod as it rewrote it
+    const char* motionTypeName() const
+    {
+        return motionType_ == MotionType::piston ? "piston"
+             : motionType_ == MotionType::flap   ? "flap" : "solitary";
+    }
+    const vector& n() const { return n_; }
+    scalar initialDepth() const { return initialDepth_; }
+    scalar wavePeriod() const { return wavePeriod_; }
+    scalar waveHeight() const { return waveHeight_; }
+    scalar waveAngle() const { return waveAngle_; }
+    scalar startTime() const { return startTime_; }
+    scalar rampTime() const { return rampTime_; }
+    bool secondOrder() const { return secondOrder_; }
+    label nPaddle() const { return nPaddle_; }
+
 private:
     enum class MotionType
     {
