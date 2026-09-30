@@ -230,6 +230,11 @@ struct WriteCadence
 {
     // writeControl adjustableRunTime -- the only mode that adjusts
     bool adjustable = false;
+    // writeControl runTime or adjustableRunTime: the modes whose write time is Time::writeTimeIndex_
+    // moving (Time.C:1115-1130). runTime moves it exactly as the adjustable mode does and only never
+    // trims deltaT, so advance() tracks it for a writer to read while adjustDeltaT keeps keying on
+    // `adjustable` alone.
+    bool runTimeIndexed = false;
     scalar writeInterval = 0;
     // Time::writeTimeIndex_, which advance() below moves
     label writeTimeIndex = 0;
@@ -244,7 +249,13 @@ struct WriteCadence
         // adjustDeltaT a no-op exactly as it is in OpenFOAM.
         const std::string wc = controlDict.wordOr("writeControl", "timeStep");
         w.adjustable = (wc == "adjustable" || wc == "adjustableRunTime");
+        w.runTimeIndexed = w.adjustable || wc == "runTime";
         w.writeInterval = controlDict.scalarOr("writeInterval", scalar(0));
+        if (w.runTimeIndexed && !(w.writeInterval > scalar(0)))
+        {
+            // runTime's index divides by it as the adjustable mode's does, below
+            w.runTimeIndexed = w.adjustable;
+        }
         if (w.adjustable && !(w.writeInterval > scalar(0)))
             throw std::runtime_error(
                 "brae: controlDict says `writeControl adjustableRunTime` but gives no positive "
@@ -253,18 +264,21 @@ struct WriteCadence
     }
 
     // Time::operator++ (Time.C:1046-1074), and the two details there both matter: the time is the one
-    // AFTER the step, the deltaT is the one that took it, and the index only ever moves FORWARD.
-    void advance(
+    // AFTER the step, the deltaT is the one that took it, and the index only ever moves FORWARD. Returns
+    // whether it moved, which under runTime and adjustableRunTime IS Time::writeTime_ (Time.C:1115-1130).
+    bool advance(
         scalar tSinceStart,
         scalar deltaT)
     {
-        if (!adjustable) return;
+        if (!runTimeIndexed) return false;
         const label wi =
             static_cast<label>((tSinceStart + scalar(0.5)*deltaT)/writeInterval);
         if (wi > writeTimeIndex)
         {
             writeTimeIndex = wi;
+            return true;
         }
+        return false;
     }
 };
 

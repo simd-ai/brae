@@ -182,6 +182,11 @@ struct DeviceInterAlphaControls
     const DeviceBuffer<scalar>* alphaPhiOldBnd = nullptr;
     DeviceBuffer<scalar>* alphaPhiOutInt = nullptr;
     DeviceBuffer<scalar>* alphaPhiOutBnd = nullptr;
+    // ...and on a WRITE step, on either branch, the flux each sub-step ends with -- the last one is
+    // alphaPhi10 as OpenFOAM writes it (DeviceInterStepControls::alphaPhiWrite*). Null copies nothing.
+    DeviceBuffer<scalar>* alphaPhiWriteInt = nullptr;
+    DeviceBuffer<scalar>* alphaPhiWriteBnd = nullptr;
+    DeviceBuffer<scalar>* alphaPhiWriteIf  = nullptr;
     // ...and, when the old level is created by this call, the copy it was created as (the flux BEFORE
     // the un-blend), which every later pass of the same time step reads
     DeviceBuffer<scalar>* alphaPhiCreatedInt = nullptr;

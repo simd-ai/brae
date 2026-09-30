@@ -76,6 +76,11 @@ struct DeviceInterStepHooks
     DeviceInterAlphaHooks    alpha;      // alpha's patch values + contact angle, and fvm::div's coeffs
     DeviceInterPressureHooks pressure;   // p_rgh's laplacian boundary coefficients, after constrainPressure
 
+    // After EACH pressure corrector, with the flux it left: continuityErrs.H, which pEqn.H includes
+    // there. Only a writer reads what it accumulates (uniform/cumulativeContErr). Null does nothing.
+    std::function<void(const DeviceBuffer<scalar>& phiInt,
+                       const DeviceBuffer<scalar>& phiBnd)> correctorDone;
+
     // U's boundary, rebuilt from whatever the device last wrote. It is refreshed once per step rather
     // than per corrector because interFoam's PIMPLE loop evaluates it there.
     // `UbStored` are U's EVALUATED patch values, one buffer per component, as the host's evaluate
@@ -253,6 +258,12 @@ struct DeviceInterStepControls
 {
     // CrankNicolson, or null for Euler -- see DeviceInterCrankNicolson
     DeviceInterCrankNicolson* cn = nullptr;
+    // OUT, on a write step only: the alpha flux the step's last alpha solve leaves (alphaEqn.H's
+    // alphaPhi10, after the CrankNicolson un-blend), which OpenFOAM writes as alphaPhi0.<phase1>.
+    // Internal faces, the uncoupled boundary faces, and a periodic pair's faces. Null copies nothing.
+    DeviceBuffer<scalar>* alphaPhiWriteInt = nullptr;
+    DeviceBuffer<scalar>* alphaPhiWriteBnd = nullptr;
+    DeviceBuffer<scalar>* alphaPhiWriteIf  = nullptr;
     // LOCALEULER: the per-cell rDeltaT fvm::ddt(rho, U) reads (MomentumAssemblyInput::ddtRDeltaT). Null ==
     // the scalar step. Separate from alphaInput's so a gate can switch one consumer off at a time.
     const DeviceBuffer<scalar>* rDeltaTUEqn = nullptr;

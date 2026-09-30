@@ -374,7 +374,17 @@ void deviceInterAlphaStep(
             if (ctl.alphaPhiOutInt) deviceCopy(*ctl.alphaPhiOutInt, alphaPhiInt);
             if (ctl.alphaPhiOutBnd) deviceCopy(*ctl.alphaPhiOutBnd, alphaPhiBnd);
             if (pair && ctl.alphaPhiOutIf) deviceCopy(*ctl.alphaPhiOutIf, *li.alphaPhiIf);
+            if (ctl.alphaPhiWriteInt) deviceCopy(*ctl.alphaPhiWriteInt, alphaPhiInt);
+            if (ctl.alphaPhiWriteBnd) deviceCopy(*ctl.alphaPhiWriteBnd, alphaPhiBnd);
+            if (pair && ctl.alphaPhiWriteIf) deviceCopy(*ctl.alphaPhiWriteIf, *li.alphaPhiIf);
             return;
+        }
+        // the Euler branch's alphaPhi10 as the sub-step leaves it, for a write (copies only)
+        if (ctl.alphaPhiWriteInt) deviceCopy(*ctl.alphaPhiWriteInt, alphaPhiInt);
+        if (ctl.alphaPhiWriteBnd) deviceCopy(*ctl.alphaPhiWriteBnd, alphaPhiBnd);
+        if (li.alphaPhiIf && li.cyc && li.cyc->n > 0 && ctl.alphaPhiWriteIf)
+        {
+            deviceCopy(*ctl.alphaPhiWriteIf, *li.alphaPhiIf);
         }
         // rhoPhi = alphaPhi10*(rho1 - rho2) + phiCN*rho2, alphaEqn.H:248 -- built once per SUB-STEP,
         // from the flux the last corrector left. The sub-cycle then time-weights these.

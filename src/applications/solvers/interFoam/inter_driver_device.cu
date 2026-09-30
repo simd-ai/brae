@@ -151,9 +151,14 @@ RunReport runInterFoamDevice(
     InterFields* fieldsOut,
     scalar endTime,
     DeviceInterStepTaps* tapsOut,
-    const MutableMesh* mutableMesh)
+    const MutableMesh* mutableMesh,
+    InterWriter* writer)
 {
     InterFields f = buildInterFields(caseDir, startDir, m, g, fvp);
+    if (writer)
+    {
+        registerUnwritten(*writer, f);
+    }
     // LOCAL TIME STEPPING. setRDeltaT.H runs on the HOST (inter_set_rdeltat_cpp: the smoothing is a
     // FaceCellWave) from this loop's fields, and each consumer -- the alpha pre-solve and CMULES,
     // fvm::ddt(rho, U), ddtCorr, kOmegaSST's two fvm::ddts -- reads the uploaded field. The gate's control
@@ -632,6 +637,15 @@ RunReport runInterFoamDevice(
         cin.solveLog = &initPcorrSolves;
         correctPhi(f.U, f.phi, f.p_rgh, cin, cpc, m, g, fvp);
         pushFluxToPatches(f, fvp);
+        // ...and continuityErrs.H after it, in both of initCorrectPhi.H's branches (correctPhi.H:11 and
+        // initCorrectPhi.H:31): the cumulative error OpenFOAM writes starts with this term, at the
+        // deltaT runTime holds before setInitialDeltaT. Without it RAS/waterChannel's 0.3 wrote
+        // -0.0023482777840429 where OpenFOAM writes -0.0023482774955524, 2.885e-10 apart -- exactly
+        // this line's `global` in OpenFOAM's log.
+        if (writer)
+        {
+            writer->addContinuityError(f.deltaT, fvc::div(f.phi, m, g, fvp), g.V());
+        }
         // (a pcorr GAMG with a different nCellsInCoarsestLevel from p_rgh's was refused here while
         // the device built a hierarchy of its own. It shares the run's now, so the first solve's
         // entry decides it and the second entry's number is never read -- which is what OpenFOAM
@@ -2034,6 +2048,31 @@ RunReport runInterFoamDevice(
     // start (Time.C:1150), so they take rep.time - startTime, exactly rep.time when the start is 0.
     const scalar startTime = startTimeOf(startDir);
     rep.time = startTime;
+    // Time::writeTime_ for the step being taken, decided at its start (as ++runTime is), and the alpha flux
+    // its last alpha solve leaves, copied out on the device only on a write step
+    bool writeNow = false;
+    DeviceBuffer<scalar> dAlphaPhiWriteI, dAlphaPhiWriteB, dAlphaPhiWriteIf;
+    // continuityErrs.H after every corrector, for uniform/cumulativeContErr -- one reduction and one
+    // scalar read-back per corrector, and none at all without a writer. A periodic pair's faces are not
+    // in deviceDiv's sum; they cancel in the volume-weighted total up to rounding.
+    scalar sumV = 0;
+    for (scalar v : g.V())
+    {
+        sumV += v;
+    }
+    if (writer)
+    {
+        H.correctorDone = [&](const DeviceBuffer<scalar>& phiInt,
+                              const DeviceBuffer<scalar>& phiBnd)
+        {
+            DeviceBuffer<scalar> divPhi;
+            deviceDiv(dm, phiInt, phiBnd, divPhi);
+            std::vector<scalar> dv;
+            divPhi.copyTo(dv);
+            writer->addContinuityError(rep.deltaT, dv, g.V());
+        };
+    }
+
     for (label s = 0; s < nSteps; ++s)
     {
         if (!(rep.time < endTime - scalar(0.5)*rep.deltaT)) break;   // Time::run(), Time.C:1000
@@ -2339,6 +2378,20 @@ RunReport runInterFoamDevice(
         stepTime = rep.time + rep.deltaT;
         acmiRescaledThisStep = false;   // once per TIME STEP, not per outer corrector
         stepIndex = s + 1;
+        // Time::operator++ moves writeTimeIndex_ with the step's time and deltaT, BEFORE the step -- what
+        // the next adjustDeltaT measures from, and under runTime/adjustableRunTime the write flag
+        {
+            const bool indexMoved = f.writeCadence.advance(stepTime - startTime, rep.deltaT);
+            writeNow = false;
+            if (writer)
+            {
+                writer->stepTaken(rep.deltaT);
+                writeNow = writer->isWriteTime(writer->startTimeIndex() + stepIndex, indexMoved);
+            }
+            C.alphaPhiWriteInt = writeNow ? &dAlphaPhiWriteI : nullptr;
+            C.alphaPhiWriteBnd = writeNow ? &dAlphaPhiWriteB : nullptr;
+            C.alphaPhiWriteIf  = writeNow ? &dAlphaPhiWriteIf : nullptr;
+        }
 
         // rho.oldTime() for the closure's ddt: f.rho still holds what the LAST step's hook left, and
         // dRho what the last step wrote -- nothing yet at the first, where the host's is the field
@@ -3347,7 +3400,100 @@ RunReport runInterFoamDevice(
 
         rep.steps = s + 1;
         rep.time += rep.deltaT;
-        f.writeCadence.advance(rep.time - startTime, rep.deltaT);   // Time::operator++, Time.C:1046-1074
+
+        // runTime.write() (interFoam.C:175): the cells from the device into writer-owned copies, the patch
+        // values as the hooks left them on the host -- nothing evaluated, nothing written back into f
+        if (writer && writeNow)
+        {
+            std::vector<scalar> aW, prghW, pW, ux, uy, uz;
+            dA.copyTo(aW);
+            dPrgh.copyTo(prghW);
+            dP.copyTo(pW);
+            dUx.copyTo(ux);
+            dUy.copyTo(uy);
+            dUz.copyTo(uz);
+            std::vector<vector> uW(static_cast<std::size_t>(nC));
+            for (label c = 0; c < nC; ++c)
+            {
+                uW[c] = vector{ux[c], uy[c], uz[c]};
+            }
+            SurfaceScalarField phiW;
+            dPhiI.copyTo(phiW.internal);
+            phiW.boundary = f.phi.boundary;
+            SurfaceScalarField aPhiW;
+            dAlphaPhiWriteI.copyTo(aPhiW.internal);
+            aPhiW.boundary.assign(fvp.size(), std::vector<scalar>());
+            unflatten(dAlphaPhiWriteB, aPhiW.boundary);
+            if (!cyclics.empty() && dAlphaPhiWriteIf.size())
+            {
+                std::vector<scalar> pif;
+                dAlphaPhiWriteIf.copyTo(pif);
+                std::size_t off = 0;
+                for (const CyclicInterface& c : cyclics)
+                {
+                    const std::size_t pi = static_cast<std::size_t>(c.patch);
+                    const std::size_t n = c.faceCells.size();
+                    if (pi < aPhiW.boundary.size() && off + n <= pif.size())
+                    {
+                        aPhiW.boundary[pi].assign(pif.begin() + off, pif.begin() + off + n);
+                    }
+                    off += n;
+                }
+            }
+            if (deviceClosure)
+            {
+                downloadDeviceInterTurbulence(dTurb, f.turbulence, fvp);
+                // ...whose evaluateBoundary blends a flux-conditional patch with the HOST object's
+                // valueFraction, which this loop never switches: the device keeps the switch in
+                // dbK/dbEps (deviceUpdateInletOutlet). RAS/damBreak's atmosphere wrote the cells, epsilon
+                // 1.7 off OpenFOAM's `uniform` inletValue at 0.0012, and RAS/waterChannel's outlet omega
+                // 3.0e-01 off, where the host arm wrote OpenFOAM's values. Those faces take the device's
+                // own values -- what its last correctBoundaryConditions left, as OpenFOAM's are.
+                auto deviceFluxConditional = [&](
+                    const DeviceBoundary& db,
+                    const DeviceBuffer<scalar>& cells,
+                    GeometricField<scalar>& fld)
+                {
+                    DeviceBuffer<scalar> dv;
+                    deviceBCValue(db, cells, dv);
+                    std::vector<std::vector<scalar>> bv;
+                    unflatten(dv, bv);
+                    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                    {
+                        const int cat = fld.boundary[pi]->bcCategory();
+                        if (cat == 3 || cat == 4)
+                        {
+                            fld.boundary[pi]->setValue(bv[pi]);
+                        }
+                    }
+                };
+                deviceFluxConditional(dTurb.dbK, dTurb.k, f.turbulence.k);
+                if (f.turbulence.model != cpu::interFoam::InterRasModel::KEqnLES)
+                {
+                    GeometricField<scalar>& second = (f.turbulence.model == cpu::interFoam::InterRasModel::KOmegaSST)
+                        ? f.turbulence.omega
+                        : f.turbulence.epsilon;
+                    deviceFluxConditional(dTurb.dbEps, dTurb.epsilon, second);
+                }
+            }
+            const std::vector<std::vector<scalar>> pB = staticPressureBoundary(f.p_rgh, stepRhoBnd, f.ghfBoundary);
+            InterWriteState ws;
+            ws.time = rep.time;
+            ws.timeIndex = writer->startTimeIndex() + rep.steps;
+            ws.deltaT = rep.deltaT;
+            ws.alpha1 = &f.alpha1;
+            ws.U = &f.U;
+            ws.p_rgh = &f.p_rgh;
+            ws.p = &pW;
+            ws.pBoundary = &pB;
+            ws.phi = &phiW;
+            ws.alphaPhi0 = &aPhiW;
+            ws.turbulence = &f.turbulence;
+            ws.alpha1Cells = &aW;
+            ws.UCells = &uW;
+            ws.p_rghCells = &prghW;
+            writer->write(ws);
+        }
 
         if (verbose)
         {

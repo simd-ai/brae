@@ -166,6 +166,9 @@ void deviceInterStep(
     actl.nHatfIf      = ctl.nHatfIf;
     actl.preSolveAlphaOut      = taps ? &taps->preSolveAlpha : nullptr;
     actl.preSolveAlphaPhiIfOut = taps ? &taps->preSolveAlphaPhiIf : nullptr;
+    actl.alphaPhiWriteInt = ctl.alphaPhiWriteInt;
+    actl.alphaPhiWriteBnd = ctl.alphaPhiWriteBnd;
+    actl.alphaPhiWriteIf  = ctl.alphaPhiWriteIf;
     if (ctl.cn)
     {
         // alphaEqn.H:236-262: ddt(rho,U) is not Euler, so rhoPhi takes phi beside rho2 and the
@@ -794,6 +797,10 @@ void deviceInterStep(
         deviceUpdatePressureInletOutletVelocity(dbU, namedUFlux(phiBnd), UX, UY, UZ, /*directionMixed=*/true);
         deviceUpdateSymmetry(dbU, UX, UY, UZ);
         deviceUpdateWedge(dbU, UX, UY, UZ);
+        if (hooks.correctorDone)
+        {
+            hooks.correctorDone(phiInt, phiBnd);
+        }
     }
     probe("p_rgh", p_rgh);
     probe("phi", phiInt);

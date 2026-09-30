@@ -33,6 +33,7 @@
 #include "inter_correct_phi_cpp.cuh"   // CorrectPhiControls, which interMeshUpdate takes
 #include "inter_peqn_cpp.cuh"
 #include "device_inter_step.cuh"
+#include "inter_writer_cpp.cuh"
 #include <string>
 
 namespace brae {
@@ -175,7 +176,10 @@ RunReport runInterFoam(
     // see MutableMesh: required by a case whose mesh moves, ignored by one whose mesh does not
     const MutableMesh* mutableMesh = nullptr,
     // the alpha step's own intermediates, for a gate bisecting its pre-solve against its corrector
-    AlphaTaps* alphaTaps = nullptr);
+    AlphaTaps* alphaTaps = nullptr,
+    // the time directories, written at OpenFOAM's write times (inter_writer_cpp.cuh); null writes
+    // nothing, which is what every gate comparing fields in memory wants
+    InterWriter* writer = nullptr);
 
 // ...and the SAME run on the GPU. Every operator, every corrector and every loop is the device code
 // gated in tests/test_device_inter_dambreak_alpha.cu, which tracks this host driver on damBreak's own
@@ -207,7 +211,9 @@ RunReport runInterFoamDevice(
     // moves it through the HOST motion solver (the move is a host operation either way) and then
     // refreshes the geometric buffers it uploaded. Null is a static mesh, and a moving case without it
     // is refused rather than run on the mesh as it started.
-    const MutableMesh* mutableMesh = nullptr);
+    const MutableMesh* mutableMesh = nullptr,
+    // the time directories, as runInterFoam writes them
+    InterWriter* writer = nullptr);
 
 } // namespace interFoam
 } // namespace cpu

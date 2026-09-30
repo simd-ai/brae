@@ -397,9 +397,14 @@ RunReport runInterFoam(
     scalar endTime,
     PressureTaps* pressureTaps,
     const MutableMesh* mutableMesh,
-    AlphaTaps* alphaTaps)
+    AlphaTaps* alphaTaps,
+    InterWriter* writer)
 {
     InterFields f = buildInterFields(caseDir, startDir, m, g, patches);
+    if (writer)
+    {
+        registerUnwritten(*writer, f);
+    }
     // THE CELL COUNT IS READ LIVE, NOT CAPTURED. `m` is the caller's mutable mesh, which an adaptive step
     // REPLACES in place -- so a cached count makes every per-cell reduction after a refinement run over
     // the pre-refinement cells only. MEASURED from OpenFOAM's own written phi on this case: the Courant
@@ -610,6 +615,15 @@ RunReport runInterFoam(
         cin.solveLog = &rep.pcorrSolves;
         correctPhi(f.U, f.phi, f.p_rgh, cin, cpc, m, g, patches);
         pushFluxToPatches(f, patches);
+        // ...and continuityErrs.H after it, in both of initCorrectPhi.H's branches (correctPhi.H:11 and
+        // initCorrectPhi.H:31): the cumulative error OpenFOAM writes starts with this term, at the
+        // deltaT runTime holds before setInitialDeltaT. Without it RAS/waterChannel's 0.3 wrote
+        // -0.0023482777840429 where OpenFOAM writes -0.0023482774955524, 2.885e-10 apart -- exactly
+        // this line's `global` in OpenFOAM's log.
+        if (writer)
+        {
+            writer->addContinuityError(f.deltaT, fvc::div(f.phi, m, g, patches), g.V());
+        }
     }
 
     // which outer corrector of the step this is, for the mesh update interFoam.C:118 makes on the
@@ -759,6 +773,12 @@ RunReport runInterFoam(
         return ltsScalarControl.count(consumer) ? &rDeltaTGlobal : &f.rDeltaT;
     };
 
+    // Time::writeTime_ for the step being taken (Time.C:1103-1130), decided when the time advances, and the
+    // alpha flux the step's LAST alpha solve leaves, kept only on a write step: OpenFOAM writes
+    // alphaPhi0.<phase1> from alphaPhi10 (createAlphaFluxes.H), which that solve overwrites
+    bool writeNow = false;
+    SurfaceScalarField alphaPhi10Write;
+
     for (label step = 0; step < nSteps; ++step)
     {
         // Time::run() (Time.C:1000), and it sits HERE -- above CourantNo.H and setDeltaT.H -- so the
@@ -846,8 +866,17 @@ RunReport runInterFoam(
                     acmiRescaledThisStep = false;
                     outerOfStep = -1;
                     // Time::operator++ moves writeTimeIndex_ AFTER the time, with the step that took
-                    // it -- which is what the next adjustDeltaT measures the distance to.
-                    f.writeCadence.advance(rep.time - startTime, rep.deltaT);
+                    // it -- which is what the next adjustDeltaT measures the distance to -- and whether it
+                    // moved is the write time under runTime/adjustableRunTime
+                    {
+                        const bool indexMoved = f.writeCadence.advance(rep.time - startTime, rep.deltaT);
+                        writeNow = false;
+                        if (writer)
+                        {
+                            writer->stepTaken(rep.deltaT);
+                            writeNow = writer->isWriteTime(writer->startTimeIndex() + rep.steps, indexMoved);
+                        }
+                    }
                     break;
 
                 case Stage::meshUpdate:
@@ -1134,6 +1163,12 @@ RunReport runInterFoam(
                             }
                             massFlux(aPhi, f.phi, f.mixture.phases.rho1, f.mixture.phases.rho2, rPhi);
                             alphaPhi10End = aPhi;
+                        }
+                        // a copy, and only on a write step -- the last call of the step wins, as the last
+                        // assignment to alphaPhi10 does in OpenFOAM
+                        if (writeNow)
+                        {
+                            alphaPhi10Write = aPhi;
                         }
                         aNew = f.alpha1.internal;
                     };
@@ -1599,6 +1634,12 @@ RunReport runInterFoam(
                         pin.uPatchesUpdatedAtEntry = (c == 0) && !f.momentumPredictorOn;
                         pin.correctorIndex = c;
                         pressureCorrector(f.p_rgh, f.U, f.phi, f.p, pin, psc, m, g, patches);
+                        // continuityErrs.H, included by pEqn.H after every corrector: only the written
+                        // cumulativeContErr reads it, so it is formed only when there is a writer
+                        if (writer)
+                        {
+                            writer->addContinuityError(rep.deltaT, fvc::div(f.phi, m, g, patches), g.V());
+                        }
                     }
                     // `U = HbyA + ...; U.correctBoundaryConditions()` (pEqn.H) moved U's eventNo
                     f.gradUCache.valid = false;
@@ -1659,7 +1700,27 @@ RunReport runInterFoam(
                     }
                     break;
                 }
-                case Stage::write:            break;
+                case Stage::write:
+                    // runTime.write() (interFoam.C:175): the stored state, nothing re-evaluated
+                    if (writer && writeNow)
+                    {
+                        const std::vector<std::vector<scalar>> pB =
+                            staticPressureBoundary(f.p_rgh, f.rhoBnd, f.ghfBoundary);
+                        InterWriteState ws;
+                        ws.time = rep.time;
+                        ws.timeIndex = writer->startTimeIndex() + rep.steps;
+                        ws.deltaT = rep.deltaT;
+                        ws.alpha1 = &f.alpha1;
+                        ws.U = &f.U;
+                        ws.p_rgh = &f.p_rgh;
+                        ws.p = &f.p;
+                        ws.pBoundary = &pB;
+                        ws.phi = &f.phi;
+                        ws.alphaPhi0 = &alphaPhi10Write;
+                        ws.turbulence = &f.turbulence;
+                        writer->write(ws);
+                    }
+                    break;
             }
         };
 

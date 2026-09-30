@@ -186,6 +186,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <stdexcept>
 #include <string>
 
 int main(int argc, char** argv)
@@ -226,8 +227,13 @@ int main(int argc, char** argv)
         char startBuf[64];
         std::snprintf(startBuf, sizeof startBuf, "%g",
                       (double)controlDict.scalarOr("startTime", scalar(0)));
+        // the probe is the case's OWN phase field: `alpha.water` here sent a `startFrom latestTime` restart
+        // of any other phase name (hifoam's alpha.liquidN2) silently back to startTime, where the writer
+        // would then overwrite and purge the run's own output
+        const std::string phase1 = cpu::twoPhase::readTransportProperties(caseDir).phase1Name;
+        const std::string alphaProbe = "alpha." + phase1;
         const std::string startName =
-            resolveStartTime(caseDir, startFrom, startBuf, "alpha.water");
+            resolveStartTime(caseDir, startFrom, startBuf, alphaProbe.c_str());
         const scalar startTime = static_cast<scalar>(std::strtod(startName.c_str(), nullptr));
 
         // WHICH TIME DIRECTORY THE MESH COMES FROM, which is a search and not a path: a run that refined or
@@ -289,8 +295,15 @@ int main(int argc, char** argv)
         // only bound and the comment here claimed otherwise: damBreak at `endTime 0.004` ran its 40
         // steps out to t = 0.054, thirteen times past the end of the case. The 4x allows the step to
         // grow at setDeltaT's 1.2 cap for eight steps before endTime has to stop the loop.
+        // UNDER adjustTimeStep endTime is the only bound: a Courant-limited run whose step averages
+        // below deltaT/4 -- a filling case -- stopped at the old 4x count before endTime, printed `End:`
+        // and said nothing. The count stays the bound of a fixed-step case.
+        const bool adjustTimeStep = controlDict.wordOr("adjustTimeStep", "no") == "yes"
+                                 || controlDict.wordOr("adjustTimeStep", "no") == "on"
+                                 || controlDict.wordOr("adjustTimeStep", "no") == "true";
         const label nSteps = (deltaT0 > scalar(0))
-            ? static_cast<label>(scalar(4)*(endTime - startTime) / deltaT0 + scalar(0.5))
+            ? (adjustTimeStep ? label(2000000000)
+                              : static_cast<label>(scalar(4)*(endTime - startTime) / deltaT0 + scalar(0.5)))
             : label(0);
         if (nSteps < 1)
             throw std::runtime_error(
@@ -300,14 +313,25 @@ int main(int argc, char** argv)
         std::printf("brae interFoam (OF-mirror): %ld cells, start %s, endTime %g\n",
                     (long)m.nCells(), startName.c_str(), (double)endTime);
 
+        // the time directories, at OpenFOAM's write times (inter_writer_cpp.cuh)
+        cpu::interFoam::InterWriter writer(caseDir, startDir, patches, phase1);
+
         // ONE case translation and ONE time loop per path, both the ones the gates call. A private
         // copy here would be the defect this file's header names.
         const RunReport r = onDevice
             ? runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/true,
-                                 /*fieldsOut=*/nullptr, endTime, /*tapsOut=*/nullptr, &mutableMesh)
+                                 /*fieldsOut=*/nullptr, endTime, /*tapsOut=*/nullptr, &mutableMesh, &writer)
             : runInterFoam(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/true,
-                           /*fieldsOut=*/nullptr, endTime, /*pressureTaps=*/nullptr, &mutableMesh);
+                           /*fieldsOut=*/nullptr, endTime, /*pressureTaps=*/nullptr, &mutableMesh,
+                           /*alphaTaps=*/nullptr, &writer);
 
+        if (r.steps >= nSteps && r.time < endTime - scalar(0.5)*r.deltaT)
+        {
+            throw std::runtime_error(
+                "brae interFoam: stopped after " + std::to_string((long)r.steps) + " steps at t = "
+                + std::to_string((double)r.time) + ", short of endTime " + std::to_string((double)endTime)
+                + " -- the fixed-step count ran out before the clock did.");
+        }
         std::printf("End: t = %.6g, alpha in [%.3e, %.8f], max|U| %.4g m/s, worst |div(phi)| %.3e\n",
                     (double)r.time, (double)r.alphaMin, (double)r.alphaMax,
                     (double)r.maxU, (double)r.worstDivPhi);
