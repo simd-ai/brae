@@ -2,6 +2,7 @@
 #include "inter_writer_cpp.cuh"
 #include "inter_turbulence_cpp.cuh"
 #include "inter_case_cpp.cuh"
+#include "inter_amr_cpp.cuh"
 #include "foam_token_reader.cuh"
 #include "brae_notice.cuh"
 #include <zlib.h>
@@ -13,6 +14,7 @@
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 
 namespace brae {
 namespace cpu {
@@ -225,6 +227,109 @@ bool uniformVector(
     return true;
 }
 
+// a plain `(x y z)` -- a point read by lookup, as rotatingWallVelocity's origin and axis are -- through
+// uniformVector's joining of however the tokenizer split it
+bool plainVector(
+    const std::vector<std::string>& toks,
+    vector& out)
+{
+    std::vector<std::string> u{"uniform"};
+    u.insert(
+        u.end(),
+        toks.begin(),
+        toks.end());
+    return uniformVector(
+        u,
+        out);
+}
+
+// A constant Function1 or PatchFunction1 as the template spells it: `constant v`, a bare v, and for a
+// PatchFunction1 also `uniform v` (Function1New.C:83-98, PatchFunction1New.C:73-96). False for any other
+// form -- a table, a coded function, a sub-dictionary -- which is refused, not echoed.
+bool constantFunction1(
+    const std::vector<std::string>& toks,
+    bool allowUniform,
+    scalar& out)
+{
+    std::size_t first = 0;
+    if (!toks.empty() && (toks[0] == "constant" || (allowUniform && toks[0] == "uniform")))
+    {
+        first = 1;
+    }
+    if (toks.size() != first + 1)
+    {
+        return false;
+    }
+    char* end = nullptr;
+    out = static_cast<scalar>(std::strtod(toks[first].c_str(), &end));
+    return end && end != toks[first].c_str() && *end == '\0';
+}
+
+bool constantFunction1(
+    const std::vector<std::string>& toks,
+    bool allowUniform,
+    vector& out)
+{
+    std::size_t first = 0;
+    if (!toks.empty() && (toks[0] == "constant" || (allowUniform && toks[0] == "uniform")))
+    {
+        first = 1;
+    }
+    std::vector<std::string> asUniform{"uniform"};
+    asUniform.insert(
+        asUniform.end(),
+        toks.begin() + static_cast<std::ptrdiff_t>(first),
+        toks.end());
+    return uniformVector(
+        asUniform,
+        out);
+}
+
+// PatchFunction1::writeData (PatchFunction1.C:180-187) writes coordinateScaling's entries first, read from
+// the dictionary the function was built from -- the patch dictionary, or `<key>Coeffs` for the `constant`
+// word form (PatchFunction1New.C:138-145, coordinateScaling.C:40-62). brae neither applies nor writes it.
+bool hasCoordinateScaling(
+    const FoamDict& d,
+    const std::string& k)
+{
+    if (d.subDict(k + "Coeffs"))
+    {
+        return true;
+    }
+    for (const char* s : {"coordinateSystem", "scale1", "scale2", "scale3"})
+    {
+        if (d.find(s) || d.subDict(s))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+// OpenFOAM's Switch as a bool entry is read (Switch.C:233-236): its words, and a label 0/1 -- which is how
+// a bool is WRITTEN (bool.C:60-66). -1 for anything else.
+int ofSwitchToken(const std::string& w);
+
+// `useImplicit` as fvPatchFieldBase::readDict reads it (readIfPresent<bool>, fvPatchFieldBase.C:109): any
+// Switch spelling, `1` and `any` included. An unreadable one counts as set -- OpenFOAM would stop on it.
+bool setsUseImplicit(const FoamDict& pd)
+{
+    return pd.find("useImplicit") && ofSwitchToken(leafWord(pd, "useImplicit", "false")) != 0;
+}
+
+int ofSwitchToken(const std::string& w)
+{
+    if (w == "true" || w == "on" || w == "yes" || w == "y" || w == "t" || w == "1" || w == "any")
+    {
+        return 1;
+    }
+    if (w == "false" || w == "off" || w == "no" || w == "n" || w == "f" || w == "0" || w == "none")
+    {
+        return 0;
+    }
+    return -1;
+}
+
 // The patch's entry in the template's boundaryField, matched as the reader and writeVolField match it:
 // the exact name first, then a group or a regex, the LAST matching entry winning.
 const FoamDict* patchDict(
@@ -289,6 +394,51 @@ const FoamDict* patchDict(
           "transcribed (inter_writer_cpp.cu).");
 }
 
+// `<key> constant <value>;` -- Function1::writeData then Constant::writeData (Function1.C:163-166,
+// Constant.C:116-122), or ConstantField::writeData for a PatchFunction1 (ConstantField.C:314-329): the
+// `constant` word whichever of the accepted forms the file used.
+template <typename T>
+void constantFunction1Entry(
+    std::ostringstream& os,
+    const std::string& field,
+    const FvPatch& p,
+    const FoamDict& pd,
+    const std::string& key,
+    bool allowUniform,
+    int precision)
+{
+    const std::vector<std::string>* toks = leaf(pd, key);
+    T c{};
+    if (!toks || !constantFunction1(*toks, allowUniform, c))
+    {
+        refuseWrite(field, p, "`" + key + "` is not a constant Function1; only `constant <value>` is written");
+    }
+    keyword(os, 8, key);
+    os << "constant " << fmt(c, precision) << ";\n";
+}
+
+// fvPatchField::write (fvPatchField.C:379-391) for a condition whose dictionary constructor runs
+// fvPatchFieldBase::readDict (fvPatchFieldBase.C:106-110): the type, then `patchType` when the file set one.
+// `useImplicit` would follow; brae does not honour it, so it is refused.
+void baseEntries(
+    std::ostringstream& os,
+    const std::string& field,
+    const FvPatch& p,
+    const FoamDict& pd,
+    const std::string& type)
+{
+    if (setsUseImplicit(pd))
+    {
+        refuseWrite(field, p, "it sets `useImplicit`, which brae does not honour");
+    }
+    wordEntry(os, 8, "type", type);
+    const std::string patchType = leafWord(pd, "patchType", "");
+    if (!patchType.empty())
+    {
+        wordEntry(os, 8, "patchType", patchType);
+    }
+}
+
 // wallFunctionBlenders::writeEntries (wallFunctionBlenders.C:88-96): the blending word always, `n` for
 // binomial only. Both defaults belong to the condition, not to the blender (the constructors at
 // epsilonWallFunctionFvPatchScalarField.C:413 STEPWISE/2, omegaWallFunctionFvPatchScalarField.C:405
@@ -342,6 +492,8 @@ void volPatch(
     const FoamDict* pd,
     const fvPatchField<T>& bc,
     const std::vector<T>* derived,
+    const std::vector<T>* stored,
+    const std::vector<T>* storedGradient,
     int precision)
 {
     os << "    " << p.name << "\n    {\n";
@@ -354,7 +506,19 @@ void volPatch(
     {
         refuseWrite(field, p, "the start directory's field file has no entry for this patch");
     }
-    const std::vector<T>& value = derived ? *derived : bc.value();
+    // `stored`: an OLD-TIME level's values through this patch's own type -- the level is a copy of the
+    // field, conditions and all (GeometricField.C:960-972), so only the values differ
+    const std::vector<T>& value = derived ? *derived : (stored ? *stored : bc.value());
+    // fvPatchField::write emits `patchType` and `useImplicit` for every condition whose dictionary
+    // constructor runs fvPatchFieldBase::readDict (fvPatchField.C:383-390). The branches below that carry
+    // them say so; everywhere else a file that sets one is refused rather than written without it.
+    const bool writesPatchType = type == "slip" || type == "turbulentIntensityKineticEnergyInlet"
+                              || type == "cyclicACMI" || type == "porousBafflePressure"
+                              || type == "permeableAlphaPressureInletOutletVelocity";
+    if (pd && !derived && !writesPatchType && (leaf(*pd, "patchType") || setsUseImplicit(*pd)))
+    {
+        refuseWrite(field, p, "it sets `patchType` or `useImplicit`, which this condition's branch does not write");
+    }
 
     // fvPatchField::write (fvPatchField.C:379-391) and the overrides that add nothing: the type alone.
     // wedge/symmetryPlane/symmetry/zeroGradient have no write() of their own; empty and noSlip and cyclic
@@ -366,8 +530,10 @@ void volPatch(
         wordEntry(os, 8, "type", type);
     }
     // calculatedFvPatchField.C:212-216, fixedValueFvPatchField.C:154-158, kqRWallFunctionFvPatchField.C:
-    // 103-107 (zeroGradient's write, then the value)
-    else if (type == "calculated" || type == "fixedValue" || type == "kqRWallFunction")
+    // 103-107 (zeroGradient's write, then the value), movingWallVelocityFvPatchVectorField.C:150-154 (the
+    // base's write and the value -- the Uwall its updateCoeffs assigned, :128-146)
+    else if (type == "calculated" || type == "fixedValue" || type == "kqRWallFunction"
+          || type == "movingWallVelocity")
     {
         wordEntry(os, 8, "type", type);
         listEntry(os, 8, "value", value, precision);
@@ -567,6 +733,428 @@ void volPatch(
             precision);
         listEntry(os, 8, "value", value, precision);
     }
+    // slip and its bases basicSymmetry and transform declare no write() (slipFvPatchField.H,
+    // basicSymmetryFvPatchField.H, transformFvPatchField.H) for any Type: the base's, no value
+    else if (type == "slip")
+    {
+        baseEntries(
+            os,
+            field,
+            p,
+            *pd,
+            type);
+    }
+    // constantAlphaContactAngleFvPatchScalarField.C:113-121 over alphaContactAngleTwoPhaseFvPatchScalarField.C:
+    // 154-161 over fixedGradientFvPatchField.C:237-241: type, gradient, limit, theta0, value. No
+    // patchType: the dictionary constructor bypasses fixedGradient's (alphaContactAngleTwoPhase...C:70). The
+    // gradient is the one correctContactAngle last set; an OLD-TIME level carries the one copied when the
+    // level was created (GeometricField.C:949), later assignments being values only (fvPatchField.C:552-558).
+    else if (type == "constantAlphaContactAngle")
+    {
+        const std::vector<T>* grad = stored ? storedGradient : bc.refGradPtr();
+        if (!grad || grad->size() != value.size())
+        {
+            refuseWrite(field, p, stored ? "the old-time level's contact-angle gradient was not captured"
+                                         : "the contact-angle patch object carries no gradient");
+        }
+        // alphaContactAngleTwoPhaseFvPatchScalarField.C:71: `limit` is mandatory
+        const std::string limit = leafWord(*pd, "limit", "");
+        if (limit != "none" && limit != "gradient" && limit != "zeroGradient" && limit != "alpha")
+        {
+            refuseWrite(field, p, "`limit` is missing or not one of none/gradient/zeroGradient/alpha");
+        }
+        // constantAlphaContactAngleFvPatchScalarField.C:57 reads it with get<scalar>
+        scalar theta0 = 0;
+        if (!leafScalar(*pd, "theta0", theta0))
+        {
+            refuseWrite(field, p, "`theta0` is missing or not a plain number");
+        }
+        wordEntry(os, 8, "type", type);
+        listEntry(os, 8, "gradient", *grad, precision);
+        wordEntry(os, 8, "limit", limit);
+        scalarEntry(os, 8, "theta0", theta0, precision);
+        listEntry(os, 8, "value", value, precision);
+    }
+    // variableHeightFlowRateFvPatchField.C:169-176: fvPatchField's write (the type), [phi], lowerBound,
+    // upperBound, value -- not mixed's, so no refValue or valueFraction. Both bounds are read without a
+    // default (.C:81-82) and never changed.
+    else if (type == "variableHeightFlowRate")
+    {
+        scalar lowerBound = 0;
+        scalar upperBound = 0;
+        if (!leafScalar(*pd, "lowerBound", lowerBound) || !leafScalar(*pd, "upperBound", upperBound))
+        {
+            refuseWrite(field, p, "`lowerBound` or `upperBound` is not a plain number");
+        }
+        wordEntry(os, 8, "type", type);
+        const std::string phiName = leafWord(*pd, "phi", "phi");
+        if (phiName != "phi")
+        {
+            wordEntry(os, 8, "phi", phiName);
+        }
+        scalarEntry(os, 8, "lowerBound", lowerBound, precision);
+        scalarEntry(os, 8, "upperBound", upperBound, precision);
+        listEntry(os, 8, "value", value, precision);
+    }
+    // variableHeightFlowRateInletVelocityFvPatchVectorField.C:145-154: the type, the flow rate's Function1,
+    // alpha, then the value updateCoeffs last stored (.C:131-141)
+    else if (type == "variableHeightFlowRateInletVelocity")
+    {
+        const std::string alphaName = leafWord(*pd, "alpha", "");
+        if (alphaName.empty())
+        {
+            refuseWrite(field, p, "it names no `alpha`");
+        }
+        wordEntry(os, 8, "type", type);
+        constantFunction1Entry<scalar>(
+            os,
+            field,
+            p,
+            *pd,
+            "flowRate",
+            false,
+            precision);
+        wordEntry(os, 8, "alpha", alphaName);
+        listEntry(os, 8, "value", value, precision);
+    }
+    // turbulentIntensityKineticEnergyInletFvPatchScalarField.C:149-159: fvPatchField's write (the type,
+    // [patchType]; its constructor runs readDict at :79), intensity, [U], [phi], value -- NOT inletOutlet's,
+    // so no inletValue: the refValue is rebuilt from U at every updateCoeffs (:142)
+    else if (type == "turbulentIntensityKineticEnergyInlet")
+    {
+        scalar intensity = 0;
+        if (!leafScalar(*pd, "intensity", intensity) || intensity != bc.turbulentInletCoefficient())
+        {
+            refuseWrite(field, p, "`intensity` is missing, not a number, or not the one the patch ran with");
+        }
+        // brae's reader takes no `U` entry, so the solve read `U` whatever the file says
+        if (leafWord(*pd, "U", "U") != "U")
+        {
+            refuseWrite(field, p, "it names a U other than `U`, which brae does not honour");
+        }
+        baseEntries(
+            os,
+            field,
+            p,
+            *pd,
+            type);
+        scalarEntry(os, 8, "intensity", intensity, precision);
+        const std::string phiName = leafWord(*pd, "phi", "phi");
+        if (phiName != "phi")
+        {
+            wordEntry(os, 8, "phi", phiName);
+        }
+        listEntry(os, 8, "value", value, precision);
+    }
+    // turbulentMixingLengthDissipationRateInletFvPatchScalarField.C:166-176: the type, then mixingLength,
+    // phi and k ALWAYS, then value. Its constructor never runs readDict (:84-99), so no patchType.
+    else if (type == "turbulentMixingLengthDissipationRateInlet")
+    {
+        scalar mixingLength = 0;
+        if (!leafScalar(*pd, "mixingLength", mixingLength) || mixingLength != bc.turbulentInletCoefficient())
+        {
+            refuseWrite(field, p, "`mixingLength` is missing, not a number, or not the one the patch ran with");
+        }
+        // brae's reader takes no `k` entry, so the solve read `k` whatever the file says
+        if (leafWord(*pd, "k", "k") != "k")
+        {
+            refuseWrite(field, p, "it names a k other than `k`, which brae does not honour");
+        }
+        wordEntry(os, 8, "type", type);
+        scalarEntry(os, 8, "mixingLength", mixingLength, precision);
+        wordEntry(os, 8, "phi", leafWord(*pd, "phi", "phi"));
+        wordEntry(os, 8, "k", "k");
+        listEntry(os, 8, "value", value, precision);
+    }
+    // cyclicACMIFvPatchField.C:974-983 and cyclicAMIFvPatchField.C:1010-1019: fvPatchField's write (type,
+    // [patchType]), the stored coupled value -- coupledFvPatchField::evaluate's lerp, which only a coupled
+    // patch object holds -- and `neighbourValue` only while patchNeighbourFieldPtr_ is set, which serially
+    // is only a start file's (cyclicAMIFvPatchField.C:75-86), refused here
+    else if (type == "cyclicACMI" || type == "cyclicAMI")
+    {
+        if (!derived && !stored && !bc.coupled())
+        {
+            refuseWrite(field, p, "the patch object is not coupled, so it holds no coupled value");
+        }
+        // pd is null for a field brae derives (p) or a file with no entry for the patch: the patch type's
+        // own constraint field, type and value only
+        if (pd && leaf(*pd, "neighbourValue"))
+        {
+            refuseWrite(field, p, "the start file carries `neighbourValue`, which OpenFOAM echoes until an "
+                                  "assignment drops it (cyclicAMIFvPatchField.C:75-86, :1025-1066)");
+        }
+        if (pd)
+        {
+            baseEntries(
+                os,
+                field,
+                p,
+                *pd,
+                type);
+        }
+        else
+        {
+            wordEntry(os, 8, "type", type);
+        }
+        listEntry(os, 8, "value", value, precision);
+    }
+    // porousBafflePressureFvPatchField.C:200-209 over fixedJumpFvPatchField.C:243-271: type, patchType
+    // (the file's, else interfaceFieldType() -- cyclic), the OWNER's jump, value, [phi], [rho], D, I,
+    // length, uniformJump. relax/jump0/minJump are fixedJump state brae refuses at construction.
+    else if (type == "porousBafflePressure")
+    {
+        if (!bc.isPorousBafflePressure())
+        {
+            refuseWrite(field, p, "the template names porousBafflePressure but the patch object is not one");
+        }
+        if (setsUseImplicit(*pd) || leaf(*pd, "relax") || leaf(*pd, "minJump"))
+        {
+            refuseWrite(field, p, "useImplicit, relax or minJump is set; none is ported");
+        }
+        const int uniformJump = ofSwitchToken(leafWord(*pd, "uniformJump", "false"));
+        scalar length = 0;
+        if (uniformJump < 0 || !leafScalar(*pd, "length", length))
+        {
+            refuseWrite(field, p, "`uniformJump` is not a switch, or `length` is missing or not a number");
+        }
+        wordEntry(os, 8, "type", type);
+        wordEntry(os, 8, "patchType", leafWord(*pd, "patchType", "cyclic"));
+        if (p.owner)
+        {
+            const std::vector<T>* jump = bc.coupledJump();
+            if (!jump)
+            {
+                refuseWrite(field, p, "the owner side's patch object carries no jump");
+            }
+            listEntry(os, 8, "jump", *jump, precision);
+        }
+        listEntry(os, 8, "value", value, precision);
+        for (const char* k : {"phi", "rho"})
+        {
+            const std::string w = leafWord(*pd, k, k);
+            if (w != k)
+            {
+                wordEntry(os, 8, k, w);
+            }
+        }
+        constantFunction1Entry<scalar>(
+            os,
+            field,
+            p,
+            *pd,
+            "D",
+            false,
+            precision);
+        constantFunction1Entry<scalar>(
+            os,
+            field,
+            p,
+            *pd,
+            "I",
+            false,
+            precision);
+        scalarEntry(os, 8, "length", length, precision);
+        // a bool is written as a label (bool.C:60-66)
+        keyword(os, 8, "uniformJump");
+        os << uniformJump << ";\n";
+    }
+    // prghPermeableAlphaTotalPressureFvPatchScalarField.C:262-278 over mixedFvPatchField.C:315-323: type,
+    // refValue, refGradient, valueFraction, source, value, [phi], [rho], [U], [alpha], [alphaMin], p. Its
+    // constructor is mixedFvPatchField(p, iF) (.C:65) without readDict, so no patchType. The coefficients
+    // are the ones the last updateSnGrad SET (.C:215-226), stored.
+    else if (type == "prghPermeableAlphaTotalPressure")
+    {
+        if (hasCoordinateScaling(*pd, "p"))
+        {
+            refuseWrite(field, p, "its `p` carries coordinate scaling or a pCoeffs dictionary, not written");
+        }
+        const std::vector<scalar>* fraction = bc.valueFractionPtr();
+        scalar alphaMin = 1;
+        if (!fraction || (leaf(*pd, "alphaMin") && !leafScalar(*pd, "alphaMin", alphaMin)))
+        {
+            refuseWrite(field, p, "the patch object carries no valueFraction, or `alphaMin` is not a number");
+        }
+        // the dictionary constructor's refGrad is 0 (.C:75) until the first updateSnGrad sets it (.C:217);
+        // brae allocates refGrad_ only there, so a null pointer IS that 0 -- write() never stops
+        // (the fatal at .C:252-257 is updateCoeffs')
+        const std::vector<T> zeros(static_cast<std::size_t>(p.size), T{});
+        const std::vector<T>* grad = bc.refGradPtr();
+        wordEntry(os, 8, "type", type);
+        listEntry(os, 8, "refValue", bc.refValues(), precision);
+        listEntry(os, 8, "refGradient", grad ? *grad : zeros, precision);
+        listEntry(os, 8, "valueFraction", *fraction, precision);
+        // source_ is Zero in the (p, iF) constructor (mixedFvPatchField.C:93) and never assigned
+        listEntry(os, 8, "source", zeros, precision);
+        listEntry(os, 8, "value", value, precision);
+        for (const char* k : {"phi", "rho", "U"})
+        {
+            const std::string w = leafWord(*pd, k, k);
+            if (w != k)
+            {
+                wordEntry(os, 8, k, w);
+            }
+        }
+        const std::string alphaName = leafWord(*pd, "alpha", "none");
+        if (alphaName != "none")
+        {
+            wordEntry(os, 8, "alpha", alphaName);
+        }
+        if (alphaMin != scalar(1))
+        {
+            scalarEntry(os, 8, "alphaMin", alphaMin, precision);
+        }
+        constantFunction1Entry<scalar>(
+            os,
+            field,
+            p,
+            *pd,
+            "p",
+            true,
+            precision);
+    }
+    // pressurePermeableAlphaInletOutletVelocityFvPatchVectorField.C:180-190 over mixedFvPatchField.C:315-323:
+    // type, [patchType] (its constructor runs readDict, .C:86), refValue, refGradient, valueFraction,
+    // source, value, [phi], [rho], [alpha], [alphaMin]. refGrad and source are the constructor's Zero.
+    else if (type == "permeableAlphaPressureInletOutletVelocity")
+    {
+        const std::vector<scalar>* fraction = bc.valueFractionPtr();
+        scalar alphaMin = 1;
+        if (!fraction || (leaf(*pd, "alphaMin") && !leafScalar(*pd, "alphaMin", alphaMin)))
+        {
+            refuseWrite(field, p, "the patch object carries no valueFraction, or `alphaMin` is not a number");
+        }
+        const std::vector<T> zeros(static_cast<std::size_t>(p.size), T{});
+        const std::vector<T>* grad = bc.refGradPtr();
+        baseEntries(
+            os,
+            field,
+            p,
+            *pd,
+            type);
+        listEntry(os, 8, "refValue", bc.refValues(), precision);
+        listEntry(os, 8, "refGradient", grad ? *grad : zeros, precision);
+        listEntry(os, 8, "valueFraction", *fraction, precision);
+        listEntry(os, 8, "source", zeros, precision);
+        listEntry(os, 8, "value", value, precision);
+        for (const char* k : {"phi", "rho"})
+        {
+            const std::string w = leafWord(*pd, k, k);
+            if (w != k)
+            {
+                wordEntry(os, 8, k, w);
+            }
+        }
+        const std::string alphaName = leafWord(*pd, "alpha", "none");
+        if (alphaName != "none")
+        {
+            wordEntry(os, 8, "alpha", alphaName);
+        }
+        if (alphaMin != scalar(1))
+        {
+            scalarEntry(os, 8, "alphaMin", alphaMin, precision);
+        }
+    }
+    // waveAlphaFvPatchScalarField.C:122-129 and waveVelocityFvPatchVectorField.C:122-129: the type, then
+    // waveDictName -- read from `waveDict`, default waveProperties (waveModel.C:46, :68 of each) -- then
+    // the value the model's last update stored
+    else if (type == "waveAlpha" || type == "waveVelocity")
+    {
+        wordEntry(os, 8, "type", type);
+        wordEntry(os, 8, "waveDictName", leafWord(*pd, "waveDict", leafWord(*pd, "waveDictName", "waveProperties")));
+        listEntry(os, 8, "value", value, precision);
+    }
+    // uniformFixedValueFvPatchField.C:186-194: fvPatchField's write, the PatchFunction1's writeData --
+    // ConstantField's `constant v` for `constant v`, `uniform v` and a bare v alike (ConstantField.C:
+    // 314-329) -- then the value, which updateCoeffs sets to that constant (.C:180)
+    else if (type == "uniformFixedValue")
+    {
+        if (hasCoordinateScaling(*pd, "uniformValue"))
+        {
+            refuseWrite(field, p, "uniformValue carries coordinate scaling or a Coeffs dictionary, not written");
+        }
+        const std::vector<std::string>* uv = leaf(*pd, "uniformValue");
+        T c{};
+        if (!uv || !constantFunction1(*uv, true, c))
+        {
+            refuseWrite(field, p, "uniformValue is not a constant; only ConstantField's `constant v` is written");
+        }
+        // brae's reader keeps whichever of `uniformValue` and `value` comes last (foam_field_reader.cuh);
+        // OpenFOAM's updateCoeffs sets the constant. A stored value off it is that substitution: refused.
+        for (const T& v : value)
+        {
+            if (!sameValue(v, c))
+            {
+                refuseWrite(field, p, "the stored value is not uniformValue's constant, which OpenFOAM applies");
+            }
+        }
+        wordEntry(os, 8, "type", type);
+        keyword(os, 8, "uniformValue");
+        os << "constant " << fmt(c, precision) << ";\n";
+        listEntry(os, 8, "value", value, precision);
+    }
+    // rotatingWallVelocityFvPatchVectorField.C:141-148: type, origin, axis, omega (`constant v`), value
+    else if (type == "rotatingWallVelocity")
+    {
+        vector origin{0, 0, 0};
+        vector axis{0, 0, 0};
+        const std::vector<std::string>* o = leaf(*pd, "origin");
+        const std::vector<std::string>* a = leaf(*pd, "axis");
+        if (!o || !plainVector(*o, origin) || !a || !plainVector(*a, axis))
+        {
+            refuseWrite(field, p, "origin or axis is not a plain `(x y z)`");
+        }
+        wordEntry(os, 8, "type", type);
+        keyword(os, 8, "origin");
+        os << fmt(origin, precision) << ";\n";
+        keyword(os, 8, "axis");
+        os << fmt(axis, precision) << ";\n";
+        constantFunction1Entry<scalar>(
+            os,
+            field,
+            p,
+            *pd,
+            "omega",
+            false,
+            precision);
+        listEntry(os, 8, "value", value, precision);
+    }
+    // outletPhaseMeanVelocityFvPatchVectorField.C:161-171: fvPatchField's write (the type), Umean, alpha,
+    // value -- not mixed's. Both read without a default (.C:78-79) and never changed.
+    else if (type == "outletPhaseMeanVelocity")
+    {
+        scalar Umean = 0;
+        const std::string alphaName = leafWord(*pd, "alpha", "");
+        if (!leafScalar(*pd, "Umean", Umean) || alphaName.empty())
+        {
+            refuseWrite(field, p, "`Umean` is not a plain number or `alpha` is missing");
+        }
+        wordEntry(os, 8, "type", type);
+        scalarEntry(os, 8, "Umean", Umean, precision);
+        wordEntry(os, 8, "alpha", alphaName);
+        listEntry(os, 8, "value", value, precision);
+    }
+    // nutkRoughWallFunctionFvPatchScalarField.C:238-246: nutWallFunction's write -- type, [U], the
+    // coefficients that differ -- then its own Cs and Ks (per-face fields, .C:130-137), then the value.
+    // nutkWallFunction's write is skipped, so there is NO blending entry.
+    else if (type == "nutkRoughWallFunction")
+    {
+        const std::vector<scalar>* Ks = bc.nutkRoughKs();
+        const std::vector<scalar>* Cs = bc.nutkRoughCs();
+        if (!Ks || !Cs)
+        {
+            refuseWrite(field, p, "the patch object carries no Ks or Cs");
+        }
+        wordEntry(os, 8, "type", type);
+        const std::string UName = leafWord(*pd, "U", "");
+        if (!UName.empty())
+        {
+            wordEntry(os, 8, "U", UName);
+        }
+        wallCoefficientEntries(os, *pd, precision);
+        listEntry(os, 8, "Cs", *Cs, precision);
+        listEntry(os, 8, "Ks", *Ks, precision);
+        listEntry(os, 8, "value", value, precision);
+    }
     else
     {
         refuseWrite(field, p, "its condition `" + type + "` has no transcribed write()");
@@ -675,12 +1263,38 @@ InterWriter::InterWriter(
             "the restart starts from controlDict's deltaT; OpenFOAM reads the stored deltaT under "
             "adjustTimeStep and deltaT0 always (Time.C:291-302)");
     }
+    const std::string startAlphaOld = startDir + "/alpha." + phase1Name + "_0";
+    startHoldsAlphaOld_ = fs::exists(startAlphaOld) || fs::exists(startAlphaOld + ".gz");
     const std::string cce = startDir + "/uniform/cumulativeContErr";
     if (fs::exists(cce) || fs::exists(cce + ".gz"))
     {
         const FoamDict cd2 = readDict(fs::exists(cce) ? cce : cce + ".gz");
         cumulativeContErr_ = cd2.scalarOr("value", scalar(0));
     }
+}
+
+bool InterWriter::startHolds(const std::string& file) const
+{
+    const std::string path = startDir_ + "/" + file;
+    return fs::exists(path) || fs::exists(path + ".gz");
+}
+
+void InterWriter::noteAlphaOldCreation(const GeometricField<scalar>& alpha1)
+{
+    if (oldLevelNoted_)
+    {
+        return;
+    }
+    oldLevelGrad_.assign(alpha1.boundary.size(), std::vector<scalar>());
+    for (std::size_t pi = 0; pi < alpha1.boundary.size(); ++pi)
+    {
+        const fvPatchField<scalar>& bc = *alpha1.boundary[pi];
+        if (bc.contactAngleTheta0() >= scalar(0) && bc.refGradPtr())
+        {
+            oldLevelGrad_[pi] = *bc.refGradPtr();
+        }
+    }
+    oldLevelNoted_ = true;
 }
 
 void InterWriter::refuseAtFirstWrite(
@@ -876,6 +1490,8 @@ std::string volFieldText(
     const FoamDict* boundary,
     const std::vector<std::unique_ptr<fvPatchField<T>>>& bcs,
     const std::vector<std::vector<T>>* derived,
+    const std::vector<std::vector<T>>* stored,
+    const std::vector<std::vector<T>>* storedGradient,
     int precision)
 {
     std::ostringstream os;
@@ -892,7 +1508,18 @@ std::string volFieldText(
         {
             refuseWrite(field, p, "the solver holds no patch object for it");
         }
-        volPatch(os, field, p, pd, *bcs[pi], derived ? &(*derived)[pi] : nullptr, precision);
+        volPatch(
+            os,
+            field,
+            p,
+            pd,
+            *bcs[pi],
+            derived ? &(*derived)[pi] : nullptr,
+            stored ? &(*stored)[pi] : nullptr,
+            (storedGradient && pi < storedGradient->size() && !(*storedGradient)[pi].empty())
+                ? &(*storedGradient)[pi]
+                : nullptr,
+            precision);
     }
     os << "}\n\n\n// ************************************************************************* //\n";
     return os.str();
@@ -927,7 +1554,7 @@ std::string surfaceFieldText(
         else
         {
             const bool constraint = (p.type == "wedge" || p.type == "symmetryPlane" || p.type == "symmetry"
-                                  || p.type == "cyclic");
+                                  || p.type == "cyclic" || p.type == "cyclicAMI" || p.type == "cyclicACMI");
             wordEntry(os, 8, "type", constraint ? p.type : std::string("calculated"));
             const std::vector<scalar> none;
             listEntry(os, 8, "value", pi < f.boundary.size() ? f.boundary[pi] : none, precision);
@@ -948,7 +1575,9 @@ std::string InterWriter::fieldText(
     const std::string& templateName,
     const std::vector<T>& cells,
     const std::vector<std::unique_ptr<fvPatchField<T>>>& bcs,
-    const std::vector<std::vector<T>>* derived)
+    const std::vector<std::vector<T>>* derived,
+    const std::vector<std::vector<T>>* stored,
+    const std::vector<std::vector<T>>* storedGradient)
 {
     const Template& t = templateFor(templateName);
     // a derived field takes the template's dimensions and nothing of its patches
@@ -962,6 +1591,8 @@ std::string InterWriter::fieldText(
         boundary,
         bcs,
         derived,
+        stored,
+        storedGradient,
         precision_);
 }
 
@@ -983,6 +1614,8 @@ void InterWriter::probeConditions(
             field,
             std::vector<T>(),
             fld.boundary,
+            nullptr,
+            nullptr,
             nullptr);
     }
     catch (const std::runtime_error& e)
@@ -1071,8 +1704,76 @@ void InterWriter::write(const InterWriteState& s)
             alphaName,
             s.alpha1Cells ? *s.alpha1Cells : s.alpha1->internal,
             s.alpha1->boundary,
+            nullptr,
+            nullptr,
             nullptr),
         true);
+    if (alphaOld_)
+    {
+        if (!s.alpha1OldCells || !s.alpha1OldBoundary || !s.alpha1SubCycleBoundary)
+        {
+            throw std::runtime_error(
+                "brae interFoam writer: alpha is sub-cycled and the loop handed no old-level state for "
+                + alphaName + "_0");
+        }
+        if (!oldLevelNoted_)
+        {
+            throw std::runtime_error(
+                "brae interFoam writer: " + alphaName + "_0's creation state (the contact-angle gradient) was "
+                "never recorded");
+        }
+        // The old level's patches after the step: the sub-cycle's storeOldTime force-copies alpha into
+        // it at every sub-cycle, patches included (GeometricField.C:932), and ~subCycleField restores it
+        // with `gf0_ = gf_0_` (subCycle.H:89-99) -- each patch's OWN operator=, which is
+        //   a copy of the step's start on an assigning patch (fvPatchField.C:407-413),
+        //   a NO-OP on the fixedValue and mixed families (fixedValueFvPatchField.H:202-204,
+        //     mixedFvPatchField.H:303-305), which so keep the last sub-cycle's copy -- alpha as that
+        //     sub-cycle began, MEASURED on laminar/waves/stokesI's waveAlpha inlet,
+        //   inletOutlet's re-blend vf*refValue + (1 - vf)*start (inletOutletFvPatchField.C:143-152) with
+        //     the old level's OWN valueFraction -- the dictionary constructor's 0 (:80), since nothing
+        //     evaluates alpha's inletOutlet patches before the level is cloned (the first alpha1.oldTime(),
+        //     subCycle.H:78) and every later store is values only (GeometricField.C:932). So it is a plain
+        //     copy of the start, as on an assigning patch. (This writer first blended with the valueFraction
+        //     brae pushes from the initial flux, which differs on any start with inflow there.)
+        const std::vector<std::vector<scalar>>& start = *s.alpha1OldBoundary;
+        // BRAE_CONTROL_ALPHA_OLD_START=1 takes the step's start on every patch -- this writer's first
+        // form, 5.3e-03 off OpenFOAM on RAS/weirOverflow's variableHeightFlowRate inlet. The control
+        // tests/interfoam_write_vs_openfoam.sh must go red on; never the default.
+        const char* startOnly = std::getenv("BRAE_CONTROL_ALPHA_OLD_START");
+        const bool controlStartOnly = startOnly && std::string(startOnly) == "1";
+        const std::vector<std::vector<scalar>>& lastSub =
+            controlStartOnly ? start : *s.alpha1SubCycleBoundary;
+        std::vector<std::vector<scalar>> old(s.alpha1->boundary.size());
+        for (std::size_t pi = 0; pi < old.size(); ++pi)
+        {
+            const fvPatchField<scalar>& bc = *s.alpha1->boundary[pi];
+            if (!bc.coupled() && bc.bcCategory() == 3)
+            {
+                old[pi] = start[pi];
+            }
+            else if (!bc.coupled() && !bc.ofAssignmentWritesValue())
+            {
+                old[pi] = lastSub[pi];
+            }
+            else
+            {
+                old[pi] = start[pi];
+            }
+        }
+        emit(
+            dir + "/" + alphaName + "_0",
+            fieldText<scalar>(
+                "volScalarField",
+                name,
+                alphaName + "_0",
+                alphaName,
+                *s.alpha1OldCells,
+                s.alpha1->boundary,
+                nullptr,
+                &old,
+                &oldLevelGrad_),
+            true);
+    }
     emit(
         dir + "/U",
         fieldText<vector>(
@@ -1082,6 +1783,8 @@ void InterWriter::write(const InterWriteState& s)
             "U",
             s.UCells ? *s.UCells : s.U->internal,
             s.U->boundary,
+            nullptr,
+            nullptr,
             nullptr),
         true);
     emit(
@@ -1093,6 +1796,8 @@ void InterWriter::write(const InterWriteState& s)
             "p_rgh",
             s.p_rghCells ? *s.p_rghCells : s.p_rgh->internal,
             s.p_rgh->boundary,
+            nullptr,
+            nullptr,
             nullptr),
         true);
     // p: NO_READ, AUTO_WRITE (createFields.H:91-102), `calculated` on every non-constraint patch, with
@@ -1106,7 +1811,9 @@ void InterWriter::write(const InterWriteState& s)
             "p_rgh",
             *s.p,
             s.p_rgh->boundary,
-            s.pBoundary),
+            s.pBoundary,
+            nullptr,
+            nullptr),
         true);
     emit(dir + "/phi", surfaceFieldText(header("surfaceScalarField", name, "phi"), *s.phi, patches_, precision_),
          true);
@@ -1139,6 +1846,8 @@ void InterWriter::write(const InterWriteState& s)
                     e.first,
                     e.second->internal,
                     e.second->boundary,
+                    nullptr,
+                    nullptr,
                     nullptr),
                 true);
         }
@@ -1184,23 +1893,70 @@ void registerUnwritten(
     w.probeConditions(a, f.alpha1);
     w.probeConditions("U", f.U);
     w.probeConditions("p_rgh", f.p_rgh);
-    if (f.turbulence.on && f.turbulence.model != InterRasModel::KEqnLES)
+    // k and nut are AUTO_WRITE under every closure brae carries (kEqn.C:92-98, eddyViscosity.C:60-69); LES
+    // kEqn has no second scalar, and its filter width is NO_WRITE (LESdelta.C:51-57)
+    if (f.turbulence.on)
     {
         w.probeConditions("k", f.turbulence.k);
         if (f.turbulence.model == InterRasModel::KOmegaSST)
         {
             w.probeConditions("omega", f.turbulence.omega);
         }
-        else
+        else if (f.turbulence.model == InterRasModel::KEpsilon)
         {
             w.probeConditions("epsilon", f.turbulence.epsilon);
         }
         w.probeConditions("nut", f.turbulence.nut);
     }
+    // A start directory holding a written field's `_0` level: OpenFOAM's read constructor takes it as AUTO_WRITE
+    // (readOldTimeIfPresent, GeometricField.C:120, :131-160) and writes it at every write time. brae writes
+    // only a sub-cycled alpha's, below; any other is refused by name rather than dropped.
+    {
+        std::vector<std::string> names{a, "U", "p_rgh"};
+        if (f.turbulence.on)
+        {
+            names.insert(names.end(), {"k", "epsilon", "omega", "nut"});
+        }
+        for (const std::string& n : names)
+        {
+            if (n == a && f.alphaCtl.nAlphaSubCycles > 1)
+            {
+                continue;
+            }
+            if (w.startHolds(n + "_0"))
+            {
+                w.refuseAtFirstWrite(n + "_0", "the start directory holds it, and OpenFOAM reads it as an old-time "
+                                               "level and writes it back at every write time");
+            }
+        }
+    }
+    // a sub-cycled alpha's old time is AUTO_WRITE (GeometricField::storeOldTime gives the level the
+    // field's writeOpt once the sub-cycle has made it an old-old one, subCycle.H:76-84) -- at every write
+    // time, the first included. On a refining mesh OpenFOAM maps that level with the mesh, which a
+    // start-of-step copy is not.
     if (f.alphaCtl.nAlphaSubCycles > 1)
     {
-        w.refuseAtFirstWrite(a + "_0", "a sub-cycled alpha keeps its old time, which OpenFOAM writes from the "
-                                       "second step (subCycle.H:76-84, GeometricField.C:933-936)");
+        if (f.amr && f.amr->active)
+        {
+            w.refuseAtFirstWrite(a + "_0", "a sub-cycled alpha's old time on a REFINING mesh, which OpenFOAM "
+                                           "maps with the topology change");
+        }
+        else
+        {
+            w.writeAlphaOld();
+        }
+        // a restart whose start directory holds alpha_0 gives OpenFOAM's old level that FILE's contact-angle
+        // gradient (readGradientEntry, alphaContactAngleTwoPhaseFvPatchScalarField.C:73-77), which brae
+        // does not read
+        for (std::size_t pi = 0; w.startHoldsAlphaOld() && pi < f.alpha1.boundary.size(); ++pi)
+        {
+            if (f.alpha1.boundary[pi]->contactAngleTheta0() >= scalar(0))
+            {
+                w.refuseAtFirstWrite(a + "_0", "a restart from a stored old level with a contact angle, whose "
+                                               "gradient OpenFOAM reads from that file and brae does not");
+                break;
+            }
+        }
     }
     if (f.ddtU == DdtScheme::CrankNicolson)
     {
@@ -1229,10 +1985,6 @@ void registerUnwritten(
     if (f.waves.any)
     {
         w.refuseAtFirstWrite("uniform/waveProperties.<patch>", "the wave models' state (waveModel.C:250-261)");
-    }
-    if (f.turbulence.on && f.turbulence.model == InterRasModel::KEqnLES)
-    {
-        w.refuseAtFirstWrite("k and nut of LES kEqn", "their written form is not gated yet");
     }
 }
 

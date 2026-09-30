@@ -778,6 +778,11 @@ RunReport runInterFoam(
     // alphaPhi0.<phase1> from alphaPhi10 (createAlphaFluxes.H), which that solve overwrites
     bool writeNow = false;
     SurfaceScalarField alphaPhi10Write;
+    // alpha.<phase1>_0 of a sub-cycled alpha: alpha as the step found it, taken only on a write step
+    std::vector<scalar> alphaOldWrite;
+    std::vector<std::vector<scalar>> alphaOldBndWrite;
+    // ...and its patch values as the step's last sub-cycle began (InterWriteState::alpha1SubCycleBoundary)
+    std::vector<std::vector<scalar>> alphaSubBndWrite;
 
     for (label step = 0; step < nSteps; ++step)
     {
@@ -875,6 +880,15 @@ RunReport runInterFoam(
                         {
                             writer->stepTaken(rep.deltaT);
                             writeNow = writer->isWriteTime(writer->startTimeIndex() + rep.steps, indexMoved);
+                        }
+                        if (writeNow && writer->writesAlphaOld())
+                        {
+                            alphaOldWrite = f.alpha1.internal;
+                            alphaOldBndWrite.assign(f.alpha1.boundary.size(), std::vector<scalar>());
+                            for (std::size_t pi = 0; pi < f.alpha1.boundary.size(); ++pi)
+                            {
+                                alphaOldBndWrite[pi] = f.alpha1.boundary[pi]->value();
+                            }
                         }
                     }
                     break;
@@ -1008,6 +1022,12 @@ RunReport runInterFoam(
 
                 case Stage::alphaEqnSubCycle:
                 {
+                    // subCycle.H:78: the run's first alpha1.oldTime() creates the old level here, and it
+                    // keeps the valueFractions and contact-angle gradients alpha has now (idempotent)
+                    if (writer && writer->writesAlphaOld())
+                    {
+                        writer->noteAlphaOldCreation(f.alpha1);
+                    }
                     AlphaStepInput ai;
                     // alphaEqn.H:18-56: the off-centring coefficient the scheme constructed for
                     // ddt(alpha) gives -- 0 for Euler, and 0 on the first step of a cold start under
@@ -1081,6 +1101,17 @@ RunReport runInterFoam(
                                      std::vector<scalar>& aNew, SurfaceScalarField& rPhi)
                     {
                         ++subCycle;
+                        // the last sub-cycle's storeOldTime (GeometricField.C:932) copies alpha's patches
+                        // into the old level as they stand now, before this sub-cycle updates any
+                        if (writeNow && writer && writer->writesAlphaOld()
+                            && subCycle == f.alphaCtl.nAlphaSubCycles)
+                        {
+                            alphaSubBndWrite.assign(f.alpha1.boundary.size(), std::vector<scalar>());
+                            for (std::size_t pi = 0; pi < f.alpha1.boundary.size(); ++pi)
+                            {
+                                alphaSubBndWrite[pi] = f.alpha1.boundary[pi]->value();
+                            }
+                        }
                         AlphaStepInput sub = ai;
                         // cyclicACMIPolyPatch::updateAreas: the step's first interpolation across the
                         // pair, which alphaEqnStep places after phic (see its geometryUpdate)
@@ -1718,6 +1749,13 @@ RunReport runInterFoam(
                         ws.phi = &f.phi;
                         ws.alphaPhi0 = &alphaPhi10Write;
                         ws.turbulence = &f.turbulence;
+                        // this loop's cells ARE the fields' own
+                        ws.alpha1Cells = &f.alpha1.internal;
+                        ws.UCells = &f.U.internal;
+                        ws.p_rghCells = &f.p_rgh.internal;
+                        ws.alpha1OldCells = &alphaOldWrite;
+                        ws.alpha1OldBoundary = &alphaOldBndWrite;
+                        ws.alpha1SubCycleBoundary = &alphaSubBndWrite;
                         writer->write(ws);
                     }
                     break;

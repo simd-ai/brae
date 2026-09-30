@@ -145,6 +145,10 @@ void deviceInterAlphaStep(
             DeviceBuffer<scalar>& rpInt, DeviceBuffer<scalar>& rpBnd)
     {
         ++subCycle;
+        if (ctl.alphaSubCycleBndWrite && subCycle == ctl.nAlphaSubCycles)
+        {
+            deviceCopy(*ctl.alphaSubCycleBndWrite, alpha1Bnd);
+        }
         DeviceAlphaStepInput li = in;
         // the volumes THIS sub-cycle runs on, before anything reads them
         if (hooks.subCycleVolumes)

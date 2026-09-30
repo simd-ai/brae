@@ -264,6 +264,9 @@ struct DeviceInterStepControls
     DeviceBuffer<scalar>* alphaPhiWriteInt = nullptr;
     DeviceBuffer<scalar>* alphaPhiWriteBnd = nullptr;
     DeviceBuffer<scalar>* alphaPhiWriteIf  = nullptr;
+    // alpha's boundary values as the step's last sub-cycle begins, for alpha.<phase1>_0 on a write step
+    // (DeviceInterAlphaControls::alphaSubCycleBndWrite). Null copies nothing.
+    DeviceBuffer<scalar>* alphaSubCycleBndWrite = nullptr;
     // LOCALEULER: the per-cell rDeltaT fvm::ddt(rho, U) reads (MomentumAssemblyInput::ddtRDeltaT). Null ==
     // the scalar step. Separate from alphaInput's so a gate can switch one consumer off at a time.
     const DeviceBuffer<scalar>* rDeltaTUEqn = nullptr;

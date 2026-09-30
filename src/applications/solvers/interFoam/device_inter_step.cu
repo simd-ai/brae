@@ -169,6 +169,7 @@ void deviceInterStep(
     actl.alphaPhiWriteInt = ctl.alphaPhiWriteInt;
     actl.alphaPhiWriteBnd = ctl.alphaPhiWriteBnd;
     actl.alphaPhiWriteIf  = ctl.alphaPhiWriteIf;
+    actl.alphaSubCycleBndWrite = ctl.alphaSubCycleBndWrite;
     if (ctl.cn)
     {
         // alphaEqn.H:236-262: ddt(rho,U) is not Euler, so rhoPhi takes phi beside rho2 and the

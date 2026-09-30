@@ -65,6 +65,14 @@ struct InterWriteState
     const std::vector<scalar>* alpha1Cells = nullptr;
     const std::vector<vector>* UCells = nullptr;
     const std::vector<scalar>* p_rghCells = nullptr;
+    // alpha.<phase1>_0, when alpha is sub-cycled: alpha's cells and STORED patch values as they stood at
+    // the start of the step -- the old-time level the sub-cycle restores (subCycle.H, ~subCycleField) and
+    // OpenFOAM writes at every write time, the first included (measured on laminar/mixerVessel2D)
+    const std::vector<scalar>* alpha1OldCells = nullptr;
+    const std::vector<std::vector<scalar>>* alpha1OldBoundary = nullptr;
+    // ...and alpha's stored patch values as the step's LAST sub-cycle began, which the old level keeps on a
+    // patch whose operator= is a no-op (the fixedValue and mixed families; see InterWriter::write)
+    const std::vector<std::vector<scalar>>* alpha1SubCycleBoundary = nullptr;
 };
 
 class InterWriter
@@ -103,6 +111,21 @@ public:
     // The start index a restart continues from (uniform/time `index`), 0 otherwise.
     label startTimeIndex() const { return startTimeIndex_; }
 
+    // alpha.<phase1>_0 is written (a sub-cycled alpha): the loops capture it at the start of a write step
+    void writeAlphaOld() { alphaOld_ = true; }
+    bool writesAlphaOld() const { return alphaOld_; }
+    // The start directory holds alpha.<phase1>_0: OpenFOAM builds the old level from that FILE
+    // (readOldTimeIfPresent, GeometricField.C:120, :151-160), so its patches are the file's -- a contact
+    // angle's gradient included (readGradientEntry), which brae does not read.
+    bool startHoldsAlphaOld() const { return startHoldsAlphaOld_; }
+    // the start directory holds this file (plain or .gz)
+    bool startHolds(const std::string& file) const;
+    // What the old level's patches keep from the moment OpenFOAM creates it -- the first alpha1.oldTime()
+    // of the run, subCycleField's constructor (subCycle.H:78) ahead of the first alpha solve: each contact
+    // angle's gradient, which later assignments never touch (values only, fvPatchField.C:407-413,
+    // :552-558). Called there by both loops; once.
+    void noteAlphaOldCreation(const GeometricField<scalar>& alpha1);
+
     // One time directory.
     void write(const InterWriteState& s);
 
@@ -137,7 +160,9 @@ private:
         const std::string& templateName,
         const std::vector<T>& cells,
         const std::vector<std::unique_ptr<fvPatchField<T>>>& bcs,
-        const std::vector<std::vector<T>>* derived);
+        const std::vector<std::vector<T>>* derived,
+        const std::vector<std::vector<T>>* stored,
+        const std::vector<std::vector<T>>* storedGradient);
     std::string timeName(scalar t, int precision) const;
     std::string header(
         const std::string& className,
@@ -166,6 +191,10 @@ private:
     scalar deltaTSave_ = 0;
     scalar deltaT0_ = 0;
     scalar cumulativeContErr_ = 0;
+    bool alphaOld_ = false;
+    bool startHoldsAlphaOld_ = false;
+    bool oldLevelNoted_ = false;
+    std::vector<std::vector<scalar>> oldLevelGrad_;
 
     std::vector<std::pair<std::string, std::string>> refused_;
     std::map<std::string, Template> templates_;

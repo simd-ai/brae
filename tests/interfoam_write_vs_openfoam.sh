@@ -26,8 +26,12 @@
 #          final directory, host and device, laminar and RAS (the device downloads its closure to write).
 #   ARM G  RAS/damBreak (kEpsilon: k, epsilon, nut, the wall functions' entries) through A-D, both arms.
 #   ARM H  purgeWrite 1 keeps what OpenFOAM keeps.
-#   ARM R  a condition with no transcribed write() (capillaryRise's contact angle) is named at startup,
-#          and the run stops at its first write time with nothing written.
+#   ARM S  a sub-cycled alpha (mixerVessel2D) writes alpha.water_0, OpenFOAM's old time, at every step.
+#   ARM W  eight tutorials whose conditions now write -- capillaryRise, weirOverflow, angledDuct,
+#          damBreakLeakage, damBreakPorousBaffle, damBreakPermeable, nozzleFlow2D, eulerianInjection --
+#          against OpenFOAM at pinned solves, host and device; the old level's restore rule witnessed.
+#   ARM R  a file brae cannot write yet (stokesI's wave-model state) is named at startup, and the run
+#          stops at its first write time with nothing written.
 #   Every arm runs on the host loop and on `-device` when a GPU is present.
 #
 #   CONTROLS, each asserted red:
@@ -46,6 +50,7 @@ OFBASHRC=${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
 TUT=${BRAE_OF_TUTORIALS:-/usr/lib/openfoam/openfoam2412/tutorials}
 LAM="$TUT/multiphase/interFoam/laminar/damBreak/damBreak"
 RAS="$TUT/multiphase/interFoam/RAS/damBreak/damBreak"
+MV="$TUT/multiphase/interFoam/laminar/mixerVessel2D"
 
 [ -x "$BIN" ]      || { echo "SKIP: $BIN not built"; exit 77; }
 [ -d "$LAM" ]      || { echo "SKIP: damBreak tutorial not found at $LAM"; exit 77; }
@@ -84,19 +89,21 @@ say() { printf '  %-86s %s\n' "$1" "$2"; [ "$2" = FAIL ] && fail=1 || true; }
 BOUND_FIELDS=${BOUND_FIELDS:-2e-10}
 BOUND_TIME=${BOUND_TIME:-1e-13}
 
+
 stage()   # stage <src> <dir> <endTime> <writeControl> <writeInterval> <purgeWrite> [key=value ...]
 {
     local src="$1" d="$2"
     cp -r "$src" "$d" || return 1
     rm -rf "$d"/[1-9]* "$d"/0 "$d"/processor* "$d"/log.*
     cp -r "$d/0.orig" "$d/0"
-    ( cd "$d" && blockMesh > log.blockMesh 2>&1 ) || return 1
-    # waterChannel's Allrun.pre: two extrusions after blockMesh
-    for i in 1 2; do
-        [ -f "$d/system/extrudeMeshDict.$i" ] || continue
-        cp "$d/system/extrudeMeshDict.$i" "$d/system/extrudeMeshDict"
-        ( cd "$d" && extrudeMesh > "log.extrudeMesh.$i" 2>&1 ) || return 1
-    done
+    # the tutorial's own mesh script when it ships one (waterChannel's extrusions, mixerVessel2D's m4,
+    # topoSet and setsToZones), blockMesh otherwise -- serial tools either way
+    if [ -x "$d/Allrun.pre" ]; then
+        ( cd "$d" && ./Allrun.pre > log.allrunpre 2>&1 ) || return 1
+        [ -d "$d/0" ] || cp -r "$d/0.orig" "$d/0"
+    else
+        ( cd "$d" && blockMesh > log.blockMesh 2>&1 ) || return 1
+    fi
     ( cd "$d" && setFields > log.setFields 2>&1 ) || return 1
     python3 - "$d/system/controlDict" "$3" "$4" "$5" "$6" "${@:7}" <<'PY'
 import re, sys
@@ -125,14 +132,43 @@ runbrae()  # runbrae <dir> <arm> [env...]
         || { echo "FAIL: brae_interFoam ($arm) did not run in $d"; tail -5 "$d/log.brae"; exit 1; }
 }
 # field bounds from the comparer's RESULT line: prints the worst file, fails structure or any rel > bound
-judge()   # judge <label> <resultFile> <bound>
+# [ofLog]: cumulativeContErr is dt*weightedAverage(div(phi), V) summed per corrector -- a signed sum of
+# face fluxes, zero in exact arithmetic on a closed domain and at rounding once the solves are pinned, so
+# a bound relative to its own value measures nothing. Its scale is the size of what cancels: the mean
+# Courant number OpenFOAM prints IS 0.5*dt*sum|phi|/sum(V) (CourantNo.H), so a corrector's term is
+# 2*Co_mean in magnitude. The floor is that total, sum over steps of nCorrectors*2*Co_mean, times the
+# larger of 10 eps and the relative gap the FIELDS of the same comparison show -- a continuity error that
+# agrees as well as the fluxes it is summed from. MEASURED on the eight W cases at pinned solves: 0.0 to
+# 3.6 eps for the cases whose fields agree to rounding; angledDuct (fields 1.3e-09) and damBreakLeakage
+# (2.4e-07, the column at rest) needed 8e+03 and 3.8e+06 eps, inside their field gaps. The floor this
+# replaced, 1e-14 of OpenFOAM's `sum local` total, was 1e-28 at pinned solves: below every rounding.
+# LIMIT, stated: where OpenFOAM's own value is itself at rounding (arms S and W at pinned solves) the floor
+# exceeds it, so a dropped accumulation would pass there. Arms D witness that class -- damBreak's 4.6e-04
+# and waterChannel's -2.3e-03 are compared relative, with no floor, and caught the missing initCorrectPhi
+# term (2.885e-10).
+judge()   # judge <label> <resultFile> <bound> [ofLog]
 {
     python3 - "$@" <<'PY'
-import json, sys
+import json, re, sys
 label, path, bound = sys.argv[1], sys.argv[2], float(sys.argv[3])
 r = json.loads([l for l in open(path) if l.startswith('RESULT ')][-1][7:])
+floor = 0.0
+if len(sys.argv) > 4:
+    log = open(sys.argv[4]).read()
+    coScale = 0.0
+    for chunk in log.split('\nTime = '):
+        co = re.search(r'Courant Number mean: (\S+)', chunk)
+        coScale += len(re.findall(r'sum local', chunk)) * 2.0 * (float(co.group(1)) if co else 0.0)
+    fieldsRel = max([v['rel'] for k, v in r['files'].items()
+                     if not k.endswith('cumulativeContErr') and 'functionObject' not in k] + [0.0])
+    floor = max(10 * 2.220446049250313e-16, fieldsRel) * coScale
 worst = max(r['files'].items(), key=lambda kv: kv[1]['rel'])
-over = [k for k, v in r['files'].items() if v['rel'] > bound]
+over = [k for k, v in r['files'].items()
+        if v['rel'] > bound and not (k.endswith('uniform/cumulativeContErr') and v['abs'] <= floor)]
+if floor > 0:
+    for k, v in r['files'].items():
+        if k.endswith('uniform/cumulativeContErr'):
+            print('      %s: |brae - OpenFOAM| %.3e against the rounding floor %.3e' % (k, v['abs'], floor))
 print('      %s: %d structure failures; worst %s at %.3e (bound %.0e)'
       % (label, r['structure'], worst[0], worst[1]['rel'], bound))
 for k in over:
@@ -295,12 +331,38 @@ sys.exit(0 if dtb == 'none' or abs(float(dtb) - float(dto)) / float(dto) > 1e-3 
 PY
 
 # ---------------------------------------------------------------------------------------------------
+# E0: a start directory holding a written field's `_0` level. OpenFOAM reads it as an AUTO_WRITE old time
+# (readOldTimeIfPresent, GeometricField.C:120, :131-160) and writes it back at every write time; brae
+# writes only a sub-cycled alpha's, so a U_0 there must be named at startup and the run stopped at its
+# first write. CONTROL: the identical restart without U_0 runs to its end.
+restart_brae()   # restart_brae <dir> [with U_0]
+{
+    mkdir -p "$1"
+    cp -r "$W/of/constant" "$W/of/system" "$W/br_host/0.1" "$1/"
+    if [ "${2:-}" = withU0 ]; then
+        sed 's/^\( *object *\)U;/\1U_0;/' "$1/0.1/U" > "$1/0.1/U_0"
+    fi
+    sed -i 's/^startFrom .*/startFrom       latestTime;/; s/^endTime .*/endTime         0.15;/' "$1/system/controlDict"
+    ( cd "$1" && stdbuf -oL -eL "$BIN" -case . > log.brae 2>&1 )
+}
+restart_brae "$W/r0" withU0; rc=$?
+[ $rc -ne 0 ] && grep -q "U_0 will not be written" "$W/r0/log.brae" && [ "$(timedirs "$W/r0")" = "0.1 " ] \
+    && say "ARM E0 a start directory's U_0 is named and the run stops at its first write" ok \
+    || { say "ARM E0 a start directory's U_0 is named and the run stops at its first write" FAIL; tail -3 "$W/r0/log.brae" | sed 's/^/      /'; }
+restart_brae "$W/r0ctl" && [ "$(timedirs "$W/r0ctl")" = "0.1 0.15 " ] \
+    && say "CONTROL  the same restart without U_0 runs to its end and writes 0.15" ok \
+    || { say "CONTROL  the same restart without U_0 runs to its end and writes 0.15" FAIL; tail -3 "$W/r0ctl/log.brae" | sed 's/^/      /'; }
+
+# ---------------------------------------------------------------------------------------------------
 # F + H: `timeStep 1, purgeWrite 1` against `timeStep N`, to endTime 0.02 -- no trim under timeStep
 stage "$LAM" "$W/of_p" 0.02 timeStep 1 1 || exit 1
 runof "$W/of_p"
 op=$(timedirs "$W/of_p")
-for case in LAM RAS; do
-    src=$LAM; [ $case = RAS ] && src=$RAS
+# ...and MV, laminar/mixerVessel2D: a SUB-CYCLED alpha, so the old level's captures run -- alpha as the
+# step starts and as its last sub-cycle begins, on the host and in a device buffer -- on every step in one
+# run and on one step after N-1 without in the other. Both damBreaks have nAlphaSubCycles 1 and run none.
+for case in LAM RAS MV; do
+    src=$LAM; [ $case = RAS ] && src=$RAS; [ $case = MV ] && src=$MV
     for arm in $ARMS; do
         d1="$W/f1_${case}_$arm"; dn="$W/fn_${case}_$arm"
         stage "$src" "$d1" 0.02 timeStep 1 1 || exit 1
@@ -337,21 +399,165 @@ for arm in $ARMS; do
 done
 
 # ---------------------------------------------------------------------------------------------------
-# R: a condition with no transcribed write() -- capillaryRise's constantAlphaContactAngle -- is named at
-# startup, before the first step, and the run stops at its first write time having written nothing.
-# CONTROL: the same case whose only write time lies past endTime runs to its end: the refusal is of the
-# OUTPUT, and a run that never reaches a write is not refused.
-CAP="$TUT/multiphase/interFoam/laminar/capillaryRise"
-if [ -d "$CAP" ]; then
-    stage "$CAP" "$W/cap" 1 timeStep 3 0 || exit 1
+# S: a SUB-CYCLED alpha (laminar/mixerVessel2D, nAlphaSubCycles 2, MRF) writes alpha.water_0 -- its old
+# time, which GeometricField::storeOldTime makes AUTO_WRITE once the sub-cycle has given it an old-old
+# level. OpenFOAM writes it at EVERY write time, the first included, and it holds alpha as the step found
+# it (bit-identical to the previous step's alpha.water, measured). Three fixed steps of 1e-3.
+if [ -d "$MV" ]; then
+    stage "$MV" "$W/of_s" 0.003 timeStep 1 0 adjustTimeStep=no || exit 1
+    runof "$W/of_s"
+    [ "$(timedirs "$W/of_s")" = "0.001 0.002 0.003 " ] && [ -f "$W/of_s/0.001/alpha.water_0" ] \
+        && say "premise: OpenFOAM writes alpha.water_0 at every step of a sub-cycled alpha, the first included" ok \
+        || say "premise: OpenFOAM writes alpha.water_0 at every step of a sub-cycled alpha, the first included" FAIL
+    for arm in $ARMS; do
+        stage "$MV" "$W/br_s_$arm" 0.003 timeStep 1 0 adjustTimeStep=no || exit 1
+        runbrae "$W/br_s_$arm" "$arm"
+        ok=1
+        for t in 0.001 0.002 0.003; do
+            [ "$(filesets "$W/of_s" $t)" = "$(filesets "$W/br_s_$arm" $t)" ] || ok=0
+        done
+        [ $ok -eq 1 ] && say "ARM S  [$arm] OpenFOAM's file set at every step, alpha.water_0 included" ok \
+                      || say "ARM S  [$arm] OpenFOAM's file set at every step, alpha.water_0 included" FAIL
+        python3 "$CMP" "$W/of_s" "$W/br_s_$arm" 0.001 0.002 0.003 > "$W/cmp_s_$arm.txt" 2>&1
+        judge "mixerVessel2D $arm" "$W/cmp_s_$arm.txt" "$BOUND_FIELDS" "$W/of_s/log.interFoam" \
+            && say "ARM S  [$arm] every file's structure is OpenFOAM's, every value within $BOUND_FIELDS" ok \
+            || { say "ARM S  [$arm] every file's structure is OpenFOAM's, every value within $BOUND_FIELDS" FAIL; grep -v RESULT "$W/cmp_s_$arm.txt" | grep -B1 "^      " | head -20; }
+        # brae's own alpha_0 IS its previous alpha -- and, the control, not its current one
+        python3 - "$W/br_s_$arm" <<'PY' && say "ARM S  [$arm] brae's alpha.water_0 at 0.002 is its 0.001 alpha bit for bit, not its 0.002 one" ok \
+                                       || say "ARM S  [$arm] brae's alpha.water_0 at 0.002 is its 0.001 alpha bit for bit, not its 0.002 one" FAIL
+import re, sys
+d = sys.argv[1]
+def cells(p):
+    t = open(p).read()
+    return t[t.find('internalField'):t.find('boundaryField')].replace('alpha.water_0', '')
+old, prev, cur = cells(d + '/0.002/alpha.water_0'), cells(d + '/0.001/alpha.water'), cells(d + '/0.002/alpha.water')
+print('      alpha_0(0.002) == alpha(0.001): %s; == alpha(0.002): %s' % (old == prev, old == cur))
+sys.exit(0 if old == prev and old != cur else 1)
+PY
+    done
+else
+    say "ARM S  mixerVessel2D tutorial missing" FAIL
+fi
+
+# ---------------------------------------------------------------------------------------------------
+# W: the tutorials each condition write() was transcribed for, AS SHIPPED but for two fixed steps at the
+# file's deltaT and PINNED solves (every tolerance 1e-13, relTol 0 -- at a case's own tolerances the
+# comparison measures where two Krylov solvers stop, 1e-07 on damBreakLeakage). Meshed by the tutorial's
+# own Allrun with the solver line dropped and its parallel steps run serially.
+#   capillaryRise         constantAlphaContactAngle (and alpha.water_0's frozen gradient)
+#   weirOverflow          variableHeightFlowRate, variableHeightFlowRateInletVelocity, and alpha.water_0
+#                         on a mixed-family patch -- the witness for the old level's restore rule
+#   angledDuct            turbulentIntensityKineticEnergyInlet, turbulentMixingLengthDissipationRateInlet, slip
+#   damBreakLeakage       cyclicACMI on every volume field, and the surface fields' ACMI patches
+#   damBreakPorousBaffle  porousBafflePressure (fixedJump's jump on the owner)
+#   damBreakPermeable     prghPermeableAlphaTotalPressure, permeableAlphaPressureInletOutletVelocity
+#   nozzleFlow2D          LES kEqn's k and nut (deltaT 1e-9: the file's 1e-8 diverges in OpenFOAM itself)
+#   eulerianInjection     alpha.water_0 over fixedValue and inletOutlet patches
+# CONTROL: BRAE_CONTROL_ALPHA_OLD_START=1 (the old level at the step's start on every patch, this
+# writer's first form) puts weirOverflow's alpha.water_0 over the bound -- 5.3e-03 at the inlet.
+stage_allrun()   # stage_allrun <src> <dir> <deltaT or ""> -- mesh as the Allrun does, two pinned steps
+{
+    local src="$1" d="$2" dtOverride="$3"
+    cp -r "$src" "$d" || return 1
+    rm -rf "$d"/[1-9]* "$d"/processor* "$d"/log.*
+    # the Allrun without its solver, its decompose/reconstruct, and with runParallel run serially
+    sed -E -e '/decomposePar|reconstructPar|redistributePar/d' -e '/\$\(getApplication\)|runApplication +interFoam|runParallel +interFoam/d' \
+        -e 's/runParallel/runApplication/' "$d/Allrun" > "$d/Allrun.mesh"
+    ( cd "$d" && bash ./Allrun.mesh > log.allrunmesh 2>&1 ) || return 1
+    [ -d "$d/0" ] || cp -r "$d/0.orig" "$d/0"
+    python3 - "$d" "$dtOverride" <<'PY'
+import re, sys
+d, dtOverride = sys.argv[1], sys.argv[2]
+c = d + '/system/controlDict'
+s = open(c).read()
+dt = float(dtOverride) if dtOverride else float(re.search(r'^deltaT\s+([^;]+);', s, re.M).group(1))
+s = re.sub(r'\nfunctions\s*\{.*?\n\}', '\nfunctions\n{\n}', s, flags=re.S)
+if not re.search(r'^functions', s, re.M):
+    s += '\nfunctions\n{\n}\n'
+for k, v in [('deltaT', '%.12g' % dt), ('endTime', '%.12g' % (2*dt)), ('writeControl', 'timeStep'),
+             ('writeInterval', '1'), ('purgeWrite', '0'), ('adjustTimeStep', 'no'), ('writePrecision', '17'),
+             ('writeFormat', 'ascii'), ('writeCompression', 'off')]:
+    if re.search(r'^%s\s' % k, s, flags=re.M):
+        s = re.sub(r'^%s\s.*' % k, '%-16s%s;' % (k, v), s, flags=re.M)
+    else:
+        s = s.replace('\nfunctions\n', '\n%-16s%s;\nfunctions\n' % (k, v), 1)
+open(c, 'w').write(s)
+q = d + '/system/fvSolution'
+t = open(q).read()
+t = re.sub(r'(tolerance\s+)[^;]+;', r'\g<1>1e-13;', t)
+t = re.sub(r'(relTol\s+)[^;]+;', r'\g<1>0;', t)
+open(q, 'w').write(t)
+PY
+}
+# <tutorial>:<deltaT override>:<bound>. The bounds are one decade above the worst of host and device at
+# pinned solves (2026-09-30): capillaryRise 3.8e-14, weirOverflow 2.6e-12, damBreakPorousBaffle 3.5e-12,
+# nozzleFlow2D 1.3e-12, eulerianInjection 1.1e-13, damBreakPermeable 1.6e-13, angledDuct 1.3e-09 -- and
+# damBreakLeakage 3.6e-07, which is NOT a port gap: at step 2 its column stands at rest behind the shut
+# baffle and U is round-off on a near-zero scale (the leakage gate's own header; it compares after 520
+# steps, at 4.9e-12). The value check there is weak and says so; its structure check is not.
+W_CASES="
+laminar/capillaryRise::4e-13
+RAS/weirOverflow::3e-11
+RAS/angledDuct::2e-08
+RAS/damBreakLeakage::4e-06
+RAS/damBreakPorousBaffle::4e-11
+laminar/damBreakPermeable::2e-12
+LES/nozzleFlow2D:1e-9:2e-11
+laminar/vofToLagrangian/eulerianInjection::2e-12
+"
+for entry in $W_CASES; do
+    rel=${entry%%:*}; rest=${entry#*:}; dtw=${rest%%:*}; BOUND_W=${rest#*:}; key=$(basename "$rel")
+    src="$TUT/multiphase/interFoam/$rel"
+    [ -d "$src" ] || { say "ARM W  $key: tutorial missing" FAIL; continue; }
+    stage_allrun "$src" "$W/w_of_$key" "$dtw" || { say "ARM W  $key: meshing failed (see $W/w_of_$key/log.allrunmesh)" FAIL; continue; }
+    runof "$W/w_of_$key"
+    ot=$(timedirs "$W/w_of_$key")
+    [ "$(echo $ot | wc -w)" = 2 ] || { say "ARM W  $key: premise, OpenFOAM writes two steps [$ot]" FAIL; continue; }
+    for arm in $ARMS; do
+        d="$W/w_br_${key}_$arm"
+        mkdir -p "$d"
+        cp -r "$W/w_of_$key/0" "$W/w_of_$key/constant" "$W/w_of_$key/system" "$d/"
+        runbrae "$d" "$arm"
+        ok=1
+        [ "$(timedirs "$d")" = "$ot" ] || ok=0
+        for t in $ot; do
+            [ "$(filesets "$W/w_of_$key" $t)" = "$(filesets "$d" $t)" ] || ok=0
+        done
+        [ $ok -eq 1 ] && say "ARM W  [$arm] $key: OpenFOAM's directories and file sets" ok \
+                      || say "ARM W  [$arm] $key: OpenFOAM's directories and file sets" FAIL
+        python3 "$CMP" "$W/w_of_$key" "$d" $ot > "$W/cmp_w_${key}_$arm.txt" 2>&1
+        judge "$key $arm" "$W/cmp_w_${key}_$arm.txt" "$BOUND_W" "$W/w_of_$key/log.interFoam" \
+            && say "ARM W  [$arm] $key: every file's structure is OpenFOAM's, every value within $BOUND_W" ok \
+            || { say "ARM W  [$arm] $key: every file's structure is OpenFOAM's, every value within $BOUND_W" FAIL; grep -v RESULT "$W/cmp_w_${key}_$arm.txt" | grep -B1 "^      " | head -12; }
+    done
+done
+if [ -d "$W/w_of_weirOverflow" ]; then
+    d="$W/w_ctl_weir"
+    mkdir -p "$d"
+    cp -r "$W/w_of_weirOverflow/0" "$W/w_of_weirOverflow/constant" "$W/w_of_weirOverflow/system" "$d/"
+    runbrae "$d" host BRAE_CONTROL_ALPHA_OLD_START=1
+    python3 "$CMP" "$W/w_of_weirOverflow" "$d" $(timedirs "$W/w_of_weirOverflow") > "$W/cmp_w_ctl.txt" 2>&1
+    judge "control start-only" "$W/cmp_w_ctl.txt" 3e-11 | grep -q "over the bound: .*alpha.water_0" \
+        && say "CONTROL  BRAE_CONTROL_ALPHA_OLD_START=1 puts weirOverflow's alpha.water_0 over the bound" ok \
+        || say "CONTROL  BRAE_CONTROL_ALPHA_OLD_START=1 puts weirOverflow's alpha.water_0 over the bound" FAIL
+fi
+
+# ---------------------------------------------------------------------------------------------------
+# R: a file brae cannot write yet -- laminar/waves/stokesI's wave-model state, uniform/waveProperties.<patch>
+# (waveModel.C:250-261) -- is named at startup, before the first step, and the run stops at its first write
+# time having written nothing. (Until the condition write()s landed this arm used capillaryRise's contact
+# angle; that one is written now.) CONTROL: the same case whose only write time lies past endTime runs to
+# its end: the refusal is of the OUTPUT, and a run that never reaches a write is not refused.
+STK="$TUT/multiphase/interFoam/laminar/waves/stokesI"
+if [ -d "$STK" ]; then
+    stage "$STK" "$W/stk" 0.05 timeStep 3 0 adjustTimeStep=no deltaT=0.01 || exit 1
     # line-buffered: the refusal goes to stderr, the steps to stdout, and only then is file order time order
-    ( cd "$W/cap" && stdbuf -oL -eL "$BIN" -case . > log.brae 2>&1 ); rc=$?
-    python3 - "$W/cap/log.brae" "$rc" "$(timedirs "$W/cap")" <<'PY' && say "ARM R  an untranscribed condition is named before step 1; the run stops at its first write, nothing written" ok \
-                                                                    || say "ARM R  an untranscribed condition is named before step 1; the run stops at its first write, nothing written" FAIL
+    ( cd "$W/stk" && stdbuf -oL -eL "$BIN" -case . > log.brae 2>&1 ); rc=$?
+    python3 - "$W/stk/log.brae" "$rc" "$(timedirs "$W/stk")" <<'PY' && say "ARM R  an unwritten file is named before step 1; the run stops at its first write, nothing written" ok \
+                                                                    || say "ARM R  an unwritten file is named before step 1; the run stops at its first write, nothing written" FAIL
 import re, sys
 log, rc, dirs = open(sys.argv[1]).read(), int(sys.argv[2]), sys.argv[3].strip()
-named = log.find('will not be written (brae interFoam writer: alpha.water on patch `walls`: its condition '
-                 '`constantAlphaContactAngle`')
+named = log.find('uniform/waveProperties.<patch> will not be written')
 first = re.search(r'^\s*t = ', log, flags=re.M)
 # the third step's line prints after runTime.write(), which is where the run stops
 steps = len(re.findall(r'^\s*t = ', log, flags=re.M))
@@ -361,13 +567,13 @@ print('      exit %d, named at offset %d, first step at %s, %d step lines, stop 
 sys.exit(0 if rc != 0 and 0 <= named < (first.start() if first else -1) and steps == 2
               and stop > first.start() and not dirs else 1)
 PY
-    stage "$CAP" "$W/cap_ctl" 3.5e-05 timeStep 1000 0 || exit 1
-    ( cd "$W/cap_ctl" && "$BIN" -case . > log.brae 2>&1 ) \
-        && [ -z "$(timedirs "$W/cap_ctl")" ] && grep -q "will not be written" "$W/cap_ctl/log.brae" \
+    stage "$STK" "$W/stk_ctl" 0.02 timeStep 1000 0 adjustTimeStep=no deltaT=0.01 || exit 1
+    ( cd "$W/stk_ctl" && "$BIN" -case . > log.brae 2>&1 ) \
+        && [ -z "$(timedirs "$W/stk_ctl")" ] && grep -q "will not be written" "$W/stk_ctl/log.brae" \
         && say "CONTROL  the same case with no write time before endTime runs to its end (exit 0)" ok \
-        || { say "CONTROL  the same case with no write time before endTime runs to its end (exit 0)" FAIL; tail -3 "$W/cap_ctl/log.brae" | sed 's/^/      /'; }
+        || { say "CONTROL  the same case with no write time before endTime runs to its end (exit 0)" FAIL; tail -3 "$W/stk_ctl/log.brae" | sed 's/^/      /'; }
 else
-    say "ARM R  capillaryRise tutorial missing" FAIL
+    say "ARM R  stokesI tutorial missing" FAIL
 fi
 
 [ $fail -eq 0 ] && echo "PASS: brae_interFoam writes OpenFOAM's time directories, when OpenFOAM does, without moving the run"

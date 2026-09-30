@@ -298,9 +298,8 @@ int main(int argc, char** argv)
         // UNDER adjustTimeStep endTime is the only bound: a Courant-limited run whose step averages
         // below deltaT/4 -- a filling case -- stopped at the old 4x count before endTime, printed `End:`
         // and said nothing. The count stays the bound of a fixed-step case.
-        const bool adjustTimeStep = controlDict.wordOr("adjustTimeStep", "no") == "yes"
-                                 || controlDict.wordOr("adjustTimeStep", "no") == "on"
-                                 || controlDict.wordOr("adjustTimeStep", "no") == "true";
+        // the reader the time loop's own controls use (readTimeControls.H), not a second parse of the entry
+        const bool adjustTimeStep = TimeControls::read(controlDict).adjustTimeStep;
         const label nSteps = (deltaT0 > scalar(0))
             ? (adjustTimeStep ? label(2000000000)
                               : static_cast<label>(scalar(4)*(endTime - startTime) / deltaT0 + scalar(0.5)))

@@ -187,6 +187,10 @@ struct DeviceInterAlphaControls
     DeviceBuffer<scalar>* alphaPhiWriteInt = nullptr;
     DeviceBuffer<scalar>* alphaPhiWriteBnd = nullptr;
     DeviceBuffer<scalar>* alphaPhiWriteIf  = nullptr;
+    // alpha1Bnd as the LAST sub-cycle begins, before it updates any patch: what the sub-cycle's
+    // storeOldTime copies into the old level (GeometricField.C:932), which keeps it on a patch whose
+    // operator= is a no-op. Null copies nothing.
+    DeviceBuffer<scalar>* alphaSubCycleBndWrite = nullptr;
     // ...and, when the old level is created by this call, the copy it was created as (the flux BEFORE
     // the un-blend), which every later pass of the same time step reads
     DeviceBuffer<scalar>* alphaPhiCreatedInt = nullptr;

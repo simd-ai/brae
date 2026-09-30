@@ -2052,18 +2052,20 @@ RunReport runInterFoamDevice(
     // its last alpha solve leaves, copied out on the device only on a write step
     bool writeNow = false;
     DeviceBuffer<scalar> dAlphaPhiWriteI, dAlphaPhiWriteB, dAlphaPhiWriteIf;
-    // continuityErrs.H after every corrector, for uniform/cumulativeContErr -- one reduction and one
-    // scalar read-back per corrector, and none at all without a writer. A periodic pair's faces are not
-    // in deviceDiv's sum; they cancel in the volume-weighted total up to rounding.
-    scalar sumV = 0;
-    for (scalar v : g.V())
-    {
-        sumV += v;
-    }
+    // alpha.<phase1>_0 of a sub-cycled alpha: alpha as the step found it, downloaded only on a write step
+    std::vector<scalar> alphaOldWrite;
+    std::vector<std::vector<scalar>> alphaOldBndWrite;
+    // ...and alpha1Bnd as the step's last sub-cycle began, copied on the device on a write step
+    DeviceBuffer<scalar> dAlphaSubBndWrite;
+    std::vector<std::vector<scalar>> alphaSubBndWrite;
+    // continuityErrs.H after every corrector, for uniform/cumulativeContErr -- one divergence and one
+    // read-back per corrector, and none at all without a writer. A periodic pair's faces are not in
+    // deviceDiv's sum; they cancel in the volume-weighted total up to rounding.
     if (writer)
     {
-        H.correctorDone = [&](const DeviceBuffer<scalar>& phiInt,
-                              const DeviceBuffer<scalar>& phiBnd)
+        H.correctorDone = [&](
+            const DeviceBuffer<scalar>& phiInt,
+            const DeviceBuffer<scalar>& phiBnd)
         {
             DeviceBuffer<scalar> divPhi;
             deviceDiv(dm, phiInt, phiBnd, divPhi);
@@ -2388,9 +2390,19 @@ RunReport runInterFoamDevice(
                 writer->stepTaken(rep.deltaT);
                 writeNow = writer->isWriteTime(writer->startTimeIndex() + stepIndex, indexMoved);
             }
+            if (writeNow && writer->writesAlphaOld())
+            {
+                dA.copyTo(alphaOldWrite);
+                alphaOldBndWrite.assign(f.alpha1.boundary.size(), std::vector<scalar>());
+                for (std::size_t pi = 0; pi < f.alpha1.boundary.size(); ++pi)
+                {
+                    alphaOldBndWrite[pi] = f.alpha1.boundary[pi]->value();
+                }
+            }
             C.alphaPhiWriteInt = writeNow ? &dAlphaPhiWriteI : nullptr;
             C.alphaPhiWriteBnd = writeNow ? &dAlphaPhiWriteB : nullptr;
             C.alphaPhiWriteIf  = writeNow ? &dAlphaPhiWriteIf : nullptr;
+            C.alphaSubCycleBndWrite = (writeNow && writer->writesAlphaOld()) ? &dAlphaSubBndWrite : nullptr;
         }
 
         // rho.oldTime() for the closure's ddt: f.rho still holds what the LAST step's hook left, and
@@ -3132,6 +3144,12 @@ RunReport runInterFoamDevice(
 
             // mesh().changing() this step: the registry is bypassed and deleted (gradScheme.C:132-142)
             C.gradUMeshChanging = dyn && dyn->moving();
+            // subCycle.H:78: the run's first alpha1.oldTime() creates the old level ahead of this step's
+            // alpha solve, keeping the valueFractions and contact-angle gradients alpha has now (idempotent)
+            if (writer && writer->writesAlphaOld())
+            {
+                writer->noteAlphaOldCreation(f.alpha1);
+            }
             deviceInterStep(dm, rep.deltaT, C, props, H, dGh, dGhf, dMagSf,
                             dA, dAOld, dUx, dUy, dUz, dUox, dUoy, dUoz,
                             dUobx, dUoby, dUobz,
@@ -3402,7 +3420,9 @@ RunReport runInterFoamDevice(
         rep.time += rep.deltaT;
 
         // runTime.write() (interFoam.C:175): the cells from the device into writer-owned copies, the patch
-        // values as the hooks left them on the host -- nothing evaluated, nothing written back into f
+        // values as the hooks left them on the host. The closure is the exception: its download writes
+        // f.turbulence, the host copy this loop never reads -- arm F of tests/interfoam_write_vs_openfoam.sh
+        // holds the run byte-identical whether it writes every step or once.
         if (writer && writeNow)
         {
             std::vector<scalar> aW, prghW, pW, ux, uy, uz;
@@ -3470,13 +3490,13 @@ RunReport runInterFoamDevice(
                 deviceFluxConditional(dTurb.dbK, dTurb.k, f.turbulence.k);
                 if (f.turbulence.model != cpu::interFoam::InterRasModel::KEqnLES)
                 {
-                    GeometricField<scalar>& second = (f.turbulence.model == cpu::interFoam::InterRasModel::KOmegaSST)
-                        ? f.turbulence.omega
-                        : f.turbulence.epsilon;
+                    const bool sst = f.turbulence.model == cpu::interFoam::InterRasModel::KOmegaSST;
+                    GeometricField<scalar>& second = sst ? f.turbulence.omega : f.turbulence.epsilon;
                     deviceFluxConditional(dTurb.dbEps, dTurb.epsilon, second);
                 }
             }
-            const std::vector<std::vector<scalar>> pB = staticPressureBoundary(f.p_rgh, stepRhoBnd, f.ghfBoundary);
+            const std::vector<std::vector<scalar>> pB =
+                staticPressureBoundary(f.p_rgh, stepRhoBnd, f.ghfBoundary);
             InterWriteState ws;
             ws.time = rep.time;
             ws.timeIndex = writer->startTimeIndex() + rep.steps;
@@ -3492,6 +3512,19 @@ RunReport runInterFoamDevice(
             ws.alpha1Cells = &aW;
             ws.UCells = &uW;
             ws.p_rghCells = &prghW;
+            ws.alpha1OldCells = &alphaOldWrite;
+            ws.alpha1OldBoundary = &alphaOldBndWrite;
+            // coupled patches keep the host's values; the writer takes the step's start there anyway
+            alphaSubBndWrite.assign(f.alpha1.boundary.size(), std::vector<scalar>());
+            for (std::size_t pi = 0; pi < f.alpha1.boundary.size(); ++pi)
+            {
+                alphaSubBndWrite[pi] = f.alpha1.boundary[pi]->value();
+            }
+            if (writer->writesAlphaOld() && dAlphaSubBndWrite.size())
+            {
+                unflatten(dAlphaSubBndWrite, alphaSubBndWrite);
+            }
+            ws.alpha1SubCycleBoundary = &alphaSubBndWrite;
             writer->write(ws);
         }
 

@@ -24,6 +24,11 @@ CASE_TIMEOUT=${CASE_TIMEOUT:-600}
 MESH_TIMEOUT=${MESH_TIMEOUT:-600}
 W=${KEEP_W:-$(mktemp -d)}
 ONLY=${ONLY:-}
+# ARMS="host" halves a census; ALL_REASONS=1 lists EVERY file the writer names at startup under a refused
+# case -- the verdict line shows only the first, and a moving case is refused for several
+ARMS=${ARMS:-host device}
+ALL_REASONS=${ALL_REASONS:-}
+mkdir -p "$W"
 
 [ -x "$BIN" ] || { echo "SKIP: $BIN not built"; exit 77; }
 [ -f "$OFBASHRC" ] || { echo "SKIP: no OpenFOAM to mesh with"; exit 77; }
@@ -108,13 +113,18 @@ s = open(p).read()
 m = re.search(r'^deltaT\s+([0-9.eE+-]+)\s*;', s, re.M)
 dt = float(m.group(1)) if m else 1e-4
 s = re.sub(r'^endTime\s+.*$', 'endTime         %.10g;' % (n*dt), s, flags=re.M)
-s = re.sub(r'^writeInterval\s+.*$', 'writeInterval   %.10g;' % (n*dt), s, flags=re.M)
+# the last step writes, so the sweep exercises brae_interFoam's writer too: a time under the run-time
+# controls, a STEP COUNT under `timeStep` -- where n*dt is a fraction, which the writer rightly refuses,
+# and every timeStep case read as refused by the staging rather than by brae
+wc = re.search(r'^writeControl\s+(\w+)', s, re.M)
+wi = n if (wc and wc.group(1) == 'timeStep') else n*dt
+s = re.sub(r'^writeInterval\s+.*$', 'writeInterval   %.10g;' % wi, s, flags=re.M)
 s = re.sub(r'^adjustTimeStep\s+.*$', 'adjustTimeStep  no;', s, flags=re.M)
 s = re.sub(r'\nfunctions\s*\{.*\n\}\s*\n', '\n', s, flags=re.S)
 open(p, 'w').write(s)
 PY
 
-    for arm in host device; do
+    for arm in $ARMS; do
         [ "$arm" = device ] && flag="-device" || flag=""
         out=$(cd "$c" && timeout "$CASE_TIMEOUT" "$BIN" -case "$c" $flag 2>&1)
         rc=$?
@@ -133,6 +143,11 @@ PY
             verdict="REFUSED/ERR: $why"
         fi
         printf '%-46s %-10s %s\n' "$rel" "$arm" "$verdict"
+        if [ -n "$ALL_REASONS" ] && [ $rc -ne 0 ]; then
+            printf '%s\n' "$out" | sed -n 's/^brae interFoam: \(.*\) will not be written (\(.*\)$/      - \1: \2/p' \
+                | sed -E 's/brae interFoam writer: [^ ]+ on patch (`[^`]*`): its condition (`[^`]*`) has no transcribed write\(\).*/\2 on \1/' \
+                | cut -c1-140 | sort -u
+        fi
     done
     rm -rf "$c"
 done

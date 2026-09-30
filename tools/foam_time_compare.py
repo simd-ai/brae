@@ -18,7 +18,7 @@ uniform/functionObjects/functionObjectProperties is compared as TEXT after the b
 function-object state, and a case run with `functions {}` has none on either side.
 
 Prints one line per file and a final `RESULT {json}` line: {"structure": <failures>, "files":
-{"<time>/<file>": {"structure": bool, "rel": x, "notes": [...]}}, "fileset": [...]}. Exit status is 1 when
+{"<time>/<file>": {"structure": bool, "rel": x, "abs": |a - b|, "notes": [...]}}, "fileset": [...]}. Exit status is 1 when
 any structure check fails, else 0 -- value bounds belong to the caller, which knows what it measured.
 """
 import gzip
@@ -205,7 +205,12 @@ def main():
                 f.endswith("functionObjectProperties"))
             if not fc.structure:
                 result["structure"] += 1
-            result["files"][tag] = {"structure": fc.structure, "rel": fc.rel(), "notes": fc.notes}
+            result["files"][tag] = {
+                "structure": fc.structure,
+                "rel": fc.rel(),
+                "abs": fc.worst,
+                "notes": fc.notes,
+            }
             print("  %-48s structure %-4s worst rel %.3e" % (tag, "ok" if fc.structure else "BAD", fc.rel()))
             for n in fc.notes[:6]:
                 print("      " + n)
