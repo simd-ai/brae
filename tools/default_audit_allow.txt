@@ -461,3 +461,18 @@ KEpsilonCoeffs keCase A0
 KEpsilonCoeffs keCase realizable
 KEpsilonCoeffs keCase kappa
 KEpsilonCoeffs keCase E
+
+# CrankNicolson ON A MOVING MESH and its written state (U7, 2026-10-01). kEpsilonRef::Compressible is built
+# at four sites and only interFoam's live closure call (inter_turbulence_cpp.cu, the `in.cn` block) is ever
+# under CrankNicolson: the validate / correctNutField sites assemble no ddt at all, and rhoSimpleFoam's ddt
+# is steadyState on a mesh that cannot move (rhoSimpleFoam.C:58, createMesh.H).
+kEpsilonRef::Compressible comp V00  # read only beside `cn` AND `V0`, and V0 without it is a refusal by name ("which reads mesh().V00(); the caller supplied V0 alone", kEpsilon_cpp.cu); the three other sites set no `cn`
+kEpsilonRef::Compressible comp cnPatchK  # read only inside the CrankNicolson fvm::ddt (the other sites set no `cn`); null keeps ddt0's cells alone, which is all the solve reads, and the writer refuses a ddt0 with no patch values ("holds no patch values", inter_writer_cpp.cu)
+kEpsilonRef::Compressible comp cnPatchEps  # same
+kEpsilonRef::Compressible comp cnStaticControl  # A GATE'S CONTROL (BRAE_CONTROL_CN_CLOSURE_STATIC), never a case setting: false IS OpenFOAM's branch choice (CrankNicolsonDdtScheme.C:862, mesh().moving())
+kEpsilonRef::Compressible comp epsOldCreated  # set only on the ONE call that creates epsilon.oldTime() on a cold start under CrankNicolson (GeometricField.C:940-972); the other sites assemble no ddt or a steadyState one, where no old level is ever asked for
+kEpsilonRef::Compressible comp epsOldBndCreated  # same
+# the HOST closure run inside the device loop (the instrument above): V00 is CrankNicolson's alone
+InterTurbulenceStepInput ti V00  # read only under CrankNicolson (it sits beside `cn`), and "BRAE_INTER_HOST_CLOSURE under CrankNicolson is not carried" refuses that first (inter_driver_device.cu)
+# the device loop's write: CrankNicolson's written state is the host loop's own objects
+InterWriteState ws cn  # the device loop refuses the files by name at start-up ("CrankNicolson's state on a moving mesh, which the device loop does not keep in its written form") and stops before its first write -- ARM ddt_cnMovingDeviceWrite (tests/interfoam_refusals.sh)

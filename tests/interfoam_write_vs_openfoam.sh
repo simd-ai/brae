@@ -40,7 +40,7 @@
 #          unrefinement, a write before any change with a restart from it (the global refine index), and a
 #          restart from a compressed refined write (the .gz lookups).
 #   ARM Z  a coupled (cyclicAMI) patch's rAU and p are the result's own cells evaluated; control
-#          BRAE_CONTROL_COUPLED_OPERAND_VALUES=1 on mixerVesselAMI (staged to PCG: GAMG across an AMI is not ported).
+#          BRAE_CONTROL_COUPLED_OPERAND_VALUES=1 on mixerVesselAMI (OpenFOAM staged to PCG; brae falls back to it).
 #   ARM M  a moving mesh's cumulativeContErr is the absolute flux's (sloshingTank2D), with its control.
 #   ARM P  the mesh update's CorrectPhi continuity error counts (waveMakerPiston, loose pcorr), with its
 #          control BRAE_CONTROL_NO_CORRECTPHI_CONTERR=1.
@@ -170,6 +170,14 @@ judge()   # judge <label> <resultFile> <bound> [ofLog]
 import json, re, sys
 label, path, bound = sys.argv[1], sys.argv[2], float(sys.argv[3])
 r = json.loads([l for l in open(path) if l.startswith('RESULT ')][-1][7:])
+# AN OLD-TIME LEVEL IS HELD ON ITS FIELD'S SCALE where that is the larger: <X>_0 is X one step back, and a
+# level that is still zero -- floatingObject's U_0 at the first write, whose only non-zero entries are the
+# 1.7e-14 m/s round-off of a wall that has not moved -- has no scale of its own to be relative to.
+for k, v in r['files'].items():
+    parent = r['files'].get(k[:-2]) if k.endswith('_0') else None
+    if parent and parent['rel'] > 0 and v['rel'] > 0:
+        own = v['abs'] / v['rel']
+        v['rel'] = v['abs'] / max(own, parent['abs'] / parent['rel'])
 floor = 0.0
 if len(sys.argv) > 4:
     log = open(sys.argv[4]).read()
@@ -606,6 +614,7 @@ laminar/damBreakWithObstacle::2e-11:3e-11
 laminar/oscillatingBox::2e-10:-
 RAS/motorBike::9e-12:2e-11
 RAS/mixerVesselAMI::5e-11:-
+RAS/floatingObject::1e-12:-
 "
 # RAS/DTCHullMoving (rigidBodyMotion: pointDisplacement, uniform/rigidBodyMotionState, points, meshPhi, Uf,
 # rAU): host 2.4e-11, pointDisplacement at 0.0002 (1.1e-16 absolute on a 4.7e-06 largest); polyMesh/points
@@ -620,10 +629,15 @@ RAS/mixerVesselAMI::5e-11:-
 # a mesh that refines AND moves, by name: `-`); motorBike 8.8e-13 host / 1.0e-12 device (snappy's binary
 # levels and its level0Edge 0.5 read, the frozenPoints zone written with its meta).
 # RAS/mixerVesselAMI (U4: rAU and p on the cyclicAMI pair, the result's own cells evaluated -- every field
-# expression ends in correctLocalBoundaryConditions, GeometricFieldFunctionsM.C:50), staged to PCG: host
+# expression ends in correctLocalBoundaryConditions, GeometricFieldFunctionsM.C:50), OpenFOAM staged to PCG: host
 # 4.3e-12 (2026-10-01, 895k cells). Its device bound is `-`: the device loop does not couple a cyclicAMI.
+# RAS/floatingObject AS SHIPPED (U7: CrankNicolson 0.5 on a mesh a rigid body moves, kEpsilon, three outer
+# correctors, correctPhi): the scheme's ddt0 fields with their patches, U_0 / k_0 / epsilon_0, meshPhiCN_0 and
+# V0, host worst 1.2e-13 (0.02/phi; 2026-10-01). Its device bound is `-`: the device loop refuses a rigid
+# body by name. Arm X holds what this row cannot witness, and its controls.
 BOUND_RB_DTC=4e-15
 BOUND_FO=9e-13
+BOUND_WFO=1e-12
 for entry in $W_CASES; do
     rel=${entry%%:*}; rest=${entry#*:}; dtw=${rest%%:*}; bounds=${rest#*:}; key=$(basename "$rel")
     BOUND_WH=${bounds%%:*}; BOUND_WD=${bounds#*:}
@@ -631,9 +645,12 @@ for entry in $W_CASES; do
     [ -d "$src" ] || { say "ARM W  $key: tutorial missing" FAIL; continue; }
     stage_allrun "$src" "$W/w_of_$key" "$dtw" || { say "ARM W  $key: meshing failed (see $W/w_of_$key/log.allrunmesh)" FAIL; continue; }
     if [ "$key" = mixerVesselAMI ]; then
-        # STAGED, in both codes, and not claimed: p_rgh (and pcorr, which takes $p_rgh) GAMG -> PCG with DIC.
-        # GAMG across an AMI agglomerates the interface (cyclicAMIGAMGInterface), which is not ported -- brae
-        # refuses GAMG on that patch by name. tests/interfoam_ami_vs_openfoam.sh stages the same way.
+        # STAGED IN OPENFOAM ONLY, and not claimed: p_rgh (and pcorr, which takes $p_rgh) GAMG -> PCG with DIC.
+        # GAMG across an AMI agglomerates the interface (cyclicAMIGAMGInterface), which is not ported; brae
+        # reads the tutorial's OWN GAMG entry (kept beside as fvSolution.gamg), runs PCG with DIC in its place
+        # and says so. So the oracle is OpenFOAM running the solver brae runs. Against OpenFOAM's own GAMG the
+        # same brae run is 1.2e-09 off (p, 2026-10-01, pinned solves: GAMG stops at its 1000-iteration cap).
+        cp "$W/w_of_$key/system/fvSolution" "$W/w_of_$key/system/fvSolution.gamg"
         python3 - "$W/w_of_$key/system/fvSolution" <<'EOF_PCG' || say "ARM W  mixerVesselAMI: the PCG staging did not apply" FAIL
 import re, sys
 p = sys.argv[1]
@@ -657,7 +674,7 @@ EOF_PCG
         # the case's own (several device refusals end in "Run without -device"), and that it wrote nothing
         if [ "$BOUND_W" = "-" ]; then
             case $key in
-                DTCHullMoving) why="moves its mesh with a rigidBodyMotion" ;;
+                DTCHullMoving|floatingObject) why="moves its mesh with a rigidBodyMotion" ;;
                 oscillatingBox) why="the mesh refines AND a motion solver moves it" ;;
                 mixerVesselAMI) why="is cyclicAMI and its coupling is not attached" ;;
                 *) why="" ;;
@@ -669,7 +686,14 @@ EOF_PCG
                 || { say "ARM W  [$arm] $key: refused at startup, by name, nothing written" FAIL; tail -3 "$d/log.brae" | sed 's/^/      /'; }
             continue
         fi
+        [ "$key" = mixerVesselAMI ] && cp "$d/system/fvSolution.gamg" "$d/system/fvSolution"
         runbrae "$d" "$arm"
+        if [ "$key" = mixerVesselAMI ]; then
+            grep -q "solver          GAMG;" "$d/system/fvSolution" \
+                && grep -q "across which brae's GAMG is not ported" "$d/log.brae" \
+                && say "ARM W  [$arm] $key: brae read the tutorial's GAMG entry and announced PCG with DIC in its place" ok \
+                || say "ARM W  [$arm] $key: brae read the tutorial's GAMG entry and announced PCG with DIC in its place" FAIL
+        fi
         ok=1
         [ "$(timedirs "$d")" = "$ot" ] || ok=0
         for t in $ot; do
@@ -998,6 +1022,16 @@ if [ -d "$W/w_of_mixerVesselAMI" ]; then
     d="$W/z_ctl_operands"
     mkdir -p "$d"
     cp -r "$W/w_of_mixerVesselAMI/0" "$W/w_of_mixerVesselAMI/constant" "$W/w_of_mixerVesselAMI/system" "$d/"
+    # ...and the fallback's own control: with BRAE_CONTROL_NO_AMI_PCG_FALLBACK=1 the tutorial's GAMG entry is
+    # left as read, and brae stops on the pair by name with nothing written
+    e="$W/z_ctl_nofallback"
+    mkdir -p "$e"
+    cp -r "$W/w_of_mixerVesselAMI/0" "$W/w_of_mixerVesselAMI/constant" "$W/w_of_mixerVesselAMI/system" "$e/"
+    cp "$e/system/fvSolution.gamg" "$e/system/fvSolution"
+    ( cd "$e" && BRAE_CONTROL_NO_AMI_PCG_FALLBACK=1 "$BIN" -case . > log.brae 2>&1 ); rc=$?
+    [ $rc -ne 0 ] && grep -q "is an AMI" "$e/log.brae" && [ -z "$(timedirs "$e")" ] \
+        && say "CONTROL  BRAE_CONTROL_NO_AMI_PCG_FALLBACK=1 stops mixerVesselAMI on its GAMG entry, by name" ok \
+        || say "CONTROL  BRAE_CONTROL_NO_AMI_PCG_FALLBACK=1 stops mixerVesselAMI on its GAMG entry, by name" FAIL
     runbrae "$d" host BRAE_CONTROL_COUPLED_OPERAND_VALUES=1
     python3 "$CMP" "$W/w_of_mixerVesselAMI" "$d" $(timedirs "$W/w_of_mixerVesselAMI") > "$W/cmp_z.txt" 2>&1
     judge "control operand values" "$W/cmp_z.txt" 5e-11 "$W/w_of_mixerVesselAMI/log.interFoam" > "$W/z.txt"
@@ -1129,10 +1163,9 @@ fi
 # size, and the text with every number masked must be OpenFOAM's -- the list form included: `N ( a b )`,
 # and `N { v }` for a list of equal entries (UListIO.C:119-123), which a body at rest writes.
 #   DTCHullMoving (arm W's run, host): a body that moves, q/qDot/qDdot nonuniform.
-#   floatingObject with `ddtSchemes default Euler`: the shipped CrankNicolson writes old-time fields brae
-#     does not (U7); under Euler OpenFOAM writes none, and its accelerationRelaxation is 0 until t = 4, so
-#     the body stays at rest and writes `2 { 0 }`. The scheme is the staging's, stated; the file under test
-#     is the same.
+#   floatingObject with `ddtSchemes default Euler`: its accelerationRelaxation is 0 until t = 4, so the
+#     body stays at rest and writes `2 { 0 }`. The scheme is the staging's, stated (this arm predates the
+#     CrankNicolson writer; the tutorial as shipped is arm W's row and arm X); the file under test is the same.
 # CONTROLS: BRAE_CONTROL_RBSTATE_PAREN=1 (the uniform lists in the paren form) fails the text on
 # floatingObject; BRAE_CONTROL_RBSTATE_OLD=1 (motionState0_, the step's start, which OpenFOAM never writes)
 # fails DTCHullMoving's entries.
@@ -1370,6 +1403,92 @@ sys.exit(1 if bad else 0)
 EOF_P6
 else
     say "ARM Q  floatingObject tutorial missing" FAIL
+fi
+
+# ---------------------------------------------------------------------------------------------------
+# X: CrankNicolson's state on a MOVING mesh (U7) -- RAS/floatingObject as shipped is arm W's row; these are
+# what that row cannot witness, and the controls of what it can.
+#   THE TUTORIAL AS SHIPPED keeps its body at rest until t = 4 (accelerationRelaxation is a table that is
+#   zero until then), so no cell changes volume and the closure's moving fvm::ddt is the static one
+#   arithmetically, and it ends before Uf_0 is first written (the third step). X1 RELEASES THE BODY --
+#   `accelerationRelaxation 0.7`, the table's own final value, in both codes -- and runs five steps: the mesh
+#   deforms, V0 and V00 differ, and OpenFOAM writes Uf_0. MEASURED (2026-10-01, host): worst file
+#   meshPhiCN_0 3.0e-11, every field below 2e-12.
+# CONTROLS, each asserted red:
+#   BRAE_CONTROL_CN_CLOSURE_STATIC=1 on X1 (kEpsilon's fvm::ddt on the scheme's static branch): ddt0(k)
+#     2.3e-03, epsilon 5.9e-04.
+#   BRAE_CONTROL_CN_PHIOLD_PREV=1 on the tutorial (the alpha blend's phi.oldTime() left at the previous
+#     step's flux in the correctors after the one that created it): U 2.9e-08, rAU 4.4e-08 at step two.
+#   BRAE_CONTROL_CN_OLD_AT_ENTRY=1 on the tutorial (epsilon.oldTime() taken before the wall function's
+#     update on a cold start): epsilon_0 8.7e-01 at the first write.
+#   BRAE_CONTROL_CN_DDT0_CELLS_ONLY=1 on the tutorial (the ddt0 fields' patches left zero): ddt0(k) and
+#     ddt0(epsilon) 1.0e+00 at step two.
+BOUND_X1=3e-10
+if [ -d "$FO" ] && [ -d "$W/w_of_floatingObject" ]; then
+    d="$W/x1_of"
+    mkdir -p "$d"
+    cp -r "$W/w_of_floatingObject/0" "$W/w_of_floatingObject/constant" "$W/w_of_floatingObject/system" "$d/"
+    python3 - "$d" <<'EOF_X1' || say "ARM X1 floatingObject: the released-body staging did not apply" FAIL
+import re, sys
+d = sys.argv[1]
+p = d + '/constant/dynamicMeshDict'
+t = open(p).read()
+t, k = re.subn(r'accelerationRelaxation\s+table\s*\((?:[^()]|\([^()]*\))*\)\s*;', 'accelerationRelaxation 0.7;', t, flags=re.S)
+open(p, 'w').write(t)
+p = d + '/system/controlDict'
+c = open(p).read()
+dt = float(re.search(r'^deltaT\s+([^;]+);', c, re.M).group(1))
+c, n1 = re.subn(r'^(endTime\s+)[^;]*;', r'\g<1>%.12g;' % (5*dt), c, flags=re.M)
+c, n2 = re.subn(r'^(writeInterval\s+)[^;]*;', r'\g<1>5;', c, flags=re.M)
+open(p, 'w').write(c)
+sys.exit(0 if (k, n1, n2) == (1, 1, 1) else 1)
+EOF_X1
+    grep -qE '^\s*default\s+CrankNicolson 0\.5;' "$d/system/fvSchemes" \
+        && say "fixture witnesses: floatingObject ships \`CrankNicolson 0.5\`" ok \
+        || say "fixture witnesses: floatingObject ships \`CrankNicolson 0.5\`" FAIL
+    runof "$d"
+    xt=$(echo $(timedirs "$d"))
+    [ "$(echo $xt | wc -w)" = 1 ] && [ -f "$d/$xt/Uf_0" ] \
+        && say "fixture witnesses: OpenFOAM's released body writes one time, with Uf_0 in it" ok \
+        || say "fixture witnesses: OpenFOAM's released body writes one time, with Uf_0 in it" FAIL
+    for v in run static; do
+        e="$W/x1_br_$v"
+        mkdir -p "$e"
+        cp -r "$d/0" "$d/constant" "$d/system" "$e/"
+    done
+    runbrae "$W/x1_br_run" host
+    [ "$(echo $(timedirs "$W/x1_br_run"))" = "$xt" ] && [ "$(filesets "$d" $xt)" = "$(filesets "$W/x1_br_run" $xt)" ] \
+        && say "ARM X1 [host] floatingObject released: OpenFOAM's directory and file set, Uf_0 included" ok \
+        || say "ARM X1 [host] floatingObject released: OpenFOAM's directory and file set, Uf_0 included" FAIL
+    python3 "$CMP" "$d" "$W/x1_br_run" $xt > "$W/cmp_x1.txt" 2>&1
+    judge "floatingObject released" "$W/cmp_x1.txt" "$BOUND_X1" "$d/log.interFoam" \
+        && say "ARM X1 [host] floatingObject released: every file's structure is OpenFOAM's, every value within $BOUND_X1" ok \
+        || { say "ARM X1 [host] floatingObject released: every file's structure is OpenFOAM's, every value within $BOUND_X1" FAIL; grep -v RESULT "$W/cmp_x1.txt" | grep -B1 "^      " | head -12; }
+    runbrae "$W/x1_br_static" host BRAE_CONTROL_CN_CLOSURE_STATIC=1
+    python3 "$CMP" "$d" "$W/x1_br_static" $xt > "$W/cmp_x1_static.txt" 2>&1
+    judge "control closure static" "$W/cmp_x1_static.txt" "$BOUND_X1" "$d/log.interFoam" > "$W/x1_static.txt" \
+        && { say "CONTROL  BRAE_CONTROL_CN_CLOSURE_STATIC=1 puts the released body's k and epsilon over the bound" FAIL; cat "$W/x1_static.txt"; } \
+        || say "CONTROL  BRAE_CONTROL_CN_CLOSURE_STATIC=1 puts the released body's k and epsilon over the bound" ok
+    grep -qE "over the bound: [0-9.e+-]+/(k|epsilon) " "$W/x1_static.txt" \
+        && say "CONTROL  ...and it is k or epsilon that goes over" ok \
+        || { say "CONTROL  ...and it is k or epsilon that goes over" FAIL; cat "$W/x1_static.txt"; }
+    # the three controls on the tutorial as shipped, against arm W's own OpenFOAM run and bound
+    ot=$(timedirs "$W/w_of_floatingObject")
+    for ctl in "BRAE_CONTROL_CN_PHIOLD_PREV:/U " "BRAE_CONTROL_CN_OLD_AT_ENTRY:/epsilon_0 " "BRAE_CONTROL_CN_DDT0_CELLS_ONLY:/ddt0\\(k\\) "; do
+        var=${ctl%%:*}
+        file=${ctl#*:}
+        e="$W/x_ctl_$var"
+        mkdir -p "$e"
+        cp -r "$W/w_of_floatingObject/0" "$W/w_of_floatingObject/constant" "$W/w_of_floatingObject/system" "$e/"
+        runbrae "$e" host "$var=1"
+        python3 "$CMP" "$W/w_of_floatingObject" "$e" $ot > "$W/cmp_x_$var.txt" 2>&1
+        judge "control $var" "$W/cmp_x_$var.txt" "$BOUND_WFO" "$W/w_of_floatingObject/log.interFoam" > "$W/x_$var.txt"
+        grep -qE "over the bound: [0-9.e+-]+$file" "$W/x_$var.txt" \
+            && say "CONTROL  $var=1 puts floatingObject's ${file% } over the bound" ok \
+            || { say "CONTROL  $var=1 puts floatingObject's ${file% } over the bound" FAIL; cat "$W/x_$var.txt"; }
+    done
+else
+    say "ARM X  floatingObject did not run in arm W" FAIL
 fi
 
 # ---------------------------------------------------------------------------------------------------

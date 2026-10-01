@@ -161,8 +161,8 @@ struct Compressible
     // ...or CrankNicolson (crank_nicolson_ddt_scheme_cpp.cuh): the scheme's clock, the two equations'
     // OWN ddt0 fields ("ddt0(rho,epsilon)" and "ddt0(rho,k)", or "ddt0(epsilon)"/"ddt0(k)" when rho
     // is null), rho.oldTime().oldTime() and the two fields' old-old levels, which the caller keeps
-    // (psi.oldTime() is the field at entry, as under Euler). With `cn` set rDeltaT is not read, and
-    // a moving mesh (V0) is refused.
+    // (psi.oldTime() is the field at entry, as under Euler). With `cn` set rDeltaT is not read. On a
+    // moving mesh (V0) the scheme takes its moving branch and needs V00 beside it.
     const fv::CrankNicolsonClock*           cn       = nullptr;
     fv::CrankNicolsonDdt0<scalar>*          cnDdt0Eps = nullptr;
     fv::CrankNicolsonDdt0<scalar>*          cnDdt0K   = nullptr;
@@ -177,6 +177,22 @@ struct Compressible
     // per step and first order in dt wrong as soon as it does not.
     const std::vector<scalar>*              kOldIn   = nullptr;
     const std::vector<scalar>*              epsOldIn = nullptr;
+    // CrankNicolson's ddt0 PATCH values (CrankNicolsonDdt0Operands): the two fields' stored patch values
+    // at the two old levels, which OpenFOAM's ddt0 fields carry and write. Null keeps the cells alone.
+    const fv::CrankNicolsonDdt0Operands<scalar>* cnPatchK = nullptr;
+    const fv::CrankNicolsonDdt0Operands<scalar>* cnPatchEps = nullptr;
+    // A COLD START'S epsilon.oldTime(). The level does not exist until something asks for it, and
+    // GeometricField::oldTime() then CREATES it as a copy of the field as it stands (GeometricField.C:
+    // 960-972). The first to ask is fvm::ddt in epsEqn (kEpsilon.C:254) -- AFTER
+    // epsilon_.boundaryFieldRef().updateCoeffs() (:247) has written the wall function's values into its
+    // cells and patches. So on the first step the old level holds the wall values of THAT step, not the
+    // start file's; from the second step storeOldTimes runs first and it is the previous step's field.
+    // The solve cannot see the difference (those rows are pinned by setValues); epsilon_0 and
+    // ddt0(epsilon) are written with it. MEASURED on RAS/floatingObject: epsilon_0 at the first write is
+    // 6.6e-01 of 7.6e-01 off 0/epsilon in the wall cells. Set on that one call: the cells and the stored
+    // patch values are written back here, and psi.oldTime() for this call is the copy.
+    std::vector<scalar>*                    epsOldCreated = nullptr;
+    std::vector<std::vector<scalar>>*       epsOldBndCreated = nullptr;
     // A MOVING MESH (EulerDdtScheme::fvmDdt under mesh().moving()): the source takes the old volumes,
     // rDeltaT*psi.oldTime()*V0, where the diagonal keeps V; and divU is the divergence of the ABSOLUTE
     // flux, fvc::div(fvc::absolute(phi, U)) = div(phi + mesh.phi()) (kEpsilon.C:232-235). Null on a
@@ -187,6 +203,12 @@ struct Compressible
     // one rather than leave it stale.
     const SurfaceScalarField*               nutPhi   = nullptr;
     const std::vector<scalar>*              V0       = nullptr;
+    // ...and mesh().V00(), which only CrankNicolson's moving branch reads
+    // (CrankNicolsonDdtScheme.C:862-893, fvmDdt(vf) under mesh().moving())
+    const std::vector<scalar>*              V00      = nullptr;
+    // A GATE'S CONTROL, never set by a solver: CrankNicolson's fvm::ddt takes the static branch on a
+    // moving mesh. WRONG wherever a cell's volume changes.
+    bool                                    cnStaticControl = false;
     const SurfaceScalarField*               meshPhi  = nullptr;
     // EddyDiffusivity::correctNut -- alphat = rho*nut/Prt, which the energy equation needs and the
     // momentum equation does not. Written out when supplied.

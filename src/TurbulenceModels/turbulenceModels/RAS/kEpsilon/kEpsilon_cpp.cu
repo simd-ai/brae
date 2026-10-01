@@ -378,14 +378,22 @@ void correct(
                 "brae kEpsilon: CrankNicolson needs the two ddt0 fields, k.oldTime().oldTime(), "
                 "epsilon.oldTime().oldTime() and, with a density, rho.oldTime().oldTime(); the caller "
                 "supplied fewer.");
-        if (comp->V0)
+        // A MOVING MESH takes the scheme's moving branch, fvmDdt(vf) under mesh().moving()
+        // (CrankNicolsonDdtScheme.C:862-893): ddt0 weighted by V0 and V00, the source by V0. The density
+        // forms' moving branches (:940-975, :1029-1065) are the same shape, but no case here reaches
+        // them, so the variable lineage stays refused rather than run ungated.
+        if (comp->V0 && !comp->V00)
             throw std::runtime_error(
                 "brae kEpsilon: CrankNicolson's fvm::ddt on a moving mesh is the scheme's moving branch, "
-                "which brae does not carry.");
+                "which reads mesh().V00(); the caller supplied V0 alone.");
+        if (comp->V0 && comp->rho)
+            throw std::runtime_error(
+                "brae kEpsilon: CrankNicolson's fvm::ddt(alpha, rho, psi) on a moving mesh under `density "
+                "variable` (CrankNicolsonDdtScheme.C:1029-1065) is not gated; refused.");
     }
     const scalar rDeltaT = (comp && !cn) ? comp->rDeltaT : scalar(0);
     const std::vector<scalar> kOld   = (comp && comp->kOldIn)   ? *comp->kOldIn   : k.internal;
-    const std::vector<scalar> epsOld = (comp && comp->epsOldIn) ? *comp->epsOldIn : epsilon.internal;
+    std::vector<scalar> epsOld = (comp && comp->epsOldIn) ? *comp->epsOldIn : epsilon.internal;
     auto rhoOldAt = [&](label c) { return (comp && comp->rhoOld) ? (*comp->rhoOld)[c] : rhoAt(c); };
 
     std::vector<scalar> G(nC);
@@ -509,6 +517,20 @@ void correct(
             epsilon.boundary[pi]->evaluate(epsilon.internal);
         }
     }
+    // a cold start's epsilon.oldTime(), created HERE -- see Compressible::epsOldCreated
+    if (comp && comp->epsOldCreated)
+    {
+        epsOld = epsilon.internal;
+        *comp->epsOldCreated = epsilon.internal;
+        if (comp->epsOldBndCreated)
+        {
+            comp->epsOldBndCreated->resize(patches.size());
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                (*comp->epsOldBndCreated)[pi] = epsilon.boundary[pi]->value();
+            }
+        }
+    }
     if (res) res->wallCells = static_cast<label>(wallCells.size());
     if (res && res->captureStages)
     {
@@ -624,7 +646,10 @@ void correct(
         if (cn)
         {
             fv::fvmDdt(*comp->cn, *comp->cnDdt0Eps, comp->rho, comp->rhoOld ? comp->rhoOld : comp->rho,
-                       comp->rhoOO, epsOld, *comp->epsOO, g.V(), M);
+                       comp->rhoOO, epsOld, *comp->epsOO, g.V(), M,
+                       comp->cnStaticControl ? nullptr : comp->V0,
+                       comp->cnStaticControl ? nullptr : comp->V00,
+                       comp->cnPatchEps);
         }
         // + fvOptions(alpha, rho, epsilon_), kEpsilon.C:258 -- the last term on the right. The density-
         // weighted lineage is the rho form of addSup, which the option refuses.
@@ -843,7 +868,10 @@ void correct(
         if (cn)
         {
             fv::fvmDdt(*comp->cn, *comp->cnDdt0K, comp->rho, comp->rhoOld ? comp->rhoOld : comp->rho,
-                       comp->rhoOO, kOld, *comp->kOO, g.V(), M);
+                       comp->rhoOO, kOld, *comp->kOO, g.V(), M,
+                       comp->cnStaticControl ? nullptr : comp->V0,
+                       comp->cnStaticControl ? nullptr : comp->V00,
+                       comp->cnPatchK);
         }
         // + fvOptions(alpha, rho, k_), kEpsilon.C:279
         if (fvOpts) cpu::fvOptions::addSup(*fvOpts, M, "k", U.internal, g, comp ? comp->rho : nullptr);

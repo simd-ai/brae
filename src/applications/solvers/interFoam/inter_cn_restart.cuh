@@ -39,9 +39,9 @@
 // NOT HERE, and still refused by name in inter_case_cpp.cu: ddtCorrDdt0(Uf) and meshPhiCN_0, the two a
 // MOVING mesh writes. Both are surface fields of a moving-mesh branch that no shipped tutorial restarts
 // -- RAS/floatingObject is the only interFoam tutorial that names CrankNicolson and it moves its mesh
-// under rigidBodyMotion: it runs, but brae neither writes its CrankNicolson state nor restarts a moved
-// mesh -- so there is no fixture to gate a seed against, and a seed nothing measures is worth less than
-// a refusal.
+// under rigidBodyMotion: it runs and its CrankNicolson state is WRITTEN (inter_writer_cpp.cu), but brae
+// does not restart a moved mesh -- so there is no fixture to gate a seed against, and a seed nothing
+// measures is worth less than a refusal.
 #include "cf_types.cuh"
 #include "crank_nicolson_ddt_scheme_cpp.cuh"
 #include "device_crank_nicolson_ddt.cuh"

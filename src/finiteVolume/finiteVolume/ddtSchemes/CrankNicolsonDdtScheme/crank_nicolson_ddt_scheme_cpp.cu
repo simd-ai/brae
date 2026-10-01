@@ -69,7 +69,8 @@ void fvmDdtBody(
     // A MOVING MESH: mesh().V0() and mesh().V00(). Null together means the static branch, which is
     // what every caller before the moving CrankNicolson port passed.
     const std::vector<scalar>* V0 = nullptr,
-    const std::vector<scalar>* V00 = nullptr)
+    const std::vector<scalar>* V00 = nullptr,
+    const CrankNicolsonDdt0Operands<T>* patchOperands = nullptr)
 {
     const std::size_t nC = V.size();
     if (clock.deltaT <= scalar(0) || clock.deltaT0 <= scalar(0))
@@ -89,6 +90,24 @@ void fvmDdtBody(
         throw std::runtime_error(
             "brae CrankNicolson fvm::ddt(" + ddt0.name + "): the three densities must be one value per cell.");
     ddt0.lookupOrCreate(clock, nC, {});
+    // ...and its patches, zero like its cells, when the caller keeps them
+    if (patchOperands)
+    {
+        if (!patchOperands->vfOld || !patchOperands->vfOO
+            || (patchOperands->rhoOld != nullptr) != (patchOperands->rhoOO != nullptr)
+            || patchOperands->vfOld->size() != patchOperands->vfOO->size())
+            throw std::runtime_error(
+                "brae CrankNicolson fvm::ddt(" + ddt0.name + "): the patch operands need vf.oldTime() and "
+                "vf.oldTime().oldTime() on every patch, and the two densities together or not at all.");
+        if (ddt0.boundary.size() != patchOperands->vfOld->size())
+        {
+            ddt0.boundary.resize(patchOperands->vfOld->size());
+            for (std::size_t pi = 0; pi < ddt0.boundary.size(); ++pi)
+            {
+                ddt0.boundary[pi].assign((*patchOperands->vfOld)[pi].size(), zeroOf(T{}));
+            }
+        }
+    }
 
     const scalar rDtCoef = ddt0.rDtCoef(clock);
     // fvm.diag() = rDtCoef*rho.primitiveField()*mesh().V()
@@ -130,6 +149,30 @@ void fvmDdtBody(
                 const scalar roo = withRho ? (*rhoOO)[c] : scalar(1);
                 ddt0.internal[c] = minus(times(rDtCoef0, minus(times(ro, vfOld[c]), times(roo, vfOO[c]))),
                                          offCentre(clock, ddt0.internal[c]));
+            }
+        }
+        // ddt0.boundaryFieldRef() = rDtCoef0*(rho.oldTime()_b*vf.oldTime()_b - rho.oo_b*vf.oo_b)
+        //                         - offCentre_(ff(ddt0.boundaryField()))
+        // -- no volume weights on a face, so the moving branch and the static whole-field assignment
+        // are one expression here
+        if (patchOperands)
+        {
+            for (std::size_t pi = 0; pi < ddt0.boundary.size(); ++pi)
+            {
+                const std::vector<T>& old = (*patchOperands->vfOld)[pi];
+                const std::vector<T>& oo = (*patchOperands->vfOO)[pi];
+                std::vector<T>& b = ddt0.boundary[pi];
+                if (old.size() != b.size() || oo.size() != b.size())
+                    throw std::runtime_error(
+                        "brae CrankNicolson fvm::ddt(" + ddt0.name + "): a patch's old levels and its ddt0 "
+                        "differ in size.");
+                for (std::size_t i = 0; i < b.size(); ++i)
+                {
+                    const scalar ro = patchOperands->rhoOld ? (*patchOperands->rhoOld)[pi][i] : scalar(1);
+                    const scalar roo = patchOperands->rhoOO ? (*patchOperands->rhoOO)[pi][i] : scalar(1);
+                    b[i] = minus(times(rDtCoef0, minus(times(ro, old[i]), times(roo, oo[i]))),
+                                 offCentre(clock, b[i]));
+                }
             }
         }
     }
@@ -191,9 +234,23 @@ void fvmDdt(
     // weights ddt0 and the source by (CrankNicolsonDdtScheme.C:1029-1065). Null together
     // means the static branch.
     const std::vector<scalar>* V0,
-    const std::vector<scalar>* V00)
+    const std::vector<scalar>* V00,
+    const CrankNicolsonDdt0Operands<vector>* patchOperands)
 {
-    fvmDdtBody<vector>(clock, ddt0, rho, rhoOld, rhoOO, vfOld, vfOO, V, M.diag, M.source, V0, V00);
+    fvmDdtBody<vector>(
+        clock,
+        ddt0,
+        rho,
+        rhoOld,
+        rhoOO,
+        vfOld,
+        vfOO,
+        V,
+        M.diag,
+        M.source,
+        V0,
+        V00,
+        patchOperands);
 }
 
 void fvmDdt(
@@ -210,9 +267,23 @@ void fvmDdt(
     // weights ddt0 and the source by (CrankNicolsonDdtScheme.C:1029-1065). Null together
     // means the static branch.
     const std::vector<scalar>* V0,
-    const std::vector<scalar>* V00)
+    const std::vector<scalar>* V00,
+    const CrankNicolsonDdt0Operands<scalar>* patchOperands)
 {
-    fvmDdtBody<scalar>(clock, ddt0, rho, rhoOld, rhoOO, vfOld, vfOO, V, M.diag, M.source, V0, V00);
+    fvmDdtBody<scalar>(
+        clock,
+        ddt0,
+        rho,
+        rhoOld,
+        rhoOO,
+        vfOld,
+        vfOO,
+        V,
+        M.diag,
+        M.source,
+        V0,
+        V00,
+        patchOperands);
 }
 
 

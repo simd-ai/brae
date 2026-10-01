@@ -164,7 +164,8 @@
 #                  times per step from one frozen start state. Its SECOND oracle is the joint state
 #                  OpenFOAM writes every step, which the static control cannot produce at all.
 #                  STAGED, and each change measured: `ddt Euler` (the tutorial's CrankNicolson on a
-#                  DEFORMING mesh is refused on both arms and held separately), `accelerationRelaxation
+#                  DEFORMING mesh is held separately: tests/interfoam_write_vs_openfoam.sh, arm X, host
+#                  since 2026-10-01; this profile predates it), `accelerationRelaxation
 #                  0.7` (the shipped table is zero until t = 4, so the body would never leave rest),
 #                  and converged pressure solves. MEASURED: alpha 1.3e-14, p_rgh 7.9e-14, U 6.0e-14,
 #                  the body's q 8.3e-17 -- and the case AMPLIFIES, one ulp on every mesh point's y
@@ -642,9 +643,9 @@ if not profile.startswith('closed'):
     elif not profile.startswith('solitary'):
         assert re.search(r'div\(rhoPhi,U\)\s+Gauss vanLeerV;', t), 'div(rhoPhi,U) is no longer Gauss vanLeerV'
     if profile.startswith('floating'):
-        # THE CASE'S OWN ddt IS `CrankNicolson 0.5`, and a DEFORMING mesh under CrankNicolson is
-        # refused on both arms -- localised, 1.06 off OpenFOAM, and held on its own (PORT.md). This
-        # profile is the body, not the ddt scheme, so BOTH codes run the same case under Euler.
+        # THE CASE'S OWN ddt IS `CrankNicolson 0.5`, and a DEFORMING mesh under CrankNicolson is held on
+        # its own (PORT.md; the write gate's arm X runs it on the host). This profile is the body, not
+        # the ddt scheme, so BOTH codes run the same case under Euler.
         assert re.search(r'default\s+CrankNicolson 0\.5;', t), \
             'floatingObject no longer ships CrankNicolson 0.5'
         t = re.sub(r'default\s+CrankNicolson 0\.5;', 'default         Euler;', t)

@@ -164,6 +164,9 @@ struct InterMomentumInput
     fv::CrankNicolsonDdt0<vector>*  cnDdt0   = nullptr;
     const std::vector<scalar>*      rhoOO    = nullptr;
     const std::vector<vector>*      UOO      = nullptr;
+    // ...and ddt0's patch half (fv::CrankNicolsonDdt0Operands): rho's and U's stored patch values at the
+    // two old levels. Null keeps ddt0's cells alone, which is all the solve reads.
+    const fv::CrankNicolsonDdt0Operands<vector>* cnPatchOperands = nullptr;
 
     DivScheme scheme             = DivScheme::upwind;
     scalar    schemeCoeff        = 1.0;          // limitedLinear's k

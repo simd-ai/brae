@@ -1212,6 +1212,11 @@ InterFields buildInterFields(const std::string&          caseDir,
                 "defect this replaced.");
         // lduMatrix::solver::readControls (lduMatrixSolver.C:195-205): tolerance 1e-6, relTol 0,
         // maxIter 1000 when absent.
+        bool hasCyclicAMI = false;
+        for (const FvPatch& q : patches)
+        {
+            hasCyclicAMI = hasCyclicAMI || q.type == "cyclicAMI";
+        }
         auto readSolve = [&](
             const FoamDict& d,
             const std::string& field)
@@ -1263,6 +1268,26 @@ InterFields buildInterFields(const std::string&          caseDir,
                     s.relTol,
                     s.maxIter,
                     "brae interFoam: fvSolution's GAMG entry for " + field + " ");
+            }
+            // GAMG ACROSS A cyclicAMI PAIR IS NOT PORTED (cyclicAMIGAMGInterface: the pair agglomerated on
+            // every level), as a solver or as PCG's preconditioner. The case's pressure then runs PCG with
+            // DIC at the entry's own tolerance, relTol and maxIter, and says so -- the choice simpleFoam and
+            // rhoSimpleFoam make for a GAMG they do not run. It is NOT OpenFOAM's solve: the iteration
+            // counts are another solver's and the fields agree to the tolerance, not to round-off.
+            // BRAE_CONTROL_NO_AMI_PCG_FALLBACK=1 leaves the entry as read, and GAMG then refuses the pair by
+            // name -- the gate's proof that this branch is what lets the case run.
+            if (hasCyclicAMI
+                && (s.gamgSolver() || s.pcgGamg())
+                && std::getenv("BRAE_CONTROL_NO_AMI_PCG_FALLBACK") == nullptr)
+            {
+                noticeApproximated("interFoam " + field + " solve",
+                    "the case asks for " + std::string(s.gamgSolver() ? "`solver GAMG`" : "`solver PCG` with a "
+                    "GAMG preconditioner") + " and the mesh has a cyclicAMI pair, across which brae's GAMG is "
+                    "not ported. brae runs `solver PCG; preconditioner DIC;` at the same tolerance, relTol "
+                    "and maxIter; the solve stops at a different point inside that tolerance.");
+                s.solver = "PCG";
+                s.preconditioner = "DIC";
+                s.gamgPreconditioned = false;
             }
             return s;
         };

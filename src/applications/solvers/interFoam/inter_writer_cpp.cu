@@ -1766,6 +1766,52 @@ std::string surfaceFieldText(
     return os.str();
 }
 
+// A volume field the scheme built itself -- CrankNicolson's ddt0: `calculated` with its value on every patch
+// (DDt0Field's creating constructor takes the default patch type, CrankNicolsonDdtScheme.C:67-83), the
+// type alone on an empty one. The constraint types are refused at start-up (registerUnwritten).
+template <typename T>
+std::string calculatedVolFieldText(
+    const std::string& head,
+    const std::string& dimensions,
+    const std::string& field,
+    const std::vector<T>& internal,
+    const std::vector<std::vector<T>>& boundary,
+    const std::vector<FvPatch>& patches,
+    int precision)
+{
+    if (boundary.size() != patches.size())
+    {
+        throw std::runtime_error("brae interFoam writer: " + field + " holds no patch values");
+    }
+    // BRAE_CONTROL_CN_DDT0_CELLS_ONLY=1 writes the patches as the scheme's cells-only form left them, zero
+    // -- the write gate's control on ddt0's patch half
+    const bool cellsOnly = std::getenv("BRAE_CONTROL_CN_DDT0_CELLS_ONLY") != nullptr;
+    std::ostringstream os;
+    os << head;
+    keyword(os, 0, "dimensions");
+    os << dimensions << ";\n\n";
+    listEntry(os, 0, "internalField", internal, precision);
+    os << "\nboundaryField\n{\n";
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& p = patches[pi];
+        os << "    " << p.name << "\n    {\n";
+        if (p.type == "empty")
+        {
+            wordEntry(os, 8, "type", "empty");
+        }
+        else
+        {
+            wordEntry(os, 8, "type", "calculated");
+            const std::vector<T> zero(cellsOnly ? boundary[pi].size() : 0, T{});
+            listEntry(os, 8, "value", cellsOnly ? zero : boundary[pi], precision);
+        }
+        os << "    }\n";
+    }
+    os << "}\n\n\n// ************************************************************************* //\n";
+    return os.str();
+}
+
 } // namespace
 
 template <typename T>
@@ -2587,6 +2633,163 @@ void InterWriter::write(const InterWriteState& s)
         emit(dir + "/rAU", os.str(), true);
     }
 
+    // CRANKNICOLSON ON A MOVING MESH (RAS/floatingObject). The scheme's ddt0 fields live on the registry as
+    // AUTO_WRITE GeometricFields (DDt0Field, CrankNicolsonDdtScheme.C:49-83) and are written whole. An
+    // old-time level is written once it has an old level of its OWN (GeometricField::storeOldTime hands it
+    // the parent's writeOpt only then, GeometricField.C:922-939), which is U, k and epsilon here -- the
+    // three whose oldTime().oldTime() fvmDdt asks for; rho is not AUTO_WRITE and phi's old-old level is
+    // never asked for on a moving mesh, where ddtCorr reads Uf. V0 is written because fvMesh::V00() makes it
+    // AUTO_WRITE when it creates V00 ("If V00 is used then V0 should be stored for restart", fvMesh.C).
+    // The dimensions are the operands' over time.
+    if (crankNicolson_)
+    {
+        if (!s.cn || !s.cn->ddt0RhoU || !s.cn->ddtCorrU || !s.cn->ddtCorrUf || !s.cn->meshPhi0 || !s.cn->UOld
+            || !s.cn->UOldBnd || !s.cn->V0)
+        {
+            throw std::runtime_error("brae interFoam writer: CrankNicolson on a moving mesh handed no state");
+        }
+        const InterWriteCrankNicolson& cn = *s.cn;
+        if (!cn.ddt0RhoU->exists || !cn.ddtCorrU->exists || !cn.ddtCorrUf->exists || !cn.meshPhi0->exists)
+        {
+            throw std::runtime_error("brae interFoam writer: a CrankNicolson ddt0 field was never created; "
+                                     "OpenFOAM creates all four in the first step");
+        }
+        emit(
+            dir + "/ddt0(rho,U)",
+            calculatedVolFieldText<vector>(
+                header("volVectorField", name, "ddt0(rho,U)"),
+                "[1 -2 -2 0 0 0 0]",
+                "ddt0(rho,U)",
+                cn.ddt0RhoU->internal,
+                cn.ddt0RhoU->boundary,
+                patches_,
+                precision_),
+            true);
+        emit(
+            dir + "/ddtCorrDdt0(U)",
+            calculatedVolFieldText<vector>(
+                header("volVectorField", name, "ddtCorrDdt0(U)"),
+                "[0 1 -2 0 0 0 0]",
+                "ddtCorrDdt0(U)",
+                cn.ddtCorrU->internal,
+                cn.ddtCorrU->boundary,
+                patches_,
+                precision_),
+            true);
+        emit(
+            dir + "/ddtCorrDdt0(Uf)",
+            surfaceFieldText(
+                header("surfaceVectorField", name, "ddtCorrDdt0(Uf)"),
+                *cn.ddtCorrUf,
+                "[0 1 -2 0 0 0 0]",
+                false,
+                patches_,
+                precision_),
+            true);
+        emit(
+            dir + "/meshPhiCN_0",
+            surfaceFieldText(
+                header("surfaceScalarField", name, "meshPhiCN_0"),
+                *cn.meshPhi0,
+                "[0 3 -1 0 0 0 0]",
+                true,
+                patches_,
+                precision_),
+            true);
+        emit(
+            dir + "/U_0",
+            fieldText<vector>(
+                "volVectorField",
+                name,
+                "U_0",
+                "U",
+                *cn.UOld,
+                s.U->boundary,
+                nullptr,
+                cn.UOldBnd,
+                nullptr),
+            true);
+        if (cn.UfOld)
+        {
+            emit(
+                dir + "/Uf_0",
+                surfaceFieldText(
+                    header("surfaceVectorField", name, "Uf_0"),
+                    *cn.UfOld,
+                    "[0 1 -1 0 0 0 0]",
+                    false,
+                    patches_,
+                    precision_),
+                true);
+        }
+        {
+            std::ostringstream os;
+            os << header("volScalarField::Internal", name, "V0");
+            keyword(os, 0, "dimensions");
+            os << "[0 3 0 0 0 0 0];\n\n";
+            listEntry(os, 0, "value", *cn.V0, precision_);
+            os << "\n\n// ************************************************************************* //\n";
+            emit(dir + "/V0", os.str(), true);
+        }
+        if (s.turbulence && s.turbulence->on)
+        {
+            const InterTurbulence& tb = *s.turbulence;
+            if (!tb.cn.ddt0K.exists || !tb.cn.ddt0Eps.exists)
+            {
+                throw std::runtime_error("brae interFoam writer: the closure's CrankNicolson ddt0 fields were "
+                                         "never created; OpenFOAM creates both in the first step");
+            }
+            emit(
+                dir + "/ddt0(k)",
+                calculatedVolFieldText<scalar>(
+                    header("volScalarField", name, "ddt0(k)"),
+                    "[0 2 -3 0 0 0 0]",
+                    "ddt0(k)",
+                    tb.cn.ddt0K.internal,
+                    tb.cn.ddt0K.boundary,
+                    patches_,
+                    precision_),
+                true);
+            emit(
+                dir + "/ddt0(epsilon)",
+                calculatedVolFieldText<scalar>(
+                    header("volScalarField", name, "ddt0(epsilon)"),
+                    "[0 2 -4 0 0 0 0]",
+                    "ddt0(epsilon)",
+                    tb.cn.ddt0Eps.internal,
+                    tb.cn.ddt0Eps.boundary,
+                    patches_,
+                    precision_),
+                true);
+            emit(
+                dir + "/k_0",
+                fieldText<scalar>(
+                    "volScalarField",
+                    name,
+                    "k_0",
+                    "k",
+                    tb.kOldStep,
+                    tb.k.boundary,
+                    nullptr,
+                    &tb.kOldBnd,
+                    nullptr),
+                true);
+            emit(
+                dir + "/epsilon_0",
+                fieldText<scalar>(
+                    "volScalarField",
+                    name,
+                    "epsilon_0",
+                    "epsilon",
+                    tb.epsOldStep,
+                    tb.epsilon.boundary,
+                    nullptr,
+                    &tb.epsOldBnd,
+                    nullptr),
+                true);
+        }
+    }
+
     // rDeltaT (createRDeltaT.H): AUTO_WRITE, 1/s, built on extrapolatedCalculated -- which the mesh's
     // constraint patches replace with their own type (fvPatchFieldNew.C:57-64). extrapolatedCalculated
     // writes calculated's type and value (calculatedFvPatchField.C:212-216), the face cells' values its
@@ -2814,8 +3017,48 @@ void registerUnwritten(
     }
     if (f.ddtU == DdtScheme::CrankNicolson)
     {
-        w.refuseAtFirstWrite("ddt0(rho,U), ddtCorrDdt0(U), U_0, phi_0",
-                             "CrankNicolson's ddt0 fields and old-time levels (CrankNicolsonDdtScheme.C:137,156)");
+        // WRITTEN on a moving mesh under kEpsilon's uniform lineage or no closure, which is what
+        // RAS/floatingObject gates. Each other shape names the files OpenFOAM would write for IT.
+        bool written = true;
+        if (!f.dynamicMesh)
+        {
+            w.refuseAtFirstWrite(
+                "ddt0(rho,U), ddtCorrDdt0(U), ddtCorrDdt0(phi), U_0, phi_0",
+                "CrankNicolson's state on a mesh that does not move, whose flux forms "
+                "(CrankNicolsonDdtScheme.C:1262-1322) are not gated in the writer");
+            written = false;
+        }
+        if (f.turbulence.on && (f.turbulence.model != InterRasModel::KEpsilon || f.turbulence.variableDensity))
+        {
+            w.refuseAtFirstWrite(
+                "the closure's ddt0 fields and old-time levels",
+                "CrankNicolson under a closure other than kEpsilon's uniform lineage, whose written state is "
+                "not gated");
+            written = false;
+        }
+        if (f.amr && f.amr->active)
+        {
+            w.refuseAtFirstWrite(
+                "ddt0(rho,U), ddtCorrDdt0(U), U_0",
+                "CrankNicolson's state on a refining mesh, whose mapped patch values are not kept");
+            written = false;
+        }
+        for (const FvPatch& p : w.patches())
+        {
+            if (p.type != "empty" && isConstraintType(p.type))
+            {
+                w.refuseAtFirstWrite(
+                    "ddt0(rho,U), ddtCorrDdt0(U)",
+                    "CrankNicolson's ddt0 fields on the " + p.type + " patch `" + p.name
+                    + "`, whose patch form is not gated");
+                written = false;
+                break;
+            }
+        }
+        if (written)
+        {
+            w.writeCrankNicolson();
+        }
     }
     if (f.ddtU == DdtScheme::backward)
     {

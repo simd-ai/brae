@@ -158,6 +158,15 @@ RunReport runInterFoamDevice(
     if (writer)
     {
         registerUnwritten(*writer, f);
+        // CrankNicolson's state on a moving mesh is written from the HOST loop's own objects (the ddt0
+        // fields' patch values, the old levels' stored patch values); this loop keeps the cells on the
+        // device and no patch half, so it names the files rather than reach its first write without them
+        if (writer->writesCrankNicolson())
+        {
+            writer->refuseAtFirstWrite(
+                "ddt0(rho,U), ddtCorrDdt0(U), ddtCorrDdt0(Uf), meshPhiCN_0, U_0, V0",
+                "CrankNicolson's state on a moving mesh, which the device loop does not keep in its written form");
+        }
     }
     // LOCAL TIME STEPPING. setRDeltaT.H runs on the HOST (inter_set_rdeltat_cpp: the smoothing is a
     // FaceCellWave) from this loop's fields, and each consumer -- the alpha pre-solve and CMULES,

@@ -664,6 +664,16 @@ RunReport runInterFoam(
     std::vector<vector> UOO = UOld;
     std::vector<std::vector<vector>> UOOBnd = UOldBnd;
     std::vector<scalar> rhoOO = rhoOld;
+    // ...and rho's STORED PATCH values at the two old levels, which only ddt0(rho,U)'s patch half reads
+    // (fv::CrankNicolsonDdt0Operands). createFields.H asks for rho.oldTime() before the time loop, so the
+    // level exists from the start as the start's own rho; the old-old one is created as its copy.
+    std::vector<std::vector<scalar>> rhoOldBnd = f.rhoBnd;
+    std::vector<std::vector<scalar>> rhoOOBnd = rhoOldBnd;
+    fv::CrankNicolsonDdt0Operands<vector> cnPatchRhoU;
+    cnPatchRhoU.rhoOld = &rhoOldBnd;
+    cnPatchRhoU.rhoOO = &rhoOOBnd;
+    cnPatchRhoU.vfOld = &UOldBnd;
+    cnPatchRhoU.vfOO = &UOOBnd;
     // phi's old-old level is DIFFERENT. U's and rho's are asked for on the first step, unconditionally,
     // at the top of fvmDdt (`vf.oldTime().oldTime(); rho.oldTime().oldTime();`), so they exist as copies
     // of U^0 and rho^0 and rotate from the second step. phi.oldTime().oldTime() is asked for ONLY inside
@@ -706,6 +716,10 @@ RunReport runInterFoam(
     // never been stored returns the current one.
     SurfaceVectorField UfOO = f.Uf;
     bool UfOOExists = false;
+    // ...and whether Uf.oldTime() has been STORED with that level in existence, which is when OpenFOAM
+    // starts writing Uf_0 (InterWriteCrankNicolson::UfOld): true from the step after the one that
+    // created the old-old level
+    bool UfOldStoredWithOO = false;
     fv::CrankNicolsonDdt0<vector> cnDdtCorrUf;
     cnDdtCorrUf.name = "ddtCorrDdt0(Uf)";
     // A RESTART from a directory OpenFOAM wrote under CrankNicolson: each ddt0 field OpenFOAM would
@@ -722,7 +736,15 @@ RunReport runInterFoam(
     // the value already in UOld/phiOld here. Without them a restart's first ddt0 estimate is
     // rDtCoef0*(x - x) = 0 where OpenFOAM's is a real difference. rho_0 and alpha.water_0 are never
     // written, so those two levels stay the copies OpenFOAM starts them as.
-    readCnOldOld(f.cnRestart, "U_0", static_cast<std::size_t>(nCAtStart), patches, UOO, UOOBnd);
+    // A COLD START'S U.oldTime() IS CREATED INSIDE THE FIRST UEqn, not before it: the level does not
+    // exist until fvm::ddt asks for it, and GeometricField::oldTime() then copies the field as it stands
+    // (GeometricField.C:960-972) -- AFTER the fvMatrix constructor ran every patch's updateCoeffs
+    // (fvMatrix.C:396). So a patch whose updateCoeffs assigns its value (movingWallVelocity, a flow-rate
+    // inlet) holds THIS step's value in U_0, and in the old-old copy made beside it. Nothing in the solve
+    // reads it -- fvcDdtPhiCoeff is zero where U fixes a value -- but U_0 and ddt0(rho,U) are written
+    // with it. MEASURED on RAS/floatingObject: U_0's floatingObject patch at the first write is U's own.
+    bool UOldCreationPending =
+        !readCnOldOld(f.cnRestart, "U_0", static_cast<std::size_t>(nCAtStart), patches, UOO, UOOBnd);
     phiOOExists = readCnOldOldSurface(f.cnRestart, "phi_0", m.nInternalFaces(), patches, phiOO);
     // ...and phi.oldTime() then EXISTS from the first step, so alphaEqn's blend reads the level rather
     // than the flux beside it. NUMERICALLY A NO-OP HERE, measured: with this line removed the restart
@@ -1095,9 +1117,25 @@ RunReport runInterFoam(
                     // 2.1e-22), and that carried into alpha 4.7e-05, U 1.2e-03 at step two and 1.06 at
                     // thirty. It is invisible without correctPhi, where the flux this line sees IS
                     // last step's, and invisible under Euler, where ocAlpha is 0.
+                    // ...AND THE LEVEL THAT REQUEST CREATES STAYS for the rest of the time index: the next
+                    // outer corrector's blend reads the COPY made here, not the previous step's flux --
+                    // storeOldTimes does nothing until the index advances. With correctPhi the two differ
+                    // (the flux here has been through this step's CorrectPhi), and with one outer corrector
+                    // nothing reads the level again before it rotates. MEASURED on RAS/floatingObject as
+                    // shipped (CrankNicolson 0.5, nOuterCorrectors 3, correctPhi): with the previous step's
+                    // flux kept, step two reads U 3.1e-08 and alpha 1.4e-09 off OpenFOAM (laminar 4.5e-06);
+                    // one outer corrector, or no correctPhi, or Euler, each read 1e-13.
+                    // BRAE_CONTROL_CN_PHIOLD_PREV=1 keeps the previous step's flux -- the write gate's control
+                    if (ocAlpha > scalar(0) && !phiOldRequested)
+                    {
+                        if (std::getenv("BRAE_CONTROL_CN_PHIOLD_PREV") == nullptr)
+                        {
+                            phiOld = f.phi;
+                        }
+                        phiOldRequested = true;
+                    }
                     const SurfaceScalarField& phiForBlend = phiOldRequested ? phiOld : f.phi;
                     offCentredFlux(f.phi, phiForBlend, cnAlpha, ocAlpha, phiCN);
-                    if (ocAlpha > scalar(0)) phiOldRequested = true;
                     ai.phi = &f.phi; ai.phiCN = &phiCN;
                     ai.cAlpha = f.interface.cAlpha;
                     ai.nAlphaCorr = f.alphaCtl.nAlphaCorr;
@@ -1450,6 +1488,7 @@ RunReport runInterFoam(
                         mi.cnDdt0 = &cnDdt0RhoU;
                         mi.rhoOO = &rhoOO;
                         mi.UOO = &UOO;
+                        mi.cnPatchOperands = &cnPatchRhoU;
                     }
                     mi.V0 = dyn ? &dyn->V0() : nullptr;
                     // ...and V00 only under CrankNicolson, which is the only scheme that reads it:
@@ -1536,6 +1575,20 @@ RunReport runInterFoam(
                                                               g.Sf(), g.magSf());
                         }
                     }
+                    // ...and a cold start's U.oldTime(), created by this first assembly's fvm::ddt with the
+                    // patch values updateCoeffs has just left -- see UOldCreationPending
+                    if (cnDdt && UOldCreationPending)
+                    {
+                        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+                        {
+                            if (f.U.boundary[pi]->fixesValue())
+                            {
+                                UOldBnd[pi] = f.U.boundary[pi]->value();
+                                UOOBnd[pi] = UOldBnd[pi];
+                            }
+                        }
+                    }
+                    UOldCreationPending = false;
                     if (!f.fvOptions.empty())
                     {
                         mi.fvOptions = &f.fvOptions;
@@ -1765,6 +1818,8 @@ RunReport runInterFoam(
                     if (dyn && dyn->moving())
                     {
                         ti.V0 = &dyn->V0();
+                        // asking for V00 creates the level (fvMesh::V00() is lazy): CrankNicolson only
+                        ti.V00 = cnDdt ? &dyn->V00() : nullptr;
                         ti.meshPhi = &fvcMeshPhi(*dyn, f);
                     }
                     ti.fvOptions = f.fvOptions.empty() ? nullptr : &f.fvOptions;
@@ -1813,6 +1868,21 @@ RunReport runInterFoam(
                         ws.displacement = f.dynamicMesh ? f.dynamicMesh->displacement() : nullptr;
                         ws.rigidBody = f.dynamicMesh ? f.dynamicMesh->rigidBody() : nullptr;
                         ws.rAU = &f.rAU;
+                        // CrankNicolson on a moving mesh: the scheme's registry state, as the step left it.
+                        // UOld is still THIS step's old level here -- the rotation follows the write.
+                        InterWriteCrankNicolson wcn;
+                        if (writer->writesCrankNicolson())
+                        {
+                            wcn.ddt0RhoU = &cnDdt0RhoU;
+                            wcn.ddtCorrU = &cnDdtCorrU;
+                            wcn.ddtCorrUf = &cnDdtCorrUf;
+                            wcn.meshPhi0 = &f.cnMeshPhi0;
+                            wcn.UOld = &UOld;
+                            wcn.UOldBnd = &UOldBnd;
+                            wcn.V0 = &f.dynamicMesh->V0();
+                            wcn.UfOld = UfOldStoredWithOO ? &UfOld : nullptr;
+                            ws.cn = &wcn;
+                        }
                         if (f.amr && f.amr->active)
                         {
                             // refinementHistory's operator<< compacts the LIVE history before it writes
@@ -1840,6 +1910,7 @@ RunReport runInterFoam(
         UOO      = UOld;
         UOOBnd   = UOldBnd;
         rhoOO    = rhoOld;
+        rhoOOBnd = rhoOldBnd;
         if (phiOOExists)
         {
             phiOO = phiOld;
@@ -1849,11 +1920,13 @@ RunReport runInterFoam(
         UOld     = f.U.internal;
         UOldBnd  = patchValuesOf(f.U);
         rhoOld   = f.rho;
+        rhoOldBnd = f.rhoBnd;
         phiOld   = f.phi;
         if (UfOOExists)
         {
             UfOO = UfOld;
         }
+        UfOldStoredWithOO = UfOOExists;
         UfOld = f.Uf;
 
         if (verbose)

@@ -35,10 +35,9 @@
 // geometricOneField; multiplying by exactly 1 changes no bit, so one implementation serves both, with
 // the density pointers null.
 //
-// NOT HERE, refused by the callers by name: a moving mesh (the moving branch reads V0 and V00 and
-// weights ddt0 by them), an `ocCoeff` that is a Function1 of time, a restart from a directory that
-// already holds the ddt0 fields (OpenFOAM reads them with startTimeIndex -2 and is CrankNicolson from
-// the first step), and fvc::ddt.
+// A MOVING MESH is fvmDdt's V0/V00 arguments (the moving branch weights ddt0 by them), fvcDdtUfCorr and
+// meshPhi below; a restart is inter_cn_restart.cuh's seed (startTimeIndex -2). NOT HERE, refused by the
+// callers by name: an `ocCoeff` that is a Function1 of time, and fvc::ddt.
 #include "cf_types.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -112,12 +111,27 @@ inline vector offCentre(
     return (clock.ocCoeff < scalar(1)) ? vector{clock.ocCoeff*x.x, clock.ocCoeff*x.y, clock.ocCoeff*x.z} : x;
 }
 
+// THE PATCH HALF of fvm::ddt's ddt0: the operands' STORED patch values at the two old levels, one list
+// per patch. ddt0 is a whole GeometricField and OpenFOAM advances its patches beside its cells
+// (CrankNicolsonDdtScheme.C:1040-1047 moving, :1069-1073 static):
+//     ddt0_b <- rDtCoef0*(rhoOld_b*vfOld_b - rhoOO_b*vfOO_b) - offCentre(ddt0_b)
+// Nothing in the solve reads them -- fvm.source() takes the primitiveField -- but the field is written
+// with them at every write time. `rhoOld`/`rhoOO` null together mean rho = 1.
+template <typename T>
+struct CrankNicolsonDdt0Operands
+{
+    const std::vector<std::vector<scalar>>* rhoOld = nullptr;
+    const std::vector<std::vector<scalar>>* rhoOO = nullptr;
+    const std::vector<std::vector<T>>* vfOld = nullptr;
+    const std::vector<std::vector<T>>* vfOO = nullptr;
+};
+
 // fvm::ddt(rho, vf) on a static mesh, added INTO M's diagonal and source (the caller has assembled the
 // other terms; the fvMatrix constructor's `+` adds this one before relax). `rho`, `rhoOld` and `rhoOO`
 // null together mean fvm::ddt(vf), rho = 1. The ddt0 field is created here if it does not exist, and
 // evaluated here if this is the step's first call -- as ddt0_() and evaluate() do inside OpenFOAM's
-// fvmDdt. Only the cells of ddt0 are kept: fvm.source() reads its primitiveField and nothing reads
-// its patches.
+// fvmDdt. The cells of ddt0 are always kept; its patches when `patchOperands` is handed (the writer's
+// callers), since fvm.source() reads its primitiveField and nothing in the solve reads its patches.
 void fvmDdt(
     const CrankNicolsonClock& clock,
     CrankNicolsonDdt0<vector>& ddt0,
@@ -132,7 +146,8 @@ void fvmDdt(
     // weights ddt0 and the source by (CrankNicolsonDdtScheme.C:1029-1065). Null together
     // means the static branch.
     const std::vector<scalar>* V0 = nullptr,
-    const std::vector<scalar>* V00 = nullptr);
+    const std::vector<scalar>* V00 = nullptr,
+    const CrankNicolsonDdt0Operands<vector>* patchOperands = nullptr);
 void fvmDdt(
     const CrankNicolsonClock& clock,
     CrankNicolsonDdt0<scalar>& ddt0,
@@ -147,7 +162,8 @@ void fvmDdt(
     // weights ddt0 and the source by (CrankNicolsonDdtScheme.C:1029-1065). Null together
     // means the static branch.
     const std::vector<scalar>* V0 = nullptr,
-    const std::vector<scalar>* V00 = nullptr);
+    const std::vector<scalar>* V00 = nullptr,
+    const CrankNicolsonDdt0Operands<scalar>* patchOperands = nullptr);
 
 // fvc::ddtCorr(U, phi) on a static mesh (fvcDdtPhiCorr):
 //     ddt0    <- rDtCoef0*(U.oldTime() - U.oldTime().oldTime()) - offCentre(ddt0)      cells AND patches

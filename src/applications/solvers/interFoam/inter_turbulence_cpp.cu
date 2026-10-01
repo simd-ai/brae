@@ -999,16 +999,31 @@ void advanceTurbulenceOldTime(
     bool                               second)
 {
     if (t.oldStepTimeIndex == timeIndex) return;
+    const auto patchValues = [](const GeometricField<scalar>& fld)
+    {
+        std::vector<std::vector<scalar>> v(fld.boundary.size());
+        for (std::size_t pi = 0; pi < v.size(); ++pi)
+        {
+            v[pi] = fld.boundary[pi]->value();
+        }
+        return v;
+    };
+    // no old level yet: this step CREATES it (a restart that read k_0 already has one)
+    t.cn.oldLevelPending = t.kOldStep.empty();
     // the old-old level rotates off the outgoing old-time level, as OpenFOAM's oldTime().oldTime() does;
     // at a cold start it is created as a copy of oldTime() and the scheme does not read it that step
     t.cn.kOO = t.kOldStep.empty() ? t.k.internal : t.kOldStep;
     t.kOldStep = t.k.internal;
+    t.cn.kOOBnd = t.kOldBnd.empty() ? patchValues(t.k) : t.kOldBnd;
+    t.kOldBnd = patchValues(t.k);
     if (second)
     {
-        const std::vector<scalar>& sec = (t.model == InterRasModel::KOmegaSST) ? t.omega.internal
-                                                                               : t.epsilon.internal;
+        const GeometricField<scalar>& secField = (t.model == InterRasModel::KOmegaSST) ? t.omega : t.epsilon;
+        const std::vector<scalar>& sec = secField.internal;
         t.cn.epsOO = t.epsOldStep.empty() ? sec : t.epsOldStep;
         t.epsOldStep = sec;
+        t.cn.epsOOBnd = t.epsOldBnd.empty() ? patchValues(secField) : t.epsOldBnd;
+        t.epsOldBnd = patchValues(secField);
     }
     t.oldStepTimeIndex = timeIndex;
 }
@@ -1327,6 +1342,23 @@ void correctInterTurbulence(
         comp.cnDdt0Eps = &c.ddt0Eps;
         comp.kOO = &c.kOO;
         comp.epsOO = &c.epsOO;
+        // ddt0's patch half: the two fields' stored patch values at the two old levels
+        c.patchK.vfOld = &t.kOldBnd;
+        c.patchK.vfOO = &c.kOOBnd;
+        c.patchEps.vfOld = &t.epsOldBnd;
+        c.patchEps.vfOO = &c.epsOOBnd;
+        comp.cnPatchK = &c.patchK;
+        comp.cnPatchEps = &c.patchEps;
+        // a cold start's first call creates epsilon.oldTime() inside, after the wall function's update
+        // BRAE_CONTROL_CN_OLD_AT_ENTRY=1 keeps the field as the step began -- the write gate's control
+        if (c.oldLevelPending && std::getenv("BRAE_CONTROL_CN_OLD_AT_ENTRY") == nullptr)
+        {
+            comp.epsOldCreated = &t.epsOldStep;
+            comp.epsOldBndCreated = &t.epsOldBnd;
+        }
+        // BRAE_CONTROL_CN_CLOSURE_STATIC=1 takes the scheme's static branch on a moving mesh -- the write
+        // gate's control on the released body, whose cells change volume
+        comp.cnStaticControl = std::getenv("BRAE_CONTROL_CN_CLOSURE_STATIC") != nullptr;
         if (t.variableDensity)
         {
             if (!in.rhoOO)
@@ -1337,6 +1369,7 @@ void correctInterTurbulence(
     }
     comp.nutPhi = in.phi;
     comp.V0 = in.V0;
+    comp.V00 = in.V00;
     comp.meshPhi = in.meshPhi;
     // The equation's own flux. In the variable lineage that is rhoPhi, while divU and every
     // flux-conditional patch still read the volumetric phi.
@@ -1422,6 +1455,14 @@ void correctInterTurbulence(
                          t.kDiv.limitedLinear, t.kDiv.limiterCoeff,
                          ks.minIter, &sel, /*linearUpwind=*/false, /*luGradK=*/scalar(0), &which,
                          &epsSolve, &t.secondDiv, &t.secondGrad);
+    // ...and epsilon.oldTime().oldTime(), which fvmDdt's `vf.oldTime().oldTime()` creates in the same
+    // call as a copy of the level just created (CrankNicolsonDdtScheme.C:860)
+    if (in.cn && t.cn.oldLevelPending)
+    {
+        t.cn.epsOO = t.epsOldStep;
+        t.cn.epsOOBnd = t.epsOldBnd;
+    }
+    t.cn.oldLevelPending = false;
     if (kd.on)
     {
         kd.scalars("epsD", res.epsD);     kd.scalars("epsSrc", res.epsSrc);

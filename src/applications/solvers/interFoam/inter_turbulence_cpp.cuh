@@ -112,6 +112,15 @@ struct InterTurbulenceCrankNicolson
     // InterTurbulence::kOldStep, because every ddt scheme needs it -- see there.
     std::vector<scalar> kOO;
     std::vector<scalar> epsOO;
+    // ...and the two fields' STORED PATCH values at the old-old level, beside InterTurbulence::kOldBnd:
+    // the operands of ddt0's patch half (fv::CrankNicolsonDdt0Operands), which OpenFOAM writes
+    std::vector<std::vector<scalar>> kOOBnd;
+    std::vector<std::vector<scalar>> epsOOBnd;
+    fv::CrankNicolsonDdt0Operands<scalar> patchK;
+    fv::CrankNicolsonDdt0Operands<scalar> patchEps;
+    // a cold start's first closure call, on which epsilon.oldTime() is CREATED after the wall function's
+    // update (kEpsilonRef::Compressible::epsOldCreated)
+    bool oldLevelPending = false;
     // A RESTART: where OpenFOAM would look these two fields up (inter_cn_restart.cuh). The names are the
     // OPERANDS' -- "ddt0(rho,k)" under the variable lineage, "ddt0(k)" under the uniform one,
     // "ddt0(omega)" under kOmegaSST -- so they are known only once the model branch has run, which is
@@ -183,6 +192,11 @@ struct InterTurbulence
     // unconditionally.
     std::vector<scalar> kOldStep;
     std::vector<scalar> epsOldStep;
+    // ...with the fields' stored patch values at the same instant: the old level is a copy of the whole
+    // field (GeometricField::storeOldTime, `*field0Ptr_ == *this`), and under CrankNicolson OpenFOAM
+    // writes it as k_0 / epsilon_0 and reads its patches into ddt0's
+    std::vector<std::vector<scalar>> kOldBnd;
+    std::vector<std::vector<scalar>> epsOldBnd;
     label oldStepTimeIndex = -1;
     InterRasModel model = InterRasModel::KEpsilon;
     // `density variable` -- see the header
@@ -342,6 +356,8 @@ struct InterTurbulenceStepInput
     // A MOVING MESH: the old volumes and the mesh flux (see kEpsilonRef::Compressible). Null on a
     // static mesh.
     const std::vector<scalar>* V0 = nullptr;
+    // ...and mesh().V00() under CrankNicolson, the only scheme that reads it
+    const std::vector<scalar>* V00 = nullptr;
     const SurfaceScalarField* meshPhi = nullptr;
     // every solve of the run, in order, for the solver-log gate
     // fvOptions(epsilon) and fvOptions(k), kEpsilon.C:258/279: the mangroves' turbulence source. Null

@@ -23,6 +23,7 @@
 // run is not lost silently.
 #pragma once
 #include "cf_types.cuh"
+#include "crank_nicolson_ddt_scheme_cpp.cuh"
 #include "foam_dict.cuh"
 #include "fv_patch.cuh"
 #include "fvc.cuh"
@@ -46,6 +47,28 @@ class DisplacementLaplacianFvMotionSolver;
 class RigidBodyMeshMotion;
 namespace cpu {
 namespace interFoam {
+
+// CrankNicolson's state on a MOVING mesh, as the registry holds it at a write time (RAS/floatingObject):
+// the scheme's ddt0 fields, cells and patches, U's old-time level and the mesh's old volumes. The closure's
+// half -- ddt0(k), ddt0(epsilon), k_0, epsilon_0 -- is read off InterTurbulence.
+struct InterWriteCrankNicolson
+{
+    const fv::CrankNicolsonDdt0<vector>* ddt0RhoU = nullptr;
+    const fv::CrankNicolsonDdt0<vector>* ddtCorrU = nullptr;
+    const fv::CrankNicolsonDdt0<vector>* ddtCorrUf = nullptr;
+    const fv::CrankNicolsonDdt0<scalar>* meshPhi0 = nullptr;
+    // U.oldTime(): its cells and STORED patch values
+    const std::vector<vector>* UOld = nullptr;
+    const std::vector<std::vector<vector>>* UOldBnd = nullptr;
+    // mesh().V0()
+    const std::vector<scalar>* V0 = nullptr;
+    // Uf.oldTime(), once OpenFOAM writes it -- null until then. The level takes Uf's writeOpt in
+    // storeOldTime only `if (field0Ptr_->field0Ptr_)` (GeometricField.C:922-939), and Uf's old-old level
+    // is created by fvcDdtUfCorr's evaluate branch in the SECOND step, after that step's store has run. So
+    // the first store that finds it is the third step's, and Uf_0 is written from there on (MEASURED on
+    // RAS/floatingObject: absent at steps one and two, present at five).
+    const SurfaceVectorField* UfOld = nullptr;
+};
 
 // What one write time hands the writer: the solver's own objects, read and never modified.
 struct InterWriteState
@@ -100,6 +123,8 @@ struct InterWriteState
     const std::vector<vector>* points0 = nullptr;
     // correctPhi's rAU cells (initCorrectPhi.H), 1/UEqn.A() of the step's last corrector
     const std::vector<scalar>* rAU = nullptr;
+    // CrankNicolson on a moving mesh; null under any other scheme
+    const InterWriteCrankNicolson* cn = nullptr;
 };
 
 class InterWriter
@@ -154,6 +179,9 @@ public:
     void writeRDeltaT() { rDeltaT_ = true; }
     // a solidBody-moved mesh's state is written: polyMesh/points, meshPhi, Uf
     void writeMeshMotion() { meshMotion_ = true; }
+    // CrankNicolson on a moving mesh: the scheme's ddt0 fields, the old-time levels and V0 are written
+    void writeCrankNicolson() { crankNicolson_ = true; }
+    bool writesCrankNicolson() const { return crankNicolson_; }
     // ...and a displacementLaplacian motion's own fields: pointDisplacement, cellDisplacement
     void writeDisplacement() { displacement_ = true; }
     // ...or a rigidBodyMotion's: pointDisplacement, uniform/rigidBodyMotionState
@@ -255,6 +283,7 @@ private:
     const InterWaves* waves_ = nullptr;
     bool rDeltaT_ = false;
     bool meshMotion_ = false;
+    bool crankNicolson_ = false;
     bool displacement_ = false;
     bool rigidBody_ = false;
     bool refine_ = false;

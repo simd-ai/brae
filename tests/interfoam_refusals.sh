@@ -397,8 +397,8 @@ arm ddt_cnDdt0Present       runs    -                         "" "$CNSET; printf
 arm ddt_cnAlphaPhi0Present  runs    -                         "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class surfaceScalarField; object alphaPhi0.water; }\ndimensions [0 3 -1 0 0 0 0];\ninternalField uniform 0;\nboundaryField { \".*\" { type calculated; value uniform 0; } }\n' > 0/alphaPhi0.water"
 # ...and the TWO A MOVING MESH WRITES are still refused, for want of a fixture that restarts one: the one
 # shipped interFoam tutorial that names CrankNicolson, RAS/floatingObject, moves its mesh under
-# rigidBodyMotion -- it runs, but brae neither writes its CrankNicolson state nor restarts a moved mesh --
-# so a seed for either would be ungated.
+# rigidBodyMotion -- it runs and its CrankNicolson state is written, but brae does not restart a moved
+# mesh -- so a seed for either would be ungated.
 arm ddt_cnUfDdt0Present     refused "ddtCorrDdt0(Uf)"         "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class surfaceVectorField; object ddtCorrDdt0(Uf); }\ndimensions [0 1 -2 0 0 0 0];\ninternalField uniform (0 0 0);\nboundaryField { \".*\" { type calculated; value uniform (0 0 0); } }\n' > '0/ddtCorrDdt0(Uf)'"
 arm ddt_cnMeshPhi0Present   refused "meshPhiCN_0"             "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class surfaceScalarField; object meshPhiCN_0; }\ndimensions [0 3 -1 0 0 0 0];\ninternalField uniform 0;\nboundaryField { \".*\" { type calculated; value uniform 0; } }\n' > '0/meshPhiCN_0'"
 # ...and a RESTART ACROSS A COUPLED PAIR, on the leakage base, whose baffles are cyclicACMI. The pair's
@@ -958,6 +958,13 @@ if [ $HAVE_GPU = 1 ]; then
     # arm by `sloshing2DCN` in tests/interfoam_moving_vs_openfoam.sh. It refused by name until they
     # were written, and `ddt_cnMoving` above is the same staging on the host.
     arm device_cnMoving     runs    -                               "-device" "$CNSET; sed -i 's/nAlphaSubCycles  *[0-9]*;/nAlphaSubCycles 1;/' system/fvSolution"
+    # ...but it does not WRITE that case: CrankNicolson's state on a moving mesh (the ddt0 fields' patch
+    # values, the old levels' stored patch values) is the host loop's own objects, so with a write time
+    # inside the run the device names the files at start-up and stops at that write. The HOST arm beside
+    # it is the control: the same staging writes and runs to its end.
+    CNWRITE="$CNSET; sed -i 's/nAlphaSubCycles  *[0-9]*;/nAlphaSubCycles 1;/' system/fvSolution; sed -i -E 's/^(writeControl\s+)[^;]*;/\1timeStep;/; s/^(writeInterval\s+)[^;]*;/\11;/' system/controlDict"
+    arm ddt_cnMovingDeviceWrite refused "which the device loop does not keep in its written form" "-device" "$CNWRITE"
+    arm ddt_cnMovingHostWrite   runs    -                           ""        "$CNWRITE"
     # the device's alpha pre-solve does not honour minIter (the host's does)
     # cellLimited grad(U) is refused on the device (the host carries it into linearUpwind and the
     # viscous term; this loop does not). The host arm `grad_namedU` above RUNS the same staging, which

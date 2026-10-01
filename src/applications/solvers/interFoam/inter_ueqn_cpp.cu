@@ -305,7 +305,7 @@ FvVectorMatrix assembleUEqn(
         // ...with the mesh's OLD volumes when it moves: the scheme's moving branch weights ddt0 by V0
         // and V00 and its source by V0, where the static one uses V throughout.
         fv::fvmDdt(*in.cn, *in.cnDdt0, in.rho, in.rhoOld, in.rhoOO, *in.UOld, *in.UOO, g.V(), M,
-                   in.V0, in.V00);
+                   in.V0, in.V00, in.cnPatchOperands);
     }
     else if (in.ddtScheme == DdtScheme::localEuler)
     {
