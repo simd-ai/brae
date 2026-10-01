@@ -141,6 +141,9 @@ MODE=${MEASURE:+measure}
 [ -f "$OFBASHRC" ] || { echo "SKIP: real OpenFOAM not available"; exit 77; }
 
 W=${KEEP_W:-$(mktemp -d)}
+
+# real OpenFOAM's runs (and meshes) are cached by a hash of the staged case: tests/of_oracle_cache.sh
+. "$(dirname "$0")/of_oracle_cache.sh"
 [ -n "${KEEP_W:-}" ] || trap 'rm -rf "$W"' EXIT
 mkdir -p "$W"
 
@@ -158,7 +161,10 @@ rm -rf "$M"/[1-9]* "$M"/0 "$M"/processor* "$M"/log.*
 grep -q "default  *localEuler;" "$M/system/fvSchemes" \
     || { echo "FAIL: the tutorial's ddtSchemes no longer names localEuler"; exit 1; }
 
-# the Allrun's meshing, serially
+# the Allrun's meshing, serially -- cached (oracleMesh): the key is the tutorial as copied, this function's
+# text and the hull's STL
+meshDTCHull()
+{
 (
     cd "$M" || exit 1
     mkdir -p constant/triSurface
@@ -176,7 +182,10 @@ grep -q "default  *localEuler;" "$M/system/fvSchemes" \
     cp -r 0.orig 0
     setFields > log.setFields 2>&1 || exit 1
     renumberMesh -overwrite > log.renumberMesh 2>&1 || exit 1
-) || { echo "FAIL: meshing DTCHull"; ls "$M"; exit 1; }
+)
+}
+oracleMesh "$M" interfoam_dtchull meshDTCHull "$(sha256sum < "$STL" | cut -c1-16)" \
+    || { echo "FAIL: meshing DTCHull"; ls "$M"; exit 1; }
 
 # stage <profile>: the meshed case, the profile's staging, OpenFOAM run for STEPS steps
 stage()
@@ -222,7 +231,7 @@ if profile == 'ras':
     assert re.search(r'type\s+nutkRoughWallFunction;', open(os.path.join(d, '0/nut')).read()), \
         'the tutorial names nutkRoughWallFunction on the hull'
 PYEOF2
-    ( cd "$C" && interFoam > log.interFoam 2>&1 ) || { echo "FAIL: interFoam [$profile]"; tail -30 "$C/log.interFoam"; return 1; }
+    oracleRun "$C" interfoam_dtchull "$profile" || { echo "FAIL: interFoam [$profile]"; tail -30 "$C/log.interFoam"; return 1; }
     [ -d "$C/$STEPS" ] || { echo "FAIL: OpenFOAM wrote no $STEPS directory [$profile]"; ls "$C"; return 1; }
     echo "OpenFOAM ran $STEPS localEuler steps of DTCHull [$profile]"
 }

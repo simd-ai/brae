@@ -66,8 +66,9 @@ oracleRestore()
         return 1
     fi
     rm -f "$tmp/.brae-oracle-key"
-    # ...and it has to hold the answer the caller is about to read
-    if [ ! -d "$tmp/$end" ]; then
+    # ...and it has to hold the answer the caller is about to read: the end-time directory, or the file
+    # the caller names as its marker of a finished run
+    if [ ! -e "$tmp/$end" ]; then
         rm -rf "$tmp"
         return 1
     fi
@@ -94,4 +95,38 @@ oracleStore()
     fi
     rm -f "$tmp" "$C/.brae-oracle-key"
     return 0
+}
+
+# oracleRun <caseDir> <tag...>  -- real interFoam on the staged case, cached on every staged byte. Returns
+# non-zero when interFoam itself failed; the caller reads log.interFoam either way.
+oracleRun()
+{
+    local C="$1"
+    shift
+    local key
+    key=$(oracleKey "$C" "$@" "run")
+    if oracleRestore "$C" "$key" "log.interFoam"; then
+        echo "  OpenFOAM's run reused from the oracle cache   [$(basename "$C")]"
+        return 0
+    fi
+    ( cd "$C" && interFoam > log.interFoam 2>&1 ) || return 1
+    oracleStore "$C" "$key"
+}
+
+# oracleMesh <caseDir> <tag> <function> [extra key...]  -- the case's meshing, cached. <function> does the
+# meshing (in the caller's shell); the key is the case as it stands BEFORE it, the function's own text and
+# whatever else the caller says decides the mesh (a geometry file outside the case).
+oracleMesh()
+{
+    local C="$1" tag="$2" fn="$3"
+    shift 3
+    local key
+    key=$(oracleKey "$C" "$tag" "mesh" "$(declare -f "$fn" | sha256sum | cut -c1-16)" "$@")
+    if oracleRestore "$C" "$key" ".brae-mesh-done"; then
+        echo "  the mesh reused from the oracle cache   [$(basename "$C")]"
+        return 0
+    fi
+    "$fn" || return 1
+    : > "$C/.brae-mesh-done"
+    oracleStore "$C" "$key"
 }

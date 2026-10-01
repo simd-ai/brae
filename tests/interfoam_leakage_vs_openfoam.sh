@@ -123,6 +123,9 @@ print('%.10g' % t)")
 [ -f "$OFBASHRC" ] || { echo "SKIP: real OpenFOAM not available"; exit 77; }
 
 W=${KEEP_W:-$(mktemp -d)}
+
+# real OpenFOAM's runs (and meshes) are cached by a hash of the staged case: tests/of_oracle_cache.sh
+. "$(dirname "$0")/of_oracle_cache.sh"
 [ -n "${KEEP_W:-}" ] || trap 'rm -rf "$W"' EXIT
 mkdir -p "$W"
 
@@ -192,7 +195,7 @@ PYEOF
     ( cd "$C" && cp -r 0.orig 0 && blockMesh > log.blockMesh 2>&1 && setFields > log.setFields 2>&1 \
           && createBaffles -overwrite > log.createBaffles 2>&1 ) \
         || { echo "FAIL: meshing [$profile]"; return 1; }
-    ( cd "$C" && interFoam > log.interFoam 2>&1 ) || { echo "FAIL: interFoam [$profile]"; tail -30 "$C/log.interFoam"; return 1; }
+    oracleRun "$C" interfoam_leakage "$profile" || { echo "FAIL: interFoam [$profile]"; tail -30 "$C/log.interFoam"; return 1; }
     [ -d "$C/$END" ] || { echo "FAIL: OpenFOAM wrote no $END directory [$profile]"; ls "$C"; return 1; }
     echo "OpenFOAM ran $STEPS steps of deltaT $DT to t = $END   [$profile]"
 }
@@ -272,8 +275,8 @@ PYEOF
           && createBaffles -overwrite > log.createBaffles 2>&1 ) \
         || { echo "FAIL: meshing [$name]"; return 1; }
     ( cd "$C" && mv 0 "$MOV_START" \
-          && sed -i "s/^startTime .*/startTime       $MOV_START;/" system/controlDict \
-          && interFoam > log.interFoam 2>&1 ) \
+          && sed -i "s/^startTime .*/startTime       $MOV_START;/" system/controlDict ) \
+        && oracleRun "$C" interfoam_leakage "$name" \
         || { echo "FAIL: interFoam [$name]"; tail -30 "$C/log.interFoam"; return 1; }
     [ -d "$C/$MOV_END" ] || { echo "FAIL: OpenFOAM wrote no $MOV_END directory [$name]"; ls "$C"; return 1; }
     echo "OpenFOAM ran $MOV_STEPS steps of deltaT $DT from t = $MOV_START to t = $MOV_END   [$name]"
@@ -300,7 +303,7 @@ rm -rf "$R"
 mkdir -p "$R"
 cp -r "$W/leak/constant" "$W/leak/system" "$W/leak/$RESTART" "$R/" || { echo "FAIL: no $RESTART written by the leak run"; exit 1; }
 sed -i "s/^startTime .*/startTime       $RESTART;/" "$R/system/controlDict"
-( cd "$R" && interFoam > log.interFoam 2>&1 ) || { echo "FAIL: interFoam [restart]"; tail -30 "$R/log.interFoam"; exit 1; }
+oracleRun "$R" interfoam_leakage restart || { echo "FAIL: interFoam [restart]"; tail -30 "$R/log.interFoam"; exit 1; }
 [ -d "$R/$END" ] || { echo "FAIL: the restarted OpenFOAM wrote no $END directory"; ls "$R"; exit 1; }
 echo "OpenFOAM restarted at t = $RESTART and ran $RESTART_STEPS steps to t = $END   [restart]"
 "$BIN" "$R" "$R/$RESTART" "$R/$END" "$RESTART_STEPS" "$R/log.interFoam" "$W/closed/$END" "$W/allOpen/$END" || rc=1

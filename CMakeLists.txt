@@ -3284,14 +3284,77 @@ set_tests_properties(interfoam_dambreak_clock_vs_openfoam PROPERTIES
 
 # brae_interFoam's time directories against OpenFOAM's: when it writes, what -- every file's structure
 # exactly, every value at a measured bound -- that OpenFOAM restarts from them, and that writing every
-# step leaves the run byte-identical; arm W runs every tutorial whose conditions the writer transcribes
-# (the waves and DTCHull among them) against OpenFOAM, meshing each serially, hence the long timeout
-add_test(NAME interfoam_write_vs_openfoam
-         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_write_vs_openfoam.sh)
-set_tests_properties(interfoam_write_vs_openfoam PROPERTIES
-                     SKIP_RETURN_CODE 77
-                     TIMEOUT 7200
-                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+# step leaves the run byte-identical.
+#
+# ONE TEST PER FILE under tests/interfoam_write/<arm>/ and one per tutorial row, not one script: each file
+# holds at most three checks, a change is checked by the file it touches, the files run side by side under
+# `ctest -j`, and real OpenFOAM's meshes and runs are cached by a hash of the staged case
+# (tests/of_oracle_cache.sh), so editing brae re-runs brae alone. As one script this gate took 3100 s on its
+# own and 5700 s beside five others (2026-10-01), every time.
+#
+# TWO TIERS, by label. `fast` is the edit loop: `ctest -L fast -R interfoam_write`. `slow` holds the
+# tutorials whose meshes are large (DTCHull and DTCHullMoving 848k cells, mixerVesselAMI 895k, motorBike,
+# the two multi-paddle wave makers 448k) and the files that run on them; it runs before a commit. On those
+# tutorials the host arm and the device arm are separate tests, and a test that runs a device arm on a
+# large mesh takes the GPU alone (RESOURCE_LOCK): five processes sharing one GPU each ran four times slower.
+file(GLOB BRAE_WRITE_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_write
+     ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_write/*/*.sh)
+list(FILTER BRAE_WRITE_TESTS EXCLUDE REGEX "/_common\\.sh$")
+set(BRAE_WRITE_SLOW_FILES "^ami/|^refine/mapping")
+set(BRAE_WRITE_GPU_FILES "^none/")
+foreach(rel ${BRAE_WRITE_TESTS})
+    string(REPLACE ".sh" "" name ${rel})
+    string(REPLACE "/" "_" name ${name})
+    set(tierLabel fast)
+    if(rel MATCHES "${BRAE_WRITE_SLOW_FILES}")
+        set(tierLabel slow)
+    endif()
+    add_test(NAME interfoam_write_${name}
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_write/${rel})
+    set_tests_properties(interfoam_write_${name} PROPERTIES
+                         SKIP_RETURN_CODE 77
+                         LABELS ${tierLabel}
+                         TIMEOUT 1800
+                         ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+    if(rel MATCHES "${BRAE_WRITE_GPU_FILES}")
+        set_tests_properties(interfoam_write_${name} PROPERTIES RESOURCE_LOCK brae_gpu)
+    endif()
+endforeach()
+set(BRAE_WRITE_TUTORIALS_FAST
+    capillaryRise weirOverflow angledDuct damBreakLeakage damBreakPorousBaffle damBreakPermeable
+    nozzleFlow2D eulerianInjection cnoidal solitary solitaryGrimshaw solitaryMcCowan stokesI stokesII
+    stokesV irregularMultiDirection streamFunction mangroveInteraction sloshingTank2D testTubeMixer
+    waveMakerSolitary waveMakerPiston waveMakerFlap damBreakWithObstacle oscillatingBox floatingObject
+    DTCHullMovingCoarse)
+set(BRAE_WRITE_TUTORIALS_SLOW
+    DTCHull DTCHullMoving mixerVesselAMI motorBike sloshingCylinder electrostaticDeposition
+    waveMakerMultiPaddleFlap waveMakerMultiPaddlePiston)
+foreach(key ${BRAE_WRITE_TUTORIALS_FAST})
+    add_test(NAME interfoam_write_tutorial_${key}
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_write/tutorial.sh ${key})
+    set_tests_properties(interfoam_write_tutorial_${key} PROPERTIES
+                         SKIP_RETURN_CODE 77
+                         LABELS fast
+                         TIMEOUT 1800
+                         ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+endforeach()
+foreach(key ${BRAE_WRITE_TUTORIALS_SLOW})
+    foreach(arm host device)
+        add_test(NAME interfoam_write_tutorial_${key}_${arm}
+                 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_write/tutorial.sh ${key} ${arm})
+        set_tests_properties(interfoam_write_tutorial_${key}_${arm} PROPERTIES
+                             SKIP_RETURN_CODE 77
+                             LABELS slow
+                             TIMEOUT 1800
+                             ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+    endforeach()
+    # ONE TURN FOR EVERY TEST ON THESE MESHES, host or device. A device run on 848k cells loads the CPU and
+    # the memory bus as well as the GPU: beside two of them the DTCHullMoving host row took 426 s and the
+    # device row 313 s, where each alone takes 289 s and 290 s (2026-10-01).
+    set_tests_properties(interfoam_write_tutorial_${key}_device PROPERTIES RESOURCE_LOCK "brae_gpu;brae_bigmesh")
+    set_tests_properties(interfoam_write_tutorial_${key}_host PROPERTIES RESOURCE_LOCK brae_bigmesh)
+endforeach()
+set_tests_properties(interfoam_write_ami_operands_control PROPERTIES RESOURCE_LOCK brae_bigmesh)
 add_dependencies(brae brae_interFoam)
 
 add_test(NAME device_inter_step COMMAND test_device_inter_step)
@@ -4065,8 +4128,24 @@ add_executable(test_inter_moving_vs_openfoam tests/test_inter_moving_vs_openfoam
 target_include_directories(test_inter_moving_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_inter_moving_vs_openfoam PRIVATE brae_core)
-add_test(NAME interfoam_moving_vs_openfoam
-         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_moving_vs_openfoam.sh)
+# ONE TEST PER FILE under tests/interfoam_moving/<family>/, each gating at most three profiles through the
+# gate's own selectors (MOVING_ONLY stages a profile and its control, MOVING_GATE gates the profile alone).
+# A change to one mesh motion is checked by its file. As ONE test this gate took 2900 s; as ten family
+# tests run five abreast the flap family alone took 1112 s where it takes 260 s by itself -- every
+# OpenFOAM run was a cache hit, and the time was five processes sharing one GPU. Hence the RESOURCE_LOCK:
+# tests that run a device arm take the GPU one at a time, and the CPU-only tests run beside them.
+file(GLOB BRAE_MOVING_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_moving
+     ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_moving/*/*.sh)
+foreach(rel ${BRAE_MOVING_TESTS})
+    string(REPLACE ".sh" "" name ${rel})
+    string(REPLACE "/" "_" name ${name})
+    add_test(NAME interfoam_moving_${name}
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_moving/${rel})
+    set_tests_properties(interfoam_moving_${name} PROPERTIES
+                         SKIP_RETURN_CODE 77
+                         TIMEOUT 900
+                         RESOURCE_LOCK brae_gpu)
+endforeach()
 
 # ...and the SOLVER those tutorials name for p_rghFinal, GAMG, as shipped: OpenFOAM's hierarchy level
 # by level, the coarsest-level solve of every V-cycle and every p_rgh line, from its log under its own

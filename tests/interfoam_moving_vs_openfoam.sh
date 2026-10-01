@@ -421,6 +421,18 @@ selected()
     return 1
 }
 
+# MOVING_GATE="a b": of the staged profiles, gate only these. A profile's control is another profile that
+# must be STAGED (its OpenFOAM run is what the profile is measured against) but not gated with it -- gating
+# it would ask for ITS control in turn. Unset, every staged profile is gated. The per-profile tests under
+# tests/interfoam_moving/ set both.
+gated()
+{
+    [ -z "${MOVING_GATE:-}" ] && { selected "$1"; return; }
+    local x
+    for x in $MOVING_GATE; do [ "$x" = "$1" ] && return 0; done
+    return 1
+}
+
 stage()
 {
     local name="$1" tutorial="$2" dt="$3" n="$4" profile="$5"
@@ -910,7 +922,10 @@ JOBS=${MOVING_JOBS:-4}
 QUEUE=()
 gate()
 {
-    selected "$1" || return 0
+    gated "$1" || return 0
+    # MOVING_PART=control runs a profile's controls alone (each is a full run of both arms, so a profile
+    # and its control are two tests); MOVING_PART=gate the profile alone; unset, both
+    [ "${MOVING_PART:-}" = control ] && return 0
     QUEUE+=("$1|$2|$3|$4|$5")
 }
 
@@ -1149,7 +1164,8 @@ runQueue
 deviceControl()   # deviceControl <profile> <ENV=1> [<steps> <endTime> <control profile>], the piston's by default
 {
     local name="$1" ctl="$2" n="${3:-30}" end="${4:-0.3}" against="${5:-piston}"
-    selected "$name" || return 0
+    gated "$name" || return 0
+    [ "${MOVING_PART:-}" = gate ] && return 0
     local out="$W/.control.$name.log"
     env "$ctl" "$BIN" "$W/$name" "$W/$name/0" "$W/$name/$end" "$n" "$W/$name/log.interFoam" "$name" \
         "$W/$against/$end" > "$out" 2>&1

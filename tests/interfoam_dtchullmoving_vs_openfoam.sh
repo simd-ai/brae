@@ -74,6 +74,9 @@ MODE=${MEASURE:+measure}
 [ -f "$OFBASHRC" ] || { echo "SKIP: real OpenFOAM not available"; exit 77; }
 
 W=${KEEP_W:-$(mktemp -d)}
+
+# real OpenFOAM's runs (and meshes) are cached by a hash of the staged case: tests/of_oracle_cache.sh
+. "$(dirname "$0")/of_oracle_cache.sh"
 [ -n "${KEEP_W:-}" ] || trap 'rm -rf "$W"' EXIT
 mkdir -p "$W"
 
@@ -93,6 +96,9 @@ if [ ! -f "$M/constant/polyMesh/owner" ]; then
     rm -rf "$M"
     cp -r "$SRC" "$M" || exit 1
     rm -rf "$M"/[1-9]* "$M"/0 "$M"/processor* "$M"/log.*
+    # ...cached (oracleMesh): the key is the tutorial as copied, this function's text and the hull's STL
+    meshDTCHullMoving()
+    {
     (
         cd "$M" || exit 1
         mkdir -p constant/triSurface
@@ -110,7 +116,10 @@ if [ ! -f "$M/constant/polyMesh/owner" ]; then
         cp -r 0.orig 0
         setFields > log.setFields 2>&1 || exit 1
         renumberMesh -overwrite > log.renumberMesh 2>&1 || exit 1
-    ) || { echo "FAIL: meshing DTCHullMoving"; ls "$M"; exit 1; }
+    )
+    }
+    oracleMesh "$M" interfoam_dtchullmoving meshDTCHullMoving "$(sha256sum < "$STL" | cut -c1-16)" \
+        || { echo "FAIL: meshing DTCHullMoving"; ls "$M"; exit 1; }
 fi
 
 
@@ -171,8 +180,8 @@ PYEOF
 stage tv shipped   || exit 1
 stage notv none    || exit 1
 stage flip flip    || exit 1
-( cd "$W/tv" && interFoam > log.interFoam 2>&1 ) &
-( cd "$W/notv" && interFoam > log.interFoam 2>&1 ) &
+oracleRun "$W/tv" interfoam_dtchullmoving tv &
+oracleRun "$W/notv" interfoam_dtchullmoving notv &
 wait
 for c in tv notv; do
     grep -q "^End" "$W/$c/log.interFoam" || { echo "FAIL: interFoam [$c]"; tail -30 "$W/$c/log.interFoam"; exit 1; }
@@ -289,7 +298,7 @@ s, k = re.subn(r'\nrestraints\s*\{(?:[^{}]|\{[^{}]*\})*\}', '\n', s)
 assert k == 1, 'restraints'
 open(p, 'w').write(s)
 PYEOF
-( cd "$MV" && interFoam > log.interFoam 2>&1 )
+oracleRun "$MV" interfoam_dtchullmoving moving
 grep -q "^End" "$MV/log.interFoam" || { echo "FAIL: interFoam [moving]"; tail -30 "$MV/log.interFoam"; exit 1; }
 grep -q "Selecting motion solver: rigidBodyMotion" "$MV/log.interFoam" \
     || { echo "FAIL: OpenFOAM's moving profile did not select rigidBodyMotion"; exit 1; }

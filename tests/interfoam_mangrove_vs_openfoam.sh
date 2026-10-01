@@ -115,6 +115,9 @@ BLOCK=${BLOCK:-"175 14 21"}
 [ -f "$OFBASHRC" ] || { echo "SKIP: real OpenFOAM not available"; exit 77; }
 
 W=${KEEP_W:-$(mktemp -d)}
+
+# real OpenFOAM's runs (and meshes) are cached by a hash of the staged case: tests/of_oracle_cache.sh
+. "$(dirname "$0")/of_oracle_cache.sh"
 [ -n "${KEEP_W:-}" ] || trap 'rm -rf "$W"' EXIT
 mkdir -p "$W"
 
@@ -252,7 +255,7 @@ PYEOF
     ( cd "$C" && cp -r 0.orig 0 && blockMesh > log.blockMesh 2>&1 && setFields > log.setFields 2>&1 \
           && topoSet > log.topoSet 2>&1 ) \
         || { echo "FAIL: meshing [$profile]"; return 1; }
-    ( cd "$C" && interFoam > log.interFoam 2>&1 ) || { echo "FAIL: interFoam [$profile]"; tail -30 "$C/log.interFoam"; return 1; }
+    oracleRun "$C" interfoam_mangrove "$profile" || { echo "FAIL: interFoam [$profile]"; tail -30 "$C/log.interFoam"; return 1; }
     [ -d "$C/$END" ] || { echo "FAIL: OpenFOAM wrote no $END directory [$profile]"; ls "$C"; return 1; }
     echo "OpenFOAM ran $STEPS steps of deltaT $DT to t = $END   [$profile]"
 }
