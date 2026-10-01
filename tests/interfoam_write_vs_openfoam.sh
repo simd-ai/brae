@@ -39,6 +39,8 @@
 #          BRAE_CONTROL_AMR_NO_WRITE_COMPACT=1 and BRAE_CONTROL_AMR_ALPHA0_START=1, sixty steps through an
 #          unrefinement, a write before any change with a restart from it (the global refine index), and a
 #          restart from a compressed refined write (the .gz lookups).
+#   ARM Z  a coupled (cyclicAMI) patch's rAU and p are the result's own cells evaluated; control
+#          BRAE_CONTROL_COUPLED_OPERAND_VALUES=1 on mixerVesselAMI (staged to PCG: GAMG across an AMI is not ported).
 #   ARM M  a moving mesh's cumulativeContErr is the absolute flux's (sloshingTank2D), with its control.
 #   ARM P  the mesh update's CorrectPhi continuity error counts (waveMakerPiston, loose pcorr), with its
 #          control BRAE_CONTROL_NO_CORRECTPHI_CONTERR=1.
@@ -603,6 +605,7 @@ RAS/DTCHullMoving::3e-10:-
 laminar/damBreakWithObstacle::2e-11:3e-11
 laminar/oscillatingBox::2e-10:-
 RAS/motorBike::9e-12:2e-11
+RAS/mixerVesselAMI::5e-11:-
 "
 # RAS/DTCHullMoving (rigidBodyMotion: pointDisplacement, uniform/rigidBodyMotionState, points, meshPhi, Uf,
 # rAU): host 2.4e-11, pointDisplacement at 0.0002 (1.1e-16 absolute on a 4.7e-06 largest); polyMesh/points
@@ -616,6 +619,9 @@ RAS/motorBike::9e-12:2e-11
 # damBreakWithObstacle 1.5e-12 host / 2.1e-12 device; oscillatingBox 1.8e-11 host (its device loop refuses
 # a mesh that refines AND moves, by name: `-`); motorBike 8.8e-13 host / 1.0e-12 device (snappy's binary
 # levels and its level0Edge 0.5 read, the frozenPoints zone written with its meta).
+# RAS/mixerVesselAMI (U4: rAU and p on the cyclicAMI pair, the result's own cells evaluated -- every field
+# expression ends in correctLocalBoundaryConditions, GeometricFieldFunctionsM.C:50), staged to PCG: host
+# 4.3e-12 (2026-10-01, 895k cells). Its device bound is `-`: the device loop does not couple a cyclicAMI.
 BOUND_RB_DTC=4e-15
 BOUND_FO=9e-13
 for entry in $W_CASES; do
@@ -624,6 +630,20 @@ for entry in $W_CASES; do
     src="$TUT/multiphase/interFoam/$rel"
     [ -d "$src" ] || { say "ARM W  $key: tutorial missing" FAIL; continue; }
     stage_allrun "$src" "$W/w_of_$key" "$dtw" || { say "ARM W  $key: meshing failed (see $W/w_of_$key/log.allrunmesh)" FAIL; continue; }
+    if [ "$key" = mixerVesselAMI ]; then
+        # STAGED, in both codes, and not claimed: p_rgh (and pcorr, which takes $p_rgh) GAMG -> PCG with DIC.
+        # GAMG across an AMI agglomerates the interface (cyclicAMIGAMGInterface), which is not ported -- brae
+        # refuses GAMG on that patch by name. tests/interfoam_ami_vs_openfoam.sh stages the same way.
+        python3 - "$W/w_of_$key/system/fvSolution" <<'EOF_PCG' || say "ARM W  mixerVesselAMI: the PCG staging did not apply" FAIL
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+s, n = re.subn(r'(\n    p_rgh\n    \{\n)\s*solver\s+GAMG;(.*?)\s*smoother\s+GaussSeidel;',
+               r'\1        solver          PCG;\n        preconditioner  DIC;\2', s, flags=re.S)
+open(p, 'w').write(s)
+sys.exit(0 if n == 1 else 1)
+EOF_PCG
+    fi
     runof "$W/w_of_$key"
     ot=$(timedirs "$W/w_of_$key")
     [ "$(echo $ot | wc -w)" = 2 ] || { say "ARM W  $key: premise, OpenFOAM writes two steps [$ot]" FAIL; continue; }
@@ -639,6 +659,7 @@ for entry in $W_CASES; do
             case $key in
                 DTCHullMoving) why="moves its mesh with a rigidBodyMotion" ;;
                 oscillatingBox) why="the mesh refines AND a motion solver moves it" ;;
+                mixerVesselAMI) why="is cyclicAMI and its coupling is not attached" ;;
                 *) why="" ;;
             esac
             [ -n "$why" ] || say "ARM W  [$arm] $key: a device bound of - with no expected refusal named" FAIL
@@ -967,6 +988,24 @@ if [ -d "$W/w_of_damBreakWithObstacle" ]; then
     judge "damBreakWithObstacle compressed restart" "$W/cmp_y5.txt" 2e-11 "$W/y5_of2/log.interFoam" \
         && say "ARM Y5 [host] restarted from a compressed refined write: OpenFOAM's levels, history and flux" ok \
         || { say "ARM Y5 [host] restarted from a compressed refined write: OpenFOAM's levels, history and flux" FAIL; grep BAD "$W/cmp_y5.txt" | head -4; }
+fi
+
+# Z: a coupled patch's value after a field expression is the RESULT's cells evaluated, w*f_P + (1 - w)*f_N
+# (correctLocalBoundaryConditions; coupledFvPatchField.H:198-205), not the operands' patch arithmetic.
+# CONTROL on mixerVesselAMI: BRAE_CONTROL_COUPLED_OPERAND_VALUES=1 writes 1/(A's patch value) for rAU and
+# p_rgh_b + rho_b*gh_b for p -- MEASURED 1.6e-02 and 6.9e-05 off on the AMI pair, both over the bound.
+if [ -d "$W/w_of_mixerVesselAMI" ]; then
+    d="$W/z_ctl_operands"
+    mkdir -p "$d"
+    cp -r "$W/w_of_mixerVesselAMI/0" "$W/w_of_mixerVesselAMI/constant" "$W/w_of_mixerVesselAMI/system" "$d/"
+    runbrae "$d" host BRAE_CONTROL_COUPLED_OPERAND_VALUES=1
+    python3 "$CMP" "$W/w_of_mixerVesselAMI" "$d" $(timedirs "$W/w_of_mixerVesselAMI") > "$W/cmp_z.txt" 2>&1
+    judge "control operand values" "$W/cmp_z.txt" 5e-11 "$W/w_of_mixerVesselAMI/log.interFoam" > "$W/z.txt"
+    grep -qE "over the bound: .*/rAU " "$W/z.txt" && grep -qE "over the bound: .*/p " "$W/z.txt" \
+        && say "CONTROL  BRAE_CONTROL_COUPLED_OPERAND_VALUES=1 puts mixerVesselAMI's rAU and p over the bound" ok \
+        || { say "CONTROL  BRAE_CONTROL_COUPLED_OPERAND_VALUES=1 puts mixerVesselAMI's rAU and p over the bound" FAIL; cat "$W/z.txt"; }
+else
+    say "ARM Z  mixerVesselAMI did not run in arm W" FAIL
 fi
 
 # M: a moving mesh's continuity error is continuityErrs.H's on the ABSOLUTE flux (pEqn.H:64, before

@@ -156,8 +156,17 @@ PY
             # brae states a refusal as a paragraph opening `brae <component>: ...`. Match THAT, not a
             # keyword: the wording varies ("Only X is ported", "asks for", "Refusing rather than"), and
             # a keyword list silently reported `exit 1` for ten cases whose reason was printed in full.
-            why=$(printf '%s\n' "$out" | grep -E "^brae (ERROR|[A-Za-z]+ ?[A-Za-z]*:)" \
-                  | grep -vE "controlDict application|\(OF-mirror\)|NOTICE" | head -1 | cut -c1-150)
+            # ...and THE LINE THAT STOPPED THE RUN, which is the LAST one: the writer names what it will not
+            # write at start-up, so the first refusal line is a notice, and a run that dies earlier in its
+            # steps for another reason was reported under the writer's (RAS/mixerVesselAMI read "rAU will not
+            # be written" while GAMG had refused its AMI interface). When the stop IS the write-time refusal,
+            # the notice is the informative line.
+            refusals=$(printf '%s\n' "$out" | grep -E "^brae (ERROR|[A-Za-z]+ ?[A-Za-z]*:)" \
+                       | grep -vE "controlDict application|\(OF-mirror\)|NOTICE")
+            why=$(printf '%s\n' "$refusals" | tail -1 | cut -c1-150)
+            if printf '%s' "$why" | grep -q "this is a write time"; then
+                why=$(printf '%s\n' "$refusals" | grep "will not be written" | head -1 | cut -c1-150)
+            fi
             [ -n "$why" ] || why=$(printf '%s\n' "$out" | grep -viE "^ |NOTICE" | grep -E "[a-z]" | tail -1 | cut -c1-150)
             [ -n "$why" ] || why="exit $rc"
             verdict="REFUSED/ERR: $why"

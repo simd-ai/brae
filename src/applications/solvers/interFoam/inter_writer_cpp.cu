@@ -389,6 +389,21 @@ bool echoableToken(const std::string& t)
     return !std::regex_search(t, notNumber);
 }
 
+// A coupled patch's value after a field expression. Every GeometricField function ends in
+// correctLocalBoundaryConditions() (GeometricFieldFunctionsM.C:50, localConsistency 1 by default), and a
+// coupled patch's evaluateLocal IS its evaluate (coupledFvPatchField.H:198-205): w*f_P + (1 - w)*f_N of the
+// RESULT's cells. So `1.0/UEqn.A()` and `p_rgh + rho*gh` on a cyclicAMI are that, and not the arithmetic of
+// their operands' patch values -- MEASURED on RAS/mixerVesselAMI: the reciprocal of A's patch value put rAU
+// 1.6e-02 off OpenFOAM's on the AMI pair, and p_rgh_b + rho_b*gh_b put p 6.9e-05 off (13.5 Pa).
+std::vector<scalar> coupledLocalValue(
+    const FvPatch& p,
+    const std::vector<scalar>& cells)
+{
+    CoupledCyclicPatchField<scalar> local(p);
+    local.evaluate(cells);
+    return local.value();
+}
+
 // UList::writeList for a label list (UListIO.C:82-178), the rule every labelList file goes by: more than one
 // entry, all equal, as `N{v}`; ten or fewer on one line, `N(a b c)`; otherwise a newline, the count, and one
 // entry per line between parentheses on lines of their own, ending in a newline.
@@ -1983,6 +1998,18 @@ void InterWriter::write(const InterWriteState& s)
         true);
     // p: NO_READ, AUTO_WRITE (createFields.H:91-102), `calculated` on every non-constraint patch, with
     // p_rgh's dimensions -- p_rgh's template, whose patch entries the derived values override
+    // ...and on a coupled patch that writes a value, `p == p_rgh + rho*gh` (pEqn.H) is the sum's own cells
+    // evaluated, as every field expression is (coupledLocalValue)
+    std::vector<std::vector<scalar>> pPatchValues = *s.pBoundary;
+    for (std::size_t pi = 0; pi < patches_.size() && pi < pPatchValues.size(); ++pi)
+    {
+        const FvPatch& q = patches_[pi];
+        if (q.coupled && (q.type == "cyclicAMI" || q.type == "cyclicACMI")
+            && std::getenv("BRAE_CONTROL_COUPLED_OPERAND_VALUES") == nullptr)
+        {
+            pPatchValues[pi] = coupledLocalValue(q, *s.p);
+        }
+    }
     emit(
         dir + "/p",
         fieldText<scalar>(
@@ -1992,7 +2019,7 @@ void InterWriter::write(const InterWriteState& s)
             "p_rgh",
             *s.p,
             s.p_rgh->boundary,
-            s.pBoundary,
+            &pPatchValues,
             nullptr,
             nullptr),
         true);
@@ -2517,6 +2544,29 @@ void InterWriter::write(const InterWriteState& s)
             {
                 wordEntry(os, 8, "type", p.type);
             }
+            else if (p.type == "cyclicAMI" && p.coupled)
+            {
+                // rAU.ref() = 1.0/UEqn.A() (pEqn.H:4) assigns the expression's patch values too, and on a
+                // coupled patch those are the result's own cells evaluated (coupledLocalValue)
+                // BRAE_CONTROL_COUPLED_OPERAND_VALUES=1 writes the operands' arithmetic instead -- the
+                // reciprocal of A's patch value here, p_rgh_b + rho_b*gh_b for p -- for the write gate's control
+                std::vector<scalar> v = coupledLocalValue(p, r);
+                if (std::getenv("BRAE_CONTROL_COUPLED_OPERAND_VALUES") != nullptr)
+                {
+                    std::vector<scalar> aCells(r.size());
+                    for (std::size_t c = 0; c < r.size(); ++c)
+                    {
+                        aCells[c] = scalar(1)/r[c];
+                    }
+                    v = coupledLocalValue(p, aCells);
+                    for (scalar& x : v)
+                    {
+                        x = scalar(1)/x;
+                    }
+                }
+                wordEntry(os, 8, "type", p.type);
+                listEntry(os, 8, "value", v, precision_);
+            }
             else if (isConstraintType(p.type))
             {
                 refuseWrite("rAU", p, "a coupled patch's rAU is the coupled 1/A, which brae does not keep");
@@ -2853,15 +2903,17 @@ void registerUnwritten(
                                  "a dynamic mesh the writer does not know (dynamicMotionSolverFvMesh.C)");
         }
     }
-    // correctPhi's rAU: written where every patch holds its face cells' value or is a type-only constraint
-    // (cyclic included); another coupled patch's value is the coupled 1/A (cyclicAMI: 1/(w*A_P + (1-w)*A_N)), which brae does not keep
+    // correctPhi's rAU: written where every patch holds its face cells' value, is a type-only constraint
+    // (cyclic included), or is a cyclicAMI the host loop coupled -- whose value is the coupled 1/A,
+    // 1/(w*A_P + (1 - w)*A_N), evaluated at the write. Any other coupled patch's is not kept.
     if (f.correctPhi)
     {
         bool coupled = false;
         for (const FvPatch& p : w.patches())
         {
             coupled = coupled || (p.type != "empty" && p.type != "wedge" && p.type != "symmetryPlane"
-                                  && p.type != "symmetry" && p.type != "cyclic" && isConstraintType(p.type));
+                                  && p.type != "symmetry" && p.type != "cyclic"
+                                  && !(p.type == "cyclicAMI" && p.coupled) && isConstraintType(p.type));
         }
         if (coupled)
         {
