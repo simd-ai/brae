@@ -2958,7 +2958,11 @@ COMPONENTS = {
                         "(the V0/V00 branch and fvcDdtUfCorr), a mangrove source under it, a closure other than kEpsilon, "
                         "alpha sub-cycling (OpenFOAM's own FatalError), a restart directory holding ddt0 fields or alphaPhi0, "
                         "a coupled pair on the device loop, fvc::ddt.",
-             note="ON A MOVING MESH THE STATE IS WRITTEN (2026-10-01, host; tests/interfoam_write_vs_openfoam.sh, arm W's "
+             note="ON THE DEVICE (2026-10-01): the alpha blend's phi.oldTime() is created per outer corrector as "
+                  "the host's is (tests/interfoam_moving_vs_openfoam.sh `solitaryOuterCN`, control alpha 6.9e-05), "
+                  "and kEpsilon under CrankNicolson on a MOVING mesh is refused by name at start-up -- the device "
+                  "closure carries the Euler moving form alone. "
+                  "ON A MOVING MESH THE STATE IS WRITTEN (2026-10-01, host; tests/interfoam_write_vs_openfoam.sh, arm W's "
                   "RAS/floatingObject row AS SHIPPED and arm X): ddt0(rho,U), ddtCorrDdt0(U), ddtCorrDdt0(Uf), ddt0(k), "
                   "ddt0(epsilon) with their PATCH values (fvmDdt advances them beside the cells, :1040-1047; "
                   "CrankNicolsonDdt0Operands), U_0 / k_0 / epsilon_0, Uf_0 from the third step, meshPhiCN_0 and V0. "

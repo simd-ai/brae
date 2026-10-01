@@ -271,6 +271,20 @@ std::vector<vector> RigidBodyMeshMotion::newPoints(
     // viscous one. `spatialVector(momentEff, forceEff)` is ANGULAR FIRST.
     const ForceResult fr = bodyForces(*load.U, *load.p, *load.rho, *load.nuEff, m, g, patches,
                                       bodyPatches_, vector{0, 0, 0}, scalar(0));
+    // Instrument: BRAE_TRACE_BODY_LOAD=1 prints the load at every solve, pressure and viscous apart, so two
+    // arms can be held against each other at the first one that differs. Costs one getenv per solve.
+    if (std::getenv("BRAE_TRACE_BODY_LOAD") != nullptr)
+    {
+        std::printf("  [body load] index %d t %.17g  Fp (%.17g %.17g %.17g)  Fv (%.17g %.17g %.17g)  "
+                    "Mp (%.17g %.17g %.17g)  Mv (%.17g %.17g %.17g)\n",
+                    static_cast<int>(timeIndex), static_cast<double>(time),
+                    static_cast<double>(fr.pressure.x), static_cast<double>(fr.pressure.y),
+                    static_cast<double>(fr.pressure.z), static_cast<double>(fr.viscous.x),
+                    static_cast<double>(fr.viscous.y), static_cast<double>(fr.viscous.z),
+                    static_cast<double>(fr.momentP.x), static_cast<double>(fr.momentP.y),
+                    static_cast<double>(fr.momentP.z), static_cast<double>(fr.momentV.x),
+                    static_cast<double>(fr.momentV.y), static_cast<double>(fr.momentV.z));
+    }
     std::vector<RBD::SpatialVector> fx(spec_.model.links.size() + 1);
     lastForce_.w = fr.moment();
     lastForce_.l = fr.total();

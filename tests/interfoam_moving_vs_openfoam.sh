@@ -470,7 +470,12 @@ if profile.endswith('CN'):
     u = open(q2).read()
     u, k = re.subn(r'^(\s*nAlphaSubCycles\s+)\d+;', r'\g<1>1;', u, flags=re.M)
     assert k == 1, 'no nAlphaSubCycles to set to 1'
-    if profile == 'solitaryCN':
+    if profile == 'solitaryOuterCN':
+        # THREE OUTER CORRECTORS, which is what makes phi.oldTime()'s creation visible past the corrector
+        # that creates it: correctors two and three blend with the COPY made at the first
+        u, k = re.subn(r'nCorrectors\s+2;', 'nCorrectors     2;\n    nOuterCorrectors 3;', u)
+        assert k == 1, 'the solitary nCorrectors 2 was not found'
+    if profile in ('solitaryCN', 'solitaryOuterCN'):
         # ...and CONVERGED pressure solves, as `piston` and `flap` have. This case amplifies: its own
         # one-ulp control reads U 2.0e-04 over thirty steps as shipped and 1.8e-06 converged, so the
         # stopping point is most of what a loose run would be measuring.
@@ -1010,6 +1015,13 @@ stage solitary       waves/waveMakerSolitary 0.01 30 solitary       || rc=1
 # p_rgh 7.933e-09. brae reads 4.077e-06, 3.960e-08, 2.929e-08 -- a small multiple of OpenFOAM's own
 # last bit. The solves are converged here for the same reason `piston` and `flap` are.
 stage solitaryCN     waves/waveMakerSolitary 0.01 30 solitaryCN     || rc=1
+# ...and THE SAME SCHEME UNDER THREE OUTER CORRECTORS, three steps: phi.oldTime() is created by the alpha
+# blend of step two's FIRST corrector and the copy stays for the other two (GeometricField::oldTime()).
+# RAS/floatingObject found it on the host (U 3.1e-08 at step two with the previous step's flux in the
+# level); this is the device loop's twin of that fix, on a case the device runs. Three steps, so the
+# case's amplification has not started. Its control is the Euler run of the same three steps.
+stage solitaryShort   waves/waveMakerSolitary 0.01 3 solitary        || rc=1
+stage solitaryOuterCN waves/waveMakerSolitary 0.01 3 solitaryOuterCN || rc=1
 stage solitaryGamg   waves/waveMakerSolitary 0.01 30 solitaryGamg   || rc=1
 stage pistonStatic   waves/waveMakerPiston   0.01 30 pistonStatic   || rc=1
 stage piston         waves/waveMakerPiston   0.01 30 piston         || rc=1
@@ -1095,6 +1107,7 @@ gate sloshing2DCorrectPhi 0.01  10 sloshing2DCorrectPhi sloshing2DStatic || rc=1
 gate cylinderCorrectPhi   0.001 10 cylinderCorrectPhi   cylinderStatic   || rc=1
 gate solitary       0.01  30 solitary       solitaryStatic || rc=1
 gate solitaryCN     0.01  30 solitaryCN     solitary       || rc=1
+gate solitaryOuterCN 0.01  3 solitaryOuterCN solitaryShort  || rc=1
 # the deforming mesh with a GAMG pressure solve, on BOTH arms -- see the solitaryGamg staging
 gate solitaryGamg   0.01  30 solitaryGamg   solitaryStatic || rc=1
 gate piston         0.01  30 piston         pistonStatic   || rc=1
@@ -1133,13 +1146,13 @@ runQueue
 #     correctPhi copies the host phi the host stage never rewrote there. MEASURED U 3.2e-06 (fixed 2.7e-08).
 #   BRAE_CONTROL_DEVICE_V0_FROM_V on pistonOuter: V0 from the volumes as they stand before each update, i.e.
 #     the first update's moved volumes at the second. MEASURED U 8.1e-04 (fixed 1.1e-10).
-deviceControl()
+deviceControl()   # deviceControl <profile> <ENV=1> [<steps> <endTime> <control profile>], the piston's by default
 {
-    local name="$1" ctl="$2"
+    local name="$1" ctl="$2" n="${3:-30}" end="${4:-0.3}" against="${5:-piston}"
     selected "$name" || return 0
     local out="$W/.control.$name.log"
-    env "$ctl" "$BIN" "$W/$name" "$W/$name/0" "$W/$name/0.3" 30 "$W/$name/log.interFoam" "$name" \
-        "$W/piston/0.3" > "$out" 2>&1
+    env "$ctl" "$BIN" "$W/$name" "$W/$name/0" "$W/$name/$end" "$n" "$W/$name/log.interFoam" "$name" \
+        "$W/$against/$end" > "$out" 2>&1
     local crc=$?
     local pat="FAIL: (the device's alpha|\.\.\.its p_rgh|\.\.\.and its U|\.\.\.and the device's Uf)"
     if [ $crc -ne 0 ] && grep -q "CONTROL MODE" "$out" && grep -qE "$pat" "$out"; then
@@ -1152,6 +1165,16 @@ deviceControl()
 }
 deviceControl pistonOuterOnce BRAE_CONTROL_DEVICE_MOVE_EVERY_OUTER=1
 deviceControl pistonOuter     BRAE_CONTROL_DEVICE_V0_FROM_V=1
+#   BRAE_CONTROL_CN_PHIOLD_PREV on solitaryOuterCN: the alpha blend's phi.oldTime() left at the previous step's
+#   flux in the correctors after the one that creates the level. MEASURED alpha 6.9e-05, p_rgh 3.2e-05,
+#   U 6.5e-03 on both arms, against the device's 3.1e-10 / 1.9e-10 / 1.5e-09.
+deviceControl solitaryOuterCN BRAE_CONTROL_CN_PHIOLD_PREV=1 3 0.03 solitaryShort
+#   THE BODY THE FLUID MOVES, on the device (`floating`), whose two halves each have a control:
+#   BRAE_CONTROL_DEVICE_KEPS_STATIC -- the device kEpsilon handed no V0 and no mesh flux, which is how it ran
+#   before it carried them (one step against the host: k 5.8e-06, nut 3.4e-06);
+#   BRAE_CONTROL_DEVICE_BODY_STALE -- the body's load from the host copies of nut and U as they stand.
+deviceControl floating BRAE_CONTROL_DEVICE_KEPS_STATIC=1 10 0.05 floatingStatic
+deviceControl floating BRAE_CONTROL_DEVICE_BODY_STALE=1 10 0.05 floatingStatic
 
 echo "interfoam_moving_vs_openfoam: rc $rc"
 exit $rc

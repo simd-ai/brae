@@ -174,7 +174,6 @@
 //   device_gamg_smootherDILU device_gradLsq
 //   device_refine_motion
 //   device_gradUCache device_gradUCacheKEpsilon device_gradUCacheLimited device_gradUCacheCoupled
-//   device_piovTangential
 // END DEVICE REFUSALS
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"

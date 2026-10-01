@@ -394,6 +394,8 @@ public:
     // pressureInletOutletVelocity's `tangentialVelocity` as the case gave it, once a solver has claimed
     // it (null everywhere else): the device builder refuses a patch that carries one.
     virtual const std::vector<T>* tangentialVelocityPtr() const { return nullptr; }
+    // ...and the refValue OpenFOAM makes from it at construction, which is what the inflow value blends
+    virtual const std::vector<T>* tangentialRefPtr() const { return nullptr; }
 
     const std::vector<T>& value() const { return value_; }
     // THE STATE A MESH CHANGE HAS TO MAP, for a gate to compare against OpenFOAM's own. Empty where the
@@ -3196,6 +3198,10 @@ public:
         return tangentialVelocity_.empty() ? nullptr : &tangentialVelocity_;
     }
     const std::vector<T>& tangentialRefValue() const { return tangentialRef_; }
+    const std::vector<T>* tangentialRefPtr() const override
+    {
+        return tangentialRef_.empty() ? nullptr : &tangentialRef_;
+    }
     // A GATE CONTROL, set only by interFoam's claim from BRAE_CONTROL_PIOV_TV: the refValue dropped from
     // the stored inflow value (`value`) or from snGrad alone (`sngrad`), so the gate can say which half it
     // witnesses. Never set on a normal run.

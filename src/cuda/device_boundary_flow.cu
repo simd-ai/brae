@@ -155,7 +155,11 @@ void piovUpdateKernel(
     scalar* __restrict__ r0,
     scalar* __restrict__ r1,
     scalar* __restrict__ r2,
-    int     directionMixed)
+    int     directionMixed,
+    // the patch's refValue per face, or null where no patch carries a tangentialVelocity
+    const scalar* __restrict__ rvx,
+    const scalar* __restrict__ rvy,
+    const scalar* __restrict__ rvz)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n || !piov[i]) return;
@@ -187,6 +191,35 @@ void piovUpdateKernel(
     const scalar dx = sqrt(fmax(scalar(0), scalar(1) - nx[i] * nx[i]));
     const scalar dy = sqrt(fmax(scalar(0), scalar(1) - ny[i] * ny[i]));
     const scalar dz = sqrt(fmax(scalar(0), scalar(1) - nz[i] * nz[i]));
+    if (rvx)
+    {
+        // WITH A refValue: directionMixed's evaluate term for term, (vf & refValue) + ((I - vf) & U_cell)
+        // with vf = I - n n, written as the host's inflowValueWithRef writes it (fv_patch_field.cuh) so the
+        // two arms round alike. The COEFFICIENTS depend on vf alone and are the ones below.
+        const scalar one = scalar(1);
+        const scalar vxx = one * (one - nx[i] * nx[i]);
+        const scalar vxy = one * (-(nx[i] * ny[i]));
+        const scalar vxz = one * (-(nx[i] * nz[i]));
+        const scalar vyy = one * (one - ny[i] * ny[i]);
+        const scalar vyz = one * (-(ny[i] * nz[i]));
+        const scalar vzz = one * (one - nz[i] * nz[i]);
+        const scalar ixx = one - vxx;
+        const scalar ixy = -vxy;
+        const scalar ixz = -vxz;
+        const scalar iyy = one - vyy;
+        const scalar iyz = -vyz;
+        const scalar izz = one - vzz;
+        const scalar ax = vxx * rvx[i] + vxy * rvy[i] + vxz * rvz[i];
+        const scalar ay = vxy * rvx[i] + vyy * rvy[i] + vyz * rvz[i];
+        const scalar az = vxz * rvx[i] + vyz * rvy[i] + vzz * rvz[i];
+        const scalar bx = ixx * Ux[c] + ixy * Uy[c] + ixz * Uz[c];
+        const scalar by = ixy * Ux[c] + iyy * Uy[c] + iyz * Uz[c];
+        const scalar bz = ixz * Ux[c] + iyz * Uy[c] + izz * Uz[c];
+        piovComponent(dx, ax + bx, Ux[c], &ty0[i], &vf0[i], &r0[i]);
+        piovComponent(dy, ay + by, Uy[c], &ty1[i], &vf1[i], &r1[i]);
+        piovComponent(dz, az + bz, Uz[c], &ty2[i], &vf2[i], &r2[i]);
+        return;
+    }
     piovComponent(dx, nx[i] * Un, Ux[c], &ty0[i], &vf0[i], &r0[i]);
     piovComponent(dy, ny[i] * Un, Uy[c], &ty1[i], &vf1[i], &r1[i]);
     piovComponent(dz, nz[i] * Un, Uz[c], &ty2[i], &vf2[i], &r2[i]);
@@ -533,13 +566,23 @@ void deviceUpdatePressureInletOutletVelocity(
 {
     const int n = dbU.n;
     if (n == 0) return;
+    const bool withRef = dbU.piovRef[0].size() == static_cast<std::size_t>(n);
+    if (withRef && !directionMixed)
+    {
+        throw std::runtime_error(
+            "brae: a pressureInletOutletVelocity patch carries a `tangentialVelocity` and this driver types "
+            "its inflow fixedValue at n*(n.U_cell); only the directionMixed form carries the refValue.");
+    }
     piovUpdateKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].piovMask.data(), dbU.comp[0].faceCell.data(), phiBnd.data(),
                                           dbU.nx.data(), dbU.ny.data(), dbU.nz.data(), Ux.data(), Uy.data(), Uz.data(),
                                           dbU.comp[0].bcType.data(), dbU.comp[1].bcType.data(), dbU.comp[2].bcType.data(),
                                           dbU.comp[0].valueFraction.data(), dbU.comp[1].valueFraction.data(),
                                           dbU.comp[2].valueFraction.data(),
                                           dbU.comp[0].refValue.data(), dbU.comp[1].refValue.data(), dbU.comp[2].refValue.data(),
-                                          directionMixed ? 1 : 0);
+                                          directionMixed ? 1 : 0,
+                                          withRef ? dbU.piovRef[0].data() : nullptr,
+                                          withRef ? dbU.piovRef[1].data() : nullptr,
+                                          withRef ? dbU.piovRef[2].data() : nullptr);
     cudaCheck(cudaGetLastError(), "piovUpdate");
 }
 

@@ -496,7 +496,7 @@ arm gradUCache_inactive     runs    -                         "" "${CACHE/CACHES
 # pressureInletOutletVelocity's `tangentialVelocity` -- RAS/DTCHullMoving's atmosphere -- RUNS on the host
 # loop: interFoam claims the entry and hands it to the patch field (the shared factory still refuses it for
 # every other solver). The bare `(a b c)` form is OpenFOAM's own stop (Field.C), a refining mesh would have to
-# map the refValue, and the device loop fixes the inflow tangential velocity to zero (device_piovTangential).
+# map the refValue. The device loop carries it too (device_piovTangential).
 TANGV="sed -i '/atmosphere/,/}/ s/type  *pressureInletOutletVelocity;/type            pressureInletOutletVelocity;\\n        tangentialVelocity TVSPEC;/' 0/U"
 arm piov_tangential         runs    -                         "" "${TANGV/TVSPEC/uniform (0.1 0 0)}"
 arm piov_tangential_bare    refused "without \`uniform\` or \`nonuniform\`" "" "${TANGV/TVSPEC/(0.1 0 0)}"
@@ -898,9 +898,10 @@ if [ $HAVE_GPU = 1 ]; then
     # numbers). It was refused twice -- for the closure, then for a momentum gap that turned out to be
     # three wedge defects -- so this arm is a `runs`, and a blanket refusal coming back fails it
     arm device_les          runs    -                      "-device" true
-    # ...and a pressureInletOutletVelocity `tangentialVelocity` is refused: every device evaluation of the
-    # patch fixes the inflow tangential velocity to zero (the host carries it, piov_tangential)
-    arm device_piovTangential refused "does not carry the entry" "-device" "${TANGV/TVSPEC/uniform (0.1 0 0)}"
+    # ...and a pressureInletOutletVelocity `tangentialVelocity` RUNS on the device now: the kernel blends the
+    # patch's refValue into the inflow value as the host does. Gated on RAS/DTCHullMoving's device arm
+    # (tests/interfoam_write_vs_openfoam.sh, arm X3, whose control leaves the refValue off: U 2.4e-06).
+    arm device_piovTangential runs    -                          "-device" "${TANGV/TVSPEC/uniform (0.1 0 0)}"
     # the MANGROVE PAIR RUNS on the device now, with k and epsilon under the PBiCG/DILU the case names
     # (tests/interfoam_mangrove_vs_openfoam.sh holds both arms to OpenFOAM, solve by solve). It was a
     # refusal by the option's name, and behind that refusal the closure would have run a Gauss-Seidel

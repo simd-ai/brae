@@ -214,6 +214,11 @@ struct DeviceVectorBoundary
     DeviceBoundary comp[3];
     int n = 0;
     DeviceBuffer<scalar> nx, ny, nz;   // nx/ny/nz = unit face normal (pressureInletOutletVelocity)
+    // pressureInletOutletVelocity's refValue per boundary face, EMPTY unless a patch carries a
+    // `tangentialVelocity`: OpenFOAM makes it once, tangentialVelocity - n*(n & tangentialVelocity) at
+    // construction (pressureInletOutletVelocityFvPatchVectorField.C:120-126), and the inflow value is
+    // directionMixed's (vf & refValue) + ((I - vf) & U_cell). Zero on every other face.
+    DeviceBuffer<scalar> piovRef[3];
 };
 
 // inletOutlet on a vector field: same patch flux for all 3 components -> update each component's bcType.
@@ -368,6 +373,9 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
 {
     std::vector<label> ty[3], fc, io, oio, mx, pv, sm, wdg, iofr, gsm;
     std::vector<scalar> dc, ms, ref[3], vf[3], nrm[3], rg[3], wdgT, iost[3], gsn;   // rg = fixedGradient, per component
+    // pressureInletOutletVelocity's refValue per face (DeviceVectorBoundary::piovRef)
+    std::vector<scalar> prv[3];
+    bool anyPiovRef = false;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         if (isCoupledInterfaceType(fvp[pi].type)) continue;                     // cyclic = internal-like (handled by appended faces)
@@ -402,15 +410,24 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
         // overridden on ProcessorFvPatchField, so it would otherwise report 0 (= zeroGradient) whose
         // valueInternalCoeffs is 1, DOUBLE-COUNTING the interface diagonal.
         const int cat = (fvp[pi].type == "processor") ? 8 : f.boundary[pi]->bcCategory();
-        // pressureInletOutletVelocity with a tangentialVelocity: every device evaluation of this category
-        // fixes the inflow tangential part to ZERO, so a patch carrying one would run a different boundary
-        // condition with nothing said. Only the host (interFoam) carries it.
-        if (f.boundary[pi]->tangentialVelocityPtr())
+        // pressureInletOutletVelocity with a tangentialVelocity: the refValue the host patch made from it
+        // at construction goes up beside the normals, and the directionMixed kernel adds it to the inflow
+        // value (deviceUpdatePressureInletOutletVelocity). The factory refuses the entry for every solver
+        // that has not claimed it, so only interFoam reaches here with one.
+        const std::vector<vector>* piovRefHost = f.boundary[pi]->tangentialRefPtr();
+        if (piovRefHost && piovRefHost->size() != static_cast<std::size_t>(fvp[pi].size))
         {
             throw std::runtime_error(
-                "brae: patch " + fvp[pi].name + " is pressureInletOutletVelocity with a "
-                "`tangentialVelocity`; the device fixes the inflow tangential velocity to zero and does "
-                "not carry the entry. Run the host loop.");
+                "brae: patch " + fvp[pi].name + " carries a `tangentialVelocity` and its refValue is not one "
+                "vector per face.");
+        }
+        anyPiovRef = anyPiovRef || piovRefHost != nullptr;
+        for (label i = 0; i < fvp[pi].size; ++i)
+        {
+            const vector rv = piovRefHost ? (*piovRefHost)[static_cast<std::size_t>(i)] : vector{0, 0, 0};
+            prv[0].push_back(rv.x);
+            prv[1].push_back(rv.y);
+            prv[2].push_back(rv.z);
         }
         const bool sym = f.boundary[pi]->isSymmetry();
         // wedge: the patch field carries the two rotation tensors; the valueFraction comes from the
@@ -513,6 +530,15 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
     }
     DeviceVectorBoundary db;
     db.n = static_cast<int>(fc.size());
+    // BRAE_CONTROL_DEVICE_PIOV_NOREF=1 leaves the refValue off the device -- the inflow tangential part is
+    // then zero, which is what this builder refused to run before it carried the entry. A gate's control.
+    if (anyPiovRef && std::getenv("BRAE_CONTROL_DEVICE_PIOV_NOREF") == nullptr)
+    {
+        for (int k = 0; k < 3; ++k)
+        {
+            db.piovRef[k].copyFrom(prv[k]);
+        }
+    }
     db.nx.copyFrom(nrm[0]);
     db.ny.copyFrom(nrm[1]);
     db.nz.copyFrom(nrm[2]);

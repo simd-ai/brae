@@ -527,22 +527,24 @@ RunReport runInterFoamDevice(
                     "Run without -device.");
             }
         }
-        // A BODY THE FLUID MOVES, refused by name. The motion is a host stage on either arm, but what
-        // it is handed is not: rigidBodyMeshMotion takes the pressure and the shear on the body's
-        // patches from InterFields' own boundary arrays, and this loop keeps the live fields on the
-        // device and refreshes those arrays at its own stages, not before the mesh update. A force
-        // built from a stale patch value would move the body by the wrong amount with nothing saying
-        // so -- and the body's own position is the case. Gated on the HOST arm only
-        // (interfoam_moving_vs_openfoam `floating`); refused here until the device loop hands the
-        // motion the fields it actually solved with, and that is gated too.
-        if (dyn->rigidBody())
+        // A BODY THE FLUID MOVES (rigidBodyMeshMotion). The motion is a host stage on either arm, and it
+        // takes the pressure and the shear on the body's patches from InterFields' own arrays AS THEY
+        // STAND when the mesh is moved (the `forces` object looks the fields up, rigidBodyMeshMotion.C:
+        // 299-307). This loop's hooks keep p_rgh (cells and patches, after every pressure solve), rho's
+        // patch values and the mixture's nu on the host; what they do NOT keep is the closure's nut,
+        // which lives in device buffers, and U's cells after the last corrector. Both are brought down
+        // right before the mesh update -- see the stage.
+        // kEpsilon UNDER CrankNicolson ON A MOVING MESH: the scheme's moving branch weights ddt0 by V0 and
+        // V00 (CrankNicolsonDdtScheme.C:862-893). The host closure carries it (RAS/floatingObject); the
+        // device kEpsilon carries the Euler form alone and would stop at its first call, so the case is
+        // named here, before the first step.
+        if (f.turbulence.on && f.turbulence.model == cpu::interFoam::InterRasModel::KEpsilon
+            && f.ddtU == DdtScheme::CrankNicolson)
         {
             throw std::runtime_error(
-                "brae interFoam -device: the case moves its mesh with a rigidBodyMotion -- a body the "
-                "FLUID drives. The force on it is taken from the pressure and the shear on its own "
-                "patches, and this loop holds those on the device: the host arrays the motion reads "
-                "are refreshed at this loop's own stages, not before the mesh update, so the body "
-                "would be moved by a stale load with nothing saying so. Run without -device.");
+                "brae interFoam -device: the case moves its mesh under CrankNicolson with a kEpsilon closure. "
+                "CrankNicolson's fvm::ddt on a moving mesh is the scheme's moving branch (V0 and V00 weights), "
+                "which the device kEpsilon does not carry. Run without -device.");
         }
         if (!mutableMesh || !mutableMesh->m || !mutableMesh->g || !mutableMesh->patches)
         {
@@ -2476,6 +2478,34 @@ RunReport runInterFoamDevice(
                 {
                     dV0.copyFrom(dm.V.host());
                 }
+                // THE BODY'S LOAD reads U (its cells beside the body's patches, for the shear) and nuEff
+                // = nut + nu on those patches, as they stand now. The closure's nut is the device's on
+                // this arm, and the host copy is whatever the build uploaded; U's cells are the device's
+                // after the last corrector. Stale, either would move the body by the wrong load with
+                // nothing saying so. BRAE_CONTROL_DEVICE_BODY_STALE=1 skips both -- the gate's control.
+                if (dyn->rigidBody() && std::getenv("BRAE_CONTROL_DEVICE_BODY_STALE") != nullptr)
+                {
+                    std::printf("  *** CONTROL MODE: the body's load is taken from the host copies as they "
+                                "stand, stale. This run is deliberately wrong. ***\n");
+                }
+                if (dyn->rigidBody() && std::getenv("BRAE_CONTROL_DEVICE_BODY_STALE") == nullptr)
+                {
+                    if (deviceClosure && dTurb.k.size() == static_cast<std::size_t>(nC))
+                    {
+                        downloadDeviceInterTurbulence(dTurb, f.turbulence, fvp);
+                    }
+                    std::vector<scalar> cx;
+                    std::vector<scalar> cy;
+                    std::vector<scalar> cz;
+                    dUx.copyTo(cx);
+                    dUy.copyTo(cy);
+                    dUz.copyTo(cz);
+                    for (label c = 0; c < nC; ++c)
+                    {
+                        const std::size_t cs = static_cast<std::size_t>(c);
+                        f.U.internal[cs] = vector{cx[cs], cy[cs], cz[cs]};
+                    }
+                }
                 std::vector<scalar> cpDiv;
                 interMeshUpdate(dyn, f, m, g, fvp, mutableMesh, /*amiPairs=*/nullptr,
                                 meshAgglomeration, meshCpc, rep, stepTime, stepIndex, outer,
@@ -3191,6 +3221,31 @@ RunReport runInterFoamDevice(
             if (writer && writer->writesAlphaOld())
             {
                 writer->noteAlphaOldCreation(f.alpha1);
+            }
+            // phi.oldTime() IS CREATED BY THE ALPHA BLEND of the first corrector that off-centres on a
+            // dynamic mesh (alphaEqn.H:91-97; GeometricField::oldTime() copies the field as it stands), and
+            // THE COPY STAYS for the rest of the time index: the next outer corrector blends with it, not
+            // with the flux beside it and not with the previous step's. The level is made here, from the
+            // flux this corrector's alpha step is about to read, so every corrector takes one path. The
+            // host driver's twin has the measurement (RAS/floatingObject, U 3.1e-08 at step two).
+            // BRAE_CONTROL_CN_PHIOLD_PREV=1 leaves the previous step's flux in the level -- the control.
+            if (cnDdt && dCn.ocAlpha > scalar(0) && !dCn.phiOldExists)
+            {
+                if (std::getenv("BRAE_CONTROL_CN_PHIOLD_PREV") != nullptr)
+                {
+                    std::printf("  *** CONTROL MODE: phi.oldTime() keeps the previous step's flux where "
+                                "OpenFOAM creates it from this corrector's. This run is deliberately wrong. ***\n");
+                }
+                else
+                {
+                    deviceCopy(dPhiOI, dPhiI);
+                    deviceCopy(dPhiOB, dPhiB);
+                    if (dCyc.n > 0)
+                    {
+                        deviceCopy(dPhiOIf, dCyc.phi);
+                    }
+                }
+                dCn.phiOldExists = true;
             }
             deviceInterStep(dm, rep.deltaT, C, props, H, dGh, dGhf, dMagSf,
                             dA, dAOld, dUx, dUy, dUz, dUox, dUoy, dUoz,

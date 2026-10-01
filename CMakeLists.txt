@@ -3290,7 +3290,7 @@ add_test(NAME interfoam_write_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_write_vs_openfoam.sh)
 set_tests_properties(interfoam_write_vs_openfoam PROPERTIES
                      SKIP_RETURN_CODE 77
-                     TIMEOUT 5400
+                     TIMEOUT 7200
                      ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 add_dependencies(brae brae_interFoam)
 

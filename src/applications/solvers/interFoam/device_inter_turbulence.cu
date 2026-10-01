@@ -924,6 +924,24 @@ void deviceCorrectInterTurbulence(
     }
 
     gpu::kEpsilonRAS::KEpsilonInput kin;
+    // the moved mesh's old volumes and its flux -- see DeviceInterTurbulenceStepInput::V0. The SST and LES
+    // branches above have handed them on since they were ported; this one did not, and ran a moving mesh
+    // on the current volumes and the relative flux (KEpsilonInput::V0 has the measurement).
+    kin.V0 = in.V0;
+    kin.meshPhiInt = in.meshPhiInt;
+    kin.meshPhiBnd = in.meshPhiBnd;
+    // BRAE_CONTROL_DEVICE_KEPS_STATIC=1 withholds them again -- the moving-mesh gate's control on `floating`
+    if (std::getenv("BRAE_CONTROL_DEVICE_KEPS_STATIC") != nullptr)
+    {
+        if (in.V0)
+        {
+            std::printf("  *** CONTROL MODE: the device kEpsilon runs the moved mesh on the current volumes and "
+                        "the relative flux. This run is deliberately wrong. ***\n");
+        }
+        kin.V0 = nullptr;
+        kin.meshPhiInt = nullptr;
+        kin.meshPhiBnd = nullptr;
+    }
     // divU and the flux-conditional patches read the volumetric phi in BOTH lineages
     kin.phiByRhoInt = in.phiInt;
     kin.phiByRhoBnd = in.phiBnd;

@@ -133,6 +133,8 @@ __global__ void epsReactionKernel(
     scalar        rDeltaT,
     const scalar* rhoOld,
     const scalar* epsOld,
+    // mesh().V0() on a moving mesh, null on a static one: the ddt SOURCE's volume
+    const scalar* V0,
     scalar*       diag,
     scalar*       source)
 {
@@ -158,7 +160,7 @@ __global__ void epsReactionKernel(
     if (rDeltaT > scalar(0))
     {
         diag[c]   += rDeltaT * r * v;
-        source[c] += rDeltaT * rhoOld[c] * epsOld[c] * v;
+        source[c] += rDeltaT * rhoOld[c] * epsOld[c] * (V0 ? V0[c] : v);
     }
 
     // `bounded`: - fvm::Sp(fvc::div(phi), epsilon), against the EQUATION's mass flux. It vanishes where
@@ -182,6 +184,8 @@ __global__ void kReactionKernel(
     scalar        rDeltaT,
     const scalar* rhoOld,
     const scalar* kOld,
+    // mesh().V0() on a moving mesh, null on a static one: the ddt SOURCE's volume
+    const scalar* V0,
     scalar*       diag,
     scalar*       source)
 {
@@ -207,7 +211,7 @@ __global__ void kReactionKernel(
     if (rDeltaT > scalar(0))
     {
         diag[c]   += rDeltaT * r * v;
-        source[c] += rDeltaT * rhoOld[c] * kOld[c] * v;
+        source[c] += rDeltaT * rhoOld[c] * kOld[c] * (V0 ? V0[c] : v);
     }
 
     if (bounded) diag[c] -= divPhi[c] * v;
@@ -648,6 +652,22 @@ void production(
     // divergence and is only read by `bounded`. In the incompressible lineage these are one field.
     deviceDiv(dm, *in.phiByRhoInt, *in.phiByRhoBnd, st.divU);
     deviceDiv(dm, *in.phiInt, *in.phiBnd, st.divPhi);
+    // ...and on a MOVING mesh divU is the divergence of the ABSOLUTE flux, div(phi + mesh.phi())
+    // (kEpsilon.C:232-235; the host reference adds meshPhi face by face, kEpsilon_cpp.cu). The volumetric
+    // flux's divergence only: `bounded`'s divPhi is the equation's own flux, which OpenFOAM leaves relative.
+    if ((in.meshPhiInt != nullptr) != (in.meshPhiBnd != nullptr))
+        throw std::runtime_error(
+            "brae kEpsilon (device): the mesh flux's internal and boundary halves come together or not at all.");
+    if (in.meshPhiInt && in.meshPhiBnd)
+    {
+        DeviceBuffer<scalar> absInt;
+        DeviceBuffer<scalar> absBnd;
+        deviceCopy(absInt, *in.phiByRhoInt);
+        deviceCopy(absBnd, *in.phiByRhoBnd);
+        deviceAxpy(scalar(1), *in.meshPhiInt, absInt);
+        deviceAxpy(scalar(1), *in.meshPhiBnd, absBnd);
+        deviceDiv(dm, absInt, absBnd, st.divU);
+    }
     // ...and the PAIR's faces, which fvc::div sums into their own cell like any other patch's
     // (fvc.cu:548-550). Each divergence takes ITS OWN flux there: divU the volumetric one and divPhi
     // the equation's, which are one field only in the incompressible lineage.
@@ -799,6 +819,15 @@ void assembleEpsEqn(
     }
     const scalar* rhoOldP = (in.rhoOldCell && in.rhoOldCell->size()) ? in.rhoOldCell->data()
                                                                        : in.rhoCell->data();
+    // mesh().V0(), the ddt source's volume on a moving mesh. Under CrankNicolson the scheme's moving
+    // branch (V0 and V00 weights) is the host's alone, so that combination is refused by name.
+    if (in.V0 && in.V0->size() != static_cast<std::size_t>(nC))
+        throw std::runtime_error("brae kEpsilon (device): V0 is not one value per cell.");
+    if (in.V0 && in.cn)
+        throw std::runtime_error(
+            "brae kEpsilon (device): CrankNicolson's fvm::ddt on a moving mesh is the scheme's moving branch "
+            "(CrankNicolsonDdtScheme.C:862-893), which the device closure does not carry. Run without -device.");
+    const scalar* v0P = in.V0 ? in.V0->data() : nullptr;
 
     // epsilon_.boundaryFieldRef().updateCoeffs(). turbulentMixingLengthDissipationRateInlet recomputes
     // its refValue from k's CURRENT patch values here, and the flux switch resolves inletOutlet -- both
@@ -827,6 +856,7 @@ void assembleEpsEqn(
                                          in.boundedEps ? 1 : 0,
                                          // the Euler ddt term, unless the scheme is CrankNicolson's
                                          in.cn ? scalar(0) : in.rDeltaT, rhoOldP, epsOld ? epsOld->data() : nullptr,
+                                         v0P,
                                          E.diag.data(), E.source.data());
     cudaCheck(cudaGetLastError(), "kEpsilon eps reaction");
     if (in.cn)
@@ -864,6 +894,15 @@ void assembleKEqn(
     }
     const scalar* rhoOldP = (in.rhoOldCell && in.rhoOldCell->size()) ? in.rhoOldCell->data()
                                                                        : in.rhoCell->data();
+    // mesh().V0(), the ddt source's volume on a moving mesh. Under CrankNicolson the scheme's moving
+    // branch (V0 and V00 weights) is the host's alone, so that combination is refused by name.
+    if (in.V0 && in.V0->size() != static_cast<std::size_t>(nC))
+        throw std::runtime_error("brae kEpsilon (device): V0 is not one value per cell.");
+    if (in.V0 && in.cn)
+        throw std::runtime_error(
+            "brae kEpsilon (device): CrankNicolson's fvm::ddt on a moving mesh is the scheme's moving branch "
+            "(CrankNicolsonDdtScheme.C:862-893), which the device closure does not carry. Run without -device.");
+    const scalar* v0P = in.V0 ? in.V0->data() : nullptr;
 
     // k_'s own boundary refresh: turbulentIntensityKineticEnergyInlet reads U's CURRENT patch values.
     if (in.turbInletKMask && in.turbInletKInt)
@@ -879,6 +918,7 @@ void assembleKEqn(
                                        epsilon.data(), st.divU.data(), st.divPhi.data(),
                                        in.boundedK ? 1 : 0,
                                        in.cn ? scalar(0) : in.rDeltaT, rhoOldP, kOld ? kOld->data() : nullptr,
+                                       v0P,
                                        K.diag.data(), K.source.data());
     cudaCheck(cudaGetLastError(), "kEpsilon k reaction");
     if (in.cn)

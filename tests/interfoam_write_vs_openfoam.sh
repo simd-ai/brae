@@ -609,7 +609,7 @@ laminar/waves/waveMakerPiston::2e-08:2e-08
 laminar/waves/waveMakerFlap::6e-09:3e-07
 laminar/waves/waveMakerMultiPaddleFlap::8e-11:1e-10
 laminar/waves/waveMakerMultiPaddlePiston::3e-10:3e-10
-RAS/DTCHullMoving::3e-10:-
+RAS/DTCHullMoving::3e-10:6e-8
 laminar/damBreakWithObstacle::2e-11:3e-11
 laminar/oscillatingBox::2e-10:-
 RAS/motorBike::9e-12:2e-11
@@ -618,8 +618,7 @@ RAS/floatingObject::1e-12:-
 "
 # RAS/DTCHullMoving (rigidBodyMotion: pointDisplacement, uniform/rigidBodyMotionState, points, meshPhi, Uf,
 # rAU): host 2.4e-11, pointDisplacement at 0.0002 (1.1e-16 absolute on a 4.7e-06 largest); polyMesh/points
-# 4.3e-18 (2026-09-30). Its device bound is `-`: the device loop refuses a rigid body by name at startup
-# (inter_driver_device.cu, `moves its mesh with a rigidBodyMotion`), which arm W asserts in its place.
+# 4.3e-18 (2026-09-30). Its device arm runs since 2026-10-01 -- see BOUND_X3_FIELDS and arm X3.
 # Arm Q's bounds: each rigidBodyMotionState entry against its own size -- DTCHullMoving's worst 3.4e-16
 # (0.0002/qDdot), floatingObject's 0 -- and floatingObject (Euler)'s fields, worst 8.7e-14 (0.02/phi).
 # The refining meshes (U5/U6: polyMesh/* after the first change -- compared as TEXT, exactly -- hexRef8's
@@ -638,6 +637,16 @@ RAS/floatingObject::1e-12:-
 BOUND_RB_DTC=4e-15
 BOUND_FO=9e-13
 BOUND_WFO=1e-12
+# RAS/DTCHullMoving ON THE DEVICE (2026-10-01): the rigid body's load and the atmosphere's tangentialVelocity
+# are carried (arm X3 holds both controls). Worst file k 6.6e-09, every other file at the host arm's level
+# (pointDisplacement 2.4e-11, U 3.4e-12). THE k GAP IS THE SOLVE, NOT A TERM: the closure's inputs and the
+# assembled k system agree with the host's to round-off (diagonal 1.7e-15, source 7.2e-15, from the stage
+# dump), and OpenFOAM's own k solve here stops at its 1000-iteration cap unconverged (final residual 1.1e-13
+# against 1e-13), so the device smoother's last bits ride the iterate. floatingObject's device bound stays
+# `-`: the rigid body runs there too (tests/interfoam_moving_vs_openfoam.sh, `floating`, under Euler), but
+# the tutorial is CrankNicolson with kEpsilon on a moving mesh, whose moving branch the device closure does
+# not carry -- refused by name at start-up -- and its written state is the host loop's alone.
+BOUND_X3_FIELDS=6e-8
 for entry in $W_CASES; do
     rel=${entry%%:*}; rest=${entry#*:}; dtw=${rest%%:*}; bounds=${rest#*:}; key=$(basename "$rel")
     BOUND_WH=${bounds%%:*}; BOUND_WD=${bounds#*:}
@@ -674,7 +683,7 @@ EOF_PCG
         # the case's own (several device refusals end in "Run without -device"), and that it wrote nothing
         if [ "$BOUND_W" = "-" ]; then
             case $key in
-                DTCHullMoving|floatingObject) why="moves its mesh with a rigidBodyMotion" ;;
+                floatingObject) why="which the device kEpsilon does not carry" ;;
                 oscillatingBox) why="the mesh refines AND a motion solver moves it" ;;
                 mixerVesselAMI) why="is cyclicAMI and its coupling is not attached" ;;
                 *) why="" ;;
@@ -1489,6 +1498,64 @@ EOF_X1
     done
 else
     say "ARM X  floatingObject did not run in arm W" FAIL
+fi
+
+# X3: A RIGID BODY ON THE DEVICE (RAS/DTCHullMoving; arm W's row holds the tutorial on both arms). Two things
+# the device loop had to carry, each with a control here:
+#   THE BODY'S LOAD reads the closure's nut and U's cells as they stand when the mesh is moved; on this arm
+#   both are the device's, brought down right before the mesh update. Arm W CANNOT witness that: it writes
+#   every step, and the write itself downloads the closure. So this arm writes at the SECOND step only.
+#   MEASURED (2026-10-01): rigidBodyMotionState 3.4e-16 and p_rgh 8.2e-13 against OpenFOAM; with
+#   BRAE_CONTROL_DEVICE_BODY_STALE=1 (the load from the stale host copies) 2.9e-09 and 2.9e-09.
+#   THE ATMOSPHERE'S `tangentialVelocity` (pressureInletOutletVelocity's refValue, which the device kernel
+#   now blends into the inflow value). With BRAE_CONTROL_DEVICE_PIOV_NOREF=1 (the refValue left off the
+#   device, the inflow tangential part zero): U 2.4e-06, k 3.1e-04.
+BOUND_X3_STATE=3e-15
+if [ $GPU -eq 1 ] && [ -d "$W/w_of_DTCHullMoving" ]; then
+    x3t=$(echo $(timedirs "$W/w_of_DTCHullMoving") | awk '{print $2}')
+    for v in run stale noref; do
+        e="$W/x3_br_$v"
+        mkdir -p "$e"
+        cp -r "$W/w_of_DTCHullMoving/0" "$W/w_of_DTCHullMoving/constant" "$W/w_of_DTCHullMoving/system" "$e/"
+        sed -i -E 's/^(writeInterval\s+)[^;]*;/\12;/' "$e/system/controlDict"
+    done
+    grep -qE '^writeInterval\s+2;' "$W/x3_br_run/system/controlDict" \
+        || say "ARM X3 DTCHullMoving: the write interval was not staged to 2" FAIL
+    x3state()   # x3state <cmp file> -- the body state's gap at the one write, and p_rgh's
+    {
+        python3 - "$1" "$x3t" "$BOUND_X3_STATE" <<'EOF_X3S'
+import json, sys
+r = json.loads([l for l in open(sys.argv[1]) if l.startswith('RESULT ')][-1][7:])
+s = r['files'][sys.argv[2] + '/uniform/rigidBodyMotionState']['rel']
+p = r['files'][sys.argv[2] + '/p_rgh']['rel']
+print('      rigidBodyMotionState %.3e (bound %s), p_rgh %.3e' % (s, sys.argv[3], p))
+sys.exit(0 if r['structure'] == 0 and s <= float(sys.argv[3]) else 1)
+EOF_X3S
+    }
+    runbrae "$W/x3_br_run" device
+    [ "$(echo $(timedirs "$W/x3_br_run"))" = "$x3t" ] \
+        && say "ARM X3 [device] DTCHullMoving written at the second step alone" ok \
+        || say "ARM X3 [device] DTCHullMoving written at the second step alone" FAIL
+    python3 "$CMP" "$W/w_of_DTCHullMoving" "$W/x3_br_run" $x3t > "$W/cmp_x3.txt" 2>&1
+    x3state "$W/cmp_x3.txt" \
+        && say "ARM X3 [device] the body's state after a step with no write between: OpenFOAM's within $BOUND_X3_STATE" ok \
+        || say "ARM X3 [device] the body's state after a step with no write between: OpenFOAM's within $BOUND_X3_STATE" FAIL
+    judge "DTCHullMoving device, one write" "$W/cmp_x3.txt" "$BOUND_X3_FIELDS" "$W/w_of_DTCHullMoving/log.interFoam" \
+        && say "ARM X3 [device] DTCHullMoving: every file's structure is OpenFOAM's, every value within $BOUND_X3_FIELDS" ok \
+        || { say "ARM X3 [device] DTCHullMoving: every file's structure is OpenFOAM's, every value within $BOUND_X3_FIELDS" FAIL; grep -v RESULT "$W/cmp_x3.txt" | grep -B1 "^      " | head -12; }
+    runbrae "$W/x3_br_stale" device BRAE_CONTROL_DEVICE_BODY_STALE=1
+    python3 "$CMP" "$W/w_of_DTCHullMoving" "$W/x3_br_stale" $x3t > "$W/cmp_x3_stale.txt" 2>&1
+    x3state "$W/cmp_x3_stale.txt" > "$W/x3_stale.txt" \
+        && { say "CONTROL  BRAE_CONTROL_DEVICE_BODY_STALE=1 puts the body's state over the bound" FAIL; cat "$W/x3_stale.txt"; } \
+        || { say "CONTROL  BRAE_CONTROL_DEVICE_BODY_STALE=1 puts the body's state over the bound" ok; cat "$W/x3_stale.txt"; }
+    runbrae "$W/x3_br_noref" device BRAE_CONTROL_DEVICE_PIOV_NOREF=1
+    python3 "$CMP" "$W/w_of_DTCHullMoving" "$W/x3_br_noref" $x3t > "$W/cmp_x3_noref.txt" 2>&1
+    judge "control no refValue" "$W/cmp_x3_noref.txt" "$BOUND_X3_FIELDS" "$W/w_of_DTCHullMoving/log.interFoam" > "$W/x3_noref.txt"
+    grep -qE "over the bound: [0-9.e+-]+/U " "$W/x3_noref.txt" \
+        && say "CONTROL  BRAE_CONTROL_DEVICE_PIOV_NOREF=1 puts DTCHullMoving's U over the bound" ok \
+        || { say "CONTROL  BRAE_CONTROL_DEVICE_PIOV_NOREF=1 puts DTCHullMoving's U over the bound" FAIL; cat "$W/x3_noref.txt"; }
+elif [ $GPU -eq 1 ]; then
+    say "ARM X3 DTCHullMoving did not run in arm W" FAIL
 fi
 
 # ---------------------------------------------------------------------------------------------------

@@ -102,6 +102,16 @@ struct KEpsilonInput
     // rhoSimpleFoam_cpp.cuh StepInput); null falls back to rhoCell, the host closure's rhoOldAt.
     scalar                      rDeltaT    = 0.0;
     const DeviceBuffer<scalar>* rhoOldCell = nullptr;
+    // A MOVING MESH, as the host reference carries it (kEpsilonRef::Compressible::V0 / meshPhi) and the
+    // kOmegaSST kernels do: EulerDdtScheme::fvmDdt under mesh().moving() takes the OLD volumes in the
+    // source, rDeltaT*rho.oldTime()*psi.oldTime()*V0, where the diagonal keeps V; and divU is the
+    // divergence of the ABSOLUTE flux, fvc::div(fvc::absolute(phi, U)) = div(phi + mesh.phi())
+    // (kEpsilon.C:232-235). Null together on a static mesh. These were absent here, and a moving mesh ran
+    // on the current volumes and the relative flux with nothing said: MEASURED on RAS/floatingObject's
+    // released body, one step, device against host -- k 5.8e-06, nut 3.4e-06, epsilon 6.5e-07.
+    const DeviceBuffer<scalar>* V0         = nullptr;
+    const DeviceBuffer<scalar>* meshPhiInt = nullptr;
+    const DeviceBuffer<scalar>* meshPhiBnd = nullptr;
     const DeviceBuffer<scalar>* nuCell     = nullptr;    // mu(T)/rho per cell.        REQUIRED.
     const DeviceBuffer<scalar>* nuBndFace  = nullptr;    // mu_b/rho_b per bnd face.   REQUIRED.
     const DeviceBuffer<scalar>* nuWallFace = nullptr;    // the same, in WALL-face order

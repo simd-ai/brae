@@ -254,7 +254,16 @@ int main(
                          || profile == "closedDamBreak" || profile == "closedDamBreakInitU"
                          || profile == "closedAdjZG" || profile == "closedAdjIO"
                          || profile == "mixerTop" || profile == "mixerPermeable"
-                         || profile == "pistonOuter" || profile == "pistonOuterOnce");
+                         || profile == "pistonOuter" || profile == "pistonOuterOnce"
+                         || profile == "floating" || profile == "solitaryOuterCN");
+    // `floating` ON THE DEVICE: the body the fluid moves, its joint state held against OpenFOAM's below
+    const bool floatingDevice = (profile == "floating");
+    // `solitaryOuterCN`: three steps of the CrankNicolson wave tank under three outer correctors, where
+    // the device's distance is its own on nine passes of 200-iteration pressure solves and not a multiple
+    // of the host's -- MEASURED (2026-10-01) host alpha 3.9e-13 / p_rgh 2.4e-13 / U 2.1e-10, device
+    // 3.1e-10 / 1.9e-10 / 1.5e-09. The defect the profile holds reads 6.9e-05 / 3.2e-05 / 6.5e-03 on
+    // both arms (BRAE_CONTROL_CN_PHIOLD_PREV), five orders above the device's bounds.
+    const bool shortOuterCN = (profile == "solitaryOuterCN");
     PrimitiveMesh mD;
     FvGeometry gD;
     std::vector<FvPatch> patchesD;
@@ -290,48 +299,38 @@ int main(
         check("both arms moved the mesh the same way",
               wv <= scalar(1e-13)*std::fmax(sv, scalar(1e-300)));
     }
-    // THE DEVICE ARM'S REFUSAL, gated rather than trusted. The motion is a host stage on either arm,
-    // but the LOAD it is handed is not: this loop keeps the live fields on the device and refreshes
-    // InterFields' boundary arrays at its own stages, not before the mesh update, so a body moved
-    // from them would be moved by a stale force with nothing saying so. A refusal nobody runs is a
-    // refusal that stops firing, which is how a port surfaces silently.
-    if (profile.rfind("floating", 0) == 0)
+    // THE BODY ON THE DEVICE ARM. The motion is a host stage on either arm; what this loop owes it is the
+    // load -- the closure's nut and U's cells brought down before the mesh update (inter_driver_device.cu)
+    // -- and the joint state it then integrates is compared with OpenFOAM's directly, as the host's is.
+    if (floatingDevice)
     {
-        int nDev = 0;
-        if (cudaGetDeviceCount(&nDev) != cudaSuccess) { cudaGetLastError(); nDev = 0; }
-        if (nDev <= 0)
+        check("the device arm read the case as a rigid-body motion",
+              finD.dynamicMesh && finD.dynamicMesh->rigidBody() != nullptr);
+        if (finD.dynamicMesh && finD.dynamicMesh->rigidBody())
         {
-            std::printf("  (no CUDA device, so the device arm's refusal is not exercised here)\n");
-        }
-        else
-        {
-            PrimitiveMesh mR;
-            mR.read(caseDir + "/constant/polyMesh");
-            FvGeometry gR;
-            gR.build(mR);
-            std::vector<FvPatch> patchesR = buildPatches(mR, gR);
-            MutableMesh mutableR;
-            mutableR.m = &mR;
-            mutableR.g = &gR;
-            mutableR.patches = &patchesR;
-            std::string msg;
-            bool threw = false;
-            try
+            const RBD::ModelState& st = finD.dynamicMesh->rigidBody()->state();
+            const std::string sp = ofDir + "/uniform/rigidBodyMotionState";
+            const std::vector<scalar> ofQ = RBD::readJointStateList(sp, "q").value_or(std::vector<scalar>{});
+            const std::vector<scalar> ofV = RBD::readJointStateList(sp, "qDot").value_or(std::vector<scalar>{});
+            const std::vector<scalar> ofA = RBD::readJointStateList(sp, "qDdot").value_or(std::vector<scalar>{});
+            scalar wq = 0, wv = 0, wa = 0, rq = 0, rv = 0, ra = 0;
+            for (std::size_t i = 0; i < st.q.size() && i < ofQ.size(); ++i)
             {
-                InterFields finR;
-                runInterFoamDevice(caseDir, startDir, mR, gR, patchesR, 1, /*verbose=*/false, &finR,
-                                   scalar(1.0e300), nullptr, &mutableR);
+                wq = std::fmax(wq, std::fabs(st.q[i] - ofQ[i]));
+                rq = std::fmax(rq, std::fabs(ofQ[i]));
+                wv = std::fmax(wv, std::fabs(st.qDot[i] - ofV[i]));
+                rv = std::fmax(rv, std::fabs(ofV[i]));
+                wa = std::fmax(wa, std::fabs(st.qDdot[i] - ofA[i]));
+                ra = std::fmax(ra, std::fabs(ofA[i]));
             }
-            catch (const std::exception& e)
-            {
-                threw = true;
-                msg = e.what();
-            }
-            std::printf("  the device arm: %s\n",
-                        threw ? msg.substr(0, 110).c_str() : "IT RAN");
-            check("the device arm refuses a body the fluid drives", threw);
-            check("...and names rigidBodyMotion in saying so",
-                  msg.find("rigidBodyMotion") != std::string::npos);
+            std::printf("  DEVICE body: q %.4e of %.4e, qDot %.4e of %.4e, qDdot %.4e of %.4e\n",
+                        (double)wq, (double)rq, (double)wv, (double)rv, (double)wa, (double)ra);
+            // the host arm's own bound: MEASURED on the device q 6.4e-17 of 1.3e-04, qDot 8.8e-15 of
+            // 6.2e-03, qDdot 1.3e-12 of 1.8e-01 (2026-10-01)
+            check("the device's joint position is OpenFOAM's",
+                  ofQ.size() == st.q.size() && wq <= scalar(1e-10)*std::fmax(rq, scalar(1e-300)));
+            check("...its joint velocity", wv <= scalar(1e-10)*std::fmax(rv, scalar(1e-300)));
+            check("...and its joint acceleration", wa <= scalar(1e-10)*std::fmax(ra, scalar(1e-300)));
         }
     }
     // `esd`: ALPHA'S PATCH VALUES, which no other arm here compares, and the only place in the
@@ -511,7 +510,7 @@ int main(
     // ...and `solitaryCN`, whose solves are converged to 1e-13 for the same reason: where the last
     // iteration is a stopping point rather than a computation, the residual CURVE is the comparison.
     const bool longSolves = profile.rfind("piston", 0) == 0 || profile.rfind("flap", 0) == 0
-                         || profile == "solitaryCN";
+                         || profile == "solitaryCN" || profile == "solitaryOuterCN";
     // `allowOne`: the DEVICE arm's rule. On a solve converged to 1e-13 with relTol 0 the last
     // iteration is where an implementation stops, not what it computes, and the device's reductions
     // are summed in a different order from OpenFOAM's by construction (device_pcg.cuh). MEASURED on
@@ -752,10 +751,13 @@ int main(
         check(amplifies ? "the device's alpha is inside this case's own one-ulp noise"
                         : "the device's alpha is as close to OpenFOAM as the host's",
               amplifies ? (eA.linf < scalar(2e-6))
+                        : shortOuterCN ? (eA.linf < scalar(3e-9))
                         : (eA.linf <= scalar(20)*std::fmax(dA.linf, scalar(1e-300))));
         check("...its p_rgh", amplifies ? (eP.rel() < scalar(2e-6))
+                                        : shortOuterCN ? (eP.rel() < scalar(2e-9))
                                         : (eP.rel() <= scalar(20)*std::fmax(dP.rel(), scalar(1e-300))));
         check("...and its U", amplifies ? (eU.rel() < scalar(2e-5))
+                                        : shortOuterCN ? (eU.rel() < scalar(1.5e-8))
                                         : (eU.rel() <= scalar(20)*std::fmax(dU.rel(), scalar(1e-300))));
         check("OpenFOAM's own fields are not zero here, so the comparison means something",
               dU.refMax > scalar(0) && dP.refMax > scalar(0));
