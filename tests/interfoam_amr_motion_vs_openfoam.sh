@@ -137,7 +137,15 @@ runOf()
 }
 
 rc=0
+# AMR_MOTION_PART=box|unrefine runs one profile alone (tests/interfoam_amr_motion/, one test per file); unset,
+# both
+PART=${AMR_MOTION_PART:-}
+case "$PART" in
+    ""|box|unrefine) ;;
+    *) echo "FAIL: unknown AMR_MOTION_PART $PART"; exit 1 ;;
+esac
 
+if [ "$PART" != unrefine ]; then
 G="$W/box"
 stage "$G" || exit 1
 runOf "$G" "box" || exit 1
@@ -193,11 +201,13 @@ if dU < 0.5:
 PYEOF
 
 "$BIN" "$G" "$G/0" "$G/$END" "$N" "$G/log.interFoam" box || rc=1
+fi
 
 # boxUnrefine: SIXTY steps, where OpenFOAM first UNREFINES (step 57). Unrefinement removes points and merges
 # cells and faces, so it is the only profile here on which points0 loses points, a merged cell's V0 is reset,
 # and a carry with no internal half (U's old-time patch values) is mapped through MERGED faces -- which read an
 # empty list in mapSurfaceField's interpolative branch and segfaulted until this unit.
+if [ "$PART" != box ]; then
 N=60
 END=$(python3 -c "print('%.10g' % ($N*float('$DT')))")
 GU="$W/boxUnrefine"
@@ -207,6 +217,7 @@ grep -qF "Unrefined from 9540 to 9400 cells." "$GU/log.interFoam" \
     || { echo "FAIL: OpenFOAM does not unrefine 9540 -> 9400 in this profile, so it cannot witness removal"
          grep -n "Unrefined from" "$GU/log.interFoam"; rc=1; }
 "$BIN" "$GU" "$GU/0" "$GU/$END" "$N" "$GU/log.interFoam" boxUnrefine || rc=1
+fi
 
 echo "interfoam_amr_motion_vs_openfoam: rc $rc"
 exit $rc

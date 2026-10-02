@@ -4017,13 +4017,22 @@ set_tests_properties(interfoam_motorbike_vs_openfoam PROPERTIES
 # ...and a mesh that REFINES AND MOVES: laminar/oscillatingBox as shipped at fixed steps (`box`, twenty; and
 # `boxUnrefine`, sixty, through its first unrefinement), the motion's points0 carried through every change and
 # its points and points0 held to OpenFOAM's bitwise. The device arm refuses the combination by name.
-add_test(NAME interfoam_amr_motion_vs_openfoam
-         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_amr_motion_vs_openfoam.sh)
-set_tests_properties(interfoam_amr_motion_vs_openfoam PROPERTIES
-                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}"
-                     SKIP_RETURN_CODE 77
-                     DEPENDS test_inter_amr_vs_openfoam
-                     TIMEOUT 1200)
+# ONE TEST PER FILE under tests/interfoam_amr_motion/, each one profile of the gate through its
+# AMR_MOTION_PART selector. MEASURED alone: box 37 s, unrefine 122 s (the two in one test read 393 s under
+# ctest -j 4).
+file(GLOB BRAE_AMR_MOTION_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_amr_motion
+     ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_amr_motion/*.sh)
+foreach(rel ${BRAE_AMR_MOTION_TESTS})
+    string(REGEX REPLACE "\\.sh$" "" name ${rel})
+    add_test(NAME interfoam_amr_motion_${name}
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_amr_motion/${rel})
+    set_tests_properties(interfoam_amr_motion_${name} PROPERTIES
+                         ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}"
+                         SKIP_RETURN_CODE 77
+                         DEPENDS test_inter_amr_vs_openfoam
+                         RESOURCE_LOCK brae_gpu
+                         TIMEOUT 600)
+endforeach()
 
 # ...and a GENUINE RESTART, where nothing is moved into constant/polyMesh: the seed leaves an ORIGINAL mesh
 # there and a REFINED one in the time directory, and both codes continue from the time directory. That is the
