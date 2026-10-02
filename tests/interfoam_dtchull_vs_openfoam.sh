@@ -259,53 +259,83 @@ control()
     return 1
 }
 
-rc=0
-for p in laminar ras
-do
-    stage "$p" || { echo "interfoam_dtchull_vs_openfoam: staging failed"; exit 1; }
-    echo "== [$p]"
-    "$BIN" "$W/$p" "$W/$p" "$STEPS" "$W/$p/log.interFoam" $MODE || rc=1
-done
-# THE DEVICE ARM, on `laminar`: all STEPS steps at its own bounds, and ONE step at the host arm's --
-# every localEuler consumer and the outlet have run by then and nothing has amplified (DEV_BOUND_* in the gate)
-echo "== [laminar device]"
-"$BIN" "$W/laminar" "$W/laminar" "$STEPS" "$W/laminar/log.interFoam" $MODE device || rc=1
-awk '/^Flow time scale min\/max/ { if (++k > 1) exit } { print }' "$W/laminar/log.interFoam" > "$W/log.one"
-echo "== [laminar device, one step]"
-"$BIN" "$W/laminar" "$W/laminar" 1 "$W/log.one" $MODE device || rc=1
-
+# WHAT RUNS. The files under tests/interfoam_dtchull/ each name a few of these and are one ctest test each,
+# so no test is the whole gate (745 s on 848k cells as one script, 2026-10-01):
+#   DTCHULL_RUN="laminar:host ras:device ..."            a profile on an arm, all STEPS steps -- and on the
+#                                                         device arm one step too, at the host arm's bounds
+#   DTCHULL_CONTROL="laminar:host:CTL=1 ras:device:..."  one control each, asserted to fail on a number
+# Both unset, everything runs, in the order the gate always had. A profile is staged when first needed.
+ALL_RUN="laminar:host ras:host laminar:device ras:device"
+ALL_CONTROL=""
 for ctl in BRAE_CONTROL_LTS_NOSMOOTH=1 BRAE_CONTROL_LTS_NODAMP=1 BRAE_CONTROL_LTS_SCALAR=alpha \
            BRAE_CONTROL_LTS_SCALAR=ueqn BRAE_CONTROL_LTS_SCALAR=ddtcorr BRAE_CONTROL_RHOPHI_ALPHAFLUX=1
 do
-    control laminar "$ctl" || rc=1
+    ALL_CONTROL="$ALL_CONTROL laminar:host:$ctl"
 done
 for ctl in BRAE_CONTROL_LTS_SCALAR=turbulence BRAE_CONTROL_SST_LU_OFF=1 BRAE_CONTROL_SST_LU_UNLIMITED=1 \
            BRAE_CONTROL_NUTK_SMOOTH=1 BRAE_CONTROL_NUTKROUGH_NOHISTORY=1 BRAE_CONTROL_OPMV_FROZEN=1 \
            BRAE_CONTROL_OPMV_NOLAG=1 BRAE_CONTROL_GRADU_UNCACHED=1
 do
-    control ras "$ctl" || rc=1
+    ALL_CONTROL="$ALL_CONTROL ras:host:$ctl"
 done
-
-# ...and the tutorial AS SHIPPED on the GPU, `ras`: ten steps at the device bounds, one at the host's (the
-# closure's residuals keep DEV_BOUND_TURB_RESIDUAL there too -- see the gate)
-echo "== [ras device]"
-"$BIN" "$W/ras" "$W/ras" "$STEPS" "$W/ras/log.interFoam" $MODE device || rc=1
-awk '/^Flow time scale min\/max/ { if (++k > 1) exit } { print }' "$W/ras/log.interFoam" > "$W/log.one"
-echo "== [ras device, one step]"
-"$BIN" "$W/ras" "$W/ras" 1 "$W/log.one" $MODE device || rc=1
 for ctl in BRAE_CONTROL_LTS_SCALAR=turbulence BRAE_CONTROL_SST_LU_OFF=1 BRAE_CONTROL_SST_LU_UNLIMITED=1 \
            BRAE_CONTROL_NUTK_SMOOTH_DEVICE=1 BRAE_CONTROL_NUTKROUGH_NOHISTORY=1 BRAE_CONTROL_GRADU_UNCACHED=1 \
            BRAE_CONTROL_GRADU_STALE=1
 do
-    control ras "$ctl" device || rc=1
+    ALL_CONTROL="$ALL_CONTROL ras:device:$ctl"
 done
-
 # ...and the device loop's own consumers, each switched off in turn: the same controls, the GPU loop
 for ctl in BRAE_CONTROL_LTS_NOSMOOTH=1 BRAE_CONTROL_LTS_NODAMP=1 BRAE_CONTROL_LTS_SCALAR=alpha \
            BRAE_CONTROL_LTS_SCALAR=ueqn BRAE_CONTROL_LTS_SCALAR=ddtcorr BRAE_CONTROL_OPMV_FROZEN=1 \
            BRAE_CONTROL_OPMV_NOLAG=1
 do
-    control laminar "$ctl" device || rc=1
+    ALL_CONTROL="$ALL_CONTROL laminar:device:$ctl"
+done
+if [ -z "${DTCHULL_RUN:-}" ] && [ -z "${DTCHULL_CONTROL:-}" ]; then
+    DTCHULL_RUN="$ALL_RUN"
+    DTCHULL_CONTROL="$ALL_CONTROL"
+fi
+
+declare -A STAGED
+need()   # need <profile> -- staged, with OpenFOAM's run, once
+{
+    [ -n "${STAGED[$1]:-}" ] && return 0
+    stage "$1" || { echo "interfoam_dtchull_vs_openfoam: staging failed"; exit 1; }
+    STAGED[$1]=1
+}
+
+rc=0
+for spec in ${DTCHULL_RUN:-}
+do
+    p=${spec%%:*}
+    arm=${spec#*:}
+    need "$p"
+    if [ "$arm" = host ]; then
+        echo "== [$p]"
+        "$BIN" "$W/$p" "$W/$p" "$STEPS" "$W/$p/log.interFoam" $MODE || rc=1
+    else
+        # THE DEVICE ARM: all STEPS steps at its own bounds, and ONE step at the host arm's -- every
+        # localEuler consumer and the outlet have run by then and nothing has amplified (DEV_BOUND_* in the
+        # gate; on `ras`, the tutorial AS SHIPPED, the closure's residuals keep DEV_BOUND_TURB_RESIDUAL too)
+        echo "== [$p device]"
+        "$BIN" "$W/$p" "$W/$p" "$STEPS" "$W/$p/log.interFoam" $MODE device || rc=1
+        awk '/^Flow time scale min\/max/ { if (++k > 1) exit } { print }' "$W/$p/log.interFoam" > "$W/log.one"
+        echo "== [$p device, one step]"
+        "$BIN" "$W/$p" "$W/$p" 1 "$W/log.one" $MODE device || rc=1
+    fi
+done
+for spec in ${DTCHULL_CONTROL:-}
+do
+    p=${spec%%:*}
+    rest=${spec#*:}
+    arm=${rest%%:*}
+    ctl=${rest#*:}
+    need "$p"
+    if [ "$arm" = device ]; then
+        control "$p" "$ctl" device || rc=1
+    else
+        control "$p" "$ctl" || rc=1
+    fi
 done
 
 echo "interfoam_dtchull_vs_openfoam: rc $rc"

@@ -282,14 +282,35 @@ PYEOF
     echo "OpenFOAM ran $MOV_STEPS steps of deltaT $DT from t = $MOV_START to t = $MOV_END   [$name]"
 }
 
+# LEAKAGE_PART="a b": run only the named parts of this gate -- the files under tests/interfoam_leakage/ each name
+# one and are one ctest test each, so no test is the whole gate (228 s as one script, 2026-10-01). Unset,
+# every part runs. A profile is staged, with its OpenFOAM run, when a part first needs it.
+part()
+{
+    [ -z "${LEAKAGE_PART:-}" ] && return 0
+    local x
+    for x in $LEAKAGE_PART; do [ "$x" = "$1" ] && return 0; done
+    return 1
+}
+declare -A STAGED
+need()
+{
+    local p
+    for p in "$@"; do
+        [ -n "${STAGED[$p]:-}" ] && continue
+        stage "$p" || { echo "interfoam_leakage_vs_openfoam: staging failed"; exit 1; }
+        STAGED[$p]=1
+    done
+}
+
 rc=0
-for p in closed allOpen leak; do
-    stage "$p" || { rc=1; break; }
-done
-[ $rc = 0 ] || { echo "interfoam_leakage_vs_openfoam: staging failed"; exit 1; }
-
+if part leak; then
+need closed allOpen leak
 "$BIN" "$W/leak" "$W/leak/0" "$W/leak/$END" "$STEPS" "$W/leak/log.interFoam" "$W/closed/$END" "$W/allOpen/$END" || rc=1
+fi
 
+if part restart; then
+need closed allOpen leak
 # THE RESTART ARM: OpenFOAM restarted from its own written state at RESTART, brae from the same files.
 # The coded scale reads this->time(); a loop whose clock starts at 0 whatever the start directory says
 # never reaches t > 0.5 in these steps and never opens the baffle.
@@ -307,7 +328,10 @@ oracleRun "$R" interfoam_leakage restart || { echo "FAIL: interFoam [restart]"; 
 [ -d "$R/$END" ] || { echo "FAIL: the restarted OpenFOAM wrote no $END directory"; ls "$R"; exit 1; }
 echo "OpenFOAM restarted at t = $RESTART and ran $RESTART_STEPS steps to t = $END   [restart]"
 "$BIN" "$R" "$R/$RESTART" "$R/$END" "$RESTART_STEPS" "$R/log.interFoam" "$W/closed/$END" "$W/allOpen/$END" || rc=1
+fi
 
+if part moving; then
+need closed allOpen leak
 # THE MOVING ARM. Its controls are shaken too -- the baffle never opening and opening on every face --
 # so they answer for the baffle and not for the motion; the STATIC twin of the same fixture is passed
 # beside them and answers for the motion.
@@ -318,6 +342,7 @@ stageMoving movingStatic 0 leak    || rc=1
 [ $rc = 0 ] || { echo "interfoam_leakage_vs_openfoam: moving staging failed"; exit 1; }
 "$BIN" "$W/moving" "$W/moving/$MOV_START" "$W/moving/$MOV_END" "$MOV_STEPS" "$W/moving/log.interFoam" \
        "$W/movingClosed/$MOV_END" "$W/movingOpen/$MOV_END" moving "$W/movingStatic/$MOV_END" || rc=1
+fi
 
 echo "interfoam_leakage_vs_openfoam: rc $rc"
 exit $rc

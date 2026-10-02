@@ -287,7 +287,11 @@ gate()
     END=$(endOf "$N")
     "$BIN" "$W/$1" "$W/$1/0" "$W/$1/$END" "$N" "$W/$1/log.interFoam" "$W/$2/$END" "$3" || rc=1
 }
-for p in $PROFILES; do
+# BAFFLE_GATE="porous": of the staged profiles, gate only these. A profile's control is another profile that
+# must be STAGED but not gated with it (gating `cyclic` beside `porous` would ask for `walls` in turn). The
+# files under tests/interfoam_baffle/ set PROFILES and BAFFLE_GATE, one profile each. Unset, every staged
+# profile is gated.
+for p in ${BAFFLE_GATE:-$PROFILES}; do
     case "$p" in
         cyclic)    gate cyclic walls cyclic ;;
         porous)    gate porous cyclic porous ;;

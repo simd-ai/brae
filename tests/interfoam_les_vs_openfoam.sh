@@ -316,12 +316,30 @@ PYEOF
     echo "OpenFOAM ran $STEPS steps of deltaT $DT to t = $END   [$profile]"
 }
 
-rc=0
-for p in delta delta3d laminar les pcorrGrad pbicg orthogonalLes uncorrected; do
-    stage "$p" || { rc=1; break; }
-done
-[ $rc = 0 ] || { echo "interfoam_les_vs_openfoam: staging failed"; exit 1; }
+# LES_PART="a b": run only the named parts of this gate -- the files under tests/interfoam_les/ each name
+# one and are one ctest test each, so no test is the whole gate (674 s as one script, 2026-10-01). Unset,
+# every part runs. A profile is staged, with its OpenFOAM run, when a part first needs it.
+part()
+{
+    [ -z "${LES_PART:-}" ] && return 0
+    local x
+    for x in $LES_PART; do [ "$x" = "$1" ] && return 0; done
+    return 1
+}
+declare -A STAGED
+need()
+{
+    local p
+    for p in "$@"; do
+        [ -n "${STAGED[$p]:-}" ] && continue
+        stage "$p" || { echo "interfoam_les_vs_openfoam: staging failed"; exit 1; }
+        STAGED[$p]=1
+    done
+}
 
+rc=0
+if part les; then
+need les laminar delta delta3d
 # the oracle took the path
 grep -q "Selecting LES turbulence model kEqn" "$W/les/log.interFoam" \
     || { echo "FAIL: OpenFOAM's log does not select kEqn"; exit 1; }
@@ -330,6 +348,10 @@ grep -q "Selecting LES delta type smooth" "$W/les/log.interFoam" \
 
 "$BIN" "$W/les" "$W/les/0" "$W/les/$END" "$STEPS" "$W/les/log.interFoam" "$W/laminar/$END" "$W/delta/0" \
        "$W/delta3d" || rc=1
+fi
+
+if part pcorrGrad; then
+need les pcorrGrad laminar delta delta3d
 # pcorrGrad: the scheme has to have MOVED OpenFOAM's own answer, or the profile tests nothing
 python3 - "$W/les/$END/U" "$W/pcorrGrad/$END/U" <<'PYEOF' || rc=1
 import re, sys
@@ -345,7 +367,10 @@ sys.exit(0 if d/ref > 1e-6 else 1)
 PYEOF
 "$BIN" "$W/pcorrGrad" "$W/pcorrGrad/0" "$W/pcorrGrad/$END" "$STEPS" "$W/pcorrGrad/log.interFoam" "$W/laminar/$END" \
        "$W/delta/0" "$W/delta3d" || rc=1
+fi
 
+if part pbicg; then
+need pbicg laminar delta delta3d
 # pbicg: OpenFOAM has to have TAKEN PBiCG for k, or the profile tests nothing
 grep -q "PBiCG:  Solving for k" "$W/pbicg/log.interFoam" \
     || { echo "FAIL: OpenFOAM's log does not solve k with PBiCG"; rc=1; }
@@ -353,8 +378,10 @@ grep -q "smoothSolver:  Solving for k" "$W/pbicg/log.interFoam" \
     && { echo "FAIL: OpenFOAM still solved k with the smoothSolver somewhere"; rc=1; }
 "$BIN" "$W/pbicg" "$W/pbicg/0" "$W/pbicg/$END" "$STEPS" "$W/pbicg/log.interFoam" "$W/laminar/$END" \
        "$W/delta/0" "$W/delta3d" || rc=1
+fi
 
-
+if part uncorrected; then
+need uncorrected orthogonalLes laminar delta delta3d
 # uncorrected: OpenFOAM's `orthogonal` has to be FAR from its `uncorrected` on the fields the wired line
 # feeds, or the arm tests nothing. This is the one control that can witness the split -- see the staging
 # note. MEASURED here, 100 steps of 1e-9: U 2.944e-03 and k 1.742e-03, over all 20,603 cells; and one ulp
@@ -388,6 +415,7 @@ sys.exit(bad)
 NOEOF
 "$BIN" "$W/uncorrected" "$W/uncorrected/0" "$W/uncorrected/$END" "$STEPS" "$W/uncorrected/log.interFoam" \
        "$W/laminar/$END" "$W/delta/0" "$W/delta3d" uncorrected || rc=1
+fi
 
 echo "interfoam_les_vs_openfoam: rc $rc"
 exit $rc

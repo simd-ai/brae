@@ -260,19 +260,43 @@ PYEOF
     echo "OpenFOAM ran $STEPS steps of deltaT $DT to t = $END   [$profile]"
 }
 
+# MANGROVE_PART="a b": run only the named parts of this gate -- the files under tests/interfoam_mangrove/ each name
+# one and are one ctest test each, so no test is the whole gate (316 s as one script, 2026-10-01). Unset,
+# every part runs. A profile is staged, with its OpenFOAM run, when a part first needs it.
+part()
+{
+    [ -z "${MANGROVE_PART:-}" ] && return 0
+    local x
+    for x in $MANGROVE_PART; do [ "$x" = "$1" ] && return 0; done
+    return 1
+}
+declare -A STAGED
+need()
+{
+    local p
+    for p in "$@"; do
+        [ -n "${STAGED[$p]:-}" ] && continue
+        stage "$p" || { echo "interfoam_mangrove_vs_openfoam: staging failed"; exit 1; }
+        STAGED[$p]=1
+    done
+}
+
 rc=0
-for p in off turbOff mangrove twoOptions densityVariable densityVariableOff; do
-    stage "$p" || { rc=1; break; }
-done
-[ $rc = 0 ] || { echo "interfoam_mangrove_vs_openfoam: staging failed"; exit 1; }
-
+if part mangrove; then
+need off turbOff mangrove
 "$BIN" "$W/mangrove" "$W/mangrove/0" "$W/mangrove/$END" "$STEPS" "$W/mangrove/log.interFoam" "$W/off/$END" "$W/turbOff/$END" || rc=1
+fi
 
+if part twoOptions; then
+need off mangrove twoOptions
 # twoOptions: TWO options of each type over the same cellZone, with the ONE-of-each run as the control --
 # the second option has to have moved OpenFOAM's own answer, or the profile tests nothing
 "$BIN" "$W/twoOptions" "$W/twoOptions/0" "$W/twoOptions/$END" "$STEPS" "$W/twoOptions/log.interFoam" \
        "$W/off/$END" "$W/mangrove/$END" twoOptions || rc=1
+fi
 
+if part densityVariable; then
+need densityVariable densityVariableOff mangrove
 # densityVariable: the density-weighted k-epsilon, with the UNIFORM run as the control -- the weighting
 # has to have moved OpenFOAM's own k, or the profile tests nothing
 grep -q "Selecting turbulence model type RAS" "$W/densityVariable/log.interFoam" \
@@ -280,6 +304,7 @@ grep -q "Selecting turbulence model type RAS" "$W/densityVariable/log.interFoam"
 "$BIN" "$W/densityVariable" "$W/densityVariable/0" "$W/densityVariable/$END" "$STEPS" \
        "$W/densityVariable/log.interFoam" "$W/densityVariableOff/$END" "$W/mangrove/$END" \
        densityVariable || rc=1
+fi
 
 echo "interfoam_mangrove_vs_openfoam: rc $rc"
 exit $rc

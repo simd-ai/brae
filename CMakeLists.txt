@@ -3301,7 +3301,6 @@ file(GLOB BRAE_WRITE_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_
      ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_write/*/*.sh)
 list(FILTER BRAE_WRITE_TESTS EXCLUDE REGEX "/_common\\.sh$")
 set(BRAE_WRITE_SLOW_FILES "^ami/|^refine/mapping")
-set(BRAE_WRITE_GPU_FILES "^none/")
 foreach(rel ${BRAE_WRITE_TESTS})
     string(REPLACE ".sh" "" name ${rel})
     string(REPLACE "/" "_" name ${name})
@@ -3316,9 +3315,6 @@ foreach(rel ${BRAE_WRITE_TESTS})
                          LABELS ${tierLabel}
                          TIMEOUT 1800
                          ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
-    if(rel MATCHES "${BRAE_WRITE_GPU_FILES}")
-        set_tests_properties(interfoam_write_${name} PROPERTIES RESOURCE_LOCK brae_gpu)
-    endif()
 endforeach()
 set(BRAE_WRITE_TUTORIALS_FAST
     capillaryRise weirOverflow angledDuct damBreakLeakage damBreakPorousBaffle damBreakPermeable
@@ -3721,11 +3717,37 @@ add_executable(test_inter_dtchull_vs_openfoam tests/test_inter_dtchull_vs_openfo
 target_include_directories(test_inter_dtchull_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_inter_dtchull_vs_openfoam PRIVATE brae_core)
-add_test(NAME interfoam_dtchull_vs_openfoam
-         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_dtchull_vs_openfoam.sh)
-set_tests_properties(interfoam_dtchull_vs_openfoam PROPERTIES
-                     SKIP_RETURN_CODE 77
-                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+# ONE TEST PER FILE under tests/interfoam_ami_device/: the device loop across a static cyclicAMI pair
+# against real OpenFOAM, and its controls (run.sh holds the fixture and what is measured)
+file(GLOB BRAE_AMI_DEVICE_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_ami_device
+     ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_ami_device/*.sh)
+list(FILTER BRAE_AMI_DEVICE_TESTS EXCLUDE REGEX "^(run|_common)\\.sh$")
+foreach(rel ${BRAE_AMI_DEVICE_TESTS})
+    string(REPLACE ".sh" "" name ${rel})
+    add_test(NAME interfoam_ami_device_${name}
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_ami_device/${rel})
+    set_tests_properties(interfoam_ami_device_${name} PROPERTIES
+                         SKIP_RETURN_CODE 77
+                         TIMEOUT 1800
+                         RESOURCE_LOCK brae_gpu
+                         ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+endforeach()
+
+# ONE TEST PER FILE under tests/interfoam_dtchull/, each a part of this gate chosen through the gate's own
+# selector, so no test is the whole gate; the device arms take the GPU one at a time (see interfoam_moving)
+file(GLOB BRAE_DTCHULL_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_dtchull
+     ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_dtchull/*.sh)
+list(FILTER BRAE_DTCHULL_TESTS EXCLUDE REGEX "^(run|_common)\\.sh$")
+foreach(rel ${BRAE_DTCHULL_TESTS})
+    string(REPLACE ".sh" "" name ${rel})
+    add_test(NAME interfoam_dtchull_${name}
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_dtchull/${rel})
+    set_tests_properties(interfoam_dtchull_${name} PROPERTIES
+                         SKIP_RETURN_CODE 77
+                         TIMEOUT 1800
+                         RESOURCE_LOCK "brae_gpu;brae_bigmesh"
+                         ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+endforeach()
 
 # ...and RAS/DTCHullMoving with its mesh FROZEN: the atmosphere's pressureInletOutletVelocity carries a
 # `tangentialVelocity`, which interFoam's host loop claims and hands to the patch field. The control is brae
@@ -3779,8 +3801,20 @@ add_executable(test_inter_baffle_vs_openfoam tests/test_inter_baffle_vs_openfoam
 target_include_directories(test_inter_baffle_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_inter_baffle_vs_openfoam PRIVATE brae_core)
-add_test(NAME interfoam_baffle_vs_openfoam
-         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_baffle_vs_openfoam.sh)
+# ONE TEST PER FILE under tests/interfoam_baffle/, each a part of this gate chosen through the gate's own
+# selector, so no test is the whole gate; the device arms take the GPU one at a time (see interfoam_moving)
+file(GLOB BRAE_BAFFLE_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_baffle
+     ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_baffle/*.sh)
+list(FILTER BRAE_BAFFLE_TESTS EXCLUDE REGEX "^(run|_common)\\.sh$")
+foreach(rel ${BRAE_BAFFLE_TESTS})
+    string(REPLACE ".sh" "" name ${rel})
+    add_test(NAME interfoam_baffle_${name}
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_baffle/${rel})
+    set_tests_properties(interfoam_baffle_${name} PROPERTIES
+                         SKIP_RETURN_CODE 77
+                         TIMEOUT 1800
+                         RESOURCE_LOCK brae_gpu)
+endforeach()
 
 # The coupled cyclic patch field and porousBafflePressure's jump face by face, against OpenFOAM's text: the
 # per-face jump, reversed flow and sign(0), which RAS/damBreakPorousBaffle does not reach.
@@ -3795,8 +3829,20 @@ add_executable(test_inter_les_vs_openfoam tests/test_inter_les_vs_openfoam.cu)
 target_include_directories(test_inter_les_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_inter_les_vs_openfoam PRIVATE brae_core)
-add_test(NAME interfoam_les_vs_openfoam
-         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_les_vs_openfoam.sh)
+# ONE TEST PER FILE under tests/interfoam_les/, each a part of this gate chosen through the gate's own
+# selector, so no test is the whole gate; the device arms take the GPU one at a time (see interfoam_moving)
+file(GLOB BRAE_LES_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_les
+     ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_les/*.sh)
+list(FILTER BRAE_LES_TESTS EXCLUDE REGEX "^(run|_common)\\.sh$")
+foreach(rel ${BRAE_LES_TESTS})
+    string(REPLACE ".sh" "" name ${rel})
+    add_test(NAME interfoam_les_${name}
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_les/${rel})
+    set_tests_properties(interfoam_les_${name} PROPERTIES
+                         SKIP_RETURN_CODE 77
+                         TIMEOUT 1800
+                         RESOURCE_LOCK brae_gpu)
+endforeach()
 
 # interFoam on a FULLY PERIODIC mesh against real OpenFOAM, on brae's own validation/interFoamCyclic.
 # The script carries the measurements, the control and the device refusal.
@@ -4058,8 +4104,20 @@ add_executable(test_inter_leakage_vs_openfoam tests/test_inter_leakage_vs_openfo
 target_include_directories(test_inter_leakage_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_inter_leakage_vs_openfoam PRIVATE brae_core)
-add_test(NAME interfoam_leakage_vs_openfoam
-         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_leakage_vs_openfoam.sh)
+# ONE TEST PER FILE under tests/interfoam_leakage/, each a part of this gate chosen through the gate's own
+# selector, so no test is the whole gate; the device arms take the GPU one at a time (see interfoam_moving)
+file(GLOB BRAE_LEAKAGE_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_leakage
+     ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_leakage/*.sh)
+list(FILTER BRAE_LEAKAGE_TESTS EXCLUDE REGEX "^(run|_common)\\.sh$")
+foreach(rel ${BRAE_LEAKAGE_TESTS})
+    string(REPLACE ".sh" "" name ${rel})
+    add_test(NAME interfoam_leakage_${name}
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_leakage/${rel})
+    set_tests_properties(interfoam_leakage_${name} PROPERTIES
+                         SKIP_RETURN_CODE 77
+                         TIMEOUT 1800
+                         RESOURCE_LOCK brae_gpu)
+endforeach()
 
 # interFoam with the mangrove fvOptions against real OpenFOAM on waves/mangroveInteraction. The script
 # carries the measurements, the controls and the fail-proofs.
@@ -4067,8 +4125,20 @@ add_executable(test_inter_mangrove_vs_openfoam tests/test_inter_mangrove_vs_open
 target_include_directories(test_inter_mangrove_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_inter_mangrove_vs_openfoam PRIVATE brae_core)
-add_test(NAME interfoam_mangrove_vs_openfoam
-         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_mangrove_vs_openfoam.sh)
+# ONE TEST PER FILE under tests/interfoam_mangrove/, each a part of this gate chosen through the gate's own
+# selector, so no test is the whole gate; the device arms take the GPU one at a time (see interfoam_moving)
+file(GLOB BRAE_MANGROVE_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_mangrove
+     ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_mangrove/*.sh)
+list(FILTER BRAE_MANGROVE_TESTS EXCLUDE REGEX "^(run|_common)\\.sh$")
+foreach(rel ${BRAE_MANGROVE_TESTS})
+    string(REPLACE ".sh" "" name ${rel})
+    add_test(NAME interfoam_mangrove_${name}
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_mangrove/${rel})
+    set_tests_properties(interfoam_mangrove_${name} PROPERTIES
+                         SKIP_RETURN_CODE 77
+                         TIMEOUT 1800
+                         RESOURCE_LOCK brae_gpu)
+endforeach()
 
 # CrankNicolson ddt on RAS/damBreak, both arms (run by tests/interfoam_cn_vs_openfoam.sh)
 add_executable(test_inter_cn_vs_openfoam tests/test_inter_cn_vs_openfoam.cu)
