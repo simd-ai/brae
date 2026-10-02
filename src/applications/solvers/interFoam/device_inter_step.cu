@@ -812,8 +812,21 @@ void deviceInterStep(
         // device kOmegaSST closure reads U's outlet through dbU for its grad(U) (device_komega_sst.cu),
         // where OpenFOAM's tgradU reads the stored, lagged value. pressureInletOutletVelocity is
         // exempt, as on the host: its updateCoeffs ends in evaluate() and clears the flag.
-        deviceUpdateInletOutlet(dbU, stillUpdated ? phiBndAtUpdateCoeffs : namedUFlux(phiBnd));
-        deviceUpdatePressureInletOutletVelocity(dbU, namedUFlux(phiBnd), UX, UY, UZ, /*directionMixed=*/true);
+        // ON A MOVING MESH THE FLUX THESE SWITCHES READ IS THE ABSOLUTE ONE. pEqn.H runs
+        // U.correctBoundaryConditions() at :61, fvc::correctUf at :66 and fvc::makeRelative(phi, U) at :69, in
+        // that order, so the patches' updateCoeffs look phi up while it is still absolute -- and the
+        // pressure step above has already made this loop's phiBnd relative. The host loop keeps the same
+        // order and says so (inter_peqn_cpp.cu, "U's patches are NOT re-told here"). MEASURED on
+        // RAS/electrostaticDeposition, one step, device against OpenFOAM: on `side-02` the relative flux
+        // is +3.56e-04 on all 225 faces (the patch moves with the mesh) while the absolute one is inflow,
+        // so the device left the patch on its outflow branch -- U's patch value 1.19e-06 off in the
+        // tangential components, U and Uf 1.5e-05 in the written files, with every cell at 1e-16.
+        const bool uReadsAbsolute = ctl.phiAbsBndOut
+                                 && ctl.phiAbsBndOut->size() == phiBnd.size()
+                                 && std::getenv("BRAE_CONTROL_DEVICE_U_PATCH_RELATIVE") == nullptr;
+        const DeviceBuffer<scalar>& phiBndForU = uReadsAbsolute ? *ctl.phiAbsBndOut : phiBnd;
+        deviceUpdateInletOutlet(dbU, stillUpdated ? phiBndAtUpdateCoeffs : namedUFlux(phiBndForU));
+        deviceUpdatePressureInletOutletVelocity(dbU, namedUFlux(phiBndForU), UX, UY, UZ, /*directionMixed=*/true);
         deviceUpdateSymmetry(dbU, UX, UY, UZ);
         deviceUpdateWedge(dbU, UX, UY, UZ);
         if (hooks.correctorDone)

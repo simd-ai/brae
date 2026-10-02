@@ -739,10 +739,22 @@ RunReport runInterFoamDevice(
     // from fixesValue() answers per patch a question OpenFOAM asks per face per update, and MULES limits
     // with it. Refreshed wherever alpha's boundary is re-evaluated, from the patch's OWN valueFraction,
     // and left alone for every other condition.
+    // ...BUT THAT IS NOT THE QUESTION MULES ASKS. MULESTemplates.C:337 tests `psiPf.fixesValue()`, a property of
+    // the PATCH, and mixedFvPatchField::fixesValue() is `return true` (mixedFvPatchField.H:197) whatever the
+    // valueFraction -- so every face of a variableHeightFlowRate patch joins the extrema, the outflow ones
+    // included, as the host's mules_cpp.cu has them. The per-face mask dropped the outflow faces. MEASURED on
+    // RAS/electrostaticDeposition, two steps, device against OpenFOAM: U 1.7e-05 with the per-face mask, where
+    // OpenFOAM against itself at one more digit of tolerance moves 2.8e-06 and the host arm reads 1.8e-07.
+    // BRAE_CONTROL_DEVICE_ALPHA_FIXES_PER_FACE=1 puts the per-face mask back -- the gate's control.
     bool hasPerFaceAlphaFixes = false;
-    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    if (std::getenv("BRAE_CONTROL_DEVICE_ALPHA_FIXES_PER_FACE") != nullptr)
     {
-        if (f.alpha1.boundary[pi]->isVariableHeightFlowRate()) hasPerFaceAlphaFixes = true;
+        std::printf("  *** CONTROL MODE: alpha's fixesValue mask on a variableHeightFlowRate patch is taken per face. "
+                    "This run is deliberately wrong. ***\n");
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (f.alpha1.boundary[pi]->isVariableHeightFlowRate()) hasPerFaceAlphaFixes = true;
+        }
     }
     auto refreshAlphaFixes = [&]()
     {
@@ -837,6 +849,40 @@ RunReport runInterFoamDevice(
             unflatten(dRpB, f.rhoPhi.boundary);
         }
         pushFluxToPatches(f, fvp, uCoefficientsKept);
+    };
+
+    // U's FLUX-CONDITIONAL PATCHES ON A MOVING MESH, told the ABSOLUTE flux the pressure step handed back
+    // before it made phi relative (C.phiAbsBndOut). No-op on a mesh that does not move, where the two are
+    // one flux, and for a condition that names rhoPhi. BRAE_CONTROL_DEVICE_U_PATCH_RELATIVE=1 leaves them on
+    // the relative flux -- the gate's control.
+    DeviceBuffer<scalar>* phiAbsBndForU = nullptr;
+    const bool uPatchRelativeControl = std::getenv("BRAE_CONTROL_DEVICE_U_PATCH_RELATIVE") != nullptr;
+    if (uPatchRelativeControl)
+    {
+        std::printf("  *** CONTROL MODE: U's patches read the RELATIVE flux after the pressure corrector on a moving "
+                    "mesh. This run is deliberately wrong. ***\n");
+    }
+    auto tellUAbsoluteFlux = [&](bool uCoefficientsKept)
+    {
+        if (!phiAbsBndForU || uPatchRelativeControl) return;
+        std::vector<scalar> flat;
+        phiAbsBndForU->copyTo(flat);
+        std::size_t off = 0;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+            if (off + n > flat.size()) return;
+            // the same patches pushFluxToPatches tells: a still-updated() patch keeps the flux its assembly
+            // read unless its updateCoeffs evaluates. MEASURED on the permeable tube mixer (no predictor),
+            // telling every patch here: device U 2.8e-03 from OpenFOAM, 4.1e-11 with this test.
+            const bool tellU = !uCoefficientsKept || f.U.boundary[pi]->updateCoeffsEvaluates();
+            if (tellU && f.U.boundary[pi]->fluxName() != "rhoPhi")
+            {
+                f.U.boundary[pi]->updateFromFlux(std::vector<scalar>(flat.begin() + off, flat.begin() + off + n));
+            }
+            off += n;
+        }
     };
 
     // THE WAVE CONDITIONS' CLOCK: OpenFOAM's time and time index for the step being taken, which the
@@ -1016,6 +1062,13 @@ RunReport runInterFoamDevice(
         // p_rgh's and alpha's patches take the new flux at every call; U's do not at the one call
         // where OpenFOAM's are still updated() -- see DeviceUBoundaryCall
         pushFlux(call == DeviceUBoundaryCall::evaluateStillUpdated);
+        // ...and on a MOVING mesh U's patches read the ABSOLUTE flux at the corrector's
+        // correctBoundaryConditions (pEqn.H:61, ahead of makeRelative at :69) -- see tellUAbsoluteFlux
+        // -- and where the patches are still updated(), only the classes pushFlux itself tells there
+        if (call == DeviceUBoundaryCall::evaluate || call == DeviceUBoundaryCall::evaluateStillUpdated)
+        {
+            tellUAbsoluteFlux(call == DeviceUBoundaryCall::evaluateStillUpdated);
+        }
         std::vector<scalar> x, y, z;
         ux.copyTo(x); uy.copyTo(y); uz.copyTo(z);
         for (label c = 0; c < nC; ++c) f.U.internal[c] = vector{x[c], y[c], z[c]};
@@ -3013,7 +3066,17 @@ RunReport runInterFoamDevice(
                     // adapter's copy was last written at the previous change, so it is given the points the
                     // motion has moved it to since -- and the motion's points0, which each change maps
                     // (the host loop's two lines, inter_driver_cpp.cu)
-                    f.amr->state.m.movePoints(mutableMesh->m->points());
+                    // BRAE_CONTROL_DEVICE_REFINE_STALE_POINTS=1 leaves the adapter on the points of its last
+                    // change -- the write gate's control: the change then hands the mesh back where it was
+                    if (std::getenv("BRAE_CONTROL_DEVICE_REFINE_STALE_POINTS") == nullptr)
+                    {
+                        f.amr->state.m.movePoints(mutableMesh->m->points());
+                    }
+                    else
+                    {
+                        std::printf("  *** CONTROL MODE: the refinement works on the points of its last change, not "
+                                    "the moved ones. This run is deliberately wrong. ***\n");
+                    }
                     f.amr->state.points0 = &dyn->points0Ref();
                 }
                 const bool changed =
@@ -3340,6 +3403,8 @@ RunReport runInterFoamDevice(
                 // moving one, and both were set inside the moving branch until this block existed.
                 C.phiAbsIntOut = &dPhiAbsI;
                 C.phiAbsBndOut = &dPhiAbsB;
+                // ...on a mesh that MOVES only: a refining mesh's flux is absolute throughout
+                phiAbsBndForU = dyn ? &dPhiAbsB : nullptr;
                 C.phiAbsIfOut  = (dCyc.n > 0) ? &dPhiAbsIf : nullptr;
                 C.rAUOut       = &dRAU;
                 std::vector<scalar> pu(static_cast<std::size_t>(nIf));

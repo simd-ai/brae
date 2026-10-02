@@ -539,7 +539,10 @@ int main(
         // from its initial residuals. The continuity floor is ABSOLUTE: both codes end at the cancellation
         // floor (brae 1.10e-15, OpenFOAM 8.64e-16). The case does not amplify -- one ulp on one alpha cell
         // moves OpenFOAM's own alpha 5.7e-15 by step 20 -- so these are round-off floors and need no twin.
-        // The device slots are the host's until the device arm runs the case (it refuses it by name).
+        // THE DEVICE ARM runs it too (2026-10-02), held to the host's own slots. MEASURED against OpenFOAM:
+        //   box, 20 steps          alpha 7.4107e-15, p_rgh 1.2108e-14, U 4.4924e-14, phi 5.5144e-15
+        //   boxUnrefine, 60 steps  alpha 9.4369e-15, p_rgh 6.5672e-15, U 6.9119e-14, phi 3.9210e-15
+        // and against the host arm U 5.1e-14 / 6.6e-14; the same run twice in one process bit-identical.
         : boxProfile
         ? Bounds{1e-14, 5e-14, 1e-13, 5e-14, 5e-12, 5e-14, 1e-13, 1e-9, 1e-14, 5e-14, 1e-14, 5e-14,
                  5e-14, 5e-14, 5e-12, 1e-14, 1e-13, 1e-13, 0, 0, 0, 0, 0, 0, 5e-14, 0}
@@ -1481,25 +1484,8 @@ int main(
     // integer maps -- so what this measures is the round trip: every mesh-sized buffer down to the
     // host, the change, and every one of them back up on a DeviceMesh rebuilt from scratch. A buffer
     // left at the old size, or a schedule cache replaying the old addressing, lands here.
-    // ...EXCEPT on the box profile, where the device loop REFUSES by name: its topology and motion
-    // branches are not yet composed in OpenFOAM's order, and a refusal nobody runs stops firing.
-    if (boxProfile)
-    {
-        std::string msg;
-        try
-        {
-            Arm D;
-            runArm(D, caseDir, startDir, nSteps, /*onDevice=*/true);
-        }
-        catch (const std::exception& e)
-        {
-            msg = e.what();
-        }
-        std::printf("  device: %s\n", msg.empty() ? "RAN" : msg.substr(0, 120).c_str());
-        check("the device refuses a mesh that refines and moves, by name",
-              msg.find("refines AND a motion solver") != std::string::npos);
-    }
-    else
+    // ...the box profile included (2026-10-02): the device loop composes the change and the move in
+    // OpenFOAM's order, so a mesh that refines AND moves takes this arm like any other.
     {
         Arm D;
         runArm(D, caseDir, startDir, nSteps, /*onDevice=*/true);

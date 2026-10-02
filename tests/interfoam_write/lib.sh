@@ -341,8 +341,10 @@ PY
 # meshed by its Allrun's snappyHexMesh serially): 5.7e-13 host, 1.0e-11 device.
 # The solidBody-moved meshes (Uf, meshPhi, polyMesh/points): sloshingTank2D 9.1e-13, testTubeMixer 3.5e-11,
 # sloshingCylinder 9.4e-11 (through its as-shipped first move, which leaves OpenFOAM's own alpha in
-# [-1.11, 1.86]); electrostaticDeposition 1.8e-07 host but 1.7e-05 DEVICE -- the device's per-face
-# fixesValue mask for variableHeightFlowRate (PORT.md X3), which the bound admits and does not hide.
+# [-1.11, 1.86]); electrostaticDeposition 1.8e-07 host and 1.8e-07 device (2026-10-02). The device
+# read 1.7e-05 until then, and the cause recorded here -- a per-face fixesValue mask -- was WRONG: its U
+# patches read the RELATIVE flux after the corrector where OpenFOAM's read the absolute one (side-02, all
+# 225 faces on the wrong branch). Control BRAE_CONTROL_DEVICE_U_PATCH_RELATIVE=1, sensitivity/.
 # The wave makers (displacementLaplacian: pointDisplacement with the waveMaker patch's write() -- the solitary
 # branch's rewritten wavePeriod, waveAngle in radians -- cellDisplacement's cellMotion patches, and correctPhi's
 # rAU): waveMakerSolitary 7.1e-11, waveMakerPiston 1.8e-09, waveMakerFlap 5.7e-10 host and 2.3e-08 device,
@@ -372,7 +374,7 @@ RAS/DTCHull::6e-12:1e-10
 laminar/sloshingTank2D::1e-11:1e-11
 laminar/testTubeMixer::4e-10:4e-10
 laminar/sloshingCylinder::1e-09:1e-09
-RAS/electrostaticDeposition::2e-06:2e-04
+RAS/electrostaticDeposition::2e-06:1.8e-06
 laminar/waves/waveMakerSolitary::7e-10:1e-09
 laminar/waves/waveMakerPiston::2e-08:2e-08
 laminar/waves/waveMakerFlap::6e-09:3e-07
@@ -381,7 +383,7 @@ laminar/waves/waveMakerMultiPaddlePiston::3e-10:3e-10
 RAS/DTCHullMoving::3e-10:6e-8
 RAS/DTCHullMovingCoarse::1e-10:2e-9
 laminar/damBreakWithObstacle::2e-11:3e-11
-laminar/oscillatingBox::2e-10:-
+laminar/oscillatingBox::2e-10:1.8e-10
 RAS/motorBike::9e-12:2e-11
 RAS/mixerVesselAMI::5e-11:5e-11
 RAS/floatingObject::1e-12:1.6e-12
@@ -394,8 +396,8 @@ RAS/floatingObject::1e-12:1.6e-12
 # The refining meshes (U5/U6: polyMesh/* after the first change -- compared as TEXT, exactly -- hexRef8's
 # cellLevel, pointLevel, level0Edge and refinementHistory at every write, the cellLevel field, Uf, and
 # oscillatingBox's meshPhi and points0; alpha.water_0 mapped with the mesh), 2026-09-30, worst field:
-# damBreakWithObstacle 1.5e-12 host / 2.1e-12 device; oscillatingBox 1.8e-11 host (its device loop refuses
-# a mesh that refines AND moves, by name: `-`); motorBike 8.8e-13 host / 1.0e-12 device (snappy's binary
+# damBreakWithObstacle 1.5e-12 host / 2.1e-12 device; oscillatingBox 1.8e-11 host / 1.8e-11 device (the device loop
+# composes the change and the move since 2026-10-02); motorBike 8.8e-13 host / 1.0e-12 device (snappy's binary
 # levels and its level0Edge 0.5 read, the frozenPoints zone written with its meta).
 # RAS/mixerVesselAMI (U4: rAU and p on the cyclicAMI pair, the result's own cells evaluated -- every field
 # expression ends in correctLocalBoundaryConditions, GeometricFieldFunctionsM.C:50), OpenFOAM staged to PCG: host
@@ -439,7 +441,6 @@ wcase_arms()
         if [ "$BOUND_W" = "-" ]; then
             case $key in
                 floatingObject) why="which the device loop does not keep in its written form" ;;
-                oscillatingBox) why="the mesh refines AND a motion solver moves it" ;;
                 *) why="" ;;
             esac
             [ -n "$why" ] || say "ARM W  [$arm] $key: a device bound of - with no expected refusal named" FAIL
