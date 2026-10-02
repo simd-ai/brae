@@ -180,6 +180,17 @@ SolverPerformance gamgSolve(
     const GamgControls& controls,
     GamgSolveLog* log = nullptr);
 
+// gamgSolve on a system ALREADY FOLDED -- the boundary's diagonal in `diag`, its source in `source` -- with
+// no coupled pair: the entry a caller that holds the folded system (the device loop) takes.
+SolverPerformance gamgSolveFolded(
+    const GamgAgglomeration& agglomeration,
+    const std::vector<scalar>& diag,
+    const std::vector<scalar>& upper,
+    const std::vector<scalar>& source,
+    std::vector<scalar>& psi,
+    const GamgControls& controls,
+    GamgSolveLog* log = nullptr);
+
 // PCG::scalarSolve with the GAMGPreconditioner: `solver PCG; preconditioner { preconditioner GAMG; ...}`,
 // which six of the seven solid-body tutorials name for p_rghFinal and pcorr. Each application starts
 // from zero and runs nVcycles V-cycles of the SAME cycle gamgSolve runs, on a GAMGSolver built on the

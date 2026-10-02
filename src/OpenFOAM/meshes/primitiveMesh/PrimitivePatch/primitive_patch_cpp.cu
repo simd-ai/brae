@@ -5,6 +5,24 @@
 
 namespace brae {
 
+CellFaces cellFaces(const PrimitiveMesh& m)
+{
+    const std::vector<std::vector<label>> cells = meshCells(m);
+    CellFaces out;
+    out.start.resize(cells.size() + 1);
+    out.start[0] = 0;
+    for (std::size_t c = 0; c < cells.size(); ++c)
+    {
+        out.start[c + 1] = out.start[c] + static_cast<label>(cells[c].size());
+    }
+    out.faces.reserve(static_cast<std::size_t>(out.start.back()));
+    for (const std::vector<label>& faces : cells)
+    {
+        out.faces.insert(out.faces.end(), faces.begin(), faces.end());
+    }
+    return out;
+}
+
 std::vector<std::vector<label>> meshCells(const PrimitiveMesh& m)
 {
     const std::vector<label>& own = m.owner();

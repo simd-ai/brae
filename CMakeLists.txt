@@ -4166,6 +4166,12 @@ target_link_libraries(test_face_area_weight_ami PRIVATE brae_core)
 
 # interFoam across a rotating cyclicAMI against real OpenFOAM on RAS/mixerVesselAMI. The script carries
 # the measurements, the controls and the fail-proofs.
+# An instrument, not a gate: both interFoam loops on one case, and the device's intermediates of the last
+# step against the host's (tools/interTapsDiff/inter_taps_diff.cu)
+add_executable(brae_inter_taps_diff tools/interTapsDiff/inter_taps_diff.cu)
+target_include_directories(brae_inter_taps_diff PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(brae_inter_taps_diff PRIVATE brae_core)
+
 add_executable(test_inter_ami_vs_openfoam tests/test_inter_ami_vs_openfoam.cu)
 target_include_directories(test_inter_ami_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)

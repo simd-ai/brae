@@ -95,6 +95,10 @@
 # first solve 1.8e-03 of alpha; prolongation that adds 7.3e-03; the level above the coarsest scaled,
 # on `coarsest`, 5.0e-05; and the coarsest MATRIX left over from the first solve -- the host solves
 # that level, from a copy -- which moves NO FIELD and reads 2.3e-02 on the coarsest-solve log arm.
+# THE DEVICE ARM HERE IS THE DEVICE'S OWN GAMG, forced: since 2026-10-02 the device loop sends a GAMG solve to
+# the host's solver on meshes below two million cells (gamgSolveOnHost, device_inter_pressure_step.cu), which
+# would leave these profiles comparing the host's solver with itself.
+export BRAE_DEVICE_GAMG=device
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_gamg_vs_openfoam"

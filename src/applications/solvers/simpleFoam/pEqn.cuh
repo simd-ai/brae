@@ -58,6 +58,13 @@ struct PressureInput
     // U patch is NOT assignable (constrainHbyA.C). fixedValue/noSlip/mixed/transform are not assignable;
     // zeroGradient is. The two masks differ on slip and inletOutlet, so they are two arguments.
     const DeviceBuffer<label>* takeUAtBoundary = nullptr;
+    // ...and U's STORED patch values, one buffer per component over the boundary faces, when the caller
+    // carries them. constrainHbyA assigns `U.boundaryField()[patchi]` (constrainHbyA.C:67) -- what U's last
+    // evaluate left, not an evaluate of its own. Null (or a wrong size) keeps the re-evaluation against the
+    // cells and the patch's coefficients as they stand, which is the same number only while neither has
+    // moved since that evaluate: a mixed patch whose updateCoeffs ran at the momentum assembly has, on the
+    // first corrector of a pass with no predictor.
+    const DeviceBuffer<scalar>* UbStored[3] = {nullptr, nullptr, nullptr};
     // The pair. H() gains its off-diagonal (fvMatrix::H is diag*psi - sum(offdiag*psi), and a periodic
     // neighbour is an off-diagonal like any other) and fvc::flux(HbyA) gains its faces.
     DeviceCyclic* cyc = nullptr;

@@ -1,4 +1,5 @@
 // One pass of pEqn.H -- see device_inter_pressure_step.cuh for the three placements it owns.
+#include "inter_phase_time.cuh"
 #include "device_inter_pressure_step.cuh"
 #include "device_fvc_reconstruct.cuh"
 #include "device_blas.cuh"
@@ -42,6 +43,49 @@ __global__ void addPhigIfKernel(const scalar* __restrict__ phig, int n, scalar* 
 
 }   // namespace
 
+
+// WHICH SIDE SOLVES A GAMG SYSTEM in the device loop. The case's smoother is one of OpenFOAM's sequential
+// ones (DIC, the Gauss-Seidels), and the device runs it level-scheduled: one step per level of the mesh's
+// dependency chain, on every multigrid level, and a coarse level's chain is nearly as long as the fine one's.
+// MEASURED on RAS/DTCHull (845,536 cells, 891 dependency levels; coarse level 1 has 422,498 cells and 1252),
+// two sweeps of the smoother: finest level 23.8 ms on the device and 11.4 ms on one CPU core, coarse level 1
+// 23.8 and 6.5, the thirteen levels below it 93 and 16.7. The whole solve: 1548 ms a step on the device, 508
+// on the host, the same 214 V-cycles over 25 steps and the same distance from OpenFOAM (p_rgh 2.8e-07).
+// So the host solves it below GAMG_HOST_MAX_CELLS. ABOVE it the device does: the host's sweep grows with the
+// cells and the device's with the chain, roughly their cube root, so the two cross -- the size is an
+// estimate from that one measurement and the scaling, not a measured crossover. A coupled pair stays on the
+// device, whose view carries the pair. BRAE_DEVICE_GAMG=host|device forces either.
+constexpr label GAMG_HOST_MAX_CELLS = 2000000;
+
+bool gamgSolveOnHost(const DeviceLduView& A)
+{
+    static const char* const forced = std::getenv("BRAE_DEVICE_GAMG");
+    const bool pair = A.nCyc > 0 || A.nAmi > 0;
+    bool host = !pair && A.nCells < GAMG_HOST_MAX_CELLS;
+    if (forced && std::string(forced) == "device")
+    {
+        host = false;
+    }
+    if (forced && std::string(forced) == "host")
+    {
+        if (pair)
+        {
+            throw std::runtime_error(
+                "brae interFoam (device): BRAE_DEVICE_GAMG=host on a mesh with a coupled pair. The host route "
+                "takes a folded system with no pair; the device's GAMG carries it.");
+        }
+        host = true;
+    }
+    static bool announced = false;
+    if (!announced)
+    {
+        announced = true;
+        std::printf("  GAMG: solved on the %s (%ld cells; the case's smoother is sequential); "
+                    "BRAE_DEVICE_GAMG=host|device forces either\n",
+                    host ? "host" : "device", (long)A.nCells);
+    }
+    return host;
+}
 
 scalar deviceInterPressureStep(
     const DeviceMesh&                  dm,
@@ -389,7 +433,35 @@ scalar deviceInterPressureStep(
                     "the second is a DeviceGamgCache that outlives the step.");
             }
             DeviceGamgHierarchy& hierarchy = in.gamgCache->get(gamg->nCellsInCoarsestLevel);
-            perf = deviceGamgSolve(A, b, p_rgh, *in.dic, hierarchy, *gamg, in.gamgLog);
+            interPhase::Nested timed("pressure: GAMG solve");
+            // WHERE THE SOLVE RUNS. GAMG's smoothers here are OpenFOAM's sequential ones, and a sequential
+            // sweep on the device is one step per level of the mesh's dependency chain whatever the level's
+            // size -- see gamgSolveOnHost. On the host route the folded system comes down, the host's GAMG
+            // (the reference the device's is held to) solves it, and p_rgh goes back.
+            if (gamgSolveOnHost(A))
+            {
+                std::vector<scalar> hDiag;
+                std::vector<scalar> hUpper;
+                std::vector<scalar> hSource;
+                std::vector<scalar> hPsi;
+                {
+                    interPhase::Nested timedDown("host gamg: bring the system down");
+                    hDiag = diagC.host();
+                    hUpper = P.upper.host();
+                    hSource = b.host();
+                    hPsi = p_rgh.host();
+                }
+                const SolverPerformance hp =
+                    gamgSolveFolded(*hierarchy.host, hDiag, hUpper, hSource, hPsi, *gamg, in.gamgLog);
+                p_rgh.copyFrom(hPsi);
+                perf.initialResidual = hp.initialResidual;
+                perf.finalResidual = hp.finalResidual;
+                perf.nIterations = hp.nIterations;
+            }
+            else
+            {
+                perf = deviceGamgSolve(A, b, p_rgh, *in.dic, hierarchy, *gamg, in.gamgLog);
+            }
         }
         else if (pcgGamg)
         {

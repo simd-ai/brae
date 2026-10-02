@@ -3,6 +3,7 @@
 // See inter_driver_cpp.cuh for why the hooks live here rather than in the gate. Everything this calls
 // is separately landed and separately gated; what this file owns is the wiring, and that wiring is
 // what tests/test_device_inter_dambreak_alpha.cu measures against the host driver on damBreak.
+#include "inter_phase_time.cuh"
 #include "inter_driver_cpp.cuh"
 #include "inter_set_rdeltat_cpp.cuh"
 #include <set>
@@ -916,6 +917,7 @@ RunReport runInterFoamDevice(
     H.alpha.updateBoundary =
         [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& aBnd, DeviceBuffer<scalar>& nBnd)
     {
+        interPhase::Nested timed("hook alpha.updateBoundary");
         pushFlux();
         a.copyTo(f.alpha1.internal);
         f.alpha1.evaluateBoundary();
@@ -934,6 +936,7 @@ RunReport runInterFoamDevice(
     H.alpha.refreshBoundary =
         [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& aBnd)
     {
+        interPhase::Nested timed("hook alpha.refreshBoundary");
         pushFlux();
         a.copyTo(f.alpha1.internal);
         f.alpha1.evaluateBoundary();
@@ -962,6 +965,7 @@ RunReport runInterFoamDevice(
         [&](const DeviceBuffer<scalar>& postMules, const DeviceBuffer<scalar>& relaxed,
             DeviceBuffer<scalar>& aBnd)
     {
+        interPhase::Nested timed("hook alpha.relaxBoundary");
         pushFlux();
         std::vector<std::vector<scalar>> alpha10B(f.alpha1.boundary.size());
         for (std::size_t pi = 0; pi < f.alpha1.boundary.size(); ++pi)
@@ -979,6 +983,7 @@ RunReport runInterFoamDevice(
     H.alpha.mixtureCorrect =
         [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& aBnd, DeviceBuffer<scalar>& nBnd)
     {
+        interPhase::Nested timed("hook alpha.mixtureCorrect");
         pushFlux();
         a.copyTo(f.alpha1.internal);
         aBnd.copyFrom(patchValues(f.alpha1, fvp));
@@ -1029,6 +1034,7 @@ RunReport runInterFoamDevice(
         [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC,
             const DeviceBuffer<scalar>* phiCNBnd)
     {
+        interPhase::Nested timed("hook alpha.divCoeffs");
         a.copyTo(f.alpha1.internal);
         f.alpha1.evaluateBoundary();
         // the flux the coefficients are built from: phiCN's patch values under CrankNicolson (a
@@ -1059,6 +1065,7 @@ RunReport runInterFoamDevice(
             const DeviceBuffer<scalar>& uz, DeviceVectorBoundary& db, DeviceBuffer<scalar>* ubOut,
             DeviceUBoundaryCall call)
     {
+        interPhase::Nested timed("hook updateUBoundary");
         // p_rgh's and alpha's patches take the new flux at every call; U's do not at the one call
         // where OpenFOAM's are still updated() -- see DeviceUBoundaryCall
         pushFlux(call == DeviceUBoundaryCall::evaluateStillUpdated);
@@ -1168,6 +1175,7 @@ RunReport runInterFoamDevice(
             DeviceBuffer<scalar>& stf, DeviceBuffer<scalar>& snRho,
             DeviceBuffer<scalar>& nuC, DeviceBuffer<scalar>& nuB, DeviceBuffer<scalar>& snP)
     {
+        interPhase::Nested timed("hook interfaceForces");
         // ...and NOT alpha's boundary: alphaEqnSubCycle.H evaluates alpha nowhere after the sub-cycle,
         // and the alpha step's last hook left f.alpha1's patch values as OpenFOAM's stand -- after a
         // relaxed corrector that is an ASSIGNMENT, which an evaluate here overwrote (the host driver
@@ -1325,6 +1333,7 @@ RunReport runInterFoamDevice(
             const DeviceBuffer<scalar>& rAUfAll, const DeviceBuffer<scalar>& rAUCell,
             DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC, DeviceBuffer<scalar>& cycJump)
     {
+        interPhase::Nested timed("hook pressure.pressureCoeffs");
         // THE PAIR'S FLUX, as it stands at THIS assembly. porousBafflePressure's jump is built from it
         // below and the host pEqn takes it from the phi the LAST CORRECTOR wrote, so it is refreshed
         // here rather than left to the step's own pushFlux, which runs once per corrector and not once
@@ -1484,6 +1493,7 @@ RunReport runInterFoamDevice(
     // gradOf(p_rgh) reads, after pressureCoeffs has run the patches' updates
     H.pressure.boundaryValues = [&](DeviceBuffer<scalar>& bval)
     {
+        interPhase::Nested timed("hook pressure.boundaryValues");
         std::vector<scalar> flat;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
@@ -1507,6 +1517,7 @@ RunReport runInterFoamDevice(
     };
     H.pressure.updateBoundary = [&](const DeviceBuffer<scalar>& pr)
     {
+        interPhase::Nested timed("hook pressure.updateBoundary");
         pr.copyTo(f.p_rgh.internal);
         f.p_rgh.evaluateBoundary();
     };
@@ -2177,6 +2188,7 @@ RunReport runInterFoamDevice(
             const DeviceBuffer<scalar>& phiInt,
             const DeviceBuffer<scalar>& phiBnd)
         {
+            interPhase::Nested timed("hook correctorDone");
             // continuityErrs.H takes the ABSOLUTE flux (pEqn.H:64, before makeRelative at :70), which a
             // moving mesh's step hands back in dPhiAbs* before making phi relative
             const bool absolute = C.phiAbsIntOut && C.phiAbsBndOut;
@@ -2203,8 +2215,13 @@ RunReport runInterFoamDevice(
         };
     }
 
+    CellFaces ltsCells;
+    unsigned long long ltsCellsId = 0;
+    bool ltsCellsBuilt = false;
+    interPhase::start();
     for (label s = 0; s < nSteps; ++s)
     {
+        interPhase::mark("0 between steps (clock, write, downloads)");
         if (!(rep.time < endTime - scalar(0.5)*rep.deltaT)) break;   // Time::run(), Time.C:1000
         // whether Uf.oldTime() was STORED with its old-old level in existence, which is when OpenFOAM
         // starts writing Uf_0: the state the last step ended in (the host loop's UfOldStoredWithOO)
@@ -2246,9 +2263,21 @@ RunReport runInterFoamDevice(
             ri.rho = &rhoH;
             // timeIndex > startTimeIndex + 1, before ++runTime: `s` steps of this run are done
             ri.damp = s > 1;
+            // ...and the mesh's cell-to-face list, kept until the addressing changes (buildDeviceMesh stamps a
+            // new addressingId at every topology change). BRAE_CONTROL_LTS_CELLS_REBUILT=1 rebuilds it every
+            // step, as the call did before -- the identity check's other arm.
+            if (!ltsCellsBuilt || ltsCellsId != dm.addressingId)
+            {
+                ltsCells = cellFaces(m);
+                ltsCellsId = dm.addressingId;
+                ltsCellsBuilt = true;
+            }
+            ri.cells = std::getenv("BRAE_CONTROL_LTS_CELLS_REBUILT") ? nullptr : &ltsCells;
             LocalEulerControls lec = f.ltsCtl;
             applySetRDeltaTControls(lec, ri.damp);
+            interPhase::mark("0 before setRDeltaT (downloads)");
             const SetRDeltaTReport lr = setRDeltaT(f.rDeltaT, lec, ri, m, g, fvp);
+            interPhase::mark("0 setRDeltaT (host)");
             rep.ltsLog.push_back(lr);
             rep.rDeltaTPerStep.push_back(f.rDeltaT);
             dRDeltaT.copyFrom(f.rDeltaT);
@@ -3482,12 +3511,14 @@ RunReport runInterFoamDevice(
                 }
                 uOldCreationPending = false;
             }
+            interPhase::mark("0 step preparation");
             deviceInterStep(dm, rep.deltaT, C, props, H, dGh, dGhf, dMagSf,
                             dA, dAOld, dUx, dUy, dUz, dUox, dUoy, dUoz,
                             dUobx, dUoby, dUobz,
                             dPhiI, dPhiB, dPhiOI, dPhiOB, dUFixes, dPrgh, dP,
                             dNH, dNHB, dABnd, dK, dAFixes, dAFlag, dbU,
                             dRho, dMu, dNu, dRpI, dRpB, tapsOut);
+            interPhase::mark("5 pressure correctors");
             if (cnDdt && dCn.ocAlpha > scalar(0))
             {
                 // the flux this pass ended on is alphaPhi10 as it stands: the next step's oldTime()
@@ -3596,7 +3627,9 @@ RunReport runInterFoamDevice(
                                 (long)dTurb.k.size(), (long)dTurb.epsilon.size(),
                                 (long)dTurb.nut.size(), (long)dTurb.nutBnd.size());
                 }
+                interPhase::mark("6 after the step, before the closure");
                 deviceCorrectInterTurbulence(dTurb, f.turbulence, ti, dm, dbU);
+                interPhase::mark("7 turbulence closure");
                 // ...and "Updating grad(U)": kOmegaSST's correct forms it, and a caching case keeps it -- the host
                 // loop's re-formation after the closure (inter_turbulence_cpp.cu), from U as it stands and its
                 // STORED patch values (f.U's, which the step's last U hook wrote). Not on a changing mesh, where
@@ -3624,6 +3657,7 @@ RunReport runInterFoamDevice(
                     const DeviceBuffer<scalar>* sb[3] = {&sbx, &sby, &sbz};
                     deviceStoreGradU(dGradUCache, dm, dbU, dUx, dUy, dUz, sb);
                 }
+                interPhase::mark("8 grad(U) kept after the closure");
                 if (std::getenv("BRAE_AMR_TRACE"))
                 {
                     std::vector<scalar> tk, tn;
@@ -3768,6 +3802,7 @@ RunReport runInterFoamDevice(
                 dRAU.copyTo(f.rAU);
             }
         }   // the outer corrector loop
+        interPhase::mark("9 end of the outer corrector (Uf, rAU)");
 
         rep.steps = s + 1;
         rep.time += rep.deltaT;
@@ -3963,6 +3998,7 @@ RunReport runInterFoamDevice(
             writer->write(ws);
         }
 
+        interPhase::mark("9 write");
         if (verbose)
         {
             std::vector<scalar> av;
@@ -4064,6 +4100,8 @@ RunReport runInterFoamDevice(
     (void)nBf;
     if (fieldsOut) *fieldsOut = std::move(f);
     rep.gradUCacheConsumed = dGradUCache.consumed;
+    interPhase::mark("0 between steps (clock, write, downloads)");
+    interPhase::report(static_cast<long>(rep.steps));
     return rep;
 }
 

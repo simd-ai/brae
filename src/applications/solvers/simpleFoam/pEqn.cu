@@ -1,4 +1,5 @@
 // CUDA implementation -- see pEqn.cuh for the provenance and the contract with the _cpp reference.
+#include "inter_phase_time.cuh"
 #include "pEqn.cuh"
 #include <cstdlib>
 #include "device_blas.cuh"
@@ -102,6 +103,7 @@ void pressurePredictor(
     const DeviceBoundary*        dbP,
     const DeviceBuffer<scalar>*  p)
 {
+    interPhase::Nested timed("pressure: rAU, HbyA, phiHbyA");
     refuseUnsupported(in);
     if (in.consistent && (!dbP || !p))
         throw std::runtime_error("pEqn(cuda): SIMPLEC needs snGrad(p) and grad(p), so the pressure field "
@@ -174,10 +176,22 @@ void pressurePredictor(
     }
 
     // ---- constrainHbyA(HbyA, U, p) -----------------------------------------------------------
+    // all three stored components or none: never a stored one beside a re-derived one in the same flux
+    const bool storedU = in.UbStored[0] && in.UbStored[1] && in.UbStored[2]
+                      && in.UbStored[0]->size() == static_cast<std::size_t>(dm.nBndFaces)
+                      && in.UbStored[1]->size() == static_cast<std::size_t>(dm.nBndFaces)
+                      && in.UbStored[2]->size() == static_cast<std::size_t>(dm.nBndFaces);
     for (int k = 0; k < 3; ++k)
     {
         DeviceBuffer<scalar> Ub;
-        deviceBCValue(dbU.comp[k], *U[k], Ub);
+        if (storedU)
+        {
+            deviceCopy(Ub, *in.UbStored[k]);
+        }
+        else
+        {
+            deviceBCValue(dbU.comp[k], *U[k], Ub);
+        }
         st.HbyAb[k].resize(dm.nBndFaces);
         if (dm.nBndFaces > 0)
         {

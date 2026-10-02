@@ -1,5 +1,6 @@
 // setRDeltaT.H -- see inter_set_rdeltat_cpp.cuh for the provenance and the four things in it that are not
 // what they look like.
+#include "inter_phase_time.cuh"
 #include "inter_set_rdeltat_cpp.cuh"
 #include "fvc_smooth_cpp.cuh"
 #include <cstdio>
@@ -186,6 +187,7 @@ SetRDeltaTReport setRDeltaT(
 
     // S1, :59-64
     {
+        interPhase::Nested timed("setRDeltaT S1: surfaceSum(|rhoPhi|)");
         const std::vector<scalar> sumRhoPhi = surfaceSum(m, patches, [&](label pi, label f)
         {
             if (pi < 0) return std::fabs(in.rhoPhi->internal[static_cast<std::size_t>(f)]);
@@ -203,6 +205,7 @@ SetRDeltaTReport setRDeltaT(
     // S2, :66-81
     if (c.maxAlphaCo < c.maxCo)
     {
+        interPhase::Nested timed("setRDeltaT S2: the interface's limit");
         // fvc::average(linearInterpolate(alpha1)) (fvcAverage.C:72-76, 108-116): the linear face values
         // -- lambda*(P - N) + N inside, the STORED patch values outside -- weighted by magSf
         const GeometricField<scalar>& alpha1 = *in.alpha1;
@@ -261,7 +264,8 @@ SetRDeltaTReport setRDeltaT(
     // S5, :90-93
     if (c.rDeltaTSmoothingCoeff < 1.0)
     {
-        fvc::smooth(rDeltaT, c.rDeltaTSmoothingCoeff, m, patches);
+        interPhase::Nested timed("setRDeltaT S5: fvc::smooth");
+        fvc::smooth(rDeltaT, c.rDeltaTSmoothingCoeff, m, patches, in.cells);
     }
 
     // S6, :95-111 -- refused where the case is read; asserted here so a caller that skipped the refusal

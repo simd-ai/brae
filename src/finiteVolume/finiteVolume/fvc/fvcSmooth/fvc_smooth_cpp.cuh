@@ -27,6 +27,7 @@
 #include "cf_types.cuh"
 #include "fv_patch.cuh"
 #include "primitive_mesh.cuh"
+#include "primitive_patch_cpp.cuh"
 #include <vector>
 
 namespace brae {
@@ -35,11 +36,15 @@ namespace fvc {
 
 // fvcSmooth.C:43-129 on the CELL values of `field`. The boundary is the caller's: OpenFOAM ends with
 // field.correctBoundaryConditions(), and what that gives depends on the field's patch types.
+// `cells` is primitiveMesh::cells() as one array (primitive_patch_cpp.cuh's CellFaces) when the caller keeps it
+// across calls; null builds it here. It is a function of the
+// mesh's addressing alone, so the caller must rebuild it whenever the addressing changes.
 void smooth(
     std::vector<scalar>& field,
     scalar coeff,
     const PrimitiveMesh& m,
-    const std::vector<FvPatch>& patches);
+    const std::vector<FvPatch>& patches,
+    const CellFaces* cells = nullptr);
 
 } // namespace fvc
 } // namespace cpu

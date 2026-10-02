@@ -1,4 +1,5 @@
 // One whole interFoam time step -- see device_inter_step.cuh for the loop order and what it decides.
+#include "inter_phase_time.cuh"
 #include "device_inter_step.cuh"
 #include "inter_peqn_cpp.cuh"   // tapCorrectorWanted
 #include "device_alpha_flux.cuh"
@@ -57,6 +58,22 @@ void probe(const char* stage, const DeviceBuffer<scalar>& b)
 }
 
 }   // namespace
+
+// BRAE_CONTROL_DEVICE_HBYA_REEVALUATED=1: constrainHbyA re-evaluating U's patches, as it did
+bool hbyaReevaluatedControl()
+{
+    static const bool on = []
+    {
+        const bool v = std::getenv("BRAE_CONTROL_DEVICE_HBYA_REEVALUATED") != nullptr;
+        if (v)
+        {
+            std::printf("  *** CONTROL MODE: constrainHbyA re-evaluates U's patches instead of taking their "
+                        "stored values. This run is deliberately wrong. ***\n");
+        }
+        return v;
+    }();
+    return on;
+}
 
 void deviceInterStep(
     const DeviceMesh&                dm,
@@ -201,6 +218,7 @@ void deviceInterStep(
     probe("rho", rho);
     probe("rhoPhi", rhoPhiInt);
 
+    interPhase::mark("1 alpha step");
     // 2. THE INTERFACE FORCES, from the field the alpha step just left
     // surfaceTensionForce() and snGrad(rho) both read the NEW alpha, and both equations below read
     // them. Building them before the alpha step would apply last step's interface.
@@ -263,6 +281,7 @@ void deviceInterStep(
     // goes with them: with no momentum and no pressure solve there is no new flux to switch an
     // inletOutlet face on, and OpenFOAM leaves those patches exactly as the last solved step did.
 
+    interPhase::mark("2 interface forces and mixture");
     if (ctl.frozenFlow) return;
 
     // 3. THE MOMENTUM MATRIX
@@ -476,6 +495,7 @@ void deviceInterStep(
         deviceCopy(taps->uEqnCycIfCoeff, UEqn.cycIfCoeff);
     }
 
+    interPhase::mark("3 momentum matrix");
     // 4. THE MOMENTUM PREDICTOR, if the case asks for one
     // damBreak sets `momentumPredictor no`. The matrix above is still assembled and relaxed either
     // way, because the pressure corrector is built on its A() and H().
@@ -570,6 +590,7 @@ void deviceInterStep(
         (void)A;
     }
 
+    interPhase::mark("4 momentum predictor");
     // 5. THE PRESSURE CORRECTOR, last, and nCorrectors TIMES
     // interFoam.C:118-121 wraps the WHOLE of pEqn.H in `while (pimple.correct())`, so every pass
     // rebuilds rAU, HbyA, phiHbyA and phig from the U and phi the previous one left -- it is not a
@@ -589,6 +610,17 @@ void deviceInterStep(
                 "brae interFoam device step: constrainHbyA needs the per-face `assignable` mask. "
                 "assignable() is NOT fixesValue() -- see DeviceInterStepControls.");
         pin.takeUAtBoundary = ctl.takeUAtBoundary;
+        // constrainHbyA takes U's STORED patch values (constrainHbyA.C:67), which the hook's host evaluate
+        // left in `ub`; re-evaluated on the device they carry the coefficients the momentum assembly's
+        // updateCoeffs set, one corrector before OpenFOAM's U.correctBoundaryConditions() applies them.
+        // MEASURED on RAS/DTCHull (no predictor, outletPhaseMeanVelocity), iteration two, first corrector:
+        // the outlet's phiHbyA 1.06e-09 from the host's of 633.84, the solved p_rgh one smooth shift of
+        // 5e-09, and the written fields 3.1e-05 from OpenFOAM by iteration 25 where the host reads 2.0e-07.
+        // BRAE_CONTROL_DEVICE_HBYA_REEVALUATED=1 puts the re-evaluation back -- the gate's control.
+        for (int k = 0; k < 3; ++k)
+        {
+            pin.UbStored[k] = hbyaReevaluatedControl() ? nullptr : ubPtr[k];
+        }
         pin.cyc = ctl.cyc;
         for (int k = 0; k < 3; ++k) pin.solutionD[k] = ctl.solutionD[k];
         if (taps && corr == cpu::interFoam::tapCorrectorWanted())

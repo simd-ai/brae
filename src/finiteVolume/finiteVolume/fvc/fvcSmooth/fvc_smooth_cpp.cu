@@ -1,3 +1,4 @@
+#include "inter_phase_time.cuh"
 #include "fvc_smooth_cpp.cuh"
 #include "primitive_patch_cpp.cuh"   // meshCells: primitiveMesh::cells() in OpenFOAM's order
 #include <stdexcept>
@@ -57,7 +58,8 @@ void smooth(
     std::vector<scalar>& field,
     scalar coeff,
     const PrimitiveMesh& m,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    const CellFaces* cellsIn)
 {
     for (const FvPatch& p : patches)
     {
@@ -79,7 +81,16 @@ void smooth(
     }
     const std::vector<label>& owner = m.owner();
     const std::vector<label>& neighbour = m.neighbour();
-    const std::vector<std::vector<label>> cells = meshCells(m);
+    CellFaces cellsBuilt;
+    if (!cellsIn)
+    {
+        cellsBuilt = cellFaces(m);
+    }
+    const CellFaces& cells = cellsIn ? *cellsIn : cellsBuilt;
+    if (static_cast<label>(cells.start.size()) != nC + 1)
+    {
+        throw std::runtime_error(std::string(WHO) + "the cell-to-face list handed in is not this mesh's.");
+    }
     // fvcSmooth.C:50 -- a scalar sum, 1 + coeff
     const scalar maxRatio = 1 + coeff;
 
@@ -151,8 +162,10 @@ void smooth(
         for (const label c : changedCells)
         {
             const SmoothData newInfo = cellInfo[static_cast<std::size_t>(c)];
-            for (const label f : cells[static_cast<std::size_t>(c)])
+            const label fEnd = cells.start[static_cast<std::size_t>(c) + 1];
+            for (label k = cells.start[static_cast<std::size_t>(c)]; k < fEnd; ++k)
             {
+                const label f = cells.faces[static_cast<std::size_t>(k)];
                 SmoothData& cur = faceInfo[static_cast<std::size_t>(f)];
                 if (cur.equal(newInfo)) continue;
                 if (cur.update(newInfo, scalar(1), propagationTol) && !changedFace[static_cast<std::size_t>(f)])
@@ -168,6 +181,10 @@ void smooth(
     };
     // FaceCellWave::iterate, maxIter = mesh.globalData().nTotalCells() (fvcSmooth.C:119); reaching it is
     // FaceCellWave's FatalError
+    // MEASURED on RAS/DTCHull (845,536 cells): about 150 iterations a call, 20 million face visits and
+    // 6.5 million cell visits, 450 ms -- and the order of every one of them decides the result, through
+    // propagationTol, so this is one thread's work
+    interPhase::Nested timedWave("fvc::smooth: the wave");
     const label maxIter = nC;
     label iter = 0;
     for (; iter < maxIter; ++iter)

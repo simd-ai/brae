@@ -32,6 +32,16 @@ namespace brae {
 // ascending face order
 std::vector<std::vector<label>> meshCells(const PrimitiveMesh& m);
 
+// ...and the same list as ONE array with a start per cell, for a caller that walks it millions of times:
+// fvc::smooth's wave makes 6.5 million cell visits a call on RAS/DTCHull (845,536 cells), and a vector per
+// cell is a pointer chase per visit.
+struct CellFaces
+{
+    std::vector<label> start;   // nCells + 1
+    std::vector<label> faces;
+};
+CellFaces cellFaces(const PrimitiveMesh& m);
+
 // primitiveMesh::pointFaces(): invertManyToMany of faces(), so each point's faces ascending
 std::vector<std::vector<label>> meshPointFaces(const PrimitiveMesh& m);
 

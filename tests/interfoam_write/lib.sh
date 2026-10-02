@@ -382,7 +382,7 @@ laminar/waves/stokesV::1.4e-08:1.6e-08
 laminar/waves/irregularMultiDirection::7.9e-09:1.2e-08
 laminar/waves/streamFunction::2.5e-08:2.7e-08
 laminar/waves/mangroveInteraction::8e-02:1e-01
-RAS/DTCHull::6e-12:1e-10
+RAS/DTCHull::6e-12:5.8e-12
 laminar/sloshingTank2D::1e-11:1e-11
 laminar/sloshingTank2D3DoF::9.7e-12:1.0e-11
 laminar/sloshingTank3D::2.8e-10:2.5e-10

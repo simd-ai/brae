@@ -865,6 +865,8 @@ RunReport runInterFoam(
                     ri.phi = &f.phi;
                     ri.alpha1 = &f.alpha1;
                     ri.rho = &f.rho;
+                    // the host loop keeps no cell-to-face list: fvc::smooth builds it in the call
+                    ri.cells = nullptr;
                     ri.damp = rep.steps > 1;
                     LocalEulerControls lec = f.ltsCtl;
                     applySetRDeltaTControls(lec, ri.damp);

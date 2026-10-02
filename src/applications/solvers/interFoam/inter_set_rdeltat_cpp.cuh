@@ -57,6 +57,8 @@
 #include <string>
 #include <vector>
 
+#include "primitive_patch_cpp.cuh"
+
 namespace brae {
 namespace cpu {
 namespace interFoam {
@@ -91,6 +93,9 @@ struct SetRDeltaTInput
     const std::vector<scalar>* rho = nullptr;           // cells
     // runTime.timeIndex() > runTime.startTimeIndex() + 1, evaluated before ++runTime
     bool damp = false;
+    // primitiveMesh::cells() for fvc::smooth's wave, when the caller keeps it across steps; null builds it
+    // in the call. The caller owns its validity: it must be rebuilt whenever the mesh's addressing changes.
+    const CellFaces* cells = nullptr;
 };
 
 // The three Info lines, gMin/gMax of 1/rDeltaT after S2, after S5 and after S8.

@@ -1,3 +1,4 @@
+#include "inter_phase_time.cuh"
 #include "gamg_solver_cpp.cuh"
 #include "foam_dict.cuh"
 #include "smooth_solver_cpp.cuh"
@@ -709,6 +710,8 @@ void vCycle(
                 coarseCorrFields[li][i] += h.preSmoothedCoarseCorrField[i];
             }
         }
+        interPhase::Nested timedCoarse(leveli == 0 ? "host gamg: post-smooth, coarse level 1"
+                                                   : "host gamg: post-smooth, coarse levels 2 and below");
         h.smoothers[li + 1].smooth(
             coarseCorrFields[li],
             coarseSources[li],
@@ -727,6 +730,7 @@ void vCycle(
     {
         psi[i] += finestCorrection[i];
     }
+    interPhase::Nested timedFinest("host gamg: smooth, finest level");
     h.smoothers[0].smooth(psi, source, controls.nFinestSweeps);
 }
 
@@ -923,6 +927,19 @@ GamgControls readGamgControls(
     return c;
 }
 
+namespace {
+// gamgSolve's solve on a matrix already folded: the body both entries share (defined below)
+SolverPerformance gamgSolveFoldedImpl(
+    const GamgAgglomeration& agglomeration,
+    const std::vector<scalar>& diag,
+    const std::vector<scalar>& upper,
+    const std::vector<scalar>& source,
+    std::vector<scalar>& psi,
+    const GamgControls& controls,
+    GamgSolveLog* log,
+    const LduLevel* iface);
+}   // namespace
+
 SolverPerformance gamgSolve(
     const FvScalarMatrix& M,
     std::vector<scalar>& psi,
@@ -938,10 +955,39 @@ SolverPerformance gamgSolve(
     foldBoundary(M, patches, diag, source);
     // ...and the pair, which foldBoundary cannot fold: its coefficient multiplies the OTHER cell's psi
     const LduLevel iface = gamgLevel0Interface(M, patches);
+    return gamgSolveFoldedImpl(agglomeration, diag, M.upper, source, psi, controls, log, &iface);
+}
 
+SolverPerformance gamgSolveFolded(
+    const GamgAgglomeration& agglomeration,
+    const std::vector<scalar>& diag,
+    const std::vector<scalar>& upper,
+    const std::vector<scalar>& source,
+    std::vector<scalar>& psi,
+    const GamgControls& controls,
+    GamgSolveLog* log)
+{
+    return gamgSolveFoldedImpl(agglomeration, diag, upper, source, psi, controls, log, nullptr);
+}
+
+namespace {
+
+SolverPerformance gamgSolveFoldedImpl(
+    const GamgAgglomeration& agglomeration,
+    const std::vector<scalar>& diag,
+    const std::vector<scalar>& upper,
+    const std::vector<scalar>& source,
+    std::vector<scalar>& psi,
+    const GamgControls& controls,
+    GamgSolveLog* log,
+    const LduLevel* iface)
+{
     // the constructor: one coarse matrix per agglomeration level, each from the one above
     GamgHierarchy h;
-    h.build(agglomeration, diag, M.upper, controls.smoother, &iface);
+    {
+        interPhase::Nested timedBuild("host gamg: build the coarse matrices and smoothers");
+        h.build(agglomeration, diag, upper, controls.smoother, iface);
+    }
     const LduLevel& fine = h.fine;
 
     const std::size_t nCells = psi.size();
@@ -979,8 +1025,6 @@ SolverPerformance gamgSolve(
     );
     return perf;
 }
-
-namespace {
 
 // PCG::scalarSolve with the GAMG preconditioner. `fineAddr` is the mesh's own addressing, and the
 // hierarchy is fetched only when the preconditioner is first needed -- see pcgGamgSolve's cache form.

@@ -1,4 +1,7 @@
 #include <map>
+#include "inter_phase_time.cuh"
+#include <deque>
+#include <string>
 #include "device_gamg_solver.cuh"
 #include "device_blas.cuh"
 #include "device_sym_gauss_seidel.cuh"
@@ -585,6 +588,20 @@ void vCycle(
         {
             deviceAxpy(scalar(1), L.preSmoothed, L.corr);
         }
+        // BRAE_INTER_PHASE_TIME: the post-smoothing of each coarse level on its own line, with its size
+        static std::deque<std::string> levelNames;
+        while (levelNames.size() <= static_cast<std::size_t>(leveli))
+        {
+            levelNames.emplace_back();
+        }
+        if (interPhase::on() && levelNames[static_cast<std::size_t>(leveli)].empty())
+        {
+            levelNames[static_cast<std::size_t>(leveli)] =
+                "gamg post-smooth, coarse level " + std::to_string((long)leveli + 1) + " ("
+              + std::to_string((long)L.view().nCells) + " cells, " + std::to_string((long)L.dic.levels())
+              + " dep levels)";
+        }
+        interPhase::Nested timed(levelNames[static_cast<std::size_t>(leveli)].c_str());
         smoothLevel(
             L.view(),
             L.dic,
@@ -605,6 +622,7 @@ void vCycle(
         scale(h.finestCorrection, h.Apsi, A, h.finestResidual);
     }
     deviceAxpy(scalar(1), h.finestCorrection, psi);
+    interPhase::Nested timed("gamg smooth, finest level");
     smoothLevel(A, fineDic, psi, b, h.rA, h.wA, controls.nFinestSweeps, kind);
 }
 
