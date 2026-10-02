@@ -348,6 +348,7 @@ int main(int argc, char** argv)
                                 name, (double)q.initialResidual, (double)q.finalResidual, (int)q.nIterations);
                 }
             };
+            printSolves("p_rgh", r.pSolves);
             printSolves("epsilon", r.epsilonSolves);
             printSolves("omega", r.omegaSolves);
             printSolves("k", r.kSolves);

@@ -13,21 +13,6 @@
 # The check is that brae is CLOSER to OpenFOAM than OpenFOAM is to its own twin, on both arms -- a statement
 # about the port that the bound alone does not make.
 for key in stokesI solitaryGrimshaw damBreakLeakage; do
-    wcase $key host device > "$W/rest_$key.txt" 2>&1
-    o="$W/w_of_$key"
-    [ -d "$o" ] || { say "$key did not stage" FAIL; continue; }
-    t="$W/twin_$key"
-    mkdir -p "$t"
-    cp -r "$o/0" "$o/constant" "$o/system" "$t/"
-    sed -i -E 's/(tolerance\s+)1e-13;/\11e-14;/' "$t/system/fvSolution"
-    grep -q "1e-14;" "$t/system/fvSolution" || { say "$key: the twin's tolerances did not tighten" FAIL; continue; }
-    runof "$t"
-    python3 "$CMP" "$o" "$t" $(timedirs "$o") > "$W/cmp_twin_$key.txt" 2>&1
-    tw=$(worstof "$W/cmp_twin_$key.txt")
-    bh=$(worstof "$W/cmp_w_${key}_host.txt")
-    bd=$(worstof "$W/cmp_w_${key}_device.txt")
-    closer "$bh" "$tw" && closer "$bd" "$tw" \
-        && say "$key: brae (host $bh, device $bd) is closer to OpenFOAM than OpenFOAM's own twin ($tw)" ok \
-        || say "$key: brae (host $bh, device $bd) is closer to OpenFOAM than OpenFOAM's own twin ($tw)" FAIL
+    twin_check $key
 done
 finish "the at-rest tutorials: brae inside OpenFOAM's own sensitivity"

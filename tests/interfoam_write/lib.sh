@@ -351,33 +351,49 @@ PY
 # waveMakerMultiPaddleFlap 7.3e-12, waveMakerMultiPaddlePiston 2.4e-11.
 # The list-entry wave models (waveProperties echoed token by token, byte-identical after the banner on both
 # arms): irregularMultiDirection 7.9e-10 host, 1.2e-09 device; streamFunction 2.5e-09 host, 2.7e-09 device.
+# THE ROWS ABOVE 1e-9 ARE THE CASES' OWN SENSITIVITY, NOT PORT GAPS -- measured 2026-10-02, worst field file,
+# brae host / brae device / OpenFOAM against itself with every tolerance 1e-14 for 1e-13 (sensitivity/):
+#   streamFunction 2.5e-09 / 2.7e-09 / 4.5e-05     stokesII 1.3e-09 / 1.5e-09 / 1.0e-04
+#   stokesV 1.4e-09 / 1.6e-09 / 9.5e-05            cnoidal 3.6e-10 / 4.2e-10 / 1.4e-05
+#   irregularMultiDirection 7.9e-10 / 1.2e-09 / 6.2e-06   solitary 1.5e-10 / 1.7e-10 / 7.6e-08
+#   solitaryMcCowan 1.0e-08 / 1.5e-08 / 9.0e-07    waveMakerPiston 1.3e-09 / 1.8e-09 / 2.1e-07
+#   waveMakerFlap 4.1e-10 / 8.9e-10 / 6.7e-08
+# RAS/angledDuct is the other kind: its p_rgh GAMG is capped at 50 cycles and never converges (the first solve
+# ENDS at 1.36 from 1.0), so tolerances do not move it and round-off does -- gravity moved by one ulp moves
+# OpenFOAM's own phi 7.4e-10, against brae's 8.3e-10 host and 1.3e-09 device (sensitivity/angled_duct_ulp.sh).
+# The four sloshing tanks beside sloshingTank2D (2026-10-02, both arms as shipped): 2D3DoF 9.7e-13 / 1.0e-12,
+# 3D 2.8e-11 / 2.5e-11, 3D3DoF 4.8e-12 / 1.8e-12, 3D6DoF 3.4e-12 / 2.2e-12.
 W_CASES="
 laminar/capillaryRise::4e-13:4e-13
 RAS/weirOverflow::5e-12:3e-11
-RAS/angledDuct::9e-09:2e-08
+RAS/angledDuct::8.3e-09:1.3e-08
 RAS/damBreakLeakage::3e-06:4e-06
 RAS/damBreakPorousBaffle::5e-12:4e-11
 laminar/damBreakPermeable::2e-12:2e-12
 LES/nozzleFlow2D:1e-9:2e-11:2e-11
 laminar/vofToLagrangian/eulerianInjection::5e-13:2e-12
-laminar/waves/cnoidal::4e-09:5e-09
-laminar/waves/solitary::2e-09:2e-09
+laminar/waves/cnoidal::3.6e-09:4.2e-09
+laminar/waves/solitary::1.5e-09:1.7e-09
 laminar/waves/solitaryGrimshaw::2e-07:2e-07
-laminar/waves/solitaryMcCowan::2e-07:2e-07
+laminar/waves/solitaryMcCowan::1.0e-07:1.5e-07
 laminar/waves/stokesI::5e-07:1e-06
-laminar/waves/stokesII::2e-08:2e-08
-laminar/waves/stokesV::2e-08:2e-08
-laminar/waves/irregularMultiDirection::8e-09:2e-08
-laminar/waves/streamFunction::3e-08:3e-08
+laminar/waves/stokesII::1.3e-08:1.5e-08
+laminar/waves/stokesV::1.4e-08:1.6e-08
+laminar/waves/irregularMultiDirection::7.9e-09:1.2e-08
+laminar/waves/streamFunction::2.5e-08:2.7e-08
 laminar/waves/mangroveInteraction::8e-02:1e-01
 RAS/DTCHull::6e-12:1e-10
 laminar/sloshingTank2D::1e-11:1e-11
+laminar/sloshingTank2D3DoF::9.7e-12:1.0e-11
+laminar/sloshingTank3D::2.8e-10:2.5e-10
+laminar/sloshingTank3D3DoF::4.8e-11:1.8e-11
+laminar/sloshingTank3D6DoF::3.4e-11:2.2e-11
 laminar/testTubeMixer::4e-10:4e-10
 laminar/sloshingCylinder::1e-09:1e-09
 RAS/electrostaticDeposition::2e-06:1.8e-06
 laminar/waves/waveMakerSolitary::7e-10:1e-09
-laminar/waves/waveMakerPiston::2e-08:2e-08
-laminar/waves/waveMakerFlap::6e-09:3e-07
+laminar/waves/waveMakerPiston::1.3e-08:1.8e-08
+laminar/waves/waveMakerFlap::4.1e-09:8.9e-09
 laminar/waves/waveMakerMultiPaddleFlap::8e-11:1e-10
 laminar/waves/waveMakerMultiPaddlePiston::3e-10:3e-10
 RAS/DTCHullMoving::3e-10:2.4e-10

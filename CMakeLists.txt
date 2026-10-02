@@ -3321,7 +3321,7 @@ set(BRAE_WRITE_TUTORIALS_FAST
     nozzleFlow2D eulerianInjection cnoidal solitary solitaryGrimshaw solitaryMcCowan stokesI stokesII
     stokesV irregularMultiDirection streamFunction mangroveInteraction sloshingTank2D testTubeMixer
     waveMakerSolitary waveMakerPiston waveMakerFlap damBreakWithObstacle oscillatingBox floatingObject
-    DTCHullMovingCoarse)
+    DTCHullMovingCoarse sloshingTank2D3DoF sloshingTank3D sloshingTank3D3DoF sloshingTank3D6DoF)
 set(BRAE_WRITE_TUTORIALS_SLOW
     DTCHull DTCHullMoving mixerVesselAMI motorBike sloshingCylinder electrostaticDeposition
     waveMakerMultiPaddleFlap waveMakerMultiPaddlePiston)
