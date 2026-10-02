@@ -4,6 +4,8 @@
 #include "device_halo.cuh"
 #include "distributed_ami.cuh"   // DistributedAMI + distributedAmiAmul: optional cyclicAMI coupling in the matvec
 #include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdlib>
 
 namespace brae {
 
@@ -99,7 +101,135 @@ void amiAmulKernel(
         s += w[k] * psi[nbr[k]];
     atomicAdd(&Apsi[own[i]], ifc[i] * s);
 }
+// lduMatrix::residual (lduMatrixATmul.C:268-340) for one cell: rA = source - diag*psi, then the face loop
+// SUBTRACTS each term from it, in face order. Not source - (A.psi): the same number to another last bit,
+// and at a converged iterate the last bits are all the residual is.
+__global__
+void residualKernel(
+    int nC,
+    const scalar* __restrict__ diag,
+    const scalar* __restrict__ upper,
+    const scalar* __restrict__ lower,
+    const label* __restrict__ nei,
+    const label* __restrict__ owner,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ losort,
+    const label* __restrict__ losortStart,
+    const scalar* __restrict__ psi,
+    const scalar* __restrict__ source,
+    scalar* __restrict__ rA)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+
+    // every product rounded before it is subtracted (__dmul_rn, __dsub_rn): OpenFOAM's x86-64 build does
+    // not fuse them
+    scalar s = __dsub_rn(source[c], __dmul_rn(diag[c], psi[c]));
+    int f = ownerStart[c];
+    const int u1 = ownerStart[c + 1];
+    int k = losortStart[c];
+    const int l1 = losortStart[c + 1];
+    while (f < u1 || k < l1)
+    {
+        const int fl = (k < l1) ? losort[k] : 0x7fffffff;
+        if (f < u1 && f < fl)
+        {
+            s = __dsub_rn(s, __dmul_rn(upper[f], psi[nei[f]]));
+            ++f;
+        }
+        else
+        {
+            s = __dsub_rn(s, __dmul_rn(lower[fl], psi[owner[fl]]));
+            ++k;
+        }
+    }
+    rA[c] = s;
+}
+
+// ...and the interfaces' share of it, the mirror of cyclicAmulKernel and amiAmulKernel
+__global__
+void cyclicResidualKernel(
+    int nCyc,
+    const label* __restrict__ own,
+    const label* __restrict__ nbr,
+    const scalar* __restrict__ coeff,
+    const scalar* __restrict__ jump,
+    const scalar* __restrict__ psi,
+    scalar* __restrict__ rA)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= nCyc) return;
+
+    const scalar pnf = jump ? (psi[nbr[j]] - jump[j]) : psi[nbr[j]];
+    atomicAdd(&rA[own[j]], -__dmul_rn(coeff[j], pnf));
+}
+
+__global__
+void amiResidualKernel(
+    int n,
+    const label* __restrict__ own,
+    const label* __restrict__ off,
+    const label* __restrict__ nbr,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ ifc,
+    const scalar* __restrict__ psi,
+    scalar* __restrict__ rA)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+
+    scalar s = 0;
+    for (label k = off[i]; k < off[i+1]; ++k)
+    {
+        s += w[k] * psi[nbr[k]];
+    }
+    atomicAdd(&rA[own[i]], -__dmul_rn(ifc[i], s));
+}
 } // namespace
+
+
+// BRAE_CONTROL_DEVICE_GS_RESIDUAL_AMUL=1 puts source - A.psi back in the smoothing loops -- the gate's control
+bool deviceResidualAsAmul()
+{
+    static const bool on = []
+    {
+        const bool v = std::getenv("BRAE_CONTROL_DEVICE_GS_RESIDUAL_AMUL") != nullptr;
+        if (v)
+        {
+            std::printf("  *** CONTROL MODE: the device smoothSolver's loop residual is source - A.psi, not "
+                        "lduMatrix::residual. This run is deliberately wrong. ***\n");
+        }
+        return v;
+    }();
+    return on;
+}
+
+void deviceResidual(
+    const DeviceLduView& A,
+    const DeviceBuffer<scalar>& psi,
+    const DeviceBuffer<scalar>& source,
+    DeviceBuffer<scalar>& rA,
+    bool onField)
+{
+    rA.resize(A.nCells);
+    const int blocks = (A.nCells + TPB - 1) / TPB;
+    residualKernel<<<blocks, TPB>>>(A.nCells, A.diag, A.upper, A.lower, A.nei, A.owner,
+                                    A.ownerStart, A.losort, A.losortStart, psi.data(), source.data(), rA.data());
+    cudaCheck(cudaGetLastError(), "residual");
+    if (A.nCyc > 0)
+    {
+        cyclicResidualKernel<<<(A.nCyc + TPB - 1) / TPB, TPB>>>(A.nCyc, A.cycOwn, A.cycNbr, A.cycCoeff,
+                                                                onField ? A.cycJump : nullptr,
+                                                                psi.data(), rA.data());
+        cudaCheck(cudaGetLastError(), "cyclicResidual");
+    }
+    if (A.nAmi > 0)
+    {
+        amiResidualKernel<<<(A.nAmi + TPB - 1) / TPB, TPB>>>(A.nAmi, A.amiOwn, A.amiOff, A.amiNbr, A.amiW,
+                                                             A.amiIfc, psi.data(), rA.data());
+        cudaCheck(cudaGetLastError(), "amiResidual");
+    }
+}
 
 
 // FP-11 TRIED THE CONTIGUOUS-ROW LAYOUT HERE AND IT DOES NOT TRANSFER. This product is the largest

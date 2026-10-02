@@ -211,6 +211,20 @@ inline DeviceLduView deviceLduViewAmi(
 void deviceAmul(const DeviceLduView& A, const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi,
                 bool onField = false);
 
+// lduMatrix::residual (lduMatrixATmul.C:268-340): rA = source - diag*psi with every face term then subtracted
+// from it in face order -- what smoothSolver's LOOP evaluates (smoothSolver.C:190-197), where its initial
+// residual is source - A.psi. The two round differently, and on a solve that stalls at round-off the
+// difference decides whether it stops. MEASURED on RAS/DTCHullMoving, step two's k solve, tolerance 1e-13:
+// OpenFOAM stalls at 1.08e-13 and runs its 1000 sweeps, source - A.psi read 4.5e-14 and stopped after 2.
+void deviceResidual(
+    const DeviceLduView& A,
+    const DeviceBuffer<scalar>& psi,
+    const DeviceBuffer<scalar>& source,
+    DeviceBuffer<scalar>& rA,
+    bool onField = false);
+// ...and the control that puts source - A.psi back (BRAE_CONTROL_DEVICE_GS_RESIDUAL_AMUL)
+bool deviceResidualAsAmul();
+
 class DeviceHalo;      // forward (parallel/pstream/device_halo.cuh)
 struct DistributedAMI; // forward (cuda/distributed_ami.cuh) -- optional cyclicAMI coupling in the matvec
 

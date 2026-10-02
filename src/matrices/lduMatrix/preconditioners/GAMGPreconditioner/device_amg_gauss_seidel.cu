@@ -230,9 +230,17 @@ static void deviceSymGaussSeidelGraph(
         cudaCheck(cudaStreamBeginCaptureToGraph(cudaStreamPerThread, body, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal), "gs capture begin");
         // smoothSolver.C:186: nSweeps sweeps, THEN one residual evaluation
         for (int sw = 0; sw < sweepsPer; ++sw) deviceSymGaussSeidelSweepExact(sA, c.gsB, psi, lv, symmetric, &c.lc, &c.cc);
-        deviceAmul(sA, psi, c.Ax);
-        deviceCopy(c.r, c.gsB);
-        deviceAxpy(-1.0, c.Ax, c.r);  // r = b - A*psi
+        // ...which is lduMatrix::residual, not source - A.psi (deviceResidual, device_ldu.cuh)
+        if (deviceResidualAsAmul())
+        {
+            deviceAmul(sA, psi, c.Ax);
+            deviceCopy(c.r, c.gsB);
+            deviceAxpy(-1.0, c.Ax, c.r);
+        }
+        else
+        {
+            deviceResidual(sA, psi, c.gsB, c.r);
+        }
         deviceSumMagInto(c.r, c.gRes.data());
         gsScaleInvK<<<1,1,0,cudaStreamPerThread>>>(c.gRes.data(), c.gNormF.data());      // finalRes = sum|r| / normFactor
         gsSetCondK<<<1,1,0,cudaStreamPerThread>>>(c.handle, c.gRes.data(), tol, c.gInit.data(), relTol,
@@ -452,9 +460,16 @@ static void deviceSymGaussSeidelGraphFused(
         for (int sw = 0; sw < sweepsPer; ++sw) deviceSymGaussSeidelSweepExactFused(sA[0], ops, lv, symmetric, &c.lc, ccp);
         for (int k = 0; k < nComp; ++k)
         {
-            deviceAmul(sA[k], *comps[k].psi, c.Ax[k]);
-            deviceCopy(c.r[k], c.gsB[k]);
-            deviceAxpy(-1.0, c.Ax[k], c.r[k]);
+            if (deviceResidualAsAmul())
+            {
+                deviceAmul(sA[k], *comps[k].psi, c.Ax[k]);
+                deviceCopy(c.r[k], c.gsB[k]);
+                deviceAxpy(-1.0, c.Ax[k], c.r[k]);
+            }
+            else
+            {
+                deviceResidual(sA[k], *comps[k].psi, c.gsB[k], c.r[k]);
+            }
             deviceSumMagInto(c.r[k], c.gRes.data() + k);
         }
         gsScaleInvNK<<<1, 32, 0, cudaStreamPerThread>>>(nComp, c.gRes.data(), c.gNormF.data());
@@ -814,9 +829,16 @@ void hostSymGaussSeidelFused(
         {
             if (!active[k]) continue;
             cudaMemcpyAsync(comps[k].psi->data(), c.psi[k], (std::size_t)nC*sizeof(scalar), cudaMemcpyHostToDevice, cudaStreamPerThread);
-            deviceAmul(*comps[k].A, *comps[k].psi, c.Ax[k]);
-            deviceCopy(c.r[k], *comps[k].b);
-            deviceAxpy(-1.0, c.Ax[k], c.r[k]);
+            if (deviceResidualAsAmul())
+            {
+                deviceAmul(*comps[k].A, *comps[k].psi, c.Ax[k]);
+                deviceCopy(c.r[k], *comps[k].b);
+                deviceAxpy(-1.0, c.Ax[k], c.r[k]);
+            }
+            else
+            {
+                deviceResidual(*comps[k].A, *comps[k].psi, *comps[k].b, c.r[k]);
+            }
             deviceSumMagInto(c.r[k], c.gRes.data() + k);
         }
         hostGsNormK<<<1, 32, 0, cudaStreamPerThread>>>(nComp, c.gRes.data(), c.gNf.data(), c.gRes.data() + GS_FUSED_MAX);
@@ -1094,9 +1116,16 @@ scalar deviceSymGaussSeidel(
         // name -- see device_sym_gauss_seidel.cuh, and tests/gs_ladder for the 1.36x-to-6.88x it cost.
         for (int s = 0; s < sweepsPer; ++s) deviceSymGaussSeidelSweepExact(A, b, psi, lv, symmetric, &lc, &cc);
         sweeps += sweepsPer;
-        deviceAmul(A, psi, Ax);
-        deviceCopy(r, b);
-        deviceAxpy(-1.0, Ax, r);
+        if (deviceResidualAsAmul())
+        {
+            deviceAmul(A, psi, Ax);
+            deviceCopy(r, b);
+            deviceAxpy(-1.0, Ax, r);
+        }
+        else
+        {
+            deviceResidual(A, psi, b, r);
+        }
         finalRes = deviceSumMag(r) / normFactor;
         if ((finalRes < tol || finalRes < relTol*initRes) && sweeps >= minIter) break;
     }

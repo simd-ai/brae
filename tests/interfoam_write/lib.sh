@@ -380,8 +380,8 @@ laminar/waves/waveMakerPiston::2e-08:2e-08
 laminar/waves/waveMakerFlap::6e-09:3e-07
 laminar/waves/waveMakerMultiPaddleFlap::8e-11:1e-10
 laminar/waves/waveMakerMultiPaddlePiston::3e-10:3e-10
-RAS/DTCHullMoving::3e-10:6e-8
-RAS/DTCHullMovingCoarse::1e-10:2e-9
+RAS/DTCHullMoving::3e-10:2.4e-10
+RAS/DTCHullMovingCoarse::1e-10:3.1e-11
 laminar/damBreakWithObstacle::2e-11:3e-11
 laminar/oscillatingBox::2e-10:1.8e-10
 RAS/motorBike::9e-12:2e-11
@@ -420,9 +420,16 @@ BOUND_WFO_DEVICE=1.6e-12
 # `-`: the rigid body runs there too (tests/interfoam_moving_vs_openfoam.sh, `floating`, under Euler), but
 # the tutorial is CrankNicolson with kEpsilon on a moving mesh, whose moving branch the device closure does
 # not carry -- refused by name at start-up -- and its written state is the host loop's alone.
-# ...and arm X3 (device_body/) runs on the COARSENED hull (coarse_dtc_source), where the device's worst file is
-# k at 2.9e-10 and the same capped k solve is the reason
-BOUND_X3_FIELDS=2e-9
+# ...and arm X3 (device_body/) runs on the COARSENED hull (coarse_dtc_source), where the device's worst file was
+# k at 2.9e-10 for the same reason.
+# THAT REASON WAS A PORT GAP, CLOSED 2026-10-02, and "the solve, not a term" was half of it: smoothSolver's
+# LOOP evaluates lduMatrix::residual (smoothSolver.C:190-197, lduMatrixATmul.C:268-340), where the device
+# evaluated source - A.psi. OpenFOAM's k solve at step two stalls at 1.08e-13 against a tolerance of 1e-13 and
+# runs its 1000 sweeps; the device read 4.5e-14 and stopped after 2. With deviceResidual: 1000 sweeps, final
+# residual 1.077e-13, k 9.4e-14 on the tutorial's mesh (worst file pointDisplacement 2.4e-11, the host arm's)
+# and worst file 3.1e-12 on the coarsened hull. Control BRAE_CONTROL_DEVICE_GS_RESIDUAL_AMUL=1:
+# device_body/k_residual_control.sh.
+BOUND_X3_FIELDS=3.1e-11
 
 declare -A WCASE_OF
 # the per-arm half of wcase: brae on each arm against the staged OpenFOAM run ($key, $ot and the two bounds

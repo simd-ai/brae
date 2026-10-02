@@ -335,6 +335,23 @@ int main(int argc, char** argv)
                 + std::to_string((double)r.time) + ", short of endTime " + std::to_string((double)endTime)
                 + " -- the fixed-step count ran out before the clock did.");
         }
+        // BRAE_PRINT_TURB_SOLVES=1: the closure's solves as OpenFOAM's log prints them, one line each -- the
+        // instrument that says whether a closure field differs because a solve STOPPED somewhere else
+        if (std::getenv("BRAE_PRINT_TURB_SOLVES") != nullptr)
+        {
+            auto printSolves = [](const char* name, const std::vector<cpu::interFoam::LinearSolveRecord>& v)
+            {
+                for (const cpu::interFoam::LinearSolveRecord& q : v)
+                {
+                    std::printf("  Solving for %s, Initial residual = %.17g, Final residual = %.17g, "
+                                "No Iterations %d\n",
+                                name, (double)q.initialResidual, (double)q.finalResidual, (int)q.nIterations);
+                }
+            };
+            printSolves("epsilon", r.epsilonSolves);
+            printSolves("omega", r.omegaSolves);
+            printSolves("k", r.kSolves);
+        }
         std::printf("End: t = %.6g, alpha in [%.3e, %.8f], max|U| %.4g m/s, worst |div(phi)| %.3e\n",
                     (double)r.time, (double)r.alphaMin, (double)r.alphaMax,
                     (double)r.maxU, (double)r.worstDivPhi);
