@@ -57,7 +57,8 @@
 # NOT CLAIMED: GAMG across the AMI (staged, above), the tutorial's 1.1M-cell mesh, adjustable time
 # steps, a transformed, periodic or low-weight-corrected AMI and every AMI keyword brae does not read
 # (refused), requireMatch false (refused), a moving mesh under kOmegaSST or LES (refused), a written
-# `value` on rotatingWallVelocity (refused), and the device loop (refused).
+# `value` on rotatingWallVelocity (refused), and the device loop (tests/interfoam_ami_device/
+# holds it, static and rotating).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BUILD:-$ROOT/build}/test_inter_ami_vs_openfoam"

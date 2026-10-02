@@ -255,9 +255,10 @@ int main(
                          || profile == "closedAdjZG" || profile == "closedAdjIO"
                          || profile == "mixerTop" || profile == "mixerPermeable"
                          || profile == "pistonOuter" || profile == "pistonOuterOnce"
-                         || profile == "floating" || profile == "solitaryOuterCN");
+                         || profile == "floating" || profile == "floatingShipped"
+                         || profile == "solitaryOuterCN");
     // `floating` ON THE DEVICE: the body the fluid moves, its joint state held against OpenFOAM's below
-    const bool floatingDevice = (profile == "floating");
+    const bool floatingDevice = (profile == "floating" || profile == "floatingShipped");
     // `solitaryOuterCN`: three steps of the CrankNicolson wave tank under three outer correctors, where
     // the device's distance is its own on nine passes of 200-iteration pressure solves and not a multiple
     // of the host's -- MEASURED (2026-10-01) host alpha 3.9e-13 / p_rgh 2.4e-13 / U 2.1e-10, device

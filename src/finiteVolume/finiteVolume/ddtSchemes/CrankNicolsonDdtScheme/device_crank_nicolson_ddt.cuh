@@ -47,6 +47,20 @@ struct DeviceCnDdt0
     scalar rDtCoef0(const cpu::fv::CrankNicolsonClock& clock) const { return coef0(clock)/clock.deltaT0; }
 };
 
+// THE PATCH HALF of fvm::ddt's ddt0, on the device's flat boundary-face arrays (the host's
+// fv::CrankNicolsonDdt0Operands): the operands' STORED patch values at the two old levels. ddt0 is a whole
+// GeometricField and OpenFOAM advances its patches beside its cells (CrankNicolsonDdtScheme.C:1040-1047
+// moving, :1069-1073 static) -- the same expression on both branches, no volumes:
+//     ddt0_b <- rDtCoef0*(rhoOld_b*vfOld_b - rhoOO_b*vfOO_b) - offCentre(ddt0_b)
+// Nothing in the solve reads them; the field is WRITTEN with them. `rhoOld`/`rhoOO` null together is rho = 1.
+struct DeviceCnDdt0PatchOperands
+{
+    const DeviceBuffer<scalar>* rhoOld = nullptr;
+    const DeviceBuffer<scalar>* rhoOO = nullptr;
+    const DeviceBuffer<scalar>* vfOld[3] = {nullptr, nullptr, nullptr};
+    const DeviceBuffer<scalar>* vfOO[3] = {nullptr, nullptr, nullptr};
+};
+
 // fvm::ddt(rho, vf), added INTO diag and the per-component sources. `rho`, `rhoOld` and
 // `rhoOO` null together is fvm::ddt(vf). `nComp` is 1 (k, epsilon) or 3 (U); the arrays are indexed
 // by component, and unused slots may be null.
@@ -68,7 +82,9 @@ void deviceCnFvmDdt(
     DeviceBuffer<scalar>& diag,
     DeviceBuffer<scalar>* const* src,
     const DeviceBuffer<scalar>* V0 = nullptr,
-    const DeviceBuffer<scalar>* V00 = nullptr);
+    const DeviceBuffer<scalar>* V00 = nullptr,
+    // the field's patches advanced beside its cells, when the caller keeps them (the writer's callers)
+    const DeviceCnDdt0PatchOperands* patchOperands = nullptr);
 
 // fvc::ddtCorr(U, Uf) on a MOVING mesh (fvcDdtUfCorr, CrankNicolsonDdtScheme.C:1201-1257),
 // transcribed from the host reference. A DIFFERENT OPERATOR from the static twin below, not a variant

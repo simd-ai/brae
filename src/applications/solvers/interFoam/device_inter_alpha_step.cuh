@@ -65,6 +65,13 @@ struct DeviceInterAlphaHooks
     std::function<void(
         const DeviceBuffer<scalar>& alpha1,
         DeviceBuffer<scalar>& alpha1Bnd)> refreshBoundary;
+    // alpha1's patch values AS THEY STAND, with no evaluate: what the top of the step reads.
+    // alphaEqn.H evaluates alpha1 nowhere before its fluxes (alpha_eqn_cpp.cu says so at length), so
+    // the explicit path's alphaPhiUn reads what the LAST evaluate left -- the previous MULES solve's
+    // closing correctBoundaryConditions, or at the first step the file's own `value`. Optional; when
+    // absent the top of the step evaluates, as it did before this hook.
+    std::function<void(
+        DeviceBuffer<scalar>& alpha1Bnd)> storedBoundary;
 
     // THE RELAXED CORRECTOR'S BOUNDARY, and the mixture.correct() after it with no evaluate in front.
     // Both or neither; when absent a relaxed corrector falls back to updateBoundary.

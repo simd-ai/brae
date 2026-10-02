@@ -386,6 +386,7 @@ void deviceInterStep(
     {
         uin.ddtCn = ctl.cn->clock;
         uin.ddtCnDdt0 = &ctl.cn->ddt0RhoU;
+        uin.ddtCnPatch = ctl.cn->ddt0RhoUPatch;
         uin.ddtRhoOO = &rhoOO;
         for (int k = 0; k < 3; ++k) uin.ddtUOO[k] = ctl.cn->UOO[k];
     }
@@ -499,7 +500,24 @@ void deviceInterStep(
         deviceCopy(sx, UEqn.source[0]);
         deviceCopy(sy, UEqn.source[1]);
         deviceCopy(sz, UEqn.source[2]);
-        deviceAddMomentumPredictorSource(dm, fInt, fBnd, sx, sy, sz);
+        // ...and on the pair, the same four fields on its own faces. MEASURED on RAS/mixerVesselAMI's
+        // first step without it, host against device: the predicted U 3.7e-01 out in the pair's cells
+        // (0.183 against -0.189), U 5.9e-05 after the corrector.
+        DeviceBuffer<scalar> fPair;
+        const bool pairForce = ctl.cyc && ctl.cyc->n > 0
+                            && std::getenv("BRAE_CONTROL_DEVICE_PREDICTOR_NO_PAIR_FORCE") == nullptr;
+        if (pairForce)
+        {
+            if (!ctl.stfIf || !ctl.ghfIf || !ctl.snGradRhoIf || !ctl.snGradPrghIf
+             || static_cast<int>(ctl.snGradPrghIf->size()) != ctl.cyc->n)
+                throw std::runtime_error(
+                    "brae interFoam device step: `momentumPredictor yes` on a mesh with a coupled pair "
+                    "needs stf, ghf, snGrad(rho) and snGrad(p_rgh) on the pair's faces.");
+            deviceMomentumSourceFlux(ctl.cyc->n, *ctl.stfIf, *ctl.ghfIf, *ctl.snGradRhoIf,
+                                     *ctl.snGradPrghIf, ctl.cyc->magSf, fPair);
+        }
+        deviceAddMomentumPredictorSource(dm, fInt, fBnd, sx, sy, sz, pairForce ? ctl.cyc : nullptr,
+                                         pairForce ? &fPair : nullptr);
 
         const DeviceLduView A = UEqn.view(dm);
         DeviceBuffer<scalar>* Uk[3] = {&UX, &UY, &UZ};
@@ -514,9 +532,7 @@ void deviceInterStep(
                        UEqn.iC[k], UEqn.bC[k], diagC, b);
             // ...with the pair's off-diagonal, so the solve applies the operator that was assembled
             const DeviceLduView Ak = (ctl.cyc && ctl.cyc->n > 0)
-                ? deviceLduViewCyclic(dm, diagC, UEqn.upper, UEqn.lower, ctl.cyc->n,
-                                      ctl.cyc->ownCell.data(), ctl.cyc->nbrCell.data(),
-                                      ctl.cyc->ifCoeff.data())
+                ? deviceLduViewPair(dm, diagC, UEqn.upper, UEqn.lower, *ctl.cyc, nullptr, &UEqn.cycIfCoeff)
                 : deviceLduView(dm, diagC, UEqn.upper, UEqn.lower);
             DeviceBuffer<scalar> dNf;
             deviceNormFactorInto(Ak, *Uk[k], b, deviceOnes(nC), dNf);
@@ -690,6 +706,8 @@ void deviceInterStep(
         pi.meshPhiAll = ctl.meshPhiAll;
         pi.phiAbsIntOut = ctl.phiAbsIntOut;
         pi.phiAbsBndOut = ctl.phiAbsBndOut;
+        pi.meshPhiIf = ctl.meshPhiIf;
+        pi.phiAbsIfOut = ctl.phiAbsIfOut;
         pi.rho = &rho;
         pi.gh  = &gh;
         pi.ddtCorrInt = &ddtCorrI;

@@ -192,7 +192,7 @@ void lsqGradKernel(
     // rotated across the interface, which is why this form serves k and omega and not grad(U).
     const label* __restrict__ cycCellStart,
     const label* __restrict__ cycPerm,
-    const label* __restrict__ cycNbrCell,
+    CyclicNbr cycNbr,
     const scalar* __restrict__ cycW,
     const scalar* __restrict__ cycMagSf,
     const scalar* __restrict__ cycDX, const scalar* __restrict__ cycDY, const scalar* __restrict__ cycDZ,
@@ -233,7 +233,7 @@ void lsqGradKernel(
             const int j = cycPerm[k];
             const vector d{cycDX[j], cycDY[j], cycDZ[j]};
             const scalar msd = cycMagSf[j] / magSqr(d);
-            s += ((1.0 - cycW[j]) * msd * (vf[cycNbrCell[j]] - vc)) * (iv & d);
+            s += ((1.0 - cycW[j]) * msd * (cyclicNbrValue(cycNbr, vf, j) - vc)) * (iv & d);
         }
     }
     // No division by V: the fit vectors already carry the normalisation.
@@ -529,7 +529,7 @@ void deviceLeastSquaresGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vo
         dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), dm.bndGFace.data(),
         dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), bval.data(), lsqInvDdFor(dm, cyc),
         cycN ? cyc->ifCellStart.data() : nullptr, cycN ? cyc->ifPerm.data() : nullptr,
-        cycN ? cyc->nbrCell.data() : nullptr,
+        cycN ? cyc->nbr() : CyclicNbr{},
         cycN ? cyc->weights.data() : nullptr, cycN ? cyc->magSf.data() : nullptr,
         cycN ? cyc->dX.data() : nullptr, cycN ? cyc->dY.data() : nullptr, cycN ? cyc->dZ.data() : nullptr,
         gx.data(), gy.data(), gz.data());

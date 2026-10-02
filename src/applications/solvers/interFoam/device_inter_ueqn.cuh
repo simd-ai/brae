@@ -38,6 +38,7 @@
 //      still converges.
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
+#include "device_cyclic.cuh"
 #include "device_mesh.cuh"
 
 namespace brae {
@@ -136,6 +137,9 @@ void deviceAddMomentumPredictorSource(
     const DeviceBuffer<scalar>& faceForceBnd,
     DeviceBuffer<scalar>&       srcX,
     DeviceBuffer<scalar>&       srcY,
-    DeviceBuffer<scalar>&       srcZ);
+    DeviceBuffer<scalar>&       srcZ,
+    // the pair and the force on its faces, which are in neither array above
+    const DeviceCyclic*         cyc = nullptr,
+    const DeviceBuffer<scalar>* faceForceIf = nullptr);
 
 } // namespace brae

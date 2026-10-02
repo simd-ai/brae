@@ -242,15 +242,26 @@ void deviceAddMomentumPredictorSource(
     const DeviceBuffer<scalar>& faceForceBnd,
     DeviceBuffer<scalar>&       srcX,
     DeviceBuffer<scalar>&       srcY,
-    DeviceBuffer<scalar>&       srcZ)
+    DeviceBuffer<scalar>&       srcZ,
+    const DeviceCyclic*         cyc,
+    const DeviceBuffer<scalar>* faceForceIf)
 {
     const int nC = dm.nCells;
+    const bool havePair = cyc && cyc->n > 0;
+    if (havePair && (!faceForceIf || static_cast<int>(faceForceIf->size()) != cyc->n))
+    {
+        throw std::runtime_error(
+            "brae interFoam device UEqn: the mesh has a coupled pair and the predictor's face force on "
+            "its faces was not handed in. fvc::reconstruct sums a coupled face like any other patch "
+            "face, so leaving it out gives a different U in every cell the pair touches.");
+    }
     if (static_cast<int>(srcX.size()) != nC)
         throw std::runtime_error(
             "brae interFoam device UEqn: the face force is added INTO an existing source -- the matrix "
             "is assembled and relaxed first, and this runs on a copy of it.");
     DeviceBuffer<scalar> rx, ry, rz;
-    deviceReconstruct(dm, faceForceInt, faceForceBnd, rx, ry, rz);
+    deviceReconstruct(dm, faceForceInt, faceForceBnd, rx, ry, rz, havePair ? cyc : nullptr,
+                      havePair ? faceForceIf : nullptr);
     addForceKernel<<<nBlocks(nC), TPB>>>(rx.data(), ry.data(), rz.data(), dm.V.data(), nC,
                                          srcX.data(), srcY.data(), srcZ.data());
     ckU(cudaGetLastError(), "source += V*reconstruct(faceForce)");

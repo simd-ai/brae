@@ -176,6 +176,9 @@ struct DeviceInterCrankNicolson
 {
     const cpu::fv::CrankNicolsonClock* clock = nullptr;
     DeviceCnDdt0 ddt0RhoU;
+    // ...and ddt0(rho,U)'s patch half, when the driver WRITES the field: rho's and U's patch values at
+    // the two old levels (DeviceCnDdt0PatchOperands). Null leaves the patches unkept.
+    const DeviceCnDdt0PatchOperands* ddt0RhoUPatch = nullptr;
     DeviceCnDdt0 ddtCorrU;
     DeviceCnDdt0 ddtCorrPhi;
     const DeviceBuffer<scalar>* UOO[3] = {nullptr, nullptr, nullptr};
@@ -297,6 +300,9 @@ struct DeviceInterStepControls
     // ...and where the pressure step leaves the ABSOLUTE flux for the driver's fvc::correctUf.
     DeviceBuffer<scalar>* phiAbsIntOut = nullptr;
     DeviceBuffer<scalar>* phiAbsBndOut = nullptr;
+    // ...and both on the pair's faces (DeviceInterPressureInput::meshPhiIf, phiAbsIfOut)
+    const DeviceBuffer<scalar>* meshPhiIf = nullptr;
+    DeviceBuffer<scalar>* phiAbsIfOut = nullptr;
     // ...and rAU, which is not this loop's to keep but the NEXT mesh update's: under `correctPhi`
     // CorrectPhi is solved with fvc::interpolate(rAU) of the LAST corrector (correctPhi.H, and
     // interFoam.C:138), and that call is a host one on either arm. Null when the caller does not
@@ -339,6 +345,9 @@ struct DeviceInterStepControls
     const DeviceBuffer<scalar>* stfIf       = nullptr;
     const DeviceBuffer<scalar>* ghfIf       = nullptr;
     const DeviceBuffer<scalar>* snGradRhoIf = nullptr;
+    // ...and snGrad(p_rgh) there, which the momentum predictor's force takes with the other three:
+    // fvc::reconstruct sums a coupled face like any other patch face (UEqn.H:19-29)
+    const DeviceBuffer<scalar>* snGradPrghIf = nullptr;
     DeviceInterAlphaControls  alpha;
     DeviceMulesControls       mules;
     // The alpha equation's per-step settings -- cAlpha, deltaN and the two flux schemes. The flux

@@ -147,8 +147,7 @@ scalar deviceAlphaPreSolve(
     deviceFold(dm, rawDiag, source, iC, bC, diagC, b);
 
     const DeviceLduView A = (cyc && cyc->n > 0)
-        ? deviceLduViewCyclic(dm, diagC, upper, lower, cyc->n, cyc->ownCell.data(),
-                              cyc->nbrCell.data(), cyc->ifCoeff.data())
+        ? deviceLduViewPair(dm, diagC, upper, lower, *cyc)
         : deviceLduView(dm, diagC, upper, lower);
 
     // OpenFOAM's lduMatrix::solver::normFactor, not sum|b| -- it scales every residual the solver

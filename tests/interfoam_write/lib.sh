@@ -383,8 +383,8 @@ RAS/DTCHullMovingCoarse::1e-10:2e-9
 laminar/damBreakWithObstacle::2e-11:3e-11
 laminar/oscillatingBox::2e-10:-
 RAS/motorBike::9e-12:2e-11
-RAS/mixerVesselAMI::5e-11:-
-RAS/floatingObject::1e-12:-
+RAS/mixerVesselAMI::5e-11:5e-11
+RAS/floatingObject::1e-12:1.6e-12
 "
 # RAS/DTCHullMoving (rigidBodyMotion: pointDisplacement, uniform/rigidBodyMotionState, points, meshPhi, Uf,
 # rAU): host 2.4e-11, pointDisplacement at 0.0002 (1.1e-16 absolute on a 4.7e-06 largest); polyMesh/points
@@ -407,6 +407,8 @@ RAS/floatingObject::1e-12:-
 BOUND_RB_DTC=4e-15
 BOUND_FO=9e-13
 BOUND_WFO=1e-12
+# ...and the same row from the device loop: measured worst 1.6e-13 (0.02/ddt0(k)), 2026-10-02
+BOUND_WFO_DEVICE=1.6e-12
 # RAS/DTCHullMoving ON THE DEVICE (2026-10-01): the rigid body's load and the atmosphere's tangentialVelocity
 # are carried (arm X3 holds both controls). Worst file k 6.6e-09, every other file at the host arm's level
 # (pointDisplacement 2.4e-11, U 3.4e-12). THE k GAP IS THE SOLVE, NOT A TERM: the closure's inputs and the
@@ -436,9 +438,8 @@ wcase_arms()
         # the case's own (several device refusals end in "Run without -device"), and that it wrote nothing
         if [ "$BOUND_W" = "-" ]; then
             case $key in
-                floatingObject) why="which the device kEpsilon does not carry" ;;
+                floatingObject) why="which the device loop does not keep in its written form" ;;
                 oscillatingBox) why="the mesh refines AND a motion solver moves it" ;;
-                mixerVesselAMI) why="is cyclicAMI and its coupling is not attached" ;;
                 *) why="" ;;
             esac
             [ -n "$why" ] || say "ARM W  [$arm] $key: a device bound of - with no expected refusal named" FAIL

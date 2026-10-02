@@ -60,14 +60,14 @@ __global__ void donorBoundaryKernel(const scalar* __restrict__ phiPsiBnd, int nB
 // is a real cell on the other side of the pair, so this is the internal-face form with the interface's
 // own addressing -- not a patch value, of which a cyclic patch has none that MULES would read.
 __global__ void donorCyclicKernel(
-    const label* __restrict__ own, const label* __restrict__ nbr,
+    const label* __restrict__ own, CyclicNbr nbr,
     const scalar* __restrict__ phi, const scalar* __restrict__ psi,
     int n, scalar* __restrict__ phiBD)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
     const scalar p = phi[j];
-    phiBD[j] = p * ((p >= scalar(0)) ? psi[own[j]] : psi[nbr[j]]);
+    phiBD[j] = p * ((p >= scalar(0)) ? psi[own[j]] : cyclicNbrValue(nbr, psi, j));
 }
 
 // THE SETUP, one gather per cell: the neighbourhood extrema, sumPhiBD, sumPhip and mSumPhim, then the
@@ -91,7 +91,7 @@ __global__ void setupKernel(
     // the COUPLED faces, which are in none of the three lists above: the device mesh keeps a cyclic
     // patch out of its boundary gather entirely (device_mesh.cuh:41-44)
     const label* __restrict__ ifCellStart, const label* __restrict__ ifPerm,
-    const label* __restrict__ ifNbrCell,
+    CyclicNbr ifNbr,
     const scalar* __restrict__ ifPhiBD, const scalar* __restrict__ ifPhiCorr,
     scalar rDeltaT, scalar extremaCoeff, scalar boundaryDeltaExtremaCoeff, scalar smoothLimiter,
     scalar* __restrict__ psiMaxn, scalar* __restrict__ psiMinn,
@@ -140,7 +140,7 @@ __global__ void setupKernel(
         for (int k = ifCellStart[c]; k < ifCellStart[c + 1]; ++k)
         {
             const int j = ifPerm[k];
-            const scalar pn = psi[ifNbrCell[j]];
+            const scalar pn = cyclicNbrValue(ifNbr, psi, j);
             mx = fmax(mx, pn);
             mn = fmin(mn, pn);
             sBD += ifPhiBD[j];
@@ -374,7 +374,7 @@ __global__ void setupCorrKernel(
     // (note B), so a coupled face brings its neighbour's psi to the extrema and its phiCorr to the
     // budgets, and nothing else -- mules_cpp.cu:534-556, CMULESTemplates.C:327.
     const label*  __restrict__ ifCellStart, const label* __restrict__ ifPerm,
-    const label*  __restrict__ ifNbrCell,   const scalar* __restrict__ ifPhiCorr,
+    CyclicNbr ifNbr,   const scalar* __restrict__ ifPhiCorr,
     const scalar* __restrict__ V,
     const scalar* __restrict__ rho,
     const scalar* __restrict__ Sp,  const scalar* __restrict__ Su,
@@ -416,7 +416,7 @@ __global__ void setupCorrKernel(
         for (int k = ifCellStart[c]; k < ifCellStart[c + 1]; ++k)
         {
             const int j = ifPerm[k];
-            const scalar pn = psi[ifNbrCell[j]];
+            const scalar pn = cyclicNbrValue(ifNbr, psi, j);
             mx = fmax(mx, pn);
             mn = fmin(mn, pn);
             const scalar pc = ifPhiCorr[j];
@@ -632,7 +632,7 @@ void deviceMulesDonorFluxCyclic(
     if (cyc.n == 0) { phiBDIf.resize(0); return; }
     phiBDIf.resize(static_cast<std::size_t>(cyc.n));
     donorCyclicKernel<<<nBlocks(cyc.n), TPB>>>(
-        cyc.ownCell.data(), cyc.nbrCell.data(), cyc.phi.data(), psi.data(), cyc.n, phiBDIf.data());
+        cyc.ownCell.data(), cyc.nbr(), cyc.phi.data(), psi.data(), cyc.n, phiBDIf.data());
     ckM(cudaGetLastError(), "donor flux, interface");
 }
 
@@ -710,7 +710,7 @@ void deviceMulesLimiter(
         f.Vsc ? f.Vsc->data() : dm.V.data(), f.Vsc0 ? f.Vsc0->data() : nullptr,
         f.rho, f.rhoOld, f.Sp, f.Su, f.psiMax, f.psiMin,
         nIf2 ? cyc->ifCellStart.data() : nullptr, nIf2 ? cyc->ifPerm.data() : nullptr,
-        nIf2 ? cyc->nbrCell.data() : nullptr,
+        nIf2 ? cyc->nbr() : CyclicNbr{},
         nIf2 ? phiBDIf->data() : nullptr, nIf2 ? phiCorrIf->data() : nullptr,
         rDeltaT, c.extremaCoeff, boundaryDeltaExtremaCoeff, c.smoothLimiter,
         psiMaxn.data(), psiMinn.data(), sumPhip.data(), mSumPhim.data());
@@ -825,7 +825,7 @@ void deviceMulesLimiterCorr(
         bndFlag.data(), bndFixesValue.data(),
         psi.data(), psiBndValue.data(), phiCorrInt.data(), phiCorrBnd.data(),
         nIfC ? cyc->ifCellStart.data() : nullptr, nIfC ? cyc->ifPerm.data() : nullptr,
-        nIfC ? cyc->nbrCell.data() : nullptr,     nIfC ? phiCorrIf->data() : nullptr,
+        nIfC ? cyc->nbr() : CyclicNbr{},     nIfC ? phiCorrIf->data() : nullptr,
         f.Vsc ? f.Vsc->data() : dm.V.data(), f.rho, f.Sp, f.Su, f.psiMax, f.psiMin,
         rDeltaT, f.rDeltaT, c.extremaCoeff, boundaryDelta, c.smoothLimiter,
         psiMaxn.data(), psiMinn.data(), sumPhip.data(), mSumPhim.data());

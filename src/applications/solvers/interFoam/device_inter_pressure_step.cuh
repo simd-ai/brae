@@ -105,6 +105,11 @@ struct DeviceInterPressureInput
     // flux this step leaves behind. Null when the caller does not want them.
     DeviceBuffer<scalar>* phiAbsIntOut = nullptr;
     DeviceBuffer<scalar>* phiAbsBndOut = nullptr;
+    // ...and both again ON THE PAIR's faces, which are in neither face array: the mesh flux makeRelative
+    // subtracts there, and the absolute flux correctUf reads there. A moving mesh with a pair needs the
+    // first; refused by name without it.
+    const DeviceBuffer<scalar>* meshPhiIf = nullptr;
+    DeviceBuffer<scalar>* phiAbsIfOut = nullptr;
 
     // the face fields the buoyancy flux is built from, over the mesh's FULL face array
     const DeviceBuffer<scalar>* stf       = nullptr;   // surfaceTensionForce

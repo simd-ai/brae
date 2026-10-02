@@ -58,7 +58,7 @@ __global__ void nHatfInternalKernel(
 // cyclic: it walks the alphaContactAngle patches, and a periodic pair is not one.
 __global__ void nHatfCyclicKernel(
     const label*  __restrict__ own,
-    const label*  __restrict__ nbr,
+    CyclicNbr nbr,
     const scalar* __restrict__ w,
     const scalar* __restrict__ Sfx,
     const scalar* __restrict__ Sfy,
@@ -72,11 +72,11 @@ __global__ void nHatfCyclicKernel(
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
 
-    const label o = own[j], nb = nbr[j];
+    const label o = own[j];
     const scalar wf = w[j], wn = scalar(1) - wf;
-    const scalar fx = wf*gx[o] + wn*gx[nb];
-    const scalar fy = wf*gy[o] + wn*gy[nb];
-    const scalar fz = wf*gz[o] + wn*gz[nb];
+    const scalar fx = wf*gx[o] + wn*cyclicNbrValue(nbr, gx, j);
+    const scalar fy = wf*gy[o] + wn*cyclicNbrValue(nbr, gy, j);
+    const scalar fz = wf*gz[o] + wn*cyclicNbrValue(nbr, gz, j);
 
     const scalar m = sqrt(fx*fx + fy*fy + fz*fz);
     const scalar s = scalar(1) / (m + deltaN);
@@ -177,7 +177,7 @@ void deviceInterfaceNormalFluxCyclic(
     if (cyc.n == 0) { nHatfIf.resize(0); return; }
     nHatfIf.resize(static_cast<std::size_t>(cyc.n));
     nHatfCyclicKernel<<<nBlocks(cyc.n), TPB>>>(
-        cyc.ownCell.data(), cyc.nbrCell.data(), cyc.weights.data(),
+        cyc.ownCell.data(), cyc.nbr(), cyc.weights.data(),
         cyc.Sfx.data(), cyc.Sfy.data(), cyc.Sfz.data(),
         gx.data(), gy.data(), gz.data(), cyc.n, deltaN, nHatfIf.data());
     ckIP(cudaGetLastError(), "nHatf, interface");

@@ -96,6 +96,13 @@ struct DeviceInterTurbulence
     // the old-old level of each field, rotated once per time index as storeOldTimes does
     DeviceCnDdt0 cnDdt0K;
     DeviceCnDdt0 cnDdt0Eps;
+    // ...and what OpenFOAM WRITES of that state beside the cells (kEpsilon alone, under CrankNicolson): the
+    // two fields' patch values at the old and the old-old level, over the device's boundary faces, the
+    // operands of ddt0's patch half, and whether a cold start's old level is still to be created inside
+    // the first call (InterTurbulenceCrankNicolson has the same set on the host)
+    DeviceBuffer<scalar> kOldBnd, epsOldBnd, cnKOOBnd, cnEpsOOBnd;
+    DeviceCnDdt0PatchOperands cnPatchK, cnPatchEps;
+    bool cnOldLevelPending = false;
     // psi.oldTime() FOR THE CLOSURE, per TIME INDEX -- the device twin of InterTurbulence::kOldStep. These
     // were cnKEntry/cnEpsEntry, filled only under CrankNicolson; every ddt scheme reads the old-TIME level
     // and only the old-OLD level (cnKOO/cnEpsOO) is CN's, so they are advanced unconditionally now.
@@ -199,8 +206,12 @@ struct DeviceInterTurbulenceStepInput
     // closure has carried the pair since it was ported (InterTurbulenceStepInput::V0/meshPhi, gated on
     // waves/waveMakerPiston `pistonSST`); the device arm refused a moving RAS closure until it did too.
     const DeviceBuffer<scalar>* V0 = nullptr;
+    // ...and mesh().V00(), for CrankNicolson's moving branch (kEpsilon alone carries it)
+    const DeviceBuffer<scalar>* V00 = nullptr;
     const DeviceBuffer<scalar>* meshPhiInt = nullptr;
     const DeviceBuffer<scalar>* meshPhiBnd = nullptr;
+    // ...and on the pair's faces, for the same divergence (kEpsilon alone carries it)
+    const DeviceBuffer<scalar>* meshPhiIf = nullptr;
     // every solve of the run, in order, for the solver-log gate
     std::vector<cpu::interFoam::LinearSolveRecord>* epsilonLog = nullptr;
     std::vector<cpu::interFoam::LinearSolveRecord>* kLog = nullptr;

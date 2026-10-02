@@ -114,6 +114,13 @@
 // `-device` RUNS the pair too -- validation/interFoamCyclic holds both arms against OpenFOAM
 // (tests/interfoam_cyclic_vs_openfoam.sh), and device_baffle/device_baffle_SST/device_les_cyclic hold
 // the baffle. What is refused across a pair is refused on both paths, by the list above.
+// A cyclicAMI PAIR runs on `-device` as well, on a static mesh and on one that MOVES: the pair's weighted
+// stencil rides beside its faces (DeviceCyclic's CyclicNbr) and every kernel reads the neighbour the
+// host's patchNeighbourValue does; after a move the host stage recomputes the AMI and the device takes
+// the pair again in place (refreshDeviceCyclicAfterMove), with the mesh flux and the absolute flux on
+// its faces. tests/interfoam_ami_device/ holds RAS/mixerVesselAMI against OpenFOAM, static and rotating,
+// nine controls beside it, and the write gate holds the tutorial as shipped on both arms. Still refused
+// on the device across a moving mesh: a plain cyclic and a cyclicACMI.
 //
 // AND LES kEqn, on the host: the uniform lineage, with the cubeRootVol or smooth filter width, on an
 // axisymmetric wedge -- whose host matrix coefficients and gradient patch value it took to get there.
@@ -268,14 +275,11 @@ int main(int argc, char** argv)
         // carries the pair -- its matrices, its fluxes, MULES and nHatf, each gated on its own -- so
         // withholding the coupling here would refuse a case the loop can run.
         attachCyclicCoupling(patches, m, g);
-        if (!onDevice)
-        {
-            // a cyclicAMI is the host's only: the device loop is handed it uncoupled, which is what
-            // the case-build refusal keys on, by name
-            // the BOUNDARY instance: the AMI entries are read from polyMesh/boundary, which polyMesh
-            // resolves separately from the faces and never older than them
-            amiPairs = cpu::cyclicAMIFvPatch::setup(mi.boundaryDir(caseDir), m, g, patches);
-        }
+        // A cyclicAMI IS COUPLED ON BOTH PATHS: the device loop carries the pair's weighted stencil
+        // beside its faces (DeviceCyclic's CyclicNbr) and reads the neighbour the host does.
+        // the BOUNDARY instance: the AMI entries are read from polyMesh/boundary, which polyMesh
+        // resolves separately from the faces and never older than them
+        amiPairs = cpu::cyclicAMIFvPatch::setup(mi.boundaryDir(caseDir), m, g, patches);
         // ...handed to the host loop mutable as well, for a case whose mesh moves (MutableMesh)
         MutableMesh mutableMesh;
         mutableMesh.m = &m;

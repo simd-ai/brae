@@ -4,6 +4,7 @@
 #include "device_mesh.cuh"
 #include "device_ldu.cuh"
 #include "device_simple.cuh"
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
@@ -84,7 +85,7 @@ __global__ void ddtCorrInternalKernel(
 // (inter_peqn_cpp.cu:252-283). fvc::dotInterpolate(Sf, U.oldTime()) there is the two CELLS' old
 // velocities interpolated, never a stored patch value -- which is why this is the internal form.
 __global__ void ddtCorrCyclicKernel(
-    const label* __restrict__ own, const label* __restrict__ nbr, const scalar* __restrict__ w,
+    const label* __restrict__ own, CyclicNbr nbr, const scalar* __restrict__ w,
     const scalar* __restrict__ Sfx, const scalar* __restrict__ Sfy, const scalar* __restrict__ Sfz,
     const scalar* __restrict__ phiOld,
     const scalar* __restrict__ uox, const scalar* __restrict__ uoy, const scalar* __restrict__ uoz,
@@ -92,11 +93,11 @@ __global__ void ddtCorrCyclicKernel(
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
-    const int o = own[j], nb = nbr[j];
+    const int o = own[j];
     const scalar wf = w[j], wm = scalar(1) - w[j];
-    const scalar ux = wf*uox[o] + wm*uox[nb];
-    const scalar uy = wf*uoy[o] + wm*uoy[nb];
-    const scalar uz = wf*uoz[o] + wm*uoz[nb];
+    const scalar ux = wf*uox[o] + wm*cyclicNbrValue(nbr, uox, j);
+    const scalar uy = wf*uoy[o] + wm*cyclicNbrValue(nbr, uoy, j);
+    const scalar uz = wf*uoz[o] + wm*cyclicNbrValue(nbr, uoz, j);
     const scalar phiCorr = phiOld[j] - (ux*Sfx[j] + uy*Sfy[j] + uz*Sfz[j]);
     out[j] = ddtCoeff(phiCorr, phiOld[j], given) * rDeltaT * phiCorr;
 }
@@ -317,11 +318,18 @@ void deviceInterDdtCorrCyclic(
             "phi.oldTime() with the flux of U.oldTime(), so the caller must snapshot the pair's flux "
             "at the top of the step, before the pressure corrector rewrites it.");
     ddtCorrCyclicKernel<<<nBlocks(cyc.n), TPB>>>(
-        cyc.ownCell.data(), cyc.nbrCell.data(), cyc.weights.data(),
+        cyc.ownCell.data(), cyc.nbr(), cyc.weights.data(),
         cyc.Sfx.data(), cyc.Sfy.data(), cyc.Sfz.data(), phiOldIf.data(),
         UOldX.data(), UOldY.data(), UOldZ.data(), cyc.n, ddtPhiCoeff,
         scalar(1)/deltaT, outIf.data());
     ckP(cudaGetLastError(), "ddtCorr, interface");
+    // ...and none at all across a cyclicAMI: the coupling coefficient is zero there
+    // (inter_peqn_cpp.cu:297-305). The host measured what a live one costs on RAS/mixerVesselAMI,
+    // U 8.7e-03 after 100 steps.
+    if (std::getenv("BRAE_CONTROL_DEVICE_AMI_DDTCORR") == nullptr)
+    {
+        deviceCyclicZeroOnAmi(cyc, outIf);
+    }
 }
 
 

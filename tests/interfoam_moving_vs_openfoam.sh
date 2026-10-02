@@ -665,7 +665,10 @@ if not profile.startswith('closed'):
         # the ddt scheme, so BOTH codes run the same case under Euler.
         assert re.search(r'default\s+CrankNicolson 0\.5;', t), \
             'floatingObject no longer ships CrankNicolson 0.5'
-        t = re.sub(r'default\s+CrankNicolson 0\.5;', 'default         Euler;', t)
+        # `floatingShipped` keeps the tutorial's own scheme: the case as shipped, the body released -- kEpsilon's
+        # fvm::ddt on the scheme's MOVING branch, on both arms
+        if not profile.startswith('floatingShipped'):
+            t = re.sub(r'default\s+CrankNicolson 0\.5;', 'default         Euler;', t)
         # ...and WRITTEN BACK. Everything else this block does to fvSchemes is an assertion, so the
         # file was never reopened for writing and a substitution here would have been thrown away --
         # which it was, and OpenFOAM ran the tutorial's own CrankNicolson while the gate said Euler.
@@ -1052,6 +1055,8 @@ stage multiFlapStatic   waves/waveMakerMultiPaddleFlap   0.01 30 multiFlapStatic
 stage multiFlap         waves/waveMakerMultiPaddleFlap   0.01 30 multiFlap         || rc=1
 stage floatingStatic ../RAS/floatingObject 5e-3 10 floatingStatic || rc=1
 stage floating       ../RAS/floatingObject 5e-3 10 floating       || rc=1
+stage floatingShippedStatic ../RAS/floatingObject 5e-3 5 floatingShippedStatic || rc=1
+stage floatingShipped       ../RAS/floatingObject 5e-3 5 floatingShipped       || rc=1
 stage closedRef1e5   damBreak/damBreak 0.001 20 closedDamBreakRef || rc=1
 stage closedDamBreak damBreak/damBreak 0.001 20 closedDamBreak    || rc=1
 stage closedDamBreakInitU damBreak/damBreak 0.001 20 closedDamBreakInitU || rc=1
@@ -1139,6 +1144,9 @@ gate multiFlap      0.01  30 multiFlap      multiFlapStatic   || rc=1
 # the mesh from the load on its own patches, with the joint state as the second oracle. Control: the
 # same tank with the mesh held still.
 gate floating       5e-3  10 floating       floatingStatic || rc=1
+# ...and the same body under the tutorial's own CrankNicolson 0.5, five steps: the closure's fvm::ddt on
+# the scheme's moving branch (V0 and V00), which the device kEpsilon refused until it carried it
+gate floatingShipped     5e-3   5 floatingShipped     floatingShippedStatic || rc=1
 gate closedDamBreak 0.001 20 closedDamBreak closedRef1e5 || rc=1
 gate closedDamBreakInitU 0.001 20 closedDamBreakInitU closedDamBreak || rc=1
 # adjustPhi's SCALING half, on both arms: the dam's atmosphere left open to an adjustable outflow under
@@ -1191,6 +1199,9 @@ deviceControl solitaryOuterCN BRAE_CONTROL_CN_PHIOLD_PREV=1 3 0.03 solitaryShort
 #   BRAE_CONTROL_DEVICE_BODY_STALE -- the body's load from the host copies of nut and U as they stand.
 deviceControl floating BRAE_CONTROL_DEVICE_KEPS_STATIC=1 10 0.05 floatingStatic
 deviceControl floating BRAE_CONTROL_DEVICE_BODY_STALE=1 10 0.05 floatingStatic
+#   BRAE_CONTROL_DEVICE_CN_CLOSURE_STATIC on floatingShipped -- the device closure's CrankNicolson ddt on the static
+#   branch (no V0, no V00), which is what it would run had the refusal simply been deleted
+deviceControl floatingShipped BRAE_CONTROL_DEVICE_CN_CLOSURE_STATIC=1 5 0.025 floatingShippedStatic
 
 echo "interfoam_moving_vs_openfoam: rc $rc"
 exit $rc

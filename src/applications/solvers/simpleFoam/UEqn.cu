@@ -5,6 +5,7 @@
 #include "device_divdevreff.cuh"
 #include "device_kepsilon.cuh"   // deviceGradUShared: grad(U) once per U state (item 65)
 #include "device_simple.cuh"
+#include <cstdlib>
 #include <cmath>
 #include <stdexcept>
 
@@ -204,6 +205,27 @@ void assembleUEqn(
                 deviceCopy(gyc[k], gm.gy[k]);
                 deviceCopy(gzc[k], gm.gz[k]);
                 addPairToGrad(k, gxc[k], gyc[k], gzc[k]);
+                // THE CASE'S grad(U) ENTRY, limiter included: correctedSnGrad<vector>::correction is
+                // fullGradCorrection, which resolves mesh.gradScheme("grad(U)") (correctedSnGrad.C:52-55,
+                // and the host's note in linearViscousStress_cpp.cu). This site took the unlimited
+                // gradient under a cellLimited entry. MEASURED on RAS/mixerVesselAMI's first step
+                // (`cellLimited Gauss linear 1`, `limited corrected 0.33`), host against device:
+                // U 2.7e-06 with the unlimited gradient here, 4.2e-13 with the entry made `Gauss linear`.
+                if (in.interOrder && in.gradUSchemeLimitK > 0.0 && !in.gradUSchemeLeastSq && !in.gradUGivenMemo
+                 && std::getenv("BRAE_CONTROL_DEVICE_NONORTH_GRADU_UNLIMITED") == nullptr)
+                {
+                    DeviceBuffer<scalar> ubv, nbrOut;
+                    const DeviceBuffer<scalar>* ub = in.UbStored ? in.UbStored[k] : nullptr;
+                    if (!ub)
+                    {
+                        deviceBCValue(dbU.comp[k], *U[k], ubv);
+                        ub = &ubv;
+                    }
+                    CellLimitInterface ifs[1];
+                    const int nIfs = pairLimitInterface(k, nbrOut, ifs);
+                    deviceCellLimitGrad(dm, *U[k], *ub, gxc[k], gyc[k], gzc[k], in.gradUSchemeLimitK,
+                                        nIfs > 0 ? ifs : nullptr, nIfs);
+                }
             }
             if (in.snGradLimitCoeff > 0.0)
             {
@@ -227,6 +249,23 @@ void assembleUEqn(
                     DeviceBuffer<scalar> lc;
                     deviceLaplacianCorr(dm, *in.nuEffFace, gxc[k], gyc[k], gzc[k], lc);
                     deviceAxpy(-1.0, lc, M.source[k]);
+                }
+            }
+            // ...AND ON THE PAIR'S FACES (fvm.cuh, laplacianCorrFluxCoupled), which the two calls above
+            // do not reach: their face arrays are the internal faces. Zero on an orthogonal cyclic, whose
+            // correction vectors are; live across a cyclicAMI. MEASURED on RAS/mixerVesselAMI's first
+            // step, host against device without it (and without the pressure's): U 2.8e-03.
+            if (in.interOrder && in.cyc && in.cyc->n > 0
+             && std::getenv("BRAE_CONTROL_DEVICE_PAIR_NO_NONORTH") == nullptr)
+            {
+                DeviceBuffer<scalar> ffcIf[3];
+                deviceCyclicLapCorrFluxVec(*in.cyc, *in.nuEffCell, U, gxc, gyc, gzc,
+                                           in.snGradLimitCoeff, ffcIf);
+                for (int k = 0; k < 3; ++k)
+                {
+                    // the host's `source += corr` with the pair's `src[own] += ffcb` (linearViscousStress_cpp.cu;
+                    // the internal faces reach the same sign through deviceFaceDivSource's negation)
+                    deviceCyclicAddToOwner(*in.cyc, ffcIf[k], scalar(1), M.source[k]);
                 }
             }
         }
@@ -401,7 +440,8 @@ void assembleUEqn(
                         "their own volumes. The caller gave V0 alone.");
                 DeviceBuffer<scalar>* src[3] = {&M.source[0], &M.source[1], &M.source[2]};
                 deviceCnFvmDdt(*in.ddtCn, *in.ddtCnDdt0, in.ddtRho, in.ddtRhoOld, in.ddtRhoOO, 3,
-                               in.ddtUOld, in.ddtUOO, dm.V, M.diag, src, in.ddtV0, in.ddtV00);
+                               in.ddtUOld, in.ddtUOO, dm.V, M.diag, src, in.ddtV0, in.ddtV00,
+                               in.ddtCnPatch);
             }
             else if (in.ddtRDeltaT)
             {

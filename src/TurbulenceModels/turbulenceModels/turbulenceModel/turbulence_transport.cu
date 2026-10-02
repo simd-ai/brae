@@ -279,11 +279,16 @@ void assembleScalarTransport(
             // the two sides' FIELD values and the delta, per interface entry: the limiter's inputs
             {
                 const std::vector<label> own = sc.cyc->ownCell.host();
-                const std::vector<label> nbr = sc.cyc->nbrCell.host();
                 const std::vector<scalar> fh = field.host();
-                std::vector<scalar> fo(own.size()), fn(own.size());
+                std::vector<scalar> fo(own.size());
                 for (std::size_t j = 0; j < own.size(); ++j)
-                { fo[j] = fh[own[j]]; fn[j] = fh[nbr[j]]; }
+                {
+                    fo[j] = fh[own[j]];
+                }
+                // the neighbour through the pair's own accessor, so the dump is right across an AMI
+                DeviceBuffer<scalar> fnDev, none;
+                deviceCyclicNbrValue(*sc.cyc, field, none, none, none, 0, fnDev);
+                const std::vector<scalar> fn = fnDev.host();
                 sc.dump->scalars(sc.dump->ctx, "CycFOwn", fo);
                 sc.dump->scalars(sc.dump->ctx, "CycFNbr", fn);
                 sc.dump->scalars(sc.dump->ctx, "CycDX", sc.cyc->dX.host());
@@ -318,6 +323,15 @@ void assembleScalarTransport(
             else
             {
                 deviceLaplacianCorr(dm, gammaFace, g.gx, g.gy, g.gz, corr);
+            }
+            // ...AND ON THE PAIR'S FACES (fvm.cuh, laplacianCorrFluxCoupled), in the sign both branches
+            // above leave `corr` in: the host's `src[own] += ffc`, negated (lapCorrGatherKernel)
+            if (sc.cyc && sc.cyc->n > 0 && std::getenv("BRAE_CONTROL_DEVICE_PAIR_NO_NONORTH") == nullptr)
+            {
+                DeviceBuffer<scalar> ffcIf;
+                deviceCyclicLapCorrFlux(*sc.cyc, *sc.gammaCell, field, g.gx, g.gy, g.gz,
+                                        sc.snGradLimitCoeff, nullptr, ffcIf);
+                deviceCyclicAddToOwner(*sc.cyc, ffcIf, scalar(-1), corr);
             }
             // deviceLaplacianCorr returns -V*div(faceFluxCorr) -- already negated -- and the laplacian
             // itself enters this equation with -1, so its explicit source does too. The two signs
@@ -459,10 +473,23 @@ void solveScalarEqn(
     // operators -- the defect the pressure step's own view note records.
     if (cyc && cyc->n > 0)
     {
-        A.nCyc = cyc->n;
-        A.cycOwn = cyc->ownCell.data();
-        A.cycNbr = cyc->nbrCell.data();
-        A.cycCoeff = cyc->ifCoeff.data();
+        // one neighbour cell per face, or a cyclicAMI's weighted stencil (deviceLduViewPair)
+        if (cyc->stencil)
+        {
+            A.nAmi = cyc->n;
+            A.amiOwn = cyc->ownCell.data();
+            A.amiOff = cyc->stOff.data();
+            A.amiNbr = cyc->stCell.data();
+            A.amiW = cyc->stW.data();
+            A.amiIfc = cyc->ifCoeff.data();
+        }
+        else
+        {
+            A.nCyc = cyc->n;
+            A.cycOwn = cyc->ownCell.data();
+            A.cycNbr = cyc->nbrCell.data();
+            A.cycCoeff = cyc->ifCoeff.data();
+        }
     }
 
     // Instrument (BRAE_STAGE_DUMP_DIR, see correct()): the FOLDED system as the solver sees it -- diag

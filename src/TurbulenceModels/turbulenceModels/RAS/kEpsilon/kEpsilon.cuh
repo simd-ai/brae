@@ -110,8 +110,14 @@ struct KEpsilonInput
     // on the current volumes and the relative flux with nothing said: MEASURED on RAS/floatingObject's
     // released body, one step, device against host -- k 5.8e-06, nut 3.4e-06, epsilon 6.5e-07.
     const DeviceBuffer<scalar>* V0         = nullptr;
+    // ...and mesh().V00(), which CrankNicolson's moving branch weights the old-old level by
+    // (CrankNicolsonDdtScheme.C:862-893). Required with V0 under `cn`; unread otherwise.
+    const DeviceBuffer<scalar>* V00        = nullptr;
     const DeviceBuffer<scalar>* meshPhiInt = nullptr;
     const DeviceBuffer<scalar>* meshPhiBnd = nullptr;
+    // ...and the mesh flux on a coupled pair's faces, which divU's absolute flux takes like any other
+    // face's. Null on a static mesh or a mesh with no pair; a moving mesh WITH a pair is refused without it.
+    const DeviceBuffer<scalar>* meshPhiIf  = nullptr;
     const DeviceBuffer<scalar>* nuCell     = nullptr;    // mu(T)/rho per cell.        REQUIRED.
     const DeviceBuffer<scalar>* nuBndFace  = nullptr;    // mu_b/rho_b per bnd face.   REQUIRED.
     const DeviceBuffer<scalar>* nuWallFace = nullptr;    // the same, in WALL-face order
@@ -183,6 +189,14 @@ struct KEpsilonInput
     const cpu::fv::CrankNicolsonClock* cn = nullptr;
     DeviceCnDdt0*               cnDdt0Eps = nullptr;
     DeviceCnDdt0*               cnDdt0K   = nullptr;
+    // ...and their patch halves, for a caller that writes the two fields (null: unkept)
+    const DeviceCnDdt0PatchOperands* cnPatchEps = nullptr;
+    const DeviceCnDdt0PatchOperands* cnPatchK   = nullptr;
+    // A COLD START's epsilon.oldTime(), CREATED inside the first call after the wall function's update
+    // (the host's Compressible::epsOldCreated, with the measurement): the cells and the boundary faces as
+    // they stand there, handed back. Null on every later call.
+    DeviceBuffer<scalar>*       epsOldCreated    = nullptr;
+    DeviceBuffer<scalar>*       epsOldBndCreated = nullptr;
     const DeviceBuffer<scalar>* rhoOOCell = nullptr;
     const DeviceBuffer<scalar>* epsOO     = nullptr;
     const DeviceBuffer<scalar>* kOO       = nullptr;

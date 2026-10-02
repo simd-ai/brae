@@ -265,6 +265,9 @@ scalar deviceInterPressureStep(
     // p_rgh's jump on the pair, refreshed by the hook at every assembly; empty = no jump there
     DeviceBuffer<scalar> cycJump;
     DeviceBuffer<scalar> ffc;
+    // ...and the pair's share of it, kept for the flux after the solve as `ffc` is
+    DeviceBuffer<scalar> ffcIf;
+    const bool noPairNonOrth = std::getenv("BRAE_CONTROL_DEVICE_PAIR_NO_NONORTH") != nullptr;
     DeviceSolverPerf perf;
     for (int pass = 0; pass <= in.nNonOrthogonalCorrectors; ++pass)
     {
@@ -331,6 +334,17 @@ scalar deviceInterPressureStep(
                 deviceLaplacianCorrFlux(dm, rAUfInt, gx, gy, gz, ffc);
             }
             deviceFaceDivSource(dm, ffc, corrSource);
+            // ...AND ON THE PAIR'S FACES (fvm.cuh, laplacianCorrFluxCoupled; inter_peqn_cpp.cu:949-953):
+            // the source takes them like any owner-side face -- NEGATED, as deviceFaceDivSource leaves
+            // the internal faces' (the host's `src[own] += ffc`, subtracted) -- and the flux below
+            // takes them back
+            if (havePair && !noPairNonOrth)
+            {
+                const bool jumpHere = static_cast<int>(cycJump.size()) == in.cyc->n;
+                deviceCyclicLapCorrFlux(*in.cyc, rAU, p_rgh, gx, gy, gz, in.snGradLimitCoeff,
+                                        jumpHere ? &cycJump : nullptr, ffcIf);
+                deviceCyclicAddToOwner(*in.cyc, ffcIf, scalar(-1), corrSource);
+            }
             if (taps && pass == 0) deviceCopy(taps->nonOrthSource, corrSource);
         }
 
@@ -362,9 +376,8 @@ scalar deviceInterPressureStep(
         // Apsi[own] += ifCoeff*psi[nbr] (device_ldu.cuh:28-33). Without it the solve is a different
         // operator from the matrix that was assembled.
         const DeviceLduView A = (in.cyc && in.cyc->n > 0)
-            ? deviceLduViewCyclic(dm, diagC, P.upper, P.lower, in.cyc->n, in.cyc->ownCell.data(),
-                                  in.cyc->nbrCell.data(), in.cyc->ifCoeff.data(),
-                                  haveJump ? cycJump.data() : nullptr)
+            ? deviceLduViewPair(dm, diagC, P.upper, P.lower, *in.cyc,
+                                haveJump ? cycJump.data() : nullptr)
             : deviceLduView(dm, diagC, P.upper, P.lower);
         if (gamg)
         {
@@ -475,6 +488,12 @@ scalar deviceInterPressureStep(
         // than differenced back out of cyc->phi.
         DeviceBuffer<scalar> fluxIf;
         deviceCyclicPressureFlux(*in.cyc, p_rgh, fluxIf, jumpNow ? &cycJump : nullptr);
+        // fvMatrix::flux() adds faceFluxCorrection on the coupled patches too (fv_matrix_ops.cuh:66-70)
+        if (in.correctedLaplacian && static_cast<int>(ffcIf.size()) == in.cyc->n)
+        {
+            deviceAxpy(scalar(1), ffcIf, fluxIf);
+            deviceAxpy(scalar(-1), ffcIf, in.cyc->phi);
+        }
         ffIf.resize(static_cast<std::size_t>(in.cyc->n));
         subKernel<<<nBlocks(in.cyc->n), TPB>>>(phigIf.data(), fluxIf.data(), in.cyc->n, ffIf.data());
         ckS(cudaGetLastError(), "phig - flux, interface");
@@ -497,6 +516,7 @@ scalar deviceInterPressureStep(
     // driver makes that call -- and it must not read the flux this step leaves behind.
     if (in.phiAbsIntOut) deviceCopy(*in.phiAbsIntOut, phiInt);
     if (in.phiAbsBndOut) deviceCopy(*in.phiAbsBndOut, phiBnd);
+    if (in.phiAbsIfOut && havePair) deviceCopy(*in.phiAbsIfOut, in.cyc->phi);
 
     // fvc::makeRelative(phi, U) ON A MOVING MESH -- phi -= meshPhi, fvcMeshPhi.C:76, at the point the
     // host reference does it (inter_peqn_cpp.cu:980): after the velocity correction and before p is
@@ -520,6 +540,19 @@ scalar deviceInterPressureStep(
             subKernel<<<nBlocks(nBf), TPB>>>(phiBnd.data(), in.meshPhiAll->data() + nIf, nBf,
                                              phiBnd.data());
             ckS(cudaGetLastError(), "makeRelative(phi), boundary");
+        }
+        // ...and on the PAIR, whose faces move with the mesh like any other: a cyclicAMI's rotor side
+        // sweeps a volume wherever the snapped surface is not the surface of revolution it approximates
+        if (havePair)
+        {
+            if (!in.meshPhiIf || static_cast<int>(in.meshPhiIf->size()) != in.cyc->n)
+                throw std::runtime_error(
+                    "brae interFoam device pEqn: a moving mesh with a coupled pair and no mesh flux on the "
+                    "pair's faces. fvc::makeRelative subtracts it there as on every other face.");
+            if (std::getenv("BRAE_CONTROL_DEVICE_PAIR_PHI_ABSOLUTE") == nullptr)
+            {
+                deviceAxpy(scalar(-1), *in.meshPhiIf, in.cyc->phi);
+            }
         }
     }
 

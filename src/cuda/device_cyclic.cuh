@@ -10,18 +10,76 @@
 // Translational only (R = I): scalars and vector components couple with identity transform. Rotational = Phase 1.
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
+#include "device_ldu.cuh"
 #include "device_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "interface/cyclic_interface.cuh"
 #include <algorithm>
 #include <map>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace brae {
 
+// THE NEIGHBOUR OF AN INTERFACE FACE, as a kernel reads it. Across a cyclic that is one cell; across a
+// cyclicAMI it is the AMI's weighted sum over several (cyclicAMIFvPatchField::patchNeighbourField,
+// AMIInterpolation::weightedSum: the result starts at zero and takes += w*value, slot by slot -- the
+// order the host's patchNeighbourValue uses, so the two arms add the same numbers in the same order).
+// `off` null = one cell per face, cell[j]; else slots off[j] .. off[j+1] of (cell, w).
+struct CyclicNbr
+{
+    const label*  cell = nullptr;
+    const label*  off = nullptr;
+    const scalar* w = nullptr;
+};
+
+#ifdef __CUDACC__
+__host__ __device__ __forceinline__ scalar cyclicNbrValue(
+    const CyclicNbr& s,
+    const scalar* x,
+    int j)
+{
+    if (!s.off)
+    {
+        return x[s.cell[j]];
+    }
+    scalar r = 0;
+    for (label k = s.off[j]; k < s.off[j + 1]; ++k)
+    {
+        r += s.w[k]*x[s.cell[k]];
+    }
+    return r;
+}
+#endif
+
 struct DeviceCyclic
 {
+    // the AMI stencil, present when ANY pair of the mesh is a cyclicAMI: then EVERY face has slots (a
+    // cyclic's face one slot of weight 1, which adds 0 + 1*x and is the cell's value to the bit), and
+    // nbrCell is not to be read -- it holds -1 on the AMI faces.
+    bool stencil = false;
+    DeviceBuffer<label>  stOff, stCell;
+    DeviceBuffer<scalar> stW;
+    // 1 on a cyclicAMI's faces, 0 on a cyclic's: what OpenFOAM tests with isA<cyclicAMIFvPatch>, which
+    // a cyclicACMI patch is not (deviceCyclicZeroOnAmi)
+    DeviceBuffer<label>  stIsAmi;
+    CyclicNbr nbr() const
+    {
+        CyclicNbr s;
+        if (stencil)
+        {
+            s.cell = stCell.data();
+            s.off = stOff.data();
+            s.w = stW.data();
+        }
+        else
+        {
+            s.cell = nbrCell.data();
+        }
+        return s;
+    }
     int n = 0;                                  // total cyclic faces (BOTH sides of every pair)
     DeviceBuffer<label>  ownCell, nbrCell;      // this-side cell, periodic-neighbour cell
     DeviceBuffer<scalar> deltaCoeffs, weights, magSf;   // face geometry (own weight w; |Sf|; 1/|delta|)
@@ -149,6 +207,43 @@ inline DeviceCyclic buildDeviceCyclic(
     DeviceCyclic d;
     d.n = (int)oc.size();
     d.rotational = rot;
+    bool anyStencil = false;
+    for (const auto& c : cyclics)
+    {
+        anyStencil = anyStencil || !c.amiOffsets.empty();
+    }
+    if (anyStencil)
+    {
+        std::vector<label> so, sc, isAmi;
+        std::vector<scalar> sw;
+        so.push_back(0);
+        for (const auto& c : cyclics)
+        {
+            for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+            {
+                if (c.amiOffsets.empty())
+                {
+                    sc.push_back(c.nbrFaceCells[i]);
+                    sw.push_back(scalar(1));
+                }
+                else
+                {
+                    for (label k = c.amiOffsets[i]; k < c.amiOffsets[i + 1]; ++k)
+                    {
+                        sc.push_back(c.amiNbrCells[static_cast<std::size_t>(k)]);
+                        sw.push_back(c.amiWeights[static_cast<std::size_t>(k)]);
+                    }
+                }
+                so.push_back(static_cast<label>(sc.size()));
+                isAmi.push_back(c.amiOffsets.empty() ? label(0) : label(1));
+            }
+        }
+        d.stIsAmi.copyFrom(isAmi);
+        d.stencil = true;
+        d.stOff.copyFrom(so);
+        d.stCell.copyFrom(sc);
+        d.stW.copyFrom(sw);
+    }
     d.ownCell.copyFrom(oc);
     d.nbrCell.copyFrom(nc);
     d.deltaCoeffs.copyFrom(dc);
@@ -194,6 +289,54 @@ inline DeviceCyclic buildDeviceCyclic(
     return d;
 }
 
+// THE WHOLE PAIR, refreshed IN PLACE after the mesh has MOVED and a cyclicAMI's weights have been
+// recomputed on the moved points (cyclicAMIPolyPatch::initMovePoints marks the AMI out of date and the
+// next AMI() rebuilds it): every geometric array and the stencil, laid out again by buildDeviceCyclic from
+// the re-coupled patches. The face count and the owner cells cannot change under a move, so the per-cell
+// map, the twin map, phi and ifCoeff stay -- and every DeviceBuffer OBJECT stays where it is, which is
+// what the step's hooks hold pointers to.
+inline void refreshDeviceCyclicAfterMove(
+    DeviceCyclic& d,
+    const std::vector<CyclicInterface>& cyclics,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp)
+{
+    DeviceCyclic fresh = buildDeviceCyclic(cyclics, g, fvp);
+    if (fresh.n != d.n || fresh.stencil != d.stencil || fresh.rotational != d.rotational)
+    {
+        throw std::runtime_error(
+            "brae device cyclic: the pair's layout changed under a mesh move (" + std::to_string(fresh.n) +
+            " faces for " + std::to_string(d.n) + "). A move keeps the topology; this refresh cannot follow "
+            "a change of it.");
+    }
+    d.deltaCoeffs = std::move(fresh.deltaCoeffs);
+    d.orthDeltaCoeffs = std::move(fresh.orthDeltaCoeffs);
+    d.weights = std::move(fresh.weights);
+    d.magSf = std::move(fresh.magSf);
+    d.Sfx = std::move(fresh.Sfx);
+    d.Sfy = std::move(fresh.Sfy);
+    d.Sfz = std::move(fresh.Sfz);
+    d.dOwnX = std::move(fresh.dOwnX);
+    d.dOwnY = std::move(fresh.dOwnY);
+    d.dOwnZ = std::move(fresh.dOwnZ);
+    d.dNbrX = std::move(fresh.dNbrX);
+    d.dNbrY = std::move(fresh.dNbrY);
+    d.dNbrZ = std::move(fresh.dNbrZ);
+    d.corrVecX = std::move(fresh.corrVecX);
+    d.corrVecY = std::move(fresh.corrVecY);
+    d.corrVecZ = std::move(fresh.corrVecZ);
+    d.dX = std::move(fresh.dX);
+    d.dY = std::move(fresh.dY);
+    d.dZ = std::move(fresh.dZ);
+    if (d.stencil)
+    {
+        d.stOff = std::move(fresh.stOff);
+        d.stCell = std::move(fresh.stCell);
+        d.stW = std::move(fresh.stW);
+        d.stIsAmi = std::move(fresh.stIsAmi);
+    }
+}
+
 // THE PAIR'S FACE AREAS, refreshed IN PLACE after a cyclicACMI rescale: magSf and Sf, in the order
 // buildDeviceCyclic laid them out, and NOTHING ELSE. OpenFOAM's rescale (cyclicACMIPolyPatch::
 // scalePatchFaceAreas, cyclicACMIFvPatch::resetPatchAreas) moves the areas and leaves the cached
@@ -233,6 +376,75 @@ inline void refreshDeviceCyclicAreas(
     d.Sfy.copyFrom(sfy);
     d.Sfz.copyFrom(sfz);
 }
+
+// THE MATRIX VIEW WITH THE PAIR'S OFF-DIAGONAL, in whichever form the pair has: one neighbour cell per
+// face (deviceAmul's cyclic term) or the AMI's weighted stencil (its AMI term, cyclicAMIFvPatchField::
+// updateInterfaceMatrix). A jump across an AMI is not ported: refused by name.
+inline DeviceLduView deviceLduViewPair(
+    const DeviceMesh& dm,
+    const DeviceBuffer<scalar>& diag,
+    const DeviceBuffer<scalar>& upper,
+    const DeviceBuffer<scalar>& lower,
+    const DeviceCyclic& cyc,
+    const scalar* cycJump = nullptr,
+    // the matrix's OWN interface coefficient where the caller kept one: cyc.ifCoeff is scratch that the
+    // next assembly on the pair overwrites (MomentumMatrix::cycIfCoeff)
+    const DeviceBuffer<scalar>* coeff = nullptr)
+{
+    const scalar* ifc = (coeff && static_cast<int>(coeff->size()) == cyc.n) ? coeff->data()
+                                                                            : cyc.ifCoeff.data();
+    if (!cyc.stencil)
+    {
+        return deviceLduViewCyclic(dm, diag, upper, lower, cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(),
+                                   ifc, cycJump);
+    }
+    if (cycJump)
+    {
+        throw std::runtime_error(
+            "brae device: a jump condition (fixedJump, porousBafflePressure) on a mesh that carries a "
+            "cyclicAMI pair. The device applies a jump across a one-to-one pair only.");
+    }
+    return deviceLduViewAmi(dm, diag, upper, lower, cyc.n, cyc.ownCell.data(), cyc.stOff.data(),
+                            cyc.stCell.data(), cyc.stW.data(), ifc);
+}
+
+// THE EXPLICIT NON-ORTHOGONAL CORRECTION ON THE PAIR'S FACES (fvm.cuh, laplacianCorrFluxCoupled):
+//     ffc = gamma_f*magSf*lim*(corrVec & (w*grad[own] + (1 - w)*patchNeighbourField(grad)))
+// gamma_f the two cells' gamma on the pair's weights, and under `limited <k>` (0 < k < 1) the cap
+//     lim = min(k*|dc*(pnf - p_own)| / ((1 - k)*|corr| + 1e-15), 1)
+// against coupledFvPatchField::snGrad(nonOrthDeltaCoeffs), the neighbour value LESS the pair's jump.
+// A translational cyclic's correction vectors are zero on an orthogonal pair and this is then zero; a
+// cyclicAMI's are not. The vector form shares ONE limiter across the three components, as
+// limitedSnGrad takes mag() of the whole snGrad and of the whole correction.
+void deviceCyclicLapCorrFlux(
+    const DeviceCyclic&         cyc,
+    const DeviceBuffer<scalar>& gammaCell,
+    const DeviceBuffer<scalar>& psi,
+    const DeviceBuffer<scalar>& gx,
+    const DeviceBuffer<scalar>& gy,
+    const DeviceBuffer<scalar>& gz,
+    scalar                      limitCoeff,
+    const DeviceBuffer<scalar>* jump,
+    DeviceBuffer<scalar>&       ffcIf);
+void deviceCyclicLapCorrFluxVec(
+    const DeviceCyclic&         cyc,
+    const DeviceBuffer<scalar>& gammaCell,
+    const DeviceBuffer<scalar>* U[3],
+    const DeviceBuffer<scalar>* gx,
+    const DeviceBuffer<scalar>* gy,
+    const DeviceBuffer<scalar>* gz,
+    scalar                      limitCoeff,
+    DeviceBuffer<scalar>*       ffcIf);
+// cell[own] += sign*f, face by face: a pair face's share of an extensive (un-normalised) face sum
+void deviceCyclicAddToOwner(
+    const DeviceCyclic&         cyc,
+    const DeviceBuffer<scalar>& faceField,
+    scalar                      sign,
+    DeviceBuffer<scalar>&       cell);
+
+// A per-face field of the pair, zeroed on the cyclicAMI faces: ddtCorr's coupling coefficient is zero
+// on every cyclicAMI patch (ddtScheme.C:178-181, 259-262, isA<cyclicAMIFvPatch>). No-op without one.
+void deviceCyclicZeroOnAmi(const DeviceCyclic& cyc, DeviceBuffer<scalar>& faceField);
 
 // ifCoeff[j] = gammaFace_j * deltaCoeffs_j * magSf_j  with gammaFace = w*gamma[own] + (1-w)*gamma[nbr]
 // (the implicit Laplacian off-diagonal); ALSO folds the diagonal contribution diag[own] -= ifCoeff[j].

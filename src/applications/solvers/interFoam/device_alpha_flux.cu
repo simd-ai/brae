@@ -39,7 +39,7 @@ __global__ void faceFluxKernel(
 // arm does (alpha_eqn_cpp.cu:263-303). An uncoupled patch has no second cell and takes its patch value
 // instead, which is why the boundary kernels above carry no weights.
 __global__ void cyclicFaceFluxKernel(
-    const label*  __restrict__ own, const label* __restrict__ nbr,
+    const label*  __restrict__ own, CyclicNbr nbr,
     const scalar* __restrict__ phi, const scalar* __restrict__ w,
     const scalar* __restrict__ field,
     const scalar* __restrict__ gx, const scalar* __restrict__ gy, const scalar* __restrict__ gz,
@@ -49,9 +49,9 @@ __global__ void cyclicFaceFluxKernel(
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
-    const int P = own[j], N = nbr[j];
+    const int P = own[j];
     const scalar pb = phi[j];
-    const scalar vfN = field[N];
+    const scalar vfN = cyclicNbrValue(nbr, field, j);
     const scalar up = (pb >= scalar(0)) ? scalar(1) : scalar(0);
     scalar wf = w[j];
     if (scheme == 1)
@@ -61,8 +61,12 @@ __global__ void cyclicFaceFluxKernel(
     else if (scheme == 2)
     {
         // NVDTVD::r with the pair's delta, then vanLeer -- the shared limiter, not a second copy
-        const int U = (pb > scalar(0)) ? P : N;
-        const scalar gradcf = dx[j]*gx[U] + dy[j]*gy[U] + dz[j]*gz[U];
+        // the upwind side's gradient: the owner cell's, or the patch's neighbour field of it
+        const bool up0 = pb > scalar(0);
+        const scalar ugx = up0 ? gx[P] : cyclicNbrValue(nbr, gx, j);
+        const scalar ugy = up0 ? gy[P] : cyclicNbrValue(nbr, gy, j);
+        const scalar ugz = up0 ? gz[P] : cyclicNbrValue(nbr, gz, j);
+        const scalar gradcf = dx[j]*ugx + dy[j]*ugy + dz[j]*ugz;
         const scalar gradf = vfN - field[P];
         scalar r;
         if (fabs(gradcf) >= 1000.0 * fabs(gradf))
@@ -186,7 +190,7 @@ void deviceAlphaCyclicFluxWith(
     if (cyc.n == 0) { out.resize(0); return; }
     out.resize(static_cast<std::size_t>(cyc.n));
     cyclicFaceFluxKernel<<<nBlocks(cyc.n), TPB>>>(
-        cyc.ownCell.data(), cyc.nbrCell.data(), phi.data(), cyc.weights.data(), field.data(),
+        cyc.ownCell.data(), cyc.nbr(), phi.data(), cyc.weights.data(), field.data(),
         gx.data(), gy.data(), gz.data(), cyc.dX.data(), cyc.dY.data(), cyc.dZ.data(),
         scheme, cyc.n, out.data());
     cudaCheck(cudaGetLastError(), "alpha flux, interface");

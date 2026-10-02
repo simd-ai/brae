@@ -137,6 +137,9 @@ struct MomentumInput
     // levels of rho and U. All or none.
     const cpu::fv::CrankNicolsonClock* ddtCn = nullptr;
     DeviceCnDdt0*               ddtCnDdt0 = nullptr;
+    // ...and ddt0's patch half, for a caller that WRITES the field (DeviceCnDdt0PatchOperands). Null
+    // leaves the patches unkept, which is what every caller before the state writer passed.
+    const DeviceCnDdt0PatchOperands* ddtCnPatch = nullptr;
     const DeviceBuffer<scalar>* ddtRhoOO  = nullptr;
     const DeviceBuffer<scalar>* ddtUOO[3] = {nullptr, nullptr, nullptr};
     // ...and on a MOVING mesh under that scheme, mesh().V00() beside ddtV0: the volumes two steps

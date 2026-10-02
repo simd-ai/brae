@@ -161,7 +161,10 @@ RunReport runInterFoamDevice(
         // CrankNicolson's state on a moving mesh is written from the HOST loop's own objects (the ddt0
         // fields' patch values, the old levels' stored patch values); this loop keeps the cells on the
         // device and no patch half, so it names the files rather than reach its first write without them
-        if (writer->writesCrankNicolson())
+        // ...KEPT NOW: the patch half of each ddt0 field is advanced on the device beside its cells
+        // (DeviceCnDdt0PatchOperands) and comes down at a write time. BRAE_CONTROL_DEVICE_CN_WRITE_REFUSED=1
+        // puts the refusal back.
+        if (writer->writesCrankNicolson() && std::getenv("BRAE_CONTROL_DEVICE_CN_WRITE_REFUSED") != nullptr)
         {
             writer->refuseAtFirstWrite(
                 "ddt0(rho,U), ddtCorrDdt0(U), ddtCorrDdt0(Uf), meshPhiCN_0, U_0, V0",
@@ -236,8 +239,13 @@ RunReport runInterFoamDevice(
     // ...INCLUDING a cyclicACMI the caller has coupled as a coincident pair (cpu::cyclicACMI::setup):
     // on the mask-scaled areas it IS a cyclic, with one difference this loop has to honour -- MULES
     // does not sync its limiter across it (CyclicInterface::ami).
-    const std::vector<CyclicInterface> cyclics =
-        buildCyclicInterfaces(m, g, fvp, /*includeCoupledACMI=*/true);
+    // ...AND a cyclicAMI the caller has coupled (cpu::cyclicAMIFvPatch::setup): its faces meet their
+    // neighbours through the AMI's weighted stencil, which the DeviceCyclic carries beside the pair
+    // (CyclicNbr) so every kernel reads the neighbour the host's patchNeighbourValue does.
+    // NOT const: a moving mesh re-couples its cyclicAMI pairs and this list is rebuilt from them, in place,
+    // so the hooks that hold a reference to it read the moved pair.
+    std::vector<CyclicInterface> cyclics =
+        buildCyclicInterfaces(m, g, fvp, /*includeCoupledACMI=*/true, /*includeCoupledAMI=*/true);
     // ...ANY coupled patch -- a cyclic, a cyclicACMI or a cyclicAMI pair alike: the cached field is formed without
     // the pair's contribution and the dev2 term's given boundary has no pair half
     for (std::size_t pi = 0; pi < fvp.size() && f.gradUCache.on && !f.dynamicMesh; ++pi)
@@ -271,6 +279,8 @@ RunReport runInterFoamDevice(
     // stf and snGrad(rho) on the pair, refilled by the interfaceForces hook every step; ghf is the
     // mesh's and is built once, below.
     DeviceBuffer<scalar> dStfIf, dSnRhoIf, dGhfIf;
+    // ...and snGrad(p_rgh) on the pair, for the momentum predictor's force (the same hook, the same call)
+    DeviceBuffer<scalar> dSnPrghIf;
     // The pair's flux, for the HOST fields the hooks read. cyc.phi is the device's copy and the only
     // current one; a condition that looks phi up on a coupled patch -- porousBafflePressure computes
     // its jump from it -- reads f.phi.boundary there, which the unflatten deliberately does not touch
@@ -436,7 +446,9 @@ RunReport runInterFoamDevice(
     // the move, points0 carried through the change (inter_driver_cpp.cu's meshUpdate stage). This loop's
     // two branches -- the topology re-upload and the motion refresh -- are an if/else-if, so it would take
     // the motion and never refine. Refused by name until they are composed in OpenFOAM's order.
-    if (dyn && f.amr && f.amr->active)
+    // ...COMPOSED NOW, in that order (the outer corrector's refineAndMove). BRAE_CONTROL_DEVICE_REFINE_MOVE_REFUSED=1
+    // puts the refusal back.
+    if (dyn && f.amr && f.amr->active && std::getenv("BRAE_CONTROL_DEVICE_REFINE_MOVE_REFUSED") != nullptr)
         throw std::runtime_error(
             "brae interFoam (device): the mesh refines AND a motion solver moves it. The host arm runs it "
             "(the change, then the move); this loop's topology and motion branches are not yet composed in "
@@ -516,9 +528,13 @@ RunReport runInterFoamDevice(
         // the geometry, and every hook in this loop holds a pointer into that layout, so rebuilding it
         // mid-run would leave them addressing the old one. Refused by name rather than run on a pair
         // whose geometry has moved out from under it.
+        // ...A cyclicAMI PAIR IS CARRIED NOW: the layout is the pair's faces and owner cells, which a
+        // move keeps, and refreshDeviceCyclicAfterMove rewrites the geometry and the stencil into the
+        // same DeviceBuffer objects. A plain cyclic or a cyclicACMI under a move is still refused: its
+        // rebuild goes through a different branch of buildCyclicInterfaces and nothing has gated it.
         for (const FvPatch& q : fvp)
         {
-            if (q.coupled)
+            if (q.coupled && q.type != "cyclicAMI")
             {
                 throw std::runtime_error(
                     "brae interFoam -device: the case moves its mesh AND carries the coupled patch `"
@@ -538,8 +554,11 @@ RunReport runInterFoamDevice(
         // V00 (CrankNicolsonDdtScheme.C:862-893). The host closure carries it (RAS/floatingObject); the
         // device kEpsilon carries the Euler form alone and would stop at its first call, so the case is
         // named here, before the first step.
+        // ...CARRIED NOW: deviceCnFvmDdt takes V0 and V00 and the closure hands them on
+        // (KEpsilonInput::V00). BRAE_CONTROL_DEVICE_CN_CLOSURE_REFUSED=1 puts the refusal back.
         if (f.turbulence.on && f.turbulence.model == cpu::interFoam::InterRasModel::KEpsilon
-            && f.ddtU == DdtScheme::CrankNicolson)
+            && f.ddtU == DdtScheme::CrankNicolson
+            && std::getenv("BRAE_CONTROL_DEVICE_CN_CLOSURE_REFUSED") != nullptr)
         {
             throw std::runtime_error(
                 "brae interFoam -device: the case moves its mesh under CrankNicolson with a kEpsilon closure. "
@@ -567,7 +586,7 @@ RunReport runInterFoamDevice(
         // AMI's weights.
         for (const FvPatch& q : fvp)
         {
-            if (q.type == "cyclicAMI" || q.type == "cyclicACMI")
+            if (q.type == "cyclicACMI")
             {
                 throw std::runtime_error(
                     "brae interFoam -device: the case moves its mesh AND carries the patch `" + q.name
@@ -874,6 +893,20 @@ RunReport runInterFoamDevice(
         f.alpha1.evaluateBoundary();
         aBnd.copyFrom(patchValues(f.alpha1, fvp));
     };
+    // ...and the top of the alpha step, which evaluates nothing: the host field's patch values as the
+    // last evaluate left them (every evaluate of this loop goes through f.alpha1, so they are current)
+    if (std::getenv("BRAE_CONTROL_DEVICE_ALPHA_TOP_EVALUATE") == nullptr)
+    {
+        H.alpha.storedBoundary = [&](DeviceBuffer<scalar>& aBnd)
+        {
+            aBnd.copyFrom(patchValues(f.alpha1, fvp));
+        };
+    }
+    else
+    {
+        std::printf("  *** CONTROL MODE: alpha's boundary is evaluated at the top of the alpha step. This run "
+                    "is deliberately wrong. ***\n");
+    }
     // A RELAXED CORRECTOR'S BOUNDARY, as the host corrector takes it (alpha_eqn_cpp.cu): MULES's own
     // evaluate on the cells it left, then the relaxation's assignment through each patch's operator=.
     // f.alpha1's patch values on entry are alpha10's -- the last mixture.correct() left them, contact
@@ -1226,9 +1259,11 @@ RunReport runInterFoamDevice(
                 f.p_rgh.boundary[pi]->updateSnGrad(
                     std::vector<scalar>(static_cast<std::size_t>(fvp[pi].size), scalar(0)));
             }
-            snP.copyFrom(fullFace(fvc::snGrad(f.p_rgh, m, g, fvp, f.snGradScheme.corrected,
-                                              f.gradPrgh.leastSquares, f.gradPrgh.cellLimitK,
-                                              f.snGradScheme.limitCoeff, f.snGradScheme.nonOrthCoeffs), fvp));
+            const SurfaceScalarField snPF = fvc::snGrad(f.p_rgh, m, g, fvp, f.snGradScheme.corrected,
+                                                        f.gradPrgh.leastSquares, f.gradPrgh.cellLimitK,
+                                                        f.snGradScheme.limitCoeff, f.snGradScheme.nonOrthCoeffs);
+            snP.copyFrom(fullFace(snPF, fvp));
+            if (!cyclics.empty()) dSnPrghIf.copyFrom(coupledFace(snPF, cyclics));
         }
         else snP.resize(0);
     };
@@ -1568,6 +1603,14 @@ RunReport runInterFoamDevice(
     DeviceBuffer<scalar> dAOO(f.alpha1.internal);
     DeviceBuffer<scalar> dUoox(f.U.internal.size()), dUooy(f.U.internal.size()), dUooz(f.U.internal.size());
     DeviceBuffer<scalar> dUoobx, dUooby, dUoobz;
+    // ...and rho's patch values at the same two levels, with the operands of ddt0(rho,U)'s patch half:
+    // read only by the state's writer (the host loop's cnPatchRhoU)
+    DeviceBuffer<scalar> dRhoOB, dRhoOOB;
+    DeviceCnDdt0PatchOperands cnPatchRhoU;
+    const bool keepCnPatches = writer && writer->writesCrankNicolson();
+    // a cold start's U.oldTime(), whose fixed-value patches take what the FIRST assembly's updateCoeffs
+    // left (the host loop's UOldCreationPending)
+    bool uOldCreationPending = keepCnPatches;
     DeviceBuffer<scalar> dPhiOOI, dPhiOOB;
     std::vector<scalar> phiOldPrevI, phiOldPrevB;
     bool phiOOExists = false;
@@ -1769,6 +1812,7 @@ RunReport runInterFoamDevice(
     C.stfIf       = (dCyc.n > 0) ? &dStfIf : nullptr;
     C.ghfIf       = (dCyc.n > 0) ? &dGhfIf : nullptr;
     C.snGradRhoIf = (dCyc.n > 0) ? &dSnRhoIf : nullptr;
+    C.snGradPrghIf = (dCyc.n > 0) ? &dSnPrghIf : nullptr;
     C.nHatfIf     = (dCyc.n > 0) ? &dNHIf : nullptr;
     cycPhiForHost = (dCyc.n > 0) ? &dCyc.phi : nullptr;
     C.porosity = dPorosity.active ? &dPorosity : nullptr;
@@ -1993,6 +2037,8 @@ RunReport runInterFoamDevice(
     // ...and the ABSOLUTE flux the pressure step leaves for fvc::correctUf below, which reads phi
     // one line before makeRelative turns it relative (pEqn.H:66 and :69).
     DeviceBuffer<scalar> dPhiAbsI, dPhiAbsB;
+    // ...and on the pair's faces, with the mesh flux there (DeviceInterPressureInput::meshPhiIf)
+    DeviceBuffer<scalar> dPhiAbsIf, dMeshPhiIf;
     SurfaceScalarField phiAbs;
     // ...and rAU, which the NEXT step's mesh update solves CorrectPhi with (interFoam.C:138,
     // correctPhi.H) on a case that asks for it
@@ -2087,6 +2133,17 @@ RunReport runInterFoamDevice(
                 absolute ? *C.phiAbsIntOut : phiInt,
                 absolute ? *C.phiAbsBndOut : phiBnd,
                 divPhi);
+            // ...AND THE PAIR's faces, which fvc::div sums into their own cells. Across a plain cyclic
+            // the two sides cancel in the volume-weighted total; across a cyclicAMI they do not (the
+            // weighted stencil is not conservative face by face) and on a moving mesh the flux here is
+            // the absolute one. MEASURED on RAS/mixerVesselAMI, one step, without it: cumulativeContErr
+            // 2.9e+09 of OpenFOAM's in relative terms, with every field at 7e-13.
+            if (dCyc.n > 0 && std::getenv("BRAE_CONTROL_DEVICE_CONTERR_NO_PAIR") == nullptr)
+            {
+                const bool absIf = C.phiAbsIfOut
+                                && C.phiAbsIfOut->size() == static_cast<std::size_t>(dCyc.n);
+                deviceCyclicAddDivFlux(dCyc, absIf ? *C.phiAbsIfOut : dCyc.phi, dm.V, divPhi);
+            }
             std::vector<scalar> dv;
             divPhi.copyTo(dv);
             writer->addContinuityError(rep.deltaT, dv, g.V());
@@ -2096,6 +2153,9 @@ RunReport runInterFoamDevice(
     for (label s = 0; s < nSteps; ++s)
     {
         if (!(rep.time < endTime - scalar(0.5)*rep.deltaT)) break;   // Time::run(), Time.C:1000
+        // whether Uf.oldTime() was STORED with its old-old level in existence, which is when OpenFOAM
+        // starts writing Uf_0: the state the last step ended in (the host loop's UfOldStoredWithOO)
+        const bool ufOldStoredWithOO = UfOOExists;
 
         // interFoam.C:98-100 -- CourantNo.H, alphaCourantNo.H, setDeltaT.H, and only THEN ++runTime.
         // Both numbers come off the flux the LAST step left behind and the step size still in force;
@@ -2205,6 +2265,13 @@ RunReport runInterFoamDevice(
                 deviceCopy(dUoobx, dUobx);
                 deviceCopy(dUooby, dUoby);
                 deviceCopy(dUoobz, dUobz);
+            }
+            // rho's two patch levels, rotated with them: the old one is what the last step left
+            if (keepCnPatches)
+            {
+                DeviceBuffer<scalar> now(flattenPatches(stepRhoBnd.empty() ? f.rhoBnd : stepRhoBnd, fvp));
+                deviceCopy(dRhoOOB, dRhoOB.size() ? dRhoOB : now);
+                deviceCopy(dRhoOB, now);
             }
         }
         std::vector<scalar> ca, cx, cy, cz;
@@ -2319,6 +2386,14 @@ RunReport runInterFoamDevice(
             dCn.alpha1OO = &dAOO;
             dCn.UOO[0] = &dUoox; dCn.UOO[1] = &dUooy; dCn.UOO[2] = &dUooz;
             dCn.UOOBnd[0] = &dUoobx; dCn.UOOBnd[1] = &dUooby; dCn.UOOBnd[2] = &dUoobz;
+            if (keepCnPatches)
+            {
+                cnPatchRhoU.rhoOld = &dRhoOB;
+                cnPatchRhoU.rhoOO = &dRhoOOB;
+                cnPatchRhoU.vfOld[0] = &dUobx; cnPatchRhoU.vfOld[1] = &dUoby; cnPatchRhoU.vfOld[2] = &dUobz;
+                cnPatchRhoU.vfOO[0] = &dUoobx; cnPatchRhoU.vfOO[1] = &dUooby; cnPatchRhoU.vfOO[2] = &dUoobz;
+                dCn.ddt0RhoUPatch = &cnPatchRhoU;
+            }
             // Time::operator++: deltaT0_ = deltaTSave_; deltaTSave_ = deltaT_
             cnClock.timeIndex = thisIndex;
             cnClock.deltaT = rep.deltaT;
@@ -2472,7 +2547,14 @@ RunReport runInterFoamDevice(
             // below is guarded. Unguarded, this block ran at every corrector: the host phi it copies under
             // correctPhi is the one the host skipped rewriting (stale), and V0 was re-taken from the MOVED
             // volumes -- neither seen by a gate while every device-arm moving profile ran one corrector.
-            if (dyn && (outer == 0 || f.moveMeshOuterCorrectors || moveEveryOuter))
+            // A MESH THAT REFINES AND MOVES (laminar/oscillatingBox): dynamicRefineFvMesh::update changes the
+            // topology FIRST and moves the points AFTER (dynamicRefineFvMesh.C:1468-1474), and interFoam.C:
+            // 112-148 then runs one block on the moved mesh. So the motion below is a block this corrector
+            // runs either on its own or AFTER the adaptive branch -- the host loop's meshUpdate stage.
+            const bool refineAndMove = dyn && f.amr && f.amr->active
+                                    && std::getenv("BRAE_CONTROL_DEVICE_REFINE_MOVE_REFUSED") == nullptr;
+            const bool moveThisCorrector = dyn && (outer == 0 || f.moveMeshOuterCorrectors || moveEveryOuter);
+            auto moveMeshNow = [&]()
             {
                 if (v0FromV)
                 {
@@ -2507,7 +2589,7 @@ RunReport runInterFoamDevice(
                     }
                 }
                 std::vector<scalar> cpDiv;
-                interMeshUpdate(dyn, f, m, g, fvp, mutableMesh, /*amiPairs=*/nullptr,
+                interMeshUpdate(dyn, f, m, g, fvp, mutableMesh, mutableMesh ? mutableMesh->ami : nullptr,
                                 meshAgglomeration, meshCpc, rep, stepTime, stepIndex, outer,
                                 f.pimple.nOuterCorrectors,
                                 f.ddtU == DdtScheme::CrankNicolson ? &cnClock : nullptr,
@@ -2539,6 +2621,22 @@ RunReport runInterFoamDevice(
                     C.V00 = &dV00;
                 }
                 refreshDeviceMeshGeometry(dm, m, g, fvp);
+                // ...and THE PAIR: the host stage above has recomputed every cyclicAMI's weights on the
+                // moved points and coupled its patches again (cyclicAMIFvPatch::Interfaces::update)
+                if (dCyc.n > 0)
+                {
+                    cyclics = buildCyclicInterfaces(m, g, fvp, /*includeCoupledACMI=*/true,
+                                                    /*includeCoupledAMI=*/true);
+                    if (std::getenv("BRAE_CONTROL_DEVICE_PAIR_STALE") == nullptr)
+                    {
+                        refreshDeviceCyclicAfterMove(dCyc, cyclics, g, fvp);
+                    }
+                    else
+                    {
+                        std::printf("  *** CONTROL MODE: the device keeps the pair it was built with after the "
+                                    "mesh moves. This run is deliberately wrong. ***\n");
+                    }
+                }
                 dMagSf.copyFrom(magSfAll());
                 dGh.copyFrom(f.gh);
                 {
@@ -2546,6 +2644,7 @@ RunReport runInterFoamDevice(
                     gf.internal = f.ghfInternal;
                     gf.boundary = f.ghfBoundary;
                     dGhf.copyFrom(fullFace(gf, fvp));
+                    if (dCyc.n > 0) dGhfIf.copyFrom(coupledFace(gf, cyclics));
                 }
                 // the patch geometry moved with the cells, and dbU carries the patch deltas and
                 // normals every boundary evaluation reads
@@ -2582,11 +2681,26 @@ RunReport runInterFoamDevice(
                     // corrector reads it.
                     dNH.copyFrom(f.nHatf.internal);
                     dNHB.copyFrom(flattenPatches(f.nHatf.boundary, fvp));
+                    // ...and both on the pair's faces: CorrectPhi's flux, already relative, and nHatf
+                    if (dCyc.n > 0)
+                    {
+                        dCyc.phi.copyFrom(coupledFace(f.phi, cyclics));
+                        dNHIf.copyFrom(coupledFace(f.nHatf, cyclics));
+                    }
                 }
                 // ...and THE MESH FLUX the move produced, which the pressure corrector makes phi
                 // relative to (fvc::makeRelative, pEqn.H:73). Over the full face array, as phi is.
                 dMeshPhi.copyFrom(fullFace(fvcMeshPhi(*dyn, f), fvp));
                 C.meshPhiAll = &dMeshPhi;
+                if (dCyc.n > 0)
+                {
+                    dMeshPhiIf.copyFrom(coupledFace(fvcMeshPhi(*dyn, f), cyclics));
+                    C.meshPhiIf = &dMeshPhiIf;
+                }
+            };
+            if (moveThisCorrector && !refineAndMove)
+            {
+                moveMeshNow();
             }
             // ...AND THE ADAPTIVE MESH, which is the same line of interFoam.C for a different
             // dynamicFvMesh: mesh.update() selects, refines, unrefines and MAPS EVERY FIELD, and
@@ -2601,7 +2715,7 @@ RunReport runInterFoamDevice(
             // mesh-sized buffer goes back up. The moving branch above owes only the GEOMETRY, because
             // a move keeps the addressing; a topology change keeps nothing, so this rebuilds the
             // DeviceMesh itself and with it every schedule cache that keys on its addressingId.
-            else if (f.amr && f.amr->active && (outer == 0 || f.moveMeshOuterCorrectors))
+            if (f.amr && f.amr->active && (outer == 0 || f.moveMeshOuterCorrectors))
             {
                 // ---- DOWN: the state the mapper carries, as the device holds it now.
                 //
@@ -2893,8 +3007,23 @@ RunReport runInterFoamDevice(
                                 (double)amx(aOldH), (double)amxv(uOldH), (double)amx(phiOldH.internal),
                                 (double)amxv(UfOld.internal));
                 }
+                if (refineAndMove)
+                {
+                    // hexRef8 lays its new points out on the LIVE mesh (hexRef8.C:3362, :3462, :3650); the
+                    // adapter's copy was last written at the previous change, so it is given the points the
+                    // motion has moved it to since -- and the motion's points0, which each change maps
+                    // (the host loop's two lines, inter_driver_cpp.cu)
+                    f.amr->state.m.movePoints(mutableMesh->m->points());
+                    f.amr->state.points0 = &dyn->points0Ref();
+                }
                 const bool changed =
                     interAmrUpdate(*f.amr, f, *mutableMesh, stepIndex, oldT, cnState);
+                // fvMesh::updateMesh as the motion sees it: the change's V0, the mesh flux recreated on the
+                // new faces (DynamicMotionSolverFvMesh::topoChanged)
+                if (changed && refineAndMove)
+                {
+                    dyn->topoChanged(f.amr->state.V0, stepIndex);
+                }
                 // the sub-cycled old level on a refining mesh is alpha as this update left it (see the host
                 // loop): the host copy the change mapped. Without a change the start-of-step copy already is.
                 if (changed && writeNow && writer->writesAlphaOld())
@@ -2913,7 +3042,7 @@ RunReport runInterFoamDevice(
                     // host loop, and the GAMG hierarchy un-built inside it.
                     // the GLOBAL time index, which the wall-distance schedule tests (wallDist.C:198)
                     interAfterMeshChange(f, *mutableMesh, meshAgglomeration, meshCpc, rep,
-                                         f.amr->startTimeIndex + stepIndex, /*motionFollows=*/false);
+                                         f.amr->startTimeIndex + stepIndex, /*motionFollows=*/refineAndMove);
 
                     // ---- the counts every array below is sized by
                     nC = m.nCells();
@@ -3181,6 +3310,13 @@ RunReport runInterFoamDevice(
                                 (long)f.amr->nRefined, (long)f.amr->nUnrefined, (long)m.nCells());
                 }
             }
+            // ...and THEN the move, with the block interFoam.C:112-148 runs after mesh.update(): the moving
+            // walls, gh/ghf, `phi = Sf & Uf`, CorrectPhi with the mesh flux, makeRelative and the mixture --
+            // once, on the moved mesh, with the geometry refreshed on the DeviceMesh the change just rebuilt
+            if (moveThisCorrector && refineAndMove)
+            {
+                moveMeshNow();
+            }
 
             // (Sf & Uf.oldTime()), the flux ddtCorr takes in phi.oldTime()'s place ON A DYNAMIC MESH --
             // fvcDdt.C:219 asks mesh.dynamic(), which is moving OR topo-changing, so a REFINING mesh
@@ -3204,6 +3340,7 @@ RunReport runInterFoamDevice(
                 // moving one, and both were set inside the moving branch until this block existed.
                 C.phiAbsIntOut = &dPhiAbsI;
                 C.phiAbsBndOut = &dPhiAbsB;
+                C.phiAbsIfOut  = (dCyc.n > 0) ? &dPhiAbsIf : nullptr;
                 C.rAUOut       = &dRAU;
                 std::vector<scalar> pu(static_cast<std::size_t>(nIf));
                 for (label fc = 0; fc < nIf; ++fc)
@@ -3246,6 +3383,39 @@ RunReport runInterFoamDevice(
                     }
                 }
                 dCn.phiOldExists = true;
+            }
+            // a cold start's U.oldTime() is CREATED inside the first assembly's fvm::ddt, after
+            // updateCoeffs (GeometricField::oldTime() copies the field as it stands): on every patch
+            // where U fixes its value the old level -- and the old-old one, a copy of it -- holds what
+            // the patch holds then, not what the start file wrote. The solve never reads it; U_0 and
+            // ddt0's patches are written with it. BRAE_CONTROL_CN_OLD_AT_ENTRY=1 leaves it as it began.
+            // TAKEN HERE, ahead of the step: the mesh update above has run U.correctBoundaryConditions()
+            // (a moving wall holds this step's velocity), and the patches whose updateCoeffs the assembly
+            // itself would move -- a time-varying inlet -- are not on any case that reaches this.
+            if (uOldCreationPending)
+            {
+                if (cnDdt && std::getenv("BRAE_CONTROL_CN_OLD_AT_ENTRY") == nullptr)
+                {
+                    std::vector<scalar> bx, by, bz;
+                    dUobx.copyTo(bx); dUoby.copyTo(by); dUobz.copyTo(bz);
+                    std::size_t off = 0;
+                    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                    {
+                        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                        const std::vector<vector>& v = f.U.boundary[pi]->value();
+                        if (f.U.boundary[pi]->fixesValue())
+                        {
+                            for (std::size_t i = 0; i < v.size() && off + i < bx.size(); ++i)
+                            {
+                                bx[off + i] = v[i].x; by[off + i] = v[i].y; bz[off + i] = v[i].z;
+                            }
+                        }
+                        off += v.size();
+                    }
+                    dUobx.copyFrom(bx); dUoby.copyFrom(by); dUobz.copyFrom(bz);
+                    dUoobx.copyFrom(bx); dUooby.copyFrom(by); dUoobz.copyFrom(bz);
+                }
+                uOldCreationPending = false;
             }
             deviceInterStep(dm, rep.deltaT, C, props, H, dGh, dGhf, dMagSf,
                             dA, dAOld, dUx, dUy, dUz, dUox, dUoy, dUoz,
@@ -3329,8 +3499,10 @@ RunReport runInterFoamDevice(
                     dMeshPhiI.copyFrom(std::vector<scalar>(mp.begin(), mp.begin() + nIf));
                     dMeshPhiB.copyFrom(std::vector<scalar>(mp.begin() + nIf, mp.end()));
                     ti.V0         = &dV0;
+                    ti.V00        = (cnDdt && dV00.size() == static_cast<std::size_t>(nC)) ? &dV00 : nullptr;
                     ti.meshPhiInt = &dMeshPhiI;
                     ti.meshPhiBnd = &dMeshPhiB;
+                    ti.meshPhiIf  = (dCyc.n > 0) ? &dMeshPhiIf : nullptr;
                 }
                 // the second field's log is omega's under kOmegaSST, as the host driver keeps it
                 ti.epsilonLog = (f.turbulence.model == cpu::interFoam::InterRasModel::KOmegaSST)
@@ -3504,6 +3676,21 @@ RunReport runInterFoamDevice(
                 phiAbs.boundary = f.phi.boundary;
                 dPhiAbsI.copyTo(phiAbs.internal);
                 unflatten(dPhiAbsB, phiAbs.boundary);
+                // ...and the pair's, which the unflatten does not touch (it has no coupled patch in it):
+                // the copy above left the RELATIVE flux there, and the next move's `phi = Sf & Uf` reads
+                // the pair's Uf like any other face's
+                if (dCyc.n > 0 && dPhiAbsIf.size() == static_cast<std::size_t>(dCyc.n))
+                {
+                    const std::vector<scalar> pa = dPhiAbsIf.host();
+                    std::size_t off = 0;
+                    for (const CyclicInterface& c : cyclics)
+                    {
+                        const std::size_t pi = static_cast<std::size_t>(c.patch);
+                        const std::size_t n = c.faceCells.size();
+                        phiAbs.boundary[pi].assign(pa.begin() + off, pa.begin() + off + n);
+                        off += n;
+                    }
+                }
                 correctUf(f.Uf, f.U, phiAbs, m, g, fvp);
                 // ...and rAU, for the same reason and with the same blindness: the NEXT mesh update
                 // interpolates it for CorrectPhi's laplacian, and nothing THIS step does reads it.
@@ -3633,6 +3820,73 @@ RunReport runInterFoamDevice(
             ws.displacement = f.dynamicMesh ? f.dynamicMesh->displacement() : nullptr;
             ws.rigidBody = f.dynamicMesh ? f.dynamicMesh->rigidBody() : nullptr;
             ws.rAU = &f.rAU;
+            // CrankNicolson on a moving mesh: the scheme's registry state as the step left it, brought
+            // down in the host loop's own form (InterWriteCrankNicolson)
+            InterWriteCrankNicolson wcn;
+            fv::CrankNicolsonDdt0<vector> wDdt0RhoU, wDdtCorrU, wDdtCorrUf;
+            std::vector<vector> wUOld;
+            std::vector<std::vector<vector>> wUOldBnd;
+            if (writer->writesCrankNicolson() && cnDdt && dyn)
+            {
+                auto splitVec = [&](const DeviceBuffer<scalar>* b[3], std::vector<std::vector<vector>>& out)
+                {
+                    std::vector<scalar> x, y, z;
+                    b[0]->copyTo(x); b[1]->copyTo(y); b[2]->copyTo(z);
+                    out.assign(fvp.size(), {});
+                    std::size_t off = 0;
+                    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                    {
+                        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                        const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+                        if (off + n > x.size()) break;
+                        out[pi].resize(n);
+                        for (std::size_t i = 0; i < n; ++i)
+                        {
+                            out[pi][i] = vector{x[off + i], y[off + i], z[off + i]};
+                        }
+                        off += n;
+                    }
+                };
+                auto down = [&](const DeviceCnDdt0& src, const char* name, fv::CrankNicolsonDdt0<vector>& dst)
+                {
+                    std::vector<scalar> x, y, z;
+                    src.internal[0].copyTo(x); src.internal[1].copyTo(y); src.internal[2].copyTo(z);
+                    dst.name = name;
+                    dst.internal.resize(x.size());
+                    for (std::size_t i = 0; i < x.size(); ++i)
+                    {
+                        dst.internal[i] = vector{x[i], y[i], z[i]};
+                    }
+                    const DeviceBuffer<scalar>* bb[3] = {&src.boundary[0], &src.boundary[1], &src.boundary[2]};
+                    splitVec(bb, dst.boundary);
+                    dst.startTimeIndex = src.startTimeIndex;
+                    dst.timeIndex = src.timeIndex;
+                    dst.exists = src.exists;
+                };
+                down(dCn.ddt0RhoU, "ddt0(rho,U)", wDdt0RhoU);
+                down(dCn.ddtCorrU, "ddtCorrDdt0(U)", wDdtCorrU);
+                down(dCn.ddtCorrUf, "ddtCorrDdt0(Uf)", wDdtCorrUf);
+                {
+                    std::vector<scalar> x, y, z;
+                    dUox.copyTo(x); dUoy.copyTo(y); dUoz.copyTo(z);
+                    wUOld.resize(x.size());
+                    for (std::size_t i = 0; i < x.size(); ++i)
+                    {
+                        wUOld[i] = vector{x[i], y[i], z[i]};
+                    }
+                    const DeviceBuffer<scalar>* bb[3] = {&dUobx, &dUoby, &dUobz};
+                    splitVec(bb, wUOldBnd);
+                }
+                wcn.ddt0RhoU = &wDdt0RhoU;
+                wcn.ddtCorrU = &wDdtCorrU;
+                wcn.ddtCorrUf = &wDdtCorrUf;
+                wcn.meshPhi0 = &f.cnMeshPhi0;
+                wcn.UOld = &wUOld;
+                wcn.UOldBnd = &wUOldBnd;
+                wcn.V0 = &dyn->V0();
+                wcn.UfOld = ufOldStoredWithOO ? &UfOld : nullptr;
+                ws.cn = &wcn;
+            }
             if (f.amr && f.amr->active)
             {
                 // the LIVE history compacted, as refinementHistory's operator<< does (see the host loop)

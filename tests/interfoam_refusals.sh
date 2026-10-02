@@ -964,7 +964,11 @@ if [ $HAVE_GPU = 1 ]; then
     # inside the run the device names the files at start-up and stops at that write. The HOST arm beside
     # it is the control: the same staging writes and runs to its end.
     CNWRITE="$CNSET; sed -i 's/nAlphaSubCycles  *[0-9]*;/nAlphaSubCycles 1;/' system/fvSolution; sed -i -E 's/^(writeControl\s+)[^;]*;/\1timeStep;/; s/^(writeInterval\s+)[^;]*;/\11;/' system/controlDict"
-    arm ddt_cnMovingDeviceWrite refused "which the device loop does not keep in its written form" "-device" "$CNWRITE"
+    # ...KEPT NOW (2026-10-02): the ddt0 fields' patches are advanced on the device beside their cells and the
+    # state comes down at the write, so the device arm RUNS and writes -- the write gate's cn_moving/
+    # released_device.sh and the floatingObject row hold what it writes against OpenFOAM. A refusal coming
+    # back fails this arm.
+    arm ddt_cnMovingDeviceWrite runs    -                           "-device" "$CNWRITE"
     arm ddt_cnMovingHostWrite   runs    -                           ""        "$CNWRITE"
     # the device's alpha pre-solve does not honour minIter (the host's does)
     # cellLimited grad(U) is refused on the device (the host carries it into linearUpwind and the

@@ -39,9 +39,24 @@ std::vector<scalar> patchValuesOf(
 void advanceDeviceTurbulenceOldTime(
     DeviceInterTurbulence& d,
     label timeIndex,
-    bool second)
+    bool second,
+    // the patch values of the two levels too, which only the CrankNicolson state's writer reads
+    bool patchLevels)
 {
     if (d.oldStepTimeIndex == timeIndex) return;
+    if (patchLevels && second)
+    {
+        // advanceTurbulenceOldTime's patch half (inter_turbulence_cpp.cu): the old-old level takes the
+        // old one, or the field's own patch values where there is none yet; the old one the field's
+        d.cnOldLevelPending = (d.kOldStep.size() == 0);
+        DeviceBuffer<scalar> kb, eb;
+        deviceBCValue(d.dbK, d.k, kb);
+        deviceBCValue(d.dbEps, d.epsilon, eb);
+        deviceCopy(d.cnKOOBnd, d.kOldBnd.size() ? d.kOldBnd : kb);
+        deviceCopy(d.cnEpsOOBnd, d.epsOldBnd.size() ? d.epsOldBnd : eb);
+        deviceCopy(d.kOldBnd, kb);
+        deviceCopy(d.epsOldBnd, eb);
+    }
     if (d.kOldStep.size() == 0)
     {
         deviceCopy(d.cnKOO, d.k);
@@ -552,7 +567,9 @@ void deviceCorrectInterTurbulence(
             "brae interFoam (device): deviceCorrectInterTurbulence needs the step's timeIndex and "
             "finalIter; the caller supplied " + std::to_string(in.timeIndex) + " and "
             + std::to_string(in.finalIter) + ".");
-    advanceDeviceTurbulenceOldTime(d, in.timeIndex, /*second=*/t.model != cpu::interFoam::InterRasModel::KEqnLES);
+    advanceDeviceTurbulenceOldTime(d, in.timeIndex, /*second=*/t.model != cpu::interFoam::InterRasModel::KEqnLES,
+                                   /*patchLevels=*/in.cn != nullptr
+                                       && t.model == cpu::interFoam::InterRasModel::KEpsilon);
     if (!in.Ux || !in.Uy || !in.Uz || !in.phiInt || !in.phiBnd || !in.rhoPhiInt || !in.rhoPhiBnd
      || !in.rho || !in.rhoBnd || !in.rhoOld || !in.nu || !in.nuBnd)
         throw std::runtime_error("brae interFoam (device): deviceCorrectInterTurbulence needs every input.");
@@ -928,8 +945,10 @@ void deviceCorrectInterTurbulence(
     // branches above have handed them on since they were ported; this one did not, and ran a moving mesh
     // on the current volumes and the relative flux (KEpsilonInput::V0 has the measurement).
     kin.V0 = in.V0;
+    kin.V00 = in.V00;
     kin.meshPhiInt = in.meshPhiInt;
     kin.meshPhiBnd = in.meshPhiBnd;
+    kin.meshPhiIf = in.meshPhiIf;
     // BRAE_CONTROL_DEVICE_KEPS_STATIC=1 withholds them again -- the moving-mesh gate's control on `floating`
     if (std::getenv("BRAE_CONTROL_DEVICE_KEPS_STATIC") != nullptr)
     {
@@ -939,8 +958,10 @@ void deviceCorrectInterTurbulence(
                         "the relative flux. This run is deliberately wrong. ***\n");
         }
         kin.V0 = nullptr;
+        kin.V00 = nullptr;
         kin.meshPhiInt = nullptr;
         kin.meshPhiBnd = nullptr;
+        kin.meshPhiIf = nullptr;
     }
     // divU and the flux-conditional patches read the volumetric phi in BOTH lineages
     kin.phiByRhoInt = in.phiInt;
@@ -1131,6 +1152,20 @@ void deviceCorrectInterTurbulence(
         kin.cnDdt0Eps = &d.cnDdt0Eps;
         kin.kOO = &d.cnKOO;
         kin.epsOO = &d.cnEpsOO;
+        // ddt0's patch half: the two fields' patch values at the two old levels
+        d.cnPatchK.vfOld[0] = &d.kOldBnd;
+        d.cnPatchK.vfOO[0] = &d.cnKOOBnd;
+        d.cnPatchEps.vfOld[0] = &d.epsOldBnd;
+        d.cnPatchEps.vfOO[0] = &d.cnEpsOOBnd;
+        kin.cnPatchK = &d.cnPatchK;
+        kin.cnPatchEps = &d.cnPatchEps;
+        // a cold start's first call creates epsilon.oldTime() inside, after the wall function's update.
+        // BRAE_CONTROL_CN_OLD_AT_ENTRY=1 keeps the field as the step began -- the write gate's control
+        if (d.cnOldLevelPending && std::getenv("BRAE_CONTROL_CN_OLD_AT_ENTRY") == nullptr)
+        {
+            kin.epsOldCreated = &d.epsOldStep;
+            kin.epsOldBndCreated = &d.epsOldBnd;
+        }
         if (t.variableDensity)
         {
             if (!in.rhoOO)
@@ -1152,6 +1187,14 @@ void deviceCorrectInterTurbulence(
 
     gpu::kEpsilonRAS::correct(d.k, d.epsilon, d.nut, d.nutBnd, /*alphat=*/nullptr,
                               /*alphatBnd=*/nullptr, d.stages, dm, dbU, d.dbK, d.dbEps, d.wall, kin);
+    // ...and at a cold start the old-old level is the level that call created (the host wrapper's
+    // closing lines, inter_turbulence_cpp.cu)
+    if (in.cn && d.cnOldLevelPending)
+    {
+        deviceCopy(d.cnEpsOO, d.epsOldStep);
+        deviceCopy(d.cnEpsOOBnd, d.epsOldBnd);
+    }
+    d.cnOldLevelPending = false;
     if (in.epsilonLog)
     {
         in.epsilonLog->push_back({d.stages.epsPerf.initialResidual, d.stages.epsPerf.finalResidual,
@@ -1213,6 +1256,42 @@ void downloadDeviceInterTurbulence(
     {
         if (d.epsOldStep.size()) d.epsOldStep.copyTo(t.epsOldStep);
         if (d.cnEpsOO.size())    d.cnEpsOO.copyTo(t.cn.epsOO);
+    }
+    // ...AND WHAT THE CrankNicolson STATE'S WRITER READS (kEpsilon): the two levels' patch values and the
+    // two ddt0 fields whole, cells and patches, with the indices that say they exist. The device's
+    // boundary arrays leave the coupled patches out; a coupled patch gets an empty list, which is what a
+    // constraint patch's entry is written from.
+    if (d.kOldBnd.size() && d.cnDdt0K.exists && d.cnDdt0Eps.exists)
+    {
+        auto split = [&](const DeviceBuffer<scalar>& flat, std::vector<std::vector<scalar>>& out)
+        {
+            std::vector<scalar> h;
+            flat.copyTo(h);
+            out.assign(patches.size(), {});
+            std::size_t o = 0;
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                if (isCoupledInterfaceType(patches[pi].type)) continue;
+                const std::size_t n = static_cast<std::size_t>(patches[pi].size);
+                if (o + n > h.size()) break;
+                out[pi].assign(h.begin() + o, h.begin() + o + n);
+                o += n;
+            }
+        };
+        split(d.kOldBnd, t.kOldBnd);
+        split(d.epsOldBnd, t.epsOldBnd);
+        split(d.cnKOOBnd, t.cn.kOOBnd);
+        split(d.cnEpsOOBnd, t.cn.epsOOBnd);
+        auto ddt0Down = [&](const DeviceCnDdt0& src, cpu::fv::CrankNicolsonDdt0<scalar>& dst)
+        {
+            src.internal[0].copyTo(dst.internal);
+            split(src.boundary[0], dst.boundary);
+            dst.startTimeIndex = src.startTimeIndex;
+            dst.timeIndex = src.timeIndex;
+            dst.exists = src.exists;
+        };
+        ddt0Down(d.cnDdt0K, t.cn.ddt0K);
+        ddt0Down(d.cnDdt0Eps, t.cn.ddt0Eps);
     }
     t.oldStepTimeIndex = d.oldStepTimeIndex;
 }

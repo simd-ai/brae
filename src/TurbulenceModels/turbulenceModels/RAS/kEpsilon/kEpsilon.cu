@@ -680,7 +680,24 @@ void production(
                 "divU takes the VOLUMETRIC flux on those faces and divPhi the equation's own; the "
                 "internal-face arrays cannot stand in for either.");
         }
-        deviceCyclicAddDivFlux(*in.cyc, *in.cycPhiByRho, dm.V, st.divU);
+        // ...the ABSOLUTE one on a moving mesh, as on the internal faces above
+        if (in.meshPhiInt && in.meshPhiBnd)
+        {
+            if (!in.meshPhiIf || static_cast<int>(in.meshPhiIf->size()) != in.cyc->n)
+            {
+                throw std::runtime_error(
+                    "kEpsilon(cuda): a moving mesh with a coupled pair and no mesh flux on the pair's "
+                    "faces. divU is the divergence of the absolute flux there too.");
+            }
+            DeviceBuffer<scalar> absIf;
+            deviceCopy(absIf, *in.cycPhiByRho);
+            deviceAxpy(scalar(1), *in.meshPhiIf, absIf);
+            deviceCyclicAddDivFlux(*in.cyc, absIf, dm.V, st.divU);
+        }
+        else
+        {
+            deviceCyclicAddDivFlux(*in.cyc, *in.cycPhiByRho, dm.V, st.divU);
+        }
         deviceCyclicAddDivFlux(*in.cyc, *in.cycPhi, dm.V, st.divPhi);
     }
 
@@ -820,14 +837,26 @@ void assembleEpsEqn(
     const scalar* rhoOldP = (in.rhoOldCell && in.rhoOldCell->size()) ? in.rhoOldCell->data()
                                                                        : in.rhoCell->data();
     // mesh().V0(), the ddt source's volume on a moving mesh. Under CrankNicolson the scheme's moving
-    // branch (V0 and V00 weights) is the host's alone, so that combination is refused by name.
+    // branch takes V0 AND V00 (deviceCnFvmDdt below), so the two come together.
     if (in.V0 && in.V0->size() != static_cast<std::size_t>(nC))
         throw std::runtime_error("brae kEpsilon (device): V0 is not one value per cell.");
-    if (in.V0 && in.cn)
+    if (in.V0 && in.cn && (!in.V00 || in.V00->size() != static_cast<std::size_t>(nC)))
         throw std::runtime_error(
             "brae kEpsilon (device): CrankNicolson's fvm::ddt on a moving mesh is the scheme's moving branch "
-            "(CrankNicolsonDdtScheme.C:862-893), which the device closure does not carry. Run without -device.");
+            "(CrankNicolsonDdtScheme.C:862-893), which weights the old-old level by V00; the caller gave V0 alone.");
     const scalar* v0P = in.V0 ? in.V0->data() : nullptr;
+    // the scheme's moving branch, unless the gate's control puts the static one in its place
+    const bool cnMoving = in.V0 && std::getenv("BRAE_CONTROL_DEVICE_CN_CLOSURE_STATIC") == nullptr;
+    if (in.V0 && in.cn && !cnMoving)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            std::printf("  *** CONTROL MODE: the device kEpsilon's CrankNicolson ddt takes the static branch on a "
+                        "moving mesh. This run is deliberately wrong. ***\n");
+            said = true;
+        }
+    }
 
     // epsilon_.boundaryFieldRef().updateCoeffs(). turbulentMixingLengthDissipationRateInlet recomputes
     // its refValue from k's CURRENT patch values here, and the flux switch resolves inletOutlet -- both
@@ -868,7 +897,8 @@ void assembleEpsEqn(
         const DeviceBuffer<scalar>* oo[1] = {in.epsOO};
         DeviceBuffer<scalar>* src[1] = {&E.source};
         deviceCnFvmDdt(*in.cn, *in.cnDdt0Eps, in.rhoCell, in.rhoOldCell ? in.rhoOldCell : in.rhoCell, in.rhoOOCell,
-                       1, old, oo, dm.V, E.diag, src);
+                       1, old, oo, dm.V, E.diag, src, cnMoving ? in.V0 : nullptr, cnMoving ? in.V00 : nullptr,
+                       in.cnPatchEps);
     }
 }
 
@@ -895,14 +925,16 @@ void assembleKEqn(
     const scalar* rhoOldP = (in.rhoOldCell && in.rhoOldCell->size()) ? in.rhoOldCell->data()
                                                                        : in.rhoCell->data();
     // mesh().V0(), the ddt source's volume on a moving mesh. Under CrankNicolson the scheme's moving
-    // branch (V0 and V00 weights) is the host's alone, so that combination is refused by name.
+    // branch takes V0 AND V00 (deviceCnFvmDdt below), so the two come together.
     if (in.V0 && in.V0->size() != static_cast<std::size_t>(nC))
         throw std::runtime_error("brae kEpsilon (device): V0 is not one value per cell.");
-    if (in.V0 && in.cn)
+    if (in.V0 && in.cn && (!in.V00 || in.V00->size() != static_cast<std::size_t>(nC)))
         throw std::runtime_error(
             "brae kEpsilon (device): CrankNicolson's fvm::ddt on a moving mesh is the scheme's moving branch "
-            "(CrankNicolsonDdtScheme.C:862-893), which the device closure does not carry. Run without -device.");
+            "(CrankNicolsonDdtScheme.C:862-893), which weights the old-old level by V00; the caller gave V0 alone.");
     const scalar* v0P = in.V0 ? in.V0->data() : nullptr;
+    // the scheme's moving branch, unless the gate's control puts the static one in its place
+    const bool cnMoving = in.V0 && std::getenv("BRAE_CONTROL_DEVICE_CN_CLOSURE_STATIC") == nullptr;
 
     // k_'s own boundary refresh: turbulentIntensityKineticEnergyInlet reads U's CURRENT patch values.
     if (in.turbInletKMask && in.turbInletKInt)
@@ -930,7 +962,8 @@ void assembleKEqn(
         const DeviceBuffer<scalar>* oo[1] = {in.kOO};
         DeviceBuffer<scalar>* src[1] = {&K.source};
         deviceCnFvmDdt(*in.cn, *in.cnDdt0K, in.rhoCell, in.rhoOldCell ? in.rhoOldCell : in.rhoCell, in.rhoOOCell,
-                       1, old, oo, dm.V, K.diag, src);
+                       1, old, oo, dm.V, K.diag, src, cnMoving ? in.V0 : nullptr, cnMoving ? in.V00 : nullptr,
+                       in.cnPatchK);
     }
 }
 
@@ -1251,6 +1284,20 @@ void correct(
     if (dbEps.n && in.wfBndMask && in.wfBndMask->size() == static_cast<std::size_t>(dbEps.n))
     {
         turbulence::wallFacesTakeCell(dm, *in.wfBndMask, epsilon, epsBndLast);
+    }
+    // a cold start's epsilon.oldTime(), created HERE -- after the wall function's write to the wall cells
+    // and its patches (KEpsilonInput::epsOldCreated; kEpsilon_cpp.cu does it at the same point)
+    if (in.epsOldCreated)
+    {
+        deviceCopy(*in.epsOldCreated, epsilon);
+        if (epsOld.size())
+        {
+            deviceCopy(epsOld, epsilon);
+        }
+        if (in.epsOldBndCreated && dbEps.n)
+        {
+            deviceCopy(*in.epsOldBndCreated, epsBndLast);
+        }
     }
 
     // ---- the epsilon equation ----------------------------------------------------------------

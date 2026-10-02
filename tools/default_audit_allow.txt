@@ -474,5 +474,9 @@ kEpsilonRef::Compressible comp epsOldCreated  # set only on the ONE call that cr
 kEpsilonRef::Compressible comp epsOldBndCreated  # same
 # the HOST closure run inside the device loop (the instrument above): V00 is CrankNicolson's alone
 InterTurbulenceStepInput ti V00  # read only under CrankNicolson (it sits beside `cn`), and "BRAE_INTER_HOST_CLOSURE under CrankNicolson is not carried" refuses that first (inter_driver_device.cu)
-# the device loop's write: CrankNicolson's written state is the host loop's own objects
-InterWriteState ws cn  # the device loop refuses the files by name at start-up ("CrankNicolson's state on a moving mesh, which the device loop does not keep in its written form") and stops before its first write -- ARM ddt_cnMovingDeviceWrite (tests/interfoam_refusals.sh)
+# buildCyclicInterfaces has two sites, a cyclic's and a cyclicAMI's, and each leaves the other's fields at rest
+CyclicInterface ci forwardT  # the cyclicAMI site: cyclic_ami_cpp refuses any transform but `noOrdering` by name, so the pair's is the identity
+CyclicInterface ci separation  # the cyclicAMI site: the same refusal -- no transform, no separation; nothing reads it on an AMI pair
+CyclicInterface ci amiOffsets  # the cyclic / coincident-ACMI site: one neighbour cell per face (nbrFaceCells), so the stencil is empty by definition
+CyclicInterface ci amiNbrCells  # the cyclic / coincident-ACMI site: as amiOffsets
+CyclicInterface ci amiWeights  # the cyclic / coincident-ACMI site: as amiOffsets

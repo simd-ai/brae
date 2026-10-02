@@ -346,6 +346,16 @@ void DeviceCnDdt0::lookupOrCreate(
 {
     if (exists)
     {
+        // A FIELD THAT EXISTS WITHOUT PATCHES takes them here, zero like its cells, the first time a caller
+        // keeps them: a restart seeds the cells alone (seedCnDdt0) and fvm::ddt's patch half arrives with the
+        // first assembly -- the host's fvmDdtBody resizes its boundary at the same point.
+        if (nComp == nComponents && internal[0].size() == nInternal && boundary[0].size() == 0 && nBoundary > 0)
+        {
+            for (int k = 0; k < nComp; ++k)
+            {
+                zeroBuffer(boundary[k], nBoundary);
+            }
+        }
         if (nComp != nComponents || internal[0].size() != nInternal || boundary[0].size() != nBoundary)
             throw std::runtime_error("brae CrankNicolson (device): the ddt0 field `" + name + "` does not fit the mesh.");
         return;
@@ -375,7 +385,8 @@ void deviceCnFvmDdt(
     DeviceBuffer<scalar>& diag,
     DeviceBuffer<scalar>* const* src,
     const DeviceBuffer<scalar>* V0,
-    const DeviceBuffer<scalar>* V00)
+    const DeviceBuffer<scalar>* V00,
+    const DeviceCnDdt0PatchOperands* patchOperands)
 {
     const std::size_t nC = V.size();
     const int n = static_cast<int>(nC);
@@ -407,7 +418,25 @@ void deviceCnFvmDdt(
     if (moving && (V0->size() != nC || V00->size() != nC))
         throw std::runtime_error(
             "brae CrankNicolson (device) fvm::ddt(" + ddt0.name + "): V0 and V00 must be one value per cell.");
-    ddt0.lookupOrCreate(clock, nComp, nC, 0);
+    std::size_t nB = 0;
+    if (patchOperands)
+    {
+        if ((patchOperands->rhoOld != nullptr) != (patchOperands->rhoOO != nullptr))
+            throw std::runtime_error(
+                "brae CrankNicolson (device) fvm::ddt(" + ddt0.name + "): the patch operands' two densities "
+                "come together or not at all.");
+        for (int k = 0; k < nComp; ++k)
+        {
+            if (!patchOperands->vfOld[k] || !patchOperands->vfOO[k]
+             || patchOperands->vfOld[k]->size() != patchOperands->vfOO[k]->size())
+                throw std::runtime_error(
+                    "brae CrankNicolson (device) fvm::ddt(" + ddt0.name + "): the patch operands need "
+                    "vf.oldTime() and vf.oldTime().oldTime() on every boundary face, component "
+                    + std::to_string(k) + " has not.");
+        }
+        nB = patchOperands->vfOld[0]->size();
+    }
+    ddt0.lookupOrCreate(clock, nComp, nC, nB);
     if (n == 0) return;
 
     const scalar rDtCoef = ddt0.rDtCoef(clock);
@@ -435,6 +464,18 @@ void deviceCnFvmDdt(
                                                         vfOld[k]->data(), vfOO[k]->data(), ddt0.internal[k].data());
             }
             cudaCheck(cudaGetLastError(), "cn ddt0");
+            // ...and its patches, the static expression on either branch
+            if (nB > 0)
+            {
+                const int nb = static_cast<int>(nB);
+                cnDdt0UpdateKernel<<<nBlocks(nb), TPB>>>(
+                    nb, rDtCoef0, clock.ocCoeff,
+                    patchOperands->rhoOld ? patchOperands->rhoOld->data() : nullptr,
+                    patchOperands->rhoOO ? patchOperands->rhoOO->data() : nullptr,
+                    patchOperands->vfOld[k]->data(), patchOperands->vfOO[k]->data(),
+                    ddt0.boundary[k].data());
+                cudaCheck(cudaGetLastError(), "cn ddt0, patches");
+            }
         }
     }
     // ...and the source on the OLD volumes when the mesh moved, which is where the old-time field
@@ -686,6 +727,12 @@ void deviceCnDdtCorr(
                                                          phiOldIf->data(), phiOOIf->data(),
                                                          dphidt0If->internal[0].data());
             cudaCheck(cudaGetLastError(), "cn ddtCorr dphidt0, interface");
+        }
+        if (cyc->stencil)
+        {
+            throw std::runtime_error(
+                "brae device CrankNicolson ddtCorr: the mesh carries a cyclicAMI pair. The device forms "
+                "this term across a one-to-one pair only; run without -device.");
         }
         outIf->resize(static_cast<std::size_t>(cyc->n));
         cnDdtCorrCyclicKernel<<<nBlocks(cyc->n), TPB>>>(cyc->n, cyc->ownCell.data(), cyc->nbrCell.data(),

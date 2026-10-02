@@ -5,6 +5,8 @@
 #include "device_alpha_flux.cuh"
 #include "device_interface_properties.cuh"
 #include "device_blas.cuh"
+#include <cstdio>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <stdexcept>
 
@@ -140,6 +142,15 @@ void deviceInterAlphaStep(
     DeviceBuffer<scalar> VscBuf, Vsc0Buf;
     // ...and phic, when the step's geometry changes under it (DeviceInterAlphaHooks::geometryUpdate)
     DeviceBuffer<scalar> phicIntPre, phicBndPre, phicIfPre;
+    // ...and the pair's mass flux summed over the sub-cycles (see where it is formed, below)
+    DeviceBuffer<scalar> rhoPhiIfSum;
+    const bool pairRhoPhiLast = std::getenv("BRAE_CONTROL_DEVICE_PAIR_RHOPHI_LAST") != nullptr;
+    if (pairRhoPhiLast)
+    {
+        std::printf("  *** CONTROL MODE: the pair's mass flux is the last sub-cycle's, not the time-weighted sum. "
+                    "This run is deliberately wrong. ***\n");
+    }
+    const bool pairRhoPhiSummed = ctl.nAlphaSubCycles > 1 && ctl.rhoPhiIf && !pairRhoPhiLast;
     DeviceAlphaEqnStep step =
         [&](const DeviceBuffer<scalar>& subOld, scalar dtSub, DeviceBuffer<scalar>& alpha,
             DeviceBuffer<scalar>& rpInt, DeviceBuffer<scalar>& rpBnd)
@@ -176,8 +187,15 @@ void deviceInterAlphaStep(
             throw std::runtime_error(
                 "brae interFoam device alpha step: alpha1 must arrive one value per cell; the step "
                 "continues from it and does not reset it.");
+        // THE STORED patch values, not an evaluate -- see DeviceInterAlphaHooks::storedBoundary.
+        // MEASURED on RAS/mixerVesselAMI's first step, host against device with the evaluate here:
+        // the outlet's 62 cells at 1 where the host's (and OpenFOAM's) rise to 1.095, alpha 8.6e-02.
+        if (hooks.storedBoundary)
+        {
+            hooks.storedBoundary(alpha1Bnd);
+        }
         // patch values only -- NOT a mixture.correct(); see DeviceInterAlphaHooks::refreshBoundary
-        if (hooks.refreshBoundary)
+        else if (hooks.refreshBoundary)
         {
             hooks.refreshBoundary(alpha, alpha1Bnd);
         }
@@ -398,11 +416,28 @@ void deviceInterAlphaStep(
         if (li.cyc && li.cyc->n > 0 && ctl.rhoPhiIf && li.phiCNIf && li.alphaPhiIf)
         {
             deviceMassFlux(li.cyc->n, *li.alphaPhiIf, *li.phiCNIf, li.rho1, li.rho2, *ctl.rhoPhiIf);
+            // ...TIME-WEIGHTED over the sub-cycles like every other face's (alphaEqnSubCycle.H:20-29,
+            // rhoPhiSum += (runTime.deltaT()/totalDeltaT)*rhoPhi): deviceAlphaEqnSubCycle sums the
+            // internal and boundary arrays it is handed, and the pair's is in neither.
+            if (pairRhoPhiSummed)
+            {
+                if (rhoPhiIfSum.size() != ctl.rhoPhiIf->size())
+                {
+                    rhoPhiIfSum.resize(ctl.rhoPhiIf->size());
+                    cudaCheck(cudaMemset(rhoPhiIfSum.data(), 0, rhoPhiIfSum.size()*sizeof(scalar)),
+                              "rhoPhi sum, interface");
+                }
+                deviceAxpy(dtSub/totalDeltaT, *ctl.rhoPhiIf, rhoPhiIfSum);
+            }
         }
     };
 
     deviceAlphaEqnSubCycle(ctl.nAlphaSubCycles, totalDeltaT, alpha1, alpha1Old,
                            rhoPhiInt, rhoPhiBnd, step);
+    if (pairRhoPhiSummed && rhoPhiIfSum.size() == ctl.rhoPhiIf->size())
+    {
+        deviceCopy(*ctl.rhoPhiIf, rhoPhiIfSum);
+    }
 
     // ...and mixture.correct() ONCE MORE after the whole sub-cycle (alphaEqnSubCycle.H:36-38), so that
     // the momentum equation is built on the NEW density. Skipping it builds UEqn on the density the
