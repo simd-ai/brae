@@ -423,7 +423,59 @@ scalar deviceInterPressureStep(
             ? deviceLduViewPair(dm, diagC, P.upper, P.lower, *in.cyc,
                                 haveJump ? cycJump.data() : nullptr)
             : deviceLduView(dm, diagC, P.upper, P.lower);
-        if (gamg)
+        // the case's GAMG, by the pressure rule: brae's AMG-PCG with the entry's own stopping controls.
+        // BRAE_PRESSURE_GAMG_PORT=1 runs the GAMG port instead -- what the exact gates against OpenFOAM run
+        // (CMakeLists.txt sets it for every test; the user's decision, 2026-10-03), so they keep checking
+        // everything else to 1e-11 while the AMG-PCG is held to its own measured bounds
+        // (tests/interfoam_write/amg_pcg/). BRAE_CONTROL_AMG_PCG_ONE_ITERATION=1 stops each AMG-PCG solve
+        // after one iteration -- those gates' control.
+        static const bool gamgPort = std::getenv("BRAE_PRESSURE_GAMG_PORT") != nullptr;
+        static const bool oneIteration = std::getenv("BRAE_CONTROL_AMG_PCG_ONE_ITERATION") != nullptr;
+        if ((gamg || pcgGamg) && !gamgPort)
+        {
+            if (!in.amgPcg)
+            {
+                throw std::runtime_error(
+                    "brae interFoam device pressure step: the case asks for GAMG on p_rgh, which runs brae's "
+                    "AMG-preconditioned PCG, and the caller handed in no DeviceAmgPcgCache.");
+            }
+            static bool announced = false;
+            if (!announced)
+            {
+                announced = true;
+                std::printf("  p_rgh: system/fvSolution asks for GAMG; brae runs its AMG-preconditioned PCG "
+                            "instead -- same operator, different Krylov method and iteration count\n");
+            }
+            interPhase::Nested timed("pressure: AMG-PCG solve");
+            AMGData& amg = in.amgPcg->get(dm.addressingId);
+            amgGalerkin(amg, diagC, P.upper, P.lower);
+            const scalar nf = deviceNormFactor(A, p_rgh, b, deviceOnes(nC));
+            const scalar tol = gamg ? gamg->tolerance : sv.tol;
+            const scalar relTol = gamg ? gamg->relTol : sv.relTol;
+            const int maxIter = oneIteration ? 1 : (gamg ? gamg->maxIter : sv.maxIter);
+            const int minIter = gamg ? gamg->minIter : 0;
+            // the fast path's performance knobs, with simpleFoam's defaults and switches
+            // (linear_solver_setup.cuh): the residual read every 4 iterations, the V-cycle replayed from a
+            // CUDA graph except across a coupled pair, and no coarse-correction scaling
+            static const int checkEvery = []()
+            {
+                const char* e = std::getenv("BRAE_PCG_CHECK_EVERY");
+                return (e && std::atoi(e) >= 1) ? std::atoi(e) : 4;
+            }();
+            static const bool useGraph = []()
+            {
+                const char* e = std::getenv("BRAE_USE_GRAPH");
+                return e ? std::atoi(e) != 0 : true;
+            }();
+            static const bool corrScaling = []()
+            {
+                const char* e = std::getenv("BRAE_CORR_SCALING");
+                return e ? std::atoi(e) != 0 : false;
+            }();
+            const bool graph = useGraph && !(in.cyc && in.cyc->n > 0);
+            perf = deviceAMGPCG(A, amg, b, p_rgh, nf, tol, relTol, maxIter, graph, checkEvery, corrScaling, minIter);
+        }
+        else if (gamg)
         {
             if (!in.dic || !in.gamgCache)
             {
@@ -639,6 +691,25 @@ scalar deviceInterPressureStep(
     }
 
     return perf.finalResidual;
+}
+
+AMGData& DeviceAmgPcgCache::get(unsigned long long id)
+{
+    if (!mesh || !geometry)
+    {
+        throw std::runtime_error("brae DeviceAmgPcgCache: the mesh and geometry were not set before the first solve.");
+    }
+    if (!built || addressingId != id)
+    {
+        const label nIf = mesh->nInternalFaces();
+        const std::vector<label> own(mesh->owner().begin(), mesh->owner().begin() + nIf);
+        const std::vector<label> nei(mesh->neighbour().begin(), mesh->neighbour().begin() + nIf);
+        const std::vector<scalar> w(geometry->magSf().begin(), geometry->magSf().begin() + nIf);
+        amg = buildAMG(own, nei, w, mesh->nCells());
+        built = true;
+        addressingId = id;
+    }
+    return amg;
 }
 
 } // namespace brae

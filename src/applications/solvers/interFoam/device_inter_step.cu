@@ -761,6 +761,7 @@ void deviceInterStep(
         pi.gamg = finalCorr ? ctl.pressureFinalGamg : ctl.pressureGamg;
         pi.pcgGamg = finalCorr ? ctl.pressureFinalPcgGamg : ctl.pressurePcgGamg;
         pi.gamgCache = ctl.gamgCache;
+        pi.amgPcg = ctl.amgPcg;
         pi.gamgLog = ctl.gamgLog;
         pi.solveLog = ctl.pressureSolveLog;
         // the non-orthogonal passes before the last take the plain entry, whichever corrector this is

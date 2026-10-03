@@ -3301,7 +3301,7 @@ set_tests_properties(interfoam_dambreak_clock_vs_openfoam PROPERTIES
 file(GLOB BRAE_WRITE_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_write
      ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_write/*/*.sh)
 list(FILTER BRAE_WRITE_TESTS EXCLUDE REGEX "/_common\\.sh$")
-set(BRAE_WRITE_SLOW_FILES "^ami/|^refine/mapping")
+set(BRAE_WRITE_SLOW_FILES "^ami/|^refine/mapping|^amg_pcg/dtchull|^identity/wave_device")
 foreach(rel ${BRAE_WRITE_TESTS})
     string(REPLACE ".sh" "" name ${rel})
     string(REPLACE "/" "_" name ${name})
@@ -5138,3 +5138,12 @@ add_executable(test_colour_gs_fused tests/test_colour_gs_fused.cu)
 target_include_directories(test_colour_gs_fused PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_colour_gs_fused PRIVATE brae_core)
 add_test(NAME colour_gs_fused COMMAND test_colour_gs_fused)
+
+# THE PRESSURE RULE'S TEST ARM. A case's GAMG on p_rgh runs brae's AMG-preconditioned PCG by default (CLAUDE.md,
+# device_inter_pressure_step.cu), which stops at a different residual from OpenFOAM's GAMG -- 2.3e-09 on
+# RAS/DTCHull at pinned 1e-13 solves, against gates held near 1e-11. So every test runs the GAMG port
+# (BRAE_PRESSURE_GAMG_PORT=1) and keeps checking the rest of the solver to its own bound; the AMG-PCG is held
+# to OpenFOAM at its measured bounds by tests/interfoam_write/amg_pcg/, which unset this. The user's decision,
+# 2026-10-03.
+get_property(BRAE_ALL_TESTS DIRECTORY PROPERTY TESTS)
+set_property(TEST ${BRAE_ALL_TESTS} APPEND PROPERTY ENVIRONMENT "BRAE_PRESSURE_GAMG_PORT=1")

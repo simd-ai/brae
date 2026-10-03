@@ -2231,6 +2231,10 @@ RunReport runInterFoamDevice(
     C.pressurePcgGamg = f.pSolve.pcgGamg() ? &f.pSolve.gamgPrecond : nullptr;
     C.pressureFinalPcgGamg = f.pSolveFinal.pcgGamg() ? &f.pSolveFinal.gamgPrecond : nullptr;
     C.gamgCache = &gamgCache;
+    DeviceAmgPcgCache amgPcgCache;
+    amgPcgCache.mesh = &m;
+    amgPcgCache.geometry = &g;
+    C.amgPcg = &amgPcgCache;
     C.gamgLog = &gamgLog;
     C.pressure.tol = f.pSolve.tol;
     C.pressure.relTol = f.pSolve.relTol;

@@ -77,6 +77,9 @@ MV="$TUT/multiphase/interFoam/laminar/mixerVessel2D"
 [ -d "$RAS" ]      || { echo "SKIP: RAS damBreak tutorial not found at $RAS"; exit 77; }
 [ -f "$OFBASHRC" ] || { echo "SKIP: real OpenFOAM not available"; exit 77; }
 
+# The GAMG port on the pressure, as CMakeLists.txt sets for every test: the exact gates compare with OpenFOAM's
+# own GAMG. tests/interfoam_write/amg_pcg/ unsets it to hold brae's default AMG-PCG to its measured bounds.
+export BRAE_PRESSURE_GAMG_PORT=1
 W=${KEEP_W:-$(mktemp -d)}
 [ -n "${KEEP_W:-}" ] || trap 'rm -rf "$W"' EXIT
 mkdir -p "$W"

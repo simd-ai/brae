@@ -371,6 +371,8 @@ struct DeviceInterStepControls
     const GamgPreconditionerControls* pressurePcgGamg = nullptr;
     const GamgPreconditionerControls* pressureFinalPcgGamg = nullptr;
     DeviceGamgCache* gamgCache = nullptr;
+    // the AMG-PCG the case's GAMG entries run (the pressure rule, DeviceAmgPcgCache)
+    DeviceAmgPcgCache* amgPcg = nullptr;
     GamgSolveLog* gamgLog = nullptr;
     // every p_rgh solve's own report, appended in order; null = not kept
     std::vector<DeviceSolverPerf>* pressureSolveLog = nullptr;

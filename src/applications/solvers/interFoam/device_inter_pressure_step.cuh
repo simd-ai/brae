@@ -41,6 +41,9 @@
 #include "device_dilu.cuh"
 #include "device_gamg_solver.cuh"
 #include "device_pcg.cuh"   // DeviceSolverPerf
+#include "device_amg.cuh"   // AMGData, deviceAMGPCG
+#include "fv_geometry.cuh"
+#include "primitive_mesh.cuh"
 #include <functional>
 #include <vector>
 
@@ -89,6 +92,22 @@ struct DeviceInterPressureHooks
     // Required when DeviceInterPressureInput::needReference is set.
     std::function<void(const DeviceBuffer<scalar>& phiHbyAInt,
                        DeviceBuffer<scalar>&       phiHbyABnd)> adjustPhi;
+};
+
+// THE PRESSURE RULE (CLAUDE.md, user decision 2026-10-03): a case's `GAMG` on p_rgh runs brae's AMG-
+// preconditioned PCG (deviceAMGPCG), the fast path simpleFoam and rhoSimpleFoam take, and says so. The
+// hierarchy is the mesh's: agglomerated on the internal faces' |Sf|, as simpleFoam's default, built on first
+// use and again when the addressing changes (DeviceMesh::addressingId); the coefficients are re-coarsened
+// every solve (amgGalerkin). A mesh that moves keeps its hierarchy -- it only preconditions the solve.
+struct DeviceAmgPcgCache
+{
+    const PrimitiveMesh* mesh = nullptr;
+    const FvGeometry* geometry = nullptr;
+    bool built = false;
+    unsigned long long addressingId = 0;
+    AMGData amg;
+
+    AMGData& get(unsigned long long id);
 };
 
 struct DeviceInterPressureInput
@@ -168,6 +187,10 @@ struct DeviceInterPressureInput
     // another preconditioner; `gamg` and this one are never both set, since the entry names one solver.
     const GamgPreconditionerControls* pcgGamg = nullptr;
     DeviceGamgCache* gamgCache = nullptr;
+    // THE PRESSURE RULE (CLAUDE.md): an entry naming GAMG -- `solver GAMG;` or a PCG preconditioned by it --
+    // runs brae's AMG-preconditioned PCG instead, on this cache's hierarchy. Required wherever `gamg` or
+    // `pcgGamg` is set, unless BRAE_PRESSURE_GAMG_PORT=1 asks for the GAMG port.
+    struct DeviceAmgPcgCache* amgPcg = nullptr;
     // the coarsest-level solve of every V-cycle, in order; null = not kept
     GamgSolveLog* gamgLog = nullptr;
     // appended to, one record per solve -- the solver's own initial/final residual and iteration
