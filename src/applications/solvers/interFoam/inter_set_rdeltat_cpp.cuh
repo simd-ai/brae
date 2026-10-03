@@ -53,6 +53,7 @@
 #include "geometric_field.cuh"
 #include "primitive_mesh.cuh"
 #include "fvc.cuh"
+#include <functional>
 #include <set>
 #include <string>
 #include <vector>
@@ -96,6 +97,9 @@ struct SetRDeltaTInput
     // primitiveMesh::cells() for fvc::smooth's wave, when the caller keeps it across steps; null builds it
     // in the call. The caller owns its validity: it must be rebuilt whenever the mesh's addressing changes.
     const CellFaces* cells = nullptr;
+    // S5's wave when set -- the device loop's deviceSmooth (device_fvc_smooth.cuh), which is the host wave to
+    // the bit; empty runs the host wave, fvc::smooth
+    std::function<void(std::vector<scalar>&, scalar)> smooth;
 };
 
 // The three Info lines, gMin/gMax of 1/rDeltaT after S2, after S5 and after S8.

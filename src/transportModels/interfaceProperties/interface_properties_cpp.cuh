@@ -192,6 +192,38 @@ void calculateK(const GeometricField<scalar>& alpha1,
                 SurfaceScalarField&           nHatf,
                 std::vector<scalar>&          K);
 
+// THE BOUNDARY HALF OF calculateK ALONE, for a caller that needs nHatf on the patches (and the contact
+// angle's write-back of alpha's wall gradient) but not the curvature: the cell gradient is taken at the
+// patches' face cells only. MEASURED on RAS/DTCHull (845,536 cells): calculateK 37 ms a call, called four
+// times a step by the device loop's alpha hooks for the boundary normal alone. The same arithmetic in the same
+// order as calculateK's boundary where it applies -- a plain Gauss linear nHat gradient of the unsmoothed field
+// on a mesh with no coupled patch -- and refused by name elsewhere; the compiler may still fuse a multiply-add
+// differently in the two loops (one ulp in a few cells on capillaryRise).
+struct NHatBoundaryStencil
+{
+    bool usable = false;
+    std::vector<label> cells;     // the patches' face cells, ascending
+    std::vector<label> slot;      // per mesh cell: its place in `cells`, -1 when it is not one
+    std::vector<label> start;     // per entry of `cells`: its internal faces, ascending
+    std::vector<label> faces;
+    std::vector<vector> gradAlpha;   // full size; only `cells` are ever written or read
+};
+NHatBoundaryStencil nHatBoundaryStencil(
+    const PrimitiveMesh& m,
+    const std::vector<FvPatch>& patches);
+bool nHatBoundaryOnlyApplies(
+    const InterfaceCoeffs& c,
+    bool gradLeastSquares,
+    const NHatBoundaryStencil& st);
+void calculateNHatBoundary(
+    const GeometricField<scalar>& alpha1,
+    const InterfaceCoeffs& c,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    NHatBoundaryStencil& st,
+    SurfaceScalarField& nHatf);
+
 }   // namespace interfaceProps
 }   // namespace cpu
 }   // namespace brae

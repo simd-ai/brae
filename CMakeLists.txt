@@ -185,6 +185,7 @@ add_library(brae_core STATIC
     src/applications/solvers/interFoam/inter_solve_cpp.cu
     src/applications/solvers/interFoam/inter_set_rdeltat_cpp.cu
     src/finiteVolume/finiteVolume/fvc/fvcSmooth/fvc_smooth_cpp.cu
+    src/finiteVolume/finiteVolume/fvc/fvcSmooth/device_fvc_smooth.cu
     src/applications/solvers/interFoam/inter_peqn_cpp.cu
     src/applications/solvers/interFoam/inter_correct_phi_cpp.cu
     src/finiteVolume/fvMatrices/solvers/MULES/mules_cpp.cu

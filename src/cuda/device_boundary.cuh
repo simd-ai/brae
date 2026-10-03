@@ -365,17 +365,49 @@ void deviceUpdateTotalPressure(DeviceBoundary& db, const DeviceBuffer<scalar>& p
                                const DeviceBuffer<scalar>* rhoBnd = nullptr);   // compressible: rho at the face
                                                                                 // (p in Pa -> 0.5*rho*|U|^2)
 
-inline DeviceVectorBoundary buildDeviceVectorBoundary(
-    const GeometricField<vector>& f,
-    const std::vector<FvPatch>& fvp,
-    const FvGeometry& g,
-    bool storedIoSeed = false)   // as the scalar builder's
+// THE HOST HALF of buildDeviceVectorBoundary: every per-face array the device boundary holds, from the field's
+// patches as they stand. Split from the upload so a caller whose mesh does not move can refresh only the arrays
+// that move (refreshDeviceVectorBoundaryState) from the same arithmetic.
+struct DeviceVectorBoundaryHost
 {
     std::vector<label> ty[3], fc, io, oio, mx, pv, sm, wdg, iofr, gsm;
     std::vector<scalar> dc, ms, ref[3], vf[3], nrm[3], rg[3], wdgT, iost[3], gsn;   // rg = fixedGradient, per component
     // pressureInletOutletVelocity's refValue per face (DeviceVectorBoundary::piovRef)
     std::vector<scalar> prv[3];
     bool anyPiovRef = false;
+};
+
+inline DeviceVectorBoundaryHost deviceVectorBoundaryArrays(
+    const GeometricField<vector>& f,
+    const std::vector<FvPatch>& fvp,
+    const FvGeometry& g,
+    bool storedIoSeed,
+    // the per-call STATE alone (ty, vf, ref, rg, iost, iofr): every other array is left empty -- the caller has
+    // established they are the ones a full build gave (deviceVectorBoundaryShape)
+    bool stateOnly = false)
+{
+    DeviceVectorBoundaryHost h;
+    std::vector<label> (&ty)[3] = h.ty;
+    std::vector<label>& fc = h.fc;
+    std::vector<label>& io = h.io;
+    std::vector<label>& oio = h.oio;
+    std::vector<label>& mx = h.mx;
+    std::vector<label>& pv = h.pv;
+    std::vector<label>& sm = h.sm;
+    std::vector<label>& wdg = h.wdg;
+    std::vector<label>& iofr = h.iofr;
+    std::vector<label>& gsm = h.gsm;
+    std::vector<scalar>& dc = h.dc;
+    std::vector<scalar>& ms = h.ms;
+    std::vector<scalar> (&ref)[3] = h.ref;
+    std::vector<scalar> (&vf)[3] = h.vf;
+    std::vector<scalar> (&nrm)[3] = h.nrm;
+    std::vector<scalar> (&rg)[3] = h.rg;
+    std::vector<scalar>& wdgT = h.wdgT;
+    std::vector<scalar> (&iost)[3] = h.iost;
+    std::vector<scalar>& gsn = h.gsn;
+    std::vector<scalar> (&prv)[3] = h.prv;
+    bool& anyPiovRef = h.anyPiovRef;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         if (isCoupledInterfaceType(fvp[pi].type)) continue;                     // cyclic = internal-like (handled by appended faces)
@@ -395,7 +427,7 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
             const scalar a = mag(sumA);
             planeN = (a > scalar(1.0e-150)) ? sumA/a : vector{0, 0, 0};
         }
-        for (label i = 0; i < fvp[pi].size; ++i)
+        for (label i = 0; i < fvp[pi].size && !stateOnly; ++i)
         {
             const label gf = fvp[pi].start + i;
             const vector n = gradSym ? g.Sf()[gf]/g.magSf()[gf] : planeN;
@@ -422,7 +454,7 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
                 "vector per face.");
         }
         anyPiovRef = anyPiovRef || piovRefHost != nullptr;
-        for (label i = 0; i < fvp[pi].size; ++i)
+        for (label i = 0; i < fvp[pi].size && !stateOnly; ++i)
         {
             const vector rv = piovRefHost ? (*piovRefHost)[static_cast<std::size_t>(i)] : vector{0, 0, 0};
             prv[0].push_back(rv.x);
@@ -448,11 +480,14 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
         const std::vector<vector>* rgv = f.boundary[pi]->refGradPtr();
         for (label i = 0; i < fvp[pi].size; ++i)
         {
-            fc.push_back(fvp[pi].faceCells[i]);
-            dc.push_back(fvp[pi].deltaCoeffs[i]);
-            ms.push_back(g.magSf()[fvp[pi].start + i]);
-            io.push_back(cat == 3 ? 1 : 0);
-            oio.push_back(cat == 4 ? 1 : 0);   // inletOutlet / outletInlet (same flux for all 3 comps)
+            if (!stateOnly)
+            {
+                fc.push_back(fvp[pi].faceCells[i]);
+                dc.push_back(fvp[pi].deltaCoeffs[i]);
+                ms.push_back(g.magSf()[fvp[pi].start + i]);
+                io.push_back(cat == 3 ? 1 : 0);
+                oio.push_back(cat == 4 ? 1 : 0);   // inletOutlet / outletInlet (same flux for all 3 comps)
+            }
             iofr.push_back((cat == 3 && storedIoSeed && ioStoredEnabled()) ? 1 : 0);
             // A WEDGE is NOT in the mixed mask, even though it reports category 5. It borrows the mixed
             // (Robin) slot for its COEFFICIENTS only -- its valueFraction d_k = 0.5*(1 - cellT_kk) is pure
@@ -462,9 +497,12 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
             // planes. On movingCone that put nuEff*magSf*deltaCoeffs (which scales as 1/r^2 at the axis)
             // into the momentum diagonal: rAU fell 17x in the first radial row, so U = HbyA - rAU*grad(p)
             // came out 7x short of OpenFOAM's on a pressure field that agreed to 2%.
-            mx.push_back((cat == 5 && !wedge) ? 1 : 0);
-            pv.push_back(cat == 6 ? 1 : 0);
-            sm.push_back(sym ? 1 : 0);   // mixed / piov / symmetry masks
+            if (!stateOnly)
+            {
+                mx.push_back((cat == 5 && !wedge) ? 1 : 0);
+                pv.push_back(cat == 6 ? 1 : 0);
+                sm.push_back(sym ? 1 : 0);   // mixed / piov / symmetry masks
+            }
             const scalar seedVf = (cat == 5 && vfp) ? (*vfp)[i] : 0.0;
             {
                 // fvPatch::nf() = Sf()/magSf() (fvPatch.C:150-153), a DIVISION, as the host's patch.nf is
@@ -482,8 +520,9 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
                 rg[0].push_back(gv.x); rg[1].push_back(gv.y); rg[2].push_back(gv.z);
             }
             const scalar rv[3] = { val[i].x, val[i].y, val[i].z };
-            wdg.push_back(wedge ? 1 : 0);
+            if (!stateOnly)
             {
+                wdg.push_back(wedge ? 1 : 0);
                 const tensor T = wedge ? *wfT : tensor{1,0,0,0,1,0,0,0,1};
                 const scalar t9[9] = {T.xx, T.xy, T.xz, T.yx, T.yy, T.yz, T.zx, T.zy, T.zz};
                 for (int q = 0; q < 9; ++q) wdgT.push_back(t9[q]);
@@ -528,6 +567,33 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
             }
         }
     }
+    return h;
+}
+
+// the upload half of buildDeviceVectorBoundary, from arrays already built
+inline DeviceVectorBoundary uploadDeviceVectorBoundary(const DeviceVectorBoundaryHost& h)
+{
+    const std::vector<label> (&ty)[3] = h.ty;
+    const std::vector<label>& fc = h.fc;
+    const std::vector<label>& io = h.io;
+    const std::vector<label>& oio = h.oio;
+    const std::vector<label>& mx = h.mx;
+    const std::vector<label>& pv = h.pv;
+    const std::vector<label>& sm = h.sm;
+    const std::vector<label>& wdg = h.wdg;
+    const std::vector<label>& iofr = h.iofr;
+    const std::vector<label>& gsm = h.gsm;
+    const std::vector<scalar>& dc = h.dc;
+    const std::vector<scalar>& ms = h.ms;
+    const std::vector<scalar> (&ref)[3] = h.ref;
+    const std::vector<scalar> (&vf)[3] = h.vf;
+    const std::vector<scalar> (&nrm)[3] = h.nrm;
+    const std::vector<scalar> (&rg)[3] = h.rg;
+    const std::vector<scalar>& wdgT = h.wdgT;
+    const std::vector<scalar> (&iost)[3] = h.iost;
+    const std::vector<scalar>& gsn = h.gsn;
+    const std::vector<scalar> (&prv)[3] = h.prv;
+    const bool anyPiovRef = h.anyPiovRef;
     DeviceVectorBoundary db;
     db.n = static_cast<int>(fc.size());
     // BRAE_CONTROL_DEVICE_PIOV_NOREF=1 leaves the refValue off the device -- the inflow tangential part is
@@ -565,6 +631,138 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
         db.comp[k].faceCell.copyFrom(fc);
     }
     return db;
+}
+
+inline DeviceVectorBoundary buildDeviceVectorBoundary(
+    const GeometricField<vector>& f,
+    const std::vector<FvPatch>& fvp,
+    const FvGeometry& g,
+    bool storedIoSeed = false)   // as the scalar builder's
+{
+    return uploadDeviceVectorBoundary(deviceVectorBoundaryArrays(f, fvp, g, storedIoSeed));
+}
+
+// WHAT THE NON-STATE ARRAYS ARE BUILT FROM: the boundary's geometry (face cells, the patches' deltaCoeffs, Sf
+// and magSf on their faces) and each uncoupled patch's kind -- its type, category, symmetry, wedge tensors and
+// tangentialVelocity refValue. Two equal keys give the same non-state arrays, so a refresh can skip building
+// them; a cyclicACMI whose open fraction moves changes its faces' areas and so its key.
+struct DeviceVectorBoundaryShape
+{
+    std::vector<label> fc;
+    std::vector<scalar> geom;
+    std::vector<std::string> kind;
+    std::vector<scalar> kindData;
+
+    bool operator==(const DeviceVectorBoundaryShape& o) const
+    {
+        return fc == o.fc && geom == o.geom && kind == o.kind && kindData == o.kindData;
+    }
+};
+
+inline DeviceVectorBoundaryShape deviceVectorBoundaryShape(
+    const GeometricField<vector>& f,
+    const std::vector<FvPatch>& fvp,
+    const FvGeometry& g)
+{
+    DeviceVectorBoundaryShape k;
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+        const int cat = (fvp[pi].type == "processor") ? 8 : f.boundary[pi]->bcCategory();
+        k.kind.push_back(fvp[pi].type + "|" + std::to_string(cat) + "|"
+                         + (f.boundary[pi]->isSymmetry() ? "s" : "-"));
+        const tensor* wfT = f.boundary[pi]->wedgeFaceT();
+        const tensor* wcT = f.boundary[pi]->wedgeCellT();
+        for (const tensor* T : {wfT, wcT})
+        {
+            if (T)
+            {
+                k.kindData.insert(k.kindData.end(), {T->xx, T->xy, T->xz, T->yx, T->yy, T->yz, T->zx, T->zy, T->zz});
+            }
+        }
+        if (const std::vector<vector>* tr = f.boundary[pi]->tangentialRefPtr())
+        {
+            for (const vector& v : *tr)
+            {
+                k.kindData.insert(k.kindData.end(), {v.x, v.y, v.z});
+            }
+        }
+        for (label i = 0; i < fvp[pi].size; ++i)
+        {
+            const label gf = fvp[pi].start + i;
+            k.fc.push_back(fvp[pi].faceCells[i]);
+            k.geom.insert(k.geom.end(), {fvp[pi].deltaCoeffs[i], g.magSf()[gf], g.Sf()[gf].x, g.Sf()[gf].y,
+                                         g.Sf()[gf].z});
+        }
+    }
+    return k;
+}
+
+// ...and on a mesh that does NOT MOVE, the arrays that can change between two builds alone: the per-face type,
+// valueFraction, refValue, refGrad and the inletOutlet stored value and seed -- the patches' state, and what the
+// device's update kernels rewrite in place. The geometry, the masks and the wedge tensors stay as `db` holds
+// them from its full build. MEASURED on RAS/DTCHull (69,887 boundary faces): a full build 16 ms, three a step,
+// two thirds of it the uploads. The caller owns the precondition: deviceVectorBoundaryShape equal to the one `db`
+// was built with. MEASURED on RAS/damBreakLeakage, where a cyclicACMI's open fraction moves on an unmoved mesh:
+// U 3.0e-01 from OpenFOAM on the device arm with the first build's geometry kept, 5.1e-12 rebuilt.
+inline void refreshDeviceVectorBoundaryState(
+    DeviceVectorBoundary& db,
+    const DeviceVectorBoundaryHost& h)
+{
+    if (static_cast<int>(h.ty[0].size()) != db.n)
+    {
+        throw std::runtime_error(
+            "brae: refreshDeviceVectorBoundaryState on a boundary of another size -- the device boundary was "
+            "built for a different mesh, which needs buildDeviceVectorBoundary.");
+    }
+    // ONE UPLOAD per type, then the device splits it: eighteen blocking uploads of one boundary's worth each
+    // were 23.7 ms a step on RAS/DTCHull (69,887 boundary faces, three calls a step)
+    const std::size_t n = static_cast<std::size_t>(db.n);
+    std::vector<scalar> packS;
+    packS.reserve(12*n);
+    std::vector<label> packL;
+    packL.reserve(4*n);
+    for (int k = 0; k < 3; ++k)
+    {
+        packS.insert(packS.end(), h.iost[k].begin(), h.iost[k].end());
+        packS.insert(packS.end(), h.vf[k].begin(), h.vf[k].end());
+        packS.insert(packS.end(), h.ref[k].begin(), h.ref[k].end());
+        packS.insert(packS.end(), h.rg[k].begin(), h.rg[k].end());
+        packL.insert(packL.end(), h.ty[k].begin(), h.ty[k].end());
+    }
+    packL.insert(packL.end(), h.iofr.begin(), h.iofr.end());
+    static DeviceBuffer<scalar> stageS;
+    static DeviceBuffer<label> stageL;
+    stageS.copyFrom(packS);
+    stageL.copyFrom(packL);
+    auto put = [&](DeviceBuffer<scalar>& to, std::size_t at)
+    {
+        if (to.size() != n)
+        {
+            to.resize(n);
+        }
+        cudaCheck(cudaMemcpyAsync(to.data(), stageS.data() + at*n, n*sizeof(scalar), cudaMemcpyDeviceToDevice,
+                                  cudaStreamPerThread), "boundary state split");
+    };
+    auto putL = [&](DeviceBuffer<label>& to, std::size_t at)
+    {
+        if (to.size() != n)
+        {
+            to.resize(n);
+        }
+        cudaCheck(cudaMemcpyAsync(to.data(), stageL.data() + at*n, n*sizeof(label), cudaMemcpyDeviceToDevice,
+                                  cudaStreamPerThread), "boundary state split");
+    };
+    for (int k = 0; k < 3; ++k)
+    {
+        const std::size_t base = 4*static_cast<std::size_t>(k);
+        put(db.comp[k].ioStored, base);
+        put(db.comp[k].valueFraction, base + 1);
+        put(db.comp[k].refValue, base + 2);
+        put(db.comp[k].refGrad, base + 3);
+        putL(db.comp[k].bcType, static_cast<std::size_t>(k));
+        putL(db.comp[k].ioFresh, 3);
+    }
 }
 
 } // namespace brae

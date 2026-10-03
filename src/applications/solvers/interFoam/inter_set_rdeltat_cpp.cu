@@ -265,7 +265,14 @@ SetRDeltaTReport setRDeltaT(
     if (c.rDeltaTSmoothingCoeff < 1.0)
     {
         interPhase::Nested timed("setRDeltaT S5: fvc::smooth");
-        fvc::smooth(rDeltaT, c.rDeltaTSmoothingCoeff, m, patches, in.cells);
+        if (in.smooth)
+        {
+            in.smooth(rDeltaT, c.rDeltaTSmoothingCoeff);
+        }
+        else
+        {
+            fvc::smooth(rDeltaT, c.rDeltaTSmoothingCoeff, m, patches, in.cells);
+        }
     }
 
     // S6, :95-111 -- refused where the case is read; asserted here so a caller that skipped the refusal

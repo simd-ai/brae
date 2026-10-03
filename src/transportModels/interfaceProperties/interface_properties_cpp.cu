@@ -194,6 +194,106 @@ void curvature(const SurfaceScalarField&   nHatf,
 }
 
 
+// calculateK's BOUNDARY HALF: nHatf on every patch, and the contact angle's write-back of alpha's wall
+// gradient, from the cell gradient at the patches' face cells (and, on a coupled patch, at the cells on its
+// other side). Shared by calculateK and calculateNHatBoundary, so the two cannot drift apart.
+void nHatBoundary(
+    const GeometricField<scalar>& alpha1,
+    scalar dN,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    const std::vector<vector>& gradAlpha,
+    SurfaceScalarField& nHatf)
+{
+    const std::vector<vector>& Sf = g.Sf();
+    // Patches that are not alphaContactAngle take the face cell's gradient unchanged (fvc::interpolate at
+    // an uncoupled patch is the patch value, and the gradient's patch value is the cell's).
+    nHatf.boundary.assign(patches.size(), std::vector<scalar>{});
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& q = patches[pi];
+
+        // gradAlphaf's BOUNDARY VALUE is not the owner cell's gradient. fvc::grad runs
+        // gaussGrad::correctBoundaryConditions, which replaces the WALL-NORMAL COMPONENT with the
+        // patch's own snGrad (gaussGrad.C):
+        //
+        //     gGrad_b += n*(vsf_b.snGrad() - (n & gGrad_b))
+        //
+        // and fvc::interpolate at an uncoupled patch then returns that value unchanged. This mattered
+        // more than anywhere else it could have: on a contact-angle patch alpha's snGrad is exactly
+        // what the contact angle SETS, so taking the raw cell gradient here discards the boundary
+        // condition's own contribution to the normal the curvature is built from. Measured on
+        // capillaryRise, where the contact angle carries the whole case.
+        std::vector<vector> gb(static_cast<std::size_t>(q.size));
+        const std::vector<scalar> snA = alpha1.boundary[pi]->snGrad(alpha1.internal);
+        for (label i = 0; i < q.size; ++i)
+        {
+            if (q.coupled)
+            {
+                // ...and at a COUPLED patch it returns the two cells' gradients interpolated, as on an
+                // internal face; gaussGrad::correctBoundaryConditions leaves a coupled patch alone
+                gb[i] = coupledLinear(q, i, gradAlpha);
+                continue;
+            }
+            const vector& n  = q.nf[i];
+            // on a wedge grad(alpha)'s own patch value is the cell gradient ROTATED onto the plane,
+            // faceT & grad -- see fvc::gradUBoundary
+            const tensor* faceT = alpha1.boundary[pi]->wedgeFaceT();
+            const vector& gcell = gradAlpha[q.faceCells[i]];
+            const vector  gc = faceT ? vector{faceT->xx*gcell.x + faceT->xy*gcell.y + faceT->xz*gcell.z,
+                                              faceT->yx*gcell.x + faceT->yy*gcell.y + faceT->yz*gcell.z,
+                                              faceT->zx*gcell.x + faceT->zy*gcell.y + faceT->zz*gcell.z}
+                                     : gcell;
+            const scalar  nn = n.x*gc.x + n.y*gc.y + n.z*gc.z;
+            const scalar  d  = snA[i] - nn;
+            gb[i] = vector{gc.x + n.x*d, gc.y + n.y*d, gc.z + n.z*d};
+        }
+
+        std::vector<vector> nb;
+        faceUnitNormal(gb, dN, nb);
+
+        // correctContactAngle, on every patch that IS one. The patch itself carries theta0 -- brae's
+        // ConstantAlphaContactAnglePatchField returns it from contactAngleTheta0() -- so the dispatch
+        // is the same question OpenFOAM asks (isA<alphaContactAngleTwoPhaseFvPatchScalarField>) and
+        // there is no parallel list to keep in step with the boundary conditions.
+        // BRAE_NO_CONTACT_ANGLE is the gate's CONTROL, not a user switch: capillaryRise's whole
+        // motion comes from this correction, and tests/test_inter_capillary_vs_openfoam.cu turns it
+        // off to show that -- without it brae's velocity is 200x too small, not 10% off.
+        const scalar theta0 = std::getenv("BRAE_NO_CONTACT_ANGLE")
+                            ? scalar(-1) : alpha1.boundary[pi]->contactAngleTheta0();
+        if (theta0 >= scalar(0))
+        {
+            const std::vector<scalar> th(static_cast<std::size_t>(q.size),
+                                         theta0 * scalar(M_PI) / scalar(180));
+            correctContactAngle(nb, q.nf, th, dN);
+
+            // ...AND THE PATCH'S OWN GRADIENT IS WRITTEN BACK (interfaceProperties.C:97):
+            //     acap.gradient() = (nf & nHatp)*mag(gradAlphaf[patchi]);  acap.evaluate();
+            // The contact angle does not only bend the normal the curvature is built from -- it sets
+            // alpha's WALL GRADIENT, and therefore the next gradient of alpha, and therefore where the
+            // interface meets the wall at all. A port that corrected nHat and stopped would wet the
+            // wall identically whatever theta0 said.
+            const std::vector<scalar> gr = contactAngleGradient(nb, q.nf, gb);
+            auto* fg = dynamic_cast<FixedGradientPatchField<scalar>*>(
+                const_cast<fvPatchField<scalar>*>(alpha1.boundary[pi].get()));
+            if (!fg)
+                throw std::runtime_error(
+                    "brae interfaceProperties: patch '" + q.name + "' reports a contact angle but is "
+                    "not a fixedGradient patch, so its wall gradient cannot be set. OpenFOAM's "
+                    "alphaContactAngle derives from fixedGradient for exactly this reason.");
+            fg->setGradient(gr);
+            const_cast<GeometricField<scalar>&>(alpha1).boundary[pi]->evaluate(alpha1.internal);
+        }
+        nHatf.boundary[pi].resize(static_cast<std::size_t>(q.size));
+        for (label i = 0; i < q.size; ++i)
+        {
+            const vector& S = Sf[q.start + i];
+            nHatf.boundary[pi][i] = nb[i].x*S.x + nb[i].y*S.y + nb[i].z*S.z;
+        }
+    }
+
+}
+
 void calculateK(const GeometricField<scalar>& alpha1,
                 const InterfaceCoeffs&        c,
                 const PrimitiveMesh&          m,
@@ -290,95 +390,135 @@ void calculateK(const GeometricField<scalar>& alpha1,
     for (label f = 0; f < nIf; ++f)
         nHatf.internal[f] = nHatfv[f].x*Sf[f].x + nHatfv[f].y*Sf[f].y + nHatfv[f].z*Sf[f].z;
 
-    // ...and the boundary, where the contact-angle correction lives. Patches that are not
-    // alphaContactAngle take the face cell's gradient unchanged (fvc::interpolate at an uncoupled
-    // patch is the patch value, and the gradient's patch value is the cell's).
-    nHatf.boundary.assign(patches.size(), std::vector<scalar>{});
-    for (std::size_t pi = 0; pi < patches.size(); ++pi)
-    {
-        const FvPatch& q = patches[pi];
-
-        // gradAlphaf's BOUNDARY VALUE is not the owner cell's gradient. fvc::grad runs
-        // gaussGrad::correctBoundaryConditions, which replaces the WALL-NORMAL COMPONENT with the
-        // patch's own snGrad (gaussGrad.C):
-        //
-        //     gGrad_b += n*(vsf_b.snGrad() - (n & gGrad_b))
-        //
-        // and fvc::interpolate at an uncoupled patch then returns that value unchanged. This mattered
-        // more than anywhere else it could have: on a contact-angle patch alpha's snGrad is exactly
-        // what the contact angle SETS, so taking the raw cell gradient here discards the boundary
-        // condition's own contribution to the normal the curvature is built from. Measured on
-        // capillaryRise, where the contact angle carries the whole case.
-        std::vector<vector> gb(static_cast<std::size_t>(q.size));
-        const std::vector<scalar> snA = alpha1.boundary[pi]->snGrad(alpha1.internal);
-        for (label i = 0; i < q.size; ++i)
-        {
-            if (q.coupled)
-            {
-                // ...and at a COUPLED patch it returns the two cells' gradients interpolated, as on an
-                // internal face; gaussGrad::correctBoundaryConditions leaves a coupled patch alone
-                gb[i] = coupledLinear(q, i, gradAlpha);
-                continue;
-            }
-            const vector& n  = q.nf[i];
-            // on a wedge grad(alpha)'s own patch value is the cell gradient ROTATED onto the plane,
-            // faceT & grad -- see fvc::gradUBoundary
-            const tensor* faceT = alpha1.boundary[pi]->wedgeFaceT();
-            const vector& gcell = gradAlpha[q.faceCells[i]];
-            const vector  gc = faceT ? vector{faceT->xx*gcell.x + faceT->xy*gcell.y + faceT->xz*gcell.z,
-                                              faceT->yx*gcell.x + faceT->yy*gcell.y + faceT->yz*gcell.z,
-                                              faceT->zx*gcell.x + faceT->zy*gcell.y + faceT->zz*gcell.z}
-                                     : gcell;
-            const scalar  nn = n.x*gc.x + n.y*gc.y + n.z*gc.z;
-            const scalar  d  = snA[i] - nn;
-            gb[i] = vector{gc.x + n.x*d, gc.y + n.y*d, gc.z + n.z*d};
-        }
-
-        std::vector<vector> nb;
-        faceUnitNormal(gb, dN, nb);
-
-        // correctContactAngle, on every patch that IS one. The patch itself carries theta0 -- brae's
-        // ConstantAlphaContactAnglePatchField returns it from contactAngleTheta0() -- so the dispatch
-        // is the same question OpenFOAM asks (isA<alphaContactAngleTwoPhaseFvPatchScalarField>) and
-        // there is no parallel list to keep in step with the boundary conditions.
-        // BRAE_NO_CONTACT_ANGLE is the gate's CONTROL, not a user switch: capillaryRise's whole
-        // motion comes from this correction, and tests/test_inter_capillary_vs_openfoam.cu turns it
-        // off to show that -- without it brae's velocity is 200x too small, not 10% off.
-        const scalar theta0 = std::getenv("BRAE_NO_CONTACT_ANGLE")
-                            ? scalar(-1) : alpha1.boundary[pi]->contactAngleTheta0();
-        if (theta0 >= scalar(0))
-        {
-            const std::vector<scalar> th(static_cast<std::size_t>(q.size),
-                                         theta0 * scalar(M_PI) / scalar(180));
-            correctContactAngle(nb, q.nf, th, dN);
-
-            // ...AND THE PATCH'S OWN GRADIENT IS WRITTEN BACK (interfaceProperties.C:97):
-            //     acap.gradient() = (nf & nHatp)*mag(gradAlphaf[patchi]);  acap.evaluate();
-            // The contact angle does not only bend the normal the curvature is built from -- it sets
-            // alpha's WALL GRADIENT, and therefore the next gradient of alpha, and therefore where the
-            // interface meets the wall at all. A port that corrected nHat and stopped would wet the
-            // wall identically whatever theta0 said.
-            const std::vector<scalar> gr = contactAngleGradient(nb, q.nf, gb);
-            auto* fg = dynamic_cast<FixedGradientPatchField<scalar>*>(
-                const_cast<fvPatchField<scalar>*>(alpha1.boundary[pi].get()));
-            if (!fg)
-                throw std::runtime_error(
-                    "brae interfaceProperties: patch '" + q.name + "' reports a contact angle but is "
-                    "not a fixedGradient patch, so its wall gradient cannot be set. OpenFOAM's "
-                    "alphaContactAngle derives from fixedGradient for exactly this reason.");
-            fg->setGradient(gr);
-            const_cast<GeometricField<scalar>&>(alpha1).boundary[pi]->evaluate(alpha1.internal);
-        }
-        nHatf.boundary[pi].resize(static_cast<std::size_t>(q.size));
-        for (label i = 0; i < q.size; ++i)
-        {
-            const vector& S = Sf[q.start + i];
-            nHatf.boundary[pi][i] = nb[i].x*S.x + nb[i].y*S.y + nb[i].z*S.z;
-        }
-    }
+    // ...and the boundary, where the contact-angle correction lives (nHatBoundary)
+    nHatBoundary(alpha1, dN, g, patches, gradAlpha, nHatf);
 
     // 5. K = -div(nHatf)
     curvature(nHatf, m, g, patches, K);
+}
+
+NHatBoundaryStencil nHatBoundaryStencil(
+    const PrimitiveMesh& m,
+    const std::vector<FvPatch>& patches)
+{
+    NHatBoundaryStencil st;
+    const label nC = m.nCells();
+    const label nIf = m.nInternalFaces();
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    std::vector<char> wanted(static_cast<std::size_t>(nC), 0);
+    for (const FvPatch& q : patches)
+    {
+        if (q.coupled) return st;
+        for (label i = 0; i < q.size; ++i) wanted[static_cast<std::size_t>(q.faceCells[i])] = 1;
+    }
+    st.slot.assign(static_cast<std::size_t>(nC), label(-1));
+    for (label c = 0; c < nC; ++c)
+    {
+        if (!wanted[static_cast<std::size_t>(c)]) continue;
+        st.slot[static_cast<std::size_t>(c)] = static_cast<label>(st.cells.size());
+        st.cells.push_back(c);
+    }
+    // each cell's internal faces in ascending face order -- the order gaussGrad's face loop reaches it
+    std::vector<std::vector<label>> faces(st.cells.size());
+    for (label f = 0; f < nIf; ++f)
+    {
+        const label so = st.slot[static_cast<std::size_t>(own[f])];
+        const label sn = st.slot[static_cast<std::size_t>(nei[f])];
+        if (so >= 0) faces[static_cast<std::size_t>(so)].push_back(f);
+        if (sn >= 0) faces[static_cast<std::size_t>(sn)].push_back(f);
+    }
+    st.start.push_back(0);
+    for (const std::vector<label>& fl : faces)
+    {
+        st.faces.insert(st.faces.end(), fl.begin(), fl.end());
+        st.start.push_back(static_cast<label>(st.faces.size()));
+    }
+    st.gradAlpha.assign(static_cast<std::size_t>(nC), vector{0, 0, 0});
+    st.usable = true;
+    return st;
+}
+
+bool nHatBoundaryOnlyApplies(
+    const InterfaceCoeffs& c,
+    bool gradLeastSquares,
+    const NHatBoundaryStencil& st)
+{
+    GradChoice nHatGrad = c.nHatGrad;
+    nHatGrad.leastSquares = nHatGrad.leastSquares || gradLeastSquares;
+    return st.usable && c.nAlphaSmoothCurvature < 1 && nHatGrad.gaussLinear();
+}
+
+void calculateNHatBoundary(
+    const GeometricField<scalar>& alpha1,
+    const InterfaceCoeffs& c,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    NHatBoundaryStencil& st,
+    SurfaceScalarField& nHatf)
+{
+    if (!nHatBoundaryOnlyApplies(c, false, st))
+    {
+        throw std::runtime_error(
+            "brae interfaceProperties::calculateNHatBoundary: the case's nHat is not a plain Gauss linear "
+            "gradient of the unsmoothed field on a mesh with no coupled patch, which is all this boundary-only "
+            "form reproduces; calculateK is the call for it.");
+    }
+    if (!(c.deltaN > scalar(0)))
+    {
+        throw std::runtime_error("brae interfaceProperties::calculateNHatBoundary: InterfaceCoeffs::deltaN is unset.");
+    }
+    // fvc::gaussGrad (fvc.cu) at the patches' face cells only: every term in the order the full face loop
+    // adds it to that cell -- its internal faces ascending, then its boundary faces patch by patch -- and
+    // the same operators, so each cell's gradient is the full one's to the bit
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    const std::vector<scalar>& w = g.weights();
+    const std::vector<vector>& Sf = g.Sf();
+    std::vector<vector> acc(st.cells.size(), vector{0, 0, 0});
+    for (std::size_t k = 0; k < st.cells.size(); ++k)
+    {
+        const label cell = st.cells[k];
+        for (label j = st.start[k]; j < st.start[k + 1]; ++j)
+        {
+            const label f = st.faces[static_cast<std::size_t>(j)];
+            const label o = own[static_cast<std::size_t>(f)];
+            const label n = nei[static_cast<std::size_t>(f)];
+            const scalar P = alpha1.internal[static_cast<std::size_t>(o)];
+            const scalar N = alpha1.internal[static_cast<std::size_t>(n)];
+            const scalar pf = w[static_cast<std::size_t>(f)] * (P - N) + N;
+            const vector Sfssf = Sf[static_cast<std::size_t>(f)] * pf;
+            if (o == cell)
+            {
+                acc[k] += Sfssf;
+            }
+            else
+            {
+                acc[k] = acc[k] - Sfssf;
+            }
+        }
+    }
+    // BRAE_CONTROL_NHAT_NO_PATCH_TERMS=1 leaves the patch faces' terms out of the gradient -- the identity
+    // gate's control, which has to show the comparison can fail
+    static const bool noPatchTerms = std::getenv("BRAE_CONTROL_NHAT_NO_PATCH_TERMS") != nullptr;
+    for (std::size_t pi = 0; pi < patches.size() && !noPatchTerms; ++pi)
+    {
+        const FvPatch& fp = patches[pi];
+        if (fp.type == "empty") continue;
+        const std::vector<scalar>& pv = alpha1.boundary[pi]->value();
+        for (label i = 0; i < fp.size; ++i)
+        {
+            const std::size_t k = static_cast<std::size_t>(st.slot[static_cast<std::size_t>(fp.faceCells[i])]);
+            acc[k] += Sf[static_cast<std::size_t>(fp.start + i)] * pv[static_cast<std::size_t>(i)];
+        }
+    }
+    for (std::size_t k = 0; k < st.cells.size(); ++k)
+    {
+        const label cell = st.cells[k];
+        st.gradAlpha[static_cast<std::size_t>(cell)] = acc[k] / g.V()[static_cast<std::size_t>(cell)];
+    }
+    nHatBoundary(alpha1, c.deltaN, g, patches, st.gradAlpha, nHatf);
 }
 
 }   // namespace interfaceProps
