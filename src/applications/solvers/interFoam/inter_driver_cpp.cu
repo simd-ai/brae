@@ -1,5 +1,6 @@
 // brae's interFoam time loop -- see inter_driver_cpp.cuh for why the driver owns no numerics and for
 // the four old-time fields that are its actual content.
+#include <optional>
 #include <filesystem>
 #include "inter_phase_time.cuh"
 #include "inter_driver_cpp.cuh"
@@ -184,6 +185,8 @@ void interMeshUpdate(
     // density times gh at the boundary FACE CENTRES (`p == p_rgh + rho*gh` in pEqn.H forces the patch
     // values; `mesh.C()`'s boundary field is Cf). p_rgh's own boundary would leave out exactly the
     // buoyancy the body floats on.
+    std::optional<interPhase::Nested> updatePart;
+    updatePart.emplace("update: the body's load (pressure, nuEff on the patches)");
     std::vector<std::vector<scalar>> bodyP, bodyNuEff;
     std::vector<scalar> bodyNuEffCells;
     BodyLoad load;
@@ -209,8 +212,10 @@ void interMeshUpdate(
         load.rho = &f.rhoBnd;
         load.nuEff = &bodyNuEff;
     }
+    updatePart.reset();
     dyn->update(time, rep.deltaT, timeIndex, finalIteration, &gamgCache,
                 needLoad ? &load : nullptr);
+    updatePart.emplace("update: the cyclicACMI after the move and the Crank-Nicolson mesh flux");
     // cyclicACMIFvPatch::movePoints, HERE and not later: fvMesh::movePoints runs the boundary's own
     // movePoints as part of the move, so it lands before fvc::meshPhi is read -- and under
     // CrankNicolson the off-centred mesh flux is built from it, so a scaling applied after that blend
@@ -259,7 +264,9 @@ void interMeshUpdate(
     }
     const SurfaceScalarField& meshPhiU = fvcMeshPhi(*dyn, f);
     // ...and fvMesh::movePoints moves the mesh objects with it: kOmegaSST's wall distance
+    updatePart.emplace("update: the closure's distances (moveInterTurbulence, host)");
     moveInterTurbulence(f.turbulence, m, g, patches, timeIndex);
+    updatePart.emplace("update: the cyclicAMI weights");
     // cyclicAMIPolyPatch::initMovePoints marks the AMI out of date, and the next AMI()
     // recomputes it on the moved points: before anything below interpolates across it
     if (amiPairs && !amiPairs->empty())
@@ -282,6 +289,7 @@ void interMeshUpdate(
     // movingWallVelocity patch takes the wall's velocity from the motion of THIS
     // step (movingWallVelocityFvPatchVectorField.C, Uwall), every other patch is
     // evaluated as it stands
+    updatePart.emplace("update: moving walls, wave inlets, U's patches evaluated");
     updateMovingWallVelocity(f, *dyn, meshPhiU, m, g, patches, rep.deltaT);
     // ...and a wave condition's model, whose FIRST update of the step is this one on a
     // moving mesh: OpenFOAM's log prints "Updating ... wave model" right after the
@@ -325,6 +333,7 @@ void interMeshUpdate(
     f.U.evaluateBoundary();
 
     // interFoam.C:130-131: gh and ghf follow the cell and face centres
+    updatePart.emplace("update: gh and ghf");
     ghField(f.g, f.ghRefValue, g.C(), f.gh);
     {
         std::vector<vector> Cf(g.Cf().begin(), g.Cf().begin() + m.nInternalFaces());
@@ -344,6 +353,7 @@ void interMeshUpdate(
     // because on that mesh this block is the only one after a change (interAfterMeshChange's own is
     // skipped, see its motionFollows): no Sf & Uf rebuild, no pcorr and no makeRelative, the mapped flux
     // kept. The mixture and the curvature below still run -- the adapter carries neither through a change.
+    updatePart.emplace("update: the flux from Uf, rAU to the faces");
     const bool amrNoCorrectPhi = f.amr && f.amr->active
                               && std::getenv("BRAE_CONTROL_AMR_NO_CORRECTPHI") != nullptr;
     if (f.correctPhi)
@@ -372,6 +382,7 @@ void interMeshUpdate(
             cin.meshPhi = &meshPhiU;
             cin.rhoPhi = &f.rhoPhi;
             cin.solveLog = &rep.pcorrSolves;
+            updatePart.reset();
             interPhase::Nested timedCorrectPhi("mesh: CorrectPhi (pcorr)");
             correctPhi(f.U, f.phi, f.p_rgh, cin, cpc, m, g, patches);
             // correctPhi.H:11, #include "continuityErrs.H" on the absolute flux.
@@ -387,9 +398,11 @@ void interMeshUpdate(
         }
         // mixture.correct(): calcNu, whose values alpha has not moved, then
         // interfaceProperties::correct() on the moved mesh
+        updatePart.emplace("update: the mixture's viscosity after the move");
         cpu::twoPhase::mixtureMu(f.alpha1.internal, f.mixture.phases, f.mu);
         cpu::twoPhase::mixtureNu(f.alpha1.internal, f.mu, f.mixture.phases, f.nu);
         updateMixtureBoundary(f, patches);
+        updatePart.reset();
         interPhase::Nested timedK("mesh: the curvature after the move (host calculateK)");
         interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, f.nHatf, f.K);
     }
