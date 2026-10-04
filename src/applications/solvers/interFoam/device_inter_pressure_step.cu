@@ -6,6 +6,7 @@
 #include "device_ldu.cuh"
 #include "device_pcg.cuh"
 #include "device_mesh.cuh"
+#include <optional>
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <cstdlib>
@@ -450,9 +451,14 @@ scalar deviceInterPressureStep(
                             "instead -- same operator, different Krylov method and iteration count\n", asked);
             }
             interPhase::Nested timed("pressure: AMG-PCG solve");
+            // ...and its three parts, as pcorr's solve names its own
+            std::optional<interPhase::Nested> timedPart;
+            timedPart.emplace("pressure: the hierarchy's coarse matrices (Galerkin)");
             AMGData& amg = in.amgPcg->get(dm.addressingId);
             amgGalerkin(amg, diagC, P.upper, P.lower);
+            timedPart.emplace("pressure: the norm factor");
             const scalar nf = deviceNormFactor(A, p_rgh, b, deviceOnes(nC));
+            timedPart.reset();
             const scalar tol = gamg ? gamg->tolerance : sv.tol;
             scalar relTol = gamg ? gamg->relTol : sv.relTol;
             const int maxIter = oneIteration ? 1 : (gamg ? gamg->maxIter : sv.maxIter);
@@ -482,8 +488,10 @@ scalar deviceInterPressureStep(
                 relTol = knobs.dicInnerRelTol;
             }
             const bool graph = knobs.graph && !(in.cyc && in.cyc->n > 0);
+            timedPart.emplace("pressure: the AMG-PCG iterations");
             perf = deviceAMGPCG(A, amg, b, p_rgh, nf, tol, relTol, maxIter, graph, knobs.checkEvery,
                                 knobs.corrScaling, minIter);
+            timedPart.reset();
         }
         else if (gamg)
         {
@@ -764,6 +772,9 @@ AMGData deviceAmgPcgHierarchy(
     const bool useDisk = disk && !cacheOff && !caseDir.empty();
     const std::vector<label> own(m.owner().begin(), m.owner().begin() + nIf);
     const std::vector<label> nei(m.neighbour().begin(), m.neighbour().begin() + nIf);
+    // |Sf|, for the smoothed hierarchy's proxy too. TRIED 2026-10-04 and worse: |Sf|*deltaCoeffs, the orthogonal
+    // laplacian's own geometric coefficient -- pcorr on waveMakerPiston at 896,000 cells, 1,781 iterations in
+    // 31 solves for 1,427.
     const std::vector<scalar> w(g.magSf().begin(), g.magSf().begin() + nIf);
     if (useDisk)
     {
