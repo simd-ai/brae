@@ -739,7 +739,7 @@ InterTurbulence readInterTurbulence(
                           "non-integer; brae will not truncate it.");
             }
             t.yCell = cellWallDist(*mesh, *geometry, patches, nullptr, nullptr,
-                                   t.wallDistCorrectWalls);
+                                   t.wallDistCorrectWalls, nullptr, &t.yCache);
         }
 
         // ...and PBiCG for k and omega too: the SST closure runs it now, as kEpsilon's has since
@@ -1034,7 +1034,8 @@ void moveInterTurbulence(
     const PrimitiveMesh&        m,
     const FvGeometry&           g,
     const std::vector<FvPatch>& patches,
-    label                       timeIndex)
+    label                       timeIndex,
+    const PatchWaveRunner* waveRunner)
 {
     if (!t.on) return;
     if (t.model == InterRasModel::KEqnLES)
@@ -1054,7 +1055,7 @@ void moveInterTurbulence(
         // patchTypeName & "Dist", and that object's patchTypeName is "patch"), NOT `wallDist`. So the
         // `wallDist { updateInterval }` this function honours below is not its interval and must not be
         // applied to it -- the motion solver's own reader is where that one belongs.
-        t.yCell = patchWave(m, g, patches, t.wallDistPatchIDs, true).distance;
+        t.yCell = patchWave(m, g, patches, t.wallDistPatchIDs, true, nullptr, waveRunner).distance;
         return;
     }
     // wallDist::movePoints's SCHEDULE, transcribed (wallDist.C:193-221) rather than reduced to a modulo:
@@ -1091,7 +1092,7 @@ void moveInterTurbulence(
         return;
     }
     t.wallDistRequireUpdate = false;
-    t.yCell = cellWallDist(m, g, patches, nullptr, nullptr, t.wallDistCorrectWalls);
+    t.yCell = cellWallDist(m, g, patches, nullptr, nullptr, t.wallDistCorrectWalls, waveRunner, &t.yCache);
 }
 
 

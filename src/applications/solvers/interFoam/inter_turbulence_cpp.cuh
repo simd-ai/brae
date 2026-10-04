@@ -54,6 +54,7 @@
 // wall-function blending other than the default binomial n = 2, wall-function coefficients other than
 // the defaults, and a moving mesh (y is taken once). The device loop runs kEpsilon's device twin,
 // device_inter_turbulence.cuh, and refuses kOmegaSST by name.
+#include "cell_wall_dist.cuh"   // CellWallDistCache, and PatchWaveRunner through it
 #include "inter_cn_restart.cuh"
 #include "fvOptions_cpp.cuh"
 #include "crank_nicolson_ddt_scheme_cpp.cuh"
@@ -229,6 +230,8 @@ struct InterTurbulence
     // fvMesh::movePoints has wallDist::movePoints do; fvSchemes' `wallDist { updateInterval }` is kept
     // to refuse anything but 1 there.
     std::vector<scalar> yCell;
+    // the near-wall correction's topology, kept from one wall-distance update to the next (cell_wall_dist.cuh)
+    CellWallDistCache yCache;
     label wallDistUpdateInterval = 1;
     // wallDist::movePoints's OWN LATCH (wallDist.C:193-221), and it is NOT a bare modulo. The interval
     // SETS `requireUpdate_`; the recompute then CLEARS it. So a step whose index the interval does not
@@ -395,7 +398,10 @@ void moveInterTurbulence(
     const std::vector<FvPatch>& patches,
     // mesh_.time().timeIndex(), the index of the step being taken -- wallDist.C:198 tests it modulo the
     // interval. Threaded in rather than derived, because the closure has no clock of its own.
-    label                       timeIndex);
+    label                       timeIndex,
+    // the wall distance's wave run elsewhere (PatchWaveRunner): the device loop hands in its GPU wave; null
+    // runs the host's
+    const PatchWaveRunner* waveRunner = nullptr);
 
 // ...AND THE MESH'S TOPOLOGY CHANGED, which is not the same call. wallDist is an UpdateableMeshObject, so
 // a change reaches wallDist::updateMesh (wallDist.C:224-234) and that FORCES its latch -- "Force update if

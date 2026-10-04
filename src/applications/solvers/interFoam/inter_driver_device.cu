@@ -632,6 +632,46 @@ RunReport runInterFoamDevice(
                 devicePatchWave(mesh, geo, motionWaveCells, seedFaces, motionWave, cellDistSqr, boundaryDistSqr);
             });
     }
+    // THE CLOSURE'S WALL DISTANCE ON THE GPU. kOmegaSST's y is a wallDist that OpenFOAM recomputes at every mesh
+    // move, and the wave behind it is the one the motion solver's diffusivity runs: FaceCellWave<wallPoint> from
+    // the wall faces. moveInterTurbulence now takes that wave from the device (devicePatchWave), for either of
+    // its two forms -- the closure's own wallDist (cellWallDist) or the motion solver's (patchWave) -- and its
+    // near-wall correction keeps its topology between calls (CellWallDistCache). The device copy of the
+    // addressing is rebuilt when the mesh's owner or neighbour list differs from the one it was made from.
+    // MEASURED on DTCHullMovingCoarse (108,833 cells, kOmegaSST): the host's wave 27 ms a call and its
+    // correction 46. BRAE_CONTROL_TURBULENCE_WAVE_HOST=1 runs the host's wave -- the identity gate's other arm.
+    DevicePatchWave turbWave;
+    CellFaces turbWaveCells;
+    std::vector<label> turbWaveOwn;
+    std::vector<label> turbWaveNei;
+    PatchWaveRunner turbWaveRunner;
+    if (std::getenv("BRAE_CONTROL_TURBULENCE_WAVE_HOST") == nullptr)
+    {
+        turbWaveRunner =
+            [&turbWave, &turbWaveCells, &turbWaveOwn, &turbWaveNei](
+                const PrimitiveMesh& mesh,
+                const FvGeometry& geo,
+                const std::vector<label>& seedFaces,
+                std::vector<scalar>& cellDistSqr,
+                std::vector<scalar>& boundaryDistSqr)
+            {
+                static bool said = false;
+                if (!said)
+                {
+                    said = true;
+                    std::printf("  wall distance: the turbulence closure's wave runs on the GPU after each mesh "
+                                "move; BRAE_CONTROL_TURBULENCE_WAVE_HOST=1 runs the host wave\n");
+                }
+                if (turbWaveOwn != mesh.owner() || turbWaveNei != mesh.neighbour())
+                {
+                    turbWaveOwn = mesh.owner();
+                    turbWaveNei = mesh.neighbour();
+                    turbWaveCells = cellFaces(mesh);
+                    turbWave.built = false;
+                }
+                devicePatchWave(mesh, geo, turbWaveCells, seedFaces, turbWave, cellDistSqr, boundaryDistSqr);
+            };
+    }
     // THE MESH FLUX OF EVERY MOVE ON THE GPU: each face's swept volume over the step (face::sweptVol), the
     // host's face loop term for term and fused product for fused product (deviceSweptVolumes), for any motion
     // solver -- the points before and after go up, meshPhi comes back. MEASURED on waveMakerPiston refined to
@@ -3674,7 +3714,8 @@ RunReport runInterFoamDevice(
                 // method on the moved points -- and the device arrays follow it.
                 if (f.turbulence.on)
                 {
-                    moveInterTurbulence(f.turbulence, m, g, fvp, stepIndex);
+                    moveInterTurbulence(f.turbulence, m, g, fvp, stepIndex,
+                                        turbWaveRunner ? &turbWaveRunner : nullptr);
                     if (deviceClosure)
                     {
                         refreshDeviceInterTurbulenceGeometry(dTurb, f.turbulence, f.U, m, g, fvp);
