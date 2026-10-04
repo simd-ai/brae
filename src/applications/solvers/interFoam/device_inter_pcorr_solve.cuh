@@ -14,8 +14,11 @@
 #include "cf_types.cuh"
 #include "device_amg.cuh"
 #include "device_buffer.cuh"
+#include "device_fv_geometry.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
+#include "geometric_field.cuh"
+#include "fvc.cuh"   // SurfaceScalarField
 #include "ldu_matrix.cuh"   // FvScalarMatrix
 #include "pcg.cuh"   // SolverPerformance
 #include "primitive_mesh.cuh"
@@ -61,7 +64,7 @@ struct DevicePcorrSolver
     // built ONCE: `fixedTopology`, set by the caller for a mesh that moves and does not refine, and only at the
     // first build. Anywhere else pcorr takes the hierarchy p_rgh takes, as before.
     // BRAE_PCORR_AMG=plain never smooths (the gate's other arm); =sa smooths at every build, whatever the mesh.
-    // NOT on the disk cache: it is rebuilt at every start.
+    // The start mesh's is read from the case's cache (deviceAmgPcgHierarchy, .brae_amgcache_sa).
     bool fixedTopology = false;
 
     // pcorrEqn.solve() on the GPU, whatever its entry names (`asked`, for the notice): the boundary folded as
@@ -79,6 +82,66 @@ struct DevicePcorrSolver
         int maxIter,
         int minIter,
         SolverPerformance& perf);
+
+    // THE WHOLE PASS ON THE GPU, for CorrectPhi's one pass with nNonOrthogonalCorrectors 0, where pcorr starts
+    // at zero: fvm::laplacian(rAUf, pcorr) == fvc::div(phi) assembled, its boundary folded, the reference set,
+    // the solve, and phi -= pcorrEqn.flux() -- the host's arithmetic operation for operation, in the host's
+    // order (a cell's faces in ascending face number), so the matrix is the host's bit for bit.
+    // The host built that system at every mesh update and uploaded it: MEASURED on waveMakerPiston at 896,000
+    // cells, ms a step: the matrix 7.1, div(phi) 1.7, the fold and four uploads 6.0, the flux 6.6 -- 22.1 with
+    // the rest, against 3.4 here (the uploads 0.7, the kernels 0.6, the flux and two downloads 0.8, and 1.2
+    // comparing the mesh's owner and neighbour with the ones the addressing was built from).
+    // Up: rAUf and phi on the internal faces, and for the faces of the patches that are neither empty nor
+    // coupled, in patch order, the flux and the two laplacian coefficients. The geometry is the GPU's own where
+    // the caller hands in one that is the host's (`deviceGeometry`, after a mesh move); uploaded otherwise.
+    // Down: phi on the internal faces and pcorr's cells (for the patches' flux, which the host forms).
+    // Returns false, touching nothing, on a mesh with a coupled patch.
+    //   `hostMatrix`  BRAE_CONTROL_PCORR_ASSEMBLY_CHECK: the system as the host assembled it; every entry of
+    //                 the GPU's is compared with it, and phi with the host's flux of the GPU's solution
+    bool correct(
+        const std::string& asked,
+        const SurfaceScalarField& rAUf,
+        SurfaceScalarField& phi,
+        const GeometricField<scalar>& pcorr,
+        bool needReference,
+        bool nonOrthDeltaCoeffs,
+        const PrimitiveMesh& m,
+        const FvGeometry& g,
+        const std::vector<FvPatch>& patches,
+        const DeviceFvGeometry* deviceGeometry,
+        scalar tol,
+        scalar relTol,
+        int maxIter,
+        int minIter,
+        SolverPerformance& perf,
+        const FvScalarMatrix* hostMatrix);
+
+private:
+    // the coupled-patch refusal and the pressure rule's notice, once
+    bool takes(
+        const std::string& asked,
+        const std::vector<FvPatch>& patches);
+    // the device addressing and the hierarchy of this mesh, rebuilt where its owner or neighbour changed
+    void prepare(
+        const PrimitiveMesh& m,
+        const FvGeometry& g,
+        const std::vector<FvPatch>& patches);
+
+    bool announced = false;
+    bool announcedCoupled = false;
+    // correct(): the faces of the patches that are neither empty nor coupled, in patch order (a "slot" each),
+    // and each cell's run of them
+    std::size_t nSlots = 0;
+    DeviceBuffer<label> dSlotStart;
+    DeviceBuffer<label> dSlotList;
+    DeviceBuffer<scalar> dGamma;
+    DeviceBuffer<scalar> dPhi;
+    DeviceBuffer<scalar> dDc;
+    DeviceBuffer<scalar> dMagSf;
+    DeviceBuffer<scalar> dV;
+    DeviceBuffer<scalar> dSlotPhi;
+    DeviceBuffer<scalar> dSlotIC;
+    DeviceBuffer<scalar> dSlotBC;
 };
 
 } // namespace brae

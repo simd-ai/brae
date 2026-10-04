@@ -64,6 +64,17 @@ struct CorrectPhiControls
     std::function<bool(const std::string&, const FvScalarMatrix&, std::vector<scalar>&, const PrimitiveMesh&,
                        const FvGeometry&, const std::vector<FvPatch>&, scalar, scalar, int, int,
                        SolverPerformance&)> amgPcgSolve;
+    // ...AND THE WHOLE PASS, where the caller can do it: the pcorr equation assembled, solved and its flux taken
+    // from phi without the host building the system (DevicePcorrSolver::correct). Offered the one pass of a case
+    // with nNonOrthogonalCorrectors 0, where pcorr is zero going in. Arguments: the entry's name, rAUf, phi
+    // (updated in place), pcorr (for its patch fields), whether it needs a reference, whether the scheme takes
+    // nonOrthDeltaCoeffs, the mesh, tolerance, relTol, maxIter, minIter, the performance out, and -- under
+    // BRAE_CONTROL_PCORR_ASSEMBLY_CHECK -- the system as the host assembled it, to be compared entry for
+    // entry. Returns false, touching nothing, where it does not apply; the host's pass runs then.
+    std::function<bool(const std::string&, const SurfaceScalarField&, SurfaceScalarField&,
+                       const GeometricField<scalar>&, bool, bool, const PrimitiveMesh&, const FvGeometry&,
+                       const std::vector<FvPatch>&, scalar, scalar, int, int, SolverPerformance&,
+                       const FvScalarMatrix*)> devicePass;
 };
 
 // The case's own CorrectPhi controls, from the fields the case reader filled: pcorr and pcorrFinal,

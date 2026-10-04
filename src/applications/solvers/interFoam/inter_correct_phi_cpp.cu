@@ -6,6 +6,7 @@
 #include "fvm.cuh"
 #include "inter_peqn_cpp.cuh"
 #include "pcg.cuh"
+#include <cstdlib>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -55,6 +56,23 @@ void relative(
             phi.boundary[pi][i] -= sign*meshPhi->boundary[pi][i];
         }
     }
+}
+
+// every cell and every patch value of the field exactly zero
+bool isZero(const GeometricField<scalar>& p)
+{
+    for (const scalar v : p.internal)
+    {
+        if (v != scalar(0)) return false;
+    }
+    for (const auto& b : p.boundary)
+    {
+        for (const scalar v : b->value())
+        {
+            if (v != scalar(0)) return false;
+        }
+    }
+    return true;
 }
 
 // pcorr's patch fields (CorrectPhi.C:52-66): fixedValue 0 where p_rgh fixes a value, zeroGradient
@@ -181,19 +199,86 @@ void correctPhi(
     }
 
     const label nC = m.nCells();
-    // div(phi) is the equation's whole source; it does not change inside the loop
-    timedPart.emplace("CorrectPhi: div(phi)");
-    const std::vector<scalar> divPhi = fvc::div(phi, m, g, patches);
+    // makePcorr's zero start is confirmed once a run (a scan of the field), and at every pass under the check
+    static bool zeroCorrectionChecked = false;
+    // div(phi) is the equation's whole source; it does not change inside the loop. Formed at the first pass
+    // the HOST assembles: a pass the caller takes whole (devicePass) forms its own.
+    std::vector<scalar> divPhi;
+    bool haveDivPhi = false;
+    static const bool assemblyCheck = std::getenv("BRAE_CONTROL_PCORR_ASSEMBLY_CHECK") != nullptr;
     timedPart.reset();
     for (label corr = 0; corr <= c.nNonOrthogonalCorrectors; ++corr)
     {
         const bool finalIter = (corr == c.nNonOrthogonalCorrectors);
+        // THE CORRECTION OF A FIELD THAT IS ZERO IS ZERO. pcorr starts every CorrectPhi at zero, cells and
+        // patches (makePcorr), so on the first pass its gradient, the non-orthogonal source and the face flux
+        // correction are all zeros: subtracting and adding them changes no value. They were computed all the
+        // same -- MEASURED 15.0 ms of a 1,027 ms step on waveMakerPiston at 896,000 cells and 21.3 of 1,352 on
+        // the 845,536-cell hull, with nNonOrthogonalCorrectors 0, where the first pass is the only one.
+        // BRAE_CONTROL_PCORR_ZERO_CORRECTION=1 computes them.
+        // BRAE_CONTROL_PCORR_CORRECTION_NEVER=1 is a gate's CONTROL, deliberately wrong: the correction is
+        // skipped at EVERY pass, a later one's too, where pcorr is no longer zero.
+        static const bool zeroCorrection = std::getenv("BRAE_CONTROL_PCORR_ZERO_CORRECTION") != nullptr;
+        static const bool correctionNever = std::getenv("BRAE_CONTROL_PCORR_CORRECTION_NEVER") != nullptr;
+        const bool pcorrIsZero = correctionNever || (!zeroCorrection && corr == 0);
+        if (!correctionNever && pcorrIsZero && (assemblyCheck || !zeroCorrectionChecked) && !isZero(pcorr))
+        {
+            throw std::runtime_error(
+                std::string(WHO) + "pcorr is not zero at the first pass; makePcorr starts it there, and the "
+                "pass skips the correction of a zero field on that ground.");
+        }
+        zeroCorrectionChecked = true;
+        const InterFields::PressureLinearSolve& s = finalIter ? *c.pcorrFinal : *c.pcorr;
+        const std::string asked = s.gamgSolver() ? "GAMG" : s.pcgGamg() ? "PCG with a GAMG preconditioner"
+                                : s.pcgDIC() ? "PCG with DIC" : "its own solver";
+        // the one pass of a case without non-orthogonal correctors, taken whole by the caller where it can
+        bool offerPass = c.devicePass && c.nNonOrthogonalCorrectors == 0 && pcorrIsZero && !correctionNever;
+        const auto takePass = [&](const FvScalarMatrix* hostMatrix)
+        {
+            SolverPerformance spd;
+            // fvm::laplacian's choice of delta coefficients
+            const bool nonOrthDc = c.correctedLaplacian || c.nonOrthCoeffs;
+            const bool taken = s.gamgSolver()
+                ? c.devicePass(asked, *in.rAUf, phi, pcorr, needReference, nonOrthDc, m, g, patches,
+                               s.gamg.tolerance, s.gamg.relTol, s.gamg.maxIter, s.gamg.minIter, spd, hostMatrix)
+                : c.devicePass(asked, *in.rAUf, phi, pcorr, needReference, nonOrthDc, m, g, patches, s.tol,
+                               s.relTol, s.maxIter, 0, spd, hostMatrix);
+            if (taken && in.solveLog)
+            {
+                in.solveLog->push_back(
+                    LinearSolveRecord{spd.initialResidual, spd.finalResidual, spd.nIterations});
+            }
+            return taken;
+        };
+        if (offerPass && !assemblyCheck)
+        {
+            timedPart.emplace("CorrectPhi: the pcorr solve, whole");
+            if (takePass(nullptr))
+            {
+                timedPart.reset();
+                continue;
+            }
+            offerPass = false;
+        }
+        if (!haveDivPhi)
+        {
+            timedPart.emplace("CorrectPhi: div(phi)");
+            divPhi = fvc::div(phi, m, g, patches);
+            haveDivPhi = true;
+        }
 
         // fvm::laplacian(rAUf, pcorr) == fvc::div(phi) - divU, divU a geometricZeroField
         timedPart.emplace("CorrectPhi: the laplacian matrix");
-        FvScalarMatrix pe = fvm::laplacian<scalar>(*in.rAUf, pcorr, m, g, patches, c.correctedLaplacian, c.nonOrthCoeffs);
+        FvScalarMatrix pe = fvm::laplacian<scalar>(
+            *in.rAUf,
+            pcorr,
+            m,
+            g,
+            patches,
+            c.correctedLaplacian,
+            c.nonOrthCoeffs);
         timedPart.emplace("CorrectPhi: the gradient, the non-orthogonal correction, the source");
-        if (c.correctedLaplacian)
+        if (c.correctedLaplacian && !pcorrIsZero)
         {
             // the fluxRequired branch of gaussLaplacianSchemes.C: CorrectPhi.C:73 sets it for pcorr
             const std::vector<vector> gradP = gradOf(pcorr, c.gradPcorr, m, g, patches);
@@ -224,13 +309,17 @@ void correctPhi(
 
         // pcorr.select(pimple.finalNonOrthogonalIter())
         timedPart.emplace("CorrectPhi: the pcorr solve, whole");
-        const InterFields::PressureLinearSolve& s = finalIter ? *c.pcorrFinal : *c.pcorr;
+        // BRAE_CONTROL_PCORR_ASSEMBLY_CHECK: the pass taken whole all the same, handed the system just
+        // assembled here to hold its own to
+        if (offerPass && takePass(&pe))
+        {
+            timedPart.reset();
+            continue;
+        }
         SolverPerformance sp;
         bool solved = false;
         if (c.amgPcgSolve)
         {
-            const std::string asked = s.gamgSolver() ? "GAMG" : s.pcgGamg() ? "PCG with a GAMG preconditioner"
-                                    : s.pcgDIC() ? "PCG with DIC" : "its own solver";
             solved = s.gamgSolver()
                 ? c.amgPcgSolve(asked, pe, pcorr.internal, m, g, patches, s.gamg.tolerance, s.gamg.relTol,
                                 s.gamg.maxIter, s.gamg.minIter, sp)

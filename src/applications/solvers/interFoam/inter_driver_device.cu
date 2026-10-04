@@ -1016,6 +1016,56 @@ RunReport runInterFoamDevice(
             {
                 return pcorrSolver.solve(asked, M, psi, mesh, geo, patches, tol, relTol, maxIter, minIter, perf);
             };
+            // ...and the whole pass where there is one pass: the system assembled on the GPU too
+            // (DevicePcorrSolver::correct). BRAE_CONTROL_PCORR_ASSEMBLY_HOST=1 leaves the host to assemble it
+            // and upload it, as before.
+            static const bool assemblyHost = std::getenv("BRAE_CONTROL_PCORR_ASSEMBLY_HOST") != nullptr;
+            if (!assemblyHost)
+            {
+                c.devicePass = [&pcorrSolver, &deviceGeometry](
+                    const std::string& asked,
+                    const SurfaceScalarField& rAUf,
+                    SurfaceScalarField& phi,
+                    const GeometricField<scalar>& pcorr,
+                    bool needReference,
+                    bool nonOrthDeltaCoeffs,
+                    const PrimitiveMesh& mesh,
+                    const FvGeometry& geo,
+                    const std::vector<FvPatch>& patches,
+                    scalar tol,
+                    scalar relTol,
+                    int maxIter,
+                    int minIter,
+                    SolverPerformance& perf,
+                    const FvScalarMatrix* hostMatrix)
+                {
+                    const bool taken = pcorrSolver.correct(
+                        asked,
+                        rAUf,
+                        phi,
+                        pcorr,
+                        needReference,
+                        nonOrthDeltaCoeffs,
+                        mesh,
+                        geo,
+                        patches,
+                        &deviceGeometry,
+                        tol,
+                        relTol,
+                        maxIter,
+                        minIter,
+                        perf,
+                        hostMatrix);
+                    static bool said = false;
+                    if (taken && !said)
+                    {
+                        said = true;
+                        std::printf("  pcorr: its equation is assembled on the GPU and its flux taken from phi "
+                                    "there; BRAE_CONTROL_PCORR_ASSEMBLY_HOST=1 assembles it on the host\n");
+                    }
+                    return taken;
+                };
+            }
         }
         return c;
     };
