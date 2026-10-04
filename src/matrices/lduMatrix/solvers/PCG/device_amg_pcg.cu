@@ -253,7 +253,7 @@ static DeviceSolverPerf deviceAMGPCGGraph(
     ensureSpectrum(amg, A);                                                       // one-time Chebyshev spectrum (pre-capture)
     // FP32 V-cycle inside the device-resident PCG: cast matrices once per solve; the WHILE body captures the FP32
     // vcycleAtF automatically (host-scalar-free). Outer Krylov + residual stay FP64 (accuracy preserved).
-    const bool fp32 = useFP32() && !amg.saSmooth && !amg.gsSmooth && !useChebyshev();
+    const bool fp32 = amgSinglePrecisionCycle(amg);
     if (fp32) amgCastFP32(amg, A);
     const LduF A0 = fp32 ? lduF(sA, amg.fDiag[0], amg.fUpper[0], amg.fLower[0]) : LduF{};
     auto applyPrec = [&]()
@@ -420,7 +420,7 @@ DeviceSolverPerf deviceParallelAMGPCGGraph(
     scalar* dPap  = amg.sPap.data();   scalar* dAlpha = amg.sAlpha.data();
     scalar* dNegAlpha = amg.sNegAlpha.data(); scalar* dBeta = amg.sBeta.data();
     ensureSpectrum(amg, A);
-    const bool fp32 = useFP32() && !amg.saSmooth && !amg.gsSmooth && !useChebyshev();
+    const bool fp32 = amgSinglePrecisionCycle(amg);
     if (fp32) amgCastFP32(amg, A);
     const LduF A0 = fp32 ? lduF(A, amg.fDiag[0], amg.fUpper[0], amg.fLower[0]) : LduF{};
     auto applyPrec = [&]()
@@ -570,8 +570,8 @@ static void chargeSplit(
     {
         std::printf("  AMG-PCG split of %s (BRAE_AMG_PCG_SPLIT): the solve leaves the captured graph and waits "
                     "after every part -- an instrument, not a measured run.\n", s.name);
-        std::printf("    its %d grids, %s, cells / faces%s:\n", nGrids,
-                    amg.saSmooth ? "smoothed aggregation, double-precision cycle" : "plain aggregation",
+        std::printf("    its %d grids, %s aggregation, %s-precision cycle, cells / faces%s:\n", nGrids,
+                    amg.saSmooth ? "smoothed" : "plain", singlePrecisionCycle ? "single" : "double",
                     amg.saSmooth ? " / prolongator entries to the next" : "");
         for (int g = 0; g < nGrids; ++g)
         {
@@ -668,9 +668,9 @@ DeviceSolverPerf deviceAMGPCG(
     // persistent work buffers), so it is captured into a CUDA graph and replayed. The graph is cached in amg.gcache,
     // keyed on the fine-matrix pointer A.diag: captured once and replayed across all PCG iters and SIMPLE steps (the
     // matrix values change in-buffer each step; the graph reads them at replay), re-captured only when the key changes.
-    // FP32 mixed precision (default smoother/aggregation only; SA/GS/Cheb/corrScaling stay FP64): the matrices are cast
+    // FP32 mixed precision (the default smoother only; GS/Cheb/corrScaling stay FP64): the matrices are cast
     // once per solve, and each application casts rA -> FP32 in / FP32 -> wA out.
-    const bool fp32 = useFP32() && !amg.saSmooth && !amg.gsSmooth && !useChebyshev() && !corrScaling;
+    const bool fp32 = amgSinglePrecisionCycle(amg) && !corrScaling;
     if (fp32)
     {
         amgCastFP32(amg, A);
@@ -808,7 +808,7 @@ DeviceSolverPerf deviceAMGPCG(
 
 // Cast the fine + coarse matrices to their FP32 mirrors for this solve's V-cycles. Call ONCE per solve, AFTER
 // amgGalerkin has updated the FP64 operators (the coarse matrices change every SIMPLE step). No-op unless FP32
-// mixed precision applies (BRAE_AMG_FP32 default on; the SA/GS/Chebyshev paths stay FP64). After this,
+// mixed precision applies (BRAE_AMG_FP32 default on; the GS/Chebyshev paths stay FP64). After this,
 
 
 DeviceSolverPerf deviceAMGPCG(

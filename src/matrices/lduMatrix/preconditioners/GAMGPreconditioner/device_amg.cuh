@@ -91,6 +91,10 @@ struct AMGLevel {
     // re-evaluated each step from the current fine matrix by the precomputed RAP scatter recipe below.
     DeviceBuffer<label>  Prow, Pcol;                           // CSR rowPtr [nFine+1], col [nnz] (coarse columns)
     DeviceBuffer<scalar> Pval;                                 // CSR values [nnz]
+    // ...and in single precision, for the single-precision cycle: cast once with that cycle's buffers
+    // (amgCastFP32). The values are fixed for the life of the hierarchy, so neither a clone nor the disk cache
+    // carries them.
+    DeviceBuffer<float>  PvalF;
     // RAP scatter recipe: nTriples contributions A_c[dst] += w * A_fine[src]. src/dstKind: 0=diag 1=upper 2=lower.
     int nTriples = 0;
     DeviceBuffer<label>  rapSrcKind, rapSrcIdx, rapDstKind, rapDstIdx;
@@ -359,9 +363,15 @@ void vcycleAt(int g, AMGData& amg, const DeviceLduView& Ag, const DeviceBuffer<s
 // calls exactly this with (useChebyshev(), amg.corrScaling, amg.saSmooth). A no-op when nothing is set.
 void amgRefuseAsymmetric(bool chebyshev, bool corrScaling, bool smoothedAggregation);
 
+// WHICH CYCLE a solve's preconditioner runs: the single-precision one (vcycleAtF) unless BRAE_AMG_FP32=0 or the
+// smoother is one only the double-precision cycle has (multicolour GS, Chebyshev). THE ONE PLACE that decides
+// -- the captured loop, the plain loop and the distributed apply each asked the same question in their own
+// words, and a smoothed-aggregation hierarchy was excluded in each.
+bool amgSinglePrecisionCycle(const AMGData& amg);
+
 // Prepare the FP32 mixed-precision V-cycle for this solve: cast the (Galerkin-updated) matrices to FP32 mirrors.
 // Call ONCE per solve before the amgVCycleApply loop; after it, amgVCycleApply runs FP32 automatically. No-op
-// unless BRAE_AMG_FP32 (default on) and the default smoother/aggregation (SA/GS/Chebyshev stay FP64).
+// unless BRAE_AMG_FP32 (default on) and the default smoother (GS/Chebyshev stay FP64): amgSinglePrecisionCycle.
 void amgPrepareFP32(AMGData& amg, const DeviceLduView& A);
 
 class DeviceHalo;   // fwd (parallel/pstream/device_halo.cuh)

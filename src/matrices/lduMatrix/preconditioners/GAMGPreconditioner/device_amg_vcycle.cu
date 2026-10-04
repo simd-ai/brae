@@ -74,36 +74,40 @@ void prolongToK(
     const int c = blockIdx.x*blockDim.x + threadIdx.x;
     if (c < nF) pc[c] = xc[map[c]];   // prolong INTO pc (not added yet)
 }
-// Smoothed-aggregation sparse prolongator apply (BRAE_AMG_SA): restrict = P^T, prolong = P.
+// Smoothed-aggregation sparse prolongator apply (BRAE_AMG_SA): restrict = P^T, prolong = P. Templated on the
+// value type, as the cycles' other work kernels are: T = scalar is the double-precision cycle's kernel as it
+// was, T = float the single-precision cycle's, over the prolongator's values cast once (AMGLevel::PvalF).
 // restrict: rc += P^T r  (each fine cell f scatters val*r[f] into its coarse columns, atomically).
+template <typename T>
 __global__
-void restrictSparseK(
+void restrictSparseT(
     int nF,
     const label* __restrict__ rowPtr,
     const label* __restrict__ col,
-    const scalar* __restrict__ val,
-    const scalar* __restrict__ r,
-    scalar* __restrict__ rc)
+    const T* __restrict__ val,
+    const T* __restrict__ r,
+    T* __restrict__ rc)
 {
     const int f = blockIdx.x*blockDim.x + threadIdx.x;
     if (f >= nF) return;
-    const scalar rf = r[f];
+    const T rf = r[f];
     for (int k = rowPtr[f]; k < rowPtr[f+1]; ++k)
         atomicAdd(&rc[col[k]], val[k]*rf);
 }
 // prolong (ADD): x[f] += sum_k P[f][k]*xc[col], the smoothed-P twin of prolongT.
+template <typename T>
 __global__
-void prolongSparseK(
+void prolongSparseT(
     int nF,
     const label* __restrict__ rowPtr,
     const label* __restrict__ col,
-    const scalar* __restrict__ val,
-    const scalar* __restrict__ xc,
-    scalar* __restrict__ x)
+    const T* __restrict__ val,
+    const T* __restrict__ xc,
+    T* __restrict__ x)
 {
     const int f = blockIdx.x*blockDim.x + threadIdx.x;
     if (f >= nF) return;
-    scalar s = 0.0;
+    T s = T(0);
     for (int k = rowPtr[f]; k < rowPtr[f+1]; ++k)
         s += val[k]*xc[col[k]];
     x[f] += s;
@@ -140,6 +144,15 @@ void scaleFactorK(
     }
 }
 } // anon
+
+bool amgSinglePrecisionCycle(const AMGData& amg)
+{
+    // BRAE_CONTROL_AMG_SA_DOUBLE=1: a smoothed-aggregation hierarchy keeps the double-precision cycle, as it
+    // did before the single-precision one had the sparse prolongator's transfers.
+    static const bool saDouble = std::getenv("BRAE_CONTROL_AMG_SA_DOUBLE") != nullptr;
+    if (amg.saSmooth && saDouble) return false;
+    return useFP32() && !amg.gsSmooth && !useChebyshev();
+}
 
 // Recursive V-cycle at grid g: x_g <- M^-1 b_g (x_g overwritten). g==nLevels is the coarsest grid (an approximate
 // solve; single-block or fused-cluster when small); above it: pre-smooth, restrict the residual to g+1, recurse,
@@ -219,7 +232,8 @@ void vcycleAt(
     {
         // Sparse-prolongator restriction still scatters; the SA path is opt-in and remains nondeterministic.
         zeroT<scalar><<<nBlocks(nc),TPB>>>(nc, amg.vB[g+1].data());
-        restrictSparseK<<<nBlocks(n),TPB>>>(n, Lg.Prow.data(), Lg.Pcol.data(), Lg.Pval.data(), amg.vR[g].data(), amg.vB[g+1].data());
+        restrictSparseT<scalar><<<nBlocks(n),TPB>>>(
+            n, Lg.Prow.data(), Lg.Pcol.data(), Lg.Pval.data(), amg.vR[g].data(), amg.vB[g+1].data());
     }
     else                                          // fixed-order gather; writes rc, so no pre-zero needed
         restrictGatherT<scalar><<<nBlocks(nc),TPB>>>(
@@ -240,7 +254,8 @@ void vcycleAt(
         deviceAxpyDev(amg.sScAlpha.data(), amg.vPc[g], xg);                           // xg += alpha * c
     }
     else if (amg.saSmooth)
-        prolongSparseK<<<nBlocks(n),TPB>>>(n, Lg.Prow.data(), Lg.Pcol.data(), Lg.Pval.data(), amg.vX[g+1].data(), xg.data());
+        prolongSparseT<scalar><<<nBlocks(n),TPB>>>(
+            n, Lg.Prow.data(), Lg.Pcol.data(), Lg.Pval.data(), amg.vX[g+1].data(), xg.data());
     else
         prolongT<scalar><<<nBlocks(n),TPB>>>(n, Lg.map.data(), amg.vX[g+1].data(), xg.data());
     amgSplit::lap(g, amgSplit::prolongation);
@@ -271,9 +286,14 @@ void vcycleAt(
 // Mixed-precision (FP32) V-cycle: a mirror of the default V-cycle (weighted-Jacobi + map restrict/prolong) with the
 // matrix values and work vectors in FP32 (half the bytes on the BW-bound SpMV+smooth); the topology (labels) is
 // shared with the FP64 path. The coarsest level casts back to FP64 and reuses the exact FP64 coarse solve. Only the
-// default smoother/aggregation is supported here (SA/GS/Chebyshev/corrScaling stay FP64; the caller gates on those).
+// default smoother is supported here (GS/Chebyshev/corrScaling stay FP64: amgSinglePrecisionCycle and its callers).
 // It reuses the templated zeroT/smoothT/residualT/restrictT/prolongT<float>; only the casts and the FP32 SpMV (amulF)
 // are FP32-specific.
+// A SMOOTHED-AGGREGATION hierarchy runs here too (2026-10-04): its coarse matrices are LDU views like any other
+// level's and are cast with them; its transfers are restrictSparseT/prolongSparseT<float> over PvalF. It ran the
+// double-precision cycle until then: MEASURED with BRAE_AMG_PCG_SPLIT on pcorr, waveMakerPiston at 896,000
+// cells, us an iteration on the finest grid, double against this cycle's on the same mesh: post-smooth 405 / 222,
+// residual 359 / 215.
 // (amulFK/amulF -- the FP32 SpMV -- now live in device_amg_internal.cuh, shared with the FP32 GS solver.)
 // ---- FP-12: the coarse operator as contiguous rows -------------------------------------------
 //
@@ -415,6 +435,26 @@ void amgCastFP32(
             amg.vXF[g].resize(v.nCells);
             amg.vBF[g].resize(v.nCells);
         }
+        if (amg.saSmooth)
+        {
+            // the sparse prolongator's values, once: they are fixed for the life of the hierarchy.
+            // BRAE_CONTROL_AMG_SA_P_NOT_CAST=1 is a gate's CONTROL, deliberately wrong: the single-precision
+            // values are left zero, so the cycle transfers nothing and has no coarse correction.
+            static const bool notCast = std::getenv("BRAE_CONTROL_AMG_SA_P_NOT_CAST") != nullptr;
+            for (int g = 0; g < G; ++g)
+            {
+                AMGLevel& L = amg.level[g];
+                const int nnz = static_cast<int>(L.Pval.size());
+                L.PvalF.resize(L.Pval.size());
+                if (nnz == 0) continue;
+                if (notCast)
+                {
+                    zeroT<float><<<nBlocks(nnz),TPB>>>(nnz, L.PvalF.data());
+                    continue;
+                }
+                cast_<scalar,float><<<nBlocks(nnz),TPB>>>(nnz, L.Pval.data(), L.PvalF.data());
+            }
+        }
         amg.fp32Alloc = true;
     }
     if (amgCsrOn() && !amg.csrBuilt) amgBuildCsrFP32(amg, A);       // FP-12, once per hierarchy
@@ -530,13 +570,30 @@ void vcycleAtF(
     amgSplit::lap(g, amgSplit::residual);
     const AMGLevel& Lg = amg.level[g];
     const int nc = Lg.nCoarse;
-    restrictGatherT<float><<<nBlocks(nc),TPB>>>(
-        nc, Lg.galCellStart.data(), Lg.galCellList.data(), amg.vRF[g].data(), amg.vBF[g+1].data());
+    if (amg.saSmooth)                                            // rc = P^T r, the sparse smoothed prolongator
+    {
+        zeroT<float><<<nBlocks(nc),TPB>>>(nc, amg.vBF[g+1].data());
+        restrictSparseT<float><<<nBlocks(n),TPB>>>(
+            n, Lg.Prow.data(), Lg.Pcol.data(), Lg.PvalF.data(), amg.vRF[g].data(), amg.vBF[g+1].data());
+    }
+    else
+    {
+        restrictGatherT<float><<<nBlocks(nc),TPB>>>(
+            nc, Lg.galCellStart.data(), Lg.galCellList.data(), amg.vRF[g].data(), amg.vBF[g+1].data());
+    }
     amgSplit::lap(g, amgSplit::restriction);
     const DeviceLduView topoC = Lg.coarseView();
     const LduF Ac = lduF(topoC, amg.fDiag[g+1], amg.fUpper[g+1], amg.fLower[g+1]);
     vcycleAtF(g+1, amg, topoC, Ac, amg.vBF[g+1].data(), amg.vXF[g+1].data(), asymmetric);
-    prolongT<float><<<nBlocks(n),TPB>>>(n, Lg.map.data(), amg.vXF[g+1].data(), xg);
+    if (amg.saSmooth)
+    {
+        prolongSparseT<float><<<nBlocks(n),TPB>>>(
+            n, Lg.Prow.data(), Lg.Pcol.data(), Lg.PvalF.data(), amg.vXF[g+1].data(), xg);
+    }
+    else
+    {
+        prolongT<float><<<nBlocks(n),TPB>>>(n, Lg.map.data(), amg.vXF[g+1].data(), xg);
+    }
     amgSplit::lap(g, amgSplit::prolongation);
     for (int s=0; s<nPostSweeps(); ++s)    // BRAE_NPOST; NPOST by default
     {
@@ -564,8 +621,7 @@ void vcycleAtF(
 // FP32 halves their bytes ~= 2x, while the r->FP32/FP32->z casts and the FP64 coarsest solve keep it accurate).
 void amgPrepareFP32(AMGData& amg, const DeviceLduView& A)
 {
-    if (useFP32() && !amg.saSmooth && !amg.gsSmooth && !useChebyshev())
-        amgCastFP32(amg, A);
+    if (amgSinglePrecisionCycle(amg)) amgCastFP32(amg, A);
 }
 
 // z = M^-1 r : ONE symmetric AMG V-cycle applied as a PRECONDITIONER, factored out of deviceAMGPCG so the
@@ -578,7 +634,7 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
                     const DeviceBuffer<scalar>& r, DeviceBuffer<scalar>& z, bool captureVcycle)
 {
     ensureSpectrum(amg, A);                // one-time Chebyshev spectrum estimate (no-op unless the Chebyshev smoother is on)
-    const bool fp32 = amg.fp32Alloc && useFP32() && !amg.saSmooth && !amg.gsSmooth && !useChebyshev();
+    const bool fp32 = amg.fp32Alloc && amgSinglePrecisionCycle(amg);
     const int nC = A.nCells;
 
     if (!captureVcycle)
