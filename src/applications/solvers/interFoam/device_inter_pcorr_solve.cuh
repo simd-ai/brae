@@ -63,6 +63,16 @@ struct DevicePcorrSolver
     // a step on damBreakWithObstacle, which rebuilds at every refinement), so it is taken only where it is
     // built ONCE: `fixedTopology`, set by the caller for a mesh that moves and does not refine, and only at the
     // first build. Anywhere else pcorr takes the hierarchy p_rgh takes, as before.
+    // ...AND ONLY ON A TWO-DIMENSIONAL MESH (a patch of type empty with faces). That is what was measured, not a
+    // theory: on every three-dimensional moving mesh tried the smoothed hierarchy takes as many iterations as
+    // the plain one or more, at a higher price each. pcorr's iterations, smoothed / plain (2026-10-04):
+    //   2-D  waveMakerPiston 896,000 cells   1,427 / 5,530 in 31 solves
+    //        waveMakerPiston 56,000          99 / 196          waveMakerSolitary 14,250   79 / 107
+    //   3-D  DTCHullMoving 845,536 (snappy)  626 / 354 in 10 solves; CorrectPhi 166.8 / 97.8 ms a step, and the
+    //                                        smoothed one is 16 s to build or a 4.3 GB cache file
+    //        DTCHullMovingCoarse 108,833     811 / 216         floatingObject 11,640 (hex)   159 / 183
+    // The smoothed prolongator is shaped from a proxy of the face areas alone (device_amg.cu); why that serves a
+    // structured 2-D mesh and not a snappy 3-D one is not established.
     // BRAE_PCORR_AMG=plain never smooths (the gate's other arm); =sa smooths at every build, whatever the mesh.
     // The start mesh's is read from the case's cache (deviceAmgPcgHierarchy, .brae_amgcache_sa).
     bool fixedTopology = false;

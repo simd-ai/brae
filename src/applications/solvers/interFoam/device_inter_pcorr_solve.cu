@@ -109,14 +109,21 @@ void DevicePcorrSolver::prepare(
             throw std::runtime_error("brae interFoam device pcorr solve: BRAE_PCORR_AMG=" + v
                                      + " is not one of plain, sa.");
         }();
-        if (mode == 2 || (mode == 0 && fixedTopology && firstBuild))
+        // ...and twoDimensional: a patch of type empty that has faces
+        bool twoDimensional = false;
+        for (const FvPatch& q : patches)
+        {
+            if (q.type == "empty" && q.size > 0) twoDimensional = true;
+        }
+        if (mode == 2 || (mode == 0 && fixedTopology && firstBuild && twoDimensional))
         {
             static bool said = false;
             if (!said)
             {
                 said = true;
                 std::printf("  pcorr: its AMG hierarchy is a smoothed-aggregation one of its own, built once "
-                            "(the mesh keeps its topology); BRAE_PCORR_AMG=plain takes the one p_rgh uses\n");
+                            "(the mesh keeps its topology and is two-dimensional); BRAE_PCORR_AMG=plain takes "
+                            "the one p_rgh uses\n");
             }
             // from the case's cache where it is this mesh's (the start mesh only), built otherwise
             interPhase::Nested timedBuild("pcorr: the smoothed-aggregation hierarchy (load or build)");
