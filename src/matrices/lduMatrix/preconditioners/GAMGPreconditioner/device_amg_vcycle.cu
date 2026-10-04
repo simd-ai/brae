@@ -154,7 +154,20 @@ void vcycleAt(
 {
     const int n = Ag.nCells;
     if (asymmetric) amgRefuseAsymmetric(useChebyshev(), amg.corrScaling, amg.saSmooth);
-    zeroT<scalar><<<nBlocks(n),TPB>>>(n, xg.data());
+    // x starts at zero. A grid whose pre-smooth is weighted Jacobi writes its first sweep straight from b
+    // (smoothFromZeroT: the sweep's own expression with the two zeros written in, so its result to the bit) and
+    // needs neither the zeroing nor the product of a zero vector -- what vcycleAtF has done since the pressure
+    // work. This cycle zeroed x and formed A*0 at every grid of every iteration: MEASURED 2026-10-04 with
+    // BRAE_AMG_PCG_SPLIT on pcorr's smoothed hierarchy, waveMakerPiston at 896,000 cells, the pre-smooth of the
+    // finest grid 454 us an iteration where its post-smooth, the same sweep, is 403.
+    // BRAE_CONTROL_AMG_ZERO_PRODUCT=1 forms both, as before. BRAE_CONTROL_AMG_FROM_ZERO_STALE=1 is a gate's
+    // CONTROL, deliberately wrong: neither the zeroing nor the from-zero sweep, so the first sweep starts from
+    // whatever the last cycle left in x.
+    static const bool zeroProduct = std::getenv("BRAE_CONTROL_AMG_ZERO_PRODUCT") != nullptr;
+    static const bool staleStart = std::getenv("BRAE_CONTROL_AMG_FROM_ZERO_STALE") != nullptr;
+    const bool jacobiPre = !useChebyshev() && !(asymmetric ? useTSGSAsym() : useTSGS()) && !amg.gsSmooth;
+    const bool fromZero = !zeroProduct && g != amg.nLevels() && jacobiPre && nPreSweeps() > 0;
+    if (!fromZero) zeroT<scalar><<<nBlocks(n),TPB>>>(n, xg.data());
     if (g == amg.nLevels())                                    // coarsest: approximate solve
     {
         // BRAE_NCOARSE_CG overrides the coarsest PCG iteration CAP (item 80: it converges, it does not count).
@@ -188,6 +201,11 @@ void vcycleAt(
     else if (amg.gsSmooth) for (int s = 0; s < nPreSweeps(); ++s) gsSweep(Ag, bg, xg, amg.coloring[g], true);    // forward GS
     else for (int s = 0; s < nPreSweeps(); ++s)
     {
+        if (s == 0 && fromZero && !staleStart)
+        {
+            smoothFromZeroT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), Ag.diag, xg.data());
+            continue;
+        }
         deviceAmul(Ag, xg, amg.vAx[g]);
         smoothT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
     }
@@ -468,7 +486,9 @@ void vcycleAtF(
     if (asymmetric) amgRefuseAsymmetric(useChebyshev(), amg.corrScaling, amg.saSmooth);
     // x starts at zero. A level that pre-smooths writes its first sweep straight from b (smoothFromZeroT) and
     // needs neither this nor the product of a zero vector; BRAE_CONTROL_AMG_ZERO_PRODUCT=1 forms both, as before.
+    // BRAE_CONTROL_AMG_FROM_ZERO_STALE=1: the deliberately wrong control vcycleAt describes.
     static const bool zeroProduct = std::getenv("BRAE_CONTROL_AMG_ZERO_PRODUCT") != nullptr;
+    static const bool staleStart = std::getenv("BRAE_CONTROL_AMG_FROM_ZERO_STALE") != nullptr;
     const bool fromZero = !zeroProduct && g != amg.nLevels() && nPreSweeps() > 0;
     if (!fromZero) zeroT<float><<<nBlocks(n),TPB>>>(n, xg);
     if (g == amg.nLevels())                                    // coarsest: cast to FP64, exact FP64 solve, cast back
@@ -496,7 +516,7 @@ void vcycleAtF(
     }
     for (int s=0; s<nPreSweeps(); ++s)     // BRAE_NPRE, as the FP64 cycle reads it; NPRE by default
     {
-        if (s == 0 && fromZero)
+        if (s == 0 && fromZero && !staleStart)
         {
             smoothFromZeroT<float><<<nBlocks(n),TPB>>>(n, bg, Ag.diag, xg);
             continue;
