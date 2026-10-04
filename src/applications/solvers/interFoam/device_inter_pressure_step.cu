@@ -796,8 +796,12 @@ AMGData deviceAmgPcgHierarchy(
                             "is this mesh's. This run is deliberately wrong. ***\n");
             }
         }
-        interPhase::Nested timedCopy("pressure: AMG hierarchy copied from the one already built");
-        AMGData copy = cloneAMG(memo->structure);
+        // THE SECOND ASKER TAKES THE KEPT COPY ITSELF: two solves ask after a change, pcorr's and p_rgh's, so
+        // the copy made for the first one is the only one a change needs. A third asker would build.
+        interPhase::Nested timedCopy("pressure: AMG hierarchy handed to the second solve");
+        AMGData copy = std::move(memo->structure);
+        memo->structure = AMGData{};
+        memo->held = false;
         if (check)
         {
             const AMGData fresh = buildAMG(own, nei, w, nC);
@@ -818,6 +822,7 @@ AMGData deviceAmgPcgHierarchy(
     }
     if (remember)
     {
+        interPhase::Nested timedKeep("hierarchy: the copy kept for the second solve (cloneAMG)");
         memo->structure = cloneAMG(built);
         memo->held = true;
         memo->nCells = nC;

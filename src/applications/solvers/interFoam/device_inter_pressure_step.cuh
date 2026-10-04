@@ -106,9 +106,10 @@ struct DeviceInterPressureHooks
 // ONE BUILD A MESH. After a change of topology two solves ask for the new mesh's hierarchy -- pcorr's, inside
 // CorrectPhi, and then p_rgh's -- and each built it: the same call on the same mesh. The hierarchy is made
 // from the internal faces' owner, neighbour and |Sf| and the cell count; nothing of either MATRIX goes in,
-// the coefficients come in at each solve through amgGalerkin. So the second one is the first one, and is
-// handed a copy of its structure (cloneAMG) in place of a build. What a solve keeps on its hierarchy -- the
-// coarse matrices' values, the smoother's spectrum, the captured graphs -- is its own copy's.
+// the coefficients come in at each solve through amgGalerkin. So the second one is the first one: the first
+// build leaves a copy of its structure (cloneAMG) and the second asker is handed that copy in place of a
+// build. What a solve keeps on its hierarchy -- the coarse matrices' values, the smoother's spectrum, the
+// captured graphs -- is its own object's.
 // MEASURED: damBreakWithObstacle built 1.6 hierarchies a step for 66 ms, RAS/motorBike 2.0 for 42.
 // Held for a mesh that CHANGED only: the start mesh's second asker reads the disk cache the first one wrote.
 //   BRAE_CONTROL_AMG_HIERARCHY_REBUILT=1  every asker builds, as before
@@ -122,7 +123,7 @@ struct AmgHierarchyMemo
     std::vector<label> owner;
     std::vector<label> neighbour;
     std::vector<scalar> weights;
-    // never solved on: the askers get copies
+    // never solved on: copied (cloneAMG) from the first asker's build and handed whole to the second
     AMGData structure;
 };
 

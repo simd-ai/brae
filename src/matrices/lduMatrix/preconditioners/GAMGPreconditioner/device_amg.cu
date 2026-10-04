@@ -1,6 +1,7 @@
 // Device AMG preconditioner: host agglomeration (static) + device Galerkin and V-cycle smoothing.
 // Used by deviceAMGPCG. Feature flags live in one BRAE_AMG_* block at the top of the anonymous namespace.
 #include "device_amg.cuh"
+#include "inter_phase_time.cuh"
 #include "device_blas.cuh"
 #include "device_ldu.cuh"       // deviceParallelAmul (halo-coupled matvec) for the distributed whole-loop graph PCG
 #include "device_halo.cuh"      // DeviceHalo + its DeviceReducer (on-stream NVSHMEM reduce)
@@ -11,6 +12,9 @@
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <algorithm>
+#include <utility>
+#include <stdexcept>
+#include <cstring>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +24,7 @@
 #include <unordered_map>
 #include <vector>
 #include <mutex>
+#include <optional>
 
 namespace cg = cooperative_groups;
 
@@ -200,6 +205,156 @@ void buildGalerkinGather(AMGLevel& L, const AgglomT& a, int nFine)
     L.galFaceFlipList.copyFrom(ff);
 }
 
+// THE COARSE FACES OF ONE AGGLOMERATION: the unique (lower, higher) coarse-cell pairs in owner-sorted order (the
+// coarse SpMV needs that order), each fine face's coarse face (or -1 - cell for a face inside an agglomerate) and
+// flip, and the coarse face weights (the sum of the fine ones, added in ascending fine face).
+// coarseFacesBySort is how it was done: every crossing face's pair into one vector, a global sort, unique, and
+// a binary search a fine face. MEASURED on damBreakWithObstacle (42k to 91k cells, a hierarchy built at 0.8 of
+// the steps): 27 of the build's 38 ms a step were these two -- the sort 11.7, the searches 15.2.
+// coarseFacesByBucket gives the SAME lists in linear time: the crossing faces bucketed by their lower coarse cell
+// (a counting sort), each bucket -- a handful of entries -- sorted by the higher cell, a run of equal ones being
+// one coarse face. Buckets in ascending lower cell and runs in ascending higher cell IS the lexicographic order
+// of the pairs. The weights are added in a last pass over the fine faces in ascending order, as the sort-based
+// form adds them, so the sums are the same bits.
+//   BRAE_CONTROL_AMG_COARSE_FACES_SORT=1      the global sort, as before
+//   BRAE_CONTROL_AMG_COARSE_FACES_CHECK=1     both, compared entry for entry
+//   BRAE_CONTROL_AMG_COARSE_FACES_UNSORTED=1  a gate's CONTROL, deliberately wrong: the buckets are not sorted
+void coarseFacesBySort(
+    const std::vector<label>&  owner,
+    const std::vector<label>&  nei,
+    const std::vector<scalar>& fw,
+    const std::vector<label>&  map,
+    std::vector<label>&        cOwn,
+    std::vector<label>&        cNei,
+    std::vector<label>&        faceRestrict,
+    std::vector<label>&        faceFlip,
+    std::vector<scalar>&       cfw)
+{
+    const int nFaces = static_cast<int>(owner.size());
+    std::vector<std::pair<label,label>> pr;
+    pr.reserve(nFaces);
+    for (int f = 0; f < nFaces; ++f)
+    {
+        const label co=map[owner[f]], cn=map[nei[f]];
+        if (co!=cn) pr.emplace_back(std::min(co,cn), std::max(co,cn));
+    }
+    std::sort(pr.begin(), pr.end());
+    pr.erase(std::unique(pr.begin(), pr.end()), pr.end());
+    const int nCF = static_cast<int>(pr.size());
+    cOwn.assign(nCF, 0);
+    cNei.assign(nCF, 0);
+    faceRestrict.assign(nFaces, 0);
+    faceFlip.assign(nFaces, 0);
+    for (int i = 0; i < nCF; ++i)
+    {
+        cOwn[i]=pr[i].first;
+        cNei[i]=pr[i].second;
+    }
+    auto findCF = [&](
+        label a,
+        label b)
+    {
+        return static_cast<label>(std::lower_bound(pr.begin(), pr.end(), std::make_pair(a, b)) - pr.begin());
+    };
+    cfw.assign(nCF, 0.0);
+    for (int f = 0; f < nFaces; ++f)
+    {
+        const label co=map[owner[f]], cn=map[nei[f]];
+        if (co==cn)
+        {
+            faceRestrict[f]=-1-co;
+            faceFlip[f]=0;
+        }
+        else
+        {
+            const label cf=findCF(std::min(co,cn),std::max(co,cn));
+            faceRestrict[f]=cf;
+            faceFlip[f]=(co>cn)?1:0;
+            cfw[cf]+=fw[f];
+        }
+    }
+}
+
+void coarseFacesByBucket(
+    const std::vector<label>&  owner,
+    const std::vector<label>&  nei,
+    const std::vector<scalar>& fw,
+    const std::vector<label>&  map,
+    label                      nCoarse,
+    std::vector<label>&        cOwn,
+    std::vector<label>&        cNei,
+    std::vector<label>&        faceRestrict,
+    std::vector<label>&        faceFlip,
+    std::vector<scalar>&       cfw)
+{
+    static const bool unsorted = std::getenv("BRAE_CONTROL_AMG_COARSE_FACES_UNSORTED") != nullptr;
+    const int nFaces = static_cast<int>(owner.size());
+    faceRestrict.assign(nFaces, 0);
+    faceFlip.assign(nFaces, 0);
+    // the crossing faces, bucketed by their lower coarse cell
+    std::vector<label> start(static_cast<std::size_t>(nCoarse) + 1, 0);
+    for (int f = 0; f < nFaces; ++f)
+    {
+        const label co = map[owner[f]];
+        const label cn = map[nei[f]];
+        if (co != cn) ++start[std::min(co, cn) + 1];
+    }
+    for (label c = 0; c < nCoarse; ++c)
+    {
+        start[c + 1] += start[c];
+    }
+    const label nCross = start[nCoarse];
+    // an entry: the higher coarse cell and the fine face
+    std::vector<std::pair<label,label>> entry(static_cast<std::size_t>(nCross));
+    {
+        std::vector<label> at(start.begin(), start.end() - 1);
+        for (int f = 0; f < nFaces; ++f)
+        {
+            const label co = map[owner[f]];
+            const label cn = map[nei[f]];
+            if (co != cn) entry[at[std::min(co, cn)]++] = std::make_pair(std::max(co, cn), static_cast<label>(f));
+        }
+    }
+    cOwn.clear();
+    cNei.clear();
+    cOwn.reserve(static_cast<std::size_t>(nCross));
+    cNei.reserve(static_cast<std::size_t>(nCross));
+    for (label c = 0; c < nCoarse; ++c)
+    {
+        const auto b = entry.begin() + start[c];
+        const auto e = entry.begin() + start[c + 1];
+        if (!unsorted) std::sort(b, e);
+        label last = -1;
+        for (auto it = b; it != e; ++it)
+        {
+            if (it->first != last)
+            {
+                last = it->first;
+                cOwn.push_back(c);
+                cNei.push_back(last);
+            }
+            faceRestrict[it->second] = static_cast<label>(cOwn.size()) - 1;
+        }
+    }
+    // the faces inside an agglomerate, the flips, and the weights in ascending fine face
+    cfw.assign(cOwn.size(), 0.0);
+    for (int f = 0; f < nFaces; ++f)
+    {
+        const label co = map[owner[f]];
+        const label cn = map[nei[f]];
+        if (co == cn)
+        {
+            faceRestrict[f] = -1 - co;
+            faceFlip[f] = 0;
+        }
+        else
+        {
+            faceFlip[f] = (co > cn) ? 1 : 0;
+            cfw[faceRestrict[f]] += fw[f];
+        }
+    }
+}
+
 // One pairwise agglomeration step (host): merge cells of a grid (owner/nei/faceWeights, nC cells) into a coarse
 // grid. Returns the cell->coarse map, the coarse addressing (cOwn/cNei + gather starts), the face restriction,
 // and the carried coarse face weights (sum of the agglomerated fine face weights) for the NEXT level.
@@ -215,6 +370,9 @@ Agglom agglomerate(
     const std::vector<scalar>& fw,
     int nC)
 {
+    // BRAE_INTER_PHASE_TIME: a level's agglomeration part by part (summed over the levels of a build)
+    std::optional<interPhase::Nested> part;
+    part.emplace("hierarchy: the cells' faces and the pairwise matching (host)");
     const int nFaces = static_cast<int>(owner.size());
     std::vector<label> nNbr(nC, 0);
     for (int f = 0; f < nFaces; ++f)
@@ -289,40 +447,46 @@ Agglom agglomerate(
         if (map[c] < 0) map[c] = nCoarse++;
     // Coarse-face dedup: unique (min,max) coarse-cell pairs in owner-sorted order (the coarse SpMV requires it).
     // sort+unique on a flat vector rather than a std::map: same ordering, cache-friendly, lookups are a binary search.
-    std::vector<std::pair<label,label>> pr;
-    pr.reserve(nFaces);
-    for (int f = 0; f < nFaces; ++f)
+    part.emplace("hierarchy: the coarse faces and each face's coarse face (host)");
+    std::vector<label> cOwn, cNei, faceRestrict, faceFlip;
+    std::vector<scalar> cfw;
+    static const bool bySort = std::getenv("BRAE_CONTROL_AMG_COARSE_FACES_SORT") != nullptr;
+    static const bool checkBoth = std::getenv("BRAE_CONTROL_AMG_COARSE_FACES_CHECK") != nullptr;
+    if (bySort)
     {
-        const label co=map[owner[f]], cn=map[nei[f]];
-        if (co!=cn) pr.emplace_back(std::min(co,cn), std::max(co,cn));
-    }
-    std::sort(pr.begin(), pr.end());
-    pr.erase(std::unique(pr.begin(), pr.end()), pr.end());
-    const int nCF = static_cast<int>(pr.size());
-    std::vector<label> cOwn(nCF), cNei(nCF), faceRestrict(nFaces), faceFlip(nFaces);
-    for (int i = 0; i < nCF; ++i)
-    {
-        cOwn[i]=pr[i].first;
-        cNei[i]=pr[i].second;
-    }
-    auto findCF = [&](label a, label b){ return static_cast<label>(std::lower_bound(pr.begin(), pr.end(), std::make_pair(a,b)) - pr.begin()); };
-    std::vector<scalar> cfw(nCF, 0.0);
-    for (int f = 0; f < nFaces; ++f)
-    {
-        const label co=map[owner[f]], cn=map[nei[f]];
-        if (co==cn)
+        static bool said = false;
+        if (!said)
         {
-            faceRestrict[f]=-1-co;
-            faceFlip[f]=0;
+            said = true;
+            std::printf("  *** CONTROL: the AMG hierarchy's coarse faces are found by the global sort, as before "
+                        "(BRAE_CONTROL_AMG_COARSE_FACES_SORT). ***\n");
         }
-        else
+        coarseFacesBySort(owner, nei, fw, map, cOwn, cNei, faceRestrict, faceFlip, cfw);
+    }
+    else
+    {
+        coarseFacesByBucket(owner, nei, fw, map, nCoarse, cOwn, cNei, faceRestrict, faceFlip, cfw);
+        if (checkBoth)
         {
-            const label cf=findCF(std::min(co,cn),std::max(co,cn));
-            faceRestrict[f]=cf;
-            faceFlip[f]=(co>cn)?1:0;
-            cfw[cf]+=fw[f];
+            std::vector<label> sOwn, sNei, sRestrict, sFlip;
+            std::vector<scalar> sW;
+            coarseFacesBySort(owner, nei, fw, map, sOwn, sNei, sRestrict, sFlip, sW);
+            const char* what = sOwn != cOwn || sNei != cNei ? "the coarse faces"
+                             : sRestrict != faceRestrict ? "a fine face's coarse face"
+                             : sFlip != faceFlip ? "a fine face's flip"
+                             : sW.size() != cfw.size()
+                            || (!sW.empty() && std::memcmp(sW.data(), cfw.data(), sW.size()*sizeof(scalar)) != 0)
+                             ? "the coarse face weights" : nullptr;
+            if (what)
+            {
+                throw std::runtime_error(
+                    std::string("brae buildAMG: BRAE_CONTROL_AMG_COARSE_FACES_CHECK: ") + what
+                    + " from the buckets are not the ones the global sort gives.");
+            }
         }
     }
+    part.emplace("hierarchy: the coarse gather lists (host)");
+    const int nCF = static_cast<int>(cOwn.size());
     std::vector<label> cOS(nCoarse+1,0), cLS(nCoarse+1,0), cLosort(nCF);
     for (int f=0;f<nCF;++f)
     {
@@ -801,6 +965,7 @@ void finalizeAMG(
     AMGData& A,
     int nFine)
 {
+    interPhase::Nested timedFinal("hierarchy: the work vectors and graph caches (finalizeAMG)");
     const int G = A.nLevels();
     A.vAx.resize(G+1);
     A.vR.resize(G+1);
@@ -965,20 +1130,29 @@ AMGData buildAMG(
             L.nFine = n;
             L.nCoarse = a.nCoarse;
             L.nCoarseFaces = a.nCoarseFaces;
-            L.map.copyFrom(a.map);
-            L.addressingId = nextDeviceAddressingId();
-            L.cOwn.copyFrom(a.cOwn);
-            L.cNei.copyFrom(a.cNei);
-            L.cOwnerStart.copyFrom(a.cOS);
-            L.cLosort.copyFrom(a.cLosort);
-            L.cLosortStart.copyFrom(a.cLS);
-            L.faceRestrict.copyFrom(a.faceRestrict);
-            L.faceFlip.copyFrom(a.faceFlip);
-            buildGalerkinGather(L, a, n);
-            L.cDiag.resize(a.nCoarse);
-            L.cUpper.resize(a.nCoarseFaces);
-            L.cLower.resize(a.nCoarseFaces);
-            A.level.push_back(std::move(L));
+            {
+                interPhase::Nested timedUp("hierarchy: a level's addressing uploaded");
+                L.map.copyFrom(a.map);
+                L.addressingId = nextDeviceAddressingId();
+                L.cOwn.copyFrom(a.cOwn);
+                L.cNei.copyFrom(a.cNei);
+                L.cOwnerStart.copyFrom(a.cOS);
+                L.cLosort.copyFrom(a.cLosort);
+                L.cLosortStart.copyFrom(a.cLS);
+                L.faceRestrict.copyFrom(a.faceRestrict);
+                L.faceFlip.copyFrom(a.faceFlip);
+            }
+            {
+                interPhase::Nested timedGather("hierarchy: the Galerkin gather lists (host) and their upload");
+                buildGalerkinGather(L, a, n);
+            }
+            {
+                interPhase::Nested timedRest("hierarchy: a level's coarse matrix sized, the level kept");
+                L.cDiag.resize(a.nCoarse);
+                L.cUpper.resize(a.nCoarseFaces);
+                L.cLower.resize(a.nCoarseFaces);
+                A.level.push_back(std::move(L));
+            }
             owner = std::move(a.cOwn);
             nei = std::move(a.cNei);
             fw = std::move(a.coarseFaceWeights);
