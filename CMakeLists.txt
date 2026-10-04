@@ -87,6 +87,7 @@ add_library(brae_core STATIC
     src/finiteVolume/expressions/PatchFunction1/patchExprFunction1.cu
     src/OpenFOAM/meshes/primitive_mesh.cu
     src/finiteVolume/fvMesh/fv_geometry.cu
+    src/finiteVolume/fvMesh/device_fv_geometry.cu
     src/finiteVolume/fvMesh/fv_patch.cu
     src/finiteVolume/fvMesh/fvPatches/constraint/cyclicACMI/cyclic_acmi_cpp.cu
     src/OpenFOAM/decompose/scotch_decomposition.cu

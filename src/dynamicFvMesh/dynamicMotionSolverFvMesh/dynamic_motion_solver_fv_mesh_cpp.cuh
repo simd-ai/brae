@@ -74,6 +74,14 @@ scalar faceSweptVolume(
 // points before and after, 1/deltaT and its count of topology changes, and takes back meshPhi on the internal
 // faces and on every patch that is not `empty` -- what its own face loop fills. The device loop's is
 // deviceSweptVolumes (device_swept_volumes.cuh), that loop to the bit.
+// THE GEOMETRY ELSEWHERE. When the mesh holds one of these, update() hands it the moved mesh and its count of
+// topology changes in place of g.build(m), and the runner leaves g holding what build would (FvGeometry::adopt).
+// The device loop's is deviceFvGeometry (device_fv_geometry.cuh), build to the bit.
+using GeometryRunner = std::function<void(
+    const PrimitiveMesh&,
+    unsigned long long,
+    FvGeometry&)>;
+
 using SweptVolumeRunner = std::function<void(
     const PrimitiveMesh&,
     const std::vector<FvPatch>&,
@@ -161,6 +169,11 @@ public:
         {
             displacement_->setPatchWaveRunner(std::move(runner));
         }
+    }
+    // the geometry of every move built elsewhere (GeometryRunner); empty runs FvGeometry::build
+    void setGeometryRunner(GeometryRunner runner)
+    {
+        geometryRunner_ = std::move(runner);
     }
     // the swept volumes of every move computed elsewhere (SweptVolumeRunner); empty runs the host's face loop
     void setSweptVolumeRunner(SweptVolumeRunner runner)
@@ -297,6 +310,7 @@ private:
     // the swept volumes elsewhere, when the driver hands a runner in, and how many times the faces have changed
     // (attach and topoChanged), which is what the runner keys its copy of them on
     SweptVolumeRunner sweptRunner_;
+    GeometryRunner geometryRunner_;
     unsigned long long topologyCount_ = 0;
     // fvGeometryScheme::setMeshPhi on the host: meshPhi on the internal faces and the patches that are not empty
     void sweptVolumesOnHost(

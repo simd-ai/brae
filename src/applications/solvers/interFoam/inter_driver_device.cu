@@ -9,6 +9,7 @@
 #include "device_fvc_smooth.cuh"
 #include "device_inter_pcorr_solve.cuh"
 #include "device_displacement_laplacian_assembly.cuh"
+#include "device_fv_geometry.cuh"
 #include "device_patch_wave.cuh"
 #include "device_swept_volumes.cuh"
 #include <cstring>
@@ -659,6 +660,31 @@ RunReport runInterFoamDevice(
                 deviceSweptVolumes(mesh, patches, oldPoints, newPoints, rdt, topology, sweptVolumes, meshPhi);
             });
     }
+    // THE MOVED MESH'S GEOMETRY ON THE GPU: face centres and areas, cell centres and volumes, the interpolation
+    // factors -- FvGeometry::build, each cell folding its faces in the host's order and every fused product the
+    // host's (deviceFvGeometry). The points go up, the nine arrays come down into the host's geometry, which the
+    // host stages after the move still read, and stay on the device. MEASURED on waveMakerPiston refined to
+    // 896,000 cells: the host's build 87 ms a step, this 13.7. BRAE_CONTROL_GEOMETRY_HOST=1 keeps the host's
+    // build -- the identity gate's other arm.
+    DeviceFvGeometry deviceGeometry;
+    if (dyn && std::getenv("BRAE_CONTROL_GEOMETRY_HOST") == nullptr)
+    {
+        dyn->setGeometryRunner(
+            [&deviceGeometry](
+                const PrimitiveMesh& mesh,
+                unsigned long long topology,
+                FvGeometry& geo)
+            {
+                static bool said = false;
+                if (!said)
+                {
+                    said = true;
+                    std::printf("  mesh geometry: after each move it is built on the GPU, the host's arithmetic; "
+                                "BRAE_CONTROL_GEOMETRY_HOST=1 builds it on the host\n");
+                }
+                deviceFvGeometry(mesh, topology, deviceGeometry, geo);
+            });
+    }
     // ...and taken back when this loop ends: the runner holds this function's buffers, and the fields (with the
     // mesh motion in them) can be handed on to the caller
     struct RunnerReset
@@ -671,6 +697,7 @@ RunReport runInterFoamDevice(
                 dyn->setPatchWaveRunner(PatchWaveRunner());
                 dyn->setDisplacementAssemblyRunner(DisplacementAssemblyRunner());
                 dyn->setSweptVolumeRunner(SweptVolumeRunner());
+                dyn->setGeometryRunner(GeometryRunner());
             }
         }
     } runnerReset{dyn};
@@ -3529,7 +3556,80 @@ RunReport runInterFoamDevice(
                     C.V00 = &dV00;
                 }
                 refreshPart.emplace("refresh: the device mesh's geometry (refreshDeviceMeshGeometry)");
-                refreshDeviceMeshGeometry(dm, m, g, fvp);
+                // FROM THE DEVICE'S OWN GEOMETRY where the move's geometry was built there and the host has not
+                // written to it since (refreshDeviceMeshFromDeviceGeometry): copies, splits and subtractions on
+                // the device in place of the host rebuilding the whole device mesh and uploading it. MEASURED
+                // on waveMakerPiston refined to 896,000 cells: 52 ms a step on the host, 3.4 here.
+                // BRAE_CONTROL_DEVICE_MESH_FROM_HOST=1 takes the host's refresh -- the identity gate's other arm.
+                // BRAE_CONTROL_DEVICE_MESH_CHECK=1 builds the device mesh from the host too and stops on one
+                // bit's difference in any geometric buffer -- its oracle.
+                static const bool meshFromHost = std::getenv("BRAE_CONTROL_DEVICE_MESH_FROM_HOST") != nullptr;
+                static const bool meshCheck = std::getenv("BRAE_CONTROL_DEVICE_MESH_CHECK") != nullptr;
+                if (!meshFromHost && refreshDeviceMeshFromDeviceGeometry(dm, deviceGeometry, g, fvp))
+                {
+                    static bool said = false;
+                    if (!said)
+                    {
+                        said = true;
+                        std::printf("  device mesh: after each move its geometry is taken from the GPU's own; "
+                                    "BRAE_CONTROL_DEVICE_MESH_FROM_HOST=1 rebuilds and uploads it from the host\n");
+                    }
+                    if (meshCheck)
+                    {
+                        const DeviceMesh fresh = buildDeviceMesh(m, g, fvp);
+                        auto same = [](
+                            const char* what,
+                            const DeviceBuffer<scalar>& got,
+                            const DeviceBuffer<scalar>& want)
+                        {
+                            std::vector<scalar> a;
+                            std::vector<scalar> b;
+                            got.copyTo(a);
+                            want.copyTo(b);
+                            if (a.size() == b.size()
+                             && (b.empty() || std::memcmp(a.data(), b.data(), b.size()*sizeof(scalar)) == 0))
+                            {
+                                return;
+                            }
+                            std::size_t at = 0;
+                            while (at < a.size() && at < b.size() && std::memcmp(&a[at], &b[at], sizeof(scalar)) == 0)
+                            {
+                                ++at;
+                            }
+                            char line[200];
+                            std::snprintf(line, sizeof(line), "%s, entry %zu of %zu: %.17g, from the host %.17g",
+                                          what, at, b.size(), at < a.size() ? a[at] : 0.0,
+                                          at < b.size() ? b[at] : 0.0);
+                            throw std::runtime_error(
+                                std::string("brae interFoam: the device mesh refreshed on the GPU is not the one "
+                                            "built from the host: ") + line);
+                        };
+                        same("V", dm.V, fresh.V);
+                        same("w", dm.w, fresh.w);
+                        same("dc", dm.dc, fresh.dc);
+                        same("nonOrthDc", dm.nonOrthDc, fresh.nonOrthDc);
+                        same("Sfx", dm.Sfx, fresh.Sfx);
+                        same("Sfy", dm.Sfy, fresh.Sfy);
+                        same("Sfz", dm.Sfz, fresh.Sfz);
+                        same("magSf", dm.magSf, fresh.magSf);
+                        same("corrVecX", dm.corrVecX, fresh.corrVecX);
+                        same("corrVecY", dm.corrVecY, fresh.corrVecY);
+                        same("corrVecZ", dm.corrVecZ, fresh.corrVecZ);
+                        same("dOwnX", dm.dOwnX, fresh.dOwnX);
+                        same("dOwnY", dm.dOwnY, fresh.dOwnY);
+                        same("dOwnZ", dm.dOwnZ, fresh.dOwnZ);
+                        same("dNeiX", dm.dNeiX, fresh.dNeiX);
+                        same("dNeiY", dm.dNeiY, fresh.dNeiY);
+                        same("dNeiZ", dm.dNeiZ, fresh.dNeiZ);
+                        same("dBndX", dm.dBndX, fresh.dBndX);
+                        same("dBndY", dm.dBndY, fresh.dBndY);
+                        same("dBndZ", dm.dBndZ, fresh.dBndZ);
+                    }
+                }
+                else
+                {
+                    refreshDeviceMeshGeometry(dm, m, g, fvp);
+                }
                 ++meshGeometryEpoch;
                 refreshPart.emplace("refresh: the pair, |Sf|, gh and ghf up");
                 // ...and THE PAIR: the host stage above has recomputed every cyclicAMI's weights on the

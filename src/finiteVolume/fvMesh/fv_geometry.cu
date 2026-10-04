@@ -162,6 +162,7 @@ void FvGeometry::makeInterpolation(const PrimitiveMesh& m)
 void FvGeometry::buildFaceGeometry(const PrimitiveMesh& m)
 {
     interPhase::Nested timed("FvGeometry: face centres and areas");
+    ++generation_;
     makeFaceCentresAndAreas(m);
     areaScaled_ = false;          // areas are raw again: a fresh scale is now legal
     rawArea_.clear();
@@ -169,6 +170,7 @@ void FvGeometry::buildFaceGeometry(const PrimitiveMesh& m)
 
 void FvGeometry::buildCellGeometry(const PrimitiveMesh& m)
 {
+    ++generation_;
     {
         interPhase::Nested timed("FvGeometry: cell centres and volumes");
         makeCellCentresAndVols(m);
@@ -184,6 +186,7 @@ void FvGeometry::applyAreaScaling(const std::vector<std::pair<label, scalar>>& f
             "brae: FvGeometry::applyAreaScaling called twice without an intervening buildFaceGeometry. "
             "cyclicACMI area scaling is defined against the RAW face areas; applying it to already-scaled "
             "areas would compound the mask every step and shrink the interface away.");
+    ++generation_;
     for (const auto& fs : faceScale)
     {
         rawArea_.emplace(fs.first, magSf_[fs.first]);   // remember the raw area before touching it
@@ -195,13 +198,43 @@ void FvGeometry::applyAreaScaling(const std::vector<std::pair<label, scalar>>& f
 
 void FvGeometry::setFaceArea(label f, const vector& Sf)
 {
+    ++generation_;
     Sf_[f] = Sf;
     magSf_[f] = mag(Sf);
 }
 
 void FvGeometry::updateCellCentresAndVols(const PrimitiveMesh& m)
 {
+    ++generation_;
     makeCellCentresAndVols(m);
+}
+
+void FvGeometry::adopt(
+    Built& b,
+    const PrimitiveMesh& m)
+{
+    const std::size_t nF = static_cast<std::size_t>(m.nFaces());
+    const std::size_t nIf = static_cast<std::size_t>(m.nInternalFaces());
+    const std::size_t nC = static_cast<std::size_t>(m.nCells());
+    if (b.Cf.size() != nF || b.Sf.size() != nF || b.magSf.size() != nF || b.C.size() != nC || b.V.size() != nC
+     || b.weights.size() != nIf || b.deltaCoeffs.size() != nIf || b.nonOrthDeltaCoeffs.size() != nIf
+     || b.nonOrthCorr.size() != nIf)
+    {
+        throw std::runtime_error("brae: FvGeometry::adopt was handed a geometry of another mesh's sizes.");
+    }
+    Cf_.swap(b.Cf);
+    Sf_.swap(b.Sf);
+    magSf_.swap(b.magSf);
+    C_.swap(b.C);
+    V_.swap(b.V);
+    weights_.swap(b.weights);
+    deltaCoeffs_.swap(b.deltaCoeffs);
+    nonOrthDeltaCoeffs_.swap(b.nonOrthDeltaCoeffs);
+    nonOrthCorr_.swap(b.nonOrthCorr);
+    // as buildFaceGeometry: the areas are raw again
+    areaScaled_ = false;
+    rawArea_.clear();
+    ++generation_;
 }
 
 void FvGeometry::build(const PrimitiveMesh& m)

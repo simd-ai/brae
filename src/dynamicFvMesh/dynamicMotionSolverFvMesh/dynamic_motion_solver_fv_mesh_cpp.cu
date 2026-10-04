@@ -501,7 +501,69 @@ void DynamicMotionSolverFvMesh::update(
     movePart.emplace("geometry: the points moved (movePoints)");
     m.movePoints(std::move(newPoints));
     movePart.emplace("geometry: face centres and areas, cell centres and volumes, interpolation");
-    g.build(m);
+    if (geometryRunner_)
+    {
+        geometryRunner_(m, topologyCount_, g);
+        // BRAE_CONTROL_GEOMETRY_CHECK=1: the host builds the geometry too, and one bit's difference in any of
+        // the nine arrays stops the run and names the entry -- the identity gate's oracle, at every move
+        static const bool check = std::getenv("BRAE_CONTROL_GEOMETRY_CHECK") != nullptr;
+        if (check)
+        {
+            FvGeometry host;
+            host.build(m);
+            auto same = [](
+                const char* what,
+                const scalar* got,
+                std::size_t nGot,
+                const scalar* want,
+                std::size_t nWant)
+            {
+                if (nGot == nWant && (nWant == 0 || std::memcmp(got, want, nWant*sizeof(scalar)) == 0))
+                {
+                    return;
+                }
+                std::size_t at = 0;
+                while (at < nGot && at < nWant && std::memcmp(got + at, want + at, sizeof(scalar)) == 0)
+                {
+                    ++at;
+                }
+                char line[200];
+                std::snprintf(line, sizeof(line), ", entry %zu of %zu: %.17g, the host's %.17g", at, nWant,
+                              at < nGot ? got[at] : 0.0, at < nWant ? want[at] : 0.0);
+                throw std::runtime_error(
+                    std::string(WHO) + "the geometry built elsewhere is not the host's: " + what + line);
+            };
+            auto sameV = [&same](
+                const char* what,
+                const std::vector<vector>& got,
+                const std::vector<vector>& want)
+            {
+                same(what, got.empty() ? nullptr : &got.data()->x, 3*got.size(),
+                     want.empty() ? nullptr : &want.data()->x, 3*want.size());
+            };
+            auto sameS = [&same](
+                const char* what,
+                const std::vector<scalar>& got,
+                const std::vector<scalar>& want)
+            {
+                same(what, got.data(), got.size(), want.data(), want.size());
+            };
+            sameV("Cf (3 a face)", g.Cf(), host.Cf());
+            sameV("Sf (3 a face)", g.Sf(), host.Sf());
+            sameS("magSf", g.magSf(), host.magSf());
+            sameV("C (3 a cell)", g.C(), host.C());
+            sameS("V", g.V(), host.V());
+            sameS("weights", g.weights(), host.weights());
+            sameS("deltaCoeffs", g.deltaCoeffs(), host.deltaCoeffs());
+            sameS("nonOrthDeltaCoeffs", g.nonOrthDeltaCoeffs(), host.nonOrthDeltaCoeffs());
+            sameV("nonOrthCorrectionVectors (3 a face)", g.nonOrthCorrectionVectors(),
+                  host.nonOrthCorrectionVectors());
+        }
+    }
+    else
+    {
+        g.build(m);
+    }
     movePart.emplace("geometry: the patches rebuilt (buildPatches)");
     // ...WITH THE cyclicACMI EXEMPTION THE CALLER ALREADY HELD. buildPatches refuses a cyclicACMI
     // unless it is told the caller is the OF-mirror interFoam loop, which couples the pair itself

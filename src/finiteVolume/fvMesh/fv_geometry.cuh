@@ -60,6 +60,32 @@ public:
         return it == rawArea_.end() ? magSf_[f] : it->second;
     }
 
+    // THE GEOMETRY BUILT ELSEWHERE, taken whole: the nine arrays build() leaves, from a caller that computed
+    // them itself -- the device loop's deviceFvGeometry, which is build() to the bit. adopt() SWAPS: `b` leaves
+    // with the arrays this held, the right sizes for the caller's next build. Like buildFaceGeometry it leaves
+    // the areas raw and unscaled.
+    struct Built
+    {
+        std::vector<vector> Cf;
+        std::vector<vector> Sf;
+        std::vector<vector> C;
+        std::vector<vector> nonOrthCorr;
+        std::vector<scalar> magSf;
+        std::vector<scalar> V;
+        std::vector<scalar> weights;
+        std::vector<scalar> deltaCoeffs;
+        std::vector<scalar> nonOrthDeltaCoeffs;
+    };
+    void adopt(
+        Built& b,
+        const PrimitiveMesh& m);
+    // HOW MANY TIMES this geometry has been written: every build, scaling, face-area set, cell update and adopt
+    // raises it. What a copy held elsewhere -- the device's -- compares to know whether it is still this one.
+    unsigned long long generation() const
+    {
+        return generation_;
+    }
+
     const std::vector<vector>& Cf()    const { return Cf_; }
     const std::vector<vector>& Sf()    const { return Sf_; }
     const std::vector<scalar>& magSf() const { return magSf_; }
@@ -78,6 +104,7 @@ private:
     std::vector<vector> Cf_, Sf_, C_, nonOrthCorr_;
     std::vector<scalar> magSf_, V_, weights_, deltaCoeffs_, nonOrthDeltaCoeffs_;
     bool areaScaled_ = false;   // guards against scaling already-scaled areas
+    unsigned long long generation_ = 0;
     std::unordered_map<label, scalar> rawArea_;   // pre-scaling |Sf|, ACMI faces only
 };
 
