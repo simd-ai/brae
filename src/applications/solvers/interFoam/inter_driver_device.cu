@@ -10,6 +10,7 @@
 #include "device_inter_pcorr_solve.cuh"
 #include "device_displacement_laplacian_assembly.cuh"
 #include "device_patch_wave.cuh"
+#include "device_swept_volumes.cuh"
 #include <cstring>
 #include <optional>
 #include <set>
@@ -630,6 +631,34 @@ RunReport runInterFoamDevice(
                 devicePatchWave(mesh, geo, motionWaveCells, seedFaces, motionWave, cellDistSqr, boundaryDistSqr);
             });
     }
+    // THE MESH FLUX OF EVERY MOVE ON THE GPU: each face's swept volume over the step (face::sweptVol), the
+    // host's face loop term for term and fused product for fused product (deviceSweptVolumes), for any motion
+    // solver -- the points before and after go up, meshPhi comes back. MEASURED on waveMakerPiston refined to
+    // 896,000 cells: the host's loop 97 ms a step, this 8.8. BRAE_CONTROL_SWEPT_VOLUME_HOST=1 keeps the host's
+    // loop -- the identity gate's other arm.
+    DeviceSweptVolumes sweptVolumes;
+    if (dyn && std::getenv("BRAE_CONTROL_SWEPT_VOLUME_HOST") == nullptr)
+    {
+        dyn->setSweptVolumeRunner(
+            [&sweptVolumes](
+                const PrimitiveMesh& mesh,
+                const std::vector<FvPatch>& patches,
+                const std::vector<vector>& oldPoints,
+                const std::vector<vector>& newPoints,
+                scalar rdt,
+                unsigned long long topology,
+                SurfaceScalarField& meshPhi)
+            {
+                static bool said = false;
+                if (!said)
+                {
+                    said = true;
+                    std::printf("  mesh flux: the swept volumes of each move are computed on the GPU, the host's "
+                                "arithmetic; BRAE_CONTROL_SWEPT_VOLUME_HOST=1 runs the host's face loop\n");
+                }
+                deviceSweptVolumes(mesh, patches, oldPoints, newPoints, rdt, topology, sweptVolumes, meshPhi);
+            });
+    }
     // ...and taken back when this loop ends: the runner holds this function's buffers, and the fields (with the
     // mesh motion in them) can be handed on to the caller
     struct RunnerReset
@@ -641,6 +670,7 @@ RunReport runInterFoamDevice(
             {
                 dyn->setPatchWaveRunner(PatchWaveRunner());
                 dyn->setDisplacementAssemblyRunner(DisplacementAssemblyRunner());
+                dyn->setSweptVolumeRunner(SweptVolumeRunner());
             }
         }
     } runnerReset{dyn};

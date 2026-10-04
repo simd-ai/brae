@@ -2,6 +2,9 @@
 #include "dynamic_motion_solver_fv_mesh_cpp.cuh"
 #include "foam_dict.cuh"
 #include "mrf_read.cuh"
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
 #include <optional>
 #include <cmath>
 #include <filesystem>
@@ -65,6 +68,31 @@ scalar faceSweptVolume(
         newPoints[m.faceVert(f, nPoints - 1)],
         newPoints[m.faceVert(f, 0)]);
     return sv;
+}
+
+void DynamicMotionSolverFvMesh::sweptVolumesOnHost(
+    const PrimitiveMesh& m,
+    const std::vector<vector>& newPoints,
+    scalar rdt,
+    SurfaceScalarField& meshPhi) const
+{
+    const label nIf = m.nInternalFaces();
+    for (label facei = 0; facei < nIf; ++facei)
+    {
+        meshPhi.internal[static_cast<std::size_t>(facei)] =
+            faceSweptVolume(m, facei, oldPoints_, newPoints)*rdt;
+    }
+    for (std::size_t pi = 0; pi < patches_->size(); ++pi)
+    {
+        const FvPatch& p = (*patches_)[pi];
+        // Empty patches
+        if (p.type == "empty") continue;
+        for (label i = 0; i < p.size; ++i)
+        {
+            meshPhi.boundary[pi][static_cast<std::size_t>(i)] =
+                faceSweptVolume(m, p.start + i, oldPoints_, newPoints)*rdt;
+        }
+    }
 }
 
 // motionSolver::New(mesh, dict) on ONE motion dictionary: the whole dynamicMeshDict for
@@ -258,6 +286,7 @@ void DynamicMotionSolverFvMesh::attach(
     g_ = &g;
     patches_ = &patches;
     points0_ = m.points();
+    ++topologyCount_;
     // zoneMotion.C:99-122: every point of every face of every zone cell, in ascending order. The
     // syncPointList there exchanges across processor boundaries; serial, it marks nothing more
     // (MEASURED on mixerVesselAMI at 82,510 cells: brae's moved points are OpenFOAM's written ones).
@@ -425,22 +454,47 @@ void DynamicMotionSolverFvMesh::update(
     // fvGeometryScheme::setMeshPhi
     movePart.emplace("geometry: the swept volumes (meshPhi)");
     const scalar rdt = 1.0/deltaT;
-    const label nIf = m.nInternalFaces();
-    for (label facei = 0; facei < nIf; ++facei)
+    if (sweptRunner_)
     {
-        meshPhi_.internal[static_cast<std::size_t>(facei)] =
-            faceSweptVolume(m, facei, oldPoints_, newPoints)*rdt;
-    }
-    for (std::size_t pi = 0; pi < patches_->size(); ++pi)
-    {
-        const FvPatch& p = (*patches_)[pi];
-        // Empty patches
-        if (p.type == "empty") continue;
-        for (label i = 0; i < p.size; ++i)
+        sweptRunner_(m, *patches_, oldPoints_, newPoints, rdt, topologyCount_, meshPhi_);
+        // BRAE_CONTROL_SWEPT_VOLUME_CHECK=1: the host's face loop runs too, and one bit's difference on any face
+        // stops the run and names it -- the identity gate's oracle, at every move
+        static const bool check = std::getenv("BRAE_CONTROL_SWEPT_VOLUME_CHECK") != nullptr;
+        if (check)
         {
-            meshPhi_.boundary[pi][static_cast<std::size_t>(i)] =
-                faceSweptVolume(m, p.start + i, oldPoints_, newPoints)*rdt;
+            SurfaceScalarField host = meshPhi_;
+            sweptVolumesOnHost(m, newPoints, rdt, host);
+            auto same = [](
+                const std::string& what,
+                const std::vector<scalar>& got,
+                const std::vector<scalar>& want)
+            {
+                if (got.size() == want.size()
+                 && (want.empty() || std::memcmp(got.data(), want.data(), want.size()*sizeof(scalar)) == 0))
+                {
+                    return;
+                }
+                std::size_t at = 0;
+                while (at < got.size() && at < want.size() && std::memcmp(&got[at], &want[at], sizeof(scalar)) == 0)
+                {
+                    ++at;
+                }
+                char line[200];
+                std::snprintf(line, sizeof(line), ", face %zu of %zu: %.17g, the host's %.17g", at, want.size(),
+                              at < got.size() ? got[at] : 0.0, at < want.size() ? want[at] : 0.0);
+                throw std::runtime_error(
+                    std::string(WHO) + "the swept volumes computed elsewhere are not the host's: " + what + line);
+            };
+            same("the internal faces", meshPhi_.internal, host.internal);
+            for (std::size_t pi = 0; pi < patches_->size(); ++pi)
+            {
+                same("patch " + (*patches_)[pi].name, meshPhi_.boundary[pi], host.boundary[pi]);
+            }
         }
+    }
+    else
+    {
+        sweptVolumesOnHost(m, newPoints, rdt, meshPhi_);
     }
 
     // ...and the geometry from the new points, each patch's copy in place
@@ -496,6 +550,7 @@ void DynamicMotionSolverFvMesh::topoChanged(
             + std::to_string(V0.size()) + " and points0 " + std::to_string(points0_.size())
             + ". The refiner carries both (RefineUpdateState::V0, ::points0).");
     }
+    ++topologyCount_;
     // fvMesh::updateMesh: storeOldVol (once per index), then the mapped and corrected V0
     V0_ = std::move(V0);
     curTimeIndex_ = timeIndex;

@@ -57,6 +57,7 @@
 #include "solid_body_motion_function_cpp.cuh"
 #include <memory>
 #include <string>
+#include <functional>
 #include <vector>
 
 namespace brae {
@@ -68,6 +69,19 @@ scalar faceSweptVolume(
     label f,
     const std::vector<vector>& oldPoints,
     const std::vector<vector>& newPoints);
+
+// THE SWEPT VOLUMES ELSEWHERE. When the mesh holds one of these, update() hands it the mesh, the patches, the
+// points before and after, 1/deltaT and its count of topology changes, and takes back meshPhi on the internal
+// faces and on every patch that is not `empty` -- what its own face loop fills. The device loop's is
+// deviceSweptVolumes (device_swept_volumes.cuh), that loop to the bit.
+using SweptVolumeRunner = std::function<void(
+    const PrimitiveMesh&,
+    const std::vector<FvPatch>&,
+    const std::vector<vector>&,
+    const std::vector<vector>&,
+    scalar,
+    unsigned long long,
+    SurfaceScalarField&)>;
 
 // Time::subCycle's two TimeStates, as fvMesh::Vsc and Vsc0 read them
 struct SubCycleTimeState
@@ -147,6 +161,11 @@ public:
         {
             displacement_->setPatchWaveRunner(std::move(runner));
         }
+    }
+    // the swept volumes of every move computed elsewhere (SweptVolumeRunner); empty runs the host's face loop
+    void setSweptVolumeRunner(SweptVolumeRunner runner)
+    {
+        sweptRunner_ = std::move(runner);
     }
     // ...and its equation's interior assembled elsewhere
     void setDisplacementAssemblyRunner(DisplacementAssemblyRunner runner)
@@ -275,6 +294,16 @@ private:
     std::vector<scalar> V00_;
     bool                V00Exists_ = false;
     SurfaceScalarField meshPhi_;
+    // the swept volumes elsewhere, when the driver hands a runner in, and how many times the faces have changed
+    // (attach and topoChanged), which is what the runner keys its copy of them on
+    SweptVolumeRunner sweptRunner_;
+    unsigned long long topologyCount_ = 0;
+    // fvGeometryScheme::setMeshPhi on the host: meshPhi on the internal faces and the patches that are not empty
+    void sweptVolumesOnHost(
+        const PrimitiveMesh& m,
+        const std::vector<vector>& newPoints,
+        scalar rdt,
+        SurfaceScalarField& meshPhi) const;
     bool moving_ = false;
     // dynamicMotionSolverListFvMesh::update moves to points() + (newPoints() - points())
     // (dynamicMotionSolverListFvMesh.C:176-183) where dynamicMotionSolverFvMesh moves to newPoints()
