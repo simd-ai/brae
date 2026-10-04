@@ -78,8 +78,13 @@ struct DevicePcorrSolver
     bool fixedTopology = false;
 
     // pcorrEqn.solve() on the GPU, whatever its entry names (`asked`, for the notice): the boundary folded as
-    // fvMatrix::solveSegregated folds it, then deviceAMGPCG with the entry's stopping controls. Returns false,
-    // solving nothing, on a mesh with a coupled patch.
+    // fvMatrix::solveSegregated folds it, then deviceAMGPCG with the entry's stopping controls.
+    // A COUPLED PAIR (cyclic, cyclicAMI) goes with it: the pair's faces, each with its own cell, its neighbour
+    // slots and weights (FvPatch's own, what patchNeighbourValue sums) and the matrix's interface coefficient,
+    // are put on the matrix view, where deviceAmul applies them and the AMG hierarchy carries them on every grid
+    // (AMGPair). Until 2026-10-04 such a mesh was declined and pcorr solved on the host with the case's own
+    // solver: MEASURED on RAS/mixerVesselAMI at 894,950 cells, CorrectPhi 364.5 ms a step.
+    // Returns false, solving nothing, on a coupled patch of any other type (cyclicACMI).
     bool solve(
         const std::string& asked,
         const FvScalarMatrix& M,
@@ -105,7 +110,8 @@ struct DevicePcorrSolver
     // coupled, in patch order, the flux and the two laplacian coefficients. The geometry is the GPU's own where
     // the caller hands in one that is the host's (`deviceGeometry`, after a mesh move); uploaded otherwise.
     // Down: phi on the internal faces and pcorr's cells (for the patches' flux, which the host forms).
-    // Returns false, touching nothing, on a mesh with a coupled patch.
+    // Returns false, touching nothing, on a mesh with a coupled patch: the host assembles there, and solve()
+    // takes the system with its pair.
     //   `hostMatrix`  BRAE_CONTROL_PCORR_ASSEMBLY_CHECK: the system as the host assembled it; every entry of
     //                 the GPU's is compared with it, and phi with the host's flux of the GPU's solution
     bool correct(
@@ -127,7 +133,7 @@ struct DevicePcorrSolver
         const FvScalarMatrix* hostMatrix);
 
 private:
-    // the coupled-patch refusal and the pressure rule's notice, once
+    // the refusal of a coupled patch that is not a cyclic or a cyclicAMI, and the pressure rule's notice, once
     bool takes(
         const std::string& asked,
         const std::vector<FvPatch>& patches);
@@ -137,8 +143,19 @@ private:
         const FvGeometry& g,
         const std::vector<FvPatch>& patches);
 
+    // solve(): the coupled pair's faces up -- own cells, slots, weights, this matrix's interface coefficients
+    void pairUp(
+        const FvScalarMatrix& M,
+        const std::vector<FvPatch>& patches);
+
     bool announced = false;
     bool announcedCoupled = false;
+    int nPair = 0;
+    DeviceBuffer<label> dPairOwn;
+    DeviceBuffer<label> dPairOff;
+    DeviceBuffer<label> dPairNbr;
+    DeviceBuffer<scalar> dPairW;
+    DeviceBuffer<scalar> dPairIfc;
     // correct(): the faces of the patches that are neither empty nor coupled, in patch order (a "slot" each),
     // and each cell's run of them
     std::size_t nSlots = 0;

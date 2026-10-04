@@ -25,13 +25,13 @@ bool DevicePcorrSolver::takes(
 {
     for (const FvPatch& p : patches)
     {
-        if (p.coupled)
+        if (p.coupled && p.type != "cyclic" && p.type != "cyclicAMI")
         {
             if (!announcedCoupled)
             {
                 announcedCoupled = true;
-                std::printf("  pcorr: the mesh has the coupled patch '%s'; pcorr keeps the case's own solver, "
-                            "which carries the pair\n", p.name.c_str());
+                std::printf("  pcorr: the mesh has the coupled patch '%s' of type %s; pcorr keeps the case's own "
+                            "solver, which carries the pair\n", p.name.c_str(), p.type.c_str());
             }
             return false;
         }
@@ -111,11 +111,21 @@ void DevicePcorrSolver::prepare(
         }();
         // ...and twoDimensional: a patch of type empty that has faces
         bool twoDimensional = false;
+        // ...and no coupled pair: the hierarchy carries a pair on its grids through its aggregate maps
+        // (AMGPair), which a smoothed prolongator is not
+        bool coupledPair = false;
         for (const FvPatch& q : patches)
         {
             if (q.type == "empty" && q.size > 0) twoDimensional = true;
+            if (q.coupled) coupledPair = true;
         }
-        if (mode == 2 || (mode == 0 && fixedTopology && firstBuild && twoDimensional))
+        if (coupledPair && mode == 2)
+        {
+            throw std::runtime_error(
+                "brae interFoam device pcorr solve: BRAE_PCORR_AMG=sa on a mesh with a coupled pair. A smoothed-"
+                "aggregation hierarchy does not carry the pair on its grids; unset it.");
+        }
+        if (mode == 2 || (mode == 0 && fixedTopology && firstBuild && twoDimensional && !coupledPair))
         {
             static bool said = false;
             if (!said)
@@ -173,6 +183,53 @@ void DevicePcorrSolver::prepare(
     }
 }
 
+void DevicePcorrSolver::pairUp(
+    const FvScalarMatrix& M,
+    const std::vector<FvPatch>& patches)
+{
+    // A face a row: its own cell, the slots patchNeighbourValue sums (a cyclic's one neighbour cell at weight
+    // 1, a cyclicAMI's weighted cells), and the coefficient. fvm::laplacian stores a coupled face's interface
+    // coefficient in boundaryCoeffs with lduMatrix's sign -- Amul takes result -= boundaryCoeffs*psi_nbr -- and
+    // deviceAmul adds, so it goes up negated.
+    std::vector<label> own;
+    std::vector<label> off{label(0)};
+    std::vector<label> nbr;
+    std::vector<scalar> w;
+    std::vector<scalar> ifc;
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& q = patches[pi];
+        if (!q.coupled) continue;
+        for (label i = 0; i < q.size; ++i)
+        {
+            const std::size_t k = static_cast<std::size_t>(i);
+            own.push_back(q.faceCells[i]);
+            ifc.push_back(-M.boundaryCoeffs[pi][k]);
+            if (q.amiOffsets.empty())
+            {
+                nbr.push_back(q.nbrFaceCells[k]);
+                w.push_back(scalar(1));
+            }
+            else
+            {
+                for (label sl = q.amiOffsets[k]; sl < q.amiOffsets[k + 1]; ++sl)
+                {
+                    nbr.push_back(q.amiNbrCells[static_cast<std::size_t>(sl)]);
+                    w.push_back(q.amiWeights[static_cast<std::size_t>(sl)]);
+                }
+            }
+            off.push_back(static_cast<label>(nbr.size()));
+        }
+    }
+    nPair = static_cast<int>(own.size());
+    if (nPair == 0) return;
+    dPairOwn.copyFrom(own);
+    dPairOff.copyFrom(off);
+    dPairNbr.copyFrom(nbr);
+    dPairW.copyFrom(w);
+    dPairIfc.copyFrom(ifc);
+}
+
 bool DevicePcorrSolver::solve(
     const std::string& asked,
     const FvScalarMatrix& M,
@@ -207,6 +264,8 @@ bool DevicePcorrSolver::solve(
         {
             const std::size_t c = static_cast<std::size_t>(patches[pi].faceCells[i]);
             diag[c] += M.internalCoeffs[pi][static_cast<std::size_t>(i)];
+            // a coupled patch's boundaryCoeffs are the INTERFACE's coefficients, never a source
+            if (patches[pi].coupled) continue;
             source[c] += M.boundaryCoeffs[pi][static_cast<std::size_t>(i)];
         }
     }
@@ -214,9 +273,19 @@ bool DevicePcorrSolver::solve(
     dUpper.copyFrom(M.upper);
     dSource.copyFrom(source);
     dPsi.copyFrom(psi);
+    pairUp(M, patches);
     DeviceLduView A{nC, nIf, dDiag.data(), dUpper.data(), dUpper.data(), dOwner.data(), dNeighbour.data(),
                     dOwnerStart.data(), dLosort.data(), dLosortStart.data(), 0, nullptr, nullptr, nullptr};
     A.addressingId = addressingId;
+    if (nPair > 0)
+    {
+        A.nAmi = nPair;
+        A.amiOwn = dPairOwn.data();
+        A.amiOff = dPairOff.data();
+        A.amiNbr = dPairNbr.data();
+        A.amiW = dPairW.data();
+        A.amiIfc = dPairIfc.data();
+    }
     timedPart.emplace("pcorr: the hierarchy's coarse matrices (Galerkin) and the norm factor");
     amgGalerkin(amg, dDiag, dUpper, dUpper);
     const scalar nf = deviceNormFactor(A, dPsi, dSource, deviceOnes(nC));
@@ -399,6 +468,11 @@ bool DevicePcorrSolver::correct(
     SolverPerformance& perf,
     const FvScalarMatrix* hostMatrix)
 {
+    // a coupled pair: the host assembles, and solve() takes the system with the pair on its view
+    for (const FvPatch& q : patches)
+    {
+        if (q.coupled) return false;
+    }
     if (!takes(asked, patches)) return false;
     static const bool ownerFirst = std::getenv("BRAE_CONTROL_PCORR_ASSEMBLY_OWNER_FIRST") != nullptr;
     const label nC = m.nCells();
