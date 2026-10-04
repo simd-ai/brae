@@ -1,3 +1,5 @@
+#include "inter_phase_time.cuh"
+#include <optional>
 #include "cyclic_ami_cpp.cuh"
 #include <cmath>
 #include <fstream>
@@ -197,9 +199,16 @@ void Interfaces::update(
     {
         FvPatch& src = patches[static_cast<std::size_t>(pr.src)];
         FvPatch& tgt = patches[static_cast<std::size_t>(pr.tgt)];
-        pr.weights = ami::faceAreaWeight(amiPatch(m, src), amiPatch(m, tgt));
+        std::optional<interPhase::Nested> part;
+        part.emplace("ami: the two patches' faces and points gathered");
+        const ami::Patch srcPatch = amiPatch(m, src);
+        const ami::Patch tgtPatch = amiPatch(m, tgt);
+        part.emplace("ami: the weights (faceAreaWeightAMI), whole");
+        pr.weights = ami::faceAreaWeight(srcPatch, tgtPatch);
+        part.emplace("ami: the two patches coupled (stencils, deltas, weights)");
         couple(src, tgt, pr.tgt, true, pr.weights.srcAddress, pr.weights.srcWeights, g);
         couple(tgt, src, pr.src, false, pr.weights.tgtAddress, pr.weights.tgtWeights, g);
+        part.reset();
     }
 }
 

@@ -1,4 +1,13 @@
 // OpenFOAM's faceAreaWeightAMI, the host reference -- see face_area_weight_ami_cpp.cuh.
+#include "inter_phase_time.cuh"
+#include <cstdint>
+#include <exception>
+#include <thread>
+#include <utility>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
+#include <optional>
 #include "face_area_weight_ami_cpp.cuh"
 #include <algorithm>
 #include <cmath>
@@ -668,18 +677,220 @@ public:
         : src_(src),
           tgt_(tgt),
           sg_(geometry(src)),
-          tg_(geometry(tgt))
+          tg_(geometry(tgt)),
+          areas_(src.faces.size())
     {}
 
     const PatchGeom& sg() const { return sg_; }
     const PatchGeom& tg() const { return tg_; }
 
-    // calcInterArea
+    // THE OVERLAP AREAS, COMPUTED AHEAD OF THE WALK BY THE HOST'S THREADS. The advancing front is sequential --
+    // which target face seeds the next source face, and the order a face's partners are recorded in, follow
+    // from the faces before it, and that order is the order OpenFOAM sums the weights in -- but what it spends
+    // its time on is not: the area of a source face and a target face is a function of the two faces alone
+    // (interArea reads nothing else and keeps no state). MEASURED on RAS/mixerVesselAMI, two patches of 41,828
+    // faces, ms a step: the walk 352.8 of the update's 420.0. With the areas computed here on 16 threads: 46.6
+    // here, the walk 175.5, the update 292.2 (on one thread here: 250.5). What the walk still spends is its
+    // own bookkeeping -- a million asks an update, the visited and queued lists, the weights' lists.
+    // So: every source face's candidates are the target faces whose bounding box meets its own grown by its
+    // size (a uniform grid over the target faces), each candidate's area is computed here, in parallel, by the
+    // same interArea, and the walk below looks its areas up. A pair the candidates missed is computed when the
+    // walk asks, as before -- the candidates decide the speed, never the result.
+    // BRAE_AMI_THREADS=n sets the thread count (1: this thread alone).
+    void computeAhead()
+    {
+        static const bool recomputed = std::getenv("BRAE_CONTROL_AMI_AREA_RECOMPUTED") != nullptr;
+        if (recomputed) return;
+        const std::vector<vector>& sp = *src_.points;
+        const std::vector<vector>& tp = *tgt_.points;
+        const std::size_t nS = src_.faces.size();
+        const std::size_t nT = tgt_.faces.size();
+        if (nS == 0 || nT == 0) return;
+        struct Box
+        {
+            vector lo;
+            vector hi;
+        };
+        const auto boxOf = [](
+            const std::vector<label>& f,
+            const std::vector<vector>& pts)
+        {
+            Box b{pts[static_cast<std::size_t>(f[0])], pts[static_cast<std::size_t>(f[0])]};
+            for (const label pi : f)
+            {
+                const vector& q = pts[static_cast<std::size_t>(pi)];
+                b.lo = vector{std::min(b.lo.x, q.x), std::min(b.lo.y, q.y), std::min(b.lo.z, q.z)};
+                b.hi = vector{std::max(b.hi.x, q.x), std::max(b.hi.y, q.y), std::max(b.hi.z, q.z)};
+            }
+            return b;
+        };
+        const auto extentOf = [](const Box& b)
+        {
+            return std::max(b.hi.x - b.lo.x, std::max(b.hi.y - b.lo.y, b.hi.z - b.lo.z));
+        };
+        // the target faces' boxes, and a grid of cells one mean face size wide over them
+        std::vector<Box> tBox(nT);
+        vector origin = tp[static_cast<std::size_t>(tgt_.faces[0][0])];
+        scalar meanExtent = 0;
+        for (std::size_t t = 0; t < nT; ++t)
+        {
+            tBox[t] = boxOf(tgt_.faces[t], tp);
+            origin = vector{std::min(origin.x, tBox[t].lo.x), std::min(origin.y, tBox[t].lo.y),
+                            std::min(origin.z, tBox[t].lo.z)};
+            meanExtent += extentOf(tBox[t]);
+        }
+        meanExtent /= static_cast<scalar>(nT);
+        if (!(meanExtent > 0)) return;
+        const scalar h = meanExtent;
+        // the cell of a coordinate, counted from the grid's origin `o` along its axis
+        const auto cellOf = [h](
+            scalar x,
+            scalar o)
+        {
+            return static_cast<long>(std::floor((x - o)/h));
+        };
+        const auto keyOf = [](
+            long i,
+            long j,
+            long k)
+        {
+            return (static_cast<std::uint64_t>(i & 0x1fffff) << 42) | (static_cast<std::uint64_t>(j & 0x1fffff) << 21)
+                 | static_cast<std::uint64_t>(k & 0x1fffff);
+        };
+        std::unordered_map<std::uint64_t, std::vector<label>> grid;
+        grid.reserve(nT*2);
+        for (std::size_t t = 0; t < nT; ++t)
+        {
+            for (long i = cellOf(tBox[t].lo.x, origin.x); i <= cellOf(tBox[t].hi.x, origin.x); ++i)
+            {
+                for (long j = cellOf(tBox[t].lo.y, origin.y); j <= cellOf(tBox[t].hi.y, origin.y); ++j)
+                {
+                    for (long k = cellOf(tBox[t].lo.z, origin.z); k <= cellOf(tBox[t].hi.z, origin.z); ++k)
+                    {
+                        grid[keyOf(i, j, k)].push_back(static_cast<label>(t));
+                    }
+                }
+            }
+        }
+        // one source face: its candidates' areas, in the order found
+        const auto faceAhead = [&](std::size_t si)
+        {
+            Box b = boxOf(src_.faces[si], sp);
+            // grown by the face's own size on every side: MEASURED on RAS/mixerVesselAMI, 94% of the walk's
+            // 1,003,343 asks an update are then answered from here; twice and three times the size answer
+            // 99.5% and 99.9%, cost 1.7x and 3.1x as much here, and leave the walk no shorter
+            const scalar grow = extentOf(b);
+            b.lo = vector{b.lo.x - grow, b.lo.y - grow, b.lo.z - grow};
+            b.hi = vector{b.hi.x + grow, b.hi.y + grow, b.hi.z + grow};
+            std::vector<std::pair<label, scalar>>& kept = areas_[si];
+            kept.reserve(32);
+            for (long i = cellOf(b.lo.x, origin.x); i <= cellOf(b.hi.x, origin.x); ++i)
+            {
+                for (long j = cellOf(b.lo.y, origin.y); j <= cellOf(b.hi.y, origin.y); ++j)
+                {
+                    for (long k = cellOf(b.lo.z, origin.z); k <= cellOf(b.hi.z, origin.z); ++k)
+                    {
+                        const auto cell = grid.find(keyOf(i, j, k));
+                        if (cell == grid.end()) continue;
+                        for (const label t : cell->second)
+                        {
+                            const Box& q = tBox[static_cast<std::size_t>(t)];
+                            if (q.hi.x < b.lo.x || q.lo.x > b.hi.x || q.hi.y < b.lo.y || q.lo.y > b.hi.y
+                             || q.hi.z < b.lo.z || q.lo.z > b.hi.z) continue;
+                            bool have = false;
+                            for (const std::pair<label, scalar>& e : kept)
+                            {
+                                if (e.first == t) have = true;
+                            }
+                            if (have) continue;
+                            kept.emplace_back(t, interArea(src_, sg_, static_cast<label>(si), tgt_, tg_, t));
+                        }
+                    }
+                }
+            }
+        };
+        static const unsigned nThreads = []()
+        {
+            const char* e = std::getenv("BRAE_AMI_THREADS");
+            const int asked = e ? std::atoi(e) : 0;
+            if (e && asked < 1)
+            {
+                throw std::runtime_error(std::string("brae AMI: BRAE_AMI_THREADS=") + e + " is not a count of 1 "
+                                         "or more.");
+            }
+            const unsigned have = std::max(1u, std::thread::hardware_concurrency());
+            return asked > 0 ? static_cast<unsigned>(asked) : std::min(have, 16u);
+        }();
+        const unsigned nT_ = static_cast<unsigned>(std::min<std::size_t>(nThreads, nS));
+        std::vector<std::exception_ptr> failed(nT_);
+        const auto range = [&](unsigned w)
+        {
+            try
+            {
+                for (std::size_t si = nS*w/nT_; si < nS*(w + 1)/nT_; ++si)
+                {
+                    faceAhead(si);
+                }
+            }
+            catch (...)
+            {
+                failed[w] = std::current_exception();
+            }
+        };
+        std::vector<std::thread> workers;
+        for (unsigned w = 1; w < nT_; ++w)
+        {
+            workers.emplace_back(range, w);
+        }
+        range(0);
+        for (std::thread& t : workers)
+        {
+            t.join();
+        }
+        for (const std::exception_ptr& e : failed)
+        {
+            if (e) std::rethrow_exception(e);
+        }
+    }
+
+    // calcInterArea: the area computed ahead where it was, computed now where it was not.
+    // BRAE_CONTROL_AMI_AREA_RECOMPUTED=1 computes at every ask, as before; BRAE_CONTROL_AMI_AREA_CHECK=1 computes
+    // at every ask AND compares it with the kept number.
     scalar area(
         label s,
         label t) const
     {
-        return interArea(src_, sg_, s, tgt_, tg_, t);
+        static const bool recomputed = std::getenv("BRAE_CONTROL_AMI_AREA_RECOMPUTED") != nullptr;
+        static const bool check = std::getenv("BRAE_CONTROL_AMI_AREA_CHECK") != nullptr;
+        // BRAE_CONTROL_AMI_AREA_BY_SOURCE=1 is a gate's CONTROL, deliberately wrong: the kept number is looked
+        // up by the source face alone, so a second target face is handed the first one's area
+        static const bool bySource = std::getenv("BRAE_CONTROL_AMI_AREA_BY_SOURCE") != nullptr;
+        if (recomputed)
+        {
+            return interArea(src_, sg_, s, tgt_, tg_, t);
+        }
+        std::vector<std::pair<label, scalar>>& kept = areas_[static_cast<std::size_t>(s)];
+        for (const std::pair<label, scalar>& e : kept)
+        {
+            if (e.first != t && !bySource) continue;
+            if (check)
+            {
+                const scalar now = interArea(src_, sg_, s, tgt_, tg_, t);
+                if (std::memcmp(&now, &e.second, sizeof(scalar)) != 0)
+                {
+                    char buf[240];
+                    std::snprintf(buf, sizeof(buf),
+                                  "brae AMI: BRAE_CONTROL_AMI_AREA_CHECK: the kept area of source face %d and "
+                                  "target face %d is %.17g and computing it gives %.17g.",
+                                  static_cast<int>(s), static_cast<int>(t), e.second, now);
+                    throw std::runtime_error(buf);
+                }
+            }
+            return e.second;
+        }
+        const scalar a = interArea(src_, sg_, s, tgt_, tg_, t);
+        kept.emplace_back(t, a);
+        return a;
     }
 
     // overlaps: faceAreaIntersect::overlaps stops as soon as the running area passes the threshold,
@@ -890,6 +1101,8 @@ private:
     const Patch& tgt_;
     PatchGeom sg_;
     PatchGeom tg_;
+    // area(): the areas computed so far, a source face each -- (target face, area) in the order asked
+    mutable std::vector<std::vector<std::pair<label, scalar>>> areas_;
 };
 
 } // namespace
@@ -899,7 +1112,12 @@ Weights faceAreaWeight(
     const Patch& src,
     const Patch& tgt)
 {
-    const Walk walk(src, tgt);
+    std::optional<interPhase::Nested> part;
+    part.emplace("ami weights: the walk's set-up (geometry, the patches' face neighbours)");
+    Walk walk(src, tgt);
+    part.emplace("ami weights: the faces' overlap areas computed ahead (host threads)");
+    walk.computeAhead();
+    part.emplace("ami weights: the advancing front (every source face's overlaps)");
     const std::size_t nS = src.faces.size();
     const std::size_t nT = tgt.faces.size();
     Weights W;
@@ -943,6 +1161,7 @@ Weights faceAreaWeight(
 
     // restartUncoveredSourceFace (on by default): a face less than 0.95 covered is searched again from
     // the target face nearest each of its points, its partners so far excluded
+    part.emplace("ami weights: the uncovered faces searched again");
     const scalar minWeight = 0.95;
     for (std::size_t si = 0; si < nS; ++si)
     {
@@ -965,6 +1184,7 @@ Weights faceAreaWeight(
         }
     }
 
+    part.emplace("ami weights: normalised and checked");
     normalise(W.srcMagSf, W.srcWeights, W.srcWeightsSum);
     normalise(W.tgtMagSf, W.tgtWeights, W.tgtWeightsSum);
     for (std::size_t si = 0; si < nS; ++si)
