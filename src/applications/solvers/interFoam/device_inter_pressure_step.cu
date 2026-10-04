@@ -453,11 +453,33 @@ scalar deviceInterPressureStep(
             amgGalerkin(amg, diagC, P.upper, P.lower);
             const scalar nf = deviceNormFactor(A, p_rgh, b, deviceOnes(nC));
             const scalar tol = gamg ? gamg->tolerance : sv.tol;
-            const scalar relTol = gamg ? gamg->relTol : sv.relTol;
+            scalar relTol = gamg ? gamg->relTol : sv.relTol;
             const int maxIter = oneIteration ? 1 : (gamg ? gamg->maxIter : sv.maxIter);
             const int minIter = gamg ? gamg->minIter : 0;
             // the fast path's knobs (amgPcgKnobs); the graph not across a coupled pair
             const AmgPcgKnobs& knobs = amgPcgKnobs();
+            // a non-final solve the Final one follows, on an entry that names PCG with DIC, stops at the knob's
+            // relTol where its own is looser (AmgPcgKnobs::dicInnerRelTol has the measurement); the Final
+            // entry is never touched. BRAE_CONTROL_DIC_INNER_EVERY_CORRECTOR=1 caps every non-final solve --
+            // what the cap was first measured as, kept to re-measure what the narrower scope saves.
+            static const bool everyCorrector = std::getenv("BRAE_CONTROL_DIC_INNER_EVERY_CORRECTOR") != nullptr;
+            const bool finalPass = lastPass && in.finalEntry;
+            const bool beforeFinal = in.finalEntry ? !lastPass : in.correctorBeforeFinal;
+            if (!finalPass && (beforeFinal || everyCorrector) && pcgDIC
+             && knobs.dicInnerRelTol >= scalar(0) && relTol > knobs.dicInnerRelTol)
+            {
+                static bool capAnnounced = false;
+                if (!capAnnounced)
+                {
+                    capAnnounced = true;
+                    std::printf("  p_rgh: the solve before the Final one names PCG with DIC at relTol %g; the "
+                                "AMG-PCG stops it at relTol %g -- stopped at the entry's own it leaves its error "
+                                "at the interface, where it becomes air velocity; "
+                                "BRAE_PRESSURE_DIC_INNER_RELTOL=case keeps the entry's own\n",
+                                static_cast<double>(relTol), static_cast<double>(knobs.dicInnerRelTol));
+                }
+                relTol = knobs.dicInnerRelTol;
+            }
             const bool graph = knobs.graph && !(in.cyc && in.cyc->n > 0);
             perf = deviceAMGPCG(A, amg, b, p_rgh, nf, tol, relTol, maxIter, graph, knobs.checkEvery,
                                 knobs.corrScaling, minIter);
@@ -699,6 +721,23 @@ const AmgPcgKnobs& amgPcgKnobs()
         if (scaling)
         {
             k.corrScaling = std::atoi(scaling) != 0;
+        }
+        const char* inner = std::getenv("BRAE_PRESSURE_DIC_INNER_RELTOL");
+        if (inner && std::string(inner) == "case")
+        {
+            k.dicInnerRelTol = scalar(-1);
+        }
+        else if (inner)
+        {
+            char* end = nullptr;
+            const double cap = std::strtod(inner, &end);
+            if (end == inner || *end != '\0' || !(cap >= 0.0))
+            {
+                throw std::runtime_error(
+                    "brae interFoam: BRAE_PRESSURE_DIC_INNER_RELTOL is `" + std::string(inner)
+                    + "`; it is `case` or a relative tolerance that is not negative.");
+            }
+            k.dicInnerRelTol = static_cast<scalar>(cap);
         }
         return k;
     }();

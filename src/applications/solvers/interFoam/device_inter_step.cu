@@ -756,6 +756,8 @@ void deviceInterStep(
         pi.pRefValue = ctl.pRefValue;
         const bool finalCorr = (corr == ctl.nCorrectors - 1);
         pi.solve = finalCorr ? ctl.pressureFinal : ctl.pressure;
+        pi.finalEntry = finalCorr;
+        pi.correctorBeforeFinal = (corr == ctl.nCorrectors - 2);
         pi.pcgDIC = finalCorr ? ctl.pressureFinalPcgDIC : ctl.pressurePcgDIC;
         pi.dic = ctl.dic;
         pi.gamg = finalCorr ? ctl.pressureFinalGamg : ctl.pressureGamg;

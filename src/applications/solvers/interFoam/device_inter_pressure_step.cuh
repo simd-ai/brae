@@ -131,6 +131,27 @@ struct AmgPcgKnobs
     int checkEvery = 4;
     bool graph = true;
     bool corrScaling = false;
+    // WHERE THE NON-FINAL p_rgh SOLVES THE FINAL ONE FOLLOWS STOP, when their entry names `PCG` WITH `DIC`: at
+    // the entry's relTol or at this one, whichever is tighter. They are the corrector before the last and the
+    // last corrector's own earlier non-orthogonal passes; a corrector further back keeps the entry's relTol,
+    // since what it leaves is solved over twice more. Negative keeps the entry's own everywhere
+    // (BRAE_PRESSURE_DIC_INNER_RELTOL=case; a number sets another cap).
+    // The wave tutorials ask for relTol 0.1 there, and what they get from OpenFOAM is one DIC-PCG iteration
+    // whose error puts no velocity in the air. An AMG-preconditioned PCG stopped at the same relTol leaves its
+    // error AT THE INTERFACE, where 1/rho turns it into air velocity; H(U) carries that into the Final
+    // corrector, which projects the flux and keeps the rest, and maxCo then cuts the time step.
+    // MEASURED, stokesI at deltaT 0.01: the Courant number at step 2 is 1.923 against 0.001 with the case's
+    // solver -- and 1.897 in OpenFOAM ITSELF with `GAMG` named for p_rgh, so it is the entry's solver the
+    // tutorial leans on and not this arithmetic. To the time 20-core OpenFOAM's 30th step reached, steps taken
+    // with the entry's own relTol and with 1e-3: stokesI 127 -> 27, stokesII 100 -> 28, streamFunction
+    // 78 -> 28, stokesV 60 -> 21, cnoidal 47 -> 30, solitary 18 -> 9; relTol 0 moves none of them further.
+    // WHAT IT COSTS where nothing was wrong, ms a step in the 42-tutorial table: capillaryRise 8.3 -> 9.8,
+    // weirOverflow 9.3 -> 10.2, mixerVessel2D 6.3 -> 7.0, damBreakRAS 7.4 -> 8.1, damBreak 6.7 -> 7.0 -- every
+    // one of 8,000 cells or fewer; waveMakerFlap (56,000) 62.1 -> 62.9. Capping EVERY non-final corrector
+    // (BRAE_CONTROL_DIC_INNER_EVERY_CORRECTOR=1) moved no wave tutorial further and cost mixerVessel2D 7.5 and
+    // damBreakRAS 8.5. AN ENTRY THAT NAMES GAMG KEEPS ITS OWN: those tutorials take OpenFOAM's step count as
+    // they are, and the same cap cost DTCHull 9% and eulerianInjection 18%.
+    scalar dicInnerRelTol = 1e-3;
 };
 const AmgPcgKnobs& amgPcgKnobs();
 
@@ -203,6 +224,12 @@ struct DeviceInterPressureInput
     scalar pRefValue     = 0;
 
     DeviceAlphaSolverControls solve;    // the case's fvSolution entry for p_rgh
+    // ...and where this corrector stands: `finalEntry` when `solve` is the case's Final entry (the last
+    // corrector's), `correctorBeforeFinal` when the next corrector is that one. The AMG-PCG's stop on a
+    // non-final solve that the Final one follows is capped where its entry names PCG with DIC
+    // (AmgPcgKnobs::dicInnerRelTol). A caller that says neither hands in the Final entry and nothing is capped.
+    bool finalEntry = true;
+    bool correctorBeforeFinal = false;
     // `solver PCG; preconditioner DIC;` -- run OpenFOAM's own pair (deviceDICPCG) rather than the
     // BiCGStab this step grew up on. It decides where a relTol 0.05 solve STOPS, which on capillaryRise
     // was the whole of the device's 9.2e-04. `dic` is the level schedule: mesh-only, built once by the
