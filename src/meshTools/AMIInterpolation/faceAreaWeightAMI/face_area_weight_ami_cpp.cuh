@@ -61,6 +61,16 @@ struct Weights
     std::vector<scalar> tgtMagSf;
 };
 
+// WHAT OF A PATCH'S SET-UP FOLLOWS FROM ITS FACES ALONE, kept from one update of the weights to the next: the
+// face neighbours (primitivePatch::faceFaces). A rotating AMI moves its points at every step and keeps its
+// faces; the lists were rebuilt all the same -- MEASURED on RAS/mixerVesselAMI, two patches of 41,828 faces,
+// 29.1 ms a step. `faces` is what they were built from: an update whose patch has other faces builds again.
+struct PatchTopology
+{
+    std::vector<std::vector<label>> faces;
+    std::vector<std::vector<label>> faceFaces;
+};
+
 // face::triangles(points, triFaces): face::split in SPLITTRIANGLE mode, appended to `tris`
 void faceTriangles(
     const std::vector<label>& f,
@@ -74,9 +84,13 @@ vector faceAreaNormal(
 
 // faceAreaWeightAMI::calculate for a serial pair with requireMatch true and no transform:
 // normaliseWeights(conformal = true)
+// `srcKept`, `tgtKept`: each side's PatchTopology from the last update of this pair, read where it is this
+// patch's and written where it is not; null builds the face neighbours and keeps nothing.
 Weights faceAreaWeight(
     const Patch& src,
-    const Patch& tgt);
+    const Patch& tgt,
+    PatchTopology* srcKept = nullptr,
+    PatchTopology* tgtKept = nullptr);
 
 } // namespace ami
 } // namespace cpu

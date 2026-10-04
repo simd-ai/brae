@@ -44,6 +44,9 @@ struct Pair
     label src = -1;
     label tgt = -1;
     ami::Weights weights;
+    // each side's face neighbours, kept from one update to the next (ami::PatchTopology)
+    ami::PatchTopology srcTopology;
+    ami::PatchTopology tgtTopology;
 };
 
 class Interfaces

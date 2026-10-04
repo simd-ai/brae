@@ -1,5 +1,8 @@
 // OpenFOAM's faceAreaWeightAMI, the host reference -- see face_area_weight_ami_cpp.cuh.
 #include "inter_phase_time.cuh"
+#include <functional>
+#include <queue>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <thread>
@@ -314,38 +317,21 @@ struct PatchGeom
     std::vector<std::vector<std::vector<label>>> tris;
     std::vector<vector> normals;
     std::vector<scalar> magSf;
-    // primitivePatch::faceFaces, in PrimitivePatch::calcAddressing's order
-    std::vector<std::vector<label>> faceFaces;
+    // primitivePatch::faceFaces, in PrimitivePatch::calcAddressing's order: the kept topology's where one was
+    // handed in (PatchTopology), this structure's own otherwise
+    const std::vector<std::vector<label>>* faceFacesOf = nullptr;
+    std::vector<std::vector<label>> faceFacesOwn;
+    const std::vector<std::vector<label>>& faceFaces() const { return *faceFacesOf; }
 };
 
 // advancingFrontAMI::triangulatePatch with tmMesh and areaNormalisationMode project, and the face
 // normals primitivePatch::faceNormals gives (face::unitNormal)
-PatchGeom geometry(const Patch& p)
+// primitivePatch::faceFaces of a patch, from its faces alone
+void faceNeighbours(
+    const Patch& p,
+    std::vector<std::vector<label>>& faceFaces)
 {
-    const std::vector<vector>& pts = *p.points;
-    PatchGeom g;
     const std::size_t n = p.faces.size();
-    g.tris.resize(n);
-    g.normals.resize(n);
-    g.magSf.resize(n);
-    for (std::size_t f = 0; f < n; ++f)
-    {
-        const std::vector<label>& face = p.faces[f];
-        faceTriangles(face, pts, g.tris[f]);
-        g.normals[f] = normalised(faceAreaNormal(face, pts));
-        scalar m = 0;
-        for (const std::vector<label>& t : g.tris[f])
-        {
-            m += dot(triAreaNormal(pts[t[0]], pts[t[1]], pts[t[2]]), g.normals[f]);
-        }
-        g.magSf[f] = m;
-    }
-
-    // PrimitivePatch::calcAddressing (PrimitivePatchAddressing.C). Faces in order; for each edge of a
-    // face (edge k = (f[k], f[k+1])) not already registered by a lower face, every HIGHER face of
-    // pointFaces[edge start] -- ascending, as calcPointFaces fills it -- carrying the same edge is a
-    // neighbour, recorded both ways. The advancing front walks these lists in this order, and the
-    // order decides which target faces it reaches.
     std::unordered_map<label, std::vector<label>> pointFaces;
     for (std::size_t f = 0; f < n; ++f)
     {
@@ -368,7 +354,7 @@ PatchGeom geometry(const Patch& p)
     {
         detected[f].assign(p.faces[f].size(), 0);
     }
-    g.faceFaces.assign(n, {});
+    faceFaces.assign(n, {});
     for (std::size_t f = 0; f < n; ++f)
     {
         for (std::size_t k = 0; k < p.faces[f].size(); ++k)
@@ -383,14 +369,75 @@ PatchGeom geometry(const Patch& p)
                 {
                     if (sameEdge(edgeOf(nbi, kk), e))
                     {
-                        g.faceFaces[f].push_back(nb);
-                        g.faceFaces[nbi].push_back(static_cast<label>(f));
+                        faceFaces[f].push_back(nb);
+                        faceFaces[nbi].push_back(static_cast<label>(f));
                         detected[nbi][kk] = 1;
                     }
                 }
             }
         }
     }
+}
+
+PatchGeom geometry(
+    const Patch& p,
+    PatchTopology* kept)
+{
+    const std::vector<vector>& pts = *p.points;
+    PatchGeom g;
+    const std::size_t n = p.faces.size();
+    std::optional<interPhase::Nested> part;
+    part.emplace("ami set-up: triangles, normals and areas");
+    g.tris.resize(n);
+    g.normals.resize(n);
+    g.magSf.resize(n);
+    for (std::size_t f = 0; f < n; ++f)
+    {
+        const std::vector<label>& face = p.faces[f];
+        faceTriangles(face, pts, g.tris[f]);
+        g.normals[f] = normalised(faceAreaNormal(face, pts));
+        scalar m = 0;
+        for (const std::vector<label>& t : g.tris[f])
+        {
+            m += dot(triAreaNormal(pts[t[0]], pts[t[1]], pts[t[2]]), g.normals[f]);
+        }
+        g.magSf[f] = m;
+    }
+
+    // PrimitivePatch::calcAddressing (PrimitivePatchAddressing.C). Faces in order; for each edge of a
+    // face (edge k = (f[k], f[k+1])) not already registered by a lower face, every HIGHER face of
+    // pointFaces[edge start] -- ascending, as calcPointFaces fills it -- carrying the same edge is a
+    // neighbour, recorded both ways. The advancing front walks these lists in this order, and the
+    // order decides which target faces it reaches.
+    part.emplace("ami set-up: the patch's face neighbours (faceFaces)");
+    // BRAE_CONTROL_AMI_TOPOLOGY_REBUILT=1 builds them at every update, as before. BRAE_CONTROL_AMI_TOPOLOGY_STALE=1
+    // is a gate's CONTROL, deliberately wrong: a kept topology is taken without asking whether its faces are
+    // this patch's.
+    static const bool rebuilt = std::getenv("BRAE_CONTROL_AMI_TOPOLOGY_REBUILT") != nullptr;
+    static const bool stale = std::getenv("BRAE_CONTROL_AMI_TOPOLOGY_STALE") != nullptr;
+    // BRAE_CONTROL_AMI_TOPOLOGY_CHECK=1: a kept topology that is taken is built as well and compared
+    static const bool check = std::getenv("BRAE_CONTROL_AMI_TOPOLOGY_CHECK") != nullptr;
+    if (kept && !rebuilt && !kept->faceFaces.empty() && (stale || kept->faces == p.faces))
+    {
+        if (check)
+        {
+            std::vector<std::vector<label>> now;
+            faceNeighbours(p, now);
+            for (std::size_t f = 0; f < now.size() || f < kept->faceFaces.size(); ++f)
+            {
+                if (f < now.size() && f < kept->faceFaces.size() && now[f] == kept->faceFaces[f]) continue;
+                throw std::runtime_error(
+                    "brae AMI: BRAE_CONTROL_AMI_TOPOLOGY_CHECK: the kept neighbours of face " + std::to_string(f)
+                    + " are not the ones its patch's faces give.");
+            }
+        }
+        g.faceFacesOf = &kept->faceFaces;
+        return g;
+    }
+    std::vector<std::vector<label>>& faceFaces = kept ? kept->faceFaces : g.faceFacesOwn;
+    g.faceFacesOf = &faceFaces;
+    if (kept) kept->faces = p.faces;
+    faceNeighbours(p, faceFaces);
     return g;
 }
 
@@ -667,17 +714,22 @@ bool contains(
     return std::find(list.begin(), list.end(), x) != list.end();
 }
 
+// the source faces that have a seed, the lowest on top (Walk::setNextFaces)
+using SeededFaces = std::priority_queue<label, std::vector<label>, std::greater<label>>;
+
 // The advancing front of faceAreaWeightAMI (faceAreaWeightAMI.C, advancingFrontAMI.C), serial
 class Walk
 {
 public:
     Walk(
         const Patch& src,
-        const Patch& tgt)
+        const Patch& tgt,
+        PatchTopology* srcKept,
+        PatchTopology* tgtKept)
         : src_(src),
           tgt_(tgt),
-          sg_(geometry(src)),
-          tg_(geometry(tgt)),
+          sg_(geometry(src, srcKept)),
+          tg_(geometry(tgt, tgtKept)),
           areas_(src.faces.size())
     {}
 
@@ -959,7 +1011,7 @@ public:
         std::vector<label>& queue) const
     {
         static const scalar thetaCos = std::cos(89.0*PI/180.0);
-        for (const label nb : tg_.faceFaces[static_cast<std::size_t>(t)])
+        for (const label nb : tg_.faceFaces()[static_cast<std::size_t>(t)])
         {
             if (contains(visited, nb) || contains(queue, nb)) continue;
             if (dot(tg_.normals[static_cast<std::size_t>(t)], tg_.normals[static_cast<std::size_t>(nb)]) > thetaCos)
@@ -1005,6 +1057,7 @@ public:
     }
 
     // faceAreaWeightAMI::setNextFaces
+    // `seeded`: the source faces that have a seed, lowest on top -- see the scan below
     bool setNextFaces(
         label& startSeedi,
         label& s,
@@ -1012,7 +1065,8 @@ public:
         const std::vector<char>& mapFlag,
         label nFlagged,
         std::vector<label>& seedFaces,
-        const std::vector<label>& visited) const
+        const std::vector<label>& visited,
+        SeededFaces& seeded) const
     {
         if (nFlagged == 0)
         {
@@ -1027,12 +1081,13 @@ public:
             }
             return label(-1);
         };
-        const std::vector<label>& srcNbrFaces = sg_.faceFaces[static_cast<std::size_t>(s)];
+        const std::vector<label>& srcNbrFaces = sg_.faceFaces()[static_cast<std::size_t>(s)];
         t = -1;
+        ++nNext_;
         bool valuesSet = false;
         const label s0 = s;
         (void)s0;
-        for (const label faceS : std::vector<label>(srcNbrFaces))
+        for (const label faceS : srcNbrFaces)
         {
             if (mapFlag[static_cast<std::size_t>(faceS)] && seedFaces[static_cast<std::size_t>(faceS)] == -1)
             {
@@ -1050,33 +1105,68 @@ public:
                         }
                     }
                 }
+                if (seedFaces[static_cast<std::size_t>(faceS)] != -1) seeded.push(faceS);
             }
         }
         if (valuesSet)
         {
             return true;
         }
+        const SplitClock scan(tScan_);
         label facei = startSeedi;
         if (!mapFlag[static_cast<std::size_t>(startSeedi)])
         {
             facei = findNext(facei);
         }
         const label startSeedi0 = facei;
-        bool foundNextSeed = false;
-        while (facei != -1)
+        // THE LOWEST UNMAPPED FACE THAT HAS A SEED. OpenFOAM walks the unmapped faces upward from the first one
+        // until it meets one with a seed; so did this, and where the front leaves the low faces unmapped and
+        // unseeded for long, every stall of the front walked them again. MEASURED on RAS/mixerVesselAMI (41,828
+        // source faces): 116.3 of the front's 181.6 ms a step. Every unmapped face is at or above the first
+        // one, so the face it meets is the LOWEST face that is seeded and unmapped -- the top of `seeded`, a
+        // min-heap a face enters when it is given its seed, once the mapped ones on top are dropped. With it
+        // the scan is 1.8 ms a step, and the update -- with the face neighbours kept (PatchTopology) -- 157.
+        // BRAE_CONTROL_AMI_SEED_SCAN=1 walks, as before; BRAE_CONTROL_AMI_SEED_CHECK=1 does both and compares.
+        // BRAE_CONTROL_AMI_SEED_STALE=1 is a gate's CONTROL, deliberately wrong: the mapped faces are not
+        // dropped, so the top may be a face the front has already mapped.
+        static const bool seedScan = std::getenv("BRAE_CONTROL_AMI_SEED_SCAN") != nullptr;
+        static const bool seedCheck = std::getenv("BRAE_CONTROL_AMI_SEED_CHECK") != nullptr;
+        static const bool seedStale = std::getenv("BRAE_CONTROL_AMI_SEED_STALE") != nullptr;
+        if (facei != -1) startSeedi = facei;
+        label scanned = -1;
+        if (seedScan || seedCheck)
         {
-            if (!foundNextSeed)
+            for (label k = facei; k != -1; k = findNext(k))
             {
-                startSeedi = facei;
-                foundNextSeed = true;
+                if (seedFaces[static_cast<std::size_t>(k)] != -1)
+                {
+                    scanned = k;
+                    break;
+                }
             }
-            if (seedFaces[static_cast<std::size_t>(facei)] != -1)
+        }
+        label queued = -1;
+        if (!seedScan)
+        {
+            while (!seedStale && !seeded.empty() && !mapFlag[static_cast<std::size_t>(seeded.top())])
             {
-                s = facei;
-                t = seedFaces[static_cast<std::size_t>(facei)];
-                return true;
+                seeded.pop();
             }
-            facei = findNext(facei);
+            if (!seeded.empty()) queued = seeded.top();
+        }
+        if (seedCheck && queued != scanned)
+        {
+            throw std::runtime_error(
+                "brae AMI: BRAE_CONTROL_AMI_SEED_CHECK: the lowest unmapped face with a seed is "
+                + std::to_string(scanned) + " by the walk over the unmapped faces and " + std::to_string(queued)
+                + " by the queue of seeded faces.");
+        }
+        const label next = seedScan ? scanned : queued;
+        if (next != -1)
+        {
+            s = next;
+            t = seedFaces[static_cast<std::size_t>(next)];
+            return true;
         }
         // the front stalled: search for a new target face
         facei = startSeedi0;
@@ -1103,6 +1193,31 @@ private:
     PatchGeom tg_;
     // area(): the areas computed so far, a source face each -- (target face, area) in the order asked
     mutable std::vector<std::vector<std::pair<label, scalar>>> areas_;
+
+public:
+    // THE FRONT'S SPLIT (BRAE_INTER_PHASE_TIME): seconds in the seeding routine's scan for the next face, and
+    // counts -- timed with the host clock alone, a step of the front being microseconds
+    struct SplitClock
+    {
+        double& into;
+        std::chrono::steady_clock::time_point t0;
+
+        explicit SplitClock(double& slot)
+        :
+            into(slot)
+        {
+            if (interPhase::on()) t0 = std::chrono::steady_clock::now();
+        }
+        ~SplitClock()
+        {
+            if (interPhase::on())
+            {
+                into += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+            }
+        }
+    };
+    mutable double tScan_ = 0;
+    mutable long nNext_ = 0;
 };
 
 } // namespace
@@ -1110,11 +1225,13 @@ private:
 
 Weights faceAreaWeight(
     const Patch& src,
-    const Patch& tgt)
+    const Patch& tgt,
+    PatchTopology* srcKept,
+    PatchTopology* tgtKept)
 {
     std::optional<interPhase::Nested> part;
     part.emplace("ami weights: the walk's set-up (geometry, the patches' face neighbours)");
-    Walk walk(src, tgt);
+    Walk walk(src, tgt, srcKept, tgtKept);
     part.emplace("ami weights: the faces' overlap areas computed ahead (host threads)");
     walk.computeAhead();
     part.emplace("ami weights: the advancing front (every source face's overlaps)");
@@ -1142,22 +1259,36 @@ Weights faceAreaWeight(
     std::vector<label> visited;
     std::vector<label> seedFaces(nS, -1);
     seedFaces[0] = 0;
+    SeededFaces seeded;
+    seeded.push(label(0));
     std::vector<char> mapFlag(nS, 1);
     label nFlagged = static_cast<label>(nS);
     label startSeedi = 0;
     bool continueWalk = true;
+    double tProcess = 0;
+    double tNext = 0;
     do
     {
         queue.clear();
         visited.clear();
-        walk.processSourceFace(s, t, queue, visited, W);
+        {
+            const Walk::SplitClock timed(tProcess);
+            walk.processSourceFace(s, t, queue, visited, W);
+        }
         if (mapFlag[static_cast<std::size_t>(s)])
         {
             mapFlag[static_cast<std::size_t>(s)] = 0;
             --nFlagged;
         }
-        continueWalk = walk.setNextFaces(startSeedi, s, t, mapFlag, nFlagged, seedFaces, visited);
+        const Walk::SplitClock timed(tNext);
+        continueWalk = walk.setNextFaces(startSeedi, s, t, mapFlag, nFlagged, seedFaces, visited, seeded);
     } while (continueWalk);
+    interPhase::charge("ami front: a source face walked over its target faces (processSourceFace)", tProcess,
+                       walk.nNext_);
+    interPhase::charge("ami front: the next face seeded from this one's neighbours", tNext - walk.tScan_,
+                       walk.nNext_);
+    interPhase::charge("ami front: ...and where no neighbour was seeded, the scan for a seeded face", walk.tScan_,
+                       walk.nNext_);
 
     // restartUncoveredSourceFace (on by default): a face less than 0.95 covered is searched again from
     // the target face nearest each of its points, its partners so far excluded

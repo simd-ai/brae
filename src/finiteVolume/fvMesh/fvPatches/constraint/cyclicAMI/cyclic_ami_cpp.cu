@@ -1,4 +1,5 @@
 #include "inter_phase_time.cuh"
+#include <cstdlib>
 #include <optional>
 #include "cyclic_ami_cpp.cuh"
 #include <cmath>
@@ -204,7 +205,14 @@ void Interfaces::update(
         const ami::Patch srcPatch = amiPatch(m, src);
         const ami::Patch tgtPatch = amiPatch(m, tgt);
         part.emplace("ami: the weights (faceAreaWeightAMI), whole");
-        pr.weights = ami::faceAreaWeight(srcPatch, tgtPatch);
+        // BRAE_CONTROL_AMI_TOPOLOGY_STALE=1, a gate's CONTROL: once the two topologies are built, each side is
+        // handed the OTHER side's, which face_area_weight_ami_cpp.cu then takes without asking whose faces
+        // it was built from
+        static const bool stale = std::getenv("BRAE_CONTROL_AMI_TOPOLOGY_STALE") != nullptr;
+        const bool swapped = stale && !pr.srcTopology.faceFaces.empty();
+        pr.weights = swapped
+            ? ami::faceAreaWeight(srcPatch, tgtPatch, &pr.tgtTopology, &pr.srcTopology)
+            : ami::faceAreaWeight(srcPatch, tgtPatch, &pr.srcTopology, &pr.tgtTopology);
         part.emplace("ami: the two patches coupled (stencils, deltas, weights)");
         couple(src, tgt, pr.tgt, true, pr.weights.srcAddress, pr.weights.srcWeights, g);
         couple(tgt, src, pr.src, false, pr.weights.tgtAddress, pr.weights.tgtWeights, g);
