@@ -178,6 +178,13 @@ struct AMGPair
     DeviceBuffer<scalar> ifc;                   // this solve's coefficient a face, and in single precision
     DeviceBuffer<float> ifcF;
     DeviceBuffer<scalar> dense;                 // the coarsest grid's pair entries, row-major, for its dense LU
+    // ON A SMALL GRID THE PAIR IS A DENSE MATRIX (single precision, n_g x n_g row-major; empty on a larger grid).
+    // Every one of the pair's faces is carried on every grid unmerged, so on a grid of a few hundred cells tens
+    // of thousands of atomic adds land on the same few addresses: MEASURED on RAS/mixerVesselAMI (83,656 faces),
+    // what the pair adds to an iteration grid by grid, us: 23-52 on grids of 895k down to 3k cells, and 60-72 on
+    // the grids of 787, 392, 195 and 97 cells. There the entries are summed once a solve into denseF and a
+    // product adds a row a thread, no atomics.
+    std::vector<DeviceBuffer<float>> denseF;
     unsigned long long epoch = 0;               // moves when a buffer above does: what a captured cycle compares
 };
 

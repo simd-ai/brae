@@ -182,17 +182,39 @@ void pairMapK(
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i < n) coarse[i] = map[fine[i]];
 }
-// the pair's entries of the coarsest grid's dense matrix: dense[own][nbr] += ifc*w, into a zeroed n*n
+// the largest grid, in cells, whose pair is held dense (AMGPair::denseF): 1,024 squared is 4 MB of floats
+constexpr int PAIR_DENSE_MAX = 1024;
+
+// y += D x for the pair held dense on a small grid (AMGPair::denseF): a row a thread
+__global__
+void pairDenseMulK(
+    int nC,
+    const float* __restrict__ dense,
+    const float* __restrict__ x,
+    float* __restrict__ y)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nC) return;
+    const float* row = dense + static_cast<std::size_t>(i)*nC;
+    float s = 0.0f;
+    for (int j = 0; j < nC; ++j)
+    {
+        s += row[j]*x[j];
+    }
+    y[i] += s;
+}
+// the pair's entries of a grid's dense matrix: dense[own][nbr] += ifc*w, into a zeroed n*n
+template <typename T>
 __global__
 void pairDenseK(
     int n,
     const label* __restrict__ own,
     const label* __restrict__ nbr,
     const label* __restrict__ off,
-    const scalar* __restrict__ w,
-    const scalar* __restrict__ ifc,
+    const T* __restrict__ w,
+    const T* __restrict__ ifc,
     int nC,
-    scalar* __restrict__ dense)
+    T* __restrict__ dense)
 {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -318,6 +340,30 @@ void amgCouplePair(
                                           p.nbr[static_cast<std::size_t>(g)].data());
     }
     cudaCheck(cudaGetLastError(), "pair mapped down the grids");
+    // ...and summed into a dense matrix on each small grid below the finest and above the coarsest (the coarsest
+    // is solved by its LU). BRAE_CONTROL_AMG_PAIR_SPARSE=1 keeps every grid's entries face by face, as before.
+    static const bool sparseOnly = std::getenv("BRAE_CONTROL_AMG_PAIR_SPARSE") != nullptr;
+    if (p.denseF.size() != static_cast<std::size_t>(G) + 1)
+    {
+        p.denseF.clear();
+        p.denseF.resize(static_cast<std::size_t>(G) + 1);
+        moved = true;
+    }
+    for (int g = 1; g < G; ++g)
+    {
+        const int ng = amg.level[static_cast<std::size_t>(g) - 1].nCoarse;
+        const bool dense = !sparseOnly && ng <= PAIR_DENSE_MAX;
+        const std::size_t nn = dense ? static_cast<std::size_t>(ng)*static_cast<std::size_t>(ng) : 0;
+        DeviceBuffer<float>& d = p.denseF[static_cast<std::size_t>(g)];
+        sized(d, nn);
+        if (!dense) continue;
+        zeroT<float><<<nBlocks(static_cast<int>(nn)),TPB>>>(static_cast<int>(nn), d.data());
+        pairDenseK<float><<<nBlocks(n),TPB>>>(n, p.own[static_cast<std::size_t>(g)].data(),
+                                              p.nbr[static_cast<std::size_t>(g)].data(),
+                                              stencil ? p.off.data() : nullptr, p.wF.data(), p.ifcF.data(), ng,
+                                              d.data());
+    }
+    cudaCheck(cudaGetLastError(), "pair dense on the small grids");
     // the coarsest grid's direct solve: the factorisation amgGalerkin made is of the LDU matrix alone
     const int nc = amg.level.back().nCoarse;
     if (amg.coarseLUn == nc && nc > 0)
@@ -325,7 +371,7 @@ void amgCouplePair(
         const std::size_t nn = static_cast<std::size_t>(nc)*static_cast<std::size_t>(nc);
         p.dense.resize(nn);
         zeroT<scalar><<<nBlocks(static_cast<int>(nn)),TPB>>>(static_cast<int>(nn), p.dense.data());
-        pairDenseK<<<nBlocks(n),TPB>>>(n, p.own[static_cast<std::size_t>(G)].data(),
+        pairDenseK<scalar><<<nBlocks(n),TPB>>>(n, p.own[static_cast<std::size_t>(G)].data(),
                                        p.nbr[static_cast<std::size_t>(G)].data(), stencil ? p.off.data() : nullptr,
                                        p.w.data(), p.ifc.data(), nc, p.dense.data());
         cudaCheck(cudaGetLastError(), "pair on the coarsest grid");
@@ -361,6 +407,12 @@ inline void pairAdd(
     const AMGPair& p = amg.pair;
     if (p.n == 0) return;
     const std::size_t gg = static_cast<std::size_t>(g);
+    if (gg < p.denseF.size() && p.denseF[gg].size() > 0)
+    {
+        const int ng = amg.level[gg - 1].nCoarse;
+        pairDenseMulK<<<nBlocks(ng),TPB>>>(ng, p.denseF[gg].data(), x, y);
+        return;
+    }
     pairAddT<float><<<nBlocks(p.n),TPB>>>(p.n, p.own[gg].data(), p.nbr[gg].data(),
                                           p.stencil ? p.off.data() : nullptr, p.wF.data(), p.ifcF.data(), x, y);
 }
