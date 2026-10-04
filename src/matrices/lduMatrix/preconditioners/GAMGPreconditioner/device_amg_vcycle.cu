@@ -151,7 +151,11 @@ bool amgSinglePrecisionCycle(const AMGData& amg)
     // did before the single-precision one had the sparse prolongator's transfers.
     static const bool saDouble = std::getenv("BRAE_CONTROL_AMG_SA_DOUBLE") != nullptr;
     if (amg.saSmooth && saDouble) return false;
-    return useFP32() && !amg.gsSmooth && !useChebyshev();
+    // A two-stage Gauss-Seidel asked for (BRAE_AMG_TSGS) is run where it exists, in the double-precision cycle.
+    // It was SILENTLY IGNORED: the single-precision cycle was chosen all the same and has weighted Jacobi only,
+    // so an arm with the switch measured Jacobi under another name -- on RAS/DTCHull, 1,072 iterations with it
+    // and 1,072 without (853 once the cycle was forced to double precision beside it).
+    return useFP32() && !amg.gsSmooth && !useChebyshev() && !useTSGS();
 }
 
 // Recursive V-cycle at grid g: x_g <- M^-1 b_g (x_g overwritten). g==nLevels is the coarsest grid (an approximate

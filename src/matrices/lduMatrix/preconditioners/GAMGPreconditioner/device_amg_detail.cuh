@@ -158,7 +158,13 @@ inline bool useGSPermuted()
 }
 inline bool useTSGS()
 {
-    static bool t = (std::getenv("BRAE_AMG_TSGS") != nullptr);
+    // on a symmetric matrix: asked for by BRAE_AMG_TSGS set to anything but 0. It read "set at all" before, so
+    // BRAE_AMG_TSGS=0 -- which turns the smoother OFF on an asymmetric matrix (useTSGSAsym) -- turned it ON here.
+    static const bool t = []()
+    {
+        const char* e = std::getenv("BRAE_AMG_TSGS");
+        return e && *e && !(e[0] == '0' && e[1] == '\0');
+    }();
     return t;
 }
 // ...and on an ASYMMETRIC matrix it is the DEFAULT, because it was measured to be. squareBend, the
