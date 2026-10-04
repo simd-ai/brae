@@ -1,8 +1,10 @@
 // polyTopoChange's face and cell ordering. See the header for what these are and why they are first.
 #include "poly_topo_change_cpp.cuh"
+#include "inter_phase_time.cuh"
 #include "foam_dict.cuh"   // isCoupledInterfaceType
 #include <algorithm>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -731,6 +733,9 @@ void changeMesh(
     ChangedMesh&           out,
     TopoChangeMap&         map)
 {
+    // BRAE_INTER_PHASE_TIME: the change part by part
+    std::optional<interPhase::Nested> part;
+    part.emplace("changeMesh: the refusals and compact's local maps and flips (compactNoOrder)");
     // ---- the refusals, before anything is consumed -----------------------------------------------
     for (const std::string& t : in.patchTypes)
     {
@@ -769,6 +774,7 @@ void changeMesh(
     // ---- 1. compact: the local maps and the flip (unit 2), then the ARRAY REORDER ----------------
     const CompactResult r = compactNoOrder(a.state);
 
+    part.emplace("changeMesh: the points reordered, every face's vertices renumbered");
     // points: reorder the coordinates and the map, renumber the reverse map and the retired set, then
     // relabel every face's vertices through it (polyTopoChange.C:1111-1139)
     reorderInPlace(r.localPointMap, a.state.points, r.nActivePoints);
@@ -791,6 +797,7 @@ void changeMesh(
     // them and only nActiveFaces_ excludes them. compactNoOrder stops at the active block because unit
     // 2's gate could not see the rest; the tail is added here. NOT WITNESSED by this unit's arms
     // either: nothing hexRef8 does retires a face, and the three scenarios produce none.
+    part.emplace("changeMesh: the faces reordered into the active block");
     std::vector<label> faceMapLocal(r.localFaceMap);
     label newFacei = r.nActiveFaces;
     for (std::size_t facei = 0; facei < a.state.faces.size(); ++facei)
@@ -806,6 +813,7 @@ void changeMesh(
 
     // cells: the reorder of the map and the reverse map. compactNoOrder has already renumbered
     // owner/neighbour and done the flip, which is why that had to run before the face reorder.
+    part.emplace("changeMesh: the cells' maps reordered");
     reorderInPlace(r.localCellMap, a.state.cellMap, r.nActiveCells);
     renumberReverseMap(r.localCellMap, a.reverseCellMap);
     renumberKey(r.localCellMap, a.cellFromPoint);
@@ -826,6 +834,7 @@ void changeMesh(
     //
     // patchStarts and patchSizes come OUT of getFaceOrder; deriving them from `region` afterwards
     // would be a second implementation of the same fact, and it got empty patches wrong.
+    part.emplace("changeMesh: the upper-triangular and patch order (makeCells, getFaceOrder, reorder)");
     {
         OrderInput oi;
         oi.cellMapSize = r.nActiveCells;
@@ -847,11 +856,13 @@ void changeMesh(
     // from-edge halves were refused above, so they come out empty as OpenFOAM's would.
     // ...and the POINT merge set, which OpenFOAM builds with the very same function -- "For point only
     // point merging" (polyTopoChange.C:2211-2217). Three calls, one arithmetic.
+    part.emplace("changeMesh: the merge sets of points, faces and cells");
     map.pointsFromPoints = getMergeSets(a.reversePointMap, a.state.pointMap);
     map.facesFromFaces = getMergeSets(a.reverseFaceMap, a.state.faceMap);
     map.cellsFromCells = getMergeSets(a.reverseCellMap, a.state.cellMap);
 
     // ---- 5. the mesh the change produced ---------------------------------------------------------
+    part.emplace("changeMesh: the new mesh and the maps copied out");
     out.points = a.state.points;
     out.faces.assign(a.state.faces.begin(), a.state.faces.begin() + r.nActiveFaces);
     out.faceOwner.assign(a.state.faceOwner.begin(), a.state.faceOwner.begin() + r.nActiveFaces);

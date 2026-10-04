@@ -1876,6 +1876,7 @@ PrimitiveMesh rebuiltMesh(
     const PrimitiveMesh&                     old,
     const cpu::polyTopoChange::ChangedMesh&  out)
 {
+    interPhase::Nested timed("topo: the changed mesh back into the solver's form (rebuiltMesh)");
     std::vector<label> faceVerts;
     std::vector<label> faceOffsets;
     faceOffsets.reserve(out.faces.size() + 1);
@@ -2171,6 +2172,7 @@ cpu::hexRef8::MeshView hexView(
 
 cpu::polyTopoChange::TopoActions actionsFromMesh(const PrimitiveMesh& m)
 {
+    interPhase::Nested timed("topo: the mesh into the change's own lists (actionsFromMesh, a list a face)");
     std::vector<label> starts, sizes;
     for (const PatchInfo& p : m.patches()) { starts.push_back(p.start); sizes.push_back(p.size); }
     std::vector<std::vector<label>> faces(static_cast<std::size_t>(m.nFaces()));
