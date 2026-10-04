@@ -8,6 +8,7 @@
 #include "inter_set_rdeltat_cpp.cuh"
 #include "device_fvc_smooth.cuh"
 #include "device_inter_pcorr_solve.cuh"
+#include "device_displacement_laplacian_assembly.cuh"
 #include "device_patch_wave.cuh"
 #include <set>
 #include "inter_amr_cpp.cuh"
@@ -613,6 +614,7 @@ RunReport runInterFoamDevice(
             if (dyn)
             {
                 dyn->setPatchWaveRunner(PatchWaveRunner());
+                dyn->setDisplacementAssemblyRunner(DisplacementAssemblyRunner());
             }
         }
     } runnerReset{dyn};
@@ -883,6 +885,38 @@ RunReport runInterFoamDevice(
     }
 
     DeviceMesh dm = buildDeviceMesh(m, g, fvp);
+    // THE MOTION SOLVER'S EQUATION ON THE GPU: the interior of displacementLaplacian's laplacian -- the face
+    // coefficients and the diagonal, grad(cellDisplacement), the non-orthogonal correction and its per-cell sum
+    // -- is assembled on the device mesh, each cell folding its faces in the host's order and every fused
+    // product the host's (deviceDisplacementAssembly), bit for bit. The geometry it reads is dm's, which this
+    // loop refreshes from the host's after every move, so it is the mesh the host assembly would read. The
+    // patches' coefficients and the solve stay with the motion solver: cellDisplacement keeps the case's own
+    // solver. MEASURED on waveMakerPiston refined to 896,000 cells: the host's matrix, gradient and correction
+    // are 94 ms a step, the device's 5.3. BRAE_CONTROL_MOTION_ASSEMBLY_HOST=1 assembles on the host -- the
+    // identity gate's other arm. Taken back with the wave runner when this loop ends.
+    DeviceDisplacementAssembly motionAssembly;
+    bool motionAssemblySaid = false;
+    if (dyn && dyn->hasDisplacementSolver() && std::getenv("BRAE_CONTROL_MOTION_ASSEMBLY_HOST") == nullptr)
+    {
+        dyn->setDisplacementAssemblyRunner(
+            [&dm, &motionAssembly, &motionAssemblySaid](
+                const std::vector<FvPatch>& patches,
+                const std::vector<scalar>& gamma,
+                const std::vector<vector>& D,
+                const std::vector<std::vector<vector>>& boundary,
+                std::vector<scalar>& upper,
+                std::vector<scalar>& diag,
+                std::vector<vector>& corr)
+            {
+                if (!motionAssemblySaid)
+                {
+                    motionAssemblySaid = true;
+                    std::printf("  mesh motion: the displacement equation's interior is assembled on the GPU in "
+                                "the host's order; BRAE_CONTROL_MOTION_ASSEMBLY_HOST=1 assembles it on the host\n");
+                }
+                deviceDisplacementAssembly(dm, patches, gamma, D, boundary, motionAssembly, upper, diag, corr);
+            });
+    }
 
     // the masks the device needs that the mesh does not carry. IN A LAMBDA because a topology change
     // re-runs it: they are per boundary FACE, and hexRef8 splits boundary faces within their patch.

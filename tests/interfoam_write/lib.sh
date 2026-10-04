@@ -84,10 +84,19 @@ W=${KEEP_W:-$(mktemp -d)}
 [ -n "${KEEP_W:-}" ] || trap 'rm -rf "$W"' EXIT
 mkdir -p "$W"
 
+# OpenFOAM's bashrc EVALUATES the positional parameters it is sourced with (etc/config.sh/setup:116-140:
+# `name=value` is exported, a file name is sourced), and a bare `source` hands it the caller's. A helper run as
+# `ab.sh BRAE_A=1 BRAE_B=1 <case>` so had BOTH switches exported into BOTH of its arms and compared an arm with
+# itself -- found 2026-10-04, when the arm that should have announced a GPU path did not. The gates here are run
+# without arguments and were never affected; the parameters are put away for the source all the same.
+lib_args=("$@")
+set --
 set +u
 # shellcheck disable=SC1091
 source "$OFBASHRC" > /dev/null 2>&1 || true
 set -u
+set -- ${lib_args[@]+"${lib_args[@]}"}
+unset lib_args
 command -v blockMesh > /dev/null 2>&1 || { echo "SKIP: blockMesh not on PATH"; exit 77; }
 command -v interFoam > /dev/null 2>&1 || { echo "SKIP: interFoam not on PATH"; exit 77; }
 

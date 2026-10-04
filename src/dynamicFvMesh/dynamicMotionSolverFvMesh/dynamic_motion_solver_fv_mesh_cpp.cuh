@@ -148,6 +148,14 @@ public:
             displacement_->setPatchWaveRunner(std::move(runner));
         }
     }
+    // ...and its equation's interior assembled elsewhere
+    void setDisplacementAssemblyRunner(DisplacementAssemblyRunner runner)
+    {
+        if (displacement_)
+        {
+            displacement_->setAssemblyRunner(std::move(runner));
+        }
+    }
     bool hasDisplacementSolver() const
     {
         return displacement_ != nullptr;

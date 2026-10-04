@@ -36,6 +36,65 @@ inline vector dotCorr(const vector& c, const tensor& gradV)
              c.x*gradV.xz + c.y*gradV.yz + c.z*gradV.zz };
 }
 
+// THE BOUNDARY HALF of fvm::laplacian (below): every patch's internalCoeffs and boundaryCoeffs, written into M.
+// Its own function so a caller that assembles the INTERIOR elsewhere -- the device loop's displacement
+// equation (device_displacement_laplacian_assembly.cuh) -- takes the boundary from this same code and the two
+// cannot drift apart. fvm::laplacian calls it; nothing in it reads the interior.
+template <typename T>
+void laplacianBoundaryCoeffs(
+    FvMatrix<T>& M,
+    const SurfaceScalarField& gammaf,
+    const GeometricField<T>& vf,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    bool corrected,
+    bool nonOrthCoeffs)
+{
+    const std::vector<scalar>& magSf = g.magSf();
+    // Boundary coefficients take the patch field's OWN deltaCoeffs, not the corrected ones, even when
+    // `corrected` is on. That is OpenFOAM's behaviour and not an omission: gaussLaplacianScheme.C branches
+    // on pvf.coupled() and passes the corrected deltaCoeffs ONLY on the coupled side, calling the
+    // argument-less gradientInternalCoeffs()/gradientBoundaryCoeffs() otherwise.
+    //
+    // THE COUPLED BRANCH (FvPatch::coupled, the OF-mirror cyclic): coupledFvPatchField's
+    // gradientInternalCoeffs(dc) is -dc and gradientBoundaryCoeffs(dc) is +dc, with dc the SCHEME's
+    // deltaCoeffs -- nonOrthDeltaCoeffs under `corrected`. So internalCoeffs = boundaryCoeffs =
+    // -gamma*magSf*dc: the first goes on the diagonal and the second is the INTERFACE coefficient, which
+    // Amul applies to the cell on the other side (result -= boundaryCoeffs*psi_nbr) and which is never a
+    // source. The deferred non-orthogonal correction on a coupled face is the explicit half's
+    // (laplacianNonOrthSource, laplacianCorrFluxCoupled).
+    M.internalCoeffs.resize(patches.size());
+    M.boundaryCoeffs.resize(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& fp = patches[pi];
+        const std::vector<T> gIC = vf.boundary[pi]->gradientInternalCoeffs();
+        const std::vector<T> gBC = vf.boundary[pi]->gradientBoundaryCoeffs();
+        M.internalCoeffs[pi].resize(fp.size);
+        M.boundaryCoeffs[pi].resize(fp.size);
+        if (fp.coupled)
+        {
+            for (label i = 0; i < fp.size; ++i)
+            {
+                const scalar pGamma = gammaf.boundary[pi][i] * magSf[fp.start + i];
+                // the SCHEME's deltaCoeffs, which `uncorrected` shares with `corrected` -- see the
+                // note on the interior choice above
+                const scalar dcb = (corrected || nonOrthCoeffs) ? fp.nonOrthDeltaCoeffs[i]
+                                                                : fp.deltaCoeffs[i];
+                M.internalCoeffs[pi][i] = (-(pGamma * dcb)) * tUniform<T>(1);
+                M.boundaryCoeffs[pi][i] = (-(pGamma * dcb)) * tUniform<T>(1);
+            }
+            continue;
+        }
+        for (label i = 0; i < fp.size; ++i)
+        {
+            const scalar pGamma = gammaf.boundary[pi][i] * magSf[fp.start + i];
+            M.internalCoeffs[pi][i] =  pGamma * gIC[i];
+            M.boundaryCoeffs[pi][i] = (-pGamma) * gBC[i];
+        }
+    }
+}
+
 // laplacian with a face-varying diffusivity gammaf (e.g. interpolate(rAU)) for the pEqn.
 //
 // `corrected` selects OpenFOAM's NON-ORTHOGONAL correction, and it changes TWO things, not one
@@ -90,48 +149,7 @@ FvMatrix<T> laplacian(
         M.diag[own[f]] -= coeff;
         M.diag[nei[f]] -= coeff;
     }
-    // Boundary coefficients take the patch field's OWN deltaCoeffs, not the corrected ones, even when
-    // `corrected` is on. That is OpenFOAM's behaviour and not an omission: gaussLaplacianScheme.C branches
-    // on pvf.coupled() and passes the corrected deltaCoeffs ONLY on the coupled side, calling the
-    // argument-less gradientInternalCoeffs()/gradientBoundaryCoeffs() otherwise.
-    //
-    // THE COUPLED BRANCH (FvPatch::coupled, the OF-mirror cyclic): coupledFvPatchField's
-    // gradientInternalCoeffs(dc) is -dc and gradientBoundaryCoeffs(dc) is +dc, with dc the SCHEME's
-    // deltaCoeffs -- nonOrthDeltaCoeffs under `corrected`. So internalCoeffs = boundaryCoeffs =
-    // -gamma*magSf*dc: the first goes on the diagonal and the second is the INTERFACE coefficient, which
-    // Amul applies to the cell on the other side (result -= boundaryCoeffs*psi_nbr) and which is never a
-    // source. The deferred non-orthogonal correction on a coupled face is the explicit half's
-    // (laplacianNonOrthSource, laplacianCorrFluxCoupled).
-    M.internalCoeffs.resize(patches.size());
-    M.boundaryCoeffs.resize(patches.size());
-    for (std::size_t pi = 0; pi < patches.size(); ++pi)
-    {
-        const FvPatch& fp = patches[pi];
-        const std::vector<T> gIC = vf.boundary[pi]->gradientInternalCoeffs();
-        const std::vector<T> gBC = vf.boundary[pi]->gradientBoundaryCoeffs();
-        M.internalCoeffs[pi].resize(fp.size);
-        M.boundaryCoeffs[pi].resize(fp.size);
-        if (fp.coupled)
-        {
-            for (label i = 0; i < fp.size; ++i)
-            {
-                const scalar pGamma = gammaf.boundary[pi][i] * magSf[fp.start + i];
-                // the SCHEME's deltaCoeffs, which `uncorrected` shares with `corrected` -- see the
-                // note on the interior choice above
-                const scalar dcb = (corrected || nonOrthCoeffs) ? fp.nonOrthDeltaCoeffs[i]
-                                                                : fp.deltaCoeffs[i];
-                M.internalCoeffs[pi][i] = (-(pGamma * dcb)) * tUniform<T>(1);
-                M.boundaryCoeffs[pi][i] = (-(pGamma * dcb)) * tUniform<T>(1);
-            }
-            continue;
-        }
-        for (label i = 0; i < fp.size; ++i)
-        {
-            const scalar pGamma = gammaf.boundary[pi][i] * magSf[fp.start + i];
-            M.internalCoeffs[pi][i] =  pGamma * gIC[i];
-            M.boundaryCoeffs[pi][i] = (-pGamma) * gBC[i];
-        }
-    }
+    laplacianBoundaryCoeffs(M, gammaf, vf, g, patches, corrected, nonOrthCoeffs);
     return M;
 }
 

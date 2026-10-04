@@ -9,6 +9,9 @@
 #include "patch_wave_cpp.cuh"
 #include "primitive_patch_cpp.cuh"
 #include "solution_directions.cuh"
+#include <cstring>
+#include <cstdio>
+#include <optional>
 #include <algorithm>
 #include <cstdlib>
 #include <filesystem>
@@ -478,6 +481,87 @@ void DisplacementLaplacianFvMotionSolver::diffusivityCorrect(
     }
 }
 
+FvMatrix<vector> DisplacementLaplacianFvMotionSolver::assembleOnHost(
+    const GeometricField<vector>& D,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches) const
+{
+    FvMatrix<vector> M;
+    {
+        interPhase::Nested timedMatrix("motion: assembly, the laplacian matrix");
+        M = fvm::laplacian<vector>(faceDiffusivity_, D, m, g, patches, true);
+    }
+    interPhase::Nested timedCorr("motion: assembly, the gradient and the non-orthogonal source");
+    std::vector<std::vector<vector>> bnd(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        bnd[pi] = (pointPatches_[pi].type == PointPatchType::empty)
+            ? std::vector<vector>(static_cast<std::size_t>(patches[pi].size), vector{0, 0, 0})
+            : cellDisplacementBoundary_[pi];
+    }
+    const std::vector<tensor> gradD = fvc::gaussGrad(D.internal, bnd, m, g, patches);
+    const std::vector<vector> corr = fvm::laplacianNonOrthSource<vector, tensor>(
+        faceDiffusivity_, D, gradD, m, g, patches);
+    for (std::size_t c = 0; c < corr.size(); ++c)
+    {
+        M.source[c] -= corr[c];
+    }
+    return M;
+}
+
+void DisplacementLaplacianFvMotionSolver::sameAssembly(
+    const FvMatrix<vector>& got,
+    const FvMatrix<vector>& host) const
+{
+    // bytes, not values: -0 against +0 and one rounding's difference are both differences
+    auto same = [](
+        const char* what,
+        const scalar* a,
+        std::size_t na,
+        const scalar* b,
+        std::size_t nb)
+    {
+        if (na != nb)
+        {
+            throw std::runtime_error(
+                std::string(WHO) + "the assembly run elsewhere has " + std::to_string(na) + " entries of " + what
+                + ", the host's " + std::to_string(nb) + ".");
+        }
+        if (na == 0 || std::memcmp(a, b, na*sizeof(scalar)) == 0) return;
+        std::size_t at = 0;
+        while (std::memcmp(a + at, b + at, sizeof(scalar)) == 0)
+        {
+            ++at;
+        }
+        char line[160];
+        std::snprintf(line, sizeof(line), " entry %zu is %.17g, the host's %.17g.", at, a[at], b[at]);
+        throw std::runtime_error(
+            std::string(WHO) + "the assembly run elsewhere is not the host's: " + what + line);
+    };
+    same("upper", got.upper.data(), got.upper.size(), host.upper.data(), host.upper.size());
+    same("lower", got.lower.data(), got.lower.size(), host.lower.data(), host.lower.size());
+    same("diag", got.diag.data(), got.diag.size(), host.diag.data(), host.diag.size());
+    same("source (3 a cell)", &got.source.data()->x, 3*got.source.size(), &host.source.data()->x,
+         3*host.source.size());
+    if (got.internalCoeffs.size() != host.internalCoeffs.size()
+     || got.boundaryCoeffs.size() != host.boundaryCoeffs.size())
+    {
+        throw std::runtime_error(std::string(WHO) + "the assembly run elsewhere has another number of patches.");
+    }
+    for (std::size_t pi = 0; pi < host.internalCoeffs.size(); ++pi)
+    {
+        const std::vector<vector>& gi = got.internalCoeffs[pi];
+        const std::vector<vector>& hi = host.internalCoeffs[pi];
+        const std::vector<vector>& gb = got.boundaryCoeffs[pi];
+        const std::vector<vector>& hb = host.boundaryCoeffs[pi];
+        same("internalCoeffs (3 a face)", gi.empty() ? nullptr : &gi.data()->x, 3*gi.size(),
+             hi.empty() ? nullptr : &hi.data()->x, 3*hi.size());
+        same("boundaryCoeffs (3 a face)", gb.empty() ? nullptr : &gb.data()->x, 3*gb.size(),
+             hb.empty() ? nullptr : &hb.data()->x, 3*hb.size());
+    }
+}
+
 void DisplacementLaplacianFvMotionSolver::solve(
     scalar time,
     bool finalIteration,
@@ -494,6 +578,8 @@ void DisplacementLaplacianFvMotionSolver::solve(
 
     // pointDisplacement_.boundaryFieldRef().updateCoeffs(): valuePointPatchField::updateCoeffs writes
     // each fixing patch's values into the point field, patch by patch
+    std::optional<interPhase::Nested> timedPart;
+    timedPart.emplace("motion: assembly, the boundary values and the field");
     for (PointPatch& pp : pointPatches_)
     {
         if (pp.type == PointPatchType::waveMaker)
@@ -563,22 +649,47 @@ void DisplacementLaplacianFvMotionSolver::solve(
     }
 
     // fvm::laplacian(1*diffusivity, cellDisplacement), Gauss linear corrected
-    FvMatrix<vector> M = fvm::laplacian<vector>(faceDiffusivity_, D, m, g, patches, true);
+    FvMatrix<vector> M;
+    if (assemblyRunner_)
     {
+        // the interior elsewhere, the patches' coefficients from the code fvm::laplacian runs, and the source
+        // as below: zero, minus the correction
+        timedPart.emplace("motion: assembly, the interior elsewhere and the patches' coefficients");
         std::vector<std::vector<vector>> bnd(patches.size());
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
-            bnd[pi] = (pointPatches_[pi].type == PointPatchType::empty)
-                ? std::vector<vector>(static_cast<std::size_t>(patches[pi].size), vector{0, 0, 0})
-                : cellDisplacementBoundary_[pi];
+            if (pointPatches_[pi].type != PointPatchType::empty)
+            {
+                bnd[pi] = cellDisplacementBoundary_[pi];
+            }
         }
-        const std::vector<tensor> gradD = fvc::gaussGrad(D.internal, bnd, m, g, patches);
-        const std::vector<vector> corr = fvm::laplacianNonOrthSource<vector, tensor>(
-            faceDiffusivity_, D, gradD, m, g, patches);
+        std::vector<vector> corr;
+        assemblyRunner_(patches, faceDiffusivity_.internal, D.internal, bnd, M.upper, M.diag, corr);
+        if (M.upper.size() != static_cast<std::size_t>(m.nInternalFaces())
+         || M.diag.size() != static_cast<std::size_t>(m.nCells())
+         || corr.size() != static_cast<std::size_t>(m.nCells()))
+        {
+            throw std::runtime_error(std::string(WHO) + "the assembly run elsewhere returned another mesh's.");
+        }
+        M.lower = M.upper;
+        M.source.assign(corr.size(), vector{0, 0, 0});
+        fvm::laplacianBoundaryCoeffs<vector>(M, faceDiffusivity_, D, g, patches, true, false);
         for (std::size_t c = 0; c < corr.size(); ++c)
         {
             M.source[c] -= corr[c];
         }
+        timedPart.reset();
+        // BRAE_CONTROL_MOTION_ASSEMBLY_CHECK=1: the host assembles too, and one bit's difference anywhere in the
+        // matrix stops the run and names the entry -- the identity gate's oracle, at every step
+        static const bool check = std::getenv("BRAE_CONTROL_MOTION_ASSEMBLY_CHECK") != nullptr;
+        if (check)
+        {
+            sameAssembly(M, assembleOnHost(D, m, g, patches));
+        }
+    }
+    else
+    {
+        M = assembleOnHost(D, m, g, patches);
     }
 
     // fvMatrix<vector>::solveSegregated: one GAMG solve per solved component
@@ -589,10 +700,29 @@ void DisplacementLaplacianFvMotionSolver::solve(
             std::string(WHO) + "the last PIMPLE iteration solves with the `cellDisplacementFinal` entry, "
             "and system/fvSolution has none.");
     }
+    timedPart.emplace("motion: the GAMG agglomeration of the moved mesh");
     const GamgAgglomeration& a = agglomeration.get(m, g, controls.nCellsInCoarsestLevel);
+    timedPart.reset();
     const SolutionDirections sd = solutionDirections(patches);
     lastSolve_ = DisplacementSolveRecord();
     interPhase::Nested timedSolves("motion: the component solves");
+    // ONE scalar system for the components: the matrix is theirs in common and is taken from M whole, and
+    // each component brings only its source and its patches' coefficients, written over the last one's. It
+    // was copied afresh for every component, the coefficients pushed back a face at a time. MEASURED on
+    // waveMakerPiston refined to 896,000 cells: the component solves 122 -> 94 ms a step, every written file
+    // of waveMakerFlap and waveMakerSolitary the same bytes as before.
+    FvScalarMatrix Mc;
+    Mc.diag = std::move(M.diag);
+    Mc.upper = std::move(M.upper);
+    Mc.lower = std::move(M.lower);
+    Mc.source.resize(M.source.size());
+    Mc.internalCoeffs.resize(patches.size());
+    Mc.boundaryCoeffs.resize(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        Mc.internalCoeffs[pi].resize(M.internalCoeffs[pi].size());
+        Mc.boundaryCoeffs[pi].resize(M.boundaryCoeffs[pi].size());
+    }
     for (int cmpt = 0; cmpt < 3; ++cmpt)
     {
         if (!sd.valid(cmpt)) continue;
@@ -600,26 +730,21 @@ void DisplacementLaplacianFvMotionSolver::solve(
         {
             return cmpt == 0 ? v.x : (cmpt == 1 ? v.y : v.z);
         };
-        FvScalarMatrix Mc;
-        Mc.diag = M.diag;
-        Mc.upper = M.upper;
-        Mc.lower = M.lower;
-        Mc.source.resize(M.source.size());
         for (std::size_t c = 0; c < M.source.size(); ++c)
         {
             Mc.source[c] = component(M.source[c]);
         }
-        Mc.internalCoeffs.resize(patches.size());
-        Mc.boundaryCoeffs.resize(patches.size());
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
-            for (const vector& v : M.internalCoeffs[pi])
+            const std::vector<vector>& ic = M.internalCoeffs[pi];
+            const std::vector<vector>& bc = M.boundaryCoeffs[pi];
+            for (std::size_t i = 0; i < ic.size(); ++i)
             {
-                Mc.internalCoeffs[pi].push_back(component(v));
+                Mc.internalCoeffs[pi][i] = component(ic[i]);
             }
-            for (const vector& v : M.boundaryCoeffs[pi])
+            for (std::size_t i = 0; i < bc.size(); ++i)
             {
-                Mc.boundaryCoeffs[pi].push_back(component(v));
+                Mc.boundaryCoeffs[pi][i] = component(bc[i]);
             }
         }
         std::vector<scalar> psi(cellDisplacement_.size());

@@ -125,6 +125,7 @@ add_library(brae_core STATIC
     src/finiteVolume/interpolation/volPointInterpolation/point_constraints_cpp.cu
     src/waveModels/derivedPointPatchFields/waveMaker/wave_maker_point_patch_vector_field_cpp.cu
     src/fvMotionSolver/fvMotionSolvers/displacement/laplacian/displacement_laplacian_fv_motion_solver_cpp.cu
+    src/fvMotionSolver/fvMotionSolvers/displacement/laplacian/device_displacement_laplacian_assembly.cu
     src/dynamicFvMesh/dynamicMotionSolverFvMesh/dynamic_motion_solver_fv_mesh_cpp.cu
     src/matrices/lduMatrix/lduMatrix/blas1.cu
     src/matrices/lduMatrix/lduMatrix/reductions.cu

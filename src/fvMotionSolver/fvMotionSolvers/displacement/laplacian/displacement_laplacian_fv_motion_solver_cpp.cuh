@@ -55,11 +55,27 @@
 #include "two_d_point_corrector_cpp.cuh"
 #include "vol_point_interpolation_cpp.cuh"
 #include "wave_maker_point_patch_vector_field_cpp.cuh"
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
 namespace brae {
+
+// THE EQUATION'S INTERIOR ELSEWHERE. When the solver holds one of these it hands it the patches, the face
+// diffusivity on the internal faces, cellDisplacement and its boundary values patch by patch (an empty patch's
+// entry is left empty: fvc::gaussGrad never reads it), and takes back fvm::laplacian's upper (= lower) and its
+// diag before the patches' diagonal, and laplacianNonOrthSource's per-cell sum, which it subtracts from the
+// source itself. The patches' coefficients stay here (fvm::laplacianBoundaryCoeffs). The device loop's is
+// deviceDisplacementAssembly (device_displacement_laplacian_assembly.cuh), the host assembly to the bit.
+using DisplacementAssemblyRunner = std::function<void(
+    const std::vector<FvPatch>&,
+    const std::vector<scalar>&,
+    const std::vector<vector>&,
+    const std::vector<std::vector<vector>>&,
+    std::vector<scalar>&,
+    std::vector<scalar>&,
+    std::vector<vector>&)>;
 
 // what one solve of the displacement equation did, per component x, y, z. A component the mesh does not
 // solve -- the empty direction of a 2-D mesh -- is not solved.
@@ -85,6 +101,12 @@ public:
     void setPatchWaveRunner(PatchWaveRunner runner)
     {
         waveRunner_ = std::move(runner);
+    }
+    // the equation's interior assembled elsewhere (DisplacementAssemblyRunner): the device loop hands in its
+    // GPU assembly. Empty assembles on the host.
+    void setAssemblyRunner(DisplacementAssemblyRunner runner)
+    {
+        assemblyRunner_ = std::move(runner);
     }
     void attach(
         const PrimitiveMesh& m,
@@ -169,6 +191,17 @@ private:
         const PrimitiveMesh& m,
         const FvGeometry& g,
         const std::vector<FvPatch>& patches);
+    // fvm::laplacian(diffusivity, cellDisplacement) under Gauss linear corrected, whole, on the host: the
+    // matrix, and the non-orthogonal correction taken off its source
+    FvMatrix<vector> assembleOnHost(
+        const GeometricField<vector>& D,
+        const PrimitiveMesh& m,
+        const FvGeometry& g,
+        const std::vector<FvPatch>& patches) const;
+    // throws, naming the first entry, unless `got` is `host` byte for byte
+    void sameAssembly(
+        const FvMatrix<vector>& got,
+        const FvMatrix<vector>& host) const;
     void solve(
         scalar time,
         bool finalIteration,
@@ -201,6 +234,8 @@ private:
     std::vector<std::vector<label>> meshPointFaces_;
     // the wave run elsewhere (patch_wave_cpp.cuh), when the driver hands one in: the device loop's GPU wave
     PatchWaveRunner waveRunner_;
+    // ...and the equation's interior assembled elsewhere, likewise
+    DisplacementAssemblyRunner assemblyRunner_;
     std::vector<label> diffusivityPatchIDs_;
     std::vector<scalar> y_;
     SurfaceScalarField faceDiffusivity_;
