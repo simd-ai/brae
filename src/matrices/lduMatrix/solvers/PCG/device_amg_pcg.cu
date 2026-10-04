@@ -274,7 +274,7 @@ static DeviceSolverPerf deviceAMGPCGGraph(
                        && c.keyAmiNbr == (const void*)A.amiNbr && c.keyAmiW == (const void*)A.amiW;
     if (!c.exec || c.key != psi.data() || c.keyEpoch != epoch
         || c.keyOwner != (const void*)A.owner || c.keyNC != nC || c.keyNF != nF
-        || c.keyAddressingId != A.addressingId || !samePair)
+        || c.keyAddressingId != A.addressingId || !samePair || c.keyPairEpoch != amg.pair.epoch)
     {
         interPhase::Nested timedCapture("AMG-PCG: graph capture");
         // PRE-SIZE everything the capture will touch (the V-cycle scratch, pA/Ax, the reduction
@@ -358,6 +358,7 @@ static DeviceSolverPerf deviceAMGPCGGraph(
         c.keyAmiOff = A.amiOff;
         c.keyAmiNbr = A.amiNbr;
         c.keyAmiW = A.amiW;
+        c.keyPairEpoch = amg.pair.epoch;
         c.keyEpoch = epoch;
         c.keyOwner = A.owner;
         c.keyAddressingId = A.addressingId;
@@ -626,6 +627,8 @@ DeviceSolverPerf deviceAMGPCG(
     bool corrScaling,
     int minIter)
 {
+    // the matrix's coupled pair onto every grid of the hierarchy, this solve's coefficients (AMGPair)
+    amgCouplePair(amg, A);
     // BRAE_AMG_PCG_SPLIT: this solve takes the plain loop below, uncaptured, the residual read at every
     // iteration as the graph reads it, with a lap after every part (device_amg_split.cuh)
     const bool split = amgSplit::wanted();
@@ -702,7 +705,8 @@ DeviceSolverPerf deviceAMGPCG(
                 return;
             }
             AMGGraphCache& gcf = *amg.gcacheF;                                          // graph the FP32 V-cycle (host-scalar-free)
-            if (!gcf.exec || gcf.key != A.diag || gcf.keyEpoch != deviceReductionScratchEpoch())
+            if (!gcf.exec || gcf.key != A.diag || gcf.keyEpoch != deviceReductionScratchEpoch()
+             || gcf.keyPairEpoch != amg.pair.epoch)
             {
                 if (gcf.exec)
                 {
@@ -719,6 +723,7 @@ DeviceSolverPerf deviceAMGPCG(
                 cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &gcf.graph), "amgF capture end");
                 cudaCheck(cudaGraphInstantiate(&gcf.exec, gcf.graph, 0), "amgF graph instantiate");
                 gcf.key = A.diag; gcf.keyEpoch = deviceReductionScratchEpoch();
+                gcf.keyPairEpoch = amg.pair.epoch;
             }
             cudaCheck(cudaGraphLaunch(gcf.exec, cudaStreamPerThread), "amgF graph launch");
             return;
@@ -728,7 +733,8 @@ DeviceSolverPerf deviceAMGPCG(
             vcycleAt(0, amg, A, rA, wA);
             return;
         }
-        if (!gc.exec || gc.key != A.diag || gc.keyEpoch != deviceReductionScratchEpoch())
+        if (!gc.exec || gc.key != A.diag || gc.keyEpoch != deviceReductionScratchEpoch()
+         || gc.keyPairEpoch != amg.pair.epoch)
         {
             if (gc.exec)
             {
@@ -745,6 +751,7 @@ DeviceSolverPerf deviceAMGPCG(
             cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &gc.graph), "amg capture end");
             cudaCheck(cudaGraphInstantiate(&gc.exec, gc.graph, 0), "amg graph instantiate");
             gc.key = A.diag; gc.keyEpoch = deviceReductionScratchEpoch();
+            gc.keyPairEpoch = amg.pair.epoch;
         }
         cudaCheck(cudaGraphLaunch(gc.exec, cudaStreamPerThread), "amg graph launch");
     };
@@ -836,7 +843,10 @@ DeviceSolverPerf deviceAMGPCG(
     {
         static const bool pcgDev = std::getenv("BRAE_PCG_DEVICE") == nullptr || std::string(std::getenv("BRAE_PCG_DEVICE")) != "0";
         if (pcgDev && !corrScaling && !normFactorOnHost() && !amgSplit::wanted())
+        {
+            amgCouplePair(amg, A);
             return deviceAMGPCGGraph(A, amg, b, psi, dNormFactor, tol, relTol, maxIter, minIter);
+        }
     }
 #endif
     return deviceAMGPCG(A, amg, b, psi, deviceReadScalar(dNormFactor), tol, relTol, maxIter, captureVcycle, checkEvery, corrScaling, minIter);

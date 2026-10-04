@@ -130,6 +130,83 @@ void prolongToSparseK(
     pc[f] = s;
 }
 
+// THE COUPLED PAIR'S TERM OF A PRODUCT, on any grid (AMGPair): y[own] += ifc*sum_k w[k]*x[nbr[k]] over a face's
+// slots -- lduMatrix::Amul's interface update, cyclicAMIFvPatchField::updateInterfaceMatrix on the fine grid.
+// `off` null is a one-to-one pair: one slot a face, weight 1. Atomic, as the fine product's own interface
+// kernels are: a cell may own several of the pair's faces.
+template <typename T>
+__global__
+void pairAddT(
+    int n,
+    const label* __restrict__ own,
+    const label* __restrict__ nbr,
+    const label* __restrict__ off,
+    const T* __restrict__ w,
+    const T* __restrict__ ifc,
+    const T* __restrict__ x,
+    T* __restrict__ y)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    T s = T(0);
+    if (off)
+    {
+        for (int k = off[i]; k < off[i+1]; ++k)
+        {
+            s += w[k]*x[nbr[k]];
+        }
+    }
+    else
+    {
+        s = x[nbr[i]];
+    }
+    atomicAdd(&y[own[i]], ifc[i]*s);
+}
+// the control's negation (BRAE_CONTROL_AMG_PAIR_WRONG_SIGN)
+__global__
+void pairNegateK(
+    int n,
+    scalar* __restrict__ ifc)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) ifc[i] = -ifc[i];
+}
+// a grid's cell of each pair entry, from the grid above's: coarse[i] = map[fine[i]]
+__global__
+void pairMapK(
+    int n,
+    const label* __restrict__ map,
+    const label* __restrict__ fine,
+    label* __restrict__ coarse)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) coarse[i] = map[fine[i]];
+}
+// the pair's entries of the coarsest grid's dense matrix: dense[own][nbr] += ifc*w, into a zeroed n*n
+__global__
+void pairDenseK(
+    int n,
+    const label* __restrict__ own,
+    const label* __restrict__ nbr,
+    const label* __restrict__ off,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ ifc,
+    int nC,
+    scalar* __restrict__ dense)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (!off)
+    {
+        atomicAdd(&dense[own[i]*nC + nbr[i]], ifc[i]);
+        return;
+    }
+    for (int k = off[i]; k < off[i+1]; ++k)
+    {
+        atomicAdd(&dense[own[i]*nC + nbr[k]], ifc[i]*w[k]);
+    }
+}
+
 // Energy-minimising coarse-correction scale (OF GAMG): alpha = (r . c)/(c . Ac), guarded since c.Ac = ||c||_A^2 >= 0.
 __global__
 void scaleFactorK(
@@ -144,6 +221,151 @@ void scaleFactorK(
     }
 }
 } // anon
+
+void amgCouplePair(
+    AMGData& amg,
+    const DeviceLduView& A)
+{
+    AMGPair& p = amg.pair;
+    static const bool uncoupled = std::getenv("BRAE_CONTROL_AMG_PAIR_UNCOUPLED") != nullptr;
+    const int n = A.nCyc > 0 ? A.nCyc : A.nAmi;
+    const int G = amg.nLevels();
+    if (n == 0 || uncoupled || amg.saSmooth || G == 0)
+    {
+        if (p.n != 0)
+        {
+            p.n = 0;
+            ++p.epoch;
+        }
+        return;
+    }
+    if (A.nCyc > 0 && A.nAmi > 0)
+    {
+        throw std::runtime_error(
+            "brae AMG: the matrix view carries a one-to-one pair AND an AMI stencil. deviceLduViewPair hands "
+            "the pair in one form or the other; the hierarchy carries one.");
+    }
+    const bool stencil = A.nAmi > 0;
+    int nSlots = n;
+    if (stencil)
+    {
+        label last = 0;
+        cudaCheck(cudaMemcpy(&last, A.amiOff + n, sizeof(label), cudaMemcpyDeviceToHost), "pair slots");
+        nSlots = static_cast<int>(last);
+    }
+    static bool said = false;
+    if (!said)
+    {
+        said = true;
+        std::printf("  AMG-PCG: the matrix's coupled pair (%d faces, %d neighbour slots) is carried on every grid "
+                    "of the hierarchy; BRAE_CONTROL_AMG_PAIR_UNCOUPLED=1 leaves the hierarchy without it\n",
+                    n, nSlots);
+    }
+    // the buffers a captured cycle reads: when one moves, the cycle is captured again (AMGPair::epoch)
+    bool moved = p.n == 0 || p.stencil != stencil || static_cast<int>(p.own.size()) != G + 1;
+    p.own.resize(static_cast<std::size_t>(G) + 1);
+    p.nbr.resize(static_cast<std::size_t>(G) + 1);
+    const auto sized = [&moved](
+        auto& buffer,
+        std::size_t count)
+    {
+        if (buffer.size() == count) return;
+        buffer.resize(count);
+        moved = true;
+    };
+    for (int g = 0; g <= G; ++g)
+    {
+        sized(p.own[static_cast<std::size_t>(g)], static_cast<std::size_t>(n));
+        sized(p.nbr[static_cast<std::size_t>(g)], static_cast<std::size_t>(nSlots));
+    }
+    sized(p.ifc, static_cast<std::size_t>(n));
+    sized(p.ifcF, static_cast<std::size_t>(n));
+    sized(p.off, stencil ? static_cast<std::size_t>(n) + 1 : 0);
+    sized(p.w, stencil ? static_cast<std::size_t>(nSlots) : 0);
+    sized(p.wF, stencil ? static_cast<std::size_t>(nSlots) : 0);
+    // the fine pair, copied: the view's arrays are the caller's and may move between solves
+    const std::size_t nb = static_cast<std::size_t>(n);
+    const std::size_t ns = static_cast<std::size_t>(nSlots);
+    cudaCheck(cudaMemcpyAsync(p.own[0].data(), stencil ? A.amiOwn : A.cycOwn, nb*sizeof(label),
+                              cudaMemcpyDeviceToDevice, cudaStreamPerThread), "pair own");
+    cudaCheck(cudaMemcpyAsync(p.nbr[0].data(), stencil ? A.amiNbr : A.cycNbr, ns*sizeof(label),
+                              cudaMemcpyDeviceToDevice, cudaStreamPerThread), "pair nbr");
+    cudaCheck(cudaMemcpyAsync(p.ifc.data(), stencil ? A.amiIfc : A.cycCoeff, nb*sizeof(scalar),
+                              cudaMemcpyDeviceToDevice, cudaStreamPerThread), "pair coefficients");
+    // BRAE_CONTROL_AMG_PAIR_WRONG_SIGN=1 is a gate's CONTROL, deliberately wrong: the hierarchy's copy of the
+    // coefficients negated, so every grid's cycle couples the two sides with the opposite sign to the matrix's.
+    static const bool wrongSign = std::getenv("BRAE_CONTROL_AMG_PAIR_WRONG_SIGN") != nullptr;
+    if (wrongSign)
+    {
+        pairNegateK<<<nBlocks(n),TPB>>>(n, p.ifc.data());
+    }
+    cast_<scalar,float><<<nBlocks(n),TPB>>>(n, p.ifc.data(), p.ifcF.data());
+    if (stencil)
+    {
+        cudaCheck(cudaMemcpyAsync(p.off.data(), A.amiOff, (nb + 1)*sizeof(label), cudaMemcpyDeviceToDevice,
+                                  cudaStreamPerThread), "pair offsets");
+        cudaCheck(cudaMemcpyAsync(p.w.data(), A.amiW, ns*sizeof(scalar), cudaMemcpyDeviceToDevice,
+                                  cudaStreamPerThread), "pair weights");
+        cast_<scalar,float><<<nBlocks(nSlots),TPB>>>(nSlots, p.w.data(), p.wF.data());
+    }
+    // ...and mapped down the grids
+    for (int g = 1; g <= G; ++g)
+    {
+        const label* map = amg.level[static_cast<std::size_t>(g) - 1].map.data();
+        pairMapK<<<nBlocks(n),TPB>>>(n, map, p.own[static_cast<std::size_t>(g) - 1].data(),
+                                     p.own[static_cast<std::size_t>(g)].data());
+        pairMapK<<<nBlocks(nSlots),TPB>>>(nSlots, map, p.nbr[static_cast<std::size_t>(g) - 1].data(),
+                                          p.nbr[static_cast<std::size_t>(g)].data());
+    }
+    cudaCheck(cudaGetLastError(), "pair mapped down the grids");
+    // the coarsest grid's direct solve: the factorisation amgGalerkin made is of the LDU matrix alone
+    const int nc = amg.level.back().nCoarse;
+    if (amg.coarseLUn == nc && nc > 0)
+    {
+        const std::size_t nn = static_cast<std::size_t>(nc)*static_cast<std::size_t>(nc);
+        p.dense.resize(nn);
+        zeroT<scalar><<<nBlocks(static_cast<int>(nn)),TPB>>>(static_cast<int>(nn), p.dense.data());
+        pairDenseK<<<nBlocks(n),TPB>>>(n, p.own[static_cast<std::size_t>(G)].data(),
+                                       p.nbr[static_cast<std::size_t>(G)].data(), stencil ? p.off.data() : nullptr,
+                                       p.w.data(), p.ifc.data(), nc, p.dense.data());
+        cudaCheck(cudaGetLastError(), "pair on the coarsest grid");
+        deviceCoarseLUFactor(amg.level.back().coarseView(), amg.coarseLU, amg.coarsePiv, p.dense.data());
+    }
+    p.n = n;
+    p.nSlots = nSlots;
+    p.stencil = stencil;
+    if (moved) ++p.epoch;
+}
+
+namespace {
+
+// the pair's term added to a product on grid g, in the cycle's precision; nothing where there is no pair
+inline void pairAdd(
+    const AMGData& amg,
+    int g,
+    const scalar* x,
+    scalar* y)
+{
+    const AMGPair& p = amg.pair;
+    if (p.n == 0) return;
+    const std::size_t gg = static_cast<std::size_t>(g);
+    pairAddT<scalar><<<nBlocks(p.n),TPB>>>(p.n, p.own[gg].data(), p.nbr[gg].data(),
+                                           p.stencil ? p.off.data() : nullptr, p.w.data(), p.ifc.data(), x, y);
+}
+inline void pairAdd(
+    const AMGData& amg,
+    int g,
+    const float* x,
+    float* y)
+{
+    const AMGPair& p = amg.pair;
+    if (p.n == 0) return;
+    const std::size_t gg = static_cast<std::size_t>(g);
+    pairAddT<float><<<nBlocks(p.n),TPB>>>(p.n, p.own[gg].data(), p.nbr[gg].data(),
+                                          p.stencil ? p.off.data() : nullptr, p.wF.data(), p.ifcF.data(), x, y);
+}
+
+}   // namespace
 
 bool amgSinglePrecisionCycle(const AMGData& amg)
 {
@@ -171,6 +393,10 @@ void vcycleAt(
 {
     const int n = Ag.nCells;
     if (asymmetric) amgRefuseAsymmetric(useChebyshev(), amg.corrScaling, amg.saSmooth);
+    // A COUPLED PAIR (AMGPair): on the finest grid deviceAmul applies it from the caller's view; on every coarser
+    // grid the view is the hierarchy's own and holds internal faces only, so each product there is followed by
+    // pairAdd. The weighted-Jacobi sweeps and the residual carry it; the Gauss-Seidel and Chebyshev smoothers'
+    // own products, and a coarsest grid solved without its dense LU, do not.
     // x starts at zero. A grid whose pre-smooth is weighted Jacobi writes its first sweep straight from b
     // (smoothFromZeroT: the sweep's own expression with the two zeros written in, so its result to the bit) and
     // needs neither the zeroing nor the product of a zero vector -- what vcycleAtF has done since the pressure
@@ -208,6 +434,7 @@ void vcycleAt(
         else for (int s = 0; s < NCOARSE; ++s)
         {
             deviceAmul(Ag, xg, amg.vAx[g]);
+            if (g > 0) pairAdd(amg, g, xg.data(), amg.vAx[g].data());
             smoothT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
         }
         amgSplit::lap(g, amgSplit::coarsest);
@@ -224,10 +451,12 @@ void vcycleAt(
             continue;
         }
         deviceAmul(Ag, xg, amg.vAx[g]);
+        if (g > 0) pairAdd(amg, g, xg.data(), amg.vAx[g].data());
         smoothT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
     }
     amgSplit::lap(g, amgSplit::smoothPre);
     deviceAmul(Ag, xg, amg.vAx[g]);
+    if (g > 0) pairAdd(amg, g, xg.data(), amg.vAx[g].data());
     residualT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), amg.vR[g].data());
     amgSplit::lap(g, amgSplit::residual);
     const int nc = amg.level[g].nCoarse;
@@ -252,6 +481,7 @@ void vcycleAt(
         if (amg.saSmooth) prolongToSparseK<<<nBlocks(n),TPB>>>(n, Lg.Prow.data(), Lg.Pcol.data(), Lg.Pval.data(), amg.vX[g+1].data(), amg.vPc[g].data());
         else              prolongToK<<<nBlocks(n),TPB>>>(n, Lg.map.data(), amg.vX[g+1].data(), amg.vPc[g].data());  // c = P*corr
         deviceAmul(Ag, amg.vPc[g], amg.vAx[g]);                                       // Ac
+        if (g > 0) pairAdd(amg, g, amg.vPc[g].data(), amg.vAx[g].data());
         deviceDotInto(amg.vR[g], amg.vPc[g], amg.sScNum.data());                      // r . c   (energy-min, OF GAMG)
         deviceDotInto(amg.vPc[g], amg.vAx[g], amg.sScDen.data());                     // c . Ac  (= ||c||_A^2 > 0)
         scaleFactorK<<<1,1>>>(amg.sScNum.data(), amg.sScDen.data(), amg.sScAlpha.data());
@@ -269,6 +499,7 @@ void vcycleAt(
     else for (int s = 0; s < nPostSweeps(); ++s)
     {
         deviceAmul(Ag, xg, amg.vAx[g]);
+        if (g > 0) pairAdd(amg, g, xg.data(), amg.vAx[g].data());
         smoothT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
     }
     amgSplit::lap(g, amgSplit::smoothPost);
@@ -528,6 +759,8 @@ void vcycleAtF(
 {
     const int n = Ag.nCells;
     if (asymmetric) amgRefuseAsymmetric(useChebyshev(), amg.corrScaling, amg.saSmooth);
+    // A COUPLED PAIR (AMGPair): this cycle's matrices are the internal faces' on EVERY grid, the finest included,
+    // so every product is followed by pairAdd.
     // x starts at zero. A level that pre-smooths writes its first sweep straight from b (smoothFromZeroT) and
     // needs neither this nor the product of a zero vector; BRAE_CONTROL_AMG_ZERO_PRODUCT=1 forms both, as before.
     // BRAE_CONTROL_AMG_FROM_ZERO_STALE=1: the deliberately wrong control vcycleAt describes.
@@ -551,6 +784,7 @@ void vcycleAtF(
             for (int s=0;s<NCOARSE;++s)
             {
                 deviceAmul(topoG, amg.vX[g], amg.vAx[g]);
+                pairAdd(amg, g, amg.vX[g].data(), amg.vAx[g].data());
                 smoothT<scalar><<<nBlocks(n),TPB>>>(n, amg.vB[g].data(), amg.vAx[g].data(), topoG.diag, amg.vX[g].data());
             }
         }
@@ -566,10 +800,12 @@ void vcycleAtF(
             continue;
         }
         amgSpmvF(amg, g, Ag, xg, amg.vAxF[g].data());
+        pairAdd(amg, g, xg, amg.vAxF[g].data());
         smoothT<float><<<nBlocks(n),TPB>>>(n, bg, amg.vAxF[g].data(), Ag.diag, xg);
     }
     amgSplit::lap(g, amgSplit::smoothPre);
     amgSpmvF(amg, g, Ag, xg, amg.vAxF[g].data());
+    pairAdd(amg, g, xg, amg.vAxF[g].data());
     residualT<float><<<nBlocks(n),TPB>>>(n, bg, amg.vAxF[g].data(), amg.vRF[g].data());
     amgSplit::lap(g, amgSplit::residual);
     const AMGLevel& Lg = amg.level[g];
@@ -602,6 +838,7 @@ void vcycleAtF(
     for (int s=0; s<nPostSweeps(); ++s)    // BRAE_NPOST; NPOST by default
     {
         amgSpmvF(amg, g, Ag, xg, amg.vAxF[g].data());
+        pairAdd(amg, g, xg, amg.vAxF[g].data());
         smoothT<float><<<nBlocks(n),TPB>>>(n, bg, amg.vAxF[g].data(), Ag.diag, xg);
     }
     amgSplit::lap(g, amgSplit::smoothPost);
@@ -666,7 +903,7 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
         const LduF A0 = lduF(A, amg.fDiag[0], amg.fUpper[0], amg.fLower[0]);
         AMGGraphCache& gcf = *amg.gcacheF;
         if (!gcf.exec || gcf.key != A.diag || gcf.keyEpoch != deviceReductionScratchEpoch()
-            || gcf.keyAddressingId != A.addressingId)
+            || gcf.keyAddressingId != A.addressingId || gcf.keyPairEpoch != amg.pair.epoch)
         {
             if (gcf.exec)  { cudaGraphExecDestroy(gcf.exec);  gcf.exec  = nullptr; }
             if (gcf.graph) { cudaGraphDestroy(gcf.graph);     gcf.graph = nullptr; }
@@ -679,6 +916,7 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
             gcf.key = A.diag;
             gcf.keyEpoch = deviceReductionScratchEpoch();
             gcf.keyAddressingId = A.addressingId;
+            gcf.keyPairEpoch = amg.pair.epoch;
         }
         cudaCheck(cudaGraphLaunch(gcf.exec, cudaStreamPerThread), "amgF graph launch");
     }
@@ -686,7 +924,7 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
     {
         AMGGraphCache& gc = *amg.gcache;
         if (!gc.exec || gc.key != A.diag || gc.keyEpoch != deviceReductionScratchEpoch()
-            || gc.keyAddressingId != A.addressingId)
+            || gc.keyAddressingId != A.addressingId || gc.keyPairEpoch != amg.pair.epoch)
         {
             if (gc.exec)  { cudaGraphExecDestroy(gc.exec);  gc.exec  = nullptr; }
             if (gc.graph) { cudaGraphDestroy(gc.graph);     gc.graph = nullptr; }
@@ -697,6 +935,7 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
             gc.key = A.diag;
             gc.keyEpoch = deviceReductionScratchEpoch();
             gc.keyAddressingId = A.addressingId;
+            gc.keyPairEpoch = amg.pair.epoch;
         }
         cudaCheck(cudaGraphLaunch(gc.exec, cudaStreamPerThread), "amg graph launch");
     }

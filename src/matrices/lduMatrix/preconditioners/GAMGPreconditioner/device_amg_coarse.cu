@@ -373,7 +373,8 @@ void coarseLUFactorKernel(
     const scalar* __restrict__ lower,
     scalar* __restrict__ lu,
     int* __restrict__ piv,
-    bool inShared)
+    bool inShared,
+    const scalar* __restrict__ extra)
 {
     const int tid = threadIdx.x;
     __shared__ scalar shPiv;      // the chosen pivot's value, and the scale below
@@ -403,6 +404,12 @@ void coarseLUFactorKernel(
         }
     }
     __syncthreads();
+    // ...and the entries the LDU form does not hold: a coupled pair's, on this grid (AMGPair::dense)
+    if (extra)
+    {
+        for (int i = tid; i < n*n; i += blockDim.x) A[i] += extra[i];
+        __syncthreads();
+    }
     if (tid == 0)
     {
         scalar m = 0.0;
@@ -634,7 +641,8 @@ void deviceCoarseBiCGStab(
 void deviceCoarseLUFactor(
     const DeviceLduView& cv,
     DeviceBuffer<scalar>& lu,
-    DeviceBuffer<int>& piv)
+    DeviceBuffer<int>& piv,
+    const scalar* extra)
 {
     const int nC = cv.nCells;
     // The trailing update is (n-k)^2 elements wide at the top of the loop, so take the whole block
@@ -649,7 +657,7 @@ void deviceCoarseLUFactor(
     const bool inShared = shBytes <= 48u*1024u;
     coarseLUFactorKernel<<<1, bs, inShared ? shBytes : 0, cudaStreamPerThread>>>(nC,
         cv.diag, cv.ownerStart, cv.nei, cv.upper, cv.losortStart, cv.losort, cv.owner, cv.lower,
-        lu.data(), piv.data(), inShared);
+        lu.data(), piv.data(), inShared, extra);
     cudaCheck(cudaGetLastError(), "coarseLUFactor launch");
 }
 

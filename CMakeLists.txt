@@ -3306,7 +3306,8 @@ set_tests_properties(interfoam_dambreak_clock_vs_openfoam PROPERTIES
 file(GLOB BRAE_WRITE_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_write
      ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_write/*/*.sh)
 list(FILTER BRAE_WRITE_TESTS EXCLUDE REGEX "/_common\\.sh$")
-set(BRAE_WRITE_SLOW_FILES "^ami/|^refine/mapping|^amg_pcg/dtchull|^identity/wave_device")
+set(BRAE_WRITE_SLOW_FILES
+    "^ami/|^refine/mapping|^amg_pcg/dtchull|^amg_pcg/coupled_pair|^amg_pcg/pcorr_across_pair|^identity/wave_device")
 foreach(rel ${BRAE_WRITE_TESTS})
     string(REPLACE ".sh" "" name ${rel})
     string(REPLACE "/" "_" name ${name})

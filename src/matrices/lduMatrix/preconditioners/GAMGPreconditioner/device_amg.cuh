@@ -28,6 +28,8 @@ struct AMGGraphCache {
     // process differing from the first), fixed there by stamping the addressing --
     // nextDeviceAddressingId(), device_mesh.cuh -- and compared here for the same reason.
     long long keyAddressingId = 0;
+    // ...and the coupled pair's buffers the cycle read at capture (AMGPair::epoch)
+    unsigned long long keyPairEpoch = 0;
     ~AMGGraphCache();
 };
 
@@ -58,6 +60,7 @@ struct PCGGraphCache {
     // graph replay against the first solve's pointer: RAS/damBreakPorousBaffle, phi 5.6e-03 from OpenFOAM.
     DeviceBuffer<scalar> gCycCoeff, gCycJump, gAmiIfc;
     int keyNCyc = -1; int keyNAmi = -1; bool keyJump = false;
+    unsigned long long keyPairEpoch = 0;      // AMGPair::epoch at capture: the cycle's pair buffers
     const void* keyCycOwn = nullptr; const void* keyCycNbr = nullptr;
     const void* keyAmiOwn = nullptr; const void* keyAmiOff = nullptr;
     const void* keyAmiNbr = nullptr; const void* keyAmiW = nullptr;
@@ -150,6 +153,34 @@ struct GridColoring {
     mutable DeviceBuffer<scalar> bP, psiP;     // nCells: gathered per sweep
 };
 
+// THE MATRIX'S COUPLED PAIR (cyclic, cyclicAMI) ON EVERY GRID. The hierarchy is built on internal faces, so until
+// 2026-10-04 its cycle preconditioned the two sides of a pair as uncoupled blocks and left the Krylov loop
+// everything that crosses it. MEASURED on RAS/mixerVesselAMI (894,950 cells, every solve pinned at 1e-13),
+// p_rgh's first four solves: 482 409 467 398 iterations, and 66 62 65 63 for the same hierarchy on the operator
+// WITHOUT the pair -- the pair was the difference.
+// With aggregation (a piecewise-constant prolongator) the Galerkin coarse pair is the fine one with its cells
+// mapped: A_c[I][J] = sum of A[i][j] over i in I, j in J, and a cell of one side never shares an aggregate with
+// one of the other (aggregates follow internal faces). So grid g holds, for each interface face, the grid-g cell
+// of its own cell and of each neighbour slot; the stencil's offsets, its weights and the coefficients are the
+// fine pair's own. The pair's diagonal part is already in the folded diagonal amgGalerkin coarsens.
+// Refreshed at EVERY solve by amgCouplePair: the coefficients are the solve's, and a rotating AMI changes its
+// stencil at every step.
+struct AMGPair
+{
+    int n = 0;                                  // interface faces; 0 = this solve's matrix has no pair
+    int nSlots = 0;                             // neighbour slots: n one-to-one, the stencil's entries for an AMI
+    bool stencil = false;                       // an AMI's weighted stencil (off, w); else one slot of weight 1
+    std::vector<DeviceBuffer<label>> own;       // [g][face]: the grid-g cell of the face's own cell
+    std::vector<DeviceBuffer<label>> nbr;       // [g][slot]: the grid-g cell of the slot's neighbour cell
+    DeviceBuffer<label> off;                    // stencil: face -> its slots, n + 1
+    DeviceBuffer<scalar> w;                     // stencil weights, and in single precision
+    DeviceBuffer<float> wF;
+    DeviceBuffer<scalar> ifc;                   // this solve's coefficient a face, and in single precision
+    DeviceBuffer<float> ifcF;
+    DeviceBuffer<scalar> dense;                 // the coarsest grid's pair entries, row-major, for its dense LU
+    unsigned long long epoch = 0;               // moves when a buffer above does: what a captured cycle compares
+};
+
 struct AMGData {
     int nFine = 0;
     std::vector<AMGLevel> level;                                // level[k]: grid k -> grid k+1 (+ grid k+1's matrix)
@@ -188,6 +219,7 @@ struct AMGData {
     // capture. coarseLUn is the level size it was factorised for, and 0 when there is no factorisation
     // (level too big, flag off, or amgGalerkin not yet run): the V-cycle dispatch tests it against the
     // grid it is about to solve and falls through to the iterative coarsest solvers when they differ.
+    AMGPair pair;                                               // the solve's coupled pair on every grid
     DeviceBuffer<scalar> coarseLU;                              // n*n row-major, L (unit diagonal) and U in place
     DeviceBuffer<int>    coarsePiv;                             // n row interchanges, in factorisation order
     int coarseLUn = 0;
@@ -362,6 +394,12 @@ void vcycleAt(int g, AMGData& amg, const DeviceLduView& Ag, const DeviceBuffer<s
 // what to set instead. Exposed (rather than left inside vcycleAt) so a test can exercise each one; vcycleAt
 // calls exactly this with (useChebyshev(), amg.corrScaling, amg.saSmooth). A no-op when nothing is set.
 void amgRefuseAsymmetric(bool chebyshev, bool corrScaling, bool smoothedAggregation);
+
+// The pair of this solve's matrix `A` carried onto every grid of `amg` (AMGPair), and the coarsest grid's dense
+// factorisation redone with the pair's entries in it. Called by deviceAMGPCG at every solve, after the caller's
+// amgGalerkin and outside every graph capture. A view without a pair clears it. Not carried, as before: a
+// smoothed-aggregation hierarchy (its prolongator is not an aggregate map) and BRAE_CONTROL_AMG_PAIR_UNCOUPLED=1.
+void amgCouplePair(AMGData& amg, const DeviceLduView& A);
 
 // WHICH CYCLE a solve's preconditioner runs: the single-precision one (vcycleAtF) unless BRAE_AMG_FP32=0 or the
 // smoother is one only the double-precision cycle has (multicolour GS, Chebyshev). THE ONE PLACE that decides
