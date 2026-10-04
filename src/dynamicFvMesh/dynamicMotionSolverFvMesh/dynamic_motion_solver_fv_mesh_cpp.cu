@@ -2,6 +2,7 @@
 #include "dynamic_motion_solver_fv_mesh_cpp.cuh"
 #include "foam_dict.cuh"
 #include "mrf_read.cuh"
+#include <optional>
 #include <cmath>
 #include <filesystem>
 #include <stdexcept>
@@ -386,6 +387,8 @@ void DynamicMotionSolverFvMesh::update(
 
     delete timedPoints;
     interPhase::Nested timedMove("mesh: swept volumes, movePoints and geometry");
+    std::optional<interPhase::Nested> movePart;
+    movePart.emplace("geometry: the old volumes and old points kept");
     // dynamicMotionSolverListFvMesh::update (:176-183): the list sums each solver's displacement from
     // the CURRENT points and moves to points() + disp -- fl(p + fl(q - p)), not q. The two agree whenever
     // q - p is exact, and differ by an ulp near zero; every step of a refining mesh with a motion takes
@@ -420,6 +423,7 @@ void DynamicMotionSolverFvMesh::update(
     haveTimeIndex_ = true;
 
     // fvGeometryScheme::setMeshPhi
+    movePart.emplace("geometry: the swept volumes (meshPhi)");
     const scalar rdt = 1.0/deltaT;
     const label nIf = m.nInternalFaces();
     for (label facei = 0; facei < nIf; ++facei)
@@ -440,8 +444,11 @@ void DynamicMotionSolverFvMesh::update(
     }
 
     // ...and the geometry from the new points, each patch's copy in place
+    movePart.emplace("geometry: the points moved (movePoints)");
     m.movePoints(std::move(newPoints));
+    movePart.emplace("geometry: face centres and areas, cell centres and volumes, interpolation");
     g.build(m);
+    movePart.emplace("geometry: the patches rebuilt (buildPatches)");
     // ...WITH THE cyclicACMI EXEMPTION THE CALLER ALREADY HELD. buildPatches refuses a cyclicACMI
     // unless it is told the caller is the OF-mirror interFoam loop, which couples the pair itself
     // (fv_patch.cu, `mirrorACMI`). A list that already HOLDS a cyclicACMI patch was built with that
@@ -469,6 +476,7 @@ void DynamicMotionSolverFvMesh::update(
     {
         agglomeration->built = false;
     }
+    movePart.reset();
 }
 
 void DynamicMotionSolverFvMesh::topoChanged(

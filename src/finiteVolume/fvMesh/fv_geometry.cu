@@ -1,3 +1,4 @@
+#include "inter_phase_time.cuh"
 #include "fv_geometry.cuh"
 #include <stdexcept>
 #include <cmath>
@@ -160,6 +161,7 @@ void FvGeometry::makeInterpolation(const PrimitiveMesh& m)
 
 void FvGeometry::buildFaceGeometry(const PrimitiveMesh& m)
 {
+    interPhase::Nested timed("FvGeometry: face centres and areas");
     makeFaceCentresAndAreas(m);
     areaScaled_ = false;          // areas are raw again: a fresh scale is now legal
     rawArea_.clear();
@@ -167,7 +169,11 @@ void FvGeometry::buildFaceGeometry(const PrimitiveMesh& m)
 
 void FvGeometry::buildCellGeometry(const PrimitiveMesh& m)
 {
-    makeCellCentresAndVols(m);
+    {
+        interPhase::Nested timed("FvGeometry: cell centres and volumes");
+        makeCellCentresAndVols(m);
+    }
+    interPhase::Nested timed("FvGeometry: weights, deltaCoeffs and correction vectors");
     makeInterpolation(m);
 }
 

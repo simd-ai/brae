@@ -3418,6 +3418,8 @@ RunReport runInterFoamDevice(
                                     writer ? &cpDiv : nullptr);
                 }
                 interPhase::Nested timedRefresh("mesh: the device refresh after it (geometry, fluxes, boundary)");
+                std::optional<interPhase::Nested> refreshPart;
+                refreshPart.emplace("refresh: the continuity error and the old volumes up");
                 // correctPhi.H:11 -- the mesh update's CorrectPhi is host code on this arm too
                 if (writer && !cpDiv.empty())
                 {
@@ -3444,8 +3446,10 @@ RunReport runInterFoamDevice(
                     dV00.copyFrom(dyn->V00());
                     C.V00 = &dV00;
                 }
+                refreshPart.emplace("refresh: the device mesh's geometry (refreshDeviceMeshGeometry)");
                 refreshDeviceMeshGeometry(dm, m, g, fvp);
                 ++meshGeometryEpoch;
+                refreshPart.emplace("refresh: the pair, |Sf|, gh and ghf up");
                 // ...and THE PAIR: the host stage above has recomputed every cyclicAMI's weights on the
                 // moved points and coupled its patches again (cyclicAMIFvPatch::Interfaces::update)
                 if (dCyc.n > 0)
@@ -3473,7 +3477,9 @@ RunReport runInterFoamDevice(
                 }
                 // the patch geometry moved with the cells, and dbU carries the patch deltas and
                 // normals every boundary evaluation reads
+                refreshPart.emplace("refresh: U's device boundary built");
                 dbU = buildDeviceVectorBoundary(f.U, fvp, g);
+                refreshPart.emplace("refresh: the turbulence closure's distances");
                 // EVERY DISTANCE THE CLOSURE HOLDS WAS MEASURED ON THE OLD MESH. OpenFOAM's wallDist
                 // and nearWallDist are MeshObjects that fvMesh::movePoints updates; this loop ran
                 // neither, on either closure path, so kOmegaSST's F1/F2 blended on the distance the
@@ -3493,6 +3499,7 @@ RunReport runInterFoamDevice(
                 // host's phi unconditionally overwrote the flux THIS loop had just computed with a
                 // stale copy at every outer corrector after the first, which is why carrying meshPhi
                 // into the pressure step changed no digit until this guard went in.
+                refreshPart.emplace("refresh: phi and nHatf up");
                 if (f.correctPhi)
                 {
                     dPhiI.copyFrom(f.phi.internal);
@@ -3515,6 +3522,7 @@ RunReport runInterFoamDevice(
                 }
                 // ...and THE MESH FLUX the move produced, which the pressure corrector makes phi
                 // relative to (fvc::makeRelative, pEqn.H:73). Over the full face array, as phi is.
+                refreshPart.emplace("refresh: the mesh flux up");
                 dMeshPhi.copyFrom(fullFace(fvcMeshPhi(*dyn, f), fvp));
                 C.meshPhiAll = &dMeshPhi;
                 if (dCyc.n > 0)
@@ -3522,6 +3530,7 @@ RunReport runInterFoamDevice(
                     dMeshPhiIf.copyFrom(coupledFace(fvcMeshPhi(*dyn, f), cyclics));
                     C.meshPhiIf = &dMeshPhiIf;
                 }
+                refreshPart.reset();
             };
             if (moveThisCorrector && !refineAndMove)
             {
