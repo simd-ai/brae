@@ -1,5 +1,6 @@
 // interFoam on an adaptive mesh. See inter_amr_cpp.cuh.
 #include "inter_amr_cpp.cuh"
+#include "inter_phase_time.cuh"
 #include "foam_dict.cuh"
 #include "mesh_cell_cells_cpp.cuh"
 #include "primitive_patch_cpp.cuh"
@@ -9,6 +10,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -467,6 +469,9 @@ bool interAmrUpdate(
     // The fields the change carries. alpha1, U and p_rgh go whole -- cells and patch fields -- and the
     // three surface fields go through the face mapper: phi and rhoPhi are FLUXES and are oriented, nHatf
     // carries an area and is not.
+    // BRAE_INTER_PHASE_TIME: this stage part by part
+    std::optional<interPhase::Nested> amrPart;
+    amrPart.emplace("amr: the carried state gathered (a copy of every field, every step)");
     amr.state.carriedScalarFields.clear();
     amr.state.carriedVectorFields.clear();
     amr.state.surfaceScalars.clear();
@@ -718,11 +723,13 @@ bool interAmrUpdate(
             "mesh. ddtCorr(U, phi, Uf) takes the Uf branch when the mesh is dynamic, so this level should "
             "never have been created -- and nothing here maps it.");
 
+    amrPart.emplace("amr: refineUpdate, whole");
     const dynamicRefine::RefineUpdateStep step =
         dynamicRefine::refineUpdate(amr.state, amr.controls, f.alpha1.internal, amr.startTimeIndex + timeIndex);
     amr.nRefined = static_cast<label>(step.cellsToRefine.size());
     amr.nUnrefined = static_cast<label>(step.pointsToUnrefine.size());
     if (!step.hasChanged) return false;
+    amrPart.emplace("amr: the mapped fields handed back to the solver");
     amr.topoChanged = true;
 
     {
@@ -944,8 +951,10 @@ bool interAmrUpdate(
     // ...and the mesh the caller's fields reference. The patches are assigned IN PLACE by the driver, so
     // `*mm.patches` is already the new one; the mesh and geometry are copied into the caller's objects for
     // the same reason -- every FvPatch, every patch field and every operator reads those.
+    amrPart.emplace("amr: the solver's mesh copied and its geometry built (FvGeometry::build)");
     *mm.m = amr.state.m;
     mm.g->build(*mm.m);
+    amrPart.emplace("amr: the solver's patches assigned");
     // ELEMENT BY ELEMENT, and the count checked: a whole-vector assignment of a DIFFERENT size
     // reallocates, and every patch field in the solver holds a `const FvPatch&` into this buffer. It
     // happens to be safe at equal sizes -- libstdc++ assigns in place then -- and that is exactly the
@@ -1007,6 +1016,9 @@ void interAfterMeshChange(
     gamgCache.built = false;
 
     // gh and ghf off the NEW centres (interFoam.C:130-131), assigned rather than written into
+    // BRAE_INTER_PHASE_TIME: this stage part by part
+    std::optional<interPhase::Nested> afterPart;
+    afterPart.emplace("after: gh and ghf");
     ghField(f.g, f.ghRefValue, g.C(), f.gh);
     {
         std::vector<vector> Cf(g.Cf().begin(), g.Cf().begin() + m.nInternalFaces());
@@ -1030,6 +1042,7 @@ void interAfterMeshChange(
     // change (fvOptionListTemplates.C:43-80 calls isActive() immediately before addSup), and every point
     // between the change and UEqn is arithmetically the same. That makes the placement a choice; it is
     // stated rather than left to be read off.
+    afterPart.emplace("after: fvOptions and MRF zones re-selected");
     if (!f.fvOptions.empty())
     {
         // A GATE'S CONTROL: keep the labels each selection gave last time instead of resolving it again.
@@ -1109,6 +1122,7 @@ void interAfterMeshChange(
         }
     }
 
+    afterPart.emplace("after: the closure's wall distance and filter width (updateMeshInterTurbulence)");
     // THE TURBULENCE CLOSURE'S MESH-DEPENDENT STATE. The FIELDS were mapped by interAmrUpdate; what is
     // left is what OpenFOAM recomputes rather than maps -- the cell wall distance kOmegaSST's F1 and F2
     // blend on, whose MeshObject forces its own latch on a topology change, and the LES filter width.
@@ -1150,6 +1164,7 @@ void interAfterMeshChange(
     // relative to. `meshChanging` is TRUE, which is what runs correctUphiBCs inside CorrectPhi -- the
     // re-evaluation of every U patch that FIXES a value, and phi_b = U_b & Sf_b on those patches.
     // ...and the control that leaves the MAPPED flux in place, which is the defect this half fixes
+    afterPart.emplace("after: the flux from Uf and CorrectPhi");
     const bool skipCorrectPhi = (std::getenv("BRAE_CONTROL_AMR_NO_CORRECTPHI") != nullptr);
     if (skipCorrectPhi)
         std::printf("  *** CONTROL MODE: the flux is left as the mapper wrote it -- no Sf & Uf rebuild "
@@ -1194,6 +1209,7 @@ void interAfterMeshChange(
     }
 
     // the mixture from the MAPPED alpha1 (mixture.correct()), every one of these assigning its own result
+    afterPart.emplace("after: the mixture, p and the reference cell");
     f.alpha2.assign(nC, scalar(0));
     for (std::size_t c = 0; c < nC; ++c) f.alpha2[c] = scalar(1) - f.alpha1.internal[c];
     cpu::twoPhase::mixtureRho(f.alpha1.internal, f.alpha2, f.mixture.phases, f.rho);
@@ -1228,6 +1244,7 @@ void interAfterMeshChange(
 
     // ...and the interface: nHatf and K are mapped, and then rebuilt on the new geometry, which is what
     // mixture.correct() does last -- on the MOVED mesh, by the motion's block, when one follows
+    afterPart.emplace("after: the curvature (calculateK)");
     if (!motionFollows)
     {
         interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, f.nHatf, f.K);

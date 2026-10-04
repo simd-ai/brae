@@ -1,4 +1,5 @@
 #include "dynamic_refine_fv_mesh_cpp.cuh"
+#include "inter_phase_time.cuh"
 
 #include "foam_token_reader.cuh"
 #include "fv_geometry.cuh"
@@ -7,6 +8,7 @@
 #include "primitive_patch_cpp.cuh"
 #include "remove_faces_cpp.cuh"
 #include <algorithm>
+#include <optional>
 #include <filesystem>
 #include <cmath>
 #include <stdexcept>
@@ -1912,16 +1914,25 @@ void buildAddressing(
     const PrimitiveMesh& m,
     StepAddressing&      a)
 {
+    // BRAE_INTER_PHASE_TIME: list by list. MEASURED on damBreakWithObstacle (42k to 91k cells): this routine is
+    // called at every step and again after each refinement and each unrefinement, and was 223 of the step's
+    // 511 ms.
+    std::optional<interPhase::Nested> part;
+    part.emplace("addressing: the geometry (FvGeometry::build)");
     a.g.build(m);
+    part.emplace("addressing: cells, pointCells, cellPoints");
     a.cells = meshCells(m);
     // pointCells through the CELLS branch, which is the one dynamicRefineFvMesh meets -- measured, and
     // the three branches sum differently
     a.pointCells = pointCellsFromCells(m, a.cells);
     a.cellPoints = cellPointsFromCells(m, a.cells);
+    part.emplace("addressing: edges (buildMeshEdges)");
     a.edges = buildMeshEdges(m);
+    part.emplace("addressing: faceEdges, edgeFaces, cellEdges");
     a.faceEdges = buildFaceEdges(m, a.edges);
     a.edgeFaces = buildEdgeFaces(m, a.faceEdges);
     a.cellEdges = buildCellEdges(a.cells, a.faceEdges);
+    part.emplace("addressing: cellCells and pointFaces");
     a.cellCells = buildCellCells(m);
     a.pointFaces = meshPointFaces(m);
 }
@@ -2393,12 +2404,17 @@ RefineUpdateStep refineUpdate(
             + std::to_string(field.size()) + " values and the mesh " + std::to_string(s.m.nCells())
             + " cells. The field must be the one on the CURRENT mesh.");
 
+    // BRAE_INTER_PHASE_TIME: the update part by part. The addressing and the selection run at EVERY step, the
+    // rest only where cells are refined or split points removed.
+    std::optional<interPhase::Nested> part;
+    part.emplace("refine: the step's addressing and patches (every step)");
     StepAddressing a;
     buildAddressing(s.m, a);
     if (s.patches.empty()) s.patches = buildPatches(s.m, a.g);
     else updatePatchesInPlace(s.patches, buildPatches(s.m, a.g));
 
     // :1357-1367. A fresh marker every step, marked from the field alone.
+    part.emplace("refine: the candidates and the cells picked (every step)");
     std::vector<char> refineCell(static_cast<std::size_t>(s.m.nCells()), char(0));
     selectRefineCandidates(c.lowerRefineLevel, c.upperRefineLevel, field, a.pointCells, s.m.nCells(),
                            refineCell);
@@ -2414,6 +2430,7 @@ RefineUpdateStep refineUpdate(
         if (!r.cellsToRefine.empty())
         {
             // ---- refine (:442-535) ----------------------------------------------------------------
+            part.emplace("refine: hexRef8's points, cells and faces (the actions)");
             cpu::polyTopoChange::TopoActions act = actionsFromMesh(s.m);
             const cpu::hexRef8::MeshView v = hexView(s.m, a);
             std::vector<std::string> patchTypes;
@@ -2432,10 +2449,12 @@ RefineUpdateStep refineUpdate(
             cpu::hexRef8::storeRefinementHistory(s.history, marks.cellAddedCells,
                                                  static_cast<label>(marks.newCellLevel.size()));
 
+            part.emplace("refine: the topology change (changeMesh)");
             cpu::polyTopoChange::ChangedMesh out;
             cpu::polyTopoChange::changeMesh(act, changeInput(s.m, s.nZones), out, r.refineMap);
 
             // hexRef8::updateMesh -- the levels and the history through the change
+            part.emplace("refine: levels, history, the field and the zones renumbered");
             s.levels.cellLevel = marks.newCellLevel;
             s.levels.pointLevel = marks.newPointLevel;
             cpu::hexRef8::updateLevels(s.levels, r.refineMap.reverseCellMap, r.refineMap.reversePointMap,
@@ -2469,10 +2488,13 @@ RefineUpdateStep refineUpdate(
             const label nOldInternalFaces = s.m.nInternalFaces();
             s.injectedPhiU = s.injectedPhiURefine;
             s.injectedPhiUBnd = s.injectedPhiURefineBnd;
+            part.emplace("refine: the mesh rebuilt, its addressing and patches");
             s.m = rebuiltMesh(s.m, out);
             buildAddressing(s.m, a);
             updatePatchesInPlace(s.patches, buildPatches(s.m, a.g));
+            part.emplace("refine: the carried fields mapped");
             mapCarriedFields(s, r.refineMap, oldV, out.nCells, a.g.V(), nOldInternalFaces, timeIndex);
+            part.emplace("refine: the marks carried over and the buffer layers");
 
             // :1391-1411. refineCell REBUILT THROUGH THE MAP: a cell stays marked if it is new, if it is
             // not its old cell's master, or if its old cell was marked. That is what keeps every child of
@@ -2506,6 +2528,7 @@ RefineUpdateStep refineUpdate(
 
     // :1419-1440. The unrefinement, which runs whether or not anything was refined.
     {
+        part.emplace("unrefine: the split points and the points picked (every step)");
         RefinementHistory hv;
         hv.parent = s.history.parent;
         hv.visibleCells = s.history.visibleCells;
@@ -2519,6 +2542,7 @@ RefineUpdateStep refineUpdate(
         if (!r.pointsToUnrefine.empty())
         {
             // ---- unrefine (:537-716) ---------------------------------------------------------------
+            part.emplace("unrefine: removeFaces' decisions and actions");
             cpu::polyTopoChange::TopoActions act = actionsFromMesh(s.m);
             const cpu::hexRef8::MeshView v = hexView(s.m, a);
             cpu::hexRef8::setUnrefinementLevels(v, s.levels, s.history, r.pointsToUnrefine);
@@ -2556,9 +2580,11 @@ RefineUpdateStep refineUpdate(
             cpu::removeFaces::setRefinementActions(rv, dec, facesToRemove, cellRegion, cellRegionMaster,
                                                    act);
 
+            part.emplace("unrefine: the topology change (changeMesh)");
             cpu::polyTopoChange::ChangedMesh out;
             cpu::polyTopoChange::changeMesh(act, changeInput(s.m, s.nZones), out, r.unrefineMap);
 
+            part.emplace("unrefine: levels, history and the zones renumbered");
             cpu::hexRef8::updateLevels(s.levels, r.unrefineMap.reverseCellMap,
                                        r.unrefineMap.reversePointMap, r.unrefineMap.cellMap,
                                        r.unrefineMap.pointMap, out.nCells,
@@ -2596,9 +2622,11 @@ RefineUpdateStep refineUpdate(
             }
             s.injectedPhiU = s.injectedPhiUUnrefine;
             s.injectedPhiUBnd = s.injectedPhiUUnrefineBnd;
+            part.emplace("unrefine: the mesh rebuilt, its addressing and patches");
             s.m = rebuiltMesh(s.m, out);
             buildAddressing(s.m, a);
             updatePatchesInPlace(s.patches, buildPatches(s.m, a.g));
+            part.emplace("unrefine: the carried fields mapped and the fluxes corrected");
             mapCarriedFields(s, r.unrefineMap, oldV, out.nCells, a.g.V(), nOldInternalFaces, timeIndex);
             // ...and then unrefine's second correction, which runs AFTER updateMesh and so after the
             // hull average (:610-689)
@@ -2633,11 +2661,15 @@ RefineUpdateStep refineUpdate(
     }
 
     // :1443-1450. Every tenth iteration, and the counter starts at 0 -- so the FIRST step compacts.
+    part.emplace("refine: the history compacted (every tenth step)");
     if ((s.nRefinementIterations % 10) == 0)
     {
         cpu::hexRef8::compactHistory(s.history);
         r.compacted = true;
     }
+    // `part` was declared before the step's addressing, so it outlives it: what is timed from here is that
+    // addressing and the step's other lists being freed as the function returns
+    part.emplace("refine: the step's addressing freed on return (every step)");
     ++s.nRefinementIterations;
 
     return r;

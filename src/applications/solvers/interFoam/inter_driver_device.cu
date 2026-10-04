@@ -3801,6 +3801,11 @@ RunReport runInterFoamDevice(
             // DeviceMesh itself and with it every schedule cache that keys on its addressingId.
             if (f.amr && f.amr->active && (outer == 0 || f.moveMeshOuterCorrectors))
             {
+                // BRAE_INTER_PHASE_TIME: the stage whole, and part by part. The download and interAmrUpdate's
+                // selection run at EVERY step; the rebuild and the upload only when the mesh changed.
+                interPhase::Nested timedStage("stage: the refinement stage, whole (down, update, rebuild, up)");
+                std::optional<interPhase::Nested> stagePart;
+                stagePart.emplace("stage: the device state down to the host (every step)");
                 // ---- DOWN: the state the mapper carries, as the device holds it now.
                 //
                 // A BUFFER THIS LOOP HAS NOT WRITTEN YET IS EMPTY, and then the HOST's copy is the one
@@ -4110,6 +4115,7 @@ RunReport runInterFoamDevice(
                     }
                     f.amr->state.points0 = &dyn->points0Ref();
                 }
+                stagePart.emplace("stage: interAmrUpdate (host)");
                 const bool changed =
                     interAmrUpdate(*f.amr, f, *mutableMesh, stepIndex, oldT, cnState);
                 // fvMesh::updateMesh as the motion sees it: the change's V0, the mesh flux recreated on the
@@ -4135,6 +4141,7 @@ RunReport runInterFoamDevice(
                     // and its pcorr solve, the mixture and the curvature. One copy, shared with the
                     // host loop, and the GAMG hierarchy un-built inside it.
                     // the GLOBAL time index, which the wall-distance schedule tests (wallDist.C:198)
+                    stagePart.emplace("stage: interAfterMeshChange (host)");
                     interAfterMeshChange(f, *mutableMesh, meshAgglomeration, meshCpc, rep,
                                          f.amr->startTimeIndex + stepIndex, /*motionFollows=*/refineAndMove);
 
@@ -4151,8 +4158,10 @@ RunReport runInterFoamDevice(
                     // cache in the tree -- the Gauss-Seidel colourings, the AMG hierarchies, the PCG
                     // and V-cycle workspaces, the coarse-level ids -- keys its validity on that id
                     // (tools/cache_key_audit.py). Rebuilding the mesh is what invalidates all of them.
+                    stagePart.emplace("stage: the device mesh rebuilt (buildDeviceMesh)");
                     dm = buildDeviceMesh(m, g, fvp);
                     ++meshGeometryEpoch;
+                    stagePart.emplace("stage: the DIC schedule rebuilt (buildDeviceDilu)");
                     dic = buildDeviceDilu(m.owner(), m.neighbour(), nC);
                     C.dic = &dic;
                     // ...and the GAMG upload, whose key is the HOST hierarchy's build count. That count
@@ -4164,6 +4173,7 @@ RunReport runInterFoamDevice(
 
                     // ---- the masks and the boundary geometry, per boundary FACE
                     // ...the porosity's cell list, which interAfterMeshChange has just RE-SELECTED
+                    stagePart.emplace("stage: porosity, MRF and the device closure rebuilt");
                     buildPorosity();
                     // ...and the MRF zones, whose host face lists it has just REBUILT
                     buildMrf();
@@ -4224,6 +4234,7 @@ RunReport runInterFoamDevice(
                                         f.turbulence.yCell.size());
                         }
                     }
+                    stagePart.emplace("stage: the boundary masks and U's device boundary rebuilt");
                     buildBoundaryMasks();
                     dAFixes.copyFrom(aFixes);
                     dAFlag.copyFrom(aFlag);
@@ -4236,6 +4247,7 @@ RunReport runInterFoamDevice(
                     else                 deviceUpdateInletOutlet(dbU, dPhiB);
 
                     // ---- UP: every mesh-sized buffer the step READS, from the mapped host fields
+                    stagePart.emplace("stage: the fields back up to the device");
                     dA.copyFrom(f.alpha1.internal);
                     dAOld.copyFrom(aOldH);
                     {
@@ -4383,6 +4395,7 @@ RunReport runInterFoamDevice(
                         }
                     }
                 }
+                stagePart.reset();
                 if (changed && cnDdt && std::getenv("BRAE_AMR_TRACE"))
                 {
                     std::printf("  TRACE sizes after the change: nC %ld nIf %ld nBf %ld | ddt0RhoU %zu/%zu "
