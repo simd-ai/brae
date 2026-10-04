@@ -40,6 +40,8 @@
 // alone, and it is const -- it mutates no mesh and is handed to no field, which is what lets it be
 // gated before brae's mesh can change size at all.
 #include "cf_types.cuh"
+#include "compact_list_list.cuh"
+#include <cstddef>
 #include <map>
 #include <string>
 #include <vector>
@@ -95,10 +97,121 @@ void makeCells(
 // transcribed rather than guessed because `points_` is the only place a removed point is recorded.
 constexpr scalar kVectorMaxComponent = 1.0e+300;
 
+// polyTopoChange's faces_ -- a DynamicList<face> there -- HELD FLAT: every face's vertices in one pool and a
+// (start, size) a face. As std::vector<std::vector<label>> it was a heap block a face, ~280,000 on a 90,000-cell
+// mesh: built from the mesh on the way in, permuted twice by the reorder, and copied face by face on the way
+// out. MEASURED on damBreakWithObstacle, ms a step: the way in 20.9, the two reorders 11.6 + part of 15.0, the
+// copy out 6.0 -- 57.5 for the round trip, of a 231 ms step.
+//   an added face goes to the pool's end; a MODIFIED face's new list goes there too (it may be longer than the
+//   one it replaces) and the old one is left behind; a removed face has size 0; the reorder moves the (start,
+//   size) pairs and not one vertex; compact(n) gathers the first n faces, in order, into a CompactListList.
+class DynamicFaceList
+{
+public:
+    std::size_t size() const { return start_.size(); }
+    LabelRow operator[](std::size_t facei) const
+    {
+        return LabelRow{pool_.data() + static_cast<std::size_t>(start_[facei]),
+                        static_cast<std::size_t>(size_[facei])};
+    }
+    // a face's vertices, to change IN PLACE (face::flip, the renumbering): never past its size
+    label* vertices(std::size_t facei) { return pool_.data() + static_cast<std::size_t>(start_[facei]); }
+    void reserve(
+        std::size_t nFaces,
+        std::size_t nVertices)
+    {
+        start_.reserve(nFaces);
+        size_.reserve(nFaces);
+        pool_.reserve(nVertices);
+    }
+    void push_back(LabelRow f)
+    {
+        const label at = toPool(f);
+        start_.push_back(at);
+        size_.push_back(static_cast<label>(f.size()));
+    }
+    void set(
+        std::size_t facei,
+        LabelRow    f)
+    {
+        const label at = toPool(f);
+        start_[facei] = at;
+        size_[facei] = static_cast<label>(f.size());
+    }
+    void clear(std::size_t facei) { size_[facei] = 0; }
+    // keep a face's first n vertices
+    void shrink(
+        std::size_t facei,
+        std::size_t n)
+    {
+        size_[facei] = static_cast<label>(n);
+    }
+    // polyTopoChangeTemplates.C's `reorder(oldToNew, lst)` and the shrink its caller does: face i goes to
+    // oldToNew[i] where that is not negative, a place nothing goes to keeps the face it had, the list is cut
+    // to newSize. The pool is not touched.
+    void reorder(
+        const std::vector<label>& oldToNew,
+        label                     newSize)
+    {
+        const std::vector<label> oldStart(start_);
+        const std::vector<label> oldSize(size_);
+        for (std::size_t i = 0; i < oldStart.size(); ++i)
+        {
+            const label n = oldToNew[i];
+            if (n >= 0)
+            {
+                start_[static_cast<std::size_t>(n)] = oldStart[i];
+                size_[static_cast<std::size_t>(n)] = oldSize[i];
+            }
+        }
+        start_.resize(static_cast<std::size_t>(newSize));
+        size_.resize(static_cast<std::size_t>(newSize));
+    }
+    // the first n faces, in order
+    CompactListList compact(std::size_t n) const
+    {
+        std::size_t total = 0;
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            total += static_cast<std::size_t>(size_[i]);
+        }
+        CompactListList out;
+        out.start(n, total);
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            out.appendRow((*this)[i]);
+        }
+        return out;
+    }
+    std::vector<std::vector<label>> unpack() const { return compact(size()).unpack(); }
+
+private:
+    // the list written at the pool's end; one that is a row of this pool is copied out first, since the
+    // insert may move the pool
+    label toPool(LabelRow f)
+    {
+        const label at = static_cast<label>(pool_.size());
+        if (!pool_.empty() && f.begin() >= pool_.data() && f.begin() < pool_.data() + pool_.size())
+        {
+            const std::vector<label> copy(f.begin(), f.end());
+            pool_.insert(pool_.end(), copy.begin(), copy.end());
+        }
+        else
+        {
+            pool_.insert(pool_.end(), f.begin(), f.end());
+        }
+        return at;
+    }
+
+    std::vector<label> start_;
+    std::vector<label> size_;
+    std::vector<label> pool_;
+};
+
 struct TopoState
 {
     std::vector<vector>               points;          // removed = every component > 0.5*vector::max
-    std::vector<std::vector<label>>   faces;           // removed = empty
+    DynamicFaceList                   faces;           // removed = empty
     std::vector<label>                faceOwner;
     std::vector<label>                faceNeighbour;   // -1 on a boundary face
     std::vector<label>                region;          // patch id, -1 internal
@@ -214,7 +327,7 @@ void removePoint(
 // with no master is allowed and gets faceMap -1, so this does not throw either.
 label addFace(
     TopoActions&              a,
-    const std::vector<label>& f,
+    LabelRow                  f,
     label                     own,
     label                     nei,
     label                     masterPointID,
@@ -229,7 +342,7 @@ label addFace(
 // slot, because OpenFOAM's does.
 void modifyFace(
     TopoActions&              a,
-    const std::vector<label>& f,
+    LabelRow                  f,
     label                     facei,
     label                     own,
     label                     nei,
@@ -263,10 +376,12 @@ void removeCell(
 // `polyTopoChange meshMod(mesh)` does, and it is why the no-op round trip is the identity.
 //
 // `patchStarts` and `patchSizes` describe the boundary as `constant/polyMesh/boundary` does.
+// `faces` in either form (LabelListListRef): a list of lists, a CompactListList, or a mesh's own faceOffsets and
+// faceVerts
 void addMesh(
     TopoActions&                           a,
     const std::vector<vector>&             points,
-    const std::vector<std::vector<label>>& faces,
+    LabelListListRef                       faces,
     const std::vector<label>&              faceOwner,
     const std::vector<label>&              faceNeighbour,
     label                                  nCells,
@@ -355,7 +470,9 @@ struct TopoChangeMap
 struct ChangedMesh
 {
     std::vector<vector>             points;
-    std::vector<std::vector<label>> faces;
+    // every face's vertex list, compact (compact_list_list.cuh): its offsets and values ARE a PrimitiveMesh's
+    // faceOffsets and faceVerts
+    CompactListList                 faces;
     std::vector<label>              faceOwner;       // nFaces
     std::vector<label>              faceNeighbour;   // nInternalFaces
     std::vector<label>              patchStarts;

@@ -1877,15 +1877,9 @@ PrimitiveMesh rebuiltMesh(
     const cpu::polyTopoChange::ChangedMesh&  out)
 {
     interPhase::Nested timed("topo: the changed mesh back into the solver's form (rebuiltMesh)");
-    std::vector<label> faceVerts;
-    std::vector<label> faceOffsets;
-    faceOffsets.reserve(out.faces.size() + 1);
-    faceOffsets.push_back(0);
-    for (const std::vector<label>& f : out.faces)
-    {
-        faceVerts.insert(faceVerts.end(), f.begin(), f.end());
-        faceOffsets.push_back(static_cast<label>(faceVerts.size()));
-    }
+    // the change hands its faces back compact: the two arrays ARE the mesh's
+    std::vector<label> faceVerts = out.faces.values();
+    std::vector<label> faceOffsets = out.faces.offsets();
     std::vector<label> nbr(out.faceNeighbour.begin(),
                            out.faceNeighbour.begin() + static_cast<std::size_t>(out.nInternalFaces));
     std::vector<PatchInfo> patches = old.patches();
@@ -2172,20 +2166,16 @@ cpu::hexRef8::MeshView hexView(
 
 cpu::polyTopoChange::TopoActions actionsFromMesh(const PrimitiveMesh& m)
 {
-    interPhase::Nested timed("topo: the mesh into the change's own lists (actionsFromMesh, a list a face)");
+    interPhase::Nested timed("topo: the mesh into the change's own lists (actionsFromMesh)");
     std::vector<label> starts, sizes;
     for (const PatchInfo& p : m.patches()) { starts.push_back(p.start); sizes.push_back(p.size); }
-    std::vector<std::vector<label>> faces(static_cast<std::size_t>(m.nFaces()));
-    for (label f = 0; f < m.nFaces(); ++f)
-    {
-        faces[static_cast<std::size_t>(f)].assign(
-            m.faceVerts().begin() + m.faceOffsets()[static_cast<std::size_t>(f)],
-            m.faceVerts().begin() + m.faceOffsets()[static_cast<std::size_t>(f) + 1]);
-    }
     std::vector<label> nbr(static_cast<std::size_t>(m.nFaces()), label(-1));
     for (label f = 0; f < m.nInternalFaces(); ++f) nbr[static_cast<std::size_t>(f)] = m.neighbour()[f];
     cpu::polyTopoChange::TopoActions a;
-    cpu::polyTopoChange::addMesh(a, m.points(), faces, m.owner(), nbr, m.nCells(), starts, sizes);
+    // the mesh's faces are read where they stand (faceOffsets, faceVerts): no list a face is made of them
+    a.state.faces.reserve(static_cast<std::size_t>(m.nFaces()), 2*m.faceVerts().size());
+    cpu::polyTopoChange::addMesh(a, m.points(), LabelListListRef(m.faceOffsets(), m.faceVerts()), m.owner(), nbr,
+                                 m.nCells(), starts, sizes);
     return a;
 }
 

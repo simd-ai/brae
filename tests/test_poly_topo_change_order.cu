@@ -147,12 +147,13 @@ TopoState stateFromMesh(
 {
     TopoState s;
     s.points.assign(m.points().begin(), m.points().end());
-    s.faces.resize(static_cast<std::size_t>(m.nFaces()));
+    // the change's faces are held flat (DynamicFaceList): each face is appended as a whole list
     for (label f = 0; f < m.nFaces(); ++f)
     {
         const label k = m.faceSize(f);
-        s.faces[static_cast<std::size_t>(f)].resize(static_cast<std::size_t>(k));
-        for (label v = 0; v < k; ++v) s.faces[static_cast<std::size_t>(f)][static_cast<std::size_t>(v)] = m.faceVert(f, v);
+        std::vector<label> verts(static_cast<std::size_t>(k));
+        for (label v = 0; v < k; ++v) verts[static_cast<std::size_t>(v)] = m.faceVert(f, v);
+        s.faces.push_back(verts);
     }
     const OrderInput in = inputFromMesh(m);
     s.faceOwner     = in.faceOwner;

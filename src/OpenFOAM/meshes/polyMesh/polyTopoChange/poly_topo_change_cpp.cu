@@ -309,9 +309,10 @@ CompactResult compactNoOrder(
                      && s.faceNeighbour[static_cast<std::size_t>(facei)]
                       < s.faceOwner[static_cast<std::size_t>(facei)])
                     {
-                        std::vector<label>& f = s.faces[static_cast<std::size_t>(facei)];
                         // face::flip -- keep the first vertex, reverse the rest (face.H)
-                        if (f.size() > 1) std::reverse(f.begin() + 1, f.end());
+                        const std::size_t nv = s.faces[static_cast<std::size_t>(facei)].size();
+                        label* fv = s.faces.vertices(static_cast<std::size_t>(facei));
+                        if (nv > 1) std::reverse(fv + 1, fv + nv);
                         std::swap(s.faceOwner[static_cast<std::size_t>(facei)],
                                   s.faceNeighbour[static_cast<std::size_t>(facei)]);
                         if (facei < static_cast<label>(s.flipFaceFlux.size()))
@@ -399,7 +400,7 @@ void removePoint(
 
 label addFace(
     TopoActions&              a,
-    const std::vector<label>& f,
+    LabelRow                  f,
     label                     own,
     label                     nei,
     label                     masterPointID,
@@ -441,7 +442,7 @@ label addFace(
 
 void modifyFace(
     TopoActions&              a,
-    const std::vector<label>& f,
+    LabelRow                  f,
     label                     facei,
     label                     own,
     label                     nei,
@@ -449,7 +450,7 @@ void modifyFace(
     label                     patchID)
 {
     // :3255-3262. The face's MAP entry is not touched: a modified face is still the same old face.
-    a.state.faces[static_cast<std::size_t>(facei)] = f;
+    a.state.faces.set(static_cast<std::size_t>(facei), f);
     a.state.faceOwner[static_cast<std::size_t>(facei)] = own;
     a.state.faceNeighbour[static_cast<std::size_t>(facei)] = nei;
     a.state.region[static_cast<std::size_t>(facei)] = patchID;
@@ -463,7 +464,7 @@ void removeFace(
     label        mergeFacei)
 {
     // :3419-3430. The EMPTY vertex list is the removal predicate, as the point sentinel is for points.
-    a.state.faces[static_cast<std::size_t>(facei)].clear();
+    a.state.faces.clear(static_cast<std::size_t>(facei));
     a.state.region[static_cast<std::size_t>(facei)] = -1;
     a.state.faceOwner[static_cast<std::size_t>(facei)] = -1;
     a.state.faceNeighbour[static_cast<std::size_t>(facei)] = -1;
@@ -527,7 +528,7 @@ void removeCell(
 void addMesh(
     TopoActions&                           a,
     const std::vector<vector>&             points,
-    const std::vector<std::vector<label>>& faces,
+    LabelListListRef                       faces,
     const std::vector<label>&              faceOwner,
     const std::vector<label>&              faceNeighbour,
     label                                  nCells,
@@ -647,18 +648,22 @@ void renumberSorted(
     s.swap(out);
 }
 
-// :123-140, renumberCompact on a face's vertex list: renumber and DROP the -1s in place.
-void renumberCompactFace(
+// :123-140, renumberCompact on a face's vertex list: renumber and DROP the -1s in place. Returns what is left.
+std::size_t renumberCompactFace(
     const std::vector<label>& oldToNew,
-    std::vector<label>&       f)
+    DynamicFaceList&          faces,
+    std::size_t               facei)
 {
+    const std::size_t was = faces[facei].size();
+    label* f = faces.vertices(facei);
     std::size_t n = 0;
-    for (const label v : f)
+    for (std::size_t k = 0; k < was; ++k)
     {
-        const label nv = oldToNew[static_cast<std::size_t>(v)];
+        const label nv = oldToNew[static_cast<std::size_t>(f[k])];
         if (nv != -1) f[n++] = nv;
     }
-    f.resize(n);
+    faces.shrink(facei, n);
+    return n;
 }
 
 // polyTopoChange.C:1290-1370, `getMergeSets`, used once on the faces and once on the cells. Both
@@ -713,7 +718,7 @@ void reorderFaceArrays(
     const std::vector<label>& oldToNew,
     label                     newSize)
 {
-    reorderInPlace(oldToNew, a.state.faces, newSize);
+    a.state.faces.reorder(oldToNew, newSize);
     reorderInPlace(oldToNew, a.state.region, newSize);
     reorderInPlace(oldToNew, a.state.faceOwner, newSize);
     reorderInPlace(oldToNew, a.state.faceNeighbour, newSize);
@@ -783,12 +788,11 @@ void changeMesh(
     renumberSorted(r.localPointMap, a.state.retiredPoints);
     for (std::size_t facei = 0; facei < a.state.faces.size(); ++facei)
     {
-        std::vector<label>& f = a.state.faces[facei];
-        renumberCompactFace(r.localPointMap, f);
-        if (!faceRemoved(a.state, static_cast<label>(facei)) && f.size() < 3)
+        const std::size_t left = renumberCompactFace(r.localPointMap, a.state.faces, facei);
+        if (!faceRemoved(a.state, static_cast<label>(facei)) && left < 3)
             throw std::runtime_error(
                 std::string(WHO4) + "filtering removed points left face " + std::to_string(facei)
-                + " with " + std::to_string(f.size()) + " vertices. OpenFOAM's own FatalError: "
+                + " with " + std::to_string(left) + " vertices. OpenFOAM's own FatalError: "
                 "\"Created illegal face\".");
     }
 
@@ -864,7 +868,7 @@ void changeMesh(
     // ---- 5. the mesh the change produced ---------------------------------------------------------
     part.emplace("changeMesh: the new mesh and the maps copied out");
     out.points = a.state.points;
-    out.faces.assign(a.state.faces.begin(), a.state.faces.begin() + r.nActiveFaces);
+    out.faces = a.state.faces.compact(static_cast<std::size_t>(r.nActiveFaces));
     out.faceOwner.assign(a.state.faceOwner.begin(), a.state.faceOwner.begin() + r.nActiveFaces);
     out.nCells = r.nActiveCells;
     out.faceNeighbour.assign(a.state.faceNeighbour.begin(),

@@ -20,6 +20,17 @@ struct LabelRow
     const label* first = nullptr;
     std::size_t  n = 0;
 
+    LabelRow() = default;
+    LabelRow(
+        const label* p,
+        std::size_t  count)
+    :
+        first(p),
+        n(count)
+    {}
+    // a std::vector<label> read as a row: the vector must outlive the row (an argument does)
+    LabelRow(const std::vector<label>& v) : first(v.data()), n(v.size()) {}
+
     const label* begin() const { return first; }
     const label* end() const { return first + n; }
     std::size_t size() const { return n; }
@@ -28,6 +39,24 @@ struct LabelRow
     const label& front() const { return first[0]; }
     const label& back() const { return first[n - 1]; }
 };
+
+inline bool operator==(
+    const LabelRow& a,
+    const LabelRow& b)
+{
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i)
+    {
+        if (a[i] != b[i]) return false;
+    }
+    return true;
+}
+inline bool operator!=(
+    const LabelRow& a,
+    const LabelRow& b)
+{
+    return !(a == b);
+}
 
 class CompactListList
 {
@@ -70,6 +99,12 @@ public:
     }
     void append(label v) { values_.push_back(v); }
     void endRow() { offsets_.push_back(static_cast<label>(values_.size())); }
+    // a whole row at once
+    void appendRow(LabelRow r)
+    {
+        values_.insert(values_.end(), r.begin(), r.end());
+        endRow();
+    }
     // the row being appended, to sort or scan before endRow()
     label* openRowBegin() { return values_.data() + static_cast<std::size_t>(offsets_.back()); }
     label* openRowEnd() { return values_.data() + values_.size(); }
@@ -139,13 +174,29 @@ public:
     LabelListListRef() = default;
     LabelListListRef(const std::vector<std::vector<label>>& l) : nested_(&l) {}
     LabelListListRef(const CompactListList& l) : compact_(&l) {}
+    // ...or a pair of arrays that already ARE the compact form: n + 1 offsets and the values (a mesh's own
+    // faceOffsets and faceVerts)
+    LabelListListRef(
+        const std::vector<label>& offsets,
+        const std::vector<label>& values)
+    :
+        offsets_(&offsets),
+        values_(&values)
+    {}
 
-    bool null() const { return nested_ == nullptr && compact_ == nullptr; }
+    bool null() const { return nested_ == nullptr && compact_ == nullptr && offsets_ == nullptr; }
     const void* address() const
     {
-        return nested_ ? static_cast<const void*>(nested_) : static_cast<const void*>(compact_);
+        return nested_ ? static_cast<const void*>(nested_)
+             : compact_ ? static_cast<const void*>(compact_)
+             : static_cast<const void*>(offsets_);
     }
-    std::size_t size() const { return nested_ ? nested_->size() : compact_->size(); }
+    std::size_t size() const
+    {
+        if (nested_) return nested_->size();
+        if (compact_) return compact_->size();
+        return offsets_->empty() ? 0 : offsets_->size() - 1;
+    }
     LabelRow operator[](std::size_t i) const
     {
         if (nested_)
@@ -153,12 +204,16 @@ public:
             const std::vector<label>& r = (*nested_)[i];
             return LabelRow{r.data(), r.size()};
         }
-        return (*compact_)[i];
+        if (compact_) return (*compact_)[i];
+        const std::size_t b = static_cast<std::size_t>((*offsets_)[i]);
+        return LabelRow{values_->data() + b, static_cast<std::size_t>((*offsets_)[i + 1]) - b};
     }
 
 private:
     const std::vector<std::vector<label>>* nested_ = nullptr;
     const CompactListList*                 compact_ = nullptr;
+    const std::vector<label>*              offsets_ = nullptr;
+    const std::vector<label>*              values_ = nullptr;
 };
 
 // ...and the nullable pointer to one that a mesh view holds (hexRef8's MeshView, removeFaces' RemoveFacesView):

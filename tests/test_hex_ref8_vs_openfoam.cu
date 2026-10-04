@@ -533,7 +533,7 @@ int main(int argc, char** argv)
                    && uout.nCells == d.scalars.at("nCells"));
                 compareList("owner after the unrefinement", uout.faceOwner, d, "owner");
                 compareList("neighbour after the unrefinement", uout.faceNeighbour, d, "neighbour");
-                compareListList("every face's vertex list after the unrefinement", uout.faces, d,
+                compareListList("every face's vertex list after the unrefinement", uout.faces.unpack(), d,
                                 "faces");
                 compareList("pointMap of the unrefinement", umap.pointMap, d, "pointMap");
                 compareList("faceMap of the unrefinement", umap.faceMap, d, "faceMap");
