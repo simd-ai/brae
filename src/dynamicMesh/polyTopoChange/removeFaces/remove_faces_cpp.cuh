@@ -57,7 +57,7 @@ namespace removeFaces {
 //                    ASCENDING face order (OpenFOAM walks the internal faces, not the input list).
 label compatibleRemoves(
     const PrimitiveMesh&                   m,
-    const std::vector<std::vector<label>>& cellCells,
+    LabelListListRef                       cellCells,
     const std::vector<label>&              facesToRemove,
     std::vector<label>&                    cellRegion,
     std::vector<label>&                    regionMaster,
@@ -89,10 +89,10 @@ struct RemoveFacesView
 {
     const PrimitiveMesh*                   m = nullptr;
     const MeshEdges*                       edges = nullptr;        // edges() and pointEdges()
-    const std::vector<std::vector<label>>* faceEdges = nullptr;
-    const std::vector<std::vector<label>>* edgeFaces = nullptr;
-    const std::vector<std::vector<label>>* cells = nullptr;        // getFacesAffected's cell faces
-    const std::vector<std::vector<label>>* pointFaces = nullptr;   // ...and its point faces
+    LabelListListPtr                       faceEdges = nullptr;
+    LabelListListPtr                       edgeFaces = nullptr;
+    LabelListListPtr                       cells = nullptr;        // getFacesAffected's cell faces
+    LabelListListPtr                       pointFaces = nullptr;   // ...and its point faces
     // polyPatch::faceNormals(), which is the face AREA VECTOR normalised -- only the minCos filter
     // reads it, and only for an edge whose two survivors are both on the boundary
     const std::vector<vector>*             faceAreas = nullptr;

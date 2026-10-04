@@ -163,6 +163,139 @@ std::vector<std::vector<label>> cellPointsFromCells(
 }
 
 
+CompactListList compactMeshCells(const PrimitiveMesh& m)
+{
+    // meshCells' rows: a cell's owned faces ascending, then the faces it is the neighbour of, ascending
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    std::vector<label> nFaces(static_cast<std::size_t>(m.nCells()), label(0));
+    for (const label c : own)
+    {
+        ++nFaces[static_cast<std::size_t>(c)];
+    }
+    for (const label c : nei)
+    {
+        ++nFaces[static_cast<std::size_t>(c)];
+    }
+    CompactListList out;
+    std::vector<label> at = out.setSizes(nFaces);
+    std::vector<label>& v = out.values();
+    for (std::size_t facei = 0; facei < own.size(); ++facei)
+    {
+        v[static_cast<std::size_t>(at[static_cast<std::size_t>(own[facei])]++)] = static_cast<label>(facei);
+    }
+    for (std::size_t facei = 0; facei < nei.size(); ++facei)
+    {
+        v[static_cast<std::size_t>(at[static_cast<std::size_t>(nei[facei])]++)] = static_cast<label>(facei);
+    }
+    return out;
+}
+
+CompactListList compactMeshPointFaces(const PrimitiveMesh& m)
+{
+    // meshPointFaces' rows: the faces in ascending order, a face once for each time it names the point
+    const std::vector<label>& fv = m.faceVerts();
+    std::vector<label> nFaces(static_cast<std::size_t>(m.nPoints()), label(0));
+    for (const label p : fv)
+    {
+        ++nFaces[static_cast<std::size_t>(p)];
+    }
+    CompactListList out;
+    std::vector<label> at = out.setSizes(nFaces);
+    std::vector<label>& v = out.values();
+    for (label facei = 0; facei < m.nFaces(); ++facei)
+    {
+        for (label fp = 0; fp < m.faceSize(facei); ++fp)
+        {
+            v[static_cast<std::size_t>(at[static_cast<std::size_t>(m.faceVert(facei, fp))]++)] = facei;
+        }
+    }
+    return out;
+}
+
+CompactListList compactPointCellsFromCells(
+    const PrimitiveMesh& m,
+    LabelListListRef     cells)
+{
+    // pointCellsFromCells' rows -- ascending cell index, a cell once a point -- in OpenFOAM's own two passes
+    // (primitiveMeshPointCells.C:114-186): the first counts, the second fills
+    const std::size_t nPoints = static_cast<std::size_t>(m.nPoints());
+    std::vector<char> usedPoints(nPoints, 0);
+    std::vector<label> currPoints;
+    std::vector<label> nCells(nPoints, label(0));
+    CompactListList out;
+    std::vector<label> at;
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        if (pass == 1)
+        {
+            at = out.setSizes(nCells);
+        }
+        for (std::size_t celli = 0; celli < cells.size(); ++celli)
+        {
+            currPoints.clear();
+            for (const label facei : cells[celli])
+            {
+                const label n = m.faceSize(facei);
+                for (label k = 0; k < n; ++k)
+                {
+                    const label pointi = m.faceVert(facei, k);
+                    char& used = usedPoints[static_cast<std::size_t>(pointi)];
+                    if (used) continue;
+                    used = 1;
+                    currPoints.push_back(pointi);
+                    if (pass == 0)
+                    {
+                        ++nCells[static_cast<std::size_t>(pointi)];
+                    }
+                    else
+                    {
+                        out.values()[static_cast<std::size_t>(at[static_cast<std::size_t>(pointi)]++)] =
+                            static_cast<label>(celli);
+                    }
+                }
+            }
+            for (const label p : currPoints)
+            {
+                usedPoints[static_cast<std::size_t>(p)] = 0;
+            }
+        }
+    }
+    return out;
+}
+
+CompactListList compactCellPointsFromCells(
+    const PrimitiveMesh& m,
+    LabelListListRef     cells)
+{
+    // cellPointsFromCells' rows: a cell's points once each, in the order its faces name them
+    CompactListList out;
+    out.start(cells.size(), 8*cells.size());
+    std::vector<char> usedPoints(static_cast<std::size_t>(m.nPoints()), 0);
+    for (std::size_t celli = 0; celli < cells.size(); ++celli)
+    {
+        for (const label facei : cells[celli])
+        {
+            const label n = m.faceSize(facei);
+            for (label k = 0; k < n; ++k)
+            {
+                const label pointi = m.faceVert(facei, k);
+                char& used = usedPoints[static_cast<std::size_t>(pointi)];
+                if (used) continue;
+                used = 1;
+                out.append(pointi);
+            }
+        }
+        for (const label* p = out.openRowBegin(); p != out.openRowEnd(); ++p)
+        {
+            usedPoints[static_cast<std::size_t>(*p)] = 0;
+        }
+        out.endRow();
+    }
+    return out;
+}
+
+
 PrimitivePatchAddressing primitivePatch(
     const PrimitiveMesh& m,
     const std::vector<label>& faces)

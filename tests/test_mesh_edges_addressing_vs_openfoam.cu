@@ -171,7 +171,8 @@ int main(int argc, char** argv)
         }
         check("...and its edges are OpenFOAM's, in OpenFOAM's numbering", same);
     }
-    compare("pointEdges", me.pointEdges, d, "pointEdges", /*sortBoth=*/false);
+    // pointEdges is held compact (compact_list_list.cuh); the comparison is on the list of lists it unpacks to
+    compare("pointEdges", me.pointEdges.unpack(), d, "pointEdges", /*sortBoth=*/false);
 
     const std::vector<std::vector<label>> fe = buildFaceEdges(m, me);
     const std::vector<std::vector<label>> ef = buildEdgeFaces(m, fe);

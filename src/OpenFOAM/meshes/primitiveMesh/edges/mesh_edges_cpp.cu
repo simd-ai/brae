@@ -11,15 +11,55 @@ namespace {
 // primitiveMeshEdges.C:41-78. Returns the edge between two points, creating it on first sight.
 // The pointEdges entry is registered ONCE when a face repeats a vertex -- blockMesh does produce
 // such a face, and registering it twice would put the same edge in the list twice.
-label getEdge(
-    std::vector<std::vector<label>>& pe,
-    std::vector<label>&              esStart,
-    std::vector<label>&              esEnd,
-    label                            pointi,
-    label                            nextPointi)
+// THE POINTS' EDGES WHILE THEY ARE BEING FOUND: a chain a point, walked in the order the edges were met -- what
+// a growing list a point held, without a heap block a point (the DynamicList<label> of primitiveMeshEdges.C:
+// 228 is one too). An entry is (edge, the point's next entry).
+struct PointEdgeChains
 {
-    for (const label edgei : pe[static_cast<std::size_t>(pointi)])
+    std::vector<label> head;
+    std::vector<label> tail;
+    std::vector<label> count;
+    std::vector<label> edge;
+    std::vector<label> next;
+
+    explicit PointEdgeChains(std::size_t nPoints)
+    :
+        head(nPoints, label(-1)),
+        tail(nPoints, label(-1)),
+        count(nPoints, label(0))
+    {}
+
+    void add(
+        label pointi,
+        label edgei)
     {
+        const label entry = static_cast<label>(edge.size());
+        edge.push_back(edgei);
+        next.push_back(label(-1));
+        const std::size_t p = static_cast<std::size_t>(pointi);
+        if (tail[p] < 0)
+        {
+            head[p] = entry;
+        }
+        else
+        {
+            next[static_cast<std::size_t>(tail[p])] = entry;
+        }
+        tail[p] = entry;
+        ++count[p];
+    }
+};
+
+label getEdge(
+    PointEdgeChains&    pe,
+    std::vector<label>& esStart,
+    std::vector<label>& esEnd,
+    label               pointi,
+    label               nextPointi)
+{
+    for (label at = pe.head[static_cast<std::size_t>(pointi)]; at >= 0; at = pe.next[static_cast<std::size_t>(at)])
+    {
+        const label edgei = pe.edge[static_cast<std::size_t>(at)];
         const std::size_t k = static_cast<std::size_t>(edgei);
         if (edgei < static_cast<label>(esStart.size())
          && (esStart[k] == nextPointi || esEnd[k] == nextPointi))
@@ -28,10 +68,10 @@ label getEdge(
         }
     }
     const label edgei = static_cast<label>(esStart.size());
-    pe[static_cast<std::size_t>(pointi)].push_back(edgei);
+    pe.add(pointi, edgei);
     if (nextPointi != pointi)
     {
-        pe[static_cast<std::size_t>(nextPointi)].push_back(edgei);
+        pe.add(nextPointi, edgei);
     }
     esStart.push_back(std::min(pointi, nextPointi));
     esEnd.push_back(std::max(pointi, nextPointi));
@@ -115,7 +155,7 @@ MeshEdges buildMeshEdges(const PrimitiveMesh& m)
     const bool ordered = calcPointOrder(m, nIntPts);
     out.nInternalPoints = ordered ? nIntPts : label(-1);
 
-    std::vector<std::vector<label>> pe(static_cast<std::size_t>(nPoints));
+    PointEdgeChains pe(static_cast<std::size_t>(nPoints));
     std::vector<label> esStart;
     std::vector<label> esEnd;
 
@@ -200,9 +240,15 @@ MeshEdges buildMeshEdges(const PrimitiveMesh& m)
 
     std::vector<label> nbrPoints;
     std::vector<label> order;
+    std::vector<label> pEdges;
     for (label pointi = 0; pointi < nPoints; ++pointi)
     {
-        const std::vector<label>& pEdges = pe[static_cast<std::size_t>(pointi)];
+        pEdges.clear();
+        for (label at = pe.head[static_cast<std::size_t>(pointi)]; at >= 0;
+             at = pe.next[static_cast<std::size_t>(at)])
+        {
+            pEdges.push_back(pe.edge[static_cast<std::size_t>(at)]);
+        }
         nbrPoints.assign(pEdges.size(), label(-1));
         for (std::size_t i = 0; i < pEdges.size(); ++i)
         {
@@ -275,13 +321,15 @@ MeshEdges buildMeshEdges(const PrimitiveMesh& m)
         out.start[static_cast<std::size_t>(n)] = esStart[k];
         out.end[static_cast<std::size_t>(n)] = esEnd[k];
     }
-    out.pointEdges.assign(static_cast<std::size_t>(nPoints), std::vector<label>());
+    out.pointEdges.start(static_cast<std::size_t>(nPoints), pe.edge.size());
     for (label p = 0; p < nPoints; ++p)
     {
-        std::vector<label>& dst = out.pointEdges[static_cast<std::size_t>(p)];
-        dst = pe[static_cast<std::size_t>(p)];
-        for (label& e : dst) e = oldToNew[static_cast<std::size_t>(e)];
-        std::sort(dst.begin(), dst.end());
+        for (label at = pe.head[static_cast<std::size_t>(p)]; at >= 0; at = pe.next[static_cast<std::size_t>(at)])
+        {
+            out.pointEdges.append(oldToNew[static_cast<std::size_t>(pe.edge[static_cast<std::size_t>(at)])]);
+        }
+        std::sort(out.pointEdges.openRowBegin(), out.pointEdges.openRowEnd());
+        out.pointEdges.endRow();
     }
     return out;
 }
@@ -383,6 +431,103 @@ std::vector<std::vector<label>> buildCellEdges(
         // header -- this is a deliberate departure with a measured reason, not a transcription.
         std::sort(ce.begin(), ce.end());
         ce.erase(std::unique(ce.begin(), ce.end()), ce.end());
+    }
+    return out;
+}
+
+
+CompactListList compactFaceEdges(
+    const PrimitiveMesh& m,
+    const MeshEdges&     me)
+{
+    // buildFaceEdges' rows, into an array shaped like faceVerts: entry (facei, fp) is the edge from the face's
+    // vertex fp to its next one
+    CompactListList out;
+    out.setOffsets(m.faceOffsets());
+    std::vector<label>& v = out.values();
+    std::fill(v.begin(), v.end(), label(-1));
+    const label nFaces = m.nFaces();
+    for (label facei = 0; facei < nFaces; ++facei)
+    {
+        const label b = m.faceOffsets()[facei];
+        const label n = m.faceOffsets()[facei + 1] - b;
+        for (label fp = 0; fp < n; ++fp)
+        {
+            const label pointi = m.faceVerts()[b + fp];
+            const label nextPointi = m.faceVerts()[b + ((fp + 1) % n)];
+            label& found = v[static_cast<std::size_t>(b + fp)];
+            for (const label edgei : me.pointEdges[static_cast<std::size_t>(pointi)])
+            {
+                const label s = me.start[static_cast<std::size_t>(edgei)];
+                const label t = me.end[static_cast<std::size_t>(edgei)];
+                const label other = (s == pointi) ? t : s;
+                if (other == nextPointi)
+                {
+                    found = edgei;
+                    break;
+                }
+            }
+            if (found < 0)
+                throw std::runtime_error(
+                    "brae faceEdges: face " + std::to_string(facei) + " position "
+                    + std::to_string(fp) + " has no edge between points " + std::to_string(pointi)
+                    + " and " + std::to_string(nextPointi) + ". The edge list and the face list "
+                    "disagree about the mesh.");
+        }
+    }
+    return out;
+}
+
+
+CompactListList compactEdgeFaces(
+    const PrimitiveMesh& m,
+    LabelListListRef     faceEdges)
+{
+    // buildEdgeFaces' rows: an edge's faces in ascending face index
+    std::size_t nEdges = 0;
+    for (std::size_t facei = 0; facei < faceEdges.size(); ++facei)
+    {
+        for (const label e : faceEdges[facei]) nEdges = std::max(nEdges, static_cast<std::size_t>(e) + 1);
+    }
+    std::vector<label> count(nEdges, label(0));
+    for (std::size_t facei = 0; facei < faceEdges.size(); ++facei)
+    {
+        for (const label e : faceEdges[facei]) ++count[static_cast<std::size_t>(e)];
+    }
+    CompactListList out;
+    std::vector<label> at = out.setSizes(count);
+    std::vector<label>& v = out.values();
+    for (std::size_t facei = 0; facei < faceEdges.size(); ++facei)
+    {
+        for (const label e : faceEdges[facei])
+        {
+            v[static_cast<std::size_t>(at[static_cast<std::size_t>(e)]++)] = static_cast<label>(facei);
+        }
+    }
+    (void)m;
+    return out;
+}
+
+
+CompactListList compactCellEdges(
+    LabelListListRef cells,
+    LabelListListRef faceEdges)
+{
+    // buildCellEdges' rows: the union of a cell's faces' edges, SORTED (the note in the header says why)
+    CompactListList out;
+    out.start(cells.size(), 12*cells.size());
+    for (std::size_t celli = 0; celli < cells.size(); ++celli)
+    {
+        for (const label facei : cells[celli])
+        {
+            for (const label e : faceEdges[static_cast<std::size_t>(facei)])
+            {
+                out.append(e);
+            }
+        }
+        std::sort(out.openRowBegin(), out.openRowEnd());
+        out.truncateOpenRow(std::unique(out.openRowBegin(), out.openRowEnd()));
+        out.endRow();
     }
     return out;
 }

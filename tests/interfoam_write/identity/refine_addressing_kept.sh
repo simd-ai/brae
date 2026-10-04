@@ -6,8 +6,9 @@
 # at the start of every step for the mesh its last change had just built them for and freed. Kept with the mesh
 # they are of, compared by content (StepAddressingKept, dynamic_refine_fv_mesh_cpp.cu).
 # MEASURED 2026-10-04, ms a step: damBreakWithObstacle 517 -> 428, RAS/motorBike 318 -> 264.
-# The default arm runs with BRAE_CONTROL_REFINE_ADDRESSING_CHECK=1: at every reuse the lists are built as well
-# and compared byte for byte. The CONTROL leaves the kept geometry as it was when the points moved
+# The default arm runs with BRAE_CONTROL_REFINE_ADDRESSING_CHECK=1: at every reuse and every build the lists
+# are built as lists of lists as well (the builders the tests hold to OpenFOAM's dumps) and compared row for
+# row. The CONTROL leaves the kept geometry as it was when the points moved
 # (BRAE_CONTROL_REFINE_ADDRESSING_STALE_GEOMETRY=1): the check must stop the run and name the geometry.
 . "$(dirname "$0")/../lib.sh"
 [ $GPU -eq 1 ] || { echo "SKIP: no GPU for the device arm"; exit 77; }

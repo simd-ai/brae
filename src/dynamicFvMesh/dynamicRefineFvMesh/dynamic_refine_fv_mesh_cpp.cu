@@ -33,12 +33,12 @@ constexpr scalar GREAT = scalar(1.0e+15);
 
 std::vector<scalar> cellToPoint(
     const std::vector<scalar>&             vFld,
-    const std::vector<std::vector<label>>& pointCells)
+    LabelListListRef                       pointCells)
 {
     std::vector<scalar> pFld(pointCells.size());
     for (std::size_t pointi = 0; pointi < pointCells.size(); ++pointi)
     {
-        const std::vector<label>& pCells = pointCells[pointi];
+        const LabelRow pCells = pointCells[pointi];
         if (pCells.empty())
         {
             // OpenFOAM divides by pCells.size() unguarded (dynamicRefineFvMesh.C:768) and would
@@ -79,7 +79,7 @@ std::vector<scalar> error(
 
 std::vector<scalar> maxPointField(
     const std::vector<scalar>&             pFld,
-    const std::vector<std::vector<label>>& pointCells,
+    LabelListListRef                       pointCells,
     label                                  nCells)
 {
     std::vector<scalar> vFld(static_cast<std::size_t>(nCells), -GREAT);
@@ -97,7 +97,7 @@ std::vector<scalar> maxPointField(
 
 std::vector<scalar> maxCellField(
     const std::vector<scalar>&             vFld,
-    const std::vector<std::vector<label>>& pointCells)
+    LabelListListRef                       pointCells)
 {
     std::vector<scalar> pFld(pointCells.size(), -GREAT);
     for (std::size_t pointi = 0; pointi < pointCells.size(); ++pointi)
@@ -115,7 +115,7 @@ void selectRefineCandidates(
     scalar                                 lowerRefineLevel,
     scalar                                 upperRefineLevel,
     const std::vector<scalar>&             vFld,
-    const std::vector<std::vector<label>>& pointCells,
+    LabelListListRef                       pointCells,
     label                                  nCells,
     std::vector<char>&                     candidateCell)
 {
@@ -311,7 +311,7 @@ void refuseCoupled(
 void extendMarkedCells(
     const PrimitiveMesh&                   m,
     const std::vector<FvPatch>&            patches,
-    const std::vector<std::vector<label>>& cells,
+    LabelListListRef                       cells,
     std::vector<char>&                     markedCell)
 {
     refuseCoupled(patches, "the buffer-layer dilation", "dynamicRefineFvMesh.C:1018");
@@ -347,8 +347,8 @@ void extendMarkedCells(
 std::vector<char> initProtectedCells(
     const std::vector<label>&              cellLevel,
     const std::vector<label>&              pointLevel,
-    const std::vector<std::vector<label>>& pointCells,
-    const std::vector<std::vector<label>>& cells,
+    LabelListListRef                       pointCells,
+    LabelListListRef                       cells,
     const PrimitiveMesh&                   m,
     const std::vector<FvPatch>&            patches)
 {
@@ -473,7 +473,7 @@ std::vector<char> initProtectedCells(
 void checkEightAnchorPoints(
     const std::vector<label>&              cellLevel,
     const std::vector<label>&              pointLevel,
-    const std::vector<std::vector<label>>& pointCells,
+    LabelListListRef                       pointCells,
     label                                  nCells,
     std::vector<char>&                     protectedCell)
 {
@@ -684,8 +684,8 @@ RefinementHistory readRefinementHistory(
 std::vector<label> getSplitPoints(
     const RefinementHistory&               history,
     const std::vector<label>&              cellLevel,
-    const std::vector<std::vector<label>>& pointCells,
-    const std::vector<std::vector<label>>& cellPoints,
+    LabelListListRef                       pointCells,
+    LabelListListRef                       cellPoints,
     const PrimitiveMesh&                   m)
 {
     if (!history.active)
@@ -771,7 +771,7 @@ std::vector<label> consistentUnrefinement(
     const std::vector<label>&              pointsToUnrefine,
     bool                                   maxSet,
     const std::vector<label>&              cellLevel,
-    const std::vector<std::vector<label>>& pointCells,
+    LabelListListRef                       pointCells,
     const PrimitiveMesh&                   m,
     const std::vector<FvPatch>&            patches)
 {
@@ -880,7 +880,7 @@ std::vector<label> selectUnrefinePoints(
     const std::vector<label>&              splitPoints,
     const std::vector<char>&               protectedCell,
     const std::vector<label>&              cellLevel,
-    const std::vector<std::vector<label>>& pointCells,
+    LabelListListRef                       pointCells,
     const PrimitiveMesh&                   m,
     const std::vector<FvPatch>&            patches)
 {
@@ -1903,15 +1903,17 @@ PrimitiveMesh rebuiltMesh(
 struct StepAddressing
 {
     FvGeometry                      g;
-    std::vector<std::vector<label>> cells;
-    std::vector<std::vector<label>> pointCells;
-    std::vector<std::vector<label>> cellPoints;
+    // THE LISTS ARE COMPACT (compact_list_list.cuh): an array of values and one of offsets each, where each was
+    // a heap block a row -- a million blocks on a 90,000-cell mesh, built after every change of topology
+    CompactListList                 cells;
+    CompactListList                 pointCells;
+    CompactListList                 cellPoints;
     MeshEdges                       edges;
-    std::vector<std::vector<label>> faceEdges;
-    std::vector<std::vector<label>> edgeFaces;
-    std::vector<std::vector<label>> cellEdges;
-    std::vector<std::vector<label>> cellCells;
-    std::vector<std::vector<label>> pointFaces;
+    CompactListList                 faceEdges;
+    CompactListList                 edgeFaces;
+    CompactListList                 cellEdges;
+    CompactListList                 cellCells;
+    CompactListList                 pointFaces;
 };
 
 void buildAddressing(
@@ -1925,20 +1927,34 @@ void buildAddressing(
     part.emplace("addressing: the geometry (FvGeometry::build)");
     a.g.build(m);
     part.emplace("addressing: cells, pointCells, cellPoints");
-    a.cells = meshCells(m);
+    a.cells = compactMeshCells(m);
+    // BRAE_CONTROL_REFINE_ADDRESSING_CELLS_SORTED=1 is a gate's CONTROL, deliberately wrong: each cell's faces in
+    // ascending order, where meshCells' are its owned faces and then the ones it is the neighbour of -- the
+    // order a compact builder written from the description alone would give
+    static const bool cellsSorted = std::getenv("BRAE_CONTROL_REFINE_ADDRESSING_CELLS_SORTED") != nullptr;
+    if (cellsSorted)
+    {
+        std::vector<label>& v = a.cells.values();
+        for (std::size_t celli = 0; celli < a.cells.size(); ++celli)
+        {
+            const std::size_t b = static_cast<std::size_t>(a.cells.offsets()[celli]);
+            const std::size_t e = static_cast<std::size_t>(a.cells.offsets()[celli + 1]);
+            std::sort(v.begin() + static_cast<std::ptrdiff_t>(b), v.begin() + static_cast<std::ptrdiff_t>(e));
+        }
+    }
     // pointCells through the CELLS branch, which is the one dynamicRefineFvMesh meets -- measured, and
     // the three branches sum differently
-    a.pointCells = pointCellsFromCells(m, a.cells);
-    a.cellPoints = cellPointsFromCells(m, a.cells);
+    a.pointCells = compactPointCellsFromCells(m, a.cells);
+    a.cellPoints = compactCellPointsFromCells(m, a.cells);
     part.emplace("addressing: edges (buildMeshEdges)");
     a.edges = buildMeshEdges(m);
     part.emplace("addressing: faceEdges, edgeFaces, cellEdges");
-    a.faceEdges = buildFaceEdges(m, a.edges);
-    a.edgeFaces = buildEdgeFaces(m, a.faceEdges);
-    a.cellEdges = buildCellEdges(a.cells, a.faceEdges);
+    a.faceEdges = compactFaceEdges(m, a.edges);
+    a.edgeFaces = compactEdgeFaces(m, a.faceEdges);
+    a.cellEdges = compactCellEdges(a.cells, a.faceEdges);
     part.emplace("addressing: cellCells and pointFaces");
-    a.cellCells = buildCellCells(m);
-    a.pointFaces = meshPointFaces(m);
+    a.cellCells = compactCellCells(m);
+    a.pointFaces = compactMeshPointFaces(m);
 }
 
 // THE STEP'S ADDRESSING, KEPT BETWEEN STEPS, with the mesh it is of. The topology's lists are a function of the
@@ -1978,43 +1994,22 @@ bool sameTopology(
         && sameBytes(k.faceOffsets, m.faceOffsets()) && sameBytes(k.faceVerts, m.faceVerts());
 }
 
+// BRAE_CONTROL_REFINE_ADDRESSING_CHECK=1 (defined below, after its oracle)
+void checkAgainstNested(
+    const StepAddressing& a,
+    const PrimitiveMesh&  m);
+
 void buildKept(
     StepAddressingKept&  k,
     const PrimitiveMesh& m)
 {
-    // HOW THE NEW LISTS REPLACE THE OLD ONES decides where the allocator puts a million small blocks, and with
-    // it how fast every later stage walks them. The lists are the same bytes either way. MEASURED, ms a step on
-    // damBreakWithObstacle and motorBike (517 and 318 before the lists were kept):
-    //   swap  all of them built beside the old ones, which are then freed     428-434   264-266   (the default)
-    //   over  each list built over the standing one                           484       281-283
-    //   free  the old ones freed first                                        600-604   306-307
-    // BRAE_CONTROL_REFINE_ADDRESSING_ORDER=over|free|swap is the switch those were measured with.
-    static const int order = []()
-    {
-        const char* e = std::getenv("BRAE_CONTROL_REFINE_ADDRESSING_ORDER");
-        const std::string v = e ? e : "swap";
-        if (v == "over") return 0;
-        if (v == "free") return 1;
-        if (v == "swap") return 2;
-        throw std::runtime_error("brae dynamicRefine: BRAE_CONTROL_REFINE_ADDRESSING_ORDER=" + v
-                                 + " is not one of over, free, swap.");
-    }();
+    // THE OLD LISTS GO FIRST: nothing reads them once the mesh has changed, and the peak is one set, not two.
+    // The order used to matter -- as lists of lists (a million small blocks) the three orders measured 428, 484
+    // and 600 ms a step on damBreakWithObstacle, and the switch that picked one is gone with them: compact, the
+    // same three measure 270, 274 and 272 (motorBike 196, 195, 197).
     k.built = false;
-    if (order == 0)
-    {
-        buildAddressing(m, k.a);
-    }
-    else if (order == 1)
-    {
-        k.a = StepAddressing();
-        buildAddressing(m, k.a);
-    }
-    else
-    {
-        StepAddressing fresh;
-        buildAddressing(m, fresh);
-        k.a = std::move(fresh);
-    }
+    k.a = StepAddressing();
+    buildAddressing(m, k.a);
     k.built = true;
     k.nCells = m.nCells();
     k.owner = m.owner();
@@ -2022,24 +2017,58 @@ void buildKept(
     k.faceOffsets = m.faceOffsets();
     k.faceVerts = m.faceVerts();
     k.points = m.points();
+    checkAgainstNested(k.a, m);
+}
+
+// THE CHECK'S ORACLE: the same lists as LISTS OF LISTS, OpenFOAM's labelListList form, from the builders the
+// tests hold to OpenFOAM's own dumps (mesh_edges_addressing_vs_openfoam, refine_candidates_vs_openfoam,
+// hex_ref8_vs_openfoam). The compact builders are held to these, row for row.
+struct NestedAddressing
+{
+    FvGeometry                      g;
+    std::vector<std::vector<label>> cells;
+    std::vector<std::vector<label>> pointCells;
+    std::vector<std::vector<label>> cellPoints;
+    MeshEdges                       edges;
+    std::vector<std::vector<label>> faceEdges;
+    std::vector<std::vector<label>> edgeFaces;
+    std::vector<std::vector<label>> cellEdges;
+    std::vector<std::vector<label>> cellCells;
+    std::vector<std::vector<label>> pointFaces;
+};
+
+void buildNested(
+    const PrimitiveMesh& m,
+    NestedAddressing&    n)
+{
+    n.g.build(m);
+    n.cells = meshCells(m);
+    n.pointCells = pointCellsFromCells(m, n.cells);
+    n.cellPoints = cellPointsFromCells(m, n.cells);
+    n.edges = buildMeshEdges(m);
+    n.faceEdges = buildFaceEdges(m, n.edges);
+    n.edgeFaces = buildEdgeFaces(m, n.faceEdges);
+    n.cellEdges = buildCellEdges(n.cells, n.faceEdges);
+    n.cellCells = buildCellCells(m);
+    n.pointFaces = meshPointFaces(m);
 }
 
 // the first list of `have` that is not `want`'s, or null: BRAE_CONTROL_REFINE_ADDRESSING_CHECK's comparison
 const char* firstDifference(
-    const StepAddressing& have,
-    const StepAddressing& want)
+    const StepAddressing&   have,
+    const NestedAddressing& want)
 {
-    if (have.cells != want.cells) return "cells";
-    if (have.pointCells != want.pointCells) return "pointCells";
-    if (have.cellPoints != want.cellPoints) return "cellPoints";
+    if (!have.cells.sameAs(want.cells)) return "cells";
+    if (!have.pointCells.sameAs(want.pointCells)) return "pointCells";
+    if (!have.cellPoints.sameAs(want.cellPoints)) return "cellPoints";
     if (have.edges.start != want.edges.start || have.edges.end != want.edges.end) return "edges";
     if (have.edges.pointEdges != want.edges.pointEdges) return "pointEdges";
     if (have.edges.nInternalPoints != want.edges.nInternalPoints) return "nInternalPoints";
-    if (have.faceEdges != want.faceEdges) return "faceEdges";
-    if (have.edgeFaces != want.edgeFaces) return "edgeFaces";
-    if (have.cellEdges != want.cellEdges) return "cellEdges";
-    if (have.cellCells != want.cellCells) return "cellCells";
-    if (have.pointFaces != want.pointFaces) return "pointFaces";
+    if (!have.faceEdges.sameAs(want.faceEdges)) return "faceEdges";
+    if (!have.edgeFaces.sameAs(want.edgeFaces)) return "edgeFaces";
+    if (!have.cellEdges.sameAs(want.cellEdges)) return "cellEdges";
+    if (!have.cellCells.sameAs(want.cellCells)) return "cellCells";
+    if (!have.pointFaces.sameAs(want.pointFaces)) return "pointFaces";
     if (!sameBytes(have.g.Cf(), want.g.Cf())) return "the geometry's face centres";
     if (!sameBytes(have.g.Sf(), want.g.Sf())) return "the geometry's face areas";
     if (!sameBytes(have.g.magSf(), want.g.magSf())) return "the geometry's face area magnitudes";
@@ -2052,6 +2081,24 @@ const char* firstDifference(
     if (!sameBytes(have.g.nonOrthCorrectionVectors(), want.g.nonOrthCorrectionVectors()))
         return "the geometry's non-orthogonal correction vectors";
     return nullptr;
+}
+
+// BRAE_CONTROL_REFINE_ADDRESSING_CHECK=1: the lists of lists are built as well and every one compared
+void checkAgainstNested(
+    const StepAddressing& a,
+    const PrimitiveMesh&  m)
+{
+    static const bool check = std::getenv("BRAE_CONTROL_REFINE_ADDRESSING_CHECK") != nullptr;
+    if (!check) return;
+    NestedAddressing fresh;
+    buildNested(m, fresh);
+    const char* what = firstDifference(a, fresh);
+    if (what)
+    {
+        throw std::runtime_error(
+            std::string("brae dynamicRefine: BRAE_CONTROL_REFINE_ADDRESSING_CHECK: of the kept addressing, ")
+            + what + " is not what building it from the mesh gives.");
+    }
 }
 
 }   // namespace
@@ -2068,14 +2115,14 @@ StepAddressingKept& keptOf(RefineUpdateState& s)
 
 // THE ADDRESSING OF THE STATE'S MESH AS IT STANDS: the kept one where it is of this mesh, built otherwise.
 //   BRAE_CONTROL_REFINE_ADDRESSING_REBUILD=1         builds it at every call, as every step did before
-//   BRAE_CONTROL_REFINE_ADDRESSING_CHECK=1           builds it as well where the kept one is used and compares
-//                                                    every list, byte for byte; stops on the first that differs
+//   BRAE_CONTROL_REFINE_ADDRESSING_CHECK=1           at every use -- kept or just built -- builds the lists of
+//                                                    lists as well (NestedAddressing) and compares every one,
+//                                                    row for row; stops on the first that differs
 //   BRAE_CONTROL_REFINE_ADDRESSING_STALE_GEOMETRY=1  a gate's CONTROL, deliberately wrong: the geometry is not
 //                                                    built again where the points moved
 StepAddressing& stepAddressingOf(RefineUpdateState& s)
 {
     static const bool rebuild = std::getenv("BRAE_CONTROL_REFINE_ADDRESSING_REBUILD") != nullptr;
-    static const bool check = std::getenv("BRAE_CONTROL_REFINE_ADDRESSING_CHECK") != nullptr;
     static const bool staleGeometry = std::getenv("BRAE_CONTROL_REFINE_ADDRESSING_STALE_GEOMETRY") != nullptr;
     StepAddressingKept& k = keptOf(s);
     if (rebuild || !sameTopology(k, s.m))
@@ -2100,18 +2147,7 @@ StepAddressing& stepAddressingOf(RefineUpdateState& s)
         k.a.g.build(s.m);
         k.points = s.m.points();
     }
-    if (check)
-    {
-        StepAddressing fresh;
-        buildAddressing(s.m, fresh);
-        const char* what = firstDifference(k.a, fresh);
-        if (what)
-        {
-            throw std::runtime_error(
-                std::string("brae dynamicRefine: BRAE_CONTROL_REFINE_ADDRESSING_CHECK: of the kept addressing, ")
-                + what + " is not what building it from the mesh gives.");
-        }
-    }
+    checkAgainstNested(k.a, s.m);
     return k.a;
 }
 
@@ -2281,7 +2317,11 @@ void mapCarriedFields(
     label                                     nNewCells,
     const std::vector<scalar>&                newV,
     label                                     nOldInternalFaces,
-    label                                     timeIndex)
+    label                                     timeIndex,
+    // the NEW mesh's cell-face list and geometry, which the caller has just built (the step's addressing): this
+    // routine built both again, the first as a list of lists
+    LabelListListRef                          newCells,
+    const FvGeometry&                         gNew)
 {
     const CellMapping cm = cellMapping(map, nNewCells, oldCellVolumes);
     for (std::vector<scalar>& f : s.cellScalars) f = mapCellField(f, cm);
@@ -2322,9 +2362,7 @@ void mapCarriedFields(
         }
         fv.owner = s.m.owner();
         fv.neighbour = s.m.neighbour();
-        fv.cells = meshCells(s.m);
-        FvGeometry gNew;
-        gNew.build(s.m);
+        fv.cells = newCells;
         std::vector<std::vector<vector>> SfBnd(patches.size());
         std::vector<std::vector<scalar>> magSfBnd(patches.size());
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
@@ -2670,7 +2708,8 @@ RefineUpdateStep refineUpdate(
             buildKept(keptOf(s), s.m);
             updatePatchesInPlace(s.patches, buildPatches(s.m, a.g));
             part.emplace("refine: the carried fields mapped");
-            mapCarriedFields(s, r.refineMap, oldV, out.nCells, a.g.V(), nOldInternalFaces, timeIndex);
+            mapCarriedFields(s, r.refineMap, oldV, out.nCells, a.g.V(), nOldInternalFaces, timeIndex, a.cells,
+                             a.g);
             part.emplace("refine: the marks carried over and the buffer layers");
 
             // :1391-1411. refineCell REBUILT THROUGH THE MAP: a cell stays marked if it is new, if it is
@@ -2804,7 +2843,8 @@ RefineUpdateStep refineUpdate(
             buildKept(keptOf(s), s.m);
             updatePatchesInPlace(s.patches, buildPatches(s.m, a.g));
             part.emplace("unrefine: the carried fields mapped and the fluxes corrected");
-            mapCarriedFields(s, r.unrefineMap, oldV, out.nCells, a.g.V(), nOldInternalFaces, timeIndex);
+            mapCarriedFields(s, r.unrefineMap, oldV, out.nCells, a.g.V(), nOldInternalFaces, timeIndex, a.cells,
+                             a.g);
             // ...and then unrefine's second correction, which runs AFTER updateMesh and so after the
             // hull average (:610-689)
             if (!s.injectedPhiU.empty() && !faceToSplitPoint.empty())

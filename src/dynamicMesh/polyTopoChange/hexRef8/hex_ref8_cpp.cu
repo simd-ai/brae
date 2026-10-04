@@ -587,7 +587,7 @@ void walkFaceToMid(
     const PrimitiveMesh& m = *v.m;
     const label b = m.faceOffsets()[facei];
     const std::size_t n = static_cast<std::size_t>(m.faceOffsets()[facei + 1] - b);
-    const std::vector<label>& fEdges = (*v.faceEdges)[static_cast<std::size_t>(facei)];
+    const LabelRow fEdges = (*v.faceEdges)[static_cast<std::size_t>(facei)];
     label fp = startFp;
     while (true)
     {
@@ -618,7 +618,7 @@ void walkFaceFromMid(
     const PrimitiveMesh& m = *v.m;
     const label b = m.faceOffsets()[facei];
     const std::size_t n = static_cast<std::size_t>(m.faceOffsets()[facei + 1] - b);
-    const std::vector<label>& fEdges = (*v.faceEdges)[static_cast<std::size_t>(facei)];
+    const LabelRow fEdges = (*v.faceEdges)[static_cast<std::size_t>(facei)];
     label fp = rcIndex(startFp, n);
     while (true)
     {
@@ -799,7 +799,7 @@ void createInternalFaces(
     TopoActions&                           a)
 {
     const PrimitiveMesh& m = *v.m;
-    const std::vector<label>& cFaces = (*v.cells)[static_cast<std::size_t>(celli)];
+    const LabelRow cFaces = (*v.cells)[static_cast<std::size_t>(celli)];
     const label cLevel = lv.cellLevel[static_cast<std::size_t>(celli)];
     MidEdgeMap midPointToAnchors;
     MidEdgeMap midPointToFaceMids;
@@ -810,7 +810,7 @@ void createInternalFaces(
         const label b = m.faceOffsets()[facei];
         const std::size_t n = static_cast<std::size_t>(m.faceOffsets()[facei + 1] - b);
         const std::vector<label> f(m.faceVerts().begin() + b, m.faceVerts().begin() + b + n);
-        const std::vector<label>& fEdges = (*v.faceEdges)[static_cast<std::size_t>(facei)];
+        const LabelRow fEdges = (*v.faceEdges)[static_cast<std::size_t>(facei)];
 
         // this cell's side of the face has either ONE anchor -- the other side was already split with
         // cLevel+1 and cLevel+2 points -- or FOUR, and nothing else is a hex (:1215-1277)
@@ -1008,7 +1008,7 @@ void setRefinementFaces(
             const label b = m.faceOffsets()[facei];
             const std::size_t n = static_cast<std::size_t>(m.faceOffsets()[facei + 1] - b);
             const std::vector<label> f(m.faceVerts().begin() + b, m.faceVerts().begin() + b + n);
-            const std::vector<label>& fEdges = (*v.faceEdges)[static_cast<std::size_t>(facei)];
+            const LabelRow fEdges = (*v.faceEdges)[static_cast<std::size_t>(facei)];
             std::vector<label> newFaceVerts;
             newFaceVerts.reserve(2*n);
             for (std::size_t fp = 0; fp < n; ++fp)
@@ -1550,7 +1550,7 @@ void setUnrefinementLevels(
             "which eight cells came from which parent.");
     for (const label pointi : splitPointLabels)
     {
-        const std::vector<label>& pCells = (*v.pointCells)[static_cast<std::size_t>(pointi)];
+        const LabelRow pCells = (*v.pointCells)[static_cast<std::size_t>(pointi)];
         if (pCells.size() != 8)
             throw std::runtime_error(
                 std::string(WHO) + "split point " + std::to_string(pointi) + " has "
@@ -1561,7 +1561,9 @@ void setUnrefinementLevels(
         {
             --lv.cellLevel[static_cast<std::size_t>(celli)];
         }
-        combineCells(h, masterCelli, pCells);
+        // combineCells keeps the list (the history's own): the row is copied out for it -- eight labels, and
+        // only at a point that is being unrefined
+        combineCells(h, masterCelli, std::vector<label>(pCells.begin(), pCells.end()));
     }
     // POINT LEVELS ARE UNTOUCHED, and that is OpenFOAM's own note at :5781-5783: the points "either get
     // removed or stay at the same position", so a surviving point's level is still the level it had.

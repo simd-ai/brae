@@ -68,12 +68,12 @@ struct MeshView
     const MeshEdges*                       edges = nullptr;
     // faceEdges(): per face, per face POSITION -- section 9 and createInternalFaces index it by fp, so
     // the order IS the answer (unit 5a's gate holds it exactly for that reason)
-    const std::vector<std::vector<label>>* faceEdges = nullptr;
-    const std::vector<std::vector<label>>* edgeFaces = nullptr;
-    const std::vector<std::vector<label>>* cells = nullptr;
-    const std::vector<std::vector<label>>* cellPoints = nullptr;
-    const std::vector<std::vector<label>>* pointCells = nullptr;
-    const std::vector<std::vector<label>>* cellEdges = nullptr;
+    LabelListListPtr                       faceEdges = nullptr;
+    LabelListListPtr                       edgeFaces = nullptr;
+    LabelListListPtr                       cells = nullptr;
+    LabelListListPtr                       cellPoints = nullptr;
+    LabelListListPtr                       pointCells = nullptr;
+    LabelListListPtr                       cellEdges = nullptr;
     const std::vector<vector>*             cellCentres = nullptr;
     const std::vector<vector>*             faceCentres = nullptr;
 };

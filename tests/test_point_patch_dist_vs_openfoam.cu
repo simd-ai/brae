@@ -101,7 +101,7 @@ int main(int argc, char** argv)
         }
         for (label p = 0; p < nPoints; ++p)
         {
-            const std::vector<label>& pe = e.pointEdges[static_cast<std::size_t>(p)];
+            const LabelRow pe = e.pointEdges[static_cast<std::size_t>(p)];
             for (std::size_t i = 1; i < pe.size(); ++i)
             {
                 ordered = ordered && (pe[i - 1] < pe[i]);

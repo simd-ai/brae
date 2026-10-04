@@ -24,6 +24,7 @@
 #pragma once
 
 #include "cf_types.cuh"
+#include "compact_list_list.cuh"
 #include "foam_dict.cuh"
 #include "fv_patch.cuh"
 #include "hex_ref8_cpp.cuh"
@@ -115,7 +116,7 @@ void renumberCellZones(
 // with no cells; this does not either, and says so rather than returning a quiet zero.
 std::vector<scalar> cellToPoint(
     const std::vector<scalar>&                  vFld,
-    const std::vector<std::vector<label>>&      pointCells);
+    LabelListListRef                            pointCells);
 
 // dynamicRefineFvMesh.C:774-793. `err = min(fld - minLevel, maxLevel - fld)` -- the distance to the
 // NEARER band edge: positive strictly inside, exactly 0 on an edge, negative outside. The result
@@ -131,7 +132,7 @@ std::vector<scalar> error(
 // The cell field starts at -GREAT (1.0e+15), so a cell no point names keeps it.
 std::vector<scalar> maxPointField(
     const std::vector<scalar>&                  pFld,
-    const std::vector<std::vector<label>>&      pointCells,
+    LabelListListRef                            pointCells,
     label                                       nCells);
 
 // dynamicRefineFvMesh.C:736-751. Cell field -> point field: each point takes the MAX over its cells,
@@ -139,7 +140,7 @@ std::vector<scalar> maxPointField(
 // it is deliberately NOT the average above.
 std::vector<scalar> maxCellField(
     const std::vector<scalar>&                  vFld,
-    const std::vector<std::vector<label>>&      pointCells);
+    LabelListListRef                            pointCells);
 
 // dynamicRefineFvMesh.C:796-827: maxPointField(error(cellToPoint(vFld), lower, upper)), marked where
 // the result is STRICTLY > 0. The two strictnesses do not agree and that is the point: `error`
@@ -152,7 +153,7 @@ void selectRefineCandidates(
     scalar                                      lowerRefineLevel,
     scalar                                      upperRefineLevel,
     const std::vector<scalar>&                  vFld,
-    const std::vector<std::vector<label>>&      pointCells,
+    LabelListListRef                            pointCells,
     label                                       nCells,
     std::vector<char>&                          candidateCell);
 
@@ -246,7 +247,7 @@ std::vector<label> selectRefineCells(
 void extendMarkedCells(
     const PrimitiveMesh&                   m,
     const std::vector<FvPatch>&            patches,
-    const std::vector<std::vector<label>>& cells,
+    LabelListListRef                       cells,
     std::vector<char>&                     markedCell);
 
 // dynamicRefineFvMesh::init's own scan (:1110-1248), the thing that FILLS protectedCell_. Four passes,
@@ -271,8 +272,8 @@ void extendMarkedCells(
 std::vector<char> initProtectedCells(
     const std::vector<label>&              cellLevel,
     const std::vector<label>&              pointLevel,
-    const std::vector<std::vector<label>>& pointCells,
-    const std::vector<std::vector<label>>& cells,
+    LabelListListRef                       pointCells,
+    LabelListListRef                       cells,
     const PrimitiveMesh&                   m,
     const std::vector<FvPatch>&            patches);
 
@@ -285,7 +286,7 @@ std::vector<char> initProtectedCells(
 void checkEightAnchorPoints(
     const std::vector<label>&              cellLevel,
     const std::vector<label>&              pointLevel,
-    const std::vector<std::vector<label>>& pointCells,
+    LabelListListRef                       pointCells,
     label                                  nCells,
     std::vector<char>&                     protectedCell);
 
@@ -348,8 +349,8 @@ RefinementHistory readRefinementHistory(
 std::vector<label> getSplitPoints(
     const RefinementHistory&               history,
     const std::vector<label>&              cellLevel,
-    const std::vector<std::vector<label>>& pointCells,
-    const std::vector<std::vector<label>>& cellPoints,
+    LabelListListRef                       pointCells,
+    LabelListListRef                       cellPoints,
     const PrimitiveMesh&                   m);
 
 // hexRef8.C:5383-5603, maxSet FALSE only -- OpenFOAM's own maxSet=true half FATALS at entry (:5395),
@@ -362,7 +363,7 @@ std::vector<label> consistentUnrefinement(
     const std::vector<label>&              pointsToUnrefine,
     bool                                   maxSet,
     const std::vector<label>&              cellLevel,
-    const std::vector<std::vector<label>>& pointCells,
+    LabelListListRef                       pointCells,
     const PrimitiveMesh&                   m,
     const std::vector<FvPatch>&            patches);
 
@@ -379,7 +380,7 @@ std::vector<label> selectUnrefinePoints(
     const std::vector<label>&              splitPoints,
     const std::vector<char>&               protectedCell,
     const std::vector<label>&              cellLevel,
-    const std::vector<std::vector<label>>& pointCells,
+    LabelListListRef                       pointCells,
     const PrimitiveMesh&                   m,
     const std::vector<FvPatch>&            patches);
 
@@ -435,7 +436,9 @@ struct FluxMeshView
     std::vector<label>              patchSize;
     std::vector<label>              owner;
     std::vector<label>              neighbour;
-    std::vector<std::vector<label>> cells;      // each cell's faces, owner-then-neighbour ascending
+    // each cell's faces, owner-then-neighbour ascending: BY REFERENCE, in either form (compact_list_list.cuh)
+    // -- the list must outlive the view
+    LabelListListRef                cells;
     // ...and WHICH PATCHES HOLD NO VALUES IN OpenFOAM, which is only `empty` today. It matters because
     // the hull average reads a FLAT array over every face, zero-initialised, that OpenFOAM fills from
     // each patch field in turn (dynamicRefineFvMeshTemplates.C:42-53): an emptyFvPatchField is

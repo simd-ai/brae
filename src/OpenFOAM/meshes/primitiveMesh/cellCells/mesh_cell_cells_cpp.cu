@@ -34,4 +34,29 @@ std::vector<std::vector<label>> buildCellCells(const PrimitiveMesh& m)
     return out;
 }
 
+CompactListList compactCellCells(const PrimitiveMesh& m)
+{
+    // buildCellCells' two passes, into one array: the count, then the partner appended at both ends of each
+    // internal face in ascending face order
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    std::vector<label> ncc(static_cast<std::size_t>(m.nCells()), label(0));
+    for (std::size_t facei = 0; facei < nei.size(); ++facei)
+    {
+        ++ncc[static_cast<std::size_t>(own[facei])];
+        ++ncc[static_cast<std::size_t>(nei[facei])];
+    }
+    CompactListList out;
+    std::vector<label> at = out.setSizes(ncc);
+    std::vector<label>& v = out.values();
+    for (std::size_t facei = 0; facei < nei.size(); ++facei)
+    {
+        const label ownCelli = own[facei];
+        const label neiCelli = nei[facei];
+        v[static_cast<std::size_t>(at[static_cast<std::size_t>(ownCelli)]++)] = neiCelli;
+        v[static_cast<std::size_t>(at[static_cast<std::size_t>(neiCelli)]++)] = ownCelli;
+    }
+    return out;
+}
+
 } // namespace brae

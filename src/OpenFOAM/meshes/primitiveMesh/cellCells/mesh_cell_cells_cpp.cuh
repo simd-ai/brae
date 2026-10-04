@@ -19,11 +19,14 @@
 // makes the region flood in compatibleRemoves stop at a processor or cyclic boundary, and it is
 // OpenFOAM's behaviour rather than an omission.
 #include "cf_types.cuh"
+#include "compact_list_list.cuh"
 #include "primitive_mesh.cuh"
 #include <vector>
 
 namespace brae {
 
 std::vector<std::vector<label>> buildCellCells(const PrimitiveMesh& m);
+// ...and compact (compact_list_list.cuh): the same rows, one array of values and one of offsets
+CompactListList compactCellCells(const PrimitiveMesh& m);
 
 } // namespace brae

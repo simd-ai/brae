@@ -22,6 +22,7 @@
 // sorted), else the walk over cells() (ascending). pointCellsFromPointFaces is the second, which is the
 // one a displacement motion solver meets: its wall distance asks for pointFaces() before anything asks
 // for pointCells().
+#include "compact_list_list.cuh"
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"
 #include <vector>
@@ -67,6 +68,19 @@ std::vector<std::vector<label>> pointCellsFromCells(
 std::vector<std::vector<label>> cellPointsFromCells(
     const PrimitiveMesh& m,
     const std::vector<std::vector<label>>& cells);
+
+// THE SAME FOUR LISTS, COMPACT (compact_list_list.cuh): one array of values and one of offsets a list, no heap
+// block a row. Row for row what meshCells, meshPointFaces, pointCellsFromCells and cellPointsFromCells give --
+// the refinement's addressing check (BRAE_CONTROL_REFINE_ADDRESSING_CHECK) holds each to its list-of-lists
+// twin at every use. The two that read `cells` take it in either form.
+CompactListList compactMeshCells(const PrimitiveMesh& m);
+CompactListList compactMeshPointFaces(const PrimitiveMesh& m);
+CompactListList compactPointCellsFromCells(
+    const PrimitiveMesh& m,
+    LabelListListRef     cells);
+CompactListList compactCellPointsFromCells(
+    const PrimitiveMesh& m,
+    LabelListListRef     cells);
 
 // A PrimitivePatch over a list of the mesh's faces
 struct PrimitivePatchAddressing

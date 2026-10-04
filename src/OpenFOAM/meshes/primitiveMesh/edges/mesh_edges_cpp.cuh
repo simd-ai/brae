@@ -31,6 +31,7 @@
 // The old comment had confused "nInternalPoints is -1" (the unordered SENTINEL) with "there are no
 // internal points" (0, which is ordered). See mesh_edges_cpp.cu:106-116.
 #include "cf_types.cuh"
+#include "compact_list_list.cuh"
 #include "primitive_mesh.cuh"
 #include <vector>
 
@@ -41,8 +42,9 @@ struct MeshEdges
     // edges(): start < end for every edge
     std::vector<label> start;
     std::vector<label> end;
-    // pointEdges(): per point, ascending edge labels (Foam::sort on the renumbered list)
-    std::vector<std::vector<label>> pointEdges;
+    // pointEdges(): per point, ascending edge labels (Foam::sort on the renumbered list). Compact
+    // (compact_list_list.cuh): one array of values and one of offsets, where it was a heap block a point.
+    CompactListList pointEdges;
     // nInternalPoints_: -1 when calcPointOrder found the points unordered
     label nInternalPoints = -1;
 
@@ -111,6 +113,19 @@ std::vector<std::vector<label>> buildEdgeFaces(
 std::vector<std::vector<label>> buildCellEdges(
     const std::vector<std::vector<label>>& cells,
     const std::vector<std::vector<label>>& faceEdges);
+
+// THE SAME THREE, COMPACT (compact_list_list.cuh): row for row what the three above give, the refinement's
+// addressing check (BRAE_CONTROL_REFINE_ADDRESSING_CHECK) holding each to its twin at every use. faceEdges is
+// shaped like the faces themselves -- a row a face, an entry a vertex -- so its offsets ARE the mesh's.
+CompactListList compactFaceEdges(
+    const PrimitiveMesh& m,
+    const MeshEdges&     me);
+CompactListList compactEdgeFaces(
+    const PrimitiveMesh& m,
+    LabelListListRef     faceEdges);
+CompactListList compactCellEdges(
+    LabelListListRef cells,
+    LabelListListRef faceEdges);
 
 
 } // namespace brae

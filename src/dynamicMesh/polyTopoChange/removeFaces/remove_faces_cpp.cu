@@ -19,7 +19,7 @@ constexpr const char* WHO = "brae removeFaces::compatibleRemoves: ";
 // is a merged cell region and OpenFOAM's own comment only hopes it is small ("Can be recursive since
 // hopefully only small area of faces removed in one go").
 void changeCellRegion(
-    const std::vector<std::vector<label>>& cellCells,
+    LabelListListRef                       cellCells,
     label                                  celli,
     label                                  oldRegion,
     label                                  newRegion,
@@ -45,7 +45,7 @@ void changeCellRegion(
 
 label compatibleRemoves(
     const PrimitiveMesh&                   m,
-    const std::vector<std::vector<label>>& cellCells,
+    LabelListListRef                       cellCells,
     const std::vector<label>&              facesToRemove,
     std::vector<label>&                    cellRegion,
     std::vector<label>&                    regionMaster,
