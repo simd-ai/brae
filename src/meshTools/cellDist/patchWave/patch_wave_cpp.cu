@@ -3,6 +3,9 @@
 #include "face_cpp.cuh"
 #include "foam_dict.cuh"
 #include "primitive_patch_cpp.cuh"
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -399,16 +402,11 @@ PatchWave patchWave(
     const label nIf = m.nInternalFaces();
     std::vector<scalar> cellDistSqr;
     std::vector<scalar> boundaryDistSqr;
-    if (runner && *runner)
-    {
-        (*runner)(m, g, seedFaces, cellDistSqr, boundaryDistSqr);
-        if (cellDistSqr.size() != static_cast<std::size_t>(m.nCells())
-         || boundaryDistSqr.size() != static_cast<std::size_t>(m.nFaces() - nIf))
-        {
-            throw std::runtime_error(std::string(WHO) + "the wave run elsewhere returned fields of another mesh.");
-        }
-    }
-    else
+    // the host's wave: FaceCellWave<wallPoint> from the seeds, the squared distance it leaves in every cell and
+    // on every boundary face
+    auto hostWave = [&](
+        std::vector<scalar>& cellOut,
+        std::vector<scalar>& boundaryOut)
     {
         std::vector<std::vector<label>> cellsBuilt;
         if (!cellsIn)
@@ -438,16 +436,61 @@ PatchWave patchWave(
         }
         const std::vector<WallPoint>& cellInfo = wave.allCellInfo();
         const std::vector<WallPoint>& faceInfo = wave.allFaceInfo();
-        cellDistSqr.resize(cellInfo.size());
+        cellOut.resize(cellInfo.size());
         for (std::size_t celli = 0; celli < cellInfo.size(); ++celli)
         {
-            cellDistSqr[celli] = cellInfo[celli].distSqr;
+            cellOut[celli] = cellInfo[celli].distSqr;
         }
-        boundaryDistSqr.resize(static_cast<std::size_t>(m.nFaces() - nIf));
-        for (std::size_t i = 0; i < boundaryDistSqr.size(); ++i)
+        boundaryOut.resize(static_cast<std::size_t>(m.nFaces() - nIf));
+        for (std::size_t i = 0; i < boundaryOut.size(); ++i)
         {
-            boundaryDistSqr[i] = faceInfo[static_cast<std::size_t>(nIf) + i].distSqr;
+            boundaryOut[i] = faceInfo[static_cast<std::size_t>(nIf) + i].distSqr;
         }
+    };
+    if (runner && *runner)
+    {
+        (*runner)(m, g, seedFaces, cellDistSqr, boundaryDistSqr);
+        if (cellDistSqr.size() != static_cast<std::size_t>(m.nCells())
+         || boundaryDistSqr.size() != static_cast<std::size_t>(m.nFaces() - nIf))
+        {
+            throw std::runtime_error(std::string(WHO) + "the wave run elsewhere returned fields of another mesh.");
+        }
+        // BRAE_CONTROL_PATCH_WAVE_CHECK=1: the host's wave runs too, and one bit's difference in any cell's or
+        // boundary face's squared distance stops the run and names it -- the identity gates' oracle
+        static const bool check = std::getenv("BRAE_CONTROL_PATCH_WAVE_CHECK") != nullptr;
+        if (check)
+        {
+            std::vector<scalar> cellHost;
+            std::vector<scalar> boundaryHost;
+            hostWave(cellHost, boundaryHost);
+            auto same = [](
+                const char* what,
+                const std::vector<scalar>& got,
+                const std::vector<scalar>& want)
+            {
+                if (got.size() == want.size()
+                 && (want.empty() || std::memcmp(got.data(), want.data(), want.size()*sizeof(scalar)) == 0))
+                {
+                    return;
+                }
+                std::size_t at = 0;
+                while (at < got.size() && at < want.size() && std::memcmp(&got[at], &want[at], sizeof(scalar)) == 0)
+                {
+                    ++at;
+                }
+                char line[200];
+                std::snprintf(line, sizeof(line), "%s %zu of %zu: %.17g, the host's %.17g", what, at, want.size(),
+                              at < got.size() ? got[at] : 0.0, at < want.size() ? want[at] : 0.0);
+                throw std::runtime_error(
+                    std::string(WHO) + "the wave run elsewhere is not the host's: squared distance, " + line);
+            };
+            same("cell", cellDistSqr, cellHost);
+            same("boundary face", boundaryDistSqr, boundaryHost);
+        }
+    }
+    else
+    {
+        hostWave(cellDistSqr, boundaryDistSqr);
     }
 
     // getValues: wallPoint::valid is distSqr > -SMALL

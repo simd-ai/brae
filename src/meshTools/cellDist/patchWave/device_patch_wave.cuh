@@ -61,6 +61,8 @@ struct DevicePatchWave
     DeviceBuffer<label> offset;
     DeviceBuffer<label> slot;
     DeviceBuffer<label> counter;
+    // what the thin front's one-launch sweeps leave for the host: see pwThinFrontKernel
+    DeviceBuffer<label> status;
     DeviceBuffer<unsigned char> scratch;
 };
 
