@@ -130,7 +130,7 @@ bool DevicePcorrSolver::solve(
         }
         else
         {
-            amg = deviceAmgPcgHierarchy(m, g, caseDir, firstBuild);
+            amg = deviceAmgPcgHierarchy(m, g, caseDir, firstBuild, amgMemo);
         }
     }
     // fvMatrix::solveSegregated: addBoundaryDiag, addBoundarySource (no coupled patch reaches here)

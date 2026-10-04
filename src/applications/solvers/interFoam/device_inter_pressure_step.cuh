@@ -103,10 +103,35 @@ struct DeviceInterPressureHooks
 // keeps its hierarchy -- it only preconditions the solve.
 // BRAE_PRESSURE_CASE_SOLVER=1 runs the case's own entry as ported instead: what every test runs, so the exact
 // gates against OpenFOAM keep their bounds (CMakeLists.txt, tests/interfoam_write/lib.sh).
+// ONE BUILD A MESH. After a change of topology two solves ask for the new mesh's hierarchy -- pcorr's, inside
+// CorrectPhi, and then p_rgh's -- and each built it: the same call on the same mesh. The hierarchy is made
+// from the internal faces' owner, neighbour and |Sf| and the cell count; nothing of either MATRIX goes in,
+// the coefficients come in at each solve through amgGalerkin. So the second one is the first one, and is
+// handed a copy of its structure (cloneAMG) in place of a build. What a solve keeps on its hierarchy -- the
+// coarse matrices' values, the smoother's spectrum, the captured graphs -- is its own copy's.
+// MEASURED: damBreakWithObstacle built 1.6 hierarchies a step for 66 ms, RAS/motorBike 2.0 for 42.
+// Held for a mesh that CHANGED only: the start mesh's second asker reads the disk cache the first one wrote.
+//   BRAE_CONTROL_AMG_HIERARCHY_REBUILT=1  every asker builds, as before
+//   BRAE_CONTROL_AMG_HIERARCHY_CHECK=1    a copy handed out is built as well and compared buffer by buffer
+//   BRAE_CONTROL_AMG_HIERARCHY_STALE=1    a gate's CONTROL, deliberately wrong: the held structure is handed
+//                                         out without asking whether it is this mesh's
+struct AmgHierarchyMemo
+{
+    bool held = false;
+    label nCells = 0;
+    std::vector<label> owner;
+    std::vector<label> neighbour;
+    std::vector<scalar> weights;
+    // never solved on: the askers get copies
+    AMGData structure;
+};
+
 struct DeviceAmgPcgCache
 {
     const PrimitiveMesh* mesh = nullptr;
     const FvGeometry* geometry = nullptr;
+    // shared with pcorr's solver (DevicePcorrSolver::amgMemo); null = this cache builds its own every time
+    AmgHierarchyMemo* memo = nullptr;
     // the case, for the hierarchy's disk cache (deviceAmgPcgHierarchy); empty = no disk cache
     std::string caseDir;
     bool built = false;
@@ -159,7 +184,8 @@ AMGData deviceAmgPcgHierarchy(
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::string& caseDir,
-    bool disk);
+    bool disk,
+    AmgHierarchyMemo* memo = nullptr);
 
 
 struct DeviceInterPressureInput

@@ -954,8 +954,11 @@ RunReport runInterFoamDevice(
     std::vector<LinearSolveRecord> initPcorrSolves;
     // THE PRESSURE RULE for pcorr: it is solved by the AMG-PCG on the GPU (DevicePcorrSolver), at the start and
     // at every mesh update, unless BRAE_PRESSURE_CASE_SOLVER asks for the case's own -- as every test does
+    // one hierarchy build a changed mesh, shared by pcorr's solve and p_rgh's (AmgHierarchyMemo)
+    AmgHierarchyMemo amgHierarchyMemo;
     DevicePcorrSolver pcorrSolver;
     pcorrSolver.caseDir = caseDir;
+    pcorrSolver.amgMemo = &amgHierarchyMemo;
     // a mesh that moves and does not refine keeps its topology, so pcorr's hierarchy is built once: the case
     // for its smoothed-aggregation hierarchy (DevicePcorrSolver::fixedTopology)
     pcorrSolver.fixedTopology = dyn != nullptr && !(f.amr && f.amr->active);
@@ -2826,6 +2829,7 @@ RunReport runInterFoamDevice(
     amgPcgCache.mesh = &m;
     amgPcgCache.geometry = &g;
     amgPcgCache.caseDir = caseDir;
+    amgPcgCache.memo = &amgHierarchyMemo;
     C.amgPcg = &amgPcgCache;
     C.gamgLog = &gamgLog;
     C.pressure.tol = f.pSolve.tol;

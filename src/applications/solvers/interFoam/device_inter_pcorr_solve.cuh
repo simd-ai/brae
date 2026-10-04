@@ -46,6 +46,9 @@ struct DevicePcorrSolver
 
     // the case, for the hierarchy's disk cache (deviceAmgPcgHierarchy); empty = no disk cache
     std::string caseDir;
+    // ONE BUILD A CHANGED MESH: shared with p_rgh's cache (AmgHierarchyMemo, device_inter_pressure_step.cuh),
+    // which asks for the same mesh's hierarchy right after this solver does. Null = each builds its own.
+    struct AmgHierarchyMemo* amgMemo = nullptr;
 
     // WHICH HIERARCHY pcorr's AMG-PCG runs on. pcorr starts from zero at every CorrectPhi and is solved to the
     // case's tolerance -- 1e-10 in the wave-maker tutorials -- so its cost is its iteration count, and on the

@@ -4,8 +4,11 @@
 #include "device_amg.cuh"          // AMGData / AMGLevel / GridColoring + writeAMGCache/loadAMGCache decls
 #include "device_amg_detail.cuh"   // useGS()/useSA() (smoother/aggregation mode) + finalizeAMG()
 #include "device_buffer.cuh"
+#include "device_ldu.cuh"          // nextDeviceAddressingId
+#include <cuda_runtime.h>
 #include <cstdio>
 #include <cstddef>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -39,6 +42,123 @@ bool rbuf(
     b.copyFrom(h);
     return true;
 }
+}
+namespace {
+template<class T>
+void dcopy(
+    DeviceBuffer<T>& dst,
+    const DeviceBuffer<T>& src)
+{
+    dst.resize(src.size());
+    if (src.size() == 0) return;
+    const cudaError_t e = cudaMemcpy(dst.data(), src.data(), src.size()*sizeof(T), cudaMemcpyDeviceToDevice);
+    if (e != cudaSuccess)
+    {
+        throw std::runtime_error(std::string("brae cloneAMG: the device copy failed: ") + cudaGetErrorString(e));
+    }
+}
+template<class T>
+bool sameBuffer(
+    const DeviceBuffer<T>& a,
+    const DeviceBuffer<T>& b)
+{
+    return a.size() == b.size() && a.host() == b.host();
+}
+}
+AMGData cloneAMG(const AMGData& S)
+{
+    AMGData A;
+    A.nFine = S.nFine;
+    A.gsSmooth = S.gsSmooth;
+    A.saSmooth = S.saSmooth;
+    A.level.resize(S.level.size());
+    for (std::size_t k = 0; k < S.level.size(); ++k)
+    {
+        const AMGLevel& s = S.level[k];
+        AMGLevel& L = A.level[k];
+        L.nFine = s.nFine;
+        L.nCoarse = s.nCoarse;
+        L.nCoarseFaces = s.nCoarseFaces;
+        L.nTriples = s.nTriples;
+        L.addressingId = nextDeviceAddressingId();
+        dcopy(L.map, s.map);
+        dcopy(L.cOwn, s.cOwn);
+        dcopy(L.cNei, s.cNei);
+        dcopy(L.cOwnerStart, s.cOwnerStart);
+        dcopy(L.cLosort, s.cLosort);
+        dcopy(L.cLosortStart, s.cLosortStart);
+        dcopy(L.faceRestrict, s.faceRestrict);
+        dcopy(L.faceFlip, s.faceFlip);
+        dcopy(L.galCellStart, s.galCellStart);
+        dcopy(L.galCellList, s.galCellList);
+        dcopy(L.galDFaceStart, s.galDFaceStart);
+        dcopy(L.galDFaceList, s.galDFaceList);
+        dcopy(L.galFaceStart, s.galFaceStart);
+        dcopy(L.galFaceList, s.galFaceList);
+        dcopy(L.galFaceFlipList, s.galFaceFlipList);
+        dcopy(L.Prow, s.Prow);
+        dcopy(L.Pcol, s.Pcol);
+        dcopy(L.Pval, s.Pval);
+        dcopy(L.rapSrcKind, s.rapSrcKind);
+        dcopy(L.rapSrcIdx, s.rapSrcIdx);
+        dcopy(L.rapDstKind, s.rapDstKind);
+        dcopy(L.rapDstIdx, s.rapDstIdx);
+        dcopy(L.rapW, s.rapW);
+        // the VALUES are Galerkin's at every solve; only their sizes are the structure's
+        L.cDiag.resize(s.nCoarse);
+        L.cUpper.resize(s.nCoarseFaces);
+        L.cLower.resize(s.nCoarseFaces);
+    }
+    A.coloring.resize(S.coloring.size());
+    for (std::size_t i = 0; i < S.coloring.size(); ++i)
+    {
+        A.coloring[i].nColors = S.coloring[i].nColors;
+        A.coloring[i].nCells = S.coloring[i].nCells;
+        dcopy(A.coloring[i].cells, S.coloring[i].cells);
+        dcopy(A.coloring[i].start, S.coloring[i].start);
+        A.coloring[i].startH = S.coloring[i].startH;
+    }
+    A.nCoarse = S.nCoarse;
+    A.nCoarseFaces = S.nCoarseFaces;
+    finalizeAMG(A, A.nFine);
+    return A;
+}
+const char* firstAMGDifference(
+    const AMGData& A,
+    const AMGData& B)
+{
+    if (A.nFine != B.nFine) return "the fine cell count";
+    if (A.gsSmooth != B.gsSmooth || A.saSmooth != B.saSmooth) return "the smoother or aggregation mode";
+    if (A.level.size() != B.level.size()) return "the number of levels";
+    for (std::size_t k = 0; k < A.level.size(); ++k)
+    {
+        const AMGLevel& a = A.level[k];
+        const AMGLevel& b = B.level[k];
+        if (a.nFine != b.nFine || a.nCoarse != b.nCoarse || a.nCoarseFaces != b.nCoarseFaces
+         || a.nTriples != b.nTriples) return "a level's sizes";
+        if (!sameBuffer(a.map, b.map)) return "a level's cell map";
+        if (!sameBuffer(a.cOwn, b.cOwn) || !sameBuffer(a.cNei, b.cNei)) return "a level's coarse addressing";
+        if (!sameBuffer(a.cOwnerStart, b.cOwnerStart) || !sameBuffer(a.cLosort, b.cLosort)
+         || !sameBuffer(a.cLosortStart, b.cLosortStart)) return "a level's coarse gather lists";
+        if (!sameBuffer(a.faceRestrict, b.faceRestrict) || !sameBuffer(a.faceFlip, b.faceFlip))
+            return "a level's face restriction";
+        if (!sameBuffer(a.galCellStart, b.galCellStart) || !sameBuffer(a.galCellList, b.galCellList)
+         || !sameBuffer(a.galDFaceStart, b.galDFaceStart) || !sameBuffer(a.galDFaceList, b.galDFaceList)
+         || !sameBuffer(a.galFaceStart, b.galFaceStart) || !sameBuffer(a.galFaceList, b.galFaceList)
+         || !sameBuffer(a.galFaceFlipList, b.galFaceFlipList)) return "a level's Galerkin gather lists";
+        if (!sameBuffer(a.Prow, b.Prow) || !sameBuffer(a.Pcol, b.Pcol) || !sameBuffer(a.Pval, b.Pval))
+            return "a level's prolongator";
+        if (!sameBuffer(a.rapSrcKind, b.rapSrcKind) || !sameBuffer(a.rapSrcIdx, b.rapSrcIdx)
+         || !sameBuffer(a.rapDstKind, b.rapDstKind) || !sameBuffer(a.rapDstIdx, b.rapDstIdx)
+         || !sameBuffer(a.rapW, b.rapW)) return "a level's RAP recipe";
+    }
+    if (A.coloring.size() != B.coloring.size()) return "the number of colourings";
+    for (std::size_t i = 0; i < A.coloring.size(); ++i)
+    {
+        if (A.coloring[i].nColors != B.coloring[i].nColors || A.coloring[i].startH != B.coloring[i].startH
+         || !sameBuffer(A.coloring[i].cells, B.coloring[i].cells)) return "a colouring";
+    }
+    return nullptr;
 }
 void writeAMGCache(
     const AMGData& A,

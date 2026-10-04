@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -748,9 +749,10 @@ AMGData deviceAmgPcgHierarchy(
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::string& caseDir,
-    bool disk)
+    bool disk,
+    AmgHierarchyMemo* memo)
 {
-    interPhase::Nested timed("pressure: AMG hierarchy (load or build)");
+    interPhase::Nested timed("pressure: AMG hierarchy (load, build or copy)");
     static const bool cacheOff = []()
     {
         const char* e = std::getenv("BRAE_AMG_CACHE");
@@ -772,10 +774,56 @@ AMGData deviceAmgPcgHierarchy(
     const std::vector<label> own(m.owner().begin(), m.owner().begin() + nIf);
     const std::vector<label> nei(m.neighbour().begin(), m.neighbour().begin() + nIf);
     const std::vector<scalar> w(g.magSf().begin(), g.magSf().begin() + nIf);
+    // ONE BUILD A CHANGED MESH (AmgHierarchyMemo): the second asker takes a copy of the first one's structure
+    static const bool rebuilt = std::getenv("BRAE_CONTROL_AMG_HIERARCHY_REBUILT") != nullptr;
+    static const bool check = std::getenv("BRAE_CONTROL_AMG_HIERARCHY_CHECK") != nullptr;
+    static const bool stale = std::getenv("BRAE_CONTROL_AMG_HIERARCHY_STALE") != nullptr;
+    const bool remember = memo && !useDisk && !rebuilt;
+    if (remember && memo->held
+     && (stale || (memo->nCells == nC && memo->owner == own && memo->neighbour == nei
+                && memo->weights.size() == w.size()
+                && std::memcmp(memo->weights.data(), w.data(), w.size()*sizeof(scalar)) == 0)))
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            std::printf("  AMG hierarchy: a changed mesh's is built once and copied to the second solve that "
+                        "asks; BRAE_CONTROL_AMG_HIERARCHY_REBUILT=1 builds it for each\n");
+            if (stale)
+            {
+                std::printf("  *** CONTROL MODE: the held hierarchy is handed out without asking whether it "
+                            "is this mesh's. This run is deliberately wrong. ***\n");
+            }
+        }
+        interPhase::Nested timedCopy("pressure: AMG hierarchy copied from the one already built");
+        AMGData copy = cloneAMG(memo->structure);
+        if (check)
+        {
+            const AMGData fresh = buildAMG(own, nei, w, nC);
+            const char* what = firstAMGDifference(copy, fresh);
+            if (what)
+            {
+                throw std::runtime_error(
+                    std::string("brae interFoam: BRAE_CONTROL_AMG_HIERARCHY_CHECK: of the copied hierarchy, ")
+                    + what + " is not what building it for this mesh gives.");
+            }
+        }
+        return copy;
+    }
     AMGData built = buildAMG(own, nei, w, nC);
     if (useDisk)
     {
         writeAMGCache(built, path);
+    }
+    if (remember)
+    {
+        memo->structure = cloneAMG(built);
+        memo->held = true;
+        memo->nCells = nC;
+        memo->owner = own;
+        memo->neighbour = nei;
+        memo->weights = w;
     }
     return built;
 }
@@ -789,7 +837,7 @@ AMGData& DeviceAmgPcgCache::get(unsigned long long id)
     if (!built || addressingId != id)
     {
         // the disk cache is the START mesh's: a rebuild after a refinement is another mesh
-        amg = deviceAmgPcgHierarchy(*mesh, *geometry, caseDir, !built);
+        amg = deviceAmgPcgHierarchy(*mesh, *geometry, caseDir, !built, memo);
         built = true;
         addressingId = id;
     }

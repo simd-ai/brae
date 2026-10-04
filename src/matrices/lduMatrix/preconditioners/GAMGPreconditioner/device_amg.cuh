@@ -203,6 +203,12 @@ AMGData buildAMG(const std::vector<label>& fineOwner, const std::vector<label>& 
 // Galerkin-rebuilt each step). loadAMGCache returns false (caller rebuilds) on any mismatch/corruption/mode change.
 void writeAMGCache(const AMGData& A, const std::string& path);
 bool loadAMGCache(const std::string& path, AMGData& A);
+// A SECOND HIERARCHY OF THE SAME STRUCTURE, copied device to device: what loadAMGCache does through a file,
+// without the file or the host. The copy's levels take addressing ids of their own, as a build's do, and its
+// per-solve state (the smoother's spectrum, the captured graphs, the coarse matrices' values) starts fresh.
+AMGData cloneAMG(const AMGData& A);
+// the first part of the two hierarchies' STRUCTURE that differs, or null: the check a clone is held to
+const char* firstAMGDifference(const AMGData& A, const AMGData& B);
 // Build the hierarchy, or reload cacheDir/.brae_amgcache if valid (newer than cacheDir/owner). writeCache persists it.
 AMGData buildOrLoadAMG(const std::vector<label>& fineOwner, const std::vector<label>& fineNei,
                        const std::vector<scalar>& faceWeights, int nFine, const std::string& cacheDir, bool writeCache);
