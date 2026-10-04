@@ -12,6 +12,8 @@
 #include "device_fv_geometry.cuh"
 #include "device_patch_wave.cuh"
 #include "device_swept_volumes.cuh"
+#include <limits>
+#include <map>
 #include <cstring>
 #include <optional>
 #include <set>
@@ -213,6 +215,30 @@ __global__ void nHatStencilInternalKernel(
     accz[k] = acc.z;
 }
 
+// out = s*in: sigma*K, the cell field the surface tension's face value is interpolated from
+__global__
+void scaledCopyKernel(
+    int n,
+    scalar s,
+    const scalar* __restrict__ in,
+    scalar* __restrict__ out)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) out[i] = s*in[i];
+}
+
+// out = a*b, face for face: the surface-tension flux on a pair's faces
+__global__
+void faceProductKernel(
+    int n,
+    const scalar* __restrict__ a,
+    const scalar* __restrict__ b,
+    scalar* __restrict__ out)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) out[i] = a[i]*b[i];
+}
+
 // fvc::snGrad's INTERNAL faces on the device, the host's arithmetic term for term (fvc.cu): the orthogonal
 // part dc*(N - P), and under `corrected` the correction vector dotted with grad interpolated w*P + (1 - w)*N,
 // capped by `limited <psi>`. The patch faces are the host's (snGradBoundary), which needs no gradient.
@@ -275,14 +301,17 @@ __global__ void surfaceTensionInternalKernel(
 
 // fvc::snGrad's PATCH faces for an uncoupled patch, from the patch field's gradient coefficients and its face
 // cells -- the host's branch, alone (fvc.cu); flattened in the device's boundary order (no coupled patch)
+// `skipCoupled`: a coupled patch's faces are left out -- the device's boundary numbering, which holds none
 std::vector<scalar> snGradBoundary(
     const GeometricField<scalar>& vf,
-    const std::vector<FvPatch>& fvp)
+    const std::vector<FvPatch>& fvp,
+    bool skipCoupled = false)
 {
     std::vector<scalar> out;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         const FvPatch& fp = fvp[pi];
+        if (skipCoupled && isCoupledInterfaceType(fp.type)) continue;
         const std::vector<scalar> gIC = vf.boundary[pi]->gradientInternalCoeffs();
         const std::vector<scalar> gBC = vf.boundary[pi]->gradientBoundaryCoeffs();
         for (label i = 0; i < fp.size; ++i)
@@ -478,6 +507,10 @@ RunReport runInterFoamDevice(
     DeviceBuffer<scalar> dStfIf, dSnRhoIf, dGhfIf;
     // ...and snGrad(p_rgh) on the pair, for the momentum predictor's force (the same hook, the same call)
     DeviceBuffer<scalar> dSnPrghIf;
+    // the device's pair, for the hooks: they are defined before it is built, and read it through this
+    const DeviceCyclic* cycForHooks = nullptr;
+    // ...and the device's p_rgh, likewise
+    const DeviceBuffer<scalar>* prghForHooks = nullptr;
     // The pair's flux, for the HOST fields the hooks read. cyc.phi is the device's copy and the only
     // current one; a condition that looks phi up on a coupled patch -- porousBafflePressure computes
     // its jump from it -- reads f.phi.boundary there, which the unflatten deliberately does not touch
@@ -1451,6 +1484,55 @@ RunReport runInterFoamDevice(
                 acc[k] = vector{a3[k], a3[k + acc.size()], a3[k + 2*acc.size()]};
             }
             interfaceProps::finishNHatBoundary(f.alpha1, f.interface, g, fvp, nHatStencil, acc, nHb);
+            // BRAE_CONTROL_NHAT_BOUNDARY_CHECK=1: calculateK whole as well, and every patch face's normal
+            // compared -- the identity check for a mesh whose runs do not reproduce (a coupled pair's products
+            // sum atomically), where two runs cannot be compared file for file. BIT FOR BIT where the host formed
+            // the gradient (BRAE_CONTROL_NHAT_HOST_GRADIENT=1): the same arithmetic in the same order. Where the
+            // kernel formed it, within 6e-7 of the largest normal on the boundary: the kernel's sums and the
+            // host's differ in the last bit of a term, which is all there is of the gradient of a uniform alpha,
+            // and nHat divides it by deltaN. MEASURED on RAS/mixerVesselAMI over two steps: the widest gap
+            // 3.3e-12 of a largest normal 5.3e-05 (6.2e-08 of it); the bound is a decade above. With the patch
+            // faces' terms left out the first face caught is 5.0e-09 off, with the neighbour side's 1.8e-09.
+            static const bool boundaryCheck = std::getenv("BRAE_CONTROL_NHAT_BOUNDARY_CHECK") != nullptr;
+            if (boundaryCheck)
+            {
+                SurfaceScalarField whole;
+                std::vector<scalar> Kwhole;
+                interfaceProps::calculateK(f.alpha1, f.interface, m, g, fvp, false, whole, Kwhole);
+                scalar largest = 0;
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                {
+                    if (fvp[pi].type == "empty") continue;
+                    for (const scalar v : whole.boundary[pi])
+                    {
+                        largest = std::max(largest, std::abs(v));
+                    }
+                }
+                const scalar allowed = nHatHostGradient ? scalar(0) : scalar(6e-7)*largest;
+                static scalar worst = -1;
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                {
+                    if (fvp[pi].type == "empty") continue;
+                    for (std::size_t i = 0; i < whole.boundary[pi].size(); ++i)
+                    {
+                        const scalar gap = std::abs(nHb.boundary[pi][i] - whole.boundary[pi][i]);
+                        if (gap > worst && largest > 0)
+                        {
+                            worst = gap;
+                            std::printf("  nHat boundary check: the widest gap so far %.3e of a largest normal "
+                                        "%.3e (patch %s)\n", gap, largest, fvp[pi].name.c_str());
+                        }
+                        if (gap <= allowed) continue;
+                        char buf[320];
+                        std::snprintf(buf, sizeof(buf),
+                                      "brae interFoam: BRAE_CONTROL_NHAT_BOUNDARY_CHECK: the boundary normal of "
+                                      "patch %s, face %zu is %.17g from the boundary's own cells and %.17g from "
+                                      "calculateK whole (allowed %.3e).", fvp[pi].name.c_str(), i,
+                                      nHb.boundary[pi][i], whole.boundary[pi][i], allowed);
+                        throw std::runtime_error(buf);
+                    }
+                }
+            }
             return;
         }
         std::vector<scalar> Kb;
@@ -2022,15 +2104,31 @@ RunReport runInterFoamDevice(
         // dropped the same line, inter_driver_cpp.cu's alphaSubCycle stage). MEASURED on
         // RAS/electrostaticDeposition at step two: 240 variableHeightFlowRate faces 5.1256e-10 from the
         // value OpenFOAM wrote, exactly on its owner cell.
+        std::optional<interPhase::Nested> forcesPart;
+        forcesPart.emplace("forces hook: alpha, K and rho down");
         a.copyTo(f.alpha1.internal);
         Kd.copyTo(f.K);
         rd.copyTo(f.rho);
+        forcesPart.reset();
         // THE FACE LOOPS ON THE DEVICE where no pair is in them: the internal faces of the surface-tension
         // flux and of snGrad(rho) by the kernels above, the patch faces by the host's own branch. MEASURED on
         // RAS/DTCHull (845,536 cells): this hook 57 ms a step on the host, of which snGrad(rho) and its upload
         // 25, snGrad(alpha) 12 and the flux's product and upload 11. BRAE_CONTROL_FORCES_HOST=1 keeps the host's
         // whole -- the identity check's other arm.
-        const bool forcesOnDevice = cyclics.empty() && std::getenv("BRAE_CONTROL_FORCES_HOST") == nullptr;
+        // ...AND WHERE ONE IS (2026-10-05): the gradient takes the pair's terms (deviceGradOf's cyc), the patch
+        // faces the host forms are the uncoupled ones, and the pair's own faces are the device's -- snGrad
+        // across the pair (deviceCyclicSnGrad) and sigma*K interpolated on its weights. A coupled mesh took the
+        // host's whole: MEASURED on RAS/mixerVesselAMI (894,950 cells), snGrad(alpha) 33.8 and snGrad(rho) 39.0
+        // ms a step. BRAE_CONTROL_FORCES_PAIR_HOST=1 keeps a coupled mesh on the host, as before.
+        static const bool forcesPairHost = std::getenv("BRAE_CONTROL_FORCES_PAIR_HOST") != nullptr;
+        // ...not where a correction's gradient is cell-limited: the limiter's range across a pair is the
+        // caller's to supply (deviceGradOf), and this hook does not
+        const bool limitedAcrossPair = f.snGradScheme.corrected
+                                    && (f.gradAlpha1.cellLimitK > scalar(0) || f.gradRho.cellLimitK > scalar(0));
+        const bool pairOnDevice = !cyclics.empty() && cycForHooks != nullptr && !forcesPairHost
+                               && !limitedAcrossPair;
+        const bool forcesOnDevice = (cyclics.empty() || pairOnDevice)
+                                 && std::getenv("BRAE_CONTROL_FORCES_HOST") == nullptr;
         // BRAE_CONTROL_FORCES_NO_CORRECTION=1 drops the non-orthogonal correction from the device's face loop --
         // the identity gate's control, which has to show the comparison can fail
         static const bool forcesNoCorrection = std::getenv("BRAE_CONTROL_FORCES_NO_CORRECTION") != nullptr;
@@ -2042,13 +2140,22 @@ RunReport runInterFoamDevice(
             const DeviceBuffer<scalar>& v,
             const DeviceBuffer<scalar>& bval,
             const GradChoice& gradChoice,
+            DeviceBuffer<scalar>& gx,
+            DeviceBuffer<scalar>& gy,
+            DeviceBuffer<scalar>& gz,
             DeviceBuffer<scalar>& out)
         {
             out.resize(static_cast<std::size_t>(nIf));
-            DeviceBuffer<scalar> gx, gy, gz;
             if (snCorrD)
             {
-                deviceGradOf(dm, v, bval, gradChoice.leastSquares, gradChoice.cellLimitK, gx, gy, gz);
+                deviceGradOf(dm, v, bval, gradChoice.leastSquares, gradChoice.cellLimitK, gx, gy, gz,
+                             pairOnDevice ? cycForHooks : nullptr);
+                // a Gauss gradient's terms on the pair's faces are the caller's to add (deviceGradOf hands the
+                // pair to the least-squares scheme alone), as the alpha step adds them
+                if (pairOnDevice && !gradChoice.leastSquares)
+                {
+                    deviceCyclicAddGrad(*cycForHooks, v, dm.V, gx, gy, gz);
+                }
             }
             const DeviceBuffer<scalar>& dcf = (snCorrD || snNonOrthD) ? dm.nonOrthDc : dm.dc;
             snGradInternalKernel<<<blocksIf, 256>>>(
@@ -2071,21 +2178,100 @@ RunReport runInterFoamDevice(
                 cudaCheck(cudaStreamSynchronize(cudaStreamPerThread), "forces boundary sync");
             }
         };
+        // BRAE_CONTROL_FORCES_CHECK=1: the host's whole as well, and every face compared -- internal, patch and
+        // pair. Within a bound relative to each field's largest value: the device's sums differ from the host's
+        // in a last bit, and a coupled mesh's runs cannot be compared file for file.
+        static const bool forcesCheck = std::getenv("BRAE_CONTROL_FORCES_CHECK") != nullptr;
+        // `floor`: an absolute allowance beside the relative one. A pair's snGrad is dc*(pnf - p_own) with pnf a
+        // weighted sum over the other side; where the field is uniform that is the sum's rounding and nothing
+        // else, the same size on the host and on the device and not the same number -- MEASURED on
+        // RAS/mixerVesselAMI's first step, snGrad(p_rgh) on the pair -8.4e-09 for -2.1e-08 with p_rgh at rest.
+        // pairFloor(field) is eight rounding units of the field's largest value times the pair's largest dc.
+        const auto pairFloor = [&](const std::vector<scalar>& cells)
+        {
+            scalar largest = 0;
+            for (const scalar v : cells)
+            {
+                largest = std::max(largest, std::abs(v));
+            }
+            scalar dcMax = 0;
+            for (const FvPatch& q : fvp)
+            {
+                if (!q.coupled) continue;
+                for (const scalar d : q.nonOrthDeltaCoeffs)
+                {
+                    dcMax = std::max(dcMax, std::abs(d));
+                }
+            }
+            return scalar(8)*std::numeric_limits<scalar>::epsilon()*largest*dcMax;
+        };
+        const auto held = [](
+            const char* what,
+            const DeviceBuffer<scalar>& have,
+            const std::vector<scalar>& want,
+            scalar floor = scalar(0))
+        {
+            const std::vector<scalar> h = have.host();
+            if (h.size() != want.size())
+            {
+                throw std::runtime_error(std::string("brae interFoam: BRAE_CONTROL_FORCES_CHECK: ") + what
+                                         + " has " + std::to_string(h.size()) + " faces on the device and "
+                                         + std::to_string(want.size()) + " on the host.");
+            }
+            scalar largest = 0;
+            scalar widest = 0;
+            std::size_t at = 0;
+            for (std::size_t i = 0; i < want.size(); ++i)
+            {
+                largest = std::max(largest, std::abs(want[i]));
+                if (std::abs(h[i] - want[i]) > widest)
+                {
+                    widest = std::abs(h[i] - want[i]);
+                    at = i;
+                }
+            }
+            static std::map<std::string, scalar> seen;
+            const scalar ratio = largest > 0 ? widest/largest : scalar(0);
+            if (ratio > seen[what])
+            {
+                seen[what] = ratio;
+                std::printf("  forces check: %s, the widest gap so far %.3e of its largest %.3e\n", what,
+                            widest, largest);
+            }
+            // MEASURED on RAS/mixerVesselAMI over two steps, the widest gap of each as a part of its
+            // largest value: the flux 5.3e-17, snGrad(rho) 1.1e-16, the flux on the pair 1.9e-14,
+            // snGrad(rho) on the pair 2.7e-13. The bound is a decade above the widest of the four. With
+            // the correction dropped from the device's face loops the flux is 2.2e-01 off.
+            if (widest > scalar(3e-12)*largest + floor)
+            {
+                char buf[300];
+                std::snprintf(buf, sizeof(buf),
+                              "brae interFoam: BRAE_CONTROL_FORCES_CHECK: %s, face %zu is %.17g on the "
+                              "device and %.17g on the host (largest %.3e).", what, at, h[at], want[at],
+                              largest);
+                throw std::runtime_error(buf);
+            }
+        };
         if (forcesOnDevice)
         {
             // surfaceTensionForce() = interpolate(sigma*K)*snGrad(alpha1)
+            forcesPart.emplace("forces hook (device): the surface-tension flux");
             const DeviceBuffer<scalar> alphaBval(patchValues(f.alpha1, fvp));
             DeviceBuffer<scalar> stfInternal;
-            deviceSnGradInternal(a, alphaBval, f.gradAlpha1, stfInternal);
+            DeviceBuffer<scalar> gAx;
+            DeviceBuffer<scalar> gAy;
+            DeviceBuffer<scalar> gAz;
+            deviceSnGradInternal(a, alphaBval, f.gradAlpha1, gAx, gAy, gAz, stfInternal);
             surfaceTensionInternalKernel<<<blocksIf, 256>>>(
                 nIf, dm.owner.data(), dm.nei.data(), dm.w.data(), Kd.data(), f.interface.sigma, stfInternal.data());
             cudaCheck(cudaGetLastError(), "surfaceTensionInternal");
-            const std::vector<scalar> snAB = snGradBoundary(f.alpha1, fvp);
+            const std::vector<scalar> snAB = snGradBoundary(f.alpha1, fvp, true);
             std::vector<scalar> stfB(snAB.size());
             {
                 std::size_t k = 0;
                 for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                 {
+                    if (isCoupledInterfaceType(fvp[pi].type)) continue;
                     for (label i = 0; i < fvp[pi].size; ++i, ++k)
                     {
                         const scalar sKb = f.interface.sigma*f.K[static_cast<std::size_t>(fvp[pi].faceCells[i])];
@@ -2094,8 +2280,33 @@ RunReport runInterFoamDevice(
                 }
             }
             appendBoundary(stf, stfInternal, stfB);
+            if (pairOnDevice)
+            {
+                // ...and on the pair's faces: interpolate(sigma*K) on the pair's weights times snGrad(alpha)
+                // across it, what fvc::interpolate and fvc::snGrad fill a coupled patch with
+                const int nPairFaces = cycForHooks->n;
+                DeviceBuffer<scalar> sKd(static_cast<std::size_t>(m.nCells()));
+                scaledCopyKernel<<<(m.nCells() + 255)/256, 256>>>(m.nCells(), f.interface.sigma, Kd.data(),
+                                                                  sKd.data());
+                cudaCheck(cudaGetLastError(), "sigma*K");
+                DeviceBuffer<scalar> sKfPair;
+                deviceCyclicFaceValue(*cycForHooks, sKd, sKfPair);
+                DeviceBuffer<scalar> snAPair;
+                deviceCyclicSnGrad(*cycForHooks, a, gAx, gAy, gAz, snCorrD && !forcesNoCorrection, snLimD,
+                                   snNonOrthD, snAPair);
+                dStfIf.resize(static_cast<std::size_t>(nPairFaces));
+                if (nPairFaces > 0)
+                {
+                    faceProductKernel<<<(nPairFaces + 255)/256, 256>>>(nPairFaces, sKfPair.data(), snAPair.data(),
+                                                                      dStfIf.data());
+                    cudaCheck(cudaGetLastError(), "the pair's surface-tension flux");
+                }
+            }
 
-            // rho's CALCULATED patch values, from the device's own blend -- see the host branch below
+            // rho's CALCULATED patch values, from the device's own blend -- see the host branch below, whose
+            // walk this is: the device's boundary array has no coupled patch in it, and a coupled patch's rho is
+            // its two cells interpolated
+            forcesPart.emplace("forces hook (device): snGrad(rho)");
             std::vector<scalar> rbFlat;
             rhoBd.copyTo(rbFlat);
             std::vector<std::vector<scalar>> rb(fvp.size());
@@ -2103,7 +2314,17 @@ RunReport runInterFoamDevice(
                 std::size_t off = 0;
                 for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                 {
-                    const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+                    const FvPatch& q = fvp[pi];
+                    const std::size_t n = static_cast<std::size_t>(q.size);
+                    if (isCoupledInterfaceType(q.type))
+                    {
+                        rb[pi].resize(n);
+                        for (label i = 0; i < q.size; ++i)
+                        {
+                            rb[pi][static_cast<std::size_t>(i)] = coupledLinear(q, i, f.rho);
+                        }
+                        continue;
+                    }
                     rb[pi].assign(rbFlat.begin() + off, rbFlat.begin() + off + n);
                     off += n;
                 }
@@ -2115,13 +2336,55 @@ RunReport runInterFoamDevice(
             }
             const GeometricField<scalar> rhoF = rhoWithPatchValues(f.rho, rb, fvp);
             DeviceBuffer<scalar> snRhoInternal;
-            deviceSnGradInternal(rd, rhoBd, f.gradRho, snRhoInternal);
-            appendBoundary(snRho, snRhoInternal, snGradBoundary(rhoF, fvp));
+            DeviceBuffer<scalar> gRx;
+            DeviceBuffer<scalar> gRy;
+            DeviceBuffer<scalar> gRz;
+            deviceSnGradInternal(rd, rhoBd, f.gradRho, gRx, gRy, gRz, snRhoInternal);
+            appendBoundary(snRho, snRhoInternal, snGradBoundary(rhoF, fvp, true));
+            if (pairOnDevice)
+            {
+                deviceCyclicSnGrad(*cycForHooks, rd, gRx, gRy, gRz, snCorrD && !forcesNoCorrection, snLimD,
+                                   snNonOrthD, dSnRhoIf);
+            }
+            if (forcesCheck)
+            {
+                forcesPart.emplace("forces hook: BRAE_CONTROL_FORCES_CHECK");
+                std::vector<scalar> sK;
+                interfaceProps::sigmaK(f.K, f.interface.sigma, sK);
+                const SurfaceScalarField sKf = fvc::interpolate(sK, m, g, fvp);
+                const SurfaceScalarField snA = fvc::snGrad(f.alpha1, m, g, fvp, snCorrD,
+                                                           f.gradAlpha1.leastSquares, f.gradAlpha1.cellLimitK,
+                                                           snLimD, snNonOrthD);
+                SurfaceScalarField t;
+                t.internal.resize(static_cast<std::size_t>(nIf));
+                for (label i = 0; i < nIf; ++i)
+                {
+                    t.internal[i] = sKf.internal[i]*snA.internal[i];
+                }
+                t.boundary.resize(fvp.size());
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                {
+                    for (label i = 0; i < fvp[pi].size; ++i)
+                    {
+                        t.boundary[pi].push_back(sKf.boundary[pi][i]*snA.boundary[pi][i]);
+                    }
+                }
+                const SurfaceScalarField snRhoF = fvc::snGrad(rhoF, m, g, fvp, snCorrD, f.gradRho.leastSquares,
+                                                              f.gradRho.cellLimitK, snLimD, snNonOrthD);
+                held("the surface-tension flux", stf, fullFace(t, fvp));
+                held("snGrad(rho)", snRho, fullFace(snRhoF, fvp));
+                if (pairOnDevice)
+                {
+                    held("the surface-tension flux on the pair", dStfIf, coupledFace(t, cyclics));
+                    held("snGrad(rho) on the pair", dSnRhoIf, coupledFace(snRhoF, cyclics), pairFloor(f.rho));
+                }
+            }
         }
         else
         {
             // surfaceTensionForce() = interpolate(sigma*K)*snGrad(alpha1), boundary INCLUDED -- at a
             // contact-angle wall that boundary term is the contact angle's only route into the equations.
+            forcesPart.emplace("forces hook (host): interpolate(sigma*K)");
             std::vector<scalar> sK;
             interfaceProps::sigmaK(f.K, f.interface.sigma, sK);
             const SurfaceScalarField sKf = fvc::interpolate(sK, m, g, fvp);
@@ -2134,9 +2397,11 @@ RunReport runInterFoamDevice(
             // ...and WHICH delta coefficients: `uncorrected` and `limited 0` take nonOrthDeltaCoeffs
             // without the correction (uncorrectedSnGrad.H:113-119), which `orthogonal` does not
             const bool snNonOrth = f.snGradScheme.nonOrthCoeffs;
+            forcesPart.emplace("forces hook (host): snGrad(alpha), its gradient with it");
             const SurfaceScalarField snA = fvc::snGrad(f.alpha1, m, g, fvp, snCorr,
                                                        f.gradAlpha1.leastSquares, f.gradAlpha1.cellLimitK, snLim,
                                                        snNonOrth);
+            forcesPart.emplace("forces hook (host): the surface-tension flux and its upload");
             SurfaceScalarField t;
             t.internal.resize(static_cast<std::size_t>(nIf));
             for (label i = 0; i < nIf; ++i) t.internal[i] = sKf.internal[i]*snA.internal[i];
@@ -2152,6 +2417,7 @@ RunReport runInterFoamDevice(
 
             // rho's CALCULATED patch values, from the device's own blend (which carries alpha2's
             // one-pass-older patch values) -- not a zeroGradient copy. See rhoWithPatchValues.
+            forcesPart.emplace("forces hook (host): rho's patch values");
             std::vector<scalar> rbFlat;
             rhoBd.copyTo(rbFlat);
             std::vector<std::vector<scalar>> rb(fvp.size());
@@ -2187,6 +2453,7 @@ RunReport runInterFoamDevice(
             {
                 deviceCopy(dStepRhoBnd, rhoBd);
             }
+            forcesPart.emplace("forces hook (host): snGrad(rho), its gradient with it, and the upload");
             const GeometricField<scalar> rhoF = rhoWithPatchValues(f.rho, rb, fvp);
             const SurfaceScalarField snRhoF = fvc::snGrad(rhoF, m, g, fvp, snCorr, f.gradRho.leastSquares,
                                                           f.gradRho.cellLimitK, snLim, snNonOrth);
@@ -2195,6 +2462,7 @@ RunReport runInterFoamDevice(
         }
 
         // the mixture's own nu. NOTE mixtureNu's second argument is mu, not alpha2.
+        forcesPart.emplace("forces hook: the mixture's mu and nu, the pair's share, nu up");
         cpu::twoPhase::mixtureMu(f.alpha1.internal, f.mixture.phases, f.mu);
         cpu::twoPhase::mixtureNu(f.alpha1.internal, f.mu, f.mixture.phases, f.nu);
         // ...and the COUPLED patches' share of the mixture boundary, which is the two CELLS'
@@ -2244,6 +2512,7 @@ RunReport runInterFoamDevice(
 
         // snGrad(p_rgh) is read ONLY when the case runs a momentum predictor; it is explicit there and
         // implicit in the pressure equation, and carrying it into both would count it twice.
+        forcesPart.emplace("forces hook: snGrad(p_rgh) for the momentum predictor");
         if (f.momentumPredictorOn)
         {
             // the gradient the last constrainPressure left, and zero only before the first -- see the
@@ -2255,11 +2524,62 @@ RunReport runInterFoamDevice(
                 f.p_rgh.boundary[pi]->updateSnGrad(
                     std::vector<scalar>(static_cast<std::size_t>(fvp[pi].size), scalar(0)));
             }
-            const SurfaceScalarField snPF = fvc::snGrad(f.p_rgh, m, g, fvp, f.snGradScheme.corrected,
-                                                        f.gradPrgh.leastSquares, f.gradPrgh.cellLimitK,
-                                                        f.snGradScheme.limitCoeff, f.snGradScheme.nonOrthCoeffs);
-            snP.copyFrom(fullFace(snPF, fvp));
-            if (!cyclics.empty()) dSnPrghIf.copyFrom(coupledFace(snPF, cyclics));
+            // ON THE DEVICE, as the two above: the internal faces by the kernel on the device's own p_rgh, the
+            // uncoupled patch faces by the host (the same gradient coefficients fvc::snGrad reads), a pair's
+            // faces by deviceCyclicSnGrad. It was the host's whole on every mesh: MEASURED on
+            // RAS/mixerVesselAMI, 38.6 ms a step. NOT where a jump crosses a pair (the neighbour value is then
+            // the cell's less the jump, which the pair's kernel does not carry), nor where the correction's
+            // gradient is cell-limited across a pair. BRAE_CONTROL_FORCES_PRGH_HOST=1 keeps the host's.
+            static const bool prghHost = std::getenv("BRAE_CONTROL_FORCES_PRGH_HOST") != nullptr;
+            bool pairJump = false;
+            for (const CyclicInterface& c : cyclics)
+            {
+                const std::vector<scalar>* j = f.p_rgh.boundary[static_cast<std::size_t>(c.patch)]->coupledJump();
+                if (j && !j->empty()) pairJump = true;
+            }
+            const bool prghLimitedAcrossPair = !cyclics.empty() && f.snGradScheme.corrected
+                                            && f.gradPrgh.cellLimitK > scalar(0);
+            const bool prghOnDevice = !prghHost && forcesOnDevice && prghForHooks != nullptr
+                                   && prghForHooks->size() == static_cast<std::size_t>(m.nCells())
+                                   && !pairJump && !prghLimitedAcrossPair;
+            if (prghOnDevice)
+            {
+                const DeviceBuffer<scalar> pBval(patchValues(f.p_rgh, fvp));
+                DeviceBuffer<scalar> snPInternal;
+                DeviceBuffer<scalar> gPx;
+                DeviceBuffer<scalar> gPy;
+                DeviceBuffer<scalar> gPz;
+                deviceSnGradInternal(*prghForHooks, pBval, f.gradPrgh, gPx, gPy, gPz, snPInternal);
+                appendBoundary(snP, snPInternal, snGradBoundary(f.p_rgh, fvp, true));
+                if (pairOnDevice)
+                {
+                    deviceCyclicSnGrad(*cycForHooks, *prghForHooks, gPx, gPy, gPz,
+                                       f.snGradScheme.corrected && !forcesNoCorrection, f.snGradScheme.limitCoeff,
+                                       f.snGradScheme.nonOrthCoeffs, dSnPrghIf);
+                }
+                if (forcesCheck)
+                {
+                    const SurfaceScalarField snPF = fvc::snGrad(f.p_rgh, m, g, fvp, f.snGradScheme.corrected,
+                                                                f.gradPrgh.leastSquares, f.gradPrgh.cellLimitK,
+                                                                f.snGradScheme.limitCoeff,
+                                                                f.snGradScheme.nonOrthCoeffs);
+                    held("snGrad(p_rgh)", snP, fullFace(snPF, fvp));
+                    if (pairOnDevice)
+                    {
+                        held("snGrad(p_rgh) on the pair", dSnPrghIf, coupledFace(snPF, cyclics),
+                             pairFloor(f.p_rgh.internal));
+                    }
+                }
+            }
+            else
+            {
+                const SurfaceScalarField snPF = fvc::snGrad(f.p_rgh, m, g, fvp, f.snGradScheme.corrected,
+                                                            f.gradPrgh.leastSquares, f.gradPrgh.cellLimitK,
+                                                            f.snGradScheme.limitCoeff,
+                                                            f.snGradScheme.nonOrthCoeffs);
+                snP.copyFrom(fullFace(snPF, fvp));
+                if (!cyclics.empty()) dSnPrghIf.copyFrom(coupledFace(snPF, cyclics));
+            }
         }
         else snP.resize(0);
     };
@@ -2704,6 +3024,7 @@ RunReport runInterFoamDevice(
     // neighbour cells and weights are already filled. Its VOLUMETRIC FLUX is state of the same kind as
     // phi: seeded from the field the case started with, rewritten by every pressure corrector.
     DeviceCyclic dCyc = buildDeviceCyclic(cyclics, g, fvp);
+    cycForHooks = &dCyc;
     DeviceBuffer<scalar> dAlphaPhiIf, dRhoPhiIf;
     if (dCyc.n > 0)
     {
@@ -3242,6 +3563,7 @@ RunReport runInterFoamDevice(
     }
     DeviceBuffer<scalar> dPhiI(f.phi.internal);
     DeviceBuffer<scalar> dPrgh(f.p_rgh.internal), dP;
+    prghForHooks = &dPrgh;
     DeviceBuffer<scalar> dNH(f.nHatf.internal), dNHB(flattenPatches(f.nHatf.boundary, fvp));
     // ...and ON THE PAIR, seeded from the same field buildInterFields built: at the first step of a
     // run that normal is calculateK's own.

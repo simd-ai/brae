@@ -419,9 +419,26 @@ NHatBoundaryStencil nHatBoundaryStencil(
     std::vector<char> wanted(static_cast<std::size_t>(nC), 0);
     for (const FvPatch& q : patches)
     {
-        if (q.coupled) return st;
         if (skipEmpty && q.type == "empty") continue;
         for (label i = 0; i < q.size; ++i) wanted[static_cast<std::size_t>(q.faceCells[i])] = 1;
+    }
+    // A COUPLED PATCH (cyclic, cyclicAMI) is in the stencil like any other. Its face's normal reads the gradient
+    // on BOTH sides (coupledLinear), and the cells on the other side are the partner patch's face cells -- in
+    // the stencil already; that is confirmed here rather than assumed, and a pair whose neighbour cells are
+    // anything else leaves the stencil unusable, as every coupled mesh did until 2026-10-04.
+    // MEASURED then on RAS/mixerVesselAMI (894,950 cells): the alpha hooks took calculateK whole on the host,
+    // six times a step, 152.5 ms.
+    for (const FvPatch& q : patches)
+    {
+        if (!q.coupled) continue;
+        for (const label c : q.nbrFaceCells)
+        {
+            if (!wanted[static_cast<std::size_t>(c)]) return st;
+        }
+        for (const label c : q.amiNbrCells)
+        {
+            if (!wanted[static_cast<std::size_t>(c)]) return st;
+        }
     }
     st.slot.assign(static_cast<std::size_t>(nC), label(-1));
     for (label c = 0; c < nC; ++c)
@@ -473,8 +490,8 @@ void calculateNHatBoundary(
     {
         throw std::runtime_error(
             "brae interfaceProperties::calculateNHatBoundary: the case's nHat is not a plain Gauss linear "
-            "gradient of the unsmoothed field on a mesh with no coupled patch, which is all this boundary-only "
-            "form reproduces; calculateK is the call for it.");
+            "gradient of the unsmoothed field, on a stencil that holds every cell it reads, which is all this "
+            "boundary-only form reproduces; calculateK is the call for it.");
     }
     // fvc::gaussGrad (fvc.cu) at the patches' face cells only: every term in the order the full face loop
     // adds it to that cell -- its internal faces ascending, then its boundary faces patch by patch -- and
@@ -535,6 +552,17 @@ void finishNHatBoundary(
     {
         const FvPatch& fp = patches[pi];
         if (fp.type == "empty") continue;
+        if (fp.coupled)
+        {
+            // a coupled face is interpolated from its two cells, whatever the patch array holds: fvc::gaussGrad's
+            // own term (fvc.cu)
+            for (label i = 0; i < fp.size; ++i)
+            {
+                const std::size_t k = static_cast<std::size_t>(st.slot[static_cast<std::size_t>(fp.faceCells[i])]);
+                acc[k] += Sf[static_cast<std::size_t>(fp.start + i)] * coupledLinear(fp, i, alpha1.internal);
+            }
+            continue;
+        }
         const std::vector<scalar>& pv = alpha1.boundary[pi]->value();
         for (label i = 0; i < fp.size; ++i)
         {

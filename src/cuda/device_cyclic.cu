@@ -612,7 +612,68 @@ void addToOwnerKernel(
 
     atomicAdd(&cell[own[j]], sign*f[j]);
 }
+__global__
+void cycSnGradKernel(
+    int n,
+    const label* __restrict__ own,
+    CyclicNbr nbr,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ dc,
+    const scalar* __restrict__ cvx,
+    const scalar* __restrict__ cvy,
+    const scalar* __restrict__ cvz,
+    const scalar* __restrict__ psi,
+    const scalar* __restrict__ gx,
+    const scalar* __restrict__ gy,
+    const scalar* __restrict__ gz,
+    int corrected,
+    scalar limitCoeff,
+    scalar* __restrict__ out)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+
+    const int o = own[j];
+    scalar v = dc[j]*(cyclicNbrValue(nbr, psi, j) - psi[o]);
+    if (corrected)
+    {
+        const scalar wf = w[j];
+        const scalar wn = 1.0 - wf;
+        const scalar gfx = wf*gx[o] + wn*cyclicNbrValue(nbr, gx, j);
+        const scalar gfy = wf*gy[o] + wn*cyclicNbrValue(nbr, gy, j);
+        const scalar gfz = wf*gz[o] + wn*cyclicNbrValue(nbr, gz, j);
+        scalar corr = cvx[j]*gfx + cvy[j]*gfy + cvz[j]*gfz;
+        if (limitCoeff > 0.0 && limitCoeff < 1.0)
+        {
+            corr *= fmin(limitCoeff*fabs(v)/((1.0 - limitCoeff)*fabs(corr) + 1e-15), 1.0);
+        }
+        v += corr;
+    }
+    out[j] = v;
+}
 } // namespace
+
+void deviceCyclicSnGrad(
+    const DeviceCyclic&         cyc,
+    const DeviceBuffer<scalar>& psi,
+    const DeviceBuffer<scalar>& gx,
+    const DeviceBuffer<scalar>& gy,
+    const DeviceBuffer<scalar>& gz,
+    bool                        corrected,
+    scalar                      limitCoeff,
+    bool                        nonOrthCoeffs,
+    DeviceBuffer<scalar>&       out)
+{
+    out.resize(static_cast<std::size_t>(cyc.n));
+    if (cyc.n == 0) return;
+    const DeviceBuffer<scalar>& dc = (corrected || nonOrthCoeffs) ? cyc.deltaCoeffs : cyc.orthDeltaCoeffs;
+    cycSnGradKernel<<<nBlocks(cyc.n), TPB>>>(
+        cyc.n, cyc.ownCell.data(), cyc.nbr(), cyc.weights.data(), dc.data(), cyc.corrVecX.data(),
+        cyc.corrVecY.data(), cyc.corrVecZ.data(), psi.data(), corrected ? gx.data() : nullptr,
+        corrected ? gy.data() : nullptr, corrected ? gz.data() : nullptr, corrected ? 1 : 0, limitCoeff,
+        out.data());
+    cudaCheck(cudaGetLastError(), "cyclicSnGrad");
+}
 
 void deviceCyclicLapCorrFlux(
     const DeviceCyclic&         cyc,

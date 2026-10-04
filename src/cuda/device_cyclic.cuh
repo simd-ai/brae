@@ -549,6 +549,15 @@ void deviceCyclicPressureFlux(const DeviceCyclic& cyc, const DeviceBuffer<scalar
                               DeviceBuffer<scalar>& out,
                               const DeviceBuffer<scalar>* jump = nullptr);
 // gaussGrad contribution: grad[own] += Sf_j * (w*psi[own]+(1-w)*psi[nbr]) / V[own].
+// fvc::snGrad ON THE PAIR'S FACES (fvc.cu, snGradScheme.C's coupled branch): dc*(pnf - psi[own]) with the
+// scheme's delta coefficient -- nonOrthDeltaCoeffs under `corrected` and `uncorrected`, the plain 1/|delta| under
+// `orthogonal` -- and under `corrected` the correction vector dotted with the two sides' gradients interpolated
+// on the pair's weights, capped under `limited <k>` as an internal face's is. No jump: the callers' fields
+// (alpha, rho) cross the pair unchanged.
+void deviceCyclicSnGrad(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& psi,
+                        const DeviceBuffer<scalar>& gx, const DeviceBuffer<scalar>& gy,
+                        const DeviceBuffer<scalar>& gz, bool corrected, scalar limitCoeff, bool nonOrthCoeffs,
+                        DeviceBuffer<scalar>& out);
 // fvc::interpolate of a CELL field onto the cyclic faces: w*psi[own] + (1-w)*psi[nbr].
 void deviceCyclicFaceValue(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& cell, DeviceBuffer<scalar>& out);
 // OF patchNeighbourField() for a cyclic patch: the raw neighbour cell value per face (rotated by forwardT
