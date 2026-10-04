@@ -33,6 +33,7 @@
 #include "map_poly_mesh_cpp.cuh"
 #include "primitive_mesh.cuh"
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
@@ -674,6 +675,12 @@ std::vector<vector> mapSurfaceField(
 struct RefineUpdateState
 {
     PrimitiveMesh        m;
+    // THE STEP'S ADDRESSING, KEPT. refineUpdate reads ten lists of the mesh -- cells, points, edges, their
+    // inverses, the geometry -- and built them at the start of EVERY step, for the mesh its last change had
+    // just built them for and freed. Kept here with the mesh they are of, compared by content at each use.
+    // Shared between copies of the state: a copy whose mesh has since changed fails the comparison and builds.
+    // The type is the source file's own (StepAddressingKept, dynamic_refine_fv_mesh_cpp.cu).
+    std::shared_ptr<void> keptAddressing;
     std::vector<FvPatch> patches;
     cpu::hexRef8::Levels levels;
     cpu::hexRef8::History history;

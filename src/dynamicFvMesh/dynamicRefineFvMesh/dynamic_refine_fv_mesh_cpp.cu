@@ -8,6 +8,10 @@
 #include "primitive_patch_cpp.cuh"
 #include "remove_faces_cpp.cuh"
 #include <algorithm>
+#include <memory>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <filesystem>
 #include <cmath>
@@ -1937,6 +1941,180 @@ void buildAddressing(
     a.pointFaces = meshPointFaces(m);
 }
 
+// THE STEP'S ADDRESSING, KEPT BETWEEN STEPS, with the mesh it is of. The topology's lists are a function of the
+// faces, their owners and neighbours; the geometry is one of the points too, so a mesh that MOVES between two
+// steps (laminar/oscillatingBox refines and moves) keeps its lists and has its geometry built again.
+// MEASURED on damBreakWithObstacle (42k to 91k cells) and RAS/motorBike (12k to 39k): building them at the start
+// of every step was 99 and 50 ms a step, and freeing them as refineUpdate returned 22 and 10 -- of 517 and 318.
+struct StepAddressingKept
+{
+    StepAddressing          a;
+    bool                    built = false;
+    label                   nCells = 0;
+    std::vector<label>      owner;
+    std::vector<label>      neighbour;
+    std::vector<label>      faceOffsets;
+    std::vector<label>      faceVerts;
+    std::vector<vector>     points;
+};
+
+namespace
+{
+
+template<class T>
+bool sameBytes(
+    const std::vector<T>& x,
+    const std::vector<T>& y)
+{
+    return x.size() == y.size() && (x.empty() || std::memcmp(x.data(), y.data(), x.size()*sizeof(T)) == 0);
+}
+
+bool sameTopology(
+    const StepAddressingKept& k,
+    const PrimitiveMesh&      m)
+{
+    return k.built && k.nCells == m.nCells() && k.points.size() == m.points().size()
+        && sameBytes(k.owner, m.owner()) && sameBytes(k.neighbour, m.neighbour())
+        && sameBytes(k.faceOffsets, m.faceOffsets()) && sameBytes(k.faceVerts, m.faceVerts());
+}
+
+void buildKept(
+    StepAddressingKept&  k,
+    const PrimitiveMesh& m)
+{
+    // HOW THE NEW LISTS REPLACE THE OLD ONES decides where the allocator puts a million small blocks, and with
+    // it how fast every later stage walks them. The lists are the same bytes either way. MEASURED, ms a step on
+    // damBreakWithObstacle and motorBike (517 and 318 before the lists were kept):
+    //   swap  all of them built beside the old ones, which are then freed     428-434   264-266   (the default)
+    //   over  each list built over the standing one                           484       281-283
+    //   free  the old ones freed first                                        600-604   306-307
+    // BRAE_CONTROL_REFINE_ADDRESSING_ORDER=over|free|swap is the switch those were measured with.
+    static const int order = []()
+    {
+        const char* e = std::getenv("BRAE_CONTROL_REFINE_ADDRESSING_ORDER");
+        const std::string v = e ? e : "swap";
+        if (v == "over") return 0;
+        if (v == "free") return 1;
+        if (v == "swap") return 2;
+        throw std::runtime_error("brae dynamicRefine: BRAE_CONTROL_REFINE_ADDRESSING_ORDER=" + v
+                                 + " is not one of over, free, swap.");
+    }();
+    k.built = false;
+    if (order == 0)
+    {
+        buildAddressing(m, k.a);
+    }
+    else if (order == 1)
+    {
+        k.a = StepAddressing();
+        buildAddressing(m, k.a);
+    }
+    else
+    {
+        StepAddressing fresh;
+        buildAddressing(m, fresh);
+        k.a = std::move(fresh);
+    }
+    k.built = true;
+    k.nCells = m.nCells();
+    k.owner = m.owner();
+    k.neighbour = m.neighbour();
+    k.faceOffsets = m.faceOffsets();
+    k.faceVerts = m.faceVerts();
+    k.points = m.points();
+}
+
+// the first list of `have` that is not `want`'s, or null: BRAE_CONTROL_REFINE_ADDRESSING_CHECK's comparison
+const char* firstDifference(
+    const StepAddressing& have,
+    const StepAddressing& want)
+{
+    if (have.cells != want.cells) return "cells";
+    if (have.pointCells != want.pointCells) return "pointCells";
+    if (have.cellPoints != want.cellPoints) return "cellPoints";
+    if (have.edges.start != want.edges.start || have.edges.end != want.edges.end) return "edges";
+    if (have.edges.pointEdges != want.edges.pointEdges) return "pointEdges";
+    if (have.edges.nInternalPoints != want.edges.nInternalPoints) return "nInternalPoints";
+    if (have.faceEdges != want.faceEdges) return "faceEdges";
+    if (have.edgeFaces != want.edgeFaces) return "edgeFaces";
+    if (have.cellEdges != want.cellEdges) return "cellEdges";
+    if (have.cellCells != want.cellCells) return "cellCells";
+    if (have.pointFaces != want.pointFaces) return "pointFaces";
+    if (!sameBytes(have.g.Cf(), want.g.Cf())) return "the geometry's face centres";
+    if (!sameBytes(have.g.Sf(), want.g.Sf())) return "the geometry's face areas";
+    if (!sameBytes(have.g.magSf(), want.g.magSf())) return "the geometry's face area magnitudes";
+    if (!sameBytes(have.g.C(), want.g.C())) return "the geometry's cell centres";
+    if (!sameBytes(have.g.V(), want.g.V())) return "the geometry's cell volumes";
+    if (!sameBytes(have.g.weights(), want.g.weights())) return "the geometry's weights";
+    if (!sameBytes(have.g.deltaCoeffs(), want.g.deltaCoeffs())) return "the geometry's deltaCoeffs";
+    if (!sameBytes(have.g.nonOrthDeltaCoeffs(), want.g.nonOrthDeltaCoeffs()))
+        return "the geometry's nonOrthDeltaCoeffs";
+    if (!sameBytes(have.g.nonOrthCorrectionVectors(), want.g.nonOrthCorrectionVectors()))
+        return "the geometry's non-orthogonal correction vectors";
+    return nullptr;
+}
+
+}   // namespace
+
+// the state's kept addressing, made on first use
+StepAddressingKept& keptOf(RefineUpdateState& s)
+{
+    if (!s.keptAddressing)
+    {
+        s.keptAddressing = std::make_shared<StepAddressingKept>();
+    }
+    return *static_cast<StepAddressingKept*>(s.keptAddressing.get());
+}
+
+// THE ADDRESSING OF THE STATE'S MESH AS IT STANDS: the kept one where it is of this mesh, built otherwise.
+//   BRAE_CONTROL_REFINE_ADDRESSING_REBUILD=1         builds it at every call, as every step did before
+//   BRAE_CONTROL_REFINE_ADDRESSING_CHECK=1           builds it as well where the kept one is used and compares
+//                                                    every list, byte for byte; stops on the first that differs
+//   BRAE_CONTROL_REFINE_ADDRESSING_STALE_GEOMETRY=1  a gate's CONTROL, deliberately wrong: the geometry is not
+//                                                    built again where the points moved
+StepAddressing& stepAddressingOf(RefineUpdateState& s)
+{
+    static const bool rebuild = std::getenv("BRAE_CONTROL_REFINE_ADDRESSING_REBUILD") != nullptr;
+    static const bool check = std::getenv("BRAE_CONTROL_REFINE_ADDRESSING_CHECK") != nullptr;
+    static const bool staleGeometry = std::getenv("BRAE_CONTROL_REFINE_ADDRESSING_STALE_GEOMETRY") != nullptr;
+    StepAddressingKept& k = keptOf(s);
+    if (rebuild || !sameTopology(k, s.m))
+    {
+        buildKept(k, s.m);
+        return k.a;
+    }
+    static bool said = false;
+    if (!said)
+    {
+        said = true;
+        std::printf("  refinement: the mesh's addressing is kept from the last change to the next step; "
+                    "BRAE_CONTROL_REFINE_ADDRESSING_REBUILD=1 builds it at every step\n");
+        if (staleGeometry)
+        {
+            std::printf("  *** CONTROL MODE: the kept addressing's geometry is not built again where the "
+                        "points moved. This run is deliberately wrong. ***\n");
+        }
+    }
+    if (!sameBytes(k.points, s.m.points()) && !staleGeometry)
+    {
+        k.a.g.build(s.m);
+        k.points = s.m.points();
+    }
+    if (check)
+    {
+        StepAddressing fresh;
+        buildAddressing(s.m, fresh);
+        const char* what = firstDifference(k.a, fresh);
+        if (what)
+        {
+            throw std::runtime_error(
+                std::string("brae dynamicRefine: BRAE_CONTROL_REFINE_ADDRESSING_CHECK: of the kept addressing, ")
+                + what + " is not what building it from the mesh gives.");
+        }
+    }
+    return k.a;
+}
+
 cpu::hexRef8::MeshView hexView(
     const PrimitiveMesh&  m,
     const StepAddressing& a)
@@ -2408,8 +2586,7 @@ RefineUpdateStep refineUpdate(
     // rest only where cells are refined or split points removed.
     std::optional<interPhase::Nested> part;
     part.emplace("refine: the step's addressing and patches (every step)");
-    StepAddressing a;
-    buildAddressing(s.m, a);
+    StepAddressing& a = stepAddressingOf(s);
     if (s.patches.empty()) s.patches = buildPatches(s.m, a.g);
     else updatePatchesInPlace(s.patches, buildPatches(s.m, a.g));
 
@@ -2490,7 +2667,7 @@ RefineUpdateStep refineUpdate(
             s.injectedPhiUBnd = s.injectedPhiURefineBnd;
             part.emplace("refine: the mesh rebuilt, its addressing and patches");
             s.m = rebuiltMesh(s.m, out);
-            buildAddressing(s.m, a);
+            buildKept(keptOf(s), s.m);
             updatePatchesInPlace(s.patches, buildPatches(s.m, a.g));
             part.emplace("refine: the carried fields mapped");
             mapCarriedFields(s, r.refineMap, oldV, out.nCells, a.g.V(), nOldInternalFaces, timeIndex);
@@ -2624,7 +2801,7 @@ RefineUpdateStep refineUpdate(
             s.injectedPhiUBnd = s.injectedPhiUUnrefineBnd;
             part.emplace("unrefine: the mesh rebuilt, its addressing and patches");
             s.m = rebuiltMesh(s.m, out);
-            buildAddressing(s.m, a);
+            buildKept(keptOf(s), s.m);
             updatePatchesInPlace(s.patches, buildPatches(s.m, a.g));
             part.emplace("unrefine: the carried fields mapped and the fluxes corrected");
             mapCarriedFields(s, r.unrefineMap, oldV, out.nCells, a.g.V(), nOldInternalFaces, timeIndex);
@@ -2667,9 +2844,8 @@ RefineUpdateStep refineUpdate(
         cpu::hexRef8::compactHistory(s.history);
         r.compacted = true;
     }
-    // `part` was declared before the step's addressing, so it outlives it: what is timed from here is that
-    // addressing and the step's other lists being freed as the function returns
-    part.emplace("refine: the step's addressing freed on return (every step)");
+    // the step's own lists being freed as the function returns; the addressing is kept (stepAddressingOf)
+    part.emplace("refine: the step's lists freed on return (every step)");
     ++s.nRefinementIterations;
 
     return r;
