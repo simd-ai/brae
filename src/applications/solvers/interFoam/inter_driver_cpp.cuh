@@ -138,7 +138,11 @@ void interMeshUpdate(
     // correctPhi.H:11's continuityErrs: fvc::div of the ABSOLUTE flux CorrectPhi leaves, taken before
     // makeRelative. Filled only when the mesh update ran CorrectPhi; the caller adds it to the written
     // cumulativeContErr. Null when nothing writes it.
-    std::vector<scalar>*                   correctPhiDivOut = nullptr);
+    std::vector<scalar>*                   correctPhiDivOut = nullptr,
+    // the closure's wall-distance wave run elsewhere (PatchWaveRunner): the device loop hands in its GPU wave,
+    // so that THIS call -- the one wallDist::movePoints corresponds to, ahead of CorrectPhi -- is the only time
+    // a move computes the distance. Null runs the host's wave.
+    const PatchWaveRunner* waveRunner = nullptr);
 
 // fvc::meshPhi(U) (fvcMeshPhi.C:35-45): the mesh flux the ddt scheme named for `ddt(U)` gives, which
 // is mesh().phi() under Euler and the off-centred combination under CrankNicolson. Every makeRelative,

@@ -156,7 +156,8 @@ void interMeshUpdate(
     label                                  outerOfStep,
     label                                  nOuterCorrectors,
     const fv::CrankNicolsonClock*          cn,
-    std::vector<scalar>*                   correctPhiDivOut)
+    std::vector<scalar>*                   correctPhiDivOut,
+    const PatchWaveRunner*                 waveRunner)
 {
     if (!dyn) return;
     // interFoam.C:118: on the first outer corrector, or on every one under
@@ -264,8 +265,15 @@ void interMeshUpdate(
     }
     const SurfaceScalarField& meshPhiU = fvcMeshPhi(*dyn, f);
     // ...and fvMesh::movePoints moves the mesh objects with it: kOmegaSST's wall distance
-    updatePart.emplace("update: the closure's distances (moveInterTurbulence, host)");
-    moveInterTurbulence(f.turbulence, m, g, patches, timeIndex);
+    updatePart.emplace("update: the closure's distances (moveInterTurbulence)");
+    // BRAE_CONTROL_TURBULENCE_DISTANCE_STALE=1 is a gate's CONTROL, deliberately wrong: the closure keeps the
+    // distances of the mesh before the move -- what a caller that dropped this call without making another
+    // would get
+    static const bool distanceStale = std::getenv("BRAE_CONTROL_TURBULENCE_DISTANCE_STALE") != nullptr;
+    if (!distanceStale)
+    {
+        moveInterTurbulence(f.turbulence, m, g, patches, timeIndex, waveRunner);
+    }
     updatePart.emplace("update: the cyclicAMI weights");
     // cyclicAMIPolyPatch::initMovePoints marks the AMI out of date, and the next AMI()
     // recomputes it on the moved points: before anything below interpolates across it

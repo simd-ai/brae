@@ -3564,7 +3564,8 @@ RunReport runInterFoamDevice(
                                     meshAgglomeration, meshCpc, rep, stepTime, stepIndex, outer,
                                     f.pimple.nOuterCorrectors,
                                     f.ddtU == DdtScheme::CrankNicolson ? &cnClock : nullptr,
-                                    writer ? &cpDiv : nullptr);
+                                    writer ? &cpDiv : nullptr,
+                                    turbWaveRunner ? &turbWaveRunner : nullptr);
                 }
                 interPhase::Nested timedRefresh("mesh: the device refresh after it (geometry, fluxes, boundary)");
                 std::optional<interPhase::Nested> refreshPart;
@@ -3712,10 +3713,32 @@ RunReport runInterFoamDevice(
                 // cells had at time zero and every wall function read a y the wall had moved away
                 // from. The host block goes first -- moveInterTurbulence re-runs wallDist's own
                 // method on the moved points -- and the device arrays follow it.
+                // THAT HOST BLOCK IS interMeshUpdate's, and it has just run: it calls moveInterTurbulence
+                // itself, ahead of CorrectPhi, where wallDist::movePoints sits in fvMesh::movePoints. This
+                // refresh used to call it AGAIN for the same moved mesh, so every move computed the distance
+                // twice -- MEASURED on RAS/DTCHullMoving (845,536 cells): 399 ms a step on the host there and
+                // 107 here, of a 1,678 ms step. The one call now takes the GPU wave (interMeshUpdate's
+                // waveRunner) and this one is gone. BRAE_CONTROL_TURBULENCE_DISTANCE_TWICE=1 makes it again
+                // -- the identity gate's other arm.
+                static const bool distanceTwice = std::getenv("BRAE_CONTROL_TURBULENCE_DISTANCE_TWICE") != nullptr;
                 if (f.turbulence.on)
                 {
-                    moveInterTurbulence(f.turbulence, m, g, fvp, stepIndex,
-                                        turbWaveRunner ? &turbWaveRunner : nullptr);
+                    if (distanceTwice)
+                    {
+                        moveInterTurbulence(f.turbulence, m, g, fvp, stepIndex,
+                                            turbWaveRunner ? &turbWaveRunner : nullptr);
+                    }
+                    else
+                    {
+                        static bool said = false;
+                        if (!said)
+                        {
+                            said = true;
+                            std::printf("  wall distance: the closure's is computed once a mesh move; "
+                                        "BRAE_CONTROL_TURBULENCE_DISTANCE_TWICE=1 computes it again in the "
+                                        "device refresh\n");
+                        }
+                    }
                     if (deviceClosure)
                     {
                         refreshDeviceInterTurbulenceGeometry(dTurb, f.turbulence, f.U, m, g, fvp);
