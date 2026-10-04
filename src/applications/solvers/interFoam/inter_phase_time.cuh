@@ -96,6 +96,25 @@ struct Nested
     }
 };
 
+// `seconds` and `calls` charged to `name` in the nested table, by something that timed itself
+inline void charge(
+    const char* name,
+    double seconds,
+    long calls)
+{
+    if (!on()) return;
+    slot(state().nested, name) += seconds;
+    for (auto& e : state().nestedCalls)
+    {
+        if (e.first == name)
+        {
+            e.second += calls;
+            return;
+        }
+    }
+    state().nestedCalls.emplace_back(name, calls);
+}
+
 inline void report(long steps)
 {
     if (!on() || steps <= 0) return;

@@ -5,6 +5,7 @@
 // headers. Verbatim split of device_amg.cu -- no logic change. The PCG drivers (device_amg.cu) call vcycleAt/
 // vcycleAtF/amgCastFP32 (external linkage) via local decls there.
 #include "device_amg.cuh"          // AMGData / AMGLevel / GridColoring / DeviceLduView / DeviceSolverPerf
+#include "device_amg_split.cuh"    // BRAE_AMG_PCG_SPLIT: a lap after every part of a cycle
 #include "device_amg_detail.cuh"   // constants (OMEGA/NPRE/NPOST/CHEB_*/SB_*/NCOARSE_CG) + env flags + nBlocks/TPB
 #include "device_amg_internal.cuh" // LduF/lduF/cast_/amulF, gsSweep + smoother decls (ensureSpectrum/cheb/tsGS)
 #include "device_amg_coarse.cuh"   // deviceCoarsePCG / deviceCoarseJacobiSingleBlock
@@ -179,6 +180,7 @@ void vcycleAt(
             deviceAmul(Ag, xg, amg.vAx[g]);
             smoothT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
         }
+        amgSplit::lap(g, amgSplit::coarsest);
         return;
     }
     if (useChebyshev()) chebyshevSmooth(Ag, bg, xg, amg.vD[g], amg.vAx[g], amg.lambdaMax[g], chebDeg());  // pre-smooth (x=0)
@@ -189,8 +191,10 @@ void vcycleAt(
         deviceAmul(Ag, xg, amg.vAx[g]);
         smoothT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
     }
+    amgSplit::lap(g, amgSplit::smoothPre);
     deviceAmul(Ag, xg, amg.vAx[g]);
     residualT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), amg.vR[g].data());
+    amgSplit::lap(g, amgSplit::residual);
     const int nc = amg.level[g].nCoarse;
     const AMGLevel& Lg = amg.level[g];
     if (amg.saSmooth)                                            // restrict rc = P^T r (sparse smoothed prolongator)
@@ -202,6 +206,7 @@ void vcycleAt(
     else                                          // fixed-order gather; writes rc, so no pre-zero needed
         restrictGatherT<scalar><<<nBlocks(nc),TPB>>>(
             nc, Lg.galCellStart.data(), Lg.galCellList.data(), amg.vR[g].data(), amg.vB[g+1].data());
+    amgSplit::lap(g, amgSplit::restriction);
     vcycleAt(g+1, amg, amg.level[g].coarseView(), amg.vB[g+1], amg.vX[g+1], asymmetric);   // recurse to the next coarser grid
     if (amg.corrScaling)
     {
@@ -220,6 +225,7 @@ void vcycleAt(
         prolongSparseK<<<nBlocks(n),TPB>>>(n, Lg.Prow.data(), Lg.Pcol.data(), Lg.Pval.data(), amg.vX[g+1].data(), xg.data());
     else
         prolongT<scalar><<<nBlocks(n),TPB>>>(n, Lg.map.data(), amg.vX[g+1].data(), xg.data());
+    amgSplit::lap(g, amgSplit::prolongation);
     if (useChebyshev()) chebyshevSmooth(Ag, bg, xg, amg.vD[g], amg.vAx[g], amg.lambdaMax[g], chebDeg());  // post-smooth
     else if (asymmetric ? useTSGSAsym() : useTSGS()) twoStageGSSmooth(Ag, bg, xg, amg.vD[g], amg.vAx[g], nPostSweeps(), tsgsOrder(), false);  // twoStageGaussSeidel (bwd -> symmetric)
     else if (amg.gsSmooth) for (int s = 0; s < nPostSweeps(); ++s) gsSweep(Ag, bg, xg, amg.coloring[g], false);  // backward GS (symmetric V-cycle)
@@ -228,6 +234,7 @@ void vcycleAt(
         deviceAmul(Ag, xg, amg.vAx[g]);
         smoothT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
     }
+    amgSplit::lap(g, amgSplit::smoothPost);
 }
 
 // The SYMMETRIC entry point, unchanged for every existing caller (device_amg.cu and device_amg_pcg.cu
@@ -484,6 +491,7 @@ void vcycleAtF(
             }
         }
         cast_<scalar,float><<<nBlocks(n),TPB>>>(n, amg.vX[g].data(), xg);
+        amgSplit::lap(g, amgSplit::coarsest);
         return;
     }
     for (int s=0; s<nPreSweeps(); ++s)     // BRAE_NPRE, as the FP64 cycle reads it; NPRE by default
@@ -496,21 +504,26 @@ void vcycleAtF(
         amgSpmvF(amg, g, Ag, xg, amg.vAxF[g].data());
         smoothT<float><<<nBlocks(n),TPB>>>(n, bg, amg.vAxF[g].data(), Ag.diag, xg);
     }
+    amgSplit::lap(g, amgSplit::smoothPre);
     amgSpmvF(amg, g, Ag, xg, amg.vAxF[g].data());
     residualT<float><<<nBlocks(n),TPB>>>(n, bg, amg.vAxF[g].data(), amg.vRF[g].data());
+    amgSplit::lap(g, amgSplit::residual);
     const AMGLevel& Lg = amg.level[g];
     const int nc = Lg.nCoarse;
     restrictGatherT<float><<<nBlocks(nc),TPB>>>(
         nc, Lg.galCellStart.data(), Lg.galCellList.data(), amg.vRF[g].data(), amg.vBF[g+1].data());
+    amgSplit::lap(g, amgSplit::restriction);
     const DeviceLduView topoC = Lg.coarseView();
     const LduF Ac = lduF(topoC, amg.fDiag[g+1], amg.fUpper[g+1], amg.fLower[g+1]);
     vcycleAtF(g+1, amg, topoC, Ac, amg.vBF[g+1].data(), amg.vXF[g+1].data(), asymmetric);
     prolongT<float><<<nBlocks(n),TPB>>>(n, Lg.map.data(), amg.vXF[g+1].data(), xg);
+    amgSplit::lap(g, amgSplit::prolongation);
     for (int s=0; s<nPostSweeps(); ++s)    // BRAE_NPOST; NPOST by default
     {
         amgSpmvF(amg, g, Ag, xg, amg.vAxF[g].data());
         smoothT<float><<<nBlocks(n),TPB>>>(n, bg, amg.vAxF[g].data(), Ag.diag, xg);
     }
+    amgSplit::lap(g, amgSplit::smoothPost);
 }
 
 // The SYMMETRIC FP32 entry point, unchanged for its existing callers (same overload-not-default reason

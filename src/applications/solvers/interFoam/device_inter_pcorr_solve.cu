@@ -2,6 +2,7 @@
 #include "device_inter_pcorr_solve.cuh"
 #include "device_inter_pressure_step.cuh"   // deviceAmgPcgHierarchy
 #include "device_blas.cuh"
+#include "device_amg_split.cuh"
 #include "device_ldu.cuh"
 #include "fv_matrix_ops.cuh"   // matrixFlux, the check's oracle
 #include "device_mesh.cuh"   // nextDeviceAddressingId
@@ -217,6 +218,8 @@ bool DevicePcorrSolver::solve(
     static const bool oneIteration = std::getenv("BRAE_CONTROL_AMG_PCG_ONE_ITERATION") != nullptr
                                   || std::getenv("BRAE_CONTROL_AMG_PCG_PCORR_ONE_ITERATION") != nullptr;
     timedPart.emplace("pcorr: the AMG-PCG iterations");
+    // the solve BRAE_AMG_PCG_SPLIT=pcorr names
+    const amgSplit::Name splitName("pcorr");
     // the fast path's knobs, the ones the p_rgh solve takes (amgPcgKnobs). By default deviceAMGPCG runs the
     // whole PCG loop from its captured graph whatever they say (BRAE_PCG_DEVICE); they matter when that is off
     // or coarse-correction scaling is asked for, and then both pressure entries now take the same ones.
@@ -525,6 +528,8 @@ bool DevicePcorrSolver::correct(
     static const bool oneIteration = std::getenv("BRAE_CONTROL_AMG_PCG_ONE_ITERATION") != nullptr
                                   || std::getenv("BRAE_CONTROL_AMG_PCG_PCORR_ONE_ITERATION") != nullptr;
     timedPart.emplace("pcorr: the AMG-PCG iterations");
+    // the solve BRAE_AMG_PCG_SPLIT=pcorr names
+    const amgSplit::Name splitName("pcorr");
     const AmgPcgKnobs& knobs = amgPcgKnobs();
     const DeviceSolverPerf r = deviceAMGPCG(A, amg, dSource, dPsi, nf, tol, relTol, oneIteration ? 1 : maxIter,
                                             knobs.graph, knobs.checkEvery, knobs.corrScaling, minIter);
