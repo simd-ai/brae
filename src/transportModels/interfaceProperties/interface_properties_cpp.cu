@@ -203,7 +203,8 @@ void nHatBoundary(
     const FvGeometry& g,
     const std::vector<FvPatch>& patches,
     const std::vector<vector>& gradAlpha,
-    SurfaceScalarField& nHatf)
+    SurfaceScalarField& nHatf,
+    bool skipEmpty = false)
 {
     const std::vector<vector>& Sf = g.Sf();
     // Patches that are not alphaContactAngle take the face cell's gradient unchanged (fvc::interpolate at
@@ -212,6 +213,13 @@ void nHatBoundary(
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const FvPatch& q = patches[pi];
+        // an empty patch has no faces in OpenFOAM; a caller whose readers skip them takes zeros and no work
+        // (NHatBoundaryStencil::skipEmpty)
+        if (skipEmpty && q.type == "empty")
+        {
+            nHatf.boundary[pi].assign(static_cast<std::size_t>(q.size), scalar(0));
+            continue;
+        }
 
         // gradAlphaf's BOUNDARY VALUE is not the owner cell's gradient. fvc::grad runs
         // gaussGrad::correctBoundaryConditions, which replaces the WALL-NORMAL COMPONENT with the
@@ -399,9 +407,11 @@ void calculateK(const GeometricField<scalar>& alpha1,
 
 NHatBoundaryStencil nHatBoundaryStencil(
     const PrimitiveMesh& m,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    bool skipEmpty)
 {
     NHatBoundaryStencil st;
+    st.skipEmpty = skipEmpty;
     const label nC = m.nCells();
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
@@ -410,6 +420,7 @@ NHatBoundaryStencil nHatBoundaryStencil(
     for (const FvPatch& q : patches)
     {
         if (q.coupled) return st;
+        if (skipEmpty && q.type == "empty") continue;
         for (label i = 0; i < q.size; ++i) wanted[static_cast<std::size_t>(q.faceCells[i])] = 1;
     }
     st.slot.assign(static_cast<std::size_t>(nC), label(-1));
@@ -536,7 +547,7 @@ void finishNHatBoundary(
         const label cell = st.cells[k];
         st.gradAlpha[static_cast<std::size_t>(cell)] = acc[k] / g.V()[static_cast<std::size_t>(cell)];
     }
-    nHatBoundary(alpha1, c.deltaN, g, patches, st.gradAlpha, nHatf);
+    nHatBoundary(alpha1, c.deltaN, g, patches, st.gradAlpha, nHatf, st.skipEmpty);
 }
 
 }   // namespace interfaceProps

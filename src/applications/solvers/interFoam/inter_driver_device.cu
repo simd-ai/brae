@@ -10,6 +10,8 @@
 #include "device_inter_pcorr_solve.cuh"
 #include "device_displacement_laplacian_assembly.cuh"
 #include "device_patch_wave.cuh"
+#include <cstring>
+#include <optional>
 #include <set>
 #include "inter_amr_cpp.cuh"
 #include "inter_correct_phi_cpp.cuh"
@@ -100,6 +102,30 @@ std::vector<scalar> patchValues(const GeometricField<scalar>& f, const std::vect
         v.insert(v.end(), b.begin(), b.end());
     }
     return v;
+}
+
+// AN `empty` PATCH'S ENTRIES ARE ITS CELLS' VALUES (EmptyPatchField::evaluate): written here for every such
+// boundary face, three components at once, into arrays in the device mesh's boundary numbering. The device's
+// own form of what the momentum hook built on the host and uploaded at every call.
+__global__
+void mirrorEmptyFacesKernel(
+    int nB,
+    const label* __restrict__ bndIsEmpty,
+    const label* __restrict__ bndCell,
+    const scalar* __restrict__ ux,
+    const scalar* __restrict__ uy,
+    const scalar* __restrict__ uz,
+    scalar* __restrict__ ox,
+    scalar* __restrict__ oy,
+    scalar* __restrict__ oz)
+{
+    const int b = blockIdx.x*blockDim.x + threadIdx.x;
+    if (b >= nB) return;
+    if (!bndIsEmpty[b]) return;
+    const label c = bndCell[b];
+    ox[b] = ux[c];
+    oy[b] = uy[c];
+    oz[b] = uz[c];
 }
 
 // calculateNHatBoundary's first half on the device: each boundary cell's sum over its internal faces of
@@ -888,6 +914,10 @@ RunReport runInterFoamDevice(
     }
 
     DeviceMesh dm = buildDeviceMesh(m, g, fvp);
+    // how many times dm's GEOMETRY has been made: a build or a refresh after a move. What a cache of
+    // geometry-derived boundary arrays keys on where it leaves the empty patches' faces out of its own key
+    // (the momentum hook's device boundary).
+    unsigned long long meshGeometryEpoch = 1;
     // THE MOTION SOLVER'S EQUATION ON THE GPU: the interior of displacementLaplacian's laplacian -- the face
     // coefficients and the diagonal, grad(cellDisplacement), the non-orthogonal correction and its per-cell sum
     // -- is assembled on the device mesh, each cell folding its faces in the host's order and every fused
@@ -1168,6 +1198,11 @@ RunReport runInterFoamDevice(
     // BRAE_CONTROL_NHAT_DEVICE_OWNER_ONLY=1 drops the neighbour side's terms in the kernel -- the identity
     // check's control, which has to show the comparison sees the GPU half
     const bool nHatOwnerOnly = std::getenv("BRAE_CONTROL_NHAT_DEVICE_OWNER_ONLY") != nullptr;
+    // AN `empty` PATCH IS LEFT OUT of the stencil and takes zeros (NHatBoundaryStencil::skipEmpty): OpenFOAM has
+    // no faces there, and what reads the boundary normal on the device skips them or multiplies them by a zero
+    // flux. On a 2-D mesh the stencil was every cell. BRAE_CONTROL_NHAT_EMPTY_CELLS=1 keeps them in, as before
+    // -- the identity gate's other arm.
+    const bool nHatEmptyCells = std::getenv("BRAE_CONTROL_NHAT_EMPTY_CELLS") != nullptr;
     DeviceBuffer<label> dStCells;
     DeviceBuffer<label> dStStart;
     DeviceBuffer<label> dStFaces;
@@ -1178,7 +1213,7 @@ RunReport runInterFoamDevice(
     {
         if (!nHatFull && (!nHatStencilBuilt || nHatStencilId != dm.addressingId))
         {
-            nHatStencil = interfaceProps::nHatBoundaryStencil(m, fvp);
+            nHatStencil = interfaceProps::nHatBoundaryStencil(m, fvp, !nHatEmptyCells);
             nHatStencilId = dm.addressingId;
             nHatStencilBuilt = true;
             dStCells.copyFrom(nHatStencil.cells);
@@ -1191,8 +1226,9 @@ RunReport runInterFoamDevice(
             if (!announced)
             {
                 announced = true;
-                std::printf("  nHat: the alpha hooks take the boundary normal from the boundary's own cells "
+                std::printf("  nHat: the alpha hooks take the boundary normal from the boundary's own cells%s "
                             "(%zu of %ld); BRAE_CONTROL_NHAT_FULL=1 takes calculateK whole\n",
+                            nHatEmptyCells ? "" : ", an empty patch's left out",
                             nHatStencil.cells.size(), (long)m.nCells());
             }
             if (nHatHostGradient)
@@ -1242,19 +1278,26 @@ RunReport runInterFoamDevice(
         [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& aBnd, DeviceBuffer<scalar>& nBnd)
     {
         interPhase::Nested timed("hook alpha.updateBoundary");
+        std::optional<interPhase::Nested> part;
+        part.emplace("alpha hook: the flux to the patches");
         pushFlux();
+        part.emplace("alpha hook: alpha down, the patches evaluated, their values up");
         a.copyTo(f.alpha1.internal);
         f.alpha1.evaluateBoundary();
         aBnd.copyFrom(patchValues(f.alpha1, fvp));
+        part.emplace("alpha hook: the mixture's boundary and alpha's fixes");
         // The boundary viscosity from alpha's patch values as they stand HERE, before the curvature
         // pass below rewrites the contact-angle gradient: mixture.correct() is calcNu() and THEN
         // interfaceProperties::correct(). The last call of a step is the one UEqn reads. See the host
         // driver's mixtureCorrect stage for the measurement.
         updateMixtureBoundary(f, fvp);
         refreshAlphaFixes();
+        part.emplace("alpha hook: the boundary normal");
         SurfaceScalarField nHb;
         boundaryNHat(nHb, a);
+        part.emplace("alpha hook: the normal up");
         nBnd.copyFrom(flattenPatches(nHb.boundary, fvp));
+        part.reset();
     };
     H.alpha.refreshBoundary =
         [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& aBnd)
@@ -1398,12 +1441,58 @@ RunReport runInterFoamDevice(
     // which device boundary object updateUBoundary last built whole, and on which addressing
     const DeviceVectorBoundary* uBoundaryBuiltIn = nullptr;
     DeviceVectorBoundaryShape uBoundaryBuiltShape;
+    unsigned long long uBoundaryBuiltEpoch = 0;
+    unsigned long long uBoundaryBuiltAddressing = 0;
+    // AN `empty` PATCH'S ENTRIES STAY ON THE GPU. brae's empty patch mirrors its cells, the kernels read its
+    // entries, and on a 2-D mesh the two empty patches hold two faces a cell: the hook built their key, their
+    // state and their values on the host and uploaded them at every call. Now the key leaves them out (they
+    // change only with the mesh: meshGeometryEpoch and the addressing say when), the state refresh and the
+    // values go up for the other patches only, run by run, and the empty faces are mirrored from the device's
+    // own U by a kernel at the calls where the host patch evaluates -- every call but the assembly's, where
+    // OpenFOAM's patches keep their stored values and so do these. MEASURED on waveMakerPiston refined to
+    // 896,000 cells, ms a step: the key 29, the state refresh 58 and the values 22 before.
+    // BRAE_CONTROL_U_EMPTY_FROM_HOST=1 builds and uploads them on the host as before -- the identity gate's
+    // other arm; BRAE_CONTROL_U_EMPTY_NO_MIRROR=1 skips the kernel -- its control.
+    const bool uEmptyFromHost = std::getenv("BRAE_CONTROL_U_EMPTY_FROM_HOST") != nullptr;
+    const bool uEmptyNoMirror = std::getenv("BRAE_CONTROL_U_EMPTY_NO_MIRROR") != nullptr;
+    // BRAE_CONTROL_U_EMPTY_CHECK=1: at every call the host builds every face's state and values as it used to,
+    // and one bit's difference from what the device now holds stops the run and names the entry -- the gate's
+    // oracle. The WRITTEN FILES cannot be it: the kernels multiply an empty face's entries by zero, so a run
+    // with the mirror skipped writes the same bytes (measured on weirOverflow, waveMakerPiston, capillaryRise).
+    const bool uEmptyCheck = std::getenv("BRAE_CONTROL_U_EMPTY_CHECK") != nullptr;
+    DeviceBuffer<scalar> uValuesStage;
+    auto sameOnDevice = [](
+        const char* what,
+        int k,
+        const DeviceBuffer<scalar>& d,
+        const std::vector<scalar>& h)
+    {
+        std::vector<scalar> got;
+        d.copyTo(got);
+        if (got.size() == h.size() && (h.empty() || std::memcmp(got.data(), h.data(), h.size()*sizeof(scalar)) == 0))
+        {
+            return;
+        }
+        std::size_t at = 0;
+        while (at < got.size() && at < h.size() && std::memcmp(&got[at], &h[at], sizeof(scalar)) == 0)
+        {
+            ++at;
+        }
+        char line[200];
+        std::snprintf(line, sizeof(line), "%s, component %d, boundary face %zu of %zu (host %zu): the device holds "
+                      "%.17g, the host builds %.17g", what, k, at, got.size(), h.size(),
+                      at < got.size() ? got[at] : 0.0, at < h.size() ? h[at] : 0.0);
+        throw std::runtime_error(std::string("brae interFoam: U's boundary kept on the GPU is not the host's: ")
+                                 + line);
+    };
     H.updateUBoundary =
         [&](const DeviceBuffer<scalar>& ux, const DeviceBuffer<scalar>& uy,
             const DeviceBuffer<scalar>& uz, DeviceVectorBoundary& db, DeviceBuffer<scalar>* ubOut,
             DeviceUBoundaryCall call)
     {
         interPhase::Nested timed("hook updateUBoundary");
+        std::optional<interPhase::Nested> part;
+        part.emplace("U hook: the flux to the patches");
         // p_rgh's and alpha's patches take the new flux at every call; U's do not at the one call
         // where OpenFOAM's are still updated() -- see DeviceUBoundaryCall
         pushFlux(call == DeviceUBoundaryCall::evaluateStillUpdated);
@@ -1414,9 +1503,11 @@ RunReport runInterFoamDevice(
         {
             tellUAbsoluteFlux(call == DeviceUBoundaryCall::evaluateStillUpdated);
         }
+        part.emplace("U hook: U down to the host field");
         std::vector<scalar> x, y, z;
         ux.copyTo(x); uy.copyTo(y); uz.copyTo(z);
         for (label c = 0; c < nC; ++c) f.U.internal[c] = vector{x[c], y[c], z[c]};
+        part.emplace("U hook: the patches' updates and evaluate");
         // waveVelocity's updateCoeffs, at the STEP's clock: the first call of a step is UEqn's, where
         // the model -- last updated inside the alpha sub-cycles -- updates again from the alpha they
         // left (f.alpha1 is the alpha hooks' last copy) and the U the step started on. Every later
@@ -1503,30 +1594,160 @@ RunReport runInterFoamDevice(
         // its control.
         static const bool uBoundaryFull = std::getenv("BRAE_CONTROL_U_BOUNDARY_FULL") != nullptr;
         static const bool uBoundaryStale = std::getenv("BRAE_CONTROL_U_BOUNDARY_STALE") != nullptr;
+        part.emplace("U hook: the device boundary's key");
+        // where the patches that are not empty sit in the boundary's numbering; the empty faces stay on the
+        // device when there are any and the boundary is in the device mesh's numbering
+        std::size_t nBndAll = 0;
+        const std::vector<DeviceBoundaryRange> ranges = deviceNonEmptyBoundaryRanges(fvp, nBndAll);
+        std::size_t nHostFaces = 0;
+        for (const DeviceBoundaryRange& r : ranges)
+        {
+            nHostFaces += r.n;
+        }
+        const bool emptyOnDevice = !uEmptyFromHost && nHostFaces < nBndAll
+                                && nBndAll == static_cast<std::size_t>(dm.nBndFaces);
+        if (emptyOnDevice)
+        {
+            static bool said = false;
+            if (!said)
+            {
+                said = true;
+                std::printf("  U boundary: an empty patch's entries stay on the GPU, mirrored from its cells "
+                            "(%zu of %zu boundary faces are the host's); BRAE_CONTROL_U_EMPTY_FROM_HOST=1 builds "
+                            "and uploads them all\n", nHostFaces, nBndAll);
+            }
+        }
+        const bool evaluated = call != DeviceUBoundaryCall::assembly;
+        auto mirrorEmpty = [&](
+            DeviceBuffer<scalar>& ox,
+            DeviceBuffer<scalar>& oy,
+            DeviceBuffer<scalar>& oz)
+        {
+            if (uEmptyNoMirror) return;
+            const int nB = dm.nBndFaces;
+            mirrorEmptyFacesKernel<<<(nB + 255)/256, 256, 0, cudaStreamPerThread>>>(
+                nB,
+                dm.bndIsEmpty.data(),
+                dm.bndCell.data(),
+                ux.data(),
+                uy.data(),
+                uz.data(),
+                ox.data(),
+                oy.data(),
+                oz.data());
+            cudaCheck(cudaGetLastError(), "mirrorEmptyFacesKernel");
+        };
         {
             // the key first, which is cheap: equal keys give equal non-state arrays (deviceVectorBoundaryShape),
             // so only the state is built; otherwise everything is, and checked against the last full build
-            DeviceVectorBoundaryShape shape = deviceVectorBoundaryShape(f.U, fvp, g);
-            const bool sameShape = !uBoundaryFull && uBoundaryBuiltIn == &db && shape == uBoundaryBuiltShape;
+            DeviceVectorBoundaryShape shape = deviceVectorBoundaryShape(f.U, fvp, g, emptyOnDevice);
+            const bool sameShape = !uBoundaryFull && uBoundaryBuiltIn == &db && shape == uBoundaryBuiltShape
+                                && uBoundaryBuiltEpoch == meshGeometryEpoch
+                                && uBoundaryBuiltAddressing == dm.addressingId;
             if (sameShape)
             {
-                if (!uBoundaryStale)
+                part.emplace("U hook: the device boundary's state refreshed");
+                if (!uBoundaryStale && emptyOnDevice)
+                {
+                    refreshDeviceVectorBoundaryState(
+                        db,
+                        deviceVectorBoundaryArrays(f.U, fvp, g, false, true, true),
+                        &ranges);
+                    if (evaluated)
+                    {
+                        mirrorEmpty(db.comp[0].refValue, db.comp[1].refValue, db.comp[2].refValue);
+                    }
+                    if (uEmptyCheck)
+                    {
+                        const DeviceVectorBoundaryHost all = deviceVectorBoundaryArrays(f.U, fvp, g, false, true);
+                        for (int k = 0; k < 3; ++k)
+                        {
+                            sameOnDevice("refValue", k, db.comp[k].refValue, all.ref[k]);
+                            sameOnDevice("valueFraction", k, db.comp[k].valueFraction, all.vf[k]);
+                            sameOnDevice("refGrad", k, db.comp[k].refGrad, all.rg[k]);
+                            sameOnDevice("the stored inletOutlet value", k, db.comp[k].ioStored, all.iost[k]);
+                        }
+                    }
+                }
+                else if (!uBoundaryStale)
                 {
                     refreshDeviceVectorBoundaryState(db, deviceVectorBoundaryArrays(f.U, fvp, g, false, true));
                 }
             }
             else
             {
+                part.emplace("U hook: the device boundary built whole");
                 db = uploadDeviceVectorBoundary(deviceVectorBoundaryArrays(f.U, fvp, g, false));
                 uBoundaryBuiltIn = &db;
                 uBoundaryBuiltShape = std::move(shape);
+                uBoundaryBuiltEpoch = meshGeometryEpoch;
+                uBoundaryBuiltAddressing = dm.addressingId;
             }
         }
+        part.reset();
         if (!ubOut) return;
+        part.emplace("U hook: the patch values out");
         // AN `empty` PATCH'S ENTRIES ARE READ ON THE DEVICE, here and in the state arrays above: MEASURED with NaN
         // written over them, RAS/weirOverflow stops in its second step. brae's empty patch mirrors its cells
-        // and the kernels' terms there vanish or cancel, so they have to stay current -- which is what makes
-        // this hook's work grow with the cell count on a 2-D case (laminar/waves/stokesI: 21 of a 34 ms step).
+        // and the kernels' terms there vanish or cancel, so they have to stay current -- on the device, from the
+        // device's own U (mirrorEmptyFacesKernel), where the buffers are already this step's.
+        if (emptyOnDevice && evaluated && ubOut[0].size() == nBndAll && ubOut[1].size() == nBndAll
+         && ubOut[2].size() == nBndAll)
+        {
+            std::vector<scalar> pack(3*nHostFaces);
+            std::size_t at = 0;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (isCoupledInterfaceType(fvp[pi].type) || fvp[pi].type == "empty") continue;
+                for (const vector& u : f.U.boundary[pi]->value())
+                {
+                    pack[at] = u.x;
+                    pack[nHostFaces + at] = u.y;
+                    pack[2*nHostFaces + at] = u.z;
+                    ++at;
+                }
+            }
+            if (at != nHostFaces)
+            {
+                throw std::runtime_error("brae interFoam: U's patches do not hold a value a face.");
+            }
+            if (nHostFaces > 0)
+            {
+                uValuesStage.copyFrom(pack);
+            }
+            for (int k = 0; k < 3; ++k)
+            {
+                std::size_t from = static_cast<std::size_t>(k)*nHostFaces;
+                for (const DeviceBoundaryRange& r : ranges)
+                {
+                    cudaCheck(cudaMemcpyAsync(ubOut[k].data() + r.at, uValuesStage.data() + from,
+                                              r.n*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread),
+                              "U patch values out");
+                    from += r.n;
+                }
+            }
+            mirrorEmpty(ubOut[0], ubOut[1], ubOut[2]);
+            if (uEmptyCheck)
+            {
+                std::vector<scalar> all[3];
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                {
+                    if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                    for (const vector& u : f.U.boundary[pi]->value())
+                    {
+                        all[0].push_back(u.x);
+                        all[1].push_back(u.y);
+                        all[2].push_back(u.z);
+                    }
+                }
+                for (int k = 0; k < 3; ++k)
+                {
+                    sameOnDevice("the patch values", k, ubOut[k], all[k]);
+                }
+            }
+            part.reset();
+            return;
+        }
         std::vector<scalar> bx, by, bz;
         std::size_t nOut = 0;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
@@ -1549,6 +1770,7 @@ RunReport runInterFoamDevice(
         ubOut[0].copyFrom(bx);
         ubOut[1].copyFrom(by);
         ubOut[2].copyFrom(bz);
+        part.reset();
     };
     H.interfaceForces =
         [&](const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& Kd,
@@ -2656,6 +2878,7 @@ RunReport runInterFoamDevice(
             acmi->rescale(stepTime, m, *mutableMesh->g, *mutableMesh->patches);
             acmiRescaledThisStep = true;
             refreshDeviceMeshGeometry(dm, m, g, fvp);
+            ++meshGeometryEpoch;
             refreshDeviceCyclicAreas(dCyc, cyclics, g, fvp);
             dMagSf.copyFrom(magSfAll());
         };
@@ -3222,6 +3445,7 @@ RunReport runInterFoamDevice(
                     C.V00 = &dV00;
                 }
                 refreshDeviceMeshGeometry(dm, m, g, fvp);
+                ++meshGeometryEpoch;
                 // ...and THE PAIR: the host stage above has recomputed every cyclicAMI's weights on the
                 // moved points and coupled its patches again (cyclicAMIFvPatch::Interfaces::update)
                 if (dCyc.n > 0)
@@ -3669,6 +3893,7 @@ RunReport runInterFoamDevice(
                     // and V-cycle workspaces, the coarse-level ids -- keys its validity on that id
                     // (tools/cache_key_audit.py). Rebuilding the mesh is what invalidates all of them.
                     dm = buildDeviceMesh(m, g, fvp);
+                    ++meshGeometryEpoch;
                     dic = buildDeviceDilu(m.owner(), m.neighbour(), nC);
                     C.dic = &dic;
                     // ...and the GAMG upload, whose key is the HOST hierarchy's build count. That count

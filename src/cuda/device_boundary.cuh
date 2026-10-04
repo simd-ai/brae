@@ -384,8 +384,17 @@ inline DeviceVectorBoundaryHost deviceVectorBoundaryArrays(
     bool storedIoSeed,
     // the per-call STATE alone (ty, vf, ref, rg, iost, iofr): every other array is left empty -- the caller has
     // established they are the ones a full build gave (deviceVectorBoundaryShape)
-    bool stateOnly = false)
+    bool stateOnly = false,
+    // ...and, of that state, NOTHING FOR AN `empty` PATCH: the arrays come out compact, the other patches' faces
+    // in patch order (deviceNonEmptyBoundaryRanges says where each run belongs), for a caller that keeps the
+    // empty faces' entries on the device itself. An empty patch's state is constant but for its refValue, which
+    // is its cells' values (EmptyPatchField::evaluate).
+    bool skipEmpty = false)
 {
+    if (skipEmpty && !stateOnly)
+    {
+        throw std::runtime_error("brae deviceVectorBoundaryArrays: skipEmpty is for a state-only build.");
+    }
     DeviceVectorBoundaryHost h;
     std::vector<label> (&ty)[3] = h.ty;
     std::vector<label>& fc = h.fc;
@@ -413,6 +422,7 @@ inline DeviceVectorBoundaryHost deviceVectorBoundaryArrays(
     std::size_t nAll = 0;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
+        if (skipEmpty && fvp[pi].type == "empty") continue;
         if (!isCoupledInterfaceType(fvp[pi].type)) nAll += static_cast<std::size_t>(fvp[pi].size);
     }
     iofr.reserve(nAll);
@@ -450,6 +460,7 @@ inline DeviceVectorBoundaryHost deviceVectorBoundaryArrays(
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         if (isCoupledInterfaceType(fvp[pi].type)) continue;                     // cyclic = internal-like (handled by appended faces)
+        if (skipEmpty && fvp[pi].type == "empty") continue;
         // the gradient's mirror normal, in the host reference's own arithmetic (fvc.cu, boundaryGradU):
         // Sf/magSf by DIVISION per face on a `symmetry`; sumA/mag(sumA) once per patch on a
         // `symmetryPlane`, summed in face order from zero and (0,0,0) below 1e-150
@@ -772,12 +783,18 @@ struct DeviceVectorBoundaryShape
 inline DeviceVectorBoundaryShape deviceVectorBoundaryShape(
     const GeometricField<vector>& f,
     const std::vector<FvPatch>& fvp,
-    const FvGeometry& g)
+    const FvGeometry& g,
+    // an `empty` patch's face cells and geometry left out of the key, for a caller that keys them otherwise --
+    // on the mesh's addressing and on a count of its geometry's changes. They change only when the mesh does,
+    // and on a 2-D mesh they are two faces a cell: MEASURED on waveMakerPiston refined to 896,000 cells, the key
+    // alone 29 ms a step, four calls.
+    bool skipEmpty = false)
 {
     DeviceVectorBoundaryShape k;
     std::size_t nAll = 0;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
+        if (skipEmpty && fvp[pi].type == "empty") continue;
         if (!isCoupledInterfaceType(fvp[pi].type)) nAll += static_cast<std::size_t>(fvp[pi].size);
     }
     k.fc.reserve(nAll);
@@ -805,6 +822,7 @@ inline DeviceVectorBoundaryShape deviceVectorBoundaryShape(
                 k.kindData.insert(k.kindData.end(), {v.x, v.y, v.z});
             }
         }
+        if (skipEmpty && fvp[pi].type == "empty") continue;
         k.fc.insert(k.fc.end(), fvp[pi].faceCells.begin(), fvp[pi].faceCells.begin() + fvp[pi].size);
         for (label i = 0; i < fvp[pi].size; ++i)
         {
@@ -827,11 +845,52 @@ inline DeviceVectorBoundaryShape deviceVectorBoundaryShape(
 // two thirds of it the uploads. The caller owns the precondition: deviceVectorBoundaryShape equal to the one `db`
 // was built with. MEASURED on RAS/damBreakLeakage, where a cyclicACMI's open fraction moves on an unmoved mesh:
 // U 3.0e-01 from OpenFOAM on the device arm with the first build's geometry kept, 5.1e-12 rebuilt.
+// where the faces of the patches that are neither `empty` nor a coupled interface sit in the device boundary's
+// numbering (the non-coupled patches in order), run by run; `nAll` is that numbering's size
+struct DeviceBoundaryRange
+{
+    std::size_t at = 0;
+    std::size_t n = 0;
+};
+inline std::vector<DeviceBoundaryRange> deviceNonEmptyBoundaryRanges(
+    const std::vector<FvPatch>& fvp,
+    std::size_t& nAll)
+{
+    std::vector<DeviceBoundaryRange> ranges;
+    nAll = 0;
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+        const std::size_t np = static_cast<std::size_t>(fvp[pi].size);
+        if (fvp[pi].type != "empty" && np > 0)
+        {
+            ranges.push_back(DeviceBoundaryRange{nAll, np});
+        }
+        nAll += np;
+    }
+    return ranges;
+}
+
+// `ranges` null: h holds every boundary face's state and all of it goes up. `ranges` set: h is COMPACT -- built
+// with skipEmpty -- and each run goes to its place, the faces between them (the empty patches') left as they are.
 inline void refreshDeviceVectorBoundaryState(
     DeviceVectorBoundary& db,
-    const DeviceVectorBoundaryHost& h)
+    const DeviceVectorBoundaryHost& h,
+    const std::vector<DeviceBoundaryRange>* ranges = nullptr)
 {
-    if (static_cast<int>(h.ty[0].size()) != db.n)
+    std::size_t nCompact = 0;
+    if (ranges)
+    {
+        for (const DeviceBoundaryRange& r : *ranges)
+        {
+            if (r.at + r.n > static_cast<std::size_t>(db.n))
+            {
+                throw std::runtime_error("brae: refreshDeviceVectorBoundaryState: a run past the boundary's end.");
+            }
+            nCompact += r.n;
+        }
+    }
+    if (static_cast<std::size_t>(h.ty[0].size()) != (ranges ? nCompact : static_cast<std::size_t>(db.n)))
     {
         throw std::runtime_error(
             "brae: refreshDeviceVectorBoundaryState on a boundary of another size -- the device boundary was "
@@ -840,10 +899,11 @@ inline void refreshDeviceVectorBoundaryState(
     // ONE UPLOAD per type, then the device splits it: eighteen blocking uploads of one boundary's worth each
     // were 23.7 ms a step on RAS/DTCHull (69,887 boundary faces, three calls a step)
     const std::size_t n = static_cast<std::size_t>(db.n);
+    const std::size_t nh = ranges ? nCompact : n;
     std::vector<scalar> packS;
-    packS.reserve(12*n);
+    packS.reserve(12*nh);
     std::vector<label> packL;
-    packL.reserve(4*n);
+    packL.reserve(4*nh);
     for (int k = 0; k < 3; ++k)
     {
         packS.insert(packS.end(), h.iost[k].begin(), h.iost[k].end());
@@ -855,25 +915,61 @@ inline void refreshDeviceVectorBoundaryState(
     packL.insert(packL.end(), h.iofr.begin(), h.iofr.end());
     static DeviceBuffer<scalar> stageS;
     static DeviceBuffer<label> stageL;
-    stageS.copyFrom(packS);
-    stageL.copyFrom(packL);
+    if (nh > 0)
+    {
+        stageS.copyFrom(packS);
+        stageL.copyFrom(packL);
+    }
+    // one array of the staged block to its buffer: whole, or run by run
     auto put = [&](DeviceBuffer<scalar>& to, std::size_t at)
     {
         if (to.size() != n)
         {
+            if (ranges)
+            {
+                throw std::runtime_error("brae: refreshDeviceVectorBoundaryState: a run-by-run refresh of a "
+                                         "boundary that was never built whole.");
+            }
             to.resize(n);
         }
-        cudaCheck(cudaMemcpyAsync(to.data(), stageS.data() + at*n, n*sizeof(scalar), cudaMemcpyDeviceToDevice,
-                                  cudaStreamPerThread), "boundary state split");
+        if (!ranges)
+        {
+            cudaCheck(cudaMemcpyAsync(to.data(), stageS.data() + at*n, n*sizeof(scalar), cudaMemcpyDeviceToDevice,
+                                      cudaStreamPerThread), "boundary state split");
+            return;
+        }
+        std::size_t from = at*nh;
+        for (const DeviceBoundaryRange& r : *ranges)
+        {
+            cudaCheck(cudaMemcpyAsync(to.data() + r.at, stageS.data() + from, r.n*sizeof(scalar),
+                                      cudaMemcpyDeviceToDevice, cudaStreamPerThread), "boundary state split");
+            from += r.n;
+        }
     };
     auto putL = [&](DeviceBuffer<label>& to, std::size_t at)
     {
         if (to.size() != n)
         {
+            if (ranges)
+            {
+                throw std::runtime_error("brae: refreshDeviceVectorBoundaryState: a run-by-run refresh of a "
+                                         "boundary that was never built whole.");
+            }
             to.resize(n);
         }
-        cudaCheck(cudaMemcpyAsync(to.data(), stageL.data() + at*n, n*sizeof(label), cudaMemcpyDeviceToDevice,
-                                  cudaStreamPerThread), "boundary state split");
+        if (!ranges)
+        {
+            cudaCheck(cudaMemcpyAsync(to.data(), stageL.data() + at*n, n*sizeof(label), cudaMemcpyDeviceToDevice,
+                                      cudaStreamPerThread), "boundary state split");
+            return;
+        }
+        std::size_t from = at*nh;
+        for (const DeviceBoundaryRange& r : *ranges)
+        {
+            cudaCheck(cudaMemcpyAsync(to.data() + r.at, stageL.data() + from, r.n*sizeof(label),
+                                      cudaMemcpyDeviceToDevice, cudaStreamPerThread), "boundary state split");
+            from += r.n;
+        }
     };
     for (int k = 0; k < 3; ++k)
     {

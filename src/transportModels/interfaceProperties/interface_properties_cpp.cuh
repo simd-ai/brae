@@ -207,10 +207,18 @@ struct NHatBoundaryStencil
     std::vector<label> start;     // per entry of `cells`: its internal faces, ascending
     std::vector<label> faces;
     std::vector<vector> gradAlpha;   // full size; only `cells` are ever written or read
+    // AN `empty` PATCH LEFT OUT: its cells are not in `cells` unless another patch puts them there, and
+    // finishNHatBoundary writes ZERO on its faces. emptyFvPatch::size() is 0 in OpenFOAM, so there is no normal
+    // there to form; brae keeps the faces in its addressing and every reader skips them (deviceDiv, by
+    // bndIsEmpty) or multiplies them by a flux that is zero there. On a 2-D mesh EVERY cell touches the empty
+    // patches, and the stencil was the whole mesh: MEASURED on waveMakerPiston refined to 896,000 cells, the
+    // alpha hooks' boundary normal 71 ms a step with them in.
+    bool skipEmpty = false;
 };
 NHatBoundaryStencil nHatBoundaryStencil(
     const PrimitiveMesh& m,
-    const std::vector<FvPatch>& patches);
+    const std::vector<FvPatch>& patches,
+    bool skipEmpty = false);
 bool nHatBoundaryOnlyApplies(
     const InterfaceCoeffs& c,
     bool gradLeastSquares,
