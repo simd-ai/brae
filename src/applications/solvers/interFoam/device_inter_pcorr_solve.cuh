@@ -37,9 +37,29 @@ struct DevicePcorrSolver
     DeviceBuffer<label> dLosort;
     DeviceBuffer<label> dLosortStart;
     AMGData amg;
+    // the system and the solution on the device, KEPT between calls: the PCG loop's captured graph is keyed on
+    // the solution's address (PCGGraphCache), so a buffer made afresh at every call would capture afresh too
+    DeviceBuffer<scalar> dDiag;
+    DeviceBuffer<scalar> dUpper;
+    DeviceBuffer<scalar> dSource;
+    DeviceBuffer<scalar> dPsi;
 
     // the case, for the hierarchy's disk cache (deviceAmgPcgHierarchy); empty = no disk cache
     std::string caseDir;
+
+    // WHICH HIERARCHY pcorr's AMG-PCG runs on. pcorr starts from zero at every CorrectPhi and is solved to the
+    // case's tolerance -- 1e-10 in the wave-maker tutorials -- so its cost is its iteration count, and on the
+    // hierarchy p_rgh uses (pairwise aggregation, a V-cycle in single precision) that is large. MEASURED on
+    // waveMakerPiston refined to 896,000 cells, 30 steps: 173 iterations a solve, 320 of CorrectPhi's 360 ms a
+    // step (OpenFOAM's own DICPCG stops at its 1,000-iteration limit there, at 5e-06). On a SMOOTHED-AGGREGATION
+    // hierarchy of its own: 48 iterations, 134 ms, CorrectPhi 360 -> 178, the same 30 steps to the same time.
+    // The smoothed hierarchy costs ten times the plain one to build (2.1 s at 896,000 cells; 575 against 59 ms
+    // a step on damBreakWithObstacle, which rebuilds at every refinement), so it is taken only where it is
+    // built ONCE: `fixedTopology`, set by the caller for a mesh that moves and does not refine, and only at the
+    // first build. Anywhere else pcorr takes the hierarchy p_rgh takes, as before.
+    // BRAE_PCORR_AMG=plain never smooths (the gate's other arm); =sa smooths at every build, whatever the mesh.
+    // NOT on the disk cache: it is rebuilt at every start.
+    bool fixedTopology = false;
 
     // pcorrEqn.solve() on the GPU, whatever its entry names (`asked`, for the notice): the boundary folded as
     // fvMatrix::solveSegregated folds it, then deviceAMGPCG with the entry's stopping controls. Returns false,

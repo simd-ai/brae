@@ -1,10 +1,12 @@
 // interFoam's correctPhi -- see inter_correct_phi_cpp.cuh for the provenance and the order.
+#include "inter_phase_time.cuh"
 #include "inter_correct_phi_cpp.cuh"
 #include "fv_matrix_ops.cuh"
 #include "fv_patch_field.cuh"
 #include "fvm.cuh"
 #include "inter_peqn_cpp.cuh"
 #include "pcg.cuh"
+#include <optional>
 #include <stdexcept>
 #include <string>
 
@@ -153,6 +155,8 @@ void correctPhi(
             "handed in.");
     }
 
+    std::optional<interPhase::Nested> timedPart;
+    timedPart.emplace("CorrectPhi: the fixing patches' U and flux, pcorr, adjustPhi");
     if (in.meshChanging)
     {
         correctUphiBCs(U, phi, in.rhoPhi, g, patches);
@@ -178,13 +182,17 @@ void correctPhi(
 
     const label nC = m.nCells();
     // div(phi) is the equation's whole source; it does not change inside the loop
+    timedPart.emplace("CorrectPhi: div(phi)");
     const std::vector<scalar> divPhi = fvc::div(phi, m, g, patches);
+    timedPart.reset();
     for (label corr = 0; corr <= c.nNonOrthogonalCorrectors; ++corr)
     {
         const bool finalIter = (corr == c.nNonOrthogonalCorrectors);
 
         // fvm::laplacian(rAUf, pcorr) == fvc::div(phi) - divU, divU a geometricZeroField
+        timedPart.emplace("CorrectPhi: the laplacian matrix");
         FvScalarMatrix pe = fvm::laplacian<scalar>(*in.rAUf, pcorr, m, g, patches, c.correctedLaplacian, c.nonOrthCoeffs);
+        timedPart.emplace("CorrectPhi: the gradient, the non-orthogonal correction, the source");
         if (c.correctedLaplacian)
         {
             // the fluxRequired branch of gaussLaplacianSchemes.C: CorrectPhi.C:73 sets it for pcorr
@@ -215,6 +223,7 @@ void correctPhi(
         }
 
         // pcorr.select(pimple.finalNonOrthogonalIter())
+        timedPart.emplace("CorrectPhi: the pcorr solve, whole");
         const InterFields::PressureLinearSolve& s = finalIter ? *c.pcorrFinal : *c.pcorr;
         SolverPerformance sp;
         bool solved = false;
@@ -282,6 +291,7 @@ void correctPhi(
         {
             in.solveLog->push_back(LinearSolveRecord{sp.initialResidual, sp.finalResidual, sp.nIterations});
         }
+        timedPart.emplace("CorrectPhi: pcorr's boundary, the flux, phi");
         pcorr.evaluateBoundary();
 
         if (finalIter)
@@ -301,6 +311,7 @@ void correctPhi(
                 }
             }
         }
+        timedPart.reset();
     }
 }
 

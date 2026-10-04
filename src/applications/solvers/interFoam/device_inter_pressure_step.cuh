@@ -121,6 +121,19 @@ struct DeviceAmgPcgCache
 // and for this smoother mode, and writes it after a build -- the file simpleFoam's fast path keeps. A stale file
 // of the right sizes can only slow the solve: the hierarchy preconditions a conjugate gradient on the TRUE
 // matrix. BRAE_AMG_CACHE=0 neither reads nor writes it.
+// THE FAST PATH'S PERFORMANCE KNOBS, one reading for every pressure entry -- p_rgh here and pcorr in
+// device_inter_pcorr_solve.cu -- with simpleFoam's defaults and switches (linear_solver_setup.cuh): the
+// residual read every 4 iterations where the loop is driven from the host (BRAE_PCG_CHECK_EVERY), the whole
+// PCG loop replayed from a CUDA graph (BRAE_USE_GRAPH=0 drives it from the host), and no coarse-correction
+// scaling (BRAE_CORR_SCALING=1). A caller with a coupled pair turns the graph off itself.
+struct AmgPcgKnobs
+{
+    int checkEvery = 4;
+    bool graph = true;
+    bool corrScaling = false;
+};
+const AmgPcgKnobs& amgPcgKnobs();
+
 AMGData deviceAmgPcgHierarchy(
     const PrimitiveMesh& m,
     const FvGeometry& g,

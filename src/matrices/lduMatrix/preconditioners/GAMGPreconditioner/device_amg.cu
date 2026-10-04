@@ -902,7 +902,8 @@ AMGData buildAMG(
     const std::vector<label>& fineOwner,
     const std::vector<label>& fineNei,
     const std::vector<scalar>& faceWeights,
-    int nFine)
+    int nFine,
+    const bool* smoothedAggregation)
 {
     // Keep coarsening until the coarsest grid is <= TARGET cells. Overridable (BRAE_AMG_TARGET)
     // so a tiny mesh can still be made to build a real hierarchy: the demo/teaching cases are
@@ -933,7 +934,7 @@ AMGData buildAMG(
     };
     const bool gs = useGS();
     A.gsSmooth = gs;
-    const bool sa = useSA();
+    const bool sa = smoothedAggregation ? *smoothedAggregation : useSA();
     A.saSmooth = sa;                    // smoothed aggregation (BRAE_AMG_SA): general RAP coarse op
     std::vector<label> owner = fineOwner, nei = fineNei;
     std::vector<scalar> fw = faceWeights;

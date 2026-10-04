@@ -456,26 +456,11 @@ scalar deviceInterPressureStep(
             const scalar relTol = gamg ? gamg->relTol : sv.relTol;
             const int maxIter = oneIteration ? 1 : (gamg ? gamg->maxIter : sv.maxIter);
             const int minIter = gamg ? gamg->minIter : 0;
-            // the fast path's performance knobs, with simpleFoam's defaults and switches
-            // (linear_solver_setup.cuh): the residual read every 4 iterations, the V-cycle replayed from a
-            // CUDA graph except across a coupled pair, and no coarse-correction scaling
-            static const int checkEvery = []()
-            {
-                const char* e = std::getenv("BRAE_PCG_CHECK_EVERY");
-                return (e && std::atoi(e) >= 1) ? std::atoi(e) : 4;
-            }();
-            static const bool useGraph = []()
-            {
-                const char* e = std::getenv("BRAE_USE_GRAPH");
-                return e ? std::atoi(e) != 0 : true;
-            }();
-            static const bool corrScaling = []()
-            {
-                const char* e = std::getenv("BRAE_CORR_SCALING");
-                return e ? std::atoi(e) != 0 : false;
-            }();
-            const bool graph = useGraph && !(in.cyc && in.cyc->n > 0);
-            perf = deviceAMGPCG(A, amg, b, p_rgh, nf, tol, relTol, maxIter, graph, checkEvery, corrScaling, minIter);
+            // the fast path's knobs (amgPcgKnobs); the graph not across a coupled pair
+            const AmgPcgKnobs& knobs = amgPcgKnobs();
+            const bool graph = knobs.graph && !(in.cyc && in.cyc->n > 0);
+            perf = deviceAMGPCG(A, amg, b, p_rgh, nf, tol, relTol, maxIter, graph, knobs.checkEvery,
+                                knobs.corrScaling, minIter);
         }
         else if (gamg)
         {
@@ -693,6 +678,31 @@ scalar deviceInterPressureStep(
     }
 
     return perf.finalResidual;
+}
+
+const AmgPcgKnobs& amgPcgKnobs()
+{
+    static const AmgPcgKnobs knobs = []()
+    {
+        AmgPcgKnobs k;
+        const char* every = std::getenv("BRAE_PCG_CHECK_EVERY");
+        if (every && std::atoi(every) >= 1)
+        {
+            k.checkEvery = std::atoi(every);
+        }
+        const char* graph = std::getenv("BRAE_USE_GRAPH");
+        if (graph)
+        {
+            k.graph = std::atoi(graph) != 0;
+        }
+        const char* scaling = std::getenv("BRAE_CORR_SCALING");
+        if (scaling)
+        {
+            k.corrScaling = std::atoi(scaling) != 0;
+        }
+        return k;
+    }();
+    return knobs;
 }
 
 AMGData deviceAmgPcgHierarchy(

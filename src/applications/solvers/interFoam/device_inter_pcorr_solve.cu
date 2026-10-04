@@ -1,9 +1,11 @@
+#include "inter_phase_time.cuh"
 #include "device_inter_pcorr_solve.cuh"
 #include "device_inter_pressure_step.cuh"   // deviceAmgPcgHierarchy
 #include "device_blas.cuh"
 #include "device_ldu.cuh"
 #include "device_mesh.cuh"   // nextDeviceAddressingId
 #include "device_pcg.cuh"    // deviceNormFactor
+#include <optional>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -53,6 +55,8 @@ bool DevicePcorrSolver::solve(
     }
     const label nC = m.nCells();
     const label nIf = m.nInternalFaces();
+    std::optional<interPhase::Nested> timedPart;
+    timedPart.emplace("pcorr: the addressing check, the fold and the uploads");
     const bool same = nC == nCells
                    && static_cast<std::size_t>(nIf) == owner.size()
                    && std::equal(owner.begin(), owner.end(), m.owner().begin())
@@ -90,7 +94,44 @@ bool DevicePcorrSolver::solve(
         // the hierarchy the p_rgh solve takes (deviceAmgPcgHierarchy), from the disk cache on the start mesh
         const bool firstBuild = addressingId == 0;
         addressingId = nextDeviceAddressingId();
-        amg = deviceAmgPcgHierarchy(m, g, caseDir, firstBuild);
+        // which hierarchy: see fixedTopology in the header
+        static const int mode = []()
+        {
+            const char* e = std::getenv("BRAE_PCORR_AMG");
+            const std::string v = e ? e : "";
+            if (v.empty())
+            {
+                return 0;
+            }
+            if (v == "plain")
+            {
+                return 1;
+            }
+            if (v == "sa")
+            {
+                return 2;
+            }
+            throw std::runtime_error("brae interFoam device pcorr solve: BRAE_PCORR_AMG=" + v
+                                     + " is not one of plain, sa.");
+        }();
+        if (mode == 2 || (mode == 0 && fixedTopology && firstBuild))
+        {
+            static bool said = false;
+            if (!said)
+            {
+                said = true;
+                std::printf("  pcorr: its AMG hierarchy is a smoothed-aggregation one of its own, built once "
+                            "(the mesh keeps its topology); BRAE_PCORR_AMG=plain takes the one p_rgh uses\n");
+            }
+            const std::vector<scalar> w(g.magSf().begin(), g.magSf().begin() + nIf);
+            const bool smoothed = true;
+            interPhase::Nested timedBuild("pcorr: the smoothed-aggregation hierarchy (build)");
+            amg = buildAMG(owner, neighbour, w, nC, &smoothed);
+        }
+        else
+        {
+            amg = deviceAmgPcgHierarchy(m, g, caseDir, firstBuild);
+        }
     }
     // fvMatrix::solveSegregated: addBoundaryDiag, addBoundarySource (no coupled patch reaches here)
     std::vector<scalar> diag = M.diag;
@@ -104,22 +145,30 @@ bool DevicePcorrSolver::solve(
             source[c] += M.boundaryCoeffs[pi][static_cast<std::size_t>(i)];
         }
     }
-    DeviceBuffer<scalar> dDiag(diag);
-    DeviceBuffer<scalar> dUpper(M.upper);
-    DeviceBuffer<scalar> dSource(source);
-    DeviceBuffer<scalar> dPsi(psi);
+    dDiag.copyFrom(diag);
+    dUpper.copyFrom(M.upper);
+    dSource.copyFrom(source);
+    dPsi.copyFrom(psi);
     DeviceLduView A{nC, nIf, dDiag.data(), dUpper.data(), dUpper.data(), dOwner.data(), dNeighbour.data(),
                     dOwnerStart.data(), dLosort.data(), dLosortStart.data(), 0, nullptr, nullptr, nullptr};
     A.addressingId = addressingId;
+    timedPart.emplace("pcorr: the hierarchy's coarse matrices (Galerkin) and the norm factor");
     amgGalerkin(amg, dDiag, dUpper, dUpper);
     const scalar nf = deviceNormFactor(A, dPsi, dSource, deviceOnes(nC));
     // BRAE_CONTROL_AMG_PCG_ONE_ITERATION=1, the AMG-PCG gates' control, as the p_rgh solve takes it; and
     // BRAE_CONTROL_AMG_PCG_PCORR_ONE_ITERATION=1, which stops pcorr's alone -- the pcorr gate's control
     static const bool oneIteration = std::getenv("BRAE_CONTROL_AMG_PCG_ONE_ITERATION") != nullptr
                                   || std::getenv("BRAE_CONTROL_AMG_PCG_PCORR_ONE_ITERATION") != nullptr;
+    timedPart.emplace("pcorr: the AMG-PCG iterations");
+    // the fast path's knobs, the ones the p_rgh solve takes (amgPcgKnobs). By default deviceAMGPCG runs the
+    // whole PCG loop from its captured graph whatever they say (BRAE_PCG_DEVICE); they matter when that is off
+    // or coarse-correction scaling is asked for, and then both pressure entries now take the same ones.
+    const AmgPcgKnobs& knobs = amgPcgKnobs();
     const DeviceSolverPerf r = deviceAMGPCG(A, amg, dSource, dPsi, nf, tol, relTol, oneIteration ? 1 : maxIter,
-                                            false, 1, false, minIter);
+                                            knobs.graph, knobs.checkEvery, knobs.corrScaling, minIter);
+    timedPart.emplace("pcorr: the download");
     dPsi.copyTo(psi);
+    timedPart.reset();
     perf.initialResidual = r.initialResidual;
     perf.finalResidual = r.finalResidual;
     perf.nIterations = r.nIterations;

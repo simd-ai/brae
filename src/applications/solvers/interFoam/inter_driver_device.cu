@@ -833,6 +833,9 @@ RunReport runInterFoamDevice(
     // at every mesh update, unless BRAE_PRESSURE_CASE_SOLVER asks for the case's own -- as every test does
     DevicePcorrSolver pcorrSolver;
     pcorrSolver.caseDir = caseDir;
+    // a mesh that moves and does not refine keeps its topology, so pcorr's hierarchy is built once: the case
+    // for its smoothed-aggregation hierarchy (DevicePcorrSolver::fixedTopology)
+    pcorrSolver.fixedTopology = dyn != nullptr && !(f.amr && f.amr->active);
     auto withDevicePcorr = [&](CorrectPhiControls c)
     {
         if (std::getenv("BRAE_PRESSURE_CASE_SOLVER") == nullptr)

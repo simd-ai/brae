@@ -193,8 +193,10 @@ struct AMGData {
 };
 
 // Build the multi-level agglomeration hierarchy (host, once) from the fine internal addressing + face weights (|Sf|).
+// `smoothedAggregation`: null takes the BRAE_AMG_SA switch; a caller that wants one hierarchy smoothed and
+// another not (interFoam's pcorr against its p_rgh) says so here.
 AMGData buildAMG(const std::vector<label>& fineOwner, const std::vector<label>& fineNei,
-                 const std::vector<scalar>& faceWeights, int nFine);
+                 const std::vector<scalar>& faceWeights, int nFine, const bool* smoothedAggregation = nullptr);
 
 // AMG hierarchy cache (the "partition" step): the agglomeration is static per mesh -> serialize the STRUCTURE so a
 // warm run reloads it instead of re-agglomerating. Only the structure is cached (cDiag/cUpper/cLower VALUES are

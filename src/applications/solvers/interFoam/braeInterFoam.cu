@@ -357,6 +357,7 @@ int main(int argc, char** argv)
             };
             printSolves("alpha.water", r.alphaSolves);
             printSolves("p_rgh", r.pSolves);
+            printSolves("pcorr", r.pcorrSolves);
             printSolves("epsilon", r.epsilonSolves);
             printSolves("omega", r.omegaSolves);
             printSolves("k", r.kSolves);

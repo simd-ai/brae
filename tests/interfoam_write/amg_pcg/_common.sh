@@ -79,3 +79,49 @@ PY
     what="$what ($(cat "$W/pcorr_control.txt"))"
     [ $rc -eq 0 ] && say "$what" ok || say "$what" FAIL
 }
+
+# amgpcg_pcorr_sa_gate <key> <bound>: pcorr on its own smoothed-aggregation hierarchy (DevicePcorrSolver's
+# fixedTopology), on a case whose mesh moves and keeps its topology. Three arms -- the default, the hierarchy
+# p_rgh uses (BRAE_PCORR_AMG=plain), and pcorr's solve stopped after one iteration -- and three checks: the
+# default announces the smoothed hierarchy and solves pcorr in FEWER iterations than the plain one, its fields
+# are within <bound> of OpenFOAM's, and the control goes over <bound>.
+amgpcg_pcorr_sa_gate()
+{
+    local key="$1" bound="$2" v e
+    unset BRAE_PRESSURE_CASE_SOLVER
+    [ $GPU -eq 1 ] || { echo "SKIP: no GPU for the device arm"; exit 77; }
+    wcase $key of > "$W/amg_stage.txt" 2>&1
+    local o="$W/w_of_$key"
+    [ -d "$o" ] || { say "$key did not stage" FAIL; return; }
+    for v in sa plain control; do
+        e="$W/pcsa_$v"
+        mkdir -p "$e"
+        cp -r "$o/0" "$o/constant" "$o/system" "$e/"
+        case $v in
+            sa)      runbrae "$e" device BRAE_PRINT_TURB_SOLVES=1 ;;
+            plain)   runbrae "$e" device BRAE_PRINT_TURB_SOLVES=1 BRAE_PCORR_AMG=plain ;;
+            control) runbrae "$e" device BRAE_CONTROL_AMG_PCG_PCORR_ONE_ITERATION=1 ;;
+        esac
+        python3 "$CMP" "$o" "$e" $(timedirs "$o") > "$W/cmp_pcsa_$v.txt" 2>&1
+    done
+    local mark="pcorr: its AMG hierarchy is a smoothed-aggregation one of its own"
+    local nsa=$(grep -a "Solving for pcorr" "$W/pcsa_sa/log.brae" | awk '{s += $NF} END {print s + 0}')
+    local npl=$(grep -a "Solving for pcorr" "$W/pcsa_plain/log.brae" | awk '{s += $NF} END {print s + 0}')
+    local what="[device] $key: pcorr takes its smoothed hierarchy and says so, in $nsa iterations against $npl"
+    grep -q "$mark" "$W/pcsa_sa/log.brae" && ! grep -q "$mark" "$W/pcsa_plain/log.brae" \
+        && [ "$nsa" -gt 0 ] && [ "$nsa" -lt "$npl" ] && say "$what" ok || say "$what" FAIL
+    judge "$key pcorr on the smoothed hierarchy" "$W/cmp_pcsa_sa.txt" "$bound" "$o/log.interFoam" \
+        && say "[device] $key with pcorr on the smoothed hierarchy: every file within $bound of OpenFOAM" ok \
+        || say "[device] $key with pcorr on the smoothed hierarchy: every file within $bound of OpenFOAM" FAIL
+    python3 - "$W/cmp_pcsa_control.txt" "$bound" > "$W/pcsa_control.txt" <<'PY'
+import json, sys
+r = json.loads([l for l in open(sys.argv[1]) if l.startswith('RESULT ')][-1][7:])
+f = max(((k, v['rel']) for k, v in r['files'].items() if 'cumulativeContErr' not in k), key=lambda kv: kv[1])
+print('%s %.1e' % f)
+sys.exit(0 if f[1] > float(sys.argv[2]) else 1)
+PY
+    local rc=$?
+    what="CONTROL  pcorr's solve stopped after one iteration puts $key's fields over $bound"
+    what="$what ($(cat "$W/pcsa_control.txt"))"
+    [ $rc -eq 0 ] && say "$what" ok || say "$what" FAIL
+}
