@@ -1,6 +1,7 @@
 #include "device_patch_wave.cuh"
 #include "device_blas.cuh"
 #include "inter_phase_time.cuh"
+#include <optional>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
@@ -503,6 +504,8 @@ void devicePatchWave(
     const label nIf = w.nIf;
     const label nAll = nC + nF;
     // the centres as the mesh stands now: cells, then faces
+    std::optional<interPhase::Nested> part;
+    part.emplace("wave: the centres to the device (host loop, three uploads)");
     {
         const std::vector<vector>& C = g.C();
         const std::vector<vector>& Cf = g.Cf();
@@ -525,6 +528,7 @@ void devicePatchWave(
         w.py.copyFrom(hy);
         w.pz.copyFrom(hz);
     }
+    part.emplace("wave: the initial state and the seeds");
     cudaCheck(cudaMemsetAsync(w.facePos.data(), 0xFF, static_cast<std::size_t>(nF)*sizeof(label),
                               cudaStreamPerThread), WHO);
     cudaCheck(cudaMemsetAsync(w.cellPos.data(), 0xFF, static_cast<std::size_t>(nC)*sizeof(label),
@@ -653,17 +657,28 @@ void devicePatchWave(
         return nf;
     };
     // MeshWave<wallPoint>(mesh, changedFaces, faceDist, nTotalCells + 1): FaceCellWave::iterate
+    part.reset();
     const label maxIter = nC + 1;
     label iter = 0;
     for (; iter < maxIter; ++iter)
     {
-        const label nCells = faceToCell();
-        const label nFaces = nCells ? cellToFace(nCells) : 0;
+        label nCells = 0;
+        {
+            interPhase::Nested timedHalf("wave: faceToCell half-sweeps");
+            nCells = faceToCell();
+        }
+        label nFaces = 0;
+        if (nCells)
+        {
+            interPhase::Nested timedHalf("wave: cellToFace half-sweeps");
+            nFaces = cellToFace(nCells);
+        }
         if (!nCells || !nFaces)
         {
             break;
         }
     }
+    part.emplace("wave: the squared distances down");
     if (iter >= maxIter)
     {
         throw std::runtime_error(std::string(WHO) + "Maximum number of iterations reached. Increase maxIter.");
@@ -677,6 +692,7 @@ void devicePatchWave(
         cudaCheck(cudaMemcpy(boundaryDistSqr.data(), w.dist.data() + nC + nIf,
                              boundaryDistSqr.size()*sizeof(scalar), cudaMemcpyDeviceToHost), WHO);
     }
+    part.reset();
 }
 
 } // namespace brae

@@ -442,6 +442,7 @@ void DisplacementLaplacianFvMotionSolver::diffusivityCorrect(
             "and faces. OpenFOAM carries on with -GREAT there; brae does not.");
     }
     y_ = wave.distance;
+    interPhase::Nested timedFace("wave: the face diffusivity from the distance (host interpolate, 1/y)");
 
     // meshWave::correct: the wave's patch distances on every non-empty patch, then
     // correctBoundaryConditions -- fixedValue on the named patches keeps them, zeroGradient elsewhere

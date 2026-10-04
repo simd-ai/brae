@@ -1,3 +1,4 @@
+#include "inter_phase_time.cuh"
 #include "patch_wave_cpp.cuh"
 #include "face_cpp.cuh"
 #include "foam_dict.cuh"
@@ -490,6 +491,7 @@ PatchWave patchWave(
     // Correct wall cells for true distance
     if (correctWalls)
     {
+        interPhase::Nested timedCorrect("wave: the near-wall correction (host correctBoundaryCells)");
         correctBoundaryCells(m, g, patches, sortedIDs, out.distance, pointFacesIn);
     }
     return out;
