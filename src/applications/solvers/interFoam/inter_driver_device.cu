@@ -2807,8 +2807,34 @@ RunReport runInterFoamDevice(
                 "with something the case did not name.");
         }
     }
-    DeviceDilu dic = buildDeviceDilu(m.owner(), m.neighbour(), nC);
-    C.dic = &dic;
+    // THE DIC SCHEDULE IS BUILT ONLY WHERE A PRESSURE SOLVE READS IT. It is OpenFOAM's DIC -- the level schedule
+    // of the incomplete Cholesky sweep -- and three solvers take it, all of them the CASE'S OWN: PCG with DIC,
+    // GAMG (its fine level) and PCG preconditioned by GAMG (device_inter_pressure_step.cu). Under the pressure
+    // rule p_rgh runs the AMG-PCG, whose smoother is weighted Jacobi and which never reads it; it was built
+    // all the same, at start-up and again after every change of topology. MEASURED: 14 ms a step of
+    // damBreakWithObstacle's 272 and 7 of RAS/motorBike's 197. A solve that needs it and finds none refuses by
+    // name, as before.
+    //   BRAE_CONTROL_DIC_SCHEDULE_ALWAYS=1  builds it whatever the path, as before
+    //   BRAE_CONTROL_DIC_SCHEDULE_NEVER=1   a gate's CONTROL: never built, so the case's own solver must refuse
+    const bool dicSchedule = [&]()
+    {
+        if (std::getenv("BRAE_CONTROL_DIC_SCHEDULE_NEVER") != nullptr) return false;
+        if (std::getenv("BRAE_CONTROL_DIC_SCHEDULE_ALWAYS") != nullptr) return true;
+        if (std::getenv("BRAE_PRESSURE_CASE_SOLVER") == nullptr) return false;
+        return f.pSolve.pcgDIC() || f.pSolve.gamgSolver() || f.pSolve.pcgGamg()
+            || f.pSolveFinal.pcgDIC() || f.pSolveFinal.gamgSolver() || f.pSolveFinal.pcgGamg();
+    }();
+    DeviceDilu dic;
+    if (dicSchedule)
+    {
+        dic = buildDeviceDilu(m.owner(), m.neighbour(), nC);
+        C.dic = &dic;
+    }
+    else
+    {
+        std::printf("  DIC schedule: not built -- no pressure solve here runs the case's own DIC or GAMG; "
+                    "BRAE_CONTROL_DIC_SCHEDULE_ALWAYS=1 builds it\n");
+    }
     std::vector<DeviceSolverPerf> pLog, aLog, uLog[3];
     C.momentumSolveLog = uLog;
     C.pressureSolveLog = &pLog;
@@ -4166,8 +4192,11 @@ RunReport runInterFoamDevice(
                     dm = buildDeviceMesh(m, g, fvp);
                     ++meshGeometryEpoch;
                     stagePart.emplace("stage: the DIC schedule rebuilt (buildDeviceDilu)");
-                    dic = buildDeviceDilu(m.owner(), m.neighbour(), nC);
-                    C.dic = &dic;
+                    if (dicSchedule)
+                    {
+                        dic = buildDeviceDilu(m.owner(), m.neighbour(), nC);
+                        C.dic = &dic;
+                    }
                     // ...and the GAMG upload, whose key is the HOST hierarchy's build count. That count
                     // is monotone across the change (inter_amr_cpp.cu un-builds the cache without
                     // resetting it), so this would be correct without the line; it is set because an
