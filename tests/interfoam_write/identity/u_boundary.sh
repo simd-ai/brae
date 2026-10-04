@@ -10,7 +10,7 @@
 wcase weirOverflow of > "$W/ub_stage.txt" 2>&1
 o="$W/w_of_weirOverflow"
 [ -d "$o" ] || { say "weirOverflow did not stage" FAIL; finish "U boundary identity"; }
-for v in refresh full stale; do
+for v in refresh full stale perface; do
     e="$W/ub_$v"
     mkdir -p "$e"
     cp -r "$o/0" "$o/constant" "$o/system" "$e/"
@@ -18,6 +18,7 @@ for v in refresh full stale; do
         refresh) runbrae "$e" device ;;
         full)    runbrae "$e" device BRAE_CONTROL_U_BOUNDARY_FULL=1 ;;
         stale)   runbrae "$e" device BRAE_CONTROL_U_BOUNDARY_STALE=1 ;;
+        perface) runbrae "$e" device BRAE_CONTROL_BOUNDARY_ARRAYS_PER_FACE=1 ;;
     esac
 done
 # differs <a> <b>: the number of written files that are not byte-identical
@@ -35,6 +36,13 @@ n=$(differs "$W/ub_refresh" "$W/ub_full")
 [ "$n" = 0 ] \
     && say "[device] the refreshed boundary writes the full rebuild's files, byte for byte" ok \
     || say "[device] the refreshed boundary writes the full rebuild's files, byte for byte ($n differ)" FAIL
+# ...and the arrays themselves: a plain patch's are written in bulk since 2026-10-03 (deviceVectorBoundaryArrays),
+# every other patch's face by face; BRAE_CONTROL_BOUNDARY_ARRAYS_PER_FACE=1 takes the per-face loop everywhere.
+# laminar/waves/stokesI, 75,000 empty faces: the hook 34 -> 21 ms a step.
+n=$(differs "$W/ub_refresh" "$W/ub_perface")
+[ "$n" = 0 ] \
+    && say "[device] the bulk arrays write the per-face arrays' files, byte for byte" ok \
+    || say "[device] the bulk arrays write the per-face arrays' files, byte for byte ($n differ)" FAIL
 n=$(differs "$W/ub_stale" "$W/ub_full")
 [ "$n" != 0 ] \
     && say "CONTROL  a boundary left unrefreshed changes $n written files" ok \

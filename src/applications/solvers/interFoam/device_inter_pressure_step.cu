@@ -423,28 +423,30 @@ scalar deviceInterPressureStep(
             ? deviceLduViewPair(dm, diagC, P.upper, P.lower, *in.cyc,
                                 haveJump ? cycJump.data() : nullptr)
             : deviceLduView(dm, diagC, P.upper, P.lower);
-        // the case's GAMG, by the pressure rule: brae's AMG-PCG with the entry's own stopping controls.
-        // BRAE_PRESSURE_GAMG_PORT=1 runs the GAMG port instead -- what the exact gates against OpenFOAM run
-        // (CMakeLists.txt sets it for every test; the user's decision, 2026-10-03), so they keep checking
-        // everything else to 1e-11 while the AMG-PCG is held to its own measured bounds
+        // THE PRESSURE RULE: brae's AMG-PCG whatever the entry names, with the entry's own stopping controls.
+        // BRAE_PRESSURE_CASE_SOLVER=1 runs the case's own entry as ported instead -- what the exact gates
+        // against OpenFOAM run (CMakeLists.txt sets it for every test; the user's decisions, 2026-10-03), so
+        // they keep checking everything else to 1e-11 while the AMG-PCG is held to its own measured bounds
         // (tests/interfoam_write/amg_pcg/). BRAE_CONTROL_AMG_PCG_ONE_ITERATION=1 stops each AMG-PCG solve
         // after one iteration -- those gates' control.
-        static const bool gamgPort = std::getenv("BRAE_PRESSURE_GAMG_PORT") != nullptr;
+        static const bool caseSolver = std::getenv("BRAE_PRESSURE_CASE_SOLVER") != nullptr;
         static const bool oneIteration = std::getenv("BRAE_CONTROL_AMG_PCG_ONE_ITERATION") != nullptr;
-        if ((gamg || pcgGamg) && !gamgPort)
+        if (!caseSolver)
         {
             if (!in.amgPcg)
             {
                 throw std::runtime_error(
-                    "brae interFoam device pressure step: the case asks for GAMG on p_rgh, which runs brae's "
-                    "AMG-preconditioned PCG, and the caller handed in no DeviceAmgPcgCache.");
+                    "brae interFoam device pressure step: p_rgh runs brae's AMG-preconditioned PCG and the "
+                    "caller handed in no DeviceAmgPcgCache.");
             }
             static bool announced = false;
             if (!announced)
             {
                 announced = true;
-                std::printf("  p_rgh: system/fvSolution asks for GAMG; brae runs its AMG-preconditioned PCG "
-                            "instead -- same operator, different Krylov method and iteration count\n");
+                const char* asked = gamg ? "GAMG" : pcgGamg ? "PCG with a GAMG preconditioner"
+                                  : pcgDIC ? "PCG with DIC" : "its own solver";
+                std::printf("  p_rgh: system/fvSolution asks for %s; brae runs its AMG-preconditioned PCG "
+                            "instead -- same operator, different Krylov method and iteration count\n", asked);
             }
             interPhase::Nested timed("pressure: AMG-PCG solve");
             AMGData& amg = in.amgPcg->get(dm.addressingId);
@@ -693,6 +695,42 @@ scalar deviceInterPressureStep(
     return perf.finalResidual;
 }
 
+AMGData deviceAmgPcgHierarchy(
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::string& caseDir,
+    bool disk)
+{
+    interPhase::Nested timed("pressure: AMG hierarchy (load or build)");
+    static const bool cacheOff = []()
+    {
+        const char* e = std::getenv("BRAE_AMG_CACHE");
+        return e && std::atoi(e) == 0;
+    }();
+    const label nC = m.nCells();
+    const label nIf = m.nInternalFaces();
+    const bool useDisk = disk && !cacheOff && !caseDir.empty();
+    const std::string path = caseDir + "/constant/polyMesh/.brae_amgcache";
+    if (useDisk)
+    {
+        AMGData cached;
+        if (loadAMGCache(path, cached) && cached.nFine == nC
+         && (cached.level.empty() || cached.level.front().faceRestrict.size() == static_cast<std::size_t>(nIf)))
+        {
+            return cached;
+        }
+    }
+    const std::vector<label> own(m.owner().begin(), m.owner().begin() + nIf);
+    const std::vector<label> nei(m.neighbour().begin(), m.neighbour().begin() + nIf);
+    const std::vector<scalar> w(g.magSf().begin(), g.magSf().begin() + nIf);
+    AMGData built = buildAMG(own, nei, w, nC);
+    if (useDisk)
+    {
+        writeAMGCache(built, path);
+    }
+    return built;
+}
+
 AMGData& DeviceAmgPcgCache::get(unsigned long long id)
 {
     if (!mesh || !geometry)
@@ -701,11 +739,8 @@ AMGData& DeviceAmgPcgCache::get(unsigned long long id)
     }
     if (!built || addressingId != id)
     {
-        const label nIf = mesh->nInternalFaces();
-        const std::vector<label> own(mesh->owner().begin(), mesh->owner().begin() + nIf);
-        const std::vector<label> nei(mesh->neighbour().begin(), mesh->neighbour().begin() + nIf);
-        const std::vector<scalar> w(geometry->magSf().begin(), geometry->magSf().begin() + nIf);
-        amg = buildAMG(own, nei, w, mesh->nCells());
+        // the disk cache is the START mesh's: a rebuild after a refinement is another mesh
+        amg = deviceAmgPcgHierarchy(*mesh, *geometry, caseDir, !built);
         built = true;
         addressingId = id;
     }

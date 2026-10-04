@@ -36,6 +36,21 @@ void smoothT(
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i < n) x[i] += T(OMEGA)*(b[i]-Ax[i])/safeDiag(diag[i]);   // safeDiag: floor the (FP32) diagonal, never divide by ~0 -> no Inf/NaN preconditioner
 }
+// The FIRST weighted-Jacobi sweep of a cycle, whose x is zero: A*x is zero, so the product is not formed. The
+// expression is smoothT's own with x = 0 and Ax = 0 written in -- 0 + omega*(b - 0)/diag -- so the result is
+// smoothT's to the bit (the compiler may not drop the two zeros under IEEE rules: they decide a zero's sign).
+// MEASURED on RAS/DTCHull: one of the three products a level makes each V-cycle.
+template <typename T>
+__global__
+void smoothFromZeroT(
+    int n,
+    const T* __restrict__ b,
+    const T* __restrict__ diag,
+    T* __restrict__ x)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) x[i] = T(0) + T(OMEGA)*(b[i] - T(0))/safeDiag(diag[i]);
+}
 template <typename T>
 __global__
 void residualT(

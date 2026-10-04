@@ -37,6 +37,16 @@ class VolPointInterpolation
 public:
     // makeWeights on the mesh as it stands. pointCells is the mesh's, in the order it has (see
     // primitive_patch_cpp.cuh).
+    // THE ADDRESSING IS KEPT between calls -- the boundary's primitive patch, which points are patch points,
+    // and each point's weight list at its size: they are the mesh's addressing's, and volPointInterpolation::
+    // movePoints remakes the WEIGHTS alone. It is rebuilt when the mesh's sizes or `pointCells` differ from the
+    // last call's, and after clearAddressing(), which a caller whose addressing changed at the same sizes owes.
+    // BRAE_CONTROL_VPI_REBUILD=1 rebuilds it at every call, as before -- the identity check's other arm.
+    // MEASURED on waveMakerPiston refined to 896,000 cells: 1.19 s a step with it rebuilt every call.
+    void clearAddressing()
+    {
+        addressingBuilt_ = false;
+    }
     void makeWeights(
         const PrimitiveMesh& m,
         const FvGeometry& g,
@@ -70,6 +80,11 @@ private:
     std::vector<char> isPatchPoint_;
     std::vector<std::vector<scalar>> pointWeights_;
     std::vector<std::vector<scalar>> boundaryPointWeights_;
+    // the sizes the kept addressing was built for
+    bool addressingBuilt_ = false;
+    label builtPoints_ = -1;
+    label builtFaces_ = -1;
+    label builtCells_ = -1;
 };
 
 } // namespace brae

@@ -5,6 +5,7 @@
 //   * deviceParallelAMGPCGGraph -- the distributed twin (halo-coupled matvec + on-stream NVSHMEM reduce in-graph).
 // The V-cycle (amgVCycleApply / vcycleAt / vcycleAtF / amgCastFP32) + Galerkin re-coarsening (amgGalerkin) + the
 // spectrum estimate (ensureSpectrum) are called across TUs. Verbatim split of device_amg.cu -- no logic change.
+#include "inter_phase_time.cuh"
 #include "device_amg.cuh"          // AMGData / DeviceSolverPerf / amgGalerkin / amgVCycleApply / deviceAMGPCG decls
 #include "device_blas.cuh"          // dot / axpy / reductions
 #include "device_ldu.cuh"           // DeviceLduView / deviceAmul / deviceParallelAmul (distributed matvec)
@@ -120,6 +121,63 @@ void pcgSetCondK(
     const bool stop = (conv || it >= maxIter) && it >= minIter;
     cudaGraphSetConditional(h, stop ? 0u : 1u);
 }
+// The serial graph's stopping controls, read from the device (PCGGraphCache::sCtl): tol, relTol, maxIter,
+// minIter. pcgSetCtlK writes them before each launch; the two condition kernels below are pcgStartCondK and
+// pcgSetCondK with the controls read instead of baked in.
+__global__
+void pcgSetCtlK(
+    scalar* ctl,
+    scalar tol,
+    scalar relTol,
+    int maxIter,
+    int minIter)
+{
+    if (threadIdx.x || blockIdx.x) return;
+    ctl[0] = tol;
+    ctl[1] = relTol;
+    ctl[2] = maxIter;
+    ctl[3] = minIter;
+}
+
+__global__
+void pcgStartCondCtlK(
+    cudaGraphConditionalHandle h,
+    const scalar* __restrict__ init,
+    const scalar* __restrict__ ctl,
+    int* __restrict__ iter,
+    scalar* __restrict__ res)
+{
+    if (threadIdx.x || blockIdx.x) return;
+    const scalar tol = ctl[0];
+    const scalar relTol = ctl[1];
+    const int minIter = static_cast<int>(ctl[3]);
+    *iter = 0;
+    const scalar ir = *init;
+    *res = ir;
+    const bool conv = (ir < tol) || (relTol > 0.0 && ir < relTol * ir);
+    cudaGraphSetConditional(h, (minIter > 0 || !conv) ? 1u : 0u);
+}
+
+__global__
+void pcgSetCondCtlK(
+    cudaGraphConditionalHandle h,
+    const scalar* res,
+    const scalar* init,
+    const scalar* ctl,
+    int* iter)
+{
+    if (threadIdx.x || blockIdx.x) return;
+    const scalar tol = ctl[0];
+    const scalar relTol = ctl[1];
+    const int maxIter = static_cast<int>(ctl[2]);
+    const int minIter = static_cast<int>(ctl[3]);
+    const int it = ++(*iter);
+    const scalar fr = *res;          // res already normalized by normFactor
+    const bool conv = (fr < tol) || (relTol > 0.0 && fr < relTol * (*init));
+    const bool stop = (conv || it >= maxIter) && it >= minIter;
+    cudaGraphSetConditional(h, stop ? 0u : 1u);
+}
+
 static DeviceSolverPerf deviceAMGPCGGraph(
     const DeviceLduView& A,
     AMGData& amg,
@@ -161,6 +219,30 @@ static DeviceSolverPerf deviceAMGPCGGraph(
     sA.diag  = c.gDiag.data();
     sA.upper = c.gUpper.data();
     sA.lower = c.gLower.data();
+    // the pair's per-solve values into graph-owned buffers, as the matrix above (PCGGraphCache)
+    if (A.nCyc > 0)
+    {
+        c.gCycCoeff.resize(static_cast<std::size_t>(A.nCyc));
+        cudaMemcpyAsync(c.gCycCoeff.data(), A.cycCoeff, (std::size_t)A.nCyc*sizeof(scalar), cudaMemcpyDeviceToDevice,
+                        cudaStreamPerThread);
+        sA.cycCoeff = c.gCycCoeff.data();
+        if (A.cycJump)
+        {
+            c.gCycJump.resize(static_cast<std::size_t>(A.nCyc));
+            cudaMemcpyAsync(c.gCycJump.data(), A.cycJump, (std::size_t)A.nCyc*sizeof(scalar),
+                            cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+            sA.cycJump = c.gCycJump.data();
+        }
+    }
+    if (A.nAmi > 0)
+    {
+        c.gAmiIfc.resize(static_cast<std::size_t>(A.nAmi));
+        cudaMemcpyAsync(c.gAmiIfc.data(), A.amiIfc, (std::size_t)A.nAmi*sizeof(scalar), cudaMemcpyDeviceToDevice,
+                        cudaStreamPerThread);
+        sA.amiIfc = c.gAmiIfc.data();
+    }
+    c.sCtl.resize(4);
+    pcgSetCtlK<<<1,1,0,cudaStreamPerThread>>>(c.sCtl.data(), tol, relTol, maxIter, minIter);
     scalar* dWArA = amg.sWArA.data();
     scalar* dWArAold = amg.sWArAold.data();
     scalar* dPap  = amg.sPap.data();
@@ -184,16 +266,23 @@ static DeviceSolverPerf deviceAMGPCGGraph(
     };
     DeviceSolverPerf perf;
     const int epoch = deviceReductionScratchEpoch();
-    if (!c.exec || c.key != psi.data() || c.keyTol != tol || c.keyRelTol != relTol || c.keyMaxIter != maxIter
-        || c.keyMinIter != minIter || c.keyEpoch != epoch
+    const bool samePair = c.keyNCyc == A.nCyc && c.keyNAmi == A.nAmi && c.keyJump == (A.cycJump != nullptr)
+                       && c.keyCycOwn == (const void*)A.cycOwn && c.keyCycNbr == (const void*)A.cycNbr
+                       && c.keyAmiOwn == (const void*)A.amiOwn && c.keyAmiOff == (const void*)A.amiOff
+                       && c.keyAmiNbr == (const void*)A.amiNbr && c.keyAmiW == (const void*)A.amiW;
+    if (!c.exec || c.key != psi.data() || c.keyEpoch != epoch
         || c.keyOwner != (const void*)A.owner || c.keyNC != nC || c.keyNF != nF
-        || c.keyAddressingId != A.addressingId)
+        || c.keyAddressingId != A.addressingId || !samePair)
     {
+        interPhase::Nested timedCapture("AMG-PCG: graph capture");
         // PRE-SIZE everything the capture will touch (the V-cycle scratch, pA/Ax, the reduction
         // partials): a capture must allocate nothing. ON THE CAPTURE ONLY -- doing it per solve, as the
         // first version of this did, repeats the prologue and a whole V-cycle whose result is thrown
         // away, and cost more than the two reads it saved (T3A 15.0 -> 17.4 ms/iter, measured).
-        deviceAmul(sA, psi, c.Ax);
+        // A*psi with `onField`: psi IS the solution field, the one product a jump cyclic applies its jump to
+        // (device_pcg.cu's own initial residual). Without it a porousBafflePressure pair was solved with no jump:
+        // RAS/damBreakPorousBaffle, phi 5.6e-03 from OpenFOAM.
+        deviceAmul(sA, psi, c.Ax, /*onField=*/true);
         deviceCopy(rA, c.gB);
         deviceAxpy(-1.0, c.Ax, rA);
         deviceSumMagInto(rA, c.sInit.data());
@@ -214,13 +303,16 @@ static DeviceSolverPerf deviceAMGPCGGraph(
         cudaCheck(cudaGraphConditionalHandleCreate(&c.handle, c.graph, 0, cudaGraphCondAssignDefault), "pcg cond handle");
         cudaCheck(cudaStreamBeginCaptureToGraph(cudaStreamPerThread, c.graph, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal), "pcg prologue capture");
         // the prologue: r = b - A psi, the initial residual, and the loop's start decision
-        deviceAmul(sA, psi, c.Ax);
+        // A*psi with `onField`: psi IS the solution field, the one product a jump cyclic applies its jump to
+        // (device_pcg.cu's own initial residual). Without it a porousBafflePressure pair was solved with no jump:
+        // RAS/damBreakPorousBaffle, phi 5.6e-03 from OpenFOAM.
+        deviceAmul(sA, psi, c.Ax, /*onField=*/true);
         deviceCopy(rA, c.gB);
         deviceAxpy(-1.0, c.Ax, rA);
         deviceSumMagInto(rA, c.sInit.data());
         gsScaleInvK<<<1,1,0,cudaStreamPerThread>>>(c.sInit.data(), c.sNormF.data());
-        pcgStartCondK<<<1,1,0,cudaStreamPerThread>>>(c.handle, c.sInit.data(), tol, relTol, minIter,
-                                                     c.sIter.data(), c.sRes.data());
+        pcgStartCondCtlK<<<1,1,0,cudaStreamPerThread>>>(c.handle, c.sInit.data(), c.sCtl.data(), c.sIter.data(),
+                                                        c.sRes.data());
         cudaStreamCaptureStatus st;
         const cudaGraphNode_t* deps = nullptr;
         std::size_t nDeps = 0;
@@ -250,15 +342,20 @@ static DeviceSolverPerf deviceAMGPCGGraph(
         deviceAxpyDev(dNegAlpha, wA, rA);
         deviceSumMagInto(rA, c.sRes.data());
         gsScaleInvK<<<1,1,0,cudaStreamPerThread>>>(c.sRes.data(), c.sNormF.data());   // normalized residual
-        pcgSetCondK<<<1,1,0,cudaStreamPerThread>>>(c.handle, c.sRes.data(), tol, c.sInit.data(), relTol,
-                                                   c.sIter.data(), maxIter, minIter);
+        pcgSetCondCtlK<<<1,1,0,cudaStreamPerThread>>>(c.handle, c.sRes.data(), c.sInit.data(), c.sCtl.data(),
+                                                      c.sIter.data());
         cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &tmp), "pcg capture end");
         cudaCheck(cudaGraphInstantiate(&c.exec, c.graph, 0), "pcg graph instantiate");
         c.key = psi.data();
-        c.keyTol = tol;
-        c.keyRelTol = relTol;
-        c.keyMaxIter = maxIter;
-        c.keyMinIter = minIter;
+        c.keyNCyc = A.nCyc;
+        c.keyNAmi = A.nAmi;
+        c.keyJump = A.cycJump != nullptr;
+        c.keyCycOwn = A.cycOwn;
+        c.keyCycNbr = A.cycNbr;
+        c.keyAmiOwn = A.amiOwn;
+        c.keyAmiOff = A.amiOff;
+        c.keyAmiNbr = A.amiNbr;
+        c.keyAmiW = A.amiW;
         c.keyEpoch = epoch;
         c.keyOwner = A.owner;
         c.keyAddressingId = A.addressingId;
@@ -480,7 +577,8 @@ DeviceSolverPerf deviceAMGPCG(
     DeviceBuffer<scalar>& wA = amg.wA;                          // persistent (fixed addr) so the captured graph stays valid
     DeviceBuffer<scalar>& rA = amg.rA;
     DeviceBuffer<scalar> pA(nC), Ax(nC), rOld(nC);             // rOld: previous residual for flexible-CG beta (corrScaling)
-    deviceAmul(A, psi, Ax);
+    // A*psi with `onField`: psi IS the solution field, the one product a jump cyclic applies its jump to
+    deviceAmul(A, psi, Ax, /*onField=*/true);
     deviceCopy(rA, b);
     deviceAxpy(-1.0, Ax, rA);
     DeviceSolverPerf perf;

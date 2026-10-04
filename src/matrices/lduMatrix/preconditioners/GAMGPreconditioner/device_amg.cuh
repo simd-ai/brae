@@ -53,6 +53,18 @@ struct PCGGraphCache {
     // ...and the right-hand side and the fine matrix, copied in per solve, because a captured prologue
     // bakes their pointers and the callers hand in fresh buffers each time.
     DeviceBuffer<scalar> gB, gDiag, gUpper, gLower;
+    // THE COUPLED PAIR'S VALUES the same way -- the cyclic coefficient, its jump, the AMI coefficient -- and its
+    // ADDRESSING in the key. A caller that builds the jump afresh each solve (interFoam's pressure step) had the
+    // graph replay against the first solve's pointer: RAS/damBreakPorousBaffle, phi 5.6e-03 from OpenFOAM.
+    DeviceBuffer<scalar> gCycCoeff, gCycJump, gAmiIfc;
+    int keyNCyc = -1; int keyNAmi = -1; bool keyJump = false;
+    const void* keyCycOwn = nullptr; const void* keyCycNbr = nullptr;
+    const void* keyAmiOwn = nullptr; const void* keyAmiOff = nullptr;
+    const void* keyAmiNbr = nullptr; const void* keyAmiW = nullptr;
+    // THE STOPPING CONTROLS ON THE DEVICE (tol, relTol, maxIter, minIter), written before each launch, for the
+    // serial graph: entries that differ in them -- interFoam's p_rgh and p_rghFinal, relTol 0.01 and 0 -- then
+    // share one captured graph instead of re-capturing at every solve.
+    DeviceBuffer<scalar> sCtl;
     ~PCGGraphCache();
 };
 

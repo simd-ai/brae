@@ -140,6 +140,18 @@ public:
     void topoChanged(
         std::vector<scalar> V0,
         label               timeIndex);
+    // the displacement solver's wall-distance wave run elsewhere; nothing to set on a mesh moved another way
+    void setPatchWaveRunner(PatchWaveRunner runner)
+    {
+        if (displacement_)
+        {
+            displacement_->setPatchWaveRunner(std::move(runner));
+        }
+    }
+    bool hasDisplacementSolver() const
+    {
+        return displacement_ != nullptr;
+    }
     // the carried points0, for the refiner to map in place
     std::vector<vector>& points0Ref()
     {

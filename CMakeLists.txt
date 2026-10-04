@@ -108,6 +108,7 @@ add_library(brae_core STATIC
     src/OpenFOAM/meshes/meshShapes/face/face_cpp.cu
     src/OpenFOAM/meshes/primitiveMesh/PrimitivePatch/primitive_patch_cpp.cu
     src/meshTools/cellDist/patchWave/patch_wave_cpp.cu
+    src/meshTools/cellDist/patchWave/device_patch_wave.cu
     src/OpenFOAM/meshes/primitiveMesh/edges/mesh_edges_cpp.cu
     src/OpenFOAM/meshes/polyMesh/mapPolyMesh/map_poly_mesh_cpp.cu
     src/OpenFOAM/meshes/polyMesh/polyTopoChange/poly_topo_change_cpp.cu
@@ -201,6 +202,7 @@ add_library(brae_core STATIC
     src/applications/solvers/interFoam/device_inter_alpha_step.cu
     src/finiteVolume/cfdTools/general/device_alpha_courant.cu
     src/applications/solvers/interFoam/device_inter_pressure_step.cu
+    src/applications/solvers/interFoam/device_inter_pcorr_solve.cu
     src/applications/solvers/interFoam/device_inter_step.cu
     src/applications/solvers/interFoam/device_inter_turbulence.cu
     src/applications/solvers/interFoam/inter_driver_device.cu
@@ -5142,8 +5144,8 @@ add_test(NAME colour_gs_fused COMMAND test_colour_gs_fused)
 # THE PRESSURE RULE'S TEST ARM. A case's GAMG on p_rgh runs brae's AMG-preconditioned PCG by default (CLAUDE.md,
 # device_inter_pressure_step.cu), which stops at a different residual from OpenFOAM's GAMG -- 2.3e-09 on
 # RAS/DTCHull at pinned 1e-13 solves, against gates held near 1e-11. So every test runs the GAMG port
-# (BRAE_PRESSURE_GAMG_PORT=1) and keeps checking the rest of the solver to its own bound; the AMG-PCG is held
+# (BRAE_PRESSURE_CASE_SOLVER=1) and keeps checking the rest of the solver to its own bound; the AMG-PCG is held
 # to OpenFOAM at its measured bounds by tests/interfoam_write/amg_pcg/, which unset this. The user's decision,
 # 2026-10-03.
 get_property(BRAE_ALL_TESTS DIRECTORY PROPERTY TESTS)
-set_property(TEST ${BRAE_ALL_TESTS} APPEND PROPERTY ENVIRONMENT "BRAE_PRESSURE_GAMG_PORT=1")
+set_property(TEST ${BRAE_ALL_TESTS} APPEND PROPERTY ENVIRONMENT "BRAE_PRESSURE_CASE_SOLVER=1")

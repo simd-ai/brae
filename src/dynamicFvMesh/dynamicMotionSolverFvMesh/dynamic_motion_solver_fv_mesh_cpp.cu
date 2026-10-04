@@ -1,3 +1,4 @@
+#include "inter_phase_time.cuh"
 #include "dynamic_motion_solver_fv_mesh_cpp.cuh"
 #include "foam_dict.cuh"
 #include "mrf_read.cuh"
@@ -337,6 +338,7 @@ void DynamicMotionSolverFvMesh::update(
     // stands. A displacement solver's GAMG hierarchy is the MESH's, shared with every other GAMG solve
     // of the run, so the caller hands in the one it keeps.
     std::vector<vector> newPoints;
+    interPhase::Nested* timedPoints = new interPhase::Nested("mesh: the motion solver's new points");
     if (rigidBody_)
     {
         if (!load)
@@ -382,6 +384,8 @@ void DynamicMotionSolverFvMesh::update(
         }
     }
 
+    delete timedPoints;
+    interPhase::Nested timedMove("mesh: swept volumes, movePoints and geometry");
     // dynamicMotionSolverListFvMesh::update (:176-183): the list sums each solver's displacement from
     // the CURRENT points and moves to points() + disp -- fl(p + fl(q - p)), not q. The two agree whenever
     // q - p is exact, and differ by an ulp near zero; every step of a refining mesh with a motion takes

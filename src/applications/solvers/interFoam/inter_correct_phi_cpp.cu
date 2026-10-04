@@ -217,53 +217,66 @@ void correctPhi(
         // pcorr.select(pimple.finalNonOrthogonalIter())
         const InterFields::PressureLinearSolve& s = finalIter ? *c.pcorrFinal : *c.pcorr;
         SolverPerformance sp;
-        if (s.pcgGamg())
+        bool solved = false;
+        if (c.amgPcgSolve)
         {
-            if (!c.gamgCache)
+            const std::string asked = s.gamgSolver() ? "GAMG" : s.pcgGamg() ? "PCG with a GAMG preconditioner"
+                                    : s.pcgDIC() ? "PCG with DIC" : "its own solver";
+            solved = s.gamgSolver()
+                ? c.amgPcgSolve(asked, pe, pcorr.internal, m, g, patches, s.gamg.tolerance, s.gamg.relTol,
+                                s.gamg.maxIter, s.gamg.minIter, sp)
+                : c.amgPcgSolve(asked, pe, pcorr.internal, m, g, patches, s.tol, s.relTol, s.maxIter, 0, sp);
+        }
+        if (!solved)
+        {
+            if (s.pcgGamg())
+            {
+                if (!c.gamgCache)
+                {
+                    throw std::runtime_error(
+                        std::string(WHO) + "a GAMG-preconditioned pcorr solve needs the mesh's hierarchy.");
+                }
+                sp = pcgGamgSolve(
+                    pe,
+                    pcorr.internal,
+                    m,
+                    g,
+                    patches,
+                    *c.gamgCache,
+                    s.tol,
+                    s.relTol,
+                    s.maxIter,
+                    0,
+                    s.gamgPrecond,
+                    nullptr);
+            }
+            else if (s.gamgSolver())
+            {
+                if (!c.gamgCache)
+                {
+                    throw std::runtime_error(
+                        std::string(WHO) + "a GAMG pcorr solve needs the mesh's hierarchy.");
+                }
+                const GamgAgglomeration& a = c.gamgCache->get(m, g, s.gamg.nCellsInCoarsestLevel);
+                sp = gamgSolve(
+                    pe,
+                    pcorr.internal,
+                    m,
+                    patches,
+                    a,
+                    s.gamg,
+                    nullptr);
+            }
+            else if (s.pcgDIC())
+            {
+                sp = pcg(pe, pcorr.internal, m, patches, s.tol, s.relTol, s.maxIter);
+            }
+            else
             {
                 throw std::runtime_error(
-                    std::string(WHO) + "a GAMG-preconditioned pcorr solve needs the mesh's hierarchy.");
+                    std::string(WHO) + "pcorr's solver `" + s.solver + "` is not ported (refused where the "
+                    "case is read; reaching here is a defect).");
             }
-            sp = pcgGamgSolve(
-                pe,
-                pcorr.internal,
-                m,
-                g,
-                patches,
-                *c.gamgCache,
-                s.tol,
-                s.relTol,
-                s.maxIter,
-                0,
-                s.gamgPrecond,
-                nullptr);
-        }
-        else if (s.gamgSolver())
-        {
-            if (!c.gamgCache)
-            {
-                throw std::runtime_error(
-                    std::string(WHO) + "a GAMG pcorr solve needs the mesh's hierarchy.");
-            }
-            const GamgAgglomeration& a = c.gamgCache->get(m, g, s.gamg.nCellsInCoarsestLevel);
-            sp = gamgSolve(
-                pe,
-                pcorr.internal,
-                m,
-                patches,
-                a,
-                s.gamg,
-                nullptr);
-        }
-        else if (s.pcgDIC())
-        {
-            sp = pcg(pe, pcorr.internal, m, patches, s.tol, s.relTol, s.maxIter);
-        }
-        else
-        {
-            throw std::runtime_error(
-                std::string(WHO) + "pcorr's solver `" + s.solver + "` is not ported (refused where the "
-                "case is read; reaching here is a defect).");
         }
         if (in.solveLog)
         {

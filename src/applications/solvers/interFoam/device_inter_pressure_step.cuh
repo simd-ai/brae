@@ -45,6 +45,7 @@
 #include "fv_geometry.cuh"
 #include "primitive_mesh.cuh"
 #include <functional>
+#include <string>
 #include <vector>
 
 namespace brae {
@@ -94,21 +95,38 @@ struct DeviceInterPressureHooks
                        DeviceBuffer<scalar>&       phiHbyABnd)> adjustPhi;
 };
 
-// THE PRESSURE RULE (CLAUDE.md, user decision 2026-10-03): a case's `GAMG` on p_rgh runs brae's AMG-
-// preconditioned PCG (deviceAMGPCG), the fast path simpleFoam and rhoSimpleFoam take, and says so. The
-// hierarchy is the mesh's: agglomerated on the internal faces' |Sf|, as simpleFoam's default, built on first
-// use and again when the addressing changes (DeviceMesh::addressingId); the coefficients are re-coarsened
-// every solve (amgGalerkin). A mesh that moves keeps its hierarchy -- it only preconditions the solve.
+// THE PRESSURE RULE (CLAUDE.md, user decisions 2026-10-03): p_rgh and pcorr run brae's AMG-preconditioned PCG
+// (deviceAMGPCG), the fast path simpleFoam and rhoSimpleFoam take, WHATEVER the case's entry names -- GAMG, PCG
+// with DIC, PCG with a GAMG preconditioner -- and say so. The hierarchy is the mesh's: agglomerated on the
+// internal faces' |Sf|, as simpleFoam's default, built on first use and again when the addressing changes
+// (DeviceMesh::addressingId); the coefficients are re-coarsened every solve (amgGalerkin). A mesh that moves
+// keeps its hierarchy -- it only preconditions the solve.
+// BRAE_PRESSURE_CASE_SOLVER=1 runs the case's own entry as ported instead: what every test runs, so the exact
+// gates against OpenFOAM keep their bounds (CMakeLists.txt, tests/interfoam_write/lib.sh).
 struct DeviceAmgPcgCache
 {
     const PrimitiveMesh* mesh = nullptr;
     const FvGeometry* geometry = nullptr;
+    // the case, for the hierarchy's disk cache (deviceAmgPcgHierarchy); empty = no disk cache
+    std::string caseDir;
     bool built = false;
     unsigned long long addressingId = 0;
     AMGData amg;
 
     AMGData& get(unsigned long long id);
 };
+
+// THE HIERARCHY, WARM WHERE IT CAN BE. `disk` (the run's start mesh) loads
+// <caseDir>/constant/polyMesh/.brae_amgcache when it holds a hierarchy for a mesh of these cell and face counts
+// and for this smoother mode, and writes it after a build -- the file simpleFoam's fast path keeps. A stale file
+// of the right sizes can only slow the solve: the hierarchy preconditions a conjugate gradient on the TRUE
+// matrix. BRAE_AMG_CACHE=0 neither reads nor writes it.
+AMGData deviceAmgPcgHierarchy(
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::string& caseDir,
+    bool disk);
+
 
 struct DeviceInterPressureInput
 {
@@ -187,9 +205,8 @@ struct DeviceInterPressureInput
     // another preconditioner; `gamg` and this one are never both set, since the entry names one solver.
     const GamgPreconditionerControls* pcgGamg = nullptr;
     DeviceGamgCache* gamgCache = nullptr;
-    // THE PRESSURE RULE (CLAUDE.md): an entry naming GAMG -- `solver GAMG;` or a PCG preconditioned by it --
-    // runs brae's AMG-preconditioned PCG instead, on this cache's hierarchy. Required wherever `gamg` or
-    // `pcgGamg` is set, unless BRAE_PRESSURE_GAMG_PORT=1 asks for the GAMG port.
+    // THE PRESSURE RULE (CLAUDE.md): every entry runs brae's AMG-preconditioned PCG instead, on this cache's
+    // hierarchy. Required unless BRAE_PRESSURE_CASE_SOLVER=1 asks for the case's own solver.
     struct DeviceAmgPcgCache* amgPcg = nullptr;
     // the coarsest-level solve of every V-cycle, in order; null = not kept
     GamgSolveLog* gamgLog = nullptr;

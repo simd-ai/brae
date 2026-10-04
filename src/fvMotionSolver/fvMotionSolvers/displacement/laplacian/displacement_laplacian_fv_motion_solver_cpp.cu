@@ -1,3 +1,4 @@
+#include "inter_phase_time.cuh"
 #include "displacement_laplacian_fv_motion_solver_cpp.cuh"
 #include "face_cpp.cuh"
 #include "fv_patch_field.cuh"
@@ -405,7 +406,12 @@ void DisplacementLaplacianFvMotionSolver::attach(
 
     twoDCorrector_.build(m, g, patches);
     // the pointFaces branch of calcPointCells: the wall distance asks for pointFaces first
-    pointCells_ = pointCellsFromPointFaces(m, meshPointFaces(m));
+    meshPointFaces_ = meshPointFaces(m);
+    pointCells_ = pointCellsFromPointFaces(m, meshPointFaces_);
+    // ...and what the two per-step passes keep from the addressing: the wave's cell-to-face lists and the
+    // interpolation's own (vol_point_interpolation_cpp.cuh)
+    meshCells_ = meshCells(m);
+    interpolation_.clearAddressing();
     attached_ = true;
 }
 
@@ -415,7 +421,17 @@ void DisplacementLaplacianFvMotionSolver::diffusivityCorrect(
     const std::vector<FvPatch>& patches)
 {
     // wallDist::New(mesh, meshWave, patchSet).y(), which the MeshObject keeps current as the mesh moves
-    const PatchWave wave = patchWave(m, g, patches, diffusivityPatchIDs_, true);
+    // BRAE_CONTROL_MOTION_CELLS_REBUILT=1 has the wave build its cell-to-face lists itself, as before
+    static const bool cellsRebuilt = std::getenv("BRAE_CONTROL_MOTION_CELLS_REBUILT") != nullptr;
+    const PatchWave wave = patchWave(
+        m,
+        g,
+        patches,
+        diffusivityPatchIDs_,
+        true,
+        cellsRebuilt ? nullptr : &meshCells_,
+        waveRunner_ ? &waveRunner_ : nullptr,
+        cellsRebuilt ? nullptr : &meshPointFaces_);
     if (wave.nUnset > 0)
     {
         throw std::runtime_error(
@@ -470,7 +486,11 @@ void DisplacementLaplacianFvMotionSolver::solve(
     const std::vector<FvPatch>& patches,
     GamgAgglomerationCache& agglomeration)
 {
-    diffusivityCorrect(m, g, patches);
+    {
+        interPhase::Nested timed("motion: inverseDistance diffusivity (meshWave)");
+        diffusivityCorrect(m, g, patches);
+    }
+    interPhase::Nested timedRest("motion: assemble and solve cellDisplacement");
 
     // pointDisplacement_.boundaryFieldRef().updateCoeffs(): valuePointPatchField::updateCoeffs writes
     // each fixing patch's values into the point field, patch by patch
@@ -572,6 +592,7 @@ void DisplacementLaplacianFvMotionSolver::solve(
     const GamgAgglomeration& a = agglomeration.get(m, g, controls.nCellsInCoarsestLevel);
     const SolutionDirections sd = solutionDirections(patches);
     lastSolve_ = DisplacementSolveRecord();
+    interPhase::Nested timedSolves("motion: the component solves");
     for (int cmpt = 0; cmpt < 3; ++cmpt)
     {
         if (!sd.valid(cmpt)) continue;
@@ -645,6 +666,7 @@ std::vector<vector> DisplacementLaplacianFvMotionSolver::curPoints(
 {
     // volPointInterpolation::New(mesh).interpolate(cellDisplacement, pointDisplacement), the weights
     // remade on the mesh as it stands (volPointInterpolation::movePoints)
+    interPhase::Nested timed("motion: cells to points (volPointInterpolation)");
     interpolation_.makeWeights(m, g, patches, pointCells_);
     interpolation_.interpolateInternalField(cellDisplacement_, pointDisplacement_);
     interpolation_.interpolateBoundaryField(cellDisplacementBoundary_, pointDisplacement_);

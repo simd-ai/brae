@@ -1,6 +1,7 @@
 // brae's interFoam time loop -- see inter_driver_cpp.cuh for why the driver owns no numerics and for
 // the four old-time fields that are its actual content.
 #include <filesystem>
+#include "inter_phase_time.cuh"
 #include "inter_driver_cpp.cuh"
 #include "inter_amr_cpp.cuh"
 #include "inter_correct_phi_cpp.cuh"
@@ -371,6 +372,7 @@ void interMeshUpdate(
             cin.meshPhi = &meshPhiU;
             cin.rhoPhi = &f.rhoPhi;
             cin.solveLog = &rep.pcorrSolves;
+            interPhase::Nested timedCorrectPhi("mesh: CorrectPhi (pcorr)");
             correctPhi(f.U, f.phi, f.p_rgh, cin, cpc, m, g, patches);
             // correctPhi.H:11, #include "continuityErrs.H" on the absolute flux.
             // BRAE_CONTROL_NO_CORRECTPHI_CONTERR=1 leaves it uncounted, the writer's form before F2 -- the
@@ -388,6 +390,7 @@ void interMeshUpdate(
         cpu::twoPhase::mixtureMu(f.alpha1.internal, f.mixture.phases, f.mu);
         cpu::twoPhase::mixtureNu(f.alpha1.internal, f.mu, f.mixture.phases, f.nu);
         updateMixtureBoundary(f, patches);
+        interPhase::Nested timedK("mesh: the curvature after the move (host calculateK)");
         interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, f.nHatf, f.K);
     }
 }

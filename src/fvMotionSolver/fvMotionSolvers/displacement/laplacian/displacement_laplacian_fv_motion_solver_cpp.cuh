@@ -49,6 +49,7 @@
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "fvc.cuh"
+#include "patch_wave_cpp.cuh"
 #include "gamg_solver_cpp.cuh"
 #include "primitive_mesh.cuh"
 #include "two_d_point_corrector_cpp.cuh"
@@ -79,6 +80,12 @@ public:
         const std::string& startDir);
 
     // the mesh as it stands: points0, each point patch's points, the 2-D corrector
+    // the wall-distance wave of the inverseDistance diffusivity run elsewhere (PatchWaveRunner): the device loop
+    // hands in its GPU wave. Empty runs the host wave.
+    void setPatchWaveRunner(PatchWaveRunner runner)
+    {
+        waveRunner_ = std::move(runner);
+    }
     void attach(
         const PrimitiveMesh& m,
         const FvGeometry& g,
@@ -188,6 +195,12 @@ private:
     std::vector<vector> cellDisplacement_;
     std::vector<std::vector<vector>> cellDisplacementBoundary_;
     std::vector<std::vector<label>> pointCells_;
+    // primitiveMesh::cells() for the diffusivity's wall-distance wave, built with the addressing in attach()
+    std::vector<std::vector<label>> meshCells_;
+    // ...and primitiveMesh::pointFaces() for its near-wall correction
+    std::vector<std::vector<label>> meshPointFaces_;
+    // the wave run elsewhere (patch_wave_cpp.cuh), when the driver hands one in: the device loop's GPU wave
+    PatchWaveRunner waveRunner_;
     std::vector<label> diffusivityPatchIDs_;
     std::vector<scalar> y_;
     SurfaceScalarField faceDiffusivity_;

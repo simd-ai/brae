@@ -459,7 +459,11 @@ void vcycleAtF(
 {
     const int n = Ag.nCells;
     if (asymmetric) amgRefuseAsymmetric(useChebyshev(), amg.corrScaling, amg.saSmooth);
-    zeroT<float><<<nBlocks(n),TPB>>>(n, xg);
+    // x starts at zero. A level that pre-smooths writes its first sweep straight from b (smoothFromZeroT) and
+    // needs neither this nor the product of a zero vector; BRAE_CONTROL_AMG_ZERO_PRODUCT=1 forms both, as before.
+    static const bool zeroProduct = std::getenv("BRAE_CONTROL_AMG_ZERO_PRODUCT") != nullptr;
+    const bool fromZero = !zeroProduct && g != amg.nLevels() && nPreSweeps() > 0;
+    if (!fromZero) zeroT<float><<<nBlocks(n),TPB>>>(n, xg);
     if (g == amg.nLevels())                                    // coarsest: cast to FP64, exact FP64 solve, cast back
     {
         cast_<float,scalar><<<nBlocks(n),TPB>>>(n, bg, amg.vB[g].data());
@@ -482,8 +486,13 @@ void vcycleAtF(
         cast_<scalar,float><<<nBlocks(n),TPB>>>(n, amg.vX[g].data(), xg);
         return;
     }
-    for (int s=0; s<NPRE; ++s)
+    for (int s=0; s<nPreSweeps(); ++s)     // BRAE_NPRE, as the FP64 cycle reads it; NPRE by default
     {
+        if (s == 0 && fromZero)
+        {
+            smoothFromZeroT<float><<<nBlocks(n),TPB>>>(n, bg, Ag.diag, xg);
+            continue;
+        }
         amgSpmvF(amg, g, Ag, xg, amg.vAxF[g].data());
         smoothT<float><<<nBlocks(n),TPB>>>(n, bg, amg.vAxF[g].data(), Ag.diag, xg);
     }
@@ -497,7 +506,7 @@ void vcycleAtF(
     const LduF Ac = lduF(topoC, amg.fDiag[g+1], amg.fUpper[g+1], amg.fLower[g+1]);
     vcycleAtF(g+1, amg, topoC, Ac, amg.vBF[g+1].data(), amg.vXF[g+1].data(), asymmetric);
     prolongT<float><<<nBlocks(n),TPB>>>(n, Lg.map.data(), amg.vXF[g+1].data(), xg);
-    for (int s=0; s<NPOST; ++s)
+    for (int s=0; s<nPostSweeps(); ++s)    // BRAE_NPOST; NPOST by default
     {
         amgSpmvF(amg, g, Ag, xg, amg.vAxF[g].data());
         smoothT<float><<<nBlocks(n),TPB>>>(n, bg, amg.vAxF[g].data(), Ag.diag, xg);

@@ -29,6 +29,7 @@
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "primitive_mesh.cuh"
+#include <functional>
 #include <vector>
 
 namespace brae {
@@ -45,11 +46,30 @@ struct PatchWave
 
 // patchWave(mesh, patchIDs, correctWalls): patchIDs in any order; the wave seeds them in the mesh's
 // patch order and correctBoundaryCells walks them sorted, both of which are the same thing
+// `cells` is primitiveMesh::cells() (meshCells, primitive_patch_cpp.cuh) when the caller keeps it across calls;
+// null builds it here. It is a function of the mesh's addressing alone, so the caller rebuilds it whenever the
+// addressing changes. MEASURED on waveMakerPiston refined to 896,000 cells, where the motion solver asks for
+// this distance every step: building the lists, one allocation a cell, was most of 1.25 s a step.
+// THE WAVE ELSEWHERE. When `runner` is set patchWave hands it the seed faces, in the order it seeds them, and
+// reads back the squared distance the wave leaves in every cell and on every boundary face (face
+// nInternalFaces + i at i; an element never reached keeps -GREAT) -- the device loop's devicePatchWave
+// (device_patch_wave.cuh), which is this file's FaceCellWave to the bit. Null runs the host wave.
+// `pointFaces` is primitiveMesh::pointFaces() (meshPointFaces) for the near-wall correction when the caller
+// keeps it; null builds it there, an allocation a point at every call.
+using PatchWaveRunner = std::function<void(
+    const PrimitiveMesh&,
+    const FvGeometry&,
+    const std::vector<label>&,
+    std::vector<scalar>&,
+    std::vector<scalar>&)>;
 PatchWave patchWave(
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& patches,
     const std::vector<label>& patchIDs,
-    bool correctWalls);
+    bool correctWalls,
+    const std::vector<std::vector<label>>* cells = nullptr,
+    const PatchWaveRunner* runner = nullptr,
+    const std::vector<std::vector<label>>* pointFaces = nullptr);
 
 } // namespace brae

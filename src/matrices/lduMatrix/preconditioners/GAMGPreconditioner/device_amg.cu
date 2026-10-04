@@ -839,6 +839,42 @@ void finalizeAMG(
 
 // Build the AMG hierarchy, or reload it from cacheDir/.brae_amgcache if a valid one is present (newer than the
 // polyMesh/owner file -> mesh unchanged). writeCache=true persists it (the "partition" step / BRAE_MESH_CACHE).
+// TWO PAIRWISE PASSES AS ONE LEVEL: `first` takes the fine grid to an intermediate one and `second` takes that
+// one further; the result takes the fine grid straight to the second's coarse grid. A fine face inside an
+// agglomerate of either pass is inside the merged one; a face that survives both carries both flips.
+// Pairwise agglomeration alone coarsens 2:1, so the coarse levels together hold more faces than the fine one
+// (RAS/DTCHull: 14 levels, 3.45M coarse faces under 2.5M fine); merged passes coarsen 4:1 or 8:1.
+Agglom composeAgglom(
+    const Agglom& first,
+    Agglom&& second)
+{
+    Agglom a = std::move(second);
+    std::vector<label> map(first.map.size());
+    for (std::size_t c = 0; c < map.size(); ++c)
+    {
+        map[c] = a.map[static_cast<std::size_t>(first.map[c])];
+    }
+    std::vector<label> faceRestrict(first.faceRestrict.size());
+    std::vector<label> faceFlip(first.faceRestrict.size());
+    for (std::size_t f = 0; f < faceRestrict.size(); ++f)
+    {
+        const label r1 = first.faceRestrict[f];
+        if (r1 < 0)
+        {
+            faceRestrict[f] = -1 - a.map[static_cast<std::size_t>(-1 - r1)];
+            faceFlip[f] = 0;
+            continue;
+        }
+        const label r2 = a.faceRestrict[static_cast<std::size_t>(r1)];
+        faceRestrict[f] = r2;
+        faceFlip[f] = (r2 < 0) ? 0 : (first.faceFlip[f] ^ a.faceFlip[static_cast<std::size_t>(r1)]);
+    }
+    a.map = std::move(map);
+    a.faceRestrict = std::move(faceRestrict);
+    a.faceFlip = std::move(faceFlip);
+    return a;
+}
+
 AMGData buildOrLoadAMG(
     const std::vector<label>& fineOwner,
     const std::vector<label>& fineNei,
@@ -877,6 +913,12 @@ AMGData buildAMG(
         const int v = e ? std::atoi(e) : 64;
         return v > 0 ? v : 64;
     }();
+    static const int MERGE = []()
+    {
+        const char* e = std::getenv("BRAE_AMG_MERGE");
+        const int v = e ? std::atoi(e) : 1;
+        return v > 0 ? v : 1;
+    }();
     AMGData A;
     A.nFine = nFine;
     // Multicolor Gauss-Seidel smoother (BRAE_AMG_GS): color every smoothed grid once at build (host, static geometry).
@@ -907,6 +949,16 @@ AMGData buildAMG(
         {
             Agglom a = agglomerate(owner, nei, fw, n);
             if (a.nCoarse >= n || a.nCoarseFaces == 0) break;   // no further coarsening possible
+            // BRAE_AMG_MERGE=k: k pairwise passes a level (composeAgglom); 1, the default, is a pass a level.
+            // MEASURED on RAS/DTCHull's p_rgh, 25 steps, solve ms a step / PCG iterations: 1 pass 115.5 / 921,
+            // 2 passes 116.3 / 1262 (each cycle cheaper, more of them), 2 passes with two sweeps each side
+            // 116.8 / 938, 3 passes 136.9 / 1279 -- flat, so the default stays.
+            for (int pass = 1; pass < MERGE && a.nCoarse > TARGET; ++pass)
+            {
+                Agglom next = agglomerate(a.cOwn, a.cNei, a.coarseFaceWeights, a.nCoarse);
+                if (next.nCoarse >= a.nCoarse || next.nCoarseFaces == 0) break;
+                a = composeAgglom(a, std::move(next));
+            }
             if (gs) pushColoring(greedyColor(a.cOwn, a.cNei, a.nCoarse));   // coloring[k+1] = coarse grid k+1
             AMGLevel L;
             L.nFine = n;

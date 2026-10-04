@@ -79,7 +79,7 @@ MV="$TUT/multiphase/interFoam/laminar/mixerVessel2D"
 
 # The GAMG port on the pressure, as CMakeLists.txt sets for every test: the exact gates compare with OpenFOAM's
 # own GAMG. tests/interfoam_write/amg_pcg/ unsets it to hold brae's default AMG-PCG to its measured bounds.
-export BRAE_PRESSURE_GAMG_PORT=1
+export BRAE_PRESSURE_CASE_SOLVER=1
 W=${KEEP_W:-$(mktemp -d)}
 [ -n "${KEEP_W:-}" ] || trap 'rm -rf "$W"' EXIT
 mkdir -p "$W"

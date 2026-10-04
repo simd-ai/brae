@@ -465,10 +465,6 @@ void calculateNHatBoundary(
             "gradient of the unsmoothed field on a mesh with no coupled patch, which is all this boundary-only "
             "form reproduces; calculateK is the call for it.");
     }
-    if (!(c.deltaN > scalar(0)))
-    {
-        throw std::runtime_error("brae interfaceProperties::calculateNHatBoundary: InterfaceCoeffs::deltaN is unset.");
-    }
     // fvc::gaussGrad (fvc.cu) at the patches' face cells only: every term in the order the full face loop
     // adds it to that cell -- its internal faces ascending, then its boundary faces patch by patch -- and
     // the same operators, so each cell's gradient is the full one's to the bit
@@ -499,6 +495,28 @@ void calculateNHatBoundary(
             }
         }
     }
+    finishNHatBoundary(alpha1, c, g, patches, st, acc, nHatf);
+}
+
+void finishNHatBoundary(
+    const GeometricField<scalar>& alpha1,
+    const InterfaceCoeffs& c,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    NHatBoundaryStencil& st,
+    std::vector<vector>& acc,
+    SurfaceScalarField& nHatf)
+{
+    if (!(c.deltaN > scalar(0)))
+    {
+        throw std::runtime_error("brae interfaceProperties::finishNHatBoundary: InterfaceCoeffs::deltaN is unset.");
+    }
+    if (acc.size() != st.cells.size())
+    {
+        throw std::runtime_error("brae interfaceProperties::finishNHatBoundary: the internal sums are not the "
+                                 "stencil's cells.");
+    }
+    const std::vector<vector>& Sf = g.Sf();
     // BRAE_CONTROL_NHAT_NO_PATCH_TERMS=1 leaves the patch faces' terms out of the gradient -- the identity
     // gate's control, which has to show the comparison can fail
     static const bool noPatchTerms = std::getenv("BRAE_CONTROL_NHAT_NO_PATCH_TERMS") != nullptr;

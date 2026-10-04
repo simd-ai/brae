@@ -408,6 +408,45 @@ inline DeviceVectorBoundaryHost deviceVectorBoundaryArrays(
     std::vector<scalar>& gsn = h.gsn;
     std::vector<scalar> (&prv)[3] = h.prv;
     bool& anyPiovRef = h.anyPiovRef;
+    // every array at its final size up front: twenty vectors grown a push_back at a time were most of the
+    // refresh on a 2-D case, whose two `empty` patches hold as many faces as the mesh has cells
+    std::size_t nAll = 0;
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        if (!isCoupledInterfaceType(fvp[pi].type)) nAll += static_cast<std::size_t>(fvp[pi].size);
+    }
+    iofr.reserve(nAll);
+    for (int k = 0; k < 3; ++k)
+    {
+        ty[k].reserve(nAll);
+        vf[k].reserve(nAll);
+        ref[k].reserve(nAll);
+        rg[k].reserve(nAll);
+        iost[k].reserve(nAll);
+    }
+    if (!stateOnly)
+    {
+        fc.reserve(nAll);
+        io.reserve(nAll);
+        oio.reserve(nAll);
+        mx.reserve(nAll);
+        pv.reserve(nAll);
+        sm.reserve(nAll);
+        wdg.reserve(nAll);
+        gsm.reserve(nAll);
+        dc.reserve(nAll);
+        ms.reserve(nAll);
+        gsn.reserve(3*nAll);
+        wdgT.reserve(9*nAll);
+        for (int k = 0; k < 3; ++k)
+        {
+            nrm[k].reserve(nAll);
+            prv[k].reserve(nAll);
+        }
+    }
+    // BRAE_CONTROL_BOUNDARY_ARRAYS_PER_FACE=1 takes the per-face loop on every patch, as before -- the identity
+    // check's other arm
+    static const bool perFaceAlways = std::getenv("BRAE_CONTROL_BOUNDARY_ARRAYS_PER_FACE") != nullptr;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         if (isCoupledInterfaceType(fvp[pi].type)) continue;                     // cyclic = internal-like (handled by appended faces)
@@ -426,6 +465,77 @@ inline DeviceVectorBoundaryHost deviceVectorBoundaryArrays(
             }
             const scalar a = mag(sumA);
             planeN = (a > scalar(1.0e-150)) ? sumA/a : vector{0, 0, 0};
+        }
+        // A PLAIN PATCH -- no wedge, no symmetry, no inletOutlet stored value, no per-face valueFraction, gradient
+        // or tangential reference -- has per-patch constants in every array but the geometry and refValue, and
+        // those are written in bulk below; every other patch takes the per-face loops. The arrays are the same.
+        const int catEarly = (fvp[pi].type == "processor") ? 8 : f.boundary[pi]->bcCategory();
+        const bool plain = !perFaceAlways && !gradSym && !gradSymPlane && catEarly != 3
+                        && !f.boundary[pi]->isSymmetry()
+                        && !(f.boundary[pi]->wedgeFaceT() && f.boundary[pi]->wedgeCellT())
+                        && f.boundary[pi]->tangentialRefPtr() == nullptr
+                        && f.boundary[pi]->refGradPtr() == nullptr
+                        && !(catEarly == 5 && f.boundary[pi]->valueFractionPtr());
+        if (plain)
+        {
+            const std::size_t np = static_cast<std::size_t>(fvp[pi].size);
+            const std::size_t start = static_cast<std::size_t>(fvp[pi].start);
+            const std::vector<vector> val = f.boundary[pi]->refValues();
+            if (!stateOnly)
+            {
+                gsm.insert(gsm.end(), np, 0);
+                gsn.insert(gsn.end(), 3*np, planeN.x);
+                fc.insert(fc.end(), fvp[pi].faceCells.begin(), fvp[pi].faceCells.begin() + fvp[pi].size);
+                dc.insert(dc.end(), fvp[pi].deltaCoeffs.begin(), fvp[pi].deltaCoeffs.begin() + fvp[pi].size);
+                ms.insert(ms.end(), g.magSf().begin() + fvp[pi].start,
+                          g.magSf().begin() + fvp[pi].start + fvp[pi].size);
+                io.insert(io.end(), np, 0);
+                oio.insert(oio.end(), np, catEarly == 4 ? 1 : 0);
+                mx.insert(mx.end(), np, catEarly == 5 ? 1 : 0);
+                pv.insert(pv.end(), np, catEarly == 6 ? 1 : 0);
+                sm.insert(sm.end(), np, 0);
+                wdg.insert(wdg.end(), np, 0);
+                const std::size_t t0 = wdgT.size();
+                wdgT.resize(t0 + 9*np, scalar(0));
+                for (std::size_t i = 0; i < np; ++i)
+                {
+                    wdgT[t0 + 9*i] = scalar(1);
+                    wdgT[t0 + 9*i + 4] = scalar(1);
+                    wdgT[t0 + 9*i + 8] = scalar(1);
+                }
+                for (int k = 0; k < 3; ++k)
+                {
+                    prv[k].insert(prv[k].end(), np, scalar(0));
+                    nrm[k].resize(nrm[k].size() + np);
+                }
+                const std::size_t n0 = nrm[0].size() - np;
+                for (std::size_t i = 0; i < np; ++i)
+                {
+                    const vector Sf = g.Sf()[start + i];
+                    const scalar mg = g.magSf()[start + i];
+                    nrm[0][n0 + i] = mg > 0 ? Sf.x / mg : 0.0;
+                    nrm[1][n0 + i] = mg > 0 ? Sf.y / mg : 0.0;
+                    nrm[2][n0 + i] = mg > 0 ? Sf.z / mg : 0.0;
+                }
+            }
+            iofr.insert(iofr.end(), np, 0);
+            const label tyPlain = (catEarly == 4 || catEarly == 9) ? 1 : (catEarly == 6 ? 0 : catEarly);
+            for (int k = 0; k < 3; ++k)
+            {
+                rg[k].insert(rg[k].end(), np, scalar(0));
+                ty[k].insert(ty[k].end(), np, tyPlain);
+                vf[k].insert(vf[k].end(), np, scalar(0));
+                iost[k].insert(iost[k].end(), np, scalar(0));
+                ref[k].resize(ref[k].size() + np);
+            }
+            const std::size_t r0 = ref[0].size() - np;
+            for (std::size_t i = 0; i < np; ++i)
+            {
+                ref[0][r0 + i] = val[i].x;
+                ref[1][r0 + i] = val[i].y;
+                ref[2][r0 + i] = val[i].z;
+            }
+            continue;
         }
         for (label i = 0; i < fvp[pi].size && !stateOnly; ++i)
         {
@@ -665,6 +775,14 @@ inline DeviceVectorBoundaryShape deviceVectorBoundaryShape(
     const FvGeometry& g)
 {
     DeviceVectorBoundaryShape k;
+    std::size_t nAll = 0;
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        if (!isCoupledInterfaceType(fvp[pi].type)) nAll += static_cast<std::size_t>(fvp[pi].size);
+    }
+    k.fc.reserve(nAll);
+    k.geom.resize(5*nAll);
+    std::size_t at = 0;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         if (isCoupledInterfaceType(fvp[pi].type)) continue;
@@ -687,12 +805,16 @@ inline DeviceVectorBoundaryShape deviceVectorBoundaryShape(
                 k.kindData.insert(k.kindData.end(), {v.x, v.y, v.z});
             }
         }
+        k.fc.insert(k.fc.end(), fvp[pi].faceCells.begin(), fvp[pi].faceCells.begin() + fvp[pi].size);
         for (label i = 0; i < fvp[pi].size; ++i)
         {
-            const label gf = fvp[pi].start + i;
-            k.fc.push_back(fvp[pi].faceCells[i]);
-            k.geom.insert(k.geom.end(), {fvp[pi].deltaCoeffs[i], g.magSf()[gf], g.Sf()[gf].x, g.Sf()[gf].y,
-                                         g.Sf()[gf].z});
+            const std::size_t gf = static_cast<std::size_t>(fvp[pi].start + i);
+            k.geom[at] = fvp[pi].deltaCoeffs[i];
+            k.geom[at + 1] = g.magSf()[gf];
+            k.geom[at + 2] = g.Sf()[gf].x;
+            k.geom[at + 3] = g.Sf()[gf].y;
+            k.geom[at + 4] = g.Sf()[gf].z;
+            at += 5;
         }
     }
     return k;

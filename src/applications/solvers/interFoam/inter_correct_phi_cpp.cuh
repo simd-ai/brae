@@ -36,6 +36,7 @@
 #include "inter_case_cpp.cuh"
 #include "inter_solve_record.cuh"
 #include "primitive_mesh.cuh"
+#include <functional>
 #include <vector>
 
 namespace brae {
@@ -56,6 +57,13 @@ struct CorrectPhiControls
     // grad(pcorr)'s gradSchemes entry, which the laplacian's correction takes
     GradChoice gradPcorr;
     label nNonOrthogonalCorrectors = 0;
+    // THE PRESSURE RULE (CLAUDE.md): when set, pcorr is solved by this instead of its own entry, with the entry's
+    // name (for the notice), tolerance, relTol, maxIter and minIter: the device loop's AMG-preconditioned PCG
+    // (DevicePcorrSolver). It returns false, solving nothing, where it does not apply, and the entry's solver
+    // runs. Empty on the host arm, and wherever BRAE_PRESSURE_CASE_SOLVER is set, as every test sets it.
+    std::function<bool(const std::string&, const FvScalarMatrix&, std::vector<scalar>&, const PrimitiveMesh&,
+                       const FvGeometry&, const std::vector<FvPatch>&, scalar, scalar, int, int,
+                       SolverPerformance&)> amgPcgSolve;
 };
 
 // The case's own CorrectPhi controls, from the fields the case reader filled: pcorr and pcorrFinal,

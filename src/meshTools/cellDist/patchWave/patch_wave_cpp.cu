@@ -278,7 +278,8 @@ void correctBoundaryCells(
     const FvGeometry& g,
     const std::vector<FvPatch>& patches,
     const std::vector<label>& sortedPatchIDs,
-    std::vector<scalar>& wallDistCorrected)
+    std::vector<scalar>& wallDistCorrected,
+    const std::vector<std::vector<label>>* pointFacesIn)
 {
     std::vector<label> faceLabels;
     for (const label patchi : sortedPatchIDs)
@@ -314,7 +315,17 @@ void correctBoundaryCells(
     // Correct all cells with a point on the wall. The cells of a point come from primitiveMesh's
     // pointCells(pointi), whose order does not matter here: each cell is corrected once, from the
     // faces of the first wall point met that touches it.
-    const std::vector<std::vector<label>> pointFaces = meshPointFaces(m);
+    // primitiveMesh::pointFaces(): the caller's when it keeps it, built here otherwise (an allocation a point)
+    std::vector<std::vector<label>> pointFacesBuilt;
+    if (!pointFacesIn)
+    {
+        pointFacesBuilt = meshPointFaces(m);
+    }
+    const std::vector<std::vector<label>>& pointFaces = pointFacesIn ? *pointFacesIn : pointFacesBuilt;
+    if (pointFaces.size() != static_cast<std::size_t>(m.nPoints()))
+    {
+        throw std::runtime_error(std::string(WHO) + "the point-to-face lists handed in are not this mesh's.");
+    }
     const std::vector<label>& own = m.owner();
     const std::vector<label>& nei = m.neighbour();
     const label nIf = m.nInternalFaces();
@@ -354,7 +365,10 @@ PatchWave patchWave(
     const FvGeometry& g,
     const std::vector<FvPatch>& patches,
     const std::vector<label>& patchIDs,
-    bool correctWalls)
+    bool correctWalls,
+    const std::vector<std::vector<label>>* cellsIn,
+    const PatchWaveRunner* runner,
+    const std::vector<std::vector<label>>* pointFacesIn)
 {
     for (const FvPatch& p : patches)
     {
@@ -369,39 +383,79 @@ PatchWave patchWave(
     std::sort(sortedIDs.begin(), sortedIDs.end());
     sortedIDs.erase(std::unique(sortedIDs.begin(), sortedIDs.end()), sortedIDs.end());
 
-    const std::vector<std::vector<label>> cells = meshCells(m);
-    FaceCellWave wave(m, g, cells);
-
-    // setChangedFaces: every face of the patches, in the mesh's patch order, seeded with its centre
+    // setChangedFaces: every face of the patches, in the mesh's patch order
+    std::vector<label> seedFaces;
     for (std::size_t patchi = 0; patchi < patches.size(); ++patchi)
     {
         if (!std::binary_search(sortedIDs.begin(), sortedIDs.end(), static_cast<label>(patchi))) continue;
         const FvPatch& patch = patches[patchi];
         for (label patchFacei = 0; patchFacei < patch.size; ++patchFacei)
         {
-            WallPoint seed;
-            seed.origin = g.Cf()[static_cast<std::size_t>(patch.start + patchFacei)];
-            seed.distSqr = 0.0;
-            wave.setFaceInfo(patch.start + patchFacei, seed);
+            seedFaces.push_back(patch.start + patchFacei);
         }
     }
-    // MeshWave<wallPoint>(mesh, changedFaces, faceDist, nTotalCells + 1)
-    const label maxIter = m.nCells() + 1;
-    const label iter = wave.iterate(maxIter);
-    if (iter >= maxIter)
+    // the squared distance the wave leaves: every cell, and every boundary face
+    const label nIf = m.nInternalFaces();
+    std::vector<scalar> cellDistSqr;
+    std::vector<scalar> boundaryDistSqr;
+    if (runner && *runner)
     {
-        throw std::runtime_error(std::string(WHO) + "Maximum number of iterations reached. Increase maxIter.");
+        (*runner)(m, g, seedFaces, cellDistSqr, boundaryDistSqr);
+        if (cellDistSqr.size() != static_cast<std::size_t>(m.nCells())
+         || boundaryDistSqr.size() != static_cast<std::size_t>(m.nFaces() - nIf))
+        {
+            throw std::runtime_error(std::string(WHO) + "the wave run elsewhere returned fields of another mesh.");
+        }
+    }
+    else
+    {
+        std::vector<std::vector<label>> cellsBuilt;
+        if (!cellsIn)
+        {
+            cellsBuilt = meshCells(m);
+        }
+        const std::vector<std::vector<label>>& cells = cellsIn ? *cellsIn : cellsBuilt;
+        if (cells.size() != static_cast<std::size_t>(m.nCells()))
+        {
+            throw std::runtime_error(std::string(WHO) + "the cell-to-face lists handed in are not this mesh's.");
+        }
+        FaceCellWave wave(m, g, cells);
+        // each seeded with its centre
+        for (const label facei : seedFaces)
+        {
+            WallPoint seed;
+            seed.origin = g.Cf()[static_cast<std::size_t>(facei)];
+            seed.distSqr = 0.0;
+            wave.setFaceInfo(facei, seed);
+        }
+        // MeshWave<wallPoint>(mesh, changedFaces, faceDist, nTotalCells + 1)
+        const label maxIter = m.nCells() + 1;
+        const label iter = wave.iterate(maxIter);
+        if (iter >= maxIter)
+        {
+            throw std::runtime_error(std::string(WHO) + "Maximum number of iterations reached. Increase maxIter.");
+        }
+        const std::vector<WallPoint>& cellInfo = wave.allCellInfo();
+        const std::vector<WallPoint>& faceInfo = wave.allFaceInfo();
+        cellDistSqr.resize(cellInfo.size());
+        for (std::size_t celli = 0; celli < cellInfo.size(); ++celli)
+        {
+            cellDistSqr[celli] = cellInfo[celli].distSqr;
+        }
+        boundaryDistSqr.resize(static_cast<std::size_t>(m.nFaces() - nIf));
+        for (std::size_t i = 0; i < boundaryDistSqr.size(); ++i)
+        {
+            boundaryDistSqr[i] = faceInfo[static_cast<std::size_t>(nIf) + i].distSqr;
+        }
     }
 
-    // getValues
+    // getValues: wallPoint::valid is distSqr > -SMALL
     PatchWave out;
-    const std::vector<WallPoint>& cellInfo = wave.allCellInfo();
-    const std::vector<WallPoint>& faceInfo = wave.allFaceInfo();
-    out.distance.resize(cellInfo.size());
-    for (std::size_t celli = 0; celli < cellInfo.size(); ++celli)
+    out.distance.resize(cellDistSqr.size());
+    for (std::size_t celli = 0; celli < cellDistSqr.size(); ++celli)
     {
-        const scalar dist = cellInfo[celli].distSqr;
-        if (cellInfo[celli].valid())
+        const scalar dist = cellDistSqr[celli];
+        if (dist > -small)
         {
             out.distance[celli] = std::sqrt(dist);
         }
@@ -419,15 +473,15 @@ PatchWave patchWave(
         patchField.resize(static_cast<std::size_t>(patch.size));
         for (label patchFacei = 0; patchFacei < patch.size; ++patchFacei)
         {
-            const WallPoint& w = faceInfo[static_cast<std::size_t>(patch.start + patchFacei)];
-            if (w.valid())
+            const scalar dist = boundaryDistSqr[static_cast<std::size_t>(patch.start + patchFacei - nIf)];
+            if (dist > -small)
             {
                 // Adding SMALL to avoid problems with /0 in the turbulence models
-                patchField[static_cast<std::size_t>(patchFacei)] = std::sqrt(w.distSqr) + small;
+                patchField[static_cast<std::size_t>(patchFacei)] = std::sqrt(dist) + small;
             }
             else
             {
-                patchField[static_cast<std::size_t>(patchFacei)] = w.distSqr;
+                patchField[static_cast<std::size_t>(patchFacei)] = dist;
                 out.nUnset++;
             }
         }
@@ -436,7 +490,7 @@ PatchWave patchWave(
     // Correct wall cells for true distance
     if (correctWalls)
     {
-        correctBoundaryCells(m, g, patches, sortedIDs, out.distance);
+        correctBoundaryCells(m, g, patches, sortedIDs, out.distance, pointFacesIn);
     }
     return out;
 }

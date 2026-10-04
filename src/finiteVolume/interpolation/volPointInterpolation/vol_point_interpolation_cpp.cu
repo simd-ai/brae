@@ -1,4 +1,5 @@
 #include "vol_point_interpolation_cpp.cuh"
+#include <cstdlib>
 #include "foam_dict.cuh"
 #include <stdexcept>
 #include <string>
@@ -11,6 +12,15 @@ void VolPointInterpolation::makeWeights(
     const std::vector<FvPatch>& patches,
     const std::vector<std::vector<label>>& pointCells)
 {
+    static const bool rebuildAlways = std::getenv("BRAE_CONTROL_VPI_REBUILD") != nullptr;
+    bool samePatches = patchStart_.size() == patches.size();
+    for (std::size_t pi = 0; pi < patches.size() && samePatches; ++pi)
+    {
+        samePatches = patchStart_[pi] == patches[pi].start && patchSize_[pi] == patches[pi].size;
+    }
+    const bool keep = !rebuildAlways && addressingBuilt_ && pointCells_ == &pointCells && samePatches
+                   && builtPoints_ == m.nPoints() && builtFaces_ == m.nFaces() && builtCells_ == m.nCells()
+                   && nInternalFaces_ == m.nInternalFaces();
     pointCells_ = &pointCells;
     nInternalFaces_ = m.nInternalFaces();
     patchStart_.clear();
@@ -29,23 +39,34 @@ void VolPointInterpolation::makeWeights(
     }
 
     // calcBoundaryAddressing
-    boundary_ = primitivePatch(m, faceRange(m.nInternalFaces(), m.nFaces() - m.nInternalFaces()));
-    boundaryIsPatchFace_.assign(boundary_.faces.size(), 0);
-    isPatchPoint_.assign(static_cast<std::size_t>(m.nPoints()), 0);
-    for (const FvPatch& pp : patches)
+    if (!keep)
     {
-        if (pp.type == "empty") continue;
-        label bFacei = pp.start - m.nInternalFaces();
-        for (label i = 0; i < pp.size; ++i)
+        boundary_ = primitivePatch(m, faceRange(m.nInternalFaces(), m.nFaces() - m.nInternalFaces()));
+        boundaryIsPatchFace_.assign(boundary_.faces.size(), 0);
+        isPatchPoint_.assign(static_cast<std::size_t>(m.nPoints()), 0);
+        for (const FvPatch& pp : patches)
         {
-            boundaryIsPatchFace_[static_cast<std::size_t>(bFacei)] = 1;
-            const label f = pp.start + i;
-            for (label fp = 0; fp < m.faceSize(f); ++fp)
+            if (pp.type == "empty") continue;
+            label bFacei = pp.start - m.nInternalFaces();
+            for (label i = 0; i < pp.size; ++i)
             {
-                isPatchPoint_[static_cast<std::size_t>(m.faceVert(f, fp))] = 1;
+                boundaryIsPatchFace_[static_cast<std::size_t>(bFacei)] = 1;
+                const label f = pp.start + i;
+                for (label fp = 0; fp < m.faceSize(f); ++fp)
+                {
+                    isPatchPoint_[static_cast<std::size_t>(m.faceVert(f, fp))] = 1;
+                }
+                bFacei++;
             }
-            bFacei++;
         }
+    }
+
+    // BRAE_CONTROL_VPI_STALE=1 keeps the weights with the addressing -- those of the mesh before it moved. The
+    // identity gate's control: it has to show the comparison sees the weights.
+    static const bool staleWeights = std::getenv("BRAE_CONTROL_VPI_STALE") != nullptr;
+    if (keep && staleWeights)
+    {
+        return;
     }
 
     // Running sum of weights
@@ -54,7 +75,10 @@ void VolPointInterpolation::makeWeights(
     // makeInternalWeights
     const std::vector<vector>& points = m.points();
     const std::vector<vector>& cellCentres = g.C();
-    pointWeights_.assign(points.size(), std::vector<scalar>());
+    if (!keep)
+    {
+        pointWeights_.assign(points.size(), std::vector<scalar>());
+    }
     for (std::size_t pointi = 0; pointi < points.size(); ++pointi)
     {
         if (!isPatchPoint_[pointi])
@@ -72,7 +96,14 @@ void VolPointInterpolation::makeWeights(
 
     // makeBoundaryWeights
     const std::vector<vector>& faceCentres = g.Cf();
-    boundaryPointWeights_.assign(boundary_.meshPoints.size(), std::vector<scalar>());
+    if (!keep)
+    {
+        boundaryPointWeights_.assign(boundary_.meshPoints.size(), std::vector<scalar>());
+    }
+    addressingBuilt_ = true;
+    builtPoints_ = m.nPoints();
+    builtFaces_ = m.nFaces();
+    builtCells_ = m.nCells();
     for (std::size_t i = 0; i < boundary_.meshPoints.size(); ++i)
     {
         const label pointi = boundary_.meshPoints[i];

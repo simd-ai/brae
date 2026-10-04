@@ -215,6 +215,18 @@ bool nHatBoundaryOnlyApplies(
     const InterfaceCoeffs& c,
     bool gradLeastSquares,
     const NHatBoundaryStencil& st);
+// calculateNHatBoundary's second half, for a caller that forms the first itself: `acc` holds each stencil cell's
+// sum over its internal faces -- Sf*interpolate(alpha), added on the owner side and subtracted on the
+// neighbour's, in ascending face order -- and this adds the patches' terms in patch order, divides by the
+// volume and runs nHatBoundary. The device loop's alpha hooks form `acc` on the GPU.
+void finishNHatBoundary(
+    const GeometricField<scalar>& alpha1,
+    const InterfaceCoeffs& c,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    NHatBoundaryStencil& st,
+    std::vector<vector>& acc,
+    SurfaceScalarField& nHatf);
 void calculateNHatBoundary(
     const GeometricField<scalar>& alpha1,
     const InterfaceCoeffs& c,

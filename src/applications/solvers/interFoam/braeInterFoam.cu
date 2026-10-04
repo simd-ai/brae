@@ -182,6 +182,7 @@
 //   device_refine_motion
 //   device_gradUCache device_gradUCacheKEpsilon device_gradUCacheLimited device_gradUCacheCoupled
 // END DEVICE REFUSALS
+#include "device_schedule.cuh"
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
@@ -198,6 +199,8 @@
 
 int main(int argc, char** argv)
 {
+    // before any CUDA call: see device_schedule.cuh
+    brae::setCudaSchedule();
     bool onDevice = false;
     std::string caseDir = ".";
     for (int i = 1; i < argc; ++i)
