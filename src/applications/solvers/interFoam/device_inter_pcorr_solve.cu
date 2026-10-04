@@ -123,10 +123,9 @@ bool DevicePcorrSolver::solve(
                 std::printf("  pcorr: its AMG hierarchy is a smoothed-aggregation one of its own, built once "
                             "(the mesh keeps its topology); BRAE_PCORR_AMG=plain takes the one p_rgh uses\n");
             }
-            const std::vector<scalar> w(g.magSf().begin(), g.magSf().begin() + nIf);
-            const bool smoothed = true;
-            interPhase::Nested timedBuild("pcorr: the smoothed-aggregation hierarchy (build)");
-            amg = buildAMG(owner, neighbour, w, nC, &smoothed);
+            // from the case's cache where it is this mesh's (the start mesh only), built otherwise
+            interPhase::Nested timedBuild("pcorr: the smoothed-aggregation hierarchy (load or build)");
+            amg = deviceAmgPcgHierarchy(m, g, caseDir, firstBuild, nullptr, /*smoothed=*/true);
         }
         else
         {

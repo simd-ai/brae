@@ -142,11 +142,12 @@ struct DeviceAmgPcgCache
     AMGData& get(unsigned long long id);
 };
 
-// THE HIERARCHY, WARM WHERE IT CAN BE. `disk` (the run's start mesh) loads
-// <caseDir>/constant/polyMesh/.brae_amgcache when it holds a hierarchy for a mesh of these cell and face counts
-// and for this smoother mode, and writes it after a build -- the file simpleFoam's fast path keeps. A stale file
-// of the right sizes can only slow the solve: the hierarchy preconditions a conjugate gradient on the TRUE
-// matrix. BRAE_AMG_CACHE=0 neither reads nor writes it.
+// THE HIERARCHY, WARM WHERE IT CAN BE. `disk` (the run's start mesh) loads the case's cache --
+// <caseDir>/constant/polyMesh/.brae_amgcache, or .brae_amgcache_sa for a smoothed one -- when the file is THIS
+// mesh's and this build's (buildOrLoadAMG's signature: the owner, neighbour and weights by content, the build's
+// parameters and version), and writes it after a build. BRAE_AMG_CACHE=0 neither reads nor writes it.
+// pcorr's smoothed hierarchy was not cached at all and was built at every start: MEASURED 2.2 s at 896,000 cells
+// (2-D) and 13.6 s on the 845,536-cell hull.
 // THE FAST PATH'S PERFORMANCE KNOBS, one reading for every pressure entry -- p_rgh here and pcorr in
 // device_inter_pcorr_solve.cu -- with simpleFoam's defaults and switches (linear_solver_setup.cuh): the
 // residual read every 4 iterations where the loop is driven from the host (BRAE_PCG_CHECK_EVERY), the whole
@@ -186,7 +187,9 @@ AMGData deviceAmgPcgHierarchy(
     const FvGeometry& g,
     const std::string& caseDir,
     bool disk,
-    AmgHierarchyMemo* memo = nullptr);
+    AmgHierarchyMemo* memo = nullptr,
+    // pcorr's smoothed-aggregation hierarchy (DevicePcorrSolver::fixedTopology): cached in a file of its own
+    bool smoothed = false);
 
 
 struct DeviceInterPressureInput

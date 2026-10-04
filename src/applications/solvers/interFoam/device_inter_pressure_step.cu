@@ -750,7 +750,8 @@ AMGData deviceAmgPcgHierarchy(
     const FvGeometry& g,
     const std::string& caseDir,
     bool disk,
-    AmgHierarchyMemo* memo)
+    AmgHierarchyMemo* memo,
+    bool smoothed)
 {
     interPhase::Nested timed("pressure: AMG hierarchy (load, build or copy)");
     static const bool cacheOff = []()
@@ -761,24 +762,41 @@ AMGData deviceAmgPcgHierarchy(
     const label nC = m.nCells();
     const label nIf = m.nInternalFaces();
     const bool useDisk = disk && !cacheOff && !caseDir.empty();
-    const std::string path = caseDir + "/constant/polyMesh/.brae_amgcache";
-    if (useDisk)
-    {
-        AMGData cached;
-        if (loadAMGCache(path, cached) && cached.nFine == nC
-         && (cached.level.empty() || cached.level.front().faceRestrict.size() == static_cast<std::size_t>(nIf)))
-        {
-            return cached;
-        }
-    }
     const std::vector<label> own(m.owner().begin(), m.owner().begin() + nIf);
     const std::vector<label> nei(m.neighbour().begin(), m.neighbour().begin() + nIf);
     const std::vector<scalar> w(g.magSf().begin(), g.magSf().begin() + nIf);
+    if (useDisk)
+    {
+        // THE START MESH'S HIERARCHY, FROM THE CASE'S CACHE where the file there is this mesh's and this build's
+        // (buildOrLoadAMG, keyed on the owner, neighbour and weights' content) -- the plain one and the smoothed
+        // one each in a file of its own. Built and written otherwise.
+        AMGCacheRead how = AMGCacheRead::absent;
+        const std::string dir = caseDir + "/constant/polyMesh";
+        AMGData A = buildOrLoadAMG(own, nei, w, nC, dir, true, smoothed ? &smoothed : nullptr, &how);
+        const char* kind = smoothed ? "smoothed-aggregation " : "plain ";
+        if (how == AMGCacheRead::loaded)
+        {
+            std::printf("  AMG hierarchy: the %sone is read from %s (this mesh's, written by this build); "
+                        "BRAE_AMG_CACHE=0 builds it\n", kind, amgCachePath(dir, smoothed).c_str());
+        }
+        else if (how == AMGCacheRead::otherMeshOrBuild)
+        {
+            std::printf("  AMG hierarchy: the %sone at %s is another mesh's or another build's: built here and "
+                        "the file rewritten\n", kind, amgCachePath(dir, smoothed).c_str());
+        }
+        else if (how == AMGCacheRead::unreadable)
+        {
+            std::printf("  AMG hierarchy: the %sone at %s could not be read whole: built here and the file "
+                        "rewritten\n", kind, amgCachePath(dir, smoothed).c_str());
+        }
+        return A;
+    }
     // ONE BUILD A CHANGED MESH (AmgHierarchyMemo): the second asker takes a copy of the first one's structure
     static const bool rebuilt = std::getenv("BRAE_CONTROL_AMG_HIERARCHY_REBUILT") != nullptr;
     static const bool check = std::getenv("BRAE_CONTROL_AMG_HIERARCHY_CHECK") != nullptr;
     static const bool stale = std::getenv("BRAE_CONTROL_AMG_HIERARCHY_STALE") != nullptr;
-    const bool remember = memo && !useDisk && !rebuilt;
+    // (the memo is the plain hierarchy's: pcorr alone asks for a smoothed one)
+    const bool remember = memo && !smoothed && !rebuilt;
     if (remember && memo->held
      && (stale || (memo->nCells == nC && memo->owner == own && memo->neighbour == nei
                 && memo->weights.size() == w.size()
@@ -804,7 +822,7 @@ AMGData deviceAmgPcgHierarchy(
         memo->held = false;
         if (check)
         {
-            const AMGData fresh = buildAMG(own, nei, w, nC);
+            const AMGData fresh = buildAMG(own, nei, w, nC, smoothed ? &smoothed : nullptr);
             const char* what = firstAMGDifference(copy, fresh);
             if (what)
             {
@@ -815,11 +833,7 @@ AMGData deviceAmgPcgHierarchy(
         }
         return copy;
     }
-    AMGData built = buildAMG(own, nei, w, nC);
-    if (useDisk)
-    {
-        writeAMGCache(built, path);
-    }
+    AMGData built = buildAMG(own, nei, w, nC, smoothed ? &smoothed : nullptr);
     if (remember)
     {
         interPhase::Nested timedKeep("hierarchy: the copy kept for the second solve (cloneAMG)");

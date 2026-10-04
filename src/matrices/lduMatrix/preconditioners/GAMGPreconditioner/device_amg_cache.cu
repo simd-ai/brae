@@ -19,7 +19,9 @@ namespace brae {
 // "partition" step builds it once and the run reloads it. cDiag/cUpper/cLower hold values (Galerkin re-fills them),
 // so they are not serialized, only re-sized.
 namespace {
-constexpr unsigned AMG_CACHE_MAGIC = 0x43464131;          // "CFA1"
+// "CFA2": the second form of the file, which carries the signature of what the hierarchy was built from. A
+// "CFA1" file has none and is read as another build's.
+constexpr unsigned AMG_CACHE_MAGIC = 0x43464132;
 template<class T>
 void wbuf(
     std::FILE* f,
@@ -160,14 +162,17 @@ const char* firstAMGDifference(
     }
     return nullptr;
 }
-void writeAMGCache(
-    const AMGData& A,
-    const std::string& path)
+bool writeAMGCache(
+    const AMGData&     A,
+    const std::string& path,
+    unsigned long long signature)
 {
-    std::FILE* f = std::fopen(path.c_str(), "wb");
-    if (!f) return;
+    const std::string partial = path + ".partial";
+    std::FILE* f = std::fopen(partial.c_str(), "wb");
+    if (!f) return false;
     unsigned magic = AMG_CACHE_MAGIC;
     std::fwrite(&magic,sizeof(magic),1,f);
+    std::fwrite(&signature,sizeof(signature),1,f);
     int nFine = A.nFine, nLev = A.nLevels();
     char gs = A.gsSmooth, sa = A.saSmooth;
     std::fwrite(&nFine,sizeof(nFine),1,f);
@@ -209,26 +214,44 @@ void writeAMGCache(
         if (ns) std::fwrite(c.startH.data(),sizeof(label),ns,f);
     }
     std::fwrite(&magic,sizeof(magic),1,f);                 // trailing sentinel (truncation/corruption check)
-    std::fclose(f);
+    // a short write anywhere above sets the stream's error flag; the flush at the close can fail too
+    const bool failed = std::ferror(f) != 0;
+    const bool closed = std::fclose(f) == 0;
+    if (failed || !closed || std::rename(partial.c_str(), path.c_str()) != 0)
+    {
+        std::remove(partial.c_str());
+        return false;
+    }
+    return true;
 }
-bool loadAMGCache(
+AMGCacheRead readAMGCache(
     const std::string& path,
-    AMGData& A)
+    AMGData&           A,
+    unsigned long long signature,
+    bool               smoothedAggregation,
+    bool               compareSignature)
 {
     std::FILE* f = std::fopen(path.c_str(), "rb");
-    if (!f) return false;
-    auto fail = [&]()
+    if (!f) return AMGCacheRead::absent;
+    auto fail = [&](AMGCacheRead why)
     {
         std::fclose(f);
-        return false;
+        return why;
     };
     unsigned magic = 0;
-    if (std::fread(&magic,sizeof(magic),1,f)!=1 || magic!=AMG_CACHE_MAGIC) return fail();
+    if (std::fread(&magic,sizeof(magic),1,f)!=1) return fail(AMGCacheRead::unreadable);
+    // an older form of the file is another build's
+    if (magic!=AMG_CACHE_MAGIC) return fail(AMGCacheRead::otherMeshOrBuild);
+    unsigned long long written = 0;
+    if (std::fread(&written,sizeof(written),1,f)!=1) return fail(AMGCacheRead::unreadable);
+    if (compareSignature && written != signature) return fail(AMGCacheRead::otherMeshOrBuild);
     int nFine=0, nLev=0;
     char gs=0, sa=0;
     if (std::fread(&nFine,sizeof(nFine),1,f)!=1 || std::fread(&nLev,sizeof(nLev),1,f)!=1
-        || std::fread(&gs,1,1,f)!=1 || std::fread(&sa,1,1,f)!=1) return fail();
-    if ((bool)gs != useGS() || (bool)sa != useSA()) return fail();   // smoother/aggregation mode (env) must match
+        || std::fread(&gs,1,1,f)!=1 || std::fread(&sa,1,1,f)!=1) return fail(AMGCacheRead::unreadable);
+    // the smoother and aggregation mode are in the signature too; told apart here so a file read with the
+    // signature not compared still cannot hand back the other kind of hierarchy
+    if ((bool)gs != useGS() || (bool)sa != smoothedAggregation) return fail(AMGCacheRead::otherMeshOrBuild);
     A = AMGData{};
     A.nFine = nFine;
     A.gsSmooth = gs;
@@ -247,10 +270,14 @@ bool loadAMGCache(
         L.cDiag.resize(L.nCoarse);
         L.cUpper.resize(L.nCoarseFaces);
         L.cLower.resize(L.nCoarseFaces);   // VALUES via Galerkin
+        // an addressing id of its own, as a built level takes (buildAMG): a loaded level's was left 0
+        L.addressingId = nextDeviceAddressingId();
         // ...and the gather lists the Galerkin re-fill indexes with. They are NOT in the file: they are
         // a pure function of map/faceRestrict/faceFlip, which are, so they are rebuilt through the same
         // builder the build path uses. Without this every cached run died on its first Galerkin.
-        rebuildGalerkinGather(L, L.nFine);
+        // A SMOOTHED level has none: its coarse matrix is the RAP recipe's (buildAMG builds no gather lists
+        // for it), and lists made here would be the one thing a loaded hierarchy held that a built one did not.
+        if (!sa) rebuildGalerkinGather(L, L.nFine);
     }
     int nCol = 0;
     ok = ok && std::fread(&nCol,sizeof(nCol),1,f)==1;
@@ -270,11 +297,15 @@ bool loadAMGCache(
     unsigned tail = 0;
     ok = ok && std::fread(&tail,sizeof(tail),1,f)==1 && tail==AMG_CACHE_MAGIC;   // sentinel
     std::fclose(f);
-    if (!ok) return false;
+    if (!ok)
+    {
+        A = AMGData{};
+        return AMGCacheRead::unreadable;
+    }
     A.nCoarse = A.level.empty() ? nFine : A.level.front().nCoarse;
     A.nCoarseFaces = A.level.empty() ? 0 : A.level.front().nCoarseFaces;
     finalizeAMG(A, nFine);
-    return true;
+    return AMGCacheRead::loaded;
 }
 
 } // namespace brae

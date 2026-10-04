@@ -200,18 +200,56 @@ AMGData buildAMG(const std::vector<label>& fineOwner, const std::vector<label>& 
 
 // AMG hierarchy cache (the "partition" step): the agglomeration is static per mesh -> serialize the STRUCTURE so a
 // warm run reloads it instead of re-agglomerating. Only the structure is cached (cDiag/cUpper/cLower VALUES are
-// Galerkin-rebuilt each step). loadAMGCache returns false (caller rebuilds) on any mismatch/corruption/mode change.
-void writeAMGCache(const AMGData& A, const std::string& path);
-bool loadAMGCache(const std::string& path, AMGData& A);
+// Galerkin-rebuilt each step).
+// THE FILE IS KEYED ON WHAT THE HIERARCHY IS A FUNCTION OF (amgHierarchySignature): the internal faces' owner,
+// neighbour and weights, the cell count, plain or smoothed aggregation, the build's parameters (BRAE_AMG_TARGET,
+// _MERGE, _SOC, _GS) and AMG_BUILD_VERSION. It was keyed on nothing -- a caller compared two sizes, or the
+// file's date with the owner file's -- so a file of another mesh with the same counts, or one written by a build
+// whose agglomeration has since changed, was loaded. That is harmless to the answer only while the structure
+// fits the mesh; a smoothed hierarchy's prolongator and RAP recipe are VALUES of the mesh it was built on.
+// A plain and a smoothed hierarchy of one mesh are two files (amgCachePath).
+enum class AMGCacheRead
+{
+    loaded,
+    absent,
+    otherMeshOrBuild,
+    unreadable
+};
+unsigned long long amgHierarchySignature(
+    const std::vector<label>&  fineOwner,
+    const std::vector<label>&  fineNei,
+    const std::vector<scalar>& faceWeights,
+    int                        nFine,
+    bool                       smoothedAggregation);
+std::string amgCachePath(
+    const std::string& cacheDir,
+    bool               smoothedAggregation);
+// Written beside its final name and renamed into place, so a run that is stopped or a disk that fills leaves no
+// half file behind; false (and nothing left) when it could not be written whole.
+bool writeAMGCache(
+    const AMGData&     A,
+    const std::string& path,
+    unsigned long long signature);
+// `compareSignature` false is a gate's CONTROL (BRAE_CONTROL_AMG_CACHE_STALE): the file is read whatever it is of
+AMGCacheRead readAMGCache(
+    const std::string& path,
+    AMGData&           A,
+    unsigned long long signature,
+    bool               smoothedAggregation,
+    bool               compareSignature = true);
 // A SECOND HIERARCHY OF THE SAME STRUCTURE, copied device to device: what loadAMGCache does through a file,
 // without the file or the host. The copy's levels take addressing ids of their own, as a build's do, and its
 // per-solve state (the smoother's spectrum, the captured graphs, the coarse matrices' values) starts fresh.
 AMGData cloneAMG(const AMGData& A);
 // the first part of the two hierarchies' STRUCTURE that differs, or null: the check a clone is held to
 const char* firstAMGDifference(const AMGData& A, const AMGData& B);
-// Build the hierarchy, or reload cacheDir/.brae_amgcache if valid (newer than cacheDir/owner). writeCache persists it.
+// Build the hierarchy, or reload it from cacheDir where the file there is THIS mesh's and this build's (the
+// signature above). writeCache persists a build. `smoothedAggregation` as buildAMG's; `how` says what the cache
+// held. BRAE_CONTROL_AMG_CACHE_CHECK=1 builds as well after a load and compares every buffer of the structure.
 AMGData buildOrLoadAMG(const std::vector<label>& fineOwner, const std::vector<label>& fineNei,
-                       const std::vector<scalar>& faceWeights, int nFine, const std::string& cacheDir, bool writeCache);
+                       const std::vector<scalar>& faceWeights, int nFine, const std::string& cacheDir,
+                       bool writeCache, const bool* smoothedAggregation = nullptr,
+                       AMGCacheRead* how = nullptr);
 
 // Galerkin: rebuild the coarse matrix coefficients from the current fine matrix (diag/upper/lower).
 void amgGalerkin(AMGData& A, const DeviceBuffer<scalar>& fineDiag, const DeviceBuffer<scalar>& fineUpper,

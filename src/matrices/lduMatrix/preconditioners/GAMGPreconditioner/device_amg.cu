@@ -205,6 +205,26 @@ void buildGalerkinGather(AMGLevel& L, const AgglomT& a, int nFine)
     L.galFaceFlipList.copyFrom(ff);
 }
 
+// THE BUILD'S PARAMETERS, read in ONE place: buildAMG and agglomerate take them from here, and so does the
+// disk cache's signature (amgHierarchySignature) -- a hierarchy built under another value is another hierarchy.
+int amgTarget()
+{
+    const char* e = std::getenv("BRAE_AMG_TARGET");
+    const int v = e ? std::atoi(e) : 64;
+    return v > 0 ? v : 64;
+}
+int amgMerge()
+{
+    const char* e = std::getenv("BRAE_AMG_MERGE");
+    const int v = e ? std::atoi(e) : 1;
+    return v > 0 ? v : 1;
+}
+double amgSocBeta()
+{
+    const char* e = std::getenv("BRAE_AMG_SOC");
+    return e ? std::atof(e) : 0.0;
+}
+
 // THE COARSE FACES OF ONE AGGLOMERATION: the unique (lower, higher) coarse-cell pairs in owner-sorted order (the
 // coarse SpMV needs that order), each fine face's coarse face (or -1 - cell for a face inside an agglomerate) and
 // flip, and the coarse face weights (the sum of the fine ones, added in ascending fine face).
@@ -393,7 +413,7 @@ Agglom agglomerate(
     // Optional strength-of-connection filter (BRAE_AMG_SOC=beta; 0 disables). A face is strong when
     // fw[f] >= beta*sqrt(D[o]*D[m]), D = row-sum of fw; matching only strong faces gives semi-coarsening along
     // the strong direction on anisotropic meshes (sweet spot beta~0.05).
-    static const scalar socBeta = [](){ const char* e = std::getenv("BRAE_AMG_SOC"); return e ? std::atof(e) : 0.0; }();
+    static const scalar socBeta = amgSocBeta();
     std::vector<scalar> D;
     if (socBeta > 0.0)
     {
@@ -1040,26 +1060,138 @@ Agglom composeAgglom(
     return a;
 }
 
+// WHAT A HIERARCHY IS BUILT BY, as one number: bump AMG_BUILD_VERSION whenever agglomerate, composeAgglom,
+// aggregateCompact, buildSmoothedP or coarsenRAPRecipe change what they produce for the same input -- a file
+// written before the change is then another build's and is not read.
+constexpr unsigned long long AMG_BUILD_VERSION = 1;
+
+namespace {
+
+// 64 bits over the bytes, eight at a time: not a cryptographic hash, a fingerprint two meshes do not share by
+// accident. MEASURED at 896,000 cells (28 MB of addressing and weights): 3.7 ms.
+struct Fingerprint
+{
+    unsigned long long h = 0x9E3779B97F4A7C15ull;
+
+    void word(unsigned long long w)
+    {
+        h ^= w;
+        h *= 0xFF51AFD7ED558CCDull;
+        h ^= h >> 33;
+    }
+    void bytes(
+        const void* p,
+        std::size_t n)
+    {
+        const unsigned char* b = static_cast<const unsigned char*>(p);
+        std::size_t i = 0;
+        for (; i + 8 <= n; i += 8)
+        {
+            unsigned long long w;
+            std::memcpy(&w, b + i, 8);
+            word(w);
+        }
+        if (i < n)
+        {
+            unsigned long long w = 0;
+            std::memcpy(&w, b + i, n - i);
+            word(w);
+        }
+        word(static_cast<unsigned long long>(n));
+    }
+    template<class T>
+    void value(const T& v)
+    {
+        bytes(&v, sizeof(T));
+    }
+    template<class T>
+    void list(const std::vector<T>& v)
+    {
+        bytes(v.data(), v.size()*sizeof(T));
+    }
+};
+
+}   // namespace
+
+unsigned long long amgHierarchySignature(
+    const std::vector<label>&  fineOwner,
+    const std::vector<label>&  fineNei,
+    const std::vector<scalar>& faceWeights,
+    int                        nFine,
+    bool                       smoothedAggregation)
+{
+    Fingerprint f;
+    f.value(AMG_BUILD_VERSION);
+    f.value(static_cast<unsigned long long>(sizeof(label)));
+    f.value(static_cast<unsigned long long>(sizeof(scalar)));
+    f.value(static_cast<long long>(nFine));
+    f.value(static_cast<long long>(smoothedAggregation ? 1 : 0));
+    f.value(static_cast<long long>(useGS() ? 1 : 0));
+    f.value(static_cast<long long>(amgTarget()));
+    f.value(static_cast<long long>(amgMerge()));
+    f.value(amgSocBeta());
+    f.list(fineOwner);
+    f.list(fineNei);
+    f.list(faceWeights);
+    return f.h;
+}
+
+std::string amgCachePath(
+    const std::string& cacheDir,
+    bool               smoothedAggregation)
+{
+    return cacheDir + (smoothedAggregation ? "/.brae_amgcache_sa" : "/.brae_amgcache");
+}
+
 AMGData buildOrLoadAMG(
     const std::vector<label>& fineOwner,
     const std::vector<label>& fineNei,
     const std::vector<scalar>& faceWeights,
     int nFine,
     const std::string& cacheDir,
-    bool writeCache)
+    bool writeCache,
+    const bool* smoothedAggregation,
+    AMGCacheRead* how)
 {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    const std::string amgPath = cacheDir + "/.brae_amgcache";
-    const std::string ownerPath = cacheDir + "/owner";
-    if (fs::exists(amgPath, ec) && fs::exists(ownerPath, ec)
-        && fs::last_write_time(amgPath, ec) >= fs::last_write_time(ownerPath, ec))
+    // BRAE_CONTROL_AMG_CACHE_STALE=1 is a gate's CONTROL, deliberately wrong: the file is read without asking
+    // whether it is this mesh's -- what every reader of it did before the signature
+    static const bool stale = std::getenv("BRAE_CONTROL_AMG_CACHE_STALE") != nullptr;
+    static const bool check = std::getenv("BRAE_CONTROL_AMG_CACHE_CHECK") != nullptr;
+    const bool sa = smoothedAggregation ? *smoothedAggregation : useSA();
+    const std::string amgPath = amgCachePath(cacheDir, sa);
+    std::optional<interPhase::Nested> part;
+    part.emplace("hierarchy: the mesh's signature, the cache's key");
+    const unsigned long long signature = amgHierarchySignature(fineOwner, fineNei, faceWeights, nFine, sa);
+    part.emplace("hierarchy: the cache file read");
+    AMGData A;
+    const AMGCacheRead read = readAMGCache(amgPath, A, signature, sa, !stale);
+    part.reset();
+    if (how) *how = read;
+    if (read == AMGCacheRead::loaded)
     {
-        AMGData A;
-        if (loadAMGCache(amgPath, A)) return A;     // warm: reuse the cached hierarchy
+        if (check)
+        {
+            const AMGData fresh = buildAMG(fineOwner, fineNei, faceWeights, nFine, &sa);
+            const char* what = firstAMGDifference(A, fresh);
+            if (what)
+            {
+                throw std::runtime_error(
+                    std::string("brae buildOrLoadAMG: BRAE_CONTROL_AMG_CACHE_CHECK: of the hierarchy read from ")
+                    + amgPath + ", " + what + " is not what building it for this mesh gives.");
+            }
+        }
+        return A;     // warm: the cached hierarchy is this mesh's and this build's
     }
-    AMGData A = buildAMG(fineOwner, fineNei, faceWeights, nFine);
-    if (writeCache) writeAMGCache(A, amgPath);
+    A = buildAMG(fineOwner, fineNei, faceWeights, nFine, &sa);
+    if (writeCache)
+    {
+        part.emplace("hierarchy: the cache file written");
+        if (!writeAMGCache(A, amgPath, signature))
+        {
+            std::printf("brae NOTICE: the AMG hierarchy could not be written to %s (no space, or no permission); "
+                        "the run goes on and the next one builds it again\n", amgPath.c_str());
+        }
+    }
     return A;
 }
 
@@ -1073,18 +1205,8 @@ AMGData buildAMG(
     // Keep coarsening until the coarsest grid is <= TARGET cells. Overridable (BRAE_AMG_TARGET)
     // so a tiny mesh can still be made to build a real hierarchy: the demo/teaching cases are
     // below the default target and would otherwise get zero levels (coarsest solve only).
-    static const int TARGET = []()
-    {
-        const char* e = std::getenv("BRAE_AMG_TARGET");
-        const int v = e ? std::atoi(e) : 64;
-        return v > 0 ? v : 64;
-    }();
-    static const int MERGE = []()
-    {
-        const char* e = std::getenv("BRAE_AMG_MERGE");
-        const int v = e ? std::atoi(e) : 1;
-        return v > 0 ? v : 1;
-    }();
+    static const int TARGET = amgTarget();
+    static const int MERGE = amgMerge();
     AMGData A;
     A.nFine = nFine;
     // Multicolor Gauss-Seidel smoother (BRAE_AMG_GS): color every smoothed grid once at build (host, static geometry).
@@ -1107,7 +1229,7 @@ AMGData buildAMG(
     HostLdu proxy;
     if (sa) proxy = proxyLaplacian(fineOwner, fineNei, faceWeights, nFine);   // level-0 geometric proxy
     // SA strength-of-connection filter (BRAE_AMG_SOC, 0 = OFF = every neighbour strong), feeds compact aggregation.
-    static const double saSoc = [](){ const char* e = std::getenv("BRAE_AMG_SOC"); return e ? std::atof(e) : 0.0; }();
+    static const double saSoc = amgSocBeta();
     if (gs) pushColoring(greedyColor(fineOwner, fineNei, nFine));   // coloring[0] = fine grid
     while (n > TARGET)
     {
