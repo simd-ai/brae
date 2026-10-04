@@ -183,6 +183,7 @@
 //   device_gradUCache device_gradUCacheKEpsilon device_gradUCacheLimited device_gradUCacheCoupled
 // END DEVICE REFUSALS
 #include "device_schedule.cuh"
+#include "host_allocator.cuh"
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
@@ -199,6 +200,8 @@
 
 int main(int argc, char** argv)
 {
+    // before the first large allocation: see host_allocator.cuh
+    const std::string hostAllocatorNotice = brae::setHostAllocator();
     // before any CUDA call: see device_schedule.cuh
     brae::setCudaSchedule();
     bool onDevice = false;
@@ -318,6 +321,7 @@ int main(int argc, char** argv)
 
         std::printf("brae interFoam (OF-mirror): %ld cells, start %s, endTime %g\n",
                     (long)m.nCells(), startName.c_str(), (double)endTime);
+        std::printf("%s", hostAllocatorNotice.c_str());
 
         // the time directories, at OpenFOAM's write times (inter_writer_cpp.cuh)
         cpu::interFoam::InterWriter writer(caseDir, startDir, patches, phase1);
