@@ -333,7 +333,7 @@ scalar deviceInterPressureStep(
         if (in.correctedLaplacian)
         {
             DeviceBuffer<scalar> bval, gx, gy, gz;
-            hooks.boundaryValues(bval);
+            hooks.boundaryValues(p_rgh, bval);
             // THE CASE'S OWN gradSchemes ENTRY, through deviceGradOf. A leastSquares fit takes the pair
             // INSIDE it (deviceLeastSquaresGrad's `cyc` argument, leastSquaresVectors.C:131-140) where the
             // Gauss path adds the pair's faces AFTERWARDS -- so the two are wired differently below, and a

@@ -30,6 +30,22 @@ public:
         for (auto& b : boundary)
             b->evaluate(internal);
     }
+    // ...and the same for the patches a caller picks (`keep(patchIndex)`): one that holds some patches' entries
+    // elsewhere evaluates the others only. The device loop keeps an `empty` patch's on the GPU, mirrored from its
+    // cells -- on a 2-D mesh they are two faces a cell, and evaluating them here is a pass over the mesh.
+    template <typename Keep>
+    void evaluateBoundaryWhere(Keep keep)
+    {
+        for (std::size_t pi = 0; pi < boundary.size(); ++pi)
+        {
+            if (keep(pi)) boundary[pi]->initEvaluate(internal);
+        }
+        Pstream::waitAll();
+        for (std::size_t pi = 0; pi < boundary.size(); ++pi)
+        {
+            if (keep(pi)) boundary[pi]->evaluate(internal);
+        }
+    }
 };
 
 // Build a GeometricField from parsed file data + the mesh patches (matched by name).

@@ -83,7 +83,10 @@ struct DeviceInterPressureHooks
     // p_rgh's STORED patch values, flattened in boundary-face order, as they stand after pressureCoeffs
     // -- what the host's gradOf(p_rgh) reads for the corrected laplacian's non-orthogonal correction
     // (inter_peqn_cpp.cu). Required when DeviceInterPressureInput::correctedLaplacian is set.
-    std::function<void(DeviceBuffer<scalar>& bval)> boundaryValues;
+    // `p_rgh` is the device field as it stands: an `empty` patch's entries are its cells' values, which the
+    // hook can take from it there rather than from a host copy.
+    std::function<void(const DeviceBuffer<scalar>& p_rgh,
+                       DeviceBuffer<scalar>&       bval)> boundaryValues;
 
     // adjustPhi(phiHbyA, U, p_rgh), pEqn.H:24, on a case whose p_rgh needs a reference: scales the
     // adjustable OUTFLOW of phiHbyABnd in place, or throws where OpenFOAM stops (adjustPhi.C:108-119).

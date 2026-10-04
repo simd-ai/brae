@@ -130,6 +130,41 @@ void mirrorEmptyFacesKernel(
     oz[b] = uz[c];
 }
 
+// ...and a SCALAR's (p_rgh's stored patch values, for the corrected laplacian's gradient)
+__global__
+void mirrorEmptyScalarKernel(
+    int nB,
+    const label* __restrict__ bndIsEmpty,
+    const label* __restrict__ bndCell,
+    const scalar* __restrict__ v,
+    scalar* __restrict__ o,
+    int mirror)
+{
+    const int b = blockIdx.x*blockDim.x + threadIdx.x;
+    if (b >= nB) return;
+    if (!bndIsEmpty[b]) return;
+    // `mirror` 0 is a gate's CONTROL: the entry is zeroed, not taken from the cell
+    o[b] = mirror ? v[bndCell[b]] : scalar(0);
+}
+
+// THE LAPLACIAN'S PATCH COEFFICIENTS ON AN `empty` PATCH, which has none: the two zeros the host's own products
+// give there -- gamma*magSf times a zero gradient coefficient, and (-gamma*magSf) times one, which is MINUS zero.
+// `wrong` non-zero is a gate's CONTROL and writes it in their place.
+__global__
+void emptyPressureCoeffsKernel(
+    int nB,
+    const label* __restrict__ bndIsEmpty,
+    scalar* __restrict__ iC,
+    scalar* __restrict__ bC,
+    scalar wrong)
+{
+    const int b = blockIdx.x*blockDim.x + threadIdx.x;
+    if (b >= nB) return;
+    if (!bndIsEmpty[b]) return;
+    iC[b] = (wrong != scalar(0)) ? wrong : scalar(0);
+    bC[b] = (wrong != scalar(0)) ? wrong : -scalar(0);
+}
+
 // calculateNHatBoundary's first half on the device: each boundary cell's sum over its internal faces of
 // Sf*interpolate(alpha), added on the owner side and subtracted on the neighbour's, in ascending face order --
 // the host loop's terms and order (interface_properties_cpp.cu), so the host's second half
@@ -2178,12 +2213,19 @@ RunReport runInterFoamDevice(
         }
         else snP.resize(0);
     };
+    // the pressure hooks' switches (the comment in pressureCoeffs says what each does)
+    static const bool pEmptyFromHost = std::getenv("BRAE_CONTROL_PRESSURE_EMPTY_FROM_HOST") != nullptr;
+    static const bool pEmptyCheck = std::getenv("BRAE_CONTROL_PRESSURE_EMPTY_CHECK") != nullptr;
+    static const bool pEmptyCoeffsWrong = std::getenv("BRAE_CONTROL_PRESSURE_EMPTY_COEFFS_WRONG") != nullptr;
+    static const bool pEmptyNoMirror = std::getenv("BRAE_CONTROL_PRESSURE_EMPTY_NO_MIRROR") != nullptr;
     H.pressure.pressureCoeffs =
         [&](const DeviceBuffer<scalar>&, const DeviceBuffer<scalar>& phiHB,
             const DeviceBuffer<scalar>& rAUfAll, const DeviceBuffer<scalar>& rAUCell,
             DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC, DeviceBuffer<scalar>& cycJump)
     {
         interPhase::Nested timed("hook pressure.pressureCoeffs");
+        std::optional<interPhase::Nested> hookPart;
+        hookPart.emplace("p hook: the pair's flux, phiHbyA and rAUf of the boundary down");
         // THE PAIR'S FLUX, as it stands at THIS assembly. porousBafflePressure's jump is built from it
         // below and the host pEqn takes it from the phi the LAST CORRECTOR wrote, so it is refreshed
         // here rather than left to the step's own pushFlux, which runs once per corrector and not once
@@ -2207,21 +2249,73 @@ RunReport runInterFoamDevice(
         // ONLY THE BOUNDARY'S rAUf comes down -- the hook reads no internal face -- and rAU's cells only where a
         // coupled patch interpolates them. MEASURED on RAS/DTCHull (845,536 cells, 69,887 boundary faces): the
         // whole of both, and the whole-mesh fvm::laplacian below it, made this hook 34 ms a step.
-        std::vector<scalar> hB, rA, rAUc;
-        phiHB.copyTo(hB);
+        // ...AND NOT AN `empty` PATCH'S FACES. A 2-D mesh's two empty patches are a face a cell each: on
+        // waveMakerPiston at 896,000 cells 1,792,000 of the 1,796,320 boundary faces. This hook, the stored
+        // values below it and the patches' evaluation walked them all on the host at every assembly -- 41 ms a
+        // step in the three -- to produce zeros and copies of cell values. Their entries are written on the GPU
+        // (emptyPressureCoeffsKernel, mirrorEmptyScalarKernel) and the host handles the other patches' faces,
+        // patch by patch.
+        //   BRAE_CONTROL_PRESSURE_EMPTY_FROM_HOST=1    every face on the host, as before
+        //   BRAE_CONTROL_PRESSURE_EMPTY_CHECK=1        the host builds every face's entry as well and compares
+        //   BRAE_CONTROL_PRESSURE_EMPTY_COEFFS_WRONG=1 a gate's CONTROL: the empty faces' coefficients are 1
+        //   BRAE_CONTROL_PRESSURE_EMPTY_NO_MIRROR=1    a gate's CONTROL: the empty faces' values are zeroed
+        const std::size_t nBnd = rAUfAll.size() - static_cast<std::size_t>(nIf);
+        if (!pEmptyFromHost)
         {
-            const std::size_t nBnd = rAUfAll.size() - static_cast<std::size_t>(nIf);
-            rA.resize(nBnd);
-            cudaCheck(cudaMemcpy(rA.data(), rAUfAll.data() + nIf, nBnd*sizeof(scalar), cudaMemcpyDeviceToHost),
-                      "pressureCoeffs rAUf boundary");
+            static bool said = false;
+            if (!said)
+            {
+                said = true;
+                std::size_t nAllFaces = 0;
+                std::size_t nHost = 0;
+                for (const DeviceBoundaryRange& r : deviceNonEmptyBoundaryRanges(fvp, nAllFaces))
+                {
+                    nHost += r.n;
+                }
+                std::printf("  p_rgh boundary: an empty patch's entries are written on the GPU (%zu of %zu boundary "
+                            "faces are the host's); BRAE_CONTROL_PRESSURE_EMPTY_FROM_HOST=1 builds and uploads "
+                            "them all\n", nHost, nAllFaces);
+            }
+        }
+        // a patch's own run of the device's boundary arrays, for the patches the host handles
+        const auto hostsPatch = [&](std::size_t pi)
+        {
+            return !isCoupledInterfaceType(fvp[pi].type) && fvp[pi].size > 0
+                && (pEmptyFromHost || fvp[pi].type != "empty");
+        };
+        std::vector<std::vector<scalar>> hBp(fvp.size()), rAp(fvp.size());
+        std::vector<scalar> rAUc;
+        {
+            std::size_t at = 0;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+                if (hostsPatch(pi))
+                {
+                    hBp[pi].resize(n);
+                    rAp[pi].resize(n);
+                    cudaCheck(cudaMemcpy(hBp[pi].data(), phiHB.data() + at, n*sizeof(scalar),
+                                         cudaMemcpyDeviceToHost), "pressureCoeffs phiHbyA of a patch");
+                    cudaCheck(cudaMemcpy(rAp[pi].data(), rAUfAll.data() + nIf + at, n*sizeof(scalar),
+                                         cudaMemcpyDeviceToHost), "pressureCoeffs rAUf of a patch");
+                }
+                at += n;
+            }
+            if (at != nBnd)
+            {
+                throw std::runtime_error("brae interFoam (device): pressureCoeffs: the patches hold "
+                                         + std::to_string(at) + " boundary faces and rAUf's array "
+                                         + std::to_string(nBnd) + ".");
+            }
         }
         if (!cyclics.empty())
         {
             rAUCell.copyTo(rAUc);
         }
+        hookPart.emplace("p hook: constrainPressure (the prescribed gradients)");
         // constrainPressure: a fixedFluxPressure gradient is PRESCRIBED from phiHbyA, and brae refuses
         // to assemble one that has not been set. rAUf is taken PER FACE from the full array.
-        label off = 0;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
             const FvPatch& q = fvp[pi];
@@ -2230,6 +2324,14 @@ RunReport runInterFoamDevice(
             if (isCoupledInterfaceType(q.type)) continue;
             if (f.p_rgh.boundary[pi]->updateableSnGrad())
             {
+                if (!hostsPatch(pi) && q.size > 0)
+                {
+                    throw std::runtime_error(
+                        "brae interFoam (device): p_rgh patch `" + q.name + "` prescribes its gradient and is "
+                        "an `empty` patch, whose faces the host does not hold here.");
+                }
+                const std::vector<scalar>& hB = hBp[pi];
+                const std::vector<scalar>& rA = rAp[pi];
                 // (phiHbyA_b - (Sf_b & U_b))/(magSf_b*rAUf_b): the VELOCITY's flux, not the stored
                 // phi_b -- see pressureCorrector, and tests/interfoam_waves_vs_openfoam.sh for what
                 // the difference is worth on a patch whose U_b changes. f.U's patch values are current:
@@ -2239,7 +2341,7 @@ RunReport runInterFoamDevice(
                 for (label i = 0; i < q.size; ++i)
                 {
                     const scalar SfU = dot(g.Sf()[q.start + i], ub[i]);
-                    sn[i] = (hB[off + i] - SfU) / (q.magSf[i] * rA[off + i]);
+                    sn[i] = (hB[static_cast<std::size_t>(i)] - SfU) / (q.magSf[i] * rA[static_cast<std::size_t>(i)]);
                 }
                 // prghPermeableAlphaTotalPressure rebuilds its refValue and valueFraction INSIDE
                 // updateSnGrad, from rho, phi and U on the patch and gh at the face centres
@@ -2260,29 +2362,24 @@ RunReport runInterFoamDevice(
                 }
                 f.p_rgh.boundary[pi]->updateSnGrad(sn);
             }
-            off += q.size;
         }
+        hookPart.emplace("p hook: rAUf a patch, totalPressure and the baffle's jump");
         // rAUf on the patches: the device's array on an uncoupled one, fvc::interpolate(rAU) -- the two cells'
         // rAU on the pair's own weights -- on a coupled one, which the device's array does not carry
         std::vector<std::vector<scalar>> rfB(fvp.size());
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            label o = 0;
-            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            const FvPatch& q = fvp[pi];
+            if (isCoupledInterfaceType(q.type))
             {
-                const FvPatch& q = fvp[pi];
-                if (isCoupledInterfaceType(q.type))
-                {
-                    for (label i = 0; i < q.size; ++i)
-                    {
-                        rfB[pi].push_back(coupledLinear(q, i, rAUc));
-                    }
-                    continue;
-                }
                 for (label i = 0; i < q.size; ++i)
                 {
-                    rfB[pi].push_back(rA[static_cast<std::size_t>(o++)]);
+                    rfB[pi].push_back(coupledLinear(q, i, rAUc));
                 }
+                continue;
             }
+            // the device's own array's run for this patch; nothing for a patch the host does not handle
+            rfB[pi] = std::move(rAp[pi]);
         }
         // totalPressure's updateCoeffs, where the fvMatrix constructor runs it. f.U's patch values and
         // f.phi's are current (updateUBoundary ran after the last corrector and pushed the flux); a
@@ -2315,22 +2412,97 @@ RunReport runInterFoamDevice(
         // fvm::laplacian's PATCH coefficients alone (fvm.cuh, the uncoupled branch): gamma*magSf times the
         // patch field's gradient coefficients. The pair's are the interface's, and nothing here reads the
         // internal faces, so the whole-mesh assembly this was is not built.
-        std::vector<scalar> i2, b2;
-        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        hookPart.emplace("p hook: the laplacian's patch coefficients (host)");
+        // ...a patch at a time, each to its own run of the device arrays; the empty patches' runs by the kernel
+        iC.resize(nBnd);
+        bC.resize(nBnd);
+        if (static_cast<std::size_t>(dm.nBndFaces) != nBnd)
         {
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;   // the pair's are the interface's
-            const std::vector<scalar> gIC = f.p_rgh.boundary[pi]->gradientInternalCoeffs();
-            const std::vector<scalar> gBC = f.p_rgh.boundary[pi]->gradientBoundaryCoeffs();
-            for (label i = 0; i < fvp[pi].size; ++i)
+            throw std::runtime_error("brae interFoam (device): pressureCoeffs: the device mesh has "
+                                     + std::to_string(dm.nBndFaces) + " boundary faces and rAUf's array "
+                                     + std::to_string(nBnd) + ".");
+        }
+        if (!pEmptyFromHost && nBnd > 0)
+        {
+            const int nB = dm.nBndFaces;
+            emptyPressureCoeffsKernel<<<(nB + 255)/256, 256, 0, cudaStreamPerThread>>>(
+                nB,
+                dm.bndIsEmpty.data(),
+                iC.data(),
+                bC.data(),
+                pEmptyCoeffsWrong ? scalar(1) : scalar(0));
+            cudaCheck(cudaGetLastError(), "emptyPressureCoeffsKernel");
+            cudaCheck(cudaStreamSynchronize(cudaStreamPerThread), "emptyPressureCoeffsKernel sync");
+        }
+        {
+            std::vector<scalar> i2, b2;
+            std::size_t at = 0;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                const scalar pGamma = rfB[pi][static_cast<std::size_t>(i)]
-                                    * g.magSf()[static_cast<std::size_t>(fvp[pi].start + i)];
-                i2.push_back(pGamma * gIC[static_cast<std::size_t>(i)]);
-                b2.push_back((-pGamma) * gBC[static_cast<std::size_t>(i)]);
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;   // the pair's are the interface's
+                const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+                if (hostsPatch(pi))
+                {
+                    const std::vector<scalar> gIC = f.p_rgh.boundary[pi]->gradientInternalCoeffs();
+                    const std::vector<scalar> gBC = f.p_rgh.boundary[pi]->gradientBoundaryCoeffs();
+                    i2.resize(n);
+                    b2.resize(n);
+                    for (std::size_t i = 0; i < n; ++i)
+                    {
+                        const scalar pGamma = rfB[pi][i]
+                                            * g.magSf()[static_cast<std::size_t>(fvp[pi].start) + i];
+                        i2[i] = pGamma * gIC[i];
+                        b2[i] = (-pGamma) * gBC[i];
+                    }
+                    hookPart.emplace("p hook: the coefficients and the jump up");
+                    cudaCheck(cudaMemcpy(iC.data() + at, i2.data(), n*sizeof(scalar), cudaMemcpyHostToDevice),
+                              "pressureCoeffs internal coefficients of a patch");
+                    cudaCheck(cudaMemcpy(bC.data() + at, b2.data(), n*sizeof(scalar), cudaMemcpyHostToDevice),
+                              "pressureCoeffs boundary coefficients of a patch");
+                    hookPart.emplace("p hook: the laplacian's patch coefficients (host)");
+                }
+                at += n;
             }
         }
-        iC.copyFrom(i2);
-        bC.copyFrom(b2);
+        if (pEmptyCheck && !pEmptyFromHost)
+        {
+            // every face's entry as the host builds it -- an empty patch's too -- against the device's arrays
+            std::vector<scalar> rAll(nBnd);
+            cudaCheck(cudaMemcpy(rAll.data(), rAUfAll.data() + nIf, nBnd*sizeof(scalar), cudaMemcpyDeviceToHost),
+                      "pressureCoeffs check rAUf");
+            std::vector<scalar> wantI, wantB, haveI, haveB;
+            std::size_t at = 0;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                const std::vector<scalar> gIC = f.p_rgh.boundary[pi]->gradientInternalCoeffs();
+                const std::vector<scalar> gBC = f.p_rgh.boundary[pi]->gradientBoundaryCoeffs();
+                for (label i = 0; i < fvp[pi].size; ++i)
+                {
+                    const scalar pGamma = rAll[at + static_cast<std::size_t>(i)]
+                                        * g.magSf()[static_cast<std::size_t>(fvp[pi].start + i)];
+                    wantI.push_back(pGamma * gIC[static_cast<std::size_t>(i)]);
+                    wantB.push_back((-pGamma) * gBC[static_cast<std::size_t>(i)]);
+                }
+                at += static_cast<std::size_t>(fvp[pi].size);
+            }
+            iC.copyTo(haveI);
+            bC.copyTo(haveB);
+            for (std::size_t b = 0; b < nBnd; ++b)
+            {
+                if (std::memcmp(&wantI[b], &haveI[b], sizeof(scalar)) != 0
+                 || std::memcmp(&wantB[b], &haveB[b], sizeof(scalar)) != 0)
+                {
+                    char buf[320];
+                    std::snprintf(buf, sizeof(buf),
+                                  "brae interFoam (device): BRAE_CONTROL_PRESSURE_EMPTY_CHECK: boundary face %zu's "
+                                  "laplacian coefficients are (%.17g, %.17g) on the device and (%.17g, %.17g) as "
+                                  "the host builds them.", b, haveI[b], haveB[b], wantI[b], wantB[b]);
+                    throw std::runtime_error(buf);
+                }
+            }
+        }
+        hookPart.emplace("p hook: the coefficients and the jump up");
 
         // p_rgh's JUMP on the pair, as the updates above have just left it. porousBafflePressure
         // recomputes it in updateCoeffs from THIS assembly's flux and viscosity, so it is taken here
@@ -2363,17 +2535,84 @@ RunReport runInterFoamDevice(
     };
     // p_rgh's stored patch values, for the corrected laplacian's grad(p_rgh): what the host's
     // gradOf(p_rgh) reads, after pressureCoeffs has run the patches' updates
-    H.pressure.boundaryValues = [&](DeviceBuffer<scalar>& bval)
+    H.pressure.boundaryValues = [&](const DeviceBuffer<scalar>& pr, DeviceBuffer<scalar>& bval)
     {
         interPhase::Nested timed("hook pressure.boundaryValues");
-        std::vector<scalar> flat;
+        if (pEmptyFromHost)
+        {
+            std::vector<scalar> flat;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                const std::vector<scalar>& v = f.p_rgh.boundary[pi]->value();
+                flat.insert(flat.end(), v.begin(), v.end());
+            }
+            bval.copyFrom(flat);
+            return;
+        }
+        // an empty patch's entries are its cells' values (EmptyPatchField::evaluate): taken from the device's
+        // own p_rgh; every other patch's stored values go up to their run
+        const int nB = dm.nBndFaces;
+        bval.resize(static_cast<std::size_t>(nB));
+        if (nB > 0)
+        {
+            mirrorEmptyScalarKernel<<<(nB + 255)/256, 256, 0, cudaStreamPerThread>>>(
+                nB,
+                dm.bndIsEmpty.data(),
+                dm.bndCell.data(),
+                pr.data(),
+                bval.data(),
+                pEmptyNoMirror ? 0 : 1);
+            cudaCheck(cudaGetLastError(), "mirrorEmptyScalarKernel");
+            cudaCheck(cudaStreamSynchronize(cudaStreamPerThread), "mirrorEmptyScalarKernel sync");
+        }
+        std::size_t at = 0;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
             if (isCoupledInterfaceType(fvp[pi].type)) continue;
-            const std::vector<scalar>& v = f.p_rgh.boundary[pi]->value();
-            flat.insert(flat.end(), v.begin(), v.end());
+            const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+            if (n > 0 && fvp[pi].type != "empty")
+            {
+                const std::vector<scalar>& v = f.p_rgh.boundary[pi]->value();
+                cudaCheck(cudaMemcpy(bval.data() + at, v.data(), n*sizeof(scalar), cudaMemcpyHostToDevice),
+                          "boundaryValues of a patch");
+            }
+            at += n;
         }
-        bval.copyFrom(flat);
+        if (pEmptyCheck)
+        {
+            // the oracle: every patch's values as the host holds them, an empty patch's as
+            // EmptyPatchField::evaluate gives them from the p_rgh the kernel was handed
+            std::vector<scalar> cells, have, want;
+            pr.copyTo(cells);
+            bval.copyTo(have);
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (fvp[pi].type == "empty")
+                {
+                    for (label i = 0; i < fvp[pi].size; ++i)
+                    {
+                        want.push_back(cells[static_cast<std::size_t>(fvp[pi].faceCells[i])]);
+                    }
+                    continue;
+                }
+                const std::vector<scalar>& v = f.p_rgh.boundary[pi]->value();
+                want.insert(want.end(), v.begin(), v.end());
+            }
+            for (std::size_t b = 0; b < want.size(); ++b)
+            {
+                if (b >= have.size() || std::memcmp(&want[b], &have[b], sizeof(scalar)) != 0)
+                {
+                    char buf[320];
+                    std::snprintf(buf, sizeof(buf),
+                                  "brae interFoam (device): BRAE_CONTROL_PRESSURE_EMPTY_CHECK: boundary face %zu's "
+                                  "stored p_rgh is %.17g on the device and %.17g as the host holds it.",
+                                  b, b < have.size() ? have[b] : 0.0, want[b]);
+                    throw std::runtime_error(buf);
+                }
+            }
+        }
     };
     // adjustPhi(phiHbyA, U, p_rgh) through the host's own function, on the boundary flux the device
     // step hands over: U's patch TYPES decide which faces are adjustable (adjustPhi reads no U values),
@@ -2390,8 +2629,24 @@ RunReport runInterFoamDevice(
     H.pressure.updateBoundary = [&](const DeviceBuffer<scalar>& pr)
     {
         interPhase::Nested timed("hook pressure.updateBoundary");
+        std::optional<interPhase::Nested> hookPart;
+        hookPart.emplace("p hook: p_rgh down to the host field");
         pr.copyTo(f.p_rgh.internal);
-        f.p_rgh.evaluateBoundary();
+        hookPart.emplace("p hook: p_rgh's patches evaluated (host)");
+        if (pEmptyFromHost)
+        {
+            f.p_rgh.evaluateBoundary();
+        }
+        else
+        {
+            // an empty patch's stored values are its cells' -- the device takes them from the cells where it
+            // reads them (boundaryValues above), and nothing on the host reads them between two writes
+            f.p_rgh.evaluateBoundaryWhere(
+                [&](std::size_t pi)
+                {
+                    return fvp[pi].type != "empty";
+                });
+        }
     };
 
     // THE MESH'S PERIODIC PAIR on the device. The caller attaches the coupling before it hands the

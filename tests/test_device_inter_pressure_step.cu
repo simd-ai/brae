@@ -301,7 +301,7 @@ void runFixture(
         pr.copyTo(prghForCoeffs->internal);
         prghForCoeffs->evaluateBoundary();
     };
-    hooks.boundaryValues = [&](DeviceBuffer<scalar>& bval)
+    hooks.boundaryValues = [&](const DeviceBuffer<scalar>&, DeviceBuffer<scalar>& bval)
     {
         std::vector<scalar> flat;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
