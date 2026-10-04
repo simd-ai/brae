@@ -1455,6 +1455,62 @@ RunReport runInterFoamDevice(
     // other arm; BRAE_CONTROL_U_EMPTY_NO_MIRROR=1 skips the kernel -- its control.
     const bool uEmptyFromHost = std::getenv("BRAE_CONTROL_U_EMPTY_FROM_HOST") != nullptr;
     const bool uEmptyNoMirror = std::getenv("BRAE_CONTROL_U_EMPTY_NO_MIRROR") != nullptr;
+    // where the patches that are not empty sit in the boundary's numbering, and whether the empty faces stay on
+    // the device: when there are any and the boundary is in the device mesh's numbering. One reading, for the
+    // hook and for whoever builds the boundary whole outside it.
+    struct UBoundaryPlan
+    {
+        std::vector<DeviceBoundaryRange> ranges;
+        std::size_t nBndAll = 0;
+        std::size_t nHostFaces = 0;
+        bool emptyOnDevice = false;
+    };
+    auto uBoundaryPlan = [&]()
+    {
+        UBoundaryPlan plan;
+        plan.ranges = deviceNonEmptyBoundaryRanges(fvp, plan.nBndAll);
+        for (const DeviceBoundaryRange& r : plan.ranges)
+        {
+            plan.nHostFaces += r.n;
+        }
+        plan.emptyOnDevice = !uEmptyFromHost && plan.nHostFaces < plan.nBndAll
+                          && plan.nBndAll == static_cast<std::size_t>(dm.nBndFaces);
+        return plan;
+    };
+    // A WHOLE BUILD MADE OUTSIDE THE HOOK IS THE HOOK'S. After a mesh move (and after a refinement) this loop
+    // builds U's device boundary whole from the new geometry -- and the momentum hook, at its first call after
+    // it, found its key changed and built the same boundary whole again, from the same geometry and the same
+    // patches. The first build is now recorded as the hook's (its key, the geometry count, the addressing), and
+    // the hook refreshes the state on it, which is all that can have moved in between. MEASURED on
+    // waveMakerPiston refined to 896,000 cells: each whole build 44 ms, two a step.
+    // BRAE_CONTROL_U_BOUNDARY_REBUILT_IN_HOOK=1 leaves the build unrecorded, as before -- the identity gate's
+    // other arm.
+    const bool uRebuiltInHook = std::getenv("BRAE_CONTROL_U_BOUNDARY_REBUILT_IN_HOOK") != nullptr;
+    // BRAE_CONTROL_U_BOUNDARY_OLD_GEOMETRY=1 is the gate's CONTROL, deliberately wrong: after a mesh move the
+    // boundary is NOT built again and is recorded as if it had been, so the hook keeps the old mesh's patch
+    // deltas, areas and normals -- what would happen if the record were ever made for a boundary that is not
+    // the moved mesh's.
+    const bool uOldGeometry = std::getenv("BRAE_CONTROL_U_BOUNDARY_OLD_GEOMETRY") != nullptr;
+    if (uOldGeometry)
+    {
+        std::printf("  *** CONTROL MODE: U's device boundary keeps the geometry it had before each mesh move. "
+                    "This run is deliberately wrong. ***\n");
+    }
+    auto recordUBoundaryBuilt = [&](DeviceVectorBoundary& db)
+    {
+        if (uRebuiltInHook) return;
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            std::printf("  U boundary: the one built whole after a mesh change is the momentum hook's too; "
+                        "BRAE_CONTROL_U_BOUNDARY_REBUILT_IN_HOOK=1 builds it again there\n");
+        }
+        uBoundaryBuiltIn = &db;
+        uBoundaryBuiltShape = deviceVectorBoundaryShape(f.U, fvp, g, uBoundaryPlan().emptyOnDevice);
+        uBoundaryBuiltEpoch = meshGeometryEpoch;
+        uBoundaryBuiltAddressing = dm.addressingId;
+    };
     // BRAE_CONTROL_U_EMPTY_CHECK=1: at every call the host builds every face's state and values as it used to,
     // and one bit's difference from what the device now holds stops the run and names the entry -- the gate's
     // oracle. The WRITTEN FILES cannot be it: the kernels multiply an empty face's entries by zero, so a run
@@ -1597,15 +1653,11 @@ RunReport runInterFoamDevice(
         part.emplace("U hook: the device boundary's key");
         // where the patches that are not empty sit in the boundary's numbering; the empty faces stay on the
         // device when there are any and the boundary is in the device mesh's numbering
-        std::size_t nBndAll = 0;
-        const std::vector<DeviceBoundaryRange> ranges = deviceNonEmptyBoundaryRanges(fvp, nBndAll);
-        std::size_t nHostFaces = 0;
-        for (const DeviceBoundaryRange& r : ranges)
-        {
-            nHostFaces += r.n;
-        }
-        const bool emptyOnDevice = !uEmptyFromHost && nHostFaces < nBndAll
-                                && nBndAll == static_cast<std::size_t>(dm.nBndFaces);
+        const UBoundaryPlan plan = uBoundaryPlan();
+        const std::vector<DeviceBoundaryRange>& ranges = plan.ranges;
+        const std::size_t nBndAll = plan.nBndAll;
+        const std::size_t nHostFaces = plan.nHostFaces;
+        const bool emptyOnDevice = plan.emptyOnDevice;
         if (emptyOnDevice)
         {
             static bool said = false;
@@ -3478,7 +3530,11 @@ RunReport runInterFoamDevice(
                 // the patch geometry moved with the cells, and dbU carries the patch deltas and
                 // normals every boundary evaluation reads
                 refreshPart.emplace("refresh: U's device boundary built");
-                dbU = buildDeviceVectorBoundary(f.U, fvp, g);
+                if (!uOldGeometry)
+                {
+                    dbU = buildDeviceVectorBoundary(f.U, fvp, g);
+                }
+                recordUBoundaryBuilt(dbU);
                 refreshPart.emplace("refresh: the turbulence closure's distances");
                 // EVERY DISTANCE THE CLOSURE HOLDS WAS MEASURED ON THE OLD MESH. OpenFOAM's wallDist
                 // and nearWallDist are MeshObjects that fvMesh::movePoints updates; this loop ran
@@ -3981,6 +4037,7 @@ RunReport runInterFoamDevice(
                     dUFixes.copyFrom(uFixes);
                     dUNamesRhoPhi.copyFrom(uNamesRhoPhi);
                     dbU = buildDeviceVectorBoundary(f.U, fvp, g);
+                    recordUBoundaryBuilt(dbU);
                     if (uNamesRhoPhiAny) deviceUpdateInletOutlet(dbU, uSwitchFlux(dPhiB));
                     else                 deviceUpdateInletOutlet(dbU, dPhiB);
 
