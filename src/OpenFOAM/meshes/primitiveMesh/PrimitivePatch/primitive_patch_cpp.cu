@@ -1,4 +1,5 @@
 #include "primitive_patch_cpp.cuh"
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -7,19 +8,40 @@ namespace brae {
 
 CellFaces cellFaces(const PrimitiveMesh& m)
 {
-    const std::vector<std::vector<label>> cells = meshCells(m);
+    // meshCells' rows, built flat by compactMeshCells: this used to build the list of lists and flatten it,
+    // which a caller that asks after every topology change pays each time -- MEASURED on RAS/motorBike
+    // (39,182 cells at the end), 2026-10-05: about 5 ms a step for the GPU wave's copy against 0.6.
+    // BRAE_CONTROL_CELL_FACES_NESTED=1 builds through the list of lists, as before;
+    // BRAE_CONTROL_CELL_FACES_CHECK=1 builds both and compares them entry for entry.
+    static const bool nested = std::getenv("BRAE_CONTROL_CELL_FACES_NESTED") != nullptr;
+    static const bool check = std::getenv("BRAE_CONTROL_CELL_FACES_CHECK") != nullptr;
     CellFaces out;
-    out.start.resize(cells.size() + 1);
-    out.start[0] = 0;
+    if (!nested)
+    {
+        const CompactListList cells = compactMeshCells(m);
+        out.start = cells.offsets();
+        out.faces = cells.values();
+        if (out.start.empty()) out.start.assign(1, label(0));
+        if (!check) return out;
+    }
+    const std::vector<std::vector<label>> cells = meshCells(m);
+    CellFaces ref;
+    ref.start.resize(cells.size() + 1);
+    ref.start[0] = 0;
     for (std::size_t c = 0; c < cells.size(); ++c)
     {
-        out.start[c + 1] = out.start[c] + static_cast<label>(cells[c].size());
+        ref.start[c + 1] = ref.start[c] + static_cast<label>(cells[c].size());
     }
-    out.faces.reserve(static_cast<std::size_t>(out.start.back()));
+    ref.faces.reserve(static_cast<std::size_t>(ref.start.back()));
     for (const std::vector<label>& faces : cells)
     {
-        out.faces.insert(out.faces.end(), faces.begin(), faces.end());
+        ref.faces.insert(ref.faces.end(), faces.begin(), faces.end());
     }
+    if (nested) return ref;
+    if (ref.start != out.start || ref.faces != out.faces)
+        throw std::runtime_error(
+            "brae cellFaces: BRAE_CONTROL_CELL_FACES_CHECK: the flat build is not the list of lists flattened ("
+            + std::to_string(out.faces.size()) + " faces against " + std::to_string(ref.faces.size()) + ").");
     return out;
 }
 

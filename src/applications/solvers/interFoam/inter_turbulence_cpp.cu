@@ -1101,7 +1101,8 @@ void updateMeshInterTurbulence(
     const PrimitiveMesh&        m,
     const FvGeometry&           g,
     const std::vector<FvPatch>& patches,
-    label                       timeIndex)
+    label                       timeIndex,
+    const PatchWaveRunner*      waveRunner)
 {
     if (!t.on) return;
     // A TOPOLOGY CHANGE IS NOT A MOVE, and the difference is one line of OpenFOAM's. wallDist is a
@@ -1123,7 +1124,7 @@ void updateMeshInterTurbulence(
     // stales: the LES filter width is a function of the cell volume, and the cell wall distance is a
     // function of the geometry. What a change ALSO does -- resize them -- falls out of recomputing them
     // from the new mesh rather than mapping them.
-    moveInterTurbulence(t, m, g, patches, timeIndex);
+    moveInterTurbulence(t, m, g, patches, timeIndex, waveRunner);
 
     // THE NEAR-WALL DISTANCE the wall functions divide by needs NOTHING here, and that is worth stating
     // rather than leaving as an absence. OpenFOAM keeps it as turbulenceModel::y_, a nearWallDist (a

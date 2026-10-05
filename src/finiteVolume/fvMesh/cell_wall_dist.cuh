@@ -65,6 +65,8 @@ struct CellWallDistCache
     // per combined point: its combined faces in the order they were met, and its cells, sorted
     std::vector<std::vector<label>> pointFaces;
     std::vector<std::vector<label>> pointCells;
+    // pass 1's own lists: each wall face's candidates, itself and every wall face sharing a vertex
+    NearWallKept near;
 };
 
 inline std::vector<scalar> cellWallDist(
@@ -343,6 +345,10 @@ inline std::vector<scalar> cellWallDist(
     }
     const bool sameTopology = k.built && k.nPoints == static_cast<label>(pts.size()) && k.own == own
                            && k.nei == nei && k.faceOffsets == fo && k.wf == wfNow;
+    // the correction's three parts by name: after a topology change the first is paid again at every call
+    // (RAS/motorBike, 2026-10-05: 7.7 ms a step of correction, one call a step)
+    std::optional<interPhase::Nested> timedPart;
+    timedPart.emplace("wallDist correction: its topology (built when the mesh's is another)");
     if (!sameTopology)
     {
         k = CellWallDistCache();
@@ -411,19 +417,76 @@ inline std::vector<scalar> cellWallDist(
         { const label gf = wf[ci]; return pointToFaceDist(Cc, pts, fv, fo[gf], fo[gf + 1]); };
 
         // pass 1 -- cells with a face on the wall
-        for (std::size_t i = 0; i < wf.size(); ++i)
+        // WHAT A FACE'S CELL TAKES IS nearWallDist's NUMBER: the smallest distance from the cell's centre to the
+        // face itself and to every wall face sharing a vertex with it, over the combined patch. So the faces are
+        // measured by nearWallDistKept -- the candidate lists kept with the cache, the faces on the host's
+        // threads -- and written here in the combined order, where the last face of a cell still wins.
+        // MEASURED on RAS/motorBike, 2026-10-05 (a topology change a step): the loop below 4.6 ms a step.
+        //   BRAE_CONTROL_WALL_DIST_PASS1_SERIAL=1      the loop, as before
+        //   BRAE_CONTROL_WALL_DIST_PASS1_CHECK=1       every face's number compared with the loop's, bitwise
+        //   BRAE_CONTROL_WALL_DIST_PASS1_SELF_ONLY=1   a gate's CONTROL, deliberately wrong: no neighbour is measured
+        timedPart.emplace("wallDist correction: pass 1, the cells with a face on the wall");
+        static const bool pass1Serial = std::getenv("BRAE_CONTROL_WALL_DIST_PASS1_SERIAL") != nullptr;
+        static const bool pass1Check = std::getenv("BRAE_CONTROL_WALL_DIST_PASS1_CHECK") != nullptr;
+        static const bool pass1SelfOnly = std::getenv("BRAE_CONTROL_WALL_DIST_PASS1_SELF_ONLY") != nullptr;
+        const auto loopBest = [&](
+            std::size_t i)
         {
-            const label c = wfCell[i];
-            const vector& Cc = C[c];
-            scalar best = distTo(Cc, (label)i);              // getPointNeighbours "adds myself" first
+            const vector& Cc = C[wfCell[i]];
+            // getPointNeighbours "adds myself" first
+            scalar best = distTo(Cc, (label)i);
             for (label j = fo[wf[i]]; j < fo[wf[i] + 1]; ++j)
+            {
                 for (const label nb : k.pointFaces[k.pointSlot[fv[j]]])
+                {
                     if (nb != (label)i) best = std::fmin(best, distTo(Cc, nb));
-            y[c] = best;                                     // unconditional: last face wins, as OF does
-            claimed[c] = 1;
+                }
+            }
+            return best;
+        };
+        if (pass1Serial)
+        {
+            for (std::size_t i = 0; i < wf.size(); ++i)
+            {
+                // unconditional: last face wins, as OF does
+                y[wfCell[i]] = loopBest(i);
+                claimed[wfCell[i]] = 1;
+            }
+        }
+        else
+        {
+            const std::vector<std::vector<scalar>> yFace =
+                nearWallDistKept(m, g, patches, k.near, nearWallThreads(), pass1SelfOnly);
+            std::size_t i = 0;
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                if (patches[pi].type != "wall") continue;
+                for (label j = 0; j < patches[pi].size; ++j)
+                {
+                    const scalar best = yFace[pi][static_cast<std::size_t>(j)];
+                    if (pass1Check)
+                    {
+                        const scalar want = loopBest(i);
+                        if (std::memcmp(&best, &want, sizeof(scalar)) != 0)
+                        {
+                            char line[240];
+                            std::snprintf(line, sizeof(line),
+                                          "brae cellWallDist: BRAE_CONTROL_WALL_DIST_PASS1_CHECK: patch %s, face "
+                                          "%ld is %.17g and the loop gives %.17g.", patches[pi].name.c_str(),
+                                          (long)j, best, want);
+                            throw std::runtime_error(line);
+                        }
+                    }
+                    // the combined order: last face wins, as OF does
+                    y[wfCell[i]] = best;
+                    claimed[wfCell[i]] = 1;
+                    ++i;
+                }
+            }
         }
 
         // pass 2 -- cells with only a point on the wall; first meshPoint to reach one wins and locks it
+        timedPart.emplace("wallDist correction: pass 2, the cells with a point on the wall");
         for (std::size_t pi = 0; pi < k.meshPoints.size(); ++pi)
         {
             const std::vector<label>& faces = k.pointFaces[pi];

@@ -212,7 +212,10 @@ void interAfterMeshChange(
     // The motion's own block (interMeshUpdate) runs that, with the mesh flux, so here only the
     // topology-only rebuild runs: a CorrectPhi here as well would solve pcorr twice, the first time
     // without the mesh flux, and a curvature pass here would be one OpenFOAM does not take.
-    bool                      motionFollows);
+    bool                      motionFollows,
+    // the closure's wall-distance wave run elsewhere (updateMeshInterTurbulence): the device loop hands in its
+    // GPU wave; null runs the host's
+    const PatchWaveRunner*    waveRunner = nullptr);
 
 } // namespace interFoam
 } // namespace cpu

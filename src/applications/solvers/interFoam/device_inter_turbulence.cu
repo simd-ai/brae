@@ -81,6 +81,81 @@ void advanceDeviceTurbulenceOldTime(
 } // namespace
 
 
+// THE NEAR-WALL DISTANCE IS MEASURED ONCE for its two readers -- the wall faces' data and the faces' y -- by
+// the closure's full build and by its moving-mesh refresh alike. Each of the two measured it through
+// buildDeviceWallData and then AGAIN through nearWallDist, which rebuilds its neighbour lists at every call.
+// MEASURED: the refresh on RAS/mixerVesselAMI (894,950 cells) 56.5 + 52.0 ms a step, 8.6 with this; the build,
+// which a refining mesh runs after every change, on RAS/motorBike 6.3 + 5.6 ms a step (2026-10-05).
+// nearWallDistKept gives the same number on every face to the bit: the minimum of the same distances.
+// THE LISTS AND THE LAST MEASURE LIVE IN THE HOST CLOSURE'S CACHE (InterTurbulence::yCache.near), which the cell
+// wall distance's first pass measures through as well: where the host has just measured this wall (kOmegaSST,
+// after a move or a change), the build and the refresh are handed that measure and measure nothing.
+//   BRAE_CONTROL_CLOSURE_REFRESH_TWICE=1   the two nearWallDist calls, as before
+//   BRAE_CONTROL_NEAR_WALL_CHECK=1         the distance compared with nearWallDist's, face for face, bitwise
+//   BRAE_CONTROL_NEAR_WALL_SELF_ONLY=1     a gate's CONTROL, deliberately wrong: no neighbour is measured
+//   BRAE_NEAR_WALL_THREADS=n               the thread count (16 at most by default)
+namespace {
+
+struct NearWallSwitches
+{
+    bool twice = false;
+    bool check = false;
+    bool selfOnly = false;
+};
+
+const NearWallSwitches& nearWallSwitches()
+{
+    static const NearWallSwitches sw = []()
+    {
+        NearWallSwitches k;
+        k.twice = std::getenv("BRAE_CONTROL_CLOSURE_REFRESH_TWICE") != nullptr;
+        k.check = std::getenv("BRAE_CONTROL_NEAR_WALL_CHECK") != nullptr;
+        k.selfOnly = std::getenv("BRAE_CONTROL_NEAR_WALL_SELF_ONLY") != nullptr;
+        return k;
+    }();
+    return sw;
+}
+
+std::vector<std::vector<scalar>> nearWallOnce(
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    NearWallKept& kept)
+{
+    const NearWallSwitches& sw = nearWallSwitches();
+    std::vector<std::vector<scalar>> yW = nearWallDistKept(m, g, patches, kept, nearWallThreads(), sw.selfOnly);
+    if (!sw.check) return yW;
+    const std::vector<std::vector<scalar>> want = nearWallDist(m, g, patches);
+    for (std::size_t pi = 0; pi < want.size(); ++pi)
+    {
+        for (std::size_t i = 0; i < want[pi].size(); ++i)
+        {
+            if (std::memcmp(&want[pi][i], &yW[pi][i], sizeof(scalar)) == 0) continue;
+            char buf[240];
+            std::snprintf(buf, sizeof(buf),
+                          "brae interFoam: BRAE_CONTROL_NEAR_WALL_CHECK: patch %s, face %zu is %.17g and "
+                          "nearWallDist gives %.17g.", patches[pi].name.c_str(), i, yW[pi][i], want[pi][i]);
+            throw std::runtime_error(buf);
+        }
+    }
+    return yW;
+}
+
+// the wall patches' velocity off the host field, which is what buildDeviceWallData's U overload collects
+std::vector<std::vector<vector>> wallVelocityOf(
+    const GeometricField<vector>& U,
+    const std::vector<FvPatch>& patches)
+{
+    std::vector<std::vector<vector>> wallU(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (patches[pi].type == "wall") wallU[pi] = U.boundary[pi]->value();
+    }
+    return wallU;
+}
+
+}   // namespace
+
 DeviceInterTurbulence buildDeviceInterTurbulence(
     const cpu::interFoam::InterTurbulence& t,
     const GeometricField<vector>& U,
@@ -90,6 +165,10 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
 {
     DeviceInterTurbulence d;
     if (!t.on) return d;
+    // the build's parts by name: it is a once-a-run cost on a fixed mesh and a once-a-CHANGE one on a refining
+    // mesh, where the driver builds the closure again (14.3 ms a step on RAS/motorBike, 2026-10-05)
+    std::optional<interPhase::Nested> part;
+    part.emplace("closure build: the DILU level schedule");
     // PBiCG's preconditioner needs the mesh's level schedule, once (see DeviceInterTurbulence::dilu)
     // ...for EITHER closure. Keyed on kEpsilon alone, the SST branch below would have found no
     // schedule and refused a case it can run.
@@ -124,6 +203,7 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
                 "closure constrains wall patches only. The host path (no -device) runs it.");
     }
 
+    part.emplace("closure build: the fields, their boundaries and nut's masks up");
     d.k.copyFrom(t.k.internal);
     if (!les) d.epsilon.copyFrom(second.internal);
     d.nut.copyFrom(t.nut.internal);
@@ -197,9 +277,22 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
     // WHAT IS STILL REFUSED is a leastSquares grad(U) on a pair (deviceLeastSquaresGradU carries no
     // interface) and a non-upwind div scheme for k or epsilon, both by name, at the sites themselves.
 
-    d.wall = buildDeviceWallData(m, g, patches, U, wfPatch);
-
-    const std::vector<std::vector<scalar>> yW = nearWallDist(m, g, patches);
+    std::vector<std::vector<scalar>> yW;
+    if (nearWallSwitches().twice)
+    {
+        part.emplace("closure build: the wall faces' data (buildDeviceWallData)");
+        d.wall = buildDeviceWallData(m, g, patches, U, wfPatch);
+        part.emplace("closure build: nearWallDist (host)");
+        yW = nearWallDist(m, g, patches);
+    }
+    else
+    {
+        part.emplace("closure build: the near-wall distance, once (host threads)");
+        yW = nearWallOnce(m, g, patches, t.yCache.near);
+        part.emplace("closure build: the wall faces' data from it");
+        d.wall = buildDeviceWallData(m, g, patches, wallVelocityOf(U, patches), wfPatch, &yW);
+    }
+    part.emplace("closure build: the wall functions' face lists, the inlets and the rest");
     std::vector<label> mask;
     std::vector<label> kind;
     std::vector<label> wallFaceOfBnd;
@@ -470,30 +563,9 @@ void refreshDeviceInterTurbulenceGeometry(
 
     // The wall faces' y, deltaCoeffs and wall velocity. The wall velocity comes from the host U as it
     // stands, which is what the build took and what this driver's dbU is rebuilt from after a move.
-    // THE NEAR-WALL DISTANCE IS MEASURED ONCE A MOVE. buildDeviceWallData measures it itself and this routine
-    // then measured it AGAIN, both through nearWallDist, which rebuilds its neighbour lists at every call --
-    // MEASURED on RAS/mixerVesselAMI (894,950 cells), 56.5 and 52.0 ms a step of this refresh's 108.9. Now once,
-    // by nearWallDistKept (the lists kept in `d`, the distances on the host's threads), and handed to both:
-    // 8.6 ms, the same number on every face to the bit.
-    //   BRAE_CONTROL_CLOSURE_REFRESH_TWICE=1   the two nearWallDist calls, as before
-    //   BRAE_CONTROL_NEAR_WALL_CHECK=1         the distance compared with nearWallDist's, face for face, bitwise
-    //   BRAE_CONTROL_NEAR_WALL_SELF_ONLY=1     a gate's CONTROL, deliberately wrong: no neighbour is measured
-    //   BRAE_NEAR_WALL_THREADS=n               the thread count (16 at most by default)
-    static const bool twice = std::getenv("BRAE_CONTROL_CLOSURE_REFRESH_TWICE") != nullptr;
-    static const bool check = std::getenv("BRAE_CONTROL_NEAR_WALL_CHECK") != nullptr;
-    static const bool selfOnly = std::getenv("BRAE_CONTROL_NEAR_WALL_SELF_ONLY") != nullptr;
-    static const unsigned nThreads = []()
-    {
-        const char* e = std::getenv("BRAE_NEAR_WALL_THREADS");
-        const int asked = e ? std::atoi(e) : 0;
-        if (e && asked < 1)
-        {
-            throw std::runtime_error(std::string("brae interFoam: BRAE_NEAR_WALL_THREADS=") + e
-                                     + " is not a count of 1 or more.");
-        }
-        const unsigned have = std::max(1u, std::thread::hardware_concurrency());
-        return asked > 0 ? static_cast<unsigned>(asked) : std::min(have, 16u);
-    }();
+    // THE NEAR-WALL DISTANCE IS MEASURED ONCE A MOVE: see nearWallOnce, which the build shares. The lists are
+    // kept in `d` from one move to the next.
+    const bool twice = nearWallSwitches().twice;
     std::optional<interPhase::Nested> part;
     std::vector<std::vector<scalar>> yW;
     if (twice)
@@ -506,31 +578,9 @@ void refreshDeviceInterTurbulenceGeometry(
     else
     {
         part.emplace("closure refresh: the near-wall distance, once (kept lists, host threads)");
-        yW = nearWallDistKept(m, g, patches, d.nearWallKept, nThreads, selfOnly);
-        if (check)
-        {
-            const std::vector<std::vector<scalar>> want = nearWallDist(m, g, patches);
-            for (std::size_t pi = 0; pi < want.size(); ++pi)
-            {
-                for (std::size_t i = 0; i < want[pi].size(); ++i)
-                {
-                    if (std::memcmp(&want[pi][i], &yW[pi][i], sizeof(scalar)) == 0) continue;
-                    char buf[240];
-                    std::snprintf(buf, sizeof(buf),
-                                  "brae interFoam: BRAE_CONTROL_NEAR_WALL_CHECK: patch %s, face %zu is %.17g and "
-                                  "nearWallDist gives %.17g.", patches[pi].name.c_str(), i, yW[pi][i],
-                                  want[pi][i]);
-                    throw std::runtime_error(buf);
-                }
-            }
-        }
+        yW = nearWallOnce(m, g, patches, t.yCache.near);
         part.emplace("closure refresh: the wall faces' data from it");
-        std::vector<std::vector<vector>> wallU(patches.size());
-        for (std::size_t pi = 0; pi < patches.size(); ++pi)
-        {
-            if (patches[pi].type == "wall") wallU[pi] = U.boundary[pi]->value();
-        }
-        d.wall = buildDeviceWallData(m, g, patches, wallU, wfPatch, &yW);
+        d.wall = buildDeviceWallData(m, g, patches, wallVelocityOf(U, patches), wfPatch, &yW);
     }
     part.emplace("closure refresh: the faces' y flattened and up, the cell fields up");
     std::vector<scalar> yBnd;

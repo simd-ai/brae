@@ -231,7 +231,10 @@ struct InterTurbulence
     // to refuse anything but 1 there.
     std::vector<scalar> yCell;
     // the near-wall correction's topology, kept from one wall-distance update to the next (cell_wall_dist.cuh)
-    CellWallDistCache yCache;
+    // -- and, in its `near`, the wall faces' distance as measured last. MUTABLE because it is a memo and not
+    // state: the device closure's build and refresh take this struct const and read the same measure through it
+    // (nearWallOnce), which is what makes the two readers one measure.
+    mutable CellWallDistCache yCache;
     label wallDistUpdateInterval = 1;
     // wallDist::movePoints's OWN LATCH (wallDist.C:193-221), and it is NOT a bare modulo. The interval
     // SETS `requireUpdate_`; the recompute then CLEARS it. So a step whose index the interval does not
@@ -415,7 +418,9 @@ void updateMeshInterTurbulence(
     const PrimitiveMesh&        m,
     const FvGeometry&           g,
     const std::vector<FvPatch>& patches,
-    label                       timeIndex);
+    label                       timeIndex,
+    // the wall distance's wave run elsewhere, as moveInterTurbulence takes it; null runs the host's
+    const PatchWaveRunner*      waveRunner = nullptr);
 
 // The registry names OpenFOAM gives the closure's two CrankNicolson ddt0 fields: the OPERANDS' names,
 // so the model's and the density lineage's ("ddt0(rho,k)" / "ddt0(k)", "ddt0(rho,epsilon)" /

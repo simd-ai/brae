@@ -986,7 +986,8 @@ void interAfterMeshChange(
     const CorrectPhiControls& cpc,
     RunReport&                rep,
     label                     timeIndex,
-    bool                      motionFollows)
+    bool                      motionFollows,
+    const PatchWaveRunner*    waveRunner)
 {
     // the mesh's own sets, for the one selection mode that re-reads a file
     const std::string polyMeshDir = f.amr ? f.amr->polyMeshDir : std::string();
@@ -1143,7 +1144,7 @@ void interAfterMeshChange(
         }
         else
         {
-            updateMeshInterTurbulence(f.turbulence, m, g, patches, timeIndex);
+            updateMeshInterTurbulence(f.turbulence, m, g, patches, timeIndex, waveRunner);
         }
     }
 

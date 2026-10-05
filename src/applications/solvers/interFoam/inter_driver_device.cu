@@ -728,7 +728,7 @@ RunReport runInterFoamDevice(
                 {
                     said = true;
                     std::printf("  wall distance: the turbulence closure's wave runs on the GPU after each mesh "
-                                "move; BRAE_CONTROL_TURBULENCE_WAVE_HOST=1 runs the host wave\n");
+                                "move or change; BRAE_CONTROL_TURBULENCE_WAVE_HOST=1 runs the host wave\n");
                 }
                 if (turbWaveOwn != mesh.owner() || turbWaveNei != mesh.neighbour())
                 {
@@ -4799,8 +4799,13 @@ RunReport runInterFoamDevice(
                     // host loop, and the GAMG hierarchy un-built inside it.
                     // the GLOBAL time index, which the wall-distance schedule tests (wallDist.C:198)
                     stagePart.emplace("stage: interAfterMeshChange (host)");
+                    // ...with the closure's wall-distance wave on the GPU, as after a move: the runner
+                    // builds its copy of the addressing again where the owner or neighbour list is
+                    // another. MEASURED on RAS/motorBike, 2026-10-05: the host's wave 6.2 ms a step,
+                    // this 2.7 and 1.4 for the copy. BRAE_CONTROL_TURBULENCE_WAVE_HOST=1 runs the host's.
                     interAfterMeshChange(f, *mutableMesh, meshAgglomeration, meshCpc, rep,
-                                         f.amr->startTimeIndex + stepIndex, /*motionFollows=*/refineAndMove);
+                                         f.amr->startTimeIndex + stepIndex, /*motionFollows=*/refineAndMove,
+                                         turbWaveRunner ? &turbWaveRunner : nullptr);
 
                     // ---- the counts every array below is sized by
                     nC = m.nCells();
@@ -4833,10 +4838,11 @@ RunReport runInterFoamDevice(
 
                     // ---- the masks and the boundary geometry, per boundary FACE
                     // ...the porosity's cell list, which interAfterMeshChange has just RE-SELECTED
-                    stagePart.emplace("stage: porosity, MRF and the device closure rebuilt");
+                    stagePart.emplace("stage: porosity and MRF rebuilt");
                     buildPorosity();
                     // ...and the MRF zones, whose host face lists it has just REBUILT
                     buildMrf();
+                    stagePart.emplace("stage: the device closure rebuilt");
                     // ...and the TURBULENCE closure, which is a FULL rebuild rather than the moving-mesh
                     // refresh: refreshDeviceInterTurbulenceGeometry refuses a changed boundary-face count
                     // by name ("A move keeps the topology fixed; this is a topology change"), and every
