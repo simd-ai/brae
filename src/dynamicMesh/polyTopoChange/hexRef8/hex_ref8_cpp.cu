@@ -79,17 +79,17 @@ std::vector<label> faceVerts(
     return std::vector<label>(m.faceVerts().begin() + b, m.faceVerts().begin() + e);
 }
 
-}   // namespace
-
-
-label findMaxLevel(
-    const Levels&             lv,
-    const std::vector<label>& f)
+// findMaxLevel and countAnchors over a face's vertices WHERE THEY STAND (a pointer and a count): what the two
+// exported forms below run, and what faceLevel runs on the mesh's own vertex array
+label findMaxLevelIn(
+    const Levels& lv,
+    const label*  f,
+    std::size_t   n)
 {
     // :658-672. STRICTLY greater, so the FIRST vertex at the maximum wins.
     label maxLevel = std::numeric_limits<label>::min();
     label maxFp = -1;
-    for (std::size_t fp = 0; fp < f.size(); ++fp)
+    for (std::size_t fp = 0; fp < n; ++fp)
     {
         const label level = lv.pointLevel[static_cast<std::size_t>(f[fp])];
         if (level > maxLevel)
@@ -101,19 +101,38 @@ label findMaxLevel(
     return maxFp;
 }
 
+label countAnchorsIn(
+    const Levels& lv,
+    const label*  f,
+    std::size_t   n,
+    label         anchorLevel)
+{
+    // :678-694
+    label count = 0;
+    for (std::size_t fp = 0; fp < n; ++fp)
+    {
+        if (lv.pointLevel[static_cast<std::size_t>(f[fp])] <= anchorLevel) ++count;
+    }
+    return count;
+}
+
+}   // namespace
+
+
+label findMaxLevel(
+    const Levels&             lv,
+    const std::vector<label>& f)
+{
+    return findMaxLevelIn(lv, f.data(), f.size());
+}
+
 
 label countAnchors(
     const Levels&             lv,
     const std::vector<label>& f,
     label                     anchorLevel)
 {
-    // :678-694
-    label n = 0;
-    for (const label pointi : f)
-    {
-        if (lv.pointLevel[static_cast<std::size_t>(pointi)] <= anchorLevel) ++n;
-    }
-    return n;
+    return countAnchorsIn(lv, f.data(), f.size(), anchorLevel);
 }
 
 
@@ -122,15 +141,21 @@ label faceLevel(
     const Levels&   lv,
     label           facei)
 {
-    // :801-826
-    const std::vector<label> f = faceVerts(*v.m, facei);
-    if (f.size() <= 4)
+    // :801-826. THE FACE'S VERTICES ARE READ WHERE THEY STAND. setRefinement asks this of EVERY face of the mesh
+    // (faceAnchorLevel, :3526), and each call copied the face's vertices into a list of its own -- a heap
+    // block a face. MEASURED on damBreakWithObstacle (290,000 faces), 2026-10-05: setRefinement's points and
+    // cells 5.4 ms a refinement of a few hundred cells.
+    const PrimitiveMesh& m = *v.m;
+    const label b = m.faceOffsets()[facei];
+    const std::size_t n = static_cast<std::size_t>(m.faceOffsets()[facei + 1] - b);
+    const label* f = m.faceVerts().data() + b;
+    if (n <= 4)
     {
-        return lv.pointLevel[static_cast<std::size_t>(f[static_cast<std::size_t>(findMaxLevel(lv, f))])];
+        return lv.pointLevel[static_cast<std::size_t>(f[static_cast<std::size_t>(findMaxLevelIn(lv, f, n))])];
     }
-    const label ownLevel = lv.cellLevel[static_cast<std::size_t>(v.m->owner()[facei])];
-    if (countAnchors(lv, f, ownLevel) == 4) return ownLevel;
-    if (countAnchors(lv, f, ownLevel + 1) == 4) return ownLevel + 1;
+    const label ownLevel = lv.cellLevel[static_cast<std::size_t>(m.owner()[facei])];
+    if (countAnchorsIn(lv, f, n, ownLevel) == 4) return ownLevel;
+    if (countAnchorsIn(lv, f, n, ownLevel + 1) == 4) return ownLevel + 1;
     return -1;
 }
 

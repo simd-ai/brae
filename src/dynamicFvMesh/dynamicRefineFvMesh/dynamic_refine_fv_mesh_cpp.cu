@@ -1131,8 +1131,44 @@ label correctFluxes(
 }
 
 
+namespace
+{
+
+// the hull average's switches (see mapNewInternalFacesFlat)
+bool hullAverageCopies()
+{
+    static const bool on = std::getenv("BRAE_CONTROL_HULL_AVERAGE_COPIES") != nullptr;
+    return on;
+}
+
+bool hullAverageCheck()
+{
+    static const bool on = std::getenv("BRAE_CONTROL_HULL_AVERAGE_CHECK") != nullptr;
+    return on;
+}
+
+// the value a NON-INJECTED face of the mesh carries in a surface field: its own entry where it is internal,
+// its patch's where it is on a boundary -- and the zero OpenFOAM's flat array was built with on a patch whose
+// field holds nothing (FluxMeshView::patchHoldsNoValues)
 template <typename T>
-void mapNewInternalFacesFlat(
+T hullFaceValue(
+    const std::vector<T>&              sFld,
+    const std::vector<std::vector<T>>& sBnd,
+    const FluxMeshView&                m,
+    label                              f)
+{
+    if (f < m.nInternalFaces) return sFld[static_cast<std::size_t>(f)];
+    std::size_t patchi = 0;
+    std::size_t i = 0;
+    if (!locateBoundaryFace(m, f, patchi, i) || patchi >= sBnd.size()) return T{};
+    if (patchi < m.patchHoldsNoValues.size() && m.patchHoldsNoValues[patchi]) return T{};
+    return i < sBnd[patchi].size() ? sBnd[patchi][i] : T{};
+}
+
+// the flat array of every face's value, and the hull average read from it: Templates:42-97 as written, and
+// what mapNewInternalFacesFlat was until the faces were read where they stand
+template <typename T>
+void mapNewInternalFacesFlatCopied(
     std::vector<T>&                    sFld,
     const std::vector<std::vector<T>>& sBnd,
     const MapPolyMesh&                 mpm,
@@ -1186,6 +1222,79 @@ void mapNewInternalFacesFlat(
     }
 }
 
+template <typename T>
+bool sameBits(
+    const std::vector<T>& x,
+    const std::vector<T>& y)
+{
+    return x.size() == y.size() && (x.empty() || std::memcmp(x.data(), y.data(), x.size()*sizeof(T)) == 0);
+}
+
+}   // namespace
+
+
+// THE HULL AVERAGE WITH THE FACES READ WHERE THEY STAND. Templates:42-97 copies every face's value into one flat
+// array and averages from that; the loop writes INJECTED faces only and reads NON-injected ones only, so what
+// it reads from the field itself is what the flat copy held. A field of 290,000 faces was copied to give a few
+// hundred faces their average -- and on an unrefinement, which injects none, to give it to nobody.
+// MEASURED on damBreakWithObstacle, 2026-10-05, ms a call: the surface vectors and their average 3.2, the hull
+// average on the four fluxes 4.7 (refine) and 3.7 (unrefine).
+//   BRAE_CONTROL_HULL_AVERAGE_COPIES=1          the flat array, and the fluxes' two whole-field arrays, as before
+//   BRAE_CONTROL_HULL_AVERAGE_CHECK=1           both, and the field compared bit for bit
+//   BRAE_CONTROL_HULL_AVERAGE_NO_ROUND_TRIP=1   a gate's CONTROL, deliberately wrong: a flux that is not injected
+//                                               keeps its mapped value (see mapNewInternalFacesOriented)
+template <typename T>
+void mapNewInternalFacesFlat(
+    std::vector<T>&                    sFld,
+    const std::vector<std::vector<T>>& sBnd,
+    const MapPolyMesh&                 mpm,
+    const FluxMeshView&                m)
+{
+    if (hullAverageCopies())
+    {
+        mapNewInternalFacesFlatCopied(sFld, sBnd, mpm, m);
+        return;
+    }
+    std::vector<T> want;
+    if (hullAverageCheck())
+    {
+        want = sFld;
+        mapNewInternalFacesFlatCopied(want, sBnd, mpm, m);
+    }
+    // Templates:59-97 -- the hull of already-mapped faces, in the cell's OWN face order
+    for (label facei = 0; facei < m.nInternalFaces; ++facei)
+    {
+        if (mpm.faceMap[static_cast<std::size_t>(facei)] != -1) continue;
+        T tmpValue{};
+        label counter = 0;
+        for (const label side : {m.owner[static_cast<std::size_t>(facei)],
+                                 m.neighbour[static_cast<std::size_t>(facei)]})
+        {
+            for (const label f : m.cells[static_cast<std::size_t>(side)])
+            {
+                if (mpm.faceMap[static_cast<std::size_t>(f)] != -1)
+                {
+                    tmpValue = tmpValue + hullFaceValue(sFld, sBnd, m, f);
+                    ++counter;
+                }
+            }
+        }
+        // :92-95 -- a face with NO mapped hull face is left alone, which is not the same as zeroed
+        if (counter > 0)
+        {
+            // Templates:94 is `tmpValue/counter` -- a DIVISION (see mapNewInternalFacesFlatCopied)
+            sFld[static_cast<std::size_t>(facei)] =
+                divideByCount(tmpValue, static_cast<scalar>(counter));
+        }
+    }
+    if (hullAverageCheck() && !sameBits(want, sFld))
+    {
+        throw std::runtime_error(
+            "brae dynamicRefineFvMesh: BRAE_CONTROL_HULL_AVERAGE_CHECK: a surface field's hull average read from "
+            "the field is not the one read from the flat copy.");
+    }
+}
+
 template void mapNewInternalFacesFlat<scalar>(
     std::vector<scalar>&, const std::vector<std::vector<scalar>>&, const MapPolyMesh&,
     const FluxMeshView&);
@@ -1194,7 +1303,12 @@ template void mapNewInternalFacesFlat<vector>(
     const FluxMeshView&);
 
 
-void mapNewInternalFacesOriented(
+namespace
+{
+
+// Templates:163-176 with its two whole-field arrays: the flux to intensive, the hull average on that, and back.
+// What mapNewInternalFacesOriented was until the two were folded into one pass.
+void mapNewInternalFacesOrientedCopied(
     std::vector<scalar>&                    phi,
     std::vector<std::vector<scalar>>&       phiBnd,
     const std::vector<vector>&              Sf,
@@ -1226,7 +1340,7 @@ void mapNewInternalFacesOriented(
     }
 
     // :172 -- map the intensive field
-    mapNewInternalFacesFlat<vector>(fFld, fBnd, mpm, m);
+    mapNewInternalFacesFlatCopied<vector>(fFld, fBnd, mpm, m);
 
     // :175 -- and back, `sFld = (fFld & Sf)`. A WHOLE-FIELD assignment: every face is rewritten, not
     // only the injected ones, and the round trip is not the identity in floating point.
@@ -1239,6 +1353,129 @@ void mapNewInternalFacesOriented(
         for (std::size_t i = 0; i < fBnd[p].size(); ++i)
         {
             phiBnd[p][i] = dot(fBnd[p][i], SfBnd[p][i]);
+        }
+    }
+}
+
+}   // namespace
+
+
+// THE FLUX'S ROUND TRIP IN ONE PASS. Templates:163-176 writes the whole intensive field (fFld = sFld*Sf/
+// sqr(magSf)), averages the injected faces on it, and assigns the whole flux back (sFld = fFld & Sf) -- every
+// face rewritten, and that round trip is not the identity in floating point, so every face must take it. But a
+// face's intensive value is a function of that face alone unless it is injected: so the injected faces' averages
+// are found first, from their hull faces' own flux and area, and one pass then sends every face out and back --
+// the same three products, the same division and the same dot product a face, with no array of 290,000
+// vectors written and read in between, nor the flat copy of it. (See mapNewInternalFacesFlat for the switches.)
+void mapNewInternalFacesOriented(
+    std::vector<scalar>&                    phi,
+    std::vector<std::vector<scalar>>&       phiBnd,
+    const std::vector<vector>&              Sf,
+    const std::vector<std::vector<vector>>& SfBnd,
+    const std::vector<scalar>&              magSf,
+    const std::vector<std::vector<scalar>>& magSfBnd,
+    const MapPolyMesh&                      mpm,
+    const FluxMeshView&                     m)
+{
+    if (hullAverageCopies())
+    {
+        mapNewInternalFacesOrientedCopied(phi, phiBnd, Sf, SfBnd, magSf, magSfBnd, mpm, m);
+        return;
+    }
+    static const bool noRoundTrip = std::getenv("BRAE_CONTROL_HULL_AVERAGE_NO_ROUND_TRIP") != nullptr;
+    std::vector<scalar> wantPhi;
+    std::vector<std::vector<scalar>> wantBnd;
+    if (hullAverageCheck())
+    {
+        wantPhi = phi;
+        wantBnd = phiBnd;
+        mapNewInternalFacesOrientedCopied(wantPhi, wantBnd, Sf, SfBnd, magSf, magSfBnd, mpm, m);
+    }
+    // the patches' intensive values, as before: a few thousand faces, and the hull below reads them
+    std::vector<std::vector<vector>> fBnd(SfBnd.size());
+    for (std::size_t p = 0; p < SfBnd.size(); ++p)
+    {
+        fBnd[p].assign(SfBnd[p].size(), vector{0, 0, 0});
+        for (std::size_t i = 0; i < SfBnd[p].size(); ++i)
+        {
+            const scalar d = magSfBnd[p][i]*magSfBnd[p][i];
+            fBnd[p][i] = (phiBnd[p][i]*SfBnd[p][i])/d;
+        }
+    }
+    // a face's intensive value from its own flux and area: Templates:169, multiply first and divide second
+    const auto intensive = [&](
+        std::size_t i)
+    {
+        const scalar d = magSf[i]*magSf[i];
+        return (phi[i]*Sf[i])/d;
+    };
+    // THE INJECTED FACES' AVERAGES FIRST, while every flux is still the mapped one. Templates:59-97 on the
+    // intensive field: the hull of already-mapped faces, in the cell's own face order.
+    std::vector<label> injected;
+    std::vector<vector> average;
+    for (label facei = 0; facei < m.nInternalFaces; ++facei)
+    {
+        if (mpm.faceMap[static_cast<std::size_t>(facei)] != -1) continue;
+        vector tmpValue{};
+        label counter = 0;
+        for (const label side : {m.owner[static_cast<std::size_t>(facei)],
+                                 m.neighbour[static_cast<std::size_t>(facei)]})
+        {
+            for (const label f : m.cells[static_cast<std::size_t>(side)])
+            {
+                if (mpm.faceMap[static_cast<std::size_t>(f)] == -1) continue;
+                if (f < m.nInternalFaces)
+                {
+                    tmpValue = tmpValue + intensive(static_cast<std::size_t>(f));
+                }
+                else
+                {
+                    // (never written by this routine before here: the patches' intensive values above)
+                    tmpValue = tmpValue + hullFaceValue(std::vector<vector>(), fBnd, m, f);
+                }
+                ++counter;
+            }
+        }
+        // :92-95 -- a face with NO mapped hull face is left alone: it keeps its own intensive value
+        if (counter > 0)
+        {
+            injected.push_back(facei);
+            average.push_back(divideByCount(tmpValue, static_cast<scalar>(counter)));
+        }
+    }
+    // :175 -- `sFld = (fFld & Sf)` on every face: an injected one from its average, any other out and back
+    std::size_t next = 0;
+    const std::size_t nInternal = static_cast<std::size_t>(m.nInternalFaces);
+    for (std::size_t i = 0; i < nInternal; ++i)
+    {
+        if (next < injected.size() && static_cast<std::size_t>(injected[next]) == i)
+        {
+            phi[i] = dot(average[next], Sf[i]);
+            ++next;
+            continue;
+        }
+        if (noRoundTrip) continue;
+        phi[i] = dot(intensive(i), Sf[i]);
+    }
+    for (std::size_t p = 0; p < fBnd.size(); ++p)
+    {
+        for (std::size_t i = 0; i < fBnd[p].size(); ++i)
+        {
+            phiBnd[p][i] = dot(fBnd[p][i], SfBnd[p][i]);
+        }
+    }
+    if (hullAverageCheck())
+    {
+        bool same = sameBits(wantPhi, phi) && wantBnd.size() == phiBnd.size();
+        for (std::size_t p = 0; same && p < wantBnd.size(); ++p)
+        {
+            same = sameBits(wantBnd[p], phiBnd[p]);
+        }
+        if (!same)
+        {
+            throw std::runtime_error(
+                "brae dynamicRefineFvMesh: BRAE_CONTROL_HULL_AVERAGE_CHECK: a flux sent out and back in one pass "
+                "is not the one Templates:163-176's two whole-field arrays give.");
         }
     }
 }
@@ -3050,14 +3287,21 @@ RefineUpdateStep refineUpdate(
         {
             // ---- refine (:442-535) ----------------------------------------------------------------
             part.emplace("refine: hexRef8's points, cells and faces (the actions)");
+            // (its parts by name inside the row: it is 11.5 ms a call on damBreakWithObstacle for a few
+            // hundred cells of 92,000)
             cpu::polyTopoChange::TopoActions act = actionsFromMesh(s.m);
+            std::optional<interPhase::Nested> actPart;
+            actPart.emplace("hexRef8: the mesh view and the patch types");
             const cpu::hexRef8::MeshView v = hexView(s.m, a);
             std::vector<std::string> patchTypes;
             for (const PatchInfo& p : s.m.patches()) patchTypes.push_back(p.type);
             cpu::hexRef8::RefinementMarks marks;
+            actPart.emplace("hexRef8: setRefinement's points and cells");
             (void)cpu::hexRef8::setRefinementPointsAndCells(v, s.levels, r.cellsToRefine, patchTypes,
                                                             act, marks);
+            actPart.emplace("hexRef8: setRefinement's faces");
             cpu::hexRef8::setRefinementFaces(v, s.levels, marks, act);
+            actPart.emplace("hexRef8: the refinement history stored");
             // marks.cellAddedCells, NOT the RETURN value: section 11 indexes cellAddedCells BY CELL
             // (hexRef8.C:4295), and what setRefinement returns is the COMPACTED per-requested-cell form
             // it builds afterwards. Passing the compacted one hands storeSplit the request INDEX as a
@@ -3067,6 +3311,7 @@ RefineUpdateStep refineUpdate(
             // splits allocated 470 new parents where OpenFOAM allocated 64 and reused 406.
             cpu::hexRef8::storeRefinementHistory(s.history, marks.cellAddedCells,
                                                  static_cast<label>(marks.newCellLevel.size()));
+            actPart.reset();
 
             part.emplace("refine: the topology change (changeMesh)");
             cpu::polyTopoChange::ChangedMesh out;
@@ -3164,8 +3409,11 @@ RefineUpdateStep refineUpdate(
             // ---- unrefine (:537-716) ---------------------------------------------------------------
             part.emplace("unrefine: removeFaces' decisions and actions");
             cpu::polyTopoChange::TopoActions act = actionsFromMesh(s.m);
+            std::optional<interPhase::Nested> actPart;
+            actPart.emplace("removeFaces: the levels and the history (setUnrefinementLevels)");
             const cpu::hexRef8::MeshView v = hexView(s.m, a);
             cpu::hexRef8::setUnrefinementLevels(v, s.levels, s.history, r.pointsToUnrefine);
+            actPart.emplace("removeFaces: the split faces and compatibleRemoves");
 
             // the faces around the split points, which is what removeFaces is asked to remove
             std::vector<char> seen(static_cast<std::size_t>(s.m.nFaces()), char(0));
@@ -3194,11 +3442,14 @@ RefineUpdateStep refineUpdate(
                                                 cellRegionMaster, facesToRemove);
             // hexRef8 builds its faceRemover with GREAT, so the feature-angle guard never runs
             // (hexRef8.C:1967)
+            actPart.emplace("removeFaces: setRefinement's decisions");
             const cpu::removeFaces::RemoveFacesDecisions dec =
                 cpu::removeFaces::setRefinementDecisions(rv, facesToRemove, cellRegion, cellRegionMaster,
                                                          scalar(1.0e+15));
+            actPart.emplace("removeFaces: setRefinement's actions");
             cpu::removeFaces::setRefinementActions(rv, dec, facesToRemove, cellRegion, cellRegionMaster,
                                                    act);
+            actPart.reset();
 
             part.emplace("unrefine: the topology change (changeMesh)");
             cpu::polyTopoChange::ChangedMesh out;

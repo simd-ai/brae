@@ -1,6 +1,7 @@
 // removeFaces::compatibleRemoves. See remove_faces_cpp.cuh.
 #include "remove_faces_cpp.cuh"
 #include <algorithm>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -242,10 +243,12 @@ label changeFaceRegion(
     const std::vector<label>& nFacesPerEdge,
     label                     startFacei,
     label                     newRegion,
-    std::vector<label>&       faceRegion)
+    std::vector<label>&       faceRegion,
+    // the walk's stack, the caller's so that a walk does not make one (it is left empty)
+    std::vector<label>&       todo)
 {
     label nChanged = 0;
-    std::vector<label> todo;
+    todo.clear();
     todo.push_back(startFacei);
     while (!todo.empty())
     {
@@ -498,6 +501,27 @@ RemoveFacesDecisions setRefinementDecisions(
     // :1177-1196. Walk face-edge-face across every edge that will be removed; each connected set of
     // faces becomes one region and will be merged into one face. A set of ONE face is marked -2: there
     // is nothing to merge, and the face is handled by the affected-face pass instead.
+    // A WALK CROSSES ONLY AN EDGE THAT GOES (a count of 0, 1 or 2, and 1 was refused above -- the edges of
+    // edgesToRemove), so a face on no such edge is a set of one whatever the walk does, and is marked -2
+    // without one. OpenFOAM starts a walk from every face of the mesh, and so did this -- each with a stack of
+    // its own. MEASURED on damBreakWithObstacle (290,000 faces), 2026-10-05: 4.7 ms an unrefinement that
+    // merges a few hundred.
+    //   BRAE_CONTROL_REMOVE_FACES_WALK_EVERY_FACE=1   a walk from every face, as before
+    //   BRAE_CONTROL_REMOVE_FACES_REGION_CHECK=1      the regions found both ways and compared, face for face
+    //   BRAE_CONTROL_REMOVE_FACES_NO_WALK=1           a gate's CONTROL, deliberately wrong: no walk at all, so
+    //                                                 every face is a set of one and nothing merges
+    static const bool walkEveryFace = std::getenv("BRAE_CONTROL_REMOVE_FACES_WALK_EVERY_FACE") != nullptr;
+    static const bool regionCheck = std::getenv("BRAE_CONTROL_REMOVE_FACES_REGION_CHECK") != nullptr;
+    static const bool noWalk = std::getenv("BRAE_CONTROL_REMOVE_FACES_NO_WALK") != nullptr;
+    std::vector<char> onRemovedEdge(static_cast<std::size_t>(nFaces), char(0));
+    for (const label edgei : edgesToRemove)
+    {
+        for (const label facei : (*v.edgeFaces)[static_cast<std::size_t>(edgei)])
+        {
+            onRemovedEdge[static_cast<std::size_t>(facei)] = 1;
+        }
+    }
+    std::vector<label> todo;
     std::vector<label> faceRegion(static_cast<std::size_t>(nFaces), label(-1));
     label nRegions = 0;
     label startFacei = 0;
@@ -508,12 +532,13 @@ RemoveFacesDecisions setRefinementDecisions(
             if (faceRegion[static_cast<std::size_t>(startFacei)] == -1
              && !removedFace[static_cast<std::size_t>(startFacei)])
             {
-                break;
+                if (walkEveryFace || (onRemovedEdge[static_cast<std::size_t>(startFacei)] && !noWalk)) break;
+                faceRegion[static_cast<std::size_t>(startFacei)] = -2;
             }
         }
         if (startFacei == nFaces) break;
         const label nRegion =
-            changeFaceRegion(v, removedFace, nFacesPerEdge, startFacei, nRegions, faceRegion);
+            changeFaceRegion(v, removedFace, nFacesPerEdge, startFacei, nRegions, faceRegion, todo);
         if (nRegion < 1)
             throw std::runtime_error(
                 std::string(WHOSET) + "the face-region walk from face " + std::to_string(startFacei)
@@ -525,6 +550,33 @@ RemoveFacesDecisions setRefinementDecisions(
         else
         {
             ++nRegions;
+        }
+    }
+    if (regionCheck && !walkEveryFace)
+    {
+        std::vector<label> want(static_cast<std::size_t>(nFaces), label(-1));
+        label nWant = 0;
+        for (label facei = 0; facei < nFaces; ++facei)
+        {
+            if (want[static_cast<std::size_t>(facei)] != -1 || removedFace[static_cast<std::size_t>(facei)]) continue;
+            const label nRegion = changeFaceRegion(v, removedFace, nFacesPerEdge, facei, nWant, want, todo);
+            if (nRegion == 1)
+            {
+                want[static_cast<std::size_t>(facei)] = -2;
+            }
+            else
+            {
+                ++nWant;
+            }
+        }
+        for (label facei = 0; facei < nFaces; ++facei)
+        {
+            if (want[static_cast<std::size_t>(facei)] == faceRegion[static_cast<std::size_t>(facei)]) continue;
+            throw std::runtime_error(
+                std::string(WHOSET) + "BRAE_CONTROL_REMOVE_FACES_REGION_CHECK: face " + std::to_string(facei)
+                + " is in region " + std::to_string(faceRegion[static_cast<std::size_t>(facei)]) + " and a walk "
+                "from every face puts it in " + std::to_string(want[static_cast<std::size_t>(facei)]) + " ("
+                + std::to_string(nRegions) + " regions against " + std::to_string(nWant) + ").");
         }
     }
 

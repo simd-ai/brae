@@ -208,6 +208,16 @@ public:
         const std::size_t b = static_cast<std::size_t>((*offsets_)[i]);
         return LabelRow{values_->data() + b, static_cast<std::size_t>((*offsets_)[i + 1]) - b};
     }
+    // the two arrays of the compact forms -- n + 1 offsets, and the values -- or null for a list of lists: for
+    // a reader that takes the whole list in one copy
+    const std::vector<label>* flatOffsets() const
+    {
+        return compact_ ? &compact_->offsets() : offsets_;
+    }
+    const std::vector<label>* flatValues() const
+    {
+        return compact_ ? &compact_->values() : values_;
+    }
 
 private:
     const std::vector<std::vector<label>>* nested_ = nullptr;

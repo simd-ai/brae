@@ -130,6 +130,22 @@ public:
         start_.push_back(at);
         size_.push_back(static_cast<label>(f.size()));
     }
+    // n faces at once, from their compact form (n + 1 offsets from 0, and the vertices): what n push_backs in
+    // order leave, in three copies
+    void appendFlat(
+        const std::vector<label>& offsets,
+        const std::vector<label>& vertices,
+        std::size_t               n)
+    {
+        const label base = static_cast<label>(pool_.size());
+        const std::size_t nVerts = static_cast<std::size_t>(offsets[n]);
+        pool_.insert(pool_.end(), vertices.begin(), vertices.begin() + static_cast<std::ptrdiff_t>(nVerts));
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            start_.push_back(base + offsets[i]);
+            size_.push_back(offsets[i + 1] - offsets[i]);
+        }
+    }
     void set(
         std::size_t facei,
         LabelRow    f)

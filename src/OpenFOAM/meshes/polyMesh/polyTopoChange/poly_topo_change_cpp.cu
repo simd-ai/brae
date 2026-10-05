@@ -2,6 +2,8 @@
 #include "poly_topo_change_cpp.cuh"
 #include "inter_phase_time.cuh"
 #include "foam_dict.cuh"   // isCoupledInterfaceType
+#include <cstring>
+#include <cstdlib>
 #include <algorithm>
 #include <numeric>
 #include <optional>
@@ -540,6 +542,134 @@ void addMesh(
     // every action APPENDS, that order IS the numbering the accumulated state carries, and it is why a
     // no-op round trip comes back as the identity rather than merely as an equivalent mesh.
     a.state.nPatches = static_cast<label>(patchStarts.size());
+    // THE WHOLE MESH AT ONCE where nothing has been added yet and the patches follow the internal faces in
+    // order: every map below is then the identity and every list the mesh's own, so they are WRITTEN as that
+    // rather than appended an entry at a time through addPoint, addCell and addFace -- 489,000 calls on
+    // damBreakWithObstacle (107k points, 92k cells, 290k faces), MEASURED 2026-10-05 at 4.0 ms a change.
+    //   BRAE_CONTROL_TOPO_ADD_MESH_ONE_BY_ONE=1   an entry at a time, as before
+    //   BRAE_CONTROL_TOPO_ADD_MESH_CHECK=1        both, and every member of the two states compared
+    //   BRAE_CONTROL_TOPO_ADD_MESH_NO_REGION=1    a gate's CONTROL, deliberately wrong: a boundary face is given
+    //                                             no patch
+    static const bool oneByOne = std::getenv("BRAE_CONTROL_TOPO_ADD_MESH_ONE_BY_ONE") != nullptr;
+    static const bool bulkCheck = std::getenv("BRAE_CONTROL_TOPO_ADD_MESH_CHECK") != nullptr;
+    static const bool noRegion = std::getenv("BRAE_CONTROL_TOPO_ADD_MESH_NO_REGION") != nullptr;
+    const std::size_t nF = faces.size();
+    bool whole = !oneByOne && faces.flatOffsets() != nullptr && faces.flatValues() != nullptr
+              && a.state.points.empty() && a.state.cellMap.empty() && a.state.faces.size() == 0
+              && a.state.pointMap.empty() && a.state.faceMap.empty() && a.state.retiredPoints.empty()
+              && a.reversePointMap.empty() && a.reverseFaceMap.empty() && a.reverseCellMap.empty()
+              && a.faceFromPoint.empty() && a.faceFromEdge.empty() && a.cellFromPoint.empty()
+              && a.cellFromEdge.empty() && a.cellFromFace.empty()
+              && faceOwner.size() >= nF && faceNeighbour.size() >= nF
+              && (nF == 0 || (*faces.flatOffsets())[0] == 0);
+    {
+        // ...and the patches: each one starts where the last ended, the first where the internal faces end
+        std::size_t next = patchStarts.empty() ? nF : static_cast<std::size_t>(patchStarts.front());
+        for (std::size_t pi = 0; pi < patchStarts.size(); ++pi)
+        {
+            if (static_cast<std::size_t>(patchStarts[pi]) != next || patchSizes[pi] < 0) whole = false;
+            next += static_cast<std::size_t>(std::max(patchSizes[pi], label(0)));
+        }
+        if (next != nF) whole = false;
+    }
+    if (whole)
+    {
+        const std::size_t nP = points.size();
+        const std::size_t nC = static_cast<std::size_t>(nCells);
+        const std::size_t nInt = patchStarts.empty() ? nF : static_cast<std::size_t>(patchStarts.front());
+        a.state.points.insert(a.state.points.end(), points.begin(), points.end());
+        a.state.pointMap.resize(nP);
+        a.reversePointMap.resize(nP);
+        for (std::size_t i = 0; i < nP; ++i)
+        {
+            a.state.pointMap[i] = static_cast<label>(i);
+            a.reversePointMap[i] = static_cast<label>(i);
+        }
+        a.state.cellMap.resize(nC);
+        a.reverseCellMap.resize(nC);
+        for (std::size_t i = 0; i < nC; ++i)
+        {
+            a.state.cellMap[i] = static_cast<label>(i);
+            a.reverseCellMap[i] = static_cast<label>(i);
+        }
+        a.state.faces.appendFlat(*faces.flatOffsets(), *faces.flatValues(), nF);
+        a.state.faceOwner.insert(a.state.faceOwner.end(), faceOwner.begin(),
+                                 faceOwner.begin() + static_cast<std::ptrdiff_t>(nF));
+        a.state.faceNeighbour.insert(a.state.faceNeighbour.end(), faceNeighbour.begin(),
+                                     faceNeighbour.begin() + static_cast<std::ptrdiff_t>(nInt));
+        a.state.faceNeighbour.resize(nF, label(-1));
+        a.state.region.assign(nF, label(-1));
+        for (std::size_t pi = 0; pi < patchStarts.size() && !noRegion; ++pi)
+        {
+            std::fill(a.state.region.begin() + patchStarts[pi],
+                      a.state.region.begin() + patchStarts[pi] + patchSizes[pi], static_cast<label>(pi));
+        }
+        a.state.faceMap.resize(nF);
+        a.reverseFaceMap.resize(nF);
+        for (std::size_t i = 0; i < nF; ++i)
+        {
+            a.state.faceMap[i] = static_cast<label>(i);
+            a.reverseFaceMap[i] = static_cast<label>(i);
+        }
+        a.state.flipFaceFlux.assign(nF, char(0));
+        if (!bulkCheck) return;
+        // the same mesh an entry at a time, and every member held to it
+        TopoActions want;
+        want.state.nPatches = a.state.nPatches;
+        for (const vector& p : points)
+        {
+            addPoint(want, p, static_cast<label>(&p - points.data()), /*inCell=*/true);
+        }
+        for (label celli = 0; celli < nCells; ++celli)
+        {
+            addCell(want, -1, -1, -1, celli);
+        }
+        for (std::size_t facei = 0; facei < nF; ++facei)
+        {
+            const bool internal = facei < nInt;
+            label patchi = -1;
+            for (std::size_t pi = 0; pi < patchStarts.size() && !internal; ++pi)
+            {
+                if (static_cast<label>(facei) >= patchStarts[pi]
+                 && static_cast<label>(facei) < patchStarts[pi] + patchSizes[pi]) patchi = static_cast<label>(pi);
+            }
+            addFace(want, faces[facei], faceOwner[facei], internal ? faceNeighbour[facei] : label(-1), -1, -1,
+                    static_cast<label>(facei), false, patchi);
+        }
+        bool sameFaces = want.state.faces.size() == a.state.faces.size();
+        for (std::size_t facei = 0; sameFaces && facei < nF; ++facei)
+        {
+            const LabelRow x = want.state.faces[facei];
+            const LabelRow y = a.state.faces[facei];
+            sameFaces = x.size() == y.size() && std::equal(x.begin(), x.end(), y.begin());
+        }
+        const char* what =
+            want.state.points.size() != a.state.points.size()
+         || (nP > 0 && std::memcmp(want.state.points.data(), a.state.points.data(), nP*sizeof(vector)) != 0)
+          ? "the points"
+          : want.state.pointMap != a.state.pointMap ? "pointMap"
+          : want.reversePointMap != a.reversePointMap ? "reversePointMap"
+          : want.state.retiredPoints != a.state.retiredPoints ? "the retired points"
+          : want.state.cellMap != a.state.cellMap ? "cellMap"
+          : want.reverseCellMap != a.reverseCellMap ? "reverseCellMap"
+          : !sameFaces ? "the faces"
+          : want.state.faceOwner != a.state.faceOwner ? "the face owners"
+          : want.state.faceNeighbour != a.state.faceNeighbour ? "the face neighbours"
+          : want.state.region != a.state.region ? "the faces' patches"
+          : want.state.faceMap != a.state.faceMap ? "faceMap"
+          : want.reverseFaceMap != a.reverseFaceMap ? "reverseFaceMap"
+          : want.state.flipFaceFlux != a.state.flipFaceFlux ? "the flux flips"
+          : want.faceFromPoint != a.faceFromPoint || want.faceFromEdge != a.faceFromEdge
+         || want.cellFromPoint != a.cellFromPoint || want.cellFromEdge != a.cellFromEdge
+         || want.cellFromFace != a.cellFromFace ? "the inflation maps" : nullptr;
+        if (what)
+        {
+            throw std::runtime_error(
+                std::string("brae polyTopoChange::addMesh: BRAE_CONTROL_TOPO_ADD_MESH_CHECK: ") + what
+                + " written at once are not the ones an entry at a time gives.");
+        }
+        return;
+    }
     for (const vector& p : points)
     {
         addPoint(a, p, static_cast<label>(&p - points.data()), /*inCell=*/true);
