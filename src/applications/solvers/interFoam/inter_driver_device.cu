@@ -2588,6 +2588,63 @@ RunReport runInterFoamDevice(
     static const bool pEmptyCheck = std::getenv("BRAE_CONTROL_PRESSURE_EMPTY_CHECK") != nullptr;
     static const bool pEmptyCoeffsWrong = std::getenv("BRAE_CONTROL_PRESSURE_EMPTY_COEFFS_WRONG") != nullptr;
     static const bool pEmptyNoMirror = std::getenv("BRAE_CONTROL_PRESSURE_EMPTY_NO_MIRROR") != nullptr;
+    // THE HOST'S PATCHES GO DOWN AND UP A RUN AT A TIME. The hooks below copied each patch's faces between the
+    // device's boundary arrays and the host on their own -- two copies down and two up a patch in pressureCoeffs,
+    // one up in boundaryValues -- and a copy is a synchronous call whose cost does not depend on its length.
+    // MEASURED on RAS/motorBike, 2026-10-05 (62 patches the host handles, 4,649 boundary faces, six assemblies a
+    // step): 1,860 copies a step, 4.1 ms down and 3.4 up in pressureCoeffs and 1.6 in boundaryValues, of a
+    // 143 ms step. Patches that follow one another in the device's numbering are ONE range of it: copied once
+    // and sliced on the host. An `empty` patch (the GPU's own, see pressureCoeffs) ends a run.
+    //   BRAE_CONTROL_PRESSURE_PATCH_COPIES=1   a patch at a time, as before
+    //   BRAE_CONTROL_PRESSURE_RUN_SHIFTED=1    a gate's CONTROL, deliberately wrong: a run's coefficients go up
+    //                                          one face late
+    static const bool pPatchCopies = std::getenv("BRAE_CONTROL_PRESSURE_PATCH_COPIES") != nullptr;
+    static const bool pRunShifted = std::getenv("BRAE_CONTROL_PRESSURE_RUN_SHIFTED") != nullptr;
+    struct HostRun
+    {
+        std::size_t at = 0;
+        std::size_t n = 0;
+        std::vector<std::size_t> patches;
+    };
+    const auto pressureHostRuns = [&]()
+    {
+        std::vector<HostRun> runs;
+        std::size_t at = 0;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+            if (n > 0 && (pEmptyFromHost || fvp[pi].type != "empty"))
+            {
+                if (runs.empty() || runs.back().at + runs.back().n != at)
+                {
+                    runs.emplace_back();
+                    runs.back().at = at;
+                }
+                runs.back().n += n;
+                runs.back().patches.push_back(pi);
+            }
+            at += n;
+        }
+        static bool said = false;
+        if (!said && !pPatchCopies)
+        {
+            said = true;
+            std::size_t nPatches = 0;
+            for (const HostRun& r : runs)
+            {
+                nPatches += r.patches.size();
+            }
+            std::printf("  p_rgh boundary: the host's %zu patches are copied as %zu run(s) of the boundary arrays; "
+                        "BRAE_CONTROL_PRESSURE_PATCH_COPIES=1 copies a patch at a time\n", nPatches, runs.size());
+            if (pRunShifted)
+            {
+                std::printf("  *** CONTROL MODE: a run's laplacian coefficients go up one face late. This run is "
+                            "deliberately wrong. ***\n");
+            }
+        }
+        return runs;
+    };
     H.pressure.pressureCoeffs =
         [&](const DeviceBuffer<scalar>&, const DeviceBuffer<scalar>& phiHB,
             const DeviceBuffer<scalar>& rAUfAll, const DeviceBuffer<scalar>& rAUCell,
@@ -2655,13 +2712,14 @@ RunReport runInterFoamDevice(
         };
         std::vector<std::vector<scalar>> hBp(fvp.size()), rAp(fvp.size());
         std::vector<scalar> rAUc;
+        const std::vector<HostRun> runs = pPatchCopies ? std::vector<HostRun>() : pressureHostRuns();
         {
             std::size_t at = 0;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
                 if (isCoupledInterfaceType(fvp[pi].type)) continue;
                 const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
-                if (hostsPatch(pi))
+                if (pPatchCopies && hostsPatch(pi))
                 {
                     hBp[pi].resize(n);
                     rAp[pi].resize(n);
@@ -2677,6 +2735,26 @@ RunReport runInterFoamDevice(
                 throw std::runtime_error("brae interFoam (device): pressureCoeffs: the patches hold "
                                          + std::to_string(at) + " boundary faces and rAUf's array "
                                          + std::to_string(nBnd) + ".");
+            }
+            // a run down in two copies, and each of its patches its own slice of them
+            std::vector<scalar> hRun;
+            std::vector<scalar> rRun;
+            for (const HostRun& r : runs)
+            {
+                hRun.resize(r.n);
+                rRun.resize(r.n);
+                cudaCheck(cudaMemcpy(hRun.data(), phiHB.data() + r.at, r.n*sizeof(scalar), cudaMemcpyDeviceToHost),
+                          "pressureCoeffs phiHbyA of a run");
+                cudaCheck(cudaMemcpy(rRun.data(), rAUfAll.data() + nIf + r.at, r.n*sizeof(scalar),
+                                     cudaMemcpyDeviceToHost), "pressureCoeffs rAUf of a run");
+                std::ptrdiff_t o = 0;
+                for (const std::size_t pi : r.patches)
+                {
+                    const std::ptrdiff_t n = static_cast<std::ptrdiff_t>(fvp[pi].size);
+                    hBp[pi].assign(hRun.begin() + o, hRun.begin() + o + n);
+                    rAp[pi].assign(rRun.begin() + o, rRun.begin() + o + n);
+                    o += n;
+                }
             }
         }
         if (!cyclics.empty())
@@ -2804,6 +2882,35 @@ RunReport runInterFoamDevice(
             cudaCheck(cudaGetLastError(), "emptyPressureCoeffsKernel");
             cudaCheck(cudaStreamSynchronize(cudaStreamPerThread), "emptyPressureCoeffsKernel sync");
         }
+        // a run's coefficients built into one list and up in two copies
+        for (const HostRun& r : runs)
+        {
+            std::vector<scalar> i2(r.n);
+            std::vector<scalar> b2(r.n);
+            std::size_t o = 0;
+            for (const std::size_t pi : r.patches)
+            {
+                const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+                const std::vector<scalar> gIC = f.p_rgh.boundary[pi]->gradientInternalCoeffs();
+                const std::vector<scalar> gBC = f.p_rgh.boundary[pi]->gradientBoundaryCoeffs();
+                for (std::size_t i = 0; i < n; ++i)
+                {
+                    const scalar pGamma = rfB[pi][i]
+                                        * g.magSf()[static_cast<std::size_t>(fvp[pi].start) + i];
+                    const std::size_t k = pRunShifted ? (o + i + 1) % r.n : o + i;
+                    i2[k] = pGamma * gIC[i];
+                    b2[k] = (-pGamma) * gBC[i];
+                }
+                o += n;
+            }
+            hookPart.emplace("p hook: the coefficients and the jump up");
+            cudaCheck(cudaMemcpy(iC.data() + r.at, i2.data(), r.n*sizeof(scalar), cudaMemcpyHostToDevice),
+                      "pressureCoeffs internal coefficients of a run");
+            cudaCheck(cudaMemcpy(bC.data() + r.at, b2.data(), r.n*sizeof(scalar), cudaMemcpyHostToDevice),
+                      "pressureCoeffs boundary coefficients of a run");
+            hookPart.emplace("p hook: the laplacian's patch coefficients (host)");
+        }
+        if (pPatchCopies)
         {
             std::vector<scalar> i2, b2;
             std::size_t at = 0;
@@ -2936,12 +3043,35 @@ RunReport runInterFoamDevice(
             cudaCheck(cudaGetLastError(), "mirrorEmptyScalarKernel");
             cudaCheck(cudaStreamSynchronize(cudaStreamPerThread), "mirrorEmptyScalarKernel sync");
         }
+        if (!pPatchCopies)
+        {
+            // a run's stored values gathered into one list and up in one copy (pressureHostRuns)
+            std::vector<scalar> vRun;
+            for (const HostRun& r : pressureHostRuns())
+            {
+                vRun.clear();
+                vRun.reserve(r.n);
+                for (const std::size_t pi : r.patches)
+                {
+                    const std::vector<scalar>& v = f.p_rgh.boundary[pi]->value();
+                    if (v.size() != static_cast<std::size_t>(fvp[pi].size))
+                    {
+                        throw std::runtime_error(
+                            "brae interFoam (device): boundaryValues: p_rgh patch `" + fvp[pi].name + "` holds "
+                            + std::to_string(v.size()) + " values for " + std::to_string(fvp[pi].size) + " faces.");
+                    }
+                    vRun.insert(vRun.end(), v.begin(), v.end());
+                }
+                cudaCheck(cudaMemcpy(bval.data() + r.at, vRun.data(), r.n*sizeof(scalar), cudaMemcpyHostToDevice),
+                          "boundaryValues of a run");
+            }
+        }
         std::size_t at = 0;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
             if (isCoupledInterfaceType(fvp[pi].type)) continue;
             const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
-            if (n > 0 && fvp[pi].type != "empty")
+            if (pPatchCopies && n > 0 && fvp[pi].type != "empty")
             {
                 const std::vector<scalar>& v = f.p_rgh.boundary[pi]->value();
                 cudaCheck(cudaMemcpy(bval.data() + at, v.data(), n*sizeof(scalar), cudaMemcpyHostToDevice),
