@@ -5,6 +5,9 @@
 #include "device_alpha_flux.cuh"
 #include "device_interface_properties.cuh"
 #include "device_blas.cuh"
+#include <vector>
+#include <string>
+#include <cstring>
 #include <cstdio>
 #include <cstdlib>
 #include <cuda_runtime.h>
@@ -103,11 +106,17 @@ void deviceInterAlphaStep(
     bool lastRelaxed = false;
     // `patchesCurrent`: alpha1Bnd already holds what OpenFOAM's alpha1 carries (a relaxed corrector's
     // assignment), so the pass must not evaluate in front -- see DeviceInterAlphaHooks::relaxBoundary.
+    // ...and which buffer the last pass ran on and in which flavour: the pass after the sub-cycle is left out
+    // only where it would be that one again
+    const DeviceBuffer<scalar>* lastPassOn = nullptr;
+    bool lastPassCurrent = false;
     auto correctMixture = [&](
         const DeviceBuffer<scalar>& a,
         bool assignsAlpha2,
         bool patchesCurrent)
     {
+        lastPassOn = &a;
+        lastPassCurrent = patchesCurrent;
         if (patchesCurrent)
         {
             hooks.mixtureCorrect(a, alpha1Bnd, nHatfBnd);
@@ -439,12 +448,190 @@ void deviceInterAlphaStep(
         deviceCopy(*ctl.rhoPhiIf, rhoPhiIfSum);
     }
 
-    // ...and mixture.correct() ONCE MORE after the whole sub-cycle (alphaEqnSubCycle.H:36-38), so that
-    // the momentum equation is built on the NEW density. Skipping it builds UEqn on the density the
-    // step started with, which at a water/air interface is wrong by a factor of 1000 and converges.
-    // alphaEqnSubCycle.H evaluates alpha nowhere after the sub-cycle, so the patch values stand as the
-    // last corrector left them -- an assignment, where it relaxed
+    // ...and mixture.correct() ONCE MORE after the whole sub-cycle (interFoam.C, after alphaEqnSubCycle.H).
+    // The momentum equation must be built on the NEW density -- a mixture of the alpha the step started with
+    // is wrong by a factor of 1000 at a water/air interface, and converges -- and what gives it that is the
+    // pass at the bottom of the last corrector, which has already run on this alpha; this one is OpenFOAM's
+    // second call of the same thing. alphaEqnSubCycle.H evaluates alpha nowhere after the sub-cycle, so the
+    // patch values stand as the last corrector left them -- an assignment, where it relaxed
+    //
+    // THIS PASS REPEATS THE LAST CORRECTOR'S, AND IS LEFT OUT WHERE IT DOES. The last corrector ended with the
+    // same hook, the same deviceInterfaceCorrect and the same deviceMixtureCorrect on this same alpha1 (the step
+    // lambda's `alpha` IS alpha1), and nothing they read is written in between: the sub-cycle sums rhoPhi and
+    // copies alpha1, no more. OpenFOAM makes both calls too (alphaEqn.H:225, then interFoam.C:154); the second
+    // leaves every field as the first left it. (Its curvature divides by mesh.Vsc() inside a sub-cycle,
+    // fvcSurfaceIntegrate.C:77 -- but the first of the two calls is in the LAST sub-cycle, where Vsc() is V()
+    // itself unless the sub-cycle's time fraction has rounded below 1 - SMALL, fvMeshGeometry.C:262-281. Every
+    // pass here divides by V, which is what OpenFOAM's second call does whatever that rounding.)
+    // MEASURED 2026-10-05: one of the four alpha hook calls a step on laminar/waves/streamFunction (the hook
+    // 4.2 ms a step), one of the three mixtureCorrect calls on RAS/electrostaticDeposition (3.6 ms each), plus
+    // the device half each time.
+    // KEPT where it is NOT a repeat or cannot be shown to be one:
+    //   * the caller's answer for the hook (ctl.mixtureCorrectRepeats): a contact angle, whose gradient every
+    //     curvature pass moves -- the NUMBER of passes is part of the answer there (the hooks' header) --, an
+    //     alpha patch whose evaluate is not known to repeat, an alpha patch that names rhoPhi;
+    //   * a coupled pair on the mesh: its interface sums are atomic, so two passes need not agree to the bit
+    //     and the check below could not hold them;
+    //   * a last pass on another buffer or of the other flavour, which no path here makes.
+    //   BRAE_CONTROL_MIXTURE_REPEAT_KEPT=1    the pass is always made, as before
+    //   BRAE_CONTROL_MIXTURE_REPEAT_CHECK=1   where it would be left out: what is left of the hook is run, as
+    //                                         the default path runs it, then the pass is made anyway, and the
+    //                                         eight buffers it writes and the HOST's state the hooks write
+    //                                         (hooks.mixtureHostState) are compared with what stood before it,
+    //                                         bitwise. `=host` compares the host's state alone.
+    //   BRAE_CONTROL_MIXTURE_REPEAT_LEFT_OUT_ANYWAY=1   a gate's CONTROL, deliberately wrong: left out whatever
+    //                                         the caller answered (a contact angle's pass is then missing)
+    //   BRAE_CONTROL_MIXTURE_REPEAT_NOTHING_LEFT=1   another: what is left of the hook
+    //                                         (hooks.mixtureRepeatLeftOut) is dropped too. Under the check it is
+    //                                         seen where a patch names rhoPhi (the host's rhoPhi boundary is
+    //                                         then the last sub-step's, not the sum). Without it, MEASURED on
+    //                                         the W rows of damBreakPermeable, solitaryGrimshaw and stokesI, 0
+    //                                         of 24 written files differ: the U hook pushes the same again
+    //                                         before anything reads it.
+    static const bool repeatKept = std::getenv("BRAE_CONTROL_MIXTURE_REPEAT_KEPT") != nullptr;
+    static const char* const repeatCheckEnv = std::getenv("BRAE_CONTROL_MIXTURE_REPEAT_CHECK");
+    static const bool repeatCheck = repeatCheckEnv != nullptr;
+    static const bool repeatCheckHostOnly = repeatCheck && std::string(repeatCheckEnv) == "host";
+    static const bool repeatAnyway = std::getenv("BRAE_CONTROL_MIXTURE_REPEAT_LEFT_OUT_ANYWAY") != nullptr;
+    static const bool repeatNothingLeft = std::getenv("BRAE_CONTROL_MIXTURE_REPEAT_NOTHING_LEFT") != nullptr;
+    const bool samePass = lastPassOn == &alpha1 && lastPassCurrent == lastRelaxed;
+    const bool pairOnMesh = in.cyc && in.cyc->n > 0;
+    const bool callerSaysNo = !ctl.mixtureCorrectRepeats && !repeatAnyway;
+    // the DECISION is these five; the text below is what the notice says of it
+    const bool kept = repeatKept || !hooks.mixtureRepeatLeftOut || !samePass || pairOnMesh || callerSaysNo;
+    std::string path = "left out, it repeats the last corrector's; BRAE_CONTROL_MIXTURE_REPEAT_KEPT=1 makes it";
+    if (repeatKept)
+    {
+        path = "made (BRAE_CONTROL_MIXTURE_REPEAT_KEPT is set)";
+    }
+    else if (!hooks.mixtureRepeatLeftOut)
+    {
+        path = "made (the caller gave no hook for what is left of it)";
+    }
+    else if (!samePass)
+    {
+        path = "made (the last pass was on another buffer or of the other flavour)";
+    }
+    else if (pairOnMesh)
+    {
+        path = "made (a coupled pair's interface sums are atomic)";
+    }
+    else if (callerSaysNo)
+    {
+        path = "made (" + (ctl.mixtureRepeatKeptFor.empty() ? std::string("the caller says its hook does not repeat")
+                                                           : ctl.mixtureRepeatKeptFor) + ")";
+    }
+    // said whenever it CHANGES, not once a process: a binary that calls the step with two answers says both
+    static std::string pathSaid;
+    if (path != pathSaid)
+    {
+        pathSaid = path;
+        std::printf("  mixture.correct() after the alpha sub-cycle: %s\n", path.c_str());
+        if (!kept && repeatAnyway && !ctl.mixtureCorrectRepeats)
+        {
+            std::printf("  *** CONTROL MODE: the mixture.correct() after the alpha sub-cycle is left out though "
+                        "the hook does not repeat (%s). This run is deliberately wrong. ***\n",
+                        ctl.mixtureRepeatKeptFor.c_str());
+        }
+        if (!kept && repeatNothingLeft)
+        {
+            std::printf("  *** CONTROL MODE: what is left of the alpha hook where that pass is left out is "
+                        "dropped too. This run is deliberately wrong. ***\n");
+        }
+    }
+    if (kept)
+    {
+        correctMixture(alpha1, false, lastRelaxed);
+        return;
+    }
+    // what is left of the hook: the production path's, and under the check too, so that what the check takes
+    // as `before` is the state the default run goes on with
+    if (!repeatNothingLeft)
+    {
+        hooks.mixtureRepeatLeftOut();
+    }
+    if (!repeatCheck) return;
+    // THE CHECK: what stands, the pass, what stands after it
+    struct Held
+    {
+        const char* name;
+        const DeviceBuffer<scalar>* buffer;
+        std::vector<scalar> before;
+    };
+    Held held[] = {
+        {"nHatf on the internal faces", &nHatfInt, {}},
+        {"the curvature K", &K, {}},
+        {"alpha2", &alpha2, {}},
+        {"rho", &rho, {}},
+        {"mu", &mu, {}},
+        {"nu", &nu, {}},
+        {"alpha1's patch values", &alpha1Bnd, {}},
+        {"nHatf on the boundary", &nHatfBnd, {}},
+    };
+    for (Held& h : held)
+    {
+        h.buffer->copyTo(h.before);
+    }
+    const std::vector<scalar> hostBefore =
+        hooks.mixtureHostState ? hooks.mixtureHostState() : std::vector<scalar>();
     correctMixture(alpha1, false, lastRelaxed);
+    std::size_t values = 0;
+    for (const Held& h : held)
+    {
+        if (repeatCheckHostOnly) break;
+        std::vector<scalar> after;
+        h.buffer->copyTo(after);
+        values += after.size();
+        if (after.size() == h.before.size()
+         && (after.empty() || std::memcmp(after.data(), h.before.data(), after.size()*sizeof(scalar)) == 0)) continue;
+        std::size_t at = 0;
+        while (at < after.size() && at < h.before.size()
+            && std::memcmp(&after[at], &h.before[at], sizeof(scalar)) == 0)
+        {
+            ++at;
+        }
+        char buf[360];
+        std::snprintf(buf, sizeof(buf),
+                      "brae interFoam device alpha step: BRAE_CONTROL_MIXTURE_REPEAT_CHECK: the mixture.correct() "
+                      "after the sub-cycle does not repeat the last corrector's: %s, entry %zu of %zu, was %.17g "
+                      "and is %.17g after the pass.", h.name, at, after.size(),
+                      at < h.before.size() ? (double)h.before[at] : 0.0,
+                      at < after.size() ? (double)after[at] : 0.0);
+        throw std::runtime_error(buf);
+    }
+    const std::vector<scalar> hostAfter =
+        hooks.mixtureHostState ? hooks.mixtureHostState() : std::vector<scalar>();
+    if (hostAfter.size() != hostBefore.size()
+     || (!hostAfter.empty()
+      && std::memcmp(hostAfter.data(), hostBefore.data(), hostAfter.size()*sizeof(scalar)) != 0))
+    {
+        std::size_t at = 0;
+        while (at < hostAfter.size() && at < hostBefore.size()
+            && std::memcmp(&hostAfter[at], &hostBefore[at], sizeof(scalar)) == 0)
+        {
+            ++at;
+        }
+        char buf[360];
+        std::snprintf(buf, sizeof(buf),
+                      "brae interFoam device alpha step: BRAE_CONTROL_MIXTURE_REPEAT_CHECK: the mixture.correct() "
+                      "after the sub-cycle does not repeat the last corrector's: the host's state, entry %zu of "
+                      "%zu (%zu before), was %.17g and is %.17g after the pass.", at, hostAfter.size(),
+                      hostBefore.size(), at < hostBefore.size() ? (double)hostBefore[at] : 0.0,
+                      at < hostAfter.size() ? (double)hostAfter[at] : 0.0);
+        throw std::runtime_error(buf);
+    }
+    // a check that passes says so: a count that grows, said at each of the first ten passes and then at 100,
+    // 1000, ... -- a two-step row's count is its steps
+    static long passes = 0;
+    static long nextSaid = 100;
+    ++passes;
+    if (passes <= 10 || passes == nextSaid)
+    {
+        nextSaid = passes == nextSaid ? nextSaid*10 : nextSaid;
+        std::printf("  mixture repeat check: %ld passes made where they would be left out, each leaving 8 buffers "
+                    "(%zu values) and the host's state (%zu values) as they stood, bitwise\n", passes, values,
+                    hostAfter.size());
+    }
 }
 
 } // namespace brae

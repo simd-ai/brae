@@ -6,13 +6,15 @@
 // check for itself:
 //
 //   at the BOTTOM of every corrector                       alphaEqn.H:225
-//   ONCE MORE inside the MULESCorr block, before them      alphaEqn.H:151-153
-//   ONCE MORE AGAIN after the whole sub-cycle              alphaEqnSubCycle.H:36-38
+//   ONCE MORE inside the MULESCorr block, before them      alphaEqn.H:151-154
+//   ONCE MORE AGAIN after the whole sub-cycle              interFoam.C:154
 //
-// Each is a calculateK pass and the curvature is a FIXED POINT in those passes -- on capillaryRise it
-// walks 7070.5 -> 8659.4 -> 9353.1 -> 9681.2, so one pass short is not a rounding difference. Missing
-// the middle one put damBreak at 1.05e-07 against OpenFOAM where the full sequence gives 3.4346e-09.
-// Arm 4 removes the last one and measures what it is worth.
+// Each is a calculateK pass and at a contact angle the curvature is a FIXED POINT in those passes -- on
+// capillaryRise it walks 7070.5 -> 8659.4 -> 9353.1 -> 9681.2, so one pass short is not a rounding
+// difference. Missing the middle one put damBreak at 1.05e-07 against OpenFOAM where the full sequence
+// gives 3.4346e-09. The last one repeats the last corrector's where no patch makes the count of passes
+// matter: arm 4 shows what a mixture of the step's OLD alpha would cost (it overwrites the mixture; it
+// removes no pass), and arm 5 leaves that last pass out and holds every field handed back to the bit.
 //
 // THE ORACLE IS THE HOST SOLVER'S OWN alphaEqnSubCycle DRIVING ITS OWN alphaEqnStep, which is the path
 // that reaches 3.4346e-09 in alpha on damBreak against real OpenFOAM -- so agreement here is agreement
@@ -31,6 +33,7 @@
 #include "fvm.cuh"
 #include "device_inter_alpha_step.cuh"
 #include "device_mesh.cuh"
+#include <cstring>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -161,10 +164,15 @@ int main()
         return v;
     };
 
+    // how often the boundary hook ran, and what was left of it where the pass after the sub-cycle is left out
+    long hookCalls = 0;
+    long mixtureCalls = 0;
+    long leftOutCalls = 0;
     DeviceInterAlphaHooks hooks;
     hooks.updateBoundary =
         [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& aBnd, DeviceBuffer<scalar>& nBnd)
     {
+        ++hookCalls;
         a.copyTo(work.internal);
         work.evaluateBoundary();
         aBnd.copyFrom(patchValues());
@@ -192,9 +200,64 @@ int main()
     };
 
     // ---- the DEVICE run --------------------------------------------------------------------------
-    struct DevResult { std::vector<scalar> alpha, rho, rhoPhi; };
-    auto runDevice = [&](int steps, bool mulesCorr, bool skipFinalMixture)
+    // everything the step hands back
+    struct DevResult
     {
+        std::vector<scalar> alpha;
+        std::vector<scalar> rho;
+        std::vector<scalar> rhoPhi;
+        std::vector<scalar> rhoPhiBnd;
+        std::vector<scalar> K;
+        std::vector<scalar> nu;
+        std::vector<scalar> mu;
+        std::vector<scalar> alpha2;
+        std::vector<scalar> nHatf;
+        std::vector<scalar> alphaBnd;
+        std::vector<scalar> nHatfBnd;
+    };
+    auto runDevice = [&](
+        int steps,
+        bool mulesCorr,
+        bool skipFinalMixture,
+        bool leaveRepeatOut = false,
+        bool relaxedHooks = false)
+    {
+        // the caller's two halves of "the pass after the sub-cycle repeats": the answer and what is left
+        DeviceInterAlphaHooks hooksNow = hooks;
+        if (leaveRepeatOut)
+        {
+            hooksNow.mixtureRepeatLeftOut = [&]()
+            {
+                ++leftOutCalls;
+            };
+        }
+        // ...and the pair a relaxed corrector takes (arm 5): on these zero-gradient patches the relaxation's
+        // assignment is the relaxed cells' values, and the pass after it must not evaluate
+        if (relaxedHooks)
+        {
+            hooksNow.relaxBoundary = [&](
+                const DeviceBuffer<scalar>&,
+                const DeviceBuffer<scalar>& relaxed,
+                DeviceBuffer<scalar>& aBnd)
+            {
+                relaxed.copyTo(work.internal);
+                work.evaluateBoundary();
+                aBnd.copyFrom(patchValues());
+            };
+            hooksNow.mixtureCorrect = [&](
+                const DeviceBuffer<scalar>& a,
+                DeviceBuffer<scalar>& aBnd,
+                DeviceBuffer<scalar>& nBnd)
+            {
+                ++mixtureCalls;
+                a.copyTo(work.internal);
+                aBnd.copyFrom(patchValues());
+                SurfaceScalarField nHb;
+                std::vector<scalar> Kb;
+                ip::calculateK(work, ic, m, g, fvp, false, nHb, Kb);
+                nBnd.copyFrom(flatten(nHb.boundary));
+            };
+        }
         work.internal = a0;
         work.evaluateBoundary();
         SurfaceScalarField nH0;
@@ -210,6 +273,7 @@ int main()
         ctl.MULESCorr       = mulesCorr;
         ctl.preSolve.tol    = scalar(1e-12);
         ctl.preSolve.maxIter = 2000;
+        ctl.mixtureCorrectRepeats = leaveRepeatOut;
 
         for (int s = 0; s < steps; ++s)
         {
@@ -217,14 +281,14 @@ int main()
             alpha.copyTo(cur);
             failures += brae::gatecheck::nonFinite("cur", cur);
             alphaOld.copyFrom(cur);
-            deviceInterAlphaStep(dm, alpha, alphaOld, totalDt, din, dmc, ctl, props, hooks,
+            deviceInterAlphaStep(dm, alpha, alphaOld, totalDt, din, dmc, ctl, props, hooksNow,
                                  aBnd, nBnd, dFixes, dFlag, nHatf, K, rpInt, rpBnd,
                                  alpha2, rho, mu, nu);
             if (skipFinalMixture)
             {
-                // arm 4's control: rebuild the mixture from the field at the START of the step, which
-                // is what leaving out alphaEqnSubCycle.H:36-38 amounts to -- UEqn would then be built
-                // on the density the step began with.
+                // arm 4's control: OVERWRITE the mixture with one of the field at the START of the step
+                // -- UEqn would then be built on the density the step began with. (This removes no
+                // pass: the last corrector's has already built the mixture from the new alpha.)
                 DeviceBuffer<scalar> stale(cur);
                 deviceMixtureCorrect(stale.data(), nC, props,
                                      alpha2.data(), rho.data(), mu.data(), nu.data());
@@ -234,6 +298,14 @@ int main()
         alpha.copyTo(r.alpha);
         rho.copyTo(r.rho);
         rpInt.copyTo(r.rhoPhi);
+        rpBnd.copyTo(r.rhoPhiBnd);
+        K.copyTo(r.K);
+        nu.copyTo(r.nu);
+        mu.copyTo(r.mu);
+        alpha2.copyTo(r.alpha2);
+        nHatf.copyTo(r.nHatf);
+        aBnd.copyTo(r.alphaBnd);
+        nBnd.copyTo(r.nHatfBnd);
         return r;
     };
 
@@ -330,10 +402,11 @@ int main()
               d > scalar(1e-3));
     }
 
-    // ---- 4: mixture.correct() AFTER the sub-cycle (alphaEqnSubCycle.H:36-38) ---------------------
-    // Skipping it leaves rho at the density the step STARTED with. alpha is untouched -- the error is
-    // entirely in the field UEqn is about to be built on, which is why it needs its own arm and why no
-    // interface gate could find it.
+    // 4: the mixture UEqn is built on must be the NEW alpha's
+    // A mixture rebuilt from the alpha the step STARTED with leaves rho stale and alpha untouched -- the
+    // error is entirely in the field UEqn is about to be built on, which is why it needs its own arm and why
+    // no interface gate could find it. (What this arm breaks is the mixture, by overwriting it: it does not
+    // remove a pass. Whether the pass AFTER the sub-cycle can go is arm 5's question.)
     {
         const DevResult good  = runDevice(nSteps, false, false);
         const DevResult stale = runDevice(nSteps, false, true);
@@ -341,10 +414,58 @@ int main()
         const scalar dAlpha = worstOf(good.alpha, stale.alpha);
         std::printf("  rebuilding the mixture from the step's OLD alpha: rho %.4e of %.0f, "
                     "alpha %.3e\n", (double)dRho, (double)rho1, (double)dAlpha);
-        check("the mixture after the sub-cycle is load-bearing -- UEqn would be built on the wrong rho",
+        check("a mixture of the step's old alpha is seen in rho -- UEqn would be built on the wrong density",
               dRho > scalar(1));
         check("...and alpha cannot see it at all, so no interface gate would catch it",
               dAlpha == scalar(0));
+    }
+
+    // 5: the pass after the sub-cycle LEFT OUT, where the caller says it repeats
+    // interFoam.C:154's mixture.correct() repeats the one at the bottom of the last corrector (alphaEqn.H:225)
+    // on the same alpha. With the caller's answer and its hook for what is left, the step makes one hook call
+    // fewer a step and everything it hands back is the same to the bit; without them (every run above) the
+    // pass is made. Both flavours of that pass: the explicit path ends on the hook that evaluates
+    // (updateBoundary), a MULESCorr step whose second corrector relaxes ends on the one that does not
+    // (mixtureCorrect). WHAT THIS ARM HOLDS IS THE STEP AND ITS KERNELS: the patches here are zero-gradient,
+    // so the host half -- whether a real case's hook repeats -- is the caller's answer and is not under test.
+    for (const bool relaxed : {false, true})
+    {
+        const long hooksBefore = hookCalls;
+        const long mixBefore = mixtureCalls;
+        const DevResult made = runDevice(nSteps, relaxed, false, false, relaxed);
+        const long madeHooks = hookCalls - hooksBefore;
+        const long madeMix = mixtureCalls - mixBefore;
+        const long leftBefore = leftOutCalls;
+        const DevResult left = runDevice(nSteps, relaxed, false, true, relaxed);
+        const long leftHooks = hookCalls - hooksBefore - madeHooks;
+        const long leftMix = mixtureCalls - mixBefore - madeMix;
+        const long leftOver = leftOutCalls - leftBefore;
+        const auto sameBits = [](
+            const std::vector<scalar>& a,
+            const std::vector<scalar>& b)
+        {
+            return a.size() == b.size() && !a.empty()
+                && std::memcmp(a.data(), b.data(), a.size()*sizeof(scalar)) == 0;
+        };
+        const bool same = sameBits(made.alpha, left.alpha) && sameBits(made.rho, left.rho)
+                       && sameBits(made.rhoPhi, left.rhoPhi) && sameBits(made.rhoPhiBnd, left.rhoPhiBnd)
+                       && sameBits(made.K, left.K) && sameBits(made.nu, left.nu) && sameBits(made.mu, left.mu)
+                       && sameBits(made.alpha2, left.alpha2) && sameBits(made.nHatf, left.nHatf)
+                       && sameBits(made.alphaBnd, left.alphaBnd) && sameBits(made.nHatfBnd, left.nHatfBnd);
+        std::printf("  the pass after the sub-cycle left out (%s): updateBoundary %ld calls against %ld, "
+                    "mixtureCorrect %ld against %ld over %d steps, %ld calls of what is left; the eleven fields "
+                    "handed back %s\n", relaxed ? "MULESCorr, relaxed" : "explicit", leftHooks, madeHooks,
+                    leftMix, madeMix, nSteps, leftOver, same ? "bit for bit" : "DIFFER");
+        // the flavour the last pass has decides which hook loses a call a step, and the other loses none
+        const long fewerHooks = madeHooks - leftHooks;
+        const long fewerMix = madeMix - leftMix;
+        check(relaxed ? "left out, relaxed: one mixtureCorrect call fewer a step, updateBoundary's unchanged"
+                      : "left out, explicit: one updateBoundary call fewer a step, one call of what is left",
+              (relaxed ? (fewerMix == nSteps && fewerHooks == 0) : (fewerHooks == nSteps && fewerMix == 0))
+              && leftOver == nSteps);
+        check(relaxed ? "...and relaxed, the eleven fields handed back are the same to the bit"
+                      : "...and the eleven fields handed back are the same to the bit",
+              same);
     }
 
     std::printf("test_device_inter_alpha_step: %d failures\n", failures);

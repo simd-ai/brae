@@ -18,11 +18,13 @@
 // sequence has three placements that are not obvious and that nothing underneath can check:
 //
 //   mixture.correct() runs at the BOTTOM of every corrector (alphaEqn.H:225), ONCE MORE inside the
-//   MULESCorr block before the correctors begin (alphaEqn.H:151-153), and ONCE MORE AGAIN after the
-//   whole sub-cycle (alphaEqnSubCycle.H:36-38) so that UEqn is built on the new density. Each is a
-//   calculateK pass, and the curvature is a FIXED POINT in those passes -- on capillaryRise it walks
-//   7070.5 -> 8659.4 -> 9353.1 -> 9681.2. Missing the middle one put damBreak at 1.05e-07 against
-//   OpenFOAM where the full sequence gives 3.4346e-09.
+//   MULESCorr block before the correctors begin (alphaEqn.H:151-154), and ONCE MORE AGAIN after the
+//   whole sub-cycle (interFoam.C:154). Each is a calculateK pass, and at a contact angle the curvature
+//   is a FIXED POINT in those passes -- on capillaryRise it walks 7070.5 -> 8659.4 -> 9353.1 -> 9681.2.
+//   Missing the middle one put damBreak at 1.05e-07 against OpenFOAM where the full sequence gives
+//   3.4346e-09. The last one REPEATS the last corrector's wherever no patch makes the count of passes
+//   matter (what gives UEqn the new density is the corrector's pass), and the step leaves it out there:
+//   see where it is called.
 //
 // WHAT STAYS ON THE HOST, and it is the same line this port has drawn throughout: the BOUNDARY
 // CONDITIONS. Evaluating alpha1's patch values is branchy dispatch over inletOutlet, zeroGradient,
@@ -37,6 +39,7 @@
 #include "device_alpha_presolve.cuh"
 #include "device_two_phase_mixture.cuh"
 #include <functional>
+#include <string>
 #include <vector>
 
 namespace brae {
@@ -137,6 +140,17 @@ struct DeviceInterAlphaHooks
     // job, as it is the host hook's. Null on every other case, and the step is then bit for bit what it
     // was: phic stays the corrector's own.
     std::function<void()> geometryUpdate;
+
+    // WHAT IS LEFT OF THE HOOK WHEN THE mixture.correct() AFTER THE SUB-CYCLE IS LEFT OUT
+    // (DeviceInterAlphaControls::mixtureCorrectRepeats): the one thing its flux push would do with a NEWER
+    // input than the last corrector's had -- tell the conditions that read alpha's patch values what the last
+    // evaluate left (pushAlphaToPatches), and a p_rgh or U patch that names rhoPhi the boundary the sub-cycle
+    // has just summed. Null = the pass is never left out.
+    std::function<void()> mixtureRepeatLeftOut;
+    // ...and, for BRAE_CONTROL_MIXTURE_REPEAT_CHECK, the HOST's state those hooks write, as one list of numbers
+    // the check takes before and after the pass and compares bitwise: the device buffers it holds are only the
+    // hook's uploads. Optional; null = the check holds the device buffers alone.
+    std::function<std::vector<scalar>()> mixtureHostState;
 };
 
 struct DeviceInterAlphaControls
@@ -144,6 +158,14 @@ struct DeviceInterAlphaControls
     int  nAlphaSubCycles = 1;       // alphaControls.H, get<label>
     int  nAlphaCorr      = 1;
     bool MULESCorr       = false;
+    // THE HOST'S HALF OF "the mixture.correct() after the sub-cycle repeats the last corrector's" -- see where
+    // the step uses it. True when the caller has established that the HOOK would write nothing new: no alpha
+    // patch is a contact angle, every alpha patch's evaluate repeats (fvPatchField::evaluateRepeats), and no
+    // ALPHA patch names rhoPhi (the sub-cycle has just overwritten its boundary with the time-weighted sum, so
+    // such a patch would be evaluated on a new flux). False -- the default -- keeps the pass, and
+    // `mixtureRepeatKeptFor` says why in the step's notice.
+    bool mixtureCorrectRepeats = false;
+    std::string mixtureRepeatKeptFor = "the caller has not said the hook repeats";
     DeviceAlphaSolverControls preSolve;   // the case's fvSolution entry for alpha, MULESCorr only
     // OUT, optional: alpha2's PATCH values, assigned where alphaEqn.H assigns alpha2 (lines 151 and
     // 223) and NOT at the mixture.correct() after the sub-cycle, which leaves alpha2 alone. They are

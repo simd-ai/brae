@@ -1645,6 +1645,84 @@ RunReport runInterFoamDevice(
         boundaryNHat(nHb, a);
         nBnd.copyFrom(flattenPatches(nHb.boundary, fvp));
     };
+    // ...and all that is left of that hook where the pass after the sub-cycle is left out
+    // (DeviceInterAlphaHooks::mixtureRepeatLeftOut): its flux push, of which the only NEWER inputs than the
+    // last corrector's had are alpha's patch values as that corrector's evaluate left them and, where a p_rgh
+    // or U patch names rhoPhi, the boundary of rhoPhi the sub-cycle has just summed -- there the push is made
+    // whole, as the hook's first statement was
+    H.alpha.mixtureRepeatLeftOut = [&]()
+    {
+        interPhase::Nested timed("hook alpha.mixtureRepeatLeftOut");
+        if (namesRhoPhi)
+        {
+            pushFlux();
+            return;
+        }
+        pushAlphaToPatches(f, fvp);
+    };
+    // ...and what those hooks write on the host, for the check that the pass repeats: the two fluxes' patches,
+    // every alpha patch's value, reference, valueFraction and gradient, the mixture's boundary, and what the
+    // flux push tells p_rgh's and U's patches (their reference and valueFraction are what a told flux or a
+    // told alpha moves)
+    H.alpha.mixtureHostState = [&]()
+    {
+        std::vector<scalar> s;
+        auto add = [&](const std::vector<scalar>& v)
+        {
+            s.insert(s.end(), v.begin(), v.end());
+        };
+        auto addVectors = [&](const std::vector<vector>& v)
+        {
+            for (const vector& u : v)
+            {
+                s.push_back(u.x);
+                s.push_back(u.y);
+                s.push_back(u.z);
+            }
+        };
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (pi < f.phi.boundary.size())
+            {
+                add(f.phi.boundary[pi]);
+            }
+            if (pi < f.rhoPhi.boundary.size())
+            {
+                add(f.rhoPhi.boundary[pi]);
+            }
+            const fvPatchField<scalar>& ap = *f.alpha1.boundary[pi];
+            add(ap.value());
+            add(ap.refValues());
+            if (const std::vector<scalar>* vf = ap.valueFractionPtr())
+            {
+                add(*vf);
+            }
+            if (const std::vector<scalar>* rg = ap.refGradPtr())
+            {
+                add(*rg);
+            }
+            if (pi < f.rhoBnd.size() && pi < f.muBnd.size() && pi < f.nuBnd.size())
+            {
+                add(f.rhoBnd[pi]);
+                add(f.muBnd[pi]);
+                add(f.nuBnd[pi]);
+            }
+            const fvPatchField<scalar>& pp = *f.p_rgh.boundary[pi];
+            add(pp.refValues());
+            if (const std::vector<scalar>* vf = pp.valueFractionPtr())
+            {
+                add(*vf);
+            }
+            const fvPatchField<vector>& up = *f.U.boundary[pi];
+            addVectors(up.refValues());
+            if (const std::vector<scalar>* vf = up.valueFractionPtr())
+            {
+                add(*vf);
+            }
+        }
+        add(f.alpha1.internal);
+        return s;
+    };
     if (f.waves.any)
     {
         H.alpha.updateModelledBoundary =
@@ -3380,6 +3458,36 @@ RunReport runInterFoamDevice(
     C.alpha.nAlphaSubCycles = static_cast<int>(f.alphaCtl.nAlphaSubCycles);
     C.alpha.nAlphaCorr      = static_cast<int>(f.alphaCtl.nAlphaCorr);
     C.alpha.MULESCorr       = f.alphaCtl.MULESCorr;
+    // THE HOST'S ANSWER FOR THE mixture.correct() AFTER THE SUB-CYCLE (DeviceInterAlphaControls): the alpha hook
+    // would write nothing new there unless a patch makes it. Asked once -- a run does not change its patches'
+    // classes (a refinement maps their fields, not their types).
+    {
+        std::string why;
+        for (std::size_t pi = 0; pi < fvp.size() && why.empty(); ++pi)
+        {
+            // (a pair keeps the pass by itself: the step sees it)
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            const fvPatchField<scalar>& ap = *f.alpha1.boundary[pi];
+            if (ap.contactAngleTheta0() >= scalar(0))
+            {
+                why = "alpha's patch `" + fvp[pi].name + "` is a contact angle, whose gradient every curvature "
+                      "pass moves";
+            }
+            else if (!ap.evaluateRepeats())
+            {
+                why = "alpha's patch `" + fvp[pi].name + "` is of a class whose evaluate is not known to repeat";
+            }
+            else if (ap.fluxName() == "rhoPhi")
+            {
+                // the sub-cycle has just summed rhoPhi's boundary: this patch's evaluate would see a new flux.
+                // (A p_rgh or U patch that names it is told that flux by what is left of the hook.)
+                why = "alpha's patch `" + fvp[pi].name + "` names rhoPhi, whose boundary the sub-cycle has "
+                      "just summed";
+            }
+        }
+        C.alpha.mixtureCorrectRepeats = why.empty();
+        C.alpha.mixtureRepeatKeptFor = why;
+    }
     // THE CASE'S OWN alpha SOLVE: its smoother where it names a Gauss-Seidel one (the device has
     // OpenFOAM's, level-scheduled and exact), and its tolerances either way. See deviceAlphaPreSolve.
     // `alphaApplyPrevCorr`: the cache outlives every step, so it lives here. See

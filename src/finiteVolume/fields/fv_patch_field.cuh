@@ -113,6 +113,16 @@ public:
     // second contact-angle model (dynamic, temperature-dependent) is a new return value here and not
     // a new branch at every call site.
     virtual scalar contactAngleTheta0() const { return scalar(-1); }
+    // DOES evaluate() REPEAT: called again on the same cells, with the same flux told and nothing else told in
+    // between, does it leave the value and the state the first call left? True for a class whose evaluate is a
+    // function of the cells and of what the patch was told. FALSE BY DEFAULT -- a class nobody has answered for
+    // is taken not to -- and false for one that reads its own last value or whose inputs the solver rewrites
+    // between two evaluates (a contact angle's gradient, which interfaceProperties::correct() moves and which
+    // its own `limit gradient` re-clamps against the value) -- and, for a class that extrapolates a `value`-less
+    // entry at its first evaluate with cells, false until that evaluate has been made. Asked of alpha's patches
+    // before the device alpha step leaves out the mixture.correct() that repeats its last corrector's
+    // (device_inter_alpha_step.cu), which is after buildInterFields has evaluated every one of them.
+    virtual bool evaluateRepeats() const { return false; }
 
     virtual bool updateableSnGrad() const { return false; }
     virtual void updateSnGrad(const std::vector<T>&)
@@ -566,6 +576,8 @@ public:
         evaluate({});
     }
     bool fixesValue() const override { return true; }
+    // the stored value again
+    bool evaluateRepeats() const override { return true; }
     bool assignable() const override { return false; }   // OF fixedValueFvPatchField.H:169
     // OF fixedValueFvPatchField.H:202-204 -- operator= is declared and EMPTY
     bool ofAssignmentWritesValue() const override { return false; }
@@ -1145,6 +1157,8 @@ public:
         this->value_ = this->patchInternalField(internal);
     }
     bool fixesValue() const override { return false; }
+    // the cells' values again
+    bool evaluateRepeats() const override { return true; }
     // OF zeroGradientFvPatchField::snGrad() returns a ZERO field (its .H), not a difference between a
     // stored value and the cell: identically zero even when the cell has moved since the last evaluate.
     std::vector<T> snGrad(const std::vector<T>&) const override
@@ -1197,6 +1211,8 @@ public:
             this->value_[i] = pif[i] + grad_[i] / this->patch_.deltaCoeffs[i];
     }
     bool fixesValue() const override { return false; }          // the VALUE is not fixed; the gradient is
+    // cell + gradient/delta: repeats while nothing moves the gradient (a contact angle answers for itself)
+    bool evaluateRepeats() const override { return true; }
     // OF fixedGradientFvPatchField::snGrad() returns gradient_ (its .H) -- the prescribed gradient, not
     // one re-derived from a value that may predate the last time the solver set it. fixedFluxPressure
     // derives from this and has its gradient overwritten by constrainPressure every assembly.
@@ -1306,6 +1322,8 @@ public:
     }
 
     scalar contactAngleTheta0() const override { return theta0_; }
+    // the gradient is rewritten by every curvature pass, and `limit gradient` reads the value back
+    bool evaluateRepeats() const override { return false; }
 
     void evaluate(const std::vector<scalar>& internal) override
     {
@@ -1457,6 +1475,7 @@ public:
         this->value_ = this->patchInternalField(internal);
     }
     bool fixesValue() const override { return false; }
+    bool evaluateRepeats() const override { return true; }
 
     // emptyFvPatchField::autoMap IS AN EMPTY BODY (emptyFvPatchField.H:140-144) because OpenFOAM's empty
     // patch field is constructed ZERO-SIZED on a patch that has faces (emptyFvPatchField.C:41): there is
@@ -1641,6 +1660,7 @@ public:
     }
 
     bool fixesValue() const override { return false; }
+    bool evaluateRepeats() const override { return true; }
     bool isSymmetry() const override { return true; }
 
     // OpenFOAM's symmetry/symmetryPlane chain (basicSymmetry -> transform -> fvPatchField) overrides no
@@ -1709,6 +1729,7 @@ public:
         this->value_ = this->patchInternalField(internal);   // scalar: zeroGradient, exactly as OF
     }
     bool fixesValue() const override { return false; }
+    bool evaluateRepeats() const override { return true; }
     int  bcCategory() const override { return 0; }           // scalar: the device's zeroGradient
     const tensor* wedgeFaceT() const override { return &faceT_; }
     const tensor* wedgeCellT() const override { return &cellT_; }
@@ -2013,6 +2034,8 @@ public:
         if (readValue.size() == static_cast<std::size_t>(p.size)) this->value_ = std::move(readValue);
     }
     bool fixesValue() const override { return true; }               // OF mixedFvPatchField::fixesValue() == true
+    // the blend of the cells and the reference by a fraction updateFromFlux set: nothing of its own value
+    bool evaluateRepeats() const override { return true; }
     int  bcCategory() const override { return 5; }                  // device: mixed (per-face valueFraction blend)
 
     // OF mixedFvPatchField::evaluate -- a BLEND, not the refValue:
@@ -2225,6 +2248,8 @@ public:
         phi_ = phip;
         rebuild();
     }
+    // the first evaluate with cells may only extrapolate (a `value`-less entry); from the next on it repeats
+    bool evaluateRepeats() const override { return !extrapolatePending_; }
     void evaluate(const std::vector<scalar>& internal) override
     {
         if (!internal.empty())
@@ -2716,6 +2741,8 @@ public:
     // extrapolateInternal() for a `value`-less entry, done at the first evaluate that carries the internal
     // field -- construction time in OpenFOAM's sense, so only while no flux has reached the patch. Once one
     // has, the mixed blend is defined and is what OpenFOAM's evaluate gives.
+    // the first evaluate with cells may only extrapolate (a `value`-less entry); from the next on it repeats
+    bool evaluateRepeats() const override { return !extrapolatePending_; }
     void evaluate(const std::vector<T>& internal) override
     {
         if (extrapolatePending_ && !internal.empty())
@@ -2899,6 +2926,8 @@ public:
         this->setValueFraction(std::move(vf));
     }
     // extrapolateInternal() for a `value`-less entry -- see InletOutletPatchField::evaluate.
+    // the first evaluate with cells may only extrapolate (a `value`-less entry); from the next on it repeats
+    bool evaluateRepeats() const override { return !extrapolatePending_; }
     void evaluate(const std::vector<T>& internal) override
     {
         if (extrapolatePending_ && !internal.empty())
