@@ -237,6 +237,40 @@ void FvGeometry::adopt(
     ++generation_;
 }
 
+void FvGeometry::copyFrom(
+    const FvGeometry& o,
+    const PrimitiveMesh& m)
+{
+    const std::size_t nF = static_cast<std::size_t>(m.nFaces());
+    const std::size_t nIf = static_cast<std::size_t>(m.nInternalFaces());
+    const std::size_t nC = static_cast<std::size_t>(m.nCells());
+    if (o.Cf_.size() != nF || o.Sf_.size() != nF || o.magSf_.size() != nF || o.C_.size() != nC || o.V_.size() != nC
+     || o.weights_.size() != nIf || o.deltaCoeffs_.size() != nIf || o.nonOrthDeltaCoeffs_.size() != nIf
+     || o.nonOrthCorr_.size() != nIf)
+    {
+        throw std::runtime_error("brae: FvGeometry::copyFrom was handed a geometry of another mesh's sizes.");
+    }
+    if (o.areaScaled_ || !o.rawArea_.empty())
+    {
+        throw std::runtime_error(
+            "brae: FvGeometry::copyFrom was handed a geometry whose face areas are scaled; build() leaves them "
+            "raw, and a copy standing in for a build must be of the raw ones.");
+    }
+    Cf_ = o.Cf_;
+    Sf_ = o.Sf_;
+    magSf_ = o.magSf_;
+    C_ = o.C_;
+    V_ = o.V_;
+    weights_ = o.weights_;
+    deltaCoeffs_ = o.deltaCoeffs_;
+    nonOrthDeltaCoeffs_ = o.nonOrthDeltaCoeffs_;
+    nonOrthCorr_ = o.nonOrthCorr_;
+    // as buildFaceGeometry: the areas are raw again
+    areaScaled_ = false;
+    rawArea_.clear();
+    ++generation_;
+}
+
 void FvGeometry::build(const PrimitiveMesh& m)
 {
     buildFaceGeometry(m);

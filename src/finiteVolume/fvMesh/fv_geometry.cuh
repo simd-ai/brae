@@ -79,6 +79,13 @@ public:
     void adopt(
         Built& b,
         const PrimitiveMesh& m);
+    // THE GEOMETRY ANOTHER OBJECT HOLDS OF THIS SAME MESH, copied whole: the nine arrays build() leaves. For a
+    // caller that knows `o` was built for `m` as it stands -- the dynamic refinement builds its own after every
+    // change and the solver's was then built again for the same mesh. Refuses an `o` whose areas are scaled
+    // (that is not what build() leaves) or whose sizes are another mesh's.
+    void copyFrom(
+        const FvGeometry& o,
+        const PrimitiveMesh& m);
     // HOW MANY TIMES this geometry has been written: every build, scaling, face-area set, cell update and adopt
     // raises it. What a copy held elsewhere -- the device's -- compares to know whether it is still this one.
     unsigned long long generation() const

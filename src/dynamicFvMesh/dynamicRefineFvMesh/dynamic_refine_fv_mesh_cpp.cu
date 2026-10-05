@@ -2154,7 +2154,10 @@ void buildAddressing(
     part.emplace("addressing: the geometry (FvGeometry::build)");
     a.g.build(m);
     part.emplace("addressing: cells, pointCells, cellPoints");
-    a.cells = compactMeshCells(m);
+    {
+        interPhase::Nested timedOne("addressing: cells");
+        a.cells = compactMeshCells(m);
+    }
     // BRAE_CONTROL_REFINE_ADDRESSING_CELLS_SORTED=1 is a gate's CONTROL, deliberately wrong: each cell's faces in
     // ascending order, where meshCells' are its owned faces and then the ones it is the neighbour of -- the
     // order a compact builder written from the description alone would give
@@ -2170,9 +2173,37 @@ void buildAddressing(
         }
     }
     // pointCells through the CELLS branch, which is the one dynamicRefineFvMesh meets -- measured, and
-    // the three branches sum differently
-    a.pointCells = compactPointCellsFromCells(m, a.cells);
-    a.cellPoints = compactCellPointsFromCells(m, a.cells);
+    // the three branches sum differently. THAT BRANCH'S LIST IS cellPoints INVERTED (the cells ascending, a
+    // cell once a point), so cellPoints is built first and pointCells from it; built on its own it found every
+    // cell's points twice more -- MEASURED on damBreakWithObstacle, 2026-10-05: 4.8 ms a build.
+    // BRAE_CONTROL_POINT_CELLS_TWO_PASSES=1 builds it on its own, as before;
+    // BRAE_CONTROL_POINT_CELLS_DESCENDING=1 is a gate's CONTROL, deliberately wrong: the cells walked from the
+    // last, so every point's list comes out descending.
+    static const bool twoPasses = std::getenv("BRAE_CONTROL_POINT_CELLS_TWO_PASSES") != nullptr;
+    static const bool descending = std::getenv("BRAE_CONTROL_POINT_CELLS_DESCENDING") != nullptr;
+    {
+        interPhase::Nested timedOne("addressing: cellPoints");
+        a.cellPoints = compactCellPointsFromCells(m, a.cells);
+    }
+    {
+        interPhase::Nested timedOne("addressing: pointCells");
+        if (twoPasses)
+        {
+            a.pointCells = compactPointCellsFromCells(m, a.cells);
+        }
+        else
+        {
+            a.pointCells = compactPointCellsFromCellPoints(static_cast<std::size_t>(m.nPoints()), a.cellPoints);
+            if (descending)
+            {
+                std::vector<label>& v = a.pointCells.values();
+                for (std::size_t p = 0; p < a.pointCells.size(); ++p)
+                {
+                    std::reverse(v.begin() + a.pointCells.offsets()[p], v.begin() + a.pointCells.offsets()[p + 1]);
+                }
+            }
+        }
+    }
     part.emplace("addressing: edges (buildMeshEdges)");
     a.edges = buildMeshEdges(m);
     part.emplace("addressing: faceEdges, edgeFaces, cellEdges");
@@ -2180,12 +2211,28 @@ void buildAddressing(
     // each came out entry for entry the same). MEASURED, 16 threads: 14.4 -> 10.1 ms a step on
     // damBreakWithObstacle and 9.9 -> 6.1 on motorBike, the steps 181.1 -> 175.5 and 163.8 -> 161.1 -- the
     // threads' start-up and the per-range counts eat most of what the ranges save at these sizes.
-    a.faceEdges = compactFaceEdges(m, a.edges);
-    a.edgeFaces = compactEdgeFaces(m, a.faceEdges);
-    a.cellEdges = compactCellEdges(a.cells, a.faceEdges);
+    {
+        // the three by name, inside the row above
+        interPhase::Nested timedOne("addressing: faceEdges");
+        a.faceEdges = compactFaceEdges(m, a.edges);
+    }
+    {
+        interPhase::Nested timedOne("addressing: edgeFaces");
+        a.edgeFaces = compactEdgeFaces(m, a.faceEdges);
+    }
+    {
+        interPhase::Nested timedOne("addressing: cellEdges");
+        a.cellEdges = compactCellEdges(a.cells, a.faceEdges, a.edges.nEdges());
+    }
     part.emplace("addressing: cellCells and pointFaces");
-    a.cellCells = compactCellCells(m);
-    a.pointFaces = compactMeshPointFaces(m);
+    {
+        interPhase::Nested timedOne("addressing: cellCells");
+        a.cellCells = compactCellCells(m);
+    }
+    {
+        interPhase::Nested timedOne("addressing: pointFaces");
+        a.pointFaces = compactMeshPointFaces(m);
+    }
 }
 
 // THE STEP'S ADDRESSING, KEPT BETWEEN STEPS, with the mesh it is of. The topology's lists are a function of the
@@ -2276,7 +2323,8 @@ void buildNested(
     n.cells = meshCells(m);
     n.pointCells = pointCellsFromCells(m, n.cells);
     n.cellPoints = cellPointsFromCells(m, n.cells);
-    n.edges = buildMeshEdges(m);
+    // (the edges by OpenFOAM's own chains, whichever way buildMeshEdges takes)
+    n.edges = buildMeshEdgesByChains(m);
     n.faceEdges = buildFaceEdges(m, n.edges);
     n.edgeFaces = buildEdgeFaces(m, n.faceEdges);
     n.cellEdges = buildCellEdges(n.cells, n.faceEdges);
@@ -2343,6 +2391,21 @@ StepAddressingKept& keptOf(RefineUpdateState& s)
     }
     return *static_cast<StepAddressingKept*>(s.keptAddressing.get());
 }
+
+}   // namespace
+
+const FvGeometry* keptStepGeometry(
+    const RefineUpdateState& s,
+    const PrimitiveMesh&     m)
+{
+    if (!s.keptAddressing) return nullptr;
+    const StepAddressingKept& k = *static_cast<const StepAddressingKept*>(s.keptAddressing.get());
+    if (!sameTopology(k, m) || !sameBytes(k.points, m.points())) return nullptr;
+    return &k.a.g;
+}
+
+namespace
+{
 
 // THE ADDRESSING OF THE STATE'S MESH AS IT STANDS: the kept one where it is of this mesh, built otherwise.
 //   BRAE_CONTROL_REFINE_ADDRESSING_REBUILD=1         builds it at every call, as every step did before

@@ -951,9 +951,85 @@ bool interAmrUpdate(
     // ...and the mesh the caller's fields reference. The patches are assigned IN PLACE by the driver, so
     // `*mm.patches` is already the new one; the mesh and geometry are copied into the caller's objects for
     // the same reason -- every FvPatch, every patch field and every operator reads those.
-    amrPart.emplace("amr: the solver's mesh copied and its geometry built (FvGeometry::build)");
+    amrPart.emplace("amr: the solver's mesh copied");
     *mm.m = amr.state.m;
-    mm.g->build(*mm.m);
+    // THE GEOMETRY IS THE ONE THE REFINEMENT HAS JUST BUILT. Its kept addressing holds an FvGeometry of this
+    // same mesh, built after the step's last change (buildAddressing), and the solver's was then built AGAIN
+    // from the same points and faces. MEASURED on damBreakWithObstacle, 2026-10-05: 6.6 ms a call for the
+    // refinement's and as much here. Copied where the kept one is of this mesh (compared by content), built
+    // otherwise -- the same function of the same mesh, so the same bits.
+    //   BRAE_CONTROL_AMR_GEOMETRY_BUILT=1   built here, as before
+    //   BRAE_CONTROL_AMR_GEOMETRY_CHECK=1   built as well, and the nine arrays compared with the copy, bitwise
+    //   BRAE_CONTROL_AMR_GEOMETRY_WRONG=1   a gate's CONTROL, deliberately wrong: the copy is of the mesh with
+    //                                       its first point moved, so the cells on that point are another shape
+    static const bool geometryBuilt = std::getenv("BRAE_CONTROL_AMR_GEOMETRY_BUILT") != nullptr;
+    static const bool geometryCheck = std::getenv("BRAE_CONTROL_AMR_GEOMETRY_CHECK") != nullptr;
+    static const bool geometryWrong = std::getenv("BRAE_CONTROL_AMR_GEOMETRY_WRONG") != nullptr;
+    const FvGeometry* keptGeometry = geometryBuilt ? nullptr : dynamicRefine::keptStepGeometry(amr.state, *mm.m);
+    if (keptGeometry)
+    {
+        amrPart.emplace("amr: the solver's geometry copied from the refinement's");
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            std::printf("  refinement: the solver's geometry after a change is the refinement's own, copied; "
+                        "BRAE_CONTROL_AMR_GEOMETRY_BUILT=1 builds it again\n");
+            if (geometryWrong)
+            {
+                std::printf("  *** CONTROL MODE: the geometry copied is of the mesh with its first point moved. "
+                            "This run is deliberately wrong. ***\n");
+            }
+        }
+        if (geometryWrong)
+        {
+            PrimitiveMesh moved = *mm.m;
+            std::vector<vector> pts = moved.points();
+            pts[0] = pts[0] + vector{1.0e-3, 0, 0};
+            moved.movePoints(pts);
+            FvGeometry other;
+            other.build(moved);
+            mm.g->copyFrom(other, *mm.m);
+        }
+        else
+        {
+            mm.g->copyFrom(*keptGeometry, *mm.m);
+        }
+        if (geometryCheck)
+        {
+            FvGeometry fresh;
+            fresh.build(*mm.m);
+            const auto differs = [](
+                const auto& x,
+                const auto& y)
+            {
+                return x.size() != y.size()
+                    || (!x.empty() && std::memcmp(x.data(), y.data(), x.size()*sizeof(x[0])) != 0);
+            };
+            const char* what = differs(fresh.Cf(), mm.g->Cf()) ? "the face centres"
+                             : differs(fresh.Sf(), mm.g->Sf()) ? "the face areas"
+                             : differs(fresh.magSf(), mm.g->magSf()) ? "the face area magnitudes"
+                             : differs(fresh.C(), mm.g->C()) ? "the cell centres"
+                             : differs(fresh.V(), mm.g->V()) ? "the cell volumes"
+                             : differs(fresh.weights(), mm.g->weights()) ? "the interpolation weights"
+                             : differs(fresh.deltaCoeffs(), mm.g->deltaCoeffs()) ? "the delta coefficients"
+                             : differs(fresh.nonOrthDeltaCoeffs(), mm.g->nonOrthDeltaCoeffs())
+                             ? "the non-orthogonal delta coefficients"
+                             : differs(fresh.nonOrthCorrectionVectors(), mm.g->nonOrthCorrectionVectors())
+                             ? "the non-orthogonal correction vectors" : nullptr;
+            if (what)
+            {
+                throw std::runtime_error(
+                    std::string(WHO) + "BRAE_CONTROL_AMR_GEOMETRY_CHECK: of the geometry copied from the "
+                    "refinement's, " + what + " are not what building it from the solver's mesh gives.");
+            }
+        }
+    }
+    else
+    {
+        amrPart.emplace("amr: the solver's geometry built (FvGeometry::build)");
+        mm.g->build(*mm.m);
+    }
     amrPart.emplace("amr: the solver's patches assigned");
     // ELEMENT BY ELEMENT, and the count checked: a whole-vector assignment of a DIFFERENT size
     // reallocates, and every patch field in the solver holds a `const FvPatch&` into this buffer. It

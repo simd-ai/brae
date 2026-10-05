@@ -286,6 +286,34 @@ CompactListList compactPointCellsFromCells(
     return out;
 }
 
+CompactListList compactPointCellsFromCellPoints(
+    std::size_t      nPoints,
+    LabelListListRef cellPoints)
+{
+    // pointCellsFromCells' rows by INVERTING cellPoints: a cell is on a point's list once for each time the
+    // point is on the cell's, which is once, and the cells are walked ascending -- so each point's cells come
+    // out ascending, a cell once. The same list, without finding each cell's points a second and a third time.
+    std::vector<label> nCells(nPoints, label(0));
+    for (std::size_t celli = 0; celli < cellPoints.size(); ++celli)
+    {
+        for (const label pointi : cellPoints[celli])
+        {
+            ++nCells[static_cast<std::size_t>(pointi)];
+        }
+    }
+    CompactListList out;
+    std::vector<label> at = out.setSizes(nCells);
+    std::vector<label>& v = out.values();
+    for (std::size_t celli = 0; celli < cellPoints.size(); ++celli)
+    {
+        for (const label pointi : cellPoints[celli])
+        {
+            v[static_cast<std::size_t>(at[static_cast<std::size_t>(pointi)]++)] = static_cast<label>(celli);
+        }
+    }
+    return out;
+}
+
 CompactListList compactCellPointsFromCells(
     const PrimitiveMesh& m,
     LabelListListRef     cells)

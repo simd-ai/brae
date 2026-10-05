@@ -81,6 +81,10 @@ CompactListList compactPointCellsFromCells(
 CompactListList compactCellPointsFromCells(
     const PrimitiveMesh& m,
     LabelListListRef     cells);
+// pointCellsFromCells' rows from cellPoints, by inversion (the cells ascending, a cell once a point)
+CompactListList compactPointCellsFromCellPoints(
+    std::size_t      nPoints,
+    LabelListListRef cellPoints);
 
 // A PrimitivePatch over a list of the mesh's faces
 struct PrimitivePatchAddressing

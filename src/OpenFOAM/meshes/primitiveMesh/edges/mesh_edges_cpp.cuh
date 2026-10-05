@@ -47,6 +47,14 @@ struct MeshEdges
     CompactListList pointEdges;
     // nInternalPoints_: -1 when calcPointOrder found the points unordered
     label nInternalPoints = -1;
+    // EACH POINT'S EDGES TO ITS HIGHER NEIGHBOURS, the neighbours ascending: point p's are entries
+    // upperStart[p] .. upperStart[p+1] of upperEnd (the neighbour) and upperEdge (the edge). What the bucket
+    // build finds the edges through, kept because "the edge between these two points" is then a scan of three
+    // entries side by side (compactFaceEdges). Empty where the edges were built by chains; not part of what
+    // OpenFOAM's edges() or pointEdges() are, and not compared by any check.
+    std::vector<label> upperStart;
+    std::vector<label> upperEnd;
+    std::vector<label> upperEdge;
 
     label nEdges() const { return static_cast<label>(start.size()); }
     // edge::centre(points)
@@ -57,7 +65,19 @@ struct MeshEdges
     }
 };
 
+// edges() and pointEdges(). THE ORDER calcEdges LEAVES IS (low point, high point) -- within each of the four
+// blocks of an ordered mesh, and over the whole list of an unordered one: its last loop walks the points
+// ascending and each point's higher neighbours sorted ascending (primitiveMeshEdges.C:304-410). So the edges
+// are found here by BUCKETS: every face's consecutive point pairs dropped in the low point's bucket, each bucket
+// sorted by the high point and made unique. OpenFOAM's own way -- a chain a point, searched for every pair --
+// is buildMeshEdgesByChains, kept as the oracle. MEASURED on damBreakWithObstacle (92k cells, 305k edges),
+// 2026-10-05: 13.5 ms a build by chains.
+//   BRAE_CONTROL_MESH_EDGES_CHAINS=1     by chains, as before
+//   BRAE_CONTROL_MESH_EDGES_CHECK=1      by both, and the lists compared entry for entry
+//   BRAE_CONTROL_MESH_EDGES_UNSORTED=1   a gate's CONTROL, deliberately wrong: a bucket is left in the order the
+//                                        faces filled it
 MeshEdges buildMeshEdges(const PrimitiveMesh& m);
+MeshEdges buildMeshEdgesByChains(const PrimitiveMesh& m);
 
 // ----------------------------------------------------------------------------------------------
 // faceEdges(), edgeFaces() and cellEdges() -- the three primitiveMesh addressings
@@ -123,9 +143,14 @@ CompactListList compactFaceEdges(
 CompactListList compactEdgeFaces(
     const PrimitiveMesh& m,
     LabelListListRef     faceEdges);
+// (the edge count where the caller has it; found by a scan of faceEdges otherwise)
+//   BRAE_CONTROL_CELL_EDGES_SORT_UNIQUE=1   every cell's faces' edges sorted and then made unique, as before
+//   BRAE_CONTROL_CELL_EDGES_FIRST_FACE=1    a gate's CONTROL, deliberately wrong: an edge two of a cell's faces
+//                                           share is taken twice
 CompactListList compactCellEdges(
     LabelListListRef cells,
-    LabelListListRef faceEdges);
+    LabelListListRef faceEdges,
+    label            nEdges = -1);
 
 
 } // namespace brae

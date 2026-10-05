@@ -832,5 +832,12 @@ RefineUpdateStep refineUpdate(
     const std::vector<scalar>& field,
     label                      timeIndex);
 
+// THE GEOMETRY THE STATE KEEPS OF ITS MESH (the kept addressing's, built after every change), where it is of
+// `m` as it stands -- the faces, their owners and neighbours and the points compared by content -- and null
+// otherwise. For the solver, whose own FvGeometry of the same mesh was built again after each change.
+const FvGeometry* keptStepGeometry(
+    const RefineUpdateState& s,
+    const PrimitiveMesh&     m);
+
 }   // namespace dynamicRefine
 }   // namespace brae
