@@ -592,6 +592,42 @@ EOF_PCG
     wcase_arms "$arms"
 }
 
+# courantOff <brae log> <OpenFOAM log> <name>: how far brae's LAST printed <name> ("Courant Number" or
+# "Interface Courant Number", mean and max, from BRAE_CONTROL_COURANT_CHECK=1) is from OpenFOAM's line of the
+# SAME STEP, as the larger relative gap of the two. brae prints both at the top of every step; OpenFOAM prints
+# the first once more before its loop (interFoam.C, CourantNo.H ahead of setInitialDeltaT) and the second only
+# inside it. A run that stopped early is so compared with the step it stopped at. "-" where a line is missing
+# or OpenFOAM's is zero.
+courantOff()
+{
+    python3 - "$1" "$2" "$3" <<'PY'
+import re, sys
+def every(path, pat):
+    out = []
+    for line in open(path, errors='replace'):
+        mm = re.search(pat, line)
+        if mm:
+            out.append((float(mm.group(1)), float(mm.group(2))))
+    return out
+name = sys.argv[3]
+b = every(sys.argv[1], r'Courant check: %s mean: (\S+) max: (\S+)' % re.escape(name))
+o = every(sys.argv[2], r'^%s mean: (\S+) max: (\S+)' % re.escape(name))
+at = len(b) - 1 + (1 if name == 'Courant Number' else 0)
+if not b or at >= len(o) or o[at][0] == 0 or o[at][1] == 0:
+    print('-')
+else:
+    print('%.1e' % max(abs(b[-1][0] - o[at][0])/abs(o[at][0]), abs(b[-1][1] - o[at][1])/abs(o[at][1])))
+PY
+}
+# within <number> <bound>, above <number> <bound>: a printed number against a bound; "-" or nothing is neither
+within()
+{
+    [ -n "$1" ] && [ "$1" != - ] && python3 -c "import sys; sys.exit(0 if float('$1') <= float('$2') else 1)"
+}
+above()
+{
+    [ -n "$1" ] && [ "$1" != - ] && python3 -c "import sys; sys.exit(0 if float('$1') > float('$2') else 1)"
+}
 # finish <what>: the arm's verdict, and what the caches saved
 finish()
 {

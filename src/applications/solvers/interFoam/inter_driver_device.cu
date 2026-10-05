@@ -1289,6 +1289,19 @@ RunReport runInterFoamDevice(
             namesRhoPhi = true;
         }
     }
+    // EVERY PATCH'S FACES COME DOWN, AN EMPTY ONE'S TOO, and into a fresh vector. Two cheaper forms were TRIED
+    // 2026-10-05 and are NOT TAKEN -- pushFlux runs this seven times a step, and on a 2-D mesh the array is mostly
+    // the empty patches' faces (320,000 of laminar/waves/streamFunction's 324,160; 0.7 + 0.6 ms a step in the
+    // alpha and U hooks):
+    //   * leaving an empty patch's list as it stands (the two rows 0.7 + 0.6 -> 0.1 + 0.0 ms). NOT EXACT. Those
+    //     lists ARE read -- fvm::div's boundary coefficients under MULESCorr, the host closure, a dynamic mesh's
+    //     next update: with NaN written into them alpha, p and U were NaN on RAS/damBreakPorousBaffle and on
+    //     laminar/waves/waveMakerPiston -- and the device does not hold zeros there: -8.0e-42 on the wave maker's
+    //     `front` (the mesh flux's rounding), 4.2e-37 on laminar/capillaryRise's with its empty patch put first.
+    //     A list that is left is neither unread nor equal. What would make it so is no reader taking an empty
+    //     face at all, as OpenFOAM has none: a change of every such reader, held to OpenFOAM, not a copy saved.
+    //   * a vector kept between calls in place of the fresh one (exact, the same bytes): 0.8 + 0.6 -> 0.6 + 0.5
+    //     ms in the two rows, the step 37.2-37.3 -> 36.6-37.2 over three pairs -- inside the step's own spread.
     auto unflatten = [&](const DeviceBuffer<scalar>& d, std::vector<std::vector<scalar>>& out)
     {
         std::vector<scalar> flat;
@@ -3990,8 +4003,143 @@ RunReport runInterFoamDevice(
         }
         else
         {
-            rep.CoNum = deviceAlphaCourantNo(dm, dPhiI, dPhiB, nullptr, rep.deltaT).CoNum;
-            rep.alphaCoNum = deviceAlphaCourantNo(dm, dPhiI, dPhiB, &dA, rep.deltaT).CoNum;
+            // THE PAIR'S FACES ARE IN THE SUM (deviceAlphaCourantNo's header): dCyc holds their flux as the last
+            // pressure corrector left it, which is the phi the two Courant numbers are taken of.
+            //   BRAE_CONTROL_COURANT_CHECK=1   each cell's flux sum of BOTH numbers against the host's
+            //                                  surfaceSumMagPhi of the same flux, every patch in its own order
+            //                                  (the second times the host's nearInterface mask): a cell may
+            //                                  differ by the order its faces were added in, not by a face. It
+            //                                  also prints the two numbers, mean and max, as OpenFOAM's log
+            //                                  does -- the gate holds them to that log.
+            static const bool courantCheck = std::getenv("BRAE_CONTROL_COURANT_CHECK") != nullptr;
+            const DeviceCyclic* pairForCo = dCyc.n > 0 ? &dCyc : nullptr;
+            std::vector<scalar> sumPhiDevice;
+            std::vector<scalar> sumPhiBandDevice;
+            const DeviceCourantNumbers co = deviceAlphaCourantNo(dm, dPhiI, dPhiB, nullptr, rep.deltaT, pairForCo,
+                                                                 courantCheck ? &sumPhiDevice : nullptr);
+            const DeviceCourantNumbers coBand = deviceAlphaCourantNo(dm, dPhiI, dPhiB, &dA, rep.deltaT, pairForCo,
+                                                                     courantCheck ? &sumPhiBandDevice : nullptr);
+            rep.CoNum = co.CoNum;
+            rep.alphaCoNum = coBand.CoNum;
+            if (courantCheck)
+            {
+                // said BEFORE the comparison, so a control that the comparison stops has its numbers in the log
+                std::printf("  Courant check: Courant Number mean: %.17g max: %.17g\n",
+                            (double)co.meanCoNum, (double)co.CoNum);
+                std::printf("  Courant check: Interface Courant Number mean: %.17g max: %.17g\n",
+                            (double)coBand.meanCoNum, (double)coBand.CoNum);
+                // the flux of every boundary face in FACE order, as the host's loop takes it: a patch the
+                // device keeps in its boundary list from dPhiB, a coupled one from the pair
+                std::vector<scalar> hostInt;
+                std::vector<scalar> flat;
+                std::vector<scalar> pairFlux;
+                std::vector<scalar> alphaHost;
+                dPhiI.copyTo(hostInt);
+                dPhiB.copyTo(flat);
+                dA.copyTo(alphaHost);
+                if (dCyc.n > 0)
+                {
+                    dCyc.phi.copyTo(pairFlux);
+                }
+                std::vector<scalar> all(static_cast<std::size_t>(m.nFaces() - nIf), scalar(0));
+                std::size_t at = 0;
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                {
+                    if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                    for (label i = 0; i < fvp[pi].size; ++i)
+                    {
+                        all[static_cast<std::size_t>(fvp[pi].start - nIf + i)] = flat[at++];
+                    }
+                }
+                const std::vector<scalar> band = nearInterface(alphaHost);
+                // how many faces of the pair carry a flux into a cell of the band: a fixture whose pair has
+                // none holds nothing of the interface number's pair term
+                label pairBandFaces = 0;
+                std::size_t off = 0;
+                for (const CyclicInterface& c : cyclics)
+                {
+                    const FvPatch& q = fvp[static_cast<std::size_t>(c.patch)];
+                    for (std::size_t i = 0; i < c.faceCells.size(); ++i)
+                    {
+                        all[static_cast<std::size_t>(q.start - nIf) + i] = pairFlux[off + i];
+                        if (pairFlux[off + i] != scalar(0)
+                         && band[static_cast<std::size_t>(c.faceCells[i])] != scalar(0))
+                        {
+                            ++pairBandFaces;
+                        }
+                    }
+                    off += c.faceCells.size();
+                }
+                const std::vector<scalar> want =
+                    surfaceSumMagPhi(m.owner(), m.neighbour(), hostInt, all, nC, nIf);
+                std::vector<scalar> wantBand(want.size());
+                scalar largest = 0;
+                for (std::size_t k = 0; k < want.size(); ++k)
+                {
+                    wantBand[k] = band[k]*want[k];
+                    largest = std::fmax(largest, std::fabs(want[k]));
+                }
+                // a cell's faces are added in another order on the device: rounding of a sum of a dozen terms.
+                // MEASURED worst, of the largest cell's sum: 2.8e-16 damBreakPorousBaffle, 3.4e-16
+                // damBreakLeakage, 3.6e-16 mixerVesselAMI (83,656 coupled faces); the bound is a decade above.
+                // A face left out moves its cell's sum by the face's own flux -- half of it, on the baffle.
+                const scalar allowed = scalar(4.0e-15);
+                auto held = [&](
+                    const char* which,
+                    const std::vector<scalar>& device,
+                    const std::vector<scalar>& host) -> scalar
+                {
+                    if (device.size() != host.size())
+                    {
+                        throw std::runtime_error(
+                            std::string("brae interFoam (device): BRAE_CONTROL_COURANT_CHECK: the ") + which
+                            + " flux sum came down with " + std::to_string(device.size()) + " cells for "
+                            + std::to_string(host.size()) + ".");
+                    }
+                    scalar worst = 0;
+                    std::size_t worstCell = 0;
+                    for (std::size_t k = 0; k < host.size(); ++k)
+                    {
+                        // written so that a sum that is not a number is the worst cell, and stops the run
+                        const scalar d = std::fabs(host[k] - device[k]);
+                        if (d <= worst) continue;
+                        worst = d;
+                        worstCell = k;
+                    }
+                    if (!(worst <= allowed*largest))
+                    {
+                        char buf[400];
+                        std::snprintf(buf, sizeof(buf),
+                                      "brae interFoam (device): BRAE_CONTROL_COURANT_CHECK: cell %zu's %s flux "
+                                      "sum is %.17g on the device and %.17g as the host sums every patch's "
+                                      "faces: %.3e of the largest cell's sum %.17g, allowed %.1e.", worstCell,
+                                      which, device[worstCell], host[worstCell],
+                                      (double)(largest > 0 ? worst/largest : worst), largest, (double)allowed);
+                        throw std::runtime_error(buf);
+                    }
+                    return largest > 0 ? worst/largest : scalar(0);
+                };
+                const scalar offAll = held("whole", sumPhiDevice, want);
+                const scalar offBand = held("interface band", sumPhiBandDevice, wantBand);
+                // a call with no flux anywhere compares zeros and holds nothing: counted apart, and said
+                // whenever the count of those that hold something, the worst cell or the pair's band grows
+                static long compared = 0;
+                static scalar worstSeen = -1;
+                static label mostBandFaces = -1;
+                if (largest > 0)
+                {
+                    ++compared;
+                    const scalar now = std::fmax(offAll, offBand);
+                    if (compared == 1 || now > worstSeen || pairBandFaces > mostBandFaces)
+                    {
+                        worstSeen = std::fmax(worstSeen, now);
+                        mostBandFaces = pairBandFaces > mostBandFaces ? pairBandFaces : mostBandFaces;
+                        std::printf("  Courant check: %ld calls with a flux compared; the worst cell is %.3g of "
+                                    "the largest sum off the host's; %ld faces of the pair carry a flux into "
+                                    "the interface band\n", compared, (double)worstSeen, (long)mostBandFaces);
+                    }
+                }
+            }
             rep.deltaT = setDeltaTVoF(rep.deltaT, rep.CoNum, rep.alphaCoNum, f.timeCtl,
                                       rep.time - startTime, &f.writeCadence);
         }

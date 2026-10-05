@@ -38,7 +38,9 @@
 // interface must not be throttled.
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
+#include "device_cyclic.cuh"
 #include "device_mesh.cuh"
+#include <vector>
 
 namespace brae {
 
@@ -51,11 +53,27 @@ struct DeviceCourantNumbers
 // surfaceSum(mag(phi)) per cell, masked to the interface band, reduced to the two numbers
 // alphaCourantNo.H prints. `alpha1` null gives the ORDINARY Courant number -- the same formula with no
 // mask -- so the two cannot drift apart, which is the reason the host shares courantNo() too.
+//
+// A COUPLED PAIR'S FACES ARE PATCH FACES TOO. surfaceSum loops over every patch of mesh.boundary()
+// (fvcSurfaceIntegrate.C:170-182), a cyclic, cyclicAMI or cyclicACMI one included, and adds each face's |phi|
+// to its face cell. The device keeps those faces apart from its boundary list (`phiBnd` has none of them), so
+// their flux is handed in with the pair: `cyc`, whose `phi` is the flux on each coupled face and whose
+// ifCellStart/ifPerm name a cell's coupled faces. Null on a mesh without a pair. LEFT OUT UNTIL 2026-10-05: a
+// cell on the pair had a short sum -- by up to half for flow straight through it -- so a step limited by such a
+// cell would have been longer than OpenFOAM's. No measured step was (the three tutorials with a pair are
+// limited at the free surface), which is why no gate saw it; brae's host loop always included them.
+//   BRAE_CONTROL_COURANT_PAIR_LEFT_OUT=1   a gate's CONTROL, deliberately wrong: the pair's faces left out
+//                                          again; `=interface` leaves them out of the masked sum alone
+// `cyc` HAS NO DEFAULT: a call that forgets the pair is the defect, so a caller without one writes nullptr.
+// `sumPhiOut`, where given, takes the per-cell sum down (masked when alpha1 is given): the driver's check
+// compares it with the host's surfaceSumMagPhi cell for cell.
 DeviceCourantNumbers deviceAlphaCourantNo(
-    const DeviceMesh&           dm,
+    const DeviceMesh& dm,
     const DeviceBuffer<scalar>& phiInt,
     const DeviceBuffer<scalar>& phiBnd,
     const DeviceBuffer<scalar>* alpha1,
-    scalar                      deltaT);
+    scalar deltaT,
+    const DeviceCyclic* cyc,
+    std::vector<scalar>* sumPhiOut = nullptr);
 
 } // namespace brae

@@ -115,7 +115,7 @@ int main()
 
     // ---- 1. against the host --------------------------------------------------------------------
     const CourantNumbers host = alphaCourantNo(sumPhi, alpha, g.V(), dt);
-    const DeviceCourantNumbers dev = deviceAlphaCourantNo(dm, dPhiInt, dPhiBnd, &dAlpha, dt);
+    const DeviceCourantNumbers dev = deviceAlphaCourantNo(dm, dPhiInt, dPhiBnd, &dAlpha, dt, nullptr);
     if (cudaDeviceSynchronize() != cudaSuccess)
     { std::printf("  FAIL: kernels did not complete\n"); return 1; }
     std::printf("  alphaCoNum: device %.17g, host %.17g;  mean: %.17g / %.17g\n",
@@ -196,8 +196,8 @@ int main()
     {
         std::vector<scalar> dry(static_cast<std::size_t>(nC), scalar(0));   // all air, no band
         DeviceBuffer<scalar> dDry(dry);
-        const DeviceCourantNumbers none = deviceAlphaCourantNo(dm, dPhiInt, dPhiBnd, &dDry, dt);
-        const DeviceCourantNumbers ord  = deviceAlphaCourantNo(dm, dPhiInt, dPhiBnd, nullptr, dt);
+        const DeviceCourantNumbers none = deviceAlphaCourantNo(dm, dPhiInt, dPhiBnd, &dDry, dt, nullptr);
+        const DeviceCourantNumbers ord  = deviceAlphaCourantNo(dm, dPhiInt, dPhiBnd, nullptr, dt, nullptr);
         const CourantNumbers hostOrd = courantNo(sumPhi, g.V(), dt);
         std::printf("  with no interface: alphaCo %.3e; the ordinary Co on the same flux %.6f "
                     "(host %.6f)\n", (double)none.CoNum, (double)ord.CoNum, (double)hostOrd.CoNum);
