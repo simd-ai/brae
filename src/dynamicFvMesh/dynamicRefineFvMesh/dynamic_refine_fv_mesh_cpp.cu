@@ -1866,6 +1866,238 @@ std::vector<scalar> mapSurfaceField(
 }
 
 // ----------------------------------------------------------------------------------------------
+// THE INTERPOLATIVE FACE MAPPING IN THREE LISTS. faceMapper's interpolative addressing is a list of lists
+// (faceMapper.C:95-190) and so is FaceMapping's. An unrefinement makes the mapping interpolative for the
+// sake of the few faces it merges, and then EVERY face of the mesh carries two heap lists of length one.
+// MEASURED on damBreakWithObstacle, 2026-10-05: 290,168 rows of one source and 48 of four; faceMapping
+// 15.3 ms, surfaceMapping's copy of it 14.2 and the two freed 13.6 -- 43 of the 61 ms an unrefinement's
+// field mapping took. Here row i's sources are addressing[start[i] .. start[i+1]), so a mapping is three
+// allocations whatever the mesh's size: 57.0 -> 16.0 ms a call, the step 179.7 -> 168.0; RAS/motorBike
+// 28.3 -> 8.0 a call, 166.1 -> 160.3.
+// The rows, their order and their weights are faceMapping's and surfaceMapping's own, and the appliers below
+// accumulate in the same expression as mapSurfaceField, so a mapped field is the same bits:
+// BRAE_CONTROL_FACE_MAPPING_CHECK=1 builds both and compares every carried surface field at every change,
+// BRAE_CONTROL_FACE_MAPPING_NESTED=1 holds the mapping as the lists of lists alone.
+
+namespace {
+
+struct FlatFaceMapping
+{
+    std::vector<label>  start;
+    std::vector<label>  addressing;
+    std::vector<scalar> weights;
+    std::vector<label>  insertedFaces;
+
+    std::size_t size() const
+    {
+        return start.empty() ? std::size_t(0) : start.size() - 1;
+    }
+};
+
+// faceMapping's interpolative branch, row for row: a face named by one of the three inflation maps takes
+// that map's masters at equal weights, any other its faceMap entry at weight one, and a face with neither is
+// an inserted one addressed at old face 0.
+FlatFaceMapping flatFaceMapping(
+    const cpu::polyTopoChange::TopoChangeMap& map,
+    label                                     nNewFaces)
+{
+    const std::size_t n = static_cast<std::size_t>(nNewFaces);
+    std::vector<const std::vector<label>*> masters(n, nullptr);
+    const auto take = [&](
+        const std::vector<cpu::polyTopoChange::ObjectMap>& maps)
+    {
+        for (const cpu::polyTopoChange::ObjectMap& m : maps)
+        {
+            if (m.masterObjects.empty()) continue;
+            const std::size_t facei = static_cast<std::size_t>(m.index);
+            if (masters[facei] != nullptr)
+                throw std::runtime_error(
+                    "brae faceMapper: face " + std::to_string(m.index) + " is mapped twice. OpenFOAM "
+                    "FatalErrors here too (faceMapper.C:118-126).");
+            masters[facei] = &m.masterObjects;
+        }
+    };
+    take(map.facesFromPoints);
+    take(map.facesFromEdges);
+    take(map.facesFromFaces);
+
+    FlatFaceMapping fm;
+    fm.start.resize(n + 1);
+    std::size_t total = 0;
+    for (std::size_t facei = 0; facei < n; ++facei)
+    {
+        fm.start[facei] = static_cast<label>(total);
+        total += (masters[facei] != nullptr) ? masters[facei]->size() : std::size_t(1);
+    }
+    fm.start[n] = static_cast<label>(total);
+    fm.addressing.resize(total);
+    fm.weights.resize(total);
+    for (std::size_t facei = 0; facei < n; ++facei)
+    {
+        std::size_t at = static_cast<std::size_t>(fm.start[facei]);
+        if (masters[facei] != nullptr)
+        {
+            const scalar w = scalar(1)/static_cast<scalar>(masters[facei]->size());
+            for (const label a : *masters[facei])
+            {
+                fm.addressing[at] = a;
+                fm.weights[at] = w;
+                ++at;
+            }
+            continue;
+        }
+        const label mapped = map.faceMap[facei];
+        fm.addressing[at] = (mapped >= 0) ? mapped : label(0);
+        fm.weights[at] = scalar(1);
+        if (mapped < 0) fm.insertedFaces.push_back(static_cast<label>(facei));
+    }
+    return fm;
+}
+
+// surfaceMapping's interpolative branch: the internal faces' rows, and a row that reaches an old BOUNDARY
+// face becomes old face 0 at weight one (fvSurfaceMapper.C:74-79, and the test is `>=`).
+// `unweighted` is the gate's control and nothing else: a merged internal face's sources at weight one each,
+// so the face is given their sum where it should have their mean. It is HERE and not in flatFaceMapping
+// because there the patches' rows differ too, and the check stopped on those first (MEASURED 2026-10-05,
+// oscillatingBox: "patch `walls` has other rows") -- which left the fields' comparison unproven.
+FlatFaceMapping flatSurfaceMapping(
+    const FlatFaceMapping& fm,
+    label                  nNewInternalFaces,
+    label                  nOldInternalFaces,
+    bool                   unweighted)
+{
+    const std::size_t n = static_cast<std::size_t>(nNewInternalFaces);
+    FlatFaceMapping sm;
+    sm.start.resize(n + 1);
+    sm.addressing.reserve(static_cast<std::size_t>(fm.start[n]));
+    sm.weights.reserve(static_cast<std::size_t>(fm.start[n]));
+    for (std::size_t facei = 0; facei < n; ++facei)
+    {
+        sm.start[facei] = static_cast<label>(sm.addressing.size());
+        const std::size_t b = static_cast<std::size_t>(fm.start[facei]);
+        const std::size_t e = static_cast<std::size_t>(fm.start[facei + 1]);
+        label mx = -1;
+        for (std::size_t j = b; j < e; ++j)
+        {
+            if (fm.addressing[j] > mx) mx = fm.addressing[j];
+        }
+        if (mx >= nOldInternalFaces)
+        {
+            sm.addressing.push_back(label(0));
+            sm.weights.push_back(scalar(1));
+            continue;
+        }
+        for (std::size_t j = b; j < e; ++j)
+        {
+            sm.addressing.push_back(fm.addressing[j]);
+            sm.weights.push_back(unweighted ? scalar(1) : fm.weights[j]);
+        }
+    }
+    sm.start[n] = static_cast<label>(sm.addressing.size());
+    for (const label facei : fm.insertedFaces)
+    {
+        if (facei < nNewInternalFaces) sm.insertedFaces.push_back(facei);
+    }
+    return sm;
+}
+
+// A patch's rows handed to patchMapping itself, so its rule -- the sources outside the old patch dropped and
+// the rest re-scaled -- is written once. A patch field's autoMap reads a FaceMapping, and the patches are
+// 8,994 of that mesh's 290,216 faces, so their rows stay lists.
+FaceMapping flatPatchMapping(
+    const FlatFaceMapping& fm,
+    label                  newPatchStart,
+    label                  newPatchSize,
+    label                  oldPatchStart,
+    label                  oldPatchSize)
+{
+    const std::size_t n = static_cast<std::size_t>(newPatchSize);
+    FaceMapping rows;
+    rows.direct = false;
+    rows.addressing.resize(n);
+    rows.weights.resize(n);
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        const std::size_t facei = static_cast<std::size_t>(newPatchStart) + i;
+        const auto b = static_cast<std::ptrdiff_t>(fm.start[facei]);
+        const auto e = static_cast<std::ptrdiff_t>(fm.start[facei + 1]);
+        rows.addressing[i].assign(fm.addressing.begin() + b, fm.addressing.begin() + e);
+        rows.weights[i].assign(fm.weights.begin() + b, fm.weights.begin() + e);
+    }
+    return patchMapping(rows, 0, newPatchSize, oldPatchStart, oldPatchSize);
+}
+
+// mapSurfaceField's interpolative branch through the three lists. Each overload accumulates in the
+// expression its nested twin uses -- `v += w*f` for a scalar, `v = v + w*f` for a vector -- because that is
+// what the compiler contracts into a fused multiply-add, and a different shape may round differently.
+std::vector<scalar> mapSurfaceFieldFlat(
+    const std::vector<scalar>& oldField,
+    const FlatFaceMapping&     sm,
+    bool                       oriented,
+    const std::vector<label>&  flipFaceFlux)
+{
+    std::vector<scalar> out(sm.size(), scalar(0));
+    // the empty-field rule -- see mapSurfaceFieldT
+    if (!oldField.empty())
+    {
+        for (std::size_t i = 0; i < out.size(); ++i)
+        {
+            scalar v = 0;
+            const std::size_t e = static_cast<std::size_t>(sm.start[i + 1]);
+            for (std::size_t j = static_cast<std::size_t>(sm.start[i]); j < e; ++j)
+            {
+                v += sm.weights[j]*oldField[static_cast<std::size_t>(sm.addressing[j])];
+            }
+            out[i] = v;
+        }
+    }
+    if (oriented)
+    {
+        for (const label facei : flipFaceFlux)
+        {
+            if (facei < static_cast<label>(out.size())) out[static_cast<std::size_t>(facei)] *= scalar(-1);
+        }
+    }
+    return out;
+}
+
+std::vector<vector> mapSurfaceFieldFlat(
+    const std::vector<vector>& oldField,
+    const FlatFaceMapping&     sm,
+    bool                       oriented,
+    const std::vector<label>&  flipFaceFlux)
+{
+    const vector zero{0, 0, 0};
+    std::vector<vector> out(sm.size(), zero);
+    if (!oldField.empty())
+    {
+        for (std::size_t i = 0; i < out.size(); ++i)
+        {
+            vector v = zero;
+            const std::size_t e = static_cast<std::size_t>(sm.start[i + 1]);
+            for (std::size_t j = static_cast<std::size_t>(sm.start[i]); j < e; ++j)
+            {
+                v = v + sm.weights[j]*oldField[static_cast<std::size_t>(sm.addressing[j])];
+            }
+            out[i] = v;
+        }
+    }
+    if (oriented)
+    {
+        for (const label facei : flipFaceFlux)
+        {
+            if (facei < static_cast<label>(out.size()))
+            {
+                out[static_cast<std::size_t>(facei)] = scalar(-1)*out[static_cast<std::size_t>(facei)];
+            }
+        }
+    }
+    return out;
+}
+
+}   // namespace
+
+// ----------------------------------------------------------------------------------------------
 // UNIT 7: the driver. See the header.
 
 namespace {
@@ -2317,8 +2549,33 @@ void mapCarriedFields(
     // the NEW mesh's cell-face list and geometry, which the caller has just built (the step's addressing): this
     // routine built both again, the first as a list of lists
     LabelListListRef                          newCells,
-    const FvGeometry&                         gNew)
+    const FvGeometry&                         gNew,
+    // which side calls, for the timers alone: the same routine is 11 ms a call after a refinement and 59 after
+    // an unrefinement (MEASURED on damBreakWithObstacle, 2026-10-05), so each side is timed under its own names
+    bool                                      unrefining = false)
 {
+    static const char* const stageNames[2][8] =
+    {
+        {"refine map: the cell mapping and the cell fields",
+         "refine map: the face, surface and patch mappings; the new mesh's view",
+         "refine map: the carried fields' patch fields (autoMap)",
+         "refine map: the surface scalars and the flux correction",
+         "refine map: the surface vectors and their average",
+         "refine map: the hull average on the surface scalars",
+         "refine map: the old volumes and points0",
+         "refine map: the mappings freed"},
+        {"unrefine map: the cell mapping and the cell fields",
+         "unrefine map: the face, surface and patch mappings; the new mesh's view",
+         "unrefine map: the carried fields' patch fields (autoMap)",
+         "unrefine map: the surface scalars and the flux correction",
+         "unrefine map: the surface vectors and their average",
+         "unrefine map: the hull average on the surface scalars",
+         "unrefine map: the old volumes and points0",
+         "unrefine map: the mappings freed"}
+    };
+    const char* const* stageName = stageNames[unrefining ? 1 : 0];
+    std::optional<interPhase::Nested> stage;
+    stage.emplace(stageName[0]);
     const CellMapping cm = cellMapping(map, nNewCells, oldCellVolumes);
     for (std::vector<scalar>& f : s.cellScalars) f = mapCellField(f, cm);
     for (std::vector<vector>& f : s.cellVectors) f = mapCellField(f, cm);
@@ -2335,16 +2592,91 @@ void mapCarriedFields(
     if (!s.surfaceScalars.empty() || !s.surfaceVectors.empty()
      || !s.carriedScalarFields.empty() || !s.carriedVectorFields.empty())
     {
-        const FaceMapping fm = faceMapping(map, s.m.nFaces());
-        const FaceMapping sm = surfaceMapping(fm, s.m.nInternalFaces(), nOldInternalFaces);
+        stage.emplace(stageName[1]);
+        // the three lists stand in for the lists of lists on an INTERPOLATIVE mapping only: a direct one
+        // (every refinement's) holds no list a face, and its builders are 0.5 ms a call
+        static const bool nestedOnly = std::getenv("BRAE_CONTROL_FACE_MAPPING_NESTED") != nullptr;
+        static const bool flatCheck = std::getenv("BRAE_CONTROL_FACE_MAPPING_CHECK") != nullptr;
+        static const bool flatUnweighted = std::getenv("BRAE_CONTROL_FACE_MAPPING_UNWEIGHTED") != nullptr;
+        const bool interpolative = !map.facesFromPoints.empty() || !map.facesFromEdges.empty()
+                                || !map.facesFromFaces.empty();
+        const bool flat = interpolative && !nestedOnly;
+        const bool nested = !flat || flatCheck;
+        FaceMapping fm;
+        FaceMapping sm;
+        FlatFaceMapping fmFlat;
+        FlatFaceMapping smFlat;
+        if (nested)
+        {
+            fm = faceMapping(map, s.m.nFaces());
+            sm = surfaceMapping(fm, s.m.nInternalFaces(), nOldInternalFaces);
+        }
+        if (flat)
+        {
+            static bool said = false;
+            if (!said)
+            {
+                said = true;
+                std::printf("  refinement: an interpolative face mapping is held as three lists; "
+                            "BRAE_CONTROL_FACE_MAPPING_NESTED=1 holds it as a list of lists a face\n");
+                if (flatUnweighted)
+                {
+                    std::printf("  *** CONTROL MODE: a merged internal face's sources are weighted one each, "
+                                "so it is given their sum. This run is deliberately wrong. ***\n");
+                }
+            }
+            fmFlat = flatFaceMapping(map, s.m.nFaces());
+            smFlat = flatSurfaceMapping(fmFlat, s.m.nInternalFaces(), nOldInternalFaces, flatUnweighted);
+        }
         const std::vector<PatchInfo>& patches = s.m.patches();
         std::vector<FaceMapping> pm;
         pm.reserve(patches.size());
         for (std::size_t p = 0; p < patches.size(); ++p)
         {
-            pm.push_back(patchMapping(fm, patches[p].start, patches[p].size, map.oldPatchStarts[p],
-                                      map.oldPatchSizes[p]));
+            if (!flat)
+            {
+                pm.push_back(patchMapping(fm, patches[p].start, patches[p].size, map.oldPatchStarts[p],
+                                          map.oldPatchSizes[p]));
+                continue;
+            }
+            pm.push_back(flatPatchMapping(fmFlat, patches[p].start, patches[p].size, map.oldPatchStarts[p],
+                                          map.oldPatchSizes[p]));
+            if (!flatCheck) continue;
+            const FaceMapping ref = patchMapping(fm, patches[p].start, patches[p].size, map.oldPatchStarts[p],
+                                                 map.oldPatchSizes[p]);
+            if (ref.addressing != pm.back().addressing || ref.weights != pm.back().weights)
+                throw std::runtime_error(
+                    "brae dynamicRefineFvMesh FACE_MAPPING_CHECK: patch `" + patches[p].name + "` has other "
+                    "rows from the three lists than from patchMapping on the lists of lists.");
         }
+        // a surface field's internal half through whichever mapping was built -- and through both under the
+        // check, which compares every face's bits
+        const auto mapInternal = [&](
+            const auto& oldField,
+            bool        oriented,
+            const char* kind)
+        {
+            if (!flat) return mapSurfaceField(oldField, sm, oriented, map.flipFaceFlux);
+            auto out = mapSurfaceFieldFlat(oldField, smFlat, oriented, map.flipFaceFlux);
+            if (!flatCheck) return out;
+            const auto ref = mapSurfaceField(oldField, sm, oriented, map.flipFaceFlux);
+            bool same = ref.size() == out.size();
+            for (std::size_t i = 0; same && i < out.size(); ++i)
+            {
+                if (std::memcmp(&ref[i], &out[i], sizeof(out[i])) == 0) continue;
+                throw std::runtime_error(
+                    std::string("brae dynamicRefineFvMesh FACE_MAPPING_CHECK: a carried surface ") + kind
+                    + " differs at internal face " + std::to_string(i) + " of " + std::to_string(out.size())
+                    + " between the three lists and the lists of lists (" + std::to_string(smFlat.start[i + 1]
+                    - smFlat.start[i]) + " sources).");
+            }
+            if (!same)
+                throw std::runtime_error(
+                    std::string("brae dynamicRefineFvMesh FACE_MAPPING_CHECK: a carried surface ") + kind
+                    + " has " + std::to_string(out.size()) + " faces from the three lists and "
+                    + std::to_string(ref.size()) + " from the lists of lists.");
+            return out;
+        };
 
         // what the hull average reads off the NEW mesh, built once for all the fields
         const MapPolyMesh mpmF = mapPolyMeshFrom(map, oldCellVolumes);
@@ -2372,6 +2704,7 @@ void mapCarriedFields(
         // UNIT 8a: whole fields, cells and patch fields together. The cell half went through the cell
         // mapper above; here each patch field is mapped by its OWN autoMap, which is what fills an
         // unmapped face from the internal field and what maps the type's own state.
+        stage.emplace(stageName[2]);
         for (GeometricField<scalar>* f : s.carriedScalarFields)
         {
             if (f->boundary.size() != patches.size())
@@ -2449,9 +2782,10 @@ void mapCarriedFields(
         }
 
         // STEP ONE for the surface fields: the addressing, and the flip on an oriented one.
+        stage.emplace(stageName[3]);
         for (RefineUpdateState::CarriedSurfaceField& f : s.surfaceScalars)
         {
-            f.field = mapSurfaceField(f.field, sm, f.oriented, map.flipFaceFlux);
+            f.field = mapInternal(f.field, f.oriented, "scalar");
             std::vector<std::vector<scalar>> bnd(patches.size());
             for (std::size_t p = 0; p < patches.size(); ++p)
             {
@@ -2481,9 +2815,10 @@ void mapCarriedFields(
 
         // the surface VECTORS -- Uf -- through the same addressing, and then the FLAT hull average,
         // because an unoriented field is averaged as itself
+        stage.emplace(stageName[4]);
         for (RefineUpdateState::CarriedSurfaceVectorField& f : s.surfaceVectors)
         {
-            f.field = mapSurfaceField(f.field, sm, f.oriented, map.flipFaceFlux);
+            f.field = mapInternal(f.field, f.oriented, "vector");
             std::vector<std::vector<vector>> bnd(patches.size());
             for (std::size_t p = 0; p < patches.size(); ++p)
             {
@@ -2497,6 +2832,7 @@ void mapCarriedFields(
         // registry and not only on the ones correctFluxes names: mapFields calls mapNewInternalFaces
         // outside the per-flux loop. MEASURED: without it brae wrote face 0's value (0) on new internal
         // face 6293 where OpenFOAM had 5232.5, the mean of the two old faces of its hull.
+        stage.emplace(stageName[5]);
         for (RefineUpdateState::CarriedSurfaceField& f : s.surfaceScalars)
         {
             if (f.oriented)
@@ -2509,11 +2845,20 @@ void mapCarriedFields(
                 mapNewInternalFacesFlat(f.field, f.bnd, mpmF, fv);
             }
         }
+        // the lists of lists are two heap blocks a face, and freeing them is 13.6 ms of an unrefinement on
+        // damBreakWithObstacle: released here by hand so the hull average's timer does not carry it
+        stage.emplace(stageName[7]);
+        fm = FaceMapping();
+        sm = FaceMapping();
+        fmFlat = FlatFaceMapping();
+        smFlat = FlatFaceMapping();
+        pm.clear();
     }
 
     // V0 comes into existence at the FIRST change and not before -- fvMesh::updateMesh only stores old
     // volumes when the current ones already exist, and what it stores is the OLD mesh's volumes -- and it
     // is stored again at the first change of every later time index (see RefineUpdateState::V0TimeIndex)
+    stage.emplace(stageName[6]);
     if (s.V0.empty() || s.V0TimeIndex != timeIndex)
     {
         s.V0 = oldCellVolumes;
@@ -2840,7 +3185,8 @@ RefineUpdateStep refineUpdate(
             updatePatchesInPlace(s.patches, buildPatches(s.m, a.g));
             part.emplace("unrefine: the carried fields mapped and the fluxes corrected");
             mapCarriedFields(s, r.unrefineMap, oldV, out.nCells, a.g.V(), nOldInternalFaces, timeIndex, a.cells,
-                             a.g);
+                             a.g, /*unrefining=*/true);
+            part.emplace("unrefine: the fluxes' second correction");
             // ...and then unrefine's second correction, which runs AFTER updateMesh and so after the
             // hull average (:610-689)
             if (!s.injectedPhiU.empty() && !faceToSplitPoint.empty())
