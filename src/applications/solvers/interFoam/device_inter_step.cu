@@ -8,6 +8,8 @@
 #include "device_pcg.cuh"
 #include "device_amg.cuh"   // deviceSymGaussSeidel
 #include "device_divdevreff.cuh"   // deviceBoundaryGradU
+#include <string>
+#include <optional>
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdio>
@@ -506,6 +508,8 @@ void deviceInterStep(
                 "brae interFoam device step: `momentumPredictor yes` needs snGrad(p_rgh) over the full "
                 "face array from the interface-force hook. It is EXPLICIT in UEqn and IMPLICIT in the "
                 "pressure equation, and carrying it into both would count the pressure gradient twice.");
+        std::optional<interPhase::Nested> predictorPart;
+        predictorPart.emplace("predictor: the force flux and the source");
         DeviceBuffer<scalar> force;
         deviceMomentumSourceFlux(nFaces, stf, ghf, snGradRho, snGradPrgh, magSf, force);
 
@@ -547,6 +551,7 @@ void deviceInterStep(
             // fvMatrixSolve.C:162-164: a component the mesh does not solve is SKIPPED, not solved to
             // zero -- on a 2-D case that is the empty direction, and OpenFOAM's log has no Uz line.
             if (ctl.solutionD[k] == -1) continue;
+            predictorPart.emplace("predictor: a component's fold and norm factor");
             DeviceBuffer<scalar> diagC, b;
             deviceFold(dm, UEqn.relaxed ? UEqn.relaxedDiag : UEqn.diag, *Sk[k],
                        UEqn.iC[k], UEqn.bC[k], diagC, b);
@@ -559,7 +564,14 @@ void deviceInterStep(
             // the case's own smoother where it names one -- see deviceAlphaPreSolve for what a
             // substituted solver at the same tolerance costs
             DeviceSolverPerf perf;
-            if (ctl.momentum.smoothSolver)
+            // TRIED 2026-10-05 and dropped (the user's decision): the Jacobi BiCGStab here in the smoothSolver's
+            // place. The predictor went 164.5 -> 54.2 ms a step on RAS/mixerVesselAMI, but it is not the case's
+            // solver (the run ends elsewhere inside the tolerance) and the device BiCGStab's graph loop
+            // crashed there on the moving pair.
+            const bool sweeps = ctl.momentum.smoothSolver;
+            predictorPart.emplace(sweeps ? "predictor: a component's solve (smoothSolver)"
+                                         : "predictor: a component's solve (BiCGStab)");
+            if (sweeps)
             {
                 deviceSymGaussSeidel(Ak, b, *Uk[k], dNf.data(), ctl.momentum.tol, ctl.momentum.relTol,
                                      ctl.momentum.maxIter, &perf, ctl.momentum.minIter,
@@ -576,12 +588,15 @@ void deviceInterStep(
                                             ctl.momentum.relTol, ctl.momentum.maxIter,
                                             /*checkEvery=*/1, ctl.momentum.minIter);
             }
+            // the iterations, in the table's calls column (no time is charged)
+            interPhase::charge("predictor: iterations of the component solves (a count)", 0.0, perf.nIterations);
             if (ctl.momentumSolveLog)
             {
                 ctl.momentumSolveLog[k].push_back(perf);
             }
         }
         // the predictor's solve ends in U.correctBoundaryConditions(), which clears updated()
+        predictorPart.emplace("predictor: U's boundary after the solves");
         hooks.updateUBoundary(UX, UY, UZ, dbU, ub, DeviceUBoundaryCall::evaluateAfterPredictor);
         deviceUpdateInletOutlet(dbU, namedUFlux(phiBnd));
         deviceUpdatePressureInletOutletVelocity(dbU, namedUFlux(phiBnd), UX, UY, UZ, /*directionMixed=*/true);

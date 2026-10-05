@@ -1944,6 +1944,10 @@ void buildAddressing(
     part.emplace("addressing: edges (buildMeshEdges)");
     a.edges = buildMeshEdges(m);
     part.emplace("addressing: faceEdges, edgeFaces, cellEdges");
+    // TRIED 2026-10-05 and dropped: these three lists built by the host's threads (a row reads no other row, so
+    // each came out entry for entry the same). MEASURED, 16 threads: 14.4 -> 10.1 ms a step on
+    // damBreakWithObstacle and 9.9 -> 6.1 on motorBike, the steps 181.1 -> 175.5 and 163.8 -> 161.1 -- the
+    // threads' start-up and the per-range counts eat most of what the ranges save at these sizes.
     a.faceEdges = compactFaceEdges(m, a.edges);
     a.edgeFaces = compactEdgeFaces(m, a.faceEdges);
     a.cellEdges = compactCellEdges(a.cells, a.faceEdges);

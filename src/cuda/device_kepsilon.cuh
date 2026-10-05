@@ -190,9 +190,14 @@ inline DeviceWallData buildDeviceWallData(
     const FvGeometry& g,
     const std::vector<FvPatch>& fvp,
     const std::vector<std::vector<vector>>& wallU,
-    const std::vector<char>& wfPatch = {})
+    const std::vector<char>& wfPatch = {},
+    // the near-wall distance where the caller has it already (refreshDeviceInterTurbulenceGeometry, which
+    // measures it once a move for this and for the faces' y); null measures it here
+    const std::vector<std::vector<scalar>>* yGiven = nullptr)
 {
-    const std::vector<std::vector<scalar>> yW = nearWallDist(m, g, fvp);
+    const std::vector<std::vector<scalar>> yOwn = yGiven ? std::vector<std::vector<scalar>>{}
+                                                         : nearWallDist(m, g, fvp);
+    const std::vector<std::vector<scalar>>& yW = yGiven ? *yGiven : yOwn;
     std::vector<label> wfCell;
     std::vector<scalar> wfY, wfDc, wux, wuy, wuz;
     std::vector<label> nw(m.nCells(), 0);

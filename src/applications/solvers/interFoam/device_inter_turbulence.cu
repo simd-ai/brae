@@ -1,4 +1,10 @@
 // interFoam's turbulence on the device. See device_inter_turbulence.cuh for what each input is.
+#include <algorithm>
+#include <string>
+#include <cstring>
+#include <thread>
+#include <optional>
+#include "inter_phase_time.cuh"
 #include "device_inter_turbulence.cuh"
 #include "device_les_keqn.cuh"
 #include "device_blas.cuh"
@@ -464,10 +470,69 @@ void refreshDeviceInterTurbulenceGeometry(
 
     // The wall faces' y, deltaCoeffs and wall velocity. The wall velocity comes from the host U as it
     // stands, which is what the build took and what this driver's dbU is rebuilt from after a move.
-    d.wall = buildDeviceWallData(m, g, patches, U, wfPatch);
-
-    // ...and the per-boundary-face near-wall distance the nut and epsilon/omega wall functions read.
-    const std::vector<std::vector<scalar>> yW = nearWallDist(m, g, patches);
+    // THE NEAR-WALL DISTANCE IS MEASURED ONCE A MOVE. buildDeviceWallData measures it itself and this routine
+    // then measured it AGAIN, both through nearWallDist, which rebuilds its neighbour lists at every call --
+    // MEASURED on RAS/mixerVesselAMI (894,950 cells), 56.5 and 52.0 ms a step of this refresh's 108.9. Now once,
+    // by nearWallDistKept (the lists kept in `d`, the distances on the host's threads), and handed to both:
+    // 8.6 ms, the same number on every face to the bit.
+    //   BRAE_CONTROL_CLOSURE_REFRESH_TWICE=1   the two nearWallDist calls, as before
+    //   BRAE_CONTROL_NEAR_WALL_CHECK=1         the distance compared with nearWallDist's, face for face, bitwise
+    //   BRAE_CONTROL_NEAR_WALL_SELF_ONLY=1     a gate's CONTROL, deliberately wrong: no neighbour is measured
+    //   BRAE_NEAR_WALL_THREADS=n               the thread count (16 at most by default)
+    static const bool twice = std::getenv("BRAE_CONTROL_CLOSURE_REFRESH_TWICE") != nullptr;
+    static const bool check = std::getenv("BRAE_CONTROL_NEAR_WALL_CHECK") != nullptr;
+    static const bool selfOnly = std::getenv("BRAE_CONTROL_NEAR_WALL_SELF_ONLY") != nullptr;
+    static const unsigned nThreads = []()
+    {
+        const char* e = std::getenv("BRAE_NEAR_WALL_THREADS");
+        const int asked = e ? std::atoi(e) : 0;
+        if (e && asked < 1)
+        {
+            throw std::runtime_error(std::string("brae interFoam: BRAE_NEAR_WALL_THREADS=") + e
+                                     + " is not a count of 1 or more.");
+        }
+        const unsigned have = std::max(1u, std::thread::hardware_concurrency());
+        return asked > 0 ? static_cast<unsigned>(asked) : std::min(have, 16u);
+    }();
+    std::optional<interPhase::Nested> part;
+    std::vector<std::vector<scalar>> yW;
+    if (twice)
+    {
+        part.emplace("closure refresh: the wall faces' data (buildDeviceWallData)");
+        d.wall = buildDeviceWallData(m, g, patches, U, wfPatch);
+        part.emplace("closure refresh: nearWallDist (host)");
+        yW = nearWallDist(m, g, patches);
+    }
+    else
+    {
+        part.emplace("closure refresh: the near-wall distance, once (kept lists, host threads)");
+        yW = nearWallDistKept(m, g, patches, d.nearWallKept, nThreads, selfOnly);
+        if (check)
+        {
+            const std::vector<std::vector<scalar>> want = nearWallDist(m, g, patches);
+            for (std::size_t pi = 0; pi < want.size(); ++pi)
+            {
+                for (std::size_t i = 0; i < want[pi].size(); ++i)
+                {
+                    if (std::memcmp(&want[pi][i], &yW[pi][i], sizeof(scalar)) == 0) continue;
+                    char buf[240];
+                    std::snprintf(buf, sizeof(buf),
+                                  "brae interFoam: BRAE_CONTROL_NEAR_WALL_CHECK: patch %s, face %zu is %.17g and "
+                                  "nearWallDist gives %.17g.", patches[pi].name.c_str(), i, yW[pi][i],
+                                  want[pi][i]);
+                    throw std::runtime_error(buf);
+                }
+            }
+        }
+        part.emplace("closure refresh: the wall faces' data from it");
+        std::vector<std::vector<vector>> wallU(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (patches[pi].type == "wall") wallU[pi] = U.boundary[pi]->value();
+        }
+        d.wall = buildDeviceWallData(m, g, patches, wallU, wfPatch, &yW);
+    }
+    part.emplace("closure refresh: the faces' y flattened and up, the cell fields up");
     std::vector<scalar> yBnd;
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {

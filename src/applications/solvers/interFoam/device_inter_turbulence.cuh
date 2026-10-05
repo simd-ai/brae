@@ -57,6 +57,8 @@ struct DeviceInterTurbulence
     DeviceBoundary dbK;
     DeviceBoundary dbEps;
     DeviceWallData wall;
+    // which wall faces neighbour which, kept from one mesh move to the next (nearWallDistKept)
+    NearWallKept nearWallKept;
     // per BOUNDARY face: does it carry a turbulence wall function, its near-wall distance, and the nut
     // wall function's own kind and coefficients
     DeviceBuffer<label> wfBndMask;

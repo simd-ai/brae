@@ -15,6 +15,8 @@
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
+#include <algorithm>
+#include <thread>
 #include <vector>
 #include <unordered_map>
 #include <utility>
@@ -166,6 +168,124 @@ inline std::vector<std::vector<scalar>> nearWallDist(
                 if (d < best) best = d;
             }
         y[pi][i] = best;
+    }
+    return y;
+}
+
+// nearWallDist WITH ITS NEIGHBOUR LISTS KEPT, ON THE HOST'S THREADS: what a mesh that moves calls at every move
+// (refreshDeviceInterTurbulenceGeometry). nearWallDist above builds, at every call, the map from a point to the
+// wall faces on it, and then measures each wall face's cell centre against the face and every wall face sharing
+// a vertex -- a face sharing two vertices twice. A mesh that moves keeps its faces, so which wall faces
+// neighbour which is kept here from one call to the next (NearWallKept), each neighbour once, and the distances
+// are measured by the host's threads. The minimum of the same distances is the same number whatever the order
+// and however often one is repeated, so y is nearWallDist's to the bit.
+// `selfOnly` is a gate's CONTROL, deliberately wrong: a face is measured against itself alone.
+struct NearWallKept
+{
+    std::vector<label> wallFace;     // the wall faces the lists were built from, and their vertices
+    std::vector<label> verts;
+    std::vector<label> start;        // wall face -> its candidates: itself, then each vertex neighbour once
+    std::vector<label> cand;
+};
+
+inline std::vector<std::vector<scalar>> nearWallDistKept(
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    NearWallKept& kept,
+    unsigned nThreads,
+    bool selfOnly = false)
+{
+    const std::vector<vector>& pts = m.points();
+    const std::vector<label>& fv = m.faceVerts();
+    const std::vector<label>& fo = m.faceOffsets();
+    const std::vector<vector>& C = g.C();
+
+    std::vector<label> wallFace;
+    std::vector<std::pair<std::size_t, label>> from;
+    std::vector<label> verts;
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& wp = patches[pi];
+        if (wp.type != "wall") continue;
+        for (label i = 0; i < wp.size; ++i)
+        {
+            const label f = wp.start + i;
+            wallFace.push_back(f);
+            from.push_back({pi, i});
+            verts.insert(verts.end(), fv.begin() + fo[f], fv.begin() + fo[f + 1]);
+        }
+    }
+    std::vector<std::vector<scalar>> y(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (patches[pi].type == "wall" && patches[pi].size > 0) y[pi].assign(patches[pi].size, nwdGreat);
+    }
+    if (wallFace.empty()) return y;
+
+    if (kept.wallFace != wallFace || kept.verts != verts)
+    {
+        std::unordered_map<label, std::vector<label>> pointFaces;
+        for (std::size_t w = 0; w < wallFace.size(); ++w)
+        {
+            const label f = wallFace[w];
+            for (label j = fo[f]; j < fo[f + 1]; ++j)
+            {
+                pointFaces[fv[j]].push_back(static_cast<label>(w));
+            }
+        }
+        kept.start.assign(1, label(0));
+        kept.cand.clear();
+        for (std::size_t w = 0; w < wallFace.size(); ++w)
+        {
+            const std::size_t first = kept.cand.size();
+            kept.cand.push_back(static_cast<label>(w));
+            const label f = wallFace[w];
+            for (label j = fo[f]; j < fo[f + 1]; ++j)
+            {
+                for (const label nw : pointFaces[fv[j]])
+                {
+                    bool have = false;
+                    for (std::size_t k = first; k < kept.cand.size(); ++k)
+                    {
+                        if (kept.cand[k] == nw) have = true;
+                    }
+                    if (!have) kept.cand.push_back(nw);
+                }
+            }
+            kept.start.push_back(static_cast<label>(kept.cand.size()));
+        }
+        kept.wallFace = wallFace;
+        kept.verts = verts;
+    }
+
+    const std::size_t nW = wallFace.size();
+    const unsigned nT = static_cast<unsigned>(std::min<std::size_t>(std::max(1u, nThreads), nW));
+    const auto range = [&](unsigned t)
+    {
+        for (std::size_t w = nW*t/nT; w < nW*(t + 1)/nT; ++w)
+        {
+            const vector& Cc = C[patches[from[w].first].faceCells[from[w].second]];
+            scalar best = nwdGreat;
+            const label last = selfOnly ? kept.start[w] + 1 : kept.start[w + 1];
+            for (label k = kept.start[w]; k < last; ++k)
+            {
+                const label gf = wallFace[static_cast<std::size_t>(kept.cand[static_cast<std::size_t>(k)])];
+                const scalar d = pointToFaceDist(Cc, pts, fv, fo[gf], fo[gf + 1]);
+                if (d < best) best = d;
+            }
+            y[from[w].first][static_cast<std::size_t>(from[w].second)] = best;
+        }
+    };
+    std::vector<std::thread> workers;
+    for (unsigned t = 1; t < nT; ++t)
+    {
+        workers.emplace_back(range, t);
+    }
+    range(0);
+    for (std::thread& t : workers)
+    {
+        t.join();
     }
     return y;
 }
