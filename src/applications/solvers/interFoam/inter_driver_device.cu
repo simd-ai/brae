@@ -4047,10 +4047,14 @@ RunReport runInterFoamDevice(
                 deviceCopy(dRhoOB, now);
             }
         }
-        std::vector<scalar> ca, cx, cy, cz;
-        dA.copyTo(ca);   dAOld.copyFrom(ca);
-        dUx.copyTo(cx);  dUy.copyTo(cy);  dUz.copyTo(cz);
-        dUox.copyFrom(cx); dUoy.copyFrom(cy); dUoz.copyFrom(cz);
+        // THE OLD-TIME LEVELS OF alpha, U AND phi ARE COPIED ON THE DEVICE. Each went down into a fresh host
+        // vector and up again at every step, and nothing reads those host copies (phi's are read under
+        // CrankNicolson alone, below, and are still taken there). MEASURED on laminar/waves/streamFunction
+        // (160,000 cells), 2026-10-05: about 1.5 of the 2.3 ms of `0 step preparation`.
+        deviceCopyNotViaHost(dAOld, dA, "alpha's old-time level");
+        deviceCopyNotViaHost(dUox, dUx, "Ux's old-time level");
+        deviceCopyNotViaHost(dUoy, dUy, "Uy's old-time level");
+        deviceCopyNotViaHost(dUoz, dUz, "Uz's old-time level");
         {
             std::vector<scalar> bx, by, bz;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
@@ -4069,8 +4073,23 @@ RunReport runInterFoamDevice(
             }
         }
         std::vector<scalar> poi, pob;
-        dPhiI.copyTo(poi); dPhiB.copyTo(pob);
-        DeviceBuffer<scalar> dPhiOI(poi), dPhiOB(pob);
+        DeviceBuffer<scalar> dPhiOI;
+        DeviceBuffer<scalar> dPhiOB;
+        deviceCopyNotViaHost(dPhiOI, dPhiI, "phi's old-time level");
+        deviceCopyNotViaHost(dPhiOB, dPhiB, "phi's old-time patch level");
+        // (the host copies CrankNicolson's old-old rotation reads, below -- and held to their sizes, because
+        // an empty one handed to that rotation would shrink the old-old level to nothing without a message)
+        if (cnDdt)
+        {
+            dPhiI.copyTo(poi);
+            dPhiB.copyTo(pob);
+            if (poi.size() != dPhiI.size() || pob.size() != dPhiB.size())
+                throw std::runtime_error(
+                    "brae interFoam (device): CrankNicolson's host copies of phi's old-time level are "
+                    + std::to_string(poi.size()) + " and " + std::to_string(pob.size()) + " values for "
+                    + std::to_string(dPhiI.size()) + " internal and " + std::to_string(dPhiB.size())
+                    + " boundary faces.");
+        }
         // ...and the PAIR's flux at the same instant. fvc::ddtCorr compares phi.oldTime() with the
         // flux of U.oldTime() on every face a coupled patch included, and the pressure corrector
         // rewrites cyc.phi, so the snapshot has to be taken here with the other two.

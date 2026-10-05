@@ -11,13 +11,24 @@
 // the scan's `<=` keeps the LAST of equal errors. Transcribed: a root-finder would return a different
 // wave.
 //
-// AND THE VELOCITY INTEGRATES THE WAVE EVERY TIME IT IS ASKED. Uf calls etaMeanSq, which sums 1000
-// elevations over a period -- per face, per update. It is a constant of the wave; OpenFOAM recomputes
-// it, and so does this, because 1000 terms summed in a different order is a different last digit.
+// THE VELOCITY ASKS FOR THE WAVE'S MEAN SQUARE ELEVATION AT EVERY FACE. Uf calls etaMeanSq, which sums 1000
+// elevations over a period, and OpenFOAM does that per face, per update. It is a constant of the wave -- a
+// function of H, m and T alone -- so it is summed ONCE, in OpenFOAM's order, and the number kept with the three
+// it was summed for: the same call gives the same bits whether it is made again or remembered. (What would
+// change the last digit is summing the 1000 terms in another order, and nothing here does.)
+// MEASURED on laminar/waves/cnoidal (52,500 cells), 2026-10-05: about 29 of the step's 44.5 ms.
+//   BRAE_CONTROL_CNOIDAL_MEAN_RECOMPUTED=1   summed at every call, as before
+//   BRAE_CONTROL_CNOIDAL_MEAN_CHECK=1        summed at every call as well, and the kept number held to it
+//   BRAE_CONTROL_CNOIDAL_MEAN_SHORT=1        a gate's CONTROL, deliberately wrong: the kept number is the mean
+//                                            of 999 elevations
 #include "wave_generation_bases_cpp.cuh"
 #include "wave_elliptic_cpp.cuh"
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
+#include <stdexcept>
 
 namespace brae {
 namespace cpu {
@@ -126,20 +137,63 @@ protected:
         return H*((1.0 - E/K)/m - 1.0 + waveSqr(cn));
     }
 
-    scalar etaMeanSq(
+    // cnoidalWaveModel.C's etaMeanSq, term for term: the mean of n squared elevations over a period (n is 1000;
+    // the gate's control asks for 999)
+    scalar etaMeanSqSummed(
         scalar H,
         scalar m,
-        scalar T) const
+        scalar T,
+        int n) const
     {
         scalar e = 0;
         scalar etaSumSq = 0;
-        for (int i = 0; i < 1000; i++)
+        for (int i = 0; i < n; i++)
         {
             e = eta1D(H, m, i*T/(1000.0), T);
             etaSumSq += e*e;
         }
         etaSumSq /= 1000.0;
         return etaSumSq;
+    }
+
+    scalar etaMeanSq(
+        scalar H,
+        scalar m,
+        scalar T) const
+    {
+        static const bool recomputed = std::getenv("BRAE_CONTROL_CNOIDAL_MEAN_RECOMPUTED") != nullptr;
+        static const bool check = std::getenv("BRAE_CONTROL_CNOIDAL_MEAN_CHECK") != nullptr;
+        static const bool shortSum = std::getenv("BRAE_CONTROL_CNOIDAL_MEAN_SHORT") != nullptr;
+        if (recomputed) return etaMeanSqSummed(H, m, T, 1000);
+        const scalar key[3] = {H, m, T};
+        if (!meanHeld_ || std::memcmp(key, meanKey_, sizeof(key)) != 0)
+        {
+            // said at EVERY sum, not once a run: a wave whose H, m and T do not change is summed once a patch,
+            // so the count of this line in a log is the count of sums (the gate holds it to one)
+            std::printf("  cnoidal: the wave's mean square elevation is summed once and kept; "
+                        "BRAE_CONTROL_CNOIDAL_MEAN_RECOMPUTED=1 sums it at every face\n");
+            if (shortSum)
+            {
+                std::printf("  *** CONTROL MODE: the kept mean is of 999 elevations, not 1000. This run is "
+                            "deliberately wrong. ***\n");
+            }
+            meanValue_ = etaMeanSqSummed(H, m, T, shortSum ? 999 : 1000);
+            std::memcpy(meanKey_, key, sizeof(key));
+            meanHeld_ = true;
+        }
+        if (check)
+        {
+            const scalar want = etaMeanSqSummed(H, m, T, 1000);
+            if (std::memcmp(&want, &meanValue_, sizeof(scalar)) != 0)
+            {
+                char buf[200];
+                std::snprintf(buf, sizeof(buf),
+                              "brae cnoidal: BRAE_CONTROL_CNOIDAL_MEAN_CHECK: the kept mean square elevation is "
+                              "%.17g and summing it gives %.17g.", meanValue_, want);
+                throw std::runtime_error(buf);
+            }
+        }
+        return meanValue_;
     }
 
     vector dEtaDx(
@@ -239,6 +293,10 @@ protected:
 
 private:
     scalar m_ = 0;
+    // etaMeanSq's number and the (H, m, T) it was summed for: a memo, so mutable
+    mutable scalar meanKey_[3] = {0, 0, 0};
+    mutable scalar meanValue_ = 0;
+    mutable bool meanHeld_ = false;
 };
 
 } // namespace

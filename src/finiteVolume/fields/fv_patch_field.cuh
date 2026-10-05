@@ -173,6 +173,12 @@ public:
         const std::vector<vector>& /*Ub*/,
         const std::vector<vector>& /*Ucell*/,
         const std::vector<scalar>& /*rhob*/) {}
+    // DOES updateFromPatchVelocity READ `Ucell`? A caller that would gather the cells' velocity for every face of
+    // every patch asks first: of the patch classes one reads it (pressureInletOutletVelocity, on a vector field).
+    virtual bool readsPatchCellVelocity() const
+    {
+        return false;
+    }
 
     // The CONSTRUCTION-time half of the same thing, and it is a different branch. OF's dict constructor
     // calls evaluate() -> updateCoeffs() only when the case supplies no `value`, so the inlet is already
@@ -3118,7 +3124,16 @@ public:
         if constexpr (std::is_same<T, vector>::value)
         {
             const label n = this->patch_.size;
-            if (n == 0 || (label)Ucell.size() < n) return;
+            if (n == 0) return;
+            // A SHORT LIST IS REFUSED, where it used to be ignored: a caller that gathers the cells' velocity
+            // only for a class that says it reads it (readsPatchCellVelocity, below) hands every other class
+            // an empty one, and a patch of THIS class given one would keep its old value without a word.
+            if (static_cast<label>(Ucell.size()) < n)
+                throw std::runtime_error(
+                    "brae pressureInletOutletVelocity: patch `" + this->patch_.name + "` has "
+                    + std::to_string(n) + " faces and was handed the velocity of " + std::to_string(Ucell.size())
+                    + " face cells. Its value is formed from them; a caller that does not gather them would "
+                    "leave it frozen.");
             std::vector<T> v(static_cast<std::size_t>(n));
             for (label i = 0; i < n; ++i)
             {
@@ -3135,6 +3150,11 @@ public:
             }
             this->setStoredValues(std::move(v));
         }
+    }
+    // ...and this is the class that reads `Ucell`, on a vector field
+    bool readsPatchCellVelocity() const override
+    {
+        return std::is_same<T, vector>::value;
     }
 
     // pressureInletOutletVelocityFvPatchVectorField::autoMap (:160-170) maps directionMixed's refValue,

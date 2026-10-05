@@ -104,10 +104,11 @@ void schemeWeights(const DeviceMesh&           dm,
         case DeviceAlphaScheme::linear:
         {
             // the mesh's own central weights, copied rather than aliased so the caller owns one buffer
-            // whatever the scheme and cannot free the mesh's out from under it.
-            std::vector<scalar> hw;
-            dm.w.copyTo(hw);
-            w.copyFrom(hw);
+            // whatever the scheme and cannot free the mesh's out from under it. ON THE DEVICE: they went down
+            // to a fresh host vector and up again, twice a corrector for `div(phirb,alpha) Gauss linear`
+            // (31 of the 42 tutorials name it) -- six round trips of the internal faces a step on a case with
+            // three sub-cycles (laminar/waves/streamFunction, 317,920 faces, 2026-10-05).
+            deviceCopyNotViaHost(w, dm.w, "the linear scheme's weights");
             break;
         }
         case DeviceAlphaScheme::upwind:

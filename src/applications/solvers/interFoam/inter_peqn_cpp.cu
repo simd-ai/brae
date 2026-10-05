@@ -356,11 +356,43 @@ void updateVelocityPatchesFromCells(
     GeometricField<vector>& U,
     const std::vector<FvPatch>& patches)
 {
+    // THE CELLS' VELOCITY IS GATHERED FOR A PATCH THAT READS IT. It was gathered for every face of every patch
+    // and handed to updateFromPatchVelocity, whose body is empty in every class but one (readsPatchCellVelocity)
+    // -- on a 2-D mesh the two empty patches are a face a cell each. MEASURED on laminar/waves/streamFunction
+    // (160,000 cells, 3 calls a step), 2026-10-05: most of the 1.9 ms of the U hook's patch updates.
+    //   BRAE_CONTROL_U_PATCH_GATHER_ALL=1    gathered for every patch, as before
+    //   BRAE_CONTROL_U_PATCH_GATHER_NONE=1   a gate's CONTROL, deliberately wrong: gathered for none, so the patch
+    //                                        that reads it is handed zeros
+    static const bool gatherAll = std::getenv("BRAE_CONTROL_U_PATCH_GATHER_ALL") != nullptr;
+    static const bool gatherNone = std::getenv("BRAE_CONTROL_U_PATCH_GATHER_NONE") != nullptr;
+    static const std::vector<vector> notRead;
+    static bool said = false;
+    if (!said && !gatherAll)
+    {
+        said = true;
+        std::size_t nRead = 0;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (U.boundary[pi]->readsPatchCellVelocity()) ++nRead;
+        }
+        std::printf("  U patches: the cells' velocity is gathered for the %zu of %zu patches that read it; "
+                    "BRAE_CONTROL_U_PATCH_GATHER_ALL=1 gathers it for every patch\n", nRead, patches.size());
+        if (gatherNone)
+        {
+            std::printf("  *** CONTROL MODE: the cells' velocity is gathered for no patch, and the ones that read "
+                        "it are handed zeros. This run is deliberately wrong. ***\n");
+        }
+    }
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const FvPatch& q = patches[pi];
+        if (!gatherAll && !U.boundary[pi]->readsPatchCellVelocity())
+        {
+            U.boundary[pi]->updateFromPatchVelocity(U.boundary[pi]->value(), notRead, {});
+            continue;
+        }
         std::vector<vector> Ucell(static_cast<std::size_t>(q.size), vector{0, 0, 0});
-        for (label i = 0; i < q.size; ++i)
+        for (label i = 0; i < q.size && !gatherNone; ++i)
         {
             const label c = q.faceCells[i];
             if (c >= 0 && c < static_cast<label>(U.internal.size()))

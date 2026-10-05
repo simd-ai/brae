@@ -3,6 +3,12 @@
 // updates (one pass, bit-identical FP sequence). Split from device_blas.cu (reductions in reductions.cu).
 #include "device_blas.cuh"
 #include <cuda_runtime.h>
+#include <vector>
+#include <string>
+#include <stdexcept>
+#include <cstring>
+#include <cstdlib>
+#include <cstdio>
 
 namespace brae {
 
@@ -201,6 +207,51 @@ void deviceCopy(DeviceBuffer<scalar>& dst, const DeviceBuffer<scalar>& src)
     // Host reads go through copyTo()/.host(), which sync explicitly.
     cudaCheck(cudaMemcpyAsync(dst.data(), src.data(), src.size() * sizeof(scalar), cudaMemcpyDeviceToDevice,
                               cudaStreamPerThread), "copy");
+}
+
+
+void deviceCopyNotViaHost(
+    DeviceBuffer<scalar>& dst,
+    const DeviceBuffer<scalar>& src,
+    const char* what)
+{
+    static const bool viaHost = std::getenv("BRAE_CONTROL_COPIES_VIA_HOST") != nullptr;
+    static const bool check = std::getenv("BRAE_CONTROL_DEVICE_COPIES_CHECK") != nullptr;
+    static const bool stale = std::getenv("BRAE_CONTROL_DEVICE_COPIES_STALE") != nullptr;
+    if (viaHost)
+    {
+        std::vector<scalar> host;
+        src.copyTo(host);
+        dst.copyFrom(host);
+        return;
+    }
+    static bool said = false;
+    if (!said)
+    {
+        said = true;
+        std::printf("  device copies: a buffer copied whole stays on the GPU; BRAE_CONTROL_COPIES_VIA_HOST=1 sends "
+                    "it down and up again\n");
+        if (stale)
+        {
+            std::printf("  *** CONTROL MODE: a buffer that already has the size is not copied. This run is "
+                        "deliberately wrong. ***\n");
+        }
+    }
+    if (!(stale && dst.size() == src.size() && dst.size() > 0))
+    {
+        deviceCopy(dst, src);
+    }
+    if (!check) return;
+    std::vector<scalar> a;
+    std::vector<scalar> b;
+    dst.copyTo(a);
+    src.copyTo(b);
+    if (a.size() != b.size() || (!a.empty() && std::memcmp(a.data(), b.data(), a.size()*sizeof(scalar)) != 0))
+    {
+        throw std::runtime_error(
+            std::string("brae: BRAE_CONTROL_DEVICE_COPIES_CHECK: ") + what + " copied on the device is not the "
+            "buffer it was copied from.");
+    }
 }
 
 
