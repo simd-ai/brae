@@ -1375,6 +1375,12 @@ RunReport runInterFoamDevice(
     scalar stepTime = 0;
     scalar stepDeltaT = 0;
     label stepIndex = 0;
+    // the device pool's counters as the time loop starts (set at the first step; reported at the end)
+    double poolSecondsAtLoop = 0;
+    std::size_t poolMallocsAtLoop = 0;
+    std::size_t poolBytesAtLoop = 0;
+    std::size_t poolHeldAtLoop = 0;
+    bool poolAtLoopSet = false;
 
     // TURBULENCE. The closure is the device's (device_inter_turbulence.cuh). BRAE_INTER_HOST_CLOSURE=1
     // puts the HOST reference in its place inside the same device loop -- the mixed build the closure
@@ -3889,6 +3895,17 @@ RunReport runInterFoamDevice(
     {
         interPhase::mark("0 between steps (clock, write, downloads)");
         if (!(rep.time < endTime - scalar(0.5)*rep.deltaT)) break;   // Time::run(), Time.C:1000
+        // a step has ended: the pool hands back what has sat idle too long (DevicePool::endOfStep)
+        if (s > 0) detail::devicePool().endOfStep();
+        // the pool's counters once the first step has asked for every size a fixed mesh needs
+        if (s == 1 && !poolAtLoopSet)
+        {
+            poolAtLoopSet = true;
+            poolSecondsAtLoop = detail::devicePool().mallocSeconds();
+            poolMallocsAtLoop = detail::devicePool().mallocs();
+            poolBytesAtLoop = detail::devicePool().mallocBytes();
+            poolHeldAtLoop = detail::devicePool().heldBytes();
+        }
         // whether Uf.oldTime() was STORED with its old-old level in existence, which is when OpenFOAM
         // starts writing Uf_0: the state the last step ended in (the host loop's UfOldStoredWithOO)
         const bool ufOldStoredWithOO = UfOOExists;
@@ -5914,6 +5931,34 @@ RunReport runInterFoamDevice(
     if (fieldsOut) *fieldsOut = std::move(f);
     rep.gradUCacheConsumed = dGradUCache.consumed;
     interPhase::mark("0 between steps (clock, write, downloads)");
+    // THE DEVICE POOL'S OWN ALLOCATIONS AFTER THE FIRST STEP. The pool hands a freed block to the next request of
+    // EXACTLY its size, so a mesh that keeps its topology asks the driver for nothing once the first step is
+    // done; a mesh that refines changes every size at every change. Charged here so the table shows what that
+    // costs, and the idle bytes printed so a run that keeps growing is seen.
+    if (poolAtLoopSet)
+    {
+        const detail::DevicePool& pool = detail::devicePool();
+        interPhase::charge("device pool: cudaMalloc after the first step",
+                           pool.mallocSeconds() - poolSecondsAtLoop,
+                           static_cast<long>(pool.mallocs() - poolMallocsAtLoop));
+        interPhase::charge("device pool: idle blocks handed back (cudaFree)", pool.freeSeconds(),
+                           static_cast<long>(pool.frees()));
+        // printed whenever the run is asked for it, so a gate can read the pool's own counts
+        if (interPhase::on() || std::getenv("BRAE_POOL_REPORT"))
+        {
+            std::printf("  device pool after the first step (%s): %zu allocations, %.1f MB asked for; idle in "
+                        "the free list %.1f MB after that step and %.1f MB at the end; %zu blocks, %.1f MB, "
+                        "handed back; in use at the end %.1f MB\n",
+                        pool.exactKeys() ? "exact-size keys, BRAE_CONTROL_POOL_EXACT" : "size classes",
+                        pool.mallocs() - poolMallocsAtLoop,
+                        static_cast<double>(pool.mallocBytes() - poolBytesAtLoop)/1048576.0,
+                        static_cast<double>(poolHeldAtLoop)/1048576.0,
+                        static_cast<double>(pool.heldBytes())/1048576.0,
+                        pool.frees(),
+                        static_cast<double>(pool.freedBytes())/1048576.0,
+                        static_cast<double>(pool.mallocBytes() - pool.freedBytes() - pool.heldBytes())/1048576.0);
+        }
+    }
     interPhase::report(static_cast<long>(rep.steps));
     return rep;
 }

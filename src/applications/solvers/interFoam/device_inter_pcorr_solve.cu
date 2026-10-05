@@ -56,8 +56,10 @@ void DevicePcorrSolver::prepare(
                    && static_cast<std::size_t>(nIf) == owner.size()
                    && std::equal(owner.begin(), owner.end(), m.owner().begin())
                    && std::equal(neighbour.begin(), neighbour.end(), m.neighbour().begin());
+    std::optional<interPhase::Nested> preparePart;
     if (!same)
     {
+        preparePart.emplace("pcorr prepare: the gather addressing built and up");
         // the gather addressing buildDeviceMesh derives, over the internal faces
         owner.assign(m.owner().begin(), m.owner().begin() + nIf);
         neighbour.assign(m.neighbour().begin(), m.neighbour().begin() + nIf);
@@ -86,6 +88,7 @@ void DevicePcorrSolver::prepare(
         dOwnerStart.copyFrom(ownerStart);
         dLosort.copyFrom(losort);
         dLosortStart.copyFrom(losortStart);
+        preparePart.emplace("pcorr prepare: the hierarchy");
         // the hierarchy the p_rgh solve takes (deviceAmgPcgHierarchy), from the disk cache on the start mesh
         const bool firstBuild = addressingId == 0;
         addressingId = nextDeviceAddressingId();
@@ -144,6 +147,7 @@ void DevicePcorrSolver::prepare(
             amg = deviceAmgPcgHierarchy(m, g, caseDir, firstBuild, amgMemo);
         }
     }
+    preparePart.emplace("pcorr prepare: the boundary slots");
     // correct()'s boundary: a slot a face of the patches that are neither empty nor coupled, in patch order, and
     // each cell's slots in that order -- the order the host adds a cell's boundary terms in
     std::size_t nNow = 0;
@@ -253,8 +257,11 @@ bool DevicePcorrSolver::solve(
     const label nC = m.nCells();
     const label nIf = m.nInternalFaces();
     std::optional<interPhase::Nested> timedPart;
-    timedPart.emplace("pcorr: the addressing check, the fold and the uploads");
+    // by parts: this was one row, "the addressing check, the fold and the uploads", 11.0 ms a step on
+    // RAS/motorBike at 2.1 calls a step (2026-10-05)
+    timedPart.emplace("pcorr solve: the addressing check and the hierarchy (prepare)");
     prepare(m, g, patches);
+    timedPart.emplace("pcorr solve: the boundary folded into the diagonal and the source (host)");
     // fvMatrix::solveSegregated: addBoundaryDiag, addBoundarySource (no coupled patch reaches here)
     std::vector<scalar> diag = M.diag;
     std::vector<scalar> source = M.source;
@@ -269,6 +276,7 @@ bool DevicePcorrSolver::solve(
             source[c] += M.boundaryCoeffs[pi][static_cast<std::size_t>(i)];
         }
     }
+    timedPart.emplace("pcorr solve: the matrix, the source and pcorr up");
     dDiag.copyFrom(diag);
     dUpper.copyFrom(M.upper);
     dSource.copyFrom(source);
