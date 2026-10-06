@@ -5,6 +5,7 @@
 #include "device_alpha_flux.cuh"
 #include "device_interface_properties.cuh"
 #include "device_blas.cuh"
+#include "inter_phase_time.cuh"
 #include <cmath>
 #include <vector>
 #include <string>
@@ -135,9 +136,13 @@ void deviceInterAlphaStep(
                                  ctl.alpha2BndOut->data(), nullptr, nullptr, nullptr);
         }
         // ...and nHatf ON THE PAIR from the same pass, which is where phir gets its normal there
-        deviceInterfaceCorrect(dm, a, alpha1Bnd, nHatfBnd, in.deltaN,
-                               in.nHatGradLeastSquares, in.nHatGradCellLimitK, nHatfInt, K,
-                               in.cyc, in.cyc ? &nHatfIfBuf : nullptr);
+        {
+            interPhase::Nested timedInterface("alpha: the interface's normal and curvature (device)");
+            deviceInterfaceCorrect(dm, a, alpha1Bnd, nHatfBnd, in.deltaN,
+                                   in.nHatGradLeastSquares, in.nHatGradCellLimitK, nHatfInt, K,
+                                   in.cyc, in.cyc ? &nHatfIfBuf : nullptr);
+        }
+        interPhase::Nested timedMixture("alpha: the mixture's cell fields (device)");
         alpha2.resize(static_cast<std::size_t>(nC));
         rho.resize(static_cast<std::size_t>(nC));
         mu.resize(static_cast<std::size_t>(nC));
@@ -290,10 +295,13 @@ void deviceInterAlphaStep(
                 std::printf("  *** CONTROL MODE: the alpha pre-solve convects across the pair with its raw flux, "
                             "not phiCN. This run is deliberately wrong. ***\n");
             }
-            deviceAlphaPreSolve(dm, alpha, subOld, *li.phiCNInt, iC, bC, dtSub, ctl.preSolve,
-                                alphaPhiInt, alphaPhiBnd, &pre, li.cyc, li.alphaPhiIf,
-                                li.Vsc, li.Vsc0, li.rDeltaT,
-                                (preRawPhi && pairHere) ? &li.cyc->phi : li.phiCNIf);
+            {
+                interPhase::Nested timedPre("alpha: the implicit pre-solve, whole (MULESCorr)");
+                deviceAlphaPreSolve(dm, alpha, subOld, *li.phiCNInt, iC, bC, dtSub, ctl.preSolve,
+                                    alphaPhiInt, alphaPhiBnd, &pre, li.cyc, li.alphaPhiIf,
+                                    li.Vsc, li.Vsc0, li.rDeltaT,
+                                    (preRawPhi && pairHere) ? &li.cyc->phi : li.phiCNIf);
+            }
             if (ctl.preSolveLog)
             {
                 ctl.preSolveLog->push_back(pre);
@@ -337,9 +345,12 @@ void deviceInterAlphaStep(
                 mf0.Vsc0 = li.Vsc0;
                 mf0.rDeltaT = li.rDeltaT ? li.rDeltaT->data() : nullptr;
                 const scalar rDeltaT = scalar(1)/dtSub;
-                deviceMulesLimitCorr(dm, nIf, nBf, rDeltaT, alpha, alpha1Bnd, bndFixesValue, bndFlag,
-                                     alphaPhiBnd, *ctl.prevCorrInt, *ctl.prevCorrBnd, mf0, mulesCtl);
-                deviceMulesCorrect(dm, rDeltaT, *ctl.prevCorrInt, *ctl.prevCorrBnd, mf0, alpha);
+                {
+                    interPhase::Nested timedPrev("alpha: the previous correction limited and applied");
+                    deviceMulesLimitCorr(dm, nIf, nBf, rDeltaT, alpha, alpha1Bnd, bndFixesValue, bndFlag,
+                                         alphaPhiBnd, *ctl.prevCorrInt, *ctl.prevCorrBnd, mf0, mulesCtl);
+                    deviceMulesCorrect(dm, rDeltaT, *ctl.prevCorrInt, *ctl.prevCorrBnd, mf0, alpha);
+                }
 
                 // alphaPhi10 += talphaPhi1Corr0()
                 deviceAxpy(scalar(1), *ctl.prevCorrInt, alphaPhiInt);
@@ -460,8 +471,11 @@ void deviceInterAlphaStep(
             const bool relaxes = ctl.MULESCorr && aCorr != 0 && static_cast<bool>(hooks.relaxBoundary);
             DeviceBuffer<scalar> postMules;
             db.alphaPostMules = relaxes ? &postMules : nullptr;
-            deviceAlphaCorrector(dm, alpha, subOld, li, db, mulesCtl, nHatfInt,
-                                 alphaPhiInt, alphaPhiBnd);
+            {
+                interPhase::Nested timedCorrector("alpha: a corrector, whole");
+                deviceAlphaCorrector(dm, alpha, subOld, li, db, mulesCtl, nHatfInt,
+                                     alphaPhiInt, alphaPhiBnd);
+            }
             if (relaxes)
             {
                 hooks.relaxBoundary(postMules, alpha, alpha1Bnd);

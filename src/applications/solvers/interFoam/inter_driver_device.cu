@@ -1883,7 +1883,7 @@ RunReport runInterFoamDevice(
     // face's entry is written by a kernel with what the host's own arithmetic gave there: alpha's and nu's are
     // the cell's (EmptyPatchField::evaluate; the mixture's nu of the cell's alpha), the normal's and the two
     // snGrads' a zero, the surface-tension flux's (sigma*K of the cell) times that zero.
-    // A RELAXED CORRECTOR (MULESCorr with more than one: damBreak and its kin) IS IN, since 2026-10-07. The
+    // A RELAXED CORRECTOR (MULESCorr with more than one: damBreak and its kin) IS IN, since 2026-10-06. The
     // relaxation ASSIGNS each patch 0.5*(its evaluate on the post-MULES cells) + 0.5*(alpha10's value); on an
     // empty patch both are the cell's, and 0.5*a + 0.5*b is one rounding of an exact sum whichever way the
     // products are fused, so the entry is the relaxed cell's -- mirrored like any other, and held bitwise by
@@ -1893,7 +1893,7 @@ RunReport runInterFoamDevice(
     // boundary normal taken from anything but the Gauss stencil with its empty patches left out,
     // BRAE_CONTROL_FORCES_CHECK, and a field on an empty patch that is not the empty class.
     // AND NOT ON A SMALL MESH: an upload by runs and a kernel are more device calls than the one upload they
-    // replace, and a few thousand empty faces cost the host less than that. MEASURED 2026-10-07, ms a step with
+    // replace, and a few thousand empty faces cost the host less than that. MEASURED 2026-10-06, ms a step with
     // the entries kept on the GPU / built on the host, damBreak and its refinements: 2,268 cells (4,536 empty
     // faces) 6.7 / 6.4, damBreakLeakage at that size 16.4 / 15.3; 9,072 cells 8.7 / 9.1; 36,288 cells 17.6 /
     // 18.7; 580,608 cells 213 / 233. So the entries stay on the GPU from 16,000 empty faces up

@@ -6,7 +6,7 @@
 # On an `empty` patch both operands of that average are the cell's, and a half of a number is exact, so the
 # entry is the relaxed cell's whichever way the two products are fused: it is mirrored like any other. The
 # divergence coefficients of an empty face are written by a kernel from the device's flux (flux*1 and
-# (-flux)*0, the host's own products). MEASURED 2026-10-07 on damBreak refined to 580,608 cells, ms a step:
+# (-flux)*0, the host's own products). MEASURED 2026-10-06 on damBreak refined to 580,608 cells, ms a step:
 # the alpha hooks 19.4 -> 2.3, the forces hook 13.0 -> 3.7, the step 233 -> 213.
 # THE FIXTURE: laminar/damBreakPermeable (2-D, MULESCorr, two correctors, a permeable wall). The oracle is
 # brae's own host build (BRAE_CONTROL_HOOKS_EMPTY_FROM_HOST=1): the written files byte for byte, the in-code

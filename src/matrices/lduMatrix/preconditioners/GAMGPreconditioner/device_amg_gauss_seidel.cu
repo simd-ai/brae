@@ -789,9 +789,19 @@ void hostSymGaussSeidelFused(
         nActive += active[k];
         perf[k] = {init[k], init[k], 0};
     }
+    // ONE ACTIVE COMPONENT SWEEPS ON THE CALLING THREAD. A thread made for the sweep is a new task, and the
+    // scheduler starts it on whichever core is free. MEASURED 2026-10-06 on interFoam's angledDuct (28,000
+    // cells, 720 sweeps): 653 of them ran on the 2.8 GHz cores while the caller sat on a 4.0 GHz one, and the
+    // caller came back from join() on a 2.8 GHz core 446 times of 720. A symmetric sweep there: 0.55 ms on
+    // its own thread, 0.27 on the caller's; at 2,268 cells 0.091 against 0.018, the thread's creation. The
+    // step: angledDuct 28.3 -> 20.4 ms, waterChannel 15.2 -> 12.5, damBreak 6.4 -> 6.1, every solver line
+    // the same bytes (181, 146 and 121 lines). Several active components keep a thread each, as before:
+    // their sweeps run side by side and that was not measured again. BRAE_GS_SWEEP_THREAD=1 gives the one
+    // its own thread back, for the comparison.
+    static const bool sweepOwnThread = std::getenv("BRAE_GS_SWEEP_THREAD") != nullptr;
     while (nActive > 0)
     {
-        // the sweeps: one thread per active component (pure CPU; nothing here touches the device)
+        // the sweeps: pure CPU, nothing here touches the device
         std::vector<std::thread> pool;
         const scalar* up = c.upper;
         const scalar* lo = c.lower;
@@ -815,13 +825,21 @@ void hostSymGaussSeidelFused(
             ifc.amiW = c.amiW.data();
             ifc.amiIfc = c.amiIfc[k].data();
             const bool haveIfc = (nCyc > 0 || nAmi > 0);
-            pool.emplace_back([=, &topo]()
+            const auto sweeps = [=, &topo]()
             {
                 for (int sw = 0; sw < sweepsPer; ++sw)
                 {
                     hostSweep(topo, up, lo, dg, bb, ps, bp, symmetric, haveIfc ? &ifc : nullptr);
                 }
-            });
+            };
+            if (nActive == 1 && !sweepOwnThread)
+            {
+                sweeps();
+            }
+            else
+            {
+                pool.emplace_back(sweeps);
+            }
         }
         for (auto& th : pool) th.join();
         // the residual, exactly as the graph evaluates it, on the uploaded field

@@ -3,7 +3,9 @@
 #include "device_blas.cuh"       // deviceCopy
 #include "device_alpha_flux.cuh"
 #include "device_mules.cuh"
+#include "inter_phase_time.cuh"
 #include <cstdlib>
+#include <optional>
 #include <cstdio>
 #include <stdexcept>
 #include <string>
@@ -231,6 +233,8 @@ void deviceAlphaCorrector(
     mf.Vsc0 = in.Vsc0;
     mf.rDeltaT = in.rDeltaT ? in.rDeltaT->data() : nullptr;   // ...and a localEuler case's local step
 
+    std::optional<interPhase::Nested> part;
+    part.emplace("alpha corrector: the compression flux and the scheme fluxes");
     // phic = cAlpha*|phi/magSf|, zeroed on every non-coupled boundary face.
     // THE COMPRESSION ON A PERIODIC PAIR. OpenFOAM zeroes phic on every UNCOUPLED patch and leaves a
     // coupled one alone (alphaEqn.H:79-89): the interface does pass through it, and phic there is
@@ -333,6 +337,7 @@ void deviceAlphaCorrector(
 
     if (in.MULESCorr)
     {
+        part.emplace("alpha corrector: the correction formed (MULESCorr)");
         // alphaEqn.H:178-205. The high-order flux is not limited as a whole here: what CMULES limits
         // is what it ADDS to the flux the implicit pre-solve already applied, because that half has
         // already advanced alpha a full time step.
@@ -373,11 +378,13 @@ void deviceAlphaCorrector(
         // quantity -- phiCN is the volumetric flux, alphaPhiUn is the alpha flux, and on a boundary
         // face holding alpha they differ by a factor of alpha.
         const bool havePair = (in.cyc && in.cyc->n > 0);
+        part.emplace("alpha corrector: the correction limited and applied (MULESCorr)");
         deviceMulesLimitCorr(dm, nIf, nBf, rDeltaT, alpha1, *bnd.alpha1, *bnd.fixesValue, *bnd.flag,
                              unBnd, corrInt, corrBnd, mf, mulesCtl, nullptr, nullptr,
                              havePair ? in.cyc : nullptr, havePair ? &corrIf : nullptr);
         deviceMulesCorrect(dm, rDeltaT, corrInt, corrBnd, mf, alpha1,
                            havePair ? in.cyc : nullptr, havePair ? &corrIf : nullptr);
+        part.emplace("alpha corrector: the relaxation and alphaPhi10 (MULESCorr)");
         // UNDER-RELAXED FOR EVERY CORRECTOR BUT THE FIRST, both halves (alphaEqn.H:195-205).
         const scalar w = (in.aCorr == 0) ? scalar(1) : scalar(0.5);
         if (in.aCorr != 0)
@@ -414,6 +421,7 @@ void deviceAlphaCorrector(
     // alphaEqn.H:208-220. alphaPhi10 IS alphaPhiUn on the explicit path, limited IN PLACE, and the
     // limiter runs against phiCN rather than phi: on a Crank-Nicolson case those differ, and
     // bounding the correction against the wrong flux would bound the wrong equation.
+    part.emplace("alpha corrector: the donor flux (explicit)");
     copyFaces(nIf, unInt, alphaPhi10Int);
     copyFaces(nBf, unBnd, alphaPhi10Bnd);
     deviceMulesDonorFlux(dm, nIf, nBf, *in.phiCNInt, alpha1, alphaPhi10Bnd, phiBDInt, phiBDBnd);
@@ -479,6 +487,7 @@ void deviceAlphaCorrector(
         deviceMulesDonorFluxCyclic(*in.cyc, rawPhi ? in.cyc->phi : *in.phiCNIf, alpha1, phiBDIf);
         deviceSubtractFaces(in.cyc->n, unIf, phiBDIf, corrIfEx);
     }
+    part.emplace("alpha corrector: the limiter (explicit)");
     deviceMulesLimiter(dm, nIf, nBf, rDeltaT, alpha1, alpha1Old, *bnd.alpha1,
                        *bnd.fixesValue, *bnd.flag, phiBDInt, phiBDBnd, corrInt, corrBnd,
                        mf, mulesCtl, lamInt, lamBnd,
@@ -486,6 +495,7 @@ void deviceAlphaCorrector(
                        havePairEx ? &phiBDIf : nullptr,
                        havePairEx ? &corrIfEx : nullptr,
                        havePairEx ? &lamIf : nullptr);
+    part.emplace("alpha corrector: the blend and the explicit solve");
     deviceMulesBlend(nIf, nBf, phiBDInt, phiBDBnd, lamInt, lamBnd, corrInt, corrBnd,
                      alphaPhi10Int, alphaPhi10Bnd);
     if (havePairEx)

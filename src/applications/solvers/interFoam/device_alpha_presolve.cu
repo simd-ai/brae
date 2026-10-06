@@ -7,6 +7,8 @@
 #include "device_amg.cuh"   // deviceSymGaussSeidel
 #include "device_blas.cuh"
 #include "device_simple.cuh"
+#include "inter_phase_time.cuh"
+#include <optional>
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
@@ -110,6 +112,8 @@ scalar deviceAlphaPreSolve(
     // fvm::div(phiCN, alpha1) with UPWIND weights -- OpenFOAM names the scheme in the code rather than
     // reading it from fvSchemes, and so does this.
     DeviceBuffer<scalar> rawDiag, upper, lower;
+    std::optional<interPhase::Nested> part;
+    part.emplace("alpha pre-solve: the matrix");
     deviceDivUpwindCoeffs(dm, phiCNInt, rawDiag, upper, lower);
     // ...and the PAIR, whose faces are in neither the internal list nor the boundary one. Upwind gives
     // a coupled face internalCoeffs = phi*w and boundaryCoeffs = -(phi*(1 - w)) with w = pos0(phi), as
@@ -170,6 +174,7 @@ scalar deviceAlphaPreSolve(
     // steps of damBreak with this solve at the case's 1e-8: alpha 3.3e-06 and U 1.2e-03 out. The driver
     // used to hide that by hardcoding 1e-12 (alpha 1.6e-10) -- a tolerance nobody chose, standing in
     // for a solver the case did not ask for.
+    part.emplace("alpha pre-solve: the linear solve");
     DeviceSolverPerf perf;
     if (sc.smoothSolver)
     {
@@ -183,6 +188,7 @@ scalar deviceAlphaPreSolve(
                                     /*checkEvery=*/1, sc.minIter);
     }
 
+    part.emplace("alpha pre-solve: the flux of the solved matrix");
     // alphaPhi10 = alpha1Eqn.flux(), the CONSERVATIVE flux of the solved matrix. For a pure upwind
     // matrix that IS the upwind flux of the solved field, bit for bit; it is taken from the matrix
     // because that is what alphaEqn.H does and what stays right if the scheme ever changes.
