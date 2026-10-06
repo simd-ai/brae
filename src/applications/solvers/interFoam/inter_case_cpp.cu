@@ -104,7 +104,8 @@ void pushAlphaToPatches(
 GeometricField<scalar> rhoWithPatchValues(
     const std::vector<scalar>& rhoCells,
     const std::vector<std::vector<scalar>>& rhoBnd,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    bool evaluateEmpty)
 {
     GeometricField<scalar> r;
     r.internal = rhoCells;
@@ -133,11 +134,25 @@ GeometricField<scalar> rhoWithPatchValues(
         }
         r.boundary.push_back(std::make_unique<FixedValuePatchField<scalar>>(q, false, scalar(0), rhoBnd[pi]));
     }
-    r.evaluateBoundary();
+    if (evaluateEmpty)
+    {
+        r.evaluateBoundary();
+    }
+    else
+    {
+        r.evaluateBoundaryWhere(
+            [&](std::size_t pi)
+            {
+                return patches[pi].type != "empty";
+            });
+    }
     return r;
 }
 
-void updateMixtureBoundary(InterFields& f, const std::vector<FvPatch>& patches)
+void updateMixtureBoundary(
+    InterFields& f,
+    const std::vector<FvPatch>& patches,
+    MixturePatches which)
 {
     f.rhoBnd.resize(patches.size());
     f.muBnd.resize(patches.size());
@@ -149,6 +164,11 @@ void updateMixtureBoundary(InterFields& f, const std::vector<FvPatch>& patches)
         f.rhoBnd[pi].resize(n);
         f.muBnd[pi].resize(n);
         f.nuBnd[pi].resize(n);
+        const bool isEmpty = patches[pi].type == "empty";
+        if ((which == MixturePatches::notEmpty && isEmpty) || (which == MixturePatches::emptyOnly && !isEmpty))
+        {
+            continue;
+        }
         if (patches[pi].coupled)
         {
             // ON A COUPLED PATCH the blend is NOT formed from alpha's patch value. OpenFOAM v2412 ends

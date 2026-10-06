@@ -380,7 +380,10 @@ struct InterFields
 GeometricField<scalar> rhoWithPatchValues(
     const std::vector<scalar>& rhoCells,
     const std::vector<std::vector<scalar>>& rhoBnd,
-    const std::vector<FvPatch>& patches);
+    const std::vector<FvPatch>& patches,
+    // false: an `empty` patch's zeroGradient stand-in is not evaluated -- for a caller that reads its gradient
+    // coefficients alone (they are zero) and never its values, which on a 2-D mesh are two faces a cell
+    bool evaluateEmpty = true);
 
 // Tell every flux-conditional patch of U, p_rgh and alpha1 the current phi -- see the definition.
 // Call it whenever phi changes, before the next boundary evaluation reads it.
@@ -413,7 +416,19 @@ void pushAlphaToPatches(
 // The case's dictionaries and fields -> InterFields. Throws, by name, on anything not ported.
 // Rebuild the boundary blends from alpha's current patch values. Called wherever mixture.correct()
 // is -- the patch values move with the contact angle every calculateK.
-void updateMixtureBoundary(InterFields& f, const std::vector<FvPatch>& patches);
+// `which`: a caller that keeps an `empty` patch's entries elsewhere (the device loop, which mirrors them from
+// the cells on the GPU) builds the other patches' alone, or the empty ones' alone to make the lists whole
+// again. A patch that is left out keeps its lists, sized.
+enum class MixturePatches
+{
+    all,
+    notEmpty,
+    emptyOnly
+};
+void updateMixtureBoundary(
+    InterFields& f,
+    const std::vector<FvPatch>& patches,
+    MixturePatches which = MixturePatches::all);
 
 InterFields buildInterFields(const std::string&          caseDir,
                              const std::string&          startDir,

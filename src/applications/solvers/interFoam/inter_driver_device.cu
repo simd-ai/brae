@@ -167,6 +167,42 @@ void emptyPressureCoeffsKernel(
     bC[b] = (wrong != scalar(0)) ? wrong : -scalar(0);
 }
 
+// AN `empty` PATCH'S ENTRIES OF A BOUNDARY ARRAY THE ALPHA AND FORCES HOOKS HAND THE DEVICE, written here in place
+// of a host loop and an upload: one constant a face -- the zero the host's own arithmetic gives there (the snGrad
+// of zero gradient coefficients; the boundary normal of a patch the stencil leaves out). A gate's CONTROL hands 1.
+__global__
+void emptyFacesSetKernel(
+    int nB,
+    const label* __restrict__ bndIsEmpty,
+    scalar value,
+    scalar* __restrict__ o)
+{
+    const int b = blockIdx.x*blockDim.x + threadIdx.x;
+    if (b >= nB) return;
+    if (!bndIsEmpty[b]) return;
+    o[b] = value;
+}
+
+// ...and the surface-tension flux's: (sigma*K of the face's cell) times that zero snGrad, the host's own product,
+// whose zero carries the curvature's sign. `times` is the zero, handed in so that no compiler folds the product
+// away; a gate's CONTROL hands 1.
+__global__
+void emptyFacesCellTimesKernel(
+    int nB,
+    const label* __restrict__ bndIsEmpty,
+    const label* __restrict__ bndCell,
+    const scalar* __restrict__ c,
+    scalar factor,
+    scalar times,
+    scalar* __restrict__ o)
+{
+    const int b = blockIdx.x*blockDim.x + threadIdx.x;
+    if (b >= nB) return;
+    if (!bndIsEmpty[b]) return;
+    const scalar scaled = factor*c[bndCell[b]];
+    o[b] = scaled*times;
+}
+
 // calculateNHatBoundary's first half on the device: each boundary cell's sum over its internal faces of
 // Sf*interpolate(alpha), added on the owner side and subtracted on the neighbour's, in ascending face order --
 // the host loop's terms and order (interface_properties_cpp.cu), so the host's second half
@@ -305,13 +341,16 @@ __global__ void surfaceTensionInternalKernel(
 std::vector<scalar> snGradBoundary(
     const GeometricField<scalar>& vf,
     const std::vector<FvPatch>& fvp,
-    bool skipCoupled = false)
+    bool skipCoupled = false,
+    // an `empty` patch's faces left out as well: the caller's kernel writes their zero
+    bool skipEmpty = false)
 {
     std::vector<scalar> out;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         const FvPatch& fp = fvp[pi];
         if (skipCoupled && isCoupledInterfaceType(fp.type)) continue;
+        if (skipEmpty && fp.type == "empty") continue;
         const std::vector<scalar> gIC = vf.boundary[pi]->gradientInternalCoeffs();
         const std::vector<scalar> gBC = vf.boundary[pi]->gradientBoundaryCoeffs();
         for (label i = 0; i < fp.size; ++i)
@@ -1302,14 +1341,95 @@ RunReport runInterFoamDevice(
     //     face at all, as OpenFOAM has none: a change of every such reader, held to OpenFOAM, not a copy saved.
     //   * a vector kept between calls in place of the fresh one (exact, the same bytes): 0.8 + 0.6 -> 0.6 + 0.5
     //     ms in the two rows, the step 37.2-37.3 -> 36.6-37.2 over three pairs -- inside the step's own spread.
-    auto unflatten = [&](const DeviceBuffer<scalar>& d, std::vector<std::vector<scalar>>& out)
+    //
+    // THE FLUX PUSH BRINGS DOWN THE PATCHES THAT ARE NOT `empty`, RUN BY RUN (2026-10-06), which is the first of
+    // the two forms above made exact: the three readers of an empty patch's list are given what they read.
+    //   * alpha's divCoeffs hook takes the flux of every face from the DEVICE (H.alpha.divCoeffs), not from the
+    //     host's copy;
+    //   * the host closure and a dynamic mesh's update are handed a WHOLE push (the two calls say so), as is the
+    //     end-of-run report.
+    // An empty patch's host list is then whatever the last whole push left, and nothing reads it: held by
+    // BRAE_CONTROL_FLUX_EMPTY_POISON=1, which writes NaN into those lists after every push by runs
+    // (tests/interfoam_write/identity/flux_empty_by_runs.sh; a census of the 42 tutorials with it).
+    //   BRAE_CONTROL_FLUX_EMPTY_FROM_HOST=1: every push whole, as before
+    //   BRAE_CONTROL_FLUX_DIVCOEFFS_FROM_HOST_COPY=1: a gate's CONTROL, deliberately wrong -- divCoeffs takes
+    //     the host's copy while the pushes go by runs
+    //   BRAE_CONTROL_FLUX_DYNAMIC_PUSH_BY_RUNS=1: another -- a dynamic mesh's push goes by runs too
+    static const bool fluxEmptyFromHost = std::getenv("BRAE_CONTROL_FLUX_EMPTY_FROM_HOST") != nullptr;
+    static const bool fluxEmptyPoison = std::getenv("BRAE_CONTROL_FLUX_EMPTY_POISON") != nullptr;
+    static const bool fluxDivFromHostCopy = std::getenv("BRAE_CONTROL_FLUX_DIVCOEFFS_FROM_HOST_COPY") != nullptr;
+    static const bool fluxDynamicByRuns = std::getenv("BRAE_CONTROL_FLUX_DYNAMIC_PUSH_BY_RUNS") != nullptr;
+    if (fluxDivFromHostCopy || fluxDynamicByRuns)
     {
+        std::printf("  *** CONTROL MODE: a reader of an empty patch's flux takes the host's stale copy (%s). This run "
+                    "is deliberately wrong. ***\n", fluxDivFromHostCopy ? "alpha's divCoeffs" : "a dynamic mesh");
+    }
+    auto unflatten = [&](
+        const DeviceBuffer<scalar>& d,
+        std::vector<std::vector<scalar>>& out,
+        bool whole = true,
+        bool poisonEmpty = false)
+    {
+        out.resize(fvp.size());
+        if (!whole)
+        {
+            // one blocking copy a run of neighbouring patches that are not empty (a copy costs its call, not
+            // its bytes: pressureHostRuns' rule), sliced into the patches' own lists
+            std::size_t at = 0;
+            std::size_t runAt = 0;
+            std::vector<std::size_t> runPatches;
+            std::vector<scalar> run;
+            const auto flush = [&]()
+            {
+                std::size_t n = 0;
+                for (const std::size_t pi : runPatches)
+                {
+                    n += static_cast<std::size_t>(fvp[pi].size);
+                }
+                if (n == 0) return;
+                run.resize(n);
+                cudaCheck(cudaMemcpy(run.data(), d.data() + runAt, n*sizeof(scalar), cudaMemcpyDeviceToHost),
+                          "the flux's patches, a run");
+                std::size_t off = 0;
+                for (const std::size_t pi : runPatches)
+                {
+                    const std::size_t np = static_cast<std::size_t>(fvp[pi].size);
+                    out[pi].assign(run.begin() + off, run.begin() + off + np);
+                    off += np;
+                }
+                runPatches.clear();
+            };
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+                if (fvp[pi].type == "empty")
+                {
+                    flush();
+                    // sized, and otherwise as it stands: no reader takes it (the poison says so)
+                    if (out[pi].size() != n || poisonEmpty)
+                    {
+                        out[pi].assign(n, poisonEmpty ? std::numeric_limits<scalar>::quiet_NaN() : scalar(0));
+                    }
+                }
+                else if (n > 0)
+                {
+                    if (runPatches.empty())
+                    {
+                        runAt = at;
+                    }
+                    runPatches.push_back(pi);
+                }
+                at += n;
+            }
+            flush();
+            return;
+        }
         std::vector<scalar> flat;
         d.copyTo(flat);
         // ...and a coupled patch is NOT in the array, so its entry keeps whatever the host holds and
         // the offset does not advance over it. Walking every patch here reads the faces of the next
         // patch and runs off the end at the last.
-        out.resize(fvp.size());
         std::size_t off = 0;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
@@ -1319,9 +1439,22 @@ RunReport runInterFoamDevice(
             off += n;
         }
     };
-    auto pushFlux = [&](bool uCoefficientsKept = false)
+    auto pushFlux = [&](
+        bool uCoefficientsKept = false,
+        bool whole = false)
     {
-        unflatten(dPhiB, f.phi.boundary);
+        const bool everyFace = whole || fluxEmptyFromHost;
+        static bool saidRuns = false;
+        if (!saidRuns)
+        {
+            saidRuns = true;
+            std::printf(fluxEmptyFromHost
+                ? "  flux push%s: every boundary face comes down to the host (BRAE_CONTROL_FLUX_EMPTY_FROM_HOST)\n"
+                : "  flux push%s: the patches that are not empty come down to the host, run by run; "
+                  "BRAE_CONTROL_FLUX_EMPTY_FROM_HOST=1 brings every face\n",
+                (fluxEmptyPoison && !fluxEmptyFromHost) ? " [an empty patch's host list POISONED with NaN]" : "");
+        }
+        unflatten(dPhiB, f.phi.boundary, everyFace, fluxEmptyPoison);
         // ...and the PAIR's own faces, which that array does not carry. Without this a
         // porousBafflePressure computes its jump from a flux that is still zero: measured on the
         // gate's `jump` profile, max|jump| 0 at every assembly and the device running the
@@ -1344,7 +1477,7 @@ RunReport runInterFoamDevice(
         }
         if (namesRhoPhi && dRpB.size() == dPhiB.size())
         {
-            unflatten(dRpB, f.rhoPhi.boundary);
+            unflatten(dRpB, f.rhoPhi.boundary, everyFace, fluxEmptyPoison);
         }
         pushFluxToPatches(f, fvp, uCoefficientsKept);
     };
@@ -1446,17 +1579,19 @@ RunReport runInterFoamDevice(
     // the three components in one buffer, so they come down in ONE copy: three blocking copies were 1.5 ms a
     // call, most of it each copy's wait (RAS/DTCHull)
     DeviceBuffer<scalar> dStAcc;
+    auto nHatStencilCurrent = [&]()
+    {
+        if (nHatFull || (nHatStencilBuilt && nHatStencilId == dm.addressingId)) return;
+        nHatStencil = interfaceProps::nHatBoundaryStencil(m, fvp, !nHatEmptyCells);
+        nHatStencilId = dm.addressingId;
+        nHatStencilBuilt = true;
+        dStCells.copyFrom(nHatStencil.cells);
+        dStStart.copyFrom(nHatStencil.start);
+        dStFaces.copyFrom(nHatStencil.faces);
+    };
     auto boundaryNHat = [&](SurfaceScalarField& nHb, const DeviceBuffer<scalar>& aDev)
     {
-        if (!nHatFull && (!nHatStencilBuilt || nHatStencilId != dm.addressingId))
-        {
-            nHatStencil = interfaceProps::nHatBoundaryStencil(m, fvp, !nHatEmptyCells);
-            nHatStencilId = dm.addressingId;
-            nHatStencilBuilt = true;
-            dStCells.copyFrom(nHatStencil.cells);
-            dStStart.copyFrom(nHatStencil.start);
-            dStFaces.copyFrom(nHatStencil.faces);
-        }
+        nHatStencilCurrent();
         if (!nHatFull && interfaceProps::nHatBoundaryOnlyApplies(f.interface, false, nHatStencil))
         {
             static bool announced = false;
@@ -1714,6 +1849,332 @@ RunReport runInterFoamDevice(
         }
     };
 
+    // THE ALPHA AND FORCES HOOKS LEAVE AN `empty` PATCH'S ENTRIES ON THE GPU (2026-10-06), as the momentum and
+    // pressure hooks do. brae's empty patch has faces -- two a cell on a 2-D mesh, 320,000 of
+    // laminar/waves/streamFunction's 324,160 boundary faces -- and at every call the hooks evaluated alpha
+    // there, built the mixture's boundary, a zero normal, a zero snGrad and a zero flux on them on the host and
+    // uploaded all of it. Now the host works on the other patches and uploads those run by run, and an empty
+    // face's entry is written by a kernel with what the host's own arithmetic gave there: alpha's and nu's are
+    // the cell's (EmptyPatchField::evaluate; the mixture's nu of the cell's alpha), the normal's and the two
+    // snGrads' a zero, the surface-tension flux's (sigma*K of the cell) times that zero.
+    // NOT where the host's whole lists are read, or where the entry is not the cell's: the host closure, a
+    // CrankNicolson writer's kept patches, a relaxed corrector (MULESCorr with more than one corrector: alpha10's
+    // patch values are the host's and the relaxation assigns the patch), a boundary normal taken from anything
+    // but the Gauss stencil with its empty patches left out, BRAE_CONTROL_FORCES_CHECK, and a field on an empty
+    // patch that is not the empty class.
+    //   BRAE_CONTROL_HOOKS_EMPTY_FROM_HOST=1: as before -- the identity gate's other arm
+    //   BRAE_CONTROL_HOOKS_EMPTY_CHECK=1: the host builds every array whole as before as well, and one bit's
+    //     difference from what the device holds stops the run and names the array and the face -- the gate's
+    //     oracle, which the written files cannot be (most of these entries are multiplied by zero)
+    //   BRAE_CONTROL_HOOKS_EMPTY_WRONG=<alpha|normal|flux|snGradRho|nu|snGradPrgh>: a gate's CONTROL,
+    //     deliberately wrong -- that array's kernel writes 1 on the empty faces
+    //   BRAE_CONTROL_HOOKS_EMPTY_POISON=1: NaN into the host's lists the hooks no longer fill (alpha's patch
+    //     values, the mixture's boundary and rho's kept patch values on an empty patch): no reader takes them
+    struct HooksEmptyPlan
+    {
+        std::vector<DeviceBoundaryRange> ranges;
+        std::size_t nBndAll = 0;
+        std::size_t nHostFaces = 0;
+        bool kept = false;
+    };
+    static const bool hooksEmptyFromHost = std::getenv("BRAE_CONTROL_HOOKS_EMPTY_FROM_HOST") != nullptr;
+    static const bool hooksEmptyCheck = std::getenv("BRAE_CONTROL_HOOKS_EMPTY_CHECK") != nullptr;
+    static const bool hooksEmptyPoison = std::getenv("BRAE_CONTROL_HOOKS_EMPTY_POISON") != nullptr;
+    static const std::string hooksEmptyWrong =
+        std::getenv("BRAE_CONTROL_HOOKS_EMPTY_WRONG") ? std::getenv("BRAE_CONTROL_HOOKS_EMPTY_WRONG") : "";
+    if (!hooksEmptyWrong.empty())
+    {
+        std::printf("  *** CONTROL MODE: the empty faces' entries of `%s` are written as 1. This run is deliberately "
+                    "wrong. ***\n", hooksEmptyWrong.c_str());
+    }
+    const bool hooksEmptyNever = hooksEmptyFromHost || hostClosure
+                              || (writer && writer->writesCrankNicolson())
+                              || (f.alphaCtl.MULESCorr && f.alphaCtl.nAlphaCorr > 1)
+                              || nHatFull || nHatEmptyCells
+                              || std::getenv("BRAE_CONTROL_NHAT_BOUNDARY_CHECK") != nullptr
+                              || std::getenv("BRAE_CONTROL_NHAT_WHOLE_GRADIENT") != nullptr
+                              || std::getenv("BRAE_CONTROL_FORCES_CHECK") != nullptr;
+    const auto notEmptyPatch = [&](std::size_t pi)
+    {
+        return fvp[pi].type != "empty";
+    };
+    const auto emptyPatch = [&](std::size_t pi)
+    {
+        return fvp[pi].type == "empty";
+    };
+    auto hooksEmptyPlan = [&]()
+    {
+        HooksEmptyPlan plan;
+        plan.ranges = deviceNonEmptyBoundaryRanges(fvp, plan.nBndAll);
+        for (const DeviceBoundaryRange& r : plan.ranges)
+        {
+            plan.nHostFaces += r.n;
+        }
+        if (hooksEmptyNever || plan.nHostFaces == plan.nBndAll
+         || plan.nBndAll != static_cast<std::size_t>(dm.nBndFaces))
+        {
+            return plan;
+        }
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (fvp[pi].type != "empty") continue;
+            if (!dynamic_cast<const EmptyPatchField<scalar>*>(f.alpha1.boundary[pi].get())
+             || !dynamic_cast<const EmptyPatchField<scalar>*>(f.p_rgh.boundary[pi].get()))
+            {
+                return plan;
+            }
+        }
+        nHatStencilCurrent();
+        plan.kept = interfaceProps::nHatBoundaryOnlyApplies(f.interface, false, nHatStencil);
+        static bool said = false;
+        if (plan.kept && !said)
+        {
+            said = true;
+            std::printf("  hooks%s%s: an empty patch's entries of alpha, the mixture, the normal and the forces' "
+                        "face arrays stay on the GPU (%zu of %zu boundary faces); "
+                        "BRAE_CONTROL_HOOKS_EMPTY_FROM_HOST=1 builds them on the host\n",
+                        hooksEmptyCheck ? " [CHECKED against the host's whole build, bitwise]" : "",
+                        (hooksEmptyPoison && !hooksEmptyCheck) ? " [the host's lists there POISONED with NaN]" : "",
+                        plan.nBndAll - plan.nHostFaces, plan.nBndAll);
+        }
+        return plan;
+    };
+    DeviceBuffer<scalar> hooksStage;
+    // the patches that are not empty, packed in patch order...
+    const auto packLists = [&](const std::vector<std::vector<scalar>>& b)
+    {
+        std::vector<scalar> v;
+        for (std::size_t pi = 0; pi < fvp.size() && pi < b.size(); ++pi)
+        {
+            if (isCoupledInterfaceType(fvp[pi].type) || fvp[pi].type == "empty") continue;
+            v.insert(v.end(), b[pi].begin(), b[pi].end());
+        }
+        return v;
+    };
+    const auto packValues = [&](const GeometricField<scalar>& vf)
+    {
+        std::vector<scalar> v;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (isCoupledInterfaceType(fvp[pi].type) || fvp[pi].type == "empty") continue;
+            const std::vector<scalar>& b = vf.boundary[pi]->value();
+            v.insert(v.end(), b.begin(), b.end());
+        }
+        return v;
+    };
+    // ...and up into `to`, an array's boundary part: one copy to the stage, then a device copy a run (a copy
+    // from the host costs its call, not its bytes)
+    auto runsUp = [&](
+        scalar* to,
+        const std::vector<scalar>& packed,
+        const HooksEmptyPlan& plan,
+        const char* what)
+    {
+        if (packed.size() != plan.nHostFaces)
+        {
+            throw std::runtime_error(std::string("brae interFoam: ") + what + " has "
+                                     + std::to_string(packed.size()) + " entries on the patches that are not "
+                                     "empty, which hold " + std::to_string(plan.nHostFaces) + " faces.");
+        }
+        if (packed.empty()) return;
+        hooksStage.copyFrom(packed);
+        std::size_t from = 0;
+        for (const DeviceBoundaryRange& r : plan.ranges)
+        {
+            cudaCheck(cudaMemcpyAsync(to + r.at, hooksStage.data() + from, r.n*sizeof(scalar),
+                                      cudaMemcpyDeviceToDevice, cudaStreamPerThread), what);
+            from += r.n;
+        }
+        cudaCheck(cudaStreamSynchronize(cudaStreamPerThread), what);
+    };
+    // the empty faces' entries: a constant, the face's cell, or (factor * the cell's value) times a zero
+    const auto emptySet = [&](
+        scalar* o,
+        scalar value,
+        const char* name)
+    {
+        const int nB = dm.nBndFaces;
+        emptyFacesSetKernel<<<(nB + 255)/256, 256>>>(
+            nB,
+            dm.bndIsEmpty.data(),
+            hooksEmptyWrong == name ? scalar(1) : value,
+            o);
+        cudaCheck(cudaGetLastError(), "emptyFacesSet");
+    };
+    const auto emptyMirror = [&](
+        scalar* o,
+        const DeviceBuffer<scalar>& cells,
+        const char* name)
+    {
+        if (hooksEmptyWrong == name)
+        {
+            emptySet(o, scalar(1), name);
+            return;
+        }
+        const int nB = dm.nBndFaces;
+        mirrorEmptyScalarKernel<<<(nB + 255)/256, 256>>>(
+            nB,
+            dm.bndIsEmpty.data(),
+            dm.bndCell.data(),
+            cells.data(),
+            o,
+            1);
+        cudaCheck(cudaGetLastError(), "mirrorEmptyScalar");
+    };
+    const auto emptyCellTimesZero = [&](
+        scalar* o,
+        const DeviceBuffer<scalar>& cells,
+        scalar factor,
+        const char* name)
+    {
+        const int nB = dm.nBndFaces;
+        emptyFacesCellTimesKernel<<<(nB + 255)/256, 256>>>(
+            nB,
+            dm.bndIsEmpty.data(),
+            dm.bndCell.data(),
+            cells.data(),
+            factor,
+            hooksEmptyWrong == name ? scalar(1) : scalar(0),
+            o);
+        cudaCheck(cudaGetLastError(), "emptyFacesCellTimes");
+    };
+    // BRAE_CONTROL_HOOKS_EMPTY_CHECK: `d` from `offset` on is the host's whole build `want`, bit for bit
+    const auto hooksHeld = [&](
+        const char* what,
+        const DeviceBuffer<scalar>& d,
+        std::size_t offset,
+        const std::vector<scalar>& want)
+    {
+        const std::vector<scalar> got = d.host();
+        const bool sized = got.size() == offset + want.size();
+        if (sized && (want.empty()
+                   || std::memcmp(got.data() + offset, want.data(), want.size()*sizeof(scalar)) == 0))
+        {
+            static std::map<std::string, long> calls;
+            const long n = ++calls[what];
+            long decade = 1;
+            while (decade*10 <= n)
+            {
+                decade *= 10;
+            }
+            if (n == decade)
+            {
+                std::printf("  hooks empty check: %s, %zu boundary faces the host's whole build, bitwise "
+                            "(%ld calls)\n", what, want.size(), n);
+            }
+            return;
+        }
+        std::size_t at = 0;
+        while (sized && at < want.size() && std::memcmp(&got[offset + at], &want[at], sizeof(scalar)) == 0)
+        {
+            ++at;
+        }
+        char line[320];
+        std::snprintf(line, sizeof(line), "brae interFoam: BRAE_CONTROL_HOOKS_EMPTY_CHECK: %s, boundary face %zu "
+                      "of %zu (the device holds %zu): the device holds %.17g, the host builds %.17g.", what, at,
+                      want.size(), got.size() - (sized ? offset : 0),
+                      (sized && at < want.size()) ? got[offset + at] : 0.0, at < want.size() ? want[at] : 0.0);
+        throw std::runtime_error(line);
+    };
+    const auto poisonEmptyLists = [&](std::vector<std::vector<scalar>>& b)
+    {
+        for (std::size_t pi = 0; pi < fvp.size() && pi < b.size(); ++pi)
+        {
+            if (fvp[pi].type != "empty") continue;
+            b[pi].assign(b[pi].size(), std::numeric_limits<scalar>::quiet_NaN());
+        }
+    };
+    // alpha's patch values onto the device. `cells`: the device's alpha the host has just taken, where the
+    // caller's OpenFOAM statement evaluates the patches; null where it does not (the stored values go up, and
+    // an empty face's entry is the one the last evaluating call mirrored)
+    auto alphaBoundaryUp = [&](
+        const HooksEmptyPlan& ep,
+        const DeviceBuffer<scalar>* cells,
+        DeviceBuffer<scalar>& aBnd)
+    {
+        if (!ep.kept)
+        {
+            if (cells)
+            {
+                f.alpha1.evaluateBoundary();
+            }
+            aBnd.copyFrom(patchValues(f.alpha1, fvp));
+            return;
+        }
+        if (cells && hooksEmptyCheck)
+        {
+            f.alpha1.evaluateBoundary();
+        }
+        else if (cells)
+        {
+            f.alpha1.evaluateBoundaryWhere(notEmptyPatch);
+        }
+        if (cells)
+        {
+            aBnd.resize(ep.nBndAll);
+        }
+        else if (aBnd.size() != ep.nBndAll)
+        {
+            throw std::runtime_error("brae interFoam: alpha's stored patch values are asked for a device array "
+                                     "that holds no empty face's entry yet.");
+        }
+        runsUp(aBnd.data(), packValues(f.alpha1), ep, "alpha's patch values");
+        if (cells)
+        {
+            emptyMirror(aBnd.data(), *cells, "alpha");
+        }
+        if (hooksEmptyCheck)
+        {
+            hooksHeld(cells ? "alpha's patch values, evaluated" : "alpha's patch values, stored", aBnd, 0,
+                      patchValues(f.alpha1, fvp));
+        }
+        else if (hooksEmptyPoison)
+        {
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (fvp[pi].type != "empty") continue;
+                f.alpha1.boundary[pi]->setValue(std::vector<scalar>(
+                    static_cast<std::size_t>(fvp[pi].size), std::numeric_limits<scalar>::quiet_NaN()));
+            }
+        }
+    };
+    auto mixtureBoundary = [&](const HooksEmptyPlan& ep)
+    {
+        const bool leftOut = ep.kept && !hooksEmptyCheck;
+        updateMixtureBoundary(f, fvp, leftOut ? MixturePatches::notEmpty : MixturePatches::all);
+        if (leftOut && hooksEmptyPoison)
+        {
+            poisonEmptyLists(f.rhoBnd);
+            poisonEmptyLists(f.muBnd);
+            poisonEmptyLists(f.nuBnd);
+        }
+    };
+    auto normalUp = [&](
+        const HooksEmptyPlan& ep,
+        const SurfaceScalarField& nHb,
+        DeviceBuffer<scalar>& nBnd)
+    {
+        if (!ep.kept)
+        {
+            nBnd.copyFrom(flattenPatches(nHb.boundary, fvp));
+            return;
+        }
+        nBnd.resize(ep.nBndAll);
+        runsUp(nBnd.data(), packLists(nHb.boundary), ep, "the boundary normal");
+        emptySet(nBnd.data(), scalar(0), "normal");
+        if (hooksEmptyCheck)
+        {
+            hooksHeld("the boundary normal", nBnd, 0, flattenPatches(nHb.boundary, fvp));
+        }
+    };
+    // the host's lists the hooks left for an empty patch, made what a whole build holds: alpha's values from
+    // the cells the last hook took, the mixture's boundary from those
+    auto hooksHostWhole = [&]()
+    {
+        f.alpha1.evaluateBoundaryWhere(emptyPatch);
+        updateMixtureBoundary(f, fvp, MixturePatches::emptyOnly);
+    };
+
     // the hooks: every one is per-patch host work, and nothing else
     DeviceInterStepHooks H;
     H.alpha.updateBoundary =
@@ -1725,20 +2186,20 @@ RunReport runInterFoamDevice(
         pushFlux();
         part.emplace("alpha hook: alpha down, the patches evaluated, their values up");
         a.copyTo(f.alpha1.internal);
-        f.alpha1.evaluateBoundary();
-        aBnd.copyFrom(patchValues(f.alpha1, fvp));
+        const HooksEmptyPlan ep = hooksEmptyPlan();
+        alphaBoundaryUp(ep, &a, aBnd);
         part.emplace("alpha hook: the mixture's boundary and alpha's fixes");
         // The boundary viscosity from alpha's patch values as they stand HERE, before the curvature
         // pass below rewrites the contact-angle gradient: mixture.correct() is calcNu() and THEN
         // interfaceProperties::correct(). The last call of a step is the one UEqn reads. See the host
         // driver's mixtureCorrect stage for the measurement.
-        updateMixtureBoundary(f, fvp);
+        mixtureBoundary(ep);
         refreshAlphaFixes();
         part.emplace("alpha hook: the boundary normal");
         SurfaceScalarField nHb;
         boundaryNHat(nHb, a);
         part.emplace("alpha hook: the normal up");
-        nBnd.copyFrom(flattenPatches(nHb.boundary, fvp));
+        normalUp(ep, nHb, nBnd);
         part.reset();
     };
     H.alpha.refreshBoundary =
@@ -1747,8 +2208,7 @@ RunReport runInterFoamDevice(
         interPhase::Nested timed("hook alpha.refreshBoundary");
         pushFlux();
         a.copyTo(f.alpha1.internal);
-        f.alpha1.evaluateBoundary();
-        aBnd.copyFrom(patchValues(f.alpha1, fvp));
+        alphaBoundaryUp(hooksEmptyPlan(), &a, aBnd);
     };
     // ...and the top of the alpha step, which evaluates nothing: the host field's patch values as the
     // last evaluate left them (every evaluate of this loop goes through f.alpha1, so they are current)
@@ -1756,7 +2216,8 @@ RunReport runInterFoamDevice(
     {
         H.alpha.storedBoundary = [&](DeviceBuffer<scalar>& aBnd)
         {
-            aBnd.copyFrom(patchValues(f.alpha1, fvp));
+            interPhase::Nested timed("hook alpha.storedBoundary");
+            alphaBoundaryUp(hooksEmptyPlan(), nullptr, aBnd);
         };
     }
     else
@@ -1794,12 +2255,13 @@ RunReport runInterFoamDevice(
         interPhase::Nested timed("hook alpha.mixtureCorrect");
         pushFlux();
         a.copyTo(f.alpha1.internal);
-        aBnd.copyFrom(patchValues(f.alpha1, fvp));
-        updateMixtureBoundary(f, fvp);
+        const HooksEmptyPlan ep = hooksEmptyPlan();
+        alphaBoundaryUp(ep, nullptr, aBnd);
+        mixtureBoundary(ep);
         refreshAlphaFixes();
         SurfaceScalarField nHb;
         boundaryNHat(nHb, a);
-        nBnd.copyFrom(flattenPatches(nHb.boundary, fvp));
+        normalUp(ep, nHb, nBnd);
     };
     // ...and all that is left of that hook where the pass after the sub-cycle is left out
     // (DeviceInterAlphaHooks::mixtureRepeatLeftOut): its flux push, of which the only NEWER inputs than the
@@ -1886,12 +2348,12 @@ RunReport runInterFoamDevice(
         {
             // waveAlpha's updateCoeffs at the SUB-CYCLE's clock. The model reads alpha's and U's cell
             // values: alpha's are the device's, and f.U's are the last updateUBoundary's.
+            interPhase::Nested timed("hook alpha.updateModelledBoundary");
             a.copyTo(f.alpha1.internal);
             const SubCycleClock clock = subCycleClock(stepTime, stepDeltaT, stepIndex,
                                                       f.alphaCtl.nAlphaSubCycles, subCycle);
             updateWaveAlpha(f.waves, f.alpha1, f.U, clock.t, clock.timeIndex, m, g, fvp);
-            f.alpha1.evaluateBoundary();
-            aBnd.copyFrom(patchValues(f.alpha1, fvp));
+            alphaBoundaryUp(hooksEmptyPlan(), &a, aBnd);
         };
     }
     if (dyn)
@@ -1921,14 +2383,74 @@ RunReport runInterFoamDevice(
     {
         interPhase::Nested timed("hook alpha.divCoeffs");
         a.copyTo(f.alpha1.internal);
-        f.alpha1.evaluateBoundary();
+        // (the coefficients below are the patches' own and read no patch value; the device's array is not this
+        // hook's to write, so an empty patch kept on the GPU is not evaluated here either)
+        if (hooksEmptyPlan().kept && !hooksEmptyCheck)
+        {
+            f.alpha1.evaluateBoundaryWhere(notEmptyPatch);
+        }
+        else
+        {
+            f.alpha1.evaluateBoundary();
+        }
         // the flux the coefficients are built from: phiCN's patch values under CrankNicolson (a
         // coupled patch keeps the host's -- the device array holds none, and the pre-solve adds the
         // pair's coefficients itself), phi's otherwise
+        // ...and EVERY FACE'S, AN EMPTY ONE'S TOO, FROM THE DEVICE: the loop below multiplies an empty face's
+        // flux by its patch's coefficients as any other's (EmptyPatchField's are the base's), and the host's
+        // copy of an empty patch's flux is stale once the pushes go by runs (pushFlux). The other patches' are
+        // the device's as last pushed either way.
+        //   BRAE_CONTROL_FLUX_DIVCOEFFS_CHECK=1: the host's copy, pushed whole, is taken as well and compared
+        //     with the device's, bitwise, on every face
+        static const bool fluxDivCheck = std::getenv("BRAE_CONTROL_FLUX_DIVCOEFFS_CHECK") != nullptr;
         std::vector<std::vector<scalar>> fluxBnd = f.phi.boundary;
         if (phiCNBnd)
         {
             unflatten(*phiCNBnd, fluxBnd);
+        }
+        else if (!fluxEmptyFromHost && !fluxDivFromHostCopy)
+        {
+            unflatten(dPhiB, fluxBnd);
+        }
+        if (fluxDivCheck && !phiCNBnd)
+        {
+            pushFlux(false, true);
+            static long compared = 0;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                const std::vector<scalar>& h = f.phi.boundary[pi];
+                const std::vector<scalar>& d = fluxBnd[pi];
+                if (h.size() != d.size()
+                 || (!h.empty() && std::memcmp(h.data(), d.data(), h.size()*sizeof(scalar)) != 0))
+                {
+                    throw std::runtime_error(
+                        "brae interFoam: BRAE_CONTROL_FLUX_DIVCOEFFS_CHECK: the flux alpha's divergence hook "
+                        "takes from the device is not the host's whole push on patch `" + fvp[pi].name + "`.");
+                }
+                compared += static_cast<long>(h.size());
+            }
+            static long calls = 0;
+            static scalar largestOnEmpty = 0;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (fvp[pi].type != "empty") continue;
+                for (const scalar v : fluxBnd[pi])
+                {
+                    largestOnEmpty = std::max(largestOnEmpty, std::abs(v));
+                }
+            }
+            ++calls;
+            long decade = 1;
+            while (decade*10 <= calls)
+            {
+                decade *= 10;
+            }
+            if (calls == decade)
+            {
+                std::printf("  flux divCoeffs check: %ld calls, %ld faces' flux the host's whole push, bitwise; the "
+                            "largest on an empty face %.3e\n", calls, compared, (double)largestOnEmpty);
+            }
         }
         // fvm::div's PATCH coefficients alone (fvm.cuh, the uncoupled branch): the patch flux times the field's
         // valueInternal/BoundaryCoeffs. Nothing here reads the internal faces, so the whole-mesh assembly this
@@ -2431,6 +2953,37 @@ RunReport runInterFoamDevice(
                 cudaCheck(cudaStreamSynchronize(cudaStreamPerThread), "forces boundary sync");
             }
         };
+        // ...and with an empty patch's entries kept on the GPU (hooksEmptyPlan): the other patches' run by run,
+        // the caller's kernel after it
+        const HooksEmptyPlan ep = hooksEmptyPlan();
+        auto appendBoundaryRuns = [&](
+            DeviceBuffer<scalar>& full,
+            const DeviceBuffer<scalar>& internal,
+            const std::vector<scalar>& packed,
+            const char* what)
+        {
+            full.resize(static_cast<std::size_t>(nIf) + ep.nBndAll);
+            cudaCheck(cudaMemcpyAsync(full.data(), internal.data(), static_cast<std::size_t>(nIf)*sizeof(scalar),
+                                      cudaMemcpyDeviceToDevice, cudaStreamPerThread), "forces internal copy");
+            runsUp(full.data() + nIf, packed, ep, what);
+        };
+        // a scalar's patch values for a corrected snGrad's gradient, the one reader (deviceSnGradInternal)
+        auto valuesForGradient = [&](
+            const GeometricField<scalar>& vf,
+            const DeviceBuffer<scalar>& cells,
+            const char* name,
+            DeviceBuffer<scalar>& bval)
+        {
+            if (!ep.kept)
+            {
+                bval.copyFrom(patchValues(vf, fvp));
+                return;
+            }
+            if (!snCorrD) return;
+            bval.resize(ep.nBndAll);
+            runsUp(bval.data(), packValues(vf), ep, "a field's patch values for its gradient");
+            emptyMirror(bval.data(), cells, name);
+        };
         // BRAE_CONTROL_FORCES_CHECK=1: the host's whole as well, and every face compared -- internal, patch and
         // pair. Within a bound relative to each field's largest value: the device's sums differ from the host's
         // in a last bit, and a coupled mesh's runs cannot be compared file for file.
@@ -2509,7 +3062,8 @@ RunReport runInterFoamDevice(
         {
             // surfaceTensionForce() = interpolate(sigma*K)*snGrad(alpha1)
             forcesPart.emplace("forces hook (device): the surface-tension flux");
-            const DeviceBuffer<scalar> alphaBval(patchValues(f.alpha1, fvp));
+            DeviceBuffer<scalar> alphaBval;
+            valuesForGradient(f.alpha1, a, "alpha", alphaBval);
             DeviceBuffer<scalar> stfInternal;
             DeviceBuffer<scalar> gAx;
             DeviceBuffer<scalar> gAy;
@@ -2518,21 +3072,37 @@ RunReport runInterFoamDevice(
             surfaceTensionInternalKernel<<<blocksIf, 256>>>(
                 nIf, dm.owner.data(), dm.nei.data(), dm.w.data(), Kd.data(), f.interface.sigma, stfInternal.data());
             cudaCheck(cudaGetLastError(), "surfaceTensionInternal");
-            const std::vector<scalar> snAB = snGradBoundary(f.alpha1, fvp, true);
-            std::vector<scalar> stfB(snAB.size());
+            const auto stfBoundary = [&](bool skipEmpty)
             {
+                const std::vector<scalar> snAB = snGradBoundary(f.alpha1, fvp, true, skipEmpty);
+                std::vector<scalar> stfB(snAB.size());
                 std::size_t k = 0;
                 for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                 {
                     if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                    if (skipEmpty && fvp[pi].type == "empty") continue;
                     for (label i = 0; i < fvp[pi].size; ++i, ++k)
                     {
                         const scalar sKb = f.interface.sigma*f.K[static_cast<std::size_t>(fvp[pi].faceCells[i])];
                         stfB[k] = sKb*snAB[k];
                     }
                 }
+                return stfB;
+            };
+            if (ep.kept)
+            {
+                appendBoundaryRuns(stf, stfInternal, stfBoundary(true), "the surface-tension flux");
+                emptyCellTimesZero(stf.data() + nIf, Kd, f.interface.sigma, "flux");
+                if (hooksEmptyCheck)
+                {
+                    hooksHeld("the surface-tension flux's patch faces", stf, static_cast<std::size_t>(nIf),
+                              stfBoundary(false));
+                }
             }
-            appendBoundary(stf, stfInternal, stfB);
+            else
+            {
+                appendBoundary(stf, stfInternal, stfBoundary(false));
+            }
             if (pairOnDevice)
             {
                 // ...and on the pair's faces: interpolate(sigma*K) on the pair's weights times snGrad(alpha)
@@ -2560,40 +3130,45 @@ RunReport runInterFoamDevice(
             // walk this is: the device's boundary array has no coupled patch in it, and a coupled patch's rho is
             // its two cells interpolated
             forcesPart.emplace("forces hook (device): snGrad(rho)");
-            std::vector<scalar> rbFlat;
-            rhoBd.copyTo(rbFlat);
-            std::vector<std::vector<scalar>> rb(fvp.size());
+            // ...straight into the list the closure and the writer read after the step, the patches that are
+            // not empty run by run where an empty patch's entries stay on the GPU: its list keeps its size and
+            // is read by nobody (the poison says so)
+            const bool rhoByRuns = ep.kept && !hooksEmptyCheck;
+            unflatten(rhoBd, stepRhoBnd, !rhoByRuns, hooksEmptyPoison);
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                std::size_t off = 0;
-                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                const FvPatch& q = fvp[pi];
+                if (!isCoupledInterfaceType(q.type)) continue;
+                stepRhoBnd[pi].resize(static_cast<std::size_t>(q.size));
+                for (label i = 0; i < q.size; ++i)
                 {
-                    const FvPatch& q = fvp[pi];
-                    const std::size_t n = static_cast<std::size_t>(q.size);
-                    if (isCoupledInterfaceType(q.type))
-                    {
-                        rb[pi].resize(n);
-                        for (label i = 0; i < q.size; ++i)
-                        {
-                            rb[pi][static_cast<std::size_t>(i)] = coupledLinear(q, i, f.rho);
-                        }
-                        continue;
-                    }
-                    rb[pi].assign(rbFlat.begin() + off, rbFlat.begin() + off + n);
-                    off += n;
+                    stepRhoBnd[pi][static_cast<std::size_t>(i)] = coupledLinear(q, i, f.rho);
                 }
             }
-            stepRhoBnd = rb;
             if (deviceClosure)
             {
                 deviceCopy(dStepRhoBnd, rhoBd);
             }
-            const GeometricField<scalar> rhoF = rhoWithPatchValues(f.rho, rb, fvp);
+            const GeometricField<scalar> rhoF = rhoWithPatchValues(f.rho, stepRhoBnd, fvp, !rhoByRuns);
             DeviceBuffer<scalar> snRhoInternal;
             DeviceBuffer<scalar> gRx;
             DeviceBuffer<scalar> gRy;
             DeviceBuffer<scalar> gRz;
             deviceSnGradInternal(rd, rhoBd, f.gradRho, gRx, gRy, gRz, snRhoInternal);
-            appendBoundary(snRho, snRhoInternal, snGradBoundary(rhoF, fvp, true));
+            if (ep.kept)
+            {
+                appendBoundaryRuns(snRho, snRhoInternal, snGradBoundary(rhoF, fvp, true, true), "snGrad(rho)");
+                emptySet(snRho.data() + nIf, scalar(0), "snGradRho");
+                if (hooksEmptyCheck)
+                {
+                    hooksHeld("snGrad(rho)'s patch faces", snRho, static_cast<std::size_t>(nIf),
+                              snGradBoundary(rhoF, fvp, true));
+                }
+            }
+            else
+            {
+                appendBoundary(snRho, snRhoInternal, snGradBoundary(rhoF, fvp, true));
+            }
             if (pairOnDevice)
             {
                 deviceCyclicSnGrad(*cycForHooks, rd, gRx, gRy, gRz, snCorrD && !forcesNoCorrection, snLimD,
@@ -2650,6 +3225,11 @@ RunReport runInterFoamDevice(
             // ...and WHICH delta coefficients: `uncorrected` and `limited 0` take nonOrthDeltaCoeffs
             // without the correction (uncorrectedSnGrad.H:113-119), which `orthogonal` does not
             const bool snNonOrth = f.snGradScheme.nonOrthCoeffs;
+            // (the host's gradient reads every patch's value: an empty patch's, left to the GPU, first)
+            if (ep.kept && !hooksEmptyCheck)
+            {
+                hooksHostWhole();
+            }
             forcesPart.emplace("forces hook (host): snGrad(alpha), its gradient with it");
             const SurfaceScalarField snA = fvc::snGrad(f.alpha1, m, g, fvp, snCorr,
                                                        f.gradAlpha1.leastSquares, f.gradAlpha1.cellLimitK, snLim,
@@ -2746,13 +3326,36 @@ RunReport runInterFoamDevice(
         // alpha's patch values one contact-angle pass too late.
         // nuEff = nut + nu: the mixture's nu alone on a laminar case. nut is the closure's, as the
         // LAST step's correct() left it -- or validate()'s, or the case file's, at the first.
+        // ...its patch values the other patches' alone where an empty patch's entries stay on the GPU, and an
+        // empty face's the cell's nu just uploaded: the mixture's boundary there was nu of the cell's alpha
+        const auto nuBoundaryUp = [&](const std::vector<std::vector<scalar>>& lists)
+        {
+            if (!ep.kept)
+            {
+                nuB.copyFrom(flattenPatches(lists, fvp));
+                return;
+            }
+            nuB.resize(ep.nBndAll);
+            runsUp(nuB.data(), packLists(lists), ep, "nu's patch values");
+            emptyMirror(nuB.data(), nuC, "nu");
+            if (hooksEmptyCheck)
+            {
+                hooksHeld("nu's patch values", nuB, 0, flattenPatches(lists, fvp));
+            }
+        };
         if (deviceClosure)
         {
             // the mixture's nu alone: the step adds the device's nut (DeviceInterStepControls::nutCell)
             nuC.copyFrom(f.nu);
-            nuB.copyFrom(flattenPatches(f.nuBnd, fvp));
+            nuBoundaryUp(f.nuBnd);
             deviceCopy(dStepNu, nuC);
             deviceCopy(dStepNuBnd, nuB);
+        }
+        else if (!f.turbulence.on && ep.kept)
+        {
+            // laminar: nuEff IS the mixture's nu (interNuEff copies both lists and returns)
+            nuC.copyFrom(f.nu);
+            nuBoundaryUp(f.nuBnd);
         }
         else
         {
@@ -2760,7 +3363,7 @@ RunReport runInterFoamDevice(
             std::vector<std::vector<scalar>> nuEffB;
             interNuEff(f.turbulence, f.nu, f.nuBnd, nuEff, nuEffB);
             nuC.copyFrom(nuEff);
-            nuB.copyFrom(flattenPatches(nuEffB, fvp));
+            nuBoundaryUp(nuEffB);
         }
 
         // snGrad(p_rgh) is read ONLY when the case runs a momentum predictor; it is explicit there and
@@ -2797,13 +3400,27 @@ RunReport runInterFoamDevice(
                                    && !pairJump && !prghLimitedAcrossPair;
             if (prghOnDevice)
             {
-                const DeviceBuffer<scalar> pBval(patchValues(f.p_rgh, fvp));
+                DeviceBuffer<scalar> pBval;
+                valuesForGradient(f.p_rgh, *prghForHooks, "prgh", pBval);
                 DeviceBuffer<scalar> snPInternal;
                 DeviceBuffer<scalar> gPx;
                 DeviceBuffer<scalar> gPy;
                 DeviceBuffer<scalar> gPz;
                 deviceSnGradInternal(*prghForHooks, pBval, f.gradPrgh, gPx, gPy, gPz, snPInternal);
-                appendBoundary(snP, snPInternal, snGradBoundary(f.p_rgh, fvp, true));
+                if (ep.kept)
+                {
+                    appendBoundaryRuns(snP, snPInternal, snGradBoundary(f.p_rgh, fvp, true, true), "snGrad(p_rgh)");
+                    emptySet(snP.data() + nIf, scalar(0), "snGradPrgh");
+                    if (hooksEmptyCheck)
+                    {
+                        hooksHeld("snGrad(p_rgh)'s patch faces", snP, static_cast<std::size_t>(nIf),
+                                  snGradBoundary(f.p_rgh, fvp, true));
+                    }
+                }
+                else
+                {
+                    appendBoundary(snP, snPInternal, snGradBoundary(f.p_rgh, fvp, true));
+                }
                 if (pairOnDevice)
                 {
                     deviceCyclicSnGrad(*cycForHooks, *prghForHooks, gPx, gPy, gPz,
@@ -4517,20 +5134,108 @@ RunReport runInterFoamDevice(
         deviceCopyNotViaHost(dUoy, dUy, "Uy's old-time level");
         deviceCopyNotViaHost(dUoz, dUz, "Uz's old-time level");
         {
-            std::vector<scalar> bx, by, bz;
-            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            interPhase::Nested timed("step: U's old-time patch values up");
+            // AN `empty` PATCH'S OLD-TIME VALUES ARE ITS CELLS' (EmptyPatchField::evaluate, and nothing moves U
+            // between a step's last evaluate and the next step's start): mirrored on the device from the U this
+            // step starts on, the other patches' packed and up run by run. Every face was flattened here by
+            // push_back and uploaded in three copies: MEASURED on laminar/waves/streamFunction (320,000 of
+            // 324,160 boundary faces empty), 1.5 ms a step. The momentum hook's switches cover it:
+            // BRAE_CONTROL_U_EMPTY_FROM_HOST=1 as before, BRAE_CONTROL_U_EMPTY_CHECK=1 every entry against the
+            // host's whole list, bitwise. BRAE_CONTROL_U_OLD_VALUES_NO_MIRROR=1 is the gate's CONTROL,
+            // deliberately wrong: the mirror is skipped here alone and the entries keep the step before's.
+            static const bool oldNoMirror = std::getenv("BRAE_CONTROL_U_OLD_VALUES_NO_MIRROR") != nullptr;
+            const UBoundaryPlan oldPlan = uBoundaryPlan();
+            DeviceBuffer<scalar>* dUob[3] = {&dUobx, &dUoby, &dUobz};
+            std::vector<scalar> all[3];
+            if (!oldPlan.emptyOnDevice || uEmptyCheck)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
-                for (const vector& v : f.U.boundary[pi]->value())
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                 {
-                    bx.push_back(v.x); by.push_back(v.y); bz.push_back(v.z);
+                    if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                    for (const vector& v : f.U.boundary[pi]->value())
+                    {
+                        all[0].push_back(v.x);
+                        all[1].push_back(v.y);
+                        all[2].push_back(v.z);
+                    }
                 }
             }
-            dUobx.copyFrom(bx); dUoby.copyFrom(by); dUobz.copyFrom(bz);
+            if (oldPlan.emptyOnDevice)
+            {
+                const std::size_t nHost = oldPlan.nHostFaces;
+                std::vector<scalar> pack(3*nHost);
+                std::size_t at = 0;
+                for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                {
+                    if (isCoupledInterfaceType(fvp[pi].type) || fvp[pi].type == "empty") continue;
+                    for (const vector& v : f.U.boundary[pi]->value())
+                    {
+                        pack[at] = v.x;
+                        pack[nHost + at] = v.y;
+                        pack[2*nHost + at] = v.z;
+                        ++at;
+                    }
+                }
+                if (at != nHost)
+                {
+                    throw std::runtime_error("brae interFoam: U's patches do not hold a value a face.");
+                }
+                if (nHost > 0)
+                {
+                    uValuesStage.copyFrom(pack);
+                }
+                for (int k = 0; k < 3; ++k)
+                {
+                    dUob[k]->resize(oldPlan.nBndAll);
+                    std::size_t from = static_cast<std::size_t>(k)*nHost;
+                    for (const DeviceBoundaryRange& r : oldPlan.ranges)
+                    {
+                        cudaCheck(cudaMemcpyAsync(dUob[k]->data() + r.at, uValuesStage.data() + from,
+                                                  r.n*sizeof(scalar), cudaMemcpyDeviceToDevice,
+                                                  cudaStreamPerThread), "U's old-time patch values");
+                        from += r.n;
+                    }
+                }
+                if (!uEmptyNoMirror && !oldNoMirror)
+                {
+                    const int nB = dm.nBndFaces;
+                    mirrorEmptyFacesKernel<<<(nB + 255)/256, 256, 0, cudaStreamPerThread>>>(
+                        nB,
+                        dm.bndIsEmpty.data(),
+                        dm.bndCell.data(),
+                        dUx.data(),
+                        dUy.data(),
+                        dUz.data(),
+                        dUobx.data(),
+                        dUoby.data(),
+                        dUobz.data());
+                    cudaCheck(cudaGetLastError(), "mirrorEmptyFacesKernel");
+                }
+                cudaCheck(cudaStreamSynchronize(cudaStreamPerThread), "U's old-time patch values");
+                for (int k = 0; uEmptyCheck && k < 3; ++k)
+                {
+                    sameOnDevice("the old-time patch values", k, *dUob[k], all[k]);
+                }
+                static long checked = 0;
+                if (uEmptyCheck && (++checked == 1 || checked % 10 == 0))
+                {
+                    std::printf("  U old-time patch values check: %ld steps, %zu boundary faces a component the "
+                                "host's whole list, bitwise\n", checked, oldPlan.nBndAll);
+                }
+            }
+            else
+            {
+                for (int k = 0; k < 3; ++k)
+                {
+                    dUob[k]->copyFrom(all[k]);
+                }
+            }
             // ...and at the first step the old-old patch values, which are the old ones (a copy)
             if (cnDdt && dUoobx.size() == 0)
             {
-                dUoobx.copyFrom(bx); dUooby.copyFrom(by); dUoobz.copyFrom(bz);
+                deviceCopy(dUoobx, dUobx);
+                deviceCopy(dUooby, dUoby);
+                deviceCopy(dUoobz, dUobz);
             }
         }
         std::vector<scalar> poi, pob;
@@ -4840,6 +5545,28 @@ RunReport runInterFoamDevice(
                         const std::size_t cs = static_cast<std::size_t>(c);
                         f.U.internal[cs] = vector{cx[cs], cy[cs], cz[cs]};
                     }
+                }
+                // ...and alpha's values on an `empty` patch, where the hooks left them to the GPU: the update's
+                // curvature pass reads every patch's (calculateK whole, whose patch snGrad is the value less
+                // the cell's). The host's cells are the last hook's copy, so this is the evaluate a whole
+                // hook made. FOUND by BRAE_CONTROL_HOOKS_EMPTY_POISON on laminar/waves/waveMakerFlap: p, U and
+                // phi NaN in the second step. BRAE_CONTROL_HOOKS_EMPTY_STALE_AT_MESH_UPDATE=1 leaves the values
+                // as they stand -- the gate's control.
+                static const bool staleAtUpdate =
+                    std::getenv("BRAE_CONTROL_HOOKS_EMPTY_STALE_AT_MESH_UPDATE") != nullptr;
+                if (staleAtUpdate)
+                {
+                    static bool said = false;
+                    if (!said)
+                    {
+                        said = true;
+                        std::printf("  *** CONTROL MODE: the mesh update reads alpha's stale values on the empty "
+                                    "patches. This run is deliberately wrong. ***\n");
+                    }
+                }
+                else if (hooksEmptyPlan().kept && !hooksEmptyCheck)
+                {
+                    f.alpha1.evaluateBoundaryWhere(emptyPatch);
                 }
                 std::vector<scalar> cpDiv;
                 {
@@ -5986,7 +6713,8 @@ RunReport runInterFoamDevice(
             if (hostClosure)
             {
                 dPhiI.copyTo(f.phi.internal);
-                pushFlux();
+                // WHOLE: the host closure takes phi with every patch's faces
+                pushFlux(false, true);
                 dRpI.copyTo(f.rhoPhi.internal);
                 {
                     std::vector<scalar> rb;
@@ -6075,7 +6803,8 @@ RunReport runInterFoamDevice(
                       f.U.internal[c] = vector{ux[c], uy[c], uz[c]};
                   f.U.evaluateBoundary(); }
                 dPhiI.copyTo(f.phi.internal);
-                pushFlux();
+                // WHOLE: the mesh's next update maps and reads the boundary flux as this push leaves it
+                pushFlux(false, !fluxDynamicByRuns);
                 // ...with the flux as it stood BEFORE makeRelative, which is the one pEqn.H:66 hands
                 // fvc::correctUf. Handing it the relative flux instead puts the MESH's normal
                 // velocity into Uf, and nothing in the step that wrote it can see the error: Uf is
@@ -6386,7 +7115,13 @@ RunReport runInterFoamDevice(
         // come from the interface array. Walking fvp whole here shifted every patch after the first
         // coupled one: MEASURED on damBreakPorousBaffle, this report read worst |div(phi)| 2.875e-01
         // against the host's 7.932e-05 on a run whose max|U| agreed to every digit.
-        pushFlux();
+        pushFlux(false, true);
+        // ...and the host's lists an empty patch's entries were kept off, for whoever reads the fields after
+        // the run
+        if (hooksEmptyPlan().kept && !hooksEmptyCheck)
+        {
+            hooksHostWhole();
+        }
         SurfaceScalarField phiOut;
         phiOut.internal = f.phi.internal;
         phiOut.boundary = f.phi.boundary;
