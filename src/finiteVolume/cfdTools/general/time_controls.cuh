@@ -30,6 +30,8 @@
 #include "foam_dict.cuh"
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -37,11 +39,42 @@
 namespace brae {
 
 // OF readTimeControls.H. maxDeltaT defaults to GREAT (i.e. no cap) exactly as OF does.
+// OPENFOAM'S SMALL AND GREAT IN THE DOUBLE BUILD these solvers mirror (etc/bashrc: WM_PRECISION_OPTION=DP;
+// scalar.H:120-133): doubleScalarSMALL = 1.0e-15 and doubleScalarGREAT = 1.0e+15 (doubleScalar.H:58-62).
+// setDeltaT.H adds SMALL to each Courant number before it divides, setInitialDeltaT.H tests `CoNum > SMALL`, and
+// readTimeControls.H defaults maxDeltaT to GREAT.
+// THESE WERE 1.0e-37 AND 1.0e300 UNTIL 2026-10-05 -- the FLOAT build's VSMALL (floatScalar.H:64) and the double
+// build's VGREAT, each under a comment naming the right constant. CoNum + 1e-37 is CoNum; CoNum + 1e-15 is a
+// few ulp above it. So on every step the Courant number limits (deltaTFact below the 1.2 cap) brae's deltaT
+// sat about 1e-15/CoNum relative from OpenFOAM's expression. MEASURED against OpenFOAM's own log, a step a row
+// (tests/interfoam_write/clock/deltat_openfoam_log.sh): of laminar/damBreak's first 186 steps, 175 were not
+// OpenFOAM's bits, up to 1.3e-15 relative, and of 306 with maxAlphaCo 0.5, 298, up to 2.3e-15; with 1e-15 all
+// are. The same mistake had been found and fixed in ddtCorr (inter_peqn_cpp.cu, device_inter_peqn.cu).
+// THE ONE PRODUCT THAT FEEDS A SUM, `1.0 + 0.1*maxDeltaTFact`, IS A FUSED MULTIPLY-ADD in this machine's
+// OpenFOAM: interFoam's own code at 0x24278 (linuxARM64GccDPInt32Opt, v2412) is `fmadd d0, d12, d1, d0` with
+// 1.0 and the constant 0.1 -- gcc -O3 contracts it on aarch64. It is written std::fma below, so that brae's
+// step does not depend on how brae was compiled. (An x86-64 OpenFOAM built without -mfma rounds the product
+// first; there the two differ by an ulp of deltaTFact on about one damped step in sixteen.)
+//   BRAE_CONTROL_DELTAT_SMALL_FLOAT=1   a gate's CONTROL, deliberately wrong: 1.0e-37 again
+constexpr scalar timeControlGreat = 1.0e+15;
+inline scalar timeControlSmall()
+{
+    static const bool floatBuilds = std::getenv("BRAE_CONTROL_DELTAT_SMALL_FLOAT") != nullptr;
+    static bool said = false;
+    if (floatBuilds && !said)
+    {
+        said = true;
+        std::printf("  *** CONTROL MODE: the time-step control adds 1e-37 to the Courant number where OpenFOAM "
+                    "adds SMALL = 1e-15. This run is deliberately wrong. ***\n");
+    }
+    return floatBuilds ? scalar(1.0e-37) : scalar(1.0e-15);
+}
+
 struct TimeControls
 {
-    bool   adjustTimeStep = false;
-    scalar maxCo          = 1.0;
-    scalar maxDeltaT      = 1.0e300;   // OF: GREAT
+    bool adjustTimeStep = false;
+    scalar maxCo = 1.0;
+    scalar maxDeltaT = timeControlGreat;
 
     static TimeControls read(const FoamDict& controlDict)
     {
@@ -49,7 +82,7 @@ struct TimeControls
         const std::string a = controlDict.wordOr("adjustTimeStep", "no");
         tc.adjustTimeStep = (a == "yes" || a == "true" || a == "on" || a == "1");
         tc.maxCo     = controlDict.scalarOr("maxCo", 1.0);
-        tc.maxDeltaT = controlDict.scalarOr("maxDeltaT", 1.0e300);
+        tc.maxDeltaT = controlDict.scalarOr("maxDeltaT", timeControlGreat);
         return tc;
     }
 };
@@ -114,7 +147,7 @@ inline CourantNumbers courantNo(
 inline scalar setInitialDeltaT(scalar deltaT, scalar CoNum, const TimeControls& tc)
 {
     if (!tc.adjustTimeStep) return deltaT;
-    const scalar kSmall = 1.0e-37;                       // OF SMALL
+    const scalar kSmall = timeControlSmall();
     if (CoNum <= kSmall) return deltaT;
     return std::min(tc.maxCo*deltaT/CoNum, std::min(deltaT, tc.maxDeltaT));
 }
@@ -123,9 +156,10 @@ inline scalar setInitialDeltaT(scalar deltaT, scalar CoNum, const TimeControls& 
 inline scalar setDeltaT(scalar deltaT, scalar CoNum, const TimeControls& tc)
 {
     if (!tc.adjustTimeStep) return deltaT;
-    const scalar kSmall = 1.0e-37;
+    const scalar kSmall = timeControlSmall();
     const scalar maxDeltaTFact = tc.maxCo/(CoNum + kSmall);
-    const scalar deltaTFact = std::min(std::min(maxDeltaTFact, scalar(1) + scalar(0.1)*maxDeltaTFact), scalar(1.2));
+    const scalar damped = std::fma(scalar(0.1), maxDeltaTFact, scalar(1));
+    const scalar deltaTFact = std::min(std::min(maxDeltaTFact, damped), scalar(1.2));
     return std::min(deltaTFact*deltaT, tc.maxDeltaT);
 }
 
@@ -159,7 +193,9 @@ inline scalar setDeltaT(scalar deltaT, scalar CoNum, const TimeControls& tc)
 // 4. THE TWO LIMITS COMBINE INSIDE maxDeltaTFact, BEFORE THE DAMPING:
 //        maxDeltaTFact = min(maxCo/(CoNum + SMALL), maxAlphaCo/(alphaCoNum + SMALL))
 //    and the 1.2 cap and the `1 + 0.1*maxDeltaTFact` growth damping are applied to that combined
-//    value. Damping each separately and then taking the min is not the same number.
+//    value. That is OpenFOAM's order and it is kept as transcribed -- though damping each and then taking
+//    the min is the same number (the damping is non-decreasing in its argument, in floating point too), so
+//    no test can tell the two apart and none claims to.
 
 struct VoFTimeControls
 {
@@ -222,10 +258,10 @@ inline CourantNumbers alphaCourantNo(
 // SHORTENS the step so the next write time is landed on exactly. So a solver that reads maxCo and
 // maxAlphaCo and ignores writeControl does not reproduce OpenFOAM's deltaT.
 //
-// MEASURED ON damBreak, whose controlDict says `writeControl adjustableRunTime; writeInterval 0.05`:
-// OpenFOAM's first step is 0.000119904 -- that is 0.05/417 -- where brae's unclamped setDeltaTVoF
-// gave 0.00012. The gap is in the fourth digit and it compounds: eleven steps later, on `endTime
-// 0.004`, OpenFOAM ended at t = 0.00385757 and brae at 0.00385805.
+// MEASURED ON damBreak, whose controlDict says `writeControl adjustable; writeInterval 0.05` and
+// `deltaT 0.001`: OpenFOAM's first step is 0.00119047619 -- that is 0.05/42 -- where brae's unclamped
+// setDeltaTVoF gave the raw 1.2 x 0.001 = 0.0012. The gap is in the third digit and it compounds. (This note
+// carried both numbers a factor of ten too small until 2026-10-05, as the clock gate's control did.)
 struct WriteCadence
 {
     // writeControl adjustableRunTime -- the only mode that adjusts
@@ -322,11 +358,11 @@ inline scalar setDeltaTVoF(
     const WriteCadence* w = nullptr)
 {
     if (!tc.base.adjustTimeStep) return deltaT;
-    const scalar kSmall = 1.0e-37;
+    const scalar kSmall = timeControlSmall();
     const scalar maxDeltaTFact = std::min(tc.base.maxCo/(CoNum + kSmall),
                                           tc.maxAlphaCo/(alphaCoNum + kSmall));
-    const scalar deltaTFact =
-        std::min(std::min(maxDeltaTFact, scalar(1) + scalar(0.1)*maxDeltaTFact), scalar(1.2));
+    const scalar damped = std::fma(scalar(0.1), maxDeltaTFact, scalar(1));
+    const scalar deltaTFact = std::min(std::min(maxDeltaTFact, damped), scalar(1.2));
     const scalar dt = std::min(deltaTFact*deltaT, tc.base.maxDeltaT);
     return w ? adjustDeltaT(dt, tSinceStart, *w) : dt;
 }

@@ -22,8 +22,9 @@
 //    guarded the division differently -- or clamped the factor -- would silently freeze a case that
 //    has not yet developed an interface.
 //
-// 4. THE TWO LIMITS COMBINE BEFORE THE DAMPING. min-then-damp is not damp-then-min, and the numbers
-//    differ whenever the binding limit wants growth.
+// 4. THE TWO LIMITS COMBINE BEFORE THE DAMPING, as setDeltaT.H writes it. (min-then-damp and
+//    damp-then-min are the same number -- the damping is non-decreasing -- so the arm below holds that
+//    BOTH limits enter, not the order.)
 #include "box_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -92,8 +93,10 @@ int main()
         bool threwFixed = false;
         try { (void)VoFTimeControls::read(fixed); } catch (const std::exception&) { threwFixed = true; }
         check("a fixed-step case does not need maxAlphaCo at all", !threwFixed);
-        checkNum("maxDeltaT defaults to GREAT (no cap)",
-                 VoFTimeControls::read(fixed).base.maxDeltaT > scalar(1e100) ? scalar(1) : scalar(0),
+        // readTimeControls.H: getOrDefault<scalar>("maxDeltaT", GREAT), and GREAT in the double build is
+        // doubleScalarGREAT = 1.0e+15 (doubleScalar.H:58) -- not VGREAT's 1e300, which this arm once took
+        checkNum("maxDeltaT defaults to GREAT, 1e15 (no cap)",
+                 VoFTimeControls::read(fixed).base.maxDeltaT == scalar(1.0e+15) ? scalar(1) : scalar(0),
                  scalar(1));
     }
 
@@ -170,7 +173,11 @@ int main()
 
         auto oracle = [&](scalar Co, scalar aCo)
         {
-            const scalar kSmall = scalar(1e-37);
+            // OpenFOAM's SMALL in the double build, doubleScalar.H:62. (This oracle carried 1e-37, as the
+            // function did. At this file's 1e-12 tolerance neither value can be told from the other: the
+            // constant is held by tests/interfoam_write/clock/deltat_openfoam_log.sh, against OpenFOAM's
+            // log, bit for bit.)
+            const scalar kSmall = scalar(1e-15);
             const scalar f = std::fmin(tc.base.maxCo/(Co + kSmall), tc.maxAlphaCo/(aCo + kSmall));
             const scalar d = std::fmin(std::fmin(f, scalar(1) + scalar(0.1)*f), scalar(1.2));
             return std::fmin(d*dt, tc.base.maxDeltaT);

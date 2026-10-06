@@ -11,8 +11,9 @@
 # WHAT IT FOUND. brae read maxCo and maxAlphaCo and ignored writeControl entirely. Time::setDeltaT
 # takes `adjust = true` by default and calls Time::adjustDeltaT, which under damBreak's
 # `writeControl adjustable; writeInterval 0.05` trims the step to land on the next write time:
-# OpenFOAM's first step is 0.05/417 = 0.000119904 where brae's was setDeltaT.H's raw 1.2x = 0.00012.
-# Eleven steps of `endTime 0.004` later, OpenFOAM ended at 0.00385757 and brae at 0.00385805.
+# OpenFOAM's first step is 0.05/42 = 0.00119047619 where brae's was setDeltaT.H's raw 1.2 x 0.001 = 0.0012.
+# (These two numbers stood here a factor of ten too small until 2026-10-05, and the control below tested
+# against the wrong one: it could not fail.)
 #
 # THE ORACLE IS OpenFOAM'S OWN LOG, and its precision is the gate's precision. At OpenFOAM's default
 # six significant figures the comparison bottomed out at 3.2e-06 -- which is half an ULP of the
@@ -79,7 +80,8 @@ else
     echo "  (no GPU: the -device clock arm is skipped)"
 fi
 
-python3 - "$W/case/log.interFoam" "$W/log.brae" "$ENDTIME" "$DEVLOG" <<'PYEOF'
+DT0=$(sed -n -E 's/^deltaT +([^;]+);.*/\1/p' "$W/case/system/controlDict" | head -1)
+python3 - "$W/case/log.interFoam" "$W/log.brae" "$ENDTIME" "$DEVLOG" "$DT0" <<'PYEOF'
 import re, sys
 
 of  = open(sys.argv[1]).read()
@@ -112,11 +114,12 @@ wT  = max(abs(brT[i]  - ofT[i]) /ofT[i]  for i in range(min(len(ofT), len(brT)))
 print("  deltaT worst %.3e relative over %d steps;  t worst %.3e;  ends OF %.9g / brae %.9g"
       % (wDt, n, wT, ofT[-1], brT[-1]))
 
-# THE CONTROL. Without Time::adjustDeltaT the first step is setDeltaT.H's raw 1.2 x deltaT0 = 1.2e-04,
-# and every check above would still pass to three digits for the first few steps. This one would not:
-# OpenFOAM's first step is 0.05/417 and differs from 1.2e-04 in the fourth.
-check("the first step is the write cadence's and not setDeltaT.H's raw 1.2x (%.9g, not 1.2e-04)"
-      % brDt[0], abs(brDt[0] - 1.2e-4) > 1e-8)
+# THE CONTROL. Without Time::adjustDeltaT the first step is setDeltaT.H's raw 1.2 x deltaT0, deltaT0 read from
+# the case, and every check above would still pass to two digits for the first few steps. This one would
+# not: OpenFOAM's first step is 0.05/42 and differs from 1.2 x 0.001 in the third.
+raw = 1.2*float(sys.argv[5])
+check("the first step is the write cadence's and not setDeltaT.H's raw 1.2 x deltaT0 (%.9g, not %.9g)"
+      % (brDt[0], raw), abs(brDt[0] - raw) > 1e-3*raw)
 
 # 1e-13, because over these thirteen steps the clock is PURE ARITHMETIC. At damBreak's maxCo 1 the
 # Courant number never binds this early -- setDeltaT's 1.2 cap sets every step until Time::
