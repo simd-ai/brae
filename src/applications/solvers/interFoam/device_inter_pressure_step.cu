@@ -555,6 +555,17 @@ scalar deviceInterPressureStep(
                 }
                 tolUsed = tol*knobs.finalTolFactor;
             }
+            if (knobs.corrScaling)
+            {
+                static bool scalingAnnounced = false;
+                if (!scalingAnnounced)
+                {
+                    scalingAnnounced = true;
+                    std::printf("  p_rgh EXPERIMENT: the AMG-PCG's coarse correction is scaled by a line search on "
+                                "every grid, which takes the plain loop and the double-precision cycle "
+                                "(BRAE_CORR_SCALING=1)\n");
+                }
+            }
             timedPart.emplace("pressure: the AMG-PCG iterations");
             perf = deviceAMGPCG(A, amg, b, p_rgh, nf, tolUsed, relTol, maxIter, graph, knobs.checkEvery,
                                 knobs.corrScaling, minIter);

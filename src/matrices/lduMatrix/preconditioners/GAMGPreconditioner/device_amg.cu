@@ -75,6 +75,64 @@ void rapScatterK(
     else if (dk==1) atomicAdd(&cUp[di], v);
     else atomicAdd(&cLo[di], v);
 }
+// The same triple product in a fixed order, two launches (AMGLevel::rapStart has why two): every triple's
+// product, a thread a triple...
+__global__
+void rapTermsK(
+    int nT,
+    const label* __restrict__ srcKind,
+    const label* __restrict__ srcIdx,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ fineDiag,
+    const scalar* __restrict__ fineUp,
+    const scalar* __restrict__ fineLo,
+    scalar* __restrict__ term)
+{
+    const int t = blockIdx.x*blockDim.x + threadIdx.x;
+    if (t >= nT) return;
+    const int sk = srcKind[t];
+    const int si = srcIdx[t];
+    const scalar src = (sk == 0) ? fineDiag[si] : (sk == 1) ? fineUp[si] : fineLo[si];
+    term[t] = w[t]*src;
+}
+
+// ...then each coarse entry's run of them added in order, a thread an entry: nCoarse diagonals, then the upper
+// and the lower faces. amgSaFixedOrder put a destination's triples next to one another. Writes every entry, so
+// the coarse matrix needs no zeroing first.
+__global__
+void rapSumK(
+    int nDest,
+    int nCoarse,
+    int nCoarseFaces,
+    int reversed,
+    const label* __restrict__ start,
+    const scalar* __restrict__ term,
+    scalar* __restrict__ cDiag,
+    scalar* __restrict__ cUp,
+    scalar* __restrict__ cLo)
+{
+    const int d = blockIdx.x*blockDim.x + threadIdx.x;
+    if (d >= nDest) return;
+    const int lo = start[d];
+    const int hi = start[d + 1];
+    scalar acc = 0;
+    for (int j = 0; j < hi - lo; ++j)
+    {
+        acc += term[reversed ? hi - 1 - j : lo + j];
+    }
+    if (d < nCoarse)
+    {
+        cDiag[d] = acc;
+    }
+    else if (d < nCoarse + nCoarseFaces)
+    {
+        cUp[d - nCoarse] = acc;
+    }
+    else
+    {
+        cLo[d - nCoarse - nCoarseFaces] = acc;
+    }
+}
 // Injection Galerkin (default path): coarse LDU from fine diag/upper/lower via faceRestrict/faceFlip.
 //
 // DETERMINISM. These used to SCATTER with atomicAdd -- cDiag[map[c]] += fineDiag[c] and
@@ -1148,7 +1206,9 @@ unsigned long long amgHierarchySignature(
     f.value(static_cast<unsigned long long>(sizeof(label)));
     f.value(static_cast<unsigned long long>(sizeof(scalar)));
     f.value(static_cast<long long>(nFine));
-    f.value(static_cast<long long>(smoothedAggregation ? 1 : 0));
+    // (2 for a smoothed hierarchy since 2026-10-06: its triple-product recipe is kept, and so written, in
+    // destination order -- amgSaFixedOrder. A file from before is another build's and is built again once.)
+    f.value(static_cast<long long>(smoothedAggregation ? 2 : 0));
     f.value(static_cast<long long>(useGS() ? 1 : 0));
     f.value(static_cast<long long>(amgTarget()));
     f.value(static_cast<long long>(amgMergeFor(nFine)));
@@ -1353,6 +1413,7 @@ AMGData buildAMG(
             L.rapDstKind.copyFrom(rec.dstKind);
             L.rapDstIdx.copyFrom(rec.dstIdx);
             L.rapW.copyFrom(rec.w);
+            amgSaFixedOrder(L);
             A.level.push_back(std::move(L));
             std::vector<scalar> cfw(nCF);                        // next level's agglomeration weights = |coarse off-diag|
             for (int f = 0; f < nCF; ++f)
@@ -1442,6 +1503,106 @@ void amgGalerkinStands(AMGData& A)
     A.fp32Stands = A.fp32Current;
 }
 
+
+void amgSaFixedOrder(AMGLevel& L)
+{
+    const int nC = L.nCoarse;
+    const int nCF = L.nCoarseFaces;
+    if (L.Prow.size() == 0)
+    {
+        L.Rrow.resize(0);
+        L.Rfine.resize(0);
+        L.Rval.resize(0);
+        L.RvalF.resize(0);
+        L.rapStart.resize(0);
+        L.Rterm.resize(0);
+        L.RtermF.resize(0);
+        L.rapTerm.resize(0);
+        return;
+    }
+    // P^T by coarse row: a counting sort of P's entries by column, the fine rows met in ascending order
+    const std::vector<label> rowPtr = L.Prow.host();
+    const std::vector<label> col = L.Pcol.host();
+    const std::vector<scalar> val = L.Pval.host();
+    const int nF = static_cast<int>(rowPtr.size()) - 1;
+    std::vector<label> rRow(nC + 1, 0);
+    for (const label c : col)
+    {
+        ++rRow[c + 1];
+    }
+    for (int c = 0; c < nC; ++c)
+    {
+        rRow[c + 1] += rRow[c];
+    }
+    std::vector<label> at(rRow.begin(), rRow.end() - 1);
+    std::vector<label> rFine(col.size());
+    std::vector<scalar> rVal(col.size());
+    for (int f = 0; f < nF; ++f)
+    {
+        for (label k = rowPtr[f]; k < rowPtr[f + 1]; ++k)
+        {
+            const label j = at[col[k]]++;
+            rFine[j] = f;
+            rVal[j] = val[k];
+        }
+    }
+    L.Rrow.copyFrom(rRow);
+    L.Rfine.copyFrom(rFine);
+    L.Rval.copyFrom(rVal);
+    // (the products' buffers: fixed addresses for the life of the level, as a captured cycle needs)
+    L.Rterm.resize(rVal.size());
+    L.RtermF.resize(rVal.size());
+    L.rapTerm.resize(L.nTriples);
+    // (the single-precision values are cast with the prolongator's, amgPrepareFP32)
+    L.RvalF.resize(0);
+    // the triples by destination: diagonals, then upper faces, then lower faces; the recipe's order within one
+    std::vector<label> dstKind = L.rapDstKind.host();
+    std::vector<label> dstIdx = L.rapDstIdx.host();
+    const int nDest = nC + 2*nCF;
+    const auto dest = [&](std::size_t t)
+    {
+        return dstKind[t] == 0 ? dstIdx[t] : dstKind[t] == 1 ? nC + dstIdx[t] : nC + nCF + dstIdx[t];
+    };
+    std::vector<label> start(nDest + 1, 0);
+    for (std::size_t t = 0; t < dstKind.size(); ++t)
+    {
+        ++start[dest(t) + 1];
+    }
+    for (int d = 0; d < nDest; ++d)
+    {
+        start[d + 1] += start[d];
+    }
+    std::vector<label> next(start.begin(), start.end() - 1);
+    std::vector<label> order(dstKind.size());
+    bool sorted = true;
+    for (std::size_t t = 0; t < dstKind.size(); ++t)
+    {
+        const label to = next[dest(t)]++;
+        order[to] = static_cast<label>(t);
+        sorted = sorted && to == static_cast<label>(t);
+    }
+    L.rapStart.copyFrom(start);
+    if (sorted)
+    {
+        return;
+    }
+    // the recipe's five lists in that order, so that a destination's triples are read one after another
+    const auto permuted = [&](const auto& from)
+    {
+        auto to = from;
+        for (std::size_t k = 0; k < order.size(); ++k)
+        {
+            to[k] = from[order[k]];
+        }
+        return to;
+    };
+    L.rapSrcKind.copyFrom(permuted(L.rapSrcKind.host()));
+    L.rapSrcIdx.copyFrom(permuted(L.rapSrcIdx.host()));
+    L.rapW.copyFrom(permuted(L.rapW.host()));
+    L.rapDstKind.copyFrom(permuted(dstKind));
+    L.rapDstIdx.copyFrom(permuted(dstIdx));
+}
+
 void amgGalerkin(
     AMGData& A,
     const DeviceBuffer<scalar>& fineDiag,
@@ -1475,14 +1636,35 @@ void amgGalerkin(
         }
         if (A.saSmooth)                                          // general Galerkin A_c = P^T A P (precomputed RAP recipe)
         {
-            // The SA path still SCATTERS, so it is still order-dependent. It is opt-in (BRAE_AMG_SA) and
-            // off by default; leaving it as it was keeps this change to one behaviour at a time. The
-            // determinism gate asserts the DEFAULT path, and the SA path is listed as a known gap.
-            zeroT<scalar><<<nBlocks(L.nCoarse),TPB>>>(L.nCoarse, L.cDiag.data());
-            zeroT<scalar><<<nBlocks(L.nCoarseFaces),TPB>>>(L.nCoarseFaces, L.cUpper.data());
-            zeroT<scalar><<<nBlocks(L.nCoarseFaces),TPB>>>(L.nCoarseFaces, L.cLower.data());
-            rapScatterK<<<nBlocks(L.nTriples),TPB>>>(L.nTriples, L.rapSrcKind.data(), L.rapSrcIdx.data(), L.rapW.data(),
-                L.rapDstKind.data(), L.rapDstIdx.data(), fd, fu, fl, L.cDiag.data(), L.cUpper.data(), L.cLower.data());
+            // GATHERED IN A FIXED ORDER, as the injection path below has been: this scattered with atomicAdd
+            // while the smoothed hierarchy was opt-in, and stayed so after pcorr on a 2-D moving mesh took it
+            // by default (AMGLevel::rapStart has what that cost). BRAE_CONTROL_AMG_SA_SCATTER=1 scatters.
+            if (amgSaScatter())
+            {
+                zeroT<scalar><<<nBlocks(L.nCoarse),TPB>>>(L.nCoarse, L.cDiag.data());
+                zeroT<scalar><<<nBlocks(L.nCoarseFaces),TPB>>>(L.nCoarseFaces, L.cUpper.data());
+                zeroT<scalar><<<nBlocks(L.nCoarseFaces),TPB>>>(L.nCoarseFaces, L.cLower.data());
+                rapScatterK<<<nBlocks(L.nTriples),TPB>>>(
+                    L.nTriples, L.rapSrcKind.data(), L.rapSrcIdx.data(), L.rapW.data(),
+                    L.rapDstKind.data(), L.rapDstIdx.data(), fd, fu, fl,
+                    L.cDiag.data(), L.cUpper.data(), L.cLower.data());
+            }
+            else
+            {
+                const int nDest = L.nCoarse + 2*L.nCoarseFaces;
+                if (static_cast<int>(L.rapStart.size()) != nDest + 1)
+                {
+                    throw std::runtime_error(
+                        "brae AMG: a smoothed-aggregation level has no fixed-order list of its triple product "
+                        "(amgSaFixedOrder was not run where the level's recipe was set)");
+                }
+                rapTermsK<<<nBlocks(L.nTriples),TPB>>>(
+                    L.nTriples, L.rapSrcKind.data(), L.rapSrcIdx.data(), L.rapW.data(), fd, fu, fl,
+                    L.rapTerm.data());
+                rapSumK<<<nBlocks(nDest),TPB>>>(
+                    nDest, L.nCoarse, L.nCoarseFaces, amgSaGatherReversed() ? 1 : 0, L.rapStart.data(),
+                    L.rapTerm.data(), L.cDiag.data(), L.cUpper.data(), L.cLower.data());
+            }
         }
         else       // injection Galerkin (default): fixed-order GATHER per coarse entity, no pre-zero needed
         {

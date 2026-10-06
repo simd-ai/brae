@@ -41,9 +41,10 @@ sed -i 's/ || gcf.keyEpoch != deviceReductionScratchEpoch()//; s/ || gc.keyEpoch
 # ...and the pair's epoch, which these guards have compared since 2026-10-04 (f4744e6). It survives pool
 # recycling too, so with it left in the guard was NOT keyed on the pointer alone, the audit rightly passed
 # the edited copy, and this arm failed from that commit on. Cut with the rest, and checked to have gone.
-sed -i 's/^\s*|| gcf.keyPairEpoch != amg.pair.epoch)/)/; s/^\s*|| gc.keyPairEpoch != amg.pair.epoch)/)/' \
-    "$W/pcg/device_amg_pcg.cu"
-left="gcf\?.keyPairEpoch != amg.pair.epoch\|gcf\?.keyEpoch != deviceReductionScratchEpoch"
+# ...and amgGraphViewMoved, which they ask since 2026-10-06 (the off-diagonal pointers and the addressing).
+sed -i 's/^\s*|| gcf.keyPairEpoch != amg.pair.epoch || amgGraphViewMoved(gcf, A))/)/' "$W/pcg/device_amg_pcg.cu"
+sed -i 's/^\s*|| gc.keyPairEpoch != amg.pair.epoch || amgGraphViewMoved(gc, A))/)/' "$W/pcg/device_amg_pcg.cu"
+left="gcf\?.keyPairEpoch != amg.pair.epoch\|gcf\?.keyEpoch != deviceReductionScratchEpoch\|amgGraphViewMoved"
 grep -q "$left" "$W/pcg/device_amg_pcg.cu" \
     && { echo "  FAIL: the PCG injection did not take"; fails=$((fails+1)); }
 if python3 "$AUDIT" "$W/pcg" > "$W/pcg.log" 2>&1; then
@@ -63,11 +64,14 @@ cp "$ROOT/src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_v
 sed -i 's/ || gcf.keyEpoch != deviceReductionScratchEpoch()//; s/ || gc.keyEpoch != deviceReductionScratchEpoch()//' \
     "$W/vcycle/device_amg_vcycle.cu"
 # (the pair's epoch shares the addressing's line since 2026-10-04 and goes with it: see (a))
-sed -i 's/^\s*|| gcf.keyAddressingId != A.addressingId || gcf.keyPairEpoch != amg.pair.epoch)/)/' \
+sed -i 's/^\s*|| gcf.keyAddressingId != A.addressingId || gcf.keyPairEpoch != amg.pair.epoch$//' \
     "$W/vcycle/device_amg_vcycle.cu"
-sed -i 's/^\s*|| gc.keyAddressingId != A.addressingId || gc.keyPairEpoch != amg.pair.epoch)/)/' \
+sed -i 's/^\s*|| gc.keyAddressingId != A.addressingId || gc.keyPairEpoch != amg.pair.epoch$//' \
     "$W/vcycle/device_amg_vcycle.cu"
-grep -q "keyAddressingId != A.addressingId\|gcf\?.keyPairEpoch != amg.pair.epoch" "$W/vcycle/device_amg_vcycle.cu" \
+# (and the line after each, which asks amgGraphViewMoved since 2026-10-06 and closes the condition)
+sed -i 's/^\s*|| amgGraphViewMoved(gcf\?, A))/)/' "$W/vcycle/device_amg_vcycle.cu"
+left="keyAddressingId != A.addressingId\|gcf\?.keyPairEpoch != amg.pair.epoch\|amgGraphViewMoved"
+grep -q "$left" "$W/vcycle/device_amg_vcycle.cu" \
     && { echo "  FAIL: the V-cycle injection did not take"; fails=$((fails+1)); }
 if python3 "$AUDIT" "$W/vcycle" > "$W/vcycle.log" 2>&1; then
     echo "  FAIL: the V-cycle graphs keyed on A.diag alone passed"

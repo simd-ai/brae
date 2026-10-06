@@ -3,7 +3,8 @@
 # captured graph for the plain loop, synchronised after every part, and its parts are charged grid by grid in
 # BRAE_INTER_PHASE_TIME's table. What it measures is only worth reading if the solve it takes apart IS the
 # graph's: the same iterations, the same answer. On waveMakerFlap, brae's default pressure path,
-# BRAE_PCORR_AMG=plain (the smoothed hierarchy a moving mesh takes by default does not reproduce run to run).
+# BRAE_PCORR_AMG=plain (chosen when the smoothed hierarchy a moving mesh takes by default did not reproduce run
+# to run; it does since 2026-10-06 -- amg_pcg/smoothed_fixed_order.sh -- and the plain one is kept here).
 # MEASURED with it 2026-10-04, pcorr on waveMakerPiston at 896,000 cells, 47.6 iterations a solve, 135 ms a step:
 # the mesh's own grid 57% (smoothing 41 ms, residual 16, the two transfers 20), grid 1 11%, grids 2-5 8%, the
 # Krylov loop 23% (A p 14, the vector updates 13) -- and the parts waited for one by one sum to the graph's time.

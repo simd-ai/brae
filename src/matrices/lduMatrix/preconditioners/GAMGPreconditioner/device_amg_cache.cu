@@ -106,6 +106,15 @@ AMGData cloneAMG(const AMGData& S)
         dcopy(L.rapDstKind, s.rapDstKind);
         dcopy(L.rapDstIdx, s.rapDstIdx);
         dcopy(L.rapW, s.rapW);
+        // ...and the fixed-order lists derived from them (amgSaFixedOrder); RvalF is cast with PvalF
+        dcopy(L.Rrow, s.Rrow);
+        dcopy(L.Rfine, s.Rfine);
+        dcopy(L.Rval, s.Rval);
+        L.RvalF.resize(0);
+        L.Rterm.resize(s.Rterm.size());
+        L.RtermF.resize(s.RtermF.size());
+        L.rapTerm.resize(s.rapTerm.size());
+        dcopy(L.rapStart, s.rapStart);
         // the VALUES are Galerkin's at every solve; only their sizes are the structure's
         L.cDiag.resize(s.nCoarse);
         L.cUpper.resize(s.nCoarseFaces);
@@ -272,6 +281,8 @@ AMGCacheRead readAMGCache(
         L.cLower.resize(L.nCoarseFaces);   // VALUES via Galerkin
         // an addressing id of its own, as a built level takes (buildAMG): a loaded level's was left 0
         L.addressingId = nextDeviceAddressingId();
+        // the smoothed hierarchy's fixed-order lists are not in the file either: derived from what is
+        amgSaFixedOrder(L);
         // ...and the gather lists the Galerkin re-fill indexes with. They are NOT in the file: they are
         // a pure function of map/faceRestrict/faceFlip, which are, so they are rebuilt through the same
         // builder the build path uses. Without this every cached run died on its first Galerkin.

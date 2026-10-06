@@ -12,6 +12,7 @@
 #include <vector>
 #include <memory>
 #include <string>
+#include <cstdlib>
 
 namespace brae {
 
@@ -30,8 +31,47 @@ struct AMGGraphCache {
     long long keyAddressingId = 0;
     // ...and the coupled pair's buffers the cycle read at capture (AMGPair::epoch)
     unsigned long long keyPairEpoch = 0;
+    // ...and the matrix's OFF-DIAGONAL buffers (amgGraphViewMoved, below)
+    const void* keyUpper = nullptr;
+    const void* keyLower = nullptr;
     ~AMGGraphCache();
 };
+
+// WHETHER THE VIEW A CAPTURED V-CYCLE READ HAS MOVED. A capture bakes every pointer the cycle was handed, and
+// the double-precision cycle is handed the caller's matrix itself on the finest grid: diag, upper, lower. The
+// guards compared `diag` alone. interFoam's pressure step folds its diagonal into a buffer that is new at
+// every solve and takes upper and lower from the matrix of that corrector, and the pool hands the three
+// blocks back in another combination: MEASURED 2026-10-06 on laminar/waves/stokesI, the plain loop with the
+// double-precision cycle (BRAE_PCG_DEVICE=0 BRAE_AMG_FP32=0, and BRAE_CORR_SCALING=1, which takes that loop),
+// solve by solve: diag 0x3324a0000 at two solves running, the key equal, and upper 0x33a400000 then
+// 0x339e00000. The replayed cycle smoothed with the off-diagonals of the solve before, which by then held
+// something else, and every Final solve from the second step on ran its 1,000 iterations without moving
+// (25,224 iterations in 27 steps for 309). The single-precision cycle reads its own cast copies and takes
+// only addressing from the view -- but for a hierarchy of one grid, where the coarsest solve is the view's --
+// so all four guards ask this. The default path is not one of them: deviceAMGPCGGraph copies the matrix into
+// buffers of its own at every solve. BRAE_CONTROL_AMG_GRAPH_VIEW_NOT_COMPARED=1 answers "not moved" always --
+// the gate's control, deliberately wrong (tests/interfoam_write/amg_pcg/captured_cycle_view.sh).
+inline bool amgGraphViewMoved(
+    const AMGGraphCache& c,
+    const DeviceLduView& A)
+{
+    static const bool notCompared = std::getenv("BRAE_CONTROL_AMG_GRAPH_VIEW_NOT_COMPARED") != nullptr;
+    if (notCompared)
+    {
+        return false;
+    }
+    return c.keyUpper != A.upper || c.keyLower != A.lower
+        || c.keyAddressingId != static_cast<long long>(A.addressingId);
+}
+
+inline void amgGraphViewStamp(
+    AMGGraphCache& c,
+    const DeviceLduView& A)
+{
+    c.keyUpper = A.upper;
+    c.keyLower = A.lower;
+    c.keyAddressingId = static_cast<long long>(A.addressingId);
+}
 
 // Cached CUDA conditional-graph of the device-resident PCG WHILE-body (#6, BRAE_PCG_DEVICE). Owned PER-SOLVER (in
 // AMGData) so it is destroyed with the hierarchy. A process-global cache is unsafe: after one solver is freed, a
@@ -102,6 +142,29 @@ struct AMGLevel {
     int nTriples = 0;
     DeviceBuffer<label>  rapSrcKind, rapSrcIdx, rapDstKind, rapDstIdx;
     DeviceBuffer<scalar> rapW;
+    // THE SAME TWO SUMS IN A FIXED ORDER (amgSaFixedOrder): P^T by coarse row -- the fine row and the value of
+    // each entry, fine rows ascending -- and the recipe above SORTED BY DESTINATION (diag, then upper, then
+    // lower; the build's order within one), with where each destination's triples start. The restriction and
+    // the coarse matrices were atomicAdd scatters, whose order is whichever thread arrives first: pcorr on a
+    // 2-D moving mesh takes this hierarchy by default, and MEASURED 2026-10-06 two runs of the same binary
+    // wrote 44 of 51 files differently on waveMakerFlap and 79 of 102 on waveMakerPiston (as shipped, 30 and
+    // 66 steps), none with BRAE_PCORR_AMG=plain. Derived from the lists above and so in neither the disk
+    // cache nor a comparison of two hierarchies; a clone copies them. RvalF is cast where PvalF is.
+    // EACH SUM IS TAKEN IN TWO LAUNCHES: every product, one thread an entry, into the `term` buffers below;
+    // then each destination's run of them added in order, one thread a destination. One launch that did
+    // both -- a thread a destination, loading each term's operands as it went -- cost more than the scatter
+    // it replaced. MEASURED 2026-10-06 on waveMakerPiston, the same 22 steps and 1,051 pcorr iterations in
+    // every arm, ms a step, scatter / one launch / two: the coarse matrices 7.9 / 12.7 / 8.9 and the
+    // iterations 75.7 / 78.9 / 78.1 at 896,000 cells (the step 745.7 / 754.1 / 748.7); the coarse matrices
+    // 0.5 / 1.0 / 0.5 at the tutorial's 56,000 (the step 42.7 / 43.6 / 42.7).
+    DeviceBuffer<label> Rrow;
+    DeviceBuffer<label> Rfine;
+    DeviceBuffer<scalar> Rval;
+    DeviceBuffer<float> RvalF;
+    DeviceBuffer<label> rapStart;
+    DeviceBuffer<scalar> Rterm;
+    DeviceBuffer<float> RtermF;
+    DeviceBuffer<scalar> rapTerm;
     DeviceLduView coarseView() const {
         DeviceLduView v{nCoarse, nCoarseFaces, cDiag.data(), cUpper.data(), cLower.data(), cOwn.data(), cNei.data(),
                         cOwnerStart.data(), cLosort.data(), cLosortStart.data()};
@@ -435,6 +498,27 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
 // would otherwise make every existing 5-argument call ambiguous.
 void vcycleAt(int g, AMGData& amg, const DeviceLduView& Ag, const DeviceBuffer<scalar>& bg,
               DeviceBuffer<scalar>& xg, bool asymmetric);
+
+// The smoothed hierarchy's fixed-order lists of one level (AMGLevel::Rrow .. rapTerm), from its prolongator and
+// its triple-product recipe as they stand on the device; the recipe's five lists are put in destination order
+// where they are not already (the build hands them over in its own; a file read back holds them sorted, and
+// the cache's signature says so -- amgHierarchySignature). Run wherever those are set: the build, the disk
+// cache's load. One download of each list and two counting sorts on the host, once a hierarchy.
+void amgSaFixedOrder(AMGLevel& L);
+// BRAE_CONTROL_AMG_SA_SCATTER=1: the two atomicAdd scatters as they were -- the arm the fixed order is held to,
+// and the timing's other arm. BRAE_CONTROL_AMG_SA_GATHER_REVERSED=1: each sum taken from its last term to its
+// first -- a gate's control, another fixed order, which the written files have to show.
+inline bool amgSaScatter()
+{
+    static const bool on = std::getenv("BRAE_CONTROL_AMG_SA_SCATTER") != nullptr;
+    return on;
+}
+
+inline bool amgSaGatherReversed()
+{
+    static const bool on = std::getenv("BRAE_CONTROL_AMG_SA_GATHER_REVERSED") != nullptr;
+    return on;
+}
 
 // The refusals the asymmetric V-cycle makes, one std::runtime_error per option, each naming itself and
 // what to set instead. Exposed (rather than left inside vcycleAt) so a test can exercise each one; vcycleAt

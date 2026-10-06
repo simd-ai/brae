@@ -156,6 +156,15 @@ struct DeviceAmgPcgCache
 // residual read every 4 iterations where the loop is driven from the host (BRAE_PCG_CHECK_EVERY), the whole
 // PCG loop replayed from a CUDA graph (BRAE_USE_GRAPH=0 drives it from the host), and no coarse-correction
 // scaling (BRAE_CORR_SCALING=1). A caller with a coupled pair turns the graph off itself.
+// BRAE_CORR_SCALING=1 IS AN EXPERIMENT THAT LOST, kept announced. It takes the plain loop and the
+// double-precision cycle. MEASURED 2026-10-06 on laminar/waves/stokesI as shipped, 27 steps, the residual
+// read at every iteration: the same 309 iterations as the default, every solve, the line-search factor being
+// 1 to twelve digits on these Galerkin grids -- and 4.6 ms a step in the pressure solve for the default's
+// 2.6. DTCHull's pinned row: 346 iterations either way. (The 25,224 iterations it was recorded with on
+// stokesI were a stale captured cycle in that loop, not the scaling: device_amg.cuh, amgGraphViewMoved. The
+// older "422 -> 1396" on DTCHull as shipped has not been re-measured.) Read every fourth iteration, as the
+// loop does by default, it over-solves by up to three and is another run: 340 iterations, max|U| 0.105 for
+// 0.182 -- set BRAE_PCG_CHECK_EVERY=1 beside it before comparing anything.
 struct AmgPcgKnobs
 {
     int checkEvery = 4;

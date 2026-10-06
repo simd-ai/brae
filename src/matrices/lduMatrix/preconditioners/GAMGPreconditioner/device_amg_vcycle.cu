@@ -94,6 +94,43 @@ void restrictSparseT(
     for (int k = rowPtr[f]; k < rowPtr[f+1]; ++k)
         atomicAdd(&rc[col[k]], val[k]*rf);
 }
+// restrict in a fixed order, rc = P^T r over P^T by coarse row (AMGLevel::Rrow, Rfine, Rval -- amgSaFixedOrder),
+// two launches (AMGLevel::rapStart has why two): every entry's product, a thread an entry...
+template <typename T>
+__global__
+void restrictTermsT(
+    int nnz,
+    const label* __restrict__ fine,
+    const T* __restrict__ val,
+    const T* __restrict__ r,
+    T* __restrict__ term)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= nnz) return;
+    term[k] = val[k]*r[fine[k]];
+}
+
+// ...then each coarse cell's run of them added in order, a thread a cell. Writes rc, so no zeroing first.
+template <typename T>
+__global__
+void restrictSumT(
+    int nC,
+    int reversed,
+    const label* __restrict__ rowPtr,
+    const T* __restrict__ term,
+    T* __restrict__ rc)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    const int lo = rowPtr[c];
+    const int hi = rowPtr[c + 1];
+    T acc = 0;
+    for (int j = 0; j < hi - lo; ++j)
+    {
+        acc += term[reversed ? hi - 1 - j : lo + j];
+    }
+    rc[c] = acc;
+}
 // prolong (ADD): x[f] += sum_k P[f][k]*xc[col], the smoothed-P twin of prolongT.
 template <typename T>
 __global__
@@ -515,10 +552,22 @@ void vcycleAt(
     const AMGLevel& Lg = amg.level[g];
     if (amg.saSmooth)                                            // restrict rc = P^T r (sparse smoothed prolongator)
     {
-        // Sparse-prolongator restriction still scatters; the SA path is opt-in and remains nondeterministic.
-        zeroT<scalar><<<nBlocks(nc),TPB>>>(nc, amg.vB[g+1].data());
-        restrictSparseT<scalar><<<nBlocks(n),TPB>>>(
-            n, Lg.Prow.data(), Lg.Pcol.data(), Lg.Pval.data(), amg.vR[g].data(), amg.vB[g+1].data());
+        // gathered by coarse row in a fixed order (AMGLevel::Rrow); BRAE_CONTROL_AMG_SA_SCATTER=1 scatters
+        if (amgSaScatter())
+        {
+            zeroT<scalar><<<nBlocks(nc),TPB>>>(nc, amg.vB[g+1].data());
+            restrictSparseT<scalar><<<nBlocks(n),TPB>>>(
+                n, Lg.Prow.data(), Lg.Pcol.data(), Lg.Pval.data(), amg.vR[g].data(), amg.vB[g+1].data());
+        }
+        else
+        {
+            const int nnz = static_cast<int>(Lg.Rval.size());
+            scalar* term = amg.level[g].Rterm.data();
+            restrictTermsT<scalar><<<nBlocks(nnz),TPB>>>(
+                nnz, Lg.Rfine.data(), Lg.Rval.data(), amg.vR[g].data(), term);
+            restrictSumT<scalar><<<nBlocks(nc),TPB>>>(
+                nc, amgSaGatherReversed() ? 1 : 0, Lg.Rrow.data(), term, amg.vB[g+1].data());
+        }
     }
     else                                          // fixed-order gather; writes rc, so no pre-zero needed
         restrictGatherT<scalar><<<nBlocks(nc),TPB>>>(
@@ -734,12 +783,22 @@ void amgCastFP32(
                 const int nnz = static_cast<int>(L.Pval.size());
                 L.PvalF.resize(L.Pval.size());
                 if (nnz == 0) continue;
+                // ...and P^T's, the same values by coarse row (amgSaFixedOrder)
+                if (L.Rval.size() != L.Pval.size())
+                {
+                    throw std::runtime_error(
+                        "brae AMG: a smoothed-aggregation level has no fixed-order list of its restriction "
+                        "(amgSaFixedOrder was not run where the level's prolongator was set)");
+                }
+                L.RvalF.resize(L.Rval.size());
                 if (notCast)
                 {
                     zeroT<float><<<nBlocks(nnz),TPB>>>(nnz, L.PvalF.data());
+                    zeroT<float><<<nBlocks(nnz),TPB>>>(nnz, L.RvalF.data());
                     continue;
                 }
                 cast_<scalar,float><<<nBlocks(nnz),TPB>>>(nnz, L.Pval.data(), L.PvalF.data());
+                cast_<scalar,float><<<nBlocks(nnz),TPB>>>(nnz, L.Rval.data(), L.RvalF.data());
             }
         }
         amg.fp32Alloc = true;
@@ -871,9 +930,21 @@ void vcycleAtF(
     const int nc = Lg.nCoarse;
     if (amg.saSmooth)                                            // rc = P^T r, the sparse smoothed prolongator
     {
-        zeroT<float><<<nBlocks(nc),TPB>>>(nc, amg.vBF[g+1].data());
-        restrictSparseT<float><<<nBlocks(n),TPB>>>(
-            n, Lg.Prow.data(), Lg.Pcol.data(), Lg.PvalF.data(), amg.vRF[g].data(), amg.vBF[g+1].data());
+        if (amgSaScatter())
+        {
+            zeroT<float><<<nBlocks(nc),TPB>>>(nc, amg.vBF[g+1].data());
+            restrictSparseT<float><<<nBlocks(n),TPB>>>(
+                n, Lg.Prow.data(), Lg.Pcol.data(), Lg.PvalF.data(), amg.vRF[g].data(), amg.vBF[g+1].data());
+        }
+        else
+        {
+            const int nnz = static_cast<int>(Lg.Rval.size());
+            float* term = amg.level[g].RtermF.data();
+            restrictTermsT<float><<<nBlocks(nnz),TPB>>>(
+                nnz, Lg.Rfine.data(), Lg.RvalF.data(), amg.vRF[g].data(), term);
+            restrictSumT<float><<<nBlocks(nc),TPB>>>(
+                nc, amgSaGatherReversed() ? 1 : 0, Lg.Rrow.data(), term, amg.vBF[g+1].data());
+        }
     }
     else
     {
@@ -962,7 +1033,8 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
         const LduF A0 = lduF(A, amg.fDiag[0], amg.fUpper[0], amg.fLower[0]);
         AMGGraphCache& gcf = *amg.gcacheF;
         if (!gcf.exec || gcf.key != A.diag || gcf.keyEpoch != deviceReductionScratchEpoch()
-            || gcf.keyAddressingId != A.addressingId || gcf.keyPairEpoch != amg.pair.epoch)
+            || gcf.keyAddressingId != A.addressingId || gcf.keyPairEpoch != amg.pair.epoch
+            || amgGraphViewMoved(gcf, A))
         {
             if (gcf.exec)  { cudaGraphExecDestroy(gcf.exec);  gcf.exec  = nullptr; }
             if (gcf.graph) { cudaGraphDestroy(gcf.graph);     gcf.graph = nullptr; }
@@ -976,6 +1048,7 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
             gcf.keyEpoch = deviceReductionScratchEpoch();
             gcf.keyAddressingId = A.addressingId;
             gcf.keyPairEpoch = amg.pair.epoch;
+            amgGraphViewStamp(gcf, A);
         }
         cudaCheck(cudaGraphLaunch(gcf.exec, cudaStreamPerThread), "amgF graph launch");
     }
@@ -983,7 +1056,8 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
     {
         AMGGraphCache& gc = *amg.gcache;
         if (!gc.exec || gc.key != A.diag || gc.keyEpoch != deviceReductionScratchEpoch()
-            || gc.keyAddressingId != A.addressingId || gc.keyPairEpoch != amg.pair.epoch)
+            || gc.keyAddressingId != A.addressingId || gc.keyPairEpoch != amg.pair.epoch
+            || amgGraphViewMoved(gc, A))
         {
             if (gc.exec)  { cudaGraphExecDestroy(gc.exec);  gc.exec  = nullptr; }
             if (gc.graph) { cudaGraphDestroy(gc.graph);     gc.graph = nullptr; }
@@ -995,6 +1069,7 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
             gc.keyEpoch = deviceReductionScratchEpoch();
             gc.keyAddressingId = A.addressingId;
             gc.keyPairEpoch = amg.pair.epoch;
+            amgGraphViewStamp(gc, A);
         }
         cudaCheck(cudaGraphLaunch(gc.exec, cudaStreamPerThread), "amg graph launch");
     }

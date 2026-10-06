@@ -13,7 +13,8 @@
 # host assembles its system as well, and every entry of the off-diagonal, the folded diagonal and source and of
 # phi after the flux is compared.
 # BRAE_PCORR_AMG=plain in every arm: on a mesh that moves pcorr takes a smoothed-aggregation hierarchy by
-# default, whose coarse matrices do not reproduce run to run (waveMakerFlap, 19 of 34 files between two runs).
+# default, whose coarse matrices did not reproduce run to run when this was written (waveMakerFlap, 19 of 34
+# files between two runs; summed in a fixed order since 2026-10-06, amg_pcg/smoothed_fixed_order.sh).
 # TWO CONTROLS on one defect, a cell's owned faces summed before the ones it neighbours: the written files
 # change, and under the check the run stops at the first entry.
 . "$(dirname "$0")/../lib.sh"

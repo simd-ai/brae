@@ -706,7 +706,7 @@ DeviceSolverPerf deviceAMGPCG(
             }
             AMGGraphCache& gcf = *amg.gcacheF;                                          // graph the FP32 V-cycle (host-scalar-free)
             if (!gcf.exec || gcf.key != A.diag || gcf.keyEpoch != deviceReductionScratchEpoch()
-             || gcf.keyPairEpoch != amg.pair.epoch)
+             || gcf.keyPairEpoch != amg.pair.epoch || amgGraphViewMoved(gcf, A))
             {
                 if (gcf.exec)
                 {
@@ -724,6 +724,7 @@ DeviceSolverPerf deviceAMGPCG(
                 cudaCheck(cudaGraphInstantiate(&gcf.exec, gcf.graph, 0), "amgF graph instantiate");
                 gcf.key = A.diag; gcf.keyEpoch = deviceReductionScratchEpoch();
                 gcf.keyPairEpoch = amg.pair.epoch;
+                amgGraphViewStamp(gcf, A);
             }
             cudaCheck(cudaGraphLaunch(gcf.exec, cudaStreamPerThread), "amgF graph launch");
             return;
@@ -734,7 +735,7 @@ DeviceSolverPerf deviceAMGPCG(
             return;
         }
         if (!gc.exec || gc.key != A.diag || gc.keyEpoch != deviceReductionScratchEpoch()
-         || gc.keyPairEpoch != amg.pair.epoch)
+         || gc.keyPairEpoch != amg.pair.epoch || amgGraphViewMoved(gc, A))
         {
             if (gc.exec)
             {
@@ -752,6 +753,7 @@ DeviceSolverPerf deviceAMGPCG(
             cudaCheck(cudaGraphInstantiate(&gc.exec, gc.graph, 0), "amg graph instantiate");
             gc.key = A.diag; gc.keyEpoch = deviceReductionScratchEpoch();
             gc.keyPairEpoch = amg.pair.epoch;
+            amgGraphViewStamp(gc, A);
         }
         cudaCheck(cudaGraphLaunch(gc.exec, cudaStreamPerThread), "amg graph launch");
     };
