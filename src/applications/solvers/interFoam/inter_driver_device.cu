@@ -203,6 +203,29 @@ void emptyFacesCellTimesKernel(
     o[b] = scaled*times;
 }
 
+// ...and fvm::div's two patch coefficients of alpha there: the host's own products of the face's flux with
+// EmptyPatchField's coefficients, which are the base's 1 and 0 -- flux*1 and (-flux)*0, a zero that carries the
+// flux's sign reversed. `one` and `zero` are handed in so that nothing folds the products away. `wrong` non-zero
+// is a gate's CONTROL and is written in their place.
+__global__
+void emptyFacesDivCoeffsKernel(
+    int nB,
+    const label* __restrict__ bndIsEmpty,
+    const scalar* __restrict__ flux,
+    scalar one,
+    scalar zero,
+    scalar wrong,
+    scalar* __restrict__ iC,
+    scalar* __restrict__ bC)
+{
+    const int b = blockIdx.x*blockDim.x + threadIdx.x;
+    if (b >= nB) return;
+    if (!bndIsEmpty[b]) return;
+    const scalar minusFlux = -flux[b];
+    iC[b] = (wrong != scalar(0)) ? wrong : flux[b]*one;
+    bC[b] = (wrong != scalar(0)) ? wrong : minusFlux*zero;
+}
+
 // calculateNHatBoundary's first half on the device: each boundary cell's sum over its internal faces of
 // Sf*interpolate(alpha), added on the owner side and subtracted on the neighbour's, in ascending face order --
 // the host loop's terms and order (interface_properties_cpp.cu), so the host's second half
@@ -1860,17 +1883,27 @@ RunReport runInterFoamDevice(
     // face's entry is written by a kernel with what the host's own arithmetic gave there: alpha's and nu's are
     // the cell's (EmptyPatchField::evaluate; the mixture's nu of the cell's alpha), the normal's and the two
     // snGrads' a zero, the surface-tension flux's (sigma*K of the cell) times that zero.
-    // NOT where the host's whole lists are read, or where the entry is not the cell's: the host closure, a
-    // CrankNicolson writer's kept patches, a relaxed corrector (MULESCorr with more than one corrector: alpha10's
-    // patch values are the host's and the relaxation assigns the patch), a boundary normal taken from anything
-    // but the Gauss stencil with its empty patches left out, BRAE_CONTROL_FORCES_CHECK, and a field on an empty
-    // patch that is not the empty class.
+    // A RELAXED CORRECTOR (MULESCorr with more than one: damBreak and its kin) IS IN, since 2026-10-07. The
+    // relaxation ASSIGNS each patch 0.5*(its evaluate on the post-MULES cells) + 0.5*(alpha10's value); on an
+    // empty patch both are the cell's, and 0.5*a + 0.5*b is one rounding of an exact sum whichever way the
+    // products are fused, so the entry is the relaxed cell's -- mirrored like any other, and held bitwise by
+    // the check. alpha's divergence coefficients (the MULESCorr pre-solve's) go the same way: the other
+    // patches' up by runs, an empty face's by a kernel from the device's flux.
+    // NOT where the host's whole lists are read: the host closure, a CrankNicolson writer's kept patches, a
+    // boundary normal taken from anything but the Gauss stencil with its empty patches left out,
+    // BRAE_CONTROL_FORCES_CHECK, and a field on an empty patch that is not the empty class.
+    // AND NOT ON A SMALL MESH: an upload by runs and a kernel are more device calls than the one upload they
+    // replace, and a few thousand empty faces cost the host less than that. MEASURED 2026-10-07, ms a step with
+    // the entries kept on the GPU / built on the host, damBreak and its refinements: 2,268 cells (4,536 empty
+    // faces) 6.7 / 6.4, damBreakLeakage at that size 16.4 / 15.3; 9,072 cells 8.7 / 9.1; 36,288 cells 17.6 /
+    // 18.7; 580,608 cells 213 / 233. So the entries stay on the GPU from 16,000 empty faces up
+    // (BRAE_HOOKS_EMPTY_MIN_FACES sets the number; the gates on small fixtures set 0).
     //   BRAE_CONTROL_HOOKS_EMPTY_FROM_HOST=1: as before -- the identity gate's other arm
     //   BRAE_CONTROL_HOOKS_EMPTY_CHECK=1: the host builds every array whole as before as well, and one bit's
     //     difference from what the device holds stops the run and names the array and the face -- the gate's
     //     oracle, which the written files cannot be (most of these entries are multiplied by zero)
-    //   BRAE_CONTROL_HOOKS_EMPTY_WRONG=<alpha|normal|flux|snGradRho|nu|snGradPrgh>: a gate's CONTROL,
-    //     deliberately wrong -- that array's kernel writes 1 on the empty faces
+    //   BRAE_CONTROL_HOOKS_EMPTY_WRONG=<alpha|alphaRelaxed|divCoeffs|normal|flux|snGradRho|nu|snGradPrgh>: a
+    //     gate's CONTROL, deliberately wrong -- that array's kernel writes 1 on the empty faces
     //   BRAE_CONTROL_HOOKS_EMPTY_POISON=1: NaN into the host's lists the hooks no longer fill (alpha's patch
     //     values, the mixture's boundary and rho's kept patch values on an empty patch): no reader takes them
     struct HooksEmptyPlan
@@ -1892,11 +1925,13 @@ RunReport runInterFoamDevice(
     }
     const bool hooksEmptyNever = hooksEmptyFromHost || hostClosure
                               || (writer && writer->writesCrankNicolson())
-                              || (f.alphaCtl.MULESCorr && f.alphaCtl.nAlphaCorr > 1)
                               || nHatFull || nHatEmptyCells
                               || std::getenv("BRAE_CONTROL_NHAT_BOUNDARY_CHECK") != nullptr
                               || std::getenv("BRAE_CONTROL_NHAT_WHOLE_GRADIENT") != nullptr
                               || std::getenv("BRAE_CONTROL_FORCES_CHECK") != nullptr;
+    static const std::size_t hooksEmptyMinFaces = std::getenv("BRAE_HOOKS_EMPTY_MIN_FACES")
+        ? static_cast<std::size_t>(std::max(0L, std::atol(std::getenv("BRAE_HOOKS_EMPTY_MIN_FACES"))))
+        : std::size_t(16000);
     const auto notEmptyPatch = [&](std::size_t pi)
     {
         return fvp[pi].type != "empty";
@@ -1914,7 +1949,8 @@ RunReport runInterFoamDevice(
             plan.nHostFaces += r.n;
         }
         if (hooksEmptyNever || plan.nHostFaces == plan.nBndAll
-         || plan.nBndAll != static_cast<std::size_t>(dm.nBndFaces))
+         || plan.nBndAll != static_cast<std::size_t>(dm.nBndFaces)
+         || plan.nBndAll - plan.nHostFaces < hooksEmptyMinFaces)
         {
             return plan;
         }
@@ -2087,28 +2123,40 @@ RunReport runInterFoamDevice(
             b[pi].assign(b[pi].size(), std::numeric_limits<scalar>::quiet_NaN());
         }
     };
-    // alpha's patch values onto the device. `cells`: the device's alpha the host has just taken, where the
-    // caller's OpenFOAM statement evaluates the patches; null where it does not (the stored values go up, and
-    // an empty face's entry is the one the last evaluating call mirrored)
+    // alpha's patch values onto the device, three ways:
+    //   evaluated  the caller's OpenFOAM statement evaluates the patches: the host's evaluate here, and an empty
+    //              face's entry mirrored from `cells`, the device's alpha the host has just taken
+    //   stored     nothing is evaluated: the stored values go up, and an empty face's entry is the one the last
+    //              mirroring call left (`cells` null)
+    //   relaxed    the caller has made the relaxed corrector's evaluate and assignment (relaxBoundary): the values
+    //              go up, and an empty face's entry is mirrored from `cells`, the RELAXED cells
+    enum class AlphaUp
+    {
+        evaluated,
+        stored,
+        relaxed
+    };
     auto alphaBoundaryUp = [&](
         const HooksEmptyPlan& ep,
+        AlphaUp how,
         const DeviceBuffer<scalar>* cells,
         DeviceBuffer<scalar>& aBnd)
     {
+        const bool evaluates = how == AlphaUp::evaluated;
         if (!ep.kept)
         {
-            if (cells)
+            if (evaluates)
             {
                 f.alpha1.evaluateBoundary();
             }
             aBnd.copyFrom(patchValues(f.alpha1, fvp));
             return;
         }
-        if (cells && hooksEmptyCheck)
+        if (evaluates && hooksEmptyCheck)
         {
             f.alpha1.evaluateBoundary();
         }
-        else if (cells)
+        else if (evaluates)
         {
             f.alpha1.evaluateBoundaryWhere(notEmptyPatch);
         }
@@ -2124,12 +2172,14 @@ RunReport runInterFoamDevice(
         runsUp(aBnd.data(), packValues(f.alpha1), ep, "alpha's patch values");
         if (cells)
         {
-            emptyMirror(aBnd.data(), *cells, "alpha");
+            emptyMirror(aBnd.data(), *cells, how == AlphaUp::relaxed ? "alphaRelaxed" : "alpha");
         }
         if (hooksEmptyCheck)
         {
-            hooksHeld(cells ? "alpha's patch values, evaluated" : "alpha's patch values, stored", aBnd, 0,
-                      patchValues(f.alpha1, fvp));
+            const char* what = how == AlphaUp::evaluated ? "alpha's patch values, evaluated"
+                             : how == AlphaUp::stored ? "alpha's patch values, stored"
+                             : "alpha's patch values, relaxed";
+            hooksHeld(what, aBnd, 0, patchValues(f.alpha1, fvp));
         }
         else if (hooksEmptyPoison)
         {
@@ -2190,7 +2240,7 @@ RunReport runInterFoamDevice(
         part.emplace("alpha hook: alpha down, the patches evaluated, their values up");
         a.copyTo(f.alpha1.internal);
         const HooksEmptyPlan ep = hooksEmptyPlan();
-        alphaBoundaryUp(ep, &a, aBnd);
+        alphaBoundaryUp(ep, AlphaUp::evaluated, &a, aBnd);
         part.emplace("alpha hook: the mixture's boundary and alpha's fixes");
         // The boundary viscosity from alpha's patch values as they stand HERE, before the curvature
         // pass below rewrites the contact-angle gradient: mixture.correct() is calcNu() and THEN
@@ -2211,7 +2261,7 @@ RunReport runInterFoamDevice(
         interPhase::Nested timed("hook alpha.refreshBoundary");
         pushFlux();
         a.copyTo(f.alpha1.internal);
-        alphaBoundaryUp(hooksEmptyPlan(), &a, aBnd);
+        alphaBoundaryUp(hooksEmptyPlan(), AlphaUp::evaluated, &a, aBnd);
     };
     // ...and the top of the alpha step, which evaluates nothing: the host field's patch values as the
     // last evaluate left them (every evaluate of this loop goes through f.alpha1, so they are current)
@@ -2220,7 +2270,7 @@ RunReport runInterFoamDevice(
         H.alpha.storedBoundary = [&](DeviceBuffer<scalar>& aBnd)
         {
             interPhase::Nested timed("hook alpha.storedBoundary");
-            alphaBoundaryUp(hooksEmptyPlan(), nullptr, aBnd);
+            alphaBoundaryUp(hooksEmptyPlan(), AlphaUp::stored, nullptr, aBnd);
         };
     }
     else
@@ -2239,16 +2289,28 @@ RunReport runInterFoamDevice(
     {
         interPhase::Nested timed("hook alpha.relaxBoundary");
         pushFlux();
+        // (an empty patch kept on the GPU takes no part on the host: no alpha10 is copied for it, it is not
+        // evaluated, relaxAlphaBoundary leaves it, and its entry is the relaxed cells' -- hooksEmptyPlan)
+        const HooksEmptyPlan ep = hooksEmptyPlan();
+        const bool leftOut = ep.kept && !hooksEmptyCheck;
         std::vector<std::vector<scalar>> alpha10B(f.alpha1.boundary.size());
         for (std::size_t pi = 0; pi < f.alpha1.boundary.size(); ++pi)
         {
+            if (leftOut && fvp[pi].type == "empty") continue;
             alpha10B[pi] = f.alpha1.boundary[pi]->value();
         }
         postMules.copyTo(f.alpha1.internal);
-        f.alpha1.evaluateBoundary();
+        if (leftOut)
+        {
+            f.alpha1.evaluateBoundaryWhere(notEmptyPatch);
+        }
+        else
+        {
+            f.alpha1.evaluateBoundary();
+        }
         relaxed.copyTo(f.alpha1.internal);
         cpu::interFoam::relaxAlphaBoundary(f.alpha1, alpha10B);
-        aBnd.copyFrom(patchValues(f.alpha1, fvp));
+        alphaBoundaryUp(ep, AlphaUp::relaxed, &relaxed, aBnd);
     };
     // ...and updateBoundary's mixture.correct() WITHOUT its evaluate, which would overwrite that
     // assignment with the relaxed cells' evaluate
@@ -2259,7 +2321,7 @@ RunReport runInterFoamDevice(
         pushFlux();
         a.copyTo(f.alpha1.internal);
         const HooksEmptyPlan ep = hooksEmptyPlan();
-        alphaBoundaryUp(ep, nullptr, aBnd);
+        alphaBoundaryUp(ep, AlphaUp::stored, nullptr, aBnd);
         mixtureBoundary(ep);
         refreshAlphaFixes();
         SurfaceScalarField nHb;
@@ -2356,7 +2418,7 @@ RunReport runInterFoamDevice(
             const SubCycleClock clock = subCycleClock(stepTime, stepDeltaT, stepIndex,
                                                       f.alphaCtl.nAlphaSubCycles, subCycle);
             updateWaveAlpha(f.waves, f.alpha1, f.U, clock.t, clock.timeIndex, m, g, fvp);
-            alphaBoundaryUp(hooksEmptyPlan(), &a, aBnd);
+            alphaBoundaryUp(hooksEmptyPlan(), AlphaUp::evaluated, &a, aBnd);
         };
     }
     if (dyn)
@@ -2380,6 +2442,9 @@ RunReport runInterFoamDevice(
             Vsc0.copyFrom(dyn->Vsc0(ts));
         };
     }
+    // (the flux of the patches that are not empty, as the divergence hook last brought it down: kept between
+    // calls so that an empty patch's list is sized once)
+    std::vector<std::vector<scalar>> divFluxBnd;
     H.alpha.divCoeffs =
         [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC,
             const DeviceBuffer<scalar>* phiCNBnd)
@@ -2388,13 +2453,83 @@ RunReport runInterFoamDevice(
         a.copyTo(f.alpha1.internal);
         // (the coefficients below are the patches' own and read no patch value; the device's array is not this
         // hook's to write, so an empty patch kept on the GPU is not evaluated here either)
-        if (hooksEmptyPlan().kept && !hooksEmptyCheck)
+        const HooksEmptyPlan ep = hooksEmptyPlan();
+        if (ep.kept && !hooksEmptyCheck)
         {
             f.alpha1.evaluateBoundaryWhere(notEmptyPatch);
         }
         else
         {
             f.alpha1.evaluateBoundary();
+        }
+        // fvm::div's PATCH coefficients alone (fvm.cuh, the uncoupled branch): the patch flux times the field's
+        // valueInternal/BoundaryCoeffs, for the uncoupled patches in the device's boundary order -- every one of
+        // them, or the ones that are not empty
+        const auto patchCoeffs = [&](
+            const std::vector<std::vector<scalar>>& flux,
+            bool skipEmpty,
+            std::vector<scalar>& i2,
+            std::vector<scalar>& b2)
+        {
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (skipEmpty && fvp[pi].type == "empty") continue;
+                if (pi >= flux.size() || flux[pi].size() != static_cast<std::size_t>(fvp[pi].size))
+                {
+                    throw std::runtime_error("brae: the alpha divergence hook has no flux on patch '" + fvp[pi].name
+                                             + "' of its size; fvm::div's patch coefficients are that flux's");
+                }
+                const std::vector<scalar> vIC = f.alpha1.boundary[pi]->valueInternalCoeffs();
+                const std::vector<scalar> vBC = f.alpha1.boundary[pi]->valueBoundaryCoeffs();
+                for (label i = 0; i < fvp[pi].size; ++i)
+                {
+                    const scalar pf = flux[pi][static_cast<std::size_t>(i)];
+                    i2.push_back(pf * vIC[static_cast<std::size_t>(i)]);
+                    b2.push_back((-pf) * vBC[static_cast<std::size_t>(i)]);
+                }
+            }
+        };
+        static const bool fluxDivCheck = std::getenv("BRAE_CONTROL_FLUX_DIVCOEFFS_CHECK") != nullptr;
+        // WITH AN EMPTY PATCH'S ENTRIES KEPT ON THE GPU (hooksEmptyPlan): the other patches' flux comes down run
+        // by run, their coefficients go up run by run, and an empty face's two are written by a kernel from the
+        // device's own flux. Every face's flux came down, was multiplied here by push_back and went up: MEASURED
+        // on damBreak refined to 580,608 cells (1,161,216 of its boundary faces empty), 6.3 ms a call.
+        if (ep.kept && !fluxEmptyFromHost && !fluxDivFromHostCopy && !fluxDivCheck)
+        {
+            const DeviceBuffer<scalar>& fluxDev = phiCNBnd ? *phiCNBnd : dPhiB;
+            unflatten(fluxDev, divFluxBnd, false);
+            std::vector<scalar> i2;
+            std::vector<scalar> b2;
+            i2.reserve(ep.nHostFaces);
+            b2.reserve(ep.nHostFaces);
+            patchCoeffs(divFluxBnd, true, i2, b2);
+            iC.resize(ep.nBndAll);
+            bC.resize(ep.nBndAll);
+            runsUp(iC.data(), i2, ep, "alpha's divergence coefficients");
+            runsUp(bC.data(), b2, ep, "alpha's divergence coefficients");
+            const int nB = dm.nBndFaces;
+            emptyFacesDivCoeffsKernel<<<(nB + 255)/256, 256>>>(
+                nB,
+                dm.bndIsEmpty.data(),
+                fluxDev.data(),
+                scalar(1),
+                scalar(0),
+                hooksEmptyWrong == "divCoeffs" ? scalar(1) : scalar(0),
+                iC.data(),
+                bC.data());
+            cudaCheck(cudaGetLastError(), "emptyFacesDivCoeffs");
+            if (hooksEmptyCheck)
+            {
+                std::vector<std::vector<scalar>> whole(fvp.size());
+                unflatten(fluxDev, whole);
+                std::vector<scalar> i2Whole;
+                std::vector<scalar> b2Whole;
+                patchCoeffs(whole, false, i2Whole, b2Whole);
+                hooksHeld("alpha's divergence coefficients, the diagonal's", iC, 0, i2Whole);
+                hooksHeld("alpha's divergence coefficients, the source's", bC, 0, b2Whole);
+            }
+            return;
         }
         // the flux the coefficients are built from: phiCN's patch values under CrankNicolson (a
         // coupled patch keeps the host's -- the device array holds none, and the pre-solve adds the
@@ -2405,7 +2540,6 @@ RunReport runInterFoamDevice(
         // the device's as last pushed either way.
         //   BRAE_CONTROL_FLUX_DIVCOEFFS_CHECK=1: the host's copy, pushed whole, is taken as well and compared
         //     with the device's, bitwise, on every face
-        static const bool fluxDivCheck = std::getenv("BRAE_CONTROL_FLUX_DIVCOEFFS_CHECK") != nullptr;
         std::vector<std::vector<scalar>> fluxBnd = f.phi.boundary;
         if (phiCNBnd)
         {
@@ -2455,31 +2589,15 @@ RunReport runInterFoamDevice(
                             "largest on an empty face %.3e\n", calls, compared, (double)largestOnEmpty);
             }
         }
-        // fvm::div's PATCH coefficients alone (fvm.cuh, the uncoupled branch): the patch flux times the field's
-        // valueInternal/BoundaryCoeffs. Nothing here reads the internal faces, so the whole-mesh assembly this
-        // was is not built -- MEASURED on RAS/DTCHull: 9.9 ms a call with it.
+        // Nothing here reads the internal faces, so the whole-mesh assembly this was is not built -- MEASURED on
+        // RAS/DTCHull: 9.9 ms a call with it.
         // The device's boundary arrays hold the UNCOUPLED patches only, as its mesh does
         // (device_mesh.cuh:41-44): a coupled patch's coefficients are the interface's, and the alpha
         // pre-solve adds those itself from the pair. Flattening every patch here made the array longer
         // than the device's boundary-face count and the pre-solve refused it by size.
-        std::vector<scalar> i2, b2;
-        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-        {
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
-            if (pi >= fluxBnd.size() || fluxBnd[pi].size() != static_cast<std::size_t>(fvp[pi].size))
-            {
-                throw std::runtime_error("brae: the alpha divergence hook has no flux on patch '" + fvp[pi].name
-                                         + "' of its size; fvm::div's patch coefficients are that flux's");
-            }
-            const std::vector<scalar> vIC = f.alpha1.boundary[pi]->valueInternalCoeffs();
-            const std::vector<scalar> vBC = f.alpha1.boundary[pi]->valueBoundaryCoeffs();
-            for (label i = 0; i < fvp[pi].size; ++i)
-            {
-                const scalar pf = fluxBnd[pi][static_cast<std::size_t>(i)];
-                i2.push_back(pf * vIC[static_cast<std::size_t>(i)]);
-                b2.push_back((-pf) * vBC[static_cast<std::size_t>(i)]);
-            }
-        }
+        std::vector<scalar> i2;
+        std::vector<scalar> b2;
+        patchCoeffs(fluxBnd, false, i2, b2);
         iC.copyFrom(i2);
         bC.copyFrom(b2);
     };

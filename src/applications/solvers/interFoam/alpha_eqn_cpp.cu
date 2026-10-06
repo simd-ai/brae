@@ -752,6 +752,9 @@ void relaxAlphaBoundary(GeometricField<scalar>&                  alpha1,
     {
         if (alpha1.boundary[pi]->coupled()) continue;
         if (!alpha1.boundary[pi]->ofAssignmentWritesValue()) continue;
+        // a patch the caller handed no alpha10 for is one whose entries it keeps elsewhere (the device loop,
+        // an `empty` patch's on the GPU): left alone, not copied twice to change nothing
+        if (alpha10B[pi].empty()) continue;
         std::vector<scalar> v = alpha1.boundary[pi]->value();
         for (std::size_t i = 0; i < v.size() && i < alpha10B[pi].size(); ++i)
             v[i] = scalar(0.5)*v[i] + scalar(0.5)*alpha10B[pi][i];
