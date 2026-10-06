@@ -188,6 +188,13 @@ void deviceAlphaCorrector(
 {
     if (!in.phiInt || !in.phiBnd || !in.phiCNInt || !in.phiCNBnd)
         throw std::runtime_error("brae interFoam device alphaEqn: phi and phiCN are both required.");
+    if (in.cyc && in.cyc->n > 0 && (!in.phiCNIf || static_cast<label>(in.phiCNIf->size()) != in.cyc->n))
+    {
+        throw std::runtime_error(
+            "brae interFoam device alphaEqn: the mesh has a coupled pair and the caller handed no phiCN for "
+            "its faces. The bounded flux there is upwind's of phiCN, as on every face (MULESTemplates.C:596); "
+            "the pair's own flux is not it under CrankNicolson.");
+    }
     if (!bnd.alpha1 || !bnd.nHatfBnd || !bnd.fixesValue || !bnd.flag)
         throw std::runtime_error(
             "brae interFoam device alphaEqn: alpha1's boundary values, nHatf's boundary values, the "
@@ -453,7 +460,23 @@ void deviceAlphaCorrector(
     DeviceBuffer<scalar> phiBDIf, corrIfEx, lamIf, blendIf;
     if (havePairEx)
     {
-        deviceMulesDonorFluxCyclic(*in.cyc, alpha1, phiBDIf);
+        // THE BOUNDED FLUX ON THE PAIR IS UPWIND'S OF phiCN, as the interior's above: limit() builds it as
+        // upwind(mesh, phi).flux(psi) with the phi explicitSolve was handed (MULESTemplates.C:596), which
+        // alphaEqn.H:210-220 makes phiCN. It was built from the pair's own flux cyc.phi. The two are one
+        // under Euler and to one rounding on the first outer corrector of a step (phi.oldTime() is then phi
+        // itself); from the second outer corrector on under CrankNicolson they differ by (1 - cnCoeff) of
+        // the flux change since the step began. FOUND 2026-10-06 by a reviewer reading; held by
+        // tests/test_device_mules_cyclic_vs_host.cu on a flux that differs from the pair's own.
+        //   BRAE_CONTROL_DEVICE_PAIR_DONOR_RAW_PHI=1: a gate's CONTROL, deliberately wrong -- cyc.phi
+        static const bool rawPhi = std::getenv("BRAE_CONTROL_DEVICE_PAIR_DONOR_RAW_PHI") != nullptr;
+        static bool saidRaw = false;
+        if (rawPhi && !saidRaw)
+        {
+            saidRaw = true;
+            std::printf("  *** CONTROL MODE: the pair's bounded flux is built from its raw flux, not phiCN. This "
+                        "run is deliberately wrong. ***\n");
+        }
+        deviceMulesDonorFluxCyclic(*in.cyc, rawPhi ? in.cyc->phi : *in.phiCNIf, alpha1, phiBDIf);
         deviceSubtractFaces(in.cyc->n, unIf, phiBDIf, corrIfEx);
     }
     deviceMulesLimiter(dm, nIf, nBf, rDeltaT, alpha1, alpha1Old, *bnd.alpha1,

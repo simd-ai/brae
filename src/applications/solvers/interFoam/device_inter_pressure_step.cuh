@@ -182,6 +182,9 @@ struct AmgPcgKnobs
     // damBreakRAS 8.5. AN ENTRY THAT NAMES GAMG KEEPS ITS OWN: those tutorials take OpenFOAM's step count as
     // they are, and the same cap cost DTCHull 9% and eulerianInjection 18%.
     scalar dicInnerRelTol = 1e-3;
+    // EXPERIMENT, off at 1 (BRAE_EXPERIMENT_PRESSURE_FINAL_TOL_FACTOR=<f>): the Final p_rgh solve's absolute
+    // tolerance on the AMG-PCG is the entry's times this. Being measured -- see the note at its use.
+    scalar finalTolFactor = 1;
 };
 const AmgPcgKnobs& amgPcgKnobs();
 

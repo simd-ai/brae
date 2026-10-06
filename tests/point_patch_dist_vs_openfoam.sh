@@ -89,14 +89,24 @@ DO=$(sed -n 's/^ *outerDistance *\([0-9.eE+-]*\);.*/\1/p' "$C/constant/dynamicMe
       && subsetMesh -overwrite c0 -patch floatingObject > log.subsetMesh 2>&1 ) \
     || { echo "FAIL: meshing"; tail -20 "$C"/log.* 2>/dev/null; exit 1; }
 
+# unreached <log>: the number of points OpenFOAM's own wave never reached, from the tool's log. Both arms hold
+# it to 0 -- the mesh is one region -- and hand it to the binary, which holds brae's count to it (a mesh where
+# it is not 0 is point_patch_dist_unreached_vs_openfoam.sh's)
+unreached() { sed -n -E 's/.*\(([0-9]+) points the wave never reached\).*/\1/p' "$1" | head -1; }
 rc=0
 ( cd "$C" && dumpPointPatchDist -patches '(floatingObject)' -di "$DI" -do "$DO" > log.dumpBody 2>&1 ) \
     || { echo "FAIL: dumpPointPatchDist (floatingObject)"; tail -20 "$C/log.dumpBody"; exit 1; }
-"$BIN" "$C" "$C/0" floatingObject "$DI" "$DO" || rc=1
+N=$(unreached "$C/log.dumpBody")
+[ "${N:-x}" = 0 ] \
+    || { echo "  FAIL: OpenFOAM's wave left ${N:-?} points unreached on floatingObject, 0 expected"; rc=1; }
+"$BIN" "$C" "$C/0" floatingObject "$DI" "$DO" "unset=${N:-0}" || rc=1
 
 ( cd "$C" && dumpPointPatchDist -patches '(atmosphere)' > log.dumpAtm 2>&1 ) \
     || { echo "FAIL: dumpPointPatchDist (atmosphere)"; tail -20 "$C/log.dumpAtm"; exit 1; }
-"$BIN" "$C" "$C/0" atmosphere || rc=1
+N=$(unreached "$C/log.dumpAtm")
+[ "${N:-x}" = 0 ] \
+    || { echo "  FAIL: OpenFOAM's wave left ${N:-?} points unreached to atmosphere, 0 expected"; rc=1; }
+"$BIN" "$C" "$C/0" atmosphere "unset=${N:-0}" || rc=1
 
 echo "point_patch_dist_vs_openfoam: rc $rc"
 exit $rc

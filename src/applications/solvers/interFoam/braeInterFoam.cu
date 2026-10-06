@@ -179,7 +179,7 @@
 //
 // BEGIN DEVICE REFUSALS
 //   device_gamg_smootherDILU device_gradLsq
-//   device_refine_motion
+//   device_refine_motion device_eulerU_cnAlpha_outer
 //   device_gradUCache device_gradUCacheKEpsilon device_gradUCacheLimited device_gradUCacheCoupled
 // END DEVICE REFUSALS
 #include "device_schedule.cuh"

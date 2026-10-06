@@ -95,7 +95,8 @@ scalar deviceAlphaPreSolve(
     DeviceBuffer<scalar>*         alphaPhi10If,
     const DeviceBuffer<scalar>*   Vsc,
     const DeviceBuffer<scalar>*   Vsc0,
-    const DeviceBuffer<scalar>*   rDeltaT)
+    const DeviceBuffer<scalar>* rDeltaT,
+    const DeviceBuffer<scalar>* phiCNIf)
 {
     const int nC  = dm.nCells;
     const int nIf = dm.nInternalFaces;
@@ -113,12 +114,19 @@ scalar deviceAlphaPreSolve(
     // ...and the PAIR, whose faces are in neither the internal list nor the boundary one. Upwind gives
     // a coupled face internalCoeffs = phi*w and boundaryCoeffs = -(phi*(1 - w)) with w = pos0(phi), as
     // on an internal face (fvm.cuh:536-549); deviceCyclicAddConvection is that, gated face by face in
-    // tests/test_device_cyclic_laplacian_vs_host.cu. cyc->phi must already hold phiCN on the pair.
+    // tests/test_device_cyclic_laplacian_vs_host.cu. The convecting flux there is phiCN's, handed in.
     if (cyc && cyc->n > 0)
     {
+        if (!phiCNIf || static_cast<label>(phiCNIf->size()) != cyc->n)
+        {
+            throw std::runtime_error(
+                "brae interFoam alpha pre-solve: the mesh has a coupled pair and the caller handed no phiCN "
+                "for its faces. fvm::div(phiCN, alpha1) convects with phiCN there as on every face "
+                "(alphaEqn.H:110-115); the pair's own flux is not it under CrankNicolson.");
+        }
         std::vector<scalar> zeros(static_cast<std::size_t>(cyc->n), scalar(0));
         cyc->ifCoeff.copyFrom(zeros);      // ADDS to the interface coefficient, so it starts clean
-        deviceCyclicAddConvection(*cyc, rawDiag);
+        deviceCyclicAddConvection(*cyc, *phiCNIf, rawDiag);
     }
 
     DeviceBuffer<scalar> source(static_cast<std::size_t>(nC));
@@ -185,7 +193,7 @@ scalar deviceAlphaPreSolve(
     // the SOLVED alpha, which is what deviceMulesDonorFluxCyclic computes.
     if (cyc && cyc->n > 0 && alphaPhi10If)
     {
-        deviceMulesDonorFluxCyclic(*cyc, alpha1, *alphaPhi10If);
+        deviceMulesDonorFluxCyclic(*cyc, *phiCNIf, alpha1, *alphaPhi10If);
     }
     alphaPhi10Bnd.resize(static_cast<std::size_t>(nBf));
     if (nBf > 0)

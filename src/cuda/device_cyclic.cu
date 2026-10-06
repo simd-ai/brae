@@ -5,6 +5,8 @@
 // diag[own] -= ifCoeff (Laplacian) / += max(phi,0) (upwind convection).
 #include "device_cyclic.cuh"
 #include <cuda_runtime.h>
+#include <stdexcept>
+#include <string>
 
 namespace brae {
 namespace {
@@ -765,10 +767,20 @@ void deviceCyclicAssembleLaplacian(
 }
 
 
-void deviceCyclicAddConvection(DeviceCyclic& cyc, DeviceBuffer<scalar>& diag, const DeviceBuffer<scalar>* wsch)
+void deviceCyclicAddConvection(
+    DeviceCyclic& cyc,
+    const DeviceBuffer<scalar>& phiIf,
+    DeviceBuffer<scalar>& diag,
+    const DeviceBuffer<scalar>* wsch)
 {
     if (cyc.n == 0) return;
-    convKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.phi.data(),
+    if (static_cast<label>(phiIf.size()) != cyc.n)
+    {
+        throw std::runtime_error(
+            "brae device cyclic: the pair's upwind convection needs the convecting flux, one value a pair face ("
+            + std::to_string(cyc.n) + "); the caller handed " + std::to_string(phiIf.size()) + ".");
+    }
+    convKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), phiIf.data(),
         (wsch && (label)wsch->size() == cyc.n) ? wsch->data() : nullptr,
         cyc.ifCoeff.data(), diag.data());
     cudaCheck(cudaGetLastError(), "cyclicConv");

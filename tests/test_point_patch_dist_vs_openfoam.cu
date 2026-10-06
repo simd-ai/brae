@@ -65,12 +65,21 @@ int main(int argc, char** argv)
 {
     if (argc < 4)
     {
-        std::printf("usage: %s <caseDir> <ofTimeDir> <patch> [innerDistance outerDistance]\n", argv[0]);
+        std::printf("usage: %s <caseDir> <ofTimeDir> <patch> [innerDistance outerDistance] [unset=<N>]\n",
+                    argv[0]);
         return 2;
     }
     const std::string caseDir = argv[1];
     const std::string ofDir = argv[2];
     const std::string pname = argv[3];
+    // `unset=<N>`, last: the number of points OpenFOAM's own wave never reached (its tool's log says it);
+    // without it the arm holds brae's count to 0
+    long ofUnset = 0;
+    if (argc > 4 && std::string(argv[argc - 1]).rfind("unset=", 0) == 0)
+    {
+        ofUnset = std::atol(argv[argc - 1] + 6);
+        --argc;
+    }
     const bool withScale = (argc > 5);
     const scalar di = withScale ? static_cast<scalar>(std::atof(argv[4])) : scalar(0);
     const scalar dOut = withScale ? static_cast<scalar>(std::atof(argv[5])) : scalar(0);
@@ -129,7 +138,8 @@ int main(int argc, char** argv)
     if (ids.empty()) { std::printf("test_point_patch_dist_vs_openfoam: %d failures\n", ++failures); return 1; }
 
     const PointPatchDist d = pointPatchDist(m, e, patches, ids);
-    check("the wave reached every point, as OpenFOAM's did", d.nUnset == 0);
+    std::printf("  points the wave never reached: %ld, OpenFOAM's %ld\n", static_cast<long>(d.nUnset), ofUnset);
+    check("the wave left unreached exactly the number of points OpenFOAM's did", d.nUnset == ofUnset);
 
     const std::vector<scalar> ofDist = readPointField(ofDir + "/pointPatchDist.dump", nPoints);
     check("OpenFOAM's dump has one value per mesh point",

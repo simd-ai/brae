@@ -1001,6 +1001,21 @@ add_executable(test_realizablke_cpp tests/test_realizablke_cpp.cu)
 target_include_directories(test_realizablke_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_realizablke_cpp PRIVATE brae_core)
 
+# realizableKE's rCmu on the device against the host reference at strain rates where the constant in its
+# denominator (OpenFOAM's SMALL) decides the answer; the control is the kernel's own switch, run as a child.
+add_executable(test_device_realizable_strain tests/test_device_realizable_strain.cu)
+target_include_directories(test_device_realizable_strain PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_device_realizable_strain PRIVATE brae_core)
+add_test(NAME device_realizable_strain COMMAND test_device_realizable_strain)
+set_tests_properties(device_realizable_strain PROPERTIES SKIP_RETURN_CODE 77)
+
+# WriteControl's cadence from a controlDict: writeInterval, its older name writeFrequency, and neither; the
+# same entry in the interFoam loops' cadence; timeStep with an interval below 1 refused
+add_executable(test_write_control_interval tests/test_write_control_interval.cu)
+target_include_directories(test_write_control_interval PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_write_control_interval PRIVATE brae_core)
+add_test(NAME write_control_interval COMMAND test_write_control_interval)
+
 add_executable(kepsilon_probe tests/kepsilon_probe.cu)
 target_include_directories(kepsilon_probe PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(kepsilon_probe PRIVATE brae_core)
@@ -1847,6 +1862,14 @@ add_executable(test_grad_subset tests/test_grad_subset.cu)
 target_include_directories(test_grad_subset PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_grad_subset PRIVATE brae_core)
 add_test(NAME grad_subset COMMAND test_grad_subset)
+
+# ...and across a coupled pair (a translational cyclic, and the same pair with a cyclicAMI's addressing): the
+# coupled branches of the fit and of the limiter in their subset form, which the solver does not reach (it
+# refuses a least-squares nHat on a mesh with a pair) and which nothing else ran.
+add_executable(test_grad_subset_coupled tests/test_grad_subset_coupled.cu)
+target_include_directories(test_grad_subset_coupled PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_grad_subset_coupled PRIVATE brae_core)
+add_test(NAME grad_subset_coupled COMMAND test_grad_subset_coupled)
 
 add_executable(rotordisk_probe tests/rotordisk_probe.cu)
 target_include_directories(rotordisk_probe PRIVATE ${BRAE_HEADER_DIRS})
@@ -4138,6 +4161,11 @@ target_link_libraries(test_point_patch_dist_vs_openfoam PRIVATE brae_core)
 add_test(NAME point_patch_dist_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/point_patch_dist_vs_openfoam.sh)
 set_tests_properties(point_patch_dist_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+# ...and on a mesh of two unconnected blocks, where the wave does not reach every point: OpenFOAM leaves those
+# at GREAT and rigidBodyMeshMotion does not move them. The control is the old value, 0.
+add_test(NAME point_patch_dist_unreached_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/point_patch_dist_unreached_vs_openfoam.sh)
+set_tests_properties(point_patch_dist_unreached_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 
 # interFoam across a coded cyclicACMI baffle against real OpenFOAM on damBreakLeakage. The script carries
 # the measurements, the controls and the fail-proofs.

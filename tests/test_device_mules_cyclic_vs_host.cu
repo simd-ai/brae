@@ -209,19 +209,27 @@ int main(int argc, char** argv)
         cpu::MULES::boundedDonorFlux(phiField, psi, phiPsi, m, fvp, hostBD);
 
         DeviceCyclic cycD = buildDeviceCyclic(cyclics, g, fvp);
+        // THE FLUX THE BOUNDED FLUX IS UPWIND OF IS HANDED IN, and the pair's own (cyc.phi) holds ANOTHER one
+        // here, of the other sign on most faces -- as phiCN and phi differ on a pair under CrankNicolson from
+        // the second outer corrector on. A kernel that read cyc.phi, which this one did until 2026-10-06,
+        // fails the bitwise check below; the control at the end of the arm shows by how much.
+        std::vector<scalar> flat;
+        for (const CyclicInterface& c : cyclics)
         {
-            std::vector<scalar> flat;
-            for (const CyclicInterface& c : cyclics)
+            for (std::size_t i = 0; i < c.faceCells.size(); ++i)
             {
-                for (std::size_t i = 0; i < c.faceCells.size(); ++i)
-                {
-                    flat.push_back(phiField.boundary[static_cast<std::size_t>(c.patch)][i]);
-                }
+                flat.push_back(phiField.boundary[static_cast<std::size_t>(c.patch)][i]);
             }
-            cycD.phi.copyFrom(flat);
         }
+        std::vector<scalar> raw(flat.size());
+        for (std::size_t j = 0; j < flat.size(); ++j)
+        {
+            raw[j] = scalar(0.01) - scalar(0.5)*flat[j];
+        }
+        cycD.phi.copyFrom(raw);
+        DeviceBuffer<scalar> dPhiCN(flat);
         DeviceBuffer<scalar> dPsiCell(psiCell), devBD;
-        deviceMulesDonorFluxCyclic(cycD, dPsiCell, devBD);
+        deviceMulesDonorFluxCyclic(cycD, dPhiCN, dPsiCell, devBD);
         std::vector<scalar> dbd;
         devBD.copyTo(dbd);
 
@@ -244,6 +252,23 @@ int main(int argc, char** argv)
         check("the device's donor flux on a coupled face IS the host's, bit for bit",
               dbd.size() == hbd.size() && worst == scalar(0));
         check("...and it is not identically zero, which an overwritten patch would be", scale > scalar(0));
+
+        // CONTROL: the same kernel handed the pair's own flux
+        DeviceBuffer<scalar> devRaw;
+        deviceMulesDonorFluxCyclic(cycD, cycD.phi, dPsiCell, devRaw);
+        std::vector<scalar> draw;
+        devRaw.copyTo(draw);
+        long differ = 0;
+        scalar worstRaw = 0;
+        for (std::size_t j = 0; j < draw.size() && j < hbd.size(); ++j)
+        {
+            differ += (draw[j] != hbd[j]) ? 1 : 0;
+            worstRaw = std::fmax(worstRaw, std::fabs(draw[j] - hbd[j]));
+        }
+        std::printf("  CONTROL, the pair's own flux in place of the one handed in: %ld of %zu faces differ from "
+                    "the host's, by %.4e at most\n", differ, hbd.size(), (double)worstRaw);
+        check("CONTROL: built from the pair's own flux, the donor flux is not the host's",
+              differ > 0 && worstRaw > scalar(0.1)*scale);
     }
 
     const DeviceMesh dmEarly = buildDeviceMesh(m, g, fvp);

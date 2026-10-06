@@ -98,8 +98,8 @@ scalar deviceAlphaPreSolve(
     DeviceBuffer<scalar>&         alphaPhi10Bnd,
     // the solver's own report -- initial and final residual and the iteration count; null = not kept
     DeviceSolverPerf*             perfOut = nullptr,
-    // THE PAIR. `cyc->phi` must hold phiCN on its faces before the call; the matrix gains the upwind
-    // coupling and the solve applies it. `alphaPhi10If` comes out as the matrix's flux there, which for
+    // THE PAIR. The matrix gains the upwind coupling, of the convecting flux `phiCNIf` (last argument),
+    // and the solve applies it. `alphaPhi10If` comes out as the matrix's flux there, which for
     // upwind coefficients is phi*(the upwind cell's alpha) -- internalCoeffs*pif - boundaryCoeffs*pnf
     // with w = pos0(phi) reduces to exactly that, which is why it is the donor-flux kernel.
     DeviceCyclic*                 cyc = nullptr,
@@ -112,6 +112,12 @@ scalar deviceAlphaPreSolve(
     // LOCALEULER: the per-cell rDeltaT, which localEulerDdtScheme's fvmDdt takes in 1/deltaT's place --
     // diag = rDeltaT*V, source = rDeltaT*alpha.oldTime()*V, in that order (localEulerDdtScheme.C:245-246;
     // alpha_eqn_cpp.cu). Null == Euler. Refused on a moving mesh, as the host refuses it.
-    const DeviceBuffer<scalar>*   rDeltaT = nullptr);
+    const DeviceBuffer<scalar>* rDeltaT = nullptr,
+    // phiCN ON THE PAIR'S FACES, one value a face: what fvm::div(phiCN, alpha1) convects with there
+    // (alphaEqn.H:110-115) and what the pair's flux out of the solve is upwind of. REQUIRED with a pair --
+    // the call refuses a pair without it. It read cyc->phi until 2026-10-06, on a note saying the caller had
+    // to have put phiCN there; no caller did, and under CrankNicolson the two differ from the second outer
+    // corrector on.
+    const DeviceBuffer<scalar>* phiCNIf = nullptr);
 
 } // namespace brae

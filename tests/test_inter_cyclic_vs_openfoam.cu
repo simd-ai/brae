@@ -76,6 +76,18 @@ const scalar B_TURB_DEV = 5e-09;
 const scalar B_ALPHA_DEV_CN = 5e-11;
 const scalar B_PRGH_DEV_CN = 3e-09;
 const scalar B_U_DEV_CN = 1e-09;
+// ...and CRANKNICOLSON WITH THREE OUTER CORRECTORS (sstCNOuter), the one profile where the pair's phiCN is
+// not its phi. MEASURED 2026-10-06, device against OpenFOAM: alpha 1.9e-11, p_rgh 4.5e-10, U 6.5e-11 (host
+// arm 4.4e-14 in alpha); with the pair's raw flux back in the alpha pre-solve alpha 4.1e-03, p_rgh 4.0e-03,
+// U 7.4e-02. And explicitCNOuter, the same under the explicit MULES: 6.5e-12, 5.0e-10, 3.9e-12; with the
+// pair's raw flux in the bounded flux 4.2e-03, 3.2e-03, 2.7e-03. A decade above the worse of the two.
+const scalar B_ALPHA_DEV_CN_OUTER = 2e-10;
+const scalar B_PRGH_DEV_CN_OUTER = 5e-09;
+const scalar B_U_DEV_CN_OUTER = 7e-10;
+// ...explicitCNOuter's own, a decade above ITS measurement (6.5e-12, 5.0e-10, 3.9e-12)
+const scalar B_ALPHA_DEV_CN_OUTER_EXPLICIT = 7e-11;
+const scalar B_PRGH_DEV_CN_OUTER_EXPLICIT = 5e-09;
+const scalar B_U_DEV_CN_OUTER_EXPLICIT = 4e-11;
 const scalar B_ALPHA_DEV_OUTER = 6e-08;
 const scalar B_PRGH_DEV_OUTER = 7e-08;
 const scalar B_U_DEV_OUTER = 7e-06;
@@ -155,12 +167,17 @@ int main(
     // `non-orthogonality Max: 0`, so it cannot witness the branch at all.
     const bool skewProfile = (profile == "skewNonOrth");
     const bool outerProfile = (profile == "outer");
+    // CrankNicolson with three outer correctors: its control is the same case with one, as `outer`'s is
+    const bool cnOuterProfile = (profile == "sstCNOuter" || profile == "explicitCNOuter");
+    // ...whose control is the Euler run with one outer corrector: the scheme AND the outer loop differ
+    const bool explicitCnOuter = (profile == "explicitCNOuter");
     // A CLOSURE ACROSS THE PAIR. `sst` is kOmegaSST with the wall-function family on the walls,
     // `les` is kEqn with the filter width the fixture's uniform cells give. The closure is what is
     // under test in those two, so its OWN fields are compared and not only the three the other
     // profiles share: a defect confined to k reaches U through nuEff alone and arrives divided by the
     // Reynolds number.
-    const bool sstProfile = (profile == "sst" || profile == "sstCN" || profile == "sstLim"
+    const bool sstProfile = (profile == "sst" || profile == "sstCN" || profile == "sstCNOuter"
+                          || profile == "sstLim"
                           || profile == "sstLimU" || profile == "sstLimDiv" || profile == "sstLsq"
                           || profile == "sstLimUpw");
     // `sstLimDiv` names `Gauss limitedLinear 1` for div(phi,k) and div(phi,omega) on a mesh with a
@@ -320,7 +337,7 @@ int main(
     const scalar stepOneBound = turbProfile ? scalar(5e-6) : scalar(5e-7);
     failures += brae::gatecheck::compareSolves(
         "host", r.pSolves, ofP, nSteps, "p_rgh", stepOneBound,
-        outerProfile ? scalar(6e-5) : stepOneBound);
+        (outerProfile || cnOuterProfile) ? scalar(6e-5) : stepOneBound);
 
     failures += brae::gatecheck::nonFinite("brae alpha", fin.alpha1.internal);
     failures += brae::gatecheck::nonFinite("brae p_rgh", fin.p_rgh.internal);
@@ -396,7 +413,8 @@ int main(
     const Diff cA = compare(wAlpha, ofAlpha);
     const Diff cU = compare(wU, ofU);
     std::printf("  CONTROL: OpenFOAM with %s: alpha %.4e, U relative %.4e\n",
-                outerProfile ? "nOuterCorrectors 1 (this case has 3)"
+                explicitCnOuter ? "the Euler ddt and nOuterCorrectors 1 (this case: CrankNicolson 0.9 and 3)"
+                : (outerProfile || cnOuterProfile) ? "nOuterCorrectors 1 (this case has 3)"
                 : (cnProfile ? "the Euler ddt (this case runs CrankNicolson 0.9)"
                 : (jumpProfile ? "the pair a PLAIN CYCLIC (no jump)"
                 : (skewProfile ? "`orthogonal` on the same sheared mesh -- deltaCoeffs where this arm "
@@ -404,7 +422,8 @@ int main(
                                  "`uncorrected` on the coupled patch"
                                : "the pair two WALLS"))),
                 (double)cA.linf, (double)cU.rel());
-    check(outerProfile ? "the OUTER CORRECTORS move OpenFOAM's own alpha far more than brae is from it"
+    check((outerProfile || cnOuterProfile)
+          ? "the OUTER CORRECTORS move OpenFOAM's own alpha far more than brae is from it"
           : (cnProfile ? "CRANKNICOLSON moves OpenFOAM's own alpha far more than brae is from it"
           : (jumpProfile ? "the JUMP moves OpenFOAM's own alpha far more than brae is from it"
           : (skewProfile ? "THE COEFFICIENT CHOICE moves OpenFOAM's own alpha far more than brae is from "
@@ -480,9 +499,15 @@ int main(
         std::printf("  device alpha:   Linf %.4e\n", (double)eA.linf);
         std::printf("  device p_rgh:   relative %.4e\n", (double)eP.rel());
         std::printf("  device U:       relative %.4e\n", (double)eU.rel());
-        const scalar bA = outerProfile ? B_ALPHA_DEV_OUTER : cnProfile ? B_ALPHA_DEV_CN : B_ALPHA_DEV;
-        const scalar bP = outerProfile ? B_PRGH_DEV_OUTER : cnProfile ? B_PRGH_DEV_CN : B_PRGH_DEV;
-        const scalar bU = outerProfile ? B_U_DEV_OUTER : cnProfile ? B_U_DEV_CN : B_U_DEV;
+        const scalar bA = explicitCnOuter ? B_ALPHA_DEV_CN_OUTER_EXPLICIT
+                        : cnOuterProfile ? B_ALPHA_DEV_CN_OUTER
+                        : outerProfile ? B_ALPHA_DEV_OUTER : cnProfile ? B_ALPHA_DEV_CN : B_ALPHA_DEV;
+        const scalar bP = explicitCnOuter ? B_PRGH_DEV_CN_OUTER_EXPLICIT
+                        : cnOuterProfile ? B_PRGH_DEV_CN_OUTER
+                        : outerProfile ? B_PRGH_DEV_OUTER : cnProfile ? B_PRGH_DEV_CN : B_PRGH_DEV;
+        const scalar bU = explicitCnOuter ? B_U_DEV_CN_OUTER_EXPLICIT
+                        : cnOuterProfile ? B_U_DEV_CN_OUTER
+                        : outerProfile ? B_U_DEV_OUTER : cnProfile ? B_U_DEV_CN : B_U_DEV;
         check("the device's alpha agrees with OpenFOAM's absolutely", eA.linf < bA);
         check("the device's p_rgh agrees with OpenFOAM's relatively", eP.rel() < bP);
         check("the device's U agrees with OpenFOAM's relatively", eU.rel() < bU);

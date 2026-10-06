@@ -361,16 +361,30 @@ int main(int argc, char** argv)
               nPos > 0 && nNeg > 0);
 
         DeviceCyclic cycC = buildDeviceCyclic(cyclics, g, fvp);
-        cycC.phi.copyFrom(phiB);
-        DeviceBuffer<scalar> cdiag(std::vector<scalar>(static_cast<std::size_t>(nC), scalar(0)));
-        {   // ifCoeff is ADDED to, so it starts at zero as the laplacian would have left it
-            std::vector<scalar> zeros(static_cast<std::size_t>(cycC.n), scalar(0));
-            cycC.ifCoeff.copyFrom(zeros);
+        // THE CONVECTING FLUX IS HANDED IN, and the pair's own (cyc.phi) holds ANOTHER one here -- as phiCN
+        // and phi differ on a pair under CrankNicolson. The routine read cyc.phi until 2026-10-06; had it
+        // still, the two bitwise checks below would fail, and the control after them shows by how much.
+        std::vector<scalar> rawB(phiB.size());
+        for (std::size_t j = 0; j < phiB.size(); ++j)
+        {
+            rawB[j] = scalar(0.01) - scalar(0.5)*phiB[j];
         }
-        deviceCyclicAddConvection(cycC, cdiag);
+        cycC.phi.copyFrom(rawB);
+        DeviceBuffer<scalar> dPhiB(phiB);
+        DeviceBuffer<scalar> cdiag(std::vector<scalar>(static_cast<std::size_t>(nC), scalar(0)));
+        const std::vector<scalar> ifZeros(static_cast<std::size_t>(cycC.n), scalar(0));
+        // ifCoeff is ADDED to, so it starts at zero as the laplacian would have left it
+        cycC.ifCoeff.copyFrom(ifZeros);
+        deviceCyclicAddConvection(cycC, dPhiB, cdiag);
         std::vector<scalar> devIf, devDiag;
         cycC.ifCoeff.copyTo(devIf);
         cdiag.copyTo(devDiag);
+        // ...and the CONTROL's coefficients, from the pair's own flux
+        DeviceBuffer<scalar> rawDiagBuf(std::vector<scalar>(static_cast<std::size_t>(nC), scalar(0)));
+        cycC.ifCoeff.copyFrom(ifZeros);
+        deviceCyclicAddConvection(cycC, cycC.phi, rawDiagBuf);
+        std::vector<scalar> rawIf;
+        cycC.ifCoeff.copyTo(rawIf);
 
         // the host's own, from its upwind div on the same faces
         SurfaceScalarField phiF;
@@ -417,6 +431,18 @@ int main(int argc, char** argv)
               devIf.size() == hostIf.size() && wIf == scalar(0));
         check("...and so is the diagonal it adds", wD == scalar(0));
         check("...and neither is identically zero", sIf > scalar(0) && sD > scalar(0));
+        long rawDiffer = 0;
+        scalar rawWorst = 0;
+        for (std::size_t j = 0; j < rawIf.size() && j < hostIf.size(); ++j)
+        {
+            rawDiffer += (rawIf[j] != -hostIf[j]) ? 1 : 0;
+            rawWorst = std::fmax(rawWorst, std::fabs(rawIf[j] - (-hostIf[j])));
+        }
+        std::printf("  CONTROL, the pair's own flux in place of the one handed in: %ld of %zu interface "
+                    "coefficients differ from the host's, by %.4e at most\n", rawDiffer, hostIf.size(),
+                    (double)rawWorst);
+        check("CONTROL: built from the pair's own flux, the convection coefficients are not the host's",
+              rawDiffer > 0 && rawWorst > scalar(0.1)*sIf);
     }
 
     // ---- THE FLUX, THE DIVERGENCE AND THE GRADIENT ON THE PAIR ----------------------------------

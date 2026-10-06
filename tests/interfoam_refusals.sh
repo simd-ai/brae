@@ -1111,6 +1111,13 @@ if [ $HAVE_GPU = 1 ]; then
     arm mesh_dynamicRefine_device refused "Entry 'correctFluxes' not found in dictionary" "-device" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
     arm device_refine_runs  runs    -                         "-device" "$REFDICT '' > constant/dynamicMeshDict"
     arm device_refine_motion refused "a motion solver on a 2-D mesh" "-device" "$REFDICT 'solvers { VF { motionSolverLibs (fvMotionSolvers); motionSolver solidBody; solidBodyMotionFunction oscillatingLinearMotion; amplitude (0.1 0 0); omega 6.283185307179586; } }' > constant/dynamicMeshDict"
+    # ALPHA'S CrankNicolson UNDER AN Euler MOMENTUM, where the device loop would run alpha on the raw flux: more
+    # than one outer corrector (the host loop runs it; with one corrector the two fluxes are one and the device runs)
+    CNOUTER="ddtblock 'default Euler;' 'ddt(alpha) CrankNicolson 0.9;'"
+    CNOUTER="$CNOUTER && sed -i -E 's/nOuterCorrectors +[0-9]+;/nOuterCorrectors 2;/' system/fvSolution"
+    CNOUTER="$CNOUTER && grep -q 'nOuterCorrectors 2;' system/fvSolution"
+    arm device_eulerU_cnAlpha_outer refused "ddt(alpha) is CrankNicolson under an Euler ddt(rho,U)" "-device" \
+        "$CNOUTER"
     # ...nor a non-orthogonal correction where it is not zero
     # the non-orthogonal correction runs on the device now (tests/interfoam_dambreak_vs_openfoam.sh
     # `sheared` holds it to OpenFOAM); `uncorrected` on a mesh that is not orthogonal is still refused

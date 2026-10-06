@@ -82,11 +82,16 @@ void deviceMulesDonorFlux(
     DeviceBuffer<scalar>&       phiBDInt,
     DeviceBuffer<scalar>&       phiBDBnd);
 
-// ...and the same for the faces of a periodic pair, whose flux the interface carries (cyc.phi) and
-// whose neighbour is a cell, not a patch value. A cyclic face is NOT overwritten by phiPsi the way an
-// uncoupled boundary face is, so its phiCorr is genuinely non-zero and the limiter has work to do on it.
+// ...and the same for the faces of a periodic pair, whose neighbour is a cell, not a patch value. A cyclic
+// face is NOT overwritten by phiPsi the way an uncoupled boundary face is, so its phiCorr is genuinely
+// non-zero and the limiter has work to do on it.
+// `phiIf` IS THE CALLER'S, one value a pair face: the flux the bounded flux is upwind OF. In alphaEqn.H that
+// is phiCN on every face, the pair's included (MULESTemplates.C:596 with the phi handed in at
+// alphaEqn.H:210-220), which under CrankNicolson is not the pair's own flux cyc.phi from the second outer
+// corrector on. This read cyc.phi itself until 2026-10-06; there is no default.
 void deviceMulesDonorFluxCyclic(
     const DeviceCyclic&         cyc,
+    const DeviceBuffer<scalar>& phiIf,
     const DeviceBuffer<scalar>& psi,
     DeviceBuffer<scalar>&       phiBDIf);
 

@@ -43,7 +43,8 @@ struct PointPatchDist
 {
     // per mesh point; the wave's distance, not the exact nearest-patch-point distance
     std::vector<scalar> distance;
-    // points the wave never reached (OpenFOAM leaves their value untouched and counts them)
+    // points the wave never reached: they hold GREAT (1e15), the value OpenFOAM constructs the field with
+    // and leaves there (pointPatchDist.C:52, :126-136), and are counted
     label nUnset = 0;
 };
 

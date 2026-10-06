@@ -286,7 +286,10 @@ struct WriteCadence
         const std::string wc = controlDict.wordOr("writeControl", "timeStep");
         w.adjustable = (wc == "adjustable" || wc == "adjustableRunTime");
         w.runTimeIndexed = w.adjustable || wc == "runTime";
-        w.writeInterval = controlDict.scalarOr("writeInterval", scalar(0));
+        // `writeInterval`, else its older name `writeFrequency` (TimeIO.C:286-297), as the writer reads it
+        // (inter_writer_cpp.cu). This read the first alone until 2026-10-06: a case spelt `writeFrequency` wrote
+        // nothing under `runTime`, with no word, and was refused under `adjustable` for an entry it had.
+        w.writeInterval = controlDict.scalarOr("writeInterval", controlDict.scalarOr("writeFrequency", scalar(0)));
         if (w.runTimeIndexed && !(w.writeInterval > scalar(0)))
         {
             // runTime's index divides by it as the adjustable mode's does, below
@@ -344,6 +347,27 @@ inline scalar adjustDeltaT(
         return std::min(newDeltaT, scalar(2)*deltaT);
     }
     return std::max(newDeltaT, scalar(0.2)*deltaT);
+}
+
+// setInitialDeltaT.H AS A SOLVER'S START RUNS IT (interFoam.C:81-85: CourantNo.H then this, before the time
+// loop). The statement is reached only at time index 0 with a Courant number above SMALL, and where it is
+// reached Time::setDeltaT lands the step on the write cadence as well -- `adjust` defaults to true
+// (Time.C:981-990) -- EVEN WHEN THE VALUE IT IS HANDED IS THE deltaT IT ALREADY HOLDS. So a start that has a
+// flux enters the loop with deltaT already trimmed to the write interval, and the first step's setDeltaT.H
+// grows THAT; a start from rest (Courant number 0) enters with the controlDict's own. The two differ wherever
+// deltaT does not divide the write interval: with writeInterval 0.011 and deltaT 0.0025 OpenFOAM's first step
+// is 0.011/3 from a start with a flux and 0.011/4 from rest
+// (tests/interfoam_write/clock/initial_deltat.sh). `timeIndex` is the start's own (uniform/time on a
+// restart, 0 otherwise).
+inline scalar setInitialDeltaT(
+    scalar deltaT,
+    scalar CoNum,
+    const TimeControls& tc,
+    label timeIndex,
+    const WriteCadence& w)
+{
+    if (!tc.adjustTimeStep || timeIndex != 0 || !(CoNum > timeControlSmall())) return deltaT;
+    return adjustDeltaT(setInitialDeltaT(deltaT, CoNum, tc), scalar(0), w);
 }
 
 // setDeltaT.H, and the adjustDeltaT that Time::setDeltaT performs on the way in. `w` null is a case

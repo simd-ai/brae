@@ -21,7 +21,8 @@
 //   * each case twice on the SAME subset with another field: the subset keeps its arrays between calls and
 //     clears the listed cells' entries only.
 // The CONTROL leaves every other face out of the subset: listed cells must then differ.
-// NOT HERE: a coupled patch (cyclic, cyclicAMI) -- the box has none.
+// NOT HERE: a coupled patch (cyclic, cyclicAMI) -- the box has none; tests/test_grad_subset_coupled.cu holds
+// the same on a pair.
 #include "box_mesh.cuh"
 #include "cellLimitedGrad_cpp.cuh"
 #include "fv_geometry.cuh"

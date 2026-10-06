@@ -1,6 +1,8 @@
 #include "point_patch_dist_cpp.cuh"
 #include "primitive_patch_cpp.cuh"
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -10,6 +12,10 @@ namespace {
 
 // PointEdgeWaveBase.C:40
 const scalar propagationTol = scalar(0.01);
+// GREAT (doubleScalar.H:58, chosen by scalar.H:126): what a point the wave never reached holds. (EpePoint's
+// own sentinel below carries distSqr 0 where OpenFOAM's default element has GREAT: every read of it is behind
+// valid() or an origin comparison an invalid entry cannot pass, so it never reaches a number.)
+constexpr scalar great = 1.0e15;
 
 // externalPointEdgePoint: an origin point and the squared distance from it. `valid` is
 // origin != point::max, which is the sentinel OpenFOAM constructs the field with.
@@ -160,8 +166,25 @@ PointPatchDist pointPatchDist(
         if (changedPoints.empty()) break;
     }
 
+    // A POINT THE WAVE NEVER REACHED HOLDS GREAT, not 0: pointPatchDist.C:52 constructs the field at GREAT and
+    // :126-136 overwrites the valid points only. rigidBodyMeshMotion.C:181-206 makes a motion scale of exactly
+    // 0 of that -- the point stays where it is -- where a 0 here made a scale of exactly 1: the point moved
+    // rigidly with the body. Serially a point is unreached when no edge path joins it to the patches (a second
+    // mesh region; by reading also when the patches have no face at all, which no gate holds). No shipped
+    // tutorial has one; MEASURED on two
+    // blocks that share no vertex (tests/point_patch_dist_unreached_vs_openfoam.sh): 45 of 90 points, each
+    // 1e15 from OpenFOAM's value with the 0 and its scale 1.0 from OpenFOAM's.
+    //   BRAE_CONTROL_POINT_PATCH_DIST_UNSET_ZERO=1: a gate's CONTROL, deliberately wrong -- 0, as before
+    static const bool unsetZero = std::getenv("BRAE_CONTROL_POINT_PATCH_DIST_UNSET_ZERO") != nullptr;
+    static bool said = false;
+    if (unsetZero && !said)
+    {
+        said = true;
+        std::printf("  *** CONTROL MODE: pointPatchDist leaves a point the wave never reached at 0, not GREAT. "
+                    "This run is deliberately wrong. ***\n");
+    }
     PointPatchDist out;
-    out.distance.assign(static_cast<std::size_t>(nPoints), scalar(0));
+    out.distance.assign(static_cast<std::size_t>(nPoints), unsetZero ? scalar(0) : great);
     for (label p = 0; p < nPoints; ++p)
     {
         const EpePoint& info = pointInfo[static_cast<std::size_t>(p)];

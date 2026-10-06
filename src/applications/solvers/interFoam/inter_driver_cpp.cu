@@ -838,6 +838,39 @@ RunReport runInterFoam(
     // ...and its patch values as the step's last sub-cycle began (InterWriteState::alpha1SubCycleBoundary)
     std::vector<std::vector<scalar>> alphaSubBndWrite;
 
+    // interFoam.C:81-85, BEFORE the time loop and not under LTS: CourantNo.H on the flux the start has, then
+    // setInitialDeltaT.H (time_controls.cuh says what it does and where it is not a no-op). Neither loop made
+    // it until 2026-10-06; a start from rest is unchanged by it.
+    //   BRAE_CONTROL_INITIAL_DELTAT_SKIPPED=1: not made, as before
+    if (!f.lts && f.timeCtl.base.adjustTimeStep)
+    {
+        static const bool skipped = std::getenv("BRAE_CONTROL_INITIAL_DELTAT_SKIPPED") != nullptr;
+        std::vector<scalar> phiBndFlat;
+        for (const auto& p : f.phi.boundary)
+        {
+            phiBndFlat.insert(phiBndFlat.end(), p.begin(), p.end());
+        }
+        const std::vector<scalar> sumPhi = surfaceSumMagPhi(
+            m.owner(), m.neighbour(), f.phi.internal, phiBndFlat, m.nCells(), m.nInternalFaces());
+        const scalar Co0 = courantNo(sumPhi, g.V(), rep.deltaT).CoNum;
+        // the start's time index is the writer's (uniform/time's on a restart). A caller with no writer -- a
+        // test binary -- is taken as a fresh start; brae_interFoam always has one.
+        const label startIndex = writer ? writer->startTimeIndex() : label(0);
+        const scalar dt0 = setInitialDeltaT(rep.deltaT, Co0, f.timeCtl.base, startIndex, f.writeCadence);
+        if (verbose || skipped)
+        {
+            std::printf(skipped
+                ? "  *** CONTROL MODE: setInitialDeltaT.H is not made before the time loop (Courant number %.17g, "
+                  "deltaT %.17g would be %.17g). This run is deliberately wrong. ***\n"
+                : "  setInitialDeltaT: Courant number %.17g at the start, deltaT %.17g -> %.17g\n",
+                (double)Co0, (double)rep.deltaT, (double)dt0);
+        }
+        if (!skipped)
+        {
+            rep.deltaT = dt0;
+        }
+    }
+
     for (label step = 0; step < nSteps; ++step)
     {
         // Time::run() (Time.C:1000), and it sits HERE -- above CourantNo.H and setDeltaT.H -- so the

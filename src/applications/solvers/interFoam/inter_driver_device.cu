@@ -3545,6 +3545,22 @@ RunReport runInterFoamDevice(
     // at it -- rotated with the old ones; phi's, created when OpenFOAM creates it; the three ddt0
     // fields; and alphaPhi10's levels for alphaEqn.H's un-blend. The closure keeps its own.
     const bool cnDdt = (f.ddtU == DdtScheme::CrankNicolson);
+    // ALPHA'S OFF-CENTRED FLUX IS FORMED BELOW ONLY UNDER A CrankNicolson MOMENTUM. alphaEqn.H takes ocCoeff from
+    // ddt(alpha) alone (:8-46) and blends phiCN whenever it is above zero (:94-97), whatever ddt(rho,U) is; the
+    // host loop does (inter_driver_cpp.cu, keyed on f.ddtAlpha). With `ddt(rho,U) Euler` and `ddt(alpha)
+    // CrankNicolson` this loop hands every alpha site the raw phi. That is phiCN to a rounding while
+    // phi.oldTime() is phi itself at the alpha step -- one outer corrector on a mesh that does not move, which
+    // interfoam_cn_vs_openfoam's eulerAlphaCN holds -- and NOT from the second outer corrector on, nor on a mesh
+    // that moves. Refused there by name until the blend is keyed on ddt(alpha) (found 2026-10-06 by a review).
+    if (!cnDdt && f.ddtAlpha == AlphaDdt::CrankNicolson && f.ddtAlphaOcCoeff > scalar(0)
+     && (f.pimple.nOuterCorrectors > 1 || f.dynamicMesh))
+    {
+        throw std::runtime_error(
+            "brae interFoam -device: ddt(alpha) is CrankNicolson under an Euler ddt(rho,U) with "
+            + std::string(f.dynamicMesh ? "a mesh that moves" : "more than one outer corrector")
+            + ". alphaEqn.H off-centres alpha's flux from ddt(alpha) alone; the device loop forms that flux only "
+              "under a CrankNicolson momentum and would run alpha on the raw flux here. The host loop runs it.");
+    }
     DeviceBuffer<scalar> dAOO(f.alpha1.internal);
     DeviceBuffer<scalar> dUoox(f.U.internal.size()), dUooy(f.U.internal.size()), dUooz(f.U.internal.size());
     DeviceBuffer<scalar> dUoobx, dUooby, dUoobz;
@@ -4177,6 +4193,29 @@ RunReport runInterFoamDevice(
     // the host wave is 430 ms a step. BRAE_CONTROL_WAVE_HOST=1 runs the host wave, the identity gate's other arm.
     static const bool waveHost = std::getenv("BRAE_CONTROL_WAVE_HOST") != nullptr;
     DeviceSmoothWave ltsWave;
+    // interFoam.C:81-85, BEFORE the time loop and not under LTS: CourantNo.H on the flux the start has (the
+    // pair's faces in the sum, as in the loop), then setInitialDeltaT.H -- see time_controls.cuh and the host
+    // loop (inter_driver_cpp.cu).
+    //   BRAE_CONTROL_INITIAL_DELTAT_SKIPPED=1: not made, as before
+    if (!f.lts && f.timeCtl.base.adjustTimeStep)
+    {
+        static const bool skipped = std::getenv("BRAE_CONTROL_INITIAL_DELTAT_SKIPPED") != nullptr;
+        const scalar Co0 = deviceAlphaCourantNo(dm, dPhiI, dPhiB, nullptr, rep.deltaT, dCyc.n > 0 ? &dCyc : nullptr,
+                                                nullptr).CoNum;
+        // the start's time index is the writer's (uniform/time's on a restart). A caller with no writer -- a
+        // test binary -- is taken as a fresh start; brae_interFoam always has one.
+        const label startIndex = writer ? writer->startTimeIndex() : label(0);
+        const scalar dt0 = setInitialDeltaT(rep.deltaT, Co0, f.timeCtl.base, startIndex, f.writeCadence);
+        std::printf(skipped
+            ? "  *** CONTROL MODE: setInitialDeltaT.H is not made before the time loop (Courant number %.17g, "
+              "deltaT %.17g would be %.17g). This run is deliberately wrong. ***\n"
+            : "  setInitialDeltaT: Courant number %.17g at the start, deltaT %.17g -> %.17g\n",
+            (double)Co0, (double)rep.deltaT, (double)dt0);
+        if (!skipped)
+        {
+            rep.deltaT = dt0;
+        }
+    }
     interPhase::start();
     for (label s = 0; s < nSteps; ++s)
     {

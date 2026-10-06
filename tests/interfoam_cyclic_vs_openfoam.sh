@@ -252,7 +252,7 @@ SKEOF
             && grep -qE "default +$w;" "$C/system/fvSchemes" \
             || { echo "FAIL: $profile was not staged"; return 1; }
     fi
-    if [ "$profile" = explicitMules ] || [ "$profile" = explicitWalls ]; then
+    if [ "$profile" = explicitMules ] || [ "$profile" = explicitWalls ] || [ "$profile" = explicitCNOuter ]; then
         # THE EXPLICIT MULES BRANCH. Without MULESCorr there is no implicit pre-solve and no
         # mixture.correct() before the correctors, so the FIRST corrector's phir reads the nHatf the
         # PREVIOUS TIME STEP left -- on the pair as everywhere else. The device kept that normal in a
@@ -261,7 +261,8 @@ SKEOF
         grep -q "MULESCorr       no;" "$C/system/fvSolution" \
             || { echo "FAIL: the $profile profile did not turn MULESCorr off"; return 1; }
     fi
-    if [ "$profile" = outer ] || [ "$profile" = outerControl ]; then
+    if [ "$profile" = outer ] || [ "$profile" = outerControl ] || [ "$profile" = sstCNOuter ] \
+    || [ "$profile" = explicitCNOuter ]; then
         # THE PIMPLE OUTER LOOP. `outer` runs nOuterCorrectors 3 -- alpha re-solved from the SAME
         # alpha.oldTime() three times with the latest flux, the momentum matrix reassembled, the
         # pressure correctors run again -- and `outerControl` is the same case with 1, which is what
@@ -308,7 +309,8 @@ PYEOF
         grep -q "porousBafflePressure" "$C/0/p_rgh" \
             || { echo "FAIL: the jump profile did not reach p_rgh"; return 1; }
     fi
-    if [ "$profile" = sstCN ] || [ "$profile" = lesCN ]; then
+    if [ "$profile" = sstCN ] || [ "$profile" = lesCN ] || [ "$profile" = sstCNOuter ] \
+    || [ "$profile" = explicitCNOuter ]; then
         # ...AND UNDER CRANKNICOLSON. The closure's equations take fvm::ddt through ddtSchemes
         # (kOmegaSSTBase.C:572 and :602, kEqn.C:172), so `default CrankNicolson 0.9` reaches k, omega
         # and every other ddt on the loop. THE CONTROL for these two is the SAME case under Euler --
@@ -325,6 +327,7 @@ PYEOF
     export CLOSUREDIV="Gauss upwind"
     [ "${profile#sstLimDiv}" != "$profile" ] && export CLOSUREDIV="Gauss limitedLinear 1"
     if [ "$profile" = sst ] || [ "$profile" = sstWalls ] || [ "$profile" = sstCN ] \
+    || [ "$profile" = sstCNOuter ] \
     || [ "${profile#sstLim}" != "$profile" ] || [ "${profile#sstLsq}" != "$profile" ] \
     || [ "$profile" = les ] || [ "$profile" = lesWalls ] || [ "$profile" = lesCN ]; then
         # A TURBULENCE CLOSURE ACROSS THE PAIR. kEpsilon was the one closure carried across a cyclic
@@ -510,7 +513,8 @@ PYEOF
 }
 
 for p in cyclic walls explicitMules explicitWalls jump outer outerControl \
-         sst sstWalls les lesWalls sstCN lesCN sstLim sstLimWalls sstLimU sstLimUWalls \
+         sst sstWalls les lesWalls sstCN lesCN sstCNOuter explicitCNOuter \
+         sstLim sstLimWalls sstLimU sstLimUWalls \
          sstLimDiv sstLimDivWalls sstLsq sstLsqWalls sstLimUpw sstLimUpwWalls gamg gamgWalls \
          skewOrthogonal skewNonOrth; do
     stage "$p" || { echo "interfoam_cyclic_vs_openfoam: staging failed"; exit 1; }
@@ -556,6 +560,54 @@ rc=0
        "$W/sstCN/log.interFoam" "$W/sst/$END" sstCN || rc=1
 "$BIN" "$W/lesCN" "$W/lesCN/0" "$W/lesCN/$END" "$STEPS" \
        "$W/lesCN/log.interFoam" "$W/les/$END" lesCN || rc=1
+# ...and CRANKNICOLSON WITH THREE OUTER CORRECTORS, the one configuration in which the pair's off-centred flux
+# phiCN is not its flux phi: phi.oldTime() is the step's first, and from the second outer corrector on phi has
+# moved (with one corrector the two are one to a rounding, which is how sstCN and lesCN above never saw it).
+# The alpha pre-solve convects across the pair with phiCN (alphaEqn.H:110-115) and the device took the pair's
+# own flux there and in the explicit solve's bounded flux until 2026-10-06. Its control for the scheme is the
+# same case with ONE outer corrector (sstCN's own answer). MEASURED, device arm against OpenFOAM: alpha
+# 1.9e-11, p_rgh 4.5e-10, U 6.5e-11.
+"$BIN" "$W/sstCNOuter" "$W/sstCNOuter/0" "$W/sstCNOuter/$END" "$STEPS" \
+       "$W/sstCNOuter/log.interFoam" "$W/sstCN/$END" sstCNOuter || rc=1
+# ...ITS CONTROL, the pair's raw flux back in the pre-solve (BRAE_CONTROL_DEVICE_PAIR_PRESOLVE_RAW_PHI=1): the
+# device arm must leave OpenFOAM by orders. MEASURED: alpha 4.1e-03, p_rgh 4.0e-03, U 7.4e-02. The switch puts
+# the raw flux in BOTH of the pre-solve's sites (the convection across the pair and the pair's flux out of the
+# solve); neither is shown red alone.
+BRAE_CONTROL_DEVICE_PAIR_PRESOLVE_RAW_PHI=1 "$BIN" "$W/sstCNOuter" "$W/sstCNOuter/0" "$W/sstCNOuter/$END" \
+    "$STEPS" "$W/sstCNOuter/log.interFoam" "$W/sstCN/$END" sstCNOuter > "$W/sstCNOuter.control.log" 2>&1
+crc=$?
+sed -n '/^  device alpha:\|^  device p_rgh:\|^  device U:/p' "$W/sstCNOuter.control.log" | sed 's/^/  CONTROL/'
+# ...and the SAME under the explicit MULES (laminar): there the site is the bounded flux of the limited solve,
+# which is upwind's of phiCN on the pair as on every face (MULESTemplates.C:596). MEASURED: device alpha
+# 6.5e-12, p_rgh 5.0e-10, U 3.9e-12; with the pair's raw flux (BRAE_CONTROL_DEVICE_PAIR_DONOR_RAW_PHI=1) alpha
+# 4.2e-03, p_rgh 3.2e-03, U 2.7e-03. Its control for the scheme is the Euler, one-corrector explicit run.
+"$BIN" "$W/explicitCNOuter" "$W/explicitCNOuter/0" "$W/explicitCNOuter/$END" "$STEPS" \
+       "$W/explicitCNOuter/log.interFoam" "$W/explicitMules/$END" explicitCNOuter || rc=1
+BRAE_CONTROL_DEVICE_PAIR_DONOR_RAW_PHI=1 "$BIN" "$W/explicitCNOuter" "$W/explicitCNOuter/0" \
+    "$W/explicitCNOuter/$END" "$STEPS" "$W/explicitCNOuter/log.interFoam" "$W/explicitMules/$END" \
+    explicitCNOuter > "$W/explicitCNOuter.control.log" 2>&1
+xrc=$?
+sed -n '/^  device alpha:\|^  device p_rgh:\|^  device U:/p' "$W/explicitCNOuter.control.log" | sed 's/^/  CONTROL/'
+if [ $xrc -ne 0 ] \
+    && grep -q "CONTROL MODE: the pair's bounded flux is built from its raw flux" "$W/explicitCNOuter.control.log" \
+    && grep -q "FAIL: the device's alpha agrees with OpenFOAM's absolutely" "$W/explicitCNOuter.control.log" \
+    && ! grep -q "FAIL: alpha agrees with OpenFOAM's absolutely" "$W/explicitCNOuter.control.log"; then
+    echo "  ok:   CONTROL  the pair's raw flux in the bounded flux: the device arm fails, the host's does not"
+else
+    echo "  FAIL: CONTROL  the pair's raw flux in the bounded flux did not fail the device arm alone (exit $xrc)"
+    rc=1
+fi
+if [ $crc -ne 0 ] \
+    && grep -q "CONTROL MODE: the alpha pre-solve convects across the pair with its raw flux" \
+            "$W/sstCNOuter.control.log" \
+    && grep -q "FAIL: the device's alpha agrees with OpenFOAM's absolutely" "$W/sstCNOuter.control.log" \
+    && grep -q "FAIL: the device's U agrees with OpenFOAM's relatively" "$W/sstCNOuter.control.log" \
+    && ! grep -q "FAIL: alpha agrees with OpenFOAM's absolutely" "$W/sstCNOuter.control.log"; then
+    echo "  ok:   CONTROL  the pair's raw flux in the pre-solve: the device arm fails alpha and U, the host's not"
+else
+    echo "  FAIL: CONTROL  the pair's raw flux in the pre-solve did not fail the device arm alone (exit $crc)"
+    rc=1
+fi
 # ...and the LIMITED schemes across the pair, which nothing else here exercises: `Gauss limitedLinear
 # 1` for k and omega (the limiter's own gradient) and `cellLimited Gauss linear 1` on grad(k) and
 # grad(omega) (the limiter's range). Its control is the same case with the pair two walls.

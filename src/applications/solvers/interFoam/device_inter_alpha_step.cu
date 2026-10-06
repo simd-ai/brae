@@ -278,9 +278,22 @@ void deviceInterAlphaStep(
             }
             hooks.divCoeffs(alpha, iC, bC, (li.phiCNBnd != li.phiBnd) ? li.phiCNBnd : nullptr);
             DeviceSolverPerf pre;
+            // the pair's convecting flux is phiCN's (alphaEqn.H:110-115), handed in beside the interior's
+            //   BRAE_CONTROL_DEVICE_PAIR_PRESOLVE_RAW_PHI=1: a gate's CONTROL, deliberately wrong -- the
+            //     pair's own flux, as before 2026-10-06
+            static const bool preRawPhi = std::getenv("BRAE_CONTROL_DEVICE_PAIR_PRESOLVE_RAW_PHI") != nullptr;
+            const bool pairHere = li.cyc && li.cyc->n > 0;
+            static bool saidPreRaw = false;
+            if (preRawPhi && pairHere && !saidPreRaw)
+            {
+                saidPreRaw = true;
+                std::printf("  *** CONTROL MODE: the alpha pre-solve convects across the pair with its raw flux, "
+                            "not phiCN. This run is deliberately wrong. ***\n");
+            }
             deviceAlphaPreSolve(dm, alpha, subOld, *li.phiCNInt, iC, bC, dtSub, ctl.preSolve,
                                 alphaPhiInt, alphaPhiBnd, &pre, li.cyc, li.alphaPhiIf,
-                                li.Vsc, li.Vsc0, li.rDeltaT);
+                                li.Vsc, li.Vsc0, li.rDeltaT,
+                                (preRawPhi && pairHere) ? &li.cyc->phi : li.phiCNIf);
             if (ctl.preSolveLog)
             {
                 ctl.preSolveLog->push_back(pre);

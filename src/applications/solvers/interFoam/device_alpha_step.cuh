@@ -74,7 +74,9 @@ struct DeviceAlphaStepInput
     const DeviceBuffer<scalar>* phiCNBnd  = nullptr;
 
     // THE MESH'S PERIODIC PAIR, whose faces are in neither list above. `cyc->phi` holds the pair's
-    // VOLUMETRIC flux; phiCNIf its off-centred twin; alphaPhiIf is the alpha flux there, in on the
+    // VOLUMETRIC flux; phiCNIf its off-centred twin, REQUIRED with a pair -- the bounded flux of the
+    // explicit solve, the pre-solve's convection and its flux out, and rhoPhi all read it (the first three
+    // read cyc->phi until 2026-10-06); alphaPhiIf is the alpha flux there, in on the
     // MULESCorr path (the pre-solve's) and out on every path. Every kernel these reach is gated
     // against the host in tests/test_device_mules_cyclic_vs_host.cu and
     // tests/test_device_cyclic_laplacian_vs_host.cu.

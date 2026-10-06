@@ -626,13 +626,20 @@ void deviceMulesDonorFlux(
 
 void deviceMulesDonorFluxCyclic(
     const DeviceCyclic&         cyc,
+    const DeviceBuffer<scalar>& phiIf,
     const DeviceBuffer<scalar>& psi,
     DeviceBuffer<scalar>&       phiBDIf)
 {
     if (cyc.n == 0) { phiBDIf.resize(0); return; }
+    if (static_cast<int>(phiIf.size()) != cyc.n)
+    {
+        throw std::runtime_error(
+            "brae device MULES: the bounded flux on a coupled pair needs the flux it is upwind of, one value a "
+            "pair face (" + std::to_string(cyc.n) + "); the caller handed " + std::to_string(phiIf.size()) + ".");
+    }
     phiBDIf.resize(static_cast<std::size_t>(cyc.n));
     donorCyclicKernel<<<nBlocks(cyc.n), TPB>>>(
-        cyc.ownCell.data(), cyc.nbr(), cyc.phi.data(), psi.data(), cyc.n, phiBDIf.data());
+        cyc.ownCell.data(), cyc.nbr(), phiIf.data(), psi.data(), cyc.n, phiBDIf.data());
     ckM(cudaGetLastError(), "donor flux, interface");
 }
 

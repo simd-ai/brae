@@ -21,9 +21,8 @@
 # at maxDeltaT), every one OpenFOAM's bits.
 # The CONTROL puts 1e-37 back (BRAE_CONTROL_DELTAT_SMALL_FLOAT=1): steps must then differ from the log in both
 # functions, and the largest gap is printed.
-# DOES NOT CLAIM: setInitialDeltaT.H by a run -- its cases are worked from the source, and NEITHER interFoam
-# loop calls it yet (interFoam.C:81-85 does, before the loop: a start that has a flux, or a write cadence
-# deltaT does not divide, can take another first step there). That brae's own run takes OpenFOAM's steps to
+# DOES NOT CLAIM: setInitialDeltaT.H by a run -- its cases are worked from the source here; that the loops
+# make it where interFoam.C:81-85 does is clock/initial_deltat.sh's. That brae's own run takes OpenFOAM's steps to
 # the bit -- its Courant numbers are its own flux's. The rounding of `1 + 0.1*maxDeltaTFact` by measurement:
 # it is a fused multiply-add in this machine's interFoam (read from the binary, time_controls.cuh) and is
 # written as one here, but the logs hold two damped steps, too few to tell a fused sum from a rounded one.

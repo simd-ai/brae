@@ -459,8 +459,13 @@ void deviceCyclicAssembleLaplacian(DeviceCyclic& cyc, const DeviceBuffer<scalar>
 
 // upwind convection on the interface: diag[own] += max(phi,0), ifCoeff[j] += min(phi,0). Adds to the existing
 // ifCoeff (call AFTER deviceCyclicAssembleLaplacian) so Apsi[own] += ifCoeff*psi[nbr] carries div-laplacian.
-void deviceCyclicAddConvection(DeviceCyclic& cyc, DeviceBuffer<scalar>& diag,
-                               const DeviceBuffer<scalar>* wsch = nullptr);
+// `phiIf` is the CONVECTING flux on the pair's faces, the caller's (deviceCyclicAssembleMomentum's form): the
+// alpha pre-solve convects with phiCN, which is not cyc.phi under CrankNicolson. No default.
+void deviceCyclicAddConvection(
+    DeviceCyclic& cyc,
+    const DeviceBuffer<scalar>& phiIf,
+    DeviceBuffer<scalar>& diag,
+    const DeviceBuffer<scalar>* wsch = nullptr);
 
 // MOMENTUM matrix interface coupling M = div(phi,U) - laplacian(nuEff,U) (cyc.phi must hold the current flux):
 //   ifCoeff[j] = -(nuFace*dc*magSf) + min(phi,0)            (off-diagonal, used in deviceAmul)

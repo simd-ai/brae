@@ -488,8 +488,22 @@ scalar deviceInterPressureStep(
                 relTol = knobs.dicInnerRelTol;
             }
             const bool graph = knobs.graph && !(in.cyc && in.cyc->n > 0);
+            // EXPERIMENT (AmgPcgKnobs::finalTolFactor): the Final solve's tolerance scaled
+            scalar tolUsed = tol;
+            if (finalPass && knobs.finalTolFactor != scalar(1))
+            {
+                static bool factorAnnounced = false;
+                if (!factorAnnounced)
+                {
+                    factorAnnounced = true;
+                    std::printf("  p_rgh EXPERIMENT: the Final solve's tolerance %g is taken as %g on the AMG-PCG "
+                                "(BRAE_EXPERIMENT_PRESSURE_FINAL_TOL_FACTOR)\n", static_cast<double>(tol),
+                                static_cast<double>(tol*knobs.finalTolFactor));
+                }
+                tolUsed = tol*knobs.finalTolFactor;
+            }
             timedPart.emplace("pressure: the AMG-PCG iterations");
-            perf = deviceAMGPCG(A, amg, b, p_rgh, nf, tol, relTol, maxIter, graph, knobs.checkEvery,
+            perf = deviceAMGPCG(A, amg, b, p_rgh, nf, tolUsed, relTol, maxIter, graph, knobs.checkEvery,
                                 knobs.corrScaling, minIter);
             timedPart.reset();
         }
@@ -747,6 +761,19 @@ const AmgPcgKnobs& amgPcgKnobs()
                     + "`; it is `case` or a relative tolerance that is not negative.");
             }
             k.dicInnerRelTol = static_cast<scalar>(cap);
+        }
+        const char* finalFactor = std::getenv("BRAE_EXPERIMENT_PRESSURE_FINAL_TOL_FACTOR");
+        if (finalFactor)
+        {
+            char* end = nullptr;
+            const double fac = std::strtod(finalFactor, &end);
+            if (end == finalFactor || *end != '\0' || !(fac > 0.0) || fac > 1.0)
+            {
+                throw std::runtime_error(
+                    "brae interFoam: BRAE_EXPERIMENT_PRESSURE_FINAL_TOL_FACTOR is `" + std::string(finalFactor)
+                    + "`; it is a factor in (0, 1].");
+            }
+            k.finalTolFactor = static_cast<scalar>(fac);
         }
         return k;
     }();

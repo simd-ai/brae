@@ -29,10 +29,12 @@
 # (BRAE_CONTROL_NHAT_SUBSET_SHORT=1) -- under the check the run must stop at a patch face; without it the run
 # must finish and write other files; and the whole-gradient form handing back its first call's normal
 # (BRAE_CONTROL_NHAT_WHOLE_GRADIENT_STALE=1) must stop under the check.
-# DOES NOT CLAIM a least-squares nHat on a mesh with a coupled pair (no shipped case; tests/test_grad_subset.cu,
-# which holds the subset gradient itself cell for cell, has no pair either). The restaged rows are brae against
-# brae: their oracle is the whole-curvature arm, not an OpenFOAM run (the W rows' OpenFOAM runs are staged and
-# not read). That the whole-mesh gradient functions still return what they did before they were made to take
+# DOES NOT CLAIM a least-squares nHat on a mesh with a coupled pair: the solver refuses that combination by
+# name (inter_case_cpp.cu; the arm baffle_leastSquaresNHat of tests/interfoam_refusals.sh), and the subset
+# form's coupled branches are held to the whole-mesh ones by tests/test_grad_subset_coupled.cu. The restaged
+# rows are brae against brae: their oracle is the whole-curvature arm, not an OpenFOAM run (the W rows' OpenFOAM
+# runs are staged and not read). That the whole-mesh gradient functions still return what they did before
+# they were made to take
 # a subset: the host arm of electrostaticDeposition's row wrote byte-identical files before and after (32
 # files, recorded in PORT.md, made once by hand), and tests/test_grad_subset.cu holds subset = whole; their
 # gates against OpenFOAM (leastsquares_grad_vs_openfoam, celllimited_vs_openfoam) have bounds and would not
