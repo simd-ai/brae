@@ -70,6 +70,22 @@ inline scalar timeControlSmall()
     return floatBuilds ? scalar(1.0e-37) : scalar(1.0e-15);
 }
 
+// setDeltaT.H's cap on a step's growth: deltaTFact = min(min(maxDeltaTFact, 1 + 0.1*maxDeltaTFact), 1.2).
+//   BRAE_CONTROL_DELTAT_GROWTH_UNCAPPED=1   a gate's CONTROL, deliberately wrong: the 1.2 is left out, so a
+//                                           run that starts at rest takes maxDeltaT at its first step
+inline scalar timeControlGrowthCap()
+{
+    static const bool uncapped = std::getenv("BRAE_CONTROL_DELTAT_GROWTH_UNCAPPED") != nullptr;
+    static bool said = false;
+    if (uncapped && !said)
+    {
+        said = true;
+        std::printf("  *** CONTROL MODE: the time-step control leaves out setDeltaT.H's cap of 1.2 on a step's "
+                    "growth. This run is deliberately wrong. ***\n");
+    }
+    return uncapped ? timeControlGreat : scalar(1.2);
+}
+
 struct TimeControls
 {
     bool adjustTimeStep = false;
@@ -159,7 +175,7 @@ inline scalar setDeltaT(scalar deltaT, scalar CoNum, const TimeControls& tc)
     const scalar kSmall = timeControlSmall();
     const scalar maxDeltaTFact = tc.maxCo/(CoNum + kSmall);
     const scalar damped = std::fma(scalar(0.1), maxDeltaTFact, scalar(1));
-    const scalar deltaTFact = std::min(std::min(maxDeltaTFact, damped), scalar(1.2));
+    const scalar deltaTFact = std::min(std::min(maxDeltaTFact, damped), timeControlGrowthCap());
     return std::min(deltaTFact*deltaT, tc.maxDeltaT);
 }
 
@@ -386,7 +402,7 @@ inline scalar setDeltaTVoF(
     const scalar maxDeltaTFact = std::min(tc.base.maxCo/(CoNum + kSmall),
                                           tc.maxAlphaCo/(alphaCoNum + kSmall));
     const scalar damped = std::fma(scalar(0.1), maxDeltaTFact, scalar(1));
-    const scalar deltaTFact = std::min(std::min(maxDeltaTFact, damped), scalar(1.2));
+    const scalar deltaTFact = std::min(std::min(maxDeltaTFact, damped), timeControlGrowthCap());
     const scalar dt = std::min(deltaTFact*deltaT, tc.base.maxDeltaT);
     return w ? adjustDeltaT(dt, tSinceStart, *w) : dt;
 }
