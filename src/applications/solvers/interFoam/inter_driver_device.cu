@@ -7174,6 +7174,12 @@ RunReport runInterFoamDevice(
                         static_cast<double>(pool.mallocBytes() - pool.freedBytes() - pool.heldBytes())/1048576.0);
         }
     }
+    // the last time directory may still be on its way to the disk (InterWriter::write): the run ends with it
+    if (writer)
+    {
+        interPhase::Nested timed("write: waiting for the last write at the end of the run");
+        writer->finish();
+    }
     interPhase::report(static_cast<long>(rep.steps));
     return rep;
 }

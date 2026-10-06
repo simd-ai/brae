@@ -2045,6 +2045,11 @@ RunReport runInterFoam(
         }
     }
     if (fieldsOut) *fieldsOut = std::move(f);
+    // the last time directory may still be on its way to the disk (InterWriter::write): the run ends with it
+    if (writer)
+    {
+        writer->finish();
+    }
     return rep;
 }
 

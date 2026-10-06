@@ -8,18 +8,25 @@
 #include "dynamic_motion_solver_fv_mesh_cpp.cuh"
 #include "foam_token_reader.cuh"
 #include "brae_notice.cuh"
+#include "inter_phase_time.cuh"
 #include <zlib.h>
+#include <algorithm>
+#include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <limits>
+#include <optional>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <type_traits>
 
 namespace brae {
@@ -82,6 +89,84 @@ void keyword(
     os << std::string(static_cast<std::size_t>(pad), ' ');
 }
 
+// A LONG LIST'S LINES ARE NOT FORMATTED WHERE THE FILE IS BUILT (2026-10-06). The numbers were formatted one
+// ostringstream each on the solver's thread, inside the step: MEASURED on laminar/waves/waveMakerPiston (56,000
+// cells, 16 MB of ASCII in 12 files), 386 ms a write, seven time steps' worth. While write() builds a time
+// directory (`deferring` set), a list in the many-line form leaves a marker in the text and a COPY of its
+// values here; flushJob renders the copies with the same `fmt` on another thread and puts the lines where the
+// markers are. The copy is what makes that safe: the solver overwrites its fields in the next step.
+struct DeferredList
+{
+    std::vector<scalar> scalars;
+    std::vector<vector> vectors;
+    // BRAE_CONTROL_WRITE_ALPHA_ALIASED: the caller's own list and no copy -- a gate's CONTROL, deliberately wrong
+    const std::vector<scalar>* aliased = nullptr;
+    bool isVector = false;
+    int precision = 0;
+};
+struct DeferredLists
+{
+    std::vector<DeferredList> lists;
+    const std::vector<scalar>* alias = nullptr;
+};
+thread_local DeferredLists* deferring = nullptr;
+// a marker is \x01, the list's index, \x02: bytes no formatter here writes
+constexpr char kMarkerOpen = '\x01';
+constexpr char kMarkerClose = '\x02';
+
+// one line a value, as the many-line form has them: the values [from, to)
+template <typename T>
+void listLines(
+    std::string& out,
+    const std::vector<T>& values,
+    std::size_t from,
+    std::size_t to,
+    int precision)
+{
+    for (std::size_t i = from; i < to; ++i)
+    {
+        out += fmt(values[i], precision);
+        out += '\n';
+    }
+}
+
+// the lines of `values` left for later: false when nothing is deferring, and the caller writes them itself
+bool deferLines(
+    std::ostringstream& os,
+    const std::vector<scalar>& values,
+    int precision)
+{
+    if (!deferring) return false;
+    os << kMarkerOpen << deferring->lists.size() << kMarkerClose;
+    DeferredList d;
+    d.precision = precision;
+    if (deferring->alias == &values)
+    {
+        d.aliased = &values;
+    }
+    else
+    {
+        d.scalars = values;
+    }
+    deferring->lists.push_back(std::move(d));
+    return true;
+}
+
+bool deferLines(
+    std::ostringstream& os,
+    const std::vector<vector>& values,
+    int precision)
+{
+    if (!deferring) return false;
+    os << kMarkerOpen << deferring->lists.size() << kMarkerClose;
+    DeferredList d;
+    d.precision = precision;
+    d.isVector = true;
+    d.vectors = values;
+    deferring->lists.push_back(std::move(d));
+    return true;
+}
+
 // Field::writeEntry (Field.C:727-748): `uniform v` when every entry compares equal (UList::uniform, which
 // needs at least one), else `nonuniform List<T> ` and the list -- one line of ten or fewer, else the count,
 // the values one per line at column zero, and the closing parenthesis on its own line before the `;`.
@@ -120,9 +205,12 @@ void listEntry(
         return;
     }
     os << "\n" << values.size() << "\n(\n";
-    for (const T& v : values)
+    if (!deferLines(os, values, precision))
     {
-        os << fmt(v, precision) << "\n";
+        for (const T& v : values)
+        {
+            os << fmt(v, precision) << "\n";
+        }
     }
     os << ")\n;\n";
 }
@@ -1491,6 +1579,8 @@ bool InterWriter::isWriteTime(
 
 void InterWriter::stepTaken(scalar deltaT)
 {
+    // a write that failed behind the last steps stops the run here, at the first step boundary after it ended
+    pollWrite();
     // Time::operator++ (Time.C:1059-1060): deltaT0_ = deltaTSave_; deltaTSave_ = deltaT_
     deltaT0_ = deltaTSave_;
     deltaTSave_ = deltaT;
@@ -1588,14 +1678,16 @@ void InterWriter::emit(
     pending_.push_back(PendingFile{path, text, compressible});
 }
 
-void InterWriter::writeFile(
+namespace {
+
+// one file onto the disk; `gz`: the run compresses and this file is one OpenFOAM compresses
+void writeFileTo(
     const std::string& path,
     const std::string& text,
-    bool compressible) const
+    bool gz)
 {
     // fstreamPointers.C:147-170: a compressed write goes to <file>.gz and removes the plain file, and the
     // other way round, so a directory never holds both
-    const bool gz = compress_ && compressible;
     const std::string target = gz ? path + ".gz" : path;
     std::error_code ec;
     fs::remove(gz ? path : path + ".gz", ec);
@@ -1619,6 +1711,233 @@ void InterWriter::writeFile(
     if (!out)
     {
         throw std::runtime_error("brae interFoam writer: cannot write " + target);
+    }
+}
+
+}   // namespace
+
+void InterWriter::writeFile(
+    const std::string& path,
+    const std::string& text,
+    bool compressible) const
+{
+    writeFileTo(path, text, compress_ && compressible);
+}
+
+// WHAT A WRITE LEAVES FOR THE OTHER THREAD: the files' text with a marker where each long list goes, the
+// lists' values (copies -- see DeferredList), and the directories purgeWrite removes once the files exist.
+// Nothing in it points into the solver's state or the writer's.
+struct InterWriter::Job
+{
+    struct File
+    {
+        std::string path;
+        std::string text;
+        bool gz = false;
+    };
+    std::string dir;
+    std::vector<File> files;
+    std::vector<DeferredList> lists;
+    std::vector<std::string> remove;
+    // how many threads render the lists: 1 inside the step (the old path), several behind it
+    unsigned threads = 1;
+};
+
+namespace {
+
+// the job, run: each list rendered (the same `fmt` the in-step path uses, value by value), each file's
+// markers replaced, then the directory -- which appears only now, every file of it built -- and the removals
+template <typename JobT>
+std::pair<double, double> flushJob(JobT& job)
+{
+    const auto t0 = std::chrono::steady_clock::now();
+    // THE LISTS ARE RENDERED IN PIECES, SIDE BY SIDE. A piece is a run of one list's values and its text is
+    // those values' lines, whoever renders it and when; a list's text is its pieces in order. MEASURED with one
+    // thread: 370 ms a write on waveMakerPiston (56,000 cells) and 2.7 s on RAS/DTCHull (845,536), against
+    // steps of 54 and 330 ms -- a write still in flight when the next one came made the solver wait.
+    struct Piece
+    {
+        std::size_t list = 0;
+        std::size_t from = 0;
+        std::size_t to = 0;
+        std::string text;
+    };
+    constexpr std::size_t kPieceValues = 16384;
+    std::vector<Piece> pieces;
+    for (std::size_t i = 0; i < job.lists.size(); ++i)
+    {
+        const DeferredList& d = job.lists[i];
+        const std::size_t n = d.isVector ? d.vectors.size() : (d.aliased ? d.aliased->size() : d.scalars.size());
+        for (std::size_t from = 0; from < n; from += kPieceValues)
+        {
+            pieces.push_back(Piece{i, from, std::min(n, from + kPieceValues), std::string()});
+        }
+    }
+    std::atomic<std::size_t> nextPiece{0};
+    std::exception_ptr failed;
+    std::atomic<bool> anyFailed{false};
+    const auto renderPieces = [&]()
+    {
+        try
+        {
+            for (std::size_t k = nextPiece.fetch_add(1); k < pieces.size(); k = nextPiece.fetch_add(1))
+            {
+                Piece& p = pieces[k];
+                const DeferredList& d = job.lists[p.list];
+                if (d.isVector)
+                {
+                    listLines(p.text, d.vectors, p.from, p.to, d.precision);
+                }
+                else
+                {
+                    listLines(p.text, d.aliased ? *d.aliased : d.scalars, p.from, p.to, d.precision);
+                }
+            }
+        }
+        catch (...)
+        {
+            if (!anyFailed.exchange(true))
+            {
+                failed = std::current_exception();
+            }
+        }
+    };
+    {
+        std::vector<std::thread> others;
+        for (unsigned t = 1; t < job.threads && t < pieces.size(); ++t)
+        {
+            others.emplace_back(renderPieces);
+        }
+        renderPieces();
+        for (std::thread& t : others)
+        {
+            t.join();
+        }
+    }
+    if (anyFailed)
+    {
+        std::rethrow_exception(failed);
+    }
+    std::vector<std::string> rendered(job.lists.size());
+    for (Piece& p : pieces)
+    {
+        rendered[p.list] += p.text;
+        p.text = std::string();
+    }
+    std::vector<int> used(job.lists.size(), 0);
+    for (auto& f : job.files)
+    {
+        if (f.text.find(kMarkerOpen) == std::string::npos) continue;
+        std::string out;
+        std::size_t at = 0;
+        while (true)
+        {
+            const std::size_t open = f.text.find(kMarkerOpen, at);
+            if (open == std::string::npos)
+            {
+                out.append(f.text, at, std::string::npos);
+                break;
+            }
+            const std::size_t close = f.text.find(kMarkerClose, open);
+            const std::size_t index = close == std::string::npos
+                                    ? job.lists.size()
+                                    : static_cast<std::size_t>(std::strtoul(f.text.c_str() + open + 1, nullptr, 10));
+            if (index >= job.lists.size())
+            {
+                throw std::runtime_error("brae interFoam writer: " + f.path + " holds a list marker with no list");
+            }
+            out.append(f.text, at, open - at);
+            out += rendered[index];
+            ++used[index];
+            at = close + 1;
+        }
+        f.text.swap(out);
+    }
+    for (std::size_t i = 0; i < used.size(); ++i)
+    {
+        // a list built and not written, or written twice, is a file that is not what write() built
+        if (used[i] != 1)
+        {
+            throw std::runtime_error("brae interFoam writer: list " + std::to_string(i) + " of " + job.dir
+                                     + " went into " + std::to_string(used[i]) + " places, not one");
+        }
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+    // BRAE_CONTROL_WRITE_FAIL_IN_BACKGROUND=1 fails here, every file built and none written -- the gate
+    // asserts the run stops, says so, and leaves no time directory
+    if (std::getenv("BRAE_CONTROL_WRITE_FAIL_IN_BACKGROUND") != nullptr)
+    {
+        throw std::runtime_error("brae interFoam writer: BRAE_CONTROL_WRITE_FAIL_IN_BACKGROUND fails " + job.dir
+                                 + " with its " + std::to_string(job.files.size()) + " files built");
+    }
+    // every file is built: only now does the time directory appear
+    for (const auto& f : job.files)
+    {
+        std::error_code ec;
+        fs::create_directories(fs::path(f.path).parent_path(), ec);
+        if (ec)
+        {
+            throw std::runtime_error("brae interFoam writer: cannot create the directory of " + f.path + ": "
+                                     + ec.message());
+        }
+        writeFileTo(f.path, f.text, f.gz);
+    }
+    for (const std::string& d : job.remove)
+    {
+        std::error_code rec;
+        fs::remove_all(d, rec);
+    }
+    const auto t2 = std::chrono::steady_clock::now();
+    return {std::chrono::duration<double>(t1 - t0).count(), std::chrono::duration<double>(t2 - t1).count()};
+}
+
+}   // namespace
+
+// the write in flight, waited for: its times to the phase table, its exception to the caller
+void InterWriter::settle()
+{
+    if (held_)
+    {
+        // (the aliased control: the job runs here, on the solver's thread, when the NEXT write or the end of
+        // the run waits for it -- steps after it was built)
+        const std::shared_ptr<Job> job = std::move(held_);
+        held_.reset();
+        flushJob(*job);
+    }
+    if (!inFlight_.valid()) return;
+    const BackgroundTimes t = inFlight_.get();
+    interPhase::charge("write (background, not the step's time): the lists formatted", t.lists, 1);
+    interPhase::charge("write (background, not the step's time): the files to disk", t.disk, 1);
+}
+
+// ...and without waiting: only where it has ended (the control's held job stays held until something waits)
+void InterWriter::pollWrite()
+{
+    if (inFlight_.valid() && inFlight_.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
+    {
+        settle();
+    }
+}
+
+void InterWriter::finish()
+{
+    settle();
+}
+
+InterWriter::~InterWriter()
+{
+    try
+    {
+        settle();
+    }
+    catch (const std::exception& e)
+    {
+        // a loop that returned without finish(), or one already unwinding: said, never dropped
+        std::fprintf(stderr, "brae interFoam writer: a time directory was not written: %s\n", e.what());
+        if (std::uncaught_exceptions() == 0)
+        {
+            std::terminate();
+        }
     }
 }
 
@@ -1890,6 +2209,46 @@ void InterWriter::write(const InterWriteState& s)
         throw std::runtime_error("brae interFoam writer: a field the time directory needs was not handed in.");
     }
 
+    // ONE WRITE AT A TIME: the one before is waited for (and what it threw is thrown here), so the directories
+    // appear in order and no more than one time's text is ever held
+    static const bool inStep = std::getenv("BRAE_CONTROL_WRITE_IN_STEP") != nullptr;
+    // BRAE_CONTROL_WRITE_ALPHA_ALIASED=1 is a gate's CONTROL, deliberately wrong, where the loop hands alpha's
+    // own cells (the host loop; the device loop hands a download that is gone a step later, and is left alone):
+    // alpha's list is NOT copied and the job is run when the next write waits for it, so the file holds a
+    // later step's alpha -- what a background write without its copies would do, made repeatable
+    static const bool aliasControl = std::getenv("BRAE_CONTROL_WRITE_ALPHA_ALIASED") != nullptr;
+    {
+        interPhase::Nested waited("write: waiting for the write before");
+        settle();
+    }
+    static bool said = false;
+    if (!said)
+    {
+        said = true;
+        std::printf(inStep
+            ? "  write: a time directory is formatted and written inside the step (BRAE_CONTROL_WRITE_IN_STEP)\n"
+            : "  write: a time directory's long lists are formatted and its files written in the background, "
+              "while the next steps run; BRAE_CONTROL_WRITE_IN_STEP=1 does both inside the step\n");
+        if (aliasControl && !inStep)
+        {
+            std::printf("  *** CONTROL MODE: alpha's list is not copied for the background write, which is made "
+                        "at the next write. This run is deliberately wrong. ***\n");
+        }
+    }
+    DeferredLists lists;
+    const bool alphaIsLive = !s.alpha1Cells || s.alpha1Cells == &s.alpha1->internal;
+    lists.alias = (aliasControl && !inStep && alphaIsLive) ? &s.alpha1->internal : nullptr;
+    struct StopDeferring
+    {
+        ~StopDeferring()
+        {
+            deferring = nullptr;
+        }
+    } stopDeferring;
+    deferring = inStep ? nullptr : &lists;
+    std::optional<interPhase::Nested> built;
+    built.emplace("write: the files built (their long lists copied, not formatted)");
+
     // Time::operator++'s precision raise (Time.C:1189-1266): the name must read back as the previous time
     // plus the step, to within 10^-precision (or a tenth of the step, or SMALL)
     std::string name = timeName(s.time, timePrecision_);
@@ -2157,9 +2516,12 @@ void InterWriter::write(const InterWriteState& s)
         std::ostringstream os;
         os << header("vectorField", name + "/polyMesh", "points") << "\n";
         os << s.points->size() << "\n(\n";
-        for (const vector& x : *s.points)
+        if (!deferLines(os, *s.points, precision_))
         {
-            os << fmt(x, precision_) << "\n";
+            for (const vector& x : *s.points)
+            {
+                os << fmt(x, precision_) << "\n";
+            }
         }
         os << ")\n\n\n// ************************************************************************* //\n";
         emit(dir + "/polyMesh/points", os.str(), true);
@@ -2522,9 +2884,12 @@ void InterWriter::write(const InterWriteState& s)
                 std::ostringstream os;
                 os << header("vectorField", pm, "points") << "\n";
                 os << m->nPoints() << "\n(\n";
-                for (const vector& x : m->points())
+                if (!deferLines(os, m->points(), precision_))
                 {
-                    os << fmt(x, precision_) << "\n";
+                    for (const vector& x : m->points())
+                    {
+                        os << fmt(x, precision_) << "\n";
+                    }
                 }
                 os << ")\n" << end;
                 emit(dir + "/polyMesh/points", os.str(), true);
@@ -2538,9 +2903,12 @@ void InterWriter::write(const InterWriteState& s)
                 std::ostringstream os;
                 os << header("vectorField", pm, "points0") << "\n";
                 os << s.points0->size() << "\n(\n";
-                for (const vector& x : *s.points0)
+                if (!deferLines(os, *s.points0, precision_))
                 {
-                    os << fmt(x, precision_) << "\n";
+                    for (const vector& x : *s.points0)
+                    {
+                        os << fmt(x, precision_) << "\n";
+                    }
                 }
                 os << ")\n" << end;
                 emit(dir + "/polyMesh/points0", os.str(), true);
@@ -2911,29 +3279,50 @@ void InterWriter::write(const InterWriteState& s)
                                  + " after building its " + std::to_string(pending_.size()) + " files");
     }
 
-    // every file is built: only now does the time directory appear
-    for (const PendingFile& pf : pending_)
+    // every file is built. The job takes them, the lists' copies, and purgeWrite's removals (TimeIO.C:559-582:
+    // the directories this run wrote, oldest removed past the limit, after this one is written; the start
+    // directory and anything from before the run are never touched)
+    deferring = nullptr;
+    built.reset();
+    const std::shared_ptr<Job> job = std::make_shared<Job>();
+    job->dir = dir;
+    job->lists = std::move(lists.lists);
+    for (PendingFile& pf : pending_)
     {
-        std::error_code ec;
-        fs::create_directories(fs::path(pf.path).parent_path(), ec);
-        if (ec)
-        {
-            throw std::runtime_error("brae interFoam writer: cannot create the directory of " + pf.path + ": "
-                                     + ec.message());
-        }
-        writeFile(pf.path, pf.text, pf.compressible);
+        job->files.push_back(Job::File{std::move(pf.path), std::move(pf.text), compress_ && pf.compressible});
     }
     pending_.clear();
-
-    // purgeWrite (TimeIO.C:559-582): the directories this run wrote, oldest removed past the limit; the
-    // start directory and anything from before the run are never touched
     written_.push_back(name);
     while (purge_ > 0 && static_cast<int>(written_.size()) > purge_)
     {
-        std::error_code rec;
-        fs::remove_all(caseDir_ + "/" + written_.front(), rec);
+        job->remove.push_back(caseDir_ + "/" + written_.front());
         written_.pop_front();
     }
+    if (inStep)
+    {
+        interPhase::Nested disk("write: the lists formatted and the files to disk, inside the step");
+        flushJob(*job);
+        return;
+    }
+    // BRAE_WRITE_THREADS=<n>: how many threads render the lists behind the solver (default: half the cores,
+    // eight at most; 1 renders them one after another)
+    {
+        const char* asked = std::getenv("BRAE_WRITE_THREADS");
+        const unsigned half = std::max(1u, std::thread::hardware_concurrency()/2);
+        job->threads = asked ? static_cast<unsigned>(std::max(1, std::atoi(asked))) : std::min(8u, half);
+    }
+    if (lists.alias)
+    {
+        held_ = job;
+        return;
+    }
+    inFlight_ = std::async(
+        std::launch::async,
+        [job]()
+        {
+            const std::pair<double, double> t = flushJob(*job);
+            return BackgroundTimes{t.first, t.second};
+        });
 }
 
 void registerUnwritten(

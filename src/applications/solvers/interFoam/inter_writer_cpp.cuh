@@ -29,7 +29,9 @@
 #include "fvc.cuh"
 #include "geometric_field.cuh"
 #include <deque>
+#include <future>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -202,8 +204,18 @@ public:
     // :552-558). Called there by both loops; once.
     void noteAlphaOldCreation(const GeometricField<scalar>& alpha1);
 
-    // One time directory.
+    // One time directory. THE STEP PAYS FOR BUILDING IT, NOT FOR FORMATTING ITS NUMBERS OR FOR THE DISK: every
+    // file's structure is built here, from the solver's fields as they stand, with each long list of numbers
+    // COPIED and left as a marker; the lists' text, the files and purgeWrite's removals are a job that runs on
+    // another thread while the next steps do (inter_writer_cpp.cu, flushJob). One job at a time: a write waits
+    // for the one before. A job that throws stops the run at the next step boundary that finds it ended, at
+    // the next write, or at finish(), whichever comes first.
+    //   BRAE_CONTROL_WRITE_IN_STEP=1: everything inside the step, as before -- the identity gate's other arm
     void write(const InterWriteState& s);
+    // The write in flight, waited for; what it threw, thrown here. Both time loops call it before they return:
+    // a run has not ended while a time directory is still being written.
+    void finish();
+    ~InterWriter();
 
     // the directories written so far, oldest first (the purgeWrite FIFO)
     const std::deque<std::string>& written() const { return written_; }
@@ -300,6 +312,18 @@ private:
         bool compressible = false;
     };
     mutable std::vector<PendingFile> pending_;
+
+    // the write in flight (its two times come back for the phase table), and the control's held one
+    struct BackgroundTimes
+    {
+        double lists = 0;
+        double disk = 0;
+    };
+    struct Job;
+    std::future<BackgroundTimes> inFlight_;
+    std::shared_ptr<Job> held_;
+    void settle();
+    void pollWrite();
 
     std::vector<std::pair<std::string, std::string>> refused_;
     std::map<std::string, Template> templates_;
