@@ -35,6 +35,9 @@ namespace brae {
 struct DevicePatchWave
 {
     bool built = false;
+    // the sweeps the last call took, FaceCellWave::iterate's count: with the cell count it is the front's mean
+    // width, which is what decides whether this wave or the host's is the faster (inter_driver_device.cu)
+    label sweeps = 0;
     label nC = 0;
     label nF = 0;
     label nIf = 0;

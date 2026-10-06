@@ -1066,6 +1066,7 @@ void devicePatchWave(
     {
         throw std::runtime_error(std::string(WHO) + "Maximum number of iterations reached. Increase maxIter.");
     }
+    w.sweeps = iter;
     part.emplace("wave: the squared distances down");
     cellDistSqr.resize(static_cast<std::size_t>(nC));
     boundaryDistSqr.resize(static_cast<std::size_t>(nF - nIf));

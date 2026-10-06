@@ -741,21 +741,37 @@ RunReport runInterFoamDevice(
     // patch distance at every step, and its FaceCellWave runs on the device in the host's order
     // (devicePatchWave), bit for bit. MEASURED on waveMakerPiston refined to 896,000 cells: 804 ms a step with
     // the host wave. BRAE_CONTROL_PATCH_WAVE_HOST=1 keeps the host wave -- the identity gate's other arm.
+    // WHICH OF THE TWO RUNS IS DECIDED BY THE FRONT'S MEAN WIDTH, cells over sweeps, once the first call has
+    // counted its sweeps. The GPU wave pays for a sweep whatever the front holds -- a chain of dependent loads
+    // and a barrier -- and the host's pays for a cell, which the 896,000-cell number above no longer describes:
+    // it was taken before the host's cell lists were kept between calls. MEASURED 2026-10-06, the diffusivity's
+    // row in ms a step, GPU wave / host wave: waveMakerSolitary (14,250 cells, 38 a sweep) 7.8 / 0.6;
+    // waveMakerFlap (56,000, 140) 12.3 / 2.9; the same refined to 224,000 (280) 35.8 / 12.2 and to 896,000 (560)
+    // 123.7 / 53.3; the 3-D waveMakerMultiPaddleFlap (448,000, 2,240) 29.0 / 33.5. So a front under 2,000 cells
+    // takes the host wave from the second call on: the number sits just under the one width where the GPU wave
+    // was the faster, and nothing between 560 and 2,240 was measured. BRAE_PATCH_WAVE_MIN_FRONT sets it; 0
+    // keeps the GPU wave, which is what its own gates run.
     DevicePatchWave motionWave;
     CellFaces motionWaveCells;
     bool motionWaveCellsBuilt = false;
+    bool motionWaveOnHost = false;
+    static const label motionWaveMinFront = std::getenv("BRAE_PATCH_WAVE_MIN_FRONT")
+        ? static_cast<label>(std::max(0L, std::atol(std::getenv("BRAE_PATCH_WAVE_MIN_FRONT"))))
+        : label(2000);
     if (dyn && dyn->hasDisplacementSolver() && std::getenv("BRAE_CONTROL_PATCH_WAVE_HOST") == nullptr)
     {
         dyn->setPatchWaveRunner(
-            [&motionWave, &motionWaveCells, &motionWaveCellsBuilt](
+            [&motionWave, &motionWaveCells, &motionWaveCellsBuilt, &motionWaveOnHost](
                 const PrimitiveMesh& mesh,
                 const FvGeometry& geo,
                 const std::vector<label>& seedFaces,
                 std::vector<scalar>& cellDistSqr,
                 std::vector<scalar>& boundaryDistSqr)
             {
+                if (motionWaveOnHost) return false;
                 // the displacement solver's topology is fixed once it is attached
-                if (!motionWaveCellsBuilt)
+                const bool first = !motionWaveCellsBuilt;
+                if (first)
                 {
                     motionWaveCells = cellFaces(mesh);
                     motionWaveCellsBuilt = true;
@@ -763,6 +779,17 @@ RunReport runInterFoamDevice(
                                 "BRAE_CONTROL_PATCH_WAVE_HOST=1 runs the host wave\n");
                 }
                 devicePatchWave(mesh, geo, motionWaveCells, seedFaces, motionWave, cellDistSqr, boundaryDistSqr);
+                const label front = mesh.nCells()/std::max(label(1), motionWave.sweeps);
+                if (first && front < motionWaveMinFront)
+                {
+                    motionWaveOnHost = true;
+                    std::printf("  wall distance: the motion solver's wave runs on the host from its next call: "
+                                "%ld sweeps over %ld cells is a front of %ld, under the %ld from which the GPU "
+                                "wave is the faster; BRAE_PATCH_WAVE_MIN_FRONT=0 keeps the GPU wave\n",
+                                static_cast<long>(motionWave.sweeps), static_cast<long>(mesh.nCells()),
+                                static_cast<long>(front), static_cast<long>(motionWaveMinFront));
+                }
+                return true;
             });
     }
     // THE CLOSURE'S WALL DISTANCE ON THE GPU. kOmegaSST's y is a wallDist that OpenFOAM recomputes at every mesh
@@ -803,6 +830,7 @@ RunReport runInterFoamDevice(
                     turbWave.built = false;
                 }
                 devicePatchWave(mesh, geo, turbWaveCells, seedFaces, turbWave, cellDistSqr, boundaryDistSqr);
+                return true;
             };
     }
     // THE MESH FLUX OF EVERY MOVE ON THE GPU: each face's swept volume over the step (face::sweptVol), the

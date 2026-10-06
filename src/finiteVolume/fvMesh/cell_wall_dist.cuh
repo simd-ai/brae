@@ -248,6 +248,8 @@ inline std::vector<scalar> cellWallDist(
     std::vector<scalar> cellD2;
     std::vector<vector> cellOrg;
     std::vector<vector> cellNrm;
+    // a runner that returns false did not run the wave at this call: the host's runs (patch_wave_cpp.cuh)
+    bool ranElsewhere = false;
     if (waveRunner && *waveRunner && !wallOrigin && !wallNormal)
     {
         // patchWave::setChangedFaces: the wall faces, ascending
@@ -257,7 +259,10 @@ inline std::vector<scalar> cellWallDist(
             if (isWallFace[f]) seeds.push_back(f);
         }
         std::vector<scalar> boundaryD2;
-        (*waveRunner)(m, g, seeds, cellD2, boundaryD2);
+        ranElsewhere = (*waveRunner)(m, g, seeds, cellD2, boundaryD2);
+    }
+    if (ranElsewhere)
+    {
         if (cellD2.size() != static_cast<std::size_t>(nCells))
         {
             throw std::runtime_error("brae cellWallDist: the wave run elsewhere returned another mesh's cells.");

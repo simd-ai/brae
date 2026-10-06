@@ -53,10 +53,12 @@ struct PatchWave
 // THE WAVE ELSEWHERE. When `runner` is set patchWave hands it the seed faces, in the order it seeds them, and
 // reads back the squared distance the wave leaves in every cell and on every boundary face (face
 // nInternalFaces + i at i; an element never reached keeps -GREAT) -- the device loop's devicePatchWave
-// (device_patch_wave.cuh), which is this file's FaceCellWave to the bit. Null runs the host wave.
+// (device_patch_wave.cuh), which is this file's FaceCellWave to the bit. Null runs the host wave, and so does
+// a runner that returns false: it did not run the wave at this call (the device loop does that where the host's
+// is the faster of the two, inter_driver_device.cu).
 // `pointFaces` is primitiveMesh::pointFaces() (meshPointFaces) for the near-wall correction when the caller
 // keeps it; null builds it there, an allocation a point at every call.
-using PatchWaveRunner = std::function<void(
+using PatchWaveRunner = std::function<bool(
     const PrimitiveMesh&,
     const FvGeometry&,
     const std::vector<label>&,

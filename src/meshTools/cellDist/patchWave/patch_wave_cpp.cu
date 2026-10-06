@@ -447,9 +447,8 @@ PatchWave patchWave(
             boundaryOut[i] = faceInfo[static_cast<std::size_t>(nIf) + i].distSqr;
         }
     };
-    if (runner && *runner)
+    if (runner && *runner && (*runner)(m, g, seedFaces, cellDistSqr, boundaryDistSqr))
     {
-        (*runner)(m, g, seedFaces, cellDistSqr, boundaryDistSqr);
         if (cellDistSqr.size() != static_cast<std::size_t>(m.nCells())
          || boundaryDistSqr.size() != static_cast<std::size_t>(m.nFaces() - nIf))
         {

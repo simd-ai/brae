@@ -15,20 +15,25 @@
 # 399 launched half-sweeps a step) and BRAE_CONTROL_PATCH_WAVE_BLOCK_CELLS=100 (the cells outgrow it at every
 # sweep: 401 launches a step, the second half-sweep on the host's path each time).
 # The control drops the neighbour side's visits (BRAE_CONTROL_PATCH_WAVE_OWNER_ONLY=1): measured, cell 1 unset.
+# THE GPU WAVE IS FORCED IN EVERY ARM (BRAE_PATCH_WAVE_MIN_FRONT=0): since 2026-10-06 a front as thin as this
+# case's, 140 cells a sweep, takes the host wave from its second call (patch_wave_front_rule.sh), and this file
+# is about the GPU wave's two paths.
 [ $GPU -eq 1 ] || { echo "SKIP: no GPU for the device arm"; exit 77; }
 wcase waveMakerFlap of > "$W/tf_stage.txt" 2>&1
 o="$W/w_of_waveMakerFlap"
 [ -d "$o" ] || { say "waveMakerFlap did not stage" FAIL; finish "thin front identity"; }
+gpu=BRAE_PATCH_WAVE_MIN_FRONT=0
+chk=BRAE_CONTROL_PATCH_WAVE_CHECK=1
 for v in block faces cells launched control; do
     e="$W/tf_$v"
     mkdir -p "$e"
     cp -r "$o/0" "$o/constant" "$o/system" "$e/"
     case $v in
-        block)    runbrae "$e" device BRAE_CONTROL_PATCH_WAVE_CHECK=1 ;;
-        faces)    runbrae "$e" device BRAE_CONTROL_PATCH_WAVE_CHECK=1 BRAE_CONTROL_PATCH_WAVE_BLOCK_FACES=200 ;;
-        cells)    runbrae "$e" device BRAE_CONTROL_PATCH_WAVE_CHECK=1 BRAE_CONTROL_PATCH_WAVE_BLOCK_CELLS=100 ;;
-        launched) runbrae "$e" device BRAE_CONTROL_PATCH_WAVE_NO_BLOCK=1 BRAE_CONTROL_PATCH_WAVE_LIST_BOUNDARY=1 ;;
-        control)  ( cd "$e" && BRAE_CONTROL_PATCH_WAVE_CHECK=1 BRAE_CONTROL_PATCH_WAVE_OWNER_ONLY=1 \
+        block)    runbrae "$e" device $gpu $chk ;;
+        faces)    runbrae "$e" device $gpu $chk BRAE_CONTROL_PATCH_WAVE_BLOCK_FACES=200 ;;
+        cells)    runbrae "$e" device $gpu $chk BRAE_CONTROL_PATCH_WAVE_BLOCK_CELLS=100 ;;
+        launched) runbrae "$e" device $gpu BRAE_CONTROL_PATCH_WAVE_NO_BLOCK=1 BRAE_CONTROL_PATCH_WAVE_LIST_BOUNDARY=1 ;;
+        control)  ( cd "$e" && env $gpu $chk BRAE_CONTROL_PATCH_WAVE_OWNER_ONLY=1 \
                         "$BIN" -case . -device > log.brae 2>&1 )
                   echo $? > "$W/tf_control.rc" ;;
     esac
