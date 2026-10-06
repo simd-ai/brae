@@ -36,10 +36,15 @@ int main(int argc, char** argv)
     for (const AMIInterface& a : amis)
     {
         scalar wmin = 1e30, wmax = 0, wsum = 0;
-        for (scalar w : a.weightsSum) { wmin = std::fmin(wmin, w); wmax = std::fmax(wmax, w); wsum += w; }
+        for (scalar w : a.coverage)
+        {
+            wmin = std::fmin(wmin, w);
+            wmax = std::fmax(wmax, w);
+            wsum += w;
+        }
         std::printf("    patch %d -> %d : %d src faces, %d stencil entries, coverage min %.6f max %.6f mean %.6f\n",
                     (int)a.patch, (int)a.nbrPatch, (int)a.ownCell.size(), (int)a.nbrCell.size(),
-                    wmin, wmax, a.weightsSum.empty() ? 0.0 : wsum / a.weightsSum.size());
+                    wmin, wmax, a.coverage.empty() ? 0.0 : wsum / a.coverage.size());
         // The FULL tensor. A 90-degree rotation has a zero diagonal in the rotated plane, so printing
         // only the diagonal cannot tell +90 from -90 -- and for a swirling flow those are opposite
         // azimuthal velocities at the interface.

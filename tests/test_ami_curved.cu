@@ -66,7 +66,8 @@ namespace {
 
 int failures = 0;
 
-// worst |weightsSum - 1| over each interface of a freshly built fixture.
+// worst |coverage - 1| over each interface of a freshly built fixture (the sum of overlap/|Sf|, before a
+// cyclicAMI's rows are divided by their sum -- after it the sum of weights is 1 by construction).
 struct Worst { scalar lo, hi, worst; };
 
 std::vector<Worst> coverageOf(const PrimitiveMesh& m, const FvGeometry& g,
@@ -76,7 +77,7 @@ std::vector<Worst> coverageOf(const PrimitiveMesh& m, const FvGeometry& g,
     for (const AMIInterface& A : buildAMIInterfaces(m, g, fvp))
     {
         Worst w{1e300, -1e300, 0};
-        for (const scalar v : A.weightsSum)
+        for (const scalar v : A.coverage)
         {
             w.lo    = std::fmin(w.lo, v);
             w.hi    = std::fmax(w.hi, v);

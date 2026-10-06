@@ -1,10 +1,11 @@
-// SA-IDDES (SpalartAllmarasIDDES, Shur/Spalart/Strelets/Travin 2008) length scale: deviceSAIDDESdTilda reproduces the
-// improved delayed-DES dTilda exactly.
-//   dTilda = fdTilde*(1 + fe)*y + (1 - fdTilde)*CDES*Delta,  Delta = min(max(Cw*y, Cw*hmax), hmax),
-//   fdTilde = max(1 - fdt, fB),  fdt = 1 - tanh((Cdt1*rd_t)^3),  fB = min(2 exp(-9 alpha^2), 1),  alpha = 0.25 - y/hmax,
-//   fe = max(fe1 - 1, 0)*fe2,  fe2 = 1 - max(ft, fl),  ft = tanh((Ct^2 rd_t)^3),  fl = tanh((Cl^2 rd_l)^10),
-//   fe1 = 2 exp(-11.09 alpha^2) [alpha>=0] | 2 exp(-9 alpha^2) [alpha<0];  rd_t/rd_l from nut/nu.  (hwn omitted -> hwn=0.)
-// Checks (a) the device kernel matches a host re-implementation, and (b) the physical limits by hand: deep near-wall
+// SA-IDDES (SpalartAllmarasIDDES) length scale: deviceSAIDDESdTilda against a host re-typing of the same statements.
+//   dTilda = max(fdTilda*(1 + fe)*y + (1 - fdTilda)*psi*CDES*Delta, SMALL),  Delta = min(max(Cw*y, Cw*hmax, hwn), hmax),
+//   fdTilda = max(1 - fdt, fB),  fdt = 1 - tanh((Cdt1*rd_t)^Cdt2),  fB = min(2 exp(alpha^2)^-9, 1),
+//   alpha = max(0.25 - y/hmax, -5),  fe = max(fe1 - 1, 0)*psi*fe2,  fe2 = 1 - max(ft, fl),
+//   ft = tanh((Ct^2 rd_t)^3),  fl = tanh((Cl^2 rd_l)^10),  fe1 = 2 exp(alpha^2)^-11.09 [alpha>=0] | ^-9 [alpha<0].
+// THIS HOLDS THE KERNEL TO ITS OWN FORMULA AND TO HAND LIMITS, not to OpenFOAM: the formula's agreement with
+// OpenFOAM's SpalartAllmarasIDDES is tests/sa_iddes_vs_openfoam.sh's, against a dump of OpenFOAM's own dTilda.
+// Checks (a) the device kernel matches the host re-typing, and (b) the physical limits by hand: deep near-wall
 // (shielded) -> dTilda = y (RANS); far-field -> dTilda = CDES*hmax (LES); the fe band -> dTilda > y (elevated stresses).
 #include "device_kepsilon.cuh"    // deviceSAIDDESdTilda
 #include "spalart_coeffs.cuh"     // SpalartAllmarasCoeffs
@@ -21,32 +22,35 @@ static double hostPsi(double chi, const SpalartAllmarasCoeffs& co)
     const double fv1 = chi3/(chi3 + Cv13);
     const double fv2 = 1.0 - chi/(1.0 + chi*fv1);
     const double K = co.Cb1/(co.Cw1()*co.kappa*co.kappa*co.fwStar);
-    return std::sqrt(std::fmax(std::fmin(100.0, (1.0 - K*fv2)/std::fmax(fv1, 1e-300)), 0.0));
+    return std::sqrt(std::fmax(std::fmin(100.0, (1.0 - K*fv2)/std::fmax(fv1, 1e-15)), 0.0));
 }
 
 static double hostIddes(const double g[9], double y, double hmax, double hwn, double nt, double nu, const SpalartAllmarasCoeffs& co)
 {
     double g2 = 0; for (int k = 0; k < 9; ++k) g2 += g[k]*g[k];
-    const double magGradU = std::fmax(std::sqrt(g2), 1e-300);
+    const double magGradU = std::sqrt(g2);
     const double chi = nt/nu, chi3 = chi*chi*chi, Cv13 = co.Cv1*co.Cv1*co.Cv1;
     const double nutc = nt*(chi3/(chi3+Cv13));
-    const double kd2 = std::fmax(co.kappa*co.kappa*y*y, 1e-300);
-    const double rdt = std::fmin(nutc/(magGradU*kd2), 10.0);
-    const double rdl = std::fmin(nu  /(magGradU*kd2), 10.0);
-    const double adt = co.Cdt1*rdt; const double fdt = 1.0 - std::tanh(adt*adt*adt);
-    const double al = co.Cl*co.Cl*rdl; const double al2=al*al, al4=al2*al2, al8=al4*al4;
-    const double fl = std::tanh(al8*al2);
+    const double psi = hostPsi(chi, co);
+    const double kd = co.kappa*y;
+    const double rDenominator = std::fmax(magGradU, 1e-15)*(kd*kd);
+    const double rdt = std::fmin(nutc/rDenominator, 10.0);
+    const double rdl = std::fmin(nu/rDenominator, 10.0);
+    const double fdt = 1.0 - std::tanh(std::pow(co.Cdt1*rdt, co.Cdt2));
+    const double fl = std::tanh(std::pow(co.Cl*co.Cl*rdl, 10.0));
     const double at = co.Ct*co.Ct*rdt; const double ft = std::tanh(at*at*at);
-    const double fe2 = 1.0 - std::fmax(ft, fl);
     const double hm = std::fmax(hmax, 1e-300);
-    const double alpha = 0.25 - y/hm;
-    const double fB = std::fmin(2.0*std::exp(-9.0*alpha*alpha), 1.0);
+    const double alpha = std::fmax(0.25 - y/hm, -5.0);
+    const double expTerm = std::exp(alpha*alpha);
+    const double fB = std::fmin(2.0*std::pow(expTerm, -9.0), 1.0);
     const double fdTilde = std::fmax(1.0 - fdt, fB);
-    const double fe1 = (alpha >= 0.0) ? 2.0*std::exp(-11.09*alpha*alpha) : 2.0*std::exp(-9.0*alpha*alpha);
-    const double fe = std::fmax(fe1 - 1.0, 0.0)*fe2;
+    const double fe1 = 2.0*std::pow(expTerm, (alpha >= 0.0) ? -11.09 : -9.0);
+    const double fe2 = 1.0 - std::fmax(ft, fl);
+    // psi multiplies fe as well as lLES (SpalartAllmarasIDDES.C:118)
+    const double fe = co.fe ? std::fmax(fe1 - 1.0, 0.0)*psi*fe2 : 0.0;
     const double delta = std::fmin(std::fmax(std::fmax(co.Cw*y, co.Cw*hm), hwn), hm);
-    const double lLES = hostPsi(nt/nu, co)*co.CDES*delta;
-    return std::fmax(fdTilde*(1.0 + fe)*y + (1.0 - fdTilde)*lLES, 1e-300);
+    const double lLES = psi*co.CDES*delta;
+    return std::fmax(fdTilde*(1.0 + fe)*y + (1.0 - fdTilde)*lLES, 1e-15);
 }
 
 int main()

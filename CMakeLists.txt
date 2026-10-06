@@ -410,6 +410,16 @@ target_include_directories(test_gpu_smagorinsky PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_gpu_smagorinsky PRIVATE brae_core)
 add_test(NAME gpu_smagorinsky COMMAND test_gpu_smagorinsky)
 
+# SA-IDDES against REAL OpenFOAM's SpalartAllmarasIDDES: the length scale's formula, the defaults and the reader,
+# on a dump of OpenFOAM's own dTilda() (tools/dumpSAIDDES, built with wmake; the gates skip without it).
+add_executable(test_sa_iddes_vs_openfoam tests/test_sa_iddes_vs_openfoam.cu)
+target_include_directories(test_sa_iddes_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_sa_iddes_vs_openfoam PRIVATE brae_core)
+foreach(SA_IDDES_MODE kernel defaults refusals)
+    add_test(NAME sa_iddes_${SA_IDDES_MODE}_vs_openfoam
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_iddes_${SA_IDDES_MODE}_vs_openfoam.sh)
+    set_tests_properties(sa_iddes_${SA_IDDES_MODE}_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+endforeach()
 add_executable(test_gpu_saiddes tests/test_gpu_saiddes.cu)
 target_include_directories(test_gpu_saiddes PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_gpu_saiddes PRIVATE brae_core)
@@ -4746,6 +4756,16 @@ target_include_directories(test_ami_device PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_ami_device PRIVATE brae_core)
 add_test(NAME ami_device COMMAND test_ami_device)
 
+# The legacy AMI builder's store test and row normalisation against REAL OpenFOAM's own AMI on two constructed
+# meshes (a cyclicACMI pair and a plain cyclicAMI pair, each offset by a sliver). The scripts carry the fixtures,
+# the premises and the controls.
+add_executable(test_ami_store_vs_openfoam tests/test_ami_store_vs_openfoam.cu)
+target_include_directories(test_ami_store_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_ami_store_vs_openfoam PRIVATE brae_core)
+add_test(NAME ami_store_vs_openfoam COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/ami_store_vs_openfoam.sh)
+set_tests_properties(ami_store_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ami_rows_vs_openfoam COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/ami_rows_vs_openfoam.sh)
+set_tests_properties(ami_rows_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(test_ami_geometry tests/test_ami_geometry.cu)
 target_include_directories(test_ami_geometry PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_ami_geometry PRIVATE brae_core)

@@ -389,7 +389,37 @@ inline void readTurbulenceModel(
                 {
                     ctl.sa = true;
                     ctl.iddes = saIddes;   // IDDES -> the improved (WMLES) length scale (maxDeltaxyz + blending); else plain DDES
-                    if (dc) ctl.saCoeffs.CDES = dc->scalarOr("CDES", ctl.saCoeffs.CDES);
+                    // THE MODEL'S COEFFICIENTS COME FROM LESDict_.optionalSubDict(type + "Coeffs") (LESModel.C:72):
+                    // the `<model>Coeffs` sub-dictionary when there is one, else LES{} itself. Read through `dc`
+                    // (the sub-dictionary alone) a coefficient written bare in LES{} ran at its default, and a
+                    // refusal keyed on it was never reached.
+                    const FoamDict* sc = les->optionalSubDict(model + "Coeffs");
+                    ctl.saCoeffs.CDES = sc->scalarOr("CDES", ctl.saCoeffs.CDES);
+                    // fwStar is SpalartAllmarasDES's (SpalartAllmarasDES.C:220-228) and feeds psi, which every
+                    // model of the family multiplies its LES length by
+                    ctl.saCoeffs.fwStar = sc->scalarOr("fwStar", ctl.saCoeffs.fwStar);
+                    // ...and three switches of the family brae runs at their defaults alone
+                    if (!sc->switchOr("lowReCorrection", true))
+                    {
+                        throw std::runtime_error(
+                            "brae: " + model + " with `lowReCorrection false` is not ported: psi is then the Zero "
+                            "field OpenFOAM constructs (SpalartAllmarasDES.C:49-63), and brae's psi is the "
+                            "low-Re correction. Refusing rather than running the correction under it.");
+                    }
+                    if (sc->switchOr("useSigma", false))
+                    {
+                        throw std::runtime_error(
+                            "brae: " + model + " with `useSigma true` is not ported: Stilda is then built from "
+                            "the sigma velocity-gradient invariant (SpalartAllmarasDES.C:95-120). Refusing "
+                            "rather than running the vorticity form under it.");
+                    }
+                    if (sc->switchOr("ft2", false))
+                    {
+                        throw std::runtime_error(
+                            "brae: " + model + " with `ft2 true` is not ported: the ft2 laminar-suppression "
+                            "term (SpalartAllmarasBase.C:76-100, :289-296) is not implemented. Refusing "
+                            "rather than running the model without it.");
+                    }
                     // OF v2412 SpalartAllmarasDDES carries a `shielding` selector (standard | ZDES2020).
                     // ZDES2020 (Deck & Renard 2020) multiplies the standard fd by a second shielding built
                     // from grad(nuTilda).n and grad(|curl U|).n, which moves the RANS/LES switch -- it is a
@@ -425,16 +455,38 @@ inline void readTurbulenceModel(
                                 "(brae has `standard` and `ZDES2020`). The shielding function decides where "
                                 "the model leaves RANS for LES, so running another one is a different answer.");
                     }
-                    if (saIddes && dc)   // IDDES blending-constant overrides (defaults = Shur/Spalart/Strelets/Travin 2008)
+                    if (saIddes)
                     {
-                        ctl.saCoeffs.Cdt1 = dc->scalarOr("Cdt1", ctl.saCoeffs.Cdt1);
-                        ctl.saCoeffs.Cl   = dc->scalarOr("Cl",   ctl.saCoeffs.Cl);
-                        ctl.saCoeffs.Ct   = dc->scalarOr("Ct",   ctl.saCoeffs.Ct);
-                        ctl.saCoeffs.Cw   = dc->scalarOr("Cw",   ctl.saCoeffs.Cw);
+                        // SpalartAllmarasIDDES's own five (SpalartAllmarasIDDES.C:165-209; defaults 8, 3, 3.55,
+                        // 1.63, true -- SpalartAllmarasCoeffs carries them).
+                        // BRAE_CONTROL_SA_IDDES_SST_DEFAULTS=1 starts from 20 / 5 / 1.87, kOmegaSSTIDDES's, which
+                        // this reader used until 2026-10-06 -- the gate's control.
+                        if (std::getenv("BRAE_CONTROL_SA_IDDES_SST_DEFAULTS") != nullptr)
+                        {
+                            std::printf("  *** CONTROL MODE: SpalartAllmarasIDDES starts from kOmegaSSTIDDES's Cdt1, "
+                                        "Cl and Ct. This run is deliberately wrong. ***\n");
+                            ctl.saCoeffs.Cdt1 = 20.0;
+                            ctl.saCoeffs.Cl = 5.0;
+                            ctl.saCoeffs.Ct = 1.87;
+                        }
+                        ctl.saCoeffs.Cdt1 = sc->scalarOr("Cdt1", ctl.saCoeffs.Cdt1);
+                        ctl.saCoeffs.Cdt2 = sc->scalarOr("Cdt2", ctl.saCoeffs.Cdt2);
+                        ctl.saCoeffs.Cl = sc->scalarOr("Cl", ctl.saCoeffs.Cl);
+                        ctl.saCoeffs.Ct = sc->scalarOr("Ct", ctl.saCoeffs.Ct);
+                        ctl.saCoeffs.fe = sc->switchOr("fe", ctl.saCoeffs.fe);
+                        // (Cw is IDDESDelta's, read from IDDESDeltaCoeffs in OpenFOAM; here it is still taken
+                        // from the model's sub-dictionary alone, as before -- its own item)
+                        if (dc)
+                        {
+                            ctl.saCoeffs.Cw = dc->scalarOr("Cw", ctl.saCoeffs.Cw);
+                        }
                     }
                     if (saIddes)
-                        std::printf("  %s (SA-IDDES, delta=IDDESDelta [maxDeltaxyz+hwn]): CDES=%.4g Cdt1=%.4g Cl=%.4g Ct=%.4g Cw=%.4g kappa=%.4g Cv1=%.3g\n",
-                                    model.c_str(), ctl.saCoeffs.CDES, ctl.saCoeffs.Cdt1, ctl.saCoeffs.Cl, ctl.saCoeffs.Ct, ctl.saCoeffs.Cw, ctl.saCoeffs.kappa, ctl.saCoeffs.Cv1);
+                        std::printf("  %s (SA-IDDES, delta=IDDESDelta [maxDeltaxyz+hwn]): CDES=%.4g Cdt1=%.4g "
+                                    "Cdt2=%.4g Cl=%.4g Ct=%.4g fe=%s fwStar=%.4g Cw=%.4g kappa=%.4g Cv1=%.3g\n",
+                                    model.c_str(), ctl.saCoeffs.CDES, ctl.saCoeffs.Cdt1, ctl.saCoeffs.Cdt2,
+                                    ctl.saCoeffs.Cl, ctl.saCoeffs.Ct, ctl.saCoeffs.fe ? "true" : "false",
+                                    ctl.saCoeffs.fwStar, ctl.saCoeffs.Cw, ctl.saCoeffs.kappa, ctl.saCoeffs.Cv1);
                     else
                         std::printf("  %s (SA-DES, delta=%s, shielding=%s): CDES=%.4g kappa=%.4g Cb1=%.4g Cw1=%.4g Cv1=%.3g\n",
                                     model.c_str(), ctl.lesDeltaMax ? "maxDeltaxyz" : "cubeRootVol",
