@@ -745,6 +745,13 @@ void amgCastFP32(
         amg.fp32Alloc = true;
     }
     if (amgCsrOn() && !amg.csrBuilt) amgBuildCsrFP32(amg, A);       // FP-12, once per hierarchy
+    // THE SAME MATRIX AGAIN (amgGalerkinStands): the copies of the last cast are this matrix's, grid for grid
+    if (amg.fp32Stands)
+    {
+        amg.fp32Stands = false;
+        return;
+    }
+    amg.fp32Current = true;
     for (int g=0; g<=G; ++g)
     {
         const DeviceLduView v = (g==0) ? A : amg.level[g-1].coarseView();

@@ -1379,12 +1379,79 @@ AMGData buildAMG(
     return A;
 }
 
+namespace
+{
+// a[i] and b[i] as bit patterns: +0 and -0 differ, a NaN is itself. Every thread that finds a difference
+// writes the same 1, so the unordered writes are one answer.
+__global__
+void sameBitsK(
+    int n,
+    const scalar* __restrict__ a,
+    const scalar* __restrict__ b,
+    int* __restrict__ differs)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (__double_as_longlong(a[i]) != __double_as_longlong(b[i]))
+    {
+        *differs = 1;
+    }
+}
+}   // namespace
+
+const int* amgFineCompare(
+    AMGData& A,
+    const DeviceBuffer<scalar>& fineDiag,
+    const DeviceBuffer<scalar>& fineUpper,
+    const DeviceBuffer<scalar>& fineLower)
+{
+    if (!A.keptValid || A.keptDiag.size() != fineDiag.size() || A.keptUpper.size() != fineUpper.size()
+     || A.keptLower.size() != fineLower.size())
+    {
+        return nullptr;
+    }
+    A.keptDiffers.resize(1);
+    cudaCheck(cudaMemsetAsync(A.keptDiffers.data(), 0, sizeof(int), cudaStreamPerThread), "amgFineCompare");
+    const int nC = static_cast<int>(fineDiag.size());
+    const int nF = static_cast<int>(fineUpper.size());
+    sameBitsK<<<nBlocks(nC),TPB>>>(nC, fineDiag.data(), A.keptDiag.data(), A.keptDiffers.data());
+    if (nF > 0)
+    {
+        sameBitsK<<<nBlocks(nF),TPB>>>(nF, fineUpper.data(), A.keptUpper.data(), A.keptDiffers.data());
+        sameBitsK<<<nBlocks(nF),TPB>>>(nF, fineLower.data(), A.keptLower.data(), A.keptDiffers.data());
+    }
+    cudaCheck(cudaGetLastError(), "amgFineCompare");
+    return A.keptDiffers.data();
+}
+
+void amgGalerkinKept(
+    AMGData& A,
+    const DeviceBuffer<scalar>& fineDiag,
+    const DeviceBuffer<scalar>& fineUpper,
+    const DeviceBuffer<scalar>& fineLower)
+{
+    amgGalerkin(A, fineDiag, fineUpper, fineLower);
+    deviceCopy(A.keptDiag, fineDiag);
+    deviceCopy(A.keptUpper, fineUpper);
+    deviceCopy(A.keptLower, fineLower);
+    A.keptValid = true;
+}
+
+void amgGalerkinStands(AMGData& A)
+{
+    A.fp32Stands = A.fp32Current;
+}
+
 void amgGalerkin(
     AMGData& A,
     const DeviceBuffer<scalar>& fineDiag,
     const DeviceBuffer<scalar>& fineUpper,
     const DeviceBuffer<scalar>& fineLower)
 {
+    // the coarse matrices are about to change: nothing kept describes them, and no cast is theirs
+    A.keptValid = false;
+    A.fp32Current = false;
+    A.fp32Stands = false;
     for (int k = 0; k < A.nLevels(); ++k)                      // grid k matrix -> grid k+1 (Galerkin scatter)
     {
         AMGLevel& L = A.level[k];

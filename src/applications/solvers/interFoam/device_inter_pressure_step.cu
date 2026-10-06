@@ -455,7 +455,60 @@ scalar deviceInterPressureStep(
             std::optional<interPhase::Nested> timedPart;
             timedPart.emplace("pressure: the hierarchy's coarse matrices (Galerkin)");
             AMGData& amg = in.amgPcg->get(dm.addressingId);
-            amgGalerkin(amg, diagC, P.upper, P.lower);
+            // A CORRECTOR AFTER THE FIRST OF A STEP SOLVES THE FIRST ONE'S MATRIX, bit for bit (device_amg.cuh,
+            // amgFineCompare, has the count): its coarse matrices and their single-precision copies stand. The
+            // matrix is COMPARED, not presumed -- a patch whose coefficients follow the flux's direction can
+            // change it between two correctors. MEASURED 2026-10-06, ms a step over three runs an arm, rebuilt at
+            // every solve / kept: stokesII 7.97 / 7.80, streamFunction 26.6 / 26.2, damBreak 6.17 / 6.03,
+            // capillaryRise 8.30 / 8.03, angledDuct 20.3 / 19.9 -- one to three percent, every solver line the same.
+            // NOT across a coupled pair, whose coarse coefficients amgCouplePair remakes at every solve and
+            // whose coarsest factorisation carries them. BRAE_CONTROL_PRESSURE_GALERKIN_ALWAYS=1 rebuilds at
+            // every solve -- the identity gate's other arm; BRAE_CONTROL_PRESSURE_GALERKIN_UNASKED=1 is its
+            // control, deliberately wrong: the coarse matrices of the run's first solve stand for good.
+            static const bool galerkinAlways = std::getenv("BRAE_CONTROL_PRESSURE_GALERKIN_ALWAYS") != nullptr;
+            static const bool galerkinUnasked = std::getenv("BRAE_CONTROL_PRESSURE_GALERKIN_UNASKED") != nullptr;
+            const bool keeps = !galerkinAlways && A.nCyc == 0 && A.nAmi == 0;
+            bool stands = false;
+            if (keeps)
+            {
+                const int* dDiffers = amgFineCompare(amg, diagC, P.upper, P.lower);
+                if (dDiffers)
+                {
+                    int differs = 1;
+                    const DeviceReadValue rv[1] = {{dDiffers, &differs, true}};
+                    deviceReadValues(rv, 1);
+                    stands = (differs == 0) || galerkinUnasked;
+                }
+            }
+            if (stands)
+            {
+                static bool said = false;
+                if (!said)
+                {
+                    said = true;
+                    std::printf("  p_rgh: a solve whose matrix is the solve before's, bit for bit, keeps that "
+                                "solve's coarse matrices and their single-precision copies; "
+                                "BRAE_CONTROL_PRESSURE_GALERKIN_ALWAYS=1 rebuilds them at every solve\n");
+                    if (galerkinUnasked)
+                    {
+                        std::printf("  *** CONTROL MODE: the coarse matrices stand without the matrix being "
+                                    "compared. This run is deliberately wrong. ***\n");
+                    }
+                }
+                amgGalerkinStands(amg);
+            }
+            else
+            {
+                interPhase::Nested timedBuild("pressure: the coarse matrices rebuilt");
+                if (keeps)
+                {
+                    amgGalerkinKept(amg, diagC, P.upper, P.lower);
+                }
+                else
+                {
+                    amgGalerkin(amg, diagC, P.upper, P.lower);
+                }
+            }
             timedPart.emplace("pressure: the norm factor");
             const scalar nf = deviceNormFactor(A, p_rgh, b, deviceOnes(nC));
             timedPart.reset();

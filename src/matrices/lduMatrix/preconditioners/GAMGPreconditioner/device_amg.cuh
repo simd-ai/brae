@@ -207,6 +207,16 @@ struct AMGData {
     std::vector<DeviceBuffer<float>> fDiag, fUpper, fLower;     // FP32 matrices per grid
     std::vector<DeviceBuffer<float>> vAxF, vRF, vXF, vBF;       // FP32 V-cycle work vectors per grid
     bool fp32Alloc = false;
+    // THE FINE COEFFICIENTS THE COARSE MATRICES WERE LAST BUILT FROM (amgGalerkinKept), for a caller whose
+    // matrix often comes back the same -- a PISO corrector after the first in a step solves the first one's
+    // matrix (amgFineCompare has the measurement). keptDiffers is the comparison's answer on the device.
+    // fp32Current: the single-precision copies were cast since the last Galerkin; fp32Stands: the caller found
+    // the fine matrix unchanged (amgGalerkinStands), so the next amgCastFP32 has nothing to cast.
+    DeviceBuffer<scalar> keptDiag, keptUpper, keptLower;
+    DeviceBuffer<int> keptDiffers;
+    bool keptValid = false;
+    bool fp32Current = false;
+    bool fp32Stands = false;
     // FP-12: the FP32 SpMV's operand, per grid, as ONE contiguous row instead of two indirections.
     // csrRow[g] is nCells+1 offsets; csrCol[g] the column of each entry; csrVal[g] its FP32 value;
     // csrSrc[g] says where that value comes from in the FP64 face arrays (f for upper[f], -(f+1) for
@@ -301,6 +311,31 @@ AMGData buildOrLoadAMG(const std::vector<label>& fineOwner, const std::vector<la
 // Galerkin: rebuild the coarse matrix coefficients from the current fine matrix (diag/upper/lower).
 void amgGalerkin(AMGData& A, const DeviceBuffer<scalar>& fineDiag, const DeviceBuffer<scalar>& fineUpper,
                  const DeviceBuffer<scalar>& fineLower);
+
+// THE SAME MATRIX AGAIN. In a PISO loop every corrector after the first of a step solves the first one's
+// matrix, bit for bit: rAU and the mesh have not changed, only the source has. MEASURED 2026-10-06 by
+// comparing each solve's three arrays with the solve before's: 28 of 56 solves on stokesII (two correctors),
+// 60 of 90 on damBreak, angledDuct, waveMakerFlap, capillaryRise and weirOverflow (three). Those solves were
+// rebuilding every coarse matrix and casting every grid again: about forty launches on a ten-grid hierarchy,
+// 0.17 ms a solve on stokesII's 27,500 cells net of the comparison and its read (the step 7.97 -> 7.80 ms).
+//   amgFineCompare    launches the comparison of these coefficients with the kept ones, as bit patterns, and
+//                     returns where its answer will be on the device (an int: 0 the same, 1 not); null when
+//                     nothing is kept or the sizes differ, which is "build".
+//   amgGalerkinKept   amgGalerkin, and the coefficients kept for the next comparison.
+//   amgGalerkinStands the caller read 0: the coarse matrices stand, and so do the single-precision copies of
+//                     the last cast. The view the solve is then handed must be that same matrix.
+// A plain amgGalerkin drops the kept copy, so a caller that never asks pays nothing and reuses nothing.
+const int* amgFineCompare(
+    AMGData& A,
+    const DeviceBuffer<scalar>& fineDiag,
+    const DeviceBuffer<scalar>& fineUpper,
+    const DeviceBuffer<scalar>& fineLower);
+void amgGalerkinKept(
+    AMGData& A,
+    const DeviceBuffer<scalar>& fineDiag,
+    const DeviceBuffer<scalar>& fineUpper,
+    const DeviceBuffer<scalar>& fineLower);
+void amgGalerkinStands(AMGData& A);
 
 // THE COLOUR-MAJOR PERMUTED GAUSS-SEIDEL LAYOUT (GridColoring above; device_amg_smoothers.cu has the
 // build, the sweep and the measurement). Public because tests/test_gpu_amg.cu holds the two sweeps
