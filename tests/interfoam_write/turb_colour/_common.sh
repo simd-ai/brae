@@ -10,11 +10,15 @@
 # turbcolour_gate <key> <bound> <field> [field ...]: three checks -- every written file within <bound> of
 # OpenFOAM; the rule announced for each <field> and its solves reported; and the CONTROL,
 # BRAE_CONTROL_TURBULENCE_COLOUR_ONE_SWEEP=1 (a solve the rule takes stops after one sweep), over the bound.
+# A file that is about a coupled pair sets TC_CONTROL / TC_CONTROL_SAYS to the control that is about the pair.
 turbcolour_gate()
 {
     local key="$1" bound="$2" v e f
     shift 2
     unset BRAE_TURBULENCE_CASE_SOLVER
+    # the rule on whatever the row's size: it applies from 4,000 cells up (scope.sh holds that), and the rows
+    # with a coupled pair are 2,268
+    export BRAE_TURBULENCE_COLOUR_MIN_CELLS=0
     [ $GPU -eq 1 ] || { echo "SKIP: no GPU for the device arm"; exit 77; }
     wcase $key of > "$W/tc_stage.txt" 2>&1
     local o="$W/w_of_$key"
@@ -25,7 +29,7 @@ turbcolour_gate()
         cp -r "$o/0" "$o/constant" "$o/system" "$e/"
         case $v in
             colour)  runbrae "$e" device BRAE_PRINT_TURB_SOLVES=1 ;;
-            control) runbrae "$e" device BRAE_CONTROL_TURBULENCE_COLOUR_ONE_SWEEP=1 ;;
+            control) runbrae "$e" device "${TC_CONTROL:-BRAE_CONTROL_TURBULENCE_COLOUR_ONE_SWEEP=1}" ;;
         esac
         python3 "$CMP" "$o" "$e" $(timedirs "$o") > "$W/cmp_tc_$v.txt" 2>&1
     done
@@ -49,6 +53,6 @@ print('%s %.1e' % f)
 sys.exit(0 if f[1] > float(sys.argv[2]) else 1)
 PY
     local rc=$?
-    what="CONTROL  one sweep a solve puts $key's fields over $bound ($(cat "$W/tc_control.txt"))"
+    what="CONTROL  ${TC_CONTROL_SAYS:-one sweep a solve} puts $key's fields over $bound ($(cat "$W/tc_control.txt"))"
     [ $rc -eq 0 ] && say "$what" ok || say "$what" FAIL
 }

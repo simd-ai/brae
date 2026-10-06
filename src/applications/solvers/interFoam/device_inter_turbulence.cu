@@ -39,22 +39,35 @@ bool turbulenceColourOrder(const cpu::interFoam::SmoothLinearSolve& s)
 {
     return s.gaussSeidel() && s.relTol == scalar(0) && !turbulenceCaseSolver();
 }
-// ...and NOT ACROSS A COUPLED PAIR: the colour sweep applies no interface (deviceColourGaussSeidelFused refuses
-// one), where OpenFOAM's sweep moves the pair's contribution to the right-hand side at every sweep. Such a mesh
-// keeps the case's own order, and says so once -- RAS/damBreakLeakage and RAS/damBreakPorousBaffle are these.
+// A ONE-TO-ONE COUPLED PAIR IS CARRIED (cyclic, cyclicACMI): the colour sweep moves its contribution to the
+// right-hand side at the top of every sweep, as OpenFOAM's does (device_colour_gauss_seidel.cuh, bEffP) --
+// RAS/damBreakLeakage and RAS/damBreakPorousBaffle. NOT A cyclicAMI's weighted stencil, which the sweep refuses:
+// such a mesh keeps the case's own order, and says so once (RAS/mixerVesselAMI).
+// AND FROM 4,000 CELLS UP. On a smaller mesh the host's sweep is a few microseconds of one core and the colour
+// order's launches and its extra sweeps cost more: MEASURED 2026-10-06 at 2,268 cells, ms a step, colour order /
+// the case's own: RAS/damBreakLeakage 13.6 / 12.6 (k 34 sweeps a solve for 19), RAS/damBreakPorousBaffle 15.1 /
+// 15.1, RAS/damBreak 5.7 / 5.6; at 5,080 (RAS/weirOverflow) 5.8 / 6.4, and from 9,072 up the colour order by
+// 1.3 to 12 times. BRAE_TURBULENCE_COLOUR_MIN_CELLS sets the number; the rule's gates on small rows set 0.
+label turbulenceColourMinCells()
+{
+    static const label n = std::getenv("BRAE_TURBULENCE_COLOUR_MIN_CELLS")
+        ? static_cast<label>(std::max(0L, std::atol(std::getenv("BRAE_TURBULENCE_COLOUR_MIN_CELLS"))))
+        : label(4000);
+    return n;
+}
 bool turbulenceColourHere(
     const cpu::interFoam::SmoothLinearSolve& s,
     const DeviceCellColouring& colouring,
     const DeviceCyclic* cyc)
 {
     if (!turbulenceColourOrder(s) || !colouring.valid) return false;
-    if (cyc && cyc->n > 0)
+    if (cyc && cyc->n > 0 && cyc->stencil)
     {
         static bool said = false;
         if (!said)
         {
             said = true;
-            std::printf("  turbulence: this mesh has a coupled pair, which the colour-order sweep does not carry; "
+            std::printf("  turbulence: this mesh has a cyclicAMI pair, which the colour-order sweep does not carry; "
                         "k and its partner keep the case's own smoothSolver order (one CPU core)\n");
         }
         return false;
@@ -248,9 +261,18 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
     }
     part.emplace("closure build: the cell colouring");
     // ...and the turbulence rule's sweep order needs the mesh's colouring, once
-    if (turbulenceColourOrder(t.kSolveFinal) || turbulenceColourOrder(t.epsSolveFinal)
-     || turbulenceColourOrder(t.omegaSolveFinal) || turbulenceColourOrder(t.kSolve)
-     || turbulenceColourOrder(t.epsSolve) || turbulenceColourOrder(t.omegaSolve))
+    const bool ruleAsked = turbulenceColourOrder(t.kSolveFinal) || turbulenceColourOrder(t.epsSolveFinal)
+                        || turbulenceColourOrder(t.omegaSolveFinal) || turbulenceColourOrder(t.kSolve)
+                        || turbulenceColourOrder(t.epsSolve) || turbulenceColourOrder(t.omegaSolve);
+    if (ruleAsked && static_cast<label>(m.nCells()) < turbulenceColourMinCells())
+    {
+        // (no colouring: turbulenceColourHere reads its absence as "the case's own order")
+        std::printf("  turbulence: a mesh of %ld cells keeps the case's own smoothSolver order for k and its "
+                    "partner; the colour order on the GPU pays from %ld cells up "
+                    "(BRAE_TURBULENCE_COLOUR_MIN_CELLS)\n", static_cast<long>(m.nCells()),
+                    static_cast<long>(turbulenceColourMinCells()));
+    }
+    else if (ruleAsked)
     {
         const std::size_t nIf = m.neighbour().size();
         const std::vector<label> ownerInternal(m.owner().begin(), m.owner().begin() + static_cast<long>(nIf));
