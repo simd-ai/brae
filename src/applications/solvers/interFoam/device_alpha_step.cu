@@ -3,6 +3,8 @@
 #include "device_blas.cuh"       // deviceCopy
 #include "device_alpha_flux.cuh"
 #include "device_mules.cuh"
+#include <cstdlib>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 
@@ -410,10 +412,37 @@ void deviceAlphaCorrector(
     deviceMulesDonorFlux(dm, nIf, nBf, *in.phiCNInt, alpha1, alphaPhi10Bnd, phiBDInt, phiBDBnd);
     if (bnd.updateModelled)
     {
-        // psi.correctBoundaryConditions(), then the bounded flux ON THE NEW PATCH VALUES. Where the
-        // values did not move this is the product that built unBnd, bit for bit.
+        // psi.correctBoundaryConditions(), the statement that opens MULES::explicitSolve
+        // (MULESTemplates.C:168). THE BOUNDED FLUX'S BOUNDARY IS NOT REBUILT ON THE NEW VALUES: limit()
+        // overwrites it with the high-order flux's on every patch that is not coupled (`if
+        // (!phiBDPf.coupled()) phiBDPf = phiPsiBf[patchi]`, :599-609), which is what deviceMulesDonorFlux
+        // has just done -- so the correction is zero there and the new values reach the limiter through
+        // the fixes-value extrema alone (:338-347). This rebuilt it as phiCN_b*alpha_b on the new values
+        // until 2026-10-05, on the reading that upwind's own boundary flux stands: the face's flux came out
+        // the same (lambda is 1 on an uncoupled face), but its cell's sums did not -- a part of the
+        // boundary flux was counted as correction, which moves lambda in that cell where its bound is
+        // active. brae's host MULES has the overwrite (mules_cpp.cu, boundedDonorFlux).
+        // NO SHIPPED CASE TELLS THE TWO FORMS APART. MEASURED 2026-10-06, device arm at pinned solves:
+        // laminar/waves/stokesI after 40 steps and RAS/weirOverflow after 60 write the same bytes with
+        // either (0 of 7 and 0 of 10 files differ), the small static AMI fixture is 7.7e-13 of OpenFOAM
+        // with the old form. It takes a patch value the evaluate moved, on a face that carries a flux, in
+        // a cell whose bound is active -- which tests/test_device_alpha_opening_evaluate.cu builds: the
+        // device step is the host's to 4.4e-16 with the overwrite and 2.4e-02 from it with the rebuild.
+        //   BRAE_CONTROL_MULES_BOUNDARY_DONOR_NEW_VALUES=1: rebuilt on the new values, as before
+        static const bool donorOnNewValues = std::getenv("BRAE_CONTROL_MULES_BOUNDARY_DONOR_NEW_VALUES") != nullptr;
         bnd.updateModelled(alpha1);
-        deviceMultiplyFaces(nBf, *in.phiCNBnd, *bnd.alpha1, phiBDBnd);
+        if (donorOnNewValues)
+        {
+            static bool said = false;
+            if (!said)
+            {
+                said = true;
+                std::printf("  *** CONTROL MODE: explicit MULES rebuilds the bounded flux's boundary on the "
+                            "re-evaluated patch values, as before 2026-10-05. Not OpenFOAM's form "
+                            "(MULESTemplates.C:599-609). ***\n");
+            }
+            deviceMultiplyFaces(nBf, *in.phiCNBnd, *bnd.alpha1, phiBDBnd);
+        }
     }
     deviceSubtractFaces(nIf, alphaPhi10Int, phiBDInt, corrInt);
     deviceSubtractFaces(nBf, alphaPhi10Bnd, phiBDBnd, corrBnd);

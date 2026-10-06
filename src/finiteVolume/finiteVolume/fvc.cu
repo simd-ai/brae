@@ -135,10 +135,17 @@ inline vector lsBoundaryDelta(const FvPatch& fp, label i, const vector& Cc)
 // shared by the scalar and the vector gradient so the two cannot drift. safeInv is what makes a 2-D mesh
 // -- an emptyFvPatch of size 0 leaves dd singular in the empty direction -- invertible as OpenFOAM's
 // SymmTensor::safeInv does (SymmTensorI.H:368-421).
-std::vector<symmTensor> leastSquaresInvDd(
+// OVER THE WHOLE MESH (`at` null) OR OVER A SUBSET'S FACES AND CELLS (GradSubset, fvc.cuh): one body in the
+// source, so the subset's tensors are not a second transcription (what holds them to the whole mesh's bits is
+// said there). `dd` and `invDd` are the caller's -- fresh for the whole mesh, kept between calls for a subset,
+// whose listed entries alone are cleared here.
+void leastSquaresInvDdInto(
+    std::vector<symmTensor>& dd,
+    std::vector<symmTensor>& invDd,
     const PrimitiveMesh& m,
     const FvGeometry& g,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    const GradSubset* at)
 {
     const label nC  = m.nCells();
     const label nIf = m.nInternalFaces();
@@ -147,13 +154,27 @@ std::vector<symmTensor> leastSquaresInvDd(
     const std::vector<scalar>& w     = g.weights();
     const std::vector<scalar>& magSf = g.magSf();
     const std::vector<vector>& C     = g.C();
+    const label nCells = at ? static_cast<label>(at->cells.size()) : nC;
+    const label nFaces = at ? static_cast<label>(at->faces.size()) : nIf;
     // A COUPLED patch is folded in below, with the coupled weight and the patch's own delta, where it
     // used to be refused outright. A ROTATIONAL pair would need the neighbour value transformed into
     // this side's frame before the fit reads it; attachCyclicCoupling refuses one by name already, so
     // no patch that reaches here carries a transform.
-    std::vector<symmTensor> dd(nC, symmTensor{0, 0, 0, 0, 0, 0});
-    for (label f = 0; f < nIf; ++f)
+    if (dd.size() != static_cast<std::size_t>(nC) || invDd.size() != static_cast<std::size_t>(nC))
     {
+        dd.assign(static_cast<std::size_t>(nC), symmTensor{0, 0, 0, 0, 0, 0});
+        invDd.assign(static_cast<std::size_t>(nC), symmTensor{0, 0, 0, 0, 0, 0});
+    }
+    else
+    {
+        for (label k = 0; k < nCells; ++k)
+        {
+            dd[at ? at->cells[static_cast<std::size_t>(k)] : k] = symmTensor{0, 0, 0, 0, 0, 0};
+        }
+    }
+    for (label k = 0; k < nFaces; ++k)
+    {
+        const label f = at ? at->faces[static_cast<std::size_t>(k)] : k;
         const label o = own[f], n = nei[f];
         const vector d = C[n] - C[o];
         const symmTensor wdd = (magSf[f] / magSqr(d)) * sqr(d);
@@ -191,19 +212,35 @@ std::vector<symmTensor> leastSquaresInvDd(
             dd[c] = dd[c] + (fp.magSf[i] / magSqr(d)) * sqr(d);
         }
     }
-    std::vector<symmTensor> invDd(nC);
-    for (label c = 0; c < nC; ++c) invDd[c] = safeInv(dd[c]);
+    for (label k = 0; k < nCells; ++k)
+    {
+        const label c = at ? at->cells[static_cast<std::size_t>(k)] : k;
+        invDd[c] = safeInv(dd[c]);
+    }
+}
+
+std::vector<symmTensor> leastSquaresInvDd(
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    std::vector<symmTensor> dd;
+    std::vector<symmTensor> invDd;
+    leastSquaresInvDdInto(dd, invDd, m, g, patches, nullptr);
     return invDd;
 }
 
-} // namespace
-
-std::vector<vector> leastSquaresGrad(
+// The scalar gradient (leastSquaresGrad.C:60-110), with the fit vectors folded in at the face: over the whole
+// mesh or over a subset, one body, as the tensor above. `grad` is the caller's, as `dd` is there.
+void leastSquaresScalarInto(
+    std::vector<vector>& grad,
+    const std::vector<symmTensor>& invDd,
     const std::vector<scalar>& internal,
     const std::vector<std::vector<scalar>>& boundary,
     const PrimitiveMesh& m,
     const FvGeometry& g,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    const GradSubset* at)
 {
     const label nC  = m.nCells();
     const label nIf = m.nInternalFaces();
@@ -212,14 +249,22 @@ std::vector<vector> leastSquaresGrad(
     const std::vector<scalar>& w     = g.weights();
     const std::vector<scalar>& magSf = g.magSf();
     const std::vector<vector>& C     = g.C();
-
-    // ---- dd, the inverse-distance-weighted second-moment tensor (leastSquaresVectors.C:60-120) ----
-    const std::vector<symmTensor> invDd = leastSquaresInvDd(m, g, patches);
-
-    // ---- the gradient (leastSquaresGrad.C:60-110), with the fit vectors folded in at the face ----
-    std::vector<vector> grad(nC, vector{0, 0, 0});
-    for (label f = 0; f < nIf; ++f)
+    const label nCells = at ? static_cast<label>(at->cells.size()) : nC;
+    const label nFaces = at ? static_cast<label>(at->faces.size()) : nIf;
+    if (grad.size() != static_cast<std::size_t>(nC))
     {
+        grad.assign(static_cast<std::size_t>(nC), vector{0, 0, 0});
+    }
+    else
+    {
+        for (label k = 0; k < nCells; ++k)
+        {
+            grad[at ? at->cells[static_cast<std::size_t>(k)] : k] = vector{0, 0, 0};
+        }
+    }
+    for (label k = 0; k < nFaces; ++k)
+    {
+        const label f = at ? at->faces[static_cast<std::size_t>(k)] : k;
         const label o = own[f], n = nei[f];
         const vector d = C[n] - C[o];
         const scalar magSfByMagSqrd = magSf[f] / magSqr(d);
@@ -254,7 +299,67 @@ std::vector<vector> leastSquaresGrad(
     }
     // NOT divided by the cell volume: the fit vectors already carry the normalisation. Dividing here --
     // the reflex from gaussGrad above -- is the easy mistake.
+}
+
+} // namespace
+
+std::vector<vector> leastSquaresGrad(
+    const std::vector<scalar>& internal,
+    const std::vector<std::vector<scalar>>& boundary,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    // dd, the inverse-distance-weighted second-moment tensor (leastSquaresVectors.C:60-120)
+    const std::vector<symmTensor> invDd = leastSquaresInvDd(m, g, patches);
+    std::vector<vector> grad;
+    leastSquaresScalarInto(grad, invDd, internal, boundary, m, g, patches, nullptr);
     return grad;
+}
+
+GradSubset gradSubset(
+    const PrimitiveMesh& m,
+    std::vector<label> cells)
+{
+    GradSubset at;
+    at.cells = std::move(cells);
+    const label nC = m.nCells();
+    const label nIf = m.nInternalFaces();
+    std::vector<char> listed(static_cast<std::size_t>(nC), 0);
+    label last = -1;
+    for (const label c : at.cells)
+    {
+        if (c <= last || c >= nC)
+        {
+            throw std::runtime_error("brae fvc::gradSubset: the cells are not ascending, each once, and the "
+                                     "mesh's (cell " + std::to_string(c) + " after " + std::to_string(last)
+                                     + ", of " + std::to_string(nC) + ").");
+        }
+        listed[static_cast<std::size_t>(c)] = 1;
+        last = c;
+    }
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    for (label f = 0; f < nIf; ++f)
+    {
+        if (listed[static_cast<std::size_t>(own[f])] || listed[static_cast<std::size_t>(nei[f])])
+        {
+            at.faces.push_back(f);
+        }
+    }
+    return at;
+}
+
+void leastSquaresGradAt(
+    const std::vector<scalar>& internal,
+    const std::vector<std::vector<scalar>>& boundary,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    const GradSubset& at)
+{
+    leastSquaresInvDdInto(at.dd, at.invDd, m, g, patches, &at);
+    leastSquaresScalarInto(at.grad, at.invDd, internal, boundary, m, g, patches, &at);
 }
 
 // The VECTOR form, for grad(U): the same fit vectors, and OpenFOAM's `lsGrad[own] += ownLs[facei]*deltaVsf`

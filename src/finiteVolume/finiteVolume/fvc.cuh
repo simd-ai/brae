@@ -71,6 +71,43 @@ std::vector<vector> leastSquaresGrad(const std::vector<scalar>& internal,
                                      const FvGeometry& g,
                                      const std::vector<FvPatch>& patches);
 
+// A GRADIENT WANTED AT SOME CELLS ONLY. The interFoam alpha hooks need the normal on the patches' faces, which
+// reads the cell gradient at the patches' face cells -- a ninth of RAS/electrostaticDeposition's mesh -- and a
+// least-squares gradient with its cell limiter is LOCAL to a cell: its fit tensor, its sum and its limiter
+// take the cell's own faces and the values across them, nothing of a neighbour's gradient.
+// The subset is the cells and every internal face with one of them on either side, ascending, so that a face
+// loop over `faces` reaches each listed cell's faces in the order the loop over the whole mesh does.
+// leastSquaresGradAt (and cpu::cellLimitGradAt) run THE SAME FUNCTION BODY as the whole-mesh forms, handed the
+// listed faces and cells in place of all of them: one transcription, not a second one that has to agree with
+// the first. That is one body in the SOURCE -- the compiler is free to specialise it for the two call forms
+// (gcc -O3 clones the limiter's pass on `at == nullptr`), so that the two give the same bits at a listed cell
+// is HELD, not promised: by tests/test_grad_subset.cu, cell for cell, and by the driver's
+// BRAE_CONTROL_NHAT_BOUNDARY_CHECK at every call. Everywhere else the arrays hold nothing meaningful.
+struct GradSubset
+{
+    std::vector<label> cells;
+    std::vector<label> faces;
+    // sized to the mesh and KEPT between calls: a call clears the listed cells' entries, not the whole mesh's
+    mutable std::vector<symmTensor> dd;
+    mutable std::vector<symmTensor> invDd;
+    mutable std::vector<vector> grad;
+    mutable std::vector<scalar> maxVsf;
+    mutable std::vector<scalar> minVsf;
+    mutable std::vector<scalar> limiter;
+};
+// the subset of `cells` (ascending, each once): its faces found
+GradSubset gradSubset(
+    const PrimitiveMesh& m,
+    std::vector<label> cells);
+// the scalar least-squares gradient at the subset's cells, left in at.grad
+void leastSquaresGradAt(
+    const std::vector<scalar>& internal,
+    const std::vector<std::vector<scalar>>& boundary,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    const GradSubset& at);
+
 // Gauss gradient of a volVectorField -> volTensorField (grad(U)_ij = sum Sf_i U_j / V).
 //
 // Array form, and the one that carries the implementation. A caller may need the gradient of U taken

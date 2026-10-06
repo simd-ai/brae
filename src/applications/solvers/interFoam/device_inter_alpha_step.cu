@@ -5,6 +5,7 @@
 #include "device_alpha_flux.cuh"
 #include "device_interface_properties.cuh"
 #include "device_blas.cuh"
+#include <cmath>
 #include <vector>
 #include <string>
 #include <cstring>
@@ -143,6 +144,41 @@ void deviceInterAlphaStep(
         nu.resize(static_cast<std::size_t>(nC));
         deviceMixtureCorrect(a.data(), nC, props,
                              alpha2.data(), rho.data(), mu.data(), nu.data());
+    };
+    // WHERE THE CURVATURE PASS MOVES ALPHA'S PATCH VALUES, THE NEXT CORRECTOR TAKES THE ONES IT LEFT. On a
+    // contact angle correctContactAngle sets the wall gradient and evaluates (interfaceProperties.C:101-102),
+    // AFTER the pass's own cell gradient and `alpha2 = 1 - alpha1` have read the values -- which is why the hooks
+    // upload alpha1Bnd before it, and why correctMixture reads that upload. What comes next INSIDE the sub-step
+    // reads the values the pass left: the next corrector builds alphaPhiUn on them (alphaEqn.H:164-176;
+    // vanLeer's limiter takes fvc::grad(alpha1) on them). The device re-read the host's values only at the top
+    // of a sub-step, so a second corrector of the same sub-step, or the first after the MULESCorr pre-solve's
+    // pass, built its flux on the values from BEFORE the pass.
+    // FOUND 2026-10-06 by a reviewer reading, CONFIRMED by a run: laminar/capillaryRise restaged to nAlphaCorr 2,
+    // forty pinned steps, the host arm 4.9e-15 of OpenFOAM: the device arm alpha 3.1e-03, U 2.0e-03, p_rgh
+    // 2.7e-02. No shipped tutorial has a contact angle with a second corrector or with MULESCorr, which is how
+    // it stood.
+    // NOT AFTER THE PASS THAT FOLLOWS THE SUB-CYCLE: what the step hands back is what the rest of the time step
+    // reads, and that is the values from BEFORE that last pass (MEASURED: re-read there too, the first step of
+    // the same row has alpha at 1.8e-16 and U 3.9e-04, p_rgh 9.3e-04 from OpenFOAM).
+    //   BRAE_CONTROL_CONTACT_ANGLE_VALUES_BEFORE_PASS=1: a gate's CONTROL, deliberately wrong: not re-read
+    auto valuesThePassLeft = [&]()
+    {
+        if (!ctl.curvaturePassMovesPatches || !hooks.storedBoundary) return;
+        static const bool beforePass = std::getenv("BRAE_CONTROL_CONTACT_ANGLE_VALUES_BEFORE_PASS") != nullptr;
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            std::printf(beforePass
+                ? "  *** CONTROL MODE: after a curvature pass the next corrector reads a contact angle's patch "
+                  "values from before it. This run is deliberately wrong. ***\n"
+                : "  mixture.correct(): the next corrector reads alpha's patch values as the curvature pass left "
+                  "them (a contact angle's evaluate moves them)\n");
+        }
+        if (!beforePass)
+        {
+            hooks.storedBoundary(alpha1Bnd);
+        }
     };
 
     // which sub-cycle this is, 1-based -- the wave conditions' clock
@@ -301,6 +337,7 @@ void deviceInterAlphaStep(
             }
 
             correctMixture(alpha, true, false);                 // alphaEqn.H:151-153
+            valuesThePassLeft();
 
             // Cache the upwind-flux (alphaEqn.H:150), to be turned into the correction once the
             // correctors below have run. Held in the cache buffers themselves, as OpenFOAM holds it
@@ -327,6 +364,84 @@ void deviceInterAlphaStep(
                     hooks.updateModelledBoundary(subCycle, a, alpha1Bnd);
                 };
             }
+            // THE EVALUATE THAT OPENS THE LIMITED EXPLICIT SOLVE, on a case with no wave patch too.
+            // MULES::explicitSolve begins with psi.correctBoundaryConditions() (MULESTemplates.C:168), AFTER
+            // the high-order flux has been built on the stored patch values and BEFORE the limiter, which
+            // takes its extrema on a patch that fixes a value from the patch values (:338-347). The host's
+            // MULES makes it (mules_cpp.cu); this loop made it only where a wave model supplies the values,
+            // so everywhere else the limiter read the values the LAST evaluate left -- on the flux of the
+            // step before. They differ where a flux-conditional patch (inletOutlet,
+            // variableHeightFlowRate) has changed direction since and its cell does not hold the inlet
+            // value, and on a contact angle, whose evaluate does not repeat.
+            // MADE AT EVERY CORRECTOR, as OpenFOAM makes it. It was left out "where it repeats the evaluate
+            // before it" for a day: no shipped explicit case has a second corrector, and a sub-cycle is a
+            // time of its own (alphaEqnSubCycle.H:19-27), so the shortcut saved nothing a tutorial runs and
+            // rested on no patch class reading the time.
+            // HELD by tests/test_device_alpha_opening_evaluate.cu on a fixture built to see it (an
+            // inletOutlet side under the interface whose flux reverses every step: the device step is the
+            // host's to 4.4e-16 with it and 8.6e-04 from it without). NO SHIPPED CASE TELLS THE TWO APART. MEASURED
+            // 2026-10-06, device arm against OpenFOAM at pinned solves, made and skipped: capillaryRise 40
+            // steps 2.8e-14 and 5.2e-14 (what moves there is a fixed-gradient wall's value, which the
+            // limiter does not read), stokesI 40 steps and weirOverflow 60 the same bytes, the small static
+            // AMI fixture 5 steps 8.4e-13.
+            // COST, MEASURED the same day: the hook is 0.1-0.3 ms a call (capillaryRise, weirOverflow,
+            // nozzleFlow2D, eulerianInjection 0.2 at 420k cells), one call a sub-cycle on a shipped case.
+            //   BRAE_CONTROL_MULES_OPENING_EVALUATE_SKIPPED=1: never made without a wave patch, as before
+            //   BRAE_MULES_OPENING_EVALUATE_REPORT=1: how many patch values each one moved and by how much at
+            //     most (said when either grows)
+            else if (!ctl.MULESCorr && hooks.refreshBoundary)
+            {
+                static const bool skipped = std::getenv("BRAE_CONTROL_MULES_OPENING_EVALUATE_SKIPPED") != nullptr;
+                static const bool report = std::getenv("BRAE_MULES_OPENING_EVALUATE_REPORT") != nullptr;
+                static bool saidForm = false;
+                if (!saidForm)
+                {
+                    saidForm = true;
+                    std::printf(skipped
+                        ? "  *** CONTROL MODE: explicit MULES does not evaluate alpha's patches at the top of the "
+                          "limited solve, as before 2026-10-06 (BRAE_CONTROL_MULES_OPENING_EVALUATE_SKIPPED). Not "
+                          "OpenFOAM's form (MULESTemplates.C:168). ***\n"
+                        : "  explicit MULES: alpha's patches are evaluated at the top of the limited solve "
+                          "(MULESTemplates.C:168)\n");
+                }
+                if (!skipped)
+                {
+                    db.updateModelled = [&](const DeviceBuffer<scalar>& a)
+                    {
+                        std::vector<scalar> before;
+                        if (report)
+                        {
+                            alpha1Bnd.copyTo(before);
+                        }
+                        hooks.refreshBoundary(a, alpha1Bnd);
+                        if (!report) return;
+                        std::vector<scalar> after;
+                        alpha1Bnd.copyTo(after);
+                        long moved = 0;
+                        scalar most = 0;
+                        for (std::size_t k = 0; k < after.size() && k < before.size(); ++k)
+                        {
+                            if (std::memcmp(&after[k], &before[k], sizeof(scalar)) == 0) continue;
+                            ++moved;
+                            most = std::fmax(most, std::fabs(after[k] - before[k]));
+                        }
+                        static long calls = 0;
+                        static long movedMost = -1;
+                        static long movedTotal = 0;
+                        static scalar mostSeen = 0;
+                        ++calls;
+                        movedTotal += moved;
+                        if (moved > movedMost || most > mostSeen || calls == 1)
+                        {
+                            movedMost = moved > movedMost ? moved : movedMost;
+                            mostSeen = std::fmax(mostSeen, most);
+                            std::printf("  explicit MULES opening evaluate: %ld made, %ld patch values moved in "
+                                        "all, at most %ld in one and by %.3e\n", calls, movedTotal, movedMost,
+                                        (double)mostSeen);
+                        }
+                    };
+                }
+            }
             // every corrector but the first RELAXES on this path, and its boundary half is an
             // assignment -- see DeviceInterAlphaHooks::relaxBoundary
             const bool relaxes = ctl.MULESCorr && aCorr != 0 && static_cast<bool>(hooks.relaxBoundary);
@@ -339,6 +454,7 @@ void deviceInterAlphaStep(
                 hooks.relaxBoundary(postMules, alpha, alpha1Bnd);
             }
             correctMixture(alpha, true, relaxes);               // alphaEqn.H:223-225
+            valuesThePassLeft();
             lastRelaxed = relaxes;
         }
 
@@ -452,8 +568,20 @@ void deviceInterAlphaStep(
     // The momentum equation must be built on the NEW density -- a mixture of the alpha the step started with
     // is wrong by a factor of 1000 at a water/air interface, and converges -- and what gives it that is the
     // pass at the bottom of the last corrector, which has already run on this alpha; this one is OpenFOAM's
-    // second call of the same thing. alphaEqnSubCycle.H evaluates alpha nowhere after the sub-cycle, so the
-    // patch values stand as the last corrector left them -- an assignment, where it relaxed
+    // second call of the same thing.
+    //
+    // THIS PASS DOES NOT EVALUATE ALPHA'S PATCHES. mixture.correct() is calcNu() and calculateK()
+    // (immiscibleIncompressibleTwoPhaseMixture.H:78-82): the only patch it evaluates is a contact angle's,
+    // inside correctContactAngle (interfaceProperties.C:102), and alphaEqnSubCycle.H evaluates nothing after
+    // the sub-cycle -- so the patch values stand as the last corrector left them. It went through the hook
+    // that evaluates first (hooks.updateBoundary) wherever the last corrector had not relaxed, on the reading
+    // that an evaluate on unchanged cells changes nothing. On a contact angle with `limit gradient` it does:
+    // the evaluate clamps the gradient against the patch's own value. MEASURED 2026-10-05 on
+    // laminar/capillaryRise at pinned solves, the host arm 2.0e-15 from OpenFOAM throughout: the device arm
+    // the same until the twelfth step, then alpha 1.3e-03 from it in one step and, at the fortieth, alpha
+    // 2.1e-03, U 1.1e-03, p_rgh 1.9e-02; without the evaluate 2.0e-15, 4.8e-15 and 2.8e-14. The two-step and
+    // five-step gates that held this case end before the clamp bites.
+    //   BRAE_CONTROL_FINAL_MIXTURE_EVALUATES=1: a gate's CONTROL, deliberately wrong: the evaluate again
     //
     // THIS PASS REPEATS THE LAST CORRECTOR'S, AND IS LEFT OUT WHERE IT DOES. The last corrector ended with the
     // same hook, the same deviceInterfaceCorrect and the same deviceMixtureCorrect on this same alpha1 (the step
@@ -473,28 +601,41 @@ void deviceInterAlphaStep(
     //   * a coupled pair on the mesh: its interface sums are atomic, so two passes need not agree to the bit
     //     and the check below could not hold them;
     //   * a last pass on another buffer or of the other flavour, which no path here makes.
-    //   BRAE_CONTROL_MIXTURE_REPEAT_KEPT=1    the pass is always made, as before
-    //   BRAE_CONTROL_MIXTURE_REPEAT_CHECK=1   where it would be left out: what is left of the hook is run, as
-    //                                         the default path runs it, then the pass is made anyway, and the
-    //                                         eight buffers it writes and the HOST's state the hooks write
-    //                                         (hooks.mixtureHostState) are compared with what stood before it,
-    //                                         bitwise. `=host` compares the host's state alone.
-    //   BRAE_CONTROL_MIXTURE_REPEAT_LEFT_OUT_ANYWAY=1   a gate's CONTROL, deliberately wrong: left out whatever
-    //                                         the caller answered (a contact angle's pass is then missing)
-    //   BRAE_CONTROL_MIXTURE_REPEAT_NOTHING_LEFT=1   another: what is left of the hook
-    //                                         (hooks.mixtureRepeatLeftOut) is dropped too. Under the check it is
-    //                                         seen where a patch names rhoPhi (the host's rhoPhi boundary is
-    //                                         then the last sub-step's, not the sum). Without it, MEASURED on
-    //                                         the W rows of damBreakPermeable, solitaryGrimshaw and stokesI, 0
-    //                                         of 24 written files differ: the U hook pushes the same again
-    //                                         before anything reads it.
+    //   BRAE_CONTROL_MIXTURE_REPEAT_KEPT=1: the pass is always made, as before
+    //   BRAE_CONTROL_MIXTURE_REPEAT_CHECK=1: where it would be left out, what is left of the hook is run, as the
+    //     default path runs it, then the pass is made anyway, and the eight buffers it writes and the HOST's
+    //     state the hooks write (hooks.mixtureHostState) are compared with what stood before it, bitwise.
+    //     `=host` compares the host's state alone.
+    //   BRAE_CONTROL_MIXTURE_REPEAT_LEFT_OUT_ANYWAY=1: a gate's CONTROL, deliberately wrong: left out whatever
+    //     the caller answered (a contact angle's pass is then missing)
+    //   BRAE_CONTROL_MIXTURE_REPEAT_NOTHING_LEFT=1: another: what is left of the hook
+    //     (hooks.mixtureRepeatLeftOut) is dropped too. Under the check it is seen where a patch names rhoPhi
+    //     (the host's rhoPhi boundary is then the last sub-step's, not the sum). Without it, MEASURED on the W
+    //     rows of damBreakPermeable, solitaryGrimshaw and stokesI, 0 of 24 written files differ: the U hook
+    //     pushes the same again before anything reads it.
     static const bool repeatKept = std::getenv("BRAE_CONTROL_MIXTURE_REPEAT_KEPT") != nullptr;
     static const char* const repeatCheckEnv = std::getenv("BRAE_CONTROL_MIXTURE_REPEAT_CHECK");
     static const bool repeatCheck = repeatCheckEnv != nullptr;
     static const bool repeatCheckHostOnly = repeatCheck && std::string(repeatCheckEnv) == "host";
     static const bool repeatAnyway = std::getenv("BRAE_CONTROL_MIXTURE_REPEAT_LEFT_OUT_ANYWAY") != nullptr;
     static const bool repeatNothingLeft = std::getenv("BRAE_CONTROL_MIXTURE_REPEAT_NOTHING_LEFT") != nullptr;
-    const bool samePass = lastPassOn == &alpha1 && lastPassCurrent == lastRelaxed;
+    static const bool finalEvaluates = std::getenv("BRAE_CONTROL_FINAL_MIXTURE_EVALUATES") != nullptr;
+    // the pass's flavour: without the evaluate wherever the caller has the hook for it (the driver always has)
+    const bool finalCurrent = (!finalEvaluates && static_cast<bool>(hooks.mixtureCorrect)) ? true : lastRelaxed;
+    // (said where the evaluating pass is MADE: on a case that leaves the pass out the switch does nothing)
+    const auto sayFinalEvaluates = [&]()
+    {
+        static bool said = false;
+        if (finalEvaluates && !finalCurrent && !said)
+        {
+            said = true;
+            std::printf("  *** CONTROL MODE: the mixture.correct() after the alpha sub-cycle evaluates alpha's "
+                        "patches first. This run is deliberately wrong. ***\n");
+        }
+    };
+    // ...and whether it would repeat the last pass: without the evaluate it is that pass's mixture and
+    // curvature again, whichever flavour that pass was; with it, only where that pass evaluated too
+    const bool samePass = lastPassOn == &alpha1 && (finalCurrent || !lastPassCurrent);
     const bool pairOnMesh = in.cyc && in.cyc->n > 0;
     const bool callerSaysNo = !ctl.mixtureCorrectRepeats && !repeatAnyway;
     // the DECISION is these five; the text below is what the notice says of it
@@ -541,7 +682,8 @@ void deviceInterAlphaStep(
     }
     if (kept)
     {
-        correctMixture(alpha1, false, lastRelaxed);
+        sayFinalEvaluates();
+        correctMixture(alpha1, false, finalCurrent);
         return;
     }
     // what is left of the hook: the production path's, and under the check too, so that what the check takes
@@ -574,7 +716,8 @@ void deviceInterAlphaStep(
     }
     const std::vector<scalar> hostBefore =
         hooks.mixtureHostState ? hooks.mixtureHostState() : std::vector<scalar>();
-    correctMixture(alpha1, false, lastRelaxed);
+    sayFinalEvaluates();
+    correctMixture(alpha1, false, finalCurrent);
     std::size_t values = 0;
     for (const Held& h : held)
     {

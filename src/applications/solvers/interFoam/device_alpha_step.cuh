@@ -28,7 +28,7 @@
 //   in device_interface_properties.cuh.
 //
 //   ...AND THAT IS WHY THIS IS ONE CORRECTOR AND NOT THE WHOLE nAlphaCorr LOOP. OpenFOAM re-evaluates
-//   alpha's boundary at the END of every MULES solve (MULESTemplates.C:181) and the next corrector's
+//   alpha's boundary at the END of every MULES solve (MULESTemplates.C:80) and the next corrector's
 //   flux, gradient and limiter all read it. A call that looped internally could not do that, and would
 //   silently run correctors 2..n against the boundary corrector 1 started from. MEASURED, on a rotating
 //   blob at nAlphaCorr = 2: one corrector agreed with the host to 2.2e-16 and two to 5.7e-08, which is
@@ -154,10 +154,13 @@ struct DeviceAlphaBoundary
     // alpha1's boundaryField().updateCoeffs(), for a condition whose value a MODEL supplies (waveAlpha).
     // On the explicit path it is the correctBoundaryConditions() that OPENS MULES::explicitSolve
     // (MULESTemplates.C:168): AFTER the high-order flux has been built on the values the last update
-    // left, BEFORE the limiter. The call REWRITES the buffer `alpha1` above points at, and the
-    // corrector then builds the bounded flux's boundary on the new values -- upwind's boundary flux is
-    // phi_b*psi_b -- so the correction is no longer zero there. Null on a case with no such patch, and
-    // then nothing below changes by a bit. See inter_waves_cpp.cuh for what was and was not measured.
+    // left, BEFORE the limiter. The call REWRITES the buffer `alpha1` above points at -- through the wave
+    // model where a patch has one, through a plain evaluate of the patches otherwise (deviceInterAlphaStep
+    // sets it on every explicit corrector whose evaluate is not a repeat). The bounded flux's boundary is NOT
+    // rebuilt on the new values: limit() overwrites it with the high-order flux's on every uncoupled patch
+    // (:599-609), so the correction stays zero there and the new values reach the limiter through the
+    // fixes-value extrema alone (:338-347). Null = no evaluate there, and nothing below changes by a bit.
+    // See inter_waves_cpp.cuh for what was and was not measured.
     std::function<void(const DeviceBuffer<scalar>& alpha1)> updateModelled;
     // OUT, optional: alpha1 as MULES left it on a corrector that RELAXES (MULESCorr, every corrector but
     // the first), copied before the average. OpenFOAM's MULES::correct ends in

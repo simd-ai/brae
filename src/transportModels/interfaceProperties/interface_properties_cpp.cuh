@@ -207,6 +207,10 @@ struct NHatBoundaryStencil
     std::vector<label> start;     // per entry of `cells`: its internal faces, ascending
     std::vector<label> faces;
     std::vector<vector> gradAlpha;   // full size; only `cells` are ever written or read
+    // `cells` and every internal face that touches one, for a least-squares `nHat` taken at them alone
+    // (calculateNHatBoundaryOfSubsetGradient, which finds it at its first call); its arrays are kept between
+    // calls
+    fvc::GradSubset subset;
     // AN `empty` PATCH LEFT OUT: its cells are not in `cells` unless another patch puts them there, and
     // finishNHatBoundary writes ZERO on its faces. emptyFvPatch::size() is 0 in OpenFOAM, so there is no normal
     // there to form; brae keeps the faces in its addressing and every reader skips them (deviceDiv, by
@@ -234,6 +238,36 @@ void finishNHatBoundary(
     const std::vector<FvPatch>& patches,
     NHatBoundaryStencil& st,
     std::vector<vector>& acc,
+    SurfaceScalarField& nHatf);
+// THE BOUNDARY NORMAL WHERE THE BOUNDARY-ONLY FORM DOES NOT APPLY (a leastSquares or cellLimited `nHat`, or a
+// stencil a coupled pair leaves unusable): calculateK's own cell gradient over the whole mesh and its boundary
+// half, and nothing else of it -- no gradient at the faces, no internal faces' normal, no curvature, which is
+// what a caller that wants the patches' normal alone throws away. Bit for bit calculateK's nHatf.boundary, the
+// contact angle's write-back included; nHatf.internal comes back empty.
+void calculateNHatBoundaryOfWholeGradient(
+    const GeometricField<scalar>& alpha1,
+    const InterfaceCoeffs& c,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    SurfaceScalarField& nHatf);
+// ...AND FROM A LEAST-SQUARES GRADIENT TAKEN AT THE STENCIL'S CELLS ALONE, with its cell limiter where the case
+// names one. A least-squares fit and its limiter are local to a cell (fvc::GradSubset), so the patches' face
+// cells need no other cell's gradient: fvc::leastSquaresGradAt and cpu::cellLimitGradAt run the whole-mesh
+// functions' own loops over the stencil's faces and cells, and nHatBoundary reads the result there. Bit for bit
+// calculateK's nHatf.boundary on every patch the stencil holds (an `empty` one it leaves out takes zeros, as
+// in the Gauss form). nHatBoundaryOfSubsetApplies says when: an unsmoothed leastSquares `nHat` on a usable
+// stencil.
+bool nHatBoundaryOfSubsetApplies(
+    const InterfaceCoeffs& c,
+    const NHatBoundaryStencil& st);
+void calculateNHatBoundaryOfSubsetGradient(
+    const GeometricField<scalar>& alpha1,
+    const InterfaceCoeffs& c,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    NHatBoundaryStencil& st,
     SurfaceScalarField& nHatf);
 void calculateNHatBoundary(
     const GeometricField<scalar>& alpha1,

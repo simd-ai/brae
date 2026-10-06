@@ -77,7 +77,7 @@ void deviceInterfaceCurvature(
 // sub-cycle and UEqn.
 //
 // IT IS A SEPARATE CALL FROM THE ALPHA CORRECTOR ON PURPOSE. OpenFOAM runs it at alphaEqn.H:225, AFTER
-// MULES::explicitSolve has ended with psi.correctBoundaryConditions() (MULESTemplates.C:181) -- so the
+// MULES::explicitSolve has ended with psi.correctBoundaryConditions() (MULESTemplates.C:80) -- so the
 // gradient it takes sees alpha's NEW patch values, not the ones the corrector started from. Folding it
 // into deviceAlphaCorrector meant it read the pre-solve boundary; MEASURED on a rotating blob, that put
 // nHatf 2.885e-04 out on a field of scale 1.7e-03, which is 17%, and carried 3.2e-09 into alpha by the

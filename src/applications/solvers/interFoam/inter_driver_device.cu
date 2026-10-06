@@ -1554,8 +1554,164 @@ RunReport runInterFoamDevice(
             }
             return;
         }
-        std::vector<scalar> Kb;
-        interfaceProps::calculateK(f.alpha1, f.interface, m, g, fvp, false, nHb, Kb);
+        // NOT A CASE THE GAUSS BOUNDARY-ONLY FORM REPRODUCES: a leastSquares or cellLimited `nHat` (RAS/
+        // electrostaticDeposition's `default cellLimited leastSquares 1`, the one shipped tutorial), or a
+        // stencil a pair leaves unusable. The hook took calculateK WHOLE there, for a boundary normal: the
+        // least-squares fit and its limiter over every cell, the gradient at every face, the internal faces'
+        // normal and the curvature. Two forms replace it, each calculateK's patch normal to the bit:
+        //   * A LEAST-SQUARES nHat ON A USABLE STENCIL: the fit and the limiter at the patches' face cells
+        //     alone (calculateNHatBoundaryOfSubsetGradient) -- they are local to a cell, and the functions
+        //     that take the subset are the whole-mesh functions' own loops;
+        //   * ANYTHING ELSE: the whole mesh's cell gradient and calculateK's boundary half
+        //     (calculateNHatBoundaryOfWholeGradient), without what lies between and after.
+        // MEASURED 2026-10-05 on RAS/electrostaticDeposition (54,390 cells, 6,642 patch faces, six calls a
+        // step), a call: calculateK whole 3.65 ms; the whole gradient and the boundary half 2.85 (the fit
+        // tensor 0.85, the fit 0.73, the limiter 1.22, the boundary half 0.04).
+        //   BRAE_CONTROL_NHAT_FULL=1: calculateK whole, as before
+        //   BRAE_CONTROL_NHAT_WHOLE_GRADIENT=1: the second form where the first would apply
+        //   BRAE_CONTROL_NHAT_BOUNDARY_CHECK=1: calculateK whole as well, and every patch face's normal compared,
+        //     bitwise, with a count of the compared normals that were not zero (refused with a contact angle,
+        //     whose curvature pass would then be made twice)
+        //   BRAE_CONTROL_NHAT_SUBSET_SHORT=1: a gate's CONTROL, deliberately wrong: every other face of the
+        //     subset is left out of the first form (one face would do where alpha varies across it, and changes
+        //     nothing where it does not: the last face of the list, tried first, passed)
+        //   BRAE_CONTROL_NHAT_WHOLE_GRADIENT_STALE=1: another: the second form hands back the normal of its
+        //     first call at every later one
+        static const bool wholeCheck = std::getenv("BRAE_CONTROL_NHAT_BOUNDARY_CHECK") != nullptr;
+        static const bool wholeGradient = std::getenv("BRAE_CONTROL_NHAT_WHOLE_GRADIENT") != nullptr;
+        static const bool wholeStale = std::getenv("BRAE_CONTROL_NHAT_WHOLE_GRADIENT_STALE") != nullptr;
+        static const bool subsetShort = std::getenv("BRAE_CONTROL_NHAT_SUBSET_SHORT") != nullptr;
+        if (nHatFull)
+        {
+            static bool announcedFull = false;
+            if (!announcedFull)
+            {
+                announcedFull = true;
+                std::printf("  nHat: the alpha hooks take calculateK whole (BRAE_CONTROL_NHAT_FULL)\n");
+            }
+            std::vector<scalar> Kb;
+            interfaceProps::calculateK(f.alpha1, f.interface, m, g, fvp, false, nHb, Kb);
+            return;
+        }
+        const bool atSubset = !wholeGradient && interfaceProps::nHatBoundaryOfSubsetApplies(f.interface, nHatStencil);
+        static int announcedForm = -1;
+        if (announcedForm != (atSubset ? 1 : 0))
+        {
+            announcedForm = atSubset ? 1 : 0;
+            if (atSubset)
+            {
+                std::printf("  nHat: the alpha hooks take the boundary normal from a least-squares gradient at "
+                            "the boundary's own cells (%zu of %ld, %zu faces); BRAE_CONTROL_NHAT_WHOLE_GRADIENT=1 "
+                            "takes the whole mesh's gradient, BRAE_CONTROL_NHAT_FULL=1 calculateK whole\n",
+                            nHatStencil.subset.cells.size(), (long)m.nCells(), nHatStencil.subset.faces.size());
+            }
+            else
+            {
+                std::printf("  nHat: the alpha hooks take the boundary normal from the whole mesh's gradient, "
+                            "without the internal faces' normal or the curvature; BRAE_CONTROL_NHAT_FULL=1 takes "
+                            "calculateK whole\n");
+            }
+            if (atSubset && subsetShort)
+            {
+                std::printf("  *** CONTROL MODE: every other face of the boundary cells' subset is left out of "
+                            "the gradient. This run is deliberately wrong. ***\n");
+            }
+            if (!atSubset && wholeStale)
+            {
+                std::printf("  *** CONTROL MODE: the boundary normal handed back is the first call's. This run "
+                            "is deliberately wrong. ***\n");
+            }
+        }
+        if (atSubset)
+        {
+            static unsigned long long shortened = 0;
+            if (subsetShort && shortened != nHatStencilId && !nHatStencil.subset.faces.empty())
+            {
+                shortened = nHatStencilId;
+                std::vector<label> kept;
+                for (std::size_t k = 0; k < nHatStencil.subset.faces.size(); k += 2)
+                {
+                    kept.push_back(nHatStencil.subset.faces[k]);
+                }
+                nHatStencil.subset.faces = kept;
+            }
+            interfaceProps::calculateNHatBoundaryOfSubsetGradient(f.alpha1, f.interface, m, g, fvp, nHatStencil,
+                                                                  nHb);
+        }
+        else
+        {
+            static SurfaceScalarField firstNormal;
+            if (wholeStale && firstNormal.boundary.size() == fvp.size())
+            {
+                nHb = firstNormal;
+            }
+            else
+            {
+                interfaceProps::calculateNHatBoundaryOfWholeGradient(f.alpha1, f.interface, m, g, fvp, nHb);
+                if (wholeStale)
+                {
+                    firstNormal = nHb;
+                }
+            }
+        }
+        if (!wholeCheck) return;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (f.alpha1.boundary[pi]->contactAngleTheta0() < scalar(0)) continue;
+            throw std::runtime_error(
+                "brae interFoam (device): BRAE_CONTROL_NHAT_BOUNDARY_CHECK on a case whose nHat is not Gauss "
+                "linear and whose patch `" + fvp[pi].name + "` is a contact angle: the check would make that "
+                "patch's curvature pass twice.");
+        }
+        SurfaceScalarField whole;
+        std::vector<scalar> Kwhole;
+        interfaceProps::calculateK(f.alpha1, f.interface, m, g, fvp, false, whole, Kwhole);
+        std::size_t faces = 0;
+        std::size_t nonZero = 0;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            // an `empty` patch the stencil leaves out takes zeros, by design (NHatBoundaryStencil::skipEmpty)
+            if (atSubset && nHatStencil.skipEmpty && fvp[pi].type == "empty") continue;
+            // a normal that is zero holds a sign and nothing of the gradient: said, so that a fixture whose
+            // patches have no normal gradient is seen for what it is
+            for (const scalar v : whole.boundary[pi])
+            {
+                nonZero += v != scalar(0) ? 1 : 0;
+            }
+            if (whole.boundary[pi].size() == nHb.boundary[pi].size()
+             && (whole.boundary[pi].empty()
+              || std::memcmp(whole.boundary[pi].data(), nHb.boundary[pi].data(),
+                             whole.boundary[pi].size()*sizeof(scalar)) == 0))
+            {
+                faces += whole.boundary[pi].size();
+                continue;
+            }
+            std::size_t at = 0;
+            while (at < whole.boundary[pi].size() && at < nHb.boundary[pi].size()
+                && std::memcmp(&whole.boundary[pi][at], &nHb.boundary[pi][at], sizeof(scalar)) == 0)
+            {
+                ++at;
+            }
+            char buf[400];
+            std::snprintf(buf, sizeof(buf),
+                          "brae interFoam (device): BRAE_CONTROL_NHAT_BOUNDARY_CHECK: the boundary normal of "
+                          "patch %s, face %zu of %zu is %.17g from %s and %.17g from calculateK whole.",
+                          fvp[pi].name.c_str(), at, whole.boundary[pi].size(),
+                          at < nHb.boundary[pi].size() ? (double)nHb.boundary[pi][at] : 0.0,
+                          atSubset ? "the gradient at the boundary's cells" : "the whole gradient alone",
+                          at < whole.boundary[pi].size() ? (double)whole.boundary[pi][at] : 0.0);
+            throw std::runtime_error(buf);
+        }
+        static long checked = 0;
+        static std::size_t mostNonZero = 0;
+        ++checked;
+        if (checked <= 10 || checked % 1000 == 0 || nonZero > mostNonZero)
+        {
+            mostNonZero = nonZero > mostNonZero ? nonZero : mostNonZero;
+            std::printf("  nHat %s check: %ld calls, each %zu patch faces' normal calculateK's, bitwise; at most "
+                        "%zu of them not zero\n", atSubset ? "boundary-cells gradient" : "whole-gradient",
+                        checked, faces, mostNonZero);
+        }
     };
 
     // the hooks: every one is per-patch host work, and nothing else
@@ -3487,6 +3643,16 @@ RunReport runInterFoamDevice(
         }
         C.alpha.mixtureCorrectRepeats = why.empty();
         C.alpha.mixtureRepeatKeptFor = why;
+        // ...and whether the curvature pass moves alpha's patch values on the host (a contact angle): the step
+        // then takes the values the pass left, not the ones the hook uploaded in front of it
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (f.alpha1.boundary[pi]->contactAngleTheta0() >= scalar(0))
+            {
+                C.alpha.curvaturePassMovesPatches = true;
+            }
+        }
     }
     // THE CASE'S OWN alpha SOLVE: its smoother where it names a Gauss-Seidel one (the device has
     // OpenFOAM's, level-scheduled and exact), and its tolerances either way. See deviceAlphaPreSolve.

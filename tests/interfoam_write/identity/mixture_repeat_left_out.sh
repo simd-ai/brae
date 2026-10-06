@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # The write gate: the mixture.correct() after the alpha sub-cycle LEFT OUT where it repeats the last
 # corrector's, against the pass made as before (BRAE_CONTROL_MIXTURE_REPEAT_KEPT=1), on four W rows:
-# laminar/waves/stokesI (explicit MULES, three sub-cycles, a wave inlet: the pass that evaluates alpha's
-# patches); laminar/waves/solitaryGrimshaw (the same, and its p_rgh names `phi rhoPhi`, whose boundary the
-# sub-cycle has just summed -- what is left of the hook pushes the flux whole there); laminar/damBreakPermeable
-# (MULESCorr with a relaxed second corrector: the pass that does not evaluate, and the two wall conditions that
-# read alpha's patch values -- what is left of the hook tells them); and laminar/sloshingTank2D, a mesh that
-# moves, rigidly, under its sub-cycles (the dynamic-mesh hooks run in the step).
+# laminar/waves/stokesI (explicit MULES, three sub-cycles, a wave inlet); laminar/waves/solitaryGrimshaw (the
+# same, and its p_rgh names `phi rhoPhi`, whose boundary the sub-cycle has just summed -- what is left of the
+# hook pushes the flux whole there); laminar/damBreakPermeable (MULESCorr with a relaxed second corrector, and
+# the two wall conditions that read alpha's patch values -- what is left of the hook tells them); and
+# laminar/sloshingTank2D, a mesh that moves, rigidly, under its sub-cycles (the dynamic-mesh hooks run in the
+# step). On every row the pass is the one that evaluates no patch (see (b)).
 # interFoam.C:154 calls mixture.correct() after alphaEqnSubCycle.H, and alphaEqn.H:225 has just called it at
 # the bottom of the last corrector: the same curvature, normal and mixture from the same alpha. The device loop
 # made both, a host hook and a dozen kernels each. MEASURED 2026-10-05 over three pairs:
@@ -17,9 +17,9 @@
 # pass and compares the eight device buffers it writes and the host's state before and after, bitwise, and
 # must say so at every step with both counts above zero; (b) the hook's CALLS a step, from a second pair run
 # with the phase table (BRAE_INTER_PHASE_TIME=1, which no byte comparison here leans on): the default makes
-# exactly one call fewer of the hook the last pass takes (updateBoundary, or mixtureCorrect where the last
-# corrector relaxed) and one of what is left -- a default run that said `left out` and made the pass would
-# write the same files.
+# exactly one call fewer of the hook that pass takes -- mixtureCorrect, the one that evaluates no patch
+# (subcycle/final_mixture_no_evaluate.sh) -- none fewer of updateBoundary, and one of what is left. A default
+# run that said `left out` and made the pass would write the same files.
 # CONTROLS, one line. laminar/capillaryRise, whose wall is a contact angle, where the pass is NOT a repeat:
 # the default run says it makes it and writes the made arm's files; left out all the same
 # (BRAE_CONTROL_MIXTURE_REPEAT_LEFT_OUT_ANYWAY=1) the run finishes and its files differ; under the check it
@@ -28,8 +28,9 @@
 # names the flux the sub-cycle has just summed). And what is left of the hook dropped
 # (BRAE_CONTROL_MIXTURE_REPEAT_NOTHING_LEFT=1) under the check on solitaryGrimshaw: the host's rhoPhi boundary
 # is then the last sub-step's and the check stops.
-# The check over every tutorial of the table, 2026-10-05: 38 of 42 leave the pass out, and at every one of
-# their 1,137 steps the pass left the eight buffers and the host's state as they stood; four make it
+# The check over every tutorial of the table, 2026-10-05 (taken while the explicit rows' pass still evaluated
+# alpha's patches first -- a stronger pass than the one made now): 38 of 42 leave the pass out, and at every
+# one of their 1,137 steps the pass left the eight buffers and the host's state as they stood; four make it
 # (capillaryRise's contact angle, the three with a coupled pair). Three skeptics reading the code as it stood
 # before the change for a configuration that breaks the claim found none.
 # DOES NOT CLAIM: file identity on a mesh whose cells CHANGE VOLUME under a sub-cycle (the wave makers: they
@@ -98,19 +99,18 @@ calls()
     c=$(grep -a "hook alpha\.$2 " "$1" | head -1 | sed -n -E 's/.*\(([0-9.]+) calls\/step\).*/\1/p')
     echo "${c:-0}"
 }
-# verdict <key> <tag> <update|mixture>: the three arms read, as "<ok|no> <files an arm> <default differs>
-# <checked differs> <passes checked> <the last pass's hook: calls a step made> <default>". ok: each arm says
-# which path it took; no written file of the default or the checked arm differs from the made arm's; the check
-# says, at every step, that the buffers and the host's state stood; and the default arm makes one call a step
-# fewer of the hook named -- none fewer of the other -- and one of what is left
+# verdict <key> <tag>: the three arms read, as "<ok|no> <files an arm> <default differs> <checked differs>
+# <passes checked> <mixtureCorrect calls a step made> <default>". ok: each arm says which path it took; no
+# written file of the default or the checked arm differs from the made arm's; the check says, at every step,
+# that the buffers and the host's state stood; and the default arm makes one mixtureCorrect call a step
+# fewer -- no updateBoundary call fewer -- and one of what is left
 verdict()
 {
     local o="$W/w_of_$1" tag="$2" hook other t n1 n2 last passes steps said=ok
     local m="$W/${tag}_made/log.brae" d="$W/${tag}_default/log.brae" c="$W/${tag}_checked/log.brae"
     local mt="$W/${tag}_madeTimed/log.brae" dt="$W/${tag}_defaultTimed/log.brae"
-    hook=updateBoundary
-    other=mixtureCorrect
-    [ "$3" = mixture ] && { hook=mixtureCorrect; other=updateBoundary; }
+    hook=mixtureCorrect
+    other=updateBoundary
     t=$(for td in $(timedirs "$W/${tag}_made"); do find "$W/${tag}_made/$td" -type f; done | wc -l)
     n1=$(same "$W/${tag}_made" "$W/${tag}_default" "$o")
     n2=$(same "$W/${tag}_made" "$W/${tag}_checked" "$o")
@@ -165,13 +165,13 @@ PY
 )
 above "$movedBy" 1e-4 \
     || { say "PREMISE  sloshingTank2D's mesh moved in the row's steps [$movedBy m]" FAIL; finish "mixture repeat"; }
-read -r v1 t1 a1 b1 p1 m1 d1 <<< "$(verdict stokesI mrs update)"
-read -r v2 t2 a2 b2 p2 m2 d2 <<< "$(verdict solitaryGrimshaw mrg update)"
+read -r v1 t1 a1 b1 p1 m1 d1 <<< "$(verdict stokesI mrs)"
+read -r v2 t2 a2 b2 p2 m2 d2 <<< "$(verdict solitaryGrimshaw mrg)"
 what="[device] explicit: stokesI $t1 files, $a1 and $b1 differ, hook $m1 -> $d1 calls a step; solitaryGrimshaw"
 what="$what (rhoPhi) $t2, $a2 and $b2, $m2 -> $d2"
 [ "$v1" = ok ] && [ "$v2" = ok ] && say "$what" ok || say "$what" FAIL
-read -r v3 t3 a3 b3 p3 m3 d3 <<< "$(verdict damBreakPermeable mrp mixture)"
-read -r v4 t4 a4 b4 p4 m4 d4 <<< "$(verdict sloshingTank2D mrt update)"
+read -r v3 t3 a3 b3 p3 m3 d3 <<< "$(verdict damBreakPermeable mrp)"
+read -r v4 t4 a4 b4 p4 m4 d4 <<< "$(verdict sloshingTank2D mrt)"
 what="[device] relaxed: damBreakPermeable $t3 files, $a3 and $b3 differ, hook $m3 -> $d3; moving: sloshingTank2D"
 what="$what $t4, $a4 and $b4, $m4 -> $d4"
 [ "$v3" = ok ] && [ "$v4" = ok ] && say "$what" ok || say "$what" FAIL

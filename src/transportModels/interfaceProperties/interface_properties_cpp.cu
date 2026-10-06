@@ -302,29 +302,22 @@ void nHatBoundary(
 
 }
 
-void calculateK(const GeometricField<scalar>& alpha1,
-                const InterfaceCoeffs&        c,
-                const PrimitiveMesh&          m,
-                const FvGeometry&             g,
-                const std::vector<FvPatch>&   patches,
-                bool                          gradLeastSquares,
-                SurfaceScalarField&           nHatf,
-                std::vector<scalar>&          K)
-{
-    // THE CONSTRUCTOR'S deltaN, not this mesh's: OpenFOAM's is a member set once and a deforming
-    // mesh does not move it (interfaceProperties.C:190-195, and the note on InterfaceCoeffs::deltaN)
-    if (!(c.deltaN > scalar(0)))
-        throw std::runtime_error(
-            "brae interfaceProperties::calculateK: InterfaceCoeffs::deltaN is unset. It is "
-            "1e-8/cbrt(average(mesh.V())) AT CONSTRUCTION -- the caller has to take it once, from the "
-            "mesh as it stands then, because on a mesh that deforms recomputing it is a different "
-            "number from OpenFOAM's.");
-    const scalar dN = c.deltaN;
+namespace {
 
-    // 1. the cell gradient, optionally smoothed first. `fvc::grad(alpha1, "nHat")` looks up the
-    //    gradSchemes entry NAMED nHat -- not grad(alpha.water) and not default. 43 of the 44 shipped
-    //    tutorials say `default Gauss linear` and name no nHat entry, so they fall to that; the
-    //    caller resolves which, and passing the wrong one changes the interface normal.
+// calculateK's step 1, the cell gradient the normal is formed from. ONE function for calculateK and for
+// calculateNHatBoundaryOfWholeGradient, so the boundary normal the second hands back cannot be another
+// gradient's than the first's.
+std::vector<vector> nHatCellGradient(
+    const GeometricField<scalar>& alpha1,
+    const InterfaceCoeffs& c,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    bool gradLeastSquares)
+{
+    // `fvc::grad(alpha1, "nHat")` looks up the gradSchemes entry NAMED nHat -- not grad(alpha.water) and
+    // not default. 43 of the 44 shipped tutorials say `default Gauss linear` and name no nHat entry, so
+    // they fall to that; the caller resolves which, and passing the wrong one changes the interface normal.
     // the caller's flag, or the case's own `nHat` entry (InterfaceCoeffs::nHatGrad)
     GradChoice nHatGrad = c.nHatGrad;
     nHatGrad.leastSquares = nHatGrad.leastSquares || gradLeastSquares;
@@ -371,6 +364,35 @@ void calculateK(const GeometricField<scalar>& alpha1,
         }
         gradAlpha = gaussGradFromValues(a, ab, m, g, patches);
     }
+    return gradAlpha;
+}
+
+} // namespace
+
+void calculateK(
+    const GeometricField<scalar>& alpha1,
+    const InterfaceCoeffs& c,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    bool gradLeastSquares,
+    SurfaceScalarField& nHatf,
+    std::vector<scalar>& K)
+{
+    // THE CONSTRUCTOR'S deltaN, not this mesh's: OpenFOAM's is a member set once and a deforming
+    // mesh does not move it (interfaceProperties.C:190-195, and the note on InterfaceCoeffs::deltaN)
+    if (!(c.deltaN > scalar(0)))
+    {
+        throw std::runtime_error(
+            "brae interfaceProperties::calculateK: InterfaceCoeffs::deltaN is unset. It is "
+            "1e-8/cbrt(average(mesh.V())) AT CONSTRUCTION -- the caller has to take it once, from the "
+            "mesh as it stands then, because on a mesh that deforms recomputing it is a different "
+            "number from OpenFOAM's.");
+    }
+    const scalar dN = c.deltaN;
+
+    // 1. the cell gradient, optionally smoothed first (nHatCellGradient)
+    const std::vector<vector> gradAlpha = nHatCellGradient(alpha1, c, m, g, patches, gradLeastSquares);
 
     // 2. interpolate the cell gradient to faces, component by component.
     const label nIf = m.nInternalFaces();
@@ -524,6 +546,81 @@ void calculateNHatBoundary(
         }
     }
     finishNHatBoundary(alpha1, c, g, patches, st, acc, nHatf);
+}
+
+void calculateNHatBoundaryOfWholeGradient(
+    const GeometricField<scalar>& alpha1,
+    const InterfaceCoeffs& c,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    SurfaceScalarField& nHatf)
+{
+    if (!(c.deltaN > scalar(0)))
+    {
+        throw std::runtime_error("brae interfaceProperties::calculateNHatBoundaryOfWholeGradient: "
+                                 "InterfaceCoeffs::deltaN is unset.");
+    }
+    // calculateK's step 1 and its boundary half, with nothing of what lies between them or after: the
+    // gradient at the faces, the internal faces' normal and the curvature feed no patch face's normal
+    const std::vector<vector> gradAlpha = nHatCellGradient(alpha1, c, m, g, patches, false);
+    nHatf.internal.clear();
+    nHatBoundary(alpha1, c.deltaN, g, patches, gradAlpha, nHatf);
+}
+
+bool nHatBoundaryOfSubsetApplies(
+    const InterfaceCoeffs& c,
+    const NHatBoundaryStencil& st)
+{
+    return st.usable && c.nAlphaSmoothCurvature < 1 && c.nHatGrad.leastSquares;
+}
+
+void calculateNHatBoundaryOfSubsetGradient(
+    const GeometricField<scalar>& alpha1,
+    const InterfaceCoeffs& c,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    NHatBoundaryStencil& st,
+    SurfaceScalarField& nHatf)
+{
+    if (!nHatBoundaryOfSubsetApplies(c, st))
+    {
+        throw std::runtime_error(
+            "brae interfaceProperties::calculateNHatBoundaryOfSubsetGradient: the case's nHat is not an "
+            "unsmoothed leastSquares gradient on a stencil that holds every cell it reads; "
+            "calculateNHatBoundaryOfWholeGradient is the call for it.");
+    }
+    if (!(c.deltaN > scalar(0)))
+    {
+        throw std::runtime_error("brae interfaceProperties::calculateNHatBoundaryOfSubsetGradient: "
+                                 "InterfaceCoeffs::deltaN is unset.");
+    }
+    // the patch values, as gradOf's two field forms take them (fvc::leastSquaresGrad, cpu::cellLimitGrad)
+    std::vector<std::vector<scalar>> bnd(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (c.nHatGrad.cellLimitK > scalar(0) && alpha1.boundary[pi]->coupledJump())
+        {
+            throw std::runtime_error(
+                "brae: a cellLimited gradient of a field with a jump across the coupled patch '"
+                + patches[pi].name + "' is not ported.");
+        }
+        bnd[pi] = alpha1.boundary[pi]->value();
+    }
+    // the subset is found at the first call that wants it: a Gauss-linear case builds the stencil at every
+    // change of topology and never reads this
+    if (st.subset.cells.size() != st.cells.size())
+    {
+        st.subset = fvc::gradSubset(m, st.cells);
+    }
+    fvc::leastSquaresGradAt(alpha1.internal, bnd, m, g, patches, st.subset);
+    if (c.nHatGrad.cellLimitK > scalar(0))
+    {
+        cellLimitGradAt(st.subset, alpha1.internal, bnd, c.nHatGrad.cellLimitK, m, g, patches);
+    }
+    nHatf.internal.clear();
+    nHatBoundary(alpha1, c.deltaN, g, patches, st.subset.grad, nHatf, st.skipEmpty);
 }
 
 void finishNHatBoundary(

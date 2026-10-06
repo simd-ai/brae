@@ -27,6 +27,7 @@
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
+#include "fvc.cuh"
 #include "geometric_field.cuh"
 
 #include <vector>
@@ -49,6 +50,18 @@ void cellLimitGrad(
     const PrimitiveMesh&                    m,
     const FvGeometry&                       g,
     const std::vector<FvPatch>&             patches);
+
+// ...and AT A SUBSET'S CELLS (fvc::GradSubset): at.grad, as fvc::leastSquaresGradAt left it, limited in place.
+// The whole-mesh form's own pass over the listed faces and cells -- the result at a listed cell is that form's
+// to the bit.
+void cellLimitGradAt(
+    const fvc::GradSubset& at,
+    const std::vector<scalar>& vsf,
+    const std::vector<std::vector<scalar>>& vsfBnd,
+    scalar k,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches);
 
 void cellLimitGrad(
     std::vector<vector>&          grad,   // in/out, per cell

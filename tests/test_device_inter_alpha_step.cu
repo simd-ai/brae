@@ -168,6 +168,7 @@ int main()
     long hookCalls = 0;
     long mixtureCalls = 0;
     long leftOutCalls = 0;
+    long refreshCalls = 0;
     DeviceInterAlphaHooks hooks;
     hooks.updateBoundary =
         [&](const DeviceBuffer<scalar>& a, DeviceBuffer<scalar>& aBnd, DeviceBuffer<scalar>& nBnd)
@@ -215,12 +216,15 @@ int main()
         std::vector<scalar> alphaBnd;
         std::vector<scalar> nHatfBnd;
     };
+    // the correctors a device run makes: the file's, but for the one run of arm 6 that takes one
+    int nAlphaCorrNow = nAlphaCorr;
     auto runDevice = [&](
         int steps,
         bool mulesCorr,
         bool skipFinalMixture,
         bool leaveRepeatOut = false,
-        bool relaxedHooks = false)
+        bool relaxedHooks = false,
+        bool driverHooks = false)
     {
         // the caller's two halves of "the pass after the sub-cycle repeats": the answer and what is left
         DeviceInterAlphaHooks hooksNow = hooks;
@@ -233,7 +237,8 @@ int main()
         }
         // ...and the pair a relaxed corrector takes (arm 5): on these zero-gradient patches the relaxation's
         // assignment is the relaxed cells' values, and the pass after it must not evaluate
-        if (relaxedHooks)
+        // (and arm 6, the explicit path with the hooks the driver hands every step: the two come as a pair)
+        if (relaxedHooks || driverHooks)
         {
             hooksNow.relaxBoundary = [&](
                 const DeviceBuffer<scalar>&,
@@ -258,6 +263,26 @@ int main()
                 nBnd.copyFrom(flatten(nHb.boundary));
             };
         }
+        // ...and the evaluate that opens the limited explicit solve (arm 6), with the hook that hands the top of
+        // a sub-step the patch values AS THEY STAND -- the driver gives both, and without the second the step
+        // would take its top-of-sub-step values through refreshBoundary and the count would be of two things
+        if (driverHooks)
+        {
+            hooksNow.storedBoundary = [&](
+                DeviceBuffer<scalar>& aBnd)
+            {
+                aBnd.copyFrom(patchValues());
+            };
+            hooksNow.refreshBoundary = [&](
+                const DeviceBuffer<scalar>& a,
+                DeviceBuffer<scalar>& aBnd)
+            {
+                ++refreshCalls;
+                a.copyTo(work.internal);
+                work.evaluateBoundary();
+                aBnd.copyFrom(patchValues());
+            };
+        }
         work.internal = a0;
         work.evaluateBoundary();
         SurfaceScalarField nH0;
@@ -269,9 +294,9 @@ int main()
 
         DeviceInterAlphaControls ctl;
         ctl.nAlphaSubCycles = nSub;
-        ctl.nAlphaCorr      = nAlphaCorr;
-        ctl.MULESCorr       = mulesCorr;
-        ctl.preSolve.tol    = scalar(1e-12);
+        ctl.nAlphaCorr = nAlphaCorrNow;
+        ctl.MULESCorr = mulesCorr;
+        ctl.preSolve.tol = scalar(1e-12);
         ctl.preSolve.maxIter = 2000;
         ctl.mixtureCorrectRepeats = leaveRepeatOut;
 
@@ -424,10 +449,29 @@ int main()
     // interFoam.C:154's mixture.correct() repeats the one at the bottom of the last corrector (alphaEqn.H:225)
     // on the same alpha. With the caller's answer and its hook for what is left, the step makes one hook call
     // fewer a step and everything it hands back is the same to the bit; without them (every run above) the
-    // pass is made. Both flavours of that pass: the explicit path ends on the hook that evaluates
-    // (updateBoundary), a MULESCorr step whose second corrector relaxes ends on the one that does not
-    // (mixtureCorrect). WHAT THIS ARM HOLDS IS THE STEP AND ITS KERNELS: the patches here are zero-gradient,
-    // so the host half -- whether a real case's hook repeats -- is the caller's answer and is not under test.
+    // pass is made. Both flavours of that pass: the explicit run here has NO mixtureCorrect hook, so its pass
+    // takes the step's fallback, the hook that evaluates (updateBoundary) -- a form only a fixture has, the
+    // driver always gives the hook (arm 6 runs the driver's form); a MULESCorr step whose second corrector
+    // relaxes ends on the hook that does not evaluate (mixtureCorrect). WHAT THIS ARM HOLDS IS THE STEP AND ITS
+    // KERNELS: the patches here are zero-gradient, so the host half -- whether a real case's hook repeats -- is
+    // the caller's answer and is not under test.
+    const auto sameBits = [](
+        const std::vector<scalar>& a,
+        const std::vector<scalar>& b)
+    {
+        return a.size() == b.size() && !a.empty()
+            && std::memcmp(a.data(), b.data(), a.size()*sizeof(scalar)) == 0;
+    };
+    // the eleven fields the step hands back, to the bit
+    const auto sameResult = [&](
+        const DevResult& a,
+        const DevResult& b)
+    {
+        return sameBits(a.alpha, b.alpha) && sameBits(a.rho, b.rho) && sameBits(a.rhoPhi, b.rhoPhi)
+            && sameBits(a.rhoPhiBnd, b.rhoPhiBnd) && sameBits(a.K, b.K) && sameBits(a.nu, b.nu)
+            && sameBits(a.mu, b.mu) && sameBits(a.alpha2, b.alpha2) && sameBits(a.nHatf, b.nHatf)
+            && sameBits(a.alphaBnd, b.alphaBnd) && sameBits(a.nHatfBnd, b.nHatfBnd);
+    };
     for (const bool relaxed : {false, true})
     {
         const long hooksBefore = hookCalls;
@@ -440,18 +484,7 @@ int main()
         const long leftHooks = hookCalls - hooksBefore - madeHooks;
         const long leftMix = mixtureCalls - mixBefore - madeMix;
         const long leftOver = leftOutCalls - leftBefore;
-        const auto sameBits = [](
-            const std::vector<scalar>& a,
-            const std::vector<scalar>& b)
-        {
-            return a.size() == b.size() && !a.empty()
-                && std::memcmp(a.data(), b.data(), a.size()*sizeof(scalar)) == 0;
-        };
-        const bool same = sameBits(made.alpha, left.alpha) && sameBits(made.rho, left.rho)
-                       && sameBits(made.rhoPhi, left.rhoPhi) && sameBits(made.rhoPhiBnd, left.rhoPhiBnd)
-                       && sameBits(made.K, left.K) && sameBits(made.nu, left.nu) && sameBits(made.mu, left.mu)
-                       && sameBits(made.alpha2, left.alpha2) && sameBits(made.nHatf, left.nHatf)
-                       && sameBits(made.alphaBnd, left.alphaBnd) && sameBits(made.nHatfBnd, left.nHatfBnd);
+        const bool same = sameResult(made, left);
         std::printf("  the pass after the sub-cycle left out (%s): updateBoundary %ld calls against %ld, "
                     "mixtureCorrect %ld against %ld over %d steps, %ld calls of what is left; the eleven fields "
                     "handed back %s\n", relaxed ? "MULESCorr, relaxed" : "explicit", leftHooks, madeHooks,
@@ -466,6 +499,68 @@ int main()
         check(relaxed ? "...and relaxed, the eleven fields handed back are the same to the bit"
                       : "...and the eleven fields handed back are the same to the bit",
               same);
+    }
+
+    // 6: the explicit path with the two hooks the DRIVER hands it, which no arm above has
+    // (a) The pass after the sub-cycle takes the hook that evaluates NO patch (mixtureCorrect): interFoam.C:154's
+    // mixture.correct() evaluates none but a contact angle's, inside correctContactAngle. It took updateBoundary
+    // until 2026-10-06, and a contact angle with `limit gradient` does not repeat under a second evaluate
+    // (capillaryRise, 2.1e-03 of OpenFOAM at forty steps; tests/interfoam_write/subcycle/
+    // final_mixture_no_evaluate.sh). (b) The evaluate that opens the limited solve (MULESTemplates.C:168) is
+    // made through refreshBoundary at every corrector, whatever the caller says of its hook (where it says the
+    // hook repeats, the pass after the sub-cycle is left out and this evaluate is still made). WHAT THIS ARM
+    // HOLDS IS THE CALLS -- tests/test_device_alpha_opening_evaluate.cu holds what the evaluate does to the
+    // answer: the patches here are zero-gradient,
+    // so neither moves a value and everything handed back must be the plain explicit run's to the bit. (The
+    // plain run has no hook but updateBoundary: its calls are the correctors', one a sub-step for the values
+    // at its top, and the pass after the sub-cycle.)
+    // SHOWN RED by hand, 2026-10-06: BRAE_CONTROL_FINAL_MIXTURE_EVALUATES=1 fails the first check,
+    // BRAE_CONTROL_MULES_OPENING_EVALUATE_SKIPPED=1 the second.
+    {
+        const long h0 = hookCalls;
+        const DevResult plain = runDevice(nSteps, false, false);
+        const long plainHooks = hookCalls - h0;
+        const long h1 = hookCalls;
+        const long m1 = mixtureCalls;
+        const long r1 = refreshCalls;
+        const DevResult every = runDevice(nSteps, false, false, false, false, true);
+        const long everyHooks = hookCalls - h1;
+        const long everyMix = mixtureCalls - m1;
+        const long everyRefresh = refreshCalls - r1;
+        const long m2 = mixtureCalls;
+        const long r2 = refreshCalls;
+        const long l2 = leftOutCalls;
+        const DevResult once = runDevice(nSteps, false, false, true, false, true);
+        const long onceMix = mixtureCalls - m2;
+        const long onceRefresh = refreshCalls - r2;
+        const long onceLeft = leftOutCalls - l2;
+        // ...and MULESCorr with ONE corrector: its only corrector is the first and does not relax
+        // (alphaEqn.H:196-204), so the pass after the sub-cycle took the evaluating hook there too. Its calls:
+        // the pre-solve's pass and the corrector's through updateBoundary, the pass after the sub-cycle through
+        // mixtureCorrect.
+        nAlphaCorrNow = 1;
+        const long h3 = hookCalls;
+        const long m3 = mixtureCalls;
+        (void)runDevice(nSteps, true, false, false, false, true);
+        nAlphaCorrNow = nAlphaCorr;
+        const long oneHooks = hookCalls - h3;
+        const long oneMix = mixtureCalls - m3;
+        const long correctors = static_cast<long>(nSteps)*nSub*nAlphaCorr;
+        std::printf("  explicit, the driver's hooks, %d steps of %d sub-cycles and %d correctors: updateBoundary "
+                    "%ld calls (%ld without them), mixtureCorrect %ld; the opening evaluate %ld calls, and %ld "
+                    "where the caller says its hook repeats (mixtureCorrect %ld)\n", nSteps, nSub, nAlphaCorr,
+                    everyHooks, plainHooks, everyMix, everyRefresh, onceRefresh, onceMix);
+        std::printf("  MULESCorr with one corrector, the driver's hooks: updateBoundary %ld calls, mixtureCorrect "
+                    "%ld\n", oneHooks, oneMix);
+        check("explicit, the driver's hooks: the pass after the sub-cycle is mixtureCorrect's, one a step, and "
+              "updateBoundary's calls are the correctors' alone",
+              plainHooks == correctors + nSteps*nSub + nSteps && everyHooks == correctors
+              && everyMix == nSteps && oneHooks == 2L*nSteps*nSub && oneMix == nSteps);
+        check("...the opening evaluate is made at every corrector, also where the caller says its hook repeats "
+              "(the pass after the sub-cycle left out there)",
+              everyRefresh == correctors && onceRefresh == correctors && onceMix == 0 && onceLeft == nSteps);
+        check("...and the eleven fields handed back are the plain explicit run's to the bit, both ways",
+              sameResult(plain, every) && sameResult(plain, once));
     }
 
     std::printf("test_device_inter_alpha_step: %d failures\n", failures);

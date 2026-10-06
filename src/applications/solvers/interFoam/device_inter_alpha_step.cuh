@@ -48,7 +48,7 @@ namespace brae {
 struct DeviceInterAlphaHooks
 {
     // alpha1's patch values, and the boundary interface normal correctContactAngle has acted on, from
-    // whatever the device last wrote. Called after every MULES solve -- MULESTemplates.C:181 ends the
+    // whatever the device last wrote. Called after every MULES solve -- MULESTemplates.C:80 ends the
     // solve with psi.correctBoundaryConditions(), and the next corrector's flux, gradient and limiter
     // all read the result.
     std::function<void(const DeviceBuffer<scalar>& alpha1,
@@ -56,7 +56,9 @@ struct DeviceInterAlphaHooks
                        DeviceBuffer<scalar>&       nHatfBnd)> updateBoundary;
 
     // alpha1's patch values ALONE, with no curvature pass behind them. Optional; when absent the step
-    // falls back to updateBoundary, which is only right on a case with no contact angle.
+    // falls back to updateBoundary, which is only right on a case with no contact angle. ALSO THE EVALUATE
+    // THAT OPENS A LIMITED EXPLICIT SOLVE (MULESTemplates.C:168): every explicit corrector calls it between
+    // its flux build and its limiter; without the hook that evaluate is not made (the unit fixtures' form).
     //
     // The two are different calls because interfaceProperties::correct() has a SIDE EFFECT at a
     // contact-angle wall: it rewrites the patch's gradient (interfaceProperties.C:97), and the gradient
@@ -76,8 +78,12 @@ struct DeviceInterAlphaHooks
     std::function<void(
         DeviceBuffer<scalar>& alpha1Bnd)> storedBoundary;
 
-    // THE RELAXED CORRECTOR'S BOUNDARY, and the mixture.correct() after it with no evaluate in front.
-    // Both or neither; when absent a relaxed corrector falls back to updateBoundary.
+    // THE RELAXED CORRECTOR'S BOUNDARY, and the mixture.correct() with no evaluate in front -- after a
+    // relaxed corrector, and AFTER THE SUB-CYCLE ON EVERY PATH (interFoam.C:154: that mixture.correct()
+    // evaluates no alpha patch but a contact angle's, whatever the last corrector was). Both or neither;
+    // when absent a relaxed corrector and the pass after the sub-cycle fall back to updateBoundary, which
+    // evaluates first: right only where an evaluate on unchanged cells changes nothing -- the unit
+    // fixtures' zero-gradient patches. The driver always gives both.
     //
     // updateBoundary's evaluate stands in for MULES's trailing correctBoundaryConditions, which is
     // right after a solve and WRONG after `alpha1 = 0.5*alpha1 + 0.5*alpha10` (VoF/alphaEqn.H:197-201):
@@ -166,6 +172,13 @@ struct DeviceInterAlphaControls
     // `mixtureRepeatKeptFor` says why in the step's notice.
     bool mixtureCorrectRepeats = false;
     std::string mixtureRepeatKeptFor = "the caller has not said the hook repeats";
+    // THE CURVATURE PASS MOVES ALPHA'S PATCH VALUES ON THE HOST: true where an alpha patch is a contact angle,
+    // whose wall gradient correctContactAngle sets and evaluates inside mixture.correct()
+    // (interfaceProperties.C:101-102). The hooks upload the patch values BEFORE that pass, which is the state
+    // the pass's own cell gradient reads; the step then takes the values the pass LEFT through
+    // hooks.storedBoundary, because the next corrector builds its flux on them. False = no patch does, and
+    // nothing is re-read.
+    bool curvaturePassMovesPatches = false;
     DeviceAlphaSolverControls preSolve;   // the case's fvSolution entry for alpha, MULESCorr only
     // OUT, optional: alpha2's PATCH values, assigned where alphaEqn.H assigns alpha2 (lines 151 and
     // 223) and NOT at the mixture.correct() after the sub-cycle, which leaves alpha2 alone. They are

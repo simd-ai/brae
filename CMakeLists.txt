@@ -1841,6 +1841,13 @@ add_executable(test_celllimited_cpp tests/test_celllimited_cpp.cu)
 target_include_directories(test_celllimited_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_celllimited_cpp PRIVATE brae_core)
 
+# The least-squares gradient and its cell limiter taken at a subset of the cells (fvc::GradSubset), against the
+# whole-mesh functions cell for cell and bit for bit: host only, no case.
+add_executable(test_grad_subset tests/test_grad_subset.cu)
+target_include_directories(test_grad_subset PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_grad_subset PRIVATE brae_core)
+add_test(NAME grad_subset COMMAND test_grad_subset)
+
 add_executable(rotordisk_probe tests/rotordisk_probe.cu)
 target_include_directories(rotordisk_probe PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(rotordisk_probe PRIVATE brae_core)
@@ -3307,7 +3314,8 @@ file(GLOB BRAE_WRITE_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_
      ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_write/*/*.sh)
 list(FILTER BRAE_WRITE_TESTS EXCLUDE REGEX "/_common\\.sh$")
 set(BRAE_WRITE_SLOW_FILES
-    "^ami/|^refine/mapping|^amg_pcg/dtchull|^amg_pcg/coupled_pair|^amg_pcg/pcorr_across_pair|^identity/wave_device")
+    "^ami/|^refine/mapping|^amg_pcg/dtchull|^amg_pcg/coupled_pair|^amg_pcg/pcorr_across_pair|^identity/wave_device\
+|^identity/nhat_least_squares")
 foreach(rel ${BRAE_WRITE_TESTS})
     string(REPLACE ".sh" "" name ${rel})
     string(REPLACE "/" "_" name ${name})
@@ -3475,6 +3483,16 @@ target_link_libraries(test_device_inter_alpha_step PRIVATE brae_core)
 add_test(NAME device_inter_alpha_step COMMAND test_device_inter_alpha_step)
 set_tests_properties(device_inter_alpha_step PROPERTIES SKIP_RETURN_CODE 77)
 
+# The evaluate that opens the limited explicit solve, and the bounded flux's boundary after it: the device's
+# alpha step against the host's on an inletOutlet side whose flux reverses every step. The two controls are the
+# code's own switches, run by the test itself as children.
+add_executable(test_device_alpha_opening_evaluate tests/test_device_alpha_opening_evaluate.cu)
+target_include_directories(test_device_alpha_opening_evaluate PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_alpha_opening_evaluate PRIVATE brae_core)
+add_test(NAME device_alpha_opening_evaluate COMMAND test_device_alpha_opening_evaluate)
+set_tests_properties(device_alpha_opening_evaluate PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(test_device_inter_peqn tests/test_device_inter_peqn.cu)
 target_include_directories(test_device_inter_peqn PRIVATE ${BRAE_HEADER_DIRS}
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
@@ -3611,6 +3629,13 @@ target_include_directories(test_alpha_courant_cpp PRIVATE ${BRAE_HEADER_DIRS}
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_alpha_courant_cpp PRIVATE brae_core)
 add_test(NAME alpha_courant_cpp COMMAND test_alpha_courant_cpp)
+
+# The time-step control against OpenFOAM's own log, a step a row: the program is run by
+# tests/interfoam_write/clock/deltat_openfoam_log.sh, which stages the OpenFOAM run and reads its RESULT line.
+add_executable(test_time_controls_openfoam_log tests/test_time_controls_openfoam_log.cu)
+target_include_directories(test_time_controls_openfoam_log PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_time_controls_openfoam_log PRIVATE brae_core)
 
 # interFoam step 12: the time step -- the alpha sub-cycle (33 of the 44 tutorials use it) and the order
 # of the PIMPLE loop. The three sub-cycle mistakes all leave a BOUNDED, plausible alpha field, so no
