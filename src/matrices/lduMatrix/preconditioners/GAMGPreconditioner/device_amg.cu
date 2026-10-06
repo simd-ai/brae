@@ -213,12 +213,35 @@ int amgTarget()
     const int v = e ? std::atoi(e) : 64;
     return v > 0 ? v : 64;
 }
-int amgMerge()
+// HOW MANY PAIRWISE PASSES MAKE A LEVEL. BRAE_AMG_MERGE=k sets it for every mesh. Unset: one, and TWO on a fine
+// grid of `amgMergeSmallMeshes` cells or fewer where a solver has asked for that rule (brae_interFoam: 10,000).
+// On a small mesh a level costs its kernel launches, not its cells, and a hierarchy of half the levels is the
+// cheaper cycle. MEASURED 2026-10-06 with BRAE_AMG_MERGE=2 over the 42 interFoam tutorials: every mesh of 10,000
+// cells or fewer 3-15% faster a step with the step count unchanged (damBreak 6.8 -> 6.0 ms, 2,268 cells: 7
+// grids -> 4, 8.6 -> 9.6 iterations a solve); flat from 400,000 cells up (DTCHull 331.8 -> 335.2); and on four
+// wave cases between 14,000 and 160,000 cells one more time step in thirty, a step further from serial
+// OpenFOAM's count -- which is why the rule stops at 10,000 and is not the default everywhere.
+int smallMeshMergeCells = 0;
+
+}   // namespace
+
+void amgMergeSmallMeshes(int cellsOrFewer)
+{
+    smallMeshMergeCells = cellsOrFewer;
+}
+int amgMergeFor(int nFine)
 {
     const char* e = std::getenv("BRAE_AMG_MERGE");
-    const int v = e ? std::atoi(e) : 1;
-    return v > 0 ? v : 1;
+    if (e)
+    {
+        const int v = std::atoi(e);
+        return v > 0 ? v : 1;
+    }
+    return (smallMeshMergeCells > 0 && nFine <= smallMeshMergeCells) ? 2 : 1;
 }
+
+namespace {
+
 double amgSocBeta()
 {
     const char* e = std::getenv("BRAE_AMG_SOC");
@@ -1128,7 +1151,7 @@ unsigned long long amgHierarchySignature(
     f.value(static_cast<long long>(smoothedAggregation ? 1 : 0));
     f.value(static_cast<long long>(useGS() ? 1 : 0));
     f.value(static_cast<long long>(amgTarget()));
-    f.value(static_cast<long long>(amgMerge()));
+    f.value(static_cast<long long>(amgMergeFor(nFine)));
     f.value(amgSocBeta());
     f.list(fineOwner);
     f.list(fineNei);
@@ -1206,7 +1229,8 @@ AMGData buildAMG(
     // so a tiny mesh can still be made to build a real hierarchy: the demo/teaching cases are
     // below the default target and would otherwise get zero levels (coarsest solve only).
     static const int TARGET = amgTarget();
-    static const int MERGE = amgMerge();
+    // (not static: the rule is the fine grid's, and a refining mesh's hierarchy is built at more than one size)
+    const int MERGE = amgMergeFor(nFine);
     AMGData A;
     A.nFine = nFine;
     // Multicolor Gauss-Seidel smoother (BRAE_AMG_GS): color every smoothed grid once at build (host, static geometry).
@@ -1237,10 +1261,10 @@ AMGData buildAMG(
         {
             Agglom a = agglomerate(owner, nei, fw, n);
             if (a.nCoarse >= n || a.nCoarseFaces == 0) break;   // no further coarsening possible
-            // BRAE_AMG_MERGE=k: k pairwise passes a level (composeAgglom); 1, the default, is a pass a level.
+            // k pairwise passes a level (composeAgglom, amgMergeFor): one, or two on a small mesh.
             // MEASURED on RAS/DTCHull's p_rgh, 25 steps, solve ms a step / PCG iterations: 1 pass 115.5 / 921,
             // 2 passes 116.3 / 1262 (each cycle cheaper, more of them), 2 passes with two sweeps each side
-            // 116.8 / 938, 3 passes 136.9 / 1279 -- flat, so the default stays.
+            // 116.8 / 938, 3 passes 136.9 / 1279 -- flat at that size, so one pass stays there.
             for (int pass = 1; pass < MERGE && a.nCoarse > TARGET; ++pass)
             {
                 Agglom next = agglomerate(a.cOwn, a.cNei, a.coarseFaceWeights, a.nCoarse);

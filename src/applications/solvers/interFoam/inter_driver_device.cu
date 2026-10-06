@@ -419,6 +419,9 @@ RunReport runInterFoamDevice(
     const MutableMesh* mutableMesh,
     InterWriter* writer)
 {
+    // the pressure hierarchy's small-mesh rule (device_amg.cu, amgMergeFor): two coarsening passes a level on a
+    // fine grid of 10,000 cells or fewer
+    amgMergeSmallMeshes(10000);
     InterFields f = buildInterFields(caseDir, startDir, m, g, fvp);
     if (writer)
     {

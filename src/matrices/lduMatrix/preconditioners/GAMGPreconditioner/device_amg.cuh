@@ -240,6 +240,10 @@ struct AMGData {
 // another not (interFoam's pcorr against its p_rgh) says so here.
 AMGData buildAMG(const std::vector<label>& fineOwner, const std::vector<label>& fineNei,
                  const std::vector<scalar>& faceWeights, int nFine, const bool* smoothedAggregation = nullptr);
+// The plain hierarchy's pairwise passes a level for a fine grid of `nFine` cells: BRAE_AMG_MERGE where set, else
+// one -- or two at `cellsOrFewer` cells or fewer once a solver has asked for the small-mesh rule (device_amg.cu).
+void amgMergeSmallMeshes(int cellsOrFewer);
+int amgMergeFor(int nFine);
 
 // AMG hierarchy cache (the "partition" step): the agglomeration is static per mesh -> serialize the STRUCTURE so a
 // warm run reloads it instead of re-agglomerating. Only the structure is cached (cDiag/cUpper/cLower VALUES are

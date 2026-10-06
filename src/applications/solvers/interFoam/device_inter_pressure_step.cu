@@ -803,6 +803,17 @@ AMGData deviceAmgPcgHierarchy(
     // laplacian's own geometric coefficient -- pcorr on waveMakerPiston at 896,000 cells, 1,781 iterations in
     // 31 solves for 1,427.
     const std::vector<scalar> w(g.magSf().begin(), g.magSf().begin() + nIf);
+    // (said whether the hierarchy is then read from the case's cache or built)
+    if (!smoothed && amgMergeFor(static_cast<int>(nC)) == 2 && std::getenv("BRAE_AMG_MERGE") == nullptr)
+    {
+        static bool saidMerge = false;
+        if (!saidMerge)
+        {
+            saidMerge = true;
+            std::printf("  AMG hierarchy: a small mesh (%ld cells) takes two coarsening passes a level, half "
+                        "the grids; BRAE_AMG_MERGE=1 takes one\n", (long)nC);
+        }
+    }
     if (useDisk)
     {
         // THE START MESH'S HIERARCHY, FROM THE CASE'S CACHE where the file there is this mesh's and this build's
