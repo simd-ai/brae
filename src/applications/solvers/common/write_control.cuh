@@ -16,8 +16,10 @@
 #include "brae_notice.cuh"
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <deque>
 #include <filesystem>
+#include <stdexcept>
 #include <string>
 
 namespace brae {
@@ -27,13 +29,20 @@ class WriteControl
 public:
     explicit WriteControl(const FoamDict& controlDict)
       : control_(controlDict.wordOr("writeControl", "timeStep")),
-        // OF's default is GREAT, i.e. "never" -- only the final state gets written. Keeping that default
-        // means a case with no writeInterval behaves exactly as before this class existed.
-        interval_(controlDict.scalarOr("writeInterval", 1e30)),
+        interval_(readInterval(controlDict)),
         purge_(std::max(0, controlDict.intOr("purgeWrite", 0))),
         deltaT_(controlDict.scalarOr("deltaT", 1.0)),
         startTime_(controlDict.scalarOr("startTime", 0.0))
     {
+        // TimeIO.C:288-293: `writeInterval < 1 for writeControl timeStep` is fatal there (on the writeInterval
+        // entry; a writeFrequency is not tested). Such a case ran here to its end with no intermediate write
+        // and no word: isWriteTime answers false for an interval below 1.
+        if (control_ == "timeStep" && controlDict.found("writeInterval") && static_cast<long>(interval_) < 1)
+        {
+            throw std::runtime_error(
+                "brae: controlDict says `writeControl timeStep` with `writeInterval " + std::to_string(interval_)
+                + "`. OpenFOAM stops on an interval below 1 there (TimeIO.C:288-293).");
+        }
         // OF stopAt: endTime | writeNow | noWriteNow | nextWrite. The last three are runtime-modifiable
         // stop requests (Foam::Time::stopAt), which brae has no mechanism for -- it does not re-read
         // controlDict mid-run. Say so rather than let the entry sit there looking honoured.
@@ -64,6 +73,37 @@ public:
                                "format from each file's own header, not from controlDict, so the output "
                                "is readable; it is larger and carries 12 significant digits rather than "
                                "binary's exact bits");
+    }
+
+    // `writeInterval`, or its older name `writeFrequency` where the first is absent -- TimeIO.C:286-297 reads
+    // them in that order. OPENFOAM HAS NO DEFAULT: with neither it stops (readEntry). brae carries on at
+    // "never", which writes the final state alone, and SAYS so: this stood as `scalarOr("writeInterval", 1e30)`
+    // under a comment calling 1e30 OpenFOAM's default GREAT, and a case that spelt the entry `writeFrequency`
+    // got no intermediate write and no word about it. (Refusing instead would stop fifteen of brae's own
+    // validation fixtures, which carry neither entry; that is a decision of its own.)
+    //   BRAE_CONTROL_WRITE_FREQUENCY_IGNORED=1: a test's CONTROL, deliberately wrong -- `writeFrequency` is
+    //     not read, as before
+    static scalar readInterval(const FoamDict& controlDict)
+    {
+        const scalar never = scalar(1e30);
+        if (controlDict.found("writeInterval"))
+        {
+            return controlDict.scalarOr("writeInterval", never);
+        }
+        if (controlDict.found("writeFrequency"))
+        {
+            if (std::getenv("BRAE_CONTROL_WRITE_FREQUENCY_IGNORED") == nullptr)
+            {
+                return controlDict.scalarOr("writeFrequency", never);
+            }
+            std::printf("  *** CONTROL MODE: controlDict's writeFrequency is not read. This run is deliberately "
+                        "wrong. ***\n");
+            return never;
+        }
+        noticeApproximated("controlDict writeInterval",
+                           "absent, and no `writeFrequency` either -- OpenFOAM stops on that (TimeIO.C:286-297); "
+                           "brae writes the final state alone");
+        return never;
     }
 
     scalar deltaT() const { return deltaT_; }

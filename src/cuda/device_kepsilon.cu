@@ -74,6 +74,7 @@ void rkeStrainKernel(
     const scalar* __restrict__ k,
     const scalar* __restrict__ eps,
     scalar A0,
+    scalar small,
     scalar* __restrict__ rCmu,
     scalar* __restrict__ magS)
 {
@@ -105,7 +106,11 @@ void rkeStrainKernel(
                 tr3 += S[i*3+j]*S[j*3+m]*S[m*3+i];
 
     const scalar S2 = 2.0*magSqrS, mS = sqrt(S2);
-    scalar arg = sqrt(6.0) * (2.0*sqrt(2.0)*tr3 / (mS*S2 + 1e-37));
+    // realizableKE.C:53-59: W = 2*sqrt(2)*((S&S)&&S)/(magS*S2 + SMALL), and SMALL is 1e-15 in this (double)
+    // build (doubleScalar.H:62). The kernel had 1e-37, the float build's VSMALL, where the host reference has
+    // 1e-15: wherever magS*S2 is below about 8 the sum differs in its last bit, and at a strain of 1e-5 /s the
+    // quotient by a factor of two (tests/test_device_realizable_strain.cu). `small` is the caller's.
+    scalar arg = sqrt(6.0) * (2.0*sqrt(2.0)*tr3 / (mS*S2 + small));
     arg = fmin(fmax(arg, -1.0), 1.0);
     const scalar As = sqrt(6.0)*cos((1.0/3.0)*acos(arg));
     const scalar Us = sqrt(0.5*S2 + skSq);
@@ -764,7 +769,18 @@ void deviceRealizableStrain(
 {
     rCmu.resize(nC);
     magS.resize(nC);
-    rkeStrainKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), k.data(), eps.data(), A0, rCmu.data(), magS.data());
+    // BRAE_CONTROL_RKE_SMALL_FLOAT=1: a gate's CONTROL, deliberately wrong -- 1e-37 for SMALL, as before
+    static const bool floatSmall = std::getenv("BRAE_CONTROL_RKE_SMALL_FLOAT") != nullptr;
+    static bool said = false;
+    if (floatSmall && !said)
+    {
+        said = true;
+        std::printf("  *** CONTROL MODE: realizableKE's rCmu adds 1e-37 where OpenFOAM adds SMALL (1e-15). This run "
+                    "is deliberately wrong. ***\n");
+    }
+    rkeStrainKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), k.data(), eps.data(), A0,
+                                          floatSmall ? scalar(1.0e-37) : scalar(1.0e-15), rCmu.data(),
+                                          magS.data());
     cudaCheck(cudaGetLastError(), "rkeStrain");
 }
 
