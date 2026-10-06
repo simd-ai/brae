@@ -88,8 +88,6 @@ KOmegaSSTInput sin hasNonWallTurbWallFunc
 # (tests/interfoam_waterchannel_vs_openfoam.sh `pbicg`). The entry leaves the day rhoSimpleFoam reads
 # the entry too.
 KOmegaSSTInput sstIn pbicgKE
-KOmegaSSTInput sin colouring
-KOmegaSSTInput sin gsColour
 KOmegaSSTInput sin polyDeg
 # rhoSimpleFoam's hook (rhoTurbulenceHook.cu `kin`): steady/Euler only, no pair on the device, no mangroves
 KEpsilonInput kin cn                # ddtSchemes other than steadyState/Euler are refused (scheme_parse.cuh:304-310, names CrankNicolson) -- ARM tests/rho_step_cuda_refusals.sh's CrankNicolson arm
@@ -480,3 +478,11 @@ CyclicInterface ci separation  # the cyclicAMI site: the same refusal -- no tran
 CyclicInterface ci amiOffsets  # the cyclic / coincident-ACMI site: one neighbour cell per face (nbrFaceCells), so the stencil is empty by definition
 CyclicInterface ci amiNbrCells  # the cyclic / coincident-ACMI site: as amiOffsets
 CyclicInterface ci amiWeights  # the cyclic / coincident-ACMI site: as amiOffsets
+
+# ---- the writer's deferred lists (inter_writer_cpp.cu, DeferredList) ------------------------------------
+# One struct for a scalar list and a vector list, built at the two deferLines overloads: each site sets
+# the half that is its own and leaves the other at "none", which IS that list's value.
+DeferredList d isVector  # the scalar overload: false is what a scalar list is
+DeferredList d vectors   # the scalar overload: a scalar list holds no vectors
+DeferredList d aliased   # the vector overload: the alias control is of alpha's scalar list alone
+DeferredList d scalars   # the vector overload: a vector list holds no scalars

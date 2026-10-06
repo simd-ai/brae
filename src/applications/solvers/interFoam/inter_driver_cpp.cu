@@ -1810,7 +1810,13 @@ RunReport runInterFoam(
                     pin.gamgLog = &gamgLog;
                     for (label c = 0; c < lc.nCorrectors; ++c)
                     {
-                        psc.finalCorrector = (c == lc.nCorrectors - 1);
+                        // pimple.finalInnerIter(): the last corrector, and where finalOnLastPimpleIterOnly is
+                        // set the last OUTER corrector's alone (pimpleControlI.H:98-112)
+                        static const bool finalEveryOuter =
+                            std::getenv("BRAE_CONTROL_FINAL_ON_EVERY_OUTER") != nullptr;
+                        const bool finalOuterHere = (outerIndex >= lc.nOuterCorrectors - 1);
+                        psc.finalCorrector = (c == lc.nCorrectors - 1)
+                            && (!f.pimple.finalOnLastPimpleIterOnly || finalEveryOuter || finalOuterHere);
                         // a predictor's solve ends in U.correctBoundaryConditions(), which clears the flag
                         pin.uPatchesUpdatedAtEntry = (c == 0) && !f.momentumPredictorOn;
                         pin.correctorIndex = c;

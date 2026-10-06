@@ -259,6 +259,10 @@ void deviceSetGradU(
 
 struct DeviceInterStepControls
 {
+    // whether this outer corrector's last pressure corrector takes the Final entry: every outer corrector by
+    // default, the last one alone under `finalOnLastPimpleIterOnly` (PimpleControls has the source lines).
+    // The driver sets it per outer corrector.
+    bool pressureFinalThisOuter = true;
     // CrankNicolson, or null for Euler -- see DeviceInterCrankNicolson
     DeviceInterCrankNicolson* cn = nullptr;
     // OUT, on a write step only: the alpha flux the step's last alpha solve leaves (alphaEqn.H's

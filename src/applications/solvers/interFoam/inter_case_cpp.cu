@@ -859,7 +859,6 @@ InterFields buildInterFields(const std::string&          caseDir,
     f.alphaCtl  = readAlphaControls(fvSolution, f.alphaName);
     f.mulesCtl  = f.alphaCtl.MULESCorr ? MULES::readControlsCorr(fvSolution, f.alphaName)
                                        : MULES::readControls(fvSolution, f.alphaName);
-    f.timeCtl   = VoFTimeControls::read(controlDict);
     f.writeCadence = WriteCadence::read(controlDict);
     f.deltaT    = controlDict.scalarOr("deltaT", scalar(1e-3));
 
@@ -938,6 +937,8 @@ InterFields buildInterFields(const std::string&          caseDir,
             const std::string ddtDefault = ddtSchemeFor(caseDir, "default");
             f.lts = (ddtDefault.substr(0, ddtDefault.find(' ')) == "localEuler");
         }
+        // ...and only now the time controls: whether maxAlphaCo is mandatory depends on it
+        f.timeCtl = VoFTimeControls::read(controlDict, f.lts);
         if (!f.lts && f.ddtU == DdtScheme::localEuler)
             throw std::runtime_error(
                 "brae interFoam: ddtSchemes resolves `ddt(rho,U)` to `" + ddtRhoU + "` under a `default` that "
@@ -1064,6 +1065,47 @@ InterFields buildInterFields(const std::string&          caseDir,
         f.pimple.frozenFlow = pim->switchOr("frozenFlow", false);
         // pimpleControl.C:51-52
         f.pimple.turbOnFinalIterOnly = pim->switchOr("turbOnFinalIterOnly", true);
+        // pimpleControl.C:53-54
+        f.pimple.finalOnLastPimpleIterOnly = pim->switchOr("finalOnLastPimpleIterOnly", false);
+        // PIMPLE's `residualControl` ENDS THE OUTER CORRECTORS EARLY, and neither loop here does that.
+        // pimple.loop() asks criteriaSatisfied() from the second outer corrector on; where every named
+        // field's initial residual is under its tolerance it runs one more corrector as the final one and
+        // leaves the loop (pimpleControl.C:62-128, 219-240). The block was named nowhere in this solver, so
+        // such a case ran every outer corrector. It is inert at one outer corrector (criteriaSatisfied
+        // returns false on the first, pimpleControl.C:65), so that is not refused -- but the block is READ
+        // at every count, and solutionControl::read(false) stops on an entry that is not a dictionary and
+        // on one without `tolerance` or `relTol` (solutionControl.C:76-91). No shipped tutorial names it.
+        if (const FoamDict* rc = pim->subDict("residualControl"))
+        {
+            if (!rc->leaves.empty())
+            {
+                throw std::runtime_error(
+                    "brae interFoam: PIMPLE's residualControl gives `" + rc->leaves.front().first + "` as a "
+                    "value. OpenFOAM stops there -- Residual data for " + rc->leaves.front().first + " must be "
+                    "specified as a dictionary (solutionControl.C:86-91): PIMPLE takes `tolerance` and "
+                    "`relTol` per field, where SIMPLE takes the one number.");
+            }
+            for (const auto& fieldEntry : rc->subs)
+            {
+                if (!fieldEntry.second.found("tolerance") || !fieldEntry.second.found("relTol"))
+                {
+                    throw std::runtime_error(
+                        "brae interFoam: PIMPLE's residualControl entry `" + fieldEntry.first + "` has no `"
+                        + (fieldEntry.second.found("tolerance") ? "relTol" : "tolerance") + "`. OpenFOAM reads "
+                        "both with get<scalar>, no default (solutionControl.C:80-81), and stops.");
+                }
+            }
+            if (!rc->subs.empty() && f.pimple.nOuterCorrectors > 1)
+            {
+                throw std::runtime_error(
+                    "brae interFoam: PIMPLE names `residualControl` (for `" + rc->subs.front().first + "`) with "
+                    "nOuterCorrectors " + std::to_string(f.pimple.nOuterCorrectors) + ". OpenFOAM then leaves "
+                    "the outer correctors as soon as the named residuals are under their tolerances "
+                    "(pimpleControl.C:62-128, 219-240); that convergence control is not ported, and running "
+                    "every outer corrector instead would be a different run. Remove the block, or set "
+                    "nOuterCorrectors 1 where it has no effect.");
+            }
+        }
         // ...and the loop's time step is the local one under localEuler, read from ddtSchemes above
         f.pimple.lts = f.lts;
 

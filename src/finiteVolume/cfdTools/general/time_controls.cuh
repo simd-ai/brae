@@ -194,9 +194,15 @@ inline scalar setDeltaT(scalar deltaT, scalar CoNum, const TimeControls& tc)
 //
 // FOUR THINGS TO GET RIGHT:
 //
-// 1. maxAlphaCo IS MANDATORY. alphaCourantNo.H reads it with get<scalar> -- no default -- where
-//    readTimeControls.H gives maxCo a default of 1. A case that turns on adjustTimeStep for interFoam
-//    and omits maxAlphaCo is a FatalError, and defaulting it would run the interface unconstrained.
+// 1. maxAlphaCo IS MANDATORY, AT A FIXED STEP TOO. alphaCourantNo.H reads it with get<scalar> -- no default
+//    -- where readTimeControls.H gives maxCo a default of 1, and interFoam.C:100-102 includes it at EVERY
+//    step of a run that is not local-time-stepped, whatever adjustTimeStep says: the interface Courant number
+//    is printed either way. So a case that omits it is a FatalIOError at its first step. This reader used to
+//    refuse only under `adjustTimeStep yes` and its test said "a fixed-step case never reads it"; real
+//    interFoam on laminar/damBreak with the entry removed and `adjustTimeStep no` stops with "Entry
+//    'maxAlphaCo' not found in dictionary" (tests/interfoam_write/refusal/max_alpha_co.sh runs it).
+//    NOT under localEuler: interFoam.C:94-97 runs setRDeltaT.H there instead, which reads its own
+//    maxAlphaCo from the PIMPLE dictionary with a default of 0.2 (setRDeltaT.H:11-14).
 //
 // 2. nearInterface() IS A 0/1 MASK, NOT A WEIGHT: pos0(alpha1 - 0.01)*pos0(0.99 - alpha1). pos0 is 1
 //    at exactly zero, so the band is the CLOSED interval [0.01, 0.99]. A smooth weight, or pos instead
@@ -218,18 +224,24 @@ struct VoFTimeControls
     TimeControls base;
     scalar       maxAlphaCo = 0;     // MANDATORY -- see note 1
 
-    static VoFTimeControls read(const FoamDict& controlDict)
+    // `localTimeStep`: ddtSchemes `default` is localEuler, where alphaCourantNo.H does not run (note 1)
+    static VoFTimeControls read(
+        const FoamDict& controlDict,
+        bool localTimeStep = false)
     {
         VoFTimeControls tc;
         tc.base = TimeControls::read(controlDict);
         // get<scalar>, not getOrDefault: alphaCourantNo.H:34-37.
         tc.maxAlphaCo = controlDict.scalarOr("maxAlphaCo", scalar(-1));
-        if (tc.base.adjustTimeStep && tc.maxAlphaCo < 0)
+        if (!localTimeStep && tc.maxAlphaCo < 0)
+        {
             throw std::runtime_error(
-                "brae interFoam: controlDict sets `adjustTimeStep` but has no `maxAlphaCo`. OpenFOAM "
-                "reads it with get<scalar> and has NO default (alphaCourantNo.H:34-37), unlike maxCo "
-                "which defaults to 1. Defaulting it here would advance the interface with no limit of "
-                "its own, which is the one thing the second Courant number exists to prevent.");
+                "brae interFoam: controlDict has no `maxAlphaCo`. OpenFOAM reads it with get<scalar> and has "
+                "NO default (alphaCourantNo.H:34-37), unlike maxCo which defaults to 1, and it reads it at "
+                "every step of a run that is not local-time-stepped, at a fixed step too (interFoam.C:100-102): "
+                "Entry 'maxAlphaCo' not found in dictionary. Defaulting it here would run a case OpenFOAM "
+                "stops on, and under `adjustTimeStep` would advance the interface with no limit of its own.");
+        }
         return tc;
     }
 };

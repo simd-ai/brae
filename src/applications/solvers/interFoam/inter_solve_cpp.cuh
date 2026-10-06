@@ -148,6 +148,13 @@ struct LoopControls
     // turbOnFinalIterOnly is TRUE in OpenFOAM, and a port that advanced the closure every outer
     // corrector runs it nOuterCorrectors times per physical step.
     bool  turbOnFinalIterOnly = true;
+    // WHICH PRESSURE SOLVES TAKE THE Final ENTRY. pEqn.H:50 solves with p_rgh.select(pimple.finalInnerIter()),
+    // and finalInnerIter() is the last non-orthogonal pass of the last PISO corrector -- of EVERY outer
+    // corrector by default, of the LAST outer corrector alone when this is on (pimpleControlI.H:98-112). It
+    // was read by neither loop, so a case that set it took p_rghFinal three times a step where OpenFOAM takes
+    // it once. No shipped tutorial sets it. BRAE_CONTROL_FINAL_ON_EVERY_OUTER=1 ignores it again -- the
+    // gate's control (tests/interfoam_write/core/final_on_last_outer.sh).
+    bool finalOnLastPimpleIterOnly = false;
     // ddtSchemes `default` is localEuler (localEulerDdt::enabled): the step's time scale is setRDeltaT's
     // local one, and CourantNo, alphaCourantNo and setDeltaT do not run
     bool  lts = false;

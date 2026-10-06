@@ -88,15 +88,37 @@ int main()
         try { (void)VoFTimeControls::read(noAlpha); } catch (const std::exception&) { threw = true; }
         check("...while a missing maxAlphaCo is REFUSED -- get<scalar>, no default", threw);
 
-        // ...but only when the step is actually being adjusted. A fixed-step case never reads it.
+        // ...AT A FIXED STEP TOO. interFoam.C:100-102 includes alphaCourantNo.H at every step of a run that is
+        // not local-time-stepped, whatever adjustTimeStep says; this arm used to assert the opposite ("a
+        // fixed-step case never reads it"), and real interFoam stops on exactly this dictionary
+        // (tests/interfoam_write/refusal/max_alpha_co.sh runs it).
         const FoamDict fixed = write("fixed", "adjustTimeStep no;\nmaxCo 0.65;\n");
         bool threwFixed = false;
-        try { (void)VoFTimeControls::read(fixed); } catch (const std::exception&) { threwFixed = true; }
-        check("a fixed-step case does not need maxAlphaCo at all", !threwFixed);
+        try
+        {
+            (void)VoFTimeControls::read(fixed);
+        }
+        catch (const std::exception&)
+        {
+            threwFixed = true;
+        }
+        check("a fixed-step case without maxAlphaCo is REFUSED too", threwFixed);
+        // ...and NOT under localEuler: interFoam.C:94-97 runs setRDeltaT.H there, which reads its own
+        // maxAlphaCo from the PIMPLE dictionary with a default
+        bool threwLts = false;
+        try
+        {
+            (void)VoFTimeControls::read(fixed, true);
+        }
+        catch (const std::exception&)
+        {
+            threwLts = true;
+        }
+        check("...but not where the run is local-time-stepped: controlDict's is never read there", !threwLts);
         // readTimeControls.H: getOrDefault<scalar>("maxDeltaT", GREAT), and GREAT in the double build is
         // doubleScalarGREAT = 1.0e+15 (doubleScalar.H:58) -- not VGREAT's 1e300, which this arm once took
         checkNum("maxDeltaT defaults to GREAT, 1e15 (no cap)",
-                 VoFTimeControls::read(fixed).base.maxDeltaT == scalar(1.0e+15) ? scalar(1) : scalar(0),
+                 VoFTimeControls::read(fixed, true).base.maxDeltaT == scalar(1.0e+15) ? scalar(1) : scalar(0),
                  scalar(1));
     }
 

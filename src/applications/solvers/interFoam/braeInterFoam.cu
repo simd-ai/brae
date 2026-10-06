@@ -158,7 +158,10 @@
 // (tests/interfoam_mrf_vs_openfoam.sh holds laminar/mixerVessel2D on the host arm and the device arm
 // at the same bounds) -- and a case that
 // omits nAlphaCorr, nAlphaSubCycles, cAlpha, maxAlphaCo or -- under MULESCorr -- nLimiterIter. Each
-// throws by name.
+// throws by name. (maxAlphaCo at a FIXED time step too, where OpenFOAM reads it as well; not under
+// localEuler, where it does not -- tests/interfoam_write/refusal/max_alpha_co.sh.) And PIMPLE's
+// `residualControl` beyond one outer corrector, where OpenFOAM would leave the outer correctors early
+// (tests/interfoam_write/refusal/pimple_residual_control.sh).
 //
 // THAT LIST WAS NOT TRUE when it was written: MRF and fvOptions were named here and refused nowhere,
 // and a moving or refining mesh was not even named. brae was run over all 44 shipped tutorials and the

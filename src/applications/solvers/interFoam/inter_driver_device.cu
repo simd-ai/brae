@@ -5783,6 +5783,9 @@ RunReport runInterFoamDevice(
         {
             const bool finalOuter = (outer == f.pimple.nOuterCorrectors - 1);
             setMomentumSolve(finalOuter);
+            // pimple.finalInnerIter() under finalOnLastPimpleIterOnly (PimpleControls, inter_solve_cpp.cuh)
+            static const bool finalEveryOuter = std::getenv("BRAE_CONTROL_FINAL_ON_EVERY_OUTER") != nullptr;
+            C.pressureFinalThisOuter = !f.pimple.finalOnLastPimpleIterOnly || finalEveryOuter || finalOuter;
 
             // interFoam.C:112-149, THE MESH UPDATE, through the same host stage the host loop calls
             // (interMeshUpdate). The motion solve, CorrectPhi and mixture.correct() are host
