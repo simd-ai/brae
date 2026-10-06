@@ -5,6 +5,11 @@
 #include "device_boundary.cuh"
 #include "device_blas.cuh"   // deviceDotInto / deviceSumMagInto: FP-9 keeps the inlet reduction on the device
 #include <map>
+#include <cstdio>
+#include <vector>
+#include <stdexcept>
+#include <cstdlib>
+#include <algorithm>
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -884,6 +889,176 @@ void deviceUpdateTotalPressure(
                                            (rhoBnd && rhoBnd->size() == static_cast<std::size_t>(db.n)) ? rhoBnd->data() : nullptr,
                                            db.refValue.data());
     cudaCheck(cudaGetLastError(), "tpUpdate");
+}
+
+
+// ---- deviceScatterRuns: arrays of one staged block to their places, run by run, in one launch ----------------
+namespace {
+constexpr int SCATTER_MAX_ARRAYS = 12;
+template<class T>
+struct ScatterArrays
+{
+    int n = 0;
+    T* to[SCATTER_MAX_ARRAYS] = {};
+    int from[SCATTER_MAX_ARRAYS] = {};
+};
+// thread i takes compact entry i of every array: its run is the first whose end is past it
+template<class T>
+__global__
+void scatterRunsKernel(
+    int nh,
+    int nRuns,
+    const label* __restrict__ runEnd,
+    const label* __restrict__ runAt,
+    const T* __restrict__ stage,
+    ScatterArrays<T> a,
+    int reversed)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nh) return;
+    int lo = 0;
+    int hi = nRuns - 1;
+    while (lo < hi)
+    {
+        const int mid = (lo + hi)/2;
+        if (i < runEnd[mid])
+        {
+            hi = mid;
+        }
+        else
+        {
+            lo = mid + 1;
+        }
+    }
+    const label begin = (lo == 0) ? 0 : runEnd[lo - 1];
+    const label at = runAt[lo] + (i - begin);
+    const int src = reversed ? (nh - 1 - i) : i;
+    for (int k = 0; k < a.n; ++k)
+    {
+        a.to[k][at] = stage[static_cast<std::size_t>(a.from[k])*nh + src];
+    }
+}
+// the runs as two device arrays, kept while the runs are the same ones: a hook asks with its mesh's runs at
+// every call
+struct RunsTable
+{
+    std::vector<label> endH;
+    std::vector<label> atH;
+    DeviceBuffer<label> end;
+    DeviceBuffer<label> at;
+};
+template<class T>
+void scatterRuns(
+    const DeviceBuffer<T>& stage,
+    std::size_t nh,
+    const std::vector<DeviceBoundaryRange>& runs,
+    const std::vector<DeviceBuffer<T>*>& to,
+    const std::vector<int>& from)
+{
+    if (nh == 0 || to.empty()) return;
+    if (to.size() != from.size() || to.size() > static_cast<std::size_t>(SCATTER_MAX_ARRAYS))
+    {
+        throw std::runtime_error("brae: deviceScatterRuns takes one source an array and at most twelve arrays.");
+    }
+    std::vector<label> endH;
+    std::vector<label> atH;
+    std::size_t total = 0;
+    for (const DeviceBoundaryRange& r : runs)
+    {
+        for (const DeviceBuffer<T>* b : to)
+        {
+            if (r.at + r.n > b->size())
+            {
+                throw std::runtime_error("brae: deviceScatterRuns: a run past the end of the buffer it fills.");
+            }
+        }
+        total += r.n;
+        endH.push_back(static_cast<label>(total));
+        atH.push_back(static_cast<label>(r.at));
+    }
+    int most = 0;
+    for (const int f : from)
+    {
+        most = std::max(most, f);
+    }
+    if (total != nh || stage.size() < (static_cast<std::size_t>(most) + 1)*nh)
+    {
+        throw std::runtime_error("brae: deviceScatterRuns: the staged block is not the runs' size.");
+    }
+    static const bool byCopies = std::getenv("BRAE_CONTROL_SCATTER_RUNS_BY_COPIES") != nullptr;
+    if (byCopies)
+    {
+        for (std::size_t k = 0; k < to.size(); ++k)
+        {
+            std::size_t at = static_cast<std::size_t>(from[k])*nh;
+            for (const DeviceBoundaryRange& r : runs)
+            {
+                cudaCheck(cudaMemcpyAsync(to[k]->data() + r.at, stage.data() + at, r.n*sizeof(T),
+                                          cudaMemcpyDeviceToDevice, cudaStreamPerThread), "deviceScatterRuns");
+                at += r.n;
+            }
+        }
+        return;
+    }
+    static const bool reversed = std::getenv("BRAE_CONTROL_SCATTER_RUNS_REVERSED") != nullptr;
+    static bool said = false;
+    if (!said)
+    {
+        said = true;
+        std::printf("  boundary arrays: a staged block's arrays go to their patches in one launch; "
+                    "BRAE_CONTROL_SCATTER_RUNS_BY_COPIES=1 copies each array run by run\n");
+        if (reversed)
+        {
+            std::printf("  *** CONTROL MODE: the staged entries land in reverse order. This run is deliberately "
+                        "wrong. ***\n");
+        }
+    }
+    static auto& table = *new RunsTable();
+    if (table.endH != endH || table.atH != atH)
+    {
+        table.end.copyFrom(endH);
+        table.at.copyFrom(atH);
+        table.endH = endH;
+        table.atH = atH;
+    }
+    ScatterArrays<T> a;
+    a.n = static_cast<int>(to.size());
+    for (std::size_t k = 0; k < to.size(); ++k)
+    {
+        a.to[k] = to[k]->data();
+        a.from[k] = from[k];
+    }
+    const int n = static_cast<int>(nh);
+    scatterRunsKernel<T><<<nBlocks(n), TPB, 0, cudaStreamPerThread>>>(
+        n,
+        static_cast<int>(runs.size()),
+        table.end.data(),
+        table.at.data(),
+        stage.data(),
+        a,
+        reversed ? 1 : 0);
+    cudaCheck(cudaGetLastError(), "deviceScatterRuns");
+}
+}   // namespace
+
+void deviceScatterRuns(
+    const DeviceBuffer<scalar>& stage,
+    std::size_t nh,
+    const std::vector<DeviceBoundaryRange>& runs,
+    const std::vector<DeviceBuffer<scalar>*>& to,
+    const std::vector<int>& from)
+{
+    scatterRuns<scalar>(stage, nh, runs, to, from);
+}
+
+void deviceScatterRuns(
+    const DeviceBuffer<label>& stage,
+    std::size_t nh,
+    const std::vector<DeviceBoundaryRange>& runs,
+    const std::vector<DeviceBuffer<label>*>& to,
+    const std::vector<int>& from)
+{
+    scatterRuns<label>(stage, nh, runs, to, from);
 }
 
 } // namespace brae

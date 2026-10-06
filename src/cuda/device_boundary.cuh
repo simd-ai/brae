@@ -871,6 +871,28 @@ inline std::vector<DeviceBoundaryRange> deviceNonEmptyBoundaryRanges(
     return ranges;
 }
 
+// ARRAYS OF ONE STAGED BLOCK TO THEIR PLACES IN THE BOUNDARY'S NUMBERING, RUN BY RUN, IN ONE LAUNCH
+// (device_boundary_flow.cu). `stage` holds whole arrays of `nh` compact entries one after another; array from[k]
+// of it goes to *to[k], entry i to the place the runs give it. The faces between the runs are left as they are.
+// It stands for a device-to-device copy an array a run, which is what a refresh was: MEASURED 2026-10-06 on
+// stokesII (four patches that are not empty, so 72 copies for U's eighteen state arrays at each of three calls
+// a step), the refresh 0.5 -> 0.1 ms a step and the step 7.73 -> 7.30; on damBreak's 2,268 cells the step
+// 6.0 -> 5.3 with the assembly's mirror. At most twelve arrays a call.
+// BRAE_CONTROL_SCATTER_RUNS_BY_COPIES=1 makes those copies instead -- the identity gate's other arm;
+// BRAE_CONTROL_SCATTER_RUNS_REVERSED=1 is its control, deliberately wrong: the entries land in reverse order.
+void deviceScatterRuns(
+    const DeviceBuffer<scalar>& stage,
+    std::size_t nh,
+    const std::vector<DeviceBoundaryRange>& runs,
+    const std::vector<DeviceBuffer<scalar>*>& to,
+    const std::vector<int>& from);
+void deviceScatterRuns(
+    const DeviceBuffer<label>& stage,
+    std::size_t nh,
+    const std::vector<DeviceBoundaryRange>& runs,
+    const std::vector<DeviceBuffer<label>*>& to,
+    const std::vector<int>& from);
+
 // `ranges` null: h holds every boundary face's state and all of it goes up. `ranges` set: h is COMPACT -- built
 // with skipEmpty -- and each run goes to its place, the faces between them (the empty patches') left as they are.
 inline void refreshDeviceVectorBoundaryState(
@@ -920,67 +942,46 @@ inline void refreshDeviceVectorBoundaryState(
         stageS.copyFrom(packS);
         stageL.copyFrom(packL);
     }
-    // one array of the staged block to its buffer: whole, or run by run
-    auto put = [&](DeviceBuffer<scalar>& to, std::size_t at)
+    // every array of the two staged blocks to its buffer, whole or run by run, in one launch a block
+    const std::vector<DeviceBoundaryRange> whole{DeviceBoundaryRange{0, n}};
+    const std::vector<DeviceBoundaryRange>& runs = ranges ? *ranges : whole;
+    auto sized = [&](auto& to)
     {
-        if (to.size() != n)
+        if (to.size() == n) return;
+        if (ranges)
         {
-            if (ranges)
-            {
-                throw std::runtime_error("brae: refreshDeviceVectorBoundaryState: a run-by-run refresh of a "
-                                         "boundary that was never built whole.");
-            }
-            to.resize(n);
+            throw std::runtime_error("brae: refreshDeviceVectorBoundaryState: a run-by-run refresh of a "
+                                     "boundary that was never built whole.");
         }
-        if (!ranges)
-        {
-            cudaCheck(cudaMemcpyAsync(to.data(), stageS.data() + at*n, n*sizeof(scalar), cudaMemcpyDeviceToDevice,
-                                      cudaStreamPerThread), "boundary state split");
-            return;
-        }
-        std::size_t from = at*nh;
-        for (const DeviceBoundaryRange& r : *ranges)
-        {
-            cudaCheck(cudaMemcpyAsync(to.data() + r.at, stageS.data() + from, r.n*sizeof(scalar),
-                                      cudaMemcpyDeviceToDevice, cudaStreamPerThread), "boundary state split");
-            from += r.n;
-        }
+        to.resize(n);
     };
-    auto putL = [&](DeviceBuffer<label>& to, std::size_t at)
-    {
-        if (to.size() != n)
-        {
-            if (ranges)
-            {
-                throw std::runtime_error("brae: refreshDeviceVectorBoundaryState: a run-by-run refresh of a "
-                                         "boundary that was never built whole.");
-            }
-            to.resize(n);
-        }
-        if (!ranges)
-        {
-            cudaCheck(cudaMemcpyAsync(to.data(), stageL.data() + at*n, n*sizeof(label), cudaMemcpyDeviceToDevice,
-                                      cudaStreamPerThread), "boundary state split");
-            return;
-        }
-        std::size_t from = at*nh;
-        for (const DeviceBoundaryRange& r : *ranges)
-        {
-            cudaCheck(cudaMemcpyAsync(to.data() + r.at, stageL.data() + from, r.n*sizeof(label),
-                                      cudaMemcpyDeviceToDevice, cudaStreamPerThread), "boundary state split");
-            from += r.n;
-        }
-    };
+    std::vector<DeviceBuffer<scalar>*> toS;
+    std::vector<int> fromS;
+    std::vector<DeviceBuffer<label>*> toL;
+    std::vector<int> fromL;
     for (int k = 0; k < 3; ++k)
     {
-        const std::size_t base = 4*static_cast<std::size_t>(k);
-        put(db.comp[k].ioStored, base);
-        put(db.comp[k].valueFraction, base + 1);
-        put(db.comp[k].refValue, base + 2);
-        put(db.comp[k].refGrad, base + 3);
-        putL(db.comp[k].bcType, static_cast<std::size_t>(k));
-        putL(db.comp[k].ioFresh, 3);
+        sized(db.comp[k].ioStored);
+        sized(db.comp[k].valueFraction);
+        sized(db.comp[k].refValue);
+        sized(db.comp[k].refGrad);
+        sized(db.comp[k].bcType);
+        sized(db.comp[k].ioFresh);
+        toS.push_back(&db.comp[k].ioStored);
+        fromS.push_back(4*k);
+        toS.push_back(&db.comp[k].valueFraction);
+        fromS.push_back(4*k + 1);
+        toS.push_back(&db.comp[k].refValue);
+        fromS.push_back(4*k + 2);
+        toS.push_back(&db.comp[k].refGrad);
+        fromS.push_back(4*k + 3);
+        toL.push_back(&db.comp[k].bcType);
+        fromL.push_back(k);
+        toL.push_back(&db.comp[k].ioFresh);
+        fromL.push_back(3);
     }
+    deviceScatterRuns(stageS, nh, runs, toS, fromS);
+    deviceScatterRuns(stageL, nh, runs, toL, fromL);
 }
 
 } // namespace brae
