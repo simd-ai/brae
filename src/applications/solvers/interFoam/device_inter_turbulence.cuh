@@ -29,6 +29,7 @@
 #include "cf_types.cuh"
 #include "device_fvoptions.cuh"   // DeviceMangroves
 #include "device_dilu.cuh"
+#include "device_colour_gauss_seidel.cuh"   // DeviceCellColouring: the turbulence rule's sweep order
 #include "device_crank_nicolson_ddt.cuh"
 #include "device_boundary.cuh"
 #include "device_buffer.cuh"
@@ -88,6 +89,9 @@ struct DeviceInterTurbulence
     // (waves/mangroveInteraction): the closure then runs OpenFOAM's PBiCG (device_pbicg.cuh) and not
     // the smoothSolver sweep every other turbulent tutorial names
     DeviceDilu dilu;
+    // the mesh's cell colouring, built when an entry is a Gauss-Seidel smoothSolver the turbulence rule
+    // takes (device_inter_turbulence.cu, turbulenceColourOrder)
+    DeviceCellColouring colouring;
     // kCoeff and epsilonCoeff of multiphaseMangrovesTurbulenceModel at this step's U, per cell
     // one per active multiphaseMangrovesTurbulenceModel, in the option list's order
     std::vector<DeviceBuffer<scalar>> mangroveK;

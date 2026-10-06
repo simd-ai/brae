@@ -80,6 +80,10 @@ MV="$TUT/multiphase/interFoam/laminar/mixerVessel2D"
 # The GAMG port on the pressure, as CMakeLists.txt sets for every test: the exact gates compare with OpenFOAM's
 # own GAMG. tests/interfoam_write/amg_pcg/ unsets it to hold brae's default AMG-PCG to its measured bounds.
 export BRAE_PRESSURE_CASE_SOLVER=1
+# ...and the turbulence fields' own smoothSolver in OpenFOAM's cell order (the turbulence rule, user decision
+# 2026-10-06: by default a relTol-0 Gauss-Seidel solve of k, epsilon or omega is swept in colour order on the GPU;
+# device_inter_turbulence.cu). The rule's gates, tests/interfoam_write/turb_colour/, unset it.
+export BRAE_TURBULENCE_CASE_SOLVER=1
 W=${KEEP_W:-$(mktemp -d)}
 [ -n "${KEEP_W:-}" ] || trap 'rm -rf "$W"' EXIT
 mkdir -p "$W"

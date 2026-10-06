@@ -5226,3 +5226,9 @@ add_test(NAME colour_gs_fused COMMAND test_colour_gs_fused)
 # 2026-10-03.
 get_property(BRAE_ALL_TESTS DIRECTORY PROPERTY TESTS)
 set_property(TEST ${BRAE_ALL_TESTS} APPEND PROPERTY ENVIRONMENT "BRAE_PRESSURE_CASE_SOLVER=1")
+# THE TURBULENCE RULE'S TEST ARM, the same arrangement. In interFoam a relTol-0 Gauss-Seidel smoothSolver on k,
+# epsilon or omega is swept in colour order on the GPU by default (device_inter_turbulence.cu): the same smoother
+# and stopping rule, another cell order, so another iterate. Every test runs the case's own order
+# (BRAE_TURBULENCE_CASE_SOLVER=1) and keeps its bound; the rule is held to OpenFOAM at its measured bounds by
+# tests/interfoam_write/turb_colour/, which unset this. The user's decision, 2026-10-06.
+set_property(TEST ${BRAE_ALL_TESTS} APPEND PROPERTY ENVIRONMENT "BRAE_TURBULENCE_CASE_SOLVER=1")

@@ -18,6 +18,72 @@
 namespace brae {
 
 namespace {
+// THE TURBULENCE RULE (the user's decision, 2026-10-06): a transported turbulence field whose entry is a
+// Gauss-Seidel smoothSolver asked to converge -- `relTol 0` -- is swept in COLOUR order on the GPU: the same
+// smoother under the same stopping rule (tolerance, maxIter, minIter, nSweeps), another order of the cells and
+// so another iterate after n sweeps. WHY: OpenFOAM's sweep is a recurrence over the cells in index order, one
+// core's work however it is scheduled, and on a finer mesh these solves take hundreds of sweeps. MEASURED on
+// RAS/weirOverflow refined to 81,280 cells: k 672 and epsilon 560 sweeps a solve (20-core OpenFOAM: 681 and
+// 568, the same solve), the closure 1,395 of a 1,520 ms step against OpenFOAM's 185 on 20 cores.
+// NOT where the entry stops at a relative tolerance: there the stopping point is part of the method (a loose
+// solve's iterate depends on the order), and those solves are a sweep or two.
+// BRAE_TURBULENCE_CASE_SOLVER=1 runs the case's own entry as ported, OpenFOAM's order -- what the exact gates
+// against OpenFOAM run (tests/interfoam_write/lib.sh and CMakeLists.txt set it for every test); the rule has
+// its own gates (tests/interfoam_write/turb_colour/).
+bool turbulenceCaseSolver()
+{
+    static const bool on = std::getenv("BRAE_TURBULENCE_CASE_SOLVER") != nullptr;
+    return on;
+}
+bool turbulenceColourOrder(const cpu::interFoam::SmoothLinearSolve& s)
+{
+    return s.gaussSeidel() && s.relTol == scalar(0) && !turbulenceCaseSolver();
+}
+// ...and NOT ACROSS A COUPLED PAIR: the colour sweep applies no interface (deviceColourGaussSeidelFused refuses
+// one), where OpenFOAM's sweep moves the pair's contribution to the right-hand side at every sweep. Such a mesh
+// keeps the case's own order, and says so once -- RAS/damBreakLeakage and RAS/damBreakPorousBaffle are these.
+bool turbulenceColourHere(
+    const cpu::interFoam::SmoothLinearSolve& s,
+    const DeviceCellColouring& colouring,
+    const DeviceCyclic* cyc)
+{
+    if (!turbulenceColourOrder(s) || !colouring.valid) return false;
+    if (cyc && cyc->n > 0)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            std::printf("  turbulence: this mesh has a coupled pair, which the colour-order sweep does not carry; "
+                        "k and its partner keep the case's own smoothSolver order (one CPU core)\n");
+        }
+        return false;
+    }
+    return true;
+}
+// BRAE_CONTROL_TURBULENCE_COLOUR_ONE_SWEEP=1 is the rule's gates' CONTROL, deliberately wrong: a solve the rule
+// takes stops after one sweep, so its field is nowhere near converged.
+int turbulenceColourMaxIter(
+    bool colour,
+    int maxIter)
+{
+    static const bool oneSweep = std::getenv("BRAE_CONTROL_TURBULENCE_COLOUR_ONE_SWEEP") != nullptr;
+    return (colour && oneSweep) ? 1 : maxIter;
+}
+void announceColourOrder(
+    const char* field,
+    const cpu::interFoam::SmoothLinearSolve& s)
+{
+    static auto& said = *new std::vector<std::string>();
+    for (const std::string& f : said)
+    {
+        if (f == field) return;
+    }
+    said.push_back(field);
+    std::printf("  %s: system/fvSolution asks for smoothSolver with %s at relTol 0; brae sweeps it in colour "
+                "order on the GPU -- the same smoother and stopping rule, another cell order and iteration "
+                "count; BRAE_TURBULENCE_CASE_SOLVER=1 runs OpenFOAM's order\n", field, s.smoother.c_str());
+}
 
 std::vector<scalar> patchValuesOf(
     const GeometricField<scalar>& f,
@@ -179,6 +245,16 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
      || t.kSolve.pbicgDILU() || t.epsSolve.pbicgDILU() || t.omegaSolve.pbicgDILU())
     {
         d.dilu = buildDeviceDilu(m.owner(), m.neighbour(), m.nCells());
+    }
+    part.emplace("closure build: the cell colouring");
+    // ...and the turbulence rule's sweep order needs the mesh's colouring, once
+    if (turbulenceColourOrder(t.kSolveFinal) || turbulenceColourOrder(t.epsSolveFinal)
+     || turbulenceColourOrder(t.omegaSolveFinal) || turbulenceColourOrder(t.kSolve)
+     || turbulenceColourOrder(t.epsSolve) || turbulenceColourOrder(t.omegaSolve))
+    {
+        const std::size_t nIf = m.neighbour().size();
+        const std::vector<label> ownerInternal(m.owner().begin(), m.owner().begin() + static_cast<long>(nIf));
+        d.colouring = buildDeviceCellColouring(ownerInternal, m.neighbour(), static_cast<int>(m.nCells()));
     }
 
     // The device closure builds its wall set from patches that are BOTH a `wall` and carry the
@@ -978,12 +1054,16 @@ void deviceCorrectInterTurbulence(
     // and only the eight the SOLVER ENTRY decides differ per equation. Leaving them default here ran the
     // second equation with a different colouring and polynomial degree from k's -- which the defaults
     // audit flagged as three fields set at one of the sites and not the other.
-    svOmega.gsColour  = sin.gsColour;
-    svOmega.colouring = sin.colouring;
+    svOmega.gsColour = turbulenceColourHere(os, d.colouring, in.cyc);
+    svOmega.colouring = &d.colouring;
+    if (svOmega.gsColour)
+    {
+        announceColourOrder("omega", os);
+    }
     svOmega.polyDeg   = sin.polyDeg;
         svOmega.tol         = os.tol;
         svOmega.relTol      = os.relTol;
-        svOmega.maxIter     = os.maxIter;
+        svOmega.maxIter = turbulenceColourMaxIter(svOmega.gsColour, os.maxIter);
         svOmega.minIter     = os.minIter;
         svOmega.nSweeps     = os.nSweeps;
         svOmega.gsSymmetric = (os.smoother == "symGaussSeidel");
@@ -1023,6 +1103,12 @@ void deviceCorrectInterTurbulence(
         {
             sin.gsK = true;
             sin.gsOmega = true;
+            sin.gsColour = turbulenceColourHere(ks, d.colouring, in.cyc);
+            sin.colouring = &d.colouring;
+            if (sin.gsColour)
+            {
+                announceColourOrder("k", ks);
+            }
         }
         else
         {
@@ -1035,7 +1121,7 @@ void deviceCorrectInterTurbulence(
         sin.nSweepsKE = ks.nSweeps;
         sin.tol = ks.tol;
         sin.relTol = ks.relTol;
-        sin.maxIter = ks.maxIter;
+        sin.maxIter = turbulenceColourMaxIter(sin.gsColour, ks.maxIter);
         sin.minIter = ks.minIter;
 
         gpu::kOmegaSSTRAS::KOmegaSSTResiduals sres;
@@ -1177,12 +1263,16 @@ void deviceCorrectInterTurbulence(
     // and only the eight the SOLVER ENTRY decides differ per equation. Leaving them default here ran the
     // second equation with a different colouring and polynomial degree from k's -- which the defaults
     // audit flagged as three fields set at one of the sites and not the other.
-    svEps.gsColour  = kin.gsColour;
-    svEps.colouring = kin.colouring;
+    svEps.gsColour = turbulenceColourHere(es, d.colouring, in.cyc);
+    svEps.colouring = &d.colouring;
+    if (svEps.gsColour)
+    {
+        announceColourOrder("epsilon", es);
+    }
     svEps.polyDeg   = kin.polyDeg;
     svEps.tol         = es.tol;
     svEps.relTol      = es.relTol;
-    svEps.maxIter     = es.maxIter;
+    svEps.maxIter = turbulenceColourMaxIter(svEps.gsColour, es.maxIter);
     svEps.minIter     = es.minIter;
     svEps.nSweeps     = es.nSweeps;
     svEps.gsSymmetric = (es.smoother == "symGaussSeidel");
@@ -1218,6 +1308,12 @@ void deviceCorrectInterTurbulence(
     {
         kin.gsK = true;
         kin.gsEps = true;
+        kin.gsColour = turbulenceColourHere(ks, d.colouring, in.cyc);
+        kin.colouring = &d.colouring;
+        if (kin.gsColour)
+        {
+            announceColourOrder("k", ks);
+        }
     }
     else
     {
@@ -1297,7 +1393,7 @@ void deviceCorrectInterTurbulence(
     kin.nSweepsKE = ks.nSweeps;
     kin.tol = ks.tol;
     kin.relTol = ks.relTol;
-    kin.maxIter = ks.maxIter;
+    kin.maxIter = turbulenceColourMaxIter(kin.gsColour, ks.maxIter);
     kin.minIter = ks.minIter;
 
     gpu::kEpsilonRAS::correct(d.k, d.epsilon, d.nut, d.nutBnd, /*alphat=*/nullptr,
