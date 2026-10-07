@@ -200,6 +200,15 @@ public:
     // angle's gradient, which later assignments never touch (values only, fvPatchField.C:407-413,
     // :552-558). Called there by both loops; once.
     void noteAlphaOldCreation(const GeometricField<scalar>& alpha1);
+    // ...and on a RESTART whose start directory holds <alpha>_0, the level is not created by a first
+    // oldTime(): OpenFOAM READS it (GeometricField.C:130-168), constructing each contact angle's patch from
+    // that file as it constructs alpha's own -- the stored gradient, the fixed gradient evaluated on the
+    // file's cells, the limiting evaluate (alphaContactAngleTwoPhaseFvPatchScalarField.C:61-83) -- and the
+    // gradient that leaves is the one every later <alpha>_0 carries. Built the same way here, once.
+    void noteAlphaOldFromStart(
+        const std::string& alphaName,
+        const std::vector<FvPatch>& patches,
+        label nCells);
 
     // One time directory. THE STEP PAYS FOR BUILDING IT, NOT FOR FORMATTING ITS NUMBERS OR FOR THE DISK: every
     // file's structure is built here, from the solver's fields as they stand, with each long list of numbers
@@ -333,7 +342,8 @@ private:
 // stops at its first write time, having said so at startup).
 void registerUnwritten(
     InterWriter& w,
-    const InterFields& f);
+    const InterFields& f,
+    const std::vector<FvPatch>& patches);
 
 // p's patch values, p == p_rgh + rho*gh on each patch (pEqn.H:72), from the rho patch values the step
 // used -- the construction the rigid-body load already makes (inter_driver_cpp.cu, interMeshUpdate).

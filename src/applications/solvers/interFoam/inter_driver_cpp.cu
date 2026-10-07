@@ -435,7 +435,7 @@ RunReport runInterFoam(
     InterFields f = buildInterFields(caseDir, startDir, m, g, patches);
     if (writer)
     {
-        registerUnwritten(*writer, f);
+        registerUnwritten(*writer, f, patches);
     }
     // THE CELL COUNT IS READ LIVE, NOT CAPTURED. `m` is the caller's mutable mesh, which an adaptive step
     // REPLACES in place -- so a cached count makes every per-cell reduction after a refinement run over

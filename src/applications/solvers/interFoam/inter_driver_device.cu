@@ -464,7 +464,7 @@ RunReport runInterFoamDevice(
     InterFields f = buildInterFields(caseDir, startDir, m, g, fvp);
     if (writer)
     {
-        registerUnwritten(*writer, f);
+        registerUnwritten(*writer, f, fvp);
         // CrankNicolson's state on a moving mesh is written from the HOST loop's own objects (the ddt0
         // fields' patch values, the old levels' stored patch values); this loop keeps the cells on the
         // device and no patch half, so it names the files rather than reach its first write without them

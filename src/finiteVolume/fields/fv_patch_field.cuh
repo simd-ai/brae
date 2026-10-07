@@ -18,6 +18,7 @@
 #include <type_traits>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 
 namespace brae {
 
@@ -1308,17 +1309,32 @@ public:
     // angle produces is written into that base's per-face grad_, which it maps.
     enum class Limit { none, gradient, zeroGradient, alpha };
 
-    ConstantAlphaContactAnglePatchField(const FvPatch& p, scalar theta0Deg, const std::string& limitWord,
-                                        bool uniform, scalar v, const std::vector<scalar>& vs)
-        : FixedGradientPatchField<scalar>(p, true, scalar(0), std::vector<scalar>{}),
-          theta0_(theta0Deg), limit_(parseLimit(limitWord, p.name))
+    // WHAT THE FILE GIVES IT IS ITS `gradient`, where it has one, and never its `value`
+    // (alphaContactAngleTwoPhaseFvPatchScalarField.C:61-83): the dictionary constructor reads the gradient
+    // and evaluates the fixed gradient -- value = patchInternalField + gradient/deltaCoeffs -- or, with no
+    // such entry, takes the cells' value and a zero gradient; constantAlphaContactAngle's own constructor
+    // then calls the limiting evaluate() once (constantAlphaContactAngleFvPatchScalarField.C:56-60). A
+    // directory OpenFOAM or brae WROTE holds the gradient, so a restart begins with the wall gradient the
+    // run had, and the first curvature pass reads it (gaussGrad's patch correction takes snGrad()).
+    // This took the file's `value` and a zero gradient: a restart began with a cold contact line.
+    // `hasGradient` false: the file has no `gradient` entry (a tutorial's 0 directory).
+    ConstantAlphaContactAnglePatchField(
+        const FvPatch& p,
+        scalar theta0Deg,
+        const std::string& limitWord,
+        bool hasGradient,
+        bool gradientUniform,
+        scalar gradientValue,
+        const std::vector<scalar>& gradientValues)
+        : FixedGradientPatchField<scalar>(
+              p,
+              hasGradient ? gradientUniform : true,
+              hasGradient ? gradientValue : scalar(0),
+              hasGradient ? gradientValues : std::vector<scalar>{}),
+          theta0_(theta0Deg),
+          limit_(parseLimit(limitWord, p.name))
     {
-        // `value` seeds the patch value; the gradient starts at zero and is written by
-        // correctContactAngle before it is ever used.
         this->value_.assign(static_cast<std::size_t>(p.size), scalar(0));
-        for (label i = 0; i < p.size; ++i)
-            this->value_[static_cast<std::size_t>(i)] =
-                uniform ? v : (static_cast<std::size_t>(i) < vs.size() ? vs[static_cast<std::size_t>(i)] : scalar(0));
     }
 
     scalar contactAngleTheta0() const override { return theta0_; }
@@ -1327,6 +1343,14 @@ public:
 
     void evaluate(const std::vector<scalar>& internal) override
     {
+        // THE CONSTRUCTOR'S HALF, at the first call -- which is the case reader's evaluate of the field it
+        // has just built, where OpenFOAM constructs the patch: the fixed gradient evaluated on the file's
+        // gradient (or on none). The limiting body below is then the derived constructor's evaluate().
+        if (!constructed_)
+        {
+            constructed_ = true;
+            FixedGradientPatchField<scalar>::evaluate(internal);
+        }
         const std::vector<scalar>& dc = this->patch_.deltaCoeffs;
         if (limit_ == Limit::gradient)
         {
@@ -1353,10 +1377,31 @@ public:
 private:
     static Limit parseLimit(const std::string& w, const std::string& patchName)
     {
-        if (w.empty() || w == "none")     return Limit::none;
-        if (w == "gradient")              return Limit::gradient;
-        if (w == "zeroGradient")          return Limit::zeroGradient;
-        if (w == "alpha")                 return Limit::alpha;
+        // `limit` has no default: limitControlNames_.get("limit", dict)
+        // (alphaContactAngleTwoPhaseFvPatchScalarField.C:71). A missing one ran as `none`.
+        if (w.empty())
+        {
+            throw std::runtime_error(
+                "brae: patch '" + patchName + "' is constantAlphaContactAngle and has no `limit`. OpenFOAM reads "
+                "it with no default (alphaContactAngleTwoPhaseFvPatchScalarField.C:71) and stops; it is one of "
+                "none, gradient, zeroGradient, alpha.");
+        }
+        if (w == "none")
+        {
+            return Limit::none;
+        }
+        if (w == "gradient")
+        {
+            return Limit::gradient;
+        }
+        if (w == "zeroGradient")
+        {
+            return Limit::zeroGradient;
+        }
+        if (w == "alpha")
+        {
+            return Limit::alpha;
+        }
         throw std::runtime_error(
             "brae: patch '" + patchName + "' is constantAlphaContactAngle with `limit " + w +
             "`, which is not one of none/gradient/zeroGradient/alpha.");
@@ -1364,6 +1409,8 @@ private:
 
     scalar theta0_;
     Limit  limit_;
+    // the dictionary constructor's evaluate has run -- see evaluate()
+    bool   constructed_ = false;
 };
 
 class FixedFluxPressurePatchField : public FixedGradientPatchField<scalar>
@@ -3808,8 +3855,18 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
                     "brae: patch " + p.name + " is constantAlphaContactAngle but has no `theta0`. "
                     "OpenFOAM reads it with get<scalar> and has no default; a contact angle nobody "
                     "chose would set the wall's wetting behaviour.");
+            //   BRAE_CONTROL_CONTACT_ANGLE_GRADIENT_IGNORED=1: a gate's CONTROL, deliberately wrong -- the
+            //   file's gradient dropped, so a restart begins with a zero wall gradient.
+            static const bool gradientIgnored =
+                std::getenv("BRAE_CONTROL_CONTACT_ANGLE_GRADIENT_IGNORED") != nullptr;
             return std::make_unique<ConstantAlphaContactAnglePatchField>(
-                p, d.contactTheta0, d.contactLimit, d.valueUniform, d.uniformValue, d.values);
+                p,
+                d.contactTheta0,
+                d.contactLimit,
+                d.hasGradient && !gradientIgnored,
+                d.gradientUniform,
+                d.gradientUniformValue,
+                d.gradientValues);
         }
     }
     if (d.type == "fixedGradient" || d.type == "gradientEnergy")

@@ -13,6 +13,7 @@
 #include "patch_entry_lookup.cuh"
 #include "scheme_parse.cuh"
 #include "turbulence_setup.cuh"
+#include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
 
@@ -471,16 +472,60 @@ InterTurbulence readInterTurbulence(
     // and solution::solverDict is FATAL when the name is absent (solution.C:474-478) -- so they are
     // required exactly there and nowhere else. ONE place computes the rule.
     const bool nonFinalRequired = (!turbOnFinalIterOnly && nOuterCorrectors > 1);
-    const std::string path = caseDir + "/constant/momentumTransport";
-    const std::string alt = caseDir + "/constant/turbulenceProperties";
-    const std::string p = std::filesystem::exists(path) ? path
-                        : (std::filesystem::exists(alt) ? alt : std::string());
-    // no dictionary at all -> laminar
-    if (p.empty()) return t;
-    const std::string file = "constant/" + std::filesystem::path(p).filename().string();
+    // constant/turbulenceProperties, AS OPENFOAM READS IT. The one name (turbulenceModel.C:40), MUST_READ
+    // (TurbulenceModel.C:91-102), with `simulationType` mandatory (:104). This preferred a
+    // constant/momentumTransport -- another fork's name, which v2412 never opens -- ran a case with neither
+    // file as laminar, and took a missing `simulationType` as laminar too.
+    const std::string file = "constant/turbulenceProperties";
+    const std::string p = caseDir + "/" + file;
+    if (!std::filesystem::exists(p) && !std::filesystem::exists(p + ".gz"))
+    {
+        throw std::runtime_error(
+            std::string(WHO) + "the case has no " + file + ". OpenFOAM reads it MUST_READ "
+            "(TurbulenceModel.C:91-102) and stops; a constant/momentumTransport is not a name v2412 reads.");
+    }
     const FoamDict d = readDict(p);
-    const std::string sim = d.wordOr("simulationType", "laminar");
-    if (sim == "laminar") return t;
+    if (!d.found("simulationType"))
+    {
+        throw std::runtime_error(
+            std::string(WHO) + file + " has no `simulationType`. OpenFOAM reads it with no default "
+            "(TurbulenceModel.C:104) and stops.");
+    }
+    // THE MODEL'S KEYWORD: `model`, and the older name only where that is absent -- getCompat<word>("model",
+    // {{"RASModel", -2006}}) and its two siblings (RASModel.C:140-144, LESModel.C:158-162,
+    // laminarModel.C:115-119). The older names alone were read, so `RAS { model kEpsilon; }` was refused as
+    // an empty RASModel.
+    //   BRAE_CONTROL_TURB_MODEL_COMPAT_ONLY=1: a gate's CONTROL, deliberately wrong -- the older names alone.
+    static const bool compatOnly = std::getenv("BRAE_CONTROL_TURB_MODEL_COMPAT_ONLY") != nullptr;
+    const auto modelWord = [&](
+        const FoamDict* sub,
+        const char* older)
+    {
+        if (!sub)
+        {
+            return std::string();
+        }
+        return (!compatOnly && sub->found("model")) ? sub->wordOr("model", "") : sub->wordOr(older, "");
+    };
+    const std::string sim = d.wordOr("simulationType", "");
+    if (sim == "laminar")
+    {
+        // laminarModel.C:109-135: a `laminar` sub-dictionary SELECTS the stress model and its `model` is
+        // mandatory there; with no sub-dictionary it is Stokes, the Newtonian stress -- the one this loop has.
+        // The sub-dictionary was never opened: `laminar { model generalisedNewtonian; }` ran Newtonian.
+        if (const FoamDict* lam = d.subDict("laminar"))
+        {
+            const std::string lm = modelWord(lam, "laminarModel");
+            if (lm != "Stokes")
+            {
+                throw std::runtime_error(
+                    std::string(WHO) + file + "'s `laminar` sub-dictionary names the stress model `" + lm
+                    + "` (laminarModel.C:109-135; an empty word is a missing `model`, where OpenFOAM stops). "
+                    "Stokes, the Newtonian stress, is the laminar model here.");
+            }
+        }
+        return t;
+    }
     if (sim != "RAS" && sim != "LES")
         throw std::runtime_error(
             std::string(WHO) + file + " asks for simulationType `" + sim + "`. brae's interFoam has "
@@ -511,7 +556,7 @@ InterTurbulence readInterTurbulence(
         if (!mesh || !geometry)
             throw std::runtime_error(std::string(WHO) + "LES needs the mesh for its filter width.");
         const FoamDict* les = d.subDict("LES");
-        const std::string lesModel = les ? les->wordOr("LESModel", "") : "";
+        const std::string lesModel = modelWord(les, "LESModel");
         if (lesModel != "kEqn")
             throw std::runtime_error(
                 std::string(WHO) + file + " asks for LESModel `" + lesModel + "`. kEqn is the LES model "
@@ -588,7 +633,7 @@ InterTurbulence readInterTurbulence(
     }
 
     const FoamDict* ras = d.subDict("RAS");
-    const std::string model = ras ? ras->wordOr("RASModel", "") : "";
+    const std::string model = modelWord(ras, "RASModel");
     if (model != "kEpsilon" && model != "kOmegaSST")
         throw std::runtime_error(
             std::string(WHO) + file + " asks for RASModel `" + model + "`. kEpsilon and kOmegaSST are "

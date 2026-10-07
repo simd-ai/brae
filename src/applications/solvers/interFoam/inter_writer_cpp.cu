@@ -1653,6 +1653,27 @@ void InterWriter::noteAlphaOldCreation(const GeometricField<scalar>& alpha1)
     oldLevelNoted_ = true;
 }
 
+void InterWriter::noteAlphaOldFromStart(
+    const std::string& alphaName,
+    const std::vector<FvPatch>& patches,
+    label nCells)
+{
+    const FieldData<scalar> stored = readField<scalar>(startDir_ + "/" + alphaName + "_0");
+    GeometricField<scalar> level = buildField<scalar>(stored, patches, nCells);
+    // the patches' construction: see ConstantAlphaContactAnglePatchField::evaluate, its first call
+    level.evaluateBoundary();
+    oldLevelGrad_.assign(level.boundary.size(), std::vector<scalar>());
+    for (std::size_t pi = 0; pi < level.boundary.size(); ++pi)
+    {
+        const fvPatchField<scalar>& bc = *level.boundary[pi];
+        if (bc.contactAngleTheta0() >= scalar(0) && bc.refGradPtr())
+        {
+            oldLevelGrad_[pi] = *bc.refGradPtr();
+        }
+    }
+    oldLevelNoted_ = true;
+}
+
 void InterWriter::refuseAtFirstWrite(
     const std::string& file,
     const std::string& why)
@@ -3481,7 +3502,8 @@ void InterWriter::write(const InterWriteState& s)
 
 void registerUnwritten(
     InterWriter& w,
-    const InterFields& f)
+    const InterFields& f,
+    const std::vector<FvPatch>& patches)
 {
     const std::string a = f.alphaName;
     // the conditions: 16 types across the shipped interFoam tutorials have no transcribed write() yet
@@ -3546,14 +3568,14 @@ void registerUnwritten(
                                            "each change");
         }
         // a restart whose start directory holds alpha_0 gives OpenFOAM's old level that FILE's contact-angle
-        // gradient (readGradientEntry, alphaContactAngleTwoPhaseFvPatchScalarField.C:73-77), which brae
-        // does not read
+        // gradient (readGradientEntry, alphaContactAngleTwoPhaseFvPatchScalarField.C:73-77). It was refused
+        // here as not read; it is read now (noteAlphaOldFromStart), and
+        // tests/interfoam_write/core/contact_angle_restart.sh holds the alpha_0 a restart writes.
         for (std::size_t pi = 0; w.startHoldsAlphaOld() && pi < f.alpha1.boundary.size(); ++pi)
         {
             if (f.alpha1.boundary[pi]->contactAngleTheta0() >= scalar(0))
             {
-                w.refuseAtFirstWrite(a + "_0", "a restart from a stored old level with a contact angle, whose "
-                                               "gradient OpenFOAM reads from that file and brae does not");
+                w.noteAlphaOldFromStart(a, patches, static_cast<label>(f.alpha1.internal.size()));
                 break;
             }
         }

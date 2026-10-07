@@ -256,6 +256,11 @@ arm turb_RAS_model          runs    -                           "" "sed -i 's/^\
 BASE="$BL"
 arm turb_LES_model          runs    -                           "" "sed -i 's/^\( *\)LESModel /\1model /' constant/turbulenceProperties; grep -q '^ *model ' constant/turbulenceProperties"
 BASE="$B"
+# a contact-angle wall's `limit` has no default (limitControlNames_.get("limit", dict),
+# alphaContactAngleTwoPhaseFvPatchScalarField.C:71); a wall without one ran as `limit none`
+CANG="python3 -c \"import re, sys; p = '0/alpha.water'; t = open(p).read(); t2 = re.sub(r'(\n    leftWall\n    \{\n)\s*type\s+zeroGradient;', r'\1        type            constantAlphaContactAngle;\n        theta0          45;\n' + sys.argv[1] + '        value           uniform 0;', t); assert t2 != t; open(p, 'w').write(t2)\""
+arm contactAngle_noLimit    refused "is constantAlphaContactAngle and has no \`limit\`" "" "$CANG ''"
+arm contactAngle_limit      runs    -                           "" "$CANG '        limit           gradient;\n'"
 
 # FROZEN PER-STEP BOUNDARY CONDITIONS. The shared factory ACCEPTS fixedMean, fanPressure,
 # codedFixedValue and codedMixed on the strength of a per-step update its own comment promises, and
