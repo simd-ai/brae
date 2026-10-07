@@ -1611,7 +1611,8 @@ InterWriter::InterWriter(
             noticeIgnored(
                 "controlDict functions",
                 "brae runs no function objects (" + names + "): their postProcessing/ output and the fields "
-                "they write are not produced; the solution does not depend on them");
+                "they write are not produced; the solution depends on them in the time step alone, where "
+                "an object's adjustableRunTime write times trim it, and that is kept");
         }
     }
 

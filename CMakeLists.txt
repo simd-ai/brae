@@ -3672,6 +3672,14 @@ target_include_directories(test_time_controls_openfoam_log PRIVATE ${BRAE_HEADER
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_time_controls_openfoam_log PRIVATE brae_core)
 
+# The whole clock against OpenFOAM's own log -- setDeltaT.H, Time's write cadence and every function object's --
+# with the run's controlDict read by the solver's own readers: run by
+# tests/interfoam_write/clock/function_object_write_times.sh and function_object_write_entries.sh.
+add_executable(test_time_controls_cadence_log tests/test_time_controls_cadence_log.cu)
+target_include_directories(test_time_controls_cadence_log PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_time_controls_cadence_log PRIVATE brae_core)
+
 # interFoam step 12: the time step -- the alpha sub-cycle (33 of the 44 tutorials use it) and the order
 # of the PIMPLE loop. The three sub-cycle mistakes all leave a BOUNDED, plausible alpha field, so no
 # boundedness gate sees them; and the loop order decides which rho the momentum predictor is built on,

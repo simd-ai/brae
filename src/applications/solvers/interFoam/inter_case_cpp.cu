@@ -468,18 +468,21 @@ void refuseUnportedCaseInputs(
     // fvOptions are read in buildInterFields (createFvOptions.H), which ports explicitPorositySource /
     // DarcyForchheimer and refuses every other active option by name.
 
-    // A function object does not normally touch the solution, and brae runs none. setTimeStep is the
-    // exception: Time::adjustDeltaT ends with functionObjects_.adjustTimeStep(), so it OVERRIDES the
-    // deltaT the Courant number chose -- the clock this solver now reproduces bit for bit.
+    // A function object does not normally touch the solution, and brae runs none. TWO THINGS REACH THE
+    // CLOCK through Time::adjustDeltaT's last statement, functionObjects_.adjustTimeStep() (Time.C:142):
+    // an object's own adjustTimeStep -- setTimeStep and setTimeStepFaRegion are the two that define one, and
+    // they OVERRIDE the deltaT the Courant number chose: refused here -- and an object's write times under
+    // `writeControl adjustableRunTime`, which trim it: ported (WriteCadence::functionObjects).
     if (const FoamDict* fns = controlDict.subDict("functions"))
     {
         for (const auto& fo : fns->subs)
         {
-            if (fo.second.wordOr("type", "") == "setTimeStep")
+            const std::string type = fo.second.wordOr("type", "");
+            if (type == "setTimeStep" || type == "setTimeStepFaRegion")
             {
                 throw std::runtime_error(
                     "brae interFoam: controlDict's function object `" + fo.first + "` is a "
-                    "setTimeStep. It overrides deltaT from inside Time::adjustDeltaT, and brae runs no "
+                    + type + ". It overrides deltaT from inside Time::adjustDeltaT, and brae runs no "
                     "function objects.");
             }
         }
@@ -989,6 +992,13 @@ InterFields buildInterFields(const std::string&          caseDir,
     f.mulesCtl  = f.alphaCtl.MULESCorr ? MULES::readControlsCorr(fvSolution, f.alphaName)
                                        : MULES::readControls(fvSolution, f.alphaName);
     f.writeCadence = WriteCadence::read(controlDict);
+    for (const FunctionObjectCadence& fo : f.writeCadence.functionObjects)
+    {
+        // said per object: the step is the solution's, and this is the one thing of a function object brae keeps
+        std::printf("  time step: the write times of function object `%s`, every %g, trim the step as "
+                    "OpenFOAM's Time::adjustDeltaT does; the object itself is not run\n",
+                    fo.name.c_str(), (double)fo.writeInterval);
+    }
     f.deltaT    = controlDict.scalarOr("deltaT", scalar(1e-3));
 
     {

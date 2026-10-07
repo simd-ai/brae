@@ -32,6 +32,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -309,6 +310,184 @@ inline CourantNumbers alphaCourantNo(
     return courantNo(masked, V, deltaT);
 }
 
+// A FUNCTION OBJECT'S WRITE TIMES ARE PART OF THE TIME STEP TOO. Time::adjustDeltaT ends with
+// functionObjects_.adjustTimeStep() (Time.C:142), and an object that names any time-control entry is wrapped
+// in functionObjects::timeControl (functionObjectList.C read()), whose adjustTimeStep
+// (timeControlFunctionObject.C:560-643) trims deltaT a second time where its `writeControl` is
+// adjustableRunTime: so that the object's own write times are landed on. NOT as Time does it:
+//   * only when the next write time is NEAR -- timeToNextWrite/deltaT under `nStepsToStartTimeChange`, 3
+//     unless the entry says otherwise (readControls, :86-95) -- where Time trims at every step;
+//   * a decrease is held within a factor of 2 (`clipThreshold = 1/clipThreshold`), Time's within 5;
+//   * a time to the next write that is not positive becomes one whole interval, Time's becomes 0;
+//   * and only while the object is ACTIVE, timeStart - deltaT/2 <= t <= timeEnd + deltaT/2 (active(),
+//     :101-140), which also gates the index: write() asks `active() && writeControl_.execute()`.
+// brae runs no function object; it keeps this much of each, because the step is the solution's.
+// MEASURED on laminar/damBreak under adjustTimeStep with a `probes` object at `writeControl
+// adjustableRunTime; writeInterval 0.013`, to t = 0.1: OpenFOAM 31 steps, brae 26, the two parting at the
+// fifth (0.0021861 for 0.0024883).
+//
+// The gates' controls, not user switches: BRAE_CONTROL_FUNCTION_OBJECT_STEP names ONE rule of this to break --
+//   untrimmed  no object trims: the clock as it was before 2026-10-07
+//   everyStep  an object trims at every step, as Time's own cadence does
+//   near3      `nStepsToStartTimeChange` is not read: 3 for every object
+//   clip5      a decrease is held within Time's factor of 5
+//   window     an object is active whatever its timeStart and timeEnd say
+//   reversed   the objects trim in the reverse of the entry's order
+inline bool functionObjectStepControl(const char* part)
+{
+    static const char* const set = std::getenv("BRAE_CONTROL_FUNCTION_OBJECT_STEP");
+    return set && std::strcmp(set, part) == 0;
+}
+
+struct FunctionObjectCadence
+{
+    std::string name;
+    // the write control's interval, and Foam::timeControl::executionIndex_ (timeControl.C execute())
+    scalar writeInterval = 0;
+    label executionIndex = 0;
+    label nStepsToStartTimeChange = 3;
+    // -VGREAT and VGREAT (doubleScalar.H:60), the constructor's own: always active
+    scalar timeStart = scalar(-1e300);
+    scalar timeEnd = scalar(1e300);
+
+    bool active(
+        scalar tNow,
+        scalar deltaT) const
+    {
+        if (functionObjectStepControl("window"))
+        {
+            return true;
+        }
+        return tNow >= timeStart - scalar(0.5)*deltaT && tNow <= timeEnd + scalar(0.5)*deltaT;
+    }
+
+    // timeControl::write()'s `active() && writeControl_.execute()` at the top of the step after this one
+    // (Time::run -> functionObjectList::execute), which is the time and the deltaT Time::operator++ left
+    void advance(
+        scalar tSinceStart,
+        scalar tNow,
+        scalar deltaT)
+    {
+        if (!active(tNow, deltaT))
+        {
+            return;
+        }
+        const label index = static_cast<label>((tSinceStart + scalar(0.5)*deltaT)/writeInterval);
+        if (index > executionIndex)
+        {
+            executionIndex = index;
+        }
+    }
+
+    // timeControlFunctionObject.C:560-643 with deltaTCoeff_ GREAT -- no `deltaTCoeff` entry, which the
+    // reader refuses -- so the first branch is taken whatever the interval's remainder is
+    scalar adjustTimeStep(
+        scalar deltaT,
+        scalar tSinceStart,
+        scalar tNow) const
+    {
+        if (!active(tNow, deltaT))
+        {
+            return deltaT;
+        }
+        scalar timeToNextWrite = scalar(executionIndex + 1)*writeInterval - tSinceStart;
+        if (timeToNextWrite <= scalar(0))
+        {
+            timeToNextWrite = writeInterval;
+        }
+        const scalar nSteps = timeToNextWrite/deltaT;
+        const bool near = nSteps < scalar(nStepsToStartTimeChange) || functionObjectStepControl("everyStep");
+        if (!(nSteps < scalar(2147483647)) || !near)
+        {
+            return deltaT;
+        }
+        // nSteps can be < 1 so make sure at least 1
+        const label nStepsToNextWrite = std::max(label(1), static_cast<label>(std::lround(nSteps)));
+        const scalar newDeltaT = timeToNextWrite/nStepsToNextWrite;
+        if (newDeltaT >= deltaT)
+        {
+            return std::min(newDeltaT, scalar(2)*deltaT);
+        }
+        return std::max(newDeltaT, (functionObjectStepControl("clip5") ? scalar(0.2) : scalar(0.5))*deltaT);
+    }
+};
+
+// The objects of controlDict's `functions` that trim the step, in the entry's order -- each trims what the
+// one before left. EMPTY under `adjustTimeStep no`: nothing calls Time::setDeltaT there, so no object's
+// adjustTimeStep is ever reached and its entries are inert. An entry OpenFOAM reads on that path and brae
+// does not carry is refused by name; an object brae cannot see into is assumed to construct in OpenFOAM
+// (one that fails to load is skipped there with a warning, and trims nothing).
+inline std::vector<FunctionObjectCadence> readFunctionObjectCadences(const FoamDict& controlDict)
+{
+    std::vector<FunctionObjectCadence> out;
+    const FoamDict* fns = controlDict.subDict("functions");
+    if (functionObjectStepControl("untrimmed") || !fns || !controlDict.switchOr("adjustTimeStep", false))
+    {
+        return out;
+    }
+    for (const auto& entry : fns->subs)
+    {
+        const FoamDict& d = entry.second;
+        // functionObjectList.C read(): `enabled`, true unless the object says otherwise
+        if (!d.switchOr("enabled", true))
+        {
+            continue;
+        }
+        // Foam::timeControl::read with the prefix `write` (timeControl.C:113-166): the older `outputControl`
+        // where it is present, and then the older name of the interval with it; `timeStep` where neither is
+        const bool olderNames = d.found("outputControl");
+        const std::string control = d.wordOr(olderNames ? "outputControl" : "writeControl", "timeStep");
+        if (control != "adjustable" && control != "adjustableRunTime")
+        {
+            continue;
+        }
+        const std::string who =
+            "brae: controlDict's function object `" + entry.first + "` has `" + control + "` for its write "
+            "control under adjustTimeStep, so its write times trim the time step "
+            "(timeControlFunctionObject.C:560-643)";
+        const std::string intervalName = olderNames ? "outputInterval" : "writeInterval";
+        if (!d.found(intervalName))
+        {
+            throw std::runtime_error(
+                who + ", and it names no `" + intervalName + "`. OpenFOAM stops on that too: the entry is "
+                "mandatory under this control (timeControl.C:158).");
+        }
+        FunctionObjectCadence fo;
+        fo.name = entry.first;
+        fo.writeInterval = d.scalarOr(intervalName, scalar(0));
+        if (!(fo.writeInterval > scalar(0)))
+        {
+            throw std::runtime_error(
+                who + ", and its `" + intervalName + "` is not positive. OpenFOAM divides by it.");
+        }
+        // NOT CARRIED, each by name. deltaTCoeff: the geometric ramp of the step toward the write time
+        // (calcExpansion, calcDeltaTCoeff). The triggers: an index other function objects set as they run.
+        for (const char* key : {"deltaTCoeff", "controlMode", "triggerStart", "triggerEnd"})
+        {
+            if (std::string(key) == "controlMode" && d.wordOr("controlMode", "time") == "time")
+            {
+                continue;
+            }
+            if (d.found(key))
+            {
+                throw std::runtime_error(
+                    who + ", and it sets `" + key + "`, which changes how they do and is not ported. "
+                    "Ported: the default trimming, `nStepsToStartTimeChange`, `timeStart`, `timeEnd`.");
+            }
+        }
+        fo.nStepsToStartTimeChange =
+            functionObjectStepControl("near3") ? label(3) : static_cast<label>(d.intOr("nStepsToStartTimeChange", 3));
+        fo.timeStart = d.scalarOr("timeStart", fo.timeStart);
+        fo.timeEnd = d.scalarOr("timeEnd", fo.timeEnd);
+        out.push_back(fo);
+    }
+    if (functionObjectStepControl("reversed"))
+    {
+        std::reverse(out.begin(), out.end());
+    }
+    return out;
+}
+
 // VoF setDeltaT.H:36-53. Both limits enter maxDeltaTFact BEFORE the damping -- see note 4.
 // THE WRITE CADENCE IS PART OF THE TIME STEP, which is not obvious and is why this is here rather
 // than wherever brae decides to write fields. Time::setDeltaT(scalar) takes `adjust = true` by
@@ -332,6 +511,11 @@ struct WriteCadence
     scalar writeInterval = 0;
     // Time::writeTimeIndex_, which advance() below moves
     label writeTimeIndex = 0;
+    // the function objects whose write times trim the step after Time's own have (Time.C:142), and
+    // Time::startTime_ for their active window, which is in the run's time: the loop that owns the clock
+    // sets it beside its own
+    std::vector<FunctionObjectCadence> functionObjects;
+    scalar startTime = 0;
 
     static WriteCadence read(const FoamDict& controlDict)
     {
@@ -357,6 +541,7 @@ struct WriteCadence
             throw std::runtime_error(
                 "brae: controlDict says `writeControl adjustableRunTime` but gives no positive "
                 "`writeInterval`. Time::adjustDeltaT divides by it (Time.C:1150).");
+        w.functionObjects = readFunctionObjectCadences(controlDict);
         return w;
     }
 
@@ -367,6 +552,10 @@ struct WriteCadence
         scalar tSinceStart,
         scalar deltaT)
     {
+        for (FunctionObjectCadence& fo : functionObjects)
+        {
+            fo.advance(tSinceStart, startTime + tSinceStart, deltaT);
+        }
         if (!runTimeIndexed) return false;
         const label wi =
             static_cast<label>((tSinceStart + scalar(0.5)*deltaT)/writeInterval);
@@ -379,9 +568,9 @@ struct WriteCadence
     }
 };
 
-// Time::adjustDeltaT() (Time.C:1136-1170). `tSinceStart` is value() - startTime_, which is what the
-// drivers' own clocks already measure.
-inline scalar adjustDeltaT(
+// Time::adjustDeltaT()'s own trimming, to Time's write cadence (Time.C:104-140). `tSinceStart` is
+// value() - startTime_, which is what the drivers' own clocks already measure.
+inline scalar adjustDeltaTToWriteTime(
     scalar deltaT,
     scalar tSinceStart,
     const WriteCadence& w)
@@ -407,6 +596,21 @@ inline scalar adjustDeltaT(
     return std::max(newDeltaT, scalar(0.2)*deltaT);
 }
 
+// Time::adjustDeltaT() whole (Time.C:102-143): Time's own cadence, then every function object's in turn,
+// each handed the step the one before left
+inline scalar adjustDeltaT(
+    scalar deltaT,
+    scalar tSinceStart,
+    const WriteCadence& w)
+{
+    scalar dt = adjustDeltaTToWriteTime(deltaT, tSinceStart, w);
+    for (const FunctionObjectCadence& fo : w.functionObjects)
+    {
+        dt = fo.adjustTimeStep(dt, tSinceStart, w.startTime + tSinceStart);
+    }
+    return dt;
+}
+
 // setInitialDeltaT.H AS A SOLVER'S START RUNS IT (interFoam.C:81-85: CourantNo.H then this, before the time
 // loop). The statement is reached only at time index 0 with a Courant number above SMALL, and where it is
 // reached Time::setDeltaT lands the step on the write cadence as well -- `adjust` defaults to true
@@ -428,9 +632,10 @@ inline scalar setInitialDeltaT(
     return adjustDeltaT(setInitialDeltaT(deltaT, CoNum, tc), scalar(0), w);
 }
 
-// setDeltaT.H, and the adjustDeltaT that Time::setDeltaT performs on the way in. `w` null is a case
-// with no adjustable write cadence -- every gate fixture, and any case on `writeControl timeStep` or
-// `runTime`, for which OpenFOAM's adjustDeltaT is a no-op anyway.
+// setDeltaT.H, and the adjustDeltaT that Time::setDeltaT performs on the way in. `w` null is setDeltaT.H
+// alone -- the unit fixtures, and the log replay that holds the formula by itself. The loops always hand the
+// case's cadence: Time's own trimming is a no-op on `writeControl timeStep` or `runTime`, a function
+// object's is not.
 inline scalar setDeltaTVoF(
     scalar deltaT,
     scalar CoNum,

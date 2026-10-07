@@ -5144,6 +5144,8 @@ RunReport runInterFoamDevice(
     // start (Time.C:1150), so they take rep.time - startTime, exactly rep.time when the start is 0.
     const scalar startTime = startTimeOf(startDir);
     rep.time = startTime;
+    // a function object's active window is in the run's time (WriteCadence::startTime)
+    f.writeCadence.startTime = startTime;
     // Time::writeTime_ for the step being taken, decided at its start (as ++runTime is), and the alpha flux
     // its last alpha solve leaves, copied out on the device only on a write step
     bool writeNow = false;

@@ -470,6 +470,24 @@ arm sigma_zero              runs    -                        "" "sed -i 's/^sigm
 # the one function object that changes the solution
 arm fo_setTimeStep          refused "setTimeStep"             "" "sed -i 's|^// \*\*\*.*||' system/controlDict; printf 'functions { dt { type setTimeStep; libs (utilityFunctionObjects); deltaT 1e-5; } }\n' >> system/controlDict"
 arm fo_harmless             runs    -                        "" "sed -i 's|^// \*\*\*.*||' system/controlDict; printf 'functions { p { type probes; libs (sampling); fields (p); probeLocations ((0.1 0.1 0)); } }\n' >> system/controlDict"
+# ...its sibling for finite-area regions, the only other object that defines an adjustTimeStep of its own
+arm fo_setTimeStepFaRegion  refused "setTimeStepFaRegion"     "" "sed -i 's|^// \*\*\*.*||' system/controlDict; printf 'functions { dt { type setTimeStepFaRegion; libs (regionFaModels); } }\n' >> system/controlDict"
+# ...and the one thing of ANY object that reaches the solution: under adjustTimeStep its write times at
+# `writeControl adjustableRunTime` trim the step (Time.C:142, timeControlFunctionObject.C:560-643). Ported and
+# said per object -- tests/interfoam_write/clock/function_object_write_times.sh holds it to OpenFOAM's log, bit
+# for bit. Refused by name: an interval left out (OpenFOAM stops on it too, run 2026-10-07) and the entries
+# that change HOW the times trim. Only where they act: at a fixed step nothing reaches an object's
+# adjustTimeStep, and OpenFOAM runs the case (run the same day).
+FOADJ="sed -i 's|^// \*\*\*.*||; s/^adjustTimeStep .*/adjustTimeStep  yes;/' system/controlDict"
+FOADJ="$FOADJ; grep -q '^adjustTimeStep  yes;' system/controlDict; printf 'functions { p { type probes; libs (sampling);"
+FOADJ="$FOADJ fields (p); probeLocations ((0.1 0.1 0)); writeControl adjustableRunTime; EXTRA } }\n' >> system/controlDict"
+FOFIX="${FOADJ//adjustTimeStep  yes;/adjustTimeStep  no;}"
+arm fo_adjustable           runs    "time step: the write times of function object \`p\`" "" "${FOADJ/EXTRA/writeInterval 0.0003;}"
+arm fo_adjustable_noInterval refused "names no \`writeInterval\`" "" "${FOADJ/EXTRA/}"
+arm fo_adjustable_deltaTCoeff refused "sets \`deltaTCoeff\`"   "" "${FOADJ/EXTRA/writeInterval 0.0003; deltaTCoeff 1.1;}"
+arm fo_adjustable_trigger   refused "sets \`triggerStart\`"   "" "${FOADJ/EXTRA/writeInterval 0.0003; triggerStart 1;}"
+arm fo_adjustable_mode      refused "sets \`controlMode\`"    "" "${FOADJ/EXTRA/writeInterval 0.0003; controlMode timeOrTrigger;}"
+arm fo_deltaTCoeff_fixedStep runs   -                        "" "${FOFIX/EXTRA/writeInterval 0.0003; deltaTCoeff 1.1;}"
 
 # already refused before this gate; here so they stay refused
 arm nonNewtonian            refused "CrossPowerLaw"           "" "sed -i '0,/transportModel  *Newtonian;/s//transportModel  CrossPowerLaw;/' constant/transportProperties"

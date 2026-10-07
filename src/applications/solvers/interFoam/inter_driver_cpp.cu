@@ -617,6 +617,8 @@ RunReport runInterFoam(
     // early, and endTime was measured from the wrong origin.
     const scalar startTime = startTimeOf(startDir);
     rep.time = startTime;
+    // a function object's active window is in the run's time (WriteCadence::startTime)
+    f.writeCadence.startTime = startTime;
     // the mesh's GAMG hierarchy, built by the first GAMG solve -- pcorr's, p_rgh's or the mesh
     // motion's -- and kept for the run
     GamgAgglomerationCache gamgCache;
