@@ -7,6 +7,7 @@
 // used to add every owned face and then every neighbouring one -- the same terms in another order, which
 // is another last bit, and on a solve whose residual is all cancellation another stopping iteration.
 // One thread per cell, no write races (the scatter is turned into a gather), reproducible order.
+#include <algorithm>
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
@@ -54,7 +55,36 @@ struct DeviceLduView
     // is recycled by the pool. Trailing so the brace initialisers above stay valid; 0 = not stamped,
     // which every cache treats as "match on the pointer and the sizes alone", as they always did.
     unsigned long long addressingId = 0;
+    // THE ORDER A CELL'S PAIR FACES ARE ADDED IN by a product (deviceAmul, deviceResidual). The interface
+    // kernels add a face's term to its own cell with atomicAdd; a cell that owns several faces of the pair
+    // was then summed in the order the threads arrived (DeviceCyclic::ifRank has the measurement: RAS/
+    // mixerVesselAMI, 21,392 such cells). pairRank[i] is face i's place among its own cell's faces, in face
+    // order, and the kernels are launched once a place -- nPairRanks launches, the faces of one place each.
+    // Null and 1: one launch, every face, as before (what a view built without them gets).
+    const label* pairRank = nullptr;
+    int nPairRanks = 1;
 };
+
+// each entry's place among the entries of the same own cell, in list order, and the most one cell has
+inline std::vector<label> pairOwnerRanks(
+    const std::vector<label>& own,
+    int& mostOfACell)
+{
+    std::vector<label> rank(own.size(), 0);
+    label top = -1;
+    for (const label c : own)
+    {
+        top = std::max(top, c);
+    }
+    std::vector<label> seen(static_cast<std::size_t>(top + 1), 0);
+    mostOfACell = 1;
+    for (std::size_t i = 0; i < own.size(); ++i)
+    {
+        rank[i] = seen[static_cast<std::size_t>(own[i])]++;
+        mostOfACell = std::max(mostOfACell, static_cast<int>(rank[i]) + 1);
+    }
+    return rank;
+}
 
 struct DeviceLduMatrix
 {

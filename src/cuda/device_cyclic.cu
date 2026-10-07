@@ -25,10 +25,14 @@ void laplKernel(
     const scalar* __restrict__ magSf,
     scalar* __restrict__ ifCoeff,
     scalar* __restrict__ diag,
-    int addToDiag)
+    int addToDiag,
+    const label* __restrict__ ownerRank,
+    int ownerPass)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
+    // one of its owner's faces a launch, in face order (DeviceCyclic::ifRank)
+    if (ownerRank && ownerRank[j] != ownerPass) return;
 
     const scalar gf = w[j] * gamma[own[j]] + (1.0 - w[j]) * cyclicNbrValue(nbr, gamma, j);   // gamma interpolated to the face
     const scalar c = gf * dc[j] * magSf[j];
@@ -44,10 +48,14 @@ void convKernel(
     const scalar* __restrict__ phi,
     const scalar* __restrict__ wsch,   // div-scheme face weight; null = upwind (pos0(phi))
     scalar* __restrict__ ifCoeff,
-    scalar* __restrict__ diag)
+    scalar* __restrict__ diag,
+    const label* __restrict__ ownerRank,
+    int ownerPass)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
+    // one of its owner's faces a launch, in face order (DeviceCyclic::ifRank)
+    if (ownerRank && ownerRank[j] != ownerPass) return;
 
     const scalar p = phi[j];
     // Same split as momKernel: the div scheme's weight, upwind when none is given.
@@ -72,10 +80,14 @@ void momKernel(
     const scalar* __restrict__ phi,
     const scalar* __restrict__ wsch,   // div-scheme face weight; null = upwind (pos0(phi))
     scalar* __restrict__ ifCoeff,
-    scalar* __restrict__ diag)
+    scalar* __restrict__ diag,
+    const label* __restrict__ ownerRank,
+    int ownerPass)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
+    // one of its owner's faces a launch, in face order (DeviceCyclic::ifRank)
+    if (ownerRank && ownerRank[j] != ownerPass) return;
 
     const scalar nf = w[j] * nu[own[j]] + (1.0 - w[j]) * cyclicNbrValue(nbr, nu, j);
     const scalar lap = nf * dc[j] * magSf[j];           // diffusion magnitude (>0)
@@ -100,10 +112,14 @@ void addHKernel(
     const scalar* __restrict__ ifCoeff,
     const scalar* __restrict__ psi,
     const scalar* __restrict__ V,
-    scalar* __restrict__ H)
+    scalar* __restrict__ H,
+    const label* __restrict__ ownerRank,
+    int ownerPass)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
+    // one of its owner's faces a launch, in face order (DeviceCyclic::ifRank)
+    if (ownerRank && ownerRank[j] != ownerPass) return;
 
     atomicAdd(&H[own[j]], -ifCoeff[j] * cyclicNbrValue(nbr, psi, j) / V[own[j]]);
 }
@@ -114,10 +130,14 @@ void offSumKernel(
     int n,
     const label* __restrict__ own,
     const scalar* __restrict__ ifCoeff,
-    scalar* __restrict__ sumOff)
+    scalar* __restrict__ sumOff,
+    const label* __restrict__ ownerRank,
+    int ownerPass)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
+    // one of its owner's faces a launch, in face order (DeviceCyclic::ifRank)
+    if (ownerRank && ownerRank[j] != ownerPass) return;
 
     atomicAdd(&sumOff[own[j]], fabs(ifCoeff[j]));
 }
@@ -153,10 +173,14 @@ void divAddKernel(
     const label* __restrict__ own,
     const scalar* __restrict__ phi,
     const scalar* __restrict__ V,
-    scalar* __restrict__ div)
+    scalar* __restrict__ div,
+    const label* __restrict__ ownerRank,
+    int ownerPass)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
+    // one of its owner's faces a launch, in face order (DeviceCyclic::ifRank)
+    if (ownerRank && ownerRank[j] != ownerPass) return;
 
     atomicAdd(&div[own[j]], phi[j] / V[own[j]]);   // deviceDiv returns the volume-normalized divergence (Sum phi / V)
 }
@@ -228,10 +252,14 @@ void cycTensorDivKernel(
     int rotational,
     scalar* __restrict__ dX,
     scalar* __restrict__ dY,
-    scalar* __restrict__ dZ)
+    scalar* __restrict__ dZ,
+    const label* __restrict__ ownerRank,
+    int ownerPass)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
+    // one of its owner's faces a launch, in face order (DeviceCyclic::ifRank)
+    if (ownerRank && ownerRank[j] != ownerPass) return;
 
     const int o = own[j];
     const scalar wf = w[j], sx = Sfx[j], sy = Sfy[j], sz = Sfz[j];
@@ -295,10 +323,14 @@ void gradAddKernel(
     const scalar* __restrict__ V,
     scalar* __restrict__ gx,
     scalar* __restrict__ gy,
-    scalar* __restrict__ gz)
+    scalar* __restrict__ gz,
+    const label* __restrict__ ownerRank,
+    int ownerPass)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
+    // one of its owner's faces a launch, in face order (DeviceCyclic::ifRank)
+    if (ownerRank && ownerRank[j] != ownerPass) return;
 
     const label o = own[j];
     // fvc::grad interpolates the patch's own value, and on a jump cyclic the neighbour half of that
@@ -380,10 +412,14 @@ void addHRotKernel(
     const scalar* __restrict__ V,
     scalar* __restrict__ Hx,
     scalar* __restrict__ Hy,
-    scalar* __restrict__ Hz)
+    scalar* __restrict__ Hz,
+    const label* __restrict__ ownerRank,
+    int ownerPass)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
+    // one of its owner's faces a launch, in face order (DeviceCyclic::ifRank)
+    if (ownerRank && ownerRank[j] != ownerPass) return;
 
     const label o = own[j];
     scalar rx, ry, rz;
@@ -412,10 +448,14 @@ void gradRotKernel(
     const scalar* __restrict__ V,
     scalar* __restrict__ gx,
     scalar* __restrict__ gy,
-    scalar* __restrict__ gz)
+    scalar* __restrict__ gz,
+    const label* __restrict__ ownerRank,
+    int ownerPass)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
+    // one of its owner's faces a launch, in face order (DeviceCyclic::ifRank)
+    if (ownerRank && ownerRank[j] != ownerPass) return;
 
     const label o = own[j];
     scalar rx, ry, rz;
@@ -440,10 +480,14 @@ void deferredRotKernel(
     const scalar* __restrict__ Ux,
     const scalar* __restrict__ Uy,
     const scalar* __restrict__ Uz,
-    scalar* __restrict__ src)
+    scalar* __restrict__ src,
+    const label* __restrict__ ownerRank,
+    int ownerPass)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
+    // one of its owner's faces a launch, in face order (DeviceCyclic::ifRank)
+    if (ownerRank && ownerRank[j] != ownerPass) return;
 
     const label o = own[j];
     scalar rx, ry, rz;
@@ -463,10 +507,14 @@ void addHDiagKernel(
     const scalar* __restrict__ ifcC,
     const scalar* __restrict__ psi,
     const scalar* __restrict__ V,
-    scalar* __restrict__ H)
+    scalar* __restrict__ H,
+    const label* __restrict__ ownerRank,
+    int ownerPass)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
+    // one of its owner's faces a launch, in face order (DeviceCyclic::ifRank)
+    if (ownerRank && ownerRank[j] != ownerPass) return;
 
     atomicAdd(&H[own[j]], -ifcC[j] * cyclicNbrValue(nbr, psi, j) / V[own[j]]);   // diag cyclic off-diag (ifCoeffC[comp])
 }
@@ -607,10 +655,14 @@ void addToOwnerKernel(
     const label* __restrict__ own,
     const scalar* __restrict__ f,
     scalar sign,
-    scalar* __restrict__ cell)
+    scalar* __restrict__ cell,
+    const label* __restrict__ ownerRank,
+    int ownerPass)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
+    // one of its owner's faces a launch, in face order (DeviceCyclic::ifRank)
+    if (ownerRank && ownerRank[j] != ownerPass) return;
 
     atomicAdd(&cell[own[j]], sign*f[j]);
 }
@@ -736,7 +788,11 @@ void deviceCyclicAddToOwner(
     DeviceBuffer<scalar>&       cell)
 {
     if (cyc.n == 0) return;
-    addToOwnerKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), faceField.data(), sign, cell.data());
+    for (int ownerPass = 0; ownerPass < cyc.ownerPasses(); ++ownerPass)
+    {
+        addToOwnerKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), faceField.data(), sign, cell.data(),
+            cyc.ownerRank(), cyc.ownerPass(ownerPass));
+    }
     cudaCheck(cudaGetLastError(), "cyclicAddToOwner");
 }
 
@@ -761,8 +817,12 @@ void deviceCyclicAssembleLaplacian(
     // the host's own choice (fvm.cuh:104-113): nonOrthDeltaCoeffs when corrected, deltaCoeffs when not
     const scalar* dc = (corrected || cyc.orthDeltaCoeffs.size() != cyc.deltaCoeffs.size())
                      ? cyc.deltaCoeffs.data() : cyc.orthDeltaCoeffs.data();
-    laplKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), gammaCell.data(),
-        dc, cyc.weights.data(), cyc.magSf.data(), cyc.ifCoeff.data(), diag.data(), addToDiag ? 1 : 0);
+    for (int ownerPass = 0; ownerPass < cyc.ownerPasses(); ++ownerPass)
+    {
+        laplKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), gammaCell.data(),
+            dc, cyc.weights.data(), cyc.magSf.data(), cyc.ifCoeff.data(), diag.data(), addToDiag ? 1 : 0,
+            cyc.ownerRank(), cyc.ownerPass(ownerPass));
+    }
     cudaCheck(cudaGetLastError(), "cyclicLapl");
 }
 
@@ -780,9 +840,13 @@ void deviceCyclicAddConvection(
             "brae device cyclic: the pair's upwind convection needs the convecting flux, one value a pair face ("
             + std::to_string(cyc.n) + "); the caller handed " + std::to_string(phiIf.size()) + ".");
     }
-    convKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), phiIf.data(),
-        (wsch && (label)wsch->size() == cyc.n) ? wsch->data() : nullptr,
-        cyc.ifCoeff.data(), diag.data());
+    for (int ownerPass = 0; ownerPass < cyc.ownerPasses(); ++ownerPass)
+    {
+        convKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), phiIf.data(),
+            (wsch && (label)wsch->size() == cyc.n) ? wsch->data() : nullptr,
+            cyc.ifCoeff.data(), diag.data(),
+            cyc.ownerRank(), cyc.ownerPass(ownerPass));
+    }
     cudaCheck(cudaGetLastError(), "cyclicConv");
 }
 
@@ -796,11 +860,15 @@ void deviceCyclicAssembleMomentum(DeviceCyclic& cyc, const DeviceBuffer<scalar>&
     // the diffusion half's own choice, as the laplacian entry point above makes it
     const scalar* dc = (corrected || cyc.orthDeltaCoeffs.size() != cyc.deltaCoeffs.size())
                      ? cyc.deltaCoeffs.data() : cyc.orthDeltaCoeffs.data();
-    momKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), nuEffCell.data(),
-        dc, cyc.weights.data(), cyc.magSf.data(),
-        (convFlux && static_cast<int>(convFlux->size()) == cyc.n) ? convFlux->data() : cyc.phi.data(),
-        (wsch && (label)wsch->size() == cyc.n) ? wsch->data() : nullptr,
-        cyc.ifCoeff.data(), diag.data());
+    for (int ownerPass = 0; ownerPass < cyc.ownerPasses(); ++ownerPass)
+    {
+        momKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), nuEffCell.data(),
+            dc, cyc.weights.data(), cyc.magSf.data(),
+            (convFlux && static_cast<int>(convFlux->size()) == cyc.n) ? convFlux->data() : cyc.phi.data(),
+            (wsch && (label)wsch->size() == cyc.n) ? wsch->data() : nullptr,
+            cyc.ifCoeff.data(), diag.data(),
+            cyc.ownerRank(), cyc.ownerPass(ownerPass));
+    }
     cudaCheck(cudaGetLastError(), "cyclicMom");
 }
 
@@ -815,8 +883,12 @@ void deviceCyclicAddH(
     if (cyc.n == 0) return;
     const scalar* c = (coeff && static_cast<int>(coeff->size()) == cyc.n) ? coeff->data()
                                                                          : cyc.ifCoeff.data();
-    addHKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), c,
-        psi.data(), V.data(), H.data());
+    for (int ownerPass = 0; ownerPass < cyc.ownerPasses(); ++ownerPass)
+    {
+        addHKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), c,
+            psi.data(), V.data(), H.data(),
+            cyc.ownerRank(), cyc.ownerPass(ownerPass));
+    }
     cudaCheck(cudaGetLastError(), "cyclicAddH");
 }
 
@@ -824,7 +896,11 @@ void deviceCyclicAddH(
 void deviceCyclicOffDiagSum(const DeviceCyclic& cyc, DeviceBuffer<scalar>& sumOff)
 {
     if (cyc.n == 0) return;
-    offSumKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.ifCoeff.data(), sumOff.data());
+    for (int ownerPass = 0; ownerPass < cyc.ownerPasses(); ++ownerPass)
+    {
+        offSumKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.ifCoeff.data(), sumOff.data(),
+            cyc.ownerRank(), cyc.ownerPass(ownerPass));
+    }
     cudaCheck(cudaGetLastError(), "cyclicOffSum");
 }
 
@@ -858,7 +934,11 @@ void deviceCyclicAddDivFlux(const DeviceCyclic& cyc,
     const DeviceBuffer<scalar>& phi, const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& div)
 {
     if (cyc.n == 0) return;
-    divAddKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), phi.data(), V.data(), div.data());
+    for (int ownerPass = 0; ownerPass < cyc.ownerPasses(); ++ownerPass)
+    {
+        divAddKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), phi.data(), V.data(), div.data(),
+            cyc.ownerRank(), cyc.ownerPass(ownerPass));
+    }
     cudaCheck(cudaGetLastError(), "cyclicDiv");
 }
 
@@ -980,8 +1060,12 @@ void deviceCyclicAddGrad(
 {
     if (cyc.n == 0) return;
     const scalar* j = (jump && static_cast<int>(jump->size()) == cyc.n) ? jump->data() : nullptr;
-    gradAddKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), cyc.weights.data(),
-        psi.data(), j, cyc.Sfx.data(), cyc.Sfy.data(), cyc.Sfz.data(), V.data(), gx.data(), gy.data(), gz.data());
+    for (int ownerPass = 0; ownerPass < cyc.ownerPasses(); ++ownerPass)
+    {
+        gradAddKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), cyc.weights.data(),
+            psi.data(), j, cyc.Sfx.data(), cyc.Sfy.data(), cyc.Sfz.data(), V.data(), gx.data(), gy.data(), gz.data(),
+            cyc.ownerRank(), cyc.ownerPass(ownerPass));
+    }
     cudaCheck(cudaGetLastError(), "cyclicGrad");
 }
 
@@ -1019,8 +1103,12 @@ void deviceCyclicAddHRot(
     DeviceBuffer<scalar>& Hz)
 {
     if (cyc.n == 0) return;
-    addHRotKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), cyc.ifCoeff.data(),
-        cyc.fT.data(), Ux.data(), Uy.data(), Uz.data(), V.data(), Hx.data(), Hy.data(), Hz.data());
+    for (int ownerPass = 0; ownerPass < cyc.ownerPasses(); ++ownerPass)
+    {
+        addHRotKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), cyc.ifCoeff.data(),
+            cyc.fT.data(), Ux.data(), Uy.data(), Uz.data(), V.data(), Hx.data(), Hy.data(), Hz.data(),
+            cyc.ownerRank(), cyc.ownerPass(ownerPass));
+    }
     cudaCheck(cudaGetLastError(), "cyclicAddHRot");
 }
 
@@ -1037,9 +1125,13 @@ void deviceCyclicAddGradRot(
     DeviceBuffer<scalar>& gz)
 {
     if (cyc.n == 0) return;
-    gradRotKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), cyc.weights.data(),
-        cyc.fT.data(), comp, Ux.data(), Uy.data(), Uz.data(), cyc.Sfx.data(), cyc.Sfy.data(), cyc.Sfz.data(),
-        V.data(), gx.data(), gy.data(), gz.data());
+    for (int ownerPass = 0; ownerPass < cyc.ownerPasses(); ++ownerPass)
+    {
+        gradRotKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), cyc.weights.data(),
+            cyc.fT.data(), comp, Ux.data(), Uy.data(), Uz.data(), cyc.Sfx.data(), cyc.Sfy.data(), cyc.Sfz.data(),
+            V.data(), gx.data(), gy.data(), gz.data(),
+            cyc.ownerRank(), cyc.ownerPass(ownerPass));
+    }
     cudaCheck(cudaGetLastError(), "cyclicGradRot");
 }
 
@@ -1053,8 +1145,12 @@ void deviceCyclicAddDeferredRot(
     DeviceBuffer<scalar>& src)
 {
     if (cyc.n == 0) return;
-    deferredRotKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), cyc.ifCoeff.data(),
-        cyc.fT.data(), comp, Ux.data(), Uy.data(), Uz.data(), src.data());
+    for (int ownerPass = 0; ownerPass < cyc.ownerPasses(); ++ownerPass)
+    {
+        deferredRotKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), cyc.ifCoeff.data(),
+            cyc.fT.data(), comp, Ux.data(), Uy.data(), Uz.data(), src.data(),
+            cyc.ownerRank(), cyc.ownerPass(ownerPass));
+    }
     cudaCheck(cudaGetLastError(), "cyclicDeferredRot");
 }
 
@@ -1067,8 +1163,12 @@ void deviceCyclicAddHDiag(
     DeviceBuffer<scalar>& H)
 {
     if (cyc.n == 0) return;
-    addHDiagKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), cyc.ifCoeffC[comp].data(),
-        psi.data(), V.data(), H.data());
+    for (int ownerPass = 0; ownerPass < cyc.ownerPasses(); ++ownerPass)
+    {
+        addHDiagKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), cyc.ifCoeffC[comp].data(),
+            psi.data(), V.data(), H.data(),
+            cyc.ownerRank(), cyc.ownerPass(ownerPass));
+    }
     cudaCheck(cudaGetLastError(), "cyclicAddHDiag");
 }
 
@@ -1097,10 +1197,14 @@ void cycLinUpwindKernel(
     const scalar* __restrict__ fT,
     int rotational,
     int comp,
-    scalar* __restrict__ corr)
+    scalar* __restrict__ corr,
+    const label* __restrict__ ownerRank,
+    int ownerPass)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
+    // one of its owner's faces a launch, in face order (DeviceCyclic::ifRank)
+    if (ownerRank && ownerRank[j] != ownerPass) return;
 
     const int o = own[j];
     const scalar pf = phi[j];
@@ -1140,11 +1244,15 @@ void deviceCyclicAddLinUpwindCorr(
     // takes cyc.phi, which is what it assembled with.
     const scalar* f = (flux && static_cast<int>(flux->size()) == cyc.n) ? flux->data()
                                                                        : cyc.phi.data();
-    cycLinUpwindKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), f,
-        gUx[0].data(), gUy[0].data(), gUz[0].data(), gUx[1].data(), gUy[1].data(), gUz[1].data(),
-        gUx[2].data(), gUy[2].data(), gUz[2].data(),
-        cyc.dOwnX.data(), cyc.dOwnY.data(), cyc.dOwnZ.data(), cyc.dNbrX.data(), cyc.dNbrY.data(), cyc.dNbrZ.data(),
-        cyc.rotational ? cyc.fT.data() : nullptr, cyc.rotational ? 1 : 0, comp, corr.data());
+    for (int ownerPass = 0; ownerPass < cyc.ownerPasses(); ++ownerPass)
+    {
+        cycLinUpwindKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), f,
+            gUx[0].data(), gUy[0].data(), gUz[0].data(), gUx[1].data(), gUy[1].data(), gUz[1].data(),
+            gUx[2].data(), gUy[2].data(), gUz[2].data(),
+            cyc.dOwnX.data(), cyc.dOwnY.data(), cyc.dOwnZ.data(), cyc.dNbrX.data(), cyc.dNbrY.data(), cyc.dNbrZ.data(),
+            cyc.rotational ? cyc.fT.data() : nullptr, cyc.rotational ? 1 : 0, comp, corr.data(),
+            cyc.ownerRank(), cyc.ownerPass(ownerPass));
+    }
     cudaCheck(cudaGetLastError(), "cyclicLinUpwind");
 }
 
@@ -1157,10 +1265,14 @@ void deviceCyclicAddLinUpwindCorr(
     DeviceBuffer<scalar>& corr)
 {
     if (cyc.n == 0) return;
-    cycLinUpwindKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), cyc.phi.data(),
-        gx.data(), gy.data(), gz.data(), gx.data(), gy.data(), gz.data(), gx.data(), gy.data(), gz.data(),
-        cyc.dOwnX.data(), cyc.dOwnY.data(), cyc.dOwnZ.data(), cyc.dNbrX.data(), cyc.dNbrY.data(), cyc.dNbrZ.data(),
-        nullptr, 0, 0, corr.data());
+    for (int ownerPass = 0; ownerPass < cyc.ownerPasses(); ++ownerPass)
+    {
+        cycLinUpwindKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), cyc.phi.data(),
+            gx.data(), gy.data(), gz.data(), gx.data(), gy.data(), gz.data(), gx.data(), gy.data(), gz.data(),
+            cyc.dOwnX.data(), cyc.dOwnY.data(), cyc.dOwnZ.data(), cyc.dNbrX.data(), cyc.dNbrY.data(), cyc.dNbrZ.data(),
+            nullptr, 0, 0, corr.data(),
+            cyc.ownerRank(), cyc.ownerPass(ownerPass));
+    }
     cudaCheck(cudaGetLastError(), "cyclicLinUpwindScalar");
 }
 
@@ -1188,10 +1300,14 @@ void cycLapCorrKernel(
     const scalar* __restrict__ fT,
     int rotational,
     int comp,
-    scalar* __restrict__ src)
+    scalar* __restrict__ src,
+    const label* __restrict__ ownerRank,
+    int ownerPass)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
+    // one of its owner's faces a launch, in face order (DeviceCyclic::ifRank)
+    if (ownerRank && ownerRank[j] != ownerPass) return;
 
     const int o = own[j];
     const scalar wf = w[j], wn = 1.0 - wf;
@@ -1234,11 +1350,15 @@ void deviceCyclicAddLapCorr(
     DeviceBuffer<scalar>& corr)
 {
     if (cyc.n == 0) return;
-    cycLapCorrKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), gammaCell.data(),
-        cyc.weights.data(), cyc.magSf.data(), cyc.corrVecX.data(), cyc.corrVecY.data(), cyc.corrVecZ.data(),
-        gUx[0].data(), gUy[0].data(), gUz[0].data(), gUx[1].data(), gUy[1].data(), gUz[1].data(),
-        gUx[2].data(), gUy[2].data(), gUz[2].data(),
-        cyc.rotational ? cyc.fT.data() : nullptr, cyc.rotational ? 1 : 0, comp, corr.data());
+    for (int ownerPass = 0; ownerPass < cyc.ownerPasses(); ++ownerPass)
+    {
+        cycLapCorrKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), gammaCell.data(),
+            cyc.weights.data(), cyc.magSf.data(), cyc.corrVecX.data(), cyc.corrVecY.data(), cyc.corrVecZ.data(),
+            gUx[0].data(), gUy[0].data(), gUz[0].data(), gUx[1].data(), gUy[1].data(), gUz[1].data(),
+            gUx[2].data(), gUy[2].data(), gUz[2].data(),
+            cyc.rotational ? cyc.fT.data() : nullptr, cyc.rotational ? 1 : 0, comp, corr.data(),
+            cyc.ownerRank(), cyc.ownerPass(ownerPass));
+    }
     cudaCheck(cudaGetLastError(), "cyclicLapCorr");
 }
 
@@ -1251,10 +1371,14 @@ void deviceCyclicAddLapCorr(
     DeviceBuffer<scalar>& corr)
 {
     if (cyc.n == 0) return;
-    cycLapCorrKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), gammaCell.data(),
-        cyc.weights.data(), cyc.magSf.data(), cyc.corrVecX.data(), cyc.corrVecY.data(), cyc.corrVecZ.data(),
-        gx.data(), gy.data(), gz.data(), gx.data(), gy.data(), gz.data(), gx.data(), gy.data(), gz.data(),
-        nullptr, 0, 0, corr.data());
+    for (int ownerPass = 0; ownerPass < cyc.ownerPasses(); ++ownerPass)
+    {
+        cycLapCorrKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), gammaCell.data(),
+            cyc.weights.data(), cyc.magSf.data(), cyc.corrVecX.data(), cyc.corrVecY.data(), cyc.corrVecZ.data(),
+            gx.data(), gy.data(), gz.data(), gx.data(), gy.data(), gz.data(), gx.data(), gy.data(), gz.data(),
+            nullptr, 0, 0, corr.data(),
+            cyc.ownerRank(), cyc.ownerPass(ownerPass));
+    }
     cudaCheck(cudaGetLastError(), "cyclicLapCorrScalar");
 }
 
@@ -1274,10 +1398,14 @@ void cycLapCorrScalarKernel(
     const scalar* __restrict__ gy,
     const scalar* __restrict__ gz,
     scalar* __restrict__ bp,
-    scalar* __restrict__ ffcOut)
+    scalar* __restrict__ ffcOut,
+    const label* __restrict__ ownerRank,
+    int ownerPass)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= n) return;
+    // one of its owner's faces a launch, in face order (DeviceCyclic::ifRank)
+    if (ownerRank && ownerRank[j] != ownerPass) return;
 
     const int o = own[j];
     const scalar wf = w[j], wn = 1.0 - wf;
@@ -1300,9 +1428,13 @@ void deviceCyclicLapCorrP(
 {
     if (cyc.n == 0) return;
     ffcOut.resize(cyc.n);
-    cycLapCorrScalarKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), gammaCell.data(),
-        cyc.weights.data(), cyc.magSf.data(), cyc.corrVecX.data(), cyc.corrVecY.data(), cyc.corrVecZ.data(),
-        gx.data(), gy.data(), gz.data(), bp.data(), ffcOut.data());
+    for (int ownerPass = 0; ownerPass < cyc.ownerPasses(); ++ownerPass)
+    {
+        cycLapCorrScalarKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), gammaCell.data(),
+            cyc.weights.data(), cyc.magSf.data(), cyc.corrVecX.data(), cyc.corrVecY.data(), cyc.corrVecZ.data(),
+            gx.data(), gy.data(), gz.data(), bp.data(), ffcOut.data(),
+            cyc.ownerRank(), cyc.ownerPass(ownerPass));
+    }
     cudaCheck(cudaGetLastError(), "cyclicLapCorrP");
 }
 
@@ -1317,9 +1449,13 @@ void deviceCyclicAddTensorDiv(
 {
     if (cyc.n == 0) return;
     const scalar* fT = cyc.rotational ? cyc.fT.data() : nullptr;
-    cycTensorDivKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), cyc.weights.data(),
-        cyc.Sfx.data(), cyc.Sfy.data(), cyc.Sfz.data(), sigmaC.data(), nC, fT, cyc.rotational ? 1 : 0,
-        srcX.data(), srcY.data(), srcZ.data());
+    for (int ownerPass = 0; ownerPass < cyc.ownerPasses(); ++ownerPass)
+    {
+        cycTensorDivKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(), cyc.weights.data(),
+            cyc.Sfx.data(), cyc.Sfy.data(), cyc.Sfz.data(), sigmaC.data(), nC, fT, cyc.rotational ? 1 : 0,
+            srcX.data(), srcY.data(), srcZ.data(),
+            cyc.ownerRank(), cyc.ownerPass(ownerPass));
+    }
     cudaCheck(cudaGetLastError(), "cyclicTensorDiv");
 }
 

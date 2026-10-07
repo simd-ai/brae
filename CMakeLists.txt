@@ -3399,6 +3399,7 @@ foreach(key ${BRAE_WRITE_TUTORIALS_SLOW})
     set_tests_properties(interfoam_write_tutorial_${key}_host PROPERTIES RESOURCE_LOCK brae_bigmesh)
 endforeach()
 set_tests_properties(interfoam_write_ami_operands_control PROPERTIES RESOURCE_LOCK brae_bigmesh)
+set_tests_properties(interfoam_write_ami_pair_sums_ordered PROPERTIES RESOURCE_LOCK "brae_gpu;brae_bigmesh")
 add_dependencies(brae brae_interFoam)
 
 add_test(NAME device_inter_step COMMAND test_device_inter_step)

@@ -16,6 +16,7 @@
 #include "fv_patch.cuh"
 #include "interface/cyclic_interface.cuh"
 #include <algorithm>
+#include <cstdlib>
 #include <map>
 #include <stdexcept>
 #include <string>
@@ -96,6 +97,45 @@ struct DeviceCyclic
     // indices; twin[j] is the index of the face j pairs with, or -1 where there is none (an AMI side,
     // which OpenFOAM does NOT sync -- see MULES's sync note).
     DeviceBuffer<label> ifCellStart, ifPerm, twin;
+    // THE ORDER A CELL'S FACES ARE SUMMED IN. The kernels that add a face's term to its owner cell do it with
+    // atomicAdd, and a cell that owns SEVERAL faces of the pair was summed in the order the threads arrived:
+    // another rounding at every run. MEASURED 2026-10-07 on RAS/mixerVesselAMI's pinned row, two runs of one
+    // binary: 25 of 34 written files differ from the first step (the host loop: none), the first operation
+    // that is not the same twice being deviceCyclicAddGrad in the alpha corrector. 11,416 + 9,976 cells of
+    // that mesh own two to six faces of the AMI, and for 6,742 of them the faces are in different thread
+    // blocks of the launch. ifRank[j] is face j's place among its owner's faces in face order (ifPerm's);
+    // such a kernel is launched once a place, each launch taking the faces of that place alone, so no two
+    // faces of a launch share a cell and a cell's terms are added in face order -- the host loop's order.
+    // One launch, as before, where no cell owns two (every cyclic tutorial).
+    //   BRAE_CONTROL_PAIR_SUMS_UNORDERED=1: one launch whatever the mesh, as it was.
+    //   BRAE_CONTROL_PAIR_SUMS_REVERSED=1: a gate's CONTROL -- the places taken last first, another fixed
+    //   order, which the written files have to show.
+    DeviceBuffer<label> ifRank;
+    int nIfRanks = 1;
+    static bool sumsUnordered()
+    {
+        static const bool on = std::getenv("BRAE_CONTROL_PAIR_SUMS_UNORDERED") != nullptr;
+        return on;
+    }
+    static bool sumsReversed()
+    {
+        static const bool on = std::getenv("BRAE_CONTROL_PAIR_SUMS_REVERSED") != nullptr;
+        return on;
+    }
+    // the number of launches such a kernel takes, the rank list to hand it (null: every face), and the
+    // place the k-th launch takes
+    int ownerPasses() const
+    {
+        return (nIfRanks <= 1 || sumsUnordered()) ? 1 : nIfRanks;
+    }
+    const label* ownerRank() const
+    {
+        return (nIfRanks <= 1 || sumsUnordered()) ? nullptr : ifRank.data();
+    }
+    int ownerPass(int k) const
+    {
+        return sumsReversed() ? ownerPasses() - 1 - k : k;
+    }
     DeviceBuffer<scalar> Sfx, Sfy, Sfz;         // face area vector, oriented OUT of ownCell
     DeviceBuffer<scalar> dOwnX, dOwnY, dOwnZ;   // Cf - C[own]          (linearUpwind face delta, own side)
     DeviceBuffer<scalar> dNbrX, dNbrY, dNbrZ;   // Cf_nbr - C[nbr]      (linearUpwind face delta, nbr side, UN-rotated)
@@ -203,6 +243,17 @@ inline DeviceCyclic buildDeviceCyclic(
             perm[static_cast<std::size_t>(fill[static_cast<std::size_t>(oc[j])]++)] = static_cast<label>(j);
         }
     }
+    // each face's place among its owner's faces, in face order (perm's), and the most one cell owns
+    std::vector<label> rank(oc.size(), 0);
+    label mostOfACell = 1;
+    for (std::size_t c = 0; c + 1 < cellStart.size(); ++c)
+    {
+        for (label k = cellStart[c]; k < cellStart[c + 1]; ++k)
+        {
+            rank[static_cast<std::size_t>(perm[static_cast<std::size_t>(k)])] = k - cellStart[c];
+        }
+        mostOfACell = std::max(mostOfACell, cellStart[c + 1] - cellStart[c]);
+    }
 
     DeviceCyclic d;
     d.n = (int)oc.size();
@@ -250,6 +301,26 @@ inline DeviceCyclic buildDeviceCyclic(
     d.orthDeltaCoeffs.copyFrom(odc);
     d.ifCellStart.copyFrom(cellStart);
     d.ifPerm.copyFrom(perm);
+    d.ifRank.copyFrom(rank);
+    d.nIfRanks = static_cast<int>(mostOfACell);
+    if (mostOfACell > 1)
+    {
+        // (said once: a moving mesh lays the pair out again at every step)
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            std::size_t several = 0;
+            for (std::size_t c = 0; c + 1 < cellStart.size(); ++c)
+            {
+                several += (cellStart[c + 1] - cellStart[c] > 1) ? 1 : 0;
+            }
+            std::printf("  coupled pair: %zu cells own several of its faces, up to %d; a cell's faces are summed in "
+                        "face order, a launch a place (BRAE_CONTROL_PAIR_SUMS_UNORDERED=1: in the order the "
+                        "threads arrive, which another run does not repeat)\n", several,
+                        static_cast<int>(mostOfACell));
+        }
+    }
     d.twin.copyFrom(twin);
     d.weights.copyFrom(w);
     d.magSf.copyFrom(ms);
@@ -395,8 +466,11 @@ inline DeviceLduView deviceLduViewPair(
                                                                             : cyc.ifCoeff.data();
     if (!cyc.stencil)
     {
-        return deviceLduViewCyclic(dm, diag, upper, lower, cyc.n, cyc.ownCell.data(), cyc.nbrCell.data(),
-                                   ifc, cycJump);
+        DeviceLduView one = deviceLduViewCyclic(dm, diag, upper, lower, cyc.n, cyc.ownCell.data(),
+                                                cyc.nbrCell.data(), ifc, cycJump);
+        one.pairRank = cyc.ownerRank();
+        one.nPairRanks = cyc.ownerPasses();
+        return one;
     }
     if (cycJump)
     {
@@ -404,8 +478,11 @@ inline DeviceLduView deviceLduViewPair(
             "brae device: a jump condition (fixedJump, porousBafflePressure) on a mesh that carries a "
             "cyclicAMI pair. The device applies a jump across a one-to-one pair only.");
     }
-    return deviceLduViewAmi(dm, diag, upper, lower, cyc.n, cyc.ownCell.data(), cyc.stOff.data(),
-                            cyc.stCell.data(), cyc.stW.data(), ifc);
+    DeviceLduView v = deviceLduViewAmi(dm, diag, upper, lower, cyc.n, cyc.ownCell.data(), cyc.stOff.data(),
+                                       cyc.stCell.data(), cyc.stW.data(), ifc);
+    v.pairRank = cyc.ownerRank();
+    v.nPairRanks = cyc.ownerPasses();
+    return v;
 }
 
 // THE EXPLICIT NON-ORTHOGONAL CORRECTION ON THE PAIR'S FACES (fvm.cuh, laplacianCorrFluxCoupled):

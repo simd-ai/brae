@@ -70,10 +70,14 @@ void cyclicAmulKernel(
     const scalar* __restrict__ coeff,
     const scalar* __restrict__ jump,        // already signed; null = no jump on this pair
     const scalar* __restrict__ psi,
-    scalar* __restrict__ Apsi)
+    scalar* __restrict__ Apsi,
+    const label* __restrict__ pairRank,
+    int pairPass)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= nCyc) return;
+    // one of its own cell's faces a launch, in face order (DeviceLduView::pairRank)
+    if (pairRank && pairRank[j] != pairPass) return;
 
     // jumpCyclicFvPatchField::updateInterfaceMatrix: the neighbour value is psi[nbr] - jump
     const scalar pnf = jump ? (psi[nbr[j]] - jump[j]) : psi[nbr[j]];
@@ -91,10 +95,14 @@ void amiAmulKernel(
     const scalar* __restrict__ w,
     const scalar* __restrict__ ifc,
     const scalar* __restrict__ psi,
-    scalar* __restrict__ Apsi)
+    scalar* __restrict__ Apsi,
+    const label* __restrict__ pairRank,
+    int pairPass)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    // one of its own cell's faces a launch, in face order (DeviceLduView::pairRank)
+    if (pairRank && pairRank[i] != pairPass) return;
 
     scalar s = 0;
     for (label k = off[i]; k < off[i+1]; ++k)
@@ -155,10 +163,14 @@ void cyclicResidualKernel(
     const scalar* __restrict__ coeff,
     const scalar* __restrict__ jump,
     const scalar* __restrict__ psi,
-    scalar* __restrict__ rA)
+    scalar* __restrict__ rA,
+    const label* __restrict__ pairRank,
+    int pairPass)
 {
     const int j = blockIdx.x * blockDim.x + threadIdx.x;
     if (j >= nCyc) return;
+    // one of its own cell's faces a launch, in face order (DeviceLduView::pairRank)
+    if (pairRank && pairRank[j] != pairPass) return;
 
     const scalar pnf = jump ? (psi[nbr[j]] - jump[j]) : psi[nbr[j]];
     atomicAdd(&rA[own[j]], -__dmul_rn(coeff[j], pnf));
@@ -173,10 +185,14 @@ void amiResidualKernel(
     const scalar* __restrict__ w,
     const scalar* __restrict__ ifc,
     const scalar* __restrict__ psi,
-    scalar* __restrict__ rA)
+    scalar* __restrict__ rA,
+    const label* __restrict__ pairRank,
+    int pairPass)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    // one of its own cell's faces a launch, in face order (DeviceLduView::pairRank)
+    if (pairRank && pairRank[i] != pairPass) return;
 
     scalar s = 0;
     for (label k = off[i]; k < off[i+1]; ++k)
@@ -218,15 +234,23 @@ void deviceResidual(
     cudaCheck(cudaGetLastError(), "residual");
     if (A.nCyc > 0)
     {
-        cyclicResidualKernel<<<(A.nCyc + TPB - 1) / TPB, TPB>>>(A.nCyc, A.cycOwn, A.cycNbr, A.cycCoeff,
-                                                                onField ? A.cycJump : nullptr,
-                                                                psi.data(), rA.data());
+        for (int pairPass = 0; pairPass < A.nPairRanks; ++pairPass)
+        {
+            cyclicResidualKernel<<<(A.nCyc + TPB - 1) / TPB, TPB>>>(A.nCyc, A.cycOwn, A.cycNbr, A.cycCoeff,
+                                                                    onField ? A.cycJump : nullptr,
+                                                                    psi.data(), rA.data(),
+                A.nPairRanks > 1 ? A.pairRank : nullptr, pairPass);
+        }
         cudaCheck(cudaGetLastError(), "cyclicResidual");
     }
     if (A.nAmi > 0)
     {
-        amiResidualKernel<<<(A.nAmi + TPB - 1) / TPB, TPB>>>(A.nAmi, A.amiOwn, A.amiOff, A.amiNbr, A.amiW,
-                                                             A.amiIfc, psi.data(), rA.data());
+        for (int pairPass = 0; pairPass < A.nPairRanks; ++pairPass)
+        {
+            amiResidualKernel<<<(A.nAmi + TPB - 1) / TPB, TPB>>>(A.nAmi, A.amiOwn, A.amiOff, A.amiNbr, A.amiW,
+                                                                 A.amiIfc, psi.data(), rA.data(),
+                A.nPairRanks > 1 ? A.pairRank : nullptr, pairPass);
+        }
         cudaCheck(cudaGetLastError(), "amiResidual");
     }
 }
@@ -259,14 +283,23 @@ void deviceAmul(const DeviceLduView& A, const DeviceBuffer<scalar>& psi, DeviceB
     cudaCheck(cudaGetLastError(), "amul");
     if (A.nCyc > 0)
     {
-        cyclicAmulKernel<<<(A.nCyc + TPB - 1) / TPB, TPB>>>(A.nCyc, A.cycOwn, A.cycNbr, A.cycCoeff,
-                                                            onField ? A.cycJump : nullptr,
-                                                            psi.data(), Apsi.data());
+        for (int pairPass = 0; pairPass < A.nPairRanks; ++pairPass)
+        {
+            cyclicAmulKernel<<<(A.nCyc + TPB - 1) / TPB, TPB>>>(A.nCyc, A.cycOwn, A.cycNbr, A.cycCoeff,
+                                                                onField ? A.cycJump : nullptr,
+                                                                psi.data(), Apsi.data(),
+                A.nPairRanks > 1 ? A.pairRank : nullptr, pairPass);
+        }
         cudaCheck(cudaGetLastError(), "cyclicAmul");
     }
     if (A.nAmi > 0)
     {
-        amiAmulKernel<<<(A.nAmi + TPB - 1) / TPB, TPB>>>(A.nAmi, A.amiOwn, A.amiOff, A.amiNbr, A.amiW, A.amiIfc, psi.data(), Apsi.data());
+        for (int pairPass = 0; pairPass < A.nPairRanks; ++pairPass)
+        {
+            amiAmulKernel<<<(A.nAmi + TPB - 1) / TPB, TPB>>>(A.nAmi, A.amiOwn, A.amiOff, A.amiNbr, A.amiW,
+                A.amiIfc, psi.data(), Apsi.data(),
+                A.nPairRanks > 1 ? A.pairRank : nullptr, pairPass);
+        }
         cudaCheck(cudaGetLastError(), "amiAmul");
     }
 }

@@ -490,6 +490,9 @@ void solveScalarEqn(
             A.cycNbr = cyc->nbrCell.data();
             A.cycCoeff = cyc->ifCoeff.data();
         }
+        // a cell's faces of the pair, added in face order by the products (DeviceLduView::pairRank)
+        A.pairRank = cyc->ownerRank();
+        A.nPairRanks = cyc->ownerPasses();
     }
 
     // Instrument (BRAE_STAGE_DUMP_DIR, see correct()): the FOLDED system as the solver sees it -- diag

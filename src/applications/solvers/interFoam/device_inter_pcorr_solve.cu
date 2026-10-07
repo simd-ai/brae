@@ -228,6 +228,8 @@ void DevicePcorrSolver::pairUp(
     nPair = static_cast<int>(own.size());
     if (nPair == 0) return;
     dPairOwn.copyFrom(own);
+    // a cell's faces of the pair, added in face order by the products (DeviceLduView::pairRank)
+    dPairRank.copyFrom(pairOwnerRanks(own, nPairRanks));
     dPairOff.copyFrom(off);
     dPairNbr.copyFrom(nbr);
     dPairW.copyFrom(w);
@@ -293,6 +295,8 @@ bool DevicePcorrSolver::solve(
         A.amiNbr = dPairNbr.data();
         A.amiW = dPairW.data();
         A.amiIfc = dPairIfc.data();
+        A.pairRank = nPairRanks > 1 ? dPairRank.data() : nullptr;
+        A.nPairRanks = nPairRanks;
     }
     timedPart.emplace("pcorr: the hierarchy's coarse matrices (Galerkin) and the norm factor");
     amgGalerkin(amg, dDiag, dUpper, dUpper);

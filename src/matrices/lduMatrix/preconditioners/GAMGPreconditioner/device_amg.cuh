@@ -248,6 +248,32 @@ struct AMGPair
     // the grids of 787, 392, 195 and 97 cells. There the entries are summed once a solve into denseF and a
     // product adds a row a thread, no atomics.
     std::vector<DeviceBuffer<float>> denseF;
+    // THE PAIR'S FACES BY OWN CELL, GRID BY GRID, so that a cell's faces are added in face order. Every face is
+    // carried on every grid, so a coarse cell owns hundreds of them and the fine one up to six; added with
+    // atomicAdd a face (pairAddT, pairDenseK) their sum's order was the threads' -- MEASURED 2026-10-07 on
+    // RAS/mixerVesselAMI's pinned row: with every other pair sum ordered, two runs of one binary still wrote
+    // 25 of 34 files differently on the AMG-PCG and none on the case's own solver. ownCells[g] lists the
+    // grid-g cells that own a face, ownStart[g] where each one's faces begin in ownFaces[g] (face order). One
+    // thread a cell adds its faces' terms in that order (pairGatherT; the dense grids' rows, pairDenseChunkT).
+    // The own cells are the mesh's and the hierarchy's, so the lists are made once (byOwnAddressing,
+    // byOwnFaces say for what).
+    // WHERE A CELL OWNS MANY FACES THE SUM IS TAKEN IN TWO OR THREE LAUNCHES, not by one thread: every face's
+    // term (a thread a face, into `term`, in the by-own order), then a cell's run of terms added in order, or
+    // -- where a run is longer than PAIR_DIRECT_MAX -- each chunk of PAIR_CHUNK terms summed first and a
+    // cell's chunks added in order: a fixed association all the same. One thread a cell
+    // walking its faces was the first cut and it cost the solve itself: MEASURED on mixerVesselAMI, the
+    // pressure solve 280 ms a step with the atomic adds and 610 with one thread a cell, all of it on the
+    // grids of 25,651 down to 1,580 cells, where a few hundred cells own the pair's 83,656 faces between them
+    // (grid 9's residual 3.6 -> 93.5 ms a step).
+    std::vector<DeviceBuffer<label>> ownCells, ownStart, ownFaces;
+    std::vector<DeviceBuffer<label>> chunkStart, cellChunk;    // [g]: a chunk's first term; a cell's first chunk
+    std::vector<int> mostFaces;                                // [g]: the most faces one cell of the grid owns
+    mutable DeviceBuffer<scalar> term, chunkSum;               // the work of one product, shared by the grids
+    mutable DeviceBuffer<float> termF, chunkSumF;
+    DeviceBuffer<scalar> strip;                                // the dense matrices' work: a strip a chunk
+    DeviceBuffer<float> stripF;
+    unsigned long long byOwnAddressing = 0;
+    int byOwnFaces = 0;
     unsigned long long epoch = 0;               // moves when a buffer above does: what a captured cycle compares
 };
 

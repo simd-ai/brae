@@ -199,6 +199,205 @@ void pairAddT(
     }
     atomicAdd(&y[own[i]], ifc[i]*s);
 }
+// The same term with a cell's faces added in face order (AMGPair::ownCells): one thread an own cell.
+template <typename T>
+__global__
+void pairGatherT(
+    int nOwn,
+    const label* __restrict__ cells,
+    const label* __restrict__ start,
+    const label* __restrict__ faces,
+    const label* __restrict__ nbr,
+    const label* __restrict__ off,
+    const T* __restrict__ w,
+    const T* __restrict__ ifc,
+    const T* __restrict__ x,
+    T* __restrict__ y)
+{
+    const int j = blockIdx.x*blockDim.x + threadIdx.x;
+    if (j >= nOwn) return;
+    const int c = cells[j];
+    T acc = y[c];
+    for (int f = start[j]; f < start[j+1]; ++f)
+    {
+        const int i = faces[f];
+        T s = T(0);
+        if (off)
+        {
+            for (int k = off[i]; k < off[i+1]; ++k)
+            {
+                s += w[k]*x[nbr[k]];
+            }
+        }
+        else
+        {
+            s = x[nbr[i]];
+        }
+        acc += ifc[i]*s;
+    }
+    y[c] = acc;
+}
+// ...AND A GRID'S DENSE MATRIX, in two launches. One thread a ROW walking the row's faces was the first cut:
+// a coarse cell owns thousands of the pair's faces, and that walk -- made at every solve -- was what the
+// ordered sums cost (MEASURED on mixerVesselAMI: the p_rgh iterations 255 -> 302 ms a step and pcorr's 49 ->
+// 70, all of it here; the products themselves 0.6% of the step). So each chunk of a row's faces is summed
+// into a strip of its own, one thread a chunk...
+template <typename T>
+__global__
+void pairDenseChunkT(
+    int nChunks,
+    const label* __restrict__ chunkStart,
+    const label* __restrict__ faces,
+    const label* __restrict__ nbr,
+    const label* __restrict__ off,
+    const T* __restrict__ w,
+    const T* __restrict__ ifc,
+    int nC,
+    T* __restrict__ strip)
+{
+    const int q = blockIdx.x*blockDim.x + threadIdx.x;
+    if (q >= nChunks) return;
+    T* row = strip + static_cast<std::size_t>(q)*nC;
+    for (int f = chunkStart[q]; f < chunkStart[q+1]; ++f)
+    {
+        const int i = faces[f];
+        if (!off)
+        {
+            row[nbr[i]] += ifc[i];
+            continue;
+        }
+        for (int k = off[i]; k < off[i+1]; ++k)
+        {
+            row[nbr[k]] += ifc[i]*w[k];
+        }
+    }
+}
+// ...and a row's strips are added entry by entry in chunk order, one thread an entry of an own cell's row
+template <typename T>
+__global__
+void pairDenseMergeT(
+    int nOwn,
+    int nC,
+    const label* __restrict__ cells,
+    const label* __restrict__ cellChunk,
+    const T* __restrict__ strip,
+    T* __restrict__ dense)
+{
+    const long long t = static_cast<long long>(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (t >= static_cast<long long>(nOwn)*nC) return;
+    const int j = static_cast<int>(t/nC);
+    const int c = static_cast<int>(t%nC);
+    T acc = T(0);
+    for (int q = cellChunk[j]; q < cellChunk[j+1]; ++q)
+    {
+        acc += strip[static_cast<std::size_t>(q)*nC + c];
+    }
+    dense[static_cast<std::size_t>(cells[j])*nC + c] = acc;
+}
+// THE SAME SUM IN TWO OR THREE LAUNCHES, for a grid where a cell owns many faces (AMGPair::chunkStart has why).
+// Every face's term, in the by-own order, one thread a face...
+template <typename T>
+__global__
+void pairTermsT(
+    int n,
+    const label* __restrict__ faces,
+    const label* __restrict__ nbr,
+    const label* __restrict__ off,
+    const T* __restrict__ w,
+    const T* __restrict__ ifc,
+    const T* __restrict__ x,
+    T* __restrict__ term)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= n) return;
+    const int i = faces[f];
+    T s = T(0);
+    if (off)
+    {
+        for (int k = off[i]; k < off[i+1]; ++k)
+        {
+            s += w[k]*x[nbr[k]];
+        }
+    }
+    else
+    {
+        s = x[nbr[i]];
+    }
+    term[f] = ifc[i]*s;
+}
+// ...then a cell's run of them added to it in order, one thread a cell (a run of up to PAIR_DIRECT_MAX)...
+template <typename T>
+__global__
+void pairRunSumT(
+    int nOwn,
+    const label* __restrict__ cells,
+    const label* __restrict__ start,
+    const T* __restrict__ term,
+    T* __restrict__ y)
+{
+    const int j = blockIdx.x*blockDim.x + threadIdx.x;
+    if (j >= nOwn) return;
+    const int c = cells[j];
+    T acc = y[c];
+    for (int f = start[j]; f < start[j+1]; ++f)
+    {
+        acc += term[f];
+    }
+    y[c] = acc;
+}
+// ...or, where a cell's run is longer than that, each chunk of PAIR_CHUNK terms summed in order first
+template <typename T>
+__global__
+void pairChunkSumT(
+    int nChunks,
+    const label* __restrict__ chunkStart,
+    const T* __restrict__ term,
+    T* __restrict__ chunkSum)
+{
+    const int q = blockIdx.x*blockDim.x + threadIdx.x;
+    if (q >= nChunks) return;
+    T acc = T(0);
+    for (int f = chunkStart[q]; f < chunkStart[q+1]; ++f)
+    {
+        acc += term[f];
+    }
+    chunkSum[q] = acc;
+}
+// ...and a cell's chunks added to it in order
+template <typename T>
+__global__
+void pairCellSumT(
+    int nOwn,
+    const label* __restrict__ cells,
+    const label* __restrict__ cellChunk,
+    const T* __restrict__ chunkSum,
+    T* __restrict__ y)
+{
+    const int j = blockIdx.x*blockDim.x + threadIdx.x;
+    if (j >= nOwn) return;
+    const int c = cells[j];
+    T acc = y[c];
+    for (int q = cellChunk[j]; q < cellChunk[j+1]; ++q)
+    {
+        acc += chunkSum[q];
+    }
+    y[c] = acc;
+}
+// the terms a chunk holds, and the most faces a cell may own for one thread to walk them (pairGatherT)
+// The faces a cell may own for one thread to walk them and their neighbour slots (pairGatherT); for one thread
+// to add their ready terms (pairRunSumT); and the terms a chunk holds beyond that. MEASURED on mixerVesselAMI,
+// the p_rgh iterations, ms a step, as each form was tried: the atomic adds 255; one thread a cell walking every
+// face on every grid 580; a thread a chunk of 32 faces walking them 46 more than a thread a face making the
+// terms first; and with these three, 267 -- 12 over the atomic adds, 1.6% of the step with pcorr's 2.
+constexpr int PAIR_GATHER_MAX = 16;
+constexpr int PAIR_DIRECT_MAX = 512;
+constexpr int PAIR_CHUNK = 64;
+// BRAE_CONTROL_PAIR_SUMS_UNORDERED=1 (DeviceCyclic::ifRank has it): the atomic adds a face, as they were
+inline bool pairSumsUnordered()
+{
+    static const bool on = std::getenv("BRAE_CONTROL_PAIR_SUMS_UNORDERED") != nullptr;
+    return on;
+}
 // the control's negation (BRAE_CONTROL_AMG_PAIR_WRONG_SIGN)
 __global__
 void pairNegateK(
@@ -377,6 +576,83 @@ void amgCouplePair(
                                           p.nbr[static_cast<std::size_t>(g)].data());
     }
     cudaCheck(cudaGetLastError(), "pair mapped down the grids");
+    // ...and listed by own cell on every grid (AMGPair::ownCells), once: a counting sort of each grid's list
+    // on the host, the faces of a cell left in face order
+    if (p.byOwnFaces != n || p.byOwnAddressing != A.addressingId
+     || p.ownCells.size() != static_cast<std::size_t>(G) + 1)
+    {
+        p.ownCells.clear();
+        p.ownStart.clear();
+        p.ownFaces.clear();
+        p.ownCells.resize(static_cast<std::size_t>(G) + 1);
+        p.ownStart.resize(static_cast<std::size_t>(G) + 1);
+        p.ownFaces.resize(static_cast<std::size_t>(G) + 1);
+        p.chunkStart.clear();
+        p.cellChunk.clear();
+        p.chunkStart.resize(static_cast<std::size_t>(G) + 1);
+        p.cellChunk.resize(static_cast<std::size_t>(G) + 1);
+        p.mostFaces.assign(static_cast<std::size_t>(G) + 1, 0);
+        std::size_t mostChunks = 0;
+        for (int g = 0; g <= G; ++g)
+        {
+            const std::size_t gg = static_cast<std::size_t>(g);
+            const std::vector<label> own = p.own[gg].host();
+            const int ng = g == 0 ? A.nCells : amg.level[gg - 1].nCoarse;
+            std::vector<label> count(static_cast<std::size_t>(ng) + 1, 0);
+            for (const label c : own)
+            {
+                ++count[static_cast<std::size_t>(c) + 1];
+            }
+            std::vector<label> cells;
+            std::vector<label> start;
+            std::vector<label> slot(static_cast<std::size_t>(ng), 0);
+            label at = 0;
+            for (int c = 0; c < ng; ++c)
+            {
+                const label k = count[static_cast<std::size_t>(c) + 1];
+                if (k == 0) continue;
+                cells.push_back(c);
+                start.push_back(at);
+                slot[static_cast<std::size_t>(c)] = at;
+                at += k;
+            }
+            start.push_back(at);
+            std::vector<label> faces(own.size(), 0);
+            for (std::size_t i = 0; i < own.size(); ++i)
+            {
+                faces[static_cast<std::size_t>(slot[static_cast<std::size_t>(own[i])]++)] = static_cast<label>(i);
+            }
+            p.ownCells[gg].copyFrom(cells);
+            p.ownStart[gg].copyFrom(start);
+            p.ownFaces[gg].copyFrom(faces);
+            // a cell's run of faces cut into chunks of PAIR_CHUNK
+            std::vector<label> chunkStart;
+            std::vector<label> cellChunk;
+            label most = 0;
+            for (std::size_t j = 0; j + 1 < start.size(); ++j)
+            {
+                cellChunk.push_back(static_cast<label>(chunkStart.size()));
+                most = std::max(most, start[j + 1] - start[j]);
+                for (label f = start[j]; f < start[j + 1]; f += PAIR_CHUNK)
+                {
+                    chunkStart.push_back(f);
+                }
+            }
+            cellChunk.push_back(static_cast<label>(chunkStart.size()));
+            chunkStart.push_back(at);
+            mostChunks = std::max(mostChunks, chunkStart.size());
+            p.mostFaces[gg] = static_cast<int>(most);
+            p.chunkStart[gg].copyFrom(chunkStart);
+            p.cellChunk[gg].copyFrom(cellChunk);
+        }
+        p.term.resize(static_cast<std::size_t>(n));
+        p.termF.resize(static_cast<std::size_t>(n));
+        p.chunkSum.resize(mostChunks);
+        p.chunkSumF.resize(mostChunks);
+        p.byOwnFaces = n;
+        p.byOwnAddressing = A.addressingId;
+        moved = true;
+    }
     // ...and summed into a dense matrix on each small grid below the finest and above the coarsest (the coarsest
     // is solved by its LU). BRAE_CONTROL_AMG_PAIR_SPARSE=1 keeps every grid's entries face by face, as before.
     static const bool sparseOnly = std::getenv("BRAE_CONTROL_AMG_PAIR_SPARSE") != nullptr;
@@ -395,10 +671,28 @@ void amgCouplePair(
         sized(d, nn);
         if (!dense) continue;
         zeroT<float><<<nBlocks(static_cast<int>(nn)),TPB>>>(static_cast<int>(nn), d.data());
-        pairDenseK<float><<<nBlocks(n),TPB>>>(n, p.own[static_cast<std::size_t>(g)].data(),
-                                              p.nbr[static_cast<std::size_t>(g)].data(),
-                                              stencil ? p.off.data() : nullptr, p.wF.data(), p.ifcF.data(), ng,
-                                              d.data());
+        if (pairSumsUnordered())
+        {
+            pairDenseK<float><<<nBlocks(n),TPB>>>(n, p.own[static_cast<std::size_t>(g)].data(),
+                                                  p.nbr[static_cast<std::size_t>(g)].data(),
+                                                  stencil ? p.off.data() : nullptr, p.wF.data(), p.ifcF.data(),
+                                                  ng, d.data());
+            continue;
+        }
+        const std::size_t gg = static_cast<std::size_t>(g);
+        const int nOwn = static_cast<int>(p.ownCells[gg].size());
+        const int nChunks = static_cast<int>(p.chunkStart[gg].size()) - 1;
+        const std::size_t nStrip = static_cast<std::size_t>(nChunks)*static_cast<std::size_t>(ng);
+        if (p.stripF.size() < nStrip)
+        {
+            p.stripF.resize(nStrip);
+        }
+        zeroT<float><<<nBlocks(static_cast<int>(nStrip)),TPB>>>(static_cast<int>(nStrip), p.stripF.data());
+        pairDenseChunkT<float><<<nBlocks(nChunks),TPB>>>(
+            nChunks, p.chunkStart[gg].data(), p.ownFaces[gg].data(), p.nbr[gg].data(),
+            stencil ? p.off.data() : nullptr, p.wF.data(), p.ifcF.data(), ng, p.stripF.data());
+        pairDenseMergeT<float><<<nBlocks(nOwn*ng),TPB>>>(
+            nOwn, ng, p.ownCells[gg].data(), p.cellChunk[gg].data(), p.stripF.data(), d.data());
     }
     cudaCheck(cudaGetLastError(), "pair dense on the small grids");
     // the coarsest grid's direct solve: the factorisation amgGalerkin made is of the LDU matrix alone
@@ -408,9 +702,29 @@ void amgCouplePair(
         const std::size_t nn = static_cast<std::size_t>(nc)*static_cast<std::size_t>(nc);
         p.dense.resize(nn);
         zeroT<scalar><<<nBlocks(static_cast<int>(nn)),TPB>>>(static_cast<int>(nn), p.dense.data());
-        pairDenseK<scalar><<<nBlocks(n),TPB>>>(n, p.own[static_cast<std::size_t>(G)].data(),
-                                       p.nbr[static_cast<std::size_t>(G)].data(), stencil ? p.off.data() : nullptr,
-                                       p.w.data(), p.ifc.data(), nc, p.dense.data());
+        const std::size_t gc = static_cast<std::size_t>(G);
+        if (pairSumsUnordered())
+        {
+            pairDenseK<scalar><<<nBlocks(n),TPB>>>(n, p.own[gc].data(), p.nbr[gc].data(),
+                                                   stencil ? p.off.data() : nullptr, p.w.data(), p.ifc.data(),
+                                                   nc, p.dense.data());
+        }
+        else
+        {
+            const int nOwn = static_cast<int>(p.ownCells[gc].size());
+            const int nChunks = static_cast<int>(p.chunkStart[gc].size()) - 1;
+            const std::size_t nStrip = static_cast<std::size_t>(nChunks)*static_cast<std::size_t>(nc);
+            if (p.strip.size() < nStrip)
+            {
+                p.strip.resize(nStrip);
+            }
+            zeroT<scalar><<<nBlocks(static_cast<int>(nStrip)),TPB>>>(static_cast<int>(nStrip), p.strip.data());
+            pairDenseChunkT<scalar><<<nBlocks(nChunks),TPB>>>(
+                nChunks, p.chunkStart[gc].data(), p.ownFaces[gc].data(), p.nbr[gc].data(),
+                stencil ? p.off.data() : nullptr, p.w.data(), p.ifc.data(), nc, p.strip.data());
+            pairDenseMergeT<scalar><<<nBlocks(nOwn*nc),TPB>>>(
+                nOwn, nc, p.ownCells[gc].data(), p.cellChunk[gc].data(), p.strip.data(), p.dense.data());
+        }
         cudaCheck(cudaGetLastError(), "pair on the coarsest grid");
         deviceCoarseLUFactor(amg.level.back().coarseView(), amg.coarseLU, amg.coarsePiv, p.dense.data());
     }
@@ -432,8 +746,34 @@ inline void pairAdd(
     const AMGPair& p = amg.pair;
     if (p.n == 0) return;
     const std::size_t gg = static_cast<std::size_t>(g);
-    pairAddT<scalar><<<nBlocks(p.n),TPB>>>(p.n, p.own[gg].data(), p.nbr[gg].data(),
-                                           p.stencil ? p.off.data() : nullptr, p.w.data(), p.ifc.data(), x, y);
+    if (pairSumsUnordered())
+    {
+        pairAddT<scalar><<<nBlocks(p.n),TPB>>>(p.n, p.own[gg].data(), p.nbr[gg].data(),
+                                               p.stencil ? p.off.data() : nullptr, p.w.data(), p.ifc.data(), x, y);
+        return;
+    }
+    const int nOwn = static_cast<int>(p.ownCells[gg].size());
+    if (p.mostFaces[gg] <= PAIR_GATHER_MAX)
+    {
+        pairGatherT<scalar><<<nBlocks(nOwn),TPB>>>(
+            nOwn, p.ownCells[gg].data(), p.ownStart[gg].data(), p.ownFaces[gg].data(), p.nbr[gg].data(),
+            p.stencil ? p.off.data() : nullptr, p.w.data(), p.ifc.data(), x, y);
+        return;
+    }
+    const int nChunks = static_cast<int>(p.chunkStart[gg].size()) - 1;
+    pairTermsT<scalar><<<nBlocks(p.n),TPB>>>(
+        p.n, p.ownFaces[gg].data(), p.nbr[gg].data(), p.stencil ? p.off.data() : nullptr, p.w.data(),
+        p.ifc.data(), x, p.term.data());
+    if (p.mostFaces[gg] <= PAIR_DIRECT_MAX)
+    {
+        pairRunSumT<scalar><<<nBlocks(nOwn),TPB>>>(
+            nOwn, p.ownCells[gg].data(), p.ownStart[gg].data(), p.term.data(), y);
+        return;
+    }
+    pairChunkSumT<scalar><<<nBlocks(nChunks),TPB>>>(
+        nChunks, p.chunkStart[gg].data(), p.term.data(), p.chunkSum.data());
+    pairCellSumT<scalar><<<nBlocks(nOwn),TPB>>>(
+        nOwn, p.ownCells[gg].data(), p.cellChunk[gg].data(), p.chunkSum.data(), y);
 }
 inline void pairAdd(
     const AMGData& amg,
@@ -450,8 +790,34 @@ inline void pairAdd(
         pairDenseMulK<<<nBlocks(ng),TPB>>>(ng, p.denseF[gg].data(), x, y);
         return;
     }
-    pairAddT<float><<<nBlocks(p.n),TPB>>>(p.n, p.own[gg].data(), p.nbr[gg].data(),
-                                          p.stencil ? p.off.data() : nullptr, p.wF.data(), p.ifcF.data(), x, y);
+    if (pairSumsUnordered())
+    {
+        pairAddT<float><<<nBlocks(p.n),TPB>>>(p.n, p.own[gg].data(), p.nbr[gg].data(),
+                                              p.stencil ? p.off.data() : nullptr, p.wF.data(), p.ifcF.data(), x, y);
+        return;
+    }
+    const int nOwn = static_cast<int>(p.ownCells[gg].size());
+    if (p.mostFaces[gg] <= PAIR_GATHER_MAX)
+    {
+        pairGatherT<float><<<nBlocks(nOwn),TPB>>>(
+            nOwn, p.ownCells[gg].data(), p.ownStart[gg].data(), p.ownFaces[gg].data(), p.nbr[gg].data(),
+            p.stencil ? p.off.data() : nullptr, p.wF.data(), p.ifcF.data(), x, y);
+        return;
+    }
+    const int nChunks = static_cast<int>(p.chunkStart[gg].size()) - 1;
+    pairTermsT<float><<<nBlocks(p.n),TPB>>>(
+        p.n, p.ownFaces[gg].data(), p.nbr[gg].data(), p.stencil ? p.off.data() : nullptr, p.wF.data(),
+        p.ifcF.data(), x, p.termF.data());
+    if (p.mostFaces[gg] <= PAIR_DIRECT_MAX)
+    {
+        pairRunSumT<float><<<nBlocks(nOwn),TPB>>>(
+            nOwn, p.ownCells[gg].data(), p.ownStart[gg].data(), p.termF.data(), y);
+        return;
+    }
+    pairChunkSumT<float><<<nBlocks(nChunks),TPB>>>(
+        nChunks, p.chunkStart[gg].data(), p.termF.data(), p.chunkSumF.data());
+    pairCellSumT<float><<<nBlocks(nOwn),TPB>>>(
+        nOwn, p.ownCells[gg].data(), p.cellChunk[gg].data(), p.chunkSumF.data(), y);
 }
 
 }   // namespace

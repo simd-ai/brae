@@ -152,6 +152,8 @@ private:
     bool announcedCoupled = false;
     int nPair = 0;
     DeviceBuffer<label> dPairOwn;
+    DeviceBuffer<label> dPairRank;
+    int nPairRanks = 1;
     DeviceBuffer<label> dPairOff;
     DeviceBuffer<label> dPairNbr;
     DeviceBuffer<scalar> dPairW;
