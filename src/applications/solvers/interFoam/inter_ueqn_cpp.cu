@@ -424,6 +424,21 @@ FvVectorMatrix assembleUEqn(
     // diagonal-dominance clamp -- see InterMomentumInput::relaxEquationU.
     stage.vectors("ueqnSrcPreRelax", M.source);
     stage.scalars("ueqnDiagPreRelax", M.diag);
+    // ...and the coefficients relax() reads: the two off-diagonals and each boundary face's diagonal and
+    // source contribution, in face order -- what the dominance test of a wall-corner cell is made of
+    stage.scalars("ueqnUpper", M.upper);
+    stage.scalars("ueqnLower", M.lower);
+    if (stage.on)
+    {
+        std::vector<vector> ic, bc;
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            ic.insert(ic.end(), M.internalCoeffs[pi].begin(), M.internalCoeffs[pi].end());
+            bc.insert(bc.end(), M.boundaryCoeffs[pi].begin(), M.boundaryCoeffs[pi].end());
+        }
+        stage.vectors("ueqnInternalCoeffs", ic);
+        stage.vectors("ueqnBoundaryCoeffs", bc);
+    }
     if (in.relaxEquationU && in.relaxU > scalar(0))
         relaxMatrix<vector>(M, U, m, patches, in.relaxU);
     stage.vectors("ueqnSrcRelax", M.source);

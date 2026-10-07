@@ -2,6 +2,7 @@
 #include "fv_patch.cuh"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cmath>
 
@@ -11,6 +12,9 @@ std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g, b
 {
     std::vector<FvPatch> patches;
     patches.reserve(m.patches().size());
+    static const bool patchDeltaSigned = std::getenv("BRAE_CONTROL_PATCH_DELTA_SIGNED") != nullptr;
+    // boundary faces whose cell's centre lies behind them -- see deltaCoeffs below
+    long behind = 0;
     for (const PatchInfo& pi : m.patches())
     {
         // OVERSET is not implemented, and it must not be mistaken for a constraint patch. It was listed in
@@ -142,12 +146,27 @@ std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g, b
             const label f = pi.start + i;
             const label c = m.owner()[f];          // boundary face owner = adjacent cell
             p.faceCells[i] = c;
-            // OF fvPatch::delta() is the normal-projected delta; deltaCoeffs = 1/(n.(Cf-C)).
+            // fvPatch::delta() is the normal-projected delta, nHat*(nHat & (Cf - Cn)) (fvPatch.C:156-161),
+            // and the patch's deltaCoeffs are 1/MAG of it (basicFvGeometryScheme.C, deltaCoeffs():
+            // `deltaCoeffsBf[patchi] = 1.0/mag(p.delta())`). The magnitude matters on a face whose cell's
+            // centre lies BEHIND it -- a warped wall-corner cell of a snapped mesh, or the child of one
+            // after a refinement: this was 1/(n.(Cf - C)), signed, so such a face took a NEGATIVE wall
+            // diffusion coefficient and a boundary snGrad of the wrong sign. MEASURED 2026-10-07 on RAS/
+            // motorBike restarted from OpenFOAM's own state at t = 0.401 (18 such cells of 43,781): the sum
+            // of a corner cell's boundary diagonal contributions read -6.2004e-03 where OpenFOAM's is
+            // +6.2004e-03, U was 4.2e-03 from OpenFOAM's after ONE step with every solve pinned, and the
+            // tutorial's own run ended at t = 0.436 of 2 with the velocity of one such cell at 2,600 m/s.
+            //   BRAE_CONTROL_PATCH_DELTA_SIGNED=1: a gate's CONTROL, deliberately wrong -- the signed form.
             const vector nHat = g.Sf()[f] / g.magSf()[f];
             p.nf[i] = nHat;
             p.magSf[i] = g.magSf()[f];
             p.Cf[i] = g.Cf()[f];
-            p.deltaCoeffs[i] = 1.0 / dot(g.Cf()[f] - g.C()[c], nHat);
+            const scalar normalDelta = dot(g.Cf()[f] - g.C()[c], nHat);
+            p.deltaCoeffs[i] = 1.0 / (patchDeltaSigned ? normalDelta : std::fabs(normalDelta));
+            if (normalDelta < scalar(0))
+            {
+                ++behind;
+            }
         }
         // OF atmBoundaryLayer.C:45 -- boundBox(pp.localPoints()).min(), taken over every point of every
         // face on the patch. An empty patch keeps the zero default; nothing reads it.
@@ -175,6 +194,17 @@ std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g, b
             }
         }
         patches.push_back(std::move(p));
+    }
+    // said once, at the first mesh that has any, and again when a later mesh has more (a refining mesh makes
+    // them as it splits a snapped wall cell)
+    static long behindSaid = 0;
+    if (behind > behindSaid)
+    {
+        behindSaid = behind;
+        std::printf("  patches: %ld boundary face(s) lie behind their own cell's centre; their delta coefficient "
+                    "is 1/|n.(Cf - C)|, as OpenFOAM's%s\n", behind,
+                    patchDeltaSigned ? "  *** CONTROL MODE: it is signed here. This run is deliberately wrong. ***"
+                                     : "");
     }
     return patches;
 }
