@@ -249,6 +249,7 @@ private:
         const std::vector<std::vector<T>>* stored,
         const std::vector<std::vector<T>>* storedGradient);
     std::string timeName(scalar t, int precision) const;
+    bool binaryFile(const std::string& className) const;
     std::string header(
         const std::string& className,
         const std::string& location,
@@ -280,6 +281,8 @@ private:
     int purge_ = 0;
     int precision_ = 6;
     bool compress_ = false;
+    // `writeFormat binary`: fields and points as their own bytes (binaryFile says which files)
+    bool binary_ = false;
     std::string timeFormat_ = "general";
     // Time::precision_, which OpenFOAM raises for good once a name would not distinguish two times
     int timePrecision_ = 6;

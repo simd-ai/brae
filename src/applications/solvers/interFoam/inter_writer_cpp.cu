@@ -104,6 +104,8 @@ struct DeferredList
     const std::vector<scalar>* aliased = nullptr;
     bool isVector = false;
     int precision = 0;
+    // `writeFormat binary`: the values' own bytes go where the marker is, not their text (binaryLists)
+    bool binary = false;
 };
 struct DeferredLists
 {
@@ -111,6 +113,15 @@ struct DeferredLists
     const std::vector<scalar>* alias = nullptr;
 };
 thread_local DeferredLists* deferring = nullptr;
+// `writeFormat binary`, for the write in hand: a nonuniform scalar or vector list is written as OpenFOAM's binary
+// stream writes it -- UList::writeList's binary-and-contiguous branch (UListIO.C): a newline, the count, a
+// newline, and the values' bytes between parentheses, at ANY length; an empty one is the count alone
+// (UList::writeEntry). `uniform v` stays text (Field::writeEntry asks that first). MEASURED on OpenFOAM's own
+// files (laminar/damBreak and waves/waveMakerFlap run with writeFormat binary): `internalField   nonuniform
+// List<scalar> \n2268\n(<18144 bytes>);\n`, and polyMesh/points `\n113082\n(<bytes>)\n\n// ***`.
+// The bytes always go through a marker (deferBytes), never into the text: flushJob finds markers by their two
+// bytes, which a list's bytes can hold.
+thread_local bool binaryLists = false;
 // a marker is \x01, the list's index, \x02: bytes no formatter here writes
 constexpr char kMarkerOpen = '\x01';
 constexpr char kMarkerClose = '\x02';
@@ -168,6 +179,20 @@ bool deferLines(
     return true;
 }
 
+// a list's BYTES left for flushJob to put in place (binaryLists): the copy deferLines makes, marked binary
+template <typename T>
+void deferBytes(
+    std::ostringstream& os,
+    const std::vector<T>& values)
+{
+    if (!deferLines(os, values, 0))
+    {
+        throw std::runtime_error("brae interFoam writer: a binary list was built with nothing deferring; its "
+                                 "bytes cannot go into a file's text");
+    }
+    deferring->lists.back().binary = true;
+}
+
 // Field::writeEntry (Field.C:727-748): `uniform v` when every entry compares equal (UList::uniform, which
 // needs at least one), else `nonuniform List<T> ` and the list -- one line of ten or fewer, else the count,
 // the values one per line at column zero, and the closing parenthesis on its own line before the `;`.
@@ -191,6 +216,18 @@ void listEntry(
         return;
     }
     os << "nonuniform " << listTypeName(T{}) << " ";
+    if (binaryLists)
+    {
+        if (values.empty())
+        {
+            os << "0;\n";
+            return;
+        }
+        os << "\n" << values.size() << "\n(";
+        deferBytes(os, values);
+        os << ");\n";
+        return;
+    }
     if (values.size() <= kShortList)
     {
         os << values.size() << "(";
@@ -214,6 +251,32 @@ void listEntry(
         }
     }
     os << ")\n;\n";
+}
+
+// A bare vectorField's list (polyMesh/points, points0): the count and the values one a line between
+// parentheses on lines of their own, or -- binaryLists -- the values' bytes between the parentheses with no
+// line of their own (UList::writeList's two branches). The caller writes the file's end after it.
+void bareVectorList(
+    std::ostringstream& os,
+    const std::vector<vector>& values,
+    int precision)
+{
+    if (binaryLists && !values.empty())
+    {
+        os << values.size() << "\n(";
+        deferBytes(os, values);
+        os << ")";
+        return;
+    }
+    os << values.size() << "\n(\n";
+    if (!deferLines(os, values, precision))
+    {
+        for (const vector& x : values)
+        {
+            os << fmt(x, precision) << "\n";
+        }
+    }
+    os << ")\n";
 }
 
 void wordEntry(
@@ -1501,16 +1564,29 @@ InterWriter::InterWriter(
     precision_ = cd.intOr("writePrecision", 6);
     const std::string comp = cd.wordOr("writeCompression", "off");
     compress_ = (comp == "on" || comp == "true" || comp == "yes" || comp == "compressed");
-    // brae writes ascii whatever writeFormat says; OpenFOAM reads a file's format from its own header
-    // (IOobjectReadHeader.C:51), so the output is honestly labelled and readable, only larger and at
-    // writePrecision rather than exact. And OpenFOAM switches compression off for binary (TimeIO.C:392-420).
+    // `writeFormat binary`: every field's scalar and vector lists, and the points, are written as their own
+    // bytes (binaryLists, binaryFile). brae wrote ascii at writePrecision whatever the entry said until
+    // 2026-10-07 -- readable, since OpenFOAM takes a file's format from its own header
+    // (IOobjectReadHeader.C:51), but larger and not exact; five shipped tutorials ask for binary. And OpenFOAM
+    // switches compression off for binary (TimeIO.C:392-420).
+    //   BRAE_CONTROL_WRITE_BINARY_AS_ASCII=1: ascii again, with the notice it carried -- the gate's other arm.
     if (cd.wordOr("writeFormat", "ascii") == "binary")
     {
-        noticeApproximated(
-            "controlDict writeFormat binary",
-            "brae writes ascii at writePrecision " + std::to_string(precision_)
-                + ", labelled `format ascii;` so OpenFOAM reads it; not bit-exact as binary would be");
         compress_ = false;
+        if (std::getenv("BRAE_CONTROL_WRITE_BINARY_AS_ASCII") != nullptr)
+        {
+            noticeApproximated(
+                "controlDict writeFormat binary",
+                "brae writes ascii at writePrecision " + std::to_string(precision_)
+                    + ", labelled `format ascii;` so OpenFOAM reads it; not bit-exact as binary would be");
+        }
+        else
+        {
+            binary_ = true;
+            std::printf("  write: writeFormat binary -- every field's lists and the points are written as their "
+                        "own bytes; a file of labels (owner, faces, the levels) and a dictionary stay text, "
+                        "labelled ascii\n");
+        }
     }
     timeFormat_ = cd.wordOr("timeFormat", "general");
     if (timeFormat_ != "general" && timeFormat_ != "fixed" && timeFormat_ != "scientific")
@@ -1658,6 +1734,23 @@ std::string InterWriter::timeName(
     return buf.str();
 }
 
+// WHICH FILES ARE BINARY under `writeFormat binary`: the ones whose lists are numbers -- a field of any kind,
+// and a bare vectorField (points, points0). Their scalar and vector lists are the values' own bytes, exact.
+// NOT the files of labels (owner, neighbour, faces, cellLevel, the zones), which this writer builds as text
+// and labels `ascii`: an integer loses nothing as text, and OpenFOAM reads each file by its own header
+// (IOobjectReadHeader.C:51). Nor a dictionary (uniform/time, a motion state), which holds no list.
+bool InterWriter::binaryFile(const std::string& className) const
+{
+    if (!binary_)
+    {
+        return false;
+    }
+    const bool field = className.size() > 5 && className.compare(className.size() - 5, 5, "Field") == 0;
+    const bool geometric = className.compare(0, 3, "vol") == 0 || className.compare(0, 7, "surface") == 0
+                        || className.compare(0, 5, "point") == 0;
+    return field && (geometric || className == "vectorField");
+}
+
 std::string InterWriter::header(
     const std::string& className,
     const std::string& location,
@@ -1686,7 +1779,7 @@ std::string InterWriter::header(
           "\\*---------------------------------------------------------------------------*/\n"
           "FoamFile\n{\n"
           "    version     2.0;\n"
-          "    format      ascii;\n"
+          "    format      " << (binaryFile(className) ? "binary" : "ascii") << ";\n"
           "    arch        \"LSB;label=32;scalar=64\";\n";
     if (!note.empty())
     {
@@ -1817,7 +1910,25 @@ std::pair<double, double> flushJob(JobT& job)
             {
                 Piece& p = pieces[k];
                 const DeferredList& d = job.lists[p.list];
-                if (d.isVector)
+                if (d.binary)
+                {
+                    // the values' own bytes: a vector is its three scalars side by side
+                    static_assert(sizeof(vector) == 3*sizeof(scalar), "a vector is three scalars");
+                    const char* bytes = d.isVector
+                        ? reinterpret_cast<const char*>(d.vectors.data())
+                        : reinterpret_cast<const char*>((d.aliased ? *d.aliased : d.scalars).data());
+                    const std::size_t width = d.isVector ? sizeof(vector) : sizeof(scalar);
+                    p.text.assign(bytes + p.from*width, (p.to - p.from)*width);
+                    // BRAE_CONTROL_WRITE_BINARY_SHIFTED=1: a gate's CONTROL, deliberately wrong -- every
+                    // piece's bytes moved up one scalar, the first taking the last's place: a file of the
+                    // right size and the wrong values
+                    static const bool shifted = std::getenv("BRAE_CONTROL_WRITE_BINARY_SHIFTED") != nullptr;
+                    if (shifted && p.text.size() > sizeof(scalar))
+                    {
+                        std::rotate(p.text.begin(), p.text.begin() + sizeof(scalar), p.text.end());
+                    }
+                }
+                else if (d.isVector)
                 {
                     listLines(p.text, d.vectors, p.from, p.to, d.precision);
                 }
@@ -2278,7 +2389,16 @@ void InterWriter::write(const InterWriteState& s)
             deferring = nullptr;
         }
     } stopDeferring;
-    deferring = inStep ? nullptr : &lists;
+    // (a binary list's bytes always go through a marker, in the step too: binaryLists)
+    deferring = (inStep && !binary_) ? nullptr : &lists;
+    struct BinaryLists
+    {
+        ~BinaryLists()
+        {
+            binaryLists = false;
+        }
+    } stopBinaryLists;
+    binaryLists = binary_;
     std::optional<interPhase::Nested> built;
     built.emplace("write: the files built (their long lists copied, not formatted)");
 
@@ -2548,15 +2668,8 @@ void InterWriter::write(const InterWriteState& s)
             true);
         std::ostringstream os;
         os << header("vectorField", name + "/polyMesh", "points") << "\n";
-        os << s.points->size() << "\n(\n";
-        if (!deferLines(os, *s.points, precision_))
-        {
-            for (const vector& x : *s.points)
-            {
-                os << fmt(x, precision_) << "\n";
-            }
-        }
-        os << ")\n\n\n// ************************************************************************* //\n";
+        bareVectorList(os, *s.points, precision_);
+        os << "\n\n// ************************************************************************* //\n";
         emit(dir + "/polyMesh/points", os.str(), true);
     }
 
@@ -2935,15 +3048,8 @@ void InterWriter::write(const InterWriteState& s)
             {
                 std::ostringstream os;
                 os << header("vectorField", pm, "points") << "\n";
-                os << m->nPoints() << "\n(\n";
-                if (!deferLines(os, m->points(), precision_))
-                {
-                    for (const vector& x : m->points())
-                    {
-                        os << fmt(x, precision_) << "\n";
-                    }
-                }
-                os << ")\n" << end;
+                bareVectorList(os, m->points(), precision_);
+                os << end;
                 emit(dir + "/polyMesh/points", os.str(), true);
             }
             else
@@ -2954,15 +3060,8 @@ void InterWriter::write(const InterWriteState& s)
                 }
                 std::ostringstream os;
                 os << header("vectorField", pm, "points0") << "\n";
-                os << s.points0->size() << "\n(\n";
-                if (!deferLines(os, *s.points0, precision_))
-                {
-                    for (const vector& x : *s.points0)
-                    {
-                        os << fmt(x, precision_) << "\n";
-                    }
-                }
-                os << ")\n" << end;
+                bareVectorList(os, *s.points0, precision_);
+                os << end;
                 emit(dir + "/polyMesh/points0", os.str(), true);
             }
         }
