@@ -650,8 +650,15 @@ scalar readOcCoeff(const std::string& entry)
     const std::size_t b = rest.find_first_not_of(" \t\n\r");
     if (b == std::string::npos)
     {
-        // no coefficient: Function1Types::Constant("ocCoeff", 1), CrankNicolsonDdtScheme.C:274
-        return scalar(1);
+        // NO COEFFICIENT IS NOT 1. The scheme's stream constructor reads a token after its name
+        // (CrankNicolsonDdtScheme.C:291-322) and there is none: MEASURED 2026-10-07, real interFoam on
+        // laminar/damBreak with `default CrankNicolson;` stops in its first step on "attempt to read beyond
+        // EOF ... system/fvSchemes/ddtSchemes/default". This returned 1 -- the default of the scheme's OTHER
+        // constructor (:274), which fvSchemes never reaches.
+        throw std::runtime_error(
+            "brae CrankNicolson: ddtSchemes gives `" + entry + "` with no off-centring coefficient. OpenFOAM "
+            "reads one after the scheme's name and stops without it (CrankNicolsonDdtScheme.C:291-322); "
+            "write `CrankNicolson 1` for the scheme un-off-centred.");
     }
     rest = rest.substr(b);
     if (rest[0] == '{' || rest.find("ocCoeff") != std::string::npos)

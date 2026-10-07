@@ -27,6 +27,7 @@
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
 #include <cmath>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -51,14 +52,23 @@ inline vector readGravity(const std::string& casePath)
 
 // constant/hRef -- READ_IF_PRESENT, default 0 (readhRef.H). Absent on every interFoam tutorial that
 // ships, which is precisely why its sign is easy to get wrong and hard to notice.
+// The FILE is optional; its `value` is not (UniformDimensionedField.C:129, readEntry). This swallowed every
+// error and read a missing value as 0, so a mistyped hRef ran with the reference height at the origin.
 inline scalar readHRef(const std::string& casePath)
 {
-    try
+    const std::string path = casePath + "/constant/hRef";
+    if (!std::filesystem::exists(path) && !std::filesystem::exists(path + ".gz"))
     {
-        const FoamDict d = readDict(casePath + "/constant/hRef");
-        return d.scalarOr("value", scalar(0));
+        return scalar(0);   // not present: OpenFOAM's default
     }
-    catch (const std::exception&) { return scalar(0); }   // not present: OF's default
+    const FoamDict d = readDict(path);
+    if (!d.found("value"))
+    {
+        throw std::runtime_error(
+            "brae interFoam: constant/hRef has no `value`. OpenFOAM reads it with no default "
+            "(UniformDimensionedField.C:129) and stops.");
+    }
+    return d.scalarOr("value", scalar(0));
 }
 
 // gh.H:2-7. The unit direction of g, dotted with g, times hRef -- NOT mag(g)*hRef.

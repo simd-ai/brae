@@ -261,6 +261,37 @@ BASE="$B"
 CANG="python3 -c \"import re, sys; p = '0/alpha.water'; t = open(p).read(); t2 = re.sub(r'(\n    leftWall\n    \{\n)\s*type\s+zeroGradient;', r'\1        type            constantAlphaContactAngle;\n        theta0          45;\n' + sys.argv[1] + '        value           uniform 0;', t); assert t2 != t; open(p, 'w').write(t2)\""
 arm contactAngle_noLimit    refused "is constantAlphaContactAngle and has no \`limit\`" "" "$CANG ''"
 arm contactAngle_limit      runs    -                           "" "$CANG '        limit           gradient;\n'"
+# SMALLER ENTRIES THAT WERE DEFAULTED OR NEVER READ (review rows R16, R11, R18, R19).
+# limitedLinearV's coefficient has no default (limitedLinear.H:67); it was 1
+arm divU_limitedLinearV_bare refused "names limitedLinearV with no coefficient" "" "$ADIV 'div(rhoPhi,U)' 'Gauss limitedLinearV'"
+arm divU_limitedLinearV     runs    -                           "" "$ADIV 'div(rhoPhi,U)' 'Gauss limitedLinearV 1'"
+# the viscous stress's explicit half is a divergence OpenFOAM looks a scheme up for (linearViscousStress.C:130);
+# the loops form it Gauss linear and never read the entry
+SDIV="python3 -c \"import re, sys; p = 'system/fvSchemes'; t = open(p).read(); k = 'div(((rho*nuEff)*dev2(T(grad(U)))))'; i = t.index(k); j = t.index(';', i); t2 = t[:i] + ((k + ' ' + sys.argv[1] + ';') if sys.argv[1] else '') + t[j + 1:]; t2 = t2.replace('divSchemes\n{', 'divSchemes\n{\n    ' + sys.argv[2]) if len(sys.argv) > 2 else t2; open(p, 'w').write(t2)\""
+arm stress_scheme_other     refused "another scheme is not ported" "" "$SDIV 'Gauss limitedLinear 1'"
+arm stress_scheme_missing   refused "names no entry for the viscous stress" "" "$SDIV ''"
+arm stress_scheme_default   runs    -                           "" "$SDIV '' 'default Gauss linear;'"
+# constant/hRef is optional; its `value` is not (UniformDimensionedField.C:129). A file without one read 0.
+arm hRef_noValue            refused "constant/hRef has no \`value\`" "" "printf '%s\ndimensions [0 1 0 0 0 0 0];\n' '$HDR' > constant/hRef"
+arm hRef_value              runs    -                           "" "printf '%s\ndimensions [0 1 0 0 0 0 0];\nvalue 0.1;\n' '$HDR' > constant/hRef"
+# a `rho` file in the start directory is read in place of alpha1*rho1 + alpha2*rho2 (createFields.H:45-55)
+arm start_rho               refused "holds a \`rho\` file"      "" "cp 0/p_rgh 0/rho"
+# icAlpha and scAlpha (alphaEqn.H:61-73) are ported on NEITHER loop: the device's refusal said the host carries
+# them, and the host stopped in its first alpha step. Refused by the case reader, for both, in one sentence.
+ICA="sed -i 's/^\( *\)nAlphaCorr /\1icAlpha 0.5;\n\1nAlphaCorr /' system/fvSolution; grep -q icAlpha system/fvSolution"
+arm icAlpha_host            refused "are not ported, on either loop" "" "$ICA"
+arm icAlpha_gpu             refused "are not ported, on either loop" "-device" "$ICA"
+arm scAlpha_host            refused "are not ported, on either loop" "" "sed -i 's/^\( *\)nAlphaCorr /\1scAlpha 0.5;\n\1nAlphaCorr /' system/fvSolution"
+# laplacianSchemes: the word after `Gauss` is the diffusivity's interpolation (laplacianScheme.H:121-141), linear
+# on both loops; and a named entry for one of interFoam's own fields is OpenFOAM's scheme for that term where
+# the loops take the default for every one. One that repeats the default, or names a field the loops do not
+# have (RAS/electrostaticDeposition's function object), changes nothing and runs.
+LAP="python3 -c \"import sys; p = 'system/fvSchemes'; t = open(p).read(); a = sys.argv[1] + '\n{'; assert a in t; open(p, 'w').write(t.replace(a, a + '\n    ' + sys.argv[2], 1))\""
+arm lap_harmonic            refused "another interpolation is not ported" "" "sed -i '/^laplacianSchemes/,/^}/ s/default .*/default         Gauss harmonic corrected;/' system/fvSchemes"
+arm lap_named_prgh          refused "names \`laplacian(rAUf,p_rgh)" "" "$LAP laplacianSchemes 'laplacian(rAUf,p_rgh) Gauss linear uncorrected;'"
+arm lap_named_same          runs    -                           "" "$LAP laplacianSchemes 'laplacian(rAUf,p_rgh) Gauss linear corrected;'"
+arm lap_named_otherField    runs    -                           "" "$LAP laplacianSchemes 'laplacian(sigma,V) Gauss linear orthogonal;'"
+arm snGrad_named_rho        refused "names \`snGrad(rho)"       "" "$LAP snGradSchemes 'snGrad(rho) uncorrected;'"
 
 # FROZEN PER-STEP BOUNDARY CONDITIONS. The shared factory ACCEPTS fixedMean, fanPressure,
 # codedFixedValue and codedMixed on the strength of a per-step update its own comment promises, and
@@ -412,6 +443,24 @@ arm fvoptions_inactive      runs    -                        "" "printf '%s\nsrc
 # constant/ is looked up FIRST and OpenFOAM stops there: an inactive one in constant/ hides an active
 # one in system/
 arm fvoptions_constant_wins runs    -                        "" "printf '%s\nsrc { type x; active no; }\n' '$HDR' > constant/fvOptions; printf '%s\nsrc { type x; }\n' '$HDR' > system/fvOptions"
+# explicitPorositySource, as OpenFOAM reads it (review row R12): `selectionMode` has no default
+# (cellSetOption.C:362), `timeStart`/`duration` is the window the option acts in (:438-440), the resistances
+# have no default (DarcyForchheimer.C:59-60), and the coordinate system is a mandatory sub-dictionary whose
+# axes may be e1/e2, e2/e3, e3/e1, axis/direction or a typed rotation (porosityModel.C:97-100,
+# axesRotation.C:160-199) -- e1 and e2 are the form read. Each was defaulted or never read.
+PORO="printf '%s\nPRE src { type explicitPorositySource; explicitPorositySourceCoeffs { BODY } } POST\n' '$HDR' > constant/fvOptions"
+PSEL="selectionMode cellZone; cellZone rotor;"
+PDF="type DarcyForchheimer; d (1e5 1e5 1e5); f (0 0 0);"
+PCS="coordinateSystem { origin (0 0 0); e1 (1 0 0); e2 (0 1 0); }"
+poro() { local a="${PORO/BODY/$1}"; a="${a/PRE/${2:-}}"; echo "${a/POST/${3:-}}"; }
+arm porosity_noSelectionMode refused "no \`selectionMode\`"      "" "$ZONE; $(poro "cellZone rotor; $PDF $PCS")"
+arm porosity_timeStart      refused "\`timeStart\` and \`duration\`" "" "$ZONE; $(poro "$PSEL timeStart 0; duration 1; $PDF $PCS")"
+arm porosity_noF            refused "no \`f\`"                  "" "$ZONE; $(poro "$PSEL type DarcyForchheimer; d (1e5 1e5 1e5); $PCS")"
+arm porosity_noCsys         refused "no \`coordinateSystem\` sub-dictionary" "" "$ZONE; $(poro "$PSEL $PDF")"
+arm porosity_e3e1           refused "not given as \`e1\` and \`e2\`" "" "$ZONE; $(poro "$PSEL $PDF coordinateSystem { origin (0 0 0); e3 (0 0 1); e1 (1 0 0); }")"
+arm porosity_rotationType   refused "rotation is \`axisAngle\`"  "" "$ZONE; $(poro "$PSEL $PDF coordinateSystem { origin (0 0 0); rotation { type axisAngle; axis (0 0 1); angle 30; } }")"
+arm porosity_rotationAxes   runs    -                           "" "$ZONE; $(poro "$PSEL $PDF coordinateSystem { origin (0 0 0); rotation { type axes; e1 (1 0 0); e2 (0 1 0); } }")"
+arm porosity_wrapped        runs    -                           "" "$ZONE; $(poro "$PSEL $PDF $PCS" "options {" "}")"
 
 # surface tension
 arm sigma_model             refused "temperatureDependent"    "" "sed -i 's/^sigma .*/sigma { type temperatureDependent; sigma table ((0 0.07)); }/' constant/transportProperties"
@@ -442,7 +491,9 @@ arm nonNewtonian            refused "CrossPowerLaw"           "" "sed -i '0,/tra
 CNSET="sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson 0.5;/' system/fvSchemes"
 arm ddt_CrankNicolson       runs    -                        "" "$CNSET"
 arm ddt_cnFull              runs    -                        "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson 1;/' system/fvSchemes"
-arm ddt_cnBare              runs    -                        "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson;/' system/fvSchemes"
+# `CrankNicolson;` with no coefficient is NOT `CrankNicolson 1`: the scheme reads a token after its name and
+# real interFoam stops on "attempt to read beyond EOF" (measured 2026-10-07; this arm said `runs` until then)
+arm ddt_cnBare              refused "with no off-centring coefficient" "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson;/' system/fvSchemes"
 arm ddt_cnRamp              refused "Function1 of time"      "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson ocCoeff { type scale; scale linearRamp; duration 0.01; value 0.9; };/' system/fvSchemes"
 arm ddt_cnOutOfRange        refused "should be >= 0 and <= 1" "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson 1.5;/' system/fvSchemes"
 # `ddt(alpha)` NEED NOT AGREE WITH THE DEFAULT, in either direction. alphaEqn.H:242-259 branches on

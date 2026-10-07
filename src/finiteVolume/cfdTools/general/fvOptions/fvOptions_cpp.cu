@@ -187,6 +187,64 @@ void recordSelection(
 }
 }   // namespace
 
+// WHAT explicitPorositySource REQUIRES OR ACTS ON that this reader defaulted or never read. `option` is the
+// source's coefficients (selectionMode, the time window) and `model` the porosity model's (the two
+// resistances, the coordinate system). Returns why the option cannot be carried as written, or nothing.
+//   selectionMode     no default: selectionModeTypeNames_.get("selectionMode", coeffs_), cellSetOption.C:362.
+//                     It defaulted to `all`.
+//   timeStart         with `duration`, the window the option acts in (cellSetOption.C:438-440,
+//                     cellSetOptionI.H:43-54). Never read: the option acted for the whole run.
+//   the resistances   no default (DarcyForchheimer.C:59-60, fixedCoeff's the same). A missing one was zero.
+//   coordinateSystem  a mandatory sub-dictionary (porosityModel.C:97-100, coordinateSystemNew.C:107-119)
+//                     whose rotation is e1/e2, e2/e3, e3/e1, axis/direction or a typed `rotation`
+//                     (axesRotation.C:160-199, coordinateSystem.C:96-122). Only e1 and e2 were read, each
+//                     defaulting to an axis of the mesh.
+namespace {
+std::string porosityNotAsWritten(
+    const FoamDict& option,
+    const FoamDict& model,
+    const char* first,
+    const char* second)
+{
+    if (!option.found("selectionMode"))
+    {
+        return "no `selectionMode`, which OpenFOAM reads with no default (cellSetOption.C:362)";
+    }
+    if (option.found("timeStart"))
+    {
+        return "`timeStart` and `duration`: the option acts inside that time window "
+               "(cellSetOption.C:438-440), which is not ported";
+    }
+    vector t;
+    for (const char* name : {first, second})
+    {
+        if (!readDimensionedVector(model, name, t))
+        {
+            return std::string("no `") + name + "`, which OpenFOAM reads with no default";
+        }
+    }
+    const FoamDict* cs = model.subDict("coordinateSystem");
+    if (!cs)
+    {
+        return "no `coordinateSystem` sub-dictionary, which the porosity model requires "
+               "(porosityModel.C:97-100)";
+    }
+    const FoamDict* rot = cs->subDict("rotation");
+    const std::string type = rot ? rot->wordOr("type", "") : cs->wordOr("rotation", "axes");
+    if (type != "axes" && type != "axesRotation")
+    {
+        return "a coordinateSystem whose rotation is `" + type + "`; the axes form (e1, e2) is the one read";
+    }
+    const FoamDict& r = rot ? *rot : *cs;
+    if (!r.found("e1") || !r.found("e2"))
+    {
+        return "a coordinateSystem whose axes are not given as `e1` and `e2` (OpenFOAM also takes e2/e3, "
+               "e3/e1 and axis/direction, axesRotation.C:160-199; those are not ported)";
+    }
+    return std::string();
+}
+}   // namespace
+
 OptionList read(const std::string& caseDir, const PrimitiveMesh& m)
 {
     (void)m;
@@ -208,7 +266,10 @@ OptionList read(const std::string& caseDir, const PrimitiveMesh& m)
     const std::string polyMeshDir = caseDir + "/constant/polyMesh";
     const auto zones = readCellZones(polyMeshDir);
 
-    for (const auto& entry : root.subs)
+    // the options may sit under `options { }` (fv::optionList::optionsDict, fvOptionList.C:44-50:
+    // optionalSubDict). Read at the top level alone, such a file was one option named `options`.
+    const FoamDict* wrapped = root.subDict("options");
+    for (const auto& entry : (wrapped ? *wrapped : root).subs)
     {
         Option o;
         o.name = entry.first;
@@ -388,6 +449,16 @@ OptionList read(const std::string& caseDir, const PrimitiveMesh& m)
         const std::string pType = src.wordOr("type", "");
         if (pType == "fixedCoeff")
         {
+            {
+                const FoamDict* coeffs = src.subDict("fixedCoeffCoeffs");
+                const std::string why = porosityNotAsWritten(src, coeffs ? *coeffs : src, "alpha", "beta");
+                if (!why.empty())
+                {
+                    o.unsupported = "explicitPorositySource: " + why;
+                    list.options.push_back(o);
+                    continue;
+                }
+            }
             const CellSelection fsel = resolveCellSelection(
                 polyMeshDir, src.wordOr("selectionMode", "all"),
                 src.wordOr("cellZone", src.wordOr("cellSet", "")), zones);
@@ -432,6 +503,16 @@ OptionList read(const std::string& caseDir, const PrimitiveMesh& m)
             continue;
         }
 
+        {
+            const FoamDict* coeffs = src.subDict("DarcyForchheimerCoeffs");
+            const std::string why = porosityNotAsWritten(src, coeffs ? *coeffs : src, "d", "f");
+            if (!why.empty())
+            {
+                o.unsupported = "explicitPorositySource: " + why;
+                list.options.push_back(o);
+                continue;
+            }
+        }
         const CellSelection sel = resolveCellSelection(
             polyMeshDir, src.wordOr("selectionMode", "all"),
             src.wordOr("cellZone", src.wordOr("cellSet", "")), zones);

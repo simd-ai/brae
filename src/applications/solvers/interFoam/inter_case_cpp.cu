@@ -336,7 +336,21 @@ DivScheme parseMomentumDiv(const std::string& entry, scalar& coeff)
     if (s == "vanLeerV")      return DivScheme::vanLeerV;
     if (s == "limitedLinearV")
     {
-        if (tok.size() > 2) coeff = std::stod(tok[2]);
+        // the same limiter, the same read: k with no default and 0 <= k <= 1 (limitedLinear.H:67-76). A
+        // missing one was 1 here.
+        if (tok.size() < 3)
+        {
+            throw std::runtime_error(
+                "brae interFoam: `div(rhoPhi,U) " + entry + "` names limitedLinearV with no coefficient; "
+                "OpenFOAM reads it with no default (limitedLinear.H:67).");
+        }
+        coeff = std::stod(tok[2]);
+        if (coeff < scalar(0) || coeff > scalar(1))
+        {
+            throw std::runtime_error(
+                "brae interFoam: `div(rhoPhi,U) " + entry + "` gives limitedLinearV a coefficient outside "
+                "[0, 1]; OpenFOAM stops on it (limitedLinear.H:69-75).");
+        }
         return DivScheme::limitedLinearV;
     }
     if (s == "limitedLinear")
@@ -487,6 +501,80 @@ NonOrthScheme readNonOrthScheme(
     s.raw = blk.substr(q + 7, e == std::string::npos ? std::string::npos : e - q - 7);
     const std::size_t b = s.raw.find_first_not_of(" \t\n\r");
     s.raw = (b == std::string::npos) ? std::string() : s.raw.substr(b);
+    // one entry's words, single-spaced: what two entries are compared by
+    const auto words = [](const std::string& text)
+    {
+        std::istringstream in(text);
+        std::string out;
+        for (std::string w; in >> w;)
+        {
+            out += (out.empty() ? "" : " ") + w;
+        }
+        return out;
+    };
+    // THE DIFFUSIVITY'S INTERPOLATION, the word after `Gauss` in a laplacian entry
+    // (laplacianScheme.H:121-141): both loops interpolate rho*nuEff, rAU and the closure's diffusivities
+    // linearly and never looked at it, so `Gauss harmonic corrected` ran linear.
+    if (block == "laplacianSchemes")
+    {
+        std::istringstream in(s.raw);
+        std::string gauss;
+        std::string interpolation;
+        in >> gauss >> interpolation;
+        if (gauss != "Gauss" || interpolation != "linear")
+        {
+            throw std::runtime_error(
+                "brae interFoam: fvSchemes `laplacianSchemes` default is `" + words(s.raw) + "`. The loops "
+                "take `Gauss linear <snGrad scheme>`: the diffusivity is interpolated linearly "
+                "(laplacianScheme.H:121-141 reads that word); another interpolation is not ported.");
+        }
+    }
+    // A NAMED ENTRY for one of interFoam's own fields that says something else than the default. OpenFOAM
+    // resolves laplacian(<gamma>,<field>) and snGrad(<field>) by name first (fvmLaplacian.C:252, :285;
+    // schemesLookupDetail.C:76-89); this reader takes the default for every one. An entry that repeats the
+    // default changes nothing and runs; so does one for a field the loops do not have (RAS/
+    // electrostaticDeposition names its function object's electricPotential:V).
+    {
+        // fvSchemesBlock hands the block from its opening brace on
+        std::size_t at = (!blk.empty() && blk[0] == '{') ? 1 : 0;
+        while (at < blk.size())
+        {
+            const std::size_t semi = blk.find(';', at);
+            if (semi == std::string::npos)
+            {
+                break;
+            }
+            std::istringstream in(blk.substr(at, semi - at));
+            at = semi + 1;
+            std::string key;
+            in >> key;
+            std::string rest;
+            std::getline(in, rest, '\0');
+            if (key.empty() || key == "default" || words(rest) == words(s.raw))
+            {
+                continue;
+            }
+            // the field: the last argument inside the key's parentheses
+            const std::size_t close = key.rfind(')');
+            const std::size_t open = key.find_last_of("(,", close == std::string::npos ? close : close - 1);
+            const std::string field = (close == std::string::npos || open == std::string::npos)
+                                    ? key : key.substr(open + 1, close - open - 1);
+            static const char* const own[] = {"p_rgh", "pcorr", "U", "k", "epsilon", "omega", "rho",
+                                              "cellDisplacement"};
+            bool ours = field.compare(0, 6, "alpha.") == 0;
+            for (const char* name : own)
+            {
+                ours = ours || field == name;
+            }
+            if (ours)
+            {
+                throw std::runtime_error(
+                    "brae interFoam: fvSchemes `" + block + "` names `" + key + " " + words(rest) + ";` beside "
+                    "a default of `" + words(s.raw) + "`. OpenFOAM takes the named entry for that term; the "
+                    "loops take the default for every one. Refused rather than run the default under its name.");
+            }
+        }
+    }
     if (schemeHasWord(s.raw, "limited"))
     {
         // `limited <c>` and `limited corrected <c>` are the same scheme (limitedSnGrad.H:98-124):
@@ -885,6 +973,19 @@ InterFields buildInterFields(const std::string&          caseDir,
     // object is constructed, off the mesh as it stands before any motion (interfaceProperties.C:190)
     f.interface.deltaN = interfaceProps::deltaN(g.V());
     f.alphaCtl  = readAlphaControls(fvSolution, f.alphaName);
+    // THE ISOTROPIC AND THE SHEAR COMPRESSION, alphaEqn.H:61-73: `icAlpha > 0` blends phic with
+    // cAlpha*icAlpha*interpolate(mag(U)) and `scAlpha > 0` adds scAlpha*mag(delta() & interpolate(symm(grad(U)))).
+    // NEITHER LOOP FORMS THEM. The GPU loop refused them saying the host loop carries both; the host loop's
+    // alpha step has the two terms and is handed neither face field (alpha_eqn_cpp.cu's call passes none), so
+    // it stopped in its first alpha step. Refused here, for both, by name. No shipped tutorial sets either.
+    if (f.alphaCtl.icAlpha > scalar(0) || f.alphaCtl.scAlpha > scalar(0))
+    {
+        throw std::runtime_error(
+            "brae interFoam: fvSolution sets icAlpha " + std::to_string((double)f.alphaCtl.icAlpha)
+            + " and scAlpha " + std::to_string((double)f.alphaCtl.scAlpha) + ". The isotropic and the shear "
+            "compression of alphaEqn.H:61-73 are not ported, on either loop; the standard interface "
+            "compression (cAlpha) is.");
+    }
     f.mulesCtl  = f.alphaCtl.MULESCorr ? MULES::readControlsCorr(fvSolution, f.alphaName)
                                        : MULES::readControls(fvSolution, f.alphaName);
     f.writeCadence = WriteCadence::read(controlDict);
@@ -941,6 +1042,51 @@ InterFields buildInterFields(const std::string&          caseDir,
         };
         f.divPhiAlpha = parseAlphaDiv(alphaEntry("div(phi,alpha)"), "div(phi,alpha)");
         f.divPhirbAlpha = parseAlphaDiv(alphaEntry("div(phirb,alpha)"), "div(phirb,alpha)");
+        // THE EXPLICIT HALF OF THE VISCOUS STRESS, fvc::div((rho*nuEff)*dev2(T(grad(U))))
+        // (linearViscousStress.C:130), is a divergence OpenFOAM looks a scheme up for -- the entry every
+        // tutorial writes as `div(((rho*nuEff)*dev2(T(grad(U))))) Gauss linear;` -- then the block's default,
+        // then it stops. Both loops form it Gauss linear and never read the entry. Found here by what the
+        // key holds, `dev2(T(grad(U)))`, since the factor in front of it is the model's.
+        {
+            const std::string stressKey = "dev2(T(grad(U)))";
+            std::string scheme;
+            const std::size_t k = div.find(stressKey);
+            if (k != std::string::npos)
+            {
+                const std::size_t keyEnd = div.find_first_of(" \t\n\r", k);
+                const std::size_t e = div.find(';', k);
+                if (keyEnd != std::string::npos && e != std::string::npos && keyEnd < e)
+                {
+                    scheme = div.substr(keyEnd, e - keyEnd);
+                }
+            }
+            else
+            {
+                scheme = entry("default", "");
+            }
+            std::vector<std::string> tok;
+            {
+                std::istringstream in(scheme);
+                for (std::string w; in >> w;)
+                {
+                    tok.push_back(w);
+                }
+            }
+            if (tok.empty() || (tok.size() == 1 && tok[0] == "none"))
+            {
+                throw std::runtime_error(
+                    "brae interFoam: fvSchemes' divSchemes names no entry for the viscous stress's explicit "
+                    "half, `div(((rho*nuEff)*dev2(T(grad(U)))))`, and has no default to take its place; "
+                    "OpenFOAM looks one up (linearViscousStress.C:130) and stops without it.");
+            }
+            if (tok.size() != 2 || tok[0] != "Gauss" || tok[1] != "linear")
+            {
+                throw std::runtime_error(
+                    "brae interFoam: fvSchemes gives the viscous stress's explicit half, `div(((rho*nuEff)*"
+                    "dev2(T(grad(U)))))`, the scheme `" + scheme.substr(scheme.find_first_not_of(" \t\n\r"))
+                    + "`. Both loops form it `Gauss linear`; another scheme is not ported.");
+            }
+        }
 
         // EACH ddt BY THE NAME ITS CALL SITE ASKS FOR (ddtSchemeFor, schemesLookupDetail.C): OpenFOAM has no
         // "U scheme". fvm::ddt(rho, U) in UEqn.H looks up `ddt(rho,U)` (fvmDdt.C:83); fvc::ddtCorr(U, phi, Uf)
@@ -1532,6 +1678,16 @@ InterFields buildInterFields(const std::string&          caseDir,
     // --- gravity ------------------------------------------------------------------------------
     f.g          = readGravity(caseDir);
     f.hRef       = readHRef(caseDir);
+    // createFields.H:45-55 constructs rho READ_IF_PRESENT from the start directory: a `rho` file there IS the
+    // density of the first step's ddt(rho,U), patches and all, where both loops form it from alpha. OpenFOAM
+    // never writes the file (no AUTO_WRITE), so only a hand-made start directory holds one. Refused.
+    if (std::filesystem::exists(startDir + "/rho") || std::filesystem::exists(startDir + "/rho.gz"))
+    {
+        throw std::runtime_error(
+            "brae interFoam: the start directory holds a `rho` file. createFields.H:45-55 reads it in place "
+            "of alpha1*rho1 + alpha2*rho2 for the first step; brae forms the density from alpha and does not "
+            "read it.");
+    }
     f.ghRefValue = ghRef(f.g, f.hRef);
 
     // --- the read fields ----------------------------------------------------------------------
