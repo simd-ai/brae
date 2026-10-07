@@ -290,6 +290,7 @@ void deviceAlphaCorrector(
     // and each negation changes which cell the interpolation reads, not just the result's sign.
     fluxWithScheme(dm, in.alphaScheme, *in.phiInt, *in.phiBnd, alpha1, *bnd.alpha1, advInt, advBnd,
                    in.cyc, in.gradAlpha1LeastSquares, in.gradAlpha1CellLimitK);
+    interStepProbe("corrector: advection", advInt);
     // ...and on the pair, where the scheme's own weight applies as on an internal face. The limiter
     // reads fvc::grad(alpha), which must carry the pair itself -- see device_alpha_flux.cuh.
     DeviceBuffer<scalar> advIf;
@@ -300,8 +301,11 @@ void deviceAlphaCorrector(
         // fit takes the pair inside it, a Gauss one has the pair's faces added after (deviceCyclicAddGrad)
         deviceGradOf(dm, alpha1, *bnd.alpha1, in.gradAlpha1LeastSquares, in.gradAlpha1CellLimitK,
                      gx, gy, gz, in.gradAlpha1LeastSquares ? in.cyc : nullptr);
+        interStepProbe("corrector: grad, no pair", gx);
         if (!in.gradAlpha1LeastSquares) deviceCyclicAddGrad(*in.cyc, alpha1, dm.V, gx, gy, gz);
+        interStepProbe("corrector: grad + pair", gx);
         deviceAlphaCyclicFlux(*in.cyc, static_cast<int>(in.alphaScheme), alpha1, gx, gy, gz, advIf);
+        interStepProbe("corrector: pair flux", advIf);
     }
     deviceNegateFaces(nIf, phirInt, negPhirInt);
     deviceNegateFaces(nBf, phirBnd, negPhirBnd);
@@ -495,6 +499,11 @@ void deviceAlphaCorrector(
                        havePairEx ? &phiBDIf : nullptr,
                        havePairEx ? &corrIfEx : nullptr,
                        havePairEx ? &lamIf : nullptr);
+    interStepProbe("corrector: limiter", lamInt);
+    if (havePairEx)
+    {
+        interStepProbe("corrector: pair limiter", lamIf);
+    }
     part.emplace("alpha corrector: the blend and the explicit solve");
     deviceMulesBlend(nIf, nBf, phiBDInt, phiBDBnd, lamInt, lamBnd, corrInt, corrBnd,
                      alphaPhi10Int, alphaPhi10Bnd);
@@ -515,9 +524,11 @@ void deviceAlphaCorrector(
         ckS(cudaMemcpy(in.alphaPhiIf->data(), sum.data(), sizeof(scalar)*in.cyc->n,
                        cudaMemcpyDeviceToDevice), "alphaPhi10 = phiPsi, interface");
     }
+    interStepProbe("corrector: flux", alphaPhi10Int);
     deviceMulesExplicitSolve(dm, rDeltaT, alpha1Old, alphaPhi10Int, alphaPhi10Bnd, mf, alpha1,
                              havePairEx ? in.cyc : nullptr,
                              havePairEx ? in.alphaPhiIf : nullptr);
+    interStepProbe("corrector: solved", alpha1);
 }
 
 } // namespace brae

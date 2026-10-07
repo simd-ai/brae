@@ -8,6 +8,7 @@
 #include "device_pcg.cuh"
 #include "device_amg.cuh"   // deviceSymGaussSeidel
 #include "device_divdevreff.cuh"   // deviceBoundaryGradU
+#include <cstring>
 #include <string>
 #include <optional>
 #include <cuda_runtime.h>
@@ -37,6 +38,11 @@ __global__ void namedUFluxKernel(
 // gate downstream sees only the end. This names the first stage whose output is not finite, which is
 // what turns "damBreak gives NaN" into a line number. It is the of-instrument approach applied to
 // brae's own code rather than to OpenFOAM's.
+// ...AND A HASH OF THE BYTES, so that two runs of one case can be compared stage by stage: the first line
+// that differs between the two logs is the first stage that is not the same run twice. (2026-10-07,
+// RAS/mixerVesselAMI: the written files differ from the first step on in every flow field, which says
+// nothing about where. The probes named it: handed the same alpha, flux and U, the alpha corrector's
+// gradient is the same before its coupled pair's term and not after -- deviceCyclicAddGrad.)
 bool stepCheckOn()
 {
     static const bool on = (std::getenv("BRAE_INTER_STEP_CHECK") != nullptr);
@@ -50,16 +56,28 @@ void probe(const char* stage, const DeviceBuffer<scalar>& b)
     b.copyTo(h);
     int bad = 0;
     scalar mx = 0;
+    // FNV-1a over the values' bit patterns
+    unsigned long long hash = 1469598103934665603ull;
     for (scalar v : h)
     {
         if (!std::isfinite(v)) ++bad;
         else mx = std::fmax(mx, std::fabs(v));
+        unsigned long long bits = 0;
+        std::memcpy(&bits, &v, sizeof(bits));
+        hash = (hash ^ bits)*1099511628211ull;
     }
-    std::fprintf(stderr, "  [step] %-22s n=%-7zu non-finite=%-6d max|.|=%.6g\n",
-                 stage, h.size(), bad, (double)mx);
+    std::fprintf(stderr, "  [step] %-22s n=%-7zu non-finite=%-6d max|.|=%.6g hash=%016llx\n",
+                 stage, h.size(), bad, (double)mx, hash);
 }
 
 }   // namespace
+
+void interStepProbe(
+    const char* stage,
+    const DeviceBuffer<scalar>& b)
+{
+    probe(stage, b);
+}
 
 // BRAE_CONTROL_DEVICE_HBYA_REEVALUATED=1: constrainHbyA re-evaluating U's patches, as it did
 bool hbyaReevaluatedControl()
@@ -205,6 +223,11 @@ void deviceInterStep(
         actl.alphaPhiCreatedInt = ctl.cn->alphaPhiCreatedInt;
         actl.alphaPhiCreatedBnd = ctl.cn->alphaPhiCreatedBnd;
     }
+    // (what the step was handed, for the comparison of two runs: the mesh update and CorrectPhi are behind it)
+    probe("in.alpha", alpha1);
+    probe("in.phi", phiInt);
+    probe("in.phiBnd", phiBnd);
+    probe("in.U.x", UX);
     deviceInterAlphaStep(dm, alpha1, alpha1Old, deltaT, ain, ctl.mules, actl, props, hooks.alpha,
                          alpha1Bnd, nHatfBnd, bndAlphaFixesValue, bndAlphaFlag,
                          nHatfInt, K, rhoPhiInt, rhoPhiBnd, alpha2, rho, mu, nu);

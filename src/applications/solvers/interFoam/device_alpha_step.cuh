@@ -52,6 +52,14 @@
 
 namespace brae {
 
+// THE STEP'S STAGE PROBE (device_inter_step.cu, BRAE_INTER_STEP_CHECK=1), callable from inside the alpha
+// corrector: one line a stage with a hash of its bytes, so that two runs of one case can be compared stage by
+// stage. A no-op when the switch is off.
+void interStepProbe(
+    const char* stage,
+    const DeviceBuffer<scalar>& b);
+
+
 // The face interpolation for one of the two fluxes. `interfaceCompression` is absent on purpose: it is
 // not a limiter variant but a different scheme entirely, the host runs it and the device driver refuses
 // it by name -- a device enum that mapped it to vanLeer, or to linear as the driver's mapping did until
