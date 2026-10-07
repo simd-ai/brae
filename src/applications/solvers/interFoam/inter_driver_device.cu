@@ -4474,8 +4474,10 @@ RunReport runInterFoamDevice(
     // ...BUT NOT ON A MESH THAT MOVES. There phi.oldTime() is created by the alpha blend itself (ddtCorr reads
     // Uf.oldTime() and never asks for it), and the creation is held to OpenFOAM under a CrankNicolson momentum
     // alone (tests/interfoam_moving's floating profiles); under an Euler one no fixture holds it. Refused by
-    // name until one does; the host loop runs it.
-    if (cnAlphaOnly && f.dynamicMesh)
+    // name until one does; the host loop runs it. `meshIsDynamic`, which is OpenFOAM's mesh.dynamic() and
+    // what ddtCorr branches on (fvcDdt.C:219-226): a refining mesh with no motion of its own has no motion
+    // solver, and the test on that pointer let it through.
+    if (cnAlphaOnly && f.meshIsDynamic)
     {
         throw std::runtime_error(
             "brae interFoam -device: ddt(alpha) is CrankNicolson under an Euler ddt(rho,U) on a mesh that moves. "
@@ -4602,6 +4604,20 @@ RunReport runInterFoamDevice(
     // `alphaApplyPrevCorr`: the cache outlives every step, so it lives here. See
     // DeviceInterAlphaControls -- the device ignored this switch until it was measured.
     DeviceBuffer<scalar> dPrevCorrI, dPrevCorrB;
+    // ...BUT NOT ACROSS A COUPLED PAIR. The cache holds the internal and the boundary faces; a pair's faces
+    // are in neither array here, so the previous correction would be limited without the cell across the
+    // pair and never stored or applied on the pair's own faces, where OpenFOAM limits and integrates a
+    // coupled patch like any other (CMULESTemplates.C:327-338, :516-536, :53-54). No shipped tutorial sets
+    // the switch on a mesh with a pair (the three that set it have none) and the host loop carries every
+    // patch. Refused by name; without MULESCorr the switch does nothing and the case runs.
+    if (f.alphaCtl.alphaApplyPrevCorr && f.alphaCtl.MULESCorr && dCyc.n > 0)
+    {
+        throw std::runtime_error(
+            "brae interFoam -device: fvSolution sets `alphaApplyPrevCorr yes` with `MULESCorr yes` on a mesh "
+            "with a coupled pair. alphaEqn.H:133-147 limits and applies the previous step's correction on "
+            "every face, the pair's among them; the device loop's cache holds the internal and the boundary "
+            "faces only. The host loop runs it.");
+    }
     C.alpha.alphaApplyPrevCorr = f.alphaCtl.alphaApplyPrevCorr;
     C.alpha.prevCorrInt = &dPrevCorrI;
     C.alpha.prevCorrBnd = &dPrevCorrB;
@@ -4637,13 +4653,19 @@ RunReport runInterFoamDevice(
             "brae interFoam (device): fvSchemes grad(U) resolves to leastSquares under LES kEqn, whose "
             "device closure takes grad(U) Gauss (device_les_keqn.cu). The host arm runs it. Refused "
             "rather than run another gradient.");
-    C.alpha.preSolve.minIter = f.aSolve.minIter;   // gated on laminar/damBreak `alphaminiter`
-    C.alpha.preSolve.tol = f.aSolve.tol;
-    C.alpha.preSolve.relTol = f.aSolve.relTol;
-    C.alpha.preSolve.maxIter = f.aSolve.maxIter;
-    C.alpha.preSolve.smoothSolver = f.aSolve.gaussSeidel();
-    C.alpha.preSolve.symmetric = (f.aSolve.smoother == "symGaussSeidel");
-    C.alpha.preSolve.nSweeps = f.aSolve.nSweeps;
+    // the entry of each outer corrector: `<alpha>Final` on the last (InterFields::aSolveFinal)
+    auto setAlphaSolve = [&](bool finalOuter)
+    {
+        const InterFields::AlphaLinearSolve& as = finalOuter ? f.aSolveFinal : f.aSolve;
+        C.alpha.preSolve.minIter = as.minIter;   // gated on laminar/damBreak `alphaminiter`
+        C.alpha.preSolve.tol = as.tol;
+        C.alpha.preSolve.relTol = as.relTol;
+        C.alpha.preSolve.maxIter = as.maxIter;
+        C.alpha.preSolve.smoothSolver = as.gaussSeidel();
+        C.alpha.preSolve.symmetric = (as.smoother == "symGaussSeidel");
+        C.alpha.preSolve.nSweeps = as.nSweeps;
+    };
+    setAlphaSolve(true);
     C.mules = DeviceMulesControls{f.mulesCtl.nLimiterIter, f.mulesCtl.smoothLimiter,
                                   f.mulesCtl.extremaCoeff, f.mulesCtl.boundaryExtremaCoeff};
     C.alphaInput.cAlpha = f.interface.cAlpha;
@@ -4773,8 +4795,8 @@ RunReport runInterFoamDevice(
     C.nonOrthCoeffs = f.laplacianScheme.nonOrthCoeffs;
     C.snGradLimitCoeff = f.laplacianScheme.limitCoeff;
     C.momentumPredictor = f.momentumPredictorOn;
-    C.relaxU = f.relaxU;
-    C.relaxEquationU = f.relaxEquationU;
+    C.relaxU = f.relaxUFinal;
+    C.relaxEquationU = f.relaxEquationUFinal;
     // Both entries, selected per corrector inside the step -- and the case's own PCG with DIC where it
     // names one, which every shipped interFoam tutorial does. The DIC is the level-scheduled DILU with
     // lower aliased to upper, bit-identical to DICPreconditioner.C (tests/test_device_dic.cu). Any other
@@ -4863,6 +4885,10 @@ RunReport runInterFoamDevice(
     // InterFields::uSolve). Set per outer corrector in the loop below.
     auto setMomentumSolve = [&](bool finalOuter)
     {
+        // UEqn.relax() by the name of this outer corrector (InterFields::relaxEquationUFinal) -- before
+        // the early return: the matrix is relaxed whether or not the predictor solves it
+        C.relaxU = finalOuter ? f.relaxUFinal : f.relaxU;
+        C.relaxEquationU = finalOuter ? f.relaxEquationUFinal : f.relaxEquationU;
         if (!f.momentumPredictorOn) return;
         const InterFields::AlphaLinearSolve& us = finalOuter ? f.uSolveFinal : f.uSolve;
         C.momentum.tol = us.tol;
@@ -5143,6 +5169,20 @@ RunReport runInterFoamDevice(
             rep.deltaT = dt0;
         }
     }
+    // p's PATCH VALUES UNDER frozenFlow. pEqn.H's `p == p_rgh + rho*gh` is all that assigns them after
+    // createFields.H, and frozenFlow never reaches it (interFoam.C:156-159): OpenFOAM writes p as the start
+    // left it, cells and patches. The write rebuilt the patches from the live density and gh, which the
+    // alpha step and a mesh move change with no pressure corrector behind them. MEASURED 2026-10-07 on
+    // laminar/sloshingTank2D with the switch: p 7.0e-03 from OpenFOAM's after one step and 1.4e-02 after
+    // two on both loops, every other file at round-off (tests/interfoam_write/core/frozen_flow_moving.sh).
+    //   BRAE_CONTROL_FROZEN_FLOW_P_REBUILT=1: a gate's CONTROL, deliberately wrong -- rebuilt at the write.
+    static const bool frozenPRebuilt = std::getenv("BRAE_CONTROL_FROZEN_FLOW_P_REBUILT") != nullptr;
+    const bool pPatchesFrozen = f.pimple.frozenFlow && !frozenPRebuilt;
+    std::vector<std::vector<scalar>> pBFrozen;
+    if (pPatchesFrozen)
+    {
+        pBFrozen = staticPressureBoundary(f.p_rgh, f.rhoBnd, f.ghfBoundary);
+    }
     interPhase::start();
     for (label s = 0; s < nSteps; ++s)
     {
@@ -5252,11 +5292,88 @@ RunReport runInterFoamDevice(
             //                                  also prints the two numbers, mean and max, as OpenFOAM's log
             //                                  does -- the gate holds them to that log.
             static const bool courantCheck = std::getenv("BRAE_CONTROL_COURANT_CHECK") != nullptr;
+            //   BRAE_TRACE_COURANT_CELL=1      the cell that carries the Courant number, every step: its
+            //                                  index, centre, volume, velocity and flux sum -- for a run whose
+            //                                  time step falls where OpenFOAM's does not
+            static const bool courantCell = std::getenv("BRAE_TRACE_COURANT_CELL") != nullptr;
             const DeviceCyclic* pairForCo = dCyc.n > 0 ? &dCyc : nullptr;
             std::vector<scalar> sumPhiDevice;
             std::vector<scalar> sumPhiBandDevice;
             const DeviceCourantNumbers co = deviceAlphaCourantNo(dm, dPhiI, dPhiB, nullptr, rep.deltaT, pairForCo,
-                                                                 courantCheck ? &sumPhiDevice : nullptr);
+                                                                 (courantCheck || courantCell) ? &sumPhiDevice
+                                                                                               : nullptr);
+            if (courantCell && sumPhiDevice.size() == g.V().size())
+            {
+                const std::vector<scalar>& vol = g.V();
+                const std::vector<vector>& ctr = g.C();
+                std::size_t at = 0;
+                for (std::size_t c = 1; c < vol.size(); ++c)
+                {
+                    if (sumPhiDevice[c]/vol[c] > sumPhiDevice[at]/vol[at])
+                    {
+                        at = c;
+                    }
+                }
+                std::vector<scalar> ux, uy, uz, al;
+                dUx.copyTo(ux);
+                dUy.copyTo(uy);
+                dUz.copyTo(uz);
+                dA.copyTo(al);
+                std::printf("  Courant cell: %zu of %zu at (%.6g %.6g %.6g) V %.4e U (%.5g %.5g %.5g) alpha %.6g "
+                            "sum|phi| %.4e Co %.4g\n", at, vol.size(), (double)ctr[at].x, (double)ctr[at].y,
+                            (double)ctr[at].z, (double)vol[at], (double)ux[at], (double)uy[at], (double)uz[at],
+                            (double)al[at], (double)sumPhiDevice[at],
+                            (double)(scalar(0.5)*sumPhiDevice[at]/vol[at]*rep.deltaT));
+                // ...and, once it is fast, its faces: the cell across each, that cell's velocity, pressure
+                // and phase, and the face's flux -- what the cell is being driven by
+                const scalar speed = std::sqrt(ux[at]*ux[at] + uy[at]*uy[at] + uz[at]*uz[at]);
+                if (speed > scalar(12))
+                {
+                    std::vector<scalar> pr, ph, nutC, kC;
+                    dPrgh.copyTo(pr);
+                    dPhiI.copyTo(ph);
+                    if (dTurb.nut.size() == vol.size())
+                    {
+                        dTurb.nut.copyTo(nutC);
+                        dTurb.k.copyTo(kC);
+                    }
+                    std::printf("    cell %zu: p_rgh %.6g nut %.4g k %.4g\n", at, (double)pr[at],
+                                nutC.empty() ? 0.0 : (double)nutC[at], kC.empty() ? 0.0 : (double)kC[at]);
+                    const std::vector<label>& own = m.owner();
+                    const std::vector<label>& nei = m.neighbour();
+                    for (std::size_t fi = 0; fi < own.size(); ++fi)
+                    {
+                        const bool internal = fi < nei.size();
+                        if (static_cast<std::size_t>(own[fi]) != at
+                         && !(internal && static_cast<std::size_t>(nei[fi]) == at))
+                        {
+                            continue;
+                        }
+                        if (internal)
+                        {
+                            const std::size_t o = static_cast<std::size_t>(own[fi]) == at
+                                                ? static_cast<std::size_t>(nei[fi])
+                                                : static_cast<std::size_t>(own[fi]);
+                            std::printf("    face %zu -> cell %zu V %.3e U (%.5g %.5g %.5g) p_rgh %.6g alpha %.4g "
+                                        "phi %.4e nut %.4g\n", fi, o, (double)vol[o], (double)ux[o],
+                                        (double)uy[o], (double)uz[o], (double)pr[o], (double)al[o],
+                                        (double)ph[fi], nutC.empty() ? 0.0 : (double)nutC[o]);
+                        }
+                        else
+                        {
+                            const char* name = "?";
+                            for (const FvPatch& q : fvp)
+                            {
+                                if (static_cast<label>(fi) >= q.start && static_cast<label>(fi) < q.start + q.size)
+                                {
+                                    name = q.name.c_str();
+                                }
+                            }
+                            std::printf("    face %zu on patch %s\n", fi, name);
+                        }
+                    }
+                }
+            }
             const DeviceCourantNumbers coBand = deviceAlphaCourantNo(dm, dPhiI, dPhiB, &dA, rep.deltaT, pairForCo,
                                                                      courantCheck ? &sumPhiBandDevice : nullptr);
             rep.CoNum = co.CoNum;
@@ -5810,6 +5927,7 @@ RunReport runInterFoamDevice(
         {
             const bool finalOuter = (outer == f.pimple.nOuterCorrectors - 1);
             setMomentumSolve(finalOuter);
+            setAlphaSolve(finalOuter);
             // pimple.finalInnerIter() under finalOnLastPimpleIterOnly (PimpleControls, inter_solve_cpp.cuh)
             static const bool finalEveryOuter = std::getenv("BRAE_CONTROL_FINAL_ON_EVERY_OUTER") != nullptr;
             C.pressureFinalThisOuter = !f.pimple.finalOnLastPimpleIterOnly || finalEveryOuter || finalOuter;
@@ -7120,7 +7238,14 @@ RunReport runInterFoamDevice(
             // a HOST field (next step's ddtCorr reads (Sf & Uf.oldTime()) off it), so the device's U and
             // phi come back for it. One copy of the arithmetic, shared with the host loop (correctUf,
             // inter_peqn_cpp.cu). rAU comes back with it, for the next change's CorrectPhi.
-            if (f.meshIsDynamic)
+            // NOT UNDER frozenFlow: interFoam.C:156-159 `continue`s past pEqn.H, so Uf is left as it is
+            // and the absolute flux this reads was never formed. MEASURED 2026-10-07 on laminar/
+            // sloshingTank2D with `frozenFlow yes`: this block read the empty buffers and the first step
+            // ended in a segmentation fault where the host loop runs.
+            //   BRAE_CONTROL_FROZEN_FLOW_CORRECT_UF=1: a gate's CONTROL, deliberately wrong -- the block
+            //   under frozenFlow too.
+            static const bool frozenCorrectUf = std::getenv("BRAE_CONTROL_FROZEN_FLOW_CORRECT_UF") != nullptr;
+            if (f.meshIsDynamic && (!f.pimple.frozenFlow || frozenCorrectUf))
             {
                 { std::vector<scalar> ux, uy, uz;
                   dUx.copyTo(ux); dUy.copyTo(uy); dUz.copyTo(uz);
@@ -7182,6 +7307,13 @@ RunReport runInterFoamDevice(
             dA.copyTo(aW);
             dPrgh.copyTo(prghW);
             dP.copyTo(pW);
+            // ...and under frozenFlow no pressure corrector ever filled the device's p: OpenFOAM writes the
+            // field createFields.H built, which is the host's as buildInterFields left it. The copy above
+            // wrote a p with no cells (found with the patch values, core/frozen_flow_moving.sh).
+            if (pPatchesFrozen)
+            {
+                pW = f.p;
+            }
             dUx.copyTo(ux);
             dUy.copyTo(uy);
             dUz.copyTo(uz);
@@ -7249,7 +7381,7 @@ RunReport runInterFoamDevice(
                 }
             }
             const std::vector<std::vector<scalar>> pB =
-                staticPressureBoundary(f.p_rgh, stepRhoBnd, f.ghfBoundary);
+                pPatchesFrozen ? pBFrozen : staticPressureBoundary(f.p_rgh, stepRhoBnd, f.ghfBoundary);
             InterWriteState ws;
             ws.time = rep.time;
             ws.timeIndex = f.startTimeIndex + rep.steps;

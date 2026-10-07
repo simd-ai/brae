@@ -140,6 +140,7 @@ void holdArm(
     const std::vector<scalar>& ofE,
     const std::vector<scalar>& ofNut,
     scalar controlU,
+    scalar controlFloor,
     Diff& dUOut)
 {
     failures += brae::gatecheck::nonFinite("alpha", f.alpha1.internal);
@@ -176,7 +177,7 @@ void holdArm(
                             dE.rel() < B.epsilon);
     check("nut agrees with OpenFOAM's relatively", dN.rel() < B.nut);
     check("the control moves OpenFOAM's own U far more than this arm is from it",
-          controlU > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)) && controlU > scalar(1e-3));
+          controlU > scalar(1000)*std::fmax(dU.rel(), scalar(1e-14)) && controlU > controlFloor);
     dUOut = dU;
 }
 }   // namespace
@@ -200,7 +201,10 @@ int main(
     const std::string eulerDir = argv[6];
     const std::string profile = argv[7];
     // ...and that last one with two outer correctors, where it stops being a no-op (the script has why)
-    const bool eulerAlphaCNOuter = (profile == "eulerAlphaCNOuter");
+    // ...and that one RESTARTED from OpenFOAM's own write: alphaPhi0 is there, so alpha's flux is
+    // off-centred from the first step under an Euler momentum too (the script has why)
+    const bool eulerAlphaCNRestart = (profile == "eulerAlphaCNRestart");
+    const bool eulerAlphaCNOuter = (profile == "eulerAlphaCNOuter") || eulerAlphaCNRestart;
     const bool outer = (profile == "cnOuter") || eulerAlphaCNOuter;
     const bool full = (profile == "cnFull");
     // THE OTHER TWO CLOSURES under the same scheme, on the same tutorial: kOmegaSST, whose second
@@ -227,6 +231,8 @@ int main(
                      : (sst ? D_SST : les ? D_LES : restart ? D_RESTART : D_CN);
     std::printf("  profile: %s\n",
                 cnAlphaEuler ? "cnAlphaEuler -- default CrankNicolson 0.5, ddt(alpha) Euler"
+                : eulerAlphaCNRestart ? "eulerAlphaCNRestart -- default Euler, ddt(alpha) CrankNicolson 0.5, "
+                                        "nOuterCorrectors 2, RESTARTED from OpenFOAM's own write at t = 0.02"
                 : eulerAlphaCNOuter ? "eulerAlphaCNOuter -- default Euler, ddt(alpha) CrankNicolson 0.5, "
                                       "nOuterCorrectors 2"
                 : eulerAlphaCN ? "eulerAlphaCN -- default Euler, ddt(alpha) CrankNicolson 0.5"
@@ -282,6 +288,10 @@ int main(
     {
         check("the closure kept NO ddt0 field -- its fvm::ddt takes the DEFAULT, which is Euler here",
               !fin.turbulence.cn.ddt0K.exists);
+        // alphaRestart is the file's presence and nothing about ddt(rho,U): seen on the restart, and
+        // not on the cold start of the same profile
+        check("alphaRestart is what the start directory says under an Euler momentum",
+              fin.cnAlphaRestart == eulerAlphaCNRestart);
     }
     else if (restart)
     {
@@ -391,7 +401,9 @@ int main(
     const Diff dCtlU = compare(readVectorCells(eulerDir + "/U"), ofU);
     const Diff dCtlA = compare(readCells(eulerDir + "/alpha.water"), ofAlpha);
     std::printf("  CONTROL: %s, U relative %.4e, alpha %.4e\n",
-                eulerAlphaCNOuter ? "OpenFOAM all-Euler against OpenFOAM with ddt(alpha) CrankNicolson, two outer "
+                eulerAlphaCNRestart ? "OpenFOAM's restart against OpenFOAM's restart with alphaPhi0 removed -- "
+                                      "its first step not off-centred, the run brae made"
+                : eulerAlphaCNOuter ? "OpenFOAM all-Euler against OpenFOAM with ddt(alpha) CrankNicolson, two outer "
                                     "correctors each -- the answer of a loop that runs alpha on the raw flux"
                 : mixedDdt ? "OpenFOAM with BOTH entries CrankNicolson against OpenFOAM with them mixed -- "
                            "the answer brae gave while it ran the two under one scheme"
@@ -400,8 +412,13 @@ int main(
                           : "OpenFOAM under Euler against OpenFOAM under CrankNicolson",
                 (double)dCtlU.rel(), (double)dCtlA.linf);
 
+    // WHAT A CONTROL HAS TO MOVE to count as one: 1e-3 of OpenFOAM's own U where the control is another
+    // scheme over the whole run. The restart under an Euler momentum differs from its control in ONE step
+    // -- the first, off-centred or not -- and MEASURED 2026-10-07 OpenFOAM's two restarts end U 1.7389e-04
+    // and alpha 3.2920e-04 apart after the twenty; both arms sit 5e-15 from the oracle inside that.
+    const scalar controlFloor = eulerAlphaCNRestart ? scalar(1e-4) : scalar(1e-3);
     Diff dUHost;
-    holdArm("host:", fin, HB, ofAlpha, ofPrgh, ofU, ofKf, ofEf, ofNut, dCtlU.rel(), dUHost);
+    holdArm("host:", fin, HB, ofAlpha, ofPrgh, ofU, ofKf, ofEf, ofNut, dCtlU.rel(), controlFloor, dUHost);
 
     // THE DEVICE LOOP, on the same case from the same start, held to OpenFOAM by its OWN bounds
     int nDev = 0;
@@ -435,7 +452,7 @@ int main(
         failures += brae::gatecheck::compareSolves("device", rd.kSolves, ofK, nSteps, "k",
                                                    scalar(1e-9), scalar(1e-8));
         Diff dUDev;
-        holdArm("DEVICE:", dev, DB, ofAlpha, ofPrgh, ofU, ofKf, ofEf, ofNut, dCtlU.rel(), dUDev);
+        holdArm("DEVICE:", dev, DB, ofAlpha, ofPrgh, ofU, ofKf, ofEf, ofNut, dCtlU.rel(), controlFloor, dUDev);
     }
 
     std::printf("test_inter_cn_vs_openfoam: %d failures\n", failures);

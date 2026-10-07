@@ -385,13 +385,41 @@ AlphaFluxScheme parseAlphaDiv(const std::string& entry, const char* key)
                     "`Gauss interfaceCompression`. It is not ported.");
         }
     }
-    if (e.find("vanLeer") != std::string::npos)   return AlphaFluxScheme::vanLeer;
-    if (e.find("upwind")  != std::string::npos)   return AlphaFluxScheme::upwind;
-    if (e.find("interfaceCompression") != std::string::npos)
-        return AlphaFluxScheme::interfaceCompression;   // the host's; the device refuses it
-    if (e.find("linear")  != std::string::npos)   return AlphaFluxScheme::linear;
+    // WHOLE WORDS, IN THEIR PLACES: `Gauss <scheme>` and nothing after it. This matched by substring, in
+    // the order vanLeer, upwind, interfaceCompression, linear -- so `Gauss linearUpwind grad(alpha)` ran as
+    // central linear (the capital U misses `upwind`), `Gauss vanLeer01` and `Gauss limitedVanLeer 0 1` as
+    // vanLeer, `Gauss localBlended linear upwind` as upwind, each with nothing said. Every shipped tutorial
+    // writes one of the four forms below.
+    std::vector<std::string> tok;
+    {
+        std::istringstream in(e);
+        for (std::string w; in >> w;)
+        {
+            tok.push_back(w);
+        }
+    }
+    if (tok.size() == 2 && tok[0] == "Gauss")
+    {
+        if (tok[1] == "vanLeer")
+        {
+            return AlphaFluxScheme::vanLeer;
+        }
+        if (tok[1] == "upwind")
+        {
+            return AlphaFluxScheme::upwind;
+        }
+        if (tok[1] == "interfaceCompression")
+        {
+            return AlphaFluxScheme::interfaceCompression;   // the host's; the device refuses it
+        }
+        if (tok[1] == "linear")
+        {
+            return AlphaFluxScheme::linear;
+        }
+    }
     throw std::runtime_error(
-        std::string("brae interFoam: `") + key + " " + entry + "` is not ported.");
+        std::string("brae interFoam: `") + key + " " + entry + "` is not ported. brae has `Gauss vanLeer`, "
+        "`Gauss upwind`, `Gauss linear` and the PhiScheme `Gauss interfaceCompression` here.");
 }
 
 AlphaDdt parseAlphaDdt(const std::string& entry)
@@ -889,8 +917,30 @@ InterFields buildInterFields(const std::string&          caseDir,
                 "brae interFoam: fvSchemes names no `div(rhoPhi,U)`. interFoam's momentum convection "
                 "has no default to fall back to -- every shipped tutorial names one.");
         f.divRhoPhiU   = parseMomentumDiv(uEntry, f.divRhoPhiUCoeff);
-        f.divPhiAlpha  = parseAlphaDiv(entry("div(phi,alpha)",   "Gauss vanLeer"), "div(phi,alpha)");
-        f.divPhirbAlpha= parseAlphaDiv(entry("div(phirb,alpha)", "Gauss linear"),  "div(phirb,alpha)");
+        // THE TWO alpha FLUX SCHEMES, each by its own name, else the block's `default`, else nothing:
+        // alphaEqn.H:2-3 hands the names to fvc::flux, which asks mesh.divScheme(name), and
+        // schemesLookupDetail.C:76-89 answers the named entry, then a default that is not `none`, then a
+        // FatalIOError. A missing entry took `Gauss vanLeer` / `Gauss linear` here whatever the block
+        // said -- vanLeer under `default Gauss linear;`, and a run where OpenFOAM stops under `default none;`.
+        auto alphaEntry = [&](const std::string& key)
+        {
+            const std::string own = entry(key, "");
+            if (!own.empty())
+            {
+                return own;
+            }
+            const std::string dflt = entry("default", "");
+            if (dflt.empty() || dflt == "none")
+            {
+                throw std::runtime_error(
+                    "brae interFoam: fvSchemes' divSchemes names no `" + key + "` and has no default to take "
+                    "its place. alphaEqn.H asks for that name and OpenFOAM stops without it "
+                    "(schemesLookupDetail.C:76-89); a key written as a pattern is not resolved here.");
+            }
+            return dflt;
+        };
+        f.divPhiAlpha = parseAlphaDiv(alphaEntry("div(phi,alpha)"), "div(phi,alpha)");
+        f.divPhirbAlpha = parseAlphaDiv(alphaEntry("div(phirb,alpha)"), "div(phirb,alpha)");
 
         // EACH ddt BY THE NAME ITS CALL SITE ASKS FOR (ddtSchemeFor, schemesLookupDetail.C): OpenFOAM has no
         // "U scheme". fvm::ddt(rho, U) in UEqn.H looks up `ddt(rho,U)` (fvmDdt.C:83); fvc::ddtCorr(U, phi, Uf)
@@ -1212,6 +1262,33 @@ InterFields buildInterFields(const std::string&          caseDir,
         {
             f.aSolve = SmoothLinearSolve::read(*ad);
         }
+        // THE FINAL ENTRY. alphaEqn.H:122's alpha1Eqn.solve() looks the solver up by psi.select(final
+        // iteration), so the pre-solve of the final outer corrector takes `<alpha>Final`, and
+        // solution::solverDict is a plain subDict: OpenFOAM stops without one (solution.C:474-478). The
+        // tutorials write `"alpha.water.*"`, which answers for both names; a case with two blocks ran the
+        // first throughout, and one with a literal `alpha.water` alone ran where OpenFOAM stops.
+        //   BRAE_CONTROL_ALPHA_ENTRY_NON_FINAL=1: a gate's CONTROL, deliberately wrong -- `<alpha>` throughout.
+        static const bool alphaNonFinal = std::getenv("BRAE_CONTROL_ALPHA_ENTRY_NON_FINAL") != nullptr;
+        const FoamDict* adf = sv ? sv->subDict(f.alphaName + "Final") : nullptr;
+        f.aSolveFinal = (adf && !alphaNonFinal) ? SmoothLinearSolve::read(*adf) : f.aSolve;
+        if (f.alphaCtl.MULESCorr && !adf)
+        {
+            throw std::runtime_error(
+                "brae interFoam: `MULESCorr yes` solves an implicit alpha equation and fvSolution has no `solvers/"
+                + f.alphaName + "Final`. alpha1Eqn.solve() takes that entry on the final outer corrector "
+                "(fvMatrix.C:1536-1542) and OpenFOAM stops without it; the tutorials write `\"" + f.alphaName
+                + ".*\"` for both.");
+        }
+        if (f.alphaCtl.MULESCorr
+         && (f.aSolveFinal.solver != f.aSolve.solver || f.aSolveFinal.smoother != f.aSolve.smoother
+          || f.aSolveFinal.preconditioner != f.aSolve.preconditioner))
+        {
+            throw std::runtime_error(
+                "brae interFoam: fvSolution's `solvers/" + f.alphaName + "` and `" + f.alphaName + "Final` name "
+                "two different solvers (`" + f.aSolve.solver + " " + f.aSolve.smoother + "` and `"
+                + f.aSolveFinal.solver + " " + f.aSolveFinal.smoother + "`). brae takes each entry's "
+                "tolerances and counts on its own corrector; one method for the two.");
+        }
         // minIter: three tutorials name it for alpha (DTCHull, DTCHullMoving, electrostaticDeposition).
         // It forces a sweep on the steps where the pre-solve's initial residual is already under
         // tolerance, which moves alpha. The host pre-solve honours it (AlphaStepInput::minIterAlpha,
@@ -1409,19 +1486,44 @@ InterFields buildInterFields(const std::string&          caseDir,
         }
     }
 
-    // relaxationFactors/equations -- see InterFields::relaxEquationU.
+    // relaxationFactors/equations -- see InterFields::relaxEquationU. Each name through the dictionary's own
+    // lookup (a literal key, else the last regex key that matches, else `default`: solution.C:379-416), as
+    // the closure reads k's and omega's.
     {
         const FoamDict* rf = fvSolution.subDict("relaxationFactors");
         const FoamDict* eq = rf ? rf->subDict("equations") : nullptr;
-        if (eq)
+        const FoamDict* fl = rf ? rf->subDict("fields") : nullptr;
+        // THE FLAT FORM, `relaxationFactors { U 0.7; p_rgh 0.3; }`: OpenFOAM still honours it
+        // (solution.C:81-101 -- every entry an equation's, those starting with p or rho a field's too).
+        // brae saw no `equations` there and relaxed nothing.
+        if (rf && !eq && !fl && !rf->leaves.empty())
         {
-            // OpenFOAM resolves the name through the same regex machinery fvSolution uses everywhere;
-            // `".*" 1` matches U, and an explicit `U` entry wins over a `default`.
-            const scalar u   = eq->scalarOr("U", scalar(-1));
-            const scalar any = eq->scalarOr("\".*\"", scalar(-1));
-            const scalar def = eq->scalarOr("default", scalar(-1));
-            const scalar v = (u >= 0) ? u : ((any >= 0) ? any : def);
-            if (v >= 0) { f.relaxEquationU = true; f.relaxU = v; }
+            throw std::runtime_error(
+                "brae interFoam: fvSolution's relaxationFactors holds `" + rf->leaves.front().first + "` and "
+                "no `equations` or `fields` sub-dictionary -- the flat form OpenFOAM still reads "
+                "(solution.C:81-101). brae reads the two sub-dictionaries only.");
+        }
+        //   BRAE_CONTROL_RELAX_U_NAME_ONLY=1: a gate's CONTROL, deliberately wrong -- `U` for every corrector.
+        static const bool relaxNameOnly = std::getenv("BRAE_CONTROL_RELAX_U_NAME_ONLY") != nullptr;
+        const EquationRelax u = EquationRelax::read(eq, "U");
+        const EquationRelax uFinal = relaxNameOnly ? u : EquationRelax::read(eq, "UFinal");
+        f.relaxEquationU = u.on;
+        f.relaxU = u.factor;
+        f.relaxEquationUFinal = uFinal.on;
+        f.relaxUFinal = uFinal.factor;
+        // relaxationFactors/fields: pEqn.H:56 calls p_rgh.relax(), which asks for `p_rgh` -- `p_rghFinal` on
+        // the final outer corrector -- and relaxes the field against its previous outer corrector's when
+        // an entry or a `default` answers (GeometricField.C:1099-1114, solution.C:337-375). Neither loop
+        // relaxes a field. No shipped tutorial names one (motorBike's `fields {}` is empty); refused.
+        for (const char* name : {"p_rgh", "p_rghFinal"})
+        {
+            if (fl && (fl->found(name) || fl->found("default")))
+            {
+                throw std::runtime_error(
+                    std::string("brae interFoam: fvSolution's relaxationFactors/fields answers for `") + name
+                    + "`. pEqn.H:56 relaxes p_rgh by it against the previous outer corrector's field "
+                    "(GeometricField.C:1099-1114); the field relaxation is not ported.");
+            }
         }
     }
 
@@ -1651,6 +1753,28 @@ InterFields buildInterFields(const std::string&          caseDir,
         throw std::runtime_error(
             "brae interFoam: the case has an active fvOption AND an active MRF zone. Each is gated on "
             "its own tutorial and nothing holds the two together against OpenFOAM.");
+    // alphaRestart (createAlphaFluxes.H:10-11): alphaPhi0.<phase> is in the start directory. It is asked of
+    // the directory WHATEVER ddt(rho,U) names -- alphaEqn.H:36-45 ORs it into ddt(alpha)'s warm-up test, and
+    // the file is AUTO_WRITE, so every written time holds it. This was set inside the CrankNicolson-momentum
+    // block below alone: a restart under `ddt(alpha) CrankNicolson` and an Euler momentum ran its first step
+    // with the flux not off-centred. Either spelling of the file (POSIX.C:870-876 finds `.gz` too).
+    //   BRAE_CONTROL_ALPHA_RESTART_CN_MOMENTUM_ONLY=1: a gate's CONTROL, deliberately wrong -- the flag
+    //   under a CrankNicolson momentum alone, as it was.
+    {
+        static const bool momentumOnly = std::getenv("BRAE_CONTROL_ALPHA_RESTART_CN_MOMENTUM_ONLY") != nullptr;
+        const std::string group = f.alphaName.substr(f.alphaName.find('.') + 1);
+        f.cnAlphaRestart = false;
+        for (const std::string& nm : {"alphaPhi0." + group, std::string("alphaPhi0")})
+        {
+            f.cnAlphaRestart = f.cnAlphaRestart
+                            || std::filesystem::exists(startDir + "/" + nm)
+                            || std::filesystem::exists(startDir + "/" + nm + ".gz");
+        }
+        if (momentumOnly && f.ddtU != DdtScheme::CrankNicolson)
+        {
+            f.cnAlphaRestart = false;
+        }
+    }
     // CrankNicolson, what it is NOT ported with. Each is a different branch of the scheme or a
     // different consumer of it that no gate holds.
     if (f.ddtU == DdtScheme::CrankNicolson)
@@ -1701,9 +1825,6 @@ InterFields buildInterFields(const std::string&          caseDir,
         // with the state removed -- U 5.2796e-03 apart in U and 7.2856e-03 in alpha over 2264 of 2268
         // cells, against which both arms sit at the round-off floor (host U 1.2975e-14, device 3.6293e-12).
         f.cnRestart.dir = startDir;
-        f.cnAlphaRestart =
-            std::filesystem::exists(startDir + "/alphaPhi0." + f.alphaName.substr(f.alphaName.find('.') + 1))
-         || std::filesystem::exists(startDir + "/alphaPhi0");
         // ...AND NOT ACROSS A COUPLED PAIR. The device loop keeps the coupled faces' flux in arrays of
         // their own -- dPhiOOIf beside dPhiOOI, ddtCorrPhiIf beside ddtCorrPhi (inter_driver_device.cu) --
         // because a cyclic patch is not in the boundary-face array; the seed above fills the boundary

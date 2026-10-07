@@ -310,6 +310,15 @@ struct BiCGGraphCache
     // destroyed solver's blocks straight back to the next one, so all of these can match while the
     // captured graph points at memory that changed owner. Bumped on solver teardown only.
     int generation = -1;
+    // ...and A COUPLED PAIR'S BUFFERS, which the captured products read where the caller left them:
+    // cycOwn/cycNbr/cycCoeff/cycJump, amiOwn/amiOff/amiNbr/amiW/amiIfc and pairRank, with the three counts
+    // that size their launches. A moving cyclicAMI's stencil is rebuilt into fresh buffers at every move
+    // (refreshDeviceCyclicAfterMove), so a replay read the previous step's, freed. MEASURED 2026-10-07 on
+    // RAS/mixerVesselAMI with `PBiCGStab` on U: the fourth step stopped on an illegal memory access where
+    // the plain loop (BRAE_BICG_HOST_LOOP=1) ran. No shipped tutorial pairs the two.
+    //   BRAE_CONTROL_BICG_GRAPH_PAIR_UNKEYED=1: a gate's CONTROL, deliberately wrong -- the key without them.
+    const void* pair[10] = {};
+    int nCyc = -1, nAmi = -1, nPairRanks = -1;
     // ...and the Neumann series' degree, because the captured body unrolls it: a replay under a
     // different degree would run the degree it was captured with, silently.
     int polyDeg = -1;
@@ -464,6 +473,16 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
     const int   diluLv   = useDilu ? precon->levels() : -1;
     const int   epoch    = deviceReductionScratchEpoch();
     const void* amgCD    = (amg && !amg->level.empty()) ? (const void*)amg->level.front().cDiag.data() : nullptr;
+    static const bool pairUnkeyed = std::getenv("BRAE_CONTROL_BICG_GRAPH_PAIR_UNKEYED") != nullptr;
+    const void* pairNow[10] =
+    {
+        A.cycOwn, A.cycNbr, A.cycCoeff, A.cycJump, A.amiOwn, A.amiOff, A.amiNbr, A.amiW, A.amiIfc, A.pairRank
+    };
+    bool pairMoved = c.nCyc != A.nCyc || c.nAmi != A.nAmi || c.nPairRanks != A.nPairRanks;
+    for (int i = 0; i < 10; ++i)
+    {
+        pairMoved = pairMoved || c.pair[i] != pairNow[i];
+    }
     const bool recapture = !c.exec || c.key != psi.data() || c.tol != tol || c.relTol != relTol
                         || c.maxIter != maxIter || c.minIter != minIter || c.precon != (useDilu ? (const void*)precon : nullptr)
                         || c.polyDeg != polyDeg
@@ -475,6 +494,7 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
                         || c.owner != (const void*)A.owner || c.nC != nC || c.addressingId != A.addressingId
                         || c.diluRD != diluRD || c.diluLevels != diluLv
                         || c.scratchEpoch != epoch || c.amg != (const void*)amg || c.amgCoarseDiag != amgCD
+                        || (pairMoved && !pairUnkeyed)
                         || c.generation != deviceGraphGeneration();
     if (recapture)
     {
@@ -549,6 +569,13 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
         c.polyDeg = polyDeg;
         c.owner = A.owner; c.nC = nC; c.addressingId = A.addressingId; c.diluRD = diluRD; c.diluLevels = diluLv; c.scratchEpoch = epoch; c.generation = deviceGraphGeneration();
         c.amg = amg; c.amgCoarseDiag = amgCD;
+        for (int i = 0; i < 10; ++i)
+        {
+            c.pair[i] = pairNow[i];
+        }
+        c.nCyc = A.nCyc;
+        c.nAmi = A.nAmi;
+        c.nPairRanks = A.nPairRanks;
     }
     static bool announced = false;
     if (!announced)

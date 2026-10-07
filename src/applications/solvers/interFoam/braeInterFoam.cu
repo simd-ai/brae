@@ -182,7 +182,8 @@
 //
 // BEGIN DEVICE REFUSALS
 //   device_gamg_smootherDILU device_gradLsq
-//   device_refine_motion device_eulerU_cnAlpha_moving
+//   device_refine_motion device_eulerU_cnAlpha_moving device_eulerU_cnAlpha_refining
+//   device_prevCorr_pair
 //   device_gradUCache device_gradUCacheKEpsilon device_gradUCacheLimited device_gradUCacheCoupled
 // END DEVICE REFUSALS
 #include "device_schedule.cuh"
@@ -232,9 +233,47 @@ int main(int argc, char** argv)
         using namespace brae::cpu::interFoam;
 
         const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
-        const scalar endTime  = controlDict.scalarOr("endTime",  scalar(0));
-        const scalar deltaT0  = controlDict.scalarOr("deltaT",   scalar(1e-3));
-        const std::string startFrom = controlDict.wordOr("startFrom", "startTime");
+        // THE ENTRIES Time READS, AS Time READS THEM (Time.C:146-190, TimeIO.C:268-356). `deltaT` is
+        // mandatory -- it defaulted to 1e-3 here; `startFrom` defaults to latestTime -- it defaulted to
+        // startTime, so a case without the entry restarted from 0 over its own output; any other word than
+        // the three stops OpenFOAM -- it ran as startTime; `startTime` is mandatory under `startFrom
+        // startTime`; and `stopAt` other than endTime ends the run at a write or at once (Time.C:1163-1181)
+        // -- it was not read at all. That last one is refused: the loops stop at endTime alone.
+        if (!controlDict.found("deltaT"))
+        {
+            throw std::runtime_error(
+                "brae interFoam: system/controlDict has no `deltaT`. Time reads it with no default "
+                "(TimeIO.C:272-275) and OpenFOAM stops.");
+        }
+        const std::string stopAt = controlDict.wordOr("stopAt", "endTime");
+        if (stopAt != "endTime")
+        {
+            throw std::runtime_error(
+                "brae interFoam: system/controlDict sets `stopAt " + stopAt + "`. Time then ends the run at "
+                "the next write, or at once (TimeIO.C:340-356, Time.C:1163-1181); the loops here stop at "
+                "endTime alone. Only `stopAt endTime` is ported.");
+        }
+        if (controlDict.found("stopAt") && !controlDict.found("endTime"))
+        {
+            throw std::runtime_error(
+                "brae interFoam: system/controlDict sets `stopAt endTime` and no `endTime`; Time reads it with "
+                "no default there (TimeIO.C:344-347) and OpenFOAM stops.");
+        }
+        const scalar endTime = controlDict.scalarOr("endTime", scalar(0));
+        const scalar deltaT0 = controlDict.scalarOr("deltaT", scalar(0));
+        const std::string startFrom = controlDict.wordOr("startFrom", "latestTime");
+        if (startFrom != "startTime" && startFrom != "firstTime" && startFrom != "latestTime")
+        {
+            throw std::runtime_error(
+                "brae interFoam: system/controlDict sets `startFrom " + startFrom + "`; expected startTime, "
+                "firstTime or latestTime (Time.C:184-190).");
+        }
+        if (startFrom == "startTime" && !controlDict.found("startTime"))
+        {
+            throw std::runtime_error(
+                "brae interFoam: system/controlDict sets `startFrom startTime` and no `startTime`; Time reads "
+                "it with no default there (Time.C:155-158) and OpenFOAM stops.");
+        }
         // `startFrom latestTime` IS HONOURED, and it used to be read and then thrown away: anything other
         // than `startTime` fell to 0, so the standard way to CONTINUE a run silently restarted it from the
         // beginning. resolveStartTime is the resolution the other drivers already shared; the probe is

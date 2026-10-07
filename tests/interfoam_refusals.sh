@@ -206,6 +206,40 @@ echo "== brae interFoam: what it refuses, and what it must not =="
 
 arm baseline                runs    -                        "" true
 
+# THE CASE READER'S ENTRIES THAT STOOD IN FOR THE CASE'S OWN (the review of 2026-10-07). Each was read by a
+# substring, a default or one name where OpenFOAM reads a whole word, no default or another name; each arm
+# is the form that used to run as something else, and beside it the form that must still run.
+# div(phi,alpha) and div(phirb,alpha), by whole words and by the block's default (alphaEqn.H:2-3,
+# schemesLookupDetail.C:76-89): `linearUpwind` ran as central linear, `vanLeer01` as vanLeer, and a missing
+# entry took a scheme of brae's choosing where OpenFOAM takes the default or stops.
+ADIV="python3 -c \"import re, sys; p = 'system/fvSchemes'; t = open(p).read(); t2 = re.sub(r'(\n\s*' + re.escape(sys.argv[1]) + r')\s[^;]*;', (r'\1 ' + sys.argv[2] + ';') if sys.argv[2] else '', t); assert t2 != t; t2 = t2.replace('divSchemes\n{', 'divSchemes\n{\n    ' + sys.argv[3]) if len(sys.argv) > 3 else t2; open(p, 'w').write(t2)\""
+arm alphaDiv_linearUpwind   refused "is not ported. brae has"   "" "$ADIV 'div(phi,alpha)' 'Gauss linearUpwind grad(alpha.water)'"
+arm alphaDiv_vanLeer01      refused "is not ported. brae has"   "" "$ADIV 'div(phi,alpha)' 'Gauss vanLeer01'"
+arm alphaDiv_blended        refused "is not ported. brae has"   "" "$ADIV 'div(phirb,alpha)' 'Gauss localBlended linear upwind'"
+arm alphaDiv_missing        refused "has no default to take"    "" "$ADIV 'div(phirb,alpha)' ''"
+arm alphaDiv_missing_none   refused "has no default to take"    "" "$ADIV 'div(phirb,alpha)' '' 'default none;'"
+arm alphaDiv_from_default   runs    -                           "" "$ADIV 'div(phirb,alpha)' '' 'default Gauss linear;'"
+# relaxationFactors: a field factor that answers for p_rgh (pEqn.H:56's p_rgh.relax()) and the flat form
+# (solution.C:81-101) are refused; an empty `fields {}` beside the equations, as RAS/motorBike writes, runs
+RLX="python3 -c \"import re, sys; p = 'system/fvSolution'; t = open(p).read(); t2 = re.sub(r'relaxationFactors\s*\{.*?\n\}', 'relaxationFactors\n{\n' + sys.argv[1] + '\n}', t, flags=re.S); assert t2 != t; open(p, 'w').write(t2)\""
+arm relax_fields_prgh       refused "relaxationFactors/fields answers" "" "$RLX '    fields { p_rgh 0.5; } equations { \".*\" 1; }'"
+arm relax_fields_default    refused "relaxationFactors/fields answers" "" "$RLX '    fields { default 0.5; } equations { \".*\" 1; }'"
+arm relax_flat              refused "the flat form"             "" "$RLX '    U 0.7;'"
+arm relax_fields_empty      runs    -                           "" "$RLX '    fields { } equations { \".*\" 1; }'"
+# `MULESCorr yes` without a `<alpha>Final` entry: alpha1Eqn.solve() takes it on the final outer corrector
+# (fvMatrix.C:1536-1542) and OpenFOAM stops; a literal `alpha.water` alone ran
+arm alphaFinal_missing      refused "has no \`solvers/alpha.waterFinal\`" "" "sed -i 's/\"alpha.water.\\*\"/alpha.water/' system/fvSolution; grep -q '^    alpha.water$' system/fvSolution"
+# controlDict, as Time reads it (Time.C:146-190, TimeIO.C:268-356)
+arm stopAt_nextWrite        refused "Only \`stopAt endTime\` is ported" "" "sed -i 's/^stopAt .*/stopAt          nextWrite;/' system/controlDict"
+arm startFrom_unknown       refused "expected startTime, firstTime or latestTime" "" "sed -i 's/^startFrom .*/startFrom       beginning;/' system/controlDict"
+arm startTime_missing       refused "no \`startTime\`"          "" "sed -i '/^startTime /d' system/controlDict"
+arm deltaT_missing          refused "has no \`deltaT\`"         "" "sed -i '/^deltaT /d' system/controlDict"
+# ...and no `startFrom` at all is latestTime, OpenFOAM's default: on a case with nothing written, the start
+arm startFrom_absent        runs    -                           "" "sed -i '/^startFrom /d' system/controlDict"
+# a Switch read as OpenFOAM's Switch (Switch.C:87-137): `y` is yes, and a word that is not one stops the run
+arm adjustTimeStep_y        runs    -                           "" "sed -i 's/^adjustTimeStep .*/adjustTimeStep  y;/' system/controlDict"
+arm adjustTimeStep_typo     refused "Unknown switch"            "" "sed -i 's/^adjustTimeStep .*/adjustTimeStep  yse;/' system/controlDict"
+
 # FROZEN PER-STEP BOUNDARY CONDITIONS. The shared factory ACCEPTS fixedMean, fanPressure,
 # codedFixedValue and codedMixed on the strength of a per-step update its own comment promises, and
 # interFoam maintains NONE of them -- no collectFixedMean, no collectFanPressure, no setupCodedBCs
@@ -311,6 +345,12 @@ arm mrf_omegaTable          refused "Function1 of type \`table\`" "" "$ZONE; ${M
 arm mrf_noOmega             refused "has no \`omega\` entry"  "" "$ZONE; ${MRFD/OMEGA/}"
 arm mrf_inactive            runs    -                        "" "printf '%s\nMRF1 { cellZone all; active no; origin (0 0 0); axis (0 0 1); omega 10; }\n' '$HDR' > constant/MRFProperties"
 arm mrf_empty               runs    -                        "" "printf '%s\n' '$HDR' > constant/MRFProperties"
+# `active` is a Switch (MRFZone.C:553): `y` is yes -- read by hand it dropped the zone, and this arm ran; with
+# the zone on it reaches the refusal of a cellZone that is not there
+arm mrf_active_y            refused "is not in constant/polyMesh/cellZones" "" "printf '%s\nMRF1 { cellZone all; active y; origin (0 0 0); axis (0 0 1); omega 10; }\n' '$HDR' > constant/MRFProperties"
+# `origin` and `axis` have no default (MRFZone.C:563-564); a zone without `axis` rotated about z
+arm mrf_noAxis              refused "has no \`axis\` of three components" "" "$ZONE && printf '%s\nMRF1 { cellZone rotor; origin (0 0 0); omega 10; }\n' '$HDR' > constant/MRFProperties"
+arm mrf_noOrigin            refused "has no \`origin\` of three components" "" "$ZONE && printf '%s\nMRF1 { cellZone rotor; axis (0 0 1); omega 10; }\n' '$HDR' > constant/MRFProperties"
 # MRF BESIDE REFINEMENT, both directions. The zone's face lists are REBUILT through a change now
 # (MRF::update, mirroring MRFZone::update -> setMRFFaces), gated end to end by
 # tests/interfoam_amr_mrf_vs_openfoam.sh on mixerVessel2D -- so the refusal that named this case is gone
@@ -945,6 +985,13 @@ if [ $HAVE_GPU = 1 ]; then
     # `les` (the closure handed no pair read k 4.3e-01, nut 2.8e-01). A blanket refusal coming back
     # fails this arm.
     arm device_les_cyclic   runs    -                              "-device" "$BLESC"
+    # ...and `alphaApplyPrevCorr yes` across the pair is refused on the device: its cache of the previous
+    # correction holds the internal and the boundary faces, the pair's being in neither, where OpenFOAM limits
+    # and integrates a coupled patch like any other (CMULESTemplates.C:327-338). The host loop carries every
+    # patch and runs it. The baffle case sets `MULESCorr yes` itself.
+    PREVC="sed -i 's/^\( *\)MULESCorr  *yes;/\1MULESCorr       yes;\n\1alphaApplyPrevCorr yes;/' system/fvSolution"
+    arm device_prevCorr_pair refused "on a mesh with a coupled pair" "-device" "$PREVC; grep -q alphaApplyPrevCorr system/fvSolution"
+    arm prevCorr_pair_host  runs    -                              "" "$PREVC; grep -q alphaApplyPrevCorr system/fvSolution"
     # a RAS closure on a MOVING mesh is refused on the device: its closure's input carries neither the
     # old volumes nor the mesh flux the host closure takes (moving_SST above runs the same staging on
     # the host). Found by auditing hand-built control structs, not by a case -- no runnable tutorial
@@ -1111,6 +1158,11 @@ if [ $HAVE_GPU = 1 ]; then
     arm mesh_dynamicRefine_device refused "Entry 'correctFluxes' not found in dictionary" "-device" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
     arm device_refine_runs  runs    -                         "-device" "$REFDICT '' > constant/dynamicMeshDict"
     arm device_refine_motion refused "a motion solver on a 2-D mesh" "-device" "$REFDICT 'solvers { VF { motionSolverLibs (fvMotionSolvers); motionSolver solidBody; solidBodyMotionFunction oscillatingLinearMotion; amplitude (0.1 0 0); omega 6.283185307179586; } }' > constant/dynamicMeshDict"
+    # ...and `ddt(alpha) CrankNicolson` under an Euler momentum on a mesh that REFINES and has no motion of
+    # its own: mesh.dynamic() all the same, which is what ddtCorr branches on. The refusal tested the motion
+    # solver's pointer, which such a mesh does not have, and the case ran with nothing said.
+    arm device_eulerU_cnAlpha_refining refused "under an Euler ddt(rho,U) on a mesh that moves" "-device" \
+        "$REFDICT '' > constant/dynamicMeshDict; ddtblock 'default Euler;' 'ddt(alpha) CrankNicolson 0.9;'"
     # ALPHA'S CrankNicolson UNDER AN Euler MOMENTUM, where the device loop would run alpha on the raw flux: more
     # than one outer corrector (the host loop runs it; with one corrector the two fluxes are one and the device runs)
     CNOUTER="ddtblock 'default Euler;' 'ddt(alpha) CrankNicolson 0.9;'"

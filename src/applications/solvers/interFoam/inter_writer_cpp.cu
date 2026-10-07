@@ -1745,7 +1745,17 @@ bool InterWriter::binaryFile(const std::string& className) const
     {
         return false;
     }
-    const bool field = className.size() > 5 && className.compare(className.size() - 5, 5, "Field") == 0;
+    // ...and a field's INTERNAL part alone -- `volScalarField::Internal`, which is V0 (fvMesh.C:306-318 reads it
+    // back whenever the file is there): a DimensionedField, written in the time's format like any field. Its
+    // name does not END in `Field`, so its header said ascii above a list written as bytes.
+    const auto endsWith = [&](const std::string& tail)
+    {
+        return className.size() > tail.size()
+            && className.compare(className.size() - tail.size(), tail.size(), tail) == 0;
+    };
+    //   BRAE_CONTROL_WRITE_V0_ASCII_HEADER=1: a gate's CONTROL, deliberately wrong -- `Field` alone.
+    static const bool internalAsText = std::getenv("BRAE_CONTROL_WRITE_V0_ASCII_HEADER") != nullptr;
+    const bool field = endsWith("Field") || (endsWith("Field::Internal") && !internalAsText);
     const bool geometric = className.compare(0, 3, "vol") == 0 || className.compare(0, 7, "surface") == 0
                         || className.compare(0, 5, "point") == 0;
     return field && (geometric || className == "vectorField");

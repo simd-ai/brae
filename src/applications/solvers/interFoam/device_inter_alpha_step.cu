@@ -488,7 +488,14 @@ void deviceInterAlphaStep(
         // alphaEqn.H:228-236: talphaPhi1Corr0 = alphaPhi10 - talphaPhi1Corr0, i.e. the compression the
         // correctors ended up applying on top of the upwind flux. The `else` clears it, which here is
         // the caller's buffers staying empty because nothing above ever filled them.
-        if (ctl.alphaApplyPrevCorr)
+        // UNDER `alphaApplyPrevCorr && MULESCorr`, as :228 has it and as the guard at the top of this
+        // function was narrowed to: under the switch alone this subtracted from the empty cache.
+        // MEASURED 2026-10-07 on laminar/capillaryRise with `alphaApplyPrevCorr yes` added (it has no
+        // MULESCorr): the first step stopped on an illegal memory access where the host loop and
+        // OpenFOAM run it as the no-op it is.
+        //   BRAE_CONTROL_PREVCORR_WITHOUT_MULES=1: a gate's CONTROL, deliberately wrong -- the switch alone.
+        static const bool prevCorrWithoutMules = std::getenv("BRAE_CONTROL_PREVCORR_WITHOUT_MULES") != nullptr;
+        if (ctl.alphaApplyPrevCorr && (ctl.MULESCorr || prevCorrWithoutMules))
         {
             DeviceBuffer<scalar> tInt, tBnd;
             deviceSubtractFaces(nIf, alphaPhiInt, *ctl.prevCorrInt, tInt);

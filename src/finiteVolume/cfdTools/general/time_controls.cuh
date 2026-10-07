@@ -95,8 +95,9 @@ struct TimeControls
     static TimeControls read(const FoamDict& controlDict)
     {
         TimeControls tc;
-        const std::string a = controlDict.wordOr("adjustTimeStep", "no");
-        tc.adjustTimeStep = (a == "yes" || a == "true" || a == "on" || a == "1");
+        // a Switch (readTimeControls.H:35-36): `y`, `t` and `any` are true and an unknown word stops the
+        // run. Read by hand, anything but yes/true/on/1 ran a fixed step with nothing said.
+        tc.adjustTimeStep = controlDict.switchOr("adjustTimeStep", false);
         tc.maxCo     = controlDict.scalarOr("maxCo", 1.0);
         tc.maxDeltaT = controlDict.scalarOr("maxDeltaT", timeControlGreat);
         return tc;

@@ -214,8 +214,8 @@ OptionList read(const std::string& caseDir, const PrimitiveMesh& m)
         o.name = entry.first;
         const FoamDict& d = entry.second;
         o.type = d.wordOr("type", "");
-        const std::string act = d.wordOr("active", "true");
-        o.active = !(act == "false" || act == "no" || act == "off" || act == "0");
+        // a Switch (fvOption.C:72): read by hand, `active none;` or `n` left the option on
+        o.active = d.switchOr("active", true);
         if (!o.active)
         {
             list.options.push_back(o);

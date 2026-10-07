@@ -870,6 +870,16 @@ RunReport runInterFoam(
         }
     }
 
+    // p's PATCH VALUES UNDER frozenFlow, as the start left them -- the device loop's note has the reading
+    // and the measurement (inter_driver_device.cu, at the same place).
+    //   BRAE_CONTROL_FROZEN_FLOW_P_REBUILT=1: a gate's CONTROL, deliberately wrong -- rebuilt at the write.
+    static const bool frozenPRebuilt = std::getenv("BRAE_CONTROL_FROZEN_FLOW_P_REBUILT") != nullptr;
+    const bool pPatchesFrozen = f.pimple.frozenFlow && !frozenPRebuilt;
+    std::vector<std::vector<scalar>> pBFrozen;
+    if (pPatchesFrozen)
+    {
+        pBFrozen = staticPressureBoundary(f.p_rgh, f.rhoBnd, f.ghfBoundary);
+    }
     for (label step = 0; step < nSteps; ++step)
     {
         // Time::run() (Time.C:1000), and it sits HERE -- above CourantNo.H and setDeltaT.H -- so the
@@ -1208,16 +1218,19 @@ RunReport runInterFoam(
                     ai.alphaApplyPrevCorr = f.alphaCtl.alphaApplyPrevCorr;
                     ai.alpha2BndOut = &f.alpha2Bnd;
                     // the case's own tolerances, where a struct default of 1e-8 used to stand
-                    ai.tolAlpha = f.aSolve.tol;
-                    ai.relTolAlpha = f.aSolve.relTol;
-                    ai.maxIterAlpha = f.aSolve.maxIter;
-                    ai.minIterAlpha = f.aSolve.minIter;
+                    // the entry of THIS outer corrector: `<alpha>Final` on the last (InterFields::aSolveFinal)
+                    const InterFields::AlphaLinearSolve& aSel =
+                        (outerIndex >= lc.nOuterCorrectors - 1) ? f.aSolveFinal : f.aSolve;
+                    ai.tolAlpha = aSel.tol;
+                    ai.relTolAlpha = aSel.relTol;
+                    ai.maxIterAlpha = aSel.maxIter;
+                    ai.minIterAlpha = aSel.minIter;
                     ai.gradAlpha1 = f.gradAlpha1;
                     ai.gradAlpha2 = f.gradAlpha2;
                     // ...and the case's own smoother, which the host can now run
-                    ai.smoothSolver = f.aSolve.gaussSeidel();
-                    ai.symmetric = (f.aSolve.smoother == "symGaussSeidel");
-                    ai.nSweeps = f.aSolve.nSweeps;
+                    ai.smoothSolver = aSel.gaussSeidel();
+                    ai.symmetric = (aSel.smoother == "symGaussSeidel");
+                    ai.nSweeps = aSel.nSweeps;
                     ai.solveLog = &rep.alphaSolves;
                     // A GATE'S CONTROL, read here as BRAE_PTOL is and announced every step it is on:
                     // see AlphaStepInput::controlPrevCorrOutletOnPhiCN. It makes the answer WRONG.
@@ -1563,7 +1576,12 @@ RunReport runInterFoam(
                     mi.rDeltaT = rDeltaTFor("ueqn");
                     mi.scheme = f.divRhoPhiU;
                     mi.schemeCoeff = f.divRhoPhiUCoeff;
-                    mi.relaxEquationU = f.relaxEquationU; mi.relaxU = f.relaxU;
+                    // the factor by the name of this outer corrector (InterFields::relaxEquationUFinal)
+                    {
+                        const bool finalOuterU = (outerIndex >= lc.nOuterCorrectors - 1);
+                        mi.relaxEquationU = finalOuterU ? f.relaxEquationUFinal : f.relaxEquationU;
+                        mi.relaxU = finalOuterU ? f.relaxUFinal : f.relaxU;
+                    }
                     // laplacianSchemes' default, for the viscous term's fvm::laplacian(rho*nuEff, U)
                     mi.correctedLaplacian = f.laplacianScheme.corrected;
                     mi.nonOrthCoeffs = f.laplacianScheme.nonOrthCoeffs;
@@ -1905,7 +1923,7 @@ RunReport runInterFoam(
                     if (writer && writeNow)
                     {
                         const std::vector<std::vector<scalar>> pB =
-                            staticPressureBoundary(f.p_rgh, f.rhoBnd, f.ghfBoundary);
+                            pPatchesFrozen ? pBFrozen : staticPressureBoundary(f.p_rgh, f.rhoBnd, f.ghfBoundary);
                         InterWriteState ws;
                         ws.time = rep.time;
                         ws.timeIndex = f.startTimeIndex + rep.steps;

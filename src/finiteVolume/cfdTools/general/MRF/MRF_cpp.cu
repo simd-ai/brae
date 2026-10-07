@@ -12,14 +12,20 @@ namespace MRF {
 
 namespace {
 
-bool isOn(const std::string& s)
+// `origin` and `axis` are read with get<vector> and no default (MRFZone.C:563-564): a zone without one
+// stops OpenFOAM. They defaulted to (0 0 0) and (0 0 1) here, so such a zone rotated about z.
+vector requiredVector(
+    const FoamDict& mrf,
+    const std::string& zone,
+    const char* name)
 {
-    return s == "yes" || s == "true" || s == "on" || s == "1";
-}
-
-vector asVector(const std::vector<scalar>& a, const vector& dflt)
-{
-    if (a.size() < 3) return dflt;
+    const std::vector<scalar> a = mrf.scalarListOr(name, {});
+    if (a.size() != 3)
+    {
+        throw std::runtime_error(
+            "brae MRF: zone `" + zone + "` has no `" + name + "` of three components. OpenFOAM reads it "
+            "with no default (MRFZone.C:563-564) and stops.");
+    }
     return vector{a[0], a[1], a[2]};
 }
 
@@ -49,7 +55,8 @@ std::vector<ZoneSpec> readMRFProperties(const std::string& constantDir)
     {
         const FoamDict& mrf = s.second;
         ZoneSpec z;
-        z.active = isOn(mrf.wordOr("active", "yes"));
+        // a Switch (MRFZone.C:553): read by hand, `active y;` dropped the zone
+        z.active = mrf.switchOr("active", true);
         if (!z.active) continue;
         z.cellZone = mrf.wordOr("cellZone", "");
         // omega IS A Function1 (MRFZone.C, `omega_.reset(Function1<scalar>::New("omega", coeffs_,
@@ -107,8 +114,8 @@ std::vector<ZoneSpec> readMRFProperties(const std::string& constantDir)
                     "is mandatory there (MRFZone.C) and stops; brae used to run the zone at omega 0.");
             }
         }
-        z.axis     = asVector(mrf.scalarListOr("axis", {}), vector{0, 0, 1});
-        z.origin   = asVector(mrf.scalarListOr("origin", {}), vector{0, 0, 0});
+        z.axis = requiredVector(mrf, s.first, "axis");
+        z.origin = requiredVector(mrf, s.first, "origin");
         z.nonRotatingPatches = mrf.wordListOr("nonRotatingPatches", {});
         out.push_back(z);
     }

@@ -861,21 +861,24 @@ void deviceMulesLimiterCorr(
                 lambdam.data(), lambdap.data(), lambdaInt.data());
             ckM(cudaGetLastError(), "CMULES iteration, faces");
         }
+        // the pair's faces whatever else the mesh has (CMULESTemplates.C:516-536 limits a coupled patch on
+        // every iteration): nested under the boundary-face branch, a mesh whose patches are all coupled
+        // kept lambda 1 on every pair face. The explicit limiter above always had them outside.
+        if (nIfC > 0)
+        {
+            iterIfFaceCorrKernel<<<nBlocks(nIfC), TPB>>>(
+                nIfC, cyc->ownCell.data(), phiCorrIf->data(),
+                lambdam.data(), lambdap.data(), lambdaIf->data());
+            ckM(cudaGetLastError(), "CMULES iteration, interface face");
+            DeviceBuffer<scalar> snap(static_cast<std::size_t>(nIfC));
+            ckM(cudaMemcpy(snap.data(), lambdaIf->data(), sizeof(scalar)*nIfC,
+                           cudaMemcpyDeviceToDevice), "CMULES lambda snapshot");
+            syncIfLambdaKernel<<<nBlocks(nIfC), TPB>>>(
+                nIfC, cyc->twin.data(), snap.data(), lambdaIf->data());
+            ckM(cudaGetLastError(), "CMULES sync, interface");
+        }
         if (nBoundaryFaces > 0)
         {
-            if (nIfC > 0)
-            {
-                iterIfFaceCorrKernel<<<nBlocks(nIfC), TPB>>>(
-                    nIfC, cyc->ownCell.data(), phiCorrIf->data(),
-                    lambdam.data(), lambdap.data(), lambdaIf->data());
-                ckM(cudaGetLastError(), "CMULES iteration, interface face");
-                DeviceBuffer<scalar> snap(static_cast<std::size_t>(nIfC));
-                ckM(cudaMemcpy(snap.data(), lambdaIf->data(), sizeof(scalar)*nIfC,
-                               cudaMemcpyDeviceToDevice), "CMULES lambda snapshot");
-                syncIfLambdaKernel<<<nBlocks(nIfC), TPB>>>(
-                    nIfC, cyc->twin.data(), snap.data(), lambdaIf->data());
-                ckM(cudaGetLastError(), "CMULES sync, interface");
-            }
             iterBoundaryCorrKernel<<<nBlocks(nBoundaryFaces), TPB>>>(
                 nBoundaryFaces, dm.bndCell.data(), bndFlag.data(),
                 phiBnd.data(), phiCorrBnd.data(), lambdam.data(), lambdap.data(), lambdaBnd.data());

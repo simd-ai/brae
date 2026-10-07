@@ -281,12 +281,12 @@ PYEOF
 # under adjustTimeStep, and brae does not read that file at all.
 restartFrom()
 {
-    local profile="$1" mode="$2"
-    local B="$W/$profile" C="$W/restart_$mode"
+    local profile="$1" mode="$2" tag="${3:-restart}"
+    local B="$W/$profile" C="$W/${tag}_$mode"
     rm -rf "$C"
     cp -r "$B" "$C" || return 1
     rm -f "$C"/log.interFoam
-    END="$END" MODE="$mode" python3 - "$C" <<'RSTEOF' || { echo "FAIL: staging restart_$mode"; return 1; }
+    END="$END" MODE="$mode" PROFILE="$profile" python3 - "$C" <<'RSTEOF' || { echo "FAIL: staging ${tag}_$mode"; return 1; }
 import glob, os, re, sys
 d = sys.argv[1]
 t = os.path.join(d, os.environ['END'])
@@ -305,6 +305,10 @@ state = sorted(os.path.basename(f) for f in
              + glob.glob(t + '/*_0'))
 want = sorted(['U_0', 'alphaPhi0.water', 'ddt0(rho,U)', 'ddt0(rho,epsilon)', 'ddt0(rho,k)',
                'ddtCorrDdt0(U)', 'ddtCorrDdt0(phi)', 'epsilon_0', 'k_0', 'phi_0'])
+# ...and under an EULER default with `ddt(alpha) CrankNicolson`, alphaPhi0 alone: no term keeps a ddt0 and
+# no field an old-old level, so the file whose presence is alphaRestart is all the state there is
+if os.environ['PROFILE'] == 'eulerAlphaCNOuter':
+    want = ['alphaPhi0.water']
 assert state == want, 'OpenFOAM wrote %s of the scheme state, not %s' % (state, want)
 if mode == 'cold':
     for f in state:
@@ -320,24 +324,24 @@ if mode == 'zeroAlphaPhi':
     open(p, 'w').write(s)
 RSTEOF
     local key
-    key=$(oracleKey "$C" "interfoam_cn" "restart_$mode" "$STEPS" "$DT")
+    key=$(oracleKey "$C" "interfoam_cn" "${tag}_$mode" "$STEPS" "$DT")
     if oracleRestore "$C" "$key" "$REND"; then
-        echo "OpenFOAM's restart to t = $REND reused from the oracle cache   [restart_$mode]"
+        echo "OpenFOAM's restart to t = $REND reused from the oracle cache   [${tag}_$mode]"
         return 0
     fi
     ( cd "$C" && interFoam > log.interFoam 2>&1 ) \
-        || { echo "FAIL: interFoam [restart_$mode]"; tail -30 "$C/log.interFoam"; return 1; }
-    [ -d "$C/$REND" ] || { echo "FAIL: OpenFOAM wrote no $REND directory [restart_$mode]"; ls "$C"; return 1; }
+        || { echo "FAIL: interFoam [${tag}_$mode]"; tail -30 "$C/log.interFoam"; return 1; }
+    [ -d "$C/$REND" ] || { echo "FAIL: OpenFOAM wrote no $REND directory [${tag}_$mode]"; ls "$C"; return 1; }
     # the arm took the path its name claims: alphaRestart is announced, and only where the file is there
     if [ "$mode" = cold ]; then
         ! grep -q "Restarting alpha" "$C/log.interFoam" \
             || { echo "FAIL: the COLD restart still found alphaPhi0"; return 1; }
     else
         grep -q "Restarting alpha" "$C/log.interFoam" \
-            || { echo "FAIL: OpenFOAM did not announce alphaRestart [restart_$mode]"; return 1; }
+            || { echo "FAIL: OpenFOAM did not announce alphaRestart [${tag}_$mode]"; return 1; }
     fi
     oracleStore "$C" "$key"
-    echo "OpenFOAM restarted $STEPS steps to t = $REND   [restart_$mode]"
+    echo "OpenFOAM restarted $STEPS steps to t = $REND   [${tag}_$mode]"
 }
 
 rc=0
@@ -350,6 +354,9 @@ done
 REND=$(python3 -c "print('%.10g' % (2*float('$END')))")
 for mode in warm cold zeroAlphaPhi; do
     restartFrom cn "$mode" || { rc=1; break; }
+done
+for mode in warm cold; do
+    restartFrom eulerAlphaCNOuter "$mode" restartEuler || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_cn_vs_openfoam: restart staging failed"; exit 1; }
 
@@ -435,6 +442,31 @@ else
     rc=1
 fi
 
+
+# ...AND THAT PROFILE RESTARTED, `eulerAlphaCNRestart`: alphaRestart is asked of the start directory whatever
+# ddt(rho,U) names (createAlphaFluxes.H:10-11, alphaEqn.H:36-45), so a restart off-centres alpha's flux from
+# its FIRST step. brae set the flag inside its CrankNicolson-momentum block alone and ran that step on the raw
+# flux, both loops. ORACLE: OpenFOAM's own restart. CONTROL: OpenFOAM's restart with alphaPhi0 removed -- its
+# first step not off-centred, which is the run brae made.
+# MEASURED 2026-10-07, 20 steps from t = 0.02: OpenFOAM's two restarts end U 1.7389e-04 and alpha 3.2920e-04
+# apart; brae's host loop is alpha 7.5e-15, U 5.2e-15 from the oracle and its device loop alpha 7.3e-15,
+# U 9.7e-15. THE CONTROL IN BRAE, asserted red here: BRAE_CONTROL_ALPHA_RESTART_CN_MOMENTUM_ONLY=1 sets the flag
+# as it was set, and the same binary has to fail on the flag and on the fields.
+"$BIN" "$W/restartEuler_warm" "$W/restartEuler_warm/$END" "$W/restartEuler_warm/$REND" "$STEPS" \
+       "$W/restartEuler_warm/log.interFoam" "$W/restartEuler_cold/$REND" eulerAlphaCNRestart || rc=1
+if BRAE_CONTROL_ALPHA_RESTART_CN_MOMENTUM_ONLY=1 "$BIN" "$W/restartEuler_warm" "$W/restartEuler_warm/$END" \
+       "$W/restartEuler_warm/$REND" "$STEPS" "$W/restartEuler_warm/log.interFoam" "$W/restartEuler_cold/$REND" \
+       eulerAlphaCNRestart > "$W/restartEuler_control.log" 2>&1; then
+    echo "  FAIL: CONTROL  alphaRestart under a CrankNicolson momentum alone passed the eulerAlphaCNRestart profile"
+    rc=1
+elif grep -q "FAIL: alphaRestart is what the start directory says" "$W/restartEuler_control.log" \
+     && grep -q "FAIL: U agrees with OpenFOAM's relatively" "$W/restartEuler_control.log"; then
+    echo "  ok:   CONTROL  alphaRestart under a CrankNicolson momentum alone fails the profile:" \
+         "$(grep '^  host: ' "$W/restartEuler_control.log" | sed 's/^ *//')"
+else
+    echo "  FAIL: CONTROL  alphaRestart under a CrankNicolson momentum alone did not fail on the flag and on U"
+    rc=1
+fi
 
 # A RESTART from OpenFOAM's own CrankNicolson state. ORACLE: OpenFOAM's warm restart. CONTROL: its COLD
 # one. And FIRST the property brae's port rests on -- alphaPhi0's VALUES are inert, only its presence is

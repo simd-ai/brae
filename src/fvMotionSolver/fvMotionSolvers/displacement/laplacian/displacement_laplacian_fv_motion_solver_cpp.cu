@@ -260,12 +260,12 @@ std::unique_ptr<DisplacementLaplacianFvMotionSolver> DisplacementLaplacianFvMoti
                 std::string(WHO) + "fvSchemes names `patchDist { method " + method + "; }`, the wall distance "
                 "the inverseDistance diffusivity takes. Only meshWave is ported.");
         }
-        const std::string cw = pd->wordOr("correctWalls", "true");
-        if (cw == "false" || cw == "no" || cw == "off")
+        // a Switch (meshWavePatchDistMethod.C:59): read by hand, `0` and `none` ran corrected
+        if (!pd->switchOr("correctWalls", true))
         {
             throw std::runtime_error(
-                std::string(WHO) + "fvSchemes sets `patchDist { correctWalls " + cw + "; }`; the ported "
-                "meshWave always corrects the cells beside the patches.");
+                std::string(WHO) + "fvSchemes sets `patchDist { correctWalls " + pd->wordOr("correctWalls", "")
+                + "; }`; the ported meshWave always corrects the cells beside the patches.");
         }
         const scalar interval = pd->scalarOr("updateInterval", scalar(1));
         if (interval != scalar(1))

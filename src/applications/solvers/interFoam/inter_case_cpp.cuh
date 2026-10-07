@@ -330,6 +330,9 @@ struct InterFields
     // 1e-12 on the device, neither read from the case. Defaults are lduMatrix::solver's own.
     using AlphaLinearSolve = SmoothLinearSolve;
     AlphaLinearSolve aSolve;
+    // ...and `<alpha>Final`, which alpha1Eqn.solve() takes on the final outer corrector -- every step at
+    // nOuterCorrectors 1 (fvMatrix.C:1536-1542, fvMatrixSolve.C:356-360). One entry served every corrector.
+    AlphaLinearSolve aSolveFinal;
     // ...AND U's, which only a `momentumPredictor yes` case solves. fvMatrix::solve() selects `UFinal`
     // on the final outer corrector and `U` on the others (the mesh's finalIteration flag), so with
     // nOuterCorrectors 1 it is UFinal that is read and `U` alone is not enough: OpenFOAM stops on
@@ -361,6 +364,12 @@ struct InterFields
     // case was run.
     bool    relaxEquationU = false;
     scalar  relaxU = 1.0;
+    // ...and BY THE NAME fvMatrix::relax() asks for (fvMatrix.C:1249-1263): `UFinal` on the final outer
+    // corrector -- every step at nOuterCorrectors 1 -- and `U` on the others. One lookup of `U` served
+    // every corrector: `U 0.7; UFinal 1;` under-relaxed the final corrector too, and `U 0.9;` alone at
+    // one outer corrector relaxed where OpenFOAM does not relax at all.
+    bool    relaxEquationUFinal = false;
+    scalar  relaxUFinal = 1.0;
 
     vector  g{0, 0, 0};
     scalar  hRef = 0;
