@@ -853,9 +853,8 @@ RunReport runInterFoam(
         const std::vector<scalar> sumPhi = surfaceSumMagPhi(
             m.owner(), m.neighbour(), f.phi.internal, phiBndFlat, m.nCells(), m.nInternalFaces());
         const scalar Co0 = courantNo(sumPhi, g.V(), rep.deltaT).CoNum;
-        // the start's time index is the writer's (uniform/time's on a restart). A caller with no writer -- a
-        // test binary -- is taken as a fresh start; brae_interFoam always has one.
-        const label startIndex = writer ? writer->startTimeIndex() : label(0);
+        // the start's time index is the case's (uniform/time's on a restart), with a writer or without one
+        const label startIndex = f.startTimeIndex;
         const scalar dt0 = setInitialDeltaT(rep.deltaT, Co0, f.timeCtl.base, startIndex, f.writeCadence);
         if (verbose || skipped)
         {
@@ -968,7 +967,7 @@ RunReport runInterFoam(
                         if (writer)
                         {
                             writer->stepTaken(rep.deltaT);
-                            writeNow = writer->isWriteTime(writer->startTimeIndex() + rep.steps, indexMoved);
+                            writeNow = writer->isWriteTime(f.startTimeIndex + rep.steps, indexMoved);
                         }
                         if (writeNow && writer->writesAlphaOld())
                         {
@@ -1909,7 +1908,7 @@ RunReport runInterFoam(
                             staticPressureBoundary(f.p_rgh, f.rhoBnd, f.ghfBoundary);
                         InterWriteState ws;
                         ws.time = rep.time;
-                        ws.timeIndex = writer->startTimeIndex() + rep.steps;
+                        ws.timeIndex = f.startTimeIndex + rep.steps;
                         ws.deltaT = rep.deltaT;
                         ws.alpha1 = &f.alpha1;
                         ws.U = &f.U;

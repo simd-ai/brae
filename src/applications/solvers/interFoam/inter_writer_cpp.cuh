@@ -162,9 +162,6 @@ public:
         const std::vector<scalar>& divPhi,
         const std::vector<scalar>& V);
 
-    // The start index a restart continues from (uniform/time `index`), 0 otherwise.
-    label startTimeIndex() const { return startTimeIndex_; }
-
     // alpha.<phase1>_0 is written (a sub-cycled alpha): the loops capture it at the start of a write step
     void writeAlphaOld() { alphaOld_ = true; }
     bool writesAlphaOld() const { return alphaOld_; }
@@ -287,7 +284,6 @@ private:
     // Time::precision_, which OpenFOAM raises for good once a name would not distinguish two times
     int timePrecision_ = 6;
 
-    label startTimeIndex_ = 0;
     scalar deltaTSave_ = 0;
     scalar deltaT0_ = 0;
     scalar cumulativeContErr_ = 0;

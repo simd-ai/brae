@@ -939,6 +939,14 @@ InterFields buildInterFields(const std::string&          caseDir,
         }
         // ...and only now the time controls: whether maxAlphaCo is mandatory depends on it
         f.timeCtl = VoFTimeControls::read(controlDict, f.lts);
+        // the time index the run starts at (InterFields::startTimeIndex)
+        {
+            const std::string timePath = startDir + "/uniform/time";
+            if (std::filesystem::exists(timePath) || std::filesystem::exists(timePath + ".gz"))
+            {
+                f.startTimeIndex = static_cast<label>(readDict(timePath).scalarOr("index", scalar(0)));
+            }
+        }
         if (!f.lts && f.ddtU == DdtScheme::localEuler)
             throw std::runtime_error(
                 "brae interFoam: ddtSchemes resolves `ddt(rho,U)` to `" + ddtRhoU + "` under a `default` that "
@@ -1148,13 +1156,7 @@ InterFields buildInterFields(const std::string&          caseDir,
         // fvOptions selection and the MRF zones resolve against the mesh as it stands.
         f.amr->state.cellZones = f.cellZones;
         f.amr->polyMeshDir = facesPolyMeshDir;
-        {
-            const std::string timePath = startDir + "/uniform/time";
-            if (std::filesystem::exists(timePath) || std::filesystem::exists(timePath + ".gz"))
-            {
-                f.amr->startTimeIndex = static_cast<label>(readDict(timePath).scalarOr("index", scalar(0)));
-            }
-        }
+        f.amr->startTimeIndex = f.startTimeIndex;
         // `dynamic` is OpenFOAM's mesh.dynamic(): moving OR topo-changing. It is what correctPhi defaults
         // to, and a REFINING mesh is dynamic -- measured on damBreakWithObstacle, where OpenFOAM writes a
         // Uf and an rAU beside every time directory and solves pcorr at every step.

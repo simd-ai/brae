@@ -34,6 +34,8 @@
 #include "interface_properties_cpp.cuh"
 #include "inter_peqn_cpp.cuh"
 #include "inter_driver_cpp.cuh"
+#include <fstream>
+#include <filesystem>
 #include <memory>
 #include <tuple>
 #include <cstdlib>
@@ -87,6 +89,30 @@ int main(int argc, char** argv)
                 (long)m.nCells(), (long)m.nInternalFaces(), patches.size());
 
     InterFields f = buildInterFields(caseDir, startDir, m, g, patches);
+
+    // THE TIME INDEX THE RUN STARTS AT is the start directory's uniform/time `index`, and 0 where there is none
+    // (Time.C:304-307). Both loops took it from the writer, so a caller with no writer restarted at 0. A copy
+    // of the start directory with an index of 37 in it has to read 37; this one, which has no such file, 0.
+    {
+        check("the fixture's start directory holds no uniform/time",
+              !std::filesystem::exists(startDir + "/uniform/time"));
+        checkNum("a start with no uniform/time is time index 0", scalar(f.startTimeIndex), scalar(0));
+        const std::string restartDir = caseDir + "/brae_test_restart_index";
+        std::filesystem::remove_all(restartDir);
+        std::filesystem::copy(startDir, restartDir, std::filesystem::copy_options::recursive);
+        std::filesystem::create_directories(restartDir + "/uniform");
+        {
+            std::ofstream os(restartDir + "/uniform/time");
+            os << "FoamFile\n{\n    version     2.0;\n    format      ascii;\n    class       dictionary;\n"
+               << "    location    \"uniform\";\n    object      time;\n}\n\n"
+               << "value           0.1;\nname            \"0.1\";\nindex           37;\n"
+               << "deltaT          0.001;\ndeltaT0         0.001;\n";
+        }
+        const InterFields restarted = buildInterFields(caseDir, restartDir, m, g, patches);
+        std::filesystem::remove_all(restartDir);
+        checkNum("a start directory whose uniform/time says index 37 is time index 37",
+                 scalar(restarted.startTimeIndex), scalar(37));
+    }
 
     // ---- 1. the case's own settings ---------------------------------------------------------------
     check   ("the alpha field is named from `phases (water air)`", f.alphaName == "alpha.water");

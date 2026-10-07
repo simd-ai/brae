@@ -9,6 +9,7 @@
 #include "foam_token_reader.cuh"
 #include "brae_notice.cuh"
 #include "inter_phase_time.cuh"
+#include <charconv>
 #include <zlib.h>
 #include <algorithm>
 #include <atomic>
@@ -495,37 +496,70 @@ std::vector<scalar> coupledLocalValue(
 // UList::writeList for a label list (UListIO.C:82-178), the rule every labelList file goes by: more than one
 // entry, all equal, as `N{v}`; ten or fewer on one line, `N(a b c)`; otherwise a newline, the count, and one
 // entry per line between parentheses on lines of their own, ending in a newline.
-std::string labelListText(const std::vector<label>& v)
+// A label's decimal text appended: the digits operator<< writes, without a stream. THE REFINING MESH'S FILES
+// WERE BUILT THROUGH A STREAM A LIST -- a std::ostringstream for every face of `faces` -- inside the step,
+// where the long lists of numbers are only copied: MEASURED 2026-10-07 on damBreakWithObstacle as shipped
+// (32,256 cells at the start, a write every ten steps), `write: the files built` 127 ms a write, more than the
+// 90 ms the background job then spends formatting every number of the directory.
+inline void appendLabel(
+    std::string& out,
+    label x)
 {
-    const std::size_t n = v.size();
+    char digits[24];
+    const std::to_chars_result r = std::to_chars(digits, digits + sizeof(digits), x);
+    out.append(digits, r.ptr);
+}
+
+void appendLabelList(
+    std::string& out,
+    const label* v,
+    std::size_t n)
+{
     bool uniform = n > 1;
     for (std::size_t i = 1; uniform && i < n; ++i)
     {
         uniform = v[i] == v[0];
     }
-    std::ostringstream os;
     if (uniform)
     {
-        os << n << "{" << v[0] << "}";
-        return os.str();
+        appendLabel(out, static_cast<label>(n));
+        out += '{';
+        appendLabel(out, v[0]);
+        out += '}';
+        return;
     }
     if (n <= kShortList)
     {
-        os << n << "(";
+        appendLabel(out, static_cast<label>(n));
+        out += '(';
         for (std::size_t i = 0; i < n; ++i)
         {
-            os << (i ? " " : "") << v[i];
+            if (i)
+            {
+                out += ' ';
+            }
+            appendLabel(out, v[i]);
         }
-        os << ")";
-        return os.str();
+        out += ')';
+        return;
     }
-    os << "\n" << n << "\n(";
-    for (const label x : v)
+    out += '\n';
+    appendLabel(out, static_cast<label>(n));
+    out += "\n(";
+    for (std::size_t i = 0; i < n; ++i)
     {
-        os << "\n" << x;
+        out += '\n';
+        appendLabel(out, v[i]);
     }
-    os << "\n)\n";
-    return os.str();
+    out += "\n)\n";
+}
+
+std::string labelListText(const std::vector<label>& v)
+{
+    std::string out;
+    out.reserve(12*v.size() + 32);
+    appendLabelList(out, v.data(), v.size());
+    return out;
 }
 
 // ...and a list of elements that are not contiguous (a face, a splitCell8): one line only when it holds at
@@ -1505,13 +1539,12 @@ InterWriter::InterWriter(
     }
 
     // A RESTART continues OpenFOAM's time index and cumulative continuity error from the start directory
-    // (Time.C:304-307, initContinuityErrs.H:40-52). deltaT and deltaT0 OpenFOAM also reads there
+    // (Time.C:304-307, initContinuityErrs.H:40-52) -- the index is the case's, InterFields::startTimeIndex,
+    // which the loops hand the write schedule. deltaT and deltaT0 OpenFOAM also reads there
     // (Time.C:291-302); brae's solver starts from controlDict's deltaT, and says so.
     const std::string ut = startDir + "/uniform/time";
     if (fs::exists(ut))
     {
-        const FoamDict td = readDict(ut);
-        startTimeIndex_ = static_cast<label>(td.scalarOr("index", scalar(0)));
         noticeIgnored(
             "uniform/time deltaT/deltaT0",
             "the restart starts from controlDict's deltaT; OpenFOAM reads the stored deltaT under "
@@ -2797,18 +2830,37 @@ void InterWriter::write(const InterWriteState& s)
         }
         if (amr->topoChanged)
         {
-            std::vector<std::string> faces;
-            faces.reserve(static_cast<std::size_t>(m->nFaces()));
+            // compoundListText's form, a face an element, built in one string
+            std::string faces;
+            faces.reserve(32*static_cast<std::size_t>(m->nFaces()) + 32);
+            std::vector<label> verts;
+            const bool oneLine = m->nFaces() <= 1;
+            if (oneLine)
+            {
+                appendLabel(faces, m->nFaces());
+                faces += '(';
+            }
+            else
+            {
+                faces += '\n';
+                appendLabel(faces, m->nFaces());
+                faces += "\n(";
+            }
             for (label fi = 0; fi < m->nFaces(); ++fi)
             {
-                std::vector<label> verts(static_cast<std::size_t>(m->faceSize(fi)));
+                verts.resize(static_cast<std::size_t>(m->faceSize(fi)));
                 for (label k = 0; k < m->faceSize(fi); ++k)
                 {
                     verts[static_cast<std::size_t>(k)] = m->faceVert(fi, k);
                 }
-                faces.push_back(labelListText(verts));
+                if (!oneLine)
+                {
+                    faces += '\n';
+                }
+                appendLabelList(faces, verts.data(), verts.size());
             }
-            emit(dir + "/polyMesh/faces", header("faceList", pm, "faces") + compoundListText(faces) + end, true);
+            faces += oneLine ? ")" : "\n)\n";
+            emit(dir + "/polyMesh/faces", header("faceList", pm, "faces") + faces + end, true);
             std::ostringstream note;
             note << "nPoints:" << m->nPoints() << "  nCells:" << m->nCells() << "  nFaces:" << m->nFaces()
                  << "  nInternalFaces:" << m->nInternalFaces();

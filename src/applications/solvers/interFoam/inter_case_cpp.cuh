@@ -95,6 +95,13 @@ scalar maxNonOrthogonality(
 
 struct InterFields
 {
+    // THE TIME INDEX THE RUN STARTS AT: `index` of <start>/uniform/time, 0 where there is none (Time.C:304-307
+    // reads it there on a restart). OpenFOAM's time index is global -- setInitialDeltaT.H is made at index 0
+    // alone, a refinement and a write on `timeStep` count from it -- and brae's step count starts at 1 in
+    // every run. Both loops took it from the WRITER (`writer ? writer->startTimeIndex() : 0`), so a caller
+    // with no writer restarted at index 0 whatever the directory said; brae_interFoam always has one, a
+    // binary built on the loops need not. Read here, once, for every reader of it.
+    label startTimeIndex = 0;
     // --- read from the start directory
     GeometricField<scalar> alpha1;
     GeometricField<vector> U;
