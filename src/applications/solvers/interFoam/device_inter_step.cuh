@@ -174,6 +174,13 @@ struct DeviceInterStepTaps
 // leave the new one. The turbulence closure keeps its own (DeviceInterTurbulence).
 struct DeviceInterCrankNicolson
 {
+    // WHETHER ddt(rho,U) IS CrankNicolson TOO. False is `ddt(alpha) CrankNicolson` under an Euler momentum, and
+    // then this state is alpha's alone: ocAlpha, cnAlpha and phiOldExists below, nothing else. alphaEqn.H takes
+    // ocCoeff from ddt(alpha) by itself (:8-46) and blends phiCN whenever it is above zero (:91-97); what it
+    // branches on ddt(rho,U) for is the END of the step (:242-259): under Euler rhoPhi takes phiCN beside rho2
+    // and alphaPhi10 is NOT un-blended. So with this false the step off-centres the flux and does nothing else
+    // of the scheme's -- no old-old levels, no ddt0 fields, Euler's own ddt and ddtCorr.
+    bool momentum = true;
     const cpu::fv::CrankNicolsonClock* clock = nullptr;
     DeviceCnDdt0 ddt0RhoU;
     // ...and ddt0(rho,U)'s patch half, when the driver WRITES the field: rho's and U's patch values at

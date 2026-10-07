@@ -185,7 +185,7 @@ if p == 'cnAlphaEuler':
                    r'\1    ddt(alpha)      Euler;\n', t)
     assert k == 1, 'ddt(alpha) Euler was not inserted beside a CrankNicolson default'
     open(q, 'w').write(t)
-if p == 'eulerAlphaCN':
+if p in ('eulerAlphaCN', 'eulerAlphaCNOuter'):
     q = os.path.join(d, 'system/fvSchemes')
     t = open(q).read()
     t, k = re.subn(r'(ddtSchemes\s*\{\s*\n\s*default\s+Euler;\n)',
@@ -244,7 +244,7 @@ if p in ('cnSST', 'cnLES', 'eulerSST', 'eulerLES'):
     t = open(q).read()
     t = t.replace('"(U|k|epsilon).*"', '"(U|k|epsilon|omega).*"')
     open(q, 'w').write(t)
-if p == 'cnOuter':
+if p in ('cnOuter', 'eulerOuter', 'eulerAlphaCNOuter'):
     q = os.path.join(d, 'system/fvSolution')
     t = open(q).read()
     t, k = re.subn(r'nOuterCorrectors\s+1;', 'nOuterCorrectors 2;', t)
@@ -341,7 +341,8 @@ RSTEOF
 }
 
 rc=0
-for p in euler cn cnOuter cnFull eulerSST cnSST eulerLES cnLES cnAlphaEuler eulerAlphaCN; do
+for p in euler cn cnOuter cnFull eulerSST cnSST eulerLES cnLES cnAlphaEuler eulerAlphaCN eulerOuter \
+         eulerAlphaCNOuter; do
     stage "$p" || { rc=1; break; }
 done
 [ $rc = 0 ] || { echo "interfoam_cn_vs_openfoam: staging failed"; exit 1; }
@@ -406,6 +407,33 @@ NOOPEOF
 for p in cnAlphaEuler eulerAlphaCN; do
     "$BIN" "$W/$p" "$W/$p/0" "$W/$p/$END" "$STEPS" "$W/$p/log.interFoam" "$W/cn/$END" "$p" || rc=1
 done
+
+# ...AND `ddt(alpha) CrankNicolson` UNDER AN EULER DEFAULT WITH TWO OUTER CORRECTORS, where it is no longer a
+# no-op: at the second outer corrector phi is not phi.oldTime() any more, so alphaEqn.H:91-97's blend acts, and
+# under an Euler ddt(rho,U) rhoPhi takes the blended flux (:242-250). The device loop formed the blend under a
+# CrankNicolson momentum only and refused this case by name until 2026-10-07. ORACLE: OpenFOAM's own run.
+# CONTROL: its all-Euler run with the same two outer correctors -- the answer a loop that ran alpha on the raw
+# flux gives -- and the distance between the two is asserted first, OpenFOAM against OpenFOAM.
+# MEASURED 2026-10-07, 20 steps: OpenFOAM's two runs are U 1.3340e-02 and alpha 9.5594e-03 apart; brae's host
+# loop is alpha 1.2e-14, p_rgh 1.4e-14, U 1.6e-14 from the oracle and its device loop alpha 6.9e-15, p_rgh
+# 8.6e-15, U 1.7e-14, k 7.3e-15, epsilon 4.8e-15, with every solve's iteration count OpenFOAM's.
+# THE DEVICE'S CONTROL, asserted red here: BRAE_CONTROL_DEVICE_CN_ALPHA_RAW_FLUX=1 hands alpha the raw flux
+# as the loop did, and the same binary has to fail.
+"$BIN" "$W/eulerAlphaCNOuter" "$W/eulerAlphaCNOuter/0" "$W/eulerAlphaCNOuter/$END" "$STEPS" \
+    "$W/eulerAlphaCNOuter/log.interFoam" "$W/eulerOuter/$END" eulerAlphaCNOuter || rc=1
+if BRAE_CONTROL_DEVICE_CN_ALPHA_RAW_FLUX=1 "$BIN" "$W/eulerAlphaCNOuter" "$W/eulerAlphaCNOuter/0" \
+       "$W/eulerAlphaCNOuter/$END" "$STEPS" "$W/eulerAlphaCNOuter/log.interFoam" "$W/eulerOuter/$END" \
+       eulerAlphaCNOuter > "$W/eulerAlphaCNOuter_control.log" 2>&1; then
+    echo "  FAIL: CONTROL  the device loop on the raw flux passed the eulerAlphaCNOuter profile"
+    rc=1
+elif grep -q "CONTROL MODE: ddt(alpha) CrankNicolson under an Euler momentum" "$W/eulerAlphaCNOuter_control.log" \
+     && grep -q "^  DEVICE: " "$W/eulerAlphaCNOuter_control.log"; then
+    echo "  ok:   CONTROL  the device loop on the raw flux fails the profile:" \
+         "$(grep '^  DEVICE: ' "$W/eulerAlphaCNOuter_control.log" | sed 's/^ *//')"
+else
+    echo "  FAIL: CONTROL  the device loop on the raw flux did not run to its comparison"
+    rc=1
+fi
 
 
 # A RESTART from OpenFOAM's own CrankNicolson state. ORACLE: OpenFOAM's warm restart. CONTROL: its COLD

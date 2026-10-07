@@ -4459,21 +4459,34 @@ RunReport runInterFoamDevice(
     // at it -- rotated with the old ones; phi's, created when OpenFOAM creates it; the three ddt0
     // fields; and alphaPhi10's levels for alphaEqn.H's un-blend. The closure keeps its own.
     const bool cnDdt = (f.ddtU == DdtScheme::CrankNicolson);
-    // ALPHA'S OFF-CENTRED FLUX IS FORMED BELOW ONLY UNDER A CrankNicolson MOMENTUM. alphaEqn.H takes ocCoeff from
-    // ddt(alpha) alone (:8-46) and blends phiCN whenever it is above zero (:94-97), whatever ddt(rho,U) is; the
-    // host loop does (inter_driver_cpp.cu, keyed on f.ddtAlpha). With `ddt(rho,U) Euler` and `ddt(alpha)
-    // CrankNicolson` this loop hands every alpha site the raw phi. That is phiCN to a rounding while
-    // phi.oldTime() is phi itself at the alpha step -- one outer corrector on a mesh that does not move, which
-    // interfoam_cn_vs_openfoam's eulerAlphaCN holds -- and NOT from the second outer corrector on, nor on a mesh
-    // that moves. Refused there by name until the blend is keyed on ddt(alpha) (found 2026-10-06 by a review).
-    if (!cnDdt && f.ddtAlpha == AlphaDdt::CrankNicolson && f.ddtAlphaOcCoeff > scalar(0)
-     && (f.pimple.nOuterCorrectors > 1 || f.dynamicMesh))
+    // ...AND ddt(alpha) CrankNicolson UNDER AN EULER MOMENTUM. alphaEqn.H takes ocCoeff from ddt(alpha) alone
+    // (:8-46) and blends phiCN whenever it is above zero (:91-97), whatever ddt(rho,U) is; under an Euler
+    // momentum that is all of the scheme there is (:242-250: rhoPhi takes phiCN, nothing is un-blended). This
+    // loop formed the blend under a CrankNicolson momentum only and handed every alpha site the raw phi here:
+    // phiCN to a rounding while phi.oldTime() is phi itself at the alpha step -- one outer corrector on a mesh
+    // that does not move -- and NOT from the second outer corrector on, nor on a mesh that moves, which it
+    // refused by name from 2026-10-06 until the blend was keyed on ddt(alpha), 2026-10-07
+    // (interfoam_cn_vs_openfoam's eulerAlphaCNOuter holds it: two outer correctors).
+    //   BRAE_CONTROL_DEVICE_CN_ALPHA_RAW_FLUX=1: a gate's CONTROL, deliberately wrong -- the raw flux again.
+    static const bool cnAlphaRawFlux = std::getenv("BRAE_CONTROL_DEVICE_CN_ALPHA_RAW_FLUX") != nullptr;
+    const bool cnAlphaOnly = !cnDdt && !cnAlphaRawFlux && f.ddtAlpha == AlphaDdt::CrankNicolson
+                          && f.ddtAlphaOcCoeff > scalar(0);
+    // ...BUT NOT ON A MESH THAT MOVES. There phi.oldTime() is created by the alpha blend itself (ddtCorr reads
+    // Uf.oldTime() and never asks for it), and the creation is held to OpenFOAM under a CrankNicolson momentum
+    // alone (tests/interfoam_moving's floating profiles); under an Euler one no fixture holds it. Refused by
+    // name until one does; the host loop runs it.
+    if (cnAlphaOnly && f.dynamicMesh)
     {
         throw std::runtime_error(
-            "brae interFoam -device: ddt(alpha) is CrankNicolson under an Euler ddt(rho,U) with "
-            + std::string(f.dynamicMesh ? "a mesh that moves" : "more than one outer corrector")
-            + ". alphaEqn.H off-centres alpha's flux from ddt(alpha) alone; the device loop forms that flux only "
-              "under a CrankNicolson momentum and would run alpha on the raw flux here. The host loop runs it.");
+            "brae interFoam -device: ddt(alpha) is CrankNicolson under an Euler ddt(rho,U) on a mesh that moves. "
+            "alphaEqn.H off-centres alpha's flux from ddt(alpha) alone, with phi.oldTime() -- which on a moving "
+            "mesh that blend itself creates; the device loop is held to OpenFOAM there under a CrankNicolson "
+            "momentum only. The host loop runs it.");
+    }
+    if (cnAlphaRawFlux && !cnDdt && f.ddtAlpha == AlphaDdt::CrankNicolson)
+    {
+        std::printf("  *** CONTROL MODE: ddt(alpha) CrankNicolson under an Euler momentum runs alpha on the raw "
+                    "flux. This run is deliberately wrong. ***\n");
     }
     DeviceBuffer<scalar> dAOO(f.alpha1.internal);
     DeviceBuffer<scalar> dUoox(f.U.internal.size()), dUooy(f.U.internal.size()), dUooz(f.U.internal.size());
@@ -4732,7 +4745,8 @@ RunReport runInterFoamDevice(
     cycPhiForHost = (dCyc.n > 0) ? &dCyc.phi : nullptr;
     C.porosity = dPorosity.active ? &dPorosity : nullptr;
     C.mangroves = dMangroves.source() ? &dMangroves : nullptr;
-    C.cn = cnDdt ? &dCn : nullptr;
+    C.cn = (cnDdt || cnAlphaOnly) ? &dCn : nullptr;
+    dCn.momentum = cnDdt;
     // p_rgh's reference, where the host driver sets it (inter_driver_cpp.cu:779-781). These three were
     // dead for as long as the device refused a case that needs one, and a step that never pins leaves the
     // singular system's level to the solver: MEASURED on laminar/mixerVessel2D before they were set, a
@@ -5712,6 +5726,20 @@ RunReport runInterFoamDevice(
                 }
                 dCn.alphaPhiOutIf = &dAlphaPhiOutIf;
                 dCn.alphaPhiCreatedIf = &dAlphaPhiOldIf;
+            }
+        }
+        else if (cnAlphaOnly)
+        {
+            // alpha's off-centring by itself (DeviceInterCrankNicolson::momentum): the coefficient this step
+            // has, and whether phi.oldTime() exists yet -- the same two rules as above, which are alphaEqn.H's
+            // and the field's own and do not ask what ddt(rho,U) is
+            dCn.ocAlpha = offCentringCoeff(f.ddtAlpha, f.alphaCtl.nAlphaSubCycles, f.ddtAlphaOcCoeff,
+                                           f.cnAlphaRestart || s + 1 > 1);
+            dCn.cnAlpha = blendingCoeff(dCn.ocAlpha);
+            dCn.phiOldExists = phiOldRequested;
+            if (dCn.ocAlpha > scalar(0) || !f.meshIsDynamic)
+            {
+                phiOldRequested = true;
             }
         }
 
@@ -6793,7 +6821,7 @@ RunReport runInterFoamDevice(
             // flux this corrector's alpha step is about to read, so every corrector takes one path. The
             // host driver's twin has the measurement (RAS/floatingObject, U 3.1e-08 at step two).
             // BRAE_CONTROL_CN_PHIOLD_PREV=1 leaves the previous step's flux in the level -- the control.
-            if (cnDdt && dCn.ocAlpha > scalar(0) && !dCn.phiOldExists)
+            if ((cnDdt || cnAlphaOnly) && dCn.ocAlpha > scalar(0) && !dCn.phiOldExists)
             {
                 if (std::getenv("BRAE_CONTROL_CN_PHIOLD_PREV") != nullptr)
                 {

@@ -199,7 +199,9 @@ int main(
     const std::string logPath = argv[5];
     const std::string eulerDir = argv[6];
     const std::string profile = argv[7];
-    const bool outer = (profile == "cnOuter");
+    // ...and that last one with two outer correctors, where it stops being a no-op (the script has why)
+    const bool eulerAlphaCNOuter = (profile == "eulerAlphaCNOuter");
+    const bool outer = (profile == "cnOuter") || eulerAlphaCNOuter;
     const bool full = (profile == "cnFull");
     // THE OTHER TWO CLOSURES under the same scheme, on the same tutorial: kOmegaSST, whose second
     // field is omega, and LES kEqn, which has none. kEpsilon carried CrankNicolson from the start;
@@ -212,7 +214,7 @@ int main(
     // alphaEqn.H:242-259 branches on `ddt(rho,U)` and takes ocCoeff/cnCoeff from `ddt(alpha)`, so the
     // two entries are two independent facts and the four combinations are four runs.
     const bool cnAlphaEuler = (profile == "cnAlphaEuler");   // momentum CrankNicolson, alpha Euler
-    const bool eulerAlphaCN = (profile == "eulerAlphaCN");   // momentum Euler, alpha CrankNicolson
+    const bool eulerAlphaCN = (profile == "eulerAlphaCN") || eulerAlphaCNOuter;   // momentum Euler, alpha CN
     const bool mixedDdt = cnAlphaEuler || eulerAlphaCN;
     // A RESTART from OpenFOAM's own CrankNicolson state: the ddt0 fields, the <field>_0 old-old levels
     // and alphaPhi0 are all on disk, and OpenFOAM is CrankNicolson from the first step rather than Euler
@@ -225,6 +227,8 @@ int main(
                      : (sst ? D_SST : les ? D_LES : restart ? D_RESTART : D_CN);
     std::printf("  profile: %s\n",
                 cnAlphaEuler ? "cnAlphaEuler -- default CrankNicolson 0.5, ddt(alpha) Euler"
+                : eulerAlphaCNOuter ? "eulerAlphaCNOuter -- default Euler, ddt(alpha) CrankNicolson 0.5, "
+                                      "nOuterCorrectors 2"
                 : eulerAlphaCN ? "eulerAlphaCN -- default Euler, ddt(alpha) CrankNicolson 0.5"
                 : restart ? "cnRestart -- CrankNicolson 0.5, RESTARTED from OpenFOAM's own state at t = 0.02"
                 : outer ? "cnOuter -- CrankNicolson 0.5 with nOuterCorrectors 2"
@@ -387,7 +391,9 @@ int main(
     const Diff dCtlU = compare(readVectorCells(eulerDir + "/U"), ofU);
     const Diff dCtlA = compare(readCells(eulerDir + "/alpha.water"), ofAlpha);
     std::printf("  CONTROL: %s, U relative %.4e, alpha %.4e\n",
-                mixedDdt ? "OpenFOAM with BOTH entries CrankNicolson against OpenFOAM with them mixed -- "
+                eulerAlphaCNOuter ? "OpenFOAM all-Euler against OpenFOAM with ddt(alpha) CrankNicolson, two outer "
+                                    "correctors each -- the answer of a loop that runs alpha on the raw flux"
+                : mixedDdt ? "OpenFOAM with BOTH entries CrankNicolson against OpenFOAM with them mixed -- "
                            "the answer brae gave while it ran the two under one scheme"
                 : restart ? "OpenFOAM's WARM restart against OpenFOAM's COLD one -- the answer brae gave "
                             "while it started the scheme cold from OpenFOAM's own state"

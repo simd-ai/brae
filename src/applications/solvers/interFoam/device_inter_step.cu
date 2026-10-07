@@ -207,7 +207,9 @@ void deviceInterStep(
     actl.alphaPhiWriteBnd = ctl.alphaPhiWriteBnd;
     actl.alphaPhiWriteIf  = ctl.alphaPhiWriteIf;
     actl.alphaSubCycleBndWrite = ctl.alphaSubCycleBndWrite;
-    if (ctl.cn)
+    // (under an Euler momentum rhoPhi takes the flux the alpha step was handed, phiCN, and nothing is
+    // un-blended: alphaEqn.H:242-250)
+    if (ctl.cn && ctl.cn->momentum)
     {
         // alphaEqn.H:236-262: ddt(rho,U) is not Euler, so rhoPhi takes phi beside rho2 and the
         // end-of-step alpha flux is un-blended when the scheme is warm
@@ -382,7 +384,7 @@ void deviceInterStep(
     }
     // ...and rho.oldTime().oldTime() for CrankNicolson, from alpha1's old-old level the same way
     DeviceBuffer<scalar> rhoOO;
-    if (ctl.cn)
+    if (ctl.cn && ctl.cn->momentum)
     {
         if (!ctl.cn->clock || !ctl.cn->alpha1OO || ctl.cn->alpha1OO->size() != static_cast<std::size_t>(nC))
             throw std::runtime_error(
@@ -426,7 +428,7 @@ void deviceInterStep(
     uin.ddtUOld[2]    = &UOldZ;
     uin.ddtDeltaT     = deltaT;
     uin.ddtRDeltaT    = ctl.rDeltaTUEqn;
-    if (ctl.cn)
+    if (ctl.cn && ctl.cn->momentum)
     {
         uin.ddtCn = ctl.cn->clock;
         uin.ddtCnDdt0 = &ctl.cn->ddt0RhoU;
@@ -687,7 +689,7 @@ void deviceInterStep(
         // (ddtPhiCoeff_ = -1), not a constant: it switches the correction off where it is large
         // compared with the flux, and it is zero on every patch where U fixes a value.
         DeviceBuffer<scalar> ddtCorrI, ddtCorrB, ddtCorrIf;
-        if (ctl.cn)
+        if (ctl.cn && ctl.cn->momentum)
         {
             const DeviceBuffer<scalar>* uo[3] = {&UOldX, &UOldY, &UOldZ};
             const DeviceBuffer<scalar>* uob[3] = {&UOldBndX, &UOldBndY, &UOldBndZ};
@@ -755,7 +757,7 @@ void deviceInterStep(
         // ...and the PAIR's half, which pEqn.H:16-18 builds with the rest of the surfaceScalarField.
         // MRF.zeroFilter does not reach it: a zone's faces are the mesh's own, and a periodic pair is
         // refused on an MRF case before this (the driver's MRF refusal).
-        if (!ctl.cn && ctl.cyc && ctl.cyc->n > 0 && ctl.phiOldIf)
+        if (!(ctl.cn && ctl.cn->momentum) && ctl.cyc && ctl.cyc->n > 0 && ctl.phiOldIf)
         {
             deviceInterDdtCorrCyclic(*ctl.cyc, *ctl.phiOldIf, UOldX, UOldY, UOldZ,
                                      /*ddtPhiCoeff=*/scalar(-1), deltaT, ddtCorrIf);

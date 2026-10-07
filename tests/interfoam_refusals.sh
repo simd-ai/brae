@@ -1116,8 +1116,9 @@ if [ $HAVE_GPU = 1 ]; then
     CNOUTER="ddtblock 'default Euler;' 'ddt(alpha) CrankNicolson 0.9;'"
     CNOUTER="$CNOUTER && sed -i -E 's/nOuterCorrectors +[0-9]+;/nOuterCorrectors 2;/' system/fvSolution"
     CNOUTER="$CNOUTER && grep -q 'nOuterCorrectors 2;' system/fvSolution"
-    arm device_eulerU_cnAlpha_outer refused "ddt(alpha) is CrankNicolson under an Euler ddt(rho,U)" "-device" \
-        "$CNOUTER"
+    # ...which the device loop RUNS since 2026-10-07 (the blend is keyed on ddt(alpha); held to OpenFOAM by
+    # interfoam_cn_vs_openfoam's eulerAlphaCNOuter)
+    arm device_eulerU_cnAlpha_outer runs    -                        "-device" "$CNOUTER"
     # ...nor a non-orthogonal correction where it is not zero
     # the non-orthogonal correction runs on the device now (tests/interfoam_dambreak_vs_openfoam.sh
     # `sheared` holds it to OpenFOAM); `uncorrected` on a mesh that is not orthogonal is still refused
@@ -1134,6 +1135,11 @@ if [ $HAVE_GPU = 1 ]; then
     # arm is here because each of the three was a refusal in turn, and a blanket one would pass every
     # other arm on this page
     arm device_moving       runs    -                      "-device" true
+    # ...but not `ddt(alpha) CrankNicolson` under an Euler momentum on it: phi.oldTime() is created by alpha's
+    # own blend on a moving mesh, held to OpenFOAM under a CrankNicolson momentum only (the host loop runs it;
+    # on a mesh that does not move the device runs it too, device_eulerU_cnAlpha_outer above)
+    arm device_eulerU_cnAlpha_moving refused "under an Euler ddt(rho,U) on a mesh that moves" "-device" \
+        "ddtblock 'default Euler;' 'ddt(alpha) CrankNicolson 0.9;'"
     # ...and the same mesh with p_rghFinal as a plain GAMG SOLVER rather than the preconditioner form,
     # so that BOTH device GAMG entry points are held on a moving mesh (the hierarchy is the mesh's and
     # is rebuilt on every move for either)
