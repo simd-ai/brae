@@ -890,8 +890,13 @@ arm host_nNonOrth1          runs    -                        "" "sed -i 's/nNonO
 # a solver without interface coefficients would run the pair as two walls and converge.
 BASE="$BB"
 PRGH="python3 -c \"import re; p='0/p_rgh'; t=open(p).read(); t=re.sub(r'(porous_half[01]\\s*\\{[^}]*?)length', r'\\1EXTRA length', t); open(p,'w').write(t)\""
+# ...and the curvature smoothing's copy of alpha across the pair: its average would need the other side's
+# cells at every pass
+SMOOTH="sed -i -E 's/^( *)nAlphaCorr( +)/\\1nAlphaSmoothCurvature 2;\\n\\1nAlphaCorr\\2/' system/fvSolution"
+SMOOTH="$SMOOTH; grep -q 'nAlphaSmoothCurvature 2;' system/fvSolution"
 arm baffle_runs             runs    -                                  "" true
 arm baffle_plainCyclic      runs    -                                  "" "python3 -c \"import re; p='0/p_rgh'; t=open(p).read(); t=re.sub(r'(porous_half[01]\\s*\\{)[^}]*\\}', r'\\1 type cyclic; }', t); open(p,'w').write(t)\""
+arm baffle_smoothCurvature  refused "nAlphaSmoothCurvature across the coupled patch" "" "$SMOOTH"
 arm baffle_relax            refused "sets \`relax\` or \`minJump\`"      "" "${PRGH/EXTRA/relax 0.5;}"
 arm baffle_minJump          refused "sets \`relax\` or \`minJump\`"      "" "${PRGH/EXTRA/minJump 0;}"
 arm baffle_massFlux         refused "MASS flux"                        "" "${PRGH/EXTRA/phi rhoPhi;}"
@@ -1245,6 +1250,15 @@ if [ $HAVE_GPU = 1 ]; then
         "$REFDICT '' > constant/dynamicMeshDict; $VLR"
     arm device_alpha2Patches runs  "alpha2's stored patch values on" "-device" "$VLR"
     arm alpha2Patches_refining_host runs -                        "" "$REFDICT '' > constant/dynamicMeshDict; $VLR"
+    # nAlphaSmoothCurvature: the host loop smooths the copy of alpha as OpenFOAM does (tests/interfoam_write/
+    # core/smooth_curvature.sh and smooth_curvature_wedge.sh hold it to interFoam). The GPU loop's curvature
+    # takes the unsmoothed gradient and refuses the entry; the host refuses the form it has not ported, a
+    # least-squares gradient of the smoothed copy (the copy across a coupled pair is `baffle_smoothCurvature`).
+    arm device_smoothCurvature refused "nAlphaSmoothCurvature is not ported to the device curvature" "-device" \
+        "$SMOOTH"
+    arm smoothCurvature_host   runs    -                             "" "$SMOOTH"
+    arm smoothCurvature_lsq    refused "nAlphaSmoothCurvature with a leastSquares or limited gradient" "" \
+        "$SMOOTH; sed -i '/^gradSchemes/,/^}/ s/default .*/default         leastSquares;/' system/fvSchemes"
     # ALPHA'S CrankNicolson UNDER AN Euler MOMENTUM, where the device loop would run alpha on the raw flux: more
     # than one outer corrector (the host loop runs it; with one corrector the two fluxes are one and the device runs)
     CNOUTER="ddtblock 'default Euler;' 'ddt(alpha) CrankNicolson 0.9;'"

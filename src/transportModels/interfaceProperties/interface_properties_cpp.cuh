@@ -148,12 +148,18 @@ inline void sigmaK(const std::vector<scalar>& K, scalar sigma, std::vector<scala
 // is gated without an instrumented OpenFOAM: it is a GEOMETRIC quantity, so a flat interface has K = 0
 // exactly at any resolution and a sphere of radius R has K -> 2/R as the mesh refines.
 
-// alpha1L = fvc::average(fvc::interpolate(alpha1L)), nPasses times. fvc::average is AREA-WEIGHTED.
-void smoothAlpha(std::vector<scalar>&        alpha,
-                 int                         nPasses,
-                 const PrimitiveMesh&        m,
-                 const FvGeometry&           g,
-                 const std::vector<FvPatch>& patches);
+// alpha1L = fvc::average(fvc::interpolate(alpha1L)), nPasses times, on a copy of alpha that carries alpha's
+// patch fields. fvc::average is AREA-WEIGHTED, and an empty patch has no faces in it.
+// IN/OUT alpha: the copy's cells. IN/OUT boundary: its patch values -- alpha's stored ones on entry; on return
+// a wedge's, a symmetry plane's and an empty patch's are the smoothed cell's and every other patch's are
+// what they were (interface_properties_cpp.cu has the reading).
+void smoothAlpha(
+    std::vector<scalar>& alpha,
+    std::vector<std::vector<scalar>>& boundary,
+    int nPasses,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches);
 
 // The contact-angle rotation. POSTCONDITION: acos(nHatp & nf) == theta.
 void correctContactAngle(std::vector<vector>&       nHatp,

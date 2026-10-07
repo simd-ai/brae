@@ -300,6 +300,26 @@ int main()
         for (label i = 0; i < c.m.nCells(); ++i)
             v[i] = ((i % 2) == 0) ? scalar(0.4) : scalar(0.6);
 
+        // the patch values a field whose patches are all zeroGradient stores: each face's own cell
+        // (smoothAlpha takes them as OpenFOAM's copy of alpha1 does, and no wall follows the smoothed cell)
+        auto wallValues = [&c](const std::vector<scalar>& x)
+        {
+            std::vector<std::vector<scalar>> b(c.fvp.size());
+            for (std::size_t pi = 0; pi < c.fvp.size(); ++pi)
+            {
+                for (label i = 0; i < c.fvp[pi].size; ++i)
+                {
+                    b[pi].push_back(x[c.fvp[pi].faceCells[i]]);
+                }
+            }
+            return b;
+        };
+        auto smooth = [&c, &wallValues](std::vector<scalar>& x, int nPasses)
+        {
+            std::vector<std::vector<scalar>> b = wallValues(x);
+            smoothAlpha(x, b, nPasses, c.m, c.g, c.fvp);
+        };
+
         // THE ORACLE AND ITS RIVAL, both one pass, computed here from OpenFOAM's own expression.
         {
             const SurfaceScalarField f = fvc::interpolate(v, c.m, c.g, c.fvp);
@@ -323,7 +343,7 @@ int main()
                     pNum[ci] += f.boundary[pi][i];   pDen[ci] += scalar(1);
                 }
             std::vector<scalar> got = v;
-            smoothAlpha(got, 1, c.m, c.g, c.fvp);
+            smooth(got, 1);
             scalar wErr = 0, rivalGap = 0;
             for (std::size_t i = 0; i < v.size(); ++i)
             {
@@ -345,14 +365,15 @@ int main()
         };
         const scalar before = spread(v);
         std::vector<scalar> s1 = v, s3 = v;
-        smoothAlpha(s1, 1, c.m, c.g, c.fvp);
-        smoothAlpha(s3, 3, c.m, c.g, c.fvp);
+        smooth(s1, 1);
+        smooth(s3, 3);
         std::printf("  checkerboard spread: %.4f -> %.4f (1 pass) -> %.4f (3 passes)\n",
                     (double)before, (double)spread(s1), (double)spread(s3));
         check("one smoothing pass reduces the spread", spread(s1) < before);
         check("...and three reduce it further", spread(s3) < spread(s1));
-        check("zero passes leaves the field untouched",
-              [&]{ std::vector<scalar> z = v; smoothAlpha(z, 0, c.m, c.g, c.fvp); return z == v; }());
+        std::vector<scalar> s0 = v;
+        smooth(s0, 0);
+        check("zero passes leaves the field untouched", s0 == v);
 
         // ...and the combination brae will not run: NO OpenFOAM tutorial sets nAlphaSmoothCurvature at
         // all, so there is no case to validate leastSquares-plus-smoothing against.

@@ -20,52 +20,147 @@
 #include "fvc.cuh"
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 
 namespace brae {
 namespace cpu {
 namespace interfaceProps {
 
-void smoothAlpha(std::vector<scalar>&        alpha,
-                 int                         nPasses,
-                 const PrimitiveMesh&        m,
-                 const FvGeometry&           g,
-                 const std::vector<FvPatch>& patches)
+namespace {
+
+// A patch whose value of a scalar IS its cell's: an empty patch has no faces of its own, and a wedge's or a
+// symmetry plane's evaluate is the cell's value transformed, which for a scalar is the value
+// (wedgeFvPatchField.C:136-144, basicSymmetryFvPatchField.C:105-116)
+bool followsItsCell(const FvPatch& q)
 {
-    // interfaceProperties.C:117-127: alpha1L = fvc::average(fvc::interpolate(alpha1L)), n times.
+    return q.type == "empty" || q.type == "wedge" || q.type == "symmetry" || q.type == "symmetryPlane";
+}
+
+// The gate's controls, not user switches: BRAE_CONTROL_SMOOTH_CURVATURE names ONE part of the smoothing to run
+// as it ran before 2026-10-07 -- `empty` sums the empty faces into the average, `patches` lets every patch
+// follow the smoothed cell, `transform` keeps a wedge's and a symmetry plane's value through the passes as every
+// other patch's is kept, `snGrad` takes the patches' normal gradient against alpha1's own cells
+bool smoothControl(const char* part)
+{
+    static const char* const set = std::getenv("BRAE_CONTROL_SMOOTH_CURVATURE");
+    return set && std::strcmp(set, part) == 0;
+}
+
+} // namespace
+
+void smoothAlpha(
+    std::vector<scalar>& alpha,
+    std::vector<std::vector<scalar>>& boundary,
+    int nPasses,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    // interfaceProperties.C:117-127: alpha1L = fvc::average(fvc::interpolate(alpha1L)), n times, on a COPY of
+    // alpha1 that carries alpha1's patch fields. `boundary` is that copy's patch values: alpha1's on entry,
+    // the smoothed copy's on return.
     //
     // fvc::average is AREA-WEIGHTED -- surfaceSum(magSf*ssf)/surfaceSum(magSf) (fvcAverage.C) -- not a
     // plain mean of the face values. On a uniform mesh the two coincide, which is why the weighting is
     // easy to drop; on a graded or anisotropic mesh they do not, and the difference lands in the
     // interface NORMAL, so it shows up as curvature rather than as an obviously wrong alpha.
+    //
+    // WHAT A PATCH CONTRIBUTES (fvcAverage.C:72-86, surfaceSum in fvcSurfaceIntegrate.C):
+    //   * an EMPTY patch, nothing: its fvPatch has no faces (emptyFvPatch.H:79-82), so neither the sum nor
+    //     the area sees it -- and on a 2-D case the two empty faces are the largest of a cell's six.
+    //   * a wedge or a symmetry plane, its cell's value after the pass before: assigning to a transform
+    //     patch is an evaluate (transformFvPatchField.C:142-148).
+    //   * EVERY OTHER PATCH, the value alpha1 had there BEFORE THE FIRST PASS, through every pass. The
+    //     average's own patches are `calculated`: they take the face values, which at an uncoupled patch are
+    //     the field's patch values; its correctBoundaryConditions leaves them; and `alpha1L = average` hands
+    //     the same numbers back -- copied onto a zeroGradient or a fixedGradient patch
+    //     (fvPatchField.C:407-414), kept by a fixedValue or a mixed one (their operator= is empty),
+    //     re-blended by an inletOutlet at a valueFraction of 0 or 1 (inletOutletFvPatchField.C:143-152).
+    //     So a zeroGradient wall does NOT follow its smoothed cell: nothing evaluates the copy.
+    // MEASURED 2026-10-07 against OpenFOAM at nAlphaSmoothCurvature 2, six steps, with the empty faces summed
+    // and every patch taken from the smoothed cells: RAS/damBreakPermeable (2-D) alphaPhi 3.0e-03, U 1.8e-03;
+    // laminar/capillaryRise phi 8.4e-01. As written here: capillaryRise 7.8e-15, damBreakPermeable 2.1e-13,
+    // RAS/weirOverflow 1.2e-13, LES/nozzleFlow2D (wedge) 4.4e-13 -- tests/interfoam_write/core/
+    // smooth_curvature.sh and smooth_curvature_wedge.sh hold the first, third and fourth.
     const label nIf = m.nInternalFaces();
     const std::vector<label>&  own = m.owner();
     const std::vector<label>&  nei = m.neighbour();
     const std::vector<scalar>& magSf = g.magSf();
+    const bool sumEmpty = smoothControl("empty");
+    const bool everyPatchFollows = smoothControl("patches");
+    const bool transformKept = smoothControl("transform");
+
+    if (boundary.size() != patches.size())
+    {
+        throw std::runtime_error(
+            "brae interfaceProperties::smoothAlpha: the patch values do not cover the mesh's patches.");
+    }
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& q = patches[pi];
+        if (q.type != "empty" && boundary[pi].size() != static_cast<std::size_t>(q.size))
+        {
+            throw std::runtime_error(
+                "brae interfaceProperties::smoothAlpha: patch '" + q.name + "' has "
+                + std::to_string(q.size) + " face(s) and " + std::to_string(boundary[pi].size())
+                + " value(s). The smoothing reads alpha's stored patch values, so they have to be there.");
+        }
+    }
 
     for (int pass = 0; pass < nPasses; ++pass)
     {
         const SurfaceScalarField f = fvc::interpolate(alpha, m, g, patches);
-        std::vector<scalar> num(alpha.size(), scalar(0)), den(alpha.size(), scalar(0));
+        std::vector<scalar> num(alpha.size(), scalar(0));
+        std::vector<scalar> den(alpha.size(), scalar(0));
         for (label fi = 0; fi < nIf; ++fi)
         {
             const scalar a = magSf[fi];
             // surfaceSum adds to BOTH sides with the same sign
-            num[own[fi]] += a * f.internal[fi];  den[own[fi]] += a;
-            num[nei[fi]] += a * f.internal[fi];  den[nei[fi]] += a;
+            num[own[fi]] += a * f.internal[fi];
+            den[own[fi]] += a;
+            num[nei[fi]] += a * f.internal[fi];
+            den[nei[fi]] += a;
         }
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
             const FvPatch& q = patches[pi];
+            const bool empty = q.type == "empty";
+            if (empty && !sumEmpty)
+            {
+                continue;
+            }
             for (label i = 0; i < q.size; ++i)
             {
                 const label ci = q.faceCells[i];
                 const scalar a = magSf[q.start + i];
-                num[ci] += a * f.boundary[pi][i];
+                num[ci] += a * (empty ? alpha[ci] : boundary[pi][i]);
                 den[ci] += a;
             }
         }
         for (std::size_t c = 0; c < alpha.size(); ++c)
-            if (den[c] > scalar(0)) alpha[c] = num[c] / den[c];
+        {
+            if (den[c] > scalar(0))
+            {
+                alpha[c] = num[c] / den[c];
+            }
+        }
+        // ...and the patches that follow their cell take the new one. An empty patch's are filled too, for
+        // the gradient below: it sums every face it is handed, and the pair of them cancels as it does for
+        // alpha1's own gradient.
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const FvPatch& q = patches[pi];
+            const bool follows = q.type == "empty" || (followsItsCell(q) && !transformKept) || everyPatchFollows;
+            if (!follows)
+            {
+                continue;
+            }
+            boundary[pi].resize(static_cast<std::size_t>(q.size));
+            for (label i = 0; i < q.size; ++i)
+            {
+                boundary[pi][i] = alpha[q.faceCells[i]];
+            }
+        }
     }
 }
 
@@ -204,7 +299,8 @@ void nHatBoundary(
     const std::vector<FvPatch>& patches,
     const std::vector<vector>& gradAlpha,
     SurfaceScalarField& nHatf,
-    bool skipEmpty = false)
+    bool skipEmpty = false,
+    const std::vector<scalar>* smoothedCells = nullptr)
 {
     const std::vector<vector>& Sf = g.Sf();
     // Patches that are not alphaContactAngle take the face cell's gradient unchanged (fvc::interpolate at
@@ -232,8 +328,25 @@ void nHatBoundary(
         // what the contact angle SETS, so taking the raw cell gradient here discards the boundary
         // condition's own contribution to the normal the curvature is built from. Measured on
         // capillaryRise, where the contact angle carries the whole case.
+        //
+        // WHOSE snGrad. gaussGrad asks the field it differentiated -- under nAlphaSmoothCurvature the smoothed
+        // COPY, which carries alpha1's patch fields (their values, gradients and fractions) over the SMOOTHED
+        // cells: a fixedValue's deltaCoeffs*(value - cell) and a mixed patch's blend read the smoothed cell
+        // there, a contact angle's is its gradient either way, and a patch that follows its cell has none.
         std::vector<vector> gb(static_cast<std::size_t>(q.size));
-        const std::vector<scalar> snA = alpha1.boundary[pi]->snGrad(alpha1.internal);
+        std::vector<scalar> snA;
+        if (!smoothedCells || smoothControl("snGrad"))
+        {
+            snA = alpha1.boundary[pi]->snGrad(alpha1.internal);
+        }
+        else if (followsItsCell(q))
+        {
+            snA.assign(static_cast<std::size_t>(q.size), scalar(0));
+        }
+        else
+        {
+            snA = alpha1.boundary[pi]->snGrad(*smoothedCells);
+        }
         for (label i = 0; i < q.size; ++i)
         {
             if (q.coupled)
@@ -313,8 +426,12 @@ std::vector<vector> nHatCellGradient(
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& patches,
-    bool gradLeastSquares)
+    bool gradLeastSquares,
+    std::vector<scalar>& smoothedCells)
 {
+    // OUT smoothedCells: the smoothed copy's cells under nAlphaSmoothCurvature, EMPTY without it -- the
+    // boundary half takes the patches' normal gradient against them (nHatBoundary)
+    smoothedCells.clear();
     // `fvc::grad(alpha1, "nHat")` looks up the gradSchemes entry NAMED nHat -- not grad(alpha.water) and
     // not default. 43 of the 44 shipped tutorials say `default Gauss linear` and name no nHat entry, so
     // they fall to that; the caller resolves which, and passing the wrong one changes the interface normal.
@@ -346,23 +463,16 @@ std::vector<vector> nHatCellGradient(
                     "brae interfaceProperties: nAlphaSmoothCurvature across the coupled patch '" + q.name
                     + "' is not ported.");
         }
+        // the copy's patch values are alpha1's STORED ones, and smoothAlpha says which of them move
         std::vector<scalar> a = alpha1.internal;
-        smoothAlpha(a, c.nAlphaSmoothCurvature, m, g, patches);
-
-        // fvc::average calls correctBoundaryConditions, so the smoothed field's boundary is
-        // re-evaluated from its own internal field. zeroGradient patches therefore follow the
-        // smoothed cell value; a patch that FIXES a value keeps it.
         std::vector<std::vector<scalar>> ab(patches.size());
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
-            const FvPatch& q = patches[pi];
-            ab[pi].resize(static_cast<std::size_t>(q.size));
-            const bool fixes = alpha1.boundary[pi]->fixesValue();
-            const std::vector<scalar>& fixed = alpha1.boundary[pi]->value();
-            for (label i = 0; i < q.size; ++i)
-                ab[pi][i] = fixes ? fixed[i] : a[q.faceCells[i]];
+            ab[pi] = alpha1.boundary[pi]->value();
         }
+        smoothAlpha(a, ab, c.nAlphaSmoothCurvature, m, g, patches);
         gradAlpha = gaussGradFromValues(a, ab, m, g, patches);
+        smoothedCells = std::move(a);
     }
     return gradAlpha;
 }
@@ -392,7 +502,10 @@ void calculateK(
     const scalar dN = c.deltaN;
 
     // 1. the cell gradient, optionally smoothed first (nHatCellGradient)
-    const std::vector<vector> gradAlpha = nHatCellGradient(alpha1, c, m, g, patches, gradLeastSquares);
+    std::vector<scalar> smoothedCells;
+    const std::vector<vector> gradAlpha =
+        nHatCellGradient(alpha1, c, m, g, patches, gradLeastSquares, smoothedCells);
+    const std::vector<scalar>* smoothed = smoothedCells.empty() ? nullptr : &smoothedCells;
 
     // 2. interpolate the cell gradient to faces, component by component.
     const label nIf = m.nInternalFaces();
@@ -421,7 +534,7 @@ void calculateK(
         nHatf.internal[f] = nHatfv[f].x*Sf[f].x + nHatfv[f].y*Sf[f].y + nHatfv[f].z*Sf[f].z;
 
     // ...and the boundary, where the contact-angle correction lives (nHatBoundary)
-    nHatBoundary(alpha1, dN, g, patches, gradAlpha, nHatf);
+    nHatBoundary(alpha1, dN, g, patches, gradAlpha, nHatf, false, smoothed);
 
     // 5. K = -div(nHatf)
     curvature(nHatf, m, g, patches, K);
@@ -563,9 +676,11 @@ void calculateNHatBoundaryOfWholeGradient(
     }
     // calculateK's step 1 and its boundary half, with nothing of what lies between them or after: the
     // gradient at the faces, the internal faces' normal and the curvature feed no patch face's normal
-    const std::vector<vector> gradAlpha = nHatCellGradient(alpha1, c, m, g, patches, false);
+    std::vector<scalar> smoothedCells;
+    const std::vector<vector> gradAlpha = nHatCellGradient(alpha1, c, m, g, patches, false, smoothedCells);
     nHatf.internal.clear();
-    nHatBoundary(alpha1, c.deltaN, g, patches, gradAlpha, nHatf);
+    nHatBoundary(alpha1, c.deltaN, g, patches, gradAlpha, nHatf, false,
+                 smoothedCells.empty() ? nullptr : &smoothedCells);
 }
 
 bool nHatBoundaryOfSubsetApplies(
