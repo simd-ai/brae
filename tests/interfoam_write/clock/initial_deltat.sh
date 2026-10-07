@@ -23,10 +23,9 @@
 # something BOUND absorbs.
 # The CONTROL leaves the statement out (BRAE_CONTROL_INITIAL_DELTAT_SKIPPED=1) on the row with a flux, in each
 # loop: the first step must be 0.011/4 there.
-# DOES NOT CLAIM the branch where the Courant number at the start exceeds maxCo (the value is then
-# maxCo*deltaT/CoNum: worked from the source in tests/test_time_controls_openfoam_log.cu, and its landing on
-# the cadence runs nowhere); the pair's faces in the device's sum at that call (no pair here); a restart (time
-# index above 0, where the statement is not reached); LTS (interFoam.C skips it).
+# NOT HERE: the branch where the Courant number at the start exceeds maxCo, and the pair's faces in the device's
+# sum at that call -- clock/initial_deltat_pair.sh holds both, on a baffle. DOES NOT CLAIM a restart (time
+# index above 0, where the statement is not reached) or LTS (interFoam.C skips it).
 . "$(dirname "$0")/../lib.sh"
 [ $GPU -eq 1 ] || { echo "SKIP: no GPU for the device arm"; exit 77; }
 STOP=0.022
