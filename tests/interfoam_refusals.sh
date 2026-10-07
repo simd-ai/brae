@@ -239,6 +239,23 @@ arm startFrom_absent        runs    -                           "" "sed -i '/^st
 # a Switch read as OpenFOAM's Switch (Switch.C:87-137): `y` is yes, and a word that is not one stops the run
 arm adjustTimeStep_y        runs    -                           "" "sed -i 's/^adjustTimeStep .*/adjustTimeStep  y;/' system/controlDict"
 arm adjustTimeStep_typo     refused "Unknown switch"            "" "sed -i 's/^adjustTimeStep .*/adjustTimeStep  yse;/' system/controlDict"
+# constant/turbulenceProperties, as OpenFOAM reads it (TurbulenceModel.C:91-104, laminarModel.C:109-135,
+# RASModel.C:140-144, LESModel.C:158-162): the one file name, MUST_READ, `simulationType` with no default, the
+# model by `model` and by its older name only where that is absent, and a `laminar` sub-dictionary that
+# selects the stress model. A case with no file, or with another fork's constant/momentumTransport, ran as
+# laminar; `laminar { model generalisedNewtonian; }` ran Newtonian; `RAS { model kEpsilon; }` was refused.
+arm turb_file_missing       refused "has no constant/turbulenceProperties" "" "rm constant/turbulenceProperties"
+arm turb_other_forks_name   refused "has no constant/turbulenceProperties" "" "mv constant/turbulenceProperties constant/momentumTransport"
+arm turb_no_simulationType  refused "has no \`simulationType\`"   "" "sed -i '/^simulationType/d' constant/turbulenceProperties"
+arm turb_laminar_Stokes     runs    -                           "" "printf 'laminar { model Stokes; }\n' >> constant/turbulenceProperties"
+arm turb_laminar_olderName  runs    -                           "" "printf 'laminar { laminarModel Stokes; }\n' >> constant/turbulenceProperties"
+arm turb_laminar_other      refused "names the stress model \`generalisedNewtonian\`" "" "printf 'laminar { model generalisedNewtonian; }\n' >> constant/turbulenceProperties"
+arm turb_laminar_noModel    refused "names the stress model"    "" "printf 'laminar { }\n' >> constant/turbulenceProperties"
+BASE="$BR"
+arm turb_RAS_model          runs    -                           "" "sed -i 's/^\( *\)RASModel /\1model /' constant/turbulenceProperties; grep -q '^ *model ' constant/turbulenceProperties"
+BASE="$BL"
+arm turb_LES_model          runs    -                           "" "sed -i 's/^\( *\)LESModel /\1model /' constant/turbulenceProperties; grep -q '^ *model ' constant/turbulenceProperties"
+BASE="$B"
 
 # FROZEN PER-STEP BOUNDARY CONDITIONS. The shared factory ACCEPTS fixedMean, fanPressure,
 # codedFixedValue and codedMixed on the strength of a per-step update its own comment promises, and

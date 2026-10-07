@@ -1595,7 +1595,8 @@ InterWriter::InterWriter(
                                  + "` -- OpenFOAM knows general, fixed and scientific (IOstreamOption.H:102-110).");
     }
     timePrecision_ = cd.intOr("timePrecision", 6);
-    deltaTSave_ = cd.scalarOr("deltaT", scalar(0));
+    // Time's own two, as setControls leaves them: the step the run begins with (startDeltaT) in both
+    deltaTSave_ = startDeltaT(cd, startDir, cd.scalarOr("deltaT", scalar(0)));
     deltaT0_ = deltaTSave_;
 
     if (const FoamDict* fns = cd.subDict("functions"))
@@ -1616,16 +1617,8 @@ InterWriter::InterWriter(
 
     // A RESTART continues OpenFOAM's time index and cumulative continuity error from the start directory
     // (Time.C:304-307, initContinuityErrs.H:40-52) -- the index is the case's, InterFields::startTimeIndex,
-    // which the loops hand the write schedule. deltaT and deltaT0 OpenFOAM also reads there
-    // (Time.C:291-302); brae's solver starts from controlDict's deltaT, and says so.
-    const std::string ut = startDir + "/uniform/time";
-    if (fs::exists(ut))
-    {
-        noticeIgnored(
-            "uniform/time deltaT/deltaT0",
-            "the restart starts from controlDict's deltaT; OpenFOAM reads the stored deltaT under "
-            "adjustTimeStep and deltaT0 always (Time.C:291-302)");
-    }
+    // which the loops hand the write schedule -- and its step, the stored deltaT under adjustTimeStep
+    // (startDeltaT above; the case reader takes the same number for the loops).
     const std::string startAlphaOld = startDir + "/alpha." + phase1Name + "_0";
     startHoldsAlphaOld_ = fs::exists(startAlphaOld) || fs::exists(startAlphaOld + ".gz");
     const std::string cce = startDir + "/uniform/cumulativeContErr";

@@ -997,6 +997,8 @@ InterFields buildInterFields(const std::string&          caseDir,
                 f.startTimeIndex = static_cast<label>(readDict(timePath).scalarOr("index", scalar(0)));
             }
         }
+        // ...and the step it starts with: the stored one under adjustTimeStep (startDeltaT, time_controls.cuh)
+        f.deltaT = startDeltaT(controlDict, startDir, f.deltaT);
         if (!f.lts && f.ddtU == DdtScheme::localEuler)
             throw std::runtime_error(
                 "brae interFoam: ddtSchemes resolves `ddt(rho,U)` to `" + ddtRhoU + "` under a `default` that "

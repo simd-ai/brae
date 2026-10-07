@@ -32,6 +32,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -84,6 +85,34 @@ inline scalar timeControlGrowthCap()
                     "growth. This run is deliberately wrong. ***\n");
     }
     return uncapped ? timeControlGreat : scalar(1.2);
+}
+
+// THE STEP A RUN BEGINS WITH. Time::setControls (Time.C:193-195, 279-292) takes controlDict's deltaT, and then --
+// under `adjustTimeStep` alone -- the `deltaT` of <start>/uniform/time where that file has one: a restart
+// continues the step the run was written with. deltaTSave_ and deltaT0_ follow it, so the first step's
+// "previous step" is that number too. The file's own `deltaT0` is read (Time.C:294) and never reaches a
+// result: Time::operator++ overwrites it with deltaTSave_ before anything asks (Time.C, operator++), which
+// tests/interfoam_write/clock/restart_deltat.sh holds against OpenFOAM itself.
+// brae began every restart from controlDict's deltaT and said so in a notice: an adaptive continuation
+// re-grew its step at 1.2 a step from there.
+//   BRAE_CONTROL_RESTART_DELTAT_CONTROLDICT=1: a gate's CONTROL, deliberately wrong -- controlDict's, as before.
+inline scalar startDeltaT(
+    const FoamDict& controlDict,
+    const std::string& startDir,
+    scalar controlDictDeltaT)
+{
+    static const bool fromControlDict = std::getenv("BRAE_CONTROL_RESTART_DELTAT_CONTROLDICT") != nullptr;
+    if (fromControlDict || !controlDict.switchOr("adjustTimeStep", false))
+    {
+        return controlDictDeltaT;
+    }
+    const std::string timePath = startDir + "/uniform/time";
+    if (!std::filesystem::exists(timePath) && !std::filesystem::exists(timePath + ".gz"))
+    {
+        return controlDictDeltaT;
+    }
+    const FoamDict timeDict = readDict(timePath);
+    return timeDict.found("deltaT") ? timeDict.scalarOr("deltaT", controlDictDeltaT) : controlDictDeltaT;
 }
 
 struct TimeControls
