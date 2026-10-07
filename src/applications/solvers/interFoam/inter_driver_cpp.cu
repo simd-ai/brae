@@ -1217,6 +1217,7 @@ RunReport runInterFoam(
                     ai.rDeltaT = rDeltaTFor("alpha");
                     ai.alphaApplyPrevCorr = f.alphaCtl.alphaApplyPrevCorr;
                     ai.alpha2BndOut = &f.alpha2Bnd;
+                    ai.alpha2Bnd = &f.alpha2Bnd;
                     // the case's own tolerances, where a struct default of 1e-8 used to stand
                     // the entry of THIS outer corrector: `<alpha>Final` on the last (InterFields::aSolveFinal)
                     const InterFields::AlphaLinearSolve& aSel =

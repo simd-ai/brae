@@ -184,6 +184,10 @@ struct DeviceInterAlphaControls
     // 223) and NOT at the mixture.correct() after the sub-cycle, which leaves alpha2 alone. They are
     // one contact-angle pass older than alpha1's -- see deviceBoundaryRho.
     DeviceBuffer<scalar>* alpha2BndOut = nullptr;
+    // ...KEPT ACROSS STEPS where a corrector's compressive flux reads them (the driver's buffer; then
+    // alpha2BndOut is this one), with the faces that take them. See DeviceAlphaStepInput::alpha2BndStored.
+    DeviceBuffer<scalar>* alpha2BndStored = nullptr;
+    const DeviceBuffer<int>* alpha2BndStoredMask = nullptr;
     // appended to, one record per pre-solve; null = not kept
     std::vector<DeviceSolverPerf>* preSolveLog = nullptr;
     // ...and the field that pre-solve LEAVES, plus its flux on the pair, for a gate bisecting the

@@ -41,6 +41,20 @@ __global__ void zeroGradientKernel(const label* __restrict__ bndCell, const scal
     if (i < nB) out[i] = vol[bndCell[i]];
 }
 
+// the stored value on the faces whose patch keeps one (DeviceAlphaStepInput::alpha2BndStored)
+__global__ void storedWhereKernel(
+    const int* __restrict__ mask,
+    const scalar* __restrict__ stored,
+    int nB,
+    scalar* __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < nB && mask[i])
+    {
+        out[i] = stored[i];
+    }
+}
+
 // pos0(phi) -- upwind's face weight. 1 takes the owner, 0 the neighbour, and phi == 0 takes the owner
 // (pos0, not pos), which is the tie-break every OpenFOAM upwind scheme makes.
 __global__ void upwindWeightKernel(const scalar* __restrict__ phi, int n, scalar* __restrict__ w)
@@ -283,6 +297,14 @@ void deviceAlphaCorrector(
         zeroGradientKernel<<<nBlocks(nBf), TPB>>>(dm.bndCell.data(), alpha2.data(), nBf,
                                                   alpha2Bnd.data());
         ckS(cudaGetLastError(), "alpha2 boundary");
+        if (in.alpha2BndStored && in.alpha2BndStoredMask
+         && in.alpha2BndStored->size() == static_cast<std::size_t>(nBf)
+         && in.alpha2BndStoredMask->size() == static_cast<std::size_t>(nBf))
+        {
+            storedWhereKernel<<<nBlocks(nBf), TPB>>>(in.alpha2BndStoredMask->data(),
+                                                     in.alpha2BndStored->data(), nBf, alpha2Bnd.data());
+            ckS(cudaGetLastError(), "alpha2 boundary, stored");
+        }
     }
 
     // alphaPhiUn, alphaEqn.H:164-176. Term 1 is plain advection; term 2 is TWO MINUS SIGNS deep,

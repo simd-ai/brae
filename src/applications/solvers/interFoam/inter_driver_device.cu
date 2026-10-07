@@ -4611,6 +4611,66 @@ RunReport runInterFoamDevice(
     C.alpha.alphaApplyPrevCorr = f.alphaCtl.alphaApplyPrevCorr;
     C.alpha.prevCorrInt = &dPrevCorrI;
     C.alpha.prevCorrBnd = &dPrevCorrB;
+    // alpha2's STORED PATCH VALUES, where the compressive flux's limiter reads them. alpha2 is a stored field,
+    // assigned `1.0 - alpha1` at alphaEqn.H:152 and :223, and fvc::flux(-phir, alpha2, alpharScheme) takes a
+    // gradient of it under a limited scheme (vanLeer here): its patch values are alpha1's as they stood at
+    // the last assignment, one curvature pass older than alpha1's own. The corrector built alpha2's from the
+    // cells, which is the same number on a patch whose value is its cell's (zeroGradient, empty, a symmetry
+    // plane, a wedge) and not on a contact angle, an inlet, or an inletOutlet in inflow. MEASURED 2026-10-07
+    // on laminar/capillaryRise with `div(phirb,alpha) Gauss vanLeer`, six pinned steps: U 3.0e-03 from
+    // OpenFOAM's on both loops. No shipped tutorial pairs the scheme with such a patch (the seven that name
+    // vanLeer there have zeroGradient and empty alpha patches alone).
+    // Kept here across steps, for the faces of the patches that need it and for no other; the step's
+    // assignments write this buffer (DeviceInterAlphaControls::alpha2BndStored).
+    //   BRAE_CONTROL_ALPHA2_PATCH_ZERO_GRADIENT=1: a gate's CONTROL, deliberately wrong -- the cells' value on
+    //   every face, as before (the host loop reads the same switch).
+    DeviceBuffer<scalar> dAlpha2Stored;
+    DeviceBuffer<int> dAlpha2StoredMask;
+    {
+        static const bool zeroGradientEverywhere = std::getenv("BRAE_CONTROL_ALPHA2_PATCH_ZERO_GRADIENT") != nullptr;
+        std::vector<int> mask;
+        long kept = 0;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (isCoupledInterfaceType(fvp[pi].type))
+            {
+                continue;
+            }
+            const std::string& type = fvp[pi].type;
+            const bool cellValued = type == "empty" || type == "symmetry" || type == "symmetryPlane" || type == "wedge"
+                                 || dynamic_cast<const ZeroGradientPatchField<scalar>*>(f.alpha1.boundary[pi].get());
+            mask.insert(mask.end(), static_cast<std::size_t>(fvp[pi].size), cellValued ? 0 : 1);
+            kept += cellValued ? 0 : fvp[pi].size;
+        }
+        if (f.divPhirbAlpha == cpu::interFoam::AlphaFluxScheme::vanLeer && kept > 0 && !zeroGradientEverywhere)
+        {
+            // ...BUT NOT ON A MESH THAT REFINES: the values would have to come down, be mapped with the faces
+            // and go up again at every change, and no fixture holds that. The host loop carries them through a
+            // change (inter_amr_cpp.cu) and runs the case.
+            if (f.amr && f.amr->active)
+            {
+                throw std::runtime_error(
+                    "brae interFoam -device: `div(phirb,alpha)` is vanLeer, an alpha patch keeps a value of its "
+                    "own (a contact angle, an inlet, an inletOutlet) and the mesh refines. The limiter's "
+                    "gradient of alpha2 reads alpha2's stored patch values (alphaEqn.H:164-176), which this "
+                    "loop does not carry through a topology change. The host loop runs it.");
+            }
+            dAlpha2Stored.copyFrom(flattenPatches(f.alpha2Bnd, fvp));
+            dAlpha2StoredMask.copyFrom(mask);
+            C.alpha.alpha2BndStored = &dAlpha2Stored;
+            C.alpha.alpha2BndStoredMask = &dAlpha2StoredMask;
+            std::printf("  alpha2: the compressive flux's limiter reads alpha2's stored patch values on %ld "
+                        "boundary face(s), the cells' value on the others\n", kept);
+        }
+        // THE HOST'S COPY IS NOT KEPT ON THIS LOOP. The case reader fills it at alpha2's construction and the
+        // HOST loop's alpha step re-assigns it every corrector; here the assignments are the device's, so the
+        // vector would stay at its construction for the whole run -- and updateMixtureBoundary, which the
+        // alpha hook calls for rho on a patch, blends rho2 with it where it finds it. Emptied, that function
+        // takes 1 - alpha1's patch value, as this loop always had it. FOUND by the damBreak gate's `inflow`
+        // profile the day the reader began filling it: p_rgh 2.6e-04 and U 1.7e-04 from OpenFOAM by step
+        // three, the atmosphere's rho blended with the alpha2 of a start that had no water there.
+        f.alpha2Bnd.clear();
+    }
     // gradSchemes: every scalar gradient on this arm takes the case's own entry. grad(p_rgh) goes through
     // deviceGradOf at the corrected laplacian's explicit correction; alpha1's and alpha2's limiter
     // gradients through the alpha step (DeviceAlphaStepInput::gradAlpha1LeastSquares and its siblings);

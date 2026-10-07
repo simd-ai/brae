@@ -183,7 +183,7 @@
 // BEGIN DEVICE REFUSALS
 //   device_gamg_smootherDILU device_gradLsq
 //   device_refine_motion device_eulerU_cnAlpha_moving device_eulerU_cnAlpha_refining
-//   device_prevCorr_pair
+//   device_prevCorr_pair device_alpha2Patches_refining
 //   device_gradUCache device_gradUCacheKEpsilon device_gradUCacheLimited device_gradUCacheCoupled
 // END DEVICE REFUSALS
 #include "device_schedule.cuh"

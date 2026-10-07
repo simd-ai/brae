@@ -1236,6 +1236,15 @@ if [ $HAVE_GPU = 1 ]; then
     # solver's pointer, which such a mesh does not have, and the case ran with nothing said.
     arm device_eulerU_cnAlpha_refining refused "under an Euler ddt(rho,U) on a mesh that moves" "-device" \
         "$REFDICT '' > constant/dynamicMeshDict; ddtblock 'default Euler;' 'ddt(alpha) CrankNicolson 0.9;'"
+    # ...and a limited compressive scheme beside an alpha patch that keeps a value of its own (damBreak's
+    # atmosphere is inletOutlet) on a mesh that REFINES: the limiter's gradient of alpha2 reads alpha2's stored
+    # patch values, which the device loop keeps across steps and does not carry through a topology change. On a
+    # mesh that does not refine it runs, and says how many faces take the stored value.
+    VLR="sed -i -E 's/^( *div\\(phirb,alpha\\) +)Gauss linear;/\\1Gauss vanLeer;/' system/fvSchemes; grep -q 'div(phirb,alpha) *Gauss vanLeer' system/fvSchemes"
+    arm device_alpha2Patches_refining refused "does not carry through a topology change" "-device" \
+        "$REFDICT '' > constant/dynamicMeshDict; $VLR"
+    arm device_alpha2Patches runs  "alpha2's stored patch values on" "-device" "$VLR"
+    arm alpha2Patches_refining_host runs -                        "" "$REFDICT '' > constant/dynamicMeshDict; $VLR"
     # ALPHA'S CrankNicolson UNDER AN Euler MOMENTUM, where the device loop would run alpha on the raw flux: more
     # than one outer corrector (the host loop runs it; with one corrector the two fluxes are one and the device runs)
     CNOUTER="ddtblock 'default Euler;' 'ddt(alpha) CrankNicolson 0.9;'"

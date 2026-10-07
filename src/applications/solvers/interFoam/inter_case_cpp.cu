@@ -1749,6 +1749,20 @@ InterFields buildInterFields(const std::string&          caseDir,
     refuseFrozenPerStepBC(prghData, "p_rgh", "interFoam", /*codedMaintained=*/false);
     f.p_rgh  = buildField<scalar>(prghData, patches, nC);
     f.alpha1.evaluateBoundary();
+    // alpha2 IS CONSTRUCTED HERE, as 1.0 - alpha1 (twoPhaseMixture.C:55-64): its patch values are alpha1's as
+    // alpha1's own construction left them, BEFORE interfaceProperties' first curvature pass moves a contact
+    // angle's. The first corrector's compressive flux reads them (AlphaStepInput::alpha2Bnd), and
+    // createFields.H's rho takes them for its rho2 half.
+    f.alpha2Bnd.resize(f.alpha1.boundary.size());
+    for (std::size_t pi = 0; pi < f.alpha1.boundary.size(); ++pi)
+    {
+        const std::vector<scalar>& ab = f.alpha1.boundary[pi]->value();
+        f.alpha2Bnd[pi].resize(ab.size());
+        for (std::size_t i = 0; i < ab.size(); ++i)
+        {
+            f.alpha2Bnd[pi][i] = scalar(1) - ab[i];
+        }
+    }
     f.U.evaluateBoundary();
     f.p_rgh.evaluateBoundary();
 

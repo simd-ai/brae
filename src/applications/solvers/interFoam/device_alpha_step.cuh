@@ -111,6 +111,12 @@ struct DeviceAlphaStepInput
     scalar gradAlpha1CellLimitK   = 0;
     bool   gradAlpha2LeastSquares = false;
     scalar gradAlpha2CellLimitK   = 0;
+    // alpha2's STORED patch values and the boundary faces that take them (1) in place of the cells' value
+    // (0): the compressive flux's limiter gradient reads alpha2 as the last `alpha2 = 1.0 - alpha1` left it
+    // (AlphaStepInput::alpha2Bnd on the host). Null: zero-gradient from the cells on every face, which is
+    // the same number wherever alpha1's patch value is its cell's.
+    const DeviceBuffer<scalar>* alpha2BndStored = nullptr;
+    const DeviceBuffer<int>*    alpha2BndStoredMask = nullptr;
     // ...and the interface normal's, which is NOT alpha1's entry: interfaceProperties.C:117 asks
     // fvc::grad(alpha1_, "nHat"), so the gradSchemes entry named nHat governs it (InterfaceCoeffs::nHatGrad).
     bool   nHatGradLeastSquares = false;

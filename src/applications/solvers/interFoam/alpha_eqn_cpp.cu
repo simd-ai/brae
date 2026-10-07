@@ -459,6 +459,25 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
     }
 
     SurfaceScalarField upwindFlux;              // talphaPhi1UD -- cached for alphaApplyPrevCorr
+    // `alpha2 = 1.0 - alpha1` (alphaEqn.H:152, :223): a whole-field assignment, so it fixes alpha2's PATCH
+    // values at alpha1's as they stand -- one line above the mixture.correct() that moves alpha1's
+    const auto assignAlpha2Patches = [&]()
+    {
+        if (!in.alpha2BndOut)
+        {
+            return;
+        }
+        in.alpha2BndOut->resize(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const std::vector<scalar>& ab = alpha1.boundary[pi]->value();
+            (*in.alpha2BndOut)[pi].resize(ab.size());
+            for (std::size_t i = 0; i < ab.size(); ++i)
+            {
+                (*in.alpha2BndOut)[pi][i] = scalar(1) - ab[i];
+            }
+        }
+    };
     if (in.MULESCorr)
     {
         // alphaEqn.H:103-155, THE IMPLICIT PRE-SOLVE.
@@ -583,6 +602,9 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
         // not a rounding difference. Missing it put damBreak at 1.05e-07 against OpenFOAM where the
         // full sequence gives 3.4e-09 -- thirty times worse, and only visible because damBreak is the
         // case that sets MULESCorr.
+        // ...and the assignment itself fixes alpha2's patch values, which the first corrector's
+        // compressive flux reads (AlphaStepInput::alpha2Bnd)
+        assignAlpha2Patches();
         interfaceProps::calculateK(alpha1, ic, m, g, patches, /*gradLeastSquares=*/false, nHatf, K);
     }
 
@@ -607,15 +629,29 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
                 phir.boundary[pi][i] = phic.boundary[pi][i] * nHatf.boundary[pi][i];
         }
 
-        // alpha2 = 1 - alpha1, rebuilt from the CURRENT alpha1 -- the compressive term reads it.
+        // alpha2 = 1 - alpha1, rebuilt from the CURRENT alpha1 -- the compressive term reads it. ITS PATCH
+        // VALUES are the stored field's, as the last `alpha2 = 1.0 - alpha1` left them
+        // (AlphaStepInput::alpha2Bnd); a coupled patch is evaluated from the cells either way.
+        //   BRAE_CONTROL_ALPHA2_PATCH_ZERO_GRADIENT=1: a gate's CONTROL, deliberately wrong -- zero-gradient
+        //   from the cells on every patch, as before.
+        static const bool alpha2ZeroGradient = std::getenv("BRAE_CONTROL_ALPHA2_PATCH_ZERO_GRADIENT") != nullptr;
         GeometricField<scalar> alpha2;
         alpha2.internal.resize(static_cast<std::size_t>(nC));
         for (label c = 0; c < nC; ++c) alpha2.internal[c] = scalar(1) - alpha1.internal[c];
-        for (const FvPatch& q : patches)
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
+            const FvPatch& q = patches[pi];
             if (q.coupled)
             {
                 alpha2.boundary.push_back(std::make_unique<CoupledCyclicPatchField<scalar>>(q));
+                continue;
+            }
+            const bool stored = !alpha2ZeroGradient && in.alpha2Bnd && pi < in.alpha2Bnd->size()
+                             && (*in.alpha2Bnd)[pi].size() == static_cast<std::size_t>(q.size) && q.size > 0;
+            if (stored)
+            {
+                alpha2.boundary.push_back(
+                    std::make_unique<FixedValuePatchField<scalar>>(q, false, scalar(0), (*in.alpha2Bnd)[pi]));
                 continue;
             }
             alpha2.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
@@ -684,19 +720,7 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
 
         // alpha2 = 1.0 - alpha1 (alphaEqn.H:223), a whole-field assignment, so alpha2's PATCH values
         // are fixed here -- one line above the mixture.correct() that rewrites alpha1's.
-        if (in.alpha2BndOut)
-        {
-            in.alpha2BndOut->resize(patches.size());
-            for (std::size_t pi = 0; pi < patches.size(); ++pi)
-            {
-                const std::vector<scalar>& ab = alpha1.boundary[pi]->value();
-                (*in.alpha2BndOut)[pi].resize(ab.size());
-                for (std::size_t i = 0; i < ab.size(); ++i)
-                {
-                    (*in.alpha2BndOut)[pi][i] = scalar(1) - ab[i];
-                }
-            }
-        }
+        assignAlpha2Patches();
 
         // ...and mixture.correct() at the BOTTOM of the corrector, alphaEqn.H:225. The next corrector
         // (or the next sub-cycle) compresses towards where MULES has just put the interface.

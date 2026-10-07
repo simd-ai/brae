@@ -196,9 +196,13 @@ void deviceInterStep(
     ain.rho2 = props.rho2;
 
     DeviceBuffer<scalar> alpha2;
-    DeviceBuffer<scalar> alpha2Bnd;
+    DeviceBuffer<scalar> alpha2BndOfThisStep;
+    // the driver's buffer where the compressive flux reads the values across steps, this step's own otherwise
+    DeviceBuffer<scalar>& alpha2Bnd = ctl.alpha.alpha2BndStored ? *ctl.alpha.alpha2BndStored : alpha2BndOfThisStep;
     DeviceInterAlphaControls actl = ctl.alpha;
     actl.alpha2BndOut = &alpha2Bnd;
+    ain.alpha2BndStored = ctl.alpha.alpha2BndStored;
+    ain.alpha2BndStoredMask = ctl.alpha.alpha2BndStoredMask;
     actl.rhoPhiIf     = ctl.rhoPhiIf;
     actl.nHatfIf      = ctl.nHatfIf;
     actl.preSolveAlphaOut      = taps ? &taps->preSolveAlpha : nullptr;

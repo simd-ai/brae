@@ -218,6 +218,13 @@ struct AlphaStepInput
     // OUT, optional: alpha2's patch values as `alpha2 = 1.0 - alpha1` leaves them (alphaEqn.H:223),
     // which is BEFORE the corrector's mixture.correct() moves alpha1's. See InterFields::alpha2Bnd.
     std::vector<std::vector<scalar>>* alpha2BndOut = nullptr;
+    // IN: those same patch values AS THEY STAND when a corrector forms its compressive flux -- the last
+    // assignment's, one curvature pass older than alpha1's. alpha2 is a stored field (twoPhaseMixture.C:55-64)
+    // and fvc::flux(-phir, alpha2, alpharScheme) takes its limiter's gradient on those values
+    // (alphaEqn.H:164-176, LimitedScheme.C:51-80). The step built alpha2 zero-gradient from the cells, which
+    // is the same number on a zeroGradient patch and not on a contact angle, an inlet or an inletOutlet in
+    // inflow. The caller hands the vector alpha2BndOut writes; null or unsized: zero-gradient, as before.
+    const std::vector<std::vector<scalar>>* alpha2Bnd = nullptr;
 
     const SurfaceScalarField* phi      = nullptr;   // the volumetric flux
     const SurfaceScalarField* phiCN    = nullptr;   // off-centred; == phi for Euler
