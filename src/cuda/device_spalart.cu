@@ -4,6 +4,7 @@
 #include "device_kepsilon.cuh"          // deviceSpalartAllmaras* decls + deviceGradU / deviceBoundaryNutSpalding / ScalarSolveEntry
 #include "device_scalar_transport.cuh"  // deviceSolveScalarTransport scaffold + nBlocks/TPB/turbStore
 #include "spalart_coeffs.cuh"
+#include <cstdlib>
 #include "device_ldu.cuh"
 #include "device_pcg.cuh"
 #include "device_simple.cuh"
@@ -36,7 +37,8 @@ __device__ inline scalar saPsi(scalar chi, const SpalartAllmarasCoeffs& co)
     const scalar fv1 = chi3 / (chi3 + Cv13);
     const scalar fv2 = scalar(1) - chi / (scalar(1) + chi*fv1);
     const scalar K = co.Cb1 / (co.Cw1() * co.kappa*co.kappa * co.fwStar);
-    const scalar psi2 = fmin(scalar(100), (scalar(1) - K*fv2) / fmax(fv1, scalar(1e-300)));
+    // max(SMALL, fv1*max(1e-10, 1 - ft2)) with ft2 off, SpalartAllmarasDES.C:70-79
+    const scalar psi2 = fmin(scalar(100), (scalar(1) - K*fv2) / fmax(fv1, scalar(1e-15)));
     return sqrt(fmax(psi2, scalar(0)));
 }
 
@@ -281,44 +283,80 @@ void saZdesFdKernel(
     fd[c] = fdStd * (scalar(1) - (scalar(1) - fdG)*fR);
 }
 
-// SA-IDDES (SpalartAllmarasIDDES, Shur/Spalart/Strelets/Travin 2008): the IMPROVED delayed-DES length scale, adding
-// wall-modelled-LES capability over DDES. dTilda = fdTilde*(1 + fe)*lRAS + (1 - fdTilde)*lLES, lRAS = y (wall dist),
-// lLES = CDES*Delta with the IDDES delta Delta = min(max(Cw*y, Cw*hmax), hmax) (hmax = maxDeltaxyz; the wall-normal
-// spacing hwn term is omitted -> hwn=0, a documented simplification). Blending: rd_t/rd_l from nut/nu, fdt/fl/ft the
-// shielding + elevated-stress functions, fB/fe1/fe the WMLES branch. des==false leaves this path untaken (RANS exact).
+// SA-IDDES, SpalartAllmarasIDDES::dTilda (SpalartAllmarasIDDES.C:94-135), statement for statement:
+//   magGradU = mag(gradU); psi = psi(chi, fv1); lRAS = y; lLES = psi*CDES*delta
+//   alpha = max(0.25 - y/hmax, -5); expTerm = exp(sqr(alpha))
+//   fB = min(2*pow(expTerm, -9), 1); fdTilda = max(1 - fdt, fB)
+//   fe1 = 2*lerp(pow(expTerm, -9), pow(expTerm, -11.09), pos0(alpha)); fe2 = 1 - max(ft, fl)
+//   fe = max(fe1 - 1, 0)*psi*fe2                      (`fe` on; 0 with it off)
+//   dTilda = max(fdTilda*(1 + fe)*lRAS + (1 - fdTilda)*lLES, SMALL)
+// with ft = tanh(pow3(sqr(Ct)*r(nut))), fl = tanh(pow(sqr(Cl)*r(nu), 10)), fdt = 1 - tanh(pow(Cdt1*r(nut), Cdt2))
+// (:62-88) and r(nur) = min(nur/(max(magGradU, SMALL)*sqr(kappa*y)), 10) (SpalartAllmarasBase.C:108-123).
+// THREE THINGS THIS KERNEL HAD DIFFERENTLY until 2026-10-06: fe was max(fe1 - 1, 0)*fe2 WITHOUT psi (the low-Re
+// correction enters dTilda twice, in lLES and in fe); fdt's exponent was a fixed cube where OpenFOAM reads
+// Cdt2; and alpha was not clamped at -5. `fePsi` false is a gate's CONTROL and leaves psi out of fe again.
+// The delta is the caller's: min(max(max(Cw*y, Cw*hmax), hwn), hmax), brae's form of IDDESDelta.
 __global__
 void saIddesDTildaKernel(
-    int nC, const scalar* __restrict__ y, const scalar* __restrict__ gradU,
-    const scalar* __restrict__ nt, scalar nu, const scalar* __restrict__ hmax, const scalar* __restrict__ hwn,
-    SpalartAllmarasCoeffs co, scalar* __restrict__ dTilda)
+    int nC,
+    const scalar* __restrict__ y,
+    const scalar* __restrict__ gradU,
+    const scalar* __restrict__ nt,
+    scalar nu,
+    const scalar* __restrict__ hmax,
+    const scalar* __restrict__ hwn,
+    SpalartAllmarasCoeffs co,
+    bool fePsi,
+    scalar* __restrict__ dTilda)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
+    const scalar small = scalar(1e-15);
     scalar g2 = 0;
-    for (int k = 0; k < 9; ++k) { const scalar gk = gradU[k*nC + c]; g2 += gk*gk; }
-    const scalar magGradU = fmax(sqrt(g2), scalar(1e-300));            // |gradU|
-    const scalar chi = nt[c]/nu, chi3 = chi*chi*chi, Cv13 = co.Cv1*co.Cv1*co.Cv1;
-    const scalar nutc = nt[c] * (chi3 / (chi3 + Cv13));                // nut = nuTilda*fv1
-    const scalar kd2 = fmax(co.kappa*co.kappa*y[c]*y[c], scalar(1e-300));
-    const scalar rdt = fmin(nutc / (magGradU * kd2), scalar(10));      // turbulent rd (nut)
-    const scalar rdl = fmin(nu   / (magGradU * kd2), scalar(10));      // laminar rd (nu)
-    const scalar adt = co.Cdt1 * rdt;   const scalar fdt = scalar(1) - tanh(adt*adt*adt);   // fdt = 1 - tanh((Cdt1 rd_t)^3)
-    const scalar al  = co.Cl*co.Cl*rdl; const scalar al2 = al*al, al4 = al2*al2, al8 = al4*al4;
-    const scalar fl  = tanh(al8*al2);                                  // fl = tanh((Cl^2 rd_l)^10)
-    const scalar at  = co.Ct*co.Ct*rdt; const scalar ft = tanh(at*at*at);                   // ft = tanh((Ct^2 rd_t)^3)
-    const scalar fe2 = scalar(1) - fmax(ft, fl);
-    const scalar hm  = fmax(hmax[c], scalar(1e-300));
-    const scalar alpha = scalar(0.25) - y[c]/hm;
-    const scalar fB  = fmin(scalar(2)*exp(scalar(-9)*alpha*alpha), scalar(1));
-    const scalar fdTilde = fmax(scalar(1) - fdt, fB);
-    const scalar fe1 = (alpha >= scalar(0)) ? scalar(2)*exp(scalar(-11.09)*alpha*alpha)
-                                            : scalar(2)*exp(scalar(-9.0)*alpha*alpha);
-    const scalar fe  = fmax(fe1 - scalar(1), scalar(0)) * fe2;
-    const scalar delta = fmin(fmax(fmax(co.Cw*y[c], co.Cw*hm), hwn[c]), hm);   // IDDES delta = min(max(max(Cw*y,Cw*hmax),hwn), hmax)
-    const scalar lLES  = saPsi(chi, co) * co.CDES * delta;            // low-Re-corrected LES length scale
-    dTilda[c] = fmax(fdTilde*(scalar(1) + fe)*y[c] + (scalar(1) - fdTilde)*lLES, scalar(1e-300));
+    for (int k = 0; k < 9; ++k)
+    {
+        const scalar gk = gradU[k*nC + c];
+        g2 += gk*gk;
+    }
+    const scalar magGradU = sqrt(g2);
+    const scalar chi = nt[c]/nu;
+    const scalar chi3 = chi*chi*chi;
+    const scalar Cv13 = co.Cv1*co.Cv1*co.Cv1;
+    const scalar fv1 = chi3/(chi3 + Cv13);
+    const scalar nutc = nt[c]*fv1;
+    const scalar psi = saPsi(chi, co);
+    const scalar kd = co.kappa*y[c];
+    const scalar rDenominator = fmax(magGradU, small)*(kd*kd);
+    const scalar rdt = fmin(nutc/rDenominator, scalar(10));
+    const scalar rdl = fmin(nu/rDenominator, scalar(10));
+    const scalar fdt = scalar(1) - tanh(pow(co.Cdt1*rdt, co.Cdt2));
+    const scalar fl = tanh(pow(co.Cl*co.Cl*rdl, scalar(10)));
+    const scalar at = co.Ct*co.Ct*rdt;
+    const scalar ft = tanh(at*at*at);
+    const scalar hm = fmax(hmax[c], scalar(1e-300));
+    const scalar alpha = fmax(scalar(0.25) - y[c]/hm, scalar(-5));
+    const scalar expTerm = exp(alpha*alpha);
+    const scalar fB = fmin(scalar(2)*pow(expTerm, scalar(-9)), scalar(1));
+    const scalar fdTilda = fmax(scalar(1) - fdt, fB);
+    scalar fe = 0;
+    if (co.fe)
+    {
+        const scalar fe1 = scalar(2)*pow(expTerm, (alpha >= scalar(0)) ? scalar(-11.09) : scalar(-9));
+        const scalar fe2 = scalar(1) - fmax(ft, fl);
+        fe = fmax(fe1 - scalar(1), scalar(0))*(fePsi ? psi : scalar(1))*fe2;
+    }
+    const scalar delta = fmin(fmax(fmax(co.Cw*y[c], co.Cw*hm), hwn[c]), hm);
+    const scalar lLES = psi*co.CDES*delta;
+    dTilda[c] = fmax(fdTilda*(scalar(1) + fe)*y[c] + (scalar(1) - fdTilda)*lLES, small);
 }
 } // namespace (SA kernels)
+
+// BRAE_CONTROL_SA_IDDES_FE_NOPSI=1 leaves psi out of fe, as the kernel had it -- the gate's control
+static bool saIddesFePsi()
+{
+    static const bool noPsi = std::getenv("BRAE_CONTROL_SA_IDDES_FE_NOPSI") != nullptr;
+    return !noPsi;
+}
 
 void deviceSpalartAllmarasCorrect(
     const DeviceMesh& dm,
@@ -406,7 +444,19 @@ void deviceSpalartAllmarasCorrect(
             cudaCheck(cudaGetLastError(), "saZdesFd");
         }
         if (iddes && hmax && hwn)
-            saIddesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), gradU.data(), nuTilda.data(), nu, hmax->data(), hwn->data(), co, dTilda.data());
+        {
+            saIddesDTildaKernel<<<nBlocks(nC), TPB>>>(
+                nC,
+                y.data(),
+                gradU.data(),
+                nuTilda.data(),
+                nu,
+                hmax->data(),
+                hwn->data(),
+                co,
+                saIddesFePsi(),
+                dTilda.data());
+        }
         else
             saDdesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), dm.V.data(), gradU.data(), nuTilda.data(), nu, co,
                                                      (lesDelta && lesDelta->size()) ? lesDelta->data() : nullptr,
@@ -563,7 +613,17 @@ void deviceSAIDDESdTilda(int nC, const DeviceBuffer<scalar>& y, const DeviceBuff
     const SpalartAllmarasCoeffs& co, DeviceBuffer<scalar>& dTilda)
 {
     dTilda.resize(nC);
-    saIddesDTildaKernel<<<nBlocks(nC), TPB>>>(nC, y.data(), gradU.data(), nuTilda.data(), nu, hmax.data(), hwn.data(), co, dTilda.data());
+    saIddesDTildaKernel<<<nBlocks(nC), TPB>>>(
+        nC,
+        y.data(),
+        gradU.data(),
+        nuTilda.data(),
+        nu,
+        hmax.data(),
+        hwn.data(),
+        co,
+        saIddesFePsi(),
+        dTilda.data());
     cudaCheck(cudaGetLastError(), "deviceSAIDDESdTilda");
 }
 

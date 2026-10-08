@@ -192,6 +192,9 @@ struct RhoMomentumInput
     cpu::rhoSimple::DivScheme scheme = cpu::rhoSimple::DivScheme::upwind;
     scalar schemeCoeff = 1.0;            // the `k` of `limitedLinear k`
     bool   correctedLaplacian = false;   // both halves -- see the header note
+    // ...and WHICH delta coefficients: `uncorrected` takes nonOrthDeltaCoeffs with no correction
+    // flux (uncorrectedSnGrad.H:113-119). See solver_controls.cuh:226.
+    bool   nonOrthCoeffs = false;
     scalar snGradLimitCoeff = 0.0;       // `limited <k> corrected`; 0 = uncapped, which is what `corrected` means
 
     // Declared by the case but not ported -> REFUSE. A solver that read MRFProperties, ignored it,

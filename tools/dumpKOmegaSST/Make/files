@@ -1,3 +1,4 @@
 kOmegaSSTDumpModels.C
+kOmegaSSTDumpIncompressibleModels.C
 
 LIB = $(FOAM_USER_LIBBIN)/libdumpKOmegaSST

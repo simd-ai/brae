@@ -11,6 +11,8 @@
 #include "geometric_field.cuh"
 #include "fvc.cuh"   // SurfaceScalarField
 #include <cmath>
+#include <stdexcept>
+#include <string>
 #include <vector>
 #include "solution_directions.cuh"   // fvMatrix<Type>::H()'s validComponents block
 
@@ -22,11 +24,18 @@ namespace brae {
 // Array form: the flux depends only on the INTERNAL field (the boundary term uses the face cell's
 // internal value, not the patch value), and a GeometricField cannot be copied -- its patch fields are
 // unique_ptr. The GeometricField overload below delegates.
+//
+// ON A COUPLED PATCH (fvMatrix.C:1483-1512) the neighbour's half is boundaryCoeffs*patchNeighbourField
+// instead of boundaryCoeffs: internalCoeffs*pif - boundaryCoeffs*pnf, the same face flux an internal
+// face gives. `coupledPnf` is that patchNeighbourField, per patch; without it the cell on the other
+// side is taken as it stands, which is every coupled field EXCEPT one that carries a jump -- so a caller
+// holding a GeometricField should use the overload below, which asks the patch field.
 inline SurfaceScalarField matrixFlux(
     const FvScalarMatrix& M,
     const std::vector<scalar>& pInternal,
     const PrimitiveMesh& m,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    const std::vector<std::vector<scalar>>* coupledPnf = nullptr)
 {
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
@@ -46,6 +55,23 @@ inline SurfaceScalarField matrixFlux(
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         flux.boundary[pi].resize(patches[pi].size);
+        if (patches[pi].coupled)
+        {
+            for (label i = 0; i < patches[pi].size; ++i)
+            {
+                const scalar pnf = coupledPnf ? (*coupledPnf)[pi][i] : patchNeighbourValue(patches[pi], i, pInternal);
+                flux.boundary[pi][i] = M.internalCoeffs[pi][i] * pInternal[patches[pi].faceCells[i]]
+                                     - M.boundaryCoeffs[pi][i] * pnf;
+            }
+            if (pi < M.faceFluxCorrectionBoundary.size() && !M.faceFluxCorrectionBoundary[pi].empty())
+            {
+                for (label i = 0; i < patches[pi].size; ++i)
+                {
+                    flux.boundary[pi][i] += M.faceFluxCorrectionBoundary[pi][i];
+                }
+            }
+            continue;
+        }
         for (label i = 0; i < patches[pi].size; ++i)
             flux.boundary[pi][i] = M.internalCoeffs[pi][i] * pInternal[patches[pi].faceCells[i]]
                                  - M.boundaryCoeffs[pi][i];
@@ -59,7 +85,17 @@ inline SurfaceScalarField matrixFlux(
     const PrimitiveMesh& m,
     const std::vector<FvPatch>& patches)
 {
-    return matrixFlux(M, p.internal, m, patches);
+    std::vector<std::vector<scalar>> pnf(patches.size());
+    bool any = false;
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (patches[pi].coupled)
+        {
+            pnf[pi] = p.boundary[pi]->patchNeighbourField(p.internal);
+            any = true;
+        }
+    }
+    return matrixFlux(M, p.internal, m, patches, any ? &pnf : nullptr);
 }
 
 // fvMatrix::setValues: fix psi at the given cells to the given values (epsilonWallFunction
@@ -120,7 +156,7 @@ inline void setValues(
 }
 
 // fvMatrix::relax(alpha): diagonal-dominance + under-relaxation of the matrix (modifies diag and
-// source). No coupled interfaces here.
+// source).
 template <typename T>
 void relaxMatrix(
     FvMatrix<T>& M,
@@ -142,14 +178,32 @@ void relaxMatrix(
         sumOff[nei[f]] += std::fabs(M.lower[f]);
     }
 
+    // fvMatrix.C, relax(): a COUPLED patch adds its internalCoeffs' component 0 to the diagonal, signed,
+    // and the magnitude of its interface coefficient to the off-diagonal sum -- it is an off-diagonal
+    // held outside the matrix -- where an uncoupled one adds the largest-magnitude diagonal contribution
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
         for (label i = 0; i < patches[pi].size; ++i)
+        {
+            if (patches[pi].coupled)
+            {
+                M.diag[patches[pi].faceCells[i]] += component(M.internalCoeffs[pi][i], 0);
+                sumOff[patches[pi].faceCells[i]] += std::fabs(component(M.boundaryCoeffs[pi][i], 0));
+                continue;
+            }
             M.diag[patches[pi].faceCells[i]] += cmptMagMax(M.internalCoeffs[pi][i]);
+        }
     for (label c = 0; c < nC; ++c)
         M.diag[c] = std::fmax(std::fabs(M.diag[c]), sumOff[c]) / alpha;
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
         for (label i = 0; i < patches[pi].size; ++i)
+        {
+            if (patches[pi].coupled)
+            {
+                M.diag[patches[pi].faceCells[i]] -= component(M.internalCoeffs[pi][i], 0);
+                continue;
+            }
             M.diag[patches[pi].faceCells[i]] -= cmptMin(M.internalCoeffs[pi][i]);
+        }
     for (label c = 0; c < nC; ++c)
         M.source[c] += (M.diag[c] - D0[c]) * psi.internal[c];
 }
@@ -204,17 +258,29 @@ std::vector<scalar> matrixH1(
         H1[nei[f]] -= M.lower[f];
         H1[own[f]] -= M.upper[f];
     }
-    (void)patches;   // coupled patches only; refused on this path
+    for (const FvPatch& fp : patches)
+    {
+        if (fp.coupled)
+        {
+            throw std::runtime_error(
+                "brae: fvMatrix::H1() with the coupled patch '" + fp.name + "' is not ported (it adds "
+                "boundaryCoeffs.component(0) there); SIMPLEC across a cyclic is refused.");
+        }
+    }
     for (label c = 0; c < nC; ++c) H1[c] /= g.V()[c];
     return H1;
 }
 
+// `coupledOut`, when given, receives the COUPLED patches' boundarySource alone, per cell and before
+// the division by V -- the pair's own half of H(), which a gate bisecting HbyA needs separated from
+// the rest. Null on every shipped call.
 inline std::vector<vector> matrixH(
     const FvVectorMatrix& M,
     const GeometricField<vector>& U,
     const PrimitiveMesh& m,
     const FvGeometry& g,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    std::vector<vector>* coupledOut = nullptr)
 {
     const label nC = m.nCells(), nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
@@ -240,9 +306,32 @@ inline std::vector<vector> matrixH(
     }
     for (label c = 0; c < nC; ++c)
         H[c] += M.source[c];                       // source
-    for (std::size_t pi = 0; pi < patches.size(); ++pi)                       // boundarySource
+    // boundarySource. fvMatrix::H() calls addBoundarySource(Hphi) with couples = true: on a COUPLED patch
+    // the term is cmptMultiply(boundaryCoeffs, patchNeighbourField) -- the off-diagonal the interface
+    // holds, times the cell on the other side, exactly what lduMatrix::H does with upper and lower
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
         for (label i = 0; i < patches[pi].size; ++i)
+        {
+            if (patches[pi].coupled)
+            {
+                const vector& bc = M.boundaryCoeffs[pi][i];
+                const vector un = patchNeighbourValue(patches[pi], i, U.internal);
+                // THIS LINE IS LEFT EXACTLY AS IT WAS. Hoisting the three products into a named
+                // `term` and adding that instead stops the compiler contracting H + bc*un into an
+                // FMA, which rounds the multiply before the add -- one ulp per face, and MEASURED
+                // enough to move a marginal p_rgh iteration count on the cyclicWet profile and fail
+                // this gate. A tap may not change what it measures, so the tap repeats the multiply.
+                H[patches[pi].faceCells[i]] += vector{bc.x*un.x, bc.y*un.y, bc.z*un.z};
+                if (coupledOut)
+                {
+                    if (coupledOut->size() != static_cast<std::size_t>(nC))
+                        coupledOut->assign(static_cast<std::size_t>(nC), vector{0, 0, 0});
+                    (*coupledOut)[patches[pi].faceCells[i]] += vector{bc.x*un.x, bc.y*un.y, bc.z*un.z};
+                }
+                continue;
+            }
             H[patches[pi].faceCells[i]] += M.boundaryCoeffs[pi][i];
+        }
     for (label c = 0; c < nC; ++c)
         H[c] = H[c] / g.V()[c];
     // fvMatrix<Type>::H() ENDS by zeroing every component polyMesh::solutionD() knocks out

@@ -33,7 +33,7 @@
 // ascending, every row's entries are the losort-then-owned order of the device's own addressing,
 // and A x through the layout equals deviceAmul on the natural layout to the rows' rounding floor
 // (the two sum a row in different orders). (j) every refusal the engine documents, held to its
-// wording: nSweeps 0, a cyclic interface, a colouring of another size, a component with its own
+// wording: nSweeps 0, a cyclicAMI interface, a colouring of another size, a component with its own
 // upper, nComp 4, and a second mesh of the SAME size whose addressing lives elsewhere -- the one the
 // size check is blind to.
 //
@@ -962,17 +962,18 @@ int main()
             const std::string what = refusalOf([&]() { runDevice(dm, U, L, std3, nfStd, col, p0); });
             check(what.find("nSweeps 0") != std::string::npos, "(j1) nSweeps 0 is refused (" + what + ")");
         }
-        // (j2) a view carrying a cyclic interface: the sweep applies no interfaces.
+        // (j2) a view carrying a cyclicAMI's weighted stencil: the sweep carries a one-to-one pair only (arm p).
         {
             DeviceSystem s;
             fillDeviceSystem(s, dm, U, L, std3, nfStd, false);
-            s.A[0].nCyc = 1;
+            s.A[0].nAmi = 1;
             DeviceSolverPerf perf[NCOMP];
             const std::string what = refusalOf([&]()
             {
                 deviceColourGaussSeidelFused(NCOMP, s.comps, col, pa.tol, pa.relTol, pa.maxIter, pa.minIter, pa.nSweeps, pa.symmetric, perf);
             });
-            check(what.find("cyclic interface") != std::string::npos, "(j2) a cyclic interface is refused (" + what + ")");
+            check(what.find("cyclicAMI interface") != std::string::npos,
+                  "(j2) a cyclicAMI interface is refused (" + what + ")");
         }
         // (j3) a colouring built for a smaller box handed this box's matrix: refused on the sizes.
         {
@@ -1357,6 +1358,178 @@ int main()
             check(rows, "(l3) the split's residual rows are the fused launches' bit for bit: the two sums are of the same numbers");
             check(sums, buf + detail);
             check(col3.nBlocks != col.nBlocks, "(l3) and the two block partitions differ, which is why the sums are held to the rounding and not to the bit");
+        }
+    }
+
+    // (p) A COUPLED PAIR on the view. OpenFOAM's sweep does not sweep an interface: at the top of every sweep it
+    // starts bPrime = source and moves the pair's contribution there from the field as it stands
+    // (symGaussSeidelSmoother.C:117-143), and the colour sweep does the same (DeviceCellColouring::bEffP). The
+    // reference below is that, around the same colour sweep; its residual is the whole operator's. The pair
+    // joins the first cells to the last, both ways, and cell 0 owns a SECOND face, so one row takes two terms
+    // in face order. The controls are the two ways it could be wrong and still converge on something: the
+    // pair left out, and its term moved once from the initial field and never again.
+    {
+        std::vector<label> pOwn;
+        std::vector<label> pNbr;
+        std::vector<scalar> pCoeff;
+        for (int j = 0; j < 12; ++j)
+        {
+            const label a = j;
+            const label z = A.nC - 1 - j;
+            pOwn.push_back(a);
+            pNbr.push_back(z);
+            pCoeff.push_back(-(0.6 + 0.05*j));
+            pOwn.push_back(z);
+            pNbr.push_back(a);
+            pCoeff.push_back(-(0.4 + 0.03*j));
+        }
+        pOwn.push_back(0);
+        pNbr.push_back(A.nC/2);
+        pCoeff.push_back(-0.35);
+        DeviceBuffer<label> dOwn;
+        DeviceBuffer<label> dNbr;
+        DeviceBuffer<scalar> dCoeff;
+        dOwn.copyFrom(pOwn);
+        dNbr.copyFrom(pNbr);
+        dCoeff.copyFrom(pCoeff);
+        auto moved = [&](
+            const std::vector<scalar>& b,
+            const std::vector<scalar>& psi)
+        {
+            std::vector<scalar> be(b);
+            for (std::size_t j = 0; j < pOwn.size(); ++j)
+            {
+                be[(std::size_t)pOwn[j]] -= pCoeff[j]*psi[(std::size_t)pNbr[j]];
+            }
+            return be;
+        };
+        auto devicePair = [&](const Params& p)
+        {
+            DeviceSystem s;
+            fillDeviceSystem(s, dm, U, L, std3, nfStd, p.nfOnDevice);
+            for (int k = 0; k < NCOMP; ++k)
+            {
+                s.A[k].nCyc = (int)pOwn.size();
+                s.A[k].cycOwn = dOwn.data();
+                s.A[k].cycNbr = dNbr.data();
+                s.A[k].cycCoeff = dCoeff.data();
+            }
+            DeviceRun out;
+            deviceColourGaussSeidelFused(NCOMP, s.comps, col, p.tol, p.relTol, p.maxIter, p.minIter, p.nSweeps,
+                                         p.symmetric, out.perf);
+            for (int k = 0; k < NCOMP; ++k)
+            {
+                s.P[k].copyTo(out.psi[k]);
+            }
+            return out;
+        };
+        // how 0: the pair carried, moved at the top of every sweep; 1: left out; 2: moved once, from the field
+        // the solve starts on
+        auto refPair = [&](
+            const Params& p,
+            int k,
+            std::vector<scalar>& psi,
+            int how)
+        {
+            const std::vector<scalar>& b = std3[k].b;
+            const std::vector<scalar> once = moved(b, psi);
+            auto source = [&](const std::vector<scalar>& x)
+            {
+                if (how == 0) return moved(b, x);
+                if (how == 1) return b;
+                return once;
+            };
+            auto sweep = [&](std::vector<scalar>& x)
+            {
+                const std::vector<scalar> be = source(x);
+                colourSweep(A, hcol, std3[k].diag, be, x, p.symmetric);
+            };
+            auto residual = [&](const std::vector<scalar>& x)
+            {
+                return residualSumMag(A, std3[k].diag, source(x), x)/nfStd[k];
+            };
+            HostRun r;
+            if (p.nSweeps < 0)
+            {
+                for (int n = 0; n < -p.nSweeps; ++n)
+                {
+                    sweep(psi);
+                }
+                r.nIter = -p.nSweeps;
+                return r;
+            }
+            r.init = residual(psi);
+            r.fin = r.init;
+            if (p.minIter > 0 || !ofConverged(p.tol, p.relTol, r.fin, r.init))
+            {
+                do
+                {
+                    for (int n = 0; n < p.nSweeps; ++n)
+                    {
+                        sweep(psi);
+                    }
+                    r.fin = residual(psi);
+                }
+                while (((r.nIter += p.nSweeps) < p.maxIter && !ofConverged(p.tol, p.relTol, r.fin, r.init))
+                    || r.nIter < p.minIter);
+            }
+            return r;
+        };
+        auto holdPair = [&](
+            const char* name,
+            const Params& p)
+        {
+            const DeviceRun dev = devicePair(p);
+            bool ok = true;
+            std::string detail;
+            for (int k = 0; k < NCOMP; ++k)
+            {
+                std::vector<scalar> psi = std3[k].psi0;
+                const HostRun ref = refPair(p, k, psi, 0);
+                const scalar floor = 4*DBL_EPSILON*termSum(A, std3[k].diag, std3[k].b, psi)/nfStd[k];
+                const DeviceSolverPerf& got = dev.perf[k];
+                const scalar psiDiff = fieldRelDiff(dev.psi[k], psi);
+                ok = ok && got.nIterations == ref.nIter && residualsAgree(got.initialResidual, ref.init, floor)
+                  && residualsAgree(got.finalResidual, ref.fin, floor) && psiDiff <= REL;
+                char buf[256];
+                std::snprintf(buf, sizeof buf, " [k%d: nIter %d/%d init %.3e/%.3e final %.3e/%.3e psi %.1e]", k,
+                              got.nIterations, ref.nIter, (double)got.initialResidual, (double)ref.init,
+                              (double)got.finalResidual, (double)ref.fin, (double)psiDiff);
+                detail += buf;
+            }
+            check(ok, std::string(name) + detail);
+            return dev;
+        };
+        Params p1;
+        p1.relTol = 0.1;
+        holdPair("(p1) a coupled pair, GaussSeidel relTol 0.1: the reference with the pair moved each sweep", p1);
+        Params p2;
+        p2.symmetric = true;
+        p2.nSweeps = 2;
+        p2.tol = 1e-9;
+        p2.maxIter = 60;
+        const DeviceRun d2 =
+            holdPair("(p2) a coupled pair, symGaussSeidel nSweeps 2 to 1e-9: moved at the top of BOTH sweeps", p2);
+        check(d2.perf[0].nIterations > 2 && d2.perf[0].finalResidual < p2.tol,
+              "(p2) the solve converged, over several blocks");
+        Params p3;
+        p3.symmetric = true;
+        p3.nSweeps = -3;
+        const DeviceRun d3 =
+            holdPair("(p3) a coupled pair, three fixed symmetric sweeps: the iterate is the reference's", p3);
+        {
+            std::vector<scalar> dropped = std3[0].psi0;
+            refPair(p3, 0, dropped, 1);
+            std::vector<scalar> once = std3[0].psi0;
+            refPair(p3, 0, once, 2);
+            const scalar dDropped = fieldRelDiff(d3.psi[0], dropped);
+            const scalar dOnce = fieldRelDiff(d3.psi[0], once);
+            char buf[200];
+            std::snprintf(buf, sizeof buf, " [from the pair left out %.1e, from the pair moved once %.1e]",
+                          (double)dDropped, (double)dOnce);
+            check(dDropped > 1e-6, std::string("(p3) control: the pair left out is another iterate") + buf);
+            check(dOnce > 1e-9,
+                  std::string("(p3) control: the pair moved once, not at every sweep, is another iterate") + buf);
         }
     }
 

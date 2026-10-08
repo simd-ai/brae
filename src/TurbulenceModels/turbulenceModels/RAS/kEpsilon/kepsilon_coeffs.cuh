@@ -52,6 +52,7 @@ struct KEpsilonCoeffs
     // coefficient; a cellLimited <k> on top of it still applies, as cellLimitedGrad wraps any base scheme.
     bool   gradKLeastSq = false;
     bool   correctedLaplacian = false;
+    bool   nonOrthCoeffs = false;   // nonOrthDeltaCoeffs without the correction -- inter_ueqn_cpp.cuh:181
     scalar snGradLimitCoeff   = 0.0;    // `limited <k> corrected`; 0 = unlimited
     // realizableKE (OF RAS/realizableKE): variable Cmu (rCmu from strain invariants), strain-based eps production
     // C1=max(eta/(5+eta),0.43)*magS*eps, destruction C2*eps^2/(k+sqrt(nu*eps)). Defaults A0=4, C2=1.9, sigmaEps=1.2.

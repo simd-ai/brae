@@ -1,0 +1,1397 @@
+#!/usr/bin/env bash
+# What brae's interFoam REFUSES, and what it must NOT refuse -- on damBreak, one input changed at a time.
+#
+# WHY THIS GATE EXISTS. brae was run over all 44 shipped interFoam tutorials and the ones that reached
+# `End:` were counted. Two did that should not have: laminar/damBreakWithObstacle and
+# laminar/oscillatingBox both ask for `dynamicRefineFvMesh`, and brae ran them on the mesh as written
+# without a word. brae's interFoam never opened constant/dynamicMeshDict. Seventeen more tutorials carry a
+# moving mesh and were only stopped because they hit some OTHER refusal first. The same sweep found MRF
+# and fvOptions running silently -- both listed as refused in braeInterFoam.cu's own header -- a
+# dictionary-form `sigma` read as ZERO surface tension, a setTimeStep function object ignored, and the
+# device loop taking nOuterCorrectors and nNonOrthogonalCorrectors as 1 and 0 whatever the case said.
+#
+# EVERY ARM HAS ITS OPPOSITE. A refusal that fires on a case OpenFOAM would run unchanged is a defect
+# too, so beside each refused input sits the form of it that OpenFOAM treats as nothing: `staticFvMesh`,
+# an MRF zone and an fvOption with `active no`, a scalar sigma. Those must RUN.
+#
+# THEN TURBULENCE ARRIVED, and with it the question of what ELSE had only been kept out by the
+# turbulence refusal. Two things, both read and then never used: `ddtSchemes default` went into
+# f.ddtU and no further, so CrankNicolson and localEuler would have run as Euler; and laplacianSchemes
+# and snGradSchemes were never opened, so `corrected` -- 28 of 44 tutorials -- ran orthogonal. On a mesh
+# of rectangles the second is not a substitution (the correction vector is zero, which is why damBreak
+# agrees with OpenFOAM to 1e-12 under `Gauss linear corrected`); on any other mesh it is. So the mesh
+# arms below shear damBreak's upper blocks by six degrees: refused under the case's own `corrected`,
+# and it must RUN once the case itself says `orthogonal`.
+#
+# No OpenFOAM solver is run -- only its mesh generator, because damBreak ships no mesh.
+set -u
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BIN="${BUILD:-$ROOT/build}/brae_interFoam"
+OFBASHRC=${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
+TUT=${BRAE_OF_TUTORIALS:-/usr/lib/openfoam/openfoam2412/tutorials}
+SRC="$TUT/multiphase/interFoam/laminar/damBreak/damBreak"
+
+# shellcheck disable=SC1091
+. "$(dirname "$0")/require_fresh_binary.sh"
+[ -x "$BIN" ]      || { echo "SKIP: $BIN not built"; exit 77; }
+[ -d "$SRC" ]      || { echo "SKIP: damBreak tutorial not found at $SRC"; exit 77; }
+[ -f "$OFBASHRC" ] || { echo "SKIP: real OpenFOAM not available (blockMesh is needed)"; exit 77; }
+requireFresh "$BIN" || exit 1
+
+W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+set +u
+# shellcheck disable=SC1091
+source "$OFBASHRC" > /dev/null 2>&1 || true
+set -u
+command -v blockMesh > /dev/null 2>&1 || { echo "SKIP: blockMesh not on PATH"; exit 77; }
+
+B="$W/base"
+cp -r "$SRC" "$B" || exit 1
+cp -r "$B/0.orig" "$B/0"
+( cd "$B" && blockMesh > log.blockMesh 2>&1 && setFields > log.setFields 2>&1 ) \
+    || { echo "SKIP: blockMesh/setFields failed"; exit 77; }
+# two fixed steps: long enough to reach the time loop, short enough to cost nothing
+sed -i 's/^endTime .*/endTime         0.0002;/; s/^deltaT .*/deltaT          1e-4;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
+    "$B/system/controlDict"
+
+# ...and RAS/damBreak, the turbulent twin, for the arms that need a case that IS turbulent
+SRCR="$TUT/multiphase/interFoam/RAS/damBreak/damBreak"
+[ -d "$SRCR" ] || { echo "SKIP: RAS/damBreak tutorial not found at $SRCR"; exit 77; }
+BR="$W/baseRAS"
+cp -r "$SRCR" "$BR" || exit 1
+cp -r "$BR/0.orig" "$BR/0"
+( cd "$BR" && blockMesh > log.blockMesh 2>&1 && setFields > log.setFields 2>&1 ) \
+    || { echo "SKIP: blockMesh/setFields failed on RAS/damBreak"; exit 77; }
+sed -i 's/^endTime .*/endTime         0.0002;/; s/^deltaT .*/deltaT          1e-4;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
+    "$BR/system/controlDict"
+
+# ...and laminar/waves/stokesI, for the wave boundary conditions, on a coarser mesh than it ships
+SRCW="$TUT/multiphase/interFoam/laminar/waves/stokesI"
+[ -d "$SRCW" ] || { echo "SKIP: waves/stokesI tutorial not found at $SRCW"; exit 77; }
+BW="$W/baseWaves"
+cp -r "$SRCW" "$BW" || exit 1
+cp -r "$BW/0.orig" "$BW/0"
+sed -i 's/(500 1 75) simpleGrading/(50 1 75) simpleGrading/' "$BW/system/blockMeshDict"
+( cd "$BW" && blockMesh > log.blockMesh 2>&1 && setFields > log.setFields 2>&1 ) \
+    || { echo "SKIP: blockMesh/setFields failed on waves/stokesI"; exit 77; }
+sed -i 's/^endTime .*/endTime         0.02;/; s/^deltaT .*/deltaT          0.01;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
+    "$BW/system/controlDict"
+
+# ...and laminar/testTubeMixer, for the moving mesh, AS SHIPPED
+SRCM="$TUT/multiphase/interFoam/laminar/testTubeMixer"
+[ -d "$SRCM" ] || { echo "SKIP: testTubeMixer tutorial not found at $SRCM"; exit 77; }
+# a brace-aware rewrite of one fvSolution entry, for the arms below that swap a pressure SOLVER.
+# A regex cannot do it: `p_rghFinal` on the mixer holds a nested `preconditioner { ... }`.
+cat > "$W/setSolver.py" <<'PYEOF'
+import sys
+key, path = sys.argv[1], 'system/fvSolution'
+body = sys.argv[2].replace('\\n', '\n')   # the caller writes the entry on one shell line
+t = open(path).read()
+i = t.index('\n    ' + key + '\n    {')
+j = t.index('{', i)
+depth, k = 0, j
+while True:
+    if t[k] == '{': depth += 1
+    elif t[k] == '}': depth -= 1
+    if depth == 0: break
+    k += 1
+open(path, 'w').write(t[:j] + '{\n' + body + '    }' + t[k + 1:])
+PYEOF
+
+BM="$W/baseMoving"
+cp -r "$SRCM" "$BM" || exit 1
+cp -r "$BM/0.orig" "$BM/0"
+( cd "$BM" && blockMesh > log.blockMesh 2>&1 && setFields > log.setFields 2>&1 ) \
+    || { echo "SKIP: blockMesh/setFields failed on testTubeMixer"; exit 77; }
+sed -i 's/^endTime .*/endTime         0.0002;/; s/^deltaT .*/deltaT          1e-4;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
+    "$BM/system/controlDict"
+
+# ...and RAS/damBreakPorousBaffle, for the cyclic baffle, meshed as its Allrun does
+SRCB="$TUT/multiphase/interFoam/RAS/damBreakPorousBaffle"
+[ -d "$SRCB" ] || { echo "SKIP: damBreakPorousBaffle tutorial not found at $SRCB"; exit 77; }
+command -v createBaffles > /dev/null 2>&1 || { echo "SKIP: createBaffles not on PATH"; exit 77; }
+BB="$W/baseBaffle"
+cp -r "$SRCB" "$BB" || exit 1
+cp -r "$BB/0.orig" "$BB/0"
+( cd "$BB" && blockMesh > log.blockMesh 2>&1 && setFields > log.setFields 2>&1 \
+      && createBaffles -overwrite > log.createBaffles 2>&1 ) \
+    || { echo "SKIP: blockMesh/setFields/createBaffles failed on damBreakPorousBaffle"; exit 77; }
+sed -i 's/^endTime .*/endTime         0.0002;/; s/^deltaT .*/deltaT          1e-4;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
+    "$BB/system/controlDict"
+
+# ...and RAS/damBreakLeakage, for the coded cyclicACMI baffle, meshed as its Allrun does
+SRCK="$TUT/multiphase/interFoam/RAS/damBreakLeakage"
+[ -d "$SRCK" ] || { echo "SKIP: damBreakLeakage tutorial not found at $SRCK"; exit 77; }
+BK="$W/baseLeak"
+cp -r "$SRCK" "$BK" || exit 1
+cp -r "$BK/0.orig" "$BK/0"
+( cd "$BK" && blockMesh > log.blockMesh 2>&1 && setFields > log.setFields 2>&1 \
+      && createBaffles -overwrite > log.createBaffles 2>&1 ) \
+    || { echo "SKIP: blockMesh/setFields/createBaffles failed on damBreakLeakage"; exit 77; }
+sed -i 's/^endTime .*/endTime         0.0002;/; s/^deltaT .*/deltaT          1e-4;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
+    "$BK/system/controlDict"
+
+# ...and laminar/waves/mangroveInteraction, for the mangrove fvOptions, meshed as Allrun does on a block
+# a fifth of the tutorial's in each direction
+SRCG="$TUT/multiphase/interFoam/laminar/waves/mangroveInteraction"
+[ -d "$SRCG" ] || { echo "SKIP: mangroveInteraction tutorial not found at $SRCG"; exit 77; }
+BG="$W/baseMangrove"
+cp -r "$SRCG" "$BG" || exit 1
+cp -r "$BG/0.orig" "$BG/0"
+sed -i 's/(350 28 42)/(70 6 8)/' "$BG/system/blockMeshDict"
+( cd "$BG" && blockMesh > log.blockMesh 2>&1 && setFields > log.setFields 2>&1 && topoSet > log.topoSet 2>&1 ) \
+    || { echo "SKIP: blockMesh/setFields/topoSet failed on mangroveInteraction"; exit 77; }
+sed -i 's/^startFrom .*/startFrom       startTime;/; s/^endTime .*/endTime         0.02;/; s/^deltaT .*/deltaT          0.01;/; s/^adjustTimeStep .*/adjustTimeStep  no;/' \
+    "$BG/system/controlDict"
+python3 -c "import re; p='$BG/system/controlDict'; t=open(p).read(); t=re.sub(r'\nfunctions\s*\{.*\n\}\s*\n', '\n', t, flags=re.S); open(p,'w').write(t)"
+
+# ...and LES/nozzleFlow2D, for LES kEqn on a wedge, meshed as its Allrun does, two steps at a fixed 1e-9
+SRCL="$TUT/multiphase/interFoam/LES/nozzleFlow2D"
+[ -d "$SRCL" ] || { echo "SKIP: nozzleFlow2D tutorial not found at $SRCL"; exit 77; }
+BL="$W/baseLES"
+cp -r "$SRCL" "$BL" || exit 1
+cp -r "$BL/0.orig" "$BL/0"
+( cd "$BL" && blockMesh > log.blockMesh 2>&1 \
+      && topoSet -dict system/topoSetDict.1 > log.topoSet.1 2>&1 \
+      && refineMesh -dict system/refineMeshDict -overwrite > log.refineMesh.1 2>&1 \
+      && topoSet -dict system/topoSetDict.2 > log.topoSet.2 2>&1 \
+      && refineMesh -dict system/refineMeshDict -overwrite > log.refineMesh.2 2>&1 ) \
+    || { echo "SKIP: meshing failed on nozzleFlow2D"; exit 77; }
+sed -i 's/^endTime .*/endTime         2e-09;/; s/^deltaT .*/deltaT          1e-9;/; s/^adjustTimeStep .*/adjustTimeStep  no;/; s/^startFrom .*/startFrom       startTime;/' \
+    "$BL/system/controlDict"
+
+HAVE_GPU=0
+if command -v nvidia-smi > /dev/null 2>&1 && nvidia-smi > /dev/null 2>&1; then HAVE_GPU=1; fi
+
+fails=0
+HDR='FoamFile { version 2.0; format ascii; class dictionary; object X; }'
+
+# arm <name> <expect: refused|runs> <substring the message must carry, or -> <flags> <edit snippet>
+arm()
+{
+    local name="$1" expect="$2" needle="$3" flags="$4"
+    shift 4
+    local C="$W/$name"
+    cp -r "${BASE:-$B}" "$C"
+    ( cd "$C" && eval "$@" ) || { echo "  FAIL: $name -- the staging edit itself failed"; fails=$((fails+1)); return; }
+    local out
+    # shellcheck disable=SC2086
+    out=$("$BIN" -case "$C" $flags 2>&1)
+    local got=refused
+    echo "$out" | grep -q "^End: t" && got=runs
+    local ok=1
+    [ "$got" = "$expect" ] || ok=0
+    # a needle on a `runs` arm is a NOTICE the run must carry: a declared substitution, not a silent one
+    if [ "$needle" != "-" ]; then
+        echo "$out" | grep -qF -- "$needle" || ok=0
+    fi
+    if [ $ok = 1 ]; then
+        printf "  ok:   %-34s %s\n" "$name" "$got"
+    else
+        printf "  FAIL: %-34s expected %s%s, got %s: %s\n" "$name" "$expect" \
+               "$([ "$needle" != "-" ] && echo " naming \`$needle\`")" "$got" \
+               "$(echo "$out" | grep -E '^brae interFoam:|^End:' | head -1 | cut -c1-140)"
+        fails=$((fails+1))
+    fi
+}
+
+# ddtblock <line>... -- replace the ddtSchemes block with these entries, one per line. A function rather
+# than a sed so a regex key's backslashes and quotes reach the file as written.
+ddtblock()
+{
+    python3 -c "import re, sys; p = 'system/fvSchemes'; t = open(p).read(); body = 'ddtSchemes\n{\n' + ''.join('    ' + a + '\n' for a in sys.argv[1:]) + '}'; t2 = re.sub(r'ddtSchemes\s*\{[^}]*\}', lambda m: body, t, count=1); assert t2 != t; open(p, 'w').write(t2)" "$@"
+}
+
+echo "== brae interFoam: what it refuses, and what it must not =="
+
+arm baseline                runs    -                        "" true
+
+# THE CASE READER'S ENTRIES THAT STOOD IN FOR THE CASE'S OWN (the review of 2026-10-07). Each was read by a
+# substring, a default or one name where OpenFOAM reads a whole word, no default or another name; each arm
+# is the form that used to run as something else, and beside it the form that must still run.
+# div(phi,alpha) and div(phirb,alpha), by whole words and by the block's default (alphaEqn.H:2-3,
+# schemesLookupDetail.C:76-89): `linearUpwind` ran as central linear, `vanLeer01` as vanLeer, and a missing
+# entry took a scheme of brae's choosing where OpenFOAM takes the default or stops.
+ADIV="python3 -c \"import re, sys; p = 'system/fvSchemes'; t = open(p).read(); t2 = re.sub(r'(\n\s*' + re.escape(sys.argv[1]) + r')\s[^;]*;', (r'\1 ' + sys.argv[2] + ';') if sys.argv[2] else '', t); assert t2 != t; t2 = t2.replace('divSchemes\n{', 'divSchemes\n{\n    ' + sys.argv[3]) if len(sys.argv) > 3 else t2; open(p, 'w').write(t2)\""
+arm alphaDiv_linearUpwind   refused "is not ported. brae has"   "" "$ADIV 'div(phi,alpha)' 'Gauss linearUpwind grad(alpha.water)'"
+arm alphaDiv_vanLeer01      refused "is not ported. brae has"   "" "$ADIV 'div(phi,alpha)' 'Gauss vanLeer01'"
+arm alphaDiv_blended        refused "is not ported. brae has"   "" "$ADIV 'div(phirb,alpha)' 'Gauss localBlended linear upwind'"
+arm alphaDiv_missing        refused "has no default to take"    "" "$ADIV 'div(phirb,alpha)' ''"
+arm alphaDiv_missing_none   refused "has no default to take"    "" "$ADIV 'div(phirb,alpha)' '' 'default none;'"
+arm alphaDiv_from_default   runs    -                           "" "$ADIV 'div(phirb,alpha)' '' 'default Gauss linear;'"
+# relaxationFactors: a field factor that answers for p_rgh (pEqn.H:56's p_rgh.relax()) and the flat form
+# (solution.C:81-101) are refused; an empty `fields {}` beside the equations, as RAS/motorBike writes, runs
+RLX="python3 -c \"import re, sys; p = 'system/fvSolution'; t = open(p).read(); t2 = re.sub(r'relaxationFactors\s*\{.*?\n\}', 'relaxationFactors\n{\n' + sys.argv[1] + '\n}', t, flags=re.S); assert t2 != t; open(p, 'w').write(t2)\""
+arm relax_fields_prgh       refused "relaxationFactors/fields answers" "" "$RLX '    fields { p_rgh 0.5; } equations { \".*\" 1; }'"
+arm relax_fields_default    refused "relaxationFactors/fields answers" "" "$RLX '    fields { default 0.5; } equations { \".*\" 1; }'"
+arm relax_flat              refused "the flat form"             "" "$RLX '    U 0.7;'"
+arm relax_fields_empty      runs    -                           "" "$RLX '    fields { } equations { \".*\" 1; }'"
+# `MULESCorr yes` without a `<alpha>Final` entry: alpha1Eqn.solve() takes it on the final outer corrector
+# (fvMatrix.C:1536-1542) and OpenFOAM stops; a literal `alpha.water` alone ran
+arm alphaFinal_missing      refused "has no \`solvers/alpha.waterFinal\`" "" "sed -i 's/\"alpha.water.\\*\"/alpha.water/' system/fvSolution; grep -q '^    alpha.water$' system/fvSolution"
+# controlDict, as Time reads it (Time.C:146-190, TimeIO.C:268-356)
+arm stopAt_nextWrite        refused "Only \`stopAt endTime\` is ported" "" "sed -i 's/^stopAt .*/stopAt          nextWrite;/' system/controlDict"
+arm startFrom_unknown       refused "expected startTime, firstTime or latestTime" "" "sed -i 's/^startFrom .*/startFrom       beginning;/' system/controlDict"
+arm startTime_missing       refused "no \`startTime\`"          "" "sed -i '/^startTime /d' system/controlDict"
+arm deltaT_missing          refused "has no \`deltaT\`"         "" "sed -i '/^deltaT /d' system/controlDict"
+# ...and no `startFrom` at all is latestTime, OpenFOAM's default: on a case with nothing written, the start
+arm startFrom_absent        runs    -                           "" "sed -i '/^startFrom /d' system/controlDict"
+# a Switch read as OpenFOAM's Switch (Switch.C:87-137): `y` is yes, and a word that is not one stops the run
+arm adjustTimeStep_y        runs    -                           "" "sed -i 's/^adjustTimeStep .*/adjustTimeStep  y;/' system/controlDict"
+arm adjustTimeStep_typo     refused "Unknown switch"            "" "sed -i 's/^adjustTimeStep .*/adjustTimeStep  yse;/' system/controlDict"
+# constant/turbulenceProperties, as OpenFOAM reads it (TurbulenceModel.C:91-104, laminarModel.C:109-135,
+# RASModel.C:140-144, LESModel.C:158-162): the one file name, MUST_READ, `simulationType` with no default, the
+# model by `model` and by its older name only where that is absent, and a `laminar` sub-dictionary that
+# selects the stress model. A case with no file, or with another fork's constant/momentumTransport, ran as
+# laminar; `laminar { model generalisedNewtonian; }` ran Newtonian; `RAS { model kEpsilon; }` was refused.
+arm turb_file_missing       refused "has no constant/turbulenceProperties" "" "rm constant/turbulenceProperties"
+arm turb_other_forks_name   refused "has no constant/turbulenceProperties" "" "mv constant/turbulenceProperties constant/momentumTransport"
+arm turb_no_simulationType  refused "has no \`simulationType\`"   "" "sed -i '/^simulationType/d' constant/turbulenceProperties"
+arm turb_laminar_Stokes     runs    -                           "" "printf 'laminar { model Stokes; }\n' >> constant/turbulenceProperties"
+arm turb_laminar_olderName  runs    -                           "" "printf 'laminar { laminarModel Stokes; }\n' >> constant/turbulenceProperties"
+arm turb_laminar_other      refused "names the stress model \`generalisedNewtonian\`" "" "printf 'laminar { model generalisedNewtonian; }\n' >> constant/turbulenceProperties"
+arm turb_laminar_noModel    refused "names the stress model"    "" "printf 'laminar { }\n' >> constant/turbulenceProperties"
+BASE="$BR"
+arm turb_RAS_model          runs    -                           "" "sed -i 's/^\( *\)RASModel /\1model /' constant/turbulenceProperties; grep -q '^ *model ' constant/turbulenceProperties"
+BASE="$BL"
+arm turb_LES_model          runs    -                           "" "sed -i 's/^\( *\)LESModel /\1model /' constant/turbulenceProperties; grep -q '^ *model ' constant/turbulenceProperties"
+BASE="$B"
+# a contact-angle wall's `limit` has no default (limitControlNames_.get("limit", dict),
+# alphaContactAngleTwoPhaseFvPatchScalarField.C:71); a wall without one ran as `limit none`
+CANG="python3 -c \"import re, sys; p = '0/alpha.water'; t = open(p).read(); t2 = re.sub(r'(\n    leftWall\n    \{\n)\s*type\s+zeroGradient;', r'\1        type            constantAlphaContactAngle;\n        theta0          45;\n' + sys.argv[1] + '        value           uniform 0;', t); assert t2 != t; open(p, 'w').write(t2)\""
+arm contactAngle_noLimit    refused "is constantAlphaContactAngle and has no \`limit\`" "" "$CANG ''"
+arm contactAngle_limit      runs    -                           "" "$CANG '        limit           gradient;\n'"
+# SMALLER ENTRIES THAT WERE DEFAULTED OR NEVER READ (review rows R16, R11, R18, R19).
+# limitedLinearV's coefficient has no default (limitedLinear.H:67); it was 1
+arm divU_limitedLinearV_bare refused "names limitedLinearV with no coefficient" "" "$ADIV 'div(rhoPhi,U)' 'Gauss limitedLinearV'"
+arm divU_limitedLinearV     runs    -                           "" "$ADIV 'div(rhoPhi,U)' 'Gauss limitedLinearV 1'"
+# the viscous stress's explicit half is a divergence OpenFOAM looks a scheme up for (linearViscousStress.C:130);
+# the loops form it Gauss linear and never read the entry
+SDIV="python3 -c \"import re, sys; p = 'system/fvSchemes'; t = open(p).read(); k = 'div(((rho*nuEff)*dev2(T(grad(U)))))'; i = t.index(k); j = t.index(';', i); t2 = t[:i] + ((k + ' ' + sys.argv[1] + ';') if sys.argv[1] else '') + t[j + 1:]; t2 = t2.replace('divSchemes\n{', 'divSchemes\n{\n    ' + sys.argv[2]) if len(sys.argv) > 2 else t2; open(p, 'w').write(t2)\""
+arm stress_scheme_other     refused "another scheme is not ported" "" "$SDIV 'Gauss limitedLinear 1'"
+arm stress_scheme_missing   refused "names no entry for the viscous stress" "" "$SDIV ''"
+arm stress_scheme_default   runs    -                           "" "$SDIV '' 'default Gauss linear;'"
+# constant/hRef is optional; its `value` is not (UniformDimensionedField.C:129). A file without one read 0.
+arm hRef_noValue            refused "constant/hRef has no \`value\`" "" "printf '%s\ndimensions [0 1 0 0 0 0 0];\n' '$HDR' > constant/hRef"
+arm hRef_value              runs    -                           "" "printf '%s\ndimensions [0 1 0 0 0 0 0];\nvalue 0.1;\n' '$HDR' > constant/hRef"
+# a `rho` file in the start directory is read in place of alpha1*rho1 + alpha2*rho2 (createFields.H:45-55)
+arm start_rho               refused "holds a \`rho\` file"      "" "cp 0/p_rgh 0/rho"
+# icAlpha and scAlpha (alphaEqn.H:61-73) are ported on NEITHER loop: the device's refusal said the host carries
+# them, and the host stopped in its first alpha step. Refused by the case reader, for both, in one sentence.
+ICA="sed -i 's/^\( *\)nAlphaCorr /\1icAlpha 0.5;\n\1nAlphaCorr /' system/fvSolution; grep -q icAlpha system/fvSolution"
+arm icAlpha_host            refused "are not ported, on either loop" "" "$ICA"
+arm icAlpha_gpu             refused "are not ported, on either loop" "-device" "$ICA"
+arm scAlpha_host            refused "are not ported, on either loop" "" "sed -i 's/^\( *\)nAlphaCorr /\1scAlpha 0.5;\n\1nAlphaCorr /' system/fvSolution"
+# laplacianSchemes: the word after `Gauss` is the diffusivity's interpolation (laplacianScheme.H:121-141), linear
+# on both loops; and a named entry for one of interFoam's own fields is OpenFOAM's scheme for that term where
+# the loops take the default for every one. One that repeats the default, or names a field the loops do not
+# have (RAS/electrostaticDeposition's function object), changes nothing and runs.
+LAP="python3 -c \"import sys; p = 'system/fvSchemes'; t = open(p).read(); a = sys.argv[1] + '\n{'; assert a in t; open(p, 'w').write(t.replace(a, a + '\n    ' + sys.argv[2], 1))\""
+arm lap_harmonic            refused "another interpolation is not ported" "" "sed -i '/^laplacianSchemes/,/^}/ s/default .*/default         Gauss harmonic corrected;/' system/fvSchemes"
+arm lap_named_prgh          refused "names \`laplacian(rAUf,p_rgh)" "" "$LAP laplacianSchemes 'laplacian(rAUf,p_rgh) Gauss linear uncorrected;'"
+arm lap_named_same          runs    -                           "" "$LAP laplacianSchemes 'laplacian(rAUf,p_rgh) Gauss linear corrected;'"
+arm lap_named_otherField    runs    -                           "" "$LAP laplacianSchemes 'laplacian(sigma,V) Gauss linear orthogonal;'"
+arm snGrad_named_rho        refused "names \`snGrad(rho)"       "" "$LAP snGradSchemes 'snGrad(rho) uncorrected;'"
+
+# FROZEN PER-STEP BOUNDARY CONDITIONS. The shared factory ACCEPTS fixedMean, fanPressure,
+# codedFixedValue and codedMixed on the strength of a per-step update its own comment promises, and
+# interFoam maintains NONE of them -- no collectFixedMean, no collectFanPressure, no setupCodedBCs
+# anywhere in its tree. So such a patch was built from the file `value` and never touched again while
+# OpenFOAM's fixedMean rescales patchInternalField at every updateCoeffs
+# (fixedMeanFvPatchField.C) -- a SILENT frozen boundary, which is the defect class this project keeps
+# finding. simpleFoam and rhoSimpleFoam have called refuseFrozenPerStepBC at their read sites all
+# along; interFoam was the driver that did not. Each field's read site is guarded, so there is an arm
+# per field, and `baseline` above is the must-run opposite.
+arm frozen_fixedMean_alpha  refused "fixedMean"   "" "sed -i '0,/type  *zeroGradient;/s//type fixedMean; meanValue 0.5; value uniform 0.5;/' 0/alpha.water"
+arm frozen_fixedMean_U      refused "fixedMean"   "" "sed -i '0,/type  *noSlip;/s//type fixedMean; meanValue (0 0 0); value uniform (0 0 0);/' 0/U"
+arm frozen_fanPressure      refused "fanPressure" "" "sed -i '0,/type  *fixedFluxPressure;/s//type fanPressure; value uniform 0;/' 0/p_rgh"
+arm frozen_codedFixedValue  refused "codedFixedValue" "" "sed -i '0,/type  *zeroGradient;/s//type codedFixedValue; name f; value uniform 0.5;/' 0/alpha.water"
+
+# interpolationSchemes. interFoam NEVER READ THIS BLOCK -- zero references in its tree -- so brae
+# interpolated `linear` whatever the case named, with no throw and no notice. All 44 shipped tutorials
+# happen to say `linear`, which is why nothing ever showed it. `interp_linear` is the must-run opposite.
+arm interp_cubic            refused "interpolationSchemes"  "" "sed -i 's/^    default  *linear;/    default         cubic;/' system/fvSchemes"
+arm interp_midPoint         refused "interpolationSchemes"  "" "sed -i '/^interpolationSchemes/,/^}/s/default  *linear;/default         midPoint;/' system/fvSchemes"
+arm interp_linear           runs    -                       "" true
+
+# `phi <name>` ON A CLASS THAT DOES NOT READ ONE. fixedFluxPressure has NO phiName_ member in v2412
+# (its constructor reads the gradient and value entries and nothing else), so `phi phiAbs;` beside it is
+# dead text OpenFOAM ignores -- and three shipped tutorials write exactly that
+# (damBreakWithObstacle, oscillatingBox, motorBike). brae recorded the name for every patch field and
+# resolved it for every patch, refusing those cases over an entry OpenFOAM never reads. The opposite arm
+# is a class that DOES read one: inletOutlet carries phiName_, so a bad flux there must still refuse.
+arm flux_fixedFluxPressure_ignored runs    -      "" "sed -i '0,/type  *fixedFluxPressure;/s//type fixedFluxPressure; phi phiAbs;/' 0/p_rgh"
+arm flux_named_on_reader           refused "phiAbs" "" "sed -i '0,/type  *inletOutlet;/s//type inletOutlet; phi phiAbs;/' 0/alpha.water"
+
+# the mesh
+# A BARE dynamicRefineFvMesh, which OpenFOAM ITSELF stops on: its constructor's readDict() reads
+# correctFluxes first (dynamicRefineFvMesh.C:184), and real OpenFOAM v2412 on this staging stops with
+# "Entry 'correctFluxes' not found in dictionary". brae stops there too, in those words, on both arms
+# (mesh_dynamicRefine_device below); it named refineInterval until the reader took OpenFOAM's order.
+# The complete dictionary RUNS on both arms -- `mesh_refine_only` and `device_refine_runs`.
+arm mesh_dynamicRefine      refused "Entry 'correctFluxes' not found in dictionary" "" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
+# dynamicMotionSolverFvMesh IS ported for a solidBody motion of the whole mesh; without a motionSolver
+# it is refused by that name, and the moving arms below hold the rest
+arm mesh_motionSolver       refused "motionSolver"             "" "printf '%s\ndynamicFvMesh dynamicMotionSolverFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
+arm mesh_noType             refused "no \`dynamicFvMesh\` entry" "" "printf '%s\n' '$HDR' > constant/dynamicMeshDict"
+arm mesh_static             runs    -                        "" "printf '%s\ndynamicFvMesh staticFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
+
+# REFINEMENT BESIDE MOTION. In v2412 dynamicRefineFvMesh IS a dynamicMotionSolverListFvMesh
+# (dynamicRefineFvMesh.H:56-58): its init reads a `solvers` SUB-DICTIONARY and builds one motionSolver per
+# sub-dictionary in it, with `mandatory` false so ZERO of them is legal (dynamicRefineFvMesh.C:1106), and
+# update() refines FIRST and then moves (:1468-1474).
+#
+# brae carried the topology change and NOT the motion, behind a refusal that could never fire: MEASURED on
+# laminar/oscillatingBox, brae refined exactly as OpenFOAM did and read max|U| 1.2e-04 m/s where OpenFOAM
+# reads 2.2. BOTH RUN NOW, on a 3-D mesh: tests/interfoam_amr_motion_vs_openfoam.sh holds oscillatingBox to
+# OpenFOAM, its points and points0 bitwise. What is refused is a motion beside refinement on a 2-D mesh --
+# OpenFOAM corrects an added point back onto the mesh's planes (twoDCorrectPoints) and that is not ported --
+# and this gate's base IS 2-D, so the motion arms below hold that refusal by its own words.
+#
+# THE OPPOSITE ARMS ARE THE POINT. This gate's base is laminar/damBreak, which is 2-D, and a 2-D adaptive
+# case RUNS: its mapper is gated exactly by the third arm of tests/refine_update_vs_openfoam.sh, which is
+# the arm that found the hull average putting an `empty` patch's stored values into the average where
+# OpenFOAM has zeros. What the third arm below proves is that the MOTION refusal keys on a motion solver
+# being there -- including past an EMPTY `solvers {}`, which OpenFOAM builds no motion solver from
+# (dynamicMotionSolverListFvMesh.C:98-133 with `mandatory` false) and brae must therefore run.
+REFDICT="printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\nrefineInterval 1;\nfield alpha.water;\nlowerRefineLevel 0.001;\nupperRefineLevel 0.999;\nunrefineLevel 10;\nnBufferLayers 1;\nmaxRefinement 1;\nmaxCells 100000;\ncorrectFluxes ((phi none) (rhoPhi none) (nHatf none));\ndumpLevel true;\n%s\n' '\$HDR'"
+arm mesh_refine_only        runs    -                        "" "$REFDICT '' > constant/dynamicMeshDict"
+arm mesh_refine_emptySolvers runs   -                        "" "$REFDICT 'solvers { }' > constant/dynamicMeshDict"
+arm mesh_refine_motion      refused "a motion solver on a 2-D mesh" "" "$REFDICT 'solvers { VF { motionSolverLibs (fvMotionSolvers); motionSolver solidBody; solidBodyMotionFunction oscillatingLinearMotion; amplitude (0.1 0 0); omega 6.283185307179586; } }' > constant/dynamicMeshDict"
+
+# MRF
+# MRF IS PORTED on the host (tests/interfoam_mrf_vs_openfoam.sh holds laminar/mixerVessel2D to OpenFOAM).
+# What is refused is what no gate holds, each by name. ZONE writes a 100-cell `rotor` cellZone into
+# damBreak, so the arms below reach the refusal they name and not "no such zone".
+ZONE="python3 -c \"open('constant/polyMesh/cellZones','w').write('FoamFile { version 2.0; format ascii; class regIOobject; location \\\"constant/polyMesh\\\"; object cellZones; }\\n1\\n(\\nrotor\\n{\\n    type cellZone;\\n    cellLabels List<label> 100(' + ' '.join(str(i) for i in range(100)) + ');\\n}\\n)\\n')\""
+# ...and the ZONE arms, which this gate CAN reach now that a 2-D adaptive case runs: changeMesh is
+# reached at the first change. A cellZone is CARRIED through it (dynamicRefine::renumberCellZones -- each
+# child takes its parent's zone id, ascending, which is what polyTopoChange.C:1900-1925 does), so it RUNS;
+# a faceZone or a pointZone is not ported and is still refused BY NAME. The opposite pair is the point:
+# with both refused, the cellZone carry that tests/interfoam_amr_vs_openfoam.sh's `porosity` profile gates
+# was unreachable, and an fvOption or an MRF zone would have applied itself to the old numbering.
+arm mesh_refine_cellZone    runs    -                        "" "$REFDICT '' > constant/dynamicMeshDict && $ZONE"
+FZONE="python3 -c \"open('constant/polyMesh/faceZones','w').write('FoamFile { version 2.0; format ascii; class regIOobject; location \\\"constant/polyMesh\\\"; object faceZones; }\\n1\\n(\\nband\\n{\\n    type faceZone;\\n    faceLabels List<label> 10(' + ' '.join(str(i) for i in range(10)) + ');\\n    flipMap List<bool> 10(' + ' '.join('0' for i in range(10)) + ');\\n}\\n)\\n')\""
+arm mesh_refine_faceZone    refused "faceZone(s)"                "" "$REFDICT '' > constant/dynamicMeshDict && $FZONE"
+# AN fvOPTION BESIDE REFINEMENT RUNS, and this arm is the refusal's replacement rather than its removal:
+# OpenFOAM RE-SELECTS an option's cells at every change (cellSetOption.C:383-396) and brae does the same, so
+# the option is carried instead of being stood in for. The numbers are gated by the `porosity` profile of
+# tests/interfoam_amr_vs_openfoam.sh -- 26711 cells of volume 0.08349609375, OpenFOAM's own to every digit.
+DARCY="printf '%s\nsrc { type explicitPorositySource; explicitPorositySourceCoeffs { selectionMode cellZone; cellZone rotor; type DarcyForchheimer; d (1e5 1e5 1e5); f (0 0 0); coordinateSystem { origin (0 0 0); e1 (1 0 0); e2 (0 1 0); } } }\n' '$HDR' > constant/fvOptions"
+arm mesh_refine_fvOptions   runs    -                        "" "$REFDICT '' > constant/dynamicMeshDict && $ZONE && $DARCY"
+
+# A pointZone or a faceZone THROUGH A TOPOLOGY CHANGE is still refused by changeMesh, which renumbers
+# neither (OpenFOAM's resetZones, polyTopoChange.C:1600-1968, does all three). THE REFUSAL WAS UNREACHABLE
+# until this session: changeInput hardcoded the zone count to 0, so a case carrying a cellZone refined with
+# the zone still in the OLD numbering -- and an MRF zone or an fvOption's cellZone would then apply itself
+# to whatever those labels now name. The count comes from the polyMesh directory now, by ENTRY COUNT and
+# not by the file's existence (subsetMesh writes all three files for every mesh it makes, each `0()`), and
+# cellZones are no longer counted at all because they are carried.
+
+MRFD="printf '%s\nMRF1 { cellZone rotor; origin (0 0 0); axis (0 0 1); OMEGA }\n' '$HDR' > constant/MRFProperties"
+arm mrf_noSuchZone          refused "is not in constant/polyMesh/cellZones" "" "printf '%s\nMRF1 { cellZone all; origin (0 0 0); axis (0 0 1); omega 10; }\n' '$HDR' > constant/MRFProperties"
+# damBreak's walls are fixedFluxPressure, where constrainPressure takes MRF.relative(Sf & U_b)
+arm mrf_fixedFluxPressure   refused "is a fixedFluxPressure"  "" "$ZONE; ${MRFD/OMEGA/omega 10;}"
+arm mrf_omegaConstant       refused "is a fixedFluxPressure"  "" "$ZONE; ${MRFD/OMEGA/omega constant 10;}"
+arm mrf_omegaDict           refused "is a fixedFluxPressure"  "" "$ZONE; ${MRFD/OMEGA/omega \{ type constant; value 10; \}}"
+arm mrf_omegaTable          refused "Function1 of type \`table\`" "" "$ZONE; ${MRFD/OMEGA/omega table ((0 0) (1 10));}"
+arm mrf_noOmega             refused "has no \`omega\` entry"  "" "$ZONE; ${MRFD/OMEGA/}"
+arm mrf_inactive            runs    -                        "" "printf '%s\nMRF1 { cellZone all; active no; origin (0 0 0); axis (0 0 1); omega 10; }\n' '$HDR' > constant/MRFProperties"
+arm mrf_empty               runs    -                        "" "printf '%s\n' '$HDR' > constant/MRFProperties"
+# `active` is a Switch (MRFZone.C:553): `y` is yes -- read by hand it dropped the zone, and this arm ran; with
+# the zone on it reaches the refusal of a cellZone that is not there
+arm mrf_active_y            refused "is not in constant/polyMesh/cellZones" "" "printf '%s\nMRF1 { cellZone all; active y; origin (0 0 0); axis (0 0 1); omega 10; }\n' '$HDR' > constant/MRFProperties"
+# `origin` and `axis` have no default (MRFZone.C:563-564); a zone without `axis` rotated about z
+arm mrf_noAxis              refused "has no \`axis\` of three components" "" "$ZONE && printf '%s\nMRF1 { cellZone rotor; origin (0 0 0); omega 10; }\n' '$HDR' > constant/MRFProperties"
+arm mrf_noOrigin            refused "has no \`origin\` of three components" "" "$ZONE && printf '%s\nMRF1 { cellZone rotor; axis (0 0 1); omega 10; }\n' '$HDR' > constant/MRFProperties"
+# MRF BESIDE REFINEMENT, both directions. The zone's face lists are REBUILT through a change now
+# (MRF::update, mirroring MRFZone::update -> setMRFFaces), gated end to end by
+# tests/interfoam_amr_mrf_vs_openfoam.sh on mixerVessel2D -- so the refusal that named this case is gone
+# and the arm that replaces it is a `runs`. damBreak's own p_rgh walls are fixedFluxPressure, which brae
+# refuses MRF beside for a reason of its own, so the running arm has to take those out; and the SECOND arm
+# is the composition risk that matters -- a refinement path must not become a way AROUND the other MRF
+# refusals, so MRF + refinement + a fixedFluxPressure wall must still be refused by name.
+PRGHZG="python3 -c \"import re; p='0/p_rgh'; t=open(p).read(); t=t.replace('fixedFluxPressure','zeroGradient'); open(p,'w').write(t)\""
+arm mrf_refine              runs    -                        "" "$REFDICT '' > constant/dynamicMeshDict && $ZONE && $PRGHZG && ${MRFD/OMEGA/omega 10;}"
+# TURBULENCE BESIDE REFINEMENT RUNS NOW -- k, the second scalar and nut mapped, the two wall distances
+# recomputed -- and it is NOT armed here. This gate's base is laminar damBreak, and making it turbulent
+# needs 0/k, 0/epsilon, 0/nut, the closure's div entries and its solver entries: the whole recipe
+# tests/interfoam_amr_ras_vs_openfoam.sh already stages onto a case that ships them. That gate runs the
+# composition end to end on both arms and would fail loudly if the refusal came back, so an arm here would
+# duplicate its staging to assert less. What is still refused beside a change -- the closure under
+# CrankNicolson, and LES -- is refused on the SCHEME and on the STATE in inter_amr_cpp.cu, and the same
+# applies: a turbulent base is needed to reach either.
+arm mrf_refine_fixedFlux    refused "is a fixedFluxPressure"  "" "$REFDICT '' > constant/dynamicMeshDict && $ZONE && ${MRFD/OMEGA/omega 10;}"
+
+# THE PERMEABLE WALL is ported (tests/interfoam_permeable_vs_openfoam.sh). What it refuses, by name:
+PERMU="python3 -c \"import re; p='0/U'; t=open(p).read(); t=re.sub(r'rightWall\\s*\\{[^}]*\\}', 'rightWall { type permeableAlphaPressureInletOutletVelocity; alpha alpha.water; alphaMin 0.01; PHI value uniform (0 0 0); }', t, count=1); open(p,'w').write(t)\""
+PERMP="python3 -c \"import re; p='0/p_rgh'; t=open(p).read(); t=re.sub(r'rightWall\\s*\\{[^}]*\\}', 'rightWall { type prghPermeableAlphaTotalPressure; alpha alpha.water; alphaMin 0.01; PENTRY value uniform 0; }', t, count=1); open(p,'w').write(t)\""
+arm permeable_runs          runs    -                        "" "${PERMU/PHI /}; ${PERMP/PENTRY/p uniform 0;}"
+arm permeable_massFlux      refused "MASS flux"               "" "${PERMU/PHI /phi rhoPhi; }; ${PERMP/PENTRY/p uniform 0;}"
+arm permeable_pTable        refused "PatchFunction1"          "" "${PERMU/PHI /}; ${PERMP/PENTRY/p table ((0 0) (1 10));}"
+arm permeable_noP           refused "has no \`p\` entry"      "" "${PERMU/PHI /}; ${PERMP/PENTRY/}"
+PERMUOIL="${PERMU/PHI /}"
+arm permeable_otherAlpha    refused "names \`alpha alpha.oil\`" "" "${PERMUOIL/alpha.water/alpha.oil}; ${PERMP/PENTRY/p uniform 0;}"
+# fvOptions, in both places OpenFOAM looks
+arm fvoptions_system        refused "scalarSemiImplicitSource" "" "printf '%s\nsrc { type scalarSemiImplicitSource; }\n' '$HDR' > system/fvOptions"
+arm fvoptions_constant      refused "scalarSemiImplicitSource" "" "printf '%s\nsrc { type scalarSemiImplicitSource; }\n' '$HDR' > constant/fvOptions"
+# explicitPorositySource/DarcyForchheimer IS ported (tests/interfoam_angledduct_vs_openfoam.sh); its
+# fixedCoeff model is not, and neither is any other type
+arm fvoptions_fixedCoeff    refused "fixedCoeff"              "" "$ZONE; printf '%s\nsrc { type explicitPorositySource; explicitPorositySourceCoeffs { selectionMode cellZone; cellZone rotor; type fixedCoeff; alpha (1 1 1); beta (0 0 0); rhoRef 1; coordinateSystem { origin (0 0 0); e1 (1 0 0); e2 (0 1 0); } } }\n' '$HDR' > constant/fvOptions"
+arm fvoptions_darcy         runs    -                        "" "$ZONE; printf '%s\nsrc { type explicitPorositySource; explicitPorositySourceCoeffs { selectionMode cellZone; cellZone rotor; type DarcyForchheimer; d (1e5 1e5 1e5); f (0 0 0); coordinateSystem { origin (0 0 0); e1 (1 0 0); e2 (0 1 0); } } }\n' '$HDR' > constant/fvOptions"
+arm fvoptions_inactive      runs    -                        "" "printf '%s\nsrc { type scalarSemiImplicitSource; active no; }\n' '$HDR' > system/fvOptions"
+# constant/ is looked up FIRST and OpenFOAM stops there: an inactive one in constant/ hides an active
+# one in system/
+arm fvoptions_constant_wins runs    -                        "" "printf '%s\nsrc { type x; active no; }\n' '$HDR' > constant/fvOptions; printf '%s\nsrc { type x; }\n' '$HDR' > system/fvOptions"
+# explicitPorositySource, as OpenFOAM reads it (review row R12): `selectionMode` has no default
+# (cellSetOption.C:362), `timeStart`/`duration` is the window the option acts in (:438-440), the resistances
+# have no default (DarcyForchheimer.C:59-60), and the coordinate system is a mandatory sub-dictionary whose
+# axes may be e1/e2, e2/e3, e3/e1, axis/direction or a typed rotation (porosityModel.C:97-100,
+# axesRotation.C:160-199) -- e1 and e2 are the form read. Each was defaulted or never read.
+PORO="printf '%s\nPRE src { type explicitPorositySource; explicitPorositySourceCoeffs { BODY } } POST\n' '$HDR' > constant/fvOptions"
+PSEL="selectionMode cellZone; cellZone rotor;"
+PDF="type DarcyForchheimer; d (1e5 1e5 1e5); f (0 0 0);"
+PCS="coordinateSystem { origin (0 0 0); e1 (1 0 0); e2 (0 1 0); }"
+poro() { local a="${PORO/BODY/$1}"; a="${a/PRE/${2:-}}"; echo "${a/POST/${3:-}}"; }
+arm porosity_noSelectionMode refused "no \`selectionMode\`"      "" "$ZONE; $(poro "cellZone rotor; $PDF $PCS")"
+arm porosity_timeStart      refused "\`timeStart\` and \`duration\`" "" "$ZONE; $(poro "$PSEL timeStart 0; duration 1; $PDF $PCS")"
+arm porosity_noF            refused "no \`f\`"                  "" "$ZONE; $(poro "$PSEL type DarcyForchheimer; d (1e5 1e5 1e5); $PCS")"
+arm porosity_noCsys         refused "no \`coordinateSystem\` sub-dictionary" "" "$ZONE; $(poro "$PSEL $PDF")"
+arm porosity_e3e1           refused "not given as \`e1\` and \`e2\`" "" "$ZONE; $(poro "$PSEL $PDF coordinateSystem { origin (0 0 0); e3 (0 0 1); e1 (1 0 0); }")"
+arm porosity_rotationType   refused "rotation is \`axisAngle\`"  "" "$ZONE; $(poro "$PSEL $PDF coordinateSystem { origin (0 0 0); rotation { type axisAngle; axis (0 0 1); angle 30; } }")"
+arm porosity_rotationAxes   runs    -                           "" "$ZONE; $(poro "$PSEL $PDF coordinateSystem { origin (0 0 0); rotation { type axes; e1 (1 0 0); e2 (0 1 0); } }")"
+arm porosity_wrapped        runs    -                           "" "$ZONE; $(poro "$PSEL $PDF $PCS" "options {" "}")"
+
+# surface tension
+arm sigma_model             refused "temperatureDependent"    "" "sed -i 's/^sigma .*/sigma { type temperatureDependent; sigma table ((0 0.07)); }/' constant/transportProperties"
+arm sigma_absent            refused "has no \`sigma\`"         "" "sed -i '/^sigma /d' constant/transportProperties"
+arm sigma_zero              runs    -                        "" "sed -i 's/^sigma .*/sigma 0;/' constant/transportProperties"
+
+# the one function object that changes the solution
+arm fo_setTimeStep          refused "setTimeStep"             "" "sed -i 's|^// \*\*\*.*||' system/controlDict; printf 'functions { dt { type setTimeStep; libs (utilityFunctionObjects); deltaT 1e-5; } }\n' >> system/controlDict"
+arm fo_harmless             runs    -                        "" "sed -i 's|^// \*\*\*.*||' system/controlDict; printf 'functions { p { type probes; libs (sampling); fields (p); probeLocations ((0.1 0.1 0)); } }\n' >> system/controlDict"
+# ...its sibling for finite-area regions, the only other object that defines an adjustTimeStep of its own
+arm fo_setTimeStepFaRegion  refused "setTimeStepFaRegion"     "" "sed -i 's|^// \*\*\*.*||' system/controlDict; printf 'functions { dt { type setTimeStepFaRegion; libs (regionFaModels); } }\n' >> system/controlDict"
+# ...and the one thing of ANY object that reaches the solution: under adjustTimeStep its write times at
+# `writeControl adjustableRunTime` trim the step (Time.C:142, timeControlFunctionObject.C:560-643). Ported and
+# said per object -- tests/interfoam_write/clock/function_object_write_times.sh holds it to OpenFOAM's log, bit
+# for bit. Refused by name: an interval left out (OpenFOAM stops on it too, run 2026-10-07) and the entries
+# that change HOW the times trim. Only where they act: at a fixed step nothing reaches an object's
+# adjustTimeStep, and OpenFOAM runs the case (run the same day).
+FOADJ="sed -i 's|^// \*\*\*.*||; s/^adjustTimeStep .*/adjustTimeStep  yes;/' system/controlDict"
+FOADJ="$FOADJ; grep -q '^adjustTimeStep  yes;' system/controlDict; printf 'functions { p { type probes; libs (sampling);"
+FOADJ="$FOADJ fields (p); probeLocations ((0.1 0.1 0)); writeControl adjustableRunTime; EXTRA } }\n' >> system/controlDict"
+FOFIX="${FOADJ//adjustTimeStep  yes;/adjustTimeStep  no;}"
+arm fo_adjustable           runs    "time step: the write times of function object \`p\`" "" "${FOADJ/EXTRA/writeInterval 0.0003;}"
+arm fo_adjustable_noInterval refused "names no \`writeInterval\`" "" "${FOADJ/EXTRA/}"
+arm fo_adjustable_deltaTCoeff refused "sets \`deltaTCoeff\`"   "" "${FOADJ/EXTRA/writeInterval 0.0003; deltaTCoeff 1.1;}"
+arm fo_adjustable_trigger   refused "sets \`triggerStart\`"   "" "${FOADJ/EXTRA/writeInterval 0.0003; triggerStart 1;}"
+arm fo_adjustable_mode      refused "sets \`controlMode\`"    "" "${FOADJ/EXTRA/writeInterval 0.0003; controlMode timeOrTrigger;}"
+arm fo_deltaTCoeff_fixedStep runs   -                        "" "${FOFIX/EXTRA/writeInterval 0.0003; deltaTCoeff 1.1;}"
+
+# already refused before this gate; here so they stay refused
+arm nonNewtonian            refused "CrossPowerLaw"           "" "sed -i '0,/transportModel  *Newtonian;/s//transportModel  CrossPowerLaw;/' constant/transportProperties"
+
+# the time scheme: read into f.ddtU and then handed to nobody, so these ran as Euler. CRANKNICOLSON RUNS
+# now, on both loops (tests/interfoam_cn_vs_openfoam.sh holds RAS/damBreak under it), and ON A MOVING
+# MESH -- its three moving branches (fvm::ddt's V0/V00 weights, fvcDdtUfCorr, the off-centred
+# fvc::meshPhi) are held by tests/interfoam_moving_vs_openfoam.sh's `sloshing2DCN`. What it refuses,
+# by name: a Function1 ocCoeff (the ramp form), a coefficient outside [0, 1], the scheme on one of the two
+# operand sets and Euler on the other, beside a mangrove source (whose
+# added mass takes fvm::ddt(U) under the case's scheme), with alpha
+# sub-cycling (OpenFOAM's own FatalError), a restart directory that holds a MOVING mesh's ddt0 fields, and
+# a restart of a case with a COUPLED PAIR.
+# A RESTART FROM OPENFOAM'S OWN STATE RUNS now, on both loops: the three static-mesh ddt0 fields are read
+# back with startTimeIndex -2, every field's <field>_0 old-time level with them, and alphaPhi0's presence
+# makes ddt(alpha)'s off-centring live from the first step (inter_cn_restart.cuh).
+# tests/interfoam_cn_vs_openfoam.sh's `cnRestart` profile holds it against OpenFOAM's own warm restart,
+# with OpenFOAM's COLD restart as the control.
+CNSET="sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson 0.5;/' system/fvSchemes"
+arm ddt_CrankNicolson       runs    -                        "" "$CNSET"
+arm ddt_cnFull              runs    -                        "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson 1;/' system/fvSchemes"
+# `CrankNicolson;` with no coefficient is NOT `CrankNicolson 1`: the scheme reads a token after its name and
+# real interFoam stops on "attempt to read beyond EOF" (measured 2026-10-07; this arm said `runs` until then)
+arm ddt_cnBare              refused "with no off-centring coefficient" "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson;/' system/fvSchemes"
+arm ddt_cnRamp              refused "Function1 of time"      "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson ocCoeff { type scale; scale linearRamp; duration 0.01; value 0.9; };/' system/fvSchemes"
+arm ddt_cnOutOfRange        refused "should be >= 0 and <= 1" "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson 1.5;/' system/fvSchemes"
+# `ddt(alpha)` NEED NOT AGREE WITH THE DEFAULT, in either direction. alphaEqn.H:242-259 branches on
+# `ddt(rho,U)` while ocCoeff comes from `ddt(alpha)` (alphaEqn.H:6-56), so all four combinations are runs
+# OpenFOAM makes. Their NUMBERS are held by tests/interfoam_cn_vs_openfoam.sh profiles `cnAlphaEuler` and
+# `eulerAlphaCN`, each against OpenFOAM's both-CrankNicolson answer -- the one brae used to produce.
+arm ddt_cnAlphaOnly         runs    -                        "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         Euler;\n    ddt(alpha)      CrankNicolson 0.5;/' system/fvSchemes"
+arm ddt_alphaEulerOnly      runs    -                        "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         CrankNicolson 0.5;\n    ddt(alpha)      Euler;/' system/fvSchemes"
+arm ddt_cnSubCycles         refused "nAlphaSubCycles > 1"    "" "$CNSET; sed -i 's/nAlphaSubCycles  *1;/nAlphaSubCycles 2;/' system/fvSolution"
+# THE RESTART STATE IS READ, not refused: these two arms RUN now. What they say is that the reader takes
+# the path -- a state file in the start directory no longer stops the case -- while the NUMBERS live in
+# the cn gate's `cnRestart` profile, where OpenFOAM's own warm restart is the oracle.
+arm ddt_cnDdt0Present       runs    -                         "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class volVectorField; object ddt0(rho,U); }\ndimensions [1 -2 -2 0 0 0 0];\ninternalField uniform (0 0 0);\nboundaryField { \".*\" { type calculated; value uniform (0 0 0); } }\n' > '0/ddt0(rho,U)'"
+arm ddt_cnAlphaPhi0Present  runs    -                         "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class surfaceScalarField; object alphaPhi0.water; }\ndimensions [0 3 -1 0 0 0 0];\ninternalField uniform 0;\nboundaryField { \".*\" { type calculated; value uniform 0; } }\n' > 0/alphaPhi0.water"
+# ...and the TWO A MOVING MESH WRITES are still refused, for want of a fixture that restarts one: the one
+# shipped interFoam tutorial that names CrankNicolson, RAS/floatingObject, moves its mesh under
+# rigidBodyMotion -- it runs and its CrankNicolson state is written, but brae does not restart a moved
+# mesh -- so a seed for either would be ungated.
+arm ddt_cnUfDdt0Present     refused "ddtCorrDdt0(Uf)"         "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class surfaceVectorField; object ddtCorrDdt0(Uf); }\ndimensions [0 1 -2 0 0 0 0];\ninternalField uniform (0 0 0);\nboundaryField { \".*\" { type calculated; value uniform (0 0 0); } }\n' > '0/ddtCorrDdt0(Uf)'"
+arm ddt_cnMeshPhi0Present   refused "meshPhiCN_0"             "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class surfaceScalarField; object meshPhiCN_0; }\ndimensions [0 3 -1 0 0 0 0];\ninternalField uniform 0;\nboundaryField { \".*\" { type calculated; value uniform 0; } }\n' > '0/meshPhiCN_0'"
+# ...and a RESTART ACROSS A COUPLED PAIR, on the leakage base, whose baffles are cyclicACMI. The pair's
+# own old-old flux and ddtCorr ddt0 live in arrays the boundary-face seed does not reach
+# (inter_driver_device.cu, dPhiOOIf beside dPhiOOI), so half of one field would start cold. The PAIR
+# ARM BELOW IT is the control: the same base under the same scheme with no state file runs, so this
+# refusal is the restart's and not the mesh's.
+BASE="$BK"
+arm ddt_cnRestartCoupled    refused "a coupled pair"          "" "$CNSET; printf 'FoamFile { version 2.0; format ascii; class volVectorField; object ddt0(rho,U); }\ndimensions [1 -2 -2 0 0 0 0];\ninternalField uniform (0 0 0);\nboundaryField { \".*\" { type calculated; value uniform (0 0 0); } }\n' > '0/ddt0(rho,U)'"
+arm ddt_cnCoupledCold       runs    -                         "" "$CNSET"
+BASE="$B"
+# LOCALEULER RUNS on the host loop (tests/interfoam_dtchull_vs_openfoam.sh holds it to OpenFOAM on DTCHull),
+# with setRDeltaT.H's controls from fvSolution's PIMPLE and OpenFOAM's defaults for them -- and two of
+# those defaults are ON: nAlphaSpreadIter 1 and nAlphaSweepIter 5 call fvc::spread and fvc::sweep, which
+# are not ported. So damBreak under `default localEuler` alone is refused by the FIRST of them, the one
+# key a case must write to run, and runs once both are 0. The switch is `default` alone
+# (localEulerDdt::enabled): a named localEuler under `default Euler` is OpenFOAM's own stop (no rDeltaT
+# field exists), and `default localEuler` beside a named Euler momentum is refused as unheld. What the
+# local step does not carry yet is refused by name: sub-cycling, the explicit MULES, a moving mesh, a
+# turbulent closure, fvOptions and MRF -- the last three on their own bases below.
+LTSSET="sed -i '/^ddtSchemes/,/^}/ s/default .*/default         localEuler;/' system/fvSchemes"
+LTSZERO="sed -i 's/^\\( *\\)momentumPredictor .*/&\\n\\1nAlphaSpreadIter 0;\\n\\1nAlphaSweepIter 0;/' system/fvSolution"
+arm ddt_localEulerSpread    refused "nAlphaSpreadIter is 1"   "" "$LTSSET"
+arm ddt_localEulerSweep     refused "nAlphaSweepIter is 5"    "" "$LTSSET; sed -i 's/^\\( *\\)momentumPredictor .*/&\\n\\1nAlphaSpreadIter 0;/' system/fvSolution"
+arm ddt_localEuler          runs    -                         "" "$LTSSET; $LTSZERO"
+arm ddt_localEulerNamedEuler refused "no fixture holds the mixture" "" "$LTSZERO; ddtblock 'default localEuler;' 'ddt(rho,U) Euler;' 'ddt(U) Euler;'"
+arm ddt_localEulerUnderEuler refused "registers the rDeltaT field only when" "" "$LTSZERO; ddtblock 'default Euler;' 'ddt(rho,U) localEuler;' 'ddt(U) localEuler;'"
+arm ddt_localEulerSubCycles refused "localRSubDeltaT"         "" "$LTSSET; $LTSZERO; sed -i 's/nAlphaSubCycles  *[0-9]*;/nAlphaSubCycles 2;/' system/fvSolution"
+arm ddt_localEulerExplicit  refused "MULESCorr is off"        "" "$LTSSET; $LTSZERO; sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       no;/' system/fvSolution"
+arm ddt_localEulerMRF       refused "has MRF zones"           "" "$LTSSET; $LTSZERO; $ZONE && $PRGHZG && ${MRFD/OMEGA/omega 10;}"
+arm ddt_backward            refused "backward"                "" "sed -i '/^ddtSchemes/,/^}/ s/default .*/default         backward;/' system/fvSchemes"
+# EACH ddt BY ITS CALL SITE'S NAME (schemesLookupDetail.C:79-89): fvm::ddt(rho, U) asks for `ddt(rho,U)`,
+# ddtCorr and meshPhi for `ddt(U)`, alphaEqn.H for `ddt(alpha)`, each named-then-default. brae read
+# `default` alone, by a text search, so `ddt_splitRhoU` REACHED End: as Euler momentum (measured on the
+# old binary). One U scheme is carried, so a split is refused in either direction; the same scheme
+# spelled out, or reached through a regex key under `default none`, runs; a name that resolves to
+# nothing is OpenFOAM's own fatal; and the scheme is its FIRST word, so `bounded Euler` is not Euler.
+arm ddt_splitRhoU           refused 'resolves `ddt(rho,U)` (the momentum matrix, UEqn.H) to `CrankNicolson 0.5`' "" "ddtblock 'default Euler;' 'ddt(rho,U) CrankNicolson 0.5;'"
+arm ddt_splitU              refused 'and `ddt(U)` (ddtCorr and the mesh flux, pEqn.H) to `CrankNicolson 0.5`'    "" "ddtblock 'default Euler;' 'ddt(U) CrankNicolson 0.5;'"
+arm ddt_namedSame           runs    -                         "" "ddtblock 'default CrankNicolson 0.5;' 'ddt(rho,U) Euler;' 'ddt(U) Euler;' 'ddt(alpha) Euler;'"
+arm ddt_regexKey            runs    -                         "" "ddtblock 'default none;' '\"ddt\\(.*\\)\" Euler;'"
+arm ddt_noneUnnamed         refused 'has no `ddt(rho,U)` and no default to fall back to' "" "ddtblock 'default none;' 'ddt(alpha) Euler;'"
+arm ddt_bounded             refused 'whose scheme `bounded` is not one brae reads' "" "ddtblock 'default bounded Euler;'"
+BASE="$BM"
+# ...on the MOVING base, which is the arm that says the moving branches are reachable and not refused.
+# testTubeMixer names nAlphaSubCycles 3, and CrankNicolson with sub-cycling is OpenFOAM's own
+# FatalError (ddt_cnSubCycles above holds that), so this arm sets 1 -- otherwise it reaches the
+# sub-cycle refusal and says nothing about the mesh.
+arm ddt_cnMoving            runs    -                         "" "$CNSET; sed -i 's/nAlphaSubCycles  *[0-9]*;/nAlphaSubCycles 1;/' system/fvSolution"
+# ...and localEuler on the moving base: localEulerDdtScheme's moving terms are not carried
+arm ddt_localEulerMoving    refused "the mesh is dynamic"     "" "$LTSSET; $LTSZERO"
+PERMUW="python3 -c \"import re; p='0/U'; t=open(p).read(); t=re.sub(r'walls\\s*\\{[^}]*\\}', 'walls { type permeableAlphaPressureInletOutletVelocity; alpha alpha.water; alphaMin 0.01; value uniform (0 0 0); }', t, count=1); open(p,'w').write(t)\""
+PERMPW="python3 -c \"import re; p='0/p_rgh'; t=open(p).read(); t=re.sub(r'walls\\s*\\{[^}]*\\}', 'walls { type prghPermeableAlphaTotalPressure; alpha alpha.water; alphaMin 0.01; p uniform 0; value uniform 0; }', t, count=1); open(p,'w').write(t)\""
+# THE PERMEABLE-WALL PAIR ON A MOVING MESH, on the same base. The host loop refused this and now RUNS
+# it: dynamicMotionSolverFvMesh::update ends in U.correctBoundaryConditions(), where phi is the
+# RELATIVE flux the previous step's pEqn left, and interMeshUpdate evaluated the pair with the
+# ABSOLUTE one it was last told. Gated field by field against real OpenFOAM by the `mixerPermeable`
+# profile of tests/interfoam_moving_vs_openfoam.sh, whose control is the same motion under
+# movingWallVelocity; this arm only holds that no refusal has come back. The DEVICE loop runs it too --
+# device_permeable_moving, below. The pair on a STATIC mesh runs -- permeable_runs, above.
+arm permeable_moving        runs    -                         "" "$PERMUW; $PERMPW"
+BASE="$BG"
+arm ddt_cnMangroves         refused "multiphaseMangrovesSource" "" "$CNSET"
+# ...and localEuler beside fvOptions: the mangroves' added mass takes its own fvm::ddt
+arm ddt_localEulerFvOptions refused "fvOptions is not empty"  "" "$LTSSET; $LTSZERO"
+BASE="$B"
+
+# a solver-entry floor the momentum predictor does not honour yet. BOTH alpha pre-solves honour it now
+# (tests/interfoam_dambreak_vs_openfoam.sh `alphaminiter`, compared on the host AND the device arm), so
+# this arm asserts the case RUNS rather than that either loop refuses it.
+# outletPhaseMeanVelocity -- RAS/DTCHull's U outlet -- RUNS on the host loop (gated by
+# tests/interfoam_dtchull_vs_openfoam.sh `ras`). Its Umean and alpha are MUST_READ; a missing `value` would
+# be extrapolated from the cells, which the factory cannot do; a phase field it names that is not the
+# case's is OpenFOAM's own stop; a DRY patch makes OpenFOAM's phase mean 0/0 (damBreak's atmosphere is air);
+# the device loop carries it (device_opmv).
+OPMV="python3 -c \"import re; p='0/U'; t=open(p).read(); t=re.sub(r'atmosphere\\s*\\{[^}]*\\}', 'atmosphere { type outletPhaseMeanVelocity; OPMVSPEC }', t, count=1); open(p,'w').write(t)\""
+arm opmv_noUmean            refused "needs both \`Umean\` and \`alpha\`" "" "${OPMV/OPMVSPEC/alpha alpha.water; value uniform (0 0 0);}"
+arm opmv_noValue            refused "has no \`value\`"           "" "${OPMV/OPMVSPEC/Umean 1; alpha alpha.water;}"
+arm opmv_otherAlpha         refused "OpenFOAM looks the named field up" "" "${OPMV/OPMVSPEC/Umean 1; alpha alpha.oil; value uniform (0 0 0);}"
+arm opmv_dry                refused "no \`alpha.water\` on the patch" "" "${OPMV/OPMVSPEC/Umean 1; alpha alpha.water; value uniform (0 0 0);}"
+
+# fvSolution's `cache { grad(U); }` -- RAS/DTCHull's -- RUNS on the host loop for kOmegaSST (sst_gradUCache
+# below; gated by tests/interfoam_dtchull_vs_openfoam.sh `ras`): the closure's validate and correct form
+# grad(U) and the next UEqn reuses it, as OpenFOAM's registry does. REFUSED where the assembly would have
+# to form and store it itself -- laminar here, kEpsilon beside the RAS base -- because which of UEqn.H's
+# operands asks first is not modelled; any other cached name, and a pattern key, by name. The device loop
+# carries it too (device_sstGradUCache runs), with the same stale-cache refusal (device_gradUCache,
+# device_gradUCacheKEpsilon) and its own beside a limited grad(U) or a coupled pair on a static mesh. An INACTIVE
+# block is OpenFOAM's uncached run and must run whatever it names.
+CACHE="printf '\\ncache\\n{\\nCACHESPEC\\n}\\n' >> system/fvSolution"
+arm gradUCache_laminar      refused "U has changed since grad(U) was last formed" "" "${CACHE/CACHESPEC/    grad(U);}"
+arm gradUCache_otherField   refused "names \`grad(p_rgh)\`"  "" "${CACHE/CACHESPEC/    grad(U);\\n    grad(p_rgh);}"
+arm gradUCache_pattern      refused "a pattern key could match" "" "${CACHE/CACHESPEC/    \"grad(.*)\";}"
+arm gradUCache_inactive     runs    -                         "" "${CACHE/CACHESPEC/    active false;\\n    grad(U);\\n    grad(p_rgh);}"
+# pressureInletOutletVelocity's `tangentialVelocity` -- RAS/DTCHullMoving's atmosphere -- RUNS on the host
+# loop: interFoam claims the entry and hands it to the patch field (the shared factory still refuses it for
+# every other solver). The bare `(a b c)` form is OpenFOAM's own stop (Field.C), a refining mesh would have to
+# map the refValue. The device loop carries it too (device_piovTangential).
+TANGV="sed -i '/atmosphere/,/}/ s/type  *pressureInletOutletVelocity;/type            pressureInletOutletVelocity;\\n        tangentialVelocity TVSPEC;/' 0/U"
+arm piov_tangential         runs    -                         "" "${TANGV/TVSPEC/uniform (0.1 0 0)}"
+arm piov_tangential_bare    refused "without \`uniform\` or \`nonuniform\`" "" "${TANGV/TVSPEC/(0.1 0 0)}"
+arm piov_tangential_refine  refused "tangentialVelocity\`, and the mesh refines" "" "$REFDICT '' > constant/dynamicMeshDict && ${TANGV/TVSPEC/uniform (0.1 0 0)}"
+# ...and linearUpwind's NAMED gradient: brae's momentum takes grad(U)'s entry and registry field, so a
+# case naming another was run as grad(U). All 25 shipped users of the family name grad(U).
+arm lu_momentumOtherGrad    refused "names the gradient \`limitedGrad\`" "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U) Gauss linearUpwind limitedGrad;/' system/fvSchemes; sed -i '/^gradSchemes/,/^}/ s/default .*/&\\n    limitedGrad     cellLimited Gauss linear 1;/' system/fvSchemes"
+
+arm alpha_minIter           runs    -                        "" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       yes;\\n\\1minIter 1;/' system/fvSolution"
+# `MULESCorr any;` is TRUE to OpenFOAM (Switch.C:114). alphaEqn's own switch helper covered six spellings
+# each way and THREW on `any` and `none`; it is FoamDict::switchOr now, so this runs.
+arm alpha_MULESCorrAny      runs    -                        "" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       any;/' system/fvSolution"
+arm alpha_MULESCorrTypo     refused "Unknown switch sure"    "" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       sure;/' system/fvSolution"
+
+# the non-orthogonal correction: damBreak says `corrected`, brae assembles orthogonal. SHEAR holds the
+# edit that makes that matter -- the upper blocks' top edge moved 0.4 in x, six degrees.
+SHEAR="sed -i 's/(0 4 /(0.4 4 /; s/(2 4 /(2.4 4 /; s/(2.16438 4 /(2.56438 4 /; s/(4 4 /(4.4 4 /' system/blockMeshDict && blockMesh > log.blockMesh 2>&1 && rm -rf 0 && cp -r 0.orig 0 && setFields > log.setFields 2>&1"
+ORTHO="sed -i '/^laplacianSchemes/,/^}/ s/default .*/default         Gauss linear orthogonal;/; /^snGradSchemes/,/^}/ s/default .*/default         orthogonal;/' system/fvSchemes"
+# the corrected schemes RUN on a non-orthogonal mesh now (interfoam_moving_vs_openfoam.sh's tanks);
+# `uncorrected` there is refused, because OpenFOAM's takes the non-orthogonal delta coefficient
+UNCORR="sed -i '/^laplacianSchemes/,/^}/ s/default .*/default         Gauss linear uncorrected;/; /^snGradSchemes/,/^}/ s/default .*/default         uncorrected;/' system/fvSchemes"
+arm mesh_sheared_corrected  runs    -                        "" "$SHEAR"
+arm mesh_sheared_orthogonal runs    -                        "" "$SHEAR && $ORTHO"
+arm mesh_sheared_uncorrected runs    -                        "" "$SHEAR && $UNCORR"
+arm mesh_square_uncorrected runs    -                        "" "$UNCORR"
+arm mesh_square_corrected   runs    -                        "" true
+# the host takes every gradient by its own entry -- Gauss linear, leastSquares, cellLimited over either
+# (tests/interfoam_dambreak_vs_openfoam.sh `gradLsqLimited` and `nHatLimited`); another scheme or limiter
+# is refused by name
+arm grad_cellLimited        runs    -                        "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         cellLimited Gauss linear 1;/' system/fvSchemes"
+arm grad_leastSquares       runs    -                        "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         leastSquares;/' system/fvSchemes"
+arm grad_namedU             runs    -                        "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
+arm grad_namedPrgh          runs    -                        "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(p_rgh)     cellLimited Gauss linear 1;/' system/fvSchemes"
+arm grad_faceLimited        refused "faceLimited"            "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         faceLimited Gauss linear 1;/' system/fvSchemes"
+arm grad_cellMDLimited      refused "cellMDLimited"          "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    nHat            cellMDLimited Gauss linear 1;/' system/fvSchemes"
+arm grad_pointCells         refused "pointCellsLeastSquares" "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         pointCellsLeastSquares;/' system/fvSchemes"
+
+# TURBULENCE. laminar damBreak made RAS carries no k, epsilon or nut, and OpenFOAM stops on it too.
+arm ras_noFields            refused "does not exist"          "" "sed -i 's/simulationType .*/simulationType RAS;\\nRAS { RASModel kEpsilon; turbulence on; }/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,U) .*/&\\n    div(phi,k) Gauss upwind;\\n    div(phi,epsilon) Gauss upwind;/' system/fvSchemes"
+BASE="$BR"
+arm ras_baseline            runs    -                        "" true
+arm mrf_RAS                 refused "MRF zone AND is turbulent" "" "$ZONE; ${MRFD/OMEGA/omega 10;}"
+arm ras_otherModel          refused "realizableKE"            "" "sed -i 's/RASModel .*/RASModel        realizableKE;/' constant/turbulenceProperties"
+# THE CLOSURE'S ddt NAMES. RAS/damBreak is `density variable`, so kEpsilon's fvm::ddt(alpha, rho, k) asks
+# for `ddt(rho,k)` and `ddt(rho,epsilon)` (fvmDdt.C:128-150); the closure carries U's scheme, so a split
+# there is refused. `ddt(k)` is a name that lineage never looks up, dead text OpenFOAM ignores -- it runs.
+arm ddt_closureSplit        refused 'the closure'"'"'s `ddt(rho,k)` to `CrankNicolson 0.5`' "" "ddtblock 'default Euler;' 'ddt(rho,k) CrankNicolson 0.5;'"
+arm ddt_closureDeadName     runs    -                         "" "ddtblock 'default Euler;' 'ddt(k) CrankNicolson 0.5;'"
+# ...and a turbulent case under localEuler: kOmegaSST in the uniform lineage takes the local step
+# (ddt_localEulerSST below, and tests/interfoam_dtchull_vs_openfoam.sh's `ras` profile); this base is
+# kEpsilon under `density variable`, whose fvm::ddt under localEuler is not ported
+arm ddt_localEulerRAS       refused "is not kOmegaSST in the uniform lineage" "" "$LTSSET; $LTSZERO"
+# ...and kEpsilon's linearUpwind, which its closure call does not carry: the reader keeps the refusal
+arm ras_linearUpwindKEpsilon refused "neither \`Gauss upwind\` nor" "" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss linearUpwind grad(k);/' system/fvSchemes"
+# ...and kEpsilon's wall nut, which carries nutk, nutU and nutLowRe and refuses the rough class by name
+arm ras_nutkRough           refused "carries \`nutkRoughWallFunction\`. The kEpsilon" "" "sed -i '0,/type  *nutkWallFunction;/ s//type nutkRoughWallFunction; Ks uniform 1e-4; Cs uniform 0.5;/' 0/nut"
+# kOmegaSST IS ported, in the uniform lineage (tests/interfoam_waterchannel_vs_openfoam.sh holds it to
+# OpenFOAM). RAS/damBreak made kOmegaSST: `density variable` with it is refused, and so is each thing
+# the closure does not carry -- on a base that RUNS, so a refusal is the one edit's.
+arm sst_variableDensity     refused "density variable"        "" "sed -i 's/RASModel .*/RASModel        kOmegaSST;/' constant/turbulenceProperties"
+SSTBASE="sed -i 's/RASModel .*/RASModel        kOmegaSST;/; /^density /d' constant/turbulenceProperties; sed -i 's/div(rhoPhi,k) .*/div(phi,k) Gauss upwind;/; s/div(rhoPhi,epsilon) .*/div(phi,omega) Gauss upwind;/' system/fvSchemes; sed -i 's/(U|k|epsilon)/(U|k|omega)/' system/fvSolution; sed 's/epsilonWallFunction/omegaWallFunction/; s/object  *epsilon;/object      omega;/; s/\\[0 2 -3 0 0 0 0\\]/[0 0 -1 0 0 0 0]/' 0/epsilon > 0/omega; printf '\\nwallDist { method meshWave; }\\n' >> system/fvSchemes"
+arm sst_baseline            runs    -                        "" "$SSTBASE"
+arm ddt_localEulerSST       runs    -                        "" "$SSTBASE; $LTSSET; $LTSZERO"
+arm sst_noOmega             refused "does not exist"          "" "$SSTBASE; rm 0/omega"
+# kOmegaSST's own wallDist reads `method` with no default (patchDistMethod.C): OpenFOAM stops without it
+arm sst_noWallDist          refused "wallDist { method ...; }" "" "$SSTBASE; sed -i '/^wallDist/d' system/fvSchemes"
+arm sst_wallDistPoisson     refused "wallDist { method Poisson; }" "" "$SSTBASE; sed -i 's/^wallDist .*/wallDist { method Poisson; }/' system/fvSchemes"
+arm sst_wallDistNoCorrect   runs    -                        "" "$SSTBASE; sed -i 's/^wallDist .*/wallDist { method meshWave; correctWalls false; }/' system/fvSchemes"
+arm sst_decayControl        refused "decayControl"            "" "$SSTBASE; sed -i 's/RASModel .*/&\\n    kOmegaSSTCoeffs { decayControl yes; kInf 1e-5; omegaInf 1; }/' constant/turbulenceProperties"
+arm sst_F3                  refused "F3"                      "" "$SSTBASE; sed -i 's/RASModel .*/&\\n    kOmegaSSTCoeffs { F3 yes; }/' constant/turbulenceProperties"
+arm sst_blending            refused "blending stepwise"       "" "$SSTBASE; sed -i '0,/omegaWallFunction;/ s/omegaWallFunction;/omegaWallFunction;\\n        blending        stepwise;/' 0/omega"
+arm sst_nutU                refused "nutUWallFunction"        "" "$SSTBASE; sed -i '0,/nutkWallFunction/ s/nutkWallFunction/nutUWallFunction/' 0/nut"
+arm sst_wallWithoutOmegaWF  refused "omegaWallFunction"       "" "$SSTBASE; sed -i '0,/omegaWallFunction;/ s/omegaWallFunction;/zeroGradient;/' 0/omega"
+# the cached grad(U) runs for kOmegaSST, whose validate forms it; kEpsilon's does not (see CACHE above)
+arm sst_gradUCache          runs    -                        "" "$SSTBASE; ${CACHE/CACHESPEC/    grad(U);}"
+arm ras_gradUCacheKEpsilon  refused "U has changed since grad(U) was last formed" "" "${CACHE/CACHESPEC/    grad(U);}"
+arm sst_linearUpwindOmega   refused "div(phi,omega)"          "" "$SSTBASE; sed -i 's/div(phi,omega) .*/div(phi,omega) Gauss linearUpwind grad(omega);/' system/fvSchemes"
+# THE CLOSURE'S linearUpwind -- RAS/DTCHull's `Gauss linearUpwind limitedGrad` over a NAMED
+# `cellLimited Gauss linear 1` -- RUNS for kOmegaSST on the pair, gated by
+# tests/interfoam_dtchull_vs_openfoam.sh `ras`. sst_linearUpwindOmega above names it for omega alone:
+# the closure carries one flag and one limiter coefficient for the pair, so that split is refused. Also
+# refused: a named gradient the closure's linearUpwind does not carry (leastSquares, and
+# cellLimited<cubic>, which the shared classifier would read as minmod), a coefficient OpenFOAM itself
+# rejects, kEpsilon's linearUpwind (ras_linearUpwindKEpsilon), a coupled mesh (sst_linearUpwindCoupled,
+# beside BSST in the device block) and the device loop (device_sstLinearUpwind).
+LUGRAD="sed -i '/^gradSchemes/,/^}/ s/default .*/&\\n    limitedGrad     LIMGRAD;/' system/fvSchemes"
+LUBOTH="sed -i 's/div(phi,k) .*/div(phi,k) Gauss linearUpwind limitedGrad;/; s/div(phi,omega) .*/div(phi,omega) Gauss linearUpwind limitedGrad;/' system/fvSchemes"
+arm sst_linearUpwind        runs    -                        "" "$SSTBASE; ${LUGRAD/LIMGRAD/cellLimited Gauss linear 1}; $LUBOTH"
+arm sst_linearUpwindLsq     refused "resolves to \`leastSquares\`" "" "$SSTBASE; ${LUGRAD/LIMGRAD/leastSquares}; $LUBOTH"
+# ...cellLimited<cubic> is stopped BEFORE the closure's reader, by the case's own gradSchemes check; the
+# reader's refusal of `cellLimited<` stays behind it for a caller that skips that check
+arm sst_linearUpwindCubic   refused "cellLimited<cubic> 1.5 Gauss linear 1\` is not ported" "" "$SSTBASE; ${LUGRAD/LIMGRAD/cellLimited<cubic> 1.5 Gauss linear 1}; $LUBOTH"
+arm sst_linearUpwindK2      refused "outside [0, 1]"          "" "$SSTBASE; ${LUGRAD/LIMGRAD/cellLimited Gauss linear 2}; $LUBOTH"
+# nutkRoughWallFunction -- RAS/DTCHull's hull -- RUNS on the host kOmegaSST closure (gated by
+# tests/interfoam_dtchull_vs_openfoam.sh `ras`, face by face on the hull). Its Ks, Cs and value are all
+# MUST_READ in OpenFOAM, and `value` is live here -- the previous nut its first calcNut limits against --
+# so each is refused missing; a bare-number Ks is OpenFOAM's own stop (Field.C:213-268). `blending` is read,
+# validated and never used by the class, so any of OpenFOAM's words runs and an unknown one is refused.
+# kEpsilon's closure refuses the type (ras_nutkRough); the device kOmegaSST closure RUNS it (device_sstNutkRough,
+# gated by tests/interfoam_dtchull_vs_openfoam.sh `ras device`, the tutorial as shipped).
+ROUGHNUT="sed -i '0,/type  *nutkWallFunction;/ s//type nutkRoughWallFunction; RSPEC/' 0/nut"
+arm sst_nutkRough           runs    -                        "" "$SSTBASE; ${ROUGHNUT/RSPEC/Ks uniform 1e-4; Cs uniform 0.5;}"
+arm sst_nutkRoughBlendMax   runs    -                        "" "$SSTBASE; ${ROUGHNUT/RSPEC/Ks uniform 1e-4; Cs uniform 0.5; blending max;}"
+arm sst_nutkRoughNoKs       refused "Required entry 'Ks' : missing" "" "$SSTBASE; ${ROUGHNUT/RSPEC/Cs uniform 0.5;}"
+arm sst_nutkRoughBareKs     refused "Ks 1e-4\` -- Ks and Cs are scalarFields" "" "$SSTBASE; ${ROUGHNUT/RSPEC/Ks 1e-4; Cs uniform 0.5;}"
+arm sst_nutkRoughBlendBad   refused "not one of OpenFOAM's blenders" "" "$SSTBASE; ${ROUGHNUT/RSPEC/Ks uniform 1e-4; Cs uniform 0.5; blending sideways;}"
+arm sst_nutkRoughNoValue    refused "Required entry 'value' : missing" "" "$SSTBASE; python3 -c \"import re; p='0/nut'; t=open(p).read(); t=re.sub(r'leftWall\\s*\\{[^}]*\\}', 'leftWall { type nutkRoughWallFunction; Ks uniform 1e-4; Cs uniform 0.5; }', t, count=1); open(p,'w').write(t)\""
+# `correctWalls no|0|n` RUNS now -- brae skips patchWave's wall-cell override as OpenFOAM does,
+# gated on RAS/waterChannel `correctWallsOff`. `decayControl` is still refused: it adds two terms
+# the closure does not carry.
+# ONE REFUSAL A SPELLING WALKED PAST until every switch went through FoamDict::switchOr. `decayControl`
+# tested {yes,on,true}, so `1` -- true to OpenFOAM (Switch.C:100) -- RAN, silently dropping
+# beta*sqr(omegaInf) and betaStar*omegaInf*kInf. `correctWalls` tested {false,no,off}, so `0` RAN brae's
+# always-correcting meshWave against OpenFOAM's uncorrected one. Both are refusals now.
+arm sst_decayControlOne     refused "beta*sqr(omegaInf)"      "" "$SSTBASE; sed -i 's/RASModel .*/&\n    kOmegaSSTCoeffs { decayControl 1; }/' constant/turbulenceProperties"
+arm sst_decayControlAny     refused "beta*sqr(omegaInf)"      "" "$SSTBASE; sed -i 's/RASModel .*/&\n    kOmegaSSTCoeffs { decayControl any; }/' constant/turbulenceProperties"
+arm sst_correctWallsZero    runs    -                             "" "$SSTBASE; sed -i 's/wallDist { method meshWave; }/wallDist { method meshWave; correctWalls 0; }/' system/fvSchemes"
+arm sst_correctWallsN       runs    -                             "" "$SSTBASE; sed -i 's/wallDist { method meshWave; }/wallDist { method meshWave; correctWalls n; }/' system/fvSchemes"
+arm sst_switchTypo          refused "Unknown switch perhaps"  "" "$SSTBASE; sed -i 's/wallDist { method meshWave; }/wallDist { method meshWave; correctWalls perhaps; }/' system/fvSchemes"
+# BOTH closures honour two different convection schemes now. The kOmegaSST arm was refused until the
+# 6.6e-09 it read on its FIRST omega solve was localised: omegaWallFunction's omegaVis was computed as
+# (beta1*y)*y where OpenFOAM writes beta1*sqr(y) -- one ulp on 5 of 2268 cells -- and that ulp decided
+# limitedLinear's 0/0 ratio on one face. Gated on `splitDiv` and `splitDivSST`, fields at 1e-13.
+arm sst_splitDiv            runs    -                        "" "$SSTBASE; sed -i 's/div(phi,omega)  *Gauss upwind;/div(phi,omega) Gauss limitedLinear 1;/' system/fvSchemes"
+arm ras_LES                 refused "LES"                     "" "sed -i 's/^simulationType .*/simulationType LES;/' constant/turbulenceProperties"
+# `turbulence off` RUNS now: the model is constructed, bounded and validated and then never corrected
+# (kEpsilon.C:216-219). On THIS base the lineage is `density variable`, which does NOT call validate()
+# (incompressibleInterPhaseTransportModel.C:99-109), so nut keeps the file's value here -- the uniform
+# lineage's rebuilt nut is gated in tests/interfoam_ras_dambreak_vs_openfoam.sh (`frozen`).
+arm ras_turbulenceOff       runs    -                         "" "sed -i 's/turbulence  *on;/turbulence      off;/' constant/turbulenceProperties"
+# ...and EVERY spelling OpenFOAM's Switch accepts means the same thing. `none`, `n` and `0` are false
+# (Switch.C:94-121); the hand-rolled test this reader replaced accepted only {off,no,false} and read the
+# other four as TRUE, running the closure on a case that had switched it off.
+arm ras_turbulenceNone      runs    -                         "" "sed -i 's/turbulence  *on;/turbulence      none;/' constant/turbulenceProperties"
+arm ras_turbulenceN         runs    -                         "" "sed -i 's/turbulence  *on;/turbulence      n;/' constant/turbulenceProperties"
+arm ras_turbulenceZero      runs    -                         "" "sed -i 's/turbulence  *on;/turbulence      0;/' constant/turbulenceProperties"
+# ...and an UNKNOWN word is OpenFOAM's own FatalError (Switch.C:130-136), not a silent `true`. `of` is
+# the typo the old test read as `turbulence on`.
+arm ras_turbulenceTypo      refused "Unknown switch of"       "" "sed -i 's/turbulence  *on;/turbulence      of;/' constant/turbulenceProperties"
+arm ras_turbulenceCapital   refused "Unknown switch On"       "" "sed -i 's/turbulence  *on;/turbulence      On;/' constant/turbulenceProperties"
+arm ras_densityBad          refused "density mixture"         "" "sed -i 's/^density .*/density mixture;/' constant/turbulenceProperties"
+# `density uniform` looks up div(phi,k), which this tutorial does not carry: OpenFOAM stops there too
+arm ras_uniform_noDivPhiK   refused "div(phi,k)"              "" "sed -i 's/^density .*/density uniform;/' constant/turbulenceProperties"
+arm ras_uniform             runs    -                        "" "sed -i 's/^density .*/density uniform;/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,k) /div(phi,k) /; s/div(rhoPhi,epsilon) /div(phi,epsilon) /' system/fvSchemes"
+# `Gauss limitedLinear <k>` RUNS on the host closure now (gated on RAS/waterChannel `limitedLinear`,
+# fields at 7.2e-12), and so does ONE equation limited with the other not: `fvm::div(phi, psi)` resolves
+# the entry by the FIELD's name, so the two are two different matrices and the kEpsilon closure assembles
+# each (gated on RAS/damBreak `splitDiv`, fields at 1e-15). The kOmegaSST twin runs it too
+# (`sst_splitDiv` above), and so does the DEVICE closure now: each equation's div entry reaches the
+# assembly through KEpsilonInput::epsDiv / KOmegaSSTInput::omegaDiv, and `splitDiv`/`splitDivSST` are held
+# to the ordinary device bounds rather than asserting a refusal.
+arm ras_limitedLinearOne    runs    -                        "" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss limitedLinear 1;/' system/fvSchemes"
+arm ras_limitedLinearBoth   runs    -                        "" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss limitedLinear 1;/; s/div(rhoPhi,epsilon) .*/div(rhoPhi,epsilon) Gauss limitedLinear 1;/' system/fvSchemes"
+arm ras_nutSpalding         refused "nutUSpaldingWallFunction" "" "sed -i 's/nutkWallFunction/nutUSpaldingWallFunction/' 0/nut"
+arm ras_nutCalculatedWall   refused "no nut wall function"    "" "sed -i '/leftWall/,/}/ s/nutkWallFunction/calculated/' 0/nut"
+# a wall function on a patch that is not a `wall`: OpenFOAM's nutWallFunction::checkType stops on it
+arm ras_wallFnOnPatch       refused "must be a \`wall\`"       "" "sed -i '/leftWall/,/}/ s/type  *wall;/type            patch;/' constant/polyMesh/boundary"
+arm ras_noKFinal            refused "kFinal"                  "" "sed -i 's/\"(U|k|epsilon)\.\*\"/\"(U|k|epsilon)\"/' system/fvSolution"
+arm ras_PBiCGStab           refused "smoothSolver"            "" "sed -i '/(U|k|epsilon)/,/}/ s/solver  *smoothSolver;/solver          PBiCGStab;/' system/fvSolution"
+arm ras_everyOuter          runs    -                         "" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;\\n    turbOnFinalIterOnly no;/' system/fvSolution"
+# ...and the form of it that changes nothing: one outer corrector IS the final one
+arm ras_everyOuter_single   runs    -                        "" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 1;\\n    turbOnFinalIterOnly no;/' system/fvSolution"
+BASE="$B"
+
+# the momentum predictor's solver entry: damBreak names `U` only, and with one outer corrector
+# fvMatrix::solve() selects `UFinal`, so real OpenFOAM stops on it. brae ran it, reading neither.
+arm mompred_noUFinal        refused "UFinal"                  "" "sed -i 's/momentumPredictor  *no;/momentumPredictor yes;/' system/fvSolution"
+arm mompred_withUFinal      runs    -                        "" "sed -i 's/momentumPredictor  *no;/momentumPredictor yes;/; s/^\( *\)U\$/\1\"U.*\"/' system/fvSolution"
+
+# WAVES. The host runs waveAlpha and waveVelocity over StokesI and shallowWaterAbsorption, and
+# nothing else under those names.
+BASE="$BW"
+arm waves_baseline          runs    -                        "" true
+arm waves_StokesII          runs    -                        "" "sed -i 's/waveModel  *StokesI;/waveModel       StokesII;/' constant/waveProperties"
+arm waves_unknownModel      refused "StokesIII"               "" "sed -i 's/waveModel  *StokesI;/waveModel       StokesIII;/' constant/waveProperties"
+arm waves_streamFn_noBjs    refused "Bjs"                     "" "sed -i 's/waveModel  *StokesI;/waveModel       streamFunction;\n    uMean 1;\n    waveLength 6;\n    Ejs (0.05 0.01);/' constant/waveProperties"
+# THE FLUX A CONDITION NAMES. totalPressure's `phi rhoPhi;` is three tutorials' own; brae read no `phi`
+# entry at all and told every condition phi.
+arm flux_rhoPhi             runs    -                        "" "sed -i '/totalPressure/a\        phi             rhoPhi;' 0/p_rgh"
+arm flux_unknown            refused "phiAbsolute"             "" "sed -i '/totalPressure/a\        phi             phiAbsolute;' 0/p_rgh"
+arm waves_noPatchEntry      refused "no entry for patch"      "" "sed -i 's/^outlet\$/outletElsewhere/' constant/waveProperties"
+arm waves_noProperties      refused "no constant/waveProperties" "" "rm constant/waveProperties"
+arm waves_otherAlpha        refused "alpha.oil"               "" "sed -i '0,/alpha  *alpha.water;/s//alpha           alpha.oil;/' constant/waveProperties"
+arm waves_noRampTime        refused "rampTime"                "" "sed -i '/rampTime/d' constant/waveProperties"
+arm waves_noActiveAbsorption refused "activeAbsorption"       "" "sed -i '/activeAbsorption/d' constant/waveProperties"
+# A RESTART IS READ NOW, not refused. The model IS an IOdictionary at
+# <startTime>/uniform/waveProperties.<patch> and OpenFOAM reads it back before merging the case's own
+# entries over it (waveModel.C:294-302), so the key the file contributes is `waterDepthRef` -- the one
+# OpenFOAM adds to itself to make a resume possible. This arm says the reader takes the PATH; the numbers
+# are held by tests/interfoam_waves_vs_openfoam.sh's `restart` profile, whose control is OpenFOAM's own
+# COLD restart. `waterDepthRef` ALONE in the file is enough, because the case supplies everything else --
+# which is what merge() means, and what the arm below asserts by leaving nothing else in it.
+arm waves_restart           runs    -                         "" "mkdir -p 0/uniform; printf '%s\nwaterDepthRef 0.6;\n' '$HDR' > 0/uniform/waveProperties.inlet"
+arm waves_otherWaveDict     refused "waveDict"                "" "sed -i '0,/type  *waveVelocity;/s//type            waveVelocity;\n        waveDict        otherWaves;/' 0/U"
+
+# p_rghFinal NAMES GAMG in this tutorial as shipped, and waves_baseline above ran it. What else the
+# entry may say: every control whose branch of GAMGSolver or GAMGAgglomeration is not ported is
+# refused by name, because each one moves where the solve stops and none moves a converged field.
+GE="sed -i '/p_rghFinal/,/}/ s/smoother  *DIC;/smoother        DIC;\\n        "
+arm gamg_GaussSeidel        runs    -                        "" "sed -i '/p_rghFinal/,/}/ s/smoother  *DIC;/smoother        GaussSeidel;/' system/fvSolution"
+arm gamg_DICGaussSeidel     runs    -                        "" "sed -i '/p_rghFinal/,/}/ s/smoother  *DIC;/smoother        DICGaussSeidel;/' system/fvSolution"
+arm gamg_smootherDILU       refused "smoother DILU"           "" "sed -i '/p_rghFinal/,/}/ s/smoother  *DIC;/smoother        DILU;/' system/fvSolution"
+arm gamg_noSmoother         refused "names no \`smoother\`"   "" "sed -i '/p_rghFinal/,/}/ {/smoother/d}' system/fvSolution"
+arm gamg_sweeps             runs    -                        "" "${GE}nPreSweeps 2; nFinestSweeps 3;/' system/fvSolution"
+arm gamg_mergeLevels1       runs    -                        "" "${GE}mergeLevels 1; agglomerator faceAreaPair; cacheAgglomeration on;/' system/fvSolution"
+arm gamg_mergeLevels2       refused "mergeLevels 2"           "" "${GE}mergeLevels 2;/' system/fvSolution"
+arm gamg_agglomerator       refused "agglomerator algebraicPair" "" "${GE}agglomerator algebraicPair;/' system/fvSolution"
+arm gamg_updateInterval     refused "updateInterval"          "" "${GE}updateInterval 5;/' system/fvSolution"
+arm gamg_noCache            refused "cacheAgglomeration no"   "" "${GE}cacheAgglomeration no;/' system/fvSolution"
+arm gamg_interpolate        refused "interpolateCorrection yes" "" "${GE}interpolateCorrection yes;/' system/fvSolution"
+arm gamg_directCoarsest     refused "directSolveCoarsest yes" "" "${GE}directSolveCoarsest yes;/' system/fvSolution"
+arm gamg_coarsestLevelCorr  refused "coarsestLevelCorr"       "" "${GE}coarsestLevelCorr { solver PCG; preconditioner DIC; tolerance 1e-3; relTol 0; }/' system/fvSolution"
+arm gamg_procAgglomerator   refused "processorAgglomerator"   "" "${GE}processorAgglomerator masterCoarsest;/' system/fvSolution"
+arm gamg_notASwitch         refused "is not a Switch"         "" "${GE}scaleCorrection maybe;/' system/fvSolution"
+BASE="$B"
+
+# THE MOVING MESH: a solid-body motion of the whole mesh runs; everything else about a moving mesh is
+# refused by name -- and so is what the SOLVER does not do on one yet
+BASE="$BM"
+arm moving_baseline         runs    -                        "" true
+# a cellZone's solid-body motion is ported (tests/interfoam_ami_vs_openfoam.sh); a zone the mesh does not
+# have, a cellSet and a regular expression are refused by name
+arm moving_cellZoneMissing  refused "No matching cellZones: rotor" "" "sed -i 's/^motionSolver .*/motionSolver    solidBody;\ncellZone        rotor;/' constant/dynamicMeshDict"
+arm moving_cellZone         runs    -                        "" "$ZONE; sed -i 's/^motionSolver .*/motionSolver    solidBody;\ncellZone        rotor;/' constant/dynamicMeshDict"
+arm moving_cellZoneRegex    refused "regular expression"     "" "$ZONE; sed -i 's/^motionSolver .*/motionSolver    solidBody;\ncellZone        \\\"rot.*\\\";/' constant/dynamicMeshDict"
+arm moving_cellSet          refused "cellSet rotor"          "" "sed -i 's/^motionSolver .*/motionSolver    solidBody;\ncellSet         rotor;/' constant/dynamicMeshDict"
+arm moving_cellSetNone      runs    -                        "" "sed -i 's/^motionSolver .*/motionSolver    solidBody;\ncellSet         none;/' constant/dynamicMeshDict"
+# displacementLaplacian is ported (tests/displacement_laplacian_vs_openfoam.sh); a motion solver that is
+# not is still refused by name, and displacementLaplacian without its mandatory diffusivity by that
+arm moving_velocityLap      refused "motionSolver velocityLaplacian" "" "sed -i 's/^motionSolver .*/motionSolver    velocityLaplacian;/' constant/dynamicMeshDict"
+arm moving_displacementLap  refused "has no \`diffusivity\`"   "" "sed -i 's/^motionSolver .*/motionSolver    displacementLaplacian;/' constant/dynamicMeshDict"
+arm moving_unknownFunction  refused "solidBodyMotionFunction \`wobble\`" "" "sed -i 's/^solidBodyMotionFunction .*/solidBodyMotionFunction wobble;/' constant/dynamicMeshDict"
+arm moving_drivenLinear     refused "drivenLinearMotion"      "" "sed -i 's/^solidBodyMotionFunction .*/solidBodyMotionFunction drivenLinearMotion;/' constant/dynamicMeshDict"
+arm moving_omegaTable       refused "Function1 \`table\`"    "" "sed -i 's/omega  *6.2832;.*/omega           table ((0 6.2832) (1 6.2832));/' constant/dynamicMeshDict"
+arm moving_points0          refused "points0 exists"          "" "cp constant/polyMesh/points constant/polyMesh/points0"
+# correctPhi is ported (tests/interfoam_moving_vs_openfoam.sh's *CorrectPhi profiles); CorrectPhi's
+# pcorrFinal entry, which every case now reads at its start, is refused by name when it is missing
+arm moving_correctPhi       runs    -                        "" "sed -i 's/correctPhi  *no;/correctPhi      yes;/' system/fvSolution"
+arm moving_noPcorr          refused "solvers/pcorrFinal"     "" "sed -i 's/\"pcorr\.\*\"/pcorrNot/' system/fvSolution"
+arm moving_noRefValue       refused "no pRefValue"            "" "sed -i '/pRefValue/d' system/fvSolution"
+arm moving_noRefPoint       refused "neither pRefCell nor pRefPoint" "" "sed -i '/pRefPoint/d' system/fvSolution"
+arm moving_refPointOutside  refused "lies in no cell"         "" "sed -i 's/^\( *\)pRefPoint .*/\1pRefPoint (1 1 1);/' system/fvSolution"
+arm moving_refCell          runs    -                        "" "sed -i 's/^\( *\)pRefPoint .*/\1pRefCell 3;/' system/fvSolution"
+KEFIELDS='for n, dim, t, v in [("k", "[0 2 -2 0 0 0 0]", "kqRWallFunction", "0.1"), ("epsilon", "[0 2 -3 0 0 0 0]", "epsilonWallFunction", "0.1"), ("nut", "[0 2 -1 0 0 0 0]", "nutkWallFunction", "0")]: open("0/" + n, "w").write("FoamFile { version 2.0; format ascii; class volScalarField; object %s; }\ndimensions %s;\ninternalField uniform %s;\nboundaryField { walls { type %s; value uniform %s; } }\n" % (n, dim, v, t, v))'
+# kEpsilon (tests/interfoam_ami_vs_openfoam.sh) and kOmegaSST (tests/interfoam_moving_vs_openfoam.sh
+# `pistonSST`) run on a moving mesh; a wallDist updateInterval other than 1 there is refused, and so is LES
+MOVSST="sed -i 's/^simulationType .*/simulationType RAS;\nRAS { RASModel kOmegaSST; turbulence on; }/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,U) .*/&\n    div(phi,k) Gauss upwind;\n    div(phi,omega) Gauss upwind;/' system/fvSchemes; printf '\\nwallDist { method meshWave; }\\n' >> system/fvSchemes; sed -i 's/(U|k|epsilon)/XX/; s/^    U$/    \"(U|k|omega).*\"/' system/fvSolution; python3 -c '${KEFIELDS//epsilon/omega}'"
+arm moving_SST              runs    -                        "" "$MOVSST"
+arm moving_SSTInterval      refused "updateInterval 2"       "" "$MOVSST; sed -i 's/^wallDist .*/wallDist { method meshWave; updateInterval 2; }/' system/fvSchemes"
+arm moving_RAS              runs    -                        "" "sed -i 's/^simulationType .*/simulationType RAS;\nRAS { RASModel kEpsilon; turbulence on; }/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,U) .*/&\n    div(phi,k) Gauss upwind;\n    div(phi,epsilon) Gauss upwind;/' system/fvSchemes; sed -i 's/(U|k|epsilon)/XX/; s/^    U$/    \"(U|k|epsilon).*\"/' system/fvSolution; python3 -c '$KEFIELDS'"
+# a dictionary-form preconditioner other than GAMG or DIC is substituted under a notice, not run silently
+arm moving_precondDILU      runs    "preconditioner { DILU ... }" "" "sed -i '/p_rghFinal/,/^    }/ s/preconditioner  *GAMG;/preconditioner DILU;/' system/fvSolution"
+arm moving_precondNoSmoother refused "names no \`smoother\`" "" "sed -i '/p_rghFinal/,/^    }/ {/smoother/d}' system/fvSolution"
+# the tutorial's own vanLeerV runs (moving_baseline), and so does limitedLinear, gated on
+# eulerianInjection; the vector scheme brae still lacks does not
+arm moving_limitedLinear    runs    -                        "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear 1;/' system/fvSchemes"
+arm moving_unknownScheme    refused "Gauss QUICKV"             "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss QUICKV;/' system/fvSchemes"
+BASE="$B"
+
+# limitedLinear's coefficient has no default and must lie in [0, 1] (limitedLinear.H:67-76)
+arm ll_runs                 runs    -                        "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear 0.2;/' system/fvSchemes"
+arm ll_noCoeff              refused "with no coefficient"      "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear;/' system/fvSchemes"
+arm ll_coeffAboveOne        refused "outside [0, 1]"           "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear 1.5;/' system/fvSchemes"
+arm ll_coeffNegative        refused "outside [0, 1]"           "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear -0.1;/' system/fvSchemes"
+# its limiter's gradient is the case's grad(magSqr(U)) entry, and a least-squares one is not ported
+# ...nor a limited one reached through the default
+arm ll_gradMagSqrDefault    refused "grad(magSqr(U)) default" "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear 0.2;/' system/fvSchemes; sed -i '/^gradSchemes/,/^}/ s/default .*/default         cellLimited Gauss linear 1;/' system/fvSchemes"
+arm ll_gradMagSqrLSQ        refused "grad(magSqr(U)) leastSquares" "" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear 0.2;/' system/fvSchemes; sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(magSqr(U)) leastSquares;/' system/fvSchemes"
+
+# PIMPLE controls the HOST honours...
+arm host_nOuter2            runs    -                        "" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' system/fvSolution"
+arm host_nNonOrth1          runs    -                        "" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"
+
+# ...and the DEVICE loop does not, so there they are refused rather than run as 1 and 0
+# THE CYCLIC BAFFLE is ported in the host loop (tests/interfoam_baffle_vs_openfoam.sh): every operator,
+# matrix and linear solver on RAS/damBreakPorousBaffle's path couples the pair, and p_rgh's
+# porousBafflePressure carries its jump. What is NOT carried across a cyclic is refused, each by name --
+# a solver without interface coefficients would run the pair as two walls and converge.
+BASE="$BB"
+PRGH="python3 -c \"import re; p='0/p_rgh'; t=open(p).read(); t=re.sub(r'(porous_half[01]\\s*\\{[^}]*?)length', r'\\1EXTRA length', t); open(p,'w').write(t)\""
+# ...and the curvature smoothing's copy of alpha across the pair: its average would need the other side's
+# cells at every pass
+SMOOTH="sed -i -E 's/^( *)nAlphaCorr( +)/\\1nAlphaSmoothCurvature 2;\\n\\1nAlphaCorr\\2/' system/fvSolution"
+SMOOTH="$SMOOTH; grep -q 'nAlphaSmoothCurvature 2;' system/fvSolution"
+arm baffle_runs             runs    -                                  "" true
+arm baffle_plainCyclic      runs    -                                  "" "python3 -c \"import re; p='0/p_rgh'; t=open(p).read(); t=re.sub(r'(porous_half[01]\\s*\\{)[^}]*\\}', r'\\1 type cyclic; }', t); open(p,'w').write(t)\""
+arm baffle_smoothCurvature  refused "nAlphaSmoothCurvature across the coupled patch" "" "$SMOOTH"
+arm baffle_relax            refused "sets \`relax\` or \`minJump\`"      "" "${PRGH/EXTRA/relax 0.5;}"
+arm baffle_minJump          refused "sets \`relax\` or \`minJump\`"      "" "${PRGH/EXTRA/minJump 0;}"
+arm baffle_massFlux         refused "MASS flux"                        "" "${PRGH/EXTRA/phi rhoPhi;}"
+arm baffle_DTable           refused "a Function1 other than"           "" "sed -i 's/^\\( *D  *\\)1000;/\\1table ((0 1000) (1 2000));/' 0/p_rgh"
+arm baffle_noLength         refused "needs \`D\`, \`I\` and \`length\`"   "" "sed -i '/^ *length  *0.15;/d' 0/p_rgh"
+arm baffle_noJump           refused "has no \`jump\` entry"             "" "sed -i '/^ *jump  *uniform 0;/d' 0/p_rgh"
+# GAMG ACROSS THE PAIR RUNS on the host now: every coarse level agglomerates the interface as
+# cyclicGAMGInterface does, and tests/interfoam_cyclic_vs_openfoam.sh `gamg` holds it to OpenFOAM
+# (30 of 30 p_rgh counts, alpha 2.6e-13). A refusal coming back fails this arm. The DEVICE still
+# refuses it, asserted in that gate rather than here.
+arm baffle_GAMG             runs    -                                 "" "python3 -c \"import re; p='system/fvSolution'; t=open(p).read(); t=re.sub(r'(\\n    p_rgh\\s*\\{\\s*solver\\s+)PCG;\\s*preconditioner\\s+DIC;', r'\\1GAMG; smoother DIC;', t); open(p,'w').write(t)\""
+arm baffle_momentumPredictor refused "a momentum predictor across the coupled patch" "" "sed -i 's/momentumPredictor  *no;/momentumPredictor   yes;/; /^ *minIter  *1;/d' system/fvSolution"
+# ...and the SPELLINGS of the same switch, on the one base where `momentumPredictor yes` is refused: `n`
+# and `none` are FALSE to OpenFOAM, so they must RUN. The hand-rolled test read both as yes and this base
+# refused them; a typo must still refuse, naming OpenFOAM's own message.
+arm baffle_mompred_n        runs    -                        "" "sed -i 's/momentumPredictor  *no;/momentumPredictor   n;/' system/fvSolution"
+arm baffle_mompred_none     runs    -                        "" "sed -i 's/momentumPredictor  *no;/momentumPredictor   none;/' system/fvSolution"
+arm baffle_mompred_typo     refused "Unknown switch maybe"   "" "sed -i 's/momentumPredictor  *no;/momentumPredictor   maybe;/' system/fvSolution"
+# `cellLimited grad(U)` ACROSS A CYCLIC RUNS on the host now: the refusal said cellLimitedGrad's
+# coupled range was gated across a cyclicAMI only, which was true until validation/interFoamCyclic
+# `sstLimU` held it on a translational pair (host U 8.8697e-13). A blanket refusal coming back
+# fails this arm.
+arm baffle_cellLimitedGradU runs    - "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
+# ...and the MOMENTUM's own limited scheme across the pair, which is still refused. fvm::div carries a
+# scheme onto a coupled patch now -- the two turbulence closures hand it the patch's own weights and
+# validation/interFoamCyclic `sstLimDiv` holds them -- but the momentum does not compute them, so it
+# reaches the same refusal by the other door. The message says what is MISSING rather than what is
+# unimplemented, and this arm keys on that.
+arm baffle_vanLeerV         refused "no weights for the coupled patch" "" "sed -i 's/div(rhoPhi,U)  *Gauss linearUpwind grad(U);/div(rhoPhi,U)   Gauss vanLeerV;/' system/fvSchemes"
+arm baffle_compression      refused "\`interfaceCompression\` across the coupled patch" "" "sed -i 's/div(phirb,alpha)  *Gauss linear;/div(phirb,alpha) Gauss interfaceCompression;/' system/fvSchemes"
+# every other gradient entry is gated on damBreak, which has no coupled patch
+arm baffle_cellLimitedPrgh  refused "grad(p_rgh) cellLimited across the coupled patch" "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(p_rgh)     cellLimited Gauss linear 1;/' system/fvSchemes"
+arm baffle_leastSquaresNHat refused "nHat leastSquares across the coupled patch" "" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    nHat            leastSquares;/' system/fvSchemes"
+BASE="$B"
+# ...and what writing that arm found: `Gauss interfaceCompression vanLeer 1` is ANOTHER scheme, which a
+# substring match read as plain vanLeer and ran
+arm compressionNew_refused  refused "limited scheme with a compression coefficient" "" "sed -i 's/div(phi,alpha)  *Gauss vanLeer;/div(phi,alpha)  Gauss interfaceCompression vanLeer 1;/' system/fvSchemes"
+
+# LES kEqn is ported in the host loop (tests/interfoam_les_vs_openfoam.sh). What it refuses, by name:
+BASE="$BL"
+TP=constant/turbulenceProperties
+arm les_runs                runs    -                                  "" true
+arm les_smagorinsky         refused "LESModel \`Smagorinsky\`"         "" "sed -i 's/LESModel  *kEqn;/LESModel Smagorinsky;/' $TP"
+arm les_deltaVanDriest      refused "LES delta \`vanDriest\`"          "" "sed -i 's/^\\( *\\)delta  *smooth;/\\1delta vanDriest;/' $TP"
+arm les_smoothPrandtl       refused "smooths the LES delta \`Prandtl\`" "" "python3 -c \"import re; p='$TP'; t=open(p).read(); t=re.sub(r'(\\nsmoothCoeffs|\\n    smoothCoeffs)(\\s*\\{\\s*)delta\\s+cubeRootVol;', r'\\1\\2delta Prandtl;', t); open(p,'w').write(t)\""
+arm les_noMaxDeltaRatio     refused "no \`maxDeltaRatio\`"            "" "python3 -c \"import re; p='$TP'; t=open(p).read(); i=t.index('\\n    smoothCoeffs'); j=t.index('maxDeltaRatio', i); t=t[:j]+'// '+t[j:]; open(p,'w').write(t)\""
+arm les_densityVariable     refused "pairs \`density variable\` with LES" "" "sed -i 's/^simulationType .*/simulationType LES;\\ndensity variable;/' $TP"
+arm les_linearUpwindK       refused "neither \`Gauss upwind\` nor"     "" "sed -i 's/div(phi,k)  *Gauss limitedLinear 1;/div(phi,k) Gauss linearUpwind grad(k);/' system/fvSchemes"
+arm les_cellLimitedGradU    refused "the LES closure computes plain \`Gauss linear\` only" "" "sed -i 's/^\\( *default  *\\)Gauss linear;/\\1cellLimited Gauss linear 1;/' system/fvSchemes"
+# LES `turbulence off`: kEqn.C:141-144 gates correct() alone, and LESModel::correct() corrects the filter
+# width BEFORE that gate (LESModel.C:251) -- which nothing reads again once the model is frozen.
+arm les_turbulenceOff       runs    -                                  "" "sed -i 's/^\\( *\\)turbulence  *on;/\\1turbulence      off;/' $TP"
+arm les_turbulenceTypo      refused "Unknown switch nope"              "" "sed -i 's/^\\( *\\)turbulence  *on;/\\1turbulence      nope;/' $TP"
+BASE="$B"
+
+# the mangrove fvOptions: they run under kEpsilon with PBiCG; each coefficient OpenFOAM reads with
+# readEntry is required, a missing zone is refused, a field-name override and another closure are not taken
+BASE="$BG"
+MG_SRC="python3 -c \"import re; p='system/fvOptions'; t=open(p).read(); i=t.index('TurbulenciaMangroves'); "
+arm mg_runs                 runs    -                        "" true
+arm mg_noZone               refused "names cellZone \`c9\`"   "" "sed -i '0,/cellZone        c0;/s//cellZone        c9;/' system/fvOptions"
+arm mg_noCd                 refused "has no \`Cd\`"           "" "sed -i '0,/Cd              1.52;/s///' system/fvOptions"
+arm mg_UNames               refused "UNames"                 "" "sed -i '0,/regions/s//UNames (U);\n        regions/' system/fvOptions"
+arm mg_epsilonNames         refused "epsilonNames"           "" "${MG_SRC}t=t[:i]+t[i:].replace('regions', 'epsilonNames (epsilon);\\n        regions', 1); open(p,'w').write(t)\""
+arm mg_laminar              refused "multiphaseMangrovesTurbulenceModel" "" "sed -i 's/^simulationType .*/simulationType laminar;/' constant/turbulenceProperties"
+arm mg_kPBiCGStab           refused "PBiCGStab"              "" "sed -i 's/solver  *PBiCG;/solver          PBiCGStab;/' system/fvSolution"
+BASE="$B"
+
+# the coded cyclicACMI baffle: it runs; the rescale point is ported for MULESCorr and one sub-cycle only;
+# the coded scale refuses what OpenFOAM would compile against its own headers, and a name its shim lacks
+BASE="$BK"
+arm leak_runs               runs    -                        "" true
+arm leak_explicitMULES      refused "MULESCorr no"           "" "sed -i 's/MULESCorr  *yes;/MULESCorr       no;/' system/fvSolution"
+arm leak_subCycles          refused "nAlphaSubCycles 2"      "" "sed -i 's/nAlphaSubCycles  *1;/nAlphaSubCycles 2;/' system/fvSolution"
+arm leak_codeInclude        refused "codeInclude"            "" "sed -i '0,/type            coded;/s//type            coded;\n            codeInclude #{ #};/' constant/polyMesh/boundary"
+arm leak_timeIndex          refused "did not compile"        "" "sed -i 's/this->time().value()/scalar(this->time().timeIndex())/' constant/polyMesh/boundary"
+arm leak_noNonOverlap       refused "nonOverlapPatch"        "" "sed -i '0,/nonOverlapPatch wall_block;/s///' constant/polyMesh/boundary"
+BASE="$B"
+
+# A CASE OPENFOAM ITSELF STOPS: damBreak's atmosphere turned fixedFluxPressure under a pressure reference.
+# Its U is pressureInletOutletVelocity, which adjustPhi counts as FIXED (directionMixed fixesValue,
+# adjustPhi.C:59), so nothing is adjustable and the balance test decides -- and real OpenFOAM v2412 aborts
+# at step one's third corrector, imbalance 2.7e-4 of totalFlux against 1e-8:
+#     Total flux              : 1.19704e-08
+#     Specified mass inflow   : 3.30162e-12
+#     Specified mass outflow  : 5.25542e-14
+#     Adjustable mass outflow : 0
+# This was the DEVICE's refusal (`device_closed`) until adjustPhi ran on the device; now BOTH arms stop
+# where OpenFOAM does, in its words, and abortedWhereOpenFOAMDoes holds each to those NUMBERS -- which is
+# what pins the step and the corrector, since the text alone would pass an abort anywhere. The runs that
+# witness the scaling half are tests/interfoam_moving_vs_openfoam.sh's `closedAdjZG`, `closedAdjIO` and
+# `mixerTop`. The host arm needs no GPU, so it stands outside the device block.
+CLOSED="sed -i '/atmosphere/,/}/ s/type  *totalPressure;/type            fixedFluxPressure;/' 0/p_rgh; sed -i '/nNonOrthogonalCorrectors/a\    pRefPoint (0.292 0.292 0.0073);\n    pRefValue 0;' system/fvSolution"
+abortedWhereOpenFOAMDoes()
+{
+    local name="$1" flags="$2" out
+    # shellcheck disable=SC2086
+    out=$("$BIN" -case "$W/$name" $flags 2>&1)
+    # OpenFOAM prints six significant digits and brae seven; five pin the corrector
+    if echo "$out" | grep -qF "Total flux              : 1.1970" \
+       && echo "$out" | grep -qF "Specified mass inflow   : 3.3016" \
+       && echo "$out" | grep -qF "Specified mass outflow  : 5.2554" \
+       && echo "$out" | grep -qF "Adjustable mass outflow : 0.000000e+00"; then
+        printf "  ok:   %-34s %s\n" "$name" "stops on OpenFOAM's four numbers"
+    else
+        printf "  FAIL: %-34s does not stop on OpenFOAM's numbers: %s\n" "$name" \
+               "$(echo "$out" | grep -E 'Total flux|mass inflow' | tr '\n' ' ' | cut -c1-140)"
+        fails=$((fails+1))
+    fi
+}
+arm closed_abort_host   refused "Continuity error cannot be removed by adjusting the outflow" ""        "$CLOSED"
+abortedWhereOpenFOAMDoes closed_abort_host ""
+
+if [ $HAVE_GPU = 1 ]; then
+    BASE="$BL"
+    # LES kEqn RUNS on the device now, on a WEDGE mesh (tests/interfoam_les_vs_openfoam.sh holds the
+    # numbers). It was refused twice -- for the closure, then for a momentum gap that turned out to be
+    # three wedge defects -- so this arm is a `runs`, and a blanket refusal coming back fails it
+    arm device_les          runs    -                      "-device" true
+    # ...and a pressureInletOutletVelocity `tangentialVelocity` RUNS on the device now: the kernel blends the
+    # patch's refValue into the inflow value as the host does. Gated on RAS/DTCHullMoving's device arm
+    # (tests/interfoam_write_vs_openfoam.sh, arm X3, whose control leaves the refValue off: U 2.4e-06).
+    arm device_piovTangential runs    -                          "-device" "${TANGV/TVSPEC/uniform (0.1 0 0)}"
+    # the MANGROVE PAIR RUNS on the device now, with k and epsilon under the PBiCG/DILU the case names
+    # (tests/interfoam_mangrove_vs_openfoam.sh holds both arms to OpenFOAM, solve by solve). It was a
+    # refusal by the option's name, and behind that refusal the closure would have run a Gauss-Seidel
+    # sweep under PBiCG's entry -- so this arm is a `runs`, and a blanket refusal coming back fails it
+    BASE="$BG"
+    arm device_mangrove     runs    -                       "-device" true
+    # ...and the turbulence option under the `density variable` k-epsilon, where OpenFOAM's addSup is
+    # -Sp(rho*coeff): the device names it before the first step (the host closure refuses the same
+    # lineage where it meets it)
+    # the DENSITY-WEIGHTED lineage runs on both loops now: `fvOptions(alpha, rho, k_)` with alpha one
+    # dispatches to addSup(rho, eqn), -Sp(rho*coeff), and both arms build the coefficient with rho in it
+    # (tests/interfoam_mangrove_vs_openfoam.sh `densityVariable` holds them to OpenFOAM solve by solve)
+    arm device_mangrove_rhoKE runs    -                     "-device" "sed -i 's/^simulationType .*/density variable;\nsimulationType RAS;/' constant/turbulenceProperties; sed -i 's/div(phi,k) /div(rhoPhi,k) /; s/div(phi,epsilon) /div(rhoPhi,epsilon) /' system/fvSchemes"
+    # kOmegaSST across a CYCLIC PAIR: the case reader refuses it by name on both arms (kEpsilon is the
+    # one closure carried across a pair, validation/interFoamCyclic). Behind that refusal the device SST
+    # closure has its own (`hasCoupledPatches`, kOmegaSST.cu), whose flag the interFoam site never set --
+    # tools/default_audit.py found it; the site sets it now, so lifting the reader's refusal cannot leave
+    # the pair contributing nothing to k and omega. Staged from the porous-baffle case: kOmegaSST for
+    # kEpsilon, omega from epsilon, div(phi,omega), the wallDist method SST needs.
+    BASE="$BB"
+    BSST="sed -i 's/^\( *RASModel  *\)kEpsilon;/\1kOmegaSST;/' constant/turbulenceProperties; sed -i 's/^\( *div(phi,epsilon) .*\)/\1\n    div(phi,omega)  Gauss upwind;/' system/fvSchemes; printf '\nwallDist { method meshWave; }\n' >> system/fvSchemes; sed -i 's/(U|k|epsilon)/(U|k|epsilon|omega)/' system/fvSolution; sed 's/object  *epsilon;/object      omega;/; s/dimensions  *\[0 2 -3 0 0 0 0\];/dimensions      [0 0 -1 0 0 0 0];/; s/epsilonWallFunction/omegaWallFunction/' 0/epsilon > 0/omega"
+    # ...and it RUNS now, on both arms: the SST closure carries the pair (grad(U), both divergences,
+    # each equation's gammaCell, the solve's interface, and CDkOmega's two gradients), gated on
+    # validation/interFoamCyclic `sst`. A blanket refusal coming back fails this arm.
+    arm device_baffle_SST   runs    -                              "-device" "$BSST"
+    # ...and the cached grad(U) across the pair is refused on this loop: the device cache is formed on an
+    # uncoupled mesh only
+    arm device_gradUCacheCoupled refused "on a mesh with the coupled patch" "-device" "$BSST; ${CACHE/CACHESPEC/    grad(U);}"
+    # ...and, on the HOST, kOmegaSST's linearUpwind across the pair: OpenFOAM adds the correction on
+    # coupled faces (linearUpwind.C:98-137), the kOmegaSST closure does not, so the reader refuses it.
+    # Here because BSST is.
+    arm sst_linearUpwindCoupled refused "coupled patch"            "" "$BSST; sed -i 's/div(phi,k) .*/div(phi,k) Gauss linearUpwind grad(k);/; s/div(phi,omega) .*/div(phi,omega) Gauss linearUpwind grad(k);/' system/fvSchemes"
+    # LES kEqn across a COUPLED PAIR: the case reader refuses any model but kEpsilon with a pair, on
+    # both arms (inter_case_cpp.cu:1285), and BEHIND that the device LES closure has its own refusal --
+    # LESkEqnInput carries no interface, so k would convect and diffuse across the periodic faces as if
+    # they were walls while every other equation couples them. The reader's is what fires, and the
+    # device's is what keeps lifting it from being silent. Staged from the porous-baffle case.
+    BASE="$BB"
+    BLESC="sed -i 's/^simulationType .*/simulationType LES;\nLES { LESModel kEqn; delta cubeRootVol; turbulence on; printCoeffs on; cubeRootVolCoeffs { deltaCoeff 1; } }/' constant/turbulenceProperties; sed -i '/^RAS$/,/^}/d' constant/turbulenceProperties; sed -i 's/div(phi,epsilon) .*//' system/fvSchemes; rm -f 0/epsilon; sed -i 's/nutkWallFunction/calculated/' 0/nut"
+    # ...and it RUNS now: LESkEqn::Input carries the pair, gated on validation/interFoamCyclic
+    # `les` (the closure handed no pair read k 4.3e-01, nut 2.8e-01). A blanket refusal coming back
+    # fails this arm.
+    arm device_les_cyclic   runs    -                              "-device" "$BLESC"
+    # ...and `alphaApplyPrevCorr yes` across the pair is refused on the device: its cache of the previous
+    # correction holds the internal and the boundary faces, the pair's being in neither, where OpenFOAM limits
+    # and integrates a coupled patch like any other (CMULESTemplates.C:327-338). The host loop carries every
+    # patch and runs it. The baffle case sets `MULESCorr yes` itself.
+    PREVC="sed -i 's/^\( *\)MULESCorr  *yes;/\1MULESCorr       yes;\n\1alphaApplyPrevCorr yes;/' system/fvSolution"
+    arm device_prevCorr_pair refused "on a mesh with a coupled pair" "-device" "$PREVC; grep -q alphaApplyPrevCorr system/fvSolution"
+    arm prevCorr_pair_host  runs    -                              "" "$PREVC; grep -q alphaApplyPrevCorr system/fvSolution"
+    # a RAS closure on a MOVING mesh is refused on the device: its closure's input carries neither the
+    # old volumes nor the mesh flux the host closure takes (moving_SST above runs the same staging on
+    # the host). Found by auditing hand-built control structs, not by a case -- no runnable tutorial
+    # reaches it -- and refused rather than left to run ddt(k) on the current volumes.
+    BASE="$BM"
+    # ...and it RUNS now: the device closure takes the old volumes, the absolute flux and every
+    # distance the move invalidated, gated on waves/waveMakerPiston `pistonSST` (the wall distance
+    # left stale reads U 1.7353e-05). A blanket refusal coming back fails this arm.
+    arm device_moving_SST   runs    -                               "-device" "$MOVSST"
+    # ...and CRANKNICOLSON ON A MOVING MESH, which this loop RUNS now: the scheme's moving ddt (V0 and
+    # V00 weights) and fvcDdtUfCorr are transcribed from the host reference and gated beside the host
+    # arm by `sloshing2DCN` in tests/interfoam_moving_vs_openfoam.sh. It refused by name until they
+    # were written, and `ddt_cnMoving` above is the same staging on the host.
+    arm device_cnMoving     runs    -                               "-device" "$CNSET; sed -i 's/nAlphaSubCycles  *[0-9]*;/nAlphaSubCycles 1;/' system/fvSolution"
+    # ...but it does not WRITE that case: CrankNicolson's state on a moving mesh (the ddt0 fields' patch
+    # values, the old levels' stored patch values) is the host loop's own objects, so with a write time
+    # inside the run the device names the files at start-up and stops at that write. The HOST arm beside
+    # it is the control: the same staging writes and runs to its end.
+    CNWRITE="$CNSET; sed -i 's/nAlphaSubCycles  *[0-9]*;/nAlphaSubCycles 1;/' system/fvSolution; sed -i -E 's/^(writeControl\s+)[^;]*;/\1timeStep;/; s/^(writeInterval\s+)[^;]*;/\11;/' system/controlDict"
+    # ...KEPT NOW (2026-10-02): the ddt0 fields' patches are advanced on the device beside their cells and the
+    # state comes down at the write, so the device arm RUNS and writes -- the write gate's cn_moving/
+    # released_device.sh and the floatingObject row hold what it writes against OpenFOAM. A refusal coming
+    # back fails this arm.
+    arm ddt_cnMovingDeviceWrite runs    -                           "-device" "$CNWRITE"
+    arm ddt_cnMovingHostWrite   runs    -                           ""        "$CNWRITE"
+    # the device's alpha pre-solve does not honour minIter (the host's does)
+    # cellLimited grad(U) is refused on the device (the host carries it into linearUpwind and the
+    # viscous term; this loop does not). The host arm `grad_namedU` above RUNS the same staging, which
+    # is what says the two answers differ by the refusal and not by the staging.
+    BASE="$B"
+    # ...and it RUNS now. The refusal hid THREE things, each found by lifting it: KOmegaSSTInput carries
+    # the grad(U) limiter twice and the interFoam site filled only the coeffs half (nut 4.1315e-01);
+    # this loop set NEITHER momentum coefficient, so the viscous dev2 term ran unlimited (nut
+    # 1.2822e-02 after the first fix); and UEqn.cu's own refusal keyed on the coefficient rather than
+    # the scheme, so it blocked `Gauss upwind` with a cellLimited gradSchemes entry. Gated on
+    # validation/interFoamCyclic `sstLimU`, both arms. A blanket refusal coming back fails this arm.
+    # ...and `Gauss limitedLinear` for the CLOSURE, which RUNS now on BOTH closures. Each was lifted
+    # on its ASSEMBLED SYSTEM against OpenFOAM's own at the first closure call, because the fields of
+    # an interFoam RAS case cannot witness the scheme (one ulp of the initial omega is worth 4.3e-02
+    # after ten steps on RAS/waterChannel): kOmegaSST 3.4e-14 on the off-diagonals
+    # (tests/interfoam_sst_assembly_vs_openfoam.sh) and kEpsilon 3.6e-15 on this very tutorial
+    # (tests/interfoam_kepsilon_assembly_vs_openfoam.sh), each against a `Gauss upwind` control that
+    # misses by 5.0e-01 and 2.0e-01. A refusal coming back fails this arm.
+    BASE="$BR"
+    arm device_limitedLinearTurb runs    -                          "-device" "sed -i 's/div(rhoPhi,k) .*/div(rhoPhi,k) Gauss limitedLinear 1;/; s/div(rhoPhi,epsilon) .*/div(rhoPhi,epsilon) Gauss limitedLinear 1;/' system/fvSchemes"
+    BASE="$B"
+    arm device_gradULimited runs    -                           "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
+    # localEuler RUNS on the device loop (tests/interfoam_dtchull_vs_openfoam.sh `laminar device`):
+    # setRDeltaT on the host, its consumers on the GPU -- kOmegaSST's two fvm::ddts included (`ras
+    # device`); kEpsilon and LES under it are refused where the case is read, for both loops
+    arm device_localEuler   runs    -                           "-device" "$LTSSET; $LTSZERO"
+    BASE="$BR"
+    arm device_localEulerSST runs   -                           "-device" "$SSTBASE; $LTSSET; $LTSZERO"
+    BASE="$B"
+    # kOmegaSST's linearUpwind RUNS on the device closure too (the transport's own correction over the
+    # named cellLimited gradient; tests/interfoam_dtchull_vs_openfoam.sh `ras device`)
+    BASE="$BR"
+    arm device_sstLinearUpwind runs  -                          "-device" "$SSTBASE; ${LUGRAD/LIMGRAD/cellLimited Gauss linear 1}; $LUBOTH"
+    # nutkRoughWallFunction RUNS on the device kOmegaSST closure, its history the wall nut as correctNut is entered
+    arm device_sstNutkRough runs    -                           "-device" "$SSTBASE; ${ROUGHNUT/RSPEC/Ks uniform 1e-4; Cs uniform 0.5;}"
+    # outletPhaseMeanVelocity RUNS on the device loop (the U hook updates it at the host loop's instants;
+    # tests/interfoam_dtchull_vs_openfoam.sh `laminar device`), here on damBreak's WET left wall -- the
+    # atmosphere the refusal arms above use is dry, which the class itself refuses (opmv_dry)
+    BASE="$B"
+    arm device_opmv         runs    -                           "-device" "python3 -c \"import re; p='0/U'; t=open(p).read(); t=re.sub(r'leftWall\\s*\\{[^}]*\\}', 'leftWall { type outletPhaseMeanVelocity; Umean 0.01; alpha alpha.water; value uniform (0 0 0); }', t, count=1); open(p,'w').write(t)\""
+    # the cached grad(U) needs a closure that forms it: laminar is the stale-cache refusal on both loops
+    arm device_gradUCache   refused "U has changed since grad(U) was last formed" "-device" "${CACHE/CACHESPEC/    grad(U);}"
+    # ...kOmegaSST's validate forms it, so the RAS base made SST RUNS with the cache on this loop too, and kEpsilon's
+    # does not, so that is the same stale-cache refusal as the host loop's
+    BASE="$BR"
+    arm device_sstGradUCache runs   -                           "-device" "$SSTBASE; ${CACHE/CACHESPEC/    grad(U);}"
+    # ...but not beside a LIMITED grad(U) on a static mesh (the least-squares case is the same throw): the device
+    # cache is formed unlimited Gauss, and the host loop carries the rest
+    arm device_gradUCacheLimited refused "is limited or least-squares" "-device" "$SSTBASE; ${CACHE/CACHESPEC/    grad(U);}; sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    grad(U)         cellLimited Gauss linear 1;/' system/fvSchemes"
+    arm device_gradUCacheKEpsilon refused "U has changed since grad(U) was last formed" "-device" "${CACHE/CACHESPEC/    grad(U);}"
+    BASE="$B"
+    BASE="$BR"
+    BASE="$B"
+    BASE="$B"
+    # the device's alpha pre-solve honours the case's minIter now, as the host's always has
+    # (DeviceAlphaSolverControls::minIter; tests/interfoam_dambreak_vs_openfoam.sh `alphaminiter` holds
+    # BOTH arms to OpenFOAM's five sweep counts, the only thing on damBreak that can witness it), so a
+    # refusal coming back fails this arm
+    arm device_alphaMinIter    runs    -                         "-device" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       yes;\\n\\1minIter 1;/' system/fvSolution"
+    # the device loop RUNS the coded cyclicACMI baffle now: the binary couples the pair for it as for
+    # the host loop, and tests/interfoam_leakage_vs_openfoam.sh holds the numbers (its harness still
+    # asserts that the pair handed over UNCOUPLED is refused, which this binary can no longer do)
+    BASE="$BK"
+    arm device_leak         runs    -                       "-device" true
+    # ...but only at the rescale point both loops gate -- `MULESCorr yes`, one alpha sub-cycle, no
+    # icAlpha or scAlpha -- so the explicit path is refused on the device as it is on the host, by the
+    # SAME rule in the same words (inter_driver_cpp.cu and inter_driver_device.cu each hold it; the host's
+    # arm is leak_explicitMULES, above). It was `device_leak_explicit` in the ledger. The one interFoam
+    # tutorial with a cyclicACMI, damBreakLeakage, ships `MULESCorr yes` and runs on both arms.
+    arm leak_explicitMULES_device refused "MULESCorr no"     "-device" "sed -i 's/^\\( *\\)MULESCorr  *yes;/\\1MULESCorr       no;/' system/fvSolution"
+    # the device momentum runs limitedLinear now -- one magSqr limiter per face, as OpenFOAM's, gated on
+    # eulerianInjection in tests/interfoam_limitedlinear_vs_openfoam.sh. It was refused here while its
+    # branch accumulated magSqr(U) into a buffer resize() had not zeroed
+    BASE="$B"
+    arm device_limitedLinear runs    -                        "-device" "sed -i 's/div(rhoPhi,U) .*/div(rhoPhi,U)  Gauss limitedLinear 0.2;/' system/fvSchemes"
+    BASE="$B"
+    # THE BAFFLE TUTORIAL on the device. Its pair and its JUMP both run now
+    # (tests/interfoam_cyclic_vs_openfoam.sh's `jump` profile measures them), so what it refuses is
+    # the one thing left: the case sets `nOuterCorrectors 3` and the device loop runs one.
+    BASE="$BB"
+    # the baffle tutorial RUNS on the device now -- pair, jump, nOuterCorrectors 3 and a RAS closure
+    # whose k and epsilon cross the pair; tests/interfoam_baffle_vs_openfoam.sh measures it against
+    # OpenFOAM. The shipped binary attaches the coupling itself, so this arm runs; the mesh handed over
+    # UNCOUPLED is still refused by name, and test_inter_baffle_vs_openfoam.cu holds that refusal.
+    arm device_baffle       runs    -                        "-device" true
+    BASE="$B"
+    # every scalar gradient takes the case's entry on the device now, and so does grad(U)'s dev2 term
+    # (RAS/electrostaticDeposition, tests/interfoam_moving_vs_openfoam.sh `esd`). What is still refused
+    # is a leastSquares grad(U) BESIDE a site the momentum assembly builds Gauss -- damBreak's
+    # `linearUpwind grad(U)` correction and its corrected laplacian both are.
+    arm device_gradLsq      refused "grad(U) resolves to leastSquares" "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         leastSquares;/' system/fvSchemes"
+    arm device_gradNHat     runs    -                        "-device" "sed -i '/^gradSchemes/,/^}/ s/default .*/default         Gauss linear;\n    nHat            cellLimited Gauss linear 1;/' system/fvSchemes"
+    arm device_baseline     runs    -                        "-device" true
+    # CrankNicolson RUNS on the device loop (tests/interfoam_cn_vs_openfoam.sh holds RAS/damBreak under it
+    # on both arms); a coupled pair under it is refused by name there, where the host loop carries it
+    arm device_cn           runs    -                        "-device" "$CNSET"
+    BASE="$BB"
+    # ...and it RUNS now: the pair carries the off-centred flux, the end-of-step un-blend and
+    # ddtCorr under the scheme, gated on validation/interFoamCyclic `sstCN`/`lesCN` (the pair left
+    # on the EULER ddtCorr read U 8.2265e-02). A blanket refusal coming back fails this arm.
+    arm device_cn_baffle    runs    -                         "-device" "$CNSET"
+    BASE="$B"
+    # the permeable-wall pair RUNS on the device loop now (tests/interfoam_permeable_vs_openfoam.sh holds
+    # it to OpenFOAM on both profiles); this arm is here because it was a blanket refusal
+    arm device_permeable    runs    -                        "-device" "${PERMU/PHI /}; ${PERMP/PENTRY/p uniform 0;}"
+    # nOuterCorrectors IS the device loop now (tests/interfoam_cyclic_vs_openfoam.sh's `outer`
+    # profile measures it against OpenFOAM, with the one-corrector answer as its control), and so is
+    # frozenFlow -- gated on RAS/damBreak `flowFrozen`, both arms, where U, p_rgh, k and epsilon are
+    # EXACTLY the start values and alpha advances over 2266 of 2268 cells.
+    arm device_nOuter2      runs    -                        "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 2;/' system/fvSolution"
+    # THE KEY IS `frozenFlow`, AND THESE ARMS USED TO WRITE `solveFlow`. interFoam.C:156 asks
+    # pimple.frozenFlow(), which pimpleControl does not override, so it is solutionControl.C:52's
+    # `frozenFlow` in the PIMPLE dict. `solveFlow` (pimpleControl.C:47, same dict) is read by exactly one
+    # solver in OpenFOAM v2412 -- sprayFoam.C:90 -- and interFoam never looks at it. So a `solveFlow no`
+    # arm tested a key that changes nothing on either code, and brae was ACTING on it.
+    arm device_frozenFlow   runs    -                        "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 1;\n    frozenFlow      yes;/' system/fvSolution"
+    # ...and its SPELLINGS, now on the right key: `y` is TRUE to Foam::Switch (Switch.C:92-137) and a
+    # hand-rolled test that accepted only {yes,true,on,1} would read it as false and solve the flow.
+    arm device_frozenFlow_y runs    -                        "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 1;\n    frozenFlow      y;/' system/fvSolution"
+    # ...and `solveFlow no` must now be a NO-OP on both codes rather than freezing brae's flow
+    arm device_solveFlowNoop runs   -                        "-device" "sed -i 's/nOuterCorrectors  *1;/nOuterCorrectors 1;\n    solveFlow       no;/' system/fvSolution"
+    # BOTH ARMS honour a per-equation `<field>Final` solver entry now: the device closures take the
+    # second equation's own SolveControls (KEpsilonInput::epsSolve, KOmegaSSTInput::omegaSolve) where they
+    # used to compare all eight fields and refuse any difference. Gated on `splitSolve`/`splitSolveSST`,
+    # whose device arm now RUNS and is held to the device's own bounds. What the device still refuses is
+    # the second equation naming a solver FAMILY it does not run -- see epsilonFinal/omegaFinal below.
+    arm device_splitSolve   runs    -                        "-device" "python3 -c \"import re; p='system/fvSolution'; t=open(p).read(); t=re.sub(r'\\n\\}\\s*\\n\\s*PIMPLE', '\\n    epsilonFinal\\n    {\\n        solver smoothSolver;\\n        smoother symGaussSeidel;\\n        tolerance 1e-12;\\n        relTol 0;\\n        minIter 1;\\n        nSweeps 2;\\n    }\\n}\\n\\nPIMPLE', t, count=1); open(p,'w').write(t)\""
+    BASE="$B"
+    # the device pressure step runs the non-orthogonal loop (laminar/damBreak `nonorth` holds it)
+    arm device_nNonOrth1    runs    -                        "-device" "sed -i 's/nNonOrthogonalCorrectors  *0;/nNonOrthogonalCorrectors 1;/' system/fvSolution"
+    # THE DEVICE ARM RUNS AN ADAPTIVE MESH NOW (tests/interfoam_amr_vs_openfoam.sh holds it to OpenFOAM
+    # at the floating-point floor: alpha 2.2e-15, p_rgh 6.1e-15 relative, U 3.2e-13) -- on a 3-D case. This
+    # gate's base is 2-D, so what the arms below show is that the refusals fire in the right ORDER on it:
+    # the missing mandatory entries first, then the empty patch, then the motion solver -- on a 2-D base
+    # the shared twoDCorrectPoints refusal; the device's OWN refusal of a 3-D mesh that refines and moves is
+    # held by tests/interfoam_amr_motion_vs_openfoam.sh's device arm until the device loop composes the two.
+    # ...and the bare dictionary on the DEVICE, which is OpenFOAM's own stop and not a device refusal:
+    # this was `device_mesh_dynamic` in the ledger long after the device loop ran a refining mesh
+    arm mesh_dynamicRefine_device refused "Entry 'correctFluxes' not found in dictionary" "-device" "printf '%s\ndynamicFvMesh dynamicRefineFvMesh;\n' '$HDR' > constant/dynamicMeshDict"
+    arm device_refine_runs  runs    -                         "-device" "$REFDICT '' > constant/dynamicMeshDict"
+    arm device_refine_motion refused "a motion solver on a 2-D mesh" "-device" "$REFDICT 'solvers { VF { motionSolverLibs (fvMotionSolvers); motionSolver solidBody; solidBodyMotionFunction oscillatingLinearMotion; amplitude (0.1 0 0); omega 6.283185307179586; } }' > constant/dynamicMeshDict"
+    # ...and `ddt(alpha) CrankNicolson` under an Euler momentum on a mesh that REFINES and has no motion of
+    # its own: mesh.dynamic() all the same, which is what ddtCorr branches on. The refusal tested the motion
+    # solver's pointer, which such a mesh does not have, and the case ran with nothing said.
+    arm device_eulerU_cnAlpha_refining refused "under an Euler ddt(rho,U) on a mesh that moves" "-device" \
+        "$REFDICT '' > constant/dynamicMeshDict; ddtblock 'default Euler;' 'ddt(alpha) CrankNicolson 0.9;'"
+    # ...and a limited compressive scheme beside an alpha patch that keeps a value of its own (damBreak's
+    # atmosphere is inletOutlet) on a mesh that REFINES: the limiter's gradient of alpha2 reads alpha2's stored
+    # patch values, which the device loop keeps across steps and does not carry through a topology change. On a
+    # mesh that does not refine it runs, and says how many faces take the stored value.
+    VLR="sed -i -E 's/^( *div\\(phirb,alpha\\) +)Gauss linear;/\\1Gauss vanLeer;/' system/fvSchemes; grep -q 'div(phirb,alpha) *Gauss vanLeer' system/fvSchemes"
+    arm device_alpha2Patches_refining refused "does not carry through a topology change" "-device" \
+        "$REFDICT '' > constant/dynamicMeshDict; $VLR"
+    arm device_alpha2Patches runs  "alpha2's stored patch values on" "-device" "$VLR"
+    arm alpha2Patches_refining_host runs -                        "" "$REFDICT '' > constant/dynamicMeshDict; $VLR"
+    # nAlphaSmoothCurvature: the host loop smooths the copy of alpha as OpenFOAM does (tests/interfoam_write/
+    # core/smooth_curvature.sh and smooth_curvature_wedge.sh hold it to interFoam). The GPU loop's curvature
+    # takes the unsmoothed gradient and refuses the entry; the host refuses the form it has not ported, a
+    # least-squares gradient of the smoothed copy (the copy across a coupled pair is `baffle_smoothCurvature`).
+    arm device_smoothCurvature refused "nAlphaSmoothCurvature is not ported to the device curvature" "-device" \
+        "$SMOOTH"
+    arm smoothCurvature_host   runs    -                             "" "$SMOOTH"
+    arm smoothCurvature_lsq    refused "nAlphaSmoothCurvature with a leastSquares or limited gradient" "" \
+        "$SMOOTH; sed -i '/^gradSchemes/,/^}/ s/default .*/default         leastSquares;/' system/fvSchemes"
+    # ALPHA'S CrankNicolson UNDER AN Euler MOMENTUM, where the device loop would run alpha on the raw flux: more
+    # than one outer corrector (the host loop runs it; with one corrector the two fluxes are one and the device runs)
+    CNOUTER="ddtblock 'default Euler;' 'ddt(alpha) CrankNicolson 0.9;'"
+    CNOUTER="$CNOUTER && sed -i -E 's/nOuterCorrectors +[0-9]+;/nOuterCorrectors 2;/' system/fvSolution"
+    CNOUTER="$CNOUTER && grep -q 'nOuterCorrectors 2;' system/fvSolution"
+    # ...which the device loop RUNS since 2026-10-07 (the blend is keyed on ddt(alpha); held to OpenFOAM by
+    # interfoam_cn_vs_openfoam's eulerAlphaCNOuter)
+    arm device_eulerU_cnAlpha_outer runs    -                        "-device" "$CNOUTER"
+    # ...nor a non-orthogonal correction where it is not zero
+    # the non-orthogonal correction runs on the device now (tests/interfoam_dambreak_vs_openfoam.sh
+    # `sheared` holds it to OpenFOAM); `uncorrected` on a mesh that is not orthogonal is still refused
+    arm device_sheared_corrected runs    -                        "-device" "$SHEAR"
+    arm device_sheared_uncorrected runs    -                        "-device" "$SHEAR && $UNCORR"
+    # the device loop moves no mesh and pins no pressure reference; both are refused by name there
+    BASE="$BM"
+    # the reason is now the SPECIFIC one -- the mesh-update stage is on the host loop only -- because
+    # the device loop carries the pieces around it (the ddt's V0, refreshDeviceMeshGeometry) and a
+    # caller passing a MutableMesh must not get a silent run on the mesh as it started
+    # a moving mesh RUNS on the device now, AS SHIPPED: testTubeMixer's p_rgh is `solver GAMG` and its
+    # p_rghFinal is `solver PCG; preconditioner { preconditioner GAMG; ... }`, and the loop runs both
+    # (tests/interfoam_moving_vs_openfoam.sh profiles `mixer`, `cylinder` and `solitaryGamg`). This
+    # arm is here because each of the three was a refusal in turn, and a blanket one would pass every
+    # other arm on this page
+    arm device_moving       runs    -                      "-device" true
+    # ...but not `ddt(alpha) CrankNicolson` under an Euler momentum on it: phi.oldTime() is created by alpha's
+    # own blend on a moving mesh, held to OpenFOAM under a CrankNicolson momentum only (the host loop runs it;
+    # on a mesh that does not move the device runs it too, device_eulerU_cnAlpha_outer above)
+    arm device_eulerU_cnAlpha_moving refused "under an Euler ddt(rho,U) on a mesh that moves" "-device" \
+        "ddtblock 'default Euler;' 'ddt(alpha) CrankNicolson 0.9;'"
+    # ...and the same mesh with p_rghFinal as a plain GAMG SOLVER rather than the preconditioner form,
+    # so that BOTH device GAMG entry points are held on a moving mesh (the hierarchy is the mesh's and
+    # is rebuilt on every move for either)
+    arm device_moving_gamg  runs    -                      "-device" "python3 '$W/setSolver.py' p_rghFinal '        solver          GAMG;\n        smoother        DIC;\n        tolerance       2e-09;\n        relTol          0;\n'"
+    # ...and the PERMEABLE-WALL pair on it RUNS: it was refused as unmeasured, and
+    # tests/interfoam_moving_vs_openfoam.sh `mixerPermeable` now holds the device to OpenFOAM at the host's
+    # level (U 4.5e-11), with the absolute-flux fail-proof at U 9.0e-04. On a static mesh the pair runs
+    # too -- device_permeable, below, on the base case.
+        arm device_permeable_moving runs    -                  "-device" "$PERMUW; $PERMPW"
+    BASE="$B"
+    # ...and the closed tank OpenFOAM itself stops, on the DEVICE -- see `closed_abort_host` above
+    arm closed_abort_device refused "Continuity error cannot be removed by adjusting the outflow" "-device" "$CLOSED"
+    abortedWhereOpenFOAMDoes closed_abort_device "-device"
+    BASE="$B"
+    # the device loop carries the kEpsilon closure now, in both lineages
+    # the device loop drives the wave conditions through its alpha and velocity hooks
+    BASE="$BW"
+    # ...WITH THE TUTORIAL'S OWN GAMG for p_rghFinal, and so under no notice about the p_rgh solve: a
+    # `runs` arm cannot say "and did not substitute", so that is checked on the output directly
+    arm device_waves        runs    -                        "-device" true
+    if "$BIN" -case "$W/device_waves" -device 2>&1 | grep -q "approximated.*p_rgh"; then
+        echo "  FAIL: device_waves                       ran GAMG's entry under a p_rgh substitution notice"
+        fails=$((fails+1))
+    else
+        echo "  ok:   device_waves                       no p_rgh substitution notice"
+    fi
+    # the device's GAMG runs the host's four smoothers now (tests/interfoam_gamg_vs_openfoam.sh's three
+    # Gauss-Seidel profiles have device arms); a smoother NONE of them names is still refused there
+    arm device_gamg_GaussSeidel runs    -                        "-device" "sed -i '/p_rghFinal/,/}/ s/smoother  *DIC;/smoother        GaussSeidel;/' system/fvSolution"
+    arm device_gamg_symGaussSeidel runs -                        "-device" "sed -i '/p_rghFinal/,/}/ s/smoother  *DIC;/smoother        symGaussSeidel;/' system/fvSolution"
+    # ...and DILU is NOT one of the smoothers missing from the device. OpenFOAM registers it for an
+    # ASYMMETRIC matrix only (addasymMatrixConstructorToTable, DILUSmoother.C:40) and p_rgh's is symmetric,
+    # so its own lookup goes to the symmetric table and stops. NO SHIPPED TUTORIAL NAMES IT -- this arm
+    # mutates the entry, as every arm on this page does -- and the refusal now says which kind of refusal it
+    # is rather than "not ported", which read as an invitation to port something OpenFOAM rejects.
+    arm device_gamg_smootherDILU refused "ASYMMETRIC matrix only" "-device" "sed -i '/p_rghFinal/,/}/ s/smoother  *DIC;/smoother        DILU;/' system/fvSolution"
+    arm device_gamg_sweeps  runs    -                        "-device" "${GE}nPreSweeps 2; nFinestSweeps 3;/' system/fvSolution"
+    # a p_rgh or alpha condition that names rhoPhi is evaluated on the host and handed rhoPhi; U's
+    # pressureInletOutletVelocity switch runs ON the device and reads phi, so there the name is refused
+    BASE="$B"
+    arm device_flux_rhoPhi  runs    -                        "-device" "sed -i '/totalPressure/a\        phi             rhoPhi;' 0/p_rgh"
+    # ...and U naming rhoPhi RUNS on the device too: the host's rhoPhi is refreshed for U's patches as it
+    # is for p_rgh's and alpha's (tests/interfoam_dambreak_vs_openfoam.sh `rhophiU`, device U 8.5e-12)
+    arm device_Uflux_rhoPhi runs    -                        "-device" "sed -i '/pressureInletOutletVelocity/a\        phi             rhoPhi;' 0/U"
+    arm host_Uflux_rhoPhi   runs    -                        "" "sed -i '/pressureInletOutletVelocity/a\        phi             rhoPhi;' 0/U"
+    BASE="$BR"
+    arm device_ras          runs    -                        "-device" true
+    arm device_ras_uniform  runs    -                        "-device" "sed -i 's/^density .*/density uniform;/' constant/turbulenceProperties; sed -i 's/div(rhoPhi,k) /div(phi,k) /; s/div(rhoPhi,epsilon) /div(phi,epsilon) /' system/fvSchemes"
+    # ...and a RAS model that is neither, which is the SHARED case reader's refusal and not the device's:
+    # the host stops on it in the same words (ras_otherModel, above). It was `device_ras_otherModel` in
+    # the ledger. No shipped interFoam tutorial names another model -- 27 laminar, 11 kEpsilon, 5 kOmegaSST,
+    # 1 LES kEqn, every one of them run on both arms -- so it is left refused on both.
+    arm ras_otherModel_device refused "realizableKE"         "-device" "sed -i 's/RASModel .*/RASModel        realizableKE;/' constant/turbulenceProperties"
+    # the device loop carries kOmegaSST too now (tests/interfoam_ras_dambreak_vs_openfoam.sh `sst`), and
+    # an inletOutlet nut with it -- evaluated against the flux after the closure, as the host closure does
+    # (tests/interfoam_ras_dambreak_vs_openfoam.sh `nutAtmosphere`, on both closures)
+    arm device_sst          runs    -                        "-device" "$SSTBASE"
+    arm device_sstNutIO     runs    -                        "-device" "$SSTBASE; python3 -c \"import re; p='0/nut'; t=open(p).read(); t=re.sub(r'atmosphere\s*\{[^}]*\}', 'atmosphere { type inletOutlet; inletValue uniform 0.001; value uniform 0; }', t, count=1); open(p,'w').write(t)\""
+    BASE="$B"
+else
+    echo "  (no GPU: the -device arms are skipped)"
+fi
+
+# THE SOLVER'S OWN HEADER, held against these arms. braeInterFoam.cu tells a reader what `-device`
+# refuses; nine of its sentences said it refuses something it had run for units (LES, a cyclic, a
+# moving mesh, kOmegaSST, interfaceCompression, the leakage pair, limitedLinear, the non-orthogonal
+# corrections, nOuterCorrectors above 1). A paragraph that contradicts the code is worse than none --
+# a reader believes it and stops -- so the header carries the list between BEGIN/END markers and this
+# compares the two SETS. It runs with or without a GPU: it reads files, it does not run the solver.
+HDRFILE="$ROOT/src/applications/solvers/interFoam/braeInterFoam.cu"
+if [ -f "$HDRFILE" ]; then
+    claimed=$(awk '/BEGIN DEVICE REFUSALS/{f=1;next} /END DEVICE REFUSALS/{f=0} f' "$HDRFILE" \
+              | tr -s ' \n' '\n' | grep '^device_' | sort -u)
+    actual=$(awk '$1=="arm" && $2 ~ /^device/ && $3=="refused" {print $2}' "$0" | sort -u)
+    if [ "$claimed" = "$actual" ]; then
+        echo "  ok:   the solver header's device-refusal list is these arms ($(echo "$actual" | wc -w) of them)"
+    else
+        echo "  FAIL: braeInterFoam.cu's device-refusal list does not match this gate's arms"
+        echo "    in the header but not refused here: $(comm -23 <(echo "$claimed") <(echo "$actual") | tr '\n' ' ')"
+        echo "    refused here but not in the header: $(comm -13 <(echo "$claimed") <(echo "$actual") | tr '\n' ' ')"
+        fails=$((fails + 1))
+    fi
+else
+    echo "  FAIL: $HDRFILE is not where the header check expects it"
+    fails=$((fails + 1))
+fi
+
+echo "interfoam_refusals: $fails failures"
+[ $fails = 0 ]

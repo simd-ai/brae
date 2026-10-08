@@ -10,7 +10,7 @@
 //   brae:
 //     reference: .../simpleControl_cpp.cu
 //     cuda:      (host-only by nature -- CONFIGURATION, not GPU work)
-//     tests:     tests/test_simple_control_cpp.cu
+//     tests:     tests/test_residual_control.cu
 //
 // WHERE THE KEYS COME FROM. solutionControl::dict() is
 //

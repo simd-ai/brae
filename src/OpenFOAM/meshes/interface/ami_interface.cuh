@@ -8,11 +8,18 @@
 //   result[ownCell[srcFace]] -= coeff[srcFace] * pnf[srcFace]
 // i.e. the single cyclic (own,nbr) pair becomes a weighted STENCIL (own, list of (tgtCell, weight)).
 //
-// Weights (faceAreaWeightAMI): map the target faces to the source side via the transform, project both to the
-// source patch's average plane, and clip each src/tgt polygon pair (Sutherland-Hodgman) -> overlap area.
-//   srcWeights[i][j] = overlap_ij / srcMagSf[i]    (conformal=false normalisation; sum_j = coverage fraction)
-//   srcWeightsSum[i] = sum_j overlap_ij / srcMagSf[i]
-// (this header: host build + weights; device coupling is in device_ami.{cuh,cu}). Both sides are built (symmetric).
+// Weights (faceAreaWeightAMI): map the target faces to the source side via the transform, project each src/tgt
+// polygon pair onto the plane perpendicular to the pair's own normal, and clip (Sutherland-Hodgman) -> overlap
+// area. A pair is stored when overlap/|Sf of the OWNER patch's face| > 1e-6 (faceAreaWeightAMI.C:228).
+//   coverage[i]      = sum_j overlap_ij / srcMagSf[i]              (OpenFOAM's wghtSum)
+//   srcWeights[i][j] = overlap_ij / sum_j overlap_ij               cyclicAMI (requireMatch, the default) and a
+//                                                                  blended cyclicACMI face
+//                    = overlap_ij / srcMagSf[i]                    cyclicPeriodicAMI
+// (this header: host build + weights; device coupling is in device_ami.{cuh,cu}). Both directions are built here,
+// each on its own; OpenFOAM builds one, on the owner, and the neighbour reads it transposed.
+// NOT OpenFOAM's: the overlap is a polygon clip with no triangulation and no coplanar snap
+// (faceAreaIntersect.C:69), the search is every candidate pair and not the advancing front, and a translational
+// pair's separation is inferred from the two patches' mean face centres.
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -36,7 +43,12 @@ struct AMIInterface
     std::vector<label>  srcOffset;              // CSR offsets into (nbrCell, weight), size nSrc+1
     std::vector<label>  nbrCell;                // target-face owner cell per stencil entry
     std::vector<scalar> weight;                 // normalised AMI weight per stencil entry
-    std::vector<scalar> weightsSum;             // per src face: coverage = sum of weights (pre-lowWeight)
+    // per src face: the sum of the weights the interface APPLIES. 1 on a row normalised by its sum (a covered
+    // cyclicAMI face, a blended cyclicACMI face), the coverage where the rows stay area-normalised.
+    std::vector<scalar> weightsSum;
+    // per src face: the sum of overlap/|Sf| before any normalisation -- OpenFOAM's wghtSum
+    // (AMIInterpolation.C:185-198), the number its "AMI: Patch source sum(weights)" line reports
+    std::vector<scalar> coverage;
     std::vector<scalar> magSf;                  // per src face |Sf|
     std::vector<vector> Sf;                     // per src face area vector (out of ownCell)
     std::vector<scalar> deltaCoeffs;            // per src face 1/(nf & delta), delta to the AMI-interpolated nbr
@@ -107,6 +119,11 @@ inline scalar overlapArea(const std::vector<vec2>& a, const std::vector<vec2>& b
     const std::vector<vec2> c = clipPoly(a, b);
     return c.size() < 3 ? 0.0 : std::fabs(signedArea(c));
 }
+// faceAreaIntersect::tol (faceAreaIntersect.C:43). faceAreaWeightAMI stores a pair when its intersection area
+// over the SOURCE face's area exceeds it (faceAreaWeightAMI.C:228), and the source is the OWNER patch's face
+// in both directions: the AMI is built once, on the owner (cyclicAMIPolyPatch::owner(), index() <
+// neighbPatchID()), and the neighbour reads the same pairs as the target side.
+constexpr scalar INTERSECT_TOL = 1e-6;
 } // namespace ami_detail
 
 // Build the cyclicAMI interfaces (both source+target sides) with faceAreaWeightAMI weights.
@@ -318,6 +335,16 @@ inline std::vector<AMIInterface> buildAMIInterfaces(
         return P;
     };
 
+    // The two controls of the 2026-10-06 change, read at each call so one test process can run both arms:
+    //   BRAE_CONTROL_AMI_OVERLAP_1E14=1: a pair is kept when its overlap exceeds 1e-14 of THIS direction's own
+    //     face, as before -- OpenFOAM never stores a pair under 1e-6 of the owner's face
+    //   BRAE_CONTROL_AMI_AREA_NORMALISED=1: a cyclicAMI's rows stay overlap/|Sf|, as before -- OpenFOAM divides
+    //     by the row's sum
+    //   BRAE_CONTROL_AMI_OWN_FACE_AREA=1: a gate's CONTROL, deliberately wrong -- OpenFOAM's threshold over this
+    //     direction's own face in place of the owner's
+    const bool overlapControl = std::getenv("BRAE_CONTROL_AMI_OVERLAP_1E14") != nullptr;
+    const bool areaNormalisedControl = std::getenv("BRAE_CONTROL_AMI_AREA_NORMALISED") != nullptr;
+    const bool ownFaceControl = std::getenv("BRAE_CONTROL_AMI_OWN_FACE_AREA") != nullptr;
     std::vector<AMIInterface> out;
     for (label pi = 0; pi < (label)fvp.size(); ++pi)
     {
@@ -404,6 +431,15 @@ inline std::vector<AMIInterface> buildAMIInterfaces(
             for (const vector& v : facePoly(S.start+i)) srcW[i].push_back(v);
         for (label j = 0; j < T.size; ++j)
             for (const vector& v : facePoly(T.start+j)) tgtW[j].push_back(mapTtoS(v));
+        // the target faces' raw areas, once a face (rawMagSf is a map lookup): the threshold below divides by
+        // the OWNER side's face, which is the target's when this patch is the pair's neighbour
+        std::vector<scalar> tgtRaw(static_cast<std::size_t>(T.size));
+        for (label j = 0; j < T.size; ++j)
+        {
+            tgtRaw[static_cast<std::size_t>(j)] = g.rawMagSf(T.start+j);
+        }
+        // pairs whose overlap is between the old threshold and OpenFOAM's: [0] all of them, [1] those kept
+        long bandPairs[2] = {0, 0};
 
         // Unit normals on the source side (the target's mapped to it), for the pair normal below.
         auto unitN = [&](label f) {
@@ -523,8 +559,9 @@ inline std::vector<AMIInterface> buildAMIInterfaces(
             return q;
         };
 
-        // faceAreaWeightAMI: per src face, overlap-area against every tgt face (brute force; OF uses an advancing
-        // front, same result). weight = overlap/srcMagSf; weightsSum = coverage fraction.
+        // faceAreaWeightAMI: per src face, the overlap area against every candidate tgt face (OpenFOAM walks an
+        // advancing front; where a face is reached by both, the pairs are the same). The entries are
+        // overlap/srcMagSf here and are normalised after the sweep.
         ai.ownCell = S.faceCells;
         ai.srcOffset.assign(S.size + 1, 0);
         std::vector<std::vector<std::pair<label,scalar>>> stencil(S.size);   // per src face: (tgtFace j, weight)
@@ -611,10 +648,28 @@ inline std::vector<AMIInterface> buildAMIInterfaces(
                 const vector orig = srcW[i][0];
                 const scalar ov = overlapArea(projectPair(srcW[i], e1, e2, orig),
                                               projectPair(tgtPoly[j], e1, e2, orig));
-                if (ov > 1e-14 * srcArea)
+                // THE STORE TEST IS OpenFOAM's: interArea/srcMagSf > faceAreaIntersect::tolerance()
+                // (faceAreaWeightAMI.C:228), over the OWNER patch's face in both directions, and no pair with a
+                // face of no area (advancingFrontAMI.C:129-136, ROOTVSMALL). It was `ov > 1e-14*srcArea` over
+                // this direction's own face: every pair of faces that share an edge then stayed in the stencil
+                // with a weight of rounding size, and a sliver between 1e-14 and 1e-6 that OpenFOAM drops was
+                // kept -- on a cyclicACMI face with no other partner, as a face coupled with mask ~1e-6 and a
+                // weight re-normalised to 1 where OpenFOAM has an uncovered face.
+                // NOT CLOSED: OpenFOAM's `ov` is a sum over triangle pairs with a coplanar snap
+                // (faceAreaIntersect.C:69), which moves a sliver thinner than 1e-6*sqrt(triangle area) wholly
+                // to the main partner; this clipper has no snap. The search here is every candidate pair, not
+                // the advancing front.
+                const scalar ta = tgtRaw[static_cast<std::size_t>(j)];
+                const scalar ownerArea = (ai.patch < ai.nbrPatch || ownFaceControl) ? srcArea : ta;
+                const bool inBand = ov > 1e-14*srcArea && !(ov/srcArea > ami_detail::INTERSECT_TOL);
+                const bool keep = overlapControl
+                                ? ov > 1e-14*srcArea
+                                : (srcArea >= 1e-150 && ta >= 1e-150 && ov/ownerArea > ami_detail::INTERSECT_TOL);
+                bandPairs[0] += inBand ? 1 : 0;
+                bandPairs[1] += (inBand && keep) ? 1 : 0;
+                if (keep)
                 {
                     stencil[i].push_back({ j, ov / srcArea });
-                    const scalar ta = g.rawMagSf(T.start+j);
                     if (ta > scalar(0)) tgtCov[j] += ov / ta;
                 }
             }
@@ -704,6 +759,7 @@ inline std::vector<AMIInterface> buildAMIInterfaces(
             ai.weightsSum.push_back(s);
             ai.srcOffset[i+1] = ai.srcOffset[i] + (label)stencil[i].size();
         }
+        ai.coverage = ai.weightsSum;
         // THE ACMI MASK -- OF cyclicACMIPolyPatch.C:348, srcMask_ = clamp(AMI.srcWeightsSum(), 0, 1).
         // The coverage fraction IS the mask: it decides how each face's area splits between the coupled
         // patch and its coincident nonOverlapPatch wall. Computed for every interface (it is just the
@@ -750,6 +806,27 @@ inline std::vector<AMIInterface> buildAMIInterfaces(
                 const scalar s = ai.weightsSum[i];
                 if (stencil[i].empty() || !(s > scalar(0))) continue;
                 for (auto& e : stencil[i]) e.second /= s;
+                ai.weightsSum[i] = scalar(1);
+            }
+        }
+        // A cyclicAMI's ROWS ARE DIVIDED BY THEIR SUM, as OpenFOAM's are: AMIInterpolation::normaliseWeights
+        // with `conformal` true (AMIInterpolation.C:184-196, called with requireMatch_ at
+        // faceAreaWeightAMI.C:812; requireMatch defaults to true, AMIInterpolation.C:562). They were
+        // overlap/|Sf|, which sums to the coverage: 1 only to rounding on a covered face, and 1 - f on a face
+        // that lost a sliver of fraction f to the store test above -- a face reading (1 - f) of its neighbour
+        // value. NOT a cyclicPeriodicAMI, whose requireMatch OpenFOAM sets false
+        // (cyclicPeriodicAMIPolyPatch.C:321): its rows stay overlap/|Sf|. The mesh reader does not carry a
+        // patch's own `requireMatch false` to here; a cyclicAMI that sets it is not told apart.
+        if (!ai.acmi && !isPeriodic && !areaNormalisedControl)
+        {
+            for (label i = 0; i < S.size; ++i)
+            {
+                const scalar s = ai.weightsSum[i];
+                if (stencil[i].empty() || !(s > scalar(0))) continue;
+                for (auto& e : stencil[i])
+                {
+                    e.second /= s;
+                }
                 ai.weightsSum[i] = scalar(1);
             }
         }
@@ -818,12 +895,12 @@ inline std::vector<AMIInterface> buildAMIInterfaces(
         // answer, which is the one outcome this codebase does not accept.
         if (!ai.acmi)
         {
-            const std::size_t n = ai.weightsSum.size();
+            const std::size_t n = ai.coverage.size();
             if (n)
             {
-                scalar sum = 0, lo = ai.weightsSum[0];
+                scalar sum = 0, lo = ai.coverage[0];
                 std::size_t under = 0;
-                for (const scalar w : ai.weightsSum)
+                for (const scalar w : ai.coverage)
                 {
                     sum += w;
                     lo = std::min(lo, w);
@@ -850,15 +927,26 @@ inline std::vector<AMIInterface> buildAMIInterfaces(
         // min:.. max:.. average:.."), so brae's coverage can be diffed against OpenFOAM's own log line
         // for line rather than inferred from a diverging continuity error. Env-gated: OF prints it
         // unconditionally, but brae's logs are already compared byte-wise by the test harness.
-        if (std::getenv("BRAE_AMI_REPORT") && !ai.weightsSum.empty())
+        if (std::getenv("BRAE_AMI_REPORT") && !ai.coverage.empty())
         {
-            scalar lo = ai.weightsSum[0], hi = ai.weightsSum[0], sum = 0;
-            for (const scalar w : ai.weightsSum) { lo = std::min(lo, w); hi = std::max(hi, w); sum += w; }
+            scalar lo = ai.coverage[0], hi = ai.coverage[0], sum = 0;
+            for (const scalar w : ai.coverage)
+            {
+                lo = std::min(lo, w);
+                hi = std::max(hi, w);
+                sum += w;
+            }
             std::fprintf(stderr,
-                         "AMI: source:%s (%d faces) target:%s (%d faces) sum(weights) min:%g max:%g average:%g%s\n",
+                         "AMI: source:%s (%d faces) target:%s (%d faces) sum(weights) min:%.17g max:%.17g "
+                         "average:%.17g%s\n",
                          S.name.c_str(), (int)S.size, T.name.c_str(), (int)T.size,
-                         (double)lo, (double)hi, (double)(sum/(scalar)ai.weightsSum.size()),
+                         (double)lo, (double)hi, (double)(sum/(scalar)ai.coverage.size()),
                          ai.acmi ? "  [ACMI]" : "");
+            // the premise of the store test's change, as a number: pairs between the old threshold and
+            // OpenFOAM's, and how many of them this build kept
+            std::fprintf(stderr,
+                         "AMI: source:%s pairs with overlap/|Sf| in (1e-14, 1e-6]: %ld, kept %ld\n",
+                         S.name.c_str(), bandPairs[0], bandPairs[1]);
         }
         out.push_back(std::move(ai));
     }

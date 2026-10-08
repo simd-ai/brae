@@ -1,0 +1,2403 @@
+// interFoam's createFields -- see inter_case_cpp.cuh for the provenance and for the four things the
+// order of this file encodes.
+#include "inter_case_cpp.cuh"
+#include "time_instances.cuh"
+#include "inter_amr_cpp.cuh"
+#include "frozen_bc_guard.cuh"
+#include <sstream>
+#include "crank_nicolson_ddt_scheme_cpp.cuh"
+#include "inter_peqn_cpp.cuh"
+#include "brae_notice.cuh"
+#include "foam_field_reader.cuh"
+#include "mrf_read.cuh"   // readCellZones
+#include "read_surface_field.cuh"
+#include "scheme_parse.cuh"
+#include "patch_set.cuh"
+#include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <utility>
+#include <map>
+
+namespace brae {
+namespace cpu {
+namespace interFoam {
+
+// OpenFOAM's flux-conditional patches LOOK UP phi when they update (pressureInletOutletVelocity,
+// inletOutlet, totalPressure: `patch().lookupPatchField<surfaceScalarField, scalar>(phiName_)` inside
+// updateCoeffs), so whatever phi is at that moment decides which faces are inflow. brae's patches
+// cannot look anything up; they are told, through updateFromFlux, and interFoam never told them. Every
+// such face therefore sat at OUTFLOW for the whole run -- on capillaryRise's bottom inlet, where water
+// is drawn IN, that dropped pressureInletOutletVelocity's two fixed tangential components and with them
+// 2/3 muEff magSf deltaCoeffs of UEqn.A(): 5.33e+05 by that formula, 5.339e+05 measured against
+// OpenFOAM's own UEqn.A() dump, in every cell of the bottom row.
+void pushFluxToPatches(
+    InterFields& f,
+    const std::vector<FvPatch>& patches,
+    bool uCoefficientsKept)
+{
+    // rhoPhi does not exist yet at the first call, from buildInterFields before the mixture is built;
+    // nothing reads a flux that early, and the call that closes buildInterFields hands it over
+    const SurfaceScalarField* rhoPhi = f.rhoPhi.boundary.size() == patches.size() ? &f.rhoPhi : nullptr;
+    for (std::size_t pi = 0; pi < patches.size() && pi < f.phi.boundary.size(); ++pi)
+    {
+        // each condition the flux its own `phi` entry NAMES -- see namedPatchFlux
+        auto fluxFor = [&](const std::string& name) -> const std::vector<scalar>*
+        {
+            if (name == "rhoPhi" && !rhoPhi) return nullptr;
+            return &namedPatchFlux(name, pi, patches[pi].name, f.phi, rhoPhi);
+        };
+        // NOT U's where OpenFOAM runs no updateCoeffs before the next read (the declaration names the
+        // two moments), unless the class evaluates inside updateCoeffs
+        const bool tellU = !uCoefficientsKept || f.U.boundary[pi]->updateCoeffsEvaluates();
+        if (const std::vector<scalar>* q = tellU ? fluxFor(f.U.boundary[pi]->fluxName()) : nullptr)
+        {
+            f.U.boundary[pi]->updateFromFlux(*q);
+        }
+        if (const std::vector<scalar>* q = fluxFor(f.p_rgh.boundary[pi]->fluxName()))
+        {
+            f.p_rgh.boundary[pi]->updateFromFlux(*q);
+        }
+        if (const std::vector<scalar>* q = fluxFor(f.alpha1.boundary[pi]->fluxName()))
+        {
+            f.alpha1.boundary[pi]->updateFromFlux(*q);
+        }
+    }
+    pushAlphaToPatches(f, patches);
+}
+
+// The two permeable-wall conditions look the PHASE FIELD up, by the name in their `alpha` entry, and read
+// its STORED values on their own patch at every updateCoeffs
+// (pressurePermeableAlphaInletOutletVelocity...C:160-163, prghPermeableAlphaTotalPressure...C:190-193).
+// brae's patches are told, after alpha's last boundary evaluate of the step, so a face whose alpha
+// crosses alphaMin switches in the step OpenFOAM switches it. NOT DISCRIMINATED by the gate: no face of
+// damBreakPermeable's wall crosses the threshold in either gated run.
+void pushAlphaToPatches(
+    InterFields& f,
+    const std::vector<FvPatch>& patches)
+{
+    for (std::size_t pi = 0; pi < patches.size() && pi < f.alpha1.boundary.size(); ++pi)
+    {
+        for (fvPatchField<vector>* ub : {f.U.boundary[pi].get()})
+        {
+            if (!ub->needsAlphaPatchValues()) continue;
+            if (ub->alphaFieldName() != f.alphaName)
+                throw std::runtime_error(
+                    "brae interFoam: U patch `" + patches[pi].name + "` names `alpha " + ub->alphaFieldName()
+                    + "`, and this case's phase field is `" + f.alphaName + "`. OpenFOAM looks the named "
+                    "field up and stops without it.");
+            ub->updateFromAlphaValues(f.alpha1.boundary[pi]->value());
+        }
+        for (fvPatchField<scalar>* pb : {f.p_rgh.boundary[pi].get()})
+        {
+            if (!pb->needsAlphaPatchValues()) continue;
+            if (pb->alphaFieldName() != f.alphaName)
+                throw std::runtime_error(
+                    "brae interFoam: p_rgh patch `" + patches[pi].name + "` names `alpha " + pb->alphaFieldName()
+                    + "`, and this case's phase field is `" + f.alphaName + "`. OpenFOAM looks the named "
+                    "field up and stops without it.");
+            pb->updateFromAlphaValues(f.alpha1.boundary[pi]->value());
+        }
+    }
+}
+
+GeometricField<scalar> rhoWithPatchValues(
+    const std::vector<scalar>& rhoCells,
+    const std::vector<std::vector<scalar>>& rhoBnd,
+    const std::vector<FvPatch>& patches,
+    bool evaluateEmpty)
+{
+    GeometricField<scalar> r;
+    r.internal = rhoCells;
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& q = patches[pi];
+        if (q.type == "empty")
+        {
+            // OpenFOAM's empty patch field has no faces at all; it contributes nothing anywhere
+            r.boundary.push_back(std::make_unique<ZeroGradientPatchField<scalar>>(q));
+            continue;
+        }
+        if (q.coupled)
+        {
+            // rho's patch on a cyclic is a cyclic: snGrad(rho) there is deltaCoeffs*(rho_nbr - rho_own)
+            r.boundary.push_back(std::make_unique<CoupledCyclicPatchField<scalar>>(q));
+            continue;
+        }
+        const bool have = pi < rhoBnd.size() && rhoBnd[pi].size() == static_cast<std::size_t>(q.size);
+        if (!have)
+        {
+            throw std::runtime_error(
+                "brae interFoam: rho has no patch values on '" + q.name + "'. fvc::snGrad(rho) reads "
+                "them -- rho's patches are `calculated`, not zeroGradient -- and defaulting to the cell "
+                "value would zero a term that is 100% of the pressure source on an inflow patch.");
+        }
+        r.boundary.push_back(std::make_unique<FixedValuePatchField<scalar>>(q, false, scalar(0), rhoBnd[pi]));
+    }
+    if (evaluateEmpty)
+    {
+        r.evaluateBoundary();
+    }
+    else
+    {
+        r.evaluateBoundaryWhere(
+            [&](std::size_t pi)
+            {
+                return patches[pi].type != "empty";
+            });
+    }
+    return r;
+}
+
+void updateMixtureBoundary(
+    InterFields& f,
+    const std::vector<FvPatch>& patches,
+    MixturePatches which)
+{
+    f.rhoBnd.resize(patches.size());
+    f.muBnd.resize(patches.size());
+    f.nuBnd.resize(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const std::vector<scalar>& ab = f.alpha1.boundary[pi]->value();
+        const std::size_t n = ab.size();
+        f.rhoBnd[pi].resize(n);
+        f.muBnd[pi].resize(n);
+        f.nuBnd[pi].resize(n);
+        const bool isEmpty = patches[pi].type == "empty";
+        if ((which == MixturePatches::notEmpty && isEmpty) || (which == MixturePatches::emptyOnly && !isEmpty))
+        {
+            continue;
+        }
+        if (patches[pi].coupled)
+        {
+            // ON A COUPLED PATCH the blend is NOT formed from alpha's patch value. OpenFOAM v2412 ends
+            // every GeometricField operation with result.correctLocalBoundaryConditions()
+            // (GeometricFieldFunctionsM.C; `localConsistency`, on by default, etc/controlDict:225), which
+            // re-evaluates a constraint patch of the RESULT: coupledFvPatchField::evaluateLocal is
+            // evaluate(), w*pif + (1 - w)*pnf of the result's own cells. For rho, linear in alpha, that
+            // is the same number. For nu it is not: measured on RAS/damBreakPorousBaffle with the free
+            // surface across the baffle, on the one face whose two cells hold alpha 0.679 and 0.520,
+            // nu(alpha_b) against the two cells' nu interpolated is 4.5e-04 of nu -- and
+            // porousBafflePressure reads exactly that patch value. It put the jump 2.8e-08 out on that
+            // face after 60 steps and U 1.05e-09, where the same case with a plain cyclic held 3e-12;
+            // refitting OpenFOAM's own written jump from its own written alpha is exact to 5e-16 with
+            // the interpolated cells and 2.8e-08 out without.
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                const label k = static_cast<label>(i);
+                f.rhoBnd[pi][i] = coupledLinear(patches[pi], k, f.rho);
+                f.muBnd[pi][i] = coupledLinear(patches[pi], k, f.mu);
+                f.nuBnd[pi][i] = coupledLinear(patches[pi], k, f.nu);
+            }
+            continue;
+        }
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            // rho takes the RAW alpha and mu/nu the CLAMPED one, exactly as in the interior
+            // (two_phase_mixture_cpp.cuh) -- the split is a property of the model, not of where it is
+            // evaluated.
+            const scalar a  = ab[i];
+            const scalar ac = cpu::twoPhase::limitedAlpha(a);
+            const auto&  p  = f.mixture.phases;
+            const bool haveA2 = pi < f.alpha2Bnd.size() && i < f.alpha2Bnd[pi].size();
+            const scalar a2 = haveA2 ? f.alpha2Bnd[pi][i] : scalar(1) - a;
+            f.rhoBnd[pi][i] = a*p.rho1 + a2*p.rho2;
+            f.muBnd[pi][i]  = ac*p.rho1*p.nu1 + (scalar(1) - ac)*p.rho2*p.nu2;
+            f.nuBnd[pi][i]  = f.muBnd[pi][i] / (ac*p.rho1 + (scalar(1) - ac)*p.rho2);
+        }
+    }
+}
+
+// 1 - cos(angle between the cell-centre vector and the face normal), the largest over the internal
+// faces. Exactly 0 on a mesh of rectangles; boundary faces do not enter, because v2412's
+// fvPatch::delta() is already the patch-NORMAL part of Cf - Cn for every non-coupled patch.
+scalar maxNonOrthogonality(
+    const PrimitiveMesh& m,
+    const FvGeometry& g)
+{
+    scalar worst = 0;
+    for (label fi = 0; fi < m.nInternalFaces(); ++fi)
+    {
+        const vector d = g.C()[m.neighbour()[fi]] - g.C()[m.owner()[fi]];
+        const vector& S = g.Sf()[fi];
+        const scalar c = dot(d, S) / (mag(d) * g.magSf()[fi]);
+        worst = std::fmax(worst, scalar(1) - c);
+    }
+    return worst;
+}
+
+namespace {
+
+// fvSolution's `cache` block: whether the case caches grad(U). solution.C:56-60 reads the sub-dictionary
+// and `active` (default true); solution::cache(name) is then `cache_.found(name)` (solution.C:297-305).
+// The KEYS are read from the text, not through FoamDict, whose tokenizer splits `grad(U)` into `grad`
+// and `( U )`. brae carries the cache for grad(U) alone: any other entry of an active block would name a
+// field whose reuse brae does not model, so it is refused by name; a pattern key is refused because it
+// could match names brae cannot enumerate.
+bool readCacheGradU(const std::string& caseDir, const FoamDict& fvSolution)
+{
+    const FoamDict* c = fvSolution.subDict("cache");
+    const std::string all = readFileExpanded(caseDir + "/system/fvSolution");
+    std::string body;
+    bool found = false;
+    int depth = 0;
+    for (std::size_t i = 0; i < all.size(); ++i)
+    {
+        const char ch = all[i];
+        if (ch == '{') { ++depth; continue; }
+        if (ch == '}') { --depth; continue; }
+        if (depth != 0 || all.compare(i, 5, "cache") != 0) continue;
+        const bool startOk = (i == 0) || std::isspace(static_cast<unsigned char>(all[i - 1]))
+                          || all[i - 1] == ';' || all[i - 1] == '}';
+        std::size_t j = i + 5;
+        while (j < all.size() && std::isspace(static_cast<unsigned char>(all[j]))) ++j;
+        if (!startOk || j >= all.size() || all[j] != '{') continue;
+        const std::size_t close = all.find('}', j + 1);
+        const std::size_t nested = all.find('{', j + 1);
+        if (close == std::string::npos || (nested != std::string::npos && nested < close))
+            throw std::runtime_error(
+                "brae interFoam: fvSolution's `cache` block holds a sub-dictionary or is unterminated. "
+                "OpenFOAM's cache entries are keys; brae reads keys only.");
+        body = all.substr(j + 1, close - j - 1);
+        found = true;
+        break;
+    }
+    if (found != (c != nullptr))
+        throw std::runtime_error(
+            "brae interFoam: fvSolution's `cache` block was found by one reader and not the other; refusing "
+            "rather than guess whether the case caches grad(U).");
+    if (!found) return false;
+    const bool active = c->switchOr("active", true);
+    bool gradU = false;
+    std::size_t b = 0;
+    while (b < body.size())
+    {
+        std::size_t e = body.find(';', b);
+        if (e == std::string::npos) e = body.size();
+        std::istringstream st(body.substr(b, e - b));
+        b = e + 1;
+        std::string key;
+        if (!(st >> key)) continue;
+        if (key == "active") continue;
+        if (key == "grad(U)")
+        {
+            gradU = true;
+            continue;
+        }
+        if (!active) continue;
+        throw std::runtime_error(
+            "brae interFoam: fvSolution's `cache` names `" + key + "`. brae carries OpenFOAM's registry reuse "
+            "for grad(U) only (" + (key.front() == '"' ? std::string("a pattern key could match fields it does "
+            "not model") : std::string("that field's reuse is not ported")) + "); refused rather than run the "
+            "gradient uncached, which OpenFOAM does not.");
+    }
+    return active && gradU;
+}
+
+// fvSchemes' divSchemes entry for div(rhoPhi,U). The shipped tutorials ask for `Gauss linearUpwind
+// grad(U)` (24), `Gauss vanLeerV` (8), `Gauss upwind` (6), `Gauss linear` (3) and
+// `Gauss limitedLinear 0.2` (1). Anything else is refused by name rather than run as something
+// similar.
+DivScheme parseMomentumDiv(const std::string& entry, scalar& coeff)
+{
+    coeff = scalar(1);
+    std::vector<std::string> tok;
+    {
+        std::string cur;
+        for (char ch : entry)
+        {
+            if (std::isspace(static_cast<unsigned char>(ch))) { if (!cur.empty()) { tok.push_back(cur); cur.clear(); } }
+            else cur += ch;
+        }
+        if (!cur.empty()) tok.push_back(cur);
+    }
+    if (tok.empty() || tok[0] != "Gauss")
+        throw std::runtime_error(
+            "brae interFoam: `div(rhoPhi,U) " + entry + "` -- only `Gauss <scheme>` is ported.");
+    const std::string s = (tok.size() > 1) ? tok[1] : "";
+    if (s == "upwind")        return DivScheme::upwind;
+    if (s == "linear")        return DivScheme::linear;
+    // linearUpwind, linearUpwindV and LUST READ the name of their gradient (linearUpwind.H:95-104) and
+    // resolve it through gradSchemes and the registry under that name. brae's momentum takes grad(U)'s
+    // entry -- and, when fvSolution caches it, grad(U)'s registry field -- so any other name would be
+    // run as grad(U). All 25 shipped interFoam tutorials using the family write `grad(U)`.
+    if (s == "LUST" || s == "linearUpwind" || s == "linearUpwindV")
+    {
+        const std::string gradName = (tok.size() > 2) ? tok[2] : "";
+        if (gradName != "grad(U)")
+            throw std::runtime_error(
+                "brae interFoam: `div(rhoPhi,U) " + entry + "` names the gradient `" + gradName + "`. brae's "
+                "momentum takes grad(U)'s gradSchemes entry and registry field; another name is not ported.");
+    }
+    if (s == "LUST")          return DivScheme::LUST;
+    if (s == "linearUpwind")  return DivScheme::linearUpwind;
+    if (s == "linearUpwindV") return DivScheme::linearUpwindV;
+    if (s == "vanLeerV")      return DivScheme::vanLeerV;
+    if (s == "limitedLinearV")
+    {
+        // the same limiter, the same read: k with no default and 0 <= k <= 1 (limitedLinear.H:67-76). A
+        // missing one was 1 here.
+        if (tok.size() < 3)
+        {
+            throw std::runtime_error(
+                "brae interFoam: `div(rhoPhi,U) " + entry + "` names limitedLinearV with no coefficient; "
+                "OpenFOAM reads it with no default (limitedLinear.H:67).");
+        }
+        coeff = std::stod(tok[2]);
+        if (coeff < scalar(0) || coeff > scalar(1))
+        {
+            throw std::runtime_error(
+                "brae interFoam: `div(rhoPhi,U) " + entry + "` gives limitedLinearV a coefficient outside "
+                "[0, 1]; OpenFOAM stops on it (limitedLinear.H:69-75).");
+        }
+        return DivScheme::limitedLinearV;
+    }
+    if (s == "limitedLinear")
+    {
+        // limitedLinear.H:67-76: the coefficient is read with no default, and 0 <= k <= 1 or OpenFOAM
+        // stops. A missing one used to fall to 1 here.
+        if (tok.size() < 3)
+        {
+            throw std::runtime_error(
+                "brae interFoam: `div(rhoPhi,U) " + entry + "` names limitedLinear with no coefficient; "
+                "OpenFOAM reads it with no default (limitedLinear.H:67).");
+        }
+        coeff = std::stod(tok[2]);
+        if (coeff < scalar(0) || coeff > scalar(1))
+        {
+            throw std::runtime_error(
+                "brae interFoam: `div(rhoPhi,U) " + entry + "` gives limitedLinear a coefficient outside "
+                "[0, 1], which OpenFOAM refuses (limitedLinear.H:69-76).");
+        }
+        return DivScheme::limitedLinear;
+    }
+    throw std::runtime_error(
+        "brae interFoam: `div(rhoPhi,U) " + entry + "` is not ported. brae has upwind, linear, "
+        "linearUpwind, linearUpwindV, limitedLinearV, LUST and vanLeerV here.");
+}
+
+AlphaFluxScheme parseAlphaDiv(const std::string& entry, const char* key)
+{
+    const std::string e = entry;
+    // `Gauss interfaceCompression vanLeer 1` is NOT the PhiScheme `Gauss interfaceCompression`: it is the
+    // run-time selectable limited scheme of interfaceCompression.H (interfaceCompressionNew), vanLeer
+    // with a compression coefficient. Matching by substring read it as plain vanLeer and ran it without
+    // a word -- found while writing a refusal arm for the cyclic baffle. No shipped interFoam tutorial
+    // names it; refused, by name.
+    {
+        const std::size_t at = e.find("interfaceCompression");
+        if (at != std::string::npos)
+        {
+            std::string rest = e.substr(at + std::string("interfaceCompression").size());
+            while (!rest.empty() && (rest.back() == ';' || rest.back() == ' ' || rest.back() == '\t')) rest.pop_back();
+            while (!rest.empty() && (rest.front() == ' ' || rest.front() == '\t')) rest.erase(rest.begin());
+            if (!rest.empty())
+                throw std::runtime_error(
+                    std::string("brae interFoam: `") + key + " " + entry + "` is interfaceCompression.H's "
+                    "limited scheme with a compression coefficient (`" + rest + "`), not the PhiScheme "
+                    "`Gauss interfaceCompression`. It is not ported.");
+        }
+    }
+    // WHOLE WORDS, IN THEIR PLACES: `Gauss <scheme>` and nothing after it. This matched by substring, in
+    // the order vanLeer, upwind, interfaceCompression, linear -- so `Gauss linearUpwind grad(alpha)` ran as
+    // central linear (the capital U misses `upwind`), `Gauss vanLeer01` and `Gauss limitedVanLeer 0 1` as
+    // vanLeer, `Gauss localBlended linear upwind` as upwind, each with nothing said. Every shipped tutorial
+    // writes one of the four forms below.
+    std::vector<std::string> tok;
+    {
+        std::istringstream in(e);
+        for (std::string w; in >> w;)
+        {
+            tok.push_back(w);
+        }
+    }
+    if (tok.size() == 2 && tok[0] == "Gauss")
+    {
+        if (tok[1] == "vanLeer")
+        {
+            return AlphaFluxScheme::vanLeer;
+        }
+        if (tok[1] == "upwind")
+        {
+            return AlphaFluxScheme::upwind;
+        }
+        if (tok[1] == "interfaceCompression")
+        {
+            return AlphaFluxScheme::interfaceCompression;   // the host's; the device refuses it
+        }
+        if (tok[1] == "linear")
+        {
+            return AlphaFluxScheme::linear;
+        }
+    }
+    throw std::runtime_error(
+        std::string("brae interFoam: `") + key + " " + entry + "` is not ported. brae has `Gauss vanLeer`, "
+        "`Gauss upwind`, `Gauss linear` and the PhiScheme `Gauss interfaceCompression` here.");
+}
+
+AlphaDdt parseAlphaDdt(const std::string& entry)
+{
+    // by the FIRST word, exactly: `bounded Euler` contains the word Euler and is not Euler
+    const std::string w = entry.substr(0, entry.find_first_of(" \t"));
+    if (w == "CrankNicolson") return AlphaDdt::CrankNicolson;
+    if (w == "localEuler")    return AlphaDdt::localEuler;
+    if (w == "Euler")         return AlphaDdt::Euler;
+    return AlphaDdt::other;                              // refused by offCentringCoeff, by name
+}
+
+// WHAT A CASE CAN ASK FOR THAT interFoam.C HONOURS AND brae DOES NOT EVEN READ. Every one of these ran
+// to completion without a word until brae was run over all 44 shipped tutorials and the ones that
+// reached `End:` were counted: laminar/damBreakWithObstacle and laminar/oscillatingBox both did, and
+// both ask for `dynamicRefineFvMesh` -- adaptive refinement driven by alpha. Seventeen more tutorials
+// carry a moving mesh and were only stopped because they hit some OTHER refusal first. braeInterFoam.cu's
+// own header listed MRF and fvOptions as refused; nothing refused them.
+//
+// The rule for each is OpenFOAM's own, read from the source named beside it, because a refusal that
+// fires on a case OpenFOAM would run as a static, source-free one is a defect too.
+void refuseUnportedCaseInputs(
+    const std::string& caseDir,
+    const FoamDict& controlDict)
+{
+    // constant/dynamicMeshDict is read by DynamicMotionSolverFvMesh::New in buildInterFields, which
+    // refuses by name every motion that is not the rigid motion of the whole mesh.
+
+    // constant/MRFProperties is read in buildInterFields (createMRF.H), which ports it and refuses by
+    // name what no gate holds: MRF under a moving mesh, under RAS, and beside a fixedFluxPressure patch.
+
+    // fvOptions are read in buildInterFields (createFvOptions.H), which ports explicitPorositySource /
+    // DarcyForchheimer and refuses every other active option by name.
+
+    // A function object does not normally touch the solution, and brae runs none. TWO THINGS REACH THE
+    // CLOCK through Time::adjustDeltaT's last statement, functionObjects_.adjustTimeStep() (Time.C:142):
+    // an object's own adjustTimeStep -- setTimeStep and setTimeStepFaRegion are the two that define one, and
+    // they OVERRIDE the deltaT the Courant number chose: refused here -- and an object's write times under
+    // `writeControl adjustableRunTime`, which trim it: ported (WriteCadence::functionObjects).
+    if (const FoamDict* fns = controlDict.subDict("functions"))
+    {
+        for (const auto& fo : fns->subs)
+        {
+            const std::string type = fo.second.wordOr("type", "");
+            if (type == "setTimeStep" || type == "setTimeStepFaRegion")
+            {
+                throw std::runtime_error(
+                    "brae interFoam: controlDict's function object `" + fo.first + "` is a "
+                    + type + ". It overrides deltaT from inside Time::adjustDeltaT, and brae runs no "
+                    "function objects.");
+            }
+        }
+    }
+}
+
+NonOrthScheme readNonOrthScheme(
+    const std::string& fvSchemesText,
+    const std::string& block)
+{
+    const std::string blk = fvSchemesBlock(fvSchemesText, block);
+    const std::size_t q = blk.find("default");
+    if (blk.empty() || q == std::string::npos)
+        throw std::runtime_error(
+            "brae interFoam: fvSchemes `" + block + "` has no `default`. interFoam takes every "
+            "laplacian and snGrad through it; OpenFOAM stops on a case without one.");
+    const std::size_t e = blk.find(';', q);
+    NonOrthScheme s;
+    s.raw = blk.substr(q + 7, e == std::string::npos ? std::string::npos : e - q - 7);
+    const std::size_t b = s.raw.find_first_not_of(" \t\n\r");
+    s.raw = (b == std::string::npos) ? std::string() : s.raw.substr(b);
+    // one entry's words, single-spaced: what two entries are compared by
+    const auto words = [](const std::string& text)
+    {
+        std::istringstream in(text);
+        std::string out;
+        for (std::string w; in >> w;)
+        {
+            out += (out.empty() ? "" : " ") + w;
+        }
+        return out;
+    };
+    // THE DIFFUSIVITY'S INTERPOLATION, the word after `Gauss` in a laplacian entry
+    // (laplacianScheme.H:121-141): both loops interpolate rho*nuEff, rAU and the closure's diffusivities
+    // linearly and never looked at it, so `Gauss harmonic corrected` ran linear.
+    if (block == "laplacianSchemes")
+    {
+        std::istringstream in(s.raw);
+        std::string gauss;
+        std::string interpolation;
+        in >> gauss >> interpolation;
+        if (gauss != "Gauss" || interpolation != "linear")
+        {
+            throw std::runtime_error(
+                "brae interFoam: fvSchemes `laplacianSchemes` default is `" + words(s.raw) + "`. The loops "
+                "take `Gauss linear <snGrad scheme>`: the diffusivity is interpolated linearly "
+                "(laplacianScheme.H:121-141 reads that word); another interpolation is not ported.");
+        }
+    }
+    // A NAMED ENTRY for one of interFoam's own fields that says something else than the default. OpenFOAM
+    // resolves laplacian(<gamma>,<field>) and snGrad(<field>) by name first (fvmLaplacian.C:252, :285;
+    // schemesLookupDetail.C:76-89); this reader takes the default for every one. An entry that repeats the
+    // default changes nothing and runs; so does one for a field the loops do not have (RAS/
+    // electrostaticDeposition names its function object's electricPotential:V).
+    {
+        // fvSchemesBlock hands the block from its opening brace on
+        std::size_t at = (!blk.empty() && blk[0] == '{') ? 1 : 0;
+        while (at < blk.size())
+        {
+            const std::size_t semi = blk.find(';', at);
+            if (semi == std::string::npos)
+            {
+                break;
+            }
+            std::istringstream in(blk.substr(at, semi - at));
+            at = semi + 1;
+            std::string key;
+            in >> key;
+            std::string rest;
+            std::getline(in, rest, '\0');
+            if (key.empty() || key == "default" || words(rest) == words(s.raw))
+            {
+                continue;
+            }
+            // the field: the last argument inside the key's parentheses
+            const std::size_t close = key.rfind(')');
+            const std::size_t open = key.find_last_of("(,", close == std::string::npos ? close : close - 1);
+            const std::string field = (close == std::string::npos || open == std::string::npos)
+                                    ? key : key.substr(open + 1, close - open - 1);
+            static const char* const own[] = {"p_rgh", "pcorr", "U", "k", "epsilon", "omega", "rho",
+                                              "cellDisplacement"};
+            bool ours = field.compare(0, 6, "alpha.") == 0;
+            for (const char* name : own)
+            {
+                ours = ours || field == name;
+            }
+            if (ours)
+            {
+                throw std::runtime_error(
+                    "brae interFoam: fvSchemes `" + block + "` names `" + key + " " + words(rest) + ";` beside "
+                    "a default of `" + words(s.raw) + "`. OpenFOAM takes the named entry for that term; the "
+                    "loops take the default for every one. Refused rather than run the default under its name.");
+            }
+        }
+    }
+    if (schemeHasWord(s.raw, "limited"))
+    {
+        // `limited <c>` and `limited corrected <c>` are the same scheme (limitedSnGrad.H:98-124):
+        // 1 is fully corrected, 0 is uncorrected.
+        double c = -1;
+        const char* at = s.raw.c_str() + s.raw.find("limited") + 7;
+        while (*at && !(std::isdigit(static_cast<unsigned char>(*at)) || *at == '.'))
+        {
+            ++at;
+        }
+        if (std::sscanf(at, "%lf", &c) != 1 || c < 0 || c > 1)
+            throw std::runtime_error(
+                "brae interFoam: fvSchemes `" + block + "` default is `" + s.raw + "`, a limited "
+                "scheme with no coefficient in [0,1].");
+        s.corrected = (c > 0);
+        s.limitCoeff = (c < 1) ? static_cast<scalar>(c) : scalar(0);
+        // limitedSnGrad wraps correctedSnGrad, so the COEFFICIENTS are nonOrthDeltaCoeffs whatever the
+        // limiter is -- including at 0, where the correction vanishes and the scheme IS `uncorrected`.
+        s.nonOrthCoeffs = true;
+        return s;
+    }
+    if (schemeHasWord(s.raw, "corrected"))
+    {
+        s.corrected = true;
+        s.nonOrthCoeffs = true;
+        return s;
+    }
+    // `uncorrected` TAKES nonOrthDeltaCoeffs -- it is corrected's coefficients without the correction
+    // flux (uncorrectedSnGrad.H:113-124). Only `orthogonal` takes deltaCoeffs. These two used to share
+    // this line, so brae ran orthogonal under both names.
+    if (schemeHasWord(s.raw, "uncorrected"))
+    {
+        s.nonOrthCoeffs = true;
+        return s;
+    }
+    if (schemeHasWord(s.raw, "orthogonal")) return s;
+    throw std::runtime_error(
+        "brae interFoam: fvSchemes `" + block + "` default is `" + s.raw + "`, which names none of "
+        "corrected, uncorrected, orthogonal or limited.");
+}
+
+
+
+// gradSchemes. Every entry must be one of the four shapes the host operators take -- `Gauss linear`,
+// `leastSquares`, or `cellLimited` over either -- and each gradient interFoam takes is resolved by the
+// name OpenFOAM asks for (InterFields::gradU, gradAlpha1/2, gradPrgh, gradPcorr, gradRho; the interface
+// normal's `nHat`), then `default`. Any other shape (cellMDLimited, faceLimited, pointCellsLeastSquares,
+// fourth, ...) is refused, because a gradient the case asks for and brae does not take is a different
+// discretisation that converges.
+// interpolationSchemes. interFoam NEVER READ THIS BLOCK -- zero references anywhere in its tree -- so
+// brae interpolated `linear` whatever the case named, with no throw and no notice. All 44 shipped
+// tutorials happen to say `linear`, which is why nothing ever showed; a case asking for `cubic`,
+// `midPoint`, `pointLinear` or a limited interpolation would have run a different scheme silently.
+// That is the defect class this project keeps finding, so it is a refusal and not a notice.
+// OpenFOAM's `fvc::interpolate` looks the entry up per field and falls back to `default`
+// (surfaceInterpolationScheme::New); brae implements `linear` alone.
+void refuseUnportedInterpolationSchemes(const std::string& fvSchemesText)
+{
+    const std::string blk = fvSchemesBlock(fvSchemesText, "interpolationSchemes");
+    if (blk.empty()) return;                    // absent is fine: OpenFOAM's own default is linear
+    std::istringstream is(blk);
+    std::string line;
+    while (std::getline(is, line))
+    {
+        // strip a trailing comment and the ';'
+        const std::size_t c = line.find("//");
+        if (c != std::string::npos) line = line.substr(0, c);
+        std::istringstream ls(line);
+        std::string key;
+        if (!(ls >> key)) continue;
+        if (key == "{" || key == "}" || key == "interpolationSchemes") continue;
+        std::string rest;
+        std::getline(ls, rest);
+        // the scheme is everything after the key, minus the semicolon and surrounding space
+        std::string sch;
+        for (char ch : rest) { if (ch != ';') sch += ch; }
+        const std::size_t b = sch.find_first_not_of(" \t");
+        const std::size_t e = sch.find_last_not_of(" \t");
+        if (b == std::string::npos) continue;
+        sch = sch.substr(b, e - b + 1);
+        if (sch.empty() || sch == "linear") continue;
+        throw std::runtime_error(
+            "brae interFoam: fvSchemes `interpolationSchemes` names `" + key + " " + sch
+            + "`. interFoam interpolates `linear` and nothing else; running this case would apply a "
+              "different interpolation from the one it asks for, silently. Refusing rather than "
+              "substituting.");
+    }
+}
+
+void refuseUnportedGradSchemes(const std::string& fvSchemesText)
+{
+    const std::string blk = fvSchemesBlock(fvSchemesText, "gradSchemes");
+    if (blk.empty())
+        throw std::runtime_error("brae interFoam: fvSchemes has no gradSchemes block.");
+    // every `key scheme;` line of the block
+    std::size_t at = 0;
+    while (true)
+    {
+        const std::size_t e = blk.find(';', at);
+        if (e == std::string::npos) break;
+        std::string line = blk.substr(at, e - at);
+        at = e + 1;
+        const std::size_t b = line.find_first_not_of(" \t\n\r{");
+        if (b == std::string::npos) continue;
+        line = line.substr(b);
+        const std::size_t sp = line.find_first_of(" \t");
+        if (sp == std::string::npos) continue;
+        const std::string key = line.substr(0, sp);
+        std::string scheme = line.substr(sp);
+        const std::size_t sb = scheme.find_first_not_of(" \t\n\r");
+        scheme = (sb == std::string::npos) ? std::string() : scheme.substr(sb);
+        while (!scheme.empty() && std::isspace(static_cast<unsigned char>(scheme.back())))
+        {
+            scheme.pop_back();
+        }
+        std::string collapsed;
+        for (char ch : scheme)
+        {
+            if (std::isspace(static_cast<unsigned char>(ch)))
+            {
+                if (!collapsed.empty() && collapsed.back() != ' ')
+                {
+                    collapsed += ' ';
+                }
+            }
+            else
+            {
+                collapsed += ch;
+            }
+        }
+        std::string base = collapsed;
+        if (base.rfind("cellLimited ", 0) == 0)
+        {
+            // `cellLimited <base> <k>`: the coefficient is the last token
+            base = base.substr(12);
+            const std::size_t lastSp = base.find_last_of(' ');
+            const std::string k = (lastSp == std::string::npos) ? std::string() : base.substr(lastSp + 1);
+            char* end = nullptr;
+            std::strtod(k.c_str(), &end);
+            base = (!k.empty() && end && *end == '\0') ? base.substr(0, lastSp) : std::string("?");
+        }
+        if (base != "Gauss linear" && base != "leastSquares")
+        {
+            throw std::runtime_error(
+                "brae interFoam: fvSchemes gradSchemes `" + key + " " + collapsed + "` is not ported. "
+                "The host operators take `Gauss linear`, `leastSquares`, and `cellLimited` over either; "
+                "another scheme or limiter is a different discretisation.");
+        }
+    }
+}
+
+
+// THE PRESSURE REFERENCE OF A CLOSED CASE -- see InterFields::PressureReference.
+//
+// setRefCell (findRefCell.C:36-110): needReference() is "no patch fixes a value"; then `pRefCell`,
+// else `pRefPoint` located with mesh.findCell(point, FACE_PLANES) -- the nearest cell centre if the
+// point is inside that cell by every face plane, else the FIRST cell in index order that is -- and
+// `pRefValue`, all mandatory. OpenFOAM falls back to an octree search with the cells decomposed
+// into tets when the plane test finds no cell; that fallback is refused here by name.
+InterFields::PressureReference readPressureReference(
+    const GeometricField<scalar>& p_rgh,
+    const FoamDict& fvSolution,
+    const PrimitiveMesh& m,
+    const FvGeometry& g)
+{
+    InterFields::PressureReference r;
+    r.needReference = true;
+    for (const auto& pf : p_rgh.boundary)
+    {
+        if (pf->fixesValue())
+        {
+            r.needReference = false;
+            break;
+        }
+    }
+    if (!r.needReference) return r;
+
+    const FoamDict* pim = fvSolution.subDict("PIMPLE");
+    if (!pim)
+    {
+        throw std::runtime_error("brae interFoam: fvSolution has no PIMPLE block for the pressure reference.");
+    }
+    if (pim->found("pRefCell"))
+    {
+        r.pRefCell = static_cast<label>(pim->scalarOr("pRefCell", scalar(-1)));
+        if (r.pRefCell < 0 || r.pRefCell >= m.nCells())
+        {
+            throw std::runtime_error(
+                "brae interFoam: PIMPLE's pRefCell " + std::to_string(r.pRefCell) + " is outside the mesh's "
+                + std::to_string(m.nCells()) + " cells. OpenFOAM stops on the same condition.");
+        }
+    }
+    else if (pim->found("pRefPoint"))
+    {
+        const std::vector<scalar> pv = pim->scalarListOr("pRefPoint", {});
+        if (pv.size() != 3)
+        {
+            throw std::runtime_error("brae interFoam: PIMPLE's pRefPoint is not a point.");
+        }
+        const vector refPoint{pv[0], pv[1], pv[2]};
+        // cell -> faces, for primitiveMesh::pointInCell
+        std::vector<std::vector<label>> cellFaces(static_cast<std::size_t>(m.nCells()));
+        for (label f = 0; f < m.nFaces(); ++f)
+        {
+            cellFaces[static_cast<std::size_t>(m.owner()[f])].push_back(f);
+            if (f < m.nInternalFaces())
+            {
+                cellFaces[static_cast<std::size_t>(m.neighbour()[f])].push_back(f);
+            }
+        }
+        auto pointInCell = [&](label celli)
+        {
+            for (const label nFace : cellFaces[static_cast<std::size_t>(celli)])
+            {
+                const vector proj = refPoint - g.Cf()[nFace];
+                vector normal = g.Sf()[nFace];
+                if (m.owner()[nFace] != celli)
+                {
+                    normal = scalar(-1)*normal;
+                }
+                if (dot(normal, proj) > 0) return false;
+            }
+            return true;
+        };
+        // primitiveMesh::findNearestCell: the first of the nearest centres
+        label nearest = 0;
+        scalar minProximity = magSqr(g.C()[0] - refPoint);
+        for (label celli = 1; celli < m.nCells(); ++celli)
+        {
+            const scalar proximity = magSqr(g.C()[celli] - refPoint);
+            if (proximity < minProximity)
+            {
+                nearest = celli;
+                minProximity = proximity;
+            }
+        }
+        r.pRefCell = -1;
+        if (pointInCell(nearest))
+        {
+            r.pRefCell = nearest;
+        }
+        else
+        {
+            for (label celli = 0; celli < m.nCells(); ++celli)
+            {
+                if (pointInCell(celli))
+                {
+                    r.pRefCell = celli;
+                    break;
+                }
+            }
+        }
+        if (r.pRefCell < 0)
+        {
+            throw std::runtime_error(
+                "brae interFoam: PIMPLE's pRefPoint lies in no cell by the face-plane test. OpenFOAM then "
+                "searches again with an octree over the cells' tet decomposition (polyMesh::findCell, "
+                "CELL_TETS), which is not ported.");
+        }
+    }
+    else
+    {
+        throw std::runtime_error(
+            "brae interFoam: p_rgh fixes its value on no patch, so it needs a reference, and PIMPLE names "
+            "neither pRefCell nor pRefPoint. OpenFOAM stops on the same condition (findRefCell.C:91).");
+    }
+    if (!pim->found("pRefValue"))
+    {
+        throw std::runtime_error(
+            "brae interFoam: p_rgh needs a reference and PIMPLE names no pRefValue. OpenFOAM reads it "
+            "with a mandatory lookup (findRefCell.C:100).");
+    }
+    r.pRefValue = pim->scalarOr("pRefValue", scalar(0));
+    return r;
+}
+
+// ONE `solver GAMG;` ENTRY. Everything GAMGSolver::readControls and GAMGAgglomeration read from it,
+// and a refusal for each control whose branch is not ported -- by name, because every one of them
+// changes where the solve stops and none of them changes a converged field.
+// pressureInletOutletVelocity's `tangentialVelocity`, CLAIMED on this reader's own copy of U's file
+// data, as the wave conditions are: the shared factory refuses the entry for every solver, and interFoam
+// takes it off the entry here, lets the factory build the patch, and hands the vectors to the built patch
+// field (setTangentialVelocity), which projects them onto the start-time normals once, as OpenFOAM's
+// dictionary constructor does (pressureInletOutletVelocityFvPatchVectorField.C:86-92, :130-136).
+struct ClaimedTangentialVelocity
+{
+    std::size_t         pi = 0;
+    std::vector<vector> tv;
+};
+
+std::vector<ClaimedTangentialVelocity> claimTangentialVelocity(
+    FieldData<vector>&          UData,
+    const std::vector<FvPatch>& patches,
+    const std::string&          caseDir)
+{
+    std::vector<ClaimedTangentialVelocity> claims;
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const PatchFieldData<vector>* entry = findPatchEntry(UData, patches[pi]);
+        if (!entry || entry->type != "pressureInletOutletVelocity" || !entry->hasTangentialVelocity)
+        {
+            continue;
+        }
+        // dynamicRefineFvMesh maps a patch field through autoMap; this class does not map the refValue
+        // or the tangentialVelocity, so the combination is refused before the first step rather than at
+        // the first refinement
+        if (caseAsksForAdaptiveMesh(caseDir))
+        {
+            throw std::runtime_error(
+                "brae interFoam: patch " + patches[pi].name + " is pressureInletOutletVelocity with a "
+                "`tangentialVelocity`, and the mesh refines: mapping its refValue and tangentialVelocity "
+                "through a topology change (.C:139-167) is not ported.");
+        }
+        ClaimedTangentialVelocity c;
+        c.pi = pi;
+        const std::size_t n = static_cast<std::size_t>(patches[pi].size);
+        // Field::assign reads nothing for a patch with no faces (Field.C:216, `if (len)`), so neither
+        // the entry's form nor its length can stop OpenFOAM there; the refValue it would make is empty
+        if (n == 0)
+        {
+            continue;
+        }
+        if (entry->tvUnparsed)
+        {
+            throw std::runtime_error(
+                "brae interFoam: patch " + patches[pi].name + " writes `tangentialVelocity` before its "
+                "`type`, and brae's reader parses the entry only once it knows the patch is "
+                "pressureInletOutletVelocity. Write `type` first.");
+        }
+        if (entry->tvBare)
+        {
+            throw std::runtime_error(
+                "brae interFoam: patch " + patches[pi].name + " writes `tangentialVelocity` without "
+                "`uniform` or `nonuniform`; OpenFOAM reads it as a vectorField and stops there "
+                "(Field.C:254-259).");
+        }
+        if (entry->tvUniform)
+        {
+            c.tv.assign(n, entry->tvUniformValue);
+        }
+        else
+        {
+            // vectorField(name, dict, p.size()) -- a list of another length is a FatalIOError (Field.C)
+            if (entry->tvValues.size() != n)
+            {
+                throw std::runtime_error(
+                    "brae interFoam: patch " + patches[pi].name + ": tangentialVelocity has "
+                    + std::to_string(entry->tvValues.size()) + " values for " + std::to_string(n)
+                    + " faces.");
+            }
+            c.tv = entry->tvValues;
+        }
+        claims.push_back(std::move(c));
+    }
+    for (PatchFieldData<vector>& b : UData.boundary)
+    {
+        if (b.type == "pressureInletOutletVelocity")
+        {
+            b.hasTangentialVelocity = false;
+        }
+    }
+    return claims;
+}
+
+
+}   // namespace
+
+
+InterFields buildInterFields(const std::string&          caseDir,
+                             const std::string&          startDir,
+                             const PrimitiveMesh&        m,
+                             const FvGeometry&           g,
+                             const std::vector<FvPatch>& patches)
+{
+    InterFields f;
+    const label nC = m.nCells();
+
+    // THIS SOLVER HONOURS Cmu/kappa/E PER PATCH on both closures -- kEpsilon has since its port
+    // (kEpsilon_cpp.cu:443, :912) and kOmegaSST does now -- so the reader must not announce those entries
+    // as unhonoured. The flag was set by rhoSimpleFoam alone, so every interFoam case printed a notice
+    // saying brae applies a model-wide value where it does not. A patch `beta1` IS still model-wide on
+    // the DEVICE arm, and that is a refusal there rather than a notice here.
+    brae::perPatchWallCoeffsHonoured() = true;
+
+    // --- the dictionaries ---------------------------------------------------------------------
+    const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
+    refuseUnportedCaseInputs(caseDir, controlDict);
+    const FoamDict fvSolution  = readDict(caseDir + "/system/fvSolution");
+    const FoamDict fvSchemes   = readDict(caseDir + "/system/fvSchemes");
+
+    f.mixture   = cpu::twoPhase::readTransportProperties(caseDir);
+    // 1: the alpha field's NAME comes from `phases (water air)`, not from a convention.
+    f.alphaName = "alpha." + f.mixture.phase1Name;
+    f.interface = interfaceProps::readInterfaceCoeffs(fvSolution, f.alphaName, f.mixture.sigma);
+    // ...and interfaceProperties' CONSTRUCTOR value of deltaN, taken here because here is where the
+    // object is constructed, off the mesh as it stands before any motion (interfaceProperties.C:190)
+    f.interface.deltaN = interfaceProps::deltaN(g.V());
+    f.alphaCtl  = readAlphaControls(fvSolution, f.alphaName);
+    // THE ISOTROPIC AND THE SHEAR COMPRESSION, alphaEqn.H:61-73: `icAlpha > 0` blends phic with
+    // cAlpha*icAlpha*interpolate(mag(U)) and `scAlpha > 0` adds scAlpha*mag(delta() & interpolate(symm(grad(U)))).
+    // NEITHER LOOP FORMS THEM. The GPU loop refused them saying the host loop carries both; the host loop's
+    // alpha step has the two terms and is handed neither face field (alpha_eqn_cpp.cu's call passes none), so
+    // it stopped in its first alpha step. Refused here, for both, by name. No shipped tutorial sets either.
+    if (f.alphaCtl.icAlpha > scalar(0) || f.alphaCtl.scAlpha > scalar(0))
+    {
+        throw std::runtime_error(
+            "brae interFoam: fvSolution sets icAlpha " + std::to_string((double)f.alphaCtl.icAlpha)
+            + " and scAlpha " + std::to_string((double)f.alphaCtl.scAlpha) + ". The isotropic and the shear "
+            "compression of alphaEqn.H:61-73 are not ported, on either loop; the standard interface "
+            "compression (cAlpha) is.");
+    }
+    f.mulesCtl  = f.alphaCtl.MULESCorr ? MULES::readControlsCorr(fvSolution, f.alphaName)
+                                       : MULES::readControls(fvSolution, f.alphaName);
+    f.writeCadence = WriteCadence::read(controlDict);
+    for (const FunctionObjectCadence& fo : f.writeCadence.functionObjects)
+    {
+        // said per object: the step is the solution's, and this is the one thing of a function object brae keeps
+        std::printf("  time step: the write times of function object `%s`, every %g, trim the step as "
+                    "OpenFOAM's Time::adjustDeltaT does; the object itself is not run\n",
+                    fo.name.c_str(), (double)fo.writeInterval);
+    }
+    f.deltaT    = controlDict.scalarOr("deltaT", scalar(1e-3));
+
+    {
+        // fvSchemes' KEYS CONTAIN PARENTHESES AND COMMAS -- `div(rhoPhi,U)` is one token to OpenFOAM
+        // and several to a dictionary tokenizer, so FoamDict cannot look them up. brae already reads
+        // them as TEXT, scoped to the block (scheme_parse.cuh's fvSchemesBlock), and this uses the
+        // same route rather than a second one that would parse the same file differently.
+        const std::string all = readFvSchemesText(caseDir);
+        std::string div = fvSchemesBlock(all, "divSchemes");
+        if (div.empty())
+            throw std::runtime_error("brae interFoam: fvSchemes has no divSchemes block.");
+        auto entry = [&](const std::string& key, const std::string& dflt)
+        {
+            const std::size_t k = div.find(key);
+            if (k == std::string::npos) return dflt;
+            const std::size_t e = div.find(';', k);
+            std::string st = div.substr(k + key.size(),
+                                        e == std::string::npos ? std::string::npos : e - k - key.size());
+            // trim
+            std::size_t b = st.find_first_not_of(" \t\n\r");
+            std::size_t f2 = st.find_last_not_of(" \t\n\r");
+            return (b == std::string::npos) ? dflt : st.substr(b, f2 - b + 1);
+        };
+        const std::string uEntry = entry("div(rhoPhi,U)", "");
+        if (uEntry.empty())
+            throw std::runtime_error(
+                "brae interFoam: fvSchemes names no `div(rhoPhi,U)`. interFoam's momentum convection "
+                "has no default to fall back to -- every shipped tutorial names one.");
+        f.divRhoPhiU   = parseMomentumDiv(uEntry, f.divRhoPhiUCoeff);
+        // THE TWO alpha FLUX SCHEMES, each by its own name, else the block's `default`, else nothing:
+        // alphaEqn.H:2-3 hands the names to fvc::flux, which asks mesh.divScheme(name), and
+        // schemesLookupDetail.C:76-89 answers the named entry, then a default that is not `none`, then a
+        // FatalIOError. A missing entry took `Gauss vanLeer` / `Gauss linear` here whatever the block
+        // said -- vanLeer under `default Gauss linear;`, and a run where OpenFOAM stops under `default none;`.
+        auto alphaEntry = [&](const std::string& key)
+        {
+            const std::string own = entry(key, "");
+            if (!own.empty())
+            {
+                return own;
+            }
+            const std::string dflt = entry("default", "");
+            if (dflt.empty() || dflt == "none")
+            {
+                throw std::runtime_error(
+                    "brae interFoam: fvSchemes' divSchemes names no `" + key + "` and has no default to take "
+                    "its place. alphaEqn.H asks for that name and OpenFOAM stops without it "
+                    "(schemesLookupDetail.C:76-89); a key written as a pattern is not resolved here.");
+            }
+            return dflt;
+        };
+        f.divPhiAlpha = parseAlphaDiv(alphaEntry("div(phi,alpha)"), "div(phi,alpha)");
+        f.divPhirbAlpha = parseAlphaDiv(alphaEntry("div(phirb,alpha)"), "div(phirb,alpha)");
+        // THE EXPLICIT HALF OF THE VISCOUS STRESS, fvc::div((rho*nuEff)*dev2(T(grad(U))))
+        // (linearViscousStress.C:130), is a divergence OpenFOAM looks a scheme up for -- the entry every
+        // tutorial writes as `div(((rho*nuEff)*dev2(T(grad(U))))) Gauss linear;` -- then the block's default,
+        // then it stops. Both loops form it Gauss linear and never read the entry. Found here by what the
+        // key holds, `dev2(T(grad(U)))`, since the factor in front of it is the model's.
+        {
+            const std::string stressKey = "dev2(T(grad(U)))";
+            std::string scheme;
+            const std::size_t k = div.find(stressKey);
+            if (k != std::string::npos)
+            {
+                const std::size_t keyEnd = div.find_first_of(" \t\n\r", k);
+                const std::size_t e = div.find(';', k);
+                if (keyEnd != std::string::npos && e != std::string::npos && keyEnd < e)
+                {
+                    scheme = div.substr(keyEnd, e - keyEnd);
+                }
+            }
+            else
+            {
+                scheme = entry("default", "");
+            }
+            std::vector<std::string> tok;
+            {
+                std::istringstream in(scheme);
+                for (std::string w; in >> w;)
+                {
+                    tok.push_back(w);
+                }
+            }
+            if (tok.empty() || (tok.size() == 1 && tok[0] == "none"))
+            {
+                throw std::runtime_error(
+                    "brae interFoam: fvSchemes' divSchemes names no entry for the viscous stress's explicit "
+                    "half, `div(((rho*nuEff)*dev2(T(grad(U)))))`, and has no default to take its place; "
+                    "OpenFOAM looks one up (linearViscousStress.C:130) and stops without it.");
+            }
+            if (tok.size() != 2 || tok[0] != "Gauss" || tok[1] != "linear")
+            {
+                throw std::runtime_error(
+                    "brae interFoam: fvSchemes gives the viscous stress's explicit half, `div(((rho*nuEff)*"
+                    "dev2(T(grad(U)))))`, the scheme `" + scheme.substr(scheme.find_first_not_of(" \t\n\r"))
+                    + "`. Both loops form it `Gauss linear`; another scheme is not ported.");
+            }
+        }
+
+        // EACH ddt BY THE NAME ITS CALL SITE ASKS FOR (ddtSchemeFor, schemesLookupDetail.C): OpenFOAM has no
+        // "U scheme". fvm::ddt(rho, U) in UEqn.H looks up `ddt(rho,U)` (fvmDdt.C:83); fvc::ddtCorr(U, phi, Uf)
+        // in pEqn.H and fvc::meshPhi(U) look up `ddt(U)` (fvcDdt.C:180, fvcMeshPhi.C:43); alphaEqn.H asks for
+        // the literal `ddt(alpha)`; the closure's are resolved after it is read, below. brae read `default`
+        // alone for every one of them, by a text search of the block, so a case writing
+        // `ddt(rho,U) CrankNicolson 0.5;` beside `default Euler;` ran its momentum as Euler with nothing said
+        // -- MEASURED, it reached End: -- and a missing default was read as Euler where OpenFOAM stops.
+        const std::string ddtRhoU = ddtSchemeFor(caseDir, "ddt(rho,U)");
+        const std::string ddtUCorr = ddtSchemeFor(caseDir, "ddt(U)");
+        // brae carries ONE time scheme for U, and its CrankNicolson state -- the ddt0 levels, the off-centred
+        // mesh flux -- is built on it, so the momentum and ddtCorr/meshPhi must resolve to the same entry.
+        // OpenFOAM would run a split as two schemes; that is refused here, on both arms, rather than run as one.
+        if (ddtRhoU != ddtUCorr)
+            throw std::runtime_error(
+                "brae interFoam: ddtSchemes resolves `ddt(rho,U)` (the momentum matrix, UEqn.H) to `" + ddtRhoU
+                + "` and `ddt(U)` (ddtCorr and the mesh flux, pEqn.H) to `" + ddtUCorr + "`. brae carries one "
+                "time scheme for U; refusing rather than running both under the first.");
+        // the scheme by its FIRST word, exactly -- `bounded Euler` used to read as Euler because the text
+        // contained the word, and `bounded` is not ported
+        auto ddtKind = [](const std::string& entry) -> DdtScheme
+        {
+            const std::string w = entry.substr(0, entry.find(' '));
+            if (w == "Euler")         return DdtScheme::Euler;
+            if (w == "CrankNicolson") return DdtScheme::CrankNicolson;
+            if (w == "localEuler")    return DdtScheme::localEuler;
+            if (w == "backward")      return DdtScheme::backward;
+            if (w == "steadyState")   return DdtScheme::steadyState;
+            throw std::runtime_error(
+                "brae interFoam: ddtSchemes names `" + entry + "`, whose scheme `" + w + "` is not one brae "
+                "reads (Euler, CrankNicolson, localEuler, backward, steadyState); refusing rather than guess.");
+        };
+        f.ddtU = ddtKind(ddtRhoU);
+        const std::string ddtAlphaEntry = ddtSchemeFor(caseDir, "ddt(alpha)");
+        f.ddtAlpha = parseAlphaDdt(ddtAlphaEntry);
+        // LOCAL TIME STEPPING IS DECIDED BY `default` ALONE, not by any name a call site asks for:
+        // localEulerDdt::enabled is `word(mesh.ddtScheme("default")) == "localEuler"` (localEulerDdt.C:39-44),
+        // and createRDeltaT.H registers the rDeltaT field only then. So a case naming localEuler for
+        // `ddt(rho,U)` under `default Euler` has no field for the scheme to look up and OpenFOAM stops
+        // there (localEulerDdt.C:52-55) -- refused below in those terms -- while `default localEuler` with a
+        // named Euler entry would run setRDeltaT and an Euler momentum at controlDict's deltaT, a mixture
+        // refused below because no fixture holds it.
+        {
+            const std::string ddtDefault = ddtSchemeFor(caseDir, "default");
+            f.lts = (ddtDefault.substr(0, ddtDefault.find(' ')) == "localEuler");
+        }
+        // ...and only now the time controls: whether maxAlphaCo is mandatory depends on it
+        f.timeCtl = VoFTimeControls::read(controlDict, f.lts);
+        // the time index the run starts at (InterFields::startTimeIndex)
+        {
+            const std::string timePath = startDir + "/uniform/time";
+            if (std::filesystem::exists(timePath) || std::filesystem::exists(timePath + ".gz"))
+            {
+                f.startTimeIndex = static_cast<label>(readDict(timePath).scalarOr("index", scalar(0)));
+            }
+        }
+        // ...and the step it starts with: the stored one under adjustTimeStep (startDeltaT, time_controls.cuh)
+        f.deltaT = startDeltaT(controlDict, startDir, f.deltaT);
+        if (!f.lts && f.ddtU == DdtScheme::localEuler)
+            throw std::runtime_error(
+                "brae interFoam: ddtSchemes resolves `ddt(rho,U)` to `" + ddtRhoU + "` under a `default` that "
+                "is not localEuler. OpenFOAM registers the rDeltaT field only when `default` is localEuler "
+                "(createRDeltaT.H, localEulerDdt::enabled), so the scheme's lookup of it fails "
+                "(localEulerDdt.C:52-55); refusing in the same place.");
+        if (f.lts && f.ddtU != DdtScheme::localEuler)
+            throw std::runtime_error(
+                "brae interFoam: ddtSchemes `default` is localEuler and `ddt(rho,U)` resolves to `" + ddtRhoU
+                + "`. That runs setRDeltaT's local time step beside a momentum equation at controlDict's "
+                "deltaT; no fixture holds the mixture, so it is refused rather than run.");
+        // READ AND THEN NEVER USED: neither driver handed ddtU to the momentum equation, whose
+        // input defaults to Euler, so `CrankNicolson 0.5` (RAS/floatingObject) and `localEuler`
+        // (RAS/DTCHull) would have run as Euler. Both tutorials were being stopped for other reasons.
+        // CrankNicolson runs now -- the momentum equation, ddtCorr and the k-epsilon closure carry it
+        // (crank_nicolson_ddt_scheme_cpp.cuh), and alphaEqn.H's own blend follows ddt(alpha). localEuler
+        // runs on the host loop, with the local time step setRDeltaT.H forms (inter_set_rdeltat_cpp.cuh).
+        if (f.ddtU != DdtScheme::Euler && f.ddtU != DdtScheme::CrankNicolson && f.ddtU != DdtScheme::localEuler)
+            throw std::runtime_error(
+                "brae interFoam: ddtSchemes resolves `ddt(rho,U)` to `" + ddtRhoU + "`. The momentum equation, "
+                "the ddt flux correction in pEqn and the turbulence closure carry Euler, CrankNicolson and "
+                "localEuler; refusing rather than running Euler under another scheme's name.");
+        if (f.ddtU == DdtScheme::CrankNicolson)
+        {
+            f.ddtOcCoeff = fv::readOcCoeff(ddtRhoU);
+        }
+        if (f.ddtAlpha == AlphaDdt::CrankNicolson)
+        {
+            f.ddtAlphaOcCoeff = fv::readOcCoeff(ddtAlphaEntry);
+        }
+        // kept for the closure's check, after the turbulence is read
+        f.ddtRhoUEntry = ddtRhoU;
+        // THE TWO NEED NOT AGREE, and both mixed cases run now. alphaEqn.H:242-259 branches on
+        // `ddt(rho,U)` -- the MOMENTUM entry -- while ocCoeff and cnCoeff come from `ddt(alpha)`
+        // (alphaEqn.H:6-56), so the four combinations are four well-defined runs and brae's two arms
+        // already formed each: the host keys the un-blend on `cnDdt` (the momentum scheme) with
+        // `ocAlpha > 0` (alpha's) inside it, and the device does the same through
+        // DeviceInterStepControls::cn and cnCoeffUnblend. The refusal here said "no gate holds it",
+        // which was true and is what this unit fixed rather than any arithmetic.
+        //
+        // MEASURED, and one of the two mixed cases is a NO-OP IN OPENFOAM ITSELF: with an Euler
+        // momentum, `ddt(alpha) CrankNicolson 1` is BIT-IDENTICAL to `ddt(alpha) Euler` -- 0 of 2268
+        // cells on RAS/damBreak over 20 steps. The reason is the ordering, not the scheme: `phiCN` is
+        // `cnCoeff*phi + (1 - cnCoeff)*phi.oldTime()`, storeOldTimes copies the previous step's final
+        // flux into phi.oldTime() at the top of the step, and NOTHING touches phi before the alpha
+        // equation runs -- so the two fields hold the same values and the blend is algebraically the
+        // identity. At `CrankNicolson 0.5` it reads 9.99e-15 instead of exactly 0, which is the same
+        // fact in the coefficients: 0.5 + 0.5 is exact in floating point and 2/3 + 1/3 is not.
+        // ddt(alpha)'s off-centring reaches the answer ONLY through the un-blend, i.e. only when the
+        // momentum scheme is not Euler. Gated on tests/interfoam_cn_vs_openfoam.sh, profiles
+        // `cnAlphaEuler` and `eulerAlphaCN`, both arms.
+
+        f.laplacianScheme = readNonOrthScheme(all, "laplacianSchemes");
+        f.snGradScheme = readNonOrthScheme(all, "snGradSchemes");
+        refuseUnportedGradSchemes(all);
+        refuseUnportedInterpolationSchemes(all);
+        // each gradient by the name its call site asks for (fvc::grad(vf) -> `grad(<vf.name()>)`)
+        auto choiceOf = [](const FieldGradScheme& s)
+        {
+            GradChoice c;
+            c.leastSquares = s.leastSquares;
+            c.cellLimitK = s.cellLimitK;
+            return c;
+        };
+        const FieldGradScheme gu = parseFieldGradScheme(caseDir, "U");
+        f.gradULimitK = gu.cellLimitK;
+        f.gradULeastSq = gu.leastSquares;
+        f.gradAlpha1 = choiceOf(parseFieldGradScheme(caseDir, f.alphaName));
+        f.gradAlpha2 = choiceOf(parseFieldGradScheme(caseDir, "alpha." + f.mixture.phase2Name));
+        f.gradPrgh = choiceOf(parseFieldGradScheme(caseDir, "p_rgh"));
+        f.gradPcorr = choiceOf(parseFieldGradScheme(caseDir, "pcorr"));
+        f.gradRho = choiceOf(parseFieldGradScheme(caseDir, "rho"));
+        // interfaceProperties.C:96: fvc::grad(alpha1_, "nHat") -- the entry NAMED nHat
+        f.interface.nHatGrad = choiceOf(parseNamedGradScheme(caseDir, "nHat"));
+        // limitedLinear on U limits on magSqr(U) and takes fvc::grad(lPhi) -- `grad(magSqr(U))`
+        // (LimitedScheme.C calcLimiter) -- which the momentum's limitedLinear branch computes Gauss
+        // linear only. Any other resolution of that entry is refused rather than run as Gauss.
+        if (f.divRhoPhiU == DivScheme::limitedLinear)
+        {
+            const FieldGradScheme gm = parseFieldGradScheme(caseDir, "magSqr(U)");
+            if (!gm.gaussLinear || !gm.unsupportedLimiter.empty() || gm.leastSquares || gm.cellLimitK > 0)
+            {
+                throw std::runtime_error(
+                    "brae interFoam: `div(rhoPhi,U) Gauss limitedLinear` takes its limiter's gradient "
+                    "through `grad(magSqr(U)) " + gm.raw + "`; that limiter's gradient is ported as "
+                    "`Gauss linear` only.");
+            }
+        }
+    }
+
+    // fvSolution's PIMPLE block -- see InterFields::pimple for why momentumPredictor is read rather
+    // than assumed.
+    {
+        const FoamDict* pim = fvSolution.subDict("PIMPLE");
+        if (!pim)
+            throw std::runtime_error(
+                "brae interFoam: fvSolution has no PIMPLE block. interFoam is a PIMPLE solver and every "
+                "shipped tutorial carries one; there is no default to fall back to.");
+        f.pimple.nOuterCorrectors = static_cast<label>(pim->scalarOr("nOuterCorrectors", scalar(1)));
+        f.pimple.nCorrectors      = static_cast<label>(pim->scalarOr("nCorrectors", scalar(1)));
+        f.nNonOrthogonalCorrectors =
+            static_cast<label>(pim->scalarOr("nNonOrthogonalCorrectors", scalar(0)));
+        // EVERY SWITCH HERE GOES THROUGH FoamDict::switchOr, which is Foam::Switch transcribed
+        // (Switch.C:92-137). The hand-rolled tests these replaced accepted {no,false,off,0} and read
+        // `none`, `f` and `n` -- all three of them false to OpenFOAM -- as TRUE, and read an unknown
+        // word as TRUE where OpenFOAM stops with `Unknown switch`.
+        f.momentumPredictorOn = pim->switchOr("momentumPredictor", true);
+        // THE KEY IS `frozenFlow`, NOT `solveFlow`, AND THIS READ THE WRONG ONE.
+        //
+        // interFoam.C:156 asks `pimple.frozenFlow()`. pimpleControl does NOT override frozenFlow(), so
+        // that is solutionControl::frozenFlow_, read at solutionControl.C:52 as
+        // `solutionDict.getOrDefault("frozenFlow", false)` with solutionDict =
+        // mesh_.solutionDict().subOrEmptyDict(algorithmName_) (solutionControl.C:300) -- the PIMPLE
+        // sub-dict, the same one momentumPredictor and nNonOrthogonalCorrectors come from.
+        //
+        // `solveFlow` is a DIFFERENT flag, read at pimpleControl.C:47 from the same dict, and in all of
+        // OpenFOAM v2412 exactly ONE solver reads it: sprayFoam.C:90. interFoam never does. So the
+        // previous line was wrong in both directions -- a case writing `frozenFlow yes` was run with the
+        // flow solved, and a case writing `solveFlow no` had its flow FROZEN where OpenFOAM solves it.
+        //
+        // `solveFlow` is deliberately not read here and deliberately not refused: OpenFOAM's interFoam
+        // accepts the entry and ignores it, so ignoring it is what matching OpenFOAM means. Refusing
+        // would reject a case OpenFOAM runs.
+        f.pimple.frozenFlow = pim->switchOr("frozenFlow", false);
+        // pimpleControl.C:51-52
+        f.pimple.turbOnFinalIterOnly = pim->switchOr("turbOnFinalIterOnly", true);
+        // pimpleControl.C:53-54
+        f.pimple.finalOnLastPimpleIterOnly = pim->switchOr("finalOnLastPimpleIterOnly", false);
+        // PIMPLE's `residualControl` ENDS THE OUTER CORRECTORS EARLY, and neither loop here does that.
+        // pimple.loop() asks criteriaSatisfied() from the second outer corrector on; where every named
+        // field's initial residual is under its tolerance it runs one more corrector as the final one and
+        // leaves the loop (pimpleControl.C:62-128, 219-240). The block was named nowhere in this solver, so
+        // such a case ran every outer corrector. It is inert at one outer corrector (criteriaSatisfied
+        // returns false on the first, pimpleControl.C:65), so that is not refused -- but the block is READ
+        // at every count, and solutionControl::read(false) stops on an entry that is not a dictionary and
+        // on one without `tolerance` or `relTol` (solutionControl.C:76-91). No shipped tutorial names it.
+        if (const FoamDict* rc = pim->subDict("residualControl"))
+        {
+            if (!rc->leaves.empty())
+            {
+                throw std::runtime_error(
+                    "brae interFoam: PIMPLE's residualControl gives `" + rc->leaves.front().first + "` as a "
+                    "value. OpenFOAM stops there -- Residual data for " + rc->leaves.front().first + " must be "
+                    "specified as a dictionary (solutionControl.C:86-91): PIMPLE takes `tolerance` and "
+                    "`relTol` per field, where SIMPLE takes the one number.");
+            }
+            for (const auto& fieldEntry : rc->subs)
+            {
+                if (!fieldEntry.second.found("tolerance") || !fieldEntry.second.found("relTol"))
+                {
+                    throw std::runtime_error(
+                        "brae interFoam: PIMPLE's residualControl entry `" + fieldEntry.first + "` has no `"
+                        + (fieldEntry.second.found("tolerance") ? "relTol" : "tolerance") + "`. OpenFOAM reads "
+                        "both with get<scalar>, no default (solutionControl.C:80-81), and stops.");
+                }
+            }
+            if (!rc->subs.empty() && f.pimple.nOuterCorrectors > 1)
+            {
+                throw std::runtime_error(
+                    "brae interFoam: PIMPLE names `residualControl` (for `" + rc->subs.front().first + "`) with "
+                    "nOuterCorrectors " + std::to_string(f.pimple.nOuterCorrectors) + ". OpenFOAM then leaves "
+                    "the outer correctors as soon as the named residuals are under their tolerances "
+                    "(pimpleControl.C:62-128, 219-240); that convergence control is not ported, and running "
+                    "every outer corrector instead would be a different run. Remove the block, or set "
+                    "nOuterCorrectors 1 where it has no effect.");
+            }
+        }
+        // ...and the loop's time step is the local one under localEuler, read from ddtSchemes above
+        f.pimple.lts = f.lts;
+
+        // createDyMControls.H: `correctPhi` defaults to mesh.dynamic(), the other two to false
+        auto switchOr = [&](const char* key, bool def) { return pim->switchOr(key, def); };
+        // AN ADAPTIVE MESH IS NOT A MOVING ONE, and the motion factory REFUSES it by name -- rightly, for
+        // every driver that cannot carry a topology change. interFoam can (inter_amr_cpp.cuh), so the
+        // dictionary is read here first and the factory is only asked about the cases it is the authority
+        // for. A driver without this branch still gets the refusal, which is what keeps the capability
+        // honest: see the note on shared capability notices in the project's own history.
+        const bool adaptive = caseAsksForAdaptiveMesh(caseDir);
+        // ...and an adaptive mesh's OWN motion, when its `solvers` list names one: the refinement is
+        // InterAmr's below, the motion this object's, and the driver runs the change and then the move
+        f.dynamicMesh = adaptive ? DynamicMotionSolverFvMesh::NewForRefine(caseDir, startDir)
+                                 : DynamicMotionSolverFvMesh::New(caseDir, startDir);
+        // ...AND THE ADAPTIVE MESH ITSELF, BUILT HERE AND NOWHERE ELSE. It used to be built by the HOST
+        // driver, which is why the device arm ran an adaptive case with no InterAmr at all: its branch
+        // asks `f.amr && f.amr->active`, and a null pointer answered no. MEASURED on
+        // damBreakWithObstacle, two steps: the device arm reached `End:` having refined NOTHING, on
+        // 32,256 cells, reporting Courant 0.044 against the host arm's 0.088 -- the same silent half
+        // the host's own cached cell count produced, from a different cause.
+        //
+        // One builder for both drivers is the rule this project keeps relearning: a capability read at
+        // one call site and not the other is a substitution waiting for the second caller.
+        // ALWAYS, and inactive on a static mesh: readInterAmr returns before it touches the mesh when
+        // there is no dynamicMeshDict or it names another dynamicFvMesh, so this costs a static case one
+        // file test. Building it only for an adaptive case left every static one with a null pointer,
+        // which the host driver then refused -- 92 arms of tests/interfoam_refusals.sh at once.
+        // THE ZONES AND THE REFINEMENT STATE COME FROM THE FACES INSTANCE, not from constant/. polyMesh
+        // reads pointZones, faceZones and cellZones at faces_.instance() (polyMesh.C:250-295, all three
+        // READ_IF_PRESENT), and hexRef8 reads cellLevel/pointLevel/refinementHistory there too. On a case
+        // that starts from rest the two are the same directory; on a genuine restart of a refined or moved
+        // mesh they are not, and reading constant/ then gives the START mesh's zones for the mesh the run
+        // is actually on -- or none at all.
+        const cpu::timePaths::MeshInstances mi = cpu::timePaths::meshInstancesForStartDir(caseDir, startDir);
+        const std::string facesPolyMeshDir = mi.facesDir(caseDir);
+        f.cellZones = readCellZones(facesPolyMeshDir);
+        f.amr = std::make_shared<InterAmr>(readInterAmr(caseDir, facesPolyMeshDir, m, patches, g));
+        // ...and the change carries them: it renumbers this copy, and the driver reads it back so the
+        // fvOptions selection and the MRF zones resolve against the mesh as it stands.
+        f.amr->state.cellZones = f.cellZones;
+        f.amr->polyMeshDir = facesPolyMeshDir;
+        f.amr->startTimeIndex = f.startTimeIndex;
+        // `dynamic` is OpenFOAM's mesh.dynamic(): moving OR topo-changing. It is what correctPhi defaults
+        // to, and a REFINING mesh is dynamic -- measured on damBreakWithObstacle, where OpenFOAM writes a
+        // Uf and an rAU beside every time directory and solves pcorr at every step.
+        f.meshIsDynamic = (f.dynamicMesh != nullptr) || adaptive;
+        const bool dynamic = f.meshIsDynamic;
+        f.correctPhi = switchOr("correctPhi", dynamic);
+        f.checkMeshCourantNo = switchOr("checkMeshCourantNo", false);
+        f.moveMeshOuterCorrectors = switchOr("moveMeshOuterCorrectors", false);
+        // initCorrectPhi.H: under correctPhi, rAU is a field kept across steps, READ_IF_PRESENT and
+        // 1 when absent; pEqn.H:4 then assigns 1/UEqn.A() into it and never clears it, so every mesh
+        // update's CorrectPhi interpolates the LAST corrector's rAU
+        // initCorrectPhi.H:5-17 -- READ_IF_PRESENT with a default of 1, and `#include "correctPhi.H"`
+        // immediately after, so on a RESTART the very FIRST CorrectPhi interpolates the file's rAU and
+        // not 1. It is AUTO_WRITE, so any case that wrote a time directory under `correctPhi` has one.
+        // This used to refuse the file's presence; brae now reads it, as OpenFOAM does.
+        f.rAU.assign(static_cast<std::size_t>(m.nCells()), scalar(1));
+        if (f.correctPhi)
+        {
+            const std::string rAUpath = std::filesystem::exists(startDir + "/rAU")
+                                      ? startDir + "/rAU"
+                                      : (std::filesystem::exists(startDir + "/rAU.gz")
+                                         ? startDir + "/rAU.gz" : std::string());
+            if (!rAUpath.empty())
+            {
+                const FieldData<scalar> rAUdata = readField<scalar>(rAUpath);
+                if (rAUdata.internalUniform)
+                {
+                    f.rAU.assign(static_cast<std::size_t>(m.nCells()), rAUdata.internalUniformValue);
+                }
+                else
+                {
+                    if (rAUdata.internalField.size() != static_cast<std::size_t>(m.nCells()))
+                        throw std::runtime_error(
+                            "brae interFoam: " + rAUpath + " holds "
+                            + std::to_string(rAUdata.internalField.size()) + " values for "
+                            + std::to_string(m.nCells()) + " cells.");
+                    f.rAU = rAUdata.internalField;
+                }
+            }
+        }
+    }
+
+    // `minIter` on U reaches the momentum solve on BOTH arms now, but the DEVICE honours it only on the
+    // Gauss-Seidel branch: deviceJacobiBiCGStab takes no minIter argument, so a case naming `minIter`
+    // beside a solver that is not smoothSolver would silently stop a sweep short there. Refused in the
+    // driver rather than here, because it is a device-arm limit and the host runs it.
+    // solvers/<alpha> -- the linear solve of the MULESCorr pre-solve. A case without MULESCorr never
+    // solves for alpha and need not name a solver (capillaryRise does not).
+    {
+        const FoamDict* sv = fvSolution.subDict("solvers");
+        const FoamDict* ad = sv ? sv->subDict(f.alphaName) : nullptr;
+        if (ad)
+        {
+            f.aSolve = SmoothLinearSolve::read(*ad);
+        }
+        // THE FINAL ENTRY. alphaEqn.H:122's alpha1Eqn.solve() looks the solver up by psi.select(final
+        // iteration), so the pre-solve of the final outer corrector takes `<alpha>Final`, and
+        // solution::solverDict is a plain subDict: OpenFOAM stops without one (solution.C:474-478). The
+        // tutorials write `"alpha.water.*"`, which answers for both names; a case with two blocks ran the
+        // first throughout, and one with a literal `alpha.water` alone ran where OpenFOAM stops.
+        //   BRAE_CONTROL_ALPHA_ENTRY_NON_FINAL=1: a gate's CONTROL, deliberately wrong -- `<alpha>` throughout.
+        static const bool alphaNonFinal = std::getenv("BRAE_CONTROL_ALPHA_ENTRY_NON_FINAL") != nullptr;
+        const FoamDict* adf = sv ? sv->subDict(f.alphaName + "Final") : nullptr;
+        f.aSolveFinal = (adf && !alphaNonFinal) ? SmoothLinearSolve::read(*adf) : f.aSolve;
+        if (f.alphaCtl.MULESCorr && !adf)
+        {
+            throw std::runtime_error(
+                "brae interFoam: `MULESCorr yes` solves an implicit alpha equation and fvSolution has no `solvers/"
+                + f.alphaName + "Final`. alpha1Eqn.solve() takes that entry on the final outer corrector "
+                "(fvMatrix.C:1536-1542) and OpenFOAM stops without it; the tutorials write `\"" + f.alphaName
+                + ".*\"` for both.");
+        }
+        if (f.alphaCtl.MULESCorr
+         && (f.aSolveFinal.solver != f.aSolve.solver || f.aSolveFinal.smoother != f.aSolve.smoother
+          || f.aSolveFinal.preconditioner != f.aSolve.preconditioner))
+        {
+            throw std::runtime_error(
+                "brae interFoam: fvSolution's `solvers/" + f.alphaName + "` and `" + f.alphaName + "Final` name "
+                "two different solvers (`" + f.aSolve.solver + " " + f.aSolve.smoother + "` and `"
+                + f.aSolveFinal.solver + " " + f.aSolveFinal.smoother + "`). brae takes each entry's "
+                "tolerances and counts on its own corrector; one method for the two.");
+        }
+        // minIter: three tutorials name it for alpha (DTCHull, DTCHullMoving, electrostaticDeposition).
+        // It forces a sweep on the steps where the pre-solve's initial residual is already under
+        // tolerance, which moves alpha. The host pre-solve honours it (AlphaStepInput::minIterAlpha,
+        // gated on laminar/damBreak `alphaminiter`); the device loop refuses it.
+        if (f.alphaCtl.MULESCorr && !f.aSolve.solver.empty() && !f.aSolve.gaussSeidel())
+        {
+            // smoothSolver with either Gauss-Seidel smoother is OpenFOAM's own on both paths
+            // (smooth_solver_cpp.cuh, deviceSymGaussSeidel). Anything else still substitutes, and says
+            // what it costs when the substitute is a poor match for a near-triangular upwind matrix.
+            noticeApproximated("interFoam alpha pre-solve",
+                "the case asks for `solver " + f.aSolve.solver + "; smoother " + f.aSolve.smoother +
+                ";` and brae runs BiCGStab at the same tolerance (DILU-preconditioned on the host, "
+                "Jacobi on the device). On damBreak the device's substitute left alpha 3.3e-06 from "
+                "OpenFOAM at the case's own 1e-8.");
+        }
+        if (f.alphaCtl.MULESCorr && f.aSolve.solver.empty())
+            throw std::runtime_error(
+                "brae interFoam: `MULESCorr yes` solves an implicit alpha equation and fvSolution's `solvers/"
+                + f.alphaName + "` names no `solver` for it. OpenFOAM refuses the same case.");
+    }
+
+    // solvers/U and solvers/UFinal -- read only when the case solves a momentum predictor, and then
+    // REQUIRED exactly where OpenFOAM requires them.
+    if (f.momentumPredictorOn)
+    {
+        const FoamDict* sv = fvSolution.subDict("solvers");
+        auto readU = [&](const char* name, bool required, InterFields::AlphaLinearSolve& out)
+        {
+            const FoamDict* d = sv ? sv->subDict(name) : nullptr;
+            if (!d)
+            {
+                if (!required) return;
+                throw std::runtime_error(
+                    std::string("brae interFoam: `momentumPredictor yes` and fvSolution has no `solvers/")
+                    + name + "` entry. fvMatrix::solve() selects it by the final-iteration flag -- UFinal "
+                      "on the last outer corrector, U on the others -- and OpenFOAM stops without it.");
+            }
+            out = SmoothLinearSolve::read(*d);
+            if (!out.gaussSeidel())
+            {
+                noticeApproximated(std::string("interFoam ") + name + " solve",
+                    "the case asks for `solver " + out.solver + "` and brae runs BiCGStab at the same "
+                    "tolerance. Only smoothSolver with a Gauss-Seidel smoother is OpenFOAM's own here; "
+                    "the difference is where the solve stops.");
+            }
+        };
+        readU("UFinal", true, f.uSolveFinal);
+        readU("U", f.pimple.nOuterCorrectors > 1, f.uSolve);
+    }
+
+    // solvers/p_rgh -- the case's own pressure solve. See InterFields::tolP for why this is read
+    // rather than assumed, and why relTol comes from the Final entry.
+    {
+        const FoamDict* sv = fvSolution.subDict("solvers");
+        const FoamDict* pr = sv ? sv->subDict("p_rgh") : nullptr;
+        const FoamDict* pf = sv ? sv->subDict("p_rghFinal") : nullptr;
+        if (!pr)
+            throw std::runtime_error(
+                "brae interFoam: fvSolution has no `solvers/p_rgh` entry. OpenFOAM reads the pressure "
+                "solve's tolerance from there and every shipped tutorial carries one; assuming a "
+                "tolerance would run the case to a convergence nobody asked for, which is exactly the "
+                "defect this replaced.");
+        // lduMatrix::solver::readControls (lduMatrixSolver.C:195-205): tolerance 1e-6, relTol 0,
+        // maxIter 1000 when absent.
+        bool hasCyclicAMI = false;
+        for (const FvPatch& q : patches)
+        {
+            hasCyclicAMI = hasCyclicAMI || q.type == "cyclicAMI";
+        }
+        auto readSolve = [&](
+            const FoamDict& d,
+            const std::string& field)
+        {
+            InterFields::PressureLinearSolve s;
+            s.solver = d.wordOr("solver", "");
+            s.preconditioner = d.wordOr("preconditioner", "");
+            s.tol = d.scalarOr("tolerance", scalar(1e-6));
+            s.relTol = d.scalarOr("relTol", scalar(0));
+            s.maxIter = static_cast<int>(d.scalarOr("maxIter", scalar(1000)));
+            // a `preconditioner { preconditioner <name>; ... }` sub-dictionary: lduMatrix::
+            // preconditioner::New reads the name from inside it and hands the preconditioner THAT
+            // dictionary as its controls (lduMatrixPreconditioner.C). A GAMG one is a GAMGSolver
+            // reading its tolerance, relTol, smoother and sweeps from there -- not from the PCG entry.
+            if (s.preconditioner.empty())
+            {
+                const FoamDict* pd = d.subDict("preconditioner");
+                if (pd)
+                {
+                    const std::string name = pd->wordOr("preconditioner", "");
+                    if (name == "DIC")
+                    {
+                        s.preconditioner = "DIC";
+                    }
+                    else if (name == "GAMG")
+                    {
+                        s.preconditioner = "{ GAMG ... }";
+                        s.gamgPreconditioned = true;
+                        // lduMatrix::solver::readControls on the sub-dictionary: its own defaults
+                        s.gamgPrecond.gamg = readGamgControls(
+                            *pd,
+                            pd->scalarOr("tolerance", scalar(1e-6)),
+                            pd->scalarOr("relTol", scalar(0)),
+                            static_cast<int>(pd->scalarOr("maxIter", scalar(1000))),
+                            "brae interFoam: fvSolution's GAMG preconditioner for " + field + " ");
+                        s.gamgPrecond.nVcycles = pd->intOr("nVcycles", 2);
+                    }
+                    else
+                    {
+                        s.preconditioner = "{ " + name + " ... }";
+                    }
+                }
+            }
+            if (s.gamgSolver())
+            {
+                s.gamg = readGamgControls(
+                    d,
+                    s.tol,
+                    s.relTol,
+                    s.maxIter,
+                    "brae interFoam: fvSolution's GAMG entry for " + field + " ");
+            }
+            // GAMG ACROSS A cyclicAMI PAIR IS NOT PORTED (cyclicAMIGAMGInterface: the pair agglomerated on
+            // every level), as a solver or as PCG's preconditioner. The case's pressure then runs PCG with
+            // DIC at the entry's own tolerance, relTol and maxIter, and says so -- the choice simpleFoam and
+            // rhoSimpleFoam make for a GAMG they do not run. It is NOT OpenFOAM's solve: the iteration
+            // counts are another solver's and the fields agree to the tolerance, not to round-off.
+            // BRAE_CONTROL_NO_AMI_PCG_FALLBACK=1 leaves the entry as read, and GAMG then refuses the pair by
+            // name -- the gate's proof that this branch is what lets the case run.
+            if (hasCyclicAMI
+                && (s.gamgSolver() || s.pcgGamg())
+                && std::getenv("BRAE_CONTROL_NO_AMI_PCG_FALLBACK") == nullptr)
+            {
+                noticeApproximated("interFoam " + field + " solve",
+                    "the case asks for " + std::string(s.gamgSolver() ? "`solver GAMG`" : "`solver PCG` with a "
+                    "GAMG preconditioner") + " and the mesh has a cyclicAMI pair, across which brae's GAMG is "
+                    "not ported. brae runs `solver PCG; preconditioner DIC;` at the same tolerance, relTol "
+                    "and maxIter; the solve stops at a different point inside that tolerance.");
+                s.solver = "PCG";
+                s.preconditioner = "DIC";
+                s.gamgPreconditioned = false;
+            }
+            return s;
+        };
+        auto noticeUnported = [&](const InterFields::PressureLinearSolve& s)
+        {
+            if (!s.pcgDIC() && !s.gamgSolver() && !s.pcgGamg())
+                noticeApproximated("interFoam p_rgh solve",
+                    "the case asks for `solver " + s.solver + "; preconditioner " +
+                    s.preconditioner + ";` and brae runs PBiCGStab at the same tolerance. Only "
+                    "PCG with DIC is OpenFOAM's own solver here; the difference is where the solve "
+                    "stops, which on a VoF case is visible as alpha's over-1 excursion.");
+        };
+        f.pSolve = readSolve(*pr, "p_rgh");
+        noticeUnported(f.pSolve);
+        if (!pf)
+            throw std::runtime_error(
+                "brae interFoam: fvSolution has `solvers/p_rgh` but no `p_rghFinal`. pEqn.H solves "
+                "the last corrector with p_rgh.select(finalInnerIter()), which OpenFOAM resolves to "
+                "the Final entry and refuses to run without; guessing it would pick the last "
+                "corrector's stopping point for the case.");
+        f.pSolveFinal = readSolve(*pf, "p_rghFinal");
+        noticeUnported(f.pSolveFinal);
+
+        // solvers/pcorr and pcorrFinal: CorrectPhi's solve, which initCorrectPhi.H runs at the start of
+        // EVERY case -- moving or not, correctPhi or not -- and interFoam.C:139 after every mesh update
+        // under `correctPhi`. pcorr.select(finalNonOrthogonalIter()) takes pcorrFinal on the last
+        // non-orthogonal pass and pcorr on the others, and OpenFOAM stops without the one it asks for.
+        // No approximation here: every tutorial names PCG with DIC, PCG with a GAMG preconditioner, or
+        // GAMG, and a zero right-hand side -- the start of a case at rest -- is exact under all three.
+        auto readPcorr = [&](
+            const std::string& field,
+            InterFields::PressureLinearSolve& out)
+        {
+            const FoamDict* d = sv->subDict(field);
+            if (!d)
+            {
+                throw std::runtime_error(
+                    "brae interFoam: fvSolution has no `solvers/" + field + "` entry. CorrectPhi "
+                    "(CorrectPhi.C:111) solves pcorr with it -- at the start of every case, from "
+                    "initCorrectPhi.H -- and OpenFOAM stops without it.");
+            }
+            out = readSolve(*d, field);
+            if (!out.pcgDIC() && !out.gamgSolver() && !out.pcgGamg())
+            {
+                throw std::runtime_error(
+                    "brae interFoam: fvSolution solves " + field + " with `solver " + out.solver +
+                    "; preconditioner " + out.preconditioner + ";`. Only PCG with DIC, PCG with a "
+                    "GAMG preconditioner and GAMG are ported for CorrectPhi's pcorr.");
+            }
+        };
+        readPcorr("pcorrFinal", f.pcorrSolveFinal);
+        if (f.nNonOrthogonalCorrectors > 0)
+        {
+            readPcorr("pcorr", f.pcorrSolve);
+        }
+    }
+
+    // relaxationFactors/equations -- see InterFields::relaxEquationU. Each name through the dictionary's own
+    // lookup (a literal key, else the last regex key that matches, else `default`: solution.C:379-416), as
+    // the closure reads k's and omega's.
+    {
+        const FoamDict* rf = fvSolution.subDict("relaxationFactors");
+        const FoamDict* eq = rf ? rf->subDict("equations") : nullptr;
+        const FoamDict* fl = rf ? rf->subDict("fields") : nullptr;
+        // THE FLAT FORM, `relaxationFactors { U 0.7; p_rgh 0.3; }`: OpenFOAM still honours it
+        // (solution.C:81-101 -- every entry an equation's, those starting with p or rho a field's too).
+        // brae saw no `equations` there and relaxed nothing.
+        if (rf && !eq && !fl && !rf->leaves.empty())
+        {
+            throw std::runtime_error(
+                "brae interFoam: fvSolution's relaxationFactors holds `" + rf->leaves.front().first + "` and "
+                "no `equations` or `fields` sub-dictionary -- the flat form OpenFOAM still reads "
+                "(solution.C:81-101). brae reads the two sub-dictionaries only.");
+        }
+        //   BRAE_CONTROL_RELAX_U_NAME_ONLY=1: a gate's CONTROL, deliberately wrong -- `U` for every corrector.
+        static const bool relaxNameOnly = std::getenv("BRAE_CONTROL_RELAX_U_NAME_ONLY") != nullptr;
+        const EquationRelax u = EquationRelax::read(eq, "U");
+        const EquationRelax uFinal = relaxNameOnly ? u : EquationRelax::read(eq, "UFinal");
+        f.relaxEquationU = u.on;
+        f.relaxU = u.factor;
+        f.relaxEquationUFinal = uFinal.on;
+        f.relaxUFinal = uFinal.factor;
+        // relaxationFactors/fields: pEqn.H:56 calls p_rgh.relax(), which asks for `p_rgh` -- `p_rghFinal` on
+        // the final outer corrector -- and relaxes the field against its previous outer corrector's when
+        // an entry or a `default` answers (GeometricField.C:1099-1114, solution.C:337-375). Neither loop
+        // relaxes a field. No shipped tutorial names one (motorBike's `fields {}` is empty); refused.
+        for (const char* name : {"p_rgh", "p_rghFinal"})
+        {
+            if (fl && (fl->found(name) || fl->found("default")))
+            {
+                throw std::runtime_error(
+                    std::string("brae interFoam: fvSolution's relaxationFactors/fields answers for `") + name
+                    + "`. pEqn.H:56 relaxes p_rgh by it against the previous outer corrector's field "
+                    "(GeometricField.C:1099-1114); the field relaxation is not ported.");
+            }
+        }
+    }
+
+    // --- gravity ------------------------------------------------------------------------------
+    f.g          = readGravity(caseDir);
+    f.hRef       = readHRef(caseDir);
+    // createFields.H:45-55 constructs rho READ_IF_PRESENT from the start directory: a `rho` file there IS the
+    // density of the first step's ddt(rho,U), patches and all, where both loops form it from alpha. OpenFOAM
+    // never writes the file (no AUTO_WRITE), so only a hand-made start directory holds one. Refused.
+    if (std::filesystem::exists(startDir + "/rho") || std::filesystem::exists(startDir + "/rho.gz"))
+    {
+        throw std::runtime_error(
+            "brae interFoam: the start directory holds a `rho` file. createFields.H:45-55 reads it in place "
+            "of alpha1*rho1 + alpha2*rho2 for the first step; brae forms the density from alpha and does not "
+            "read it.");
+    }
+    f.ghRefValue = ghRef(f.g, f.hRef);
+
+    // --- the read fields ----------------------------------------------------------------------
+    // THE WAVE CONDITIONS ARE CLAIMED HERE, on this reader's own copy of the file data, and nowhere
+    // else: the shared factory refuses both type names, so no other solver can build one frozen.
+    FieldData<scalar> alphaData = readField<scalar>(startDir + "/" + f.alphaName);
+    FieldData<vector> UData = readField<vector>(startDir + "/U");
+    // THE FROZEN-BC GUARD, which interFoam did not have. The shared factory ACCEPTS fixedMean,
+    // fanPressure, codedFixedValue and codedMixed on the strength of a per-step update its own comment
+    // promises, and only some drivers keep that promise -- gpuPimpleFoam maintains all four,
+    // gpuSimpleFoam the coded pair. interFoam maintains NONE of them (no collectFixedMean, no
+    // collectFanPressure, no setupCodedBCs anywhere in this tree), so such a patch was built from the
+    // file `value` and never touched again: OpenFOAM's fixedMean rescales patchInternalField every
+    // updateCoeffs to hold the prescribed mean (fixedMeanFvPatchField.C), and brae held the file's
+    // value for the whole run with nothing said. simpleFoam and rhoSimpleFoam have called this guard
+    // at their read sites for exactly this reason; interFoam was the driver that did not.
+    // `codedMaintained = false`: interFoam has no NVRTC coded path of its own.
+    refuseFrozenPerStepBC(alphaData, f.alphaName, "interFoam", /*codedMaintained=*/false);
+    refuseFrozenPerStepBC(UData, "U", "interFoam", /*codedMaintained=*/false);
+    f.waves = readInterWaves(caseDir, startDir, alphaData, UData, patches, f.g, f.alphaName);
+    const std::vector<ClaimedTangentialVelocity> tvClaims = claimTangentialVelocity(UData, patches, caseDir);
+    f.alpha1 = buildField<scalar>(alphaData, patches, nC);
+    f.U = buildField<vector>(UData, patches, nC);
+    for (const ClaimedTangentialVelocity& c : tvClaims)
+    {
+        auto* piov = dynamic_cast<PressureInletOutletVelocityPatchField<vector>*>(f.U.boundary[c.pi].get());
+        if (!piov)
+        {
+            throw std::runtime_error(
+                "brae interFoam: patch " + patches[c.pi].name + " claimed a tangentialVelocity and was "
+                "not built as pressureInletOutletVelocity.");
+        }
+        piov->setTangentialVelocity(c.tv);
+        // tests/interfoam_dtchullmoving_vs_openfoam.sh's controls: which half of the patch field the gate
+        // witnesses, the stored inflow value or snGrad
+        if (const char* ctl = std::getenv("BRAE_CONTROL_PIOV_TV"))
+        {
+            const std::string mode(ctl);
+            if (mode != "value" && mode != "sngrad")
+            {
+                throw std::runtime_error(
+                    "brae interFoam: BRAE_CONTROL_PIOV_TV is `" + mode + "`; it takes `value` or `sngrad`.");
+            }
+            std::printf("brae interFoam: CONTROL MODE BRAE_CONTROL_PIOV_TV=%s on patch %s\n",
+                        mode.c_str(), patches[c.pi].name.c_str());
+            piov->setTangentialControl(mode == "value", mode == "sngrad");
+        }
+    }
+    f.movingWallVelocityPatch.assign(patches.size(), 0);
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const PatchFieldData<vector>* entry = findPatchEntry(UData, patches[pi]);
+        if (entry && entry->type == "movingWallVelocity")
+        {
+            f.movingWallVelocityPatch[pi] = 1;
+        }
+    }
+    const FieldData<scalar> prghData = readField<scalar>(startDir + "/p_rgh");
+    refuseFrozenPerStepBC(prghData, "p_rgh", "interFoam", /*codedMaintained=*/false);
+    f.p_rgh  = buildField<scalar>(prghData, patches, nC);
+    f.alpha1.evaluateBoundary();
+    // alpha2 IS CONSTRUCTED HERE, as 1.0 - alpha1 (twoPhaseMixture.C:55-64): its patch values are alpha1's as
+    // alpha1's own construction left them, BEFORE interfaceProperties' first curvature pass moves a contact
+    // angle's. The first corrector's compressive flux reads them (AlphaStepInput::alpha2Bnd), and
+    // createFields.H's rho takes them for its rho2 half.
+    f.alpha2Bnd.resize(f.alpha1.boundary.size());
+    for (std::size_t pi = 0; pi < f.alpha1.boundary.size(); ++pi)
+    {
+        const std::vector<scalar>& ab = f.alpha1.boundary[pi]->value();
+        f.alpha2Bnd[pi].resize(ab.size());
+        for (std::size_t i = 0; i < ab.size(); ++i)
+        {
+            f.alpha2Bnd[pi][i] = scalar(1) - ab[i];
+        }
+    }
+    f.U.evaluateBoundary();
+    f.p_rgh.evaluateBoundary();
+
+    // 3: createAlphaFluxes.H READS phi when it is there. A restart continues from the WRITTEN flux,
+    // which is not fvc::flux(U) -- U and phi disagree by the continuity error the pressure corrector
+    // has just driven down, and recomputing it discards exactly that.
+    f.phi = readPhiIfPresent(startDir, patches, m.nInternalFaces(),
+                             fvc::flux(f.U, m, g, patches), &f.phiWasRead);
+    // ...AND EVERY PATCH THAT DECIDES INFLOW FROM OUTFLOW BY IT LEARNS IT. See pushFluxToPatches.
+    pushFluxToPatches(f, patches);
+
+    // --- the mixture --------------------------------------------------------------------------
+    // 2: rho from the RAW alpha, mu and nu from the CLAMPED one -- see two_phase_mixture_cpp.cuh.
+    f.alpha2.resize(static_cast<std::size_t>(nC));
+    for (label c = 0; c < nC; ++c) f.alpha2[c] = scalar(1) - f.alpha1.internal[c];
+    cpu::twoPhase::mixtureRho(f.alpha1.internal, f.alpha2, f.mixture.phases, f.rho);
+    cpu::twoPhase::mixtureMu (f.alpha1.internal, f.mixture.phases, f.mu);
+    cpu::twoPhase::mixtureNu (f.alpha1.internal, f.mu, f.mixture.phases, f.nu);
+
+    // ...and the same three blends on every patch, from alpha's own boundary values.
+    updateMixtureBoundary(f, patches);
+
+    // Turbulence. createFields.H:78 constructs it AFTER the mixture, because validate() -- in the one
+    // lineage that calls it -- evaluates the nut wall functions with the mixture's nu at the wall.
+    // the wallDist the motion solver registers first, under displacementLaplacian's inverseDistance
+    // diffusivity (InterTurbulence::wallDistPatchIDs)
+    std::vector<label> sharedWallDist;
+    if (f.dynamicMesh && f.dynamicMesh->displacementSolver())
+    {
+        sharedWallDist = patchSet(patches, f.dynamicMesh->displacementSolver()->diffusivityPatches());
+    }
+    f.turbulence = readInterTurbulence(caseDir, startDir, fvSolution,
+                                       f.ddtU == DdtScheme::Euler || f.ddtU == DdtScheme::CrankNicolson,
+                                       f.laplacianScheme.corrected, f.laplacianScheme.nonOrthCoeffs,
+                                       f.laplacianScheme.limitCoeff,
+                                       patches, nC, &m, &g, &sharedWallDist,
+                                       f.pimple.nOuterCorrectors, f.pimple.turbOnFinalIterOnly);
+    // ...AND THE CLOSURE'S OWN ddt NAMES, which it carries under U's scheme. The model calls
+    // fvm::ddt(alpha, rho, k) with geometricOneField alpha, so the name is `ddt(k)` in the uniform lineage and
+    // `ddt(rho,k)` under `density variable` (fvmDdt.C:128-150), and likewise for epsilon or omega.
+    if (f.turbulence.on)
+    {
+        std::vector<std::string> fields{"k"};
+        if (f.turbulence.model == InterRasModel::KEpsilon) fields.push_back("epsilon");
+        if (f.turbulence.model == InterRasModel::KOmegaSST) fields.push_back("omega");
+        for (const std::string& fld : fields)
+        {
+            const std::string name = f.turbulence.variableDensity ? "ddt(rho," + fld + ")" : "ddt(" + fld + ")";
+            const std::string entry = ddtSchemeFor(caseDir, name);
+            if (entry != f.ddtRhoUEntry)
+                throw std::runtime_error(
+                    "brae interFoam: ddtSchemes resolves the closure's `" + name + "` to `" + entry
+                    + "` and the momentum's `ddt(rho,U)` to `" + f.ddtRhoUEntry + "`. The closure carries "
+                    "U's time scheme; refusing rather than running it under the momentum's.");
+        }
+    }
+    // LOCAL TIME STEPPING: setRDeltaT.H's controls from fvSolution's PIMPLE and the parts of it that are
+    // not ported. What the CASE carries beside it -- a moving mesh, options, zones, a closure, alpha's
+    // sub-cycles -- is refused further down, after all of those are read.
+    if (f.lts)
+    {
+        const FoamDict* pim = fvSolution.subDict("PIMPLE");
+        f.ltsCtl = readLocalEulerControls(*pim);
+        refuseUnportedLocalEuler(f.ltsCtl, patches);
+        f.rDeltaT.assign(static_cast<std::size_t>(nC), scalar(1));
+    }
+    // `turbOnFinalIterOnly no` WITH MORE THAN ONE OUTER CORRECTOR RUNS NOW, on both arms. Two halves:
+    //   * psi.oldTime() is kept per TIME INDEX rather than recaptured per call
+    //     (InterTurbulence::kOldStep, advanceTurbulenceOldTime). OpenFOAM's storeOldTimes is guarded on
+    //     `timeIndex_ != time().timeIndex()` (GeometricField.C:904-917), so every corrector of a step
+    //     reads the PREVIOUS STEP's field -- not the previous corrector's solved-and-bounded one.
+    //   * both the Final and the non-Final solver and relaxation entries are read and the corrector picks
+    //     between them (pickClosure), because fvMatrix::solve() and fvMatrix::relax() select
+    //     `<field>Final` only on the final corrector (fvMatrix.C:1536-1542, :1249-1263). The non-Final
+    //     SOLVER entries are required exactly when the closure runs on a non-final corrector, since
+    //     solution::solverDict is fatal when the name is absent.
+    //
+    // ONE MIS-INDENTED PAIR OF LINES cost a day here: `comp.kOldIn`/`comp.epsOldIn` sat inside
+    // `if (t.variableDensity)`, so the uniform lineage fell back to the CURRENT field and corrector 2 read
+    // epsilon's initial residual 0.808 and k's 8.702 relative from OpenFOAM's. It was localised with
+    // tools/dumpKEpsilon by rebuilding OpenFOAM's whole path offline and substituting ONE term: the ddt
+    // source. See the note at that site. A measurement that toggled the per-call/per-step switch looked
+    // like it REFUTED the old-time hypothesis -- it changed nothing because the per-step store was not
+    // reaching the closure either way. The measurement refuted the fix, not the cause.
+    // fvSolution's cache block, before validate(): kOmegaSST's validate is the first to form grad(U)
+    f.gradUCache.on = readCacheGradU(caseDir, fvSolution);
+    validateInterTurbulence(f.turbulence, f.U, f.nu, f.nuBnd, f.phi, m, g, patches, f.gradUCache);
+
+    // createMRF.H -> IOMRFZoneList (READ_IF_PRESENT); a zone is active unless it says otherwise
+    // (MRFZone.C:248, :553). createFields.H:129 constructs it AFTER everything above, and nothing here
+    // applies it: MRF.correctBoundaryVelocity(U) is UEqn.H's first line, not createFields'.
+    {
+        const std::vector<MRF::ZoneSpec> specs = MRF::readMRFProperties(caseDir + "/constant");
+        if (!specs.empty())
+        {
+            const std::map<std::string, std::vector<label>>& zoneMap = f.cellZones;
+            for (const MRF::ZoneSpec& sp : specs)
+            {
+                const auto it = zoneMap.find(sp.cellZone);
+                if (it == zoneMap.end())
+                    throw std::runtime_error(
+                        "brae interFoam: MRF cellZone `" + sp.cellZone + "` is not in "
+                        "constant/polyMesh/cellZones. OpenFOAM stops on this (MRFZone.C:583-590, the "
+                        "FatalErrorInFunction at :587; :258-266 is addCoriolis and was the wrong line).");
+                f.mrfZones.push_back(MRF::buildZone(sp, it->second, m, patches));
+                // KEPT, not discarded: a topology change rebuilds the zone from its own spec.
+                f.mrfSpecs.push_back(sp);
+            }
+        }
+    }
+    // createFvOptions.H -> fv::options (constant/ first, then system/; an option is active unless it
+    // says otherwise, fvOption.C:72). interFoam reaches the list in four places: UEqn.H:9
+    // `== fvOptions(rho, U)`, :14 constrain(UEqn), :31 and pEqn.H:65 correct(U). A source reaches the
+    // first alone, and ONE source is ported here.
+    f.fvOptions = fvOptions::read(caseDir, m);
+    for (const fvOptions::Option& o : f.fvOptions.options)
+    {
+        if (!o.active) continue;
+        const bool darcyForchheimer = o.unsupported.empty() && !o.rotorDisk && !o.actuationDisk
+                                   && !o.fixedCoeff && o.constraint == fvOptions::Option::Constraint::none
+                                   && o.mangroves == fvOptions::Option::Mangroves::none;
+        if (darcyForchheimer) continue;
+        // the mangroves: the drag and added mass on U, and the turbulence source on k and epsilon --
+        // laminar/waves/mangroveInteraction's pair. The turbulence one reaches k and epsilon through
+        // kEpsilon's fvOptions(k)/fvOptions(epsilon); under any other closure it would reach a k
+        // equation no gate holds, or none at all, so it is taken with kEpsilon only.
+        if (o.unsupported.empty() && o.mangroves == fvOptions::Option::Mangroves::source) continue;
+        if (o.unsupported.empty() && o.mangroves == fvOptions::Option::Mangroves::turbulence)
+        {
+            if (f.turbulence.on && f.turbulence.model == InterRasModel::KEpsilon)
+            {
+                continue;
+            }
+            throw std::runtime_error(
+                "brae interFoam: fvOptions has `" + o.name + "` (multiphaseMangrovesTurbulenceModel), which "
+                "adds to the k and epsilon equations; brae applies it under RAS kEpsilon only, and this case "
+                "runs " + std::string(f.turbulence.on ? "another closure" : "laminar") + ".");
+        }
+        const std::string what = !o.unsupported.empty() ? o.unsupported
+                               : o.fixedCoeff ? std::string("explicitPorositySource with the fixedCoeff model")
+                               : o.type;
+        throw std::runtime_error(
+            "brae interFoam: fvOptions has an active option `" + o.name + "` (" + what + "). interFoam "
+            "applies fvOptions to UEqn as `== fvOptions(rho, U)`, constrains the matrix with them and "
+            "corrects U after every corrector; brae's interFoam carries explicitPorositySource with "
+            "DarcyForchheimer -- RAS/angledDuct's -- and the mangrove pair -- waves/mangroveInteraction's -- "
+            "both gated against OpenFOAM, and nothing else.");
+    }
+    bool anyFvOption = false;
+    for (const fvOptions::Option& o : f.fvOptions.options)
+    {
+        anyFvOption = anyFvOption || o.active;
+    }
+    if (anyFvOption && f.dynamicMesh)
+        throw std::runtime_error(
+            "brae interFoam: the case has an active fvOption AND a moving mesh. The option's cell "
+            "selection and its resistance tensor are taken once; no shipped tutorial pairs them and no "
+            "gate holds it.");
+    if (anyFvOption && !f.mrfZones.empty())
+        throw std::runtime_error(
+            "brae interFoam: the case has an active fvOption AND an active MRF zone. Each is gated on "
+            "its own tutorial and nothing holds the two together against OpenFOAM.");
+    // alphaRestart (createAlphaFluxes.H:10-11): alphaPhi0.<phase> is in the start directory. It is asked of
+    // the directory WHATEVER ddt(rho,U) names -- alphaEqn.H:36-45 ORs it into ddt(alpha)'s warm-up test, and
+    // the file is AUTO_WRITE, so every written time holds it. This was set inside the CrankNicolson-momentum
+    // block below alone: a restart under `ddt(alpha) CrankNicolson` and an Euler momentum ran its first step
+    // with the flux not off-centred. Either spelling of the file (POSIX.C:870-876 finds `.gz` too).
+    //   BRAE_CONTROL_ALPHA_RESTART_CN_MOMENTUM_ONLY=1: a gate's CONTROL, deliberately wrong -- the flag
+    //   under a CrankNicolson momentum alone, as it was.
+    {
+        static const bool momentumOnly = std::getenv("BRAE_CONTROL_ALPHA_RESTART_CN_MOMENTUM_ONLY") != nullptr;
+        const std::string group = f.alphaName.substr(f.alphaName.find('.') + 1);
+        f.cnAlphaRestart = false;
+        for (const std::string& nm : {"alphaPhi0." + group, std::string("alphaPhi0")})
+        {
+            f.cnAlphaRestart = f.cnAlphaRestart
+                            || std::filesystem::exists(startDir + "/" + nm)
+                            || std::filesystem::exists(startDir + "/" + nm + ".gz");
+        }
+        if (momentumOnly && f.ddtU != DdtScheme::CrankNicolson)
+        {
+            f.cnAlphaRestart = false;
+        }
+    }
+    // CrankNicolson, what it is NOT ported with. Each is a different branch of the scheme or a
+    // different consumer of it that no gate holds.
+    if (f.ddtU == DdtScheme::CrankNicolson)
+    {
+        // A MESH THAT DEFORMS RUNS TOO, on both arms (`solitaryCN`, waves/waveMakerSolitary under
+        // `CrankNicolson 0.9`). It was refused for one unit, on a measurement that turned out to name
+        // a defect of brae's rather than a gap in the scheme: phi.oldTime()'s LAZY CREATION. See the
+        // note at the host driver's offCentredFlux call -- on a moving mesh nothing asks for
+        // phi.oldTime() until alphaEqn's own blend does, so the level is born a copy of the flux
+        // beside it and the blend is inert for that one step. brae blended with the previous step's
+        // flux: phiCN 1.17 RELATIVE from OpenFOAM's at step two, U 1.2e-03 there and 1.06 at thirty.
+        // With it modelled, two steps read U 1.5e-11 and alpha 2.5e-14 against OpenFOAM's own
+        // one-ulp floor of 5.2e-12 and 6.9e-15.
+        // A MOVING MESH IS PORTED NOW, in both the places the scheme branches on it:
+        //   * fvm::ddt weights ddt0 by V0 and V00 and its source by V0 rather than V
+        //     (CrankNicolsonDdtScheme.C:1029-1065) -- a cell that grew between the two old levels does
+        //     not carry the static form's weight;
+        //   * ddtCorr(U, Uf) is fvcDdtUfCorr (:1201-1257), a different member function from the static
+        //     ddtCorr(U, phi): built from Uf.oldTime() and an old-old level of Uf, with its own surface
+        //     ddt0 field, and its coefficient taken against `Sf & Uf.oldTime()` rather than phi;
+        //   * and THE MESH FLUX ITSELF is off-centred (:1626-1661) -- fvc::meshPhi asks the ddt
+        //     scheme, so makeRelative, makeAbsolute, every movingWallVelocity patch and the closure's
+        //     divU read a combination of this move's flux and the previous one's, not mesh().phi().
+        // fvMesh::V00 is carried for the first, created on first use as OpenFOAM creates it.
+        // Held by tests/interfoam_moving_vs_openfoam.sh's `sloshing2DCN` profile, whose control is the
+        // EULER run of the same staging.
+        for (const fvOptions::Option& o : f.fvOptions.options)
+        {
+            if (o.active && o.mangroves == fvOptions::Option::Mangroves::source)
+                throw std::runtime_error(
+                    "brae interFoam: ddtSchemes names CrankNicolson AND fvOptions has `" + o.name + "` "
+                    "(multiphaseMangrovesSource), whose added mass is inertiaCoeff*fvm::ddt(U) under the "
+                    "case's scheme -- a ddt0 field of its own that brae's option does not keep (it forms "
+                    "the Euler term). Refused rather than run one scheme under another's name.");
+        }
+        // EVERY CLOSURE FORMS THE SCHEME'S OWN fvm::ddt NOW. This refused anything but kEpsilon;
+        // kOmegaSST's two equations (kOmegaSSTBase.C:572, :602) and kEqn's one (kEqn.C:172) take
+        // fvm::ddt through ddtSchemes like every other term, and each now adds the CrankNicolson
+        // term with its Euler line left inert and keeps its own ddt0 field. Gated on
+        // validation/interFoamCyclic, profiles `sstCN` and `lesCN`, whose control is the SAME case
+        // under Euler -- on both arms.
+        // A RESTART from a directory OpenFOAM wrote under CrankNicolson IS PORTED NOW: the ddt0 fields
+        // are read back with startTimeIndex -2 so the scheme is warm from the first step, and
+        // alphaPhi0's presence makes ddt(alpha)'s off-centring live there too. inter_cn_restart.cuh
+        // carries the two facts and which of the two is only a presence; the drivers do the seeding,
+        // because the ddt0 objects are theirs. Held by tests/interfoam_cn_vs_openfoam.sh's `cnRestart`
+        // profile, whose oracle is OpenFOAM's own warm restart and whose control is the same restart
+        // with the state removed -- U 5.2796e-03 apart in U and 7.2856e-03 in alpha over 2264 of 2268
+        // cells, against which both arms sit at the round-off floor (host U 1.2975e-14, device 3.6293e-12).
+        f.cnRestart.dir = startDir;
+        // ...AND NOT ACROSS A COUPLED PAIR. The device loop keeps the coupled faces' flux in arrays of
+        // their own -- dPhiOOIf beside dPhiOOI, ddtCorrPhiIf beside ddtCorrPhi (inter_driver_device.cu) --
+        // because a cyclic patch is not in the boundary-face array; the seed above fills the boundary
+        // arrays and leaves those cold, so a restart of a coupled case would run one half of one field
+        // warm. No shipped tutorial restarts a coupled interFoam case under this scheme and
+        // validation/interFoamCyclic's CrankNicolson profiles start from t = 0, so there is nothing that
+        // could witness the other half. Keyed on a state file actually being there, so a coupled case that
+        // starts cold under this scheme still runs.
+        {
+            bool anyState = f.cnAlphaRestart;
+            for (const char* nm : {"ddt0(rho,U)", "ddtCorrDdt0(U)", "ddtCorrDdt0(phi)", "phi_0", "U_0"})
+            {
+                anyState = anyState || std::filesystem::exists(startDir + "/" + nm);
+            }
+            if (anyState)
+            {
+                for (const FvPatch& q : patches)
+                {
+                    if (!isCoupledInterfaceType(q.type)) continue;
+                    throw std::runtime_error(
+                        "brae interFoam: ddtSchemes names CrankNicolson, the start directory holds the "
+                        "scheme's state, and patch `" + q.name + "` is `" + q.type + "` -- a coupled pair. "
+                        "The old-old flux and the ddtCorr ddt0 across a pair live in arrays of their own "
+                        "that this restart does not seed, so one half of one field would start cold. No "
+                        "fixture restarts a coupled case under this scheme. Refused rather than run half "
+                        "of it warm.");
+                }
+            }
+        }
+        // ...EXCEPT THE TWO A MOVING MESH WRITES. ddtCorrDdt0(Uf) is fvcDdtUfCorr's surface-vector ddt0
+        // and meshPhiCN_0 is the off-centred mesh flux's; the one shipped interFoam tutorial that names
+        // CrankNicolson, RAS/floatingObject, moves its mesh under rigidBodyMotion: it runs, but brae does
+        // not write its CrankNicolson state (the writer refuses it) and refuses a restart of a moved mesh,
+        // so there is no fixture that could witness a seed for either. A seed nothing measures is worth
+        // less than a refusal.
+        for (const char* name : {"ddtCorrDdt0(Uf)", "meshPhiCN_0"})
+        {
+            if (std::filesystem::exists(startDir + "/" + name))
+                throw std::runtime_error(
+                    "brae interFoam: ddtSchemes names CrankNicolson and the start directory holds `"
+                    + std::string(name) + "`, which OpenFOAM reads back as a MOVING mesh's previous-step "
+                    "ddt (ddt0_ with startTimeIndex -2) and runs CrankNicolson from the first step. brae "
+                    "reads the static-mesh state and starts these two cold; no shipped tutorial restarts a "
+                    "moving interFoam case under this scheme, so no gate could hold a seed. Refused rather "
+                    "than run a different first step.");
+        }
+    }
+    // THE localEuler REFUSALS OF WHAT THE CASE CARRIES, after everything they test has been read. The
+    // first cut placed them with the controls above, before the options and the zones were read: those
+    // two could never fire, and ddt_localEulerMRF RAN -- to max|U| 1.3e+13 in two steps. One order, so
+    // each refusal arm reaches its own: the mesh, the options, the zones, the closure, then alpha's own.
+    if (f.lts && f.meshIsDynamic)
+        throw std::runtime_error(
+            "brae interFoam: ddtSchemes `default` is localEuler and the mesh is dynamic. localEulerDdtScheme's "
+            "moving-mesh terms (Vsc, meshPhi) and a local time step on a changing mesh are not ported.");
+    if (f.lts && !f.fvOptions.empty())
+        throw std::runtime_error(
+            "brae interFoam: ddtSchemes `default` is localEuler and fvOptions is not empty. An option's own "
+            "fvm::ddt (the mangroves' added mass) would take controlDict's deltaT where OpenFOAM's takes the "
+            "local one.");
+    if (f.lts && !f.mrfZones.empty())
+        throw std::runtime_error(
+            "brae interFoam: ddtSchemes `default` is localEuler and the case has MRF zones. No fixture holds "
+            "MRF under a local time step.");
+    // kOmegaSST in the uniform lineage takes the local step (kOmegaSST::Compressible::rDeltaTCells); the
+    // other closures do not yet
+    if (f.lts && f.turbulence.on
+     && !(f.turbulence.model == InterRasModel::KOmegaSST && !f.turbulence.variableDensity))
+        throw std::runtime_error(
+            "brae interFoam: ddtSchemes `default` is localEuler and the closure is not kOmegaSST in the uniform "
+            "lineage. Its fvm::ddt under localEuler (localEulerDdtScheme.C:225-341, by the closure's alpha and "
+            "rho) is ported for kOmegaSST's fvmDdt(vf) (:225-249) only.");
+    if (f.lts && f.alphaCtl.nAlphaSubCycles > 1)
+        throw std::runtime_error(
+            "brae interFoam: ddtSchemes `default` is localEuler and nAlphaSubCycles is "
+            + std::to_string(f.alphaCtl.nAlphaSubCycles) + ". alphaEqnSubCycle.H:13-17 then runs alpha on "
+            "localRSubDeltaT (localEulerDdt.C:71-89), which is not ported.");
+    if (f.lts && !f.alphaCtl.MULESCorr)
+        throw std::runtime_error(
+            "brae interFoam: ddtSchemes `default` is localEuler and MULESCorr is off. The explicit MULES solve "
+            "then takes the local rDeltaT (MULESTemplates.C, localEulerDdt::enabled), which is not ported; "
+            "MULESCorr yes is.");
+    if (f.lts && f.ddtAlpha == AlphaDdt::CrankNicolson)
+        throw std::runtime_error(
+            "brae interFoam: ddtSchemes `default` is localEuler and `ddt(alpha)` names CrankNicolson. "
+            "alphaEqn.H's off-centred flux under a local time step is held by no fixture; refusing rather "
+            "than run.");
+    if (!f.mrfZones.empty() && f.dynamicMesh)
+        throw std::runtime_error(
+            "brae interFoam: the case has an active MRF zone AND a moving mesh. MRF.update() rebuilds "
+            "the zone's face lists when the topology changes and makeRelative composes with the mesh "
+            "flux (interFoam.C:128, pEqn.H:19-24); no shipped tutorial pairs them and no gate holds it.");
+    if (!f.mrfZones.empty() && f.turbulence.on)
+        throw std::runtime_error(
+            "brae interFoam: the case has an active MRF zone AND is turbulent. The one shipped MRF "
+            "tutorial, laminar/mixerVessel2D, is laminar, so no gate holds the closure in a rotating "
+            "frame against OpenFOAM. Refused rather than run ungated.");
+    for (std::size_t pi = 0; pi < patches.size() && !f.mrfZones.empty(); ++pi)
+    {
+        if (!f.p_rgh.boundary[pi]->updateableSnGrad()) continue;
+        throw std::runtime_error(
+            "brae interFoam: the case has an active MRF zone AND p_rgh patch `" + patches[pi].name
+            + "` is a fixedFluxPressure. constrainPressure(p_rgh, U, phiHbyA, rAUf, MRF) subtracts "
+            "MRF.relative(Sf & U_b) there (constrainPressureI.H), and this port's subtracts Sf & U_b; "
+            "mixerVessel2D's walls are zeroGradient, so nothing gates the difference.");
+    }
+    // A MOVING MESH UNDER kEpsilon OR kOmegaSST: fvm::ddt takes V0 in the source and divU the absolute
+    // flux (the Compressible V0 and meshPhi of each), the wall functions' y is recomputed from the moved
+    // geometry at every correct (nearWallDist::movePoints), and kOmegaSST's meshWave wallDist after every
+    // motion (moveInterTurbulence). The LES closure's moving-mesh terms are not carried: refused.
+    // ...AND THE LES CLOSURE CARRIES IT NOW, with a third term the RAS ones do not have: the FILTER
+    // WIDTH. LESModel::correct() calls delta_().correct() first (LESModel.C:251) and
+    // cubeRootVolDelta::correct() recomputes (deltaCoeff*V)^(1/3) whenever the mesh is changing
+    // (cubeRootVolDelta.C:128-134). Gated on waves/waveMakerPiston `pistonLES`, both arms.
+    // A WAVE CONDITION ON A MOVING MESH IS NOT REFUSED. OpenFOAM's wave models take their geometry once,
+    // at construction (waveModel::initialiseGeometry: the patch's orientation, each face's height and
+    // paddle), and read only its magSf and its face cells' alpha as the run goes (waveModel::waterLevel);
+    // brae's WaveModel does the same, through the patch the mesh update rebuilds in place. The five
+    // waveMaker tutorials absorb at a wall whose points the motion pins, where the two are one geometry.
+
+    // --- coupled patches ----------------------------------------------------------------------
+    // A cyclic is a real coupled patch here ONLY when the caller attached its coupling to the mesh patch
+    // (attachCyclicCoupling): then the shared factory built a CoupledCyclicPatchField and every operator
+    // on this path branches on FvPatch::coupled. Without it the factory's placeholder is a zeroGradient
+    // and the pair would run as two walls, silently -- so that is refused, and so is every coupled
+    // type the operators do not carry, and every pairing of a cyclic with a part of interFoam that was
+    // never run across one.
+    {
+        const FvPatch* firstCoupled = nullptr;
+        for (const FvPatch& q : patches)
+        {
+            if (isCoupledInterfaceType(q.type) && !q.coupled)
+            {
+                throw std::runtime_error(
+                    "brae interFoam: patch `" + q.name + "` is " + q.type + " and its coupling is not "
+                    "attached. The host loop couples a translational `cyclic` (a baffle pair included) "
+                    "once attachCyclicCoupling() has filled the mesh patch, a coincident cyclicACMI "
+                    "pair once cpu::cyclicACMI::setup() has, and a cyclicAMI pair once "
+                    "cpu::cyclicAMIFvPatch::setup() has; processor patches are not ported here. Refused "
+                    "rather than run as two walls.");
+            }
+            if (q.coupled && !firstCoupled)
+            {
+                firstCoupled = &q;
+            }
+        }
+        // A JUMP IS THE OWNER'S: fixedJumpFvPatchField::jump() on the other side returns the owner's, so
+        // the file's `jump` on the owner is handed across before anything reads it
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            if (!patches[pi].coupled || !patches[pi].owner) continue;
+            if (const std::vector<scalar>* j = f.p_rgh.boundary[pi]->coupledJump())
+            {
+                f.p_rgh.boundary[static_cast<std::size_t>(patches[pi].nbrPatch)]->setOwnerJump(*j);
+            }
+        }
+        f.p_rgh.evaluateBoundary();
+        if (firstCoupled)
+        {
+            const std::string who = "brae interFoam: the case has the cyclic patch `" + firstCoupled->name + "` AND ";
+            // WHICH PAIRS ARE COUPLED AGAIN AFTER A MOVE. A cyclicAMI is (cyclic_ami_cpp, through the
+            // driver's mesh update). A cyclicACMI is too, now: interMeshUpdate re-runs
+            // cpu::cyclicACMI::setup on the moved points -- resetAMI() then scalePatchFaceAreas(),
+            // which is what cyclicACMIFvPatch::movePoints does -- and attachCyclicCoupling behind it,
+            // so a PLAIN CYCLIC in the same mesh is re-coupled with it and its weights and deltas are
+            // the moved geometry's. Without an ACMI nothing re-runs attachCyclicCoupling, so a plain
+            // cyclic on a mesh that moves is still refused: its weights would be the start's.
+            bool hasACMI = false;
+            for (const FvPatch& q : patches)
+            {
+                hasACMI = hasACMI || q.type == "cyclicACMI";
+            }
+            bool allRecoupled = true;
+            for (const FvPatch& q : patches)
+            {
+                allRecoupled = allRecoupled
+                            && (!q.coupled || q.type == "cyclicAMI" || q.type == "cyclicACMI" || hasACMI);
+            }
+            if (f.dynamicMesh && !allRecoupled)
+                throw std::runtime_error(who + "a moving mesh. The pair's weights and deltas are taken once.");
+            // ...AND THE MECHANISM, which this refusal did not name until the MRF-beside-refinement unit
+            // went looking for what setMRFFaces does that buildZone does not. Its last statement is
+            // syncTools::syncFaceList(mesh_, faceType, maxEqOp<label>()) (MRFZone.C:123), and that
+            // function's cyclic half is OUTSIDE the parRun block that closes at syncToolsTemplates.C:1222
+            // -- "Do the cyclics." at :1224 runs IN SERIAL TOO. So a cyclic face takes the MAX of its own
+            // and its partner's faceType: a face whose own cell is outside the zone but whose PARTNER's
+            // cell is inside it is type 2 in OpenFOAM, and lands in excludedFaces_. brae's buildZone has no
+            // sync, so that face is type 0 and lands in neither list. VERIFIED that this refusal reaches
+            // such a case: validation/interFoamCyclic with a 100-cell cellZone and an MRFProperties on it
+            // stops here by name -- once the p_rgh fixedFluxPressure is taken out, because THAT refusal
+            // fires first and hid this one on the fixture.
+            if (!f.mrfZones.empty())
+                throw std::runtime_error(who + "an active MRF zone. MRF's face lists do not carry coupled faces here: "
+                    "setMRFFaces ends in syncTools::syncFaceList with maxEqOp (MRFZone.C:123), whose cyclic half runs "
+                    "in serial too (syncToolsTemplates.C:1224), so a face whose PARTNER's cell is in the zone is "
+                    "excluded in OpenFOAM and in neither list here.");
+            if (anyFvOption)
+                throw std::runtime_error(who + "an active fvOption. Nothing holds the two together against OpenFOAM.");
+            if (f.waves.any)
+                throw std::runtime_error(who + "a wave condition. Nothing holds the two together against OpenFOAM.");
+            // EVERY CLOSURE THE READER BUILDS IS CARRIED ACROSS A PAIR NOW. This refused anything but
+            // kEpsilon; what it hid was that the host kOmegaSST folded the pair's boundaryCoeffs into
+            // its source (they are interface coefficients the solver multiplies by the neighbour's
+            // psi, not a constant) and rebuilt DkEff/DomegaEff on those faces from a `calculated` nut
+            // instead of keeping fvc::interpolate's value. Both are fixed and all three closures are
+            // gated on validation/interFoamCyclic -- profiles `sst` and `les`, each against its own
+            // walled control. The DEVICE closure is a separate question and refuses by name
+            // (inter_driver_device.cu).
+            // THE SEGREGATED MOMENTUM SOLVE AND THE LIMITED grad(U) carry a coupled patch through the
+            // interface stencil (solveVector, cellLimitedGrad) and are gated across a cyclicAMI
+            // (tests/interfoam_ami_vs_openfoam.sh); across a cyclic or cyclicACMI no gate holds them
+            for (const FvPatch& q : patches)
+            {
+                if (!q.coupled || q.type == "cyclicAMI") continue;
+                if (f.momentumPredictorOn)
+                    throw std::runtime_error(
+                        "brae interFoam: the case runs a momentum predictor across the coupled patch `" + q.name
+                        + "` (" + q.type + "). fvMatrix::solveSegregated's coupled source is gated across a "
+                        "cyclicAMI only; refused rather than run ungated.");
+                // `cellLimited grad(U)` ACROSS A PLAIN CYCLIC runs now. The refusal said
+                // cellLimitedGrad's coupled range was gated across a cyclicAMI only, which was true:
+                // the code walked the patch, nothing held it on a translational pair.
+                // validation/interFoamCyclic `sstLim` holds it -- grad(U), grad(k) and grad(omega)
+                // all `cellLimited Gauss linear 1` on a `corrected` laplacian, both arms.
+            }
+            // THE OTHER GRADIENTS' ENTRIES. Every one is gated on damBreak (`gradLsqLimited`, `nHatLimited`),
+            // which has no coupled patch; the limiter's coupled range is the one limitPass that grad(U)'s
+            // cyclicAMI gate holds, and nothing holds a least-squares stencil across any coupled patch.
+            {
+                const std::pair<const char*, GradChoice> sites[] = {
+                    {"grad(alpha)", f.gradAlpha1},
+                    {"grad(alpha2)", f.gradAlpha2},
+                    {"grad(p_rgh)", f.gradPrgh},
+                    {"grad(pcorr)", f.gradPcorr},
+                    {"grad(rho)", f.gradRho},
+                    {"nHat", f.interface.nHatGrad},
+                };
+                for (const FvPatch& q : patches)
+                {
+                    if (!q.coupled) continue;
+                    const bool ami = q.type == "cyclicAMI";
+                    if (f.gradULeastSq)
+                        throw std::runtime_error(
+                            "brae interFoam: fvSchemes takes grad(U) leastSquares across the coupled patch `" + q.name
+                            + "` (" + q.type + "). No gate holds a least-squares stencil across a coupled patch; "
+                            "refused rather than run ungated.");
+                    for (const auto& site : sites)
+                    {
+                        if (site.second.leastSquares || (!ami && site.second.cellLimitK > scalar(0)))
+                            throw std::runtime_error(
+                                std::string("brae interFoam: fvSchemes takes ") + site.first + " "
+                                + (site.second.leastSquares ? "leastSquares" : "cellLimited")
+                                + " across the coupled patch `" + q.name + "` (" + q.type + "). The gradient "
+                                "entries are gated on damBreak, which has none, and the limiter's coupled range "
+                                "across a cyclicAMI only; refused rather than run ungated.");
+                    }
+                }
+            }
+            // gaussLaplacianScheme adds the deferred non-orthogonal correction on a coupled face too (its
+            // correction vectors are not zero there): fvm::laplacianNonOrthSource assembles it and
+            // laplacianCorrFluxCoupled hands it to the pressure flux
+        }
+    }
+
+    // --- gh, ghf and p ------------------------------------------------------------------------
+    ghField(f.g, f.ghRefValue, g.C(), f.gh);
+    {
+        std::vector<vector> Cf(static_cast<std::size_t>(m.nInternalFaces()));
+        for (label i = 0; i < m.nInternalFaces(); ++i) Cf[i] = g.Cf()[i];
+        ghField(f.g, f.ghRefValue, Cf, f.ghfInternal);
+
+        f.ghfBoundary.resize(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const FvPatch& q = patches[pi];
+            std::vector<vector> bCf(static_cast<std::size_t>(q.size));
+            for (label i = 0; i < q.size; ++i) bCf[i] = g.Cf()[q.start + i];
+            ghField(f.g, f.ghRefValue, bCf, f.ghfBoundary[pi]);
+        }
+    }
+    staticPressure(f.p_rgh.internal, f.rho, f.gh, f.p);
+    f.pRef = readPressureReference(f.p_rgh, fvSolution, m, g);
+    if (f.pRef.needReference)
+    {
+        // createFields.H:115-124
+        applyPressureReference(f.p, f.p_rgh.internal, f.rho, f.gh, f.pRef.pRefCell, f.pRef.pRefValue);
+        f.p_rgh.evaluateBoundary();
+    }
+
+    // createUfIfPresent.H:38-58 builds Uf `if (mesh.dynamic())`, which is MOVING OR TOPO-CHANGING -- not
+    // "has a motion solver". MEASURED: OpenFOAM's own run of laminar/damBreakWithObstacle, a refine-only
+    // case, writes a Uf beside every time directory. Built on f.dynamicMesh instead, an adaptive case had
+    // no Uf at all, so the flux rebuild a mesh change needs (phi = Sf & Uf) would have read zeros.
+    //
+    // ...AND IT IS READ_IF_PRESENT, which this port had as an unconditional interpolation behind a comment
+    // that said "a `Uf` file in the start directory is a restart's, and a restart of a moving mesh is
+    // refused where the mesh is read". True of a MOVING mesh and FALSE of a refining one: the two lines
+    // above are the reason -- a refining mesh is dynamic, so it is AUTO_WRITE and every time directory it
+    // writes carries a Uf, and a run resumed from one of those must read it. The IOobject is
+    // `READ_IF_PRESENT` with `fvc::interpolate(U)` only as the fallback, exactly as createPhi.H is for phi
+    // (which this port already read).
+    //
+    // MEASURED, on a case resumed from a refined mesh (tests/interfoam_amr_levels_vs_openfoam.sh's fixture,
+    // with the file left in place): the mesh and EVERY CELL LEVEL came out exactly OpenFOAM's while alpha
+    // read 8.8625e-02, p_rgh 8.9647e-02 and U 1.2349e+00 -- because `phi = mesh.Sf() & Uf()`
+    // (interFoam.C:131) consumes it directly at the change and fvc::ddtCorr reads its oldTime.
+    if (f.meshIsDynamic)
+    {
+        std::vector<std::vector<vector>> Ub(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            Ub[pi] = f.U.boundary[pi]->value();
+        }
+        if (std::getenv("BRAE_CONTROL_NO_UF_READ"))
+        {
+            // A GATE'S CONTROL: interpolate unconditionally, which is what this port did. It is the shipped
+            // behaviour rather than an invented one, and on a case with no Uf file it is also OpenFOAM's.
+            std::printf("  *** CONTROL MODE: Uf is interpolated from U, not read from the start directory. "
+                        "This run is deliberately wrong on a case that has one. ***\n");
+            f.Uf = fvc::interpolate(f.U.internal, Ub, m, g, patches);
+            f.UfWasRead = false;
+        }
+        else
+        {
+            f.Uf = readUfIfPresent(startDir, patches, m.nInternalFaces(),
+                                   fvc::interpolate(f.U.internal, Ub, m, g, patches), &f.UfWasRead);
+        }
+    }
+
+    // interfaceProperties' CONSTRUCTOR calls calculateK (interfaceProperties.C:196-210). That first
+    // pass is what leaves alpha's wall gradient non-zero for the second one to build on.
+    interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, f.nHatf, f.K);
+
+    // rhoPhi AS createFields.H:59-71 BUILDS IT: fvc::interpolate(rho)*phi, from the phi as it was read --
+    // before initCorrectPhi -- and interpolate(rho) is linear through interpolationSchemes' default,
+    // lambda*(P - N) + N on an internal face and rho's own (calculated) patch value on a patch.
+    // alphaEqn overwrites it every step, but two things read it first: the patches that name it, at
+    // initCorrectPhi, and setRDeltaT.H's momentum Courant limit at the first step of a localEuler case.
+    // brae built it as the vanLeer alpha flux's mass flux, which is a different field; under Euler no
+    // gate could see it, and under localEuler it sets the first step's time scale.
+    if (std::getenv("BRAE_CONTROL_RHOPHI_ALPHAFLUX"))
+    {
+        // A GATE'S CONTROL: the form this port used, the vanLeer alpha flux's mass flux. It is WRONG
+        // wherever the initial rhoPhi is read -- setRDeltaT's first step under localEuler.
+        std::printf("  *** CONTROL MODE: the initial rhoPhi is the alpha flux's mass flux, not "
+                    "interpolate(rho)*phi. This run is deliberately wrong. ***\n");
+        SurfaceScalarField alphaPhi;
+        fluxWithScheme(f.phi, f.alpha1, f.divPhiAlpha, m, g, patches, alphaPhi, f.gradAlpha1);
+        massFlux(alphaPhi, f.phi, f.mixture.phases.rho1, f.mixture.phases.rho2, f.rhoPhi);
+    }
+    else
+    {
+        const label nIf = m.nInternalFaces();
+        const std::vector<label>& own = m.owner();
+        const std::vector<label>& nei = m.neighbour();
+        const std::vector<scalar>& w = g.weights();
+        f.rhoPhi.internal.resize(static_cast<std::size_t>(nIf));
+        for (label fi = 0; fi < nIf; ++fi)
+        {
+            const std::size_t ff = static_cast<std::size_t>(fi);
+            const scalar P = f.rho[static_cast<std::size_t>(own[ff])];
+            const scalar N = f.rho[static_cast<std::size_t>(nei[ff])];
+            f.rhoPhi.internal[ff] = (w[ff]*(P - N) + N)*f.phi.internal[ff];
+        }
+        f.rhoPhi.boundary.resize(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            const std::size_t n = f.phi.boundary[pi].size();
+            if (patches[pi].type == "empty")
+            {
+                // a zero-sized fvsPatchField in OpenFOAM; brae keeps the list at phi's length
+                f.rhoPhi.boundary[pi].assign(n, scalar(0));
+                continue;
+            }
+            if (f.rhoBnd[pi].size() != n)
+                throw std::runtime_error(
+                    "brae interFoam: rho has no patch values on '" + patches[pi].name + "', which the initial "
+                    "rhoPhi = interpolate(rho)*phi reads.");
+            f.rhoPhi.boundary[pi].resize(n);
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                f.rhoPhi.boundary[pi][i] = f.rhoBnd[pi][i]*f.phi.boundary[pi][i];
+            }
+        }
+    }
+    // ...and now that rhoPhi exists, the patches that NAME it learn it
+    pushFluxToPatches(f, patches);
+
+    return f;
+}
+
+} // namespace interFoam
+} // namespace cpu
+} // namespace brae

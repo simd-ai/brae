@@ -15,6 +15,13 @@
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
+#include <string>
+#include <thread>
 #include <vector>
 #include <unordered_map>
 #include <utility>
@@ -167,6 +174,195 @@ inline std::vector<std::vector<scalar>> nearWallDist(
             }
         y[pi][i] = best;
     }
+    return y;
+}
+
+// nearWallDist WITH ITS NEIGHBOUR LISTS KEPT, ON THE HOST'S THREADS: what a mesh that moves calls at every move
+// (refreshDeviceInterTurbulenceGeometry). nearWallDist above builds, at every call, the map from a point to the
+// wall faces on it, and then measures each wall face's cell centre against the face and every wall face sharing
+// a vertex -- a face sharing two vertices twice. A mesh that moves keeps its faces, so which wall faces
+// neighbour which is kept here from one call to the next (NearWallKept), each neighbour once, and the distances
+// are measured by the host's threads. The minimum of the same distances is the same number whatever the order
+// and however often one is repeated, so y is nearWallDist's to the bit.
+// `selfOnly` is a gate's CONTROL, deliberately wrong: a face is measured against itself alone.
+// the thread count the near-wall measures run on: BRAE_NEAR_WALL_THREADS=n, 16 at most by default
+inline unsigned nearWallThreads()
+{
+    static const unsigned n = []()
+    {
+        const char* e = std::getenv("BRAE_NEAR_WALL_THREADS");
+        const int asked = e ? std::atoi(e) : 0;
+        if (e && asked < 1)
+        {
+            throw std::runtime_error(std::string("brae: BRAE_NEAR_WALL_THREADS=") + e
+                                     + " is not a count of 1 or more.");
+        }
+        const unsigned have = std::max(1u, std::thread::hardware_concurrency());
+        return asked > 0 ? static_cast<unsigned>(asked) : std::min(have, 16u);
+    }();
+    return n;
+}
+
+struct NearWallKept
+{
+    std::vector<label> wallFace;     // the wall faces the lists were built from, and their vertices
+    std::vector<label> verts;
+    std::vector<label> start;        // wall face -> its candidates: itself, then each vertex neighbour once
+    std::vector<label> cand;
+    // WHAT WAS MEASURED LAST, AND ON WHAT: the wall faces' vertices and their cells' centres, by content. A
+    // second reader of the same wall geometry is handed the same numbers -- the cell wall distance's first
+    // pass and the closure's wall functions read ONE measure a mesh update where they share this object.
+    std::vector<vector>              coords;
+    std::vector<vector>              centres;
+    std::vector<std::vector<scalar>> y;
+    bool                             held = false;
+    bool                             heldSelfOnly = false;
+};
+
+inline std::vector<std::vector<scalar>> nearWallDistKept(
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    NearWallKept& kept,
+    unsigned nThreads,
+    bool selfOnly = false)
+{
+    const std::vector<vector>& pts = m.points();
+    const std::vector<label>& fv = m.faceVerts();
+    const std::vector<label>& fo = m.faceOffsets();
+    const std::vector<vector>& C = g.C();
+
+    std::vector<label> wallFace;
+    std::vector<std::pair<std::size_t, label>> from;
+    std::vector<label> verts;
+    std::vector<vector> coords;
+    std::vector<vector> centres;
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& wp = patches[pi];
+        if (wp.type != "wall") continue;
+        for (label i = 0; i < wp.size; ++i)
+        {
+            const label f = wp.start + i;
+            wallFace.push_back(f);
+            from.push_back({pi, i});
+            verts.insert(verts.end(), fv.begin() + fo[f], fv.begin() + fo[f + 1]);
+            for (label j = fo[f]; j < fo[f + 1]; ++j)
+            {
+                coords.push_back(pts[fv[j]]);
+            }
+            centres.push_back(C[wp.faceCells[i]]);
+        }
+    }
+    std::vector<std::vector<scalar>> y(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (patches[pi].type == "wall" && patches[pi].size > 0) y[pi].assign(patches[pi].size, nwdGreat);
+    }
+    if (wallFace.empty()) return y;
+
+    // THE SAME WALL, THE SAME NUMBERS: where the faces, their vertices' coordinates and their cells' centres are
+    // the ones the kept measure was taken on -- compared by content, not by a stamp -- it is handed out.
+    // MEASURED on RAS/motorBike, 2026-10-05 (a topology change a step, so the lists below are built at every
+    // measure): 3.1 ms a step for the cell wall distance's first pass and 3.2 again for the closure's build.
+    //   BRAE_CONTROL_NEAR_WALL_REMEASURE=1   every reader measures, as before
+    //   BRAE_CONTROL_NEAR_WALL_STALE=1       a gate's CONTROL, deliberately wrong: handed out on the faces alone
+    static const bool remeasure = std::getenv("BRAE_CONTROL_NEAR_WALL_REMEASURE") != nullptr;
+    static const bool stale = std::getenv("BRAE_CONTROL_NEAR_WALL_STALE") != nullptr;
+    const auto sameBits = [](
+        const std::vector<vector>& a,
+        const std::vector<vector>& b)
+    {
+        return a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size()*sizeof(vector)) == 0;
+    };
+    const bool sameLists = kept.wallFace == wallFace && kept.verts == verts;
+    if (!remeasure && kept.held && sameLists && kept.heldSelfOnly == selfOnly && kept.y.size() == y.size()
+     && (stale || (sameBits(kept.coords, coords) && sameBits(kept.centres, centres))))
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            std::printf("  near-wall distance: a second reader of the same wall geometry is handed the first "
+                        "one's measure; BRAE_CONTROL_NEAR_WALL_REMEASURE=1 measures for each\n");
+            if (stale)
+            {
+                std::printf("  *** CONTROL MODE: the kept near-wall distance is handed out without asking "
+                            "whether the wall moved. This run is deliberately wrong. ***\n");
+            }
+        }
+        return kept.y;
+    }
+
+    if (!sameLists)
+    {
+        std::unordered_map<label, std::vector<label>> pointFaces;
+        for (std::size_t w = 0; w < wallFace.size(); ++w)
+        {
+            const label f = wallFace[w];
+            for (label j = fo[f]; j < fo[f + 1]; ++j)
+            {
+                pointFaces[fv[j]].push_back(static_cast<label>(w));
+            }
+        }
+        kept.start.assign(1, label(0));
+        kept.cand.clear();
+        for (std::size_t w = 0; w < wallFace.size(); ++w)
+        {
+            const std::size_t first = kept.cand.size();
+            kept.cand.push_back(static_cast<label>(w));
+            const label f = wallFace[w];
+            for (label j = fo[f]; j < fo[f + 1]; ++j)
+            {
+                for (const label nw : pointFaces[fv[j]])
+                {
+                    bool have = false;
+                    for (std::size_t k = first; k < kept.cand.size(); ++k)
+                    {
+                        if (kept.cand[k] == nw) have = true;
+                    }
+                    if (!have) kept.cand.push_back(nw);
+                }
+            }
+            kept.start.push_back(static_cast<label>(kept.cand.size()));
+        }
+        kept.wallFace = wallFace;
+        kept.verts = verts;
+    }
+
+    const std::size_t nW = wallFace.size();
+    const unsigned nT = static_cast<unsigned>(std::min<std::size_t>(std::max(1u, nThreads), nW));
+    const auto range = [&](unsigned t)
+    {
+        for (std::size_t w = nW*t/nT; w < nW*(t + 1)/nT; ++w)
+        {
+            const vector& Cc = C[patches[from[w].first].faceCells[from[w].second]];
+            scalar best = nwdGreat;
+            const label last = selfOnly ? kept.start[w] + 1 : kept.start[w + 1];
+            for (label k = kept.start[w]; k < last; ++k)
+            {
+                const label gf = wallFace[static_cast<std::size_t>(kept.cand[static_cast<std::size_t>(k)])];
+                const scalar d = pointToFaceDist(Cc, pts, fv, fo[gf], fo[gf + 1]);
+                if (d < best) best = d;
+            }
+            y[from[w].first][static_cast<std::size_t>(from[w].second)] = best;
+        }
+    };
+    std::vector<std::thread> workers;
+    for (unsigned t = 1; t < nT; ++t)
+    {
+        workers.emplace_back(range, t);
+    }
+    range(0);
+    for (std::thread& t : workers)
+    {
+        t.join();
+    }
+    kept.coords.swap(coords);
+    kept.centres.swap(centres);
+    kept.y = y;
+    kept.held = true;
+    kept.heldSelfOnly = selfOnly;
     return y;
 }
 

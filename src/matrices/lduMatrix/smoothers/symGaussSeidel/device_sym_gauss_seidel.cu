@@ -469,8 +469,14 @@ const DeviceGaussSeidelLevels& gsLevelsFor(const DeviceLduView& A)
     cacheStat("gs-levels", cache.size());
     auto it = cache.find(A.owner);
     // A recycled owner pointer (the device pool hands equal-sized blocks back) must not replay another
-    // mesh's levels: the entry has to match the view's sizes, or it is rebuilt.
-    if (it != cache.end() && (it->second.nCells != A.nCells || it->second.nEntries != 2*A.nInternalFaces))
+    // addressing's levels. The sizes alone did not catch it: a moving mesh rebuilds its GAMG hierarchy
+    // every step and the coarse levels return at the same pointers with the same cell and face counts
+    // but a different pairing (waveMakerMultiPaddlePiston, 448k cells: device U 3.0e-02 vs OpenFOAM at
+    // 30 steps, 6.4e-11 once the smoother read the right schedule). The view's addressingId names the
+    // content; an unstamped view (0) still falls back to the pointer and the sizes.
+    if (it != cache.end()
+     && (it->second.nCells != A.nCells || it->second.nEntries != 2*A.nInternalFaces
+      || it->second.addressingId != A.addressingId))
     {
         cache.erase(it);
         it = cache.end();
@@ -493,6 +499,7 @@ const DeviceGaussSeidelLevels& gsLevelsFor(const DeviceLduView& A)
             cudaMemcpy(ownerStartH.data(),  A.ownerStart,  ((std::size_t)nC + 1)*sizeof(label), cudaMemcpyDeviceToHost);
         }
         it = cache.emplace(A.owner, buildDeviceGaussSeidelLevels(ownerH, neiH, nC, losortH, losortStartH, ownerStartH)).first;
+        it->second.addressingId = A.addressingId;
     }
     return it->second;
 }

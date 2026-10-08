@@ -128,6 +128,7 @@ Residuals simpleStep(
     mi.actuationDisk = in.actuationDisk;
     mi.nuLaminar    = in.nuLaminar;
     mi.correctedLaplacian = in.correctedLaplacian;
+    mi.nonOrthCoeffs = in.nonOrthCoeffs;
     mi.hasMRF = in.hasMRF;          mi.hasFvOptions = in.hasFvOptions;
 
     const DeviceStageDump sd = deviceStageDump();
@@ -291,6 +292,7 @@ Residuals simpleStep(
     pin.pRefCell = in.pRefCell;   pin.pRefValue = in.pRefValue;
     pin.consistent = in.consistent;
     pin.correctedLaplacian = in.correctedLaplacian;
+    pin.nonOrthCoeffs = in.nonOrthCoeffs;
     pin.snGradLimitCoeff   = in.snGradLimitCoeff;
     pin.hasMRF = in.hasMRF;       pin.hasFvOptions = in.hasFvOptions;
     pin.mrf = in.mrf;

@@ -1,0 +1,457 @@
+#pragma once
+// interFoam's createFields -- the case on disk turned into the fields the solver runs on.
+//
+// provenance:
+//   openfoam:
+//     file: applications/solvers/multiphase/interFoam/createFields.H
+//     also: applications/solvers/multiphase/VoF/createAlphaFluxes.H
+//           src/finiteVolume/cfdTools/general/include/readGravitationalAcceleration.H
+//   brae:
+//     reference: this header
+//     cuda:      (pending)
+//     tests:     tests/test_inter_case_cpp.cu, tests/interfoam_createfields_vs_openfoam.sh
+//
+// WHY THIS FILE IS SEPARATE FROM THE DRIVER, and it is the lesson rhoSimpleFoam's mirror wrote down:
+// the harness and the solver must SHARE the case-to-fields translation. A private copy in the driver
+// is the defect this project keeps finding one level up -- the gate proves the step, the driver feeds
+// it something else, and nothing compares the two. buildInterFields is the one translation, and both
+// the gate and brae_interFoam call it.
+//
+// WHAT createFields.H ACTUALLY BUILDS, in order, and the three places a port goes wrong:
+//
+//   1. p_rgh and U are READ. alpha1 is read as "alpha." + phase1Name -- damBreak's is alpha.water, and
+//      the NAME comes from `phases (water air)` in transportProperties, not from a convention. Reading
+//      a hard-coded "alpha1" finds nothing on any shipped case.
+//
+//   2. alpha2 = 1 - alpha1, then the mixture: rho from the RAW alpha, mu and nu from the CLAMPED one.
+//      (two_phase_mixture_cpp.cuh carries that split and its gate.)
+//
+//   3. phi COMES FROM createAlphaFluxes.H, NOT from fvc::flux(U). OpenFOAM READS `phi` from the start
+//      directory if it is there and only computes linearInterpolate(U) & Sf when it is not. A restart
+//      therefore continues from the written flux, and recomputing it from U is a different field --
+//      U and phi are not consistent to round-off after a solve, and the difference is the continuity
+//      error the pressure corrector has just driven down.
+//
+//   4. gh and ghf need g AND hRef, and ghRef carries g's SIGN (inter_create_fields_cpp.cuh).
+//      p = p_rgh + rho*gh is written and never solved.
+#include "fvOptions_cpp.cuh"
+#include "inter_cn_restart.cuh"
+#include "MRF_cpp.cuh"
+#include "cf_types.cuh"
+#include "foam_dict.cuh"
+#include "primitive_mesh.cuh"
+#include "fv_geometry.cuh"
+#include "fv_patch.cuh"
+#include "geometric_field.cuh"
+#include "fvc.cuh"
+#include "grad_choice.cuh"
+#include "time_controls.cuh"
+#include "two_phase_mixture_cpp.cuh"
+#include "interface_properties_cpp.cuh"
+#include "alpha_eqn_cpp.cuh"
+#include "inter_ueqn_cpp.cuh"
+#include "inter_solve_cpp.cuh"
+#include "inter_set_rdeltat_cpp.cuh"
+#include "inter_create_fields_cpp.cuh"
+#include "inter_linear_solve.cuh"
+#include "gamg_solver_cpp.cuh"
+#include "inter_turbulence_cpp.cuh"
+#include "inter_waves_cpp.cuh"
+#include "dynamic_motion_solver_fv_mesh_cpp.cuh"
+#include "mules_cpp.cuh"
+#include <memory>
+#include <map>
+#include <string>
+#include <vector>
+
+namespace brae {
+namespace cpu {
+namespace interFoam {
+
+// What the case's laplacianSchemes and snGradSchemes `default` say about the NON-ORTHOGONAL part.
+struct NonOrthScheme
+{
+    // WHETHER THE EXPLICIT CORRECTION IS ADDED: `corrected`, or `limited` with a coefficient above 0.
+    bool corrected = false;
+    // WHICH DELTA COEFFICIENTS, which is a SEPARATE fact and was conflated with the one above.
+    // correctedSnGrad and uncorrectedSnGrad BOTH take `nonOrthDeltaCoeffs` (correctedSnGrad.H:108-114,
+    // uncorrectedSnGrad.H:113-119); only orthogonalSnGrad takes `deltaCoeffs` (orthogonalSnGrad.H:113-119).
+    // They differ in `corrected()`: true for the first, false for the other two. So `uncorrected` is
+    // "corrected's coefficients WITHOUT the correction flux" -- and brae, having one flag, ran ORTHOGONAL
+    // under that name, with the wrong face coefficient on every non-orthogonal face. `limited 0` is the
+    // same scheme as `uncorrected` (limitedSnGrad.H:98-124) and had the same fate.
+    bool nonOrthCoeffs = false;
+    // `limited <c>` with 0 < c < 1; 0 is "not limited", brae's convention throughout fvm/fvc
+    scalar limitCoeff = 0;
+    std::string raw;
+};
+
+// 1 - cos(angle between the cell-centre vector and the face normal), the largest over the internal
+// faces; 0 on a mesh of rectangles. Public because the device driver, which assembles orthogonal,
+// refuses a corrected scheme on a mesh where the correction is not zero.
+scalar maxNonOrthogonality(
+    const PrimitiveMesh& m,
+    const FvGeometry& g);
+
+struct InterFields
+{
+    // THE TIME INDEX THE RUN STARTS AT: `index` of <start>/uniform/time, 0 where there is none (Time.C:304-307
+    // reads it there on a restart). OpenFOAM's time index is global -- setInitialDeltaT.H is made at index 0
+    // alone, a refinement and a write on `timeStep` count from it -- and brae's step count starts at 1 in
+    // every run. Both loops took it from the WRITER (`writer ? writer->startTimeIndex() : 0`), so a caller
+    // with no writer restarted at index 0 whatever the directory said; brae_interFoam always has one, a
+    // binary built on the loops need not. Read here, once, for every reader of it.
+    label startTimeIndex = 0;
+    // --- read from the start directory
+    GeometricField<scalar> alpha1;
+    GeometricField<vector> U;
+    GeometricField<scalar> p_rgh;
+    SurfaceScalarField     phi;            // read if present, else linearInterpolate(U) & Sf
+
+    // --- derived
+    std::vector<scalar> alpha2, rho, mu, nu, gh, p;
+    // alpha2's PATCH values, which are NOT 1 - alpha1's. `alpha2 = 1.0 - alpha1` (alphaEqn.H:223) runs
+    // one line ABOVE the corrector's mixture.correct(), and at a contact-angle wall that call rewrites
+    // alpha1's gradient and re-evaluates its patch. `rho == alpha1*rho1 + alpha2*rho2` then blends the
+    // NEW alpha1 patch value with the OLD alpha2 one. Empty until the first alpha step, where
+    // 1 - alpha1's patch value is what OpenFOAM's createFields leaves too.
+    std::vector<std::vector<scalar>> alpha2Bnd;
+    // THE MIXTURE ON THE BOUNDARY, built from alpha's PATCH VALUES and not from the face cell's.
+    // Those are different fields at a contact-angle wall: alpha's patch value is
+    // patchInternalField + gradient/deltaCoeffs, and the contact angle's gradient is what pulls the
+    // interface up the wall -- 9681 over a deltaCoeffs of 20000 is +0.48 of alpha. Taking the cell
+    // value instead gives an AIR viscosity on a face the interface has climbed, and
+    // divDevRhoReff's laplacian is built from exactly that. Measured on capillaryRise against
+    // OpenFOAM's own UEqn.A(): exact in all 3200 water cells, up to 56% low in the air cells at the
+    // wall, which is where the contact line is.
+    std::vector<std::vector<scalar>> rhoBnd, muBnd, nuBnd;
+    // THE INTERFACE NORMAL AND CURVATURE ARE STATE, not a derived quantity recomputed on demand.
+    // calculateK reads alpha's WALL GRADIENT, which the previous calculateK wrote through
+    // correctContactAngle -- so it is a fixed-point iteration, and running it a different number of
+    // times than OpenFOAM gives a different curvature. Measured on capillaryRise against OpenFOAM's
+    // own K: one pass is 18% low at the contact line, two passes agree to 4e-07 relative, three
+    // overshoot by 8%. interfaceProperties' CONSTRUCTOR runs the first pass, which is why these are
+    // filled by buildInterFields and not left empty.
+    SurfaceScalarField  nHatf;
+    std::vector<scalar> K;
+    std::vector<scalar> ghfInternal;                 // gh on the internal faces
+    // ...AND ON THE BOUNDARY. The face forces are surfaceScalarFields, boundary included, and at a
+    // contact-angle wall snGrad(alpha) is the contact angle's own gradient -- so zeroing the boundary
+    // of the surface-tension force removes exactly the term the contact angle exists to apply. That
+    // was measured on capillaryRise: it is worth 6% of the velocity at step 1.
+    std::vector<std::vector<scalar>> ghfBoundary;
+    SurfaceScalarField  rhoPhi;
+
+    // --- the case's own settings
+    cpu::twoPhase::MixtureSpec   mixture;
+    interfaceProps::InterfaceCoeffs interface;
+    AlphaControls                alphaCtl;
+    MULES::Controls              mulesCtl;
+    VoFTimeControls              timeCtl;
+    // Part of the TIME STEP, not of the output: Time::setDeltaT calls adjustDeltaT, which under
+    // `writeControl adjustableRunTime` trims deltaT to land on the next write time. See
+    // time_controls.cuh, which carries the damBreak measurement.
+    WriteCadence writeCadence;
+    DivScheme                    divRhoPhiU     = DivScheme::upwind;
+    scalar                       divRhoPhiUCoeff = 1.0;
+    AlphaFluxScheme              divPhiAlpha    = AlphaFluxScheme::vanLeer;
+    AlphaFluxScheme              divPhirbAlpha  = AlphaFluxScheme::linear;
+    AlphaDdt                     ddtAlpha       = AlphaDdt::Euler;
+    DdtScheme                    ddtU           = DdtScheme::Euler;
+    // the entry `ddt(rho,U)` resolved to (fvSchemes::ddtScheme), which ddtU classifies and which the
+    // closure's own ddt names must resolve to as well
+    std::string                  ddtRhoUEntry;
+    // LOCAL TIME STEPPING: ddtSchemes `default` is localEuler (localEulerDdt::enabled). setRDeltaT.H then
+    // replaces CourantNo/alphaCourantNo/setDeltaT, reading `ltsCtl` from fvSolution's PIMPLE, and every
+    // localEuler consumer reads the per-cell `rDeltaT` -- createRDeltaT.H's field, 1/s, 1 at the start
+    // (its READ_IF_PRESENT is inert, see inter_set_rdeltat_cpp.cuh). Cells only: its patch values are the
+    // face cells'.
+    bool                         lts = false;
+    LocalEulerControls           ltsCtl;
+    std::vector<scalar>          rDeltaT;
+    // CrankNicolson's off-centring coefficient, from the entry each operand set resolves to: `ddt(alpha)`
+    // for alphaEqn.H's own blend (it asks the scheme it constructs for ddt(alpha)), `default` for
+    // fvm::ddt(rho, U), fvm::ddt(k) and ddtCorr. 1 is OpenFOAM's when the entry names none.
+    scalar                       ddtAlphaOcCoeff = 1;
+    scalar                       ddtOcCoeff      = 1;
+    // ...and what the START DIRECTORY holds of the scheme's state, when it holds any: OpenFOAM reads the
+    // ddt0 fields back and is CrankNicolson from the first step. See inter_cn_restart.cuh.
+    InterCnRestart               cnRestart;
+    // ...and whether alphaPhi0 was there: createAlphaFluxes.H's alphaRestart, which alphaEqn.H:36-45 ORs
+    // with the warm-up test so ddt(alpha)'s off-centring is live on the FIRST step. Only the file's
+    // presence reaches the answer -- see fact (2) in inter_cn_restart.cuh.
+    bool                         cnAlphaRestart  = false;
+    // laplacianSchemes and snGradSchemes `default`, as TWO facts: whether the correction flux is added
+    // (`corrected`) and which delta coefficients the implicit half takes (`nonOrthCoeffs`). OpenFOAM
+    // separates them -- uncorrectedSnGrad.H:113-119 returns nonOrthDeltaCoeffs exactly as
+    // correctedSnGrad.H:108-114 does, and only orthogonalSnGrad.H:113-119 returns deltaCoeffs -- so one
+    // flag ran ORTHOGONAL under the names `uncorrected` AND `limited 0`.
+    NonOrthScheme laplacianScheme;
+    // the `k` of `grad(U) cellLimited Gauss linear <k>`, 0 unlimited: the gradient the momentum
+    // equation's linearUpwind, its viscous term and that term's non-orthogonal correction all take
+    // through gradSchemes' grad(U) entry
+    scalar gradULimitK = 0;
+    // ...its base scheme, and the other gradients' resolved entries (grad(alpha.<phase1>),
+    // grad(alpha.<phase2>), grad(p_rgh), grad(pcorr), grad(rho)); interface.nHatGrad holds `nHat`'s
+    bool gradULeastSq = false;
+    // fvSolution's `cache { grad(U); }` and the registry field it keeps -- see GradUCache
+    GradUCache gradUCache;
+    GradChoice gradAlpha1;
+    GradChoice gradAlpha2;
+    GradChoice gradPrgh;
+    GradChoice gradPcorr;
+    GradChoice gradRho;
+    NonOrthScheme snGradScheme;
+
+    // fvSolution's PIMPLE block. READ, not assumed: damBreak sets `momentumPredictor no`, which means
+    // UEqn is ASSEMBLED AND NEVER SOLVED -- the matrix exists so pEqn can take A() and H() from it,
+    // and the velocity is left entirely to the pressure corrector. A driver that always solves the
+    // momentum equation runs a different algorithm on the canonical case and converges anyway.
+    LoopControls pimple;
+    label   nNonOrthogonalCorrectors = 0;
+    bool    momentumPredictorOn = true;
+
+    // constant/dynamicMeshDict: a mesh that MOVES, as a rigid body, or null for one that does not.
+    // Read here so that every refusal fires with the case; the driver attaches it to a mutable mesh
+    // and calls update() where interFoam.C:120 calls mesh.update(). Shared, because InterFields is
+    // copied by value into a gate's `fieldsOut`.
+    std::shared_ptr<DynamicMotionSolverFvMesh> dynamicMesh;
+    // constant/dynamicMeshDict naming `dynamicRefineFvMesh`: adaptive refinement, whose state (the mesh,
+    // the levels, the history and the protected cells) lives here for the same reason the motion solver
+    // does -- the driver's mesh-update stage owns it and InterFields is copied by value into a gate's
+    // `fieldsOut`. Null on every case that does not ask for it, which is all but three of the tutorials.
+    // The type is opaque here (inter_amr_cpp.cuh has it) so that this header does not pull the dynamic
+    // mesh in.
+    std::shared_ptr<struct InterAmr> amr;
+    // OpenFOAM's mesh.dynamic(): MOVING or TOPO-CHANGING. ONE field, because it is the predicate five
+    // different things ask -- `correctPhi`'s default, whether Uf exists at all (createUfIfPresent.H:38),
+    // whether fvc::correctUf runs (fvcMeshPhi.C:224) and which branch fvc::ddtCorr takes (fvcDdt.C:219).
+    // Deriving it per site from `dynamicMesh != nullptr` made an ADAPTIVE case answer no to all of them:
+    // Uf was never built, so the field the AMR adapter lists as mapped was never mapped, and ddtCorr ran
+    // the phi.oldTime() form where OpenFOAM runs the Uf.oldTime() one.
+    bool meshIsDynamic = false;
+    // createMRF.H: every ACTIVE zone of constant/MRFProperties, resolved against the mesh. Empty is a
+    // case without MRF. UEqn.H and pEqn.H reach it in four places -- see inter_ueqn_cpp.cuh and
+    // inter_peqn_cpp.cuh.
+    std::vector<MRF::Zone> mrfZones;
+    // ...and the SPECS they were built from, one per zone, in build order. A topology change rebuilds each
+    // zone's face lists from its own spec against the renumbered cellZone, which is what
+    // MRFZone::update() does (MRFZone.C:598-603). They were read and discarded before this unit, so the
+    // rebuild had nothing to rebuild from and MRF beside refinement was refused instead.
+    std::vector<MRF::ZoneSpec> mrfSpecs;
+    // createFvOptions.H: the case's ACTIVE options. interFoam applies them in UEqn.H:9 (== fvOptions(rho,
+    // U)), :14 (constrain) and :31 plus pEqn.H:65 (correct). ONE is ported, explicitPorositySource with
+    // DarcyForchheimer, which only the first of those reaches; everything else is refused by name.
+    fvOptions::OptionList fvOptions;
+    // THE MESH'S cellZones, ONE COPY, live. brae's PrimitiveMesh holds none, and this was read from the
+    // file twice and discarded twice -- once for MRF, once inside fvOptions::read. A topology change
+    // RENUMBERS them (a split zone cell gains its seven children), and OpenFOAM's own consumers resolve
+    // against the renumbered zone at every change, so there has to be exactly one to renumber.
+    std::map<std::string, std::vector<label>> cellZones;
+    // createDyMControls.H / readDyMControls.H: PIMPLE's `correctPhi` (default mesh.dynamic()),
+    // `checkMeshCourantNo` and `moveMeshOuterCorrectors` (default false)
+    bool correctPhi = false;
+    bool checkMeshCourantNo = false;
+    bool moveMeshOuterCorrectors = false;
+    // U's patches of type movingWallVelocity, whose value the driver assigns from the motion at every
+    // mesh update (movingWallVelocityFvPatchVectorField::updateCoeffs). The shared factory builds
+    // them as fixedValue, which is what they are on a mesh that does not move.
+    std::vector<char> movingWallVelocityPatch;
+    // fvc::interpolate(U) at the start and fvc::correctUf's result after every pressure corrector
+    // (createUfIfPresent.H, pEqn.H:70): the face velocity a moving mesh's ddtCorr reads at its OLD
+    // time. Empty on a mesh that does not move.
+    SurfaceVectorField Uf;
+    // fvc::meshPhi(U) AS THE RUN'S ddt SCHEME GIVES IT. Euler answers with mesh().phi() itself, so
+    // nothing here is used; CrankNicolson answers with an off-centred combination of this move's flux
+    // and the previous one's (crank_nicolson_ddt_scheme_cpp.cuh, meshPhi), and EVERY consumer of the
+    // mesh flux goes through fvc::meshPhi: fvc::makeRelative and makeAbsolute, the movingWallVelocity
+    // patches, CorrectPhi's adjustPhi, and the closure's divU. Refreshed by interMeshUpdate at each
+    // move and read through fvcMeshPhi(); empty on a mesh that does not move.
+    SurfaceScalarField meshPhiCN;
+    fv::CrankNicolsonDdt0<scalar> cnMeshPhi0;      // OpenFOAM's registry field `meshPhiCN_0`
+    // mesh().phi().oldTime(): the flux of the PREVIOUS move, taken before this one overwrites it and
+    // only when the time index has advanced, as fvMesh::movePoints does (fvMesh.C:971-978)
+    SurfaceScalarField meshPhiPrev;
+    label              meshPhiPrevIndex = -1;
+
+    // THE PRESSURE REFERENCE. p_rgh.needReference() is true when NO patch fixes its value -- a
+    // closed tank -- and then createFields.H:104-124 reads pRefCell or pRefPoint and pRefValue from
+    // the PIMPLE dictionary, pEqn.H:47 pins the reference cell at its CURRENT p_rgh, and pEqn.H:74-83
+    // shifts p to pRefValue there and rebuilds p_rgh from it. This was `needReference = false` in the
+    // driver, with a note that damBreak's atmosphere is a totalPressure; every gated case had one.
+    struct PressureReference
+    {
+        bool needReference = false;
+        label pRefCell = -1;
+        scalar pRefValue = 0;
+    };
+    PressureReference pRef;
+
+    // THE CASE'S OWN p_rgh SOLVE, read from fvSolution's `solvers` block. It was hardcoded to 1e-9 in
+    // the driver, with a BRAE_PTOL override -- so every tutorial ran to a tolerance nobody chose, and
+    // a case asking for a LOOSER one (damBreak says `tolerance 1e-07; relTol 0.05`, five per cent of
+    // the initial residual) was solved far tighter than OpenFOAM solves it. That is not a free
+    // improvement: OpenFOAM's answer IS the loosely-solved one, and a gate comparing against it
+    // measures the two stopping points.
+    //
+    // TWO ENTRIES, CHOSEN PER CORRECTOR. pEqn.H:50 solves with p_rgh.select(pimple.finalInnerIter()),
+    // and finalInnerIter() (pimpleControlI.H:98-111) is true only on the LAST corrector's last
+    // non-orthogonal pass -- so damBreak's three correctors solve to `relTol 0.05` twice and to
+    // p_rghFinal's `relTol 0` once. This used to read relTol from the Final entry and apply it to all
+    // three, which over-solved the first two and handed the last a different starting guess.
+    //
+    // AND THE SOLVER, where brae has OpenFOAM's own. It is not cosmetic here: damBreak's over-1 alpha
+    // excursion is dt x the div(phi) this solve leaves (interFoam's alphaSuSp.H has no divU), and
+    // with PBiCGStab standing in for the case's PCG+DIC it ran anywhere from 0.12x to 3.18x
+    // OpenFOAM's from step to step. Tightening ONLY p_rgh removed all of it on both codes.
+    struct PressureLinearSolve
+    {
+        std::string solver;
+        std::string preconditioner;
+        scalar tol = 1e-7;
+        scalar relTol = 0;
+        // lduMatrix::defaultMaxIter, lduMatrix.H:125
+        int maxIter = 1000;
+        // brae::pcg is lduMatrix PCG + DICPreconditioner, gated in tests/test_pcg.cu
+        bool pcgDIC() const { return solver == "PCG" && preconditioner == "DIC"; }
+        // brae::gamgSolve is GAMGSolver on the faceAreaPair hierarchy, gated in
+        // tests/interfoam_gamg_vs_openfoam.sh; `gamg` holds that entry's controls
+        bool gamgSolver() const { return solver == "GAMG"; }
+        GamgControls gamg;
+        // `solver PCG; preconditioner { preconditioner GAMG; ... }` -- brae::pcgGamgSolve, with the
+        // sub-dictionary's controls in `gamgPrecond`. Six of the seven solid-body tutorials name it
+        // for p_rghFinal.
+        bool pcgGamg() const { return solver == "PCG" && gamgPreconditioned; }
+        bool gamgPreconditioned = false;
+        GamgPreconditionerControls gamgPrecond;
+    };
+    // THE CASE'S alpha SOLVE, which only a MULESCorr case performs (the implicit upwind pre-solve,
+    // alphaEqn.H:103-149). It used to run at a struct default of 1e-8 on the host and a hardcoded
+    // 1e-12 on the device, neither read from the case. Defaults are lduMatrix::solver's own.
+    using AlphaLinearSolve = SmoothLinearSolve;
+    AlphaLinearSolve aSolve;
+    // ...and `<alpha>Final`, which alpha1Eqn.solve() takes on the final outer corrector -- every step at
+    // nOuterCorrectors 1 (fvMatrix.C:1536-1542, fvMatrixSolve.C:356-360). One entry served every corrector.
+    AlphaLinearSolve aSolveFinal;
+    // ...AND U's, which only a `momentumPredictor yes` case solves. fvMatrix::solve() selects `UFinal`
+    // on the final outer corrector and `U` on the others (the mesh's finalIteration flag), so with
+    // nOuterCorrectors 1 it is UFinal that is read and `U` alone is not enough: OpenFOAM stops on
+    // damBreak with the predictor switched on, "Entry 'UFinal' not found". brae ran that case, to a
+    // struct default of 1e-7 on the host and a hardcoded 1e-12 on the device, reading neither entry.
+    AlphaLinearSolve uSolve;
+    AlphaLinearSolve uSolveFinal;
+    // incompressibleInterPhaseTransportModel: laminar, or kEpsilon in one of its two lineages
+    InterTurbulence turbulence;
+    // waveAlpha / waveVelocity patches and their models -- see inter_waves_cpp.cuh for the timing
+    InterWaves waves;
+    // solvers/p_rgh
+    PressureLinearSolve pSolve;
+    // solvers/p_rghFinal
+    PressureLinearSolve pSolveFinal;
+    // solvers/pcorr and pcorrFinal, for CorrectPhi -- pcorr is read only when a non-orthogonal
+    // corrector asks for it
+    PressureLinearSolve pcorrSolve;
+    PressureLinearSolve pcorrSolveFinal;
+    // rAU as pEqn.H leaves it for the next mesh update's CorrectPhi: 1 at the start (initCorrectPhi.H),
+    // then 1/UEqn.A() of the last corrector. Its patch values are the face cells' (A() is
+    // extrapolatedCalculated), which is what fvc::interpolate's boundary takes.
+    std::vector<scalar> rAU;
+    // relaxationFactors/equations. THE QUESTION IS "DOES THE CASE NAME ONE", not "is it below 1":
+    // fvMatrix::relax() is `if (mesh.relaxEquation(name, coeff)) relax(coeff)` and relaxEquation is
+    // `found(name) || found("default")` (solution.C:330-334), so a case naming 1 relaxes -- the
+    // dominance clamp still runs -- and a case naming nothing does not. damBreak says `".*" 1`;
+    // capillaryRise has no relaxationFactors block at all, and this was hardcoded to true until that
+    // case was run.
+    bool    relaxEquationU = false;
+    scalar  relaxU = 1.0;
+    // ...and BY THE NAME fvMatrix::relax() asks for (fvMatrix.C:1249-1263): `UFinal` on the final outer
+    // corrector -- every step at nOuterCorrectors 1 -- and `U` on the others. One lookup of `U` served
+    // every corrector: `U 0.7; UFinal 1;` under-relaxed the final corrector too, and `U 0.9;` alone at
+    // one outer corrector relaxed where OpenFOAM does not relax at all.
+    bool    relaxEquationUFinal = false;
+    scalar  relaxUFinal = 1.0;
+
+    vector  g{0, 0, 0};
+    scalar  hRef = 0;
+    scalar  ghRefValue = 0;
+    scalar  deltaT = 0;
+    std::string alphaName;                 // "alpha." + phase1Name
+    bool    phiWasRead = false;            // see note 3
+    // ...and the same question for Uf, which createUfIfPresent.H also builds READ_IF_PRESENT. A gate needs
+    // this to assert its fixture actually CARRIES one: an arm comparing Uf would otherwise pass on a case
+    // that has no file, where both codes interpolate and agree by construction.
+    bool    UfWasRead = false;
+};
+
+// rho AS OpenFOAM HOLDS IT: the cell values plus CALCULATED patch values, for fvc::snGrad(rho).
+// createFields.H builds rho from `alpha1*rho1 + alpha2*rho2`, so its patches are `calculated` and their
+// snGrad() is the base class's, deltaCoeffs*(rho_b - rho_cell) (fvPatchField.C:220-223) -- NOT zero.
+// brae took snGrad(rho) from a zeroGradient copy, which is zero on every patch. On a fixedFluxPressure
+// wall that cancels through constrainPressure, and on both shipped tutorials alpha's patch value equals
+// the cell's everywhere else, so nothing showed: the manifest carried it as LATENT. It is not small.
+// Where a value-fixing pressure patch takes in one phase over a cell holding the other -- measured on
+// damBreak with the atmosphere's inletValue set to 1 -- OpenFOAM's boundary snGrad(rho) is 1.57e+05 on
+// 19 of 46 faces and phig there is 1.66e-02 against a phiHbyA of 2.5e-06. brae had 0, and alpha, p_rgh
+// and U were each 100% out from the second step on.
+GeometricField<scalar> rhoWithPatchValues(
+    const std::vector<scalar>& rhoCells,
+    const std::vector<std::vector<scalar>>& rhoBnd,
+    const std::vector<FvPatch>& patches,
+    // false: an `empty` patch's zeroGradient stand-in is not evaluated -- for a caller that reads its gradient
+    // coefficients alone (they are zero) and never its values, which on a 2-D mesh are two faces a cell
+    bool evaluateEmpty = true);
+
+// Tell every flux-conditional patch of U, p_rgh and alpha1 the current phi -- see the definition.
+// Call it whenever phi changes, before the next boundary evaluation reads it.
+// `uCoefficientsKept`: U's patches are NOT told (a class whose updateCoeffs ends in evaluate() still
+// is), because OpenFOAM's inletOutlet family moves its valueFraction only inside updateCoeffs, and
+// there are two moments where phi has moved and no updateCoeffs of U's follows before the next read:
+//   - the FIRST pressure corrector of a pass with no momentum predictor, where the patches are still
+//     updated() from the momentum assembly and their evaluate blends with the assembly-time
+//     coefficients (the host pEqn carries this rule in its own loop, inter_peqn_cpp.cu, where the
+//     measurements are; the device loop's hand-over is this function);
+//   - the END of the corrector loop: nothing runs updateCoeffs on U until the next momentum assembly,
+//     and the turbulence correct in between reads the patch's snGrad() -- vf*(refValue - pif)*dc --
+//     through gaussGrad's boundary correction. Told early, the closure saw the new switch where
+//     OpenFOAM's still held the assembly's: MEASURED on RAS/waterChannel with an inletOutlet
+//     atmosphere and nCorrectors 1 (the lagged evaluate is then the step's last), kOmegaSST, 20 steps
+//     of 0.01: UEqn.A 3.2e-02 in the atmosphere cells at step 2 (5e-10 elsewhere), U 2.7e-05 and
+//     nut 2.4e-03 against OpenFOAM; the laminar twin, whose closure reads nothing, 8.9e-12.
+void pushFluxToPatches(
+    InterFields& f,
+    const std::vector<FvPatch>& patches,
+    bool uCoefficientsKept = false);
+
+// ...and the phase field's stored patch values, to the conditions that look ALPHA up (the two
+// permeable-wall ones). pushFluxToPatches ends with it; call it again after any evaluate of alpha's
+// boundary that the next momentum or pressure assembly should see.
+void pushAlphaToPatches(
+    InterFields& f,
+    const std::vector<FvPatch>& patches);
+
+// The case's dictionaries and fields -> InterFields. Throws, by name, on anything not ported.
+// Rebuild the boundary blends from alpha's current patch values. Called wherever mixture.correct()
+// is -- the patch values move with the contact angle every calculateK.
+// `which`: a caller that keeps an `empty` patch's entries elsewhere (the device loop, which mirrors them from
+// the cells on the GPU) builds the other patches' alone, or the empty ones' alone to make the lists whole
+// again. A patch that is left out keeps its lists, sized.
+enum class MixturePatches
+{
+    all,
+    notEmpty,
+    emptyOnly
+};
+void updateMixtureBoundary(
+    InterFields& f,
+    const std::vector<FvPatch>& patches,
+    MixturePatches which = MixturePatches::all);
+
+InterFields buildInterFields(const std::string&          caseDir,
+                             const std::string&          startDir,
+                             const PrimitiveMesh&        m,
+                             const FvGeometry&           g,
+                             const std::vector<FvPatch>& patches);
+
+} // namespace interFoam
+} // namespace cpu
+} // namespace brae

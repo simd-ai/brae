@@ -1,6 +1,7 @@
 // The OF-mirror kOmegaSST on the device. See kOmegaSST.cuh for why this exists alongside the legacy
 // deviceKOmegaSSTCorrect, and kOmegaSST_cpp.cu for the host twin this must agree with.
 #include "kOmegaSST.cuh"
+#include "limitedSchemes_cpp.cuh"   // EqnDivScheme / EqnGradScheme, dereferenced below
 #include "sst_stage_dump.cuh"
 #include "turbulence_transport.cuh"   // assembleScalarTransport / solveScalarEqn -- shared with kEpsilon
 #include "kEpsilon.cuh"               // boundField: Foam::bound, the mirror's area-weighted form
@@ -19,6 +20,20 @@ namespace brae {
 namespace gpu {
 namespace kOmegaSSTRAS {
 
+// The assembly's own instrument sink (TransportScheme::dump). `pre` keeps omega's columns and k's
+// apart under the same dump directory.
+struct AsmDumpCtx
+{
+    const brae::turbulence::SstStageDump* sd;
+    const char*                     pre;
+};
+static void asmDumpScalars(void* c, const char* name, const std::vector<scalar>& v)
+{
+    const AsmDumpCtx* x = static_cast<const AsmDumpCtx*>(c);
+    x->sd->scalars((std::string(x->pre) + name).c_str(), v);
+}
+
+
 namespace {
 
 int nBlk(int n) { return (n + 255) / 256; }
@@ -35,11 +50,23 @@ void zeroed(DeviceBuffer<scalar>& b, int n)
 // different one. Same set and same wording shape as the kEpsilon closure's.
 void refuseUnsupported(const KOmegaSSTInput& in)
 {
+    // A PAIR IS CARRIED NOW (KOmegaSSTInput::cyc, gated on validation/interFoamCyclic `sst`), so this
+    // is the refusal for a caller that has coupled faces and hands none: buildDeviceMesh keeps them
+    // out of the LDU, so they would contribute nothing to the convection or the diffusion of k and
+    // omega -- silently. rhoSimpleFoam's hook sets the flag and passes no pair; interFoam's passes
+    // the pair and does not set it.
     if (in.hasCoupledPatches)
         throw std::runtime_error(
-            "kOmegaSST(cuda): the mesh has cyclic/AMI/processor patches. buildDeviceMesh keeps those "
-            "faces out of the LDU, so they would contribute nothing to the convection or the diffusion "
-            "of k and omega -- silently.");
+            "kOmegaSST(cuda): the mesh has cyclic/AMI/processor patches and the caller handed this "
+            "closure no pair (KOmegaSSTInput::cyc is null). Those faces are not in the LDU, so they "
+            "would contribute nothing to the convection or the diffusion of k and omega -- silently. "
+            "correctNut's boundary assignment is wrong there too: OpenFOAM's "
+            "correctBoundaryConditions() overwrites a coupled face with the interpolated value, and "
+            "a1*k_b/max(...) is not the interpolation of the same expression on the two cells.");
+    if (in.hasCoupledPatches && in.cyc)
+        throw std::runtime_error(
+            "kOmegaSST(cuda): the caller both set `hasCoupledPatches` and handed a pair. One of the "
+            "two is stale; refusing rather than picking one.");
     if (in.hasUnportedFvOption)
         throw std::runtime_error(
             "kOmegaSST(cuda): the case declares an fvOption this path does not implement"
@@ -62,11 +89,15 @@ void refuseUnsupported(const KOmegaSSTInput& in)
             "kOmegaSST(cuda): a turbulence wall function sits on a patch that is not of type `wall`. "
             "nearWallDist only fills y on `wall` patches, so the wall treatment would divide by an "
             "unset distance.");
+    // THE `bounded` SPLIT IS STILL REFUSED -- see the kEpsilon twin for why the code is ready and the
+    // throw stays anyway. What this used to claim ("this closure carries one flag for both") was never
+    // true of the kernels: :782 reads in.boundedOmega and :897 in.boundedK, and the host honours it per
+    // equation too (kOmegaSST_cpp.cu:929 reads oDiv.bounded, :1094 k's).
     if (in.boundedK != in.boundedOmega)
         throw std::runtime_error(
-            "kOmegaSST(cuda): `bounded` is set on one of div(phi,k)/div(phi,omega) and not the other. "
-            "This closure carries one flag for both; refusing rather than bounding an equation the case "
-            "did not ask to bound.");
+            "kOmegaSST(cuda): `bounded` is set on one of div(phi,k)/div(phi,omega) and not the other. The "
+            "kernels and the host reference both carry it per equation; this throw is waiting for the gate "
+            "arm that would hold the split, not for the code.");
     if (!in.nuCell || !in.nuBndFace)
         throw std::runtime_error(
             "kOmegaSST(cuda): the compressible closure needs nu = mu(T)/rho per cell AND per boundary "
@@ -74,21 +105,37 @@ void refuseUnsupported(const KOmegaSSTInput& in)
 }
 
 // The scheme block every transported scalar here shares -- one place, so k and omega cannot drift.
-turbulence::TransportScheme schemeOf(const KOmegaSSTInput& in)
+// `eqnDiv`/`eqnGrad` are THIS equation's entries, or null for "take k's" -- see
+// KOmegaSSTInput::omegaDiv. Defaulted, so a caller that wants k's keeps its one-argument call.
+turbulence::TransportScheme schemeOf(const KOmegaSSTInput& in,
+                                    const cpu::EqnDivScheme*  eqnDiv  = nullptr,
+                                    const cpu::EqnGradScheme* eqnGrad = nullptr)
 {
     turbulence::TransportScheme sc;
     sc.phiInt             = in.phiInt;
     sc.phiBnd             = in.phiBnd;
-    sc.limitedLinear      = in.limitedLinear;
-    sc.limiterCoeff       = in.limiterCoeff;
-    sc.limGradK           = in.limGradK;
-    sc.limGradLeastSq     = in.limGradLeastSq;
-    sc.linearUpwind       = in.linearUpwind;
-    sc.luGradK            = in.luGradK;
+    sc.limitedLinear      = eqnDiv ? eqnDiv->limitedLinear : in.limitedLinear;
+    sc.limiterCoeff       = eqnDiv ? eqnDiv->limiterCoeff  : in.limiterCoeff;
+    // the LIMITER's gradient: the case's grad(<field>) entry, which lives in `co` and only there.
+    // It used to be a second pair of fields on this input struct, and interFoam's site filled
+    // neither -- so a case naming `grad(k) cellLimited` limited nothing (1.9e-01 off OpenFOAM's
+    // assembled system on RAS/damBreak). Same entry as gradFieldLimitK below: OpenFOAM resolves the
+    // limiter's gradient (LimitedScheme.C:56-59) and correctedSnGrad's (correctedSnGrad.C:52-55)
+    // through the same gradSchemes lookup.
+    sc.limGradK           = eqnGrad ? eqnGrad->cellLimitK  : in.co.gradKLimitK;
+    sc.limGradLeastSq     = eqnGrad ? eqnGrad->leastSquares : in.co.gradKLeastSq;
+    sc.linearUpwind       = eqnDiv  ? eqnDiv->linearUpwind  : in.linearUpwind;
+    sc.luGradK            = eqnDiv  ? eqnDiv->luGradK       : in.luGradK;
     sc.correctedLaplacian = in.correctedLaplacian;
-    sc.gradFieldLimitK    = in.co.gradKLimitK;
-    sc.gradFieldLeastSq   = in.co.gradKLeastSq;
+    sc.nonOrthCoeffs = in.nonOrthCoeffs;
+    sc.gradFieldLimitK    = eqnGrad ? eqnGrad->cellLimitK  : in.co.gradKLimitK;
+    sc.gradFieldLeastSq   = eqnGrad ? eqnGrad->leastSquares : in.co.gradKLeastSq;
     sc.snGradLimitCoeff   = in.snGradLimitCoeff;
+    // THE PAIR and the flux those equations convect with on its faces. `gammaCell` is NOT set here:
+    // it is the equation's own effective diffusivity as a CELL field and differs between omega and k,
+    // so each assembly sets its own below.
+    sc.cyc                = in.cyc;
+    sc.cycPhi             = in.cycPhi;
     return sc;
 }
 
@@ -105,6 +152,7 @@ turbulence::SolveControls solveOf(const KOmegaSSTInput& in)
     sv.polyDeg     = in.polyDeg;
     sv.gsColour    = in.gsColour;
     sv.colouring   = in.colouring;
+    sv.pbicg       = in.pbicgKE;
     return sv;
 }
 
@@ -120,10 +168,18 @@ __global__
 void ddtKernel(
     int                        nC,
     const scalar* __restrict__ V,
+    // A MOVING MESH's OLD volumes, or null on a mesh that does not move. EulerDdtScheme::fvmDdt under
+    // mesh().moving() keeps V in the DIAGONAL and takes V0 in the SOURCE
+    // (EulerDdtScheme.C: rDeltaT*rho.oldTime()*vf.oldTime()*mesh().V0()), which is exactly what the
+    // host reference does -- kEpsilon_cpp.cu:564 and :786, `(comp && comp->V0) ? (*comp->V0)[c] : V`.
+    // Transcribed from it rather than reasoned about: the two must round the same way.
+    const scalar* __restrict__ V0,
     const scalar* __restrict__ rho,
     const scalar* __restrict__ rhoOld,
     const scalar* __restrict__ psiOld,
     scalar                     rDeltaT,
+    // localEuler's per-cell rDeltaT, or null for the scalar -- the host's rDeltaTAt(c), same products
+    const scalar* __restrict__ rDeltaTCells,
     scalar* __restrict__       diag,
     scalar* __restrict__       source)
 {
@@ -131,8 +187,9 @@ void ddtKernel(
     if (c >= nC) return;
     const scalar r  = rho    ? rho[c]    : scalar(1);
     const scalar r0 = rhoOld ? rhoOld[c] : r;
-    diag[c]   += rDeltaT * r * V[c];
-    source[c] += rDeltaT * r0 * psiOld[c] * V[c];
+    const scalar rDT = rDeltaTCells ? rDeltaTCells[c] : rDeltaT;
+    diag[c]   += rDT * r * V[c];
+    source[c] += rDT * r0 * psiOld[c] * (V0 ? V0[c] : V[c]);
 }
 
 
@@ -270,6 +327,13 @@ void wallNutDispatchKernel(
     const scalar* __restrict__ wfYplLam,
     const scalar* __restrict__ Ucx, const scalar* __restrict__ Ucy, const scalar* __restrict__ Ucz,
     const scalar* __restrict__ Ubx, const scalar* __restrict__ Uby, const scalar* __restrict__ Ubz,
+    // nutkRoughWallFunction: the wall nut as correctNut was ENTERED (its limiter's history), the per-face Ks
+    // and Cs, and sqrt(sqrt(Cmu)); null when no face is rough. `noHistory` is the gate's control.
+    const scalar* __restrict__ nutPrev,
+    const scalar* __restrict__ roughKs,
+    const scalar* __restrict__ roughCs,
+    const scalar* __restrict__ roughCmu25,
+    int                        noHistory,
     scalar*       __restrict__ nutBnd)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -280,6 +344,13 @@ void wallNutDispatchKernel(
     const scalar yplLam = wfYplLam ? wfYplLam[i] : scalar(11.53);
     const int kind = wfKind ? static_cast<int>(wfKind[i]) : static_cast<int>(NutWall::Nutk);
     if (kind == static_cast<int>(NutWall::LowRe)) { nutBnd[i] = scalar(0); return; }
+    if (kind == static_cast<int>(NutWall::NutkRough))
+    {
+        // kOmegaSST_cpp.cu correctNutField's rough branch; the caller has refused a null history or Ks
+        nutBnd[i] = nutkRoughWallValue(roughCmu25[i], kCell[bndCell[i]], y[i], nuFace[i],
+                                       noHistory ? scalar(0) : nutPrev[i], roughKs[i], roughCs[i], kappa, E);
+        return;
+    }
     if (kind == static_cast<int>(NutWall::NutU) && Ucx && Ubx)
     {
         const int c = bndCell[i];
@@ -330,6 +401,20 @@ void dumpTerms(const char* fieldName, int nC, const DeviceBuffer<scalar>& field,
     };
     std::printf("  [sst] %-5s |upper| %.10g  |lower| %.10g  |iC| %.10g  |bC| %.10g\n",
                 fieldName, l2(M.upper), l2(M.lower), l2(M.iC), l2(M.bC));
+    // ...and the off-diagonals FACE BY FACE, in the same one-value-per-line form the host capture
+    // writes (inter_turbulence_cpp.cu's captureStages block). A norm says the two differ; only the
+    // faces say which, and on this closure the answer has twice been a handful of faces out of
+    // eighty thousand.
+    auto dumpVec = [&](const char* suffix, const DeviceBuffer<scalar>& b)
+    {
+        char fn2[512];
+        std::snprintf(fn2, sizeof fn2, "%s/%s_%s_%04d", termDir, fieldName, suffix, myCall);
+        std::ofstream o2(fn2);
+        o2.precision(17);
+        for (const scalar v : b.host()) o2 << v << "\n";
+    };
+    dumpVec("upper", M.upper);
+    dumpVec("lower", M.lower);
 }
 
 } // namespace
@@ -373,12 +458,19 @@ void correct(
     if (dbK.n) deviceBCValue(dbK, k, kBndLast);
     // psi.oldTime() for fvm::ddt under Euler: the fields as this call was entered, BEFORE the wall
     // override rewrites omega's wall cells -- where kOmegaSST_cpp.cu takes its kOld / omegaOld.
+    if (in.rDeltaTCells
+     && (in.cn || in.V0 || static_cast<int>(in.rDeltaTCells->size()) != nC))
+        throw std::runtime_error(
+            "brae kOmegaSST (device): a local time step (localEuler) beside CrankNicolson or on a moving mesh is "
+            "not ported, and the rDeltaT field must have one value per cell.");
     DeviceBuffer<scalar> kOld, omegaOld;
-    if (in.rDeltaT > scalar(0))
+    if (in.rDeltaT > scalar(0) || in.rDeltaTCells)
     {
-        deviceCopy(kOld, k);
-        deviceCopy(omegaOld, omega);
+        deviceCopy(kOld, in.kOldIn ? *in.kOldIn : k);
+        deviceCopy(omegaOld, in.omegaOldIn ? *in.omegaOldIn : omega);
     }
+    // the moved mesh's old volumes, null on a static one -- see ddtKernel
+    const scalar* v0P = (in.V0 && in.V0->size() == static_cast<std::size_t>(nC)) ? in.V0->data() : nullptr;
     const scalar* rhoOldP = (in.rhoOldCell && in.rhoOldCell->size()) ? in.rhoOldCell->data()
                           : (in.rhoCell ? in.rhoCell->data() : nullptr);
 
@@ -410,10 +502,27 @@ void correct(
     DeviceBuffer<scalar> gradU, S2, GbyNu0, G;
     // fvc::grad(U) through the case's grad(U) scheme (kOmegaSSTBase.C:522): leastSquares where it
     // resolves so (kOmegaSST_cpp.cu:398 is the reference), then cellLimited.
-    if (in.co.gradULeastSq) deviceLeastSquaresGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, gradU);
-    else                    deviceGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, gradU);
-    if (in.gradULimitK > scalar(0))
-        deviceCellLimitGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, gradU, in.gradULimitK);
+    // ...WITH THE PAIR. fvc::grad sums a coupled face like any other patch's, and the production term
+    // reads this gradient in the pair's own cells, where a gradient built without it is the gradient
+    // of a field with a wall there. The kEpsilon closure carries the same two calls.
+    if (in.co.gradULeastSq)
+    {
+        if (in.cyc && in.cyc->n > 0)
+        {
+            throw std::runtime_error(
+                "kOmegaSST(cuda): the case asks for a leastSquares grad(U) and the mesh has a "
+                "periodic pair. deviceLeastSquaresGradU does not carry an interface, so the pair's "
+                "cells would get a gradient fitted without it. The Gauss form does.");
+        }
+        deviceLeastSquaresGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, gradU);
+    }
+    else
+    {
+        deviceGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, gradU, /*ami=*/nullptr, in.cyc);
+    }
+    // `co.gradULimitK`, the case's ONE grad(U) entry (this struct used to carry it twice)
+    if (in.co.gradULimitK > scalar(0))
+        deviceCellLimitGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, gradU, in.co.gradULimitK, in.cyc);
     // FP-2: s2 + gByNu + G = nut*GbyNu0 in one read of the tensor (deviceSstProduction, bit-identical
     // to the three kernels it replaces).
     deviceSstProduction(gradU, nut, nC, S2, GbyNu0, G);
@@ -440,6 +549,37 @@ void correct(
     deviceDiv(dm, *in.phiInt, *in.phiBnd, divPhi);
     if (in.phiByRhoInt && in.phiByRhoBnd) deviceDiv(dm, *in.phiByRhoInt, *in.phiByRhoBnd, divU);
     else                                  deviceCopy(divU, divPhi);
+    // ...and on a MOVING mesh that divergence is of the ABSOLUTE flux: OpenFOAM's divU is
+    // fvc::div(fvc::absolute(phi, U)) = div(phi + mesh.phi()) (kOmegaSSTBase.C, and the host
+    // reference at kEpsilon_cpp.cu:279-291 adds meshPhi face by face before taking the divergence).
+    // Added to the VOLUMETRIC flux's divergence only: `bounded`'s divPhi is the equation's own mass
+    // flux, which OpenFOAM leaves relative.
+    if (in.meshPhiInt && in.meshPhiBnd)
+    {
+        const DeviceBuffer<scalar>* vi = (in.phiByRhoInt && in.phiByRhoBnd) ? in.phiByRhoInt : in.phiInt;
+        const DeviceBuffer<scalar>* vb = (in.phiByRhoInt && in.phiByRhoBnd) ? in.phiByRhoBnd : in.phiBnd;
+        DeviceBuffer<scalar> absInt, absBnd;
+        deviceCopy(absInt, *vi);
+        deviceCopy(absBnd, *vb);
+        deviceAxpy(scalar(1), *in.meshPhiInt, absInt);
+        deviceAxpy(scalar(1), *in.meshPhiBnd, absBnd);
+        deviceDiv(dm, absInt, absBnd, divU);
+    }
+    // ...and THE PAIR's faces, which fvc::div sums into their own cell like any other patch's. Each
+    // divergence takes ITS OWN flux there: divU the volumetric one and divPhi the equation's, which
+    // are one field only in the incompressible lineage.
+    if (in.cyc && in.cyc->n > 0)
+    {
+        if (!in.cycPhi || !in.cycPhiByRho)
+        {
+            throw std::runtime_error(
+                "kOmegaSST(cuda): the mesh has a periodic pair and the caller gave no flux for it. "
+                "divU takes the VOLUMETRIC flux on those faces and divPhi the equation's own; the "
+                "internal-face arrays cannot stand in for either.");
+        }
+        deviceCyclicAddDivFlux(*in.cyc, *in.cycPhiByRho, dm.V, divU);
+        deviceCyclicAddDivFlux(*in.cyc, *in.cycPhi, dm.V, divPhi);
+    }
 
     // ---- omegaWallFunction FIRST: OpenFOAM's order --------------------------------------------
     // kOmegaSSTBase::correct() calls omega_.boundaryFieldRef().updateCoeffs() (kOmegaSSTBase.C:541)
@@ -490,16 +630,57 @@ void correct(
     // grad(k) and grad(omega) through the case's OWN gradSchemes entry (fvcGrad.C:149): leastSquares
     // where it resolves so (kOmegaSST_cpp.cu:545-547, gated against OpenFOAM by
     // tests/rho_leastsquares_closure_vs_openfoam.sh), Gauss linear otherwise, cellLimited on top.
-    if (in.co.gradKLeastSq) deviceLeastSquaresGrad(dm, k, kbv, kgx, kgy, kgz);
+    // ...AND THE PAIR, which gaussGrad sums like any other patch's face. CDkOmega is
+    // 2*alphaOmega2/omega*(grad(k) & grad(omega)) and F1 blends every coefficient of the omega
+    // equation on it, so a gradient built without the pair is a different model in the pair's cells.
+    // ...and the LEAST-SQUARES form carries it too now: the pair's faces go into the dd tensor with
+    // the coupled weight and the patch's own delta, and into the fit with the NEIGHBOUR CELL's value
+    // (leastSquaresVectors.C:131-140, leastSquaresGrad.C:108-119). A scalar is never rotated across
+    // the interface, so k and omega need no transform -- grad(U) does, and stays refused below.
+    const bool pair = in.cyc && in.cyc->n > 0;
+    // ...and the LIMITER sees the pair too where the case names cellLimited: OF's cellLimitedGrad
+    // folds a coupled patch's patchNeighbourField into its range and clips the extrapolation to that
+    // face. A scalar is never rotated across the interface, so the neighbour value is the raw cell
+    // value (CellLimitInterface).
+    DeviceBuffer<scalar> cycKNbr, cycONbr, cycEmpty;
+    CellLimitInterface kIfs[1], oIfs[1];
+    int nKIfs = 0, nOIfs = 0;
+    if (in.co.gradKLeastSq) deviceLeastSquaresGrad(dm, k, kbv, kgx, kgy, kgz, in.cyc);
     else                    deviceGaussGrad(dm, k, kbv, kgx, kgy, kgz);
+    // deviceCyclicAddGrad is the GAUSS form of the pair's face -- Sf*value/V. The least-squares fit
+    // carries its own coupled term inside the kernel, so adding this one there would be a second,
+    // differently normalised copy of the same face.
+    if (pair && !in.co.gradKLeastSq) deviceCyclicAddGrad(*in.cyc, k, dm.V, kgx, kgy, kgz);
     if (in.co.gradKLimitK > scalar(0))
-        deviceCellLimitGrad(dm, k, kbv, kgx, kgy, kgz, in.co.gradKLimitK);
+    {
+        if (pair)
+        {
+            deviceCyclicNbrValue(*in.cyc, k, cycEmpty, cycEmpty, cycEmpty, 0, cycKNbr);
+            kIfs[nKIfs++] = { in.cyc->n, in.cyc->ownCell.data(), cycKNbr.data(),
+                              in.cyc->dOwnX.data(), in.cyc->dOwnY.data(), in.cyc->dOwnZ.data() };
+        }
+        deviceCellLimitGrad(dm, k, kbv, kgx, kgy, kgz, in.co.gradKLimitK, kIfs, nKIfs);
+    }
     if (omegaBndLast.size()) deviceCopy(obv, omegaBndLast);
     else                     deviceBCValue(dbOmega, omega, obv);
-    if (in.co.gradKLeastSq) deviceLeastSquaresGrad(dm, omega, obv, ogx, ogy, ogz);
-    else                    deviceGaussGrad(dm, omega, obv, ogx, ogy, ogz);
-    if (in.co.gradKLimitK > scalar(0))
-        deviceCellLimitGrad(dm, omega, obv, ogx, ogy, ogz, in.co.gradKLimitK);
+    // OMEGA'S OWN gradient entry. CDkOmega is grad(k) & grad(omega) in one expression
+    // (kOmegaSSTBase.C:548) and OpenFOAM resolves each by ITS field's name, so this half cannot read
+    // grad(k)'s scheme. Null omegaGrad means the case gave one `default`, which is k's.
+    const bool  oLeastSq = in.omegaGrad ? in.omegaGrad->leastSquares : in.co.gradKLeastSq;
+    const scalar oLimitK = in.omegaGrad ? in.omegaGrad->cellLimitK   : in.co.gradKLimitK;
+    if (oLeastSq) deviceLeastSquaresGrad(dm, omega, obv, ogx, ogy, ogz, in.cyc);
+    else          deviceGaussGrad(dm, omega, obv, ogx, ogy, ogz);
+    if (pair && !oLeastSq) deviceCyclicAddGrad(*in.cyc, omega, dm.V, ogx, ogy, ogz);   // as for k
+    if (oLimitK > scalar(0))
+    {
+        if (pair)
+        {
+            deviceCyclicNbrValue(*in.cyc, omega, cycEmpty, cycEmpty, cycEmpty, 0, cycONbr);
+            oIfs[nOIfs++] = { in.cyc->n, in.cyc->ownCell.data(), cycONbr.data(),
+                              in.cyc->dOwnX.data(), in.cyc->dOwnY.data(), in.cyc->dOwnZ.data() };
+        }
+        deviceCellLimitGrad(dm, omega, obv, ogx, ogy, ogz, oLimitK, oIfs, nOIfs);
+    }
     // F1/F2 blend on the KINEMATIC laminar viscosity, per cell -- the compressible lineage has no
     // case-constant nu, and arg1/arg2 are written in nu, not mu. FP-2: CDkOmega, F1 and F2 in one launch
     // (deviceSstCdF1F2; F1 reads the CD its own thread formed; bit-identical to the three kernels).
@@ -579,6 +760,8 @@ void correct(
 
     const turbulence::TransportScheme sc = schemeOf(in);
     const turbulence::SolveControls   sv = solveOf(in);
+    // omega's own, absent which it is k's -- which is what a caller that still refuses a mismatch means.
+    const turbulence::SolveControls   svOmega = in.omegaSolve ? *in.omegaSolve : sv;
 
     // ---- the omega equation -------------------------------------------------------------------
     // Solved FIRST, and the k equation below reads the omega this solve produced. That lag is
@@ -592,8 +775,45 @@ void correct(
         deviceInterpolate(dm, DomegaEff, gammaFace);
 
         PressureMatrix M;
-        turbulence::TransportScheme scOmega = sc;
+        // THE LIMITER'S WEIGHTS THEMSELVES, which is the one quantity the assembled matrix cannot
+        // show: that carries the laplacian and the relaxation with it. Same call, same gradient and
+        // same twoByk the assembly uses.
+        if (sd.on && in.limitedLinear)
+        {
+            DeviceBuffer<scalar> wLim;
+            deviceLimitedFaceWeights(dm, *in.phiInt, omega, ogx, ogy, ogz,
+                                     scalar(2) / std::fmax(in.limiterCoeff, scalar(1e-15)), wLim);
+            sd.scalars("omegaLimW", wLim.host());
+            sd.scalars("phiAsm", in.phiInt->host());
+        }
+        // the boundary the LIMITER's gradient will read, dumped beside the host's `omegaB_*`
+        if (sd.on && omegaBndLast.size()) sd.scalars("omegaBndLast", omegaBndLast.host());
+        if (sd.on)
+        {
+            sd.scalars("omegaAsm", omega.host());
+            const std::vector<scalar> hx = ogx.host(), hy = ogy.host(), hz = ogz.host();
+            std::vector<scalar> flat(hx.size()*3);
+            for (std::size_t c = 0; c < hx.size(); ++c)
+            { flat[c*3+0]=hx[c]; flat[c*3+1]=hy[c]; flat[c*3+2]=hz[c]; }
+            sd.components("gradOmega", flat, 3);
+        }
+        // OMEGA'S OWN entries, not a copy of k's. `sc` above is k's and the k block below still takes it.
+        turbulence::TransportScheme scOmega = schemeOf(in, in.omegaDiv, in.omegaGrad);
         scOmega.bndValues = omegaBndLast.size() ? &omegaBndLast : nullptr;
+        // ...and the assembly's OWN limiter weights, beside the recomputed pair above: the two are
+        // the same number only if the gradient the limiter uses is the gradient CDkOmega built.
+        const AsmDumpCtx omegaAsmCtx{ &sd, "omega" };
+        turbulence::TransportDump omegaAsmDump;
+        if (sd.on)
+        {
+            omegaAsmDump.ctx     = const_cast<AsmDumpCtx*>(&omegaAsmCtx);
+            omegaAsmDump.scalars = &asmDumpScalars;
+            scOmega.dump = &omegaAsmDump;
+        }
+        // the pair's diffusivity is DomegaEff's two CELLS interpolated, which is what
+        // surfaceInterpolationScheme::interpolate gives a coupled patch (:186-191); DomB is built from
+        // nut's PATCH values and blends an F1 the pair does not have -- a different number there.
+        scOmega.gammaCell = in.cyc ? &DomegaEff : nullptr;
         turbulence::assembleScalarTransport(M, dm, dbOmega, omega, gammaFace,
                                             DomB.size() ? DomB : gammaFace, scOmega);
         if (in.boundedOmega)
@@ -604,12 +824,30 @@ void correct(
         dumpTerms("omega", nC, omega, M, [&]{
             deviceOmegaReaction(dm.V, gamma, beta, GbyNu0lim, F1, CD, omega, divU,
                                 M.diag, M.source, in.rhoCell);
-            if (in.rDeltaT > scalar(0))   // fvm::ddt(alpha, rho, omega_), kOmegaSSTBase.C:572
+            // fvm::ddt(alpha, rho, omega_), kOmegaSSTBase.C:572 -- Euler, or nothing at all
+            // under steadyState. CrankNicolson takes the branch below in its place.
+            if ((in.rDeltaT > scalar(0) || in.rDeltaTCells) && !in.cn)
             {
-                ddtKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), in.rhoCell ? in.rhoCell->data() : nullptr,
+                ddtKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), v0P, in.rhoCell ? in.rhoCell->data() : nullptr,
                                              rhoOldP, omegaOld.data(), in.rDeltaT,
+                                             in.rDeltaTCells ? in.rDeltaTCells->data() : nullptr,
                                              M.diag.data(), M.source.data());
                 cudaCheck(cudaGetLastError(), "kOmegaSST omega ddt");
+            }
+            if (in.cn)
+            {
+                // ...the SCHEME's own fvm::ddt, "ddt0(rho,omega)". Transcribed from the kEpsilon
+                // closure's pair of calls, which is the gated reference for this shape.
+                if (!in.cnDdt0Omega || !in.omegaOO || !in.rhoOOCell)
+                    throw std::runtime_error(
+                        "kOmegaSST(cuda): CrankNicolson needs omega's ddt0 field, its old-old level "
+                        "and rho's.");
+                const DeviceBuffer<scalar>* old[1] = {&omegaOld};
+                const DeviceBuffer<scalar>* oo[1]  = {in.omegaOO};
+                DeviceBuffer<scalar>* src[1] = {&M.source};
+                deviceCnFvmDdt(*in.cn, *in.cnDdt0Omega, in.rhoCell,
+                               in.rhoOldCell ? in.rhoOldCell : in.rhoCell, in.rhoOOCell,
+                               1, old, oo, dm.V, M.diag, src);
             }
         });
 
@@ -622,7 +860,18 @@ void correct(
                                    // constraint value is the current field.
                                    wall.nWF > 0 ? &wall.isWallCell : nullptr,
                                    wall.nWF > 0 ? &omega0 : nullptr,
-                                   sv, res.omega, std::string(), in.gsOmega);
+                                   // ...and the FOLDED system at the solve, under the dump. The host
+                                   // capture (captureSSTSystem) runs after relax and setValues; this
+                                   // arm's dumpTerms runs BEFORE both, and comparing the two put
+                                   // 18,511 faces in the report that were only the host's setValues
+                                   // zeroing a pinned row. Same point, same convention, directly
+                                   // diffable.
+                                   svOmega, res.omega, sd.on ? sd.dir + "/omegaSys" : std::string(),
+                                   in.gsOmega, &res.omegaPerf,
+                                   // ...and the pair's off-diagonal, which deviceAmul applies as
+                                   // Apsi[own] += ifCoeff*psi[nbr]: without it the solve runs a
+                                   // different operator from the matrix it was handed
+                                   in.cyc);
         // Foam::bound(omega_, omegaMin_) -- the mirror's area-weighted form, not a clamp.
         kEpsilonRAS::boundField(omega, dm, dbOmega, in.co.omegaMin, "omega");
         if (std::getenv("BRAE_SST_DEBUG"))
@@ -669,8 +918,18 @@ void correct(
         if (in.phiBnd) deviceUpdateInletOutlet(dbK, *in.phiBnd);
 
         PressureMatrix M;
+        if (sd.on && kBndLast.size()) sd.scalars("kBndLast", kBndLast.host());
         turbulence::TransportScheme scK = sc;
         scK.bndValues = kBndLast.size() ? &kBndLast : nullptr;
+        const AsmDumpCtx kAsmCtx{ &sd, "k" };
+        turbulence::TransportDump kAsmDump;
+        if (sd.on)
+        {
+            kAsmDump.ctx     = const_cast<AsmDumpCtx*>(&kAsmCtx);
+            kAsmDump.scalars = &asmDumpScalars;
+            scK.dump = &kAsmDump;
+        }
+        scK.gammaCell = in.cyc ? &DkEff : nullptr;   // as scOmega.gammaCell, k's own DEff
         turbulence::assembleScalarTransport(M, dm, dbK, k, gammaFace,
                                             DkB.size() ? DkB : gammaFace, scK);
         if (in.boundedK)
@@ -681,12 +940,30 @@ void correct(
         dumpTerms("k", nC, k, M, [&]{
             deviceKReactionSST(dm.V, k, omega, G, divU, in.co, M.diag, M.source,
                                /*gammaIntEff=*/nullptr, /*FDES=*/nullptr, in.rhoCell);
-            if (in.rDeltaT > scalar(0))   // fvm::ddt(alpha, rho, k_), kOmegaSSTBase.C:602
+            // fvm::ddt(alpha, rho, k_), kOmegaSSTBase.C:602 -- Euler, or nothing at all
+            // under steadyState. CrankNicolson takes the branch below in its place.
+            if ((in.rDeltaT > scalar(0) || in.rDeltaTCells) && !in.cn)
             {
-                ddtKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), in.rhoCell ? in.rhoCell->data() : nullptr,
+                ddtKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), v0P, in.rhoCell ? in.rhoCell->data() : nullptr,
                                              rhoOldP, kOld.data(), in.rDeltaT,
+                                             in.rDeltaTCells ? in.rDeltaTCells->data() : nullptr,
                                              M.diag.data(), M.source.data());
                 cudaCheck(cudaGetLastError(), "kOmegaSST k ddt");
+            }
+            if (in.cn)
+            {
+                // ...the SCHEME's own fvm::ddt, "ddt0(rho,k)". Transcribed from the kEpsilon
+                // closure's pair of calls, which is the gated reference for this shape.
+                if (!in.cnDdt0K || !in.kOO || !in.rhoOOCell)
+                    throw std::runtime_error(
+                        "kOmegaSST(cuda): CrankNicolson needs k's ddt0 field, its old-old level "
+                        "and rho's.");
+                const DeviceBuffer<scalar>* old[1] = {&kOld};
+                const DeviceBuffer<scalar>* oo[1]  = {in.kOO};
+                DeviceBuffer<scalar>* src[1] = {&M.source};
+                deviceCnFvmDdt(*in.cn, *in.cnDdt0K, in.rhoCell,
+                               in.rhoOldCell ? in.rhoOldCell : in.rhoCell, in.rhoOOCell,
+                               1, old, oo, dm.V, M.diag, src);
             }
         });
 
@@ -695,7 +972,8 @@ void correct(
         // equation.
         turbulence::solveScalarEqn(M, k, dm, in.relaxEquationK, in.relaxK,
                                    in.fvoKMask, in.fvoKVal, nullptr, nullptr,
-                                   sv, res.k, std::string(), in.gsK);
+                                   sv, res.k, sd.on ? sd.dir + "/kSys" : std::string(),
+                                   in.gsK, &res.kPerf, in.cyc);
         kEpsilonRAS::boundField(k, dm, dbK, in.co.kMin, "k");
         if (std::getenv("BRAE_SST_DEBUG"))
             std::printf("  [sst] k     solve: initialResidual %.6g\n", (double)res.k);
@@ -723,6 +1001,16 @@ void correct(
             // dispatch the kEpsilon closure makes, from the same per-face codes.
             if (in.wfBndMask && in.wallYBndFace)
             {
+                // a rough face limits against the wall nut as this call was entered, which nutBnd no longer
+                // holds -- deviceSSTNutBoundary has just written every calculated face -- so it reads the
+                // caller's entry snapshot, nutBndFace
+                const bool rough = in.nutWfKsBnd != nullptr;
+                if (rough && (!in.nutWfCsBnd || !in.nutWfRoughCmu25Bnd || !in.nutBndFace
+                           || static_cast<int>(in.nutBndFace->size()) != nB
+                           || static_cast<int>(in.nutWfKsBnd->size()) != nB))
+                    throw std::runtime_error(
+                        "kOmegaSST(cuda): a nutkRoughWallFunction face needs Ks, Cs, its Cmu25 and the wall nut as "
+                        "correctNut was entered (nutBndFace), one per boundary face; the caller supplied fewer.");
                 DeviceBuffer<scalar> uBx, uBy, uBz;
                 deviceBCValue(dbU.comp[0], *in.Ux, uBx);
                 deviceBCValue(dbU.comp[1], *in.Uy, uBy);
@@ -736,7 +1024,13 @@ void correct(
                     in.nutWfEBnd      ? in.nutWfEBnd->data()      : nullptr,
                     in.nutWfYplLamBnd ? in.nutWfYplLamBnd->data() : nullptr,
                     in.Ux->data(), in.Uy->data(), in.Uz->data(),
-                    uBx.data(), uBy.data(), uBz.data(), nutBnd.data());
+                    uBx.data(), uBy.data(), uBz.data(),
+                    rough ? in.nutBndFace->data() : nullptr,
+                    rough ? in.nutWfKsBnd->data() : nullptr,
+                    rough ? in.nutWfCsBnd->data() : nullptr,
+                    rough ? in.nutWfRoughCmu25Bnd->data() : nullptr,
+                    in.nutkRoughNoHistory ? 1 : 0,
+                    nutBnd.data());
                 cudaCheck(cudaGetLastError(), "kOmegaSST wall nut");
             }
         }

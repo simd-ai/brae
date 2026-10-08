@@ -131,5 +131,23 @@ ran "$out" && ! refused "$out" \
     && say "a VECTOR \`n (0 0 1)\` still parses and runs (the scalar gate)" ok \
     || { echo "$out" | tail -3; say "a VECTOR \`n (0 0 1)\` still parses and runs (the scalar gate)" FAIL; }
 
+# ---- arm 11: nutkRoughWallFunction on this driver refuses BY NAME ---------------------------------
+# The factory builds the type now (the interFoam host kOmegaSST closure carries it), so the factory throw
+# that used to stop it here is gone. This driver's closures recompute the wall nut from k with no history,
+# and selectNutWall would have left it at nutk in silence; it refuses by name instead.
+stage kEpsilon
+python3 - "$W/c/0/nut" <<'PYEOF2'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+open(p, 'w').write(s.replace("type            nutkWallFunction;",
+                             "type            nutkRoughWallFunction;\n        Ks              uniform 1e-4;\n"
+                             "        Cs              uniform 0.5;"))
+PYEOF2
+out=$(run)
+refused "$out" && echo "$out" | grep -q "is nutkRoughWallFunction, which the" \
+    && say "nutkRoughWallFunction on the legacy driver refuses by name" ok \
+    || { echo "$out" | tail -3; say "nutkRoughWallFunction on the legacy driver refuses by name" FAIL; }
+
 [ "$fail" = 0 ] && echo "== PASSED ==" || echo "== FAILED =="
 exit "$fail"

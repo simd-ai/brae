@@ -12,7 +12,12 @@
 // subtracts only on the excluded ones. On mixerVessel2D the included faces carry a frame flux up to
 // 1.28e-04, so the two are not the same arithmetic and the difference is measurable.
 //
-// The zone geometry is static and Omega is constant, so the per-face frame flux is precomputed once.
+// Omega is constant and the geometry does not move, so the per-face frame flux is PRECOMPUTED rather than
+// formed per call -- which the host does not do, and which is why an ADAPTIVE case has to rebuild these
+// zones at every topology change and not merely re-point them at a renumbered cell list: frameFluxInt and
+// frameFluxBnd are Omega x (Cf - origin) dotted with Sf, and a refined face has a new centre and a quarter
+// of the area. interFoam's device driver re-runs buildDeviceMRFZone in its change branch for exactly that
+// (inter_driver_device.cu, buildMrf). "Precomputed once" was true of this file until then.
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 #include "MRF_cpp.cuh"
@@ -31,6 +36,10 @@ struct DeviceMRFZone
     DeviceBuffer<scalar> frameFluxInt;   // (Omega x (Cf - origin)) & Sf, 0 off the zone's internal faces
     DeviceBuffer<scalar> frameFluxBnd;   // the same, on EXCLUDED boundary faces only
     DeviceBuffer<label>  zeroBnd;        // 1 on INCLUDED boundary faces: OF sets these to zero outright
+    // MRFZone::zero's face set (MRFZoneTemplates.C:213-247), which is NOT the makeRelative one: it zeroes
+    // the zone's internal faces and BOTH its included and excluded boundary faces.
+    DeviceBuffer<label>  filterInt;
+    DeviceBuffer<label>  filterBnd;
     bool active = false;
 };
 
@@ -49,6 +58,13 @@ void deviceMrfCoriolisZone(
     const DeviceBuffer<scalar>&       Uz,
     int                               cmpt,
     DeviceBuffer<scalar>&             src);
+
+// MRFZoneList::zeroFilter(phi) -> MRFZone::zero (MRFZoneTemplates.C:213-247): the flux is set to Zero on
+// the zone's internal faces and on its included AND excluded boundary faces.
+void deviceMrfZeroFilter(
+    const std::vector<DeviceMRFZone>& zones,
+    DeviceBuffer<scalar>&             phiInt,
+    DeviceBuffer<scalar>&             phiBnd);
 
 // MRFZoneList::makeRelative(phi): subtract the frame flux on internal and excluded faces, ZERO the
 // included ones.

@@ -6,7 +6,7 @@
 //             src/finiteVolume/cfdTools/general/MRF/MRFZoneList.C
 //             src/finiteVolume/cfdTools/general/MRF/MRFZoneTemplates.C
 //   brae:     src/finiteVolume/cfdTools/general/MRF/MRF_cpp.cu
-//   tests:    tests/test_mrf_cpp.cu, tests/mrf_cpp_vs_openfoam.sh
+//   tests:    tests/mrf_cpp_vs_openfoam.sh, tests/mrf_cuda_vs_openfoam.sh, tests/interfoam_mrf_vs_openfoam.sh, tests/mrf_cpp_vs_openfoam.sh
 //
 // simpleFoam reaches it in exactly three places that do arithmetic (UEqn.H:3,8 and pEqn.H:5):
 //
@@ -38,6 +38,7 @@
 #include "geometric_field.cuh"
 #include "fvc.cuh"          // SurfaceScalarField
 
+#include <map>
 #include <string>
 #include <vector>
 
@@ -78,6 +79,19 @@ Zone buildZone(
     const std::vector<label>&   zoneCells,
     const PrimitiveMesh&        m,
     const std::vector<FvPatch>& patches);
+
+// MRFZoneList::update() (MRFZoneList.C:441-450) -> MRFZone::update() (MRFZone.C:598-604), which calls
+// setMRFFaces() AND NOTHING ELSE: it does not re-read the dictionary, does not re-look-up cellZoneID_ and
+// does not re-evaluate omega. Everything buildZone computes beyond the spec's three scalars IS
+// setMRFFaces, and the spec cannot change, so the faithful update is a rebuild from the SAME spec against
+// the LIVE cellZone -- which a topology change has renumbered by giving each child its parent's zone id.
+// The two lists stay parallel by construction (one zone per spec, built in order).
+void update(
+    std::vector<Zone>&                                zones,
+    const std::vector<ZoneSpec>&                      specs,
+    const std::map<std::string, std::vector<label>>&  cellZones,
+    const PrimitiveMesh&                              m,
+    const std::vector<FvPatch>&                       patches);
 
 // MRFZoneList::correctBoundaryVelocity -- included patch faces take the frame velocity.
 void correctBoundaryVelocity(

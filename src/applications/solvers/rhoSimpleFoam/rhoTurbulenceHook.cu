@@ -143,8 +143,6 @@ void correctTurbulence(
     kin.divSchemeUnsupported  = opt.divSchemeUnsupported;
     kin.limitedLinear         = opt.limitedLinear;
     kin.limiterCoeff          = opt.limiterCoeff;
-    kin.limGradK              = opt.limGradK;
-    kin.limGradLeastSq        = opt.limGradLeastSq;
     kin.rDeltaT               = opt.rDeltaT;
     if (opt.rDeltaT > scalar(0))
     {
@@ -183,6 +181,11 @@ void correctTurbulence(
         // disagrees with this arm's HOST reference on bound(), the nut boundary and the wall-function
         // family. kOmegaSST.cuh has the measurement.
         kOmegaSSTRAS::KOmegaSSTInput sstIn;
+        // EXPLICITLY null, not left to the default: this driver reads ONE solver entry for both closure
+        // equations and refuses a mismatch, so omega takes k's -- which is exactly what null means
+        // (kOmegaSST.cuh's omegaSolve). Said here because a reader of two builders that fill different
+        // subsets cannot tell "one entry by design" from "forgotten", and the defaults audit agrees.
+        sstIn.omegaSolve = nullptr;
         sstIn.phiInt = kin.phiInt;   sstIn.phiBnd = kin.phiBnd;
         sstIn.phiByRhoInt = kin.phiByRhoInt;   sstIn.phiByRhoBnd = kin.phiByRhoBnd;
         sstIn.rhoCell = kin.rhoCell;           sstIn.rhoBndFace = kin.rhoBndFace;
@@ -202,12 +205,10 @@ void correctTurbulence(
         sstIn.alphatWallMask = kin.alphatWallMask;  sstIn.alphatPrtFace = kin.alphatPrtFace;
         sstIn.boundedK = kin.boundedK;   sstIn.boundedOmega = kin.boundedEps;
         sstIn.limitedLinear = kin.limitedLinear;  sstIn.limiterCoeff = kin.limiterCoeff;
-        sstIn.limGradK = kin.limGradK;   sstIn.limGradLeastSq = kin.limGradLeastSq;
         sstIn.rDeltaT = kin.rDeltaT;     sstIn.rhoOldCell = kin.rhoOldCell;
         sstIn.linearUpwind = kin.linearUpwind;  sstIn.luGradK = kin.luGradK;
         sstIn.correctedLaplacian = kin.correctedLaplacian;
         sstIn.snGradLimitCoeff   = kin.snGradLimitCoeff;
-        sstIn.gradULimitK        = opt.co.gradULimitK;
         sstIn.relaxEquationOmega = kin.relaxEquationEps;  sstIn.relaxOmega = kin.relaxEps;
         sstIn.relaxEquationK     = kin.relaxEquationK;    sstIn.relaxK     = kin.relaxK;
         sstIn.tol = kin.tol;  sstIn.relTol = kin.relTol;  sstIn.maxIter = kin.maxIter;  sstIn.minIter = kin.minIter;

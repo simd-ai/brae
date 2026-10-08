@@ -151,12 +151,17 @@ struct StepInput
     scalar    gradKELimitK     = 0.0;
     // The LAPLACIAN entry's own snGrad scheme (laplacianScheme.H:121-141): every fvm::laplacian.
     bool      correctedLaplacian = false;
+    // ...and WHICH delta coefficients: `uncorrected` takes nonOrthDeltaCoeffs with no correction
+    // flux (uncorrectedSnGrad.H:113-119). See solver_controls.cuh:226.
+    bool      nonOrthCoeffs = false;
     scalar    snGradLimitCoeff   = 0.0;
     // fvc::snGrad's scheme, the snGradSchemes block -- a DIFFERENT operator (fvcSnGrad.C:56-64 ->
     // schemesLookup.C:249). Read by the SIMPLEC flux correction alone (pcEqn.H:27,64), and TRUE by
     // default because OpenFOAM's own default for an absent snGradSchemes block is `corrected`
     // (schemesLookup.C:82). These two shared one flag until 2026-09-15.
     bool      correctedFvcSnGrad  = true;
+    // ...and the snGrad block's own coefficient choice -- same two facts, other block.
+    bool      fvcSnGradNonOrthCoeffs = true;
     scalar    fvcSnGradLimitCoeff = 0.0;
 
     // --- relaxation ---
@@ -209,8 +214,6 @@ struct StepInput
     scalar turbLimiterCoeff  = 1.0;
     // cellLimited k of the LIMITER's gradient for k/epsilon|omega -- grad(k) through gradSchemes, which
     // is a different lookup from KEpsilonCoeffs::gradKLimitK's use in the corrected laplacian.
-    scalar turbLimGradK      = 0.0;
-    bool   turbLimGradLeastSq = false;
     // `Gauss linearUpwind <name>` on BOTH turbulence scalars, and the cellLimited coefficient of the
     // gradient scheme <name> resolves to (0 => unlimited Gauss linear). Both host closures assemble it;
     // the device closure does not, and the CUDA driver refuses it there by name.

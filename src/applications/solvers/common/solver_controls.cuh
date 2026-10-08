@@ -93,6 +93,13 @@ struct DeviceSimpleControls
     //
     // Neither is ever set on the steady path: OF's simpleControl has no Final concept either.
     bool   finalInner = false;   // p        -- last pressure corrector, last non-orth pass
+    // WHICH inner (pressure) corrector this is, 0-based. OpenFOAM's pEqn.H ends every corrector with
+    // U.correctBoundaryConditions(), where a flux-conditional patch re-runs updateCoeffs on the flux
+    // that corrector just produced -- EXCEPT on the first one of a pass that ran no momentum predictor,
+    // where the patches are still updated() from the momentum assembly and mixedFvPatchField::evaluate
+    // skips updateCoeffs (mixedFvPatchField.C:234-237). The interFoam loop carries the same rule
+    // (DeviceUBoundaryCall::evaluateStillUpdated).
+    int    innerCorrector = 0;
     bool   finalIter  = false;   // U, k/eps -- anywhere in the last outer corrector
     int    pMaxIter() const { return finalInner ? maxIterPFinal : maxIterP; }
     int    pMinIter() const { return finalInner ? minIterPFinal : minIterP; }
@@ -177,6 +184,22 @@ struct DeviceSimpleControls
     scalar maxwellNuM = 0.0;
     scalar maxwellLambda = 0.0;
     bool   divSigmaVanAlbada = false;   // div(phi,sigma) Gauss vanAlbada (what both Maxwell tutorials name)
+    // interFoam's VoF transport, both halves of it, in the same `twoByk` currency every other limited
+    // scheme here uses (see kVanLeerTwoByk in device_mesh.cuh): > 0 is limitedLinear's 2/max(k,SMALL),
+    // 0 is vanAlbada, -1 is vanLeer. Every interFoam tutorial writes
+    //     div(phi,alpha)   Gauss vanLeer;
+    //     div(phirb,alpha) Gauss linear;
+    // so vanLeer is the default here and the compression flux is plain linear. Both are REFUSED by name
+    // when the case asks for something brae does not have -- substituting a limiter on the interface
+    // transport is not a tolerance, it is a different interface.
+    scalar divAlphaTwoByk   = -1.0;    // kVanLeerTwoByk
+    bool   divAlphaRbLinear = true;    // div(phirb,alpha) Gauss linear
+    // WHETHER THE CASE NAMED ONE, which the value alone cannot say: the defaults above are what
+    // every interFoam tutorial asks for, so a test asserting `divAlphaTwoByk == kVanLeerTwoByk`
+    // passes whether the parser selected it or never ran -- the exact shape of the div(phi,sigma)
+    // defect above. Caught by the fail-proof on tests/test_scheme_blocks.cu, 2026-09-16.
+    bool   foundDivAlpha    = false;
+    bool   foundDivAlphaRb  = false;
     scalar relaxSigma = 1.0;            // relaxationFactors/equations/sigma (OF sigmaEqn.relax(); absent -> none)
     bool   gsSigma = false;             // solvers/sigma smoothSolver + a GaussSeidel smoother
     bool   divULimitedV = false;
@@ -190,7 +213,17 @@ struct DeviceSimpleControls
     // THE LAPLACIAN'S OWN snGrad SCHEME, from laplacianSchemes ONLY. An `fvm::laplacian` entry carries
     // its own snGrad scheme, built from that entry's Istream (laplacianScheme.H:121-141), so
     // `Gauss linear corrected` governs every laplacian in the solver and nothing else.
+    // NAMED FOR THE COEFFICIENTS BUT MEANING THE CORRECTION -- read `nonOrthCoeffs` below before using it.
     bool   nonOrth = false;      // laplacianSchemes "corrected"|"limited": nonOrthDeltaCoeffs implicit + explicit corrVec.grad correction.
+    // ...AND THE COEFFICIENT CHOICE, WHICH IS A SECOND FACT. `uncorrected` takes nonOrthDeltaCoeffs with
+    // the correction flux left off: uncorrectedSnGrad.H:113-119 returns mesh().nonOrthDeltaCoeffs()
+    // exactly as correctedSnGrad.H:108-114 does, and only orthogonalSnGrad.H:113-119 returns
+    // deltaCoeffs(). With `nonOrth` alone -- which `hasWord(ln, "corrected")` leaves FALSE for the word
+    // `uncorrected`, since it is word-boundaried -- brae ran ORTHOGONAL under the name `uncorrected`,
+    // indistinguishable from the case having said `orthogonal`. Every consumer that picks coefficients
+    // must read `nonOrth || nonOrthCoeffs`; every consumer that decides whether to ADD the correction
+    // flux must read `nonOrth` alone.
+    bool   nonOrthCoeffs = false;
     scalar nonOrthLimit = 1.0;   // that entry's "limited <psi>" coeff (OF fv::limitedSnGrad); 1.0 = "corrected" (unlimited).
     // fvc::snGrad's scheme, from snGradSchemes ONLY -- A DIFFERENT OPERATOR WITH A DIFFERENT ENTRY.
     // fvcSnGrad.C:56-64 looks the field up in snGradSchemes (schemesLookup.C:249-253); the laplacian
@@ -205,6 +238,13 @@ struct DeviceSimpleControls
     // fixture with the blocks disagreeing (rhoCtl, rhoPM) is a perfect box, where corrected ==
     // orthogonal. validation/rhoSnGrad is the fixture that can see it.
     bool   snGradCorrected = true;   // snGradSchemes "corrected"|"limited"; OF's default when the block is absent
+    // the snGrad block's own coefficient choice -- see nonOrthCoeffs above. TRUE with snGradCorrected
+    // because OpenFOAM's absent-block default is `corrected`, which takes nonOrthDeltaCoeffs.
+    // PARSED BUT NOT YET READ: the only consumer of this block's pair is rhoSimpleFoam's
+    // `correctedFvcSnGrad` (rhoSimpleFoamDriver_cpp.cu:221), which is threaded in its own gated unit
+    // against validation/rhoSnGrad. Stored here because the one reader answers both blocks at once; it is
+    // a fact with no consumer yet, NOT a field that consumers leave unset.
+    bool   snGradNonOrthCoeffs = true;
     scalar snGradLimit     = 1.0;    // snGradSchemes "limited <psi>" coeff; 1.0 = uncapped
     int    nNonOrth = 0;         // SIMPLE.nNonOrthogonalCorrectors: extra pressure-correction passes (pEqn re-solved nNonOrth+1 times). Set from fvSolution.
     scalar gradULimitK = 0.0;    // grad(U) "cellLimited Gauss linear <k>" coeff (OF cellLimitedGrad<minmod>); 0 = unlimited. Set from fvSchemes.

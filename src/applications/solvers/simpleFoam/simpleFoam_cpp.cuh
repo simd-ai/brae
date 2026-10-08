@@ -118,6 +118,7 @@ struct StepInput
     int    maxIterU = 1000, minIterU = 0;
     int    maxIterP = 1000, minIterP = 0;
     bool   correctedLaplacian = false;           // `corrected` laplacianSchemes
+    bool   nonOrthCoeffs = false;   // nonOrthDeltaCoeffs with no correction -- solver_controls.cuh:226
     scalar snGradLimitCoeff = 0.0;               // `limited <k> corrected` (OF limitedSnGrad)
     bool   bounded = false;                      // div(phi,U) `bounded`
     bool   linearUpwind = false;                 // div(phi,U) `linearUpwind`

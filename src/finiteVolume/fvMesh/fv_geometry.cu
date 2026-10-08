@@ -1,3 +1,4 @@
+#include "inter_phase_time.cuh"
 #include "fv_geometry.cuh"
 #include <stdexcept>
 #include <cmath>
@@ -25,7 +26,8 @@ void FvGeometry::makeFaceCentresAndAreas(const PrimitiveMesh& m)
             const vector& a = P[m.faceVert(f, 0)];
             const vector& b = P[m.faceVert(f, 1)];
             const vector& c = P[m.faceVert(f, 2)];
-            Cf_[f] = (a + b + c) / 3.0;
+            // triangle::centre and areaNormal (triangleI.H:150-190): (1/3)*(sum), not sum/3
+            Cf_[f] = (1.0 / 3.0) * (a + b + c);
             Sf_[f] = 0.5 * cross(b - a, c - a);
         }
         else
@@ -57,7 +59,11 @@ void FvGeometry::makeFaceCentresAndAreas(const PrimitiveMesh& m)
             }
             else
             {
-                Cf_[f] = (1.0 / 3.0) * (sumAc / sumA);
+                // primitiveMeshTools.C: (1.0/3.0)*sumAc/sumA, the scaling BEFORE the division. This
+                // was (1/3)*(sumAc/sumA), which differs in the last bit -- enough to move a cell centre
+                // by 1e-16 and, on sloshingTank2D, to pin p_rgh's reference in the cell OpenFOAM did
+                // not: pRefPoint (0 0 0.15) lies on a face, and findCell takes the nearer centre.
+                Cf_[f] = ((1.0 / 3.0) * sumAc) / sumA;
                 Sf_[f] = 0.5 * sumN;
             }
         }
@@ -155,6 +161,8 @@ void FvGeometry::makeInterpolation(const PrimitiveMesh& m)
 
 void FvGeometry::buildFaceGeometry(const PrimitiveMesh& m)
 {
+    interPhase::Nested timed("FvGeometry: face centres and areas");
+    ++generation_;
     makeFaceCentresAndAreas(m);
     areaScaled_ = false;          // areas are raw again: a fresh scale is now legal
     rawArea_.clear();
@@ -162,7 +170,12 @@ void FvGeometry::buildFaceGeometry(const PrimitiveMesh& m)
 
 void FvGeometry::buildCellGeometry(const PrimitiveMesh& m)
 {
-    makeCellCentresAndVols(m);
+    ++generation_;
+    {
+        interPhase::Nested timed("FvGeometry: cell centres and volumes");
+        makeCellCentresAndVols(m);
+    }
+    interPhase::Nested timed("FvGeometry: weights, deltaCoeffs and correction vectors");
     makeInterpolation(m);
 }
 
@@ -173,6 +186,7 @@ void FvGeometry::applyAreaScaling(const std::vector<std::pair<label, scalar>>& f
             "brae: FvGeometry::applyAreaScaling called twice without an intervening buildFaceGeometry. "
             "cyclicACMI area scaling is defined against the RAW face areas; applying it to already-scaled "
             "areas would compound the mask every step and shrink the interface away.");
+    ++generation_;
     for (const auto& fs : faceScale)
     {
         rawArea_.emplace(fs.first, magSf_[fs.first]);   // remember the raw area before touching it
@@ -180,6 +194,81 @@ void FvGeometry::applyAreaScaling(const std::vector<std::pair<label, scalar>>& f
         magSf_[fs.first] = magSf_[fs.first]*fs.second;
     }
     areaScaled_ = true;
+}
+
+void FvGeometry::setFaceArea(label f, const vector& Sf)
+{
+    ++generation_;
+    Sf_[f] = Sf;
+    magSf_[f] = mag(Sf);
+}
+
+void FvGeometry::updateCellCentresAndVols(const PrimitiveMesh& m)
+{
+    ++generation_;
+    makeCellCentresAndVols(m);
+}
+
+void FvGeometry::adopt(
+    Built& b,
+    const PrimitiveMesh& m)
+{
+    const std::size_t nF = static_cast<std::size_t>(m.nFaces());
+    const std::size_t nIf = static_cast<std::size_t>(m.nInternalFaces());
+    const std::size_t nC = static_cast<std::size_t>(m.nCells());
+    if (b.Cf.size() != nF || b.Sf.size() != nF || b.magSf.size() != nF || b.C.size() != nC || b.V.size() != nC
+     || b.weights.size() != nIf || b.deltaCoeffs.size() != nIf || b.nonOrthDeltaCoeffs.size() != nIf
+     || b.nonOrthCorr.size() != nIf)
+    {
+        throw std::runtime_error("brae: FvGeometry::adopt was handed a geometry of another mesh's sizes.");
+    }
+    Cf_.swap(b.Cf);
+    Sf_.swap(b.Sf);
+    magSf_.swap(b.magSf);
+    C_.swap(b.C);
+    V_.swap(b.V);
+    weights_.swap(b.weights);
+    deltaCoeffs_.swap(b.deltaCoeffs);
+    nonOrthDeltaCoeffs_.swap(b.nonOrthDeltaCoeffs);
+    nonOrthCorr_.swap(b.nonOrthCorr);
+    // as buildFaceGeometry: the areas are raw again
+    areaScaled_ = false;
+    rawArea_.clear();
+    ++generation_;
+}
+
+void FvGeometry::copyFrom(
+    const FvGeometry& o,
+    const PrimitiveMesh& m)
+{
+    const std::size_t nF = static_cast<std::size_t>(m.nFaces());
+    const std::size_t nIf = static_cast<std::size_t>(m.nInternalFaces());
+    const std::size_t nC = static_cast<std::size_t>(m.nCells());
+    if (o.Cf_.size() != nF || o.Sf_.size() != nF || o.magSf_.size() != nF || o.C_.size() != nC || o.V_.size() != nC
+     || o.weights_.size() != nIf || o.deltaCoeffs_.size() != nIf || o.nonOrthDeltaCoeffs_.size() != nIf
+     || o.nonOrthCorr_.size() != nIf)
+    {
+        throw std::runtime_error("brae: FvGeometry::copyFrom was handed a geometry of another mesh's sizes.");
+    }
+    if (o.areaScaled_ || !o.rawArea_.empty())
+    {
+        throw std::runtime_error(
+            "brae: FvGeometry::copyFrom was handed a geometry whose face areas are scaled; build() leaves them "
+            "raw, and a copy standing in for a build must be of the raw ones.");
+    }
+    Cf_ = o.Cf_;
+    Sf_ = o.Sf_;
+    magSf_ = o.magSf_;
+    C_ = o.C_;
+    V_ = o.V_;
+    weights_ = o.weights_;
+    deltaCoeffs_ = o.deltaCoeffs_;
+    nonOrthDeltaCoeffs_ = o.nonOrthDeltaCoeffs_;
+    nonOrthCorr_ = o.nonOrthCorr_;
+    // as buildFaceGeometry: the areas are raw again
+    areaScaled_ = false;
+    rawArea_.clear();
+    ++generation_;
 }
 
 void FvGeometry::build(const PrimitiveMesh& m)

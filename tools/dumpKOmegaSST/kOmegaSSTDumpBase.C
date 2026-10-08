@@ -35,6 +35,7 @@ License
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
 #include "zeroGradientFvPatchFields.H"
+#include "calculatedFvPatchFields.H"
 
 // brae oracle. OpenFOAM's own kOmegaSST with writes added and its equations untouched, so every
 // intermediate the port is built from has an oracle rather than an argument. Nothing below alters a
@@ -612,6 +613,55 @@ void kOmegaSSTDumpBase<BasicEddyViscosityModel>::correct()
 
     const volScalarField F1(this->F1(CDkOmega));
     const volScalarField F23(this->F23());
+
+    // THE LIMITER'S OWN GRADIENT, and the field it is taken from. CDkOmega above is
+    // grad(k) & grad(omega), and on a case whose k is still uniform grad(k) is exactly zero -- so
+    // CDkOmega matching says nothing about grad(omega), which is what a TVD limiter's branch turns
+    // on. Writes only; nothing here is read back by the model.
+    if (this->mesh_.time().timeIndex() == braeDumpSSTIter())
+    {
+        volVectorField gOm(fvc::grad(omega_));  gOm.rename("stage_sstGradOmega");
+        gOm.write();
+        volVectorField gKf(fvc::grad(k_));      gKf.rename("stage_sstGradKfield");
+        gKf.write();
+        volScalarField omAsm(omega_);           omAsm.rename("stage_sstOmegaAsm");
+        omAsm.write();
+    }
+
+    // THE CONVECTION TERM ON ITS OWN, before it is summed with the ddt, the laplacian and the
+    // sources. fvm::div resolves the case's own `div(phi,omega)` entry exactly as the equation below
+    // does, so its lower() carries the limiter's face weights: gaussConvectionScheme sets
+    // lower = -weights*faceFlux and upper = lower + faceFlux (gaussConvectionScheme.C:96-98), which
+    // recovers weights = -lower/faceFlux on every face the flux does not vanish on. A separate
+    // matrix; the equation is untouched.
+    if (this->mesh_.time().timeIndex() == braeDumpSSTIter())
+    {
+        fvScalarMatrix divOnly(fvm::div(alphaRhoPhi, omega_));
+        braeDumpSSTSystem(this->mesh_, divOnly, "stage_sstOmDivD", "stage_sstOmDivSrc");
+    }
+
+    // THE TWO INPUTS THE omegaWallFunction PINS omega WITH, per wall face: turbModel.y() (nearWallDist,
+    // NOT wallDist::New) and nu at the patch. omega0 = cornerWeight*pow(pow(omegaVis,n)+pow(omegaLog,n),
+    // 1/n) with the BINOMIAL default n = 2 (omegaWallFunctionFvPatchScalarField.C:258-270, :405), and
+    // those two fields plus k are everything that goes into it -- so a port's pinned value can be
+    // reproduced from them rather than argued about. Writes only.
+    if (this->mesh_.time().timeIndex() == braeDumpSSTIter())
+    {
+        const fvMesh& mesh = this->mesh_;
+        volScalarField yw
+        (
+            IOobject("stage_sstYWall", mesh.time().timeName(), mesh,
+                     IOobject::NO_READ, IOobject::NO_WRITE),
+            mesh, dimensionedScalar(dimless, Zero), calculatedFvPatchScalarField::typeName
+        );
+        volScalarField nuw(yw);  nuw.rename("stage_sstNuWall");
+        forAll(mesh.boundary(), pj)
+        {
+            yw.boundaryFieldRef()[pj]  == this->y()[pj];
+            nuw.boundaryFieldRef()[pj] == this->nu(pj)();
+        }
+        yw.write();  nuw.write();
+    }
 
     if (this->mesh_.time().timeIndex() == braeDumpSSTIter())
     {

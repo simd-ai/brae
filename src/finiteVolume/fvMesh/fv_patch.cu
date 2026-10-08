@@ -2,15 +2,19 @@
 #include "fv_patch.cuh"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cmath>
 
 namespace brae {
 
-std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g)
+std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g, bool mirrorACMI)
 {
     std::vector<FvPatch> patches;
     patches.reserve(m.patches().size());
+    static const bool patchDeltaSigned = std::getenv("BRAE_CONTROL_PATCH_DELTA_SIGNED") != nullptr;
+    // boundary faces whose cell's centre lies behind them -- see deltaCoeffs below
+    long behind = 0;
     for (const PatchInfo& pi : m.patches())
     {
         // OVERSET is not implemented, and it must not be mistaken for a constraint patch. It was listed in
@@ -74,7 +78,11 @@ std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g)
         // so ACMI stays refused while the turbulence coupling is open. BRAE_ALLOW_ACMI=1 opts in for
         // development; it is deliberately not a dictionary setting, so no case file can turn it on by
         // accident.
-        if (pi.type == "cyclicACMI" && !std::getenv("BRAE_ALLOW_ACMI"))
+        //
+        // The refusal is the device drivers'. The OF-mirror interFoam host loop couples a COINCIDENT
+        // pair itself (cyclic_acmi_cpp), k and epsilon included, and is gated against OpenFOAM on
+        // RAS/damBreakLeakage; it says so with mirrorACMI, which no case file can set.
+        if (pi.type == "cyclicACMI" && !mirrorACMI && !std::getenv("BRAE_ALLOW_ACMI"))
             throw std::runtime_error(
                 "brae: patch '" + pi.name + "' is type 'cyclicACMI'. The momentum, pressure and interface "
                 "flux path now matches OpenFOAM -- on pimpleFoam/RAS/oscillatingInletACMI2D run laminar "
@@ -138,12 +146,27 @@ std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g)
             const label f = pi.start + i;
             const label c = m.owner()[f];          // boundary face owner = adjacent cell
             p.faceCells[i] = c;
-            // OF fvPatch::delta() is the normal-projected delta; deltaCoeffs = 1/(n.(Cf-C)).
+            // fvPatch::delta() is the normal-projected delta, nHat*(nHat & (Cf - Cn)) (fvPatch.C:156-161),
+            // and the patch's deltaCoeffs are 1/MAG of it (basicFvGeometryScheme.C, deltaCoeffs():
+            // `deltaCoeffsBf[patchi] = 1.0/mag(p.delta())`). The magnitude matters on a face whose cell's
+            // centre lies BEHIND it -- a warped wall-corner cell of a snapped mesh, or the child of one
+            // after a refinement: this was 1/(n.(Cf - C)), signed, so such a face took a NEGATIVE wall
+            // diffusion coefficient and a boundary snGrad of the wrong sign. MEASURED 2026-10-07 on RAS/
+            // motorBike restarted from OpenFOAM's own state at t = 0.401 (18 such cells of 43,781): the sum
+            // of a corner cell's boundary diagonal contributions read -6.2004e-03 where OpenFOAM's is
+            // +6.2004e-03, U was 4.2e-03 from OpenFOAM's after ONE step with every solve pinned, and the
+            // tutorial's own run ended at t = 0.436 of 2 with the velocity of one such cell at 2,600 m/s.
+            //   BRAE_CONTROL_PATCH_DELTA_SIGNED=1: a gate's CONTROL, deliberately wrong -- the signed form.
             const vector nHat = g.Sf()[f] / g.magSf()[f];
             p.nf[i] = nHat;
             p.magSf[i] = g.magSf()[f];
             p.Cf[i] = g.Cf()[f];
-            p.deltaCoeffs[i] = 1.0 / dot(g.Cf()[f] - g.C()[c], nHat);
+            const scalar normalDelta = dot(g.Cf()[f] - g.C()[c], nHat);
+            p.deltaCoeffs[i] = 1.0 / (patchDeltaSigned ? normalDelta : std::fabs(normalDelta));
+            if (normalDelta < scalar(0))
+            {
+                ++behind;
+            }
         }
         // OF atmBoundaryLayer.C:45 -- boundBox(pp.localPoints()).min(), taken over every point of every
         // face on the patch. An empty patch keeps the zero default; nothing reads it.
@@ -172,7 +195,106 @@ std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g)
         }
         patches.push_back(std::move(p));
     }
+    // said once, at the first mesh that has any, and again when a later mesh has more (a refining mesh makes
+    // them as it splits a snapped wall cell)
+    static long behindSaid = 0;
+    if (behind > behindSaid)
+    {
+        behindSaid = behind;
+        std::printf("  patches: %ld boundary face(s) lie behind their own cell's centre; their delta coefficient "
+                    "is 1/|n.(Cf - C)|, as OpenFOAM's%s\n", behind,
+                    patchDeltaSigned ? "  *** CONTROL MODE: it is signed here. This run is deliberately wrong. ***"
+                                     : "");
+    }
     return patches;
+}
+
+void coupleTranslationalPair(
+    FvPatch& p,
+    const FvPatch& q,
+    label nbr,
+    bool owner,
+    const FvGeometry& g)
+{
+    p.coupled = true;
+    p.nbrPatch = nbr;
+    p.owner = owner;
+    p.nbrFaceCells = q.faceCells;
+    const std::size_t n = static_cast<std::size_t>(p.size);
+    p.weights.resize(n);
+    p.delta.resize(n);
+    p.nonOrthDeltaCoeffs.resize(n);
+    p.nonOrthCorrectionVectors.resize(n);
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        const label f = p.start + static_cast<label>(i);
+        const label fn = q.start + static_cast<label>(i);
+        // `transform unknown` leaves OpenFOAM to work the transform out from the two sides' normals
+        // (cyclicPolyPatch::calcTransforms): anti-parallel is a translation -- a baffle is one of
+        // zero length -- and anything else is a rotation, which is refused above when it is named.
+        if (dot(p.nf[i], q.nf[i]) > scalar(-1) + scalar(1e-6))
+        {
+            throw std::runtime_error(
+                "brae: cyclic patch '" + p.name + "' and its neighbour '" + q.name + "' do not face each "
+                "other (nf & nf_nbr = " + std::to_string(dot(p.nf[i], q.nf[i])) + " on face "
+                + std::to_string(i) + "), so OpenFOAM would couple them through a rotation. The "
+                "OF-mirror operators couple a translational cyclic only.");
+        }
+        const vector patchD = g.Cf()[f] - g.C()[p.faceCells[i]];
+        const vector nbrD = g.Cf()[fn] - g.C()[q.faceCells[i]];
+        const scalar di = dot(p.nf[i], patchD);
+        const scalar dni = dot(q.nf[i], nbrD);
+        const vector d = patchD - nbrD;
+        p.weights[i] = dni/(di + dni);
+        p.delta[i] = d;
+        p.deltaCoeffs[i] = scalar(1)/mag(d);
+        p.nonOrthDeltaCoeffs[i] = scalar(1)/std::fmax(dot(p.nf[i], d), scalar(0.05)*mag(d));
+        p.nonOrthCorrectionVectors[i] = p.nf[i] - d*p.nonOrthDeltaCoeffs[i];
+    }
+}
+
+void attachCyclicCoupling(
+    std::vector<FvPatch>& patches,
+    const PrimitiveMesh& m,
+    const FvGeometry& g)
+{
+    const std::vector<PatchInfo>& info = m.patches();
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        FvPatch& p = patches[pi];
+        if (p.type != "cyclic")
+        {
+            continue;
+        }
+        if (info[pi].transform == "rotational")
+        {
+            throw std::runtime_error(
+                "brae: cyclic patch '" + p.name + "' is rotational. The OF-mirror operators couple a "
+                "translational cyclic only; the vector transform across a rotational pair is not ported.");
+        }
+        label nbr = -1;
+        for (std::size_t qi = 0; qi < patches.size(); ++qi)
+        {
+            if (patches[qi].name == info[pi].neighbourPatch)
+            {
+                nbr = static_cast<label>(qi);
+            }
+        }
+        if (nbr < 0)
+        {
+            throw std::runtime_error(
+                "brae: cyclic patch '" + p.name + "' names the neighbourPatch '" + info[pi].neighbourPatch
+                + "', which the mesh does not have.");
+        }
+        const FvPatch& q = patches[static_cast<std::size_t>(nbr)];
+        if (q.size != p.size)
+        {
+            throw std::runtime_error(
+                "brae: cyclic patch '" + p.name + "' has " + std::to_string(p.size) + " faces and its "
+                "neighbour '" + q.name + "' " + std::to_string(q.size) + ".");
+        }
+        coupleTranslationalPair(p, q, nbr, static_cast<label>(pi) < nbr, g);
+    }
 }
 
 } // namespace brae

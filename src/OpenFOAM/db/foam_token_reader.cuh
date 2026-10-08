@@ -22,6 +22,13 @@ std::string foamFormat(const std::string& path);
 // is always an ASCII dictionary, so it uses TokenStream regardless of format.
 std::vector<vector> readBinaryPoints(const std::string& path);
 std::vector<label>  readBinaryLabelList(const std::string& path);
+
+// A polyMesh labelList in EITHER format, which is the only way to read one safely: `owner`, `neighbour`,
+// `cellLevel` and `pointLevel` are all written in the case's own writeFormat, and motorBike's controlDict
+// says `binary`. This was file-static in primitive_mesh.cu serving owner and neighbour alone; the
+// refinement-state reader needs the same two branches, and a second copy of a format switch is how the
+// cellZones reader came to be ASCII-only.
+std::vector<label>  readLabelListFile(const std::string& path);
 void readBinaryCompactFaces(const std::string& path, std::vector<label>& offsets, std::vector<label>& verts);
 
 // Binary constant/polyMesh/cellZones reader. cellZones is a MIXED file: the ZoneMesh structure

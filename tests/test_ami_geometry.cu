@@ -28,7 +28,9 @@ int main(int argc, char** argv) {
             const int ne = (int)(a.srcOffset[i+1] - a.srcOffset[i]);
             maxStencil = std::max(maxStencil, ne);
             if (ne != 1) ++fail;                                         // conforming -> exactly one overlap
-            maxWsum = std::fmax(maxWsum, std::fabs(a.weightsSum[i] - 1.0));
+            // the COVERAGE, sum of overlap/|Sf| before the rows are divided by their sum (after it the sum
+            // of weights is 1 by construction and would hold nothing)
+            maxWsum = std::fmax(maxWsum, std::fabs(a.coverage[i] - 1.0));
             maxDC   = std::fmax(maxDC,   std::fabs(a.deltaCoeffs[i] - 10.0));
             maxW    = std::fmax(maxW,    std::fabs(a.weights[i] - 0.5));
             for (label k = a.srcOffset[i]; k < a.srcOffset[i+1]; ++k)

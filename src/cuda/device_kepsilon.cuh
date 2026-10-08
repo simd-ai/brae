@@ -17,6 +17,8 @@
 #include "komega_sst_coeffs.cuh"
 #include "spalart_coeffs.cuh"
 #include "device_pcg.cuh"     // DeviceSolverPerf (turbulence solve report)
+#include "grad_u_memo.cuh"   // GradUMemo, the memo described below (its own header so a caller can hold
+                              // one without this header's DdtScheme)
 #include <vector>
 #include <string>
 
@@ -69,18 +71,15 @@ void deviceGbyNu(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
 // bits a fresh computation would; interface (cyclic/AMI) contributions are added by the caller on a
 // copy, as before. BRAE_GRADU_MEMO=0 recomputes at every site (the identity arm); =stale never
 // recomputes after the first (the gate's fail-proof: it must change the run).
-struct GradUMemo
-{
-    int nC = 0;
-    bool valid = false;
-    unsigned long long fp = 0;
-    DeviceBuffer<scalar> gx[3], gy[3], gz[3];     // gaussGrad(U_k), unlimited, interior + boundary faces
-    DeviceBuffer<scalar> ub[3];                   // the boundary values it used (deviceBCValue per component)
-    DeviceBuffer<unsigned long long> dev;         // device state: acc, stored fingerprint, valid, hit, nHit, nMiss
-    unsigned long long computed = 0, reused = 0;  // read only under BRAE_GRADU_MEMO_STATS
-};
+// UbStored: U's STORED patch values, one buffer per component, for a caller that keeps them. OpenFOAM's
+// fvc::grad(U) reads the stored values, and at a momentum ASSEMBLY those are the last evaluate's while
+// dbU already carries the coefficients updateCoeffs has just moved -- re-deriving the value from dbU
+// there evaluates a patch OpenFOAM has not. Null re-derives (deviceBCValue), which is the same number
+// wherever the caller evaluates U's boundary before the call. The stored values are part of the
+// fingerprint, so a stored call and a re-derived one never share a result.
 const GradUMemo& deviceGradUShared(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
-                                   const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz);
+                                   const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
+                                   const DeviceBuffer<scalar>* const* UbStored = nullptr);
 
 // gradU tensor (9*nC, OF convention column i = gaussGrad(U_i)) + GbyNu from a prebuilt gradU. Shared by k-eps
 // (GbyNu) and kOmegaSST (which also needs gradU for S2 = 2 magSqr(symm(gradU))).
@@ -165,6 +164,10 @@ struct DeviceWallData
     // epsilon patch's entry, WallFunctionCoeffs; item 16h-port). Empty -> the kernels use the
     // model-wide KEpsilonCoeffs values, which is what the legacy drivers still hand them.
     DeviceBuffer<scalar> wfCmu25, wfCmu75, wfKappa, wfE, wfYplLam;
+    // epsilonWallFunction's OWN `lowReCorrection` per wall face, 1 or 0. EMPTY means the driver
+    // filling this struct still carries one flag for every wall, and the kernel falls back to the
+    // scalar it is passed -- the same nullable convention as the five above.
+    DeviceBuffer<scalar> wfLowRe;
 };
 // The predicate the wall set is built on, in one place so the DeviceWallData faces and the wall-face ->
 // boundary-face map below cannot drift apart.
@@ -187,9 +190,14 @@ inline DeviceWallData buildDeviceWallData(
     const FvGeometry& g,
     const std::vector<FvPatch>& fvp,
     const std::vector<std::vector<vector>>& wallU,
-    const std::vector<char>& wfPatch = {})
+    const std::vector<char>& wfPatch = {},
+    // the near-wall distance where the caller has it already (refreshDeviceInterTurbulenceGeometry, which
+    // measures it once a move for this and for the faces' y); null measures it here
+    const std::vector<std::vector<scalar>>* yGiven = nullptr)
 {
-    const std::vector<std::vector<scalar>> yW = nearWallDist(m, g, fvp);
+    const std::vector<std::vector<scalar>> yOwn = yGiven ? std::vector<std::vector<scalar>>{}
+                                                         : nearWallDist(m, g, fvp);
+    const std::vector<std::vector<scalar>>& yW = yGiven ? *yGiven : yOwn;
     std::vector<label> wfCell;
     std::vector<scalar> wfY, wfDc, wux, wuy, wuz;
     std::vector<label> nw(m.nCells(), 0);

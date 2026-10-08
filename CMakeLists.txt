@@ -9,7 +9,7 @@ if(NOT DEFINED CACHE{CMAKE_CUDA_ARCHITECTURES})
         CACHE STRING "CUDA architectures cf is built for" FORCE)
 endif()
 
-project(brae VERSION 0.3.1 LANGUAGES CXX CUDA)
+project(brae VERSION 0.4.0 LANGUAGES CXX CUDA)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -59,6 +59,19 @@ foreach(_h ${BRAE_ALL_HEADERS})
 endforeach()
 list(REMOVE_DUPLICATES BRAE_HEADER_DIRS)
 
+# Where OpenFOAM's tutorials live. $ENV{FOAM_TUTORIALS} is only set inside an OpenFOAM shell, and a
+# cmake run outside one leaves it EMPTY -- which silently handed the interFoam gates the path
+# "/multiphase/interFoam/..." and made every dictionary arm skip while the test still reported green.
+# Defaulted to the known install exactly as tests/*.sh default OFBASHRC, and overridable.
+if(DEFINED ENV{FOAM_TUTORIALS} AND NOT "$ENV{FOAM_TUTORIALS}" STREQUAL "")
+    set(BRAE_OF_TUTORIALS "$ENV{FOAM_TUTORIALS}" CACHE PATH "OpenFOAM tutorials directory")
+else()
+    set(BRAE_OF_TUTORIALS "/usr/lib/openfoam/openfoam2412/tutorials" CACHE PATH "OpenFOAM tutorials directory")
+endif()
+if(NOT EXISTS "${BRAE_OF_TUTORIALS}")
+    message(STATUS "OpenFOAM tutorials not found at ${BRAE_OF_TUTORIALS}; tutorial-backed arms will SKIP")
+endif()
+
 # ---------------------------------------------------------------------------
 # brae_core, Phase 1 substrate (comm seam + interfaces). Grows as modules land.
 # ---------------------------------------------------------------------------
@@ -68,11 +81,15 @@ add_library(brae_core STATIC
     src/parallel/pstream/device_reduce.cu
     src/OpenFOAM/meshes/interface/processor_interface.cu
     src/OpenFOAM/db/foam_token_reader.cu
+    src/OpenFOAM/db/dynamicLibrary/codedBase/coded_library.cu
     src/OpenFOAM/primitives/functions/Function1/Coded/codedFunction1.cu
+    src/meshTools/PatchFunction1/CodedField/codedPatchFunction1.cu
     src/finiteVolume/expressions/PatchFunction1/patchExprFunction1.cu
     src/OpenFOAM/meshes/primitive_mesh.cu
     src/finiteVolume/fvMesh/fv_geometry.cu
+    src/finiteVolume/fvMesh/device_fv_geometry.cu
     src/finiteVolume/fvMesh/fv_patch.cu
+    src/finiteVolume/fvMesh/fvPatches/constraint/cyclicACMI/cyclic_acmi_cpp.cu
     src/OpenFOAM/decompose/scotch_decomposition.cu
     src/OpenFOAM/decompose/domain_decomposition.cu
     src/TurbulenceModels/turbulenceModels/derivedFvPatchFields/wallFunctions/nut_wall_function.cu
@@ -82,6 +99,36 @@ add_library(brae_core STATIC
     src/OpenFOAM/matrices/pcg.cu
     src/OpenFOAM/matrices/gamg.cu
     src/OpenFOAM/matrices/pbicgstab.cu
+    src/OpenFOAM/matrices/pbicg.cu
+    src/meshTools/AMIInterpolation/faceAreaWeightAMI/face_area_weight_ami_cpp.cu
+    src/finiteVolume/fvMesh/fvPatches/constraint/cyclicAMI/cyclic_ami_cpp.cu
+    src/OpenFOAM/matrices/smooth_solver_cpp.cu
+    src/matrices/lduMatrix/solvers/GAMG/GAMGAgglomerations/pair_gamg_agglomeration_cpp.cu
+    src/matrices/lduMatrix/solvers/GAMG/gamg_solver_cpp.cu
+    src/meshTools/solidBodyMotionFunctions/solid_body_motion_function_cpp.cu
+    src/OpenFOAM/meshes/meshShapes/face/face_cpp.cu
+    src/OpenFOAM/meshes/primitiveMesh/PrimitivePatch/primitive_patch_cpp.cu
+    src/meshTools/cellDist/patchWave/patch_wave_cpp.cu
+    src/meshTools/cellDist/patchWave/device_patch_wave.cu
+    src/OpenFOAM/meshes/primitiveMesh/edges/mesh_edges_cpp.cu
+    src/OpenFOAM/meshes/polyMesh/mapPolyMesh/map_poly_mesh_cpp.cu
+    src/OpenFOAM/meshes/polyMesh/polyTopoChange/poly_topo_change_cpp.cu
+    src/OpenFOAM/meshes/primitiveMesh/cellCells/mesh_cell_cells_cpp.cu
+    src/dynamicMesh/polyTopoChange/removeFaces/remove_faces_cpp.cu
+    src/dynamicMesh/polyTopoChange/hexRef8/hex_ref8_cpp.cu
+    src/dynamicFvMesh/dynamicRefineFvMesh/dynamic_refine_fv_mesh_cpp.cu
+    src/applications/solvers/interFoam/inter_amr_cpp.cu
+    src/dynamicMesh/pointPatchDist/point_patch_dist_cpp.cu
+    src/rigidBodyDynamics/rigid_body_motion_cpp.cu
+    src/rigidBodyMeshMotion/rigid_body_mesh_motion_cpp.cu
+    src/meshTools/twoDPointCorrector/two_d_point_corrector_cpp.cu
+    src/finiteVolume/interpolation/volPointInterpolation/vol_point_interpolation_cpp.cu
+    src/finiteVolume/interpolation/volPointInterpolation/point_constraints_cpp.cu
+    src/waveModels/derivedPointPatchFields/waveMaker/wave_maker_point_patch_vector_field_cpp.cu
+    src/fvMotionSolver/fvMotionSolvers/displacement/laplacian/displacement_laplacian_fv_motion_solver_cpp.cu
+    src/fvMotionSolver/fvMotionSolvers/displacement/laplacian/device_displacement_laplacian_assembly.cu
+    src/dynamicFvMesh/dynamicMotionSolverFvMesh/dynamic_motion_solver_fv_mesh_cpp.cu
+    src/dynamicFvMesh/dynamicMotionSolverFvMesh/device_swept_volumes.cu
     src/matrices/lduMatrix/lduMatrix/blas1.cu
     src/matrices/lduMatrix/lduMatrix/reductions.cu
     src/matrices/lduMatrix/lduMatrix/device_spmv.cu
@@ -93,6 +140,9 @@ add_library(brae_core STATIC
     src/TurbulenceModels/turbulenceModels/RAS/kOmegaSSTLM/kOmegaSSTLM_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/realizableKE/realizableKE_cpp.cu
     src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon_cpp.cu
+    src/TurbulenceModels/turbulenceModels/LES/LESdeltas/les_delta_cpp.cu
+    src/TurbulenceModels/turbulenceModels/LES/kEqn/les_kEqn_cpp.cu
+    src/TurbulenceModels/turbulenceModels/LES/kEqn/device_les_keqn.cu
     src/TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon.cu
     src/TurbulenceModels/turbulenceModels/RAS/SpalartAllmaras/SpalartAllmaras_cpp.cu
     src/finiteVolume/cfdTools/general/fvOptions/fvOptions_cpp.cu
@@ -115,6 +165,53 @@ add_library(brae_core STATIC
     src/applications/solvers/simpleFoam/simpleFoamV2.cu
     src/applications/solvers/simpleFoam/pEqn_cpp.cu
     src/applications/solvers/simpleFoam/createFields_cpp.cu
+    src/applications/solvers/interFoam/inter_driver_cpp.cu
+    src/applications/solvers/interFoam/inter_writer_cpp.cu
+    src/applications/solvers/interFoam/inter_case_cpp.cu
+    src/applications/solvers/interFoam/inter_cn_restart.cu
+    src/applications/solvers/interFoam/inter_turbulence_cpp.cu
+    src/applications/solvers/interFoam/inter_waves_cpp.cu
+    src/waveModels/waveModel/wave_model_cpp.cu
+    src/waveModels/waveGenerationModels/base/wave_generation_bases_cpp.cu
+    src/waveModels/waveGenerationModels/derived/StokesI/stokes_i_wave_model_cpp.cu
+    src/waveModels/waveGenerationModels/derived/StokesII/stokes_ii_wave_model_cpp.cu
+    src/waveModels/waveGenerationModels/derived/StokesV/stokes_v_wave_model_cpp.cu
+    src/waveModels/waveGenerationModels/derived/cnoidal/cnoidal_wave_model_cpp.cu
+    src/waveModels/waveGenerationModels/derived/streamFunction/stream_function_wave_model_cpp.cu
+    src/waveModels/waveGenerationModels/derived/irregularMultiDirectional/irregular_multi_directional_wave_model_cpp.cu
+    src/waveModels/waveGenerationModels/derived/Boussinesq/boussinesq_wave_model_cpp.cu
+    src/waveModels/waveGenerationModels/derived/Grimshaw/grimshaw_wave_model_cpp.cu
+    src/waveModels/waveGenerationModels/derived/McCowan/mccowan_wave_model_cpp.cu
+    src/waveModels/waveAbsorptionModels/derived/shallowWaterAbsorption/shallow_water_absorption_cpp.cu
+    src/transportModels/interfaceProperties/device_interface_properties.cu
+    src/transportModels/twoPhaseMixture/device_two_phase_mixture.cu
+    src/transportModels/interfaceProperties/interface_properties_cpp.cu
+    src/applications/solvers/interFoam/inter_solve_cpp.cu
+    src/applications/solvers/interFoam/inter_set_rdeltat_cpp.cu
+    src/finiteVolume/finiteVolume/fvc/fvcSmooth/fvc_smooth_cpp.cu
+    src/finiteVolume/finiteVolume/fvc/fvcSmooth/device_fvc_smooth.cu
+    src/applications/solvers/interFoam/inter_peqn_cpp.cu
+    src/applications/solvers/interFoam/inter_correct_phi_cpp.cu
+    src/finiteVolume/fvMatrices/solvers/MULES/mules_cpp.cu
+    src/finiteVolume/fvMatrices/solvers/MULES/device_mules.cu
+    src/applications/solvers/interFoam/alpha_eqn_cpp.cu
+    src/applications/solvers/interFoam/device_alpha_flux.cu
+    src/applications/solvers/interFoam/device_alpha_step.cu
+    src/applications/solvers/interFoam/device_alpha_presolve.cu
+    src/applications/solvers/interFoam/device_alpha_subcycle.cu
+    src/finiteVolume/finiteVolume/device_fvc_reconstruct.cu
+    src/applications/solvers/interFoam/device_inter_ueqn.cu
+    src/applications/solvers/interFoam/device_inter_peqn.cu
+    src/applications/solvers/interFoam/device_inter_alpha_step.cu
+    src/finiteVolume/cfdTools/general/device_alpha_courant.cu
+    src/applications/solvers/interFoam/device_inter_pressure_step.cu
+    src/applications/solvers/interFoam/device_inter_pcorr_solve.cu
+    src/applications/solvers/interFoam/device_inter_step.cu
+    src/applications/solvers/interFoam/device_inter_turbulence.cu
+    src/applications/solvers/interFoam/inter_driver_device.cu
+    src/applications/solvers/interFoam/inter_ueqn_cpp.cu
+    src/finiteVolume/finiteVolume/ddtSchemes/CrankNicolsonDdtScheme/crank_nicolson_ddt_scheme_cpp.cu
+    src/finiteVolume/finiteVolume/ddtSchemes/CrankNicolsonDdtScheme/device_crank_nicolson_ddt.cu
     src/applications/solvers/rhoSimpleFoam/rhoCreateFields_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoUEqn_cpp.cu
     src/applications/solvers/rhoSimpleFoam/rhoUEqn.cu
@@ -134,6 +231,7 @@ add_library(brae_core STATIC
     src/applications/solvers/simpleFoam/simpleFoam_cpp.cu
     src/finiteVolume/cfdTools/general/solutionControl/simpleControl/simpleControl_cpp.cu
     src/matrices/lduMatrix/solvers/PCG/device_pcg.cu
+    src/matrices/lduMatrix/solvers/PBiCG/device_pbicg.cu
     src/cuda/device_fvc.cu
     src/cuda/device_fvm.cu
     src/cuda/device_simple.cu
@@ -166,6 +264,7 @@ add_library(brae_core STATIC
     src/matrices/lduMatrix/smoothers/GaussSeidel/device_colour_gauss_seidel.cu
     src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_vcycle.cu
     src/matrices/lduMatrix/solvers/PCG/device_amg_pcg.cu
+    src/matrices/lduMatrix/solvers/GAMG/device_gamg_solver.cu
     src/cuda/device_cluster.cu
     src/cuda/device_cyclic.cu
     src/cuda/device_ami.cu
@@ -311,6 +410,16 @@ target_include_directories(test_gpu_smagorinsky PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_gpu_smagorinsky PRIVATE brae_core)
 add_test(NAME gpu_smagorinsky COMMAND test_gpu_smagorinsky)
 
+# SA-IDDES against REAL OpenFOAM's SpalartAllmarasIDDES: the length scale's formula, the defaults and the reader,
+# on a dump of OpenFOAM's own dTilda() (tools/dumpSAIDDES, built with wmake; the gates skip without it).
+add_executable(test_sa_iddes_vs_openfoam tests/test_sa_iddes_vs_openfoam.cu)
+target_include_directories(test_sa_iddes_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_sa_iddes_vs_openfoam PRIVATE brae_core)
+foreach(SA_IDDES_MODE kernel defaults refusals)
+    add_test(NAME sa_iddes_${SA_IDDES_MODE}_vs_openfoam
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_iddes_${SA_IDDES_MODE}_vs_openfoam.sh)
+    set_tests_properties(sa_iddes_${SA_IDDES_MODE}_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+endforeach()
 add_executable(test_gpu_saiddes tests/test_gpu_saiddes.cu)
 target_include_directories(test_gpu_saiddes PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_gpu_saiddes PRIVATE brae_core)
@@ -716,6 +825,103 @@ add_test(NAME manifest_simplefoam_not_drifted
                  --check ${CMAKE_CURRENT_SOURCE_DIR}/manifest/simpleFoam.yaml)
 set_tests_properties(manifest_simplefoam_not_drifted PROPERTIES SKIP_RETURN_CODE 77)
 
+# ...and the interFoam twin, added with the manifest itself rather than weeks later. The curated half of
+# that table is where each component's brae_reference/brae_target path lives, and those paths were WRONG
+# for six components within a day of being written -- the files landed under different names. Nothing
+# caught it because nothing asked.
+add_test(NAME manifest_interfoam_not_drifted
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/of_manifest.py interFoam
+                 --check ${CMAKE_CURRENT_SOURCE_DIR}/manifest/interFoam.yaml)
+set_tests_properties(manifest_interfoam_not_drifted PROPERTIES SKIP_RETURN_CODE 77)
+# Defaults left over from porting, in the interFoam mirror: a controls struct built by hand at several
+# sites with a field set at some and not at others runs the default where the case said otherwise --
+# the device's start-up CorrectPhi ran grad(pcorr) as Gauss linear that way, and its closure would have
+# run a moving mesh on the current volumes. Every justified omission is in tools/default_audit_allow.txt
+# with its reason; an unlisted one, or a listed one that no longer exists, fails here.
+# ...over the WHOLE of src now: the backlog the first run found (341 across 28 structs) is closed, so
+# a new omission anywhere is a new finding rather than one of a crowd.
+# ...and the other half of the same question: what each ported file SAYS holds it. Every provenance
+# block's `tests:` line names paths; this fails when one of them does not exist, which is the rot that
+# let braeInterFoam.cu keep saying `-device` refuses LES for units after it ran. `--gaps` (not run here)
+# lists the files that declare provenance and name no test at all.
+add_test(NAME mirror_coverage
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/mirror_coverage.py --check)
+
+add_test(NAME default_audit_interfoam
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/default_audit.py
+                 --allow ${CMAKE_CURRENT_SOURCE_DIR}/tools/default_audit_allow.txt
+                 ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+# DeviceBuffer::resize does not zero -- it hands the old block back to a pool and takes one out, and
+# `resize(n)` with n unchanged returns at once, keeping the LAST call's values. A kernel that
+# accumulates (`out[i] +=`, atomicAdd) into such a buffer adds to whatever was there: interFoam's
+# vector limitedLinear built its magSqr limiter that way and read U 5.1e-01 of OpenFOAM's. The audit
+# asks it of every accumulating kernel in the tree, in the same function and across one call.
+add_test(NAME resize_audit
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/resize_audit.py
+                 --allow ${CMAKE_CURRENT_SOURCE_DIR}/tools/resize_audit_allow.txt
+                 ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# ...and the proof that it fails when the defect is there: it cuts the zeroing out of two real sites
+# (one same-function, one across a call) and checks each is named, plus that a memset written in a
+# COMMENT does not count -- which is how the audit's own first run reported a comment as a defect.
+# A device cache keyed on a POINTER: the pool hands equal-sized blocks back at the same address, so
+# `A.diag` or `A.owner` is not the identity of an addressing. On a moving mesh the GAMG hierarchy is
+# rebuilt every step and its levels return at the same pointers with the same counts and a different
+# pairing -- device U 3.0057e-02 on waveMakerMultiPaddlePiston, and a second run in one process
+# differing from the first. Every such guard must also compare an identity that survives recycling.
+add_test(NAME cache_key_audit
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/cache_key_audit.py
+                 --allow ${CMAKE_CURRENT_SOURCE_DIR}/tools/cache_key_audit_allow.txt
+                 ${CMAKE_CURRENT_SOURCE_DIR}/src)
+add_test(NAME cache_key_audit_selftest
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/cache_key_audit_selftest.sh)
+
+# A function DEFINED in a .cuh without inline/static/constexpr is a strong symbol in every object that
+# includes the header, and the link fails the moment two of them are put together. `readSurfaceField`
+# was that for six translation units -- the ordinary build survived only because the archive handed out
+# one of them, while a localiser that pulled the other could not be linked at all.
+add_test(NAME header_odr_audit
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/header_odr_audit.py
+                 --allow ${CMAKE_CURRENT_SOURCE_DIR}/tools/header_odr_audit_allow.txt
+                 ${CMAKE_CURRENT_SOURCE_DIR}/src)
+# ...and the proof that it names them: it restores both real defects in scratch copies, and checks that
+# a declaration, a braced default argument, a template and a class member are NOT reported.
+add_test(NAME header_odr_audit_selftest
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/header_odr_audit_selftest.sh)
+
+# ...and the default ledger's own keys: `Compressible` is defined in kEpsilonRef AND kOmegaSST with the
+# same field names, so a line keyed on the struct name alone exempted the field in both types and a
+# line stale in one was held alive by the other. The key carries the namespace now.
+add_test(NAME default_audit_selftest
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/default_audit_selftest.sh)
+
+# gradBKernel's type-code branches, one patch per branch, against the host reference. Only two of them
+# had a fixture (symmetry, and the flux-conditional ones through waterChannel's oneCorrector profile);
+# the rest were held by whole-case gates, where `snGrad = the prescribed gradient` against
+# `(value - internal)*deltaCoeffs` can hide behind everything else in the step.
+# assignable() on a transform patch: brae returns false where OpenFOAM returns true, as one half of a
+# pair with HbyA having no constraint patch fields -- both give a ZERO NORMAL FLUX, which is all the
+# boundary of HbyA feeds. This pins the composition, so neither half moves alone (correcting
+# assignable() by itself reads U 6.1507e-01 on RAS/damBreakLeakage).
+add_executable(test_symmetry_assignable tests/test_symmetry_assignable.cu)
+target_include_directories(test_symmetry_assignable PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_symmetry_assignable PRIVATE brae_core)
+add_test(NAME symmetry_assignable
+         COMMAND test_symmetry_assignable
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/windAroundBuildingsBox
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/halfChannel)
+set_tests_properties(symmetry_assignable PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_device_grad_boundary tests/test_device_grad_boundary.cu)
+target_include_directories(test_device_grad_boundary PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_device_grad_boundary PRIVATE brae_core)
+add_test(NAME device_grad_boundary
+         COMMAND test_device_grad_boundary ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurb)
+set_tests_properties(device_grad_boundary PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(NAME resize_audit_selftest
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/resize_audit_selftest.sh)
+
 add_executable(test_rho_kepsilon_cuda tests/test_rho_kepsilon_cuda.cu)
 target_include_directories(test_rho_kepsilon_cuda PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_rho_kepsilon_cuda PRIVATE brae_core)
@@ -804,6 +1010,21 @@ target_link_libraries(test_komegasst_cpp PRIVATE brae_core)
 add_executable(test_realizablke_cpp tests/test_realizablke_cpp.cu)
 target_include_directories(test_realizablke_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_realizablke_cpp PRIVATE brae_core)
+
+# realizableKE's rCmu on the device against the host reference at strain rates where the constant in its
+# denominator (OpenFOAM's SMALL) decides the answer; the control is the kernel's own switch, run as a child.
+add_executable(test_device_realizable_strain tests/test_device_realizable_strain.cu)
+target_include_directories(test_device_realizable_strain PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_device_realizable_strain PRIVATE brae_core)
+add_test(NAME device_realizable_strain COMMAND test_device_realizable_strain)
+set_tests_properties(device_realizable_strain PROPERTIES SKIP_RETURN_CODE 77)
+
+# WriteControl's cadence from a controlDict: writeInterval, its older name writeFrequency, and neither; the
+# same entry in the interFoam loops' cadence; timeStep with an interval below 1 refused
+add_executable(test_write_control_interval tests/test_write_control_interval.cu)
+target_include_directories(test_write_control_interval PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_write_control_interval PRIVATE brae_core)
+add_test(NAME write_control_interval COMMAND test_write_control_interval)
 
 add_executable(kepsilon_probe tests/kepsilon_probe.cu)
 target_include_directories(kepsilon_probe PRIVATE ${BRAE_HEADER_DIRS})
@@ -1220,7 +1441,9 @@ set_tests_properties(gs_host_smoother_identity PROPERTIES SKIP_RETURN_CODE 77 TI
 
 add_test(NAME gradu_memo_identity
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/gradu_memo_identity.sh)
-set_tests_properties(gradu_memo_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+# 161 s by itself; 635 s and then past 900 s in two full suites (2026-10-08), sharing the GPU with whatever ran
+# beside it. The limit is for a hang and has to clear that.
+set_tests_properties(gradu_memo_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 2400)
 
 add_test(NAME normfactor_device_identity
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/normfactor_device_identity.sh)
@@ -1442,7 +1665,8 @@ set_tests_properties(tutorial_backwardfacingstep2d PROPERTIES SKIP_RETURN_CODE 7
 add_test(NAME tutorial_turbulentflatplate_komegasst
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
                  turbulentFlatPlate:kOmegaSST:2200 U=2e-04,p=3e-02,k=1e-03,omega=5e-04,nut=2e-02)
-set_tests_properties(tutorial_turbulentflatplate_komegasst PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 2400)
+# its kEpsilon twin's limit: 2,174 s and 1,984 s of the 2,400 it had in two full suites (2026-10-08)
+set_tests_properties(tutorial_turbulentflatplate_komegasst PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 3600)
 
 add_test(NAME tutorial_bump2d_spalartallmaras
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
@@ -1645,6 +1869,21 @@ add_executable(test_celllimited_cpp tests/test_celllimited_cpp.cu)
 target_include_directories(test_celllimited_cpp PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_celllimited_cpp PRIVATE brae_core)
 
+# The least-squares gradient and its cell limiter taken at a subset of the cells (fvc::GradSubset), against the
+# whole-mesh functions cell for cell and bit for bit: host only, no case.
+add_executable(test_grad_subset tests/test_grad_subset.cu)
+target_include_directories(test_grad_subset PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_grad_subset PRIVATE brae_core)
+add_test(NAME grad_subset COMMAND test_grad_subset)
+
+# ...and across a coupled pair (a translational cyclic, and the same pair with a cyclicAMI's addressing): the
+# coupled branches of the fit and of the limiter in their subset form, which the solver does not reach (it
+# refuses a least-squares nHat on a mesh with a pair) and which nothing else ran.
+add_executable(test_grad_subset_coupled tests/test_grad_subset_coupled.cu)
+target_include_directories(test_grad_subset_coupled PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_grad_subset_coupled PRIVATE brae_core)
+add_test(NAME grad_subset_coupled COMMAND test_grad_subset_coupled)
+
 add_executable(rotordisk_probe tests/rotordisk_probe.cu)
 target_include_directories(rotordisk_probe PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(rotordisk_probe PRIVATE brae_core)
@@ -1748,6 +1987,9 @@ add_dependencies(brae brae_pimpleFoam)
 # so the run died at the hand-over with the case fully parsed. The comment above already said every
 # registered solver belongs here; only the line was missing.
 add_dependencies(brae brae_rhoSimpleFoam)
+# ...and brae_interFoam, added to this list at the same time as its registry row, because the comment
+# above says every registered solver belongs here and the last one to be added was not.
+add_dependencies(brae brae_interFoam)
 
 # End-to-end kOmegaSSTLM (Langtry-Menter transition) vs a SAVED OpenFOAM v2412 oracle (no OF needed at test time):
 # runs brae on a transition flat plate and checks U L2 < 3% and the gammaInt transition is captured.
@@ -1797,6 +2039,12 @@ add_executable(test_cyclic_fvc tests/test_cyclic_fvc.cu)
 target_include_directories(test_cyclic_fvc PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_cyclic_fvc PRIVATE brae_core)
 add_test(NAME cyclic_fvc COMMAND test_cyclic_fvc ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannel)
+
+# brae_interFoam: transient two-phase VoF. Gated against real OpenFOAM on damBreak (alpha 3.4e-09)
+# and capillaryRise (0.7%, the case where surface tension IS the answer).
+add_executable(brae_interFoam src/applications/solvers/interFoam/braeInterFoam.cu)
+target_include_directories(brae_interFoam PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(brae_interFoam PRIVATE brae_core)
 
 # brae_rhoSimpleFoam: steady compressible solver (subsonic, laminar)
 add_executable(brae_rhoSimpleFoam src/applications/solvers/rhoSimpleFoam/gpuRhoSimpleFoam.cu)
@@ -3002,6 +3250,1135 @@ target_include_directories(test_scheme_blocks PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_scheme_blocks PRIVATE brae_core)
 add_test(NAME scheme_blocks COMMAND test_scheme_blocks)
 
+# interFoam step 3: the two-phase mixture. Reads the case's own transportProperties (phase ORDER decides
+# which phase alpha1 is) and blends rho/mu/nu, where rho takes the RAW alpha and mu/nu the clamped one --
+# a difference invisible on any in-range field, so the gate sweeps alpha outside [0,1] and carries a
+# control that fails if rho is clamped.
+add_executable(test_two_phase_mixture tests/test_two_phase_mixture.cu)
+target_include_directories(test_two_phase_mixture PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/src/transportModels/twoPhaseMixture)
+target_link_libraries(test_two_phase_mixture PRIVATE brae_core)
+# interFoam on the DEVICE, first component: the mixture. Held to BIT-FOR-BIT agreement with the host
+# reference rather than to a tolerance -- it is per-cell arithmetic with no addressing, reduction or
+# interpolation, so there is nothing for a tolerance to absorb and any difference is a defect. The
+# sweep leaves [0,1] on purpose: rho takes the raw alpha and mu/nu the clamped one, and a fused kernel
+# that clamps once passes every in-range test.
+add_executable(test_device_two_phase_mixture tests/test_device_two_phase_mixture.cu)
+target_include_directories(test_device_two_phase_mixture PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_device_two_phase_mixture PRIVATE brae_core)
+add_test(NAME device_two_phase_mixture COMMAND test_device_two_phase_mixture)
+
+# ...and the interface normal and curvature. Unlike the mixture this CANNOT be bit-for-bit: K is a
+# reduction and the device sums a cell's faces in a different order from the host's serial loop, so a
+# difference is guaranteed and only its size is in question. The per-face half has no reduction and is
+# held to 4 ULP; K to 1e-12 relative, which is four orders below the curvature it measures.
+add_executable(test_device_interface_properties tests/test_device_interface_properties.cu)
+target_include_directories(test_device_interface_properties PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_interface_properties PRIVATE brae_core)
+add_test(NAME device_interface_properties COMMAND test_device_interface_properties)
+
+# ...and MULES. Two kinds of arm: the PROPERTY (alpha stays in [0,1]) asserted exactly, because that is
+# what MULES is for and needs no host to compare against; and lambda itself within a measured
+# tolerance, because each cell's five gathers run in a different ORDER from the host's face loop and
+# floating-point addition is not associative. The donor flux has no reduction and IS bit-identical.
+add_executable(test_device_mules tests/test_device_mules.cu)
+target_include_directories(test_device_mules PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_mules PRIVATE brae_core)
+add_test(NAME device_mules COMMAND test_device_mules)
+
+# ...and the alpha fluxes. The arm worth having is alphaPhiUn: five face operations with two minus
+# signs in the middle, where the upwind direction of each interpolation is set by the flux passed in --
+# so the negations change WHICH CELL each face reads, not just a sign.
+add_executable(test_device_alpha_flux tests/test_device_alpha_flux.cu)
+target_include_directories(test_device_alpha_flux PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_alpha_flux PRIVATE brae_core)
+add_test(NAME device_alpha_flux COMMAND test_device_alpha_flux)
+set_tests_properties(device_alpha_flux PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_device_inter_dambreak_alpha tests/test_device_inter_dambreak_alpha.cu)
+target_include_directories(test_device_inter_dambreak_alpha PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_inter_dambreak_alpha PRIVATE brae_core)
+
+add_executable(test_device_inter_step tests/test_device_inter_step.cu)
+target_include_directories(test_device_inter_step PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_inter_step PRIVATE brae_core)
+add_test(NAME interfoam_dambreak_device_vs_host
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_dambreak_device_vs_host.sh)
+set_tests_properties(interfoam_dambreak_device_vs_host PROPERTIES
+                     SKIP_RETURN_CODE 77
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_dependencies(brae test_device_inter_dambreak_alpha)
+
+# What brae's interFoam REFUSES and what it must not: one unported input at a time on damBreak, each beside
+# the form of it OpenFOAM treats as nothing. Found by running brae over all 44 tutorials and counting
+# the ones that reached End: -- two did, on a dynamicRefineFvMesh brae never opened.
+add_test(NAME interfoam_refusals
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_refusals.sh)
+set_tests_properties(interfoam_refusals PROPERTIES
+                     SKIP_RETURN_CODE 77
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+
+# The ADAPTIVE CLOCK against real OpenFOAM, on damBreak exactly as it ships -- the one interFoam gate
+# that does not pin deltaT, and so the only one that can see setDeltaT or Time::adjustDeltaT.
+add_test(NAME interfoam_dambreak_clock_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_dambreak_clock_vs_openfoam.sh)
+set_tests_properties(interfoam_dambreak_clock_vs_openfoam PROPERTIES
+                     SKIP_RETURN_CODE 77
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+
+# brae_interFoam's time directories against OpenFOAM's: when it writes, what -- every file's structure
+# exactly, every value at a measured bound -- that OpenFOAM restarts from them, and that writing every
+# step leaves the run byte-identical.
+#
+# ONE TEST PER FILE under tests/interfoam_write/<arm>/ and one per tutorial row, not one script: each file
+# holds at most three checks, a change is checked by the file it touches, the files run side by side under
+# `ctest -j`, and real OpenFOAM's meshes and runs are cached by a hash of the staged case
+# (tests/of_oracle_cache.sh), so editing brae re-runs brae alone. As one script this gate took 3100 s on its
+# own and 5700 s beside five others (2026-10-01), every time.
+#
+# TWO TIERS, by label. `fast` is the edit loop: `ctest -L fast -R interfoam_write`. `slow` holds the
+# tutorials whose meshes are large (DTCHull and DTCHullMoving 848k cells, mixerVesselAMI 895k, motorBike,
+# the two multi-paddle wave makers 448k) and the files that run on them; it runs before a commit. On those
+# tutorials the host arm and the device arm are separate tests, and a test that runs a device arm on a
+# large mesh takes the GPU alone (RESOURCE_LOCK): five processes sharing one GPU each ran four times slower.
+file(GLOB BRAE_WRITE_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_write
+     ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_write/*/*.sh)
+list(FILTER BRAE_WRITE_TESTS EXCLUDE REGEX "/_common\\.sh$")
+set(BRAE_WRITE_SLOW_FILES
+    "^ami/|^refine/mapping|^amg_pcg/dtchull|^amg_pcg/coupled_pair|^amg_pcg/pcorr_across_pair|^identity/wave_device\
+|^identity/nhat_least_squares")
+foreach(rel ${BRAE_WRITE_TESTS})
+    string(REPLACE ".sh" "" name ${rel})
+    string(REPLACE "/" "_" name ${name})
+    set(tierLabel fast)
+    if(rel MATCHES "${BRAE_WRITE_SLOW_FILES}")
+        set(tierLabel slow)
+    endif()
+    add_test(NAME interfoam_write_${name}
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_write/${rel})
+    set_tests_properties(interfoam_write_${name} PROPERTIES
+                         SKIP_RETURN_CODE 77
+                         LABELS ${tierLabel}
+                         TIMEOUT 1800
+                         ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+endforeach()
+# THE TWO FORTY-STEP GATES take a minute or two by themselves and 1,321 s and 1,312 s in a full suite
+# (2026-10-08, -j 6): their device arms share the GPU with every small gate beside them. A limit for a hang,
+# clear of that.
+set_tests_properties(interfoam_write_subcycle_final_mixture_no_evaluate
+                     interfoam_write_subcycle_contact_angle_next_corrector PROPERTIES TIMEOUT 3600)
+set(BRAE_WRITE_TUTORIALS_FAST
+    capillaryRise weirOverflow angledDuct damBreakLeakage damBreakPorousBaffle damBreakPermeable
+    nozzleFlow2D eulerianInjection cnoidal solitary solitaryGrimshaw solitaryMcCowan stokesI stokesII
+    stokesV irregularMultiDirection streamFunction mangroveInteraction sloshingTank2D testTubeMixer
+    waveMakerSolitary waveMakerPiston waveMakerFlap damBreakWithObstacle oscillatingBox floatingObject
+    DTCHullMovingCoarse sloshingTank2D3DoF sloshingTank3D sloshingTank3D3DoF sloshingTank3D6DoF)
+set(BRAE_WRITE_TUTORIALS_SLOW
+    DTCHull DTCHullMoving mixerVesselAMI motorBike sloshingCylinder electrostaticDeposition
+    waveMakerMultiPaddleFlap waveMakerMultiPaddlePiston)
+foreach(key ${BRAE_WRITE_TUTORIALS_FAST})
+    add_test(NAME interfoam_write_tutorial_${key}
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_write/tutorial.sh ${key})
+    set_tests_properties(interfoam_write_tutorial_${key} PROPERTIES
+                         SKIP_RETURN_CODE 77
+                         LABELS fast
+                         TIMEOUT 1800
+                         ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+endforeach()
+foreach(key ${BRAE_WRITE_TUTORIALS_SLOW})
+    foreach(arm host device)
+        add_test(NAME interfoam_write_tutorial_${key}_${arm}
+                 COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_write/tutorial.sh ${key} ${arm})
+        set_tests_properties(interfoam_write_tutorial_${key}_${arm} PROPERTIES
+                             SKIP_RETURN_CODE 77
+                             LABELS slow
+                             TIMEOUT 1800
+                             ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+    endforeach()
+    # ONE TURN FOR EVERY TEST ON THESE MESHES, host or device. A device run on 848k cells loads the CPU and
+    # the memory bus as well as the GPU: beside two of them the DTCHullMoving host row took 426 s and the
+    # device row 313 s, where each alone takes 289 s and 290 s (2026-10-01).
+    set_tests_properties(interfoam_write_tutorial_${key}_device PROPERTIES RESOURCE_LOCK "brae_gpu;brae_bigmesh")
+    set_tests_properties(interfoam_write_tutorial_${key}_host PROPERTIES RESOURCE_LOCK brae_bigmesh)
+endforeach()
+set_tests_properties(interfoam_write_ami_operands_control PROPERTIES RESOURCE_LOCK brae_bigmesh)
+set_tests_properties(interfoam_write_ami_pair_sums_ordered PROPERTIES RESOURCE_LOCK "brae_gpu;brae_bigmesh")
+set_tests_properties(interfoam_write_ami_bicg_graph_pair PROPERTIES RESOURCE_LOCK "brae_gpu;brae_bigmesh")
+add_dependencies(brae brae_interFoam)
+
+add_test(NAME device_inter_step COMMAND test_device_inter_step)
+set_tests_properties(device_inter_step PROPERTIES SKIP_RETURN_CODE 77)
+
+# the device laplacian's kernels and fvc::div against the host's, bit for bit, on a sheared mesh, with the
+# owner-first sums the device used to form as controls
+add_executable(test_device_laplacian_vs_host tests/test_device_laplacian_vs_host.cu)
+target_include_directories(test_device_laplacian_vs_host PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_laplacian_vs_host PRIVATE brae_core)
+add_test(NAME device_laplacian_vs_host COMMAND test_device_laplacian_vs_host)
+set_tests_properties(device_laplacian_vs_host PROPERTIES SKIP_RETURN_CODE 77)
+
+# the device's CYCLIC-interface laplacian coefficients against the host's fvm::laplacian, the first
+# module of interFoam's cyclic path (it depends on nothing else in that loop)
+add_executable(test_device_cyclic_laplacian_vs_host tests/test_device_cyclic_laplacian_vs_host.cu)
+target_include_directories(test_device_cyclic_laplacian_vs_host PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_cyclic_laplacian_vs_host PRIVATE brae_core)
+add_test(NAME device_cyclic_laplacian_vs_host
+         COMMAND test_device_cyclic_laplacian_vs_host
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannel)
+set_tests_properties(device_cyclic_laplacian_vs_host PROPERTIES SKIP_RETURN_CODE 77)
+# ...and again on a SKEWED periodic pair, where nonOrthDeltaCoeffs differs from deltaCoeffs, so the
+# `corrected` and orthogonal passes are two different matrices. cyclicChannel cannot tell them apart.
+add_test(NAME device_cyclic_laplacian_vs_host_skew
+         COMMAND test_device_cyclic_laplacian_vs_host
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannelSkew)
+set_tests_properties(device_cyclic_laplacian_vs_host_skew PROPERTIES SKIP_RETURN_CODE 77)
+
+# MULES's limiter across a cyclic pair: the device's lambda against the host's
+add_executable(test_device_mules_cyclic_vs_host tests/test_device_mules_cyclic_vs_host.cu)
+target_include_directories(test_device_mules_cyclic_vs_host PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_mules_cyclic_vs_host PRIVATE brae_core)
+add_test(NAME device_mules_cyclic_vs_host
+         COMMAND test_device_mules_cyclic_vs_host
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannel)
+set_tests_properties(device_mules_cyclic_vs_host PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME device_mules_cyclic_vs_host_skew
+         COMMAND test_device_mules_cyclic_vs_host
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannelSkew)
+set_tests_properties(device_mules_cyclic_vs_host_skew PROPERTIES SKIP_RETURN_CODE 77)
+
+# interFoam's device pressure operator across a cyclic pair: the assembled matrix against the host's
+add_executable(test_device_inter_peqn_cyclic_vs_host tests/test_device_inter_peqn_cyclic_vs_host.cu)
+target_include_directories(test_device_inter_peqn_cyclic_vs_host PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_inter_peqn_cyclic_vs_host PRIVATE brae_core)
+add_test(NAME device_inter_peqn_cyclic_vs_host
+         COMMAND test_device_inter_peqn_cyclic_vs_host
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannel)
+set_tests_properties(device_inter_peqn_cyclic_vs_host PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME device_inter_peqn_cyclic_vs_host_skew
+         COMMAND test_device_inter_peqn_cyclic_vs_host
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/cyclicChannelSkew)
+set_tests_properties(device_inter_peqn_cyclic_vs_host_skew PROPERTIES SKIP_RETURN_CODE 77)
+
+# the device's nHatf on a cyclic pair against REAL OpenFOAM's own written field
+add_executable(test_device_cyclic_nhatf_vs_openfoam tests/test_device_cyclic_nhatf_vs_openfoam.cu)
+target_include_directories(test_device_cyclic_nhatf_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_cyclic_nhatf_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_cyclic_nhatf_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_cyclic_nhatf_vs_openfoam.sh)
+set_tests_properties(interfoam_cyclic_nhatf_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}")
+
+# the device's epsilon at a wall-function-constrained cell that also touches a cyclic pair, against
+# REAL OpenFOAM's own epsilon after one step with every solve pinned
+add_executable(test_device_wallfn_cyclic_vs_openfoam tests/test_device_wallfn_cyclic_vs_openfoam.cu)
+target_include_directories(test_device_wallfn_cyclic_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_wallfn_cyclic_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_wallfn_cyclic_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_wallfn_cyclic_vs_openfoam.sh)
+set_tests_properties(interfoam_wallfn_cyclic_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}")
+
+# the device Gauss gradient against the host's fvc::gaussGrad, bit for bit, with the two forms the device
+# used to have as controls
+add_executable(test_device_gauss_grad tests/test_device_gauss_grad.cu)
+target_include_directories(test_device_gauss_grad PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_gauss_grad PRIVATE brae_core)
+add_test(NAME device_gauss_grad COMMAND test_device_gauss_grad)
+set_tests_properties(device_gauss_grad PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_device_inter_pressure_step tests/test_device_inter_pressure_step.cu)
+target_include_directories(test_device_inter_pressure_step PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_inter_pressure_step PRIVATE brae_core)
+add_test(NAME device_inter_pressure_step COMMAND test_device_inter_pressure_step)
+set_tests_properties(device_inter_pressure_step PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_device_inter_ueqn_assembly tests/test_device_inter_ueqn_assembly.cu)
+target_include_directories(test_device_inter_ueqn_assembly PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_inter_ueqn_assembly PRIVATE brae_core)
+add_test(NAME device_inter_ueqn_assembly COMMAND test_device_inter_ueqn_assembly)
+set_tests_properties(device_inter_ueqn_assembly PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_device_alpha_courant tests/test_device_alpha_courant.cu)
+target_include_directories(test_device_alpha_courant PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_alpha_courant PRIVATE brae_core)
+add_test(NAME device_alpha_courant COMMAND test_device_alpha_courant)
+set_tests_properties(device_alpha_courant PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_device_inter_alpha_step tests/test_device_inter_alpha_step.cu)
+target_include_directories(test_device_inter_alpha_step PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_inter_alpha_step PRIVATE brae_core)
+add_test(NAME device_inter_alpha_step COMMAND test_device_inter_alpha_step)
+set_tests_properties(device_inter_alpha_step PROPERTIES SKIP_RETURN_CODE 77)
+
+# The evaluate that opens the limited explicit solve, and the bounded flux's boundary after it: the device's
+# alpha step against the host's on an inletOutlet side whose flux reverses every step. The two controls are the
+# code's own switches, run by the test itself as children.
+add_executable(test_device_alpha_opening_evaluate tests/test_device_alpha_opening_evaluate.cu)
+target_include_directories(test_device_alpha_opening_evaluate PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_alpha_opening_evaluate PRIVATE brae_core)
+add_test(NAME device_alpha_opening_evaluate COMMAND test_device_alpha_opening_evaluate)
+set_tests_properties(device_alpha_opening_evaluate PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_device_inter_peqn tests/test_device_inter_peqn.cu)
+target_include_directories(test_device_inter_peqn PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_inter_peqn PRIVATE brae_core)
+add_test(NAME device_inter_peqn COMMAND test_device_inter_peqn)
+set_tests_properties(device_inter_peqn PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_device_inter_ueqn tests/test_device_inter_ueqn.cu)
+target_include_directories(test_device_inter_ueqn PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_inter_ueqn PRIVATE brae_core)
+add_test(NAME device_inter_ueqn COMMAND test_device_inter_ueqn)
+set_tests_properties(device_inter_ueqn PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_device_alpha_subcycle tests/test_device_alpha_subcycle.cu)
+target_include_directories(test_device_alpha_subcycle PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_alpha_subcycle PRIVATE brae_core)
+add_test(NAME device_alpha_subcycle COMMAND test_device_alpha_subcycle)
+set_tests_properties(device_alpha_subcycle PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_device_alpha_presolve tests/test_device_alpha_presolve.cu)
+target_include_directories(test_device_alpha_presolve PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_alpha_presolve PRIVATE brae_core)
+add_test(NAME device_alpha_presolve COMMAND test_device_alpha_presolve)
+set_tests_properties(device_alpha_presolve PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_device_mules_corr tests/test_device_mules_corr.cu)
+target_include_directories(test_device_mules_corr PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_mules_corr PRIVATE brae_core)
+add_test(NAME device_mules_corr COMMAND test_device_mules_corr)
+set_tests_properties(device_mules_corr PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_device_alpha_step tests/test_device_alpha_step.cu)
+target_include_directories(test_device_alpha_step PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_alpha_step PRIVATE brae_core)
+add_test(NAME device_alpha_step COMMAND test_device_alpha_step)
+set_tests_properties(device_alpha_step PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(device_mules PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(device_interface_properties PROPERTIES SKIP_RETURN_CODE 77)
+set_tests_properties(device_two_phase_mixture PROPERTIES SKIP_RETURN_CODE 77)
+
+add_test(NAME two_phase_mixture
+         COMMAND test_two_phase_mixture
+                 ${BRAE_OF_TUTORIALS}/multiphase/interFoam/laminar/damBreak/damBreak)
+
+# interFoam step 4: interface curvature and surface tension. The dictionary half is the part that bites --
+# damBreak keys its alpha solver as the REGEX "alpha.water.*", cAlpha has NO default in OpenFOAM, and
+# deltaN is 1e-8/cbrt(average(V)) rather than a constant.
+add_executable(test_interface_properties tests/test_interface_properties.cu)
+target_include_directories(test_interface_properties PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/src/transportModels/interfaceProperties
+                           ${CMAKE_CURRENT_SOURCE_DIR}/src/transportModels/twoPhaseMixture)
+target_link_libraries(test_interface_properties PRIVATE brae_core)
+add_test(NAME interface_properties
+         COMMAND test_interface_properties
+                 ${BRAE_OF_TUTORIALS}/multiphase/interFoam/laminar/damBreak/damBreak)
+
+# interFoam step 5: the gravity fields. ghRef carries g's SIGN (gh.H:2-7), and NO shipped tutorial sets
+# constant/hRef -- so on every stock case ghRef is 0 and the sign is unobservable. The gate supplies its
+# own hRef, which is the only way that arm can discriminate.
+add_executable(test_inter_create_fields tests/test_inter_create_fields.cu)
+target_include_directories(test_inter_create_fields PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/src/applications/solvers/interFoam)
+target_link_libraries(test_inter_create_fields PRIVATE brae_core)
+add_test(NAME inter_create_fields
+         COMMAND test_inter_create_fields
+                 ${BRAE_OF_TUTORIALS}/multiphase/interFoam/laminar/damBreak/damBreak)
+
+# interFoam step 6: fvc::reconstruct, which brae did not have and interFoam needs twice (the momentum
+# predictor's source and rebuilding U after the pressure solve). Held against its defining identity --
+# reconstruct(V & Sf) == V -- which no fixture is needed for and which both plausible mistakes break.
+add_executable(test_fvc_reconstruct tests/test_fvc_reconstruct.cu)
+target_include_directories(test_fvc_reconstruct PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_fvc_reconstruct PRIVATE brae_core)
+add_test(NAME fvc_reconstruct COMMAND test_fvc_reconstruct)
+
+# interFoam step 7: UEqn.H. Assembly from pieces brae already had, plus the two that are new to this
+# solver -- fvm::ddt(rho, U) with rho.oldTime() in the SOURCE and rho in the DIAGONAL (they differ by the
+# water/air ratio in every cell the interface crossed), and a momentum source that is a reconstructed
+# FACE flux rather than a cell gradient. Arms 1 and 3 carry the controls that separate each from its
+# plausible substitute; neither difference is visible on a smooth field.
+add_executable(test_inter_ueqn_cpp tests/test_inter_ueqn_cpp.cu)
+target_include_directories(test_inter_ueqn_cpp PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_ueqn_cpp PRIVATE brae_core)
+add_test(NAME inter_ueqn_cpp COMMAND test_inter_ueqn_cpp)
+
+# interFoam step 8: alphaEqn.H's flux assembly -- the controls, the off-centring, phic, alphaPhiUn and
+# rhoPhi. MULES itself is the next stage and is deliberately not here. The arms that matter are the ones
+# no field plot shows: phic zeroed on non-coupled boundaries, the two minus signs in the nested
+# compressive flux, and vanLeer's limiter reaching 2 rather than being clamped to 1.
+add_executable(test_alpha_eqn_cpp tests/test_alpha_eqn_cpp.cu)
+target_include_directories(test_alpha_eqn_cpp PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_alpha_eqn_cpp PRIVATE brae_core)
+add_test(NAME alpha_eqn_cpp
+         COMMAND test_alpha_eqn_cpp
+                 ${BRAE_OF_TUTORIALS}/multiphase/interFoam/laminar/damBreak/damBreak)
+
+# interFoam step 9: MULES. The oracle is BOUNDEDNESS -- an assertion, not a tolerance -- and it needs no
+# instrumented OpenFOAM, which matters because a stock run never writes the limiter. A boundedness gate
+# alone would pass with lambda == 0 everywhere (i.e. first-order upwind, the case's scheme discarded),
+# so the gate is a PAIR: the limited run stays in [0,1] where the unlimited one does not, AND a smooth
+# in-bounds field comes back with lambda == 1 on every face.
+add_executable(test_mules_cpp tests/test_mules_cpp.cu)
+target_include_directories(test_mules_cpp PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_mules_cpp PRIVATE brae_core)
+add_test(NAME mules_cpp
+         COMMAND test_mules_cpp
+                 ${BRAE_OF_TUTORIALS}/multiphase/interFoam/laminar/damBreak/damBreak)
+
+# interFoam step 10: pEqn.H. Only the four things that are NOT shared with every other pressure
+# corrector -- where the pressure gradient went (explicit in UEqn, implicit here), ddtCorr's
+# interpolate(rho*rAU) weighting, the /rAUf inside the velocity reconstruction, and the reference that
+# moves p AND rebuilds p_rgh. Two of the four are invisible unless rho and rAU actually vary, which is
+# what the fixture is built for.
+add_executable(test_inter_peqn_cpp tests/test_inter_peqn_cpp.cu)
+target_include_directories(test_inter_peqn_cpp PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_peqn_cpp PRIVATE brae_core)
+add_test(NAME inter_peqn_cpp COMMAND test_inter_peqn_cpp)
+
+# interFoam step 11: the SECOND Courant number and the time step that shares it. maxAlphaCo is
+# MANDATORY where maxCo defaults to 1 -- the same controlDict is refused by one reader and not the
+# other -- and nearInterface() is a 0/1 mask over the CLOSED band [0.01, 0.99], so the two cells at its
+# edges are the ones an advancing interface is passing through.
+add_executable(test_alpha_courant_cpp tests/test_alpha_courant_cpp.cu)
+target_include_directories(test_alpha_courant_cpp PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_alpha_courant_cpp PRIVATE brae_core)
+add_test(NAME alpha_courant_cpp COMMAND test_alpha_courant_cpp)
+
+# The time-step control against OpenFOAM's own log, a step a row: the program is run by
+# tests/interfoam_write/clock/deltat_openfoam_log.sh, which stages the OpenFOAM run and reads its RESULT line.
+add_executable(test_time_controls_openfoam_log tests/test_time_controls_openfoam_log.cu)
+target_include_directories(test_time_controls_openfoam_log PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_time_controls_openfoam_log PRIVATE brae_core)
+
+# The whole clock against OpenFOAM's own log -- setDeltaT.H, Time's write cadence and every function object's --
+# with the run's controlDict read by the solver's own readers: run by
+# tests/interfoam_write/clock/function_object_write_times.sh and function_object_write_entries.sh.
+add_executable(test_time_controls_cadence_log tests/test_time_controls_cadence_log.cu)
+target_include_directories(test_time_controls_cadence_log PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_time_controls_cadence_log PRIVATE brae_core)
+
+# interFoam step 12: the time step -- the alpha sub-cycle (33 of the 44 tutorials use it) and the order
+# of the PIMPLE loop. The three sub-cycle mistakes all leave a BOUNDED, plausible alpha field, so no
+# boundedness gate sees them; and the loop order decides which rho the momentum predictor is built on,
+# which is a factor of 1000 at a water/air interface.
+add_executable(test_inter_solve_cpp tests/test_inter_solve_cpp.cu)
+target_include_directories(test_inter_solve_cpp PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_solve_cpp PRIVATE brae_core)
+add_test(NAME inter_solve_cpp COMMAND test_inter_solve_cpp)
+
+# interFoam step 13: interface CURVATURE, the component the manifest carried as needing an instrumented
+# OpenFOAM. It does not: curvature is GEOMETRY. A plane has K = 0 exactly at any resolution, a sphere
+# of radius R has K = 2/R as the mesh refines, and the contact angle has an exact postcondition --
+# acos(nHat & nf) IS theta. The convergence arm is what makes the sphere's tolerance a statement about
+# the scheme rather than about this mesh.
+add_executable(test_interface_curvature_cpp tests/test_interface_curvature_cpp.cu)
+target_include_directories(test_interface_curvature_cpp PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_interface_curvature_cpp PRIVATE brae_core)
+add_test(NAME interface_curvature_cpp COMMAND test_interface_curvature_cpp)
+
+# interFoam step 14: createFields against damBreak's own case. damBreak ships 0.orig and NO mesh, so
+# the fixture is a PROCEDURE -- blockMesh then setFields -- not a directory this repo can check in.
+# The shell gate runs OpenFOAM's own two utilities and hands the prepared case to the binary; both
+# SKIP rather than fail where OpenFOAM is not installed.
+add_executable(test_inter_case_cpp tests/test_inter_case_cpp.cu)
+target_include_directories(test_inter_case_cpp PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_inter_case_cpp PRIVATE brae_core)
+add_test(NAME interfoam_createfields_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_createfields_vs_openfoam.sh)
+
+# interFoam step 16: brae's interFoam against REAL OpenFOAM's, on damBreak, after exactly N IDENTICAL
+# time steps. The gate rewrites the case with `adjustTimeStep no` before running either -- an adaptive
+# step makes the two diverge in TIME the moment their Courant numbers differ at all, and then every
+# field is compared at a different instant.
+add_executable(test_inter_dambreak_vs_openfoam tests/test_inter_dambreak_vs_openfoam.cu)
+target_include_directories(test_inter_dambreak_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_dambreak_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_dambreak_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_dambreak_vs_openfoam.sh)
+
+# ...and RAS/damBreak: kEpsilon in BOTH of incompressibleInterPhaseTransportModel's lineages, against
+# real OpenFOAM's fields and its epsilon and k solver log, with OpenFOAM's laminar answer and its
+# other lineage's as the controls.
+add_executable(test_inter_ras_dambreak_vs_openfoam tests/test_inter_ras_dambreak_vs_openfoam.cu)
+target_include_directories(test_inter_ras_dambreak_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_ras_dambreak_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_ras_dambreak_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_ras_dambreak_vs_openfoam.sh)
+
+# ...and kOmegaSST, on RAS/waterChannel as shipped: the ordinary incompressible model handed the
+# mixture's nu, the cell wall distance, omega and nutk wall functions, and a convection scheme named
+# through a pattern key. The control is OpenFOAM's own laminar run; the device loop must refuse by name.
+add_executable(test_inter_waterchannel_vs_openfoam tests/test_inter_waterchannel_vs_openfoam.cu)
+target_include_directories(test_inter_waterchannel_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_waterchannel_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_waterchannel_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_waterchannel_vs_openfoam.sh)
+
+# ...and the closure's ASSEMBLED SYSTEM against OpenFOAM's own, at the first call, under
+# `Gauss limitedLinear 1`. The fields of that profile cannot witness the scheme -- one ulp of the
+# initial omega is worth 4.3e-02 there after ten steps -- so the device arm is gated on the matrix it
+# assembles, with OpenFOAM's `Gauss upwind` system as the control that must NOT match.
+add_test(NAME interfoam_sst_assembly_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_sst_assembly_vs_openfoam.sh)
+set_tests_properties(interfoam_sst_assembly_vs_openfoam PROPERTIES LABELS slow)
+
+# ...and its kEpsilon twin, on RAS/damBreak, sharing the comparator (tests/assembly_compare.py). The
+# oracle had to reach interFoam's lineage first: tools/dumpKEpsilon registers the VoF-phase table now.
+add_test(NAME interfoam_kepsilon_assembly_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_kepsilon_assembly_vs_openfoam.sh)
+set_tests_properties(interfoam_kepsilon_assembly_vs_openfoam PROPERTIES LABELS slow)
+
+# ...whose first run found pressureInletOutletVelocity's snGrad() reading the stored value where
+# OpenFOAM's directionMixed builds it from the valueFraction and the cell. Held on its own here.
+add_executable(test_piov_sngrad tests/test_piov_sngrad.cu)
+target_include_directories(test_piov_sngrad PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_piov_sngrad PRIVATE brae_core)
+add_test(NAME piov_sngrad COMMAND test_piov_sngrad)
+
+# ...and MRF, on laminar/mixerVessel2D as shipped: the rotor's frame velocity, rho*(Omega x U), the
+# zero-filtered ddtCorr flux and the relative phiHbyA. The control is OpenFOAM with the zone inactive;
+# the device loop must refuse by name.
+add_executable(test_inter_mrf_vs_openfoam tests/test_inter_mrf_vs_openfoam.cu)
+target_include_directories(test_inter_mrf_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_mrf_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_mrf_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_mrf_vs_openfoam.sh)
+
+# ...and an fvOption, on RAS/angledDuct as shipped: explicitPorositySource/DarcyForchheimer in a
+# force-dimensioned UEqn (rho and rho*nu from the mixture), under kEpsilon on a mesh non-orthogonal to
+# 44.5 degrees. The control is OpenFOAM with the option inactive; the device loop must refuse by name.
+add_executable(test_inter_angledduct_vs_openfoam tests/test_inter_angledduct_vs_openfoam.cu)
+target_include_directories(test_inter_angledduct_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_angledduct_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_angledduct_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_angledduct_vs_openfoam.sh)
+
+# ...and the free-level inlet, on RAS/weirOverflow as shipped: variableHeightFlowRateInletVelocity on U
+# and variableHeightFlowRate on alpha. The controls are OpenFOAM with the inlet frozen at its file value
+# and with the alpha condition an inletOutlet of zero; the device loop must refuse by name.
+# ...and localEuler (LTS), on RAS/DTCHull meshed serially by real OpenFOAM: setRDeltaT.H's local time
+# step against the rDeltaT OpenFOAM writes at every step, and the fields it advances.
+add_executable(test_inter_dtchull_vs_openfoam tests/test_inter_dtchull_vs_openfoam.cu)
+target_include_directories(test_inter_dtchull_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_dtchull_vs_openfoam PRIVATE brae_core)
+# ONE TEST PER FILE under tests/interfoam_ami_device/: the device loop across a static cyclicAMI pair
+# against real OpenFOAM, and its controls (run.sh holds the fixture and what is measured)
+file(GLOB BRAE_AMI_DEVICE_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_ami_device
+     ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_ami_device/*.sh)
+list(FILTER BRAE_AMI_DEVICE_TESTS EXCLUDE REGEX "^(run|_common)\\.sh$")
+foreach(rel ${BRAE_AMI_DEVICE_TESTS})
+    string(REPLACE ".sh" "" name ${rel})
+    add_test(NAME interfoam_ami_device_${name}
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_ami_device/${rel})
+    set_tests_properties(interfoam_ami_device_${name} PROPERTIES
+                         SKIP_RETURN_CODE 77
+                         TIMEOUT 1800
+                         RESOURCE_LOCK brae_gpu
+                         ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+endforeach()
+
+# ONE TEST PER FILE under tests/interfoam_dtchull/, each a part of this gate chosen through the gate's own
+# selector, so no test is the whole gate; the device arms take the GPU one at a time (see interfoam_moving)
+file(GLOB BRAE_DTCHULL_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_dtchull
+     ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_dtchull/*.sh)
+list(FILTER BRAE_DTCHULL_TESTS EXCLUDE REGEX "^(run|_common)\\.sh$")
+foreach(rel ${BRAE_DTCHULL_TESTS})
+    string(REPLACE ".sh" "" name ${rel})
+    add_test(NAME interfoam_dtchull_${name}
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_dtchull/${rel})
+    set_tests_properties(interfoam_dtchull_${name} PROPERTIES
+                         SKIP_RETURN_CODE 77
+                         TIMEOUT 1800
+                         RESOURCE_LOCK "brae_gpu;brae_bigmesh"
+                         ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+endforeach()
+
+# ...and RAS/DTCHullMoving with its mesh FROZEN: the atmosphere's pressureInletOutletVelocity carries a
+# `tangentialVelocity`, which interFoam's host loop claims and hands to the patch field. The control is brae
+# with the entry stripped against OpenFOAM with it; OpenFOAM against itself without the entry is the proof the
+# window can see it. Meshes the tutorial serially, as the DTCHull gate does.
+add_executable(test_inter_dtchullmoving_vs_openfoam tests/test_inter_dtchullmoving_vs_openfoam.cu)
+target_include_directories(test_inter_dtchullmoving_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_dtchullmoving_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_dtchullmoving_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_dtchullmoving_vs_openfoam.sh)
+set_tests_properties(interfoam_dtchullmoving_vs_openfoam PROPERTIES
+                     SKIP_RETURN_CODE 77
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+
+add_executable(test_inter_weiroverflow_vs_openfoam tests/test_inter_weiroverflow_vs_openfoam.cu)
+target_include_directories(test_inter_weiroverflow_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_weiroverflow_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_weiroverflow_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_weiroverflow_vs_openfoam.sh)
+
+# ...whose alpha condition that case cannot tell from a zeroGradient; its per-face logic, with bounds
+# that are not 0 and 1, is held here against OpenFOAM's own text, with an inletOutlet as the control.
+add_executable(test_variable_height_flow_rate tests/test_variable_height_flow_rate.cu)
+target_include_directories(test_variable_height_flow_rate PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_variable_height_flow_rate PRIVATE brae_core)
+add_test(NAME variable_height_flow_rate COMMAND test_variable_height_flow_rate)
+
+# The two permeable-wall conditions face by face, against OpenFOAM's text: the `alpha none` half and the
+# dry-inflow face, which laminar/damBreakPermeable does not reach.
+add_executable(test_permeable_wall_conditions tests/test_permeable_wall_conditions.cu)
+target_include_directories(test_permeable_wall_conditions PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_permeable_wall_conditions PRIVATE brae_core)
+add_test(NAME permeable_wall_conditions COMMAND test_permeable_wall_conditions)
+
+# ...and the permeable wall, on laminar/damBreakPermeable: a velocity and a pressure condition that each
+# switch face by face, on the phase fraction at the patch, between a wall and an open boundary. Two
+# profiles -- as shipped (the wall stays dry) and the column staged against the wall (faces go dry as it
+# falls); the control is OpenFOAM with the wall closed, and the device loop must refuse by name.
+add_executable(test_inter_permeable_vs_openfoam tests/test_inter_permeable_vs_openfoam.cu)
+target_include_directories(test_inter_permeable_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_permeable_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_permeable_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_permeable_vs_openfoam.sh)
+
+# interFoam across a cyclic baffle, and with porousBafflePressure's jump on it, against real OpenFOAM on
+# RAS/damBreakPorousBaffle. The script carries the measurements, the controls and the fail-proofs.
+add_executable(test_inter_baffle_vs_openfoam tests/test_inter_baffle_vs_openfoam.cu)
+target_include_directories(test_inter_baffle_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_baffle_vs_openfoam PRIVATE brae_core)
+# ONE TEST PER FILE under tests/interfoam_baffle/, each a part of this gate chosen through the gate's own
+# selector, so no test is the whole gate; the device arms take the GPU one at a time (see interfoam_moving)
+file(GLOB BRAE_BAFFLE_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_baffle
+     ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_baffle/*.sh)
+list(FILTER BRAE_BAFFLE_TESTS EXCLUDE REGEX "^(run|_common)\\.sh$")
+foreach(rel ${BRAE_BAFFLE_TESTS})
+    string(REPLACE ".sh" "" name ${rel})
+    add_test(NAME interfoam_baffle_${name}
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_baffle/${rel})
+    set_tests_properties(interfoam_baffle_${name} PROPERTIES
+                         SKIP_RETURN_CODE 77
+                         TIMEOUT 1800
+                         RESOURCE_LOCK brae_gpu)
+endforeach()
+
+# The coupled cyclic patch field and porousBafflePressure's jump face by face, against OpenFOAM's text: the
+# per-face jump, reversed flow and sign(0), which RAS/damBreakPorousBaffle does not reach.
+add_executable(test_porous_baffle_pressure tests/test_porous_baffle_pressure.cu)
+target_include_directories(test_porous_baffle_pressure PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_porous_baffle_pressure PRIVATE brae_core)
+add_test(NAME porous_baffle_pressure COMMAND test_porous_baffle_pressure)
+
+# interFoam with LES kEqn on an axisymmetric wedge against real OpenFOAM on LES/nozzleFlow2D. The script
+# carries the measurements, the control and the fail-proofs.
+add_executable(test_inter_les_vs_openfoam tests/test_inter_les_vs_openfoam.cu)
+target_include_directories(test_inter_les_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_les_vs_openfoam PRIVATE brae_core)
+# ONE TEST PER FILE under tests/interfoam_les/, each a part of this gate chosen through the gate's own
+# selector, so no test is the whole gate; the device arms take the GPU one at a time (see interfoam_moving)
+file(GLOB BRAE_LES_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_les
+     ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_les/*.sh)
+list(FILTER BRAE_LES_TESTS EXCLUDE REGEX "^(run|_common)\\.sh$")
+foreach(rel ${BRAE_LES_TESTS})
+    string(REPLACE ".sh" "" name ${rel})
+    add_test(NAME interfoam_les_${name}
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_les/${rel})
+    set_tests_properties(interfoam_les_${name} PROPERTIES
+                         SKIP_RETURN_CODE 77
+                         TIMEOUT 1800
+                         RESOURCE_LOCK brae_gpu)
+endforeach()
+
+# interFoam on a FULLY PERIODIC mesh against real OpenFOAM, on brae's own validation/interFoamCyclic.
+# The script carries the measurements, the control and the device refusal.
+add_executable(test_inter_cyclic_vs_openfoam tests/test_inter_cyclic_vs_openfoam.cu)
+target_include_directories(test_inter_cyclic_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_cyclic_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_cyclic_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_cyclic_vs_openfoam.sh)
+
+# interFoam with limitedLinear on div(rhoPhi,U) against real OpenFOAM on eulerianInjection. The script
+# carries the measurements, the controls and the fail-proofs.
+add_executable(test_inter_limitedlinear_vs_openfoam tests/test_inter_limitedlinear_vs_openfoam.cu)
+target_include_directories(test_inter_limitedlinear_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_limitedlinear_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_limitedlinear_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_limitedlinear_vs_openfoam.sh)
+
+# brae's articulated-body dynamics against real OpenFOAM's own rigidBodyMotion::solve.
+add_executable(test_rigid_body_dynamics_vs_openfoam tests/test_rigid_body_dynamics_vs_openfoam.cu)
+target_include_directories(test_rigid_body_dynamics_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_rigid_body_dynamics_vs_openfoam PRIVATE brae_core)
+add_test(NAME rigid_body_dynamics_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rigid_body_dynamics_vs_openfoam.sh)
+set_tests_properties(rigid_body_dynamics_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# brae's Newmark integrator and acceleration relaxation against real OpenFOAM's own joint state.
+add_executable(test_rigid_body_newmark_vs_openfoam tests/test_rigid_body_newmark_vs_openfoam.cu)
+target_include_directories(test_rigid_body_newmark_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_rigid_body_newmark_vs_openfoam PRIVATE brae_core)
+add_test(NAME rigid_body_newmark_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rigid_body_newmark_vs_openfoam.sh)
+set_tests_properties(rigid_body_newmark_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# brae's fluid force and moment on a body's patches against real OpenFOAM's functionObjects::forces.
+add_executable(test_rigid_body_forces_vs_openfoam tests/test_rigid_body_forces_vs_openfoam.cu)
+target_include_directories(test_rigid_body_forces_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_rigid_body_forces_vs_openfoam PRIVATE brae_core)
+add_test(NAME rigid_body_forces_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rigid_body_forces_vs_openfoam.sh)
+set_tests_properties(rigid_body_forces_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# brae's rigid-body point transform against real OpenFOAM's pointDisplacement, with the joint state
+# taken from OpenFOAM's own. The script carries the measurements and the controls.
+add_executable(test_rigid_body_transform_vs_openfoam tests/test_rigid_body_transform_vs_openfoam.cu)
+target_include_directories(test_rigid_body_transform_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_rigid_body_transform_vs_openfoam PRIVATE brae_core)
+add_test(NAME rigid_body_transform_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/rigid_body_transform_vs_openfoam.sh)
+set_tests_properties(rigid_body_transform_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# brae's three flux corrections against real OpenFOAM's own.
+add_executable(test_flux_map_vs_openfoam tests/test_flux_map_vs_openfoam.cu)
+target_include_directories(test_flux_map_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_flux_map_vs_openfoam PRIVATE brae_core)
+
+# brae's cell mapper against real OpenFOAM's own, through a refinement and an unrefinement step.
+add_executable(test_field_map_vs_openfoam tests/test_field_map_vs_openfoam.cu)
+target_include_directories(test_field_map_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_field_map_vs_openfoam PRIVATE brae_core)
+add_test(NAME field_map_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/field_map_vs_openfoam.sh)
+set_tests_properties(field_map_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# brae's refinement candidate selection against real OpenFOAM's own dynamicRefineFvMesh members.
+add_executable(test_refine_candidates_vs_openfoam tests/test_refine_candidates_vs_openfoam.cu)
+target_include_directories(test_refine_candidates_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_refine_candidates_vs_openfoam PRIVATE brae_core)
+add_test(NAME refine_candidates_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/refine_candidates_vs_openfoam.sh)
+set_tests_properties(refine_candidates_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# brae's polyTopoChange FACE ORDERING against OpenFOAM's own mesh numbering -- unit 1 of
+# dynamicRefineFvMesh's producing half. The oracle is the mesh itself: a written OpenFOAM mesh is
+# already in this order, so it must come back the identity. The script carries the controls.
+add_executable(test_poly_topo_change_order tests/test_poly_topo_change_order.cu)
+target_include_directories(test_poly_topo_change_order PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_poly_topo_change_order PRIVATE brae_core)
+add_test(NAME poly_topo_change_order_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/poly_topo_change_order_vs_openfoam.sh)
+set_tests_properties(poly_topo_change_order_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# UNITS 3 AND 4 of the dynamicRefineFvMesh port: the action surface and changeMesh, against OpenFOAM's
+# own mapPolyMesh for a scripted action list both codes read from the same file (tools/dumpTopoChange).
+add_executable(test_topo_change_vs_openfoam tests/test_topo_change_vs_openfoam.cu)
+target_include_directories(test_topo_change_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_topo_change_vs_openfoam PRIVATE brae_core)
+add_test(NAME topo_change_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/topo_change_vs_openfoam.sh)
+set_tests_properties(topo_change_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# UNIT 5a: faceEdges / edgeFaces / cellEdges -- the primitiveMesh addressing hexRef8::setRefinement reads,
+# against OpenFOAM's own (tools/dumpMeshEdges dumps BOTH of OpenFOAM's two forms of each).
+add_executable(test_mesh_edges_addressing_vs_openfoam tests/test_mesh_edges_addressing_vs_openfoam.cu)
+target_include_directories(test_mesh_edges_addressing_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_mesh_edges_addressing_vs_openfoam PRIVATE brae_core)
+add_test(NAME mesh_edges_addressing_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mesh_edges_addressing_vs_openfoam.sh)
+set_tests_properties(mesh_edges_addressing_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# UNIT 5b: hexRef8::setRefinement, against OpenFOAM's own (tools/dumpHexRef8 dumps cellAddedCells, the
+# levels, the map and the mesh). Stage 5b-1 holds the points, the cells and the levels.
+add_executable(test_refine_update_vs_openfoam tests/test_refine_update_vs_openfoam.cu)
+target_include_directories(test_refine_update_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_refine_update_vs_openfoam PRIVATE brae_core)
+add_test(NAME refine_update_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/refine_update_vs_openfoam.sh)
+set_tests_properties(refine_update_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+add_executable(test_hex_ref8_vs_openfoam tests/test_hex_ref8_vs_openfoam.cu)
+target_include_directories(test_hex_ref8_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_hex_ref8_vs_openfoam PRIVATE brae_core)
+add_test(NAME hex_ref8_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/hex_ref8_vs_openfoam.sh)
+set_tests_properties(hex_ref8_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# UNIT 8e: brae's interFoam on an ADAPTIVE mesh against real OpenFOAM's -- the whole chain through the
+# solver, on the mesh OpenFOAM itself refined, with a control for each half (the flux rebuild and the
+# old-time mapping). The script says what the two steps exercise and what this fixture cannot witness.
+add_executable(test_inter_amr_vs_openfoam tests/test_inter_amr_vs_openfoam.cu)
+target_include_directories(test_inter_amr_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_amr_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_amr_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_amr_vs_openfoam.sh)
+set_tests_properties(interfoam_amr_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_inter_amr_vs_openfoam
+                     TIMEOUT 900)
+
+# ...and a mesh that is ALREADY REFINED when the run starts, which is what RAS/motorBike needs: brae assigned
+# level 0 everywhere and a snappyHexMesh mesh is at levels 1 to 3, so `maxRefinement` meant different things
+# in the two codes. Two profiles, one fixture: `levels` reads OpenFOAM's ASCII cellLevel/pointLevel/
+# refinementHistory, `levelsBinary` reads the SAME mesh re-written by OpenFOAM in binary with the history
+# removed as motorBike's Allrun.pre removes it. Runs OpenFOAM three times (an ASCII seed, a binary seed and
+# the oracle) plus a one-ulp twin; all cached.
+add_test(NAME interfoam_amr_levels_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_amr_levels_vs_openfoam.sh)
+set_tests_properties(interfoam_amr_levels_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_inter_amr_vs_openfoam
+                     TIMEOUT 1800)
+
+# ...and RAS/motorBike ITSELF, which is what the levels, instance, RAS and autoMap units were each built for:
+# a snappyHexMesh mesh at levels 1 to 3 with BINARY cellLevel/pointLevel and no refinementHistory, 61 patches,
+# and kOmegaSST on a mesh that changes under it. The mesh is an INPUT, produced once by real OpenFOAM's own
+# SERIAL snappyHexMesh -- the path Allrun.pre ships commented out, 1.53 s for 8655 cells -- because snappy is
+# a mesher and brae's subject is interFoam. Nothing in this gate is parallel.
+add_test(NAME interfoam_motorbike_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_motorbike_vs_openfoam.sh)
+set_tests_properties(interfoam_motorbike_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_inter_amr_vs_openfoam
+                     TIMEOUT 1200)
+
+# ...and a mesh that REFINES AND MOVES: laminar/oscillatingBox as shipped at fixed steps (`box`, twenty; and
+# `boxUnrefine`, sixty, through its first unrefinement), the motion's points0 carried through every change and
+# its points and points0 held to OpenFOAM's bitwise. The device arm refuses the combination by name.
+# ONE TEST PER FILE under tests/interfoam_amr_motion/, each one profile of the gate through its
+# AMR_MOTION_PART selector. MEASURED alone: box 37 s, unrefine 122 s (the two in one test read 393 s under
+# ctest -j 4).
+file(GLOB BRAE_AMR_MOTION_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_amr_motion
+     ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_amr_motion/*.sh)
+foreach(rel ${BRAE_AMR_MOTION_TESTS})
+    string(REGEX REPLACE "\\.sh$" "" name ${rel})
+    add_test(NAME interfoam_amr_motion_${name}
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_amr_motion/${rel})
+    set_tests_properties(interfoam_amr_motion_${name} PROPERTIES
+                         ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}"
+                         SKIP_RETURN_CODE 77
+                         DEPENDS test_inter_amr_vs_openfoam
+                         RESOURCE_LOCK brae_gpu
+                         TIMEOUT 600)
+endforeach()
+
+# ...and a GENUINE RESTART, where nothing is moved into constant/polyMesh: the seed leaves an ORIGINAL mesh
+# there and a REFINED one in the time directory, and both codes continue from the time directory. That is the
+# instance resolution the levels gate above explicitly did not claim -- OpenFOAM SEARCHES for points, faces
+# and boundary separately (polyMesh.C:175-295 over Time::findInstance), and brae read constant/polyMesh in
+# four places. It also covers `startFrom latestTime`, which braeInterFoam read and then dropped. Runs
+# OpenFOAM three times (a seed, the continuation and a one-ulp twin), all cached, and the shipped solver
+# twice -- once as written and once under the control that pins every instance to constant/.
+add_test(NAME interfoam_restart_instance_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_restart_instance_vs_openfoam.sh)
+set_tests_properties(interfoam_restart_instance_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_inter_amr_vs_openfoam
+                     TIMEOUT 1800)
+
+# ...and a RAS TURBULENCE MODEL on a refining mesh, which is what RAS/motorBike needs before it can be
+# attempted. Its own script for the same reason the MRF one is: it stages RAS/damBreak (already turbulent,
+# already held statically by interfoam_ras_dambreak_vs_openfoam) plus one injected dynamicMeshDict, in two
+# profiles -- kEpsilon as shipped and the same case made kOmegaSST, which is the only one of the two that
+# builds a CELL wall distance.
+add_test(NAME interfoam_amr_ras_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_amr_ras_vs_openfoam.sh)
+set_tests_properties(interfoam_amr_ras_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_inter_amr_vs_openfoam
+                     TIMEOUT 1800)
+
+# ...and MRF on a refining mesh, which needs a DIFFERENT case and therefore its own script: the four
+# profiles above stage damBreakWithObstacle, whose fixedFluxPressure walls brae refuses MRF beside. It runs
+# the same test binary on laminar/mixerVessel2D with the `mrf` profile, and runs OpenFOAM TWICE -- the
+# oracle and a one-ulp twin, which is where its bounds come from. Both are cached.
+add_test(NAME interfoam_amr_mrf_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_amr_mrf_vs_openfoam.sh)
+set_tests_properties(interfoam_amr_mrf_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_inter_amr_vs_openfoam
+                     TIMEOUT 1800)
+
+# brae's dynamicRefineFvMeshCoeffs reader against the three shipped AMR tutorials' own dictionaries --
+# flat, flat-beside-a-subdict, and wrapped. The oracle is the dictionary; the script says why all three.
+add_executable(test_refine_controls tests/test_refine_controls.cu)
+target_include_directories(test_refine_controls PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_refine_controls PRIVATE brae_core)
+add_test(NAME refine_controls_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/refine_controls_vs_openfoam.sh)
+set_tests_properties(refine_controls_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# pointConstraints::constrainDisplacement -- the symmetryPlane point patches and the corner constraints the
+# rigid-body mesh motion ends every solve with -- against OpenFOAM's own class on the same staged input
+# (tools/dumpPointConstraints): RAS/DTCHullMoving's mesh, its fixedValue patches pinned off zero, and a
+# parallelepiped whose three tilted symmetry planes meet at a corner.
+add_executable(test_point_constraints_vs_openfoam tests/test_point_constraints_vs_openfoam.cu)
+target_include_directories(test_point_constraints_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_point_constraints_vs_openfoam PRIVATE brae_core)
+add_test(NAME point_constraints_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/point_constraints_vs_openfoam.sh)
+set_tests_properties(point_constraints_vs_openfoam PROPERTIES
+                     SKIP_RETURN_CODE 77
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+
+# brae's pointPatchDist and the rigidBodyMeshMotion scale against real OpenFOAM, on the mesh
+# RAS/floatingObject builds. The script carries the measurements and the controls.
+add_executable(test_point_patch_dist_vs_openfoam tests/test_point_patch_dist_vs_openfoam.cu)
+target_include_directories(test_point_patch_dist_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_point_patch_dist_vs_openfoam PRIVATE brae_core)
+add_test(NAME point_patch_dist_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/point_patch_dist_vs_openfoam.sh)
+set_tests_properties(point_patch_dist_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+# ...and on a mesh of two unconnected blocks, where the wave does not reach every point: OpenFOAM leaves those
+# at GREAT and rigidBodyMeshMotion does not move them. The control is the old value, 0.
+add_test(NAME point_patch_dist_unreached_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/point_patch_dist_unreached_vs_openfoam.sh)
+set_tests_properties(point_patch_dist_unreached_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+
+# interFoam across a coded cyclicACMI baffle against real OpenFOAM on damBreakLeakage. The script carries
+# the measurements, the controls and the fail-proofs.
+add_executable(test_inter_leakage_vs_openfoam tests/test_inter_leakage_vs_openfoam.cu)
+target_include_directories(test_inter_leakage_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_leakage_vs_openfoam PRIVATE brae_core)
+# ONE TEST PER FILE under tests/interfoam_leakage/, each a part of this gate chosen through the gate's own
+# selector, so no test is the whole gate; the device arms take the GPU one at a time (see interfoam_moving)
+file(GLOB BRAE_LEAKAGE_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_leakage
+     ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_leakage/*.sh)
+list(FILTER BRAE_LEAKAGE_TESTS EXCLUDE REGEX "^(run|_common)\\.sh$")
+foreach(rel ${BRAE_LEAKAGE_TESTS})
+    string(REPLACE ".sh" "" name ${rel})
+    add_test(NAME interfoam_leakage_${name}
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_leakage/${rel})
+    set_tests_properties(interfoam_leakage_${name} PROPERTIES
+                         SKIP_RETURN_CODE 77
+                         TIMEOUT 1800
+                         RESOURCE_LOCK brae_gpu)
+endforeach()
+
+# interFoam with the mangrove fvOptions against real OpenFOAM on waves/mangroveInteraction. The script
+# carries the measurements, the controls and the fail-proofs.
+add_executable(test_inter_mangrove_vs_openfoam tests/test_inter_mangrove_vs_openfoam.cu)
+target_include_directories(test_inter_mangrove_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_mangrove_vs_openfoam PRIVATE brae_core)
+# ONE TEST PER FILE under tests/interfoam_mangrove/, each a part of this gate chosen through the gate's own
+# selector, so no test is the whole gate; the device arms take the GPU one at a time (see interfoam_moving)
+file(GLOB BRAE_MANGROVE_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_mangrove
+     ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_mangrove/*.sh)
+list(FILTER BRAE_MANGROVE_TESTS EXCLUDE REGEX "^(run|_common)\\.sh$")
+foreach(rel ${BRAE_MANGROVE_TESTS})
+    string(REPLACE ".sh" "" name ${rel})
+    add_test(NAME interfoam_mangrove_${name}
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_mangrove/${rel})
+    set_tests_properties(interfoam_mangrove_${name} PROPERTIES
+                         SKIP_RETURN_CODE 77
+                         TIMEOUT 1800
+                         RESOURCE_LOCK brae_gpu)
+endforeach()
+
+# CrankNicolson ddt on RAS/damBreak, both arms (run by tests/interfoam_cn_vs_openfoam.sh)
+add_executable(test_inter_cn_vs_openfoam tests/test_inter_cn_vs_openfoam.cu)
+target_include_directories(test_inter_cn_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_cn_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_cn_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_cn_vs_openfoam.sh)
+set_tests_properties(interfoam_cn_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# OpenFOAM's faceAreaWeightAMI on the host, against the weights its own cyclicAMI holds on
+# RAS/mixerVesselAMI as the rotor turns (run by tests/interfoam_ami_vs_openfoam.sh)
+add_executable(test_face_area_weight_ami tests/test_face_area_weight_ami.cu)
+target_include_directories(test_face_area_weight_ami PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_face_area_weight_ami PRIVATE brae_core)
+
+# interFoam across a rotating cyclicAMI against real OpenFOAM on RAS/mixerVesselAMI. The script carries
+# the measurements, the controls and the fail-proofs.
+# An instrument, not a gate: both interFoam loops on one case, and the device's intermediates of the last
+# step against the host's (tools/interTapsDiff/inter_taps_diff.cu)
+add_executable(brae_inter_taps_diff tools/interTapsDiff/inter_taps_diff.cu)
+target_include_directories(brae_inter_taps_diff PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(brae_inter_taps_diff PRIVATE brae_core)
+
+add_executable(test_inter_ami_vs_openfoam tests/test_inter_ami_vs_openfoam.cu)
+target_include_directories(test_inter_ami_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_ami_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_ami_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_ami_vs_openfoam.sh)
+
+# ...and the wave boundary conditions (waveAlpha, waveVelocity) on laminar/waves/stokesI: fields, the
+# patch values the wave model assigns, its two derived constants and the ORDER it updates in, all
+# against real OpenFOAM; the control is OpenFOAM's own answer with the wave switched off.
+add_executable(test_inter_waves_vs_openfoam tests/test_inter_waves_vs_openfoam.cu)
+target_include_directories(test_inter_waves_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_waves_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_waves_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_waves_vs_openfoam.sh)
+
+# MESH MOTION ON ITS OWN, before any solver reads it: the moved points, meshPhi, V and C of a
+# solid-body motion against OpenFOAM's moveDynamicMesh, per time step.
+add_executable(test_mesh_motion_vs_openfoam tests/test_mesh_motion_vs_openfoam.cu)
+target_include_directories(test_mesh_motion_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_mesh_motion_vs_openfoam PRIVATE brae_core)
+add_test(NAME mesh_motion_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mesh_motion_vs_openfoam.sh)
+
+# ...and a DEFORMING one: displacementLaplacian from the waveMaker paddles, the points, the motion
+# solver's two fields, meshPhi and every GAMG solve against OpenFOAM's moveDynamicMesh, per time step.
+add_executable(test_displacement_laplacian_vs_openfoam tests/test_displacement_laplacian_vs_openfoam.cu)
+target_include_directories(test_displacement_laplacian_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_displacement_laplacian_vs_openfoam PRIVATE brae_core)
+add_test(NAME displacement_laplacian_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/displacement_laplacian_vs_openfoam.sh)
+
+# ...and interFoam ON a mesh in solid-body motion: a closed tank, against OpenFOAM's fields, its moved
+# mesh, its Uf and its wall velocity, with the same tank held still as the control.
+add_executable(test_inter_moving_vs_openfoam tests/test_inter_moving_vs_openfoam.cu)
+target_include_directories(test_inter_moving_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_moving_vs_openfoam PRIVATE brae_core)
+# ONE TEST PER FILE under tests/interfoam_moving/<family>/, each gating at most three profiles through the
+# gate's own selectors (MOVING_ONLY stages a profile and its control, MOVING_GATE gates the profile alone).
+# A change to one mesh motion is checked by its file. As ONE test this gate took 2900 s; as ten family
+# tests run five abreast the flap family alone took 1112 s where it takes 260 s by itself -- every
+# OpenFOAM run was a cache hit, and the time was five processes sharing one GPU. Hence the RESOURCE_LOCK:
+# tests that run a device arm take the GPU one at a time, and the CPU-only tests run beside them.
+file(GLOB BRAE_MOVING_TESTS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_moving
+     ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_moving/*/*.sh)
+foreach(rel ${BRAE_MOVING_TESTS})
+    string(REPLACE ".sh" "" name ${rel})
+    string(REPLACE "/" "_" name ${name})
+    add_test(NAME interfoam_moving_${name}
+             COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_moving/${rel})
+    # THE TIME LIMIT IS FOR A HANG, and it has to clear the suite's load: piston/outer_once_control is 210 s by
+    # itself and ran past 900 s in the full suite at -j 8 (2026-10-08), beside tests of the other solvers that
+    # take the GPU without this lock; piston/outer_control was 629 s in the same run. No check changed.
+    set_tests_properties(interfoam_moving_${name} PROPERTIES
+                         SKIP_RETURN_CODE 77
+                         TIMEOUT 1800
+                         RESOURCE_LOCK brae_gpu)
+endforeach()
+
+# ...and the SOLVER those tutorials name for p_rghFinal, GAMG, as shipped: OpenFOAM's hierarchy level
+# by level, the coarsest-level solve of every V-cycle and every p_rgh line, from its log under its own
+# debug switches; the control is OpenFOAM's own answer with PCG in GAMG's place.
+add_executable(test_inter_gamg_vs_openfoam tests/test_inter_gamg_vs_openfoam.cu)
+target_include_directories(test_inter_gamg_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_gamg_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_gamg_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_gamg_vs_openfoam.sh)
+
+# ...and capillaryRise, where surface tension IS the answer rather than a correction, and which is the
+# ONLY shipped interFoam tutorial with a contact angle. damBreak would still look broadly right with
+# sigma set to zero; this one would not move at all.
+add_executable(test_inter_capillary_vs_openfoam tests/test_inter_capillary_vs_openfoam.cu)
+target_include_directories(test_inter_capillary_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_inter_capillary_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_capillaryrise_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_capillaryrise_vs_openfoam.sh)
+
+# ...and the CURVATURE itself, against OpenFOAM's UNMODIFIED interfaceProperties via
+# tools/dumpInterfaceK. Swept over four calculateK pass counts, because the curvature is a FIXED POINT
+# in those passes -- it reads the wall gradient its own previous pass wrote -- so agreement at one
+# count says much less than agreement at four.
+add_executable(test_inter_curvature_vs_openfoam tests/test_inter_curvature_vs_openfoam.cu)
+target_include_directories(test_inter_curvature_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_inter_curvature_vs_openfoam PRIVATE brae_core)
+add_test(NAME interfoam_curvature_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_curvature_vs_openfoam.sh)
+set_tests_properties(interfoam_curvature_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_inter_curvature_vs_openfoam
+                     TIMEOUT 600)
+set_tests_properties(interfoam_capillaryrise_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_inter_capillary_vs_openfoam
+                     TIMEOUT 900)
+set_tests_properties(interfoam_dambreak_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_inter_dambreak_vs_openfoam
+                     TIMEOUT 900)
+set_tests_properties(interfoam_createfields_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
+                     SKIP_RETURN_CODE 77
+                     DEPENDS test_inter_case_cpp
+                     TIMEOUT 600)
+
+# These five read damBreak's own dictionaries. A box without OpenFOAM must SKIP, not report green: the
+# arms silently stopped running the moment $FOAM_TUTORIALS was empty, and nothing said so.
+set_tests_properties(two_phase_mixture interface_properties inter_create_fields
+                     alpha_eqn_cpp mules_cpp
+                     PROPERTIES SKIP_RETURN_CODE 77)
+
 add_executable(test_residual_control tests/test_residual_control.cu)
 target_include_directories(test_residual_control PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_residual_control PRIVATE brae_core)
@@ -3125,6 +4502,30 @@ add_executable(test_lust_implicit tests/test_lust_implicit.cu)
 target_include_directories(test_lust_implicit PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_lust_implicit PRIVATE brae_core)
 add_test(NAME lust_implicit COMMAND test_lust_implicit)
+# DIC on the device: the level-scheduled DILU with lower aliased to upper, held BIT-IDENTICAL to a
+# transcription of DICPreconditioner.C, and PCG with it held to the host PCG+DIC's ITERATE at relTol
+# 0.05 -- which is where interFoam's p_rgh stops on every corrector but the last.
+add_executable(test_device_dic tests/test_device_dic.cu)
+target_include_directories(test_device_dic PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_dic PRIVATE brae_core)
+add_test(NAME device_dic COMMAND test_device_dic)
+set_tests_properties(device_dic PROPERTIES SKIP_RETURN_CODE 77)
+
+# PBiCG with DILU on the device against the host reference (waves/mangroveInteraction's k and epsilon)
+add_executable(test_device_pbicg tests/test_device_pbicg.cu)
+target_include_directories(test_device_pbicg PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_pbicg PRIVATE brae_core)
+add_test(NAME device_pbicg COMMAND test_device_pbicg)
+set_tests_properties(device_pbicg PROPERTIES SKIP_RETURN_CODE 77)
+
+# brae::smoothSolver, the host reference: smoothSolver::solve's loop (what nIterations counts, nSweeps,
+# minIter, the negative-sweep branch, the mesh-order refusal) against the device's OpenFOAM-held solver,
+# with PBiCGStab as the control. The SWEEP is gs_ladder's, against OpenFOAM's own per-sweep residuals.
+add_executable(test_smooth_solver_cpp tests/test_smooth_solver_cpp.cu)
+target_include_directories(test_smooth_solver_cpp PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_smooth_solver_cpp PRIVATE brae_core)
+add_test(NAME smooth_solver_cpp COMMAND test_smooth_solver_cpp)
+
 add_executable(test_dilu tests/test_dilu.cu)
 target_include_directories(test_dilu PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_dilu PRIVATE brae_core)
@@ -3212,6 +4613,11 @@ add_executable(test_wedge_device_coeffs tests/test_wedge_device_coeffs.cu)
 target_include_directories(test_wedge_device_coeffs PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_wedge_device_coeffs PRIVATE brae_core)
 add_test(NAME wedge_device_coeffs COMMAND test_wedge_device_coeffs)
+
+add_executable(test_device_grad_symmetry tests/test_device_grad_symmetry.cu)
+target_include_directories(test_device_grad_symmetry PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_device_grad_symmetry PRIVATE brae_core)
+add_test(NAME device_grad_symmetry COMMAND test_device_grad_symmetry ${CMAKE_CURRENT_SOURCE_DIR}/validation)
 
 add_executable(test_vol_point_interp tests/test_vol_point_interp.cu)
 target_include_directories(test_vol_point_interp PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
@@ -3371,6 +4777,16 @@ target_include_directories(test_ami_device PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_ami_device PRIVATE brae_core)
 add_test(NAME ami_device COMMAND test_ami_device)
 
+# The legacy AMI builder's store test and row normalisation against REAL OpenFOAM's own AMI on two constructed
+# meshes (a cyclicACMI pair and a plain cyclicAMI pair, each offset by a sliver). The scripts carry the fixtures,
+# the premises and the controls.
+add_executable(test_ami_store_vs_openfoam tests/test_ami_store_vs_openfoam.cu)
+target_include_directories(test_ami_store_vs_openfoam PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_ami_store_vs_openfoam PRIVATE brae_core)
+add_test(NAME ami_store_vs_openfoam COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/ami_store_vs_openfoam.sh)
+set_tests_properties(ami_store_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME ami_rows_vs_openfoam COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/ami_rows_vs_openfoam.sh)
+set_tests_properties(ami_rows_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(test_ami_geometry tests/test_ami_geometry.cu)
 target_include_directories(test_ami_geometry PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_ami_geometry PRIVATE brae_core)
@@ -3552,6 +4968,17 @@ add_test(NAME pimple_run
                  ${CMAKE_CURRENT_BINARY_DIR}/pimple_run_work)
 set_tests_properties(pimple_run PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 300)
 
+# THE PRESSURE REFERENCE on the transient driver, against real OpenFOAM pimpleFoam: pitzDaily staged
+# all-Neumann (its outlet p and U zeroGradient), where OpenFOAM's p.needReference() is true. The driver
+# never set DeviceSimpleControls::needRef, so the shared solver took the default and ran the singular
+# system with neither adjustPhi nor setReference. The control (BRAE_NO_PREF=1) diverges at step two.
+add_test(NAME pimple_pressure_reference
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/pimple_pressure_reference_vs_openfoam.sh
+                 $<TARGET_FILE:brae_pimpleFoam>
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily
+                 ${CMAKE_CURRENT_BINARY_DIR}/pimple_pressure_reference_work)
+set_tests_properties(pimple_pressure_reference PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 900)
+
 # PIMPLE/momentumPredictor: the same case with the switch on and off must give DIFFERENT fields (and the
 # default must equal `on`). See the header of the script for why the log line is not enough.
 add_test(NAME momentum_predictor
@@ -3686,7 +5113,9 @@ add_test(NAME node_cli COMMAND test_node_cli)
 # what a failure looks like to someone at a terminal.
 add_test(NAME brae_run
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/brae_run.sh $<TARGET_FILE:brae> python3)
-set_tests_properties(brae_run PROPERTIES TIMEOUT 120)
+# brae-agent is optional (built only with libcurl headers), and `brae job` execs it -- so a box without
+# it must SKIP, not fail. The GH200 reported 9 red checks for exactly this on 2026-09-16.
+set_tests_properties(brae_run PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77)
 set_tests_properties(node_cli PROPERTIES TIMEOUT 60)
 
 # The real transport, against a deliberately awkward local server: a redirect that would leak the bearer token,
@@ -3809,3 +5238,18 @@ add_executable(test_colour_gs_fused tests/test_colour_gs_fused.cu)
 target_include_directories(test_colour_gs_fused PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_colour_gs_fused PRIVATE brae_core)
 add_test(NAME colour_gs_fused COMMAND test_colour_gs_fused)
+
+# THE PRESSURE RULE'S TEST ARM. A case's GAMG on p_rgh runs brae's AMG-preconditioned PCG by default (CLAUDE.md,
+# device_inter_pressure_step.cu), which stops at a different residual from OpenFOAM's GAMG -- 2.3e-09 on
+# RAS/DTCHull at pinned 1e-13 solves, against gates held near 1e-11. So every test runs the GAMG port
+# (BRAE_PRESSURE_CASE_SOLVER=1) and keeps checking the rest of the solver to its own bound; the AMG-PCG is held
+# to OpenFOAM at its measured bounds by tests/interfoam_write/amg_pcg/, which unset this. The user's decision,
+# 2026-10-03.
+get_property(BRAE_ALL_TESTS DIRECTORY PROPERTY TESTS)
+set_property(TEST ${BRAE_ALL_TESTS} APPEND PROPERTY ENVIRONMENT "BRAE_PRESSURE_CASE_SOLVER=1")
+# THE TURBULENCE RULE'S TEST ARM, the same arrangement. In interFoam a relTol-0 Gauss-Seidel smoothSolver on k,
+# epsilon or omega is swept in colour order on the GPU by default (device_inter_turbulence.cu): the same smoother
+# and stopping rule, another cell order, so another iterate. Every test runs the case's own order
+# (BRAE_TURBULENCE_CASE_SOLVER=1) and keeps its bound; the rule is held to OpenFOAM at its measured bounds by
+# tests/interfoam_write/turb_colour/, which unset this. The user's decision, 2026-10-06.
+set_property(TEST ${BRAE_ALL_TESTS} APPEND PROPERTY ENVIRONMENT "BRAE_TURBULENCE_CASE_SOLVER=1")

@@ -1,0 +1,150 @@
+#pragma once
+// OpenFOAM's topological addressing, in OpenFOAM's ORDER: a mesh's cells(), pointFaces() and
+// pointCells(), and a PrimitivePatch's meshPoints(), localFaces() and pointFaces(). The host reference.
+//
+// provenance:
+//   openfoam: src/OpenFOAM/meshes/primitiveMesh/primitiveMeshCells.C (calcCells)
+//             src/OpenFOAM/meshes/primitiveMesh/primitiveMeshPointFaces.C:33-48 (pointFaces)
+//             src/OpenFOAM/meshes/primitiveMesh/primitiveMeshPointCells.C (calcPointCells)
+//             src/OpenFOAM/meshes/primitiveMesh/PrimitivePatch/PrimitivePatchMeshData.C (calcMeshData)
+//             src/OpenFOAM/meshes/primitiveMesh/PrimitivePatch/PrimitivePatchPointAddressing.C
+//                 (calcPointFaces)
+//   tests:    tests/test_mesh_geometry.cu and tests/test_face_area_weight_ami.cu -- the patch
+//             addressing and local points this builds, which the AMI weights are computed on.
+//
+// WHY THE ORDER IS THE CONTENT. Every list here is a SET in the mathematics and a SEQUENCE in the code
+// that reads it: a wall-distance wave visits a cell's faces in cells() order and keeps the first of two
+// equally near origins; volPointInterpolation sums a point's cell weights in pointCells() order. A
+// different order is a different last digit, or a different nearest wall.
+//
+// pointCells() HAS THREE ORDERS in OpenFOAM, chosen by what the mesh has already computed: the inverse of
+// cellPoints() when that exists (ascending), else the walk over pointFaces() when THAT exists (not
+// sorted), else the walk over cells() (ascending). pointCellsFromPointFaces is the second, which is the
+// one a displacement motion solver meets: its wall distance asks for pointFaces() before anything asks
+// for pointCells().
+#include "compact_list_list.cuh"
+#include "cf_types.cuh"
+#include "primitive_mesh.cuh"
+#include <vector>
+
+namespace brae {
+
+// primitiveMesh::cells(): each cell's faces, those it owns first, then those it neighbours, each in
+// ascending face order
+std::vector<std::vector<label>> meshCells(const PrimitiveMesh& m);
+
+// ...and the same list as ONE array with a start per cell, for a caller that walks it millions of times:
+// fvc::smooth's wave makes 6.5 million cell visits a call on RAS/DTCHull (845,536 cells), and a vector per
+// cell is a pointer chase per visit.
+struct CellFaces
+{
+    std::vector<label> start;   // nCells + 1
+    std::vector<label> faces;
+};
+CellFaces cellFaces(const PrimitiveMesh& m);
+
+// primitiveMesh::pointFaces(): invertManyToMany of faces(), so each point's faces ascending
+std::vector<std::vector<label>> meshPointFaces(const PrimitiveMesh& m);
+
+// primitiveMesh::calcPointCells' pointFaces branch: for each face of the point, its owner and then its
+// neighbour, each cell once, in the order met
+std::vector<std::vector<label>> pointCellsFromPointFaces(
+    const PrimitiveMesh& m,
+    const std::vector<std::vector<label>>& pointFaces);
+
+// primitiveMesh::calcPointCells' CELLS branch (primitiveMeshPointCells.C:114-186), the one taken when
+// neither cellPoints() nor pointFaces() has been computed yet: two passes over cells() in ascending
+// cell order, each point counted once per cell, so every point's list comes out ASCENDING IN CELL
+// INDEX. That is a different order from pointCellsFromPointFaces above, and the order is the content
+// wherever a sum is taken in it -- dynamicRefineFvMesh::cellToPoint is such a sum.
+std::vector<std::vector<label>> pointCellsFromCells(
+    const PrimitiveMesh& m,
+    const std::vector<std::vector<label>>& cells);
+
+// primitiveMesh::cellPoints(): each cell's points, once each, in the order its faces name them
+// (primitiveMeshCellPoints.C's cells() branch). hexRef8::getSplitPoints is the only consumer here and
+// it visits each point of a cell exactly once, deciding by which CELL reaches a point first -- so the
+// order WITHIN a cell does not change its answer, and the set is what matters.
+std::vector<std::vector<label>> cellPointsFromCells(
+    const PrimitiveMesh& m,
+    const std::vector<std::vector<label>>& cells);
+
+// THE SAME FOUR LISTS, COMPACT (compact_list_list.cuh): one array of values and one of offsets a list, no heap
+// block a row. Row for row what meshCells, meshPointFaces, pointCellsFromCells and cellPointsFromCells give --
+// the refinement's addressing check (BRAE_CONTROL_REFINE_ADDRESSING_CHECK) holds each to its list-of-lists
+// twin at every use. The two that read `cells` take it in either form.
+CompactListList compactMeshCells(const PrimitiveMesh& m);
+CompactListList compactMeshPointFaces(const PrimitiveMesh& m);
+CompactListList compactPointCellsFromCells(
+    const PrimitiveMesh& m,
+    LabelListListRef     cells);
+CompactListList compactCellPointsFromCells(
+    const PrimitiveMesh& m,
+    LabelListListRef     cells);
+// pointCellsFromCells' rows from cellPoints, by inversion (the cells ascending, a cell once a point)
+CompactListList compactPointCellsFromCellPoints(
+    std::size_t      nPoints,
+    LabelListListRef cellPoints);
+
+// A PrimitivePatch over a list of the mesh's faces
+struct PrimitivePatchAddressing
+{
+    // the mesh faces the patch is made of, in the patch's order
+    std::vector<label> faces;
+    // meshPoints(): the mesh point of each local point, numbered by first appearance face by face
+    std::vector<label> meshPoints;
+    // localFaces(): each face in local point labels
+    std::vector<std::vector<label>> localFaces;
+    // pointFaces(): each local point's faces, ascending
+    std::vector<std::vector<label>> pointFaces;
+};
+
+PrimitivePatchAddressing primitivePatch(
+    const PrimitiveMesh& m,
+    const std::vector<label>& faces);
+
+// the faces [start, start + size) of the mesh, as a polyPatch is
+std::vector<label> faceRange(
+    label start,
+    label size);
+
+// ----------------------------------------------------------------------------------------------
+// A PrimitivePatch's EDGE addressing and its edgeLoops() -- what removeFaces::mergeFaces reads to
+// decide which of the faces it is merging becomes the master and in which direction the merged face
+// runs.
+//
+// provenance:
+//   openfoam: PrimitivePatchAddressing.C:47-272 (calcAddressing), PrimitivePatchPointAddressing.C
+//             (calcPointEdges, which is invertManyToMany over the edges), PrimitivePatchEdgeLoops.C:
+//             39-130 (calcEdgeLoops)
+//   tests:    tests/hex_ref8_vs_openfoam.sh, through the merged face of every one of an unrefinement's
+//             face regions -- the master face, the loop direction and the vertex list are all functions
+//             of this numbering, so the numbering is what is being tested
+//
+// THE EDGE NUMBERING IS TWO BLOCKS. Internal edges (shared by two or more of the patch's faces) come
+// first, in the order the face-by-face walk finds them, and for one face they are added in increasing
+// order of the NEIGHBOUR face's label rather than in the face's own edge order. Boundary edges follow,
+// in face-then-edge order. calcEdgeLoops walks only the second block, which is why the split matters and
+// not just the set.
+struct PatchEdgeAddressing
+{
+    // edges(): patch-local point pairs, internal edges first
+    std::vector<label> start;
+    std::vector<label> end;
+    label              nInternalEdges = 0;
+    // faceEdges(): per local face, its edge labels in the face's own edge order
+    std::vector<std::vector<label>> faceEdges;
+    // edgeFaces(): per edge, the owning face first and then its neighbours in the order found
+    std::vector<std::vector<label>> edgeFaces;
+    // pointEdges(): per local point, its edges ASCENDING (invertManyToMany)
+    std::vector<std::vector<label>> pointEdges;
+};
+
+PatchEdgeAddressing patchEdges(const PrimitivePatchAddressing& p);
+
+// PrimitivePatch::edgeLoops(): each closed loop of the patch's OUTSIDE vertices, in patch-local point
+// labels. OpenFOAM's own note is that it "goes wrong on multiply connected edges (loops will be
+// unclosed)" -- the caller checks the loop count instead, and mergeFaces refuses anything but one loop.
+std::vector<std::vector<label>> patchEdgeLoops(const PatchEdgeAddressing& pe);
+
+} // namespace brae

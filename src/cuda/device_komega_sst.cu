@@ -404,7 +404,8 @@ void wallOmegaG0Kernel(
         else
             g0 += wallProductionG0(c, wf, y, dc, kc, iN, wux, wuy, wuz, Ux, Uy, Uz, nuw,
                                    yplLam, Cmu25, kappa, E, atmZ0, atmBoundNut, nutWall);
-        const scalar omegaVis = 6.0 * nuw / (beta1 * y * y);
+        // beta1*(y*y), as OpenFOAM's sqr() makes it -- see the host twin for the measurement
+        const scalar omegaVis = 6.0 * nuw / (beta1 * (y * y));
         const scalar omegaLog = sqrt(kc) / (Cmu25 * kappa * y);
         w0 += iN * sqrt(omegaVis*omegaVis + omegaLog*omegaLog);   // BINOMIAL n=2 (distinct omega wall value)
     }

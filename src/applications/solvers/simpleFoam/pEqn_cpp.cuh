@@ -83,6 +83,7 @@ struct PressureInput
     // A pressure patch of type fixedFluxPressure -- pEqn.H reaches it through constrainPressure, which
     // is NOT ported, so it must be refused rather than left with a stale gradient.
     bool   correctedLaplacian = false;   // `corrected` laplacianSchemes
+    bool   nonOrthCoeffs = false;   // nonOrthDeltaCoeffs with no correction -- solver_controls.cuh:226
     scalar snGradLimitCoeff = 0.0;       // `limited <k> corrected` (OF limitedSnGrad)
     bool   hasMRF = false;      // refused
     bool   hasFvOptions = false;// refused

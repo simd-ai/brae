@@ -1,0 +1,10 @@
+FoamFile { version 2.0; format ascii; class dictionary; object setFieldsDict; }
+// A STEP IN THE WATER SURFACE AT THE PERIODIC BOUNDARY. A flat interface would put the same alpha on
+// both sides of the pair and the coupling would carry almost nothing; the deep box runs to x = 0.35 so
+// the surface is at y = 0.3 on one side of the pair and y = 0.15 on the other.
+defaultFieldValues ( volScalarFieldValue alpha.water 0 );
+regions
+(
+    boxToCell { box (0 0 -1) (1 0.15 1); fieldValues ( volScalarFieldValue alpha.water 1 ); }
+    boxToCell { box (0 0 -1) (0.35 0.3 1); fieldValues ( volScalarFieldValue alpha.water 1 ); }
+);

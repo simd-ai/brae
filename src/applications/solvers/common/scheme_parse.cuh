@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <map>
+#include <regex>
 #include <sstream>
 #include <utility>
 #include <vector>
@@ -311,6 +312,65 @@ inline DdtSchemeEntry parseDdtScheme(const std::string& caseDir)
     return d;
 }
 
+// fvSchemes::ddtScheme(name) -- the entry a call site's ddt NAME resolves to, as schemesLookupDetail.C
+// resolves it: the entry named for that call site when the dictionary has one (a literal key, else the last
+// regex key that matches -- FoamDict::find is dictionary::found's REGEX search), else `default` -- unless
+// there is no `default` or it is `default none`, and then the lookup of the name itself is fatal
+// (:79-89, :110-122). The names are the CALL SITE's, built from its operands: fvm::ddt(rho, U) asks for
+// `ddt(rho,U)` and fvc::ddtCorr(U, phi, Uf) for `ddt(U)` (fvmDdt.C:83, fvcDdt.C:180). Returns the entry's
+// tokens joined by single spaces, so two spellings of one scheme compare equal.
+inline std::string ddtSchemeFor(const std::string& caseDir, const std::string& name)
+{
+    const FoamDict fvs = readDict(caseDir + "/system/fvSchemes");
+    const FoamDict* d = fvs.subDict("ddtSchemes");
+    if (!d)
+        throw std::runtime_error("brae: system/fvSchemes has no ddtSchemes dictionary, and the case asks for `"
+                                 + name + "`.");
+    auto join = [](const std::vector<std::string>& v)
+    {
+        std::string out;
+        for (const std::string& t : v) out += (out.empty() ? "" : " ") + t;
+        return out;
+    };
+    // The LITERAL key is found in the text, not through FoamDict: FoamDict's tokenizer splits an unquoted
+    // `ddt(rho,U)` into a key `ddt` and value tokens `( rho,U )`, so find() never sees it (measured: a case
+    // with `default Euler; ddt(rho,U) CrankNicolson 0.5;` resolved to Euler). OpenFOAM reads the key as one
+    // word. A quoted key is a regex in OpenFOAM and parses whole in FoamDict, so find() still owns those.
+    const std::string blk = fvSchemesBlock(readFvSchemesText(caseDir), "ddtSchemes");
+    for (std::size_t q = blk.find(name); q != std::string::npos; q = blk.find(name, q + 1))
+    {
+        const bool startOk = (q == 0) || std::isspace((unsigned char)blk[q - 1]) || blk[q - 1] == '{'
+                          || blk[q - 1] == ';';
+        const std::size_t e = q + name.size();
+        const bool endOk = (e < blk.size()) && std::isspace((unsigned char)blk[e]);
+        if (!startOk || !endOk)
+        {
+            continue;
+        }
+        const std::size_t semi = blk.find(';', e);
+        std::istringstream in(blk.substr(e, semi == std::string::npos ? std::string::npos : semi - e));
+        std::vector<std::string> v;
+        for (std::string t; in >> t; )
+        {
+            v.push_back(t);
+        }
+        if (!v.empty())
+        {
+            return join(v);
+        }
+    }
+    if (const std::vector<std::string>* v = d->find(name))
+    {
+        if (!v->empty()) return join(*v);
+    }
+    const std::vector<std::string>* dv = d->find("default");
+    if (!dv || dv->empty() || dv->front() == "none")
+        throw std::runtime_error(
+            "brae: fvSchemes ddtSchemes has no `" + name + "` and no default to fall back to (it is absent or "
+            "`none`). OpenFOAM's lookup of that name then fails (schemesLookupDetail.C:79-89).");
+    return join(*dv);
+}
+
 // mesh.gradScheme(<name>) for an ARBITRARY name -- the one a scheme READS rather than grad(<field>):
 // linearUpwind's `limited`, say. schemesLookup::lookupDetail::lookup is named-then-default
 // (schemesLookupDetail.C:76-89): the entry of that name if the gradSchemes dictionary has one, else
@@ -354,7 +414,15 @@ inline FieldGradScheme parseNamedGradScheme(const std::string& caseDir, const st
 }
 
 
-inline FieldDivScheme parseFieldDivScheme(const std::string& caseDir, const std::string& field, bool vectorField = false)
+// `fluxName` is the flux the equation is WRITTEN with, which is part of the dictionary key: interFoam's
+// `density variable` turbulence convects k with rhoPhi and looks up `div(rhoPhi,k)`, where every other
+// caller's key is `div(phi,<field>)`. The two are different entries and a case names the one its
+// lineage reads -- RAS/damBreak ships div(rhoPhi,k) and no div(phi,k) at all.
+inline FieldDivScheme parseFieldDivScheme(
+    const std::string& caseDir,
+    const std::string& field,
+    bool vectorField = false,
+    const std::string& fluxName = "phi")
 {
     // Same source as parseFvSchemesControls: $-expanded, so `div(phi,tracer0) $turbulence;` resolves.
     const std::string all = readFvSchemesText(caseDir);
@@ -363,11 +431,53 @@ inline FieldDivScheme parseFieldDivScheme(const std::string& caseDir, const std:
     // first and misreports why a lookup failed -- every fvSchemes has several `default` lines.
     std::string raw = fvSchemesBlock(all, "divSchemes");
     if (raw.empty()) raw = all;
-    const std::string key = "div(phi," + field + ")";
+    const std::string key = "div(" + fluxName + "," + field + ")";
 
     // Find the statement for this field: from the key to its terminating ';'.
     const std::size_t k = raw.find(key);
+    // A PATTERN KEY, when no literal one names the field. fvSchemes is a dictionary and OpenFOAM looks
+    // a scheme up as it looks anything up: the literal key, else the LAST pattern that matches
+    // (dictionarySearch.C, csearch). RAS/waterChannel writes
+    //     "div\(phi,(k|omega)\)"      Gauss upwind;
+    // and this parser, which searches the text for the literal key, refused the case as having no
+    // div(phi,k) under `default none`.
+    std::string patternStatement;
     if (k == std::string::npos)
+    {
+        std::size_t pos = 0;
+        while (pos < raw.size())
+        {
+            const std::size_t semi = raw.find(';', pos);
+            if (semi == std::string::npos)
+            {
+                break;
+            }
+            std::size_t q0 = pos;
+            while (q0 < semi && std::isspace(static_cast<unsigned char>(raw[q0])))
+            {
+                ++q0;
+            }
+            const std::size_t q1 = (q0 < semi && raw[q0] == '"') ? raw.find('"', q0 + 1) : std::string::npos;
+            if (q1 != std::string::npos && q1 < semi)
+            {
+                bool matches = false;
+                try
+                {
+                    matches = std::regex_match(key, compileFoamRegex(raw.substr(q0 + 1, q1 - q0 - 1)));
+                }
+                catch (...)
+                {
+                }
+                if (matches)
+                {
+                    // the key in the pattern's place, so everything below reads one shape of statement
+                    patternStatement = key + raw.substr(q1 + 1, semi - q1 - 1);
+                }
+            }
+            pos = semi + 1;
+        }
+    }
+    if (k == std::string::npos && patternStatement.empty())
     {
         // OF: `default none` means an unlisted scheme is a fatal error, not a silent fallback.
         const std::size_t d = raw.find("default");
@@ -383,8 +493,10 @@ inline FieldDivScheme parseFieldDivScheme(const std::string& caseDir, const std:
             "brae: fvSchemes divSchemes has no `" + key + "` entry and brae does not resolve the "
             "divSchemes `default`; add the entry explicitly.");
     }
-    const std::size_t end = raw.find(';', k);
-    const std::string st = raw.substr(k, end == std::string::npos ? std::string::npos : end - k);
+    const std::size_t end = (k == std::string::npos) ? std::string::npos : raw.find(';', k);
+    const std::string st = !patternStatement.empty()
+                         ? patternStatement
+                         : raw.substr(k, end == std::string::npos ? std::string::npos : end - k);
 
     FieldDivScheme fs;
     divSchemesConsumed().insert(key);   // recorded here too: the tracer's own div(phi,<field>)
@@ -788,6 +900,38 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                 // Found by the coverage manifest, not by a case: `vanAlbada` appeared as a type the
                 // tutorials DEMAND and brae never names in a quoted comparison, which is exactly the
                 // signature of a control that is plumbed but never selected.
+                // interFoam's alpha transport. Two entries, two different jobs: div(phi,alpha) carries
+                // the VoF field and every tutorial limits it with vanLeer, while div(phirb,alpha) is the
+                // INTERFACE COMPRESSION flux and every tutorial leaves it linear. Getting either wrong
+                // changes where the interface sits, so neither is substituted silently.
+                if (inDiv && ln.find("div(phi,alpha)") != std::string::npos)
+                {
+                    const std::string sw = divSchemeWord(ln);
+                    ctl.foundDivAlpha = true;
+                    if      (sw == "vanLeer")   ctl.divAlphaTwoByk = scalar(-1.0);          // kVanLeerTwoByk
+                    else if (sw == "vanAlbada") ctl.divAlphaTwoByk = scalar(0.0);
+                    else if (sw == "limitedLinear")
+                    {
+                        const scalar t = limitedTwoByk(ln);
+                        ctl.divAlphaTwoByk = (t > 0.0) ? t : scalar(2.0);
+                    }
+                    else if (!sw.empty())
+                        throw std::runtime_error(
+                            "brae: div(phi,alpha) scheme 'Gauss " + sw + "' is not implemented (brae has "
+                            "`vanLeer`, `vanAlbada` and `limitedLinear <k>`). This entry limits the VoF "
+                            "transport itself, so running another limiter moves the interface:\n  " + ln);
+                }
+                if (inDiv && ln.find("div(phirb,alpha)") != std::string::npos)
+                {
+                    const std::string sw = divSchemeWord(ln);
+                    ctl.foundDivAlphaRb = true;
+                    if (sw == "linear") ctl.divAlphaRbLinear = true;
+                    else if (!sw.empty())
+                        throw std::runtime_error(
+                            "brae: div(phirb,alpha) scheme 'Gauss " + sw + "' is not implemented (brae has "
+                            "`linear`, which is what every interFoam tutorial names). This entry is the "
+                            "INTERFACE COMPRESSION flux, not the transport:\n  " + ln);
+                }
                 if (inDiv && ln.find("div(phi,sigma)") != std::string::npos)
                 {
                     const std::string sw = divSchemeWord(ln);
@@ -886,28 +1030,50 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                 // entry builds its snGrad through the same snGradScheme<Type>::New the snGradSchemes
                 // block uses (laplacianScheme.H:134-138). What differs is only which pair of flags the
                 // answer lands in, which is exactly what was collapsed.
-                auto readSnGrad = [&](const std::string& ln, bool& corrected, scalar& limit)
+                // THREE SCHEMES, TWO FACTS: whether the correction flux is added (`corrected`) and which
+                // delta coefficients the implicit half takes (`nonOrthCoeffs`). `uncorrected` shares the
+                // SECOND with `corrected` -- uncorrectedSnGrad.H:113-119 and correctedSnGrad.H:108-114
+                // both return mesh().nonOrthDeltaCoeffs() and differ only in corrected(); only
+                // orthogonalSnGrad.H:113-119 returns deltaCoeffs(). `hasWord` is word-boundaried, so the
+                // word `uncorrected` matched NEITHER test below and the flag kept its default: brae ran
+                // ORTHOGONAL under the case's own name `uncorrected`, with nothing to say so.
+                auto readSnGrad = [&](const std::string& ln, bool& corrected, scalar& limit,
+                                      bool& nonOrthCoeffs)
                 {
-                    if (hasWord(ln, "corrected")) corrected = true;       // unlimited non-orth correction (psi = 1)
+                    if (hasWord(ln, "corrected")) { corrected = true; nonOrthCoeffs = true; }   // unlimited non-orth correction (psi = 1)
+                    // ...and the one that takes those coefficients with NO correction flux
+                    if (hasWord(ln, "uncorrected")) nonOrthCoeffs = true;
+                    // `orthogonal` leaves both clear, which is the only scheme that takes deltaCoeffs()
                     // OF fv::limitedSnGrad "limited [<correctedScheme>] <psi>" (psi in [0,1]): non-orth correction
                     // capped per-face. hasWord avoids matching "unlimited" and "limitedLinear" (a div scheme); the coeff
                     // is the next numeric token after "limited" (skip an optional scheme word like "corrected").
                     if (hasWord(ln, "limited"))
                     {
+                        // limitedSnGrad DERIVES from correctedSnGrad, so its coefficients are
+                        // nonOrthDeltaCoeffs whatever the limiter (limitedSnGrad.H:165-172) -- including
+                        // at psi = 0, where limitedSnGrad.C:48-58 makes the limiter identically zero.
                         corrected = true;
+                        nonOrthCoeffs = true;
                         scalar psi = 1.0;
                         const char* c = ln.c_str() + ln.find("limited") + 7;
                         while (*c && !(std::isdigit((unsigned char)*c) || *c == '.')) ++c;   // skip to the coefficient
                         if (std::sscanf(c, "%lf", &psi) == 1) limit = psi;
                     }
                 };
-                if (inLap)    readSnGrad(ln, ctl.nonOrth, ctl.nonOrthLimit);
+                if (inLap)    readSnGrad(ln, ctl.nonOrth, ctl.nonOrthLimit, ctl.nonOrthCoeffs);
                 if (inSnGrad)
                 {
                     // The block IS present, so its default is the file's, not OpenFOAM's `corrected`
-                    // fallback. Cleared first because the fallback is the initial value of the flag.
-                    if (!sawSnGradBlock) { sawSnGradBlock = true; ctl.snGradCorrected = false; ctl.snGradLimit = 1.0; }
-                    readSnGrad(ln, ctl.snGradCorrected, ctl.snGradLimit);
+                    // fallback. Cleared first because the fallback is the initial value of the flag --
+                    // BOTH flags, since the fallback `corrected` sets the coefficient choice too.
+                    if (!sawSnGradBlock)
+                    {
+                        sawSnGradBlock = true;
+                        ctl.snGradCorrected = false;
+                        ctl.snGradNonOrthCoeffs = false;
+                        ctl.snGradLimit = 1.0;
+                    }
+                    readSnGrad(ln, ctl.snGradCorrected, ctl.snGradLimit, ctl.snGradNonOrthCoeffs);
                 }
             }
             // No explicit div(phi,K|Ekp): OF would fall through to the divSchemes `default`. brae keeps its

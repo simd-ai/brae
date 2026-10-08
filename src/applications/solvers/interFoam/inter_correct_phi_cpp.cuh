@@ -1,0 +1,135 @@
+#pragma once
+// interFoam's correctPhi -- CorrectPhi's pcorr equation, at the start of every case and after every
+// mesh update under `correctPhi`. The host reference.
+//
+// provenance:
+//   openfoam: src/finiteVolume/cfdTools/general/CorrectPhi/CorrectPhi.C:36-117 (the incompressible
+//                 template)
+//             src/finiteVolume/cfdTools/general/CorrectPhi/correctUphiBCs.C:34-66
+//             applications/solvers/multiphase/interFoam/initCorrectPhi.H, correctPhi.H
+//             applications/solvers/multiphase/interFoam/interFoam.C:130-148
+//   tests:    tests/test_correct_phi.cu (the solve itself), tests/interfoam_moving_vs_openfoam.sh (where
+//             CorrectPhi runs after every mesh update) and tests/interfoam_ami_vs_openfoam.sh.
+//
+// WHY IT LIVES HERE. OpenFOAM's CorrectPhi is general cfdTools, and the mirror's place for it is
+// src/finiteVolume/cfdTools/general/CorrectPhi/. What it calls -- adjustPhi, makeRelative and
+// makeAbsolute, the p_rgh solve's dispatch -- is still interFoam's own (inter_peqn_cpp.cuh), so it sits
+// beside them until they move.
+//
+// WHAT ONE CALL DOES, in CorrectPhi.C's order:
+//   1. correctUphiBCs, and only when the mesh is changing: every velocity patch that FIXES a value is
+//      evaluated again -- a pressureInletOutletVelocity against the flux it has just been handed -- and
+//      phi on it is set to U_b & Sf, overwriting what Sf & Uf gave there;
+//   2. pcorr: zero, fixedValue where p_rgh fixes a value and zeroGradient elsewhere;
+//   3. if pcorr then needs a reference -- a closed domain -- phi is made relative, adjustPhi balances
+//      its adjustable outflow, and phi is made absolute again;
+//   4. laplacian(rAUf, pcorr) == div(phi), pinned at cell 0 to 0 when it needs a reference, solved
+//      nNonOrthogonalCorrectors + 1 times with pcorrFinal on the last pass;
+//   5. on the last pass only, phi -= pcorrEqn.flux(), the non-orthogonal face correction included.
+// The caller then makes phi relative (interFoam.C:141) and corrects the mixture on the moved mesh.
+#include "cf_types.cuh"
+#include "fv_geometry.cuh"
+#include "fv_patch.cuh"
+#include "fvc.cuh"
+#include "gamg_solver_cpp.cuh"
+#include "geometric_field.cuh"
+#include "inter_case_cpp.cuh"
+#include "inter_solve_record.cuh"
+#include "primitive_mesh.cuh"
+#include <functional>
+#include <vector>
+
+namespace brae {
+namespace cpu {
+namespace interFoam {
+
+struct CorrectPhiControls
+{
+    // solvers/pcorr, for every non-orthogonal pass but the last, and solvers/pcorrFinal for the last
+    const InterFields::PressureLinearSolve* pcorr = nullptr;
+    const InterFields::PressureLinearSolve* pcorrFinal = nullptr;
+    // the mesh's GAMG hierarchy, which a GAMG pcorr solve shares with p_rgh's
+    GamgAgglomerationCache* gamgCache = nullptr;
+    // laplacianSchemes' default, for fvm::laplacian(rAUf, pcorr)
+    bool correctedLaplacian = false;
+    bool nonOrthCoeffs = false;   // nonOrthDeltaCoeffs without the correction -- inter_ueqn_cpp.cuh:181
+    scalar snGradLimitCoeff = 0;
+    // grad(pcorr)'s gradSchemes entry, which the laplacian's correction takes
+    GradChoice gradPcorr;
+    label nNonOrthogonalCorrectors = 0;
+    // THE PRESSURE RULE (CLAUDE.md): when set, pcorr is solved by this instead of its own entry, with the entry's
+    // name (for the notice), tolerance, relTol, maxIter and minIter: the device loop's AMG-preconditioned PCG
+    // (DevicePcorrSolver). It returns false, solving nothing, where it does not apply, and the entry's solver
+    // runs. Empty on the host arm, and wherever BRAE_PRESSURE_CASE_SOLVER is set, as every test sets it.
+    std::function<bool(const std::string&, const FvScalarMatrix&, std::vector<scalar>&, const PrimitiveMesh&,
+                       const FvGeometry&, const std::vector<FvPatch>&, scalar, scalar, int, int,
+                       SolverPerformance&)> amgPcgSolve;
+    // ...AND THE WHOLE PASS, where the caller can do it: the pcorr equation assembled, solved and its flux taken
+    // from phi without the host building the system (DevicePcorrSolver::correct). Offered the one pass of a case
+    // with nNonOrthogonalCorrectors 0, where pcorr is zero going in. Arguments: the entry's name, rAUf, phi
+    // (updated in place), pcorr (for its patch fields), whether it needs a reference, whether the scheme takes
+    // nonOrthDeltaCoeffs, the mesh, tolerance, relTol, maxIter, minIter, the performance out, and -- under
+    // BRAE_CONTROL_PCORR_ASSEMBLY_CHECK -- the system as the host assembled it, to be compared entry for
+    // entry. Returns false, touching nothing, where it does not apply; the host's pass runs then.
+    std::function<bool(const std::string&, const SurfaceScalarField&, SurfaceScalarField&,
+                       const GeometricField<scalar>&, bool, bool, const PrimitiveMesh&, const FvGeometry&,
+                       const std::vector<FvPatch>&, scalar, scalar, int, int, SolverPerformance&,
+                       const FvScalarMatrix*)> devicePass;
+};
+
+// The case's own CorrectPhi controls, from the fields the case reader filled: pcorr and pcorrFinal,
+// laplacianSchemes' default, grad(pcorr)'s entry and PIMPLE's non-orthogonal correctors, sharing
+// `gamgCache` with every other GAMG solve on the mesh. ONE builder for the three callers (the host
+// driver's, the device driver's start-up CorrectPhi and its mesh update's): the device's start-up
+// controls were assembled by hand and left gradPcorr at its default, so a second non-orthogonal pass
+// there would have taken Gauss linear whatever the case named -- unreachable only because the device
+// driver refused every non-Gauss-linear grad(pcorr) outright, a refusal CorrectPhi never needed since it
+// runs on the host on both arms.
+CorrectPhiControls correctPhiControlsOf(
+    const InterFields& f,
+    GamgAgglomerationCache& gamgCache);
+
+struct CorrectPhiInput
+{
+    // rAUf: interpolate(rAU) under correctPhi, or 1 on every face
+    const SurfaceScalarField* rAUf = nullptr;
+    // polyMesh::changing(): correctUphiBCs acts only then, so never at the start of a case
+    bool meshChanging = false;
+    // fvc::meshPhi, for makeRelative and makeAbsolute around adjustPhi; null when the mesh is not
+    // moving, where both are no-ops
+    const SurfaceScalarField* meshPhi = nullptr;
+    // the alpha step's mass flux, for a velocity patch whose condition names `phi rhoPhi`
+    const SurfaceScalarField* rhoPhi = nullptr;
+    // one record per pcorr solve; null = not kept
+    std::vector<LinearSolveRecord>* solveLog = nullptr;
+};
+
+// correctUphiBCs(U, phi)
+void correctUphiBCs(
+    GeometricField<vector>& U,
+    SurfaceScalarField& phi,
+    const SurfaceScalarField* rhoPhi,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches);
+
+// CorrectPhi(U, phi, p_rgh, rAUf, geometricZeroField(), pimple)
+void correctPhi(
+    GeometricField<vector>& U,
+    SurfaceScalarField& phi,
+    const GeometricField<scalar>& p_rgh,
+    const CorrectPhiInput& in,
+    const CorrectPhiControls& c,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches);
+
+// rAUf at the start of a case: EXACTLY 1 on every face. initCorrectPhi.H passes either the
+// dimensionedScalar 1 or interpolate(rAU) of a field of 1, and OpenFOAM's linear interpolation,
+// lambda*(P - N) + N, returns 1 there to the bit; brae's w*P + (1 - w)*N need not.
+SurfaceScalarField unitFaceField(
+    const PrimitiveMesh& m,
+    const std::vector<FvPatch>& patches);
+
+} // namespace interFoam
+} // namespace cpu
+} // namespace brae

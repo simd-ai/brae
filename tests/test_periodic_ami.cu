@@ -121,10 +121,13 @@ const AMIInterface* find(const std::vector<AMIInterface>& v, const std::vector<F
 
 scalar meanCoverage(const AMIInterface& a)
 {
-    if (a.weightsSum.empty()) return 0;
+    if (a.coverage.empty()) return 0;
     scalar s = 0;
-    for (const scalar w : a.weightsSum) s += w;
-    return s/(scalar)a.weightsSum.size();
+    for (const scalar w : a.coverage)
+    {
+        s += w;
+    }
+    return s/(scalar)a.coverage.size();
 }
 } // namespace
 

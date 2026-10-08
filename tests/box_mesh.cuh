@@ -26,7 +26,14 @@ namespace boxtest {
 // makes the non-orthogonal correction invisible: on an orthogonal mesh "corrected" == "orthogonal" exactly.
 // Testing that correction on an orthogonal mesh is the same class of blindness as testing a cut-face term on
 // a zero-flux cut.
-PrimitiveMesh boxMesh(label Nx, label Ny, label Nz, scalar shear = 0.0)
+//
+// `dx/dy/dz` set the CELL SIZE per axis. They default to 1, which is the unit box every existing caller
+// gets, and that box has one property worth naming: every face has the same area, so any term carrying a
+// magSf factor is indistinguishable from the same term without it. Giving the three axes different sizes
+// makes the six face areas take three distinct values while the mesh stays ORTHOGONAL -- so an exact
+// identity still holds on it and a missing magSf no longer does.
+PrimitiveMesh boxMesh(label Nx, label Ny, label Nz, scalar shear = 0.0,
+                      scalar dx = 1.0, scalar dy = 1.0, scalar dz = 1.0)
 {
     const label nC = Nx * Ny * Nz;
     auto cell  = [&](label i, label j, label k) { return i + Nx * (j + Ny * k); };
@@ -36,7 +43,9 @@ PrimitiveMesh boxMesh(label Nx, label Ny, label Nz, scalar shear = 0.0)
     for (label k = 0; k <= Nz; ++k)
         for (label j = 0; j <= Ny; ++j)
             for (label i = 0; i <= Nx; ++i)
-                pts[point(i, j, k)] = vector{scalar(i) + shear * scalar(j), scalar(j), scalar(k)};
+                pts[point(i, j, k)] = vector{dx * scalar(i) + shear * dy * scalar(j),
+                                             dy * scalar(j),
+                                             dz * scalar(k)};
 
     // reserve: at ~1e8 cells these reach ~1e9 entries, and push_back's doubling would otherwise transiently
     // double an already multi-GB allocation. nFaces = 3*nC + the 6 boundary planes; nInternal = nFaces - nBnd.

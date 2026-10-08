@@ -4,7 +4,10 @@
 // provenance:
 //   openfoam: fvm::div(phi, vf) - fvm::laplacian(DEff, vf), as every RAS model's correct() writes it
 //   brae:     src/TurbulenceModels/turbulenceModels/turbulenceModel/turbulence_transport.cu
-//   tests:    every gate covering the mirror device closures -- it is the same code they already ran
+//   tests:    tests/interfoam_sst_assembly_vs_openfoam.sh, tests/interfoam_kepsilon_assembly_vs_openfoam.sh
+//             -- both hold the system THIS assembles against OpenFOAM's own at the first closure
+//             call, with a `Gauss upwind` oracle as the control; and every other gate covering the
+//             mirror device closures runs the same code
 //
 // This lived inside the kEpsilon device closure, in an anonymous namespace, taking a KEpsilonInput. It
 // is not kEpsilon-specific: k, epsilon, omega, nuTilda and the Langtry-Menter pair all transport the
@@ -19,7 +22,9 @@
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
 #include "device_boundary.cuh"
+#include "device_cyclic.cuh"
 #include <string>
+#include <vector>   // TransportDump's sink takes a host column
 #include "device_dilu.cuh"    // DeviceDilu -- the case's preconditioner for these solves
 #include "device_colour_gauss_seidel.cuh"   // DeviceCellColouring -- the colour-order smoothSolver (FP-1)
 #include "pEqn.cuh"               // PressureMatrix -- the assembled scalar object, shared not redefined
@@ -27,6 +32,24 @@
 namespace brae {
 namespace gpu {
 namespace turbulence {
+
+// An INSTRUMENT sink: when set, the assembly writes the objects it actually assembled with -- the
+// limiter's weights, the gradient that built them, and the patch values that gradient read -- through
+// the caller's own dump.
+//
+// WHY THE ASSEMBLY AND NOT BESIDE IT. The device closure dumped the weights by RECOMPUTING them next to
+// this call, from CDkOmega's gradient. That dump cannot witness a disagreement between the gradient the
+// limiter uses and the one the dump recomputes with, which is exactly the class of gap being chased
+// (omega's weights differ from the host's on 357 of 79,800 faces while every input compared identical).
+// A number read from the assembly's own buffers can.
+//
+// A function pointer and a void* rather than std::function: this header is included by every device
+// closure, and the sink is the caller's stage dump, which knows its own file layout.
+struct TransportDump
+{
+    void* ctx = nullptr;
+    void (*scalars)(void* ctx, const char* name, const std::vector<scalar>& v) = nullptr;
+};
 
 // The case's schemes for this one field. Every member is read from the case, never defaulted into a
 // substitution: a closure that leaves `limitedLinear` false when the case named it runs upwind under
@@ -60,6 +83,7 @@ struct TransportScheme
     // the implicit half moves the SOURCE while leaving the DIAGONAL exact, which no gate comparing D()
     // can see.
     bool   correctedLaplacian = false;
+    bool   nonOrthCoeffs = false;   // nonOrthDeltaCoeffs without the correction -- inter_ueqn_cpp.cuh:181
     // The field's OWN grad scheme, which correctedSnGrad's correction takes (correctedSnGrad.C:52-55).
     // A DIFFERENT lookup from limGradK above, even though both come from gradSchemes.
     scalar gradFieldLimitK    = 0.0;
@@ -77,12 +101,28 @@ struct TransportScheme
     // driver and the closure -- which is what the dropped snGradLimitCoeff was -- reached no gate.
     // Null by default and free when null.
     const char* stageTag      = nullptr;
+
+    // A PERIODIC PAIR. k's and epsilon's equations are fvm::div - fvm::laplacian like the momentum's,
+    // so across a pair they carry the SAME interface coefficient: -gamma_f*dc*magSf + phi*(1 - w),
+    // which is what deviceCyclicAssembleMomentum builds (device_cyclic.cu's momKernel). `gammaCell`
+    // is the diffusivity as a CELL field, because a coupled face takes fvc::interpolate's value --
+    // the two CELLS interpolated -- and not a patch value (kEpsilon_cpp.cu:152-158). Null = a mesh
+    // with no pair, which is every case this assembler ran on before.
+    DeviceCyclic*               cyc        = nullptr;
+    const DeviceBuffer<scalar>* gammaCell  = nullptr;
+    // ...and the flux the equation CONVECTS with on the pair's own faces. It is not phiInt, which is
+    // the internal-face array, and it is not always cyc->phi either: a compressible closure convects
+    // with the mass flux. Required when `cyc` is set.
+    const DeviceBuffer<scalar>* cycPhi     = nullptr;
     // The field's PATCH VALUES as the gradients below must read them, when they are not what a live
     // evaluate of `db` gives. OpenFOAM's gradients read the patch field's STORED values -- those of its
     // last evaluate, plus whatever updateCoeffs assigned since (epsilonWallFunction's
     // `epf == epsilon0`) -- while `db` carries the coefficients updateCoeffs has JUST refreshed for this
     // assembly. Null = evaluate `db` live, which is what every caller did before stage H3.5.
     const DeviceBuffer<scalar>* bndValues = nullptr;
+
+    // Null by default and free when null (see TransportDump above).
+    const TransportDump* dump = nullptr;
 };
 
 // The linear solve for ONE transported scalar: relax() -> fvOptions.constrain() -> setValues(wall), in
@@ -101,6 +141,9 @@ struct SolveControls
     // the Neumann series' degree that policy derived from the case's relaxation factor.
     const DeviceDilu* precon = nullptr;
     int    polyDeg  = 0;
+    // ...or OpenFOAM's PBiCG with that DILU (device_pbicg.cuh), when the case names it: a different
+    // method from BiCGStab that stops at different iterates. `precon` must be set; refused otherwise.
+    bool   pbicg    = false;
     // FP-1 (bench/rhoSimpleFoam/FASTPATH.md): when the case's smoothSolver is honoured (gs), sweep it in
     // COLOUR order through deviceColourGaussSeidelFused with one component over `colouring` -- the
     // momentum engine, the same stop rule, a different iterate after n sweeps, which the driver
@@ -128,7 +171,14 @@ void solveScalarEqn(
     const SolveControls&        sv,
     scalar&                     residualOut,
     const std::string&          dumpPrefix,
-    bool                        gs);
+    bool gs,
+    // the solve WHOLE -- initial residual, final residual, iteration count -- which is what OpenFOAM's
+    // log prints and so what a solver-log gate compares. Null = not kept.
+    DeviceSolverPerf* perfOut = nullptr,
+    // A PERIODIC PAIR's off-diagonal, which deviceAmul applies as Apsi[own] += ifCoeff*psi[nbr]. The
+    // assembly put its diagonal straight into M.diag, so the fold below adds nothing for it and the
+    // solve would otherwise run a different operator from the matrix. Null = no pair.
+    DeviceCyclic* cyc = nullptr);
 
 // bnd[f] = field[bndCell[f]] on every boundary face `wfMask` marks, and nothing elsewhere: the one
 // assignment the epsilon and omega wall functions make to their own patches inside updateCoeffs

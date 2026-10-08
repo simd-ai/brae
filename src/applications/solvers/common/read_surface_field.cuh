@@ -24,10 +24,23 @@ namespace brae
 // length against nCells -- that check lives only in buildField, which we bypass). Values come from `calculated` patches;
 // zeros stand in for empty/cyclic/cyclicAMI/no-value patches (the ctor recomputes cyclic/AMI flux from U + skips them,
 // and an empty face flux is 0). Used only for a seamless restart (resume the exact written flux state).
-SurfaceScalarField readSurfaceField(const std::string& path, const std::vector<FvPatch>& patches, label nInternalFaces)
+// INLINE, because six translation units include this header and two of them -- interFoam's case
+// reader and simpleFoam's driver -- end up in the same binary. Without it each emits a strong
+// definition and the link fails the moment both objects are pulled (`multiple definition of
+// brae::readSurfaceField`); the ordinary build survives only because the archive hands out one of
+// them. tools/header_odr_audit.py asks this of every function defined in a .cuh.
+// ONE IMPLEMENTATION FOR BOTH SURFACE TYPES. SurfaceScalarField and SurfaceVectorField are two structs with
+// the same layout (fvc.cuh:16-25), and Uf needs exactly this read: createUfIfPresent.H is READ_IF_PRESENT
+// with fvc::interpolate(U) only as its FALLBACK, the same shape as createPhi.H. Two copies of a reader is how
+// the cellZones reader came to be ASCII-only while the mesh's own lists were not.
+namespace detail
 {
-    const FieldData<scalar> fd = readField<scalar>(path);
-    SurfaceScalarField ssf;
+
+template <typename Field, typename T>
+inline Field readSurfaceFieldImpl(const std::string& path, const std::vector<FvPatch>& patches, label nInternalFaces)
+{
+    const FieldData<T> fd = readField<T>(path);
+    Field ssf;
     if (fd.internalUniform)
         ssf.internal.assign(static_cast<std::size_t>(nInternalFaces), fd.internalUniformValue);
     else if (static_cast<label>(fd.internalField.size()) != nInternalFaces)
@@ -40,7 +53,7 @@ SurfaceScalarField readSurfaceField(const std::string& path, const std::vector<F
     ssf.boundary.resize(patches.size());
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
-        std::vector<scalar> vals(static_cast<std::size_t>(patches[pi].size), scalar(0));
+        std::vector<T> vals(static_cast<std::size_t>(patches[pi].size), T{});
         for (const auto& b : fd.boundary)   // pass-1 exact-name match (written phi lists exact mesh-patch names)
         {
             if (b.name != patches[pi].name) continue;
@@ -62,6 +75,23 @@ SurfaceScalarField readSurfaceField(const std::string& path, const std::vector<F
     return ssf;
 }
 
+} // namespace detail
+
+inline SurfaceScalarField readSurfaceField(const std::string& path, const std::vector<FvPatch>& patches, label nInternalFaces)
+{
+    return detail::readSurfaceFieldImpl<SurfaceScalarField, scalar>(path, patches, nInternalFaces);
+}
+
+// ...and Uf, the FACE VELOCITY of a dynamic mesh. createUfIfPresent.H builds it inside `if (mesh.dynamic())`
+// -- MOVING OR TOPO-CHANGING -- with IOobject::READ_IF_PRESENT and AUTO_WRITE, so every time directory a
+// REFINING case writes carries one, and a run resumed from any of them must read it. `phi = mesh.Sf() & Uf()`
+// in interFoam's mesh-changed block (interFoam.C:131) consumes it directly, and fvc::ddtCorr reads its
+// oldTime, so an interpolation standing in for it is not a small error.
+inline SurfaceVectorField readSurfaceVectorField(const std::string& path, const std::vector<FvPatch>& patches, label nInternalFaces)
+{
+    return detail::readSurfaceFieldImpl<SurfaceVectorField, vector>(path, patches, nInternalFaces);
+}
+
 // OF READ_IF_PRESENT: the stored flux on a restart, else the caller's freshly computed fallback.
 // `wasRead`, when given, reports which branch was taken. A caller that only looks at the returned field
 // cannot tell: a coupled patch's boundary values are meaningful on the read path (OpenFOAM writes the
@@ -71,13 +101,36 @@ inline SurfaceScalarField readPhiIfPresent(const std::string& fieldDir, const st
                                            bool* wasRead = nullptr)
 {
     const std::string phiPath = fieldDir + "/phi";
-    if (!std::filesystem::exists(phiPath))
+    // plain or .gz (writeCompression on): the reader opens either, and OpenFOAM's lookup finds either
+    // (POSIX.C:870-876). Probing the plain path alone fell back to the interpolated flux on a restart from a
+    // compressed write, with nothing said.
+    if (!std::filesystem::exists(phiPath) && !std::filesystem::exists(phiPath + ".gz"))
     {
         if (wasRead) *wasRead = false;
         return std::move(fallback);
     }
     if (wasRead) *wasRead = true;
     return readSurfaceField(phiPath, patches, nInternalFaces);
+}
+
+// OF createUfIfPresent.H: the stored face velocity on a restart, else the caller's fvc::interpolate(U).
+// `wasRead` reports which branch was taken, so a gate can assert that its fixture actually carries one --
+// without it an arm comparing Uf could pass on a case that has no file at all.
+inline SurfaceVectorField readUfIfPresent(const std::string& fieldDir, const std::vector<FvPatch>& patches,
+                                          label nInternalFaces, SurfaceVectorField&& fallback,
+                                          bool* wasRead = nullptr)
+{
+    const std::string ufPath = fieldDir + "/Uf";
+    // plain or .gz, as readPhiIfPresent above. MEASURED on laminar/damBreakWithObstacle restarted from a
+    // compressed refined write: the mesh and every level exactly OpenFOAM's, U 3.2e-01 off, because
+    // phi = Sf & Uf at the change read the interpolation instead of the stored Uf.
+    if (!std::filesystem::exists(ufPath) && !std::filesystem::exists(ufPath + ".gz"))
+    {
+        if (wasRead) *wasRead = false;
+        return std::move(fallback);
+    }
+    if (wasRead) *wasRead = true;
+    return readSurfaceVectorField(ufPath, patches, nInternalFaces);
 }
 
 } // namespace brae

@@ -5,6 +5,7 @@
 //   * deviceParallelAMGPCGGraph -- the distributed twin (halo-coupled matvec + on-stream NVSHMEM reduce in-graph).
 // The V-cycle (amgVCycleApply / vcycleAt / vcycleAtF / amgCastFP32) + Galerkin re-coarsening (amgGalerkin) + the
 // spectrum estimate (ensureSpectrum) are called across TUs. Verbatim split of device_amg.cu -- no logic change.
+#include "inter_phase_time.cuh"
 #include "device_amg.cuh"          // AMGData / DeviceSolverPerf / amgGalerkin / amgVCycleApply / deviceAMGPCG decls
 #include "device_blas.cuh"          // dot / axpy / reductions
 #include "device_ldu.cuh"           // DeviceLduView / deviceAmul / deviceParallelAmul (distributed matvec)
@@ -13,6 +14,8 @@
 #include "device_pcg.cuh"         // normFactorOnHost, deviceReadScalar    // BRAE_HAS_GS_DEVICE, gsScaleInvK-adjacent constants + env flags + nBlocks/TPB
 #include "amg_kernels.cuh"          // zeroT<> etc. (if referenced)
 #include "device_amg_internal.cuh"  // LduF/cast_/amulF, gsScaleInvK, ensureSpectrum decl
+#include "device_amg_split.cuh"     // BRAE_AMG_PCG_SPLIT
+#include <set>
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <vector>
@@ -120,6 +123,63 @@ void pcgSetCondK(
     const bool stop = (conv || it >= maxIter) && it >= minIter;
     cudaGraphSetConditional(h, stop ? 0u : 1u);
 }
+// The serial graph's stopping controls, read from the device (PCGGraphCache::sCtl): tol, relTol, maxIter,
+// minIter. pcgSetCtlK writes them before each launch; the two condition kernels below are pcgStartCondK and
+// pcgSetCondK with the controls read instead of baked in.
+__global__
+void pcgSetCtlK(
+    scalar* ctl,
+    scalar tol,
+    scalar relTol,
+    int maxIter,
+    int minIter)
+{
+    if (threadIdx.x || blockIdx.x) return;
+    ctl[0] = tol;
+    ctl[1] = relTol;
+    ctl[2] = maxIter;
+    ctl[3] = minIter;
+}
+
+__global__
+void pcgStartCondCtlK(
+    cudaGraphConditionalHandle h,
+    const scalar* __restrict__ init,
+    const scalar* __restrict__ ctl,
+    int* __restrict__ iter,
+    scalar* __restrict__ res)
+{
+    if (threadIdx.x || blockIdx.x) return;
+    const scalar tol = ctl[0];
+    const scalar relTol = ctl[1];
+    const int minIter = static_cast<int>(ctl[3]);
+    *iter = 0;
+    const scalar ir = *init;
+    *res = ir;
+    const bool conv = (ir < tol) || (relTol > 0.0 && ir < relTol * ir);
+    cudaGraphSetConditional(h, (minIter > 0 || !conv) ? 1u : 0u);
+}
+
+__global__
+void pcgSetCondCtlK(
+    cudaGraphConditionalHandle h,
+    const scalar* res,
+    const scalar* init,
+    const scalar* ctl,
+    int* iter)
+{
+    if (threadIdx.x || blockIdx.x) return;
+    const scalar tol = ctl[0];
+    const scalar relTol = ctl[1];
+    const int maxIter = static_cast<int>(ctl[2]);
+    const int minIter = static_cast<int>(ctl[3]);
+    const int it = ++(*iter);
+    const scalar fr = *res;          // res already normalized by normFactor
+    const bool conv = (fr < tol) || (relTol > 0.0 && fr < relTol * (*init));
+    const bool stop = (conv || it >= maxIter) && it >= minIter;
+    cudaGraphSetConditional(h, stop ? 0u : 1u);
+}
+
 static DeviceSolverPerf deviceAMGPCGGraph(
     const DeviceLduView& A,
     AMGData& amg,
@@ -161,6 +221,30 @@ static DeviceSolverPerf deviceAMGPCGGraph(
     sA.diag  = c.gDiag.data();
     sA.upper = c.gUpper.data();
     sA.lower = c.gLower.data();
+    // the pair's per-solve values into graph-owned buffers, as the matrix above (PCGGraphCache)
+    if (A.nCyc > 0)
+    {
+        c.gCycCoeff.resize(static_cast<std::size_t>(A.nCyc));
+        cudaMemcpyAsync(c.gCycCoeff.data(), A.cycCoeff, (std::size_t)A.nCyc*sizeof(scalar), cudaMemcpyDeviceToDevice,
+                        cudaStreamPerThread);
+        sA.cycCoeff = c.gCycCoeff.data();
+        if (A.cycJump)
+        {
+            c.gCycJump.resize(static_cast<std::size_t>(A.nCyc));
+            cudaMemcpyAsync(c.gCycJump.data(), A.cycJump, (std::size_t)A.nCyc*sizeof(scalar),
+                            cudaMemcpyDeviceToDevice, cudaStreamPerThread);
+            sA.cycJump = c.gCycJump.data();
+        }
+    }
+    if (A.nAmi > 0)
+    {
+        c.gAmiIfc.resize(static_cast<std::size_t>(A.nAmi));
+        cudaMemcpyAsync(c.gAmiIfc.data(), A.amiIfc, (std::size_t)A.nAmi*sizeof(scalar), cudaMemcpyDeviceToDevice,
+                        cudaStreamPerThread);
+        sA.amiIfc = c.gAmiIfc.data();
+    }
+    c.sCtl.resize(4);
+    pcgSetCtlK<<<1,1,0,cudaStreamPerThread>>>(c.sCtl.data(), tol, relTol, maxIter, minIter);
     scalar* dWArA = amg.sWArA.data();
     scalar* dWArAold = amg.sWArAold.data();
     scalar* dPap  = amg.sPap.data();
@@ -169,7 +253,7 @@ static DeviceSolverPerf deviceAMGPCGGraph(
     ensureSpectrum(amg, A);                                                       // one-time Chebyshev spectrum (pre-capture)
     // FP32 V-cycle inside the device-resident PCG: cast matrices once per solve; the WHILE body captures the FP32
     // vcycleAtF automatically (host-scalar-free). Outer Krylov + residual stay FP64 (accuracy preserved).
-    const bool fp32 = useFP32() && !amg.saSmooth && !amg.gsSmooth && !useChebyshev();
+    const bool fp32 = amgSinglePrecisionCycle(amg);
     if (fp32) amgCastFP32(amg, A);
     const LduF A0 = fp32 ? lduF(sA, amg.fDiag[0], amg.fUpper[0], amg.fLower[0]) : LduF{};
     auto applyPrec = [&]()
@@ -184,15 +268,23 @@ static DeviceSolverPerf deviceAMGPCGGraph(
     };
     DeviceSolverPerf perf;
     const int epoch = deviceReductionScratchEpoch();
-    if (!c.exec || c.key != psi.data() || c.keyTol != tol || c.keyRelTol != relTol || c.keyMaxIter != maxIter
-        || c.keyMinIter != minIter || c.keyEpoch != epoch
-        || c.keyOwner != (const void*)A.owner || c.keyNC != nC || c.keyNF != nF)
+    const bool samePair = c.keyNCyc == A.nCyc && c.keyNAmi == A.nAmi && c.keyJump == (A.cycJump != nullptr)
+                       && c.keyCycOwn == (const void*)A.cycOwn && c.keyCycNbr == (const void*)A.cycNbr
+                       && c.keyAmiOwn == (const void*)A.amiOwn && c.keyAmiOff == (const void*)A.amiOff
+                       && c.keyAmiNbr == (const void*)A.amiNbr && c.keyAmiW == (const void*)A.amiW;
+    if (!c.exec || c.key != psi.data() || c.keyEpoch != epoch
+        || c.keyOwner != (const void*)A.owner || c.keyNC != nC || c.keyNF != nF
+        || c.keyAddressingId != A.addressingId || !samePair || c.keyPairEpoch != amg.pair.epoch)
     {
+        interPhase::Nested timedCapture("AMG-PCG: graph capture");
         // PRE-SIZE everything the capture will touch (the V-cycle scratch, pA/Ax, the reduction
         // partials): a capture must allocate nothing. ON THE CAPTURE ONLY -- doing it per solve, as the
         // first version of this did, repeats the prologue and a whole V-cycle whose result is thrown
         // away, and cost more than the two reads it saved (T3A 15.0 -> 17.4 ms/iter, measured).
-        deviceAmul(sA, psi, c.Ax);
+        // A*psi with `onField`: psi IS the solution field, the one product a jump cyclic applies its jump to
+        // (device_pcg.cu's own initial residual). Without it a porousBafflePressure pair was solved with no jump:
+        // RAS/damBreakPorousBaffle, phi 5.6e-03 from OpenFOAM.
+        deviceAmul(sA, psi, c.Ax, /*onField=*/true);
         deviceCopy(rA, c.gB);
         deviceAxpy(-1.0, c.Ax, rA);
         deviceSumMagInto(rA, c.sInit.data());
@@ -213,13 +305,16 @@ static DeviceSolverPerf deviceAMGPCGGraph(
         cudaCheck(cudaGraphConditionalHandleCreate(&c.handle, c.graph, 0, cudaGraphCondAssignDefault), "pcg cond handle");
         cudaCheck(cudaStreamBeginCaptureToGraph(cudaStreamPerThread, c.graph, nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal), "pcg prologue capture");
         // the prologue: r = b - A psi, the initial residual, and the loop's start decision
-        deviceAmul(sA, psi, c.Ax);
+        // A*psi with `onField`: psi IS the solution field, the one product a jump cyclic applies its jump to
+        // (device_pcg.cu's own initial residual). Without it a porousBafflePressure pair was solved with no jump:
+        // RAS/damBreakPorousBaffle, phi 5.6e-03 from OpenFOAM.
+        deviceAmul(sA, psi, c.Ax, /*onField=*/true);
         deviceCopy(rA, c.gB);
         deviceAxpy(-1.0, c.Ax, rA);
         deviceSumMagInto(rA, c.sInit.data());
         gsScaleInvK<<<1,1,0,cudaStreamPerThread>>>(c.sInit.data(), c.sNormF.data());
-        pcgStartCondK<<<1,1,0,cudaStreamPerThread>>>(c.handle, c.sInit.data(), tol, relTol, minIter,
-                                                     c.sIter.data(), c.sRes.data());
+        pcgStartCondCtlK<<<1,1,0,cudaStreamPerThread>>>(c.handle, c.sInit.data(), c.sCtl.data(), c.sIter.data(),
+                                                        c.sRes.data());
         cudaStreamCaptureStatus st;
         const cudaGraphNode_t* deps = nullptr;
         std::size_t nDeps = 0;
@@ -249,17 +344,24 @@ static DeviceSolverPerf deviceAMGPCGGraph(
         deviceAxpyDev(dNegAlpha, wA, rA);
         deviceSumMagInto(rA, c.sRes.data());
         gsScaleInvK<<<1,1,0,cudaStreamPerThread>>>(c.sRes.data(), c.sNormF.data());   // normalized residual
-        pcgSetCondK<<<1,1,0,cudaStreamPerThread>>>(c.handle, c.sRes.data(), tol, c.sInit.data(), relTol,
-                                                   c.sIter.data(), maxIter, minIter);
+        pcgSetCondCtlK<<<1,1,0,cudaStreamPerThread>>>(c.handle, c.sRes.data(), c.sInit.data(), c.sCtl.data(),
+                                                      c.sIter.data());
         cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &tmp), "pcg capture end");
         cudaCheck(cudaGraphInstantiate(&c.exec, c.graph, 0), "pcg graph instantiate");
         c.key = psi.data();
-        c.keyTol = tol;
-        c.keyRelTol = relTol;
-        c.keyMaxIter = maxIter;
-        c.keyMinIter = minIter;
+        c.keyNCyc = A.nCyc;
+        c.keyNAmi = A.nAmi;
+        c.keyJump = A.cycJump != nullptr;
+        c.keyCycOwn = A.cycOwn;
+        c.keyCycNbr = A.cycNbr;
+        c.keyAmiOwn = A.amiOwn;
+        c.keyAmiOff = A.amiOff;
+        c.keyAmiNbr = A.amiNbr;
+        c.keyAmiW = A.amiW;
+        c.keyPairEpoch = amg.pair.epoch;
         c.keyEpoch = epoch;
         c.keyOwner = A.owner;
+        c.keyAddressingId = A.addressingId;
         c.keyNC = nC;
         c.keyNF = nF;
     }
@@ -319,7 +421,7 @@ DeviceSolverPerf deviceParallelAMGPCGGraph(
     scalar* dPap  = amg.sPap.data();   scalar* dAlpha = amg.sAlpha.data();
     scalar* dNegAlpha = amg.sNegAlpha.data(); scalar* dBeta = amg.sBeta.data();
     ensureSpectrum(amg, A);
-    const bool fp32 = useFP32() && !amg.saSmooth && !amg.gsSmooth && !useChebyshev();
+    const bool fp32 = amgSinglePrecisionCycle(amg);
     if (fp32) amgCastFP32(amg, A);
     const LduF A0 = fp32 ? lduF(A, amg.fDiag[0], amg.fUpper[0], amg.fLower[0]) : LduF{};
     auto applyPrec = [&]()
@@ -448,6 +550,69 @@ DeviceSolverPerf deviceParallelAMGPCGGraph(
 }
 #endif
 
+// BRAE_AMG_PCG_SPLIT: a split solve's parts into the phase table -- a line a grid's part, the Krylov loop's
+// own after them -- and, once a solve name, the hierarchy's shape, which is what the parts' sizes follow
+static void chargeSplit(
+    const DeviceLduView& A,
+    const AMGData& amg,
+    bool singlePrecisionCycle,
+    int nIter)
+{
+    amgSplit::State& s = amgSplit::state();
+    s.active = false;
+    static const char* const partName[amgSplit::nParts] =
+        {"pre-smooth", "residual", "restriction", "coarsest solve", "prolongation", "post-smooth"};
+    static const char* const krylovName[amgSplit::nKrylov] =
+        {"the first residual", "the matrices cast to single precision", "r and w cast (single-precision cycle)",
+         "A p", "dots, p, psi and r", "the residual norm, read"};
+    const int nGrids = amg.nLevels() + 1;
+    static std::set<std::string> shown;
+    if (shown.insert(s.name).second)
+    {
+        std::printf("  AMG-PCG split of %s (BRAE_AMG_PCG_SPLIT): the solve leaves the captured graph and waits "
+                    "after every part -- an instrument, not a measured run.\n", s.name);
+        std::printf("    its %d grids, %s aggregation, %s-precision cycle, cells / faces%s:\n", nGrids,
+                    amg.saSmooth ? "smoothed" : "plain", singlePrecisionCycle ? "single" : "double",
+                    amg.saSmooth ? " / prolongator entries to the next" : "");
+        for (int g = 0; g < nGrids; ++g)
+        {
+            const int cells = g == 0 ? A.nCells : amg.level[g - 1].nCoarse;
+            const int faces = g == 0 ? A.nInternalFaces : amg.level[g - 1].nCoarseFaces;
+            if (amg.saSmooth && g < amg.nLevels())
+            {
+                std::printf("      grid %2d  %9d / %9d / %zu\n", g, cells, faces, amg.level[g].Pval.size());
+            }
+            else
+            {
+                std::printf("      grid %2d  %9d / %9d\n", g, cells, faces);
+            }
+        }
+    }
+    char label[160];
+    double all = 0.0;
+    for (int g = 0; g < nGrids && g < amgSplit::MAX_GRIDS; ++g)
+    {
+        for (int p = 0; p < amgSplit::nParts; ++p)
+        {
+            // the coarsest grid is solved and nothing else; every other grid is everything but solved
+            if ((g == amg.nLevels()) != (p == amgSplit::coarsest)) continue;
+            std::snprintf(label, sizeof(label), "%s split: grid %d %s", s.name, g, partName[p]);
+            interPhase::charge(label, s.grid[g][p], nIter);
+            all += s.grid[g][p];
+        }
+    }
+    for (int k = 0; k < amgSplit::nKrylov; ++k)
+    {
+        // the two casts are the single-precision cycle's
+        if (!singlePrecisionCycle && (k == amgSplit::matrixCast || k == amgSplit::vectorCasts)) continue;
+        std::snprintf(label, sizeof(label), "%s split: Krylov, %s", s.name, krylovName[k]);
+        interPhase::charge(label, s.krylov[k], k <= amgSplit::matrixCast ? 1 : nIter);
+        all += s.krylov[k];
+    }
+    std::snprintf(label, sizeof(label), "%s split: ALL PARTS, waited for one by one", s.name);
+    interPhase::charge(label, all, 1);
+}
+
 DeviceSolverPerf deviceAMGPCG(
     const DeviceLduView& A,
     AMGData& amg,
@@ -462,10 +627,20 @@ DeviceSolverPerf deviceAMGPCG(
     bool corrScaling,
     int minIter)
 {
+    // the matrix's coupled pair onto every grid of the hierarchy, this solve's coefficients (AMGPair)
+    amgCouplePair(amg, A);
+    // BRAE_AMG_PCG_SPLIT: this solve takes the plain loop below, uncaptured, the residual read at every
+    // iteration as the graph reads it, with a lap after every part (device_amg_split.cuh)
+    const bool split = amgSplit::wanted();
+    if (split)
+    {
+        captureVcycle = false;
+        checkEvery = 1;
+    }
 #ifdef BRAE_HAS_GS_DEVICE
     {
         static const bool pcgDev = envFlag("BRAE_PCG_DEVICE", true);                 // device-resident pressure solve (default ON; opt out BRAE_PCG_DEVICE=0)
-        if (pcgDev && !corrScaling)
+        if (pcgDev && !corrScaling && !split)
         {
             static thread_local auto& dNf = *new DeviceBuffer<scalar>(1);
             cudaMemcpyAsync(dNf.data(), &normFactor, sizeof(scalar), cudaMemcpyHostToDevice, cudaStreamPerThread);
@@ -478,7 +653,9 @@ DeviceSolverPerf deviceAMGPCG(
     DeviceBuffer<scalar>& wA = amg.wA;                          // persistent (fixed addr) so the captured graph stays valid
     DeviceBuffer<scalar>& rA = amg.rA;
     DeviceBuffer<scalar> pA(nC), Ax(nC), rOld(nC);             // rOld: previous residual for flexible-CG beta (corrScaling)
-    deviceAmul(A, psi, Ax);
+    if (split) amgSplit::begin();
+    // A*psi with `onField`: psi IS the solution field, the one product a jump cyclic applies its jump to
+    deviceAmul(A, psi, Ax, /*onField=*/true);
     deviceCopy(rA, b);
     deviceAxpy(-1.0, Ax, rA);
     DeviceSolverPerf perf;
@@ -486,6 +663,7 @@ DeviceSolverPerf deviceAMGPCG(
     perf.finalResidual = perf.initialResidual;
     auto converged = [&](scalar fr){ return (fr<tol) || (relTol>0.0 && fr<relTol*perf.initialResidual); };
 
+    amgSplit::lap(amgSplit::prologue);
     // One-time Chebyshev spectrum estimate (host scalars -> must precede any graph capture); no-op unless Chebyshev.
     ensureSpectrum(amg, A);
 
@@ -493,9 +671,9 @@ DeviceSolverPerf deviceAMGPCG(
     // persistent work buffers), so it is captured into a CUDA graph and replayed. The graph is cached in amg.gcache,
     // keyed on the fine-matrix pointer A.diag: captured once and replayed across all PCG iters and SIMPLE steps (the
     // matrix values change in-buffer each step; the graph reads them at replay), re-captured only when the key changes.
-    // FP32 mixed precision (default smoother/aggregation only; SA/GS/Cheb/corrScaling stay FP64): the matrices are cast
+    // FP32 mixed precision (the default smoother only; GS/Cheb/corrScaling stay FP64): the matrices are cast
     // once per solve, and each application casts rA -> FP32 in / FP32 -> wA out.
-    const bool fp32 = useFP32() && !amg.saSmooth && !amg.gsSmooth && !useChebyshev() && !corrScaling;
+    const bool fp32 = amgSinglePrecisionCycle(amg) && !corrScaling;
     if (fp32)
     {
         amgCastFP32(amg, A);
@@ -506,6 +684,7 @@ DeviceSolverPerf deviceAMGPCG(
             if(std::getenv("BRAE_AMG_CYCLES")) std::fprintf(stderr,"[AMG] FP32 V-cycle ENGAGED (levels=%d)\n", amg.nLevels());
         }
     }
+    amgSplit::lap(amgSplit::matrixCast);
     AMGGraphCache& gc = *amg.gcache;
     auto applyPrecond = [&]()
     {
@@ -515,8 +694,10 @@ DeviceSolverPerf deviceAMGPCG(
             auto runF = [&]()                                                        // cast in -> FP32 V-cycle -> cast out
             {
                 cast_<scalar,float><<<nBlocks(nC),TPB>>>(nC, rA.data(), amg.vBF[0].data());
+                amgSplit::lap(amgSplit::vectorCasts);
                 vcycleAtF(0, amg, A, A0, amg.vBF[0].data(), amg.vXF[0].data());
                 cast_<float,scalar><<<nBlocks(nC),TPB>>>(nC, amg.vXF[0].data(), wA.data());
+                amgSplit::lap(amgSplit::vectorCasts);
             };
             if (!captureVcycle)
             {
@@ -524,7 +705,8 @@ DeviceSolverPerf deviceAMGPCG(
                 return;
             }
             AMGGraphCache& gcf = *amg.gcacheF;                                          // graph the FP32 V-cycle (host-scalar-free)
-            if (!gcf.exec || gcf.key != A.diag || gcf.keyEpoch != deviceReductionScratchEpoch())
+            if (!gcf.exec || gcf.key != A.diag || gcf.keyEpoch != deviceReductionScratchEpoch()
+             || gcf.keyPairEpoch != amg.pair.epoch || amgGraphViewMoved(gcf, A))
             {
                 if (gcf.exec)
                 {
@@ -541,6 +723,8 @@ DeviceSolverPerf deviceAMGPCG(
                 cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &gcf.graph), "amgF capture end");
                 cudaCheck(cudaGraphInstantiate(&gcf.exec, gcf.graph, 0), "amgF graph instantiate");
                 gcf.key = A.diag; gcf.keyEpoch = deviceReductionScratchEpoch();
+                gcf.keyPairEpoch = amg.pair.epoch;
+                amgGraphViewStamp(gcf, A);
             }
             cudaCheck(cudaGraphLaunch(gcf.exec, cudaStreamPerThread), "amgF graph launch");
             return;
@@ -550,7 +734,8 @@ DeviceSolverPerf deviceAMGPCG(
             vcycleAt(0, amg, A, rA, wA);
             return;
         }
-        if (!gc.exec || gc.key != A.diag || gc.keyEpoch != deviceReductionScratchEpoch())
+        if (!gc.exec || gc.key != A.diag || gc.keyEpoch != deviceReductionScratchEpoch()
+         || gc.keyPairEpoch != amg.pair.epoch || amgGraphViewMoved(gc, A))
         {
             if (gc.exec)
             {
@@ -567,6 +752,8 @@ DeviceSolverPerf deviceAMGPCG(
             cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &gc.graph), "amg capture end");
             cudaCheck(cudaGraphInstantiate(&gc.exec, gc.graph, 0), "amg graph instantiate");
             gc.key = A.diag; gc.keyEpoch = deviceReductionScratchEpoch();
+            gc.keyPairEpoch = amg.pair.epoch;
+            amgGraphViewStamp(gc, A);
         }
         cudaCheck(cudaGraphLaunch(gc.exec, cudaStreamPerThread), "amg graph launch");
     };
@@ -604,20 +791,25 @@ DeviceSolverPerf deviceAMGPCG(
                 deviceFusedScaleAxpy(pA, dBeta, wA);
             }
             if (corrScaling) deviceCopy(rOld, rA);              // save r_k for iter k+1 (rA is about to be updated)
+            amgSplit::lap(amgSplit::updates);
             deviceAmul(A, pA, wA);
+            amgSplit::lap(amgSplit::product);
             deviceDotInto(wA, pA, dPap);
             deviceScalarDivNeg(dWArA, dPap, dAlpha, dNegAlpha);
             deviceAxpyDev(dAlpha, pA, psi);
             deviceAxpyDev(dNegAlpha, wA, rA);
+            amgSplit::lap(amgSplit::updates);
             ++nIter;
             if (nIter % K == 0 || nIter >= maxIter)           // read |r|_1 only every K iters (K=1: exact per-iter)
             {
                 deviceSumMagInto(rA, dResNorm);
                 perf.finalResidual = deviceReadScalar(dResNorm)/normFactor;   // the only host sync
             }
+            amgSplit::lap(amgSplit::residualRead);
         } while ((nIter < maxIter && !converged(perf.finalResidual)) || nIter < minIter);
     }
     perf.nIterations = nIter;
+    if (split) chargeSplit(A, amg, fp32, nIter);
     static const bool dbgCyc = std::getenv("BRAE_AMG_CYCLES") != nullptr;   // benchmark: AMG V-cycles per pressure solve
     if (dbgCyc) std::fprintf(stderr, "[AMG] p cycles=%d finalRes=%.3e\n", nIter, perf.finalResidual);
     return perf;
@@ -625,7 +817,7 @@ DeviceSolverPerf deviceAMGPCG(
 
 // Cast the fine + coarse matrices to their FP32 mirrors for this solve's V-cycles. Call ONCE per solve, AFTER
 // amgGalerkin has updated the FP64 operators (the coarse matrices change every SIMPLE step). No-op unless FP32
-// mixed precision applies (BRAE_AMG_FP32 default on; the SA/GS/Chebyshev paths stay FP64). After this,
+// mixed precision applies (BRAE_AMG_FP32 default on; the GS/Chebyshev paths stay FP64). After this,
 
 
 DeviceSolverPerf deviceAMGPCG(
@@ -652,8 +844,11 @@ DeviceSolverPerf deviceAMGPCG(
     // beside it. The sibling call at :472 was already guarded; this one was not.
     {
         static const bool pcgDev = std::getenv("BRAE_PCG_DEVICE") == nullptr || std::string(std::getenv("BRAE_PCG_DEVICE")) != "0";
-        if (pcgDev && !corrScaling && !normFactorOnHost())
+        if (pcgDev && !corrScaling && !normFactorOnHost() && !amgSplit::wanted())
+        {
+            amgCouplePair(amg, A);
             return deviceAMGPCGGraph(A, amg, b, psi, dNormFactor, tol, relTol, maxIter, minIter);
+        }
     }
 #endif
     return deviceAMGPCG(A, amg, b, psi, deviceReadScalar(dNormFactor), tol, relTol, maxIter, captureVcycle, checkEvery, corrScaling, minIter);

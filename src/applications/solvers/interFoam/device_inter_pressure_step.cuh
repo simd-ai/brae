@@ -1,0 +1,364 @@
+#pragma once
+// ONE PASS OF pEqn.H on the device -- rAU and HbyA, phiHbyA with interFoam's two extra terms, the
+// p_rgh solve, then phi, U and p rebuilt from it.
+//
+// provenance:
+//   openfoam:  applications/solvers/multiphase/interFoam/pEqn.H:1-89
+//   host:      src/applications/solvers/interFoam/inter_peqn_cpp.cu, pressureCorrector -- the ORACLE,
+//              and the path that reaches 2.29e-06 relative in p_rgh and 3.31e-06 in U on damBreak
+//              against real OpenFOAM.
+//   tests:     tests/test_device_inter_pressure_step.cu
+//
+// ONE PASS, NOT THE NON-ORTHOGONAL LOOP, for the same reason deviceAlphaCorrector is one corrector:
+// OpenFOAM re-evaluates p_rgh's boundary after every solve and the next pass's matrix and flux both
+// read it, and a call that looped internally could not do that. The loop is the caller's.
+//
+// STAGES 1-4 ARE simpleFoam's pressurePredictor, REUSED. rAU = 1/A(), H(), HbyA, constrainHbyA and
+// fvc::flux(HbyA) are the same operators, and A() takes the RELAXED diagonal with the boundary average
+// added ON TOP of it -- OpenFOAM's relax() writes diag_ in place and A() is taken afterwards. What
+// interFoam adds is stages 5 onward, and each is already landed and gated on its own.
+//
+// THE THREE THINGS THIS FILE OWNS ARE PLACEMENTS, not operators:
+//
+//   phig GOES INTO phiHbyA ON BOTH SIDES. fvc::div(phiHbyA) sums the boundary faces, so a wall's
+//   buoyancy and surface tension reach the pressure equation's SOURCE through it -- measured at 9.4e+01
+//   of 1.9e+02, half the source. On capillaryRise, where momentumPredictor is off, that is the only
+//   route surface tension has into the solution at all.
+//
+//   THE SAME phig IS REUSED IN THE VELOCITY CORRECTION, (phig - flux)/rAUf, and it is the flux BEFORE
+//   the division. Recomputing it there from a separately interpolated rAUf would be a different number.
+//
+//   p IS REBUILT FROM THE SOLVED p_rgh, not carried. p == p_rgh + rho*gh, and when p_rgh needs a
+//   reference BOTH move: p is shifted and p_rgh is then rebuilt from the shifted p. Stopping after the
+//   first leaves them disagreeing by a constant that surfaces in the next step's momentum source.
+#include "cf_types.cuh"
+#include "device_buffer.cuh"
+#include "device_mesh.cuh"
+#include "device_inter_peqn.cuh"
+#include "device_MRF.cuh"
+#include "device_cyclic.cuh"
+#include "device_alpha_presolve.cuh"   // DeviceAlphaSolverControls, the same shape of solver entry
+#include "device_dilu.cuh"
+#include "device_gamg_solver.cuh"
+#include "device_pcg.cuh"   // DeviceSolverPerf
+#include "device_amg.cuh"   // AMGData, deviceAMGPCG
+#include "fv_geometry.cuh"
+#include "primitive_mesh.cuh"
+#include <functional>
+#include <string>
+#include <vector>
+
+namespace brae {
+
+struct DeviceInterPressureHooks
+{
+    // p_rgh's patch values, re-evaluated after each solve. The NEXT corrector's laplacian and its flux
+    // both read them, exactly as OpenFOAM's p_rgh.correctBoundaryConditions() at the end of pEqn.H
+    // leaves them for the next pass. Optional: a case with nCorrectors 1 never needs it.
+    std::function<void(const DeviceBuffer<scalar>& p_rgh)> updateBoundary;
+
+    // p_rgh's laplacian boundary coefficients, flattened in boundary-face order, AFTER
+    // constrainPressure has set any fixedFluxPressure patch's gradient from phiHbyA. Branchy per-patch
+    // dispatch over fixedFluxPressure, totalPressure and zeroGradient -- host work, as everywhere else.
+    // `rAUfAll` is the FULL face array -- internal faces then the boundary patches -- and not just the
+    // internal half. Both are needed: the laplacian's boundary coefficients scale with rAUf at the
+    // patch, and constrainPressure divides by it per face. A hook given only the internal half has to
+    // invent the boundary values, and standing in the first internal face's value for all of them put
+    // U 60% out on damBreak.
+    // `rAUCell` is rAU itself, which the hook needs for one thing rAUfAll cannot give it: a COUPLED
+    // patch's rAUf. The device's face arrays have no coupled patch in them, and fvm::laplacian reads
+    // gammaf on every patch, so the pair's is interpolated from the two cells there.
+    // `cycJump` is an OUT parameter: p_rgh's JUMP on each coupled face, already signed, in the pair's
+    // own face order -- and EMPTY on a pair without one. It belongs to this hook because a
+    // porousBafflePressure recomputes its jump in updateCoeffs, from the flux and the viscosity at
+    // THIS assembly, so it is as fresh as the coefficients beside it.
+    std::function<void(const DeviceBuffer<scalar>& phiHbyAInt,
+                       const DeviceBuffer<scalar>& phiHbyABnd,
+                       const DeviceBuffer<scalar>& rAUfAll,
+                       const DeviceBuffer<scalar>& rAUCell,
+                       DeviceBuffer<scalar>&       iC,
+                       DeviceBuffer<scalar>&       bC,
+                       DeviceBuffer<scalar>&       cycJump)> pressureCoeffs;
+
+    // p_rgh's STORED patch values, flattened in boundary-face order, as they stand after pressureCoeffs
+    // -- what the host's gradOf(p_rgh) reads for the corrected laplacian's non-orthogonal correction
+    // (inter_peqn_cpp.cu). Required when DeviceInterPressureInput::correctedLaplacian is set.
+    // `p_rgh` is the device field as it stands: an `empty` patch's entries are its cells' values, which the
+    // hook can take from it there rather than from a host copy.
+    std::function<void(const DeviceBuffer<scalar>& p_rgh,
+                       DeviceBuffer<scalar>&       bval)> boundaryValues;
+
+    // adjustPhi(phiHbyA, U, p_rgh), pEqn.H:24, on a case whose p_rgh needs a reference: scales the
+    // adjustable OUTFLOW of phiHbyABnd in place, or throws where OpenFOAM stops (adjustPhi.C:108-119).
+    // Handed phiHbyA as pEqn.H:23 leaves it -- ddtCorr, MRF.makeRelative and, on a moving mesh,
+    // fvc::makeRelative applied, phig not; phiHbyAInt is read for totalFlux only. The driver's
+    // implementation IS the host's cpu::interFoam::adjustPhi, so the two arms cannot differ by a bit.
+    // Required when DeviceInterPressureInput::needReference is set.
+    std::function<void(const DeviceBuffer<scalar>& phiHbyAInt,
+                       DeviceBuffer<scalar>&       phiHbyABnd)> adjustPhi;
+};
+
+// THE PRESSURE RULE (CLAUDE.md, user decisions 2026-10-03): p_rgh and pcorr run brae's AMG-preconditioned PCG
+// (deviceAMGPCG), the fast path simpleFoam and rhoSimpleFoam take, WHATEVER the case's entry names -- GAMG, PCG
+// with DIC, PCG with a GAMG preconditioner -- and say so. The hierarchy is the mesh's: agglomerated on the
+// internal faces' |Sf|, as simpleFoam's default, built on first use and again when the addressing changes
+// (DeviceMesh::addressingId); the coefficients are re-coarsened every solve (amgGalerkin). A mesh that moves
+// keeps its hierarchy -- it only preconditions the solve.
+// BRAE_PRESSURE_CASE_SOLVER=1 runs the case's own entry as ported instead: what every test runs, so the exact
+// gates against OpenFOAM keep their bounds (CMakeLists.txt, tests/interfoam_write/lib.sh).
+// ONE BUILD A MESH. After a change of topology two solves ask for the new mesh's hierarchy -- pcorr's, inside
+// CorrectPhi, and then p_rgh's -- and each built it: the same call on the same mesh. The hierarchy is made
+// from the internal faces' owner, neighbour and |Sf| and the cell count; nothing of either MATRIX goes in,
+// the coefficients come in at each solve through amgGalerkin. So the second one is the first one: the first
+// build leaves a copy of its structure (cloneAMG) and the second asker is handed that copy in place of a
+// build. What a solve keeps on its hierarchy -- the coarse matrices' values, the smoother's spectrum, the
+// captured graphs -- is its own object's.
+// MEASURED: damBreakWithObstacle built 1.6 hierarchies a step for 66 ms, RAS/motorBike 2.0 for 42.
+// Held for a mesh that CHANGED only: the start mesh's second asker reads the disk cache the first one wrote.
+//   BRAE_CONTROL_AMG_HIERARCHY_REBUILT=1  every asker builds, as before
+//   BRAE_CONTROL_AMG_HIERARCHY_CHECK=1    a copy handed out is built as well and compared buffer by buffer
+//   BRAE_CONTROL_AMG_HIERARCHY_STALE=1    a gate's CONTROL, deliberately wrong: the held structure is handed
+//                                         out without asking whether it is this mesh's
+struct AmgHierarchyMemo
+{
+    bool held = false;
+    label nCells = 0;
+    std::vector<label> owner;
+    std::vector<label> neighbour;
+    std::vector<scalar> weights;
+    // never solved on: copied (cloneAMG) from the first asker's build and handed whole to the second
+    AMGData structure;
+};
+
+struct DeviceAmgPcgCache
+{
+    const PrimitiveMesh* mesh = nullptr;
+    const FvGeometry* geometry = nullptr;
+    // shared with pcorr's solver (DevicePcorrSolver::amgMemo); null = this cache builds its own every time
+    AmgHierarchyMemo* memo = nullptr;
+    // the case, for the hierarchy's disk cache (deviceAmgPcgHierarchy); empty = no disk cache
+    std::string caseDir;
+    bool built = false;
+    unsigned long long addressingId = 0;
+    AMGData amg;
+
+    AMGData& get(unsigned long long id);
+};
+
+// THE HIERARCHY, WARM WHERE IT CAN BE. `disk` (the run's start mesh) loads the case's cache --
+// <caseDir>/constant/polyMesh/.brae_amgcache, or .brae_amgcache_sa for a smoothed one -- when the file is THIS
+// mesh's and this build's (buildOrLoadAMG's signature: the owner, neighbour and weights by content, the build's
+// parameters and version), and writes it after a build. BRAE_AMG_CACHE=0 neither reads nor writes it.
+// pcorr's smoothed hierarchy was not cached at all and was built at every start: MEASURED 2.2 s at 896,000 cells
+// (2-D) and 13.6 s on the 845,536-cell hull.
+// THE FAST PATH'S PERFORMANCE KNOBS, one reading for every pressure entry -- p_rgh here and pcorr in
+// device_inter_pcorr_solve.cu -- with simpleFoam's defaults and switches (linear_solver_setup.cuh): the
+// residual read every 4 iterations where the loop is driven from the host (BRAE_PCG_CHECK_EVERY), the whole
+// PCG loop replayed from a CUDA graph (BRAE_USE_GRAPH=0 drives it from the host), and no coarse-correction
+// scaling (BRAE_CORR_SCALING=1). A caller with a coupled pair turns the graph off itself.
+// BRAE_CORR_SCALING=1 IS AN EXPERIMENT THAT LOST, kept announced. It takes the plain loop and the
+// double-precision cycle. MEASURED 2026-10-06 on laminar/waves/stokesI as shipped, 27 steps, the residual
+// read at every iteration: the same 309 iterations as the default, every solve, the line-search factor being
+// 1 to twelve digits on these Galerkin grids -- and 4.6 ms a step in the pressure solve for the default's
+// 2.6. DTCHull's pinned row: 346 iterations either way. (The 25,224 iterations it was recorded with on
+// stokesI were a stale captured cycle in that loop, not the scaling: device_amg.cuh, amgGraphViewMoved. The
+// older "422 -> 1396" on DTCHull as shipped has not been re-measured.) Read every fourth iteration, as the
+// loop does by default, it over-solves by up to three and is another run: 340 iterations, max|U| 0.105 for
+// 0.182 -- set BRAE_PCG_CHECK_EVERY=1 beside it before comparing anything.
+struct AmgPcgKnobs
+{
+    int checkEvery = 4;
+    bool graph = true;
+    bool corrScaling = false;
+    // WHERE THE NON-FINAL p_rgh SOLVES THE FINAL ONE FOLLOWS STOP, when their entry names `PCG` WITH `DIC`: at
+    // the entry's relTol or at this one, whichever is tighter. They are the corrector before the last and the
+    // last corrector's own earlier non-orthogonal passes; a corrector further back keeps the entry's relTol,
+    // since what it leaves is solved over twice more. Negative keeps the entry's own everywhere
+    // (BRAE_PRESSURE_DIC_INNER_RELTOL=case; a number sets another cap).
+    // The wave tutorials ask for relTol 0.1 there, and what they get from OpenFOAM is one DIC-PCG iteration
+    // whose error puts no velocity in the air. An AMG-preconditioned PCG stopped at the same relTol leaves its
+    // error AT THE INTERFACE, where 1/rho turns it into air velocity; H(U) carries that into the Final
+    // corrector, which projects the flux and keeps the rest, and maxCo then cuts the time step.
+    // MEASURED, stokesI at deltaT 0.01: the Courant number at step 2 is 1.923 against 0.001 with the case's
+    // solver -- and 1.897 in OpenFOAM ITSELF with `GAMG` named for p_rgh, so it is the entry's solver the
+    // tutorial leans on and not this arithmetic. To the time 20-core OpenFOAM's 30th step reached, steps taken
+    // with the entry's own relTol and with 1e-3: stokesI 127 -> 27, stokesII 100 -> 28, streamFunction
+    // 78 -> 28, stokesV 60 -> 21, cnoidal 47 -> 30, solitary 18 -> 9; relTol 0 moves none of them further.
+    // WHAT IT COSTS where nothing was wrong, ms a step in the 42-tutorial table: capillaryRise 8.3 -> 9.8,
+    // weirOverflow 9.3 -> 10.2, mixerVessel2D 6.3 -> 7.0, damBreakRAS 7.4 -> 8.1, damBreak 6.7 -> 7.0 -- every
+    // one of 8,000 cells or fewer; waveMakerFlap (56,000) 62.1 -> 62.9. Capping EVERY non-final corrector
+    // (BRAE_CONTROL_DIC_INNER_EVERY_CORRECTOR=1) moved no wave tutorial further and cost mixerVessel2D 7.5 and
+    // damBreakRAS 8.5. AN ENTRY THAT NAMES GAMG KEEPS ITS OWN: those tutorials take OpenFOAM's step count as
+    // they are, and the same cap cost DTCHull 9% and eulerianInjection 18%.
+    scalar dicInnerRelTol = 1e-3;
+    // EXPERIMENT, off at 1 (BRAE_EXPERIMENT_PRESSURE_FINAL_TOL_FACTOR=<f>): the Final p_rgh solve's absolute
+    // tolerance on the AMG-PCG is the entry's times this. Being measured -- see the note at its use.
+    scalar finalTolFactor = 1;
+};
+const AmgPcgKnobs& amgPcgKnobs();
+
+AMGData deviceAmgPcgHierarchy(
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::string& caseDir,
+    bool disk,
+    AmgHierarchyMemo* memo = nullptr,
+    // pcorr's smoothed-aggregation hierarchy (DevicePcorrSolver::fixedTopology): cached in a file of its own
+    bool smoothed = false);
+
+
+struct DeviceInterPressureInput
+{
+    // THE MESH FLUX, over the mesh's FULL face array, on a moving mesh only (null otherwise). pEqn.H
+    // ends with fvc::makeRelative(phi, U) on a mesh that moves -- phi -= meshPhi (fvcMeshPhi.C:76) --
+    // so the flux the next alpha equation convects with is the one relative to the motion. The host
+    // reference does it at inter_peqn_cpp.cu:980, after the velocity correction.
+    const DeviceBuffer<scalar>* meshPhiAll = nullptr;
+
+    // ...and where the step hands BACK the flux as it stands one line EARLIER, still absolute.
+    // fvc::correctUf(Uf, U, phi) reads the absolute flux (pEqn.H:66, with makeRelative on the line
+    // after it), and Uf is a host field, so the driver does that call -- from these, not from the
+    // flux this step leaves behind. Null when the caller does not want them.
+    DeviceBuffer<scalar>* phiAbsIntOut = nullptr;
+    DeviceBuffer<scalar>* phiAbsBndOut = nullptr;
+    // ...and both again ON THE PAIR's faces, which are in neither face array: the mesh flux makeRelative
+    // subtracts there, and the absolute flux correctUf reads there. A moving mesh with a pair needs the
+    // first; refused by name without it.
+    const DeviceBuffer<scalar>* meshPhiIf = nullptr;
+    DeviceBuffer<scalar>* phiAbsIfOut = nullptr;
+
+    // the face fields the buoyancy flux is built from, over the mesh's FULL face array
+    const DeviceBuffer<scalar>* stf       = nullptr;   // surfaceTensionForce
+    const DeviceBuffer<scalar>* ghf       = nullptr;
+    const DeviceBuffer<scalar>* snGradRho = nullptr;
+    const DeviceBuffer<scalar>* magSf     = nullptr;
+    const DeviceBuffer<scalar>* rAUfAll   = nullptr;   // interpolate(rAU) over the full face array
+
+    const DeviceBuffer<scalar>* rho = nullptr;         // cells, for interpolate(rho*rAU) and for p
+    const DeviceBuffer<scalar>* gh  = nullptr;         // cells
+
+    // fvc::ddtCorr(U, phi). Null on a start from rest, where there is no old flux to correct against.
+    const DeviceBuffer<scalar>* ddtCorrInt = nullptr;
+    // ...and its boundary half, with rho's patch values: live on any patch whose U fixes no value
+    const DeviceBuffer<scalar>* ddtCorrBnd = nullptr;
+    const DeviceBuffer<scalar>* rhoBndFace = nullptr;
+    const DeviceBuffer<int>*    bndUFixesValue = nullptr;
+    // the mesh's periodic pair: its laplacian coefficients go into the matrix and its off-diagonal into
+    // every SpMV of the solve
+    DeviceCyclic*               cyc = nullptr;
+    // ...and phiHbyA ON THE PAIR. fvc::flux(HbyA) there is the two cells' HbyA interpolated and dotted
+    // with Sf (deviceCyclicFlux), which gpu::pressurePredictor does not yet produce -- so a caller with
+    // a pair and no such array is refused below rather than solved against a source that is missing the
+    // pair's own flux.
+    const DeviceBuffer<scalar>* phiHbyAIf = nullptr;
+    // ...and the three fields phig is built from, ON THE PAIR. phig = (stf - ghf*snGrad(rho))*rAUf*magSf
+    // is a whole-surfaceScalarField expression in pEqn.H:28-36, so a coupled patch has it like any
+    // other; the device's face arrays exclude coupled patches, so they arrive here separately. rAUf is
+    // NOT among them: it is fvc::interpolate(rAU) on that face, which the step builds from the pair's
+    // own weights (deviceCyclicFaceValue).
+    // fvc::ddtCorr ON THE PAIR, built by the caller beside the internal and boundary halves
+    const DeviceBuffer<scalar>* ddtCorrIf   = nullptr;
+    const DeviceBuffer<scalar>* stfIf       = nullptr;
+    const DeviceBuffer<scalar>* ghfIf       = nullptr;
+    const DeviceBuffer<scalar>* snGradRhoIf = nullptr;
+    // MRFZoneList::makeRelative(phiHbyA), pEqn.H:19
+    const std::vector<DeviceMRFZone>* mrf = nullptr;
+
+    bool   needReference = false;
+    int    pRefCell      = 0;
+    scalar pRefValue     = 0;
+
+    DeviceAlphaSolverControls solve;    // the case's fvSolution entry for p_rgh
+    // ...and where this corrector stands: `finalEntry` when `solve` is the case's Final entry (the last
+    // corrector's), `correctorBeforeFinal` when the next corrector is that one. The AMG-PCG's stop on a
+    // non-final solve that the Final one follows is capped where its entry names PCG with DIC
+    // (AmgPcgKnobs::dicInnerRelTol). A caller that says neither hands in the Final entry and nothing is capped.
+    bool finalEntry = true;
+    bool correctorBeforeFinal = false;
+    // `solver PCG; preconditioner DIC;` -- run OpenFOAM's own pair (deviceDICPCG) rather than the
+    // BiCGStab this step grew up on. It decides where a relTol 0.05 solve STOPS, which on capillaryRise
+    // was the whole of the device's 9.2e-04. `dic` is the level schedule: mesh-only, built once by the
+    // caller with buildDeviceDilu, and required when pcgDIC is set.
+    bool pcgDIC = false;
+    DeviceDilu* dic = nullptr;
+    // `solver GAMG;` -- OpenFOAM's own V-cycle on the device (device_gamg_solver.cuh), with that
+    // entry's controls; null on an entry that names another solver. The hierarchy is the mesh's and
+    // the caller owns it across steps. `dic` is required here too: it is the FINE level's schedule.
+    const GamgControls* gamg = nullptr;
+    // ...and `solver PCG; preconditioner { preconditioner GAMG; ... }`, which is a PCG whose
+    // preconditioner is that entry's V-cycles (devicePcgGamgSolve). Null on an entry that names
+    // another preconditioner; `gamg` and this one are never both set, since the entry names one solver.
+    const GamgPreconditionerControls* pcgGamg = nullptr;
+    DeviceGamgCache* gamgCache = nullptr;
+    // THE PRESSURE RULE (CLAUDE.md): every entry runs brae's AMG-preconditioned PCG instead, on this cache's
+    // hierarchy. Required unless BRAE_PRESSURE_CASE_SOLVER=1 asks for the case's own solver.
+    struct DeviceAmgPcgCache* amgPcg = nullptr;
+    // the coarsest-level solve of every V-cycle, in order; null = not kept
+    GamgSolveLog* gamgLog = nullptr;
+    // appended to, one record per solve -- the solver's own initial/final residual and iteration
+    // count, which is what a gate compares with OpenFOAM's "Solving for p_rgh" lines; null = not kept
+    std::vector<DeviceSolverPerf>* solveLog = nullptr;
+
+    // THE NON-ORTHOGONAL LOOP, as the host's pressureCorrector runs it (inter_peqn_cpp.cu):
+    // nNonOrthogonalCorrectors + 1 assemblies and solves of p_rgh, each pass's correction from the
+    // p_rgh the last one left. `solve`/`pcgDIC`/`gamg` above are the LAST pass's settings; every pass
+    // before it takes the plain `p_rgh` entry below, because p_rgh.select(finalInnerIter()) (pEqn.H:50)
+    // is Final only on the last non-orthogonal pass of the last corrector.
+    int nNonOrthogonalCorrectors = 0;
+    DeviceAlphaSolverControls solveInner;
+    bool pcgDICInner = false;
+    const GamgControls* gamgInner = nullptr;
+    const GamgPreconditionerControls* pcgGamgInner = nullptr;
+    // the case's laplacianSchemes for the p_rgh laplacian: `corrected` and a `limited` coefficient
+    // (0 = unlimited). Under `corrected` each pass adds the explicit correction from grad(p_rgh) and
+    // keeps its face flux for p_rghEqn.flux().
+    bool correctedLaplacian = false;
+    // ...and THAT gradient's own gradSchemes entry, which is no longer Gauss linear only: the two numbers
+    // a GradChoice holds (grad_choice.cuh), passed to deviceGradOf. RAS/electrostaticDeposition asks for
+    // `cellLimited leastSquares 1` on every gradient, and its host arm runs while its device arm refused.
+    bool   prghGradLeastSquares = false;
+    scalar prghGradCellLimitK = 0;
+    bool nonOrthCoeffs = false;   // nonOrthDeltaCoeffs without the correction -- inter_ueqn_cpp.cuh:181
+    scalar snGradLimitCoeff = 0;
+};
+
+// `phiHbyAInt`/`phiHbyABnd` come in as fvc::flux(HbyA) -- what the shared pressure predictor left --
+// and are advanced in place to phiHbyA + the two terms. `p_rgh` goes in as the previous value and comes
+// out solved. `phi`, `U` and `p` are rebuilt from it.
+//
+// Returns the solver's final normalised residual, so a caller can refuse a pass that did not converge.
+struct DevicePressureTaps
+{
+    DeviceBuffer<scalar> diag, upper, lower, source, iC, bC;
+    // phig and rAUf ON THE PAIR, for comparing the two arms across a coupled face
+    DeviceBuffer<scalar> phigIf, rAUfIf, ffIf, phiIf, phiHbyAIfPrePhig, cycJumpTap;
+    // phiHbyA on the INTERNAL faces before phig, the same point the host's PressureTaps::phiHbyA is
+    DeviceBuffer<scalar> nonOrthSource;       // the corrected laplacian's source correction
+    DeviceBuffer<scalar> phigIntTap;
+    DeviceBuffer<scalar> phigBndTap;
+    DeviceBuffer<scalar> divPhiHbyA;   // fvc::div(phiHbyA), before the multiply by V          // phig on the internal faces, as the host taps it
+    DeviceBuffer<scalar> phiHbyAIntPrePhig;
+    DeviceBuffer<scalar> phiHbyABndPrePhig;
+    std::vector<std::vector<scalar>> jumpHistory;   // one entry per assembly
+};
+
+scalar deviceInterPressureStep(
+    const DeviceMesh&                  dm,
+    const DeviceInterPressureInput&    in,
+    const DeviceInterPressureHooks&    hooks,
+    const DeviceBuffer<scalar>&        rAU,
+    const DeviceBuffer<scalar>&        HbyAX,
+    const DeviceBuffer<scalar>&        HbyAY,
+    const DeviceBuffer<scalar>&        HbyAZ,
+    DeviceBuffer<scalar>&              phiHbyAInt,
+    DeviceBuffer<scalar>&              phiHbyABnd,
+    DeviceBuffer<scalar>&              p_rgh,
+    DeviceBuffer<scalar>&              phiInt,
+    DeviceBuffer<scalar>&              phiBnd,
+    DeviceBuffer<scalar>&              UX,
+    DeviceBuffer<scalar>&              UY,
+    DeviceBuffer<scalar>&              UZ,
+    DeviceBuffer<scalar>&              p,
+    DevicePressureTaps*                taps = nullptr);
+
+} // namespace brae

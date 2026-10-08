@@ -1,3 +1,5 @@
+#include <stdexcept>
+#include <string>
 #include "cellLimitedGrad_cpp.cuh"
 
 #include <algorithm>
@@ -33,33 +35,51 @@ void limitFaceCmpt(scalar& limiter, scalar maxDelta, scalar minDelta, scalar ext
 // One pass of the whole scheme over `nCmpt` components. The caller supplies accessors so the scalar and
 // vector forms share this body rather than restating it -- the two differ only in how many components
 // the field has and in how the limiter multiplies the gradient.
-template <typename ValueAt, typename GradDotAt, typename ApplyLimiter>
+// OVER THE WHOLE MESH (`at` null) OR OVER A SUBSET'S FACES AND CELLS (fvc::GradSubset): the same loops handed
+// the listed faces and cells, with the subset's kept arrays in place of fresh ones. A cell's limiter takes
+// its own faces, the values across them and its own gradient, so at a listed cell the result is the whole
+// mesh's (held by tests/test_grad_subset.cu: the compiler clones this pass for the two forms); an unlisted
+// cell's entries are touched by the faces it shares with a listed one and mean nothing.
+template <typename ValueAt, typename PatchValueAt, typename GradDotAt, typename ApplyLimiter>
 void limitPass(
     label                       nC,
     int                         nCmpt,
     ValueAt                     valueAt,      // (cell, cmpt) -> scalar
+    PatchValueAt patchValueAt,                // (patch, face, cmpt) -> scalar, an uncoupled patch's value
     GradDotAt                   gradDotAt,    // (cell, cmpt, d) -> (d & grad_cmpt)
     ApplyLimiter                applyLimiter, // (cell, cmpt, limiter)
     scalar                      k,
     const PrimitiveMesh&        m,
     const FvGeometry&           g,
     const std::vector<FvPatch>& patches,
-    const std::vector<std::vector<std::vector<scalar>>>& patchValues)   // [patch][face][cmpt]
+    const fvc::GradSubset* at)
 {
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
     const std::vector<label>& nei = m.neighbour();
+    const label nCells = at ? static_cast<label>(at->cells.size()) : nC;
+    const label nFaces = at ? static_cast<label>(at->faces.size()) : nIf;
+    std::vector<scalar> maxWhole;
+    std::vector<scalar> minWhole;
+    std::vector<scalar> limiterWhole;
+    std::vector<scalar>& maxVsf = at ? at->maxVsf : maxWhole;
+    std::vector<scalar>& minVsf = at ? at->minVsf : minWhole;
+    std::vector<scalar>& limiter = at ? at->limiter : limiterWhole;
+    maxVsf.resize(static_cast<std::size_t>(nC));
+    minVsf.resize(static_cast<std::size_t>(nC));
+    limiter.resize(static_cast<std::size_t>(nC));
 
     for (int cmpt = 0; cmpt < nCmpt; ++cmpt)
     {
-        std::vector<scalar> maxVsf(nC), minVsf(nC);
-        for (label c = 0; c < nC; ++c)
+        for (label j = 0; j < nCells; ++j)
         {
+            const label c = at ? at->cells[static_cast<std::size_t>(j)] : j;
             maxVsf[c] = valueAt(c, cmpt);
             minVsf[c] = maxVsf[c];
         }
-        for (label f = 0; f < nIf; ++f)
+        for (label j = 0; j < nFaces; ++j)
         {
+            const label f = at ? at->faces[static_cast<std::size_t>(j)] : j;
             const scalar vo = valueAt(own[f], cmpt), vn = valueAt(nei[f], cmpt);
             maxVsf[own[f]] = std::fmax(maxVsf[own[f]], vn);
             minVsf[own[f]] = std::fmin(minVsf[own[f]], vn);
@@ -74,33 +94,59 @@ void limitPass(
             // 0, so cellLimitedGrad's boundary loops never see those faces. brae keeps the mesh's face
             // count on an empty patch, and including them here is not harmless -- see the face loop below.
             if (patches[pi].type == "empty") continue;
-            for (label i = 0; i < patches[pi].size; ++i)
+            // ...and a COUPLED patch its patchNeighbourField (cellLimitedGrad.C, the psf.coupled()
+            // branch): the cell across a cyclic, the AMI's weighted sum across a cyclicAMI -- never a
+            // stored patch value
+            const FvPatch& fp = patches[pi];
+            for (label i = 0; i < fp.size; ++i)
             {
-                const label c = patches[pi].faceCells[i];
-                const scalar vb = patchValues[pi][i][cmpt];
+                const label c = fp.faceCells[i];
+                scalar vb = 0;
+                if (!fp.coupled)
+                {
+                    vb = patchValueAt(pi, i, cmpt);
+                }
+                else if (fp.amiOffsets.empty())
+                {
+                    vb = valueAt(fp.nbrFaceCells[static_cast<std::size_t>(i)], cmpt);
+                }
+                else
+                {
+                    for (label sl = fp.amiOffsets[i]; sl < fp.amiOffsets[i + 1]; ++sl)
+                    {
+                        vb += fp.amiWeights[static_cast<std::size_t>(sl)]
+                             *valueAt(fp.amiNbrCells[static_cast<std::size_t>(sl)], cmpt);
+                    }
+                }
                 maxVsf[c] = std::fmax(maxVsf[c], vb);
                 minVsf[c] = std::fmin(minVsf[c], vb);
             }
         }
 
-        for (label c = 0; c < nC; ++c)
+        for (label j = 0; j < nCells; ++j)
         {
+            const label c = at ? at->cells[static_cast<std::size_t>(j)] : j;
             maxVsf[c] -= valueAt(c, cmpt);
             minVsf[c] -= valueAt(c, cmpt);
         }
         if (k < 1.0)
         {
-            for (label c = 0; c < nC; ++c)
+            for (label j = 0; j < nCells; ++j)
             {
+                const label c = at ? at->cells[static_cast<std::size_t>(j)] : j;
                 const scalar w = (1.0 / k - 1.0) * (maxVsf[c] - minVsf[c]);
                 maxVsf[c] += w;
                 minVsf[c] -= w;
             }
         }
 
-        std::vector<scalar> limiter(nC, 1.0);
-        for (label f = 0; f < nIf; ++f)
+        for (label j = 0; j < nCells; ++j)
         {
+            limiter[at ? at->cells[static_cast<std::size_t>(j)] : j] = 1.0;
+        }
+        for (label j = 0; j < nFaces; ++j)
+        {
+            const label f = at ? at->faces[static_cast<std::size_t>(j)] : j;
             const vector& Cf = g.Cf()[f];
             const label o = own[f], n = nei[f];
             limitFaceCmpt(limiter[o], maxVsf[o], minVsf[o], gradDotAt(o, cmpt, Cf - g.C()[o]));
@@ -122,8 +168,58 @@ void limitPass(
             }
         }
 
-        for (label c = 0; c < nC; ++c) applyLimiter(c, cmpt, limiter[c]);
+        for (label j = 0; j < nCells; ++j)
+        {
+            const label c = at ? at->cells[static_cast<std::size_t>(j)] : j;
+            applyLimiter(c, cmpt, limiter[c]);
+        }
     }
+}
+
+// The scalar limiter, over the whole mesh or at a subset: ONE call of limitPass with one set of accessors, so
+// both forms are the same instantiation of it. An uncoupled patch face's value is the caller's, or its face
+// cell's where the caller's list is short (a patch handed no values).
+void cellLimitScalar(
+    std::vector<vector>& grad,
+    const std::vector<scalar>& vsf,
+    const std::vector<std::vector<scalar>>& vsfBnd,
+    scalar k,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    const fvc::GradSubset* at)
+{
+    limitPass(
+        m.nCells(), 1,
+        [&](
+            label c,
+            int)
+        {
+            return vsf[c];
+        },
+        [&](
+            std::size_t pi,
+            label i,
+            int)
+        {
+            const std::vector<scalar>& b = vsfBnd[pi];
+            return i < static_cast<label>(b.size()) ? b[i] : vsf[patches[pi].faceCells[i]];
+        },
+        [&](
+            label c,
+            int,
+            const vector& d)
+        {
+            return dot(d, grad[c]);
+        },
+        [&](
+            label c,
+            int,
+            scalar lim)
+        {
+            grad[c] = grad[c] * lim;
+        },
+        k, m, g, patches, at);
 }
 
 } // namespace
@@ -138,22 +234,26 @@ void cellLimitGrad(
     const std::vector<FvPatch>&             patches)
 {
     if (k < SMALL_) return;   // OF: `if (k_ < SMALL) return tGrad;` -- the scheme is off
-    const label nC = m.nCells();
+    // (the patch values are read where the pass wants one: this built a vector a boundary FACE for them at
+    // every call -- 6,642 heap blocks a call on RAS/electrostaticDeposition)
+    cellLimitScalar(grad, vsf, vsfBnd, k, m, g, patches, nullptr);
+}
 
-    std::vector<std::vector<std::vector<scalar>>> pv(patches.size());
-    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+void cellLimitGradAt(
+    const fvc::GradSubset& at,
+    const std::vector<scalar>& vsf,
+    const std::vector<std::vector<scalar>>& vsfBnd,
+    scalar k,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    if (k < SMALL_) return;
+    if (at.grad.size() != static_cast<std::size_t>(m.nCells()))
     {
-        const std::vector<scalar>& b = vsfBnd[pi];
-        pv[pi].resize(patches[pi].size);
-        for (label i = 0; i < patches[pi].size; ++i) pv[pi][i] = {i < static_cast<label>(b.size()) ? b[i] : vsf[patches[pi].faceCells[i]]};
+        throw std::runtime_error("brae cellLimitGradAt: the subset holds no gradient of this mesh to limit.");
     }
-
-    limitPass(
-        nC, 1,
-        [&](label c, int) { return vsf[c]; },
-        [&](label c, int, const vector& d) { return dot(d, grad[c]); },
-        [&](label c, int, scalar lim) { grad[c] = grad[c] * lim; },
-        k, m, g, patches, pv);
+    cellLimitScalar(at.grad, vsf, vsfBnd, k, m, g, patches, &at);
 }
 
 void cellLimitGrad(
@@ -166,7 +266,18 @@ void cellLimitGrad(
 {
     if (k < SMALL_) return;
     std::vector<std::vector<scalar>> bnd(patches.size());
-    for (std::size_t pi = 0; pi < patches.size(); ++pi) bnd[pi] = vsf.boundary[pi]->value();
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        // a jump cyclic's patchNeighbourField is the cell LESS the jump, which the limiter's own
+        // neighbour stencil does not subtract
+        if (vsf.boundary[pi]->coupledJump())
+        {
+            throw std::runtime_error(
+                "brae: a cellLimited gradient of a field with a jump across the coupled patch '"
+                + patches[pi].name + "' is not ported.");
+        }
+        bnd[pi] = vsf.boundary[pi]->value();
+    }
     cellLimitGrad(grad, vsf.internal, bnd, k, m, g, patches);
 }
 
@@ -201,6 +312,13 @@ void cellLimitGrad(
     limitPass(
         nC, 3,
         [&](label c, int cmpt) { return (&vsf[c].x)[cmpt]; },
+        [&](
+            std::size_t pi,
+            label i,
+            int cmpt)
+        {
+            return pv[pi][i][cmpt];
+        },
         [&](label c, int cmpt, const vector& d)
         {
             const scalar* t = &grad[c].xx;
@@ -213,7 +331,7 @@ void cellLimitGrad(
             p[3] *= lim;
             p[6] *= lim;
         },
-        k, m, g, patches, pv);
+        k, m, g, patches, nullptr);
 }
 
 // ...and the field form, over the values the field currently holds.
@@ -227,7 +345,18 @@ void cellLimitGrad(
 {
     if (k < SMALL_) return;
     std::vector<std::vector<vector>> bnd(patches.size());
-    for (std::size_t pi = 0; pi < patches.size(); ++pi) bnd[pi] = vsf.boundary[pi]->value();
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        // a jump cyclic's patchNeighbourField is the cell LESS the jump, which the limiter's own
+        // neighbour stencil does not subtract
+        if (vsf.boundary[pi]->coupledJump())
+        {
+            throw std::runtime_error(
+                "brae: a cellLimited gradient of a field with a jump across the coupled patch '"
+                + patches[pi].name + "' is not ported.");
+        }
+        bnd[pi] = vsf.boundary[pi]->value();
+    }
     cellLimitGrad(grad, vsf.internal, bnd, k, m, g, patches);
 }
 

@@ -7,6 +7,7 @@
 // substitution this module refuses, a new kernel is written and the reason is recorded above it.
 #include "turbulence_transport.cuh"   // assembleScalarTransport: shared by every transported scalar
 #include "kEpsilon.cuh"
+#include "limitedSchemes_cpp.cuh"   // EqnDivScheme / EqnGradScheme, dereferenced below
 #include <array>
 #include <map>
 #include <string>
@@ -132,6 +133,8 @@ __global__ void epsReactionKernel(
     scalar        rDeltaT,
     const scalar* rhoOld,
     const scalar* epsOld,
+    // mesh().V0() on a moving mesh, null on a static one: the ddt SOURCE's volume
+    const scalar* V0,
     scalar*       diag,
     scalar*       source)
 {
@@ -157,7 +160,7 @@ __global__ void epsReactionKernel(
     if (rDeltaT > scalar(0))
     {
         diag[c]   += rDeltaT * r * v;
-        source[c] += rDeltaT * rhoOld[c] * epsOld[c] * v;
+        source[c] += rDeltaT * rhoOld[c] * epsOld[c] * (V0 ? V0[c] : v);
     }
 
     // `bounded`: - fvm::Sp(fvc::div(phi), epsilon), against the EQUATION's mass flux. It vanishes where
@@ -181,6 +184,8 @@ __global__ void kReactionKernel(
     scalar        rDeltaT,
     const scalar* rhoOld,
     const scalar* kOld,
+    // mesh().V0() on a moving mesh, null on a static one: the ddt SOURCE's volume
+    const scalar* V0,
     scalar*       diag,
     scalar*       source)
 {
@@ -206,7 +211,7 @@ __global__ void kReactionKernel(
     if (rDeltaT > scalar(0))
     {
         diag[c]   += rDeltaT * r * v;
-        source[c] += rDeltaT * rhoOld[c] * kOld[c] * v;
+        source[c] += rDeltaT * rhoOld[c] * kOld[c] * (V0 ? V0[c] : v);
     }
 
     if (bounded) diag[c] -= divPhi[c] * v;
@@ -464,6 +469,35 @@ __global__ void alphatKernel(
 // The wall-cell mask, from the per-wall-face cell list DeviceWallData already carries. isWallCell in
 // that struct answers "is this cell's epsilon fixed by a wall function", which is the same question --
 // it is copied rather than recomputed so the two cannot drift.
+// iC[f] += gamma_b*deltaCoeffs*magSf on the wall-function faces: the laplacian's fixedValue
+// internalCoeff, which OpenFOAM's epsilonWallFunction patch carries into relax()
+__global__ void wallLaplacianCoeffKernel(
+    int nB,
+    const label* __restrict__ wfMask,
+    const scalar* __restrict__ gammaBnd,
+    const scalar* __restrict__ deltaCoeffs,
+    const scalar* __restrict__ magSf,
+    scalar* __restrict__ iC)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= nB) return;
+    if (!wfMask[f]) return;
+    iC[f] += gammaBnd[f] * deltaCoeffs[f] * magSf[f];
+}
+
+// `+ fvOptions(epsilon)` / `+ fvOptions(k)` for an option whose addSup is -fvm::Sp(coeff, field): on the
+// right of the equation, so the matrix takes diag += V*coeff (fvOptions_cpp.cu, the scalar addSup)
+__global__ void fvOptionsSpKernel(
+    int nC,
+    const scalar* V,
+    const scalar* coeff,
+    scalar* diag)
+{
+    const int c = blockDim.x*blockIdx.x + threadIdx.x;
+    if (c >= nC) return;
+    diag[c] += V[c]*coeff[c];
+}
+
 __global__ void copyMaskKernel(int nC, const label* src, label* dst)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -522,12 +556,22 @@ void refuseUnported(const KEpsilonInput& in)
             "nearWallDist only fills y on `wall` patches, so the wall treatment would divide by an "
             "unset distance.");
     }
+    // THE `bounded` SPLIT IS STILL REFUSED, and the reason it used to give was WRONG rather than the
+    // refusal being wrong. It said "the host reference carries ONE `bounded` flag for both": the host has
+    // honoured it per equation since the convection split (kEpsilon_cpp.cu:563/:615 read eDiv.bounded,
+    // :834 k's), and these kernels have taken it per equation all along (:811 passes boundedEps, :864
+    // boundedK). So the code on both sides is ready and this throw guards nothing real.
+    //
+    // IT STAYS until its own unit, because lifting it is not free: tests/test_rho_kepsilon_cuda.cu's
+    // refusal table asserts it, and that arm has to become a NUMBERS arm -- bound one equation, not the
+    // other, and show the answer differs from both `bounded` and neither -- before the throw comes out.
+    // Removing the throw and leaving that arm expecting it turns a green gate red for no measured reason.
     if (in.boundedK != in.boundedEps)
     {
         throw std::runtime_error(
-            "kEpsilon(cuda): the case bounds one of div(phi,k) / div(phi,epsilon) and not the other. "
-            "The host reference carries ONE `bounded` flag for both, so honouring the split here would "
-            "compare against a reference that cannot express it.");
+            "kEpsilon(cuda): the case bounds one of div(phi,k) / div(phi,epsilon) and not the other. The "
+            "kernels and the host reference both carry it per equation; this throw is waiting for the gate "
+            "arm that would hold the split, not for the code.");
     }
     if (!in.phiInt || !in.phiBnd || !in.phiByRhoInt || !in.phiByRhoBnd)
     {
@@ -582,15 +626,80 @@ void production(
     // exactly these and are already gated.
     // ...through the case's grad(U) scheme (kEpsilon.C:237): leastSquares where it resolves so, then
     // cellLimited where fvSchemes says so (kEpsilon_cpp.cu:260-262 is the reference).
-    if (in.co.gradULeastSq) deviceLeastSquaresGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU);
-    else                    deviceGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU);
-    if (in.co.gradULimitK > scalar(0)) deviceCellLimitGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU, in.co.gradULimitK);
+    // ...WITH THE PAIR. fvc::grad sums a coupled face like any other patch's (fvc.cu's gaussGrad), and
+    // the production term reads this gradient in every cell -- including the pair's own, where a
+    // gradient built without it is the gradient of a field with a wall there.
+    if (in.co.gradULeastSq)
+    {
+        if (in.cyc && in.cyc->n > 0)
+        {
+            throw std::runtime_error(
+                "kEpsilon(cuda): the case asks for a leastSquares grad(U) and the mesh has a periodic "
+                "pair. deviceLeastSquaresGradU does not carry an interface, so the pair's cells would "
+                "get a gradient fitted without it. The Gauss form does; the host closure carries both.");
+        }
+        deviceLeastSquaresGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU);
+    }
+    else
+    {
+        deviceGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU, /*ami=*/nullptr, in.cyc);
+    }
+    if (in.co.gradULimitK > scalar(0))
+        deviceCellLimitGradU(dm, dbU, *in.Ux, *in.Uy, *in.Uz, st.gradU, in.co.gradULimitK, in.cyc);
     deviceGByNuFromGradU(st.gradU, nC, st.gByNu);
 
     // divU is the DILATATION and comes from the VOLUMETRIC flux; divPhi is the EQUATION's own mass-flux
     // divergence and is only read by `bounded`. In the incompressible lineage these are one field.
     deviceDiv(dm, *in.phiByRhoInt, *in.phiByRhoBnd, st.divU);
     deviceDiv(dm, *in.phiInt, *in.phiBnd, st.divPhi);
+    // ...and on a MOVING mesh divU is the divergence of the ABSOLUTE flux, div(phi + mesh.phi())
+    // (kEpsilon.C:232-235; the host reference adds meshPhi face by face, kEpsilon_cpp.cu). The volumetric
+    // flux's divergence only: `bounded`'s divPhi is the equation's own flux, which OpenFOAM leaves relative.
+    if ((in.meshPhiInt != nullptr) != (in.meshPhiBnd != nullptr))
+        throw std::runtime_error(
+            "brae kEpsilon (device): the mesh flux's internal and boundary halves come together or not at all.");
+    if (in.meshPhiInt && in.meshPhiBnd)
+    {
+        DeviceBuffer<scalar> absInt;
+        DeviceBuffer<scalar> absBnd;
+        deviceCopy(absInt, *in.phiByRhoInt);
+        deviceCopy(absBnd, *in.phiByRhoBnd);
+        deviceAxpy(scalar(1), *in.meshPhiInt, absInt);
+        deviceAxpy(scalar(1), *in.meshPhiBnd, absBnd);
+        deviceDiv(dm, absInt, absBnd, st.divU);
+    }
+    // ...and the PAIR's faces, which fvc::div sums into their own cell like any other patch's
+    // (fvc.cu:548-550). Each divergence takes ITS OWN flux there: divU the volumetric one and divPhi
+    // the equation's, which are one field only in the incompressible lineage.
+    if (in.cyc && in.cyc->n > 0)
+    {
+        if (!in.cycPhi || !in.cycPhiByRho)
+        {
+            throw std::runtime_error(
+                "kEpsilon(cuda): the mesh has a periodic pair and the caller gave no flux for it. "
+                "divU takes the VOLUMETRIC flux on those faces and divPhi the equation's own; the "
+                "internal-face arrays cannot stand in for either.");
+        }
+        // ...the ABSOLUTE one on a moving mesh, as on the internal faces above
+        if (in.meshPhiInt && in.meshPhiBnd)
+        {
+            if (!in.meshPhiIf || static_cast<int>(in.meshPhiIf->size()) != in.cyc->n)
+            {
+                throw std::runtime_error(
+                    "kEpsilon(cuda): a moving mesh with a coupled pair and no mesh flux on the pair's "
+                    "faces. divU is the divergence of the absolute flux there too.");
+            }
+            DeviceBuffer<scalar> absIf;
+            deviceCopy(absIf, *in.cycPhiByRho);
+            deviceAxpy(scalar(1), *in.meshPhiIf, absIf);
+            deviceCyclicAddDivFlux(*in.cyc, absIf, dm.V, st.divU);
+        }
+        else
+        {
+            deviceCyclicAddDivFlux(*in.cyc, *in.cycPhiByRho, dm.V, st.divU);
+        }
+        deviceCyclicAddDivFlux(*in.cyc, *in.cycPhi, dm.V, st.divPhi);
+    }
 
     // G = nut*GbyNu, captured BEFORE the wall replacement -- which is where OpenFOAM writes it too.
     deviceHadamard(st.G, nut, st.gByNu);
@@ -644,7 +753,11 @@ void assembleTransport(
     scalar                      sigma,
     const KEpsilonInput&        in,
     const DeviceBuffer<scalar>* bndValues = nullptr,
-    const char*                 stageTag  = nullptr)
+    const char*                 stageTag  = nullptr,
+    // THIS EQUATION'S OWN entries, or null for "take k's" -- see KEpsilonInput::epsDiv. Last and
+    // defaulted, so the k call below is unchanged and reads k's as it always did.
+    const cpu::EqnDivScheme*    eqnDiv    = nullptr,
+    const cpu::EqnGradScheme*   eqnGrad   = nullptr)
 {
     const int nC = dm.nCells;
     const int nB = db.n;
@@ -669,18 +782,31 @@ void assembleTransport(
     turbulence::TransportScheme sc;
     sc.phiInt             = in.phiInt;
     sc.phiBnd             = in.phiBnd;
-    sc.limitedLinear      = in.limitedLinear;
-    sc.limiterCoeff       = in.limiterCoeff;
-    sc.limGradK           = in.limGradK;
-    sc.limGradLeastSq     = in.limGradLeastSq;
-    sc.linearUpwind       = in.linearUpwind;
-    sc.luGradK            = in.luGradK;
+    sc.limitedLinear      = eqnDiv ? eqnDiv->limitedLinear : in.limitedLinear;
+    sc.limiterCoeff       = eqnDiv ? eqnDiv->limiterCoeff  : in.limiterCoeff;
+    // the LIMITER's gradient: the case's grad(<field>) entry, which lives in `co` and only there.
+    // It used to be a second pair of fields on this input struct, and interFoam's site filled
+    // neither -- so a case naming `grad(k) cellLimited` limited nothing (1.9e-01 off OpenFOAM's
+    // assembled system on RAS/damBreak). Same entry as gradFieldLimitK below: OpenFOAM resolves the
+    // limiter's gradient (LimitedScheme.C:56-59) and correctedSnGrad's (correctedSnGrad.C:52-55)
+    // through the same gradSchemes lookup.
+    sc.limGradK           = eqnGrad ? eqnGrad->cellLimitK   : in.co.gradKLimitK;
+    sc.limGradLeastSq     = eqnGrad ? eqnGrad->leastSquares  : in.co.gradKLeastSq;
+    sc.linearUpwind       = eqnDiv  ? eqnDiv->linearUpwind   : in.linearUpwind;
+    sc.luGradK            = eqnDiv  ? eqnDiv->luGradK        : in.luGradK;
     sc.correctedLaplacian = in.correctedLaplacian;
-    sc.gradFieldLimitK    = in.co.gradKLimitK;
-    sc.gradFieldLeastSq   = in.co.gradKLeastSq;
+    sc.nonOrthCoeffs = in.nonOrthCoeffs;
+    sc.gradFieldLimitK    = eqnGrad ? eqnGrad->cellLimitK  : in.co.gradKLimitK;
+    sc.gradFieldLeastSq   = eqnGrad ? eqnGrad->leastSquares : in.co.gradKLeastSq;
     sc.snGradLimitCoeff   = in.snGradLimitCoeff;
     sc.bndValues          = bndValues;
     sc.stageTag           = stageTag;
+    // THE PAIR, with the diffusivity as a CELL field: a coupled face takes fvc::interpolate's value,
+    // the two cells' (kEpsilon_cpp.cu:152-158), and gammaBnd above is built from nut's PATCH values,
+    // which is a different number there.
+    sc.cyc       = in.cyc;
+    sc.gammaCell = in.cyc ? &Dcell : nullptr;
+    sc.cycPhi    = in.cycPhi;
     turbulence::assembleScalarTransport(M, dm, db, field, gammaFace, gammaBnd, sc);
 }
 
@@ -710,6 +836,27 @@ void assembleEpsEqn(
     }
     const scalar* rhoOldP = (in.rhoOldCell && in.rhoOldCell->size()) ? in.rhoOldCell->data()
                                                                        : in.rhoCell->data();
+    // mesh().V0(), the ddt source's volume on a moving mesh. Under CrankNicolson the scheme's moving
+    // branch takes V0 AND V00 (deviceCnFvmDdt below), so the two come together.
+    if (in.V0 && in.V0->size() != static_cast<std::size_t>(nC))
+        throw std::runtime_error("brae kEpsilon (device): V0 is not one value per cell.");
+    if (in.V0 && in.cn && (!in.V00 || in.V00->size() != static_cast<std::size_t>(nC)))
+        throw std::runtime_error(
+            "brae kEpsilon (device): CrankNicolson's fvm::ddt on a moving mesh is the scheme's moving branch "
+            "(CrankNicolsonDdtScheme.C:862-893), which weights the old-old level by V00; the caller gave V0 alone.");
+    const scalar* v0P = in.V0 ? in.V0->data() : nullptr;
+    // the scheme's moving branch, unless the gate's control puts the static one in its place
+    const bool cnMoving = in.V0 && std::getenv("BRAE_CONTROL_DEVICE_CN_CLOSURE_STATIC") == nullptr;
+    if (in.V0 && in.cn && !cnMoving)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            std::printf("  *** CONTROL MODE: the device kEpsilon's CrankNicolson ddt takes the static branch on a "
+                        "moving mesh. This run is deliberately wrong. ***\n");
+            said = true;
+        }
+    }
 
     // epsilon_.boundaryFieldRef().updateCoeffs(). turbulentMixingLengthDissipationRateInlet recomputes
     // its refValue from k's CURRENT patch values here, and the flux switch resolves inletOutlet -- both
@@ -726,18 +873,33 @@ void assembleEpsEqn(
         deviceUpdateTurbulentInletSecond(dbK, *in.turbInletEpsMask, *in.turbInletEpsLen,
                                          in.co.Cmu, dbEps);
     }
-    deviceUpdateInletOutlet(dbEps, *in.phiBnd);
+    deviceUpdateInletOutlet(dbEps, in.bcPhiBnd ? *in.bcPhiBnd : *in.phiBnd);
 
+    // EPSILON'S OWN entries reach the assembly here; k's call below passes none and so reads k's.
     assembleTransport(E, st.DepsilonEff, st.gammaEpsFace, st.gammaEpsBnd, dm, dbEps, epsilon, nut,
-                      in.co.sigmaEps, in, epsBndValues, /*stageTag=*/"eps");
+                      in.co.sigmaEps, in, epsBndValues, /*stageTag=*/"eps", in.epsDiv, in.epsGrad);
 
     epsReactionKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), in.rhoCell->data(), st.gByNu.data(), k.data(),
                                          epsilon.data(), st.divU.data(), st.divPhi.data(),
                                          in.co.C1, in.co.C2, in.co.C3, in.co.Cmu,
                                          in.boundedEps ? 1 : 0,
-                                         in.rDeltaT, rhoOldP, epsOld ? epsOld->data() : nullptr,
+                                         // the Euler ddt term, unless the scheme is CrankNicolson's
+                                         in.cn ? scalar(0) : in.rDeltaT, rhoOldP, epsOld ? epsOld->data() : nullptr,
+                                         v0P,
                                          E.diag.data(), E.source.data());
     cudaCheck(cudaGetLastError(), "kEpsilon eps reaction");
+    if (in.cn)
+    {
+        // fvm::ddt(alpha, rho, epsilon_) under CrankNicolson, "ddt0(rho,epsilon)"
+        if (!in.cnDdt0Eps || !in.epsOO || !epsOld || !in.rhoOOCell)
+            throw std::runtime_error("brae kEpsilon (device): CrankNicolson needs epsilon's ddt0 field, its old-old level and rho's.");
+        const DeviceBuffer<scalar>* old[1] = {epsOld};
+        const DeviceBuffer<scalar>* oo[1] = {in.epsOO};
+        DeviceBuffer<scalar>* src[1] = {&E.source};
+        deviceCnFvmDdt(*in.cn, *in.cnDdt0Eps, in.rhoCell, in.rhoOldCell ? in.rhoOldCell : in.rhoCell, in.rhoOOCell,
+                       1, old, oo, dm.V, E.diag, src, cnMoving ? in.V0 : nullptr, cnMoving ? in.V00 : nullptr,
+                       in.cnPatchEps);
+    }
 }
 
 
@@ -762,13 +924,24 @@ void assembleKEqn(
     }
     const scalar* rhoOldP = (in.rhoOldCell && in.rhoOldCell->size()) ? in.rhoOldCell->data()
                                                                        : in.rhoCell->data();
+    // mesh().V0(), the ddt source's volume on a moving mesh. Under CrankNicolson the scheme's moving
+    // branch takes V0 AND V00 (deviceCnFvmDdt below), so the two come together.
+    if (in.V0 && in.V0->size() != static_cast<std::size_t>(nC))
+        throw std::runtime_error("brae kEpsilon (device): V0 is not one value per cell.");
+    if (in.V0 && in.cn && (!in.V00 || in.V00->size() != static_cast<std::size_t>(nC)))
+        throw std::runtime_error(
+            "brae kEpsilon (device): CrankNicolson's fvm::ddt on a moving mesh is the scheme's moving branch "
+            "(CrankNicolsonDdtScheme.C:862-893), which weights the old-old level by V00; the caller gave V0 alone.");
+    const scalar* v0P = in.V0 ? in.V0->data() : nullptr;
+    // the scheme's moving branch, unless the gate's control puts the static one in its place
+    const bool cnMoving = in.V0 && std::getenv("BRAE_CONTROL_DEVICE_CN_CLOSURE_STATIC") == nullptr;
 
     // k_'s own boundary refresh: turbulentIntensityKineticEnergyInlet reads U's CURRENT patch values.
     if (in.turbInletKMask && in.turbInletKInt)
     {
         deviceUpdateTurbulentInletK(dbU, *in.turbInletKMask, *in.turbInletKInt, dbK);
     }
-    deviceUpdateInletOutlet(dbK, *in.phiBnd);
+    deviceUpdateInletOutlet(dbK, in.bcPhiBnd ? *in.bcPhiBnd : *in.phiBnd);
 
     assembleTransport(K, st.DkEff, st.gammaKFace, st.gammaKBnd, dm, dbK, k, nut, in.co.sigmaK, in, kBndValues,
                       /*stageTag=*/"k");
@@ -776,9 +949,22 @@ void assembleKEqn(
     kReactionKernel<<<nBlk(nC), TPB>>>(nC, dm.V.data(), in.rhoCell->data(), st.G.data(), k.data(),
                                        epsilon.data(), st.divU.data(), st.divPhi.data(),
                                        in.boundedK ? 1 : 0,
-                                       in.rDeltaT, rhoOldP, kOld ? kOld->data() : nullptr,
+                                       in.cn ? scalar(0) : in.rDeltaT, rhoOldP, kOld ? kOld->data() : nullptr,
+                                       v0P,
                                        K.diag.data(), K.source.data());
     cudaCheck(cudaGetLastError(), "kEpsilon k reaction");
+    if (in.cn)
+    {
+        // fvm::ddt(alpha, rho, k_) under CrankNicolson, "ddt0(rho,k)"
+        if (!in.cnDdt0K || !in.kOO || !kOld || !in.rhoOOCell)
+            throw std::runtime_error("brae kEpsilon (device): CrankNicolson needs k's ddt0 field, its old-old level and rho's.");
+        const DeviceBuffer<scalar>* old[1] = {kOld};
+        const DeviceBuffer<scalar>* oo[1] = {in.kOO};
+        DeviceBuffer<scalar>* src[1] = {&K.source};
+        deviceCnFvmDdt(*in.cn, *in.cnDdt0K, in.rhoCell, in.rhoOldCell ? in.rhoOldCell : in.rhoCell, in.rhoOOCell,
+                       1, old, oo, dm.V, K.diag, src, cnMoving ? in.V0 : nullptr, cnMoving ? in.V00 : nullptr,
+                       in.cnPatchK);
+    }
 }
 
 
@@ -990,7 +1176,13 @@ void finishAndSolve(
     const KEpsilonInput&        in,
     scalar&                     residualOut,
     const std::string&          dumpPrefix,
-    bool                        gs)
+    bool gs,
+    DeviceSolverPerf* perfOut,
+    // THIS EQUATION'S OWN SOLVER SETTING, or null for k's. `fvMatrix::solve()` looks the dictionary up by
+    // FIELD name (fvMatrix.C:1536-1542), so epsilonFinal need not match kFinal -- kEpsilon.C:268 solves
+    // epsilon and :288 solves k, each selecting its own entry. ONE builder below still fills `sv` from
+    // `in`; the override replaces it wholesale rather than field by field, so the two cannot half-mix.
+    const turbulence::SolveControls* ovr = nullptr)
 {
     turbulence::SolveControls sv;
     sv.tol         = in.tol;
@@ -1003,8 +1195,9 @@ void finishAndSolve(
     sv.polyDeg     = in.polyDeg;
     sv.gsColour    = in.gsColour;
     sv.colouring   = in.colouring;
+    sv.pbicg       = in.pbicgKE;
     turbulence::solveScalarEqn(M, field, dm, relaxEquation, alpha, fvoMask, fvoVal, wallMask, wallVal,
-                               sv, residualOut, dumpPrefix, gs);
+                               ovr ? *ovr : sv, residualOut, dumpPrefix, gs, perfOut, in.cyc);
 }
 
 } // namespace
@@ -1082,8 +1275,8 @@ void correct(
     DeviceBuffer<scalar> kOld, epsOld;
     if (in.rDeltaT > scalar(0))
     {
-        deviceCopy(kOld, k);
-        deviceCopy(epsOld, epsilon);
+        deviceCopy(kOld, in.kOldIn ? *in.kOldIn : k);
+        deviceCopy(epsOld, in.epsOldIn ? *in.epsOldIn : epsilon);
     }
 
     production(st, dm, dbU, nut, in);
@@ -1091,6 +1284,20 @@ void correct(
     if (dbEps.n && in.wfBndMask && in.wfBndMask->size() == static_cast<std::size_t>(dbEps.n))
     {
         turbulence::wallFacesTakeCell(dm, *in.wfBndMask, epsilon, epsBndLast);
+    }
+    // a cold start's epsilon.oldTime(), created HERE -- after the wall function's write to the wall cells
+    // and its patches (KEpsilonInput::epsOldCreated; kEpsilon_cpp.cu does it at the same point)
+    if (in.epsOldCreated)
+    {
+        deviceCopy(*in.epsOldCreated, epsilon);
+        if (epsOld.size())
+        {
+            deviceCopy(epsOld, epsilon);
+        }
+        if (in.epsOldBndCreated && dbEps.n)
+        {
+            deviceCopy(*in.epsOldBndCreated, epsBndLast);
+        }
     }
 
     // ---- the epsilon equation ----------------------------------------------------------------
@@ -1105,6 +1312,17 @@ void correct(
         PressureMatrix& E = turbulenceMatrix(dm, 0);
         assembleEpsEqn(E, st, dm, dbEps, dbK, epsilon, k, nut, in, dbEps.n ? &epsBndLast : nullptr,
                        epsOld.size() ? &epsOld : nullptr);
+        // + fvOptions(alpha, rho, epsilon_), kEpsilon.C:258: the last term on the right, ahead of relax()
+        // ONE PASS PER OPTION, in the list's order: the sum over the list, added the way the host's
+        // loop adds it (one diag += V*coeff per option, never V*(sum of coeffs))
+        for (const DeviceBuffer<scalar>* sp : in.fvoSpEps)
+        {
+            if (!sp || sp->size() != static_cast<std::size_t>(dm.nCells))
+                throw std::runtime_error("brae kEpsilon (device): fvoSpEps must be one coefficient per cell.");
+            fvOptionsSpKernel<<<nBlk(dm.nCells), TPB>>>(dm.nCells, dm.V.data(), sp->data(),
+                                                        E.diag.data());
+            cudaCheck(cudaGetLastError(), "kEpsilon fvOptions(epsilon)");
+        }
 
         // The wall constraint's VALUE IS THE CURRENT FIELD, not the eps0 array -- OpenFOAM's
         // epsilonWallFunction::manipulateMatrix is
@@ -1119,10 +1337,25 @@ void correct(
         //
         // wallTreatment has already written eps0 into epsilon for every wall cell, so on a case with no
         // constraint this reads exactly what it read before.
+        // epsilonWallFunction IS A fixedValue PATCH in OpenFOAM, so at relax() its faces still carry
+        // the laplacian's fixedValue coefficient and the relaxed diagonal is
+        // max(|D0 + ic|, sumOff)/alpha - ic, not D0/alpha. See kEpsilon_cpp.cu, where it was found and
+        // measured (interFoam RAS/damBreak at relaxation 0.7: epsilon equal to 1e-13 while every
+        // residual of its solve sat 1.1e-04 from OpenFOAM's). The rows are the ones setValues pins
+        // next, so only normFactor -- and so where the solve stops -- can see it.
+        if (in.relaxEquationEps && in.relaxEps > scalar(0) && dbEps.n && in.wfBndMask)
+        {
+            wallLaplacianCoeffKernel<<<nBlk(dbEps.n), TPB>>>(dbEps.n, in.wfBndMask->data(),
+                                                             st.gammaEpsBnd.data(),
+                                                             dbEps.deltaCoeffs.data(),
+                                                             dbEps.magSf.data(), E.iC.data());
+            cudaCheck(cudaGetLastError(), "kEpsilon wall laplacian coefficient");
+        }
         finishAndSolve(E, epsilon, dm, in.relaxEquationEps, in.relaxEps,
                        in.fvoEpsMask, in.fvoEpsVal,
                        &st.isWallCell, &epsilon, in, st.epsResidual,
-                       dumpDir.empty() ? std::string() : dumpDir + "eps", in.gsEps);
+                       dumpDir.empty() ? std::string() : dumpDir + "eps", in.gsEps, &st.epsPerf,
+                       in.epsSolve);
 
         boundField(epsilon, dm, dbEps, in.co.epsilonMin, "epsilon");
     }
@@ -1132,12 +1365,22 @@ void correct(
         PressureMatrix& K = turbulenceMatrix(dm, 1);      // FP-10: persistent, see the epsilon equation
         assembleKEqn(K, st, dm, dbK, dbU, k, epsilon, nut, in, dbK.n ? &kBndLast : nullptr,
                      kOld.size() ? &kOld : nullptr);
+        // + fvOptions(alpha, rho, k_), kEpsilon.C:279
+        for (const DeviceBuffer<scalar>* sp : in.fvoSpK)   // one pass per option, as for epsilon
+        {
+            if (!sp || sp->size() != static_cast<std::size_t>(dm.nCells))
+                throw std::runtime_error("brae kEpsilon (device): fvoSpK must be one coefficient per cell.");
+            fvOptionsSpKernel<<<nBlk(dm.nCells), TPB>>>(dm.nCells, dm.V.data(), sp->data(),
+                                                        K.diag.data());
+            cudaCheck(cudaGetLastError(), "kEpsilon fvOptions(k)");
+        }
 
         // No wall mask: see finishAndSolve.
         finishAndSolve(K, k, dm, in.relaxEquationK, in.relaxK,
                        in.fvoKMask, in.fvoKVal,
                        nullptr, nullptr, in, st.kResidual,
-                       dumpDir.empty() ? std::string() : dumpDir + "k", in.gsK);
+                       dumpDir.empty() ? std::string() : dumpDir + "k", in.gsK, &st.kPerf,
+                       /*ovr=*/nullptr);   // k always takes kFinal, which `in` carries
 
         boundField(k, dm, dbK, in.co.kMin, "k");
     }

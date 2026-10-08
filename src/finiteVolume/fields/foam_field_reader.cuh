@@ -23,6 +23,27 @@
 
 namespace brae {
 
+// Foam::Switch on a TOKEN, the boundaryField form. FoamDict::switchOr does this for a dictionary entry;
+// the patch dictionaries here are read straight off a TokenStream, so they need the same table.
+// Switch.C:92-137: `false no off none 0 f n` and `true yes on any 1 t y`, and anything else is
+// OpenFOAM's `Unknown switch <str>` FatalError -- NOT false. Five patch switches in this file tested
+// `{true,yes,on,1}` and read every other word, including OpenFOAM's own `any`, `t` and `y`, as FALSE:
+// each of those silently runs a BC feature the case switched ON.
+inline bool ofSwitchToken(
+    const std::string& v,
+    const char*        key)
+{
+    if (v == "true" || v == "yes" || v == "on" || v == "any" || v == "1" || v == "t" || v == "y")
+    {
+        return true;
+    }
+    if (v == "false" || v == "no" || v == "off" || v == "none" || v == "0" || v == "f" || v == "n")
+    {
+        return false;
+    }
+    throw std::runtime_error("Unknown switch " + v + " for entry `" + std::string(key) + "`");
+}
+
 template <typename T> inline T readFoamValue(TokenStream& ts);
 template <> inline scalar readFoamValue<scalar>(TokenStream& ts) { return ts.nextScalar(); }
 template <> inline vector readFoamValue<vector>(TokenStream& ts)
@@ -97,11 +118,23 @@ struct PatchFieldData
     bool           hasPatchExpr = false;
     Function1      p0Function1;              // uniformTotalPressure p0(t); empty unless hasP0Function1
     bool           hasP0Function1 = false;
-    // pressureInletOutletVelocity's optional `tangentialVelocity`. OF sets
-    // refValue = tv - n*(n & tv) (pressureInletOutletVelocityFvPatchVectorField.C:135); brae leaves the
-    // tangential refValue at zero, so honouring the key would need per-face storage it does not have.
-    // Recorded so it can be refused instead of quietly changing the boundary condition.
+    // pressureInletOutletVelocity's optional `tangentialVelocity`, read as OpenFOAM reads it:
+    // vectorField("tangentialVelocity", dict, p.size()) (pressureInletOutletVelocityFvPatchVectorField.C:90),
+    // `uniform`, `nonuniform` or `$internalField`. OpenFOAM turns it into refValue = tv - n*(n & tv) once,
+    // at construction (:130-136). The shared factory still REFUSES the entry: only a solver that claims it
+    // and hands it to the patch field (interFoam, claimTangentialVelocity) runs it.
     bool           hasTangentialVelocity = false;
+    bool           tvUniform = false;
+    T              tvUniformValue{};
+    std::vector<T> tvValues;
+    // the entry was there and NOT parsed: written in the bare `(a b c)` form, or before `type`, or on a
+    // patch that is not pressureInletOutletVelocity -- see the reader branch and the claim
+    bool           tvBare = false;
+    bool           tvUnparsed = false;
+    // `patchType`: OpenFOAM keeps an entry's own type on a constraint patch whose type it names instead of
+    // replacing it by the constraint (pointPatchFieldNew.C:143-161, fvPatchFieldNew.C). Recorded so the
+    // readers that honour the constraint can refuse it.
+    std::string    patchType;
     // fixedGradient (and the heat-flux BCs derived from it): the prescribed normal gradient.
     // Plain `mixed` (Robin) carries refValue + refGradient + valueFraction. refGradient shares the
     // gradient* slots below; these two are its own. Distinct from inletValue*, which inletOutlet and the
@@ -116,6 +149,9 @@ struct PatchFieldData
     // may differ; brae applies one model-wide value per closure. Parsed so a per-patch value can be
     // ANNOUNCED instead of skipped (item 16h); honouring it per patch is queued as 16h-port.
     scalar         wfCmu = 0.09, wfKappa = 0.41, wfE = 9.8;
+    // omegaWallFunction's own, from the PATCH dict (omegaWallFunctionFvPatchScalarField.C:408)
+    scalar         wfBeta1 = 0.075;
+    bool           hasWfBeta1 = false;
     bool           hasWfCmu = false, hasWfKappa = false, hasWfE = false;
     // ...and the VISCOUS/INERTIAL SUBLAYER BLENDING those four wall functions also read from the patch
     // dictionary (wallFunctionBlenders.C:59-82: `blending`, one of stepwise/max/binomial/exponential/
@@ -125,9 +161,33 @@ struct PatchFieldData
     std::string    wfBlending;                 // the `blending` word as written, empty when absent
     scalar         wfBlendN = 0.0;
     bool           hasWfBlendN = false;
+    // nutkRoughWallFunction's roughness height and constant, per face. Both are MUST_READ scalarFields --
+    // `uniform <v>` or `nonuniform List<scalar> N (...)`, anything else OpenFOAM's FatalIOError
+    // (nutkRoughWallFunctionFvPatchScalarField.C:179-180, Field.C:213-268) -- and constant in time: not
+    // PatchFunction1s. A form the reader cannot take is named in roughFormError and refused by the factory
+    // row, which alone knows the type needs them.
+    // outletPhaseMeanVelocity's target phase-mean outflow speed, MUST_READ (dict.get<scalar>("Umean"),
+    // outletPhaseMeanVelocityFvPatchVectorField.C:74); its `alpha` goes to vhAlphaName
+    bool           hasOpmvUmean = false;
+    scalar         opmvUmean = 0;
+    bool           hasRoughKs = false;
+    bool           roughKsUniform = false;
+    scalar         roughKsUniformValue = 0;
+    std::vector<scalar> roughKsValues;
+    bool           hasRoughCs = false;
+    bool           roughCsUniform = false;
+    scalar         roughCsUniformValue = 0;
+    std::vector<scalar> roughCsValues;
+    std::string    roughFormError;
     bool           vfUniform        = false;
     scalar         vfUniformValue   = 0;
     std::vector<scalar> vfValues;
+
+    // alphaContactAngle (interFoam). theta0 in DEGREES, < 0 when the patch is not one; `limit` is the
+    // word as written, because it selects between four different evaluate() bodies and defaulting it
+    // would run a different one from the case's.
+    scalar         contactTheta0 = -1;
+    std::string    contactLimit;
 
     bool           hasGradient    = false;
     bool           gradientUniform = false;
@@ -157,6 +217,12 @@ struct PatchFieldData
     // does not implement. Recorded so it can be refused by name instead of silently running low-speed.
     std::string    psiName      = "none";
     scalar         gammaTP      = 1.0;
+    // `phi <name>;` -- the flux a flux-conditional condition looks up (totalPressure, inletOutlet,
+    // pressureInletOutletVelocity and their relatives all carry a phiName_, default "phi"). It is a
+    // FIELD NAME, not a number, and a solver with more than one flux can be asked for the other:
+    // interFoam's solitaryGrimshaw, solitaryMcCowan and mangroveInteraction write `phi rhoPhi;` on
+    // their totalPressure top. This entry was skipped with every other unknown key.
+    std::string phiName = "phi";
     // flowRateInletVelocity (OF flowRateInletVelocityFvPatchVectorField). OF selects the branch by which
     // key is present: "volumetricFlowRate" -> volumetric_ = true; otherwise "massFlowRate" (default
     // rhoName "rho"). rhoInlet is only the FALLBACK used when the rho field is not registered -- in
@@ -175,6 +241,47 @@ struct PatchFieldData
     // cannot be read as a constant by a consumer that only knows flowRate.
     Function1      flowRateFunction1;
     scalar         rhoInlet     = -1.0;   // OF default -VGREAT ("not given")
+    // variableHeightFlowRateInletVelocity: `flowRate` (a Function1) and `alpha`, the phase field's name
+    // (variableHeightFlowRateInletVelocityFvPatchVectorField.C:57-58, both mandatory)
+    bool           hasVhFlowRate = false;
+    Function1      vhFlowRateFunction1;
+    // rotatingWallVelocity: origin, axis and a constant omega
+    vector         rwOrigin{0, 0, 0};
+    vector         rwAxis{0, 0, 0};
+    scalar         rwOmega = 0;
+    bool           hasRwOmega = false;
+    std::string    vhAlphaName;
+    // variableHeightFlowRate: `lowerBound` and `upperBound`, both mandatory (...FvPatchField.C:81-82)
+    bool           hasLowerBound = false;
+    bool           hasUpperBound = false;
+    scalar         lowerBound   = 0.0;
+    scalar         upperBound   = 0.0;
+    // permeableAlphaPressureInletOutletVelocity and prghPermeableAlphaTotalPressure: `alphaMin` (default
+    // 1) beside the `alpha` name above (default `none`), and the second one's reference pressure `p`, a
+    // PatchFunction1 that brae reads as `uniform <value>` or a bare value
+    bool           hasAlphaMin  = false;
+    scalar         alphaMin     = 1.0;
+    // porousBafflePressure (a fixedJump cyclic): `D` and `I` are Function1s, read as `constant <value>`
+    // or a bare value; `length` is a scalar; `uniformJump` defaults false; `jump` is MUST_READ on the
+    // owner side and read as `uniform <value>`; `relax` (default -1, off) and `minJump` are fixedJump's.
+    // Anything else in those slots is named here and refused where the patch is built.
+    bool           hasBaffleD = false;
+    bool           hasBaffleI = false;
+    bool           hasBaffleLength = false;
+    scalar         baffleD = 0.0;
+    scalar         baffleI = 0.0;
+    scalar         baffleLength = 0.0;
+    bool           uniformJump = false;
+    bool           hasJump = false;
+    bool           jumpIsUniform = true;
+    scalar         jumpUniform = 0.0;
+    std::vector<scalar> jumpValues;      // `nonuniform`: what OpenFOAM writes once rho varies along the baffle
+    bool           hasJumpRelax = false;
+    bool           hasMinJump = false;
+    std::string    baffleUnsupported;
+    bool           hasPrghP     = false;
+    scalar         prghP        = 0.0;
+    std::string    prghPUnsupported;
     bool           extrapolateProfile = false;
     scalar         mixingLength = 0;
     // turbulentMixingLengthDissipationRateInlet's OWN `Cmu` (turbulentMixingLengthDissipationRateInlet-
@@ -736,13 +843,13 @@ inline FieldData<T> readField(const std::string& path)
                     else if (key == "boundNut")   // atmNutkWallFunction: clamp nut>=0 (true/false)
                     {
                         const std::string v = ts.next();
-                        p.atmBoundNut = (v == "true" || v == "yes" || v == "on" || v == "1");
+                        p.atmBoundNut = ofSwitchToken(v, "boundNut");
                         ts.expect(";");
                     }
                     else if (key == "lowReCorrection")   // epsilonWallFunction: resolved-sublayer branch
                     {
                         const std::string v = ts.next();
-                        p.epsLowRe = (v == "true" || v == "yes" || v == "on" || v == "1");
+                        p.epsLowRe = ofSwitchToken(v, "lowReCorrection");
                         ts.expect(";");
                     }
                     else if (key == "flowDir" || key == "zDir")
@@ -774,6 +881,16 @@ inline FieldData<T> readField(const std::string& path)
                         else             p.ablC2 = v;
                         ts.expect(";");
                     }
+                    else if (key == "theta0")
+                    {
+                        p.contactTheta0 = ts.nextScalar();
+                        ts.expect(";");
+                    }
+                    else if (key == "limit")
+                    {
+                        p.contactLimit = ts.next();
+                        ts.expect(";");
+                    }
                     else if ((key == "kappa" || key == "Cmu") && p.hasABL)
                     {
                         const scalar v = ts.nextScalar();
@@ -781,7 +898,7 @@ inline FieldData<T> readField(const std::string& path)
                         if (key == "kappa") p.ablKappa = v;
                         else p.ablCmu = v;
                     }
-                    else if ((key == "kappa" || key == "Cmu" || key == "E") && !p.hasABL)
+                    else if ((key == "kappa" || key == "Cmu" || key == "E" || key == "beta1") && !p.hasABL)
                     {
                         // A wall function's own coefficients (see PatchFieldData). Stored on every
                         // non-ABL entry that carries them; whether the entry IS a wall function is
@@ -795,6 +912,7 @@ inline FieldData<T> readField(const std::string& path)
                         ts.expect(";");
                         if      (key == "kappa") { p.wfKappa = v; p.hasWfKappa = true; }
                         else if (key == "Cmu")   { p.wfCmu   = v; p.hasWfCmu   = true; p.Cmu = v; }
+                        else if (key == "beta1") { p.wfBeta1 = v; p.hasWfBeta1 = true; }
                         else                     { p.wfE     = v; p.hasWfE     = true; }
                     }
                     else if (key == "blending")
@@ -855,7 +973,7 @@ inline FieldData<T> readField(const std::string& path)
                     else if (key == "setAverage" && p.type == "timeVaryingMappedFixedValue")
                     {
                         const std::string v = ts.next();
-                        if (v == "true" || v == "yes" || v == "on" || v == "1")
+                        if (ofSwitchToken(v, "setAverage"))
                             p.mapUnsupported = "setAverage";   // rescales to the file average -- fully matters at steady
                         ts.expect(";");
                     }
@@ -1095,6 +1213,31 @@ inline FieldData<T> readField(const std::string& path)
                         }
                         ts.expect(";");
                     }
+                    // rotatingWallVelocity (rotatingWallVelocityFvPatchVectorField.C:52-54): origin and axis
+                    // are points read with lookup, omega a Function1 of time -- read here as `constant
+                    // <value>` or a bare value; any other form is refused rather than frozen
+                    else if ((key == "origin" || key == "axis") && p.type == "rotatingWallVelocity")
+                    {
+                        ts.expect("(");
+                        const vector v{ts.nextScalar(), ts.nextScalar(), ts.nextScalar()};
+                        ts.expect(")");
+                        ts.expect(";");
+                        if (key == "origin") p.rwOrigin = v;
+                        else p.rwAxis = v;
+                    }
+                    else if (key == "omega" && p.type == "rotatingWallVelocity")
+                    {
+                        std::string w = ts.next();
+                        if (w == "constant") w = ts.next();
+                        if (!isFoamNumber(w))
+                            throw std::runtime_error(
+                                "brae: rotatingWallVelocity on patch " + p.name + " gives `omega` starting `" + w
+                                + "`. It is a Function1 of time and brae reads `constant <value>` and a bare "
+                                "value; refusing rather than holding a varying rate fixed.");
+                        p.rwOmega = std::stod(w);
+                        p.hasRwOmega = true;
+                        ts.expect(";");
+                    }
                     else if (key == "value")
                     {
                         readValueOrInternal(ts, fd, p.valueUniform, p.uniformValue, p.values);   // uniform/nonuniform/$internalField
@@ -1133,6 +1276,145 @@ inline FieldData<T> readField(const std::string& path)
                             ts.expect(";");
                         }
                     }
+                    else if (key == "flowRate")   // variableHeightFlowRateInletVelocity
+                    {
+                        std::string w = ts.next();
+                        if (w == "constant") w = ts.next();
+                        if (!isFoamNumber(w))
+                            throw std::runtime_error(
+                                "brae: `flowRate` on patch " + p.name + " starts `" + w + "`. It is a "
+                                "Function1 (variableHeightFlowRateInletVelocityFvPatchVectorField.C:57) and "
+                                "brae reads `constant <value>` and a bare value there; refusing rather than "
+                                "holding a time-varying rate fixed.");
+                        p.hasVhFlowRate = true;
+                        p.vhFlowRateFunction1 = Function1::constant(std::stod(w));
+                        ts.expect(";");
+                    }
+                    else if (key == "Umean")      // outletPhaseMeanVelocity's target mean speed
+                    {
+                        p.hasOpmvUmean = true;
+                        p.opmvUmean = std::stod(ts.next());
+                        ts.expect(";");
+                    }
+                    else if (key == "alpha")      // ...and the phase field it weights the inlet by
+                    {
+                        p.vhAlphaName = ts.next();
+                        ts.expect(";");
+                    }
+                    else if (key == "D" || key == "I")   // porousBafflePressure's two Function1s
+                    {
+                        std::string w = ts.next();
+                        if (w == "constant") w = ts.next();
+                        if (isFoamNumber(w))
+                        {
+                            if (key == "D")
+                            {
+                                p.baffleD = std::stod(w);
+                                p.hasBaffleD = true;
+                            }
+                            else
+                            {
+                                p.baffleI = std::stod(w);
+                                p.hasBaffleI = true;
+                            }
+                            ts.expect(";");
+                        }
+                        else
+                        {
+                            p.baffleUnsupported = "`" + key + " " + w + " ...`, a Function1 other than `constant`";
+                            if (!skipToSemicolon(ts)) ts.expect(";");
+                        }
+                    }
+                    else if (key == "length")
+                    {
+                        p.baffleLength = ts.nextScalar();
+                        p.hasBaffleLength = true;
+                        ts.expect(";");
+                    }
+                    else if (key == "uniformJump")
+                    {
+                        const std::string w = ts.next();
+                        p.uniformJump = ofSwitchToken(w, "uniformJump");
+                        ts.expect(";");
+                    }
+                    else if (key == "jump")
+                    {
+                        std::string w = ts.next();
+                        if (w == "uniform")
+                        {
+                            p.jumpUniform = ts.nextScalar();
+                            p.hasJump = true;
+                            ts.expect(";");
+                        }
+                        else if (w == "nonuniform")
+                        {
+                            ts.next();
+                            const label n = ts.nextLabel();
+                            ts.expect("(");
+                            p.jumpValues.resize(static_cast<std::size_t>(n));
+                            for (label i = 0; i < n; ++i)
+                            {
+                                p.jumpValues[static_cast<std::size_t>(i)] = ts.nextScalar();
+                            }
+                            ts.expect(")");
+                            p.jumpIsUniform = false;
+                            p.hasJump = true;
+                            ts.expect(";");
+                        }
+                        else
+                        {
+                            p.baffleUnsupported = "a `jump` that is neither `uniform <value>` nor a `nonuniform` list";
+                            if (!skipToSemicolon(ts)) ts.expect(";");
+                        }
+                    }
+                    else if (key == "relax" || key == "minJump")   // fixedJump's own two
+                    {
+                        (key == "relax" ? p.hasJumpRelax : p.hasMinJump) = true;
+                        if (!skipToSemicolon(ts)) ts.expect(";");
+                    }
+                    else if (key == "alphaMin")    // the two permeable-wall conditions
+                    {
+                        p.alphaMin = ts.nextScalar();
+                        p.hasAlphaMin = true;
+                        ts.expect(";");
+                    }
+                    else if (key == "p")           // prghPermeableAlphaTotalPressure's reference pressure
+                    {
+                        std::string w = ts.next();
+                        if (w == "uniform" || w == "constant") w = ts.next();
+                        if (isFoamNumber(w))
+                        {
+                            p.prghP = std::stod(w);
+                            p.hasPrghP = true;
+                            ts.expect(";");
+                        }
+                        else
+                        {
+                            // named by the dispatch, not died on here: skip the entry whole
+                            p.prghPUnsupported = w;
+                            int depth = (w == "{" || w == "(") ? 1 : 0;
+                            while (!ts.eof() && !(depth == 0 && ts.peek() == ";"))
+                            {
+                                const std::string t = ts.next();
+                                if (t == "{" || t == "(") ++depth;
+                                else if (t == "}" || t == ")") --depth;
+                                if (depth == 0 && (t == "}")) break;
+                            }
+                            if (!ts.eof() && ts.peek() == ";") ts.next();
+                        }
+                    }
+                    else if (key == "lowerBound")  // variableHeightFlowRate
+                    {
+                        p.lowerBound = ts.nextScalar();
+                        p.hasLowerBound = true;
+                        ts.expect(";");
+                    }
+                    else if (key == "upperBound")
+                    {
+                        p.upperBound = ts.nextScalar();
+                        p.hasUpperBound = true;
+                        ts.expect(";");
+                    }
                     else if (key == "rho")
                     {
                         p.flowRateRhoName = ts.next();
@@ -1146,7 +1428,12 @@ inline FieldData<T> readField(const std::string& path)
                     else if (key == "extrapolateProfile")
                     {
                         const std::string w = ts.next();
-                        p.extrapolateProfile = (w == "true" || w == "yes" || w == "on" || w == "1");
+                        p.extrapolateProfile = ofSwitchToken(w, "extrapolateProfile");
+                        ts.expect(";");
+                    }
+                    else if (key == "phi")    // the flux a flux-conditional condition looks up, by NAME
+                    {
+                        p.phiName = ts.next();
                         ts.expect(";");
                     }
                     else if (key == "psi")    // totalPressure: selects OF's isentropic branch when != none
@@ -1229,10 +1516,91 @@ inline FieldData<T> readField(const std::string& path)
                         p.hasValueFraction = true;
                         ts.expect(";");
                     }
+                    else if (key == "Ks" || key == "Cs")    // nutkRoughWallFunction's per-face scalarFields
+                    {
+                        const bool isKs = (key == "Ks");
+                        const std::string w = ts.peek();
+                        bool uni = false;
+                        scalar uval = 0;
+                        std::vector<scalar> vals;
+                        if (w == "uniform")
+                        {
+                            ts.next();
+                            uni = true;
+                            uval = std::stod(ts.next());
+                            ts.expect(";");
+                        }
+                        else if (w == "nonuniform")
+                        {
+                            ts.next();
+                            if (ts.peek() == "List<scalar>") ts.next();
+                            const int n = std::stoi(ts.next());
+                            ts.expect("(");
+                            vals.resize(static_cast<std::size_t>(n));
+                            for (int i = 0; i < n; ++i) vals[static_cast<std::size_t>(i)] = std::stod(ts.next());
+                            ts.expect(")");
+                            ts.expect(";");
+                        }
+                        else
+                        {
+                            // a bare number, or anything else: OpenFOAM's Field::assign stops on it
+                            p.roughFormError = key + " " + w;
+                            if (!skipToSemicolon(ts)) ts.expect(";");
+                        }
+                        if (isKs)
+                        {
+                            p.hasRoughKs = true;
+                            p.roughKsUniform = uni;
+                            p.roughKsUniformValue = uval;
+                            p.roughKsValues = std::move(vals);
+                        }
+                        else
+                        {
+                            p.hasRoughCs = true;
+                            p.roughCsUniform = uni;
+                            p.roughCsUniformValue = uval;
+                            p.roughCsValues = std::move(vals);
+                        }
+                    }
+                    else if (key == "patchType")
+                    {
+                        p.patchType = ts.next();
+                        ts.expect(";");
+                    }
                     else if (key == "tangentialVelocity")   // pressureInletOutletVelocity, optional
                     {
                         p.hasTangentialVelocity = true;
-                        skipToSemicolon(ts);
+                        // PARSED ONLY FOR pressureInletOutletVelocity: swirlInletVelocity names the same key
+                        // as a Function1<scalar> (`tangentialVelocity constant 100;`, .H:56), and reading
+                        // that as a vectorField stopped the case on a parse error before the factory's
+                        // refusal of the type could name it. A key written before `type` is not parsed
+                        // either; the claim refuses it by name (tvUnparsed).
+                        if constexpr (std::is_same<T, vector>::value)
+                        {
+                            if (p.type != "pressureInletOutletVelocity")
+                            {
+                                p.tvUnparsed = true;
+                                skipToSemicolon(ts);
+                            }
+                            else if (ts.peek() == "(" || isFoamNumber(ts.peek()))
+                            {
+                                // Field.C:254-259: a bare `(a b c)` is a FatalIOError for a Field entry --
+                                // but only on a patch with faces (Field.C:216, `if (len)`), which this
+                                // reader cannot see; the claim refuses it where OpenFOAM would stop
+                                p.tvBare = true;
+                                skipToSemicolon(ts);
+                            }
+                            else
+                            {
+                                readValueOrInternal(ts, fd, p.tvUniform, p.tvUniformValue, p.tvValues);
+                                ts.expect(";");
+                            }
+                        }
+                        else
+                        {
+                            // not a vector field: no class of this type reads it
+                            skipToSemicolon(ts);
+                        }
                     }
                     else
                     {

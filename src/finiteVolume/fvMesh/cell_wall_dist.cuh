@@ -27,12 +27,47 @@
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "near_wall_dist.cuh"   // closestPointOnTriangle, pointToFaceDist, nwdGreat (= OF correctWalls)
+#include "inter_phase_time.cuh"
+#include "patch_wave_cpp.cuh"   // PatchWaveRunner: the wave run elsewhere
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <optional>
+#include <stdexcept>
+#include <string>
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
 #include <cmath>
 
 namespace brae {
+
+// WHAT THE NEAR-WALL CORRECTION NEEDS OF THE TOPOLOGY, kept between calls by a caller whose mesh moves: the
+// combined wall patch's faces and owner cells, its points in first-appearance order, each point's combined
+// faces, and each point's cells. None of it depends on where the points are. cellWallDist rebuilt all of it at
+// every call -- with the point-to-cell lists of EVERY mesh point, sorted -- which on a moving RAS case is every
+// step: MEASURED on DTCHullMovingCoarse (108,833 cells, kOmegaSST), 46 ms a call for the correction against 27
+// for the wave. The cache is rebuilt when the mesh's sizes, owner, neighbour, face offsets or wall faces differ
+// from the ones it was built for.
+struct CellWallDistCache
+{
+    bool built = false;
+    std::vector<label> own;
+    std::vector<label> nei;
+    std::vector<label> faceOffsets;
+    label nPoints = -1;
+    // combined index -> global face, and -> owner cell
+    std::vector<label> wf;
+    std::vector<label> wfCell;
+    // the combined patch's points in first-appearance order, and each mesh point's place among them (-1: none)
+    std::vector<label> meshPoints;
+    std::vector<label> pointSlot;
+    // per combined point: its combined faces in the order they were met, and its cells, sorted
+    std::vector<std::vector<label>> pointFaces;
+    std::vector<std::vector<label>> pointCells;
+    // pass 1's own lists: each wall face's candidates, itself and every wall face sharing a vertex
+    NearWallKept near;
+};
 
 inline std::vector<scalar> cellWallDist(
     const PrimitiveMesh& m,
@@ -47,7 +82,22 @@ inline std::vector<scalar> cellWallDist(
     // normal pointing OUT of the domain -- away from the fluid, i.e. roughly opposite to (C - origin).
     // ZDES2020 takes max(grad(nuTilda) & n, 0) with this n, so the sign is load-bearing: get it backwards
     // and the shielding fires where it should be dormant.
-    std::vector<vector>* wallNormal = nullptr)
+    std::vector<vector>* wallNormal = nullptr,
+    // meshWavePatchDistMethod.C:59 reads `correctWalls` (default true) and hands it to
+    // `patchWave(mesh, patchIDs, correctWalls_)` at :84. patchWave::correct() (patchWave.C:178-236)
+    // always runs the wave and takes the cell value from it, and only THEN, `if (correctWalls_)`,
+    // overwrites the wall-adjacent cells with the exact distance to the face POLYGON. So `false` skips
+    // that block entirely and those cells keep the wave's face-CENTRE distance -- strictly less work,
+    // and it changes only cells that own or touch a wall face. Hardcoded true until now, and the
+    // interFoam reader refused a case that asked for false. Last, so no positional caller moves.
+    bool correctWalls = true,
+    // THE WAVE ELSEWHERE: handed the wall faces in seeding order, it returns the squared distance the wave
+    // leaves in every cell (negative where it never reached) -- the device loop's devicePatchWave, which is
+    // FaceCellWave<wallPoint> to the bit. Taken only where neither the origin nor the normal is asked for (the
+    // device wave carries neither). BRAE_CONTROL_PATCH_WAVE_CHECK=1 runs the host's wave too and compares.
+    const PatchWaveRunner* waveRunner = nullptr,
+    // the near-wall correction's topology, kept between calls (CellWallDistCache); null builds it here
+    CellWallDistCache* cache = nullptr)
 {
     const std::vector<vector>& C   = g.C();
     const std::vector<vector>& Cf  = g.Cf();
@@ -73,114 +123,188 @@ inline std::vector<scalar> cellWallDist(
         }
     if (!anyWall) return y;                                   // no walls -> all GREAT (no SST near-wall branch)
 
-    // cell -> faces adjacency (OF mesh_.cells()), CSR built from owner/neighbour
-    std::vector<label> cfOff(nCells + 1, 0);
-    for (label f = 0; f < nFaces; ++f)
-        cfOff[own[f] + 1]++;
-    for (label f = 0; f < nIntF;  ++f)
-        cfOff[nei[f] + 1]++;
-    for (label c = 0; c < nCells; ++c)
-        cfOff[c + 1] += cfOff[c];
-    std::vector<label> cfList(cfOff[nCells]);
+    // the host's wave: FaceCellWave<wallPoint> from the wall faces, what it leaves in every cell
+    auto hostWave = [&](
+        std::vector<char>& cellSet,
+        std::vector<scalar>& cellD2,
+        std::vector<vector>& cellOrg,
+        std::vector<vector>& cellNrm)
     {
-        std::vector<label> cur(cfOff.begin(), cfOff.end() - 1);
+        // cell -> faces adjacency (OF mesh_.cells()), CSR built from owner/neighbour
+        interPhase::Nested timedWave("wallDist: the cell-to-face lists and the wave (host)");
+        std::vector<label> cfOff(nCells + 1, 0);
         for (label f = 0; f < nFaces; ++f)
-            cfList[cur[own[f]]++] = f;
+            cfOff[own[f] + 1]++;
         for (label f = 0; f < nIntF;  ++f)
-            cfList[cur[nei[f]]++] = f;
-    }
-
-    // FaceCellWave<wallPoint> front. origin = wall-face centre; distSqr = magSqr(pt - origin).
-    const scalar tol = 0.01;                                  // OF FaceCellWave::propagationTol_
-    std::vector<vector> faceOrg(nFaces), cellOrg(nCells);
-    std::vector<vector> faceNrm(nFaces), cellNrm(nCells);     // the wall normal riding along with the origin
-    std::vector<scalar> faceD2(nFaces, 0.0), cellD2(nCells, 0.0);
-    std::vector<char> faceSet(nFaces, 0), cellSet(nCells, 0);
-    std::vector<char> faceQ(nFaces, 0), cellQ(nCells, 0);     // already-in-changed-list flags (OF changedFace_/changedCell_)
-
-    // wallPoint::update (wallPointI.H): first visit accepts any value; else accept iff strictly closer by > tol.
-    auto update = [&](char& set, scalar& d2cur, vector& orgcur, vector& nrmcur,
-                      const vector& pt, const vector& org, const vector& nrm) -> bool
-    {
-        const scalar d2 = magSqr(pt - org);
-        if (!set)
+            cfOff[nei[f] + 1]++;
+        for (label c = 0; c < nCells; ++c)
+            cfOff[c + 1] += cfOff[c];
+        std::vector<label> cfList(cfOff[nCells]);
         {
+            std::vector<label> cur(cfOff.begin(), cfOff.end() - 1);
+            for (label f = 0; f < nFaces; ++f)
+                cfList[cur[own[f]]++] = f;
+            for (label f = 0; f < nIntF;  ++f)
+                cfList[cur[nei[f]]++] = f;
+        }
+
+        // FaceCellWave<wallPoint> front. origin = wall-face centre; distSqr = magSqr(pt - origin).
+        const scalar tol = 0.01;                                  // OF FaceCellWave::propagationTol_
+        std::vector<vector> faceOrg(nFaces);
+        std::vector<vector> faceNrm(nFaces);                      // the wall normal riding along with the origin
+        std::vector<scalar> faceD2(nFaces, 0.0);
+        std::vector<char> faceSet(nFaces, 0);
+        cellOrg.assign(nCells, vector{0, 0, 0});
+        cellNrm.assign(nCells, vector{0, 0, 0});
+        cellD2.assign(nCells, 0.0);
+        cellSet.assign(nCells, 0);
+        // already-in-changed-list flags (OF changedFace_/changedCell_)
+        std::vector<char> faceQ(nFaces, 0), cellQ(nCells, 0);
+
+        // wallPoint::update (wallPointI.H): first visit accepts any value; else accept iff strictly closer by > tol.
+        auto update = [&](char& set, scalar& d2cur, vector& orgcur, vector& nrmcur,
+                          const vector& pt, const vector& org, const vector& nrm) -> bool
+        {
+            const scalar d2 = magSqr(pt - org);
+            if (!set)
+            {
+                d2cur = d2;
+                orgcur = org;
+                nrmcur = nrm;
+                set = 1;
+                return true;
+            }
+            const scalar diff = d2cur - d2;
+            if (diff < 0) return false;                                              // already nearer
+            // wallPointI.H: `(diff < SMALL) || ((distSqr_ > SMALL) && (diff/distSqr_ < tol))`, SMALL = 1e-15. This
+            // read 1e-300 (VSMALL) until 2026-10-04: the same answer unless a squared distance is below 1e-13.
+            if (diff < 1e-15 || (d2cur > 1e-15 && diff / d2cur < tol)) return false; // improvement too small
             d2cur = d2;
             orgcur = org;
             nrmcur = nrm;
-            set = 1;
             return true;
+        };
+
+        std::vector<label> changedFaces, changedCells;
+        changedFaces.reserve(nFaces / 8 + 1);
+        for (label f = 0; f < nFaces; ++f)
+            if (isWallFace[f])
+            {
+                faceOrg[f] = Cf[f];
+                {   // the seed datum: this wall face's OUTWARD unit normal (OF patch.nf())
+                    const vector& sf = g.Sf()[f];
+                    const scalar a = g.magSf()[f];
+                    faceNrm[f] = (a > scalar(0)) ? vector{sf.x/a, sf.y/a, sf.z/a} : vector{0, 0, 0};
+                }
+                faceD2[f] = 0.0;
+                faceSet[f] = 1;
+                faceQ[f] = 1;
+                changedFaces.push_back(f);
+            }
+
+        while (!changedFaces.empty())
+        {
+            changedCells.clear();                                // faceToCell
+            for (label f : changedFaces)
+            {
+                faceQ[f] = 0;
+                const vector org = faceOrg[f];
+                const vector nrm = faceNrm[f];
+                const label o = own[f];
+                if (update(cellSet[o], cellD2[o], cellOrg[o], cellNrm[o], C[o], org, nrm) && !cellQ[o])
+                {
+                    cellQ[o] = 1;
+                    changedCells.push_back(o);
+                }
+                if (f < nIntF)
+                {
+                    const label n = nei[f];
+                    if (update(cellSet[n], cellD2[n], cellOrg[n], cellNrm[n], C[n], org, nrm) && !cellQ[n])
+                    {
+                        cellQ[n] = 1;
+                        changedCells.push_back(n);
+                    }
+                }
+            }
+            changedFaces.clear();                                // cellToFace
+            for (label c : changedCells)
+            {
+                cellQ[c] = 0;
+                const vector org = cellOrg[c];
+                const vector nrm = cellNrm[c];
+                for (label k = cfOff[c]; k < cfOff[c + 1]; ++k)
+                {
+                    const label f = cfList[k];
+                    if (update(faceSet[f], faceD2[f], faceOrg[f], faceNrm[f], Cf[f], org, nrm) && !faceQ[f])
+                    {
+                        faceQ[f] = 1;
+                        changedFaces.push_back(f);
+                    }
+                }
+            }
         }
-        const scalar diff = d2cur - d2;
-        if (diff < 0) return false;                                              // already nearer
-        if (diff < 1e-300 || (d2cur > 1e-300 && diff / d2cur < tol)) return false; // improvement too small
-        d2cur = d2;
-        orgcur = org;
-        nrmcur = nrm;
-        return true;
     };
-
-    std::vector<label> changedFaces, changedCells;
-    changedFaces.reserve(nFaces / 8 + 1);
-    for (label f = 0; f < nFaces; ++f)
-        if (isWallFace[f])
-        {
-            faceOrg[f] = Cf[f];
-            {   // the seed datum: this wall face's OUTWARD unit normal (OF patch.nf())
-                const vector& sf = g.Sf()[f];
-                const scalar a = g.magSf()[f];
-                faceNrm[f] = (a > scalar(0)) ? vector{sf.x/a, sf.y/a, sf.z/a} : vector{0, 0, 0};
-            }
-            faceD2[f] = 0.0;
-            faceSet[f] = 1;
-            faceQ[f] = 1;
-            changedFaces.push_back(f);
-        }
-
-    while (!changedFaces.empty())
+    std::vector<char> cellSet;
+    std::vector<scalar> cellD2;
+    std::vector<vector> cellOrg;
+    std::vector<vector> cellNrm;
+    // a runner that returns false did not run the wave at this call: the host's runs (patch_wave_cpp.cuh)
+    bool ranElsewhere = false;
+    if (waveRunner && *waveRunner && !wallOrigin && !wallNormal)
     {
-        changedCells.clear();                                // faceToCell
-        for (label f : changedFaces)
+        // patchWave::setChangedFaces: the wall faces, ascending
+        std::vector<label> seeds;
+        for (label f = 0; f < nFaces; ++f)
         {
-            faceQ[f] = 0;
-            const vector org = faceOrg[f];
-            const vector nrm = faceNrm[f];
-            const label o = own[f];
-            if (update(cellSet[o], cellD2[o], cellOrg[o], cellNrm[o], C[o], org, nrm) && !cellQ[o])
+            if (isWallFace[f]) seeds.push_back(f);
+        }
+        std::vector<scalar> boundaryD2;
+        ranElsewhere = (*waveRunner)(m, g, seeds, cellD2, boundaryD2);
+    }
+    if (ranElsewhere)
+    {
+        if (cellD2.size() != static_cast<std::size_t>(nCells))
+        {
+            throw std::runtime_error("brae cellWallDist: the wave run elsewhere returned another mesh's cells.");
+        }
+        // wallPoint::valid: distSqr > -SMALL
+        cellSet.assign(nCells, 0);
+        for (label c = 0; c < nCells; ++c)
+        {
+            cellSet[c] = (cellD2[c] > -1.0e-15) ? 1 : 0;
+        }
+        static const bool check = std::getenv("BRAE_CONTROL_PATCH_WAVE_CHECK") != nullptr;
+        if (check)
+        {
+            std::vector<char> hostSet;
+            std::vector<scalar> hostD2;
+            std::vector<vector> hostOrg;
+            std::vector<vector> hostNrm;
+            hostWave(hostSet, hostD2, hostOrg, hostNrm);
+            for (label c = 0; c < nCells; ++c)
             {
-                cellQ[o] = 1;
-                changedCells.push_back(o);
-            }
-            if (f < nIntF)
-            {
-                const label n = nei[f];
-                if (update(cellSet[n], cellD2[n], cellOrg[n], cellNrm[n], C[n], org, nrm) && !cellQ[n])
-                {
-                    cellQ[n] = 1;
-                    changedCells.push_back(n);
-                }
+                const bool same = cellSet[c] == hostSet[c]
+                               && (!hostSet[c] || std::memcmp(&cellD2[c], &hostD2[c], sizeof(scalar)) == 0);
+                if (same) continue;
+                char line[200];
+                std::snprintf(line, sizeof(line), "cell %ld of %ld: %.17g (reached %d), the host's %.17g (reached %d)",
+                              (long)c, (long)nCells, cellD2[c], (int)cellSet[c], hostD2[c], (int)hostSet[c]);
+                throw std::runtime_error(
+                    std::string("brae cellWallDist: the wave run elsewhere is not the host's: squared distance, ")
+                    + line);
             }
         }
-        changedFaces.clear();                                // cellToFace
-        for (label c : changedCells)
-        {
-            cellQ[c] = 0;
-            const vector org = cellOrg[c];
-            const vector nrm = cellNrm[c];
-            for (label k = cfOff[c]; k < cfOff[c + 1]; ++k)
-            {
-                const label f = cfList[k];
-                if (update(faceSet[f], faceD2[f], faceOrg[f], faceNrm[f], Cf[f], org, nrm) && !faceQ[f])
-                {
-                    faceQ[f] = 1;
-                    changedFaces.push_back(f);
-                }
-            }
-        }
+    }
+    else
+    {
+        hostWave(cellSet, cellD2, cellOrg, cellNrm);
     }
     for (label c = 0; c < nCells; ++c)
         if (cellSet[c]) y[c] = std::sqrt(cellD2[c]);
 
+    if (correctWalls)
+    {
+    interPhase::Nested timedCorrect("wallDist: the near-wall correction (host)");
     // correctWalls = correctBoundaryFaceCells THEN correctBoundaryPointCells (cellDistFuncs.C), in that order:
     // a cell already corrected by its own wall face is NOT overwritten by the point pass.
     const std::vector<vector>& pts = m.points();
@@ -209,66 +333,169 @@ inline std::vector<scalar> cellWallDist(
     //              smallest -- and the cell is recorded in nearestFace
     //   pass 2     for each combined meshPoint in order, for each cell on it NOT already recorded:
     //              smallestDist over that point's combined faces, then the cell is LOCKED
-    std::vector<label> wf;                                   // combined index -> global face
-    std::vector<label> wfCell;                               // combined index -> owner cell
+    // ...and everything of that which is TOPOLOGY comes from the cache, built here when it is not this mesh's
+    // BRAE_CONTROL_WALL_DIST_NO_CACHE=1 builds it at every call, as before -- the identity gate's other arm
+    static const bool noCache = std::getenv("BRAE_CONTROL_WALL_DIST_NO_CACHE") != nullptr;
+    CellWallDistCache local;
+    CellWallDistCache& k = (cache && !noCache) ? *cache : local;
+    // combined index -> global face, as the patches stand
+    std::vector<label> wfNow;
     for (const FvPatch& p : patches)
-        if (p.type == "wall")
+    {
+        if (p.type != "wall") continue;
+        for (label i = 0; i < p.size; ++i)
+        {
+            wfNow.push_back(p.start + i);
+        }
+    }
+    const bool sameTopology = k.built && k.nPoints == static_cast<label>(pts.size()) && k.own == own
+                           && k.nei == nei && k.faceOffsets == fo && k.wf == wfNow;
+    // the correction's three parts by name: after a topology change the first is paid again at every call
+    // (RAS/motorBike, 2026-10-05: 7.7 ms a step of correction, one call a step)
+    std::optional<interPhase::Nested> timedPart;
+    timedPart.emplace("wallDist correction: its topology (built when the mesh's is another)");
+    if (!sameTopology)
+    {
+        k = CellWallDistCache();
+        k.own = own;
+        k.nei = nei;
+        k.faceOffsets = fo;
+        k.nPoints = static_cast<label>(pts.size());
+        k.wf = wfNow;
+        for (const FvPatch& p : patches)
+        {
+            if (p.type != "wall") continue;
             for (label i = 0; i < p.size; ++i)
             {
-                wf.push_back(p.start + i);
-                wfCell.push_back(p.faceCells[i]);
+                k.wfCell.push_back(p.faceCells[i]);
             }
+        }
+        // combined-patch point -> combined faces, plus meshPoints in first-appearance order
+        k.pointSlot.assign(pts.size(), label(-1));
+        k.meshPoints.reserve(k.wf.size() * 4);
+        for (std::size_t i = 0; i < k.wf.size(); ++i)
+        {
+            for (label j = fo[k.wf[i]]; j < fo[k.wf[i] + 1]; ++j)
+            {
+                const label v = fv[j];
+                if (k.pointSlot[v] < 0)
+                {
+                    k.pointSlot[v] = static_cast<label>(k.meshPoints.size());
+                    k.meshPoints.push_back(v);
+                    k.pointFaces.emplace_back();
+                }
+                k.pointFaces[k.pointSlot[v]].push_back((label)i);
+            }
+        }
+        // point -> cells (OF mesh().pointCells()), for the combined patch's points: a cell touches a point if
+        // one of its faces uses it. Sorted and unique, as the list over every mesh point was.
+        k.pointCells.assign(k.meshPoints.size(), std::vector<label>());
+        for (label f = 0; f < nFaces; ++f)
+        {
+            const label c0 = own[f];
+            const label c1 = (f < nIntF ? nei[f] : -1);
+            for (label j = fo[f]; j < fo[f + 1]; ++j)
+            {
+                const label slot = k.pointSlot[fv[j]];
+                if (slot < 0) continue;
+                k.pointCells[slot].push_back(c0);
+                if (c1 >= 0)
+                {
+                    k.pointCells[slot].push_back(c1);
+                }
+            }
+        }
+        for (std::vector<label>& v : k.pointCells)
+        {
+            std::sort(v.begin(), v.end());
+            v.erase(std::unique(v.begin(), v.end()), v.end());
+        }
+        k.built = true;
+    }
+    const std::vector<label>& wf = k.wf;
+    const std::vector<label>& wfCell = k.wfCell;
 
     if (!wf.empty())
     {
-        // combined-patch point -> combined faces, plus meshPoints in first-appearance order
-        std::unordered_map<label, std::vector<label>> ptF;
-        std::vector<label> meshPoints;
-        meshPoints.reserve(wf.size() * 4);
-        for (std::size_t i = 0; i < wf.size(); ++i)
-            for (label j = fo[wf[i]]; j < fo[wf[i] + 1]; ++j)
-            {
-                const label v = fv[j];
-                auto it = ptF.find(v);
-                if (it == ptF.end()) { ptF.emplace(v, std::vector<label>{(label)i}); meshPoints.push_back(v); }
-                else it->second.push_back((label)i);
-            }
-
-        // point -> cells (OF mesh().pointCells()): a cell touches a point if one of its faces uses it.
-        std::vector<std::vector<label>> pc(pts.size());
-        for (label f = 0; f < nFaces; ++f)
-        {
-            const label c0 = own[f], c1 = (f < nIntF ? nei[f] : -1);
-            for (label j = fo[f]; j < fo[f + 1]; ++j)
-            {
-                pc[fv[j]].push_back(c0);
-                if (c1 >= 0) pc[fv[j]].push_back(c1);
-            }
-        }
-        for (auto& v : pc) { std::sort(v.begin(), v.end()); v.erase(std::unique(v.begin(), v.end()), v.end()); }
-
         std::vector<char> claimed(nCells, 0);
         auto distTo = [&](const vector& Cc, label ci)
         { const label gf = wf[ci]; return pointToFaceDist(Cc, pts, fv, fo[gf], fo[gf + 1]); };
 
         // pass 1 -- cells with a face on the wall
-        for (std::size_t i = 0; i < wf.size(); ++i)
+        // WHAT A FACE'S CELL TAKES IS nearWallDist's NUMBER: the smallest distance from the cell's centre to the
+        // face itself and to every wall face sharing a vertex with it, over the combined patch. So the faces are
+        // measured by nearWallDistKept -- the candidate lists kept with the cache, the faces on the host's
+        // threads -- and written here in the combined order, where the last face of a cell still wins.
+        // MEASURED on RAS/motorBike, 2026-10-05 (a topology change a step): the loop below 4.6 ms a step.
+        //   BRAE_CONTROL_WALL_DIST_PASS1_SERIAL=1      the loop, as before
+        //   BRAE_CONTROL_WALL_DIST_PASS1_CHECK=1       every face's number compared with the loop's, bitwise
+        //   BRAE_CONTROL_WALL_DIST_PASS1_SELF_ONLY=1   a gate's CONTROL, deliberately wrong: no neighbour is measured
+        timedPart.emplace("wallDist correction: pass 1, the cells with a face on the wall");
+        static const bool pass1Serial = std::getenv("BRAE_CONTROL_WALL_DIST_PASS1_SERIAL") != nullptr;
+        static const bool pass1Check = std::getenv("BRAE_CONTROL_WALL_DIST_PASS1_CHECK") != nullptr;
+        static const bool pass1SelfOnly = std::getenv("BRAE_CONTROL_WALL_DIST_PASS1_SELF_ONLY") != nullptr;
+        const auto loopBest = [&](
+            std::size_t i)
         {
-            const label c = wfCell[i];
-            const vector& Cc = C[c];
-            scalar best = distTo(Cc, (label)i);              // getPointNeighbours "adds myself" first
+            const vector& Cc = C[wfCell[i]];
+            // getPointNeighbours "adds myself" first
+            scalar best = distTo(Cc, (label)i);
             for (label j = fo[wf[i]]; j < fo[wf[i] + 1]; ++j)
-                for (const label nb : ptF[fv[j]])
+            {
+                for (const label nb : k.pointFaces[k.pointSlot[fv[j]]])
+                {
                     if (nb != (label)i) best = std::fmin(best, distTo(Cc, nb));
-            y[c] = best;                                     // unconditional: last face wins, as OF does
-            claimed[c] = 1;
+                }
+            }
+            return best;
+        };
+        if (pass1Serial)
+        {
+            for (std::size_t i = 0; i < wf.size(); ++i)
+            {
+                // unconditional: last face wins, as OF does
+                y[wfCell[i]] = loopBest(i);
+                claimed[wfCell[i]] = 1;
+            }
+        }
+        else
+        {
+            const std::vector<std::vector<scalar>> yFace =
+                nearWallDistKept(m, g, patches, k.near, nearWallThreads(), pass1SelfOnly);
+            std::size_t i = 0;
+            for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            {
+                if (patches[pi].type != "wall") continue;
+                for (label j = 0; j < patches[pi].size; ++j)
+                {
+                    const scalar best = yFace[pi][static_cast<std::size_t>(j)];
+                    if (pass1Check)
+                    {
+                        const scalar want = loopBest(i);
+                        if (std::memcmp(&best, &want, sizeof(scalar)) != 0)
+                        {
+                            char line[240];
+                            std::snprintf(line, sizeof(line),
+                                          "brae cellWallDist: BRAE_CONTROL_WALL_DIST_PASS1_CHECK: patch %s, face "
+                                          "%ld is %.17g and the loop gives %.17g.", patches[pi].name.c_str(),
+                                          (long)j, best, want);
+                            throw std::runtime_error(line);
+                        }
+                    }
+                    // the combined order: last face wins, as OF does
+                    y[wfCell[i]] = best;
+                    claimed[wfCell[i]] = 1;
+                    ++i;
+                }
+            }
         }
 
         // pass 2 -- cells with only a point on the wall; first meshPoint to reach one wins and locks it
-        for (const label v : meshPoints)
+        timedPart.emplace("wallDist correction: pass 2, the cells with a point on the wall");
+        for (std::size_t pi = 0; pi < k.meshPoints.size(); ++pi)
         {
-            const std::vector<label>& faces = ptF[v];
-            for (const label c : pc[v])
+            const std::vector<label>& faces = k.pointFaces[pi];
+            for (const label c : k.pointCells[pi])
             {
                 if (claimed[c]) continue;
                 scalar best = nwdGreat;
@@ -278,6 +505,8 @@ inline std::vector<scalar> cellWallDist(
             }
         }
     }
+
+    }   // correctWalls -- patchWave.C:203
 
     // the wave's nearest wall-face centre per reached cell -> the IDDES wall-normal direction (C - origin). Cells the
     // wave never reached keep the default (C, degenerate). Does not alter y (the correctWalls override above is intact).

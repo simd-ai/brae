@@ -125,6 +125,9 @@ struct RhoEnergyInput
     bool   limGradKELeastSq = false;
 
     bool   correctedLaplacian = false;   // BOTH halves -- see the header
+    // ...and WHICH delta coefficients: `uncorrected` takes nonOrthDeltaCoeffs with no correction
+    // flux (uncorrectedSnGrad.H:113-119). See solver_controls.cuh:226.
+    bool   nonOrthCoeffs = false;
     scalar snGradLimitCoeff   = 0.0;
 
     bool hasMRF            = false;   // EEqn.H adds fvc::div(MRF.phi(), p) -- refused

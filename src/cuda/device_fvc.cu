@@ -1,6 +1,7 @@
 // cf GPU offload (G3): fvc explicit operators on device. interpolate is per-internal-face; div and
 // gaussGrad are per-cell gathers (internal owner/neighbour faces via ownerStart/losort, boundary faces via
 // bndCellStart), race-free, deterministic, matching the CPU fvc to machine precision.
+#include "device_cyclic.cuh"   // DeviceCyclic -- the periodic pair the least-squares fit folds in
 #include "device_mesh.cuh"
 #include <cuda_runtime.h>
 #include <cstdio>
@@ -46,11 +47,28 @@ void divKernel(
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
 
+    // A TRANSCRIPTION of the host's fvc::div (fvc.cu): `d[own] += phi; d[nei] -= phi` in FACE ORDER from
+    // zero, so this cell's owner and neighbour lists (each ascending) are merged by face index, then the
+    // boundary faces in patch order, then the division by V. Summed owner-first it differed from the
+    // host's in the last bit (tests/test_device_laplacian_vs_host.cu holds the two to memcmp).
     scalar s = 0.0;
-    for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)
-        s += phiInt[f];              // +owner internal
-    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
-        s -= phiInt[losort[k]];    // -neighbour internal
+    int fo = ownerStart[c];
+    const int foEnd = ownerStart[c + 1];
+    int kn = losortStart[c];
+    const int knEnd = losortStart[c + 1];
+    while (fo < foEnd || kn < knEnd)
+    {
+        if ((kn >= knEnd) || (fo < foEnd && fo < losort[kn]))
+        {
+            s += phiInt[fo];            // +owner internal
+            ++fo;
+        }
+        else
+        {
+            s -= phiInt[losort[kn]];    // -neighbour internal
+            ++kn;
+        }
+    }
     for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)
     {
         const int bk = bndPerm[k];
@@ -99,6 +117,16 @@ void lsqInvDdKernel(
     const label* __restrict__ bndIsEmpty,
     const label* __restrict__ bndGFace,
     const scalar* __restrict__ dBndX, const scalar* __restrict__ dBndY, const scalar* __restrict__ dBndZ,
+    // THE PERIODIC PAIR, or null. leastSquaresVectors.C:131-140 folds a COUPLED patch into dd with the
+    // owner weight and the patch's own delta -- `((1 - w)*magSf/magSqr(d))*sqr(d)` -- where an
+    // uncoupled one takes the whole face (`(magSf/magSqr(d))*sqr(d)`). brae's boundary arrays skip
+    // coupled patches by construction, so without this loop the pair's cells were fitted from a
+    // stencil missing a face each.
+    const label* __restrict__ cycCellStart,
+    const label* __restrict__ cycPerm,
+    const scalar* __restrict__ cycW,
+    const scalar* __restrict__ cycMagSf,
+    const scalar* __restrict__ cycDX, const scalar* __restrict__ cycDY, const scalar* __restrict__ cycDZ,
     scalar* __restrict__ idd)     // 6*nC, component-major
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -123,6 +151,15 @@ void lsqInvDdKernel(
         const int gf = bndGFace[bk];
         const vector d = lsqBndDelta(dBndX[bk], dBndY[bk], dBndZ[bk], Sfx[gf], Sfy[gf], Sfz[gf], magSf[gf]);
         dd = dd + (magSf[gf] / magSqr(d)) * sqr(d);
+    }
+    if (cycCellStart)
+    {
+        for (int k = cycCellStart[c]; k < cycCellStart[c + 1]; ++k)
+        {
+            const int j = cycPerm[k];
+            const vector d{cycDX[j], cycDY[j], cycDZ[j]};   // fvPatch::delta(), OF's pd
+            dd = dd + ((1.0 - cycW[j]) * (cycMagSf[j] / magSqr(d))) * sqr(d);
+        }
     }
     const symmTensor r = safeInv(dd);
     idd[0 * nC + c] = r.xx; idd[1 * nC + c] = r.xy; idd[2 * nC + c] = r.xz;
@@ -150,6 +187,15 @@ void lsqGradKernel(
     const scalar* __restrict__ dBndX, const scalar* __restrict__ dBndY, const scalar* __restrict__ dBndZ,
     const scalar* __restrict__ bval,
     const scalar* __restrict__ idd,
+    // the pair, or null: leastSquaresGrad.C:108-119 takes the NEIGHBOUR CELL's value across a coupled
+    // patch, with the coupled fit vector `((1 - w)*magSf/magSqr(d))*(invDd & d)`. A SCALAR is never
+    // rotated across the interface, which is why this form serves k and omega and not grad(U).
+    const label* __restrict__ cycCellStart,
+    const label* __restrict__ cycPerm,
+    CyclicNbr cycNbr,
+    const scalar* __restrict__ cycW,
+    const scalar* __restrict__ cycMagSf,
+    const scalar* __restrict__ cycDX, const scalar* __restrict__ cycDY, const scalar* __restrict__ cycDZ,
     scalar* __restrict__ gx, scalar* __restrict__ gy, scalar* __restrict__ gz)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -179,6 +225,16 @@ void lsqGradKernel(
         const int gf = bndGFace[bk];
         const vector d = lsqBndDelta(dBndX[bk], dBndY[bk], dBndZ[bk], Sfx[gf], Sfy[gf], Sfz[gf], magSf[gf]);
         s += ((magSf[gf] / magSqr(d)) * (bval[bk] - vc)) * (iv & d);
+    }
+    if (cycCellStart)
+    {
+        for (int k = cycCellStart[c]; k < cycCellStart[c + 1]; ++k)
+        {
+            const int j = cycPerm[k];
+            const vector d{cycDX[j], cycDY[j], cycDZ[j]};
+            const scalar msd = cycMagSf[j] / magSqr(d);
+            s += ((1.0 - cycW[j]) * msd * (cyclicNbrValue(cycNbr, vf, j) - vc)) * (iv & d);
+        }
     }
     // No division by V: the fit vectors already carry the normalisation.
     gx[c] = s.x; gy[c] = s.y; gz[c] = s.z;
@@ -214,21 +270,39 @@ void gradKernel(
     if (c >= nC) return;
     if (skipIf && *skipIf) return;
 
+    // A TRANSCRIPTION of the host's fvc::gaussGrad (fvc.cu), which is OpenFOAM's gaussGrad::gradf:
+    //   the face value in OpenFOAM's arithmetic, lambda*(P - N) + N (surfaceInterpolationScheme.C:270),
+    //   not w*P + (1 - w)*N -- on a face whose two cells hold the same value it returns that value
+    //   exactly, and the other form can miss by an ulp whose SIGN is the gradient of a uniform field;
+    //   and this cell's internal faces summed in FACE ORDER, as the host's face loop reaches them --
+    //   the owner and neighbour lists are each ascending, so they are merged by face index. MEASURED
+    //   before, on a sheared 960-cell box: 912 cells differed from the host in some bit on a smooth
+    //   field, 934 on a uniform one, where the difference (3.9e-27) was the size of the gradient itself.
+    //   tests/test_device_gauss_grad.cu holds the two to memcmp.
     scalar sx = 0.0, sy = 0.0, sz = 0.0;
-    for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)   // +owner internal
+    int fo = ownerStart[c];
+    const int foEnd = ownerStart[c + 1];
+    int kn = losortStart[c];
+    const int knEnd = losortStart[c + 1];
+    while (fo < foEnd || kn < knEnd)
     {
-        const scalar pf = w[f] * vol[own[f]] + (1.0 - w[f]) * vol[nei[f]];
-        sx += Sfx[f] * pf;
-        sy += Sfy[f] * pf;
-        sz += Sfz[f] * pf;
-    }
-    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)   // -neighbour internal
-    {
-        const int f = losort[k];
-        const scalar pf = w[f] * vol[own[f]] + (1.0 - w[f]) * vol[nei[f]];
-        sx -= Sfx[f] * pf;
-        sy -= Sfy[f] * pf;
-        sz -= Sfz[f] * pf;
+        const bool takeOwner = (kn >= knEnd) || (fo < foEnd && fo < losort[kn]);
+        const int f = takeOwner ? fo : losort[kn];
+        const scalar pf = w[f] * (vol[own[f]] - vol[nei[f]]) + vol[nei[f]];
+        if (takeOwner)   // +owner internal
+        {
+            sx += Sfx[f] * pf;
+            sy += Sfy[f] * pf;
+            sz += Sfz[f] * pf;
+            ++fo;
+        }
+        else             // -neighbour internal
+        {
+            sx -= Sfx[f] * pf;
+            sy -= Sfy[f] * pf;
+            sz -= Sfz[f] * pf;
+            ++kn;
+        }
     }
     for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)   // +boundary
     {
@@ -259,11 +333,13 @@ void deviceInterpolate(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol, De
 }
 
 
-void deviceDiv(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& bval, DeviceBuffer<scalar>& d)
+void deviceDiv(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& bval, DeviceBuffer<scalar>& d,
+               const DeviceBuffer<scalar>* V)
 {
     d.resize(dm.nCells);
     divKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
-                                           phiInt.data(), dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), bval.data(), dm.V.data(), d.data());
+                                           phiInt.data(), dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), bval.data(),
+                                           V ? V->data() : dm.V.data(), d.data());
     cudaCheck(cudaGetLastError(), "div");
 }
 
@@ -395,7 +471,7 @@ void launchLsqFused(
 } // namespace
 
 
-const scalar* lsqInvDdFor(const DeviceMesh& dm)
+const scalar* lsqInvDdFor(const DeviceMesh& dm, const DeviceCyclic* cyc)
 {
     // The control: rebuild at every request, which is what every gradient did before FP-3.
     static const bool recompute = []()
@@ -404,8 +480,11 @@ const scalar* lsqInvDdFor(const DeviceMesh& dm)
         return e && std::string(e) == "recompute";
     }();
     const int nC = dm.nCells;
+    const int cycN = (cyc && cyc->n > 0) ? cyc->n : 0;
     const std::size_t want = static_cast<std::size_t>(6) * nC;
-    if (dm.lsqInvDd.size() == want && !recompute) return dm.lsqInvDd.data();
+    // the pair is PART of the tensor, so a cached one built without it (or with a different one) is
+    // not this mesh's -- see DeviceMesh::lsqInvDdCycN
+    if (dm.lsqInvDd.size() == want && dm.lsqInvDdCycN == cycN && !recompute) return dm.lsqInvDd.data();
     static bool announced = false;
     if (!announced)
     {
@@ -420,17 +499,24 @@ const scalar* lsqInvDdFor(const DeviceMesh& dm)
         dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
         dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
         dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), dm.bndGFace.data(),
-        dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), dm.lsqInvDd.data());
+        dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(),
+        cycN ? cyc->ifCellStart.data() : nullptr, cycN ? cyc->ifPerm.data() : nullptr,
+        cycN ? cyc->weights.data() : nullptr, cycN ? cyc->magSf.data() : nullptr,
+        cycN ? cyc->dX.data() : nullptr, cycN ? cyc->dY.data() : nullptr, cycN ? cyc->dZ.data() : nullptr,
+        dm.lsqInvDd.data());
     cudaCheck(cudaGetLastError(), "lsqInvDd");
+    dm.lsqInvDdCycN = cycN;
     return dm.lsqInvDd.data();
 }
 
 
 void deviceLeastSquaresGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol,
                             const DeviceBuffer<scalar>& bval,
-                            DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz)
+                            DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz,
+                            const DeviceCyclic* cyc)
 {
     const int nC = dm.nCells;
+    const int cycN = (cyc && cyc->n > 0) ? cyc->n : 0;
     gx.resize(nC); gy.resize(nC); gz.resize(nC);
     // The single-field kernel stays the reference the fused one is held against; it does NOT forward
     // to the fused path (the same reason deviceGaussGrad does not).
@@ -441,9 +527,39 @@ void deviceLeastSquaresGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vo
         dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
         dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(), vol.data(),
         dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), dm.bndGFace.data(),
-        dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), bval.data(), lsqInvDdFor(dm),
+        dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), bval.data(), lsqInvDdFor(dm, cyc),
+        cycN ? cyc->ifCellStart.data() : nullptr, cycN ? cyc->ifPerm.data() : nullptr,
+        cycN ? cyc->nbr() : CyclicNbr{},
+        cycN ? cyc->weights.data() : nullptr, cycN ? cyc->magSf.data() : nullptr,
+        cycN ? cyc->dX.data() : nullptr, cycN ? cyc->dY.data() : nullptr, cycN ? cyc->dZ.data() : nullptr,
         gx.data(), gy.data(), gz.data());
     cudaCheck(cudaGetLastError(), "lsqGrad");
+}
+
+
+// See device_mesh.cuh. The ORDER is the host's: the scheme, then the limiter -- cellLimitedGrad wraps a
+// base scheme and limits what it returns (OF cellLimitedGrad<minmod>::calcGrad calls basicGradScheme_
+// first), so limiting a Gauss gradient where the case asked for a limited leastSquares one is a different
+// gradient, not a rounding difference.
+void deviceGradOf(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol, const DeviceBuffer<scalar>& bval,
+                  bool leastSquares, scalar cellLimitK,
+                  DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz,
+                  const DeviceCyclic* cyc)
+{
+    if (leastSquares)
+    {
+        deviceLeastSquaresGrad(dm, vol, bval, gx, gy, gz, cyc);
+    }
+    else
+    {
+        deviceGaussGrad(dm, vol, bval, gx, gy, gz);
+    }
+    if (cellLimitK > scalar(0))
+    {
+        // the interface-carrying overload is the caller's job where a pair exists: deviceCellLimitGrad
+        // takes a CellLimitInterface list, and a cyclic pair's faces are in neither of the arrays above
+        deviceCellLimitGrad(dm, vol, bval, gx, gy, gz, cellLimitK);
+    }
 }
 
 
@@ -584,33 +700,43 @@ void gradFusedKernel(
         sy[i] = 0.0;
         sz[i] = 0.0;
     }
-    for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)   // +owner internal
+    // gradKernel's transcription of the host's gaussGrad, per field: OpenFOAM's face arithmetic and the
+    // internal faces merged into face order (see gradKernel)
+    int fo = ownerStart[c];
+    const int foEnd = ownerStart[c + 1];
+    int kn = losortStart[c];
+    const int knEnd = losortStart[c + 1];
+    while (fo < foEnd || kn < knEnd)
     {
+        const bool takeOwner = (kn >= knEnd) || (fo < foEnd && fo < losort[kn]);
+        const int f = takeOwner ? fo : losort[kn];
         const scalar wf = w[f];
         const label o = own[f], n = nei[f];
         const scalar sfx = Sfx[f], sfy = Sfy[f], sfz = Sfz[f];
 #pragma unroll
         for (int i = 0; i < N; ++i)
         {
-            const scalar pf = wf * fld.vol[i][o] + (1.0 - wf) * fld.vol[i][n];
-            sx[i] += sfx * pf;
-            sy[i] += sfy * pf;
-            sz[i] += sfz * pf;
+            const scalar pf = wf * (fld.vol[i][o] - fld.vol[i][n]) + fld.vol[i][n];
+            if (takeOwner)
+            {
+                sx[i] += sfx * pf;
+                sy[i] += sfy * pf;
+                sz[i] += sfz * pf;
+            }
+            else
+            {
+                sx[i] -= sfx * pf;
+                sy[i] -= sfy * pf;
+                sz[i] -= sfz * pf;
+            }
         }
-    }
-    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)   // -neighbour internal
-    {
-        const int f = losort[k];
-        const scalar wf = w[f];
-        const label o = own[f], n = nei[f];
-        const scalar sfx = Sfx[f], sfy = Sfy[f], sfz = Sfz[f];
-#pragma unroll
-        for (int i = 0; i < N; ++i)
+        if (takeOwner)
         {
-            const scalar pf = wf * fld.vol[i][o] + (1.0 - wf) * fld.vol[i][n];
-            sx[i] -= sfx * pf;
-            sy[i] -= sfy * pf;
-            sz[i] -= sfz * pf;
+            ++fo;
+        }
+        else
+        {
+            ++kn;
         }
     }
     for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)   // +boundary

@@ -27,6 +27,7 @@
 // HOST arm on all four. Measured on validation/rhoSST at 20 iterations, the two lineages sit the same
 // distance from OpenFOAM (legacy k 3.54e-04, mirror host 4.13e-04) but 6.44e-04 from EACH OTHER -- so
 // the legacy SST is not wrong, it is a different code, and an arm must agree with its own reference.
+#include "turbulence_transport.cuh"   // turbulence::SolveControls
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
@@ -35,11 +36,16 @@
 #include "device_komega_sst.cuh"    // the shared SST physics kernels
 #include "device_dilu.cuh"
 #include "device_colour_gauss_seidel.cuh"   // DeviceCellColouring (FP-1)
+#include "device_crank_nicolson_ddt.cuh"   // DeviceCnDdt0, deviceCnFvmDdt
+#include "device_cyclic.cuh"               // DeviceCyclic, the periodic pair
 #include "komega_sst_coeffs.cuh"
 #include "pEqn.cuh"
 #include <string>
 
 namespace brae {
+// One equation's fvSchemes div and grad entries (cpu/limitedSchemes_cpp.cuh). Forward-declared: this
+// header holds only POINTERS, and the .cu that dereferences them includes the definition.
+namespace cpu { struct EqnDivScheme; struct EqnGradScheme; }
 namespace gpu {
 namespace kOmegaSSTRAS {
 
@@ -63,7 +69,20 @@ struct KOmegaSSTInput
     // rhoOldCell is rho.oldTime() as the caller resolves it (RhoStepInput::firstIteration), null ->
     // rhoCell, the host closure's rhoOldAt. Same contract as KEpsilonInput's.
     scalar                      rDeltaT    = 0.0;
+    // LOCALEULER (interFoam): the per-cell rDeltaT setRDeltaT.H formed, which both fvm::ddts take in
+    // rDeltaT's place (localEulerDdtScheme.C; the host's Compressible::rDeltaTCells). Null == the scalar.
+    // Refused beside CrankNicolson or a moving mesh, as the host refuses it.
+    const DeviceBuffer<scalar>* rDeltaTCells = nullptr;
     const DeviceBuffer<scalar>* rhoOldCell = nullptr;
+    // A MOVING MESH. `V0` is the volume the cells had BEFORE this step's move, which OpenFOAM's Euler
+    // ddt takes in the SOURCE while the diagonal keeps V (EulerDdtScheme::fvmDdt under
+    // mesh().moving()); `meshPhiInt`/`meshPhiBnd` are the mesh flux, which makes the divU the closure's
+    // SuSp terms read the ABSOLUTE flux -- fvc::div(fvc::absolute(phi, U)) = div(phi + mesh.phi()),
+    // kOmegaSSTBase.C's divU. Null on a mesh that does not move, where both collapse to the static
+    // forms. The host reference carries the same pair as Compressible::V0 / ::meshPhi.
+    const DeviceBuffer<scalar>* V0         = nullptr;
+    const DeviceBuffer<scalar>* meshPhiInt = nullptr;
+    const DeviceBuffer<scalar>* meshPhiBnd = nullptr;
     const DeviceBuffer<scalar>* nuCell     = nullptr;    // mu(T)/rho per cell.       REQUIRED here
     const DeviceBuffer<scalar>* nuBndFace  = nullptr;    // mu_b/rho_b per bnd face.  REQUIRED here
     const DeviceBuffer<scalar>* nuWallFace = nullptr;    // the same, in WALL-face order
@@ -102,6 +121,13 @@ struct KOmegaSSTInput
     const DeviceBuffer<scalar>* nutWfEBnd      = nullptr;
     const DeviceBuffer<scalar>* nutWfYplLamBnd = nullptr;
     const DeviceBuffer<label>*  nutWfKindBnd   = nullptr;
+    // nutkRoughWallFunction's per-face Ks, Cs and sqrt(sqrt(Cmu)), in boundary-face order; null when no face is
+    // rough. Its limiter's history is nutBndFace (the wall nut as correctNut is entered), required with them.
+    // `nutkRoughNoHistory` is the gate's control (BRAE_CONTROL_NUTKROUGH_NOHISTORY): the limiter against nu_w.
+    const DeviceBuffer<scalar>* nutWfKsBnd         = nullptr;
+    const DeviceBuffer<scalar>* nutWfCsBnd         = nullptr;
+    const DeviceBuffer<scalar>* nutWfRoughCmu25Bnd = nullptr;
+    bool                        nutkRoughNoHistory = false;
     // Which boundary faces nut's own patch FILLS (a `calculated` nut), so correctNut writes those and
     // leaves a pinned fixedValue alone.
     const DeviceBuffer<label>*  nutCalcMask    = nullptr;
@@ -119,17 +145,29 @@ struct KOmegaSSTInput
     const DeviceBuffer<scalar>* yCell = nullptr;         // wall distance per CELL, for F1/F2
 
     // --- schemes and solver, per field, from the case ---
+    // SEPARATE fvSchemes entries, and the kernels have taken them separately all along (:782 reads
+    // boundedOmega, :897 boundedK). The refusal that stood in front of this pair was guarding code
+    // that already worked, on a reason that expired when the HOST split landed.
     bool   boundedK     = false;
     bool   boundedOmega = false;
+    // OMEGA'S OWN div and grad entries; null means "omega takes k's", which is what a case with one
+    // `default` means and what every caller got before these existed. `fvc::grad(vf)` resolves
+    // `grad(<vf>)` by the FIELD's name, and CDkOmega reads grad(k) AND grad(omega) in ONE expression
+    // (kOmegaSSTBase.C:548), so the two must be resolved separately rather than by one flag per call.
+    const cpu::EqnDivScheme*  omegaDiv  = nullptr;
+    const cpu::EqnGradScheme* omegaGrad = nullptr;
     bool   limitedLinear = false;      // ONE flag for the pair, as the host closure carries
     scalar limiterCoeff  = 1.0;        // RAW k; the transport helper converts to 2/max(k,SMALL)
-    scalar limGradK      = 0.0;        // the LIMITER's gradient limiter, from grad(<field>)
-    bool   limGradLeastSq = false;     // ...and its SCHEME, when the case names leastSquares
     bool   linearUpwind  = false;      // `Gauss linearUpwind <name>` on the pair (TransportScheme)
     scalar luGradK       = 0.0;        // ...the cellLimited coefficient of the gradient it NAMES
     bool   correctedLaplacian = false;
+    bool   nonOrthCoeffs = false;   // nonOrthDeltaCoeffs without the correction -- inter_ueqn_cpp.cuh:181
     scalar snGradLimitCoeff   = 0.0;
-    scalar gradULimitK        = 0.0;   // grad(U) cellLimited, for the production strain
+    // grad(U)'s cellLimited coefficient lives in `co` and NOWHERE ELSE. It used to be here as well --
+    // one fvSchemes entry in two fields of one struct -- and interFoam's site filled the coeffs half
+    // only, so the production strain ran on an UNLIMITED gradient while the host limited it (nut
+    // 4.1315e-01 on validation/interFoamCyclic `sstLimU`). The refusal that caught the two
+    // disagreeing is gone with the second field: there is nothing left to disagree.
     bool   relaxEquationOmega = false;
     scalar relaxOmega         = 1.0;
     bool   relaxEquationK     = false;
@@ -142,6 +180,24 @@ struct KOmegaSSTInput
     int    polyDeg = 1;
     bool   gsK = false, gsOmega = false, gsSymmetric = true;
     int    nSweepsKE = 1;
+    // ...or `solver PBiCG; preconditioner DILU;` for BOTH equations (device_pbicg.cuh): NOT
+    // PBiCGStab, and it needs `precon` above to carry the mesh's DILU schedule. The kEpsilon twin has
+    // carried this since waves/mangroveInteraction (KEpsilonInput::pbicgKE); this branch set gsK and
+    // gsOmega UNCONDITIONALLY, so a case naming PBiCG ran symGaussSeidel sweeps under PBiCG's
+    // tolerance and said nothing -- the same silent substitution, in the twin that was not looked at.
+    bool   pbicgKE = false;
+    // psi.oldTime(): the PREVIOUS STEP's field, which the caller supplies once `turbOnFinalIterOnly no`
+    // makes the closure run on every outer corrector. Null keeps the field at entry -- identical while the
+    // closure runs once per step (GeometricField.C:904-917; the host twins carry the same note).
+    const DeviceBuffer<scalar>* kOldIn = nullptr;
+    const DeviceBuffer<scalar>* omegaOldIn = nullptr;
+    // THE SECOND EQUATION'S OWN SOLVER SETTING. `fvMatrix::solve()` looks the solver dictionary up by
+    // FIELD name (fvMatrix.C:1536-1542), so `omegaFinal` may name different tolerances, sweep counts or a
+    // different solver from `kFinal` and OpenFOAM honours each (kEpsilon.C:268 / kOmegaSSTBase.C:593 solve
+    // the second equation, :288 / :618 solve k). This closure took k's for both and the driver refused a
+    // mismatch. Null keeps that: the caller has ONE setting and says so. The host twin is
+    // kOmegaSST_cpp.cu's EqnSolveSetting.
+    const turbulence::SolveControls* omegaSolve = nullptr;
     // FP-1: sweep the honoured smoothSolver in COLOUR order over `colouring` (SolveControls::gsColour).
     bool   gsColour = false;
     const DeviceCellColouring* colouring = nullptr;
@@ -154,6 +210,27 @@ struct KOmegaSSTInput
 
     KOmegaSSTCoeffs co;
     scalar Prt = 1.0;
+
+    // fvm::ddt(alpha, rho, psi) under CRANKNICOLSON, as KEpsilonInput carries it: the scheme's clock,
+    // the two equations' OWN ddt0 fields kept by the caller across the run, and the old-old level of
+    // each field (and of rho in the variable-density lineage). Null runs the Euler branch, which is
+    // what `rDeltaT` drives. kOmegaSSTBase.C takes fvm::ddt through ddtSchemes at :572 and :602, so
+    // a case naming CrankNicolson gets it on both equations or on neither.
+    const cpu::fv::CrankNicolsonClock* cn = nullptr;
+    DeviceCnDdt0*               cnDdt0Omega = nullptr;
+    DeviceCnDdt0*               cnDdt0K     = nullptr;
+    const DeviceBuffer<scalar>* rhoOOCell   = nullptr;
+    const DeviceBuffer<scalar>* omegaOO     = nullptr;
+    const DeviceBuffer<scalar>* kOO         = nullptr;
+
+    // A PERIODIC PAIR, exactly as KEpsilonInput carries it: the pair's own off-diagonal for the
+    // transport matrix AND for the solve (TransportScheme::cyc, solveScalarEqn's last argument),
+    // the flux those equations convect with on those faces, and -- in the variable-density lineage --
+    // the VOLUMETRIC flux there, which is what divU takes and is a different field from cycPhi.
+    // Null is a mesh with no pair; `hasCoupledPatches` below then refuses one that has.
+    DeviceCyclic*               cyc         = nullptr;
+    const DeviceBuffer<scalar>* cycPhi      = nullptr;
+    const DeviceBuffer<scalar>* cycPhiByRho = nullptr;
 
     // --- refusals, the same set the kEpsilon closure carries ---
     bool        hasCoupledPatches      = false;
@@ -169,6 +246,10 @@ struct KOmegaSSTResiduals
 {
     scalar omega = 0.0;
     scalar k     = 0.0;
+    // ...and each solve's full record -- initial and final residual and iteration count -- which is what
+    // a gate compares with OpenFOAM's "Solving for omega" lines (interFoam's device arm reads these)
+    DeviceSolverPerf omegaPerf;
+    DeviceSolverPerf kPerf;
 };
 
 // One kOmegaSSTBase::correct(): production -> omega wall function -> CDkOmega/F1/F2 -> omega eqn ->

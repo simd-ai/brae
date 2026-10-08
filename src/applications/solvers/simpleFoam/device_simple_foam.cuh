@@ -849,6 +849,14 @@ private:
     bool   hasWedge_ = false;   // any wedge (axisymmetric constraint) U patch -> per-step rotated value                                  // any freestreamVelocity/Pressure (mixed) patch present
     bool   hasPiov_ = false;                                   // any pressureInletOutletVelocity (directionMixed) patch present
     bool   hasSym_ = false;                                    // any slip/symmetry patch present (general normal)
+    // ANY U patch whose boundary coefficients DIFFER PER COMPONENT, which is what the shared momentum
+    // diagonal has to be folded from (fvMatrix::A() takes cmptAv of internalCoeffs, relax() takes
+    // cmptMax(cmptMag)): symmetry/slip (vf_k = |n_k|), a WEDGE (d_k = 0.5(1 - cellT_kk)), and a
+    // directionMixed pressureInletOutletVelocity (d_k = sqrt(1 - n_k^2): the normal component
+    // zeroGradient, the tangential ones fixed). Folding iC[0] instead is right ONLY while the three
+    // components agree -- which is why the piov compensation stayed hidden for so long; see
+    // tests/simple_piov_vs_openfoam.sh's header for the measurement that named it.
+    bool   hasCmptBC_ = false;
     bool   hasTotalP_ = false;                                 // any totalPressure p patch present (per-step refValue)
     bool   hasCyclic_ = false;                                 // any cyclic (periodic) interface -> Jacobi-PCG pressure (no AMG)
     DeviceCyclic cyc_;                                          // periodic interface coupling (OF updateInterfaceMatrix)

@@ -52,6 +52,10 @@ struct CodedFunction1Spec
     std::string unsupportedKeys;
 };
 
+// The scalar shim the snippet compiles against, for a coded object that extends it (the coded
+// PatchFunction1 adds OpenFOAM's field types on top).
+const char* codedFunction1ScalarShim();
+
 class CodedFunction1
 {
 public:

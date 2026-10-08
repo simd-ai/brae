@@ -77,8 +77,10 @@ enum class DivScheme
     limitedLinear,    // weights from the NVDTVD limiter on magSqr(U); no correction
     limitedLinearV,   // weights from the NVDVTVDV vector limiter;  no correction
     LUST,             // weights = 0.75*linear + 0.25*upwind;       correction = 0.25*linearUpwind's
-    linearUpwindV     // weights UNCHANGED;  a DIFFERENT correction: linearUpwind's, limited so it cannot
+    linearUpwindV,    // weights UNCHANGED;  a DIFFERENT correction: linearUpwind's, limited so it cannot
                       // overshoot the owner-to-neighbour jump along its own direction (linearUpwindV.C)
+    vanLeerV,         // weights from vanLeer's limiter on the NVDVTVDV vector r; no correction, no k
+    linear            // weights = the mesh's own (central differencing); no correction
 };
 
 struct MomentumInput
@@ -113,6 +115,7 @@ struct MomentumInput
     // deferred correction to the source (gaussLaplacianScheme.C). OpenFOAM's default when the word is
     // absent, so most real cases set it.
     bool   correctedLaplacian = false;
+    bool   nonOrthCoeffs = false;   // nonOrthDeltaCoeffs with no correction -- solver_controls.cuh:226
     scalar snGradLimitCoeff = 0.0;               // `limited <k> corrected` (OF limitedSnGrad)
     bool   hasMRF = false;                                       // present in the case -> must refuse
     bool   hasFvOptions = false;                                 // an UNIMPLEMENTED option -> must refuse

@@ -658,6 +658,7 @@ Residuals rhoSimpleStep(
     uin.gradPLeastSq       = in.gradPLeastSq;
     uin.gradULULimitK      = in.gradULULimitK;
     uin.correctedLaplacian = in.correctedLaplacian;
+    uin.nonOrthCoeffs = in.nonOrthCoeffs;
     uin.snGradLimitCoeff   = in.snGradLimitCoeff;
     uin.hasMRF             = in.hasMRF;
     uin.hasFvOptions       = in.hasFvOptions;
@@ -748,6 +749,7 @@ Residuals rhoSimpleStep(
         ein.limGradKELeastSq  = in.limGradKELeastSq;
         ein.gradKELimitK      = in.gradKELimitK;
         ein.correctedLaplacian = in.correctedLaplacian;
+        ein.nonOrthCoeffs = in.nonOrthCoeffs;
         ein.snGradLimitCoeff  = in.snGradLimitCoeff;
         ein.hasMRF            = in.hasMRF;
         ein.hasFvOptions      = in.hasFvOptions;
@@ -896,7 +898,9 @@ Residuals rhoSimpleStep(
     pin.pRefCell             = f.pressureControl.refCell;
     pin.pRefValue            = f.pressureControl.refValue;
     pin.correctedLaplacian   = in.correctedLaplacian;
+    pin.nonOrthCoeffs = in.nonOrthCoeffs;
     pin.correctedFvcSnGrad   = in.correctedFvcSnGrad;    // snGradSchemes, for the SIMPLEC fvc::snGrad(p)
+    pin.fvcSnGradNonOrthCoeffs = in.fvcSnGradNonOrthCoeffs;
     pin.fvcSnGradLimitCoeff  = in.fvcSnGradLimitCoeff;
     pin.gradPLeastSq = in.gradPLeastSq;
     pin.gradPLimitK  = in.gradPLimitK;
@@ -1419,7 +1423,8 @@ Residuals rhoSimpleStep(
                              in.relaxEpsilon, in.relaxK, in.tolTurb, in.relTolTurb, in.maxIterTurb,
                              keco, &kres, in.boundedTurb, /*dropTerm=*/0, &comp, in.fvOpts,
                              in.relaxEquationEps, in.relaxEquationK, /*constrainBeforeWall=*/true,
-                             in.limitedLinearTurb, in.turbLimiterCoeff, in.turbLimGradK,
+                             // `keco.gradKLimitK` carries the limiter's gradient limiter (one field)
+                             in.limitedLinearTurb, in.turbLimiterCoeff,
                              in.minIterTurb, &nsel, in.linearUpwindTurb, in.turbLUGradK);
         res["epsilon"] = kres.epsilon;
         res["k"]       = kres.k;

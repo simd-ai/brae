@@ -265,7 +265,9 @@ RhoStepInput buildDeviceStepInput(
     in.schemeKE  = hin.schemeKE;
     in.schemeCoeffU = hin.schemeCoeffU;
     in.correctedLaplacian  = hin.correctedLaplacian;
+    in.nonOrthCoeffs = hin.nonOrthCoeffs;
     in.correctedFvcSnGrad  = hin.correctedFvcSnGrad;    // snGradSchemes, for the SIMPLEC fvc::snGrad(p)
+    in.fvcSnGradNonOrthCoeffs = hin.fvcSnGradNonOrthCoeffs;
     in.fvcSnGradLimitCoeff = hin.fvcSnGradLimitCoeff;
     in.ddtEuler           = hin.ddtEuler;   // firstIteration is set per step by the loop below
     in.snGradLimitCoeff   = hin.snGradLimitCoeff;
@@ -354,6 +356,13 @@ TurbulenceHookOptions buildTurbulenceHookOptions(
     opt.sstCo.gradKLimitK  = hin.gradKLimitK;
     opt.sstCo.gradKLeastSq = hin.gradKLeastSq;
     opt.sstCo.gradULeastSq = hin.gradULeastSq;
+    // ...and grad(U)'s cellLimited coefficient, which this struct did NOT carry. It reached the SST
+    // closure through a top-level `gradULimitK` field on the input struct, filled from the kEpsilon
+    // coeffs beside it (`opt.co.gradULimitK`) -- one fvSchemes entry, three places. The closure reads
+    // `co.gradULimitK` now, so it has to be in the SST coeffs, and aerofoilNACA0012 (`cellLimited
+    // grad(U|k|omega)`) says so: without this line its CUDA arm reads k 1.7e-04, omega 9.9e-04 and
+    // nut 1.1e-03 against OpenFOAM at iteration ONE, where the host arm reads 2.6e-12.
+    opt.sstCo.gradULimitK  = hin.gradULimitK;
     opt.Prt                   = hf.Prt;
     opt.bounded               = hin.boundedTurb;
     opt.correctedLaplacian    = hin.correctedLaplacian;
@@ -369,8 +378,6 @@ TurbulenceHookOptions buildTurbulenceHookOptions(
     opt.luGradK              = hin.turbLUGradK;
     opt.limitedLinear        = hin.limitedLinearTurb;
     opt.limiterCoeff         = hin.turbLimiterCoeff;
-    opt.limGradK             = hin.turbLimGradK;
-    opt.limGradLeastSq       = hin.turbLimGradLeastSq;
     opt.relaxEquationK   = hin.relaxEquationK;
     opt.relaxK           = hin.relaxK;
     // THE SECOND SCALAR'S OWN relaxation key -- `omega` under kOmegaSST, `epsilon` otherwise. The driver

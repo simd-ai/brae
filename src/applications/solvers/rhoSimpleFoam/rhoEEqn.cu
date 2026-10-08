@@ -382,7 +382,7 @@ void assembleEEqn(
     {
         DeviceBuffer<scalar> gammaf, lD, lU, lL, lIC, lBC;
         deviceInterpolate(dm, *in.alphaEffCell, gammaf);
-        deviceLaplacianCoeffs(dm, gammaf, lD, lU, lL, in.correctedLaplacian);
+        deviceLaplacianCoeffs(dm, gammaf, lD, lU, lL, in.correctedLaplacian || in.nonOrthCoeffs);
         // The FACE variant: the boundary diffusivity is the PATCH alphaEff, not the owner cell's.
         deviceBCLaplacianCoeffsFace(dbHe, *in.alphaEffBndFace, lIC, lBC);
 

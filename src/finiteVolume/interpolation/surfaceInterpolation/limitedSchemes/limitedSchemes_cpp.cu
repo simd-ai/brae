@@ -15,6 +15,7 @@ namespace {
 using detail::rScalar;
 using detail::rVector;
 using detail::clamp01;
+using detail::vanLeerLimiter;
 
 } // namespace
 
@@ -59,6 +60,117 @@ std::vector<scalar> limitedLinearWeights(
         const vector d { C[N].x - C[P].x, C[N].y - C[P].y, C[N].z - C[P].z };
         const scalar r = rScalar(phi[f], vf.internal[P], vf.internal[N], gradVf[P], gradVf[N], d);
         const scalar lim = clamp01(twoByk * r);
+        w[f] = lim*cd[f] + (1.0 - lim)*((phi[f] >= 0.0) ? 1.0 : 0.0);
+    }
+    return w;
+}
+
+
+std::vector<std::vector<scalar>> limitedLinearPatchWeights(
+    const std::vector<std::vector<scalar>>& phiBoundary,
+    const std::vector<scalar>&              vf,
+    const std::vector<vector>&              gradVf,
+    scalar                                  k,
+    const std::vector<FvPatch>&             patches)
+{
+    std::vector<std::vector<scalar>> out(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        const FvPatch& fp = patches[pi];
+        if (!fp.coupled || fp.size == 0) continue;
+        const std::size_t n = static_cast<std::size_t>(fp.size);
+        std::vector<scalar> vfP(n), vfN(n);
+        std::vector<vector> gP(n), gN(n);
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const label c = fp.faceCells[i];
+            vfP[i] = vf[static_cast<std::size_t>(c)];
+            vfN[i] = patchNeighbourValue(fp, static_cast<label>(i), vf);
+            gP[i]  = gradVf[static_cast<std::size_t>(c)];
+            gN[i]  = patchNeighbourValue(fp, static_cast<label>(i), gradVf);
+        }
+        out[pi] = limitedLinearWeightsCoupled(phiBoundary[pi], fp.weights, fp.delta,
+                                              vfP, vfN, gP, gN, k);
+    }
+    return out;
+}
+
+
+std::vector<scalar> vanLeerWeights(
+    const std::vector<scalar>&    phi,
+    const GeometricField<scalar>& vf,
+    const std::vector<vector>&    gradVf,
+    const PrimitiveMesh&          m,
+    const FvGeometry&             g)
+{
+    const label nIf = m.nInternalFaces();
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    const std::vector<scalar>& cd = g.weights();
+    const std::vector<vector>& C  = g.C();
+
+    std::vector<scalar> w(nIf);
+    for (label f = 0; f < nIf; ++f)
+    {
+        const label P = own[f], N = nei[f];
+        const vector d { C[N].x - C[P].x, C[N].y - C[P].y, C[N].z - C[P].z };
+        const scalar r = rScalar(phi[f], vf.internal[P], vf.internal[N], gradVf[P], gradVf[N], d);
+        // no clamp: vanLeer's limiter reaches 2, and capping it at 1 would be limitedLinear
+        const scalar lim = vanLeerLimiter(r);
+        w[f] = lim*cd[f] + (1.0 - lim)*((phi[f] >= 0.0) ? 1.0 : 0.0);
+    }
+    return w;
+}
+
+
+std::vector<scalar> interfaceCompressionWeights(
+    const std::vector<scalar>&    phi,
+    const GeometricField<scalar>& vf,
+    const PrimitiveMesh&          m,
+    const FvGeometry&             g)
+{
+    const label nIf = m.nInternalFaces();
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    const std::vector<scalar>& cd = g.weights();
+
+    std::vector<scalar> w(static_cast<std::size_t>(nIf));
+    for (label f = 0; f < nIf; ++f)
+    {
+        const scalar phiP = vf.internal[static_cast<std::size_t>(own[f])];
+        const scalar phiN = vf.internal[static_cast<std::size_t>(nei[f])];
+        // Quartic compression scheme
+        const scalar aP = 1 - 4*phiP*(1 - phiP);
+        const scalar aN = 1 - 4*phiN*(1 - phiN);
+        const scalar lim = detail::clamp01(1 - std::fmax(aP*aP, aN*aN));
+        w[static_cast<std::size_t>(f)] = detail::blend(lim, cd[f], phi[f]);
+    }
+    return w;
+}
+
+
+std::vector<scalar> vanLeerVWeights(
+    const std::vector<scalar>&    phi,
+    const GeometricField<vector>& vf,
+    const std::vector<tensor>&    gradVf,
+    const PrimitiveMesh&          m,
+    const FvGeometry&             g)
+{
+    const label nIf = m.nInternalFaces();
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    const std::vector<scalar>& cd = g.weights();
+    const std::vector<vector>& C = g.C();
+
+    std::vector<scalar> w(nIf);
+    for (label f = 0; f < nIf; ++f)
+    {
+        const label P = own[f];
+        const label N = nei[f];
+        const vector d{C[N].x - C[P].x, C[N].y - C[P].y, C[N].z - C[P].z};
+        const scalar r = rVector(phi[f], vf.internal[P], vf.internal[N], gradVf[P], gradVf[N], d);
+        // vanLeer's limiter is not clamped -- see vanLeerWeights
+        const scalar lim = vanLeerLimiter(r);
         w[f] = lim*cd[f] + (1.0 - lim)*((phi[f] >= 0.0) ? 1.0 : 0.0);
     }
     return w;

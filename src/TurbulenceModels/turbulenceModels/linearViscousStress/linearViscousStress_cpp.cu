@@ -2,6 +2,7 @@
 #include "linearViscousStress_cpp.cuh"
 #include "cellLimitedGrad_cpp.cuh"
 #include "fvm.cuh"
+#include <stdexcept>
 
 namespace brae {
 namespace cpu {
@@ -18,6 +19,11 @@ SurfaceScalarField effectiveFaceViscosity(
     SurfaceScalarField gf = fvc::interpolate(nuEff, m, g, patches);
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
+        if (patches[pi].coupled)
+        {
+            // a coupled face keeps fvc::interpolate's value, from the two cells
+            continue;
+        }
         if (pi < nuEffBnd.size() && nuEffBnd[pi].size() == gf.boundary[pi].size())
         {
             gf.boundary[pi] = nuEffBnd[pi];
@@ -35,18 +41,34 @@ std::vector<vector> divDevReffExplicit(
     const FvGeometry&             g,
     const std::vector<FvPatch>&   patches,
     scalar                        gradULimitK,
-    bool                          gradULeastSq)
+    bool                          gradULeastSq,
+    const std::vector<tensor>*              gradUGiven,
+    const std::vector<std::vector<tensor>>* gradUBndGiven)
 {
-    // fvc::grad(U) -- cell tensors, then the boundary tensors with OpenFOAM's gaussGrad boundary
-    // correction (wall-normal component replaced by snGrad(U)).
-    std::vector<tensor> gradU = gradULeastSq ? fvc::leastSquaresGrad(U, m, g, patches)
-                                             : fvc::gaussGrad(U, m, g, patches);
-    // The case's gradScheme, applied to the SAME gradient the dev2 term is built from. OpenFOAM resolves
-    // fvc::grad(U) here against gradSchemes/grad(U); running the unlimited base scheme where the case
-    // names `cellLimited Gauss linear 1` is a different discretisation under the case's own scheme name.
-    if (gradULimitK > 0.0) cellLimitGrad(gradU, U, gradULimitK, m, g, patches);
-    const std::vector<std::vector<tensor>> gradUb =
-        fvc::gradUBoundary(U, gradU, m, g, patches);
+    if ((gradUGiven == nullptr) != (gradUBndGiven == nullptr))
+        throw std::runtime_error(
+            "divDevReffExplicit: a given grad(U) needs its cells AND its boundary -- the boundary is the "
+            "one gaussGrad corrected when the gradient was formed, not one rebuilt from U now.");
+    std::vector<tensor> gradU;
+    std::vector<std::vector<tensor>> gradUb;
+    if (gradUGiven)
+    {
+        gradU = *gradUGiven;
+        gradUb = *gradUBndGiven;
+    }
+    else
+    {
+        // fvc::grad(U) -- cell tensors, then the boundary tensors with OpenFOAM's gaussGrad boundary
+        // correction (wall-normal component replaced by snGrad(U)).
+        gradU = gradULeastSq ? fvc::leastSquaresGrad(U, m, g, patches)
+                             : fvc::gaussGrad(U, m, g, patches);
+        // The case's gradScheme, applied to the SAME gradient the dev2 term is built from. OpenFOAM
+        // resolves fvc::grad(U) here against gradSchemes/grad(U); running the unlimited base scheme where
+        // the case names `cellLimited Gauss linear 1` is a different discretisation under the case's own
+        // scheme name.
+        if (gradULimitK > 0.0) cellLimitGrad(gradU, U, gradULimitK, m, g, patches);
+        gradUb = fvc::gradUBoundary(U, gradU, m, g, patches);
+    }
 
     // nuEff*dev2(T(grad(U))) as a volTensorField (cells + boundary faces).
     std::vector<tensor> tCell(gradU.size());
@@ -89,12 +111,15 @@ void addDivDevReff(
     bool                          correctedLaplacian,
     scalar                        snGradLimitCoeff,
     scalar                        gradULimitK,
-    bool                          gradULeastSq)
+    bool                          gradULeastSq,
+    bool                          nonOrthCoeffs,
+    const std::vector<tensor>*              gradUGiven,
+    const std::vector<std::vector<tensor>>* gradUBndGiven)
 {
     // Implicit half: OpenFOAM writes `- fvm::laplacian(nuEff, U)` inside divDevReff, and UEqn.H adds
     // divDevReff to the equation -- so the laplacian enters with coefficient -1.
     const SurfaceScalarField gammaf = effectiveFaceViscosity(nuEff, nuEffBnd, m, g, patches);
-    addEqual(UEqn, fvm::laplacian<vector>(gammaf, U, m, g, patches, correctedLaplacian), -1.0);
+    addEqual(UEqn, fvm::laplacian<vector>(gammaf, U, m, g, patches, correctedLaplacian, nonOrthCoeffs), -1.0);
 
     // ...and, when `corrected`, its explicit deferred correction.
     //
@@ -114,9 +139,17 @@ void addDivDevReff(
         // Gauss linear 1 on aerofoilNACA0012. Measured there at iteration 1 with the unlimited gradient:
         // the momentum source on the 120 aerofoil-adjacent cells 2.36e-05 against OpenFOAM's, with the
         // gradient, the dev2 term, the diagonal and the off-diagonals all exact (queue item 25).
-        std::vector<tensor> gradU = gradULeastSq ? fvc::leastSquaresGrad(U, m, g, patches)
-                                             : fvc::gaussGrad(U, m, g, patches);
-        if (gradULimitK > 0.0) cellLimitGrad(gradU, U, gradULimitK, m, g, patches);
+        std::vector<tensor> gradU;
+        if (gradUGiven)
+        {
+            gradU = *gradUGiven;
+        }
+        else
+        {
+            gradU = gradULeastSq ? fvc::leastSquaresGrad(U, m, g, patches)
+                                 : fvc::gaussGrad(U, m, g, patches);
+            if (gradULimitK > 0.0) cellLimitGrad(gradU, U, gradULimitK, m, g, patches);
+        }
         const std::vector<vector> corr =
             fvm::laplacianNonOrthSource<vector, tensor>(gammaf, U, gradU, m, g, patches,
                                                         snGradLimitCoeff);
@@ -139,7 +172,8 @@ void addDivDevReff(
     // tests/test_divdevreff_cpp.cu pins the result against an OpenFOAM dump; do not "simplify" the signs
     // here without re-running it.
     const std::vector<vector> expl =
-        divDevReffExplicit(U, nuEff, nuEffBnd, m, g, patches, gradULimitK, gradULeastSq);
+        divDevReffExplicit(U, nuEff, nuEffBnd, m, g, patches, gradULimitK, gradULeastSq,
+                           gradUGiven, gradUBndGiven);
     const std::vector<scalar>& V = g.V();
     for (std::size_t c = 0; c < expl.size(); ++c)
     {

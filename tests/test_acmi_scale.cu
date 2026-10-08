@@ -23,6 +23,7 @@
 #include "acmi_mesh.cuh"
 #include <cmath>
 #include <cstdio>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -183,6 +184,44 @@ int main()
         check(!hasACMITimeScale(m), "...and the solver is not asked to rebuild geometry every step");
         PrimitiveMesh ms = acmiWithScale(Function1::table({{0.0, 1.0}, {1.0, 0.0}}));
         check(hasACMITimeScale(ms), "a scaled interface DOES ask for the per-step rebuild");
+    }
+
+    // ---- Leg 6: a per-face CODED scale is not this path's -------------------------------------------
+    // The boundary reader captures `scale { type coded; }` for the interFoam host loop, which evaluates
+    // it (cyclic_acmi_cpp); here acmiScale stays empty, which would read as "no scale" and run the
+    // interface fully open. It must refuse, naming the coded scale.
+    {
+        const PrimitiveMesh src = acmitest::twoBlockACMI(acmitest::ACMI_DY, /*withBlockage=*/true);
+        std::vector<PatchInfo> ps = src.patches();
+        for (PatchInfo& p : ps)
+        {
+            if (p.type == "cyclicACMI")
+            {
+                p.acmiScaleCoded = true;
+                p.acmiScaleCodedSpec.name = "scale";
+                p.acmiScaleCodedSpec.code = "return tmp<scalarField>::New(this->patch().size(), 1.0);";
+                break;
+            }
+        }
+        propagateACMIScale(ps);
+        PrimitiveMesh m;
+        m.assign(src.points(), src.faceVerts(), src.faceOffsets(), src.owner(), src.neighbour(),
+                 std::move(ps), src.nCells());
+        check(hasACMITimeScale(m), "a coded scale asks for the per-step rebuild");
+        bool refused = false;
+        try
+        {
+            FvGeometry g;
+            std::vector<FvPatch> fvp;
+            std::vector<AMIInterface> amis;
+            buildGeometryPatchesAndAMI(m, g, fvp, amis, 0.0);
+        }
+        catch (const std::exception& e)
+        {
+            refused = std::string(e.what()).find("type coded") != std::string::npos;
+            std::printf("        (%s)\n", std::string(e.what()).substr(0, 110).c_str());
+        }
+        check(refused, "a coded scale is refused by name on this path, not run fully open");
     }
 
     std::printf(failures ? "== FAILED (%d) ==\n" : "== PASSED ==\n", failures);

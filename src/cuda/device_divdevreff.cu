@@ -49,6 +49,10 @@ struct BndSnGradView
     const scalar* vf;
     const scalar* ref;
     const scalar* rgr;   // may be null: no fixedGradient face on this component
+    // 1 on an inletOutlet / outletInlet face: a MIXED patch whose valueFraction the device keeps as the
+    // type code itself (1 = inflow fixed at the inletValue, 0 = outflow zeroGradient) -- see the kernel
+    const label*  io;
+    const label*  oio;
 };
 
 // boundary gradient: gradB = gradC + n (x) (snGrad - n & gradC), OF gaussGrad::correctBoundaryConditions.
@@ -85,6 +89,10 @@ void gradBKernel(
     BndSnGradView bx,
     BndSnGradView by,
     BndSnGradView bz,
+    const label* __restrict__ wedgeMask,   // 1 on a wedge face; null when the mesh has none
+    const scalar* __restrict__ wedgeT,     // that face's faceT, 9 per face, row-major
+    const label* __restrict__ gradSymMask, // 1 on a symmetry / symmetryPlane MESH patch face; null = none
+    const scalar* __restrict__ gradSymN,   // that face's mirror normal, 3 per face
     scalar* __restrict__ gradB)
 {
     const int bi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -102,6 +110,52 @@ void gradBKernel(
     for (int q = 0; q < 9; ++q)
         gc[q] = gradU[q * nC + c];
 
+    // THE GRADIENT FIELD'S OWN PATCH VALUE ON A WEDGE, before the normal correction -- the host's
+    // boundaryGradU (fvc.cu:637-672) and OpenFOAM's: gaussGrad builds grad(U) with
+    // extrapolatedCalculated patches, but fvPatchField::New puts a constraint patch's own type in
+    // their place (fvPatchFieldNew.C) and calcGrad ends in gGrad.correctBoundaryConditions()
+    // (gaussGrad.C:106), so on a WEDGE the value is transform(faceT, cell gradient) = faceT & G &
+    // faceT^T and not the cell gradient. The host measured what leaving it out costs on
+    // LES/nozzleFlow2D, where every cell touches both wedge planes: HbyA 2e-06 out in every cell at
+    // step two. This kernel left it out, and read the same: |U| 3.6e-06 from the host arm at step
+    // two on that case's laminar twin, with step one exact because U starts at rest.
+    const bool wedge = wedgeMask && wedgeMask[bi];
+    if (wedge)
+    {
+        // the host's transformTensor, in its loop order: AB = T & G, then R = AB & T^T
+        const scalar* T = wedgeT + 9*bi;
+        scalar AB[9];
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                AB[i*3+j] = T[i*3+0]*gc[0*3+j] + T[i*3+1]*gc[1*3+j] + T[i*3+2]*gc[2*3+j];
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                gc[i*3+j] = AB[i*3+0]*T[j*3+0] + AB[i*3+1]*T[j*3+1] + AB[i*3+2]*T[j*3+2];
+    }
+
+    else if (gradSymMask && gradSymMask[bi])
+    {
+        // ...and on a SYMMETRY PLANE the gradient's patch value is the cell gradient averaged with its
+        // mirror image, (G + R G R^T)/2 with R = I - 2 nn -- the host's symmetryValue (fvc.cu:589-601),
+        // in its expressions and its loop order. The normal correction below then replaces the normal
+        // row; what the mirror adds is the tangential rows' NORMAL column, dU_n/dt, zeroed. The host
+        // measured what leaving it out costs on RAS/damBreakLeakage, whose cyclicACMI hands its closed
+        // area to two symmetry patches: HbyA 3% out beside the baffle on the opening step.
+        const scalar mx = gradSymN[3*bi + 0], my = gradSymN[3*bi + 1], mz = gradSymN[3*bi + 2];
+        const scalar R[9] = { scalar(1) - 2.0*(mx*mx), scalar(0) - 2.0*(mx*my), scalar(0) - 2.0*(mx*mz),
+                              scalar(0) - 2.0*(my*mx), scalar(1) - 2.0*(my*my), scalar(0) - 2.0*(my*mz),
+                              scalar(0) - 2.0*(mz*mx), scalar(0) - 2.0*(mz*my), scalar(1) - 2.0*(mz*mz) };
+        scalar AB[9], T[9];
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                AB[i*3+j] = R[i*3+0]*gc[0*3+j] + R[i*3+1]*gc[1*3+j] + R[i*3+2]*gc[2*3+j];
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                T[i*3+j] = AB[i*3+0]*R[j*3+0] + AB[i*3+1]*R[j*3+1] + AB[i*3+2]*R[j*3+2];
+        for (int q = 0; q < 9; ++q)
+            gc[q] = (gc[q] + T[q])/2.0;
+    }
+
     // A coupled face keeps the extrapolated cell gradient: OF's correction runs only on !coupled().
     if (bx.type[bi] == 8)
     {
@@ -118,10 +172,40 @@ void gradBKernel(
     {
         const label t = bv[k].type[bi];
         const scalar rg = bv[k].rgr ? bv[k].rgr[bi] : scalar(0);
-        if (t == 1 || t == 2)   sn[k] = (ub[k] - uc[k]) * dc[bi];                          // fvPatchField
+        // inletOutlet and outletInlet ARE mixed patches (inletOutletFvPatchField.H derives from
+        // mixedFvPatchField), so their snGrad is the mixed one with the switch as the valueFraction and
+        // refGrad zero: vf*(inletValue - pif)*deltaCoeffs. The type code the io switch writes IS that
+        // valueFraction, and the base formula (ub - uc)*dc below gives the same number only while the
+        // stored value was blended with the CURRENT switch. It was not on the one corrector where
+        // OpenFOAM's patch is still updated() and keeps the assembly's valueFraction: with one pressure
+        // corrector that lagged value is the step's last, and at the next assembly the switch has moved
+        // where the value has not. MEASURED on RAS/waterChannel with an inletOutlet atmosphere and
+        // nCorrectors 1, laminar: HbyA.z 6.7e-07 in the atmosphere cells at step 2 (1e-12 elsewhere),
+        // U 6.2e-09 against OpenFOAM, 7.8e-14 at step 1; the SST run of the same case 1.3e-07.
+        const bool io = (bv[k].io && bv[k].io[bi]) || (bv[k].oio && bv[k].oio[bi]);
+        if (io)                 sn[k] = scalar(t) * (bv[k].ref[bi] - uc[k]) * dc[bi];      // mixed, vf = the switch
+        else if (t == 1 || t == 2) sn[k] = (ub[k] - uc[k]) * dc[bi];                       // fvPatchField
         else if (t == 5)        sn[k] = bv[k].vf[bi] * (bv[k].ref[bi] - uc[k]) * dc[bi]     // mixed
                                       + (scalar(1) - bv[k].vf[bi]) * rg;
         else                    sn[k] = rg;                       // zeroGradient (0) / fixedGradient
+    }
+    if (wedge)
+    {
+        // wedgeFvPatchField::snGrad is NOT the mixed slot's vf*(ref - uc)*dc. That form carries the
+        // VALUE's rotation, faceT, where OpenFOAM's snGrad takes cellT = faceT & faceT
+        // (wedgePolyPatch.C:128) and HALF the deltaCoeffs:
+        //     snGrad = (cellT & pif - pif)*0.5*deltaCoeffs
+        // The two agree to first order in the wedge angle and differ at second.
+        const scalar* T = wedgeT + 9*bi;
+        scalar cT[9];
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                cT[i*3+j] = T[i*3+0]*T[0*3+j] + T[i*3+1]*T[1*3+j] + T[i*3+2]*T[2*3+j];
+        for (int k = 0; k < 3; ++k)
+        {
+            const scalar rot = cT[k*3+0]*uc[0] + cT[k*3+1]*uc[1] + cT[k*3+2]*uc[2];
+            sn[k] = (rot - uc[k]) * (scalar(0.5)*dc[bi]);
+        }
     }
 
     // (n & gradC)_j = sum_i n_i gc[i][j]
@@ -141,6 +225,8 @@ inline BndSnGradView snGradView(const DeviceBoundary& db)
     v.vf   = db.valueFraction.data();
     v.ref  = db.refValue.data();
     v.rgr  = db.refGrad.size() ? db.refGrad.data() : nullptr;
+    v.io   = db.ioMask.size() ? db.ioMask.data() : nullptr;
+    v.oio  = db.oioMask.size() ? db.oioMask.data() : nullptr;
     return v;
 }
 
@@ -175,35 +261,39 @@ void tensorDivKernel(
 
     scalar d[3] = { 0, 0, 0 };
 
-    // internal faces owned by c (+): sigma_face = w*own + (1-w)*nei
-    for (int fi = ownerStart[c]; fi < ownerStart[c + 1]; ++fi)
+    // The host reference's fvc::div(tensor) (fvc.cu), face for face and rounding for rounding:
+    //  - the internal faces in FACE order, a cell's owned (+) and neighboured (-) faces interleaved, as the
+    //    host's scatter reaches them -- this took every owned face and then every neighboured one -- then
+    //    the boundary faces in patch order;
+    //  - the contraction g++ makes of it (objdump -dl of the host object): the face value
+    //    fma(w, own, (1-w)*nei), and Sf & T as fma(Sz, T_zj, fma(Sx, T_xj, Sy*T_yj)) -- the y product
+    //    rounded -- on internal and boundary faces alike; the accumulations plain adds.
+    // MEASURED on mixerVessel2D's mesh with a smooth U (scratch parity harness, the host's sigma in):
+    // 38-58 per cent of cells off the host's sum in the last bit per component before, 0 after.
+    int fo = ownerStart[c];
+    const int u1 = ownerStart[c + 1];
+    int kn = losortStart[c];
+    const int l1 = losortStart[c + 1];
+    while (fo < u1 || kn < l1)
     {
+        const int fl = (kn < l1) ? losort[kn] : 0x7fffffff;
+        const bool owned = (fo < u1 && fo < fl);
+        const int fi = owned ? fo : fl;
         const int o = own[fi], n2 = nei[fi];
         const scalar wf = w[fi];
+        const scalar wn = 1.0 - wf;
         const scalar sx = Sfx[fi], sy = Sfy[fi], sz = Sfz[fi];
         for (int j = 0; j < 3; ++j)
         {
-            const scalar s0 = wf*sigmaC[(0*3+j)*nC+o] + (1.0-wf)*sigmaC[(0*3+j)*nC+n2];
-            const scalar s1 = wf*sigmaC[(1*3+j)*nC+o] + (1.0-wf)*sigmaC[(1*3+j)*nC+n2];
-            const scalar s2 = wf*sigmaC[(2*3+j)*nC+o] + (1.0-wf)*sigmaC[(2*3+j)*nC+n2];
-            d[j] += sx*s0 + sy*s1 + sz*s2;
+            const scalar s0 = fma(wf, sigmaC[(0*3+j)*nC+o], wn*sigmaC[(0*3+j)*nC+n2]);
+            const scalar s1 = fma(wf, sigmaC[(1*3+j)*nC+o], wn*sigmaC[(1*3+j)*nC+n2]);
+            const scalar s2 = fma(wf, sigmaC[(2*3+j)*nC+o], wn*sigmaC[(2*3+j)*nC+n2]);
+            const scalar r = fma(sz, s2, fma(sx, s0, sy*s1));
+            if (owned) d[j] += r;
+            else       d[j] -= r;
         }
-    }
-
-    // internal faces neighbouring c (-)
-    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
-    {
-        const int fi = losort[k];
-        const int o = own[fi], n2 = nei[fi];
-        const scalar wf = w[fi];
-        const scalar sx = Sfx[fi], sy = Sfy[fi], sz = Sfz[fi];
-        for (int j = 0; j < 3; ++j)
-        {
-            const scalar s0 = wf*sigmaC[(0*3+j)*nC+o] + (1.0-wf)*sigmaC[(0*3+j)*nC+n2];
-            const scalar s1 = wf*sigmaC[(1*3+j)*nC+o] + (1.0-wf)*sigmaC[(1*3+j)*nC+n2];
-            const scalar s2 = wf*sigmaC[(2*3+j)*nC+o] + (1.0-wf)*sigmaC[(2*3+j)*nC+n2];
-            d[j] -= sx*s0 + sy*s1 + sz*s2;
-        }
+        if (owned) ++fo;
+        else       ++kn;
     }
 
     // boundary faces (+): sigma_b at the boundary face (empty patches excluded, as in CPU fvc::div)
@@ -214,10 +304,12 @@ void tensorDivKernel(
         const int f = bndGFace[bi];
         const scalar sx = Sfx[f], sy = Sfy[f], sz = Sfz[f];
         for (int j = 0; j < 3; ++j)
-            d[j] += sx*sigmaB[(0*3+j)*nB+bi] + sy*sigmaB[(1*3+j)*nB+bi] + sz*sigmaB[(2*3+j)*nB+bi];
+            d[j] += fma(sz, sigmaB[(2*3+j)*nB+bi], fma(sx, sigmaB[(0*3+j)*nB+bi], sy*sigmaB[(1*3+j)*nB+bi]));
     }
 
-    // = V*fvc::div (the /V and *V cancel -> raw sum)
+    // the RAW sum. The legacy momentum order takes it as the source directly; the /V and *V do NOT cancel
+    // in floating point, and interFoam's order forms the host's fl(sum/V)*V from it (UEqn.cu,
+    // addStressAsHostKernel).
     dX[c] = d[0];
     dY[c] = d[1];
     dZ[c] = d[2];
@@ -253,6 +345,10 @@ void deviceBoundaryGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                                       gradU.data(), nC, uxb.data(), uyb.data(), uzb.data(), Ux.data(), Uy.data(), Uz.data(),
                                       dbU.comp[0].deltaCoeffs.data(),
                                       snGradView(dbU.comp[0]), snGradView(dbU.comp[1]), snGradView(dbU.comp[2]),
+                                      dbU.comp[0].wedgeMask.size() ? dbU.comp[0].wedgeMask.data() : nullptr,
+                                      dbU.comp[0].wedgeT.size() ? dbU.comp[0].wedgeT.data() : nullptr,
+                                      dbU.comp[0].gradSymMask.size() ? dbU.comp[0].gradSymMask.data() : nullptr,
+                                      dbU.comp[0].gradSymN.size() ? dbU.comp[0].gradSymN.data() : nullptr,
                                       gradB.data());
     cudaCheck(cudaGetLastError(), "boundaryGradU");
 }
@@ -318,12 +414,25 @@ void deviceDivDevReff(
     const DeviceProcStress* proc,
     const DeviceBuffer<scalar>* const* UbStored,
     scalar gradULimitK,
-    bool gradULeastSq)
+    bool gradULeastSq,
+    const DeviceBuffer<scalar>* gradUGiven,
+    const DeviceBuffer<scalar>* gradBGiven)
 {
     const int nC = dm.nCells, nB = dm.nBndFaces;
     const DeviceBuffer<scalar>* Uc[3] = { &Ux, &Uy, &Uz };
     if (gradULeastSq && (cyc || ami || proc))
         throw std::runtime_error("deviceDivDevReff: grad(U) leastSquares is not computed across a coupled interface.");
+    const bool given = (gradUGiven != nullptr);
+    if ((gradUGiven == nullptr) != (gradBGiven == nullptr))
+        throw std::runtime_error(
+            "deviceDivDevReff: a given grad(U) needs its cells AND the boundary gaussGrad corrected when it was "
+            "formed; the caller gave one without the other.");
+    if (given && (cyc || ami || proc || gradULimitK > scalar(0) || gradULeastSq
+               || gradUGiven->size() != static_cast<std::size_t>(9) * nC
+               || gradBGiven->size() != static_cast<std::size_t>(9) * nB))
+        throw std::runtime_error(
+            "deviceDivDevReff: a given grad(U) is carried on an uncoupled mesh with an unlimited Gauss grad(U) only, "
+            "9 values per cell and per boundary face.");
 
     // gradU (packed 9*nC): row i = gaussGrad(U_i).
     DevReffWorkspace& ws = devReffWorkspace(dm);       // FP-10: persistent temporaries, see above
@@ -355,65 +464,73 @@ void deviceDivDevReff(
     // (tests/test_grad_fused.cu holds the fused kernel to three separate deviceGaussGrad calls by
     // memcmp). The per-component work AFTER the gradient -- the cyclic and AMI contributions, which
     // OpenFOAM adds to the base Gauss gradient before any limiting -- is unchanged and still per i.
-    DeviceBuffer<scalar>* bvals = ws.bvals;
-    for (int i = 0; i < 3; ++i)
+    // the given field (the registry's grad(U)) in place of forming one -- see the header
+    if (given)
     {
-        // U's boundary as OF's fvc::grad(U) reads it: the STORED value when the caller keeps one, and a
-        // re-derivation only when it does not. The two agree only while the caller evaluates U's boundary
-        // before every assembly, which OpenFOAM does not -- see the header (queue items 25, 30).
-        if (UbStored && UbStored[i] && UbStored[i]->size() == static_cast<std::size_t>(nB))
-            deviceCopy(bvals[i], *UbStored[i]);
-        else
-            deviceBCValue(dbU.comp[i], *Uc[i], bvals[i]);
-        if (proc)   // processor faces are bcType 8: deviceBCValue leaves them, the halo supplies the value
-        {
-            proc->halo->exchange(Uc[i]->data());
-            proc->halo->scatterBoundaryValues(Uc[i]->data(), *proc->weights, *proc->procStart, bvals[i].data());
-            proc->halo->waitExchange();   // recv buffer is reused by the next component -- see device_halo.cuh
-        }
+        deviceCopy(gradU, *gradUGiven);
     }
-    DeviceBuffer<scalar>* gxs = ws.gxs;
-    DeviceBuffer<scalar>* gys = ws.gys;
-    DeviceBuffer<scalar>* gzs = ws.gzs;
-    // fvc::grad(U) through the case's grad(U) entry (linearViscousStress.C's divDevRhoReff takes
-    // dev2(T(fvc::grad(U)))): leastSquares where it resolves so, the host's gradULeastSq.
+    else
     {
-        const DeviceBuffer<scalar>* vol[3] = {Uc[0], Uc[1], Uc[2]};
-        const DeviceBuffer<scalar>* bv[3]  = {&bvals[0], &bvals[1], &bvals[2]};
-        if (gradULeastSq) deviceLeastSquaresGradFused(dm, 3, vol, bv, gxs, gys, gzs);   // FP-3: one launch
-        else              deviceGaussGradFused(dm, 3, vol, bv, gxs, gys, gzs);
-    }
-    for (int i = 0; i < 3; ++i)
-    {
-        DeviceBuffer<scalar>& bval = bvals[i];
-        DeviceBuffer<scalar>& gx = gxs[i];
-        DeviceBuffer<scalar>& gy = gys[i];
-        DeviceBuffer<scalar>& gz = gzs[i];
-
-        if (cyc)   // + cyclic faces in gradU (periodic consistency)
+        DeviceBuffer<scalar>* bvals = ws.bvals;
+        for (int i = 0; i < 3; ++i)
         {
-            if (cyc->rotational) deviceCyclicAddGradRot(*cyc, Ux, Uy, Uz, i, dm.V, gx, gy, gz);   // neighbour rotated
-            else interfaceAddGrad(*cyc, *Uc[i], dm.V, gx, gy, gz);
+            // U's boundary as OF's fvc::grad(U) reads it: the STORED value when the caller keeps one, and a
+            // re-derivation only when it does not. The two agree only while the caller evaluates U's boundary
+            // before every assembly, which OpenFOAM does not -- see the header (queue items 25, 30).
+            if (UbStored && UbStored[i] && UbStored[i]->size() == static_cast<std::size_t>(nB))
+                deviceCopy(bvals[i], *UbStored[i]);
+            else
+                deviceBCValue(dbU.comp[i], *Uc[i], bvals[i]);
+            if (proc)   // processor faces are bcType 8: deviceBCValue leaves them, the halo supplies the value
+            {
+                proc->halo->exchange(Uc[i]->data());
+                proc->halo->scatterBoundaryValues(Uc[i]->data(), *proc->weights, *proc->procStart, bvals[i].data());
+                proc->halo->waitExchange();   // recv buffer is reused by the next component -- see device_halo.cuh
+            }
         }
-        if (ami)
+        DeviceBuffer<scalar>* gxs = ws.gxs;
+        DeviceBuffer<scalar>* gys = ws.gys;
+        DeviceBuffer<scalar>* gzs = ws.gzs;
+        // fvc::grad(U) through the case's grad(U) entry (linearViscousStress.C's divDevRhoReff takes
+        // dev2(T(fvc::grad(U)))): leastSquares where it resolves so, the host's gradULeastSq.
         {
-            if (ami->rotational) deviceAmiAddGradRot(*ami, *Uc[i], *amiUN[i], dm.V, gx, gy, gz);   // neighbour rotated
-            else interfaceAddGrad(*ami, *Uc[i], dm.V, gx, gy, gz);
+            const DeviceBuffer<scalar>* vol[3] = {Uc[0], Uc[1], Uc[2]};
+            const DeviceBuffer<scalar>* bv[3]  = {&bvals[0], &bvals[1], &bvals[2]};
+            if (gradULeastSq) deviceLeastSquaresGradFused(dm, 3, vol, bv, gxs, gys, gzs);   // FP-3: one launch
+            else              deviceGaussGradFused(dm, 3, vol, bv, gxs, gys, gzs);
+        }
+        for (int i = 0; i < 3; ++i)
+        {
+            DeviceBuffer<scalar>& bval = bvals[i];
+            DeviceBuffer<scalar>& gx = gxs[i];
+            DeviceBuffer<scalar>& gy = gys[i];
+            DeviceBuffer<scalar>& gz = gzs[i];
+
+            if (cyc)   // + cyclic faces in gradU (periodic consistency)
+            {
+                if (cyc->rotational) deviceCyclicAddGradRot(*cyc, Ux, Uy, Uz, i, dm.V, gx, gy, gz);   // neighbour rotated
+                else interfaceAddGrad(*cyc, *Uc[i], dm.V, gx, gy, gz);
+            }
+            if (ami)
+            {
+                if (ami->rotational) deviceAmiAddGradRot(*ami, *Uc[i], *amiUN[i], dm.V, gx, gy, gz);   // neighbour rotated
+                else interfaceAddGrad(*ami, *Uc[i], dm.V, gx, gy, gz);
+            }
+
+            // ASYNC on the per-thread stream, ordered before the consumer, as deviceGradU and
+            // deviceLeastSquaresGradU do it. These were BLOCKING copies -- nine per momentum assembly, each
+            // draining the queue and leaving the host to refill it, inside a phase measured at 59% GPU-busy
+            // -- and a blocking copy is also what makes this function impossible to capture into a graph,
+            // which is where FP-10's row is headed. Same bytes, same order, same bits.
+            cudaCheck(cudaMemcpyAsync(gradU.data() + (0*3+i)*nC, gx.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "ddr g");
+            cudaCheck(cudaMemcpyAsync(gradU.data() + (1*3+i)*nC, gy.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "ddr g");
+            cudaCheck(cudaMemcpyAsync(gradU.data() + (2*3+i)*nC, gz.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "ddr g");
         }
 
-        // ASYNC on the per-thread stream, ordered before the consumer, as deviceGradU and
-        // deviceLeastSquaresGradU do it. These were BLOCKING copies -- nine per momentum assembly, each
-        // draining the queue and leaving the host to refill it, inside a phase measured at 59% GPU-busy
-        // -- and a blocking copy is also what makes this function impossible to capture into a graph,
-        // which is where FP-10's row is headed. Same bytes, same order, same bits.
-        cudaCheck(cudaMemcpyAsync(gradU.data() + (0*3+i)*nC, gx.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "ddr g");
-        cudaCheck(cudaMemcpyAsync(gradU.data() + (1*3+i)*nC, gy.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "ddr g");
-        cudaCheck(cudaMemcpyAsync(gradU.data() + (2*3+i)*nC, gz.data(), nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread), "ddr g");
+        // ...then LIMIT it, if the case named a limited grad(U). OF applies cellLimitedGrad to the base
+        // Gauss gradient AFTER the coupled-patch contributions are in, which is exactly here.
+        if (gradULimitK > scalar(0)) deviceCellLimitGradU(dm, dbU, Ux, Uy, Uz, gradU, gradULimitK, cyc, ami);
     }
-
-    // ...then LIMIT it, if the case named a limited grad(U). OF applies cellLimitedGrad to the base
-    // Gauss gradient AFTER the coupled-patch contributions are in, which is exactly here.
-    if (gradULimitK > scalar(0)) deviceCellLimitGradU(dm, dbU, Ux, Uy, Uz, gradU, gradULimitK, cyc, ami);
 
     // sigma cell
     DeviceBuffer<scalar>& sigmaC = ws.sigmaC;
@@ -424,12 +541,24 @@ void deviceDivDevReff(
     // boundary gradient + sigma boundary
     DeviceBuffer<scalar>& gradB = ws.gradB;
     gradB.resize(static_cast<std::size_t>(9) * nB);
-    gradBKernel<<<nBlocks(nB), TPB>>>(nB, dm.bndCell.data(), dm.bndGFace.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
-                                      gradU.data(), nC, uxb.data(), uyb.data(), uzb.data(), Ux.data(), Uy.data(), Uz.data(),
-                                      /* bnd deltaCoeffs */ dbU.comp[0].deltaCoeffs.data(),
-                                      snGradView(dbU.comp[0]), snGradView(dbU.comp[1]), snGradView(dbU.comp[2]),
-                                      gradB.data());
-    cudaCheck(cudaGetLastError(), "ddr gradB");
+    // ...the given field's boundary, as gaussGrad corrected it when the field was formed
+    if (given)
+    {
+        deviceCopy(gradB, *gradBGiven);
+    }
+    else
+    {
+        gradBKernel<<<nBlocks(nB), TPB>>>(nB, dm.bndCell.data(), dm.bndGFace.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
+                                          gradU.data(), nC, uxb.data(), uyb.data(), uzb.data(), Ux.data(), Uy.data(), Uz.data(),
+                                          /* bnd deltaCoeffs */ dbU.comp[0].deltaCoeffs.data(),
+                                          snGradView(dbU.comp[0]), snGradView(dbU.comp[1]), snGradView(dbU.comp[2]),
+                                          dbU.comp[0].wedgeMask.size() ? dbU.comp[0].wedgeMask.data() : nullptr,
+                                          dbU.comp[0].wedgeT.size() ? dbU.comp[0].wedgeT.data() : nullptr,
+                                          dbU.comp[0].gradSymMask.size() ? dbU.comp[0].gradSymMask.data() : nullptr,
+                                          dbU.comp[0].gradSymN.size() ? dbU.comp[0].gradSymN.data() : nullptr,
+                                          gradB.data());
+        cudaCheck(cudaGetLastError(), "ddr gradB");
+    }
     DeviceBuffer<scalar>& sigmaB = ws.sigmaB;
     sigmaB.resize(static_cast<std::size_t>(9) * nB);
     sigmaKernel<<<nBlocks(nB), TPB>>>(nB, gradB.data(), nuBnd.data(), sigmaB.data());

@@ -174,17 +174,21 @@ struct RhoStepInput
     scalar schemeCoeffHe = 1.0, schemeCoeffKE = 1.0;
     scalar limGradHeK    = 0.0, limGradKEK    = 0.0;
     bool   limGradHeLeastSq = false, limGradKELeastSq = false;
-    bool   turbLimGradLeastSq = false;
     // grad(p)'s own gradSchemes entry resolving to leastSquares (fvcGrad.C:149): the momentum source
     // -grad(p)*V, U = HbyA - rAtU*grad(p), SIMPLEC's HbyA correction and each pressure branch's
     // non-orthogonal correction all take it. The host reference's StepInput::gradPLeastSq.
     bool   gradPLeastSq = false;
     scalar gradPLimitK  = 0.0;   // ...and its cellLimited coefficient, on the same five consumers (0 = unlimited)
     bool   correctedLaplacian = false;
+    // ...and WHICH delta coefficients: `uncorrected` takes nonOrthDeltaCoeffs with no correction
+    // flux (uncorrectedSnGrad.H:113-119). See solver_controls.cuh:226.
+    bool   nonOrthCoeffs = false;
     // snGradSchemes, read only by rhoPcEqn's SIMPLEC correction (fvc::snGrad(p), pcEqn.H:64). A
     // different block from the laplacian's and defaulting to `corrected` when absent, as OpenFOAM does
     // (schemesLookup.C:82). See solver_controls.cuh.
     bool   correctedFvcSnGrad  = true;
+    // ...and the snGrad block's own coefficient choice -- same two facts, other block.
+    bool   fvcSnGradNonOrthCoeffs = true;
     scalar fvcSnGradLimitCoeff = 0.0;
     scalar snGradLimitCoeff   = 0.0;
     bool   isE = true;                    // he == "e" selects Ekp, "h" selects K

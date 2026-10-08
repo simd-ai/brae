@@ -12,6 +12,7 @@
 #include <vector>
 #include <memory>
 #include <string>
+#include <cstdlib>
 
 namespace brae {
 
@@ -20,8 +21,57 @@ namespace brae {
 struct AMGGraphCache {
     cudaGraphExec_t exec = nullptr; cudaGraph_t graph = nullptr; const void* key = nullptr;
     int keyEpoch = -1;   // deviceReductionScratchEpoch() at capture: the V-cycle captures reductions, whose scratch is regrown by freeing
+    // ...and the ADDRESSING the graph was captured against. `key` is A.diag, a pointer, and the pool
+    // hands equal-sized blocks back at the same address: on a moving mesh the hierarchy is rebuilt
+    // every step and its levels return at the same pointers with the same counts and a different
+    // pairing, so a pointer-only guard replays the previous step's V-cycle. That is the defect
+    // measured on waveMakerMultiPaddlePiston (device U 3.0057e-02, and a second run in the same
+    // process differing from the first), fixed there by stamping the addressing --
+    // nextDeviceAddressingId(), device_mesh.cuh -- and compared here for the same reason.
+    long long keyAddressingId = 0;
+    // ...and the coupled pair's buffers the cycle read at capture (AMGPair::epoch)
+    unsigned long long keyPairEpoch = 0;
+    // ...and the matrix's OFF-DIAGONAL buffers (amgGraphViewMoved, below)
+    const void* keyUpper = nullptr;
+    const void* keyLower = nullptr;
     ~AMGGraphCache();
 };
+
+// WHETHER THE VIEW A CAPTURED V-CYCLE READ HAS MOVED. A capture bakes every pointer the cycle was handed, and
+// the double-precision cycle is handed the caller's matrix itself on the finest grid: diag, upper, lower. The
+// guards compared `diag` alone. interFoam's pressure step folds its diagonal into a buffer that is new at
+// every solve and takes upper and lower from the matrix of that corrector, and the pool hands the three
+// blocks back in another combination: MEASURED 2026-10-06 on laminar/waves/stokesI, the plain loop with the
+// double-precision cycle (BRAE_PCG_DEVICE=0 BRAE_AMG_FP32=0, and BRAE_CORR_SCALING=1, which takes that loop),
+// solve by solve: diag 0x3324a0000 at two solves running, the key equal, and upper 0x33a400000 then
+// 0x339e00000. The replayed cycle smoothed with the off-diagonals of the solve before, which by then held
+// something else, and every Final solve from the second step on ran its 1,000 iterations without moving
+// (25,224 iterations in 27 steps for 309). The single-precision cycle reads its own cast copies and takes
+// only addressing from the view -- but for a hierarchy of one grid, where the coarsest solve is the view's --
+// so all four guards ask this. The default path is not one of them: deviceAMGPCGGraph copies the matrix into
+// buffers of its own at every solve. BRAE_CONTROL_AMG_GRAPH_VIEW_NOT_COMPARED=1 answers "not moved" always --
+// the gate's control, deliberately wrong (tests/interfoam_write/amg_pcg/captured_cycle_view.sh).
+inline bool amgGraphViewMoved(
+    const AMGGraphCache& c,
+    const DeviceLduView& A)
+{
+    static const bool notCompared = std::getenv("BRAE_CONTROL_AMG_GRAPH_VIEW_NOT_COMPARED") != nullptr;
+    if (notCompared)
+    {
+        return false;
+    }
+    return c.keyUpper != A.upper || c.keyLower != A.lower
+        || c.keyAddressingId != static_cast<long long>(A.addressingId);
+}
+
+inline void amgGraphViewStamp(
+    AMGGraphCache& c,
+    const DeviceLduView& A)
+{
+    c.keyUpper = A.upper;
+    c.keyLower = A.lower;
+    c.keyAddressingId = static_cast<long long>(A.addressingId);
+}
 
 // Cached CUDA conditional-graph of the device-resident PCG WHILE-body (#6, BRAE_PCG_DEVICE). Owned PER-SOLVER (in
 // AMGData) so it is destroyed with the hierarchy. A process-global cache is unsafe: after one solver is freed, a
@@ -40,10 +90,24 @@ struct PCGGraphCache {
     // The whole solve is captured now (item 72), so the graph also holds the MESH pointers and the sizes
     // it was built for; a different matrix on the same psi must rebuild rather than replay.
     const void* keyOwner = nullptr; int keyNC = -1; int keyNF = -1;
+    unsigned long long keyAddressingId = 0;   // the owner pointer's content identity (recycled pool blocks)
     DeviceBuffer<scalar> pA, Ax, sNormF, sInit, sRes; DeviceBuffer<int> sIter;   // persistent (graph-referenced)
     // ...and the right-hand side and the fine matrix, copied in per solve, because a captured prologue
     // bakes their pointers and the callers hand in fresh buffers each time.
     DeviceBuffer<scalar> gB, gDiag, gUpper, gLower;
+    // THE COUPLED PAIR'S VALUES the same way -- the cyclic coefficient, its jump, the AMI coefficient -- and its
+    // ADDRESSING in the key. A caller that builds the jump afresh each solve (interFoam's pressure step) had the
+    // graph replay against the first solve's pointer: RAS/damBreakPorousBaffle, phi 5.6e-03 from OpenFOAM.
+    DeviceBuffer<scalar> gCycCoeff, gCycJump, gAmiIfc;
+    int keyNCyc = -1; int keyNAmi = -1; bool keyJump = false;
+    unsigned long long keyPairEpoch = 0;      // AMGPair::epoch at capture: the cycle's pair buffers
+    const void* keyCycOwn = nullptr; const void* keyCycNbr = nullptr;
+    const void* keyAmiOwn = nullptr; const void* keyAmiOff = nullptr;
+    const void* keyAmiNbr = nullptr; const void* keyAmiW = nullptr;
+    // THE STOPPING CONTROLS ON THE DEVICE (tol, relTol, maxIter, minIter), written before each launch, for the
+    // serial graph: entries that differ in them -- interFoam's p_rgh and p_rghFinal, relTol 0.01 and 0 -- then
+    // share one captured graph instead of re-capturing at every solve.
+    DeviceBuffer<scalar> sCtl;
     ~PCGGraphCache();
 };
 
@@ -52,6 +116,7 @@ struct AMGLevel {
     int nFine = 0, nCoarse = 0, nCoarseFaces = 0;
     DeviceBuffer<label>  map;                                   // grid-k cell -> grid-(k+1) cell
     DeviceBuffer<label>  cOwn, cNei, cOwnerStart, cLosort, cLosortStart;  // grid-(k+1) addressing (SpMV gather)
+    unsigned long long   addressingId = 0;                      // of cOwn/cNei's content, see nextDeviceAddressingId
     DeviceBuffer<label>  faceRestrict, faceFlip;               // grid-k face -> grid-(k+1) face (>=0) / -1-coarseCell
     DeviceBuffer<scalar> cDiag, cUpper, cLower;                // grid-(k+1) matrix (rebuilt by Galerkin)
     // DETERMINISTIC GALERKIN GATHER (see the note above galDiagGatherK in device_amg.cu).
@@ -69,13 +134,42 @@ struct AMGLevel {
     // re-evaluated each step from the current fine matrix by the precomputed RAP scatter recipe below.
     DeviceBuffer<label>  Prow, Pcol;                           // CSR rowPtr [nFine+1], col [nnz] (coarse columns)
     DeviceBuffer<scalar> Pval;                                 // CSR values [nnz]
+    // ...and in single precision, for the single-precision cycle: cast once with that cycle's buffers
+    // (amgCastFP32). The values are fixed for the life of the hierarchy, so neither a clone nor the disk cache
+    // carries them.
+    DeviceBuffer<float>  PvalF;
     // RAP scatter recipe: nTriples contributions A_c[dst] += w * A_fine[src]. src/dstKind: 0=diag 1=upper 2=lower.
     int nTriples = 0;
     DeviceBuffer<label>  rapSrcKind, rapSrcIdx, rapDstKind, rapDstIdx;
     DeviceBuffer<scalar> rapW;
+    // THE SAME TWO SUMS IN A FIXED ORDER (amgSaFixedOrder): P^T by coarse row -- the fine row and the value of
+    // each entry, fine rows ascending -- and the recipe above SORTED BY DESTINATION (diag, then upper, then
+    // lower; the build's order within one), with where each destination's triples start. The restriction and
+    // the coarse matrices were atomicAdd scatters, whose order is whichever thread arrives first: pcorr on a
+    // 2-D moving mesh takes this hierarchy by default, and MEASURED 2026-10-06 two runs of the same binary
+    // wrote 44 of 51 files differently on waveMakerFlap and 79 of 102 on waveMakerPiston (as shipped, 30 and
+    // 66 steps), none with BRAE_PCORR_AMG=plain. Derived from the lists above and so in neither the disk
+    // cache nor a comparison of two hierarchies; a clone copies them. RvalF is cast where PvalF is.
+    // EACH SUM IS TAKEN IN TWO LAUNCHES: every product, one thread an entry, into the `term` buffers below;
+    // then each destination's run of them added in order, one thread a destination. One launch that did
+    // both -- a thread a destination, loading each term's operands as it went -- cost more than the scatter
+    // it replaced. MEASURED 2026-10-06 on waveMakerPiston, the same 22 steps and 1,051 pcorr iterations in
+    // every arm, ms a step, scatter / one launch / two: the coarse matrices 7.9 / 12.7 / 8.9 and the
+    // iterations 75.7 / 78.9 / 78.1 at 896,000 cells (the step 745.7 / 754.1 / 748.7); the coarse matrices
+    // 0.5 / 1.0 / 0.5 at the tutorial's 56,000 (the step 42.7 / 43.6 / 42.7).
+    DeviceBuffer<label> Rrow;
+    DeviceBuffer<label> Rfine;
+    DeviceBuffer<scalar> Rval;
+    DeviceBuffer<float> RvalF;
+    DeviceBuffer<label> rapStart;
+    DeviceBuffer<scalar> Rterm;
+    DeviceBuffer<float> RtermF;
+    DeviceBuffer<scalar> rapTerm;
     DeviceLduView coarseView() const {
-        return {nCoarse, nCoarseFaces, cDiag.data(), cUpper.data(), cLower.data(), cOwn.data(), cNei.data(),
-                cOwnerStart.data(), cLosort.data(), cLosortStart.data()};
+        DeviceLduView v{nCoarse, nCoarseFaces, cDiag.data(), cUpper.data(), cLower.data(), cOwn.data(), cNei.data(),
+                        cOwnerStart.data(), cLosort.data(), cLosortStart.data()};
+        v.addressingId = addressingId;
+        return v;
     }
 };
 
@@ -84,6 +178,8 @@ struct AMGLevel {
 // The standard cure for high-aspect-ratio anisotropy where point Jacobi/Chebyshev stall (see cf-airfoil-aero-test).
 struct GridColoring {
     int nColors = 0;
+    int nCells = 0;                        // of the graph coloured, with its addressing id: gsColoringFor's stale check
+    unsigned long long addressingId = 0;
     DeviceBuffer<label> cells;   // grid cells reordered by color (size = grid nCells)
     DeviceBuffer<label> start;   // color offsets into cells[] (size nColors+1, host-readable copy below)
     std::vector<label>  startH;  // host copy of start (the smoother loops colors on the host, launching per color)
@@ -120,6 +216,67 @@ struct GridColoring {
     mutable DeviceBuffer<scalar> bP, psiP;     // nCells: gathered per sweep
 };
 
+// THE MATRIX'S COUPLED PAIR (cyclic, cyclicAMI) ON EVERY GRID. The hierarchy is built on internal faces, so until
+// 2026-10-04 its cycle preconditioned the two sides of a pair as uncoupled blocks and left the Krylov loop
+// everything that crosses it. MEASURED on RAS/mixerVesselAMI (894,950 cells, every solve pinned at 1e-13),
+// p_rgh's first four solves: 482 409 467 398 iterations, and 66 62 65 63 for the same hierarchy on the operator
+// WITHOUT the pair -- the pair was the difference.
+// With aggregation (a piecewise-constant prolongator) the Galerkin coarse pair is the fine one with its cells
+// mapped: A_c[I][J] = sum of A[i][j] over i in I, j in J, and a cell of one side never shares an aggregate with
+// one of the other (aggregates follow internal faces). So grid g holds, for each interface face, the grid-g cell
+// of its own cell and of each neighbour slot; the stencil's offsets, its weights and the coefficients are the
+// fine pair's own. The pair's diagonal part is already in the folded diagonal amgGalerkin coarsens.
+// Refreshed at EVERY solve by amgCouplePair: the coefficients are the solve's, and a rotating AMI changes its
+// stencil at every step.
+struct AMGPair
+{
+    int n = 0;                                  // interface faces; 0 = this solve's matrix has no pair
+    int nSlots = 0;                             // neighbour slots: n one-to-one, the stencil's entries for an AMI
+    bool stencil = false;                       // an AMI's weighted stencil (off, w); else one slot of weight 1
+    std::vector<DeviceBuffer<label>> own;       // [g][face]: the grid-g cell of the face's own cell
+    std::vector<DeviceBuffer<label>> nbr;       // [g][slot]: the grid-g cell of the slot's neighbour cell
+    DeviceBuffer<label> off;                    // stencil: face -> its slots, n + 1
+    DeviceBuffer<scalar> w;                     // stencil weights, and in single precision
+    DeviceBuffer<float> wF;
+    DeviceBuffer<scalar> ifc;                   // this solve's coefficient a face, and in single precision
+    DeviceBuffer<float> ifcF;
+    DeviceBuffer<scalar> dense;                 // the coarsest grid's pair entries, row-major, for its dense LU
+    // ON A SMALL GRID THE PAIR IS A DENSE MATRIX (single precision, n_g x n_g row-major; empty on a larger grid).
+    // Every one of the pair's faces is carried on every grid unmerged, so on a grid of a few hundred cells tens
+    // of thousands of atomic adds land on the same few addresses: MEASURED on RAS/mixerVesselAMI (83,656 faces),
+    // what the pair adds to an iteration grid by grid, us: 23-52 on grids of 895k down to 3k cells, and 60-72 on
+    // the grids of 787, 392, 195 and 97 cells. There the entries are summed once a solve into denseF and a
+    // product adds a row a thread, no atomics.
+    std::vector<DeviceBuffer<float>> denseF;
+    // THE PAIR'S FACES BY OWN CELL, GRID BY GRID, so that a cell's faces are added in face order. Every face is
+    // carried on every grid, so a coarse cell owns hundreds of them and the fine one up to six; added with
+    // atomicAdd a face (pairAddT, pairDenseK) their sum's order was the threads' -- MEASURED 2026-10-07 on
+    // RAS/mixerVesselAMI's pinned row: with every other pair sum ordered, two runs of one binary still wrote
+    // 25 of 34 files differently on the AMG-PCG and none on the case's own solver. ownCells[g] lists the
+    // grid-g cells that own a face, ownStart[g] where each one's faces begin in ownFaces[g] (face order). One
+    // thread a cell adds its faces' terms in that order (pairGatherT; the dense grids' rows, pairDenseChunkT).
+    // The own cells are the mesh's and the hierarchy's, so the lists are made once (byOwnAddressing,
+    // byOwnFaces say for what).
+    // WHERE A CELL OWNS MANY FACES THE SUM IS TAKEN IN TWO OR THREE LAUNCHES, not by one thread: every face's
+    // term (a thread a face, into `term`, in the by-own order), then a cell's run of terms added in order, or
+    // -- where a run is longer than PAIR_DIRECT_MAX -- each chunk of PAIR_CHUNK terms summed first and a
+    // cell's chunks added in order: a fixed association all the same. One thread a cell
+    // walking its faces was the first cut and it cost the solve itself: MEASURED on mixerVesselAMI, the
+    // pressure solve 280 ms a step with the atomic adds and 610 with one thread a cell, all of it on the
+    // grids of 25,651 down to 1,580 cells, where a few hundred cells own the pair's 83,656 faces between them
+    // (grid 9's residual 3.6 -> 93.5 ms a step).
+    std::vector<DeviceBuffer<label>> ownCells, ownStart, ownFaces;
+    std::vector<DeviceBuffer<label>> chunkStart, cellChunk;    // [g]: a chunk's first term; a cell's first chunk
+    std::vector<int> mostFaces;                                // [g]: the most faces one cell of the grid owns
+    mutable DeviceBuffer<scalar> term, chunkSum;               // the work of one product, shared by the grids
+    mutable DeviceBuffer<float> termF, chunkSumF;
+    DeviceBuffer<scalar> strip;                                // the dense matrices' work: a strip a chunk
+    DeviceBuffer<float> stripF;
+    unsigned long long byOwnAddressing = 0;
+    int byOwnFaces = 0;
+    unsigned long long epoch = 0;               // moves when a buffer above does: what a captured cycle compares
+};
+
 struct AMGData {
     int nFine = 0;
     std::vector<AMGLevel> level;                                // level[k]: grid k -> grid k+1 (+ grid k+1's matrix)
@@ -129,6 +286,14 @@ struct AMGData {
     bool spectrumReady = false;                                // estimated once (D^-1 A is diagonal-scale invariant -> stable)
     bool gsSmooth = false;                                      // multicolor Gauss-Seidel smoother (BRAE_AMG_GS) instead of weighted-Jacobi
     bool saSmooth = false;                                      // smoothed aggregation (BRAE_AMG_SA): sparse smoothed P + general RAP coarse operator
+    // THE HIERARCHY HOLDS THE CALLER'S COUPLED PAIR ITSELF: it was agglomerated over [internal faces | interface
+    // entries] and its coarse matrices are made from both (DeviceSimpleSolver -- simpleFoam, pimpleFoam). Set by
+    // that builder; amgCouplePair then carries nothing. A pair carried a SECOND time on the coarse grids leaves
+    // the cycle no positive-definite preconditioner: tests/test_mean_velocity_force.cu's undriven duct, two
+    // pressure solves of 100 ended after 1,000 iterations at residuals 3.4e+02 and 9.5e+04 and the mean velocity
+    // was 11,116 after 50 steps where it decays to 0.437 -- found by the full suite 2026-10-08, there since the
+    // pair went onto every grid for interFoam (2026-10-04).
+    bool pairInCoarseMatrices = false;
     bool corrScaling = false;                                  // OF-GAMG coarse-correction scaling (nonlinear precond -> needs flexible CG)
     DeviceBuffer<scalar> sScNum, sScDen, sScAlpha, sZrOld;     // correction-scaling + flexible-CG scalars (device-resident, graph-safe)
     DeviceBuffer<scalar> wA, rA;                                // persistent V-cycle out/in (fixed addrs -> graph valid)
@@ -139,6 +304,16 @@ struct AMGData {
     std::vector<DeviceBuffer<float>> fDiag, fUpper, fLower;     // FP32 matrices per grid
     std::vector<DeviceBuffer<float>> vAxF, vRF, vXF, vBF;       // FP32 V-cycle work vectors per grid
     bool fp32Alloc = false;
+    // THE FINE COEFFICIENTS THE COARSE MATRICES WERE LAST BUILT FROM (amgGalerkinKept), for a caller whose
+    // matrix often comes back the same -- a PISO corrector after the first in a step solves the first one's
+    // matrix (amgFineCompare has the measurement). keptDiffers is the comparison's answer on the device.
+    // fp32Current: the single-precision copies were cast since the last Galerkin; fp32Stands: the caller found
+    // the fine matrix unchanged (amgGalerkinStands), so the next amgCastFP32 has nothing to cast.
+    DeviceBuffer<scalar> keptDiag, keptUpper, keptLower;
+    DeviceBuffer<int> keptDiffers;
+    bool keptValid = false;
+    bool fp32Current = false;
+    bool fp32Stands = false;
     // FP-12: the FP32 SpMV's operand, per grid, as ONE contiguous row instead of two indirections.
     // csrRow[g] is nCells+1 offsets; csrCol[g] the column of each entry; csrVal[g] its FP32 value;
     // csrSrc[g] says where that value comes from in the FP64 face arrays (f for upper[f], -(f+1) for
@@ -158,6 +333,7 @@ struct AMGData {
     // capture. coarseLUn is the level size it was factorised for, and 0 when there is no factorisation
     // (level too big, flag off, or amgGalerkin not yet run): the V-cycle dispatch tests it against the
     // grid it is about to solve and falls through to the iterative coarsest solvers when they differ.
+    AMGPair pair;                                               // the solve's coupled pair on every grid
     DeviceBuffer<scalar> coarseLU;                              // n*n row-major, L (unit diagonal) and U in place
     DeviceBuffer<int>    coarsePiv;                             // n row interchanges, in factorisation order
     int coarseLUn = 0;
@@ -167,21 +343,96 @@ struct AMGData {
 };
 
 // Build the multi-level agglomeration hierarchy (host, once) from the fine internal addressing + face weights (|Sf|).
+// `smoothedAggregation`: null takes the BRAE_AMG_SA switch; a caller that wants one hierarchy smoothed and
+// another not (interFoam's pcorr against its p_rgh) says so here.
 AMGData buildAMG(const std::vector<label>& fineOwner, const std::vector<label>& fineNei,
-                 const std::vector<scalar>& faceWeights, int nFine);
+                 const std::vector<scalar>& faceWeights, int nFine, const bool* smoothedAggregation = nullptr);
+// The plain hierarchy's pairwise passes a level for a fine grid of `nFine` cells: BRAE_AMG_MERGE where set, else
+// one -- or two at `cellsOrFewer` cells or fewer once a solver has asked for the small-mesh rule (device_amg.cu).
+void amgMergeSmallMeshes(int cellsOrFewer);
+int amgMergeFor(int nFine);
 
 // AMG hierarchy cache (the "partition" step): the agglomeration is static per mesh -> serialize the STRUCTURE so a
 // warm run reloads it instead of re-agglomerating. Only the structure is cached (cDiag/cUpper/cLower VALUES are
-// Galerkin-rebuilt each step). loadAMGCache returns false (caller rebuilds) on any mismatch/corruption/mode change.
-void writeAMGCache(const AMGData& A, const std::string& path);
-bool loadAMGCache(const std::string& path, AMGData& A);
-// Build the hierarchy, or reload cacheDir/.brae_amgcache if valid (newer than cacheDir/owner). writeCache persists it.
+// Galerkin-rebuilt each step).
+// THE FILE IS KEYED ON WHAT THE HIERARCHY IS A FUNCTION OF (amgHierarchySignature): the internal faces' owner,
+// neighbour and weights, the cell count, plain or smoothed aggregation, the build's parameters (BRAE_AMG_TARGET,
+// _MERGE, _SOC, _GS) and AMG_BUILD_VERSION. It was keyed on nothing -- a caller compared two sizes, or the
+// file's date with the owner file's -- so a file of another mesh with the same counts, or one written by a build
+// whose agglomeration has since changed, was loaded. That is harmless to the answer only while the structure
+// fits the mesh; a smoothed hierarchy's prolongator and RAP recipe are VALUES of the mesh it was built on.
+// A plain and a smoothed hierarchy of one mesh are two files (amgCachePath).
+enum class AMGCacheRead
+{
+    loaded,
+    absent,
+    otherMeshOrBuild,
+    unreadable
+};
+unsigned long long amgHierarchySignature(
+    const std::vector<label>&  fineOwner,
+    const std::vector<label>&  fineNei,
+    const std::vector<scalar>& faceWeights,
+    int                        nFine,
+    bool                       smoothedAggregation);
+std::string amgCachePath(
+    const std::string& cacheDir,
+    bool               smoothedAggregation);
+// Written beside its final name and renamed into place, so a run that is stopped or a disk that fills leaves no
+// half file behind; false (and nothing left) when it could not be written whole.
+bool writeAMGCache(
+    const AMGData&     A,
+    const std::string& path,
+    unsigned long long signature);
+// `compareSignature` false is a gate's CONTROL (BRAE_CONTROL_AMG_CACHE_STALE): the file is read whatever it is of
+AMGCacheRead readAMGCache(
+    const std::string& path,
+    AMGData&           A,
+    unsigned long long signature,
+    bool               smoothedAggregation,
+    bool               compareSignature = true);
+// A SECOND HIERARCHY OF THE SAME STRUCTURE, copied device to device: what loadAMGCache does through a file,
+// without the file or the host. The copy's levels take addressing ids of their own, as a build's do, and its
+// per-solve state (the smoother's spectrum, the captured graphs, the coarse matrices' values) starts fresh.
+AMGData cloneAMG(const AMGData& A);
+// the first part of the two hierarchies' STRUCTURE that differs, or null: the check a clone is held to
+const char* firstAMGDifference(const AMGData& A, const AMGData& B);
+// Build the hierarchy, or reload it from cacheDir where the file there is THIS mesh's and this build's (the
+// signature above). writeCache persists a build. `smoothedAggregation` as buildAMG's; `how` says what the cache
+// held. BRAE_CONTROL_AMG_CACHE_CHECK=1 builds as well after a load and compares every buffer of the structure.
 AMGData buildOrLoadAMG(const std::vector<label>& fineOwner, const std::vector<label>& fineNei,
-                       const std::vector<scalar>& faceWeights, int nFine, const std::string& cacheDir, bool writeCache);
+                       const std::vector<scalar>& faceWeights, int nFine, const std::string& cacheDir,
+                       bool writeCache, const bool* smoothedAggregation = nullptr,
+                       AMGCacheRead* how = nullptr);
 
 // Galerkin: rebuild the coarse matrix coefficients from the current fine matrix (diag/upper/lower).
 void amgGalerkin(AMGData& A, const DeviceBuffer<scalar>& fineDiag, const DeviceBuffer<scalar>& fineUpper,
                  const DeviceBuffer<scalar>& fineLower);
+
+// THE SAME MATRIX AGAIN. In a PISO loop every corrector after the first of a step solves the first one's
+// matrix, bit for bit: rAU and the mesh have not changed, only the source has. MEASURED 2026-10-06 by
+// comparing each solve's three arrays with the solve before's: 28 of 56 solves on stokesII (two correctors),
+// 60 of 90 on damBreak, angledDuct, waveMakerFlap, capillaryRise and weirOverflow (three). Those solves were
+// rebuilding every coarse matrix and casting every grid again: about forty launches on a ten-grid hierarchy,
+// 0.17 ms a solve on stokesII's 27,500 cells net of the comparison and its read (the step 7.97 -> 7.80 ms).
+//   amgFineCompare    launches the comparison of these coefficients with the kept ones, as bit patterns, and
+//                     returns where its answer will be on the device (an int: 0 the same, 1 not); null when
+//                     nothing is kept or the sizes differ, which is "build".
+//   amgGalerkinKept   amgGalerkin, and the coefficients kept for the next comparison.
+//   amgGalerkinStands the caller read 0: the coarse matrices stand, and so do the single-precision copies of
+//                     the last cast. The view the solve is then handed must be that same matrix.
+// A plain amgGalerkin drops the kept copy, so a caller that never asks pays nothing and reuses nothing.
+const int* amgFineCompare(
+    AMGData& A,
+    const DeviceBuffer<scalar>& fineDiag,
+    const DeviceBuffer<scalar>& fineUpper,
+    const DeviceBuffer<scalar>& fineLower);
+void amgGalerkinKept(
+    AMGData& A,
+    const DeviceBuffer<scalar>& fineDiag,
+    const DeviceBuffer<scalar>& fineUpper,
+    const DeviceBuffer<scalar>& fineLower);
+void amgGalerkinStands(AMGData& A);
 
 // THE COLOUR-MAJOR PERMUTED GAUSS-SEIDEL LAYOUT (GridColoring above; device_amg_smoothers.cu has the
 // build, the sweep and the measurement). Public because tests/test_gpu_amg.cu holds the two sweeps
@@ -215,9 +466,9 @@ void amgGSSweepIndirect(const DeviceLduView& A, const DeviceBuffer<scalar>& b, D
 
 // Apsi = A psi computed THROUGH the permuted layout (the gathered coefficients and row entries the
 // sweep reads), written back to the natural numbering. Its per-row summation is amulKernel's
-// (device_spmv.cu:31-40: the diagonal, then the owned faces' upper terms in face order, then the
-// neighboured faces' lower terms in losort order), so it is the same bits as deviceAmul on a sound
-// layout -- which is what makes it a test of the ADDRESSING. Throws as the sweep does. It writes the
+// (device_spmv.cu: the diagonal, then the faces in increasing face index, owned and neighboured
+// interleaved -- a merge of the row's two runs, which the sweep keeps in gsColorT's order), so it is the
+// same bits as deviceAmul on a sound layout -- which is what makes it a test of the ADDRESSING. Throws as the sweep does. It writes the
 // colouring's per-sweep scratch (bP/psiP), which every sweep rewrites anyway, so it must not be called
 // between a sweep's gather and its colour launches -- a diagnostic, not a solver call.
 void amgPermutedLayoutAmul(const GridColoring& gc, const DeviceLduView& A,
@@ -282,14 +533,47 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
 void vcycleAt(int g, AMGData& amg, const DeviceLduView& Ag, const DeviceBuffer<scalar>& bg,
               DeviceBuffer<scalar>& xg, bool asymmetric);
 
+// The smoothed hierarchy's fixed-order lists of one level (AMGLevel::Rrow .. rapTerm), from its prolongator and
+// its triple-product recipe as they stand on the device; the recipe's five lists are put in destination order
+// where they are not already (the build hands them over in its own; a file read back holds them sorted, and
+// the cache's signature says so -- amgHierarchySignature). Run wherever those are set: the build, the disk
+// cache's load. One download of each list and two counting sorts on the host, once a hierarchy.
+void amgSaFixedOrder(AMGLevel& L);
+// BRAE_CONTROL_AMG_SA_SCATTER=1: the two atomicAdd scatters as they were -- the arm the fixed order is held to,
+// and the timing's other arm. BRAE_CONTROL_AMG_SA_GATHER_REVERSED=1: each sum taken from its last term to its
+// first -- a gate's control, another fixed order, which the written files have to show.
+inline bool amgSaScatter()
+{
+    static const bool on = std::getenv("BRAE_CONTROL_AMG_SA_SCATTER") != nullptr;
+    return on;
+}
+
+inline bool amgSaGatherReversed()
+{
+    static const bool on = std::getenv("BRAE_CONTROL_AMG_SA_GATHER_REVERSED") != nullptr;
+    return on;
+}
+
 // The refusals the asymmetric V-cycle makes, one std::runtime_error per option, each naming itself and
 // what to set instead. Exposed (rather than left inside vcycleAt) so a test can exercise each one; vcycleAt
 // calls exactly this with (useChebyshev(), amg.corrScaling, amg.saSmooth). A no-op when nothing is set.
 void amgRefuseAsymmetric(bool chebyshev, bool corrScaling, bool smoothedAggregation);
 
+// The pair of this solve's matrix `A` carried onto every grid of `amg` (AMGPair), and the coarsest grid's dense
+// factorisation redone with the pair's entries in it. Called by deviceAMGPCG at every solve, after the caller's
+// amgGalerkin and outside every graph capture. A view without a pair clears it. Not carried, as before: a
+// smoothed-aggregation hierarchy (its prolongator is not an aggregate map) and BRAE_CONTROL_AMG_PAIR_UNCOUPLED=1.
+void amgCouplePair(AMGData& amg, const DeviceLduView& A);
+
+// WHICH CYCLE a solve's preconditioner runs: the single-precision one (vcycleAtF) unless BRAE_AMG_FP32=0 or the
+// smoother is one only the double-precision cycle has (multicolour GS, Chebyshev). THE ONE PLACE that decides
+// -- the captured loop, the plain loop and the distributed apply each asked the same question in their own
+// words, and a smoothed-aggregation hierarchy was excluded in each.
+bool amgSinglePrecisionCycle(const AMGData& amg);
+
 // Prepare the FP32 mixed-precision V-cycle for this solve: cast the (Galerkin-updated) matrices to FP32 mirrors.
 // Call ONCE per solve before the amgVCycleApply loop; after it, amgVCycleApply runs FP32 automatically. No-op
-// unless BRAE_AMG_FP32 (default on) and the default smoother/aggregation (SA/GS/Chebyshev stay FP64).
+// unless BRAE_AMG_FP32 (default on) and the default smoother (GS/Chebyshev stay FP64): amgSinglePrecisionCycle.
 void amgPrepareFP32(AMGData& amg, const DeviceLduView& A);
 
 class DeviceHalo;   // fwd (parallel/pstream/device_halo.cuh)
@@ -341,6 +625,11 @@ scalar deviceSymGaussSeidel(const DeviceLduView& A, const DeviceBuffer<scalar>& 
 scalar deviceSymGaussSeidel(const DeviceLduView& A, const DeviceBuffer<scalar>& b, DeviceBuffer<scalar>& psi,
                             const scalar* dNormFactor, scalar tol, scalar relTol, int maxIter,
                             DeviceSolverPerf* perf = nullptr, int minIter = 0, int nSweeps = 1, bool symmetric = true);
+
+// Which sweep deviceSymGaussSeidel runs in THIS process: OpenFOAM's sequential one on the CPU (the
+// default, by measurement) or the level-scheduled device loop (BRAE_GS_HOST_SMOOTHER=0). Both are the
+// same arithmetic; an identity gate needs to know which of them it compared.
+bool deviceGaussSeidelUsesHostSmoother();
 
 // The components of ONE vector matrix, solved together (item 60a): their systems share topology, upper
 // and lower; each has its own folded diagonal, source, normFactor, residual, sweep count and stop. One

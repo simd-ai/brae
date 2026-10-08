@@ -1,4 +1,6 @@
 #include "fvc.cuh"
+#include <stdexcept>
+#include <string>
 #include "cellLimitedGrad_cpp.cuh"   // the field's own cellLimited coefficient on snGrad's correction gradient
 
 namespace brae {
@@ -22,7 +24,14 @@ std::vector<vector> gaussGrad(
     for (label f = 0; f < nIf; ++f)
     {
         const label o = own[f], n = nei[f];
-        const scalar pf = w[f] * internal[o] + (1.0 - w[f]) * internal[n];
+        // OpenFOAM's linear interpolation, in ITS arithmetic: lambda*(P - N) + N
+        // (surfaceInterpolationScheme.C:270, dotInterpolate). Not w*P + (1 - w)*N: on a face whose two
+        // cells hold the same value OpenFOAM's form returns that value exactly and this one can miss by
+        // an ulp -- and that ulp is the gradient of a uniform field, whose SIGN decides a TVD limiter at
+        // a face where the field does not change (NVDTVD::r's 1000x guard). Measured on LES/nozzleFlow2D:
+        // k is uniform 1e-11 across most of the mesh at step one, and limitedLinear chose upwind where
+        // OpenFOAM chose central on thousands of faces, 2.3e-03 of k after one step.
+        const scalar pf = w[f] * (internal[o] - internal[n]) + internal[n];
         const vector Sfssf = Sf[f] * pf;
         grad[o] += Sfssf;
         grad[n] = grad[n] - Sfssf;
@@ -37,6 +46,13 @@ std::vector<vector> gaussGrad(
         // the cancellation of two large opposite terms, which is round-off (item 36c).
         if (fp.type == "empty") continue;
         if (pi >= boundary.size()) continue;
+        if (fp.coupled)
+        {
+            // a coupled face is interpolated from its two cells, whatever the patch array holds
+            for (label i = 0; i < fp.size; ++i)
+                grad[fp.faceCells[i]] += Sf[fp.start + i] * coupledLinear(fp, i, internal);
+            continue;
+        }
         for (label i = 0; i < fp.size && i < (label)boundary[pi].size(); ++i)
             grad[fp.faceCells[i]] += Sf[fp.start + i] * boundary[pi][i];
     }
@@ -67,7 +83,7 @@ std::vector<vector> gaussGrad(
     for (label f = 0; f < nIf; ++f)
     {
         const label o = own[f], n = nei[f];
-        const scalar pf = w[f] * p.internal[o] + (1.0 - w[f]) * p.internal[n];
+        const scalar pf = w[f] * (p.internal[o] - p.internal[n]) + p.internal[n];   // OpenFOAM's form, see above
         const vector Sfssf = Sf[f] * pf;
         grad[o] += Sfssf;
         grad[n] = grad[n] - Sfssf;
@@ -78,6 +94,18 @@ std::vector<vector> gaussGrad(
     {
         const FvPatch& fp = patches[pi];
         if (fp.type == "empty") continue;   // emptyFvPatch::size() == 0: never in OpenFOAM's sum (item 36c)
+        if (fp.coupled)
+        {
+            // from the two cells, plus whatever the patch field puts between them: a jump cyclic's
+            // patchNeighbourField is the neighbour cell's value LESS the jump
+            const std::vector<scalar> pnf = p.boundary[pi]->patchNeighbourField(p.internal);
+            for (label i = 0; i < fp.size; ++i)
+            {
+                const scalar wf = fp.weights[i];
+                grad[fp.faceCells[i]] += Sf[fp.start + i] * (wf*p.internal[fp.faceCells[i]] + (scalar(1) - wf)*pnf[i]);
+            }
+            continue;
+        }
         const std::vector<scalar>& pv = p.boundary[pi]->value();
         for (label i = 0; i < fp.size; ++i)
             grad[fp.faceCells[i]] += Sf[fp.start + i] * pv[i];
@@ -107,10 +135,17 @@ inline vector lsBoundaryDelta(const FvPatch& fp, label i, const vector& Cc)
 // shared by the scalar and the vector gradient so the two cannot drift. safeInv is what makes a 2-D mesh
 // -- an emptyFvPatch of size 0 leaves dd singular in the empty direction -- invertible as OpenFOAM's
 // SymmTensor::safeInv does (SymmTensorI.H:368-421).
-std::vector<symmTensor> leastSquaresInvDd(
+// OVER THE WHOLE MESH (`at` null) OR OVER A SUBSET'S FACES AND CELLS (GradSubset, fvc.cuh): one body in the
+// source, so the subset's tensors are not a second transcription (what holds them to the whole mesh's bits is
+// said there). `dd` and `invDd` are the caller's -- fresh for the whole mesh, kept between calls for a subset,
+// whose listed entries alone are cleared here.
+void leastSquaresInvDdInto(
+    std::vector<symmTensor>& dd,
+    std::vector<symmTensor>& invDd,
     const PrimitiveMesh& m,
     const FvGeometry& g,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    const GradSubset* at)
 {
     const label nC  = m.nCells();
     const label nIf = m.nInternalFaces();
@@ -119,9 +154,27 @@ std::vector<symmTensor> leastSquaresInvDd(
     const std::vector<scalar>& w     = g.weights();
     const std::vector<scalar>& magSf = g.magSf();
     const std::vector<vector>& C     = g.C();
-    std::vector<symmTensor> dd(nC, symmTensor{0, 0, 0, 0, 0, 0});
-    for (label f = 0; f < nIf; ++f)
+    const label nCells = at ? static_cast<label>(at->cells.size()) : nC;
+    const label nFaces = at ? static_cast<label>(at->faces.size()) : nIf;
+    // A COUPLED patch is folded in below, with the coupled weight and the patch's own delta, where it
+    // used to be refused outright. A ROTATIONAL pair would need the neighbour value transformed into
+    // this side's frame before the fit reads it; attachCyclicCoupling refuses one by name already, so
+    // no patch that reaches here carries a transform.
+    if (dd.size() != static_cast<std::size_t>(nC) || invDd.size() != static_cast<std::size_t>(nC))
     {
+        dd.assign(static_cast<std::size_t>(nC), symmTensor{0, 0, 0, 0, 0, 0});
+        invDd.assign(static_cast<std::size_t>(nC), symmTensor{0, 0, 0, 0, 0, 0});
+    }
+    else
+    {
+        for (label k = 0; k < nCells; ++k)
+        {
+            dd[at ? at->cells[static_cast<std::size_t>(k)] : k] = symmTensor{0, 0, 0, 0, 0, 0};
+        }
+    }
+    for (label k = 0; k < nFaces; ++k)
+    {
+        const label f = at ? at->faces[static_cast<std::size_t>(k)] : k;
         const label o = own[f], n = nei[f];
         const vector d = C[n] - C[o];
         const symmTensor wdd = (magSf[f] / magSqr(d)) * sqr(d);
@@ -144,23 +197,50 @@ std::vector<symmTensor> leastSquaresInvDd(
             // On gasMixing/injectorPipe's snappyHexMesh mesh the boundary faces are skewed and it is
             // 5.8e-02 of OpenFOAM's own grad(p), with 90% of the squared error in 77 of 74650 cells,
             // every one of them touching a boundary patch.
+            // ...and a COUPLED face takes the OWNER WEIGHT and fvPatch::delta() as it stands --
+            // `((1 - w)*magSf/magSqr(d))*sqr(d)` (leastSquaresVectors.C:131-140) -- where an uncoupled
+            // one takes the whole face. delta() across a pair is the cell-to-cell vector, not a
+            // patch-normal projection, so lsBoundaryDelta is not the right d there.
+            if (fp.coupled)
+            {
+                const vector d = fp.delta[static_cast<std::size_t>(i)];
+                dd[c] = dd[c] + ((1.0 - fp.weights[static_cast<std::size_t>(i)])
+                                 * (fp.magSf[i] / magSqr(d))) * sqr(d);
+                continue;
+            }
             const vector d = lsBoundaryDelta(fp, i, C[c]);
             dd[c] = dd[c] + (fp.magSf[i] / magSqr(d)) * sqr(d);
         }
     }
-    std::vector<symmTensor> invDd(nC);
-    for (label c = 0; c < nC; ++c) invDd[c] = safeInv(dd[c]);
+    for (label k = 0; k < nCells; ++k)
+    {
+        const label c = at ? at->cells[static_cast<std::size_t>(k)] : k;
+        invDd[c] = safeInv(dd[c]);
+    }
+}
+
+std::vector<symmTensor> leastSquaresInvDd(
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    std::vector<symmTensor> dd;
+    std::vector<symmTensor> invDd;
+    leastSquaresInvDdInto(dd, invDd, m, g, patches, nullptr);
     return invDd;
 }
 
-} // namespace
-
-std::vector<vector> leastSquaresGrad(
+// The scalar gradient (leastSquaresGrad.C:60-110), with the fit vectors folded in at the face: over the whole
+// mesh or over a subset, one body, as the tensor above. `grad` is the caller's, as `dd` is there.
+void leastSquaresScalarInto(
+    std::vector<vector>& grad,
+    const std::vector<symmTensor>& invDd,
     const std::vector<scalar>& internal,
     const std::vector<std::vector<scalar>>& boundary,
     const PrimitiveMesh& m,
     const FvGeometry& g,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    const GradSubset* at)
 {
     const label nC  = m.nCells();
     const label nIf = m.nInternalFaces();
@@ -169,14 +249,22 @@ std::vector<vector> leastSquaresGrad(
     const std::vector<scalar>& w     = g.weights();
     const std::vector<scalar>& magSf = g.magSf();
     const std::vector<vector>& C     = g.C();
-
-    // ---- dd, the inverse-distance-weighted second-moment tensor (leastSquaresVectors.C:60-120) ----
-    const std::vector<symmTensor> invDd = leastSquaresInvDd(m, g, patches);
-
-    // ---- the gradient (leastSquaresGrad.C:60-110), with the fit vectors folded in at the face ----
-    std::vector<vector> grad(nC, vector{0, 0, 0});
-    for (label f = 0; f < nIf; ++f)
+    const label nCells = at ? static_cast<label>(at->cells.size()) : nC;
+    const label nFaces = at ? static_cast<label>(at->faces.size()) : nIf;
+    if (grad.size() != static_cast<std::size_t>(nC))
     {
+        grad.assign(static_cast<std::size_t>(nC), vector{0, 0, 0});
+    }
+    else
+    {
+        for (label k = 0; k < nCells; ++k)
+        {
+            grad[at ? at->cells[static_cast<std::size_t>(k)] : k] = vector{0, 0, 0};
+        }
+    }
+    for (label k = 0; k < nFaces; ++k)
+    {
+        const label f = at ? at->faces[static_cast<std::size_t>(k)] : k;
         const label o = own[f], n = nei[f];
         const vector d = C[n] - C[o];
         const scalar magSfByMagSqrd = magSf[f] / magSqr(d);
@@ -194,6 +282,16 @@ std::vector<vector> leastSquaresGrad(
         for (label i = 0; i < fp.size; ++i)
         {
             const label c = fp.faceCells[i];
+            // the coupled half: the NEIGHBOUR CELL's value, with the coupled fit vector
+            // (leastSquaresGrad.C:108-119). A scalar crosses the interface untransformed.
+            if (fp.coupled)
+            {
+                const vector d = fp.delta[static_cast<std::size_t>(i)];
+                const vector lsP = ((1.0 - fp.weights[static_cast<std::size_t>(i)])
+                                    * (fp.magSf[i] / magSqr(d))) * (invDd[c] & d);
+                grad[c] += lsP * (patchNeighbourValue(fp, i, internal) - internal[c]);
+                continue;
+            }
             const vector d = lsBoundaryDelta(fp, i, C[c]);   // fvPatch::delta(), patch-normal
             const vector lsP = (fp.magSf[i] / magSqr(d)) * (invDd[c] & d);
             grad[c] += lsP * (pv[i] - internal[c]);
@@ -201,7 +299,67 @@ std::vector<vector> leastSquaresGrad(
     }
     // NOT divided by the cell volume: the fit vectors already carry the normalisation. Dividing here --
     // the reflex from gaussGrad above -- is the easy mistake.
+}
+
+} // namespace
+
+std::vector<vector> leastSquaresGrad(
+    const std::vector<scalar>& internal,
+    const std::vector<std::vector<scalar>>& boundary,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    // dd, the inverse-distance-weighted second-moment tensor (leastSquaresVectors.C:60-120)
+    const std::vector<symmTensor> invDd = leastSquaresInvDd(m, g, patches);
+    std::vector<vector> grad;
+    leastSquaresScalarInto(grad, invDd, internal, boundary, m, g, patches, nullptr);
     return grad;
+}
+
+GradSubset gradSubset(
+    const PrimitiveMesh& m,
+    std::vector<label> cells)
+{
+    GradSubset at;
+    at.cells = std::move(cells);
+    const label nC = m.nCells();
+    const label nIf = m.nInternalFaces();
+    std::vector<char> listed(static_cast<std::size_t>(nC), 0);
+    label last = -1;
+    for (const label c : at.cells)
+    {
+        if (c <= last || c >= nC)
+        {
+            throw std::runtime_error("brae fvc::gradSubset: the cells are not ascending, each once, and the "
+                                     "mesh's (cell " + std::to_string(c) + " after " + std::to_string(last)
+                                     + ", of " + std::to_string(nC) + ").");
+        }
+        listed[static_cast<std::size_t>(c)] = 1;
+        last = c;
+    }
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    for (label f = 0; f < nIf; ++f)
+    {
+        if (listed[static_cast<std::size_t>(own[f])] || listed[static_cast<std::size_t>(nei[f])])
+        {
+            at.faces.push_back(f);
+        }
+    }
+    return at;
+}
+
+void leastSquaresGradAt(
+    const std::vector<scalar>& internal,
+    const std::vector<std::vector<scalar>>& boundary,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    const GradSubset& at)
+{
+    leastSquaresInvDdInto(at.dd, at.invDd, m, g, patches, &at);
+    leastSquaresScalarInto(at.grad, at.invDd, internal, boundary, m, g, patches, &at);
 }
 
 // The VECTOR form, for grad(U): the same fit vectors, and OpenFOAM's `lsGrad[own] += ownLs[facei]*deltaVsf`
@@ -289,7 +447,7 @@ std::vector<tensor> gaussGrad(
     std::vector<tensor> grad(nC, tensor{0,0,0,0,0,0,0,0,0});
     for (label f = 0; f < nIf; ++f)
     {
-        const vector Uf = w[f] * internal[own[f]] + (1.0 - w[f]) * internal[nei[f]];
+        const vector Uf = w[f] * (internal[own[f]] - internal[nei[f]]) + internal[nei[f]];   // OpenFOAM's form
         const tensor SfUf = outer(Sf[f], Uf);
         grad[own[f]] += SfUf;
         grad[nei[f]] = grad[nei[f]] - SfUf;
@@ -298,6 +456,12 @@ std::vector<tensor> gaussGrad(
     {
         const FvPatch& fp = patches[pi];
         if (fp.type == "empty") continue;   // emptyFvPatch::size() == 0: never in OpenFOAM's sum (item 36c)
+        if (fp.coupled)
+        {
+            for (label i = 0; i < fp.size; ++i)
+                grad[fp.faceCells[i]] += outer(Sf[fp.start + i], coupledLinear(fp, i, internal));
+            continue;
+        }
         const std::vector<vector>& uv = boundary[pi];
         for (label i = 0; i < fp.size; ++i)
             grad[fp.faceCells[i]] += outer(Sf[fp.start + i], uv[i]);
@@ -353,6 +517,12 @@ SurfaceScalarField flux(
         // not skip them adds nothing. It used to store U_c . Sf, which on an extruded mesh is U_z*Sf_z
         // -- round-off, but round-off that reached div, adjustPhi and the continuity error (item 36d).
         if (fp.type == "empty") continue;
+        if (fp.coupled)
+        {
+            for (label i = 0; i < fp.size; ++i)
+                phi.boundary[pi][i] = dot(coupledLinear(fp, i, internal), Sf[fp.start + i]);
+            continue;
+        }
         for (label i = 0; i < fp.size; ++i)
             phi.boundary[pi][i] = dot(boundary[pi][i], Sf[fp.start + i]);
     }
@@ -417,10 +587,56 @@ SurfaceScalarField interpolate(
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         sf.boundary[pi].resize(patches[pi].size);
+        if (patches[pi].coupled)
+        {
+            for (label i = 0; i < patches[pi].size; ++i)
+                sf.boundary[pi][i] = coupledLinear(patches[pi], i, vol);
+            continue;
+        }
         for (label i = 0; i < patches[pi].size; ++i)
             sf.boundary[pi][i] = vol[patches[pi].faceCells[i]];
     }
     return sf;
+}
+
+SurfaceVectorField interpolate(
+    const std::vector<vector>& cells,
+    const std::vector<std::vector<vector>>& boundary,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    const label nIf = m.nInternalFaces();
+    const std::vector<label>& own = m.owner();
+    const std::vector<label>& nei = m.neighbour();
+    const std::vector<scalar>& w = g.weights();
+    SurfaceVectorField out;
+    out.internal.resize(static_cast<std::size_t>(nIf));
+    for (label f = 0; f < nIf; ++f)
+    {
+        // surfaceInterpolationScheme::interpolate: w*vf[own] + (1 - w)*vf[nei], per component
+        const vector& uo = cells[own[f]];
+        const vector& un = cells[nei[f]];
+        out.internal[f] = vector{
+            w[f]*uo.x + (scalar(1) - w[f])*un.x,
+            w[f]*uo.y + (scalar(1) - w[f])*un.y,
+            w[f]*uo.z + (scalar(1) - w[f])*un.z};
+    }
+    out.boundary.resize(patches.size());
+    for (std::size_t pi = 0; pi < patches.size(); ++pi)
+    {
+        if (patches[pi].coupled)
+        {
+            out.boundary[pi].resize(static_cast<std::size_t>(patches[pi].size));
+            for (label i = 0; i < patches[pi].size; ++i)
+                out.boundary[pi][static_cast<std::size_t>(i)] = coupledLinear(patches[pi], i, cells);
+            continue;
+        }
+        out.boundary[pi] = pi < boundary.size()
+            ? boundary[pi]
+            : std::vector<vector>(static_cast<std::size_t>(patches[pi].size), vector{0, 0, 0});
+    }
+    return out;
 }
 
 std::vector<scalar> div(
@@ -428,6 +644,15 @@ std::vector<scalar> div(
     const PrimitiveMesh& m,
     const FvGeometry& g,
     const std::vector<FvPatch>& patches)
+{
+    return div(phi, m, patches, g.V());
+}
+
+std::vector<scalar> div(
+    const SurfaceScalarField& phi,
+    const PrimitiveMesh& m,
+    const std::vector<FvPatch>& patches,
+    const std::vector<scalar>& Vsc)
 {
     const label nC = m.nCells(), nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
@@ -446,9 +671,57 @@ std::vector<scalar> div(
             d[patches[pi].faceCells[i]] += phi.boundary[pi][i];
     }
     for (label c = 0; c < nC; ++c)
-        d[c] /= g.V()[c];
+        d[c] /= Vsc[c];
     return d;
 }
+
+namespace {
+
+// OpenFOAM's transform(T, t) for a tensor: T & t & T^T
+tensor transformTensor(
+    const tensor& T,
+    const tensor& t)
+{
+    tensor Tt{};
+    const scalar A[3][3] = {{T.xx, T.xy, T.xz}, {T.yx, T.yy, T.yz}, {T.zx, T.zy, T.zz}};
+    const scalar B[3][3] = {{t.xx, t.xy, t.xz}, {t.yx, t.yy, t.yz}, {t.zx, t.zy, t.zz}};
+    scalar AB[3][3];
+    scalar R[3][3];
+    for (int i = 0; i < 3; ++i)
+    {
+        for (int j = 0; j < 3; ++j)
+        {
+            AB[i][j] = A[i][0]*B[0][j] + A[i][1]*B[1][j] + A[i][2]*B[2][j];
+        }
+    }
+    for (int i = 0; i < 3; ++i)
+    {
+        for (int j = 0; j < 3; ++j)
+        {
+            R[i][j] = AB[i][0]*A[j][0] + AB[i][1]*A[j][1] + AB[i][2]*A[j][2];
+        }
+    }
+    Tt = tensor{R[0][0], R[0][1], R[0][2], R[1][0], R[1][1], R[1][2], R[2][0], R[2][1], R[2][2]};
+    return Tt;
+}
+
+// basicSymmetryFvPatchField::evaluate (basicSymmetryFvPatchField.C) and symmetryPlaneFvPatchField::
+// evaluate, for a tensor: (iF + transform(I - 2.0*sqr(nHat), iF))/2.0 -- the value and its mirror image
+// in the plane, averaged
+tensor symmetryValue(
+    const tensor& G,
+    const vector& n)
+{
+    const tensor R{1 - 2.0*(n.x*n.x), 0 - 2.0*(n.x*n.y), 0 - 2.0*(n.x*n.z),
+                   0 - 2.0*(n.y*n.x), 1 - 2.0*(n.y*n.y), 0 - 2.0*(n.y*n.z),
+                   0 - 2.0*(n.z*n.x), 0 - 2.0*(n.z*n.y), 1 - 2.0*(n.z*n.z)};
+    const tensor T = transformTensor(R, G);
+    return tensor{(G.xx + T.xx)/2.0, (G.xy + T.xy)/2.0, (G.xz + T.xz)/2.0,
+                  (G.yx + T.yx)/2.0, (G.yy + T.yy)/2.0, (G.yz + T.yz)/2.0,
+                  (G.zx + T.zx)/2.0, (G.zy + T.zy)/2.0, (G.zz + T.zz)/2.0};
+}
+
+} // namespace
 
 std::vector<std::vector<tensor>> gradUBoundary(
     const GeometricField<vector>& U,
@@ -465,6 +738,17 @@ std::vector<std::vector<tensor>> gradUBoundary(
         const FvPatch& fp = patches[pi];
         gb[pi].assign(fp.size, tensor{0,0,0,0,0,0,0,0,0});
         if (fp.type == "empty") continue;   // empty patches contribute nothing to fvc operations
+        if (fp.coupled)
+        {
+            // gaussGrad::correctBoundaryConditions skips a coupled patch (gaussGrad.C, `if
+            // (!vsf.boundaryField()[patchi].coupled())`): the gradient's own cyclic patch field is left
+            // at what its evaluate() gives, the two cells' gradients interpolated
+            for (label i = 0; i < fp.size; ++i)
+            {
+                gb[pi][i] = coupledLinear(fp, i, gradUcell);
+            }
+            continue;
+        }
         // THE PATCH'S OWN snGrad(), as OF's gaussGrad::correctBoundaryConditions asks for it
         // (gaussGrad.C: `gGradbf[patchi] += n*(vsf.boundaryField()[patchi].snGrad() - (n & gGradbf))`).
         // This used to inline (U_b - U_c)*deltaCoeffs, which is the BASE class's formula and wrong on
@@ -472,12 +756,53 @@ std::vector<std::vector<tensor>> gradUBoundary(
         // gradient) and the mixed family, whose snGrad uses the CURRENT valueFraction while value() still
         // carries the blend of the previous one. See fv_patch_field.cuh's snGrad for the measurement.
         const std::vector<vector> sn = U.boundary[pi]->snGrad(U.internal);
+        // THE GRADIENT FIELD'S OWN PATCH VALUE, before the normal correction. gaussGrad builds grad(U)
+        // with extrapolatedCalculated patches, but fvPatchField::New puts a constraint patch's own type
+        // in their place (fvPatchFieldNew.C), and calcGrad ends in gGrad.correctBoundaryConditions()
+        // (gaussGrad.C:106) -- so on a WEDGE the value is transform(faceT, cell gradient),
+        // faceT & G & faceT^T, not the cell gradient itself. Measured on LES/nozzleFlow2D, where every
+        // cell touches the two wedge planes: without the rotation HbyA was 2e-06 out in every cell and
+        // 5.6e-06 in the axis corner at step two, against OpenFOAM's dumped HbyA.
+        // symmetry and symmetryPlane take THEIR constraint type the same way: the value is the cell
+        // gradient averaged with its mirror image, (G + R G R^T)/2 with R = I - 2 nn -- per face on a
+        // `symmetry` (basicSymmetry, patch().nf()), with the patch's ONE normal on a `symmetryPlane`
+        // (symmetryPlanePolyPatch::calcGeometry: the area-weighted sum of the face areas, normalised).
+        // The normal correction below then replaces the normal row; what the mirror adds is the
+        // tangential rows' NORMAL column, dU_n/dt, zeroed. Measured on RAS/damBreakLeakage, whose
+        // cyclicACMI hands its closed area to two symmetry patches: HbyA 3% out beside the baffle on the
+        // opening step without it, against OpenFOAM's dumped HbyA.
+        const tensor* faceT = U.boundary[pi]->wedgeFaceT();
+        const bool symmetry = (fp.type == "symmetry");
+        const bool symmetryPlane = (fp.type == "symmetryPlane");
+        vector planeN{0, 0, 0};
+        if (symmetryPlane)
+        {
+            vector sumA{0, 0, 0};
+            for (label i = 0; i < fp.size; ++i)
+            {
+                sumA = sumA + Sf[fp.start + i];
+            }
+            const scalar a = mag(sumA);
+            planeN = (a > scalar(1.0e-150)) ? sumA/a : vector{0, 0, 0};
+        }
         for (label i = 0; i < fp.size; ++i)
         {
             const label c  = fp.faceCells[i];
             const label gf = fp.start + i;
             const vector n = (1.0 / magSf[gf]) * Sf[gf];                       // unit normal
-            const tensor& gc = gradUcell[c];                                   // extrapolated cell grad
+            tensor gc = gradUcell[c];                                          // the gradient's patch value
+            if (faceT)
+            {
+                gc = transformTensor(*faceT, gradUcell[c]);
+            }
+            else if (symmetry)
+            {
+                gc = symmetryValue(gradUcell[c], Sf[gf]/magSf[gf]);
+            }
+            else if (symmetryPlane)
+            {
+                gc = symmetryValue(gradUcell[c], planeN);
+            }
             gb[pi][i] = gc + outer(n, sn[i] - dot(n, gc));                     // normal comp -> snGrad
         }
     }
@@ -508,6 +833,12 @@ std::vector<vector> div(
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         if (patches[pi].type == "empty") continue;   // empty patches excluded (OF fvc semantics)
+        if (patches[pi].coupled)
+        {
+            for (label i = 0; i < patches[pi].size; ++i)
+                d[patches[pi].faceCells[i]] += dot(Sf[patches[pi].start + i], coupledLinear(patches[pi], i, tCell));
+            continue;
+        }
         for (label i = 0; i < patches[pi].size; ++i)
             d[patches[pi].faceCells[i]] += dot(Sf[patches[pi].start + i], tBnd[pi][i]);
     }
@@ -524,12 +855,16 @@ SurfaceScalarField snGrad(
     bool                          corrected,
     bool                          leastSquares,
     scalar                        cellLimitK,
-    scalar                        limitCoeff)
+    scalar                        limitCoeff,
+    // `uncorrected` and `limited 0` take nonOrthDeltaCoeffs WITHOUT the correction -- see the note on
+    // fvm::laplacian's identical parameter. Defaulted in the declaration, so no caller moves.
+    bool                          nonOrthCoeffs)
 {
     const label nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
     const std::vector<label>& nei = m.neighbour();
-    const std::vector<scalar>& dc = corrected ? g.nonOrthDeltaCoeffs() : g.deltaCoeffs();
+    const std::vector<scalar>& dc = (corrected || nonOrthCoeffs) ? g.nonOrthDeltaCoeffs()
+                                                                 : g.deltaCoeffs();
 
     SurfaceScalarField sf;
     sf.internal.resize(nIf);
@@ -539,17 +874,18 @@ SurfaceScalarField snGrad(
     // correctedSnGrad::fullGradCorrection -- linear interpolation of grad(vf) dotted with the correction
     // vectors, which are zero on boundary faces. grad(vf) through the FIELD's own gradSchemes entry
     // (correctedSnGrad.C:52-55), as the header says.
+    std::vector<vector> gradVf;
+    const bool limited = (limitCoeff > 0.0 && limitCoeff < 1.0);
     if (corrected)
     {
-        std::vector<vector>        gradVf   = leastSquares ? leastSquaresGrad(vf, m, g, patches)
-                                                           : gaussGrad(vf, m, g, patches);
+        gradVf = leastSquares ? leastSquaresGrad(vf, m, g, patches)
+                              : gaussGrad(vf, m, g, patches);
         if (cellLimitK > 0.0) cpu::cellLimitGrad(gradVf, vf, cellLimitK, m, g, patches);
         const std::vector<vector>& corrVecs = g.nonOrthCorrectionVectors();
         const std::vector<scalar>& w        = g.weights();
         // limitedSnGrad's per-face cap, against the ORTHOGONAL part of this same snGrad -- which is
         // sf.internal[f] as it stands here, before the correction is added. Same arithmetic as
         // fvm::laplacianCorrFlux's, on the same quantity; psi >= 1 or 0 means uncapped.
-        const bool limited = (limitCoeff > 0.0 && limitCoeff < 1.0);
         for (label f = 0; f < nIf; ++f)
         {
             const vector& go = gradVf[own[f]];
@@ -573,6 +909,34 @@ SurfaceScalarField snGrad(
         const std::vector<scalar> gIC = vf.boundary[pi]->gradientInternalCoeffs();
         const std::vector<scalar> gBC = vf.boundary[pi]->gradientBoundaryCoeffs();
         sf.boundary[pi].resize(fp.size);
+        if (fp.coupled)
+        {
+            // snGradScheme.C, the pvf.coupled() branch: pvf.snGrad(deltaCoeffs) = dc*(pnf - pif), with
+            // the SCHEME's deltaCoeffs -- nonOrthDeltaCoeffs under `corrected` AND under `uncorrected`,
+            // which return the same coefficients and differ only in corrected() -- and, there, the
+            // correction too: nonOrthCorrectionVectors is not zero on a coupled patch. pnf comes from
+            // the patch field, because a jump cyclic's is the neighbour cell LESS the jump.
+            const std::vector<scalar> pnf = vf.boundary[pi]->patchNeighbourField(vf.internal);
+            for (label i = 0; i < fp.size; ++i)
+            {
+                const scalar dcb = (corrected || nonOrthCoeffs) ? fp.nonOrthDeltaCoeffs[i]
+                                                                : fp.deltaCoeffs[i];
+                scalar v = dcb * (pnf[i] - vf.internal[fp.faceCells[i]]);
+                if (corrected)
+                {
+                    scalar corr = dot(fp.nonOrthCorrectionVectors[i], coupledLinear(fp, i, gradVf));
+                    if (limited)
+                    {
+                        corr *= std::fmin(limitCoeff * std::fabs(v)
+                                              / ((1.0 - limitCoeff) * std::fabs(corr) + 1e-15),
+                                          1.0);
+                    }
+                    v += corr;
+                }
+                sf.boundary[pi][i] = v;
+            }
+            continue;
+        }
         for (label i = 0; i < fp.size; ++i)
             sf.boundary[pi][i] = gIC[i] * vf.internal[fp.faceCells[i]] + gBC[i];
     }

@@ -8,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -440,6 +441,49 @@ inline bool ofConverged(
     return finalRes < tol || (relTol > 1e-20 && finalRes < relTol*initRes);
 }
 
+// THE PAIR'S CONTRIBUTION MOVED TO THE RIGHT-HAND SIDE, from the field as it stands: for pair cell i, the
+// source less coeff*psi[neighbour] for each of its pair faces in face order. deviceAmul applies a pair as
+// Apsi[own] += cycCoeff*psi[nbr] (device_ldu.cuh), so this is b - A_pair*psi on those rows; a jump cyclic
+// hands the matrix psi[nbr] - jump (jumpCyclicFvPatchField.C:94-125), and the sweep's operand is the solution
+// field, so the jump is taken. One thread a pair cell, each writing its own row of bEff and reading psi: no
+// thread reads what another writes.
+struct ColourGSPair
+{
+    int nComp = 0;
+    const scalar* b[NC_MAX] = {};
+    const scalar* psi[NC_MAX] = {};
+    const scalar* coeff[NC_MAX] = {};
+    const scalar* jump[NC_MAX] = {};
+    scalar* bEff[NC_MAX] = {};
+};
+__global__
+void pairSourceKernel(
+    int nPairCells,
+    const label* __restrict__ row,
+    const label* __restrict__ start,
+    const label* __restrict__ nbr,
+    const label* __restrict__ face,
+    int frozen,
+    ColourGSPair p)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nPairCells) return;
+    const label c = row[i];
+    for (int k = 0; k < p.nComp; ++k)
+    {
+        scalar acc = p.b[k][c];
+        for (label e = start[i]; e < start[i + 1]; ++e)
+        {
+            const label j = face[e];
+            // (the CONTROL: the neighbour's value left out, so the pair is not carried at all)
+            const scalar x = frozen ? scalar(0) : p.psi[k][nbr[e]];
+            const scalar pnf = p.jump[k] ? (x - p.jump[k][j]) : x;
+            acc -= p.coeff[k][j]*pnf;
+        }
+        p.bEff[k][c] = acc;
+    }
+}
+
 void refuse(const std::string& why)
 {
     throw std::runtime_error("deviceColourGaussSeidelFused: " + why);
@@ -830,7 +874,8 @@ ColourGSOperands compact(
     int nComp,
     const DeviceCellColouring& col,
     const int* active,
-    int* slot)
+    int* slot,
+    bool pair = false)
 {
     ColourGSOperands ops;
     ops.writeR = col.writeResidualVector ? 1 : 0;
@@ -839,7 +884,7 @@ ColourGSOperands compact(
         if (!active[k]) continue;
         const int j = ops.nComp++;
         ops.diag[j] = col.diagP[k].data();
-        ops.b[j] = col.bP[k].data();
+        ops.b[j] = pair ? col.bEffP[k].data() : col.bP[k].data();
         ops.psi[j] = col.psiP[k].data();
         ops.r[j] = ops.writeR ? col.rP[k].data() : nullptr;
         ops.save[j] = col.saveP[k].data();
@@ -925,13 +970,15 @@ void validate(
             refuse(who + " has a null matrix, source or field");
         }
         const DeviceLduView& A = *comps[k].A;
-        if (A.nCyc != 0)
+        if (A.nCyc != 0 && (!A.cycOwn || !A.cycNbr || !A.cycCoeff))
         {
-            refuse(who + " carries a cyclic interface (" + std::to_string(A.nCyc) + " faces); the colour sweep applies no interfaces");
+            refuse(who + " carries a cyclic interface (" + std::to_string(A.nCyc)
+                 + " faces) with no addressing or no coefficients");
         }
         if (A.nAmi != 0)
         {
-            refuse(who + " carries a cyclicAMI interface (" + std::to_string(A.nAmi) + " faces); the colour sweep applies no interfaces");
+            refuse(who + " carries a cyclicAMI interface (" + std::to_string(A.nAmi)
+                 + " faces); the colour sweep carries a one-to-one pair only");
         }
         if ((int)comps[k].b->size() != A.nCells)
         {
@@ -946,7 +993,8 @@ void validate(
         const bool shared = A.upper == A0.upper && A.lower == A0.lower
                          && A.owner == A0.owner && A.nei == A0.nei
                          && A.ownerStart == A0.ownerStart && A.losort == A0.losort && A.losortStart == A0.losortStart
-                         && A.nCells == A0.nCells && A.nInternalFaces == A0.nInternalFaces;
+                         && A.nCells == A0.nCells && A.nInternalFaces == A0.nInternalFaces
+                         && A.nCyc == A0.nCyc && A.cycOwn == A0.cycOwn && A.cycNbr == A0.cycNbr;
         if (!shared)
         {
             refuse(who + " does not share component 0's upper/lower/addressing; the fused sweep needs one matrix topology");
@@ -1150,6 +1198,71 @@ DeviceCellColouring buildDeviceCellColouring(
     return buildDeviceCellColouringFromClasses(ownerInternal, neiInternal, nCells, c.cells, c.start);
 }
 
+namespace
+{
+// The pair in the permuted numbering (DeviceCellColouring::pairRow and the rest), built once for a pair's
+// addressing: its faces grouped by their own cell's row, in face order within a cell.
+void ensurePair(
+    const DeviceCellColouring& col,
+    const DeviceLduView& A)
+{
+    if (col.pairBuilt && col.pairOwnKey == A.cycOwn && col.pairNbrKey == A.cycNbr && col.pairNKey == A.nCyc
+     && col.pairAddressingKey == A.addressingId)
+    {
+        return;
+    }
+    const std::size_t n = (std::size_t)A.nCyc;
+    std::vector<label> own(n);
+    std::vector<label> nbrCell(n);
+    cudaCheck(cudaMemcpy(own.data(), A.cycOwn, n*sizeof(label), cudaMemcpyDeviceToHost),
+              "colourGaussSeidel pair own");
+    cudaCheck(cudaMemcpy(nbrCell.data(), A.cycNbr, n*sizeof(label), cudaMemcpyDeviceToHost),
+              "colourGaussSeidel pair nbr");
+    std::vector<label> order(n);
+    for (std::size_t j = 0; j < n; ++j)
+    {
+        if (own[j] < 0 || own[j] >= col.nCells || nbrCell[j] < 0 || nbrCell[j] >= col.nCells)
+        {
+            refuse("a face of the cyclic interface names a cell outside the matrix");
+        }
+        order[j] = (label)j;
+    }
+    std::stable_sort(order.begin(), order.end(), [&](
+        label a,
+        label b)
+    {
+        return col.newIndex[(std::size_t)own[(std::size_t)a]] < col.newIndex[(std::size_t)own[(std::size_t)b]];
+    });
+    std::vector<label> rows;
+    std::vector<label> start;
+    std::vector<label> nbrRow(n);
+    std::vector<label> face(n);
+    for (std::size_t e = 0; e < n; ++e)
+    {
+        const label j = order[e];
+        const label r = col.newIndex[(std::size_t)own[(std::size_t)j]];
+        if (rows.empty() || rows.back() != r)
+        {
+            rows.push_back(r);
+            start.push_back((label)e);
+        }
+        nbrRow[e] = col.newIndex[(std::size_t)nbrCell[(std::size_t)j]];
+        face[e] = j;
+    }
+    start.push_back((label)n);
+    col.nPairCells = (int)rows.size();
+    col.pairRow.copyFrom(rows);
+    col.pairStart.copyFrom(start);
+    col.pairNbr.copyFrom(nbrRow);
+    col.pairFace.copyFrom(face);
+    col.pairBuilt = true;
+    col.pairOwnKey = A.cycOwn;
+    col.pairNbrKey = A.cycNbr;
+    col.pairNKey = A.nCyc;
+    col.pairAddressingKey = A.addressingId;
+}
+}   // namespace
+
 bool deviceColourGaussSeidelFusesResidual(const DeviceCellColouring& colouring)
 {
     if (colouring.nColours != 2 || colouring.startH.size() != 3) return false;
@@ -1170,8 +1283,21 @@ void deviceColourGaussSeidelFused(
 {
     validate(nComp, comps, colouring, nSweeps, perf);
     const DeviceLduView& A = *comps[0].A;
-    const bool fused = nSweeps >= 0 && deviceColourGaussSeidelFusesResidual(colouring);
+    // A COUPLED PAIR is carried the way OpenFOAM's sweep carries it (DeviceCellColouring::bEffP): its
+    // contribution goes to the right-hand side at the top of every sweep, from the field as it stands. Two
+    // things follow. A colour is no longer "current" across sweeps -- the source it reads has moved -- so every
+    // sweep is planned whole; and the residual is the explicit pass on the source the next sweep will read,
+    // not the one fused into the launches, which would carry the previous sweep's.
+    // BRAE_CONTROL_COLOUR_GS_PAIR_DROPPED=1 is a gate's CONTROL, deliberately wrong: the pair's term is formed
+    // with a zero neighbour, so the sweep solves the two sides uncoupled.
+    const bool pair = A.nCyc > 0;
+    static const bool pairDropped = std::getenv("BRAE_CONTROL_COLOUR_GS_PAIR_DROPPED") != nullptr;
+    const bool fused = nSweeps >= 0 && !pair && deviceColourGaussSeidelFusesResidual(colouring);
     ensureScratch(colouring, nComp, nSweeps >= 0, fused);
+    if (pair)
+    {
+        ensurePair(colouring, A);
+    }
 
     // Natural -> permuted for every component, and the coefficients of this solve's matrix.
     ColourGSGather gather;
@@ -1187,6 +1313,17 @@ void deviceColourGaussSeidelFused(
     }
     launchGather(colouring, gather);
     launchCoeff(A, colouring, colouring.coeff.data());
+    if (pair)
+    {
+        // every row's source as gathered; the pair's cells' rows are rewritten at the top of each sweep
+        for (int k = 0; k < nComp; ++k)
+        {
+            colouring.bEffP[k].resize((std::size_t)colouring.nCells);
+            cudaCheck(cudaMemcpyAsync(colouring.bEffP[k].data(), colouring.bP[k].data(),
+                                      (std::size_t)colouring.nCells*sizeof(scalar), cudaMemcpyDeviceToDevice,
+                                      cudaStreamPerThread), "colourGaussSeidel effective source");
+        }
+    }
 
     int active[NC_MAX];
     int swept[NC_MAX];
@@ -1213,6 +1350,48 @@ void deviceColourGaussSeidelFused(
         launchScatter(colouring, s);
     };
 
+    // the pair's term to the right-hand side of every still-active component, from the field as it stands
+    auto launchPair = [&]()
+    {
+        ColourGSPair p;
+        for (int k = 0; k < nComp; ++k)
+        {
+            if (!active[k]) continue;
+            const int j = p.nComp++;
+            p.b[j] = colouring.bP[k].data();
+            p.psi[j] = colouring.psiP[k].data();
+            p.coeff[j] = comps[k].A->cycCoeff;
+            p.jump[j] = comps[k].A->cycJump;
+            p.bEff[j] = colouring.bEffP[k].data();
+        }
+        if (p.nComp == 0 || colouring.nPairCells == 0) return;
+        pairSourceKernel<<<nBlk(colouring.nPairCells), TPB_COLOUR, 0, cudaStreamPerThread>>>(
+            colouring.nPairCells,
+            colouring.pairRow.data(),
+            colouring.pairStart.data(),
+            colouring.pairNbr.data(),
+            colouring.pairFace.data(),
+            pairDropped ? 1 : 0,
+            p);
+        cudaCheck(cudaGetLastError(), "colourGaussSeidel pair source");
+    };
+    // one whole sweep with a pair: the source moved first, then every colour of the sweep
+    auto launchPairSweep = [&](
+        const ColourGSOperands& ops,
+        bool moved)
+    {
+        if (!moved)
+        {
+            launchPair();
+        }
+        std::vector<int> whole;
+        int none = -1;
+        planSweep(colouring, symmetric, none, whole);
+        for (int c : whole)
+        {
+            launchColour(colouring, ops, c, SWEEP_ONLY);
+        }
+    };
     // The launches of one block of nSweeps sweeps from the current skip state, in order.
     std::vector<int> plan;
     auto planBlock = [&](int n)
@@ -1229,11 +1408,21 @@ void deviceColourGaussSeidelFused(
     // mailbox pass either.
     if (nSweeps < 0)
     {
-        const ColourGSOperands ops = compact(nComp, colouring, active, slot);
-        planBlock(-nSweeps);
-        for (int c : plan)
+        const ColourGSOperands ops = compact(nComp, colouring, active, slot, pair);
+        if (pair)
         {
-            launchColour(colouring, ops, c, SWEEP_ONLY);
+            for (int s = 0; s < -nSweeps; ++s)
+            {
+                launchPairSweep(ops, false);
+            }
+        }
+        else
+        {
+            planBlock(-nSweeps);
+            for (int c : plan)
+            {
+                launchColour(colouring, ops, c, SWEEP_ONLY);
+            }
         }
         for (int k = 0; k < nComp; ++k)
         {
@@ -1276,7 +1465,11 @@ void deviceColourGaussSeidelFused(
         nfPtrs.p[k] = comps[k].dNormFactor;
     }
     {
-        const ColourGSOperands ops = compact(nComp, colouring, active, slot);
+        const ColourGSOperands ops = compact(nComp, colouring, active, slot, pair);
+        if (pair)
+        {
+            launchPair();
+        }
         launchResidual(colouring, ops);
         publishResiduals(ops, nfPtrs);
     }
@@ -1332,8 +1525,19 @@ void deviceColourGaussSeidelFused(
     int specColour = -1;
     while (nActive > 0)
     {
-        const ColourGSOperands ops = compact(nComp, colouring, active, slot);
-        if (!fused)
+        const ColourGSOperands ops = compact(nComp, colouring, active, slot, pair);
+        if (pair)
+        {
+            // the residual pass before this block left the source moved for the block's first sweep; the
+            // one after the block moves it again, for its own pass and for the next block's first sweep
+            for (int s = 0; s < nSweeps; ++s)
+            {
+                launchPairSweep(ops, s == 0);
+            }
+            launchPair();
+            launchResidual(colouring, ops);
+        }
+        else if (!fused)
         {
             planBlock(nSweeps);
             for (int c : plan)

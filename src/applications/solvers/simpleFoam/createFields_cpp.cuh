@@ -9,7 +9,10 @@
 //           src/OpenFOAM/fields/GeometricFields/GeometricField/GeometricField.C:1068-1085 (needReference)
 //   brae:
 //     reference: src/applications/solvers/simpleFoam/createFields_cpp.cu
-//     tests:     tests/test_create_fields_cpp.cu
+//     tests:     tests/test_simple_step_cuda.cu, tests/test_simple_turbulent_cpp.cu -- it has no
+//                test of its own; both build their fields through this and would fail on a field
+//                this never created (the name that used to be here, test_create_fields_cpp.cu,
+//                was never written)
 //
 // OpenFOAM, in order:
 //   p    MUST_READ

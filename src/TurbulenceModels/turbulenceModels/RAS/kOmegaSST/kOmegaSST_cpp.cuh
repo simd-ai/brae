@@ -8,7 +8,7 @@
 //   brae:
 //     reference: src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/kOmegaSST_cpp.cu
 //     cuda:      src/cuda/device_komega_sst.cu   (deviceKOmegaSSTCorrect)
-//     tests:     tests/test_komegasst_cpp.cu, tests/komegasst_vs_openfoam.sh
+//     tests:     tests/test_komegasst_cpp.cu, tests/test_komegasst_cpp.cu, tests/rho_komegasst_vs_openfoam.sh
 //
 // WHY A HOST REFERENCE AT ALL, when a validated CUDA kOmegaSST already exists: the same reason every other
 // component of this port has one. The device model is a single fused entry point; a disagreement with
@@ -48,10 +48,13 @@
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
+#include "limitedSchemes_cpp.cuh"   // EqnDivScheme
 #include "ldu_matrix.cuh"
 #include "fvm.cuh"
 #include "fvc.cuh"
+#include "crank_nicolson_ddt_scheme_cpp.cuh"
 #include "fv_matrix_ops.cuh"
+#include "smooth_solver_cpp.cuh"   // LinearSolverChoice, SolverPerformance
 #include <vector>
 
 namespace brae {
@@ -151,6 +154,11 @@ void correctNutField(
 struct SSTResiduals
 {
     scalar omega = 0, k = 0;
+    // The two solves WHOLE -- initial residual, final residual, iteration count -- which is what
+    // OpenFOAM's log prints per solve and so what a solver-log gate compares. `omega` and `k` above are
+    // the initial residuals alone and predate these.
+    SolverPerformance omegaPerf;
+    SolverPerformance kPerf;
 
     // OPT-IN diagnostics, compared against tools/dumpKOmegaSST's stage_sst* writes. The solver asks for
     // the residuals every outer iteration and would otherwise pay to copy every intermediate with them.
@@ -160,6 +168,10 @@ struct SSTResiduals
     std::vector<tensor> gradU;
     // the assembled systems, before relax and after, plus the off-diagonals a per-cell view misses
     std::vector<scalar> omD0, omSrc0, omD, omSrc, omUpper, omLower;
+    // the PAIR's off-diagonal (the coupled patches' boundaryCoeffs, flattened in patch order). It is
+    // not folded into omSrc/kSrc: see captureSSTSystem for why an interface coefficient in a source
+    // column is a difference in the instrument rather than in the system.
+    std::vector<scalar> omIfc, kIfc;
     std::vector<scalar> kD0,  kSrc0,  kD,  kSrc,  kUpper,  kLower;
 };
 
@@ -186,7 +198,44 @@ struct Compressible
     // steadyState. rhoOld is rho.oldTime() -- StepInput::firstIteration says which rho; psi.oldTime() is
     // the field at entry. The same term the kEpsilon port carries (kEpsilon_cpp.cuh Compressible).
     scalar                                  rDeltaT  = 0.0;
+    // ...or, under LOCALEULER, the per-cell rDeltaT in the scalar's place: kOmegaSSTBase.C:572 and :602
+    // take fvm::ddt(alpha, rho, psi), which with geometricOneField alpha and rho is fvm::ddt(psi)
+    // (fvmDdt.C:127-137) under the name `ddt(omega)`/`ddt(k)`, and localEulerDdtScheme::fvmDdt is
+    // diag = rDeltaT*V, source = (rDeltaT*psi.oldTime())*V (localEulerDdtScheme.C:243-246) -- the Euler
+    // lines below with rDeltaT read per cell. Null == the scalar; refused with `cn` or a moving mesh.
+    const std::vector<scalar>*              rDeltaTCells = nullptr;
     const std::vector<scalar>*              rhoOld   = nullptr;
+    // THE FLUX nut's flux-conditional patches read (inletOutlet's phiName, `phi` by default). After the
+    // field assignment OpenFOAM's nut.correctBoundaryConditions() evaluates such a patch: valueFraction =
+    // neg(phi), then the mixed blend of the inletValue and the new cell nut. Null refuses a case that has
+    // one rather than leave it stale.
+    const SurfaceScalarField*               nutPhi   = nullptr;
+    // A MOVING MESH (EulerDdtScheme::fvmDdt under mesh().moving()): the ddt source takes the old volumes,
+    // rDeltaT*psi.oldTime()*V0, where the diagonal keeps V; and divU is the divergence of the ABSOLUTE
+    // flux, fvc::div(fvc::absolute(this->phi(), U)) = div(phi + mesh.phi()) (kOmegaSSTBase.C:517-520),
+    // while fvm::div and `bounded` keep the relative phi. Null on a static mesh. kEpsilon's are the same
+    // (kEpsilon_cpp.cuh Compressible).
+    const std::vector<scalar>*              V0       = nullptr;
+    const SurfaceScalarField*               meshPhi  = nullptr;
+    // ...or CRANKNICOLSON (crank_nicolson_ddt_scheme_cpp.cuh) in Euler's place: the scheme's clock,
+    // each equation's own ddt0 field kept by the caller across the run, and the old-old level of each
+    // field (psi.oldTime() is still the field at entry, as under Euler). With `cn` set rDeltaT is not
+    // read. kOmegaSSTBase takes fvm::ddt through ddtSchemes at :572 and :602, so a case naming
+    // CrankNicolson gets it on both equations. The kEpsilon port carries the same six members.
+    const fv::CrankNicolsonClock*           cn         = nullptr;
+    fv::CrankNicolsonDdt0<scalar>*          cnDdt0Omega = nullptr;
+    fv::CrankNicolsonDdt0<scalar>*          cnDdt0K     = nullptr;
+    const std::vector<scalar>*              rhoOO       = nullptr;
+    const std::vector<scalar>*              omegaOO     = nullptr;
+    const std::vector<scalar>*              kOO         = nullptr;
+    // psi.oldTime(): the field at this TIME INDEX's first correct(), which is NOT the field at entry once
+    // `turbOnFinalIterOnly no` makes the closure run on every outer corrector. OpenFOAM's
+    // GeometricField::storeOldTimes() is guarded on `timeIndex_ != time().timeIndex()`
+    // (GeometricField.C:904-917), so the old level is the PREVIOUS STEP's for every corrector of a step.
+    // Null keeps the old behaviour -- the field at entry -- which is identical while the closure runs once
+    // per step and first order in dt wrong as soon as it does not.
+    const std::vector<scalar>*              kOldIn      = nullptr;
+    const std::vector<scalar>*              omegaOldIn  = nullptr;
 };
 
 // kOmegaSSTLM's three virtual overrides of this model, supplied by the DERIVED model rather than
@@ -258,7 +307,28 @@ void correct(
     // 1.0 still applies the dominance clamp. Defaulted true so every positional caller keeps its
     // arithmetic; the compressible driver passes what the case says. Same shape as kEpsilon_cpp.
     bool                           relaxEquationOmega = true,
-    bool                           relaxEquationK = true);
+    bool                           relaxEquationK = true,
+    // THE CASE'S LINEAR SOLVER for both equations, as kEpsilon_cpp takes it. Null keeps PBiCGStab,
+    // which every caller before interFoam ran; interFoam's waterChannel names `smoothSolver;
+    // symGaussSeidel;` for k and omega, and a substituted solver at the same tolerance stops somewhere
+    // else. Last, so no positional caller moves.
+    const LinearSolverChoice*      which = nullptr,
+    // OMEGA'S OWN SOLVER SETTING. `fvMatrix::solve()` looks the dictionary up BY FIELD NAME, so
+    // `kFinal` and `omegaFinal` may name different tolerances, sweep counts or different solvers
+    // outright, and OpenFOAM honours each. This reference took k's for both and the caller refused a
+    // mismatch rather than substitute. Null keeps that: the caller has ONE setting and says so.
+    const EqnSolveSetting*         omegaSolve = nullptr,
+    // OMEGA'S OWN CONVECTION SCHEME. `fvm::div(phi, psi)` resolves `div(phi,<psi>)` by the FIELD's name,
+    // so `div(phi,k)` and `div(phi,omega)` may name different schemes. `bounded`/`limitedLinear`/
+    // `limiterCoeff` above are k's; null here means ONE scheme for both. `linearUpwind` is NOT read from
+    // here: the positional flag and co.luGradLimitK carry it for both equations, and the callers refuse a
+    // pair that disagrees.
+    const EqnDivScheme*            omegaDiv = nullptr,
+    // OMEGA'S OWN GRADIENT SCHEME; `co.gradKLeastSq`/`gradKLimitK` are k's. Null means ONE for both.
+    const EqnGradScheme*           omegaGrad = nullptr,
+    // `uncorrected`/`limited 0` on BOTH equations' laplacians: nonOrthDeltaCoeffs with no correction
+    // (uncorrectedSnGrad.H:113-119). Last, for the same positional reason as everything above it.
+    bool                           nonOrthCoeffs = false);
 
 } // namespace kOmegaSST
 } // namespace cpu

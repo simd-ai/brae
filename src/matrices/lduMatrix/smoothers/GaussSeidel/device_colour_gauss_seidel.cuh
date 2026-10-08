@@ -231,6 +231,25 @@ struct DeviceCellColouring
     mutable DeviceBuffer<scalar> saveP[COLOUR_GS_MAX_COMPONENTS];
     mutable DeviceBuffer<scalar> partP;
     mutable DeviceBuffer<scalar> dRes;
+    // A COUPLED PAIR on the view (nCyc). OpenFOAM's sweep does not sweep an interface: at the top of every
+    // sweep it starts bPrime = source and moves the pair's contribution there with the field as it stands
+    // (symGaussSeidelSmoother.C:117-143, "an effective jacobi interface"). The colour sweep does the same:
+    // bEffP[k] is component k's source with that term moved -- bP on every row but the pair's cells' -- and
+    // the pair is kept in the permuted numbering: pair cell i is row pairRow[i], its faces
+    // [pairStart[i], pairStart[i+1]) in face order (the order OpenFOAM subtracts them in), each naming the
+    // neighbour's row (pairNbr) and the face whose coefficient it takes (pairFace). Built on the first solve
+    // with a pair and again when the pair's addressing is another one.
+    mutable DeviceBuffer<scalar> bEffP[COLOUR_GS_MAX_COMPONENTS];
+    mutable DeviceBuffer<label> pairRow;
+    mutable DeviceBuffer<label> pairStart;
+    mutable DeviceBuffer<label> pairNbr;
+    mutable DeviceBuffer<label> pairFace;
+    mutable int nPairCells = 0;
+    mutable bool pairBuilt = false;
+    mutable const label* pairOwnKey = nullptr;
+    mutable const label* pairNbrKey = nullptr;
+    mutable int pairNKey = 0;
+    mutable unsigned long long pairAddressingKey = 0;
     // Whether a residual-reporting solve also STORES each row's residual in rP (THE REDUCTION IN
     // THE LAUNCH): the production path does not -- the launches reduce |r| from registers through
     // shared memory and never write the vector -- and the unit test turns it on for its

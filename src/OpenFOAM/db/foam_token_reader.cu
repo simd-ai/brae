@@ -290,6 +290,47 @@ std::string expandIncludes(const std::string& text, const std::string& baseDir, 
     std::size_t i = 0;
     while (i < text.size())
     {
+        // A DIRECTIVE INSIDE A COMMENT IS NOT A DIRECTIVE. OpenFOAM's lexer discards comments before a
+        // '#' can start a token; this pass ran ahead of stripComments and honoured them. cylinder2D's
+        // controlDict switches a function object off with `// #include "DMDs/stdmd30"` and brae read
+        // all of stdmd30 in; three snappyHexMeshDicts carry `// #includeEtc "caseDicts/meshQualityDict"`
+        // and gained its thirteen entries. Measured against foamDictionary -expand over the 9,500
+        // tutorial dictionaries: 140 entries OpenFOAM does not have. The comment is copied through for
+        // stripComments to remove.
+        if (text[i] == '/' && i + 1 < text.size() && text[i + 1] == '/')
+        {
+            while (i < text.size() && text[i] != '\n')
+            {
+                out += text[i++];
+            }
+            continue;
+        }
+        if (text[i] == '/' && i + 1 < text.size() && text[i + 1] == '*')
+        {
+            const std::size_t close = text.find("*/", i + 2);
+            const std::size_t end = (close == std::string::npos) ? text.size() : close + 2;
+            out += text.substr(i, end - i);
+            i = end;
+            continue;
+        }
+        // ...and neither is one inside a string, nor is a "//" there a comment (`"http://..."`)
+        if (text[i] == '"')
+        {
+            out += text[i++];
+            while (i < text.size() && text[i] != '"' && text[i] != '\n')
+            {
+                if (text[i] == '\\' && i + 1 < text.size())
+                {
+                    out += text[i++];
+                }
+                out += text[i++];
+            }
+            if (i < text.size() && text[i] == '"')
+            {
+                out += text[i++];
+            }
+            continue;
+        }
         if (text[i] == '#')
         {
             std::size_t j = i + 1;

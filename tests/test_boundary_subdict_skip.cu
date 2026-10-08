@@ -111,6 +111,109 @@ int main()
         }
     }
 
+    // ---- 2b. THE DICTIONARY FORM: `scale { type coded; ... }` is READ, and the same form holding a table
+    // is read too. OpenFOAM reads `scale` as a PatchFunction1 (cyclicACMIPolyPatch.C:625);
+    // RAS/damBreakLeakage writes a coded one, and the parser died there on "expected ';' got 'type'".
+    //
+    // THIS LEG USED TO ASSERT A REFUSAL, and it was stale: the coded scale is PORTED now -- interFoam's
+    // host and device loops both evaluate it, gated against real OpenFOAM on damBreakLeakage
+    // (tests/interfoam_leakage_vs_openfoam.sh, both arms, plus a restart). What the read must do is
+    // RECORD it, and the two refusals that remain live where they can be honoured rather than here:
+    //   * a solver path that evaluates one number per time step refuses the per-face function by name
+    //     (acmi_area_scaling.cuh:111-116) -- otherwise an empty scale reads as "no scale" and the
+    //     interface runs fully open
+    //   * a key OpenFOAM would compile in and brae cannot is refused when the function is BUILT
+    //     (cyclic_acmi_cpp.cu:238-240), which is why `sub { a 1; }` below must land in unsupportedKeys
+    // Asserting the record rather than the throw is the stronger of the two: a read that quietly dropped
+    // the block would have passed the old refusal test as soon as the refusal moved.
+    {
+        // A VALID coded scale, the shape damBreakLeakage writes, plus ONE key OpenFOAM compiles into its
+        // own dynamicCode and brae cannot. `codeInclude`/`localCode`/`codeOptions`/`codeLibs` are that
+        // set (primitive_mesh.cu:322) and each must be NAMED so the build-time refusal can quote it; an
+        // unknown key is NOT in it, because OpenFOAM does not compile one either.
+        auto codedLeg = [&](const char* what, const char* block, const char* wantName,
+                            const char* wantCodeFragment, const char* wantUnsupported)
+        {
+            writeBoundary(dir, block, "cyclicACMI");
+            PrimitiveMesh mm;
+            try
+            {
+                mm.readBoundary(dir);
+            }
+            catch (const std::exception& e)
+            {
+                std::printf("  FAIL %s threw at read: %s\n", what, e.what());
+                ++failures;
+                return;
+            }
+            const PatchInfo* pi = nullptr;
+            for (const PatchInfo& q : mm.patches())
+            {
+                if (q.acmiScaleCoded) pi = &q;
+            }
+            if (!pi)
+            {
+                std::printf("  FAIL %s parsed but was NOT recorded as coded -- the interface would then\n"
+                            "       run fully open, with an empty scale reading as `no scale`\n", what);
+                ++failures;
+                return;
+            }
+            const CodedPatchFunction1Spec& sp = pi->acmiScaleCodedSpec;
+            std::printf("  %s: recorded, name `%s`, code %zu chars, unsupported `%s`\n",
+                        what, sp.name.c_str(), sp.code.size(), sp.unsupportedKeys.c_str());
+            if (sp.name != wantName)
+            {
+                std::printf("  FAIL %s: `name` read as `%s`, not `%s`\n", what, sp.name.c_str(), wantName);
+                ++failures;
+            }
+            if (sp.code.find(wantCodeFragment) == std::string::npos)
+            {
+                std::printf("  FAIL %s: the verbatim code body does not carry `%s`\n", what, wantCodeFragment);
+                ++failures;
+            }
+            if (std::string(wantUnsupported).empty()
+                ? !sp.unsupportedKeys.empty()
+                : sp.unsupportedKeys.find(wantUnsupported) == std::string::npos)
+            {
+                std::printf("  FAIL %s: unsupported keys read `%s`, wanted `%s`\n", what,
+                            sp.unsupportedKeys.c_str(), wantUnsupported);
+                ++failures;
+            }
+        };
+        codedLeg("scale { type coded; code #{...#}; }",
+                 "        scale\n        {\n            type            coded;\n"
+                 "            name            leak;\n"
+                 "            code            #{ return scalar(0.5); #};\n        }\n",
+                 "leak", "return scalar(0.5)", "");
+        codedLeg("...with a codeInclude OpenFOAM would compile in",
+                 "        scale\n        {\n            type            coded;\n"
+                 "            name            leak;\n"
+                 "            codeInclude     #{ #include \"fvCFD.H\" #};\n"
+                 "            code            #{ return scalar(0.5); #};\n        }\n",
+                 "leak", "return scalar(0.5)", "codeInclude");
+        writeBoundary(dir,
+            "        scale\n        {\n            type            table;\n"
+            "            values          3((0 1)(0.2 1)(0.3 0));\n        }\n",
+            "cyclicACMI");
+        PrimitiveMesh m2;
+        try
+        {
+            m2.readBoundary(dir);
+            const bool ok = m2.patches().size() == 2
+                         && std::fabs(m2.patches()[1].acmiScale.value(0.25) - 0.5) < 1e-12;
+            if (!ok)
+            {
+                std::printf("  FAIL scale { type table; values ...; } does not read as the inline table does\n");
+                ++failures;
+            }
+        }
+        catch (const std::exception& e)
+        {
+            std::printf("  FAIL scale { type table; } threw (%s)\n", e.what());
+            ++failures;
+        }
+    }
+
     // ---- 3. VACUITY GUARD: without the block, the same cyclicACMI patch must parse fine ----
     {
         writeBoundary(dir, "", "cyclicACMI");

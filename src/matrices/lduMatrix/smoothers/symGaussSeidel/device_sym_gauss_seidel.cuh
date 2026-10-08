@@ -70,6 +70,8 @@ struct DeviceGaussSeidelLevels
 {
     int nCells = 0;
     bool valid = false;
+    // the addressing these levels were built from (DeviceLduView::addressingId); gsLevelsFor's stale check
+    unsigned long long addressingId = 0;
     // cells ordered by DAG depth, with per-level [begin,end) held host-side because they drive the
     // launch loop. fwd = the ascending-index sweep, bwd = the descending one.
     DeviceBuffer<label> fwdCells, bwdCells;

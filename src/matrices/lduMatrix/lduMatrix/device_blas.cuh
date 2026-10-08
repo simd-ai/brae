@@ -8,8 +8,21 @@ namespace brae {
 
 void   deviceAxpy(scalar a, const DeviceBuffer<scalar>& x, DeviceBuffer<scalar>& y);  // y += a*x
 void   deviceScale(DeviceBuffer<scalar>& x, scalar a);                                // x *= a
+// BRAE_DEVICE_OF_REDUCE=1: every dot and sum(|x|) below in OpenFOAM's sequential cell order (reductions.cu)
+bool deviceOfOrderReductions();
 scalar deviceDot(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y);       // x . y  (reduction)
 void   deviceCopy(DeviceBuffer<scalar>& dst, const DeviceBuffer<scalar>& src);        // dst = src (D2D)
+// A WHOLE BUFFER COPIED ON THE DEVICE WHERE IT WENT THROUGH THE HOST: `dst = src` by deviceCopy, standing in for
+// src.copyTo(host); dst.copyFrom(host) at sites that read the host copy nowhere. The same bytes by another
+// route, without a download, an upload, a host vector and two waits. `what` names the buffer in a refusal.
+//   BRAE_CONTROL_COPIES_VIA_HOST=1          down and up again, as before
+//   BRAE_CONTROL_DEVICE_COPIES_CHECK=1      both buffers read back after the copy and compared, byte for byte
+//   BRAE_CONTROL_DEVICE_COPIES_STALE=1      a gate's CONTROL, deliberately wrong: a buffer that already has the
+//                                           size is left as it was
+void deviceCopyNotViaHost(
+    DeviceBuffer<scalar>& dst,
+    const DeviceBuffer<scalar>& src,
+    const char* what);
 void   deviceJacobi(DeviceBuffer<scalar>& z, const DeviceBuffer<scalar>& r, const scalar* diag);  // z = r/diag
 // one term of the truncated Neumann series preconditioner: t <- t - D^-1 (A t), w += t (device_pcg.cuh)
 void   deviceNeumannStep(DeviceBuffer<scalar>& t, const DeviceBuffer<scalar>& At, const scalar* diag,

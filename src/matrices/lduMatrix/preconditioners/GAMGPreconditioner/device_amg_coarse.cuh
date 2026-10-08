@@ -19,7 +19,9 @@ void deviceCoarseBiCGStab(const DeviceLduView& cv, const DeviceBuffer<scalar>& r
 // Galerkin update (amgGalerkin, the one point where the coarse coefficients change) and each V-cycle then
 // pays only the two substitutions. Being exact, it makes the V-cycle a fixed linear operator by
 // construction -- the property the iterative twins have to reach COARSE_REL_TOL to earn.
-void deviceCoarseLUFactor(const DeviceLduView& cv, DeviceBuffer<scalar>& lu, DeviceBuffer<int>& piv);
+// `extra`: n*n row-major entries added to the matrix before it is factorised -- the coupled pair's (AMGPair::dense)
+void deviceCoarseLUFactor(const DeviceLduView& cv, DeviceBuffer<scalar>& lu, DeviceBuffer<int>& piv,
+                          const scalar* extra = nullptr);
 void deviceCoarseLUSolve(int nC, const DeviceBuffer<scalar>& lu, const DeviceBuffer<int>& piv,
                          const DeviceBuffer<scalar>& rc, DeviceBuffer<scalar>& xc);
 void deviceCoarseJacobiSingleBlock(const DeviceLduView& cv, const DeviceBuffer<scalar>& rc, DeviceBuffer<scalar>& xc, int nSweeps);

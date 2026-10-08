@@ -90,7 +90,13 @@ std::vector<vector> divDevReffExplicit(
     // coefficient above applies on top of either). divDevRhoReff's explicit term is the largest in the
     // momentum equation, so a `default leastSquares` that reached the closure and the pressure gradient
     // but not this one left validation/rhoSST at omega 5.6e-04 restarted from OpenFOAM's iteration 5.
-    bool                          gradULeastSq = false);
+    bool                          gradULeastSq = false,
+    // A grad(U) formed EARLIER, cells and boundary, used instead of forming one here: fvSolution's
+    // `cache { grad(U); }` makes fvc::grad(U) return the registry's field while U's eventNo has not moved
+    // (gradScheme.C:120-160), and that field's boundary is the one gaussGrad corrected when it was formed.
+    // Null forms it here, from U as it stands. Both or neither.
+    const std::vector<tensor>*              gradUGiven = nullptr,
+    const std::vector<std::vector<tensor>>* gradUBndGiven = nullptr);
 
 // The full operator as it appears in UEqn.H: the IMPLICIT laplacian assembled into the matrix, and the
 // EXPLICIT dev2 term added to the source.
@@ -122,7 +128,15 @@ void addDivDevReff(
     // coefficient above applies on top of either). divDevRhoReff's explicit term is the largest in the
     // momentum equation, so a `default leastSquares` that reached the closure and the pressure gradient
     // but not this one left validation/rhoSST at omega 5.6e-04 restarted from OpenFOAM's iteration 5.
-    bool                          gradULeastSq = false);
+    bool                          gradULeastSq = false,
+    // `uncorrected`/`limited 0`: nonOrthDeltaCoeffs on the IMPLICIT half with no explicit correction --
+    // uncorrectedSnGrad.H:113-119 returns nonOrthDeltaCoeffs, only orthogonalSnGrad.H:113-119 returns
+    // deltaCoeffs. Last, so no positional caller of the eight above moves.
+    bool                          nonOrthCoeffs = false,
+    // The cached grad(U), as divDevReffExplicit takes it. It reaches the explicit dev2 term AND the
+    // corrected laplacian's fullGradCorrection, which resolves the same name (correctedSnGrad.C:52-56).
+    const std::vector<tensor>*              gradUGiven = nullptr,
+    const std::vector<std::vector<tensor>>* gradUBndGiven = nullptr);
 
 } // namespace cpu
 } // namespace brae

@@ -5,6 +5,11 @@
 #include "device_boundary.cuh"
 #include "device_blas.cuh"   // deviceDotInto / deviceSumMagInto: FP-9 keeps the inlet reduction on the device
 #include <map>
+#include <cstdio>
+#include <vector>
+#include <stdexcept>
+#include <cstdlib>
+#include <algorithm>
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -155,7 +160,11 @@ void piovUpdateKernel(
     scalar* __restrict__ r0,
     scalar* __restrict__ r1,
     scalar* __restrict__ r2,
-    int     directionMixed)
+    int     directionMixed,
+    // the patch's refValue per face, or null where no patch carries a tangentialVelocity
+    const scalar* __restrict__ rvx,
+    const scalar* __restrict__ rvy,
+    const scalar* __restrict__ rvz)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n || !piov[i]) return;
@@ -187,6 +196,35 @@ void piovUpdateKernel(
     const scalar dx = sqrt(fmax(scalar(0), scalar(1) - nx[i] * nx[i]));
     const scalar dy = sqrt(fmax(scalar(0), scalar(1) - ny[i] * ny[i]));
     const scalar dz = sqrt(fmax(scalar(0), scalar(1) - nz[i] * nz[i]));
+    if (rvx)
+    {
+        // WITH A refValue: directionMixed's evaluate term for term, (vf & refValue) + ((I - vf) & U_cell)
+        // with vf = I - n n, written as the host's inflowValueWithRef writes it (fv_patch_field.cuh) so the
+        // two arms round alike. The COEFFICIENTS depend on vf alone and are the ones below.
+        const scalar one = scalar(1);
+        const scalar vxx = one * (one - nx[i] * nx[i]);
+        const scalar vxy = one * (-(nx[i] * ny[i]));
+        const scalar vxz = one * (-(nx[i] * nz[i]));
+        const scalar vyy = one * (one - ny[i] * ny[i]);
+        const scalar vyz = one * (-(ny[i] * nz[i]));
+        const scalar vzz = one * (one - nz[i] * nz[i]);
+        const scalar ixx = one - vxx;
+        const scalar ixy = -vxy;
+        const scalar ixz = -vxz;
+        const scalar iyy = one - vyy;
+        const scalar iyz = -vyz;
+        const scalar izz = one - vzz;
+        const scalar ax = vxx * rvx[i] + vxy * rvy[i] + vxz * rvz[i];
+        const scalar ay = vxy * rvx[i] + vyy * rvy[i] + vyz * rvz[i];
+        const scalar az = vxz * rvx[i] + vyz * rvy[i] + vzz * rvz[i];
+        const scalar bx = ixx * Ux[c] + ixy * Uy[c] + ixz * Uz[c];
+        const scalar by = ixy * Ux[c] + iyy * Uy[c] + iyz * Uz[c];
+        const scalar bz = ixz * Ux[c] + iyz * Uy[c] + izz * Uz[c];
+        piovComponent(dx, ax + bx, Ux[c], &ty0[i], &vf0[i], &r0[i]);
+        piovComponent(dy, ay + by, Uy[c], &ty1[i], &vf1[i], &r1[i]);
+        piovComponent(dz, az + bz, Uz[c], &ty2[i], &vf2[i], &r2[i]);
+        return;
+    }
     piovComponent(dx, nx[i] * Un, Ux[c], &ty0[i], &vf0[i], &r0[i]);
     piovComponent(dy, ny[i] * Un, Uy[c], &ty1[i], &vf1[i], &r1[i]);
     piovComponent(dz, nz[i] * Un, Uz[c], &ty2[i], &vf2[i], &r2[i]);
@@ -533,13 +571,23 @@ void deviceUpdatePressureInletOutletVelocity(
 {
     const int n = dbU.n;
     if (n == 0) return;
+    const bool withRef = dbU.piovRef[0].size() == static_cast<std::size_t>(n);
+    if (withRef && !directionMixed)
+    {
+        throw std::runtime_error(
+            "brae: a pressureInletOutletVelocity patch carries a `tangentialVelocity` and this driver types "
+            "its inflow fixedValue at n*(n.U_cell); only the directionMixed form carries the refValue.");
+    }
     piovUpdateKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].piovMask.data(), dbU.comp[0].faceCell.data(), phiBnd.data(),
                                           dbU.nx.data(), dbU.ny.data(), dbU.nz.data(), Ux.data(), Uy.data(), Uz.data(),
                                           dbU.comp[0].bcType.data(), dbU.comp[1].bcType.data(), dbU.comp[2].bcType.data(),
                                           dbU.comp[0].valueFraction.data(), dbU.comp[1].valueFraction.data(),
                                           dbU.comp[2].valueFraction.data(),
                                           dbU.comp[0].refValue.data(), dbU.comp[1].refValue.data(), dbU.comp[2].refValue.data(),
-                                          directionMixed ? 1 : 0);
+                                          directionMixed ? 1 : 0,
+                                          withRef ? dbU.piovRef[0].data() : nullptr,
+                                          withRef ? dbU.piovRef[1].data() : nullptr,
+                                          withRef ? dbU.piovRef[2].data() : nullptr);
     cudaCheck(cudaGetLastError(), "piovUpdate");
 }
 
@@ -641,6 +689,68 @@ void deviceWedgeFaceValue(
                                               dbU.comp[0].wedgeT.data(), fx.data(), fy.data(), fz.data(),
                                               bx.data(), by.data(), bz.data());
     cudaCheck(cudaGetLastError(), "wedgeFaceValue");
+}
+
+
+namespace {
+// THE WEDGE'S gradientBoundaryCoeffs, which the mixed slot cannot carry. A wedge is emulated here as a
+// mixed condition with ONE refValue, chosen by deviceUpdateWedge to reproduce OpenFOAM's VALUE,
+// transform(faceT, pif). OpenFOAM's gradient coefficients come from a DIFFERENT expression
+// (transformFvPatchField.C:95-136, wedgeFvPatchField.C snGrad):
+//     gradientInternalCoeffs = -deltaCoeffs*d,                 d_k = 0.5*(1 - cellT_kk)
+//     gradientBoundaryCoeffs = snGrad - gradientInternalCoeffs*pif
+//                            = 0.5*deltaCoeffs*((cellT & pif)_k - cellT_kk*pif_k)
+// with cellT = faceT & faceT (wedgePolyPatch.C:128). The mixed slot's explicit half, vf*ref*dc, is
+// dc*((faceT & pif)_k - (1 - d_k)*pif_k) instead -- the two agree to first order in the wedge angle
+// and differ at second, in the components the rotation mixes. The implicit half is already OpenFOAM's.
+// This overwrites a laplacian's boundaryCoeffs on the wedge faces with OpenFOAM's, component k:
+//     bC = -gamma*magSf*gradientBoundaryCoeffs_k
+__global__
+void wedgeLaplacianBCKernel(
+    int n,
+    int k,
+    const label* __restrict__ wdg,
+    const label* __restrict__ fc,
+    const scalar* __restrict__ T,     // 9*n, row-major faceT per face
+    const scalar* __restrict__ dc,
+    const scalar* __restrict__ magSf,
+    const scalar* __restrict__ gammaFace,
+    const scalar* __restrict__ fx, const scalar* __restrict__ fy, const scalar* __restrict__ fz,
+    scalar* __restrict__ bC)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || !wdg[i]) return;
+
+    const int c = fc[i];
+    const scalar v[3] = { fx[c], fy[c], fz[c] };
+    const scalar* F = T + 9*i;
+    // row k of cellT = faceT & faceT
+    scalar cTk[3];
+    for (int j = 0; j < 3; ++j)
+        cTk[j] = F[3*k + 0]*F[0*3 + j] + F[3*k + 1]*F[1*3 + j] + F[3*k + 2]*F[2*3 + j];
+    const scalar rot = cTk[0]*v[0] + cTk[1]*v[1] + cTk[2]*v[2];
+    const scalar gradBC = (scalar(0.5)*dc[i])*(rot - cTk[k]*v[k]);
+    bC[i] = -(gammaFace[i]*magSf[i])*gradBC;
+}
+} // namespace
+
+void deviceWedgeLaplacianBC(
+    const DeviceVectorBoundary& dbU,
+    int k,
+    const DeviceBuffer<scalar>& gammaFace,
+    const DeviceBuffer<scalar>& fx,
+    const DeviceBuffer<scalar>& fy,
+    const DeviceBuffer<scalar>& fz,
+    DeviceBuffer<scalar>& bC)
+{
+    const int n = dbU.n;
+    if (n == 0 || dbU.comp[0].wedgeMask.size() == 0) return;
+    const DeviceBoundary& b = dbU.comp[k];
+    wedgeLaplacianBCKernel<<<nBlocks(n), TPB>>>(n, k, dbU.comp[0].wedgeMask.data(), b.faceCell.data(),
+                                                dbU.comp[0].wedgeT.data(), b.deltaCoeffs.data(),
+                                                b.magSf.data(), gammaFace.data(),
+                                                fx.data(), fy.data(), fz.data(), bC.data());
+    cudaCheck(cudaGetLastError(), "wedgeLaplacianBC");
 }
 
 
@@ -779,6 +889,176 @@ void deviceUpdateTotalPressure(
                                            (rhoBnd && rhoBnd->size() == static_cast<std::size_t>(db.n)) ? rhoBnd->data() : nullptr,
                                            db.refValue.data());
     cudaCheck(cudaGetLastError(), "tpUpdate");
+}
+
+
+// ---- deviceScatterRuns: arrays of one staged block to their places, run by run, in one launch ----------------
+namespace {
+constexpr int SCATTER_MAX_ARRAYS = 12;
+template<class T>
+struct ScatterArrays
+{
+    int n = 0;
+    T* to[SCATTER_MAX_ARRAYS] = {};
+    int from[SCATTER_MAX_ARRAYS] = {};
+};
+// thread i takes compact entry i of every array: its run is the first whose end is past it
+template<class T>
+__global__
+void scatterRunsKernel(
+    int nh,
+    int nRuns,
+    const label* __restrict__ runEnd,
+    const label* __restrict__ runAt,
+    const T* __restrict__ stage,
+    ScatterArrays<T> a,
+    int reversed)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nh) return;
+    int lo = 0;
+    int hi = nRuns - 1;
+    while (lo < hi)
+    {
+        const int mid = (lo + hi)/2;
+        if (i < runEnd[mid])
+        {
+            hi = mid;
+        }
+        else
+        {
+            lo = mid + 1;
+        }
+    }
+    const label begin = (lo == 0) ? 0 : runEnd[lo - 1];
+    const label at = runAt[lo] + (i - begin);
+    const int src = reversed ? (nh - 1 - i) : i;
+    for (int k = 0; k < a.n; ++k)
+    {
+        a.to[k][at] = stage[static_cast<std::size_t>(a.from[k])*nh + src];
+    }
+}
+// the runs as two device arrays, kept while the runs are the same ones: a hook asks with its mesh's runs at
+// every call
+struct RunsTable
+{
+    std::vector<label> endH;
+    std::vector<label> atH;
+    DeviceBuffer<label> end;
+    DeviceBuffer<label> at;
+};
+template<class T>
+void scatterRuns(
+    const DeviceBuffer<T>& stage,
+    std::size_t nh,
+    const std::vector<DeviceBoundaryRange>& runs,
+    const std::vector<DeviceBuffer<T>*>& to,
+    const std::vector<int>& from)
+{
+    if (nh == 0 || to.empty()) return;
+    if (to.size() != from.size() || to.size() > static_cast<std::size_t>(SCATTER_MAX_ARRAYS))
+    {
+        throw std::runtime_error("brae: deviceScatterRuns takes one source an array and at most twelve arrays.");
+    }
+    std::vector<label> endH;
+    std::vector<label> atH;
+    std::size_t total = 0;
+    for (const DeviceBoundaryRange& r : runs)
+    {
+        for (const DeviceBuffer<T>* b : to)
+        {
+            if (r.at + r.n > b->size())
+            {
+                throw std::runtime_error("brae: deviceScatterRuns: a run past the end of the buffer it fills.");
+            }
+        }
+        total += r.n;
+        endH.push_back(static_cast<label>(total));
+        atH.push_back(static_cast<label>(r.at));
+    }
+    int most = 0;
+    for (const int f : from)
+    {
+        most = std::max(most, f);
+    }
+    if (total != nh || stage.size() < (static_cast<std::size_t>(most) + 1)*nh)
+    {
+        throw std::runtime_error("brae: deviceScatterRuns: the staged block is not the runs' size.");
+    }
+    static const bool byCopies = std::getenv("BRAE_CONTROL_SCATTER_RUNS_BY_COPIES") != nullptr;
+    if (byCopies)
+    {
+        for (std::size_t k = 0; k < to.size(); ++k)
+        {
+            std::size_t at = static_cast<std::size_t>(from[k])*nh;
+            for (const DeviceBoundaryRange& r : runs)
+            {
+                cudaCheck(cudaMemcpyAsync(to[k]->data() + r.at, stage.data() + at, r.n*sizeof(T),
+                                          cudaMemcpyDeviceToDevice, cudaStreamPerThread), "deviceScatterRuns");
+                at += r.n;
+            }
+        }
+        return;
+    }
+    static const bool reversed = std::getenv("BRAE_CONTROL_SCATTER_RUNS_REVERSED") != nullptr;
+    static bool said = false;
+    if (!said)
+    {
+        said = true;
+        std::printf("  boundary arrays: a staged block's arrays go to their patches in one launch; "
+                    "BRAE_CONTROL_SCATTER_RUNS_BY_COPIES=1 copies each array run by run\n");
+        if (reversed)
+        {
+            std::printf("  *** CONTROL MODE: the staged entries land in reverse order. This run is deliberately "
+                        "wrong. ***\n");
+        }
+    }
+    static auto& table = *new RunsTable();
+    if (table.endH != endH || table.atH != atH)
+    {
+        table.end.copyFrom(endH);
+        table.at.copyFrom(atH);
+        table.endH = endH;
+        table.atH = atH;
+    }
+    ScatterArrays<T> a;
+    a.n = static_cast<int>(to.size());
+    for (std::size_t k = 0; k < to.size(); ++k)
+    {
+        a.to[k] = to[k]->data();
+        a.from[k] = from[k];
+    }
+    const int n = static_cast<int>(nh);
+    scatterRunsKernel<T><<<nBlocks(n), TPB, 0, cudaStreamPerThread>>>(
+        n,
+        static_cast<int>(runs.size()),
+        table.end.data(),
+        table.at.data(),
+        stage.data(),
+        a,
+        reversed ? 1 : 0);
+    cudaCheck(cudaGetLastError(), "deviceScatterRuns");
+}
+}   // namespace
+
+void deviceScatterRuns(
+    const DeviceBuffer<scalar>& stage,
+    std::size_t nh,
+    const std::vector<DeviceBoundaryRange>& runs,
+    const std::vector<DeviceBuffer<scalar>*>& to,
+    const std::vector<int>& from)
+{
+    scatterRuns<scalar>(stage, nh, runs, to, from);
+}
+
+void deviceScatterRuns(
+    const DeviceBuffer<label>& stage,
+    std::size_t nh,
+    const std::vector<DeviceBoundaryRange>& runs,
+    const std::vector<DeviceBuffer<label>*>& to,
+    const std::vector<int>& from)
+{
+    scatterRuns<label>(stage, nh, runs, to, from);
 }
 
 } // namespace brae

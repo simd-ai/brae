@@ -220,13 +220,37 @@ static std::vector<label> readLabelColumn(const std::string& path)
     FastScan s(path);
     const label n = static_cast<label>(s.nextLong());   // count; '(' then the n ints ')' are parsed as delimiters
     std::vector<label> v(n);
-    for (label i = 0; i < n; ++i) v[i] = static_cast<label>(s.nextLong());
+    // UListIO.C:119-123 writes a list of more than one entry, all equal, as `N{v}` -- a cellLevel before
+    // any refinement is `1000{0}` -- and ListIO.C reads the one value into every entry. Scanned as a
+    // column it read the value once and then ran off the end: strtol there returns 0 without moving, so
+    // `8{2}` came back as one 2 and seven zeros, with nothing said.
+    while (s.p < s.end && std::isspace(static_cast<unsigned char>(*s.p)))
+    {
+        ++s.p;
+    }
+    if (s.p < s.end && *s.p == '{')
+    {
+        const label uniformValue = static_cast<label>(s.nextLong());
+        std::fill(v.begin(), v.end(), uniformValue);
+        return v;
+    }
+    for (label i = 0; i < n; ++i)
+    {
+        v[i] = static_cast<label>(s.nextLong());
+    }
     return v;
+}
+
+// ...and the same two branches, EXPORTED, because cellLevel and pointLevel need them too and a second copy
+// of a format switch is how the cellZones reader came to be ASCII-only on a binary mesh.
+std::vector<label> readLabelListFile(const std::string& path)
+{
+    return (foamFormat(path) == "binary") ? readBinaryLabelList(path) : readLabelColumn(path);
 }
 
 static std::vector<label> readLabelFile(const std::string& path)
 {
-    return (foamFormat(path) == "binary") ? readBinaryLabelList(path) : readLabelColumn(path);
+    return readLabelListFile(path);
 }
 
 void PrimitiveMesh::readOwner(const std::string& dir)     { owner_     = readLabelFile(dir + "/owner"); }
@@ -268,12 +292,114 @@ void PrimitiveMesh::readBoundary(const std::string& dir)
         std::string acmiScaleType;
         std::vector<std::pair<scalar, scalar>> acmiScaleTable;
         scalar acmiScaleConst = 1;
+        // `type coded;`: the keys CodedField.C reads -- `name` (default the entry name, :158) and `code`;
+        // codeInclude, localCode, codeOptions and codeLibs are collected so the coded object refuses them
+        CodedPatchFunction1Spec acmiCoded;
+        acmiCoded.name = "scale";
         pi.name = ts.next();
         ts.expect("{");
         while (ts.peek() != "}")
         {
             const std::string key = ts.next();
-            if      (key == "scale")
+            if      (key == "scale" && ts.peek() == "{")
+            {
+                // THE DICTIONARY FORM, `scale { type coded; code #{ ... #}; }`. OpenFOAM reads `scale` as a
+                // PatchFunction1 (cyclicACMIPolyPatch.C:625), so the selector may sit inside a block, and
+                // RAS/damBreakLeakage writes a per-face coded one there. This branch took `{` for the
+                // selector word and the parse died on "expected ';' got 'type'", naming nothing. `constant`
+                // and `table` are read as their inline forms are; any other type reaches the refusal below
+                // under its own name.
+                ts.expect("{");
+                while (ts.peek() != "}")
+                {
+                    const std::string k2 = ts.next();
+                    if (k2 == "type")
+                    {
+                        acmiScaleType = ts.next();
+                        ts.expect(";");
+                    }
+                    else if (k2 == "value" && ts.peek() != "{")
+                    {
+                        acmiScaleConst = ts.nextScalar();
+                        ts.expect(";");
+                    }
+                    else if (k2 == "values")
+                    {
+                        acmiScaleTable = readAcmiScaleTable(ts);
+                        ts.expect(";");
+                    }
+                    else if (k2 == "code")
+                    {
+                        // the verbatim #{ ... #} token; a quoted string is a legal `code` too
+                        const std::string tok = ts.next();
+                        if (!ts.verbatim(tok, acmiCoded.code))
+                        {
+                            acmiCoded.code = tok;
+                        }
+                        ts.expect(";");
+                    }
+                    else if (k2 == "name")
+                    {
+                        acmiCoded.name = ts.next();
+                        ts.expect(";");
+                    }
+                    else if (k2 == "codeInclude" || k2 == "localCode" || k2 == "codeOptions" || k2 == "codeLibs")
+                    {
+                        acmiCoded.unsupportedKeys += (acmiCoded.unsupportedKeys.empty() ? "`" : ", `") + k2 + "`";
+                        if (ts.peek() == "{")
+                        {
+                            ts.expect("{");
+                            for (int depth = 1; depth > 0; )
+                            {
+                                const std::string t = ts.next();
+                                if (t == "{")
+                                {
+                                    ++depth;
+                                }
+                                else if (t == "}")
+                                {
+                                    --depth;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            while (ts.peek() != ";")
+                            {
+                                ts.next();
+                            }
+                            ts.expect(";");
+                        }
+                    }
+                    else if (ts.peek() == "{")
+                    {
+                        ts.expect("{");
+                        for (int depth = 1; depth > 0; )
+                        {
+                            const std::string t = ts.next();
+                            if (t == "{")
+                            {
+                                ++depth;
+                            }
+                            else if (t == "}")
+                            {
+                                --depth;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        while (ts.peek() != ";")
+                        {
+                            ts.next();
+                        }
+                        ts.expect(";");
+                    }
+                }
+                ts.expect("}");
+                continue;
+            }
+            else if (key == "scale")
             {
                 acmiScaleType = ts.next();
                 // `scale constant 0.5;` carries its value inline; `scale table;` defers to scaleCoeffs.
@@ -354,10 +480,19 @@ void PrimitiveMesh::readBoundary(const std::string& dir)
             if (acmiScaleType == "constant")        pi.acmiScale = Function1::constant(acmiScaleConst);
             else if (acmiScaleType == "table" && !acmiScaleTable.empty())
                                                     pi.acmiScale = Function1::table(acmiScaleTable);
+            else if (acmiScaleType == "coded")
+            {
+                acmiCoded.origin = dir + "/boundary: patch '" + pi.name + "', scale";
+                // <case>/dynamicCode, where OpenFOAM builds its own (a brae/ subdirectory keeps the two apart)
+                acmiCoded.codeDir =
+                    (std::filesystem::path(dir).parent_path().parent_path() / "dynamicCode" / "brae").string();
+                pi.acmiScaleCoded = true;
+                pi.acmiScaleCodedSpec = acmiCoded;
+            }
             else
                 throw std::runtime_error(
                     "brae: cyclicACMI '" + pi.name + "' has `scale " + acmiScaleType + "`, which brae "
-                    "does not evaluate (it reads `constant` and `table`). The scale sets how far the "
+                    "does not evaluate (it reads `constant`, `table` and `coded`). The scale sets how far the "
                     "interface is open at each time, so substituting another function solves a "
                     "different case.");
         }
@@ -369,28 +504,39 @@ void PrimitiveMesh::readBoundary(const std::string& dir)
     propagateACMIScale(patches_);
 }
 
-void PrimitiveMesh::read(const std::string& polyMeshDir)
+void PrimitiveMesh::read(
+    const std::string& pointsDir,
+    const std::string& facesDir,
+    const std::string& boundaryDir)
 {
-    // BRAE_MESH_CACHE: skip the (slow) ASCII parse on a warm run by reloading a binary blob, provided it is newer than
-    // the polyMesh/owner file (so an edited/regenerated mesh auto-invalidates the cache). Same idea as OF reusing
-    // decomposePar's processor* dirs, one cold parse, then fast warm starts.
-    const std::string cachePath = polyMeshDir + "/.brae_meshcache";
-    {   // AUTO warm-load if a valid cache is present (newer than owner), no env needed, so a `-partition` run makes
-        // the subsequent solve warm automatically. Stale/foreign caches are rejected (mtime + magic) -> cold parse.
+    // THE INSTANCES CAN DIFFER, and when they do neither half of the mesh cache applies: the cache holds one
+    // mesh keyed on ONE directory, so a warm load would hand back the faces directory's points instead of
+    // the points instance's, and a write would leave that for the next run.
+    const bool splitInstances = (pointsDir != facesDir) || (boundaryDir != facesDir);
+
+    // BRAE_MESH_CACHE: skip the (slow) ASCII parse on a warm run by reloading a binary blob, provided it is
+    // newer than the polyMesh/owner file (so an edited/regenerated mesh auto-invalidates the cache). Same
+    // idea as OF reusing decomposePar's processor* dirs, one cold parse, then fast warm starts. It is keyed
+    // on the FACES directory, which is where `owner` lives.
+    const std::string cachePath = facesDir + "/.brae_meshcache";
+    if (!splitInstances)
+    {   // AUTO warm-load if a valid cache is present (newer than owner), no env needed, so a `-partition`
+        // run makes the subsequent solve warm automatically. Stale/foreign caches are rejected (mtime +
+        // magic) -> cold parse.
         std::error_code ec;
         namespace fs = std::filesystem;
-        const std::string ownerPath = polyMeshDir + "/owner";
+        const std::string ownerPath = facesDir + "/owner";
         if (fs::exists(cachePath, ec) && fs::exists(ownerPath, ec)
             && fs::last_write_time(cachePath, ec) >= fs::last_write_time(ownerPath, ec)
             && loadBinary(cachePath))
             return;                                          // warm: reloaded from cache
     }
-    const bool writeCache = std::getenv("BRAE_MESH_CACHE") != nullptr;   // write only when asked (-partition / env)
-    readPoints(polyMeshDir);
-    readFaces(polyMeshDir);
-    readOwner(polyMeshDir);
-    readNeighbour(polyMeshDir);
-    readBoundary(polyMeshDir);
+    const bool writeCache = std::getenv("BRAE_MESH_CACHE") != nullptr;   // write only when asked
+    readPoints(pointsDir);
+    readFaces(facesDir);
+    readOwner(facesDir);
+    readNeighbour(facesDir);
+    readBoundary(boundaryDir);
 
     // nCells = max cell index referenced by owner/neighbour, + 1.
     label maxCell = -1;
@@ -398,7 +544,7 @@ void PrimitiveMesh::read(const std::string& polyMeshDir)
     for (const label c : neighbour_) maxCell = std::max(maxCell, c);
     nCells_ = maxCell + 1;
 
-    if (writeCache) writeBinary(cachePath);                  // cold: write the cache for next time
+    if (writeCache && !splitInstances) writeBinary(cachePath);   // cold: write the cache for next time
 }
 
 } // namespace brae

@@ -81,4 +81,18 @@ echo "$out" | grep -q "what():.*H2O.*647.13" \
     && echo "  H2O above its critical point refused, naming the range ok" \
     || { echo "$out" | tail -3; echo "FAIL: no correlation-range REFUSAL fired on the CUDA path"; fail=1; }
 
+# --- a ddt scheme the closures do not carry -> refused naming it ---------------------------------
+# The closures take fvm::ddt through ddtSchemes (kEpsilon.C:254, kOmegaSSTBase.C:572) and this port
+# carries steadyState and Euler only; backward and CrankNicolson have coefficients it does not take
+# (scheme_parse.cuh:304-310). tools/default_audit_allow.txt cites that refusal as the reason the
+# CrankNicolson half of KEpsilonInput and Compressible is left null on this path -- a cited refusal
+# that nothing exercises is a claim, not a guarantee, so it is exercised here.
+mkarm
+sed -i 's/ddtSchemes { default steadyState;/ddtSchemes { default CrankNicolson 0.9;/' "$W/c/system/fvSchemes"
+grep -q "CrankNicolson" "$W/c/system/fvSchemes" || { echo "FAIL: the ddt arm was not staged"; fail=1; }
+out=$("$BIN" "$W/c" 0.orig 2 2>&1) && { echo "FAIL: a CrankNicolson ddt RAN on the CUDA path"; fail=1; }
+echo "$out" | grep -q "ddtSchemes default is" \
+    && echo "  a CrankNicolson ddt refused by name               ok" \
+    || { echo "$out" | tail -3; echo "FAIL: no ddt-scheme REFUSAL fired"; fail=1; }
+
 [ $fail = 0 ] && echo PASS || { echo FAIL; exit 1; }

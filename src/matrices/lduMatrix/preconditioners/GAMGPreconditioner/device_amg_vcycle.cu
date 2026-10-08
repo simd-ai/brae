@@ -5,6 +5,7 @@
 // headers. Verbatim split of device_amg.cu -- no logic change. The PCG drivers (device_amg.cu) call vcycleAt/
 // vcycleAtF/amgCastFP32 (external linkage) via local decls there.
 #include "device_amg.cuh"          // AMGData / AMGLevel / GridColoring / DeviceLduView / DeviceSolverPerf
+#include "device_amg_split.cuh"    // BRAE_AMG_PCG_SPLIT: a lap after every part of a cycle
 #include "device_amg_detail.cuh"   // constants (OMEGA/NPRE/NPOST/CHEB_*/SB_*/NCOARSE_CG) + env flags + nBlocks/TPB
 #include "device_amg_internal.cuh" // LduF/lduF/cast_/amulF, gsSweep + smoother decls (ensureSpectrum/cheb/tsGS)
 #include "device_amg_coarse.cuh"   // deviceCoarsePCG / deviceCoarseJacobiSingleBlock
@@ -73,36 +74,77 @@ void prolongToK(
     const int c = blockIdx.x*blockDim.x + threadIdx.x;
     if (c < nF) pc[c] = xc[map[c]];   // prolong INTO pc (not added yet)
 }
-// Smoothed-aggregation sparse prolongator apply (BRAE_AMG_SA): restrict = P^T, prolong = P.
+// Smoothed-aggregation sparse prolongator apply (BRAE_AMG_SA): restrict = P^T, prolong = P. Templated on the
+// value type, as the cycles' other work kernels are: T = scalar is the double-precision cycle's kernel as it
+// was, T = float the single-precision cycle's, over the prolongator's values cast once (AMGLevel::PvalF).
 // restrict: rc += P^T r  (each fine cell f scatters val*r[f] into its coarse columns, atomically).
+template <typename T>
 __global__
-void restrictSparseK(
+void restrictSparseT(
     int nF,
     const label* __restrict__ rowPtr,
     const label* __restrict__ col,
-    const scalar* __restrict__ val,
-    const scalar* __restrict__ r,
-    scalar* __restrict__ rc)
+    const T* __restrict__ val,
+    const T* __restrict__ r,
+    T* __restrict__ rc)
 {
     const int f = blockIdx.x*blockDim.x + threadIdx.x;
     if (f >= nF) return;
-    const scalar rf = r[f];
+    const T rf = r[f];
     for (int k = rowPtr[f]; k < rowPtr[f+1]; ++k)
         atomicAdd(&rc[col[k]], val[k]*rf);
 }
-// prolong (ADD): x[f] += sum_k P[f][k]*xc[col], the smoothed-P twin of prolongT.
+// restrict in a fixed order, rc = P^T r over P^T by coarse row (AMGLevel::Rrow, Rfine, Rval -- amgSaFixedOrder),
+// two launches (AMGLevel::rapStart has why two): every entry's product, a thread an entry...
+template <typename T>
 __global__
-void prolongSparseK(
+void restrictTermsT(
+    int nnz,
+    const label* __restrict__ fine,
+    const T* __restrict__ val,
+    const T* __restrict__ r,
+    T* __restrict__ term)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= nnz) return;
+    term[k] = val[k]*r[fine[k]];
+}
+
+// ...then each coarse cell's run of them added in order, a thread a cell. Writes rc, so no zeroing first.
+template <typename T>
+__global__
+void restrictSumT(
+    int nC,
+    int reversed,
+    const label* __restrict__ rowPtr,
+    const T* __restrict__ term,
+    T* __restrict__ rc)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    const int lo = rowPtr[c];
+    const int hi = rowPtr[c + 1];
+    T acc = 0;
+    for (int j = 0; j < hi - lo; ++j)
+    {
+        acc += term[reversed ? hi - 1 - j : lo + j];
+    }
+    rc[c] = acc;
+}
+// prolong (ADD): x[f] += sum_k P[f][k]*xc[col], the smoothed-P twin of prolongT.
+template <typename T>
+__global__
+void prolongSparseT(
     int nF,
     const label* __restrict__ rowPtr,
     const label* __restrict__ col,
-    const scalar* __restrict__ val,
-    const scalar* __restrict__ xc,
-    scalar* __restrict__ x)
+    const T* __restrict__ val,
+    const T* __restrict__ xc,
+    T* __restrict__ x)
 {
     const int f = blockIdx.x*blockDim.x + threadIdx.x;
     if (f >= nF) return;
-    scalar s = 0.0;
+    T s = T(0);
     for (int k = rowPtr[f]; k < rowPtr[f+1]; ++k)
         s += val[k]*xc[col[k]];
     x[f] += s;
@@ -125,6 +167,304 @@ void prolongToSparseK(
     pc[f] = s;
 }
 
+// THE COUPLED PAIR'S TERM OF A PRODUCT, on any grid (AMGPair): y[own] += ifc*sum_k w[k]*x[nbr[k]] over a face's
+// slots -- lduMatrix::Amul's interface update, cyclicAMIFvPatchField::updateInterfaceMatrix on the fine grid.
+// `off` null is a one-to-one pair: one slot a face, weight 1. Atomic, as the fine product's own interface
+// kernels are: a cell may own several of the pair's faces.
+template <typename T>
+__global__
+void pairAddT(
+    int n,
+    const label* __restrict__ own,
+    const label* __restrict__ nbr,
+    const label* __restrict__ off,
+    const T* __restrict__ w,
+    const T* __restrict__ ifc,
+    const T* __restrict__ x,
+    T* __restrict__ y)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    T s = T(0);
+    if (off)
+    {
+        for (int k = off[i]; k < off[i+1]; ++k)
+        {
+            s += w[k]*x[nbr[k]];
+        }
+    }
+    else
+    {
+        s = x[nbr[i]];
+    }
+    atomicAdd(&y[own[i]], ifc[i]*s);
+}
+// The same term with a cell's faces added in face order (AMGPair::ownCells): one thread an own cell.
+template <typename T>
+__global__
+void pairGatherT(
+    int nOwn,
+    const label* __restrict__ cells,
+    const label* __restrict__ start,
+    const label* __restrict__ faces,
+    const label* __restrict__ nbr,
+    const label* __restrict__ off,
+    const T* __restrict__ w,
+    const T* __restrict__ ifc,
+    const T* __restrict__ x,
+    T* __restrict__ y)
+{
+    const int j = blockIdx.x*blockDim.x + threadIdx.x;
+    if (j >= nOwn) return;
+    const int c = cells[j];
+    T acc = y[c];
+    for (int f = start[j]; f < start[j+1]; ++f)
+    {
+        const int i = faces[f];
+        T s = T(0);
+        if (off)
+        {
+            for (int k = off[i]; k < off[i+1]; ++k)
+            {
+                s += w[k]*x[nbr[k]];
+            }
+        }
+        else
+        {
+            s = x[nbr[i]];
+        }
+        acc += ifc[i]*s;
+    }
+    y[c] = acc;
+}
+// ...AND A GRID'S DENSE MATRIX, in two launches. One thread a ROW walking the row's faces was the first cut:
+// a coarse cell owns thousands of the pair's faces, and that walk -- made at every solve -- was what the
+// ordered sums cost (MEASURED on mixerVesselAMI: the p_rgh iterations 255 -> 302 ms a step and pcorr's 49 ->
+// 70, all of it here; the products themselves 0.6% of the step). So each chunk of a row's faces is summed
+// into a strip of its own, one thread a chunk...
+template <typename T>
+__global__
+void pairDenseChunkT(
+    int nChunks,
+    const label* __restrict__ chunkStart,
+    const label* __restrict__ faces,
+    const label* __restrict__ nbr,
+    const label* __restrict__ off,
+    const T* __restrict__ w,
+    const T* __restrict__ ifc,
+    int nC,
+    T* __restrict__ strip)
+{
+    const int q = blockIdx.x*blockDim.x + threadIdx.x;
+    if (q >= nChunks) return;
+    T* row = strip + static_cast<std::size_t>(q)*nC;
+    for (int f = chunkStart[q]; f < chunkStart[q+1]; ++f)
+    {
+        const int i = faces[f];
+        if (!off)
+        {
+            row[nbr[i]] += ifc[i];
+            continue;
+        }
+        for (int k = off[i]; k < off[i+1]; ++k)
+        {
+            row[nbr[k]] += ifc[i]*w[k];
+        }
+    }
+}
+// ...and a row's strips are added entry by entry in chunk order, one thread an entry of an own cell's row
+template <typename T>
+__global__
+void pairDenseMergeT(
+    int nOwn,
+    int nC,
+    const label* __restrict__ cells,
+    const label* __restrict__ cellChunk,
+    const T* __restrict__ strip,
+    T* __restrict__ dense)
+{
+    const long long t = static_cast<long long>(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (t >= static_cast<long long>(nOwn)*nC) return;
+    const int j = static_cast<int>(t/nC);
+    const int c = static_cast<int>(t%nC);
+    T acc = T(0);
+    for (int q = cellChunk[j]; q < cellChunk[j+1]; ++q)
+    {
+        acc += strip[static_cast<std::size_t>(q)*nC + c];
+    }
+    dense[static_cast<std::size_t>(cells[j])*nC + c] = acc;
+}
+// THE SAME SUM IN TWO OR THREE LAUNCHES, for a grid where a cell owns many faces (AMGPair::chunkStart has why).
+// Every face's term, in the by-own order, one thread a face...
+template <typename T>
+__global__
+void pairTermsT(
+    int n,
+    const label* __restrict__ faces,
+    const label* __restrict__ nbr,
+    const label* __restrict__ off,
+    const T* __restrict__ w,
+    const T* __restrict__ ifc,
+    const T* __restrict__ x,
+    T* __restrict__ term)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= n) return;
+    const int i = faces[f];
+    T s = T(0);
+    if (off)
+    {
+        for (int k = off[i]; k < off[i+1]; ++k)
+        {
+            s += w[k]*x[nbr[k]];
+        }
+    }
+    else
+    {
+        s = x[nbr[i]];
+    }
+    term[f] = ifc[i]*s;
+}
+// ...then a cell's run of them added to it in order, one thread a cell (a run of up to PAIR_DIRECT_MAX)...
+template <typename T>
+__global__
+void pairRunSumT(
+    int nOwn,
+    const label* __restrict__ cells,
+    const label* __restrict__ start,
+    const T* __restrict__ term,
+    T* __restrict__ y)
+{
+    const int j = blockIdx.x*blockDim.x + threadIdx.x;
+    if (j >= nOwn) return;
+    const int c = cells[j];
+    T acc = y[c];
+    for (int f = start[j]; f < start[j+1]; ++f)
+    {
+        acc += term[f];
+    }
+    y[c] = acc;
+}
+// ...or, where a cell's run is longer than that, each chunk of PAIR_CHUNK terms summed in order first
+template <typename T>
+__global__
+void pairChunkSumT(
+    int nChunks,
+    const label* __restrict__ chunkStart,
+    const T* __restrict__ term,
+    T* __restrict__ chunkSum)
+{
+    const int q = blockIdx.x*blockDim.x + threadIdx.x;
+    if (q >= nChunks) return;
+    T acc = T(0);
+    for (int f = chunkStart[q]; f < chunkStart[q+1]; ++f)
+    {
+        acc += term[f];
+    }
+    chunkSum[q] = acc;
+}
+// ...and a cell's chunks added to it in order
+template <typename T>
+__global__
+void pairCellSumT(
+    int nOwn,
+    const label* __restrict__ cells,
+    const label* __restrict__ cellChunk,
+    const T* __restrict__ chunkSum,
+    T* __restrict__ y)
+{
+    const int j = blockIdx.x*blockDim.x + threadIdx.x;
+    if (j >= nOwn) return;
+    const int c = cells[j];
+    T acc = y[c];
+    for (int q = cellChunk[j]; q < cellChunk[j+1]; ++q)
+    {
+        acc += chunkSum[q];
+    }
+    y[c] = acc;
+}
+// the terms a chunk holds, and the most faces a cell may own for one thread to walk them (pairGatherT)
+// The faces a cell may own for one thread to walk them and their neighbour slots (pairGatherT); for one thread
+// to add their ready terms (pairRunSumT); and the terms a chunk holds beyond that. MEASURED on mixerVesselAMI,
+// the p_rgh iterations, ms a step, as each form was tried: the atomic adds 255; one thread a cell walking every
+// face on every grid 580; a thread a chunk of 32 faces walking them 46 more than a thread a face making the
+// terms first; and with these three, 267 -- 12 over the atomic adds, 1.6% of the step with pcorr's 2.
+constexpr int PAIR_GATHER_MAX = 16;
+constexpr int PAIR_DIRECT_MAX = 512;
+constexpr int PAIR_CHUNK = 64;
+// BRAE_CONTROL_PAIR_SUMS_UNORDERED=1 (DeviceCyclic::ifRank has it): the atomic adds a face, as they were
+inline bool pairSumsUnordered()
+{
+    static const bool on = std::getenv("BRAE_CONTROL_PAIR_SUMS_UNORDERED") != nullptr;
+    return on;
+}
+// the control's negation (BRAE_CONTROL_AMG_PAIR_WRONG_SIGN)
+__global__
+void pairNegateK(
+    int n,
+    scalar* __restrict__ ifc)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) ifc[i] = -ifc[i];
+}
+// a grid's cell of each pair entry, from the grid above's: coarse[i] = map[fine[i]]
+__global__
+void pairMapK(
+    int n,
+    const label* __restrict__ map,
+    const label* __restrict__ fine,
+    label* __restrict__ coarse)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) coarse[i] = map[fine[i]];
+}
+// the largest grid, in cells, whose pair is held dense (AMGPair::denseF): 1,024 squared is 4 MB of floats
+constexpr int PAIR_DENSE_MAX = 1024;
+
+// y += D x for the pair held dense on a small grid (AMGPair::denseF): a row a thread
+__global__
+void pairDenseMulK(
+    int nC,
+    const float* __restrict__ dense,
+    const float* __restrict__ x,
+    float* __restrict__ y)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nC) return;
+    const float* row = dense + static_cast<std::size_t>(i)*nC;
+    float s = 0.0f;
+    for (int j = 0; j < nC; ++j)
+    {
+        s += row[j]*x[j];
+    }
+    y[i] += s;
+}
+// the pair's entries of a grid's dense matrix: dense[own][nbr] += ifc*w, into a zeroed n*n
+template <typename T>
+__global__
+void pairDenseK(
+    int n,
+    const label* __restrict__ own,
+    const label* __restrict__ nbr,
+    const label* __restrict__ off,
+    const T* __restrict__ w,
+    const T* __restrict__ ifc,
+    int nC,
+    T* __restrict__ dense)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (!off)
+    {
+        atomicAdd(&dense[own[i]*nC + nbr[i]], ifc[i]);
+        return;
+    }
+    for (int k = off[i]; k < off[i+1]; ++k)
+    {
+        atomicAdd(&dense[own[i]*nC + nbr[k]], ifc[i]*w[k]);
+    }
+}
+
 // Energy-minimising coarse-correction scale (OF GAMG): alpha = (r . c)/(c . Ac), guarded since c.Ac = ||c||_A^2 >= 0.
 __global__
 void scaleFactorK(
@@ -140,6 +480,378 @@ void scaleFactorK(
 }
 } // anon
 
+void amgCouplePair(
+    AMGData& amg,
+    const DeviceLduView& A)
+{
+    AMGPair& p = amg.pair;
+    static const bool uncoupled = std::getenv("BRAE_CONTROL_AMG_PAIR_UNCOUPLED") != nullptr;
+    const int n = A.nCyc > 0 ? A.nCyc : A.nAmi;
+    const int G = amg.nLevels();
+    // a hierarchy that holds the pair in its own coarse matrices is handed nothing more (AMGData::
+    // pairInCoarseMatrices); BRAE_CONTROL_AMG_PAIR_TWICE=1 is the gate's control and couples it all the same
+    static const bool twice = std::getenv("BRAE_CONTROL_AMG_PAIR_TWICE") != nullptr;
+    const bool heldAlready = amg.pairInCoarseMatrices && !twice;
+    if (n > 0 && amg.pairInCoarseMatrices)
+    {
+        static bool saidHeld = false;
+        if (!saidHeld)
+        {
+            saidHeld = true;
+            std::printf(twice
+                ? "  *** CONTROL MODE (BRAE_CONTROL_AMG_PAIR_TWICE): the matrix's coupled pair is carried on every "
+                  "grid of a hierarchy whose coarse matrices hold it already\n"
+                : "  AMG-PCG: the hierarchy's own coarse matrices hold the matrix's coupled pair (%d faces); it is "
+                  "not carried on the grids a second time\n", n);
+        }
+    }
+    if (n == 0 || uncoupled || amg.saSmooth || G == 0 || heldAlready)
+    {
+        if (p.n != 0)
+        {
+            p.n = 0;
+            ++p.epoch;
+        }
+        return;
+    }
+    if (A.nCyc > 0 && A.nAmi > 0)
+    {
+        throw std::runtime_error(
+            "brae AMG: the matrix view carries a one-to-one pair AND an AMI stencil. deviceLduViewPair hands "
+            "the pair in one form or the other; the hierarchy carries one.");
+    }
+    const bool stencil = A.nAmi > 0;
+    int nSlots = n;
+    if (stencil)
+    {
+        label last = 0;
+        cudaCheck(cudaMemcpy(&last, A.amiOff + n, sizeof(label), cudaMemcpyDeviceToHost), "pair slots");
+        nSlots = static_cast<int>(last);
+    }
+    static bool said = false;
+    if (!said)
+    {
+        said = true;
+        std::printf("  AMG-PCG: the matrix's coupled pair (%d faces, %d neighbour slots) is carried on every grid "
+                    "of the hierarchy; BRAE_CONTROL_AMG_PAIR_UNCOUPLED=1 leaves the hierarchy without it\n",
+                    n, nSlots);
+    }
+    // the buffers a captured cycle reads: when one moves, the cycle is captured again (AMGPair::epoch)
+    bool moved = p.n == 0 || p.stencil != stencil || static_cast<int>(p.own.size()) != G + 1;
+    p.own.resize(static_cast<std::size_t>(G) + 1);
+    p.nbr.resize(static_cast<std::size_t>(G) + 1);
+    const auto sized = [&moved](
+        auto& buffer,
+        std::size_t count)
+    {
+        if (buffer.size() == count) return;
+        buffer.resize(count);
+        moved = true;
+    };
+    for (int g = 0; g <= G; ++g)
+    {
+        sized(p.own[static_cast<std::size_t>(g)], static_cast<std::size_t>(n));
+        sized(p.nbr[static_cast<std::size_t>(g)], static_cast<std::size_t>(nSlots));
+    }
+    sized(p.ifc, static_cast<std::size_t>(n));
+    sized(p.ifcF, static_cast<std::size_t>(n));
+    sized(p.off, stencil ? static_cast<std::size_t>(n) + 1 : 0);
+    sized(p.w, stencil ? static_cast<std::size_t>(nSlots) : 0);
+    sized(p.wF, stencil ? static_cast<std::size_t>(nSlots) : 0);
+    // the fine pair, copied: the view's arrays are the caller's and may move between solves
+    const std::size_t nb = static_cast<std::size_t>(n);
+    const std::size_t ns = static_cast<std::size_t>(nSlots);
+    cudaCheck(cudaMemcpyAsync(p.own[0].data(), stencil ? A.amiOwn : A.cycOwn, nb*sizeof(label),
+                              cudaMemcpyDeviceToDevice, cudaStreamPerThread), "pair own");
+    cudaCheck(cudaMemcpyAsync(p.nbr[0].data(), stencil ? A.amiNbr : A.cycNbr, ns*sizeof(label),
+                              cudaMemcpyDeviceToDevice, cudaStreamPerThread), "pair nbr");
+    cudaCheck(cudaMemcpyAsync(p.ifc.data(), stencil ? A.amiIfc : A.cycCoeff, nb*sizeof(scalar),
+                              cudaMemcpyDeviceToDevice, cudaStreamPerThread), "pair coefficients");
+    // BRAE_CONTROL_AMG_PAIR_WRONG_SIGN=1 is a gate's CONTROL, deliberately wrong: the hierarchy's copy of the
+    // coefficients negated, so every grid's cycle couples the two sides with the opposite sign to the matrix's.
+    static const bool wrongSign = std::getenv("BRAE_CONTROL_AMG_PAIR_WRONG_SIGN") != nullptr;
+    if (wrongSign)
+    {
+        pairNegateK<<<nBlocks(n),TPB>>>(n, p.ifc.data());
+    }
+    cast_<scalar,float><<<nBlocks(n),TPB>>>(n, p.ifc.data(), p.ifcF.data());
+    if (stencil)
+    {
+        cudaCheck(cudaMemcpyAsync(p.off.data(), A.amiOff, (nb + 1)*sizeof(label), cudaMemcpyDeviceToDevice,
+                                  cudaStreamPerThread), "pair offsets");
+        cudaCheck(cudaMemcpyAsync(p.w.data(), A.amiW, ns*sizeof(scalar), cudaMemcpyDeviceToDevice,
+                                  cudaStreamPerThread), "pair weights");
+        cast_<scalar,float><<<nBlocks(nSlots),TPB>>>(nSlots, p.w.data(), p.wF.data());
+    }
+    // ...and mapped down the grids
+    for (int g = 1; g <= G; ++g)
+    {
+        const label* map = amg.level[static_cast<std::size_t>(g) - 1].map.data();
+        pairMapK<<<nBlocks(n),TPB>>>(n, map, p.own[static_cast<std::size_t>(g) - 1].data(),
+                                     p.own[static_cast<std::size_t>(g)].data());
+        pairMapK<<<nBlocks(nSlots),TPB>>>(nSlots, map, p.nbr[static_cast<std::size_t>(g) - 1].data(),
+                                          p.nbr[static_cast<std::size_t>(g)].data());
+    }
+    cudaCheck(cudaGetLastError(), "pair mapped down the grids");
+    // ...and listed by own cell on every grid (AMGPair::ownCells), once: a counting sort of each grid's list
+    // on the host, the faces of a cell left in face order
+    if (p.byOwnFaces != n || p.byOwnAddressing != A.addressingId
+     || p.ownCells.size() != static_cast<std::size_t>(G) + 1)
+    {
+        p.ownCells.clear();
+        p.ownStart.clear();
+        p.ownFaces.clear();
+        p.ownCells.resize(static_cast<std::size_t>(G) + 1);
+        p.ownStart.resize(static_cast<std::size_t>(G) + 1);
+        p.ownFaces.resize(static_cast<std::size_t>(G) + 1);
+        p.chunkStart.clear();
+        p.cellChunk.clear();
+        p.chunkStart.resize(static_cast<std::size_t>(G) + 1);
+        p.cellChunk.resize(static_cast<std::size_t>(G) + 1);
+        p.mostFaces.assign(static_cast<std::size_t>(G) + 1, 0);
+        std::size_t mostChunks = 0;
+        for (int g = 0; g <= G; ++g)
+        {
+            const std::size_t gg = static_cast<std::size_t>(g);
+            const std::vector<label> own = p.own[gg].host();
+            const int ng = g == 0 ? A.nCells : amg.level[gg - 1].nCoarse;
+            std::vector<label> count(static_cast<std::size_t>(ng) + 1, 0);
+            for (const label c : own)
+            {
+                ++count[static_cast<std::size_t>(c) + 1];
+            }
+            std::vector<label> cells;
+            std::vector<label> start;
+            std::vector<label> slot(static_cast<std::size_t>(ng), 0);
+            label at = 0;
+            for (int c = 0; c < ng; ++c)
+            {
+                const label k = count[static_cast<std::size_t>(c) + 1];
+                if (k == 0) continue;
+                cells.push_back(c);
+                start.push_back(at);
+                slot[static_cast<std::size_t>(c)] = at;
+                at += k;
+            }
+            start.push_back(at);
+            std::vector<label> faces(own.size(), 0);
+            for (std::size_t i = 0; i < own.size(); ++i)
+            {
+                faces[static_cast<std::size_t>(slot[static_cast<std::size_t>(own[i])]++)] = static_cast<label>(i);
+            }
+            p.ownCells[gg].copyFrom(cells);
+            p.ownStart[gg].copyFrom(start);
+            p.ownFaces[gg].copyFrom(faces);
+            // a cell's run of faces cut into chunks of PAIR_CHUNK
+            std::vector<label> chunkStart;
+            std::vector<label> cellChunk;
+            label most = 0;
+            for (std::size_t j = 0; j + 1 < start.size(); ++j)
+            {
+                cellChunk.push_back(static_cast<label>(chunkStart.size()));
+                most = std::max(most, start[j + 1] - start[j]);
+                for (label f = start[j]; f < start[j + 1]; f += PAIR_CHUNK)
+                {
+                    chunkStart.push_back(f);
+                }
+            }
+            cellChunk.push_back(static_cast<label>(chunkStart.size()));
+            chunkStart.push_back(at);
+            mostChunks = std::max(mostChunks, chunkStart.size());
+            p.mostFaces[gg] = static_cast<int>(most);
+            p.chunkStart[gg].copyFrom(chunkStart);
+            p.cellChunk[gg].copyFrom(cellChunk);
+        }
+        p.term.resize(static_cast<std::size_t>(n));
+        p.termF.resize(static_cast<std::size_t>(n));
+        p.chunkSum.resize(mostChunks);
+        p.chunkSumF.resize(mostChunks);
+        p.byOwnFaces = n;
+        p.byOwnAddressing = A.addressingId;
+        moved = true;
+    }
+    // ...and summed into a dense matrix on each small grid below the finest and above the coarsest (the coarsest
+    // is solved by its LU). BRAE_CONTROL_AMG_PAIR_SPARSE=1 keeps every grid's entries face by face, as before.
+    static const bool sparseOnly = std::getenv("BRAE_CONTROL_AMG_PAIR_SPARSE") != nullptr;
+    if (p.denseF.size() != static_cast<std::size_t>(G) + 1)
+    {
+        p.denseF.clear();
+        p.denseF.resize(static_cast<std::size_t>(G) + 1);
+        moved = true;
+    }
+    for (int g = 1; g < G; ++g)
+    {
+        const int ng = amg.level[static_cast<std::size_t>(g) - 1].nCoarse;
+        const bool dense = !sparseOnly && ng <= PAIR_DENSE_MAX;
+        const std::size_t nn = dense ? static_cast<std::size_t>(ng)*static_cast<std::size_t>(ng) : 0;
+        DeviceBuffer<float>& d = p.denseF[static_cast<std::size_t>(g)];
+        sized(d, nn);
+        if (!dense) continue;
+        zeroT<float><<<nBlocks(static_cast<int>(nn)),TPB>>>(static_cast<int>(nn), d.data());
+        if (pairSumsUnordered())
+        {
+            pairDenseK<float><<<nBlocks(n),TPB>>>(n, p.own[static_cast<std::size_t>(g)].data(),
+                                                  p.nbr[static_cast<std::size_t>(g)].data(),
+                                                  stencil ? p.off.data() : nullptr, p.wF.data(), p.ifcF.data(),
+                                                  ng, d.data());
+            continue;
+        }
+        const std::size_t gg = static_cast<std::size_t>(g);
+        const int nOwn = static_cast<int>(p.ownCells[gg].size());
+        const int nChunks = static_cast<int>(p.chunkStart[gg].size()) - 1;
+        const std::size_t nStrip = static_cast<std::size_t>(nChunks)*static_cast<std::size_t>(ng);
+        if (p.stripF.size() < nStrip)
+        {
+            p.stripF.resize(nStrip);
+        }
+        zeroT<float><<<nBlocks(static_cast<int>(nStrip)),TPB>>>(static_cast<int>(nStrip), p.stripF.data());
+        pairDenseChunkT<float><<<nBlocks(nChunks),TPB>>>(
+            nChunks, p.chunkStart[gg].data(), p.ownFaces[gg].data(), p.nbr[gg].data(),
+            stencil ? p.off.data() : nullptr, p.wF.data(), p.ifcF.data(), ng, p.stripF.data());
+        pairDenseMergeT<float><<<nBlocks(nOwn*ng),TPB>>>(
+            nOwn, ng, p.ownCells[gg].data(), p.cellChunk[gg].data(), p.stripF.data(), d.data());
+    }
+    cudaCheck(cudaGetLastError(), "pair dense on the small grids");
+    // the coarsest grid's direct solve: the factorisation amgGalerkin made is of the LDU matrix alone
+    const int nc = amg.level.back().nCoarse;
+    if (amg.coarseLUn == nc && nc > 0)
+    {
+        const std::size_t nn = static_cast<std::size_t>(nc)*static_cast<std::size_t>(nc);
+        p.dense.resize(nn);
+        zeroT<scalar><<<nBlocks(static_cast<int>(nn)),TPB>>>(static_cast<int>(nn), p.dense.data());
+        const std::size_t gc = static_cast<std::size_t>(G);
+        if (pairSumsUnordered())
+        {
+            pairDenseK<scalar><<<nBlocks(n),TPB>>>(n, p.own[gc].data(), p.nbr[gc].data(),
+                                                   stencil ? p.off.data() : nullptr, p.w.data(), p.ifc.data(),
+                                                   nc, p.dense.data());
+        }
+        else
+        {
+            const int nOwn = static_cast<int>(p.ownCells[gc].size());
+            const int nChunks = static_cast<int>(p.chunkStart[gc].size()) - 1;
+            const std::size_t nStrip = static_cast<std::size_t>(nChunks)*static_cast<std::size_t>(nc);
+            if (p.strip.size() < nStrip)
+            {
+                p.strip.resize(nStrip);
+            }
+            zeroT<scalar><<<nBlocks(static_cast<int>(nStrip)),TPB>>>(static_cast<int>(nStrip), p.strip.data());
+            pairDenseChunkT<scalar><<<nBlocks(nChunks),TPB>>>(
+                nChunks, p.chunkStart[gc].data(), p.ownFaces[gc].data(), p.nbr[gc].data(),
+                stencil ? p.off.data() : nullptr, p.w.data(), p.ifc.data(), nc, p.strip.data());
+            pairDenseMergeT<scalar><<<nBlocks(nOwn*nc),TPB>>>(
+                nOwn, nc, p.ownCells[gc].data(), p.cellChunk[gc].data(), p.strip.data(), p.dense.data());
+        }
+        cudaCheck(cudaGetLastError(), "pair on the coarsest grid");
+        deviceCoarseLUFactor(amg.level.back().coarseView(), amg.coarseLU, amg.coarsePiv, p.dense.data());
+    }
+    p.n = n;
+    p.nSlots = nSlots;
+    p.stencil = stencil;
+    if (moved) ++p.epoch;
+}
+
+namespace {
+
+// the pair's term added to a product on grid g, in the cycle's precision; nothing where there is no pair
+inline void pairAdd(
+    const AMGData& amg,
+    int g,
+    const scalar* x,
+    scalar* y)
+{
+    const AMGPair& p = amg.pair;
+    if (p.n == 0) return;
+    const std::size_t gg = static_cast<std::size_t>(g);
+    if (pairSumsUnordered())
+    {
+        pairAddT<scalar><<<nBlocks(p.n),TPB>>>(p.n, p.own[gg].data(), p.nbr[gg].data(),
+                                               p.stencil ? p.off.data() : nullptr, p.w.data(), p.ifc.data(), x, y);
+        return;
+    }
+    const int nOwn = static_cast<int>(p.ownCells[gg].size());
+    if (p.mostFaces[gg] <= PAIR_GATHER_MAX)
+    {
+        pairGatherT<scalar><<<nBlocks(nOwn),TPB>>>(
+            nOwn, p.ownCells[gg].data(), p.ownStart[gg].data(), p.ownFaces[gg].data(), p.nbr[gg].data(),
+            p.stencil ? p.off.data() : nullptr, p.w.data(), p.ifc.data(), x, y);
+        return;
+    }
+    const int nChunks = static_cast<int>(p.chunkStart[gg].size()) - 1;
+    pairTermsT<scalar><<<nBlocks(p.n),TPB>>>(
+        p.n, p.ownFaces[gg].data(), p.nbr[gg].data(), p.stencil ? p.off.data() : nullptr, p.w.data(),
+        p.ifc.data(), x, p.term.data());
+    if (p.mostFaces[gg] <= PAIR_DIRECT_MAX)
+    {
+        pairRunSumT<scalar><<<nBlocks(nOwn),TPB>>>(
+            nOwn, p.ownCells[gg].data(), p.ownStart[gg].data(), p.term.data(), y);
+        return;
+    }
+    pairChunkSumT<scalar><<<nBlocks(nChunks),TPB>>>(
+        nChunks, p.chunkStart[gg].data(), p.term.data(), p.chunkSum.data());
+    pairCellSumT<scalar><<<nBlocks(nOwn),TPB>>>(
+        nOwn, p.ownCells[gg].data(), p.cellChunk[gg].data(), p.chunkSum.data(), y);
+}
+inline void pairAdd(
+    const AMGData& amg,
+    int g,
+    const float* x,
+    float* y)
+{
+    const AMGPair& p = amg.pair;
+    if (p.n == 0) return;
+    const std::size_t gg = static_cast<std::size_t>(g);
+    if (gg < p.denseF.size() && p.denseF[gg].size() > 0)
+    {
+        const int ng = amg.level[gg - 1].nCoarse;
+        pairDenseMulK<<<nBlocks(ng),TPB>>>(ng, p.denseF[gg].data(), x, y);
+        return;
+    }
+    if (pairSumsUnordered())
+    {
+        pairAddT<float><<<nBlocks(p.n),TPB>>>(p.n, p.own[gg].data(), p.nbr[gg].data(),
+                                              p.stencil ? p.off.data() : nullptr, p.wF.data(), p.ifcF.data(), x, y);
+        return;
+    }
+    const int nOwn = static_cast<int>(p.ownCells[gg].size());
+    if (p.mostFaces[gg] <= PAIR_GATHER_MAX)
+    {
+        pairGatherT<float><<<nBlocks(nOwn),TPB>>>(
+            nOwn, p.ownCells[gg].data(), p.ownStart[gg].data(), p.ownFaces[gg].data(), p.nbr[gg].data(),
+            p.stencil ? p.off.data() : nullptr, p.wF.data(), p.ifcF.data(), x, y);
+        return;
+    }
+    const int nChunks = static_cast<int>(p.chunkStart[gg].size()) - 1;
+    pairTermsT<float><<<nBlocks(p.n),TPB>>>(
+        p.n, p.ownFaces[gg].data(), p.nbr[gg].data(), p.stencil ? p.off.data() : nullptr, p.wF.data(),
+        p.ifcF.data(), x, p.termF.data());
+    if (p.mostFaces[gg] <= PAIR_DIRECT_MAX)
+    {
+        pairRunSumT<float><<<nBlocks(nOwn),TPB>>>(
+            nOwn, p.ownCells[gg].data(), p.ownStart[gg].data(), p.termF.data(), y);
+        return;
+    }
+    pairChunkSumT<float><<<nBlocks(nChunks),TPB>>>(
+        nChunks, p.chunkStart[gg].data(), p.termF.data(), p.chunkSumF.data());
+    pairCellSumT<float><<<nBlocks(nOwn),TPB>>>(
+        nOwn, p.ownCells[gg].data(), p.cellChunk[gg].data(), p.chunkSumF.data(), y);
+}
+
+}   // namespace
+
+bool amgSinglePrecisionCycle(const AMGData& amg)
+{
+    // BRAE_CONTROL_AMG_SA_DOUBLE=1: a smoothed-aggregation hierarchy keeps the double-precision cycle, as it
+    // did before the single-precision one had the sparse prolongator's transfers.
+    static const bool saDouble = std::getenv("BRAE_CONTROL_AMG_SA_DOUBLE") != nullptr;
+    if (amg.saSmooth && saDouble) return false;
+    // A two-stage Gauss-Seidel asked for (BRAE_AMG_TSGS) is run where it exists, in the double-precision cycle.
+    // It was SILENTLY IGNORED: the single-precision cycle was chosen all the same and has weighted Jacobi only,
+    // so an arm with the switch measured Jacobi under another name -- on RAS/DTCHull, 1,072 iterations with it
+    // and 1,072 without (853 once the cycle was forced to double precision beside it).
+    return useFP32() && !amg.gsSmooth && !useChebyshev() && !useTSGS();
+}
+
 // Recursive V-cycle at grid g: x_g <- M^-1 b_g (x_g overwritten). g==nLevels is the coarsest grid (an approximate
 // solve; single-block or fused-cluster when small); above it: pre-smooth, restrict the residual to g+1, recurse,
 // prolong the correction, post-smooth.
@@ -153,7 +865,24 @@ void vcycleAt(
 {
     const int n = Ag.nCells;
     if (asymmetric) amgRefuseAsymmetric(useChebyshev(), amg.corrScaling, amg.saSmooth);
-    zeroT<scalar><<<nBlocks(n),TPB>>>(n, xg.data());
+    // A COUPLED PAIR (AMGPair): on the finest grid deviceAmul applies it from the caller's view; on every coarser
+    // grid the view is the hierarchy's own and holds internal faces only, so each product there is followed by
+    // pairAdd. The weighted-Jacobi sweeps and the residual carry it; the Gauss-Seidel and Chebyshev smoothers'
+    // own products, and a coarsest grid solved without its dense LU, do not.
+    // x starts at zero. A grid whose pre-smooth is weighted Jacobi writes its first sweep straight from b
+    // (smoothFromZeroT: the sweep's own expression with the two zeros written in, so its result to the bit) and
+    // needs neither the zeroing nor the product of a zero vector -- what vcycleAtF has done since the pressure
+    // work. This cycle zeroed x and formed A*0 at every grid of every iteration: MEASURED 2026-10-04 with
+    // BRAE_AMG_PCG_SPLIT on pcorr's smoothed hierarchy, waveMakerPiston at 896,000 cells, the pre-smooth of the
+    // finest grid 454 us an iteration where its post-smooth, the same sweep, is 403.
+    // BRAE_CONTROL_AMG_ZERO_PRODUCT=1 forms both, as before. BRAE_CONTROL_AMG_FROM_ZERO_STALE=1 is a gate's
+    // CONTROL, deliberately wrong: neither the zeroing nor the from-zero sweep, so the first sweep starts from
+    // whatever the last cycle left in x.
+    static const bool zeroProduct = std::getenv("BRAE_CONTROL_AMG_ZERO_PRODUCT") != nullptr;
+    static const bool staleStart = std::getenv("BRAE_CONTROL_AMG_FROM_ZERO_STALE") != nullptr;
+    const bool jacobiPre = !useChebyshev() && !(asymmetric ? useTSGSAsym() : useTSGS()) && !amg.gsSmooth;
+    const bool fromZero = !zeroProduct && g != amg.nLevels() && jacobiPre && nPreSweeps() > 0;
+    if (!fromZero) zeroT<scalar><<<nBlocks(n),TPB>>>(n, xg.data());
     if (g == amg.nLevels())                                    // coarsest: approximate solve
     {
         // BRAE_NCOARSE_CG overrides the coarsest PCG iteration CAP (item 80: it converges, it does not count).
@@ -177,8 +906,10 @@ void vcycleAt(
         else for (int s = 0; s < NCOARSE; ++s)
         {
             deviceAmul(Ag, xg, amg.vAx[g]);
+            if (g > 0) pairAdd(amg, g, xg.data(), amg.vAx[g].data());
             smoothT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
         }
+        amgSplit::lap(g, amgSplit::coarsest);
         return;
     }
     if (useChebyshev()) chebyshevSmooth(Ag, bg, xg, amg.vD[g], amg.vAx[g], amg.lambdaMax[g], chebDeg());  // pre-smooth (x=0)
@@ -186,22 +917,45 @@ void vcycleAt(
     else if (amg.gsSmooth) for (int s = 0; s < nPreSweeps(); ++s) gsSweep(Ag, bg, xg, amg.coloring[g], true);    // forward GS
     else for (int s = 0; s < nPreSweeps(); ++s)
     {
+        if (s == 0 && fromZero && !staleStart)
+        {
+            smoothFromZeroT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), Ag.diag, xg.data());
+            continue;
+        }
         deviceAmul(Ag, xg, amg.vAx[g]);
+        if (g > 0) pairAdd(amg, g, xg.data(), amg.vAx[g].data());
         smoothT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
     }
+    amgSplit::lap(g, amgSplit::smoothPre);
     deviceAmul(Ag, xg, amg.vAx[g]);
+    if (g > 0) pairAdd(amg, g, xg.data(), amg.vAx[g].data());
     residualT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), amg.vR[g].data());
+    amgSplit::lap(g, amgSplit::residual);
     const int nc = amg.level[g].nCoarse;
     const AMGLevel& Lg = amg.level[g];
     if (amg.saSmooth)                                            // restrict rc = P^T r (sparse smoothed prolongator)
     {
-        // Sparse-prolongator restriction still scatters; the SA path is opt-in and remains nondeterministic.
-        zeroT<scalar><<<nBlocks(nc),TPB>>>(nc, amg.vB[g+1].data());
-        restrictSparseK<<<nBlocks(n),TPB>>>(n, Lg.Prow.data(), Lg.Pcol.data(), Lg.Pval.data(), amg.vR[g].data(), amg.vB[g+1].data());
+        // gathered by coarse row in a fixed order (AMGLevel::Rrow); BRAE_CONTROL_AMG_SA_SCATTER=1 scatters
+        if (amgSaScatter())
+        {
+            zeroT<scalar><<<nBlocks(nc),TPB>>>(nc, amg.vB[g+1].data());
+            restrictSparseT<scalar><<<nBlocks(n),TPB>>>(
+                n, Lg.Prow.data(), Lg.Pcol.data(), Lg.Pval.data(), amg.vR[g].data(), amg.vB[g+1].data());
+        }
+        else
+        {
+            const int nnz = static_cast<int>(Lg.Rval.size());
+            scalar* term = amg.level[g].Rterm.data();
+            restrictTermsT<scalar><<<nBlocks(nnz),TPB>>>(
+                nnz, Lg.Rfine.data(), Lg.Rval.data(), amg.vR[g].data(), term);
+            restrictSumT<scalar><<<nBlocks(nc),TPB>>>(
+                nc, amgSaGatherReversed() ? 1 : 0, Lg.Rrow.data(), term, amg.vB[g+1].data());
+        }
     }
     else                                          // fixed-order gather; writes rc, so no pre-zero needed
         restrictGatherT<scalar><<<nBlocks(nc),TPB>>>(
             nc, Lg.galCellStart.data(), Lg.galCellList.data(), amg.vR[g].data(), amg.vB[g+1].data());
+    amgSplit::lap(g, amgSplit::restriction);
     vcycleAt(g+1, amg, amg.level[g].coarseView(), amg.vB[g+1], amg.vX[g+1], asymmetric);   // recurse to the next coarser grid
     if (amg.corrScaling)
     {
@@ -211,23 +965,28 @@ void vcycleAt(
         if (amg.saSmooth) prolongToSparseK<<<nBlocks(n),TPB>>>(n, Lg.Prow.data(), Lg.Pcol.data(), Lg.Pval.data(), amg.vX[g+1].data(), amg.vPc[g].data());
         else              prolongToK<<<nBlocks(n),TPB>>>(n, Lg.map.data(), amg.vX[g+1].data(), amg.vPc[g].data());  // c = P*corr
         deviceAmul(Ag, amg.vPc[g], amg.vAx[g]);                                       // Ac
+        if (g > 0) pairAdd(amg, g, amg.vPc[g].data(), amg.vAx[g].data());
         deviceDotInto(amg.vR[g], amg.vPc[g], amg.sScNum.data());                      // r . c   (energy-min, OF GAMG)
         deviceDotInto(amg.vPc[g], amg.vAx[g], amg.sScDen.data());                     // c . Ac  (= ||c||_A^2 > 0)
         scaleFactorK<<<1,1>>>(amg.sScNum.data(), amg.sScDen.data(), amg.sScAlpha.data());
         deviceAxpyDev(amg.sScAlpha.data(), amg.vPc[g], xg);                           // xg += alpha * c
     }
     else if (amg.saSmooth)
-        prolongSparseK<<<nBlocks(n),TPB>>>(n, Lg.Prow.data(), Lg.Pcol.data(), Lg.Pval.data(), amg.vX[g+1].data(), xg.data());
+        prolongSparseT<scalar><<<nBlocks(n),TPB>>>(
+            n, Lg.Prow.data(), Lg.Pcol.data(), Lg.Pval.data(), amg.vX[g+1].data(), xg.data());
     else
         prolongT<scalar><<<nBlocks(n),TPB>>>(n, Lg.map.data(), amg.vX[g+1].data(), xg.data());
+    amgSplit::lap(g, amgSplit::prolongation);
     if (useChebyshev()) chebyshevSmooth(Ag, bg, xg, amg.vD[g], amg.vAx[g], amg.lambdaMax[g], chebDeg());  // post-smooth
     else if (asymmetric ? useTSGSAsym() : useTSGS()) twoStageGSSmooth(Ag, bg, xg, amg.vD[g], amg.vAx[g], nPostSweeps(), tsgsOrder(), false);  // twoStageGaussSeidel (bwd -> symmetric)
     else if (amg.gsSmooth) for (int s = 0; s < nPostSweeps(); ++s) gsSweep(Ag, bg, xg, amg.coloring[g], false);  // backward GS (symmetric V-cycle)
     else for (int s = 0; s < nPostSweeps(); ++s)
     {
         deviceAmul(Ag, xg, amg.vAx[g]);
+        if (g > 0) pairAdd(amg, g, xg.data(), amg.vAx[g].data());
         smoothT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
     }
+    amgSplit::lap(g, amgSplit::smoothPost);
 }
 
 // The SYMMETRIC entry point, unchanged for every existing caller (device_amg.cu and device_amg_pcg.cu
@@ -246,9 +1005,14 @@ void vcycleAt(
 // Mixed-precision (FP32) V-cycle: a mirror of the default V-cycle (weighted-Jacobi + map restrict/prolong) with the
 // matrix values and work vectors in FP32 (half the bytes on the BW-bound SpMV+smooth); the topology (labels) is
 // shared with the FP64 path. The coarsest level casts back to FP64 and reuses the exact FP64 coarse solve. Only the
-// default smoother/aggregation is supported here (SA/GS/Chebyshev/corrScaling stay FP64; the caller gates on those).
+// default smoother is supported here (GS/Chebyshev/corrScaling stay FP64: amgSinglePrecisionCycle and its callers).
 // It reuses the templated zeroT/smoothT/residualT/restrictT/prolongT<float>; only the casts and the FP32 SpMV (amulF)
 // are FP32-specific.
+// A SMOOTHED-AGGREGATION hierarchy runs here too (2026-10-04): its coarse matrices are LDU views like any other
+// level's and are cast with them; its transfers are restrictSparseT/prolongSparseT<float> over PvalF. It ran the
+// double-precision cycle until then: MEASURED with BRAE_AMG_PCG_SPLIT on pcorr, waveMakerPiston at 896,000
+// cells, us an iteration on the finest grid, double against this cycle's on the same mesh: post-smooth 405 / 222,
+// residual 359 / 215.
 // (amulFK/amulF -- the FP32 SpMV -- now live in device_amg_internal.cuh, shared with the FP32 GS solver.)
 // ---- FP-12: the coarse operator as contiguous rows -------------------------------------------
 //
@@ -390,9 +1154,46 @@ void amgCastFP32(
             amg.vXF[g].resize(v.nCells);
             amg.vBF[g].resize(v.nCells);
         }
+        if (amg.saSmooth)
+        {
+            // the sparse prolongator's values, once: they are fixed for the life of the hierarchy.
+            // BRAE_CONTROL_AMG_SA_P_NOT_CAST=1 is a gate's CONTROL, deliberately wrong: the single-precision
+            // values are left zero, so the cycle transfers nothing and has no coarse correction.
+            static const bool notCast = std::getenv("BRAE_CONTROL_AMG_SA_P_NOT_CAST") != nullptr;
+            for (int g = 0; g < G; ++g)
+            {
+                AMGLevel& L = amg.level[g];
+                const int nnz = static_cast<int>(L.Pval.size());
+                L.PvalF.resize(L.Pval.size());
+                if (nnz == 0) continue;
+                // ...and P^T's, the same values by coarse row (amgSaFixedOrder)
+                if (L.Rval.size() != L.Pval.size())
+                {
+                    throw std::runtime_error(
+                        "brae AMG: a smoothed-aggregation level has no fixed-order list of its restriction "
+                        "(amgSaFixedOrder was not run where the level's prolongator was set)");
+                }
+                L.RvalF.resize(L.Rval.size());
+                if (notCast)
+                {
+                    zeroT<float><<<nBlocks(nnz),TPB>>>(nnz, L.PvalF.data());
+                    zeroT<float><<<nBlocks(nnz),TPB>>>(nnz, L.RvalF.data());
+                    continue;
+                }
+                cast_<scalar,float><<<nBlocks(nnz),TPB>>>(nnz, L.Pval.data(), L.PvalF.data());
+                cast_<scalar,float><<<nBlocks(nnz),TPB>>>(nnz, L.Rval.data(), L.RvalF.data());
+            }
+        }
         amg.fp32Alloc = true;
     }
     if (amgCsrOn() && !amg.csrBuilt) amgBuildCsrFP32(amg, A);       // FP-12, once per hierarchy
+    // THE SAME MATRIX AGAIN (amgGalerkinStands): the copies of the last cast are this matrix's, grid for grid
+    if (amg.fp32Stands)
+    {
+        amg.fp32Stands = false;
+        return;
+    }
+    amg.fp32Current = true;
     for (int g=0; g<=G; ++g)
     {
         const DeviceLduView v = (g==0) ? A : amg.level[g-1].coarseView();
@@ -459,7 +1260,15 @@ void vcycleAtF(
 {
     const int n = Ag.nCells;
     if (asymmetric) amgRefuseAsymmetric(useChebyshev(), amg.corrScaling, amg.saSmooth);
-    zeroT<float><<<nBlocks(n),TPB>>>(n, xg);
+    // A COUPLED PAIR (AMGPair): this cycle's matrices are the internal faces' on EVERY grid, the finest included,
+    // so every product is followed by pairAdd.
+    // x starts at zero. A level that pre-smooths writes its first sweep straight from b (smoothFromZeroT) and
+    // needs neither this nor the product of a zero vector; BRAE_CONTROL_AMG_ZERO_PRODUCT=1 forms both, as before.
+    // BRAE_CONTROL_AMG_FROM_ZERO_STALE=1: the deliberately wrong control vcycleAt describes.
+    static const bool zeroProduct = std::getenv("BRAE_CONTROL_AMG_ZERO_PRODUCT") != nullptr;
+    static const bool staleStart = std::getenv("BRAE_CONTROL_AMG_FROM_ZERO_STALE") != nullptr;
+    const bool fromZero = !zeroProduct && g != amg.nLevels() && nPreSweeps() > 0;
+    if (!fromZero) zeroT<float><<<nBlocks(n),TPB>>>(n, xg);
     if (g == amg.nLevels())                                    // coarsest: cast to FP64, exact FP64 solve, cast back
     {
         cast_<float,scalar><<<nBlocks(n),TPB>>>(n, bg, amg.vB[g].data());
@@ -476,32 +1285,76 @@ void vcycleAtF(
             for (int s=0;s<NCOARSE;++s)
             {
                 deviceAmul(topoG, amg.vX[g], amg.vAx[g]);
+                pairAdd(amg, g, amg.vX[g].data(), amg.vAx[g].data());
                 smoothT<scalar><<<nBlocks(n),TPB>>>(n, amg.vB[g].data(), amg.vAx[g].data(), topoG.diag, amg.vX[g].data());
             }
         }
         cast_<scalar,float><<<nBlocks(n),TPB>>>(n, amg.vX[g].data(), xg);
+        amgSplit::lap(g, amgSplit::coarsest);
         return;
     }
-    for (int s=0; s<NPRE; ++s)
+    for (int s=0; s<nPreSweeps(); ++s)     // BRAE_NPRE, as the FP64 cycle reads it; NPRE by default
     {
+        if (s == 0 && fromZero && !staleStart)
+        {
+            smoothFromZeroT<float><<<nBlocks(n),TPB>>>(n, bg, Ag.diag, xg);
+            continue;
+        }
         amgSpmvF(amg, g, Ag, xg, amg.vAxF[g].data());
+        pairAdd(amg, g, xg, amg.vAxF[g].data());
         smoothT<float><<<nBlocks(n),TPB>>>(n, bg, amg.vAxF[g].data(), Ag.diag, xg);
     }
+    amgSplit::lap(g, amgSplit::smoothPre);
     amgSpmvF(amg, g, Ag, xg, amg.vAxF[g].data());
+    pairAdd(amg, g, xg, amg.vAxF[g].data());
     residualT<float><<<nBlocks(n),TPB>>>(n, bg, amg.vAxF[g].data(), amg.vRF[g].data());
+    amgSplit::lap(g, amgSplit::residual);
     const AMGLevel& Lg = amg.level[g];
     const int nc = Lg.nCoarse;
-    restrictGatherT<float><<<nBlocks(nc),TPB>>>(
-        nc, Lg.galCellStart.data(), Lg.galCellList.data(), amg.vRF[g].data(), amg.vBF[g+1].data());
+    if (amg.saSmooth)                                            // rc = P^T r, the sparse smoothed prolongator
+    {
+        if (amgSaScatter())
+        {
+            zeroT<float><<<nBlocks(nc),TPB>>>(nc, amg.vBF[g+1].data());
+            restrictSparseT<float><<<nBlocks(n),TPB>>>(
+                n, Lg.Prow.data(), Lg.Pcol.data(), Lg.PvalF.data(), amg.vRF[g].data(), amg.vBF[g+1].data());
+        }
+        else
+        {
+            const int nnz = static_cast<int>(Lg.Rval.size());
+            float* term = amg.level[g].RtermF.data();
+            restrictTermsT<float><<<nBlocks(nnz),TPB>>>(
+                nnz, Lg.Rfine.data(), Lg.RvalF.data(), amg.vRF[g].data(), term);
+            restrictSumT<float><<<nBlocks(nc),TPB>>>(
+                nc, amgSaGatherReversed() ? 1 : 0, Lg.Rrow.data(), term, amg.vBF[g+1].data());
+        }
+    }
+    else
+    {
+        restrictGatherT<float><<<nBlocks(nc),TPB>>>(
+            nc, Lg.galCellStart.data(), Lg.galCellList.data(), amg.vRF[g].data(), amg.vBF[g+1].data());
+    }
+    amgSplit::lap(g, amgSplit::restriction);
     const DeviceLduView topoC = Lg.coarseView();
     const LduF Ac = lduF(topoC, amg.fDiag[g+1], amg.fUpper[g+1], amg.fLower[g+1]);
     vcycleAtF(g+1, amg, topoC, Ac, amg.vBF[g+1].data(), amg.vXF[g+1].data(), asymmetric);
-    prolongT<float><<<nBlocks(n),TPB>>>(n, Lg.map.data(), amg.vXF[g+1].data(), xg);
-    for (int s=0; s<NPOST; ++s)
+    if (amg.saSmooth)
+    {
+        prolongSparseT<float><<<nBlocks(n),TPB>>>(
+            n, Lg.Prow.data(), Lg.Pcol.data(), Lg.PvalF.data(), amg.vXF[g+1].data(), xg);
+    }
+    else
+    {
+        prolongT<float><<<nBlocks(n),TPB>>>(n, Lg.map.data(), amg.vXF[g+1].data(), xg);
+    }
+    amgSplit::lap(g, amgSplit::prolongation);
+    for (int s=0; s<nPostSweeps(); ++s)    // BRAE_NPOST; NPOST by default
     {
         amgSpmvF(amg, g, Ag, xg, amg.vAxF[g].data());
+        pairAdd(amg, g, xg, amg.vAxF[g].data());
         smoothT<float><<<nBlocks(n),TPB>>>(n, bg, amg.vAxF[g].data(), Ag.diag, xg);
     }
+    amgSplit::lap(g, amgSplit::smoothPost);
 }
 
 // The SYMMETRIC FP32 entry point, unchanged for its existing callers (same overload-not-default reason
@@ -522,8 +1375,7 @@ void vcycleAtF(
 // FP32 halves their bytes ~= 2x, while the r->FP32/FP32->z casts and the FP64 coarsest solve keep it accurate).
 void amgPrepareFP32(AMGData& amg, const DeviceLduView& A)
 {
-    if (useFP32() && !amg.saSmooth && !amg.gsSmooth && !useChebyshev())
-        amgCastFP32(amg, A);
+    if (amgSinglePrecisionCycle(amg)) amgCastFP32(amg, A);
 }
 
 // z = M^-1 r : ONE symmetric AMG V-cycle applied as a PRECONDITIONER, factored out of deviceAMGPCG so the
@@ -536,7 +1388,7 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
                     const DeviceBuffer<scalar>& r, DeviceBuffer<scalar>& z, bool captureVcycle)
 {
     ensureSpectrum(amg, A);                // one-time Chebyshev spectrum estimate (no-op unless the Chebyshev smoother is on)
-    const bool fp32 = amg.fp32Alloc && useFP32() && !amg.saSmooth && !amg.gsSmooth && !useChebyshev();
+    const bool fp32 = amg.fp32Alloc && amgSinglePrecisionCycle(amg);
     const int nC = A.nCells;
 
     if (!captureVcycle)
@@ -563,7 +1415,9 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
     {
         const LduF A0 = lduF(A, amg.fDiag[0], amg.fUpper[0], amg.fLower[0]);
         AMGGraphCache& gcf = *amg.gcacheF;
-        if (!gcf.exec || gcf.key != A.diag)
+        if (!gcf.exec || gcf.key != A.diag || gcf.keyEpoch != deviceReductionScratchEpoch()
+            || gcf.keyAddressingId != A.addressingId || gcf.keyPairEpoch != amg.pair.epoch
+            || amgGraphViewMoved(gcf, A))
         {
             if (gcf.exec)  { cudaGraphExecDestroy(gcf.exec);  gcf.exec  = nullptr; }
             if (gcf.graph) { cudaGraphDestroy(gcf.graph);     gcf.graph = nullptr; }
@@ -574,13 +1428,19 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
             cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &gcf.graph), "amgF capture end");
             cudaCheck(cudaGraphInstantiate(&gcf.exec, gcf.graph, 0), "amgF graph instantiate");
             gcf.key = A.diag;
+            gcf.keyEpoch = deviceReductionScratchEpoch();
+            gcf.keyAddressingId = A.addressingId;
+            gcf.keyPairEpoch = amg.pair.epoch;
+            amgGraphViewStamp(gcf, A);
         }
         cudaCheck(cudaGraphLaunch(gcf.exec, cudaStreamPerThread), "amgF graph launch");
     }
     else
     {
         AMGGraphCache& gc = *amg.gcache;
-        if (!gc.exec || gc.key != A.diag)
+        if (!gc.exec || gc.key != A.diag || gc.keyEpoch != deviceReductionScratchEpoch()
+            || gc.keyAddressingId != A.addressingId || gc.keyPairEpoch != amg.pair.epoch
+            || amgGraphViewMoved(gc, A))
         {
             if (gc.exec)  { cudaGraphExecDestroy(gc.exec);  gc.exec  = nullptr; }
             if (gc.graph) { cudaGraphDestroy(gc.graph);     gc.graph = nullptr; }
@@ -589,6 +1449,10 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
             cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &gc.graph), "amg capture end");
             cudaCheck(cudaGraphInstantiate(&gc.exec, gc.graph, 0), "amg graph instantiate");
             gc.key = A.diag;
+            gc.keyEpoch = deviceReductionScratchEpoch();
+            gc.keyAddressingId = A.addressingId;
+            gc.keyPairEpoch = amg.pair.epoch;
+            amgGraphViewStamp(gc, A);
         }
         cudaCheck(cudaGraphLaunch(gc.exec, cudaStreamPerThread), "amg graph launch");
     }

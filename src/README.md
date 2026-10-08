@@ -37,10 +37,21 @@ dictionary access are all the second kind.
 | `src/OpenFOAM/` | `src/OpenFOAM/` | primitives, meshes, db, matrices/solution |
 | `src/matrices/lduMatrix/lduMatrix/` | same | LDU view, BLAS1, deterministic reductions, SpMV |
 | `src/matrices/lduMatrix/solvers/PCG/` | same | PCG and the AMG-preconditioned / conditional-graph drivers |
+| `src/matrices/lduMatrix/solvers/GAMG/` | same | OpenFOAM's GAMGSolver: the host reference (V-cycle, DIC and Gauss-Seidel smoothers, correction scaling, PCG on the coarsest level) and the device V-cycle with the DIC smoother; `GAMGAgglomerations/` holds the faceAreaPair hierarchy and its numbering |
+| `src/OpenFOAM/primitives/septernion/` | `src/OpenFOAM/primitives/{quaternion,septernion}/` | quaternion and septernion arithmetic, and transformPoints, as a solid-body motion uses them |
+| `src/meshTools/solidBodyMotionFunctions/` | same | the eight solid-body motion functions, one septernion per time |
+| `src/dynamicFvMesh/dynamicMotionSolverFvMesh/` | same, plus `src/dynamicMesh/motionSolvers/displacement/solidBody/` | mesh.update() for the whole mesh in rigid motion or by displacementLaplacian: oldPoints, V0, meshPhi, Vsc and Vsc0, the geometry recomputed in place |
+| `src/fvMotionSolver/fvMotionSolvers/displacement/laplacian/` | same | displacementLaplacian with the inverseDistance diffusivity: cellMotion boundaries, the per-component GAMG solve, cells to points, the 2-D correction |
+| `src/meshTools/cellDist/patchWave/` | same | the meshWave distance to a set of patches: FaceCellWave with wallPoint, in OpenFOAM's visiting order, and correctBoundaryCells |
+| `src/meshTools/twoDPointCorrector/` | same | a 2-D mesh's points put back on lines normal to its plane after a motion |
+| `src/finiteVolume/interpolation/volPointInterpolation/` | same | cells to points by inverse distance, patch points from boundary faces |
+| `src/waveModels/derivedPointPatchFields/waveMaker/` | same | the piston, flap and solitary paddle displacement |
+| `src/OpenFOAM/meshes/meshShapes/face/`, `src/OpenFOAM/meshes/primitiveMesh/PrimitivePatch/` | same | face::centre, face::average and face::nearestPoint on arbitrary points; cells(), pointFaces(), pointCells() and a PrimitivePatch's addressing in OpenFOAM's order |
 | `src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/` | same | AMG build, Galerkin re-coarsening, V-cycle, smoothers, cache |
 | `src/matrices/lduMatrix/preconditioners/DILUPreconditioner/` | same | level-scheduled DILU |
 | `src/finiteVolume/` | `src/finiteVolume/` | fields, fvMesh, fvMatrices, fvc/fvm, cfdTools |
 | `src/TurbulenceModels/` | `src/TurbulenceModels/` | momentum transport models |
+| `src/waveModels/` | `src/waveModels/` | the wave generation and absorption models behind `waveAlpha` / `waveVelocity` |
 | `src/applications/solvers/` | `applications/solvers/` | thin drivers only |
 
 Paths follow **the OpenFOAM version actually being mirrored**. v2412 puts the turbulence models under

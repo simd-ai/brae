@@ -30,8 +30,12 @@ rm -rf "$WORK"; mkdir -p "$WORK"
 
 # 1. A solver brae does not implement: stop, name it, and list what brae does have. Never silently solve it
 #    with simpleFoam -- a wrong solver is a wrong answer that looks right.
-mkcase "$WORK/unsupported" "application     interFoam;" "Euler"
-check unsupported_application "$WORK/unsupported" "'interFoam' is not a solver brae implements yet"
+# `interFoam` was this arm's example of an unsupported solver until brae grew one, at which point the
+# arm failed -- which is the right failure: a test that names a specific missing capability has to be
+# updated when the capability lands, rather than silently continuing to pass against something else.
+# chtMultiRegionFoam is multi-region conjugate heat transfer and is a long way from anything here.
+mkcase "$WORK/unsupported" "application     chtMultiRegionFoam;" "Euler"
+check unsupported_application "$WORK/unsupported" "'chtMultiRegionFoam' is not a solver brae implements yet"
 grep -qF "pimpleFoam" "$WORK/unsupported_application.log" || { echo "FAIL: error does not list brae's solvers"; fail=1; }
 
 # 2. STEADY solver + transient ddtSchemes: NOT an error. OpenFOAM's steady solvers construct no ddt term
@@ -87,6 +91,17 @@ if [ -x "$(dirname "$BIN")/brae_rhoSimpleFoam" ]; then
     echo "ok:   rhosimplefoam_sibling_built"
 else
     echo "FAIL: rhosimplefoam_sibling_built -- the registry routes to a binary that was not built"; fail=1
+fi
+
+# 8. application interFoam is handed over to brae_interFoam. Added WITH the registry row and the
+#    add_dependencies line this time, rather than after a fresh build had already exec'd a binary that
+#    was never built -- which is what happened with rhoSimpleFoam and is what arm 7 exists to catch.
+mkcase "$WORK/inter" "application     interFoam;" "Euler"
+check application_interfoam "$WORK/inter" "controlDict application interFoam -> interFoam"
+if [ -x "$(dirname "$BIN")/brae_interFoam" ]; then
+    echo "ok:   interfoam_sibling_built"
+else
+    echo "FAIL: interfoam_sibling_built -- the registry routes to a binary that was not built"; fail=1
 fi
 
 [ "$fail" -eq 0 ] && echo "PASS: solver selection routes and refuses correctly"

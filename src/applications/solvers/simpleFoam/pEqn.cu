@@ -1,4 +1,5 @@
 // CUDA implementation -- see pEqn.cuh for the provenance and the contract with the _cpp reference.
+#include "inter_phase_time.cuh"
 #include "pEqn.cuh"
 #include <cstdlib>
 #include "device_blas.cuh"
@@ -64,9 +65,27 @@ void foldBoundaryDiagKernel(
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
-    scalar s = 0.0;
-    for (label k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k) s += icAv[bndPerm[k]];
-    D[c] += s;
+    // face by face INTO D, in patch order, as the host's A() folds it (fv_matrix_ops.cuh) -- summing a
+    // corner cell's faces first and adding the sum once rounds differently (pistonLES's four corners)
+    scalar d = D[c];
+    for (label k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k) d += icAv[bndPerm[k]];
+    D[c] = d;
+}
+
+// cmptAv(internalCoeffs) = (x + y + z)/3 (VectorSpaceI.H cmptAv: cmptSum/nComponents; cf_types.cuh). A
+// DIVISION: the scale by 1.0/3.0 this replaced multiplies by a rounded third, which is not the same
+// number on up to half the faces.
+__global__
+void cmptAvKernel(
+    int n,
+    const scalar* __restrict__ x,
+    const scalar* __restrict__ y,
+    const scalar* __restrict__ z,
+    scalar* __restrict__ av)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    av[i] = (x[i] + y[i] + z[i]) / 3.0;
 }
 
 } // namespace
@@ -84,6 +103,7 @@ void pressurePredictor(
     const DeviceBoundary*        dbP,
     const DeviceBuffer<scalar>*  p)
 {
+    interPhase::Nested timed("pressure: rAU, HbyA, phiHbyA");
     refuseUnsupported(in);
     if (in.consistent && (!dbP || !p))
         throw std::runtime_error("pEqn(cuda): SIMPLEC needs snGrad(p) and grad(p), so the pressure field "
@@ -93,10 +113,16 @@ void pressurePredictor(
 
     // cmptAv(internalCoeffs) -- shared by A() and by H()'s boundary-diagonal term.
     DeviceBuffer<scalar> icAv;
-    deviceCopy(icAv, UEqn.iC[0]);
-    deviceAxpy(1.0, UEqn.iC[1], icAv);
-    deviceAxpy(1.0, UEqn.iC[2], icAv);
-    deviceScale(icAv, 1.0 / 3.0);
+    {
+        const int nB = static_cast<int>(UEqn.iC[0].size());
+        icAv.resize(static_cast<std::size_t>(nB));
+        if (nB > 0)
+        {
+            cmptAvKernel<<<nBlocks(nB), TPB>>>(nB, UEqn.iC[0].data(), UEqn.iC[1].data(), UEqn.iC[2].data(),
+                                               icAv.data());
+            cudaCheck(cudaGetLastError(), "cmptAv");
+        }
+    }
 
     // ---- rAU = 1/A() -------------------------------------------------------------------------
     // A() = D/V with D = diag + cmptAv(internalCoeffs). `diag` here is the RELAXED diagonal when the
@@ -126,14 +152,46 @@ void pressurePredictor(
         DeviceBuffer<scalar> Hk;
         deviceMatrixH(A, dm, *U[k], UEqn.source[k], bdDiagK, UEqn.bC[k], Hk,
                       in.solutionD[k] > 0);
+        // ...and the pair's off-diagonal, which deviceMatrixH's face loops do not reach:
+        // H[own] -= ifCoeff*psi[nbr]/V[own] (deviceCyclicAddH), BEFORE the rAU weighting, because
+        // HbyA is rAU*H and not rAU applied to a half-built H.
+        if (k == 0 && in.hNoPairTap)
+        {
+            deviceCopy(*in.hNoPairTap, Hk);
+        }
+        if (in.cyc && in.cyc->n > 0)
+        {
+            // ...with the MOMENTUM matrix's own interface coefficient: cyc.ifCoeff has held the
+            // pressure laplacian's since the last corrector assembled it (MomentumMatrix::cycIfCoeff).
+            deviceCyclicAddH(*in.cyc, *U[k], dm.V, Hk, &UEqn.cycIfCoeff);
+        }
+        if (k == 0 && in.hPairTap && in.hNoPairTap)
+        {
+            // the pair's own contribution, by difference -- so the tap is what the call DID, not a
+            // second copy of its arithmetic that could drift from it
+            deviceCopy(*in.hPairTap, Hk);
+            deviceAxpy(-1.0, *in.hNoPairTap, *in.hPairTap);
+        }
         deviceHadamard(st.HbyA[k], st.rAU, Hk);
     }
 
     // ---- constrainHbyA(HbyA, U, p) -----------------------------------------------------------
+    // all three stored components or none: never a stored one beside a re-derived one in the same flux
+    const bool storedU = in.UbStored[0] && in.UbStored[1] && in.UbStored[2]
+                      && in.UbStored[0]->size() == static_cast<std::size_t>(dm.nBndFaces)
+                      && in.UbStored[1]->size() == static_cast<std::size_t>(dm.nBndFaces)
+                      && in.UbStored[2]->size() == static_cast<std::size_t>(dm.nBndFaces);
     for (int k = 0; k < 3; ++k)
     {
         DeviceBuffer<scalar> Ub;
-        deviceBCValue(dbU.comp[k], *U[k], Ub);
+        if (storedU)
+        {
+            deviceCopy(Ub, *in.UbStored[k]);
+        }
+        else
+        {
+            deviceBCValue(dbU.comp[k], *U[k], Ub);
+        }
         st.HbyAb[k].resize(dm.nBndFaces);
         if (dm.nBndFaces > 0)
         {
@@ -147,6 +205,12 @@ void pressurePredictor(
     // ---- phiHbyA = fvc::flux(HbyA) -----------------------------------------------------------
     deviceVectorFlux(dm, st.HbyA[0], st.HbyA[1], st.HbyA[2], st.phiHbyAInt);
     deviceBoundaryFlux(dm, st.HbyAb[0], st.HbyAb[1], st.HbyAb[2], st.phiHbyABnd);
+    // ...and on the pair, where fvc::flux is the two CELLS' HbyA interpolated and dotted with Sf --
+    // gated against the host's dot(coupledLinear(H), Sf) in test_device_cyclic_laplacian_vs_host.cu.
+    if (in.cyc && in.cyc->n > 0)
+    {
+        deviceCyclicFluxTo(*in.cyc, st.HbyA[0], st.HbyA[1], st.HbyA[2], st.phiHbyAIf);
+    }
 
     // ---- MRF.makeRelative(phiHbyA) -- pEqn.H:5, BEFORE adjustPhi -----------------------------
     // adjustPhi balances the flux it is handed, so the frame flux has to be out of it first.
@@ -208,7 +272,7 @@ void pressurePredictor(
         deviceInterpolate(dm, drAtU, drAtUf);
         {
             DeviceBuffer<scalar> ld, lu, ll, fInt;
-            deviceLaplacianCoeffs(dm, drAtUf, ld, lu, ll, in.correctedLaplacian);
+            deviceLaplacianCoeffs(dm, drAtUf, ld, lu, ll, in.correctedLaplacian || in.nonOrthCoeffs);
             deviceMatrixFluxInternal(deviceLduView(dm, ld, lu, ll), *p, fInt);
             deviceAxpy(1.0, fInt, st.phiHbyAInt);
         }
@@ -281,7 +345,7 @@ void assemblePEqn(
     // fvm::laplacian(rAU, p). The boundary diffusivity is rAU's own boundary value, which for the
     // extrapolatedCalculated field fvMatrix::A() produces IS the owner cell's -- hence the cell-gamma
     // kernel here rather than the face variant used for nuEff.
-    deviceLaplacianCoeffs(dm, rAUface, P.diag, P.upper, P.lower, in.correctedLaplacian);
+    deviceLaplacianCoeffs(dm, rAUface, P.diag, P.upper, P.lower, in.correctedLaplacian || in.nonOrthCoeffs);
     deviceBCLaplacianCoeffs(dbP, st.rAtU, P.iC, P.bC);
 
     // == fvc::div(phiHbyA), extensive: source = V*div(phiHbyA).

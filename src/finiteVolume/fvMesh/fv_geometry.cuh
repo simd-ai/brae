@@ -36,6 +36,19 @@ public:
     // cyclicACMIPolyPatch.C:392).
     void applyAreaScaling(const std::vector<std::pair<label, scalar>>& faceScale);
 
+    // cyclicACMIPolyPatch::scalePatchFaceAreas (cyclicACMIPolyPatch.C:230-258) for a scale that moves
+    // with time: the face's area set from its RAW area times the mask, and |Sf| taken from the result
+    // (cyclicACMIFvPatch::resetPatchAreas, magSf = mag(faceAreas)). Used by cyclic_acmi_cpp every step.
+    void setFaceArea(label f, const vector& Sf);
+
+    // primitiveMeshTools::updateCellCentresAndVols after the rescale: the centres and volumes from the
+    // current face areas, and NOTHING else -- OpenFOAM's weights, deltaCoeffs and non-orthogonal vectors
+    // are cached from the first time they were asked for and a static mesh never clears them. It
+    // recomputes every cell where OpenFOAM recomputes the ACMI patches' face cells only; the rest are
+    // unchanged inputs, and the per-cell sum runs in OpenFOAM's order either way (owned faces ascending,
+    // then neighbour faces ascending -- primitiveMesh::calcCells, and makeCellCentresAndVols' two passes).
+    void updateCellCentresAndVols(const PrimitiveMesh& m);
+
     // Pre-scaling |Sf| of the faces applyAreaScaling touched (empty on a mesh without cyclicACMI).
     // The AMI normalises its overlap by the RAW area: dividing by an already-scaled area returns 1 for
     // every face and erases the mask. Stored sparsely -- only ACMI faces are ever scaled -- so a mesh
@@ -45,6 +58,39 @@ public:
     {
         const auto it = rawArea_.find(f);
         return it == rawArea_.end() ? magSf_[f] : it->second;
+    }
+
+    // THE GEOMETRY BUILT ELSEWHERE, taken whole: the nine arrays build() leaves, from a caller that computed
+    // them itself -- the device loop's deviceFvGeometry, which is build() to the bit. adopt() SWAPS: `b` leaves
+    // with the arrays this held, the right sizes for the caller's next build. Like buildFaceGeometry it leaves
+    // the areas raw and unscaled.
+    struct Built
+    {
+        std::vector<vector> Cf;
+        std::vector<vector> Sf;
+        std::vector<vector> C;
+        std::vector<vector> nonOrthCorr;
+        std::vector<scalar> magSf;
+        std::vector<scalar> V;
+        std::vector<scalar> weights;
+        std::vector<scalar> deltaCoeffs;
+        std::vector<scalar> nonOrthDeltaCoeffs;
+    };
+    void adopt(
+        Built& b,
+        const PrimitiveMesh& m);
+    // THE GEOMETRY ANOTHER OBJECT HOLDS OF THIS SAME MESH, copied whole: the nine arrays build() leaves. For a
+    // caller that knows `o` was built for `m` as it stands -- the dynamic refinement builds its own after every
+    // change and the solver's was then built again for the same mesh. Refuses an `o` whose areas are scaled
+    // (that is not what build() leaves) or whose sizes are another mesh's.
+    void copyFrom(
+        const FvGeometry& o,
+        const PrimitiveMesh& m);
+    // HOW MANY TIMES this geometry has been written: every build, scaling, face-area set, cell update and adopt
+    // raises it. What a copy held elsewhere -- the device's -- compares to know whether it is still this one.
+    unsigned long long generation() const
+    {
+        return generation_;
     }
 
     const std::vector<vector>& Cf()    const { return Cf_; }
@@ -65,6 +111,7 @@ private:
     std::vector<vector> Cf_, Sf_, C_, nonOrthCorr_;
     std::vector<scalar> magSf_, V_, weights_, deltaCoeffs_, nonOrthDeltaCoeffs_;
     bool areaScaled_ = false;   // guards against scaling already-scaled areas
+    unsigned long long generation_ = 0;
     std::unordered_map<label, scalar> rawArea_;   // pre-scaling |Sf|, ACMI faces only
 };
 

@@ -127,6 +127,70 @@ int main()
               !r.threw && std::fabs((double)r.v[0] - (2.0 + 3.0*0.05 + 10.0)) < 1e-12);
     }
 
+    // ---- A MESH CHANGE RE-INTERPOLATES, it does not carry the parent's value ----------------------
+    //
+    // OpenFOAM's MappedFile<Type>::autoMap (MappedFile.C:228-248) maps the sample values and then throws
+    // the interpolator away -- `filterFieldPtr_.reset(nullptr); mapperPtr_.reset(nullptr);
+    // sampleIndex_ = labelPair(-1,-1)` -- so the next updateCoeffs interpolates the table at the patch's
+    // NEW face centres. brae used to keep only the interpolated result, so a refinement handed each child
+    // its parent's value: a staircase of the parent faces, on a patch that had just been refined to
+    // resolve exactly that.
+    //
+    // NO ORACLE RUN IS NEEDED, for the same reason as the arms above: barycentric interpolation is exact
+    // on a linear profile, so 2 + 3y at the CHILD's own centre is the answer and the parent's value is a
+    // measurable 3*0.025 = 0.075 away. That distance is the control -- if the arm ever reads zero for it,
+    // the children are not displaced from their parents and the split is vacuous.
+    {
+        writeCase("refine", "");
+        const FieldData<scalar> fd = readField<scalar>(BASE + "/refine/0/T");
+        FvPatch p = midPatch();                    // 5 parent faces, mid-station
+        auto pf = makePatchField<scalar>(p, fd.boundary.at(0));
+        pf->evaluate({});
+        const std::vector<scalar> parent = pf->value();
+
+        // the patch is refined IN PLACE, which is what the refine driver does before it maps the carried
+        // fields (updatePatchesInPlace, then mapCarriedFields): each face splits in two in y
+        FvPatchFieldMapping pm;
+        pm.direct = true;
+        FvPatch child;
+        child.name = p.name;
+        child.type = p.type;
+        child.size = 10;
+        for (label i = 0; i < 5; ++i)
+        {
+            for (int h = 0; h < 2; ++h)
+            {
+                child.faceCells.push_back(0);
+                child.deltaCoeffs.push_back(1.0);
+                child.nf.push_back(vector{1, 0, 0});
+                child.magSf.push_back(0.5);
+                child.Cf.push_back(vector{0, 0.025 + 0.05*h + 0.1*i, 0.025});
+                pm.directAddressing.push_back(i);   // both children map from their parent
+            }
+        }
+        p = child;                                 // the field holds a reference, so this is the new patch
+        pf->autoMap(pm, {});
+        pf->evaluate({});
+        const std::vector<scalar> mapped = pf->value();
+
+        check("the mapped patch field is the new patch's size", mapped.size() == 10);
+        double dExact = 0;
+        double dParent = 0;
+        for (std::size_t k = 0; k < mapped.size() && mapped.size() == 10; ++k)
+        {
+            const double y = 0.025 + 0.05*(k % 2) + 0.1*(k / 2);
+            dExact = std::fmax(dExact, std::fabs((double)mapped[k] - (2.0 + 3.0*y)));
+            dParent = std::fmax(dParent, std::fabs((double)mapped[k] - (double)parent[k / 2]));
+        }
+        std::printf("     max |child - exact linear at the CHILD centre| = %.3e\n", dExact);
+        std::printf("     max |child - the PARENT's value|               = %.3e (the staircase, 0.075)\n",
+                    dParent);
+        check("a refined patch is re-interpolated at the CHILDREN's face centres",
+              mapped.size() == 10 && dExact < 1e-12);
+        check("...and that is measurably NOT the parent's value (the arm can witness)",
+              mapped.size() == 10 && dParent > 0.07);
+    }
+
     // ---- the refusals, each by name ---------------------------------------------------------------
     writeCase("twodirs", "");
     std::filesystem::create_directories(BASE + "/twodirs/constant/boundaryData/inlet/1");

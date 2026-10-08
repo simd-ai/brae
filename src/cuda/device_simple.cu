@@ -34,22 +34,40 @@ void matrixHKernel(
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
-    scalar h = source[c];
-    for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)
-        h -= upper[f] * psi[nei[f]];   // -upper*psi[nei] (owned faces)
-    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
+    // The host reference's order (fv_matrix_ops.cuh matrixH), term by term, and its contraction as g++
+    // compiles it (objdump -dl of the host object: one fmla/fmadd per boundary-diagonal term, one
+    // fmls/fmsub per face, plain adds for the source and the boundary source):
+    //   H = 0; H += (cmptAv(ic) - ic_k)*psi per boundary face in patch order; H -= coeff*psi over the
+    //   faces in FACE order, a cell's owned and neighbour faces interleaved; H += source; H += bC per
+    //   boundary face; H /= V.
+    // This started from the source, summed the owned faces before the neighbour ones and folded the
+    // boundary diagonal once -- the same terms rounded in another order on every cell.
+    scalar h = 0;
+    const int b0 = bndCellStart[c];
+    const int b1 = bndCellStart[c + 1];
+    for (int k = b0; k < b1; ++k)
+        h = fma(bdDiag[bndPerm[k]], psi[c], h);
+    int f = ownerStart[c];
+    const int u1 = ownerStart[c + 1];
+    int k = losortStart[c];
+    const int l1 = losortStart[c + 1];
+    while (f < u1 || k < l1)
     {
-        const int f = losort[k];
-        h -= lower[f] * psi[own[f]];  // -lower*psi[own]
+        const int fl = (k < l1) ? losort[k] : 0x7fffffff;
+        if (f < u1 && f < fl)
+        {
+            h = fma(-upper[f], psi[nei[f]], h);
+            ++f;
+        }
+        else
+        {
+            h = fma(-lower[fl], psi[own[fl]], h);
+            ++k;
+        }
     }
-    scalar bd = 0, bs = 0;
-    for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)
-    {
-        const int kk = bndPerm[k];
-        bd += bdDiag[kk];
-        bs += bdSrc[kk];
-    }
-    h += bd * psi[c] + bs;
+    h += source[c];
+    for (int k2 = b0; k2 < b1; ++k2)
+        h += bdSrc[bndPerm[k2]];
     H[c] = h / V[c];
 }
 __global__
@@ -60,7 +78,12 @@ void reciprocalVKernel(
     scalar* __restrict__ rAU)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
-    if (c < nC) rAU[c] = V[c] / diagC[c];
+    // 1/(D/V): OpenFOAM's rAU = 1.0/UEqn.A() with A() = D()/V (fvMatrix.C:1324), and every host reference's
+    // (fv_matrix_ops.cuh A(), then 1.0/A). V/D is the same number only when neither rounding lands
+    // differently. MEASURED on pistonLES, step 1, corrector 0, with the momentum term order
+    // (MomentumInput::interOrder) and H()'s: rAU off the host's in the last bit in 21,159 of 56,000
+    // cells before the three, 102 after.
+    if (c < nC) rAU[c] = scalar(1) / (diagC[c] / V[c]);
 }
 __global__
 void vectorFluxKernel(

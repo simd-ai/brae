@@ -4,6 +4,7 @@
 //   laplacian : upper=lower = deltaCoeffs * gammaf * |Sf|
 //   div upwind: lower = -max(phi,0)... w=(phi>=0); lower=-w*phi; upper=lower+phi
 #include "device_mesh.cuh"
+#include "device_limiter.cuh"
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -76,38 +77,42 @@ void divFaceKernel(int nIf, const scalar* __restrict__ phi, scalar* __restrict__
 // twoByk > 0 selects limitedLinear (limiter = clamp(2/k * r, 0, 1)); twoByk == 0 selects vanAlbada
 // (limiter = r(r+1)/(r^2+1), vanAlbada.H:85), which the Maxwell tutorials name for div(phi,sigma).
 // Same NVDTVD r either way -- only the limiter function differs, so they share this.
-__device__ __forceinline__ scalar limitedFaceWeight(
-    int f, int P, int N, scalar p, scalar cdwF,
-    const scalar* __restrict__ field,
-    const scalar* __restrict__ gx, const scalar* __restrict__ gy, const scalar* __restrict__ gz,
-    const scalar* __restrict__ dOwnX, const scalar* __restrict__ dOwnY, const scalar* __restrict__ dOwnZ,
-    const scalar* __restrict__ dNeiX, const scalar* __restrict__ dNeiY, const scalar* __restrict__ dNeiZ,
-    scalar twoByk)
-{
-    const scalar dx = dOwnX[f] - dNeiX[f], dy = dOwnY[f] - dNeiY[f], dz = dOwnZ[f] - dNeiZ[f];   // d = C[N]-C[P]
-    // NVDTVD::r, upwind-cell gradient (strict phi>0) projected on d, vs the face gradient.
-    const int U = (p > 0.0) ? P : N;
-    const scalar gradcf = dx*gx[U] + dy*gy[U] + dz*gz[U];
-    const scalar gradf  = field[N] - field[P];
-    scalar r;   // sign(s) = (s>=0)?1:-1  (OF Scalar.H)
-    if (fabs(gradcf) >= 1000.0 * fabs(gradf))
-        r = 2.0 * 1000.0 * ((gradcf >= 0.0) ? 1.0 : -1.0) * ((gradf >= 0.0) ? 1.0 : -1.0) - 1.0;
-    else
-        r = 2.0 * (gradcf / gradf) - 1.0;
-    scalar limiter;
-    if (twoByk > 0.0)
-    {
-        limiter = twoByk * r;
-        limiter = (limiter < 0.0) ? 0.0 : (limiter > 1.0 ? 1.0 : limiter);    // clamp(.,0,1)
-    }
-    else
-    {
-        limiter = r * (r + 1.0) / (r*r + 1.0);        // OF vanAlbada: NOT clamped, and it is <= 1 anyway
-    }
-    const scalar pos0 = (p >= 0.0) ? 1.0 : 0.0;
-    return limiter * cdwF + (1.0 - limiter) * pos0;
-}
+//
+// vanLeer (vanLeer.H:70, limiter = (r + |r|)/(1 + |r|)) is selected by the SENTINEL kVanLeerTwoByk,
+// not by a third sign convention: twoByk is a real coefficient for limitedLinear and 0 already means
+// vanAlbada, and device_ami.cu reads `<= 0` as vanAlbada too -- so a negative range would have changed
+// the AMI path's meaning silently. An exact sentinel cannot collide with 2/max(k,SMALL), which is
+// always > 0. Every interFoam tutorial names `div(phi,alpha) Gauss vanLeer`, which is why it is here.
 
+
+// interfaceCompression's face weights. A PhiScheme, not an NVD/TVD one: its limiter reads the TWO CELL
+// VALUES and nothing else -- no gradient, no r --
+//     limiter = clamp(1 - max(sqr(1 - 4 phiP (1 - phiP)), sqr(1 - 4 phiN (1 - phiN))), 0, 1)
+// (interfaceCompression.H, the quartic form), blended as every limited scheme is:
+// w = limiter*cdWeight + (1 - limiter)*pos0(phi) (limitedSurfaceInterpolationScheme.C). It is 1 where
+// both cells are half full and 0 where either is empty or full, so the face value is central across
+// the interface and upwind away from it. Written as the host reference writes it
+// (limitedSchemes_cpp.cu:96-119) so the two contract the same multiply-adds.
+__global__
+void interfaceCompressionWeightsKernel(
+    int nIf,
+    const label* __restrict__ own,
+    const label* __restrict__ nei,
+    const scalar* __restrict__ cdw,
+    const scalar* __restrict__ phi,
+    const scalar* __restrict__ field,
+    scalar* __restrict__ w)
+{
+    const int f = blockIdx.x * blockDim.x + threadIdx.x;
+    if (f >= nIf) return;
+    const scalar phiP = field[own[f]];
+    const scalar phiN = field[nei[f]];
+    const scalar aP = scalar(1) - scalar(4)*phiP*(scalar(1) - phiP);
+    const scalar aN = scalar(1) - scalar(4)*phiN*(scalar(1) - phiN);
+    scalar lim = scalar(1) - fmax(aP*aP, aN*aN);
+    lim = fmin(fmax(lim, scalar(0)), scalar(1));
+    w[f] = lim*cdw[f] + (scalar(1) - lim)*((phi[f] >= scalar(0)) ? scalar(1) : scalar(0));
+}
 
 // The face weights alone, for a caller assembling an EXPLICIT divergence rather than matrix
 // coefficients -- rhoSimpleFoam's fvc::div(phi, Ekp). Same limiter, same currency (twoByk, not raw k).
@@ -224,8 +229,9 @@ void divLimitedVFaceKernel(
         r = 2.0 * 1000.0 * ((gradcf >= 0.0) ? 1.0 : -1.0) * ((gradf >= 0.0) ? 1.0 : -1.0) - 1.0;
     else
         r = 2.0 * (gradcf / gradf) - 1.0;
-    scalar limiter = twoByk * r;
-    limiter = (limiter < 0.0) ? 0.0 : (limiter > 1.0 ? 1.0 : limiter);        // clamp(.,0,1)
+    // limitedLinearV's clamp, or vanLeerV's unclamped limiter by the sentinel -- the V schemes differ
+    // from their scalar forms in r alone (NVDVTVDV against NVDTVD), never in the limiter
+    const scalar limiter = limiterOfR(r, twoByk);
     const scalar pos0 = (p >= 0.0) ? 1.0 : 0.0;
     const scalar W = limiter * cdw[f] + (1.0 - limiter) * pos0;
     const scalar lo = -W * p;
@@ -247,12 +253,28 @@ void diagGatherKernel(
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
 
+    // A TRANSCRIPTION of the host's fvm::laplacian (fvm.cuh): `diag[own] -= coeff; diag[nei] -= coeff`
+    // in FACE ORDER from zero, so this cell's owner and neighbour lists (each ascending) are merged by
+    // face index. Summed owner-first, the diagonal differed from the host's in the last bit.
     scalar s = 0.0;
-    for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)
-        s += lower[f];              // faces owned by c
-    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
-        s += upper[losort[k]];    // faces neighbouring c
-    diag[c] = -s;
+    int fo = ownerStart[c];
+    const int foEnd = ownerStart[c + 1];
+    int kn = losortStart[c];
+    const int knEnd = losortStart[c + 1];
+    while (fo < foEnd || kn < knEnd)
+    {
+        if ((kn >= knEnd) || (fo < foEnd && fo < losort[kn]))
+        {
+            s -= lower[fo];             // a face c owns
+            ++fo;
+        }
+        else
+        {
+            s -= upper[losort[kn]];     // a face c neighbours
+            ++kn;
+        }
+    }
+    diag[c] = s;
 }
 
 
@@ -374,7 +396,8 @@ void lapCorrFaceLimitedKernel(
     const scalar orthSn = nonOrthDc[f] * (phi[n] - phi[o]);        // orthogonal snGrad (over-relaxed)
     scalar limiter = (psi * fabs(orthSn)) / ((1.0 - psi) * fabs(corr) + 1.0e-15);
     if (limiter > 1.0) limiter = 1.0;
-    ffc[f] = gammaf[f] * magSf[f] * limiter * corr;
+    // the host's order: corr = lim*corr, then (gamma*magSf)*corr (fvm.cuh laplacianCorrFlux)
+    ffc[f] = (gammaf[f] * magSf[f]) * (limiter * corr);
 }
 
 
@@ -391,11 +414,27 @@ void lapCorrGatherKernel(
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
 
+    // The host's laplacianNonOrthSource sums `src[own] += ffc; src[nei] -= ffc` in FACE ORDER and the
+    // caller subtracts it; this is its negation, accumulated in the same order (owner and neighbour
+    // lists merged by face index), so it is the host's value with the sign flipped, bit for bit.
     scalar s = 0.0;
-    for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)
-        s -= ffc[f];               // c is owner
-    for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
-        s += ffc[losort[k]];      // c is neighbour
+    int fo = ownerStart[c];
+    const int foEnd = ownerStart[c + 1];
+    int kn = losortStart[c];
+    const int knEnd = losortStart[c + 1];
+    while (fo < foEnd || kn < knEnd)
+    {
+        if ((kn >= knEnd) || (fo < foEnd && fo < losort[kn]))
+        {
+            s -= ffc[fo];               // c is owner
+            ++fo;
+        }
+        else
+        {
+            s += ffc[losort[kn]];       // c is neighbour
+            ++kn;
+        }
+    }
     src[c] = s;
 }
 } // namespace
@@ -493,10 +532,11 @@ void lapCorrFaceLimitedVecKernel(
     scalar limiter = (psi * magOrth) / ((1.0 - psi) * magCorr + 1.0e-15);
     if (limiter > 1.0) limiter = 1.0;
 
-    const scalar s = gammaf[f] * magSf[f] * limiter;
-    f0[f] = s * c0;
-    f1[f] = s * c1;
-    f2[f] = s * c2;
+    // the host's order: corr = lim*corr, then (gamma*magSf)*corr (fvm.cuh laplacianCorrFlux)
+    const scalar gm = gammaf[f] * magSf[f];
+    f0[f] = gm * (limiter * c0);
+    f1[f] = gm * (limiter * c1);
+    f2[f] = gm * (limiter * c2);
 }
 } // namespace
 
@@ -610,6 +650,21 @@ void deviceDivLimitedCoeffs(
     cudaCheck(cudaGetLastError(), "divLimitedFace");
     diagGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), upper.data(), lower.data(), diag.data());
     cudaCheck(cudaGetLastError(), "diagGather");
+}
+
+
+void deviceInterfaceCompressionWeights(
+    const DeviceMesh&           dm,
+    const DeviceBuffer<scalar>& phiInt,
+    const DeviceBuffer<scalar>& field,
+    DeviceBuffer<scalar>&       w)
+{
+    const int nIf = dm.nInternalFaces;
+    w.resize(nIf);
+    if (!nIf) return;
+    interfaceCompressionWeightsKernel<<<nBlocks(nIf), TPB>>>(
+        nIf, dm.owner.data(), dm.nei.data(), dm.w.data(), phiInt.data(), field.data(), w.data());
+    cudaCheck(cudaGetLastError(), "interfaceCompressionWeights");
 }
 
 

@@ -255,7 +255,7 @@ FvVectorMatrix assembleUEqn(
         muEffBnd = &muEffBndOwned;
     }
     addDivDevReff(M, U, *muEff, *muEffBnd, m, g, patches, in.correctedLaplacian, in.snGradLimitCoeff,
-                  in.gradULimitK, in.gradULeastSq);
+                  in.gradULimitK, in.gradULeastSq, in.nonOrthCoeffs);
 
     // == fvOptions(rho, U). rhoSimpleFoam's momentum equation is in FORCE units, which is what selects
     // fixedCoeff's rhoRef branch over the kinematic one.

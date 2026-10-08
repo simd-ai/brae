@@ -54,6 +54,7 @@
 //   substituted by the time it arrives), coupled patches, unported fvOptions, a div scheme other than
 //   upwind, a turbulence wall function on a non-`wall` patch, and a case that bounds one of the two
 //   convection terms but not the other.
+#include "turbulence_transport.cuh"   // turbulence::SolveControls
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
@@ -63,9 +64,15 @@
 #include "device_colour_gauss_seidel.cuh"   // DeviceCellColouring: the colour-order smoothSolver (FP-1)
 #include "kepsilon_coeffs.cuh"
 #include "pEqn.cuh"               // PressureMatrix -- the assembled scalar object, shared not redefined
+#include "device_crank_nicolson_ddt.cuh"
 #include <string>
+#include <vector>
 
 namespace brae {
+// `fvSchemes` div and grad entries for ONE equation (cpu/limitedSchemes_cpp.cuh). Forward-declared
+// because this header only holds POINTERS to them; the .cu that dereferences them includes the
+// definition. Keeps a host scheme header out of every device translation unit that sees this one.
+namespace cpu { struct EqnDivScheme; struct EqnGradScheme; }
 namespace gpu {
 namespace kEpsilonRAS {
 
@@ -76,6 +83,13 @@ struct KEpsilonInput
     const DeviceBuffer<scalar>* phiBnd      = nullptr;
     const DeviceBuffer<scalar>* phiByRhoInt = nullptr;   // VOLUMETRIC flux -- divU ONLY
     const DeviceBuffer<scalar>* phiByRhoBnd = nullptr;
+    // THE FLUX A FLUX-CONDITIONAL PATCH LOOKS UP, when that is not the equation's own -- the host
+    // reference's Compressible::bcPhi. inletOutlet reads the registry's `phi`. In rhoSimpleFoam that IS
+    // the mass flux above, so null (the equation's flux) is right. In interFoam's `density variable`
+    // lineage the equation convects with rhoPhi, which the ALPHA step built from the phi the time step
+    // started on; `phi` has been through the pressure correctors since. Measured on RAS/damBreak at
+    // step one: rhoPhi is exactly 0 on all 46 atmosphere faces (phi started at rest) and phi is not.
+    const DeviceBuffer<scalar>* bcPhiBnd = nullptr;
 
     // --- the compressible instantiation: alpha = 1, rho = the solver's relaxed density ---
     const DeviceBuffer<scalar>* rhoCell    = nullptr;
@@ -88,6 +102,22 @@ struct KEpsilonInput
     // rhoSimpleFoam_cpp.cuh StepInput); null falls back to rhoCell, the host closure's rhoOldAt.
     scalar                      rDeltaT    = 0.0;
     const DeviceBuffer<scalar>* rhoOldCell = nullptr;
+    // A MOVING MESH, as the host reference carries it (kEpsilonRef::Compressible::V0 / meshPhi) and the
+    // kOmegaSST kernels do: EulerDdtScheme::fvmDdt under mesh().moving() takes the OLD volumes in the
+    // source, rDeltaT*rho.oldTime()*psi.oldTime()*V0, where the diagonal keeps V; and divU is the
+    // divergence of the ABSOLUTE flux, fvc::div(fvc::absolute(phi, U)) = div(phi + mesh.phi())
+    // (kEpsilon.C:232-235). Null together on a static mesh. These were absent here, and a moving mesh ran
+    // on the current volumes and the relative flux with nothing said: MEASURED on RAS/floatingObject's
+    // released body, one step, device against host -- k 5.8e-06, nut 3.4e-06, epsilon 6.5e-07.
+    const DeviceBuffer<scalar>* V0         = nullptr;
+    // ...and mesh().V00(), which CrankNicolson's moving branch weights the old-old level by
+    // (CrankNicolsonDdtScheme.C:862-893). Required with V0 under `cn`; unread otherwise.
+    const DeviceBuffer<scalar>* V00        = nullptr;
+    const DeviceBuffer<scalar>* meshPhiInt = nullptr;
+    const DeviceBuffer<scalar>* meshPhiBnd = nullptr;
+    // ...and the mesh flux on a coupled pair's faces, which divU's absolute flux takes like any other
+    // face's. Null on a static mesh or a mesh with no pair; a moving mesh WITH a pair is refused without it.
+    const DeviceBuffer<scalar>* meshPhiIf  = nullptr;
     const DeviceBuffer<scalar>* nuCell     = nullptr;    // mu(T)/rho per cell.        REQUIRED.
     const DeviceBuffer<scalar>* nuBndFace  = nullptr;    // mu_b/rho_b per bnd face.   REQUIRED.
     const DeviceBuffer<scalar>* nuWallFace = nullptr;    // the same, in WALL-face order
@@ -134,15 +164,73 @@ struct KEpsilonInput
     // variant and ONE nSweeps for the pair, which linear_solver_setup refuses to resolve when they differ.
     bool   gsK = false, gsEps = false, gsSymmetric = true;
     int    nSweepsKE = 1;
+    // ...or `solver PBiCG; preconditioner DILU;` for BOTH equations (device_pbicg.cuh): NOT PBiCGStab,
+    // and it needs `precon` below to carry the mesh's DILU schedule. waves/mangroveInteraction names it.
+    bool   pbicgKE = false;
+    // psi.oldTime(): the PREVIOUS STEP's field, which the caller supplies once `turbOnFinalIterOnly no`
+    // makes the closure run on every outer corrector. Null keeps the field at entry -- identical while the
+    // closure runs once per step (GeometricField.C:904-917; the host twins carry the same note).
+    const DeviceBuffer<scalar>* kOldIn = nullptr;
+    const DeviceBuffer<scalar>* epsOldIn = nullptr;
+    // THE SECOND EQUATION'S OWN SOLVER SETTING. `fvMatrix::solve()` looks the solver dictionary up by
+    // FIELD name (fvMatrix.C:1536-1542), so `epsilonFinal` may name different tolerances, sweep counts or a
+    // different solver from `kFinal` and OpenFOAM honours each (kEpsilon.C:268 / kOmegaSSTBase.C:593 solve
+    // the second equation, :288 / :618 solve k). This closure took k's for both and the driver refused a
+    // mismatch. Null keeps that: the caller has ONE setting and says so. The host twin is
+    // kEpsilon_cpp.cu's EqnSolveSetting.
+    const turbulence::SolveControls* epsSolve = nullptr;
+    // ...or CrankNicolson's fvm::ddt in Euler's place (device_crank_nicolson_ddt.cuh), transcribed from
+    // the host closure: the scheme's clock, the two equations' OWN ddt0 fields kept by the caller across
+    // steps, rho.oldTime().oldTime() (the ones vector in the incompressible lineage, as rhoCell is) and
+    // the fields' old-old levels (k.oldTime().oldTime(), which the caller rotates once per time index).
+    // rDeltaT must still be positive -- it marks the equation transient and the old levels are taken
+    // -- but the Euler term is not added. The static form only; the interFoam driver refuses
+    // CrankNicolson beside a moving mesh before the closure is built.
+    const cpu::fv::CrankNicolsonClock* cn = nullptr;
+    DeviceCnDdt0*               cnDdt0Eps = nullptr;
+    DeviceCnDdt0*               cnDdt0K   = nullptr;
+    // ...and their patch halves, for a caller that writes the two fields (null: unkept)
+    const DeviceCnDdt0PatchOperands* cnPatchEps = nullptr;
+    const DeviceCnDdt0PatchOperands* cnPatchK   = nullptr;
+    // A COLD START's epsilon.oldTime(), CREATED inside the first call after the wall function's update
+    // (the host's Compressible::epsOldCreated, with the measurement): the cells and the boundary faces as
+    // they stand there, handed back. Null on every later call.
+    DeviceBuffer<scalar>*       epsOldCreated    = nullptr;
+    DeviceBuffer<scalar>*       epsOldBndCreated = nullptr;
+    const DeviceBuffer<scalar>* rhoOOCell = nullptr;
+    const DeviceBuffer<scalar>* epsOO     = nullptr;
+    const DeviceBuffer<scalar>* kOO       = nullptr;
+    // + fvOptions(epsilon) and + fvOptions(k) for an option whose addSup is -fvm::Sp(coeff, field): one
+    // coefficient per cell, which the matrix takes as diag += V*coeff after every other term and before
+    // relax() (kEpsilon.C:258 and :279). The CALLER forms the coefficient, from whatever the option
+    // reads -- the mangroves' is Cx*Cd*a*N*|U|. Empty = no such option. The incompressible lineage
+    // only: OpenFOAM's density-weighted form is -Sp(rho*coeff) and no gate holds it.
+    //
+    // ONE ENTRY PER OPTION: `fvOptions(k)` is a sum over the list, so two options that name the same
+    // cell each add their own -Sp, and the matrix takes diag += V*coeff_1 then diag += V*coeff_2 --
+    // term for term what the host's loop over the option list leaves, not V*(coeff_1 + coeff_2).
+    std::vector<const DeviceBuffer<scalar>*> fvoSpEps;
+    std::vector<const DeviceBuffer<scalar>*> fvoSpK;
     // FP-1: sweep the honoured smoothSolver in COLOUR order over `colouring` (turbulence_transport.cuh
     // SolveControls::gsColour); the driver announces the order per field.
     bool   gsColour = false;
     const DeviceCellColouring* colouring = nullptr;
+    // SEPARATE fvSchemes entries, and the kernels have always taken them separately (the `bounded`
+    // argument of the two assembly kernels, filled from boundedEps at the epsilon call and boundedK at
+    // k's). The refusal that used to stand in front of this pair was guarding code that already worked.
     bool   boundedK   = false;
-    bool   boundedEps = false;    // separate fvSchemes entries; the reference carries ONE bool for both,
-                                  // so a case that bounds one and not the other is refused here rather
-                                  // than quietly bounded twice or not at all.
+    bool   boundedEps = false;
+    // EPSILON'S OWN div and grad entries. `fvc::grad(vf)` resolves `grad(<vf>)` by the FIELD's name and
+    // `fvm::div(phi, vf)` its entry likewise, so `div(phi,k)` and `div(phi,epsilon)` are two schemes and
+    // OpenFOAM assembles each; the same for the gradients the limiter and the corrected laplacian take.
+    // NULL means "epsilon takes k's", which is what every caller got before these existed and what a
+    // case with one `default` still means -- so no positional caller moves and nothing silently reads
+    // the other field's entry. K's stay where they always were: `limitedLinear`/`limiterCoeff`/
+    // `linearUpwind`/`luGradK` here and `co.gradKLeastSq`/`co.gradKLimitK` on the coefficients.
+    const cpu::EqnDivScheme*  epsDiv  = nullptr;
+    const cpu::EqnGradScheme* epsGrad = nullptr;
     bool   correctedLaplacian = false;   // BOTH halves: the implicit coefficient AND the explicit source
+    bool   nonOrthCoeffs = false;   // nonOrthDeltaCoeffs without the correction -- inter_ueqn_cpp.cuh:181
     scalar snGradLimitCoeff   = 0.0;
 
     // --- relaxation. relax(1.0) is NOT the identity: fvMatrix::relax early-returns only on alpha <= 0,
@@ -213,8 +301,6 @@ struct KEpsilonInput
     // KEpsilonCoeffs::gradKLimitK's use in the corrected laplacian.
     bool        limitedLinear = false;
     scalar      limiterCoeff  = 1.0;
-    scalar      limGradK      = 0.0;
-    bool        limGradLeastSq = false;
     // `Gauss linearUpwind <name>` on the pair, and the cellLimited coefficient of the gradient it names
     // (turbulence_transport.cuh, TransportScheme::linearUpwind).
     bool        linearUpwind  = false;
@@ -222,6 +308,17 @@ struct KEpsilonInput
 
     // --- refusals ---
     bool        hasCoupledPatches      = false;
+    // A PERIODIC PAIR, once the caller carries one. k's and epsilon's equations are
+    // fvm::div - fvm::laplacian, so across a pair they need the interface off-diagonal in the matrix
+    // AND in the solve -- see TransportScheme::cyc. `cycPhi` is the flux those equations convect with
+    // on the pair's own faces. Both null = no pair, which is what hasCoupledPatches still refuses.
+    DeviceCyclic*               cyc    = nullptr;
+    const DeviceBuffer<scalar>* cycPhi = nullptr;
+    // ...and the VOLUMETRIC flux on the pair, which is a different field from cycPhi in the
+    // compressible lineage: divU is the dilatation and comes from phiByRho, divPhi is the equation's
+    // own mass-flux divergence. In the incompressible lineage the two are one field and the caller
+    // passes the same buffer twice, exactly as it does for phiByRhoInt/phiInt.
+    const DeviceBuffer<scalar>* cycPhiByRho = nullptr;
     bool        hasUnportedFvOption    = false;
     bool        hasNonUpwindDivScheme  = false;
     bool        hasNonWallTurbWallFunc = false;
@@ -249,6 +346,9 @@ struct KEpsilonStages
     scalar epsResidual = 0.0;
     scalar kResidual   = 0.0;
     label  wallCells   = 0;
+    // the two solves whole, for a solver-log gate; the two residuals above are their initial ones
+    DeviceSolverPerf epsPerf;
+    DeviceSolverPerf kPerf;
 };
 
 // Stage 1: gradU, gByNu, divU, divPhi and G. Touches no matrix. G is left PRE-wall, which is the state

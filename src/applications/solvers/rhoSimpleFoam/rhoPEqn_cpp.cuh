@@ -89,9 +89,14 @@ struct PressureInput
     label  pRefCell             = -1;      // pressureControl.refCell(); -1 => no reference needed
     scalar pRefValue            = 0.0;
     bool   correctedLaplacian   = false;
+    // ...and WHICH delta coefficients: `uncorrected` takes nonOrthDeltaCoeffs with no correction
+    // flux (uncorrectedSnGrad.H:113-119). See solver_controls.cuh:226.
+    bool   nonOrthCoeffs = false;
     // snGradSchemes, for rhoPcEqn_cpp's fvc::snGrad(p) alone (pcEqn.H:64) -- a different block from the
     // laplacian's, defaulting to `corrected` as OpenFOAM's does (schemesLookup.C:82).
     bool   correctedFvcSnGrad   = true;
+    // ...and the snGrad block's own coefficient choice -- same two facts, other block.
+    bool   fvcSnGradNonOrthCoeffs = true;
     scalar fvcSnGradLimitCoeff  = 0.0;
     scalar snGradLimitCoeff     = 0.0;
     bool   hasMRF               = false;   // MRF.makeRelative -- refused

@@ -1,6 +1,7 @@
 // Device AMG preconditioner: host agglomeration (static) + device Galerkin and V-cycle smoothing.
 // Used by deviceAMGPCG. Feature flags live in one BRAE_AMG_* block at the top of the anonymous namespace.
 #include "device_amg.cuh"
+#include "inter_phase_time.cuh"
 #include "device_blas.cuh"
 #include "device_ldu.cuh"       // deviceParallelAmul (halo-coupled matvec) for the distributed whole-loop graph PCG
 #include "device_halo.cuh"      // DeviceHalo + its DeviceReducer (on-stream NVSHMEM reduce)
@@ -11,6 +12,9 @@
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <algorithm>
+#include <utility>
+#include <stdexcept>
+#include <cstring>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +24,7 @@
 #include <unordered_map>
 #include <vector>
 #include <mutex>
+#include <optional>
 
 namespace cg = cooperative_groups;
 
@@ -69,6 +74,64 @@ void rapScatterK(
     if (dk==0) atomicAdd(&cDiag[di], v);
     else if (dk==1) atomicAdd(&cUp[di], v);
     else atomicAdd(&cLo[di], v);
+}
+// The same triple product in a fixed order, two launches (AMGLevel::rapStart has why two): every triple's
+// product, a thread a triple...
+__global__
+void rapTermsK(
+    int nT,
+    const label* __restrict__ srcKind,
+    const label* __restrict__ srcIdx,
+    const scalar* __restrict__ w,
+    const scalar* __restrict__ fineDiag,
+    const scalar* __restrict__ fineUp,
+    const scalar* __restrict__ fineLo,
+    scalar* __restrict__ term)
+{
+    const int t = blockIdx.x*blockDim.x + threadIdx.x;
+    if (t >= nT) return;
+    const int sk = srcKind[t];
+    const int si = srcIdx[t];
+    const scalar src = (sk == 0) ? fineDiag[si] : (sk == 1) ? fineUp[si] : fineLo[si];
+    term[t] = w[t]*src;
+}
+
+// ...then each coarse entry's run of them added in order, a thread an entry: nCoarse diagonals, then the upper
+// and the lower faces. amgSaFixedOrder put a destination's triples next to one another. Writes every entry, so
+// the coarse matrix needs no zeroing first.
+__global__
+void rapSumK(
+    int nDest,
+    int nCoarse,
+    int nCoarseFaces,
+    int reversed,
+    const label* __restrict__ start,
+    const scalar* __restrict__ term,
+    scalar* __restrict__ cDiag,
+    scalar* __restrict__ cUp,
+    scalar* __restrict__ cLo)
+{
+    const int d = blockIdx.x*blockDim.x + threadIdx.x;
+    if (d >= nDest) return;
+    const int lo = start[d];
+    const int hi = start[d + 1];
+    scalar acc = 0;
+    for (int j = 0; j < hi - lo; ++j)
+    {
+        acc += term[reversed ? hi - 1 - j : lo + j];
+    }
+    if (d < nCoarse)
+    {
+        cDiag[d] = acc;
+    }
+    else if (d < nCoarse + nCoarseFaces)
+    {
+        cUp[d - nCoarse] = acc;
+    }
+    else
+    {
+        cLo[d - nCoarse - nCoarseFaces] = acc;
+    }
 }
 // Injection Galerkin (default path): coarse LDU from fine diag/upper/lower via faceRestrict/faceFlip.
 //
@@ -200,6 +263,199 @@ void buildGalerkinGather(AMGLevel& L, const AgglomT& a, int nFine)
     L.galFaceFlipList.copyFrom(ff);
 }
 
+// THE BUILD'S PARAMETERS, read in ONE place: buildAMG and agglomerate take them from here, and so does the
+// disk cache's signature (amgHierarchySignature) -- a hierarchy built under another value is another hierarchy.
+int amgTarget()
+{
+    const char* e = std::getenv("BRAE_AMG_TARGET");
+    const int v = e ? std::atoi(e) : 64;
+    return v > 0 ? v : 64;
+}
+// HOW MANY PAIRWISE PASSES MAKE A LEVEL. BRAE_AMG_MERGE=k sets it for every mesh. Unset: one, and TWO on a fine
+// grid of `amgMergeSmallMeshes` cells or fewer where a solver has asked for that rule (brae_interFoam: 10,000).
+// On a small mesh a level costs its kernel launches, not its cells, and a hierarchy of half the levels is the
+// cheaper cycle. MEASURED 2026-10-06 with BRAE_AMG_MERGE=2 over the 42 interFoam tutorials: every mesh of 10,000
+// cells or fewer 3-15% faster a step with the step count unchanged (damBreak 6.8 -> 6.0 ms, 2,268 cells: 7
+// grids -> 4, 8.6 -> 9.6 iterations a solve); flat from 400,000 cells up (DTCHull 331.8 -> 335.2); and on four
+// wave cases between 14,000 and 160,000 cells one more time step in thirty, a step further from serial
+// OpenFOAM's count -- which is why the rule stops at 10,000 and is not the default everywhere.
+int smallMeshMergeCells = 0;
+
+}   // namespace
+
+void amgMergeSmallMeshes(int cellsOrFewer)
+{
+    smallMeshMergeCells = cellsOrFewer;
+}
+int amgMergeFor(int nFine)
+{
+    const char* e = std::getenv("BRAE_AMG_MERGE");
+    if (e)
+    {
+        const int v = std::atoi(e);
+        return v > 0 ? v : 1;
+    }
+    return (smallMeshMergeCells > 0 && nFine <= smallMeshMergeCells) ? 2 : 1;
+}
+
+namespace {
+
+double amgSocBeta()
+{
+    const char* e = std::getenv("BRAE_AMG_SOC");
+    return e ? std::atof(e) : 0.0;
+}
+
+// THE COARSE FACES OF ONE AGGLOMERATION: the unique (lower, higher) coarse-cell pairs in owner-sorted order (the
+// coarse SpMV needs that order), each fine face's coarse face (or -1 - cell for a face inside an agglomerate) and
+// flip, and the coarse face weights (the sum of the fine ones, added in ascending fine face).
+// coarseFacesBySort is how it was done: every crossing face's pair into one vector, a global sort, unique, and
+// a binary search a fine face. MEASURED on damBreakWithObstacle (42k to 91k cells, a hierarchy built at 0.8 of
+// the steps): 27 of the build's 38 ms a step were these two -- the sort 11.7, the searches 15.2.
+// coarseFacesByBucket gives the SAME lists in linear time: the crossing faces bucketed by their lower coarse cell
+// (a counting sort), each bucket -- a handful of entries -- sorted by the higher cell, a run of equal ones being
+// one coarse face. Buckets in ascending lower cell and runs in ascending higher cell IS the lexicographic order
+// of the pairs. The weights are added in a last pass over the fine faces in ascending order, as the sort-based
+// form adds them, so the sums are the same bits.
+//   BRAE_CONTROL_AMG_COARSE_FACES_SORT=1      the global sort, as before
+//   BRAE_CONTROL_AMG_COARSE_FACES_CHECK=1     both, compared entry for entry
+//   BRAE_CONTROL_AMG_COARSE_FACES_UNSORTED=1  a gate's CONTROL, deliberately wrong: the buckets are not sorted
+void coarseFacesBySort(
+    const std::vector<label>&  owner,
+    const std::vector<label>&  nei,
+    const std::vector<scalar>& fw,
+    const std::vector<label>&  map,
+    std::vector<label>&        cOwn,
+    std::vector<label>&        cNei,
+    std::vector<label>&        faceRestrict,
+    std::vector<label>&        faceFlip,
+    std::vector<scalar>&       cfw)
+{
+    const int nFaces = static_cast<int>(owner.size());
+    std::vector<std::pair<label,label>> pr;
+    pr.reserve(nFaces);
+    for (int f = 0; f < nFaces; ++f)
+    {
+        const label co=map[owner[f]], cn=map[nei[f]];
+        if (co!=cn) pr.emplace_back(std::min(co,cn), std::max(co,cn));
+    }
+    std::sort(pr.begin(), pr.end());
+    pr.erase(std::unique(pr.begin(), pr.end()), pr.end());
+    const int nCF = static_cast<int>(pr.size());
+    cOwn.assign(nCF, 0);
+    cNei.assign(nCF, 0);
+    faceRestrict.assign(nFaces, 0);
+    faceFlip.assign(nFaces, 0);
+    for (int i = 0; i < nCF; ++i)
+    {
+        cOwn[i]=pr[i].first;
+        cNei[i]=pr[i].second;
+    }
+    auto findCF = [&](
+        label a,
+        label b)
+    {
+        return static_cast<label>(std::lower_bound(pr.begin(), pr.end(), std::make_pair(a, b)) - pr.begin());
+    };
+    cfw.assign(nCF, 0.0);
+    for (int f = 0; f < nFaces; ++f)
+    {
+        const label co=map[owner[f]], cn=map[nei[f]];
+        if (co==cn)
+        {
+            faceRestrict[f]=-1-co;
+            faceFlip[f]=0;
+        }
+        else
+        {
+            const label cf=findCF(std::min(co,cn),std::max(co,cn));
+            faceRestrict[f]=cf;
+            faceFlip[f]=(co>cn)?1:0;
+            cfw[cf]+=fw[f];
+        }
+    }
+}
+
+void coarseFacesByBucket(
+    const std::vector<label>&  owner,
+    const std::vector<label>&  nei,
+    const std::vector<scalar>& fw,
+    const std::vector<label>&  map,
+    label                      nCoarse,
+    std::vector<label>&        cOwn,
+    std::vector<label>&        cNei,
+    std::vector<label>&        faceRestrict,
+    std::vector<label>&        faceFlip,
+    std::vector<scalar>&       cfw)
+{
+    static const bool unsorted = std::getenv("BRAE_CONTROL_AMG_COARSE_FACES_UNSORTED") != nullptr;
+    const int nFaces = static_cast<int>(owner.size());
+    faceRestrict.assign(nFaces, 0);
+    faceFlip.assign(nFaces, 0);
+    // the crossing faces, bucketed by their lower coarse cell
+    std::vector<label> start(static_cast<std::size_t>(nCoarse) + 1, 0);
+    for (int f = 0; f < nFaces; ++f)
+    {
+        const label co = map[owner[f]];
+        const label cn = map[nei[f]];
+        if (co != cn) ++start[std::min(co, cn) + 1];
+    }
+    for (label c = 0; c < nCoarse; ++c)
+    {
+        start[c + 1] += start[c];
+    }
+    const label nCross = start[nCoarse];
+    // an entry: the higher coarse cell and the fine face
+    std::vector<std::pair<label,label>> entry(static_cast<std::size_t>(nCross));
+    {
+        std::vector<label> at(start.begin(), start.end() - 1);
+        for (int f = 0; f < nFaces; ++f)
+        {
+            const label co = map[owner[f]];
+            const label cn = map[nei[f]];
+            if (co != cn) entry[at[std::min(co, cn)]++] = std::make_pair(std::max(co, cn), static_cast<label>(f));
+        }
+    }
+    cOwn.clear();
+    cNei.clear();
+    cOwn.reserve(static_cast<std::size_t>(nCross));
+    cNei.reserve(static_cast<std::size_t>(nCross));
+    for (label c = 0; c < nCoarse; ++c)
+    {
+        const auto b = entry.begin() + start[c];
+        const auto e = entry.begin() + start[c + 1];
+        if (!unsorted) std::sort(b, e);
+        label last = -1;
+        for (auto it = b; it != e; ++it)
+        {
+            if (it->first != last)
+            {
+                last = it->first;
+                cOwn.push_back(c);
+                cNei.push_back(last);
+            }
+            faceRestrict[it->second] = static_cast<label>(cOwn.size()) - 1;
+        }
+    }
+    // the faces inside an agglomerate, the flips, and the weights in ascending fine face
+    cfw.assign(cOwn.size(), 0.0);
+    for (int f = 0; f < nFaces; ++f)
+    {
+        const label co = map[owner[f]];
+        const label cn = map[nei[f]];
+        if (co == cn)
+        {
+            faceRestrict[f] = -1 - co;
+            faceFlip[f] = 0;
+        }
+        else
+        {
+            faceFlip[f] = (co > cn) ? 1 : 0;
+            cfw[faceRestrict[f]] += fw[f];
+        }
+    }
+}
+
 // One pairwise agglomeration step (host): merge cells of a grid (owner/nei/faceWeights, nC cells) into a coarse
 // grid. Returns the cell->coarse map, the coarse addressing (cOwn/cNei + gather starts), the face restriction,
 // and the carried coarse face weights (sum of the agglomerated fine face weights) for the NEXT level.
@@ -215,6 +471,9 @@ Agglom agglomerate(
     const std::vector<scalar>& fw,
     int nC)
 {
+    // BRAE_INTER_PHASE_TIME: a level's agglomeration part by part (summed over the levels of a build)
+    std::optional<interPhase::Nested> part;
+    part.emplace("hierarchy: the cells' faces and the pairwise matching (host)");
     const int nFaces = static_cast<int>(owner.size());
     std::vector<label> nNbr(nC, 0);
     for (int f = 0; f < nFaces; ++f)
@@ -235,7 +494,7 @@ Agglom agglomerate(
     // Optional strength-of-connection filter (BRAE_AMG_SOC=beta; 0 disables). A face is strong when
     // fw[f] >= beta*sqrt(D[o]*D[m]), D = row-sum of fw; matching only strong faces gives semi-coarsening along
     // the strong direction on anisotropic meshes (sweet spot beta~0.05).
-    static const scalar socBeta = [](){ const char* e = std::getenv("BRAE_AMG_SOC"); return e ? std::atof(e) : 0.0; }();
+    static const scalar socBeta = amgSocBeta();
     std::vector<scalar> D;
     if (socBeta > 0.0)
     {
@@ -289,40 +548,46 @@ Agglom agglomerate(
         if (map[c] < 0) map[c] = nCoarse++;
     // Coarse-face dedup: unique (min,max) coarse-cell pairs in owner-sorted order (the coarse SpMV requires it).
     // sort+unique on a flat vector rather than a std::map: same ordering, cache-friendly, lookups are a binary search.
-    std::vector<std::pair<label,label>> pr;
-    pr.reserve(nFaces);
-    for (int f = 0; f < nFaces; ++f)
+    part.emplace("hierarchy: the coarse faces and each face's coarse face (host)");
+    std::vector<label> cOwn, cNei, faceRestrict, faceFlip;
+    std::vector<scalar> cfw;
+    static const bool bySort = std::getenv("BRAE_CONTROL_AMG_COARSE_FACES_SORT") != nullptr;
+    static const bool checkBoth = std::getenv("BRAE_CONTROL_AMG_COARSE_FACES_CHECK") != nullptr;
+    if (bySort)
     {
-        const label co=map[owner[f]], cn=map[nei[f]];
-        if (co!=cn) pr.emplace_back(std::min(co,cn), std::max(co,cn));
-    }
-    std::sort(pr.begin(), pr.end());
-    pr.erase(std::unique(pr.begin(), pr.end()), pr.end());
-    const int nCF = static_cast<int>(pr.size());
-    std::vector<label> cOwn(nCF), cNei(nCF), faceRestrict(nFaces), faceFlip(nFaces);
-    for (int i = 0; i < nCF; ++i)
-    {
-        cOwn[i]=pr[i].first;
-        cNei[i]=pr[i].second;
-    }
-    auto findCF = [&](label a, label b){ return static_cast<label>(std::lower_bound(pr.begin(), pr.end(), std::make_pair(a,b)) - pr.begin()); };
-    std::vector<scalar> cfw(nCF, 0.0);
-    for (int f = 0; f < nFaces; ++f)
-    {
-        const label co=map[owner[f]], cn=map[nei[f]];
-        if (co==cn)
+        static bool said = false;
+        if (!said)
         {
-            faceRestrict[f]=-1-co;
-            faceFlip[f]=0;
+            said = true;
+            std::printf("  *** CONTROL: the AMG hierarchy's coarse faces are found by the global sort, as before "
+                        "(BRAE_CONTROL_AMG_COARSE_FACES_SORT). ***\n");
         }
-        else
+        coarseFacesBySort(owner, nei, fw, map, cOwn, cNei, faceRestrict, faceFlip, cfw);
+    }
+    else
+    {
+        coarseFacesByBucket(owner, nei, fw, map, nCoarse, cOwn, cNei, faceRestrict, faceFlip, cfw);
+        if (checkBoth)
         {
-            const label cf=findCF(std::min(co,cn),std::max(co,cn));
-            faceRestrict[f]=cf;
-            faceFlip[f]=(co>cn)?1:0;
-            cfw[cf]+=fw[f];
+            std::vector<label> sOwn, sNei, sRestrict, sFlip;
+            std::vector<scalar> sW;
+            coarseFacesBySort(owner, nei, fw, map, sOwn, sNei, sRestrict, sFlip, sW);
+            const char* what = sOwn != cOwn || sNei != cNei ? "the coarse faces"
+                             : sRestrict != faceRestrict ? "a fine face's coarse face"
+                             : sFlip != faceFlip ? "a fine face's flip"
+                             : sW.size() != cfw.size()
+                            || (!sW.empty() && std::memcmp(sW.data(), cfw.data(), sW.size()*sizeof(scalar)) != 0)
+                             ? "the coarse face weights" : nullptr;
+            if (what)
+            {
+                throw std::runtime_error(
+                    std::string("brae buildAMG: BRAE_CONTROL_AMG_COARSE_FACES_CHECK: ") + what
+                    + " from the buckets are not the ones the global sort gives.");
+            }
         }
     }
+    part.emplace("hierarchy: the coarse gather lists (host)");
+    const int nCF = static_cast<int>(cOwn.size());
     std::vector<label> cOS(nCoarse+1,0), cLS(nCoarse+1,0), cLosort(nCF);
     for (int f=0;f<nCF;++f)
     {
@@ -801,6 +1066,7 @@ void finalizeAMG(
     AMGData& A,
     int nFine)
 {
+    interPhase::Nested timedFinal("hierarchy: the work vectors and graph caches (finalizeAMG)");
     const int G = A.nLevels();
     A.vAx.resize(G+1);
     A.vR.resize(G+1);
@@ -839,26 +1105,176 @@ void finalizeAMG(
 
 // Build the AMG hierarchy, or reload it from cacheDir/.brae_amgcache if a valid one is present (newer than the
 // polyMesh/owner file -> mesh unchanged). writeCache=true persists it (the "partition" step / BRAE_MESH_CACHE).
+// TWO PAIRWISE PASSES AS ONE LEVEL: `first` takes the fine grid to an intermediate one and `second` takes that
+// one further; the result takes the fine grid straight to the second's coarse grid. A fine face inside an
+// agglomerate of either pass is inside the merged one; a face that survives both carries both flips.
+// Pairwise agglomeration alone coarsens 2:1, so the coarse levels together hold more faces than the fine one
+// (RAS/DTCHull: 14 levels, 3.45M coarse faces under 2.5M fine); merged passes coarsen 4:1 or 8:1.
+Agglom composeAgglom(
+    const Agglom& first,
+    Agglom&& second)
+{
+    Agglom a = std::move(second);
+    std::vector<label> map(first.map.size());
+    for (std::size_t c = 0; c < map.size(); ++c)
+    {
+        map[c] = a.map[static_cast<std::size_t>(first.map[c])];
+    }
+    std::vector<label> faceRestrict(first.faceRestrict.size());
+    std::vector<label> faceFlip(first.faceRestrict.size());
+    for (std::size_t f = 0; f < faceRestrict.size(); ++f)
+    {
+        const label r1 = first.faceRestrict[f];
+        if (r1 < 0)
+        {
+            faceRestrict[f] = -1 - a.map[static_cast<std::size_t>(-1 - r1)];
+            faceFlip[f] = 0;
+            continue;
+        }
+        const label r2 = a.faceRestrict[static_cast<std::size_t>(r1)];
+        faceRestrict[f] = r2;
+        faceFlip[f] = (r2 < 0) ? 0 : (first.faceFlip[f] ^ a.faceFlip[static_cast<std::size_t>(r1)]);
+    }
+    a.map = std::move(map);
+    a.faceRestrict = std::move(faceRestrict);
+    a.faceFlip = std::move(faceFlip);
+    return a;
+}
+
+// WHAT A HIERARCHY IS BUILT BY, as one number: bump AMG_BUILD_VERSION whenever agglomerate, composeAgglom,
+// aggregateCompact, buildSmoothedP or coarsenRAPRecipe change what they produce for the same input -- a file
+// written before the change is then another build's and is not read.
+constexpr unsigned long long AMG_BUILD_VERSION = 1;
+
+namespace {
+
+// 64 bits over the bytes, eight at a time: not a cryptographic hash, a fingerprint two meshes do not share by
+// accident. MEASURED at 896,000 cells (28 MB of addressing and weights): 3.7 ms.
+struct Fingerprint
+{
+    unsigned long long h = 0x9E3779B97F4A7C15ull;
+
+    void word(unsigned long long w)
+    {
+        h ^= w;
+        h *= 0xFF51AFD7ED558CCDull;
+        h ^= h >> 33;
+    }
+    void bytes(
+        const void* p,
+        std::size_t n)
+    {
+        const unsigned char* b = static_cast<const unsigned char*>(p);
+        std::size_t i = 0;
+        for (; i + 8 <= n; i += 8)
+        {
+            unsigned long long w;
+            std::memcpy(&w, b + i, 8);
+            word(w);
+        }
+        if (i < n)
+        {
+            unsigned long long w = 0;
+            std::memcpy(&w, b + i, n - i);
+            word(w);
+        }
+        word(static_cast<unsigned long long>(n));
+    }
+    template<class T>
+    void value(const T& v)
+    {
+        bytes(&v, sizeof(T));
+    }
+    template<class T>
+    void list(const std::vector<T>& v)
+    {
+        bytes(v.data(), v.size()*sizeof(T));
+    }
+};
+
+}   // namespace
+
+unsigned long long amgHierarchySignature(
+    const std::vector<label>&  fineOwner,
+    const std::vector<label>&  fineNei,
+    const std::vector<scalar>& faceWeights,
+    int                        nFine,
+    bool                       smoothedAggregation)
+{
+    Fingerprint f;
+    f.value(AMG_BUILD_VERSION);
+    f.value(static_cast<unsigned long long>(sizeof(label)));
+    f.value(static_cast<unsigned long long>(sizeof(scalar)));
+    f.value(static_cast<long long>(nFine));
+    // (2 for a smoothed hierarchy since 2026-10-06: its triple-product recipe is kept, and so written, in
+    // destination order -- amgSaFixedOrder. A file from before is another build's and is built again once.)
+    f.value(static_cast<long long>(smoothedAggregation ? 2 : 0));
+    f.value(static_cast<long long>(useGS() ? 1 : 0));
+    f.value(static_cast<long long>(amgTarget()));
+    f.value(static_cast<long long>(amgMergeFor(nFine)));
+    f.value(amgSocBeta());
+    f.list(fineOwner);
+    f.list(fineNei);
+    f.list(faceWeights);
+    return f.h;
+}
+
+std::string amgCachePath(
+    const std::string& cacheDir,
+    bool               smoothedAggregation)
+{
+    return cacheDir + (smoothedAggregation ? "/.brae_amgcache_sa" : "/.brae_amgcache");
+}
+
 AMGData buildOrLoadAMG(
     const std::vector<label>& fineOwner,
     const std::vector<label>& fineNei,
     const std::vector<scalar>& faceWeights,
     int nFine,
     const std::string& cacheDir,
-    bool writeCache)
+    bool writeCache,
+    const bool* smoothedAggregation,
+    AMGCacheRead* how)
 {
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    const std::string amgPath = cacheDir + "/.brae_amgcache";
-    const std::string ownerPath = cacheDir + "/owner";
-    if (fs::exists(amgPath, ec) && fs::exists(ownerPath, ec)
-        && fs::last_write_time(amgPath, ec) >= fs::last_write_time(ownerPath, ec))
+    // BRAE_CONTROL_AMG_CACHE_STALE=1 is a gate's CONTROL, deliberately wrong: the file is read without asking
+    // whether it is this mesh's -- what every reader of it did before the signature
+    static const bool stale = std::getenv("BRAE_CONTROL_AMG_CACHE_STALE") != nullptr;
+    static const bool check = std::getenv("BRAE_CONTROL_AMG_CACHE_CHECK") != nullptr;
+    const bool sa = smoothedAggregation ? *smoothedAggregation : useSA();
+    const std::string amgPath = amgCachePath(cacheDir, sa);
+    std::optional<interPhase::Nested> part;
+    part.emplace("hierarchy: the mesh's signature, the cache's key");
+    const unsigned long long signature = amgHierarchySignature(fineOwner, fineNei, faceWeights, nFine, sa);
+    part.emplace("hierarchy: the cache file read");
+    AMGData A;
+    const AMGCacheRead read = readAMGCache(amgPath, A, signature, sa, !stale);
+    part.reset();
+    if (how) *how = read;
+    if (read == AMGCacheRead::loaded)
     {
-        AMGData A;
-        if (loadAMGCache(amgPath, A)) return A;     // warm: reuse the cached hierarchy
+        if (check)
+        {
+            const AMGData fresh = buildAMG(fineOwner, fineNei, faceWeights, nFine, &sa);
+            const char* what = firstAMGDifference(A, fresh);
+            if (what)
+            {
+                throw std::runtime_error(
+                    std::string("brae buildOrLoadAMG: BRAE_CONTROL_AMG_CACHE_CHECK: of the hierarchy read from ")
+                    + amgPath + ", " + what + " is not what building it for this mesh gives.");
+            }
+        }
+        return A;     // warm: the cached hierarchy is this mesh's and this build's
     }
-    AMGData A = buildAMG(fineOwner, fineNei, faceWeights, nFine);
-    if (writeCache) writeAMGCache(A, amgPath);
+    A = buildAMG(fineOwner, fineNei, faceWeights, nFine, &sa);
+    if (writeCache)
+    {
+        part.emplace("hierarchy: the cache file written");
+        if (!writeAMGCache(A, amgPath, signature))
+        {
+            std::printf("brae NOTICE: the AMG hierarchy could not be written to %s (no space, or no permission); "
+                        "the run goes on and the next one builds it again\n", amgPath.c_str());
+        }
+    }
     return A;
 }
 
@@ -866,17 +1282,15 @@ AMGData buildAMG(
     const std::vector<label>& fineOwner,
     const std::vector<label>& fineNei,
     const std::vector<scalar>& faceWeights,
-    int nFine)
+    int nFine,
+    const bool* smoothedAggregation)
 {
     // Keep coarsening until the coarsest grid is <= TARGET cells. Overridable (BRAE_AMG_TARGET)
     // so a tiny mesh can still be made to build a real hierarchy: the demo/teaching cases are
     // below the default target and would otherwise get zero levels (coarsest solve only).
-    static const int TARGET = []()
-    {
-        const char* e = std::getenv("BRAE_AMG_TARGET");
-        const int v = e ? std::atoi(e) : 64;
-        return v > 0 ? v : 64;
-    }();
+    static const int TARGET = amgTarget();
+    // (not static: the rule is the fine grid's, and a refining mesh's hierarchy is built at more than one size)
+    const int MERGE = amgMergeFor(nFine);
     AMGData A;
     A.nFine = nFine;
     // Multicolor Gauss-Seidel smoother (BRAE_AMG_GS): color every smoothed grid once at build (host, static geometry).
@@ -891,7 +1305,7 @@ AMGData buildAMG(
     };
     const bool gs = useGS();
     A.gsSmooth = gs;
-    const bool sa = useSA();
+    const bool sa = smoothedAggregation ? *smoothedAggregation : useSA();
     A.saSmooth = sa;                    // smoothed aggregation (BRAE_AMG_SA): general RAP coarse op
     std::vector<label> owner = fineOwner, nei = fineNei;
     std::vector<scalar> fw = faceWeights;
@@ -899,7 +1313,7 @@ AMGData buildAMG(
     HostLdu proxy;
     if (sa) proxy = proxyLaplacian(fineOwner, fineNei, faceWeights, nFine);   // level-0 geometric proxy
     // SA strength-of-connection filter (BRAE_AMG_SOC, 0 = OFF = every neighbour strong), feeds compact aggregation.
-    static const double saSoc = [](){ const char* e = std::getenv("BRAE_AMG_SOC"); return e ? std::atof(e) : 0.0; }();
+    static const double saSoc = amgSocBeta();
     if (gs) pushColoring(greedyColor(fineOwner, fineNei, nFine));   // coloring[0] = fine grid
     while (n > TARGET)
     {
@@ -907,24 +1321,44 @@ AMGData buildAMG(
         {
             Agglom a = agglomerate(owner, nei, fw, n);
             if (a.nCoarse >= n || a.nCoarseFaces == 0) break;   // no further coarsening possible
+            // k pairwise passes a level (composeAgglom, amgMergeFor): one, or two on a small mesh.
+            // MEASURED on RAS/DTCHull's p_rgh, 25 steps, solve ms a step / PCG iterations: 1 pass 115.5 / 921,
+            // 2 passes 116.3 / 1262 (each cycle cheaper, more of them), 2 passes with two sweeps each side
+            // 116.8 / 938, 3 passes 136.9 / 1279 -- flat at that size, so one pass stays there.
+            for (int pass = 1; pass < MERGE && a.nCoarse > TARGET; ++pass)
+            {
+                Agglom next = agglomerate(a.cOwn, a.cNei, a.coarseFaceWeights, a.nCoarse);
+                if (next.nCoarse >= a.nCoarse || next.nCoarseFaces == 0) break;
+                a = composeAgglom(a, std::move(next));
+            }
             if (gs) pushColoring(greedyColor(a.cOwn, a.cNei, a.nCoarse));   // coloring[k+1] = coarse grid k+1
             AMGLevel L;
             L.nFine = n;
             L.nCoarse = a.nCoarse;
             L.nCoarseFaces = a.nCoarseFaces;
-            L.map.copyFrom(a.map);
-            L.cOwn.copyFrom(a.cOwn);
-            L.cNei.copyFrom(a.cNei);
-            L.cOwnerStart.copyFrom(a.cOS);
-            L.cLosort.copyFrom(a.cLosort);
-            L.cLosortStart.copyFrom(a.cLS);
-            L.faceRestrict.copyFrom(a.faceRestrict);
-            L.faceFlip.copyFrom(a.faceFlip);
-            buildGalerkinGather(L, a, n);
-            L.cDiag.resize(a.nCoarse);
-            L.cUpper.resize(a.nCoarseFaces);
-            L.cLower.resize(a.nCoarseFaces);
-            A.level.push_back(std::move(L));
+            {
+                interPhase::Nested timedUp("hierarchy: a level's addressing uploaded");
+                L.map.copyFrom(a.map);
+                L.addressingId = nextDeviceAddressingId();
+                L.cOwn.copyFrom(a.cOwn);
+                L.cNei.copyFrom(a.cNei);
+                L.cOwnerStart.copyFrom(a.cOS);
+                L.cLosort.copyFrom(a.cLosort);
+                L.cLosortStart.copyFrom(a.cLS);
+                L.faceRestrict.copyFrom(a.faceRestrict);
+                L.faceFlip.copyFrom(a.faceFlip);
+            }
+            {
+                interPhase::Nested timedGather("hierarchy: the Galerkin gather lists (host) and their upload");
+                buildGalerkinGather(L, a, n);
+            }
+            {
+                interPhase::Nested timedRest("hierarchy: a level's coarse matrix sized, the level kept");
+                L.cDiag.resize(a.nCoarse);
+                L.cUpper.resize(a.nCoarseFaces);
+                L.cLower.resize(a.nCoarseFaces);
+                A.level.push_back(std::move(L));
+            }
             owner = std::move(a.cOwn);
             nei = std::move(a.cNei);
             fw = std::move(a.coarseFaceWeights);
@@ -945,6 +1379,7 @@ AMGData buildAMG(
             L.nCoarse = a.nCoarse;
             L.nCoarseFaces = nCF;
             L.map.copyFrom(a.map);                              // retained for uniformity (SA uses the sparse P, not map)
+            L.addressingId = nextDeviceAddressingId();
             L.cOwn.copyFrom(C.lowerAddr);
             L.cNei.copyFrom(C.upperAddr);   // coarse SpMV addressing from RAP faces (owner<nbr)
             std::vector<label> cOS(a.nCoarse+1, 0), cLS(a.nCoarse+1, 0), cLosort(nCF);
@@ -978,6 +1413,7 @@ AMGData buildAMG(
             L.rapDstKind.copyFrom(rec.dstKind);
             L.rapDstIdx.copyFrom(rec.dstIdx);
             L.rapW.copyFrom(rec.w);
+            amgSaFixedOrder(L);
             A.level.push_back(std::move(L));
             std::vector<scalar> cfw(nCF);                        // next level's agglomeration weights = |coarse off-diag|
             for (int f = 0; f < nCF; ++f)
@@ -1004,12 +1440,179 @@ AMGData buildAMG(
     return A;
 }
 
+namespace
+{
+// a[i] and b[i] as bit patterns: +0 and -0 differ, a NaN is itself. Every thread that finds a difference
+// writes the same 1, so the unordered writes are one answer.
+__global__
+void sameBitsK(
+    int n,
+    const scalar* __restrict__ a,
+    const scalar* __restrict__ b,
+    int* __restrict__ differs)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (__double_as_longlong(a[i]) != __double_as_longlong(b[i]))
+    {
+        *differs = 1;
+    }
+}
+}   // namespace
+
+const int* amgFineCompare(
+    AMGData& A,
+    const DeviceBuffer<scalar>& fineDiag,
+    const DeviceBuffer<scalar>& fineUpper,
+    const DeviceBuffer<scalar>& fineLower)
+{
+    if (!A.keptValid || A.keptDiag.size() != fineDiag.size() || A.keptUpper.size() != fineUpper.size()
+     || A.keptLower.size() != fineLower.size())
+    {
+        return nullptr;
+    }
+    A.keptDiffers.resize(1);
+    cudaCheck(cudaMemsetAsync(A.keptDiffers.data(), 0, sizeof(int), cudaStreamPerThread), "amgFineCompare");
+    const int nC = static_cast<int>(fineDiag.size());
+    const int nF = static_cast<int>(fineUpper.size());
+    sameBitsK<<<nBlocks(nC),TPB>>>(nC, fineDiag.data(), A.keptDiag.data(), A.keptDiffers.data());
+    if (nF > 0)
+    {
+        sameBitsK<<<nBlocks(nF),TPB>>>(nF, fineUpper.data(), A.keptUpper.data(), A.keptDiffers.data());
+        sameBitsK<<<nBlocks(nF),TPB>>>(nF, fineLower.data(), A.keptLower.data(), A.keptDiffers.data());
+    }
+    cudaCheck(cudaGetLastError(), "amgFineCompare");
+    return A.keptDiffers.data();
+}
+
+void amgGalerkinKept(
+    AMGData& A,
+    const DeviceBuffer<scalar>& fineDiag,
+    const DeviceBuffer<scalar>& fineUpper,
+    const DeviceBuffer<scalar>& fineLower)
+{
+    amgGalerkin(A, fineDiag, fineUpper, fineLower);
+    deviceCopy(A.keptDiag, fineDiag);
+    deviceCopy(A.keptUpper, fineUpper);
+    deviceCopy(A.keptLower, fineLower);
+    A.keptValid = true;
+}
+
+void amgGalerkinStands(AMGData& A)
+{
+    A.fp32Stands = A.fp32Current;
+}
+
+
+void amgSaFixedOrder(AMGLevel& L)
+{
+    const int nC = L.nCoarse;
+    const int nCF = L.nCoarseFaces;
+    if (L.Prow.size() == 0)
+    {
+        L.Rrow.resize(0);
+        L.Rfine.resize(0);
+        L.Rval.resize(0);
+        L.RvalF.resize(0);
+        L.rapStart.resize(0);
+        L.Rterm.resize(0);
+        L.RtermF.resize(0);
+        L.rapTerm.resize(0);
+        return;
+    }
+    // P^T by coarse row: a counting sort of P's entries by column, the fine rows met in ascending order
+    const std::vector<label> rowPtr = L.Prow.host();
+    const std::vector<label> col = L.Pcol.host();
+    const std::vector<scalar> val = L.Pval.host();
+    const int nF = static_cast<int>(rowPtr.size()) - 1;
+    std::vector<label> rRow(nC + 1, 0);
+    for (const label c : col)
+    {
+        ++rRow[c + 1];
+    }
+    for (int c = 0; c < nC; ++c)
+    {
+        rRow[c + 1] += rRow[c];
+    }
+    std::vector<label> at(rRow.begin(), rRow.end() - 1);
+    std::vector<label> rFine(col.size());
+    std::vector<scalar> rVal(col.size());
+    for (int f = 0; f < nF; ++f)
+    {
+        for (label k = rowPtr[f]; k < rowPtr[f + 1]; ++k)
+        {
+            const label j = at[col[k]]++;
+            rFine[j] = f;
+            rVal[j] = val[k];
+        }
+    }
+    L.Rrow.copyFrom(rRow);
+    L.Rfine.copyFrom(rFine);
+    L.Rval.copyFrom(rVal);
+    // (the products' buffers: fixed addresses for the life of the level, as a captured cycle needs)
+    L.Rterm.resize(rVal.size());
+    L.RtermF.resize(rVal.size());
+    L.rapTerm.resize(L.nTriples);
+    // (the single-precision values are cast with the prolongator's, amgPrepareFP32)
+    L.RvalF.resize(0);
+    // the triples by destination: diagonals, then upper faces, then lower faces; the recipe's order within one
+    std::vector<label> dstKind = L.rapDstKind.host();
+    std::vector<label> dstIdx = L.rapDstIdx.host();
+    const int nDest = nC + 2*nCF;
+    const auto dest = [&](std::size_t t)
+    {
+        return dstKind[t] == 0 ? dstIdx[t] : dstKind[t] == 1 ? nC + dstIdx[t] : nC + nCF + dstIdx[t];
+    };
+    std::vector<label> start(nDest + 1, 0);
+    for (std::size_t t = 0; t < dstKind.size(); ++t)
+    {
+        ++start[dest(t) + 1];
+    }
+    for (int d = 0; d < nDest; ++d)
+    {
+        start[d + 1] += start[d];
+    }
+    std::vector<label> next(start.begin(), start.end() - 1);
+    std::vector<label> order(dstKind.size());
+    bool sorted = true;
+    for (std::size_t t = 0; t < dstKind.size(); ++t)
+    {
+        const label to = next[dest(t)]++;
+        order[to] = static_cast<label>(t);
+        sorted = sorted && to == static_cast<label>(t);
+    }
+    L.rapStart.copyFrom(start);
+    if (sorted)
+    {
+        return;
+    }
+    // the recipe's five lists in that order, so that a destination's triples are read one after another
+    const auto permuted = [&](const auto& from)
+    {
+        auto to = from;
+        for (std::size_t k = 0; k < order.size(); ++k)
+        {
+            to[k] = from[order[k]];
+        }
+        return to;
+    };
+    L.rapSrcKind.copyFrom(permuted(L.rapSrcKind.host()));
+    L.rapSrcIdx.copyFrom(permuted(L.rapSrcIdx.host()));
+    L.rapW.copyFrom(permuted(L.rapW.host()));
+    L.rapDstKind.copyFrom(permuted(dstKind));
+    L.rapDstIdx.copyFrom(permuted(dstIdx));
+}
+
 void amgGalerkin(
     AMGData& A,
     const DeviceBuffer<scalar>& fineDiag,
     const DeviceBuffer<scalar>& fineUpper,
     const DeviceBuffer<scalar>& fineLower)
 {
+    // the coarse matrices are about to change: nothing kept describes them, and no cast is theirs
+    A.keptValid = false;
+    A.fp32Current = false;
+    A.fp32Stands = false;
     for (int k = 0; k < A.nLevels(); ++k)                      // grid k matrix -> grid k+1 (Galerkin scatter)
     {
         AMGLevel& L = A.level[k];
@@ -1033,14 +1636,35 @@ void amgGalerkin(
         }
         if (A.saSmooth)                                          // general Galerkin A_c = P^T A P (precomputed RAP recipe)
         {
-            // The SA path still SCATTERS, so it is still order-dependent. It is opt-in (BRAE_AMG_SA) and
-            // off by default; leaving it as it was keeps this change to one behaviour at a time. The
-            // determinism gate asserts the DEFAULT path, and the SA path is listed as a known gap.
-            zeroT<scalar><<<nBlocks(L.nCoarse),TPB>>>(L.nCoarse, L.cDiag.data());
-            zeroT<scalar><<<nBlocks(L.nCoarseFaces),TPB>>>(L.nCoarseFaces, L.cUpper.data());
-            zeroT<scalar><<<nBlocks(L.nCoarseFaces),TPB>>>(L.nCoarseFaces, L.cLower.data());
-            rapScatterK<<<nBlocks(L.nTriples),TPB>>>(L.nTriples, L.rapSrcKind.data(), L.rapSrcIdx.data(), L.rapW.data(),
-                L.rapDstKind.data(), L.rapDstIdx.data(), fd, fu, fl, L.cDiag.data(), L.cUpper.data(), L.cLower.data());
+            // GATHERED IN A FIXED ORDER, as the injection path below has been: this scattered with atomicAdd
+            // while the smoothed hierarchy was opt-in, and stayed so after pcorr on a 2-D moving mesh took it
+            // by default (AMGLevel::rapStart has what that cost). BRAE_CONTROL_AMG_SA_SCATTER=1 scatters.
+            if (amgSaScatter())
+            {
+                zeroT<scalar><<<nBlocks(L.nCoarse),TPB>>>(L.nCoarse, L.cDiag.data());
+                zeroT<scalar><<<nBlocks(L.nCoarseFaces),TPB>>>(L.nCoarseFaces, L.cUpper.data());
+                zeroT<scalar><<<nBlocks(L.nCoarseFaces),TPB>>>(L.nCoarseFaces, L.cLower.data());
+                rapScatterK<<<nBlocks(L.nTriples),TPB>>>(
+                    L.nTriples, L.rapSrcKind.data(), L.rapSrcIdx.data(), L.rapW.data(),
+                    L.rapDstKind.data(), L.rapDstIdx.data(), fd, fu, fl,
+                    L.cDiag.data(), L.cUpper.data(), L.cLower.data());
+            }
+            else
+            {
+                const int nDest = L.nCoarse + 2*L.nCoarseFaces;
+                if (static_cast<int>(L.rapStart.size()) != nDest + 1)
+                {
+                    throw std::runtime_error(
+                        "brae AMG: a smoothed-aggregation level has no fixed-order list of its triple product "
+                        "(amgSaFixedOrder was not run where the level's recipe was set)");
+                }
+                rapTermsK<<<nBlocks(L.nTriples),TPB>>>(
+                    L.nTriples, L.rapSrcKind.data(), L.rapSrcIdx.data(), L.rapW.data(), fd, fu, fl,
+                    L.rapTerm.data());
+                rapSumK<<<nBlocks(nDest),TPB>>>(
+                    nDest, L.nCoarse, L.nCoarseFaces, amgSaGatherReversed() ? 1 : 0, L.rapStart.data(),
+                    L.rapTerm.data(), L.cDiag.data(), L.cUpper.data(), L.cLower.data());
+            }
         }
         else       // injection Galerkin (default): fixed-order GATHER per coarse entity, no pre-zero needed
         {

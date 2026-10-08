@@ -208,6 +208,7 @@ StepInput buildStepInput(
                 "represents only those two and the capped `limited <psi>`; refusing rather than running "
                 "one of them under the case's name.");
         in.correctedLaplacian = sctl.nonOrth;
+        in.nonOrthCoeffs = sctl.nonOrthCoeffs;
         in.snGradLimitCoeff   = (sctl.nonOrth && sctl.nonOrthLimit < 1.0) ? sctl.nonOrthLimit : 0.0;
         // snGradSchemes, the OTHER block, for fvc::snGrad alone. Same three regimes and the same
         // refusal: `limited 0` is nonOrthDeltaCoeffs with the explicit correction zeroed, which
@@ -219,6 +220,7 @@ StepInput buildStepInput(
                 "correction, which is neither `orthogonal` nor `corrected`; fvc::snGrad here carries one "
                 "flag for both halves. Refusing rather than running a neighbour under the case's name.");
         in.correctedFvcSnGrad  = sctl.snGradCorrected;
+        in.fvcSnGradNonOrthCoeffs = sctl.snGradNonOrthCoeffs;
         in.fvcSnGradLimitCoeff = (sctl.snGradCorrected && sctl.snGradLimit < 1.0) ? sctl.snGradLimit : 0.0;
         in.gradULimitK        = sctl.gradULimitK;
         in.gradKLimitK        = sctl.gradKLimitK;
@@ -489,8 +491,15 @@ StepInput buildStepInput(
                     "would be a substituted discretisation)";
             else
             {
-                in.turbLimGradK      = gK.cellLimitK;
-                in.turbLimGradLeastSq = gK.leastSquares;
+                // THE SAME TWO FIELDS the block above wrote, on purpose. grad(k) is ONE fvSchemes
+                // entry and the closures now carry it once (`co.gradKLimitK`, `co.gradKLeastSq`);
+                // this used to be a second pair (`turbLimGradK`/`turbLimGradLeastSq`) carried in
+                // parallel, and a site that filled one and not the other ran a scheme the case did
+                // not name. The block above guards `leastSquares` on whether a gradient is taken at
+                // all, which is false for a case whose ONLY reader is the limiter -- so when the
+                // limiter is on, the unguarded parse is written here, after it.
+                in.gradKLimitK  = gK.cellLimitK;
+                in.gradKLeastSq = gK.leastSquares;
             }
         }
     }

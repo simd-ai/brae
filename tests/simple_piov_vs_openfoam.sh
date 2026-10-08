@@ -3,18 +3,46 @@
 # ships -- validation/piov (simpleFoam, laminar, a pressure-driven inlet with backflow allowed) against
 # validation/piov_of/393, real simpleFoam's converged answer for the same case.
 #
-# WHY THIS EXISTS. The piov device kernel (device_boundary_flow.cu, deviceUpdatePressureInletOutletVelocity)
-# and the host class (fv_patch_field.cuh, PressureInletOutletVelocityPatchField) are SHARED between the
-# rhoSimpleFoam mirror and the shipped incompressible driver (device_simple_foam.cu), and until this file
-# no registered test ran an incompressible piov fixture: queue item 22. Item 19 rewrote both for the
-# compressible mirror (OpenFOAM's directionMixed coefficients, gated at 1e-12 on rhoTP) and the shipped
-# `brae` binary on THIS case moved from the fixture's recorded U 1.15e-04 / p 1.09e-03 (validation/piov_cf,
-# 378 iterations) to U 1.49e-03 / p 1.29e-02 at 394 iterations -- a change the mirror's gates could not
-# see. Bisected 2026-09-03 with the host class held new: the KERNEL typing alone moves it (old kernel
-# 1.1459e-04 / 1.0915e-03, exactly the fixture's record). The kernel now carries a `directionMixed` mode
-# the mirror asks for and the frozen driver does not, and this gate holds the driver at its record:
-# bounds ~3.5x it. Fail-proof: the directionMixed form forced on the legacy call site reads
-# U 1.4911e-03 / p 1.2878e-02 and FAILS both rows.
+# WHY THIS EXISTS, and what it finally found (2026-09-22). The piov device kernel
+# (device_boundary_flow.cu, deviceUpdatePressureInletOutletVelocity) and the host class
+# (fv_patch_field.cuh, PressureInletOutletVelocityPatchField) are SHARED between the rhoSimpleFoam
+# mirror and the shipped incompressible driver (device_simple_foam.cu), and until this file no
+# registered test ran an incompressible piov fixture: queue item 22. Item 19 rewrote both for the
+# compressible mirror -- OpenFOAM's directionMixed coefficients, gated at 1e-12 on rhoTP -- and the
+# shipped binary on THIS case got WORSE with them, from U 1.15e-04 to 1.49e-03 and later to no
+# convergence at all. That looked like the legacy typing being "closer to OpenFOAM". It was not.
+#
+# THE TWO WERE A COMPENSATING PAIR, and both halves are fixed now:
+#   1. THE TYPING. Every inflow component was typed fixedValue at n(n.U_cell). OpenFOAM's piov is a
+#      directionMixed whose valueFraction is neg(phi)*(I - sqr(nf())): the NORMAL component is free
+#      (zeroGradient) and only the tangential ones are fixed
+#      (pressureInletOutletVelocityFvPatchVectorField.C, directionMixedFvPatchField.C:139-155).
+#   2. THE SHARED DIAGONAL. device_simple_foam.cu folded the boundary diagonal into A() as
+#      `hasSym_ ? cmptAvIC : iC[0]` -- the per-component average ONLY when a symmetry/slip patch
+#      exists. A directionMixed piov has the same per-component asymmetry (at these backflow faces
+#      iC.x = -5.63e-05 against iC.y = +8.33e-04, a factor of fifteen) and set no such flag, so the X
+#      component was folded into a diagonal all three share. With the LEGACY typing all three agree,
+#      so iC[0] IS the average and the defect could not be seen. The fold now keys on hasCmptBC_ --
+#      symmetry, wedge OR piov -- and H()'s matching bdDiag term with it.
+#
+# HOW IT WAS FOUND, because the route matters more than the fix: the gap first showed on
+# incompressible/pimpleFoam/RAS/TJunction (U 7.1e-03 against real pimpleFoam). A laminar twin, every
+# solver pinned at 1e-14/relTol 0, and `Gauss upwind` for the case's limitedLinearV each moved it
+# nowhere; a plain fixedValue inlet moved it to 5.6e-04, which named the piov patch. Then both codes
+# were run ONE iteration from OpenFOAM's converged 393 with tools/dumpSimpleFoam (extended to dump the
+# y and z SOLVE systems: internalCoeffs and boundaryCoeffs are VECTORS, so an x-only dump cannot see a
+# defect that lives in y) against brae's BRAE_DUMP_STAGE. That said the momentum matrix was OpenFOAM's
+# to round-off -- residual 1.7473e-10 against 1.7472e-10 over the nine backflow cells -- while HbyA was
+# exact everywhere in the field (median 6.6e-11) EXCEPT those same cells (2.78e-02), with phiHbyA
+# inheriting its percentages face for face. Matrix right, HbyA wrong, patch value equal to the cell
+# value in both codes: the only ingredient left was rAU, and rAU is where the fold lives.
+#
+# MEASURED, both halves in: brae converges at iteration 393 -- OpenFOAM's own count -- and reads
+# U 4.0249e-09 and p 2.1312e-08 against OpenFOAM's converged answer, from 1.1459e-04 and 1.0915e-03.
+# The bounds below are that measurement.
+# BROKEN ONCE EACH: the fold back to `hasSym_ ? ... : iC[0]` with the typing kept -- the run DIVERGES
+# at iteration 417 (non-finite p and Ux); the legacy typing back with the fold fixed -- U 1.1477e-04
+# and p 1.0931e-03, five orders outside the bounds, which is the old answer to the digit.
 #
 # The comparison is CONVERGED (both runs stop on the case's own residualControl), so it cannot see an
 # ordering defect -- only a boundary-condition or matrix-coefficient one, which is what it is here for.
@@ -25,8 +53,11 @@ BIN="$BUILDDIR/brae"
 SRC="$ROOT/validation/piov"
 REF="$ROOT/validation/piov_of/393"
 OFBASHRC=${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
-U_BOUND=${U_BOUND:-4e-04}
-P_BOUND=${P_BOUND:-4e-03}
+# THE BOUNDS ARE THE MEASUREMENT, and they moved by five orders when the compensation was resolved
+# (see the header): brae now converges at iteration 393, OpenFOAM's own count, and reads
+# U 4.0249e-09 / p 2.1312e-08 against its converged answer. Pinned at ~5x that.
+U_BOUND=${U_BOUND:-2e-08}
+P_BOUND=${P_BOUND:-1e-07}
 
 [ -x "$BIN" ]      || { echo "SKIP: $BIN not built"; exit 77; }
 [ -d "$SRC" ]      || { echo "SKIP: fixture $SRC missing"; exit 77; }

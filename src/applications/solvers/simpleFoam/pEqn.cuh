@@ -16,6 +16,7 @@
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
+#include "device_cyclic.cuh"
 #include "device_boundary.cuh"
 #include "device_MRF.cuh"
 #include "device_ldu.cuh"
@@ -26,6 +27,12 @@ namespace gpu {
 
 struct PressureInput
 {
+    // H()'s TWO HALVES at a coupled mesh, x component, for bisecting HbyA: what the face loops build
+    // before the pair's off-diagonal is added, and the pair's own contribution alone. A gate sets
+    // these; they are null on every shipped run and cost nothing then.
+    DeviceBuffer<scalar>* hNoPairTap = nullptr;
+    DeviceBuffer<scalar>* hPairTap   = nullptr;
+
     // MRF.makeRelative(phiHbyA), pEqn.H:5 -- between fvc::flux(HbyA) and adjustPhi.
     const std::vector<DeviceMRFZone>* mrf = nullptr;
 
@@ -34,6 +41,7 @@ struct PressureInput
     scalar pRefValue = 0.0;
     bool   consistent = false;           // SIMPLEC -- implemented (pEqn.H:8-16)
     bool   correctedLaplacian = false;
+    bool   nonOrthCoeffs = false;        // nonOrthDeltaCoeffs with no correction -- solver_controls.cuh:226
     scalar snGradLimitCoeff = 0.0;   // `limited <k> corrected` (OF limitedSnGrad)   // `corrected` laplacianSchemes
     bool   hasMRF = false;       // refused
     bool   hasFvOptions = false; // refused
@@ -50,6 +58,16 @@ struct PressureInput
     // U patch is NOT assignable (constrainHbyA.C). fixedValue/noSlip/mixed/transform are not assignable;
     // zeroGradient is. The two masks differ on slip and inletOutlet, so they are two arguments.
     const DeviceBuffer<label>* takeUAtBoundary = nullptr;
+    // ...and U's STORED patch values, one buffer per component over the boundary faces, when the caller
+    // carries them. constrainHbyA assigns `U.boundaryField()[patchi]` (constrainHbyA.C:67) -- what U's last
+    // evaluate left, not an evaluate of its own. Null (or a wrong size) keeps the re-evaluation against the
+    // cells and the patch's coefficients as they stand, which is the same number only while neither has
+    // moved since that evaluate: a mixed patch whose updateCoeffs ran at the momentum assembly has, on the
+    // first corrector of a pass with no predictor.
+    const DeviceBuffer<scalar>* UbStored[3] = {nullptr, nullptr, nullptr};
+    // The pair. H() gains its off-diagonal (fvMatrix::H is diag*psi - sum(offdiag*psi), and a periodic
+    // neighbour is an off-diagonal like any other) and fvc::flux(HbyA) gains its faces.
+    DeviceCyclic* cyc = nullptr;
 };
 
 // Every intermediate of pEqn.H, in the order OpenFOAM produces them.
@@ -64,6 +82,9 @@ struct PressureStages
     DeviceBuffer<scalar> phiHbyAInt, phiHbyABnd;
     scalar massCorr = 1.0;
     bool   phiAdjusted = false;
+    // phiHbyA ON A PERIODIC PAIR. Not cyc.phi: that is the pair's own flux, state the correctors
+    // rewrite, and computing phiHbyA over it would lose the flux the step began with.
+    DeviceBuffer<scalar> phiHbyAIf;
 };
 
 // Stages 1-3: rAU, HbyA (constrained), phiHbyA (adjusted). Solves nothing.
@@ -100,6 +121,7 @@ struct PressureMatrix
         A.owner = dm.owner.data(); A.nei = dm.nei.data();
         A.ownerStart = dm.ownerStart.data();
         A.losort = dm.losort.data(); A.losortStart = dm.losortStart.data();
+        A.addressingId = dm.addressingId;
         return A;
     }
 };

@@ -95,6 +95,13 @@ prep()
     sed -i "s/^snGradSchemes    { default corrected; }/snGradSchemes    { default $2; }/" "$1/system/fvSchemes"
     grep -q "snGradSchemes    { default $2; }" "$1/system/fvSchemes" \
         || { echo "  could not set snGradSchemes to '$2'"; exit 1; }
+    # ...and the LAPLACIAN block, for the `uncorrected` arms. Via an env var, so the optional 4th
+    # positional (the seed directory) keeps its place.
+    if [ "${LAPW:-orthogonal}" != orthogonal ]; then
+        sed -i "s/^laplacianSchemes { default Gauss linear orthogonal; }/laplacianSchemes { default Gauss linear ${LAPW}; }/" "$1/system/fvSchemes"
+        grep -q "laplacianSchemes { default Gauss linear ${LAPW}; }" "$1/system/fvSchemes" \
+            || { echo "  could not set laplacianSchemes to '${LAPW}'"; exit 1; }
+    fi
     END="$3" python3 - "$1" <<'PREPPY'
 import os, re, sys
 c = os.path.join(sys.argv[1], 'system/controlDict'); s = open(c).read()
@@ -119,10 +126,27 @@ SEEDT=$(ls -d "$W/dev"/[1-9]* 2>/dev/null | xargs -n1 basename | sort -n | tail 
 [ -n "$SEEDT" ] || { echo "  no developed state written"; exit 1; }
 printf '  seed state: OpenFOAM at iteration %s\n' "$SEEDT"
 
-for spec in "of_split|corrected|of" "br_split|corrected|br" \
-            "of_agree|orthogonal|of" "br_agree|orthogonal|br"; do
-    IFS='|' read -r tag sng who <<< "$spec"
-    prep "$W/$tag" "$sng" 1 "$W/dev/$SEEDT"
+# `uncorrected` IS NOT `orthogonal`, AND THAT IS THE POINT OF THE LAST FOUR RUNS.
+# uncorrectedSnGrad.H:113-119 returns mesh().nonOrthDeltaCoeffs() exactly as correctedSnGrad.H:108-114
+# does and differs only in corrected(); only orthogonalSnGrad.H:113-119 returns deltaCoeffs(). brae's
+# SHARED parser tested `hasWord(ln, "corrected")`, which is word-boundaried, so the word `uncorrected`
+# matched nothing and the flag kept its default -- rhoSimpleFoam ran ORTHOGONAL under the case's own name,
+# in every one of its laplacians AND in the SIMPLEC fvc::snGrad(p).
+#
+# ONE WORD PER BLOCK, so each arm attributes to one half. THEIR CONTROLS ARE THE RUNS ALREADY STAGED:
+#   lapUnco (lap uncorrected, sng corrected)  -- control of_split (lap orthogonal, sng corrected)
+#   sngUnco (lap orthogonal,  sng uncorrected) -- control of_agree (lap orthogonal, sng orthogonal)
+# MEASURED, OpenFOAM against OpenFOAM at this gate's own seed and single iteration:
+#   laplacian half  p 1.187800e-06 (5.9x BOUND), U 5.050600e-03 (5.1x BOUND_U), T 2.53e-09, 1200/1200 cells
+#   snGrad half     p 6.520300e-07 (3.3x BOUND), U 2.565500e-03 (2.6x BOUND_U), T EXACTLY 0.0
+# T being exactly zero on the snGrad half is itself a check that the blocks stay separate: the energy
+# equation reads no fvc::snGrad, so its answer cannot move when only that block changes.
+for spec in "of_split|corrected|of|orthogonal" "br_split|corrected|br|orthogonal" \
+            "of_agree|orthogonal|of|orthogonal" "br_agree|orthogonal|br|orthogonal" \
+            "of_lapUnco|corrected|of|uncorrected" "br_lapUnco|corrected|br|uncorrected" \
+            "of_sngUnco|uncorrected|of|orthogonal" "br_sngUnco|uncorrected|br|orthogonal"; do
+    IFS='|' read -r tag sng who lapw <<< "$spec"
+    LAPW="$lapw" prep "$W/$tag" "$sng" 1 "$W/dev/$SEEDT"
     if [ "$who" = of ]; then
         ( cd "$W/$tag" && rhoSimpleFoam > log.run 2>&1 ) \
             || { echo "  OpenFOAM ($tag) failed"; tail -4 "$W/$tag/log.run"; exit 1; }
@@ -175,6 +199,32 @@ if armU > boundU: bad = 1
 
 print('  reported T                                           %-12.6e  (not gated)'
       % rel(rd(W + '/of_split/1/T'), rd(W + '/br_split/1/T')))
+
+# `uncorrected`: nonOrthDeltaCoeffs with NO correction flux, which brae read as `orthogonal`. One arm per
+# block, each against the run that differs from it in that block alone, and each with its own OF-vs-OF
+# control -- the shipped `orthogonal` answer, i.e. precisely what brae used to compute under the name.
+for label, armTag, ctlTag, ctlName in (('laplacian', 'lapUnco', 'of_split', 'orthogonal laplacian'),
+                                       ('snGrad   ', 'sngUnco', 'of_agree', 'orthogonal snGrad')):
+    ofArm = rd(W + '/of_' + armTag + '/1/p')
+    ctl = rel(ofArm, rd(W + '/' + ctlTag + '/1/p'))
+    print('  CONTROL  OpenFOAM p, uncorrected vs %-18s %-12.6e (needs >= %-9.3e) %s'
+          % (ctlName, ctl, cmin, 'OK' if ctl >= cmin else 'FAIL'))
+    if ctl < cmin: bad = 1
+    a = rel(ofArm, rd(W + '/br_' + armTag + '/1/p'))
+    print('  ARM p    %s uncorrected                        %-12.6e (bound %-9.3e) %s'
+          % (label, a, bound, 'OK' if a <= bound else 'FAIL'))
+    if a > bound: bad = 1
+    aU = rel(rd(W + '/of_' + armTag + '/1/U'), rd(W + '/br_' + armTag + '/1/U'))
+    print('  ARM U    %s uncorrected                        %-12.6e (bound %-9.3e) %s'
+          % (label, aU, boundU, 'OK' if aU <= boundU else 'FAIL'))
+    if aU > boundU: bad = 1
+
+# ...and the ENERGY equation must be untouched by the snGrad block alone, in OpenFOAM's own answer: it
+# assembles no fvc::snGrad, so a non-zero move here would mean the two blocks are not separate after all.
+tsng = rel(rd(W + '/of_sngUnco/1/T'), rd(W + '/of_agree/1/T'))
+print('  CHECK    OpenFOAM T, snGrad block alone              %-12.6e (must be 0) %s'
+      % (tsng, 'OK' if tsng == 0.0 else 'FAIL'))
+if tsng != 0.0: bad = 1
 sys.exit(bad)
 CMPPY
 rc=$?

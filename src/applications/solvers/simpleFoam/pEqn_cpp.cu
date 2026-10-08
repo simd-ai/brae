@@ -156,7 +156,13 @@ PressureStages pressurePredictor(
         std::vector<scalar> dR(st.rAU.size());
         for (std::size_t c = 0; c < dR.size(); ++c) dR[c] = st.rAtU[c] - st.rAU[c];
         const SurfaceScalarField dRf  = fvc::interpolate(dR, m, g, patches);
-        const SurfaceScalarField snGp = fvc::snGrad(p, m, g, patches, in.correctedLaplacian);
+        // THE INTERVENING DEFAULTS ARE WRITTEN OUT because the coefficient choice is the LAST parameter and
+        // has to be reached positionally. They are what this call already passed implicitly; that this
+        // snGrad takes the LAPLACIANSCHEMES flag rather than snGradSchemes' own is a separate defect
+        // (OpenFOAM resolves fvc::snGrad against snGradSchemes, fvcSnGrad.C:56-64) and is not changed here.
+        const SurfaceScalarField snGp = fvc::snGrad(p, m, g, patches, in.correctedLaplacian,
+                                                   /*leastSquares=*/false, /*cellLimitK=*/scalar(0),
+                                                   /*limitCoeff=*/scalar(0), in.nonOrthCoeffs);
         const std::vector<scalar>& magSf = g.magSf();
         for (std::size_t f = 0; f < st.phiHbyA.internal.size(); ++f)
             st.phiHbyA.internal[f] += dRf.internal[f] * snGp.internal[f] * magSf[f];
@@ -214,7 +220,7 @@ FvScalarMatrix assemblePEqn(
     // extrapolatedCalculated field (fvMatrix::A() sets that type), so this is the correct boundary value
     // rather than a convenience.
     const SurfaceScalarField rAUf = fvc::interpolate(st.rAtU, m, g, patches);
-    FvScalarMatrix pEqn = fvm::laplacian<scalar>(rAUf, p, m, g, patches, in.correctedLaplacian);
+    FvScalarMatrix pEqn = fvm::laplacian<scalar>(rAUf, p, m, g, patches, in.correctedLaplacian, in.nonOrthCoeffs);
     if (in.correctedLaplacian)
     {
         const std::vector<vector> gradP = fvc::gaussGrad(p, m, g, patches);

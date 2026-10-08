@@ -501,7 +501,7 @@ void assembleUEqn(
     // corrected" defect this port has already paid for on the energy and pressure equations (PORT.md:394).
     {
         DeviceBuffer<scalar>& lD = ws.lD; DeviceBuffer<scalar>& lU = ws.lU; DeviceBuffer<scalar>& lL = ws.lL;
-        deviceLaplacianCoeffs(dm, muFace, lD, lU, lL, in.correctedLaplacian);
+        deviceLaplacianCoeffs(dm, muFace, lD, lU, lL, in.correctedLaplacian || in.nonOrthCoeffs);
         deviceAxpy(-1.0, lD, M.diag);
         deviceAxpy(-1.0, lU, M.upper);
         deviceAxpy(-1.0, lL, M.lower);

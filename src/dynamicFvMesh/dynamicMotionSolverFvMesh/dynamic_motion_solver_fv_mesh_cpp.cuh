@@ -1,0 +1,331 @@
+#pragma once
+// OpenFOAM's dynamicMotionSolverFvMesh with the solidBody or the displacementLaplacian motion solver,
+// the host reference: what mesh.update() does to the mesh, and everything a solver then reads from a
+// mesh that has moved. The displacement solver is its own file,
+// src/fvMotionSolver/fvMotionSolvers/displacement/laplacian/.
+//
+// provenance:
+//   openfoam:  src/dynamicFvMesh/dynamicFvMesh/dynamicFvMeshNew.C:65-128 (no dictionary: static)
+//              src/dynamicFvMesh/dynamicMotionSolverFvMesh/dynamicMotionSolverFvMesh.C:101-114 (update)
+//              src/dynamicMesh/motionSolvers/displacement/solidBody/solidBodyMotionSolver.C:70-91
+//              src/dynamicMesh/motionSolvers/displacement/displacement/zoneMotion.C:37-127
+//              src/dynamicMesh/motionSolvers/displacement/points0/points0MotionSolver.C:42-76
+//              src/finiteVolume/fvMesh/fvMesh.C (movePoints), fvMeshGeometry.C (storeOldVol, V0,
+//                  Vsc, Vsc0, phi)
+//              src/finiteVolume/fvMesh/fvGeometryScheme/fvGeometryScheme/fvGeometryScheme.C:60-117
+//                  (setMeshPhi)
+//              src/OpenFOAM/meshes/polyMesh/polyMesh.C (movePoints, oldPoints)
+//              src/OpenFOAM/meshes/meshShapes/face/face.C:513-563 (centre), :656-730 (sweptVol)
+//              src/OpenFOAM/meshes/primitiveShapes/triangle/triangleI.H:386-401 (sweptVol)
+//   tests:     tests/test_mesh_motion_vs_openfoam.cu and tests/test_displacement_laplacian_vs_openfoam.cu,
+//              against the polyMesh/points and meshPhi
+//              OpenFOAM writes per time step and the V and C its postProcess writes from them
+//
+// THE ORDER INSIDE ONE update(), which is fvMesh::movePoints':
+//   1. the volumes the mesh HAS become V0 -- once per time index, so a second update in the same step
+//      (moveMeshOuterCorrectors) does not overwrite them;
+//   2. the points the mesh HAS become oldPoints, under the same once-per-index rule;
+//   3. the points are replaced by the motion solver's, which are an absolute function of the NEW time
+//      applied to points0 -- never an increment;
+//   4. meshPhi = sweptVol(oldPoints, newPoints)*(1.0/deltaT) on every face -- a product with the
+//      reciprocal, not a quotient, and brae compares it to the last digit;
+//   5. the geometry is recomputed from the new points: Sf, magSf, Cf, C, V, and the interpolation
+//      weights and deltaCoeffs with them, and each FvPatch's copy IN PLACE, because every patch field
+//      holds a reference to its FvPatch.
+//
+// face::sweptVol fans each face about face::centre() at both times, and face::centre is NOT the
+// mesh's Cf: primitiveMesh computes Cf with its own sums (primitiveMeshFaceCentresAndAreas.C), and
+// the two differ in the last digits on any face that is not a triangle. src/OpenFOAM/motion/
+// swept_volume.cuh uses a third arrangement of the same cross product; this file transcribes face.C.
+//
+// NOT PORTED, refused by name where the dictionary is read: every dynamicFvMesh but
+// dynamicMotionSolverFvMesh (and staticFvMesh, which is no motion); every motionSolver but solidBody,
+// displacementLaplacian and rigidBodyMotion;
+// a `cellZone` or `cellSet` (the motion of part of a mesh deforms the cells around it, and the
+// interFoam tutorial that asks for one slides it on an AMI); a `points0` file; and a start from a
+// time directory that carries its own polyMesh/points.
+#include "cf_types.cuh"
+#include "displacement_laplacian_fv_motion_solver_cpp.cuh"
+#include "face_cpp.cuh"
+#include "foam_dict.cuh"
+#include "gamg_solver_cpp.cuh"
+#include "fv_geometry.cuh"
+#include "fv_patch.cuh"
+#include "fvc.cuh"
+#include "primitive_mesh.cuh"
+#include "rigid_body_mesh_motion_cpp.cuh"
+#include "solid_body_motion_function_cpp.cuh"
+#include <memory>
+#include <string>
+#include <functional>
+#include <vector>
+
+namespace brae {
+
+// face::sweptVol(oldPoints, newPoints), for face f of the mesh's topology (face::centre is
+// face_cpp.cuh's faceCentreOfPoints)
+scalar faceSweptVolume(
+    const PrimitiveMesh& m,
+    label f,
+    const std::vector<vector>& oldPoints,
+    const std::vector<vector>& newPoints);
+
+// THE SWEPT VOLUMES ELSEWHERE. When the mesh holds one of these, update() hands it the mesh, the patches, the
+// points before and after, 1/deltaT and its count of topology changes, and takes back meshPhi on the internal
+// faces and on every patch that is not `empty` -- what its own face loop fills. The device loop's is
+// deviceSweptVolumes (device_swept_volumes.cuh), that loop to the bit.
+// THE GEOMETRY ELSEWHERE. When the mesh holds one of these, update() hands it the moved mesh and its count of
+// topology changes in place of g.build(m), and the runner leaves g holding what build would (FvGeometry::adopt).
+// The device loop's is deviceFvGeometry (device_fv_geometry.cuh), build to the bit.
+using GeometryRunner = std::function<void(
+    const PrimitiveMesh&,
+    unsigned long long,
+    FvGeometry&)>;
+
+using SweptVolumeRunner = std::function<void(
+    const PrimitiveMesh&,
+    const std::vector<FvPatch>&,
+    const std::vector<vector>&,
+    const std::vector<vector>&,
+    scalar,
+    unsigned long long,
+    SurfaceScalarField&)>;
+
+// Time::subCycle's two TimeStates, as fvMesh::Vsc and Vsc0 read them
+struct SubCycleTimeState
+{
+    bool subCycling = false;
+    // the sub-cycle's own time and step
+    scalar value = 0;
+    scalar deltaT = 0;
+    // ...and the step it divides (prevTimeState)
+    scalar value0 = 0;
+    scalar deltaT0 = 0;
+};
+
+class DynamicMotionSolverFvMesh
+{
+public:
+    // dynamicFvMesh::New for the case, from its dictionaries alone. Returns null for a mesh that does
+    // not move -- no constant/dynamicMeshDict, or `dynamicFvMesh staticFvMesh` -- and throws, by
+    // name, for every motion that is not ported. Reading is separate from attach() so that a case
+    // reader with no mutable mesh in hand still refuses what it must.
+    static std::unique_ptr<DynamicMotionSolverFvMesh> New(
+        const std::string& caseDir,
+        const std::string& startDir);
+
+    // ...AND THE MOTION OF A REFINING MESH: dynamicRefineFvMesh IS a dynamicMotionSolverListFvMesh
+    // (dynamicRefineFvMesh.H:92-95), which builds one motionSolver per sub-dictionary of `solvers`
+    // (dynamicMotionSolverListFvMesh.C:98-127) with `mandatory` false (dynamicRefineFvMesh.C:1107), so no
+    // `solvers`, or an empty one, is no motion and returns null. What is ported is ONE solidBody motion of
+    // the WHOLE mesh; everything else is refused by name: more than one solver (their displacements are
+    // summed, :176-183), any other motionSolver (a displacement field or a rigid body's blend would have
+    // to be carried through every change), and a cellZone or cellSet (zoneMotion has no updateMesh, so
+    // OpenFOAM itself moves stale point labels after a change). The mesh then moves in the LIST form.
+    static std::unique_ptr<DynamicMotionSolverFvMesh> NewForRefine(
+        const std::string& caseDir,
+        const std::string& startDir);
+
+    // The mesh, its geometry and its patches this motion MOVES IN PLACE: the caller's, which must
+    // outlive this object. Takes points0 from the mesh as it stands.
+    void attach(
+        PrimitiveMesh& m,
+        FvGeometry& g,
+        std::vector<FvPatch>& patches);
+    bool attached() const
+    {
+        return m_ != nullptr;
+    }
+
+    // mesh.update() at the new time. finalIteration is PIMPLE's "finalIteration" flag, which selects
+    // the displacement equation's Final solver entry; agglomeration is the run's GAMG hierarchy, which a
+    // displacement solver shares with every other GAMG solve and which a move invalidates.
+    // `load` is the fluid's pressure and shear on the body's patches, which ONLY a rigidBodyMotion
+    // needs: its points come from equations of motion the flow drives. A prescribed motion ignores it
+    // and the rigid body refuses to move without it, rather than integrating a body with no load.
+    void update(
+        scalar time,
+        scalar deltaT,
+        label timeIndex,
+        bool finalIteration = false,
+        GamgAgglomerationCache* agglomeration = nullptr,
+        const BodyLoad* load = nullptr);
+
+    // fvMesh::updateMesh AS THE MOTION SEES IT, after a topology change at `timeIndex` and before the move
+    // (dynamicRefineFvMesh::update: updateTopology() first, the motion second, dynamicRefineFvMesh.C:1468-1474).
+    // points0 has already been mapped -- the refiner carries it (RefineUpdateState::points0) -- and `V0` is
+    // the change's: the old mesh's volumes stored once per time index, mapped, and corrected for split and
+    // merged cells (fvMesh.C:1026, dynamicRefineFvMesh.C:203-253). The mesh flux is recreated as ZERO on the
+    // new faces with no old-time level (fvMesh.C:1057-1077). curTimeIndex_ is set so the move that follows
+    // does not store V0 again (fvMesh.C:942-945); curMotionTimeIndex_ is left, so the move takes oldPoints
+    // from the REFINED points, overwriting the mapped ones (polyMesh.C:1194-1213).
+    void topoChanged(
+        std::vector<scalar> V0,
+        label               timeIndex);
+    // the displacement solver's wall-distance wave run elsewhere; nothing to set on a mesh moved another way
+    void setPatchWaveRunner(PatchWaveRunner runner)
+    {
+        if (displacement_)
+        {
+            displacement_->setPatchWaveRunner(std::move(runner));
+        }
+    }
+    // the geometry of every move built elsewhere (GeometryRunner); empty runs FvGeometry::build
+    void setGeometryRunner(GeometryRunner runner)
+    {
+        geometryRunner_ = std::move(runner);
+    }
+    // the swept volumes of every move computed elsewhere (SweptVolumeRunner); empty runs the host's face loop
+    void setSweptVolumeRunner(SweptVolumeRunner runner)
+    {
+        sweptRunner_ = std::move(runner);
+    }
+    // ...and its equation's interior assembled elsewhere
+    void setDisplacementAssemblyRunner(DisplacementAssemblyRunner runner)
+    {
+        if (displacement_)
+        {
+            displacement_->setAssemblyRunner(std::move(runner));
+        }
+    }
+    bool hasDisplacementSolver() const
+    {
+        return displacement_ != nullptr;
+    }
+    // the carried points0, for the refiner to map in place
+    std::vector<vector>& points0Ref()
+    {
+        return points0_;
+    }
+    bool listForm() const
+    {
+        return listForm_;
+    }
+
+    // polyMesh::moving(): false until the first update
+    bool moving() const
+    {
+        return moving_;
+    }
+    const std::string& motionType() const
+    {
+        return motionType_;
+    }
+    // the displacementLaplacian solver, or null for a solid-body motion
+    const DisplacementLaplacianFvMotionSolver* displacementSolver() const
+    {
+        return displacement_.get();
+    }
+    // the rigid body this motion integrates, or null for a prescribed motion
+    const RigidBodyMeshMotion* rigidBody() const
+    {
+        return rigidBody_.get();
+    }
+    const std::vector<vector>& points0() const
+    {
+        return points0_;
+    }
+    // zoneMotion::pointIDs(): the points a cellZone motion moves, ascending; empty when the whole mesh
+    // moves. Filled by attach().
+    const std::vector<label>& pointIDs() const
+    {
+        return pointIDs_;
+    }
+    const std::vector<vector>& oldPoints() const
+    {
+        return oldPoints_;
+    }
+    // fvMesh::phi(): the mesh-motion flux of the current step. Empty patches carry zeros here;
+    // OpenFOAM's have no faces.
+    // MUTABLE, for cyclicACMIFvPatch::movePoints alone: fvMesh::movePoints runs the boundary's own
+    // movePoints as part of the move, and an ACMI's scales the mesh flux to the face areas its
+    // updateAreas just changed (cyclicACMIFvPatch.C). The swept volume computed above is the face's
+    // FULL geometric flux, so the pair's two halves must be weighted by the mask afterwards or the
+    // mesh flux and the face area disagree by it.
+    SurfaceScalarField& meshPhiRef()
+    {
+        return meshPhi_;
+    }
+    // A solidBody motion and nothing else: the one whose written state is the mesh itself -- points,
+    // meshPhi, Uf -- with no motion solver field of its own (displacementLaplacian's cellDisplacement and
+    // pointDisplacement, a rigid body's pointDisplacement and uniform/rigidBodyMotionState)
+    bool solidBodyOnly() const
+    {
+        return SBMF_ != nullptr && !displacement_ && !rigidBody_;
+    }
+    // the displacementLaplacian motion solver, or null: its pointDisplacement and cellDisplacement are
+    // written with the mesh (displacementMotionSolver.C:50-61, displacementLaplacianFvMotionSolver.C:71-84)
+    const DisplacementLaplacianFvMotionSolver* displacement() const
+    {
+        return displacement_.get();
+    }
+    const SurfaceScalarField& meshPhi() const
+    {
+        return meshPhi_;
+    }
+    const std::vector<scalar>& V0() const
+    {
+        return V0_;
+    }
+    // fvMesh::V00(): the volumes two steps back, created on first use as a copy of V0 and rotated
+    // from then on (fvMesh.C:1015-1040). Only the CrankNicolson ddt's moving branch reads it.
+    const std::vector<scalar>& V00()
+    {
+        if (!V00Exists_)
+        {
+            V00_ = V0_;
+            V00Exists_ = true;
+        }
+        return V00_;
+    }
+    // fvMesh::Vsc() and Vsc0(): V and V0 outside a sub-cycle, and inside one the volumes at the end
+    // and at the start of THAT sub-cycle, linear in time between V0 and V
+    std::vector<scalar> Vsc(const SubCycleTimeState& ts) const;
+    std::vector<scalar> Vsc0(const SubCycleTimeState& ts) const;
+
+private:
+    DynamicMotionSolverFvMesh() = default;
+    static std::unique_ptr<DynamicMotionSolverFvMesh> fromMotionDict(
+        const FoamDict&    d,
+        const std::string& caseDir,
+        const std::string& startDir,
+        bool               listForm);
+
+    PrimitiveMesh* m_ = nullptr;
+    FvGeometry* g_ = nullptr;
+    std::vector<FvPatch>* patches_ = nullptr;
+    std::unique_ptr<SolidBodyMotionFunction> SBMF_;
+    std::unique_ptr<DisplacementLaplacianFvMotionSolver> displacement_;
+    std::unique_ptr<RigidBodyMeshMotion> rigidBody_;
+    std::string motionType_;
+    std::vector<vector> points0_;
+    std::string cellZone_;
+    std::vector<label> zoneCells_;
+    std::vector<label> pointIDs_;
+    std::vector<vector> oldPoints_;
+    std::vector<scalar> V0_;
+    std::vector<scalar> V00_;
+    bool                V00Exists_ = false;
+    SurfaceScalarField meshPhi_;
+    // the swept volumes elsewhere, when the driver hands a runner in, and how many times the faces have changed
+    // (attach and topoChanged), which is what the runner keys its copy of them on
+    SweptVolumeRunner sweptRunner_;
+    GeometryRunner geometryRunner_;
+    unsigned long long topologyCount_ = 0;
+    // fvGeometryScheme::setMeshPhi on the host: meshPhi on the internal faces and the patches that are not empty
+    void sweptVolumesOnHost(
+        const PrimitiveMesh& m,
+        const std::vector<vector>& newPoints,
+        scalar rdt,
+        SurfaceScalarField& meshPhi) const;
+    bool moving_ = false;
+    // dynamicMotionSolverListFvMesh::update moves to points() + (newPoints() - points())
+    // (dynamicMotionSolverListFvMesh.C:176-183) where dynamicMotionSolverFvMesh moves to newPoints()
+    bool listForm_ = false;
+    // fvMesh::curTimeIndex_ and polyMesh::curMotionTimeIndex_
+    label curTimeIndex_ = -1;
+    label curMotionTimeIndex_ = -1;
+    bool haveTimeIndex_ = false;
+};
+
+} // namespace brae

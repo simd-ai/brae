@@ -145,6 +145,7 @@ struct StepInput
     const std::vector<DeviceMRFZone>* mrf = nullptr;
     scalar         nuLaminar = 0.0;
     bool   correctedLaplacian = false;   // `corrected` laplacianSchemes
+    bool   nonOrthCoeffs = false;        // nonOrthDeltaCoeffs with no correction -- solver_controls.cuh:226
     // `limited <k> corrected` (OF limitedSnGrad): caps the non-orth correction against the orthogonal
     // part of the same snGrad. 0 = no cap, which is what `corrected` and `limited 1` both mean.
     scalar snGradLimitCoeff = 0.0;

@@ -1,0 +1,278 @@
+#pragma once
+// ONE TIME STEP'S ALPHA HALF, end to end on the device: the sub-cycle, the correctors inside it, the
+// MULESCorr pre-solve where the case asks for one, mixture.correct() at every stage OpenFOAM runs it,
+// and rhoPhi out at the end for the momentum equation to be built on.
+//
+// provenance:
+//   openfoam:  applications/solvers/multiphase/VoF/alphaEqnSubCycle.H:1-45, alphaEqn.H:1-260,
+//              applications/solvers/multiphase/interFoam/interFoam.C:96-104 (the call site)
+//   host:      src/applications/solvers/interFoam/inter_solve_cpp.cu (alphaEqnSubCycle) and
+//              alpha_eqn_cpp.cu (alphaEqnStep) -- the ORACLE, and the path that reaches 3.4346e-09 in
+//              alpha on damBreak against real OpenFOAM.
+//   tests:     tests/test_device_inter_alpha_step.cu
+//
+// This is the first function in the interFoam port that a SOLVER LOOP could call rather than a gate.
+// Everything under it is separately landed and separately gated: deviceAlphaEqnSubCycle, the explicit
+// and MULESCorr branches of deviceAlphaCorrector, deviceAlphaPreSolve, deviceMulesLimitCorr,
+// deviceInterfaceCorrect and deviceMixtureCorrect. What this file owns is the SEQUENCE, and interFoam's
+// sequence has three placements that are not obvious and that nothing underneath can check:
+//
+//   mixture.correct() runs at the BOTTOM of every corrector (alphaEqn.H:225), ONCE MORE inside the
+//   MULESCorr block before the correctors begin (alphaEqn.H:151-154), and ONCE MORE AGAIN after the
+//   whole sub-cycle (interFoam.C:154). Each is a calculateK pass, and at a contact angle the curvature
+//   is a FIXED POINT in those passes -- on capillaryRise it walks 7070.5 -> 8659.4 -> 9353.1 -> 9681.2.
+//   Missing the middle one put damBreak at 1.05e-07 against OpenFOAM where the full sequence gives
+//   3.4346e-09. The last one REPEATS the last corrector's wherever no patch makes the count of passes
+//   matter (what gives UEqn the new density is the corrector's pass), and the step leaves it out there:
+//   see where it is called.
+//
+// WHAT STAYS ON THE HOST, and it is the same line this port has drawn throughout: the BOUNDARY
+// CONDITIONS. Evaluating alpha1's patch values is branchy dispatch over inletOutlet, zeroGradient,
+// alphaContactAngle and empty; correctContactAngle touches two faces of eight hundred on capillaryRise
+// and is stateful and iterative; and fvm::div's per-patch valueInternalCoeffs are the same kind of
+// work. All three arrive through `hooks` below. Everything that scales with the CELL COUNT is here.
+#include "cf_types.cuh"
+#include "device_buffer.cuh"
+#include "device_mesh.cuh"
+#include "device_mules.cuh"
+#include "device_alpha_step.cuh"
+#include "device_alpha_presolve.cuh"
+#include "device_two_phase_mixture.cuh"
+#include <functional>
+#include <string>
+#include <vector>
+
+namespace brae {
+
+// The host's side of the step. Called exactly where OpenFOAM calls the things they stand for.
+struct DeviceInterAlphaHooks
+{
+    // alpha1's patch values, and the boundary interface normal correctContactAngle has acted on, from
+    // whatever the device last wrote. Called after every MULES solve -- MULESTemplates.C:80 ends the
+    // solve with psi.correctBoundaryConditions(), and the next corrector's flux, gradient and limiter
+    // all read the result.
+    std::function<void(const DeviceBuffer<scalar>& alpha1,
+                       DeviceBuffer<scalar>&       alpha1Bnd,
+                       DeviceBuffer<scalar>&       nHatfBnd)> updateBoundary;
+
+    // alpha1's patch values ALONE, with no curvature pass behind them. Optional; when absent the step
+    // falls back to updateBoundary, which is only right on a case with no contact angle. ALSO THE EVALUATE
+    // THAT OPENS A LIMITED EXPLICIT SOLVE (MULESTemplates.C:168): every explicit corrector calls it between
+    // its flux build and its limiter; without the hook that evaluate is not made (the unit fixtures' form).
+    //
+    // The two are different calls because interfaceProperties::correct() has a SIDE EFFECT at a
+    // contact-angle wall: it rewrites the patch's gradient (interfaceProperties.C:97), and the gradient
+    // is a fixed-point iteration in its passes -- 7070.5, 8659.4, 9353.1, 9681.2 on capillaryRise. So
+    // the NUMBER of passes is part of the answer. The sub-step's reset of alpha1 needs fresh patch
+    // values and is not a mixture.correct(); routing it through updateBoundary gave the device five
+    // curvature passes a step where OpenFOAM takes three, and put it 1.9% out in U after ONE step on
+    // capillaryRise with every other term exact. damBreak has no contact angle and could not see it.
+    std::function<void(
+        const DeviceBuffer<scalar>& alpha1,
+        DeviceBuffer<scalar>& alpha1Bnd)> refreshBoundary;
+    // alpha1's patch values AS THEY STAND, with no evaluate: what the top of the step reads.
+    // alphaEqn.H evaluates alpha1 nowhere before its fluxes (alpha_eqn_cpp.cu says so at length), so
+    // the explicit path's alphaPhiUn reads what the LAST evaluate left -- the previous MULES solve's
+    // closing correctBoundaryConditions, or at the first step the file's own `value`. Optional; when
+    // absent the top of the step evaluates, as it did before this hook.
+    std::function<void(
+        DeviceBuffer<scalar>& alpha1Bnd)> storedBoundary;
+
+    // THE RELAXED CORRECTOR'S BOUNDARY, and the mixture.correct() with no evaluate in front -- after a
+    // relaxed corrector, and AFTER THE SUB-CYCLE ON EVERY PATH (interFoam.C:154: that mixture.correct()
+    // evaluates no alpha patch but a contact angle's, whatever the last corrector was). Both or neither;
+    // when absent a relaxed corrector and the pass after the sub-cycle fall back to updateBoundary, which
+    // evaluates first: right only where an evaluate on unchanged cells changes nothing -- the unit
+    // fixtures' zero-gradient patches. The driver always gives both.
+    //
+    // updateBoundary's evaluate stands in for MULES's trailing correctBoundaryConditions, which is
+    // right after a solve and WRONG after `alpha1 = 0.5*alpha1 + 0.5*alpha10` (VoF/alphaEqn.H:197-201):
+    // that is an assignment, and a mixed-family patch keeps its post-MULES value through it. So:
+    //   relaxBoundary  -- evaluate on the POST-MULES cells, then relaxAlphaBoundary (alpha_eqn_cpp.cuh)
+    //                     on the relaxed ones, leaving alpha1Bnd what OpenFOAM's alpha1 carries;
+    //   mixtureCorrect -- updateBoundary's mixture boundary and curvature pass, from alpha's patch
+    //                     values AS THEY STAND. mixture.correct() evaluates no alpha patch but a
+    //                     contact-angle one (interfaceProperties.C:97), which the curvature pass does.
+    // MEASURED on RAS/electrostaticDeposition at step two, before these existed: the device's
+    // variableHeightFlowRate faces sat EXACTLY on OpenFOAM's owner cell, 5.1256e-10 from the value
+    // OpenFOAM wrote -- the host's pre-fix signature -- and U 1.17e-07 against the host's 4.8e-10.
+    std::function<void(
+        const DeviceBuffer<scalar>& alphaPostMules,
+        const DeviceBuffer<scalar>& alphaRelaxed,
+        DeviceBuffer<scalar>&       alpha1Bnd)> relaxBoundary;
+    std::function<void(
+        const DeviceBuffer<scalar>& alpha1,
+        DeviceBuffer<scalar>&       alpha1Bnd,
+        DeviceBuffer<scalar>&       nHatfBnd)> mixtureCorrect;
+
+    // fvm::div(phiCN, alpha1)'s internalCoeffs and boundaryCoeffs, flattened in boundary-face order.
+    // Only reached when MULESCorr is on; a case without it never needs them and passing none is fine.
+    // `phiCNBnd` is phiCN on the boundary faces, in the device's layout: the flux the coefficients
+    // are built from, which under CrankNicolson is NOT the patch flux the hook's host field holds
+    // (phiCN = cnCoeff*phi + (1 - cnCoeff)*phi.oldTime(), alphaEqn.H:96 and :114). NOT DISCRIMINATED
+    // by any gate in the tree: on RAS/damBreak the one flux-conditional alpha patch is the atmosphere,
+    // whose cells hold exactly 0, and a coefficient on a zero row moves nothing. Null = phi itself.
+    std::function<void(const DeviceBuffer<scalar>& alpha1,
+                       DeviceBuffer<scalar>&       iC,
+                       DeviceBuffer<scalar>&       bC,
+                       const DeviceBuffer<scalar>* phiCNBnd)> divCoeffs;
+
+    // waveAlpha: the patch values a wave MODEL supplies, at the clock of the sub-cycle it is called in
+    // (1-based). A sub-cycle is its own time index to OpenFOAM, so the model updates in each -- see
+    // inter_waves_cpp.cuh. Called where OpenFOAM's first updateCoeffs of the pass fires: ahead of the
+    // pre-solve's assembly under MULESCorr, and otherwise between the high-order flux and the limiter
+    // (DeviceAlphaBoundary::updateModelled). Null on a case with no such patch.
+    std::function<void(
+        int subCycle,
+        const DeviceBuffer<scalar>& alpha1,
+        DeviceBuffer<scalar>& alpha1Bnd)> updateModelledBoundary;
+
+    // fvMesh::Vsc() and Vsc0() at the clock of the sub-cycle it is called in (1-based), filled into
+    // the two buffers the step then hands MULES and the pre-solve. A sub-cycle is its own time index
+    // to OpenFOAM, and Vsc interpolates between V0 and V by where in the step that index falls
+    // (fvMeshGeometry.C) -- so the volumes change WITHIN a step, which is why this is a call and not
+    // a pair of pointers. Null on a mesh that does not move, where Vsc is V and Vsc0 is V.
+    std::function<void(
+        int subCycle,
+        DeviceBuffer<scalar>& Vsc,
+        DeviceBuffer<scalar>& Vsc0)> subCycleVolumes;
+
+    // THE STEP'S GEOMETRY CHANGE, where the host's alphaEqnStep has it (alpha_eqn_cpp.cu,
+    // geometryUpdate): AFTER phic is formed and BEFORE the pre-solve assembles. It exists for a
+    // cyclicACMI whose `scale` moves with time -- OpenFOAM rescales the pair's areas lazily, at the
+    // pre-solve's first updateCoeffs -- and the callee both rescales and re-uploads whatever this step
+    // reads from the mesh and the pair, IN PLACE (`dm` and the pair are held by reference here). It is
+    // called at every sub-step and every outer corrector; landing once per TIME STEP is the callee's
+    // job, as it is the host hook's. Null on every other case, and the step is then bit for bit what it
+    // was: phic stays the corrector's own.
+    std::function<void()> geometryUpdate;
+
+    // WHAT IS LEFT OF THE HOOK WHEN THE mixture.correct() AFTER THE SUB-CYCLE IS LEFT OUT
+    // (DeviceInterAlphaControls::mixtureCorrectRepeats): the one thing its flux push would do with a NEWER
+    // input than the last corrector's had -- tell the conditions that read alpha's patch values what the last
+    // evaluate left (pushAlphaToPatches), and a p_rgh or U patch that names rhoPhi the boundary the sub-cycle
+    // has just summed. Null = the pass is never left out.
+    std::function<void()> mixtureRepeatLeftOut;
+    // ...and, for BRAE_CONTROL_MIXTURE_REPEAT_CHECK, the HOST's state those hooks write, as one list of numbers
+    // the check takes before and after the pass and compares bitwise: the device buffers it holds are only the
+    // hook's uploads. Optional; null = the check holds the device buffers alone.
+    std::function<std::vector<scalar>()> mixtureHostState;
+};
+
+struct DeviceInterAlphaControls
+{
+    int  nAlphaSubCycles = 1;       // alphaControls.H, get<label>
+    int  nAlphaCorr      = 1;
+    bool MULESCorr       = false;
+    // THE HOST'S HALF OF "the mixture.correct() after the sub-cycle repeats the last corrector's" -- see where
+    // the step uses it. True when the caller has established that the HOOK would write nothing new: no alpha
+    // patch is a contact angle, every alpha patch's evaluate repeats (fvPatchField::evaluateRepeats), and no
+    // ALPHA patch names rhoPhi (the sub-cycle has just overwritten its boundary with the time-weighted sum, so
+    // such a patch would be evaluated on a new flux). False -- the default -- keeps the pass, and
+    // `mixtureRepeatKeptFor` says why in the step's notice.
+    bool mixtureCorrectRepeats = false;
+    std::string mixtureRepeatKeptFor = "the caller has not said the hook repeats";
+    // THE CURVATURE PASS MOVES ALPHA'S PATCH VALUES ON THE HOST: true where an alpha patch is a contact angle,
+    // whose wall gradient correctContactAngle sets and evaluates inside mixture.correct()
+    // (interfaceProperties.C:101-102). The hooks upload the patch values BEFORE that pass, which is the state
+    // the pass's own cell gradient reads; the step then takes the values the pass LEFT through
+    // hooks.storedBoundary, because the next corrector builds its flux on them. False = no patch does, and
+    // nothing is re-read.
+    bool curvaturePassMovesPatches = false;
+    DeviceAlphaSolverControls preSolve;   // the case's fvSolution entry for alpha, MULESCorr only
+    // OUT, optional: alpha2's PATCH values, assigned where alphaEqn.H assigns alpha2 (lines 151 and
+    // 223) and NOT at the mixture.correct() after the sub-cycle, which leaves alpha2 alone. They are
+    // one contact-angle pass older than alpha1's -- see deviceBoundaryRho.
+    DeviceBuffer<scalar>* alpha2BndOut = nullptr;
+    // ...KEPT ACROSS STEPS where a corrector's compressive flux reads them (the driver's buffer; then
+    // alpha2BndOut is this one), with the faces that take them. See DeviceAlphaStepInput::alpha2BndStored.
+    DeviceBuffer<scalar>* alpha2BndStored = nullptr;
+    const DeviceBuffer<int>* alpha2BndStoredMask = nullptr;
+    // appended to, one record per pre-solve; null = not kept
+    std::vector<DeviceSolverPerf>* preSolveLog = nullptr;
+    // ...and the field that pre-solve LEAVES, plus its flux on the pair, for a gate bisecting the
+    // implicit half against the corrector. Null in every production run.
+    DeviceBuffer<scalar>* preSolveAlphaOut = nullptr;
+    DeviceBuffer<scalar>* preSolveAlphaPhiIfOut = nullptr;
+    // `alphaApplyPrevCorr yes` (alphaEqn.H:133-150, :228-236): the compression flux the correctors
+    // ENDED on is cached, and the next pre-solve applies it, limited, before its own correctors run.
+    // The cache is talphaPhi1Corr0 and it outlives the call -- it carries across SUB-CYCLES as well as
+    // time steps -- so the CALLER owns it: two buffers, empty until the first alpha step has filled
+    // them, which is what OpenFOAM's `.valid()` tests. Setting the switch without handing them in is
+    // refused; this step used to ignore the switch altogether, and on damBreak at dt 5e-3 that put the
+    // device 1.07e-02 of alpha from OpenFOAM -- to five digits, OpenFOAM's own distance from itself
+    // with the switch off.
+    bool alphaApplyPrevCorr = false;
+    DeviceBuffer<scalar>* prevCorrInt = nullptr;
+    DeviceBuffer<scalar>* prevCorrBnd = nullptr;
+    // THE PAIR's mass flux out, for the momentum equation. The pair itself, its flux and its alpha flux
+    // travel in DeviceAlphaStepInput, which is what the corrector reads.
+    DeviceBuffer<scalar>* rhoPhiIf = nullptr;
+    // A PERIODIC PAIR UNDER CRANKNICOLSON. alphaPhi10's own old level and its out slot on the PAIR's
+    // faces, which live in their own array and not in the boundary one: the end-of-step un-blend
+    // (alphaEqn.H:253-262) is face-local, so the pair needs exactly the same two buffers the interior
+    // and the boundary get. Null with a pair and ocCoeff > 0 means the level does not exist yet --
+    // OpenFOAM creates it lazily, as a copy of the flux as it stands.
+    const DeviceBuffer<scalar>* alphaPhiOldIf = nullptr;
+    DeviceBuffer<scalar>*       alphaPhiOutIf = nullptr;
+    DeviceBuffer<scalar>*       alphaPhiCreatedIf = nullptr;
+    // alphaEqn.H:236-262 under a ddt(rho,U) that is neither Euler nor localEuler (CrankNicolson): the
+    // end-of-step alpha flux is un-blended against alphaPhi10.oldTime() when ocCoeff > 0, and rhoPhi
+    // takes phi, not phiCN, beside rho2. `cnCoeffUnblend` 1 skips the un-blend; `alphaPhiOld*` null
+    // with it below 1 means the old level is CREATED by this call as a copy of the current flux, which
+    // is what GeometricField::oldTime() does on the first blended step; `alphaPhiOut*` is where the
+    // caller keeps the flux the step ends on, for the next step's old level. A pair is refused.
+    bool rhoPhiFromPhi = false;
+    scalar cnCoeffUnblend = 1;
+    const DeviceBuffer<scalar>* alphaPhiOldInt = nullptr;
+    const DeviceBuffer<scalar>* alphaPhiOldBnd = nullptr;
+    DeviceBuffer<scalar>* alphaPhiOutInt = nullptr;
+    DeviceBuffer<scalar>* alphaPhiOutBnd = nullptr;
+    // ...and on a WRITE step, on either branch, the flux each sub-step ends with -- the last one is
+    // alphaPhi10 as OpenFOAM writes it (DeviceInterStepControls::alphaPhiWrite*). Null copies nothing.
+    DeviceBuffer<scalar>* alphaPhiWriteInt = nullptr;
+    DeviceBuffer<scalar>* alphaPhiWriteBnd = nullptr;
+    DeviceBuffer<scalar>* alphaPhiWriteIf  = nullptr;
+    // alpha1Bnd as the LAST sub-cycle begins, before it updates any patch: what the sub-cycle's
+    // storeOldTime copies into the old level (GeometricField.C:932), which keeps it on a patch whose
+    // operator= is a no-op. Null copies nothing.
+    DeviceBuffer<scalar>* alphaSubCycleBndWrite = nullptr;
+    // ...and, when the old level is created by this call, the copy it was created as (the flux BEFORE
+    // the un-blend), which every later pass of the same time step reads
+    DeviceBuffer<scalar>* alphaPhiCreatedInt = nullptr;
+    DeviceBuffer<scalar>* alphaPhiCreatedBnd = nullptr;
+    // nHatf ON THE PAIR, and it is the CALLER's buffer because it has to outlive the call. The first
+    // corrector's phir reads the normal the LAST mixture.correct() left (alphaEqn.H:162) -- which,
+    // without MULESCorr, is the previous TIME STEP's, since nothing runs between the two. Held here
+    // for the same reason nHatfInt and nHatfBnd are the driver's: a buffer local to one step is empty
+    // when the first corrector of a `MULESCorr no` case asks for it, and that was a refusal.
+    DeviceBuffer<scalar>* nHatfIf = nullptr;
+};
+
+// `alpha1` is advanced in place from `alpha1Old`, which is never written. `rho`, `mu` and `nu` come out
+// as mixture.correct() left them after the sub-cycle, ready for UEqn. `nHatfInt` and `K` are carried in
+// and out so the calculateK pass count matches OpenFOAM's across time steps.
+void deviceInterAlphaStep(
+    const DeviceMesh&                dm,
+    DeviceBuffer<scalar>&            alpha1,
+    const DeviceBuffer<scalar>&      alpha1Old,
+    scalar                           totalDeltaT,
+    const DeviceAlphaStepInput&      in,           // deltaT is set per sub-step and is ignored here
+    const DeviceMulesControls&       mulesCtl,
+    const DeviceInterAlphaControls&  ctl,
+    const DevicePhaseProperties&     props,
+    const DeviceInterAlphaHooks&     hooks,
+    DeviceBuffer<scalar>&            alpha1Bnd,    // in: the starting boundary; out: the final one
+    DeviceBuffer<scalar>&            nHatfBnd,
+    const DeviceBuffer<int>&         bndFixesValue,
+    const DeviceBuffer<int>&         bndFlag,
+    DeviceBuffer<scalar>&            nHatfInt,
+    DeviceBuffer<scalar>&            K,
+    DeviceBuffer<scalar>&            rhoPhiInt,
+    DeviceBuffer<scalar>&            rhoPhiBnd,
+    DeviceBuffer<scalar>&            alpha2,
+    DeviceBuffer<scalar>&            rho,
+    DeviceBuffer<scalar>&            mu,
+    DeviceBuffer<scalar>&            nu);
+
+} // namespace brae

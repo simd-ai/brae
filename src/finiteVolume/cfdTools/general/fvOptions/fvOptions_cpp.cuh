@@ -40,6 +40,7 @@
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
 #include "ldu_matrix.cuh"
+#include <map>
 #include <string>
 #include <vector>
 
@@ -61,6 +62,15 @@ struct Option
     bool               active = true;
     std::vector<label> cells;                 // resolved by cellSetOption's rules; empty => all cells
     bool               allCells = false;
+    // ...AND THE SELECTION ITSELF, kept because OpenFOAM RE-SELECTS rather than maps. cellSetOption::
+    // isActive() re-runs setCellSelection() whenever the mesh is topoChanging (cellSetOption.C:383-396),
+    // so after a topology change the cells come from the selection again and not from the labels it gave
+    // last time: a cellZone resolves against the LIVE, renumbered zone (:278-300), where the labels
+    // themselves would name a fraction of it -- a split zone cell gains its seven children.
+    // `cellSet` is the one mode where re-selecting and keeping are the same numbers, and that too is
+    // OpenFOAM's own behaviour: it reads the set from disk again (:269-276), in the ORIGINAL numbering.
+    std::string        selectionMode;         // all | cellZone | cellSet, as the dictionary spells it
+    std::string        selectionName;         // the zone or set it names
     std::string        unsupported;           // non-empty => this option's type is not implemented
 
     // DarcyForchheimer, already transformed into the global frame with the 0.5 folded into F.
@@ -88,6 +98,29 @@ struct Option
     tensor alpha{};
     tensor beta{};
     scalar rhoRef = 1.0;
+
+    // THE MANGROVE PAIR (src/waveModels/fvOptions): a vegetation drag and added mass on U, and the
+    // turbulence it produces on k and epsilon, both over cellZones listed under `regions`.
+    //   multiphaseMangrovesSource.C:36-101      dragCoeff = 0.5*Cd*a*N*|U|, inertiaCoeff =
+    //                                           0.25*(Cm + 1)*pi*a^2*N, per region, assigned in order
+    //   multiphaseMangrovesSource.C:125-143     addSup(rho, eqn): eqn += -Sp(rho*dragCoeff, U)
+    //                                                                   - rho*inertiaCoeff*ddt(U)
+    //   multiphaseMangrovesTurbulenceModel.C    kCoeff = Ckp*Cd*a*N*|U|, epsilonCoeff = Cep*Cd*a*N*|U|;
+    //                                           addSup(eqn): eqn += -Sp(coeff, k or epsilon)
+    enum class Mangroves { none, source, turbulence };
+    Mangroves mangroves = Mangroves::none;
+    struct MangroveRegion
+    {
+        std::string        name;
+        std::vector<label> cells;
+        scalar a = 1;
+        scalar N = 1;
+        scalar Cm = 1;
+        scalar Cd = 1;
+        scalar Ckp = 1;
+        scalar Cep = 1;
+    };
+    std::vector<MangroveRegion> mangroveRegions;
 };
 
 struct OptionList
@@ -109,6 +142,16 @@ struct OptionList
 // Read system/fvOptions or constant/fvOptions (OpenFOAM looks in both). Absent file => empty list.
 OptionList read(const std::string& caseDir, const PrimitiveMesh& m);
 
+// ...and the SAME resolution again on the mesh as it stands now, which is what OpenFOAM does at every
+// topology change. `zones` is the LIVE cellZone map -- the caller's, carried through the change -- and
+// `polyMeshDir` is only read by the cellSet mode, which is the one OpenFOAM re-reads from disk too.
+// Every ACTIVE option is re-selected; an inactive one is left alone, as OpenFOAM's isActive() short-
+// circuits before the refresh.
+void reselect(
+    OptionList&                                      list,
+    const std::map<std::string, std::vector<label>>& zones,
+    const std::string&                               polyMeshDir);
+
 // UEqn.H's `== fvOptions(U)`, for a KINEMATIC momentum equation (nu, not mu -- DarcyForchheimer.C
 // dispatches on UEqn.dimensions() and takes the `one`/nu branch when the equation is not in force units).
 void addSup(
@@ -129,7 +172,24 @@ void addSup(
     // Passing forceDimensions=true with a DF option and NO muCell is refused -- the previous behaviour
     // was nu = 0, which zeroed the whole Darcy term and ran the Forchheimer half without rho, silently.
     const std::vector<scalar>*    rhoCell = nullptr,
-    const std::vector<scalar>*    muCell  = nullptr);
+    const std::vector<scalar>*    muCell  = nullptr,
+    // U.oldTime() and the time step, for the one source with a time derivative in it -- the mangroves'
+    // added mass, rho*inertiaCoeff*ddt(U) (Euler). A mangrove source without them, or without rhoCell,
+    // is refused: a steady driver has no ddt to give, and dropping the term would be a different case.
+    const std::vector<vector>*    UOld    = nullptr,
+    scalar                        deltaT  = 0);
+
+// fvOptions(k) / fvOptions(epsilon) for a SCALAR transport equation, `field` its name: the mangroves'
+// turbulence source, -Sp(coeff, field), moved to the matrix as diag += V*coeff. U is the registry's `U`,
+// as multiphaseMangrovesTurbulenceModel looks it up. `rhoCell` non-null is the density-weighted lineage
+// (addSup(rho, eqn)), which no gate holds and is refused.
+void addSup(
+    const OptionList&           opts,
+    FvScalarMatrix&             eqn,
+    const std::string&          field,
+    const std::vector<vector>&  U,
+    const FvGeometry&           g,
+    const std::vector<scalar>*  rhoCell = nullptr);
 
 // fvOptions.constrain(eqn) for a SCALAR equation. `field` is the name the equation solves ("e"/"h" for
 // energy, "k", "epsilon", ...); a constraint that does not name it does nothing. The energy equation

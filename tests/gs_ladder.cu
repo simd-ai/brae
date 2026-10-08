@@ -44,6 +44,7 @@
 // relTol 0.1 after 5 sweeps, the colour order needs 9-10 and so always took the cap, and with the
 // pressure solve tight in both codes real simpleFoam CONVERGES at 5 sweeps and DIVERGES when forced to
 // take all ten (Ux 2.997e-01 at iteration 400).
+#include "smooth_solver_cpp.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -188,35 +189,16 @@ int main(int argc, char** argv)
     // The forward walk reads the faces OWNED by the cell (ownerStart[c]..ownerStart[c+1]), gathering
     // upper*psi[neighbour] and distributing lower*psi_c forward into bPrime; the reverse walk gathers the
     // same faces off the bPrime the forward half left, and does NOT distribute again (:191).
-    std::vector<label> ownStart(static_cast<std::size_t>(nC) + 1, 0);
-    for (label f = 0; f < nIf; ++f) ++ownStart[own[f] + 1];
-    for (label c = 0; c < nC; ++c) ownStart[c + 1] += ownStart[c];
+    // THE SHIPPED TRANSCRIPTION, brae::gaussSeidelSmoothFolded (smooth_solver_cpp.cu), and not a copy of
+    // it kept here. This leg used to carry its own loops, which proved that THOSE were OpenFOAM's; the
+    // ones the host solver runs were a second copy nothing compared. lduOwnerStart also refuses a mesh
+    // whose internal faces are not in OpenFOAM's upper-triangular order.
+    const std::vector<label> ownInternal(own.begin(), own.begin() + nIf);
+    const std::vector<label> ownStart = lduOwnerStart(ownInternal, nei, nC);
     auto sequentialSweeps = [&](int nSweeps, bool symmetric)
     {
-        std::vector<scalar> psi(psi0), bPrime(static_cast<std::size_t>(nC));
-        for (int s = 0; s < nSweeps; ++s)
-        {
-            bPrime = src;
-            for (label c = 0; c < nC; ++c)
-            {
-                scalar psii = bPrime[c];
-                for (label f = ownStart[c]; f < ownStart[c + 1]; ++f) psii -= upper[f] * psi[nei[f]];
-                psii /= diag[c];
-                for (label f = ownStart[c]; f < ownStart[c + 1]; ++f) bPrime[nei[f]] -= lower[f] * psii;
-                psi[c] = psii;
-            }
-            // GaussSeidelSmoother.C:145-176 stops after the ascending walk; symGaussSeidelSmoother.C
-            // adds this descending one, which re-reads the bPrime the forward half left (:191 does not
-            // distribute again).
-            if (!symmetric) continue;
-            for (label c = nC - 1; c >= 0; --c)
-            {
-                scalar psii = bPrime[c];
-                for (label f = ownStart[c]; f < ownStart[c + 1]; ++f) psii -= upper[f] * psi[nei[f]];
-                psii /= diag[c];
-                psi[c] = psii;
-            }
-        }
+        std::vector<scalar> psi(psi0);
+        gaussSeidelSmoothFolded(ownStart, nei, diag, upper, lower, src, psi, nSweeps, symmetric);
         return residual(psi);
     };
 

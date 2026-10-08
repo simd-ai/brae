@@ -34,6 +34,18 @@ struct CyclicInterface
     std::vector<vector> delta;
     std::vector<vector> corrVec;            // non-orth correction vector nf - delta*deltaCoeffs (laplacian "corrected")
     bool                translational = true;
+    // An AMI-family pair (cyclicAMI, cyclicACMI). ONE thing reads it: MULES' limiter sync, which is
+    // syncTools::syncFaceList and covers processor and cyclicPolyPatch ONLY (syncToolsTemplates.C:
+    // 1225-1234; cyclicAMIPolyPatch derives from coupledPolyPatch, cyclicAMIPolyPatch.H:70-72), so the
+    // two sides of such a pair keep their OWN lambda. The host carries the same flag as FvPatch::ami.
+    bool                ami = false;
+    // A cyclicAMI pair: face i's neighbour value is the AMI's weighted sum over the neighbour patch's
+    // face cells, slots amiOffsets[i] .. amiOffsets[i + 1] -- FvPatch's own stencil (fv_patch.cuh,
+    // patchNeighbourValue), copied so the device reads the numbers the host does. Empty on a cyclic and
+    // on a coincident ACMI, whose faces meet one neighbour cell (nbrFaceCells); nbrFaceCells is then -1.
+    std::vector<label>  amiOffsets;
+    std::vector<label>  amiNbrCells;
+    std::vector<scalar> amiWeights;
     vector              separation{0, 0, 0};   // translational: period vector Cf_nbr - Cf_own
     tensor              forwardT{1, 0, 0, 0, 1, 0, 0, 0, 1};   // rotational: nbr->own rotation (identity if translational)
 };
@@ -51,10 +63,18 @@ inline tensor rotationTensor(const vector& axis, scalar angle)
 // Build the cyclic interfaces from the mesh. Faces are matched by stored order (OpenFOAM orders cyclic
 // patches so face i pairs with neighbour face i); the constant separation vector is recorded so callers
 // can verify the match geometrically.
+//
+// `includeCoupledACMI`: also take a cyclicACMI pair the caller has ALREADY COUPLED as a coincident
+// translational pair (cpu::cyclicACMI::setup -- every face lies on one twin, AMI weight 1, so the AMI
+// interpolate is a copy and the pair is a cyclic on the mask-scaled areas). OPT-IN, because the legacy
+// drivers call this same function and couple an ACMI through AMIInterface/DeviceAMI instead; taking it
+// here as well would couple it twice there.
 inline std::vector<CyclicInterface> buildCyclicInterfaces(
     const PrimitiveMesh& m,
     const FvGeometry& g,
-    const std::vector<FvPatch>& fvp)
+    const std::vector<FvPatch>& fvp,
+    bool includeCoupledACMI = false,
+    bool includeCoupledAMI = false)
 {
     std::map<std::string, label> nameToIdx;
     for (label pi = 0; pi < (label)fvp.size(); ++pi) nameToIdx[fvp[pi].name] = pi;
@@ -63,9 +83,53 @@ inline std::vector<CyclicInterface> buildCyclicInterfaces(
     std::vector<CyclicInterface> out;
     for (label pi = 0; pi < (label)fvp.size(); ++pi)
     {
-        if (fvp[pi].type != "cyclic") continue;
+        const bool acmi = includeCoupledACMI && fvp[pi].type == "cyclicACMI" && fvp[pi].coupled;
+        // `includeCoupledAMI`: a cyclicAMI pair the caller has ALREADY COUPLED (cpu::cyclicAMIFvPatch::
+        // setup). Its geometry is NOT re-derived here: the weights, delta, delta coefficients and
+        // correction vectors are the ones cyclic_ami_cpp put on the patch from the AMI, taken as they
+        // stand so the device and the host cannot drift apart. OPT-IN for the reason ACMI is.
+        if (includeCoupledAMI && fvp[pi].type == "cyclicAMI" && fvp[pi].coupled)
+        {
+            const FvPatch& P = fvp[pi];
+            const std::size_t n = static_cast<std::size_t>(P.size);
+            if (P.amiOffsets.size() != n + 1 || P.weights.size() != n || P.delta.size() != n
+                || P.nonOrthDeltaCoeffs.size() != n || P.nonOrthCorrectionVectors.size() != n)
+            {
+                throw std::runtime_error(
+                    "cyclicAMI: patch `" + P.name + "` is marked coupled but carries no AMI stencil or "
+                    "coupled geometry; cpu::cyclicAMIFvPatch::setup has to run before the pair is built.");
+            }
+            CyclicInterface ci;
+            ci.patch = pi;
+            ci.nbrPatch = P.nbrPatch;
+            ci.ami = true;
+            ci.translational = true;
+            ci.faceCells = P.faceCells;
+            ci.nbrFaceCells.assign(n, label(-1));
+            ci.amiOffsets = P.amiOffsets;
+            ci.amiNbrCells = P.amiNbrCells;
+            ci.amiWeights = P.amiWeights;
+            ci.weights = P.weights;
+            ci.deltaCoeffs = P.nonOrthDeltaCoeffs;
+            ci.delta = P.delta;
+            ci.corrVec = P.nonOrthCorrectionVectors;
+            ci.dOwn.resize(n);
+            ci.dNbr.resize(n);
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                ci.dOwn[i] = g.Cf()[P.start + static_cast<label>(i)] - g.C()[P.faceCells[i]];
+                // linearUpwind's neighbour half is (Cf - d - C[own]) & gradNbr (linearUpwind.C, the
+                // coupled branch of correction()), d the patch's delta: with one neighbour cell that
+                // is the neighbour's own Cf - C, and here it is whatever the AMI's delta leaves
+                ci.dNbr[i] = ci.dOwn[i] - ci.delta[i];
+            }
+            out.push_back(std::move(ci));
+            continue;
+        }
+        if (fvp[pi].type != "cyclic" && !acmi) continue;
         CyclicInterface ci;
         ci.patch = pi;
+        ci.ami = acmi;
         const std::string nbrName = pinfo[pi].neighbourPatch;
         const auto it = nameToIdx.find(nbrName);
         if (it == nameToIdx.end()) throw std::runtime_error("cyclic: neighbourPatch '" + nbrName + "' not found");

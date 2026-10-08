@@ -153,6 +153,9 @@ struct RhoMomentumInput
     DivScheme scheme             = DivScheme::upwind;
     scalar    schemeCoeff        = 1.0;
     bool      correctedLaplacian = false;
+    // ...and WHICH delta coefficients: `uncorrected` takes nonOrthDeltaCoeffs with no correction
+    // flux (uncorrectedSnGrad.H:113-119). See solver_controls.cuh:226.
+    bool      nonOrthCoeffs = false;
     scalar    snGradLimitCoeff   = 0.0;
     bool      hasMRF             = false;   // declared by the case -> must refuse until ported
     bool      hasFvOptions       = false;   // an UNIMPLEMENTED option -> must refuse

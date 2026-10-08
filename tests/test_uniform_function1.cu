@@ -240,6 +240,49 @@ int main()
         else { std::printf("  FAIL the constant form broke (built=%d, U_b=(%g %g %g))\n",
                            (int)built, (double)v0.x, (double)v0.y, (double)v0.z); failures++; }
 
+        // THE PER-FACE SCALAR MUST SURVIVE A GEOMETRY CHANGE. OpenFOAM keeps refValue_ and re-forms
+        // refValue_*patch().nf() at every updateCoeffs (surfaceNormalFixedValueFvPatchVectorField.C:155-166),
+        // and maps the SCALAR in its autoMap (.C:131-135). brae used to multiply by nf once at construction
+        // and keep only the product, which cannot be re-formed against a normal that has changed.
+        //
+        // WHAT CAN WITNESS IT, and what cannot: a hexRef8 refinement splits a boundary face into COPLANAR
+        // children, so the mapped product and a re-formed one are the same number and no refinement fixture
+        // can tell them apart. A patch whose NORMAL changes can -- a moving mesh, or, here, the same thing
+        // done directly. Two faces, mapped onto one, with the surviving face turned 90 degrees: the answer
+        // is refValue on the NEW axis. MEASURED with the product kept instead: (-10 -0 -0), the old axis.
+        {
+            FvPatch q;
+            q.name = "inlet";
+            q.type = "patch";
+            q.size = 2;
+            q.faceCells.assign(2, 0);
+            q.deltaCoeffs.assign(2, 1.0);
+            q.nf.assign(2, vector{1, 0, 0});
+            q.magSf.assign(2, 1.0);
+            q.Cf.assign(2, vector{0, 0, 0});
+            auto pf = makePatchField<vector>(q, plain.boundary.at(0));
+            pf->evaluate({});
+
+            FvPatchFieldMapping pm;
+            pm.direct = true;
+            pm.directAddressing = {1};
+            FvPatch turned = q;
+            turned.size = 1;
+            turned.faceCells.assign(1, 0);
+            turned.deltaCoeffs.assign(1, 1.0);
+            turned.nf.assign(1, vector{0, 1, 0});     // the surviving face now faces +y
+            turned.magSf.assign(1, 1.0);
+            turned.Cf.assign(1, vector{0, 0, 0});
+            q = turned;                                // the field holds a reference
+            pf->autoMap(pm, std::vector<vector>(1, vector{}));
+            pf->evaluate({});
+            const vector vm = pf->value().at(0);
+            if (pf->value().size() == 1 && vm.x == 0.0 && vm.y == -10.0 && vm.z == 0.0)
+                std::printf("  OK   refValue is re-formed against the CURRENT normal: (0 -10 0)\n");
+            else { std::printf("  FAIL the normal change was not followed (U_b=(%g %g %g))\n",
+                               (double)vm.x, (double)vm.y, (double)vm.z); failures++; }
+        }
+
         // The uniformNormalFixedValue spelling routes through the same slot; same rule.
         const FieldData<vector> unf = readField<vector>(writeU(base + "/snf/uniform",
             "    inlet { type uniformNormalFixedValue; uniformValue table ((0 0) (1 -10));\n"

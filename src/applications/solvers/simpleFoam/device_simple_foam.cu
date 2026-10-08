@@ -296,6 +296,9 @@ void amgFineCoeffKernel(
                 hasSym_ = true;
                 break;
             }
+        // ...and the SHARED DIAGONAL's question, which is a different one: does any patch give the
+        // three components DIFFERENT boundary coefficients? See DeviceSimpleSolver::hasCmptBC_.
+        hasCmptBC_ = hasSym_ || hasWedge_ || hasPiov_;
         // flowRateInletVelocity, EITHER form: one masked-magSf buffer per such patch, plus the outward
         // normals over all boundary faces. Both are geometric and built once.
         {
@@ -492,6 +495,9 @@ void amgFineCoeffKernel(
         amg_ = nAmgIfEdges_
              ? buildAMG(ownerInt, neiInt, fwAMG, nC_)
              : buildOrLoadAMG(ownerInt, neiInt, fwAMG, nC_, ctl_.caseDir + "/constant/polyMesh", ctl_.writeCache);
+        // ...and with its interface edges in the agglomeration this hierarchy's coarse matrices hold the pair:
+        // the pressure solver must not carry it on the grids a second time (AMGData::pairInCoarseMatrices)
+        amg_.pairInCoarseMatrices = nAmgIfEdges_ > 0;
 
         // initial device state.
         {
@@ -1095,7 +1101,7 @@ void amgFineCoeffKernel(
         // mixed freestreamVelocity/Pressure: recompute the per-face valueFraction from the (lagged) flow angle.
         if (hasMixed_) deviceUpdateMixedFreestream(dbU_, dbP_, phiBnd_, Uk_[0], Uk_[1], Uk_[2],
                                                   compressible_ ? &rhoBnd_ : nullptr);   // phiBnd_ is a MASS flux
-        if (hasPiov_)  deviceUpdatePressureInletOutletVelocity(dbU_, phiBnd_, Uk_[0], Uk_[1], Uk_[2]);
+        if (hasPiov_)  deviceUpdatePressureInletOutletVelocity(dbU_, phiBnd_, Uk_[0], Uk_[1], Uk_[2], /*directionMixed=*/true);
         if (hasSym_)   deviceUpdateSymmetry(dbU_, Uk_[0], Uk_[1], Uk_[2]);
         if (hasWedge_) deviceUpdateWedge(dbU_, Uk_[0], Uk_[1], Uk_[2]);   // axisymmetric: the rotated cell velocity
         // totalPressure p: recompute refValue = p0 - 0.5*neg(phi)|U_b|^2 from the boundary velocity (deviceBCValue
@@ -1497,7 +1503,7 @@ void amgFineCoeffKernel(
             deviceScale(mLo,   DeviceSimpleControls::lustUpwindFrac);  deviceAxpy(DeviceSimpleControls::lustCentralFrac, cL, mLo);
         }
         else                 deviceDivUpwindCoeffs(dm, phiInt_, mDiag, mUp, mLo);
-        deviceLaplacianCoeffs(dm, nuEff_f, lD, lU, lL, ctl_.nonOrth);
+        deviceLaplacianCoeffs(dm, nuEff_f, lD, lU, lL, ctl_.nonOrth || ctl_.nonOrthCoeffs);
         deviceAxpy(-1.0,lD,mDiag);
         deviceAxpy(-1.0,lU,mUp);
         deviceAxpy(-1.0,lL,mLo);
@@ -1610,7 +1616,7 @@ void amgFineCoeffKernel(
         // must use OF's cmptMax(cmptMag(iC0,iC1,iC2)), not comp[0] alone (== comp[0] when components are equal, so
         // every other BC is unaffected). Compute the per-component boundary iC and the per-face max magnitude.
         DeviceBuffer<scalar> iCmaxMag, iCmin;
-        if (hasSym_)
+        if (hasCmptBC_)
         {
             DeviceBuffer<scalar> r1IC,r1BC,r1lIC,r1lBC, r2IC,r2BC,r2lIC,r2lBC;
             deviceBCDivCoeffs(dbU_.comp[1], phiBnd_, r1IC, r1BC);
@@ -1628,8 +1634,8 @@ void amgFineCoeffKernel(
         DeviceBuffer<scalar> delta;   // mDiagR is now a member
         deviceRelaxDiag(deviceLduView(dm,mDiag,mUp,mLo), dm, r0IC, ctl_.uRelax(), mDiagR, delta,
                         hasCyclic_ ? cycSumOff.data() : (hasAMI_ ? amiSumOff.data() : nullptr),
-                        hasSym_ ? iCmaxMag.data() : nullptr,
-                        hasSym_ ? iCmin.data() : nullptr);
+                        hasCmptBC_ ? iCmaxMag.data() : nullptr,
+                        hasCmptBC_ ? iCmin.data() : nullptr);
         if (stageDumpActive() && stageDumpFirstOnly("mommat"))
         {
             stageDump("stage_mDiag0", mDiag);     // assembled momentum diagonal BEFORE relax (OF D0)
@@ -1986,7 +1992,7 @@ void amgFineCoeffKernel(
         // misses the constrained-component diagonal (bottom symmetry iC=(0,iC_v,0): iC[0]=0 but cmptAv=iC_v/3), which
         // on high-AR cells made rAU wildly too large -> catastrophic slip blowup. Reused below as the H() cmptAv term.
         DeviceBuffer<scalar> cmptAvIC;
-        if (hasSym_)
+        if (hasCmptBC_)
         {
             deviceCopy(cmptAvIC, iC[0]);
             deviceAxpy(1.0, iC[1], cmptAvIC);
@@ -1994,7 +2000,7 @@ void amgFineCoeffKernel(
             deviceScale(cmptAvIC, 1.0/3.0);
         }
         DeviceBuffer<scalar> diagA,dumb,rAU;
-        deviceFold(dm,mDiagR,zeroSrc_, hasSym_ ? cmptAvIC : iC[0], zeroBndU_,diagA,dumb);
+        deviceFold(dm,mDiagR,zeroSrc_, hasCmptBC_ ? cmptAvIC : iC[0], zeroBndU_,diagA,dumb);
         deviceReciprocalV(dm,diagA,rAU);
         // SIMPLEC: rAtU = 1/(1/rAU - H1) = V/max(A*1, 0.1*diagA) (A*1 = row sum = deviceAmul with ones). drAtU = rAtU - rAU.
         DeviceBuffer<scalar> rAtU, drAtU;
@@ -2058,13 +2064,16 @@ void amgFineCoeffKernel(
             DeviceBuffer<scalar>* UN[3] = { &UNx, &UNy, &UNz };
             for (int kk = 0; kk < 3; ++kk)
             {
-                DeviceBuffer<scalar> bdH;   // slip: bdDiag = cmptAv(iC) - iC[kk] (OF H() term); else zero (bit-identical)
-                if (hasSym_)
+                // OF's H() carries the SAME per-component correction as A(): bdDiag = cmptAv(iC) -
+                // iC[kk], zero only while the three agree. Keyed on hasCmptBC_ with the fold above --
+                // a wedge or a directionMixed piov needs it exactly as a slip patch does.
+                DeviceBuffer<scalar> bdH;
+                if (hasCmptBC_)
                 {
                     deviceCopy(bdH, cmptAvH);
                     deviceAxpy(-1.0, iC[kk], bdH);
                 }
-                deviceMatrixH(Uview, dm, Uk_[kk], relaxSrc[kk], hasSym_ ? bdH : zeroBndU_, bCb[kk], Hk[kk]);
+                deviceMatrixH(Uview, dm, Uk_[kk], relaxSrc[kk], hasCmptBC_ ? bdH : zeroBndU_, bCb[kk], Hk[kk]);
                 if (hasCyclic_ && !cyc_.rotational) interfaceAddH(cyc_, Uk_[kk], dm.V, Hk[kk]);   // translational off-diag
                 if (hasAMI_) interfaceAddH(ami_, *UN[kk], dm.V, Hk[kk]);
             }
@@ -2360,7 +2369,7 @@ void amgFineCoeffKernel(
             DeviceBuffer<scalar> drAtUf;
             deviceInterpolate(dm, drAtUFlux_, drAtUf);   // rho*(rAtU-rAU) when compressible
             DeviceBuffer<scalar> ld, lu, ll;
-            deviceLaplacianCoeffs(dm, drAtUf, ld, lu, ll, ctl_.nonOrth);   // over-relaxed nonOrthDeltaCoeffs to match OF's corrected snGrad(p) (was orthogonal dc -> cos(theta) too small on non-orth meshes)
+            deviceLaplacianCoeffs(dm, drAtUf, ld, lu, ll, ctl_.nonOrth || ctl_.nonOrthCoeffs);   // over-relaxed nonOrthDeltaCoeffs to match OF's corrected snGrad(p) (was orthogonal dc -> cos(theta) too small on non-orth meshes)
             DeviceBuffer<scalar> fInt;
             deviceMatrixFluxInternal(deviceLduView(dm, ld, lu, ll), dp_, fInt);
             deviceAxpy(1.0, fInt, phiHi);
@@ -2541,7 +2550,7 @@ void amgFineCoeffKernel(
                 if (hasCyclic_) interfaceAddGrad(cyc_, dp_, dm.V, gx, gy, gz);
                 if (hasAMI_)    interfaceAddGrad(ami_, dp_, dm.V, gx, gy, gz);
             }
-            deviceLaplacianCoeffs(dm, rAUf, pD_, pU_, pL_, ctl_.nonOrth);
+            deviceLaplacianCoeffs(dm, rAUf, pD_, pU_, pL_, ctl_.nonOrth || ctl_.nonOrthCoeffs);
             // OF: `- fvm::laplacian(rhorAtU, p)` with `rhorAtU = rho*rAtU` (pcEqn.H:13), and an fvMatrix's
             // internalCoeffs/boundaryCoeffs are built from the SAME diffusivity as its internal
             // coefficients. brae passed the unweighted rAtU here while the internal coefficients used
@@ -2840,6 +2849,45 @@ void amgFineCoeffKernel(
         }
         if (hasWedge_) deviceUpdateWedge(dbU_, Uk_[0], Uk_[1], Uk_[2]);   // pEqn.H's U.correctBoundaryConditions()
         if (hasSym_)   deviceUpdateSymmetry(dbU_, Uk_[0], Uk_[1], Uk_[2]); // ...for the symmetry patches too (item 13)
+        // ...AND THE FLUX-CONDITIONAL CLASSES, which that same correctBoundaryConditions moves.
+        // inletOutlet's valueFraction is neg(phi) and pressureInletOutletVelocity's typing is the flux
+        // sign, both set inside updateCoeffs -- which evaluate() runs whenever the patch is not still
+        // updated() (mixedFvPatchField.C:234-237). This loop applied them ONCE per outer iteration, at
+        // the momentum assembly, so correctors 2..N ran on the switch the assembly left while
+        // OpenFOAM's had moved to the flux each corrector produced. THE FIRST corrector of a pass with
+        // no momentum predictor is the exception, and is OpenFOAM's own: nothing has evaluated U since
+        // the assembly, so its patches are still updated() and keep the assembly's coefficients -- the
+        // rule interFoam's loop carries as DeviceUBoundaryCall::evaluateStillUpdated. With a momentum
+        // predictor its solve ends in an evaluate, which clears the flag, so every corrector switches.
+        // BRAE_IO_NO_CORRECTOR_REFRESH=1 restores the behaviour before this correction -- the switch
+        // left at the momentum assembly's flux for the whole pass. An instrument, not a mode, and it
+        // is the CONTROL a gate for this needs: THERE IS NO SUCH GATE YET, and here is why, measured
+        // on RAS/TJunction (two inletOutlet outlets, nCorrectors 2) with the flips COUNTED. Of the 50
+        // io faces, exactly 25 ever change type, once, at corrector 0 of the FIRST step -- and they
+        // change from the zeroGradient the assembly's phi = 0 implies to fixedValue at the inletValue,
+        // with the case starting from rest, so U_cell is itself ~0 = inletValue and the two states
+        // COINCIDE. Every later step: 0 of 50. Three stagings were built to force more (a p0 table
+        // crossing the outlet's own pressure, and a large reversal at ten times the step) and each
+        // read the same digits with the refresh and without it.
+        // WHAT A DISCRIMINATING CASE NEEDS, from that: the flip must happen WITHIN a step, between
+        // correctors -- a flip between steps is caught by the assembly call above and this one never
+        // sees it -- AND the patch's velocity must be far from the inletValue when it happens, which
+        // means a developed flow reversing at an outlet face that still carries a large tangential
+        // velocity. Until such a case exists this correction is faithful-but-unwitnessed, and saying
+        // so is the point of this comment.
+        static const bool ioRefreshOff = (std::getenv("BRAE_IO_NO_CORRECTOR_REFRESH") != nullptr);
+        if (!ioRefreshOff && (ctl_.innerCorrector > 0 || ctl_.momentumPredictor))
+        {
+            deviceUpdateInletOutlet(dbU_, phiBnd_);
+            // NOT pressureInletOutletVelocity, though OpenFOAM's updateCoeffs moves it here too: this
+            // driver types a piov face in the LEGACY form (deviceUpdatePressureInletOutletVelocity's
+            // `directionMixed=false`, every inflow component fixedValue at n(n.U_cell)), which the
+            // frozen incompressible path's fluxes and matrix grew around and which validation/piov is
+            // held to at its recorded numbers (tests/simple_piov_vs_openfoam.sh). Re-applying THAT form
+            // per corrector is not OpenFOAM's directionMixed either: MEASURED on RAS/TJunction, ten
+            // steps of 0.002, it moves U from 7.078e-03 to 7.690e-02 against OpenFOAM -- ten times
+            // further. The piov half of this correction belongs with the directionMixed port.
+        }
         // limitVelocity (fvOptions.correct): clamp |U| <= max on the corrected (output) velocity. OF clamps after the
         // momentum predictor; cf clamps the post-corrector U so the WRITTEN field is bounded (matches OF's output).
         if (limUActive_) deviceFvoLimitVelocity(limUCells_, limUMax_, Uk_[0], Uk_[1], Uk_[2]);
@@ -3186,7 +3234,7 @@ void amgFineCoeffKernel(
         for (int pass = 0; pass < nPasses; ++pass)
         {
             DeviceBuffer<scalar> pcD, pcU, pcL, pcIC, pcBC, diagC, b, divPhi, ffc;
-            deviceLaplacianCoeffs(dm, onesF, pcD, pcU, pcL, ctl_.nonOrth);
+            deviceLaplacianCoeffs(dm, onesF, pcD, pcU, pcL, ctl_.nonOrth || ctl_.nonOrthCoeffs);
             deviceBCLaplacianCoeffs(dbPcorr_, onesC, pcIC, pcBC);
             deviceDiv(dm, phiInt_, phiBnd_, divPhi);
             if (hasCyclic_) interfaceAddDiv(cyc_, dm.V, divPhi);
@@ -3964,6 +4012,7 @@ void amgFineCoeffKernel(
                 // finalOnLastPimpleIterOnly. The non-orth half of finalInnerIter() is applied inside
                 // correctPressureVelocity, which owns that loop.
                 ctl_.finalInner = (pc == nCorr - 1) && (!ctl_.finalOnLastPimpleIterOnly || ctl_.finalIter);
+                ctl_.innerCorrector = pc;   // the flux-conditional patches' lag -- see correctPressureVelocity
                 correctPressureVelocity(res);
             }
             }   // solveFlow

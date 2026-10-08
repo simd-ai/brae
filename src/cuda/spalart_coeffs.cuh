@@ -16,11 +16,17 @@ struct SpalartAllmarasCoeffs {
     scalar Cs       = 0.3;
     scalar E        = 9.8;       // nutUSpaldingWallFunction wall E (Spalding law)
     scalar CDES     = 0.65;      // SA-DES/DDES/IDDES model constant (OF SpalartAllmarasDES default)
-    // SA-IDDES (SpalartAllmarasIDDES, Shur/Spalart/Strelets/Travin 2008) blending constants. Exponents are fixed per
-    // the reference (f_dt cube, f_l ^10, f_t cube); only the multipliers are carried here.
-    scalar Cdt1     = 20.0;      // f_dt = 1 - tanh((Cdt1*rd_t)^3)
-    scalar Cl       = 5.0;       // f_l  = tanh((Cl^2*rd_l)^10)
-    scalar Ct       = 1.87;      // f_t  = tanh((Ct^2*rd_t)^3)
+    // SA-IDDES (SpalartAllmarasIDDES) blending constants, at OpenFOAM's defaults for THIS model
+    // (SpalartAllmarasIDDES.C:165-209). They were 20 / 5 / 1.87, which are kOmegaSSTIDDES's
+    // (kOmegaSSTIDDES.C:160-193): a case that left them unset ran the other model's blending.
+    // f_dt = 1 - tanh((Cdt1*rd_t)^Cdt2), f_l = tanh((Cl^2*rd_l)^10), f_t = tanh((Ct^2*rd_t)^3)
+    scalar Cdt1 = 8.0;
+    scalar Cdt2 = 3.0;
+    scalar Cl = 3.55;
+    scalar Ct = 1.63;
+    // `fe`: the elevating function of Shur et al. (2008); false is Gritskevich et al.'s (2011) simplified form
+    // with fe = 0 (SpalartAllmarasIDDES.C:112-134)
+    bool fe = true;
     scalar Cw       = 0.15;      // IDDES length scale delta = min(max(Cw*y, Cw*hmax), hmax)
     scalar fwStar   = 0.424;     // low-Re DES correction Psi: f_w in the log layer (Spalart et al. 2006)
     // DDES shielding function fd = 1 - tanh((Cd1*r)^Cd2). OF exposes Cd1/Cd2 as dictionary entries

@@ -131,10 +131,15 @@ struct RhoPressureInput
     scalar pRefValue = 0.0;
 
     bool   correctedLaplacian = false;   // BOTH halves, as everywhere else in this port
+    // ...and WHICH delta coefficients: `uncorrected` takes nonOrthDeltaCoeffs with no correction
+    // flux (uncorrectedSnGrad.H:113-119). See solver_controls.cuh:226.
+    bool   nonOrthCoeffs = false;
     scalar snGradLimitCoeff   = 0.0;
     // snGradSchemes, for rhoPcEqn's fvc::snGrad(p) ALONE (pcEqn.H:64) -- pEqn's laplacian takes the
     // pair above. Defaults to `corrected` because OpenFOAM's absent-block default is (schemesLookup.C:82).
     bool   correctedFvcSnGrad  = true;
+    // ...and the snGrad block's own coefficient choice -- same two facts, other block.
+    bool   fvcSnGradNonOrthCoeffs = true;
     scalar fvcSnGradLimitCoeff = 0.0;
     // grad(p) resolving to leastSquares: the non-orthogonal correction's gradient here and in pcEqn,
     // and SIMPLEC's HbyA correction (pcEqn.H:30,65). See RhoStepInput::gradPLeastSq.

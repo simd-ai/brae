@@ -162,7 +162,8 @@ ConsistentPressureStages consistentPressurePredictor(
     // in.correctedLaplacian until 2026-09-15, so a case whose two blocks disagreed ran the laplacian's
     // scheme here under the snGrad block's name; see solver_controls.cuh and validation/rhoSnGrad.
     const SurfaceScalarField snGradP = fvc::snGrad(p, m, g, patches, in.correctedFvcSnGrad, in.gradPLeastSq,
-                                                   in.gradPLimitK, in.fvcSnGradLimitCoeff);
+                                                   in.gradPLimitK, in.fvcSnGradLimitCoeff,
+                                                   in.fvcSnGradNonOrthCoeffs);
 
     SurfaceScalarField simplecCorr;
     simplecCorr.internal.resize(st.phiHbyA.internal.size());
@@ -270,7 +271,7 @@ FvScalarMatrix assemblePcEqn(
     const SurfaceScalarField gammaf =
         effectiveFaceViscosity(st.rhorAtU, rhorAtUb, m, g, patches);
 
-    FvScalarMatrix M = fvm::laplacian<scalar>(gammaf, p, m, g, patches, in.correctedLaplacian);
+    FvScalarMatrix M = fvm::laplacian<scalar>(gammaf, p, m, g, patches, in.correctedLaplacian, in.nonOrthCoeffs);
     // `corrected` HAS TWO HALVES AND THIS FILE ONLY HAD ONE. correctedLaplacian selects
     // nonOrthDeltaCoeffs for the implicit coefficients; the explicit
     // source -= V*div(gamma*magSf*(corrVec & interpolate(grad p))) is a separate term that

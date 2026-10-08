@@ -39,6 +39,7 @@ DeviceLduView foldedView(const DeviceMesh& dm, const PressureMatrix& P, const De
     A.ownerStart = dm.ownerStart.data();
     A.losort = dm.losort.data();
     A.losortStart = dm.losortStart.data();
+    A.addressingId = dm.addressingId;
     return A;
 }
 
@@ -55,6 +56,7 @@ DeviceLduView foldedViewM(const DeviceMesh& dm, const MomentumMatrix& M, const D
     A.ownerStart = dm.ownerStart.data();
     A.losort = dm.losort.data();
     A.losortStart = dm.losortStart.data();
+    A.addressingId = dm.addressingId;
     return A;
 }
 
@@ -882,6 +884,7 @@ Residuals rhoSimpleStep(
     uin.gradULULimitK = in.gradULULimitK;
     uin.gradULeastSq  = in.gradULeastSq;
     uin.correctedLaplacian = in.correctedLaplacian;
+    uin.nonOrthCoeffs = in.nonOrthCoeffs;
     uin.snGradLimitCoeff = in.snGradLimitCoeff;
     // The porosity the momentum module has always been able to apply, and which the driver never passed.
     uin.porosity = in.porosity;
@@ -1189,6 +1192,7 @@ Residuals rhoSimpleStep(
         ein.limGradHeLeastSq = in.limGradHeLeastSq;
         ein.limGradKELeastSq = in.limGradKELeastSq;
         ein.correctedLaplacian = in.correctedLaplacian;
+        ein.nonOrthCoeffs = in.nonOrthCoeffs;
         ein.snGradLimitCoeff = in.snGradLimitCoeff;
         ein.hasMRF = in.hasMRF;
         ein.hasFvOptions = in.hasFvOptions;
@@ -1355,7 +1359,9 @@ Residuals rhoSimpleStep(
     pin.relaxPSpecified = in.relaxPEqnSpecified;
     pin.pRefCell = in.pRefCell;      pin.pRefValue = in.pRefValue;
     pin.correctedLaplacian  = in.correctedLaplacian;
+    pin.nonOrthCoeffs = in.nonOrthCoeffs;
     pin.correctedFvcSnGrad  = in.correctedFvcSnGrad;    // snGradSchemes, for the SIMPLEC fvc::snGrad(p)
+    pin.fvcSnGradNonOrthCoeffs = in.fvcSnGradNonOrthCoeffs;
     pin.fvcSnGradLimitCoeff = in.fvcSnGradLimitCoeff;
     pin.snGradLimitCoeff = in.snGradLimitCoeff;
     pin.gradPLeastSq     = in.gradPLeastSq;

@@ -319,7 +319,7 @@ void consistentPressurePredictor(
         // Both arms read in.correctedLaplacian here until 2026-09-15; validation/rhoSnGrad is the
         // fixture where the two blocks disagree and the difference is visible.
         DeviceBuffer<scalar> ld, lu, ll;
-        deviceLaplacianCoeffs(dm, gammaf, ld, lu, ll, in.correctedFvcSnGrad);
+        deviceLaplacianCoeffs(dm, gammaf, ld, lu, ll, in.correctedFvcSnGrad || in.fvcSnGradNonOrthCoeffs);
         deviceMatrixFluxInternal(deviceLduView(dm, ld, lu, ll), p, corrInt);
         if (in.correctedFvcSnGrad)
         {
@@ -437,7 +437,7 @@ void assemblePcEqn(
     const int nC = dm.nCells;
 
     // ---- -fvm::laplacian(rhorAtU, p) --------------------------------------------------------
-    deviceLaplacianCoeffs(dm, st.rhorAtUf, P.diag, P.upper, P.lower, in.correctedLaplacian);
+    deviceLaplacianCoeffs(dm, st.rhorAtUf, P.diag, P.upper, P.lower, in.correctedLaplacian || in.nonOrthCoeffs);
     deviceBCLaplacianCoeffsFace(dbP, st.rhorAtUfBnd, P.iC, P.bC);
     zeroed(P.source, nC);
 

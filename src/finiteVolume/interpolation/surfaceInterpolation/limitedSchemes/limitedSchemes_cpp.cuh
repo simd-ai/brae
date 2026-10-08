@@ -47,6 +47,49 @@
 
 namespace brae {
 namespace cpu {
+
+// ONE EQUATION'S CONVECTION SCHEME, as `fvSchemes { divSchemes }` gives it.
+//
+// WHY IT EXISTS: `fvm::div(phi, psi)` resolves `div(phi,<psi>)` by the FIELD's name, so a case may write
+// `div(phi,k) Gauss upwind;` beside `div(phi,epsilon) Gauss limitedLinear 1;` and OpenFOAM assembles two
+// different matrices. brae's kEpsilon and kOmegaSST references took ONE scheme for both equations, and
+// every caller refused a mismatch rather than substitute -- honestly, but the case was then unrunnable.
+// A closure takes k's positionally, as it always has, and this for the second equation.
+//
+// `bounded` belongs here too: boundedConvectionScheme WRAPS the Gauss operator and subtracts
+// Sp(div(phi), psi), so it is part of the same fvm::div object and is per-entry in exactly the same way.
+// `linearUpwind`/`luGradK` are carried by the kEpsilon closure only; the kOmegaSST one does not assemble
+// that scheme and refuses it, so they stay false there.
+struct EqnDivScheme
+{
+    bool   bounded       = false;
+    bool   limitedLinear = false;
+    // the RAW k of `limitedLinear <k>` -- limitedLinearWeights computes twoByk itself
+    scalar limiterCoeff  = 1.0;
+    bool   linearUpwind  = false;
+    // the cellLimited k of the gradient linearUpwind NAMES, which is not grad(<field>)'s
+    scalar luGradK       = 0.0;
+};
+
+// ONE EQUATION'S GRADIENT SCHEME, as `fvSchemes { gradSchemes }` gives it.
+//
+// `fvc::grad(vf)` resolves `grad(<vf>)` by the FIELD's name, so `grad(k) Gauss linear` beside
+// `grad(epsilon) cellLimited Gauss linear 1` are two different gradients and OpenFOAM computes each. The
+// kEpsilon and kOmegaSST references carried ONE pair of flags for both equations and every caller refused
+// a mismatch. `KEpsilonCoeffs::gradKLeastSq`/`gradKLimitK` remain K's, as they always were, and this is
+// the second equation's -- so no positional caller moves and no site can silently read the other field's.
+//
+// WHERE IT IS READ: the corrected laplacian's deferred correction takes grad(<field>) for the field it is
+// differencing; limitedLinear's limiter takes grad(<field>) of the field it limits; and under kOmegaSST
+// CDkOmega takes grad(k) AND grad(omega) in ONE expression (kOmegaSSTBase.C:548), which is why the two
+// have to be resolved separately rather than by one flag chosen per call.
+struct EqnGradScheme
+{
+    bool   leastSquares = false;
+    // the cellLimited coefficient, 0 meaning unlimited
+    scalar cellLimitK   = 0;
+};
+
 namespace limitedSchemes {
 
 // THE LIMITER MATH ITSELF, exposed rather than kept private to the .cu, because it is needed in TWO
@@ -100,6 +143,17 @@ inline scalar rVector(scalar faceFlux, const vector& phiP, const vector& phiN,
 // limitedLinear.H's limiter, and the blend limitedSurfaceInterpolationScheme::weights applies to it.
 inline scalar limitedLinearLimiter(scalar r, scalar twoByk) { return clamp01(twoByk * r); }
 
+// vanLeer.H:85 -- (r + |r|)/(1 + |r|). NOT clamped, and NOT bounded by 1: it rises through 1 at r = 1
+// and asymptotes to 2 as r -> inf, which is the Sweby TVD ceiling. limitedLinear clamps to [0,1]
+// because its own twoByk*r form would run away; writing the same clamp here would cap vanLeer at the
+// central-difference weight and make it a different scheme. Every interFoam tutorial limits
+// div(phi,alpha) with it, so this is the VoF scheme, not an option.
+inline scalar vanLeerLimiter(scalar r)
+{
+    const scalar ar = std::fabs(r);
+    return (r + ar) / (scalar(1) + ar);
+}
+
 inline scalar blend(scalar limiter, scalar cdWeight, scalar faceFlux)
 {
     return limiter*cdWeight + (1.0 - limiter)*((faceFlux >= 0.0) ? 1.0 : 0.0);   // pos0
@@ -138,6 +192,25 @@ std::vector<scalar> limitedLinearWeightsCoupled(
     const std::vector<vector>& gN,    // grad's patchNeighbourField (rotated when the patch transforms)
     scalar                     k);
 
+// ...and the whole boundaryField of the scheme's weights, patch by patch, which is what
+// gaussConvectionScheme::fvmDiv hands fvm::div for a COUPLED patch (gaussConvectionScheme.C:105-108).
+// Uncoupled patches get an empty entry: their coefficients come from the field's own
+// valueInternalCoeffs/valueBoundaryCoeffs, which take no weight.
+//
+// It exists so the two closures (and any other caller of fvm::div with weights) share ONE assembly of
+// the coupled side. Doing it at each call site is how a scheme ends up carried on one path and not the
+// other -- which is exactly what this function is fixing: a limited div scheme on a mesh with a pair
+// was refused outright, because the pair's coefficient was only ever built with upwind's weight.
+//
+// A ROTATIONAL pair would need the neighbour's GRADIENT rotated (patchNeighbourField transforms a
+// vector); brae refuses one before this is reached, and this asserts nothing about it.
+std::vector<std::vector<scalar>> limitedLinearPatchWeights(
+    const std::vector<std::vector<scalar>>& phiBoundary,
+    const std::vector<scalar>&              vf,        // the CELL values
+    const std::vector<vector>&              gradVf,    // the limiter's gradient, per cell
+    scalar                                  k,
+    const std::vector<FvPatch>&             patches);
+
 // The V form. gP/gN use OPENFOAM's packing, gradc_ij = d(U_j)/d(x_i) -- see detail::rVector.
 std::vector<scalar> limitedLinearVWeightsCoupled(
     const std::vector<scalar>& phi,
@@ -164,6 +237,43 @@ std::vector<scalar> limitedLinearWeights(
     const GeometricField<scalar>&     vf,
     const std::vector<vector>&        gradVf,
     scalar                            k,        // the scheme coefficient; `limitedLinear 1` -> k = 1
+    const PrimitiveMesh&              m,
+    const FvGeometry&                 g);
+
+// vanLeer, scalar form: weights = limiter*CD + (1-limiter)*pos0(phi), with vanLeer's own limiter. It
+// takes no coefficient -- `Gauss vanLeer` has no k -- which is the one structural difference from
+// limitedLinear's signature.
+std::vector<scalar> vanLeerWeights(
+    const std::vector<scalar>&        phi,
+    const GeometricField<scalar>&     vf,
+    const std::vector<vector>&        gradVf,
+    const PrimitiveMesh&              m,
+    const FvGeometry&                 g);
+
+// interfaceCompression: a PhiScheme (makePhiSurfaceInterpolationScheme(interfaceCompression,
+// interfaceCompressionLimiter, scalar), interfaceCompression.C:33-41), so its limiter reads the TWO CELL
+// VALUES of the field and nothing else -- no gradient, no r:
+//     limiter = clamp(1 - max(sqr(1 - 4 phiP (1 - phiP)), sqr(1 - 4 phiN (1 - phiN))), 0, 1)
+// (interfaceCompression.H, the quartic form). It is 1 where both cells are half full and 0 where either
+// is empty or full, so the face value is central across the interface and upwind away from it. The
+// blend is limitedSurfaceInterpolationScheme::weights' (PhiScheme.C, limiter; limitedSurfaceInterpolation-
+// Scheme.C, weights). Internal faces only: on an uncoupled patch the limiter is 1 and the face value is
+// the patch's own.
+std::vector<scalar> interfaceCompressionWeights(
+    const std::vector<scalar>&        phi,
+    const GeometricField<scalar>&     vf,
+    const PrimitiveMesh&              m,
+    const FvGeometry&                 g);
+
+// vanLeerV: vanLeer's limiter on NVDVTVDV's r -- makeLimitedVSurfaceInterpolationScheme(vanLeerV,
+// vanLeerLimiter) in vanLeer.C:37, which is LimitedScheme<vector, vanLeerLimiter<NVDVTVDV>, null>.
+// Eight interFoam tutorials name it for div(rhoPhi,U), every one a closed tank in motion. The
+// gradient is grad(U) through the case's own gradSchemes entry, as LimitedScheme::calcLimiter's
+// fvc::grad(lPhi) resolves it.
+std::vector<scalar> vanLeerVWeights(
+    const std::vector<scalar>&        phi,
+    const GeometricField<vector>&     vf,
+    const std::vector<tensor>&        gradVf,
     const PrimitiveMesh&              m,
     const FvGeometry&                 g);
 

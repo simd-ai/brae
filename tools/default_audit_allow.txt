@@ -1,0 +1,488 @@
+# Defaults knowingly kept -- tools/default_audit.py's ledger. One line per justified omission:
+#     <Struct> <variable> <field>    # why the default IS the case's value at that site
+# A NAME IS NOT A TYPE: where a struct name is defined in more than one namespace -- `Compressible` in
+# kEpsilonRef and in kOmegaSST, `PressureInput` in three -- the line names the namespace as C++ does,
+#     <namespace>::<Struct> <variable> <field>
+# and the bare form is REPORTED, not matched. Keyed on the name alone, one line exempted the field in
+# both types and a line that had gone stale in one was held alive by the other.
+# An entry leaves when the field is wired, the site is folded into a builder, or the refusal that
+# makes it unreachable is lifted (then the field must be set and gated). A stale entry fails the gate.
+
+# start-up CorrectPhi (initCorrectPhi.H) runs before any mesh update: polyMesh::changing() is false and
+# there is no mesh flux; the mesh-update site sets both
+CorrectPhiInput cin meshChanging    # inter_driver_device.cu, start-up: OpenFOAM's mesh.changing() is false at t0
+CorrectPhiInput cin meshPhi         # inter_driver_cpp.cu + inter_driver_device.cu, start-up: no motion yet, makeRelative is a no-op
+
+# the instrument that runs the HOST closure inside the device loop (BRAE_INTER_HOST_CLOSURE): the four
+# inputs it does not set are each behind a refusal by name in inter_driver_device.cu
+InterTurbulenceStepInput ti V0      # a RAS closure on a moving mesh is refused on the device ("RAS closure AND moves its mesh") -- ARM device_moving_SST
+InterTurbulenceStepInput ti meshPhi # same refusal -- ARM device_moving_SST
+InterTurbulenceStepInput ti cn      # BRAE_INTER_HOST_CLOSURE under CrankNicolson is refused
+InterTurbulenceStepInput ti rhoOO   # same refusal
+
+# RunReport is an OUTPUT the drivers fill as they go, not a control read from the case
+RunReport rep alphaSolves
+RunReport rep pSolves
+RunReport rep steps
+RunReport rep pcorrSolves
+RunReport rep turbulenceOnDevice
+
+# ---- the shared closure inputs (kEpsilon.cuh KEpsilonInput, kOmegaSST.cuh KOmegaSSTInput) -------------
+# interFoam's device closure (device_inter_turbulence.cu, `kin` at the kEpsilon site, `sin` at the SST
+# site) against rhoSimpleFoam's hook (rhoTurbulenceHook.cu). Reasons per family:
+#   alphat: the compressible EddyDiffusivity (alphat = rho*nut/Prt) has no counterpart in interFoam --
+#     incompressible::turbulenceModel and interFoam's `density variable` lineage carry no energy equation
+#     (interFoam/createFields.H builds no alphat; compressibleInterPhaseTransportModel.H has none)
+#   div schemes: interFoam's reader admits `Gauss upwind` only for div(phi,k|epsilon|omega) --
+#     requireUpwind, inter_turbulence_cpp.cu:94-104 ("is not plain `Gauss upwind`... refusing")
+#   fvOptions on k/epsilon/omega (scalarFixedValue-type masks): every option type but the ported ones is
+#     refused by its own name before the loop runs (inter_driver_device.cu, "fvOptions has an active
+#     option `...`")
+#   colouring/gsColour/polyDeg/precon: brae's solver VARIANTS (coloured Gauss-Seidel, polynomial
+#     preconditioning); off = OpenFOAM's own symGaussSeidel smoother / PBiCG-DILU, which is what the
+#     interFoam reader admits (readFinalSolve, inter_turbulence_cpp.cu:78-88) and what kin/sin select
+#   notices (hasNonUpwindDivScheme, divSchemeUnsupported, hasUnportedFvOption, fvOptionUnsupported,
+#     hasNonWallTurbWallFunc): rhoSimpleFoam's hook fills them for the closure's own refuseUnsupported;
+#     interFoam refuses each condition itself before the closure is built (requireUpwind; the fvOptions
+#     refusal; device_inter_turbulence.cu:65 "carries an epsilon or omega wall function and is a `...`,
+#     not a `wall`")
+KEpsilonInput kin alphatPrtFace
+KEpsilonInput kin alphatWallMask
+KEpsilonInput kin Prt
+KEpsilonInput kin boundedK
+KEpsilonInput kin boundedEps
+KEpsilonInput kin linearUpwind
+KEpsilonInput kin luGradK
+KEpsilonInput kin hasNonUpwindDivScheme
+KEpsilonInput kin divSchemeUnsupported
+KEpsilonInput kin fvoKMask
+KEpsilonInput kin fvoKVal
+KEpsilonInput kin fvoEpsMask
+KEpsilonInput kin fvoEpsVal
+KEpsilonInput kin colouring
+KEpsilonInput kin gsColour
+KEpsilonInput kin polyDeg
+KOmegaSSTInput sstIn rDeltaTCells   # rhoTurbulenceHook.cu: rhoSimpleFoam is steady -- no ddtSchemes localEuler, so there is no per-cell step to take
+KOmegaSSTInput sstIn nutWfKsBnd     # rhoTurbulenceHook.cu: rhoSimpleFoam's reader refuses nutkRoughWallFunction by name (turbulence_setup.cuh:89, the shared refusal wall_blending_refusals.sh arm 11 asserts), so no face is rough
+KOmegaSSTInput sstIn nutWfCsBnd     # same site, same refusal
+KOmegaSSTInput sstIn nutWfRoughCmu25Bnd  # same site, same refusal
+KOmegaSSTInput sstIn nutkRoughNoHistory  # same site: a gate control, meaningful only on a rough face
+KOmegaSSTInput sin alphatPrtFace
+KOmegaSSTInput sin alphatWallMask
+KOmegaSSTInput sin Prt
+KOmegaSSTInput sin boundedK
+KOmegaSSTInput sin boundedOmega
+KOmegaSSTInput sin hasNonUpwindDivScheme
+KOmegaSSTInput sin divSchemeUnsupported
+KOmegaSSTInput sin fvoKMask
+KOmegaSSTInput sin fvoKVal
+KOmegaSSTInput sin fvoOmegaMask
+KOmegaSSTInput sin fvoOmegaVal
+KOmegaSSTInput sin hasUnportedFvOption
+KOmegaSSTInput sin fvOptionUnsupported
+KOmegaSSTInput sin hasNonWallTurbWallFunc
+# rhoSimpleFoam offers no PBiCG for the closure AT ALL -- linear_solver_setup reads `gsK` as
+# "smoothSolver named" and otherwise ANNOUNCES the substitute it runs (noticeSolverChoice("k",
+# "PBiCGStab", ...)), which is a declared substitution and not a silent one. interFoam's two sites set
+# `pbicgKE` because its reader admits `solver PBiCG; preconditioner DILU;` for k and omega
+# (tests/interfoam_waterchannel_vs_openfoam.sh `pbicg`). The entry leaves the day rhoSimpleFoam reads
+# the entry too.
+KOmegaSSTInput sstIn pbicgKE
+KOmegaSSTInput sin polyDeg
+# rhoSimpleFoam's hook (rhoTurbulenceHook.cu `kin`): steady/Euler only, no pair on the device, no mangroves
+KEpsilonInput kin cn                # ddtSchemes other than steadyState/Euler are refused (scheme_parse.cuh:304-310, names CrankNicolson) -- ARM tests/rho_step_cuda_refusals.sh's CrankNicolson arm
+KEpsilonInput kin cnDdt0Eps         # same refusal
+KEpsilonInput kin cnDdt0K           # same refusal
+KEpsilonInput kin kOO               # same refusal
+KEpsilonInput kin epsOO             # same refusal
+KEpsilonInput kin rhoOOCell         # same refusal
+KEpsilonInput kin cyc               # the hook sets hasCoupledPatches instead, and the closure's refuseUnsupported fires on it (kEpsilon.cu); the pair port is interFoam's
+KEpsilonInput kin cycPhi            # same
+KEpsilonInput kin cycPhiByRho       # same
+KEpsilonInput kin fvoSpK            # multiphaseMangrovesTurbulenceModel is interFoam's; every other driver refuses the option type by name (firstUnsupported, rhoSimpleFoamDriver.cu:80)
+KEpsilonInput kin fvoSpEps          # same
+KEpsilonInput kin pbicgKE           # the rho mirror selects the closure's solver through TurbulenceHookOptions (gsK/precon), a declared selection of its own (rhoSimpleFoamDriver.cu:553-570)
+KEpsilonInput kin bcPhiBnd          # null = the equation's own flux, which the consumer takes (kEpsilon.cu:796,850 `in.bcPhiBnd ? ... : *in.phiBnd`); the separate flux is interFoam's `density variable` case, kEpsilon.cuh:82-86
+
+# ---- DeviceSimpleControls (solver_controls.cuh) at the two INCOMPRESSIBLE driver sites ---------------
+# gpuSimpleFoam.cu (steady) and gpuPimpleFoam.cu (transient) build the same struct the compressible
+# drivers do; what each leaves at its default is either a control OpenFOAM's own solver never reads on
+# that path, or one the other ALGORITHM owns. `needRef`/`pRefCell`/`pRefValue` used to be here for
+# pimpleFoam and were NOT of this kind -- they are wired now (tests/pimple_pressure_reference_vs_openfoam.sh).
+DeviceSimpleControls ctl transonic               # incompressible: OF's simpleFoam/pimpleFoam pEqn has no transonic branch (the compressible pEqn does); dict_audit.cuh:108-109 says so to the preflight
+DeviceSimpleControls ctl simpleRho               # SIMPLErho is the compressible rho cadence; inert on an incompressible path (solver_controls.cuh:149)
+DeviceSimpleControls ctl correctPhi              # PIMPLE's, read on a MOVING mesh (pimpleFoam sets it from the PIMPLE dict); steady simpleFoam does not move its mesh
+DeviceSimpleControls ctl meshUpdateControl       # same: the mesh-update cadence is the transient driver's
+DeviceSimpleControls ctl meshUpdateInterval      # same
+DeviceSimpleControls ctl moveMeshOuterCorrectors # same (PIMPLE moveMeshOuterCorrectors)
+DeviceSimpleControls ctl momentumPredictor       # a PISO/PIMPLE switch: OF's SIMPLE always predicts momentum, so the default `true` IS simpleFoam's behaviour
+DeviceSimpleControls ctl solveFlow               # PIMPLE's `solveFlow no`; SIMPLE has no such entry, and the preflight would report an unread one
+DeviceSimpleControls ctl turbOnFinalIterOnly     # PIMPLE's turbOnFinalIterOnly: the steady loop corrects turbulence every iteration, as OF's simpleFoam does
+DeviceSimpleControls ctl outerResidualControl    # PIMPLE's residualControl over OUTER correctors; SIMPLE's own residualControl is read separately (gpuSimpleFoam.cu:368)
+
+# ---- DeviceSimpleControls at the rhoSimpleFoam sites -------------------------------------------------
+# `lctl` and `sctl` are NOT case-controls objects: each is a scratch struct handed to a reader as an
+# OUT PARAMETER, from which the site copies the few fields it wanted -- readLinearSolverControls fills
+# lctl and the site takes tol/relTol/maxIter/minIter for U, p, he and the turbulence pair
+# (rhoSimpleFoamDriver.cu:697-700); parseFvSchemesControls fills sctl and the site takes the
+# laplacian/snGrad/limited-gradient flags (rhoSimpleFoamDriver_cpp.cu:203-224). VERIFIED that neither
+# reader CONSUMES a field it does not also write, so no default of theirs reaches the answer:
+# readLinearSolverControls reads only what it writes (plus `turbulent`, which both sites set), and
+# parseFvSchemesControls' three read-looking fields (nonOrth, nonOrthLimit, desCoeffs) are its own
+# by-reference out-parameters. The wildcard says the SITE is not a controls object; see the tool.
+DeviceSimpleControls lctl *   # out-parameter buffer for readLinearSolverControls; the site copies the solver tolerances out
+DeviceSimpleControls sctl *   # out-parameter buffer for parseFvSchemesControls; the site copies the scheme flags out
+# The three smaller rho drivers (gpuRhoSimpleFoam, legacy, slice) leave the AMG hierarchy cache path and
+# its write switch at their defaults, which is a RECORDED open finding, not a new one: "nothing in the
+# compressible lineage threads amgCacheDir ... every compressible run re-agglomerates from scratch"
+# (rhoPEqn.cuh:58-63, PORT.md's open findings). It changes no answer -- device_amg.cuh:115-117 caches
+# the STRUCTURE only and Galerkin-rebuilds the coefficients from the current fine matrix every step --
+# so it is a cold start, not a substitution. The legacy driver is frozen and must not be edited.
+DeviceSimpleControls ctl caseDir
+DeviceSimpleControls ctl writeCache
+
+# ---- Compressible (kEpsilon_cpp.cuh:138, the closures' optional compressible half) -------------------
+# Built at four interFoam sites (inter_turbulence_cpp.cu: `comp`/`sstComp` at 593 and 602 inside
+# validateTurbulence, which only runs correctNut, and at 699/738 on the live path) and four
+# rhoSimpleFoam sites (`comp`/`sc` in rhoSimpleFoam_cpp.cu and rhoCreateFields_cpp.cu). The struct's
+# own contract is that a null pointer MEANS something -- "null => the incompressible 1" for rho, and
+# for nutPhi "null refuses a case that has one rather than leave it stale" -- so most omissions here
+# are the contract being used, not forgotten. Each line says which.
+kEpsilonRef::Compressible comp alphat  # interFoam has no energy equation in either lineage (createFields.H builds no alphat), so EddyDiffusivity's alphat = rho*nut/Prt has nothing to write into; the rho sites set it when the case has one
+kEpsilonRef::Compressible comp Prt  # same: read only beside alphat (correctNutField), and 1.0 is OpenFOAM's own default
+kOmegaSST::Compressible sstComp alphat  # same, at the kOmegaSST site
+kOmegaSST::Compressible sstComp Prt  # same
+kEpsilonRef::Compressible comp rho  # NULL IS THE INCOMPRESSIBLE 1 (kEpsilon_cpp.cuh:140) -- interFoam's UNIFORM lineage, where the closure's rho is exactly 1; the `density variable` lineage sets it, and validateTurbulence returns before this for that lineage (inter_turbulence_cpp.cu:576)
+kEpsilonRef::Compressible comp rhoBnd  # same
+kEpsilonRef::Compressible comp rhoOld  # same: the ddt's rho.oldTime() is 1 in the uniform lineage
+kOmegaSST::Compressible comp rhoOld  # the same omission at the kOmegaSST site, for the reason above
+kEpsilonRef::Compressible comp phiByRho  # the VOLUMETRIC flux for divU: in the uniform lineage the equation already convects with phi, so the separate field is the variable lineage's
+
+# ---- the closures' per-step old time (kOldIn / epsOldIn / omegaOldIn) --------------------------------
+# NULL MEANS "recapture psi.oldTime() at this call", which is the same field wherever a site makes at
+# most ONE closure call per time index. interFoam's PIMPLE is the exception that created these inputs:
+# with nOuterCorrectors > 1 it calls the closure several times inside one step and OpenFOAM's
+# storeOldTimes is guarded on timeIndex (GeometricField.C:904-917), so the old time must be handed in.
+# Every site below is either a correctNutField call -- eddyViscosity::validate, which assembles no
+# equation and so has no ddt to read an old time for -- or a SIMPLE iteration, where the time index
+# advances once per closure call and recapturing gives that same field.
+# NOTE the tool keys on the VARIABLE name, so one line covers every site spelling it the same way.
+kOmegaSST::Compressible sstComp kOldIn  # inter_turbulence_cpp.cu:792, validateTurbulence -> correctNutField: nut only, no k equation
+kOmegaSST::Compressible sstComp omegaOldIn  # same site, same reason
+kOmegaSST::Compressible sstComp rDeltaTCells  # same site: correctNutField forms no fvm::ddt; the field is read only by correct()'s two ddt lines
+kEpsilonRef::Compressible comp kOldIn  # the correctNutField sites (inter_turbulence_cpp.cu:801, rhoCreateFields_cpp.cu:1080) and rhoSimpleFoam_cpp.cu:1367, one closure call per SIMPLE iteration
+kEpsilonRef::Compressible comp epsOldIn  # same sites, same reason
+kOmegaSST::Compressible comp kOldIn  # rhoCreateFields_cpp.cu:1106, validate()'s correctNutField
+kOmegaSST::Compressible comp omegaOldIn  # same site, same reason
+kOmegaSST::Compressible comp rDeltaTCells  # same site: correctNutField forms no fvm::ddt; the field is read only by correct()'s two ddt lines
+kOmegaSST::Compressible sc kOldIn  # rhoSimpleFoam_cpp.cu:1240, the live SST call: one per SIMPLE iteration, so oldTime() is this step's
+kOmegaSST::Compressible sc omegaOldIn  # same site, same reason
+kOmegaSST::Compressible sc rDeltaTCells  # rhoSimpleFoam never runs localEuler: parseDdtScheme refuses every ddtSchemes default but steadyState and Euler ("fvSchemes ddtSchemes default is `...`. The turbulence closures take fvm::ddt through it") -- scheme_parse.cuh
+KOmegaSSTInput sstIn kOldIn  # rhoTurbulenceHook.cu:183, the device mirror's SST: one call per SIMPLE iteration
+KOmegaSSTInput sstIn omegaOldIn  # same site, same reason
+
+# ---- `uncorrected` in the turbulence closures (item 10's blast radius) --------------------------------
+# THE REASON THIS LINE GIVES HAS CHANGED, so it is rewritten rather than left carrying a false one. The
+# shared parser DOES distinguish `uncorrected` now (scheme_parse.cuh readSnGrad, gated on
+# validation/shearedChannel), and rhoSimpleFoam's laminar path takes the choice through every laplacian
+# and its SIMPLEC fvc::snGrad (gated on validation/rhoSnGrad, both arms). What remains unwired is the
+# CLOSURE half: kOmegaSST::correct takes the choice as its last parameter, but no fixture can witness it,
+# because validation/rhoSnGrad is laminar and no committed turbulent rho fixture has a mesh whose AVERAGE
+# non-orthogonality is large enough (the average is the predictor, not the max: airFoil2D reaches 41.6 deg
+# at one face and is vacuous at its own gate's bound). Wiring it here would be an ungated behaviour change.
+KOmegaSSTInput sstIn nonOrthCoeffs  # the closure half: no turbulent rho fixture can witness it yet -- see above
+
+# ---- the closures' PER-EQUATION div and grad entries (#28) --------------------------------------------
+# The kOmegaSST and kEpsilon device closures take the second equation's own fvSchemes entries now
+# (KOmegaSSTInput::omegaDiv/omegaGrad, KEpsilonInput::epsDiv/epsGrad), gated for interFoam on
+# RAS/damBreak `splitDiv`/`splitDivSST` and on the assembled system in
+# tests/interfoam_sst_assembly_vs_openfoam.sh (arms F-I). rhoSimpleFoam leaves them NULL and that is
+# honest rather than an omission: its HOST reference carries one scheme for both equations, and its driver
+# REFUSES a case whose two entries disagree (rhoSimpleFoamDriver_cpp.cu:424, `turbDivUnsupported`), so a
+# split cannot reach this site at all. THIS LINE LEAVES when rhoSimpleFoam's own host half is split and
+# that refusal is lifted against a fixture -- the device closure is ready for it already.
+KOmegaSSTInput sstIn omegaDiv  # rhoSimpleFoam refuses a split upstream and its host carries one scheme
+KOmegaSSTInput sstIn omegaGrad  # same site, same reason
+
+# interFoam builds a gpu::PressureInput only for gpu::pressurePredictor (device_inter_step.cu:483), and
+# NEITHER reader of this field is on that path: pEqn.cu:237 sits inside `if (in.consistent)` -- SIMPLEC,
+# which interFoam never sets -- and pEqn.cu:310 is assemblePEqn, which interFoam does not call at all
+# (it has deviceInterAssemblePEqn, with its own nonOrthCoeffs parameter). The two V2 sites fill it.
+gpu::PressureInput pin nonOrthCoeffs  # interFoam reaches neither reader: one is SIMPLEC-only, one is a function it does not call
+kOmegaSST::Compressible comp phiByRho  # the same omission at the kOmegaSST site, for the reason above
+kOmegaSST::Compressible sstComp rho  # ARM sst_variableDensity. kOmegaSST + `density variable` is REFUSED by name -- "pairs `density variable` with kOmegaSST ... Refused rather than run ungated" (inter_turbulence_cpp.cu:427-433) -- so this site is the uniform lineage only
+kOmegaSST::Compressible sstComp rhoBnd  # same refusal
+kOmegaSST::Compressible sstComp rhoOld  # same refusal
+kOmegaSST::Compressible sstComp phiByRho  # same refusal
+kEpsilonRef::Compressible comp rDeltaT  # the validate site runs correctNut ONLY (no ddt); on the live rho path the ddt is steadyState, where OpenFOAM's term vanishes and rDeltaT 0 IS that (kEpsilon.C:254 under steadyState), and Euler sets it
+kOmegaSST::Compressible comp rDeltaT  # the same omission at the kOmegaSST site, for the reason above
+kOmegaSST::Compressible sstComp rDeltaT  # same
+kEpsilonRef::Compressible comp V0  # a MOVING mesh: OpenFOAM's rhoSimpleFoam is built on createMesh.H, not createDynamicFvMesh.H (rhoSimpleFoam.C:58) -- its mesh cannot move; interFoam's live sites DO set it, and the validate sites run no ddt
+kOmegaSST::Compressible comp V0  # the same omission at the kOmegaSST site, for the reason above
+kEpsilonRef::Compressible comp meshPhi  # same
+kOmegaSST::Compressible comp meshPhi  # the same omission at the kOmegaSST site, for the reason above
+kOmegaSST::Compressible sstComp V0  # same
+kOmegaSST::Compressible sstComp meshPhi  # same
+kOmegaSST::Compressible sc V0  # `sc` is the rhoSimpleFoam kOmegaSST instantiation: same static-mesh fact
+kOmegaSST::Compressible sc meshPhi  # same
+kEpsilonRef::Compressible comp nutPhi  # NULL IS A REFUSAL, not a default: a flux-conditional nut patch with no flux throws by name ("nut on patch `...` is flux-conditional (inletOutlet) and the caller handed the closure no flux to decide inflow by", kEpsilon_cpp.cu:940-945). The rho path never sets it, so such a case is refused there -- ARMED in tests/rho_step_cuda_turbulent.sh, rhoKE's outlet nut made inletOutlet; interFoam sets it at every site
+kOmegaSST::Compressible comp nutPhi  # the same omission at the kOmegaSST site, for the reason above
+kOmegaSST::Compressible sc nutPhi  # same
+
+# ...and the CrankNicolson family + bcPhi, which only the LIVE interFoam kEpsilon site sets
+# (inter_turbulence_cpp.cu:738). CrankNicolson is READ ONLY when the case's ddt is CrankNicolson:
+#   rhoSimpleFoam : any ddt but steadyState and Euler is refused by name, CrankNicolson among them --
+#                   "brae: fvSchemes ddtSchemes default is `...` ... backward and CrankNicolson have
+#                   coefficients that this closure port does not yet take" (scheme_parse.cuh:304-310)
+#   interFoam SST : the LIVE site sets the family now -- kOmegaSST and LES kEqn take CrankNicolson
+#                   (gated, interfoam_cn_vs_openfoam `cnSST`/`cnLES`), and the refusal this entry
+#                   used to cite ("this closure carries Euler only") is lifted. What is left here is
+#                   the two validateTurbulence sites (593, 602), which run correctNut ONLY -- no ddt
+#                   at all, so no scheme of any kind reaches them.
+# A NAME IS NOT A TYPE, and this block is where it bites: `Compressible` is kEpsilonRef's AND
+# kOmegaSST's, the two differ in their second field's name (cnDdt0Eps/epsOO against
+# cnDdt0Omega/omegaOO), and the tool matches a site that assigns only the shared fields to both
+# definitions. So `comp` gets lines for omega's members and `sstComp` for epsilon's; neither struct
+# has the other's field at all. Recorded rather than papered over -- see interFoam/PORT.md.
+# bcPhi is the flux a flux-conditional patch looks up when that is not the equation's own: null means
+# the equation's flux, which the struct's own note says is right wherever the equation convects with
+# what the patches read (kEpsilon_cpp.cuh:145-154 -- it is interFoam's `density variable` lineage that
+# needs the separate field, and that lineage is refused under kOmegaSST).
+kEpsilonRef::Compressible comp cn  # the same omission at the kEpsilonRef site, for the reason above
+kOmegaSST::Compressible comp cn  # the same omission at the kOmegaSST site, for the reason above
+kEpsilonRef::Compressible comp cnDdt0Eps  # the same omission at the kEpsilonRef site, for the reason above
+kEpsilonRef::Compressible comp cnDdt0K  # the same omission at the kEpsilonRef site, for the reason above
+kOmegaSST::Compressible comp cnDdt0K  # the same omission at the kOmegaSST site, for the reason above
+kEpsilonRef::Compressible comp rhoOO  # the same omission at the kEpsilonRef site, for the reason above
+kEpsilonRef::Compressible comp epsOO  # the same omission at the kEpsilonRef site, for the reason above
+kEpsilonRef::Compressible comp kOO  # the same omission at the kEpsilonRef site, for the reason above
+kOmegaSST::Compressible comp kOO  # the same omission at the kOmegaSST site, for the reason above
+kEpsilonRef::Compressible comp bcPhi  # the same omission at the kEpsilonRef site, for the reason above
+kOmegaSST::Compressible sstComp cn  # the same omission at the kOmegaSST site, for the reason above
+Compressible sstComp cnDdt0Eps
+kOmegaSST::Compressible sstComp cnDdt0K  # the same omission at the kOmegaSST site, for the reason above
+Compressible sstComp rhoOO
+Compressible sstComp epsOO
+kOmegaSST::Compressible sstComp kOO  # the same omission at the kOmegaSST site, for the reason above
+Compressible sstComp bcPhi
+kOmegaSST::Compressible sc cn  # the same omission at the kOmegaSST site, for the reason above
+Compressible sc cnDdt0Eps
+kOmegaSST::Compressible sc cnDdt0K  # the same omission at the kOmegaSST site, for the reason above
+Compressible sc rhoOO
+kOmegaSST::Compressible comp cnDdt0Omega  # kEpsilonRef::Compressible HAS NO SUCH FIELD -- see the note above; the tool cannot tell the two `Compressible` definitions apart at a site that assigns only what they share
+kOmegaSST::Compressible comp omegaOO  # same
+kOmegaSST::Compressible sstComp cnDdt0Omega  # the validateTurbulence site (593) runs correctNutField ONLY: it forms no matrix, so no fvm::ddt of any scheme reaches it
+kOmegaSST::Compressible sstComp omegaOO  # same
+kOmegaSST::Compressible sc cnDdt0Omega  # rhoSimpleFoam refuses CrankNicolson by name -- "backward and CrankNicolson have coefficients that this closure port does not yet take" (scheme_parse.cuh:304-310), ARMED in tests/rho_step_cuda_refusals.sh
+kOmegaSST::Compressible sc omegaOO  # same refusal
+Compressible sc epsOO
+kOmegaSST::Compressible sc kOO  # the same omission at the kOmegaSST site, for the reason above
+Compressible sc bcPhi
+
+# ---- PressureInput (gpu::simpleFoam, pEqn.cuh:28) ---------------------------------------------------
+# interFoam's device step builds this ONLY for gpu::pressurePredictor -- rAU, HbyA, phiHbyA -- and
+# assembles and solves its own p_rgh in device_inter_pressure_step.cu, which carries the reference, the
+# MRF and the schemes in its OWN input (DeviceInterPressureInput: pi.mrf, pi.needReference, pi.pRefCell,
+# pi.pRefValue at device_inter_step.cu:557-562). The p-equation fields are left null so the shared code
+# does not apply them a SECOND time: `mrf` set here would run deviceMrfMakeRelative on phiHbyA
+# (pEqn.cu:179-181) beside interFoam's own, and `pRefCell >= 0` would adjustPhi (pEqn.cu:189-193) beside
+# interFoam's. `consistent` is SIMPLEC, which PIMPLE has no entry for; `correctedLaplacian` and
+# `snGradLimitCoeff` are read only inside the `consistent` block and inside assemblePEqn, neither of
+# which interFoam calls; `hasMRF`/`hasFvOptions` drive refuseUnsupported for the SIMPLE p solve that is
+# not run here -- interFoam refuses both by its own name (inter_driver_device.cu).
+gpu::PressureInput pin adjustable  # the same omission at the gpu site, for the reason above
+gpu::PressureInput pin consistent  # the same omission at the gpu site, for the reason above
+gpu::PressureInput pin correctedLaplacian  # the same omission at the gpu site, for the reason above
+gpu::PressureInput pin snGradLimitCoeff  # the same omission at the gpu site, for the reason above
+gpu::PressureInput pin hasFvOptions  # the same omission at the gpu site, for the reason above
+gpu::PressureInput pin hasMRF  # the same omission at the gpu site, for the reason above
+gpu::PressureInput pin mrf  # the same omission at the gpu site, for the reason above
+gpu::PressureInput pin pRefCell  # the same omission at the gpu site, for the reason above
+gpu::PressureInput pin pRefValue  # the same omission at the gpu site, for the reason above
+gpu::PressureInput pin relaxP  # SIMPLE's p relaxation; interFoam relaxes p_rgh in its own step (relax() at the case's factor), and OF's pimpleFoam relaxes on the non-final corrector only
+# the two simpleFoam sites: the taps are a GATE's instrument (null = not tapping), and `cyc`/`adjustable`/
+# `takeUAtBoundary` are the coupled-pair and constrainHbyA masks a case without a pair has nothing to give
+gpu::PressureInput pin cyc  # the same omission at the gpu site, for the reason above
+gpu::PressureInput pin hNoPairTap  # the same omission at the gpu site, for the reason above
+gpu::PressureInput pin hPairTap  # the same omission at the gpu site, for the reason above
+gpu::PressureInput pi cyc  # the same omission at the gpu site, for the reason above
+gpu::PressureInput pi hNoPairTap  # the same omission at the gpu site, for the reason above
+gpu::PressureInput pi hPairTap  # the same omission at the gpu site, for the reason above
+gpu::PressureInput pi adjustable  # the same omission at the gpu site, for the reason above
+gpu::PressureInput pi takeUAtBoundary  # the same omission at the gpu site, for the reason above
+
+# ---- TransportScheme (turbulence_transport.cuh:35, the scalar-transport scheme block) ----------------
+# Built by each closure for its own equations. The omissions are one of three things:
+#   cyc / cycPhi : a coupled pair. The device kOmegaSST refuses one outright (kOmegaSST.cu:38-42, "the
+#                  mesh has cyclic/AMI/processor patches"), and LESkEqnInput carries no interface at
+#                  all -- now refused by name on the interFoam device loop ("LES kEqn AND carries a
+#                  coupled pair"), behind the case reader's own blanket refusal of any model but
+#                  kEpsilon with a pair (inter_case_cpp.cu:1285). Arm `device_les_cyclic`.
+#   gammaCell    : the pair's cell diffusivity, "required when `cyc` is set" and read only then
+#   bndValues    : the field's STORED patch values, "null = evaluate `db` live, which is what every
+#                  caller did before stage H3.5" (turbulence_transport.cuh:94-99) -- the stored-value
+#                  path is the interFoam kEpsilon site's
+#   stageTag     : a gate's instrument, "null by default and free when null" (:80)
+#   the gradient/limiter family at the LES site: kEqn's k convects by upwind or limitedLinear, and the
+#                  case reader refuses anything else ("neither `Gauss upwind` nor `Gauss limitedLinear
+#                  <k>`, the two the LES closure carries", inter_turbulence_cpp.cu:365-368)
+TransportScheme sc gammaCell
+TransportScheme sc bndValues
+TransportScheme sc stageTag
+TransportScheme sc gradFieldLeastSq
+TransportScheme sc gradFieldLimitK
+TransportScheme sc limGradK
+TransportScheme sc limGradLeastSq
+TransportScheme sc linearUpwind
+TransportScheme sc luGradK
+
+# ---- SpalartAllmarasCoeffs (spalart_coeffs.cuh:8) at simpleFoamV2's two wall-function sites ----------
+# Both sites (`dsp`, `dsaW`) build the struct ONLY to carry the Spalding wall function's two constants
+# into deviceBoundaryNutSpalding, whose body and kernel read `E` and `kappa` and nothing else (checked
+# by extracting them). The MODEL's constants are read from the case where the model runs:
+# cpu::SA::readCoeffs(rasDict, saCoeffs) at simpleFoamV2.cu:1265 and the DES/DDES/IDDES entries at
+# turbulence_setup.cuh:360-375, both from `RAS/SpalartAllmarasCoeffs` as OpenFOAM's own
+# getOrAddToDict does -- so no coefficient is silently defaulted anywhere it is used.
+SpalartAllmarasCoeffs dsp sigmaNut
+SpalartAllmarasCoeffs dsp Cb1
+SpalartAllmarasCoeffs dsp Cb2
+SpalartAllmarasCoeffs dsp Cw2
+SpalartAllmarasCoeffs dsp Cw3
+SpalartAllmarasCoeffs dsp Cv1
+SpalartAllmarasCoeffs dsp Cs
+SpalartAllmarasCoeffs dsaW sigmaNut
+SpalartAllmarasCoeffs dsaW Cb1
+SpalartAllmarasCoeffs dsaW Cb2
+SpalartAllmarasCoeffs dsaW Cw2
+SpalartAllmarasCoeffs dsaW Cw3
+SpalartAllmarasCoeffs dsaW Cv1
+SpalartAllmarasCoeffs dsaW Cs
+
+# ---- Val (patchExprFunction1.cu:39) -- a VARIANT, not a controls struct ------------------------------
+# The expression evaluator's value record: a uniform scalar, a scalar field, a uniform vector or a
+# vector field, one shape per static factory (scalarUniform / scalarField / vectorField, :48-50), each
+# of which sets the members ITS shape uses and leaves the others at the defaults that say "not this
+# shape" (`uniform` true, `isVector` false). `at(i)` reads only the pair the flags select.
+Val r *
+
+# ---- SolverRunsAs (linear_solver_setup.cuh:59) -- what a driver RUNS, per driver ---------------------
+# This struct is a DESCRIPTION of the arm holding it, so two arms differ by construction and the reader
+# uses it to decide which substitution notices to print. The host reference arm "solves every field
+# through pbicgstab.cuh, which is a DILU-preconditioned BiCGStab whatever the dict says"
+# (rhoSimpleFoamDriver_cpp.cu:632-640), so it runs NO smoothSolver and the smoothSolverOn* flags are
+# false for it; the mirror sets them from BRAE_RHO_SMOOTHSOLVER and does not force DILU everywhere, so
+# `alwaysDilu` is the host arm's alone. Each site's omissions ARE its own description.
+SolverRunsAs runsAs alwaysDilu
+SolverRunsAs runsAs smoothSolverOnEnergy
+SolverRunsAs runsAs smoothSolverOnMomentum
+SolverRunsAs runsAs smoothSolverOnTurbulence
+SolverRunsAs runsAs fixedSweepsField
+SolverRunsAs runsAs momentumNoticedByCaller
+
+# ---- SolveControls (turbulence_transport.cuh:105) at the LES and kOmegaSST sites ---------------------
+# `pbicg` and `precon` came OFF this ledger when the LES kEqn learned to run the PBiCG the case names
+# (both arms, gated by the `pbicg` profile in tests/interfoam_les_vs_openfoam.sh): the LES site now
+# fills them from the case's kFinal entry instead of leaving them at their defaults, so an entry here
+# would be a stale exemption. colouring/gsColour/polyDeg are brae's own solver accelerations, whose
+# `off` IS OpenFOAM's own symGaussSeidel smoother -- what every turbulent tutorial names.
+SolveControls sv colouring
+SolveControls sv gsColour
+SolveControls sv polyDeg
+
+# ---- the tail: four records that are not case controls ----------------------------------------------
+# Tok (patchExprFunction1.cu:54) is the expression lexer's TOKEN variant, like Val above: a number
+# token carries `num`, a name/operator token carries `text`, and each site fills its own shape.
+Tok t *
+Tok e *
+# SolverPerformance (pcg.cuh:16) is an OUTPUT record the solvers fill as they run: a site that reports
+# a converged-at-entry solve writes the residuals and leaves nIterations at 0, which IS the count.
+# HeToTResult (nsrds_functions.cuh:147) is the energy inversion's output: the sites that return an
+# EXACT inversion (no Newton loop) leave `iterations` and `residual` at 0, which is that result.
+HeToTResult r iterations
+HeToTResult r residual
+# GSFusedComponent (device_amg.cuh:362) carries the normFactor EITHER as a host scalar or as a device
+# pointer -- two entry points for the same solve (device_amg.cuh:256 and :261, item 66) -- so a site
+# using one leaves the other null by construction.
+GSFusedComponent one normFactor
+GSFusedComponent one dNormFactor
+
+# UNARMED, and named so rather than left to look armed: two cited refusals still have no arm.
+#   InterTurbulenceStepInput ti cn / rhoOO -- "BRAE_INTER_HOST_CLOSURE under CrankNicolson is not
+#     carried". The refusals harness passes FLAGS to the binary, not environment, so an arm for it
+#     needs a harness change; the refusal itself is one line in inter_driver_device.cu.
+#   KEpsilonInput kin cyc / cycPhi / cycPhiByRho -- the rho path hands the closure hasCoupledPatches
+#     and kEpsilon.cu refuses a pair; validation/rhoBox has no cyclic, so an arm needs a fixture that
+#     does. Both are in the pending list rather than in this file's silence.
+
+# ---- the closure inputs, now that the audit can SEE them (2026-09-23) -------------------------------
+# These two structs were silently unevaluated until the parser learned to read `bool a = false, b = true;`
+# as three fields: every site assigning gsEps/gsOmega/gsSymmetric was dropped from the comparison, both
+# sites were dropped, and a struct with fewer than two sites is skipped. Thirty ledger lines were never
+# checked and no omission in either struct could be reported -- including the four fields interFoam's
+# site left unset under `Gauss limitedLinear` (#28). The lines below are the omissions that survive
+# with a reason, each verified in the code named.
+#
+# rhoSimpleFoam's SST site (rhoTurbulenceHook.cu) against interFoam's (device_inter_turbulence.cu):
+#   cyc/cycPhi/cycPhiByRho: rho sets `hasCoupledPatches` instead, and the closure REFUSES a mesh with
+#     coupled patches and no pair (kOmegaSST.cu:57-64) rather than running those faces as walls
+#   V0/meshPhiInt/meshPhiBnd: OpenFOAM's rhoSimpleFoam never moves the mesh -- no mesh.update() in the
+#     solver at all -- so V0 == V and meshPhi == 0 by construction
+#   cn/cnDdt0K/cnDdt0Omega/kOO/omegaOO/rhoOOCell: CrankNicolson is refused by name on this path --
+#     parseDdtScheme (scheme_parse.cuh:279-306) admits `steadyState` and `Euler` and throws otherwise
+KOmegaSSTInput sstIn cyc
+KOmegaSSTInput sstIn cycPhi
+KOmegaSSTInput sstIn cycPhiByRho
+KOmegaSSTInput sstIn V0
+KOmegaSSTInput sstIn meshPhiInt
+KOmegaSSTInput sstIn meshPhiBnd
+KOmegaSSTInput sstIn cn
+KOmegaSSTInput sstIn cnDdt0K
+KOmegaSSTInput sstIn cnDdt0Omega
+KOmegaSSTInput sstIn kOO
+KOmegaSSTInput sstIn omegaOO
+KOmegaSSTInput sstIn rhoOOCell
+# ...and the other way round: interFoam hands the closure a REAL pair, so the flag that says "there are
+# coupled patches and no pair" must stay false -- the closure refuses if both are set (kOmegaSST.cu:65-68)
+KOmegaSSTInput sin hasCoupledPatches
+# The incompressible simpleFoam device path has no energy equation, so the residual struct's energy
+# fields are the ones it never fills (he, heFinal, heIters).
+DeviceSimpleResidual res he
+DeviceSimpleResidual res heFinal
+DeviceSimpleResidual res heIters
+# rhoCreateFields' CONSTRUCTION-TIME coefficients (`keCase`), read for the first correctNut and the
+# bounds, against the coefficients the run uses:
+#   A0/realizable: realizableKE is refused by name on this solver (rhoSimpleFoam_cpp.cuh:43-47 --
+#     "every other model is refused by name"), so its coefficients are unreachable here
+#   kappa/E: the wall functions' Cmu/kappa/E are PER PATCH, from each field's own entry
+#     (WallFunctionCoeffs, kEpsilon_cpp.cu:263), not from the model dictionary's copy
+KEpsilonCoeffs keCase A0
+KEpsilonCoeffs keCase realizable
+KEpsilonCoeffs keCase kappa
+KEpsilonCoeffs keCase E
+
+# CrankNicolson ON A MOVING MESH and its written state (U7, 2026-10-01). kEpsilonRef::Compressible is built
+# at four sites and only interFoam's live closure call (inter_turbulence_cpp.cu, the `in.cn` block) is ever
+# under CrankNicolson: the validate / correctNutField sites assemble no ddt at all, and rhoSimpleFoam's ddt
+# is steadyState on a mesh that cannot move (rhoSimpleFoam.C:58, createMesh.H).
+kEpsilonRef::Compressible comp V00  # read only beside `cn` AND `V0`, and V0 without it is a refusal by name ("which reads mesh().V00(); the caller supplied V0 alone", kEpsilon_cpp.cu); the three other sites set no `cn`
+kEpsilonRef::Compressible comp cnPatchK  # read only inside the CrankNicolson fvm::ddt (the other sites set no `cn`); null keeps ddt0's cells alone, which is all the solve reads, and the writer refuses a ddt0 with no patch values ("holds no patch values", inter_writer_cpp.cu)
+kEpsilonRef::Compressible comp cnPatchEps  # same
+kEpsilonRef::Compressible comp cnStaticControl  # A GATE'S CONTROL (BRAE_CONTROL_CN_CLOSURE_STATIC), never a case setting: false IS OpenFOAM's branch choice (CrankNicolsonDdtScheme.C:862, mesh().moving())
+kEpsilonRef::Compressible comp epsOldCreated  # set only on the ONE call that creates epsilon.oldTime() on a cold start under CrankNicolson (GeometricField.C:940-972); the other sites assemble no ddt or a steadyState one, where no old level is ever asked for
+kEpsilonRef::Compressible comp epsOldBndCreated  # same
+# the HOST closure run inside the device loop (the instrument above): V00 is CrankNicolson's alone
+InterTurbulenceStepInput ti V00  # read only under CrankNicolson (it sits beside `cn`), and "BRAE_INTER_HOST_CLOSURE under CrankNicolson is not carried" refuses that first (inter_driver_device.cu)
+# buildCyclicInterfaces has two sites, a cyclic's and a cyclicAMI's, and each leaves the other's fields at rest
+CyclicInterface ci forwardT  # the cyclicAMI site: cyclic_ami_cpp refuses any transform but `noOrdering` by name, so the pair's is the identity
+CyclicInterface ci separation  # the cyclicAMI site: the same refusal -- no transform, no separation; nothing reads it on an AMI pair
+CyclicInterface ci amiOffsets  # the cyclic / coincident-ACMI site: one neighbour cell per face (nbrFaceCells), so the stencil is empty by definition
+CyclicInterface ci amiNbrCells  # the cyclic / coincident-ACMI site: as amiOffsets
+CyclicInterface ci amiWeights  # the cyclic / coincident-ACMI site: as amiOffsets
+
+# ---- the writer's deferred lists (inter_writer_cpp.cu, DeferredList) ------------------------------------
+# One struct for a scalar list and a vector list, built at the two deferLines overloads: each site sets
+# the half that is its own and leaves the other at "none", which IS that list's value.
+DeferredList d isVector  # the scalar overload: false is what a scalar list is
+DeferredList d vectors   # the scalar overload: a scalar list holds no vectors
+DeferredList d aliased   # the vector overload: the alias control is of alpha's scalar list alone
+DeferredList d scalars   # the vector overload: a vector list holds no scalars

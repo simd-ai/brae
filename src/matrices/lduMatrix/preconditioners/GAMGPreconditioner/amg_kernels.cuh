@@ -36,6 +36,21 @@ void smoothT(
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i < n) x[i] += T(OMEGA)*(b[i]-Ax[i])/safeDiag(diag[i]);   // safeDiag: floor the (FP32) diagonal, never divide by ~0 -> no Inf/NaN preconditioner
 }
+// The FIRST weighted-Jacobi sweep of a cycle, whose x is zero: A*x is zero, so the product is not formed. The
+// expression is smoothT's own with x = 0 and Ax = 0 written in -- 0 + omega*(b - 0)/diag -- so the result is
+// smoothT's to the bit (the compiler may not drop the two zeros under IEEE rules: they decide a zero's sign).
+// MEASURED on RAS/DTCHull: one of the three products a level makes each V-cycle.
+template <typename T>
+__global__
+void smoothFromZeroT(
+    int n,
+    const T* __restrict__ b,
+    const T* __restrict__ diag,
+    T* __restrict__ x)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) x[i] = T(0) + T(OMEGA)*(b[i] - T(0))/safeDiag(diag[i]);
+}
 template <typename T>
 __global__
 void residualT(
@@ -177,9 +192,12 @@ void gsColorPermT(
 }
 
 // Apsi = A psi through the permuted layout, written straight back to the natural numbering. The
-// diagonal term FIRST, then the row's entries in their layout order, which is amulKernel's order
-// (device_spmv.cu:31-40) -- so on a sound layout this is deviceAmul's bits, and a disagreement is an
-// addressing fault. The diagnostic behind test arm (b); the V-cycle never calls it.
+// diagonal term FIRST, then the row's entries in amulKernel's order (device_spmv.cu), which is OpenFOAM's
+// face loop's: increasing FACE index, owned and neighboured faces interleaved. The row stores its owned
+// faces (src = f) and then its neighboured ones (src = -1 - f), each ascending -- gsColorT's order, which
+// the sweep keeps -- so this walks the two runs merged by face. On a sound layout that is deviceAmul's
+// bits, and a disagreement is an addressing fault. The diagnostic behind test arm (b); the V-cycle never
+// calls it.
 template <typename T>
 __global__
 void permLayoutAmulT(
@@ -187,6 +205,7 @@ void permLayoutAmulT(
     const label* __restrict__ cells,
     const label* __restrict__ rowStart,
     const label* __restrict__ nbr,
+    const label* __restrict__ src,
     const T* __restrict__ coeff,
     const T* __restrict__ diag,
     const T* __restrict__ x,
@@ -195,9 +214,29 @@ void permLayoutAmulT(
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= n) return;
     T s = diag[i] * x[i];
+    const label e0 = rowStart[i];
     const label e1 = rowStart[i+1];
-    for (label e = rowStart[i]; e < e1; ++e)
-        s += coeff[e] * x[nbr[e]];
+    label split = e0;
+    while (split < e1 && src[split] >= 0)
+    {
+        ++split;
+    }
+    label u = e0;
+    label l = split;
+    while (u < split || l < e1)
+    {
+        const label fl = (l < e1) ? -1 - src[l] : 0x7fffffff;
+        if (u < split && src[u] < fl)
+        {
+            s += coeff[u] * x[nbr[u]];
+            ++u;
+        }
+        else
+        {
+            s += coeff[l] * x[nbr[l]];
+            ++l;
+        }
+    }
     Apsi[cells[i]] = s;
 }
 
