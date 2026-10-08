@@ -16,7 +16,7 @@ Ordered by value against cost, not by ambition.
    `nOuterCorrectors 1`.
 2. **`rhoPimpleFoam`** — transient compressible. Reuses `rhoSimpleFoam`'s thermo, energy equation and turbulence
    closure on `pimpleFoam`'s time loop. No new numerics.
-3. ~~**`interFoam`** — two-phase VoF.~~ Shipped in 0.5.0: see [the solver page](solvers/interfoam.md).
+3. ~~**`interFoam`** — two-phase VoF.~~ Shipped in 0.4.1: see [the solver page](solvers/interfoam.md).
 4. **Adaptive time stepping** — `adjustTimeStep` / `maxCo`. Refused today; needed by `interFoam` anyway.
 5. **MRF and `fvOptions` in the transient solver** — the steady solvers have both.
 6. **A general functionObject framework** — `forceCoeffs` is hard-wired today; probes, `fieldAverage`, sampling and
