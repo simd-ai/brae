@@ -8,6 +8,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      no_cache:
+        description: 'Run every test, whatever passed before (do this before a release tag)'
+        type: boolean
+        default: false
 
 # One GPU job at a time (kernels would contend for the single device).
 concurrency:
@@ -36,5 +41,12 @@ jobs:
         # compile-check does, and the same OOM is one busy runner away.
         run: cmake --build build -j "$(nproc)"   # all targets: brae + the ctest unit-test executables
 
-      - name: Test (ctest)
-        run: ctest --test-dir build --output-on-failure -j4
+      - name: Test (ctest, leaving out what already passed on the same inputs)
+        # tools/ctest_cached.py fingerprints every test's inputs -- the loaded bytes of each binary it runs,
+        # its scripts and fixtures, OpenFOAM, the GPU driver -- and hands ctest only the tests with no recorded
+        # pass for that fingerprint. The store is in the runner's home, so it outlives this fresh checkout,
+        # and a binary rebuilt from unchanged sources keeps its fingerprint (the tool's header has the
+        # measurement). A change to shared code still runs everything that links it; only passes are kept.
+        run: |
+          python3 tools/ctest_cached.py --test-dir build \
+              ${{ inputs.no_cache && '--no-cache' || '' }} --output-on-failure -j4

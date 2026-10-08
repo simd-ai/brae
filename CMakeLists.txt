@@ -5139,6 +5139,15 @@ else()
                    "(install libcurl4-openssl-dev)")
 endif()
 
+# tools/ctest_cached.py -- ctest with every test left out that has already passed on the same inputs -- held
+# to that on a throwaway project of four tests: held while the inputs stand, run when one changes, a failure
+# and a test that rewrites its own inputs never held. No GPU, no solver.
+add_test(NAME ctest_cache_selftest
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/ctest_cache_selftest.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/tools/ctest_cached.py
+                 ${CMAKE_CURRENT_BINARY_DIR}/ctest_cache_selftest_work)
+set_tests_properties(ctest_cache_selftest PROPERTIES TIMEOUT 120)
+
 # Solver selection itself: routes on controlDict `application`, refuses the solvers brae does not have, and
 # catches an application/ddtSchemes contradiction. Dict-only fake cases, no mesh and no GPU.
 add_test(NAME solver_dispatch
