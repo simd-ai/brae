@@ -38,6 +38,11 @@ struct BraeSolver
     const char* exe;           // brae executable that runs it
     bool        transient;     // marches in time (ddtSchemes.default != steadyState)
     const char* what;          // one-line description, shown when a case asks for a solver brae lacks
+    // Arguments the launcher ADDS when it hands a case over, "" for none. interFoam's executable holds two
+    // time loops -- the host reference its gates compare with OpenFOAM, and the GPU one -- and takes the GPU
+    // one by name (`-device`). `brae` is the GPU command, so its hand-over asks for it. FOUND 2026-10-08 by
+    // running `brae` on laminar/damBreak: the row was there, the case was handed over, and it ran on the CPU.
+    const char* launchArgs;
 };
 
 // The registry. Every row has the same shape, including the steady one: `brae` is the launcher AND the steady
@@ -48,10 +53,11 @@ struct BraeSolver
 inline const std::vector<BraeSolver>& braeSolvers()
 {
     static const std::vector<BraeSolver> reg = {
-        {"simpleFoam", "brae",            false, "steady incompressible, RAS/laminar"},
-        {"pimpleFoam", "brae_pimpleFoam", true,  "transient incompressible, URANS/DES/LES/laminar"},
-        {"rhoSimpleFoam", "brae_rhoSimpleFoam", false, "steady compressible (subsonic, laminar, perfectGas+hConst)"},
-        {"interFoam", "brae_interFoam", true, "transient two-phase VoF (laminar; MULES and CMULES, contact angle)"},
+        {"simpleFoam", "brae",            false, "steady incompressible, RAS/laminar", ""},
+        {"pimpleFoam", "brae_pimpleFoam", true,  "transient incompressible, URANS/DES/LES/laminar", ""},
+        {"rhoSimpleFoam", "brae_rhoSimpleFoam", false, "steady compressible (subsonic, laminar, perfectGas+hConst)", ""},
+        {"interFoam", "brae_interFoam", true,
+         "transient two-phase VoF, laminar/RAS/LES; moving and refining meshes, waves", "-device"},
     };
     return reg;
 }
@@ -141,8 +147,29 @@ inline std::string braeSolverList()
 {
     std::vector<std::string> args;
     for (int i = 1; i < argc; ++i) args.emplace_back(argv[i]);
+    // the row's own arguments, each once: a user who typed one already is not handed it twice
+    std::string added;
+    {
+        const std::string all = s.launchArgs;
+        std::size_t at = 0;
+        while (at < all.size())
+        {
+            const std::size_t end = std::min(all.find(' ', at), all.size());
+            const std::string one = all.substr(at, end - at);
+            at = end + 1;
+            if (one.empty())
+            {
+                continue;
+            }
+            if (std::find(args.begin(), args.end(), one) == args.end())
+            {
+                args.push_back(one);
+            }
+            added += " " + one;
+        }
+    }
     execSibling(s.exe, args,
-                why + " -> " + s.application + " (" + s.exe + ")",
+                why + " -> " + s.application + " (" + s.exe + added + ")",
                 std::string("cases using ") + s.application);
 }
 

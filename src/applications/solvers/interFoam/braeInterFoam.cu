@@ -210,20 +210,41 @@ int main(int argc, char** argv)
     brae::setCudaSchedule();
     bool onDevice = false;
     std::string caseDir = ".";
+    // WHAT `brae` HANDS ON IS WHAT THIS TAKES: the launcher forwards its own arguments unchanged
+    // (solver_dispatch.cuh), and a user may have typed the case as `-case <dir>` or as a bare directory. A bare
+    // directory was not read here -- `brae myCase` ran the current directory -- and an option this binary does
+    // not have was skipped without a word; it is refused by name below.
+    std::string unknownOption;
     for (int i = 1; i < argc; ++i)
     {
-        if (std::strcmp(argv[i], "-case") == 0 && i + 1 < argc) caseDir = argv[++i];
-        else if (std::strcmp(argv[i], "-device") == 0) onDevice = true;
-        else if (std::strcmp(argv[i], "-help") == 0)
+        const std::string a = argv[i];
+        if (a == "-case" && i + 1 < argc)
+        {
+            caseDir = argv[++i];
+        }
+        else if (a == "-device")
+        {
+            onDevice = true;
+        }
+        else if (a == "-help" || a == "--help" || a == "-h")
         {
             std::printf("brae_interFoam: OpenFOAM's interFoam, re-ported.\n"
-                        "  usage: brae_interFoam -case <dir> [-device]\n"
+                        "  usage: brae_interFoam [-case] <dir> [-device]\n"
                         "    -device  run the time loop on the GPU (runInterFoamDevice). The same\n"
                         "             components and the same case translation; the boundary\n"
-                        "             conditions stay on the host. Gated against the host loop on\n"
-                        "             damBreak's own mesh: alpha 7.3e-11, U 2.6e-09 relative,\n"
-                        "             p_rgh 6.9e-11 over five steps.\n");
+                        "             conditions stay on the host. Without it the HOST loop runs: the\n"
+                        "             reference the gates hold to OpenFOAM, on one core.\n"
+                        "  `brae <dir>` on a case whose controlDict says `application interFoam` runs\n"
+                        "  this binary with -device.\n");
             return 0;
+        }
+        else if (!a.empty() && a[0] != '-')
+        {
+            caseDir = a;
+        }
+        else if (unknownOption.empty())
+        {
+            unknownOption = a;
         }
     }
 
@@ -232,6 +253,12 @@ int main(int argc, char** argv)
         using namespace brae;
         using namespace brae::cpu::interFoam;
 
+        if (!unknownOption.empty())
+        {
+            throw std::runtime_error(
+                "the option `" + unknownOption + "` is not one this solver takes. It takes `-case <dir>` or a "
+                "bare case directory, and `-device` for the GPU loop.");
+        }
         const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
         // THE ENTRIES Time READS, AS Time READS THEM (Time.C:146-190, TimeIO.C:268-356). `deltaT` is
         // mandatory -- it defaulted to 1e-3 here; `startFrom` defaults to latestTime -- it defaulted to
