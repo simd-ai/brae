@@ -155,7 +155,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="$arch" || 
 # row cannot repeat it.
 SOLVERS=$(sed -n 's/.*{"[A-Za-z]*", *"\(brae[A-Za-z_]*\)".*/\1/p' \
           src/applications/solvers/common/solver_dispatch.cuh | sort -u)
-[ -n "$SOLVERS" ] || SOLVERS="brae brae_pimpleFoam brae_rhoSimpleFoam"   # registry unreadable: known set
+[ -n "$SOLVERS" ] || SOLVERS="brae brae_pimpleFoam brae_rhoSimpleFoam brae_interFoam"   # registry unreadable: known set
 say "solvers to build: $(echo $SOLVERS | tr '\n' ' ')"
 
 jobs=$(nproc 2>/dev/null || echo 4)

@@ -89,6 +89,7 @@ Type `brae`. It reads the `application` entry in your `controlDict` and runs the
 | [`simpleFoam`](docs/solvers/simplefoam.md) | steady incompressible |
 | [`pimpleFoam`](docs/solvers/pimplefoam.md) | transient incompressible — URANS / DES / LES |
 | [`rhoSimpleFoam`](docs/solvers/rhosimplefoam.md) | steady compressible, subsonic and transonic |
+| [`interFoam`](docs/solvers/interfoam.md) | transient two-phase VoF — laminar / RAS / LES, moving and refining meshes, waves |
 
 <details>
 <summary><b>Full support matrix</b> — turbulence, thermo, schemes, 25+ boundary conditions, fvOptions</summary>
@@ -119,7 +120,7 @@ Type `brae`. It reads the `application` entry in your `controlDict` and runs the
 
 </details>
 
-Coming soon: `interFoam` (two-phase VoF).
+Coming soon: runtime function objects (probes, gauges, sampling) for `interFoam`.
 
 ---
 
@@ -156,10 +157,10 @@ NVIDIA GPU (Ampere or newer), CUDA 12.4+ (13.x recommended), C++17.
 git clone https://github.com/simd-ai/brae.git
 cd brae
 cmake -B build -DCMAKE_CUDA_ARCHITECTURES=<your_arch>
-cmake --build build -j --target brae brae_pimpleFoam brae_rhoSimpleFoam
+cmake --build build -j --target brae brae_pimpleFoam brae_rhoSimpleFoam brae_interFoam
 ```
 
-`brae` hands each case to the solver its `application` entry names, so build all three side by side.
+`brae` hands each case to the solver its `application` entry names, so build all four side by side.
 
 | GPU | `<your_arch>` | GPU | `<your_arch>` |
 |---|---:|---|---:|

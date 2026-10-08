@@ -59,9 +59,7 @@ static void printUsage()
     std::printf(
 "brae, a GPU-native, OpenFOAM-compatible CFD solver. The whole solve runs on one GPU; reads a standard\n"
 "OpenFOAM case and writes standard time dirs.\n\n"
-"Solvers (picked from the case's controlDict `application`, so `brae` is the only command you type):\n"
-"  simpleFoam       steady incompressible, RAS/laminar\n"
-"  pimpleFoam       transient incompressible, URANS/DES/LES/laminar\n"
+"Solvers (picked from the case's controlDict `application`, so `brae` is the only command you type):%s\n"
 "Any other application stops at start-up rather than run the case with the wrong solver.\n\n"
 "Subcommands (the only two reserved words; anything else leading is a case directory):\n"
 "  brae benchmark [sample]        run the standard workload, writes brae-benchmark.json\n"
@@ -84,7 +82,9 @@ static void printUsage()
 "  BRAE_JOBS=N        how many cases to run at once with -cases (default: number of GPUs)\n"
 "  BRAE_PCG_DEVICE=0  disable the device-resident PCG (on by default)\n"
 "  BRAE_AMG_FP32=0    use the FP64 AMG preconditioner instead of FP32 (on by default)\n\n"
-"Docs and benchmarks: https://github.com/simd-ai/brae\n");
+"Docs and benchmarks: https://github.com/simd-ai/brae\n",
+        // the list is the registry's own (solver_dispatch.cuh): written out here it named two of four solvers
+        braeSolverList().c_str());
 }
 
 int main(int argc, char** argv)

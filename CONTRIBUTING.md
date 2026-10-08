@@ -21,6 +21,11 @@ If you keep those two in mind, the rest is detail.
 - The hosted build-check (`ci.yml`) compiles every PR for sm_80 and sm_90. The full `ctest` runs on a real GB10
   (`gpu-test.yml`) after merge to `main`, so a green build-check is necessary but not sufficient. Say in the PR how
   you validated on a GPU.
+- **`tools/ctest_cached.py` runs the suite without repeating what already passed.** It takes ctest's own
+  arguments (`tools/ctest_cached.py -j 6`), fingerprints each test's inputs — the code each binary loads, its
+  scripts and fixtures — and runs only the tests with no recorded pass for that fingerprint. Change a shared file
+  and everything that links it runs again; change a README and nothing does. `--list` shows what would run,
+  `--explain <test>` what a test depends on, `--no-cache` runs everything.
 - If you change anything numerical, put the OpenFOAM comparison in the PR description: which case, which fields,
   what the L2 difference is. "Looks right" is not a validation.
 - Write the commit/PR title in the imperative: "add vanLeer limiter", not "added" or "adds".

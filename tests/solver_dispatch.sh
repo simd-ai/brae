@@ -96,12 +96,28 @@ fi
 # 8. application interFoam is handed over to brae_interFoam. Added WITH the registry row and the
 #    add_dependencies line this time, rather than after a fresh build had already exec'd a binary that
 #    was never built -- which is what happened with rhoSimpleFoam and is what arm 7 exists to catch.
+#    ...and WITH `-device`: brae_interFoam holds a host reference loop and the GPU loop, and until 2026-10-08
+#    the hand-over forwarded the user's arguments alone -- `brae` on an interFoam case ran on one CPU core.
+#    The registry row carries the argument (BraeSolver::launchArgs) and the hand-over names it; the run itself
+#    is tests/interfoam_write/core/launcher.sh's.
 mkcase "$WORK/inter" "application     interFoam;" "Euler"
-check application_interfoam "$WORK/inter" "controlDict application interFoam -> interFoam"
+check application_interfoam "$WORK/inter" "controlDict application interFoam -> interFoam (brae_interFoam -device)"
 if [ -x "$(dirname "$BIN")/brae_interFoam" ]; then
     echo "ok:   interfoam_sibling_built"
 else
     echo "FAIL: interfoam_sibling_built -- the registry routes to a binary that was not built"; fail=1
+fi
+
+# 9. The usage text lists the registry, every row of it: written out by hand it named two solvers of four.
+"$BIN" --help > "$WORK/help.log" 2>&1
+missing=""
+for app in simpleFoam pimpleFoam rhoSimpleFoam interFoam; do
+    grep -qE "^ +$app +[a-z]" "$WORK/help.log" || missing="$missing $app"
+done
+if [ -z "$missing" ]; then
+    echo "ok:   help_lists_every_solver"
+else
+    echo "FAIL: help_lists_every_solver -- \`brae --help\` does not list:$missing"; fail=1
 fi
 
 [ "$fail" -eq 0 ] && echo "PASS: solver selection routes and refuses correctly"
