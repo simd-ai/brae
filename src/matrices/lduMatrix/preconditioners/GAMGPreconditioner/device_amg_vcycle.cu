@@ -488,7 +488,24 @@ void amgCouplePair(
     static const bool uncoupled = std::getenv("BRAE_CONTROL_AMG_PAIR_UNCOUPLED") != nullptr;
     const int n = A.nCyc > 0 ? A.nCyc : A.nAmi;
     const int G = amg.nLevels();
-    if (n == 0 || uncoupled || amg.saSmooth || G == 0)
+    // a hierarchy that holds the pair in its own coarse matrices is handed nothing more (AMGData::
+    // pairInCoarseMatrices); BRAE_CONTROL_AMG_PAIR_TWICE=1 is the gate's control and couples it all the same
+    static const bool twice = std::getenv("BRAE_CONTROL_AMG_PAIR_TWICE") != nullptr;
+    const bool heldAlready = amg.pairInCoarseMatrices && !twice;
+    if (n > 0 && amg.pairInCoarseMatrices)
+    {
+        static bool saidHeld = false;
+        if (!saidHeld)
+        {
+            saidHeld = true;
+            std::printf(twice
+                ? "  *** CONTROL MODE (BRAE_CONTROL_AMG_PAIR_TWICE): the matrix's coupled pair is carried on every "
+                  "grid of a hierarchy whose coarse matrices hold it already\n"
+                : "  AMG-PCG: the hierarchy's own coarse matrices hold the matrix's coupled pair (%d faces); it is "
+                  "not carried on the grids a second time\n", n);
+        }
+    }
+    if (n == 0 || uncoupled || amg.saSmooth || G == 0 || heldAlready)
     {
         if (p.n != 0)
         {

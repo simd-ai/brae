@@ -144,11 +144,48 @@ Run march(bool withSource, int nSteps)
 }
 } // namespace
 
-int main()
+// this binary again as a child with the control set: the undriven mean its `child` line prints. A child that
+// never said it ran the control has not run it, and comes back as a NaN.
+scalar childUndrivenMean(
+    const std::string& self,
+    const std::string& envSwitch)
 {
+    const std::string cmd = envSwitch + "=1 '" + self + "' child 2>&1";
+    FILE* p = popen(cmd.c_str(), "r");
+    if (!p)
+    {
+        return std::nan("");
+    }
+    char line[2048];
+    scalar mean = std::nan("");
+    bool controlSaid = false;
+    while (std::fgets(line, sizeof(line), p))
+    {
+        const std::string l(line);
+        controlSaid = controlSaid || l.find("CONTROL MODE (" + envSwitch + ")") != std::string::npos;
+        double v = 0;
+        if (std::sscanf(line, "CHILD undrivenMean=%lf", &v) == 1)
+        {
+            mean = static_cast<scalar>(v);
+        }
+    }
+    pclose(p);
+    return controlSaid ? mean : std::nan("");
+}
+
+int main(
+    int argc,
+    char** argv)
+{
+    const int N = 50;
+    if (argc > 1 && std::string(argv[1]) == "child")
+    {
+        const Run alone = march(/*withSource*/false, N);
+        std::printf("CHILD undrivenMean=%.17g\n", (double)alone.meanUx.back());
+        return 0;
+    }
     std::printf("== meanVelocityForce holds the prescribed flow rate ==\n");
 
-    const int N = 50;
     const Run on = march(/*withSource*/true, N);
     const Run off = march(/*withSource*/false, N);
 
@@ -184,11 +221,26 @@ int main()
     // ---- Leg 3: the source is what does it (vacuity guard) ------------------------------------------
     // Without it the channel has nothing driving it and must decay. If this passed, Legs 1-2 would be
     // measuring an initial condition that happened to sit at Ubar rather than a controller holding it.
+    // DECAYS, and no more than that: the mean stays between rest and where it started. The guard was one-sided
+    // (below 0.9 Ubar) until 2026-10-08, and a pressure solve that had diverged passed it at -36.3.
     {
         const scalar lastOff = off.meanUx.back();
-        check(lastOff < scalar(0.9)*UBAR,
+        check(off.finite && lastOff > scalar(0) && lastOff < scalar(0.9)*UBAR,
               "vacuity guard: with the source removed the flow DECAYS, so Legs 1-2 measure the source");
         std::printf("        (undriven mean after %d steps: %.6f)\n", N, (double)lastOff);
+    }
+
+    // ---- Leg 4: the periodic pair is in the pressure hierarchy ONCE -----------------------------------
+    // This solver's hierarchy is agglomerated over its interface edges and its coarse matrices hold the
+    // pair (device_simple_foam.cu); the pressure solver's own way of carrying a pair on every grid, made for
+    // interFoam, must then add nothing (AMGData::pairInCoarseMatrices). CONTROL, this binary again with
+    // BRAE_CONTROL_AMG_PAIR_TWICE=1: the pair on the coarse grids twice, two pressure solves diverge, and
+    // the undriven mean leaves the band above. MEASURED 2026-10-08: 0.436919 as it is, 11116.38 twice.
+    {
+        const scalar twice = childUndrivenMean(argv[0], "BRAE_CONTROL_AMG_PAIR_TWICE");
+        check(std::isfinite(twice) && !(twice > scalar(0) && twice < scalar(0.9)*UBAR),
+              "CONTROL: with the pair carried on the coarse grids a second time the undriven flow does NOT decay");
+        std::printf("        (undriven mean with the pair twice: %.6f)\n", (double)twice);
     }
 
     std::printf(failures ? "== FAILED (%d) ==\n" : "== PASSED ==\n", failures);

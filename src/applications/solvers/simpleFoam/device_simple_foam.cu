@@ -495,6 +495,9 @@ void amgFineCoeffKernel(
         amg_ = nAmgIfEdges_
              ? buildAMG(ownerInt, neiInt, fwAMG, nC_)
              : buildOrLoadAMG(ownerInt, neiInt, fwAMG, nC_, ctl_.caseDir + "/constant/polyMesh", ctl_.writeCache);
+        // ...and with its interface edges in the agglomeration this hierarchy's coarse matrices hold the pair:
+        // the pressure solver must not carry it on the grids a second time (AMGData::pairInCoarseMatrices)
+        amg_.pairInCoarseMatrices = nAmgIfEdges_ > 0;
 
         // initial device state.
         {

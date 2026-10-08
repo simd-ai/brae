@@ -286,6 +286,14 @@ struct AMGData {
     bool spectrumReady = false;                                // estimated once (D^-1 A is diagonal-scale invariant -> stable)
     bool gsSmooth = false;                                      // multicolor Gauss-Seidel smoother (BRAE_AMG_GS) instead of weighted-Jacobi
     bool saSmooth = false;                                      // smoothed aggregation (BRAE_AMG_SA): sparse smoothed P + general RAP coarse operator
+    // THE HIERARCHY HOLDS THE CALLER'S COUPLED PAIR ITSELF: it was agglomerated over [internal faces | interface
+    // entries] and its coarse matrices are made from both (DeviceSimpleSolver -- simpleFoam, pimpleFoam). Set by
+    // that builder; amgCouplePair then carries nothing. A pair carried a SECOND time on the coarse grids leaves
+    // the cycle no positive-definite preconditioner: tests/test_mean_velocity_force.cu's undriven duct, two
+    // pressure solves of 100 ended after 1,000 iterations at residuals 3.4e+02 and 9.5e+04 and the mean velocity
+    // was 11,116 after 50 steps where it decays to 0.437 -- found by the full suite 2026-10-08, there since the
+    // pair went onto every grid for interFoam (2026-10-04).
+    bool pairInCoarseMatrices = false;
     bool corrScaling = false;                                  // OF-GAMG coarse-correction scaling (nonlinear precond -> needs flexible CG)
     DeviceBuffer<scalar> sScNum, sScDen, sScAlpha, sZrOld;     // correction-scaling + flexible-CG scalars (device-resident, graph-safe)
     DeviceBuffer<scalar> wA, rA;                                // persistent V-cycle out/in (fixed addrs -> graph valid)

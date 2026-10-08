@@ -73,6 +73,7 @@ AMGData cloneAMG(const AMGData& S)
     A.nFine = S.nFine;
     A.gsSmooth = S.gsSmooth;
     A.saSmooth = S.saSmooth;
+    A.pairInCoarseMatrices = S.pairInCoarseMatrices;
     A.level.resize(S.level.size());
     for (std::size_t k = 0; k < S.level.size(); ++k)
     {
