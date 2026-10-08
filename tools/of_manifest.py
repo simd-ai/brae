@@ -4701,6 +4701,118 @@ COMPONENTS = {
                   "non-Gauss entry across a cyclic or cyclicACMI, or leastSquares across any coupled patch "
                   "(refused; grad(U) cellLimited alone is gated across a cyclicAMI); the device, whose operators "
                   "are Gauss linear and which refuses every other entry."),
+        dict(name="interFoam_functionObjectList", of_symbol="functionObjectList",
+             of_file="src/OpenFOAM/db/functionObjects/functionObjectList/functionObjectList.C",
+             classification="HOST_ONLY", status="PORTED",
+             brae_reference="src/OpenFOAM/db/functionObjects/functionObjectList/function_object_list_cpp.cuh",
+             brae_target="src/applications/solvers/interFoam/inter_function_objects_cpp.cuh",
+             validation="tests/interfoam_write/function_objects/ (2026-10-08), every file against what real "
+                        "OpenFOAM's own function objects wrote for the same staged case, on the host loop and "
+                        "the GPU loop. state.sh: the state dictionary at three write times is OpenFOAM's text "
+                        "with the numbers masked, 74 numbers within 4.3e-13 (host) and 3.3e-13 (GPU); control "
+                        "`stale` (written ahead of the step's execute) 18 lines of other text. "
+                        "state_restart.sh: a continuation from OpenFOAM's 0.05 reads the dictionary and carries "
+                        "a disabled object's results, 4.0e-13 / 3.2e-13 with the solves pinned; control `fresh` "
+                        "25 lines. refusals.sh: five entries OpenFOAM v2412 itself stops on stop brae (its log "
+                        "is the oracle), five it runs and brae has not ported are refused by name, an unported "
+                        "TYPE is named as not run and the run goes on. NOT CLAIMED: `errors warn|ignore` (brae "
+                        "stops on an object's error where OpenFOAM would warn and go on), `libs`, a controlDict "
+                        "re-read at run time, any type but probes, and the single-phase solvers, which still "
+                        "run their own reduced list (src/OpenFOAM/db/Time/brae_time.cuh).",
+             note="Time owns the list and Time::run() runs it: start() = read() at the first step, execute() "
+                  "at the top of every later one, execute() then end() when the run is over (Time.C:781-860). "
+                  "execute() calls execute() and then write() on every object at every step and, at a write "
+                  "time, writes the state dictionary at 16 digits (functionObjectList.C:615-792). brae has no "
+                  "Time: both interFoam loops call the list in the step's WRITE STAGE, ahead of the writer, "
+                  "which then writes the dictionary with the time directory's other files -- nothing touches a "
+                  "field between the bottom of one step and the top of the next, so the instant is the same, "
+                  "and the writer's files go to the disk on another thread. The state dictionary has its own "
+                  "reader: its keywords are `average(p)`, one word to OpenFOAM's ISstream, which brae's "
+                  "dictionary tokenizer splits at the parenthesis (found by state_restart.sh). An entry is "
+                  "written `( x y z )`, tokens a space apart (found by state.sh). #includeFunc inside "
+                  "`functions` is refused by name."),
+        dict(name="interFoam_functionObjectTimeControl", of_symbol="functionObjects::timeControl",
+             of_file="src/OpenFOAM/db/functionObjects/timeControl/timeControlFunctionObject.C",
+             classification="HOST_ONLY", status="PORTED",
+             brae_reference="src/OpenFOAM/db/functionObjects/timeControl/time_control_function_object_cpp.cuh",
+             brae_target="src/OpenFOAM/db/functionObjects/timeControl/time_control_cpp.cuh",
+             validation="tests/interfoam_write/function_objects/timing.sh (2026-10-08): laminar/damBreak with "
+                        "a probes object for each rule -- timeStep 3, runTime 0.02, adjustableRunTime 0.013, "
+                        "timeStart/timeEnd, onEnd, the older outputControl names, enabled false. The rows a "
+                        "file holds are the steps the rule fired at: OpenFOAM's 12, 6, 9, 8, 1 and 1 of 38 "
+                        "steps, brae's the same on both loops with the time columns OpenFOAM's text and the "
+                        "values within 3.1e-14 (host) and 1.4e-14 (GPU). Controls: a runTime index without the "
+                        "half step puts 5 of 6 rows at another time; an object active whatever its window "
+                        "writes 38 rows for 8. The three clock gates (tests/interfoam_write/clock/"
+                        "function_object_write_*.sh) hold the trimming of the time step to OpenFOAM's log bit "
+                        "for bit. NOT CLAIMED: clockTime and cpuTime (refused: they fire by the machine's "
+                        "elapsed time), controlMode other than time (refused: the trigger index), deltaTCoeff "
+                        "(refused by the clock's reader).",
+             note="functionObjectList::read wraps an object in this when its dictionary has any timing entry "
+                  "(entriesPresent) and hands it over bare otherwise. execute() passes on only inside the "
+                  "active window and when executeControl fires; write() when writeControl fires, executing "
+                  "the object first if it has not run at this time index; end() when either control fires. "
+                  "Foam::timeControl::execute is the rule per control: timeStep on Time's index, writeTime "
+                  "counting write times, runTime and adjustableRunTime on label((value - startTime + "
+                  "0.5*deltaT)/interval), onEnd past endTime - 0.5*deltaT. THE TRIMMING OF THE TIME STEP "
+                  "(adjustTimeStep) stays with the clock, FunctionObjectCadence in time_controls.cuh, because "
+                  "it must act for an object of a type brae does not run too; its index and the wrapper's "
+                  "are one expression of the same numbers, and the solver stops if they ever part."),
+        dict(name="interFoam_probes", of_symbol="probes",
+             of_file="src/sampling/probes/probes.C",
+             classification="HOST_ONLY", status="PORTED",
+             brae_reference="src/sampling/probes/probes_cpp.cuh",
+             brae_target="src/applications/solvers/interFoam/inter_function_objects_cpp.cuh",
+             schema_for="probes",
+             validation="tests/interfoam_write/function_objects/probes_dam_break.sh (2026-10-08): p, p_rgh, "
+                        "alpha.water and U at a location on a face, one inside a cell, one in the water and "
+                        "one outside the mesh, a row a step and a row a write -- five files, 150 rows, the "
+                        "heads and time columns OpenFOAM's bytes, the values within 4.0e-13 (host) and 2.9e-12 "
+                        "(GPU); control (nearest cell centre for the octree's order) 1.6e+00 off at the face "
+                        "location. probes_moving_mesh.sh: laminar/sloshingTank2D with the tutorial's own "
+                        "entry (fixedLocations false) and a fixedLocations object, 40 steps -- 6.6e-11 / "
+                        "3.4e-11; OpenFOAM's own fixed and riding columns part by 7.3e-02 and the control "
+                        "(the search not repeated) puts brae's that far off. NOT CLAIMED, each refused by "
+                        "name: a surface field, a field the solver does not hand over (handed over: p, p_rgh, "
+                        "alpha.<phase1>, U), a pattern in `fields`, interpolationScheme other than cell under "
+                        "fixedLocations, fixedLocations false on a refining mesh, a location whose candidate "
+                        "cells have a face of more than three points on a coupled patch, a tetBasePtIs file. "
+                        "NOT GATED: updateMesh on a refining mesh (the search is repeated, as written; no "
+                        "tutorial has probes on one).",
+             note="HOST LOGIC, FIELDS WHERE THEY LIVE: on the GPU loop a probe's cells are gathered on the "
+                  "device (deviceGatherIndexed) and only those values come back; no field is downloaded. "
+                  "The cell is polyMesh::findCell in its default mode (see interFoam_findCell). The value is "
+                  "the cell's own (interpolationCell, or psi[celli] without fixedLocations); a location with "
+                  "no cell is -VGREAT, in the file and in the stored average. A VECTOR field with such a "
+                  "location stops OpenFOAM v2412 at its first sample (`ill defined primitiveEntry starting at "
+                  "keyword 'min(U)'`, 'average(U)' when no location has a cell): observed, and brae stops "
+                  "there with the same keyword. Files: <case>/postProcessing/<name>/<start time>/<field>, "
+                  "writePrecision + 7 columns left-justified."),
+        dict(name="interFoam_findCell", of_symbol="polyMesh::findCell",
+             of_file="src/OpenFOAM/meshes/polyMesh/polyMesh.C",
+             classification="HOST_ONLY", status="PORTED",
+             brae_reference="src/OpenFOAM/meshes/polyMesh/polyMeshTetDecomposition/poly_mesh_tet_search_cpp.cuh",
+             brae_target="src/OpenFOAM/meshes/polyMesh/polyMeshTetDecomposition/poly_mesh_tet_search_cpp.cuh",
+             validation="Through the probes gates: on laminar/damBreak the location (0.292 0.05 0.0073) lies "
+                        "on the face between two blocks and both cells hold it; brae's column is OpenFOAM's "
+                        "within 4.0e-13 and the nearest-centre cell's is 1.6e+00 off, so the cell is "
+                        "OpenFOAM's. A location outside the mesh is not found in both codes. On "
+                        "laminar/sloshingTank2D the search repeated after every move gives OpenFOAM's columns "
+                        "over 40 steps. NOT CLAIMED: a mesh with warped faces (the base-point rule is "
+                        "transcribed and has no case that needs a base point other than 0), and the one "
+                        "coincidence the note names.",
+             note="CELL_TETS: findCell -> cellTree().findInside(p) -> the octree leaf's cells in their order, "
+                  "the first whose tet decomposition holds p (tetrahedron::inside, a tolerance of SMALL on "
+                  "the far side of each plane). The octree starts from identity(nCells) and divide() keeps "
+                  "the order, a leaf holds every cell whose box overlaps its own, and the leaf found for p "
+                  "holds p: so the answer is THE LOWEST-NUMBERED CELL THAT HOLDS p, which is computed "
+                  "directly over all cells behind a bounding-box cut, with no octree. The two can part only "
+                  "where p is within 1e-15 of a leaf's own plane, a position drawn from Random(261782). "
+                  "tetBasePtIs is transcribed for internal and uncoupled boundary faces (the first face "
+                  "point whose fan has quality above sqr(SMALL) from both cells), kept across movePoints "
+                  "and rebuilt on a topology change as OpenFOAM does. A coupled patch's face needs the cell "
+                  "centre across the coupling: refused by name for a location whose candidate cells have "
+                  "one. interFoam's pRefPoint uses another mode (FACE_PLANES), in inter_case_cpp.cu."),
     ],
 
     "rhoSimpleFoam": [

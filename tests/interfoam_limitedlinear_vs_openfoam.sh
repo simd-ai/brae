@@ -91,7 +91,7 @@ n = int(os.environ['STEPS'])
 dt = os.environ['DT']
 c = os.path.join(d, 'system/controlDict')
 s = open(c).read()
-# extractEulerianParticles writes nothing a field comparison reads, and brae runs no function objects
+# extractEulerianParticles writes nothing a field comparison reads, and brae does not run that type
 s = re.sub(r'\nfunctions\s*\{.*\n\}\s*\n', '\n', s, flags=re.S)
 for key, val in [('adjustTimeStep', 'no'), ('deltaT', dt), ('endTime', '%.10g' % (n*float(dt))),
                  ('writeControl', 'timeStep'), ('writeInterval', str(n)), ('writeFormat', 'ascii'),

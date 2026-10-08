@@ -321,7 +321,8 @@ inline CourantNumbers alphaCourantNo(
 //   * a time to the next write that is not positive becomes one whole interval, Time's becomes 0;
 //   * and only while the object is ACTIVE, timeStart - deltaT/2 <= t <= timeEnd + deltaT/2 (active(),
 //     :101-140), which also gates the index: write() asks `active() && writeControl_.execute()`.
-// brae runs no function object; it keeps this much of each, because the step is the solution's.
+// The clock keeps this much of EVERY object, of a type brae runs (probes) or not, because the step is the
+// solution's; the objects themselves are src/OpenFOAM/db/functionObjects/.
 // MEASURED on laminar/damBreak under adjustTimeStep with a `probes` object at `writeControl
 // adjustableRunTime; writeInterval 0.013`, to t = 0.1: OpenFOAM 31 steps, brae 26, the two parting at the
 // fifth (0.0021861 for 0.0024883).

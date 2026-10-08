@@ -26,7 +26,8 @@ cd yourTwoPhaseCase && brae
 | **Waves** | OpenFOAM's `waveModels` generation and absorption conditions |
 | **Sources** | `explicitPorositySource` (Darcy-Forchheimer), MRF |
 | **I/O** | standard OpenFOAM case in, standard time directories out, ASCII or binary |
-| **Not yet** | function objects (their `adjustableRunTime` write times do trim the time step, as in OpenFOAM), multi-GPU |
+| **Function objects** | `probes` (p, p_rgh, alpha, U at points; OpenFOAM's files under `postProcessing/` and its state dictionary), with OpenFOAM's timing entries (`writeControl`, `executeControl`, `timeStart`, `timeEnd`), on static and moving meshes |
+| **Not yet** | the other function-object types (each is named at start-up and not run; its `adjustableRunTime` write times still trim the time step, as in OpenFOAM), multi-GPU |
 
 A setting this solver does not carry stops the run at start-up and names itself; it is never replaced by a
 default.

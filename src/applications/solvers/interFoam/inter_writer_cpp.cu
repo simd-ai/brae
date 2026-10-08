@@ -1599,23 +1599,6 @@ InterWriter::InterWriter(
     deltaTSave_ = startDeltaT(cd, startDir, cd.scalarOr("deltaT", scalar(0)));
     deltaT0_ = deltaTSave_;
 
-    if (const FoamDict* fns = cd.subDict("functions"))
-    {
-        if (!fns->subs.empty())
-        {
-            std::string names;
-            for (const auto& s : fns->subs)
-            {
-                names += (names.empty() ? "" : ", ") + s.first;
-            }
-            noticeIgnored(
-                "controlDict functions",
-                "brae runs no function objects (" + names + "): their postProcessing/ output and the fields "
-                "they write are not produced; the solution depends on them in the time step alone, where "
-                "an object's adjustableRunTime write times trim it, and that is kept");
-        }
-    }
-
     // A RESTART continues OpenFOAM's time index and cumulative continuity error from the start directory
     // (Time.C:304-307, initContinuityErrs.H:40-52) -- the index is the case's, InterFields::startTimeIndex,
     // which the loops hand the write schedule -- and its step, the stored deltaT under adjustTimeStep
@@ -3428,8 +3411,8 @@ void InterWriter::write(const InterWriteState& s)
         emit(dir + "/uniform/" + object, os.str(), true);
     }
 
-    // uniform/cumulativeContErr (initContinuityErrs.H:40-52), and the function objects' state file,
-    // empty because brae runs none
+    // uniform/cumulativeContErr (initContinuityErrs.H:40-52), and the function objects' state dictionary:
+    // the entries the list's execute at this step left (inter_function_objects_cpp.cuh)
     {
         std::ostringstream os;
         os << header("uniformDimensionedScalarField", name + "/uniform", "cumulativeContErr");
@@ -3442,6 +3425,10 @@ void InterWriter::write(const InterWriteState& s)
     {
         std::ostringstream os;
         os << header("dictionary", name + "/uniform/functionObjects", "functionObjectProperties");
+        if (s.functionObjectProperties)
+        {
+            os << *s.functionObjectProperties;
+        }
         os << "\n\n// ************************************************************************* //\n";
         emit(dir + "/uniform/functionObjects/functionObjectProperties", os.str(), true);
     }

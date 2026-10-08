@@ -6,6 +6,7 @@
 #include "inter_driver_cpp.cuh"
 #include "inter_amr_cpp.cuh"
 #include "inter_correct_phi_cpp.cuh"
+#include "inter_function_objects_cpp.cuh"
 #include "inter_solve_cpp.cuh"
 #include "inter_peqn_cpp.cuh"
 #include "interface_properties_cpp.cuh"
@@ -882,6 +883,49 @@ RunReport runInterFoam(
     {
         pBFrozen = staticPressureBoundary(f.p_rgh, f.rhoBnd, f.ghfBoundary);
     }
+    // THE FUNCTION OBJECTS, built as Time::run() builds them at the first step (functionObjects_.start(),
+    // Time.C:817-821): on the start mesh, before anything is executed. With no writer there is no time
+    // directory to hold their state and no start-time name for their files: a caller's own test loop.
+    std::unique_ptr<InterFunctionObjects> functionObjects;
+    if (writer && nSteps > 0 && rep.time < endTime - scalar(0.5)*rep.deltaT)
+    {
+        functionObjects.reset(new InterFunctionObjects());
+        // interFoam's registry, as far as it is handed over: this loop's cells ARE the fields' own
+        functionObjects->fields.add(
+            "p",
+            [&f](
+                const std::vector<label>& cells,
+                std::vector<scalar>& out)
+            {
+                functionObjectCellsOf(f.p, cells, out);
+            });
+        functionObjects->fields.add(
+            "p_rgh",
+            [&f](
+                const std::vector<label>& cells,
+                std::vector<scalar>& out)
+            {
+                functionObjectCellsOf(f.p_rgh.internal, cells, out);
+            });
+        functionObjects->fields.add(
+            f.alphaName,
+            [&f](
+                const std::vector<label>& cells,
+                std::vector<scalar>& out)
+            {
+                functionObjectCellsOf(f.alpha1.internal, cells, out);
+            });
+        functionObjects->fields.add(
+            "U",
+            [&f](
+                const std::vector<label>& cells,
+                std::vector<vector>& out)
+            {
+                functionObjectCellsOf(f.U.internal, cells, out);
+            });
+        functionObjects->start(caseDir, writer->timeNameAtStart(startTime), writer->writePrecision(), startTime,
+                               endTime, f.startTimeIndex, m, g.C(), f.amr && f.amr->active);
+    }
     for (label step = 0; step < nSteps; ++step)
     {
         // Time::run() (Time.C:1000), and it sits HERE -- above CourantNo.H and setDeltaT.H -- so the
@@ -1119,6 +1163,12 @@ RunReport runInterFoam(
                             // the GLOBAL time index, which the wall-distance schedule tests (wallDist.C:198)
                             interAfterMeshChange(f, *mutableMesh, gamgCache, cpc, rep,
                                                  f.amr->startTimeIndex + rep.steps, refineAndMove);
+                            // polyMesh::updateMesh's last statement (polyMeshUpdate.C:152)
+                            if (functionObjects)
+                            {
+                                functionObjects->setTime(rep.time, rep.deltaT, f.startTimeIndex + rep.steps, writeNow);
+                                functionObjects->updateMesh();
+                            }
                         }
                         // OpenFOAM prints "Refined from N to M cells." at every change; this is the same
                         // line, and a run that silently refines nothing is what it exists to show.
@@ -1142,6 +1192,12 @@ RunReport runInterFoam(
                         {
                             writer->addContinuityError(rep.deltaT, cpDiv, g.V());
                         }
+                    }
+                    // polyMesh::movePoints' last statement (polyMesh.C:1292), on a mesh that moves
+                    if (functionObjects && dyn)
+                    {
+                        functionObjects->setTime(rep.time, rep.deltaT, f.startTimeIndex + rep.steps, writeNow);
+                        functionObjects->movePoints();
                     }
                     break;
                 }
@@ -1922,6 +1978,13 @@ RunReport runInterFoam(
                     break;
                 }
                 case Stage::write:
+                    // functionObjects_.execute(), which Time::run() makes at the top of the NEXT step on
+                    // the fields as they stand here (inter_function_objects_cpp.cuh has why it sits here)
+                    if (functionObjects)
+                    {
+                        functionObjects->setTime(rep.time, rep.deltaT, f.startTimeIndex + rep.steps, writeNow);
+                        functionObjects->execute(f.writeCadence);
+                    }
                     // runTime.write() (interFoam.C:175): the stored state, nothing re-evaluated
                     if (writer && writeNow)
                     {
@@ -1953,6 +2016,7 @@ RunReport runInterFoam(
                         ws.displacement = f.dynamicMesh ? f.dynamicMesh->displacement() : nullptr;
                         ws.rigidBody = f.dynamicMesh ? f.dynamicMesh->rigidBody() : nullptr;
                         ws.rAU = &f.rAU;
+                        ws.functionObjectProperties = functionObjects ? &functionObjects->propertiesBody() : nullptr;
                         // CrankNicolson on a moving mesh: the scheme's registry state, as the step left it.
                         // UOld is still THIS step's old level here -- the rotation follows the write.
                         InterWriteCrankNicolson wcn;
@@ -1989,6 +2053,13 @@ RunReport runInterFoam(
         };
 
         runTimeStep(lc, hooks);
+
+        // Time::run() when the run is over (Time.C:790-802): the last execute -- made in the write stage
+        // above -- and then end()
+        if (functionObjects && !(rep.time < endTime - scalar(0.5)*rep.deltaT))
+        {
+            functionObjects->end();
+        }
 
         // ...and the old-time set moves forward, all four together -- five on a moving mesh -- with
         // the old-old level CrankNicolson reads taking the old one first

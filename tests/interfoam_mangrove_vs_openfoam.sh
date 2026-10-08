@@ -159,7 +159,7 @@ for i in range(n):
     t += float(dt)
 c = os.path.join(d, 'system/controlDict')
 s = open(c).read()
-# the line sets write nothing a field comparison reads, and brae runs no function objects
+# the line sets write nothing a field comparison reads, and brae does not run that type
 s = re.sub(r'\nfunctions\s*\{.*\n\}\s*\n', '\n', s, flags=re.S)
 for key, val in [('startFrom', 'startTime'), ('adjustTimeStep', 'no'), ('deltaT', dt), ('endTime', '%.10g' % t),
                  ('writeControl', 'timeStep'), ('writeInterval', str(n)), ('writeFormat', 'ascii'),

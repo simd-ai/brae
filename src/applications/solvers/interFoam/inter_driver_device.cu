@@ -19,6 +19,7 @@
 #include <set>
 #include "inter_amr_cpp.cuh"
 #include "inter_correct_phi_cpp.cuh"
+#include "inter_function_objects_cpp.cuh"
 #include "inter_case_cpp.cuh"
 #include "inter_peqn_cpp.cuh"
 #include "inter_ueqn_cpp.cuh"
@@ -5235,6 +5236,74 @@ RunReport runInterFoamDevice(
     {
         pBFrozen = staticPressureBoundary(f.p_rgh, f.rhoBnd, f.ghfBoundary);
     }
+    // THE FUNCTION OBJECTS, as the host loop builds them (inter_driver_cpp.cu, at the same place). THE FIELDS
+    // LIVE ON THE GPU HERE: an object's cells are gathered there (deviceGatherIndexed) and only those values
+    // come back -- no field is downloaded for a probe.
+    std::unique_ptr<cpu::interFoam::InterFunctionObjects> functionObjects;
+    if (writer && nSteps > 0 && rep.time < endTime - scalar(0.5)*rep.deltaT)
+    {
+        functionObjects.reset(new cpu::interFoam::InterFunctionObjects());
+        auto deviceCells = [](
+            const DeviceBuffer<scalar>& field,
+            const std::vector<label>& cells,
+            std::vector<scalar>& out)
+        {
+            const DeviceBuffer<label> dCells(cells);
+            DeviceBuffer<scalar> dOut;
+            deviceGatherIndexed(field, dCells, dOut);
+            dOut.copyTo(out);
+        };
+        functionObjects->fields.add(
+            "p",
+            [&, deviceCells](
+                const std::vector<label>& cells,
+                std::vector<scalar>& out)
+            {
+                // under frozenFlow no pressure corrector fills the device's p: the host's is the field
+                if (pPatchesFrozen)
+                {
+                    cpu::interFoam::functionObjectCellsOf(f.p, cells, out);
+                    return;
+                }
+                deviceCells(dP, cells, out);
+            });
+        functionObjects->fields.add(
+            "p_rgh",
+            [&, deviceCells](
+                const std::vector<label>& cells,
+                std::vector<scalar>& out)
+            {
+                deviceCells(dPrgh, cells, out);
+            });
+        functionObjects->fields.add(
+            f.alphaName,
+            [&, deviceCells](
+                const std::vector<label>& cells,
+                std::vector<scalar>& out)
+            {
+                deviceCells(dA, cells, out);
+            });
+        functionObjects->fields.add(
+            "U",
+            [&, deviceCells](
+                const std::vector<label>& cells,
+                std::vector<vector>& out)
+            {
+                std::vector<scalar> ux;
+                std::vector<scalar> uy;
+                std::vector<scalar> uz;
+                deviceCells(dUx, cells, ux);
+                deviceCells(dUy, cells, uy);
+                deviceCells(dUz, cells, uz);
+                out.resize(cells.size());
+                for (std::size_t i = 0; i < cells.size(); ++i)
+                {
+                    out[i] = vector{ux[i], uy[i], uz[i]};
+                }
+            });
+        functionObjects->start(caseDir, writer->timeNameAtStart(startTime), writer->writePrecision(), startTime,
+                               endTime, f.startTimeIndex, m, g.C(), f.amr && f.amr->active);
+    }
     interPhase::start();
     for (label s = 0; s < nSteps; ++s)
     {
@@ -6068,6 +6137,12 @@ RunReport runInterFoamDevice(
                                     writer ? &cpDiv : nullptr,
                                     turbWaveRunner ? &turbWaveRunner : nullptr);
                 }
+                // polyMesh::movePoints' last statement (polyMesh.C:1292)
+                if (functionObjects && dyn)
+                {
+                    functionObjects->setTime(stepTime, rep.deltaT, f.startTimeIndex + stepIndex, writeNow);
+                    functionObjects->movePoints();
+                }
                 interPhase::Nested timedRefresh("mesh: the device refresh after it (geometry, fluxes, boundary)");
                 std::optional<interPhase::Nested> refreshPart;
                 refreshPart.emplace("refresh: the continuity error and the old volumes up");
@@ -6653,6 +6728,12 @@ RunReport runInterFoamDevice(
                     interAfterMeshChange(f, *mutableMesh, meshAgglomeration, meshCpc, rep,
                                          f.amr->startTimeIndex + stepIndex, /*motionFollows=*/refineAndMove,
                                          turbWaveRunner ? &turbWaveRunner : nullptr);
+                    // polyMesh::updateMesh's last statement (polyMeshUpdate.C:152)
+                    if (functionObjects)
+                    {
+                        functionObjects->setTime(stepTime, rep.deltaT, f.startTimeIndex + stepIndex, writeNow);
+                        functionObjects->updateMesh();
+                    }
 
                     // ---- the counts every array below is sized by
                     nC = m.nCells();
@@ -7353,6 +7434,14 @@ RunReport runInterFoamDevice(
         // values as the hooks left them on the host. The closure is the exception: its download writes
         // f.turbulence, the host copy this loop never reads -- arm F of tests/interfoam_write_vs_openfoam.sh
         // holds the run byte-identical whether it writes every step or once.
+        // functionObjects_.execute() first, which Time::run() makes at the top of the NEXT step on the
+        // fields as they stand here (inter_function_objects_cpp.cuh has why it sits here)
+        if (functionObjects)
+        {
+            interPhase::Nested timed("function objects: execute and write");
+            functionObjects->setTime(rep.time, rep.deltaT, f.startTimeIndex + rep.steps, writeNow);
+            functionObjects->execute(f.writeCadence);
+        }
         if (writer && writeNow)
         {
             std::vector<scalar> aW, prghW, pW, ux, uy, uz;
@@ -7449,6 +7538,7 @@ RunReport runInterFoamDevice(
             ws.alpha1Cells = &aW;
             ws.UCells = &uW;
             ws.p_rghCells = &prghW;
+            ws.functionObjectProperties = functionObjects ? &functionObjects->propertiesBody() : nullptr;
             ws.alpha1OldCells = &alphaOldWrite;
             ws.alpha1OldBoundary = &alphaOldBndWrite;
             // coupled patches keep the host's values; the writer takes the step's start there anyway
@@ -7545,6 +7635,11 @@ RunReport runInterFoamDevice(
                 ws.points0 = f.dynamicMesh ? &f.dynamicMesh->points0() : nullptr;
             }
             writer->write(ws);
+        }
+        // Time::run() when the run is over (Time.C:790-802): the last execute, made above, and then end()
+        if (functionObjects && !(rep.time < endTime - scalar(0.5)*rep.deltaT))
+        {
+            functionObjects->end();
         }
 
         interPhase::mark("9 write");

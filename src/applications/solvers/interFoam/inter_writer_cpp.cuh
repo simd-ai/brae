@@ -127,6 +127,9 @@ struct InterWriteState
     const std::vector<scalar>* rAU = nullptr;
     // CrankNicolson on a moving mesh; null under any other scheme
     const InterWriteCrankNicolson* cn = nullptr;
+    // the entries of uniform/functionObjects/functionObjectProperties as the function objects' execute at
+    // this step left them (functionObjectList.C:776-789); null: an empty dictionary
+    const std::string* functionObjectProperties = nullptr;
 };
 
 class InterWriter
@@ -170,6 +173,10 @@ public:
     // angle's gradient included (readGradientEntry), which brae does not read.
     bool startHoldsAlphaOld() const { return startHoldsAlphaOld_; }
     const std::vector<FvPatch>& patches() const { return patches_; }
+    // Time::timeName(t) as the run starts: the instance of a function object's output files
+    std::string timeNameAtStart(scalar t) const { return timeName(t, timePrecision_); }
+    // IOstream::defaultPrecision(), the case's writePrecision
+    int writePrecision() const { return precision_; }
     // the start directory holds this file (plain or .gz)
     bool startHolds(const std::string& file) const;
     // the wave models whose state is written, uniform/waveProperties.<patch> (null: a case without waves)

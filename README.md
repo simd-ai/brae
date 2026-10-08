@@ -120,7 +120,8 @@ Type `brae`. It reads the `application` entry in your `controlDict` and runs the
 
 </details>
 
-Coming soon: runtime function objects (probes, gauges, sampling) for `interFoam`.
+`interFoam` runs `probes` function objects as OpenFOAM does. Coming soon: the other runtime function objects
+(gauges, sampling, forces).
 
 ---
 
