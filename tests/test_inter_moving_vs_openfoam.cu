@@ -8,6 +8,7 @@
 // pressure reference of a tank with no free surface to the outside.
 //
 // tests/interfoam_moving_vs_openfoam.sh says what each profile is for and what it measured.
+#include "device_schedule.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -172,6 +173,11 @@ int main(
     int argc,
     char** argv)
 {
+    // THE SOLVER'S OWN WAIT ON THE DEVICE, first thing as its main does (braeInterFoam.cu, device_schedule.cuh).
+    // Without it this binary took the driver's blocking wait: MEASURED 2026-10-08 on piston/outer_once_control,
+    // 267 s of wall clock for 42 s of CPU -- the process asleep between a device call's end and its return --
+    // and under the full suite's load, beside tests that take the GPU without the lock, past its 900 s limit.
+    brae::setCudaSchedule();
     std::printf("== brae interFoam vs OpenFOAM interFoam: a moving mesh ==\n");
     if (argc < 8)
     {

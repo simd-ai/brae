@@ -1441,7 +1441,9 @@ set_tests_properties(gs_host_smoother_identity PROPERTIES SKIP_RETURN_CODE 77 TI
 
 add_test(NAME gradu_memo_identity
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/gradu_memo_identity.sh)
-set_tests_properties(gradu_memo_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+# 161 s by itself; 635 s and then past 900 s in two full suites (2026-10-08), sharing the GPU with whatever ran
+# beside it. The limit is for a hang and has to clear that.
+set_tests_properties(gradu_memo_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 2400)
 
 add_test(NAME normfactor_device_identity
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/normfactor_device_identity.sh)
@@ -1663,7 +1665,8 @@ set_tests_properties(tutorial_backwardfacingstep2d PROPERTIES SKIP_RETURN_CODE 7
 add_test(NAME tutorial_turbulentflatplate_komegasst
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
                  turbulentFlatPlate:kOmegaSST:2200 U=2e-04,p=3e-02,k=1e-03,omega=5e-04,nut=2e-02)
-set_tests_properties(tutorial_turbulentflatplate_komegasst PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 2400)
+# its kEpsilon twin's limit: 2,174 s and 1,984 s of the 2,400 it had in two full suites (2026-10-08)
+set_tests_properties(tutorial_turbulentflatplate_komegasst PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 3600)
 
 add_test(NAME tutorial_bump2d_spalartallmaras
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
@@ -3364,6 +3367,11 @@ foreach(rel ${BRAE_WRITE_TESTS})
                          TIMEOUT 1800
                          ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 endforeach()
+# THE TWO FORTY-STEP GATES take a minute or two by themselves and 1,321 s and 1,312 s in a full suite
+# (2026-10-08, -j 6): their device arms share the GPU with every small gate beside them. A limit for a hang,
+# clear of that.
+set_tests_properties(interfoam_write_subcycle_final_mixture_no_evaluate
+                     interfoam_write_subcycle_contact_angle_next_corrector PROPERTIES TIMEOUT 3600)
 set(BRAE_WRITE_TUTORIALS_FAST
     capillaryRise weirOverflow angledDuct damBreakLeakage damBreakPorousBaffle damBreakPermeable
     nozzleFlow2D eulerianInjection cnoidal solitary solitaryGrimshaw solitaryMcCowan stokesI stokesII
@@ -4306,9 +4314,12 @@ foreach(rel ${BRAE_MOVING_TESTS})
     string(REPLACE "/" "_" name ${name})
     add_test(NAME interfoam_moving_${name}
              COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/interfoam_moving/${rel})
+    # THE TIME LIMIT IS FOR A HANG, and it has to clear the suite's load: piston/outer_once_control is 210 s by
+    # itself and ran past 900 s in the full suite at -j 8 (2026-10-08), beside tests of the other solvers that
+    # take the GPU without this lock; piston/outer_control was 629 s in the same run. No check changed.
     set_tests_properties(interfoam_moving_${name} PROPERTIES
                          SKIP_RETURN_CODE 77
-                         TIMEOUT 900
+                         TIMEOUT 1800
                          RESOURCE_LOCK brae_gpu)
 endforeach()
 
