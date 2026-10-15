@@ -278,8 +278,9 @@ struct AMGPair
 };
 
 // THE COARSEST SOLVE'S ALTERNATIVES (BRAE_AMG_COARSE_SOLVE, an experiment on perf/amg-coarse-solve):
-// lu (the default) applies coarseLU with coarseLUSolveKernel; tri the same factors by one warp; inverse A^-1
-// formed at the factorisation and applied as a product; cholesky L L^T where the level is SPD, the LU
+// lu applies coarseLU with coarseLUSolveKernel; tri the same factors by one warp; inverse (the default,
+// device_amg_coarse_default.cuh) A^-1 formed at the factorisation and applied as a product, the LU's substitutions
+// where its check finds it unsafe; cholesky L L^T where the level is SPD, the LU
 // otherwise (decided on the device, so it holds inside a captured graph). Prepared beside the LU, outside
 // every capture; same lifecycle as coarseLU.
 enum class CoarseSolveKind { LU = 0, Tri = 1, Inverse = 2, Cholesky = 3 };
