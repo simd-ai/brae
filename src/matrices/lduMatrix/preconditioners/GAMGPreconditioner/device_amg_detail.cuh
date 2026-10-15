@@ -208,6 +208,18 @@ inline bool useDenseCoarse()
     static bool b = envFlag("BRAE_AMG_COARSE_LU", true);
     return b;
 }
+// the largest coarsest grid the direct solve takes: DENSE_COARSE_MAX, or BRAE_AMG_DENSE_MAX (1..256) for the
+// coarse-solve experiment's 128-cell levels
+inline int denseCoarseMax()
+{
+    static const int m = []()
+    {
+        const char* e = std::getenv("BRAE_AMG_DENSE_MAX");
+        const int v = e ? std::atoi(e) : 0;
+        return (v >= 1 && v <= 256) ? v : DENSE_COARSE_MAX;
+    }();
+    return m;
+}
 inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
 
 // V-cycle work kernels are templated on the value type: <scalar> is the FP64 path, <float> the mixed-precision

@@ -277,6 +277,23 @@ struct AMGPair
     unsigned long long epoch = 0;               // moves when a buffer above does: what a captured cycle compares
 };
 
+// THE COARSEST SOLVE'S ALTERNATIVES (BRAE_AMG_COARSE_SOLVE, an experiment on perf/amg-coarse-solve):
+// lu (the default) applies coarseLU with coarseLUSolveKernel; tri the same factors by one warp; inverse A^-1
+// formed at the factorisation and applied as a product; cholesky L L^T where the level is SPD, the LU
+// otherwise (decided on the device, so it holds inside a captured graph). Prepared beside the LU, outside
+// every capture; same lifecycle as coarseLU.
+enum class CoarseSolveKind { LU = 0, Tri = 1, Inverse = 2, Cholesky = 3 };
+struct CoarseDirect
+{
+    CoarseSolveKind kind = CoarseSolveKind::LU;
+    int n = 0;
+    DeviceBuffer<scalar> fc;                                    // the LU, column-major (tri, and cholesky's fallback)
+    DeviceBuffer<scalar> f2;                                    // A^-1 row-major (inverse), L and L^T column-major (cholesky)
+    DeviceBuffer<scalar> work;                                  // cholesky's working matrix where it does not fit in shared
+    DeviceBuffer<int> perm;                                     // the LU's interchanges as one gather
+    DeviceBuffer<int> chol;                                     // 1 where cholesky factorised the level
+};
+
 struct AMGData {
     int nFine = 0;
     std::vector<AMGLevel> level;                                // level[k]: grid k -> grid k+1 (+ grid k+1's matrix)
@@ -337,6 +354,7 @@ struct AMGData {
     DeviceBuffer<scalar> coarseLU;                              // n*n row-major, L (unit diagonal) and U in place
     DeviceBuffer<int>    coarsePiv;                             // n row interchanges, in factorisation order
     int coarseLUn = 0;
+    CoarseDirect coarseDirect;                                  // the coarsest solve's alternative (BRAE_AMG_COARSE_SOLVE)
     int nCoarse = 0, nCoarseFaces = 0;                          // back-compat: the FIRST coarse level (level[0])
     int nLevels() const { return static_cast<int>(level.size()); }
     DeviceLduView coarseView() const { return level.front().coarseView(); }   // first coarse level (for #7b tests)

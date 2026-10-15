@@ -1,6 +1,7 @@
 // Device AMG preconditioner: host agglomeration (static) + device Galerkin and V-cycle smoothing.
 // Used by deviceAMGPCG. Feature flags live in one BRAE_AMG_* block at the top of the anonymous namespace.
 #include "device_amg.cuh"
+#include <unistd.h>
 #include "inter_phase_time.cuh"
 #include "device_blas.cuh"
 #include "device_ldu.cuh"       // deviceParallelAmul (halo-coupled matvec) for the distributed whole-loop graph PCG
@@ -265,6 +266,51 @@ void buildGalerkinGather(AMGLevel& L, const AgglomT& a, int nFine)
 
 // THE BUILD'S PARAMETERS, read in ONE place: buildAMG and agglomerate take them from here, and so does the
 // disk cache's signature (amgHierarchySignature) -- a hierarchy built under another value is another hierarchy.
+// INSTRUMENT (BRAE_AMG_COARSE_DUMP=<dir>): the coarsest grid's matrix, dense and row-major at 17 digits, for the
+// coarse-solve benchmark (tests/bench_amg_coarse_solve.cu); the first BRAE_AMG_COARSE_DUMP_MAX (4) a process.
+static void dumpCoarsestForBenchmark(
+    const DeviceLduView& cv)
+{
+    static const char* dir = std::getenv("BRAE_AMG_COARSE_DUMP");
+    if (!dir) return;
+    static int written = 0;
+    static const int most = std::getenv("BRAE_AMG_COARSE_DUMP_MAX") ? std::atoi(std::getenv("BRAE_AMG_COARSE_DUMP_MAX")) : 4;
+    if (written >= most) return;
+    const int n = cv.nCells;
+    const int nf = cv.nInternalFaces;
+    std::vector<scalar> diag(n), upper(nf), lower(nf);
+    std::vector<label> owner(nf), nei(nf);
+    cudaCheck(cudaDeviceSynchronize(), "coarse dump sync");
+    cudaCheck(cudaMemcpy(diag.data(), cv.diag, n*sizeof(scalar), cudaMemcpyDeviceToHost), "coarse dump diag");
+    if (nf > 0)
+    {
+        cudaCheck(cudaMemcpy(upper.data(), cv.upper, nf*sizeof(scalar), cudaMemcpyDeviceToHost), "coarse dump upper");
+        cudaCheck(cudaMemcpy(lower.data(), cv.lower, nf*sizeof(scalar), cudaMemcpyDeviceToHost), "coarse dump lower");
+        cudaCheck(cudaMemcpy(owner.data(), cv.owner, nf*sizeof(label), cudaMemcpyDeviceToHost), "coarse dump owner");
+        cudaCheck(cudaMemcpy(nei.data(), cv.nei, nf*sizeof(label), cudaMemcpyDeviceToHost), "coarse dump nei");
+    }
+    std::vector<scalar> dense(static_cast<std::size_t>(n)*n, 0.0);
+    for (int c = 0; c < n; ++c) dense[static_cast<std::size_t>(c)*n + c] = diag[c];
+    for (int f = 0; f < nf; ++f)
+    {
+        dense[static_cast<std::size_t>(owner[f])*n + nei[f]] += upper[f];
+        dense[static_cast<std::size_t>(nei[f])*n + owner[f]] += lower[f];
+    }
+    char name[512];
+    std::snprintf(name, sizeof(name), "%s/coarsest_%d_%d.txt", dir, static_cast<int>(getpid()), written);
+    FILE* fp = std::fopen(name, "w");
+    if (!fp) return;
+    std::fprintf(fp, "%d\n", n);
+    for (int i = 0; i < n; ++i)
+    {
+        for (int j = 0; j < n; ++j) std::fprintf(fp, j ? " %.17g" : "%.17g", dense[static_cast<std::size_t>(i)*n + j]);
+        std::fprintf(fp, "\n");
+    }
+    std::fclose(fp);
+    std::printf("INSTRUMENT: the coarsest grid's matrix (%d cells) written to %s\n", n, name);
+    ++written;
+}
+
 int amgTarget()
 {
     const char* e = std::getenv("BRAE_AMG_TARGET");
@@ -1717,7 +1763,7 @@ void amgGalerkin(
     // part that is not an optimisation -- OUTSIDE every graph capture, for the same reason the permuted
     // GS coefficients are gathered here. A factorisation made conditional inside a captured V-cycle
     // would bake the coefficients of the iteration the graph was captured in into every replay.
-    if (useDenseCoarse() && A.nLevels() > 0 && A.level.back().nCoarse <= DENSE_COARSE_MAX)
+    if (useDenseCoarse() && A.nLevels() > 0 && A.level.back().nCoarse <= denseCoarseMax())
     {
         const int n = A.level.back().nCoarse;
         if (A.coarseLUn != n)
@@ -1727,6 +1773,8 @@ void amgGalerkin(
             A.coarseLUn = n;
         }
         deviceCoarseLUFactor(A.level.back().coarseView(), A.coarseLU, A.coarsePiv);
+        deviceCoarseDirectPrepare(coarseSolveKind(), A.level.back().coarseView(), nullptr, A.coarseLU, A.coarsePiv, A.coarseDirect);
+        dumpCoarsestForBenchmark(A.level.back().coarseView());
     }
     else
     {

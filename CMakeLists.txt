@@ -4937,6 +4937,10 @@ add_test(NAME gpu_resident_turb COMMAND test_gpu_resident_turb ${CMAKE_CURRENT_S
 add_executable(test_gpu_amg tests/test_gpu_amg.cu)
 target_include_directories(test_gpu_amg PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_gpu_amg PRIVATE brae_core)
+# The AMG coarsest grid's direct solve, kind by kind (BRAE_AMG_COARSE_SOLVE): a benchmark, not a test
+add_executable(bench_amg_coarse_solve tests/bench_amg_coarse_solve.cu)
+target_include_directories(bench_amg_coarse_solve PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(bench_amg_coarse_solve PRIVATE brae_core)
 add_test(NAME gpu_amg COMMAND test_gpu_amg ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
 
 add_executable(test_gpu_benchmark tests/test_gpu_benchmark.cu)

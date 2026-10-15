@@ -11,6 +11,10 @@
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
 #include <mutex>
+#include <string>
+#include <stdexcept>
+#include <cstdio>
+#include <cstdlib>
 #include <cstddef>
 
 namespace cg = cooperative_groups;
@@ -537,6 +541,317 @@ void coarseLUSolveKernel(
     for (int i = tid; i < n; i += blockDim.x) xc[i] = y[i];
 }
 
+// ---------------------------------------------------------------------------------------------------
+// THE COARSEST SOLVE'S ALTERNATIVES (BRAE_AMG_COARSE_SOLVE; branch perf/amg-coarse-solve, an experiment).
+// Each is prepared from the factorisation amgGalerkin makes, outside every capture, and applied inside the
+// V-cycle: `tri` the same LU applied by one warp, `inverse` A^-1 formed once and applied as a product,
+// `cholesky` L L^T where the level is symmetric and its pivots positive, the LU otherwise.
+// ---------------------------------------------------------------------------------------------------
+
+// rows a lane holds: the warp kernels below take n <= 32*TRI_ROWS
+constexpr int TRI_ROWS = 4;
+// Cholesky is taken only on a level symmetric to this, relative to max|diag| (a Galerkin product sums its
+// upper and lower entries in different orders, so a symmetric level is symmetric to a rounding, not exactly)
+constexpr scalar CHOL_SYM_TOL = 1e-12;
+// and only with every pivot above this, relative to max|diag|: a singular level (an all-Neumann pressure)
+// leaves a pivot of a rounding, and keeps the LU's floored pivot (DENSE_LU_EPS) by falling back to it
+constexpr scalar CHOL_PIVOT_MIN = 1e-10;
+
+// lu (row-major, unit L and U in place) -> fc column-major, fc[k*n + i] = lu[i*n + k], so that a warp reading
+// column k of a factor reads consecutive words; and the row interchanges composed into one gather,
+// y[i] = b[perm[i]]: the swaps of coarseLUSolveKernel applied to the positions, in factorisation order
+__global__
+void coarseLUColumnMajorKernel(
+    int n,
+    const scalar* __restrict__ lu,
+    const int* __restrict__ piv,
+    scalar* __restrict__ fc,
+    int* __restrict__ perm)
+{
+    for (int idx = blockIdx.x*blockDim.x + threadIdx.x; idx < n*n; idx += gridDim.x*blockDim.x)
+    {
+        const int i = idx / n;
+        const int k = idx % n;
+        fc[k*n + i] = lu[idx];
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+    {
+        for (int i = 0; i < n; ++i) perm[i] = i;
+        for (int k = 0; k < n; ++k)
+        {
+            const int r = piv[k];
+            if (r != k)
+            {
+                const int t = perm[k];
+                perm[k] = perm[r];
+                perm[r] = t;
+            }
+        }
+    }
+}
+
+// row i lives in lane i % 32, slot i / 32 (a constant index into the slots, so they stay in registers)
+__device__ __forceinline__
+scalar warpRow(
+    const scalar (&yr)[TRI_ROWS],
+    int k)
+{
+    const int s = k >> 5;
+    const scalar v = (s == 0) ? yr[0] : (s == 1) ? yr[1] : (s == 2) ? yr[2] : yr[3];
+    return __shfl_sync(0xffffffffu, v, k & 31);
+}
+
+__device__ __forceinline__
+void warpDivideRow(
+    scalar (&yr)[TRI_ROWS],
+    int k,
+    int lane,
+    scalar d)
+{
+    if ((k & 31) != lane) return;
+    const int s = k >> 5;
+    if (s == 0) yr[0] /= d;
+    else if (s == 1) yr[1] /= d;
+    else if (s == 2) yr[2] /= d;
+    else yr[3] /= d;
+}
+
+// coarseLUSolveKernel's two substitutions, row for row and step for step (y_i -= F_ik y_k in k order, the
+// backward step's division at its own row first), by one warp: the same arithmetic in the same order is the
+// same bits. F is column-major. unitLower: L's diagonal is 1 and not stored (the LU); otherwise the forward
+// step divides by F_kk first (Cholesky's L).
+__device__ __forceinline__
+void warpSubstitute(
+    int n,
+    const scalar* __restrict__ F,
+    bool unitLower,
+    scalar (&yr)[TRI_ROWS],
+    int lane)
+{
+    for (int k = 0; k < n; ++k)
+    {
+        if (!unitLower) warpDivideRow(yr, k, lane, F[k*n + k]);
+        const scalar yk = warpRow(yr, k);
+        #pragma unroll
+        for (int s = 0; s < TRI_ROWS; ++s)
+        {
+            const int i = lane + 32*s;
+            if (i > k && i < n) yr[s] -= F[k*n + i]*yk;
+        }
+    }
+    for (int k = n - 1; k >= 0; --k)
+    {
+        warpDivideRow(yr, k, lane, F[k*n + k]);
+        const scalar yk = warpRow(yr, k);
+        #pragma unroll
+        for (int s = 0; s < TRI_ROWS; ++s)
+        {
+            const int i = lane + 32*s;
+            if (i < k) yr[s] -= F[k*n + i]*yk;
+        }
+    }
+}
+
+// x = A^-1 r in one block: the block brings the factors into shared memory in one coalesced pass when they
+// fit, and ONE warp then runs both substitutions with the vector in its registers -- no block barrier in the
+// n steps, where coarseLUSolveKernel takes about 3n. chol (a device flag, so the choice made at the
+// factorisation holds inside a captured graph): 1 = F2 holds Cholesky's L and L^T, taken with no
+// interchange; otherwise the LU (F, perm).
+__global__
+void coarseWarpSolveKernel(
+    int n,
+    const scalar* __restrict__ F,
+    const int* __restrict__ perm,
+    const scalar* __restrict__ F2,
+    const int* __restrict__ chol,
+    const scalar* __restrict__ rc,
+    scalar* __restrict__ xc,
+    bool inShared)
+{
+    extern __shared__ scalar sh[];
+    const bool useChol = F2 != nullptr && chol != nullptr && *chol == 1;
+    const scalar* __restrict__ G = useChol ? F2 : F;
+    if (inShared)
+    {
+        for (int i = threadIdx.x; i < n*n; i += blockDim.x) sh[i] = G[i];
+        __syncthreads();
+        G = sh;
+    }
+    if (threadIdx.x >= 32) return;
+    const int lane = threadIdx.x;
+    scalar yr[TRI_ROWS];
+    #pragma unroll
+    for (int s = 0; s < TRI_ROWS; ++s)
+    {
+        const int i = lane + 32*s;
+        yr[s] = (i < n) ? rc[useChol ? i : perm[i]] : 0.0;
+    }
+    warpSubstitute(n, G, !useChol, yr, lane);
+    #pragma unroll
+    for (int s = 0; s < TRI_ROWS; ++s)
+    {
+        const int i = lane + 32*s;
+        if (i < n) xc[i] = yr[s];
+    }
+}
+
+// A^-1, a column a warp: column j is the LU's solve of e_j by the same substitutions, written row-major
+// (inv[i*n + j]) for the product below. Reads the column-major factors from global memory: once a factorisation.
+__global__
+void coarseInverseKernel(
+    int n,
+    const scalar* __restrict__ F,
+    const int* __restrict__ perm,
+    scalar* __restrict__ inv)
+{
+    const int j = (blockIdx.x*blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (j >= n) return;
+    scalar yr[TRI_ROWS];
+    #pragma unroll
+    for (int s = 0; s < TRI_ROWS; ++s)
+    {
+        const int i = lane + 32*s;
+        yr[s] = (i < n && perm[i] == j) ? 1.0 : 0.0;
+    }
+    warpSubstitute(n, F, true, yr, lane);
+    #pragma unroll
+    for (int s = 0; s < TRI_ROWS; ++s)
+    {
+        const int i = lane + 32*s;
+        if (i < n) inv[i*n + j] = yr[s];
+    }
+}
+
+// x = A^-1 r as a product: a warp a row, each lane every 32nd column, then a fixed shuffle tree
+__global__
+void coarseInverseApplyKernel(
+    int n,
+    const scalar* __restrict__ inv,
+    const scalar* __restrict__ rc,
+    scalar* __restrict__ xc)
+{
+    const int i = (blockIdx.x*blockDim.x + threadIdx.x) >> 5;
+    const int lane = threadIdx.x & 31;
+    if (i >= n) return;
+    scalar s = 0.0;
+    for (int j = lane; j < n; j += 32) s += inv[i*n + j]*rc[j];
+    for (int off = 16; off > 0; off >>= 1) s += __shfl_down_sync(0xffffffffu, s, off);
+    if (lane == 0) xc[i] = s;
+}
+
+// A_c = L L^T where the level allows it, in ONE block (the fill is coarseLUFactorKernel's, the coupled pair's
+// dense entries with it). work is the n*n row-major working matrix (shared memory when inShared). Writes lc
+// column-major with both factors, lc[k*n + i] = L[i][k] for i >= k and L[k][i] for i < k, so that the warp
+// solve reads L's columns forward and L^T's backward; chol = 1 then, 0 (and lc untouched) where the level is
+// not symmetric to CHOL_SYM_TOL or a pivot falls below CHOL_PIVOT_MIN.
+__global__
+void coarseCholeskyKernel(
+    int n,
+    const scalar* __restrict__ diag,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ nei,
+    const scalar* __restrict__ upper,
+    const label* __restrict__ losortStart,
+    const label* __restrict__ losort,
+    const label* __restrict__ owner,
+    const scalar* __restrict__ lower,
+    const scalar* __restrict__ extra,
+    scalar* __restrict__ work,
+    scalar* __restrict__ lc,
+    int* __restrict__ chol,
+    bool inShared)
+{
+    const int tid = threadIdx.x;
+    __shared__ scalar shScale;
+    __shared__ scalar shAsym[TPB];
+    __shared__ scalar shL;
+    __shared__ int shFail;
+    extern __shared__ scalar sh[];
+    scalar* __restrict__ A = inShared ? sh : work;
+    for (int i = tid; i < n*n; i += blockDim.x) A[i] = 0.0;
+    __syncthreads();
+    for (int c = tid; c < n; c += blockDim.x)
+    {
+        A[c*n + c] = diag[c];
+        for (int f = ownerStart[c]; f < ownerStart[c+1]; ++f) A[c*n + nei[f]] = upper[f];
+        for (int k = losortStart[c]; k < losortStart[c+1]; ++k)
+        {
+            const int f = losort[k];
+            A[c*n + owner[f]] = lower[f];
+        }
+    }
+    __syncthreads();
+    if (extra)
+    {
+        for (int i = tid; i < n*n; i += blockDim.x) A[i] += extra[i];
+        __syncthreads();
+    }
+    scalar asym = 0.0;
+    for (int idx = tid; idx < n*n; idx += blockDim.x)
+    {
+        const int i = idx / n;
+        const int j = idx % n;
+        if (j > i) asym = fmax(asym, fabs(A[i*n + j] - A[j*n + i]));
+    }
+    shAsym[tid] = asym;
+    if (tid == 0)
+    {
+        scalar m = 0.0;
+        for (int c = 0; c < n; ++c) m = fmax(m, fabs(diag[c]));
+        shScale = (m > 0.0) ? m : 1.0;
+        shFail = 0;
+    }
+    __syncthreads();
+    for (int width = blockDim.x / 2; width > 0; width /= 2)
+    {
+        if (tid < width) shAsym[tid] = fmax(shAsym[tid], shAsym[tid + width]);
+        __syncthreads();
+    }
+    if (!(shAsym[0] <= CHOL_SYM_TOL*shScale))
+    {
+        if (tid == 0) *chol = 0;
+        return;
+    }
+    for (int k = 0; k < n; ++k)
+    {
+        if (tid == 0)
+        {
+            const scalar d = A[k*n + k];
+            if (!(d > CHOL_PIVOT_MIN*shScale)) shFail = 1;
+            else
+            {
+                shL = sqrt(d);
+                A[k*n + k] = shL;
+            }
+        }
+        __syncthreads();
+        if (shFail)
+        {
+            if (tid == 0) *chol = 0;
+            return;
+        }
+        const scalar l = shL;
+        for (int i = k+1+tid; i < n; i += blockDim.x) A[i*n + k] /= l;
+        __syncthreads();
+        const int m = n - k - 1;
+        for (int idx = tid; idx < m*m; idx += blockDim.x)            // the lower triangle of the trailing block
+        {
+            const int i = k + 1 + idx/m;
+            const int j = k + 1 + idx%m;
+            if (j <= i) A[i*n + j] -= A[i*n + k]*A[j*n + k];
+        }
+        __syncthreads();
+    }
+    for (int idx = tid; idx < n*n; idx += blockDim.x)
+    {
+        const int k = idx / n;
+        const int i = idx % n;
+        lc[idx] = (i >= k) ? A[i*n + k] : A[k*n + i];
+    }
+    if (tid == 0) *chol = 1;
+}
+
 } // anon
 
 bool deviceCoarseFitsCluster(int nCoarse)
@@ -678,6 +993,113 @@ void deviceCoarseLUSolve(
     cudaCheck(cudaGetLastError(), "coarseLUSolve launch");
 }
 
+
+CoarseSolveKind coarseSolveKind()
+{
+    static const CoarseSolveKind kind = []()
+    {
+        const char* e = std::getenv("BRAE_AMG_COARSE_SOLVE");
+        const std::string v = e ? e : "";
+        CoarseSolveKind k = CoarseSolveKind::LU;
+        if (v.empty() || v == "lu") k = CoarseSolveKind::LU;
+        else if (v == "tri") k = CoarseSolveKind::Tri;
+        else if (v == "inverse") k = CoarseSolveKind::Inverse;
+        else if (v == "cholesky") k = CoarseSolveKind::Cholesky;
+        else throw std::runtime_error("BRAE_AMG_COARSE_SOLVE='" + v + "' is not one of lu, tri, inverse, cholesky");
+        if (k != CoarseSolveKind::LU) std::printf("NOTICE: the AMG's coarsest direct solve is '%s' (BRAE_AMG_COARSE_SOLVE)\n", v.c_str());
+        return k;
+    }();
+    return kind;
+}
+
+namespace
+{
+// the largest dynamic shared memory a block may ask for here, granted to the warp solve once (outside every
+// capture: the first prepare)
+int warpSolveSharedMax()
+{
+    static int bytes = 0;
+    static std::once_flag once;
+    std::call_once(once, []()
+    {
+        int dev = 0;
+        cudaCheck(cudaGetDevice(&dev), "warp solve device");
+        int optin = 0;
+        cudaCheck(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev), "warp solve shared");
+        cudaCheck(cudaFuncSetAttribute(coarseWarpSolveKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, optin),
+                  "warp solve shared optin");
+        bytes = optin;
+    });
+    return bytes;
+}
+} // anon
+
+void deviceCoarseDirectPrepare(
+    CoarseSolveKind kind,
+    const DeviceLduView& cv,
+    const scalar* extra,
+    const DeviceBuffer<scalar>& lu,
+    const DeviceBuffer<int>& piv,
+    CoarseDirect& d)
+{
+    const int n = cv.nCells;
+    // the warp kernels hold n <= 32*TRI_ROWS rows; above it every kind is the LU
+    d.kind = (n <= 32*TRI_ROWS) ? kind : CoarseSolveKind::LU;
+    d.n = n;
+    if (d.kind == CoarseSolveKind::LU) return;
+    const std::size_t nn = static_cast<std::size_t>(n)*n;
+    d.fc.resize(nn);
+    d.perm.resize(n);
+    warpSolveSharedMax();
+    coarseLUColumnMajorKernel<<<nBlocks(static_cast<int>(nn)), TPB, 0, cudaStreamPerThread>>>(n, lu.data(), piv.data(), d.fc.data(), d.perm.data());
+    cudaCheck(cudaGetLastError(), "coarse LU column-major");
+    if (d.kind == CoarseSolveKind::Inverse)
+    {
+        d.f2.resize(nn);
+        coarseInverseKernel<<<nBlocks(32*n), TPB, 0, cudaStreamPerThread>>>(n, d.fc.data(), d.perm.data(), d.f2.data());
+        cudaCheck(cudaGetLastError(), "coarse inverse");
+    }
+    else if (d.kind == CoarseSolveKind::Cholesky)
+    {
+        d.f2.resize(nn);
+        d.chol.resize(1);
+        const std::size_t shBytes = nn*sizeof(scalar);
+        // the static shared (the asymmetry reduction, TPB doubles) shares the 48 KB with the working matrix
+        const bool inShared = shBytes + TPB*sizeof(scalar) + 64 <= 48u*1024u;
+        if (!inShared) d.work.resize(nn);
+        coarseCholeskyKernel<<<1, TPB, inShared ? shBytes : 0, cudaStreamPerThread>>>(n,
+            cv.diag, cv.ownerStart, cv.nei, cv.upper, cv.losortStart, cv.losort, cv.owner, cv.lower, extra,
+            inShared ? nullptr : d.work.data(), d.f2.data(), d.chol.data(), inShared);
+        cudaCheck(cudaGetLastError(), "coarse cholesky");
+    }
+}
+
+void deviceCoarseDirectSolve(
+    int nC,
+    const DeviceBuffer<scalar>& lu,
+    const DeviceBuffer<int>& piv,
+    const CoarseDirect& d,
+    const DeviceBuffer<scalar>& rc,
+    DeviceBuffer<scalar>& xc)
+{
+    if (d.kind == CoarseSolveKind::LU || d.n != nC)
+    {
+        deviceCoarseLUSolve(nC, lu, piv, rc, xc);
+        return;
+    }
+    if (d.kind == CoarseSolveKind::Inverse)
+    {
+        coarseInverseApplyKernel<<<nBlocks(32*nC), TPB, 0, cudaStreamPerThread>>>(nC, d.f2.data(), rc.data(), xc.data());
+        cudaCheck(cudaGetLastError(), "coarse inverse apply");
+        return;
+    }
+    const std::size_t shBytes = static_cast<std::size_t>(nC)*nC*sizeof(scalar);
+    const bool inShared = static_cast<int>(shBytes) <= warpSolveSharedMax();
+    const bool chol = d.kind == CoarseSolveKind::Cholesky;
+    coarseWarpSolveKernel<<<1, TPB, inShared ? shBytes : 0, cudaStreamPerThread>>>(nC, d.fc.data(), d.perm.data(),
+        chol ? d.f2.data() : nullptr, chol ? d.chol.data() : nullptr, rc.data(), xc.data(), inShared);
+    cudaCheck(cudaGetLastError(), "coarse warp solve");
+}
 
 // Iterated coarsest solve: nSweeps of global weighted-Jacobi (deviceAmul + smoothT). Reuses the V-cycle's
 // smoothT<> kernel (amg_kernels.cuh) and deviceAmul; kept out of the single-launch solvers above for that reason.

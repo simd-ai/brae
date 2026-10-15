@@ -24,5 +24,14 @@ void deviceCoarseLUFactor(const DeviceLduView& cv, DeviceBuffer<scalar>& lu, Dev
                           const scalar* extra = nullptr);
 void deviceCoarseLUSolve(int nC, const DeviceBuffer<scalar>& lu, const DeviceBuffer<int>& piv,
                          const DeviceBuffer<scalar>& rc, DeviceBuffer<scalar>& xc);
+// BRAE_AMG_COARSE_SOLVE (lu | tri | inverse | cholesky), read once; an unknown value is refused
+CoarseSolveKind coarseSolveKind();
+// what the kind needs beside the LU, made from it (and, for cholesky, from the level itself); after
+// deviceCoarseLUFactor, outside every capture
+void deviceCoarseDirectPrepare(CoarseSolveKind kind, const DeviceLduView& cv, const scalar* extra,
+                               const DeviceBuffer<scalar>& lu, const DeviceBuffer<int>& piv, CoarseDirect& d);
+// x = A_c^-1 r by the kind prepared (the LU's own kernel for lu)
+void deviceCoarseDirectSolve(int nC, const DeviceBuffer<scalar>& lu, const DeviceBuffer<int>& piv,
+                             const CoarseDirect& d, const DeviceBuffer<scalar>& rc, DeviceBuffer<scalar>& xc);
 void deviceCoarseJacobiSingleBlock(const DeviceLduView& cv, const DeviceBuffer<scalar>& rc, DeviceBuffer<scalar>& xc, int nSweeps);
 } // namespace brae

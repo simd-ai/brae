@@ -744,6 +744,8 @@ void amgCouplePair(
         }
         cudaCheck(cudaGetLastError(), "pair on the coarsest grid");
         deviceCoarseLUFactor(amg.level.back().coarseView(), amg.coarseLU, amg.coarsePiv, p.dense.data());
+        deviceCoarseDirectPrepare(coarseSolveKind(), amg.level.back().coarseView(), p.dense.data(), amg.coarseLU, amg.coarsePiv,
+                                  amg.coarseDirect);
     }
     p.n = n;
     p.nSlots = nSlots;
@@ -898,7 +900,7 @@ void vcycleAt(
         // test is against the grid size so a hierarchy whose coarsest changed, or a caller that never
         // ran a Galerkin update, falls through to the iterative solvers below). Exact for both the
         // symmetric and the asymmetric operator, so it precedes the CG/BiCGStab split.
-        if (amg.coarseLUn == n) deviceCoarseLUSolve(n, amg.coarseLU, amg.coarsePiv, bg, xg);
+        if (amg.coarseLUn == n) deviceCoarseDirectSolve(n, amg.coarseLU, amg.coarsePiv, amg.coarseDirect, bg, xg);
         else if (n <= SB_CG_MAX && asymmetric) deviceCoarseBiCGStab(Ag, bg, xg, ncoarseAsymCap);
         else if (n <= SB_CG_MAX) deviceCoarsePCG(Ag, bg, xg, ncoarseCG);            // tiny coarsest: single-block Jacobi-PCG (cheap+accurate)
         else if (n <= SB_MAX) deviceCoarseJacobiSingleBlock(Ag, bg, xg, NCOARSE);   // larger: single-block many-sweep Jacobi
@@ -1276,7 +1278,7 @@ void vcycleAtF(
         // The asymmetric coarsest solve iterates to COARSE_REL_TOL and this is only its CAP.
         static const int ncoarseAsymCap = [](){ const char* e=std::getenv("BRAE_NCOARSE_CG"); return (e&&std::atoi(e)>0)?std::atoi(e):NCOARSE_ASYM_CAP; }();
         // Same coarsest split as the FP64 V-cycle: CG is not a solve on a nonsymmetric operator.
-        if (amg.coarseLUn == n) deviceCoarseLUSolve(n, amg.coarseLU, amg.coarsePiv, amg.vB[g], amg.vX[g]);
+        if (amg.coarseLUn == n) deviceCoarseDirectSolve(n, amg.coarseLU, amg.coarsePiv, amg.coarseDirect, amg.vB[g], amg.vX[g]);
         else if (n <= SB_CG_MAX && asymmetric) deviceCoarseBiCGStab(topoG, amg.vB[g], amg.vX[g], ncoarseAsymCap);
         else if (n <= SB_CG_MAX) deviceCoarsePCG(topoG, amg.vB[g], amg.vX[g], ncoarseCG);
         else
