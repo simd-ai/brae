@@ -4943,6 +4943,14 @@ target_include_directories(bench_amg_coarse_solve PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(bench_amg_coarse_solve PRIVATE brae_core)
 add_test(NAME gpu_amg COMMAND test_gpu_amg ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
 
+# The AMG coarsest grid's precomputed inverse against the LU and a long double oracle, the whole preconditioner's
+# symmetry and definiteness, and six broken-inverse controls run as children (BRAE_CONTROL_COARSE_INVERSE)
+add_executable(test_amg_coarse_inverse tests/test_amg_coarse_inverse.cu)
+target_include_directories(test_amg_coarse_inverse PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_amg_coarse_inverse PRIVATE brae_core)
+add_test(NAME amg_coarse_inverse COMMAND test_amg_coarse_inverse ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+set_tests_properties(amg_coarse_inverse PROPERTIES RESOURCE_LOCK brae_gpu LABELS fast)
+
 add_executable(test_gpu_benchmark tests/test_gpu_benchmark.cu)
 target_include_directories(test_gpu_benchmark PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_gpu_benchmark PRIVATE brae_core)

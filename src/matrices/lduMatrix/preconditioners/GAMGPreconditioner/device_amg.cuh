@@ -292,6 +292,8 @@ struct CoarseDirect
     DeviceBuffer<scalar> work;                                  // cholesky's working matrix where it does not fit in shared
     DeviceBuffer<int> perm;                                     // the LU's interchanges as one gather
     DeviceBuffer<int> chol;                                     // 1 where cholesky factorised the level
+    DeviceBuffer<int> unsafe;                                   // inverse: 0, or why its solves take the LU (1 floored, 2 not finite, 3 probes)
+    DeviceBuffer<scalar> probe;                                 // inverse: the check's two vectors' scratch
 };
 
 struct AMGData {
