@@ -832,6 +832,17 @@ set_tests_properties(simple_solver_entry_checks PROPERTIES SKIP_RETURN_CODE 77 T
 # fields); BRAE_AMG_CACHE=0 writes none.
 add_test(NAME simple_amg_cache COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_amg_cache.sh)
 set_tests_properties(simple_amg_cache PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# The case's grad(U)/grad(nuTilda) cellLimited entries on Spalart-Allmaras (linearUpwind's named gradient, the
+# non-orthogonal correction's, Omega's grad(U)), airFoil2D with those entries, restarted from OpenFOAM's time 3:
+# nuTilda to 1e-04 at t4; unlimited (BRAE_CONTROL_SA_GRAD_UNLIMITED=1, how it ran) misses by three orders.
+add_test(NAME sa_gradlimit_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_gradlimit_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/airFoil2D)
+set_tests_properties(sa_gradlimit_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# forceCoeffs sampled through a simpleFoam run on request (BRAE_FORCE_INTERVAL, BRAE_FORCE_FROM): the rows asked
+# for, the last one equal to the end-of-run evaluation; unset, no file. Fail-proofed against the binary before.
+add_test(NAME simple_force_sampling COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_force_sampling.sh)
+set_tests_properties(simple_force_sampling PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 # V2 on Spalart-Allmaras with a `calculated` nut patch (the boxy5 UAV's inlet_front): it took kEpsilon's nut
 # path and stopped on the empty epsilon boundary. It must run, and match the shipped `freestream` arrangement.
 add_test(NAME sa_v2_calculated_nut COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_v2_calculated_nut.sh)

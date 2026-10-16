@@ -1025,6 +1025,8 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                     if (t > 0.0) { ctl.limitedK = true; ctl.twoBykK = t; }
                     if (ln.find("linearUpwind") != std::string::npos) ctl.luK = true;
                     if (hasWord(ln, "bounded")) ctl.boundedK = true;   // SA: nuTilda uses the k slot
+                    // ...and linearUpwind's NAMED gradient, as div(phi,k) reads it: the SA path ran it unlimited
+                    { const scalar g = luGradLimit(ln); if (g >= 0.0) ctl.gradKLULimitK = g; }
                 }
                 // One reader for both blocks, because the scheme VOCABULARY is shared -- a laplacian
                 // entry builds its snGrad through the same snGradScheme<Type>::New the snGradSchemes

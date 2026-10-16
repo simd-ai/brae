@@ -703,6 +703,78 @@ int main(int argc, char** argv)
                 "iterations -- on a restart set it past the time you are restarting from.");
         int iter = 0;
         bool converged = false;
+        // forceCoeffs SAMPLED through the run, on request: BRAE_FORCE_INTERVAL=N writes Cd/Cl/Cm every N iterations
+        // from iteration BRAE_FORCE_FROM (default 1) to postProcessing/forceCoeffs/<startTime>/coefficient.dat, as
+        // gpuPimpleFoam does. OpenFOAM's forceCoeffs runs every time step and writes that history; this driver
+        // otherwise evaluates it once, after the loop (below). Not every iteration by default because the evaluation
+        // is wallForces' host gaussGrad and near-wall distance over the whole mesh -- seconds on a few million cells.
+        // The polar of the boxy5 UAV compares means over the last 300 iterations, which is what this is for.
+        const long forceInterval = std::getenv("BRAE_FORCE_INTERVAL")
+                                 ? std::max(0L, std::atol(std::getenv("BRAE_FORCE_INTERVAL"))) : 0;
+        const long forceFrom = std::getenv("BRAE_FORCE_FROM")
+                             ? std::max(1L, std::atol(std::getenv("BRAE_FORCE_FROM"))) : 1;
+        const FoamDict* fcSampleDict = nullptr;
+        if (const FoamDict* funcs = controlDict.subDict("functions"))
+            for (const auto& sd : funcs->subs)
+                if (sd.second.wordOr("type", "") == "forceCoeffs")
+                {
+                    fcSampleDict = &sd.second;
+                    break;
+                }
+        std::vector<std::string> fcSampleWalls;
+        for (const auto& q : fvp)
+            if (q.type == "wall") fcSampleWalls.push_back(q.name);
+        std::ofstream fcOut;
+        if (forceInterval > 0 && fcSampleDict && ctl.turbulent && !fcSampleWalls.empty())
+        {
+            const std::string fdir = caseDir + "/postProcessing/forceCoeffs/" + startStr;
+            std::error_code fec;
+            std::filesystem::create_directories(fdir, fec);
+            fcOut.open(fdir + "/coefficient.dat");
+            fcOut << "# Time\tCd\tCl\tCm\n";
+            fcOut.setf(std::ios::scientific);
+            fcOut.precision(10);
+            std::printf("  forceCoeffs: sampled every %ld iterations from iteration %ld to "
+                        "postProcessing/forceCoeffs/%s/coefficient.dat (BRAE_FORCE_INTERVAL, BRAE_FORCE_FROM)\n",
+                        forceInterval,
+                        forceFrom,
+                        startStr.c_str());
+        }
+        else if (forceInterval > 0)
+        {
+            std::printf("  forceCoeffs: BRAE_FORCE_INTERVAL set but NOT sampled (%s)\n",
+                        !fcSampleDict ? "no forceCoeffs entry in controlDict.functions"
+                                      : (!ctl.turbulent ? "laminar case" : "no wall patches"));
+        }
+        // the same evaluation as the one after the loop, from the current device state
+        auto sampleForceCoeffs = [&](scalar tval)
+        {
+            const std::vector<vector> Ug = solver.U();
+            const std::vector<scalar> pg = solver.p();
+            for (label c = 0; c < nC; ++c)
+                U.internal[c] = Ug[c];
+            p.internal = pg;
+            U.evaluateBoundary();
+            p.evaluateBoundary();
+            const scalar wCmu   = ctl.sst ? ctl.ksstCoeffs.betaStar : ctl.keCoeffs.Cmu;
+            const scalar wKappa = ctl.sst ? ctl.ksstCoeffs.kappa    : ctl.keCoeffs.kappa;
+            const scalar wE     = ctl.sst ? ctl.ksstCoeffs.E        : ctl.keCoeffs.E;
+            const bool velNutWall = ctl.sa || ctl.nutWall != NutWall::Nutk;
+            const std::vector<scalar> saNutWall = velNutWall ? solver.nutWall() : std::vector<scalar>();
+            const std::vector<scalar>* nwb = velNutWall ? &saNutWall : nullptr;
+            auto toV = [](const std::vector<scalar>& a, vector d){ return a.size() >= 3 ? vector{a[0],a[1],a[2]} : d; };
+            const std::vector<std::string> fcP = fcSampleDict->wordListOr("patches", fcSampleWalls);
+            const scalar rhoInf = fcSampleDict->scalarOr("rhoInf", 1.0), magUInf = fcSampleDict->scalarOr("magUInf", 1.0);
+            const scalar Aref = fcSampleDict->scalarOr("Aref", 1.0), lRef = fcSampleDict->scalarOr("lRef", 1.0);
+            const vector liftDir = toV(fcSampleDict->scalarListOr("liftDir", {}), vector{0,1,0});
+            const vector dragDir = toV(fcSampleDict->scalarListOr("dragDir", {}), vector{1,0,0});
+            const vector pitchAxis = toV(fcSampleDict->scalarListOr("pitchAxis", {}), vector{0,0,1});
+            const vector CofR = toV(fcSampleDict->scalarListOr("CofR", {}), vector{0,0,0});
+            const ForceResult Fc = wallForces(U, p, solver.k(), ctl.nu, m, g, fvp, fcP, rhoInf, 0.0, CofR, wCmu, wKappa, wE, nwb);
+            const ForceCoeffs cc = forceCoeffs(Fc, dragDir, liftDir, pitchAxis, rhoInf, magUInf, Aref, lRef);
+            fcOut << tval << '\t' << cc.Cd << '\t' << cc.Cl << '\t' << cc.Cm << '\n';
+            fcOut.flush();
+        };
         const auto _runStart = std::chrono::high_resolution_clock::now();          // for OpenFOAM-style ExecutionTime
         double _cumCont = 0.0;                                                     // cumulative continuity error (OF continuityErrs.H)
         time.setSteps(static_cast<int>(nSteps));
@@ -860,6 +932,10 @@ int main(int argc, char** argv)
             // a plausible-looking field set (simpleControl.C:51-57).
             converged = converged && rcChecked > 0;
             const scalar tval = startTimeVal + (scalar)iter * deltaT;               // OF time value at this step
+            if (fcOut.is_open() && iter >= forceFrom && iter % forceInterval == 0)
+            {
+                sampleForceCoeffs(tval);
+            }
             if (!converged && iter != nSteps && time.writeControl().isWriteTime(iter, tval))
             {
                 writeTimeDir(WriteControl::timeName(tval));

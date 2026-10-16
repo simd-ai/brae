@@ -393,7 +393,9 @@ void deviceSpalartAllmarasCorrect(
     const DeviceBuffer<scalar>* wallN,
     scalar gradULimitK,   // OF `grad(U)` cellLimited coefficient; see the declaration
     int nSweeps,          // solvers/nuTilda/nSweeps; see the declaration
-    bool gsSymmetric)
+    bool gsSymmetric,
+    scalar gradNuTildaLULimitK,    // see the declaration
+    scalar gradNuTildaLapLimitK)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> gradU;
@@ -530,14 +532,15 @@ void deviceSpalartAllmarasCorrect(
                                    saReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), nuTilda.data(), Stilda.data(),
                                        fw.data(), dScale.data(), gradNt2.data(), co, diag.data(), src.data()); },
                                nullptr, nullptr, ami, cyc, ntDdt, DB.size() ? &DB : nullptr,
-                               // gradLimitK 0, boundPositive true (nuTilda is positive-definite), no
-                               // fvOptions set-values, no limiter override, Jacobi, then the case's own
-                               // smoothSolver sweep count.
-                               /*gradLimitK*/0.0, /*boundPositive*/true,
+                               // the case's linearUpwind gradient limiter, boundPositive true (nuTilda is
+                               // positive-definite), no fvOptions set-values, no limiter override, Jacobi,
+                               // the case's own smoothSolver sweep count, and grad(nuTilda)'s limiter for the
+                               // non-orthogonal correction.
+                               gradNuTildaLULimitK, /*boundPositive*/true,
                                /*fvoSetMask*/nullptr, /*fvoSetVal*/nullptr,
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/scalar(0.0));
+                               /*boundFloor*/scalar(0.0), gradNuTildaLapLimitK);
     // deviceSolveScalarTransport already bounds to 1e-15 (~ bound(nuTilda, 0)). correctNut: nut = nuTilda*fv1(new).
     saNutKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), nu, co.Cv1, nut.data());
     cudaCheck(cudaGetLastError(), "SA correctNut");

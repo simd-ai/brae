@@ -548,7 +548,13 @@ void deviceSpalartAllmarasCorrect(const DeviceMesh& dm, const DeviceVectorBounda
                                   // (ascending then descending), false = GaussSeidel, whose sweep loop in
                                   // GaussSeidelSmoother.C is the ascending walk ONLY. Different smoothers,
                                   // so the same relTol stops in a different place.
-                                  bool gsSymmetric = true);
+                                  bool gsSymmetric = true,
+                                  // The case's grad(nuTilda) limiters (cellLimited coefficients, 0 = unlimited):
+                                  // the one linearUpwind's div entry names, and gradSchemes `grad(nuTilda)` for
+                                  // the non-orthogonal laplacian correction (deviceSolveScalarTransport's
+                                  // gradLimitK and lapGradLimitK). Every caller ran both unlimited before.
+                                  scalar gradNuTildaLULimitK = 0.0,
+                                  scalar gradNuTildaLapLimitK = 0.0);
 
 // Standalone SA correctNut (nut = nuTilda*fv1(nuTilda)) for the solver startup validate().
 void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, DeviceBuffer<scalar>& nut);

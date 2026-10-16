@@ -68,6 +68,15 @@ int simpleColourMaxIter(
     static const bool oneSweep = std::getenv("BRAE_CONTROL_SIMPLE_COLOUR_ONE_SWEEP") != nullptr;
     return oneSweep ? 1 : maxIter;
 }
+// BRAE_CONTROL_SA_GRAD_UNLIMITED=1 is the Spalart-Allmaras limiter gate's CONTROL: the case's grad(U) and
+// grad(nuTilda) limiters dropped again, as this driver ran before 2026-10-16 (the boxy5 UAV blew up at -3 to
+// -9 degrees on its four highly skewed faces' cells that way).
+scalar saGradLimit(
+    scalar k)
+{
+    static const bool off = std::getenv("BRAE_CONTROL_SA_GRAD_UNLIMITED") != nullptr;
+    return off ? scalar(0) : k;
+}
 // BRAE_CONTROL_SIMPLE_COLOUR_SWAP=1, the colour gate's other CONTROL and the one a steady case can see: the
 // fused U solve writes the first solved component's solution into the second's field and back. Fewer sweeps
 // only slow a SIMPLE loop down on the way to the same fixed point; a solve into the wrong field moves it.
@@ -1167,11 +1176,15 @@ bool simpleColourSwapControl()
                                              ctl_.gsK, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, kDdt,   // nuTilda ddt (kOld_)
                                              ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr, ctl_.iddes ? &hwn_ : nullptr, &lesDelta_,
                                              wallN_.size() ? &wallN_ : nullptr,   // SA-DDES/IDDES length-scale limiter (no-op for plain SA-RANS)
-                                             /*gradULimitK*/0.0,
-                                             /*nSweeps*/1, ctl_.gsKESym);   // ...and WHICH GaussSeidel the case named: OF has two in that family and
+                                             // grad(U)'s own limiter for Omega and Stilda: SpalartAllmarasBase.C:461
+                                             // takes fvc::grad(U), the gradSchemes entry. It was 0, unlimited.
+                                             saGradLimit(ctl_.gradULimitK),
+                                             /*nSweeps*/1, ctl_.gsKESym,   // ...and WHICH GaussSeidel the case named: OF has two in that family and
                                              // GaussSeidelSmoother.C sweeps ascending ONLY. Passing this is what
                                              // keeps the legacy arm from answering a `GaussSeidel` case with the
                                              // symmetric sweep in silence, now that the substitution notice is gone.
+                                             saGradLimit(ctl_.gradKLULimitK),   // linearUpwind's named grad(nuTilda): ran unlimited
+                                             saGradLimit(ctl_.gradKLimitK));    // gradSchemes grad(nuTilda), the non-orth correction's
             else if (ctl_.sst)   // de_ slot holds omega; relaxEps/limitedEps/twoBykEps carry the omega-equation settings
             {
                 deviceKOmegaSSTCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
