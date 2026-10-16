@@ -140,6 +140,9 @@ DeviceSimpleControls sctl *   # out-parameter buffer for parseFvSchemesControls;
 # so it is a cold start, not a substitution. The legacy driver is frozen and must not be edited.
 DeviceSimpleControls ctl caseDir
 DeviceSimpleControls ctl writeCache
+# simpleFoam's colour rule (CLAUDE.md, user decision 2026-10-16) is the simpleFoam driver's alone: its `false`
+# at the pimpleFoam and rhoSimpleFoam sites IS OpenFOAM's own sweep order, what those drivers ran before.
+DeviceSimpleControls ctl colourWhereGaussSeidel
 
 # ---- Compressible (kEpsilon_cpp.cuh:138, the closures' optional compressible half) -------------------
 # Built at four interFoam sites (inter_turbulence_cpp.cu: `comp`/`sstComp` at 593 and 602 inside
@@ -306,6 +309,11 @@ gpu::PressureInput pin cyc  # the same omission at the gpu site, for the reason 
 gpu::PressureInput pin hNoPairTap  # the same omission at the gpu site, for the reason above
 gpu::PressureInput pin hPairTap  # the same omission at the gpu site, for the reason above
 gpu::PressureInput pi cyc  # the same omission at the gpu site, for the reason above
+# p's freestream boundary as stored (pbStoredFs): only the rebuilt simpleFoam driver keeps it (simpleFoamV2.cu,
+# 2026-10-16). Null re-derives the boundary from the cells, as every caller did before: interFoam's step and
+# the host reference here keep no freestream stored values.
+gpu::PressureInput pin pbStoredFs
+gpu::PressureInput pi pbStoredFs
 gpu::PressureInput pi hNoPairTap  # the same omission at the gpu site, for the reason above
 gpu::PressureInput pi hPairTap  # the same omission at the gpu site, for the reason above
 gpu::PressureInput pi adjustable  # the same omission at the gpu site, for the reason above
@@ -378,6 +386,14 @@ SolverRunsAs runsAs smoothSolverOnMomentum
 SolverRunsAs runsAs smoothSolverOnTurbulence
 SolverRunsAs runsAs fixedSweepsField
 SolverRunsAs runsAs momentumNoticedByCaller
+# gpuSimpleFoam.cu builds one too since 2026-10-16, to hand the reader turbulenceSmootherNoticedByCaller: its
+# pressure pair is the default PCG + GAMG (the AMG-PCG it runs, announced) and it has no energy equation, so
+# the defaults ARE its description -- the call took `SolverRunsAs{}` before. The other drivers do not own
+# nuTilda's smoother line: the reader's is true for them.
+SolverRunsAs runsAs diluOnEnergy
+SolverRunsAs runsAs pPrecon
+SolverRunsAs runsAs pSolver
+SolverRunsAs runsAs turbulenceSmootherNoticedByCaller
 
 # ---- SolveControls (turbulence_transport.cuh:105) at the LES and kOmegaSST sites ---------------------
 # `pbicg` and `precon` came OFF this ledger when the LES kEqn learned to run the PBiCG the case names

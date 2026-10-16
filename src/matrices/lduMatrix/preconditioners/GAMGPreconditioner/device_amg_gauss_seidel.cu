@@ -20,6 +20,7 @@
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 
 namespace brae {
 
@@ -670,6 +671,17 @@ void hostSymGaussSeidelFused(
 {
     const DeviceLduView& A0 = *comps[0].A;
     const HostGSTopo& topo = hostGsTopoFor(A0);
+    // BRAE_PHASE_TIME=1: this solve's wall time, its download and its sweeps, one line per call
+    static const bool phaseTime = std::getenv("BRAE_PHASE_TIME") != nullptr;
+    using PhaseClock = std::chrono::steady_clock;
+    PhaseClock::time_point tCall, tDown;
+    double sweepMs = 0.0;
+    int nPasses = 0;
+    if (phaseTime)
+    {
+        cudaDeviceSynchronize();
+        tCall = PhaseClock::now();
+    }
     // ONE SCRATCH, not a cache keyed on the field. Everything below is working storage for THIS call --
     // the matrix and field copied down, the sweep's bPrime, the residual vectors -- and nothing survives
     // it, so there is nothing to key. Keyed on psi.data() (which is what the GRAPH caches must do,
@@ -778,6 +790,7 @@ void hostSymGaussSeidelFused(
     // CPU's view of the whole matrix on an ordering guarantee that is not written down. It is one sync
     // per solve; the per-sweep read inside the loop below, which is the one that pays, is the mailbox.
     cudaStreamSynchronize(cudaStreamPerThread);
+    if (phaseTime) tDown = PhaseClock::now();
     int nActive = 0;
     for (int k = 0; k < nComp; ++k)
     {
@@ -803,6 +816,7 @@ void hostSymGaussSeidelFused(
     {
         // the sweeps: pure CPU, nothing here touches the device
         std::vector<std::thread> pool;
+        const PhaseClock::time_point tSweep = phaseTime ? PhaseClock::now() : PhaseClock::time_point();
         const scalar* up = c.upper;
         const scalar* lo = c.lower;
         for (int k = 0; k < nComp; ++k)
@@ -842,6 +856,11 @@ void hostSymGaussSeidelFused(
             }
         }
         for (auto& th : pool) th.join();
+        if (phaseTime)
+        {
+            sweepMs += std::chrono::duration<double, std::milli>(PhaseClock::now() - tSweep).count();
+            ++nPasses;
+        }
         // the residual, exactly as the graph evaluates it, on the uploaded field
         for (int k = 0; k < nComp; ++k)
         {
@@ -889,6 +908,18 @@ void hostSymGaussSeidelFused(
     }
     for (int k = 0; k < nComp; ++k)
         if (startedActive[k]) perf[k] = {init[k], fin[k], iter[k]};
+    if (phaseTime)
+    {
+        cudaDeviceSynchronize();
+        const PhaseClock::time_point t = PhaseClock::now();
+        std::printf("  gs host solve: %d comp, %d cells, total %.1f ms, download+init %.1f ms, %d passes of sweeps %.1f ms\n",
+                    nComp,
+                    nC,
+                    std::chrono::duration<double, std::milli>(t - tCall).count(),
+                    std::chrono::duration<double, std::milli>(tDown - tCall).count(),
+                    nPasses,
+                    sweepMs);
+    }
 }
 // THE DEFAULT, from measurement (warm 40-minus-20, two repeats, V2): T3A 27-29 -> 16.5 ms per outer
 // iteration, the composed flat plate 68-69 -> 60, every solve line and field identical. The device loop

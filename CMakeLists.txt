@@ -803,6 +803,39 @@ set_tests_properties(sa_turbulence_model_keyword PROPERTIES SKIP_RETURN_CODE 77)
 # on the rebuilt driver, which honours both entries.
 add_test(NAME simple_smoother_notices COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_smoother_notices.sh)
 set_tests_properties(simple_smoother_notices PROPERTIES SKIP_RETURN_CODE 77)
+# The freestream family's valueFraction from U's (and p's) STORED patch values at OpenFOAM's evaluate points, on
+# the legacy simpleFoam driver: laminar airFoil2D restarted from OpenFOAM's own time 3, every solve pinned, U and
+# p held to round-off at 4 and 6; the re-derivation it replaced (BRAE_CONTROL_FREESTREAM_REEVALUATE=1) fails.
+add_test(NAME simple_freestream_stored_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_freestream_stored_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/airFoil2D)
+set_tests_properties(simple_freestream_stored_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# ...and OpenFOAM-13's form of freestreamVelocity (BRAE_FREESTREAM_VELOCITY_UP=average) against real OpenFOAM-13,
+# the same restart; it SKIPS where /opt/openfoam13 is absent (OF13RC names another bashrc).
+add_test(NAME simple_freestream_of13_vs_openfoam13
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_freestream_of13_vs_openfoam13.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/airFoil2D)
+set_tests_properties(simple_freestream_of13_vs_openfoam13 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# simpleFoam's colour rule (U and the turbulence fields swept in colour order on the GPU, relTol entries
+# included) against OpenFOAM's converged pitzDailyTurb: the colour order converges, lands within 1e-03 of
+# OpenFOAM's order and no further from OpenFOAM than it; a component swap in the fused solve fails. It unsets
+# BRAE_SIMPLE_CASE_SOLVER for its own arms.
+add_test(NAME simple_colour_vs_openfoam COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_colour_vs_openfoam.sh)
+set_tests_properties(simple_colour_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
+# The legacy driver's solver reading: an entry naming no `solver` is refused as OpenFOAM refuses it,
+# residualControl's turbulence targets are read at the start (no false unread notice) and still gate, and the
+# `Solving for U?` label names what runs (DILUPBiCGStab, the colour sweep). Fail-proofed against the binary
+# before these fixes: every one of the five checks goes red, the controls do not.
+add_test(NAME simple_solver_entry_checks COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_solver_entry_checks.sh)
+set_tests_properties(simple_solver_entry_checks PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# The legacy simpleFoam driver writes its AMG hierarchy cache by default and reads it next run (identical
+# fields); BRAE_AMG_CACHE=0 writes none.
+add_test(NAME simple_amg_cache COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_amg_cache.sh)
+set_tests_properties(simple_amg_cache PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# V2 on Spalart-Allmaras with a `calculated` nut patch (the boxy5 UAV's inlet_front): it took kEpsilon's nut
+# path and stopped on the empty epsilon boundary. It must run, and match the shipped `freestream` arrangement.
+add_test(NAME sa_v2_calculated_nut COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_v2_calculated_nut.sh)
+set_tests_properties(sa_v2_calculated_nut PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 
 # Audit finding #16: the turbulence-setup guards compared boundaryField keys to patch names exactly, so
 # regex/group keys (bfs2D writes every wall BC as "(upperWall|lowerWall)") disarmed them silently while
@@ -5287,3 +5320,10 @@ set_property(TEST ${BRAE_ALL_TESTS} APPEND PROPERTY ENVIRONMENT "BRAE_PRESSURE_C
 # (BRAE_TURBULENCE_CASE_SOLVER=1) and keeps its bound; the rule is held to OpenFOAM at its measured bounds by
 # tests/interfoam_write/turb_colour/, which unset this. The user's decision, 2026-10-06.
 set_property(TEST ${BRAE_ALL_TESTS} APPEND PROPERTY ENVIRONMENT "BRAE_TURBULENCE_CASE_SOLVER=1")
+# SIMPLEFOAM'S COLOUR RULE'S TEST ARM, the same arrangement again. The legacy simpleFoam driver sweeps a
+# Gauss-Seidel smoothSolver on U and on the transported turbulence fields in colour order on the GPU by default
+# (device_simple_foam.cu, decideColourRule), relTol entries included: the same smoother and stopping rule,
+# another cell order, so another iterate. Every test runs OpenFOAM's order (BRAE_SIMPLE_CASE_SOLVER=1) and keeps
+# its bound; the rule is held to OpenFOAM by tests/simple_colour_vs_openfoam.sh, which unsets this. The user's
+# decision, 2026-10-16.
+set_property(TEST ${BRAE_ALL_TESTS} APPEND PROPERTY ENVIRONMENT "BRAE_SIMPLE_CASE_SOLVER=1")

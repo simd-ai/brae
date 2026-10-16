@@ -267,6 +267,14 @@ struct DeviceSimpleControls
     // fvSolution solvers/<field>/nSweeps (smoothSolver.C:78, default 1): the sweeps between residual
     // EVALUATIONS, so it decides where a solve stops, not merely how fast it gets there.
     int    nSweepsU = 1, nSweepsHe = 1, nSweepsKE = 1;
+    // nuTilda's OWN smoother and sweep count (Spalart-Allmaras). The case-order path does not run them --
+    // it sweeps nuTilda with gsKESym and one sweep between evaluations, and says so (linear_solver_setup.cuh)
+    // -- but the colour rule runs each field's own entry, so it needs them read.
+    bool   gsNuTildaSym = true;
+    int    nSweepsNuTilda = 1;
+    // simpleFoam's COLOUR RULE was asked for: the driver sets it unless BRAE_SIMPLE_CASE_SOLVER=1, and the
+    // solver decides per field whether the rule applies (device_simple_foam.cu, colourU_ / colourTurb_).
+    bool   colourWhereGaussSeidel = false;
     // The ENERGY equation on a smoothSolver + GaussSeidel-family smoother, and which of the two OF
     // smoothers. True only when the case asks AND the calling driver honours it (SolverRunsAs::
     // smoothSolverOnEnergy) -- a shared flag that assumed the caller is how the mirror came to run

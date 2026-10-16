@@ -165,6 +165,18 @@ struct StepInput
     // A hook rather than a hard dependency because the model is runtime-selected: the driver must not
     // know which one it is, and a driver that hard-codes kEpsilon is the god object starting over.
     std::function<void()> correct;
+    // THE FREESTREAM FAMILY'S STORED VALUES, kept by the driver (simpleFoamV2.cu); null without a freestream patch.
+    // freestreamVelocity and freestreamPressure take their valueFraction from U's patch value as the LAST
+    // evaluate left it, and fvc::grad reads U's and p's patch values as they stand -- p's relaxed with the field by
+    // p.relax(). fsUbGrad: U's boundary for the momentum assembly's gradients (the evaluation, with the freestream
+    // faces' stored value); fsPbStored: p's, stored and relaxed; the hooks refresh U's stored value and the
+    // valueFractions at OpenFOAM's points -- after the momentum solve, at the pressure assembly, and in the
+    // evaluate after the velocity correction.
+    const DeviceBuffer<scalar>* const* fsUbGrad = nullptr;
+    DeviceBuffer<scalar>* fsPbStored = nullptr;
+    std::function<void()> fsAfterMomentum;
+    std::function<void()> fsBeforePressureLoop;
+    std::function<void()> fsAfterCorrection;
 };
 
 using Residuals = std::map<std::string, scalar>;

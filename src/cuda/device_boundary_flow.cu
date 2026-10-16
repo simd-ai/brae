@@ -7,6 +7,7 @@
 #include <map>
 #include <cstdio>
 #include <vector>
+#include <string>
 #include <stdexcept>
 #include <cstdlib>
 #include <algorithm>
@@ -67,7 +68,8 @@ void mixedUpdateKernel(
     scalar* __restrict__ vfU2,
     scalar* __restrict__ vfP,
     int doU,
-    int doP)
+    int doP,
+    int upAverage)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -90,7 +92,17 @@ void mixedUpdateKernel(
     ct = fmin(fmax(ct, -1.0), 1.0);   // |cos| <= 1 analytically; the clamp is only against roundoff now
     if (mu)   // velocity sign
     {
-        const scalar vfu = 0.5 - 0.5 * ct;
+        scalar vfu = 0.5 - 0.5 * ct;
+        // OpenFOAM-13's freestreamVelocity takes Up = 0.5*(patchInternalField() + *this) and falls back to 0.5
+        // where |Up| <= vSmall (OpenFOAM-13 freestreamVelocityFvPatchVectorField.C); its freestreamPressure
+        // keeps the patch value alone, as v2412's both do.
+        if (upAverage)
+        {
+            const int c = fc[i];
+            const scalar ax = 0.5 * (Ux[c] + ubx), ay = 0.5 * (Uy[c] + uby), az = 0.5 * (Uz[c] + ubz);
+            const scalar mA = sqrt(ax*ax + ay*ay + az*az);
+            vfu = (mA > 1e-300) ? 0.5 - 0.5 * (ax*nx[i] + ay*ny[i] + az*nz[i]) / mA : 0.5;
+        }
         vfU0[i] = vfu;
         vfU1[i] = vfu;
         vfU2[i] = vfu;
@@ -514,6 +526,35 @@ void deviceUpdateInletOutlet(DeviceBoundary& db, const DeviceBuffer<scalar>& phi
 }
 
 
+// WHICH `Up` freestreamVelocity takes. OpenFOAM v2412, the version brae ports, takes the patch's stored value
+// (`const Field<vector>& Up = *this`, freestreamVelocityFvPatchVectorField.C:105); OpenFOAM-13 takes the mean
+// of it and the adjacent cells (`0.5*(patchInternalField() + *this)`), a different boundary condition under the
+// same name. A case written for OpenFOAM-13 and run under v2412's, as the boxy5 UAV staged by name, is another
+// problem: OpenFOAM v2412 itself DIVERGED on it (-np 13: off OpenFOAM-13's lift by iteration 300, negative by
+// 400), and brae with v2412's form diverged too (turbulence blow-up at iteration 327, colour order, H100).
+// BRAE_FREESTREAM_VELOCITY_UP=average runs OpenFOAM-13's, and says so; `stored`, or unset, runs v2412's.
+// Anything else is refused.
+bool freestreamVelocityUpAverage()
+{
+    static const bool on = []()
+    {
+        const char* e = std::getenv("BRAE_FREESTREAM_VELOCITY_UP");
+        const std::string v = e ? e : "";
+        if (v.empty() || v == "stored") return false;
+        if (v == "average")
+        {
+            std::fprintf(stderr, "brae NOTICE [approximated] freestreamVelocity Up: OpenFOAM-13's form, "
+                                 "0.5*(patchInternalField() + *this) (BRAE_FREESTREAM_VELOCITY_UP=average); "
+                                 "OpenFOAM v2412 takes the patch value alone\n");
+            return true;
+        }
+        throw std::runtime_error("brae: BRAE_FREESTREAM_VELOCITY_UP='" + v + "' names no form of freestreamVelocity's "
+                                 "Up. Accepted: `stored` (OpenFOAM v2412's *this, the default) or `average` "
+                                 "(OpenFOAM-13's 0.5*(patchInternalField() + *this)).");
+    }();
+    return on;
+}
+
 void deviceUpdateMixedFreestream(
     DeviceVectorBoundary& dbU,
     DeviceBoundary& dbP,
@@ -556,7 +597,8 @@ void deviceUpdateMixedFreestream(
                                            dbU.nx.data(), dbU.ny.data(), dbU.nz.data(),
                                            dbU.comp[0].valueFraction.data(), dbU.comp[1].valueFraction.data(),
                                            dbU.comp[2].valueFraction.data(), dbP.valueFraction.data(),
-                                           (which & 1) ? 1 : 0, (which & 2) ? 1 : 0);
+                                           (which & 1) ? 1 : 0, (which & 2) ? 1 : 0,
+                                           freestreamVelocityUpAverage() ? 1 : 0);
     cudaCheck(cudaGetLastError(), "mixedUpdate");
 }
 
@@ -830,6 +872,72 @@ void deviceExtrapolateIOHbyA(
     cudaCheck(cudaGetLastError(), "extrapolateIOHbyA");
 }
 
+
+__global__
+void storedFreestreamValuesKernel(
+    int n,
+    const label* __restrict__ mask,
+    const scalar* __restrict__ s0,
+    const scalar* __restrict__ s1,
+    const scalar* __restrict__ s2,
+    scalar* __restrict__ u0,
+    scalar* __restrict__ u1,
+    scalar* __restrict__ u2)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || !mask[i]) return;
+    u0[i] = s0[i];
+    u1[i] = s1[i];
+    u2[i] = s2[i];
+}
+
+void deviceStoredFreestreamValues(
+    const DeviceVectorBoundary& dbU,
+    const DeviceBuffer<scalar>* const* UbStored,
+    DeviceBuffer<scalar>* ub)
+{
+    const int n = dbU.comp[0].n;
+    if (n == 0) return;
+    for (int k = 0; k < 3; ++k)
+    {
+        if (UbStored[k]->size() != static_cast<std::size_t>(n) || ub[k].size() != static_cast<std::size_t>(n))
+            throw std::runtime_error("brae: deviceStoredFreestreamValues was handed boundary arrays of the wrong size");
+    }
+    storedFreestreamValuesKernel<<<nBlocks(n), TPB>>>(n,
+                                                      dbU.comp[0].mixedMask.data(),
+                                                      UbStored[0]->data(),
+                                                      UbStored[1]->data(),
+                                                      UbStored[2]->data(),
+                                                      ub[0].data(),
+                                                      ub[1].data(),
+                                                      ub[2].data());
+    cudaCheck(cudaGetLastError(), "storedFreestreamValues");
+}
+
+__global__
+void storedFreestreamScalarKernel(
+    int n,
+    const label* __restrict__ mask,
+    const scalar* __restrict__ s,
+    scalar* __restrict__ u)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || !mask[i]) return;
+    u[i] = s[i];
+}
+
+void deviceStoredFreestreamValues(
+    const DeviceBoundary& dbP,
+    const DeviceBuffer<scalar>& pbStored,
+    DeviceBuffer<scalar>& pb)
+{
+    const int n = dbP.n;
+    if (n == 0) return;
+    if (pbStored.size() != static_cast<std::size_t>(n) || pb.size() != static_cast<std::size_t>(n))
+        throw std::runtime_error("brae: deviceStoredFreestreamValues (p) was handed boundary arrays of the wrong size");
+    storedFreestreamScalarKernel<<<nBlocks(n), TPB>>>(n, dbP.mixedMask.data(), pbStored.data(), pb.data());
+    cudaCheck(cudaGetLastError(), "storedFreestreamScalar");
+}
 
 void deviceConstrainMixedHbyA(
     const DeviceVectorBoundary& dbU,

@@ -1400,7 +1400,12 @@ int runSimpleFoamV2(const std::string& caseDir)
                 }
             }
             if (hasNutCalc) nutCalcMask.copyFrom(cm);
-            keNut = hasNutCalc && !sstModel && !keCoeffs.realizable;
+            // ...and kEpsilon is the only model it is, so NOT Spalart-Allmaras either: SA's nut is nuTilda*fv1,
+            // assigned on every face below, and an SA case has no epsilon boundary to evaluate. With a
+            // `calculated` nut patch -- the boxy5 UAV's inlet_front -- this
+            // asked dbEps (no faces) for its values and the zero-block launch stopped the run: `bcValue: invalid
+            // configuration argument`. airFoil2D's far-field nut is `freestream`, so no SA gate ever got here.
+            keNut = hasNutCalc && !sstModel && !keCoeffs.realizable && !saModel;
         }
 
         // Wall geometry for the wall functions. wallU is the patch velocity; a static mesh with no
@@ -2261,6 +2266,72 @@ int runSimpleFoamV2(const std::string& caseDir)
     turbPrecon() = (diluKE && dilu.valid) ? &dilu : nullptr;
     turbPolyDeg() = (diluKE && dilu.valid) ? 1 : polyDegKE;     // same reason: write it either way
 
+    // ---- the freestream family's stored values (StepInput::fsUbGrad and the hooks) -------------------
+    // U's and p's patch values as read -- OpenFOAM's mixed constructor keeps the file's `value`
+    // (freestreamVelocityFvPatchVectorField.C:55-58) and so does the host field -- then kept where OpenFOAM
+    // evaluates them. Only with a freestream patch (a wedge's category 5 is geometry, not one), and not under
+    // the control BRAE_CONTROL_FREESTREAM_REEVALUATE=1, which re-derives Up from the cells once an iteration as
+    // this driver did before. The default driver's arrangement (device_simple_foam.cu, UbStored_).
+    bool hasFreestream = false;
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        if ((f.U.boundary[pi]->bcCategory() == 5 && !f.U.boundary[pi]->wedgeFaceT())
+         || f.p.boundary[pi]->bcCategory() == 5)
+        {
+            hasFreestream = true;
+        }
+    }
+    const bool fsStored = hasFreestream && std::getenv("BRAE_CONTROL_FREESTREAM_REEVALUATE") == nullptr;
+    DeviceBuffer<scalar> fsUb[3];
+    DeviceBuffer<scalar> fsUbGrad[3];
+    const DeviceBuffer<scalar>* fsUbGradP[3] = {&fsUbGrad[0], &fsUbGrad[1], &fsUbGrad[2]};
+    DeviceBuffer<scalar> fsPb;
+    if (fsStored)
+    {
+        std::vector<scalar> ub[3], pb;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            const std::vector<vector>& v = f.U.boundary[pi]->value();
+            const std::vector<scalar>& w = f.p.boundary[pi]->value();
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                // an `empty` patch holds no values; its faces are never in the freestream mask
+                const std::size_t j = static_cast<std::size_t>(i);
+                const vector u = j < v.size() ? v[j] : vector{0, 0, 0};
+                ub[0].push_back(u.x);
+                ub[1].push_back(u.y);
+                ub[2].push_back(u.z);
+                pb.push_back(j < w.size() ? w[j] : scalar(0));
+            }
+        }
+        if (static_cast<int>(ub[0].size()) != dbU.comp[0].n || static_cast<int>(pb.size()) != dbP.n)
+            throw std::runtime_error("brae simpleFoam v2: U's and p's stored patch values do not span the device boundary");
+        for (int k = 0; k < 3; ++k) fsUb[k].copyFrom(ub[k]);
+        fsPb.copyFrom(pb);
+        in.fsUbGrad = fsUbGradP;
+        in.fsPbStored = &fsPb;
+        in.fsAfterMomentum = [&]()
+        {
+            deviceBCValue(dbU.comp[0], gf.Ux, fsUb[0]);
+            deviceBCValue(dbU.comp[1], gf.Uy, fsUb[1]);
+            deviceBCValue(dbU.comp[2], gf.Uz, fsUb[2]);
+        };
+        in.fsBeforePressureLoop = [&]()
+        {
+            deviceUpdateMixedFreestream(dbU, dbP, gf.phiBnd, gf.Ux, gf.Uy, gf.Uz, nullptr, /*which=*/2,
+                                        &fsUb[0], &fsUb[1], &fsUb[2]);
+        };
+        in.fsAfterCorrection = [&]()
+        {
+            deviceUpdateMixedFreestream(dbU, dbP, gf.phiBnd, gf.Ux, gf.Uy, gf.Uz, nullptr, /*which=*/1,
+                                        &fsUb[0], &fsUb[1], &fsUb[2]);
+            deviceBCValue(dbU.comp[0], gf.Ux, fsUb[0]);
+            deviceBCValue(dbU.comp[1], gf.Uy, fsUb[1]);
+            deviceBCValue(dbU.comp[2], gf.Uz, fsUb[2]);
+        };
+    }
+
     // ---- the SIMPLE loop ---------------------------------------------------------------------
     SolverWorkspace ws;
     std::map<std::string, scalar> residuals;
@@ -2292,7 +2363,20 @@ int runSimpleFoamV2(const std::string& caseDir)
         // far-field face a half-and-half blend whether it is inflow or outflow; on airFoil2D, whose whole
         // far field is freestream, that and the mixed evaluate() blend were worth 372x -> 47x on the
         // momentum residual and 3551x -> 136x on pressure.
-        if (hasMixedBC)
+        // With the stored values: U's valueFraction only, from the stored Up (freestreamPressure's moves at the
+        // pressure assembly, fsBeforePressureLoop), and the momentum assembly's gradients read the stored value
+        // on the freestream faces (fsUbGrad).
+        if (fsStored)
+        {
+            deviceUpdateMixedFreestream(dbU, dbP, gf.phiBnd, gf.Ux, gf.Uy, gf.Uz, nullptr, /*which=*/1,
+                                        &fsUb[0], &fsUb[1], &fsUb[2]);
+            deviceBCValue(dbU.comp[0], gf.Ux, fsUbGrad[0]);
+            deviceBCValue(dbU.comp[1], gf.Uy, fsUbGrad[1]);
+            deviceBCValue(dbU.comp[2], gf.Uz, fsUbGrad[2]);
+            const DeviceBuffer<scalar>* stored[3] = {&fsUb[0], &fsUb[1], &fsUb[2]};
+            deviceStoredFreestreamValues(dbU, stored, fsUbGrad);
+        }
+        else if (hasMixedBC)
             deviceUpdateMixedFreestream(dbU, dbP, gf.phiBnd, gf.Ux, gf.Uy, gf.Uz, nullptr);
 
         residuals = simpleStep(gf, ws, dm, dbU, dbP, in);

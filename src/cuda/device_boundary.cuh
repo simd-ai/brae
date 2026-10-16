@@ -255,6 +255,18 @@ void deviceUpdateMixedFreestream(DeviceVectorBoundary& dbU, DeviceBoundary& dbP,
 // cf's HbyA boundary value uses HbyA_cell in the (1-vf) part; at mixed faces replace hb[k] with the boundary value
 // of U itself (U_b = (1-vf) U_cell + vf U_freestream) so the boundary flux uses U_b, not HbyA_b. Non-mixed faces
 // untouched (pure fixedValue already = U_b; zeroGradient is not fixesValue).
+// U's patch values as OpenFOAM's fvc::grad(U) reads them at a momentum assembly, for a driver that keeps the
+// freestream faces' STORED value (UbStored, the last evaluate's) apart from the valueFraction the assembly has
+// just rebuilt: ub[k] arrives holding deviceBCValue's evaluation and leaves with the freestream velocity faces
+// (comp[0].mixedMask) replaced by UbStored[k]. Every other face is untouched.
+void deviceStoredFreestreamValues(const DeviceVectorBoundary& dbU,
+                                  const DeviceBuffer<scalar>* const* UbStored,
+                                  DeviceBuffer<scalar>* ub);
+// ...and p's: pb arrives holding deviceBCValue's evaluation and leaves with the freestream pressure faces
+// (dbP.mixedMask) replaced by pbStored -- what the last evaluate, and p.relax() after it, left there.
+void deviceStoredFreestreamValues(const DeviceBoundary& dbP,
+                                  const DeviceBuffer<scalar>& pbStored,
+                                  DeviceBuffer<scalar>& pb);
 void deviceConstrainMixedHbyA(const DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& Ux,
                               const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                               DeviceBuffer<scalar>& hbx, DeviceBuffer<scalar>& hby, DeviceBuffer<scalar>& hbz);

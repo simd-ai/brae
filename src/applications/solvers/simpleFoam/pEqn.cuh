@@ -65,6 +65,10 @@ struct PressureInput
     // moved since that evaluate: a mixed patch whose updateCoeffs ran at the momentum assembly has, on the
     // first corrector of a pass with no predictor.
     const DeviceBuffer<scalar>* UbStored[3] = {nullptr, nullptr, nullptr};
+    // p's freestream faces as they stand (StepInput::fsPbStored): what fvc::grad(p) reads in the SIMPLEC
+    // correction and in the FIRST non-orthogonal pass, before any pressure solve of this iteration has
+    // evaluated p's boundary. Null: re-derived.
+    const DeviceBuffer<scalar>* pbStoredFs = nullptr;
     // The pair. H() gains its off-diagonal (fvMatrix::H is diag*psi - sum(offdiag*psi), and a periodic
     // neighbour is an off-diagonal like any other) and fvc::flux(HbyA) gains its faces.
     DeviceCyclic* cyc = nullptr;

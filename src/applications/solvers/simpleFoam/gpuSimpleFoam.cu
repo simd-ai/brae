@@ -42,6 +42,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <chrono>
 #include <deque>
 #include <filesystem>
@@ -294,7 +295,15 @@ int main(int argc, char** argv)
 
         DeviceSimpleControls ctl;
         ctl.caseDir = caseDir;
-        ctl.writeCache = std::getenv("BRAE_MESH_CACHE") != nullptr;   // -partition (above) or the env
+        // The AMG hierarchy cache is WRITTEN by default, as interFoam's is (device_inter_pressure_step.cu): the
+        // hierarchy is a function of the mesh alone and the file is keyed on it (amgHierarchySignature), so the
+        // next run on this case reads it instead of agglomerating again. BRAE_AMG_CACHE=0 neither reads nor
+        // writes one (device_simple_foam.cu); BRAE_MESH_CACHE=1, or -partition above, still asks for it too.
+        {
+            const char* amgCache = std::getenv("BRAE_AMG_CACHE");
+            const bool amgCacheOff = amgCache && std::atoi(amgCache) == 0;
+            ctl.writeCache = std::getenv("BRAE_MESH_CACHE") != nullptr || !amgCacheOff;
+        }
         ctl.nu = transport.scalarOr("nu", 1e-5);
         // brae is Newtonian-only; a non-Newtonian transportModel has no top-level nu, so it would silently run with
         // the default constant nu (the wrong viscosity for a shear-thinning/thickening fluid). Fail loud instead.
@@ -362,12 +371,36 @@ int main(int argc, char** argv)
         // This used to be an inline copy here; the compressible driver was ported from it and silently
         // dropped fifteen of these controls. One reader means a new driver gets the whole set or none.
         const std::string second = ctl.sst ? "omega" : "epsilon";
-        readLinearSolverControls(fvSolution, second, ctl);
+        // THE COLOUR RULE is asked for unless BRAE_SIMPLE_CASE_SOLVER=1 (the exact gates set it); the solver
+        // decides per field whether it applies and prints the line that is true, so the reader leaves
+        // nuTilda's smoother line to it.
+        ctl.colourWhereGaussSeidel = std::getenv("BRAE_SIMPLE_CASE_SOLVER") == nullptr;
+        SolverRunsAs runsAs;
+        runsAs.turbulenceSmootherNoticedByCaller = ctl.colourWhereGaussSeidel;
+        readLinearSolverControls(fvSolution, second, ctl, "SIMPLE", "", runsAs);
 
         const FoamDict* simple = fvSolution.subDict("SIMPLE");
         const FoamDict* resCtl = simple ? simple->subDict("residualControl") : nullptr;
         const bool hasRC = (resCtl != nullptr);
         const scalar rcP = resCtl ? resCtl->scalarOr("p", -1) : -1, rcU = resCtl ? resCtl->scalarOr("U", -1) : -1;
+        // ...and the transported turbulence fields' targets, read HERE rather than at the convergence test.
+        // The test reads a field's target only once p and U have passed, so a run that never got there --
+        // the boxy5 UAV's 1000 iterations, targets 1e-6 -- ended with `SIMPLE/residualControl/nuTilda` in
+        // the unread notice although the test does gate on it. Same lookup, same values, read once.
+        std::map<std::string, scalar> rcTurb;
+        if (resCtl && ctl.turbulent && !ctl.les)
+        {
+            std::vector<std::string> names;
+            if (ctl.sa)       names = {"nuTilda"};
+            else if (ctl.sst) names = {"k", "omega"};
+            else              names = {"k", "epsilon"};
+            if (ctl.lm)
+            {
+                names.push_back("ReThetat");
+                names.push_back("gammaInt");
+            }
+            for (const std::string& f : names) rcTurb[f] = resCtl->scalarOr(f, -1);
+        }
         // consistent / nNonOrthogonalCorrectors / bodyForce are read by readLinearSolverControls above.
 
         // The model readTurbulenceModel selected, by its own name: this line read `(kEpsilon)` for every
@@ -695,9 +728,8 @@ int main(int argc, char** argv)
                 // Naming WHICH GaussSeidel, because OF has two in that family and they are different
                 // solvers: GaussSeidelSmoother.C sweeps ascending only. A log that said
                 // "symGaussSeidel" for both would be asserting a capability again.
-                const char* uSolv = ctl.gsU ? (ctl.gsUSym ? "smoothSolver[symGaussSeidel]"
-                                                          : "smoothSolver[GaussSeidel]")
-                                            : "Jacobi-BiCGStab";
+                const std::string uSolvName = solver.momentumSolverName();
+                const char* uSolv = uSolvName.c_str();
                 // OF prints the TIME NAME (simpleFoam.C:100, runTime.timeName()), not the iteration
                 // index. The two coincide only at startTime 0 with deltaT 1, which every fixture in
                 // validation/ happens to be -- the same blind spot that hid it on the V2 driver until
@@ -725,7 +757,13 @@ int main(int argc, char** argv)
                 // the solve reads, so the label cannot drift from it.
                 char kSolvBuf[64];
                 const char* kSolv;
-                if (ctl.gsK)
+                if (ctl.gsK && solver.colourTurbulence())
+                {
+                    // the colour rule runs the case-order path's smoother (decideColourRule)
+                    const bool sym = ctl.gsKESym;
+                    kSolv = sym ? "smoothSolver[colourSymGaussSeidel]" : "smoothSolver[colourGaussSeidel]";
+                }
+                else if (ctl.gsK)
                 {
                     kSolv = ctl.gsKESym ? "smoothSolver[symGaussSeidel]" : "smoothSolver[GaussSeidel]";
                 }
@@ -812,7 +850,11 @@ int main(int argc, char** argv)
             converged = hasRC && ok(r.p, rcP) && ok(uMax, rcU);
             if (converged)
                 for (const auto& e : turbulenceReport())
-                    if (!ok(e.perf.initialResidual, resCtl->scalarOr(e.field, -1))) { converged = false; break; }
+                {
+                    const auto it = rcTurb.find(e.field);
+                    const scalar target = (it != rcTurb.end()) ? it->second : resCtl->scalarOr(e.field, -1);
+                    if (!ok(e.perf.initialResidual, target)) { converged = false; break; }
+                }
             // OF's `checked` safety: `residualControl { }`, or a dict naming only fields brae does not
             // check, must NOT report convergence. Without this brae stopped after ONE iteration and wrote
             // a plausible-looking field set (simpleControl.C:51-57).

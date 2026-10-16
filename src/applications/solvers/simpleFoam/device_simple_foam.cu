@@ -10,6 +10,8 @@
 #include "fan_pressure.cuh"   // applyFixedMean: OF fixedMeanFvPatchField, shared with its test
 #include "brae_notice.cuh"   // never drop an input silently (the ddtCorr scheme gate)
 #include "stage_dump.cuh"   // Phase 0 stage harness (cudafoam/rhosimplefoam-restage-plan.md)
+#include "linear_solver_setup.cuh"   // noticeNuTildaCaseOrder: the colour rule owns nuTilda's line when asked
+#include <chrono>
 
 namespace brae {
 
@@ -47,6 +49,32 @@ void amgFineCoeffKernel(
     const int j = i - nIf - nCyc;
     up[i] = amiIf[amiSrc[j]] * amiW[j];
     lo[i] = 0;
+}
+// THE COLOUR RULE's mesh floor. On a small mesh OpenFOAM's sweep on one core is microseconds and the colour
+// order's launches cost more; interFoam's rule measured the crossover between 2,268 and 9,072 cells
+// (device_inter_turbulence.cu) and this driver starts from its number. BRAE_SIMPLE_COLOUR_MIN_CELLS sets it.
+label simpleColourMinCells()
+{
+    static const label n = std::getenv("BRAE_SIMPLE_COLOUR_MIN_CELLS")
+        ? static_cast<label>(std::max(0L, std::atol(std::getenv("BRAE_SIMPLE_COLOUR_MIN_CELLS"))))
+        : label(4000);
+    return n;
+}
+// BRAE_CONTROL_SIMPLE_COLOUR_ONE_SWEEP=1 is the rule's gate's CONTROL, deliberately wrong: every solve the
+// rule takes stops after its first block of nSweeps sweeps, so the fields are nowhere near converged.
+int simpleColourMaxIter(
+    int maxIter)
+{
+    static const bool oneSweep = std::getenv("BRAE_CONTROL_SIMPLE_COLOUR_ONE_SWEEP") != nullptr;
+    return oneSweep ? 1 : maxIter;
+}
+// BRAE_CONTROL_SIMPLE_COLOUR_SWAP=1, the colour gate's other CONTROL and the one a steady case can see: the
+// fused U solve writes the first solved component's solution into the second's field and back. Fewer sweeps
+// only slow a SIMPLE loop down on the way to the same fixed point; a solve into the wrong field moves it.
+bool simpleColourSwapControl()
+{
+    static const bool on = std::getenv("BRAE_CONTROL_SIMPLE_COLOUR_SWAP") != nullptr;
+    return on;
 }
 }   // namespace
 
@@ -88,28 +116,6 @@ void amgFineCoeffKernel(
             std::printf("  empty patches knock out a solution direction: U is solved in (%s%s%s) only, "
                         "as fvMatrix<vector>::solveSegregated does\n",
                         sd_.valid(0) ? "x" : "", sd_.valid(1) ? "y" : "", sd_.valid(2) ? "z" : "");
-        // THE SWEEP COUNT this driver runs on a smoothSolver: one sweep between residual evaluations,
-        // whatever the case's nSweeps says -- the U and turbulence solves below pass 1. OpenFOAM smooths
-        // nSweeps times before it looks at the residual again (smoothSolver.C:186-205), so a case asking 2
-        // stops its solves elsewhere: on the boxy5 UAV case (4.94 M cells) brae's first Ux solve left at
-        // 0.0224 where OpenFOAM's left at 0.0024. Kept, not ported -- user decision 2026-10-15, brae keeps
-        // its own smoother path where it has one -- and said here, because a silent difference is the
-        // defect. The rebuilt driver (BRAE_SIMPLEFOAM_V2=1) and the rhoSimpleFoam mirror honour the entry.
-        // nuTilda's own entry is announced by the reader (linear_solver_setup.cuh), which never reads it.
-        if (ctl_.gsU && ctl_.nSweepsU != 1)
-        {
-            noticeApproximated("solvers/U nSweeps",
-                               std::to_string(ctl_.nSweepsU) + " in the case; this driver evaluates the residual "
-                               "after every sweep (nSweeps 1), so its U solves stop where OpenFOAM's do not. "
-                               "BRAE_SIMPLEFOAM_V2=1 honours the entry.");
-        }
-        if (ctl_.gsK && !ctl_.sa && ctl_.nSweepsKE != 1)
-        {
-            noticeApproximated("solvers/k nSweeps",
-                               std::to_string(ctl_.nSweepsKE) + " in the case; this driver evaluates the "
-                               "residual of the turbulence solves after every sweep (nSweeps 1), so they stop "
-                               "where OpenFOAM's do not. BRAE_SIMPLEFOAM_V2=1 honours the entry.");
-        }
         // cyclic (periodic) interfaces: a SEPARATE lduInterface (OF cyclicFvPatchField::updateInterfaceMatrix),
         // NOT merged into the owner-sorted LDU. Both sides of each pair are stored (symmetric coupling).
         const std::vector<CyclicInterface> cyclics = buildCyclicInterfaces(m, g, fvp);
@@ -141,6 +147,7 @@ void amgFineCoeffKernel(
             if (a.nbrCell.size() > a.ownCell.size()) { amiNonConforming_ = true; break; }
         if (std::getenv("BRAE_AMI_PCG")) amiNonConforming_ = false;   // attribution escape hatch
         if (hasCyclic_ || hasAMI_) ctl_.useGraph = false;   // V-cycle graph replay not interface-safe; minor perf only.
+        decideColourRule(m);
         // The DILU level schedule: mesh addressing only, so once per solver. Skipped entirely when the
         // case did not ask for DILU, so no case pays for it unasked.
         // ONE level schedule for every DILU-preconditioned solve on this mesh -- momentum and the
@@ -304,6 +311,46 @@ void amgFineCoeffKernel(
                 hasMixed_ = true;
                 break;
             }
+        // the freestream family's stored Up, as read: OpenFOAM's mixed constructor keeps the file's `value`
+        // (freestreamVelocityFvPatchVectorField.C:55-58) and so does the host field (MixedPatchField), so a
+        // start from a written state -- potentialFoam's, or a restart -- begins with OpenFOAM's own Up
+        static const bool reevaluateFreestream = std::getenv("BRAE_CONTROL_FREESTREAM_REEVALUATE") != nullptr;
+        if (hasMixed_ && !reevaluateFreestream)
+        {
+            std::vector<scalar> ub[3];
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                const std::vector<vector>& v = U.boundary[pi]->value();
+                for (label i = 0; i < fvp[pi].size; ++i)
+                {
+                    // an `empty` patch holds no values; its faces are never in the freestream mask
+                    const vector u = static_cast<std::size_t>(i) < v.size() ? v[static_cast<std::size_t>(i)] : vector{0, 0, 0};
+                    ub[0].push_back(u.x);
+                    ub[1].push_back(u.y);
+                    ub[2].push_back(u.z);
+                }
+            }
+            if (static_cast<int>(ub[0].size()) != dbU_.comp[0].n)
+                throw std::runtime_error("brae: U's stored patch values do not span the device boundary ("
+                                         + std::to_string(ub[0].size()) + " faces against "
+                                         + std::to_string(dbU_.comp[0].n) + ")");
+            for (int k = 0; k < 3; ++k) UbStored_[k].copyFrom(ub[k]);
+            std::vector<scalar> pb;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                const std::vector<scalar>& v = p.boundary[pi]->value();
+                for (label i = 0; i < fvp[pi].size; ++i)
+                {
+                    // an `empty` patch holds no values; its faces are never in the freestream mask
+                    pb.push_back(static_cast<std::size_t>(i) < v.size() ? v[static_cast<std::size_t>(i)] : scalar(0));
+                }
+            }
+            if (static_cast<int>(pb.size()) != dbP_.n)
+                throw std::runtime_error("brae: p's stored patch values do not span the device boundary");
+            pbStored_.copyFrom(pb);
+        }
         // any pressureInletOutletVelocity (directionMixed) U patch present -> run its per-step updateCoeffs.
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             if (U.boundary[pi]->bcCategory() == 6)
@@ -514,9 +561,29 @@ void amgFineCoeffKernel(
         ctorMark("pre-AMG");
         // The hierarchy CACHE keys on the mesh only, so a run that adds interface edges must not reload a
         // hierarchy built without them (or vice versa). Interface meshes therefore build fresh.
-        amg_ = nAmgIfEdges_
-             ? buildAMG(ownerInt, neiInt, fwAMG, nC_)
-             : buildOrLoadAMG(ownerInt, neiInt, fwAMG, nC_, ctl_.caseDir + "/constant/polyMesh", ctl_.writeCache);
+        // BRAE_AMG_CACHE=0 builds it here and touches no file, read or write (interFoam's switch, the same word).
+        static const bool amgCacheOff = []()
+        {
+            const char* e = std::getenv("BRAE_AMG_CACHE");
+            return e && std::atoi(e) == 0;
+        }();
+        if (nAmgIfEdges_ || amgCacheOff)
+        {
+            amg_ = buildAMG(ownerInt, neiInt, fwAMG, nC_);
+        }
+        else
+        {
+            const std::string dir = ctl_.caseDir + "/constant/polyMesh";
+            AMGCacheRead how = AMGCacheRead::absent;
+            amg_ = buildOrLoadAMG(ownerInt, neiInt, fwAMG, nC_, dir, ctl_.writeCache, nullptr, &how);
+            if (how == AMGCacheRead::loaded)
+                std::printf("  AMG hierarchy: read from the cache in %s (this mesh's, written by this build); "
+                            "BRAE_AMG_CACHE=0 builds it\n", dir.c_str());
+            else if (ctl_.writeCache)
+                std::printf("  AMG hierarchy: built and written to the cache in %s for the next run%s; "
+                            "BRAE_AMG_CACHE=0 writes none\n", dir.c_str(),
+                            how == AMGCacheRead::absent ? "" : " (the file there was another mesh's or build's, or unreadable)");
+        }
         // ...and with its interface edges in the agglomeration this hierarchy's coarse matrices hold the pair:
         // the pressure solver must not carry it on the grids a second time (AMGData::pairInCoarseMatrices)
         amg_.pairInCoarseMatrices = nAmgIfEdges_ > 0;
@@ -711,6 +778,154 @@ void amgFineCoeffKernel(
         // time U's patches evaluate, so seed avgU from the solver rho -- rhoBndP_, just set above.
         updateFlowRateInlets();
         validateTurbulence();
+    }
+
+    // THE COLOUR RULE (the user's decision, 2026-10-16, on the boxy5 UAV case). A Gauss-Seidel smoothSolver
+    // on U or on a transported turbulence field is swept in COLOUR order on the GPU: what the case-order path
+    // runs -- its smoother and sweep count (see THE SWEEP COUNT below) under the entry's tolerance, relTol,
+    // maxIter and minIter -- over another order of the cells, so another iterate after n sweeps, and under a
+    // relTol another stopping point. Unlike
+    // interFoam's rule (CLAUDE.md) it takes an entry that stops at a relative tolerance: that is every SIMPLE
+    // case's U and turbulence entry, and the steady answer is the fixed point, which the sweep order does
+    // not move. WHY: OpenFOAM's sweep is one core's recurrence. On the boxy5 UAV (4.94 M cells, 25.96 M
+    // internal faces, H100, BRAE_PHASE_TIME=1) the case-order sweeps were 1,670 of a 1,769 ms momentum phase
+    // and 437 of a 720 ms turbulence phase per iteration, about 133 ms a sweep.
+    // NOT on a mesh with a cyclic or cyclicAMI interface (this driver's colour sweep carries none), NOT under
+    // BRAE_SIMPLE_COLOUR_MIN_CELLS cells, NOT on kOmegaSSTLM (its transition scalars are not wired), and only
+    // when the driver asked (ctl_.colourWhereGaussSeidel: simpleFoam, unless BRAE_SIMPLE_CASE_SOLVER=1, which
+    // CMakeLists.txt sets for every test so the exact gates keep OpenFOAM's order). The rule's own gate is
+    // tests/simple_colour_vs_openfoam.sh.
+    void DeviceSimpleSolver::decideColourRule(const PrimitiveMesh& m)
+    {
+        const bool asked = ctl_.colourWhereGaussSeidel;
+        const bool anyGs = ctl_.gsU || ctl_.gsK || ctl_.gsEps;
+        bool meshTakes = asked;
+        if (meshTakes && anyGs && (hasCyclic_ || hasAMI_))
+        {
+            std::printf("  colour rule: this mesh has a %s interface, which this driver's colour sweep does not "
+                        "carry; U and the turbulence fields keep OpenFOAM's order (one CPU core)\n",
+                        hasAMI_ ? "cyclicAMI" : "cyclic");
+            meshTakes = false;
+        }
+        if (meshTakes && anyGs && nC_ < simpleColourMinCells())
+        {
+            std::printf("  colour rule: %ld cells keep OpenFOAM's order on U and the turbulence fields; the colour "
+                        "order on the GPU pays from %ld cells up (BRAE_SIMPLE_COLOUR_MIN_CELLS)\n",
+                        static_cast<long>(nC_),
+                        static_cast<long>(simpleColourMinCells()));
+            meshTakes = false;
+        }
+        colourU_ = meshTakes && ctl_.gsU;
+        colourTurb_ = meshTakes && ctl_.turbulent && !ctl_.les && !ctl_.lm && (ctl_.gsK || ctl_.gsEps);
+        const std::string secondName = ctl_.sst ? "omega" : "epsilon";
+        std::string fields;
+        auto smootherWord = [](bool symmetric)
+        {
+            return std::string(symmetric ? "symGaussSeidel" : "GaussSeidel");
+        };
+        auto colourNotice = [&](const std::string& field, bool caseSymmetric, bool runSymmetric)
+        {
+            noticeApproximated("solvers/" + field + " smoother",
+                               "case asks '" + smootherWord(caseSymmetric) + "' in OpenFOAM's index order; brae "
+                               "sweeps " + smootherWord(runSymmetric) + " in COLOUR order on the GPU, under the "
+                               "case's tolerance, relTol, maxIter and minIter with this driver's sweep count -- "
+                               "another cell order, so another iterate after n sweeps and another stopping point "
+                               "under a relTol. BRAE_SIMPLE_CASE_SOLVER=1 runs OpenFOAM's order");
+            fields += (fields.empty() ? "" : ", ") + field;
+        };
+        // THE SWEEP COUNT this driver runs on a smoothSolver, in either order: one sweep between residual
+        // evaluations, whatever the case's nSweeps says -- the U and turbulence solves pass 1. OpenFOAM
+        // smooths nSweeps times before it looks at the residual again (smoothSolver.C:186-205), so a case
+        // asking 2 stops its solves elsewhere: on the boxy5 UAV case (4.94 M cells) brae's first Ux solve
+        // left at 0.0224 where OpenFOAM's left at 0.0024. Kept, not ported -- user decision 2026-10-15,
+        // brae keeps its own smoother path where it has one -- and said here, because a silent difference
+        // is the defect. The colour rule keeps it too, and that was MEASURED rather than assumed: boxy5 in
+        // OpenFOAM-13's freestream form with the case's own nSweeps 2 and GaussSeidel nuTilda, colour order,
+        // Ux grew 2.5e-04 -> 9.7e-04 over iterations 500-1000 (OpenFOAM-13 -np 13 sat flat at 2.76e-04 on
+        // the same entries); with this driver's count and symGaussSeidel nuTilda Ux reached 3.6e-06 by
+        // iteration 400, as OpenFOAM's order with the same settings did (2.0e-06). The rebuilt driver
+        // (BRAE_SIMPLEFOAM_V2=1) and the rhoSimpleFoam mirror honour the entry.
+        if (colourU_)
+        {
+            colourNotice("U", ctl_.gsUSym, ctl_.gsUSym);
+        }
+        if (ctl_.gsU && ctl_.nSweepsU != 1)
+        {
+            noticeApproximated("solvers/U nSweeps",
+                               std::to_string(ctl_.nSweepsU) + " in the case; this driver evaluates the residual "
+                               "after every sweep (nSweeps 1), so its U solves stop where OpenFOAM's do not. "
+                               "BRAE_SIMPLEFOAM_V2=1 honours the entry.");
+        }
+        if (colourTurb_)
+        {
+            if (ctl_.sa)
+            {
+                colourNotice("nuTilda", ctl_.gsNuTildaSym, ctl_.gsKESym);
+            }
+            else
+            {
+                if (ctl_.gsK) colourNotice("k", ctl_.gsKESym, ctl_.gsKESym);
+                if (ctl_.gsEps) colourNotice(secondName, ctl_.gsKESym, ctl_.gsKESym);
+            }
+        }
+        if (ctl_.gsK && !ctl_.sa && ctl_.nSweepsKE != 1)
+        {
+            noticeApproximated("solvers/k nSweeps",
+                               std::to_string(ctl_.nSweepsKE) + " in the case; this driver evaluates the "
+                               "residual of the turbulence solves after every sweep (nSweeps 1), so they stop "
+                               "where OpenFOAM's do not. BRAE_SIMPLEFOAM_V2=1 honours the entry.");
+        }
+        // the reader left nuTilda's line to this driver when the rule was asked for; under the rule the colour
+        // notice already names the smoother, so only the sweep count is said
+        if (ctl_.sa && ctl_.gsK && asked)
+        {
+            noticeNuTildaCaseOrder(ctl_, /*smoother*/!colourTurb_);
+        }
+        if (colourU_ || colourTurb_)
+        {
+            // PrimitiveMesh::owner() spans the boundary faces as well, neighbour() stops at the internal ones,
+            // so owner is cut to neighbour().size() before the two are paired (rhoSimpleFoamDriver.cu does the same)
+            const std::vector<label>& ownerAll = m.owner();
+            const std::vector<label>& nei = m.neighbour();
+            const std::vector<label> ownerInternal(
+                ownerAll.begin(),
+                ownerAll.begin() + static_cast<std::ptrdiff_t>(nei.size()));
+            colouring_ = buildDeviceCellColouring(ownerInternal, nei, static_cast<int>(nC_));
+            if (!colouring_.valid)
+                throw std::runtime_error(
+                    "brae simpleFoam: the colour rule needs a cell colouring and it could not be built; refusing "
+                    "rather than running the order the notice denied. BRAE_SIMPLE_CASE_SOLVER=1 runs OpenFOAM's "
+                    "order.");
+            std::string sizes;
+            for (int c = 0; c + 1 < static_cast<int>(colouring_.startH.size()); ++c)
+            {
+                if (!sizes.empty()) sizes += ' ';
+                sizes += std::to_string(colouring_.startH[static_cast<std::size_t>(c) + 1]
+                                      - colouring_.startH[static_cast<std::size_t>(c)]);
+            }
+            std::printf("  colour rule: %s swept in colour order on the GPU, %d colours (sizes %s)\n",
+                        fields.c_str(),
+                        colouring_.nColours,
+                        sizes.c_str());
+        }
+        // process-wide like turbPrecon(), so written either way: an earlier solver's setting must not leak
+        TurbColourRule& rule = turbColourRule();
+        rule.colouring = colourTurb_ ? &colouring_ : nullptr;
+        rule.maxIter = simpleColourMaxIter(ctl_.maxIterKE);
+        rule.minIter = ctl_.minIterKE;
+    }
+
+    std::string DeviceSimpleSolver::momentumSolverName() const
+    {
+        if (colourU_)
+        {
+            return ctl_.gsUSym ? "smoothSolver[colourSymGaussSeidel]" : "smoothSolver[colourGaussSeidel]";
+        }
+        if (ctl_.gsU && !hasCyclic_ && !hasAMI_)
+        {
+            return ctl_.gsUSym ? "smoothSolver[symGaussSeidel]" : "smoothSolver[GaussSeidel]";
+        }
+        return (ctl_.diluU && dilu_.valid) ? "DILUPBiCGStab" : "Jacobi-BiCGStab";
     }
 
     void DeviceSimpleSolver::validateTurbulence()
@@ -952,7 +1167,8 @@ void amgFineCoeffKernel(
                                              ctl_.gsK, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, kDdt,   // nuTilda ddt (kOld_)
                                              ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr, ctl_.iddes ? &hwn_ : nullptr, &lesDelta_,
                                              wallN_.size() ? &wallN_ : nullptr,   // SA-DDES/IDDES length-scale limiter (no-op for plain SA-RANS)
-                                             /*gradULimitK*/0.0, /*nSweeps*/1, ctl_.gsKESym);   // ...and WHICH GaussSeidel the case named: OF has two in that family and
+                                             /*gradULimitK*/0.0,
+                                             /*nSweeps*/1, ctl_.gsKESym);   // ...and WHICH GaussSeidel the case named: OF has two in that family and
                                              // GaussSeidelSmoother.C sweeps ascending ONLY. Passing this is what
                                              // keeps the legacy arm from answering a `GaussSeidel` case with the
                                              // symmetric sweep in silence, now that the substitution notice is gone.
@@ -1120,9 +1336,23 @@ void amgFineCoeffKernel(
                 deviceUpdateInletOutlet(dbGammaInt_, phiBnd_);
             }
         }
-        // mixed freestreamVelocity/Pressure: recompute the per-face valueFraction from the (lagged) flow angle.
-        if (hasMixed_) deviceUpdateMixedFreestream(dbU_, dbP_, phiBnd_, Uk_[0], Uk_[1], Uk_[2],
-                                                  compressible_ ? &rhoBnd_ : nullptr);   // phiBnd_ is a MASS flux
+        // simple.loop()'s storePrevIterFields: p's prevIter, boundary included
+        if (freestreamStored()) deviceCopy(pbPrev_, pbStored_);
+        // mixed freestreamVelocity: updateCoeffs inside the momentum fvMatrix constructor rebuilds its
+        // valueFraction from the STORED patch velocity (UbStored_, what the last evaluate left). Its pressure
+        // partner moves at the pressure assembly instead (correctPressureVelocity). The control re-derives
+        // Up from the cells and moves both here, once an iteration, as this driver did before: on the boxy5
+        // UAV that left iteration 1's Ux at 0.534657 against OpenFOAM's 0.553727.
+        if (hasMixed_)
+        {
+            if (freestreamStored())
+                deviceUpdateMixedFreestream(dbU_, dbP_, phiBnd_, Uk_[0], Uk_[1], Uk_[2],
+                                            compressible_ ? &rhoBnd_ : nullptr, /*which=*/1,
+                                            &UbStored_[0], &UbStored_[1], &UbStored_[2]);
+            else
+                deviceUpdateMixedFreestream(dbU_, dbP_, phiBnd_, Uk_[0], Uk_[1], Uk_[2],
+                                            compressible_ ? &rhoBnd_ : nullptr);   // phiBnd_ is a MASS flux
+        }
         if (hasPiov_)  deviceUpdatePressureInletOutletVelocity(dbU_, phiBnd_, Uk_[0], Uk_[1], Uk_[2], /*directionMixed=*/true);
         if (hasSym_)   deviceUpdateSymmetry(dbU_, Uk_[0], Uk_[1], Uk_[2]);
         if (hasWedge_) deviceUpdateWedge(dbU_, Uk_[0], Uk_[1], Uk_[2]);   // axisymmetric: the rotated cell velocity
@@ -1430,12 +1660,27 @@ void amgFineCoeffKernel(
         const DeviceBuffer<scalar>& ddrNuCell = ctl_.maxwell ? nuConst_ : nuEff;
         DeviceBuffer<scalar> ddrNuBnd;
         if (ctl_.maxwell) deviceBCValue(dbExtrap_, nuConst_, ddrNuBnd);
+        // fvc::grad(U) at this assembly reads U's patch values as the last evaluate left them. Re-deriving
+        // them is the same number everywhere but on the freestream faces, whose valueFraction the assembly
+        // has just rebuilt (above), so those faces take their stored value (gradUBnd).
+        DeviceBuffer<scalar> gradUBnd[3];
+        const DeviceBuffer<scalar>* gradUBndP[3] = {nullptr, nullptr, nullptr};
+        if (freestreamStored())
+        {
+            for (int k = 0; k < 3; ++k)
+            {
+                deviceBCValue(dbU_.comp[k], Uk_[k], gradUBnd[k]);
+                gradUBndP[k] = &gradUBnd[k];
+            }
+            const DeviceBuffer<scalar>* stored[3] = {&UbStored_[0], &UbStored_[1], &UbStored_[2]};
+            deviceStoredFreestreamValues(dbU_, stored, gradUBnd);
+        }
         deviceDivDevReff(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], ddrNuCell, ctl_.maxwell ? ddrNuBnd : nuEffBnd,
                          ddrX, ddrY, ddrZ,
                          hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr, nullptr,
-                         // null: this driver evaluates U's boundary before the assembly, so re-deriving
-                         // it here is the same number. See the header (queue item 30).
-                         nullptr, ctl_.gradULimitK);
+                         // null without a freestream patch: this driver evaluates U's boundary before the
+                         // assembly, so re-deriving it here is the same number. See the header (item 30).
+                         freestreamStored() ? gradUBndP : nullptr, ctl_.gradULimitK);
         // ...and the two terms only Maxwell has. Both are V*fvc::div of a tensor, added to the same
         // source the dev2 term feeds, with the same sign OF gives them (divDevRhoReff is subtracted from
         // the momentum equation, and brae's ddr carries that sign already -- see the loop below).
@@ -1464,6 +1709,8 @@ void amgFineCoeffKernel(
 
         DeviceBuffer<scalar> pbv;
         deviceBCValue(dbP_, dp_, pbv);
+        // fvc::grad(p) reads p's patch values as they stand: on the freestream faces the stored, relaxed ones
+        if (freestreamStored()) deviceStoredFreestreamValues(dbP_, pbStored_, pbv);
         // gx/gy/gz are members (shared with the pressure phase).
         deviceGaussGrad(dm, dp_, pbv, gx, gy, gz);
         if (hasCyclic_) interfaceAddGrad(cyc_, dp_, dm.V, gx, gy, gz);   // cyclic-face contribution to grad(p) in the momentum source
@@ -1701,7 +1948,8 @@ void amgFineCoeffKernel(
             for (int l = 0; l < 3; ++l)
             {
                 DeviceBuffer<scalar> ubv;
-                deviceBCValue(dbU_.comp[l], Uk_[l], ubv);
+                if (freestreamStored()) deviceCopy(ubv, gradUBnd[l]);   // the stored freestream values, as above
+                else                    deviceBCValue(dbU_.comp[l], Uk_[l], ubv);
                 deviceGaussGrad(dm, Uk_[l], ubv, gUx[l], gUy[l], gUz[l]);
                 if (hasCyclic_)
                 {
@@ -1793,6 +2041,17 @@ void amgFineCoeffKernel(
             deviceDesHybridSigma(nC_, gradU, dm.V, dnut_, ctl_.nu, ctl_.desCoeffs, desSigma, &lesDelta_);
         }
         if (ctl_.linearUpwindV) deviceLinearUpwindVCorr(dm, phiInt_, LUx, LUy, LUz, Uk_[0], Uk_[1], Uk_[2], corrV[0], corrV[1], corrV[2]);
+        // THE COLOUR RULE's systems (colourU_): each solved component's folded diagonal, source, view and
+        // normFactor, kept until the loop has assembled all three and then solved in ONE fused colour sweep
+        // after it (the components share upper, lower and the addressing). OpenFOAM assembles UEqn whole
+        // before solveSegregated solves it, so no component's assembly reads another's solved field there
+        // either.
+        DeviceBuffer<scalar> colourDiag[3];
+        DeviceBuffer<scalar> colourB[3];
+        DeviceBuffer<scalar> colourNf[3];
+        DeviceLduView colourView[3];
+        int colourComp[3];
+        int nColour = 0;
         for (int kk = 0; kk < 3; ++kk)   // (#5 OpenMP-parallel momentum was tried + benchmarked -> 136x SLOWER, reverted)
         {
             DeviceBuffer<scalar> dIC,dBC,lIC,lBC;
@@ -1918,7 +2177,9 @@ void amgFineCoeffKernel(
             // the normFactor-scaled number never leaves O(0.1) (T3A read 6.83e-01 for Uz every single
             // iteration, against 5.7e-07 for Ux at convergence).
             if (!sd_.valid(kk)) continue;
-            const scalar nf = deviceNormFactor(mv, Uk_[kk], b, ones_);          // OF residualControl normalisation
+            // OF residualControl normalisation. The colour rule keeps its own on the device (below) and needs
+            // this host copy only for the stage dump's residual.
+            const scalar nf = (colourU_ && !stageDumpActive()) ? scalar(0) : deviceNormFactor(mv, Uk_[kk], b, ones_);
             // The PER-CELL momentum residual, r = b - A*psi, before the solve moves anything.
             //
             // The global initial residual is one number for the whole field, so it can say that brae's
@@ -1937,6 +2198,15 @@ void amgFineCoeffKernel(
                     stageDump(std::string("stage_") + mrTag, r);
                     stageDump(std::string("stage_") + mrTag + "_normFactor", std::vector<scalar>(1, nf));
                 }
+            }
+            if (colourU_)
+            {
+                colourDiag[kk] = std::move(diagC);
+                colourB[kk] = std::move(b);
+                colourView[kk] = deviceLduView(dm, colourDiag[kk], mUp, mLo);
+                deviceNormFactorInto(colourView[kk], Uk_[kk], colourB[kk], ones_, colourNf[kk]);
+                colourComp[nColour++] = kk;
+                continue;
             }
             // OF fvVectorMatrix::solveSegregated solves each U component with the `U` lduMatrix solver
             // (smoothSolver/GaussSeidel for motorBike). Route through deviceSymGaussSeidel when
@@ -1965,6 +2235,47 @@ void amgFineCoeffKernel(
             else if (kk == 1) { res.Uy = ur; res.UyFinal = uperf.finalResidual; res.UyIters = uperf.nIterations; }
             else              { res.Uz = ur; res.UzFinal = uperf.finalResidual; res.UzIters = uperf.nIterations; }
             res.solvedU[kk] = 1;
+        }
+        if (nColour > 0)
+        {
+            // THE COLOUR RULE: the U entry's smoother under its own stop rule (tolerance, relTol, maxIter,
+            // minIter, nSweeps), swept in colour order on the GPU -- announced at construction.
+            GSFusedComponent comps[3];
+            DeviceSolverPerf fp[3];
+            for (int i = 0; i < nColour; ++i)
+            {
+                const int k = colourComp[i];
+                comps[i].A = &colourView[k];
+                comps[i].b = &colourB[k];
+                comps[i].psi = &Uk_[k];
+                comps[i].normFactor = 1.0;
+                comps[i].dNormFactor = colourNf[k].data();
+            }
+            if (simpleColourSwapControl() && nColour >= 2) std::swap(comps[0].psi, comps[1].psi);
+            deviceColourGaussSeidelFused(nColour,
+                                         comps,
+                                         colouring_,
+                                         tol,
+                                         ctl_.uRelTol(),
+                                         simpleColourMaxIter(ctl_.uMaxIter()),
+                                         ctl_.uMinIter(),
+                                         /*nSweeps*/1,   // the case-order path's count (decideColourRule)
+                                         ctl_.gsUSym,
+                                         fp);
+            for (int i = 0; i < nColour; ++i)
+            {
+                const int k = colourComp[i];
+                if (k == 0)      { res.Ux = fp[i].initialResidual; res.UxFinal = fp[i].finalResidual; res.UxIters = fp[i].nIterations; }
+                else if (k == 1) { res.Uy = fp[i].initialResidual; res.UyFinal = fp[i].finalResidual; res.UyIters = fp[i].nIterations; }
+                else             { res.Uz = fp[i].initialResidual; res.UzFinal = fp[i].finalResidual; res.UzIters = fp[i].nIterations; }
+                res.solvedU[k] = 1;
+            }
+        }
+        // the momentum solve's U.correctBoundaryConditions(): the freestream faces' stored value is now the
+        // blend of the solved cells under the valueFraction this assembly built
+        if (freestreamStored() && ctl_.momentumPredictor)
+        {
+            for (int k = 0; k < 3; ++k) deviceBCValue(dbU_.comp[k], Uk_[k], UbStored_[k]);
         }
         // meanVelocityForce CONSTRAIN -- OF meanVelocityForce::constrain (meanVelocityForce.C:246-247):
         //     gradP0_ += dGradP_;  dGradP_ = 0.0;
@@ -2553,6 +2864,13 @@ void amgFineCoeffKernel(
         // diagCp_/bp_, and setReference doubles a FRESH diag, so per-pass re-assembly is self-consistent). Unchanged
         // for SIMPLE vs SIMPLEC: rAtU is just the diffusivity (= rAU for SIMPLE, = 1/(1/rAU - H1) for SIMPLEC); the
         // one-time SIMPLEC phiHbyA/HbyA correction above already used the entry p, as in OF (it is outside this loop).
+        // freestreamPressure's updateCoeffs, inside the pressure fvMatrix constructor: its valueFraction from
+        // U's STORED patch velocity, which the momentum solve's evaluate left (UbStored_). Every non-orthogonal
+        // pass rebuilds the matrix from that same Up, so once here is each pass's number.
+        if (freestreamStored())
+            deviceUpdateMixedFreestream(dbU_, dbP_, phiBnd_, Uk_[0], Uk_[1], Uk_[2],
+                                        compressible_ ? &rhoBnd_ : nullptr, /*which=*/2,
+                                        &UbStored_[0], &UbStored_[1], &UbStored_[2]);
         const int nPass = (ctl_.nonOrth ? ctl_.nNonOrth : 0) + 1;
         DeviceBuffer<scalar> pIC, pBC, ffcP, ffcPcyc, ffcPami;
         DeviceSolverPerf pp, pp0;
@@ -2851,12 +3169,25 @@ void amgFineCoeffKernel(
             pTraceNote(pTraceIt_, "p_finalResidual",   pp.finalResidual);
             pTraceNote(pTraceIt_, "p_nIterations",     pp.nIterations);
         }
+        // The last pass's solve ended in p.correctBoundaryConditions(), so p's freestream faces hold the blend
+        // of the SOLVED cells under this pressure assembly's valueFraction; p.relax() then relaxes that boundary
+        // value with the field. A blend of the relaxed cells is another number wherever the valueFraction
+        // moved since prevIter was stored.
+        if (freestreamStored())
+        {
+            DeviceBuffer<scalar> pbSolved;
+            deviceBCValue(dbP_, dp_, pbSolved);
+            deviceCopy(pbStored_, pbSolved);
+            deviceScale(pbStored_, ctl_.pRelax());
+            deviceAxpy(1.0 - ctl_.pRelax(), pbPrev_, pbStored_);
+        }
         deviceScale(dp_, ctl_.pRelax());
         deviceAxpy(1.0 - ctl_.pRelax(), pPrev, dp_);
         if (stageDumpActive() && stageDumpFirstOnly("pRelaxed")) stageDump("stage_pRelaxed", dp_);
         if (pTraceActive()) pTraceDump("P4_pRelaxed", pTraceIt_, dp_);   // after p.relax()
         DeviceBuffer<scalar> pbv2;
         deviceBCValue(dbP_, dp_, pbv2);
+        if (freestreamStored()) deviceStoredFreestreamValues(dbP_, pbStored_, pbv2);
         if (pTraceActive()) pTraceDump("P5_pBoundary", pTraceIt_, pbv2);   // after BC evaluation
         DeviceBuffer<scalar> gnx,gny,gnz;
         deviceGaussGrad(dm, dp_, pbv2, gnx,gny,gnz);
@@ -2871,6 +3202,16 @@ void amgFineCoeffKernel(
         }
         if (hasWedge_) deviceUpdateWedge(dbU_, Uk_[0], Uk_[1], Uk_[2]);   // pEqn.H's U.correctBoundaryConditions()
         if (hasSym_)   deviceUpdateSymmetry(dbU_, Uk_[0], Uk_[1], Uk_[2]); // ...for the symmetry patches too (item 13)
+        // ...and the freestream faces: that evaluate finds them not updated() (the momentum solve's evaluate
+        // cleared the flag), so it runs updateCoeffs first -- the valueFraction from the stored Up the momentum
+        // solve left -- and then blends the corrected cells. The closures read U's boundary after this.
+        if (freestreamStored())
+        {
+            deviceUpdateMixedFreestream(dbU_, dbP_, phiBnd_, Uk_[0], Uk_[1], Uk_[2],
+                                        compressible_ ? &rhoBnd_ : nullptr, /*which=*/1,
+                                        &UbStored_[0], &UbStored_[1], &UbStored_[2]);
+            for (int k = 0; k < 3; ++k) deviceBCValue(dbU_.comp[k], Uk_[k], UbStored_[k]);
+        }
         // ...AND THE FLUX-CONDITIONAL CLASSES, which that same correctBoundaryConditions moves.
         // inletOutlet's valueFraction is neg(phi) and pressureInletOutletVelocity's typing is the flux
         // sign, both set inside updateCoeffs -- which evaluate() runs whenever the patch is not still
@@ -2965,10 +3306,39 @@ void amgFineCoeffKernel(
     {
         const DeviceMesh& dm = dm_;
         DeviceSimpleResidual res;
+        // BRAE_PHASE_TIME=1: the wall time of each phase of the iteration, the device drained at every
+        // boundary (so the sum is a little above an untimed iteration's). The share each phase takes is
+        // the number to have before optimising one of them.
+        static const bool phaseTime = std::getenv("BRAE_PHASE_TIME") != nullptr;
+        using PhaseClock = std::chrono::steady_clock;
+        PhaseClock::time_point phaseT0;
+        if (phaseTime)
+        {
+            cudaDeviceSynchronize();
+            phaseT0 = PhaseClock::now();
+        }
+        auto phaseMs = [&]()
+        {
+            cudaDeviceSynchronize();
+            const PhaseClock::time_point t = PhaseClock::now();
+            const double ms = std::chrono::duration<double, std::milli>(t - phaseT0).count();
+            phaseT0 = t;
+            return ms;
+        };
         solveMomentumPredictor(res);
+        const double msU = phaseTime ? phaseMs() : 0.0;
         correctPressureVelocity(res);
+        const double msP = phaseTime ? phaseMs() : 0.0;
 
         correctTurbulence();
+        if (phaseTime)
+        {
+            const double msT = phaseMs();
+            std::printf("  phase ms: momentum %.1f  pressure %.1f  turbulence %.1f\n",
+                        msU,
+                        msP,
+                        msT);
+        }
         // OF continuityErrs.H: contErr = fvc::div(phi) on the CORRECTED flux; sum local = sum(V|contErr|)/sumV,
         // global = sum(V contErr)/sumV. deviceDiv gives Sum(phi)/V per cell, so R = V*div = the cell flux balance.
         {

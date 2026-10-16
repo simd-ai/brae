@@ -17,6 +17,7 @@
 #include "device_cyclic.cuh"
 #include "device_interface.cuh"   // interfaceAssembleMomentum/OffDiagSum/ZeroWallIfCoeff
 #include "device_amg.cuh"         // deviceSymGaussSeidel
+#include "device_colour_gauss_seidel.cuh"   // the colour rule's sweep (turbColourRule)
 #include "stage_dump.cuh"      // Phase 0 stage harness
 #include "device_ddt.cuh"         // ScalarDdt + deviceFvmDdtDiag/Source (transient turbulence)
 #include <cuda_runtime.h>
@@ -49,6 +50,19 @@ inline const DeviceDilu*& turbPrecon() { static const DeviceDilu* p = nullptr; r
 // unchanged. Process-wide for the same reason turbPrecon is: this scaffold is called from closures that
 // do not carry the solver controls.
 inline int& turbPolyDeg() { static int d = 1; return d; }
+// ...and simpleFoam's COLOUR RULE for the transported scalars, set by the same solver at the same point
+// (device_simple_foam.cu, colourTurb_): with a colouring here, a smoothSolver solve below sweeps in colour
+// order on the GPU (deviceColourGaussSeidelFused) under the entry's own stop rule -- its tolerance and
+// relTol (the call's), maxIter and minIter (these), nSweeps and smoother (the call's). Null is OpenFOAM's
+// own order, so an unset driver is unchanged. The legacy closures stop a case-order solve at a fixed 3000
+// sweeps; the rule takes the entry's maxIter instead, since it is the case's stop rule it claims to run.
+struct TurbColourRule
+{
+    const DeviceCellColouring* colouring = nullptr;
+    int maxIter = 1000;
+    int minIter = 0;
+};
+inline TurbColourRule& turbColourRule() { static TurbColourRule r; return r; }
 
 namespace {
 // setValues (eps wall constraint): zero wall-cell off-diagonals + move the known eps0 to the neighbour RHS.
@@ -391,6 +405,12 @@ void deviceSolveScalarTransport(
     // internalCoeffs never enters the diagonal here -- it is folded in at solve time -- so a wrong
     // boundary diffusivity leaves every column above intact. Added when the mirror SST closure
     // matched this one on all of them and still solved to a different omega.
+    // ON REQUEST ONLY (BRAE_TURB_COEFF_NORMS=1): the norms are taken on the host from a pageable copy of
+    // both off-diagonals, every solve. On the boxy5 UAV's 4.94 M cells (25.96 M internal faces, H100)
+    // that was a 415 MB download and a single-core pass per iteration, inside a 720 ms turbulence phase;
+    // no test reads the line.
+    static const bool coeffNorms = std::getenv("BRAE_TURB_COEFF_NORMS") != nullptr;
+    if (coeffNorms)
     {
         auto l2 = [](const DeviceBuffer<scalar>& b)
         {
@@ -569,8 +589,28 @@ void deviceSolveScalarTransport(
     }
     // The smoothSolver the case asked for, algorithm included: OpenFOAM's own sweep, level-scheduled
     // (device_sym_gauss_seidel.cuh), symmetric or ascending-only as the `smoother` entry names.
-    if (gs) deviceSymGaussSeidel(sv, B, field, dnf.data(), tol, relTolKE, 3000, &perf, /*minIter*/0, nSweeps,
-                                 gsSymmetric);
+    const TurbColourRule& colourRule = turbColourRule();
+    if (gs && colourRule.colouring)
+    {
+        GSFusedComponent one;
+        one.A = &sv;
+        one.b = &B;
+        one.psi = &field;
+        one.normFactor = 1.0;
+        one.dNormFactor = dnf.data();
+        deviceColourGaussSeidelFused(1,
+                                     &one,
+                                     *colourRule.colouring,
+                                     tol,
+                                     relTolKE,
+                                     colourRule.maxIter,
+                                     colourRule.minIter,
+                                     nSweeps,
+                                     gsSymmetric,
+                                     &perf);
+    }
+    else if (gs) deviceSymGaussSeidel(sv, B, field, dnf.data(), tol, relTolKE, 3000, &perf, /*minIter*/0, nSweeps,
+                                      gsSymmetric);
     // DILU when the case asks for it, Jacobi otherwise. NOT a cost choice: both reach the requested
     // relTol, but they stop in different places -- on turbulentFlatPlate:kEpsilon OpenFOAM's DILU solve
     // lands at a median 0.0064 of the initial residual against brae's Jacobi 0.0726, and that gap leaves

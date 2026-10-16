@@ -108,6 +108,9 @@ Residuals simpleStep(
     // relaxes against the value p had before this iteration touched it.
     DeviceBuffer<scalar> pPrev;
     deviceCopy(pPrev, f.p);
+    // ...the boundary included: p.relax() relaxes p's patch values with the field
+    DeviceBuffer<scalar> pbPrev;
+    if (in.fsPbStored) deviceCopy(pbPrev, *in.fsPbStored);
 
     // ---- UEqn.H ------------------------------------------------------------------------------
     MomentumInput mi;
@@ -130,6 +133,7 @@ Residuals simpleStep(
     mi.correctedLaplacian = in.correctedLaplacian;
     mi.nonOrthCoeffs = in.nonOrthCoeffs;
     mi.hasMRF = in.hasMRF;          mi.hasFvOptions = in.hasFvOptions;
+    mi.UbStored = in.fsUbGrad;
 
     const DeviceStageDump sd = deviceStageDump();
     sd.vectors("stage_Uass", f.Ux, f.Uy, f.Uz);
@@ -179,6 +183,7 @@ Residuals simpleStep(
 
         DeviceBuffer<scalar> gpx, gpy, gpz, pb;
         deviceBCValue(dbP, f.p, pb);
+        if (in.fsPbStored) deviceStoredFreestreamValues(dbP, *in.fsPbStored, pb);
         deviceGaussGrad(dm, f.p, pb, gpx, gpy, gpz);
         addPressureGradient(Mp, dm, gpx, gpy, gpz);
 
@@ -282,6 +287,9 @@ Residuals simpleStep(
         res["U"] = uInitialResidual;
     }
 
+    // the momentum solve's U.correctBoundaryConditions(), for the freestream faces' stored value
+    if (in.momentumPredictor && in.fsAfterMomentum) in.fsAfterMomentum();
+
     // U out of the momentum predictor. UEqn.H() below is built from THIS field, so it sits between
     // the matrix and HbyA and separates a solver difference from an assembly one.
     sd.vectors("stage_Upred", f.Ux, f.Uy, f.Uz);
@@ -301,7 +309,11 @@ Residuals simpleStep(
     for (int cmpt = 0; cmpt < 3; ++cmpt) pin.solutionD[cmpt] = in.solutionD[cmpt];
 
     PressureStages st;
+    pin.pbStoredFs = in.fsPbStored;
     pressurePredictor(st, dm, dbU, MU, f.Ux, f.Uy, f.Uz, pin, &dbP, &f.p);
+    // freestreamPressure's updateCoeffs, inside the pressure fvMatrix constructor -- after the SIMPLEC
+    // correction, whose snGrad(p) took the previous valueFraction
+    if (in.fsBeforePressureLoop) in.fsBeforePressureLoop();
 
     // rAU and rAtU, the pair the whole SIMPLEC question is about. dumpSimpleFoam writes the reciprocal
     // of rAtU as stage_rowSum -- 1/rAU - H1, which is the relaxed matrix row sum over V -- so H1 needs no
@@ -332,6 +344,8 @@ Residuals simpleStep(
     for (label corr = 1; corr <= nCorr; ++corr)
     {
         PressureMatrix& P = w.P;                       // persistent -- see SolverWorkspace
+        // the first pass reads p's boundary as it stood; every later one, the evaluate the solve ended in
+        pin.pbStoredFs = (corr == 1) ? in.fsPbStored : nullptr;
         assemblePEqn(P, st, dm, dbP, rAUface, pin, &f.p);
 
         DeviceBuffer<scalar>& diagC = w.diagC;
@@ -390,15 +404,25 @@ Residuals simpleStep(
         }
     }
 
-    // p.relax(), then the momentum corrector -- in that order.
+    // p.relax(), then the momentum corrector -- in that order. The relax takes p's freestream faces with it:
+    // they hold the last solve's evaluate and become prevIter's plus alpha times the change (relaxField's own
+    // rule, alpha outside (0, 1) leaving the solved value).
+    if (in.fsPbStored)
+    {
+        deviceBCValue(dbP, f.p, *in.fsPbStored);
+        relaxField(*in.fsPbStored, pbPrev, in.relaxP);
+    }
     relaxField(f.p, pPrev, in.relaxP);
 
     {
         DeviceBuffer<scalar> gpx, gpy, gpz, pb;
         deviceBCValue(dbP, f.p, pb);
+        if (in.fsPbStored) deviceStoredFreestreamValues(dbP, *in.fsPbStored, pb);
         deviceGaussGrad(dm, f.p, pb, gpx, gpy, gpz);
         correctVelocity(f.Ux, f.Uy, f.Uz, st, gpx, gpy, gpz);
     }
+    // pEqn.H's U.correctBoundaryConditions(): updateCoeffs on the stored value, then the evaluate
+    if (in.fsAfterCorrection) in.fsAfterCorrection();
 
     // The end of the step, before turbulence->correct() moves nut: p and U after the corrector and the
     // conservative flux the next assembly convects by.

@@ -46,6 +46,7 @@
 #include "device_divdevreff.cuh"
 #include "device_ddt.cuh"          // transient fvm::ddt(U) for the PIMPLE path (no-op in steady SIMPLE)
 #include "device_amg.cuh"
+#include "device_colour_gauss_seidel.cuh"   // the colour rule's sweep (DeviceCellColouring)
 #include "fv_options.cuh"
 #include "device_fvoptions.cuh"
 #include "solver_controls.cuh"
@@ -93,6 +94,15 @@ public:
     // motorBike AND pitzDaily, i.e. fully laminar; harmless on attached flows but the seed of divergence on high-Re
     // skewed meshes. kMin_/epsilonMin_/omegaMin_ default to SMALL (= 1e-15), matching the floors used in correct().
     void validateTurbulence();
+    // The names on the `Solving for U?` lines: what the momentum solve RUNS, from the conditions it branches
+    // on -- the colour rule, OpenFOAM's sweep, or BiCGStab (an interface mesh's, or a Krylov entry's, with
+    // the DILU it was handed when it was). The label said `Jacobi-BiCGStab` under an honoured DILU, and
+    // `smoothSolver[...]` on a cyclic mesh, where the sweep is not run.
+    std::string momentumSolverName() const;
+    bool colourTurbulence() const { return colourTurb_; }
+    // THE COLOUR RULE: whether U and the transported turbulence fields are swept in colour order on the GPU
+    // (colourU_, colourTurb_), the colouring they share, and the one true line per field (the .cu has why).
+    void decideColourRule(const PrimitiveMesh& m);
     // E7: re-run OF's validate() ONCE the thermo exists, which is where OF does it.
     //
     // OF constructs the thermo, THEN the turbulence model, THEN calls validate() -> correctNut(). brae
@@ -846,6 +856,21 @@ private:
     // corrector, so it is gated on the case actually having such a patch.
     bool   hasInletOutletU_ = false;
     bool   hasMixed_ = false;
+    // U's STORED patch values (OpenFOAM's U.boundaryField(): what the last evaluate left), on the uncoupled
+    // boundary layout, for the freestream family. freestreamVelocity and freestreamPressure take their
+    // valueFraction from them (`const Field<vector>& Up = *this`, freestreamVelocityFvPatchVectorField.C:105;
+    // lookupPatchField, freestreamPressureFvPatchScalarField.C:117) and fvc::grad(U) reads them at the
+    // momentum assembly. Seeded from the field as read, refreshed where OpenFOAM evaluates U's boundary:
+    // after the momentum solve and after the velocity correction. Empty without a freestream patch, and
+    // under the control BRAE_CONTROL_FREESTREAM_REEVALUATE=1 (the re-derivation this replaced).
+    DeviceBuffer<scalar> UbStored_[3];
+    // ...and p's, for freestreamPressure: what p's last evaluate left and p.relax() then relaxed with the field
+    // (GeometricField::relax assigns the boundary too, `operator==(prevIter() + alpha*(*this - prevIter()))`).
+    // The momentum assembly's grad(p) and the velocity correction's read it. pbPrev_ is prevIter()'s, taken
+    // where simple.loop() stores it, at the top of the iteration.
+    DeviceBuffer<scalar> pbStored_;
+    DeviceBuffer<scalar> pbPrev_;
+    bool freestreamStored() const { return UbStored_[0].size() > 0; }
     bool   hasWedge_ = false;   // any wedge (axisymmetric constraint) U patch -> per-step rotated value                                  // any freestreamVelocity/Pressure (mixed) patch present
     bool   hasPiov_ = false;                                   // any pressureInletOutletVelocity (directionMixed) patch present
     bool   hasSym_ = false;                                    // any slip/symmetry patch present (general normal)
@@ -916,6 +941,11 @@ private:
     // DILU for the momentum solves (OF's `preconditioner DILU`). The level schedule depends only on the
     // mesh addressing, so it is built once; rD is refactorised inside every solve.
     DeviceDilu dilu_;   // shared by the momentum and turbulence BiCGStab (schedule depends only on the mesh)
+    // THE COLOUR RULE (constructor): U, and the transported turbulence fields, swept in colour order on the
+    // GPU over this colouring -- one per mesh, shared by both, as rhoSimpleFoam's FP-1 shares its own.
+    bool   colourU_ = false;
+    bool   colourTurb_ = false;
+    DeviceCellColouring colouring_;
     bool   hasAMI_ = false;                                     // any cyclicAMI interface -> Jacobi-PCG pressure (no AMG)
     bool   amiNonConforming_ = false;                           // ...and a face with >1 partner -> BiCGStab (see below)
     DeviceAMI    ami_;                                          // cyclicAMI weighted-stencil coupling (translational path)

@@ -266,6 +266,7 @@ void pressurePredictor(
         // 440k mesh and was 13% of GPU time across the outer iteration, so a duplicate is not free.
         DeviceBuffer<scalar> pb, gx, gy, gz;
         deviceBCValue(*dbP, *p, pb);
+        if (in.pbStoredFs) deviceStoredFreestreamValues(*dbP, *in.pbStoredFs, pb);
         deviceGaussGrad(dm, *p, pb, gx, gy, gz);
 
         DeviceBuffer<scalar> drAtUf;
@@ -361,6 +362,7 @@ void assemblePEqn(
     {
         DeviceBuffer<scalar> pb, gx, gy, gz, lc;
         deviceBCValue(dbP, *p, pb);
+        if (in.pbStoredFs) deviceStoredFreestreamValues(dbP, *in.pbStoredFs, pb);
         deviceGaussGrad(dm, *p, pb, gx, gy, gz);
         if (in.snGradLimitCoeff > 0.0)
         {
