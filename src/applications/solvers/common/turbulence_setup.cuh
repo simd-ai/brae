@@ -40,6 +40,29 @@ namespace brae {
 // `dict` is the RAS or the LES sub-dict; null leaves every default alone. nuTilda, ReThetat and gammaInt
 // are NOT plumbed: OpenFOAM bounds those at a literal Zero (SpalartAllmarasBase.C:487, kOmegaSSTLM.C:548
 // and :585), not at kMin, so brae's 0.0 there is already right.
+// The model's KEYWORD, as OpenFOAM reads it: getCompat<word>("model", {{"RASModel", -2006}}) and its
+// sibling for LES (RASModel.C:140-144, LESModel.C:158-162) -- `model`, and the older name only where that
+// is absent. brae's three turbulenceProperties readers took the older name alone, so a case written
+// `RAS { model SpalartAllmaras; }` (the boxy5 UAV case, staged from OpenFOAM-13's momentumTransport) was
+// refused as an empty RASModel. interFoam's reader (inter_turbulence_cpp.cu) already read it this way.
+//   BRAE_CONTROL_TURB_MODEL_COMPAT_ONLY=1: a gate's CONTROL, deliberately wrong -- the older name alone,
+//   the same switch interFoam's reader honours.
+inline std::string turbulenceModelWord(
+    const FoamDict* sub,
+    const char*     older)
+{
+    if (!sub)
+    {
+        return std::string();
+    }
+    static const bool compatOnly = std::getenv("BRAE_CONTROL_TURB_MODEL_COMPAT_ONLY") != nullptr;
+    if (!compatOnly && sub->found("model"))
+    {
+        return sub->wordOr("model", "");
+    }
+    return sub->wordOr(older, "");
+}
+
 inline void readTurbulenceMinima(
     const FoamDict* dict,
     scalar&         kMin,
@@ -338,7 +361,7 @@ inline void readTurbulenceModel(
             // transport (ctl.sa) plus the DES length-scale limiter (ctl.des); only cubeRootVol delta is supported (v1).
             if (const FoamDict* les = turbProps.subDict("LES"))
             {
-                const std::string model = les->wordOr("LESModel", "");
+                const std::string model = turbulenceModelWord(les, "LESModel");
                 const bool saIddes  = (model == "SpalartAllmarasIDDES");
                 const bool sstIddes = (model == "kOmegaSSTIDDES");
                 const bool saDes  = (model == "SpalartAllmarasDDES" || model == "SpalartAllmarasDES" || saIddes);
@@ -537,7 +560,7 @@ inline void readTurbulenceModel(
                                   "values and momentum uses that frozen nut (OF RASModel::correct() returns "
                                   "immediately). This is not the same as simulationType laminar.");
             }
-            const std::string model = ras ? ras->wordOr("RASModel", "") : "";
+            const std::string model = turbulenceModelWord(ras, "RASModel");
             ctl.lm  = (model == "kOmegaSSTLM");                 // Langtry-Menter transition = kOmegaSST + gamma-ReThetat
             ctl.sst = (model == "kOmegaSST") || ctl.lm;
             ctl.sa  = (model == "SpalartAllmaras");

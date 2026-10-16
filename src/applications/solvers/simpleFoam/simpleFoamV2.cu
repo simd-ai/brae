@@ -594,7 +594,7 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
         if (simType == "RAS")
         {
             const FoamDict* ras = turbProps.subDict("RAS");
-            const std::string model = ras ? ras->wordOr("RASModel", "") : "";
+            const std::string model = turbulenceModelWord(ras, "RASModel");
             if (model != "kEpsilon" && model != "kOmegaSST" && model != "realizableKE"
                 && model != "SpalartAllmaras" && model != "kOmegaSSTLM")
                 r.blockers.push_back("RASModel is `" + model + "`; the rebuilt path wires kEpsilon, "
@@ -612,7 +612,7 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
         if (simType == "RAS")
         {
             const FoamDict* ras = turbProps.subDict("RAS");
-            const std::string model = ras ? ras->wordOr("RASModel", "") : "";
+            const std::string model = turbulenceModelWord(ras, "RASModel");
             // SpalartAllmaras transports nuTilda and names no k or epsilon entry at all.
             std::vector<std::string> keys;
             if (model == "SpalartAllmaras")
@@ -1245,14 +1245,14 @@ int runSimpleFoamV2(const std::string& caseDir)
                             "validate() built from them. This is NOT simulationType laminar.\n",
                             sw.c_str());
         }
-        lmModel  = rasDict && rasDict->wordOr("RASModel", "") == "kOmegaSSTLM";
+        lmModel  = turbulenceModelWord(rasDict, "RASModel") == "kOmegaSSTLM";
         // The LM model IS kOmegaSST plus the transition transport, so every kOmegaSST path below is
         // taken as well -- the two flags are deliberately not exclusive.
-        sstModel = lmModel || (rasDict && rasDict->wordOr("RASModel", "") == "kOmegaSST");
+        sstModel = lmModel || (turbulenceModelWord(rasDict, "RASModel") == "kOmegaSST");
         // realizableKE rides the SAME fused device kEpsilon through KEpsilonCoeffs::realizable: variable
         // Cmu, the strain-based epsilon production and the C2*eps^2/(k + sqrt(nu*eps)) destruction are
         // all selected by that flag, so this is a coefficient change and not a second model path.
-        if (rasDict && rasDict->wordOr("RASModel", "") == "realizableKE")
+        if (turbulenceModelWord(rasDict, "RASModel") == "realizableKE")
         {
             keCoeffs.realizable = true;
             RealizableKECoeffs rc;
@@ -1269,7 +1269,7 @@ int runSimpleFoamV2(const std::string& caseDir)
             // the legacy driver and rhoSimpleFoam use (turbulence_setup.cuh).
             readKEpsilonCoeffsDict(rasDict, keCoeffs);
         }
-        saModel = rasDict && rasDict->wordOr("RASModel", "") == "SpalartAllmaras";
+        saModel = turbulenceModelWord(rasDict, "RASModel") == "SpalartAllmaras";
         if (saModel) cpu::SA::readCoeffs(rasDict, saCoeffs);
 
         // SpalartAllmaras has no k and no epsilon: nuTilda is the whole model, and it rides the k slot

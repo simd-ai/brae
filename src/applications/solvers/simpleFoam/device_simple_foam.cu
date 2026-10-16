@@ -88,6 +88,28 @@ void amgFineCoeffKernel(
             std::printf("  empty patches knock out a solution direction: U is solved in (%s%s%s) only, "
                         "as fvMatrix<vector>::solveSegregated does\n",
                         sd_.valid(0) ? "x" : "", sd_.valid(1) ? "y" : "", sd_.valid(2) ? "z" : "");
+        // THE SWEEP COUNT this driver runs on a smoothSolver: one sweep between residual evaluations,
+        // whatever the case's nSweeps says -- the U and turbulence solves below pass 1. OpenFOAM smooths
+        // nSweeps times before it looks at the residual again (smoothSolver.C:186-205), so a case asking 2
+        // stops its solves elsewhere: on the boxy5 UAV case (4.94 M cells) brae's first Ux solve left at
+        // 0.0224 where OpenFOAM's left at 0.0024. Kept, not ported -- user decision 2026-10-15, brae keeps
+        // its own smoother path where it has one -- and said here, because a silent difference is the
+        // defect. The rebuilt driver (BRAE_SIMPLEFOAM_V2=1) and the rhoSimpleFoam mirror honour the entry.
+        // nuTilda's own entry is announced by the reader (linear_solver_setup.cuh), which never reads it.
+        if (ctl_.gsU && ctl_.nSweepsU != 1)
+        {
+            noticeApproximated("solvers/U nSweeps",
+                               std::to_string(ctl_.nSweepsU) + " in the case; this driver evaluates the residual "
+                               "after every sweep (nSweeps 1), so its U solves stop where OpenFOAM's do not. "
+                               "BRAE_SIMPLEFOAM_V2=1 honours the entry.");
+        }
+        if (ctl_.gsK && !ctl_.sa && ctl_.nSweepsKE != 1)
+        {
+            noticeApproximated("solvers/k nSweeps",
+                               std::to_string(ctl_.nSweepsKE) + " in the case; this driver evaluates the "
+                               "residual of the turbulence solves after every sweep (nSweeps 1), so they stop "
+                               "where OpenFOAM's do not. BRAE_SIMPLEFOAM_V2=1 honours the entry.");
+        }
         // cyclic (periodic) interfaces: a SEPARATE lduInterface (OF cyclicFvPatchField::updateInterfaceMatrix),
         // NOT merged into the owner-sorted LDU. Both sides of each pair are stored (symmetric coupling).
         const std::vector<CyclicInterface> cyclics = buildCyclicInterfaces(m, g, fvp);

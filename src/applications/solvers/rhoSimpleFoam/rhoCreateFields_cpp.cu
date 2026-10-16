@@ -751,7 +751,7 @@ RhoSimpleFields createFields(
             // Cmu*k^2/eps = 0.001265625 against mu/rho ~ 1.5e-5 -- eighty times the molecular value.
             f.turbulent = true;
             f.turbulenceFrozen = ras && ras->wordOr("turbulence", "on") == "off";
-            f.rasModel  = ras ? ras->wordOr("RASModel", "") : "";
+            f.rasModel  = turbulenceModelWord(ras, "RASModel");
             // ALL SIX, as OpenFOAM reads them (kEpsilon.C:199-204 readIfPresent on Cmu, C1, C2, C3,
             // sigmak, sigmaEps). Only Cmu was read here, so a case naming any of the other five got the
             // model default and no warning. OF spells the diffusivity denominators `sigmak`/`sigmaEps`;
@@ -778,7 +778,7 @@ RhoSimpleFields createFields(
             readKOmegaSSTCoeffs(ras, f.sstCoeffs);   // OpenFOAM's defaults where the dict is absent
             f.sstCoeffs.kMin = keCase.kMin;          // ...after, so the SST reader cannot overwrite it
             f.Prt      = f.thermo.Prt;
-            if (ras && ras->wordOr("RASModel", "") == "kOmegaSST")
+            if (turbulenceModelWord(ras, "RASModel") == "kOmegaSST")
                 std::printf("  kOmegaSSTCoeffs (case): betaStar=%.4g a1=%.4g gamma1=%.4g beta1=%.4g Prt=%.4g\n",
                             (double)f.sstCoeffs.betaStar, (double)f.sstCoeffs.a1, (double)f.sstCoeffs.gamma1,
                             (double)f.sstCoeffs.beta1, (double)f.Prt);

@@ -523,6 +523,29 @@ inline void readLinearSolverControls(
             ctl.gsK = useSymGS("nuTilda") && runsAs.smoothSolverOnTurbulence;
             ctl.gsEps = false;
             noticeSolverChoice("nuTilda", "PBiCGStab", krylovPreconGs("nuTilda", ctl.gsK), ctl.gsK);
+            // nuTilda's SMOOTHER and SWEEP COUNT are not read into ctl: gsKESym and nSweepsKE come from k's
+            // entry in the branch below, so every caller of this reader runs nuTilda with symGaussSeidel
+            // and one sweep between residual evaluations, whatever nuTilda's own entry says. Kept, not
+            // ported -- user decision 2026-10-15, brae keeps its own smoother path where it has one -- and
+            // announced HERE because it is true for every caller (the rebuilt driver, BRAE_SIMPLEFOAM_V2=1,
+            // reads its own fvSolution and honours both).
+            if (ctl.gsK)
+            {
+                if (!gsIsSymmetric("nuTilda"))
+                {
+                    noticeApproximated("solvers/nuTilda smoother",
+                                       "'GaussSeidel' in the case (GaussSeidelSmoother.C sweeps ascending only); "
+                                       "brae runs symGaussSeidel on nuTilda (ascending, then back down).");
+                }
+                const int nSweepsNuTilda = solverNSweeps("nuTilda", 1);
+                if (nSweepsNuTilda != 1)
+                {
+                    noticeApproximated("solvers/nuTilda nSweeps",
+                                       std::to_string(nSweepsNuTilda) + " in the case; brae evaluates the "
+                                       "residual after every sweep (nSweeps 1), so its nuTilda solves stop "
+                                       "where OpenFOAM's do not.");
+                }
+            }
             // THIS BRANCH NEVER SET THE PRECONDITIONER. ctl.diluKE was assigned only in the k/epsilon
             // branch below, so it stayed false here and a case naming `preconditioner DILU` on nuTilda --
             // which 37 of the 43 SpalartAllmaras tutorials in OpenFOAM do (4 name smoothSolver, 2 PBiCG,

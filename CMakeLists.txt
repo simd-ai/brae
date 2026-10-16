@@ -791,6 +791,19 @@ set_tests_properties(les_wallfunction_refusals PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME sa_wallfunction_refusals COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_wallfunction_refusals.sh)
 set_tests_properties(sa_wallfunction_refusals PROPERTIES SKIP_RETURN_CODE 77)
 
+# The RAS model by its keyword on the simpleFoam drivers: `model`, and `RASModel` only where that is
+# absent (RASModel.C:140-144). `RAS { model SpalartAllmaras; }` was refused as an empty RASModel. Byte
+# identity against the `RASModel` case on both drivers, OpenFOAM's own premise, and a compat-only control.
+add_test(NAME sa_turbulence_model_keyword COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_turbulence_model_keyword.sh)
+set_tests_properties(sa_turbulence_model_keyword PROPERTIES SKIP_RETURN_CODE 77)
+
+# The default simpleFoam driver runs nSweeps 1 on U and the turbulence solves and symGaussSeidel on
+# nuTilda whatever the case names (kept by user decision 2026-10-15) -- and must SAY so: notices on
+# airFoil2D as shipped and on pitzDaily with nSweeps 2, none where the case asks what the driver runs, none
+# on the rebuilt driver, which honours both entries.
+add_test(NAME simple_smoother_notices COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_smoother_notices.sh)
+set_tests_properties(simple_smoother_notices PROPERTIES SKIP_RETURN_CODE 77)
+
 # Audit finding #16: the turbulence-setup guards compared boundaryField keys to patch names exactly, so
 # regex/group keys (bfs2D writes every wall BC as "(upperWall|lowerWall)") disarmed them silently while
 # buildField resolved the same keys correctly. The guards resolve through patchesResolvingTo now; two

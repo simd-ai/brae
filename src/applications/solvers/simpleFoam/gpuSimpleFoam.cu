@@ -370,8 +370,14 @@ int main(int argc, char** argv)
         const scalar rcP = resCtl ? resCtl->scalarOr("p", -1) : -1, rcU = resCtl ? resCtl->scalarOr("U", -1) : -1;
         // consistent / nNonOrthogonalCorrectors / bodyForce are read by readLinearSolverControls above.
 
-        std::printf("brae (device-resident) | case=%s | %s%s | nu=%.3g\n", caseDir.c_str(),
-                    simType.c_str(), ctl.turbulent ? (ctl.sst ? " (kOmegaSST)" : " (kEpsilon)") : "", ctl.nu);
+        // The model readTurbulenceModel selected, by its own name: this line read `(kEpsilon)` for every
+        // turbulent case that was not kOmegaSST, Spalart-Allmaras included.
+        const std::string modelTag = ctl.turbulent ? " (" + ctl.modelName + ")" : std::string();
+        std::printf("brae (device-resident) | case=%s | %s%s | nu=%.3g\n",
+                    caseDir.c_str(),
+                    simType.c_str(),
+                    modelTag.c_str(),
+                    ctl.nu);
         std::printf("  relax U=%.2g p=%.2g | tol p=%.1g U=%.1g | endTime=%d | residualControl=%s\n",
                     ctl.relaxU, ctl.relaxP, ctl.tolP, ctl.tolU, endTime, hasRC ? "on" : "off");
         std::printf("  schemes: bounded(U=%d,k=%d,eps=%d) linearUpwind(U)=%d nonOrth(corrected)=%d nonOrthLimit=%.3g consistent(SIMPLEC)=%d limitedLinear(k=%d,eps=%d) linearUpwind(k=%d,eps=%d)\n",
