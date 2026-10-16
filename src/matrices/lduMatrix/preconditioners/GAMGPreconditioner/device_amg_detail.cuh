@@ -12,6 +12,9 @@
 #include "cf_types.cuh"     // scalar / label
 #include <cuda_runtime.h>   // __shfl_down_sync, __syncthreads
 #include <cstdlib>          // std::getenv / std::atoi (env-flag readers)
+#include <cstdio>           // std::printf (BRAE_AMG_DENSE_MAX's notice)
+#include <stdexcept>        // std::runtime_error (its refusal)
+#include <string>
 
 // Device-resident (conditional-graph WHILE) solver variants require CUDA 13's stream-capture-to-graph + conditional
 // nodes. Defined here (not inline in device_amg.cu) so it gates BOTH the device-resident GS solver and the
@@ -208,15 +211,24 @@ inline bool useDenseCoarse()
     static bool b = envFlag("BRAE_AMG_COARSE_LU", true);
     return b;
 }
-// the largest coarsest grid the direct solve takes: DENSE_COARSE_MAX, or BRAE_AMG_DENSE_MAX (1..256) for the
-// coarse-solve experiment's 128-cell levels
+// the largest coarsest grid the direct solve takes: DENSE_COARSE_MAX, or BRAE_AMG_DENSE_MAX (1..128, the rows the
+// coarse solve's warp kernels hold) for the coarse-solve experiment's larger levels -- said where it is set, and a
+// value that is not a whole number in range refused rather than read as the default
 inline int denseCoarseMax()
 {
     static const int m = []()
     {
         const char* e = std::getenv("BRAE_AMG_DENSE_MAX");
-        const int v = e ? std::atoi(e) : 0;
-        return (v >= 1 && v <= 256) ? v : DENSE_COARSE_MAX;
+        if (!e) return DENSE_COARSE_MAX;
+        char* end = nullptr;
+        const long v = std::strtol(e, &end, 10);
+        if (end == e || *end != '\0' || v < 1 || v > 128)
+        {
+            throw std::runtime_error(std::string("BRAE_AMG_DENSE_MAX='") + e + "' is not a whole number of cells from 1 to 128");
+        }
+        std::printf("NOTICE: the AMG's coarsest grid is solved directly up to %ld cells (BRAE_AMG_DENSE_MAX; the default is %d)\n",
+                    v, DENSE_COARSE_MAX);
+        return static_cast<int>(v);
     }();
     return m;
 }

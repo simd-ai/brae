@@ -1763,6 +1763,9 @@ void amgGalerkin(
     // part that is not an optimisation -- OUTSIDE every graph capture, for the same reason the permuted
     // GS coefficients are gathered here. A factorisation made conditional inside a captured V-cycle
     // would bake the coefficients of the iteration the graph was captured in into every replay.
+    // The coarsest solve's kind is read here whatever the level, so that a BRAE_AMG_COARSE_SOLVE no direct level
+    // reaches is still refused or said.
+    const CoarseSolveKind coarseKind = coarseSolveKind();
     if (useDenseCoarse() && A.nLevels() > 0 && A.level.back().nCoarse <= denseCoarseMax())
     {
         const int n = A.level.back().nCoarse;
@@ -1773,7 +1776,7 @@ void amgGalerkin(
             A.coarseLUn = n;
         }
         deviceCoarseLUFactor(A.level.back().coarseView(), A.coarseLU, A.coarsePiv);
-        deviceCoarseDirectPrepare(coarseSolveKind(), A.level.back().coarseView(), nullptr, A.coarseLU, A.coarsePiv, A.coarseDirect);
+        deviceCoarseDirectPrepare(coarseKind, A.level.back().coarseView(), nullptr, A.coarseLU, A.coarsePiv, A.coarseDirect);
         dumpCoarsestForBenchmark(A.level.back().coarseView());
     }
     else

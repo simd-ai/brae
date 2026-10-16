@@ -10,7 +10,9 @@
 //             where the check sends its solves to the LU (a floored pivot, an entry not finite, the probes): every bit
 //             the LU's -- the null-space behaviour kept; the singular levels must go that way
 //             where the inverse stands: |x - x_lu| / |x_lu|, the normwise backward error, the forward error against
-//             the oracle (no worse than the LU's own, by a factor) and, for a symmetric level, |u.M v - v.M u|
+//             the oracle (no worse than the LU's own, by a factor), the backward error on a consistent b = A w (red
+//             on 13 levels before the check's consistent probe: cond 1e12 and 1e16, near-singular; 1e-7 to 3.9e-3)
+//             and, for a symmetric level, |u.M v - v.M u|
 //           and a stale-factorisation check: a second level through the same state takes its own inverse
 // PART B    the whole preconditioner on pitzDaily's Laplacian: one V-cycle M (amgVCycleApply) with each coarsest
 //           solve -- its symmetry, and its definiteness with A's own sign on random vectors; the AMG-PCG's iterations
@@ -20,6 +22,8 @@
 //           after the check): red; transpose: red on the asymmetric levels; stale: red; nofallback: red on the
 //           singular levels; half: red; probe_blind (one entry moved BEFORE the check): the check must send every
 //           level the inverse took to the LU, and nothing goes red
+// REFUSALS  (a child each) BRAE_AMG_COARSE_SOLVE=invrse with no direct level, BRAE_AMG_DENSE_MAX=512 and =12x stop
+//           by name; BRAE_AMG_DENSE_MAX=96 runs and says so
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -312,7 +316,7 @@ int partA()
         mats.push_back(illConditioned(n, 1e12, 1000u + n));
         mats.push_back(illConditioned(n, 1e16, 2000u + n));
     }
-    double worstVs = 0.0, worstBwd = 0.0, worstFwdRatio = 0.0, worstSym = 0.0;
+    double worstVs = 0.0, worstBwd = 0.0, worstBwdC = 0.0, worstFwdRatio = 0.0, worstSym = 0.0;
     int byProbe = 0, taken = 0, toLu = 0;
     for (const Dense& d : mats)
     {
@@ -363,6 +367,20 @@ int partA()
         if (!(vs <= VS_LU_BOUND)) fail(tag + ": |x - x_lu| / |x_lu| " + std::to_string(vs));
         if (!(bwd <= BACKWARD_BOUND)) fail(tag + ": backward error " + std::to_string(bwd));
         if (!(fwdIn <= FORWARD_FACTOR*fwdLu + FORWARD_FLOOR)) fail(tag + ": forward error " + std::to_string(fwdIn) + " against the LU's " + std::to_string(fwdLu));
+        // a consistent right-hand side, b = A w: its answer is the size of w, where a random b's answer on a
+        // near-singular level is the near-null mode's 1/lambda and hides an error in every other component (what a
+        // V-cycle's restricted residual, nearly orthogonal to that mode, meets)
+        std::vector<double> w(n), bc(n);
+        for (auto& x : w) x = uni(rng);
+        for (int i = 0; i < n; ++i)
+        {
+            long double s = 0.0L;
+            for (int j = 0; j < n; ++j) s += static_cast<long double>(d.a[i*n + j])*w[j];
+            bc[i] = static_cast<double>(s);
+        }
+        const double bwdC = backwardError(d, solve(n, inv, bc), bc);
+        worstBwdC = std::max(worstBwdC, bwdC);
+        if (!(bwdC <= BACKWARD_BOUND)) fail(tag + ": backward error on b = A w " + std::to_string(bwdC) + " (the LU's " + std::to_string(backwardError(d, solve(n, lu, bc), bc)) + ")");
         if (d.symmetric)
         {
             const double si = symmetryOf(n, inv, u, v);
@@ -386,7 +404,8 @@ int partA()
         if (!(vs <= VS_LU_BOUND)) fail("stale: the second level's answer is " + std::to_string(vs) + " from its own LU's");
     }
     std::printf("PART A: %d levels, the inverse taken on %d and the LU on %d (%d by the probes); worst |x - x_lu|/|x_lu| %.2e, backward %.2e, "
-                "forward/LU's %.2f, symmetry %.2e\n", static_cast<int>(mats.size()), taken, toLu, byProbe, worstVs, worstBwd, worstFwdRatio, worstSym);
+                "backward on b = A w %.2e, forward/LU's %.2f, symmetry %.2e\n", static_cast<int>(mats.size()), taken, toLu, byProbe, worstVs, worstBwd,
+                worstBwdC, worstFwdRatio, worstSym);
     return byProbe;
 }
 
@@ -533,6 +552,21 @@ int main(int argc, char** argv)
         std::printf("CHILD failures %d probes %d\n", fails, byProbe);
         return 0;
     }
+    if (argc > 2 && std::string(argv[1]) == "refusal")
+    {
+        // a refusal's run: pitzDaily's hierarchy and its Galerkin product (where the coarsest solve is factorised)
+        // under the BRAE_AMG_* the parent set, then one line for the parent
+        try
+        {
+            partB(argv[2], false);
+            std::printf("CHILD ran\n");
+        }
+        catch (const std::exception& e)
+        {
+            std::printf("CHILD refused: %s\n", e.what());
+        }
+        return 0;
+    }
     const std::string caseDir = argc > 1 ? argv[1] : "validation/pitzDaily";
     if (std::getenv("BRAE_CONTROL_COARSE_INVERSE")) { std::printf("FAIL run the gate without a control set\n"); return 1; }
     const int byProbe = partA();
@@ -560,6 +594,32 @@ int main(int argc, char** argv)
         if (c.red && childFails > 0) std::printf("RED  control %-12s %d failure(s)\n", c.control, childFails);
         else if (!c.red && childFails == 0 && childProbes > 0) std::printf("HELD control %-12s the check sent %d level(s) to the LU, nothing red\n", c.control, childProbes);
         else fail(std::string("control ") + c.control + ": failures " + std::to_string(childFails) + ", probes " + std::to_string(childProbes));
+    }
+    // the refusals, a child each: a kind that is not one, or a size that is not a whole number from 1 to 128, stops the
+    // run by name -- the kind read when the hierarchy is built, whether or not a direct level reaches it (here none:
+    // BRAE_AMG_COARSE_LU=0) -- and a size in range runs and is said (the arm that shows a child can run)
+    struct Refusal { const char* env; const char* says; };
+    const Refusal refusals[] = {{"BRAE_AMG_COARSE_SOLVE=invrse BRAE_AMG_COARSE_LU=0", "BRAE_AMG_COARSE_SOLVE='invrse'"},
+                                {"BRAE_AMG_DENSE_MAX=512", "BRAE_AMG_DENSE_MAX='512'"},
+                                {"BRAE_AMG_DENSE_MAX=12x", "BRAE_AMG_DENSE_MAX='12x'"},
+                                {"BRAE_AMG_DENSE_MAX=96", nullptr}};
+    for (const Refusal& r : refusals)
+    {
+        const std::string cmd = std::string(r.env) + " " + argv[0] + " refusal " + caseDir + " 2>&1";
+        FILE* p = popen(cmd.c_str(), "r");
+        if (!p) { fail(std::string(r.env) + ": could not run the child"); continue; }
+        char line[2048];
+        bool refused = false, ran = false, said = false;
+        while (std::fgets(line, sizeof(line), p))
+        {
+            if (std::strstr(line, "CHILD refused:") && r.says && std::strstr(line, r.says)) refused = true;
+            if (std::strstr(line, "CHILD ran")) ran = true;
+            if (std::strstr(line, "solved directly up to 96 cells (BRAE_AMG_DENSE_MAX")) said = true;
+        }
+        pclose(p);
+        if (r.says && refused && !ran) std::printf("REFUSED %s\n", r.env);
+        else if (!r.says && ran && said) std::printf("RAN     %s, and said so\n", r.env);
+        else fail(std::string(r.env) + ": refused " + (refused ? "yes" : "no") + ", ran " + (ran ? "yes" : "no") + ", said " + (said ? "yes" : "no"));
     }
     std::printf("%s (%d failure(s))\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;

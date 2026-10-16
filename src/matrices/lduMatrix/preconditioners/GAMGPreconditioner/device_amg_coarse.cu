@@ -557,9 +557,11 @@ constexpr scalar CHOL_SYM_TOL = 1e-12;
 // and only with every pivot above this, relative to max|diag|: a singular level (an all-Neumann pressure)
 // leaves a pivot of a rounding, and keeps the LU's floored pivot (DENSE_LU_EPS) by falling back to it
 constexpr scalar CHOL_PIVOT_MIN = 1e-10;
-// the inverse stands in for the LU only where it reproduces the LU's substitutions on two probe vectors to this,
+// the inverse stands in for the LU only where it reproduces the LU's substitutions on three probe vectors to this,
 // relative to the LU's answer: the inverse and the LU differed by at most 2.5e-14 over thirty synthetic levels to a
-// condition number of 1e12 and twenty CFD coarsest grids (bench_amg_coarse_solve, GB10, 2026-10-15)
+// condition number of 1e12 and twenty CFD coarsest grids (bench_amg_coarse_solve, GB10, 2026-10-15). On the consistent
+// probe the difference grows as eps*cond, so a level kept has the inverse's backward error far below the V-cycle's
+// single-precision cast
 constexpr scalar INVERSE_PROBE_TOL = 1e-10;
 
 // lu (row-major, unit L and U in place) -> fc column-major, fc[k*n + i] = lu[i*n + k], so that a warp reading
@@ -776,8 +778,9 @@ void coarseInverseApplyKernel(
 // Whether the inverse may stand in for the LU, decided once a factorisation, on the device (so the decision holds
 // inside a captured graph): unsafe = 1 where a pivot was floored (|U_kk| <= DENSE_LU_EPS*max|diag|, the LU's own
 // test: a singular level, whose null-space behaviour stays the LU's), 2 where an entry of the inverse is not
-// finite, 3 where the inverse and the LU's substitutions disagree on either of two probe vectors by more than
-// INVERSE_PROBE_TOL relative to the LU's answer. One block; warp 0 runs the LU's substitutions on the probes.
+// finite, 3 where the inverse and the LU's substitutions disagree on any of three probe vectors (the third consistent,
+// b = A w) by more than INVERSE_PROBE_TOL relative to the LU's answer. One block; warp 0 runs the LU's substitutions
+// on the probes.
 __global__
 void coarseInverseCheckKernel(
     int n,
@@ -813,12 +816,40 @@ void coarseInverseCheckKernel(
         if (bad) atomicExch(&shUnsafe, 2);
     }
     __syncthreads();
-    for (int p = 0; p < 2 && shUnsafe == 0; ++p)
+    for (int p = 0; p < 3 && shUnsafe == 0; ++p)
     {
         // probe[0..n) holds v, probe[n..2n) the LU's answer
-        for (int i = tid; i < n; i += blockDim.x)
+        if (p < 2)
         {
-            probe[i] = (p == 0) ? cos(0.37*i) + 1.1 : ((i & 1) ? -1.0 : 1.0)*(1.0 + 0.01*i);
+            for (int i = tid; i < n; i += blockDim.x)
+            {
+                probe[i] = (p == 0) ? cos(0.37*i) + 1.1 : ((i & 1) ? -1.0 : 1.0)*(1.0 + 0.01*i);
+            }
+        }
+        else
+        {
+            // the consistent probe, v = P^T L U w: its answer is w's size, where the first two's answers on a
+            // near-singular or ill-conditioned level are the smallest mode's, 1/lambda, and hide an error in every
+            // other component. The inverse's backward error grows as eps*cond and the LU's does not: on b = A w at
+            // cond 1e12 and 1e16 and one cell shifted by 1e-11 the inverse's was 1e-7 to 3.9e-3, the LU's 1e-16, and
+            // the first two probes passed every one (tests/test_amg_coarse_inverse.cu, GB10, 2026-10-15)
+            for (int i = tid; i < n; i += blockDim.x) probe[i] = sin(0.71*i) + 0.3;
+            __syncthreads();
+            // (U w)_i, U's diagonal included, into probe[n..2n)
+            for (int i = tid; i < n; i += blockDim.x)
+            {
+                scalar t = 0.0;
+                for (int k = i; k < n; ++k) t += F[k*n + i]*probe[k];
+                probe[n + i] = t;
+            }
+            __syncthreads();
+            // (L U w)_i, L's unit diagonal not stored, scattered so that the solve's gather b[perm[i]] reads it back
+            for (int i = tid; i < n; i += blockDim.x)
+            {
+                scalar c = probe[n + i];
+                for (int k = 0; k < i; ++k) c += F[k*n + i]*probe[n + k];
+                probe[perm[i]] = c;
+            }
         }
         __syncthreads();
         if (tid < 32)
@@ -1228,8 +1259,9 @@ void deviceCoarseDirectPrepare(
     CoarseDirect& d)
 {
     const int n = cv.nCells;
-    // the warp kernels hold n <= 32*TRI_ROWS rows; above it every kind is the LU
-    d.kind = (n <= 32*TRI_ROWS) ? kind : CoarseSolveKind::LU;
+    // the warp kernels hold n <= 32*TRI_ROWS rows; above it every kind is the LU, and so is an empty level (an
+    // empty mesh: a launch of no blocks is an error, which the LU's solve never makes)
+    d.kind = (n >= 1 && n <= 32*TRI_ROWS) ? kind : CoarseSolveKind::LU;
     d.n = n;
     if (d.kind == CoarseSolveKind::LU) return;
     const std::size_t nn = static_cast<std::size_t>(n)*n;
