@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 #include <map>          // BRAE_POOL_STATS: allocation-size histogram
+#include <set>          // BRAE_POOL_POISON: the take numbers to poison
 #include <algorithm>    // sort, for the histogram report
 #include <unordered_map>
 #include <dlfcn.h>      // BRAE_POOL_STATS: the large-block ledger's frame offsets
@@ -55,6 +56,18 @@ public:
         short_(std::getenv("BRAE_CONTROL_POOL_SHORT_CLASS") != nullptr),
         stats_(std::getenv("BRAE_POOL_STATS") != nullptr)
     {
+        // BRAE_POOL_BIG_MIB: the smallest block the census tracks one by one (64 MiB unless set); a mesh of a few
+        // million cells has its cell fields below 64 MiB, so a lifetime audit there needs it lower
+        if (const char* m = std::getenv("BRAE_POOL_BIG_MIB"))
+        {
+            const long mib = std::atol(m);
+            if (mib < 1)
+            {
+                throw std::runtime_error(std::string("brae: BRAE_POOL_BIG_MIB=") + m + " is not a size of 1 MiB or more.");
+            }
+            big_ = static_cast<std::size_t>(mib) << 20;
+        }
+        readPoison();
         const char* e = std::getenv("BRAE_POOL_KEEP_STEPS");
         const long asked = e ? std::atol(e) : 0;
         if (e && asked < 1)
@@ -152,6 +165,20 @@ public:
     void phase(const char* name)
     {
         phase_ = name;
+        if (poisonPhase_.empty() || poisonPhase_ != name) return;
+        // BRAE_POOL_POISON: the chosen blocks overwritten at this phase's entry, from its poisonFrom_-th entry on.
+        // A block whose value here is never read before it is written again leaves every field as it was.
+        if (++poisonEntries_ < poisonFrom_) return;
+        std::size_t n = 0, bytes = 0;
+        for (const auto& kv : bigLive_)
+        {
+            if (!poisonIds_.count(kv.second.seq) && !takenAtPoisonSite(kv.second)) continue;
+            cudaCheck(cudaMemset(kv.first, poisonByte_, kv.second.cls), "pool poison");
+            ++n;
+            bytes += kv.second.cls;
+        }
+        std::fprintf(stderr, "[poison] %s entry %lu: %zu blocks, %.3f GB, byte 0x%02x\n", name, poisonEntries_, n,
+                     bytes/1073741824.0, poisonByte_);
     }
     // A STEP OF THE CALLER'S LOOP HAS ENDED: a block that has sat idle for `keep` steps is handed back to the
     // driver. A step's own temporaries are taken and given at every step, so what stays idle that long is a size
@@ -266,10 +293,15 @@ public:
     void reportLive(const char* when) const
     {
         if (!stats_) return;
-        std::fprintf(stderr, "[live] %s: %zu blocks of 64 MiB or more; at the peak in use %zu\n", when,
-                     bigLive_.size(), peakBig_.size());
+        std::fprintf(stderr, "[live] %s: %zu blocks of %zu MiB or more; at the peak in use %zu\n", when,
+                     bigLive_.size(), big_ >> 20, peakBig_.size());
         printBig("now", bigLive_);
         printBig("peak", peakBig_);
+        // ...and what was alive at each phase's own peak, so the overlap of lifetimes is visible per phase
+        for (const auto& kv : peakBigByPhase_)
+        {
+            printBig(("@" + kv.first).c_str(), kv.second);
+        }
     }
 private:
     // a template so that it may precede Big's declaration below
@@ -279,7 +311,7 @@ private:
         for (const auto& kv : m)
         {
             const auto& b = kv.second;
-            std::fprintf(stderr, "[live] %-4s %8.2f MB  %-12s", tag, b.cls/1048576.0, b.phase);
+            std::fprintf(stderr, "[live] %-4s #%-6zu %8.2f MB  %-12s", tag, b.seq, b.cls/1048576.0, b.phase);
             for (int i = 0; i < b.nFrames; ++i)
             {
                 Dl_info info;
@@ -302,14 +334,19 @@ private:
         if (!stats_) return;
         liveBytes_ += cls;
         lastTakePhase_[cls] = phase_;
-        std::size_t& ph = peakByPhase_[phase_];
-        if (liveBytes_ > ph) ph = liveBytes_;
-        if (cls >= bigBytes)
+        if (cls >= big_)
         {
             Big& b = bigLive_[p];
             b.cls = cls;
             b.phase = phase_;
+            b.seq = ++seq_;
             b.nFrames = backtrace(b.frames, 16);
+        }
+        std::size_t& ph = peakByPhase_[phase_];
+        if (liveBytes_ > ph)
+        {
+            ph = liveBytes_;
+            peakBigByPhase_[phase_] = bigLive_;
         }
         if (liveBytes_ > peakLive_)
         {
@@ -337,17 +374,84 @@ private:
     std::map<std::string, std::size_t> mallocByPhase_;
     std::map<std::string, std::size_t> peakByPhase_;   // the most in use while each phase ran
     std::unordered_map<std::size_t, const char*> lastTakePhase_;
-    // every live block of 64 MiB or more: its class, the phase and the call stack of its last take
-    static constexpr std::size_t bigBytes = std::size_t(64) << 20;
+    // every live block of big_ or more: its class, the phase and the call stack of its last take, and the take's
+    // number among the tracked ones (the same from run to run of one binary on one case, so a poison names it)
+    std::size_t big_ = std::size_t(64) << 20;
     struct Big
     {
         std::size_t cls = 0;
         const char* phase = "";
+        std::size_t seq = 0;
         void*       frames[16] = {};
         int         nFrames = 0;
     };
+    std::size_t seq_ = 0;
     std::unordered_map<void*, Big> bigLive_;
     std::unordered_map<void*, Big> peakBig_;   // bigLive_ at the moment of the peak in use
+    std::map<std::string, std::unordered_map<void*, Big>> peakBigByPhase_;   // ...and at each phase's own peak
+    // BRAE_POOL_POISON=<phase>:<nan|big>:<ids>, ids a comma list of take numbers, a-b ranges and x<offset> sites
+    // (every live block one of whose frames is that offset): at every entry to
+    // <phase> from the second on (BRAE_POOL_POISON_FROM), the live blocks of those takes are filled with 0xff
+    // bytes (a NaN in double and in float) or 0x7f bytes (finite and huge in both). A lifetime audit's tool.
+    void readPoison()
+    {
+        const char* e = std::getenv("BRAE_POOL_POISON");
+        if (!e) return;
+        // parsed from the right: a phase name may itself hold a colon (mom:matrix)
+        const std::string spec(e);
+        const std::size_t b = spec.rfind(':');
+        const std::size_t a = (b == std::string::npos || b == 0) ? std::string::npos : spec.rfind(':', b - 1);
+        if (!stats_ || a == std::string::npos)
+        {
+            throw std::runtime_error("brae: BRAE_POOL_POISON=" + spec + " needs BRAE_POOL_STATS=1 and the form "
+                                     "<phase>:<nan|big>:<ids>");
+        }
+        poisonPhase_ = spec.substr(0, a);
+        const std::string kind = spec.substr(a + 1, b - a - 1);
+        if (kind == "nan") poisonByte_ = 0xff;
+        else if (kind == "big") poisonByte_ = 0x7f;
+        else throw std::runtime_error("brae: BRAE_POOL_POISON sentinel '" + kind + "' is neither nan nor big");
+        std::size_t i = b + 1;
+        while (i < spec.size())
+        {
+            std::size_t j = spec.find(',', i);
+            if (j == std::string::npos) j = spec.size();
+            const std::string item = spec.substr(i, j - i);
+            if (!item.empty() && item[0] == 'x')
+            {
+                poisonSites_.insert(std::stoul(item.substr(1), nullptr, 16));
+                i = j + 1;
+                continue;
+            }
+            const std::size_t dash = item.find('-');
+            const std::size_t lo = std::stoul(item.substr(0, dash));
+            const std::size_t hi = (dash == std::string::npos) ? lo : std::stoul(item.substr(dash + 1));
+            for (std::size_t k = lo; k <= hi; ++k) poisonIds_.insert(k);
+            i = j + 1;
+        }
+        if (const char* f = std::getenv("BRAE_POOL_POISON_FROM")) poisonFrom_ = std::stoul(f);
+    }
+    // a block re-taken at every iteration has a new take number each time; its call site does not change, so a
+    // site (x<offset>, a frame's offset into the executable as the live lists print it) names it for good
+    bool takenAtPoisonSite(const Big& b) const
+    {
+        if (poisonSites_.empty()) return false;
+        for (int i = 0; i < b.nFrames; ++i)
+        {
+            Dl_info info;
+            if (!dladdr(b.frames[i], &info) || !info.dli_fbase) continue;
+            const unsigned long off = static_cast<unsigned long>(
+                reinterpret_cast<char*>(b.frames[i]) - reinterpret_cast<char*>(info.dli_fbase));
+            if (poisonSites_.count(off)) return true;
+        }
+        return false;
+    }
+    std::set<unsigned long> poisonSites_;
+    std::string poisonPhase_;
+    int poisonByte_ = 0xff;
+    std::set<std::size_t> poisonIds_;
+    unsigned long poisonFrom_ = 2;
+    unsigned long poisonEntries_ = 0;
     bool enabled_;
     bool exact_;
     bool short_;

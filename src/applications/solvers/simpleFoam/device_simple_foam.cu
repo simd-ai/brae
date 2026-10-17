@@ -1661,6 +1661,8 @@ bool simpleColourSwapControl()
             deviceCopy(nuEffBnd, muBnd_);   // laminar compressible: mu_b = Sutherland(T_b), OF transport_.mu(patchi)
         else
             deviceBCValue(dbExtrap_, nuEff, nuEffBnd);   // laminar: adjacent-cell value
+        // BRAE_POOL_STATS: the momentum phase in four parts, for the census's per-part peaks
+        detail::devicePool().phase("mom:stress");
         // explicit divDevReff stress (uses the incoming U; coupled across the 3 components)
         DeviceBuffer<scalar> ddrX, ddrY, ddrZ;
         // ...with the case's NAMED grad(U) scheme, not a bare Gauss one: OF's divDevReff calls
@@ -1728,6 +1730,7 @@ bool simpleColourSwapControl()
         deviceGaussGrad(dm, dp_, pbv, gx, gy, gz);
         if (hasCyclic_) interfaceAddGrad(cyc_, dp_, dm.V, gx, gy, gz);   // cyclic-face contribution to grad(p) in the momentum source
         if (hasAMI_)    interfaceAddGrad(ami_, dp_, dm.V, gx, gy, gz);       // AMI-face contribution to grad(p)
+        detail::devicePool().phase("mom:matrix");
         DeviceBuffer<scalar> mDiag, lD, lU, lL;   // mUp/mLo are now members (shared with the pressure phase)
         // div(phi,U): central differencing when the case asks for a bare `Gauss linear`, otherwise the
         // upwind matrix (with linearUpwind's deferred correction added separately below). Same
@@ -2065,6 +2068,7 @@ bool simpleColourSwapControl()
         DeviceLduView colourView[3];
         int colourComp[3];
         int nColour = 0;
+        detail::devicePool().phase("mom:sources");
         for (int kk = 0; kk < 3; ++kk)   // (#5 OpenMP-parallel momentum was tried + benchmarked -> 136x SLOWER, reverted)
         {
             DeviceBuffer<scalar> dIC,dBC,lIC,lBC;
@@ -2253,6 +2257,7 @@ bool simpleColourSwapControl()
         {
             // THE COLOUR RULE: the U entry's smoother under its own stop rule (tolerance, relTol, maxIter,
             // minIter, nSweeps), swept in colour order on the GPU -- announced at construction.
+            detail::devicePool().phase("mom:solve");
             GSFusedComponent comps[3];
             DeviceSolverPerf fp[3];
             for (int i = 0; i < nColour; ++i)
