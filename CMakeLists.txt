@@ -5249,6 +5249,13 @@ target_include_directories(test_gpu_amg_graph PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_gpu_amg_graph PRIVATE brae_core)
 add_test(NAME gpu_amg_graph COMMAND test_gpu_amg_graph ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurbBig)
 
+# The coarse matrices of a fine matrix handed with one off-diagonal: one coarse off-diagonal a level, the same bits
+# and solves as two, and a hierarchy switched to two off-diagonals drops its captured graphs (with its control).
+add_executable(test_amg_one_off_diagonal tests/test_amg_one_off_diagonal.cu)
+target_include_directories(test_amg_one_off_diagonal PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_amg_one_off_diagonal PRIVATE brae_core)
+add_test(NAME amg_one_off_diagonal COMMAND test_amg_one_off_diagonal ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+
 # GPU offload #7c-loop: cached V-cycle graph replayed across SIMPLE steps (persistent buffers) vs direct, in-loop A/B.
 add_executable(test_gpu_loop_graph tests/test_gpu_loop_graph.cu)
 target_include_directories(test_gpu_loop_graph PRIVATE ${BRAE_HEADER_DIRS} src/applications/solvers/simpleFoam)

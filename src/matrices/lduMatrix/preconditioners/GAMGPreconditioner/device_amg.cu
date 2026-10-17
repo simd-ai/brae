@@ -202,6 +202,25 @@ void galFaceGatherK(
     cUp[cf] = u;
     cLo[cf] = l;
 }
+// ...for a fine matrix with ONE off-diagonal (upper and lower the same buffer): the flip picks between two equal
+// values, so the coarse face's sum is galFaceGatherK's u term for term, and its l is the same sum again
+__global__
+void galFaceGatherSymK(
+    int nCoarseFaces,
+    const label* __restrict__ faceStart,
+    const label* __restrict__ faceList,
+    const scalar* __restrict__ off,
+    scalar* __restrict__ cOff)
+{
+    const int cf = blockIdx.x*blockDim.x + threadIdx.x;
+    if (cf >= nCoarseFaces) return;
+    scalar u = 0.0;
+    for (label k = faceStart[cf]; k < faceStart[cf+1]; ++k)
+    {
+        u += off[faceList[k]];
+    }
+    cOff[cf] = u;
+}
 
 
 } // namespace
@@ -1402,7 +1421,7 @@ AMGData buildAMG(
                 interPhase::Nested timedRest("hierarchy: a level's coarse matrix sized, the level kept");
                 L.cDiag.resize(a.nCoarse);
                 L.cUpper.resize(a.nCoarseFaces);
-                L.cLower.resize(a.nCoarseFaces);
+                // no cLower yet: the first Galerkin takes it for a matrix with two off-diagonals (amgTakeCoarseLower)
                 A.level.push_back(std::move(L));
             }
             owner = std::move(a.cOwn);
@@ -1649,6 +1668,28 @@ void amgSaFixedOrder(AMGLevel& L)
     L.rapDstIdx.copyFrom(permuted(dstIdx));
 }
 
+// A level without a lower off-diagonal (AMGLevel::coarseLower) takes one the first time a fine matrix with two
+// comes, and keeps it. If a Galerkin ran before, cycles may have been captured that read cUpper as the lower:
+// this hierarchy's graphs are dropped, and every other cache is told (deviceGraphGeneration), as when a solver's
+// long-lived buffers go.
+static void amgTakeCoarseLower(AMGData& A)
+{
+    bool taken = false;
+    for (AMGLevel& L : A.level)
+    {
+        if (static_cast<int>(L.cLower.size()) == L.nCoarseFaces) continue;
+        L.cLower.resize(L.nCoarseFaces);
+        taken = true;
+    }
+    // BRAE_CONTROL_AMG_LOWER_GRAPHS_KEPT=1, a gate's CONTROL, deliberately wrong: the graphs are kept, and a replay
+    // reads cUpper as the lower (tests/test_amg_one_off_diagonal.cu). Read at each call: the gate sets it for one arm.
+    if (!taken || !A.galerkinRun || std::getenv("BRAE_CONTROL_AMG_LOWER_GRAPHS_KEPT")) return;
+    A.gcache = std::make_unique<AMGGraphCache>();
+    A.gcacheF = std::make_unique<AMGGraphCache>();
+    A.pcgCache.reset();
+    bumpDeviceGraphGeneration();
+}
+
 void amgGalerkin(
     AMGData& A,
     const DeviceBuffer<scalar>& fineDiag,
@@ -1659,6 +1700,14 @@ void amgGalerkin(
     A.keptValid = false;
     A.fp32Current = false;
     A.fp32Stands = false;
+    // ONE OFF-DIAGONAL FOR A FINE MATRIX HANDED WITH ONE (upper and lower the same buffer: simpleFoam's
+    // symmetric pressure, interFoam's pcorr). The gather below then sums the same values in the same order into
+    // a coarse face's upper and lower, so they are the same bits on every grid, and an injection level keeps
+    // one: its view hands cUpper as the lower. The lifetime audit (2026-10-17) found cUpper and cLower equal
+    // byte for byte on all 16 coarse grids of boxy5 at 4.94 M cells, 225 MiB there. A smoothed level keeps both
+    // (its RAP recipe writes them apart), and so does a level that has once taken its own.
+    const bool oneOffDiagonal = !A.saSmooth && fineUpper.data() == fineLower.data();
+    if (!oneOffDiagonal) amgTakeCoarseLower(A);
     for (int k = 0; k < A.nLevels(); ++k)                      // grid k matrix -> grid k+1 (Galerkin scatter)
     {
         AMGLevel& L = A.level[k];
@@ -1677,7 +1726,7 @@ void amgGalerkin(
         {
             fd = A.level[k-1].cDiag.data();
             fu = A.level[k-1].cUpper.data();
-            fl = A.level[k-1].cLower.data();
+            fl = A.level[k-1].coarseLower();
             nFaces = A.level[k-1].nCoarseFaces;
         }
         if (A.saSmooth)                                          // general Galerkin A_c = P^T A P (precomputed RAP recipe)
@@ -1717,9 +1766,17 @@ void amgGalerkin(
             galDiagGatherK<<<nBlocks(L.nCoarse),TPB>>>(
                 L.nCoarse, L.galCellStart.data(), L.galCellList.data(),
                 L.galDFaceStart.data(), L.galDFaceList.data(), fd, fu, fl, L.cDiag.data());
-            galFaceGatherK<<<nBlocks(L.nCoarseFaces),TPB>>>(
-                L.nCoarseFaces, L.galFaceStart.data(), L.galFaceList.data(), L.galFaceFlipList.data(),
-                fu, fl, L.cUpper.data(), L.cLower.data());
+            if (L.cLower.size() > 0)
+            {
+                galFaceGatherK<<<nBlocks(L.nCoarseFaces),TPB>>>(
+                    L.nCoarseFaces, L.galFaceStart.data(), L.galFaceList.data(), L.galFaceFlipList.data(),
+                    fu, fl, L.cUpper.data(), L.cLower.data());
+            }
+            else
+            {
+                galFaceGatherSymK<<<nBlocks(L.nCoarseFaces),TPB>>>(
+                    L.nCoarseFaces, L.galFaceStart.data(), L.galFaceList.data(), fu, L.cUpper.data());
+            }
         }
     }
     cudaCheck(cudaGetLastError(), "galerkin");
@@ -1747,7 +1804,7 @@ void amgGalerkin(
             else
             {
                 const AMGLevel& Lg = A.level[g-1];
-                amgGatherPermutedGSCoeffs(A.coloring[g], Lg.cDiag.data(), Lg.cUpper.data(), Lg.cLower.data());
+                amgGatherPermutedGSCoeffs(A.coloring[g], Lg.cDiag.data(), Lg.cUpper.data(), Lg.coarseLower());
             }
         }
     }
@@ -1784,6 +1841,7 @@ void amgGalerkin(
         A.coarseLUn = 0;
     }
     A.spectrumReady = false;
+    A.galerkinRun = true;
     static bool saDbgOnce = false;                             // report the SA coarse-operator health just once
     if (A.saSmooth && std::getenv("BRAE_AMG_DEBUG") && !saDbgOnce)   // diag sign + dominance + coarsest definiteness
     {

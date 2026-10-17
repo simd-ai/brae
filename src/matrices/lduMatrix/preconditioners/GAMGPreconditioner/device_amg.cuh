@@ -118,7 +118,8 @@ struct AMGLevel {
     DeviceBuffer<label>  cOwn, cNei, cOwnerStart, cLosort, cLosortStart;  // grid-(k+1) addressing (SpMV gather)
     unsigned long long   addressingId = 0;                      // of cOwn/cNei's content, see nextDeviceAddressingId
     DeviceBuffer<label>  faceRestrict, faceFlip;               // grid-k face -> grid-(k+1) face (>=0) / -1-coarseCell
-    DeviceBuffer<scalar> cDiag, cUpper, cLower;                // grid-(k+1) matrix (rebuilt by Galerkin)
+    // grid-(k+1) matrix (rebuilt by Galerkin); cLower is empty while the level has one off-diagonal (coarseLower)
+    DeviceBuffer<scalar> cDiag, cUpper, cLower;
     // DETERMINISTIC GALERKIN GATHER (see the note above galDiagGatherK in device_amg.cu).
     // The inverses of map/faceRestrict, as CSR lists over the COARSE entities. Agglomeration is static
     // for the life of the mesh, so these are built once on the host and reused by every solve; they let
@@ -165,8 +166,11 @@ struct AMGLevel {
     DeviceBuffer<scalar> Rterm;
     DeviceBuffer<float> RtermF;
     DeviceBuffer<scalar> rapTerm;
+    // ONE OFF-DIAGONAL FOR A SYMMETRIC MATRIX (amgGalerkin): an injection level coarsened only from fine matrices
+    // handed with one off-diagonal has no cLower, and every reader of the lower is handed cUpper -- the same bits.
+    const scalar* coarseLower() const { return cLower.size() > 0 ? cLower.data() : cUpper.data(); }
     DeviceLduView coarseView() const {
-        DeviceLduView v{nCoarse, nCoarseFaces, cDiag.data(), cUpper.data(), cLower.data(), cOwn.data(), cNei.data(),
+        DeviceLduView v{nCoarse, nCoarseFaces, cDiag.data(), cUpper.data(), coarseLower(), cOwn.data(), cNei.data(),
                         cOwnerStart.data(), cLosort.data(), cLosortStart.data()};
         v.addressingId = addressingId;
         return v;
@@ -334,6 +338,9 @@ struct AMGData {
     bool keptValid = false;
     bool fp32Current = false;
     bool fp32Stands = false;
+    // amgGalerkin has run on this hierarchy: a cycle captured since may hold its levels' coarse views
+    // (amgTakeCoarseLower)
+    bool galerkinRun = false;
     // FP-12: the FP32 SpMV's operand, per grid, as ONE contiguous row instead of two indirections.
     // csrRow[g] is nCells+1 offsets; csrCol[g] the column of each entry; csrVal[g] its FP32 value;
     // csrSrc[g] says where that value comes from in the FP64 face arrays (f for upper[f], -(f+1) for

@@ -116,10 +116,11 @@ AMGData cloneAMG(const AMGData& S)
         L.RtermF.resize(s.RtermF.size());
         L.rapTerm.resize(s.rapTerm.size());
         dcopy(L.rapStart, s.rapStart);
-        // the VALUES are Galerkin's at every solve; only their sizes are the structure's
+        // the VALUES are Galerkin's at every solve; only their sizes are the structure's -- and whether the level
+        // holds a lower off-diagonal of its own, as the source does (AMGLevel::coarseLower)
         L.cDiag.resize(s.nCoarse);
         L.cUpper.resize(s.nCoarseFaces);
-        L.cLower.resize(s.nCoarseFaces);
+        L.cLower.resize(s.cLower.size());
     }
     A.coloring.resize(S.coloring.size());
     for (std::size_t i = 0; i < S.coloring.size(); ++i)
@@ -278,8 +279,10 @@ AMGCacheRead readAMGCache(
                 && rbuf(f,L.rapSrcKind) && rbuf(f,L.rapSrcIdx) && rbuf(f,L.rapDstKind) && rbuf(f,L.rapDstIdx) && rbuf(f,L.rapW);
         if (!ok) break;
         L.cDiag.resize(L.nCoarse);
-        L.cUpper.resize(L.nCoarseFaces);
-        L.cLower.resize(L.nCoarseFaces);   // VALUES via Galerkin
+        L.cUpper.resize(L.nCoarseFaces);   // VALUES via Galerkin
+        // a smoothed level's RAP writes a lower of its own; an injection level takes one at the first Galerkin
+        // that needs it, as a built level does (amgTakeCoarseLower)
+        if (sa) L.cLower.resize(L.nCoarseFaces);
         // an addressing id of its own, as a built level takes (buildAMG): a loaded level's was left 0
         L.addressingId = nextDeviceAddressingId();
         // the smoothed hierarchy's fixed-order lists are not in the file either: derived from what is
