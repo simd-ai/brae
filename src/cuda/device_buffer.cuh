@@ -12,6 +12,8 @@
 #include <map>          // BRAE_POOL_STATS: allocation-size histogram
 #include <algorithm>    // sort, for the histogram report
 #include <unordered_map>
+#include <dlfcn.h>      // BRAE_POOL_STATS: the large-block ledger's frame offsets
+#include <execinfo.h>
 #include <cstdlib>
 #include <cstdio>
 
@@ -50,7 +52,8 @@ public:
     :
         enabled_(std::getenv("BRAE_NO_DEVICE_POOL") == nullptr),
         exact_(std::getenv("BRAE_CONTROL_POOL_EXACT") != nullptr),
-        short_(std::getenv("BRAE_CONTROL_POOL_SHORT_CLASS") != nullptr)
+        short_(std::getenv("BRAE_CONTROL_POOL_SHORT_CLASS") != nullptr),
+        stats_(std::getenv("BRAE_POOL_STATS") != nullptr)
     {
         const char* e = std::getenv("BRAE_POOL_KEEP_STEPS");
         const long asked = e ? std::atol(e) : 0;
@@ -109,6 +112,7 @@ public:
                 void* p = it->second.back().p;
                 it->second.pop_back();
                 heldBytes_ -= cls;
+                countTake(p, cls);
                 return p;
             }
         }
@@ -120,11 +124,18 @@ public:
         ++mallocs_;
         hist_[cls].first += cls;
         ++hist_[cls].second;
+        if (stats_) mallocByPhase_[phase_] += cls;
+        countTake(p, cls);
         return p;
     }
     void give(void* p, std::size_t bytes)
     {
         if (!p) return;
+        if (stats_)
+        {
+            liveBytes_ -= classOf(bytes);
+            bigLive_.erase(p);
+        }
         if (enabled_ && bytes)
         {
             const std::size_t cls = classOf(bytes);
@@ -135,6 +146,12 @@ public:
         {
             cudaFree(p);
         }
+    }
+    // BRAE_POOL_STATS=1: the part of the caller's loop that is running, for the report's attribution of the
+    // bytes cudaMalloc'ed and of the peak of the bytes in use. A string literal; nothing but the report reads it.
+    void phase(const char* name)
+    {
+        phase_ = name;
     }
     // A STEP OF THE CALLER'S LOOP HAS ENDED: a block that has sat idle for `keep` steps is handed back to the
     // driver. A step's own temporaries are taken and given at every step, so what stays idle that long is a size
@@ -208,6 +225,29 @@ public:
             "[pool] %-10s cudaMalloc %8.3f GB in %zu calls | idle in free list %8.3f GB "
             "(%zu distinct sizes, %zu blocks)\n",
             when, mallocBytes_/1073741824.0, mallocs_, heldBytes_/1073741824.0, sizes, blocks);
+        // The footprint is what the driver holds for the pool (what an out-of-memory is about); in use is what
+        // the buffers alive now span, and its peak is the most the run has needed at once. The footprint less
+        // the peak is what reuse leaves on the table: blocks idle in one size class while another class asked
+        // the driver for more. Idle since start-up: the classes no request has taken since the loop began.
+        std::size_t idleStartup = 0;
+        for (const auto& kv : free_)
+        {
+            const auto lt = lastTakePhase_.find(kv.first);
+            if (lt != lastTakePhase_.end() && std::string(lt->second) == "start-up")
+            {
+                idleStartup += kv.second.size()*kv.first;
+            }
+        }
+        std::fprintf(stderr,
+            "[pool] %-10s footprint %8.3f GB | in use %8.3f GB | peak in use %8.3f GB (in %s) | idle in classes "
+            "last taken at start-up %8.3f GB\n",
+            when, (mallocBytes_ - freedBytes_)/1073741824.0, liveBytes_/1073741824.0, peakLive_/1073741824.0,
+            peakPhase_, idleStartup/1073741824.0);
+        for (const auto& kv : mallocByPhase_)
+        {
+            std::fprintf(stderr, "[pool]   cudaMalloc in %-12s %8.3f GB | peak in use in it %8.3f GB\n", kv.first.c_str(),
+                         kv.second/1073741824.0, peakByPhase_.count(kv.first) ? peakByPhase_.at(kv.first)/1073741824.0 : 0.0);
+        }
         // The biggest consumers, by total bytes. Sizes are the attribution: a buffer is sized by what it
         // spans, so nCells*8 is a cell field, nFaces*8 a face field, and the tail of odd sizes is the
         // AMG hierarchy's coarse levels. Cheaper and more honest than guessing at call sites.
@@ -221,12 +261,63 @@ public:
                          v[i].second.first/1048576.0, v[i].second.second, v[i].first/1048576.0);
         }
     }
+    // BRAE_POOL_STATS=1: every live block of 64 MiB or more, with the phase of its last take and that take's
+    // call stack as offsets into the executable (resolve with addr2line -f -C -e <brae> <offset>...)
+    void reportLive(const char* when) const
+    {
+        if (!stats_) return;
+        std::fprintf(stderr, "[live] %s: %zu blocks of 64 MiB or more; at the peak in use %zu\n", when,
+                     bigLive_.size(), peakBig_.size());
+        printBig("now", bigLive_);
+        printBig("peak", peakBig_);
+    }
 private:
+    // a template so that it may precede Big's declaration below
+    template <typename BigMap>
+    static void printBig(const char* tag, const BigMap& m)
+    {
+        for (const auto& kv : m)
+        {
+            const auto& b = kv.second;
+            std::fprintf(stderr, "[live] %-4s %8.2f MB  %-12s", tag, b.cls/1048576.0, b.phase);
+            for (int i = 0; i < b.nFrames; ++i)
+            {
+                Dl_info info;
+                if (dladdr(b.frames[i], &info) && info.dli_fbase)
+                {
+                    std::fprintf(stderr, " %lx", static_cast<unsigned long>(
+                        reinterpret_cast<char*>(b.frames[i]) - reinterpret_cast<char*>(info.dli_fbase)));
+                }
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
     struct Idle
     {
         void*         p = nullptr;
         unsigned long step = 0;
     };
+    void countTake(void* p, std::size_t cls)
+    {
+        if (!stats_) return;
+        liveBytes_ += cls;
+        lastTakePhase_[cls] = phase_;
+        std::size_t& ph = peakByPhase_[phase_];
+        if (liveBytes_ > ph) ph = liveBytes_;
+        if (cls >= bigBytes)
+        {
+            Big& b = bigLive_[p];
+            b.cls = cls;
+            b.phase = phase_;
+            b.nFrames = backtrace(b.frames, 16);
+        }
+        if (liveBytes_ > peakLive_)
+        {
+            peakLive_ = liveBytes_;
+            peakPhase_ = phase_;
+            peakBig_ = bigLive_;
+        }
+    }
     std::unordered_map<std::size_t, std::vector<Idle>> free_;
     std::size_t mallocBytes_ = 0, heldBytes_ = 0, mallocs_ = 0;
     std::size_t frees_ = 0;
@@ -237,9 +328,30 @@ private:
     // steps a block may sit idle before it goes back to the driver (BRAE_POOL_KEEP_STEPS)
     unsigned long keep_ = 4;
     std::map<std::size_t, std::pair<std::size_t, std::size_t>> hist_;   // size -> {total bytes, count}
+    // BRAE_POOL_STATS only: the bytes in use and their peak, where they peaked, cudaMalloc by phase, and the
+    // phase of each size class's last take
+    std::size_t liveBytes_ = 0;
+    std::size_t peakLive_ = 0;
+    const char* phase_ = "start-up";
+    const char* peakPhase_ = "start-up";
+    std::map<std::string, std::size_t> mallocByPhase_;
+    std::map<std::string, std::size_t> peakByPhase_;   // the most in use while each phase ran
+    std::unordered_map<std::size_t, const char*> lastTakePhase_;
+    // every live block of 64 MiB or more: its class, the phase and the call stack of its last take
+    static constexpr std::size_t bigBytes = std::size_t(64) << 20;
+    struct Big
+    {
+        std::size_t cls = 0;
+        const char* phase = "";
+        void*       frames[16] = {};
+        int         nFrames = 0;
+    };
+    std::unordered_map<void*, Big> bigLive_;
+    std::unordered_map<void*, Big> peakBig_;   // bigLive_ at the moment of the peak in use
     bool enabled_;
     bool exact_;
     bool short_;
+    bool stats_;
 };
 inline DevicePool& devicePool() { static DevicePool* p = new DevicePool(); return *p; }   // intentionally leaked
 } // namespace detail

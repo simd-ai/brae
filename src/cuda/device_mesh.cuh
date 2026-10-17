@@ -39,7 +39,9 @@ struct DeviceMesh
     DeviceBuffer<label>  ownerStart, losort, losortStart;
     DeviceBuffer<label>  bndCell, bndGFace, bndPerm, bndCellStart;  // boundary-face gather
     DeviceBuffer<label>  bndIsEmpty;                                // 1 if the boundary face is on an empty patch
-    DeviceBuffer<scalar> dOwnX,dOwnY,dOwnZ, dNeiX,dNeiY,dNeiZ;      // internal face: Cf - C(owner) / Cf - C(neighbour) (linearUpwind)
+    // internal face centres and cell centres, which the face-to-cell offsets are formed from (FaceOffsets)
+    DeviceBuffer<scalar> Cfx, Cfy, Cfz;                             // internal face centres (nIf)
+    DeviceBuffer<scalar> Cx, Cy, Cz;                                // cell centres (nC)
     DeviceBuffer<scalar> dBndX,dBndY,dBndZ;                         // boundary face: Cf - C(faceCell) (cellLimited grad extrapolation)
     // leastSquaresVectors' inverted dd tensor, 6*nCells component-major, GEOMETRY ONLY (d vectors,
     // weights, |Sf|, the empty-patch skip) -- OpenFOAM builds it once per mesh as a MeshObject and so
@@ -56,6 +58,34 @@ struct DeviceMesh
     // is the implicit deltaCoeffs; corrVec = n - delta*nonOrthDc the explicit deferred-correction vector.
     DeviceBuffer<scalar> nonOrthDc, corrVecX, corrVecY, corrVecZ;   // per internal face
 };
+
+// The face-to-cell offsets of an internal face, Cf - C(owner) and Cf - C(neighbour), formed where a kernel
+// reads them (linearUpwind, the cell limiters, least squares) instead of stored per face. It is the one
+// subtraction of the same two doubles that buildDeviceMesh and the moving mesh's geometry kernel make, so
+// the same bits; and it holds three face and three cell scalars where the stored form held six face
+// scalars: 0.5 GB of boxy5's 17.5 GB at 4.94 M cells (BRAE_POOL_STATS census, 2026-10-17).
+struct FaceOffsets
+{
+    const scalar* Cfx;
+    const scalar* Cfy;
+    const scalar* Cfz;
+    const scalar* Cx;
+    const scalar* Cy;
+    const scalar* Cz;
+
+    // Cf[f] - C[cell], cell being f's owner or its neighbour
+    BRAE_HD vector of(
+        int f,
+        int cell) const
+    {
+        return vector{Cfx[f] - Cx[cell], Cfy[f] - Cy[cell], Cfz[f] - Cz[cell]};
+    }
+};
+
+inline FaceOffsets faceOffsets(const DeviceMesh& dm)
+{
+    return FaceOffsets{dm.Cfx.data(), dm.Cfy.data(), dm.Cfz.data(), dm.Cx.data(), dm.Cy.data(), dm.Cz.data()};
+}
 
 // cyclic (periodic) patches are SKIPPED in the boundary gather: they are not boundary faces. The periodic
 // coupling is applied as a SEPARATE interface (DeviceCyclic, device_cyclic.cuh) exactly like OpenFOAM's
@@ -108,7 +138,7 @@ inline DeviceMesh buildDeviceMesh(
 
     std::vector<label>  ownI(nIf), neiI(nIf);
     std::vector<scalar> wI(nIf), dcI(nIf), nodcI(nIf);
-    std::vector<scalar> dOwnX(nIf),dOwnY(nIf),dOwnZ(nIf), dNeiX(nIf),dNeiY(nIf),dNeiZ(nIf), corrX(nIf),corrY(nIf),corrZ(nIf);
+    std::vector<scalar> CfX(nIf), CfY(nIf), CfZ(nIf), corrX(nIf),corrY(nIf),corrZ(nIf);
     std::vector<scalar> SfxN, SfyN, SfzN, magSfN;          // Sf layout: [internal | non-cyclic boundary]
     SfxN.reserve(magSfAll.size());
     SfyN.reserve(magSfAll.size());
@@ -121,13 +151,9 @@ inline DeviceMesh buildDeviceMesh(
         wI[f]=wts[f];
         dcI[f]=dcAll[f];
         nodcI[f]=nodcAll[f];
-        const vector dO=Cf[f]-C[own[f]], dN=Cf[f]-C[nei[f]];
-        dOwnX[f]=dO.x;
-        dOwnY[f]=dO.y;
-        dOwnZ[f]=dO.z;
-        dNeiX[f]=dN.x;
-        dNeiY[f]=dN.y;
-        dNeiZ[f]=dN.z;
+        CfX[f]=Cf[f].x;
+        CfY[f]=Cf[f].y;
+        CfZ[f]=Cf[f].z;
         corrX[f]=cvAll[f].x;
         corrY[f]=cvAll[f].y;
         corrZ[f]=cvAll[f].z;
@@ -208,12 +234,21 @@ inline DeviceMesh buildDeviceMesh(
     dm.bndPerm.copyFrom(bndPerm);
     dm.bndCellStart.copyFrom(bndCellStart);
     dm.bndIsEmpty.copyFrom(bndIsEmpty);
-    dm.dOwnX.copyFrom(dOwnX);
-    dm.dOwnY.copyFrom(dOwnY);
-    dm.dOwnZ.copyFrom(dOwnZ);
-    dm.dNeiX.copyFrom(dNeiX);
-    dm.dNeiY.copyFrom(dNeiY);
-    dm.dNeiZ.copyFrom(dNeiZ);
+    dm.Cfx.copyFrom(CfX);
+    dm.Cfy.copyFrom(CfY);
+    dm.Cfz.copyFrom(CfZ);
+    {
+        std::vector<scalar> CX(nC), CY(nC), CZ(nC);
+        for (int c = 0; c < nC; ++c)
+        {
+            CX[c] = C[c].x;
+            CY[c] = C[c].y;
+            CZ[c] = C[c].z;
+        }
+        dm.Cx.copyFrom(CX);
+        dm.Cy.copyFrom(CY);
+        dm.Cz.copyFrom(CZ);
+    }
     dm.dBndX.copyFrom(dBndX);
     dm.dBndY.copyFrom(dBndY);
     dm.dBndZ.copyFrom(dBndZ);
@@ -250,13 +285,13 @@ inline void refreshDeviceMeshGeometry(
     dm.corrVecX  = std::move(fresh.corrVecX);
     dm.corrVecY  = std::move(fresh.corrVecY);
     dm.corrVecZ  = std::move(fresh.corrVecZ);
-    // face-to-cell offsets: functions of faceCentres and cellCentres, both cleared by clearGeom
-    dm.dOwnX = std::move(fresh.dOwnX); dm.dOwnY = std::move(fresh.dOwnY); dm.dOwnZ = std::move(fresh.dOwnZ);
-    dm.dNeiX = std::move(fresh.dNeiX); dm.dNeiY = std::move(fresh.dNeiY); dm.dNeiZ = std::move(fresh.dNeiZ);
+    // faceCentres and cellCentres, both cleared by clearGeom, and the boundary offsets made from them
+    dm.Cfx = std::move(fresh.Cfx); dm.Cfy = std::move(fresh.Cfy); dm.Cfz = std::move(fresh.Cfz);
+    dm.Cx = std::move(fresh.Cx); dm.Cy = std::move(fresh.Cy); dm.Cz = std::move(fresh.Cz);
     dm.dBndX = std::move(fresh.dBndX); dm.dBndY = std::move(fresh.dBndY); dm.dBndZ = std::move(fresh.dBndZ);
     // leastSquaresVectors is a MeshObject with MoveableMeshObject semantics: a move invalidates it
     // (leastSquaresVectors.C movePoints -> calcLeastSquaresVectors). Every input of the cached tensor
-    // -- w, magSf, Sf, dOwn, dNei, dBnd -- has just been replaced above, so dropping it here is what
+    // -- w, magSf, Sf, Cf, C, dBnd -- has just been replaced above, so dropping it here is what
     // keeps the cache from serving a pre-move fit on a moving mesh (FP-3).
     dm.lsqInvDd.resize(0);
     // owner/nei, ownerStart/losort/losortStart, bnd* and addressingId deliberately NOT touched:
@@ -377,6 +412,12 @@ void deviceCellLimitGradFused(const DeviceMesh& dm, int n,
 void deviceLaplacianCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& gammafInt,
                            DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& upper, DeviceBuffer<scalar>& lower,
                            bool nonOrth = false);
+// The same matrix holding its off-diagonal once: a laplacian's lower is its upper bit for bit, so a caller
+// whose matrix nothing makes asymmetric afterwards hands `upper` to every reader as the lower too. One
+// face scalar saved: 208 MB on boxy5's 4.94 M cells (BRAE_POOL_STATS census, 2026-10-17).
+void deviceLaplacianCoeffsSymmetric(const DeviceMesh& dm, const DeviceBuffer<scalar>& gammafInt,
+                                    DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& upper,
+                                    bool nonOrth = false);
 // Explicit non-orth correction of fvm::laplacian(gamma, vf): returns lapCorrSource = -V*fvc::div(faceFluxCorr),
 // faceFluxCorr_f = gamma_f*|Sf|_f * (corrVec_f . grad(vf)_f) with grad linearly interpolated to the face.
 // This equals fvm::laplacian(gamma,vf).source()'s correction term (OF gaussLaplacianScheme). gx/gy/gz = cell grad(vf).

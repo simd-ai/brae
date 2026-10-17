@@ -64,8 +64,7 @@ void desFaceCorrKernel(
     const scalar* __restrict__ phi, const scalar* __restrict__ w, const scalar* __restrict__ sigma,
     const scalar* __restrict__ field, const scalar* __restrict__ gx, const scalar* __restrict__ gy,
     const scalar* __restrict__ gz,
-    const scalar* __restrict__ dOwnX, const scalar* __restrict__ dOwnY, const scalar* __restrict__ dOwnZ,
-    const scalar* __restrict__ dNeiX, const scalar* __restrict__ dNeiY, const scalar* __restrict__ dNeiZ,
+    FaceOffsets fo,
     scalar* __restrict__ fc)
 {
     const int f = blockIdx.x * blockDim.x + threadIdx.x;
@@ -78,9 +77,10 @@ void desFaceCorrKernel(
     const scalar lin  = (w[f] - pos0) * (field[o] - field[n]);
 
     const int up = (pf >= 0) ? o : n;
-    const scalar dx = (pf >= 0) ? dOwnX[f] : dNeiX[f];
-    const scalar dy = (pf >= 0) ? dOwnY[f] : dNeiY[f];
-    const scalar dz = (pf >= 0) ? dOwnZ[f] : dNeiZ[f];
+    const vector d = fo.of(f, up);
+    const scalar dx = d.x;
+    const scalar dy = d.y;
+    const scalar dz = d.z;
     const scalar lu = gx[up]*dx + gy[up]*dy + gz[up]*dz;
 
     fc[f] = (scalar(1) - bf)*lin + bf*lu;
@@ -129,8 +129,7 @@ void deviceDesHybridCorr(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiIn
     if (nIf > 0)
         desFaceCorrKernel<<<nBlocks(nIf), TPB>>>(nIf, dm.owner.data(), dm.nei.data(), phiInt.data(),
             dm.w.data(), sigma.data(), field.data(), gx.data(), gy.data(), gz.data(),
-            dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
-            dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(), fc.data());
+            faceOffsets(dm), fc.data());
     desDivKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.ownerStart.data(), dm.losort.data(),
         dm.losortStart.data(), phiInt.data(), fc.data(), corr.data());
     cudaCheck(cudaGetLastError(), "desHybridCorr");

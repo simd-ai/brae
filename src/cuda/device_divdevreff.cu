@@ -398,6 +398,12 @@ DevReffWorkspace& devReffWorkspace(const DeviceMesh& dm)
 }
 }   // namespace
 
+void deviceDivDevReffRelease(const DeviceMesh& dm)
+{
+    // every buffer's block goes back to the pool as the empty workspace is moved over it
+    devReffWorkspace(dm) = DevReffWorkspace();
+}
+
 void deviceDivDevReff(
     const DeviceMesh& dm,
     const DeviceVectorBoundary& dbU,

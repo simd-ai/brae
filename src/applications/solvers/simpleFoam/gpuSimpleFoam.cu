@@ -778,10 +778,20 @@ int main(int argc, char** argv)
         const auto _runStart = std::chrono::high_resolution_clock::now();          // for OpenFOAM-style ExecutionTime
         double _cumCont = 0.0;                                                     // cumulative continuity error (OF continuityErrs.H)
         time.setSteps(static_cast<int>(nSteps));
+        // BRAE_POOL_STATS=1: the device pool after start-up, after the first iterations and every 25th -- its
+        // footprint, the bytes in use and their peak, and which phase asked the driver for what
+        detail::devicePool().report("start-up");
         while (!converged && time.loop())
         {
             iter = time.timeIndex();
             const DeviceSimpleResidual r = solver.step();
+            detail::devicePool().phase("output");
+            if (iter <= 3 || iter == 5 || iter == 10 || iter % 25 == 0)
+            {
+                const std::string when = "iter " + std::to_string(iter);
+                detail::devicePool().report(when.c_str());
+                if (iter == 2) detail::devicePool().reportLive(when.c_str());
+            }
             {
                 // OpenFOAM-style per-iteration report: Time, per-field solver residuals, continuity, turbulence, ExecutionTime.
                 const double _et = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - _runStart).count();
@@ -943,6 +953,7 @@ int main(int argc, char** argv)
             }
         }
         time.end();   // OF Time.C:790-802: a final execute() so the last step is seen, then end()
+        detail::devicePool().report("loop end");
         // timeIndex() is the iteration that ran, so no -1: the for-loop this replaced incremented past it.
         const int nIter = converged ? time.timeIndex() : static_cast<int>(nSteps);
         std::printf(converged ? "SIMPLE solution converged in %d iterations\n"

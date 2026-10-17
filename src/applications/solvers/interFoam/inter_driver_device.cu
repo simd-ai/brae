@@ -6157,12 +6157,12 @@ RunReport runInterFoamDevice(
                         same("corrVecX", dm.corrVecX, fresh.corrVecX);
                         same("corrVecY", dm.corrVecY, fresh.corrVecY);
                         same("corrVecZ", dm.corrVecZ, fresh.corrVecZ);
-                        same("dOwnX", dm.dOwnX, fresh.dOwnX);
-                        same("dOwnY", dm.dOwnY, fresh.dOwnY);
-                        same("dOwnZ", dm.dOwnZ, fresh.dOwnZ);
-                        same("dNeiX", dm.dNeiX, fresh.dNeiX);
-                        same("dNeiY", dm.dNeiY, fresh.dNeiY);
-                        same("dNeiZ", dm.dNeiZ, fresh.dNeiZ);
+                        same("Cfx", dm.Cfx, fresh.Cfx);
+                        same("Cfy", dm.Cfy, fresh.Cfy);
+                        same("Cfz", dm.Cfz, fresh.Cfz);
+                        same("Cx", dm.Cx, fresh.Cx);
+                        same("Cy", dm.Cy, fresh.Cy);
+                        same("Cz", dm.Cz, fresh.Cz);
                         same("dBndX", dm.dBndX, fresh.dBndX);
                         same("dBndY", dm.dBndY, fresh.dBndY);
                         same("dBndZ", dm.dBndZ, fresh.dBndZ);

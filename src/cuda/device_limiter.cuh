@@ -46,15 +46,15 @@ __device__ __forceinline__ scalar limiterOfR(
     return limiter;
 }
 
+// d is the face's two offsets subtracted, (Cf - C[P]) - (Cf - C[N]): C[N]-C[P] as the stored offsets gave it
 __device__ __forceinline__ scalar limitedFaceWeight(
-    int f, int P, int N, scalar p, scalar cdwF,
+    int P, int N, scalar p, scalar cdwF,
     const scalar* __restrict__ field,
     const scalar* __restrict__ gx, const scalar* __restrict__ gy, const scalar* __restrict__ gz,
-    const scalar* __restrict__ dOwnX, const scalar* __restrict__ dOwnY, const scalar* __restrict__ dOwnZ,
-    const scalar* __restrict__ dNeiX, const scalar* __restrict__ dNeiY, const scalar* __restrict__ dNeiZ,
+    const vector& d,
     scalar twoByk)
 {
-    const scalar dx = dOwnX[f] - dNeiX[f], dy = dOwnY[f] - dNeiY[f], dz = dOwnZ[f] - dNeiZ[f];   // d = C[N]-C[P]
+    const scalar dx = d.x, dy = d.y, dz = d.z;
     // NVDTVD::r, upwind-cell gradient (strict phi>0) projected on d, vs the face gradient.
     const int U = (p > 0.0) ? P : N;
     const scalar gradcf = dx*gx[U] + dy*gy[U] + dz*gz[U];

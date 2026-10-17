@@ -104,14 +104,15 @@ BRAE_HD inline vector lsqBndDelta(
 __global__
 void lsqInvDdKernel(
     int nC,
+    const label* __restrict__ own,
+    const label* __restrict__ nei,
     const label* __restrict__ ownerStart,
     const label* __restrict__ losort,
     const label* __restrict__ losortStart,
     const scalar* __restrict__ w,
     const scalar* __restrict__ magSf,
     const scalar* __restrict__ Sfx, const scalar* __restrict__ Sfy, const scalar* __restrict__ Sfz,
-    const scalar* __restrict__ dOwnX, const scalar* __restrict__ dOwnY, const scalar* __restrict__ dOwnZ,
-    const scalar* __restrict__ dNeiX, const scalar* __restrict__ dNeiY, const scalar* __restrict__ dNeiZ,
+    FaceOffsets fo,
     const label* __restrict__ bndCellStart,
     const label* __restrict__ bndPerm,
     const label* __restrict__ bndIsEmpty,
@@ -135,13 +136,13 @@ void lsqInvDdKernel(
     symmTensor dd{0, 0, 0, 0, 0, 0};
     for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)
     {
-        const vector d{dOwnX[f] - dNeiX[f], dOwnY[f] - dNeiY[f], dOwnZ[f] - dNeiZ[f]};
+        const vector d = fo.of(f, c) - fo.of(f, nei[f]);
         dd = dd + ((1.0 - w[f]) * (magSf[f] / magSqr(d))) * sqr(d);
     }
     for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
     {
         const int f = losort[k];
-        const vector d{dOwnX[f] - dNeiX[f], dOwnY[f] - dNeiY[f], dOwnZ[f] - dNeiZ[f]};
+        const vector d = fo.of(f, own[f]) - fo.of(f, c);
         dd = dd + (w[f] * (magSf[f] / magSqr(d))) * sqr(d);
     }
     for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)
@@ -177,8 +178,7 @@ void lsqGradKernel(
     const scalar* __restrict__ w,
     const scalar* __restrict__ magSf,
     const scalar* __restrict__ Sfx, const scalar* __restrict__ Sfy, const scalar* __restrict__ Sfz,
-    const scalar* __restrict__ dOwnX, const scalar* __restrict__ dOwnY, const scalar* __restrict__ dOwnZ,
-    const scalar* __restrict__ dNeiX, const scalar* __restrict__ dNeiY, const scalar* __restrict__ dNeiZ,
+    FaceOffsets fo,
     const scalar* __restrict__ vf,
     const label* __restrict__ bndCellStart,
     const label* __restrict__ bndPerm,
@@ -206,14 +206,14 @@ void lsqGradKernel(
     vector s{0, 0, 0};
     for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)
     {
-        const vector d{dOwnX[f] - dNeiX[f], dOwnY[f] - dNeiY[f], dOwnZ[f] - dNeiZ[f]};
+        const vector d = fo.of(f, c) - fo.of(f, nei[f]);
         const scalar msd = magSf[f] / magSqr(d);
         s += ((1.0 - w[f]) * msd * (vf[nei[f]] - vc)) * (iv & d);
     }
     for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
     {
         const int f = losort[k];
-        const vector d{dOwnX[f] - dNeiX[f], dOwnY[f] - dNeiY[f], dOwnZ[f] - dNeiZ[f]};
+        const vector d = fo.of(f, own[f]) - fo.of(f, c);
         const scalar msd = magSf[f] / magSqr(d);
         // grad[nei] -= nVectors*dvf with nVectors = -w*msd*(invDd[nei] & d) and dvf = vf[nei] - vf[own]
         s += (w[f] * msd * (vc - vf[own[f]])) * (iv & d);
@@ -372,8 +372,7 @@ void lsqGradFusedKernel(
     const scalar* __restrict__ w,
     const scalar* __restrict__ magSf,
     const scalar* __restrict__ Sfx, const scalar* __restrict__ Sfy, const scalar* __restrict__ Sfz,
-    const scalar* __restrict__ dOwnX, const scalar* __restrict__ dOwnY, const scalar* __restrict__ dOwnZ,
-    const scalar* __restrict__ dNeiX, const scalar* __restrict__ dNeiY, const scalar* __restrict__ dNeiZ,
+    FaceOffsets fo,
     const label* __restrict__ bndCellStart,
     const label* __restrict__ bndPerm,
     const label* __restrict__ bndIsEmpty,
@@ -396,9 +395,9 @@ void lsqGradFusedKernel(
     }
     for (int f = ownerStart[c]; f < ownerStart[c + 1]; ++f)
     {
-        const vector d{dOwnX[f] - dNeiX[f], dOwnY[f] - dNeiY[f], dOwnZ[f] - dNeiZ[f]};
-        const scalar msd = magSf[f] / magSqr(d);
         const label n = nei[f];
+        const vector d = fo.of(f, c) - fo.of(f, n);
+        const scalar msd = magSf[f] / magSqr(d);
 #pragma unroll
         for (int i = 0; i < N; ++i)
         {
@@ -408,9 +407,9 @@ void lsqGradFusedKernel(
     for (int k = losortStart[c]; k < losortStart[c + 1]; ++k)
     {
         const int f = losort[k];
-        const vector d{dOwnX[f] - dNeiX[f], dOwnY[f] - dNeiY[f], dOwnZ[f] - dNeiZ[f]};
-        const scalar msd = magSf[f] / magSqr(d);
         const label o = own[f];
+        const vector d = fo.of(f, o) - fo.of(f, c);
+        const scalar msd = magSf[f] / magSqr(d);
 #pragma unroll
         for (int i = 0; i < N; ++i)
         {
@@ -462,8 +461,7 @@ void launchLsqFused(
         nC, dm.owner.data(), dm.nei.data(), dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
         dm.w.data(), dm.magSf.data(),
         dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
-        dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
-        dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
+        faceOffsets(dm),
         dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), dm.bndGFace.data(),
         dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), lsqInvDdFor(dm), fld);
     cudaCheck(cudaGetLastError(), "lsqGradFused");
@@ -494,10 +492,9 @@ const scalar* lsqInvDdFor(const DeviceMesh& dm, const DeviceCyclic* cyc)
     }
     dm.lsqInvDd.resize(want);
     lsqInvDdKernel<<<nBlocks(nC), TPB>>>(
-        nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), dm.w.data(), dm.magSf.data(),
+        nC, dm.owner.data(), dm.nei.data(), dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), dm.w.data(), dm.magSf.data(),
         dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
-        dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
-        dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
+        faceOffsets(dm),
         dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), dm.bndGFace.data(),
         dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(),
         cycN ? cyc->ifCellStart.data() : nullptr, cycN ? cyc->ifPerm.data() : nullptr,
@@ -524,8 +521,7 @@ void deviceLeastSquaresGrad(const DeviceMesh& dm, const DeviceBuffer<scalar>& vo
         nC, dm.owner.data(), dm.nei.data(), dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
         dm.w.data(), dm.magSf.data(),
         dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
-        dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
-        dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(), vol.data(),
+        faceOffsets(dm), vol.data(),
         dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(), dm.bndGFace.data(),
         dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), bval.data(), lsqInvDdFor(dm, cyc),
         cycN ? cyc->ifCellStart.data() : nullptr, cycN ? cyc->ifPerm.data() : nullptr,
@@ -860,12 +856,7 @@ void cellLimitGradKernel(
     const label* __restrict__ bndCellStart,
     const label* __restrict__ bndPerm,
     const label* __restrict__ bndIsEmpty,
-    const scalar* __restrict__ dOwnX,
-    const scalar* __restrict__ dOwnY,
-    const scalar* __restrict__ dOwnZ,
-    const scalar* __restrict__ dNeiX,
-    const scalar* __restrict__ dNeiY,
-    const scalar* __restrict__ dNeiZ,
+    FaceOffsets fo,
     const scalar* __restrict__ dBndX,
     const scalar* __restrict__ dBndY,
     const scalar* __restrict__ dBndZ,
@@ -924,11 +915,15 @@ void cellLimitGradKernel(
     const scalar gcx = gx[c], gcy = gy[c], gcz = gz[c];
     scalar lim = 1.0;
     for (int f = ownerStart[c]; f < ownerStart[c+1]; ++f)
-        lim = fmin(lim, limFace(maxD, minD, dOwnX[f]*gcx + dOwnY[f]*gcy + dOwnZ[f]*gcz));
+    {
+        const vector a = fo.of(f, c);
+        lim = fmin(lim, limFace(maxD, minD, a.x*gcx + a.y*gcy + a.z*gcz));
+    }
     for (int j = losortStart[c]; j < losortStart[c+1]; ++j)
     {
         const int f = losort[j];
-        lim = fmin(lim, limFace(maxD, minD, dNeiX[f]*gcx + dNeiY[f]*gcy + dNeiZ[f]*gcz));
+        const vector a = fo.of(f, c);
+        lim = fmin(lim, limFace(maxD, minD, a.x*gcx + a.y*gcy + a.z*gcz));
     }
     for (int j = bndCellStart[c]; j < bndCellStart[c+1]; ++j)
     {
@@ -1037,8 +1032,7 @@ void cellLimitFactorKernel(
     const label* __restrict__ bndCellStart,
     const label* __restrict__ bndPerm,
     const label* __restrict__ bndIsEmpty,
-    const scalar* __restrict__ dOwnX, const scalar* __restrict__ dOwnY, const scalar* __restrict__ dOwnZ,
-    const scalar* __restrict__ dNeiX, const scalar* __restrict__ dNeiY, const scalar* __restrict__ dNeiZ,
+    FaceOffsets fo,
     const scalar* __restrict__ dBndX, const scalar* __restrict__ dBndY, const scalar* __restrict__ dBndZ,
     const scalar* __restrict__ maxD, const scalar* __restrict__ minD,
     const scalar* __restrict__ gx, const scalar* __restrict__ gy, const scalar* __restrict__ gz,
@@ -1049,9 +1043,16 @@ void cellLimitFactorKernel(
     const scalar gcx = gx[c], gcy = gy[c], gcz = gz[c], mx = maxD[c], mn = minD[c];
     scalar l = 1.0;
     for (int f = ownerStart[c]; f < ownerStart[c+1]; ++f)
-        l = fmin(l, limFace(mx, mn, dOwnX[f]*gcx + dOwnY[f]*gcy + dOwnZ[f]*gcz));
+    {
+        const vector a = fo.of(f, c);
+        l = fmin(l, limFace(mx, mn, a.x*gcx + a.y*gcy + a.z*gcz));
+    }
     for (int j = losortStart[c]; j < losortStart[c+1]; ++j)
-    { const int f = losort[j]; l = fmin(l, limFace(mx, mn, dNeiX[f]*gcx + dNeiY[f]*gcy + dNeiZ[f]*gcz)); }
+    {
+        const int f = losort[j];
+        const vector a = fo.of(f, c);
+        l = fmin(l, limFace(mx, mn, a.x*gcx + a.y*gcy + a.z*gcz));
+    }
     // ...and here the skip is load-bearing rather than tidy: Cf - C on an empty face points out of the
     // 2D plane, so this extrapolate is round-off and the ratio against maxDelta can clamp the limiter far
     // below what any real face asks for (cellLimitedGrad_cpp.cu:111-116).
@@ -1145,8 +1146,7 @@ void cellLimitGradFusedKernel(
     const label* __restrict__ bndCellStart,
     const label* __restrict__ bndPerm,
     const label* __restrict__ bndIsEmpty,
-    const scalar* __restrict__ dOwnX, const scalar* __restrict__ dOwnY, const scalar* __restrict__ dOwnZ,
-    const scalar* __restrict__ dNeiX, const scalar* __restrict__ dNeiY, const scalar* __restrict__ dNeiZ,
+    FaceOffsets fo,
     const scalar* __restrict__ dBndX, const scalar* __restrict__ dBndY, const scalar* __restrict__ dBndZ,
     LimitFusedFields<N> fld)
 {
@@ -1218,7 +1218,8 @@ void cellLimitGradFusedKernel(
     }
     for (int f = ownerStart[c]; f < ownerStart[c+1]; ++f)
     {
-        const scalar ax = dOwnX[f], ay = dOwnY[f], az = dOwnZ[f];
+        const vector a = fo.of(f, c);
+        const scalar ax = a.x, ay = a.y, az = a.z;
 #pragma unroll
         for (int i = 0; i < N; ++i)
             lim[i] = fmin(lim[i], limFace(maxD[i], minD[i], ax*gcx[i] + ay*gcy[i] + az*gcz[i]));
@@ -1226,7 +1227,8 @@ void cellLimitGradFusedKernel(
     for (int j = losortStart[c]; j < losortStart[c+1]; ++j)
     {
         const int f = losort[j];
-        const scalar ax = dNeiX[f], ay = dNeiY[f], az = dNeiZ[f];
+        const vector a = fo.of(f, c);
+        const scalar ax = a.x, ay = a.y, az = a.z;
 #pragma unroll
         for (int i = 0; i < N; ++i)
             lim[i] = fmin(lim[i], limFace(maxD[i], minD[i], ax*gcx[i] + ay*gcy[i] + az*gcz[i]));
@@ -1271,7 +1273,7 @@ void launchLimitFused(
     cellLimitGradFusedKernel<N><<<nBlocks(dm.nCells), TPB>>>(dm.nCells, k,
         dm.ownerStart.data(), dm.nei.data(), dm.losort.data(), dm.losortStart.data(), dm.owner.data(),
         dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(),
-        dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(), dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
+        faceOffsets(dm),
         dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), fld);
     cudaCheck(cudaGetLastError(), "cellLimitGradFused");
 }
@@ -1341,7 +1343,7 @@ void deviceCellLimitGrad(
         cellLimitFactorKernel<<<nBlocks(nC), TPB>>>(nC,
             dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
             dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(),
-            dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(), dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
+            faceOffsets(dm),
             dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), maxD.data(), minD.data(),
             gx.data(), gy.data(), gz.data(), lim.data());
         for (int i = 0; i < nIfs; ++i)
@@ -1356,7 +1358,7 @@ void deviceCellLimitGrad(
     cellLimitGradKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, k, U.data(), Ubnd.data(),
         dm.ownerStart.data(), dm.nei.data(), dm.losort.data(), dm.losortStart.data(), dm.owner.data(),
         dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(),
-        dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(), dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
+        faceOffsets(dm),
         dm.dBndX.data(), dm.dBndY.data(), dm.dBndZ.data(), gx.data(), gy.data(), gz.data());
     cudaCheck(cudaGetLastError(), "cellLimitGrad");
 }

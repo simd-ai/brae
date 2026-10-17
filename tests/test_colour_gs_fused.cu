@@ -874,16 +874,19 @@ int main()
     // entries are, in order, the losort faces of the cell (coefficient lower, neighbour the face's
     // owner) then its owned faces (coefficient upper, neighbour the face's neighbour), read off the
     // device's OWN losort/ownerStart so the summation-order claim is checked rather than asserted;
-    // and A x through the layout equals deviceAmul on the natural layout for a random x.
+    // and A x through the layout equals deviceAmul on the natural layout for a random x. The layout
+    // stores no face or side per entry -- the solve's coefficient gather reads them off the matrix's
+    // addressing -- so the side is checked on what that gather wrote: a solve of this ASYMMETRIC
+    // matrix, and every entry's coefficient bit for bit the one its face and side name.
     {
-        std::vector<label> cells, rowStart, nbr, face;
-        std::vector<unsigned char> isUpper;
+        std::vector<label> cells, rowStart, nbr;
+        std::vector<scalar> coeff;
         const std::vector<label>& newIndex = col.newIndex;
         col.cells.copyTo(cells);
         col.rowStart.copyTo(rowStart);
         col.nbr.copyTo(nbr);
-        col.face.copyTo(face);
-        col.isUpper.copyTo(isUpper);
+        runDevice(dm, U, L, std3, nfStd, col, pa);
+        col.coeff.copyTo(coeff);
         bool bijection = (int)cells.size() == A.nC && (int)newIndex.size() == A.nC
                       && col.startH.front() == 0 && col.startH.back() == A.nC;
         std::vector<int> seen((std::size_t)A.nC, 0);
@@ -901,7 +904,7 @@ int main()
         check(ascending, "(i) each colour's cells are in ascending original index");
 
         bool rows = (int)rowStart.size() == A.nC + 1 && rowStart[0] == 0 && (int)rowStart.back() == 2*A.nIf
-                 && nbr.size() == (std::size_t)2*A.nIf && face.size() == nbr.size() && isUpper.size() == nbr.size();
+                 && nbr.size() == (std::size_t)2*A.nIf && coeff.size() == nbr.size();
         for (label i = 0; i < A.nC && rows; ++i)
         {
             const label c = cells[(std::size_t)i];
@@ -909,17 +912,17 @@ int main()
             for (label j = A.losortStart[(std::size_t)c]; j < A.losortStart[(std::size_t)c + 1] && rows; ++j, ++e)
             {
                 const label f = A.losort[(std::size_t)j];
-                rows = e < (std::size_t)rowStart[(std::size_t)i + 1] && face[e] == f && isUpper[e] == 0
+                rows = e < (std::size_t)rowStart[(std::size_t)i + 1] && coeff[e] == A.lower[(std::size_t)f]
                     && nbr[e] == newIndex[(std::size_t)A.owner[(std::size_t)f]];
             }
             for (label f = A.ownerStart[(std::size_t)c]; f < A.ownerStart[(std::size_t)c + 1] && rows; ++f, ++e)
             {
-                rows = e < (std::size_t)rowStart[(std::size_t)i + 1] && face[e] == f && isUpper[e] == 1
+                rows = e < (std::size_t)rowStart[(std::size_t)i + 1] && coeff[e] == A.upper[(std::size_t)f]
                     && nbr[e] == newIndex[(std::size_t)A.nei[(std::size_t)f]];
             }
             if (rows) rows = e == (std::size_t)rowStart[(std::size_t)i + 1];
         }
-        check(rows, "(i) every row's entries are the device's losort faces then its owned faces, in that order, with the right side of each");
+        check(rows, "(i) every row's entries are the device's losort faces then its owned faces, in that order, each with its face's neighbour and its side's coefficient (lower, then upper)");
 
         std::mt19937 rng(20260907u);
         std::uniform_real_distribution<scalar> uni(-1.0, 1.0);

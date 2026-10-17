@@ -769,7 +769,8 @@ private:
     RhoSimpleControls rc_{};
     DeviceThermo th_{};
     DeviceBoundary dbHe_{};
-    DeviceBuffer<scalar> pD_, pU_, pL_, diagCp_, bp_;            // persistent pressure matrix (graph-stable addresses)
+    DeviceBuffer<scalar> pD_, pU_, pL_, diagCp_, bp_;            // persistent pressure matrix (graph-stable addresses);
+                                                                 // pL_ is filled only where it can differ from pU_ (transonic)
     DeviceBuffer<label>  bndIsWall_, adjustMask_;              // wall mask (true boundary nut); adjustPhi adjustable mask
     // kEpsilon: 1 on boundary faces whose 0/nut BC is 'calculated'. OF fills those by field assignment
     // (Cmu*k_b^2/eps_b) rather than extrapolating the cell, and the two differ by >12x at a fixed-k inlet.

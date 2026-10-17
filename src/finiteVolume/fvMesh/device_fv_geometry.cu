@@ -1,5 +1,6 @@
 #include "device_fv_geometry.cuh"
 #include "inter_phase_time.cuh"
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -433,43 +434,44 @@ void deviceFvGeometry(
 
 namespace {
 
-// the internal faces' share of the device mesh: the face-to-cell offsets and the correction vectors by component
+// the internal faces' and the cells' share of the device mesh: the face and cell centres the face-to-cell
+// offsets are formed from (FaceOffsets), and the correction vectors, by component. One thread a face and a cell.
 __global__
 void geoMeshInternalKernel(
     label nIf,
-    const label* own,
-    const label* nei,
+    label nC,
     const scalar* Cf,
     const scalar* C,
     const scalar* nonOrthCorr,
-    scalar* dOwnX,
-    scalar* dOwnY,
-    scalar* dOwnZ,
-    scalar* dNeiX,
-    scalar* dNeiY,
-    scalar* dNeiZ,
+    scalar* Cfx,
+    scalar* Cfy,
+    scalar* Cfz,
+    scalar* Cx,
+    scalar* Cy,
+    scalar* Cz,
     scalar* corrX,
     scalar* corrY,
     scalar* corrZ)
 {
-    const label f = blockIdx.x*blockDim.x + threadIdx.x;
-    if (f >= nIf)
+    const label i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < nIf)
     {
-        return;
+        const GeoVec fc = geoAt(Cf, i);
+        const GeoVec cv = geoAt(nonOrthCorr, i);
+        Cfx[i] = fc.x;
+        Cfy[i] = fc.y;
+        Cfz[i] = fc.z;
+        corrX[i] = cv.x;
+        corrY[i] = cv.y;
+        corrZ[i] = cv.z;
     }
-    const GeoVec fc = geoAt(Cf, f);
-    const GeoVec dO = geoSub(fc, geoAt(C, own[f]));
-    const GeoVec dN = geoSub(fc, geoAt(C, nei[f]));
-    const GeoVec cv = geoAt(nonOrthCorr, f);
-    dOwnX[f] = dO.x;
-    dOwnY[f] = dO.y;
-    dOwnZ[f] = dO.z;
-    dNeiX[f] = dN.x;
-    dNeiY[f] = dN.y;
-    dNeiZ[f] = dN.z;
-    corrX[f] = cv.x;
-    corrY[f] = cv.y;
-    corrZ[f] = cv.z;
+    if (i < nC)
+    {
+        const GeoVec cc = geoAt(C, i);
+        Cx[i] = cc.x;
+        Cy[i] = cc.y;
+        Cz[i] = cc.z;
+    }
 }
 
 // Sf and |Sf| in the device mesh's layout: the internal faces, then its boundary slots
@@ -559,8 +561,8 @@ bool refreshDeviceMeshFromDeviceGeometry(
         w.bndFaceAddressing = dm.addressingId;
     }
     if (dm.w.size() != sIf || dm.dc.size() != sIf || dm.nonOrthDc.size() != sIf || dm.V.size() != sC
-     || dm.Sfx.size() != sIf + sB || dm.magSf.size() != sIf + sB || dm.dOwnX.size() != sIf
-     || dm.dBndX.size() != sB || dm.corrVecX.size() != sIf)
+     || dm.Sfx.size() != sIf + sB || dm.magSf.size() != sIf + sB || dm.Cfx.size() != sIf
+     || dm.Cx.size() != sC || dm.dBndX.size() != sB || dm.corrVecX.size() != sIf)
     {
         return false;
     }
@@ -578,24 +580,23 @@ bool refreshDeviceMeshFromDeviceGeometry(
     copy(dm.w, w.weights, sIf);
     copy(dm.dc, w.deltaCoeffs, sIf);
     copy(dm.nonOrthDc, w.nonOrthDeltaCoeffs, sIf);
-    // BRAE_CONTROL_DEVICE_MESH_STALE_OFFSETS=1 leaves the internal faces' offsets and correction vectors as the
-    // last mesh's -- the identity gate's control
+    // BRAE_CONTROL_DEVICE_MESH_STALE_OFFSETS=1 leaves the internal faces' offsets (the face and cell centres
+    // they are formed from) and correction vectors as the last mesh's -- the identity gate's control
     static const bool staleOffsets = std::getenv("BRAE_CONTROL_DEVICE_MESH_STALE_OFFSETS") != nullptr;
-    if (nIf > 0 && !staleOffsets)
+    if ((nIf > 0 || sC > 0) && !staleOffsets)
     {
-        geoMeshInternalKernel<<<geoBlocks(nIf), geoTPB, 0, cudaStreamPerThread>>>(
+        geoMeshInternalKernel<<<geoBlocks(std::max(nIf, static_cast<label>(dm.nCells))), geoTPB, 0, cudaStreamPerThread>>>(
             nIf,
-            dm.owner.data(),
-            dm.nei.data(),
+            dm.nCells,
             w.Cf.data(),
             w.C.data(),
             w.nonOrthCorr.data(),
-            dm.dOwnX.data(),
-            dm.dOwnY.data(),
-            dm.dOwnZ.data(),
-            dm.dNeiX.data(),
-            dm.dNeiY.data(),
-            dm.dNeiZ.data(),
+            dm.Cfx.data(),
+            dm.Cfy.data(),
+            dm.Cfz.data(),
+            dm.Cx.data(),
+            dm.Cy.data(),
+            dm.Cz.data(),
             dm.corrVecX.data(),
             dm.corrVecY.data(),
             dm.corrVecZ.data());

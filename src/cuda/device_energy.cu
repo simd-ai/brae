@@ -191,12 +191,7 @@ void kineticFaceFluxK(
     const scalar* __restrict__ gx,
     const scalar* __restrict__ gy,
     const scalar* __restrict__ gz,
-    const scalar* __restrict__ dOwnX,
-    const scalar* __restrict__ dOwnY,
-    const scalar* __restrict__ dOwnZ,
-    const scalar* __restrict__ dNeiX,
-    const scalar* __restrict__ dNeiY,
-    const scalar* __restrict__ dNeiZ,
+    FaceOffsets fo,
     scalar twoByk,
     scalar* __restrict__ ffc)
 {
@@ -210,16 +205,18 @@ void kineticFaceFluxK(
         // OF's EEqn carries this term as fvc::div (fully EXPLICIT), so linearUpwind is simply a different
         // face value -- no deferred-correction split is needed, unlike the implicit div(phi,he).
         const int Uc = (ph > scalar(0)) ? P : N;
-        const scalar dxu = (Uc == P) ? dOwnX[f] : dNeiX[f];
-        const scalar dyu = (Uc == P) ? dOwnY[f] : dNeiY[f];
-        const scalar dzu = (Uc == P) ? dOwnZ[f] : dNeiZ[f];
+        const vector du = fo.of(f, Uc);
+        const scalar dxu = du.x;
+        const scalar dyu = du.y;
+        const scalar dzu = du.z;
         ffc[f] = ph * (K[Uc] + dxu*gx[Uc] + dyu*gy[Uc] + dzu*gz[Uc]);
         return;
     }
     scalar W = pos0;
     if (cdw)
     {
-        const scalar dx = dOwnX[f] - dNeiX[f], dy = dOwnY[f] - dNeiY[f], dz = dOwnZ[f] - dNeiZ[f];
+        const vector d = fo.of(f, P) - fo.of(f, N);
+        const scalar dx = d.x, dy = d.y, dz = d.z;
         const int U = (ph > scalar(0)) ? P : N;
         const scalar gradcf = dx*gx[U] + dy*gy[U] + dz*gz[U];
         const scalar gradf  = K[N] - K[P];
@@ -341,8 +338,7 @@ void deviceEnergyKineticSource(
                                            (limited || linearUpwind) ? gx.data() : nullptr,
                                            (limited || linearUpwind) ? gy.data() : nullptr,
                                            (limited || linearUpwind) ? gz.data() : nullptr,
-                                           dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
-                                           dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
+                                           faceOffsets(dm),
                                            twoByk, ffc.data());
     cudaCheck(cudaGetLastError(), "kineticFaceFlux");
     // deviceFaceDivSource returns MINUS V*div (it exists for the laplacian non-orth correction, which

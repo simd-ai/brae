@@ -28,7 +28,11 @@ void lapFaceKernel(
     {
         const scalar c = dc[f] * gammaf[f] * magSf[f];
         upper[f] = c;
-        lower[f] = c;
+        // null for deviceLaplacianCoeffsSymmetric: the same product, written once
+        if (lower != nullptr)
+        {
+            lower[f] = c;
+        }
     }
 }
 
@@ -127,19 +131,14 @@ void limitedFaceWeightsKernel(
     const scalar* __restrict__ gx,
     const scalar* __restrict__ gy,
     const scalar* __restrict__ gz,
-    const scalar* __restrict__ dOwnX,
-    const scalar* __restrict__ dOwnY,
-    const scalar* __restrict__ dOwnZ,
-    const scalar* __restrict__ dNeiX,
-    const scalar* __restrict__ dNeiY,
-    const scalar* __restrict__ dNeiZ,
+    FaceOffsets fo,
     scalar twoByk,
     scalar* __restrict__ w)
 {
     const int f = blockIdx.x * blockDim.x + threadIdx.x;
     if (f >= nIf) return;
-    w[f] = limitedFaceWeight(f, own[f], nei[f], phi[f], cdw[f], field, gx, gy, gz,
-                             dOwnX, dOwnY, dOwnZ, dNeiX, dNeiY, dNeiZ, twoByk);
+    const int P = own[f], N = nei[f];
+    w[f] = limitedFaceWeight(P, N, phi[f], cdw[f], field, gx, gy, gz, fo.of(f, P) - fo.of(f, N), twoByk);
 }
 
 
@@ -154,12 +153,7 @@ void divLimitedFaceKernel(
     const scalar* __restrict__ gx,
     const scalar* __restrict__ gy,
     const scalar* __restrict__ gz,
-    const scalar* __restrict__ dOwnX,
-    const scalar* __restrict__ dOwnY,
-    const scalar* __restrict__ dOwnZ,
-    const scalar* __restrict__ dNeiX,
-    const scalar* __restrict__ dNeiY,
-    const scalar* __restrict__ dNeiZ,
+    FaceOffsets fo,
     scalar twoByk,
     scalar* __restrict__ upper,
     scalar* __restrict__ lower)
@@ -169,8 +163,7 @@ void divLimitedFaceKernel(
 
     const int P = own[f], N = nei[f];
     const scalar p = phi[f];
-    const scalar W = limitedFaceWeight(f, P, N, p, cdw[f], field, gx, gy, gz,
-                                       dOwnX, dOwnY, dOwnZ, dNeiX, dNeiY, dNeiZ, twoByk);
+    const scalar W = limitedFaceWeight(P, N, p, cdw[f], field, gx, gy, gz, fo.of(f, P) - fo.of(f, N), twoByk);
     const scalar lo = -W * p;
     lower[f] = lo;
     upper[f] = lo + p;
@@ -201,12 +194,7 @@ void divLimitedVFaceKernel(
     const scalar* __restrict__ gU2x,
     const scalar* __restrict__ gU2y,
     const scalar* __restrict__ gU2z,
-    const scalar* __restrict__ dOwnX,
-    const scalar* __restrict__ dOwnY,
-    const scalar* __restrict__ dOwnZ,
-    const scalar* __restrict__ dNeiX,
-    const scalar* __restrict__ dNeiY,
-    const scalar* __restrict__ dNeiZ,
+    FaceOffsets fo,
     scalar twoByk,
     scalar* __restrict__ upper,
     scalar* __restrict__ lower)
@@ -216,7 +204,8 @@ void divLimitedVFaceKernel(
 
     const int P = own[f], N = nei[f];
     const scalar p = phi[f];
-    const scalar dx = dOwnX[f] - dNeiX[f], dy = dOwnY[f] - dNeiY[f], dz = dOwnZ[f] - dNeiZ[f];   // d = C[N]-C[P]
+    const vector d = fo.of(f, P) - fo.of(f, N);                                // d = C[N]-C[P]
+    const scalar dx = d.x, dy = d.y, dz = d.z;
     const scalar g0 = U0[N] - U0[P], g1 = U1[N] - U1[P], g2 = U2[N] - U2[P];   // gradfV = U[N]-U[P]
     const scalar gradf = g0*g0 + g1*g1 + g2*g2;                                // gradfV . gradfV
     const int U = (p > 0.0) ? P : N;                                          // strict upwind cell
@@ -326,6 +315,25 @@ void deviceLaplacianCoeffs(
     lapFaceKernel<<<nBlocks(nIf), TPB>>>(nIf, dcPtr, gammafInt.data(), dm.magSf.data(), upper.data(), lower.data());
     cudaCheck(cudaGetLastError(), "lapFace");
     diagGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), upper.data(), lower.data(), diag.data());
+    cudaCheck(cudaGetLastError(), "diagGather");
+}
+
+
+void deviceLaplacianCoeffsSymmetric(
+    const DeviceMesh& dm,
+    const DeviceBuffer<scalar>& gammafInt,
+    DeviceBuffer<scalar>& diag,
+    DeviceBuffer<scalar>& upper,
+    bool nonOrth)
+{
+    const int nIf = dm.nInternalFaces, nC = dm.nCells;
+    upper.resize(nIf);
+    diag.resize(nC);
+    const scalar* dcPtr = nonOrth ? dm.nonOrthDc.data() : dm.dc.data();
+    lapFaceKernel<<<nBlocks(nIf), TPB>>>(nIf, dcPtr, gammafInt.data(), dm.magSf.data(), upper.data(), nullptr);
+    cudaCheck(cudaGetLastError(), "lapFace");
+    // upper as the lower too: the values deviceLaplacianCoeffs would have gathered, read from one copy
+    diagGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), upper.data(), upper.data(), diag.data());
     cudaCheck(cudaGetLastError(), "diagGather");
 }
 
@@ -644,8 +652,7 @@ void deviceDivLimitedCoeffs(
     diag.resize(nC);
     divLimitedFaceKernel<<<nBlocks(nIf), TPB>>>(nIf, dm.owner.data(), dm.nei.data(), dm.w.data(), phiInt.data(), field.data(),
                                                 gx.data(), gy.data(), gz.data(),
-                                                dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
-                                                dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
+                                                faceOffsets(dm),
                                                 twoByk, upper.data(), lower.data());
     cudaCheck(cudaGetLastError(), "divLimitedFace");
     diagGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), upper.data(), lower.data(), diag.data());
@@ -684,8 +691,7 @@ void deviceLimitedFaceWeights(
     limitedFaceWeightsKernel<<<nBlocks(nIf), TPB>>>(nIf, dm.owner.data(), dm.nei.data(), dm.w.data(),
                                                     phiInt.data(), field.data(),
                                                     gx.data(), gy.data(), gz.data(),
-                                                    dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
-                                                    dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
+                                                    faceOffsets(dm),
                                                     twoByk, w.data());
     cudaCheck(cudaGetLastError(), "limitedFaceWeights");
 }
@@ -712,8 +718,7 @@ void deviceDivLimitedVCoeffs(
                                                  gUx[0].data(), gUy[0].data(), gUz[0].data(),
                                                  gUx[1].data(), gUy[1].data(), gUz[1].data(),
                                                  gUx[2].data(), gUy[2].data(), gUz[2].data(),
-                                                 dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
-                                                 dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
+                                                 faceOffsets(dm),
                                                  twoByk, upper.data(), lower.data());
     cudaCheck(cudaGetLastError(), "divLimitedVFace");
     diagGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), upper.data(), lower.data(), diag.data());
@@ -745,8 +750,7 @@ void deviceDivLimitedVCoeffs(
                                                  g + 0*nC, g + 3*nC, g + 6*nC,     // d(U_0)/d{x,y,z}
                                                  g + 1*nC, g + 4*nC, g + 7*nC,     // d(U_1)/d{x,y,z}
                                                  g + 2*nC, g + 5*nC, g + 8*nC,     // d(U_2)/d{x,y,z}
-                                                 dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(),
-                                                 dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
+                                                 faceOffsets(dm),
                                                  twoByk, upper.data(), lower.data());
     cudaCheck(cudaGetLastError(), "divLimitedVFacePacked");
     diagGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(), upper.data(), lower.data(), diag.data());

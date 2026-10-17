@@ -201,15 +201,14 @@ struct DeviceCellColouring
     std::vector<label> newIndex;
     std::vector<label> startH;
     // The rows as a CSR over NEW cells: row i's entries are [rowStart[i], rowStart[i+1]); entry e
-    // names the neighbour's NEW index (nbr), the ORIGINAL face the coefficient comes from (face) and
-    // whether row i's cell owns that face (isUpper 1: the coefficient is upper[face]) or neighbours
-    // it (isUpper 0: lower[face]). Per row the entries are in GaussSeidelSmoother's order -- the
-    // neighboured faces in losort order, then the owned faces in face order -- so the summation
-    // order, and with it every bit of the result, is the host reference's.
+    // names the neighbour's NEW index (nbr). Per row the entries are in GaussSeidelSmoother's order --
+    // the neighboured faces in losort order (coefficient lower[face]), then the owned faces in face
+    // order (upper[face]) -- so the summation order, and with it every bit of the result, is the host
+    // reference's. That order is also why the face and its side are not stored: the coefficient gather
+    // reads them off the matrix's own ownerStart/losort, 2 x nInternalFaces labels and flags fewer
+    // (0.27 GB of boxy5's footprint at 4.94 M cells, BRAE_POOL_STATS census, 2026-10-17).
     DeviceBuffer<label> rowStart;
     DeviceBuffer<label> nbr;
-    DeviceBuffer<label> face;
-    DeviceBuffer<unsigned char> isUpper;
     // The mesh addressing the colouring was first swept with (see above). Mutable because the solver
     // records it through its const reference on the first solve.
     mutable bool meshRecorded = false;

@@ -83,6 +83,11 @@ void deviceDivDevReff(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                       // carries whatever the scheme did). Null forms it here, as every other caller does.
                       const DeviceBuffer<scalar>* gradUGiven = nullptr,
                       const DeviceBuffer<scalar>* gradBGiven = nullptr);
+// Hands the stress term's persistent temporaries (two 9*nCells tensors among them) back to the pool until
+// the next call re-takes them. They persist so that a CAPTURED assembly replays on stable addresses
+// (DevReffWorkspace, device_divdevreff.cu), so only a caller that captures none may call this between
+// its assemblies -- the steady simpleFoam step does, before its turbulence phase.
+void deviceDivDevReffRelease(const DeviceMesh& dm);
 
 // Exported for the Maxwell model and for generalizedNewtonian's strainRate -- see the definitions in
 // device_divdevreff.cu. UbStored: U's STORED boundary values, one buffer per component, for a caller that

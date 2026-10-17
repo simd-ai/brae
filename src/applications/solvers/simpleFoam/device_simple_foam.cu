@@ -2892,6 +2892,11 @@ bool simpleColourSwapControl()
         // pFinal, the earlier passes being intermediate solves of the same corrector. Restored on the way
         // out so the steady caller, which never sets it, is unaffected.
         const bool finalInnerCorrector = ctl_.finalInner;
+        // Only the transonic div(phid,p) below makes the matrix asymmetric. Every other pressure matrix keeps
+        // its off-diagonal once and hands pU_ to every reader as the lower: one face scalar, 208 MB of a
+        // 17.5 GB footprint on boxy5's 4.94 M cells (BRAE_POOL_STATS census, 2026-10-17).
+        const bool pSymmetric = !(compressible_ && ctl_.transonic);
+        const DeviceBuffer<scalar>& pLower = pSymmetric ? pU_ : pL_;
         for (int nonOrthPass = 0; nonOrthPass < nPass; ++nonOrthPass)
         {
             ctl_.finalInner = finalInnerCorrector && (nonOrthPass == nPass - 1);
@@ -2903,7 +2908,14 @@ bool simpleColourSwapControl()
                 if (hasCyclic_) interfaceAddGrad(cyc_, dp_, dm.V, gx, gy, gz);
                 if (hasAMI_)    interfaceAddGrad(ami_, dp_, dm.V, gx, gy, gz);
             }
-            deviceLaplacianCoeffs(dm, rAUf, pD_, pU_, pL_, ctl_.nonOrth || ctl_.nonOrthCoeffs);
+            if (pSymmetric)
+            {
+                deviceLaplacianCoeffsSymmetric(dm, rAUf, pD_, pU_, ctl_.nonOrth || ctl_.nonOrthCoeffs);
+            }
+            else
+            {
+                deviceLaplacianCoeffs(dm, rAUf, pD_, pU_, pL_, ctl_.nonOrth || ctl_.nonOrthCoeffs);
+            }
             // OF: `- fvm::laplacian(rhorAtU, p)` with `rhorAtU = rho*rAtU` (pcEqn.H:13), and an fvMatrix's
             // internalCoeffs/boundaryCoeffs are built from the SAME diffusivity as its internal
             // coefficients. brae passed the unweighted rAtU here while the internal coefficients used
@@ -2979,7 +2991,7 @@ bool simpleColourSwapControl()
                 DeviceBuffer<scalar>& dTerm = pRelaxSrc_;
                 deviceCopy(negD, pD_);   deviceScale(negD, -1.0);
                 deviceCopy(negIC, pIC);  deviceScale(negIC, -1.0);
-                deviceRelaxDiag(deviceLduView(dm, negD, pU_, pL_), dm, negIC, ctl_.relaxPEqn, rdM, deltaM);
+                deviceRelaxDiag(deviceLduView(dm, negD, pU_, pLower), dm, negIC, ctl_.relaxPEqn, rdM, deltaM);
                 deviceScale(rdM, -1.0);        // back to brae's orientation
                 deviceScale(deltaM, -1.0);
                 deviceHadamard(dTerm, deltaM, dp_);
@@ -3080,13 +3092,13 @@ bool simpleColourSwapControl()
                 // interface's off-diagonal out of the matrix while its diagonal and flux stayed in.
                 const DeviceLduView pvc =
                     (hasCyclic_ && hasAMI_)
-                    ? deviceLduViewCyclicAmi(dm,diagCp_,pU_,pL_,
+                    ? deviceLduViewCyclicAmi(dm,diagCp_,pU_,pLower,
                                              cyc_.n, cyc_.ownCell.data(), cyc_.nbrCell.data(), cyc_.ifCoeff.data(),
                                              ami_.n, ami_.ownCell.data(), ami_.off.data(), ami_.nbrCell.data(),
                                              ami_.weight.data(), ami_.ifCoeff.data())
                     : hasCyclic_
-                    ? deviceLduViewCyclic(dm,diagCp_,pU_,pL_, cyc_.n, cyc_.ownCell.data(), cyc_.nbrCell.data(), cyc_.ifCoeff.data())
-                    : deviceLduViewAmi(dm,diagCp_,pU_,pL_, ami_.n, ami_.ownCell.data(), ami_.off.data(), ami_.nbrCell.data(), ami_.weight.data(), ami_.ifCoeff.data());
+                    ? deviceLduViewCyclic(dm,diagCp_,pU_,pLower, cyc_.n, cyc_.ownCell.data(), cyc_.nbrCell.data(), cyc_.ifCoeff.data())
+                    : deviceLduViewAmi(dm,diagCp_,pU_,pLower, ami_.n, ami_.ownCell.data(), ami_.off.data(), ami_.nbrCell.data(), ami_.weight.data(), ami_.ifCoeff.data());
                 const scalar nfp = deviceNormFactor(pvc, dp_, bp_, ones_);
                 // A NON-CONFORMING AMI makes this operator non-self-adjoint (see the constructor), and CG
                 // requires symmetry. Conforming interfaces -- every plain cyclic, and an AMI whose two
@@ -3107,7 +3119,7 @@ bool simpleColourSwapControl()
                     amgFineLower_.resize(nE);
                     amgFineCoeffKernel<<<nBlocks(nE), TPB>>>(
                         (int)nIf_, (int)nAmgCycEdges_, (int)nAmgAmiEdges_,
-                        pU_.data(), pL_.data(),
+                        pU_.data(), pLower.data(),
                         hasCyclic_ ? cyc_.ifCoeff.data() : nullptr,
                         hasAMI_    ? ami_.ifCoeff.data() : nullptr,
                         nAmgAmiEdges_ ? amgIfAmiSrc_.data() : nullptr,
@@ -3132,15 +3144,15 @@ bool simpleColourSwapControl()
                 // step burns the full 3000-iteration cap, which is how this first showed up (squareBend
                 // stalled before printing iteration 1). BiCGStab handles the asymmetry; it is the same
                 // solver brae already uses for every asymmetric scalar transport.
-                const DeviceLduView pv = deviceLduView(dm, diagCp_, pU_, pL_);
+                const DeviceLduView pv = deviceLduView(dm, diagCp_, pU_, pLower);
                 const scalar nfp = deviceNormFactor(pv, dp_, bp_, ones_);
                 pp = deviceJacobiBiCGStab(pv, bp_, dp_, nfp, ctl_.pTol(), ctl_.pRelTol(), ctl_.pMaxIter(), ctl_.pcgCheckEvery, ctl_.pMinIter());
             }
             else
             {
-                const scalar nfp = deviceNormFactor(deviceLduView(dm,diagCp_,pU_,pL_), dp_, bp_, ones_);
-                amgGalerkin(amg_, diagCp_, pU_, pL_);                                      // re-coarsen the pressure matrix
-                pp = deviceAMGPCG(deviceLduView(dm,diagCp_,pU_,pL_), amg_, bp_, dp_, nfp, ctl_.pTol(), ctl_.pRelTol(), ctl_.pMaxIter(), ctl_.useGraph, ctl_.pcgCheckEvery, ctl_.corrScaling, ctl_.pMinIter());
+                const scalar nfp = deviceNormFactor(deviceLduView(dm,diagCp_,pU_,pLower), dp_, bp_, ones_);
+                amgGalerkin(amg_, diagCp_, pU_, pLower);                                    // re-coarsen the pressure matrix
+                pp = deviceAMGPCG(deviceLduView(dm,diagCp_,pU_,pLower), amg_, bp_, dp_, nfp, ctl_.pTol(), ctl_.pRelTol(), ctl_.pMaxIter(), ctl_.useGraph, ctl_.pcgCheckEvery, ctl_.corrScaling, ctl_.pMinIter());
             }
             if (nonOrthPass == 0) pp0 = pp;   // SIMPLE residualControl uses the FIRST pass's initial residual (OF convention)
         }
@@ -3150,7 +3162,7 @@ bool simpleColourSwapControl()
         res.pIters = pp.nIterations;
         if (std::getenv("BRAE_SOLVER_DEBUG")) std::printf("    p %s iters=%d  init=%.2e final=%.2e\n",
                                                         (hasCyclic_||hasAMI_) ? (amiNonConforming_ ? "Jacobi-BiCGStab (non-conforming AMI)" : "Jacobi-PCG") : ((compressible_ && ctl_.transonic) ? "Jacobi-BiCGStab" : "AMG-PCG"), pp.nIterations, pp.initialResidual, pp.finalResidual);
-        const DeviceLduView pview = deviceLduView(dm,diagCp_,pU_,pL_);
+        const DeviceLduView pview = deviceLduView(dm,diagCp_,pU_,pLower);
         DeviceBuffer<scalar> pfi;
         deviceMatrixFluxInternal(pview, dp_, pfi);
         deviceCopy(phiInt_, phiHi);
@@ -3338,12 +3350,25 @@ bool simpleColourSwapControl()
             phaseT0 = t;
             return ms;
         };
+        // BRAE_POOL_STATS=1 attributes the device pool's growth and peak to these phases
+        detail::devicePool().phase("momentum");
         solveMomentumPredictor(res);
         const double msU = phaseTime ? phaseMs() : 0.0;
+        detail::devicePool().phase("pressure");
         correctPressureVelocity(res);
         const double msP = phaseTime ? phaseMs() : 0.0;
 
+        // The momentum matrix's off-diagonals and the stress term's workspace are dead from here to the
+        // next assembly (H() and SIMPLEC's row sum, their last readers, are in the pressure phase), and this
+        // driver captures neither phase in a graph. Back in the pool, they serve the turbulence phase's own
+        // temporaries, whose peak was the iteration's: 0.4 GB above the momentum phase's on boxy5's 4.94 M
+        // cells (BRAE_POOL_STATS census, 2026-10-17).
+        mUp.resize(0);
+        mLo.resize(0);
+        deviceDivDevReffRelease(dm);
+        detail::devicePool().phase("turbulence");
         correctTurbulence();
+        detail::devicePool().phase("continuity");
         if (phaseTime)
         {
             const double msT = phaseMs();

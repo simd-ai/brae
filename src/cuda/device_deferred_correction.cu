@@ -27,12 +27,7 @@ void linearUpwindCorrKernel(
     const scalar* __restrict__ gx,
     const scalar* __restrict__ gy,
     const scalar* __restrict__ gz,
-    const scalar* __restrict__ dOwnX,
-    const scalar* __restrict__ dOwnY,
-    const scalar* __restrict__ dOwnZ,
-    const scalar* __restrict__ dNeiX,
-    const scalar* __restrict__ dNeiY,
-    const scalar* __restrict__ dNeiZ,
+    FaceOffsets fo,
     scalar* __restrict__ corrSource)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
@@ -59,9 +54,10 @@ void linearUpwindCorrKernel(
         const scalar pf = phi[face];
         const bool fromOwner = (pf > 0);
         const int up = fromOwner ? own[face] : nei[face];
-        const scalar dx = fromOwner ? dOwnX[face] : dNeiX[face];
-        const scalar dy = fromOwner ? dOwnY[face] : dNeiY[face];
-        const scalar dz = fromOwner ? dOwnZ[face] : dNeiZ[face];
+        const vector d = fo.of(face, up);
+        const scalar dx = d.x;
+        const scalar dy = d.y;
+        const scalar dz = d.z;
         const scalar dot = fma(dz, gz[up], fma(dx, gx[up], dy * gy[up]));
         if (owned)
         {
@@ -87,7 +83,7 @@ void deviceLinearUpwindCorr(
     corrSource.resize(dm.nCells);
     linearUpwindCorrKernel<<<nBlocks(dm.nCells), TPB>>>(dm.nCells, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
         dm.owner.data(), dm.nei.data(), phiInt.data(), gx.data(), gy.data(), gz.data(),
-        dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(), dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(), corrSource.data());
+        faceOffsets(dm), corrSource.data());
     cudaCheck(cudaGetLastError(), "linearUpwindCorr");
 }
 
@@ -103,12 +99,7 @@ void linearUpwindVFaceKernel(
     const label* __restrict__ nei,
     const scalar* __restrict__ phi,
     const scalar* __restrict__ w,
-    const scalar* __restrict__ dOwnX,
-    const scalar* __restrict__ dOwnY,
-    const scalar* __restrict__ dOwnZ,
-    const scalar* __restrict__ dNeiX,
-    const scalar* __restrict__ dNeiY,
-    const scalar* __restrict__ dNeiZ,
+    FaceOffsets fo,
     const scalar* __restrict__ g0x,
     const scalar* __restrict__ g0y,
     const scalar* __restrict__ g0z,
@@ -131,7 +122,8 @@ void linearUpwindVFaceKernel(
     const bool pos = (pf >= 0.0);
     const int o = own[f], n = nei[f];
     const int up = pos ? o : n;
-    const scalar dx = pos ? dOwnX[f] : dNeiX[f], dy = pos ? dOwnY[f] : dNeiY[f], dz = pos ? dOwnZ[f] : dNeiZ[f];
+    const vector d = fo.of(f, up);                                                    // Cf - C_up
+    const scalar dx = d.x, dy = d.y, dz = d.z;
     scalar cx = g0x[up]*dx + g0y[up]*dy + g0z[up]*dz;                                 // (Cf-C_up).grad(U_i)_up
     scalar cy = g1x[up]*dx + g1y[up]*dy + g1z[up]*dz;
     scalar cz = g2x[up]*dx + g2y[up]*dy + g2z[up]*dz;
@@ -200,7 +192,7 @@ void deviceLinearUpwindVCorr(
     const int nIf = dm.nInternalFaces;
     DeviceBuffer<scalar> fcX(nIf), fcY(nIf), fcZ(nIf);
     linearUpwindVFaceKernel<<<nBlocks(nIf), TPB>>>(nIf, dm.owner.data(), dm.nei.data(), phiInt.data(), dm.w.data(),
-        dm.dOwnX.data(), dm.dOwnY.data(), dm.dOwnZ.data(), dm.dNeiX.data(), dm.dNeiY.data(), dm.dNeiZ.data(),
+        faceOffsets(dm),
         gUx[0].data(), gUy[0].data(), gUz[0].data(), gUx[1].data(), gUy[1].data(), gUz[1].data(),
         gUx[2].data(), gUy[2].data(), gUz[2].data(), U0.data(), U1.data(), U2.data(),
         fcX.data(), fcY.data(), fcZ.data());

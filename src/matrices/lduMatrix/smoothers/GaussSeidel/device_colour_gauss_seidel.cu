@@ -131,21 +131,36 @@ void scatterKernel(
     }
 }
 
-// The per-entry coefficient: upper[face] where the row's cell owns the face, lower[face] where it is
-// the neighbour. The only per-solve cost that scales with faces (2 x nInternalFaces x 8 B written).
+// The per-entry coefficients, a row a thread: the row's cell's neighboured faces in losort order take
+// lower[face], then its owned faces in face order take upper[face] -- the order the layout's rows were
+// built in, read off the matrix's own addressing. The only per-solve cost that scales with faces
+// (2 x nInternalFaces x 8 B written).
 __global__
 void coeffKernel(
-    int nE,
-    const label* __restrict__ face,
-    const unsigned char* __restrict__ isUpper,
+    int nRows,
+    const label* __restrict__ cells,
+    const label* __restrict__ rowStart,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ losort,
+    const label* __restrict__ losortStart,
     const scalar* __restrict__ upper,
     const scalar* __restrict__ lower,
     scalar* __restrict__ coeff)
 {
-    const int e = blockIdx.x*blockDim.x + threadIdx.x;
-    if (e >= nE) return;
-    const label f = face[e];
-    coeff[e] = isUpper[e] ? upper[f] : lower[f];
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nRows) return;
+    const label c = cells[i];
+    label e = rowStart[i];
+    for (label j = losortStart[c]; j < losortStart[c + 1]; ++j)
+    {
+        coeff[e] = lower[losort[j]];
+        ++e;
+    }
+    for (label f = ownerStart[c]; f < ownerStart[c + 1]; ++f)
+    {
+        coeff[e] = upper[f];
+        ++e;
+    }
 }
 
 // One row's residual from its accumulator acc = b - sum_j a_j psi_j (the row's entries in order)
@@ -610,12 +625,18 @@ void launchCoeff(
     const DeviceCellColouring& col,
     scalar* coeff)
 {
-    const int nE = 2*col.nInternalFaces;
-    if (nE == 0) return;
-    coeffKernel<<<nBlk(nE), TPB_COLOUR, 0, cudaStreamPerThread>>>(
-        nE,
-        col.face.data(),
-        col.isUpper.data(),
+    if (col.nInternalFaces == 0) return;
+    if (!A.ownerStart || !A.losort || !A.losortStart)
+    {
+        refuse("the matrix view carries no ownerStart/losort, which the coefficient gather reads each row's faces from");
+    }
+    coeffKernel<<<nBlk(col.nCells), TPB_COLOUR, 0, cudaStreamPerThread>>>(
+        col.nCells,
+        col.cells.data(),
+        col.rowStart.data(),
+        A.ownerStart,
+        A.losort,
+        A.losortStart,
         A.upper,
         A.lower,
         coeff);
@@ -916,7 +937,7 @@ void validateLayout(
     const bool ranges = (int)col.startH.size() == col.nColours + 1
                      && !col.startH.empty() && col.startH.front() == 0 && col.startH.back() == col.nCells;
     const bool arrays = col.cells.size() == nC && col.newIndex.size() == nC && col.rowStart.size() == nC + 1
-                     && col.nbr.size() == nE && col.face.size() == nE && col.isUpper.size() == nE;
+                     && col.nbr.size() == nE;
     if (!ranges || !arrays)
     {
         refuse("colouring arrays are inconsistent with its nColours/nCells/nInternalFaces");
@@ -1149,8 +1170,7 @@ DeviceCellColouring buildDeviceCellColouringFromClasses(
         rowStart[(std::size_t)i + 1] = rowStart[(std::size_t)i] + nLo + nOwn;
     }
     const std::size_t nE = 2*(std::size_t)nF;
-    std::vector<label> nbr(nE), face(nE);
-    std::vector<unsigned char> isUpper(nE);
+    std::vector<label> nbr(nE);
     for (label i = 0; i < nCells; ++i)
     {
         const label c = cells[(std::size_t)i];
@@ -1159,15 +1179,11 @@ DeviceCellColouring buildDeviceCellColouringFromClasses(
         {
             const label f = losort[(std::size_t)j];
             nbr[e] = newIndex[(std::size_t)ownerInternal[(std::size_t)f]];
-            face[e] = f;
-            isUpper[e] = 0;
             ++e;
         }
         for (label f = ownerStart[(std::size_t)c]; f < ownerStart[(std::size_t)c + 1]; ++f)
         {
             nbr[e] = newIndex[(std::size_t)neiInternal[(std::size_t)f]];
-            face[e] = f;
-            isUpper[e] = 1;
             ++e;
         }
     }
@@ -1181,8 +1197,6 @@ DeviceCellColouring buildDeviceCellColouringFromClasses(
     col.startH = colourStart;
     col.rowStart.copyFrom(rowStart);
     col.nbr.copyFrom(nbr);
-    col.face.copyFrom(face);
-    col.isUpper.copyFrom(isUpper);
     col.valid = true;
     return col;
 }

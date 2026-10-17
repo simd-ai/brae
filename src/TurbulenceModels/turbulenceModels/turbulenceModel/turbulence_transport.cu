@@ -184,12 +184,29 @@ void assembleScalarTransport(
             // route, and a face where the limiter sits on its clamp turns a round-off difference in d
             // into a whole scheme.
             sc.dump->scalars(sc.dump->ctx, "AsmCd",    dm.w.host());
-            sc.dump->scalars(sc.dump->ctx, "AsmDOwnX", dm.dOwnX.host());
-            sc.dump->scalars(sc.dump->ctx, "AsmDOwnY", dm.dOwnY.host());
-            sc.dump->scalars(sc.dump->ctx, "AsmDOwnZ", dm.dOwnZ.host());
-            sc.dump->scalars(sc.dump->ctx, "AsmDNeiX", dm.dNeiX.host());
-            sc.dump->scalars(sc.dump->ctx, "AsmDNeiY", dm.dNeiY.host());
-            sc.dump->scalars(sc.dump->ctx, "AsmDNeiZ", dm.dNeiZ.host());
+            // the offsets as the kernels form them (FaceOffsets): Cf - C, the same subtraction on the host
+            {
+                const std::vector<label> o = dm.owner.host(), n = dm.nei.host();
+                const std::vector<scalar> fx = dm.Cfx.host(), fy = dm.Cfy.host(), fz = dm.Cfz.host();
+                const std::vector<scalar> cx = dm.Cx.host(), cy = dm.Cy.host(), cz = dm.Cz.host();
+                const std::size_t nIf = o.size();
+                std::vector<scalar> dox(nIf), doy(nIf), doz(nIf), dnx(nIf), dny(nIf), dnz(nIf);
+                for (std::size_t f = 0; f < nIf; ++f)
+                {
+                    dox[f] = fx[f] - cx[o[f]];
+                    doy[f] = fy[f] - cy[o[f]];
+                    doz[f] = fz[f] - cz[o[f]];
+                    dnx[f] = fx[f] - cx[n[f]];
+                    dny[f] = fy[f] - cy[n[f]];
+                    dnz[f] = fz[f] - cz[n[f]];
+                }
+                sc.dump->scalars(sc.dump->ctx, "AsmDOwnX", dox);
+                sc.dump->scalars(sc.dump->ctx, "AsmDOwnY", doy);
+                sc.dump->scalars(sc.dump->ctx, "AsmDOwnZ", doz);
+                sc.dump->scalars(sc.dump->ctx, "AsmDNeiX", dnx);
+                sc.dump->scalars(sc.dump->ctx, "AsmDNeiY", dny);
+                sc.dump->scalars(sc.dump->ctx, "AsmDNeiZ", dnz);
+            }
         }
     }
     else
