@@ -1113,7 +1113,8 @@ bool buildCsrForGrid(AMGData& amg, int g, const LduF& A)
 }   // namespace
 
 // Builds the CSR mirror for every grid that qualifies. Called once, from amgCastFP32, after the FP32
-// buffers exist; the agglomeration behind it is static for the life of the mesh.
+// diagonals and work vectors exist and before the face-form copies, which only a grid it leaves out
+// takes; the agglomeration behind it is static for the life of the mesh.
 void amgBuildCsrFP32(AMGData& amg, const DeviceLduView& A)
 {
     const int G = amg.nLevels();
@@ -1149,12 +1150,22 @@ void amgCastFP32(
         {
             const DeviceLduView v = (g==0) ? A : amg.level[g-1].coarseView();
             amg.fDiag[g].resize(v.nCells);
-            amg.fUpper[g].resize(v.nInternalFaces);
-            amg.fLower[g].resize(v.nInternalFaces);
             amg.vAxF[g].resize(v.nCells);
             amg.vRF[g].resize(v.nCells);
             amg.vXF[g].resize(v.nCells);
             amg.vBF[g].resize(v.nCells);
+        }
+        // The row layout first, so that a grid's face-form copies are taken only where it has none: a CSR grid's
+        // off-diagonals are gathered into csrVal and its SpMV reads them there (amgSpmvF), so its fUpper/fLower
+        // would never be written or read. The lifetime audit (2026-10-17) found them idle: 0.42 GiB on boxy5 at
+        // 4.94 M cells, every grid in CSR.
+        if (amgCsrOn() && !amg.csrBuilt) amgBuildCsrFP32(amg, A);       // FP-12, once per hierarchy
+        for (int g=0; g<=G; ++g)
+        {
+            if (!amg.csrVal.empty() && amg.csrVal[g].size() > 0) continue;
+            const DeviceLduView v = (g==0) ? A : amg.level[g-1].coarseView();
+            amg.fUpper[g].resize(v.nInternalFaces);
+            amg.fLower[g].resize(v.nInternalFaces);
         }
         if (amg.saSmooth)
         {
@@ -1188,7 +1199,6 @@ void amgCastFP32(
         }
         amg.fp32Alloc = true;
     }
-    if (amgCsrOn() && !amg.csrBuilt) amgBuildCsrFP32(amg, A);       // FP-12, once per hierarchy
     // THE SAME MATRIX AGAIN (amgGalerkinStands): the copies of the last cast are this matrix's, grid for grid
     if (amg.fp32Stands)
     {
