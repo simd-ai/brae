@@ -1696,6 +1696,13 @@ bool simpleColourSwapControl()
                          // null without a freestream patch: this driver evaluates U's boundary before the
                          // assembly, so re-deriving it here is the same number. See the header (item 30).
                          freestreamStored() ? gradUBndP : nullptr, ctl_.gradULimitK);
+        // The stress term's workspace is dead from here to the next assembly, and this driver captures no
+        // phase in a graph. Its nine gradient blocks are of the cell-field class, which peaks in mom:sources:
+        // back in the pool they serve that part's own temporaries (the lifetime audit, 2026-10-17: dead at
+        // mom:matrix under both poisons; the class census, boxy5 at 4.94 M cells: 104 of that class alive at
+        // the peak). Its two nine-component tensors are a class only this term takes, so they lower the
+        // bytes in use but not the footprint.
+        deviceDivDevReffRelease(dm);
         // ...and the two terms only Maxwell has. Both are V*fvc::div of a tensor, added to the same
         // source the dev2 term feeds, with the same sign OF gives them (divDevRhoReff is subtracted from
         // the momentum equation, and brae's ddr carries that sign already -- see the loop below).
@@ -1792,6 +1799,12 @@ bool simpleColourSwapControl()
         deviceAxpy(-1.0,lD,mDiag);
         deviceAxpy(-1.0,lU,mUp);
         deviceAxpy(-1.0,lL,mLo);
+        // folded in: the Laplacian's own coefficients are dead (the lifetime audit: dead at mom:sources). lD is
+        // of the cell-field class that peaks there; lU/lL are face-sized, a class whose most is matched in the
+        // pressure and turbulence phases, so they lower the bytes in use only.
+        lD.resize(0);
+        lU.resize(0);
+        lL.resize(0);
         // bounded Gauss upwind: - fvm::Sp(fvc::div(phi), U). mDiag -= V*div(phi). Stabilises the rest-start
         // transient (vanishes at convergence); matches OF's bounded scheme + the CPU simpleStep.
         // div(phi) MUST include the cyclic-face flux (OF's fvc::div sums ALL faces). Without it the cyclic cells
@@ -3363,14 +3376,13 @@ bool simpleColourSwapControl()
         correctPressureVelocity(res);
         const double msP = phaseTime ? phaseMs() : 0.0;
 
-        // The momentum matrix's off-diagonals and the stress term's workspace are dead from here to the
-        // next assembly (H() and SIMPLEC's row sum, their last readers, are in the pressure phase), and this
-        // driver captures neither phase in a graph. Back in the pool, they serve the turbulence phase's own
-        // temporaries, whose peak was the iteration's: 0.4 GB above the momentum phase's on boxy5's 4.94 M
-        // cells (BRAE_POOL_STATS census, 2026-10-17).
+        // The momentum matrix's off-diagonals are dead from here to the next assembly (H() and SIMPLEC's row
+        // sum, their last readers, are in the pressure phase), and this driver captures neither phase in a
+        // graph. Back in the pool, they serve the turbulence phase's own temporaries, whose peak was the
+        // iteration's: 0.4 GB above the momentum phase's on boxy5's 4.94 M cells (BRAE_POOL_STATS census,
+        // 2026-10-17). The stress term's workspace went back at its last use, in the momentum phase.
         mUp.resize(0);
         mLo.resize(0);
-        deviceDivDevReffRelease(dm);
         detail::devicePool().phase("turbulence");
         correctTurbulence();
         detail::devicePool().phase("continuity");

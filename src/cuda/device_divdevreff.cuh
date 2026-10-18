@@ -86,7 +86,7 @@ void deviceDivDevReff(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
 // Hands the stress term's persistent temporaries (two 9*nCells tensors among them) back to the pool until
 // the next call re-takes them. They persist so that a CAPTURED assembly replays on stable addresses
 // (DevReffWorkspace, device_divdevreff.cu), so only a caller that captures none may call this between
-// its assemblies -- the steady simpleFoam step does, before its turbulence phase.
+// its assemblies -- the steady simpleFoam step does, right after its one call an iteration.
 void deviceDivDevReffRelease(const DeviceMesh& dm);
 
 // Exported for the Maxwell model and for generalizedNewtonian's strainRate -- see the definitions in
