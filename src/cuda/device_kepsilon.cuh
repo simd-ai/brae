@@ -559,7 +559,12 @@ void deviceSpalartAllmarasCorrect(const DeviceMesh& dm, const DeviceVectorBounda
                                   // the non-orthogonal laplacian correction (deviceSolveScalarTransport's
                                   // gradLimitK and lapGradLimitK). Every caller ran both unlimited before.
                                   scalar gradNuTildaLULimitK = 0.0,
-                                  scalar gradNuTildaLapLimitK = 0.0);
+                                  scalar gradNuTildaLapLimitK = 0.0,
+                                  // true hands the shared grad(U) memo (deviceGradUShared) back to the pool as soon
+                                  // as the model has its tensor. Only for a driver whose next reader of the memo is
+                                  // a new U anyway: legacy simpleFoam's step(), which drops it after turbulence.
+                                  // pimpleFoam's step and V2 keep it, and with it their next sites' hits.
+                                  bool releaseGradUMemo = false);
 
 // Standalone SA correctNut (nut = nuTilda*fv1(nuTilda)) for the solver startup validate().
 void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, DeviceBuffer<scalar>& nut);

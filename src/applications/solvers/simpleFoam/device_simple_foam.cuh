@@ -122,7 +122,9 @@ public:
     void revalidateAfterThermo(const std::vector<scalar>* rhoBndSeed = nullptr);
     // PIMPLE-foundation composable phase: turbulence transport (k/eps/omega/nuTilda -> nut). Uses only members,
     // so SIMPLE's step() and a future PIMPLE outer loop both call it (once per outer corrector) unchanged.
-    void correctTurbulence();
+    // releaseGradUMemo: the model may hand the shared grad(U) memo back once it has read it (Spalart-Allmaras); only
+    // step() asks, which drops the memo after turbulence anyway. pimpleStep and rhoSimpleStep keep it.
+    void correctTurbulence(bool releaseGradUMemo = false);
     // PIMPLE-foundation composable phase 1: the momentum predictor -- assemble div(phi,U) - laplacian(nuEff,U)
     // - fvc::div(nuEff dev2(grad U)^T) + fvOptions/MRF/limiters + body force, relax, and solve each U component
     // (BiCGStab/GaussSeidel). Fills Uk_ + the shared members mDiagR/mUp/mLo/iC/bCb/relaxSrc (the relaxed matrix

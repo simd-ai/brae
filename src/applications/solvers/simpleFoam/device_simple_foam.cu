@@ -1088,7 +1088,7 @@ bool simpleColourSwapControl()
         return on;
     }
 
-    void DeviceSimpleSolver::correctTurbulence()
+    void DeviceSimpleSolver::correctTurbulence(bool releaseGradUMemo)
     {
         const DeviceMesh& dm = dm_;
         // OF calls turbulence->correct() every outer corrector whatever the model is, and for a laminar
@@ -1184,7 +1184,8 @@ bool simpleColourSwapControl()
                                              // keeps the legacy arm from answering a `GaussSeidel` case with the
                                              // symmetric sweep in silence, now that the substitution notice is gone.
                                              saGradLimit(ctl_.gradKLULimitK),   // linearUpwind's named grad(nuTilda): ran unlimited
-                                             saGradLimit(ctl_.gradKLimitK));    // gradSchemes grad(nuTilda), the non-orth correction's
+                                             saGradLimit(ctl_.gradKLimitK),     // gradSchemes grad(nuTilda), the non-orth correction's
+                                             releaseGradUMemo);
             else if (ctl_.sst)   // de_ slot holds omega; relaxEps/limitedEps/twoBykEps carry the omega-equation settings
             {
                 deviceKOmegaSSTCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
@@ -3391,7 +3392,9 @@ bool simpleColourSwapControl()
             relaxSrc[kk].resize(0);
         }
         detail::devicePool().phase("turbulence");
-        correctTurbulence();
+        // this step drops the grad(U) memo after turbulence (below), so the model may drop it as soon as it has
+        // read it
+        correctTurbulence(/*releaseGradUMemo*/ true);
         // Turbulence's own held buffers are dead from here to its next correct(): the shared grad(U) memo, which
         // U's change misses at every iteration's first site, and the folded systems its colour-order sweeps
         // read (one a Krylov solve read keeps its addresses for that solve's graph). Both sat idle through the

@@ -395,7 +395,8 @@ void deviceSpalartAllmarasCorrect(
     int nSweeps,          // solvers/nuTilda/nSweeps; see the declaration
     bool gsSymmetric,
     scalar gradNuTildaLULimitK,    // see the declaration
-    scalar gradNuTildaLapLimitK)
+    scalar gradNuTildaLapLimitK,
+    bool releaseGradUMemo)   // see the declaration
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> gradU;
@@ -404,6 +405,13 @@ void deviceSpalartAllmarasCorrect(
     // to the TENSOR, as cellLimitedGrad does, so Omega, Stilda and the DES/IDDES length scales all see
     // the same gradient OpenFOAM built them from.
     if (gradULimitK > scalar(0)) deviceCellLimitGradU(dm, dbU, Ux, Uy, Uz, gradU, gradULimitK);
+    // deviceGradU above was this call's one reader of the shared memo, and the caller's next is a new U. Its nine
+    // cell fields back in the pool here serve the solve's temporaries, which set the turbulence phase's peak (the
+    // class census on boxy5 at 4.94 M cells: the memo was nine of the 40 MiB class's blocks alive there).
+    if (releaseGradUMemo)
+    {
+        deviceGradUSharedRelease(dm);
+    }
     // SA-DDES/IDDES: replace the wall distance y with the DES length scale dTilda in the SA length-scale terms (Stilda,
     // fw, destruction). des==false (RANS) -> dScale aliases y, so the model is byte-for-byte the standard SA. iddes uses
     // the improved (WMLES) length scale (needs hmax = maxDeltaxyz); otherwise the plain DDES cubeRootVol limiter.
