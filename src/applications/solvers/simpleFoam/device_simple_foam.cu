@@ -2321,7 +2321,9 @@ bool simpleColourSwapControl()
         if (mvfActive_) { mvfGradP0_ += mvfDGradP_; mvfDGradP_ = 0; }
     }
 
-    void DeviceSimpleSolver::correctPressureVelocity(DeviceSimpleResidual& res)
+    void DeviceSimpleSolver::correctPressureVelocity(
+        DeviceSimpleResidual& res,
+        bool releaseMomentumMatrix)
     {
         // Put the momentum interface coefficient back before H() is built: a previous corrector's pressure
         // assembly leaves the LAPLACIAN coefficient in the same buffer (see solveMomentumPredictor).
@@ -2464,6 +2466,19 @@ bool simpleColourSwapControl()
         }
         DeviceBuffer<scalar> phiHi;
         deviceVectorFlux(dm, HbyA[0], HbyA[1], HbyA[2], phiHi);   // flux of the ORIGINAL HbyA
+        // The momentum matrix's off-diagonals and its source have no reader from here to the next assembly: H() and
+        // SIMPLEC's row sum, above, were the last (Uview names them and is not read below). Back in the pool before
+        // the pressure solve, they serve its temporaries instead of the next phase's. Only a caller that assembles
+        // again before its next H() asks: pimpleStep's next corrector re-reads them.
+        if (releaseMomentumMatrix)
+        {
+            mUp.resize(0);
+            mLo.resize(0);
+            for (int kk = 0; kk < 3; ++kk)
+            {
+                relaxSrc[kk].resize(0);
+            }
+        }
         // Phase 0 stage harness: the MOMENTUM stage's outputs, at the same point OF's pcEqn.H writes them
         // (rAU/rAtU/HbyA constructed, flux taken, nothing from the pressure step applied yet).
         if (stageDumpActive() && stageDumpFirstOnly("momentum"))
@@ -3389,23 +3404,14 @@ bool simpleColourSwapControl()
         solveMomentumPredictor(res);
         const double msU = phaseTime ? phaseMs() : 0.0;
         detail::devicePool().phase("pressure");
-        correctPressureVelocity(res);
+        // This driver assembles the momentum matrix again before its next H() and captures neither phase in a graph,
+        // so the pressure phase hands the matrix's off-diagonals and the momentum source back as soon as HbyA's flux
+        // is taken. The next sources part rewrites relaxSrc whole before any read (the lifetime audit, 2026-10-17:
+        // dead at momentum entry under both poisons). They went back after this phase before (step 4); in it, they
+        // stop counting toward the pressure phase's peak too. The stress term's workspace goes back at its last use,
+        // in the momentum phase.
+        correctPressureVelocity(res, /*releaseMomentumMatrix*/ true);
         const double msP = phaseTime ? phaseMs() : 0.0;
-
-        // The momentum matrix's off-diagonals are dead from here to the next assembly (H() and SIMPLEC's row
-        // sum, their last readers, are in the pressure phase), and this driver captures neither phase in a
-        // graph. Back in the pool, they serve the turbulence phase's own temporaries, whose peak was the
-        // iteration's: 0.4 GB above the momentum phase's on boxy5's 4.94 M cells (BRAE_POOL_STATS census,
-        // 2026-10-17). The stress term's workspace went back at its last use, in the momentum phase.
-        mUp.resize(0);
-        mLo.resize(0);
-        // ...and the momentum source: its last reader is H(), above; the next sources part rewrites it whole
-        // before any read (the lifetime audit, 2026-10-17: dead at momentum entry under both poisons; no reader
-        // in the turbulence phase). Three blocks of the cell-field class.
-        for (int kk = 0; kk < 3; ++kk)
-        {
-            relaxSrc[kk].resize(0);
-        }
         detail::devicePool().phase("turbulence");
         // this step drops the grad(U) memo after turbulence (below), so the model may drop it as soon as it has
         // read it

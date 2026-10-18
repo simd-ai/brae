@@ -133,7 +133,11 @@ public:
     // PIMPLE-foundation composable phase: pressure-velocity coupling (SIMPLE/SIMPLEC corrector). Reads the
     // predictor outputs (member relaxed matrix + boundary coeffs + source), forms rAU/HbyA, solves the pressure
     // correction (with non-orth passes) and corrects U + the conservative face flux. res gets the p residuals.
-    void correctPressureVelocity(DeviceSimpleResidual& res);
+    // releaseMomentumMatrix: mUp/mLo and relaxSrc go back to the pool once HbyA's flux is taken (H() and SIMPLEC's row
+    // sum were their last readers). Only step() asks; pimpleStep's next pressure corrector re-reads them in H().
+    void correctPressureVelocity(
+        DeviceSimpleResidual& res,
+        bool releaseMomentumMatrix = false);
 
     DeviceSimpleResidual step();
 
