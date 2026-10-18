@@ -5262,6 +5262,13 @@ add_test(NAME amg_csr_rows_identity
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/amg_csr_rows_identity.sh)
 set_tests_properties(amg_csr_rows_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 
+# The BiCGStab graph cache keyed on the field it solves holds one graph per solved field: the velocity corrector
+# writes U into its own block (a new block each iteration had become a new cache entry an iteration once boxy5's
+# memory step 4 moved the pool's free list). Control: BRAE_CONTROL_U_CORRECTOR_NEW_BLOCK=1, the old new block.
+add_test(NAME bicg_graph_cache_bounded
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/bicg_graph_cache_bounded.sh)
+set_tests_properties(bicg_graph_cache_bounded PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
 # GPU offload #7c-loop: cached V-cycle graph replayed across SIMPLE steps (persistent buffers) vs direct, in-loop A/B.
 add_executable(test_gpu_loop_graph tests/test_gpu_loop_graph.cu)
 target_include_directories(test_gpu_loop_graph PRIVATE ${BRAE_HEADER_DIRS} src/applications/solvers/simpleFoam)

@@ -3238,11 +3238,26 @@ bool simpleColourSwapControl()
         if (hasCyclic_) interfaceAddGrad(cyc_, dp_, dm.V, gnx,gny,gnz);   // + cyclic-face contribution to grad(p)
         if (hasAMI_)    interfaceAddGrad(ami_, dp_, dm.V, gnx,gny,gnz);       // + AMI-face contribution to grad(p)
         DeviceBuffer<scalar>* gn[3]={&gnx,&gny,&gnz};
-        for (int kk = 0; kk < 3; ++kk)   // SIMPLEC: rAtU
+        // SIMPLEC: rAtU. Into U's own block: the corrector reads HbyA, rAtU and grad(p), never U, and a solver
+        // graph keyed on the field it solves finds the field where it was. A new block moved in each iteration put
+        // U wherever the pool's free list stood, and once the momentum source went back after the pressure phase
+        // (step 4) those addresses stopped recurring: the BiCGStab graph cache, keyed on psi and never evicted,
+        // took an entry an iteration (implicitAMI 101 after 100 iterations, 5 before; BRAE_CACHE_STATS, GB10).
+        // BRAE_CONTROL_U_CORRECTOR_NEW_BLOCK=1, a gate's CONTROL, deliberately wrong: the new block moved in, as
+        // before (tests/bicg_graph_cache_bounded.sh).
+        static const bool newBlockControl = std::getenv("BRAE_CONTROL_U_CORRECTOR_NEW_BLOCK") != nullptr;
+        for (int kk = 0; kk < 3; ++kk)
         {
-            DeviceBuffer<scalar> Un;
-            deviceCorrector(HbyA[kk], rAtU, *gn[kk], Un);
-            Uk_[kk]=std::move(Un);
+            if (newBlockControl)
+            {
+                DeviceBuffer<scalar> Un;
+                deviceCorrector(HbyA[kk], rAtU, *gn[kk], Un);
+                Uk_[kk] = std::move(Un);
+            }
+            else
+            {
+                deviceCorrector(HbyA[kk], rAtU, *gn[kk], Uk_[kk]);
+            }
         }
         if (hasWedge_) deviceUpdateWedge(dbU_, Uk_[0], Uk_[1], Uk_[2]);   // pEqn.H's U.correctBoundaryConditions()
         if (hasSym_)   deviceUpdateSymmetry(dbU_, Uk_[0], Uk_[1], Uk_[2]); // ...for the symmetry patches too (item 13)
