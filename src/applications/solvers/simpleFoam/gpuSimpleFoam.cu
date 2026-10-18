@@ -954,6 +954,7 @@ int main(int argc, char** argv)
         }
         time.end();   // OF Time.C:790-802: a final execute() so the last step is seen, then end()
         detail::devicePool().report("loop end");
+        detail::devicePool().reportClasses("loop end");
         // timeIndex() is the iteration that ran, so no -1: the for-loop this replaced incremented past it.
         const int nIter = converged ? time.timeIndex() : static_cast<int>(nSteps);
         std::printf(converged ? "SIMPLE solution converged in %d iterations\n"

@@ -125,7 +125,7 @@ public:
                 void* p = it->second.back().p;
                 it->second.pop_back();
                 heldBytes_ -= cls;
-                countTake(p, cls);
+                countTake(p, cls, true);
                 return p;
             }
         }
@@ -138,7 +138,7 @@ public:
         hist_[cls].first += cls;
         ++hist_[cls].second;
         if (stats_) mallocByPhase_[phase_] += cls;
-        countTake(p, cls);
+        countTake(p, cls, false);
         return p;
     }
     void give(void* p, std::size_t bytes)
@@ -147,6 +147,7 @@ public:
         if (stats_)
         {
             liveBytes_ -= classOf(bytes);
+            --classStat_[classOf(bytes)].live;
             bigLive_.erase(p);
         }
         if (enabled_ && bytes)
@@ -165,6 +166,15 @@ public:
     void phase(const char* name)
     {
         phase_ = name;
+        // a class's blocks alive when a phase begins count as that phase's too, though it takes none
+        if (stats_)
+        {
+            for (auto& kv : classStat_)
+            {
+                std::size_t& inPhase = kv.second.maxByPhase[name];
+                if (kv.second.live > inPhase) inPhase = kv.second.live;
+            }
+        }
         if (poisonPhase_.empty() || poisonPhase_ != name) return;
         // BRAE_POOL_POISON: the chosen blocks overwritten at this phase's entry, from its poisonFrom_-th entry on.
         // A block whose value here is never read before it is written again leaves every field as it was.
@@ -201,6 +211,7 @@ public:
             }
             if (n == 0) continue;
             idle.erase(idle.begin(), idle.begin() + static_cast<std::ptrdiff_t>(n));
+            if (stats_) classStat_[kv.first].trimmed += n;
             heldBytes_ -= n*kv.first;
             freedBytes_ += n*kv.first;
             frees_ += n;
@@ -288,6 +299,50 @@ public:
                          v[i].second.first/1048576.0, v[i].second.second, v[i].first/1048576.0);
         }
     }
+    // BRAE_POOL_STATS=1: the footprint BY SIZE CLASS. A freed block serves only a later take of its own class, so
+    // a class's share of the footprint is the most of its blocks ever alive at once (less those handed back), and
+    // freeing a buffer earlier lowers the footprint only if it lowers that most. "at peak" is how many were alive
+    // when the bytes in use peaked; the rest of the class's blocks sat idle then. Classes of 1 MiB or more.
+    void reportClasses(const char* when) const
+    {
+        if (!stats_) return;
+        std::vector<std::pair<std::size_t, ClassStat>> v(classStat_.begin(), classStat_.end());
+        std::sort(v.begin(), v.end(),
+                  [](const auto& a, const auto& b) { return a.first*a.second.maxLive > b.first*b.second.maxLive; });
+        std::fprintf(stderr, "[class] %s: class MB | most alive (MB) | alive at the peak in use | takes | "
+                     "from the free list | handed back\n", when);
+        for (const auto& kv : v)
+        {
+            if (kv.first < (std::size_t(1) << 20)) continue;
+            const ClassStat& c = kv.second;
+            std::fprintf(stderr, "[class] %10.2f | %5zu (%9.2f) | %5zu | %7zu | %7zu | %5zu\n", kv.first/1048576.0,
+                         c.maxLive, c.maxLive*(kv.first/1048576.0), c.atPeak, c.takes, c.reused, c.trimmed);
+        }
+        // The pool asks the driver for a block only when its class has none idle, so a class's cudaMalloc count is
+        // its most alive at once: while nothing has been handed back, the two sums over every class agree.
+        std::size_t most = 0;
+        std::size_t back = 0;
+        for (const auto& kv : classStat_)
+        {
+            most += kv.first*kv.second.maxLive;
+            back += kv.first*kv.second.trimmed;
+        }
+        std::fprintf(stderr, "[class] %s: the classes' most alive sum to %.3f GB, cudaMalloc %.3f GB, handed back %.3f GB\n",
+                     when, most/1073741824.0, mallocBytes_/1073741824.0, back/1073741824.0);
+        // ...and, for the classes of 64 MiB of footprint or more, the most alive in each phase: the phases at the
+        // class's most are where a release can lower it
+        for (const auto& kv : v)
+        {
+            const ClassStat& c = kv.second;
+            if (kv.first*c.maxLive < (std::size_t(64) << 20)) continue;
+            std::fprintf(stderr, "[class] %10.2f MB by phase:", kv.first/1048576.0);
+            for (const auto& ph : c.maxByPhase)
+            {
+                std::fprintf(stderr, " %s %zu", ph.first.c_str(), ph.second);
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
     // BRAE_POOL_STATS=1: every live block of 64 MiB or more, with the phase of its last take and that take's
     // call stack as offsets into the executable (resolve with addr2line -f -C -e <brae> <offset>...)
     void reportLive(const char* when) const
@@ -329,11 +384,20 @@ private:
         void*         p = nullptr;
         unsigned long step = 0;
     };
-    void countTake(void* p, std::size_t cls)
+    void countTake(
+        void* p,
+        std::size_t cls,
+        bool fromFreeList)
     {
         if (!stats_) return;
         liveBytes_ += cls;
         lastTakePhase_[cls] = phase_;
+        ClassStat& c = classStat_[cls];
+        ++c.takes;
+        if (fromFreeList) ++c.reused;
+        if (++c.live > c.maxLive) c.maxLive = c.live;
+        std::size_t& inPhase = c.maxByPhase[phase_];
+        if (c.live > inPhase) inPhase = c.live;
         if (cls >= big_)
         {
             Big& b = bigLive_[p];
@@ -353,6 +417,7 @@ private:
             peakLive_ = liveBytes_;
             peakPhase_ = phase_;
             peakBig_ = bigLive_;
+            for (auto& kv : classStat_) kv.second.atPeak = kv.second.live;
         }
     }
     std::unordered_map<std::size_t, std::vector<Idle>> free_;
@@ -374,6 +439,19 @@ private:
     std::map<std::string, std::size_t> mallocByPhase_;
     std::map<std::string, std::size_t> peakByPhase_;   // the most in use while each phase ran
     std::unordered_map<std::size_t, const char*> lastTakePhase_;
+    // per size class: blocks alive now, the most alive at once, alive at the moment of the peak in use, takes, the
+    // takes the free list served, and blocks handed back to the driver (reportClasses)
+    struct ClassStat
+    {
+        std::size_t live = 0;
+        std::size_t maxLive = 0;
+        std::size_t atPeak = 0;
+        std::size_t takes = 0;
+        std::size_t reused = 0;
+        std::size_t trimmed = 0;
+        std::map<std::string, std::size_t> maxByPhase;   // the most alive while each phase ran
+    };
+    std::map<std::size_t, ClassStat> classStat_;
     // every live block of big_ or more: its class, the phase and the call stack of its last take, and the take's
     // number among the tracked ones (the same from run to run of one binary on one case, so a poison names it)
     std::size_t big_ = std::size_t(64) << 20;
