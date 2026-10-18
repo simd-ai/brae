@@ -5256,6 +5256,12 @@ target_include_directories(test_amg_one_off_diagonal PRIVATE ${BRAE_HEADER_DIRS}
 target_link_libraries(test_amg_one_off_diagonal PRIVATE brae_core)
 add_test(NAME amg_one_off_diagonal COMMAND test_amg_one_off_diagonal ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
 
+# The AMG's single-precision CSR values gathered through each grid's addressing: the stored source list's
+# bits (BRAE_AMG_CSR_SRC=1 keeps the list), a smaller footprint, and a control that changes the cycle.
+add_test(NAME amg_csr_rows_identity
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/amg_csr_rows_identity.sh)
+set_tests_properties(amg_csr_rows_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
 # GPU offload #7c-loop: cached V-cycle graph replayed across SIMPLE steps (persistent buffers) vs direct, in-loop A/B.
 add_executable(test_gpu_loop_graph tests/test_gpu_loop_graph.cu)
 target_include_directories(test_gpu_loop_graph PRIVATE ${BRAE_HEADER_DIRS} src/applications/solvers/simpleFoam)

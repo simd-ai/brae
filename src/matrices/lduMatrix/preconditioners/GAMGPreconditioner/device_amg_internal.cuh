@@ -136,6 +136,40 @@ void csrGatherValsK(int nnz, const label* __restrict__ src, const scalar* __rest
     const label s = src[i];
     val[i] = (s >= 0) ? (float)upper[s] : (float)lower[-s - 1];
 }
+// ...and the same values through the grid's own addressing, so that the stored source list is not needed (csrSrc,
+// AMGData). Row c is its owner faces in ownerStart order and then its neighbour faces in losort order (the layout
+// buildCsrForGrid gives it), so upper[f] sits at row[owner[f]] + (f - ownerStart[owner[f]]) and the lower of the
+// face at losort slot k at row[c] + (its owner count) + (k - losortStart[c]), c = nei[losort[k]]: one thread a
+// slot, threads [0, nF) the upper values in face order and [nF, 2 nF) the lower ones in losort order. The same
+// casts of the same values into the same slots. ONE THREAD A ROW, walking it, was measured first and cost the
+// stored list's speed: on boxy5 at 4.94 M cells (H100, 200 iterations) 0.4088 and 0.4091 s/it against 0.4031 --
+// its loads and stores stride a row apart across a warp, where these run along the face arrays.
+static __global__
+void csrGatherFacesK(
+    int nF,
+    const label* __restrict__ row,
+    const label* __restrict__ owner,
+    const label* __restrict__ nei,
+    const label* __restrict__ ownerStart,
+    const label* __restrict__ losortStart,
+    const label* __restrict__ losort,
+    const scalar* __restrict__ upper,
+    const scalar* __restrict__ lower,
+    float* __restrict__ val)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= 2*nF) return;
+    if (i < nF)
+    {
+        const label c = owner[i];
+        val[row[c] + (i - ownerStart[c])] = (float)upper[i];
+        return;
+    }
+    const label k = i - nF;
+    const label f = losort[k];
+    const label c = nei[f];
+    val[row[c] + (ownerStart[c+1] - ownerStart[c]) + (k - losortStart[c])] = (float)lower[f];
+}
 inline void amulF(const LduF& A, const float* x, float* y)
 {
     amulFK<<<nBlocks(A.nCells),TPB>>>(A.nCells, A.diag, A.upper, A.lower, A.nei, A.owner,

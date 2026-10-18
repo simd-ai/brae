@@ -1035,7 +1035,17 @@ void vcycleAt(
 // launch. The structure is built once per hierarchy: agglomeration is static for the life of the mesh.
 //
 // BRAE_AMG_CSR=0 restores the face form everywhere; BRAE_AMG_CSR_BELOW moves the threshold.
+//
+// The values are gathered through the grid's own addressing (csrGatherFacesK), not through a stored list of
+// where each one comes from: that list was as large as the columns, 0.42 GiB on boxy5 at 4.94 M cells.
+// BRAE_AMG_CSR_SRC=1 keeps the list and the entry-by-entry gather (csrGatherValsK) -- the same bits.
 namespace {
+
+bool amgCsrStoredSrc()
+{
+    static const bool on = std::getenv("BRAE_AMG_CSR_SRC") && std::atoi(std::getenv("BRAE_AMG_CSR_SRC")) != 0;
+    return on;
+}
 
 int amgCsrOn()
 {
@@ -1083,29 +1093,30 @@ bool buildCsrForGrid(AMGData& amg, int g, const LduF& A)
     const std::vector<label> nei = pullLabels(A.nei, A.nInternalFaces);
     const std::vector<label> owner = pullLabels(A.owner, A.nInternalFaces);
 
+    const bool storeSrc = amgCsrStoredSrc();
     std::vector<label> row(A.nCells + 1, 0), col, src;
     col.reserve(2*A.nInternalFaces);
-    src.reserve(2*A.nInternalFaces);
+    if (storeSrc) src.reserve(2*A.nInternalFaces);
     for (int c = 0; c < A.nCells; ++c)
     {
         row[c] = static_cast<label>(col.size());
         for (label f = ownerStart[c]; f < ownerStart[c+1]; ++f)      // upper[f] * psi[nei[f]]
         {
             col.push_back(nei[f]);
-            src.push_back(f);
+            if (storeSrc) src.push_back(f);
         }
         for (label k = losortStart[c]; k < losortStart[c+1]; ++k)    // lower[f] * psi[owner[f]]
         {
             const label f = losort[k];
             col.push_back(owner[f]);
-            src.push_back(-f - 1);
+            if (storeSrc) src.push_back(-f - 1);
         }
     }
     row[A.nCells] = static_cast<label>(col.size());
 
     amg.csrRow[g].copyFrom(row);
     amg.csrCol[g].copyFrom(col);
-    amg.csrSrc[g].copyFrom(src);
+    if (storeSrc) amg.csrSrc[g].copyFrom(src);
     amg.csrVal[g].resize(col.size());
     return true;
 }
@@ -1215,10 +1226,16 @@ void amgCastFP32(
             // A CSR grid takes its off-diagonals through the row layout instead, in ONE launch where
             // the face form needs two -- the same values, gathered into the order the SpMV reads them.
             const int nnz = amgCsrOn() ? static_cast<int>(amg.csrVal[g].size()) : 0;
-            if (nnz > 0)
+            if (nnz > 0 && amg.csrSrc[g].size() > 0)
             {
                 csrGatherValsK<<<nBlocks(nnz),TPB>>>(nnz, amg.csrSrc[g].data(), v.upper, v.lower,
                                                      amg.csrVal[g].data());
+            }
+            else if (nnz > 0)
+            {
+                csrGatherFacesK<<<nBlocks(2*v.nInternalFaces),TPB>>>(v.nInternalFaces, amg.csrRow[g].data(), v.owner,
+                                                                     v.nei, v.ownerStart, v.losortStart, v.losort,
+                                                                     v.upper, v.lower, amg.csrVal[g].data());
             }
             else
             {

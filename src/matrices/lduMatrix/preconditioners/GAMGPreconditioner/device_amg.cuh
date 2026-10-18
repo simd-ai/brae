@@ -343,8 +343,9 @@ struct AMGData {
     bool galerkinRun = false;
     // FP-12: the FP32 SpMV's operand, per grid, as ONE contiguous row instead of two indirections.
     // csrRow[g] is nCells+1 offsets; csrCol[g] the column of each entry; csrVal[g] its FP32 value;
-    // csrSrc[g] says where that value comes from in the FP64 face arrays (f for upper[f], -(f+1) for
-    // lower[f]) so amgCastFP32 can refill the values in one pass per grid. The entries of a row are the
+    // csrSrc[g], only under BRAE_AMG_CSR_SRC=1, says where that value comes from in the FP64 face arrays (f for
+    // upper[f], -(f+1) for lower[f]); otherwise amgCastFP32 refills the values through the grid's own addressing
+    // (csrGatherFacesK), in one pass per grid either way. The entries of a row are the
     // cell's owner faces in ownerStart order and then its neighbour faces in losort order -- the exact
     // sequence amulFK sums in, so the arithmetic and the bits are unchanged. Empty for grids that keep
     // the face form (see amgCsrBelow).
