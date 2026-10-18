@@ -21,6 +21,8 @@
 //   * each case twice on the SAME subset with another field: the subset keeps its arrays between calls and
 //     clears the listed cells' entries only.
 // The CONTROL leaves every other face out of the subset: listed cells must then differ.
+// fvc::gaussGradAt (the Gauss gradient of a vector field, which wallForces takes at the patches' cells when the
+// forces are sampled through a run) is held the same way, on the same two boxes, with its own control.
 // NOT HERE: a coupled patch (cyclic, cyclicAMI) -- the box has none; tests/test_grad_subset_coupled.cu holds
 // the same on a pair.
 #include "box_mesh.cuh"
@@ -146,10 +148,117 @@ Tally run(
     return t;
 }
 
+// fvc::gaussGradAt, the Gauss gradient of a vector field that wallForces takes at the patches' cells: the same
+// subset, two fields on it in turn, against fvc::gaussGrad over the whole mesh. `everyOtherFace` is the control.
+Tally runGauss(
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp,
+    bool everyOtherFace)
+{
+    const label nC = m.nCells();
+    std::vector<char> on(static_cast<std::size_t>(nC), 0);
+    for (const FvPatch& q : fvp)
+    {
+        if (q.type == "empty") continue;
+        for (label i = 0; i < q.size; ++i)
+        {
+            on[static_cast<std::size_t>(q.faceCells[i])] = 1;
+        }
+    }
+    std::vector<label> cells;
+    for (label c = 0; c < nC; ++c)
+    {
+        if (on[static_cast<std::size_t>(c)])
+        {
+            cells.push_back(c);
+        }
+    }
+    fvc::GradSubset at = fvc::gradSubset(m, cells);
+    if (everyOtherFace)
+    {
+        std::vector<label> kept;
+        for (std::size_t k = 0; k < at.faces.size(); k += 2)
+        {
+            kept.push_back(at.faces[k]);
+        }
+        at.faces = kept;
+    }
+    Tally t;
+    for (int field = 0; field < 2; ++field)
+    {
+        std::vector<vector> u(static_cast<std::size_t>(nC));
+        for (label c = 0; c < nC; ++c)
+        {
+            const vector& x = g.C()[c];
+            u[static_cast<std::size_t>(c)] = vector{
+                scalar(0.5) + scalar(0.4)*std::sin(scalar(1.3 + field)*x.x + scalar(0.7)*x.y),
+                scalar(0.3)*std::cos(scalar(0.9)*x.y - scalar(0.4 + 0.2*field)*x.z),
+                scalar(0.2)*std::sin(scalar(1.7)*x.z + scalar(0.5)*x.x)};
+        }
+        std::vector<std::vector<vector>> bnd(fvp.size());
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            bnd[pi].resize(static_cast<std::size_t>(fvp[pi].size));
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                const vector& uc = u[static_cast<std::size_t>(fvp[pi].faceCells[i])];
+                const scalar d = scalar(0.07)*scalar(1 + pi % 3);
+                bnd[pi][static_cast<std::size_t>(i)] = vector{uc.x + d, uc.y - d, uc.z + scalar(0.5)*d};
+            }
+        }
+        const std::vector<tensor> whole = fvc::gaussGrad(u, bnd, m, g, fvp);
+        fvc::gaussGradAt(u, bnd, m, g, fvp, at);
+        for (const label c : cells)
+        {
+            const std::size_t s = static_cast<std::size_t>(c);
+            ++t.compared;
+            t.differing += std::memcmp(&at.gradU[s], &whole[s], sizeof(tensor)) == 0 ? 0 : 1;
+            t.nonZero += (whole[s].xx != scalar(0) || whole[s].yz != scalar(0)) ? 1 : 0;
+        }
+    }
+    return t;
+}
+
 } // namespace
 
 int main()
 {
+    std::printf("== a Gauss gradient of a vector field at a subset of the cells ==\n");
+    // 3-D, sheared, three cell sizes
+    {
+        PrimitiveMesh m = boxtest::boxMesh(7, 6, 5, scalar(0.3), scalar(1), scalar(0.7), scalar(1.3));
+        FvGeometry g;
+        g.build(m);
+        const std::vector<FvPatch> fvp = buildPatches(m, g);
+        const Tally t = runGauss(m, g, fvp, false);
+        std::printf("  sheared 3-D box: %ld gradients compared at the cells on a patch, %ld differ, %ld are not "
+                    "zero\n", t.compared, t.differing, t.nonZero);
+        check("3-D, non-orthogonal: the subset's Gauss gradient is the whole mesh's, bit for bit",
+              t.compared > 0 && t.differing == 0 && 2*t.nonZero > t.compared);
+        const Tally wrong = runGauss(m, g, fvp, true);
+        std::printf("  CONTROL, every other face of the subset left out: %ld of %ld differ\n", wrong.differing,
+                    wrong.compared);
+        check("CONTROL: with faces left out of the subset the Gauss comparison fails", wrong.differing > 0);
+    }
+    // 2-D: the z planes empty
+    {
+        PrimitiveMesh m = boxtest::boxMesh(9, 7, 1, scalar(0.2), scalar(1), scalar(0.8), scalar(1));
+        FvGeometry g;
+        g.build(m);
+        std::vector<FvPatch> fvp = buildPatches(m, g);
+        for (FvPatch& q : fvp)
+        {
+            if (q.name == "wallZmin" || q.name == "wallZmax")
+            {
+                q.type = "empty";
+            }
+        }
+        const Tally t = runGauss(m, g, fvp, false);
+        std::printf("  2-D box: %ld Gauss gradients compared, %ld differ\n", t.compared, t.differing);
+        check("2-D, the z planes empty: the subset's Gauss gradient is the whole mesh's, bit for bit",
+              t.compared > 0 && t.differing == 0);
+    }
     std::printf("== a least-squares gradient and its cell limiter at a subset of the cells ==\n");
     // 3-D, sheared, three cell sizes
     {

@@ -40,6 +40,9 @@ inline tensor devTwoSymm(const tensor& g)
 //, pass the active model's wall Cmu (kEpsilon Cmu, kOmegaSST betaStar). rhoRef = rhoInf, pRef kinematic.
 // nutWallBnd (optional): per-boundary-face wall nut to use INSTEAD of nutkWallFunction (e.g. the SA
 // nutUSpaldingWallFunction value from the device solver). Indexed in the patch-then-face boundary order.
+// gradAt (optional): the cells of every patch that is not empty (fvc::gradSubset), to take grad(U) there only;
+// gradUBoundary reads it at those cells and nowhere else. A caller that samples the forces through a run builds it
+// once.
 inline ForceResult wallForces(
     const GeometricField<vector>& U,
     const GeometricField<scalar>& p,
@@ -55,11 +58,26 @@ inline ForceResult wallForces(
     scalar Cmu = 0.09,
     scalar kappa = 0.41,
     scalar E = 9.8,
-    const std::vector<scalar>* nutWallBnd = nullptr)
+    const std::vector<scalar>* nutWallBnd = nullptr,
+    const fvc::GradSubset* gradAt = nullptr)
 {
-    const std::vector<tensor> gradC = fvc::gaussGrad(U, m, g, patches);
+    std::vector<tensor> gradWhole;
+    if (gradAt)
+    {
+        std::vector<std::vector<vector>> bnd(patches.size());
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+            bnd[pi] = U.boundary[pi]->value();
+        fvc::gaussGradAt(U.internal, bnd, m, g, patches, *gradAt);
+    }
+    else
+        gradWhole = fvc::gaussGrad(U, m, g, patches);
+    const std::vector<tensor>& gradC = gradAt ? gradAt->gradU : gradWhole;
     const std::vector<std::vector<tensor>> gradB = fvc::gradUBoundary(U, gradC, m, g, patches);
-    const std::vector<std::vector<scalar>> yW = nearWallDist(m, g, patches);    // near-wall y for the wall nut
+    // near-wall y for the wall nut: only nutkWallFunction reads it, so not when the caller passes its own wall nut
+    // (the SA driver's nutUSpaldingWallFunction value). On the boxy5 UAV (4.94 M cells, H100 host) a force sample
+    // cost 2.37 s next to a 0.32 s iteration, which priced a per-iteration history of the 20-angle polar at 15 h.
+    const std::vector<std::vector<scalar>> yW = nutWallBnd ? std::vector<std::vector<scalar>>()
+                                                           : nearWallDist(m, g, patches);
     ForceResult R;
     label bndOff = 0;                                                           // cumulative boundary-face index (all patches)
     for (std::size_t pi = 0; pi < patches.size(); ++pi)

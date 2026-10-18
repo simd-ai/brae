@@ -724,6 +724,22 @@ int main(int argc, char** argv)
         std::vector<std::string> fcSampleWalls;
         for (const auto& q : fvp)
             if (q.type == "wall") fcSampleWalls.push_back(q.name);
+        // grad(U) is needed at the patches' cells only (wallForces' gradAt): the subset, made once
+        fvc::GradSubset fcSampleAt;
+        if (forceInterval > 0)
+        {
+            std::vector<char> onPatch(static_cast<std::size_t>(nC), 0);
+            for (const auto& q : fvp)
+            {
+                if (q.type == "empty") continue;
+                for (label i = 0; i < q.size; ++i)
+                    onPatch[static_cast<std::size_t>(q.faceCells[i])] = 1;
+            }
+            std::vector<label> cells;
+            for (label c = 0; c < nC; ++c)
+                if (onPatch[static_cast<std::size_t>(c)]) cells.push_back(c);
+            fcSampleAt = fvc::gradSubset(m, cells);
+        }
         std::ofstream fcOut;
         if (forceInterval > 0 && fcSampleDict && ctl.turbulent && !fcSampleWalls.empty())
         {
@@ -770,7 +786,22 @@ int main(int argc, char** argv)
             const vector dragDir = toV(fcSampleDict->scalarListOr("dragDir", {}), vector{1,0,0});
             const vector pitchAxis = toV(fcSampleDict->scalarListOr("pitchAxis", {}), vector{0,0,1});
             const vector CofR = toV(fcSampleDict->scalarListOr("CofR", {}), vector{0,0,0});
-            const ForceResult Fc = wallForces(U, p, solver.k(), ctl.nu, m, g, fvp, fcP, rhoInf, 0.0, CofR, wCmu, wKappa, wE, nwb);
+            const ForceResult Fc = wallForces(U,
+                                              p,
+                                              solver.k(),
+                                              ctl.nu,
+                                              m,
+                                              g,
+                                              fvp,
+                                              fcP,
+                                              rhoInf,
+                                              0.0,
+                                              CofR,
+                                              wCmu,
+                                              wKappa,
+                                              wE,
+                                              nwb,
+                                              &fcSampleAt);
             const ForceCoeffs cc = forceCoeffs(Fc, dragDir, liftDir, pitchAxis, rhoInf, magUInf, Aref, lRef);
             fcOut << tval << '\t' << cc.Cd << '\t' << cc.Cl << '\t' << cc.Cm << '\n';
             fcOut.flush();

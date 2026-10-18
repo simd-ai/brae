@@ -94,6 +94,8 @@ struct GradSubset
     mutable std::vector<scalar> maxVsf;
     mutable std::vector<scalar> minVsf;
     mutable std::vector<scalar> limiter;
+    // gaussGradAt's: the listed cells' entries are the gradient, an unlisted neighbour's a partial sum
+    mutable std::vector<tensor> gradU;
 };
 // the subset of `cells` (ascending, each once): its faces found
 GradSubset gradSubset(
@@ -125,6 +127,18 @@ std::vector<tensor> gaussGrad(const GeometricField<vector>& U,
                               const PrimitiveMesh& m,
                               const FvGeometry& g,
                               const std::vector<FvPatch>& patches);
+
+// ...and at a subset's cells, left in at.gradU: gaussGrad's own body over the subset's faces. A force integral
+// reads the gradient at the walls' cells only, and the whole mesh's took most of a force sample on the boxy5
+// UAV (4.94 M cells: 29 % of the run's host time with the forces sampled every iteration). Held to the whole
+// mesh's bits by tests/test_grad_subset.cu.
+void gaussGradAt(
+    const std::vector<vector>& internal,
+    const std::vector<std::vector<vector>>& boundary,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    const GradSubset& at);
 
 // flux(U) = interpolate(U) & Sf  (linear interpolation, face-normal flux).
 // Array form: for a vector field that is not a GeometricField (HbyA in pEqn.H, whose boundary values

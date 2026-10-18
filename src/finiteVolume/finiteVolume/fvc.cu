@@ -431,22 +431,49 @@ std::vector<vector> leastSquaresGrad(
     return leastSquaresGrad(p.internal, pb, m, g, patches);
 }
 
-std::vector<tensor> gaussGrad(
+namespace {
+
+// gaussGrad's body. With `at` the internal-face loop runs over the subset's faces (every internal face with a
+// listed cell on either side, ascending) and the division over its cells, so a listed cell takes the terms the
+// whole mesh's loop gives it, in the same order. The entries the loops write are cleared first; an unlisted cell
+// beside the subset is left with a partial sum, which nothing reads.
+void gaussGradInto(
+    std::vector<tensor>& grad,
     const std::vector<vector>& internal,
     const std::vector<std::vector<vector>>& boundary,
     const PrimitiveMesh& m,
     const FvGeometry& g,
-    const std::vector<FvPatch>& patches)
+    const std::vector<FvPatch>& patches,
+    const GradSubset* at)
 {
     const label nC = m.nCells(), nIf = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
     const std::vector<label>& nei = m.neighbour();
     const std::vector<scalar>& w  = g.weights();
     const std::vector<vector>& Sf = g.Sf();
+    const tensor zero{0,0,0,0,0,0,0,0,0};
+    const label nF = at ? static_cast<label>(at->faces.size()) : nIf;
 
-    std::vector<tensor> grad(nC, tensor{0,0,0,0,0,0,0,0,0});
-    for (label f = 0; f < nIf; ++f)
+    if (at)
     {
+        grad.resize(static_cast<std::size_t>(nC), zero);
+        for (label k = 0; k < nF; ++k)
+        {
+            const label f = at->faces[k];
+            grad[own[f]] = zero;
+            grad[nei[f]] = zero;
+        }
+        for (const FvPatch& fp : patches)
+            for (label i = 0; i < fp.size; ++i)
+                grad[fp.faceCells[i]] = zero;
+        for (const label c : at->cells)
+            grad[c] = zero;
+    }
+    else
+        grad.assign(static_cast<std::size_t>(nC), zero);
+    for (label k = 0; k < nF; ++k)
+    {
+        const label f = at ? at->faces[k] : k;
         const vector Uf = w[f] * (internal[own[f]] - internal[nei[f]]) + internal[nei[f]];   // OpenFOAM's form
         const tensor SfUf = outer(Sf[f], Uf);
         grad[own[f]] += SfUf;
@@ -466,9 +493,37 @@ std::vector<tensor> gaussGrad(
         for (label i = 0; i < fp.size; ++i)
             grad[fp.faceCells[i]] += outer(Sf[fp.start + i], uv[i]);
     }
-    for (label c = 0; c < nC; ++c)
-        grad[c] = grad[c] / g.V()[c];
+    if (at)
+        for (const label c : at->cells)
+            grad[c] = grad[c] / g.V()[c];
+    else
+        for (label c = 0; c < nC; ++c)
+            grad[c] = grad[c] / g.V()[c];
+}
+
+} // namespace
+
+std::vector<tensor> gaussGrad(
+    const std::vector<vector>& internal,
+    const std::vector<std::vector<vector>>& boundary,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches)
+{
+    std::vector<tensor> grad;
+    gaussGradInto(grad, internal, boundary, m, g, patches, nullptr);
     return grad;
+}
+
+void gaussGradAt(
+    const std::vector<vector>& internal,
+    const std::vector<std::vector<vector>>& boundary,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& patches,
+    const GradSubset& at)
+{
+    gaussGradInto(at.gradU, internal, boundary, m, g, patches, &at);
 }
 
 // ...and the field form, which is the array form over the values the field currently holds.
