@@ -2139,6 +2139,19 @@ bool simpleColourSwapControl()
                 if (hasAMI_)    interfaceAddLapCorr(ami_, kk, nuEff, gUx, gUy, gUz, lc);       // + AMI-face non-orth (rotated tensor stencil)
                 deviceAxpy(-nonOrthRelaxU, lc, relaxSrc[kk]);
             }
+            // Component kk's gradients have no reader past its two corrections above unless an interface term reads
+            // every component's (cyclic, AMI). Back in the pool here, they serve the next components' assembly, and
+            // the cell-field class peaks inside this loop: on boxy5 at 4.94 M cells its blocks alive in mom:sources
+            // went 83 -> 71 and in mom:solve 78 -> 60, the footprint 13.869 -> 13.400 GiB (BRAE_POOL_STATS census).
+            if (!hasCyclic_ && !hasAMI_)
+            {
+                gUx[kk].resize(0);
+                gUy[kk].resize(0);
+                gUz[kk].resize(0);
+                gLUx[kk].resize(0);
+                gLUy[kk].resize(0);
+                gLUz[kk].resize(0);
+            }
             // constant body force (drives periodic channels) is an explicit momentum SOURCE: it must go into relaxSrc
             // so it feeds BOTH the predictor AND H()/HbyA (OF UEqn.H() includes fvOptions sources). Adding it only to
             // the predictor leaves HbyA short by rAU*g -> the corrector U = HbyA - rAU*grad(p) converges ~(1-relax) low.
@@ -2266,6 +2279,17 @@ bool simpleColourSwapControl()
             else if (kk == 1) { res.Uy = ur; res.UyFinal = uperf.finalResidual; res.UyIters = uperf.nIterations; }
             else              { res.Uz = ur; res.UzFinal = uperf.finalResidual; res.UzIters = uperf.nIterations; }
             res.solvedU[kk] = 1;
+        }
+        // ...and with an interface, every component's after the loop: nothing past it reads them (the solve, the
+        // boundary correction and the pressure phase read grad(p)), and they were alive through the solve for nothing.
+        for (int l = 0; l < 3; ++l)
+        {
+            gUx[l].resize(0);
+            gUy[l].resize(0);
+            gUz[l].resize(0);
+            gLUx[l].resize(0);
+            gLUy[l].resize(0);
+            gLUz[l].resize(0);
         }
         if (nColour > 0)
         {
