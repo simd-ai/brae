@@ -63,6 +63,32 @@ struct TurbColourRule
     int minIter = 0;
 };
 inline TurbColourRule& turbColourRule() { static TurbColourRule r; return r; }
+// The folded system of each transported scalar, per mesh and field (deviceSolveScalarTransport has why it
+// persists), and whether its last solve was the colour-order sweep -- which gathers the system into scratch
+// of its own, where a Krylov solve captures a graph pinned to these addresses (FP-10 there). One store for
+// every model's instantiation, so that a driver can hand the swept ones back.
+struct ScalarTransportFold
+{
+    DeviceBuffer<scalar> diag;
+    DeviceBuffer<scalar> B;
+    bool colourSwept = false;
+};
+inline std::map<std::pair<const void*, std::string>, ScalarTransportFold>& scalarTransportFolds()
+{
+    static auto& store = *new std::map<std::pair<const void*, std::string>, ScalarTransportFold>();
+    return store;
+}
+// Hands the mesh's colour-swept folded systems back to the pool until the next solve re-takes them; a system
+// a Krylov solve read keeps its addresses for that solve's graph.
+inline void deviceScalarTransportFoldRelease(const DeviceMesh& dm)
+{
+    auto& store = scalarTransportFolds();
+    for (auto it = store.begin(); it != store.end();)
+    {
+        if (it->first.first == dm.owner.data() && it->second.colourSwept) it = store.erase(it);
+        else ++it;
+    }
+}
 
 namespace {
 // setValues (eps wall constraint): zero wall-cell off-diagonals + move the known eps0 to the neighbour RHS.
@@ -535,10 +561,9 @@ void deviceSolveScalarTransport(
     // had to copy the matrix into its own buffers before capturing a graph against them -- at 896,000
     // cells the largest copy in the iteration. With these stable the solver takes its direct path
     // (device_pcg.cu) and the copy does not happen. deviceFold resizes and overwrites both.
-    static auto& foldCache = *new std::map<std::pair<const void*, std::string>, std::pair<DeviceBuffer<scalar>, DeviceBuffer<scalar>>>();
-    auto& folded = foldCache[{dm.owner.data(), std::string(fieldName)}];
-    DeviceBuffer<scalar>& diagC = folded.first;
-    DeviceBuffer<scalar>& B = folded.second;
+    ScalarTransportFold& folded = scalarTransportFolds()[{dm.owner.data(), std::string(fieldName)}];
+    DeviceBuffer<scalar>& diagC = folded.diag;
+    DeviceBuffer<scalar>& B = folded.B;
     deviceFold(dm, aRD, src, aIC, aBC, diagC, B);
     // Stage harness: the assembled system for this transported scalar, at its first assembly only.
     if (stageDumpActive() && stageDumpFirstOnly((std::string("xport-") + fieldName).c_str()))
@@ -626,6 +651,7 @@ void deviceSolveScalarTransport(
     // The smoothSolver the case asked for, algorithm included: OpenFOAM's own sweep, level-scheduled
     // (device_sym_gauss_seidel.cuh), symmetric or ascending-only as the `smoother` entry names.
     const TurbColourRule& colourRule = turbColourRule();
+    folded.colourSwept = gs && colourRule.colouring;
     if (gs && colourRule.colouring)
     {
         GSFusedComponent one;

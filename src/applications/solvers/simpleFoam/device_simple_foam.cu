@@ -3383,8 +3383,23 @@ bool simpleColourSwapControl()
         // 2026-10-17). The stress term's workspace went back at its last use, in the momentum phase.
         mUp.resize(0);
         mLo.resize(0);
+        // ...and the momentum source: its last reader is H(), above; the next sources part rewrites it whole
+        // before any read (the lifetime audit, 2026-10-17: dead at momentum entry under both poisons; no reader
+        // in the turbulence phase). Three blocks of the cell-field class.
+        for (int kk = 0; kk < 3; ++kk)
+        {
+            relaxSrc[kk].resize(0);
+        }
         detail::devicePool().phase("turbulence");
         correctTurbulence();
+        // Turbulence's own held buffers are dead from here to its next correct(): the shared grad(U) memo, which
+        // U's change misses at every iteration's first site, and the folded systems its colour-order sweeps
+        // read (one a Krylov solve read keeps its addresses for that solve's graph). Both sat idle through the
+        // momentum phase, whose part mom:sources is where the cell-field class peaks (the lifetime audit: dead
+        // at momentum entry under both poisons; the class census: nine plus two of the 104 alive at the peak
+        // on boxy5 at 4.94 M cells).
+        deviceGradUSharedRelease(dm);
+        deviceScalarTransportFoldRelease(dm);
         detail::devicePool().phase("continuity");
         if (phaseTime)
         {

@@ -479,6 +479,12 @@ __global__ void fpDecideK(const unsigned long long* __restrict__ acc, unsigned l
     *valid = 1;
     if (h) ++(*nHit); else ++(*nMiss);
 }
+// the memos, one a mesh (deviceGradUShared has why the key is the mesh)
+std::map<const void*, GradUMemo>& gradUMemos()
+{
+    static auto& cache = *new std::map<const void*, GradUMemo>();
+    return cache;
+}
 int gradUMemoMode()
 {
     static const int mode = []()
@@ -509,7 +515,7 @@ const GradUMemo& deviceGradUShared(
     // (item 76, the device twin of item 75). dm.owner is the mesh's own addressing and lives as long as
     // the mesh; the device pool can hand a freed mesh's block back, so the entry is rebuilt whenever the
     // cell count disagrees and the fingerprint carries V to witness the rest.
-    static auto& cache = *new std::map<const void*, GradUMemo>();
+    auto& cache = gradUMemos();
     GradUMemo& m = cache[dm.owner.data()];
     cacheStat("gradu-memo", cache.size());
     const int nC = dm.nCells;
@@ -633,6 +639,16 @@ const GradUMemo& deviceGradUShared(
     }
     m.valid = true;
     return m;
+}
+
+void deviceGradUSharedRelease(const DeviceMesh& dm)
+{
+    // every buffer's block goes back to the pool as the empty memo is moved over it; the next call finds a cell
+    // count of 0, starts the device state invalid and computes -- where a hit returns the bits that computation
+    // would give
+    auto& cache = gradUMemos();
+    const auto it = cache.find(dm.owner.data());
+    if (it != cache.end()) it->second = GradUMemo();
 }
 
 void deviceGradU(

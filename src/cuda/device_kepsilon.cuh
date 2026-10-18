@@ -81,6 +81,11 @@ const GradUMemo& deviceGradUShared(const DeviceMesh& dm, const DeviceVectorBound
                                    const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                                    const DeviceBuffer<scalar>* const* UbStored = nullptr);
 
+// Hands the mesh's memo back to the pool until the next call re-takes and recomputes it: for a driver whose U
+// moves between the phases that read the memo, so that no hit is lost (the steady simpleFoam step, after its
+// turbulence phase).
+void deviceGradUSharedRelease(const DeviceMesh& dm);
+
 // gradU tensor (9*nC, OF convention column i = gaussGrad(U_i)) + GbyNu from a prebuilt gradU. Shared by k-eps
 // (GbyNu) and kOmegaSST (which also needs gradU for S2 = 2 magSqr(symm(gradU))).
 void deviceGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
