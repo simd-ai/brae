@@ -9,6 +9,11 @@
 //       off-diagonals. It takes its cLower and drops its graphs, and its next captured cycle is a fresh
 //       hierarchy's bit for bit. CONTROL: BRAE_CONTROL_AMG_LOWER_GRAPHS_KEPT=1 keeps the graphs, and that cycle
 //       must then differ -- the replay reads cUpper as the lower.
+//   (e) THE WHOLE-LOOP PCG GRAPH's copy (deviceAMGPCGGraph, CUDA 13 builds): handed one off-diagonal it copies the
+//       upper alone and its graph reads that copy as the lower. On one hierarchy, the fine view's lower moves from
+//       its own buffer to the upper and back: each second solve is a fresh solver's of that view, bit for bit.
+//       CONTROL: BRAE_CONTROL_PCG_GRAPH_LOWER_UNKEYED=1 leaves the lower out of the graph's key, and each second
+//       solve must then differ -- the replay reads the other view's lower.
 // The double-precision cycle throughout (BRAE_AMG_FP32=0, set before the first solve): its captured graph reads
 // the coarse views' lower, where the single-precision one reads copies cast outside the graph.
 #include "primitive_mesh.cuh"
@@ -20,6 +25,7 @@
 #include "device_buffer.cuh"
 #include "device_ldu.cuh"
 #include "device_amg.cuh"
+#include "device_amg_detail.cuh"   // BRAE_HAS_GS_DEVICE: leg (e) needs the whole-loop PCG graph (CUDA 13)
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -186,6 +192,64 @@ int main(int argc, char** argv)
             check(sameBits(zAfter, zRef), "(d) after the switch the cycle is the fresh hierarchy's, bit for bit");
         }
     }
+    // (e) the whole-loop PCG graph's copy of the matrix, one view after the other on one hierarchy
+#ifdef BRAE_HAS_GS_DEVICE
+    {
+        // the same addressing, the upper as the lower or the asymmetric lower beside it: only the lower moves
+        DeviceLduView two = dM.view();
+        two.lower = dA.lower.data();
+        // eight iterations from zero into ONE psi per hierarchy: the graph is keyed on psi, so a second buffer
+        // would recapture whatever the lower did, and the control below could not fail
+        const auto solve = [&](AMGData& amg, const DeviceLduView& v, DeviceBuffer<scalar>& x)
+        {
+            cudaCheck(cudaMemsetAsync(x.data(), 0, static_cast<std::size_t>(nC)*sizeof(scalar), cudaStreamPerThread), "psi = 0");
+            deviceAMGPCG(v, amg, db, x, normFactor, 1e-30, 0.0, 8, /*captureVcycle*/ true);
+            cudaCheck(cudaDeviceSynchronize(), "graph solve");
+            return x.host();
+        };
+        DeviceBuffer<scalar> xE(std::vector<scalar>(nC, 0.0));
+        const auto fresh = [&]()
+        {
+            AMGData a = buildAMG(ownerInt, m.neighbour(), magSfInt, nC);
+            amgGalerkin(a, dM.diag, dM.upper, dM.upper);
+            return a;
+        };
+        AMGData F1 = fresh();
+        const std::vector<scalar> refOne = solve(F1, one, xE);
+        check(F1.pcgCache && F1.pcgCache->gLower.size() == 0 && F1.pcgCache->gUpper.size() == static_cast<std::size_t>(nIf),
+              "(e) premise: handed one off-diagonal, the graph copies the upper alone");
+        AMGData F2 = fresh();
+        const std::vector<scalar> refTwo = solve(F2, two, xE);
+        check(F2.pcgCache && F2.pcgCache->gLower.size() == static_cast<std::size_t>(nIf),
+              "(e) premise: handed two, it copies the lower too");
+        check(!sameBits(refOne, refTwo), "(e) premise: the two views' solves differ");
+        for (int arm = 0; arm < 2; ++arm)
+        {
+            const bool control = arm == 1;
+            if (control) setenv("BRAE_CONTROL_PCG_GRAPH_LOWER_UNKEYED", "1", 1);
+            AMGData E = fresh();
+            solve(E, two, xE);
+            const std::vector<scalar> twoThenOne = solve(E, one, xE);
+            AMGData G = fresh();
+            solve(G, one, xE);
+            const std::vector<scalar> oneThenTwo = solve(G, two, xE);
+            if (control)
+            {
+                unsetenv("BRAE_CONTROL_PCG_GRAPH_LOWER_UNKEYED");
+                check(!sameBits(twoThenOne, refOne), "(e) CONTROL, lower unkeyed: two then one replays the other lower");
+                check(!sameBits(oneThenTwo, refTwo), "(e) CONTROL, lower unkeyed: one then two replays the upper as the lower");
+            }
+            else
+            {
+                check(sameBits(twoThenOne, refOne), "(e) two then one: the second solve is a fresh one-view solver's, bit for bit");
+                check(sameBits(oneThenTwo, refTwo), "(e) one then two: the second solve is a fresh two-view solver's, bit for bit");
+            }
+        }
+    }
+#else
+    std::printf("  (e) not run: no whole-loop PCG graph in this build (it needs CUDA 13)\n");
+#endif
+
     std::printf("%s\n", failures == 0 ? "PASS" : "FAIL");
     return failures == 0 ? 0 : 1;
 }

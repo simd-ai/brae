@@ -95,6 +95,10 @@ struct PCGGraphCache {
     // ...and the right-hand side and the fine matrix, copied in per solve, because a captured prologue
     // bakes their pointers and the callers hand in fresh buffers each time.
     DeviceBuffer<scalar> gB, gDiag, gUpper, gLower;
+    // A matrix handed with ONE off-diagonal (lower == upper: simpleFoam's symmetric pressure) is copied into gUpper
+    // alone and the graph reads gUpper as the lower; gLower stays empty. The lower the graph reads is in the key,
+    // so a view whose off-diagonals stop or start sharing is captured afresh instead of replayed.
+    const void* keyLower = nullptr;
     // THE COUPLED PAIR'S VALUES the same way -- the cyclic coefficient, its jump, the AMI coefficient -- and its
     // ADDRESSING in the key. A caller that builds the jump afresh each solve (interFoam's pressure step) had the
     // graph replay against the first solve's pointer: RAS/damBreakPorousBaffle, phi 5.6e-03 from OpenFOAM.
