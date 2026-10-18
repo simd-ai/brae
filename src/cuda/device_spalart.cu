@@ -475,6 +475,11 @@ void deviceSpalartAllmarasCorrect(
     deviceGaussGrad(dm, nuTilda, nbv, gnx, gny, gnz);
     DeviceBuffer<scalar> gradNt2(static_cast<std::size_t>(nC));
     saMagSqrKernel<<<nBlocks(nC), TPB>>>(nC, gnx.data(), gny.data(), gnz.data(), gradNt2.data());
+    // grad(nuTilda) has no reader past |grad nuTilda|^2. Back in the pool here, its three cell fields serve the
+    // solve's own temporaries, which set the turbulence phase's peak (BRAE_POOL_STATS class census, boxy5 4.94 M).
+    gnx.resize(0);
+    gny.resize(0);
+    gnz.resize(0);
     if (const char* sapath = std::getenv("BRAE_DUMP_SA"))   // cell-level SA-term dump (vs OF reference) -- first call only
     {
         static bool saDumped = false;
@@ -500,6 +505,9 @@ void deviceSpalartAllmarasCorrect(
             std::fprintf(stderr, "[BRAE_DUMP_SA] wrote %d cells to %s\n", nC, sapath);
         }
     }
+    // ...and the gradU tensor: Stilda, the DES length scales and the dump above were its last readers, and the
+    // reaction below reads Stilda and fw instead. Nine cell fields in one block, idle through the solve.
+    gradU.resize(0);
     DeviceBuffer<scalar> D(static_cast<std::size_t>(nC));
     saDEffKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), nu, co.sigmaNut, D.data());
     DeviceBuffer<scalar> divU;
