@@ -568,11 +568,29 @@ inline void readLinearSolverControls(
     if (!runsAs.momentumNoticedByCaller)
         noticeSolverChoice("U", "PBiCGStab", krylovPrecon("U"), ctl.gsU);
 
+    // One field's OWN stop rule: tolerance, relTol, maxIter and minIter from its dictionary, with lduMatrix::solver's
+    // defaults where the entry is silent (lduMatrixSolver.C:193-207). A name that matches no entry leaves the four
+    // as they stand -- for a `Final` name, the base field's rule (OpenFOAM would stop there; the Final note in
+    // DeviceSimpleControls has why brae does not).
+    auto readOwnStop = [&](const std::string& f,
+                           scalar& tol,
+                           scalar& relTol,
+                           int& maxIter,
+                           int& minIter)
+    {
+        if (!solvers || !solvers->subDict(f))
+            return;
+        tol = solverTol(f, kOpenFoamDefaultTolerance);
+        relTol = solverRelTol(f);
+        maxIter = solverMaxIter(f, 1000);
+        minIter = solverMinIter(f, 0);
+    };
     if (ctl.turbulent)
     {
-        // brae solves the turbulence pair to ONE tolerance (the tighter of the two), so the Final pair
-        // collapses the same way. Falling back to the base value per field keeps a case that defines
-        // only one of them (kFinal but no epsilonFinal) from tightening the pair on the strength of it.
+        // The ...KE figures solve the turbulence pair to ONE tolerance (the tighter of the two), so the
+        // Final pair collapses the same way. Falling back to the base value per field keeps a case that
+        // defines only one of them (kFinal but no epsilonFinal) from tightening the pair on the strength of
+        // it. The device closures take each field's own instead (tolK, tolEps; DeviceSimpleControls).
         if (ctl.sa)
         {
             ctl.tolKE = solverTol("nuTilda", kOpenFoamDefaultTolerance);
@@ -581,6 +599,13 @@ inline void readLinearSolverControls(
             ctl.minIterKE = solverMinIter("nuTilda", 0);
             ctl.tolKEFinal = solverTol("nuTildaFinal", ctl.tolKE);
             ctl.relTolKEFinal = solvers && solvers->subDict("nuTildaFinal") ? solverRelTol("nuTildaFinal") : ctl.relTolKE;
+            // the k slot is nuTilda's: its own rule, and its Final entry's
+            readOwnStop("nuTilda", ctl.tolK, ctl.relTolK, ctl.maxIterK, ctl.minIterK);
+            ctl.tolKFinal = ctl.tolK;
+            ctl.relTolKFinal = ctl.relTolK;
+            ctl.maxIterKFinal = ctl.maxIterK;
+            ctl.minIterKFinal = ctl.minIterK;
+            readOwnStop("nuTildaFinal", ctl.tolKFinal, ctl.relTolKFinal, ctl.maxIterKFinal, ctl.minIterKFinal);
             ctl.gsK = useSymGS("nuTilda") && runsAs.smoothSolverOnTurbulence;
             ctl.gsEps = false;
             noticeSolverChoice("nuTilda", "PBiCGStab", krylovPreconGs("nuTilda", ctl.gsK), ctl.gsK);
@@ -625,13 +650,49 @@ inline void readLinearSolverControls(
             if (solverMaxIter("k", 1000) != solverMaxIter(secondName, 1000)
              || solverMinIter("k", 0) != solverMinIter(secondName, 0))
                 noticeApproximated("solvers/k and solvers/" + secondName + " maxIter/minIter",
-                                   "the pair is solved under ONE cap: the tighter maxIter and the larger"
-                                   " minIter of the two entries");
+                                   "rhoSimpleFoam's mirror drivers (BRAE_RHOSIMPLEFOAM_MIRROR) solve the pair under"
+                                   " ONE cap: the tighter maxIter and the larger minIter of the two entries; the"
+                                   " device closures take each field's own");
             ctl.tolKEFinal = std::fmin(solverTol("kFinal", solverTol("k", kOpenFoamDefaultTolerance)),
                                        solverTol(secondName + "Final", solverTol(secondName, kOpenFoamDefaultTolerance)));
             ctl.relTolKEFinal = std::fmin(
                 solvers && solvers->subDict("kFinal") ? solverRelTol("kFinal") : solverRelTol("k"),
                 solvers && solvers->subDict(secondName + "Final") ? solverRelTol(secondName + "Final") : solverRelTol(secondName));
+            // Each field under its OWN entry, the device closures' rule, and each Final entry's.
+            readOwnStop("k", ctl.tolK, ctl.relTolK, ctl.maxIterK, ctl.minIterK);
+            readOwnStop(secondName, ctl.tolEps, ctl.relTolEps, ctl.maxIterEps, ctl.minIterEps);
+            ctl.tolKFinal = ctl.tolK;
+            ctl.relTolKFinal = ctl.relTolK;
+            ctl.maxIterKFinal = ctl.maxIterK;
+            ctl.minIterKFinal = ctl.minIterK;
+            ctl.tolEpsFinal = ctl.tolEps;
+            ctl.relTolEpsFinal = ctl.relTolEps;
+            ctl.maxIterEpsFinal = ctl.maxIterEps;
+            ctl.minIterEpsFinal = ctl.minIterEps;
+            readOwnStop("kFinal", ctl.tolKFinal, ctl.relTolKFinal, ctl.maxIterKFinal, ctl.minIterKFinal);
+            readOwnStop(secondName + "Final", ctl.tolEpsFinal, ctl.relTolEpsFinal, ctl.maxIterEpsFinal, ctl.minIterEpsFinal);
+            // BRAE_CONTROL_TURB_PAIR_ONE_RULE=1, the stop-rule gate's CONTROL
+            // (tests/simple_turbulence_stop_rule_vs_openfoam.sh): both fields under the merged figures, as the
+            // device closures solved them before each field's own was handed down.
+            if (std::getenv("BRAE_CONTROL_TURB_PAIR_ONE_RULE"))
+            {
+                ctl.tolK = ctl.tolKE;
+                ctl.relTolK = ctl.relTolKE;
+                ctl.maxIterK = ctl.maxIterKE;
+                ctl.minIterK = ctl.minIterKE;
+                ctl.tolEps = ctl.tolKE;
+                ctl.relTolEps = ctl.relTolKE;
+                ctl.maxIterEps = ctl.maxIterKE;
+                ctl.minIterEps = ctl.minIterKE;
+                ctl.tolKFinal = ctl.tolKEFinal;
+                ctl.relTolKFinal = ctl.relTolKEFinal;
+                ctl.maxIterKFinal = ctl.maxIterKE;
+                ctl.minIterKFinal = ctl.minIterKE;
+                ctl.tolEpsFinal = ctl.tolKEFinal;
+                ctl.relTolEpsFinal = ctl.relTolKEFinal;
+                ctl.maxIterEpsFinal = ctl.maxIterKE;
+                ctl.minIterEpsFinal = ctl.minIterKE;
+            }
             ctl.gsK = useSymGS("k") && runsAs.smoothSolverOnTurbulence;
             ctl.gsEps = useSymGS(secondName) && runsAs.smoothSolverOnTurbulence;
             // ONE smoother variant for the transported pair, as nSweeps is: the model solves both

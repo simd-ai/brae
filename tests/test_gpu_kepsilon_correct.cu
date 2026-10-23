@@ -78,11 +78,13 @@ int main(int argc, char** argv) {
     DeviceBuffer<scalar> dUx(ux),dUy(uy),dUz(uz), dk(kIn), de(eIn), dnut(nIn);
     DeviceBuffer<scalar> phiB(([&]{std::vector<scalar> o; for(auto&a:phi.boundary)o.insert(o.end(),a.begin(),a.end());return o;}()));
     const DeviceBuffer<scalar> dNutB(nutBIn);
+    // both fields under one rule, the cap the solves had before each field's own was handed down
+    const ScalarStopRule stop{tol, 0.0, kUnreadEntryMaxIter, 0};
     deviceKEpsilonCorrect(dm, wall, dbEps, dbK, dbU, dUx, dUy, dUz, dk, de, dnut,
-                          DeviceBuffer<scalar>(phi.internal), phiB, nu, relaxEps, relaxK, tol,
+                          DeviceBuffer<scalar>(phi.internal), phiB, nu, relaxEps, relaxK, stop, stop,
                           /*bounded*/false, /*boundedEps*/false,
                           /*limitedK*/false, /*limitedEps*/false, 2.0, 2.0,
-                          /*co*/{}, /*relTolKE*/0.0, /*keCheckEvery*/1,
+                          /*co*/{}, /*keCheckEvery*/1,
                           /*linearUpwindK*/false, /*linearUpwindEps*/false, /*nonOrth*/false,
                           /*gsK*/false, /*gsEps*/false, /*ami*/nullptr, /*cyc*/nullptr,
                           /*nutWall*/0, /*atmZ0*/0.0, /*atmBoundNut*/true,

@@ -372,12 +372,11 @@ void deviceSpalartAllmarasCorrect(
     const DeviceBuffer<scalar>& phiBnd,
     scalar nu,
     scalar relax,
-    scalar tol,
+    const ScalarStopRule& stop,
     bool bounded,
     bool limited,
     scalar twoByk,
     const SpalartAllmarasCoeffs& co,
-    scalar relTol,
     int checkEvery,
     bool linearUpwind,
     bool nonOrth,
@@ -543,7 +542,7 @@ void deviceSpalartAllmarasCorrect(
         cudaCheck(cudaGetLastError(), "SA DEff boundary");
     }
     deviceSolveScalarTransport(dm, dbNuTilda, nuTilda, "nuTilda", D, phiInt, phiBnd, divU, bounded, limited, linearUpwind, nonOrth, twoByk,
-                               relax, tol, relTol, checkEvery, gsK,
+                               relax, stop, checkEvery, gsK,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){
                                    saReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), nuTilda.data(), Stilda.data(),
                                        fw.data(), dScale.data(), gradNt2.data(), co, diag.data(), src.data()); },

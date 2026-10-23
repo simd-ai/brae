@@ -52,16 +52,26 @@ inline const DeviceDilu*& turbPrecon() { static const DeviceDilu* p = nullptr; r
 inline int& turbPolyDeg() { static int d = 1; return d; }
 // ...and simpleFoam's COLOUR RULE for the transported scalars, set by the same solver at the same point
 // (device_simple_foam.cu, colourTurb_): with a colouring here, a smoothSolver solve below sweeps in colour
-// order on the GPU (deviceColourGaussSeidelFused) under the entry's own stop rule -- its tolerance and
-// relTol (the call's), maxIter and minIter (these), nSweeps and smoother (the call's). Null is OpenFOAM's
-// own order, so an unset driver is unchanged. The legacy closures stop a case-order solve at a fixed 3000
-// sweeps; the rule takes the entry's maxIter instead, since it is the case's stop rule it claims to run.
+// order on the GPU (deviceColourGaussSeidelFused) under the field's own stop rule, the call's: its
+// tolerance, relTol, maxIter and minIter (ScalarStopRule), nSweeps and smoother. Null is OpenFOAM's own
+// order, so an unset driver is unchanged. The rule held ONE maxIter and minIter here for every field it
+// took, the tighter maxIter and the larger minIter of k's and omega's entries.
+//
+// oneSweep is the rule's gate's CONTROL (BRAE_CONTROL_SIMPLE_COLOUR_ONE_SWEEP): every solve the rule
+// takes stops after its first block of nSweeps sweeps.
 struct TurbColourRule
 {
     const DeviceCellColouring* colouring = nullptr;
-    int maxIter = 1000;
-    int minIter = 0;
+    bool oneSweep = false;
 };
+// BRAE_CONTROL_SCALAR_FIXED_CAP=1, the stop-rule gate's CONTROL (tests/simple_turbulence_stop_rule_vs_openfoam.sh):
+// OpenFOAM's order and the Krylov solve stop at kUnreadEntryMaxIter with no minIter, whatever the field's entry
+// says, as every scalar transport solve did before each field's own maxIter and minIter were handed down.
+inline bool scalarFixedCapControl()
+{
+    static const bool on = std::getenv("BRAE_CONTROL_SCALAR_FIXED_CAP") != nullptr;
+    return on;
+}
 inline TurbColourRule& turbColourRule() { static TurbColourRule r; return r; }
 // The folded system of each transported scalar, per mesh and field (deviceSolveScalarTransport has why it
 // persists), and whether its last solve was the colour-order sweep -- which gathers the system into scratch
@@ -246,8 +256,7 @@ void deviceSolveScalarTransport(
     bool nonOrth,
     scalar twoByk,
     scalar relax,
-    scalar tol,
-    scalar relTolKE,
+    const ScalarStopRule& stop,   // the field's own entry: tolerance, relTol, maxIter, minIter
     int keCheckEvery,
     bool useGS,
     Reaction&& reaction,
@@ -652,6 +661,9 @@ void deviceSolveScalarTransport(
     // (device_sym_gauss_seidel.cuh), symmetric or ascending-only as the `smoother` entry names.
     const TurbColourRule& colourRule = turbColourRule();
     folded.colourSwept = gs && colourRule.colouring;
+    const bool fixedCap = scalarFixedCapControl();
+    const int maxIter = fixedCap ? kUnreadEntryMaxIter : stop.maxIter;
+    const int minIter = fixedCap ? 0 : stop.minIter;
     if (gs && colourRule.colouring)
     {
         GSFusedComponent one;
@@ -663,15 +675,15 @@ void deviceSolveScalarTransport(
         deviceColourGaussSeidelFused(1,
                                      &one,
                                      *colourRule.colouring,
-                                     tol,
-                                     relTolKE,
-                                     colourRule.maxIter,
-                                     colourRule.minIter,
+                                     stop.tol,
+                                     stop.relTol,
+                                     colourRule.oneSweep ? 1 : stop.maxIter,
+                                     stop.minIter,
                                      nSweeps,
                                      gsSymmetric,
                                      &perf);
     }
-    else if (gs) deviceSymGaussSeidel(sv, B, field, dnf.data(), tol, relTolKE, 3000, &perf, /*minIter*/0, nSweeps,
+    else if (gs) deviceSymGaussSeidel(sv, B, field, dnf.data(), stop.tol, stop.relTol, maxIter, &perf, minIter, nSweeps,
                                       gsSymmetric);
     // DILU when the case asks for it, Jacobi otherwise. NOT a cost choice: both reach the requested
     // relTol, but they stop in different places -- on turbulentFlatPlate:kEpsilon OpenFOAM's DILU solve
@@ -680,7 +692,7 @@ void deviceSolveScalarTransport(
     else
     {
         const DeviceDilu* pc = precon ? precon : turbPrecon();
-        perf = deviceJacobiBiCGStab(sv, B, field, dnf.data(), tol, relTolKE, 3000, keCheckEvery, 0,
+        perf = deviceJacobiBiCGStab(sv, B, field, dnf.data(), stop.tol, stop.relTol, maxIter, keCheckEvery, minIter,
                                     (pc && pc->valid) ? pc : nullptr, /*amg=*/nullptr,
                                     (pc && pc->valid) ? 1 : turbPolyDeg());
     }

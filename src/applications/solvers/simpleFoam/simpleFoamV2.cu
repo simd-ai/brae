@@ -1669,6 +1669,11 @@ int runSimpleFoamV2(const std::string& caseDir)
             // outer iteration while the case asks for 1e-05 / relTol 0.1 / symGaussSeidel. Measured: the
             // turbulence hook was 168 ms of a ~300 ms outer iteration on 440k cells -- 56% of the run --
             // and almost none of that was the nuEff host copy (6 ms); it was over-solving these two.
+            //
+            // ONE rule for both fields of the pair, from k's entry alone (the reader below reads no other), at
+            // the old cap: a known gap of this driver (kUnreadEntryMaxIter). The legacy driver takes each
+            // field's own entry.
+            const ScalarStopRule v2PairStop{tolKE, relTolKE, kUnreadEntryMaxIter, 0};
             if (saModel)
             {
                 // SpalartAllmarasBase::correct(): chi/fv1/fv2/ft2 -> Stilda -> the nuTilda transport
@@ -1686,9 +1691,9 @@ int runSimpleFoamV2(const std::string& caseDir)
                 dsa.E        = saCoeffs.E;
                 deviceSpalartAllmarasCorrect(dm, dbU, dbK, gf.Ux, gf.Uy, gf.Uz,
                                              dK, dNut, dY, gf.phiInt, gf.phiBnd,
-                                             nu, relaxK, tolKE,
+                                             nu, relaxK, v2PairStop,
                                              boundedK, limitedK, twoBykK,
-                                             dsa, relTolKE, /*checkEvery*/1,
+                                             dsa, /*checkEvery*/1,
                                              // SpalartAllmaras's own laplacian takes the case's scheme
                                              // too. validation/airFoil2D names
                                              // `div(phi,nuTilda) bounded Gauss linearUpwind grad(nuTilda)`
@@ -1712,10 +1717,10 @@ int runSimpleFoamV2(const std::string& caseDir)
                 // omega-wall setValues) -> bound -> k eqn -> bound -> correctNut (Bradshaw limiter).
                 deviceKOmegaSSTCorrect(dm, wall, dbEps, dbK, dbU, gf.Ux, gf.Uy, gf.Uz,
                                        dK, dEps, dNut, dY, gf.phiInt, gf.phiBnd,
-                                       nu, relaxEps, relaxK, tolKE,
+                                       nu, relaxEps, relaxK, v2PairStop, v2PairStop,
                                        boundedK, boundedEps,
                                        limitedK, limitedEps, twoBykK, twoBykEps,
-                                       sstCoeffs, relTolKE, /*keCheckEvery*/1,
+                                       sstCoeffs, /*keCheckEvery*/1,
                                        // The case's OWN turbulence div and laplacian schemes. These were
                                        // hardcoded off while the setup line above printed what the case
                                        // asked for -- so a case naming `linearUpwind` or `corrected` got
@@ -1763,10 +1768,10 @@ int runSimpleFoamV2(const std::string& caseDir)
             else
             deviceKEpsilonCorrect(dm, wall, dbEps, dbK, dbU, gf.Ux, gf.Uy, gf.Uz,
                                   dK, dEps, dNut, gf.phiInt, gf.phiBnd,
-                                  nu, relaxEps, relaxK, tolKE,
+                                  nu, relaxEps, relaxK, v2PairStop, v2PairStop,
                                   boundedK, boundedEps,
                                   limitedK, limitedEps, twoBykK, twoBykEps,
-                                  keCoeffs, relTolKE, /*keCheckEvery*/1,
+                                  keCoeffs, /*keCheckEvery*/1,
                                   // The case's OWN turbulence div and laplacian schemes. These were three
                                   // hardcoded `false`s while the SST call forty lines above forwarded the
                                   // very same variables, and while the driver printed what the case asked

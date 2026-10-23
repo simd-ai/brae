@@ -74,6 +74,20 @@ struct DeviceSimpleControls
     int    minIterUFinal = 0,    minIterPFinal = 0,    minIterKEFinal = 0;
     scalar tolUFinal = 1e-6, tolPFinal = 1e-6, tolKEFinal = 1e-6;
     scalar relTolUFinal = 0.0, relTolPFinal = 0.0, relTolKEFinal = 0.0;
+    // The transported pair's OWN entries, one field each: k (nuTilda under Spalart-Allmaras) and the second
+    // field, epsilon or omega. OpenFOAM's lduMatrix::solver reads tolerance, relTol, maxIter and minIter from
+    // the dictionary of the field it solves (lduMatrixSolver.C:193-207) and the models solve each equation on
+    // its own (kOmegaSSTBase.C:593/:618, kEpsilon.C:268/:288); the device closures take these.
+    //
+    // The ...KE figures above are the pair MERGED -- the tighter tolerance, relTol and maxIter, the larger
+    // minIter -- which the device closures took until 2026-10-22: with k staged at 1e-13 beside omega at
+    // 1e-15, k ran to its sweep cap at every solve on motorBike. They stay for the callers that still carry
+    // one rule for the pair or take the pair's for a field of their own: the rho mirror drivers' host
+    // closures, kOmegaSSTLM's transition scalars, Maxwell's sigma, a scalarTransport object's relTol.
+    scalar tolK = 1e-6, relTolK = 0.0, tolKFinal = 1e-6, relTolKFinal = 0.0;
+    int    maxIterK = 1000, minIterK = 0, maxIterKFinal = 1000, minIterKFinal = 0;
+    scalar tolEps = 1e-6, relTolEps = 0.0, tolEpsFinal = 1e-6, relTolEpsFinal = 0.0;
+    int    maxIterEps = 1000, minIterEps = 0, maxIterEpsFinal = 1000, minIterEpsFinal = 0;
     // TWO flags, because OF selects the Final entry two different ways and the difference is visible in
     // its log on any PISO-mode case (nOuterCorrectors 1, two pressure correctors):
     //
@@ -115,6 +129,14 @@ struct DeviceSimpleControls
     scalar uRelTol()  const { return finalIter  ? relTolUFinal  : relTolU; }
     scalar keTol()    const { return finalIter  ? tolKEFinal    : tolKE; }
     scalar keRelTol() const { return finalIter  ? relTolKEFinal : relTolKE; }
+    scalar kTol()       const { return finalIter ? tolKFinal       : tolK; }
+    scalar kRelTol()    const { return finalIter ? relTolKFinal    : relTolK; }
+    int    kMaxIter()   const { return finalIter ? maxIterKFinal   : maxIterK; }
+    int    kMinIter()   const { return finalIter ? minIterKFinal   : minIterK; }
+    scalar epsTol()     const { return finalIter ? tolEpsFinal     : tolEps; }
+    scalar epsRelTol()  const { return finalIter ? relTolEpsFinal  : relTolEps; }
+    int    epsMaxIter() const { return finalIter ? maxIterEpsFinal : maxIterEps; }
+    int    epsMinIter() const { return finalIter ? minIterEpsFinal : minIterEps; }
     // fvSolution PIMPLE/finalOnLastPimpleIterOnly (pimpleControl.C:53, default false).
     bool   finalOnLastPimpleIterOnly = false;
     int    bicgCheckEvery = 1;      // batched convergence for ALL BiCGStab solves (momentum + k/eps); BRAE_BICG_CHECK_EVERY.

@@ -419,6 +419,10 @@ void deviceSolveEnergy(
     // The only source is OF's kinetic-energy transport: EEqn carries + fvc::div(phi, K) on the LHS with
     // K = 0.5|U|^2, so it enters the RHS with a minus. Negligible in a slow laminar duct, which is why
     // phase 1 left it out; at 50 m/s against a noSlip wall it is not, and it shifts T by percent.
+    //
+    // he's own tolerance and relTol, and the old cap: its maxIter and minIter, which the reader has
+    // (DeviceSimpleControls::maxIterHe), are not handed down to here yet (kUnreadEntryMaxIter).
+    const ScalarStopRule heStop{tol, relTol, kUnreadEntryMaxIter, 0};
     deviceSolveScalarTransport(
         dm,
         dbHe,
@@ -434,8 +438,7 @@ void deviceSolveEnergy(
         nonOrth,
         twoByk,
         relax,
-        tol,
-        relTol,
+        heStop,
         checkEvery,
         useGS,
         [&](DeviceBuffer<scalar>&, DeviceBuffer<scalar>& source)

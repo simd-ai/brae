@@ -909,7 +909,8 @@ void deviceKOmegaSSTCorrect(
     scalar nu,
     scalar relaxOmega,
     scalar relaxK,
-    scalar tol,
+    const ScalarStopRule& kStop,
+    const ScalarStopRule& omegaStop,
     bool bounded,
     bool boundedEps,   // div(phi,epsilon|omega) `bounded`; `bounded` above is div(phi,k)'s
     bool limitedK,
@@ -917,7 +918,6 @@ void deviceKOmegaSSTCorrect(
     scalar twoBykK,
     scalar twoBykOmega,
     const KOmegaSSTCoeffs& co,
-    scalar relTolKE,
     int keCheckEvery,
     bool linearUpwindK,
     bool linearUpwindOmega,
@@ -1086,7 +1086,7 @@ void deviceKOmegaSSTCorrect(
         }
     }
     deviceSolveScalarTransport(dm, dbOmega, omega, "omega", DomegaEff, phiInt, phiBnd, divPhi, boundedEps, limitedOmega, linearUpwindOmega, nonOrth, twoBykOmega,
-                               relaxOmega, tol, relTolKE, keCheckEvery, gsEps,
+                               relaxOmega, omegaStop, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceOmegaReaction(dm.V, gamma, beta, GbyNu0lim, F1, CD, omega, divU, diag, src, rho); },
                                &wall, &omega0, ami, cyc, sDdt, DomB.size() ? &DomB : nullptr, gradScalarLimitK,
                                true, fvoEMask, fvoEVal,
@@ -1102,7 +1102,7 @@ void deviceKOmegaSSTCorrect(
     deviceDEff(F1, nut, co.alphaK1, co.alphaK2, rho ? scalar(0) : nu, DkEff);
     if (rho && muLam) scaleDEffCompressible(*rho, *muLam, DkEff);
     deviceSolveScalarTransport(dm, dbK, k, "k", DkEff, phiInt, phiBnd, divPhi, bounded, limitedK, linearUpwindK, nonOrth, twoBykK,
-                               relaxK, tol, relTolKE, keCheckEvery, gsK,
+                               relaxK, kStop, keCheckEvery, gsK,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceKReactionSST(dm.V, k, omega, G, divU, co, diag, src, gammaIntEff, des ? &FDES : nullptr, rho); },
                                nullptr, nullptr, ami, cyc, kDdt, DkB.size() ? &DkB : nullptr, gradScalarLimitK,
                                true, fvoKMask, fvoKVal,
@@ -1467,6 +1467,9 @@ void deviceKOmegaSSTLMCorrect(
     bool gsSymmetric)
 {
     const int nC = dm.nCells;
+    // ReThetat and gammaInt solve under the pair's tolerance and relTol that the caller hands in, not their own
+    // entries, and at the old cap: a known gap (kUnreadEntryMaxIter). The colour rule does not take this model.
+    const ScalarStopRule transitionStop{tol, relTolKE, kUnreadEntryMaxIter, 0};
     const LMCoeffs lm;
     DeviceBuffer<scalar> gradU;
     deviceGradU(dm, dbU, Ux, Uy, Uz, gradU, ami, cyc);
@@ -1481,7 +1484,7 @@ void deviceKOmegaSSTLMCorrect(
     DeviceBuffer<scalar> DRe(nC);
     lmReDiffKernel<<<nBlocks(nC), TPB>>>(nC, nut.data(), lm.sigmaThetat, nu, DRe.data());   // sigmaThetat*(nut+nu)
     deviceSolveScalarTransport(dm, dbReThetat, ReThetat, "ReThetat", DRe, phiInt, phiBnd, divU, bounded, limitedLinear, linearUpwind, nonOrth, 2.0,
-                               relax, tol, relTolKE, keCheckEvery, gsEps,
+                               relax, transitionStop, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ lmAddReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), spR.data(), suR.data(), diag.data(), src.data()); },
                                nullptr, nullptr, ami, cyc, reDdt, /*DBnd*/nullptr, /*gradLimitK*/0.0,
                                /*bound*/true, /*fvoMask*/nullptr, /*fvoVal*/nullptr,
@@ -1498,7 +1501,7 @@ void deviceKOmegaSSTLMCorrect(
     DeviceBuffer<scalar> DgI(nC);
     depsKernel<<<nBlocks(nC), TPB>>>(nC, nut.data(), 1.0, nu, DgI.data());   // nut/1 + nu
     deviceSolveScalarTransport(dm, dbGammaInt, gammaInt, "gammaInt", DgI, phiInt, phiBnd, divU, bounded, limitedLinear, linearUpwind, nonOrth, 2.0,
-                               relax, tol, relTolKE, keCheckEvery, gsEps,
+                               relax, transitionStop, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ lmAddReactionKernel<<<nBlocks(nC), TPB>>>(nC, dm.V.data(), spG.data(), suG.data(), diag.data(), src.data()); },
                                nullptr, nullptr, ami, cyc, giDdt, /*DBnd*/nullptr, /*gradLimitK*/0.0,
                                /*bound*/true, /*fvoMask*/nullptr, /*fvoVal*/nullptr,

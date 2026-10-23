@@ -190,11 +190,13 @@ int main(int argc, char** argv) {
         // DkEff(patchi)/DepsilonEff(patchi) come from nut's OWN boundary on the host path, so the device
         // is given the same thing -- rebuilt from the CURRENT k each step, exactly as the host's
         // correctNut rewrites the wall value at the end of every correct().
+        // both fields under one rule, the cap the solves had before each field's own was handed down
+        const ScalarStopRule stop{tol, 0.0, kUnreadEntryMaxIter, 0};
         deviceKEpsilonCorrect(dm, wall, dbEps, dbK, dbU, Uk[0], Uk[1], Uk[2], dk, de, dnut, phiInt, phiBnd,
-                              nu, relaxEps, relaxK, tol,
+                              nu, relaxEps, relaxK, stop, stop,
                               /*bounded*/false, /*boundedEps*/false,
                               /*limitedK*/false, /*limitedEps*/false, 2.0, 2.0,
-                              /*co*/{}, /*relTolKE*/0.0, /*keCheckEvery*/1,
+                              /*co*/{}, /*keCheckEvery*/1,
                               /*linearUpwindK*/false, /*linearUpwindEps*/false, /*nonOrth*/false,
                               /*gsK*/false, /*gsEps*/false, /*ami*/nullptr, /*cyc*/nullptr,
                               /*nutWall*/0, /*atmZ0*/0.0, /*atmBoundNut*/true,

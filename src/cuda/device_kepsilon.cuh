@@ -390,8 +390,28 @@ void deviceBoundaryNut(const DeviceBoundary& db, const DeviceBuffer<label>& isWa
                        const DeviceBuffer<scalar>* kBnd = nullptr,
                        const DeviceBuffer<scalar>* epsBnd = nullptr);
 
+// One transported scalar's stop rule, from that field's OWN fvSolution entry. OpenFOAM's lduMatrix::solver reads
+// tolerance, relTol, maxIter and minIter from the dictionary of the field it solves (lduMatrixSolver.C:193-207;
+// defaults 1e-6, 0, 1000 and 0), and kEpsilon.C:268/:288 and kOmegaSSTBase.C:593/:618 solve each equation of the
+// pair on its own. brae solved k and epsilon/omega under ONE tolerance and relTol, the tighter of the two entries,
+// and said nothing, and stopped every sweep in OpenFOAM's order at a literal 3000 whatever the entry's maxIter:
+// staged at k 1e-13 beside omega 1e-15 (motorBike, 14.1 M cells), k ran to that cap at every solve.
+struct ScalarStopRule
+{
+    scalar tol;
+    scalar relTol;
+    int maxIter;
+    int minIter;
+};
+// The cap every scalar transport solve took before each field's own maxIter was handed down, and minIter 0 beside
+// it. Still taken by the solves whose maxIter and minIter no driver hands down yet -- kOmegaSSTLM's ReThetat and
+// gammaInt, the energy, Maxwell's sigma, a scalarTransport object, the V2 driver's pair -- each a known gap:
+// OpenFOAM stops them at their own entry's maxIter, 1000 by default (lduMatrix.H:125).
+constexpr int kUnreadEntryMaxIter = 3000;
+
 // The full device kEpsilon::correct(): production -> wall functions/override -> eps eqn (with the wall
 // setValues constraint) -> k eqn -> correctNut. Updates k/eps/nut in place. Mirrors the CPU correct().
+// kStop and epsStop are k's and epsilon's own entries (ScalarStopRule).
 // div(phi,k)/div(phi,epsilon) scheme: upwind by default; limitedLinear when limitedK/limitedEps set (twoByk* =
 // 2/max(k_,SMALL) from the scheme coefficient). limitedLinear reduces to upwind at limiter=0 (bit-identical off).
 void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, const DeviceBoundary& dbEps,
@@ -399,10 +419,11 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
                            const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                            DeviceBuffer<scalar>& k, DeviceBuffer<scalar>& eps, DeviceBuffer<scalar>& nut,
                            const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& phiBnd,
-                           scalar nu, scalar relaxEps, scalar relaxK, scalar tol, bool bounded = false,
+                           scalar nu, scalar relaxEps, scalar relaxK, const ScalarStopRule& kStop,
+                           const ScalarStopRule& epsStop, bool bounded = false,
                            bool boundedEps = false,   // div(phi,epsilon) `bounded` (bounded = div(phi,k)'s)
                            bool limitedK = false, bool limitedEps = false, scalar twoBykK = 2.0, scalar twoBykEps = 2.0,
-                           const KEpsilonCoeffs& co = {}, scalar relTolKE = 0.0, int keCheckEvery = 1,
+                           const KEpsilonCoeffs& co = {}, int keCheckEvery = 1,
                            bool linearUpwindK = false, bool linearUpwindEps = false, bool nonOrth = false,
                            bool gsK = false, bool gsEps = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
                            int nutWall = 0,   // 0=nutk 1=nutUSpalding 2=nutUBlended: near-wall G0 uses the BC-chosen nutw
@@ -445,15 +466,17 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
 // omega eqn (loose solve, omega-wall setValues) -> bound -> k eqn (loose solve) -> bound -> correctNut (Bradshaw
 // limiter). y = precomputed cell wall distance (cellWallDist). All blocks reuse the C1-6 validated kernels +
 // the shared deviceSolveScalarTransport scaffold. Updates k/omega/nut in place. Mirrors kOmegaSSTBase::correct().
+// kStop and omegaStop are k's and omega's own entries (ScalarStopRule).
 void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, const DeviceBoundary& dbOmega,
                             const DeviceBoundary& dbK, const DeviceVectorBoundary& dbU,
                             const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                             DeviceBuffer<scalar>& k, DeviceBuffer<scalar>& omega, DeviceBuffer<scalar>& nut,
                             const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& phiBnd,
-                            scalar nu, scalar relaxOmega, scalar relaxK, scalar tol, bool bounded = false,
+                            scalar nu, scalar relaxOmega, scalar relaxK, const ScalarStopRule& kStop,
+                            const ScalarStopRule& omegaStop, bool bounded = false,
                             bool boundedEps = false,   // div(phi,omega) `bounded` (bounded = div(phi,k)'s)
                             bool limitedK = false, bool limitedOmega = false, scalar twoBykK = 2.0, scalar twoBykOmega = 2.0,
-                            const KOmegaSSTCoeffs& co = {}, scalar relTolKE = 0.0, int keCheckEvery = 1,
+                            const KOmegaSSTCoeffs& co = {}, int keCheckEvery = 1,
                             bool linearUpwindK = false, bool linearUpwindOmega = false, bool nonOrth = false, scalar gradULimitK = 0.0,
                             bool gsK = false, bool gsEps = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
                             const scalar* gammaIntEff = nullptr,   // kOmegaSSTLM transition: scales k Pk/epsilonByk
@@ -520,13 +543,13 @@ void deviceKOmegaSSTLMCorrect(const DeviceMesh& dm, const DeviceVectorBoundary& 
 // Spalart-Allmaras (one-equation): solve the nuTilda transport (div - laplacian(DnuTildaEff) + Sp(destruction) ==
 // production + Cb2 grad^2) via the shared scaffold, then nut = nuTilda*fv1. Mirrors SpalartAllmarasBase::correct()
 // (incompressible, steady, ft2 off). dbNuTilda = the nuTilda boundary (freestream + fixedValue-0 wall). y = cell
-// wall distance. nuTilda/nut updated in place.
+// wall distance. nuTilda/nut updated in place. stop is nuTilda's own entry (ScalarStopRule).
 void deviceSpalartAllmarasCorrect(const DeviceMesh& dm, const DeviceVectorBoundary& dbU, const DeviceBoundary& dbNuTilda,
                                   const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                                   DeviceBuffer<scalar>& nuTilda, DeviceBuffer<scalar>& nut, const DeviceBuffer<scalar>& y,
                                   const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& phiBnd,
-                                  scalar nu, scalar relax, scalar tol, bool bounded = false, bool limited = false,
-                                  scalar twoByk = 2.0, const SpalartAllmarasCoeffs& co = {}, scalar relTol = 0.0, int checkEvery = 1,
+                                  scalar nu, scalar relax, const ScalarStopRule& stop, bool bounded = false, bool limited = false,
+                                  scalar twoByk = 2.0, const SpalartAllmarasCoeffs& co = {}, int checkEvery = 1,
                                   bool linearUpwind = false, bool nonOrth = false,
                                   bool gsK = false, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
                                   const ScalarDdt& ntDdt = {},   // transient fvm::ddt(nuTilda)

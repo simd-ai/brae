@@ -283,10 +283,13 @@ public:
             throw std::runtime_error("brae: scalarTransport '" + spec_.field + "' asks nCorr " + std::to_string(spec_.nCorr) +
                                      " on the device arm, which runs one correction per iteration; refusing rather "
                                      "than running fewer.");
+        // the object's own tolerance and relTol, and the old cap: no maxIter or minIter is handed down here yet
+        // (kUnreadEntryMaxIter)
+        const ScalarStopRule stop{spec_.sc.tol, spec_.sc.relTol, kUnreadEntryMaxIter, 0};
         deviceSolveScalarTransport(
             dm, db_, field_, spec_.field.c_str(), D_, f.phiInt, f.phiBnd, divPhi,
             spec_.scheme.bounded, spec_.scheme.limited, spec_.scheme.linearUpwind, spec_.scheme.nonOrth,
-            spec_.scheme.twoByk, spec_.sc.relax, spec_.sc.tol, spec_.sc.relTol, /*checkEvery*/1, spec_.sc.gs,
+            spec_.scheme.twoByk, spec_.sc.relax, stop, /*checkEvery*/1, spec_.sc.gs,
             [](DeviceBuffer<scalar>&, DeviceBuffer<scalar>&){},   // passive: no reaction
             nullptr, nullptr, nullptr, nullptr,
             ScalarDdt{},            // steady: fvm::ddt(rho, s) drops out

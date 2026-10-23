@@ -89,9 +89,15 @@ int main()
         eqScalar("tolU", ctl.tolU, 1e-09);
         eqScalar("relTolP", ctl.relTolP, 0.05);
         eqScalar("relTolU", ctl.relTolU, 0.02);
-        // k/omega share one solve tolerance in brae: OF solves them separately, so take the TIGHTER.
+        // The MERGED figure, for the callers that still carry one rule for the pair: the TIGHTER.
         eqScalar("tolKE = min(tol k, tol omega)", ctl.tolKE, 1e-11);
         eqScalar("relTolKE = min(relTol k, relTol omega)", ctl.relTolKE, 0.03);
+        // ...and each field's OWN, which the device closures solve under: OF reads every field from its
+        // own dictionary (lduMatrixSolver.C:193-207).
+        eqScalar("tolK is k's own", ctl.tolK, 1e-11);
+        eqScalar("tolEps is omega's own", ctl.tolEps, 1e-10);
+        eqScalar("relTolK is k's own", ctl.relTolK, 0.03);
+        eqScalar("relTolEps is omega's own", ctl.relTolEps, 0.04);
         // smoothSolver + a GaussSeidel-family smoother -> symGS; anything else stays BiCGStab.
         eqBool("gsU (smoothSolver/symGaussSeidel)", ctl.gsU, true);
         eqBool("gsK (smoothSolver/GaussSeidel)", ctl.gsK, true);
@@ -199,6 +205,63 @@ int main()
         eqInt   ("laminar -> maxIterKE untouched", lam.maxIterKE, dflt.maxIterKE);
         eqScalar("laminar -> tolHe still read",    lam.tolHe,     1e-03);
         if (failures == 0) std::printf("  OK   energy slot and turbulence caps read from their own entries\n");
+    }
+
+    // ---- 4c. each field of the pair under its OWN entry, Final entries included ----
+    // The device closures solved k and omega under the merged figure: k staged at 1e-13 beside omega at
+    // 1e-15 ran to its sweep cap. Every figure distinct per field is the test; a reader that fills both
+    // fields from one entry, or a Final from its base field when the Final entry is there, fails it.
+    {
+        const std::string d = base + "/ownstop";
+        std::filesystem::create_directories(d + "/system");
+        {
+            std::ofstream f(d + "/system/fvSolution");
+            f << "FoamFile { version 2.0; format ascii; class dictionary; object fvSolution; }\n"
+              << "solvers\n{\n"
+              << "    k          { solver smoothSolver; smoother GaussSeidel; tolerance 1e-13; relTol 0;    maxIter 7;  minIter 2; }\n"
+              << "    omega      { solver smoothSolver; smoother GaussSeidel; tolerance 1e-17; relTol 0.01; maxIter 13; minIter 3; }\n"
+              << "    omegaFinal { solver smoothSolver; smoother GaussSeidel; tolerance 1e-09; }\n"
+              << "    nuTilda    { solver smoothSolver; smoother GaussSeidel; tolerance 1e-08; relTol 0.2;  maxIter 5;  minIter 4; }\n"
+              << "}\n"
+              << "SIMPLE { }\n";
+        }
+        const FoamDict fv = readDict(d + "/system/fvSolution");
+        DeviceSimpleControls ctl;   ctl.turbulent = true;   ctl.sst = true;
+        readLinearSolverControls(fv, "omega", ctl, "SIMPLE");
+        eqScalar("own: tolK",        ctl.tolK,       1e-13);
+        eqScalar("own: relTolK",     ctl.relTolK,    0.0);
+        eqInt   ("own: maxIterK",    ctl.maxIterK,   7);
+        eqInt   ("own: minIterK",    ctl.minIterK,   2);
+        eqScalar("own: tolEps",      ctl.tolEps,     1e-17);
+        eqScalar("own: relTolEps",   ctl.relTolEps,  0.01);
+        eqInt   ("own: maxIterEps",  ctl.maxIterEps, 13);
+        eqInt   ("own: minIterEps",  ctl.minIterEps, 3);
+        // no kFinal: k's own stands; omegaFinal is there and silent on all but its tolerance, so
+        // lduMatrix::solver's defaults (relTol 0, maxIter 1000, minIter 0), not omega's
+        eqScalar("own: tolKFinal is k's",          ctl.tolKFinal,       1e-13);
+        eqInt   ("own: maxIterKFinal is k's",      ctl.maxIterKFinal,   7);
+        eqScalar("own: tolEpsFinal",               ctl.tolEpsFinal,     1e-09);
+        eqScalar("own: relTolEpsFinal default",    ctl.relTolEpsFinal,  0.0);
+        eqInt   ("own: maxIterEpsFinal default",   ctl.maxIterEpsFinal, 1000);
+        eqInt   ("own: minIterEpsFinal default",   ctl.minIterEpsFinal, 0);
+        ctl.finalIter = true;
+        eqScalar("own: kTol() on the last corrector",   ctl.kTol(),   1e-13);
+        eqScalar("own: epsTol() on the last corrector", ctl.epsTol(), 1e-09);
+        ctl.finalIter = false;
+        eqScalar("own: epsTol() otherwise",             ctl.epsTol(), 1e-17);
+        eqInt   ("own: epsMinIter() otherwise",         ctl.epsMinIter(), 3);
+        // the merged figures are still the pair's, for the callers that take them
+        eqScalar("merged: tolKE",    ctl.tolKE,     1e-17);
+        eqInt   ("merged: maxIterKE", ctl.maxIterKE, 7);
+        eqInt   ("merged: minIterKE", ctl.minIterKE, 3);
+
+        DeviceSimpleControls sa;   sa.turbulent = true;   sa.sa = true;
+        readLinearSolverControls(fv, "omega", sa, "SIMPLE");
+        eqScalar("SA: the k slot is nuTilda's tolerance", sa.tolK,     1e-08);
+        eqScalar("SA: ...its relTol",                     sa.relTolK,  0.2);
+        eqInt   ("SA: ...its maxIter",                    sa.maxIterK, 5);
+        eqInt   ("SA: ...its minIter",                    sa.minIterK, 4);
+        if (failures == 0) std::printf("  OK   each field of the pair under its own entry\n");
     }
 
     // ---- 5. relaxationFactors: modern nested form, per-FIELD keys ----

@@ -62,11 +62,28 @@ label simpleColourMinCells()
 }
 // BRAE_CONTROL_SIMPLE_COLOUR_ONE_SWEEP=1 is the rule's gate's CONTROL, deliberately wrong: every solve the
 // rule takes stops after its first block of nSweeps sweeps, so the fields are nowhere near converged.
+bool simpleColourOneSweep()
+{
+    static const bool on = std::getenv("BRAE_CONTROL_SIMPLE_COLOUR_ONE_SWEEP") != nullptr;
+    return on;
+}
 int simpleColourMaxIter(
     int maxIter)
 {
-    static const bool oneSweep = std::getenv("BRAE_CONTROL_SIMPLE_COLOUR_ONE_SWEEP") != nullptr;
-    return oneSweep ? 1 : maxIter;
+    return simpleColourOneSweep() ? 1 : maxIter;
+}
+// Each transported field's OWN stop rule, as the reader filled it (linear_solver_setup.cuh): the k slot
+// (nuTilda's entry under Spalart-Allmaras) and the second field's (epsilon or omega), the Final entries on
+// the last outer corrector.
+ScalarStopRule kStopRule(
+    const DeviceSimpleControls& ctl)
+{
+    return ScalarStopRule{ctl.kTol(), ctl.kRelTol(), ctl.kMaxIter(), ctl.kMinIter()};
+}
+ScalarStopRule epsStopRule(
+    const DeviceSimpleControls& ctl)
+{
+    return ScalarStopRule{ctl.epsTol(), ctl.epsRelTol(), ctl.epsMaxIter(), ctl.epsMinIter()};
 }
 // BRAE_CONTROL_SA_GRAD_UNLIMITED=1 is the Spalart-Allmaras limiter gate's CONTROL: the case's grad(U) and
 // grad(nuTilda) limiters dropped again, as this driver ran before 2026-10-16 (the boxy5 UAV blew up at -3 to
@@ -920,8 +937,7 @@ bool simpleColourSwapControl()
         // process-wide like turbPrecon(), so written either way: an earlier solver's setting must not leak
         TurbColourRule& rule = turbColourRule();
         rule.colouring = colourTurb_ ? &colouring_ : nullptr;
-        rule.maxIter = simpleColourMaxIter(ctl_.maxIterKE);
-        rule.minIter = ctl_.minIterKE;
+        rule.oneSweep = simpleColourOneSweep();
     }
 
     std::string DeviceSimpleSolver::momentumSolverName() const
@@ -1059,6 +1075,9 @@ bool simpleColourSwapControl()
         DeviceBuffer<scalar> zeroD(std::vector<scalar>(static_cast<std::size_t>(nC_), scalar(0)));
         DeviceBuffer<scalar> divU;
         deviceDiv(dm, phiInt_, phiBnd_, divU);
+        // sigma solves under the turbulence slot's tolerance and relTol, not its own entry's, and at the old
+        // cap (kUnreadEntryMaxIter): a known gap
+        const ScalarStopRule sigmaStop{ctl_.keTol(), ctl_.keRelTol(), kUnreadEntryMaxIter, 0};
         for (int k = 0; k < 6; ++k)
         {
             const ScalarDdt sDdt{ ddtc, &sigOld_[k],
@@ -1068,7 +1087,7 @@ bool simpleColourSwapControl()
                 dm, dbSig_[k], sig_[k], "sigma", zeroD, phiInt_, phiBnd_, divU,
                 /*bounded=*/false, /*limited=*/vanAlbada, /*linearUpwind=*/false, /*nonOrth=*/false,
                 /*twoByk=*/scalar(0),   // 0 selects vanAlbada in the shared limiter kernel
-                ctl_.relaxSigma, ctl_.keTol(), ctl_.keRelTol(), ctl_.bicgCheckEvery, /*useGS=*/ctl_.gsSigma,
+                ctl_.relaxSigma, sigmaStop, ctl_.bicgCheckEvery, /*useGS=*/ctl_.gsSigma,
                 [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src)
                 { deviceMaxwellReaction(dm.V, rLambda, P[k], diag, src); },
                 nullptr, nullptr, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, sDdt,
@@ -1171,8 +1190,8 @@ bool simpleColourSwapControl()
             const ScalarDdt giDdt{ ddtc, &gammaIntOld_, gammaIntOld2_.size() ? &gammaIntOld2_ : nullptr, ddtc.cn ? &gammaIntddt0_ : nullptr };
             if (ctl_.sa)    // one-equation: dk_ slot holds nuTilda; relaxK/limitedK/twoBykK carry the nuTilda settings
                 deviceSpalartAllmarasCorrect(dm, dbU_, dbK_, Uk_[0], Uk_[1], Uk_[2], dk_, dnut_, y_, phiInt_, phiBnd_,
-                                             ctl_.nu, ctl_.kRelax(), ctl_.keTol(), ctl_.boundedK, ctl_.limitedK, ctl_.twoBykK,
-                                             ctl_.saCoeffs, ctl_.keRelTol(), ctl_.bicgCheckEvery, ctl_.luK, ctl_.nonOrth,
+                                             ctl_.nu, ctl_.kRelax(), kStopRule(ctl_), ctl_.boundedK, ctl_.limitedK, ctl_.twoBykK,
+                                             ctl_.saCoeffs, ctl_.bicgCheckEvery, ctl_.luK, ctl_.nonOrth,
                                              ctl_.gsK, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, kDdt,   // nuTilda ddt (kOld_)
                                              ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr, ctl_.iddes ? &hwn_ : nullptr, &lesDelta_,
                                              wallN_.size() ? &wallN_ : nullptr,   // SA-DDES/IDDES length-scale limiter (no-op for plain SA-RANS)
@@ -1189,8 +1208,8 @@ bool simpleColourSwapControl()
             else if (ctl_.sst)   // de_ slot holds omega; relaxEps/limitedEps/twoBykEps carry the omega-equation settings
             {
                 deviceKOmegaSSTCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
-                                       phiInt_, phiBnd_, ctl_.nu, ctl_.epsRelax(), ctl_.kRelax(), ctl_.keTol(), ctl_.boundedK, ctl_.boundedEps,
-                                       ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.ksstCoeffs, ctl_.keRelTol(), ctl_.bicgCheckEvery,
+                                       phiInt_, phiBnd_, ctl_.nu, ctl_.epsRelax(), ctl_.kRelax(), kStopRule(ctl_), epsStopRule(ctl_), ctl_.boundedK, ctl_.boundedEps,
+                                       ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.ksstCoeffs, ctl_.bicgCheckEvery,
                                        ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gradULimitK, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
                                        ctl_.lm ? gammaIntEff_.data() : nullptr,   // LM: scale k Pk/epsilonByk by the lagged gammaIntEff
                                        static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear
@@ -1224,8 +1243,8 @@ bool simpleColourSwapControl()
             }
             else
                 deviceKEpsilonCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_,
-                                      phiInt_, phiBnd_, ctl_.nu, ctl_.epsRelax(), ctl_.kRelax(), ctl_.keTol(), ctl_.boundedK, ctl_.boundedEps,
-                                      ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.keCoeffs, ctl_.keRelTol(), ctl_.bicgCheckEvery,
+                                      phiInt_, phiBnd_, ctl_.nu, ctl_.epsRelax(), ctl_.kRelax(), kStopRule(ctl_), epsStopRule(ctl_), ctl_.boundedK, ctl_.boundedEps,
+                                      ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.keCoeffs, ctl_.bicgCheckEvery,
                                       ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
                                       static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear
                                       ctl_.atmZ0, ctl_.atmBoundNut,   // atmNutkWallFunction roughness for the near-wall G0
@@ -4123,10 +4142,14 @@ bool simpleColourSwapControl()
 
         // No reaction: a passive scalar has no source. OF's fvOptions_(rho, s) is not applied -- brae
         // refuses unsupported fvOptions at start-up, so there is nothing here to drop silently.
+        //
+        // The caller's tolerance, the turbulence slot's relTol and the old cap (kUnreadEntryMaxIter): the
+        // object's own relTol, maxIter and minIter are not handed down here yet, a known gap.
+        const ScalarStopRule stop{tol, ctl_.keRelTol(), kUnreadEntryMaxIter, 0};
         deviceSolveScalarTransport(
             dm_, db, field, fieldName, D, phiInt_, phiBnd_, divPhi,
             schemeBounded, schemeLimited, schemeLinearUpwind, schemeNonOrth, schemeTwoByk,
-            relax, tol, ctl_.keRelTol(), ctl_.bicgCheckEvery, false,
+            relax, stop, ctl_.bicgCheckEvery, false,
             [](DeviceBuffer<scalar>&, DeviceBuffer<scalar>&){},   // passive: no reaction
             nullptr, nullptr,
             hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,

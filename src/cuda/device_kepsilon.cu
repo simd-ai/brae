@@ -1068,7 +1068,8 @@ void deviceKEpsilonCorrect(
     scalar nu,
     scalar relaxEps,
     scalar relaxK,
-    scalar tol,
+    const ScalarStopRule& kStop,
+    const ScalarStopRule& epsStop,
     bool bounded,
     bool boundedEps,   // div(phi,epsilon|omega) `bounded`; `bounded` above is div(phi,k)'s
     bool limitedK,
@@ -1076,7 +1077,6 @@ void deviceKEpsilonCorrect(
     scalar twoBykK,
     scalar twoBykEps,
     const KEpsilonCoeffs& co,
-    scalar relTolKE,
     int keCheckEvery,
     bool linearUpwindK,
     bool linearUpwindEps,
@@ -1223,7 +1223,7 @@ void deviceKEpsilonCorrect(
         }
     }
     deviceSolveScalarTransport(dm, dbEps, eps, "epsilon", Deps, phiInt, phiBnd, divPhi, boundedEps, limitedEps, linearUpwindEps, nonOrth, twoBykEps,
-                               relaxEps, tol, relTolKE, keCheckEvery, gsEps,
+                               relaxEps, epsStop, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){
                                    if (co.realizable) deviceEpsReactionRealizable(dm, eps, k, magS, nu, co.C2, diag, src);
                                    else               deviceEpsReaction(dm, eps, k, gByNu, divU, diag, src, co, rho); },
@@ -1240,7 +1240,7 @@ void deviceKEpsilonCorrect(
     depsKernel<<<nBlocks(nC), TPB>>>(nC, nut.data(), co.sigmaK, (rho ? scalar(0) : nu), Dk.data());
     if (rho && muLam) scaleDEffCompressibleKE(*rho, *muLam, Dk);
     deviceSolveScalarTransport(dm, dbK, k, "k", Dk, phiInt, phiBnd, divPhi, bounded, limitedK, linearUpwindK, nonOrth, twoBykK,
-                               relaxK, tol, relTolKE, keCheckEvery, gsK,
+                               relaxK, kStop, keCheckEvery, gsK,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceKReaction(dm, k, eps, G, divU, diag, src, rho); },
                                nullptr, nullptr, ami, cyc, kDdt, DkB.size() ? &DkB : nullptr, gradScalarLimitK,
                                true, fvoKMask, fvoKVal,
