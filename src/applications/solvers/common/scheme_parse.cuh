@@ -10,6 +10,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <initializer_list>
 #include <map>
 #include <regex>
@@ -633,10 +634,31 @@ inline void checkWallDistMethod(const std::string& caseDir, DeviceSimpleControls
         "model, not an approximation.");
 }
 
+// The second transported field of the case's RAS model: "omega", "epsilon", or "" where this cannot tell (no RAS model, or a
+// model without either). ctl's eps flags hold ONE field's scheme and both entries set them, so a case naming the two
+// differently ran the field on the other's entry: pitzDailySST with a spare `div(phi,epsilon) $turbulence` ran omega on
+// limitedLinear under `div(phi,omega) upwind` (fields about 1 % from OpenFOAM's fixed point, 2e-5 once it took its own entry).
+// BRAE_CONTROL_SCHEME_SECOND_BOTH=1: a gate's CONTROL, deliberately wrong -- both entries set the flags, as before.
+inline std::string rasSecondField(const std::string& caseDir)
+{
+    if (std::getenv("BRAE_CONTROL_SCHEME_SECOND_BOTH")) return "";
+    std::ifstream exists(caseDir + "/constant/turbulenceProperties");
+    if (!exists) return "";
+    const FoamDict turb = readDict(caseDir + "/constant/turbulenceProperties");
+    if (turb.wordOr("simulationType", "") != "RAS") return "";
+    const FoamDict* ras = turb.subDict("RAS");
+    if (!ras) return "";
+    const std::string model = ras->wordOr("model", ras->wordOr("RASModel", ""));
+    if (model.find("kOmega") != std::string::npos) return "omega";
+    if (model.find("Epsilon") != std::string::npos || model.find("KE") != std::string::npos) return "epsilon";
+    return "";
+}
+
 inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleControls& ctl)
 {
     // Refuse an unimplemented wall-distance method here, where every solver already passes.
     checkWallDistMethod(caseDir, ctl);
+    const std::string secondField = rasSecondField(caseDir);
 
             std::string schemesText = readFileExpanded(caseDir + "/system/fvSchemes");   // $var expanded ($turbulence)
             // Statements are ';'-terminated and each one belongs to a SUB-DICTIONARY. Both halves matter.
@@ -983,7 +1005,8 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                     if (hasWord(ln, "bounded")) ctl.boundedK = true;
                     { const scalar g = luGradLimit(ln); if (g >= 0.0) ctl.gradKLULimitK = g; }   // linearUpwind's named grad(k|eps)
                 }
-                if (inDiv && (ln.find("div(phi,epsilon)") != std::string::npos || ln.find("div(phi,omega)") != std::string::npos))
+                if (inDiv && ((ln.find("div(phi,epsilon)") != std::string::npos && secondField != "omega")
+                              || (ln.find("div(phi,omega)") != std::string::npos && secondField != "epsilon")))
                 {
                     checkDiv(ln, "epsilon|omega", {"upwind", "linearUpwind", "limitedLinear"}, {});
                     const scalar t = limitedTwoByk(ln);

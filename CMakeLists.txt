@@ -820,6 +820,10 @@ set_tests_properties(simple_freestream_of13_vs_openfoam13 PROPERTIES SKIP_RETURN
 # included) against OpenFOAM's converged pitzDailyTurb: the colour order converges, lands within 1e-03 of
 # OpenFOAM's order and no further from OpenFOAM than it; a component swap in the fused solve fails. It unsets
 # BRAE_SIMPLE_CASE_SOLVER for its own arms.
+# A case's div(phi,epsilon) and div(phi,omega) naming different schemes: the model's own field takes its own entry. Control: the
+# other entry setting the flags, as before.
+add_test(NAME simple_second_scalar_scheme COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_second_scalar_scheme.sh)
+set_tests_properties(simple_second_scalar_scheme PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 add_test(NAME simple_colour_vs_openfoam COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_colour_vs_openfoam.sh)
 set_tests_properties(simple_colour_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
 # Each transported turbulence field (k, epsilon, omega, nuTilda) stops on its OWN fvSolution entry --
