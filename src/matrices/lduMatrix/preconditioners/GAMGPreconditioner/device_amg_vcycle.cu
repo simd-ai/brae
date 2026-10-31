@@ -4,6 +4,7 @@
 // (ensureSpectrum/chebyshevSmooth/twoStageGSSmooth/gsSweep) + coarse solvers are called across TUs via the AMG
 // headers. Verbatim split of device_amg.cu -- no logic change. The PCG drivers (device_amg.cu) call vcycleAt/
 // vcycleAtF/amgCastFP32 (external linkage) via local decls there.
+#include <chrono>
 #include "device_amg.cuh"          // AMGData / AMGLevel / GridColoring / DeviceLduView / DeviceSolverPerf
 #include "device_amg_split.cuh"    // BRAE_AMG_PCG_SPLIT: a lap after every part of a cycle
 #include "device_amg_detail.cuh"   // constants (OMEGA/NPRE/NPOST/CHEB_*/SB_*/NCOARSE_CG) + env flags + nBlocks/TPB
@@ -854,6 +855,26 @@ bool amgSinglePrecisionCycle(const AMGData& amg)
     return useFP32() && !amg.gsSmooth && !useChebyshev() && !useTSGS();
 }
 
+// The double cycle's product on grid g: the row layout where the grid has one (amgGatherCsr64), amulKernel otherwise. The same
+// sum in the same order. Never on the finest grid, whose view is the caller's and may carry coupled faces.
+static inline void amgSpmvD(
+    AMGData& amg,
+    int g,
+    const DeviceLduView& Ag,
+    const DeviceBuffer<scalar>& x,
+    DeviceBuffer<scalar>& y)
+{
+    if (g > 0 && !amg.csr64Val.empty() && amg.csr64Val[g].size() > 0)
+    {
+        y.resize(Ag.nCells);
+        amulCsrDK<<<nBlocks(Ag.nCells),TPB>>>(Ag.nCells, Ag.diag, amg.csr64Row[g].data(), amg.csr64Col[g].data(),
+                                              amg.csr64Val[g].data(), x.data(), y.data());
+        cudaCheck(cudaGetLastError(), "amulCsrD");
+        return;
+    }
+    deviceAmul(Ag, x, y);
+}
+
 // Recursive V-cycle at grid g: x_g <- M^-1 b_g (x_g overwritten). g==nLevels is the coarsest grid (an approximate
 // solve; single-block or fused-cluster when small); above it: pre-smooth, restrict the residual to g+1, recurse,
 // prolong the correction, post-smooth.
@@ -924,12 +945,12 @@ void vcycleAt(
             smoothFromZeroT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), Ag.diag, xg.data());
             continue;
         }
-        deviceAmul(Ag, xg, amg.vAx[g]);
+        amgSpmvD(amg, g, Ag, xg, amg.vAx[g]);
         if (g > 0) pairAdd(amg, g, xg.data(), amg.vAx[g].data());
         smoothT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
     }
     amgSplit::lap(g, amgSplit::smoothPre);
-    deviceAmul(Ag, xg, amg.vAx[g]);
+    amgSpmvD(amg, g, Ag, xg, amg.vAx[g]);
     if (g > 0) pairAdd(amg, g, xg.data(), amg.vAx[g].data());
     residualT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), amg.vR[g].data());
     amgSplit::lap(g, amgSplit::residual);
@@ -984,7 +1005,7 @@ void vcycleAt(
     else if (amg.gsSmooth) for (int s = 0; s < nPostSweeps(); ++s) gsSweep(Ag, bg, xg, amg.coloring[g], false);  // backward GS (symmetric V-cycle)
     else for (int s = 0; s < nPostSweeps(); ++s)
     {
-        deviceAmul(Ag, xg, amg.vAx[g]);
+        amgSpmvD(amg, g, Ag, xg, amg.vAx[g]);
         if (g > 0) pairAdd(amg, g, xg.data(), amg.vAx[g].data());
         smoothT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
     }
@@ -1140,6 +1161,103 @@ void amgBuildCsrFP32(AMGData& amg, const DeviceLduView& A)
         buildCsrForGrid(amg, g, f);
     }
     amg.csrBuilt = true;
+}
+
+// THE DOUBLE CYCLE'S ROW LAYOUT (BRAE_AMG_CSR64_BELOW=<cells>, off by default, the experiment of 2026-10-30). On motorBike at 16
+// GH200s the grids under 50,000 cells a GPU are 5.6% of the hierarchy's cells and 51% of the double V-cycle's time, 80% of each
+// grid's in its two products: amulKernel's merge of two face lists, three chained reads an entry, with few threads to hide the
+// latency. The single-precision row layout is 1.6 to 2.5 times faster there, where hardly any bytes move, so that gap is the layout's.
+// The comment on device_spmv.cu's rejected row form is about a FINE grid, where a row layout doubles the bytes that bind.
+//
+// A row here is the cell's faces in increasing face index, amulKernel's order and OpenFOAM's face loop's, not the single-precision
+// layout's owner-then-neighbour: the same sum in the same order, so the same bits as the double cycle without the layout. Coarse
+// grids only (g >= 1).
+// BRAE_CONTROL_AMG_CSR64_ORDER=1 is a gate's CONTROL, deliberately different: each row owner faces first, the same sum in another
+// order, so other bits. BRAE_CONTROL_AMG_CSR64_STALE=1 is another, deliberately wrong: the values gathered once and never again.
+static int amgCsr64Below()
+{
+    static const int n = []()
+    {
+        const char* e = std::getenv("BRAE_AMG_CSR64_BELOW");
+        return (e && std::atoi(e) > 0) ? std::atoi(e) : 0;
+    }();
+    return n;
+}
+
+void amgGatherCsr64(AMGData& amg)
+{
+    const int below = amgCsr64Below();
+    if (below == 0) return;
+    static const bool ownerFirst = std::getenv("BRAE_CONTROL_AMG_CSR64_ORDER") != nullptr;
+    static const bool stale = std::getenv("BRAE_CONTROL_AMG_CSR64_STALE") != nullptr;
+    const int G = amg.nLevels();
+    const bool first = !amg.csr64Built;
+    if (first)
+    {
+        const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+        amg.csr64Row.resize(G+1);
+        amg.csr64Col.resize(G+1);
+        amg.csr64Src.resize(G+1);
+        amg.csr64Val.resize(G+1);
+        int grids = 0;
+        std::size_t entries = 0;
+        for (int g = 1; g <= G; ++g)
+        {
+            const DeviceLduView v = amg.level[g-1].coarseView();
+            if (v.nCells >= below || v.nInternalFaces <= 0) continue;
+            const std::vector<label> ownerStart = pullLabels(v.ownerStart, v.nCells + 1);
+            const std::vector<label> losortStart = pullLabels(v.losortStart, v.nCells + 1);
+            const std::vector<label> losort = pullLabels(v.losort, v.nInternalFaces);
+            const std::vector<label> nei = pullLabels(v.nei, v.nInternalFaces);
+            const std::vector<label> owner = pullLabels(v.owner, v.nInternalFaces);
+            std::vector<label> row(v.nCells + 1, 0), col, src;
+            col.reserve(2*v.nInternalFaces);
+            src.reserve(2*v.nInternalFaces);
+            for (int c = 0; c < v.nCells; ++c)
+            {
+                row[c] = static_cast<label>(col.size());
+                label f = ownerStart[c];
+                label k = losortStart[c];
+                // amulKernel's walk: the two ascending lists merged by face index
+                while (f < ownerStart[c+1] || k < losortStart[c+1])
+                {
+                    const label fl = (k < losortStart[c+1]) ? losort[k] : 0x7fffffff;
+                    if (f < ownerStart[c+1] && (ownerFirst || f < fl))
+                    {
+                        col.push_back(nei[f]);
+                        src.push_back(f);
+                        ++f;
+                    }
+                    else
+                    {
+                        col.push_back(owner[fl]);
+                        src.push_back(-fl - 1);
+                        ++k;
+                    }
+                }
+            }
+            row[v.nCells] = static_cast<label>(col.size());
+            amg.csr64Row[g].copyFrom(row);
+            amg.csr64Col[g].copyFrom(col);
+            amg.csr64Src[g].copyFrom(src);
+            amg.csr64Val[g].resize(col.size());
+            ++grids;
+            entries += col.size();
+        }
+        amg.csr64Built = true;
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+        std::printf("brae AMG: NOTICE: the double cycle's row layout on %d coarse grids under %d cells: %zu entries, built in %.4f s\n",
+                    grids, below, entries, seconds);
+    }
+    if (stale && !first) return;
+    for (int g = 1; g <= G; ++g)
+    {
+        const int nnz = static_cast<int>(amg.csr64Val[g].size());
+        if (nnz == 0) continue;
+        const DeviceLduView v = amg.level[g-1].coarseView();
+        csr64GatherK<<<nBlocks(nnz),TPB>>>(nnz, amg.csr64Src[g].data(), v.upper, v.lower, amg.csr64Val[g].data());
+    }
+    cudaCheck(cudaGetLastError(), "csr64 gather");
 }
 
 // Cast the (current) FP64 fine + coarse matrices to their FP32 mirrors. Allocates the mirrors + FP32 work vectors once.

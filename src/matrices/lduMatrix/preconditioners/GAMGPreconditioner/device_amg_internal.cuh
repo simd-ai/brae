@@ -42,6 +42,9 @@ Coloring greedyColor(
 //      drivers (ensureSpectrum) call these across TUs; the standalone symGaussSeidel solver also reuses gsSweep. ----
 struct AMGData;   // fwd (full definition in the public device_amg.cuh)
 void ensureSpectrum(AMGData& amg, const DeviceLduView& A);
+// The double cycle's row layout on its small grids (AMGData::csr64Row): built at the first call, its values gathered at every
+// call. amgGalerkin's last act: the one point where the coarse matrices change and outside every captured cycle.
+void amgGatherCsr64(AMGData& amg);
 void gsSweep(const DeviceLduView& A, const DeviceBuffer<scalar>& b, DeviceBuffer<scalar>& x,
              const GridColoring& gc, bool forward);
 void chebyshevSmooth(const DeviceLduView& A, const DeviceBuffer<scalar>& b, DeviceBuffer<scalar>& x,
@@ -124,6 +127,33 @@ void amulCsrFK(int nC, const float* __restrict__ diag, const label* __restrict__
     for (label i = row[c]; i < row[c+1]; ++i)
         s += val[i]*psi[col[i]];
     Apsi[c]=s;
+}
+// The double cycle's product on a grid with the row layout (AMGData::csr64Row): one contiguous row, where amulKernel merges two
+// lists of faces through three chained reads an entry. Nsight Compute, one launch at 1 to 197 blocks (motorBike, 16 GH200s):
+// amulKernel 13.5 to 19 us, amulCsrFK in single precision 5.9 to 9 us. The same sum as amulKernel, in its order, and the same
+// rounding: its multiply and add stay apart (the if-converted merge compiles to DMUL then DADD), where a plain s += a*b here compiled
+// to DFMA, one rounding fewer: 1e-14 from amulKernel's answers within 18 CG iterations on pitzDaily's pressure (tests/mgpu_sequence.sh).
+static __global__
+void amulCsrDK(int nC, const scalar* __restrict__ diag, const label* __restrict__ row,
+               const label* __restrict__ col, const scalar* __restrict__ val,
+               const scalar* __restrict__ psi, scalar* __restrict__ Apsi)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    scalar s = diag[c]*psi[c];
+    for (label i = row[c]; i < row[c+1]; ++i)
+        s = __dmul_rn(val[i], psi[col[i]]) + s;
+    Apsi[c]=s;
+}
+// Refill a double row layout's values from the grid's face arrays
+static __global__
+void csr64GatherK(int nnz, const label* __restrict__ src, const scalar* __restrict__ upper,
+                  const scalar* __restrict__ lower, scalar* __restrict__ val)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= nnz) return;
+    const label s = src[i];
+    val[i] = (s >= 0) ? upper[s] : lower[-s - 1];
 }
 // Refill a grid's CSR values from its FP64 face arrays. Replaces the two cast_ launches that grid's
 // upper and lower would otherwise need, so a CSR grid costs one launch per solve, not two.

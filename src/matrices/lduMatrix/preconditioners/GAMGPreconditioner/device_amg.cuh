@@ -356,6 +356,12 @@ struct AMGData {
     std::vector<DeviceBuffer<label>> csrRow, csrCol, csrSrc;
     std::vector<DeviceBuffer<float>> csrVal;
     bool csrBuilt = false;
+    // THE DOUBLE CYCLE'S ROW LAYOUT, on the coarse grids under BRAE_AMG_CSR64_BELOW cells (off by default; the experiment of
+    // 2026-10-30, device_amg_vcycle.cu's amgGatherCsr64): each row is the cell's faces in increasing face index, amulKernel's
+    // order, so the same bits as that kernel; csr64Src says where each value comes from (f: upper[f], -(f+1): lower[f]).
+    std::vector<DeviceBuffer<label>> csr64Row, csr64Col, csr64Src;
+    std::vector<DeviceBuffer<scalar>> csr64Val;
+    bool csr64Built = false;
     std::unique_ptr<AMGGraphCache> gcache;                      // cached V-cycle graph (capture once, replay)
     std::unique_ptr<AMGGraphCache> gcacheF;                     // cached FP32 V-cycle graph (#7 mixed precision)
     std::unique_ptr<PCGGraphCache> pcgCache;                    // cached device-resident PCG WHILE-body graph (#6); per-solver lifetime

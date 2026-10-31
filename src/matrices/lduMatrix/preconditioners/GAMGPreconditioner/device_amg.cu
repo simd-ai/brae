@@ -1909,6 +1909,7 @@ void amgGalerkin(
             }
         }
     }
+    amgGatherCsr64(A);
 }
 
 } // namespace brae
