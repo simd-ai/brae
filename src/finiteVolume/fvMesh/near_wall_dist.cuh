@@ -296,13 +296,27 @@ inline std::vector<std::vector<scalar>> nearWallDistKept(
 
     if (!sameLists)
     {
-        std::unordered_map<label, std::vector<label>> pointFaces;
-        for (std::size_t w = 0; w < wallFace.size(); ++w)
+        // a point -> the wall faces on it, flat and in face order: a hash map of lists here was most of the near-wall step on a large wall (pass 1 78 of its 102 s, 18 M wall
+        // faces on the fine DrivAer, job 2611821), and the lists come out in the same order
+        std::vector<label> onPoint(pts.size() + 1, 0);
+        for (const label v : verts)
         {
-            const label f = wallFace[w];
-            for (label j = fo[f]; j < fo[f + 1]; ++j)
+            ++onPoint[static_cast<std::size_t>(v) + 1];
+        }
+        for (std::size_t p = 0; p < pts.size(); ++p)
+        {
+            onPoint[p + 1] += onPoint[p];
+        }
+        std::vector<label> facesOnPoint(verts.size());
+        {
+            std::vector<label> next(onPoint.begin(), onPoint.end() - 1);
+            for (std::size_t w = 0; w < wallFace.size(); ++w)
             {
-                pointFaces[fv[j]].push_back(static_cast<label>(w));
+                const label f = wallFace[w];
+                for (label j = fo[f]; j < fo[f + 1]; ++j)
+                {
+                    facesOnPoint[static_cast<std::size_t>(next[fv[j]]++)] = static_cast<label>(w);
+                }
             }
         }
         kept.start.assign(1, label(0));
@@ -314,8 +328,9 @@ inline std::vector<std::vector<scalar>> nearWallDistKept(
             const label f = wallFace[w];
             for (label j = fo[f]; j < fo[f + 1]; ++j)
             {
-                for (const label nw : pointFaces[fv[j]])
+                for (label q = onPoint[fv[j]]; q < onPoint[fv[j] + 1]; ++q)
                 {
+                    const label nw = facesOnPoint[static_cast<std::size_t>(q)];
                     bool have = false;
                     for (std::size_t k = first; k < kept.cand.size(); ++k)
                     {
