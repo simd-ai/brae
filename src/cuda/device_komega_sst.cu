@@ -990,7 +990,7 @@ void deviceKOmegaSSTCorrect(
         const int nB = static_cast<int>(phiBnd.size());
         DeviceBuffer<scalar> phiVolBnd;
         phiVolBnd.resize(nB);
-        nuFromMuRhoK<<<nBlocks(nB), TPB>>>(nB, phiBnd.data(), rhoBnd->data(), phiVolBnd.data());
+        if (nB > 0) nuFromMuRhoK<<<nBlocks(nB), TPB>>>(nB, phiBnd.data(), rhoBnd->data(), phiVolBnd.data());
         cudaCheck(cudaGetLastError(), "phiVolBnd");
         deviceDiv(dm, phiVolInt, phiVolBnd, divU);
         if (ami && ami->n) interfaceAddDiv(*ami, dm.V, divU);

@@ -1010,6 +1010,7 @@ void deviceBoundaryNut(
     // viscosity. Constant-property incompressible flow makes that a single number, which is why the scalar
     // argument exists; compressible flow does not, so nuFace overrides it when supplied.
     nutBnd.resize(db.n);
+    if (db.n == 0) return;   // a rank with no physical boundary face (deviceBCValue)
     const scalar Cmu25 = std::pow(co.Cmu, 0.25), yplLam = yPlusLamHost(co.kappa, co.E);
     boundaryNutKernel<<<nBlocks(db.n), TPB>>>(db.n, db.faceCell.data(), isWall.data(), y.data(), k.data(), nut.data(),
                                               nu, yplLam, Cmu25, co.kappa, co.E, atmZ0, atmBoundNut, nutBnd.data(),
@@ -1169,7 +1170,7 @@ void deviceKEpsilonCorrect(
         divideFaceK<<<nBlocks(nIf), TPB>>>(nIf, phiInt.data(), rhoF.data(), pvI.data());
         const int nB = static_cast<int>(phiBnd.size());
         DeviceBuffer<scalar> pvB(static_cast<std::size_t>(nB));
-        divideFaceK<<<nBlocks(nB), TPB>>>(nB, phiBnd.data(), rhoBnd->data(), pvB.data());
+        if (nB > 0) divideFaceK<<<nBlocks(nB), TPB>>>(nB, phiBnd.data(), rhoBnd->data(), pvB.data());
         cudaCheck(cudaGetLastError(), "keVolFlux");
         deviceDiv(dm, pvI, pvB, divU);
         if (ami && ami->n) interfaceAddDiv(*ami, dm.V, divU);
@@ -1357,6 +1358,7 @@ void deviceBoundaryNutSpalding(
         nutBnd.resize(n);
         cudaCheck(cudaMemsetAsync(nutBnd.data(), 0, n*sizeof(scalar), cudaStreamPerThread), "spalding init");
     }
+    if (n == 0) return;   // a rank with no physical boundary face (deviceBCValue)
     spaldingNutKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].faceCell.data(), isWall.data(), y.data(),
                                            dbU.comp[0].deltaCoeffs.data(), Ux.data(), Uy.data(), Uz.data(),
                                            nutCell.data(), nu, co.kappa, co.E, nutBnd.data(),
@@ -1393,6 +1395,7 @@ void deviceBoundaryNutBlended(
         nutBnd.resize(n);
         cudaCheck(cudaMemsetAsync(nutBnd.data(), 0, n*sizeof(scalar), cudaStreamPerThread), "blended init");
     }
+    if (n == 0) return;   // a rank with no physical boundary face (deviceBCValue)
     blendedNutKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].faceCell.data(), isWall.data(), y.data(),
                                           dbU.comp[0].deltaCoeffs.data(), Ux.data(), Uy.data(), Uz.data(),
                                           nutCell.data(), nu, kappa, E, nutBnd.data(),

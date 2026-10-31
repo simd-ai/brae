@@ -186,6 +186,8 @@ void fusedScaleAxpyK(scalar* __restrict__ p, const scalar* __restrict__ b, const
 void deviceAxpy(scalar a, const DeviceBuffer<scalar>& x, DeviceBuffer<scalar>& y)
 {
     const int n = static_cast<int>(x.size());
+    // a vector of a rank with no physical boundary face is empty, and CUDA 13 refuses a launch of zero blocks (deviceBCValue)
+    if (n == 0) return;
     axpyKernel<<<nBlocks(n), TPB>>>(a, x.data(), y.data(), n);
     cudaCheck(cudaGetLastError(), "axpy");
 }
@@ -194,6 +196,7 @@ void deviceAxpy(scalar a, const DeviceBuffer<scalar>& x, DeviceBuffer<scalar>& y
 void deviceScale(DeviceBuffer<scalar>& x, scalar a)
 {
     const int n = static_cast<int>(x.size());
+    if (n == 0) return;
     scaleKernel<<<nBlocks(n), TPB>>>(a, x.data(), n);
     cudaCheck(cudaGetLastError(), "scale");
 }
@@ -259,6 +262,7 @@ void deviceJacobi(DeviceBuffer<scalar>& z, const DeviceBuffer<scalar>& r, const 
 {
     const int n = static_cast<int>(r.size());
     z.resize(n);
+    if (n == 0) return;
     jacobiKernel<<<nBlocks(n), TPB>>>(r.data(), diag, z.data(), n);
     cudaCheck(cudaGetLastError(), "jacobi");
 }
@@ -271,6 +275,7 @@ void deviceNeumannStep(DeviceBuffer<scalar>& t, const DeviceBuffer<scalar>& At, 
                        DeviceBuffer<scalar>& w)
 {
     const int n = static_cast<int>(t.size());
+    if (n == 0) return;
     neumannStepKernel<<<nBlocks(n), TPB>>>(t.data(), At.data(), diag, w.data(), n);
     cudaCheck(cudaGetLastError(), "neumann step");
 }
@@ -292,6 +297,7 @@ void deviceDivide(DeviceBuffer<scalar>& out, const DeviceBuffer<scalar>& a, cons
 {
     const int n = static_cast<int>(a.size());
     out.resize(n);
+    if (n == 0) return;
     divideKernel<<<nBlocks(n), TPB>>>(a.data(), b.data(), out.data(), n);
     cudaCheck(cudaGetLastError(), "divide");
 }
@@ -301,6 +307,7 @@ void deviceHadamard(DeviceBuffer<scalar>& out, const DeviceBuffer<scalar>& a, co
 {
     const int n = static_cast<int>(a.size());
     out.resize(n);
+    if (n == 0) return;
     hadamardKernel<<<nBlocks(n), TPB>>>(a.data(), b.data(), out.data(), n);
     cudaCheck(cudaGetLastError(), "hadamard");
 }
@@ -315,6 +322,7 @@ void deviceFusedBicgP(
     const scalar* negOmega)
 {
     const int n = static_cast<int>(pA.size());
+    if (n == 0) return;
     fusedBicgPK<<<nBlocks(n), TPB>>>(rA.data(), pA.data(), AyA.data(), beta, negOmega, n);
     cudaCheck(cudaGetLastError(), "fusedBicgP");
 }
@@ -324,6 +332,7 @@ void deviceFusedSxpy(DeviceBuffer<scalar>& out, const DeviceBuffer<scalar>& src,
 {
     const int n = static_cast<int>(src.size());
     out.resize(n);
+    if (n == 0) return;
     fusedSxpyK<<<nBlocks(n), TPB>>>(out.data(), src.data(), a, x.data(), n);
     cudaCheck(cudaGetLastError(), "fusedSxpy");
 }
@@ -332,6 +341,7 @@ void deviceFusedSxpy(DeviceBuffer<scalar>& out, const DeviceBuffer<scalar>& src,
 void deviceFusedAxpy2(DeviceBuffer<scalar>& y, const scalar* a, const DeviceBuffer<scalar>& x1, const scalar* b, const DeviceBuffer<scalar>& x2)
 {
     const int n = static_cast<int>(y.size());
+    if (n == 0) return;
     fusedAxpy2K<<<nBlocks(n), TPB>>>(y.data(), a, x1.data(), b, x2.data(), n);
     cudaCheck(cudaGetLastError(), "fusedAxpy2");
 }
@@ -340,6 +350,7 @@ void deviceFusedAxpy2(DeviceBuffer<scalar>& y, const scalar* a, const DeviceBuff
 void deviceFusedScaleAxpy(DeviceBuffer<scalar>& p, const scalar* b, const DeviceBuffer<scalar>& w)
 {
     const int n = static_cast<int>(p.size());
+    if (n == 0) return;
     fusedScaleAxpyK<<<nBlocks(n), TPB>>>(p.data(), b, w.data(), n);
     cudaCheck(cudaGetLastError(), "fusedScaleAxpy");
 }
@@ -348,6 +359,7 @@ void deviceFusedScaleAxpy(DeviceBuffer<scalar>& p, const scalar* b, const Device
 void deviceAxpyDev(const scalar* dA, const DeviceBuffer<scalar>& x, DeviceBuffer<scalar>& y)
 {
     const int n = static_cast<int>(x.size());
+    if (n == 0) return;
     axpyDevKernel<<<nBlocks(n), TPB>>>(dA, x.data(), y.data(), n);
     cudaCheck(cudaGetLastError(), "axpyDev");
 }
@@ -356,6 +368,7 @@ void deviceAxpyDev(const scalar* dA, const DeviceBuffer<scalar>& x, DeviceBuffer
 void deviceScaleDev(const scalar* dA, DeviceBuffer<scalar>& x)
 {
     const int n = static_cast<int>(x.size());
+    if (n == 0) return;
     scaleDevKernel<<<nBlocks(n), TPB>>>(dA, x.data(), n);
     cudaCheck(cudaGetLastError(), "scaleDev");
 }

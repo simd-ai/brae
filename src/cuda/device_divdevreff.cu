@@ -341,6 +341,7 @@ void deviceBoundaryGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
             deviceBCValue(dbU.comp[i], *Uc[i], *ub[i]);
     }
     gradB.resize(static_cast<std::size_t>(9) * nB);
+    if (nB == 0) return;   // a rank with no physical boundary face (deviceBCValue)
     gradBKernel<<<nBlocks(nB), TPB>>>(nB, dm.bndCell.data(), dm.bndGFace.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
                                       gradU.data(), nC, uxb.data(), uyb.data(), uzb.data(), Ux.data(), Uy.data(), Uz.data(),
                                       dbU.comp[0].deltaCoeffs.data(),
@@ -552,7 +553,7 @@ void deviceDivDevReff(
     {
         deviceCopy(gradB, *gradBGiven);
     }
-    else
+    else if (nB > 0)   // a rank with no physical boundary face (deviceBCValue)
     {
         gradBKernel<<<nBlocks(nB), TPB>>>(nB, dm.bndCell.data(), dm.bndGFace.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
                                           gradU.data(), nC, uxb.data(), uyb.data(), uzb.data(), Ux.data(), Uy.data(), Uz.data(),
@@ -567,7 +568,7 @@ void deviceDivDevReff(
     }
     DeviceBuffer<scalar>& sigmaB = ws.sigmaB;
     sigmaB.resize(static_cast<std::size_t>(9) * nB);
-    sigmaKernel<<<nBlocks(nB), TPB>>>(nB, gradB.data(), nuBnd.data(), sigmaB.data());
+    if (nB > 0) sigmaKernel<<<nBlocks(nB), TPB>>>(nB, gradB.data(), nuBnd.data(), sigmaB.data());
     cudaCheck(cudaGetLastError(), "ddr sigmaB");
 
     // Processor faces: OVERWRITE the sigmaB just computed from dev2(T(gradB)). A cut face is interior to the

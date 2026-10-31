@@ -477,6 +477,7 @@ void deviceUpdateFlowRateInletDev(
                       && static_cast<int>(UxBnd->size()) == n
                       && static_cast<int>(UyBnd->size()) == n
                       && static_cast<int>(UzBnd->size()) == n;
+    if (n == 0) return;   // a rank with no physical boundary face (deviceBCValue)
     frUpdateDevKernel<<<nBlocks(n), TPB>>>(n, maskMagSf.data(), w.data() + 1, nx.data(), ny.data(), nz.data(),
                                            dbU.comp[0].refValue.data(),
                                            dbU.comp[1].refValue.data(),
@@ -589,6 +590,7 @@ void deviceUpdateMixedFreestream(
     const scalar* pub0 = stored ? UbX->data() : ub0.data();
     const scalar* pub1 = stored ? UbY->data() : ub1.data();
     const scalar* pub2 = stored ? UbZ->data() : ub2.data();
+    if (n == 0) return;   // a rank with no physical boundary face (deviceBCValue)
     mixedUpdateKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].mixedMask.data(), dbP.mixedMask.data(), dbP.faceCell.data(),
                                            phiBnd.data(), dbP.magSf.data(),
                                            (rhoBnd && rhoBnd->size() == static_cast<std::size_t>(n)) ? rhoBnd->data() : nullptr,
@@ -1137,6 +1139,7 @@ void scatterRuns(
         a.from[k] = from[k];
     }
     const int n = static_cast<int>(nh);
+    if (n == 0) return;   // a rank with no physical boundary face (deviceBCValue)
     scatterRunsKernel<T><<<nBlocks(n), TPB, 0, cudaStreamPerThread>>>(
         n,
         static_cast<int>(runs.size()),

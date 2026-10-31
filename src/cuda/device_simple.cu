@@ -417,6 +417,7 @@ void deviceBoundaryFlux(
     DeviceBuffer<scalar>& phiB)
 {
     phiB.resize(dm.nBndFaces);
+    if (dm.nBndFaces == 0) return;   // a rank with no physical boundary face (deviceBCValue)
     bndFluxKernel<<<nBlocks(dm.nBndFaces), TPB>>>(dm.nBndFaces, dm.bndGFace.data(), dm.Sfx.data(), dm.Sfy.data(),
                                                   dm.Sfz.data(), uxb.data(), uyb.data(), uzb.data(), dm.bndIsEmpty.data(), phiB.data());
     cudaCheck(cudaGetLastError(), "bndFlux");
@@ -518,6 +519,7 @@ void deviceCmptMaxMag3(
 {
     const int n = static_cast<int>(a.size());
     out.resize(n);
+    if (n == 0) return;   // a rank with no physical boundary face (deviceBCValue)
     cmptMaxMag3Kernel<<<nBlocks(n), TPB>>>(n, a.data(), b.data(), c.data(), out.data());
     cudaCheck(cudaGetLastError(), "cmptMaxMag3");
 }
@@ -544,6 +546,7 @@ void deviceCmptMin3(
 {
     const int n = static_cast<int>(a.size());
     out.resize(n);
+    if (n == 0) return;   // a rank with no physical boundary face (deviceBCValue)
     cmptMin3Kernel<<<nBlocks(n), TPB>>>(n, a.data(), b.data(), c.data(), out.data());
     cudaCheck(cudaGetLastError(), "cmptMin3");
 }

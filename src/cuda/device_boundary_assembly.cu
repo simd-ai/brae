@@ -169,6 +169,10 @@ void bcMatrixFluxKernel(
 void deviceBCValue(const DeviceBoundary& db, const DeviceBuffer<scalar>& internal, DeviceBuffer<scalar>& value, const int* skipIf)
 {
     value.resize(db.n);
+    // A rank with no physical boundary face: a mesh partition whose faces are all interfaces, so every boundary array
+    // of this rank is empty. CUDA 13 refuses a launch of zero blocks (cudaErrorInvalidValue, "invalid argument"): the
+    // 14.1 M-cell motorBike at 16 ranks stopped here on the 7 ranks with no outer patch. Same in every boundary kernel below.
+    if (db.n == 0) return;
     bcValueKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.refValue.data(), db.valueFraction.data(),
                                           db.faceCell.data(), internal.data(),
                                           db.refGrad.size() ? db.refGrad.data() : nullptr,
@@ -187,6 +191,7 @@ void deviceBCLaplacianCoeffsFace(
 {
     iC.resize(db.n);
     bC.resize(db.n);
+    if (db.n == 0) return;   // see deviceBCValue
     bcLaplacianFaceKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.refValue.data(), db.valueFraction.data(),
                                                   db.deltaCoeffs.data(), db.magSf.data(), gammaFace.data(),
                                                   db.refGrad.size() ? db.refGrad.data() : nullptr, iC.data(), bC.data());
@@ -202,6 +207,7 @@ void deviceBCLaplacianCoeffs(
 {
     iC.resize(db.n);
     bC.resize(db.n);
+    if (db.n == 0) return;   // see deviceBCValue
     bcLaplacianKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.refValue.data(), db.valueFraction.data(),
                                               db.deltaCoeffs.data(), db.magSf.data(), gammaCell.data(), db.faceCell.data(),
                                               db.refGrad.size() ? db.refGrad.data() : nullptr,
@@ -218,6 +224,7 @@ void deviceBCDivCoeffs(
 {
     iC.resize(db.n);
     bC.resize(db.n);
+    if (db.n == 0) return;   // see deviceBCValue
     bcDivKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.refValue.data(), db.valueFraction.data(),
                                         db.refGrad.size() ? db.refGrad.data() : nullptr, db.deltaCoeffs.data(),
                                         phiB.data(), iC.data(), bC.data());
@@ -233,6 +240,7 @@ void deviceMatrixFluxBoundary(
     DeviceBuffer<scalar>& fluxB)
 {
     fluxB.resize(db.n);
+    if (db.n == 0) return;   // see deviceBCValue
     bcMatrixFluxKernel<<<nBlocks(db.n), TPB>>>(db.n, db.faceCell.data(), iC.data(), bC.data(), p.data(), fluxB.data());
     cudaCheck(cudaGetLastError(), "bcMatrixFlux");
 }
