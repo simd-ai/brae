@@ -422,7 +422,9 @@ void deviceSolveScalarTransport(
         }
     }
     // laplacian "corrected": nonOrthDeltaCoeffs implicit (in deviceLaplacianCoeffs) + corrVec.grad(field) explicit (deviceLaplacianCorr).
-    deviceLaplacianCoeffs(dm, Df, lD, lU, lL, nonOrth);
+    // ...and `uncorrected` takes those coefficients with no correction. MEASURED on pitzDailyTurb from one state, two tight
+    // iterations (JUPITER job 2637170): orthogonal's coefficients left epsilon 1.0e-04, k 1.8e-05, nut 2.2e-05 from OpenFOAM
+    deviceLaplacianCoeffs(dm, Df, lD, lU, lL, nonOrth || dm.scalarNonOrthCoeffs);
     deviceAxpy(-1.0, lD, aD); deviceAxpy(-1.0, lU, aU); deviceAxpy(-1.0, lL, aL);
     if (nonOrth)
     {

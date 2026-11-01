@@ -184,6 +184,7 @@ bool simpleColourSwapControl()
         turbPrecon() = (ctl_.diluKE && dilu_.valid) ? &dilu_ : nullptr;
         ctorMark("enter");
         dm_   = buildDeviceMesh(m, g, fvp);
+        dm_.scalarNonOrthCoeffs = ctl_.nonOrthCoeffs && !std::getenv("BRAE_CONTROL_SCALAR_ORTHOGONAL_DELTA");
         ctorMark("deviceMesh built");
         cyc_  = buildDeviceCyclic(cyclics, g, fvp);
         ami_  = buildDeviceAMI(amis);

@@ -36,6 +36,9 @@ struct DeviceMesh
     DeviceBuffer<label>  owner, nei;                    // internal faces
     DeviceBuffer<scalar> w, V, Sfx, Sfy, Sfz;           // weights(nIf), V(nC), Sf components(all faces)
     DeviceBuffer<scalar> dc, magSf;                     // deltaCoeffs(nIf), |Sf|(all faces), for fvm assembly
+    // the laplacian's coefficients for the transported scalars, solver_controls.cuh's `nonOrthCoeffs`: `uncorrected`
+    // takes nonOrthDeltaCoeffs with no correction flux, and the scaffold's `nonOrth` says only whether to add that flux
+    bool scalarNonOrthCoeffs = false;
     DeviceBuffer<label>  ownerStart, losort, losortStart;
     DeviceBuffer<label>  bndCell, bndGFace, bndPerm, bndCellStart;  // boundary-face gather
     DeviceBuffer<label>  bndIsEmpty;                                // 1 if the boundary face is on an empty patch
