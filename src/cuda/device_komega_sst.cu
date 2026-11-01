@@ -685,6 +685,64 @@ void sstNutBoundaryK(
     nutBnd[bi] = a1*kb / fmax(a1*ob, b1*F2*sqrt(fmax(S2, scalar(0))));
 }
 
+// EXPERIMENT (BRAE_SST_F1_PATCH=1, off by default): F1 on a boundary face, as OpenFOAM's F1() evaluates it there: its expression from the patch values of k and omega, y's patch value
+// (zeroGradient off a wall, so the cell's), and CDkOmega from the corrected boundary gradients of k and omega (gaussGrad::correctBoundaryConditions).
+__global__
+void f1PatchK(
+    int nB,
+    const label* __restrict__ fc,
+    const scalar* __restrict__ kb,
+    const scalar* __restrict__ ob,
+    const scalar* __restrict__ yCell,
+    const scalar* __restrict__ kc,
+    const scalar* __restrict__ oc,
+    const scalar* __restrict__ gkx,
+    const scalar* __restrict__ gky,
+    const scalar* __restrict__ gkz,
+    const scalar* __restrict__ gox,
+    const scalar* __restrict__ goy,
+    const scalar* __restrict__ goz,
+    const scalar* __restrict__ nx,
+    const scalar* __restrict__ ny,
+    const scalar* __restrict__ nz,
+    const scalar* __restrict__ dc,
+    const scalar* __restrict__ F1c,
+    scalar nu,
+    scalar betaStar,
+    scalar alphaOmega2,
+    scalar* __restrict__ F1b)
+{
+    const int bi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bi >= nB) return;
+    const int c = fc[bi];
+    const scalar y = yCell[c];
+    const scalar kk = kb[bi];
+    const scalar w = ob[bi];
+    if (!(w > scalar(0)) || !(y > scalar(0)) || kk < scalar(0))
+    {
+        F1b[bi] = F1c[c];
+        return;
+    }
+    const scalar snK = (kk - kc[c]) * dc[bi];
+    const scalar snO = (w - oc[c]) * dc[bi];
+    const scalar nK = nx[bi]*gkx[c] + ny[bi]*gky[c] + nz[bi]*gkz[c];
+    const scalar nO = nx[bi]*gox[c] + ny[bi]*goy[c] + nz[bi]*goz[c];
+    const scalar kbx = gkx[c] + nx[bi]*(snK - nK);
+    const scalar kby = gky[c] + ny[bi]*(snK - nK);
+    const scalar kbz = gkz[c] + nz[bi]*(snK - nK);
+    const scalar obx = gox[c] + nx[bi]*(snO - nO);
+    const scalar oby = goy[c] + ny[bi]*(snO - nO);
+    const scalar obz = goz[c] + nz[bi]*(snO - nO);
+    const scalar CD = (2.0*alphaOmega2)*(kbx*obx + kby*oby + kbz*obz)/w;
+    const scalar CDplus = fmax(CD, (scalar)1.0e-10);
+    const scalar a  = (1.0 / betaStar) * sqrt(kk) / (w * y);
+    const scalar b  = 500.0 * nu / (y * y * w);
+    const scalar cc = (4.0 * alphaOmega2) * kk / (CDplus * y * y);
+    const scalar arg1 = fmin(fmin(fmax(a, b), cc), (scalar)10.0);
+    const scalar a2 = arg1 * arg1;
+    F1b[bi] = tanh(a2 * a2);
+}
+
 void deviceSSTNutBoundary(
     const DeviceVectorBoundary& dbU,
     const DeviceBuffer<scalar>& kBnd,
@@ -1078,6 +1136,15 @@ void deviceKOmegaSSTCorrect(
         F1b.resize(nB);
         gatherCellToFaceK<<<nBlocks(nB), TPB>>>(nB, dbOmega.faceCell.data(), F1.data(), F1b.data());
         cudaCheck(cudaGetLastError(), "F1b");
+        static const bool f1Patch = std::getenv("BRAE_SST_F1_PATCH") != nullptr;
+        if (f1Patch && !rho && !gammaIntEff)
+        {
+            f1PatchK<<<nBlocks(nB), TPB>>>(nB, dbOmega.faceCell.data(), kbv.data(), obv.data(), y.data(), k.data(), omega.data(),
+                                           kgx.data(), kgy.data(), kgz.data(), ogx.data(), ogy.data(), ogz.data(),
+                                           dbU.nx.data(), dbU.ny.data(), dbU.nz.data(), dbU.comp[0].deltaCoeffs.data(), F1.data(),
+                                           nu, co.betaStar, co.alphaOmega2, F1b.data());
+            cudaCheck(cudaGetLastError(), "F1 on the patch");
+        }
         DomB.resize(nB); DkB.resize(nB);
         deviceDEff(F1b, *nutBnd, co.alphaOmega1, co.alphaOmega2, rho ? scalar(0) : nu, DomB);
         deviceDEff(F1b, *nutBnd, co.alphaK1,     co.alphaK2,     rho ? scalar(0) : nu, DkB);
