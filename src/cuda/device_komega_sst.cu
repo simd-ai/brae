@@ -12,8 +12,10 @@
 #include "device_cyclic.cuh"
 #include "device_interface.cuh"
 #include "device_amg.cuh"
+#include "stage_dump.cuh"
 #include <cuda_runtime.h>
 #include <cmath>
+#include <cstdlib>
 
 namespace brae {
 
@@ -1144,6 +1146,12 @@ void deviceKOmegaSSTCorrect(
                                            dbU.nx.data(), dbU.ny.data(), dbU.nz.data(), dbU.comp[0].deltaCoeffs.data(), F1.data(),
                                            nu, co.betaStar, co.alphaOmega2, F1b.data());
             cudaCheck(cudaGetLastError(), "F1 on the patch");
+        }
+        if (stageDumpActive() && stageDumpFirstOnly("sstF1b"))
+        {
+            stageDump("stage_sstF1", F1);
+            stageDump("stage_sstF1b", F1b);
+            stageDump("stage_sstCD", CD);
         }
         DomB.resize(nB); DkB.resize(nB);
         deviceDEff(F1b, *nutBnd, co.alphaOmega1, co.alphaOmega2, rho ? scalar(0) : nu, DomB);
