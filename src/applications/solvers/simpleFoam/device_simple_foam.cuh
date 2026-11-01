@@ -878,6 +878,8 @@ private:
     DeviceBuffer<scalar> pbStored_;
     DeviceBuffer<scalar> pbPrev_;
     bool freestreamStored() const { return UbStored_[0].size() > 0; }
+    // U's patch values as read, for kOmegaSST's validate() alone: empty once the first iteration begins
+    DeviceBuffer<scalar> UbRead_[3];
     bool   hasWedge_ = false;   // any wedge (axisymmetric constraint) U patch -> per-step rotated value                                  // any freestreamVelocity/Pressure (mixed) patch present
     bool   hasPiov_ = false;                                   // any pressureInletOutletVelocity (directionMixed) patch present
     bool   hasSym_ = false;                                    // any slip/symmetry patch present (general normal)

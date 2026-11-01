@@ -813,7 +813,8 @@ void deviceCellLimitGradU(
     DeviceBuffer<scalar>& gradU,
     scalar kc,
     const DeviceCyclic* cyc,
-    const DeviceAMI* ami)
+    const DeviceAMI* ami,
+    const DeviceBuffer<scalar>* const* UbStored)
 {
     const int nC = dm.nCells;
     const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
@@ -831,7 +832,8 @@ void deviceCellLimitGradU(
         cudaMemcpyAsync(gy.data(), gradU.data()+(std::size_t)(3+j)*nC, nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
         cudaMemcpyAsync(gz.data(), gradU.data()+(std::size_t)(6+j)*nC, nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread);
         DeviceBuffer<scalar> ubv;
-        deviceBCValue(dbU.comp[j], *U[j], ubv);
+        if (UbStored) deviceCopy(ubv, *UbStored[j]);
+        else deviceBCValue(dbU.comp[j], *U[j], ubv);
         // The coupled patches join the limiter's range, exactly as in the momentum predictor -- an
         // interface cell limited as if the interface were not there is the defect this whole path
         // turned on. See CellLimitInterface.

@@ -377,6 +377,32 @@ bool simpleColourSwapControl()
                 throw std::runtime_error("brae: p's stored patch values do not span the device boundary");
             pbStored_.copyFrom(pb);
         }
+        // kOmegaSST's first correctNut reads fvc::grad(U) with U's patch values as read, what kOmegaSST::validate() finds: nothing has evaluated them yet. deviceBCValue
+        // does not give those on an inletOutlet patch before the first deviceUpdateInletOutlet: its faces are still at their inletValue. MEASURED on the 3-D duct from
+        // OpenFOAM's iteration 50, outlet inletOutlet with inletValue 0: nut in the outlet column 19x low for iteration 1, reproduced from OpenFOAM's own grad(U) with the
+        // outlet at 0 to 6.9e-16, U 3.8e-04 from corrected OpenFOAM after one iteration against 7.2e-15 with the outlet zeroGradient. Released at the first iteration.
+        // BRAE_CONTROL_SST_START_EVALUATE=1 takes the old value, the gate's control.
+        if (ctl_.turbulent && ctl_.sst && !std::getenv("BRAE_CONTROL_SST_START_EVALUATE"))
+        {
+            std::vector<scalar> ub[3];
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                const std::vector<vector>& v = U.boundary[pi]->value();
+                for (label i = 0; i < fvp[pi].size; ++i)
+                {
+                    const vector u = static_cast<std::size_t>(i) < v.size() ? v[static_cast<std::size_t>(i)] : vector{0, 0, 0};
+                    ub[0].push_back(u.x);
+                    ub[1].push_back(u.y);
+                    ub[2].push_back(u.z);
+                }
+            }
+            if (static_cast<int>(ub[0].size()) != dbU_.comp[0].n)
+                throw std::runtime_error("brae: U's patch values as read do not span the device boundary ("
+                                         + std::to_string(ub[0].size()) + " faces against "
+                                         + std::to_string(dbU_.comp[0].n) + ")");
+            for (int k = 0; k < 3; ++k) UbRead_[k].copyFrom(ub[k]);
+        }
         // any pressureInletOutletVelocity (directionMixed) U patch present -> run its per-step updateCoeffs.
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             if (U.boundary[pi]->bcCategory() == 6)
@@ -993,11 +1019,13 @@ bool simpleColourSwapControl()
         }
         else if (ctl_.sst)
         {
+            const DeviceBuffer<scalar>* read[3] = {&UbRead_[0], &UbRead_[1], &UbRead_[2]};
+            const DeviceBuffer<scalar>* const* asRead = UbRead_[0].size() ? read : nullptr;
             DeviceBuffer<scalar> gradU;
             deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU,
-                        hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+                        hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, asRead);
             if (ctl_.gradULimitK > 0.0) deviceCellLimitGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, ctl_.gradULimitK,
-                                                          hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr);   // OF grad(U) cellLimited (validate correctNut)
+                                                          hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr, asRead);   // OF grad(U) cellLimited (validate correctNut)
             DeviceBuffer<scalar> S2;
             deviceS2(gradU, nC_, S2);
             DeviceBuffer<scalar> F2;
@@ -1343,6 +1371,8 @@ bool simpleColourSwapControl()
         // nonOrthLimitP (the pressure non-orth limiter) is declared in step() -- it is read only by the pressure phase.
         const scalar nonOrthRelaxU = std::getenv("BRAE_NONORTH_RELAX_U") ? std::atof(std::getenv("BRAE_NONORTH_RELAX_U")) : 1.0;
 
+        // validate() is behind us
+        for (int k = 0; k < 3; ++k) UbRead_[k] = DeviceBuffer<scalar>();
         // inletOutlet BCs: resolve each IO face to fixedValue|zeroGradient from the PREVIOUS step's boundary flux
         // (OF updateCoeffs uses the prior corrector's phi). No-op when a boundary has no inletOutlet faces.
         deviceUpdateInletOutlet(dbU_, phiBnd_);

@@ -659,12 +659,13 @@ void deviceGradU(
     const DeviceBuffer<scalar>& Uz,
     DeviceBuffer<scalar>& gradU,
     DeviceAMI* ami,
-    DeviceCyclic* cyc)
+    DeviceCyclic* cyc,
+    const DeviceBuffer<scalar>* const* UbStored)
 {
     const int nC = dm.nCells;
     const DeviceBuffer<scalar>* Uc[3] = { &Ux, &Uy, &Uz };
     gradU.resize(static_cast<std::size_t>(9) * nC);
-    const GradUMemo& memo = deviceGradUShared(dm, dbU, Ux, Uy, Uz);
+    const GradUMemo& memo = deviceGradUShared(dm, dbU, Ux, Uy, Uz, UbStored);
 
     // interface (cyclic/cyclicAMI) face contribution to grad(U): without it the gradient at interface cells is
     // ONE-SIDED -> wrong turbulence production G=nut*(gradU&&devTwoSymm(gradU)) there (the divDevReff x-invariance

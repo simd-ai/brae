@@ -90,7 +90,8 @@ void deviceGradUSharedRelease(const DeviceMesh& dm);
 // (GbyNu) and kOmegaSST (which also needs gradU for S2 = 2 magSqr(symm(gradU))).
 void deviceGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                  const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
-                 DeviceBuffer<scalar>& gradU, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr);
+                 DeviceBuffer<scalar>& gradU, DeviceAMI* ami = nullptr, DeviceCyclic* cyc = nullptr,
+                 const DeviceBuffer<scalar>* const* UbStored = nullptr);
 void deviceGByNuFromGradU(const DeviceBuffer<scalar>& gradU, int nC, DeviceBuffer<scalar>& gByNu);
 // The same 9*nC tensor from OpenFOAM's least-squares fit: leastSquaresGrad.C's calcGrad on a vector
 // is lsGrad += ownLs*deltaVsf (an outer product), so column j is the SCALAR least-squares gradient of
@@ -105,7 +106,8 @@ void deviceLeastSquaresGradU(const DeviceMesh& dm, const DeviceVectorBoundary& d
 void deviceCellLimitGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                           const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                           DeviceBuffer<scalar>& gradU, scalar kc,
-                          const DeviceCyclic* cyc = nullptr, const DeviceAMI* ami = nullptr);
+                          const DeviceCyclic* cyc = nullptr, const DeviceAMI* ami = nullptr,
+                          const DeviceBuffer<scalar>* const* UbStored = nullptr);
 
 // nut = Cmu k^2 / eps.
 void deviceNut(const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& eps, DeviceBuffer<scalar>& nut,
