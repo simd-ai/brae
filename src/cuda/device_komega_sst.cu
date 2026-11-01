@@ -745,6 +745,35 @@ void f1PatchK(
     F1b[bi] = tanh(a2 * a2);
 }
 
+void deviceF1OnPatch(
+    const DeviceBoundary& dbOmega,
+    const DeviceVectorBoundary& dbU,
+    const DeviceBuffer<scalar>& kBnd,
+    const DeviceBuffer<scalar>& omegaBnd,
+    const DeviceBuffer<scalar>& yCell,
+    const DeviceBuffer<scalar>& k,
+    const DeviceBuffer<scalar>& omega,
+    const DeviceBuffer<scalar>& gkx,
+    const DeviceBuffer<scalar>& gky,
+    const DeviceBuffer<scalar>& gkz,
+    const DeviceBuffer<scalar>& gox,
+    const DeviceBuffer<scalar>& goy,
+    const DeviceBuffer<scalar>& goz,
+    const DeviceBuffer<scalar>& F1,
+    scalar nu,
+    const KOmegaSSTCoeffs& co,
+    DeviceBuffer<scalar>& F1b)
+{
+    static const bool on = std::getenv("BRAE_SST_F1_PATCH") != nullptr;
+    const int nB = static_cast<int>(F1b.size());
+    if (!on || nB == 0) return;
+    f1PatchK<<<nBlocks(nB), TPB>>>(nB, dbOmega.faceCell.data(), kBnd.data(), omegaBnd.data(), yCell.data(), k.data(), omega.data(),
+                                   gkx.data(), gky.data(), gkz.data(), gox.data(), goy.data(), goz.data(),
+                                   dbU.nx.data(), dbU.ny.data(), dbU.nz.data(), dbU.comp[0].deltaCoeffs.data(), F1.data(),
+                                   nu, co.betaStar, co.alphaOmega2, F1b.data());
+    cudaCheck(cudaGetLastError(), "F1 on the patch");
+}
+
 void deviceSSTNutBoundary(
     const DeviceVectorBoundary& dbU,
     const DeviceBuffer<scalar>& kBnd,
@@ -1138,15 +1167,7 @@ void deviceKOmegaSSTCorrect(
         F1b.resize(nB);
         gatherCellToFaceK<<<nBlocks(nB), TPB>>>(nB, dbOmega.faceCell.data(), F1.data(), F1b.data());
         cudaCheck(cudaGetLastError(), "F1b");
-        static const bool f1Patch = std::getenv("BRAE_SST_F1_PATCH") != nullptr;
-        if (f1Patch && !rho && !gammaIntEff)
-        {
-            f1PatchK<<<nBlocks(nB), TPB>>>(nB, dbOmega.faceCell.data(), kbv.data(), obv.data(), y.data(), k.data(), omega.data(),
-                                           kgx.data(), kgy.data(), kgz.data(), ogx.data(), ogy.data(), ogz.data(),
-                                           dbU.nx.data(), dbU.ny.data(), dbU.nz.data(), dbU.comp[0].deltaCoeffs.data(), F1.data(),
-                                           nu, co.betaStar, co.alphaOmega2, F1b.data());
-            cudaCheck(cudaGetLastError(), "F1 on the patch");
-        }
+        if (!rho && !gammaIntEff) deviceF1OnPatch(dbOmega, dbU, kbv, obv, y, k, omega, kgx, kgy, kgz, ogx, ogy, ogz, F1, nu, co, F1b);
         if (stageDumpActive() && stageDumpFirstOnly("sstF1b"))
         {
             stageDump("stage_sstF1", F1);

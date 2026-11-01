@@ -8,7 +8,8 @@
 # THE ORACLE: real OpenFOAM on the same bytes. On JUPITER use a build that passes scripts/jsc/of_oracle.sh of brae-multigpu: its installed v2506 returns the wrong xz from T(tmp<volTensorField>).
 # THE BOUNDS, each arm: U within 1e-12, p within 1e-10 after the iteration; Ux, Uy, Uz and p first residuals within 5e-6 relative, brae printing six digits. k, omega and nut are printed and not bound on
 # the plain arm: they carry the inlet's F1 from the adjacent cell. The arm with BRAE_SST_F1_PATCH=1 holds them too, each within 1e-12. MEASURED restarted (JUPITER job 2622756): k 1.9e-14 omega 8.2e-15
-# nut 5.4e-15, and 1.55e-06, 7.51e-06, 3.32e-05 without it.
+# nut 5.4e-15, and 1.55e-06, 7.51e-06, 3.32e-05 without it. COLD, that bound is on upwind k and omega only (the coldup arm): limitedLinear from a uniform start breaks its round-off ties anyhow. MEASURED
+# (job 2629994), OpenFOAM against itself with every k and omega moved a coin's 1 ulp: limitedLinear k 2.1e-02 omega 3.5e-02 nut 8.7e-02, upwind 4.8e-16, 3.9e-16, 6.2e-16.
 # CONTROL, asserted red: BRAE_CONTROL_SST_START_EVALUATE=1 on the inletOutlet arms, the old value: U or a first residual must miss.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -42,12 +43,12 @@ def field(case, name, cls, dims, value, inlet, outlet, walls):
     write(case, '0/' + name, cls, 'dimensions %s; internalField uniform %s;\nboundaryField {\n    inlet { %s }\n    outlet { %s }\n    walls { %s }\n}\n' % (dims, value, inlet, outlet, walls))
 
 
-def stage(case, outlet):
+def stage(case, outlet, turbulence='limitedLinear'):
     for d in ('', '/0', '/constant', '/system'):
         os.mkdir(case + d)
     write(case, 'system/controlDict', 'dictionary', 'application simpleFoam; startFrom startTime; startTime 0; stopAt endTime; endTime 1;\ndeltaT 1; writeControl timeStep; writeInterval 1; writeFormat ascii; writePrecision 17;\nwriteCompression off; timeFormat general; timePrecision 6; runTimeModifiable false;\n')
     write(case, 'system/blockMeshDict', 'dictionary', 'scale 1;\nvertices ( (0 0 0)(2 0 0)(2 0.2 0)(0 0.2 0)(0 0 0.2)(2 0 0.2)(2 0.2 0.2)(0 0.2 0.2) );\nblocks ( hex (0 1 2 3 4 5 6 7) (40 15 15)\n  simpleGrading (1 ((0.5 0.5 6)(0.5 0.5 0.1667)) ((0.5 0.5 6)(0.5 0.5 0.1667))) );\nedges ();\nboundary\n(\n    inlet  { type patch; faces ( (0 4 7 3) ); }\n    outlet { type patch; faces ( (1 2 6 5) ); }\n    walls  { type wall;  faces ( (0 1 5 4)(3 2 6 7)(0 3 2 1)(4 5 6 7) ); }\n);\n')
-    write(case, 'system/fvSchemes', 'dictionary', 'ddtSchemes { default steadyState; }\ngradSchemes { default Gauss linear; }\ndivSchemes { default none; div(phi,U) bounded Gauss linearUpwind grad(U);\n  div(phi,k) bounded Gauss limitedLinear 1; div(phi,omega) bounded Gauss limitedLinear 1;\n  div((nuEff*dev2(T(grad(U))))) Gauss linear; }\nlaplacianSchemes { default Gauss linear corrected; }\ninterpolationSchemes { default linear; }\nsnGradSchemes { default corrected; }\nwallDist { method meshWave; }\n')
+    write(case, 'system/fvSchemes', 'dictionary', 'ddtSchemes { default steadyState; }\ngradSchemes { default Gauss linear; }\ndivSchemes { default none; div(phi,U) bounded Gauss linearUpwind grad(U);\n  div(phi,k) bounded Gauss TURB; div(phi,omega) bounded Gauss TURB;\n  div((nuEff*dev2(T(grad(U))))) Gauss linear; }\nlaplacianSchemes { default Gauss linear corrected; }\ninterpolationSchemes { default linear; }\nsnGradSchemes { default corrected; }\nwallDist { method meshWave; }\n'.replace('TURB', 'upwind' if turbulence == 'upwind' else 'limitedLinear 1'))
     write(case, 'system/fvSolution', 'dictionary', 'solvers { p { solver GAMG; smoother GaussSeidel; tolerance 1e-12; relTol 0; maxIter 5000; }\n  "(U|k|omega)" { solver smoothSolver; smoother symGaussSeidel; tolerance 1e-13; relTol 0; maxIter 2000; } }\nSIMPLE { nNonOrthogonalCorrectors 0; }\nrelaxationFactors { fields { p 0.3; } equations { U 0.7; k 0.7; omega 0.7; } }\n')
     write(case, 'constant/transportProperties', 'dictionary', 'transportModel Newtonian; nu 1e-4;\n')
     write(case, 'constant/turbulenceProperties', 'dictionary', 'simulationType RAS; RAS { RASModel kOmegaSST; turbulence on; printCoeffs on; }\n')
@@ -93,7 +94,7 @@ def compare(ofcase, brcase, t):
 
 what = sys.argv[1]
 if what == 'stage':
-    stage(sys.argv[2], sys.argv[3])
+    stage(*sys.argv[2:])
 elif what == 'restart':
     restart(sys.argv[2], sys.argv[3], sys.argv[4])
 else:
@@ -115,13 +116,16 @@ do
     cold="$W/cold-$outlet"
     python3 -B "$W/gate.py" stage "$cold" "$outlet"
     cp -r "$BASE/constant/polyMesh" "$cold/constant/"
+    coldup="$W/coldup-$outlet"
+    python3 -B "$W/gate.py" stage "$coldup" "$outlet" upwind
+    cp -r "$BASE/constant/polyMesh" "$coldup/constant/"
     # restart: OpenFOAM to iteration 20, then each from its bytes
     dev="$W/dev-$outlet"
     python3 -B "$W/gate.py" stage "$dev" "$outlet"
     cp -r "$BASE/constant/polyMesh" "$dev/constant/"
     python3 -B "$W/gate.py" restart "$dev" 0 20
     of "cd '$dev' && simpleFoam > log 2>&1" < /dev/null || { echo "FAIL OpenFOAM development run, outlet $outlet"; fail=1; continue; }
-    for kind in cold restart
+    for kind in cold coldup restart
     do
         for who in of brae ctl f1
         do
@@ -131,9 +135,13 @@ do
             then
                 cp -r "$cold/0" "$cold/constant" "$cold/system" "$c/"
                 t=1
+            elif [ "$kind" = coldup ]
+            then
+                cp -r "$coldup/0" "$coldup/constant" "$coldup/system" "$c/"
+                t=1
             else
                 cp -r "$dev/constant" "$dev/system" "$dev/20" "$c/"
-                rm -rf "$c/20/uniform"
+                rm -rf "${c:?}/20/uniform"
                 python3 -B "$W/gate.py" restart "$c" 20 21
                 t=21
             fi
@@ -144,8 +152,13 @@ do
         python3 -B "$W/gate.py" compare "$W/$kind-$outlet-of" "$W/$kind-$outlet-brae" "$t" hold || fail=1
         ( cd "$W/$kind-$outlet-f1" && BRAE_SIMPLE_CASE_SOLVER=1 BRAE_SST_F1_PATCH=1 "$BRAE" -case . > log 2> err < /dev/null ) || { echo "FAIL brae F1 $kind $outlet exited $?"; fail=1; continue; }
         printf '  F1 %-8s %-3s ' "$kind" "$outlet"
-        python3 -B "$W/gate.py" compare "$W/$kind-$outlet-of" "$W/$kind-$outlet-f1" "$t" all || fail=1
-        if [ "$outlet" = io ]
+        if [ "$kind" = cold ]
+        then
+            python3 -B "$W/gate.py" compare "$W/$kind-$outlet-of" "$W/$kind-$outlet-f1" "$t" hold || fail=1
+        else
+            python3 -B "$W/gate.py" compare "$W/$kind-$outlet-of" "$W/$kind-$outlet-f1" "$t" all || fail=1
+        fi
+        if [ "$outlet" = io ] && [ "$kind" != coldup ]
         then
             ( cd "$W/$kind-$outlet-ctl" && BRAE_SIMPLE_CASE_SOLVER=1 BRAE_CONTROL_SST_START_EVALUATE=1 "$BRAE" -case . > log 2> err < /dev/null ) || { echo "FAIL control $kind exited $?"; fail=1; continue; }
             printf '  CONTROL %-8s ' "$kind"
