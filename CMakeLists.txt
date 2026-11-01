@@ -826,6 +826,9 @@ add_test(NAME simple_second_scalar_scheme COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/te
 set_tests_properties(simple_second_scalar_scheme PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 add_test(NAME simple_colour_vs_openfoam COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_colour_vs_openfoam.sh)
 set_tests_properties(simple_colour_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
+# kOmegaSST's first correctNut with U's patch values as read: one iteration on a 3-D duct, both outlets, cold and restarted, against real OpenFOAM. It sets its own BRAE_SIMPLE_CASE_SOLVER.
+add_test(NAME simple_sst_start_vs_openfoam COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_sst_start_vs_openfoam.sh)
+set_tests_properties(simple_sst_start_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
 # Each transported turbulence field (k, epsilon, omega, nuTilda) stops on its OWN fvSolution entry --
 # tolerance, relTol, maxIter, minIter -- in both orders, against real OpenFOAM's sweep counts on pitzDailySST,
 # pitzDailyTurb and airFoil2D. Controls: the pair under one merged rule, the fixed 3000 cap with no minIter.
