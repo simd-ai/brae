@@ -6,8 +6,9 @@
 #
 # ARMS, one SIMPLE iteration each, every solve tight (p 1e-12, the rest 1e-13), OpenFOAM's sweep order: {outlet inletOutlet, outlet zeroGradient} x {cold from 0, restart from OpenFOAM's iteration 20}.
 # THE ORACLE: real OpenFOAM on the same bytes. On JUPITER use a build that passes scripts/jsc/of_oracle.sh of brae-multigpu: its installed v2506 returns the wrong xz from T(tmp<volTensorField>).
-# THE BOUNDS, each arm: U within 1e-12, p within 1e-10 after the iteration; Ux, Uy, Uz and p first residuals within 5e-6 relative, brae printing six digits. k, omega and nut are printed and not bound:
-# they carry the inlet's F1 on the face (BRAE_SST_F1_PATCH), which this gate does not hold.
+# THE BOUNDS, each arm: U within 1e-12, p within 1e-10 after the iteration; Ux, Uy, Uz and p first residuals within 5e-6 relative, brae printing six digits. k, omega and nut are printed and not bound on
+# the plain arm: they carry the inlet's F1 from the adjacent cell. The arm with BRAE_SST_F1_PATCH=1 holds them too, each within 1e-12. MEASURED restarted (JUPITER job 2622756): k 1.9e-14 omega 8.2e-15
+# nut 5.4e-15, and 1.55e-06, 7.51e-06, 3.32e-05 without it.
 # CONTROL, asserted red: BRAE_CONTROL_SST_START_EVALUATE=1 on the inletOutlet arms, the old value: U or a first residual must miss.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -99,8 +100,10 @@ else:
     gaps, res, ro, rb = compare(sys.argv[2], sys.argv[3], sys.argv[4])
     want = sys.argv[5]
     ok = gaps['U'] <= 1e-12 and gaps['p'] <= 1e-10 and res <= 5e-6
+    if want == 'all':
+        ok = ok and gaps['k'] <= 1e-12 and gaps['omega'] <= 1e-12 and gaps['nut'] <= 1e-12
     print('%s U %.2e p %.2e k %.2e omega %.2e nut %.2e; first residuals worst %.2e (OpenFOAM Ux %.4e Uz %.4e p %.4e; brae Ux %.4e Uz %.4e p %.4e)' % ('within' if ok else 'MISSES', gaps['U'], gaps['p'], gaps['k'], gaps['omega'], gaps['nut'], res, ro['Ux'], ro['Uz'], ro['p'], rb['Ux'], rb['Uz'], rb['p']))
-    sys.exit(0 if ok == (want == 'hold') else 1)
+    sys.exit(0 if ok == (want != 'miss') else 1)
 PY
 fail=0
 BASE="$W/mesh"
@@ -120,7 +123,7 @@ do
     of "cd '$dev' && simpleFoam > log 2>&1" < /dev/null || { echo "FAIL OpenFOAM development run, outlet $outlet"; fail=1; continue; }
     for kind in cold restart
     do
-        for who in of brae ctl
+        for who in of brae ctl f1
         do
             c="$W/$kind-$outlet-$who"
             mkdir "$c"
@@ -139,6 +142,9 @@ do
         ( cd "$W/$kind-$outlet-brae" && BRAE_SIMPLE_CASE_SOLVER=1 "$BRAE" -case . > log 2> err < /dev/null ) || { echo "FAIL brae $kind $outlet exited $?"; fail=1; continue; }
         printf '  %-8s %-3s ' "$kind" "$outlet"
         python3 -B "$W/gate.py" compare "$W/$kind-$outlet-of" "$W/$kind-$outlet-brae" "$t" hold || fail=1
+        ( cd "$W/$kind-$outlet-f1" && BRAE_SIMPLE_CASE_SOLVER=1 BRAE_SST_F1_PATCH=1 "$BRAE" -case . > log 2> err < /dev/null ) || { echo "FAIL brae F1 $kind $outlet exited $?"; fail=1; continue; }
+        printf '  F1 %-8s %-3s ' "$kind" "$outlet"
+        python3 -B "$W/gate.py" compare "$W/$kind-$outlet-of" "$W/$kind-$outlet-f1" "$t" all || fail=1
         if [ "$outlet" = io ]
         then
             ( cd "$W/$kind-$outlet-ctl" && BRAE_SIMPLE_CASE_SOLVER=1 BRAE_CONTROL_SST_START_EVALUATE=1 "$BRAE" -case . > log 2> err < /dev/null ) || { echo "FAIL control $kind exited $?"; fail=1; continue; }
