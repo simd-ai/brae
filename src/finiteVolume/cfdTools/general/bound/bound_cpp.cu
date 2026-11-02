@@ -75,6 +75,8 @@ scalar bound(
     }
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
+        // An `empty` patch has no faces to surfaceSum (emptyFvPatch::size() is 0).
+        if (patches[pi].type == "empty") continue;
         const std::vector<scalar>& b = vsf.boundary[pi]->value();
         for (label i = 0; i < patches[pi].size; ++i)
         {

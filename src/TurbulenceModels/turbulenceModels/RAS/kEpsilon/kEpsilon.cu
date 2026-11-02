@@ -267,12 +267,14 @@ __global__ void boundGatherBndKernel(
     const label*  bndCell,
     const scalar* magSf,
     const scalar* bval,
+    const label*  bndIsEmpty,
     scalar        floorV,
     scalar*       num,
     scalar*       den)
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= nB) return;
+    if (bndIsEmpty && bndIsEmpty[i]) return;
     const label  c = bndCell[i];
     const scalar a = magSf[i];
     atomicAdd(&num[c], a * fmax(bval[i], floorV));
@@ -306,6 +308,7 @@ __global__ void boundGatherCellKernel(
     const label*  __restrict__ bndPerm,
     const scalar* __restrict__ bndMagSf,
     const scalar* __restrict__ bval,
+    const label*  __restrict__ bndIsEmpty,
     scalar*       __restrict__ num,
     scalar*       __restrict__ den)
 {
@@ -333,6 +336,9 @@ __global__ void boundGatherCellKernel(
         for (label q = bndCellStart[c]; q < bndCellStart[c + 1]; ++q)
         {
             const label b = bndPerm[q];
+            // An `empty` patch has no faces to surfaceSum (emptyFvPatch::size() is 0). MEASURED (pitzDailySST cold, job 4844884): counting
+            // its two faces left a 2-D inlet cell at 816.4 against OpenFOAM's 1059.2. Null is the control.
+            if (bndIsEmpty && bndIsEmpty[b]) continue;
             const scalar a = bndMagSf[b];
             n += a * fmax(bval[b], floorV);
             d += a;
@@ -996,6 +1002,7 @@ void boundField(
     // D-1: the per-cell gather in OpenFOAM's face order is the default; BRAE_BOUND_SCATTER=1 restores
     // the atomic scatter, which is the control tests/rho_run_to_run_identity.sh runs.
     static const bool scatter = std::getenv("BRAE_BOUND_SCATTER") != nullptr;
+    static const bool emptyFaces = std::getenv("BRAE_CONTROL_BOUND_EMPTY") != nullptr;
     if (!scatter)
     {
         boundGatherCellKernel<<<nBlk(nC), TPB>>>(
@@ -1003,6 +1010,7 @@ void boundField(
             dm.w.data(), dm.magSf.data(), x.data(), floorV,
             db.n ? dm.bndCellStart.data() : nullptr, db.n ? dm.bndPerm.data() : nullptr,
             db.n ? db.magSf.data() : nullptr, db.n ? bval.data() : nullptr,
+            db.n && !emptyFaces ? dm.bndIsEmpty.data() : nullptr,
             num.data(), den.data());
         cudaCheck(cudaGetLastError(), "kEpsilon bound gather (cell)");
     }
@@ -1015,6 +1023,7 @@ void boundField(
         if (db.n)
         {
             boundGatherBndKernel<<<nBlk(db.n), TPB>>>(db.n, dm.bndCell.data(), db.magSf.data(), bval.data(),
+                                                      emptyFaces ? nullptr : dm.bndIsEmpty.data(),
                                                       floorV, num.data(), den.data());
             cudaCheck(cudaGetLastError(), "kEpsilon bound gather boundary");
         }
