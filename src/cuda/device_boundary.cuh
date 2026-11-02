@@ -39,6 +39,7 @@ struct DeviceBoundary
     // consumer: without this the device arms clamped nothing there, and clamping everything would move
     // wall-function faces OpenFOAM leaves alone.
     DeviceBuffer<label>  assignableMask;
+    DeviceBuffer<label>  wallFunctionMask;  // 1 on an epsilon/omegaWallFunction face, whose value follows the wall cell it writes
     DeviceBuffer<label>  ioMask;            // 1 if the face is inletOutlet (bcType recomputed from the flux sign)
     DeviceBuffer<label>  oioMask;           // 1 if the face is outletInlet (freestreamPressure): opposite flux switch
     // The STORED patch value of an inletOutlet / outletInlet face, and whether it is still what an evaluate
@@ -109,7 +110,7 @@ inline DeviceBoundary buildDeviceBoundary(
     // the closure fields only -- see DeviceBoundary::ioStored for the two measurements that bound it.
     bool storedIoSeed = false)
 {
-    std::vector<label> ty, fc, io, oio, mx, pv, sm, tp, sg, asg, iofr;
+    std::vector<label> ty, fc, io, oio, mx, pv, sm, tp, sg, asg, iofr, wfm;
     std::vector<scalar> ref, dc, ms, vf, p0, rg, iost;   // rg = fixedGradient normal gradient (0 elsewhere)
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
@@ -149,6 +150,7 @@ inline DeviceBoundary buildDeviceBoundary(
             iost.push_back((cat == 3 && i < (label)cur.size()) ? cur[i] : 0.0);
             iofr.push_back((cat == 3 && storedIoSeed && ioStoredEnabled()) ? 1 : 0);
             asg.push_back(f.boundary[pi]->assignable() ? 1 : 0);
+            wfm.push_back(f.boundary[pi]->isTurbulenceWallFunction() ? 1 : 0);
             io.push_back(cat == 3 ? 1 : 0);
             oio.push_back(cat == 4 ? 1 : 0);
             mx.push_back(cat == 5 ? 1 : 0);
@@ -169,6 +171,7 @@ inline DeviceBoundary buildDeviceBoundary(
     db.n = static_cast<int>(ty.size());
     db.bcType.copyFrom(ty);
     db.assignableMask.copyFrom(asg);
+    db.wallFunctionMask.copyFrom(wfm);
     db.ioMask.copyFrom(io);
     db.oioMask.copyFrom(oio);
     db.ioStored.copyFrom(iost);
@@ -195,6 +198,9 @@ inline DeviceBoundary buildDeviceBoundary(
 void deviceUpdateInletOutlet(DeviceBoundary& db, const DeviceBuffer<scalar>& phiBnd);
 void deviceBCValue(const DeviceBoundary& db, const DeviceBuffer<scalar>& internal, DeviceBuffer<scalar>& value,
                    const int* skipIf = nullptr);   // skipIf: device flag, the launch is a no-op when set
+// A wall function writes cells (updateCoeffs) with no evaluate after it: a face that stores the last evaluate keeps it, a wall
+// function's own face reads the new cell. value holds the live evaluate on entry; stored is the evaluate before the write.
+void deviceBCKeepStored(const DeviceBoundary& db, const DeviceBuffer<scalar>& stored, DeviceBuffer<scalar>& value);
 void deviceBCLaplacianCoeffs(const DeviceBoundary& db, const DeviceBuffer<scalar>& gammaCell,
                              DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC);
 // variant taking gamma per BOUNDARY FACE (for nuEff with the true wall nut, not the cell value).

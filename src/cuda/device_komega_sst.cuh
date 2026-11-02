@@ -18,7 +18,8 @@ namespace brae {
 struct DeviceWallData;   // device_kepsilon.cuh (shared wall geometry: wfCell/wfY/wfDc/wfUw*/invNw/nWF)
 
 // EXPERIMENT (BRAE_SST_F1_PATCH=1, off by default): overwrites F1b, the adjacent cells' F1 at the boundary faces, with F1 evaluated on each face. A no-op when the switch is unset.
-void deviceF1OnPatch(const DeviceBoundary& dbOmega, const DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& kBnd, const DeviceBuffer<scalar>& omegaBnd, const DeviceBuffer<scalar>& yCell,
+void deviceF1OnPatch(const DeviceBoundary& dbK,
+    const DeviceBoundary& dbOmega, const DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& kBnd, const DeviceBuffer<scalar>& omegaBnd, const DeviceBuffer<scalar>& yCell,
                      const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega, const DeviceBuffer<scalar>& gkx, const DeviceBuffer<scalar>& gky, const DeviceBuffer<scalar>& gkz,
                      const DeviceBuffer<scalar>& gox, const DeviceBuffer<scalar>& goy, const DeviceBuffer<scalar>& goz, const DeviceBuffer<scalar>& F1, scalar nu, const KOmegaSSTCoeffs& co,
                      DeviceBuffer<scalar>& F1b);

@@ -1182,6 +1182,7 @@ public:
     // near-wall CELL constraint it stands for lives in the turbulence model, not the patch field.
     explicit EpsilonWallFunctionPatchField(const FvPatch& p) : ZeroGradientPatchField<T>(p) {}
     bool isTurbulenceWallFunction() const override { return true; }
+    bool assignable() const override { return false; }   // OF: both derive from fixedValue (fixedValueFvPatchField.H:169)
 };
 
 // fixedGradient: the normal gradient is prescribed, the value follows.

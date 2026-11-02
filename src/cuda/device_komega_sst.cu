@@ -692,6 +692,8 @@ void sstNutBoundaryK(
 __global__
 void f1PatchK(
     int nB,
+    const label* __restrict__ typeK,
+    const label* __restrict__ typeO,
     const label* __restrict__ fc,
     const scalar* __restrict__ kb,
     const scalar* __restrict__ ob,
@@ -725,8 +727,10 @@ void f1PatchK(
         F1b[bi] = F1c[c];
         return;
     }
-    const scalar snK = (kk - kc[c]) * dc[bi];
-    const scalar snO = (w - oc[c]) * dc[bi];
+    // a zeroGradient patch's snGrad is zero whatever it stores, and it can store something other than the cell: the floor after
+    // Foam::bound, the last evaluate beside a wall function's write (zeroGradientFvPatchField.H, snGrad)
+    const scalar snK = typeK[bi] == 0 ? scalar(0) : (kk - kc[c]) * dc[bi];
+    const scalar snO = typeO[bi] == 0 ? scalar(0) : (w - oc[c]) * dc[bi];
     const scalar nK = nx[bi]*gkx[c] + ny[bi]*gky[c] + nz[bi]*gkz[c];
     const scalar nO = nx[bi]*gox[c] + ny[bi]*goy[c] + nz[bi]*goz[c];
     const scalar kbx = gkx[c] + nx[bi]*(snK - nK);
@@ -746,6 +750,7 @@ void f1PatchK(
 }
 
 void deviceF1OnPatch(
+    const DeviceBoundary& dbK,
     const DeviceBoundary& dbOmega,
     const DeviceVectorBoundary& dbU,
     const DeviceBuffer<scalar>& kBnd,
@@ -767,7 +772,7 @@ void deviceF1OnPatch(
     static const bool on = std::getenv("BRAE_SST_F1_PATCH") != nullptr;
     const int nB = static_cast<int>(F1b.size());
     if (!on || nB == 0) return;
-    f1PatchK<<<nBlocks(nB), TPB>>>(nB, dbOmega.faceCell.data(), kBnd.data(), omegaBnd.data(), yCell.data(), k.data(), omega.data(),
+    f1PatchK<<<nBlocks(nB), TPB>>>(nB, dbK.bcType.data(), dbOmega.bcType.data(), dbOmega.faceCell.data(), kBnd.data(), omegaBnd.data(), yCell.data(), k.data(), omega.data(),
                                    gkx.data(), gky.data(), gkz.data(), gox.data(), goy.data(), goz.data(),
                                    dbU.nx.data(), dbU.ny.data(), dbU.nz.data(), dbU.comp[0].deltaCoeffs.data(), F1.data(),
                                    nu, co.betaStar, co.alphaOmega2, F1b.data());
@@ -1094,6 +1099,13 @@ void deviceKOmegaSSTCorrect(
     DeviceBuffer<scalar> S2;
     deviceS2(gradU, nC, S2);
 
+    // omega's patches as the last evaluate left them. updateCoeffs below writes the wall cells and nothing evaluates after it, so
+    // grad(omega) in CDkOmega reads the OLD value on a zeroGradient or symmetry face beside a wall cell and the new one on the wall
+    // function's own (the mirror's omegaBndLast, kOmegaSST.cu). MEASURED (JUPITER job 2647231, 10,112 cells): CDkOmega 10.58 in
+    // OpenFOAM and 5.40 here at a wall cell with a symmetry face, then k 3.05e-09 and omega 5.98e-11 after one iteration, which a
+    // 30-iteration history took to Ux 1.5e-03. BRAE_CONTROL_SST_OMEGA_LIVE=1 reads the new cell on every face.
+    DeviceBuffer<scalar> obvStored;
+    deviceBCValue(dbOmega, omega, obvStored);
     // omega wall function FIRST (OF updateCoeffs before CDkOmega): omega0/G0, override omega & G at wall cells, so
     // grad(omega)/CDkOmega/F1/F2 and the reaction all see the wall-corrected omega (matches kOmegaSSTBase::correct).
     DeviceBuffer<scalar> omega0, G0;
@@ -1108,6 +1120,8 @@ void deviceKOmegaSSTCorrect(
     deviceGaussGrad(dm, k, kbv, kgx, kgy, kgz);
     DeviceBuffer<scalar> obv;
     deviceBCValue(dbOmega, omega, obv);
+    static const bool omegaLive = std::getenv("BRAE_CONTROL_SST_OMEGA_LIVE") != nullptr;
+    if (!omegaLive) deviceBCKeepStored(dbOmega, obvStored, obv);
     DeviceBuffer<scalar> ogx, ogy, ogz;
     deviceGaussGrad(dm, omega, obv, ogx, ogy, ogz);
     DeviceBuffer<scalar> CD;
@@ -1167,7 +1181,7 @@ void deviceKOmegaSSTCorrect(
         F1b.resize(nB);
         gatherCellToFaceK<<<nBlocks(nB), TPB>>>(nB, dbOmega.faceCell.data(), F1.data(), F1b.data());
         cudaCheck(cudaGetLastError(), "F1b");
-        if (!rho && !gammaIntEff) deviceF1OnPatch(dbOmega, dbU, kbv, obv, y, k, omega, kgx, kgy, kgz, ogx, ogy, ogz, F1, nu, co, F1b);
+        if (!rho && !gammaIntEff) deviceF1OnPatch(dbK, dbOmega, dbU, kbv, obv, y, k, omega, kgx, kgy, kgz, ogx, ogy, ogz, F1, nu, co, F1b);
         if (stageDumpActive() && stageDumpFirstOnly("sstF1b"))
         {
             stageDump("stage_sstF1", F1);

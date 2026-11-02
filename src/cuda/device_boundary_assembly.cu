@@ -163,7 +163,26 @@ void bcMatrixFluxKernel(
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) fluxB[i] = iC[i] * p[fc[i]] - bC[i];
 }
+
+__global__ void bcKeepStoredKernel(
+    int n,
+    const label* __restrict__ wallFunction,
+    const scalar* __restrict__ stored,
+    scalar* __restrict__ value)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (!wallFunction[i]) value[i] = stored[i];
+}
 } // namespace
+
+
+void deviceBCKeepStored(const DeviceBoundary& db, const DeviceBuffer<scalar>& stored, DeviceBuffer<scalar>& value)
+{
+    if (db.n == 0) return;
+    bcKeepStoredKernel<<<nBlocks(db.n), TPB>>>(db.n, db.wallFunctionMask.data(), stored.data(), value.data());
+    cudaCheck(cudaGetLastError(), "bcKeepStored");
+}
 
 
 void deviceBCValue(const DeviceBoundary& db, const DeviceBuffer<scalar>& internal, DeviceBuffer<scalar>& value, const int* skipIf)
