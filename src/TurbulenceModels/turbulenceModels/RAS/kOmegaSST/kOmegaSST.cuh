@@ -15,8 +15,7 @@
 // closure was written to fix:
 //
 //   * Foam::bound is an area-weighted neighbour average for a cell that solved NEGATIVE, not a clamp
-//     (bound.C:38-56). deviceBoundField takes an unweighted face-count mean and reads the CELL value on
-//     boundary faces.
+//     (bound.C:38-56). The legacy deviceBoundField now delegates to the mirror's boundField.
 //   * nut on a `calculated` patch is Cmu-style field assignment from the patch's OWN k and omega, not
 //     the owner cell's value.
 //   * the nut wall-function FAMILY dispatches per face on the patch's own type; the legacy path carries

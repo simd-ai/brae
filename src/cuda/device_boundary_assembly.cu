@@ -174,6 +174,35 @@ __global__ void bcKeepStoredKernel(
     if (i >= n) return;
     if (!wallFunction[i]) value[i] = stored[i];
 }
+
+// Which faces bound.C:59 leaves at the floor. The assignment dispatches on the patch: fixedValue and mixed ignore it, a
+// transform patch's operator= is its own evaluate (transformFvPatchField.C:142), which gives a scalar the bounded cell (both
+// have assignable() false here, fv_patch_field.cuh), a coupled face is re-derived on the next line of bound.C, and an
+// inletOutlet on inflow keeps its inletValue (inletOutletFvPatchField.C, operator=). What is left stores the floor.
+__global__ void boundCapMarkKernel(
+    int n,
+    const label* __restrict__ type,
+    const label* __restrict__ assignable,
+    const scalar* __restrict__ bval,
+    scalar floor,
+    label* __restrict__ capped)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const bool stores = assignable[i] && type[i] != 1 && type[i] != 8;
+    capped[i] = (stores && bval[i] < floor) ? 1 : 0;
+}
+
+__global__ void boundCapApplyKernel(
+    int n,
+    const label* __restrict__ capped,
+    scalar cap,
+    scalar* __restrict__ value)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (capped[i]) value[i] = cap;
+}
 } // namespace
 
 
@@ -199,6 +228,30 @@ void deviceBCValue(const DeviceBoundary& db, const DeviceBuffer<scalar>& interna
                                           db.ioStored.size() ? db.ioStored.data() : nullptr,
                                           db.ioFresh.size()  ? db.ioFresh.data()  : nullptr);
     cudaCheck(cudaGetLastError(), "bcValue");
+    if (db.boundCapped.size())
+    {
+        boundCapApplyKernel<<<nBlocks(db.n), TPB>>>(db.n, db.boundCapped.data(), db.boundCap, value.data());
+        cudaCheck(cudaGetLastError(), "bcValue bound cap");
+    }
+}
+
+
+void deviceBoundCap(const DeviceBoundary& db, const DeviceBuffer<scalar>& bval, scalar floor)
+{
+    db.boundCapped.resize(0);
+    if (db.n == 0) return;
+    // Foam::bound's guard has fired, or this is not reached, so the mask costs nothing on a field with nothing to bound
+    db.boundCapped.resize(db.n);
+    db.boundCap = floor;
+    boundCapMarkKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.assignableMask.data(), bval.data(), floor,
+                                               db.boundCapped.data());
+    cudaCheck(cudaGetLastError(), "bound cap");
+}
+
+
+void deviceBoundCapClear(const DeviceBoundary& db)
+{
+    db.boundCapped.resize(0);
 }
 
 

@@ -18,7 +18,9 @@
 #include "device_interface.cuh"  // interface<Op>() overloads dispatching to the cyclic/AMI backends
 #include "device_amg.cuh"        // deviceSymGaussSeidel (scalar smoothSolver, for stiff low-Re k/omega)
 #include "nut_wall_function.cuh" // nutkWallFunctionValue / yPlusWall (shared wall-nut physics, BRAE_HD)
+#include "kEpsilon.cuh"          // gpu::kEpsilonRAS::boundField: Foam::bound, one implementation
 #include <cuda_runtime.h>
+#include <stdexcept>
 #include <vector>
 
 namespace brae {
@@ -889,6 +891,16 @@ void deviceBoundField(
     const char*           fieldName,
     const DeviceBoundary* db)
 {
+    // fvc::average(max(field, floor)) takes the mesh's face areas and the patches' values (bound.C:50, fvcAverage.C), as the
+    // mirror closure's boundField does. MEASURED: the unweighted mean of faces below, with the cell's value on the boundary,
+    // gave bounded cells 12.02 and 0.44 where OpenFOAM gave 31.58 and 6.46 (JUPITER job 2638365, pitzDailyTurb, epsilon at -41).
+    static const bool unweighted = std::getenv("BRAE_CONTROL_BOUND_UNWEIGHTED") != nullptr;
+    if (!unweighted)
+    {
+        if (!db) throw std::runtime_error("deviceBoundField: fvc::average reads the patch values, and no boundary was given");
+        gpu::kEpsilonRAS::boundField(x, dm, *db, floor, fieldName);
+        return;
+    }
     // BEFORE the clamp, as OpenFOAM does (bound.C:42 precedes bound.C:48).
     if (fieldName)
     {

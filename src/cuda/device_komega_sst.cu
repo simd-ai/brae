@@ -1207,7 +1207,9 @@ void deviceKOmegaSSTCorrect(
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
                                /*boundFloor*/co.omegaMin);
-    deviceBoundField(dm, omega, co.omegaMin, "omega", &dbOmega);   // OF bound(omega_, omegaMin_)
+
+    // deviceSolveScalarTransport just bound omega, as it binds every transported field here: a second bound would find
+    // nothing below the floor and forget bound.C:59's patch half (deviceBoundCap).
 
     // k equation (loose solve)
     DeviceBuffer<scalar> DkEff;
@@ -1223,7 +1225,6 @@ void deviceKOmegaSSTCorrect(
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
                                /*boundFloor*/co.kMin);
-    deviceBoundField(dm, k, co.kMin, "k", &dbK);   // OF bound(k_, kMin_)
 
     // correctNut (Bradshaw): nut = a1*k / max(a1*omega, b1*F2*sqrt(S2)).
     //
@@ -1603,7 +1604,6 @@ void deviceKOmegaSSTLMCorrect(
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, /*nSweeps*/1, gsSymmetric,
                                /*boundFloor*/scalar(0.0));
-    deviceBoundField(dm, ReThetat, 0.0, "ReThetat", &dbReThetat);
 
     // gammaInt: DgammaIntEff = nut+nu; reaction = Pgamma+Egamma - Sp(ce1*Pgamma+ce2*Egamma).
     DeviceBuffer<scalar> spG(nC), suG(nC);
@@ -1620,7 +1620,6 @@ void deviceKOmegaSSTLMCorrect(
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, /*nSweeps*/1, gsSymmetric,
                                /*boundFloor*/scalar(0.0));
-    deviceBoundField(dm, gammaInt, 0.0, "gammaInt", &dbGammaInt);
     gammaIntEff.resize(nC);
     lmGammaEffKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
         y.data(), ReThetat.data(), gammaInt.data(), Fth.data(), nu, LM_SMALL, gammaIntEff.data());

@@ -40,6 +40,11 @@ struct DeviceBoundary
     // wall-function faces OpenFOAM leaves alone.
     DeviceBuffer<label>  assignableMask;
     DeviceBuffer<label>  wallFunctionMask;  // 1 on an epsilon/omegaWallFunction face, whose value follows the wall cell it writes
+    // Foam::bound's boundary half (bound.C:59), the one state this descriptor stores. A face whose field solved below the
+    // floor and whose patch takes the assignment holds the floor until that field's next evaluate, where its cell holds
+    // the bounded average; every read through deviceBCValue returns it. Empty when no face holds one. See deviceBoundCap.
+    mutable DeviceBuffer<label> boundCapped;
+    mutable scalar boundCap = 0;
     DeviceBuffer<label>  ioMask;            // 1 if the face is inletOutlet (bcType recomputed from the flux sign)
     DeviceBuffer<label>  oioMask;           // 1 if the face is outletInlet (freestreamPressure): opposite flux switch
     // The STORED patch value of an inletOutlet / outletInlet face, and whether it is still what an evaluate
@@ -201,6 +206,10 @@ void deviceBCValue(const DeviceBoundary& db, const DeviceBuffer<scalar>& interna
 // A wall function writes cells (updateCoeffs) with no evaluate after it: a face that stores the last evaluate keeps it, a wall
 // function's own face reads the new cell. value holds the live evaluate on entry; stored is the evaluate before the write.
 void deviceBCKeepStored(const DeviceBoundary& db, const DeviceBuffer<scalar>& stored, DeviceBuffer<scalar>& value);
+// bound.C:59, vsf.boundaryFieldRef() = max(vsf.boundaryField(), lowerBound): bval is the patch values the solve's evaluate left,
+// and a face below the floor stays AT the floor until the field's next evaluate. deviceBoundCapClear is that evaluate.
+void deviceBoundCap(const DeviceBoundary& db, const DeviceBuffer<scalar>& bval, scalar floor);
+void deviceBoundCapClear(const DeviceBoundary& db);
 void deviceBCLaplacianCoeffs(const DeviceBoundary& db, const DeviceBuffer<scalar>& gammaCell,
                              DeviceBuffer<scalar>& iC, DeviceBuffer<scalar>& bC);
 // variant taking gamma per BOUNDARY FACE (for nuEff with the true wall nut, not the cell value).

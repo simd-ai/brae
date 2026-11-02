@@ -409,8 +409,7 @@ void assembleKEqn(
 
 // Foam::bound(vsf, lowerBound): a cell that solved BELOW the floor takes the AREA-WEIGHTED average of
 // its bounded neighbours, not a hard clamp (bound.C:38-56 via fvc::average = surfaceSum(magSf*ssf)/
-// surfaceSum(magSf)). The legacy deviceBoundField takes an unweighted face-count mean and reads the CELL
-// value on boundary faces, so it is not reused here.
+// surfaceSum(magSf)). The legacy deviceBoundField delegates here.
 // `fieldName` makes it emit OpenFOAM's `bounding <field>` line (bound.C:38-46) into boundStore, for the
 // driver to print next to that field's own solve line. It is not optional here: this overload is the one
 // the mirror closure calls, and every one of its call sites has the name.

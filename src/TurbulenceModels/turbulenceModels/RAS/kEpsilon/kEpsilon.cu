@@ -234,9 +234,10 @@ __global__ void kReactionKernel(
 // Foam::bound, area-weighted. OF's fvc::average is surfaceSum(magSf*ssf)/surfaceSum(magSf)
 // (fvcAverage.C), and the host reference is the same with the PATCH value on a boundary face.
 //
-// deviceBoundField is NOT reused: its gather takes an unweighted face-count mean and uses the CELL value
-// on boundary faces. That difference lands in every bounded cell, and bound() fires exactly where the
-// solve went negative -- which is where an error compounds rather than washes out.
+// The legacy deviceBoundField now delegates here. Its own gather took an unweighted face-count mean with the
+// CELL value on boundary faces, kept only as the control of tests/simple_bound_vs_openfoam.sh. That difference
+// lands in every bounded cell, and bound() fires exactly where the solve went negative -- which is where an
+// error compounds rather than washes out.
 __global__ void boundGatherKernel(
     int           nIf,
     const label*  own,
@@ -358,28 +359,13 @@ __global__ void boundApplyKernel(
 }
 
 
-// bound.C:59 -- vsf.boundaryFieldRef() = max(vsf.boundaryField(), lowerBound) -- HAS NO DEVICE EQUIVALENT
-// HERE, and a kernel that clamped boundary values would be wrong rather than incomplete. Three facts
-// decide it, and they are worth writing down because the naive version looks right:
-//
-//   1. That line is an ASSIGNMENT, so fvPatchField::operator= dispatches it, and that is overridden to do
-//      NOTHING on the fixedValue, mixed and transform families. It does not touch an epsilonWallFunction,
-//      an omegaWallFunction or a plain fixedValue -- only patches whose value may be overwritten
-//      (assignable(); DeviceBoundary::assignableMask carries it per face, and the host arm's bound_cpp.cu
-//      now honours it -- it used to clamp every patch, which moved faces OpenFOAM leaves alone).
-//   2. brae's device boundary is DERIVED, not stored: bcValueKernel rebuilds each face from the
-//      descriptor every evaluate (device_boundary_assembly.cu:16-47). A zeroGradient face is
-//      internal[cell], so once the internal half has run it already satisfies the bound with nothing to
-//      clamp; a coupled face is the halo value, which OF re-derives at bound.C:62 anyway.
-//   3. What is left is the faces that DO store a value and ARE assignable: `calculated`, and an
-//      inletOutlet resolved to fixedValue on an inflow face. Clamping those means clamping refValue --
-//      and refValue is the DESCRIPTOR, so the clamp would persist into every later iteration, where
-//      OpenFOAM's is transient and the patch's own evaluate() overwrites it on the next pass.
-//
-// So the honest state is: the internal half is faithful, the fixedValue family is faithfully untouched,
-// and a `calculated` k/epsilon patch whose stored value sits below the floor is not clamped where
-// OpenFOAM would clamp it. Invisible at the 1e-15 default; reachable now that a case can raise kMin.
-// Closing it needs a stored boundary-value array, which is a change to DeviceBoundary, not to bound().
+// bound.C:59 -- vsf.boundaryFieldRef() = max(vsf.boundaryField(), lowerBound). That line is an ASSIGNMENT, so
+// fvPatchField::operator= dispatches it: nothing on the fixedValue and mixed families, the patch's own evaluate on
+// the transform family, and otherwise the value stored. A zeroGradient face beside a cell that solved negative was
+// negative after the solve's evaluate, so it holds the FLOOR until the next evaluate while its cell holds the
+// bounded average, and nut_ on a `calculated` patch and the next gradient read that floor. MEASURED (JUPITER job
+// 2645639): k 1e-15 in OpenFOAM and 2.58 in brae on those faces, nut 7e12 on `calculated` faces, and every field
+// apart from the second iteration (U 4e-04, p 1e-02) with the cells exact at the first. deviceBoundCap carries it.
 
 
 // correctNut's BOUNDARY half. A turbulence-wall-function face takes nutkWallFunction; every other face
@@ -983,6 +969,10 @@ void boundField(
     const int nC = dm.nCells;
     // BEFORE the clamp, as OpenFOAM does: printing afterwards would report min == floorV every time.
     // The patch values are folded into min/max (but not the average) -- deviceBoundingReport has why.
+    // The solve just evaluated this field's patches, so an earlier bound's floor is gone. The constructor's has no solve
+    // before it and nothing to clear.
+    deviceBoundCapClear(db);
+    bool fired = false;
     {
         DeviceBuffer<scalar> bvalReport;
         if (db.n) deviceBCValue(db, x, bvalReport);
@@ -992,6 +982,7 @@ void boundField(
         if (deviceBoundingReport(x, db.n ? &bvalReport : nullptr, floorV, bMin, bMax, bAvg))
         {
             boundStore().push_back({fieldName, bMin, bMax, bAvg});
+            fired = true;
         }
     }
     DeviceBuffer<scalar> num, den;
@@ -1031,6 +1022,8 @@ void boundField(
 
     boundApplyKernel<<<nBlk(nC), TPB>>>(nC, num.data(), den.data(), floorV, x.data());
     cudaCheck(cudaGetLastError(), "kEpsilon bound apply");
+    static const bool patchLive = std::getenv("BRAE_CONTROL_BOUND_PATCH_LIVE") != nullptr;
+    if (fired && !patchLive) deviceBoundCap(db, bval, floorV);
 }
 
 
