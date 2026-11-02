@@ -9,12 +9,19 @@
 # diffing extremes against OpenFOAM over several days. Real OpenFOAM on that same case printed TEN of
 # these lines in the first eight iterations.
 #
-# THE ORACLE is real rhoSimpleFoam on the same mesh with the same weak preconditioner, so the message is
-# checked against OpenFOAM's own text and not against this test's idea of it.
+# THE ORACLE is real rhoSimpleFoam on the same bytes, so the message is checked against OpenFOAM's own
+# text and not against this test's idea of it.
+#
+# THE CASE: sbMatched at OpenFOAM's iteration 4, limitedLinear on k and epsilon, the outlet held at three times each
+# field's maximum, ten tight iterations: a tight solve goes negative and every code carries on. The stage this gate
+# had, the loose bare-diagonal solve of item 78, is kept as tests/bound_weak_solver_stress.sh: at its iteration 7 a
+# correct patch half leaves nut at 3e15 on an outlet face, and OpenFOAM from that state dies at the same iteration.
 #
 #   ARM 1    brae prints the line, in OpenFOAM's exact format, on a case that bounds
 #   ARM 2    the numbers are the PRE-bound ones (min < the floor, not == it)
 #   ARM 3    min/max include the BOUNDARY and average does not -- OF's asymmetry
+#   ARM 4    the bounded fields against OpenFOAM's, cell and patch values at five iterations, and every line's numbers
+#   CONTROL  BRAE_CONTROL_BOUND_PATCH_LIVE=1, the old patch half, turns arm 4 red
 #   CONTROL  a healthy run prints NOTHING (the message is an event, not a banner)
 #   CONTROL  the line cannot break a log-parsing gate: no `Time = ` prefix, no `Solving for`,
 #            no `time step continuity errors`
@@ -35,10 +42,8 @@ ITERS=12
 fail=0
 say() { printf '  %-72s %s\n' "$1" "$2"; [ "$2" = FAIL ] && fail=1 || true; }
 
-# The tutorial's own loose GAMG entries on the turbulence pair. brae substitutes a PBiCGStab for GAMG,
-# and with BRAE_POLY_KE=1 that substitute is the bare `diagonal` -- the preconditioner item 78 removed,
-# and the one that makes this case bound. A gate for a message needs a case that fires it.
-stage() {
+# The default run of the healthy control: the tutorial's own loose GAMG entries on the turbulence pair, nothing bounds.
+stage_healthy() {
     rm -rf "$1"; mkdir -p "$1"
     cp -r "$SRC/constant" "$SRC/system" "$1/"
     cp -r "$SRC/0.orig" "$1/0"
@@ -64,25 +69,75 @@ open(f, 'w').write(s)
 PYEOF
 }
 
-# ---- the ORACLE: real OpenFOAM on the same case, its own diagonal on the pair ---------------------
-stage "$W/of"
-python3 - "$W/of/system/fvSolution" <<'PYEOF'
-import sys
-p = sys.argv[1]; s = open(p).read()
-s = s.replace('        solver          GAMG;\n        smoother        GaussSeidel;\n        tolerance       1e-08;\n        relTol          0.1;\n    }',
-              '        solver          PBiCGStab;\n        preconditioner  diagonal;\n        tolerance       1e-08;\n        relTol          0.1;\n    }', 1)
+# tight <case> <start> <end>: every solve tight, every iteration written in full
+tight() {
+    python3 - "$@" <<'PYEOF'
+import re, sys
+d, st, en = sys.argv[1:]
+p = d + '/system/controlDict'; s = open(p).read()
+s = re.sub(r'functions\s*\{.*', '', s, flags=re.S)
+for k, v in (('startFrom', 'startTime'), ('startTime', st), ('endTime', en), ('writeInterval', '1'), ('writeFormat', 'ascii'), ('writePrecision', '17')):
+    s, n = re.subn(r'(?m)(^|\s)%s\s+[^;]*;' % k, r'\1%s %s;' % (k, v), s)
+    if n == 0:
+        s += '\n%s %s;\n' % (k, v)
+open(p, 'w').write(s + '\n')
+p = d + '/system/fvSolution'; s = open(p).read()
+s = re.sub(r'residualControl\s*\{[^{}]*\}', 'residualControl { }', s)
+s = re.sub(r'tolerance\s+[^;]*;', 'tolerance 1e-13;', s)
+s = re.sub(r'relTol\s+[^;]*;', 'relTol 0;', s)
 open(p, 'w').write(s)
 PYEOF
+}
+
+# ---- the DEVELOPED STATE, OpenFOAM's iteration 4, once ---------------------------------------------
+mkdir -p "$W/dev"
+cp -r "$SRC/constant" "$SRC/system" "$W/dev/"
+cp -r "$SRC/0.orig" "$W/dev/0"
+tight "$W/dev" 0 4
 ( set +u; source "$OFBASHRC" > /dev/null 2>&1
   command -v rhoSimpleFoam > /dev/null 2>&1 || exit 77
-  cd "$W/of" && rhoSimpleFoam > run.log 2>&1 ) || { echo "SKIP: OpenFOAM rhoSimpleFoam did not run"; exit 77; }
+  cd "$W/dev" && rhoSimpleFoam > run.log 2>&1 ) || { echo "SKIP: OpenFOAM rhoSimpleFoam did not run"; exit 77; }
+
+# stage <dir>: iteration 4, limitedLinear on the pair, each outlet at three times its field's maximum. MEASURED (job 4837184): 1.5x
+# bounds and stays exact, 3x bounds 19 times and the old patch half moves by 1e-2, 10x and over abort in every code.
+stage() {
+    rm -rf "$1"; mkdir -p "$1"
+    cp -r "$W/dev/constant" "$W/dev/system" "$W/dev/4" "$1/"
+    rm -rf "$1/4/uniform"
+    tight "$1" 4 "$ITERS"
+    python3 - "$1" <<'PYEOF'
+import re, sys
+d = sys.argv[1]
+for f in ('k', 'epsilon'):
+    p = '%s/4/%s' % (d, f)
+    s = open(p).read()
+    m = re.search(r'internalField\s+nonuniform\s+List<scalar>\s*\n?(\d+)\s*\n?\(', s)
+    assert m, f
+    e = s.index('\n)', m.end())
+    hi = 3 * max(float(x) for x in s[m.end():e].split())
+    s, n = re.subn(r'(\boutlet\s*\{)[^}]*\}', lambda g: g.group(1) + ' type fixedValue; value uniform %.17g; }' % hi, s, count=1)
+    assert n == 1, f
+    open(p, 'w').write(s)
+p = d + '/system/fvSchemes'
+s = open(p).read()
+s, n = re.subn(r'turbulence\s+bounded Gauss upwind;', 'turbulence bounded Gauss limitedLinear 1;', s)
+assert n == 1
+open(p, 'w').write(s)
+PYEOF
+}
+ITERS=14
+
+# ---- the ORACLE: real OpenFOAM on the same bytes ---------------------------------------------------
+stage "$W/of"
+( set +u; source "$OFBASHRC" > /dev/null 2>&1
+  cd "$W/of" && rhoSimpleFoam > run.log 2>&1 ) || { echo "FAIL: OpenFOAM did not finish the bounded stage"; tail -3 "$W/of/run.log"; exit 1; }
 OF_N=$(grep -c '^bounding ' "$W/of/run.log" || true)
-[ "${OF_N:-0}" -gt 0 ] || { echo "SKIP: OpenFOAM did not bound on this case, so there is no oracle"; exit 77; }
+[ "${OF_N:-0}" -gt 0 ] && say "OpenFOAM bounds on this stage (premise)" ok || say "OpenFOAM bounds on this stage (premise)" FAIL
 printf '        (OpenFOAM printed %s bounding lines; first: %s)\n' "$OF_N" "$(grep -m1 '^bounding ' "$W/of/run.log")"
 
 # ---- ARM 1: brae prints it, in OpenFOAM's format -------------------------------------------------
 stage "$W/br"
-( cd "$W/br" && BRAE_POLY_KE=1 BRAE_DILU_KE=0 BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BRAE" -case "$W/br" > run.log 2>&1 ) \
+( cd "$W/br" && BRAE_AMG_CACHE=0 BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BRAE" -case "$W/br" > run.log 2>&1 ) \
     || { tail -3 "$W/br/run.log"; say "brae runs the case" FAIL; }
 BR_N=$(grep -c '^bounding ' "$W/br/run.log" || true)
 [ "${BR_N:-0}" -gt 0 ] && say "brae prints the bounding message on a case that bounds" ok \
@@ -107,6 +162,70 @@ print('  %-72s %s' % ("...and names only fields OpenFOAM also bounds on this cas
 print('        (OpenFOAM: %s | brae: %s)' % (sorted(offlds), sorted(brflds)))
 raise SystemExit(0 if (ok1 and ok2) else 1)
 PYEOF
+
+# ---- ARM 4: the bounded fields and every line against OpenFOAM's -----------------------------------
+# BOUND 1e-6 at every field and patch: the worst on the candidate is nut 1.3e-07 at iteration 14 (job 4837184).
+# The control is 1.0e-02 on U and 1.5e-01 on epsilon at the same iteration, so five decades separate them.
+cat > "$W/arm4.py" <<'PYEOF'
+import re, sys
+import numpy as np
+of, br, want = sys.argv[1:4]
+BOUND = 1e-6
+TIMES = (5, 6, 7, 10, 14)
+FIELDS = ('U', 'p', 'k', 'epsilon', 'nut')
+def internal(s):
+    m = re.search(r'internalField\s+nonuniform\s+List<(scalar|vector)>\s*\n?(\d+)\s*\n?\(', s)
+    n, nc = int(m.group(2)), 3 if m.group(1) == 'vector' else 1
+    b = s[m.end():]
+    b = b[:b.index('\n)')]
+    return np.array(b.replace('(', ' ').replace(')', ' ').split(), dtype=float).reshape(n, nc)
+def patches(s):
+    out = {}
+    b = s[s.index('boundaryField'):]
+    for m in re.finditer(r'(\w+)\s*\{([^{}]*)\}', b):
+        v = re.search(r'value\s+nonuniform\s+List<scalar>\s*\n?(\d+)\s*\n?\(([^)]*)\)', m.group(2))
+        if v:
+            out[m.group(1)] = np.array(v.group(2).split(), dtype=float)
+    return out
+worst = 0.0
+where = ''
+npatch = 0
+for t in TIMES:
+    for f in FIELDS:
+        a = open('%s/%d/%s' % (of, t, f), errors='replace').read()
+        c = open('%s/%d/%s' % (br, t, f), errors='replace').read()
+        x, y = internal(a), internal(c)
+        e = np.linalg.norm(y - x) / np.linalg.norm(x)
+        if e > worst:
+            worst, where = e, '%s cells t=%d' % (f, t)
+        if f in ('k', 'epsilon'):
+            pa, pc = patches(a), patches(c)
+            for n in pa:
+                if n in pc and np.linalg.norm(pa[n]) > 0:
+                    npatch += 1
+                    e = np.linalg.norm(pc[n] - pa[n]) / np.linalg.norm(pa[n])
+                    if e > worst:
+                        worst, where = e, '%s %s t=%d' % (f, n, t)
+pat = re.compile(r'^bounding (\w+), min: (\S+) max: (\S+) average: (\S+)')
+la = [pat.match(l) for l in open(of + '/run.log', errors='replace') if pat.match(l)]
+lc = [pat.match(l) for l in open(br + '/run.log', errors='replace') if pat.match(l)]
+same = len(la) == len(lc)
+wl = 0.0
+if same:
+    for x, y in zip(la, lc):
+        same = same and x.group(1) == y.group(1)
+        for k in (2, 3, 4):
+            wl = max(wl, abs(float(x.group(k)) - float(y.group(k))) / max(abs(float(x.group(k))), 1e-300))
+print('        worst %.3e (%s), %d patch comparisons, %d and %d bounding lines, worst line number %.3e' % (worst, where, npatch, len(la), len(lc), wl))
+inside = worst < BOUND and same and wl < BOUND and npatch > 0
+raise SystemExit(0 if inside == (want == 'ok') else 1)
+PYEOF
+python3 "$W/arm4.py" "$W/of" "$W/br" ok && say "the bounded cells, patches and lines match OpenFOAM within 1e-6" ok \
+    || say "the bounded cells, patches and lines match OpenFOAM within 1e-6" FAIL
+stage "$W/live"
+( cd "$W/live" && BRAE_AMG_CACHE=0 BRAE_RHOSIMPLEFOAM_MIRROR=cuda BRAE_CONTROL_BOUND_PATCH_LIVE=1 "$BRAE" -case "$W/live" > run.log 2>&1 ) || tail -2 "$W/live/run.log"
+python3 "$W/arm4.py" "$W/of" "$W/live" red && say "CONTROL: the old patch half is out by more than that" ok \
+    || say "CONTROL: the old patch half is out by more than that" FAIL
 
 # ---- ARM 2: the numbers are the PRE-bound ones ---------------------------------------------------
 # Printing after the clamp would report min == the floor every time; OF prints before (bound.C:42
@@ -136,7 +255,8 @@ raise SystemExit(0 if ok else 1)
 PYEOF
 
 # ---- CONTROL: a healthy run says nothing ---------------------------------------------------------
-stage "$W/ok"
+ITERS=12
+stage_healthy "$W/ok"
 ( cd "$W/ok" && BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BRAE" -case "$W/ok" > run.log 2>&1 ) || true
 OKN=$(grep -c '^bounding ' "$W/ok/run.log" || true)
 [ "${OKN:-1}" = 0 ] && say "the default run prints NOTHING (an event, not a banner)" ok \
@@ -189,8 +309,9 @@ else
 fi
 
 # ---- FAIL-PROOF ----------------------------------------------------------------------------------
+ITERS=14
 stage "$W/off"
-( cd "$W/off" && BRAE_BOUND_REPORT=0 BRAE_POLY_KE=1 BRAE_DILU_KE=0 BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BRAE" -case "$W/off" > run.log 2>&1 ) || true
+( cd "$W/off" && BRAE_BOUND_REPORT=0 BRAE_AMG_CACHE=0 BRAE_RHOSIMPLEFOAM_MIRROR=cuda "$BRAE" -case "$W/off" > run.log 2>&1 ) || true
 OFFN=$(grep -c '^bounding ' "$W/off/run.log" || true)
 [ "${OFFN:-1}" = 0 ] && say "BRAE_BOUND_REPORT=0 silences it (fail-proof for the arms above)" ok \
                      || say "BRAE_BOUND_REPORT=0 silences it (fail-proof for the arms above)" FAIL
