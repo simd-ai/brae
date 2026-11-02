@@ -19,8 +19,8 @@
 #             a near-zero omega amplifies the difference through 1/omega in CDkOmega (cell 8749, CDkOmega 51,258 and 104,988), and kOmegaSST breaks at iteration 24 (job 2648101). OpenFOAM against itself with
 #             only p's tolerance moved 1e-9 to 0.9e-9 passes this arm's k bound at iteration 28, where tight brae holds it throughout (job 2648136).
 # THE ORACLE: real OpenFOAM on the same bytes. On JUPITER use a build that passes brae-multigpu's scripts/jsc/of_oracle.sh.
-# THE BOUNDS: start, interior and solve, every held field within 1e-10 relative L2. history, U, p and k residuals within 2e-5 of OpenFOAM's and the second field's within 1e-2: its residual carries the known
-# wall-row norm factor gap (omega 0.42%, epsilon 0.27%, the same at every iteration), which a field does not show.
+# THE BOUNDS: start, interior and solve, every held field within 1e-10 relative L2. history, U, p and k residuals within 2e-5 of OpenFOAM's and the second field's within 2e-4. It was 1e-2 for the wall rows'
+# diagonal, which left the norm factor 0.42% out on omega and 0.27% on epsilon with no field to show it (device_scalar_transport.cuh, wfRelaxICKernel). MEASURED with that fixed: omega 7.6e-05, epsilon 3.9e-06.
 # PREMISES, asserted: both codes print `bounding`, and the solve arm's OpenFOAM really bounds.
 # CONTROLS, asserted red: BRAE_CONTROL_BOUND_UNWEIGHTED=1, the old average, on the start, interior and solve arms; BRAE_CONTROL_BOUND_PATCH_LIVE=1, the patch half gone, on the start and history arms;
 # on kOmegaSST's solve arm, BRAE_CONTROL_SST_OMEGA_LIVE=1, grad(omega) reading the wall cell's new value on a neighbouring face.
@@ -221,7 +221,7 @@ def history(of, br, second):
             worst[f] = max(worst.get(f, 0.0), abs(y[f] - x[f]) / max(abs(x[f]), 1e-300))
     ok = len(a) == len(b) == 30 and bounds(of + '/log') > 0 and bounds(of + '/log') == bounds(br + '/log')
     for f, w in worst.items():
-        ok = ok and w <= (1e-2 if f == second else 2e-5)
+        ok = ok and w <= (2e-4 if f == second else 2e-5)
     print('%s iterations %d %d, bounding lines %d %d; worst relative residual gap %s' % ('within' if ok else 'MISSES', len(a), len(b), bounds(of + '/log'), bounds(br + '/log'), ' '.join('%s %.2e' % kv for kv in worst.items())))
     return ok
 
@@ -338,7 +338,7 @@ do
     Y=$W/history-$model
     cp -r "$V" "$Y"
     g end "$Y" 30
-    for who in of br lve
+    for who in of br lve nrm
     do
         cp -r "$Y" "$Y-$who"
     done
@@ -352,6 +352,17 @@ do
     then
         echo "FAIL CONTROL the patch half's history stayed green"
         fail=1
+    fi
+    # Red on kEpsilon alone: omega's wall rows are 8.3e-05 here with it and 7.6e-05 without, and tests/simple_linearupwind_turbulence_vs_openfoam.sh holds them where they show.
+    if [ "$model" = kEpsilon ]
+    then
+        brae "$Y-nrm" BRAE_CONTROL_WALL_ROW_NORM=1
+        printf '  CONTROL wall rows      '
+        if g history "$Y-of" "$Y-nrm" "$second"
+        then
+            echo "FAIL CONTROL the wall rows' norm factor stayed green"
+            fail=1
+        fi
     fi
 done
 [ "$fail" = 0 ] && echo "PASS: a bounded cell takes OpenFOAM's area-weighted average, and a bounded face OpenFOAM's floor until its next evaluate" || { echo FAIL; exit 1; }

@@ -180,6 +180,20 @@ void svBndKernel(
 
 
 static __global__
+void wfRelaxICKernel(
+    int nB,
+    const label* __restrict__ wallFunction,
+    const scalar* __restrict__ gamma,
+    const scalar* __restrict__ magSf,
+    const scalar* __restrict__ deltaCoeffs,
+    scalar* __restrict__ iC)
+{
+    const int bi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bi < nB && wallFunction[bi]) { iC[bi] += gamma[bi] * magSf[bi] * deltaCoeffs[bi]; }
+}
+
+
+static __global__
 void svCellKernel(
     int nC,
     const label* __restrict__ isW,
@@ -530,8 +544,29 @@ void deviceSolveScalarTransport(
     DeviceBuffer<scalar> aRD, aDelta;
     if (relax > scalar(0))
     {
+        // A wall function's face is a fixedValue in OpenFOAM (omegaWallFunctionFvPatchScalarField.H) and carries zeroGradient's slots here, so its laplacian
+        // coefficient is missing from aIC. setValues cuts it from the cell below, so nothing but this relax reads it: fvMatrix::relax adds it and takes
+        // it off around the division, which leaves the wall row's diagonal, and so the normalised residual, 0.16 to 0.42% from OpenFOAM's with the fields exact.
+        // MEASURED (pitzDailySST, jobs 4845099, 4845295): row 1 7.2845e-06 against 7.2951e-06, all 472 wall rows, no other row.
+        DeviceBuffer<scalar> wfIC, wfICmag;
+        static const bool wfNorm = std::getenv("BRAE_CONTROL_WALL_ROW_NORM") == nullptr;
+        if (wall && eps0 && wfNorm && db.n)
+        {
+            deviceCopy(wfIC, aIC);
+            const DeviceBuffer<scalar>* gammaB = (DBnd && DBnd->size()) ? DBnd : nullptr;
+            DeviceBuffer<scalar> gammaCell;
+            if (!gammaB)
+            {
+                deviceOwnerGather(dm, D, gammaCell);
+            }
+            wfRelaxICKernel<<<nBlocks(db.n), TPB>>>(db.n, db.wallFunctionMask.data(), gammaB ? gammaB->data() : gammaCell.data(), db.magSf.data(), db.deltaCoeffs.data(), wfIC.data());
+            cudaCheck(cudaGetLastError(), "wall function relax coefficient");
+            deviceCmptMaxMag3(wfIC, wfIC, wfIC, wfICmag);
+        }
         deviceRelaxDiag(deviceLduView(dm, aD, aU, aL), dm, aIC, relax, aRD, aDelta,
-                        ifSumOff.size() ? ifSumOff.data() : nullptr);
+                        ifSumOff.size() ? ifSumOff.data() : nullptr,
+                        wfICmag.size() ? wfICmag.data() : nullptr,
+                        wfIC.size() ? wfIC.data() : nullptr);
         DeviceBuffer<scalar> t;
         deviceHadamard(t, aDelta, field);
         deviceAxpy(1.0, t, src);
