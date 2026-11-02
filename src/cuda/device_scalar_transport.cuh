@@ -327,7 +327,10 @@ void deviceSolveScalarTransport(
     // takes: OpenFOAM's correctedSnGrad builds it from mesh.gradScheme("grad(" + vf.name() + ')')
     // (correctedSnGrad.C:52-55), the field's OWN entry, falling back to `default` only when there is none.
     // 0 = unlimited, what every caller passed before. Trailing, so every existing call is unchanged.
-    scalar lapGradLimitK = 0.0)
+    scalar lapGradLimitK = 0.0,
+    // The field's patch values as OpenFOAM's gradient reads them, when they are not this equation's own evaluate:
+    // null is deviceBCValue. Trailing, so every existing call is unchanged. See deviceKOmegaSSTCorrect's obv.
+    const DeviceBuffer<scalar>* storedBnd = nullptr)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> Df;
@@ -352,7 +355,8 @@ void deviceSolveScalarTransport(
     if (limited || linearUpwind || nonOrth)
     {
         DeviceBuffer<scalar> bv;
-        deviceBCValue(db, field, bv);
+        if (storedBnd) deviceCopy(bv, *storedBnd);
+        else           deviceBCValue(db, field, bv);
         deviceGaussGrad(dm, field, bv, gx, gy, gz);
         // THE COUPLED FACES, which this gradient never had. deviceGaussGrad sums over the internal and
         // non-coupled boundary faces; a cyclic/AMI/ACMI face is in neither list, so the gradient of k,

@@ -1210,8 +1210,16 @@ void deviceKEpsilonCorrect(
             wo << c << ' ' << (int)hIs[c] << ' ' << hW[c] << ' ' << hInv[c] << ' '
                << hE0[c] << ' ' << hG0[c] << ' ' << hE[c] << ' ' << hK[c] << '\n';
     }
+    // epsilon's patches as the last evaluate left them: updateCoeffs below writes the wall cells and nothing evaluates after it, so the
+    // equation's gradient reads the old value on a zeroGradient face beside a wall cell, as deviceKOmegaSSTCorrect's obv has why.
+    DeviceBuffer<scalar> ebvStored;
+    deviceBCValue(dbEps, eps, ebvStored);
     overrideKernel<<<nBlocks(nC), TPB>>>(nC, wall.isWallCell.data(), G0.data(), eps0.data(), G.data(), eps.data(),
                                           wall.wallW.size() ? wall.wallW.data() : nullptr);
+    DeviceBuffer<scalar> ebv;
+    deviceBCValue(dbEps, eps, ebv);
+    deviceBCKeepStored(dbEps, ebvStored, ebv);
+    static const bool gradLive = std::getenv("BRAE_CONTROL_TURB_GRAD_LIVE") != nullptr;
 
     // epsilon equation (loose solve) with the near-wall setValues constraint
     // DepsilonEff = nut/sigmaEps + nu. OF's laplacian is alpha*rho*DepsilonEff, so compressible wants
@@ -1247,7 +1255,7 @@ void deviceKEpsilonCorrect(
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/co.epsilonMin);
+                               /*boundFloor*/co.epsilonMin, /*lapGradLimitK*/scalar(0.0), gradLive ? nullptr : &ebv);
 
     // k equation (loose solve)
     DeviceBuffer<scalar> Dk(static_cast<std::size_t>(nC));

@@ -1197,6 +1197,11 @@ void deviceKOmegaSSTCorrect(
             scaleDEffCompressible(*rhoBnd, *muBnd, DkB);
         }
     }
+    // linearUpwind.C:94 grads vf.component(cmpt), whose patches are copies of the stored values, and correctedSnGrad.C:52 reads vf's:
+    // the wall cells above changed and nothing evaluated, so this gradient reads what CDkOmega's did. MEASURED (pitzDailySST cold, tight,
+    // job 4844884): a live zeroGradient outlet at the wall corner put the outlet column 0.18% out in iteration 1, U and p still 1e-13.
+    static const bool gradLive = std::getenv("BRAE_CONTROL_TURB_GRAD_LIVE") != nullptr;
+    const bool luStored = !gradLive && !omegaLive;
     deviceSolveScalarTransport(dm, dbOmega, omega, "omega", DomegaEff, phiInt, phiBnd, divPhi, boundedEps, limitedOmega, linearUpwindOmega, nonOrth, twoBykOmega,
                                relaxOmega, omegaStop, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceOmegaReaction(dm.V, gamma, beta, GbyNu0lim, F1, CD, omega, divU, diag, src, rho); },
@@ -1206,7 +1211,7 @@ void deviceKOmegaSSTCorrect(
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/co.omegaMin);
+                               /*boundFloor*/co.omegaMin, /*lapGradLimitK*/scalar(0.0), luStored ? &obv : nullptr);
 
     // deviceSolveScalarTransport just bound omega, as it binds every transported field here: a second bound would find
     // nothing below the floor and forget bound.C:59's patch half (deviceBoundCap).

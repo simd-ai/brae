@@ -1621,6 +1621,9 @@ set_tests_properties(simple_gradu_sites_vs_openfoam PROPERTIES SKIP_RETURN_CODE 
 add_test(NAME bound_message_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/bound_message_vs_openfoam.sh)
 set_tests_properties(bound_message_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+add_test(NAME simple_linearupwind_turbulence_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_linearupwind_turbulence_vs_openfoam.sh)
+set_tests_properties(simple_linearupwind_turbulence_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 add_test(NAME bound_at_construction_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/bound_at_construction_vs_openfoam.sh)
 set_tests_properties(bound_at_construction_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
