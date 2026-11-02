@@ -1627,6 +1627,12 @@ set_tests_properties(bound_weak_solver_stress PROPERTIES SKIP_RETURN_CODE 77 TIM
 add_test(NAME simple_linearupwind_turbulence_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_linearupwind_turbulence_vs_openfoam.sh)
 set_tests_properties(simple_linearupwind_turbulence_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+add_test(NAME motorbike_tight_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/motorbike_tight_vs_openfoam.sh)
+set_tests_properties(motorbike_tight_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 3600)
+add_test(NAME limitedlinear_robustness_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/limitedlinear_robustness_vs_openfoam.sh)
+set_tests_properties(limitedlinear_robustness_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 add_test(NAME simple_divergence_detector
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_divergence_detector.sh)
 set_tests_properties(simple_divergence_detector PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
