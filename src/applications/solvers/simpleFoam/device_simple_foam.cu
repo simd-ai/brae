@@ -1669,6 +1669,13 @@ bool simpleColourSwapControl()
                     deviceBCValue(dbEps_, de_, omBs);
                     deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradUs,
                                 hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+                    // correctNut's S2 on these faces is the model's own fvc::grad(U), so gradSchemes grad(U) here too
+                    // (kOmegaSSTBase.C correct(), then the patch half of nut_'s assignment). MEASURED: nuEff 4.7e-02 off
+                    // on a slip patch beside a wall with cellLimited (JUPITER job 2641827), and exact without it.
+                    static const bool sstNutUnlimited = std::getenv("BRAE_CONTROL_SST_NUT_UNLIMITED") != nullptr;
+                    if (ctl_.gradULimitK > 0.0 && !sstNutUnlimited)
+                        deviceCellLimitGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradUs, ctl_.gradULimitK,
+                                             hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr);
                     deviceSSTNutBoundary(dbU_, kBs, omBs, y_,   // CELL wall distance (bndY_ is 0 off-wall)
                                          compressible_ ? &nuWallBnd_ : nullptr, ctl_.nu,
                                          gradUs, nC_, Uk_[0], Uk_[1], Uk_[2],
@@ -2014,13 +2021,21 @@ bool simpleColourSwapControl()
         // point, none solved yet), cyclic-inclusive: the cyclic linearUpwind reconstruction rotates gradU[nbr], so it
         // needs every component from a consistent field (computing per-kk inside the loop would read freshly-solved
         // earlier components -> the same sequencing leak as the deferred mixing).
-        // gU* = gradSchemes `default` (unlimited), for the non-orthogonal laplacian correction.
+        // gU* = the bare Gauss gradient.
         // gLU* = the gradient the linearUpwind div statement names, limited when that name resolves to a
         // cellLimited scheme. LUx/LUy/LUz below select between them so the unlimited path costs nothing.
+        // gNO* = gradSchemes `grad(U)` where that is limited and gLU* is not the same gradient, for the
+        // non-orthogonal laplacian correction: correctedSnGrad<vector>::correction is fullGradCorrection(U), which
+        // takes mesh.gradScheme("grad(U)") (correctedSnGrad.C:50-55), the case's entry when it has one.
         DeviceBuffer<scalar> gUx[3], gUy[3], gUz[3];
         DeviceBuffer<scalar> gLUx[3], gLUy[3], gLUz[3];
+        DeviceBuffer<scalar> gNOx[3], gNOy[3], gNOz[3];
         DeviceBuffer<scalar> cycNbr[3], amiNbr[3];   // interface neighbour value per face, for the limiter
         const bool limitLU = (ctl_.gradULULimitK > 0.0);
+        static const bool lapCorrDefault = std::getenv("BRAE_CONTROL_LAP_CORR_DEFAULT_GRAD") != nullptr;
+        const bool limitNO = ctl_.nonOrth && ctl_.gradULimitK > 0.0 && !lapCorrDefault;
+        const bool sharedNO = limitNO && limitLU && ctl_.gradULULimitK == ctl_.gradULimitK;
+        const bool ownNO = limitNO && !sharedNO;
         DeviceBuffer<scalar> amiURot[3];   // rotated AMI-interp of the CURRENT U (gradient face value + linearUpwind/non-orth nbr)
         if ((ctl_.linearUpwind || ctl_.lust || ctl_.nonOrth) && hasAMI_ && ami_.rotational)
             deviceAmiInterpolateVec(ami_, Uk_[0], Uk_[1], Uk_[2], amiURot[0], amiURot[1], amiURot[2]);
@@ -2046,16 +2061,14 @@ bool simpleColourSwapControl()
                 // TWO CONSUMERS, TWO SCHEMES. OF does not have "the" grad(U) here: linearUpwind takes the
                 // gradient its own div statement NAMES (`linearUpwind limited` -> cellLimited Gauss linear 1,
                 // via mesh.gradScheme(gradSchemeName_) in linearUpwind.C), while the non-orthogonal laplacian
-                // correction takes gradSchemes `default`, which in this case is plain Gauss linear. Limiting
+                // correction takes the gradSchemes entry grad(U) (correctedSnGrad.C:50-55), or `default` when
+                // there is none, which in this case is plain Gauss linear. Limiting
                 // one buffer in place gave BOTH the same gradient and so had to be wrong for one of them:
                 // unlimited was wrong for linearUpwind (the converged squareBendLiq U was 24x off), and
                 // limiting it in place then fed an over-limited gradient into the non-orth correction and
                 // produced a transient nut excursion. Keeping them apart is the only way both match OF.
-                if (limitLU)
+                if (limitLU || ownNO)
                 {
-                    deviceCopy(gLUx[l], gUx[l]);
-                    deviceCopy(gLUy[l], gUy[l]);
-                    deviceCopy(gLUz[l], gUz[l]);
                     // ...and the limiter has to SEE the interface. A coupled face is invisible to brae's
                     // boundary addressing but internal to OF's cellLimitedGrad, so without this an
                     // interface cell is limited as if its interface neighbour did not exist. Measured on
@@ -2078,8 +2091,22 @@ bool simpleColourSwapControl()
                         ifs[nIfs++] = { ami_.n, ami_.ownCell.data(), amiNbr[l].data(),
                                         ami_.dOwnX.data(), ami_.dOwnY.data(), ami_.dOwnZ.data() };
                     }
-                    deviceCellLimitGrad(dm, Uk_[l], ubv, gLUx[l], gLUy[l], gLUz[l], ctl_.gradULULimitK,
-                                        ifs, nIfs);
+                    if (limitLU)
+                    {
+                        deviceCopy(gLUx[l], gUx[l]);
+                        deviceCopy(gLUy[l], gUy[l]);
+                        deviceCopy(gLUz[l], gUz[l]);
+                        deviceCellLimitGrad(dm, Uk_[l], ubv, gLUx[l], gLUy[l], gLUz[l], ctl_.gradULULimitK,
+                                            ifs, nIfs);
+                    }
+                    if (ownNO)
+                    {
+                        deviceCopy(gNOx[l], gUx[l]);
+                        deviceCopy(gNOy[l], gUy[l]);
+                        deviceCopy(gNOz[l], gUz[l]);
+                        deviceCellLimitGrad(dm, Uk_[l], ubv, gNOx[l], gNOy[l], gNOz[l], ctl_.gradULimitK,
+                                            ifs, nIfs);
+                    }
                 }
             }
         // actuationDiskSource (Froude): T = 2*rho*A*(Uref.diskDir)^2*a*(1-a), Uref = mean U over the monitor cells
@@ -2184,9 +2211,14 @@ bool simpleColourSwapControl()
             if (ctl_.nonOrth)   // -fvm::laplacian source correction: -= lapCorr(nuEff, grad(U_kk))
             {
                 DeviceBuffer<scalar> lc;
-                deviceLaplacianCorr(dm, nuEff_f, gUx[kk], gUy[kk], gUz[kk], lc);
-                if (hasCyclic_) interfaceAddLapCorr(cyc_, kk, nuEff, gUx, gUy, gUz, lc);   // + cyclic-face non-orth (rotated tensor)
-                if (hasAMI_)    interfaceAddLapCorr(ami_, kk, nuEff, gUx, gUy, gUz, lc);       // + AMI-face non-orth (rotated tensor stencil)
+                // MEASURED: this took the unlimited gradient under `grad(U) cellLimited`, and the source then differed in
+                // 84,098 of 307,645 interior cells of the tutorial's coarse motorBike (JUPITER job 2641827).
+                DeviceBuffer<scalar>* NOx = sharedNO ? gLUx : ownNO ? gNOx : gUx;
+                DeviceBuffer<scalar>* NOy = sharedNO ? gLUy : ownNO ? gNOy : gUy;
+                DeviceBuffer<scalar>* NOz = sharedNO ? gLUz : ownNO ? gNOz : gUz;
+                deviceLaplacianCorr(dm, nuEff_f, NOx[kk], NOy[kk], NOz[kk], lc);
+                if (hasCyclic_) interfaceAddLapCorr(cyc_, kk, nuEff, NOx, NOy, NOz, lc);   // + cyclic-face non-orth (rotated tensor)
+                if (hasAMI_)    interfaceAddLapCorr(ami_, kk, nuEff, NOx, NOy, NOz, lc);       // + AMI-face non-orth (rotated tensor stencil)
                 deviceAxpy(-nonOrthRelaxU, lc, relaxSrc[kk]);
             }
             // Component kk's gradients have no reader past its two corrections above unless an interface term reads
@@ -2201,6 +2233,9 @@ bool simpleColourSwapControl()
                 gLUx[kk].resize(0);
                 gLUy[kk].resize(0);
                 gLUz[kk].resize(0);
+                gNOx[kk].resize(0);
+                gNOy[kk].resize(0);
+                gNOz[kk].resize(0);
             }
             // constant body force (drives periodic channels) is an explicit momentum SOURCE: it must go into relaxSrc
             // so it feeds BOTH the predictor AND H()/HbyA (OF UEqn.H() includes fvOptions sources). Adding it only to
@@ -2340,6 +2375,9 @@ bool simpleColourSwapControl()
             gLUx[l].resize(0);
             gLUy[l].resize(0);
             gLUz[l].resize(0);
+            gNOx[l].resize(0);
+            gNOy[l].resize(0);
+            gNOz[l].resize(0);
         }
         if (nColour > 0)
         {
