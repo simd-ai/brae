@@ -11,6 +11,7 @@
 // nuEff at boundary faces = the adjacent-cell value (this path's convention, consistent with its laplacian
 // boundary). The fully-faithful boundary-nut (nutkWallFunction) treatment lives in the host simple_foam.cuh.
 #include "cf_types.cuh"
+#include "solution_health.cuh"
 #include "function1.cuh"
 #include "foam_field_reader.cuh"   // FieldData/PatchFieldData: the parsed p0 Function1
 #include "primitive_mesh.cuh"
@@ -387,6 +388,60 @@ public:
         if (dk_.size()) s += deviceSumMag(dk_);
         if (de_.size()) s += deviceSumMag(de_);
         return s;
+    }
+    // The reductions the divergence detector reads (solvers/common/solution_health.cuh), of every field the loop carries.
+    // One group of device reads per field, so one queue drain each, once an iteration.
+    std::vector<HealthField> healthFields() const
+    {
+        std::vector<HealthField> out;
+        const auto add = [&](const char* name, const DeviceBuffer<scalar>& x, bool boundedBelow)
+        {
+            if (x.size() == 0) return;
+            HealthField f;
+            f.name = name;
+            f.boundedBelow = boundedBelow;
+            DeviceBuffer<scalar> mmm(3);
+            deviceMinMaxMeanInto(x, mmm.data());
+            DeviceReadValue v[3];
+            v[0].dSrc = mmm.data();     v[0].hDst = &f.min;  v[0].isInt = false;
+            v[1].dSrc = mmm.data() + 1; v[1].hDst = &f.max;  v[1].isInt = false;
+            v[2].dSrc = mmm.data() + 2; v[2].hDst = &f.mean; v[2].isInt = false;
+            deviceReadValues(v, 3);
+            out.push_back(f);
+        };
+        add("Ux", Uk_[0], false);
+        add("Uy", Uk_[1], false);
+        add("Uz", Uk_[2], false);
+        add("p", dp_, false);
+        add("phi", phiInt_, false);
+        add("k", dk_, true);
+        add("epsilon|omega|nuTilda", de_, true);
+        add("nut", dnut_, false);
+        return out;
+    }
+    // TEST CONTROL (BRAE_TEST_CORRUPT=<field>:<nan|inf|neg|big>:<iteration>): one cell of one field, so the gates can show
+    // the detector stops a run on each thing it claims to read. Nothing else reaches this.
+    void corruptForTest(const std::string& field, const std::string& kind)
+    {
+        DeviceBuffer<scalar>* x = field == "U" ? &Uk_[0]
+                                : field == "p" ? &dp_
+                                : field == "phi" ? &phiInt_
+                                : field == "k" ? &dk_
+                                : field == "omega" || field == "epsilon" ? &de_
+                                : field == "nut" ? &dnut_ : nullptr;
+        if (!x || x->size() == 0)
+        {
+            throw std::runtime_error("BRAE_TEST_CORRUPT: no field '" + field + "'");
+        }
+        scalar v = kind == "nan" ? std::numeric_limits<scalar>::quiet_NaN()
+                 : kind == "inf" ? std::numeric_limits<scalar>::infinity()
+                 : kind == "neg" ? scalar(-1) : kind == "big" ? scalar(1e12) : scalar(0);
+        if (kind != "nan" && kind != "inf" && kind != "neg" && kind != "big")
+        {
+            throw std::runtime_error("BRAE_TEST_CORRUPT: no kind '" + kind + "'");
+        }
+        const std::size_t c = x->size() / 2;
+        cudaCheck(cudaMemcpy(x->data() + c, &v, sizeof(scalar), cudaMemcpyHostToDevice), "test corrupt");
     }
     // Per-face turbulent-inlet data, so the boundary values can be refreshed per iteration (OF parity).
     void setTurbulentInlets(const std::vector<label>& tiMask, const std::vector<scalar>& tiIntensity,

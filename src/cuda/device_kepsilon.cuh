@@ -38,6 +38,17 @@ struct ScalarSolveEntry
 void clearTurbulenceReport();
 const std::vector<ScalarSolveEntry>& turbulenceReport();
 
+// What the last iteration's own equation can sustain for omega or epsilon, for the divergence detector
+// (solvers/common/solution_health.cuh). 0: this closure sets none.
+struct SecondFieldLimit
+{
+    scalar limit = 0.0;
+};
+SecondFieldLimit& secondFieldLimit();
+scalar deviceFieldMax(const DeviceBuffer<scalar>& x);
+// The largest value on a face that holds its own: fixedValue and the wall functions. A zeroGradient face only repeats a cell.
+scalar deviceFixedFaceMax(const DeviceBoundary& db, const DeviceBuffer<scalar>& value);
+
 // Foam::bound's message, for the fields whose guard fired this iteration. A store of its own rather than
 // a field on ScalarSolveEntry: the OF-mirror closure reports its residuals through its own path and
 // never fills turbStore, so a report hung off that entry reached one driver and silently not the other.

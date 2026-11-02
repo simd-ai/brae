@@ -19,6 +19,7 @@
 #include "mrf_read.cuh"
 #include "fv_options.cuh"
 #include "turbulent_inlet.cuh"
+#include "solution_health.cuh"
 #include "turb_blowup.cuh"
 #include "foam_dict.cuh"
 #include "dict_audit.cuh"
@@ -615,6 +616,25 @@ int main(int argc, char** argv)
         // converges if at least one criterion was ACTUALLY checked (see solvers/common/residual_control.cuh).
         int rcChecked = 0;
         TurbBlowup turbBlowup;   // sum|turb| tripwire; see solvers/common/turb_blowup.cuh
+        HealthAdmissible healthSecond;   // solvers/common/solution_health.cuh
+        const char* const healthLog = std::getenv("BRAE_HEALTH_LOG");
+        // TEST CONTROL: <field>:<kind>:<iteration>, DeviceSimpleFoam::corruptForTest
+        std::string corruptField;
+        std::string corruptKind;
+        long corruptIter = -1;
+        if (const char* e = std::getenv("BRAE_TEST_CORRUPT"))
+        {
+            const std::string t(e);
+            const std::size_t a = t.find(':');
+            const std::size_t b = t.rfind(':');
+            if (a == std::string::npos || b == a)
+            {
+                throw std::runtime_error("BRAE_TEST_CORRUPT wants <field>:<kind>:<iteration>");
+            }
+            corruptField = t.substr(0, a);
+            corruptKind = t.substr(a + 1, b - a - 1);
+            corruptIter = std::atol(t.c_str() + b + 1);
+        }
         auto ok = [&](scalar res, scalar ctlv) { if (ctlv < 0) return true; ++rcChecked; return res < ctlv; };
         // OF controlDict write cadence: writeControl / writeInterval / purgeWrite (ported from Foam::Time)
         const std::string writeControl = controlDict.wordOr("writeControl", "timeStep");
@@ -940,6 +960,46 @@ int main(int argc, char** argv)
             {
                 if (turbBlowup.update(solver.turbSumMag(), (int)iter))
                     throw std::runtime_error(turbBlowup.message((int)iter));
+            }
+            if ((long)iter == corruptIter)
+            {
+                solver.corruptForTest(corruptField, corruptKind);
+            }
+            // The fields and every residual, not only p's and U's: see solvers/common/solution_health.cuh.
+            if (!std::getenv("BRAE_ALLOW_NONFINITE"))
+            {
+                std::string why;
+                for (const auto& e : turbulenceReport())
+                {
+                    if (why.empty()) why = healthResidual(e.field, e.perf.initialResidual, (int)iter);
+                    if (why.empty()) why = healthResidual(e.field + " (final)", e.perf.finalResidual, (int)iter);
+                }
+                const std::vector<HealthField> fields = solver.healthFields();
+                for (const HealthField& f : fields)
+                {
+                    if (why.empty()) why = healthField(f, (int)iter);
+                }
+                if (why.empty() && ctl.turbulent && !ctl.sa)
+                {
+                    const SecondFieldLimit& lim = secondFieldLimit();
+                    for (const HealthField& f : fields)
+                    {
+                        const bool second = std::string(f.name) == "epsilon|omega|nuTilda";
+                        if (!second) continue;
+                        if (healthLog)
+                        {
+                            std::printf("health: %s max %.6e limit %.6e ratio %.3e\n", ctl.sst ? "omega" : "epsilon", (double)f.max, (double)lim.limit, lim.limit > 0 ? (double)(f.max / lim.limit) : 0.0);
+                        }
+                        if (lim.limit > 0 && healthSecond.update(f.max, lim.limit))
+                        {
+                            why = healthSecond.message(ctl.sst ? "omega" : "epsilon", (int)iter);
+                        }
+                    }
+                }
+                if (!why.empty())
+                {
+                    throw std::runtime_error("solution diverged: " + why + ". No field written. Set BRAE_ALLOW_NONFINITE=1 to continue anyway.");
+                }
             }
             // OF residualControl: also gate on every turbulence field (k/epsilon/omega/nuTilda) that lists a target.
             // Previously ONLY p and Ux were checked, so a turbulent case could report "converged" with k/epsilon

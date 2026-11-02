@@ -32,6 +32,49 @@ void clearBoundingReports() { boundStore().clear(); }
 const std::vector<BoundingReport>& boundingReports() { return boundStore(); }
 const std::vector<ScalarSolveEntry>& turbulenceReport() { return turbStore(); }
 
+SecondFieldLimit& secondFieldLimit()
+{
+    static SecondFieldLimit l;
+    return l;
+}
+
+namespace {
+__global__ void fixedFaceValueKernel(
+    int                        n,
+    const label*  __restrict__ type,
+    const label*  __restrict__ wallFunction,
+    const scalar* __restrict__ value,
+    scalar*       __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = (type[i] == 1 || wallFunction[i]) ? value[i] : scalar(0);
+}
+}   // namespace
+
+scalar deviceFieldMax(const DeviceBuffer<scalar>& x)
+{
+    if (x.size() == 0) return scalar(0);
+    DeviceBuffer<scalar> mmm(3);
+    deviceMinMaxMeanInto(x, mmm.data());
+    scalar v = 0.0;
+    DeviceReadValue r;
+    r.dSrc = mmm.data() + 1;
+    r.hDst = &v;
+    r.isInt = false;
+    deviceReadValues(&r, 1);
+    return v;
+}
+
+scalar deviceFixedFaceMax(const DeviceBoundary& db, const DeviceBuffer<scalar>& value)
+{
+    if (db.n == 0) return scalar(0);
+    DeviceBuffer<scalar> out;
+    out.resize(static_cast<std::size_t>(db.n));
+    fixedFaceValueKernel<<<nBlocks(db.n), TPB>>>(db.n, db.bcType.data(), db.wallFunctionMask.data(), value.data(), out.data());
+    cudaCheck(cudaGetLastError(), "fixedFaceValue");
+    return deviceFieldMax(out);
+}
+
 namespace {
 inline scalar yPlusLamHost(scalar kappa, scalar E) { scalar y = 11.0; for (int i = 0; i < 10; ++i) y = std::log(std::fmax(E * y, 1.0)) / kappa; return y; }
 
@@ -1220,6 +1263,9 @@ void deviceKEpsilonCorrect(
     deviceBCValue(dbEps, eps, ebv);
     deviceBCKeepStored(dbEps, ebvStored, ebv);
     static const bool gradLive = std::getenv("BRAE_CONTROL_TURB_GRAD_LIVE") != nullptr;
+    // epsilon's own equation sets what it can reach, C1 G = C2 epsilon: solvers/common/solution_health.cuh. None for the realizable closure,
+    // whose production is not G.
+    secondFieldLimit().limit = co.realizable ? scalar(0) : std::max(deviceFixedFaceMax(dbEps, ebv), (co.C1 / co.C2) * deviceFieldMax(G));
 
     // epsilon equation (loose solve) with the near-wall setValues constraint
     // DepsilonEff = nut/sigmaEps + nu. OF's laplacian is alpha*rho*DepsilonEff, so compressible wants

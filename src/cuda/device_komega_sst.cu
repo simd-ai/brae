@@ -1202,6 +1202,8 @@ void deviceKOmegaSSTCorrect(
     // job 4844884): a live zeroGradient outlet at the wall corner put the outlet column 0.18% out in iteration 1, U and p still 1e-13.
     static const bool gradLive = std::getenv("BRAE_CONTROL_TURB_GRAD_LIVE") != nullptr;
     const bool luStored = !gradLive && !omegaLive;
+    // omega's own equation sets what it can reach: solvers/common/solution_health.cuh.
+    secondFieldLimit().limit = std::max(deviceFixedFaceMax(dbOmega, obv), std::sqrt(std::max(co.gamma1 / co.beta1, co.gamma2 / co.beta2) * deviceFieldMax(S2)));
     deviceSolveScalarTransport(dm, dbOmega, omega, "omega", DomegaEff, phiInt, phiBnd, divPhi, boundedEps, limitedOmega, linearUpwindOmega, nonOrth, twoBykOmega,
                                relaxOmega, omegaStop, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceOmegaReaction(dm.V, gamma, beta, GbyNu0lim, F1, CD, omega, divU, diag, src, rho); },

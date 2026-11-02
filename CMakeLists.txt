@@ -1624,6 +1624,9 @@ set_tests_properties(bound_message_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TI
 add_test(NAME simple_linearupwind_turbulence_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_linearupwind_turbulence_vs_openfoam.sh)
 set_tests_properties(simple_linearupwind_turbulence_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+add_test(NAME simple_divergence_detector
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_divergence_detector.sh)
+set_tests_properties(simple_divergence_detector PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 add_test(NAME bound_at_construction_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/bound_at_construction_vs_openfoam.sh)
 set_tests_properties(bound_at_construction_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
@@ -2755,6 +2758,11 @@ add_executable(test_turb_blowup tests/test_turb_blowup.cu)
 target_include_directories(test_turb_blowup PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_turb_blowup PRIVATE brae_core)
 add_test(NAME turb_blowup COMMAND test_turb_blowup)
+
+add_executable(test_solution_health tests/test_solution_health.cu)
+target_include_directories(test_solution_health PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_solution_health PRIVATE brae_core)
+add_test(NAME solution_health COMMAND test_solution_health)
 
 # rhoSimpleFoam's createFields.H against real OpenFOAM. The oracle is OpenFOAM's own
 # `rhoSimpleFoam -postProcess -func "writeObjects(phi,rho)"`, which builds createFields.H's field set and
