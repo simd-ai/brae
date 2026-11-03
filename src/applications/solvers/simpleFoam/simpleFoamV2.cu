@@ -1021,6 +1021,34 @@ int runSimpleFoamV2(const std::string& caseDir)
     // brae computes.
     scalar gradUSchemeLimit = 0.0;
     gradUSchemeUnsupported(caseDir, &gradUSchemeLimit);
+    const scalar gradUCaseLimit = gradUSchemeLimit;
+    scalar gradUDivDevLimit = gradUSchemeLimit;
+    // BRAE_CONTROL_GRADU_LIMIT_IGNORED, closure_gradlimit_vs_openfoam's CONTROL and deliberately wrong: the
+    // case's grad(U) limiter dropped again, as this driver ran before 2026-09-04 -- `1` at every site,
+    // `closure` in the closures only (strain, production, the start-up correctNut, the SST's calculated nut
+    // boundary), `divdev` in divDevReff's dev2 term only. The setup line still prints the case's
+    // coefficient, as the defect did.
+    if (const char* c = std::getenv("BRAE_CONTROL_GRADU_LIMIT_IGNORED"))
+    {
+        const std::string which(c);
+        if (which != "1" && which != "closure" && which != "divdev")
+        {
+            throw std::runtime_error("brae: BRAE_CONTROL_GRADU_LIMIT_IGNORED=" + which
+                                     + " is none of 1, closure, divdev.");
+        }
+        if (which != "divdev")
+        {
+            gradUSchemeLimit = 0.0;
+        }
+        if (which != "closure")
+        {
+            gradUDivDevLimit = 0.0;
+        }
+        std::printf("brae CONTROL: BRAE_CONTROL_GRADU_LIMIT_IGNORED=%s, the case's grad(U) limiter dropped in %s\n",
+                    which.c_str(),
+                    which == "1" ? "divDevReff and the closures" : (which == "closure" ? "the closures"
+                                                                                       : "divDevReff"));
+    }
     // The TRANSPORTED scalars' own `grad(<var>)` entries, which feed their limitedLinear weight, their
     // linearUpwind correction and the non-orthogonal laplacian correction. brae carries ONE coefficient
     // for the pair, so a case that limits them differently is refused by name rather than run with
@@ -2119,10 +2147,10 @@ int runSimpleFoamV2(const std::string& caseDir)
     // printed on its own line because the two can differ (validation/rotorDisk) and because the single
     // line this replaced named the SCHEME while carrying linearUpwind's value -- the display string
     // asserting a capability the code did not have.
-    in.gradUSchemeLimitK = gradUSchemeLimit;
-    if (gradUSchemeLimit > 0.0)
+    in.gradUSchemeLimitK = gradUDivDevLimit;
+    if (gradUCaseLimit > 0.0)
         std::printf("  gradSchemes grad(U): cellLimited Gauss linear %g "
-                    "(fvc::grad(U): divDevReff + the closures)\n", gradUSchemeLimit);
+                    "(fvc::grad(U): divDevReff + the closures)\n", gradUCaseLimit);
 
     std::printf("  U solver: %s\n",
                 // "as the case asks" was the display string this line used to carry, and it was the

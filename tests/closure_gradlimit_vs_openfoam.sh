@@ -23,10 +23,26 @@
 # OpenFOAM is U 7.2e-03 / k 1.7e-02, so no absolute bound can tell them apart. What CAN be asserted, and
 # is the whole content of the fix, is which of the two answers brae is CLOSER to.
 #
-#   ARM      rel(brae, OF_limited) < rel(brae, OF_unlimited) on the fields the limiter reaches.
-#   CONTROL  the two OpenFOAM answers must themselves differ by more than REL_MIN, or brae is being
-#            asked to choose between two identical oracles and the arm means nothing.
+# WHICH FIELDS CAN BE JUDGED is decided BEFORE brae's answer on the limited case is read, from the two
+# OpenFOAM answers and the comparison's own uncertainty. Per field, as relative L2 distances:
+#   S   = |OF_lim - OF_unl|                    what the limiter does to OpenFOAM's answer
+#   u   = max(|brae_unl - OF_unl|,             brae against OpenFOAM where the limiter is not in play
+#             |OF_lim - OF_lim'|, |OF_unl - OF_unl'|)   ...and OpenFOAM against itself, k's start one ulp up
+#   judgeable  iff  S > (1 + MARGIN) u
+# If brae's error on the limited case is within u, as it is on the unlimited one, a CORRECT brae has
+# dl <= u and du >= S - u > MARGIN u >= MARGIN dl: the arm passes. A brae that drops the limiter sits within
+# u of OF_unl: du <= u < (S - u)/MARGIN <= dl/MARGIN, and the arm fails. The rule fixes both outcomes in
+# advance; on a field where S is not that large, the question has no answer at this resolution.
+# Until 2026-11-03 a field was judged when brae's OWN answer sat inside the oracles' separation, so a
+# better brae could turn a field from skipped to judged: patch 0018 brought nut from 1.95e-02 to 1.52e-02
+# of OpenFOAM, nut became judged, and missed the margin at 1.049 against 1.05 while every field moved
+# closer to OpenFOAM.
+#
+#   ARM      on every judgeable field, rel(brae, OF_unlimited) > MARGIN rel(brae, OF_limited).
+#   CONTROL  at least one field is judgeable, or the arm asserts nothing.
 #   CONTROL2 brae must print the gradSchemes grad(U) line, i.e. it read the entry at all.
+#   CONTROL3 BRAE_CONTROL_GRADU_LIMIT_IGNORED=<each of GATED_CONTROLS> -- brae with the case's grad(U)
+#            limiter dropped -- must FAIL the arm on the same judgeable fields.
 #
 # Fail-proof, 2026-09-04: with gradUSchemeUnsupported returning 0.0, the inequality flips on U and k.
 set -u
@@ -37,6 +53,7 @@ OFBASHRC=${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
 N=${N:-20}
 REL_MIN=${REL_MIN:-1e-04}          # below this the two oracles are the same answer
 MARGIN=${MARGIN:-1.05}             # brae must be at least this much closer to the limited oracle
+GATED_CONTROLS=${GATED_CONTROLS:-1}   # BRAE_CONTROL_GRADU_LIMIT_IGNORED values that must fail the arm
 
 [ -x "$BRAE" ]     || { echo "SKIP: no brae at $BRAE"; exit 77; }
 [ -d "$SRC" ]      || { echo "SKIP: fixture $SRC missing"; exit 77; }
@@ -49,18 +66,18 @@ source "$OFBASHRC" > /dev/null 2>&1 || true
 set -u
 command -v simpleFoam > /dev/null 2>&1 || { echo "SKIP: simpleFoam not on PATH"; exit 77; }
 
-W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
+W=$(mktemp -d); [ -n "${KEEP_W:-}" ] && echo "work dir $W" || trap 'rm -rf "$W"' EXIT
 
-stage()   # stage <dir> <limited|unlimited>
+stage()   # stage <dir> <limited|unlimited> [twin]
 {
     # This fixture ships 0/ directly (no 0.orig) and a committed 400/ reference; both are kept out of
     # the way so the run starts where the dictionary says and writes exactly one time directory.
     rm -rf "$1"; cp -r "$SRC" "$1"; rm -rf "$1"/[1-9]* "$1"/log.* "$1"/postProcessing
     [ -d "$1/0.orig" ] && { rm -rf "$1/0"; cp -r "$1/0.orig" "$1/0"; }
     [ -d "$1/0" ] || { echo "SKIP: fixture ships no 0/"; exit 77; }
-    python3 - "$1" "$2" "$N" <<'PY'
-import re, sys
-d, mode, n = sys.argv[1], sys.argv[2], sys.argv[3]
+    python3 - "$1" "$2" "$N" "${3:-}" <<'PY'
+import math, re, sys
+d, mode, n, twin = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 c = d + '/system/controlDict'; s = open(c).read()
 s = re.sub(r'functions\s*\{.*\n\}', 'functions\n{\n}', s, flags=re.S)
 s = re.sub(r'endTime\s+\S+;',        'endTime         %s;' % n, s)
@@ -80,21 +97,40 @@ if mode == 'unlimited':
     g = d + '/system/fvSchemes'; s = open(g).read()
     s = re.sub(r'grad\(U\)\s+\S+;', 'grad(U)         Gauss linear;', s)
     open(g, 'w').write(s)
+if twin:
+    # OpenFOAM's own spread: k's starting value one ulp up, the boundary values as shipped
+    f = d + '/0/k'; s = open(f).read()
+    v = float(re.search(r'^kInlet\s+([0-9.eE+-]+);', s, flags=re.M).group(1))
+    s, nsub = re.subn(r'internalField\s+uniform\s+\$kInlet;', 'internalField   uniform %r;' % math.nextafter(v, 2*v), s)
+    if nsub != 1: sys.exit('twin: 0/k has no internalField uniform $kInlet')
+    open(f, 'w').write(s)
 PY
 }
 
-stage "$W/of_lim" limited
-stage "$W/of_unl" unlimited
-stage "$W/br"     limited
-( cd "$W/of_lim" && simpleFoam > run.log 2>&1 ) || { echo "FAIL: OpenFOAM (limited) did not run"; tail -8 "$W/of_lim/run.log"; exit 1; }
-( cd "$W/of_unl" && simpleFoam > run.log 2>&1 ) || { echo "FAIL: OpenFOAM (unlimited) did not run"; tail -8 "$W/of_unl/run.log"; exit 1; }
-( cd "$W/br" && BRAE_SIMPLEFOAM_V2=1 "$BRAE" "$W/br" > run.log 2>&1 ) \
-    || { echo "FAIL: brae crashed"; tail -15 "$W/br/run.log"; exit 1; }
+stage "$W/of_lim"  limited
+stage "$W/of_unl"  unlimited
+stage "$W/of_limt" limited   twin
+stage "$W/of_unlt" unlimited twin
+stage "$W/br_unl"  unlimited
+stage "$W/br"      limited
+for o in of_lim of_unl of_limt of_unlt; do
+    ( cd "$W/$o" && simpleFoam > run.log 2>&1 ) || { echo "FAIL: OpenFOAM ($o) did not run"; tail -8 "$W/$o/run.log"; exit 1; }
+done
+for b in br_unl br; do
+    ( cd "$W/$b" && BRAE_SIMPLEFOAM_V2=1 "$BRAE" "$W/$b" > run.log 2>&1 ) \
+        || { echo "FAIL: brae crashed ($b)"; tail -15 "$W/$b/run.log"; exit 1; }
+done
+for c in $GATED_CONTROLS; do
+    stage "$W/ctl_$c" limited
+    ( cd "$W/ctl_$c" && BRAE_SIMPLEFOAM_V2=1 BRAE_CONTROL_GRADU_LIMIT_IGNORED=$c "$BRAE" "$W/ctl_$c" > run.log 2>&1 ) \
+        || { echo "FAIL: brae crashed (control $c)"; tail -15 "$W/ctl_$c/run.log"; exit 1; }
+done
 
-python3 - "$W" "$N" "$REL_MIN" "$MARGIN" <<'PY'
+python3 - "$W" "$N" "$REL_MIN" "$MARGIN" "$GATED_CONTROLS" <<'PY'
 import gzip, os, re, sys
 import numpy as np
 W, n, relmin, margin = sys.argv[1], sys.argv[2], float(sys.argv[3]), float(sys.argv[4])
+controls = sys.argv[5].split()
 fail = 0
 def say(msg, ok):
     global fail
@@ -122,31 +158,47 @@ def rel(a, b):
     return float(np.linalg.norm(a - b) / max(np.linalg.norm(a), 1e-300))
 
 print('  brae ran with the case as shipped; the two OpenFOAM runs differ ONLY in the grad(U) entry.')
-any_field = False
-for f in ('U', 'k', 'epsilon', 'nut', 'p'):
-    lim = rd(os.path.join(W, 'of_lim', n, f))
-    unl = rd(os.path.join(W, 'of_unl', n, f))
-    br  = rd(os.path.join(W, 'br',     n, f))
-    if lim is None or unl is None or br is None:
+FIELDS = ('U', 'k', 'epsilon', 'nut', 'p')
+def fields(arm):
+    return {f: rd(os.path.join(W, arm, n, f)) for f in FIELDS}
+lim, unl, limt, unlt, bru = (fields(a) for a in ('of_lim', 'of_unl', 'of_limt', 'of_unlt', 'br_unl'))
+# 1. The judgeable fields, from OpenFOAM and brae's UNLIMITED run only. brae's limited answer is not read yet.
+judged = []
+for f in FIELDS:
+    if any(x[f] is None for x in (lim, unl, limt, unlt, bru)):
         print('  %-8s missing on one side -- skipped' % f); continue
-    sep = rel(lim, unl)
-    dl, du = rel(lim, br), rel(unl, br)
+    sep = rel(lim[f], unl[f])
     if sep < relmin:
         print('  %-8s the two oracles agree to %.3e -- the limiter does not reach this field' % (f, sep))
         continue
-    # A field is only DECIDABLE when brae sits closer to one of the two oracles than they sit to each
-    # other. Where brae's own error on the field exceeds their separation -- k and epsilon here, whose
-    # transport carries an error of 1.3e-02 against a 5.7e-03 separation -- the question "which oracle is
-    # brae nearer" has no content, and asserting it would be asserting noise. Those are reported and
-    # skipped rather than quietly dropped.
-    if min(dl, du) >= sep:
-        print('  %-8s INCONCLUSIVE: brae is %.3e / %.3e from the two oracles, which are only %.3e apart'
-              % (f, dl, du, sep))
-        continue
-    any_field = True
-    say('%-8s brae is %.3e from LIMITED, %.3e from unlimited (oracles %.3e apart)'
-        % (f, dl, du, sep), du > margin * dl)
-say('CONTROL  at least one field is decidable (brae inside the oracles\' separation)', any_field)
+    floor, twin = rel(unl[f], bru[f]), max(rel(lim[f], limt[f]), rel(unl[f], unlt[f]))
+    u = max(floor, twin)
+    ok = sep > (1.0 + margin) * u
+    print('  %-8s S %.3e  u %.3e (brae floor %.3e, OpenFOAM twin %.3e)  S/u %7.2f against %.2f: %s'
+          % (f, sep, u, floor, twin, sep / u if u > 0 else float('inf'), 1.0 + margin,
+             'judgeable' if ok else 'NOT judgeable'))
+    if ok: judged.append(f)
+say('CONTROL  at least one field is judgeable (S > (1 + MARGIN) u)', len(judged) > 0)
+# 2. The arm, then each control, on those fields only.
+def verdict(arm, label):
+    br = fields(arm)
+    passed = True
+    for f in FIELDS:
+        if any(x[f] is None for x in (lim, unl, br)): continue
+        dl, du = rel(lim[f], br[f]), rel(unl[f], br[f])
+        good = du > margin * dl
+        if f in judged: passed = passed and good
+        print('  %-8s %-12s %.3e from LIMITED, %.3e from unlimited, ratio %7.3f against %.2f  %s'
+              % (f, label, dl, du, du / dl if dl > 0 else float('inf'), margin,
+                 ('ok' if good else 'fails') if f in judged else '(not judged)'))
+    return passed
+say('ARM      brae is closer to the LIMITED oracle on every judgeable field', verdict('br', 'brae'))
+for c in controls:
+    log = open(os.path.join(W, 'ctl_' + c, 'run.log')).read()
+    say('CONTROL3 BRAE_CONTROL_GRADU_LIMIT_IGNORED=%s reached brae' % c,
+        'BRAE_CONTROL_GRADU_LIMIT_IGNORED=%s' % c in log)
+    say('CONTROL3 BRAE_CONTROL_GRADU_LIMIT_IGNORED=%s fails the arm' % c,
+        bool(judged) and not verdict('ctl_' + c, 'control ' + c))
 say('CONTROL2 brae read the gradSchemes grad(U) entry',
     'gradSchemes grad(U): cellLimited' in open(os.path.join(W, 'br', 'run.log')).read())
 sys.exit(1 if fail else 0)
