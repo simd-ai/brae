@@ -20,6 +20,7 @@
 #include "fv_options.cuh"
 #include "turbulent_inlet.cuh"
 #include "solution_health.cuh"
+#include "memory_probe.cuh"   // BRAE_MEMORY_PROBE: memory at fixed iterations, host_smoother_memory's reading
 #include "turb_blowup.cuh"
 #include "foam_dict.cuh"
 #include "dict_audit.cuh"
@@ -839,6 +840,9 @@ int main(int argc, char** argv)
         // BRAE_POOL_STATS=1: the device pool after start-up, after the first iterations and every 25th -- its
         // footprint, the bytes in use and their peak, and which phase asked the driver for what
         detail::devicePool().report("start-up");
+        // BRAE_MEMORY_PROBE: the memory the run holds at fixed iterations (solvers/common/memory_probe.cuh)
+        MemoryProbe memProbe;
+        memProbe.startUp();
         while (!converged && time.loop())
         {
             iter = time.timeIndex();
@@ -1049,8 +1053,10 @@ int main(int argc, char** argv)
                 writeTimeDir(WriteControl::timeName(tval));
                 time.write();   // OF splits write() from execute(); this driver owns its own cadence
             }
+            memProbe.iteration(iter);
         }
         time.end();   // OF Time.C:790-802: a final execute() so the last step is seen, then end()
+        memProbe.loopEnd(iter);
         detail::devicePool().report("loop end");
         detail::devicePool().reportClasses("loop end");
         // timeIndex() is the iteration that ran, so no -1: the for-loop this replaced incremented past it.
@@ -1201,6 +1207,7 @@ int main(int argc, char** argv)
                 }
             }
         }
+        memProbe.end(nIter);
     }
     catch (const std::exception& e)
     {

@@ -38,6 +38,7 @@
 #include "mrf_read.cuh"          // readCellZones
 #include "fv_options.cuh"        // readFvOptions -> RotorDiskParams
 #include "rotor_disk.cuh"
+#include "memory_probe.cuh"   // BRAE_MEMORY_PROBE: memory at fixed iterations, host_smoother_memory's reading
 #include "fvOptions_cpp.cuh"       // the fvOptions framework + explicitPorositySource    // readKOmegaSSTCoeffs (RAS.kOmegaSSTCoeffs, OF defaults when absent)
 #include "cell_wall_dist.cuh"       // cellWallDist: kOmegaSST's F1/F2 need y at every CELL, not just walls
 #include "near_wall_dist.cuh"
@@ -2379,6 +2380,9 @@ int runSimpleFoamV2(const std::string& caseDir)
     std::map<std::string, scalar> residuals;
     label iter = 0;
     scalar timeValue = startTimeVal;
+    // BRAE_MEMORY_PROBE: the memory the run holds at fixed iterations (solvers/common/memory_probe.cuh)
+    MemoryProbe memProbe;
+    memProbe.startUp();
     while (ctl.loop(iter + 1, nSteps, residuals))
     {
         ++iter;
@@ -2459,7 +2463,9 @@ int runSimpleFoamV2(const std::string& caseDir)
             wc.recordWritten(caseDir, tname);
             lastWritten = tname;
         }
+        memProbe.iteration(iter);
     }
+    memProbe.loopEnd(iter);
     if (ctl.converged())
     {
         std::printf("SIMPLE solution converged in %d iterations\n", static_cast<int>(iter));
@@ -2487,6 +2493,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                     g_hookSeconds,    iter ? 1e3 * g_hookSeconds    / (double)iter : 0.0,
                     g_refreshSeconds, iter ? 1e3 * g_refreshSeconds / (double)iter : 0.0,
                     static_cast<int>(iter));
+    memProbe.end(iter);
 
     // ---- write -------------------------------------------------------------------------------
     return static_cast<int>(iter);

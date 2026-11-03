@@ -135,6 +135,11 @@ public:
         mallocSeconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         mallocBytes_ += cls;
         ++mallocs_;
+        // the footprint only grows here, so its peak is taken here (BRAE_MEMORY_PROBE)
+        if (mallocBytes_ - freedBytes_ > peakFootprint_)
+        {
+            peakFootprint_ = mallocBytes_ - freedBytes_;
+        }
         hist_[cls].first += cls;
         ++hist_[cls].second;
         if (stats_) mallocByPhase_[phase_] += cls;
@@ -247,6 +252,16 @@ public:
     std::size_t freedBytes() const
     {
         return freedBytes_;
+    }
+    // the most the pool has held from the driver at once (cudaMalloc less what endOfStep handed back)
+    std::size_t peakFootprint() const
+    {
+        return peakFootprint_;
+    }
+    // false under BRAE_NO_DEVICE_POOL=1, where a give is a cudaFree that the footprint does not see
+    bool enabled() const
+    {
+        return enabled_;
     }
     bool exactKeys() const
     {
@@ -424,6 +439,7 @@ private:
     std::size_t mallocBytes_ = 0, heldBytes_ = 0, mallocs_ = 0;
     std::size_t frees_ = 0;
     std::size_t freedBytes_ = 0;
+    std::size_t peakFootprint_ = 0;
     double mallocSeconds_ = 0;
     double freeSeconds_ = 0;
     unsigned long step_ = 0;
