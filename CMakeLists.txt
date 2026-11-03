@@ -1441,6 +1441,13 @@ add_test(NAME closure_gradlimit_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/windAroundBuildingsBox)
 set_tests_properties(closure_gradlimit_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1200)
 
+# The V2 driver restarted from OpenFOAM's converged windAroundBuildingsBox 400/, against OpenFOAM's own restart: its first
+# boundary nut from k's and epsilon's stored outlet values, as OpenFOAM's validate() reads them. Control: BRAE_IO_STORED=0.
+add_test(NAME simple_v2_restart_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_v2_restart_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/windAroundBuildingsBox)
+set_tests_properties(simple_v2_restart_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
 add_test(NAME solver_iterbounds_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/solver_iterbounds_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO)

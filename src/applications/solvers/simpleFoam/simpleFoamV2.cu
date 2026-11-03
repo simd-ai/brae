@@ -1396,13 +1396,21 @@ int runSimpleFoamV2(const std::string& caseDir)
                         "gammaIntEff seeded at 0 as OpenFOAM constructs it\n");
         }
 
+        // k's and epsilon|omega's inletOutlet faces hold their STORED values until the loop's first flux switch
+        // (DeviceBoundary::ioStored, the closures' seed): validate()'s correctNut below and the nuEff seed after it
+        // read them, and OpenFOAM's correctNut reads the patch values as read, nothing having evaluated them.
+        // Built without the seed, an outlet's k and epsilon stood at their inletValue there, which a start from
+        // rest cannot see (the field is the inletValue) and a restart can: windAroundBuildingsBox one iteration
+        // from OpenFOAM's t=400 (JUPITER job 2669843) held U's matrix to 1e-16 of OpenFOAM's and its source 3.0e-01
+        // off in z, on the outlet's 200 cells alone, then U 7.6e-05 and p 2.9e-03 where the legacy driver is
+        // 2.6e-16 and 1.9e-12. BRAE_IO_STORED=0 restores the inletValue seed: the gate's control.
         dK.copyFrom(kF.internal); dNut.copyFrom(nutF.internal);
-        dbK   = buildDeviceBoundary(kF,   fvp, g);
+        dbK   = buildDeviceBoundary(kF,   fvp, g, /*storedIoSeed=*/true);
         dbNut = buildDeviceBoundary(nutF, fvp, g);
         if (!saModel)
         {
             dEps.copyFrom(epsF.internal);
-            dbEps = buildDeviceBoundary(epsF, fvp, g);
+            dbEps = buildDeviceBoundary(epsF, fvp, g, /*storedIoSeed=*/true);
         }
 
         // OF fills nut by FIELD ASSIGNMENT (nut_ = Cmu*sqr(k_)/epsilon_), which writes the BOUNDARY from
