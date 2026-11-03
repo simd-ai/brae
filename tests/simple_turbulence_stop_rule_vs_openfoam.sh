@@ -13,6 +13,18 @@
 # relTol 0, and the transported fields as smoothSolver / GaussSeidel / nSweeps 1 -- the legacy driver's own sweep
 # count -- with the entries below; each field's entry is its own dictionary.
 #
+# FROM OPENFOAM'S ITERATION DEV, NOT FROM REST. Each fixture runs once as shipped to OpenFOAM's iteration DEV (100),
+# written at 17 digits, and every row starts there. From rest, k and omega start uniform under limitedLinear, where
+# rounding in the gradient of a uniform field picks the limiter's branch: there OpenFOAM's own counts move with its
+# own last bit. MEASURED (JUPITER job 2671225): from rest, OpenFOAM with k's or omega's start one ulp up took 1 to 4
+# sweeps more or fewer than itself on solves of every SST tolerance and relTol row; from DEV its twin kept every count
+# of all five SST rows, and so did brae. From rest the CASE check had passed on the GB10 (0 sweeps off, 2026-10-22)
+# and failed on JUPITER and Arrhenius at the same commit (k 35 against 34, omega 19 against 20 and 15 against 16;
+# job 2671173: 7a82d815, e95ed639, the 18-patch candidate, its device loop alike): after 5 iterations from rest the
+# GB10's brae was k 3.6e-04 from OpenFOAM and JUPITER's 2.5e-02, OpenFOAM byte-identical on both. A PREMISE now
+# asks it of every row: OpenFOAM with every internal value of the row's first field one ulp up at DEV keeps its own
+# counts, or the row's counts are not a fact this oracle holds.
+#
 #   row         fixture        k (or nuTilda)                       epsilon / omega
 #   sst-tol     pitzDailySST   tolerance 1e-6                       tolerance 1e-11             (relTol 0)
 #   sst-tolrev  pitzDailySST   tolerance 1e-11                      tolerance 1e-6
@@ -25,8 +37,9 @@
 #   sa-min      airFoil2D      nuTilda minIter 3 (tolerance 10)
 #
 # CHECKS
+#   PREMISE  OpenFOAM's one-ulp twin at DEV gives OpenFOAM's counts, solve for solve.
 #   CASE     brae in OpenFOAM's order (BRAE_SIMPLE_CASE_SOLVER=1): every solve's sweep count is OpenFOAM's, solve
-#            for solve (MEASURED on the GB10: 0 sweeps off on every such row) -- but on ke-tol, which holds the
+#            for solve (MEASURED from DEV on JUPITER: 0 sweeps off on every SST row) -- but on ke-tol, which holds the
 #            BAND below: brae's epsilon residual is not OpenFOAM's (iteration 1 starts at 0.165439 against
 #            0.163500; brae writes epsilon's wall rows by setValues), so a solve to 1e-11 takes 28-31 sweeps
 #            where OpenFOAM's takes 31-35, under 21d124d6 as under this change.
@@ -50,6 +63,7 @@ BRAE="${BRAE_BIN:-$ROOT/build/brae}"
 V="$ROOT/validation"
 OFBASHRC=${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}
 N=5
+DEV=100                 # OpenFOAM's iteration every row starts from (FROM OPENFOAM'S ITERATION DEV)
 SLACK=${SLACK:-0}       # sweeps a CASE count may differ from OpenFOAM's
 FLOOR=${FLOOR:-1e-3}    # a BAND solve stops above FLOOR x its own entry's figure
 [ -x "$BRAE" ] || { echo "SKIP: no brae at $BRAE"; exit 77; }
@@ -74,23 +88,48 @@ say()
     return 0
 }
 
-# stage <fixture> <dir> <field>=<key>:<value>,... ...
+# develop <fixture>: the fixture as shipped to OpenFOAM's iteration DEV, ascii at 17 digits, in $W/dev-<fixture>
+develop()
+{
+    local fx=$1 d=$W/dev-$1
+    [ -d "$d/$DEV" ] && return 0
+    mkdir -p "$d"
+    cp -r "$V/$fx/constant" "$V/$fx/system" "$V/$fx/0" "$d/"
+    python3 - "$d/system/controlDict" "$DEV" <<'PY'
+import re
+import sys
+
+c, dev = sys.argv[1], sys.argv[2]
+s = open(c).read()
+s = re.sub(r'functions\s*\{.*\n\}', 'functions\n{\n}', s, flags=re.S)
+for k, v in (('startFrom', 'startTime'), ('endTime', dev), ('writeInterval', dev), ('writeControl', 'timeStep'),
+             ('writeFormat', 'ascii'), ('writePrecision', '17'), ('writeCompression', 'off')):
+    s, m = re.subn(r'(?m)^%s\s+\S+;' % k, '%s %s;' % (k.ljust(15), v), s)
+    if m == 0:
+        s = s.rstrip() + '\n%s %s;\n' % (k.ljust(15), v)
+open(c, 'w').write(s)
+PY
+    ( cd "$d" && simpleFoam > log 2>&1 ) && [ -d "$d/$DEV" ]
+}
+
+# stage <fixture> <dir> <field>=<key>:<value>,... ...: from the fixture's iteration DEV, N iterations
 stage()
 {
     local fx=$1 d=$2
     shift 2
     mkdir -p "$d"
-    cp -r "$V/$fx/constant" "$V/$fx/system" "$V/$fx/0" "$d/"
-    python3 - "$d" "$N" "$@" <<'PY'
+    cp -r "$W/dev-$fx/constant" "$W/dev-$fx/system" "$W/dev-$fx/$DEV" "$d/"
+    python3 - "$d" "$N" "$DEV" "$@" <<'PY'
 import re
 import sys
 
-d, n = sys.argv[1], sys.argv[2]
+d, n, dev = sys.argv[1], sys.argv[2], sys.argv[3]
+sys.argv[3:] = sys.argv[4:]
 c = d + '/system/controlDict'
 s = open(c).read()
 s = re.sub(r'functions\s*\{.*\n\}', 'functions\n{\n}', s, flags=re.S)
-for k, v in (('endTime', n), ('writeInterval', n), ('writeControl', 'timeStep'), ('writeFormat', 'ascii'),
-             ('writePrecision', '15'), ('writeCompression', 'off')):
+for k, v in (('startFrom', 'latestTime'), ('endTime', str(int(dev) + int(n))), ('writeInterval', n),
+             ('writeControl', 'timeStep'), ('writeFormat', 'ascii'), ('writePrecision', '15'), ('writeCompression', 'off')):
     s, m = re.subn(r'(?m)^%s\s+\S+;' % k, '%s %s;' % (k.ljust(15), v), s)
     if m == 0:
         s = s.rstrip() + '\n%s %s;\n' % (k.ljust(15), v)
@@ -229,7 +268,7 @@ brae()
     local d=$1 a=$2
     shift 2
     mkdir -p "$d/$a"
-    cp -r "$d/of/constant" "$d/of/system" "$d/of/0" "$d/$a/"
+    cp -r "$d/of/constant" "$d/of/system" "$d/of/$DEV" "$d/$a/"
     ( cd "$d/$a" && env -u BRAE_SIMPLE_CASE_SOLVER -u BRAE_CONTROL_TURB_PAIR_ONE_RULE -u BRAE_CONTROL_SCALAR_FIXED_CAP \
         "$@" "$BRAE" -case . > log 2> err )
     echo $? > "$d/$a/rc"
@@ -240,12 +279,36 @@ for r in "${ROWS[@]}"
 do
     read -r row fx fields specs <<< "$r"
     d="$W/$row"
+    develop "$fx" || { say "PREMISE $row: OpenFOAM ran $fx to its iteration $DEV" FAIL; continue; }
     # shellcheck disable=SC2086
     stage "$fx" "$d/of" $specs
     ( cd "$d/of" && simpleFoam > log 2>&1 )
     [ $? = 0 ] || { say "PREMISE $row: OpenFOAM ran" FAIL; continue; }
     counts "$d/of/log" "$fields" > "$d/of.counts"
     [ "$(wc -l < "$d/of.counts")" -ge "$N" ] || { say "PREMISE $row: OpenFOAM's solves of $fields" FAIL; continue; }
+    # OpenFOAM against itself: every internal value of the row's first field one ulp up at DEV
+    # shellcheck disable=SC2086
+    stage "$fx" "$d/oft" $specs
+    python3 - "$d/oft/$DEV/${fields%%|*}" <<'PY'
+import math
+import re
+import sys
+
+f = sys.argv[1]
+s = open(f).read()
+m = re.search(r'internalField\s+nonuniform\s+List<scalar>\s*\n?(\d+)\s*\n?\(', s)
+if not m:
+    sys.exit('twin: %s holds no ascii nonuniform internalField' % f)
+e = s.index(')', m.end())
+v = [float(x) for x in s[m.end():e].split()]
+if len(v) != int(m.group(1)):
+    sys.exit('twin: %s lists %d of %s values' % (f, len(v), m.group(1)))
+open(f, 'w').write(s[:m.end()] + '\n' + '\n'.join(repr(math.nextafter(x, math.inf)) for x in v) + '\n' + s[e:])
+PY
+    ( cd "$d/oft" && simpleFoam > log 2>&1 ) && counts "$d/oft/log" "$fields" > "$d/oft.counts"
+    m=$(same "$d/of.counts" "$d/oft.counts" 0)
+    [ $? = 0 ] && say "PREMISE $row: OpenFOAM's one-ulp twin at $DEV: $m" ok \
+        || say "PREMISE $row: OpenFOAM's one-ulp twin at $DEV: $m" FAIL
     two=0
     [[ "$fields" == *"|"* ]] && two=1
     capmin=0
