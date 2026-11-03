@@ -550,7 +550,8 @@ void deviceSpalartAllmarasCorrect(
                                // the case's linearUpwind gradient limiter, boundPositive true (nuTilda is
                                // positive-definite), no fvOptions set-values, no limiter override, Jacobi,
                                // the case's own smoothSolver sweep count, and grad(nuTilda)'s limiter for the
-                               // non-orthogonal correction.
+                               // non-orthogonal correction and, since 2026-11-03, limitedLinear's limiter too
+                               // (LimitedScheme.C:56 takes the same grad(nuTilda) entry).
                                gradNuTildaLULimitK, /*boundPositive*/true,
                                /*fvoSetMask*/nullptr, /*fvoSetVal*/nullptr,
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,

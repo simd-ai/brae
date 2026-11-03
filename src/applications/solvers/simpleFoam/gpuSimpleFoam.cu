@@ -417,6 +417,13 @@ int main(int argc, char** argv)
         std::printf("  schemes: bounded(U=%d,k=%d,eps=%d) linearUpwind(U)=%d nonOrth(corrected)=%d nonOrthLimit=%.3g consistent(SIMPLEC)=%d limitedLinear(k=%d,eps=%d) linearUpwind(k=%d,eps=%d)\n",
                     ctl.bounded, ctl.boundedK, ctl.boundedEps, ctl.linearUpwind, ctl.nonOrth, ctl.nonOrthLimit, ctl.consistent, ctl.limitedK, ctl.limitedEps, ctl.luK, ctl.luEps);
         std::printf("  grad(U) cellLimited k=%.3g (0=unlimited)\n", ctl.gradULimitK);
+        // What the turbulence closures take for grad(k|nuTilda) and grad(epsilon|omega), each its own entry, and for
+        // the gradients the two linearUpwind entries name. A gate reads this line to see the entries were read.
+        if (ctl.turbulent)
+            std::printf("  turbulence gradients cellLimited (0=unlimited): grad(%s)=%.3g grad(%s)=%.3g "
+                        "linearUpwind(k|nuTilda)=%.3g linearUpwind(epsilon|omega)=%.3g\n",
+                        ctl.sa ? "nuTilda" : "k", ctl.gradKLimitK, ctl.sst ? "omega" : "epsilon", ctl.gradEpsLimitK,
+                        ctl.gradKLULimitK, ctl.gradEpsLULimitK);
         std::printf("  linear solver (GaussSeidel from fvSolution; else BiCGStab): U=%d k|nuTilda=%d eps|omega=%d\n", ctl.gsU, ctl.gsK, ctl.gsEps);
 
         // mesh + start fields (single GPU: read directly, no decomposition)

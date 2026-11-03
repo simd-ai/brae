@@ -422,6 +422,33 @@ struct ScalarStopRule
 // OpenFOAM stops them at their own entry's maxIter, 1000 by default (lduMatrix.H:125).
 constexpr int kUnreadEntryMaxIter = 3000;
 
+// The cellLimited coefficients (0 = unlimited) of the gradients a two-equation closure takes of its own two scalars,
+// each from its OWN fvSchemes entry. OpenFOAM looks up four: gradSchemes `grad(k)` and `grad(epsilon|omega)`, which
+// kOmegaSST's CDkOmega (kOmegaSSTBase.C:557), the corrected laplacian (correctedSnGrad.C:52-55) and limitedLinear's
+// limiter (LimitedScheme.C:56) take, and the gradient each div entry's linearUpwind NAMES (linearUpwind.C). One
+// scalar used to carry all four, read as the linearUpwind one, so the other three ran unlimited whatever the case
+// said. -1 is UNSET and the closures refuse it: a caller resolves the case's entries or does not call.
+struct TurbScalarGradLimits
+{
+    scalar kField = -1.0;   // gradSchemes grad(k)
+    scalar eField = -1.0;   // gradSchemes grad(epsilon) or grad(omega)
+    scalar kLU    = -1.0;   // the gradient div(phi,k)'s linearUpwind names
+    scalar eLU    = -1.0;   // the gradient div(phi,epsilon|omega)'s linearUpwind names
+};
+
+// BRAE_CONTROL_TURB_GRAD_UNLIMITED, a gate's CONTROL and deliberately wrong: the closures take grad(k) and
+// grad(epsilon|omega) unlimited again, as before 2026-11-03. `cd` reverts CDkOmega alone, `eqn` the two
+// equations' laplacian correction and limitedLinear limiter alone, any other value both. Announced once.
+struct TurbGradControl
+{
+    bool cd  = false;
+    bool eqn = false;
+};
+TurbGradControl turbGradControl();
+
+// Refuses an unset TurbScalarGradLimits, naming the closure that was handed it.
+void requireTurbGradLimits(const TurbScalarGradLimits& g, const char* closure);
+
 // The full device kEpsilon::correct(): production -> wall functions/override -> eps eqn (with the wall
 // setValues constraint) -> k eqn -> correctNut. Updates k/eps/nut in place. Mirrors the CPU correct().
 // kStop and epsStop are k's and epsilon's own entries (ScalarStopRule).
@@ -448,9 +475,9 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
                             const DeviceBuffer<scalar>* nuWallFace = nullptr,  // compressible: nu = mu_b/rho_b per wall face
                             const DeviceBuffer<scalar>* nutBnd = nullptr,      // nut at boundary faces -> patch diffusivity
                             const DeviceBuffer<scalar>* muBnd = nullptr,       // compressible: mu at boundary faces
-                            // OF `grad(k)`/`grad(epsilon)` cellLimited coefficient (0 = unlimited); see the
-                            // kOmegaSST declaration below for why this is distinct from gradULimitK.
-                            scalar gradScalarLimitK = 0.0,
+                            // The case's grad(k)/grad(epsilon) and linearUpwind gradient limits, each its
+                            // own entry; see TurbScalarGradLimits. Distinct from gradULimitK below.
+                            const TurbScalarGradLimits& gradLim = TurbScalarGradLimits{},
                             // OF `grad(U)` cellLimited coefficient. kEpsilon::correct() builds its
                             // production from fvc::grad(U), which resolves that entry; leaving it
                             // unlimited makes the production term too large wherever the limiter bites.
@@ -507,11 +534,10 @@ void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, co
                             const DeviceBuffer<scalar>* rhoBnd = nullptr,   // compressible: rho at boundary faces (volumetric flux for divU)
                             const DeviceBuffer<scalar>* nutBnd = nullptr,   // nut at boundary faces -> patch diffusivity
                             const DeviceBuffer<scalar>* muBnd = nullptr,   // compressible: mu at boundary faces
-                            // OF `grad(k)`/`grad(omega)` cellLimited coefficient (0 = unlimited). Distinct from
-                            // gradULimitK above, which limits grad(U) for the production term; this one limits the
-                            // TRANSPORTED scalar's own gradient, which feeds its limitedLinear weight, its
-                            // linearUpwind correction and the non-orth laplacian correction.
-                            scalar gradScalarLimitK = 0.0,
+                            // The case's grad(k)/grad(omega) and linearUpwind gradient limits, each its own
+                            // entry; see TurbScalarGradLimits. Distinct from gradULimitK above, which limits
+                            // grad(U) for the production term.
+                            const TurbScalarGradLimits& gradLim = TurbScalarGradLimits{},
                             // fvOptions scalarFixedValueConstraint on k / epsilon (OF eqn.setValues).
                             // Applied BEFORE the eps wall function, per kEpsilon.C:266-267.
                             const DeviceBuffer<label>*  fvoKMask = nullptr,
@@ -592,8 +618,9 @@ void deviceSpalartAllmarasCorrect(const DeviceMesh& dm, const DeviceVectorBounda
                                   bool gsSymmetric = true,
                                   // The case's grad(nuTilda) limiters (cellLimited coefficients, 0 = unlimited):
                                   // the one linearUpwind's div entry names, and gradSchemes `grad(nuTilda)` for
-                                  // the non-orthogonal laplacian correction (deviceSolveScalarTransport's
-                                  // gradLimitK and lapGradLimitK). Every caller ran both unlimited before.
+                                  // the non-orthogonal laplacian correction and limitedLinear's limiter
+                                  // (deviceSolveScalarTransport's gradLimitK and fieldGradLimitK). Every caller
+                                  // ran both unlimited before.
                                   scalar gradNuTildaLULimitK = 0.0,
                                   scalar gradNuTildaLapLimitK = 0.0,
                                   // true hands the shared grad(U) memo (deviceGradUShared) back to the pool as soon

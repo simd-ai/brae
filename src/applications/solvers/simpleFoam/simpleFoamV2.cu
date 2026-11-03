@@ -1674,6 +1674,15 @@ int runSimpleFoamV2(const std::string& caseDir)
             // the old cap: a known gap of this driver (kUnreadEntryMaxIter). The legacy driver takes each
             // field's own entry.
             const ScalarStopRule v2PairStop{tolKE, relTolKE, kUnreadEntryMaxIter, 0};
+            // This driver resolves ONE coefficient for grad(k) and grad(epsilon|omega) and refuses a case that limits
+            // them differently (above), so the two field slots are exact. Its linearUpwind takes the same one, as it
+            // did before the closures split the slots: whether that matches the gradient the div entries name is
+            // this driver's own question, not answered here.
+            TurbScalarGradLimits v2GradLim;
+            v2GradLim.kField = gradScalarSchemeLimit;
+            v2GradLim.eField = gradScalarSchemeLimit;
+            v2GradLim.kLU    = gradScalarSchemeLimit;
+            v2GradLim.eLU    = gradScalarSchemeLimit;
             if (saModel)
             {
                 // SpalartAllmarasBase::correct(): chi/fv1/fv2/ft2 -> Stilda -> the nuTilda transport
@@ -1747,7 +1756,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                                        &nb,
                                        /*muBnd*/nullptr,
                                        // `grad(k)`/`grad(omega)`, the transported scalars' own entries.
-                                       gradScalarSchemeLimit,
+                                       v2GradLim,
                                        /*fvoKMask*/nullptr, /*fvoKVal*/nullptr,
                                        /*fvoEMask*/nullptr, /*fvoEVal*/nullptr,
                                        /*lesDelta*/nullptr,
@@ -1792,7 +1801,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                                   // DkEff(patchi)/DepsilonEff(patchi) from nut's OWN boundary.
                                   &nb,
                                   /*muBnd*/nullptr,
-                                  gradScalarSchemeLimit,
+                                  v2GradLim,
                                   // kEpsilon::correct builds GbyNu from fvc::grad(U) (kEpsilon.C:237),
                                   // which resolves the case's `grad(U)` entry. These three arguments
                                   // used to fall through to their defaults, so the limiter never

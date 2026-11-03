@@ -65,6 +65,13 @@ The standard incompressible set: `fixedValue`, `zeroGradient`, `noSlip`, `slip`,
 The vector-limited `limitedLinearV` falls back to its scalar form; `leastSquares` gradient and `cellLimited`-corrected
 combinations are not yet available.
 
+The turbulence scalars' gradients come from each field's own `grad(k)`, `grad(epsilon|omega)` entry, falling back to
+`default` as OpenFOAM's lookup does: kOmegaSST's CDkOmega, the corrected laplacian's non-orthogonal correction and
+limitedLinear's limiter take them, and each `linearUpwind` takes the gradient its own div entry names. A two-equation
+case whose `grad(k)` or `grad(epsilon|omega)` resolves to anything but Gauss linear, optionally `cellLimited` (minmod),
+is refused. Open: CDkOmega's two gradients do not include the coupled faces of a cyclic or AMI patch (the transport
+equations' gradients do); no gated case has both.
+
 ## Physics & function objects
 
 | feature | status |

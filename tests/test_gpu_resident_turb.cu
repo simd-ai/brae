@@ -192,6 +192,12 @@ int main(int argc, char** argv) {
         // correctNut rewrites the wall value at the end of every correct().
         // both fields under one rule, the cap the solves had before each field's own was handed down
         const ScalarStopRule stop{tol, 0.0, kUnreadEntryMaxIter, 0};
+        // The host reference takes every gradient unlimited, and so does this fixture's fvSchemes.
+        TurbScalarGradLimits unlimited;
+        unlimited.kField = 0.0;
+        unlimited.eField = 0.0;
+        unlimited.kLU    = 0.0;
+        unlimited.eLU    = 0.0;
         deviceKEpsilonCorrect(dm, wall, dbEps, dbK, dbU, Uk[0], Uk[1], Uk[2], dk, de, dnut, phiInt, phiBnd,
                               nu, relaxEps, relaxK, stop, stop,
                               /*bounded*/false, /*boundedEps*/false,
@@ -202,7 +208,7 @@ int main(int argc, char** argv) {
                               /*nutWall*/0, /*atmZ0*/0.0, /*atmBoundNut*/true,
                               /*kDdt*/{}, /*eDdt*/{},
                               /*rho*/nullptr, /*muLam*/nullptr, /*rhoBnd*/nullptr, /*nuWallFace*/nullptr,
-                              &dNutB);
+                              &dNutB, /*muBnd*/nullptr, unlimited);
     }
 
     const std::vector<scalar> uxg=Uk[0].host(), uyg=Uk[1].host(), pg=dp.host(), kg=dk.host(), eg=de.host();

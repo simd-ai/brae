@@ -323,11 +323,12 @@ void deviceSolveScalarTransport(
     bool gsSymmetric = true,
     // OpenFOAM's lower bound for THIS field, used by the clamp AND by Foam::bound's message.
     scalar boundFloor = 1e-15,
-    // The cellLimited coefficient of gradSchemes `grad(<field>)`, which the non-orthogonal laplacian correction
-    // takes: OpenFOAM's correctedSnGrad builds it from mesh.gradScheme("grad(" + vf.name() + ')')
-    // (correctedSnGrad.C:52-55), the field's OWN entry, falling back to `default` only when there is none.
-    // 0 = unlimited, what every caller passed before. Trailing, so every existing call is unchanged.
-    scalar lapGradLimitK = 0.0,
+    // The cellLimited coefficient of gradSchemes `grad(<field>)`, the field's OWN entry, falling back to `default`
+    // only when there is none. Two consumers take it: the non-orthogonal laplacian correction (correctedSnGrad.C:
+    // 52-55, mesh.gradScheme("grad(" + vf.name() + ')')) and limitedLinear's limiter (LimitedScheme.C:56,
+    // fvc::grad(lPhi), and lPhi is the field itself for a scalar). The limiter took the plain Gauss gradient here
+    // whatever the entry said. 0 = unlimited. Trailing, so every existing call is unchanged.
+    scalar fieldGradLimitK = 0.0,
     // The field's patch values as OpenFOAM's gradient reads them, when they are not this equation's own evaluate:
     // null is deviceBCValue. Trailing, so every existing call is unchanged. See deviceKOmegaSSTCorrect's obv.
     const DeviceBuffer<scalar>* storedBnd = nullptr)
@@ -336,22 +337,21 @@ void deviceSolveScalarTransport(
     DeviceBuffer<scalar> Df;
     deviceInterpolate(dm, D, Df);
     DeviceBuffer<scalar> aD, aU, aL, lD, lU, lL, luCorr, lapCorr;   // luCorr/lapCorr = linearUpwind / non-orth deferred sources (empty otherwise)
-    DeviceBuffer<scalar> gx, gy, gz;         // gradSchemes `default`: limitedLinear's limiter + non-orth
+    DeviceBuffer<scalar> gx, gy, gz;         // plain Gauss linear
     DeviceBuffer<scalar> lgx, lgy, lgz;      // the gradient linearUpwind NAMES (limited when that name is cellLimited)
     // ONE GRADIENT CANNOT SERVE ALL THREE. linearUpwind takes the gradient its div entry NAMES
-    // (linearUpwind.C: mesh.gradScheme(gradSchemeName_)); the non-orthogonal laplacian correction takes
-    // `grad(<field>)` (correctedSnGrad.C:52-55, lapGradLimitK below) and limitedLinear's limiter `default`,
-    // so on squareBendLiq -- linearUpwind naming a limited scheme, no grad(k) entry -- the other two are
-    // plain Gauss linear. Limiting
+    // (linearUpwind.C: mesh.gradScheme(gradSchemeName_)); the non-orthogonal laplacian correction and
+    // limitedLinear's limiter take `grad(<field>)` (fieldGradLimitK below), so on squareBendLiq --
+    // linearUpwind naming a limited scheme, no grad(k) entry -- those two are plain Gauss linear. Limiting
     // the shared buffer in place therefore over-limited the other two -- measured on squareBendLiq as a
     // transient nut excursion to 1.5e+01 against OF's 1.4e-03.
     const bool limitLU = (gradLimitK > 0.0) && linearUpwind;
-    // ...and the laplacian's correction takes `grad(<field>)`, which a case can limit as well (the boxy5 UAV:
-    // `grad(nuTilda) cellLimited Gauss linear 1`, also what its linearUpwind names). The same limited buffer
-    // when the two coefficients agree, a separate one when they do not.
-    const bool limitLap = (lapGradLimitK > 0.0) && nonOrth;
-    const bool lapSharesLU = limitLap && limitLU && lapGradLimitK == gradLimitK;
-    DeviceBuffer<scalar> ngx, ngy, ngz;      // the laplacian correction's gradient, when it is limited apart
+    // ...and `grad(<field>)` itself, which a case can limit as well (the boxy5 UAV: `grad(nuTilda) cellLimited
+    // Gauss linear 1`, also what its linearUpwind names). The same limited buffer when the two coefficients
+    // agree, a separate one when they do not.
+    const bool limitField = (fieldGradLimitK > 0.0) && (nonOrth || limited);
+    const bool fieldSharesLU = limitField && limitLU && fieldGradLimitK == gradLimitK;
+    DeviceBuffer<scalar> ngx, ngy, ngz;      // grad(<field>), when it is limited apart
     if (limited || linearUpwind || nonOrth)
     {
         DeviceBuffer<scalar> bv;
@@ -389,7 +389,7 @@ void deviceSolveScalarTransport(
             }
             deviceCellLimitGrad(dm, field, bv, lgx, lgy, lgz, gradLimitK, ifs, nIfs);
         }
-        if (limitLap && !lapSharesLU)
+        if (limitField && !fieldSharesLU)
         {
             deviceCopy(ngx, gx); deviceCopy(ngy, gy); deviceCopy(ngz, gz);
             CellLimitInterface ifs[2];
@@ -407,20 +407,20 @@ void deviceSolveScalarTransport(
                 ifs[nIfs++] = { ami->n, ami->ownCell.data(), amiNbr.data(),
                                 ami->dOwnX.data(), ami->dOwnY.data(), ami->dOwnZ.data() };
             }
-            deviceCellLimitGrad(dm, field, bv, ngx, ngy, ngz, lapGradLimitK, ifs, nIfs);
+            deviceCellLimitGrad(dm, field, bv, ngx, ngy, ngz, fieldGradLimitK, ifs, nIfs);
         }
     }
-    const DeviceBuffer<scalar>& lapGx = !limitLap ? gx : (lapSharesLU ? lgx : ngx);
-    const DeviceBuffer<scalar>& lapGy = !limitLap ? gy : (lapSharesLU ? lgy : ngy);
-    const DeviceBuffer<scalar>& lapGz = !limitLap ? gz : (lapSharesLU ? lgz : ngz);
+    const DeviceBuffer<scalar>& fieldGx = !limitField ? gx : (fieldSharesLU ? lgx : ngx);
+    const DeviceBuffer<scalar>& fieldGy = !limitField ? gy : (fieldSharesLU ? lgy : ngy);
+    const DeviceBuffer<scalar>& fieldGz = !limitField ? gz : (fieldSharesLU ? lgz : ngz);
     const bool sharedLim = limField && limGradX && limGradY && limGradZ;
     if (limited)
     {
         deviceDivLimitedCoeffs(dm, phiInt,
                                sharedLim ? *limField  : field,
-                               sharedLim ? *limGradX  : gx,
-                               sharedLim ? *limGradY  : gy,
-                               sharedLim ? *limGradZ  : gz,
+                               sharedLim ? *limGradX  : fieldGx,
+                               sharedLim ? *limGradY  : fieldGy,
+                               sharedLim ? *limGradZ  : fieldGz,
                                twoByk, aD, aU, aL);   // Gauss limitedLinear/vanAlbada: implicit limited weight
     }
     else
@@ -446,12 +446,12 @@ void deviceSolveScalarTransport(
     deviceAxpy(-1.0, lD, aD); deviceAxpy(-1.0, lU, aU); deviceAxpy(-1.0, lL, aL);
     if (nonOrth)
     {
-        deviceLaplacianCorr(dm, Df, lapGx, lapGy, lapGz, lapCorr);
+        deviceLaplacianCorr(dm, Df, fieldGx, fieldGy, fieldGz, lapCorr);
         // The interface's own non-orthogonal correction. An AMI face is non-conformal by construction, so
         // its corrVec is NOT small even on a mesh that is orthogonal everywhere else -- the one place a
         // "corrected" laplacian actually has work to do on this fixture.
-        if (cyc && cyc->n > 0) interfaceAddLapCorr(*cyc, D, lapGx, lapGy, lapGz, lapCorr);
-        if (ami && ami->n > 0) interfaceAddLapCorr(*ami, D, lapGx, lapGy, lapGz, lapCorr);
+        if (cyc && cyc->n > 0) interfaceAddLapCorr(*cyc, D, fieldGx, fieldGy, fieldGz, lapCorr);
+        if (ami && ami->n > 0) interfaceAddLapCorr(*ami, D, fieldGx, fieldGy, fieldGz, lapCorr);
     }
     if (bounded) { DeviceBuffer<scalar> bt; deviceHadamard(bt, divU, dm.V); deviceAxpy(-1.0, bt, aD); }   // -Sp(div(phi),f)
     DeviceBuffer<scalar> src(static_cast<std::size_t>(nC));

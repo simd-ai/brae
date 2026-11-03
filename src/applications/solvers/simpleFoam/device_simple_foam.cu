@@ -1217,6 +1217,15 @@ bool simpleColourSwapControl()
             const ScalarDdt sDdt{ ddtc, &e2Old_, e2Old2_.size() ? &e2Old2_ : nullptr, ddtc.cn ? &e2ddt0_ : nullptr };
             const ScalarDdt reDdt{ ddtc, &ReThetatOld_, ReThetatOld2_.size() ? &ReThetatOld2_ : nullptr, ddtc.cn ? &ReThetatddt0_ : nullptr };   // kOmegaSSTLM
             const ScalarDdt giDdt{ ddtc, &gammaIntOld_, gammaIntOld2_.size() ? &gammaIntOld2_ : nullptr, ddtc.cn ? &gammaIntddt0_ : nullptr };
+            // The two-equation closures' gradients, each from its own fvSchemes entry (scheme_parse.cuh). A grad(k) or
+            // grad(epsilon|omega) these closures do not compute is refused here, where the gradient is taken.
+            if (!ctl_.sa && !ctl_.gradTurbUncomputed.empty())
+                throw std::runtime_error("brae: " + ctl_.gradTurbUncomputed);
+            TurbScalarGradLimits turbGradLim;
+            turbGradLim.kField = ctl_.gradKLimitK;
+            turbGradLim.eField = ctl_.gradEpsLimitK;
+            turbGradLim.kLU    = ctl_.gradKLULimitK;
+            turbGradLim.eLU    = ctl_.gradEpsLULimitK;
             if (ctl_.sa)    // one-equation: dk_ slot holds nuTilda; relaxK/limitedK/twoBykK carry the nuTilda settings
                 deviceSpalartAllmarasCorrect(dm, dbU_, dbK_, Uk_[0], Uk_[1], Uk_[2], dk_, dnut_, y_, phiInt_, phiBnd_,
                                              ctl_.nu, ctl_.kRelax(), kStopRule(ctl_), ctl_.boundedK, ctl_.limitedK, ctl_.twoBykK,
@@ -1252,10 +1261,10 @@ bool simpleColourSwapControl()
                                        // (3.1e-5 -> 3.2e-3). Enabled only now that nut_b is evaluated.
                                        nutBndAll_.size() ? &nutBndAll_ : nullptr,
                                        compressible_ ? &muBnd_ : nullptr,
-                                       ctl_.gradKLULimitK,   // linearUpwind's named grad(k|eps), not gradSchemes grad(k)
+                                       turbGradLim,   // grad(k), grad(omega) and each linearUpwind's named gradient
                                        // fvOptions scalarFixedValueConstraint (k / omega)
                                        fixScaK_ ? &fixScaMask_ : nullptr, fixScaK_ ? &fixScaKVal_ : nullptr,
-                                       fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr,   // grad(k)/grad(omega) cellLimited (C2)
+                                       fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr,
                                        &lesDelta_,   // the case's `delta` for the DDES length scale (empty -> cubeRootVol)
                                        /*nSweeps*/1, ctl_.gsKESym);   // ...and WHICH GaussSeidel the case named
                 if (ctl_.lm)   // Langtry-Menter: transport ReThetat + gammaInt, update gammaIntEff for next iter
@@ -1284,7 +1293,7 @@ bool simpleColourSwapControl()
                                       (compressible_ && wfNu_.size()) ? &wfNu_ : nullptr,   // nu at wall faces (OF nu(patchi))
                                       nutBndAll_.size() ? &nutBndAll_ : nullptr,   // nut_b -> DkEff/DepsEff(patchi)
                                       compressible_ ? &muBnd_ : nullptr,
-                                      ctl_.gradKLULimitK,   // linearUpwind's named grad(k|eps)
+                                      turbGradLim,          // grad(k), grad(epsilon) and each linearUpwind's named gradient
                                       ctl_.gradULimitK,     // kEpsilon::correct()'s own fvc::grad(U) -> gradSchemes grad(U)
                                       // fvOptions scalarFixedValueConstraint (OF eqn.setValues per field)
                                       fixScaK_ ? &fixScaMask_ : nullptr, fixScaK_ ? &fixScaKVal_ : nullptr,

@@ -1108,6 +1108,32 @@ static void scaleDEffCompressibleKE(
     deviceAxpy(1.0, muLam, D);
 }
 
+TurbGradControl turbGradControl()
+{
+    static const TurbGradControl c = []()
+    {
+        TurbGradControl t;
+        const char* e = std::getenv("BRAE_CONTROL_TURB_GRAD_UNLIMITED");
+        if (!e || !*e) return t;
+        const std::string v(e);
+        t.cd  = (v != "eqn");
+        t.eqn = (v != "cd");
+        std::fprintf(stderr, "brae CONTROL: BRAE_CONTROL_TURB_GRAD_UNLIMITED=%s -- the legacy closures take grad(k) and "
+                     "grad(epsilon|omega) unlimited in%s%s, whatever the case's gradSchemes say\n",
+                     e, t.cd ? " CDkOmega" : "", t.eqn ? " the laplacian correction and limitedLinear's limiter" : "");
+        return t;
+    }();
+    return c;
+}
+
+void requireTurbGradLimits(const TurbScalarGradLimits& g, const char* closure)
+{
+    if (g.kField < 0.0 || g.eField < 0.0 || g.kLU < 0.0 || g.eLU < 0.0)
+        throw std::runtime_error(std::string("brae: ") + closure + " was handed an unset TurbScalarGradLimits. The "
+                                 "caller resolves the case's grad(k), grad(epsilon|omega) and linearUpwind gradient "
+                                 "entries; a default here would run them unlimited under the case's name.");
+}
+
 void deviceKEpsilonCorrect(
     const DeviceMesh& dm,
     const DeviceWallData& wall,
@@ -1153,7 +1179,7 @@ void deviceKEpsilonCorrect(
     const DeviceBuffer<scalar>* nuWallFace,   // compressible: nu = mu_b/rho_b per WALL face (OF nu(patchi))
     const DeviceBuffer<scalar>* nutBnd,       // nut at boundary FACES -> DkEff/DepsEff(patchi), as OF's laplacian uses
     const DeviceBuffer<scalar>* muBnd,
-    scalar gradScalarLimitK,
+    const TurbScalarGradLimits& gradLim,
     scalar gradULimitK,
                             const DeviceBuffer<label>*  fvoKMask,
                             const DeviceBuffer<scalar>* fvoKVal,
@@ -1162,6 +1188,11 @@ void deviceKEpsilonCorrect(
                             int nSweeps,                              // solvers/<field>/nSweeps; see the declaration
                             bool gsSymmetric)
 {
+    requireTurbGradLimits(gradLim, "deviceKEpsilonCorrect");
+    // grad(k) and grad(epsilon) as the two equations take them: the corrected laplacian's non-orthogonal
+    // correction and limitedLinear's limiter (deviceSolveScalarTransport's fieldGradLimitK). Both ran unlimited.
+    const scalar kEqnGradLimit = turbGradControl().eqn ? scalar(0) : gradLim.kField;
+    const scalar eEqnGradLimit = turbGradControl().eqn ? scalar(0) : gradLim.eField;
     const int nC = dm.nCells;
     // production + divU, wall functions + near-wall override.
     DeviceBuffer<scalar> gByNu, rCmu, magS;
@@ -1295,13 +1326,13 @@ void deviceKEpsilonCorrect(
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){
                                    if (co.realizable) deviceEpsReactionRealizable(dm, eps, k, magS, nu, co.C2, diag, src);
                                    else               deviceEpsReaction(dm, eps, k, gByNu, divU, diag, src, co, rho); },
-                               &wall, &eps0, ami, cyc, eDdt, DepsB.size() ? &DepsB : nullptr, gradScalarLimitK,
+                               &wall, &eps0, ami, cyc, eDdt, DepsB.size() ? &DepsB : nullptr, gradLim.eLU,
                                true, fvoEMask, fvoEVal,
                                // limField/limGrad* null (a scalar builds its own limiter), precon null
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/co.epsilonMin, /*lapGradLimitK*/scalar(0.0), gradLive ? nullptr : &ebv);
+                               /*boundFloor*/co.epsilonMin, eEqnGradLimit, gradLive ? nullptr : &ebv);
 
     // k equation (loose solve)
     DeviceBuffer<scalar> Dk(static_cast<std::size_t>(nC));
@@ -1310,13 +1341,13 @@ void deviceKEpsilonCorrect(
     deviceSolveScalarTransport(dm, dbK, k, "k", Dk, phiInt, phiBnd, divPhi, bounded, limitedK, linearUpwindK, nonOrth, twoBykK,
                                relaxK, kStop, keCheckEvery, gsK,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceKReaction(dm, k, eps, G, divU, diag, src, rho); },
-                               nullptr, nullptr, ami, cyc, kDdt, DkB.size() ? &DkB : nullptr, gradScalarLimitK,
+                               nullptr, nullptr, ami, cyc, kDdt, DkB.size() ? &DkB : nullptr, gradLim.kLU,
                                true, fvoKMask, fvoKVal,
                                // limField/limGrad* null (a scalar builds its own limiter), precon null
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/co.kMin);
+                               /*boundFloor*/co.kMin, kEqnGradLimit);
 
     // correctNut (cell): nut = Cmu k^2 / eps (realizableKE: rCmu k^2 / eps with the variable Cmu).
     if (co.realizable) deviceRealizableNut(rCmu, k, eps, nut);

@@ -1630,6 +1630,16 @@ set_tests_properties(simple_linearupwind_turbulence_vs_openfoam PROPERTIES SKIP_
 add_test(NAME motorbike_tight_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/motorbike_tight_vs_openfoam.sh)
 set_tests_properties(motorbike_tight_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 3600)
+# grad(k) and grad(omega) each take the case's own gradSchemes entry, named-then-default, in the legacy kOmegaSST's
+# CDkOmega, laplacian correction and limitedLinear limiter: five arms (plain, limited, split, widened, default) against
+# OpenFOAM's own intermediates, 2-D pitzDailySST restarted and 3-D motorBike cold. Controls: the limiter ignored
+# (all, CDkOmega alone, the equations alone) and omega on k's entry, each red.
+add_test(NAME simple_turb_gradlimit_2d_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_turb_gradlimit_vs_openfoam.sh 2d)
+set_tests_properties(simple_turb_gradlimit_2d_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+add_test(NAME simple_turb_gradlimit_3d_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_turb_gradlimit_vs_openfoam.sh 3d)
+set_tests_properties(simple_turb_gradlimit_3d_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 5400)
 add_test(NAME limitedlinear_robustness_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/limitedlinear_robustness_vs_openfoam.sh)
 set_tests_properties(limitedlinear_robustness_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)

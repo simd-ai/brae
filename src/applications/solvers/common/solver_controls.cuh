@@ -386,8 +386,20 @@ struct DeviceSimpleControls
     bool   gnPowerLaw = false;
     scalar gnNuMin = 0.0, gnNuMax = 0.0, gnN = 1.0;
     scalar gradULULimitK = 0.0;                    // linearUpwind's own grad(U)
-    scalar gradKLULimitK = 0.0;                    // linearUpwind's own grad(k)/grad(epsilon)
-    scalar gradKLimitK = 0.0;                      // grad(k) / grad(omega) / grad(epsilon) / grad(nuTilda)
+    // ONE ENTRY, ONE FIELD. The four turbulence slots below were two until 2026-11-03: gradKLimitK took
+    // whichever of grad(k), grad(omega), grad(epsilon), grad(nuTilda) came last, plus the gradient
+    // div(phi,omega)'s linearUpwind names, and gradKLULimitK served the linearUpwind of both scalars.
+    // The legacy closures read neither for CDkOmega or the laplacian correction, so a cellLimited
+    // grad(k)/grad(omega) changed nothing: on the coarse motorBike, cold and tight, brae's fields were
+    // bit-identical with and without it while OpenFOAM's omega moved 3.4e-02 (Arrhenius job 4860833).
+    scalar gradKLULimitK = 0.0;                    // the gradient div(phi,k|nuTilda)'s linearUpwind names
+    scalar gradEpsLULimitK = 0.0;                  // the gradient div(phi,epsilon|omega)'s linearUpwind names
+    scalar gradKLimitK = 0.0;                      // gradSchemes grad(k), grad(nuTilda) under SA; named-then-default
+    scalar gradEpsLimitK = 0.0;                    // gradSchemes grad(epsilon|omega); named-then-default
+    // Non-empty when grad(k) or grad(epsilon|omega) resolves to a scheme the legacy closures do not compute
+    // (leastSquares, cellMDLimited, faceLimited, ...). The legacy driver refuses on it where the gradient is
+    // taken; the OF-mirror closures resolve their own and compute leastSquares, so the parser only records it.
+    std::string gradTurbUncomputed;
     scalar gradHeLimitK = 0.0;                     // grad(h) / grad(e)
     // The cellLimited coefficient of the gradient the KINETIC term's linearUpwind uses. Separate from
     // gradHeLimitK because fvSchemes gives div(phi,K|Ekp) its own entry, which may name a different

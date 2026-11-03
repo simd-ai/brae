@@ -381,8 +381,9 @@ StepInput buildStepInput(
         // before relax() read 1.56e-04 off OpenFOAM's in 144 cells at the non-orthogonal block
         // junction, while the convection term itself was exact to 5.6e-15 -- and epsilon 2.6e-06 after
         // the solve. It also reads only explicit grad(k)/grad(epsilon) lines, so a cellLimited
-        // `default` never reached the closures at all. The shared parser serves the incompressible
-        // drivers too and is left as it is; the mirror resolves its own.
+        // `default` never reached the closures at all. The mirror resolves its own. (The shared parser
+        // was split on 2026-11-03: gradKLimitK is grad(k) alone, named-then-default, and the line marked
+        // EXPERIMENT is gone; the mirror keeps its own resolution, which also computes leastSquares.)
         {
             const FieldGradScheme gK = parseFieldGradScheme(caseDir, "k");
             const FieldGradScheme gS = parseFieldGradScheme(caseDir, secondT);

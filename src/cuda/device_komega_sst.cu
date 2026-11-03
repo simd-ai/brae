@@ -1039,7 +1039,7 @@ void deviceKOmegaSSTCorrect(
     const DeviceBuffer<scalar>* rhoBnd,    // compressible: rho at boundary faces, for the volumetric flux
     const DeviceBuffer<scalar>* nutBnd,    // nut at boundary FACES -> DkEff/DomegaEff(patchi), as OF's laplacian uses
     const DeviceBuffer<scalar>* muBnd,
-    scalar gradScalarLimitK,
+    const TurbScalarGradLimits& gradLim,
     const DeviceBuffer<label>*  fvoKMask,
     const DeviceBuffer<scalar>* fvoKVal,
     const DeviceBuffer<label>*  fvoEMask,
@@ -1048,6 +1048,7 @@ void deviceKOmegaSSTCorrect(
     int nSweeps,                             // solvers/<field>/nSweeps; see the declaration
     bool gsSymmetric)
 {
+    requireTurbGradLimits(gradLim, "deviceKOmegaSSTCorrect");
     const int nC = dm.nCells;
     // production (raw GbyNu0) + G = nut*GbyNu0, divU, S2 (shared gradU = OF tgradU = grad(U) scheme).
     DeviceBuffer<scalar> gradU;
@@ -1114,16 +1115,35 @@ void deviceKOmegaSSTCorrect(
                                           wall.wallW.size() ? wall.wallW.data() : nullptr);
 
     // CDkOmega from grad(k), grad(omega); F1, F2.
+    //
+    // EACH GRADIENT THROUGH ITS OWN gradSchemes ENTRY: CDkOmega is (2*alphaOmega2)*(fvc::grad(k_) & fvc::grad(omega_))/omega_
+    // (kOmegaSSTBase.C:557) and fvc::grad resolves grad(k) and grad(omega) by name, falling back to `default`. These were plain
+    // Gauss linear whatever the case said. MEASURED on the coarse motorBike, cold, every solve tight (Arrhenius job 4860833):
+    // with `grad(k) cellLimited Gauss linear 1; grad(omega) cellLimited Gauss linear 1;` brae's fields were bit-identical to
+    // the case without them, while OpenFOAM's omega moved 3.4e-02 and k 6.1e-03 at iteration 1; without the entries the two
+    // codes agree to 1.9e-13. cellLimitedGrad then evaluates the gradient's patch values from the LIMITED cell gradient
+    // (cellLimitedGrad.C, correctBoundaryConditions after limitGradient), which is what F1's patch half reads below.
+    // The coupled faces of a cyclic or AMI are in neither the sum nor the limiter's range here, as before: an open gap of
+    // its own, recorded in docs/solvers/simplefoam.md, not part of this change.
+    const scalar kCdLimit = turbGradControl().cd ? scalar(0) : gradLim.kField;
+    const scalar oCdLimit = turbGradControl().cd ? scalar(0) : gradLim.eField;
     DeviceBuffer<scalar> kbv;
     deviceBCValue(dbK, k, kbv);
     DeviceBuffer<scalar> kgx, kgy, kgz;
     deviceGaussGrad(dm, k, kbv, kgx, kgy, kgz);
+    if (kCdLimit > scalar(0)) deviceCellLimitGrad(dm, k, kbv, kgx, kgy, kgz, kCdLimit, nullptr, 0);
     DeviceBuffer<scalar> obv;
     deviceBCValue(dbOmega, omega, obv);
     static const bool omegaLive = std::getenv("BRAE_CONTROL_SST_OMEGA_LIVE") != nullptr;
     if (!omegaLive) deviceBCKeepStored(dbOmega, obvStored, obv);
     DeviceBuffer<scalar> ogx, ogy, ogz;
     deviceGaussGrad(dm, omega, obv, ogx, ogy, ogz);
+    if (oCdLimit > scalar(0)) deviceCellLimitGrad(dm, omega, obv, ogx, ogy, ogz, oCdLimit, nullptr, 0);
+    if (stageDumpActive() && stageDumpFirstOnly("sstGradKOmega"))
+    {
+        stageDump3("stage_sstGradKfield", kgx, kgy, kgz);
+        stageDump3("stage_sstGradOmega", ogx, ogy, ogz);
+    }
     DeviceBuffer<scalar> CD;
     deviceCDkOmega(kgx, kgy, kgz, ogx, ogy, ogz, omega, co.alphaOmega2, CD);
     DeviceBuffer<scalar> F1;
@@ -1204,16 +1224,21 @@ void deviceKOmegaSSTCorrect(
     const bool luStored = !gradLive && !omegaLive;
     // omega's own equation sets what it can reach: solvers/common/solution_health.cuh.
     secondFieldLimit().limit = std::max(deviceFixedFaceMax(dbOmega, obv), std::sqrt(std::max(co.gamma1 / co.beta1, co.gamma2 / co.beta2) * deviceFieldMax(S2)));
+    // grad(k) and grad(omega) as the two equations take them: the corrected laplacian's non-orthogonal correction
+    // (correctedSnGrad.C:52-55) and limitedLinear's limiter (LimitedScheme.C:56). Both ran unlimited; the linearUpwind
+    // each div entry names is its own slot, and omega's used to be k's.
+    const scalar kEqnGradLimit = turbGradControl().eqn ? scalar(0) : gradLim.kField;
+    const scalar oEqnGradLimit = turbGradControl().eqn ? scalar(0) : gradLim.eField;
     deviceSolveScalarTransport(dm, dbOmega, omega, "omega", DomegaEff, phiInt, phiBnd, divPhi, boundedEps, limitedOmega, linearUpwindOmega, nonOrth, twoBykOmega,
                                relaxOmega, omegaStop, keCheckEvery, gsEps,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceOmegaReaction(dm.V, gamma, beta, GbyNu0lim, F1, CD, omega, divU, diag, src, rho); },
-                               &wall, &omega0, ami, cyc, sDdt, DomB.size() ? &DomB : nullptr, gradScalarLimitK,
+                               &wall, &omega0, ami, cyc, sDdt, DomB.size() ? &DomB : nullptr, gradLim.eLU,
                                true, fvoEMask, fvoEVal,
                                // limField/limGrad* null (a scalar builds its own limiter), precon null
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/co.omegaMin, /*lapGradLimitK*/scalar(0.0), luStored ? &obv : nullptr);
+                               /*boundFloor*/co.omegaMin, oEqnGradLimit, luStored ? &obv : nullptr);
 
     // deviceSolveScalarTransport just bound omega, as it binds every transported field here: a second bound would find
     // nothing below the floor and forget bound.C:59's patch half (deviceBoundCap).
@@ -1225,13 +1250,13 @@ void deviceKOmegaSSTCorrect(
     deviceSolveScalarTransport(dm, dbK, k, "k", DkEff, phiInt, phiBnd, divPhi, bounded, limitedK, linearUpwindK, nonOrth, twoBykK,
                                relaxK, kStop, keCheckEvery, gsK,
                                [&](DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& src){ deviceKReactionSST(dm.V, k, omega, G, divU, co, diag, src, gammaIntEff, des ? &FDES : nullptr, rho); },
-                               nullptr, nullptr, ami, cyc, kDdt, DkB.size() ? &DkB : nullptr, gradScalarLimitK,
+                               nullptr, nullptr, ami, cyc, kDdt, DkB.size() ? &DkB : nullptr, gradLim.kLU,
                                true, fvoKMask, fvoKVal,
                                // limField/limGrad* null (a scalar builds its own limiter), precon null
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/co.kMin);
+                               /*boundFloor*/co.kMin, kEqnGradLimit);
 
     // correctNut (Bradshaw): nut = a1*k / max(a1*omega, b1*F2*sqrt(S2)).
     //

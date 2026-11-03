@@ -654,6 +654,26 @@ inline std::string rasSecondField(const std::string& caseDir)
     return "";
 }
 
+// The transported turbulence scalars whose gradients the legacy closures take, as {first, second}: {"k", "omega"},
+// {"k", "epsilon"}, {"nuTilda", ""} for the SpalartAllmaras family (RAS or LES), {"", ""} for anything else. Not
+// rasSecondField: that one answers a div-entry question and a gate's control blanks it on purpose.
+inline std::pair<std::string, std::string> turbulenceGradFields(const std::string& caseDir)
+{
+    std::ifstream exists(caseDir + "/constant/turbulenceProperties");
+    if (!exists) return {};
+    const FoamDict turb = readDict(caseDir + "/constant/turbulenceProperties");
+    const std::string sim = turb.wordOr("simulationType", "");
+    if (sim != "RAS" && sim != "LES") return {};
+    const FoamDict* sub = turb.subDict(sim);
+    if (!sub) return {};
+    const std::string model = sub->wordOr("model", sub->wordOr(sim + "Model", ""));
+    if (model.find("SpalartAllmaras") != std::string::npos) return {"nuTilda", ""};
+    if (sim != "RAS") return {};
+    if (model.find("kOmega") != std::string::npos) return {"k", "omega"};
+    if (model.find("Epsilon") != std::string::npos || model.find("KE") != std::string::npos) return {"k", "epsilon"};
+    return {};
+}
+
 inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleControls& ctl)
 {
     // Refuse an unimplemented wall-distance method here, where every solver already passes.
@@ -975,17 +995,14 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                     scalar kc;
                     if (std::sscanf(s, "%lf", &kc) == 1) ctl.gradULimitK = kc;
                 }
-                // C2: the same cellLimited rule for the TURBULENCE and ENERGY gradients. Previously only
-                // grad(U) was scanned, so `grad(k) cellLimited Gauss linear 1` was read and discarded.
+                // C2: the same cellLimited rule for the ENERGY gradients. Previously only grad(U) was
+                // scanned. The turbulence scalars are resolved after this loop, each by its own name.
                 if (inGrad && hasWord(ln, "cellLimited"))
                 {
                     scalar kc = 1.0;
                     const char* c = ln.c_str() + ln.find("cellLimited") + 11;
                     while (*c && !(std::isdigit((unsigned char)*c) || *c == '.')) ++c;
                     if (std::sscanf(c, "%lf", &kc) != 1) kc = 1.0;
-                    if (ln.find("grad(k)") != std::string::npos || ln.find("grad(omega)") != std::string::npos
-                     || ln.find("grad(epsilon)") != std::string::npos || ln.find("grad(nuTilda)") != std::string::npos)
-                        ctl.gradKLimitK = kc;
                     if (ln.find("grad(h)") != std::string::npos || ln.find("grad(e)") != std::string::npos)
                         ctl.gradHeLimitK = kc;
                 }
@@ -1013,7 +1030,9 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                     if (t > 0.0) { ctl.limitedEps = true; ctl.twoBykEps = t; }   // 2nd turb scalar (eps|omega)
                     if (ln.find("linearUpwind") != std::string::npos) ctl.luEps = true;
                     if (hasWord(ln, "bounded")) ctl.boundedEps = true;
-                    { const scalar g = luGradLimit(ln); if (g >= 0.0) ctl.gradKLimitK = g; }   // EXPERIMENT
+                    // the gradient THIS entry's linearUpwind names. It went into gradKLimitK, the gradSchemes
+                    // slot, under a comment that said EXPERIMENT, and omega's linearUpwind took k's.
+                    { const scalar g = luGradLimit(ln); if (g >= 0.0) ctl.gradEpsLULimitK = g; }
                 }
                 // Energy: OF names the field "h" for sensibleEnthalpy and "e" for sensibleInternalEnergy,
                 // and the kinetic term "K" or "Ekp" to match. Any of them sets the same flags.
@@ -1101,6 +1120,54 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                     readSnGrad(ln, ctl.snGradCorrected, ctl.snGradLimit, ctl.snGradNonOrthCoeffs);
                 }
             }
+            // grad(k) and grad(epsilon|omega), grad(nuTilda) under SpalartAllmaras: EACH FIELD'S OWN gradSchemes
+            // entry, named-then-default (fvcGrad.C:143-149, schemesLookupDetail.C:76-88). OpenFOAM takes them in
+            // three places: kOmegaSST's CDkOmega (kOmegaSSTBase.C:557, fvc::grad), the corrected laplacian's
+            // non-orthogonal correction (correctedSnGrad.C:52-55) and limitedLinear's limiter (LimitedScheme.C:56,
+            // fvc::grad of the field itself for a scalar). Looked up only where one of them is taken, as OpenFOAM
+            // does. A cellLimited `default` with no named entry used to reach no closure at all.
+            {
+                const auto tf = turbulenceGradFields(caseDir);
+                const bool sstFamily = (tf.second == "omega");
+                const bool saFamily  = (tf.first == "nuTilda");
+                // SpalartAllmaras's Cb2 term takes fvc::grad(nuTilda) every iteration.
+                const bool usedFirst  = !tf.first.empty() && (sstFamily || saFamily || ctl.nonOrth || ctl.limitedK);
+                const bool usedSecond = !tf.second.empty() && (sstFamily || ctl.nonOrth || ctl.limitedEps);
+                std::string uncomputed;
+                auto resolve = [&](const std::string& field, scalar& limitK)
+                {
+                    const FieldGradScheme g = parseFieldGradScheme(caseDir, field);
+                    limitK = g.cellLimitK;
+                    // cellLimited<cubic> and cellLimited<Venkatakrishnan> carry their own parameter first, which
+                    // the coefficient scan above would read as minmod's k; and OpenFOAM refuses k outside [0, 1].
+                    const bool otherLimiter = g.raw.find("cellLimited<") != std::string::npos;
+                    if (!g.gaussLinear || g.leastSquares || !g.unsupportedLimiter.empty() || otherLimiter
+                        || g.cellLimitK < 0.0 || g.cellLimitK > 1.0)
+                    {
+                        uncomputed += uncomputed.empty() ? "" : "; ";
+                        uncomputed += "grad(" + field + ") resolves to `" + g.raw + "`";
+                    }
+                };
+                if (usedFirst)  resolve(tf.first, ctl.gradKLimitK);
+                if (usedSecond) resolve(tf.second, ctl.gradEpsLimitK);
+                // A gate's CONTROL, deliberately wrong: the second scalar takes the first's entry, one slot for both.
+                if (usedSecond && std::getenv("BRAE_CONTROL_TURB_GRAD_ONE_SLOT"))
+                {
+                    std::fprintf(stderr, "brae CONTROL: BRAE_CONTROL_TURB_GRAD_ONE_SLOT -- grad(%s) takes grad(%s)'s "
+                                 "cellLimited coefficient %g in place of its own %g\n", tf.second.c_str(),
+                                 tf.first.c_str(), (double)ctl.gradKLimitK, (double)ctl.gradEpsLimitK);
+                    ctl.gradEpsLimitK = ctl.gradKLimitK;
+                }
+                // SpalartAllmaras keeps the warning it had: its closure is outside this unit, and a refusal there
+                // would stop LES cases that run today on a `default leastSquares`.
+                if (!uncomputed.empty() && !saFamily)
+                    ctl.gradTurbUncomputed =
+                        uncomputed + ". The legacy " + std::string(sstFamily ? "kOmegaSST" : "kEpsilon")
+                        + " closure takes these gradients as Gauss linear, optionally cellLimited (minmod), for "
+                        + std::string(sstFamily ? "CDkOmega, " : "") + "the corrected laplacian and limitedLinear's "
+                        "limiter, and computes nothing else; running would substitute another gradient under the "
+                        "case's name.";
+            }
             // No explicit div(phi,K|Ekp): OF would fall through to the divSchemes `default`. brae keeps its
             // previous behaviour (the energy scheme) rather than inventing one, but says so, because that is
             // an assumption and not what the file asked for.
@@ -1147,11 +1214,13 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                 auto sname = [](bool lu, bool lim) { return lu ? "linearUpwind" : (lim ? "limitedLinear" : "upwind"); };
                 std::fprintf(stderr,
                     "[scheme] RESOLVED  div(phi,U)=%s%s  div(phi,k|omega)=%s  div(phi,h|e)=%s  "
-                    "div(phi,K|Ekp)=%s%s  nonOrth=%d gradLimit(U=%g,k|omega=%g,h|e=%g)\n",
+                    "div(phi,K|Ekp)=%s%s  nonOrth=%d gradLimit(U=%g,k=%g,epsilon|omega=%g,h|e=%g) "
+                    "linearUpwindGradLimit(k=%g,epsilon|omega=%g)\n",
                     ctl.linearUpwind ? "linearUpwind" : "upwind", ctl.linearUpwindV ? "V" : "",
                     sname(ctl.luK, ctl.limitedK), sname(ctl.luHe, ctl.limitedHe),
                     sname(ctl.luKin, ctl.limitedKin), ctl.foundKinScheme ? "" : "(inherited)",
-                    (int)ctl.nonOrth, ctl.gradULimitK, ctl.gradKLimitK, ctl.gradHeLimitK);
+                    (int)ctl.nonOrth, ctl.gradULimitK, ctl.gradKLimitK, ctl.gradEpsLimitK, ctl.gradHeLimitK,
+                    ctl.gradKLULimitK, ctl.gradEpsLULimitK);
             }
 }
 
