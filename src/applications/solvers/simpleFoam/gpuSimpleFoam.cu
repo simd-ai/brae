@@ -988,6 +988,16 @@ int main(int argc, char** argv)
                 const std::vector<HealthField> fields = solver.healthFields();
                 for (const HealthField& f : fields)
                 {
+                    // BRAE_HEALTH_LOG: the reductions the detector judges, every field, every iteration
+                    if (healthLog)
+                    {
+                        std::printf("health: field %s iteration %ld min %.6e max %.6e mean %.6e\n",
+                                    f.name,
+                                    (long)iter,
+                                    (double)f.min,
+                                    (double)f.max,
+                                    (double)f.mean);
+                    }
                     if (why.empty()) why = healthField(f, (int)iter);
                 }
                 if (why.empty() && ctl.turbulent && !ctl.sa)
