@@ -147,7 +147,18 @@ int main()
     }
 
     // ---- C2: cellLimited on the TURBULENCE and ENERGY gradients, not just grad(U) ----
+    // grad(k) and grad(omega) are looked up only where the case's closure takes them (0018, as OpenFOAM does), so both
+    // fixtures name kOmegaSST, whose CDkOmega takes both; without a model the lookup never runs and 0.5 read 0 (JUPITER
+    // job 2676042).
     {
+        for (const char* d : {"/c2", "/c2_plain"})
+        {
+            std::filesystem::create_directories(tmp + d + "/constant");
+            std::ofstream(tmp + d + "/constant/turbulenceProperties")
+                << "FoamFile\n{\n    version 2.0;\n    format ascii;\n    class dictionary;\n    object turbulenceProperties;\n}\n"
+                   "simulationType RAS;\n"
+                   "RAS\n{\n    model kOmegaSST;\n    turbulence on;\n}\n";
+        }
         const std::string body =
             std::string("gradSchemes { default Gauss linear;\n")
             + "              grad(U)     cellLimited Gauss linear 1;\n"
@@ -157,7 +168,8 @@ int main()
             + LAP_ORTHOGONAL;
         const DeviceSimpleControls c = parse(tmp + "/c2", body);
         checkNum("C2 grad(U) limiter", c.gradULimitK, 1.0);
-        checkNum("C2 grad(k)/grad(omega) limiter", c.gradKLimitK, 0.5);
+        checkNum("C2 grad(k) limiter", c.gradKLimitK, 0.5);
+        checkNum("C2 grad(omega) limiter", c.gradEpsLimitK, 0.5);
         checkNum("C2 grad(h|e) unlisted stays unlimited", c.gradHeLimitK, 0.0);
         // Negative control: with no cellLimited anywhere, every limiter must be 0.
         const std::string plain =
@@ -167,6 +179,7 @@ int main()
         const DeviceSimpleControls d = parse(tmp + "/c2_plain", plain);
         checkNum("C2 negative control grad(U)", d.gradULimitK, 0.0);
         checkNum("C2 negative control grad(k)", d.gradKLimitK, 0.0);
+        checkNum("C2 negative control grad(omega)", d.gradEpsLimitK, 0.0);
     }
 
     // ---- C1: interpolationSchemes was never parsed; a non-linear default must be refused ----
