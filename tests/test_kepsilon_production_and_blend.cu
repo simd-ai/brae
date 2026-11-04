@@ -115,6 +115,12 @@ int main()
         DeviceBuffer<scalar> dk(kIn), de(eIn), dnut(nIn);
         // both fields under one rule, the cap the solves had before each field's own was handed down
         const ScalarStopRule stop{tol, 0.0, kUnreadEntryMaxIter, 0};
+        // grad(k) and grad(epsilon) unlimited, which the one scalar 0.0 passed here meant before each took its own entry
+        TurbScalarGradLimits unlimited;
+        unlimited.kField = 0.0;
+        unlimited.eField = 0.0;
+        unlimited.kLU    = 0.0;
+        unlimited.eLU    = 0.0;
         deviceKEpsilonCorrect(dm, w, dbEps, dbK, dbU, dUx, dUy, dUz, dk, de, dnut,
                               DeviceBuffer<scalar>(phi.internal), DeviceBuffer<scalar>(phiB),
                               nu, relaxEps, relaxK, stop, stop,
@@ -124,7 +130,7 @@ int main()
                               /*ami*/nullptr, /*cyc*/nullptr, /*nutWall*/0, /*atmZ0*/0.0, /*atmBoundNut*/true,
                               ScalarDdt{}, ScalarDdt{},
                               nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-                              /*gradScalarLimitK*/0.0, gradULimitK);
+                              unlimited, gradULimitK);
         kOut = dk.host();
         eOut = de.host();
     };
