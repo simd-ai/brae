@@ -80,6 +80,12 @@ int main(int argc, char** argv) {
     const DeviceBuffer<scalar> dNutB(nutBIn);
     // both fields under one rule, the cap the solves had before each field's own was handed down
     const ScalarStopRule stop{tol, 0.0, kUnreadEntryMaxIter, 0};
+    // The CPU correct() above takes every gradient unlimited, and this fixture reads no fvSchemes.
+    TurbScalarGradLimits unlimited;
+    unlimited.kField = 0.0;
+    unlimited.eField = 0.0;
+    unlimited.kLU    = 0.0;
+    unlimited.eLU    = 0.0;
     deviceKEpsilonCorrect(dm, wall, dbEps, dbK, dbU, dUx, dUy, dUz, dk, de, dnut,
                           DeviceBuffer<scalar>(phi.internal), phiB, nu, relaxEps, relaxK, stop, stop,
                           /*bounded*/false, /*boundedEps*/false,
@@ -90,7 +96,7 @@ int main(int argc, char** argv) {
                           /*nutWall*/0, /*atmZ0*/0.0, /*atmBoundNut*/true,
                           /*kDdt*/{}, /*eDdt*/{},
                           /*rho*/nullptr, /*muLam*/nullptr, /*rhoBnd*/nullptr, /*nuWallFace*/nullptr,
-                          &dNutB);
+                          &dNutB, /*muBnd*/nullptr, unlimited);
 
     std::printf("GPU closed kEpsilon::correct (nCells=%d):\n", nC);
     std::printf("  eps device vs CPU : %.3e\n", relMax(de.host(), eCpu));
