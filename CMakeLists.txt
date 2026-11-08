@@ -5323,6 +5323,12 @@ add_test(NAME amg_csr_rows_identity
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/amg_csr_rows_identity.sh)
 set_tests_properties(amg_csr_rows_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 
+# The pressure AMG-PCG's double-precision rows (the PCG's product, the double cycle's finest and coarse grids) byte for byte the face
+# form, in both cycle precisions; controls: the rows in another order, the values never gathered again.
+add_test(NAME amg_double_rows_identity
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/amg_double_rows_identity.sh)
+set_tests_properties(amg_double_rows_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
+
 # The BiCGStab graph cache keyed on the field it solves holds one graph per solved field: the velocity corrector
 # writes U into its own block (a new block each iteration had become a new cache entry an iteration once boxy5's
 # memory step 4 moved the pool's free list). Control: BRAE_CONTROL_U_CORRECTOR_NEW_BLOCK=1, the old new block.

@@ -356,12 +356,18 @@ struct AMGData {
     std::vector<DeviceBuffer<label>> csrRow, csrCol, csrSrc;
     std::vector<DeviceBuffer<float>> csrVal;
     bool csrBuilt = false;
-    // THE DOUBLE CYCLE'S ROW LAYOUT, on the coarse grids under BRAE_AMG_CSR64_BELOW cells (off by default; the experiment of
-    // 2026-10-30, device_amg_vcycle.cu's amgGatherCsr64): each row is the cell's faces in increasing face index, amulKernel's
-    // order, so the same bits as that kernel; csr64Src says where each value comes from (f: upper[f], -(f+1): lower[f]).
+    // THE DOUBLE CYCLE'S ROW LAYOUT, on every coarse grid under BRAE_AMG_CSR64_BELOW cells (off by default, the private build's setting;
+    // device_amg_vcycle.cu's amgGatherCsr64), and on the finest grid (index 0, amgGatherFineCsr64, BRAE_AMG_FINE_CSR): each row is the
+    // cell's faces in increasing face index, amulKernel's order, so the same bits as that kernel; csr64Src says where each value comes
+    // from (f: upper[f], -(f+1): lower[f]). The finest grid's rows belong to the view they were made from (csr64FineKey, its
+    // ownerStart, and its size), and its values are gathered again at every solve
     std::vector<DeviceBuffer<label>> csr64Row, csr64Col, csr64Src;
     std::vector<DeviceBuffer<scalar>> csr64Val;
     bool csr64Built = false;
+    const label* csr64FineKey = nullptr;
+    int csr64FineCells = 0;
+    int csr64FineFaces = 0;
+    bool csr64FineFilled = false;
     std::unique_ptr<AMGGraphCache> gcache;                      // cached V-cycle graph (capture once, replay)
     std::unique_ptr<AMGGraphCache> gcacheF;                     // cached FP32 V-cycle graph (#7 mixed precision)
     std::unique_ptr<PCGGraphCache> pcgCache;                    // cached device-resident PCG WHILE-body graph (#6); per-solver lifetime
@@ -555,6 +561,23 @@ DeviceSolverPerf deviceAMGPCG(const DeviceLduView& Afine, AMGData& amg, const De
 // removing the launch overhead of the V-cycle's many small kernels. Default false (direct launch).
 void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
                     const DeviceBuffer<scalar>& r, DeviceBuffer<scalar>& z, bool captureVcycle = false);
+
+// THE FINEST GRID'S ROW LAYOUT (BRAE_AMG_FINE_CSR, on by default, 0 the fallback): A's rows made once for its addressing and its
+// values gathered from A's upper and lower, which a caller does at every solve before any captured graph replays (the values change
+// in their buffers from one system to the next). The V-cycle's finest-grid products and amgFineAmul then read the rows: amulKernel's
+// sum in its order, so the same bits. On an LDU view of 2.9 M cells a GH200 took 113.6 us a product in amulKernel and 98.3 in the
+// rows (6.1 M: 238.7 and 205.7; private bench, JUPITER job 2738781), the gather about one product. Not for a view with coupled
+// faces (a cyclic's or AMI's terms are deviceAmul's): it keeps amulKernel
+void amgGatherFineCsr64(AMGData& amg, const DeviceLduView& A);
+
+// ...in its two parts, for a caller that captures the fill. amgPrepareFineCsr64 makes the rows for A outside any capture and says
+// whether they serve it; amgFillFineCsr64 is one launch, which a capture holds: at every replay it reads the upper and lower the
+// capture baked, as a captured amulKernel would, so a graph keyed wrongly reads stale coefficients in either form
+bool amgPrepareFineCsr64(AMGData& amg, const DeviceLduView& A);
+void amgFillFineCsr64(AMGData& amg, const DeviceLduView& A);
+
+// y = A x on the finest grid: the rows of amgGatherFineCsr64 when they are A's, deviceAmul otherwise
+void amgFineAmul(AMGData& amg, const DeviceLduView& A, const DeviceBuffer<scalar>& x, DeviceBuffer<scalar>& y);
 
 // THE ASYMMETRIC V-CYCLE (upper != lower: the transonic pressure equation's fvm::div(phid, p)).
 //

@@ -855,8 +855,8 @@ bool amgSinglePrecisionCycle(const AMGData& amg)
     return useFP32() && !amg.gsSmooth && !useChebyshev() && !useTSGS();
 }
 
-// The double cycle's product on grid g: the row layout where the grid has one (amgGatherCsr64), amulKernel otherwise. The same
-// sum in the same order. Never on the finest grid, whose view is the caller's and may carry coupled faces.
+// The double cycle's product on grid g: the row layout where the grid has one (amgGatherCsr64; on the finest grid
+// amgGatherFineCsr64's, when its rows are the caller's view's), amulKernel otherwise. The same sum in the same order.
 static inline void amgSpmvD(
     AMGData& amg,
     int g,
@@ -864,7 +864,14 @@ static inline void amgSpmvD(
     const DeviceBuffer<scalar>& x,
     DeviceBuffer<scalar>& y)
 {
-    if (g > 0 && !amg.csr64Val.empty() && amg.csr64Val[g].size() > 0)
+    if (g == 0)
+    {
+        amgFineAmul(amg, Ag, x, y);
+        return;
+    }
+    // the coarse grids hold rows only when BRAE_AMG_CSR64_BELOW made them (amgGatherCsr64 sizes the lists to every grid); otherwise the
+    // lists hold the finest grid's alone, and a coarse grid's index is past them (job 4988466: the double cycle crashed there)
+    if (g < static_cast<int>(amg.csr64Val.size()) && amg.csr64Val[g].size() > 0)
     {
         y.resize(Ag.nCells);
         amulCsrDK<<<nBlocks(Ag.nCells),TPB>>>(Ag.nCells, Ag.diag, amg.csr64Row[g].data(), amg.csr64Col[g].data(),
@@ -1163,15 +1170,19 @@ void amgBuildCsrFP32(AMGData& amg, const DeviceLduView& A)
     amg.csrBuilt = true;
 }
 
-// THE DOUBLE CYCLE'S ROW LAYOUT (BRAE_AMG_CSR64_BELOW=<cells>, off by default, the experiment of 2026-10-30). On motorBike at 16
-// GH200s the grids under 50,000 cells a GPU are 5.6% of the hierarchy's cells and 51% of the double V-cycle's time, 80% of each
-// grid's in its two products: amulKernel's merge of two face lists, three chained reads an entry, with few threads to hide the
-// latency. The single-precision row layout is 1.6 to 2.5 times faster there, where hardly any bytes move, so that gap is the layout's.
-// The comment on device_spmv.cu's rejected row form is about a FINE grid, where a row layout doubles the bytes that bind.
+// THE DOUBLE CYCLE'S ROW LAYOUT (BRAE_AMG_CSR64_BELOW=<cells>, off by default, the experiment of 2026-10-30; the private multi-GPU
+// build sets it on every coarse grid). Off here by default because the coarse grids' values are gathered by amgGalerkin, outside the
+// captured cycle: tests/test_amg_one_off_diagonal.cu's control, a cycle kept across the switch to a lower of its own, could no longer
+// show the cycle reading the old lower (public suite on Arrhenius, job 4982403). On motorBike at 16 GH200s the grids under 50,000 cells a GPU are 5.6% of
+// the hierarchy's cells and 51% of the double V-cycle's time, 80% of each grid's in its two products: amulKernel's merge of two face
+// lists, three chained reads an entry, with few threads to hide the latency. The single-precision row layout is 1.6 to 2.5 times
+// faster there, where hardly any bytes move, so that gap is the layout's. On the FINEST grid (amgGatherFineCsr64 below) the rows
+// read 7% more bytes than amulKernel and still take 13.5% less time, 2.52 -> 3.10 TB/s on a GH200 (Nsight Compute, 2.9 M cells):
+// what binds there is the chain of reads, not the bytes; device_spmv.cu's FP-11 rejection measured BiCGStab solves, whose few
+// products a matrix do not pay for the gather.
 //
 // A row here is the cell's faces in increasing face index, amulKernel's order and OpenFOAM's face loop's, not the single-precision
-// layout's owner-then-neighbour: the same sum in the same order, so the same bits as the double cycle without the layout. Coarse
-// grids only (g >= 1).
+// layout's owner-then-neighbour: the same sum in the same order, so the same bits as the double cycle without the layout.
 // BRAE_CONTROL_AMG_CSR64_ORDER=1 is a gate's CONTROL, deliberately different: each row owner faces first, the same sum in another
 // order, so other bits. BRAE_CONTROL_AMG_CSR64_STALE=1 is another, deliberately wrong: the values gathered once and never again.
 static int amgCsr64Below()
@@ -1184,17 +1195,86 @@ static int amgCsr64Below()
     return n;
 }
 
+// BRAE_AMG_FINE_CSR=0: the finest grid keeps amulKernel (the fallback); anything else, or unset, takes the rows
+static bool amgFineCsrOn()
+{
+    static const bool on = []()
+    {
+        const char* e = std::getenv("BRAE_AMG_FINE_CSR");
+        return !(e && *e && std::atoi(e) == 0);
+    }();
+    return on;
+}
+
+static bool csr64OwnerFirst()
+{
+    static const bool on = std::getenv("BRAE_CONTROL_AMG_CSR64_ORDER") != nullptr;
+    return on;
+}
+
+static bool csr64Stale()
+{
+    static const bool on = std::getenv("BRAE_CONTROL_AMG_CSR64_STALE") != nullptr;
+    return on;
+}
+
+// one grid's rows in amulKernel's order (owner faces first under the ORDER control), and where each value comes from
+static void buildRows64(
+    const DeviceLduView& v,
+    DeviceBuffer<label>& rowD,
+    DeviceBuffer<label>& colD,
+    DeviceBuffer<label>& srcD,
+    DeviceBuffer<scalar>& valD)
+{
+    const bool ownerFirst = csr64OwnerFirst();
+    const std::vector<label> ownerStart = pullLabels(v.ownerStart, v.nCells + 1);
+    const std::vector<label> losortStart = pullLabels(v.losortStart, v.nCells + 1);
+    const std::vector<label> losort = pullLabels(v.losort, v.nInternalFaces);
+    const std::vector<label> nei = pullLabels(v.nei, v.nInternalFaces);
+    const std::vector<label> owner = pullLabels(v.owner, v.nInternalFaces);
+    std::vector<label> row(v.nCells + 1, 0), col, src;
+    col.reserve(2*v.nInternalFaces);
+    src.reserve(2*v.nInternalFaces);
+    for (int c = 0; c < v.nCells; ++c)
+    {
+        row[c] = static_cast<label>(col.size());
+        label f = ownerStart[c];
+        label k = losortStart[c];
+        // amulKernel's walk: the two ascending lists merged by face index
+        while (f < ownerStart[c+1] || k < losortStart[c+1])
+        {
+            const label fl = (k < losortStart[c+1]) ? losort[k] : 0x7fffffff;
+            if (f < ownerStart[c+1] && (ownerFirst || f < fl))
+            {
+                col.push_back(nei[f]);
+                src.push_back(f);
+                ++f;
+            }
+            else
+            {
+                col.push_back(owner[fl]);
+                src.push_back(-fl - 1);
+                ++k;
+            }
+        }
+    }
+    row[v.nCells] = static_cast<label>(col.size());
+    rowD.copyFrom(row);
+    colD.copyFrom(col);
+    srcD.copyFrom(src);
+    valD.resize(col.size());
+}
+
 void amgGatherCsr64(AMGData& amg)
 {
     const int below = amgCsr64Below();
     if (below == 0) return;
-    static const bool ownerFirst = std::getenv("BRAE_CONTROL_AMG_CSR64_ORDER") != nullptr;
-    static const bool stale = std::getenv("BRAE_CONTROL_AMG_CSR64_STALE") != nullptr;
     const int G = amg.nLevels();
     const bool first = !amg.csr64Built;
     if (first)
     {
         const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+        // index 0 is the finest grid's (amgGatherFineCsr64), kept as it is
         amg.csr64Row.resize(G+1);
         amg.csr64Col.resize(G+1);
         amg.csr64Src.resize(G+1);
@@ -1205,51 +1285,16 @@ void amgGatherCsr64(AMGData& amg)
         {
             const DeviceLduView v = amg.level[g-1].coarseView();
             if (v.nCells >= below || v.nInternalFaces <= 0) continue;
-            const std::vector<label> ownerStart = pullLabels(v.ownerStart, v.nCells + 1);
-            const std::vector<label> losortStart = pullLabels(v.losortStart, v.nCells + 1);
-            const std::vector<label> losort = pullLabels(v.losort, v.nInternalFaces);
-            const std::vector<label> nei = pullLabels(v.nei, v.nInternalFaces);
-            const std::vector<label> owner = pullLabels(v.owner, v.nInternalFaces);
-            std::vector<label> row(v.nCells + 1, 0), col, src;
-            col.reserve(2*v.nInternalFaces);
-            src.reserve(2*v.nInternalFaces);
-            for (int c = 0; c < v.nCells; ++c)
-            {
-                row[c] = static_cast<label>(col.size());
-                label f = ownerStart[c];
-                label k = losortStart[c];
-                // amulKernel's walk: the two ascending lists merged by face index
-                while (f < ownerStart[c+1] || k < losortStart[c+1])
-                {
-                    const label fl = (k < losortStart[c+1]) ? losort[k] : 0x7fffffff;
-                    if (f < ownerStart[c+1] && (ownerFirst || f < fl))
-                    {
-                        col.push_back(nei[f]);
-                        src.push_back(f);
-                        ++f;
-                    }
-                    else
-                    {
-                        col.push_back(owner[fl]);
-                        src.push_back(-fl - 1);
-                        ++k;
-                    }
-                }
-            }
-            row[v.nCells] = static_cast<label>(col.size());
-            amg.csr64Row[g].copyFrom(row);
-            amg.csr64Col[g].copyFrom(col);
-            amg.csr64Src[g].copyFrom(src);
-            amg.csr64Val[g].resize(col.size());
+            buildRows64(v, amg.csr64Row[g], amg.csr64Col[g], amg.csr64Src[g], amg.csr64Val[g]);
             ++grids;
-            entries += col.size();
+            entries += amg.csr64Val[g].size();
         }
         amg.csr64Built = true;
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
         std::printf("brae AMG: NOTICE: the double cycle's row layout on %d coarse grids under %d cells: %zu entries, built in %.4f s\n",
                     grids, below, entries, seconds);
     }
-    if (stale && !first) return;
+    if (csr64Stale() && !first) return;
     for (int g = 1; g <= G; ++g)
     {
         const int nnz = static_cast<int>(amg.csr64Val[g].size());
@@ -1258,6 +1303,97 @@ void amgGatherCsr64(AMGData& amg)
         csr64GatherK<<<nBlocks(nnz),TPB>>>(nnz, amg.csr64Src[g].data(), v.upper, v.lower, amg.csr64Val[g].data());
     }
     cudaCheck(cudaGetLastError(), "csr64 gather");
+}
+
+// the finest grid's rows are this view's: made from its addressing, at its size, with no coupled faces
+static bool fineRowsAre(
+    const AMGData& amg,
+    const DeviceLduView& A)
+{
+    return amg.csr64FineKey != nullptr && amg.csr64FineKey == A.ownerStart && amg.csr64FineCells == A.nCells
+        && amg.csr64FineFaces == A.nInternalFaces && A.nCyc == 0 && A.nAmi == 0 && !amg.csr64Val.empty()
+        && amg.csr64Val[0].size() > 0;
+}
+
+bool amgPrepareFineCsr64(
+    AMGData& amg,
+    const DeviceLduView& A)
+{
+    // NO CAPTURED GRAPH IS DROPPED HERE: the graphs' own keys decide what replays (the one-off-diagonal and captured-cycle-view gates
+    // hold them), and a graph captured with the rows reads their blocks at every replay. So the rows' blocks never move once made: a
+    // view of the same size is made into them in place (DeviceBuffer::copyFrom keeps a block of the same size), a view of another
+    // size keeps amulKernel. Dropping the graphs here instead hid the one-off-diagonal gate's control and crashed interFoam's
+    // captured cycle, whose solves hold the cache across this call (public suite on Arrhenius, job 4977432)
+    if (!amgFineCsrOn() || A.nCyc > 0 || A.nAmi > 0 || A.nInternalFaces <= 0)
+    {
+        // a view the rows cannot serve: its products take amulKernel, and the rows stay as they are
+        amg.csr64FineKey = nullptr;
+        return false;
+    }
+    if (amg.csr64Row.empty())
+    {
+        amg.csr64Row.resize(1);
+        amg.csr64Col.resize(1);
+        amg.csr64Src.resize(1);
+        amg.csr64Val.resize(1);
+    }
+    const bool made = amg.csr64FineKey == A.ownerStart && amg.csr64FineCells == A.nCells && amg.csr64FineFaces == A.nInternalFaces;
+    if (!made)
+    {
+        if (amg.csr64Val[0].size() > 0 && (amg.csr64FineCells != A.nCells || amg.csr64FineFaces != A.nInternalFaces))
+        {
+            // rows of another size are held, and a graph captured with them may still replay for their view: this one keeps amulKernel
+            amg.csr64FineKey = nullptr;
+            return false;
+        }
+        const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+        buildRows64(A, amg.csr64Row[0], amg.csr64Col[0], amg.csr64Src[0], amg.csr64Val[0]);
+        amg.csr64FineKey = A.ownerStart;
+        amg.csr64FineCells = A.nCells;
+        amg.csr64FineFaces = A.nInternalFaces;
+        amg.csr64FineFilled = false;
+        const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+        std::printf("brae AMG: NOTICE: the finest grid's row layout, %d cells, %zu entries, built in %.4f s (BRAE_AMG_FINE_CSR=0: amulKernel)\n",
+                    A.nCells, amg.csr64Val[0].size(), seconds);
+    }
+    return true;
+}
+
+void amgFillFineCsr64(
+    AMGData& amg,
+    const DeviceLduView& A)
+{
+    if (!fineRowsAre(amg, A)) return;
+    // TEST CONTROL BRAE_CONTROL_AMG_CSR64_STALE: the values filled once and never again (a capture then holds no fill at all)
+    if (csr64Stale() && amg.csr64FineFilled) return;
+    const int nnz = static_cast<int>(amg.csr64Val[0].size());
+    csr64GatherK<<<nBlocks(nnz),TPB>>>(nnz, amg.csr64Src[0].data(), A.upper, A.lower, amg.csr64Val[0].data());
+    cudaCheck(cudaGetLastError(), "fine csr64 fill");
+    amg.csr64FineFilled = true;
+}
+
+void amgGatherFineCsr64(
+    AMGData& amg,
+    const DeviceLduView& A)
+{
+    if (amgPrepareFineCsr64(amg, A)) amgFillFineCsr64(amg, A);
+}
+
+void amgFineAmul(
+    AMGData& amg,
+    const DeviceLduView& A,
+    const DeviceBuffer<scalar>& x,
+    DeviceBuffer<scalar>& y)
+{
+    if (!fineRowsAre(amg, A))
+    {
+        deviceAmul(A, x, y);
+        return;
+    }
+    y.resize(A.nCells);
+    amulCsrDK<<<nBlocks(A.nCells),TPB>>>(A.nCells, A.diag, amg.csr64Row[0].data(), amg.csr64Col[0].data(), amg.csr64Val[0].data(),
+                                         x.data(), y.data());
+    cudaCheck(cudaGetLastError(), "fine amulCsrD");
 }
 
 // Cast the (current) FP64 fine + coarse matrices to their FP32 mirrors. Allocates the mirrors + FP32 work vectors once.

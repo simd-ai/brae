@@ -195,6 +195,10 @@ static DeviceSolverPerf deviceAMGPCGGraph(
     amg.corrScaling = false;
     DeviceBuffer<scalar>& wA = amg.wA;
     DeviceBuffer<scalar>& rA = amg.rA;
+    // THE FINEST GRID'S ROWS (amgPrepareFineCsr64): made here, outside any capture; their values are filled in the captured prologue
+    // below (amgFillFineCsr64) from the graph's own copies of the matrix, as a captured amulKernel reads them, so the graph's key
+    // governs both forms alike
+    amgPrepareFineCsr64(amg, A);
     if (!amg.pcgCache) amg.pcgCache = std::make_unique<PCGGraphCache>();          // per-solver lifetime: dies with amg, so no stale reuse across solvers
     PCGGraphCache& c = *amg.pcgCache;
     c.pA.resize(nC);
@@ -299,6 +303,7 @@ static DeviceSolverPerf deviceAMGPCGGraph(
         // A*psi with `onField`: psi IS the solution field, the one product a jump cyclic applies its jump to
         // (device_pcg.cu's own initial residual). Without it a porousBafflePressure pair was solved with no jump:
         // RAS/damBreakPorousBaffle, phi 5.6e-03 from OpenFOAM.
+        amgFillFineCsr64(amg, sA);
         deviceAmul(sA, psi, c.Ax, /*onField=*/true);
         deviceCopy(rA, c.gB);
         deviceAxpy(-1.0, c.Ax, rA);
@@ -323,6 +328,7 @@ static DeviceSolverPerf deviceAMGPCGGraph(
         // A*psi with `onField`: psi IS the solution field, the one product a jump cyclic applies its jump to
         // (device_pcg.cu's own initial residual). Without it a porousBafflePressure pair was solved with no jump:
         // RAS/damBreakPorousBaffle, phi 5.6e-03 from OpenFOAM.
+        amgFillFineCsr64(amg, sA);
         deviceAmul(sA, psi, c.Ax, /*onField=*/true);
         deviceCopy(rA, c.gB);
         deviceAxpy(-1.0, c.Ax, rA);
@@ -352,7 +358,7 @@ static DeviceSolverPerf deviceAMGPCGGraph(
         deviceDotInto(wA, rA, dWArA);
         pcgSearchDirK<<<nBlocks(nC),TPB,0,cudaStreamPerThread>>>(c.pA.data(), wA.data(), dWArA, dWArAold,
                                                                  c.sIter.data(), nC);
-        deviceAmul(sA, c.pA, wA);
+        amgFineAmul(amg, sA, c.pA, wA);
         deviceDotInto(wA, c.pA, dPap);
         deviceScalarDivNeg(dWArA, dPap, dAlpha, dNegAlpha);
         deviceAxpyDev(dAlpha, c.pA, psi);
@@ -666,6 +672,10 @@ DeviceSolverPerf deviceAMGPCG(
 #endif
     const int nC = A.nCells;
     amg.corrScaling = corrScaling;                             // seen by vcycleAt (scaled prolongation)
+    // the finest grid's rows in the plain loop only when its V-cycle is launched: a captured cycle bakes the view it was handed, and
+    // its gate (tests/interfoam_write/amg_pcg/captured_cycle_view.sh) holds that cycle's keying on amulKernel's terms
+    if (captureVcycle) amg.csr64FineKey = nullptr;
+    else amgGatherFineCsr64(amg, A);
     DeviceBuffer<scalar>& wA = amg.wA;                          // persistent (fixed addr) so the captured graph stays valid
     DeviceBuffer<scalar>& rA = amg.rA;
     DeviceBuffer<scalar> pA(nC), Ax(nC), rOld(nC);             // rOld: previous residual for flexible-CG beta (corrScaling)
@@ -808,7 +818,7 @@ DeviceSolverPerf deviceAMGPCG(
             }
             if (corrScaling) deviceCopy(rOld, rA);              // save r_k for iter k+1 (rA is about to be updated)
             amgSplit::lap(amgSplit::updates);
-            deviceAmul(A, pA, wA);
+            amgFineAmul(amg, A, pA, wA);
             amgSplit::lap(amgSplit::product);
             deviceDotInto(wA, pA, dPap);
             deviceScalarDivNeg(dWArA, dPap, dAlpha, dNegAlpha);
