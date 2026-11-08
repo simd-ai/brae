@@ -153,8 +153,19 @@ Residuals simpleStep(
     while (ctl.correctNonOrthogonal())
     {
         const FvScalarMatrix pEqn = assemblePEqn(st, f.p, pi, m, g, patches);
-        const SolverPerformance pp =
-            gamg(pEqn, f.p.internal, m, g, patches, in.tolP, in.relTolP, in.maxIterP);
+        const SolverPerformance pp = gamg(pEqn,
+                                          f.p.internal,
+                                          m,
+                                          g,
+                                          patches,
+                                          in.tolP,
+                                          in.relTolP,
+                                          in.maxIterP,
+                                          /*nCellsInCoarsest*/10,
+                                          /*nPreSweeps*/0,
+                                          /*nPostSweeps*/2,
+                                          /*nFinestSweeps*/2,
+                                          in.minIterP);
         if (res.find("p") == res.end()) res["p"] = pp.initialResidual;   // the FIRST solve's residual
         f.p.evaluateBoundary();
 

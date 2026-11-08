@@ -202,6 +202,8 @@ struct DeviceSimpleControls
     // because the projection only has to remove the mapping error, not converge a pressure field.
     scalar tolPcorr = 0.02, relTolPcorr = 0.0;
     int    maxIterPcorr = 1000;
+    // ...and its minIter, OpenFOAM's floor on the iterations (PCG.C:127,197-200); default 0
+    int    minIterPcorr = 0;
     bool   maxwell = false;
     scalar maxwellNuM = 0.0;
     scalar maxwellLambda = 0.0;

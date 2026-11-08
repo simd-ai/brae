@@ -276,7 +276,8 @@ SolverPerformance gamg(
     int nCellsInCoarsest,
     int nPreSweeps,
     int nPostSweeps,
-    int nFinestSweeps)
+    int nFinestSweeps,
+    int minIter)
 {
     (void)nPreSweeps;
     const label nC = m.nCells();
@@ -358,7 +359,7 @@ SolverPerformance gamg(
         return (fr < tolerance) || (relTol > 0.0 && fr < relTol * perf.initialResidual);
     };
 
-    if (!converged(perf.finalResidual))
+    if (minIter > 0 || !converged(perf.finalResidual))
     {
         std::vector<std::vector<scalar>> cSource(levels.size()), cCorr(levels.size());
         int nIter = 0;
@@ -392,7 +393,7 @@ SolverPerformance gamg(
             for (label c = 0; c < nC; ++c) finestResidual[c] = b[c] - Apsi[c];
             perf.finalResidual = sumMag(finestResidual) / normFactor;
             ++nIter;
-        } while (nIter < maxIter && !converged(perf.finalResidual));
+        } while ((nIter < maxIter && !converged(perf.finalResidual)) || nIter < minIter);
         perf.nIterations = nIter;
     }
     return perf;

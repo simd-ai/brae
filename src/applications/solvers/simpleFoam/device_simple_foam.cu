@@ -102,6 +102,16 @@ bool simpleColourSwapControl()
     static const bool on = std::getenv("BRAE_CONTROL_SIMPLE_COLOUR_SWAP") != nullptr;
     return on;
 }
+// BRAE_CONTROL_U_FIXED_CAP=1 is the U stop rule gate's CONTROL (tests/simple_u_stop_rule_vs_openfoam.sh), deliberately
+// wrong: the sweep in OpenFOAM's order stops at 5000 sweeps with no minIter, whatever the U entry says, as it did before
+// 2026-11-08. With `minIter 1` OpenFOAM sweeps U once in every solve; this driver skipped the solve once the initial
+// residual was under the tolerance. The same call on the multi-GPU driver grew a mode at the tyre contact patches of
+// a 123.4 M-cell DrivAer DDES (|U| 1,397 m/s at step 20, 683,000 m/s at step 40) where OpenFOAM's run stayed flat.
+bool uFixedCapControl()
+{
+    static const bool on = std::getenv("BRAE_CONTROL_U_FIXED_CAP") != nullptr;
+    return on;
+}
 }   // namespace
 
 
@@ -2353,11 +2363,26 @@ bool simpleColourSwapControl()
             // order (see device_amg.cuh for the measurement; announced by linear_solver_setup.cuh).
             // Robust on anisotropic snappy cells where Jacobi-BiCGStab under-solves the loose relTol;
             // interface LDUs keep BiCGStab.
+            // The stop rule is the U entry's: its maxIter and minIter (UFinal's on the final outer corrector), as the
+            // Krylov branch below and the colour rule take them. minIter is OpenFOAM's floor on the sweeps, taken even
+            // when the initial residual is already under the tolerance (smoothSolver.C:159-208).
             scalar ur;
             DeviceSolverPerf uperf;
             if (ctl_.gsU && !hasCyclic_ && !hasAMI_)
-                ur = deviceSymGaussSeidel(mv, b, Uk_[kk], nf, tol, ctl_.uRelTol(), 5000, &uperf,
-                                          /*minIter*/0, /*nSweeps*/1, ctl_.gsUSym);
+            {
+                const bool fixedCap = uFixedCapControl();
+                ur = deviceSymGaussSeidel(mv,
+                                          b,
+                                          Uk_[kk],
+                                          nf,
+                                          tol,
+                                          ctl_.uRelTol(),
+                                          fixedCap ? 5000 : ctl_.uMaxIter(),
+                                          &uperf,
+                                          fixedCap ? 0 : ctl_.uMinIter(),
+                                          /*nSweeps*/1,
+                                          ctl_.gsUSym);
+            }
             else
             {
                 // DILU when the case asked for it. It matters most exactly where Jacobi is weakest: on a
@@ -3884,8 +3909,14 @@ bool simpleColourSwapControl()
                     : deviceLduViewAmi(dm, diagC, pcU, pcL, ami_.n, ami_.ownCell.data(), ami_.off.data(), ami_.nbrCell.data(), ami_.weight.data(), ami_.ifCoeff.data()))
                 : deviceLduView(dm, diagC, pcU, pcL);
             const scalar nf = deviceNormFactor(pv, pcorr, b, ones_);
-            const DeviceSolverPerf r = deviceJacobiPCG(pv, b, pcorr, nf, ctl_.tolPcorr, ctl_.relTolPcorr,
-                                                        ctl_.maxIterPcorr, 0);
+            const DeviceSolverPerf r = deviceJacobiPCG(pv,
+                                                       b,
+                                                       pcorr,
+                                                       nf,
+                                                       ctl_.tolPcorr,
+                                                       ctl_.relTolPcorr,
+                                                       ctl_.maxIterPcorr,
+                                                       ctl_.minIterPcorr);
             if (pass == 0) pr = r;
 
             if (pass == nPasses - 1)   // OF: phi -= pcorrEqn.flux() on the FINAL non-orthogonal pass only

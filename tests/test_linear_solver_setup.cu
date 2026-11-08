@@ -264,6 +264,46 @@ int main()
         if (failures == 0) std::printf("  OK   each field of the pair under its own entry\n");
     }
 
+    // ---- 4d. pcorr's maxIter AND minIter, from the pcorr entry ----
+    // The reader took pcorr's tolerance, relTol and maxIter, and the solve ran with minIter 0 whatever the entry said
+    // (OpenFOAM's PCG floor: PCG.C:127,197-200). Distinct figures, and a case with no pcorr entry keeping OpenFOAM's
+    // defaults, are the test: a reader that fills minIterPcorr from p's entry fails the second.
+    {
+        const std::string d = base + "/pcorr";
+        std::filesystem::create_directories(d + "/system");
+        {
+            std::ofstream f(d + "/system/fvSolution");
+            f << "FoamFile { version 2.0; format ascii; class dictionary; object fvSolution; }\n"
+              << "solvers\n{\n"
+              << "    p          { solver GAMG; tolerance 1e-07; relTol 0.05; maxIter 13; minIter 2; }\n"
+              << "    \"pcorr.*\"  { solver PCG; preconditioner DIC; tolerance 1e-05; relTol 0; maxIter 11; minIter 4; }\n"
+              << "}\n"
+              << "PIMPLE { }\n";
+        }
+        const FoamDict fv = readDict(d + "/system/fvSolution");
+        DeviceSimpleControls ctl;
+        readLinearSolverControls(fv, "epsilon", ctl, "PIMPLE");
+        eqInt("pcorr: maxIterPcorr from its entry", ctl.maxIterPcorr, 11);
+        eqInt("pcorr: minIterPcorr from its entry", ctl.minIterPcorr, 4);
+
+        const std::string d2 = base + "/nopcorr";
+        std::filesystem::create_directories(d2 + "/system");
+        {
+            std::ofstream f(d2 + "/system/fvSolution");
+            f << "FoamFile { version 2.0; format ascii; class dictionary; object fvSolution; }\n"
+              << "solvers\n{\n"
+              << "    p          { solver GAMG; tolerance 1e-07; relTol 0.05; maxIter 13; minIter 2; }\n"
+              << "}\n"
+              << "PIMPLE { }\n";
+        }
+        const FoamDict fv2 = readDict(d2 + "/system/fvSolution");
+        DeviceSimpleControls none;
+        readLinearSolverControls(fv2, "epsilon", none, "PIMPLE");
+        eqInt("no pcorr entry: minIterPcorr 0, not p's", none.minIterPcorr, 0);
+        eqInt("no pcorr entry: maxIterPcorr 1000, not p's", none.maxIterPcorr, 1000);
+        if (failures == 0) std::printf("  OK   pcorr's maxIter and minIter from its own entry\n");
+    }
+
     // ---- 5. relaxationFactors: modern nested form, per-FIELD keys ----
     // The transient driver took epsilon/omega's factor from "k", so distinct values here are the test.
     {

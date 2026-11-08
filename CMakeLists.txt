@@ -840,6 +840,12 @@ set_tests_properties(simple_scalar_uncorrected_vs_openfoam PROPERTIES SKIP_RETUR
 add_test(NAME simple_turbulence_stop_rule_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_turbulence_stop_rule_vs_openfoam.sh)
 set_tests_properties(simple_turbulence_stop_rule_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# U's sweep in OpenFOAM's order stops on the U entry's own maxIter and minIter (UFinal's on PIMPLE's final corrector),
+# minIter outranking maxIter as in smoothSolver.C; it took 5000 and 0 whatever the entry said. Control:
+# BRAE_CONTROL_U_FIXED_CAP=1.
+add_test(NAME simple_u_stop_rule_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_u_stop_rule_vs_openfoam.sh)
+set_tests_properties(simple_u_stop_rule_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 # The legacy driver's solver reading: an entry naming no `solver` is refused as OpenFOAM refuses it,
 # residualControl's turbulence targets are read at the start (no false unread notice) and still gate, and the
 # `Solving for U?` label names what runs (DILUPBiCGStab, the colour sweep). Fail-proofed against the binary
