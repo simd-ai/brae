@@ -1816,7 +1816,10 @@ set_tests_properties(tutorial_turbulentflatplate_kepsilon PROPERTIES SKIP_RETURN
 add_test(NAME tutorial_motorbike
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/tutorial_vs_openfoam.sh
                  motorBike U=8e-02,p=9e-02,k=1.7e-01,omega=1.0e-01,nut=2e-02 3e-04)
-set_tests_properties(tutorial_motorbike PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 5400)
+# known-red (2026-11-08, the user's decision): on the coarse mesh the cold start's pressure solver picks one of two steady states
+# 9-10 % apart that both codes hold, OpenFOAM's GAMG one and brae's AMG-PCG the other (SIM-24, 2026-11-03), so the bounds are
+# not met and stay as they are. The GB10 CI leaves the label out (.github/workflows/gpu-test.yml); ctest -L known-red runs it
+set_tests_properties(tutorial_motorbike PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow;known-red" TIMEOUT 5400)
 
 # pitzDailyExptInlet ships no Allrun at all (blockMesh + simpleFoam) and its residualControl is very loose
 # -- p 1e-2, U 1e-3. That looseness is most of the gap: at the case's own settings brae reads U 2.866e-02

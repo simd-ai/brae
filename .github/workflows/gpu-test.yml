@@ -47,6 +47,7 @@ jobs:
         # pass for that fingerprint. The store is in the runner's home, so it outlives this fresh checkout,
         # and a binary rebuilt from unchanged sources keeps its fingerprint (the tool's header has the
         # measurement). A change to shared code still runs everything that links it; only passes are kept.
+        # -LE known-red: a test whose red is understood and decided (CMakeLists.txt says which and why) is left out here
         run: |
           python3 tools/ctest_cached.py --test-dir build \
-              ${{ inputs.no_cache && '--no-cache' || '' }} --output-on-failure -j4
+              ${{ inputs.no_cache && '--no-cache' || '' }} --output-on-failure -j4 -LE known-red
