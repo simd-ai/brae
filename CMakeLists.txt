@@ -846,6 +846,12 @@ set_tests_properties(simple_turbulence_stop_rule_vs_openfoam PROPERTIES SKIP_RET
 add_test(NAME simple_u_stop_rule_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_u_stop_rule_vs_openfoam.sh)
 set_tests_properties(simple_u_stop_rule_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+# laplacianSchemes `limited corrected <psi>` on the legacy driver's momentum laplacian, every closure's (kOmegaSST, kEpsilon,
+# SpalartAllmaras), the steady and the transient step, against OpenFOAM serial on snappyHexMesh's Ahmed body; `limited 0` is
+# `uncorrected` byte for byte. Controls: BRAE_CONTROL_LAP_UNLIMITED=1 and =closure, each red.
+add_test(NAME simple_ahmed_limited_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_ahmed_limited_vs_openfoam.sh)
+set_tests_properties(simple_ahmed_limited_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 5400)
 # The legacy driver's solver reading: an entry naming no `solver` is refused as OpenFOAM refuses it,
 # residualControl's turbulence targets are read at the start (no false unread notice) and still gate, and the
 # `Solving for U?` label names what runs (DILUPBiCGStab, the colour sweep). Fail-proofed against the binary

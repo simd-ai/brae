@@ -745,7 +745,7 @@ int main(int argc, char** argv)
                 // too -- reported and declined rather than run with a substituted discretisation.
                 const std::string schemesField = fd.wordOr("schemesField", fld);
                 FieldDivScheme scheme;
-                try { scheme = parseFieldDivScheme(caseDir, schemesField); }
+                try { scheme = parseFieldDivScheme(caseDir, schemesField); requireUncappedLaplacian(scheme, schemesField); }
                 catch (const std::exception& e)
                 {
                     noticeIgnored("functions/" + foName, std::string(e.what()) +

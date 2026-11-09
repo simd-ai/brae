@@ -331,7 +331,11 @@ void deviceSolveScalarTransport(
     scalar fieldGradLimitK = 0.0,
     // The field's patch values as OpenFOAM's gradient reads them, when they are not this equation's own evaluate:
     // null is deviceBCValue. Trailing, so every existing call is unchanged. See deviceKOmegaSSTCorrect's obv.
-    const DeviceBuffer<scalar>* storedBnd = nullptr)
+    const DeviceBuffer<scalar>* storedBnd = nullptr,
+    // laplacianSchemes `limited corrected <psi>`: the non-orthogonal correction capped face by face against the
+    // uncorrected snGrad (limitedSnGrad.C:48-58), 0 <= psi < 1, psi = 0 being no correction at all. 1 is `corrected`,
+    // the whole correction. Trailing, so every existing call is unchanged; the caller passes its case's lapLimit().
+    scalar lapLimit = 1)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> Df;
@@ -444,7 +448,29 @@ void deviceSolveScalarTransport(
     // iterations (JUPITER job 2637170): orthogonal's coefficients left epsilon 1.0e-04, k 1.8e-05, nut 2.2e-05 from OpenFOAM
     deviceLaplacianCoeffs(dm, Df, lD, lU, lL, nonOrth || dm.scalarNonOrthCoeffs);
     deviceAxpy(-1.0, lD, aD); deviceAxpy(-1.0, lU, aU); deviceAxpy(-1.0, lL, aL);
-    if (nonOrth)
+    if (nonOrth && lapLimit < scalar(1))
+    {
+        // `limited corrected <psi>`, the correction capped face by face, a cyclic face's as a coupled face's
+        // (limitedSnGrad.C:48-58). MEASURED: from the Ahmed body's uniform start (snappyHexMesh, 311,172 cells,
+        // non-orthogonality 55.5) the unlimited correction under `limited corrected 0.33` put U 1.1e-3 and p 6.7e-4 from
+        // OpenFOAM serial after one iteration, 4.4e-13 and 2.6e-12 with the cap (Arrhenius job 5042510).
+        if (ami && ami->n > 0)
+            throw std::runtime_error(std::string("brae: laplacianSchemes `limited corrected ") + std::to_string(lapLimit)
+                                     + "` on " + fieldName + " across a cyclicAMI: the capped correction is not carried on "
+                                       "an AMI face; refused rather than run the unlimited one");
+        DeviceBuffer<scalar> ffc;
+        deviceLaplacianCorrFluxLimited(dm, Df, field, fieldGx, fieldGy, fieldGz, lapLimit, ffc);
+        deviceFaceDivSource(dm, ffc, lapCorr);
+        // ...a cyclic face's too, but for psi = 0, whose cap is zero there as everywhere: deviceCyclicLapCorrFlux reads 0 as
+        // `corrected`, the whole correction
+        if (cyc && cyc->n > 0 && lapLimit > scalar(0))
+        {
+            DeviceBuffer<scalar> ffcIf;
+            deviceCyclicLapCorrFlux(*cyc, D, field, fieldGx, fieldGy, fieldGz, lapLimit, nullptr, ffcIf);
+            deviceCyclicAddToOwner(*cyc, ffcIf, -1.0, lapCorr);
+        }
+    }
+    else if (nonOrth)
     {
         deviceLaplacianCorr(dm, Df, fieldGx, fieldGy, fieldGz, lapCorr);
         // The interface's own non-orthogonal correction. An AMI face is non-conformal by construction, so

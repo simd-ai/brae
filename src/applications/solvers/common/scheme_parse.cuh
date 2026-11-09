@@ -145,6 +145,9 @@ struct FieldDivScheme
     // Unlike divSchemes, laplacianSchemes almost always carries a usable `default`, which OF resolves
     // normally, so absence falls back to it rather than refusing.
     bool   nonOrth      = true;
+    // ...and that entry's `limited <psi>` (limitedSnGrad.C:48-58), 1 for `corrected`. No consumer of this struct carries
+    // the cap: requireUncappedLaplacian refuses it where a tracer is set up.
+    scalar nonOrthLimit = 1.0;
 };
 
 // Extract the brace-delimited body of a top-level fvSchemes block ("divSchemes", "laplacianSchemes").
@@ -598,8 +601,29 @@ inline FieldDivScheme parseFieldDivScheme(
                 "will not substitute one.");
         if (ls.find("uncorrected") != std::string::npos
          || ls.find("orthogonal")  != std::string::npos) fs.nonOrth = false;
+        const std::size_t lim = ls.find("limited");
+        if (lim != std::string::npos)
+        {
+            const char* c = ls.c_str() + lim + 7;
+            while (*c && !(std::isdigit((unsigned char)*c) || *c == '.' || *c == '-')) ++c;
+            double psi = 1.0;
+            if (std::sscanf(c, "%lf", &psi) == 1) fs.nonOrthLimit = static_cast<scalar>(psi);
+        }
     }
     return fs;
+}
+
+// A scalarTransport function object's tracer under `limited corrected <psi>`, psi < 1: the tracers' equation
+// (deviceSolveScalarTransport through the legacy driver's solvePassiveScalar, rhoSimpleFoam's scalarTransport
+// function object) takes the whole correction, so the cap is refused where the tracer is set up.
+inline void requireUncappedLaplacian(
+    const FieldDivScheme& fs,
+    const std::string& field)
+{
+    if (fs.nonOrth && fs.nonOrthLimit < 1.0)
+        throw std::runtime_error("brae: fvSchemes laplacian(D" + field + "," + field + ") is `limited " + std::to_string(fs.nonOrthLimit)
+                                 + "`, and the tracer's equation carries no cap on its non-orthogonal correction; refused rather "
+                                   "than run the whole correction under that name");
 }
 
 // fvSchemes `wallDist { method <m>; }`. brae's cellWallDist is a byte-for-byte port of OF's DEFAULT
@@ -842,6 +866,7 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                 return d != gradLimitByName.end() ? d->second : 0.0;
             };
             bool sawSnGradBlock = false;
+            std::set<std::string> lapSnGrads;
             for (const Stmt& st : stmts)
             {
                 const std::string& ln = st.text;
@@ -1100,10 +1125,42 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                         nonOrthCoeffs = true;
                         scalar psi = 1.0;
                         const char* c = ln.c_str() + ln.find("limited") + 7;
-                        while (*c && !(std::isdigit((unsigned char)*c) || *c == '.')) ++c;   // skip to the coefficient
+                        while (*c && !(std::isdigit((unsigned char)*c) || *c == '.' || *c == '-')) ++c;   // skip to the coefficient
                         if (std::sscanf(c, "%lf", &psi) == 1) limit = psi;
+                        // ...which OpenFOAM refuses outside [0, 1] (limitedSnGrad.H:149-155, a FatalIOError). Read here
+                        // as given, a negative one turned the pressure's correction round
+                        if (psi < 0.0 || psi > 1.0)
+                            throw std::runtime_error("brae: fvSchemes `" + ln + "`: limitCoeff is " + std::to_string(psi)
+                                                     + " and OpenFOAM requires 0 <= limitCoeff <= 1 (limitedSnGrad.H:149-155)");
                     }
                 };
+                // ONE SCHEME FOR EVERY LAPLACIAN. Every laplacianSchemes statement writes the same two flags and
+                // coefficient, so a named entry that differs from `default` (validation/saf_of_ortho's orthogonal
+                // laplacian(DnuTildaEff,nuTilda) beside a corrected default) ran every laplacian under whichever
+                // statement set the flag last, with nothing to say so. Each statement's snGrad scheme is collected and
+                // more than one is refused below; `default none` names none.
+                auto lapSnGradOf = [&](const std::string& ln) -> std::string
+                {
+                    if (hasWord(ln, "none") && ln.find("Gauss") == std::string::npos) return std::string();
+                    if (hasWord(ln, "limited"))
+                    {
+                        bool cc = false;
+                        bool nc = false;
+                        scalar lim = 1.0;
+                        readSnGrad(ln, cc, lim, nc);
+                        return "limited " + std::to_string(lim);
+                    }
+                    if (hasWord(ln, "uncorrected")) return "uncorrected";
+                    if (hasWord(ln, "corrected")) return "corrected";
+                    if (hasWord(ln, "orthogonal")) return "orthogonal";
+                    return ln.substr(ln.find_first_of(" \t") == std::string::npos ? 0 : ln.find_first_of(" \t") + 1);
+                };
+                if (inLap)
+                {
+                    const std::string sg = lapSnGradOf(ln);
+                    if (!sg.empty())
+                        lapSnGrads.insert(sg);
+                }
                 if (inLap)    readSnGrad(ln, ctl.nonOrth, ctl.nonOrthLimit, ctl.nonOrthCoeffs);
                 if (inSnGrad)
                 {
@@ -1119,6 +1176,14 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                     }
                     readSnGrad(ln, ctl.snGradCorrected, ctl.snGradLimit, ctl.snGradNonOrthCoeffs);
                 }
+            }
+            if (lapSnGrads.size() > 1)
+            {
+                std::string names;
+                for (const std::string& n : lapSnGrads)
+                    names += (names.empty() ? "`" : ", `") + n + "`";
+                throw std::runtime_error("brae: fvSchemes laplacianSchemes names " + names + ": this driver takes one snGrad "
+                                         "scheme for every laplacian; refused rather than run one of them under the others' names");
             }
             // grad(k) and grad(epsilon|omega), grad(nuTilda) under SpalartAllmaras: EACH FIELD'S OWN gradSchemes
             // entry, named-then-default (fvcGrad.C:143-149, schemesLookupDetail.C:76-88). OpenFOAM takes them in

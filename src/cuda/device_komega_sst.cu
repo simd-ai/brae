@@ -1046,7 +1046,8 @@ void deviceKOmegaSSTCorrect(
     const DeviceBuffer<scalar>* fvoEVal,     // compressible: mu at boundary faces (the +mu of rho*D+mu)
     const DeviceBuffer<scalar>* lesDelta,    // case `delta` (maxDeltaxyz); null = OF's cubeRootVol
     int nSweeps,                             // solvers/<field>/nSweeps; see the declaration
-    bool gsSymmetric)
+    bool gsSymmetric,
+    scalar lapLimit)                         // see the declaration
 {
     requireTurbGradLimits(gradLim, "deviceKOmegaSSTCorrect");
     const int nC = dm.nCells;
@@ -1238,7 +1239,7 @@ void deviceKOmegaSSTCorrect(
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/co.omegaMin, oEqnGradLimit, luStored ? &obv : nullptr);
+                               /*boundFloor*/co.omegaMin, oEqnGradLimit, luStored ? &obv : nullptr, lapLimit);
 
     // deviceSolveScalarTransport just bound omega, as it binds every transported field here: a second bound would find
     // nothing below the floor and forget bound.C:59's patch half (deviceBoundCap).
@@ -1256,7 +1257,7 @@ void deviceKOmegaSSTCorrect(
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/co.kMin, kEqnGradLimit);
+                               /*boundFloor*/co.kMin, kEqnGradLimit, /*storedBnd*/nullptr, lapLimit);
 
     // correctNut (Bradshaw): nut = a1*k / max(a1*omega, b1*F2*sqrt(S2)).
     //
@@ -1609,7 +1610,8 @@ void deviceKOmegaSSTLMCorrect(
     // reference's end-to-end error, so it is threaded through rather than assumed.
     bool limitedLinear,
     bool linearUpwind,
-    bool gsSymmetric)
+    bool gsSymmetric,
+    scalar lapLimit)
 {
     const int nC = dm.nCells;
     // ReThetat and gammaInt solve under the pair's tolerance and relTol that the caller hands in, not their own
@@ -1635,7 +1637,7 @@ void deviceKOmegaSSTLMCorrect(
                                /*bound*/true, /*fvoMask*/nullptr, /*fvoVal*/nullptr,
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, /*nSweeps*/1, gsSymmetric,
-                               /*boundFloor*/scalar(0.0));
+                               /*boundFloor*/scalar(0.0), /*fieldGradLimitK*/0.0, /*storedBnd*/nullptr, lapLimit);
 
     // gammaInt: DgammaIntEff = nut+nu; reaction = Pgamma+Egamma - Sp(ce1*Pgamma+ce2*Egamma).
     DeviceBuffer<scalar> spG(nC), suG(nC);
@@ -1651,7 +1653,7 @@ void deviceKOmegaSSTLMCorrect(
                                /*bound*/true, /*fvoMask*/nullptr, /*fvoVal*/nullptr,
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, /*nSweeps*/1, gsSymmetric,
-                               /*boundFloor*/scalar(0.0));
+                               /*boundFloor*/scalar(0.0), /*fieldGradLimitK*/0.0, /*storedBnd*/nullptr, lapLimit);
     gammaIntEff.resize(nC);
     lmGammaEffKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
         y.data(), ReThetat.data(), gammaInt.data(), Fth.data(), nu, LM_SMALL, gammaIntEff.data());

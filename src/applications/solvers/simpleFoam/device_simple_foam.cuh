@@ -126,6 +126,8 @@ public:
     // releaseGradUMemo: the model may hand the shared grad(U) memo back once it has read it (Spalart-Allmaras); only
     // step() asks, which drops the memo after turbulence anyway. pimpleStep and rhoSimpleStep keep it.
     void correctTurbulence(bool releaseGradUMemo = false);
+    void boundaryNuEff(const DeviceBuffer<scalar>& nuEff, DeviceBuffer<scalar>& nuEffBnd);
+    void refreshNutBoundary();
     // PIMPLE-foundation composable phase 1: the momentum predictor -- assemble div(phi,U) - laplacian(nuEff,U)
     // - fvc::div(nuEff dev2(grad U)^T) + fvOptions/MRF/limiters + body force, relax, and solve each U component
     // (BiCGStab/GaussSeidel). Fills Uk_ + the shared members mDiagR/mUp/mLo/iC/bCb/relaxSrc (the relaxed matrix
@@ -716,6 +718,9 @@ public:
 private:
     const std::vector<FvPatch>& fvp_;
     DeviceSimpleControls ctl_;
+    // refreshNutBoundary's nuEff at the boundary faces, for the next momentum assembly to take once
+    DeviceBuffer<scalar> nuEffBndHeld_;
+    bool nuEffBndHeldValid_ = false;
     label nC_, nIf_;
     DeviceMesh dm_;
     DeviceVectorBoundary dbU_;

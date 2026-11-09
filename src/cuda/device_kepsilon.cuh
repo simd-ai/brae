@@ -500,7 +500,10 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
                             // (ascending then descending), false = GaussSeidel, whose sweep loop in
                             // GaussSeidelSmoother.C is the ascending walk ONLY. Different smoothers,
                             // so the same relTol stops in a different place.
-                            bool gsSymmetric = true);
+                            bool gsSymmetric = true,
+                            // laplacianSchemes `limited corrected <psi>` on k's and epsilon's non-orthogonal
+                            // correction (deviceSolveScalarTransport's lapLimit); 1 is `corrected`.
+                            scalar lapLimit = 1);
 
 // Closed device kOmegaSST::correct(): production (raw GbyNu0 + omega-wall G0 override) -> F1/F2/CDkOmega/S2 ->
 // omega eqn (loose solve, omega-wall setValues) -> bound -> k eqn (loose solve) -> bound -> correctNut (Bradshaw
@@ -556,7 +559,10 @@ void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, co
                             // (ascending then descending), false = GaussSeidel, whose sweep loop in
                             // GaussSeidelSmoother.C is the ascending walk ONLY. Different smoothers,
                             // so the same relTol stops in a different place.
-                            bool gsSymmetric = true);
+                            bool gsSymmetric = true,
+                            // laplacianSchemes `limited corrected <psi>` on k's and omega's non-orthogonal
+                            // correction (deviceSolveScalarTransport's lapLimit); 1 is `corrected`.
+                            scalar lapLimit = 1);
 
 // nuWall[i] = nuBnd[wfBndIdx[i]] -- OF nu(patchi) re-indexed from boundary-face into wall-face ordering.
 void deviceGatherWallNu(const DeviceBuffer<label>& wfBndIdx, const DeviceBuffer<scalar>& nuBnd,
@@ -577,7 +583,10 @@ void deviceKOmegaSSTLMCorrect(const DeviceMesh& dm, const DeviceVectorBoundary& 
                               bool limitedLinear = false, bool linearUpwind = false,
                               // WHICH GaussSeidel smoother the case named on the transported pair; see
                               // deviceKOmegaSSTCorrect. The two transition scalars ride the same entry.
-                              bool gsSymmetric = true);
+                              bool gsSymmetric = true,
+                              // laplacianSchemes `limited corrected <psi>` on ReThetat's and gammaInt's
+                              // non-orthogonal correction (deviceSolveScalarTransport's lapLimit).
+                              scalar lapLimit = 1);
 
 // Spalart-Allmaras (one-equation): solve the nuTilda transport (div - laplacian(DnuTildaEff) + Sp(destruction) ==
 // production + Cb2 grad^2) via the shared scaffold, then nut = nuTilda*fv1. Mirrors SpalartAllmarasBase::correct()
@@ -627,7 +636,10 @@ void deviceSpalartAllmarasCorrect(const DeviceMesh& dm, const DeviceVectorBounda
                                   // as the model has its tensor. Only for a driver whose next reader of the memo is
                                   // a new U anyway: legacy simpleFoam's step(), which drops it after turbulence.
                                   // pimpleFoam's step and V2 keep it, and with it their next sites' hits.
-                                  bool releaseGradUMemo = false);
+                                  bool releaseGradUMemo = false,
+                                  // laplacianSchemes `limited corrected <psi>` on nuTilda's non-orthogonal
+                                  // correction (deviceSolveScalarTransport's lapLimit); 1 is `corrected`.
+                                  scalar lapLimit = 1);
 
 // Standalone SA correctNut (nut = nuTilda*fv1(nuTilda)) for the solver startup validate().
 void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, DeviceBuffer<scalar>& nut);

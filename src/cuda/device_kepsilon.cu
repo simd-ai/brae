@@ -1186,7 +1186,8 @@ void deviceKEpsilonCorrect(
                             const DeviceBuffer<label>*  fvoEMask,
                             const DeviceBuffer<scalar>* fvoEVal,       // compressible: mu at boundary faces (the +mu of rho*D+mu)
                             int nSweeps,                              // solvers/<field>/nSweeps; see the declaration
-                            bool gsSymmetric)
+                            bool gsSymmetric,
+                             scalar lapLimit)   // see the declaration
 {
     requireTurbGradLimits(gradLim, "deviceKEpsilonCorrect");
     // grad(k) and grad(epsilon) as the two equations take them: the corrected laplacian's non-orthogonal
@@ -1332,7 +1333,7 @@ void deviceKEpsilonCorrect(
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/co.epsilonMin, eEqnGradLimit, gradLive ? nullptr : &ebv);
+                               /*boundFloor*/co.epsilonMin, eEqnGradLimit, gradLive ? nullptr : &ebv, lapLimit);
 
     // k equation (loose solve)
     DeviceBuffer<scalar> Dk(static_cast<std::size_t>(nC));
@@ -1347,7 +1348,7 @@ void deviceKEpsilonCorrect(
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/co.kMin, kEqnGradLimit);
+                               /*boundFloor*/co.kMin, kEqnGradLimit, /*storedBnd*/nullptr, lapLimit);
 
     // correctNut (cell): nut = Cmu k^2 / eps (realizableKE: rCmu k^2 / eps with the variable Cmu).
     if (co.realizable) deviceRealizableNut(rCmu, k, eps, nut);
@@ -1357,6 +1358,29 @@ void deviceKEpsilonCorrect(
 
 // OF kOmegaSSTBase::correct/correctNut use tgradU = fvc::grad(U) = the named grad(U) scheme for BOTH the strain
 
+
+namespace {
+// The first evaluation's Newton seed of an iterative wall function (nutUSpalding, nutUBlended): OpenFOAM's calcUTau starts from
+// ut = sqrt((nutw + nuw) magGradU) with nutw = *this, the patch's own values, which on the first evaluation are the ones read
+// from the case's nut file (nutUSpaldingWallFunctionFvPatchScalarField.C:135-145, nutUBlended...C:95-102). brae started from
+// zero: from a developed start (snappyHexMesh's Ahmed body, SpalartAllmaras, OpenFOAM's iteration 150) its 10 Newton steps
+// from the laminar estimate stopped at 7.3e-6 on wall faces where OpenFOAM's are 7.8e-4, and U was 7.9e-2 from OpenFOAM's in
+// the wall cells after one iteration (Arrhenius job 5067080). A file holding zeros, as a cold start's, seeds zero as before.
+// CONTROL BRAE_CONTROL_WALL_NUT_ZERO_SEED=1: the zero seed, as before
+void wallNutFirstSeed(
+    DeviceBuffer<scalar>& nutBnd,
+    const DeviceBuffer<scalar>* nutFile,
+    int n,
+    const char* what)
+{
+    static const bool zeroSeed = std::getenv("BRAE_CONTROL_WALL_NUT_ZERO_SEED") != nullptr;
+    if (nutFile && static_cast<int>(nutFile->size()) == n && !zeroSeed)
+        cudaCheck(cudaMemcpyAsync(nutBnd.data(), nutFile->data(), n * sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread),
+                  what);
+    else
+        cudaCheck(cudaMemsetAsync(nutBnd.data(), 0, n * sizeof(scalar), cudaStreamPerThread), what);
+}
+}  // namespace
 
 namespace {  // wall-function nut kernels (spaldingNut/blendedNut), used by deviceBoundaryNut* below
 // nutUSpaldingWallFunction: wall faces -> Newton uTau from Spalding's law, nut = max(0, uTau^2/magGradU - nu).
@@ -1451,10 +1475,10 @@ void deviceBoundaryNutSpalding(
     // argument exists; compressible flow does not, so nuFace overrides it when supplied.
 
     const int n = dbU.comp[0].n;
-    if (static_cast<int>(nutBnd.size()) != n)   // first call: zero seed (warm-starts thereafter)
+    if (static_cast<int>(nutBnd.size()) != n)   // first call: OpenFOAM's seed (warm-starts thereafter)
     {
         nutBnd.resize(n);
-        cudaCheck(cudaMemsetAsync(nutBnd.data(), 0, n*sizeof(scalar), cudaStreamPerThread), "spalding init");
+        wallNutFirstSeed(nutBnd, nutFile, n, "spalding init");
     }
     if (n == 0) return;   // a rank with no physical boundary face (deviceBCValue)
     spaldingNutKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].faceCell.data(), isWall.data(), y.data(),
@@ -1488,10 +1512,10 @@ void deviceBoundaryNutBlended(
     // argument exists; compressible flow does not, so nuFace overrides it when supplied.
 
     const int n = dbU.comp[0].n;
-    if (static_cast<int>(nutBnd.size()) != n)   // first call: zero seed (warm-starts thereafter)
+    if (static_cast<int>(nutBnd.size()) != n)   // first call: OpenFOAM's seed (warm-starts thereafter)
     {
         nutBnd.resize(n);
-        cudaCheck(cudaMemsetAsync(nutBnd.data(), 0, n*sizeof(scalar), cudaStreamPerThread), "blended init");
+        wallNutFirstSeed(nutBnd, nutFile, n, "blended init");
     }
     if (n == 0) return;   // a rank with no physical boundary face (deviceBCValue)
     blendedNutKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].faceCell.data(), isWall.data(), y.data(),

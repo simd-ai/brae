@@ -1012,6 +1012,9 @@ int runSimpleFoamV2(const std::string& caseDir)
         nonOrthLaplacian = lapS.corrected;
         snGradLimitK     = lapS.limitCoeff;
     }
+    // ...and the closures' laplacians, which took the whole correction under `limited corrected <psi>` (limitedSnGrad.C:48-58):
+    // the cap in the closures' convention, 1 for `corrected` (this path's `limited 0` is uncorrected, nonOrthLaplacian false)
+    const scalar closureLapLimit = (snGradLimitK > scalar(0) && snGradLimitK < scalar(1)) ? snGradLimitK : scalar(1);
     // The `grad(U)` ENTRY's limiter coefficient, read once here because everything that takes
     // fvc::grad(U) needs it: divDevReff's explicit dev2 term (linearViscousStress.C:114), the closures'
     // strain and production (kOmegaSSTBase.C:522, kEpsilon.C:237, SpalartAllmarasBase.C:461), the
@@ -1755,7 +1758,10 @@ int runSimpleFoamV2(const std::string& caseDir)
                                              gradUSchemeLimit,
                                              // solvers/nuTilda/nSweeps -- validation/airFoil2D really
                                              // does ship `nSweeps 2` here.
-                                             nSweepsKE, gsKESym);
+                                             nSweepsKE, gsKESym,
+                                             /*gradNuTildaLULimitK*/0.0, /*gradNuTildaLapLimitK*/0.0,
+                                             /*releaseGradUMemo*/false,
+                                             closureLapLimit);   // `limited corrected <psi>` on nuTilda
             }
             else if (sstModel)
             {
@@ -1798,7 +1804,8 @@ int runSimpleFoamV2(const std::string& caseDir)
                                        /*fvoEMask*/nullptr, /*fvoEVal*/nullptr,
                                        /*lesDelta*/nullptr,
                                        // solvers/k|omega/nSweeps -- the case's own sweep count.
-                                       nSweepsKE, gsKESym);
+                                       nSweepsKE, gsKESym,
+                                       closureLapLimit);   // `limited corrected <psi>` on k and omega
 
             // OF kOmegaSSTLM::correct() runs kOmegaSST::correct() FIRST and the transition transport
             // SECOND, so k and omega always advance on the PREVIOUS iteration's gammaIntEff. Reversing
@@ -1809,7 +1816,8 @@ int runSimpleFoamV2(const std::string& caseDir)
                                          gf.phiInt, gf.phiBnd, nu, relaxEps, tolKE, relTolKE,
                                          /*keCheckEvery*/1, boundedEps, nonOrthLaplacian, gsKE,
                                          /*ami*/nullptr, /*cyc*/nullptr, /*reDdt*/{}, /*giDdt*/{},
-                                         limitedEps, linearUpwindEps, gsKESym);
+                                         limitedEps, linearUpwindEps, gsKESym,
+                                         closureLapLimit);   // `limited corrected <psi>` on ReThetat and gammaInt
             }
             else
             deviceKEpsilonCorrect(dm, wall, dbEps, dbK, dbU, gf.Ux, gf.Uy, gf.Uz,
@@ -1847,7 +1855,8 @@ int runSimpleFoamV2(const std::string& caseDir)
                                   /*fvoKMask*/nullptr, /*fvoKVal*/nullptr,
                                   /*fvoEMask*/nullptr, /*fvoEVal*/nullptr,
                                   // solvers/k|epsilon/nSweeps -- the case's own sweep count.
-                                  nSweepsKE, gsKESym);
+                                  nSweepsKE, gsKESym,
+                                  closureLapLimit);   // `limited corrected <psi>` on k and epsilon
 
             // OpenFOAM prints an Initial residual for every turbulence solve, and comparing those against
             // its log is how this path is checked against the oracle. Off unless asked for, so that the
