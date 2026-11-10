@@ -30,6 +30,8 @@
 #include "dict_audit.cuh"
 #include <regex>
 #include "scheme_parse.cuh"         // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse
+#include "pimple_controls.cuh"       // parsePimpleDdtScheme, readPimpleAlgorithm: shared with `brae check`
+#include "check_setup.cuh"           // `brae check --setup` stops before the first step
 #include "turbulence_setup.cuh"    // readTurbulenceModel + readTurbulenceFields (shared with brae)
 #include "komega_sst_coeffs.cuh"    // readKOmegaSSTCoeffs
 #include "fvc.cuh"
@@ -71,37 +73,7 @@ std::string timeName(scalar t)
     return std::string(b);
 }
 
-// fvSchemes holds multi-token scheme values + $-vars (not a plain key/value dict), so text-parse ddtSchemes.default.
-DdtScheme parseDdtScheme(const std::string& fvSchemesPath, scalar& ocCoeff)
-{
-    ocCoeff = 1.0;                                    // CrankNicolson off-centring; default = pure CN (1)
-    std::ifstream f(fvSchemesPath);
-    if (!f) throw std::runtime_error("cannot read " + fvSchemesPath);
-    const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    const std::size_t blk = text.find("ddtSchemes");
-    if (blk == std::string::npos)
-        throw std::runtime_error("fvSchemes has no ddtSchemes block (transient pimpleFoam needs Euler|backward).");
-    std::size_t d = text.find("default", blk);
-    if (d == std::string::npos) throw std::runtime_error("fvSchemes ddtSchemes has no 'default' entry.");
-    d += 7;
-    while (d < text.size() && std::isspace((unsigned char)text[d])) ++d;
-    std::string w;
-    while (d < text.size() && !std::isspace((unsigned char)text[d]) && text[d] != ';') w += text[d++];
-    if (w == "steadyState")
-        throw std::runtime_error("fvSchemes ddtSchemes.default = steadyState -> use the steady solver 'brae'.");
-    if (w == "backward")                return DdtScheme::backward;
-    if (w == "Euler" || w == "bounded") return DdtScheme::Euler;
-    if (w == "CrankNicolson")
-    {
-        // read the off-centring coefficient (OF "CrankNicolson <ocCoeff>", oc in [0,1]); absent -> pure CN (1).
-        while (d < text.size() && std::isspace((unsigned char)text[d])) ++d;
-        std::string oc;
-        while (d < text.size() && !std::isspace((unsigned char)text[d]) && text[d] != ';') oc += text[d++];
-        if (!oc.empty()) { try { ocCoeff = std::stod(oc); } catch (...) {} }
-        return DdtScheme::CrankNicolson;
-    }
-    throw std::runtime_error("fvSchemes ddtSchemes.default '" + w + "' unsupported (Euler|backward|CrankNicolson|steadyState).");
-}
+// parsePimpleDdtScheme: pimple_controls.cuh (shared with `brae check`)
 
 
 
@@ -150,7 +122,7 @@ try
     audit.add(transport,   "constant/transportProperties");
     audit.addFvSchemes(caseDir);   // reported at scope exit, once every consumer has run
     scalar ddtOcCoeff = 1.0;
-    const DdtScheme ddtScheme  = parseDdtScheme(caseDir + "/system/fvSchemes", ddtOcCoeff);
+    const DdtScheme ddtScheme  = parsePimpleDdtScheme(caseDir + "/system/fvSchemes", ddtOcCoeff);
 
     scalar       startTime     = controlDict.scalarOr("startTime", 0.0);   // resolved below for startFrom latestTime (restart)
     scalar deltaT              = controlDict.scalarOr("deltaT", 1e-3);   // varies when adjustTimeStep
@@ -206,13 +178,14 @@ try
 
 
     // ---- PIMPLE + solver controls (fvSolution) ----
+    // the PIMPLE block, every control the run takes from it (pRefCell/pRefValue apart, read below where a reference is needed),
+    // in one reader `brae check` calls too (pimple_controls.cuh); its values go to ctl where they always have
     const FoamDict* pimple  = fvSolution.subDict("PIMPLE");
-    const int nOuter   = pimple ? std::max(1, pimple->intOr("nOuterCorrectors", 1)) : 1;
-    const int nCorr    = pimple ? std::max(1, pimple->intOr("nCorrectors", 1)) : 1;
-    // OF pimpleControl.C:55, default true. pEqn.H guards the whole fvc::ddtCorr term with it.
-    const std::string ddtCorrW = pimple ? pimple->wordOr("ddtCorr", "yes") : "yes";
-    const bool ddtCorrOn = !(ddtCorrW == "no" || ddtCorrW == "false" || ddtCorrW == "off" || ddtCorrW == "0");
-    const int nNonOrth = pimple ? pimple->intOr("nNonOrthogonalCorrectors", 0) : 0;
+    const PimpleAlgorithm pimpleAlg = readPimpleAlgorithm(fvSolution, meshMotion.active || vclMotion.active);
+    const int nOuter   = pimpleAlg.nOuter;
+    const int nCorr    = pimpleAlg.nCorr;
+    const bool ddtCorrOn = pimpleAlg.ddtCorr;
+    const int nNonOrth = pimpleAlg.nNonOrth;
     const scalar nu = transport.scalarOr("nu", 1e-5);
 
     DeviceSimpleControls ctl;
@@ -335,19 +308,17 @@ try
     // PIMPLE/momentumPredictor: OF assembles UEqn either way (rAU/HbyA come from it) and only skips the
     // SOLVE. Default true, as pimpleControl's.
     {
-        const std::string mp = pimple ? pimple->wordOr("momentumPredictor", "yes") : "yes";
-        ctl.momentumPredictor = !(mp == "no" || mp == "false" || mp == "off" || mp == "0");
+        ctl.momentumPredictor = pimpleAlg.momentumPredictor;
         if (!ctl.momentumPredictor)
             std::printf("  PIMPLE momentumPredictor off: UEqn is assembled (rAU/HbyA) but not solved\n");
     }
     // PIMPLE loop contract (OF pimpleControl::read). Defaults are OpenFOAM's, not brae's convenience:
     // turbOnFinalIterOnly TRUE, solveFlow TRUE, SIMPLErho FALSE.
     {
-        auto yes = [](const std::string& v) { return !(v == "no" || v == "false" || v == "off" || v == "0"); };
-        ctl.turbOnFinalIterOnly = pimple ? yes(pimple->wordOr("turbOnFinalIterOnly", "yes")) : true;
-        ctl.solveFlow           = pimple ? yes(pimple->wordOr("solveFlow", "yes")) : true;
-        ctl.simpleRho           = pimple ? yes(pimple->wordOr("SIMPLErho", "no")) : false;
-        ctl.moveMeshOuterCorrectors = pimple ? yes(pimple->wordOr("moveMeshOuterCorrectors", "no")) : false;
+        ctl.turbOnFinalIterOnly = pimpleAlg.turbOnFinalIterOnly;
+        ctl.solveFlow           = pimpleAlg.solveFlow;
+        ctl.simpleRho           = pimpleAlg.simpleRho;
+        ctl.moveMeshOuterCorrectors = pimpleAlg.moveMeshOuterCorrectors;
         if (ctl.moveMeshOuterCorrectors)
             std::printf("  PIMPLE moveMeshOuterCorrectors on: the mesh moves before EVERY outer corrector\n");
         // dynamicFvMesh::controlledUpdate -- OF's timeControl with the "update" prefix. Read here, where
@@ -366,14 +337,13 @@ try
         if (!ctl.solveFlow) std::printf("  PIMPLE solveFlow off: the momentum/pressure solve is skipped\n");
         // residualControl: outer-loop convergence. Parsed as OF does -- each entry is a field name whose
         // sub-dict carries `tolerance` (absolute) and/or `relTol`.
-        if (const FoamDict* rc = pimple ? pimple->subDict("residualControl") : nullptr)
         {
-            for (const auto& e : rc->subs)
+            for (const PimpleAlgorithm::ResidualControl& e : pimpleAlg.residualControl)
             {
                 DeviceSimpleControls::OuterResidualControl o;
-                o.field  = e.first;
-                o.absTol = e.second.scalarOr("tolerance", 0.0);
-                o.relTol = e.second.scalarOr("relTol", 0.0);
+                o.field  = e.field;
+                o.absTol = e.absTol;
+                o.relTol = e.relTol;
                 ctl.outerResidualControl.push_back(o);
             }
             if (!ctl.outerResidualControl.empty())
@@ -389,9 +359,7 @@ try
     // solver is active. brae mirrors that -- a case that moves its mesh and says nothing gets the
     // projection, as it does in OpenFOAM, and a case that says `correctPhi no` opts out.
     {
-        const bool dyn = meshMotion.active || vclMotion.active;
-        const std::string cp = pimple ? pimple->wordOr("correctPhi", dyn ? "yes" : "no") : (dyn ? "yes" : "no");
-        ctl.correctPhi = dyn && !(cp == "no" || cp == "false" || cp == "off" || cp == "0");
+        ctl.correctPhi = pimpleAlg.correctPhi;
         if (ctl.correctPhi)
             std::printf("  PIMPLE correctPhi on: phi is rebuilt from Uf and projected divergence-free after each mesh move\n");
     }
@@ -845,6 +813,14 @@ try
     // Does any cyclicACMI carry a time `scale`? Then the geometry is rebuilt every step even on a
     // static mesh; without one, a static mesh keeps the single setup-time build it always had.
     const bool acmiTimeScale = hasACMITimeScale(m);
+    // `brae check --setup`: everything above is the run's own setup; stop before its first step, with the Courant numbers the
+    // first step starts from at the case's deltaT
+    if (cli::checkSetupDone("pimpleFoam"))
+    {
+        const CourantNumbers c = courant();
+        std::printf("brae check --setup: Courant number at the start, deltaT %g: mean %g max %g\n", deltaT, c.meanCoNum, c.CoNum);
+        return 0;
+    }
     for (scalar t = startTime + deltaT; t <= tEnd && time.loop(); t += deltaT) {
         ++timeIndex;
         solver.setTime(t);   // feed the current time to any codedFixedValue snippet's `t`

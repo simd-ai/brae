@@ -3798,6 +3798,48 @@ private:
 template <typename T>
 std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const PatchFieldData<T>& d);
 
+// Every patch-field type makePatchFieldImpl has a branch for, and the one list of them: the factory refuses any other type
+// before its chain, so this list is what the compiled factory takes, and `brae capabilities` / `brae check` print and consult
+// it rather than a list of their own. tests/brae_patch_types_vs_factory.py holds the two equal (a branch whose name is missing
+// here, or a name here with no branch, is a FAIL). A branch may still refuse a listed type on its entries -- totalPressure with
+// psi, pressureInletOutletVelocity with tangentialVelocity, a non-constant Function1 -- or always
+// (patchFieldTypesAlwaysRefused): those refusals stay in the branch, where `brae check --setup` reaches them.
+inline const std::vector<std::string>& patchFieldTypeNames()
+{
+    static const std::vector<std::string> names = {
+        "alphatJayatillekeWallFunction", "alphatWallFunction", "atmBoundaryLayerInletEpsilon", "atmBoundaryLayerInletK",
+        "atmBoundaryLayerInletOmega", "atmBoundaryLayerInletVelocity", "atmNutkWallFunction", "calculated", "cellMotion",
+        "codedFixedValue", "codedMixed", "compressible::alphatJayatillekeWallFunction", "compressible::alphatWallFunction",
+        "compressible::externalWallHeatFluxTemperature", "constantAlphaContactAngle", "cyclic", "cyclicACMI", "cyclicAMI",
+        "cyclicPeriodicAMI", "empty", "epsilonWallFunction", "externalWallHeatFluxTemperature", "fanPressure", "fixedEnergy",
+        "fixedFluxPressure", "fixedGradient", "fixedMean", "fixedValue", "flowRateInletVelocity", "freestream",
+        "freestreamPressure", "freestreamVelocity", "gradientEnergy", "inletOutlet", "kqRWallFunction", "mixed", "mixedEnergy",
+        "movingWallVelocity", "noSlip", "nutkRoughWallFunction", "nutkWallFunction", "nutLowReWallFunction",
+        "nutUBlendedWallFunction", "nutUSpaldingWallFunction", "nutUWallFunction", "omegaWallFunction", "outletInlet",
+        "outletPhaseMeanVelocity", "permeableAlphaPressureInletOutletVelocity", "porousBafflePressure",
+        "pressureInletOutletVelocity", "prghPermeableAlphaTotalPressure", "rotatingWallVelocity", "slip",
+        "surfaceNormalFixedValue", "symmetry", "symmetryPlane", "timeVaryingMappedFixedValue", "totalPressure",
+        "turbulentIntensityKineticEnergyInlet", "turbulentMixingLengthDissipationRateInlet",
+        "turbulentMixingLengthFrequencyInlet", "uniformFixedValue", "uniformNormalFixedValue", "uniformTotalPressure",
+        "variableHeightFlowRate", "variableHeightFlowRateInletVelocity", "wedge", "zeroGradient",
+    };
+    return names;
+}
+
+// Listed types whose branch always refuses (the type is named so its refusal can say why, not to run it)
+inline const std::vector<std::string>& patchFieldTypesAlwaysRefused()
+{
+    static const std::vector<std::string> names = {"externalWallHeatFluxTemperature",
+                                                   "compressible::externalWallHeatFluxTemperature"};
+    return names;
+}
+
+inline bool isPatchFieldTypeName(const std::string& t)
+{
+    const std::vector<std::string>& n = patchFieldTypeNames();
+    return std::find(n.begin(), n.end(), t) != n.end();
+}
+
 // Every patch field leaves here carrying the wall-function coefficients its own entry wrote (or
 // OpenFOAM's defaults), whatever its type: only the wall treatments read them, and they read them from
 // the field they belong to.
@@ -3831,6 +3873,9 @@ std::unique_ptr<fvPatchField<T>> makePatchField(const FvPatch& p, const PatchFie
 template <typename T>
 std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const PatchFieldData<T>& d)
 {
+    // patchFieldTypeNames is the list of the branches below: a type outside it is refused here, with the message the end of the
+    // chain gives (and gave alone before the list existed)
+    if (!isPatchFieldTypeName(d.type)) throw std::runtime_error("brae: unsupported BC type '" + d.type + "' on patch " + p.name);
     // THE ENERGY BOUNDARY FAMILY -- fixedEnergy, gradientEnergy, mixedEnergy -- handled by the three
     // branches they derive from. This is NOT a substitution. OpenFOAM's energy patch fields ARE their
     // base classes as far as the matrix is concerned:

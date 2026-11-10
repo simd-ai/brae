@@ -16,6 +16,7 @@
 // solvers use. A case copied from simpleFoam with p in m2/s2 will run and give nonsense, so the
 // dimensions line is checked.
 
+#include "check_setup.cuh"           // `brae check --setup` stops before the first step
 #include "primitive_mesh.cuh"
 #include "acmi_area_scaling.cuh"
 #include "../common/read_surface_field.cuh"   // OF READ_IF_PRESENT for phi on restart
@@ -839,6 +840,8 @@ int main(int argc, char** argv)
         int nIter = static_cast<int>(nSteps);
         bool converged = false;
         scalar cumulativeCont = 0;   // OF's "cumulative =" in the continuity-error line
+        // `brae check --setup`: everything above is the run's own setup; stop before its first iteration
+        if (cli::checkSetupDone("rhoSimpleFoam")) return 0;
         while (time.loop())
         {
             const int iter = time.timeIndex();

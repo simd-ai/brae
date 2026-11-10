@@ -27,6 +27,7 @@
 #include "scheme_parse.cuh"
 #include "linear_solver_setup.cuh"   // readLinearSolverControls (shared with gpuRhoSimpleFoam)   // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse (steady + transient)
 #include "solver_dispatch.cuh"   // dispatchSolver + execSibling: route to the solver / component that owns the work
+#include "brae_cli.cuh"        // brae --version | solvers | capabilities | check | run: the command line
 #include "simpleFoamV2.cuh"      // the rebuilt path + its envelope guard (BRAE_SIMPLEFOAM_V2)
 #include "benchmark.cuh"         // brae benchmark [sample]: the standard workload, pulled from the template repo
 #include "turbulence_setup.cuh"   // readTurbulenceModel + readTurbulenceFields (shared with pimpleFoam)
@@ -60,26 +61,37 @@ using namespace brae;
 static void printUsage()
 {
     std::printf(
-"brae, a GPU-native, OpenFOAM-compatible CFD solver. The whole solve runs on one GPU; reads a standard\n"
-"OpenFOAM case and writes standard time dirs.\n\n"
+"brae %s, a GPU-native, OpenFOAM-compatible CFD solver. Reads a standard OpenFOAM case and writes standard time\n"
+"directories; the whole solve runs on the GPU.\n\n"
 "Solvers (picked from the case's controlDict `application`, so `brae` is the only command you type):%s\n"
 "Any other application stops at start-up rather than run the case with the wrong solver.\n\n"
-"Subcommands (the only two reserved words; anything else leading is a case directory):\n"
-"  brae benchmark [sample]        run the standard workload, writes brae-benchmark.json\n"
-"  brae benchmark --list          the samples published at github.com/simd-ai/brae-bench\n"
-"  brae node register|status|unregister\n"
-"                                 join this machine to the Brae network (needs brae-agent)\n"
-"A case directory called 'node' or 'benchmark' is addressed as `brae -case node`.\n\n"
 "Usage:\n"
-"  brae [-case <dir>]             solve an OpenFOAM case (default: the current directory)\n"
+"  brae [-case <dir>] | brae <dir>  solve an OpenFOAM case (default: the current directory)\n"
+"  brae run -case <dir>             the same, spelled as a command\n"
+"  brae check -case <dir> [--setup] read the case's dictionaries, fields and mesh the way a run does and report what\n"
+"                                   brae would run, approximate or refuse, without solving. --setup also sets the case\n"
+"                                   up on the GPU (mesh, fields, boundary conditions, device arrays) and stops there.\n"
+"                                   exit 0 supported, 1 supported with notices, 2 refused, 3 not a case\n"
+"  brae solvers                     the solvers this build has, on one GPU and on several\n"
+"  brae capabilities [--json]       what this build accepts in a case (solvers, turbulence models, boundary\n"
+"                                   conditions, schemes, linear solvers, mesh, time, known limitations), read from the\n"
+"                                   tables the code checks cases against\n"
+"  brae --version                   version, commit, CUDA, GPU architectures, the multi-GPU layer if installed\n"
 "  mpirun -np N brae -case <dir> -parallel\n"
-"                                 solve across N GPUs, one rank per GPU (laminar only; needs P2P/NVLink).\n"
-"                                 Decomposes in core and reconstructs on write -- no decomposePar step.\n"
-"  brae -partition [-case <dir>]  build + cache the mesh and AMG hierarchy, then exit (no solve)\n"
-"  brae -cases <d1> <d2> ...      run several cases at once, one per GPU (mesh/parameter study)\n"
-"  brae --help                    show this message\n\n"
+"                                   several GPUs: handed to the multi-GPU layer (brae-mgpu) when it is installed next\n"
+"                                   to brae; refused otherwise\n"
+"  brae -partition [-case <dir>]    build + cache the mesh and AMG hierarchy, then exit (no solve)\n"
+"  brae -cases <d1> <d2> ...        run several cases at once, one per GPU (mesh/parameter study)\n"
+"  brae benchmark [sample]          run the standard workload, writes brae-benchmark.json\n"
+"  brae benchmark --list            the samples published at github.com/simd-ai/brae-bench\n"
+"  brae node register|status|unregister\n"
+"                                   join this machine to the Brae network (needs brae-agent)\n"
+"  brae --help                      show this message\n\n"
+"Command words and case directories: benchmark, node and job are reserved words; run, check, solvers and capabilities\n"
+"are commands unless a case directory of that name is here, which then runs as a case, as it always has (brae says so).\n"
+"A case directory called 'node' or 'benchmark' is addressed as `brae -case node`; any case as `brae -case <dir>`.\n\n"
 "A case is a standard OpenFOAM directory (0/ constant/ system/, ASCII or binary mesh). No decomposePar\n"
-"needed; brae auto-partitions for the GPU. With -cases, extra cases queue as GPUs free up.\n\n"
+"needed on one GPU. With -cases, extra cases queue as GPUs free up.\n\n"
 "Environment:\n"
 "  BRAE_GPUS=N        override the detected GPU count (for -cases)\n"
 "  BRAE_JOBS=N        how many cases to run at once with -cases (default: number of GPUs)\n"
@@ -87,13 +99,40 @@ static void printUsage()
 "  BRAE_AMG_FP32=0    use the FP64 AMG preconditioner instead of FP32 (on by default)\n\n"
 "Docs and benchmarks: https://github.com/simd-ai/brae\n",
         // the list is the registry's own (solver_dispatch.cuh): written out here it named two of four solvers
-        braeSolverList().c_str());
+        BRAE_VERSION_STRING, braeSolverList().c_str());
 }
 
 int main(int argc, char** argv)
 {
     try
     {
+        // `brae --version`, and the commands -- solvers, capabilities, check, run -- wherever a case directory of the same name does
+        // not claim the word first (cli::isCommand). `run` and `check --setup` on a case this binary solves carry on below with the
+        // command word dropped, so they run exactly the code `brae -case <dir>` runs.
+        if (argc > 1 && (std::string(argv[1]) == "--version" || std::string(argv[1]) == "-version")) return cli::version();
+        static std::vector<std::string> keptArgs;
+        static std::vector<char*> keptArgv;
+        if (cli::isCommand(argc, argv))
+        {
+            const std::string word = argv[1];
+            if (word == "solvers") return cli::solversCommand();
+            if (word == "capabilities") return cli::capabilitiesCommand(argc, argv);
+            if (word == "check")
+            {
+                const int code = cli::checkCommand(argc, argv);
+                if (code != -1) return code;
+                keptArgs = {argv[0], "-case", cli::caseOf(argc, argv, 2)};
+            }
+            else
+            {
+                keptArgs.assign(argv, argv + argc);
+                keptArgs.erase(keptArgs.begin() + 1);
+            }
+            for (std::string& a : keptArgs) keptArgv.push_back(a.data());
+            keptArgv.push_back(nullptr);
+            argc = static_cast<int>(keptArgs.size());
+            argv = keptArgv.data();
+        }
         // Subcommands. ONLY these three leading words are reserved -- everything else is a case directory, so
         // `brae myCase` is untouched. A case actually named `node`, `benchmark` or `job` is reached with -case.
         if (argc > 1 && argv[1][0] != '-')
@@ -149,11 +188,23 @@ int main(int argc, char** argv)
         // REFUSE rather than fall through to the single-GPU path: under `mpirun -np N` that would run N
         // redundant identical solves, each writing over the others' time directories.
         for (int i = 1; i < argc; ++i)
+            if (std::string(argv[i]) == "-parallel" && !cli::mgpuSibling().empty())
+            {
+                // the multi-GPU layer, when installed next to brae: exec'd directly (not through execSibling, whose
+                // one-hand-over guard would stop brae-mgpu choosing its own solver), each MPI rank alike
+                const std::string mgpu = cli::mgpuSibling();
+                std::fprintf(stderr, "brae: -parallel -> %s (the multi-GPU layer)\n", mgpu.c_str());
+                std::vector<char*> av(argv, argv + argc);
+                av[0] = const_cast<char*>(mgpu.c_str());
+                av.push_back(nullptr);
+                execv(mgpu.c_str(), av.data());
+                throw std::runtime_error("cannot start " + mgpu);
+            }
+        for (int i = 1; i < argc; ++i)
             if (std::string(argv[i]) == "-parallel")
                 throw std::runtime_error(
-                    "brae: -parallel (multi-GPU) is not supported in this build. The distributed solver was "
-                    "moved to legacy/ and is out of scope; see legacy/README.md. Run brae single-GPU without "
-                    "-parallel (and without mpirun).");
+                    "brae: -parallel (multi-GPU) needs the multi-GPU layer, brae-mgpu, installed next to brae, and this "
+                    "install has none. Run brae single-GPU without -parallel (and without mpirun).");
         std::string caseDir = ".";
         bool partition = false;                              // -partition: build mesh + AMG caches, then exit (no solve)
         for (int i = 1; i < argc; ++i)
@@ -843,6 +894,8 @@ int main(int argc, char** argv)
         // BRAE_MEMORY_PROBE: the memory the run holds at fixed iterations (solvers/common/memory_probe.cuh)
         MemoryProbe memProbe;
         memProbe.startUp();
+        // `brae check --setup`: everything above is the run's own setup; stop before its first iteration
+        if (cli::checkSetupDone("simpleFoam")) return 0;
         while (!converged && time.loop())
         {
             iter = time.timeIndex();
