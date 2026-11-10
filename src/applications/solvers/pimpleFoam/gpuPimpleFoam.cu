@@ -64,13 +64,11 @@ using namespace brae;
 
 namespace {
 
+// Time::timeName at the run's timeFormat and timePrecision (start_time.cuh), shared with the writer. This driver's own
+// copy formatted %g whatever the case said.
 std::string timeName(scalar t)
 {
-    if (t == std::floor(t) && std::fabs((double)t) < 1e15)
-        return std::to_string((long long)std::llround((double)t));
-    char b[64];
-    std::snprintf(b, sizeof b, "%g", (double)t);
-    return std::string(b);
+    return openFoamTimeName(static_cast<double>(t));
 }
 
 // parsePimpleDdtScheme: pimple_controls.cuh (shared with `brae check`)
@@ -107,6 +105,7 @@ try
         else if (a == "-case" && i + 1 < argc) caseDir = argv[++i];
         else if (a[0] != '-')                  caseDir = a;
     }
+    setCaseEnvironment(caseDir);   // FOAM_CASE, before any dictionary is read (argList.C:891-893)
 
     // ---- case dictionaries ----
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
@@ -244,10 +243,9 @@ try
     // THIS DRIVER'S OWN COPY WAS WRONG. It tested only `latestTime`, so `startFrom firstTime` fell
     // through to startTime and was silently ignored -- OF resolves both. Found by consolidating three
     // hand-written copies of one behaviour, which is the second such defect in this sweep after phi.
-    std::string startStr = resolveStartTime(caseDir,
-                                            controlDict.wordOr("startFrom", "startTime"),
-                                            timeName(startTime));
-    startTime = static_cast<scalar>(std::strtod(startStr.c_str(), nullptr));
+    const StartTime start = resolveStartTime(caseDir, controlDict);
+    std::string startStr = start.name;
+    startTime = static_cast<scalar>(start.value);
     const std::string fieldDir = caseDir + "/" + startStr;
     GeometricField<vector> U = buildField<vector>(readField<vector>(fieldDir + "/U"), fvp, nC); U.evaluateBoundary();
     const FieldData<scalar> pFd = readField<scalar>(fieldDir + "/p");

@@ -87,6 +87,7 @@ int main(int argc, char** argv)
             // directory -- a different case, or a "no polyMesh" abort with the user's argument in hand.
             else if (!a.empty() && a[0] != '-') caseDir = a;
         }
+        setCaseEnvironment(caseDir);   // FOAM_CASE, before any dictionary is read (argList.C:891-893)
 
         // THE OF-MIRROR PATH, opt-in. `application rhoSimpleFoam` routes to this binary, whose body
         // below is the PRE-MIRROR implementation; the mirror is the re-port under this directory that
@@ -157,14 +158,12 @@ int main(int argc, char** argv)
         // latestTime` (the standard way to CONTINUE a compressible run) silently restarted from scratch
         // and then converged to a perfectly good answer, having discarded the restart.
         mark__("patches built");
-        const std::string startName = resolveStartTime(
-            caseDir,
-            controlDict.wordOr("startFrom", "startTime"),
-            controlDict.wordOr("startTime", "0"));
+        const StartTime start = resolveStartTime(caseDir, controlDict);
+        const std::string startName = start.name;
         const std::string t0 = caseDir + "/" + startName;
         // The ABSOLUTE time this run begins at. endTime is absolute too (OF's Time::run() tests
         // value() < endTime - 0.5*deltaT), so the run length is endTime - startTime -- see the loop.
-        const scalar tStart = static_cast<scalar>(std::strtod(startName.c_str(), nullptr));
+        const scalar tStart = static_cast<scalar>(start.value);
         GeometricField<vector> U = buildField<vector>(readField<vector>(t0 + "/U"), fvp, nC);
         const FieldData<scalar> pFd = readField<scalar>(t0 + "/p");
         GeometricField<scalar> p = buildField<scalar>(pFd, fvp, nC);

@@ -217,6 +217,7 @@ int main(int argc, char** argv)
             else if (a[0] != '-')
                 caseDir = a;
         }
+        setCaseEnvironment(caseDir);   // FOAM_CASE, before any dictionary is read (argList.C:891-893)
         // The case names its solver (controlDict `application`), so `brae` is the only command a user types: this
         // executable keeps the steady cases and hands the others to the brae solver that owns them, before any dict
         // read or CUDA init. -partition is solver-agnostic prep (mesh + AMG cache) and always runs here.

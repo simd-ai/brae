@@ -1449,6 +1449,30 @@ add_test(NAME timeloop_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO)
 set_tests_properties(timeloop_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 
+# The start directory is timeName(startTime) at the case's timeFormat and timePrecision, and startFrom defaults to
+# latestTime, against real OpenFOAM on simpleFoam (the default `brae` path) and pimpleFoam; `brae check` must name the
+# directory the run reads. `startTime 0.;` (as ANSA writes it) is the arm that found it.
+add_test(NAME start_time_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/start_time_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pimFR)
+set_tests_properties(start_time_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+# `#include "${FOAM_CASE}/..."`, #eval of the included variables and a coded function object's verbatim `#include`s,
+# as occDrivAerStaticMesh writes them, read as OpenFOAM reads them: brae on the structured case is brae on OpenFOAM's
+# own `foamDictionary -expand` of it, byte for byte
+add_test(NAME case_include_eval_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/case_include_eval_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailySST)
+set_tests_properties(case_include_eval_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+# The turbulence model is the one simulationType names: an LES{} block under `simulationType RAS` is not read, by OpenFOAM
+# or by brae (it ran the LES model, occDrivAerRotMesh's RANS stage); `simulationType LES` takes it
+add_test(NAME turbulence_simulation_type_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/turbulence_simulation_type_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailySST)
+set_tests_properties(turbulence_simulation_type_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
 add_test(NAME closure_gradlimit_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/closure_gradlimit_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/windAroundBuildingsBox)
@@ -2097,8 +2121,36 @@ endforeach()
 
 # The single-GPU device-resident solver app: brae -case <caseDir>
 add_executable(brae src/applications/solvers/simpleFoam/gpuSimpleFoam.cu)
-target_include_directories(brae PRIVATE ${BRAE_HEADER_DIRS})
+target_include_directories(brae PRIVATE ${BRAE_HEADER_DIRS} src/applications/solvers/pimpleFoam)
 target_link_libraries(brae PRIVATE brae_core)
+# `brae --version`: the release, the commit the build was configured at (a later commit without a reconfigure keeps the older
+# one, so the line says "configured at"), and the CUDA architectures the device code was compiled for
+execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} rev-parse --short=12 HEAD
+                OUTPUT_VARIABLE BRAE_GIT_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} status --porcelain --untracked-files=no
+                OUTPUT_VARIABLE BRAE_GIT_DIRTY OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+# A source tarball has no .git, and a delivered binary must still name its source: whoever packs the tree from a commit
+# writes that commit into BRAE_SOURCE_COMMIT at its root (one line, a hex hash), and --version says it was stamped there.
+# Without either, the commit is "unknown" and --version says why.
+set(BRAE_COMMIT_ORIGIN "git")
+if(NOT BRAE_GIT_COMMIT AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/BRAE_SOURCE_COMMIT)
+    file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/BRAE_SOURCE_COMMIT _brae_stamp LIMIT_COUNT 1)
+    string(STRIP "${_brae_stamp}" _brae_stamp)
+    if(_brae_stamp MATCHES "^[0-9a-f]+$")
+        string(SUBSTRING "${_brae_stamp}" 0 12 BRAE_GIT_COMMIT)
+        set(BRAE_COMMIT_ORIGIN "stamp")
+    else()
+        message(FATAL_ERROR "BRAE_SOURCE_COMMIT holds '${_brae_stamp}', not a commit hash")
+    endif()
+endif()
+if(NOT BRAE_GIT_COMMIT)
+    set(BRAE_GIT_COMMIT "unknown")
+    set(BRAE_COMMIT_ORIGIN "none")
+elseif(BRAE_GIT_DIRTY)
+    string(APPEND BRAE_GIT_COMMIT "+modified")
+endif()
+target_compile_definitions(brae PRIVATE BRAE_VERSION_STRING="${PROJECT_VERSION}" BRAE_GIT_COMMIT="${BRAE_GIT_COMMIT}"
+                           BRAE_COMMIT_ORIGIN="${BRAE_COMMIT_ORIGIN}" BRAE_CUDA_ARCHS_STRING="${CMAKE_CUDA_ARCHITECTURES}")
 
 # The single-GPU device-resident TRANSIENT solver app (PIMPLE): brae_pimpleFoam <caseDir>. Reuses DeviceSimpleSolver's
 # three composable phases via pimpleStep, with implicit fvm::ddt(U). v1 laminar.
@@ -5159,6 +5211,18 @@ add_test(NAME brae_subcommands
                  $<TARGET_FILE:brae>
                  ${CMAKE_CURRENT_BINARY_DIR}/brae_subcommands_work)
 set_tests_properties(brae_subcommands PROPERTIES TIMEOUT 300)
+# The command line's commands -- --version, solvers, capabilities, check, run -- on real cases, every refusal of `brae check` a
+# negative control that must exit 2 naming its setting, case directories named like the commands still running as cases, and
+# every gate a capability names held to this list of tests
+add_test(NAME brae_cli
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/brae_cli.sh
+                 $<TARGET_FILE:brae> ${CMAKE_CURRENT_BINARY_DIR}/brae_cli_work ${CMAKE_CURRENT_SOURCE_DIR}
+                 ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(brae_cli PROPERTIES TIMEOUT 900)
+# patchFieldTypeNames (what `brae capabilities` lists and `brae check` consults) is the boundary-condition factory's branches,
+# with its own mutation control
+add_test(NAME brae_patch_types_vs_factory
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/brae_patch_types_vs_factory.py ${CMAKE_CURRENT_SOURCE_DIR})
 
 # `brae benchmark <sample>` end to end against a LOCAL fixture template repo: fetch, cache, manifest, and the
 # security guard that refuses a sample carrying coded (NVRTC-compiled) boundary conditions. Solves the committed

@@ -388,7 +388,19 @@ inline void readTurbulenceModel(
         {
             // simulationType LES: DES/LES models live under an LES{} sub-dict (OF convention). SA-DDES reuses the SA
             // transport (ctl.sa) plus the DES length-scale limiter (ctl.des); only cubeRootVol delta is supported (v1).
-            if (const FoamDict* les = turbProps.subDict("LES"))
+            //
+            // THE SUB-DICTIONARY IS THE ONE simulationType NAMES: turbulenceModel::New selects RASModel or LESModel by it
+            // and never reads the other. This took LES{} whenever the file held one, so occDrivAerRotMesh's RANS stage --
+            // `simulationType RAS` with both blocks, as many cases keep them -- ran its kOmegaSSTDDES where OpenFOAM runs
+            // kOmegaSST. `simulationType LES` with no LES{} stops OpenFOAM, and is refused here.
+            const bool lesType = turbProps.wordOr("simulationType", "laminar") == "LES";
+            const FoamDict* les = lesType ? turbProps.subDict("LES") : nullptr;
+            if (lesType && !les)
+            {
+                throw std::runtime_error("brae: constant/turbulenceProperties says `simulationType LES` and holds no LES "
+                                         "dictionary; OpenFOAM's LESModel::New reads its model from it and stops");
+            }
+            if (les)
             {
                 const std::string model = turbulenceModelWord(les, "LESModel");
                 const bool saIddes  = (model == "SpalartAllmarasIDDES");

@@ -231,10 +231,9 @@ public:
          const std::vector<std::string>& appliedOutside = {})
       : owned_(controlDict), wc_(&owned_), nSteps_(0)
     {
-        startName_ = resolveStartTime(caseDir,
-                                      controlDict.wordOr("startFrom", "startTime"),
-                                      controlDict.wordOr("startTime", "0"));
-        owned_.setStartTime(static_cast<scalar>(std::strtod(startName_.c_str(), nullptr)));
+        const StartTime start = resolveStartTime(caseDir, controlDict);
+        startName_ = start.name;
+        owned_.setStartTime(static_cast<scalar>(start.value));
         for (const auto& t : types) functionObjects_.registerType(t.first, t.second);
         functionObjects_.read(controlDict.subDict("functions"), approximatedOutside, appliedOutside);
     }

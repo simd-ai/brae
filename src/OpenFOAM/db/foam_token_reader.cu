@@ -313,6 +313,18 @@ std::string expandIncludes(const std::string& text, const std::string& baseDir, 
             i = end;
             continue;
         }
+        // ...nor is one inside a verbatim block: `#{ ... #}` is ONE string token to OpenFOAM's lexer (ISstream::
+        // readVerbatim), the C++ of a coded function object or boundary condition, and its `#include "clockValue.H"`
+        // is for the compiler. occDrivAerStaticMesh's FOwallClockTimeStatistics carries three, and brae went looking
+        // for system/clockValue.H.
+        if (text[i] == '#' && i + 1 < text.size() && text[i + 1] == '{')
+        {
+            const std::size_t close = text.find("#}", i + 2);
+            const std::size_t end = (close == std::string::npos) ? text.size() : close + 2;
+            out += text.substr(i, end - i);
+            i = end;
+            continue;
+        }
         // ...and neither is one inside a string, nor is a "//" there a comment (`"http://..."`)
         if (text[i] == '"')
         {
@@ -580,6 +592,13 @@ std::string captureVerbatim(const std::string& text, std::vector<std::string>& s
 
 } // namespace
 
+// stripComments for a reader outside this file: `brae check`'s scan of the boundary file, where a comment holding
+// a "(" before the patch list was taken for the list
+std::string stripFoamComments(const std::string& s)
+{
+    return stripComments(s);
+}
+
 // #eval{...} / #calc "..." -- OF src/OpenFOAM/expressions. Run AFTER $macro expansion, because the
 // bodies reference macros. An expression that cannot be evaluated exactly THROWS from evalExpression;
 // it is never defaulted, since an #eval that quietly became 0 is a silently wrong control value.
@@ -633,9 +652,14 @@ std::string expandEvalDirectives(const std::string& text)
                         throw std::runtime_error("brae: unterminated #" + dir + " expression");
                     bodyStart = k + 1; bodyEnd = e; next = e + 1;
                 }
+                // THE BODY'S OWN #eval FIRST. OpenFOAM evaluates `kref #eval{ ... };` as it reads that entry, so a later
+                // `#eval{ $kref/$nutref }` sees numbers; here $macros expand before any #eval, and the body arrived holding
+                // the inner directives' text (occDrivAerStaticMesh's 0/omega: "unexpected character '#'"). Evaluated
+                // innermost first and written at %.17g, which reads back as the same double the entry holds in OpenFOAM.
                 char buf[64];
                 std::snprintf(buf, sizeof(buf), "%.17g",
-                              static_cast<double>(evalExpression(text.substr(bodyStart, bodyEnd - bodyStart))));
+                              static_cast<double>(evalExpression(
+                                  expandEvalDirectives(text.substr(bodyStart, bodyEnd - bodyStart)))));
                 out += buf;
                 i = next;
                 continue;

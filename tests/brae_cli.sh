@@ -114,6 +114,24 @@ for c in steady transient; do
         bad "check $c case" "exit $rc: $(grep -E 'refused|error|verdict' "$WORK/check-$c.log" | head -n 3 | tr '\n' ' ')"
     fi
 done
+# a comment holding a "(" between the boundary file's header and its patch list is a comment, as OpenFOAM's lexer reads it:
+# check took it for the list and said "lists no patch" (a reconstructed boundary file, 2026-11-10)
+commented="$WORK/commented"
+rm -rf "$commented"
+cp -r "$steady" "$commented"
+python3 - "$commented/constant/polyMesh/boundary" << 'PY3'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+i = s.index('}', s.index('FoamFile')) + 1
+open(p, 'w').write(s[:i] + '\n// a note (with parentheses) before the list\n/* and (another) */\n' + s[i:])
+PY3
+n=$(grep -cE '^\s+type\s' "$steady/constant/polyMesh/boundary")
+"$BIN" check -case "$commented" > "$WORK/check-commented.log" 2>&1
+rc=$?
+grep -q "mesh .* $n patches" "$WORK/check-commented.log" && [ $rc -lt 2 ] \
+    && ok "check reads a boundary file with a commented '(' before its list: $n patches" \
+    || bad "commented boundary file" "exit $rc: $(grep -E 'mesh|verdict' "$WORK/check-commented.log" | tr '\n' ' ')"
 
 # ---- NEGATIVE CONTROLS: each must exit 2 and name what it refuses ------------------------------------------------------------
 control()   # <name> <expected word> <setup command run inside the copy>
@@ -158,6 +176,31 @@ mkdir -p "$WORK/notacase"
 "$BIN" check -case "$WORK/notacase" > "$WORK/ctl-notacase.log" 2>&1
 rc=$?
 [ $rc = 3 ] && ok "CONTROL a directory with no controlDict: exit 3" || bad "CONTROL notacase" "exit $rc"
+
+# a dynamicFvMesh brae does not implement, on the transient case: refused by check, as pimpleFoam's setup refuses it
+ctl_dyn="$WORK/ctl-dynmesh"
+rm -rf "$ctl_dyn"
+cp -r "$transient" "$ctl_dyn"
+printf 'FoamFile { version 2.0; format ascii; class dictionary; object dynamicMeshDict; }\ndynamicFvMesh dynamicMultiMotionSolverFvMesh;\n' \
+    > "$ctl_dyn/constant/dynamicMeshDict"
+"$BIN" check -case "$ctl_dyn" > "$WORK/ctl-dynmesh.log" 2>&1
+rc=$?
+[ $rc = 2 ] && grep -q "dynamicMultiMotionSolverFvMesh" "$WORK/ctl-dynmesh.log" \
+    && ok "CONTROL dynamicFvMesh dynamicMultiMotionSolverFvMesh refused by check (exit 2), as the solver refuses it" \
+    || bad "CONTROL dynmesh" "exit $rc: $(tail -n 3 "$WORK/ctl-dynmesh.log" | tr '\n' ' ')"
+
+# two active MRF zones on the steady case: simpleFoam rotates one and refuses a second, and check says so (occDrivAerRotMesh's
+# RANS stage has four)
+ctl_mrf="$WORK/ctl-mrf2"
+rm -rf "$ctl_mrf"
+cp -r "$steady" "$ctl_mrf"
+printf 'FoamFile { version 2.0; format ascii; class dictionary; object MRFProperties; }\nMRF_A { cellZone zA; active yes; nonRotatingPatches (); origin (0 0 0); axis (0 0 1); omega 1; }\nMRF_B { cellZone zB; active yes; nonRotatingPatches (); origin (0 0 0); axis (0 0 1); omega 1; }\n' \
+    > "$ctl_mrf/constant/MRFProperties"
+"$BIN" check -case "$ctl_mrf" > "$WORK/ctl-mrf2.log" 2>&1
+rc=$?
+[ $rc = 2 ] && grep -q "2 active zones (MRF_A, MRF_B)" "$WORK/ctl-mrf2.log" \
+    && ok "CONTROL two active MRF zones refused by check (exit 2), as simpleFoam refuses them" \
+    || bad "CONTROL mrf2" "exit $rc: $(tail -n 3 "$WORK/ctl-mrf2.log" | tr '\n' ' ')"
 
 # ---- command words beside case directories -----------------------------------------------------------------------------------
 words=$WORK/words

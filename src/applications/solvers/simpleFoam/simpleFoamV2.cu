@@ -743,10 +743,9 @@ int runSimpleFoamV2(const std::string& caseDir)
     // simpleBoxIO staged with 0/ and 7/ and endTime 10, real OpenFOAM starts at 7 and takes 3 steps
     // while this took 10 from 0. resolveStartTime is the helper the legacy driver already uses, so the
     // two paths cannot disagree about which directory a case restarts from.
-    const std::string startTime = resolveStartTime(caseDir,
-                                                   controlDict.wordOr("startFrom", "startTime"),
-                                                   controlDict.wordOr("startTime", "0"));
-    const scalar startTimeVal = static_cast<scalar>(std::strtod(startTime.c_str(), nullptr));
+    const StartTime start = resolveStartTime(caseDir, controlDict);
+    const std::string startTime = start.name;
+    const scalar startTimeVal = static_cast<scalar>(start.value);
     cpu::SimpleFields f = cpu::createFields(caseDir + "/" + startTime, simpleDict, m, g, fvp);
 
     cpu::SimpleControlDict cd = cpu::readSimpleControl(fvSolution);
