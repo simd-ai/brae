@@ -1473,6 +1473,14 @@ add_test(NAME turbulence_simulation_type_vs_openfoam
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailySST)
 set_tests_properties(turbulence_simulation_type_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 
+# velocityDampingConstraint (occDrivAerStaticMesh's fvOption) against real OpenFOAM on one GPU: selectionMode all and a cellZone,
+# pitzDaily restarted from OpenFOAM's iteration 50, 5 tight iterations; a missing UMax, selectionMode points and a missing zone
+# refused by the run and by `brae check`
+add_test(NAME fvoptions_velocity_damping_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/fvoptions_velocity_damping_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+set_tests_properties(fvoptions_velocity_damping_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
 add_test(NAME closure_gradlimit_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/closure_gradlimit_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/windAroundBuildingsBox)

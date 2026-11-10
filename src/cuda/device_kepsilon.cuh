@@ -186,6 +186,9 @@ struct DeviceWallData
     // filling this struct still carries one flag for every wall, and the kernel falls back to the
     // scalar it is passed -- the same nullable convention as the five above.
     DeviceBuffer<scalar> wfLowRe;
+    // Per boundary face, in the boundary descriptors' order (coupled interfaces left out, as bndIsWall_): 1 on a wall-type patch,
+    // where wallDist's y is 0 -- what kOmegaSSTBase::F1 evaluates on a wall face (deviceF1OnPatch)
+    DeviceBuffer<label>  isWallFace;
 };
 // The predicate the wall set is built on, in one place so the DeviceWallData faces and the wall-face ->
 // boundary-face map below cannot drift apart.
@@ -316,6 +319,15 @@ inline DeviceWallData buildDeviceWallData(
     w.invNw.copyFrom(invNw);
     w.isWallCell.copyFrom(isW);
     w.wallW.copyFrom(wallW);
+    {
+        std::vector<label> wallFace;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            wallFace.insert(wallFace.end(), static_cast<std::size_t>(fvp[pi].size), fvp[pi].type == "wall" ? 1 : 0);
+        }
+        w.isWallFace.copyFrom(wallFace);
+    }
     return w;
 }
 

@@ -5014,7 +5014,7 @@ SimplecSnGrad simplecSnGrad(
             vdcUMax_ = fo.vdcUMax;
             vdcC_ = fo.vdcC;
             std::vector<label> vc = fo.vdcCells;
-            if (vc.empty())   // selectionMode all
+            if (fo.vdcAll)   // selectionMode all; an EMPTY cellZone selection damps nothing (a part may hold none of it)
             {
                 vc.resize(nC_);
                 for (label c = 0; c < nC_; ++c)

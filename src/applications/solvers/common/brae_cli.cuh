@@ -23,6 +23,7 @@
 #include "start_time.cuh"
 #include "solid_body_motion.cuh"   // readMeshMotion: what pimpleFoam refuses of a dynamicMeshDict
 #include "mrf_read.cuh"            // readMRFProperties: the zones simpleFoam rotates
+#include "fv_options.cuh"          // readFvOptions: what every solver here refuses of an fvOptions
 #include "patch_entry_lookup.cuh"  // findPatchEntry: the entry a patch takes, the solver's rule
 #include "pimple_controls.cuh"
 #include "fv_patch_field.cuh"
@@ -31,6 +32,7 @@
 #include "check_setup.cuh"
 
 #include <cuda_runtime.h>
+#include <algorithm>
 
 #include <cstdio>
 #include <cstdlib>
@@ -104,6 +106,8 @@ inline std::string caseOf(int argc, char** argv, int first)
         const std::string a = argv[i];
         if (a == "-case" && i + 1 < argc)
             c = argv[++i];
+        else if (a == "-np" && i + 1 < argc)
+            ++i;   // `check -parallel -np N`: the rank count, not a case
         else if (!a.empty() && a[0] != '-')
             c = a;
     }
@@ -130,7 +134,12 @@ inline std::string mgpuSibling()
 }
 
 // A command's standard output, "" on failure
-inline std::string captureCommand(const std::string& cmd)
+// what cmd printed, or "" when it exited non-zero -- unless keepOnFailure: `brae-mgpu check` exits 1 on a notice and 2 on a
+// refusal, and its lines ARE the answer then (brief #15: dropping them made every multi-GPU check of the official DrivAer case read
+// "gave no answer")
+inline std::string captureCommand(
+    const std::string& cmd,
+    bool keepOnFailure = false)
 {
     std::string out;
     FILE* p = popen(cmd.c_str(), "r");
@@ -138,7 +147,7 @@ inline std::string captureCommand(const std::string& cmd)
     char buf[4096];
     std::size_t n;
     while ((n = std::fread(buf, 1, sizeof buf, p)) > 0) out.append(buf, n);
-    if (pclose(p) != 0) return "";
+    if (pclose(p) != 0 && !keepOnFailure) return "";
     return out;
 }
 
@@ -527,7 +536,14 @@ inline int checkCommand(int argc, char** argv)
 {
     const std::string caseDir = caseOf(argc, argv, 2);
     const bool setup = hasFlag(argc, argv, 2, "--setup");
-    std::printf("brae check %s\n", caseDir.c_str());
+    // THE EXECUTION MODE THE RUN WILL USE. `-parallel` is the multi-GPU layer (brae-mgpu), whose distributed drivers refuse inputs
+    // the single-GPU path runs: check passed occDrivAerStaticMesh while brae-mgpu refused its velocityDampingConstraint at run
+    // time (brief #14). In that mode the layer's own check is run and merged below, and --setup is its set-up on every rank.
+    const bool parallel = hasFlag(argc, argv, 2, "-parallel");
+    int np = 0;
+    for (int i = 2; i + 1 < argc; ++i)
+        if (std::string(argv[i]) == "-np") np = std::atoi(argv[i + 1]);
+    std::printf("brae check %s%s\n", caseDir.c_str(), parallel ? " -parallel (multi-GPU)" : "");
     if (!isCaseDirectory(caseDir))
     {
         std::printf("  [error]   %s has no system/controlDict: not an OpenFOAM case\nverdict: CASE ERROR\n", caseDir.c_str());
@@ -541,10 +557,20 @@ inline int checkCommand(int argc, char** argv)
         controlDict = readDict(caseDir + "/system/controlDict");
         const SolverDecision d = decideSolver(caseDir, controlDict);
         solver = d.row;
-        return std::string(solver->application) + " (" + solver->exe + ", 1 GPU): " + solver->what;
+        // in -parallel the run is brae-mgpu's: its own mgpu-solver line below says whether it carries the application
+        const std::string mode = parallel ? std::string(" (multi-GPU: brae-mgpu, its mgpu-solver line below)")
+                                          : std::string(" (") + solver->exe + ", 1 GPU)";
+        return std::string(solver->application) + mode + ": " + solver->what;
     });
     const std::string app = solver ? solver->application : "";
     const bool legacyFamily = (app == "simpleFoam" || app == "pimpleFoam" || app == "rhoSimpleFoam");
+    const std::string mgpu = parallel ? mgpuSibling() : std::string();
+    if (parallel && mgpu.empty())
+        r.add("mode", "refused", "-parallel needs the multi-GPU layer, brae-mgpu, installed next to brae; this install has none");
+    else if (parallel)
+        r.add("mode", "ok", "multi-GPU: " + mgpu + (np > 0 ? ", " + std::to_string(np) + " ranks" : ", ranks from decomposeParDict"));
+    else
+        r.add("mode", "ok", "one GPU (brae -case); -parallel checks the multi-GPU layer");
 
     // the mesh: its patches, as the boundary file names them -- name, type and inGroups, what the solver's field reader
     // resolves each boundaryField entry against (findPatchEntry)
@@ -692,6 +718,36 @@ inline int checkCommand(int argc, char** argv)
         r.add("fvSchemes", "notice", app + " reads its fvSchemes and fvSolution with its own reader: `brae check --setup` runs it");
     }
 
+    // fvOptions, through readFvOptions, the reader every solver here calls: a source it cannot apply -- an unsupported type, a
+    // velocityDampingConstraint with no UMax or a selection it does not implement, a zone the mesh does not have -- is refused by
+    // name, as the solver refuses it at its set-up. The reader takes cell volumes and centres for a few sources' coefficients;
+    // check has no geometry, so it hands arrays the size of the zones' cells (what a selection indexes), and their values are
+    // not reported.
+    if (legacyFamily && (std::filesystem::exists(caseDir + "/system/fvOptions") || std::filesystem::exists(caseDir + "/constant/fvOptions")))
+    {
+        checkStep(r, "fvOptions", [&]() {
+            const std::map<std::string, std::vector<label>> zones = readCellZones(caseDir + "/constant/polyMesh");
+            label n = 0;
+            for (const auto& z : zones)
+                for (const label c : z.second)
+                    n = std::max(n, c + 1);
+            const std::vector<scalar> V(static_cast<std::size_t>(n), scalar(1));
+            const std::vector<vector> C(static_cast<std::size_t>(n), vector{0, 0, 0});
+            const FvOptionsData fo = readFvOptions(caseDir, zones, V, n, C);
+            if (!fo.unsupported.empty())
+            {
+                std::string all;
+                for (const std::string& u : fo.unsupported) all += "\n              " + u;
+                throw std::runtime_error(std::to_string(fo.unsupported.size()) + " fvOptions source(s) brae cannot apply:" + all);
+            }
+            std::string what = std::to_string(fo.count) + " source(s)";
+            if (fo.vdcActive)
+                what += std::string(", velocityDampingConstraint UMax ") + std::to_string(fo.vdcUMax) +
+                        (fo.vdcAll ? " on every cell" : " on " + std::to_string(fo.vdcCells.size()) + " zone cells");
+            return what;
+        });
+    }
+
     // MRF, through the reader simpleFoam calls (mrf_read.cuh): one active zone runs; a second is refused, by the solver and so
     // here. pimpleFoam applies none, and refuses an active zone at its setup.
     if ((app == "simpleFoam" || app == "pimpleFoam") && std::filesystem::exists(caseDir + "/constant/MRFProperties"))
@@ -787,6 +843,36 @@ inline int checkCommand(int argc, char** argv)
                (unusedEntries ? " (" + std::to_string(unusedEntries) + " entries no patch takes, not built)" : std::string());
     });
 
+    // the multi-GPU layer's own rules for the case, in its lines (brae-mgpu check: the solver, the decomposition, what the
+    // distributed step refuses, a rank's memory), merged into this report
+    if (parallel && !mgpu.empty())
+    {
+        const std::string out = captureCommand("'" + mgpu + "' check -case '" + caseDir + "'" + (np > 0 ? " -np " + std::to_string(np) : "")
+                                                   + " 2>&1",
+                                               true);
+        std::istringstream ls(out);
+        std::string line;
+        int merged = 0;
+        while (std::getline(ls, line))
+        {
+            const std::size_t a = line.find('[');
+            const std::size_t b = line.find(']', a == std::string::npos ? 0 : a);
+            if (a == std::string::npos || b == std::string::npos || line.compare(0, 2, "  ") != 0) continue;
+            std::string verdict = line.substr(a + 1, b - a - 1);
+            while (!verdict.empty() && verdict.back() == ' ') verdict.pop_back();
+            std::istringstream rest(line.substr(b + 1));
+            std::string topic;
+            rest >> topic;
+            std::string text;
+            std::getline(rest, text);
+            const std::size_t t0 = text.find_first_not_of(' ');
+            r.add(topic, verdict, t0 == std::string::npos ? std::string() : text.substr(t0));
+            ++merged;
+        }
+        if (merged == 0)
+            r.add("mgpu", "refused", "brae-mgpu check gave no answer: " + out.substr(0, 200));
+    }
+
     // the GPU this machine has (the check itself needs none)
     {
         int n = 0;
@@ -798,6 +884,58 @@ inline int checkCommand(int argc, char** argv)
             cudaGetDeviceProperties(&p, 0);
             r.add("GPU", "ok", std::to_string(n) + " x " + p.name + ", sm_" + std::to_string(p.major) + std::to_string(p.minor) + ", " +
                                    std::to_string(p.totalGlobalMem >> 30) + " GiB");
+        }
+    }
+
+    // ONE GPU's memory against the case's cell count (the multi-GPU layer's own estimate a rank is in its memory line). The figures
+    // are measured, not modelled (brief #15, Arrhenius 5117734, the device pool's own count): occDrivAerStaticMesh's 65,334,765
+    // cells (kOmegaSST, SIMPLEC, 3.1 faces a cell) set up at a peak of 76.568 GiB, 1,258 bytes a cell, and its first step asked for
+    // more than 94.6 GiB of the GH200's 95 and stopped out of memory in the momentum matrix's assembly: more than 1,555 bytes a
+    // cell in the pool, with 0.6 GiB held outside it (the CUDA context and libraries: 95.000 GiB less 94.100 in use less 0.291
+    // free). A lower bound, so a case past it is refused and one below it is not promised to fit. Without the 0.6 GiB the line
+    // called the very case that ran out "within 20%" (94.6 of 95 GiB, Arrhenius 5121678).
+    if (!parallel && app == "simpleFoam")
+    {
+        constexpr double setupBytesPerCell = 1258.0;
+        constexpr double stepBytesPerCellAtLeast = 1555.0;
+        constexpr double outsidePoolGiB = 0.6;
+        std::ifstream f(caseDir + "/constant/polyMesh/owner");
+        std::string head(4096, '\0');
+        f.read(&head[0], static_cast<std::streamsize>(head.size()));
+        head.resize(static_cast<std::size_t>(f.gcount()));
+        const std::size_t at = head.find("nCells:");
+        std::error_code ec;
+        const auto ownerBytes = std::filesystem::file_size(caseDir + "/constant/polyMesh/owner", ec);
+        // no `note "... nCells:N ..."` header (OpenFOAM's writers put one; some generated meshes have none): a mesh whose owner
+        // file is under 100 MB (some 10M faces in ascii) is far below any GPU's memory, one above is not judged
+        if (at == std::string::npos && !ec && ownerBytes < 100000000)
+            r.add("memory", "ok", "no cell count in the owner file's header; a small mesh (owner " + std::to_string(ownerBytes / 1000000)
+                                  + " MB): no estimate needed");
+        else if (at == std::string::npos)
+            r.add("memory", "notice", "the cell count is not in the owner file's header: no estimate");
+        else
+        {
+            const double cells = std::atof(head.c_str() + at + 7);
+            const double gib = 1073741824.0;
+            const double setupGiB = cells * setupBytesPerCell / gib;
+            const double stepGiB = cells * stepBytesPerCellAtLeast / gib + outsidePoolGiB;
+            int n = 0;
+            cudaDeviceProp p{};
+            const bool gpu = cudaGetDeviceCount(&n) == cudaSuccess && n > 0 && cudaGetDeviceProperties(&p, 0) == cudaSuccess;
+            const double have = gpu ? static_cast<double>(p.totalGlobalMem) / gib : 0.0;
+            char t[600];
+            std::snprintf(t, sizeof t, "%.0f cells: the set-up about %.1f GiB and the first step more than %.1f GiB (1,258 and more than "
+                          "1,555 bytes a cell and 0.6 GiB outside the pool, measured on occDrivAerStaticMesh's 65.3M cells, kOmegaSST "
+                          "SIMPLEC)%s", cells, setupGiB,
+                          stepGiB, gpu ? (", this GPU has " + std::to_string(static_cast<int>(have)) + " GiB").c_str() : "");
+            if (gpu && stepGiB > have)
+                r.add("memory", "refused", std::string(t) + ": it does not fit on one GPU -- run it on several with -parallel");
+            else if (!gpu)
+                r.add("memory", "notice", std::string(t) + ": no GPU here to hold it against");
+            else if (stepGiB > 0.8 * have)
+                r.add("memory", "notice", std::string(t) + ": within 20% of this GPU's memory, where the step's peak is not measured");
+            else
+                r.add("memory", "ok", t);
         }
     }
 
@@ -816,6 +954,20 @@ inline int checkCommand(int argc, char** argv)
     }
     else
         std::printf("verdict: SUPPORTED\n");
+    if (setup && code < 2 && parallel && !mgpu.empty())
+    {
+        // every rank of the caller's launch (`mpirun -np N brae check -case D -parallel --setup`) sets its partition up in brae-mgpu
+        // and stops before the first step, saying its own GPU's memory
+        std::fflush(stdout);
+        setenv("BRAE_CHECK_SETUP", "1", 1);
+        std::vector<std::string> args = {mgpu, "-case", caseDir};
+        std::vector<char*> av;
+        for (std::string& a : args) av.push_back(a.data());
+        av.push_back(nullptr);
+        execv(mgpu.c_str(), av.data());
+        std::printf("--setup: cannot start %s\n", mgpu.c_str());
+        return 2;
+    }
     if (setup && code < 2 && solver)
     {
         // Only a solver path that stops before its first step under BRAE_CHECK_SETUP (check_setup.cuh) is handed the case: any

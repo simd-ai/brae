@@ -19,6 +19,9 @@
 #   unknown application exactly as `brae -case D` does
 #   check --setup on the steady case (a GPU): the solver sets the case up and stops before its first iteration
 #   -parallel with no multi-GPU layer installed is refused, naming brae-mgpu
+#   memory (one GPU, a GPU visible): the steady case's line is ok; CONTROL its copy with an owner header claiming 200,000,000
+#   cells (310 GiB at the measured 1,555 bytes a cell, past any GPU's memory) is refused, "does not fit on one GPU" (brief #15:
+#   check called occDrivAerStaticMesh's 65.3M cells runnable on one GH200, where its first step ran out of memory)
 set -u
 BIN="${1:?brae binary}"
 WORK="${2:?work dir}"
@@ -201,6 +204,58 @@ rc=$?
 [ $rc = 2 ] && grep -q "2 active zones (MRF_A, MRF_B)" "$WORK/ctl-mrf2.log" \
     && ok "CONTROL two active MRF zones refused by check (exit 2), as simpleFoam refuses them" \
     || bad "CONTROL mrf2" "exit $rc: $(tail -n 3 "$WORK/ctl-mrf2.log" | tr '\n' ' ')"
+
+# the multi-GPU mode with no multi-GPU layer installed: refused by name (`brae check -parallel` checks the execution mode the run
+# will use, brief #15)
+"$BIN" check -case "$steady" -parallel > "$WORK/ctl-parallel.log" 2>&1
+rc=$?
+[ $rc = 2 ] && grep -q "needs the multi-GPU layer, brae-mgpu" "$WORK/ctl-parallel.log" \
+    && ok "CONTROL check -parallel with no brae-mgpu beside brae: refused (exit 2), naming brae-mgpu" \
+    || bad "CONTROL check -parallel" "exit $rc: $(grep -E 'mode|verdict' "$WORK/ctl-parallel.log" | tr '\n' ' ')"
+
+# one GPU's memory against the case's cell count (a GPU visible): the steady case fits, a header claiming 200M cells does not
+if command -v nvidia-smi > /dev/null 2>&1 && nvidia-smi -L > /dev/null 2>&1
+then
+    "$BIN" check -case "$steady" > "$WORK/mem-ok.log" 2>&1
+    grep -qE '^  \[ok +\] memory +[0-9]+ cells: ' "$WORK/mem-ok.log" \
+        && ok "memory: the steady case's line is ok ($(grep -m1 ' memory ' "$WORK/mem-ok.log" | cut -c22-80)...)" \
+        || bad "memory ok" "$(grep -E ' memory |verdict' "$WORK/mem-ok.log" | tr '\n' ' ')"
+    big="$WORK/big"
+    rm -rf "$big"
+    cp -r "$steady" "$big"
+    python3 - "$big/constant/polyMesh/owner" << 'PY4'
+import re, sys
+p = sys.argv[1]
+s = open(p, 'rb').read()
+t = re.sub(rb'nCells:\s*\d+', b'nCells:200000000', s, count=1)
+assert t != s, 'no nCells in the owner header'
+open(p, 'wb').write(t)
+PY4
+    "$BIN" check -case "$big" > "$WORK/mem-big.log" 2>&1
+    rc=$?
+    [ $rc = 2 ] && grep -qE '^  \[refused\] memory +200000000 cells: .*does not fit on one GPU' "$WORK/mem-big.log" \
+        && ok "CONTROL memory: 200M cells in the header refused on one GPU (exit 2)" \
+        || bad "CONTROL memory" "exit $rc: $(grep -E ' memory |verdict' "$WORK/mem-big.log" | tr '\n' ' ')"
+    # the measured case itself: occDrivAerStaticMesh's 65,334,765 cells ran out of a 95 GiB GH200 in its first step, so on a GPU
+    # of 95 GiB or less check must refuse it (lc11 called it "within 20%": the 0.6 GiB outside the pool left out, 5121678)
+    mib=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -n 1)
+    if [ "${mib:-0}" -le 97900 ]
+    then
+        python3 - "$big/constant/polyMesh/owner" << 'PY5'
+import re, sys
+p = sys.argv[1]
+s = open(p, 'rb').read()
+open(p, 'wb').write(re.sub(rb'nCells:\s*\d+', b'nCells:65334765', s, count=1))
+PY5
+        "$BIN" check -case "$big" > "$WORK/mem-65.log" 2>&1
+        rc=$?
+        [ $rc = 2 ] && grep -qE '^  \[refused\] memory +65334765 cells: .*does not fit on one GPU' "$WORK/mem-65.log" \
+            && ok "memory: occDrivAerStaticMesh's 65.3M cells refused on this ${mib} MiB GPU, as its first step ran out (exit 2)" \
+            || bad "memory 65.3M" "exit $rc: $(grep -E ' memory |verdict' "$WORK/mem-65.log" | tr '\n' ' ')"
+    fi
+else
+    echo "note: no GPU visible: the memory arms are not run"
+fi
 
 # ---- command words beside case directories -----------------------------------------------------------------------------------
 words=$WORK/words
