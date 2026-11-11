@@ -102,6 +102,20 @@ std::string foamBinaryToAscii(const std::vector<char>& in)
         std::size_t k = j;
         while (k < n && std::isspace((unsigned char)in[k])) ++k;
 
+        // An EMPTY binary list is its count alone: OpenFOAM writes `nl << len << nl` and the bytes with their delimiters only
+        // when len is not zero (UListIO.C:92-102, and reads it back the same way, :237-250), so a patch with no face on a part
+        // reads `value nonuniform List<scalar> \n0\n;`. Copied through, the ascii parser asked for '(' and refused a legal
+        // file (Arrhenius 5144475: foamFormatConvert's binary fields of a decomposed case, an empty patch on processor0; the
+        // official occDrivAerStaticMesh's parts are written binary). Written as the ascii empty list `0()`.
+        // TEST CONTROL BRAE_CONTROL_BINARY_EMPTY_LIST_ASIS: copied through as before
+        if (nCmpt != 0 && haveCount && count == 0 && k < n && in[k] != '(' && !std::getenv("BRAE_CONTROL_BINARY_EMPTY_LIST_ASIS"))
+        {
+            out.append(in.begin()+i, in.begin()+close+1);    // "...List<scalar>"
+            out += " 0()";
+            i = k;                                           // on from the ';'
+            continue;
+        }
+
         // Not a raw primitive payload (a word list, or no `N (` shape): copy through and continue.
         if (nCmpt == 0 || !haveCount || k >= n || in[k] != '(')
         {

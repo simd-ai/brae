@@ -76,6 +76,7 @@ endif()
 # brae_core, Phase 1 substrate (comm seam + interfaces). Grows as modules land.
 # ---------------------------------------------------------------------------
 add_library(brae_core STATIC
+    src/functionObjects/forces_device.cu
     src/parallel/pstream/cf_pstream.cu
     src/parallel/pstream/device_halo.cu
     src/parallel/pstream/device_reduce.cu
@@ -869,10 +870,14 @@ add_test(NAME sa_gradlimit_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_gradlimit_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/airFoil2D)
 set_tests_properties(sa_gradlimit_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
-# forceCoeffs sampled through a simpleFoam run on request (BRAE_FORCE_INTERVAL, BRAE_FORCE_FROM): the rows asked
-# for, the last one equal to the end-of-run evaluation; unset, no file. Fail-proofed against the binary before.
+# forceCoeffs through a simpleFoam run under the case's own controls (every step by default, writeInterval, timeStart):
+# the rows at the times asked for; no entry, no file
 add_test(NAME simple_force_sampling COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_force_sampling.sh)
 set_tests_properties(simple_force_sampling PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# functionObjects::forces and ::forceCoeffs against OpenFOAM v2412's on the same fields (brief #17): every column, the headers,
+# two controls, the lifecycle's times against OpenFOAM's own run, the restart's layout, and the refusals
+add_test(NAME functionobjects_forces_vs_openfoam COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/functionobjects_forces_vs_openfoam.sh)
+set_tests_properties(functionobjects_forces_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 # V2 on Spalart-Allmaras with a `calculated` nut patch (the boxy5 UAV's inlet_front): it took kEpsilon's nut
 # path and stopped on the empty epsilon boundary. It must run, and match the shipped `freestream` arrangement.
 add_test(NAME sa_v2_calculated_nut COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_v2_calculated_nut.sh)
