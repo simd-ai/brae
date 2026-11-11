@@ -9,11 +9,10 @@
 // (foam_field_reader/writer) + dict parsing (foam_dict) + turbulence model setup. BOTH the momentum ddt AND the
 // turbulence transport ddt (fvm::ddt(k/eps/omega/nuTilda)) are fully implicit + OF-exact -- the turbulence is transient
 // URANS/DES, not quasi-steady (see device_simple_foam.cu:294). fvSchemes div/laplacian schemes are parsed; phi output +
-// restart, CrankNicolson ddt0 restart, coded (fixedValue/mixed) BCs and forceCoeffs (Cd/Cl/Cm, sampled on the write
-// cadence to postProcessing/forceCoeffs/) are wired. NOT yet: MRF, fvOptions,
-// adjustTimeStep + maxCo (adaptive dt), a general functionObject framework (forceCoeffs above is hard-wired, NOT
-// a framework -- probes/fieldAverage/sampling/surfaces are still absent and are silently ignored), distributed
-// (multi-GPU) transient. The first three are REFUSED at start-up rather than silently skipped (see main).
+// restart, CrankNicolson ddt0 restart, coded (fixedValue/mixed) BCs, and the functionObjects forces and forceCoeffs
+// (forces_fo.cuh, every step their controls select) are wired. NOT yet: MRF, fvOptions, adjustTimeStep + maxCo (adaptive
+// dt), probes/fieldAverage/sampling/surfaces (each named as NOT run), distributed (multi-GPU) transient. The first three
+// are REFUSED at start-up rather than silently skipped (see main).
 // Kept a SEPARATE executable (brae_pimpleFoam) so it cannot regress the validated steady brae; `brae` hands
 // over to it whenever a case's controlDict says `application pimpleFoam` (solvers/common/solver_dispatch.cuh).
 #include "primitive_mesh.cuh"
@@ -45,6 +44,7 @@
 #include "time_controls.cuh"   // OF readTimeControls/CourantNo/setInitialDeltaT/setDeltaT
 #include "brae_time.cuh"
 #include "fan_pressure.cuh"   // fanPressure: the fan curve + direction, read where caseDir is known
+#include "forces_fo.cuh"   // OF functionObjects::forces and forceCoeffs, every step, on the device
 #include "scalar_transport_fo.cuh"   // OF functionObjects::scalarTransport, on the device flux   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
 #include <cctype>
 #include <cmath>
@@ -625,9 +625,25 @@ try
             scalarTransports.push_back(fo.get());
             return fo;
         });
-    Time time(controlDict, nullptr, 0, foTypes, {}, {"forceCoeffs"});
+    // OF functionObjects::forces and ::forceCoeffs (forces_fo.cuh): run every step their controls select, written under
+    // postProcessing/ as OpenFOAM writes them
+    const ForcesContext forcesCtx = forcesContext(caseDir, timeRegistry, controlDict);
+    foTypes.emplace_back(
+        "forces",
+        [&](const std::string& foName, const FoamDict& fd) -> std::unique_ptr<FunctionObject>
+        {
+            return ForcesFO::make(foName, fd, false, forcesCtx);
+        });
+    foTypes.emplace_back(
+        "forceCoeffs",
+        [&](const std::string& foName, const FoamDict& fd) -> std::unique_ptr<FunctionObject>
+        {
+            return ForcesFO::make(foName, fd, true, forcesCtx);
+        });
+    Time time(controlDict, nullptr, 0, foTypes);
+    time.setRunStart(startStr, startTime);
 
-    auto writeTimeDir = [&](const std::string& tname) {
+    auto writeTimeDirBody = [&](const std::string& tname) {
         const std::string outDir = caseDir + "/" + tname;
         std::filesystem::create_directories(outDir);
         // scalarTransport tracers: OF's transported field is AUTO_WRITE (scalarTransport.C
@@ -700,83 +716,34 @@ try
         time.writeControl().recordWritten(caseDir, tname);
     };
 
-    // ---- forceCoeffs (Cd/Cl/Cm) sampling -------------------------------------------------------------------
-    // The steady solver evaluates forces ONCE at convergence (gpuSimpleFoam.cu). A DES has no converged state:
-    // the wake sheds, so Cd(t) oscillates and only its TIME AVERAGE is meaningful. So sample it through the run
-    // and stream to postProcessing/forceCoeffs/<startTime>/coefficient.dat, matching OF's layout closely enough
-    // that the same plotting scripts work.
-    //
-    // COST: wallForces runs fvc::gaussGrad over the whole mesh ON THE HOST and calls nearWallDist internally,
-    // both mesh-wide and single-threaded. On 6M cells that is seconds per call, so sampling EVERY timestep would
-    // dwarf the solve (16 000 calls). It is therefore sampled on the WRITE cadence by default -- 160 samples over
-    // this run, ~7 per shedding cycle, enough for a stable mean if not a spectrum. BRAE_FORCE_INTERVAL overrides
-    // it (in timesteps) when a finer Cd(t) trace is worth the cost.
-    std::vector<std::string> forceWalls;
-    for (const auto& q : fvp)
-        if (q.type == "wall") forceWalls.push_back(q.name);
-    const FoamDict* fcFuncs = controlDict.subDict("functions");
-    // Account for EVERY controlDict.functions entry through the shared list. forceCoeffs is declared
-    // APPLIED here (not approximated as in gpuSimpleFoam): this driver samples on the write cadence and
-    // writes postProcessing/forceCoeffs/<time>/coefficient.dat, which is what OF's forceCoeffs does.
-    // Anything else is reported as ignored instead of being silently passed over.
-    // Time owns the functionObject lifecycle (OF Foam::Time). forceCoeffs is declared APPLIED here, not
-    // approximated: this driver samples on the write cadence and writes
-    // postProcessing/forceCoeffs/<time>/coefficient.dat, which is what OF's forceCoeffs does.
+    // BRAE_PHASE_TIME: each time directory's write, the benchmark protocol's E (run_timing.cuh)
 
-    const FoamDict* fcDict = nullptr;
-    if (fcFuncs)
-        for (const auto& s : fcFuncs->subs)
-            if (s.second.wordOr("type", "") == "forceCoeffs") { fcDict = &s.second; break; }
-    const long forceInterval = std::getenv("BRAE_FORCE_INTERVAL")
-                             ? std::atol(std::getenv("BRAE_FORCE_INTERVAL")) : 0;   // 0 -> follow the write cadence
-    std::ofstream fcOut;
-    if (fcDict && ctl.turbulent && !forceWalls.empty()) {
-        const std::string fdir = caseDir + "/postProcessing/forceCoeffs/" + timeName(startTime);
-        std::error_code fec; std::filesystem::create_directories(fdir, fec);
-        fcOut.open(fdir + "/coefficient.dat");
-        fcOut << "# Time\tCd\tCl\tCm\tFx\tFy\tFz\n";
-        fcOut.setf(std::ios::scientific); fcOut.precision(8);
-        std::printf("  forceCoeffs: sampling Cd/Cl/Cm -> postProcessing/forceCoeffs/%s/coefficient.dat%s\n",
-                    timeName(startTime).c_str(),
-                    forceInterval > 0 ? (" every " + std::to_string(forceInterval) + " steps").c_str() : " on the write cadence");
-    } else if (fcDict) {
-        // Do not let a forceCoeffs block look like it is running when it is not.
-        std::printf("  forceCoeffs: present in controlDict but NOT sampled (%s)\n",
-                    !ctl.turbulent ? "laminar case" : "no wall patches");
-    }
+    const bool timingMaster = true;
 
-    // Evaluate forces from the CURRENT device state and append one row. Mirrors the steady solver's block
-    // (gpuSimpleFoam.cu): pull U/p back, re-evaluate wall BCs, then wallForces on the requested patches.
-    auto sampleForces = [&](scalar tval) {
-        if (!fcOut.is_open()) return;
-        const std::vector<vector> Ug = solver.U();
-        const std::vector<scalar> pg = solver.p();
-        for (label c = 0; c < nC; ++c) U.internal[c] = Ug[c];
-        p.internal = pg;
-        U.evaluateBoundary();
-        p.evaluateBoundary();
-        const scalar wCmu   = ctl.sst ? ctl.ksstCoeffs.betaStar : ctl.keCoeffs.Cmu;
-        const scalar wKappa = ctl.sst ? ctl.ksstCoeffs.kappa    : ctl.keCoeffs.kappa;
-        const scalar wE     = ctl.sst ? ctl.ksstCoeffs.E        : ctl.keCoeffs.E;
-        const bool velNutWall = ctl.sa || ctl.nutWall != NutWall::Nutk;
-        const std::vector<scalar> saNutWall = velNutWall ? solver.nutWall() : std::vector<scalar>();
-        const std::vector<scalar>* nwb = velNutWall ? &saNutWall : nullptr;
-        auto toV = [](const std::vector<scalar>& a, vector d){ return a.size() >= 3 ? vector{a[0],a[1],a[2]} : d; };
-        const std::vector<std::string> fcP = fcDict->wordListOr("patches", forceWalls);
-        const scalar rhoInf  = fcDict->scalarOr("rhoInf", 1.0), magUInf = fcDict->scalarOr("magUInf", 1.0);
-        const scalar Aref    = fcDict->scalarOr("Aref", 1.0),   lRef    = fcDict->scalarOr("lRef", 1.0);
-        const vector liftDir = toV(fcDict->scalarListOr("liftDir", {}), vector{0,1,0});
-        const vector dragDir = toV(fcDict->scalarListOr("dragDir", {}), vector{1,0,0});
-        const vector pitchAx = toV(fcDict->scalarListOr("pitchAxis", {}), vector{0,0,1});
-        const vector CofR    = toV(fcDict->scalarListOr("CofR", {}), vector{0,0,0});
-        const ForceResult F  = wallForces(U, p, solver.k(), ctl.nu, m, g, fvp, fcP, rhoInf, 0.0, CofR,
-                                          wCmu, wKappa, wE, nwb);
-        const ForceCoeffs cc = forceCoeffs(F, dragDir, liftDir, pitchAx, rhoInf, magUInf, Aref, lRef);
-        const vector T = F.total();
-        fcOut << tval << '\t' << cc.Cd << '\t' << cc.Cl << '\t' << cc.Cm << '\t'
-              << T.x << '\t' << T.y << '\t' << T.z << '\n';
-        fcOut.flush();                       // a long DES should not lose its Cd trace if the run is killed
-        std::printf("  forceCoeffs: Cd=%.6e  Cl=%.6e  Cm=%.6e\n", cc.Cd, cc.Cl, cc.Cm);
+    auto writeTimeDir = [&](const std::string& tname)
+
+    {
+
+        if (!RunTiming::on())
+
+        {
+
+            writeTimeDirBody(tname);
+
+            return;
+
+        }
+
+        RunTiming::drain();
+
+        const double w0 = RunTiming::now();
+
+        writeTimeDirBody(tname);
+
+        RunTiming::drain();
+
+        if (timingMaster) std::printf("brae-timing write %s %.6f\n", tname.c_str(), RunTiming::now() - w0);
+
     };
 
     // ---- transient time loop ----
@@ -819,6 +786,15 @@ try
         std::printf("brae check --setup: Courant number at the start, deltaT %g: mean %g max %g\n", deltaT, c.meanCoNum, c.CoNum);
         return 0;
     }
+    // BRAE_PHASE_TIME: start-up to here (the benchmark protocol's B) and the loop's wall time (run_timing.cuh)
+    double loopStart = 0;
+    if (RunTiming::on())
+    {
+        RunTiming::drain();
+        loopStart = RunTiming::now();
+        if (timingMaster) std::printf("brae-timing startup %.6f\n", RunTiming::sinceProcessStart());
+    }
+    time.setReportTiming(timingMaster);
     for (scalar t = startTime + deltaT; t <= tEnd && time.loop(); t += deltaT) {
         ++timeIndex;
         solver.setTime(t);   // feed the current time to any codedFixedValue snippet's `t`
@@ -923,14 +899,16 @@ try
             throw std::runtime_error("solution diverged: non-finite residual at Time = " + tn + ". Reduce deltaT (CFL).");
         const bool isWrite = time.writeControl().isWriteTime(timeIndex, t);
         if (isWrite) { writeTimeDir(tn); lastWritten = tn; time.write(); }
-        // Sample Cd on the write cadence, or on BRAE_FORCE_INTERVAL when set (see the cost note above).
-        if (forceInterval > 0 ? (timeIndex % forceInterval == 0) : isWrite) sampleForces(t);
     }
+    // brae writes the final state below when the cadence did not; OpenFOAM does not, so it is not noted as a write time
+    const std::string finalName = timeName(startTime + deltaT * (scalar)timeIndex);
     time.end();   // OF Time.C:790-802: a final execute() so the last step is seen, then end()
+    if (RunTiming::on())
     {
-        const std::string tn = timeName(startTime + deltaT * (scalar)timeIndex);
-        if (tn != lastWritten) { writeTimeDir(tn); sampleForces(startTime + deltaT * (scalar)timeIndex); }
+        RunTiming::drain();
+        if (timingMaster) std::printf("brae-timing loop %.6f %ld\n", RunTiming::now() - loopStart, static_cast<long>(timeIndex));
     }
+    if (finalName != lastWritten) writeTimeDir(finalName);
     return 0;
 }
 catch (const std::exception& e)

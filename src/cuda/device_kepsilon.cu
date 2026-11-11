@@ -18,6 +18,8 @@
 #include "device_interface.cuh"  // interface<Op>() overloads dispatching to the cyclic/AMI backends
 #include "device_amg.cuh"        // deviceSymGaussSeidel (scalar smoothSolver, for stiff low-Re k/omega)
 #include "nut_wall_function.cuh" // nutkWallFunctionValue / yPlusWall (shared wall-nut physics, BRAE_HD)
+#include "foam_dict.cuh"         // isCoupledInterfaceType: the DeviceBoundary order (spaldingFaceControls)
+#include <stdexcept>
 #include "kEpsilon.cuh"          // gpu::kEpsilonRAS::boundField: Foam::bound, one implementation
 #include <cuda_runtime.h>
 #include <stdexcept>
@@ -1266,7 +1268,9 @@ void deviceKEpsilonCorrect(
     }
     else deviceCopy(divU, divPhi);
     DeviceBuffer<scalar> eps0, G0;
-    deviceWallEpsG0(wall, k, Ux, Uy, Uz, nu, eps0, G0, co, nutWall, atmZ0, atmBoundNut, nuWallFace);
+    DeviceBuffer<scalar> nutwStored;
+    deviceWallEpsG0(wall, k, Ux, Uy, Uz, nu, eps0, G0, co, nutWall, atmZ0, atmBoundNut, nuWallFace,
+                    deviceStoredWallNut(wall, nutBnd, nutwStored, "kEpsilon"));
     // BRAE_DUMP_TERMS: the wall-function inputs, BEFORE the override rewrites eps/eps0. eps0 is the raw
     // near-wall value invNw*Cmu^.75*k^1.5/(kappa*y), so a disagreement with OF here is one of invNw
     // (the corner weighting, 1/nWallFaces), y, or k -- and the three are separable only side by side.
@@ -1385,7 +1389,8 @@ void wallNutFirstSeed(
 namespace {  // wall-function nut kernels (spaldingNut/blendedNut), used by deviceBoundaryNut* below
 // nutUSpaldingWallFunction: wall faces -> Newton uTau from Spalding's law, nut = max(0, uTau^2/magGradU - nu).
 // magGradU = |snGrad U| = |U_cell|*deltaCoeffs (noSlip U_wall=0); magUp = |U_cell|; y = near-wall distance.
-// Warm-started from the previous wall nut (nutBnd in/out), 10 Newton iters with the OF tol=0.01 early-out.
+// Warm-started from the previous wall nut (nutBnd in/out, OpenFOAM's `nutw = *this`), under each face's patch's own tolerance and
+// maxIter (spaldingNutValue)
 __global__
 void spaldingNutKernel(
     int n,
@@ -1401,6 +1406,8 @@ void spaldingNutKernel(
     scalar kappa,
     scalar E,
     scalar* __restrict__ nutBnd,
+    const scalar* __restrict__ tolerance,   // the face's patch's own Newton controls (SpaldingFaceControls)
+    const label* __restrict__ maxIter,
     const scalar* __restrict__ nuFace,   // compressible: per-face nu = mu_b/rho_b, null -> the scalar nu
     const scalar* __restrict__ nutFile)  // the patch's OWN nut boundaryField, null -> extrapolate
 {
@@ -1414,7 +1421,7 @@ void spaldingNutKernel(
     const scalar magUp = sqrt(Ux[c]*Ux[c] + Uy[c]*Uy[c] + Uz[c]*Uz[c]);
     const scalar magGradU = magUp * dc[i];
     const scalar nuw = nuFace ? nuFace[i] : nu;
-    nutBnd[i] = spaldingNutValue(magUp, magGradU, y[i], nuw, kappa, E, nutBnd[i]);   // shared with G0 (nut_wall_function.cuh)
+    nutBnd[i] = spaldingNutValue(magUp, magGradU, y[i], nuw, kappa, E, nutBnd[i], tolerance[i], static_cast<int>(maxIter[i]));
 }
 
 
@@ -1456,6 +1463,28 @@ void blendedNutKernel(
 } // namespace
 
 
+SpaldingFaceControls spaldingFaceControls(const GeometricField<scalar>& nut, const std::vector<FvPatch>& fvp)
+{
+    std::vector<scalar> tol;
+    std::vector<label> its;
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+        const bool spalding = pi < nut.boundary.size() && nut.boundary[pi] && nut.boundary[pi]->isNutUSpalding();
+        const scalar t = spalding ? nut.boundary[pi]->nutUTolerance() : scalar(0.01);
+        const label m = spalding ? nut.boundary[pi]->nutUMaxIter() : label(10);
+        for (label i = 0; i < fvp[pi].size; ++i)
+        {
+            tol.push_back(t);
+            its.push_back(m);
+        }
+    }
+    SpaldingFaceControls out;
+    out.tolerance.copyFrom(tol);
+    out.maxIter.copyFrom(its);
+    return out;
+}
+
 void deviceBoundaryNutSpalding(
     const DeviceVectorBoundary& dbU,
     const DeviceBuffer<label>& isWall,
@@ -1467,6 +1496,7 @@ void deviceBoundaryNutSpalding(
     scalar nu,
     const SpalartAllmarasCoeffs& co,
     DeviceBuffer<scalar>& nutBnd,
+    const SpaldingFaceControls& controls,
     const DeviceBuffer<scalar>* nuFace,
     const DeviceBuffer<scalar>* nutFile)
 {
@@ -1481,9 +1511,13 @@ void deviceBoundaryNutSpalding(
         wallNutFirstSeed(nutBnd, nutFile, n, "spalding init");
     }
     if (n == 0) return;   // a rank with no physical boundary face (deviceBCValue)
+    if (static_cast<int>(controls.tolerance.size()) != n || static_cast<int>(controls.maxIter.size()) != n)
+        throw std::logic_error("deviceBoundaryNutSpalding: " + std::to_string(controls.tolerance.size()) + " faces' Newton controls for "
+                               + std::to_string(n) + " boundary faces (spaldingFaceControls)");
     spaldingNutKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].faceCell.data(), isWall.data(), y.data(),
                                            dbU.comp[0].deltaCoeffs.data(), Ux.data(), Uy.data(), Uz.data(),
                                            nutCell.data(), nu, co.kappa, co.E, nutBnd.data(),
+                                           controls.tolerance.data(), controls.maxIter.data(),
                                            nuFace ? nuFace->data() : nullptr,
                                            nutFile ? nutFile->data() : nullptr);
     cudaCheck(cudaGetLastError(), "spaldingNut");

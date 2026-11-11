@@ -279,6 +279,9 @@ public:
     // from Spalding's law, and for SpalartAllmaras (nuTilda fixedValue 0 at a wall) the assignment would
     // otherwise leave the wall with NO eddy viscosity at all.
     virtual bool isNutUSpalding() const { return false; }
+    // nutUSpaldingWallFunction's Newton controls; any other patch asked for them is a caller's error
+    virtual scalar nutUTolerance() const { throw std::logic_error("nutUTolerance: not a nutUSpaldingWallFunction patch"); }
+    virtual label nutUMaxIter() const { throw std::logic_error("nutUMaxIter: not a nutUSpaldingWallFunction patch"); }
     // Is this nut patch a nutkRoughWallFunction? Its per-face Ks and Cs when it is, null otherwise: the
     // model's correctNut reads them, and the patch's own PREVIOUS value, to form the new wall nut.
     virtual const std::vector<scalar>* nutkRoughKs() const { return nullptr; }
@@ -1998,7 +2001,25 @@ public:
     // autoMap: TRUE from ExtrapolatedValuePatchField via CalculatedPatchField, correctly: the Spalding
     // inversion is recomputed from U and y at every correct(), nothing per-face is kept here.
     using CalculatedPatchField<T>::CalculatedPatchField;
+    // with the patch's own Newton controls (nutUSpaldingWallFunctionFvPatchScalarField.C:256-257), which every evaluation of the
+    // law on this patch takes (spaldingNutValue)
+    NutUSpaldingPatchField(
+        const FvPatch& p,
+        bool valueUniform,
+        const T& uniformValue,
+        const std::vector<T>& values,
+        scalar tolerance,
+        label maxIter)
+        : CalculatedPatchField<T>(p, valueUniform, uniformValue, values), tolerance_(tolerance), maxIter_(maxIter)
+    {
+    }
     bool isNutUSpalding() const override { return true; }
+    scalar nutUTolerance() const override { return tolerance_; }
+    label nutUMaxIter() const override { return maxIter_; }
+
+private:
+    scalar tolerance_ = 0.01;
+    label maxIter_ = 10;
 };
 
 // nutkRoughWallFunction: a wall nut the model writes (setValue) at every correctNut, like nutkWallFunction,
@@ -4473,7 +4494,7 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
     // SA wall nut. Device: deviceBoundaryNutSpalding. Host: the model's correctNut recomputes it -- see
     // isNutUSpalding, and SpalartAllmaras_cpp.cu for what taking the field assignment there costs.
     if (d.type == "nutUSpaldingWallFunction")
-        return std::make_unique<NutUSpaldingPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
+        return std::make_unique<NutUSpaldingPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values, d.nutTolerance, d.nutMaxIter);
     // nutLowReWallFunction: OF calcNut()=0 (resolved viscous sublayer). cf's nutkWallFunction already yields nut=0 for
     // yPlus<yPlusLam, so on the low-Re mesh this BC is used on it is the same; nutUBlendedWallFunction is the same
     // log-law wall-nut family as nutk. Both -> Calculated (device wall nut from deviceBoundaryNut). Validated vs OF.

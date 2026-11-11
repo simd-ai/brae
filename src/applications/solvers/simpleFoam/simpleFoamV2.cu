@@ -1090,6 +1090,7 @@ int runSimpleFoamV2(const std::string& caseDir)
     bool   hasSpaldingWall = false;
     DeviceBuffer<label>  spaldingIsWall;
     DeviceBuffer<scalar> spaldingY;
+    SpaldingFaceControls spaldingControls;   // each nutUSpaldingWallFunction patch's own tolerance and maxIter, per boundary face
     std::string secondField = "epsilon";
     KOmegaSSTCoeffs sstCoeffs;
     KEpsilonCoeffs  keCoeffs;
@@ -1134,7 +1135,7 @@ int runSimpleFoamV2(const std::string& caseDir)
             dsp.kappa = keCoeffs.kappa;
             dsp.E     = keCoeffs.E;
             deviceBoundaryNutSpalding(dbU, bndIsWall, bndY, gf.Ux, gf.Uy, gf.Uz,
-                                      dNut, nu, dsp, nb, nullptr, nullptr);
+                                      dNut, nu, dsp, nb, spaldingControls, nullptr, nullptr);
         }
         else if (!saModel && v2NutWall == NutWall::Blended)
             deviceBoundaryNutBlended(dbU, bndIsWall, bndY, gf.Ux, gf.Uy, gf.Uz, dNut, nu,
@@ -1205,7 +1206,7 @@ int runSimpleFoamV2(const std::string& caseDir)
             // already holds, and every other face from `nutFile` -- or, without it, from the adjacent
             // CELL, which would discard the field assignment.
             deviceBoundaryNutSpalding(dbU, spaldingIsWall, spaldingY, gf.Ux, gf.Uy, gf.Uz,
-                                      dNut, nu, dsaW, nb, nullptr, &saNutAssigned);
+                                      dNut, nu, dsaW, nb, spaldingControls, nullptr, &saNutAssigned);
         }
 
         // kOmegaSST's `calculated` patches carry a1*k_b/max(a1*om_b, b1*F2_b*sqrt(S2_b)) -- a different
@@ -1495,6 +1496,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                 }
             }
             bndIsWall.copyFrom(isW);
+            spaldingControls = spaldingFaceControls(nutF, fvp);
 
             // SpalartAllmaras puts its wall treatment on NUT, not on the transported scalar: a wall
             // carrying nutUSpaldingWallFunction recomputes nut from Spalding's law every correctNut.

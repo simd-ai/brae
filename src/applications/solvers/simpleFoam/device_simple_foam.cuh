@@ -57,6 +57,7 @@
 #include <map>
 #include <vector>
 #include <cuda_runtime.h>
+#include "forces_device.cuh"   // functionObjects::forces' face integration
 
 namespace brae {
 
@@ -485,6 +486,16 @@ public:
     // The SOLVED boundary values, so the written boundaryField reports what the solve used rather than
     // echoing the input file. nut is the one that matters most: on a wall its value comes from the wall
     // function, and post-processing (yPlus, wall shear, force split) reads it straight back.
+    // functionObjects::forces' twelve sums a selected patch on the current fields (forces_device.cuh): fvc::grad(U) under the
+    // case's grad(U) scheme (Gauss linear, cellLimited), U and p at the boundary faces, and nuEff there as correctNut leaves
+    // it (refreshNutBoundary, after the step's turbulence correction). rhoP: the pressure force's density; rhoV: the viscous
+    // stress's; pRef: pRef/rhoRef
+    std::vector<double> forcePatchSums(
+        const DeviceForceFaces& faces,
+        scalar rhoP,
+        scalar rhoV,
+        scalar pRef,
+        const vector& origin);
     std::vector<scalar> nutBoundary() const
     {
         return nutBndAll_.size() ? nutBndAll_.host() : std::vector<scalar>();
@@ -846,6 +857,7 @@ private:
     DeviceBuffer<scalar> Vold_;
     std::vector<label> patchStart_;   // DeviceBoundary face offset per patch
     DeviceBuffer<scalar> nutBndFile_;   // nut's own boundaryField (OF reads nut_b from here, not cells)
+    SpaldingFaceControls spaldingControls_;   // each nutUSpaldingWallFunction patch's own tolerance and maxIter, per boundary face
     bool hasNutCalc_ = false;
     bool hasNutFixed_ = false;
     DeviceBuffer<label> nutCalcSel_;   // complement of nutCalcMask_ (0 on calc faces), for deviceSelectFixedFlux

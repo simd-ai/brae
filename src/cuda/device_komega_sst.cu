@@ -15,6 +15,7 @@
 #include "stage_dump.cuh"
 #include <cuda_runtime.h>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 
 namespace brae {
@@ -596,6 +597,36 @@ void deviceGatherWallNu(
     cudaCheck(cudaGetLastError(), "gatherWallNu");
 }
 
+const DeviceBuffer<scalar>* deviceStoredWallNut(
+    const DeviceWallData& wall,
+    const DeviceBuffer<scalar>* nutBnd,
+    DeviceBuffer<scalar>& out,
+    const char* closure)
+{
+    if (wall.nWF == 0) return nullptr;
+    static const bool recomputed = std::getenv("BRAE_CONTROL_G0_NUT_RECOMPUTED") != nullptr;
+    if (recomputed)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            std::fprintf(stderr, "brae: CONTROL BRAE_CONTROL_G0_NUT_RECOMPUTED INJECTED: the wall functions' G0 makes the wall nut "
+                                 "again from the current U and k\n");
+        }
+        return nullptr;
+    }
+    if (!nutBnd || static_cast<label>(nutBnd->size()) != wall.nBndFaces || static_cast<int>(wall.wfBnd.size()) != wall.nWF)
+        throw std::runtime_error(std::string("brae: ") + closure + ": the wall functions' G0 reads the stored wall nut (the nut "
+                                 "patch values the last correctNut left), and the closure was handed "
+                                 + (nutBnd ? std::to_string(nutBnd->size()) + " boundary nut values for "
+                                             + std::to_string(wall.nBndFaces) + " boundary faces"
+                                           : std::string("none"))
+                                 + "; refused rather than make the wall nut again");
+    deviceGatherWallNu(wall.wfBnd, *nutBnd, out);
+    return &out;
+}
+
 // out[i] = cell[faceCell[i]] -- plain adjacent-cell extrapolation for a boundary face.
 __global__
 void gatherCellToFaceK(
@@ -1137,7 +1168,9 @@ void deviceKOmegaSSTCorrect(
     // omega wall function FIRST (OF updateCoeffs before CDkOmega): omega0/G0, override omega & G at wall cells, so
     // grad(omega)/CDkOmega/F1/F2 and the reaction all see the wall-corrected omega (matches kOmegaSSTBase::correct).
     DeviceBuffer<scalar> omega0, G0;
-    deviceWallOmegaG0(wall, k, Ux, Uy, Uz, nu, omega0, G0, co, nutWall, atmZ0, atmBoundNut, nuWallFace);
+    DeviceBuffer<scalar> nutwStored;
+    deviceWallOmegaG0(wall, k, Ux, Uy, Uz, nu, omega0, G0, co, nutWall, atmZ0, atmBoundNut, nuWallFace,
+                      deviceStoredWallNut(wall, nutBnd, nutwStored, "kOmegaSST"));
     overrideKernel<<<nBlocks(nC), TPB>>>(nC, wall.isWallCell.data(), G0.data(), omega0.data(), G.data(), omega.data(),
                                           wall.wallW.size() ? wall.wallW.data() : nullptr);
 

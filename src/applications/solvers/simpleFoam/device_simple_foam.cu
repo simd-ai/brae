@@ -335,6 +335,7 @@ SimplecSnGrad simplecSnGrad(
             if (hasNutCalc_) { nutCalcMask_.copyFrom(cm); nutCalcSel_.copyFrom(cs); }
             if (hasNutFixed_) nutFixedMask_.copyFrom(fx);
             nutBndFile_.copyFrom(nb);
+            spaldingControls_ = spaldingFaceControls(*nut, fvp);
         }
         {
             // Wall-face -> boundary-face index. buildDeviceWallData walks fvp keeping the TURBULENCE WALL
@@ -1461,7 +1462,7 @@ SimplecSnGrad simplecSnGrad(
             if (ctl_.nutWall == NutWall::Spalding)
             {
                 deviceCopy(nuEffBnd, nuBndConst_);
-                deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_,
+                deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_, spaldingControls_,
                                           compressible_ ? &nuWallBnd_ : nullptr);
                 deviceAxpy(1.0, dnutBndWall_, nuEffBnd);
             }
@@ -1497,7 +1498,7 @@ SimplecSnGrad simplecSnGrad(
             }
             else if (ctl_.sa || ctl_.nutWall == NutWall::Spalding)   // nutUSpaldingWallFunction (velocity-based Newton uTau): SA when the BC selects it (or names none), or the BC on any model
             {
-                deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_,
+                deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_, spaldingControls_,
                                           nullptr, nutBndFile_.size() ? &nutBndFile_ : nullptr);
                 // SPALART-ALLMARAS: the `calculated` patches carry nuTilda_b*fv1(chi_b), which is what OF's
                 // correctNut leaves there -- `nut_ = nuTilda_*fv1` is a GeometricField assignment, so the
@@ -1630,6 +1631,79 @@ SimplecSnGrad simplecSnGrad(
         deviceAxpy(1.0, nuConst_, nuEff);
         boundaryNuEff(nuEff, nuEffBndHeld_);
         nuEffBndHeldValid_ = true;
+    }
+
+    std::vector<double> DeviceSimpleSolver::forcePatchSums(
+        const DeviceForceFaces& faces,
+        scalar rhoP,
+        scalar rhoV,
+        scalar pRef,
+        const vector& origin)
+    {
+        if (compressible_) throw std::runtime_error("functionObjects forces: not carried on a compressible driver");
+        // fvc::grad(U) under the case's grad(U) scheme, the same two forms the turbulence model takes it in
+        DeviceBuffer<scalar> gradU;
+        deviceGradU(dm_, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+        if (ctl_.gradULimitK > 0.0)
+            deviceCellLimitGradU(dm_, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, ctl_.gradULimitK, hasCyclic_ ? &cyc_ : nullptr,
+                                 hasAMI_ ? &ami_ : nullptr);
+        DeviceBuffer<scalar> UB[3];
+        for (int k = 0; k < 3; ++k) deviceBCValue(dbU_.comp[k], Uk_[k], UB[k]);
+        DeviceBuffer<scalar> pB;
+        deviceBCValue(dbP_, dp_, pB);
+        // nuEff at the boundary faces: nu + the boundary nut the step made last (refreshNutBoundary: correctNut's, after the
+        // turbulence correction), boundaryNuEff's own sum. NOT boundaryNuEff called again: the iterative wall functions
+        // (nutUSpalding, nutU, nutUBlended) start their Newton from the last value, so a second evaluation here would change
+        // the run a functionObject only measures. Laminar: nu
+        DeviceBuffer<scalar> nuEffB;
+        deviceCopy(nuEffB, nuBndConst_);
+        if (ctl_.turbulent && ctl_.les)
+        {
+            // boundaryNuEff's LES branch, its inputs as the step left them: the Spalding wall nut it last made, else the cells'
+            // nuEff extrapolated to the faces
+            if (ctl_.nutWall == NutWall::Spalding && dnutBndWall_.size() == nuBndConst_.size())
+            {
+                deviceAxpy(1.0, dnutBndWall_, nuEffB);
+            }
+            else
+            {
+                DeviceBuffer<scalar> nuEff;
+                deviceCopy(nuEff, dnut_);
+                deviceAxpy(1.0, nuConst_, nuEff);
+                deviceBCValue(dbExtrap_, nuEff, nuEffB);
+            }
+        }
+        else if (ctl_.turbulent)
+        {
+            if (nutBndAll_.size() != nuBndConst_.size())
+                throw std::logic_error("functionObjects forces: the boundary nut has not been made (no step has run)");
+            deviceAxpy(1.0, nutBndAll_, nuEffB);
+        }
+        DeviceForceFields fl;
+        fl.faceCellB = dm_.bndCell.data();
+        fl.dcB = dbU_.comp[0].deltaCoeffs.data();
+        fl.pB = pB.data();
+        for (int k = 0; k < 3; ++k)
+        {
+            fl.UB[k] = UB[k].data();
+            fl.U[k] = Uk_[k].data();
+        }
+        fl.gradU = gradU.data();
+        fl.nCells = nC_;
+        fl.nuEffB = nuEffB.data();
+        fl.rhoP = rhoP;
+        fl.rhoV = rhoV;
+        fl.pRef = pRef;
+        fl.origin = origin;
+        static const bool cellGrad = std::getenv("BRAE_CONTROL_FORCES_GRAD_CELL") != nullptr;
+        if (cellGrad)
+        {
+            static bool said = false;
+            if (!said) std::printf("  *** CONTROL BRAE_CONTROL_FORCES_GRAD_CELL: forces take the cell gradient at the wall. This run is deliberately wrong. ***\n");
+            said = true;
+            fl.correctGrad = false;
+        }
+        return deviceForcePatchSums(faces, fl);
     }
 
     void DeviceSimpleSolver::solveMomentumPredictor(DeviceSimpleResidual& res)
@@ -3022,6 +3096,33 @@ SimplecSnGrad simplecSnGrad(
         if (compressible_ && ctl_.transonic) { deviceCopy(phiHi0, phiHi); deviceCopy(phiHb0, phiHb); }
         if (ctl_.consistent)
         {
+            // pimpleFoam's SIMPLEC terms (pEqn.H: phiHbyA += interpolate(rAtU - rAU)*snGrad(p)*magSf, HbyA -= (rAU - rAtU)*grad(p))
+            // read fvc::grad of the p ENTERING this corrector. gx/gy/gz hold the momentum predictor's, which is that p on the first
+            // corrector only: from a transient step's second corrector on the previous one has solved p, and the pass-0 refresh
+            // below comes after this block. Found by the multi-GPU driver's oracle gate (brief #18, JUPITER 2834090): pitzDaily
+            // laminar, consistent yes, Euler 1 x 2 at Courant 41, the first corrector's p initial residual OpenFOAM's to 6 digits and
+            // the second's 0.045942 against 0.045465, U 6.3e-02 from OpenFOAM after one step; 7.2e-14 with the gradient refreshed
+            // (2836461). Here: tests/pimple_simplec_corrector_grad_vs_openfoam.sh. CONTROL BRAE_CONTROL_SIMPLEC_PREDICTOR_GRAD=1:
+            // the predictor's gradient, as before
+            static const bool simplecPredictorGrad = std::getenv("BRAE_CONTROL_SIMPLEC_PREDICTOR_GRAD") != nullptr;
+            if (simplecPredictorGrad && ctl_.innerCorrector > 0)
+            {
+                static bool said = false;
+                if (!said)
+                {
+                    said = true;
+                    std::fprintf(stderr, "brae: CONTROL BRAE_CONTROL_SIMPLEC_PREDICTOR_GRAD INJECTED: the later correctors' SIMPLEC "
+                                         "terms from the momentum predictor's grad(p)\n");
+                }
+            }
+            if (ctl_.innerCorrector > 0 && !simplecPredictorGrad)
+            {
+                DeviceBuffer<scalar> pbvS;
+                deviceBCValue(dbP_, dp_, pbvS);
+                deviceGaussGrad(dm, dp_, pbvS, gx, gy, gz);
+                if (hasCyclic_) interfaceAddGrad(cyc_, dp_, dm.V, gx, gy, gz);
+                if (hasAMI_)    interfaceAddGrad(ami_, dp_, dm.V, gx, gy, gz);
+            }
             // phiHbyA += interpolate(rAtU-rAU)*snGrad(p)*magSf = laplacian(interp(drAtU), p).flux()  (NOT via HbyA flux)
             DeviceBuffer<scalar> drAtUf;
             deviceInterpolate(dm, drAtUFlux_, drAtUf);   // rho*(rAtU-rAU) when compressible

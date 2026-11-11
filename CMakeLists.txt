@@ -811,6 +811,18 @@ add_test(NAME simple_freestream_stored_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_freestream_stored_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/airFoil2D)
 set_tests_properties(simple_freestream_stored_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# omegaWallFunction's and epsilonWallFunction's G0 from the STORED wall nut in the legacy closures: pitzDailySST with Spalding walls
+# at tolerance 1e-9, one iteration from OpenFOAM's own iteration 50 against real OpenFOAM; the made-again nut
+# (BRAE_CONTROL_G0_NUT_RECOMPUTED=1) fails.
+add_test(NAME simple_g0_stored_nut_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_g0_stored_nut_vs_openfoam.sh)
+set_tests_properties(simple_g0_stored_nut_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+# pimpleFoam's SIMPLEC terms on the second pressure corrector from the p entering it: pitzDaily laminar, consistent yes, one
+# Euler step from OpenFOAM's developed field against real OpenFOAM pimpleFoam; the predictor's grad(p)
+# (BRAE_CONTROL_SIMPLEC_PREDICTOR_GRAD=1) fails.
+add_test(NAME pimple_simplec_corrector_grad_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/pimple_simplec_corrector_grad_vs_openfoam.sh)
+set_tests_properties(pimple_simplec_corrector_grad_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 # ...and OpenFOAM-13's form of freestreamVelocity (BRAE_FREESTREAM_VELOCITY_UP=average) against real OpenFOAM-13,
 # the same restart; it SKIPS where /opt/openfoam13 is absent (OF13RC names another bashrc).
 add_test(NAME simple_freestream_of13_vs_openfoam13
@@ -4887,6 +4899,11 @@ add_executable(test_binary_field_read tests/test_binary_field_read.cu)
 target_include_directories(test_binary_field_read PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_binary_field_read PRIVATE brae_core)
 add_test(NAME binary_field_read COMMAND test_binary_field_read)
+# nutUSpaldingWallFunction's own tolerance and maxIter, and calcNut's keep branch (brief 2026-11-11 #18)
+add_executable(test_nut_spalding_controls tests/test_nut_spalding_controls.cu)
+target_include_directories(test_nut_spalding_controls PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_nut_spalding_controls PRIVATE brae_core)
+add_test(NAME nut_spalding_controls COMMAND test_nut_spalding_controls)
 
 add_executable(test_fixed_mean tests/test_fixed_mean.cu)
 target_include_directories(test_fixed_mean PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
