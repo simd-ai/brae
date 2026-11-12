@@ -2174,8 +2174,11 @@ if(NOT BRAE_GIT_COMMIT)
 elseif(BRAE_GIT_DIRTY)
     string(APPEND BRAE_GIT_COMMIT "+modified")
 endif()
+# A list of architectures ("80;90", as CI builds) would split the definition at the ';' into two broken ones
+# (`/bin/sh: Unterminated quoted string`), so --version gets them comma-separated.
+string(REPLACE ";" "," BRAE_CUDA_ARCHS_LIST "${CMAKE_CUDA_ARCHITECTURES}")
 target_compile_definitions(brae PRIVATE BRAE_VERSION_STRING="${PROJECT_VERSION}" BRAE_GIT_COMMIT="${BRAE_GIT_COMMIT}"
-                           BRAE_COMMIT_ORIGIN="${BRAE_COMMIT_ORIGIN}" BRAE_CUDA_ARCHS_STRING="${CMAKE_CUDA_ARCHITECTURES}")
+                           BRAE_COMMIT_ORIGIN="${BRAE_COMMIT_ORIGIN}" BRAE_CUDA_ARCHS_STRING="${BRAE_CUDA_ARCHS_LIST}")
 
 # The single-GPU device-resident TRANSIENT solver app (PIMPLE): brae_pimpleFoam <caseDir>. Reuses DeviceSimpleSolver's
 # three composable phases via pimpleStep, with implicit fvm::ddt(U). v1 laminar.
