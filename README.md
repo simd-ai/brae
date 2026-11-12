@@ -157,10 +157,12 @@ NVIDIA GPU (Ampere or newer), CUDA 12.4+ (13.x recommended), C++17.
 git clone https://github.com/simd-ai/brae.git
 cd brae
 cmake -B build -DCMAKE_CUDA_ARCHITECTURES=<your_arch>
-cmake --build build -j --target brae brae_pimpleFoam brae_rhoSimpleFoam brae_interFoam
+cmake --build build -j 4 --target brae brae_pimpleFoam brae_rhoSimpleFoam brae_interFoam
 ```
 
-`brae` hands each case to the solver its `application` entry names, so build all four side by side.
+`brae` hands each case to the solver its `application` entry names, so build all four side by side. Keep `-j`
+bounded, about one job per 2 GB of free memory: a bare `-j` starts every compile job at once and runs out of memory
+(the build then stops with only `Error 2`).
 
 | GPU | `<your_arch>` | GPU | `<your_arch>` |
 |---|---:|---|---:|
