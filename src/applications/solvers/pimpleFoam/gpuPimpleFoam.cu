@@ -9,11 +9,10 @@
 // (foam_field_reader/writer) + dict parsing (foam_dict) + turbulence model setup. BOTH the momentum ddt AND the
 // turbulence transport ddt (fvm::ddt(k/eps/omega/nuTilda)) are fully implicit + OF-exact -- the turbulence is transient
 // URANS/DES, not quasi-steady (see device_simple_foam.cu:294). fvSchemes div/laplacian schemes are parsed; phi output +
-// restart, CrankNicolson ddt0 restart, coded (fixedValue/mixed) BCs and forceCoeffs (Cd/Cl/Cm, sampled on the write
-// cadence to postProcessing/forceCoeffs/) are wired. NOT yet: MRF, fvOptions,
-// adjustTimeStep + maxCo (adaptive dt), a general functionObject framework (forceCoeffs above is hard-wired, NOT
-// a framework -- probes/fieldAverage/sampling/surfaces are still absent and are silently ignored), distributed
-// (multi-GPU) transient. The first three are REFUSED at start-up rather than silently skipped (see main).
+// restart, CrankNicolson ddt0 restart, coded (fixedValue/mixed) BCs, and the functionObjects forces and forceCoeffs
+// (forces_fo.cuh, every step their controls select) are wired. NOT yet: MRF, fvOptions, adjustTimeStep + maxCo (adaptive
+// dt), probes/fieldAverage/sampling/surfaces (each named as NOT run), distributed (multi-GPU) transient. The first three
+// are REFUSED at start-up rather than silently skipped (see main).
 // Kept a SEPARATE executable (brae_pimpleFoam) so it cannot regress the validated steady brae; `brae` hands
 // over to it whenever a case's controlDict says `application pimpleFoam` (solvers/common/solver_dispatch.cuh).
 #include "primitive_mesh.cuh"
@@ -30,6 +29,8 @@
 #include "dict_audit.cuh"
 #include <regex>
 #include "scheme_parse.cuh"         // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse
+#include "pimple_controls.cuh"       // parsePimpleDdtScheme, readPimpleAlgorithm: shared with `brae check`
+#include "check_setup.cuh"           // `brae check --setup` stops before the first step
 #include "turbulence_setup.cuh"    // readTurbulenceModel + readTurbulenceFields (shared with brae)
 #include "komega_sst_coeffs.cuh"    // readKOmegaSSTCoeffs
 #include "fvc.cuh"
@@ -43,6 +44,7 @@
 #include "time_controls.cuh"   // OF readTimeControls/CourantNo/setInitialDeltaT/setDeltaT
 #include "brae_time.cuh"
 #include "fan_pressure.cuh"   // fanPressure: the fan curve + direction, read where caseDir is known
+#include "forces_fo.cuh"   // OF functionObjects::forces and forceCoeffs, every step, on the device
 #include "scalar_transport_fo.cuh"   // OF functionObjects::scalarTransport, on the device flux   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
 #include <cctype>
 #include <cmath>
@@ -62,46 +64,14 @@ using namespace brae;
 
 namespace {
 
+// Time::timeName at the run's timeFormat and timePrecision (start_time.cuh), shared with the writer. This driver's own
+// copy formatted %g whatever the case said.
 std::string timeName(scalar t)
 {
-    if (t == std::floor(t) && std::fabs((double)t) < 1e15)
-        return std::to_string((long long)std::llround((double)t));
-    char b[64];
-    std::snprintf(b, sizeof b, "%g", (double)t);
-    return std::string(b);
+    return openFoamTimeName(static_cast<double>(t));
 }
 
-// fvSchemes holds multi-token scheme values + $-vars (not a plain key/value dict), so text-parse ddtSchemes.default.
-DdtScheme parseDdtScheme(const std::string& fvSchemesPath, scalar& ocCoeff)
-{
-    ocCoeff = 1.0;                                    // CrankNicolson off-centring; default = pure CN (1)
-    std::ifstream f(fvSchemesPath);
-    if (!f) throw std::runtime_error("cannot read " + fvSchemesPath);
-    const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    const std::size_t blk = text.find("ddtSchemes");
-    if (blk == std::string::npos)
-        throw std::runtime_error("fvSchemes has no ddtSchemes block (transient pimpleFoam needs Euler|backward).");
-    std::size_t d = text.find("default", blk);
-    if (d == std::string::npos) throw std::runtime_error("fvSchemes ddtSchemes has no 'default' entry.");
-    d += 7;
-    while (d < text.size() && std::isspace((unsigned char)text[d])) ++d;
-    std::string w;
-    while (d < text.size() && !std::isspace((unsigned char)text[d]) && text[d] != ';') w += text[d++];
-    if (w == "steadyState")
-        throw std::runtime_error("fvSchemes ddtSchemes.default = steadyState -> use the steady solver 'brae'.");
-    if (w == "backward")                return DdtScheme::backward;
-    if (w == "Euler" || w == "bounded") return DdtScheme::Euler;
-    if (w == "CrankNicolson")
-    {
-        // read the off-centring coefficient (OF "CrankNicolson <ocCoeff>", oc in [0,1]); absent -> pure CN (1).
-        while (d < text.size() && std::isspace((unsigned char)text[d])) ++d;
-        std::string oc;
-        while (d < text.size() && !std::isspace((unsigned char)text[d]) && text[d] != ';') oc += text[d++];
-        if (!oc.empty()) { try { ocCoeff = std::stod(oc); } catch (...) {} }
-        return DdtScheme::CrankNicolson;
-    }
-    throw std::runtime_error("fvSchemes ddtSchemes.default '" + w + "' unsupported (Euler|backward|CrankNicolson|steadyState).");
-}
+// parsePimpleDdtScheme: pimple_controls.cuh (shared with `brae check`)
 
 
 
@@ -135,6 +105,7 @@ try
         else if (a == "-case" && i + 1 < argc) caseDir = argv[++i];
         else if (a[0] != '-')                  caseDir = a;
     }
+    setCaseEnvironment(caseDir);   // FOAM_CASE, before any dictionary is read (argList.C:891-893)
 
     // ---- case dictionaries ----
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
@@ -150,7 +121,7 @@ try
     audit.add(transport,   "constant/transportProperties");
     audit.addFvSchemes(caseDir);   // reported at scope exit, once every consumer has run
     scalar ddtOcCoeff = 1.0;
-    const DdtScheme ddtScheme  = parseDdtScheme(caseDir + "/system/fvSchemes", ddtOcCoeff);
+    const DdtScheme ddtScheme  = parsePimpleDdtScheme(caseDir + "/system/fvSchemes", ddtOcCoeff);
 
     scalar       startTime     = controlDict.scalarOr("startTime", 0.0);   // resolved below for startFrom latestTime (restart)
     scalar deltaT              = controlDict.scalarOr("deltaT", 1e-3);   // varies when adjustTimeStep
@@ -206,13 +177,14 @@ try
 
 
     // ---- PIMPLE + solver controls (fvSolution) ----
+    // the PIMPLE block, every control the run takes from it (pRefCell/pRefValue apart, read below where a reference is needed),
+    // in one reader `brae check` calls too (pimple_controls.cuh); its values go to ctl where they always have
     const FoamDict* pimple  = fvSolution.subDict("PIMPLE");
-    const int nOuter   = pimple ? std::max(1, pimple->intOr("nOuterCorrectors", 1)) : 1;
-    const int nCorr    = pimple ? std::max(1, pimple->intOr("nCorrectors", 1)) : 1;
-    // OF pimpleControl.C:55, default true. pEqn.H guards the whole fvc::ddtCorr term with it.
-    const std::string ddtCorrW = pimple ? pimple->wordOr("ddtCorr", "yes") : "yes";
-    const bool ddtCorrOn = !(ddtCorrW == "no" || ddtCorrW == "false" || ddtCorrW == "off" || ddtCorrW == "0");
-    const int nNonOrth = pimple ? pimple->intOr("nNonOrthogonalCorrectors", 0) : 0;
+    const PimpleAlgorithm pimpleAlg = readPimpleAlgorithm(fvSolution, meshMotion.active || vclMotion.active);
+    const int nOuter   = pimpleAlg.nOuter;
+    const int nCorr    = pimpleAlg.nCorr;
+    const bool ddtCorrOn = pimpleAlg.ddtCorr;
+    const int nNonOrth = pimpleAlg.nNonOrth;
     const scalar nu = transport.scalarOr("nu", 1e-5);
 
     DeviceSimpleControls ctl;
@@ -271,10 +243,9 @@ try
     // THIS DRIVER'S OWN COPY WAS WRONG. It tested only `latestTime`, so `startFrom firstTime` fell
     // through to startTime and was silently ignored -- OF resolves both. Found by consolidating three
     // hand-written copies of one behaviour, which is the second such defect in this sweep after phi.
-    std::string startStr = resolveStartTime(caseDir,
-                                            controlDict.wordOr("startFrom", "startTime"),
-                                            timeName(startTime));
-    startTime = static_cast<scalar>(std::strtod(startStr.c_str(), nullptr));
+    const StartTime start = resolveStartTime(caseDir, controlDict);
+    std::string startStr = start.name;
+    startTime = static_cast<scalar>(start.value);
     const std::string fieldDir = caseDir + "/" + startStr;
     GeometricField<vector> U = buildField<vector>(readField<vector>(fieldDir + "/U"), fvp, nC); U.evaluateBoundary();
     const FieldData<scalar> pFd = readField<scalar>(fieldDir + "/p");
@@ -335,19 +306,17 @@ try
     // PIMPLE/momentumPredictor: OF assembles UEqn either way (rAU/HbyA come from it) and only skips the
     // SOLVE. Default true, as pimpleControl's.
     {
-        const std::string mp = pimple ? pimple->wordOr("momentumPredictor", "yes") : "yes";
-        ctl.momentumPredictor = !(mp == "no" || mp == "false" || mp == "off" || mp == "0");
+        ctl.momentumPredictor = pimpleAlg.momentumPredictor;
         if (!ctl.momentumPredictor)
             std::printf("  PIMPLE momentumPredictor off: UEqn is assembled (rAU/HbyA) but not solved\n");
     }
     // PIMPLE loop contract (OF pimpleControl::read). Defaults are OpenFOAM's, not brae's convenience:
     // turbOnFinalIterOnly TRUE, solveFlow TRUE, SIMPLErho FALSE.
     {
-        auto yes = [](const std::string& v) { return !(v == "no" || v == "false" || v == "off" || v == "0"); };
-        ctl.turbOnFinalIterOnly = pimple ? yes(pimple->wordOr("turbOnFinalIterOnly", "yes")) : true;
-        ctl.solveFlow           = pimple ? yes(pimple->wordOr("solveFlow", "yes")) : true;
-        ctl.simpleRho           = pimple ? yes(pimple->wordOr("SIMPLErho", "no")) : false;
-        ctl.moveMeshOuterCorrectors = pimple ? yes(pimple->wordOr("moveMeshOuterCorrectors", "no")) : false;
+        ctl.turbOnFinalIterOnly = pimpleAlg.turbOnFinalIterOnly;
+        ctl.solveFlow           = pimpleAlg.solveFlow;
+        ctl.simpleRho           = pimpleAlg.simpleRho;
+        ctl.moveMeshOuterCorrectors = pimpleAlg.moveMeshOuterCorrectors;
         if (ctl.moveMeshOuterCorrectors)
             std::printf("  PIMPLE moveMeshOuterCorrectors on: the mesh moves before EVERY outer corrector\n");
         // dynamicFvMesh::controlledUpdate -- OF's timeControl with the "update" prefix. Read here, where
@@ -366,14 +335,13 @@ try
         if (!ctl.solveFlow) std::printf("  PIMPLE solveFlow off: the momentum/pressure solve is skipped\n");
         // residualControl: outer-loop convergence. Parsed as OF does -- each entry is a field name whose
         // sub-dict carries `tolerance` (absolute) and/or `relTol`.
-        if (const FoamDict* rc = pimple ? pimple->subDict("residualControl") : nullptr)
         {
-            for (const auto& e : rc->subs)
+            for (const PimpleAlgorithm::ResidualControl& e : pimpleAlg.residualControl)
             {
                 DeviceSimpleControls::OuterResidualControl o;
-                o.field  = e.first;
-                o.absTol = e.second.scalarOr("tolerance", 0.0);
-                o.relTol = e.second.scalarOr("relTol", 0.0);
+                o.field  = e.field;
+                o.absTol = e.absTol;
+                o.relTol = e.relTol;
                 ctl.outerResidualControl.push_back(o);
             }
             if (!ctl.outerResidualControl.empty())
@@ -389,9 +357,7 @@ try
     // solver is active. brae mirrors that -- a case that moves its mesh and says nothing gets the
     // projection, as it does in OpenFOAM, and a case that says `correctPhi no` opts out.
     {
-        const bool dyn = meshMotion.active || vclMotion.active;
-        const std::string cp = pimple ? pimple->wordOr("correctPhi", dyn ? "yes" : "no") : (dyn ? "yes" : "no");
-        ctl.correctPhi = dyn && !(cp == "no" || cp == "false" || cp == "off" || cp == "0");
+        ctl.correctPhi = pimpleAlg.correctPhi;
         if (ctl.correctPhi)
             std::printf("  PIMPLE correctPhi on: phi is rebuilt from Uf and projected divergence-free after each mesh move\n");
     }
@@ -646,7 +612,7 @@ try
             // reported and declined rather than run with a substituted discretisation.
             const std::string schemesField = fd.wordOr("schemesField", fld);
             FieldDivScheme scheme;
-            try { scheme = parseFieldDivScheme(caseDir, schemesField); }
+            try { scheme = parseFieldDivScheme(caseDir, schemesField); requireUncappedLaplacian(scheme, schemesField); }
             catch (const std::exception& e)
             {
                 noticeIgnored("functions/" + foName, std::string(e.what()) + " -- this tracer is NOT solved.");
@@ -659,9 +625,25 @@ try
             scalarTransports.push_back(fo.get());
             return fo;
         });
-    Time time(controlDict, nullptr, 0, foTypes, {}, {"forceCoeffs"});
+    // OF functionObjects::forces and ::forceCoeffs (forces_fo.cuh): run every step their controls select, written under
+    // postProcessing/ as OpenFOAM writes them
+    const ForcesContext forcesCtx = forcesContext(caseDir, timeRegistry, controlDict);
+    foTypes.emplace_back(
+        "forces",
+        [&](const std::string& foName, const FoamDict& fd) -> std::unique_ptr<FunctionObject>
+        {
+            return ForcesFO::make(foName, fd, false, forcesCtx);
+        });
+    foTypes.emplace_back(
+        "forceCoeffs",
+        [&](const std::string& foName, const FoamDict& fd) -> std::unique_ptr<FunctionObject>
+        {
+            return ForcesFO::make(foName, fd, true, forcesCtx);
+        });
+    Time time(controlDict, nullptr, 0, foTypes);
+    time.setRunStart(startStr, startTime);
 
-    auto writeTimeDir = [&](const std::string& tname) {
+    auto writeTimeDirBody = [&](const std::string& tname) {
         const std::string outDir = caseDir + "/" + tname;
         std::filesystem::create_directories(outDir);
         // scalarTransport tracers: OF's transported field is AUTO_WRITE (scalarTransport.C
@@ -734,83 +716,34 @@ try
         time.writeControl().recordWritten(caseDir, tname);
     };
 
-    // ---- forceCoeffs (Cd/Cl/Cm) sampling -------------------------------------------------------------------
-    // The steady solver evaluates forces ONCE at convergence (gpuSimpleFoam.cu). A DES has no converged state:
-    // the wake sheds, so Cd(t) oscillates and only its TIME AVERAGE is meaningful. So sample it through the run
-    // and stream to postProcessing/forceCoeffs/<startTime>/coefficient.dat, matching OF's layout closely enough
-    // that the same plotting scripts work.
-    //
-    // COST: wallForces runs fvc::gaussGrad over the whole mesh ON THE HOST and calls nearWallDist internally,
-    // both mesh-wide and single-threaded. On 6M cells that is seconds per call, so sampling EVERY timestep would
-    // dwarf the solve (16 000 calls). It is therefore sampled on the WRITE cadence by default -- 160 samples over
-    // this run, ~7 per shedding cycle, enough for a stable mean if not a spectrum. BRAE_FORCE_INTERVAL overrides
-    // it (in timesteps) when a finer Cd(t) trace is worth the cost.
-    std::vector<std::string> forceWalls;
-    for (const auto& q : fvp)
-        if (q.type == "wall") forceWalls.push_back(q.name);
-    const FoamDict* fcFuncs = controlDict.subDict("functions");
-    // Account for EVERY controlDict.functions entry through the shared list. forceCoeffs is declared
-    // APPLIED here (not approximated as in gpuSimpleFoam): this driver samples on the write cadence and
-    // writes postProcessing/forceCoeffs/<time>/coefficient.dat, which is what OF's forceCoeffs does.
-    // Anything else is reported as ignored instead of being silently passed over.
-    // Time owns the functionObject lifecycle (OF Foam::Time). forceCoeffs is declared APPLIED here, not
-    // approximated: this driver samples on the write cadence and writes
-    // postProcessing/forceCoeffs/<time>/coefficient.dat, which is what OF's forceCoeffs does.
+    // BRAE_PHASE_TIME: each time directory's write, the benchmark protocol's E (run_timing.cuh)
 
-    const FoamDict* fcDict = nullptr;
-    if (fcFuncs)
-        for (const auto& s : fcFuncs->subs)
-            if (s.second.wordOr("type", "") == "forceCoeffs") { fcDict = &s.second; break; }
-    const long forceInterval = std::getenv("BRAE_FORCE_INTERVAL")
-                             ? std::atol(std::getenv("BRAE_FORCE_INTERVAL")) : 0;   // 0 -> follow the write cadence
-    std::ofstream fcOut;
-    if (fcDict && ctl.turbulent && !forceWalls.empty()) {
-        const std::string fdir = caseDir + "/postProcessing/forceCoeffs/" + timeName(startTime);
-        std::error_code fec; std::filesystem::create_directories(fdir, fec);
-        fcOut.open(fdir + "/coefficient.dat");
-        fcOut << "# Time\tCd\tCl\tCm\tFx\tFy\tFz\n";
-        fcOut.setf(std::ios::scientific); fcOut.precision(8);
-        std::printf("  forceCoeffs: sampling Cd/Cl/Cm -> postProcessing/forceCoeffs/%s/coefficient.dat%s\n",
-                    timeName(startTime).c_str(),
-                    forceInterval > 0 ? (" every " + std::to_string(forceInterval) + " steps").c_str() : " on the write cadence");
-    } else if (fcDict) {
-        // Do not let a forceCoeffs block look like it is running when it is not.
-        std::printf("  forceCoeffs: present in controlDict but NOT sampled (%s)\n",
-                    !ctl.turbulent ? "laminar case" : "no wall patches");
-    }
+    const bool timingMaster = true;
 
-    // Evaluate forces from the CURRENT device state and append one row. Mirrors the steady solver's block
-    // (gpuSimpleFoam.cu): pull U/p back, re-evaluate wall BCs, then wallForces on the requested patches.
-    auto sampleForces = [&](scalar tval) {
-        if (!fcOut.is_open()) return;
-        const std::vector<vector> Ug = solver.U();
-        const std::vector<scalar> pg = solver.p();
-        for (label c = 0; c < nC; ++c) U.internal[c] = Ug[c];
-        p.internal = pg;
-        U.evaluateBoundary();
-        p.evaluateBoundary();
-        const scalar wCmu   = ctl.sst ? ctl.ksstCoeffs.betaStar : ctl.keCoeffs.Cmu;
-        const scalar wKappa = ctl.sst ? ctl.ksstCoeffs.kappa    : ctl.keCoeffs.kappa;
-        const scalar wE     = ctl.sst ? ctl.ksstCoeffs.E        : ctl.keCoeffs.E;
-        const bool velNutWall = ctl.sa || ctl.nutWall != NutWall::Nutk;
-        const std::vector<scalar> saNutWall = velNutWall ? solver.nutWall() : std::vector<scalar>();
-        const std::vector<scalar>* nwb = velNutWall ? &saNutWall : nullptr;
-        auto toV = [](const std::vector<scalar>& a, vector d){ return a.size() >= 3 ? vector{a[0],a[1],a[2]} : d; };
-        const std::vector<std::string> fcP = fcDict->wordListOr("patches", forceWalls);
-        const scalar rhoInf  = fcDict->scalarOr("rhoInf", 1.0), magUInf = fcDict->scalarOr("magUInf", 1.0);
-        const scalar Aref    = fcDict->scalarOr("Aref", 1.0),   lRef    = fcDict->scalarOr("lRef", 1.0);
-        const vector liftDir = toV(fcDict->scalarListOr("liftDir", {}), vector{0,1,0});
-        const vector dragDir = toV(fcDict->scalarListOr("dragDir", {}), vector{1,0,0});
-        const vector pitchAx = toV(fcDict->scalarListOr("pitchAxis", {}), vector{0,0,1});
-        const vector CofR    = toV(fcDict->scalarListOr("CofR", {}), vector{0,0,0});
-        const ForceResult F  = wallForces(U, p, solver.k(), ctl.nu, m, g, fvp, fcP, rhoInf, 0.0, CofR,
-                                          wCmu, wKappa, wE, nwb);
-        const ForceCoeffs cc = forceCoeffs(F, dragDir, liftDir, pitchAx, rhoInf, magUInf, Aref, lRef);
-        const vector T = F.total();
-        fcOut << tval << '\t' << cc.Cd << '\t' << cc.Cl << '\t' << cc.Cm << '\t'
-              << T.x << '\t' << T.y << '\t' << T.z << '\n';
-        fcOut.flush();                       // a long DES should not lose its Cd trace if the run is killed
-        std::printf("  forceCoeffs: Cd=%.6e  Cl=%.6e  Cm=%.6e\n", cc.Cd, cc.Cl, cc.Cm);
+    auto writeTimeDir = [&](const std::string& tname)
+
+    {
+
+        if (!RunTiming::on())
+
+        {
+
+            writeTimeDirBody(tname);
+
+            return;
+
+        }
+
+        RunTiming::drain();
+
+        const double w0 = RunTiming::now();
+
+        writeTimeDirBody(tname);
+
+        RunTiming::drain();
+
+        if (timingMaster) std::printf("brae-timing write %s %.6f\n", tname.c_str(), RunTiming::now() - w0);
+
     };
 
     // ---- transient time loop ----
@@ -845,6 +778,23 @@ try
     // Does any cyclicACMI carry a time `scale`? Then the geometry is rebuilt every step even on a
     // static mesh; without one, a static mesh keeps the single setup-time build it always had.
     const bool acmiTimeScale = hasACMITimeScale(m);
+    // `brae check --setup`: everything above is the run's own setup; stop before its first step, with the Courant numbers the
+    // first step starts from at the case's deltaT
+    if (cli::checkSetupDone("pimpleFoam"))
+    {
+        const CourantNumbers c = courant();
+        std::printf("brae check --setup: Courant number at the start, deltaT %g: mean %g max %g\n", deltaT, c.meanCoNum, c.CoNum);
+        return 0;
+    }
+    // BRAE_PHASE_TIME: start-up to here (the benchmark protocol's B) and the loop's wall time (run_timing.cuh)
+    double loopStart = 0;
+    if (RunTiming::on())
+    {
+        RunTiming::drain();
+        loopStart = RunTiming::now();
+        if (timingMaster) std::printf("brae-timing startup %.6f\n", RunTiming::sinceProcessStart());
+    }
+    time.setReportTiming(timingMaster);
     for (scalar t = startTime + deltaT; t <= tEnd && time.loop(); t += deltaT) {
         ++timeIndex;
         solver.setTime(t);   // feed the current time to any codedFixedValue snippet's `t`
@@ -949,14 +899,16 @@ try
             throw std::runtime_error("solution diverged: non-finite residual at Time = " + tn + ". Reduce deltaT (CFL).");
         const bool isWrite = time.writeControl().isWriteTime(timeIndex, t);
         if (isWrite) { writeTimeDir(tn); lastWritten = tn; time.write(); }
-        // Sample Cd on the write cadence, or on BRAE_FORCE_INTERVAL when set (see the cost note above).
-        if (forceInterval > 0 ? (timeIndex % forceInterval == 0) : isWrite) sampleForces(t);
     }
+    // brae writes the final state below when the cadence did not; OpenFOAM does not, so it is not noted as a write time
+    const std::string finalName = timeName(startTime + deltaT * (scalar)timeIndex);
     time.end();   // OF Time.C:790-802: a final execute() so the last step is seen, then end()
+    if (RunTiming::on())
     {
-        const std::string tn = timeName(startTime + deltaT * (scalar)timeIndex);
-        if (tn != lastWritten) { writeTimeDir(tn); sampleForces(startTime + deltaT * (scalar)timeIndex); }
+        RunTiming::drain();
+        if (timingMaster) std::printf("brae-timing loop %.6f %ld\n", RunTiming::now() - loopStart, static_cast<long>(timeIndex));
     }
+    if (finalName != lastWritten) writeTimeDir(finalName);
     return 0;
 }
 catch (const std::exception& e)

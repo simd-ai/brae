@@ -17,6 +17,8 @@ std::vector<char> gzSlurp(const std::string& base, std::size_t maxBytes = 0);
 
 // Format of a foam file ("ascii" or "binary") from its FoamFile header `format` entry.
 std::string foamFormat(const std::string& path);
+// `//` and `/* */` comments removed, as OpenFOAM's lexer drops them
+std::string stripFoamComments(const std::string& s);
 
 // Binary polyMesh list readers (used when foamFormat(path) == "binary"). The boundary file
 // is always an ASCII dictionary, so it uses TokenStream regardless of format.

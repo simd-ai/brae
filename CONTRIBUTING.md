@@ -17,7 +17,10 @@ If you keep those two in mind, the rest is detail.
 ## Pull requests
 
 - Keep PRs focused. One change, one story. A kernel rewrite and a refactor are two PRs.
-- **Build and test before you open it.** `cmake --build build -j --target brae && ctest --test-dir build`.
+- **Build and test before you open it.** The test suite is off in a user's build; switch it on with
+  `cmake --preset dev` (or `cmake -B build -DBRAE_BUILD_TESTS=ON`), then
+  `cmake --build build -j 4 && ctest --test-dir build` (`-j` with a number: a bare `-j` is unbounded and nvcc can
+  run the machine out of memory).
 - The hosted build-check (`ci.yml`) compiles every PR for sm_80 and sm_90. The full `ctest` runs on a real GB10
   (`gpu-test.yml`) after merge to `main`, so a green build-check is necessary but not sufficient. Say in the PR how
   you validated on a GPU.

@@ -279,10 +279,15 @@ void pressurePredictor(
         }
         // ...and the non-orthogonal half of that snGrad, which the laplacian coefficients do not carry.
         // Zero on an orthogonal mesh; NOT zero on pitzDaily.
+        // Capped under `limited corrected <psi>` (limitedSnGrad.C:48-58), which it was not; this path's `limited 0` is
+        // uncorrected (correctedLaplacian false), so a coefficient in (0, 1) is the cap
         if (in.correctedLaplacian)
         {
             DeviceBuffer<scalar> ffc;
-            deviceLaplacianCorrFlux(dm, drAtUf, gx, gy, gz, ffc);
+            if (in.snGradLimitCoeff > 0.0 && in.snGradLimitCoeff < 1.0)
+                deviceLaplacianCorrFluxLimited(dm, drAtUf, *p, gx, gy, gz, in.snGradLimitCoeff, ffc);
+            else
+                deviceLaplacianCorrFlux(dm, drAtUf, gx, gy, gz, ffc);
             deviceAxpy(1.0, ffc, st.phiHbyAInt);
         }
         {

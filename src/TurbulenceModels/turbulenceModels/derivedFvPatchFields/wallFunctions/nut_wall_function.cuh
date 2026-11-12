@@ -103,26 +103,53 @@ BRAE_HD inline scalar kBasedWallNut(scalar yPlus, scalar y, scalar z0, bool atmB
 // (exactly as OpenFOAM). magUp = |U_cell - U_wall|, magGradU = |snGrad U| = magUp*deltaCoeffs; nutSeed warm-starts
 // the iteration (pass 0 for a cold start). BRAE_HD: identical on host + device.
 //
-// nutUSpaldingWallFunction: Newton on Spalding's law (OF nutUSpaldingWallFunctionFvPatchScalarField, 10 iters, tol 0.01).
-BRAE_HD inline scalar spaldingNutValue(scalar magUp, scalar magGradU, scalar y, scalar nu, scalar kappa, scalar E, scalar nutSeed)
+// nutUSpaldingWallFunction, one face, OpenFOAM's calcUTau (nutUSpaldingWallFunctionFvPatchScalarField.C:105-180): Newton on
+// Spalding's law from ut = sqrt((nutSeed + nu)*magGradU), nutSeed the patch's own nut as it stands (`nutw = *this`), while ut stays
+// above ROOTVSMALL, a step moves uTau by more than `tolerance` of itself, and fewer than `iters` steps were taken. err is the last
+// step's relative change (0 when the seed is not above ROOTVSMALL, as calcUTau leaves it). Expression for expression OpenFOAM's,
+// sqr(kUu) taken first; ROOTVSMALL is doubleScalar.H's 1e-150
+BRAE_HD inline scalar spaldingUTau(scalar magUp, scalar magGradU, scalar y, scalar nu, scalar kappa, scalar E, scalar nutSeed,
+                                   scalar tolerance, int iters, scalar& err)
 {
-    scalar ut = sqrt((nutSeed + nu) * magGradU);   // warm seed
-    if (ut > scalar(1e-300) && magGradU > scalar(1e-300))
+    const scalar rootVSmall = scalar(1e-150);
+    err = scalar(0);
+    scalar ut = sqrt((nutSeed + nu)*magGradU);
+    if (!(rootVSmall < ut)) return scalar(0);
+    int iter = 0;
+    do
     {
-        for (int it = 0; it < 10; ++it)
-        {
-            const scalar kUu = fmin(kappa*magUp/ut, scalar(50.0));
-            const scalar fkUu = exp(kUu) - scalar(1.0) - kUu*(scalar(1.0) + scalar(0.5)*kUu);
-            const scalar f  = -ut*y/nu + magUp/ut + (scalar(1.0)/E)*(fkUu - (scalar(1.0)/scalar(6.0))*kUu*kUu*kUu);
-            const scalar df =  y/nu + magUp/(ut*ut) + (scalar(1.0)/E)*kUu*fkUu/ut;
-            const scalar utNew = ut + f/df;
-            const scalar err = fabs((ut - utNew) / ut);
-            ut = utNew;
-            if (!(ut > scalar(1e-300)) || err < scalar(0.01)) break;
-        }
+        const scalar kUu = fmin(kappa*magUp/ut, scalar(50));
+        const scalar fkUu = exp(kUu) - scalar(1) - kUu*(scalar(1) + scalar(0.5)*kUu);
+        const scalar f = -ut*y/nu + magUp/ut + scalar(1.0)/E*(fkUu - scalar(1.0)/scalar(6.0)*kUu*(kUu*kUu));
+        const scalar df = y/nu + magUp/(ut*ut) + scalar(1.0)/E*kUu*fkUu/ut;
+        const scalar uTauNew = ut + f/df;
+        err = fabs((ut - uTauNew)/ut);
+        ut = uTauNew;
     }
-    const scalar uTau = fmax(scalar(0.0), ut);
-    return fmax(scalar(0.0), uTau*uTau / (magGradU + scalar(1e-300)) - nu);
+    while (ut > rootVSmall && err > tolerance && ++iter < iters);
+    return fmax(scalar(0), ut);
+}
+
+// nutUSpaldingWallFunction::calcNut, one face (nutUSpaldingWallFunctionFvPatchScalarField.C:52-90): nutw = max(0, uTau^2/(magGradU +
+// ROOTVSMALL) - nu) with the patch's own `tolerance` and `maxIter` (OpenFOAM's defaults 0.01 and 10, .C:256-257), and, when the
+// tolerance is not 0.01, the face KEEPS its seed if one step from it already moves uTau by less than the tolerance (.C:69-90).
+// magUp = |U_cell - U_wall|, magGradU = |snGrad U|. SINGLE source of the law for the momentum wall kernels (spaldingNutKernel) and
+// the host closure. brae stopped every Newton at 0.01 and 10 whatever the patch said, and had no keep branch: the official
+// occDrivAerStaticMesh sets `tolerance 1e-9` on every car wall (brief 2026-11-11 #18, the execution audit). BRAE_HD: identical on
+// host and device
+BRAE_HD inline scalar spaldingNutValue(scalar magUp, scalar magGradU, scalar y, scalar nu, scalar kappa, scalar E, scalar nutSeed,
+                                       scalar tolerance, int maxIter)
+{
+    scalar err = scalar(0);
+    const scalar uTau = spaldingUTau(magUp, magGradU, y, nu, kappa, E, nutSeed, tolerance, maxIter, err);
+    scalar nutw = fmax(scalar(0), uTau*uTau/(magGradU + scalar(1e-150)) - nu);
+    if (tolerance != scalar(0.01))
+    {
+        scalar err1 = scalar(0);
+        spaldingUTau(magUp, magGradU, y, nu, kappa, E, nutSeed, tolerance, 1, err1);
+        if (err1 < tolerance) nutw = nutSeed;
+    }
+    return nutw;
 }
 // nutUWallFunction (OF nutUWallFunctionFvPatchScalarField, STEPWISE blender -- the default set by
 // wallFunctionBlenders(dict, blenderType::STEPWISE, 4)).
@@ -228,7 +255,10 @@ __device__ inline scalar wallProductionG0(
     else                                                     // velocity-based: magUp = |U_cell - U_wall| = magG/dc
     {
         const scalar magUp = magG / fmax(dc, scalar(1e-300));
-        nutw = (nutWall == 1) ? spaldingNutValue(magUp, magG, y, nu, kappa, E, scalar(0.0))
+        // OPEN (brief 2026-11-11 #18, defect D2): omegaWallFunction and epsilonWallFunction read the STORED wall nut here
+        // (turbModel.nut(patchi)); this recompute from a zero seed is the public legacy closure's own, so it takes OpenFOAM's
+        // default controls, not the patch's. Callers that pass the stored nut (nutwStored) never reach it
+        nutw = (nutWall == 1) ? spaldingNutValue(magUp, magG, y, nu, kappa, E, scalar(0.0), scalar(0.01), 10)
                               : blendedNutValue (magUp, magG, y, nu, kappa, E, scalar(0.0));
     }
     return invNwC * (nutw + nu) * magG * Cmu25 * sqrt(kc) / (kappa * y);

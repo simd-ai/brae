@@ -19,6 +19,7 @@
 #include "device_pcg.cuh"     // DeviceSolverPerf (turbulence solve report)
 #include "grad_u_memo.cuh"   // GradUMemo, the memo described below (its own header so a caller can hold
                               // one without this header's DdtScheme)
+#include <stdexcept>
 #include <vector>
 #include <string>
 
@@ -186,6 +187,14 @@ struct DeviceWallData
     // filling this struct still carries one flag for every wall, and the kernel falls back to the
     // scalar it is passed -- the same nullable convention as the five above.
     DeviceBuffer<scalar> wfLowRe;
+    // Per boundary face, in the boundary descriptors' order (coupled interfaces left out, as bndIsWall_): 1 on a wall-type patch,
+    // where wallDist's y is 0 -- what kOmegaSSTBase::F1 evaluates on a wall face (deviceF1OnPatch)
+    DeviceBuffer<label>  isWallFace;
+    // Each wall face's place among those boundary faces, and how many there are: what a closure needs to read the STORED wall
+    // nut out of the driver's boundary nut (deviceStoredWallNut). Made by the same walk as the wall faces and isWallFace, so
+    // the three cannot drift apart
+    DeviceBuffer<label>  wfBnd;
+    label                nBndFaces = -1;
 };
 // The predicate the wall set is built on, in one place so the DeviceWallData faces and the wall-face ->
 // boundary-face map below cannot drift apart.
@@ -316,6 +325,24 @@ inline DeviceWallData buildDeviceWallData(
     w.invNw.copyFrom(invNw);
     w.isWallCell.copyFrom(isW);
     w.wallW.copyFrom(wallW);
+    {
+        std::vector<label> wallFace;
+        std::vector<label> wfBnd;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isTurbWallPatch(fvp, pi, wfPatch))
+                for (label i = 0; i < fvp[pi].size; ++i)
+                    wfBnd.push_back(static_cast<label>(wallFace.size()) + i);
+            wallFace.insert(wallFace.end(), static_cast<std::size_t>(fvp[pi].size), fvp[pi].type == "wall" ? 1 : 0);
+        }
+        w.isWallFace.copyFrom(wallFace);
+        w.wfBnd.copyFrom(wfBnd);
+        w.nBndFaces = static_cast<label>(wallFace.size());
+        if (static_cast<int>(wfBnd.size()) != w.nWF)
+            throw std::logic_error("buildDeviceWallData: " + std::to_string(wfBnd.size()) + " wall faces among the boundary faces, "
+                                   + std::to_string(w.nWF) + " in the wall set (a wall patch that is a coupled interface?)");
+    }
     return w;
 }
 
@@ -500,7 +527,10 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
                             // (ascending then descending), false = GaussSeidel, whose sweep loop in
                             // GaussSeidelSmoother.C is the ascending walk ONLY. Different smoothers,
                             // so the same relTol stops in a different place.
-                            bool gsSymmetric = true);
+                            bool gsSymmetric = true,
+                            // laplacianSchemes `limited corrected <psi>` on k's and epsilon's non-orthogonal
+                            // correction (deviceSolveScalarTransport's lapLimit); 1 is `corrected`.
+                            scalar lapLimit = 1);
 
 // Closed device kOmegaSST::correct(): production (raw GbyNu0 + omega-wall G0 override) -> F1/F2/CDkOmega/S2 ->
 // omega eqn (loose solve, omega-wall setValues) -> bound -> k eqn (loose solve) -> bound -> correctNut (Bradshaw
@@ -556,11 +586,24 @@ void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, co
                             // (ascending then descending), false = GaussSeidel, whose sweep loop in
                             // GaussSeidelSmoother.C is the ascending walk ONLY. Different smoothers,
                             // so the same relTol stops in a different place.
-                            bool gsSymmetric = true);
+                            bool gsSymmetric = true,
+                            // laplacianSchemes `limited corrected <psi>` on k's and omega's non-orthogonal
+                            // correction (deviceSolveScalarTransport's lapLimit); 1 is `corrected`.
+                            scalar lapLimit = 1);
 
 // nuWall[i] = nuBnd[wfBndIdx[i]] -- OF nu(patchi) re-indexed from boundary-face into wall-face ordering.
 void deviceGatherWallNu(const DeviceBuffer<label>& wfBndIdx, const DeviceBuffer<scalar>& nuBnd,
                         DeviceBuffer<scalar>& nuWall);
+
+// The wall nut omegaWallFunction's and epsilonWallFunction's G0 read: the nut patch values the last correctNut (or validate)
+// STORED (omegaWallFunctionFvPatchScalarField.C:199-200, `const scalarField& nutw = turbModel.nut(patchi)`), gathered from the
+// driver's boundary nut into `out` in wall-face order; null where the wall set has no face. The legacy closures made it again
+// from the current U and k instead (a Spalding Newton from zero at tolerance 0.01 whatever the patch said): on the official
+// DrivAer's boundary conditions that put k 7.1e-02 from OpenFOAM after 3 iterations, 1.1e-03 with the stored value (brief #18,
+// JUPITER 2836461). A closure handed no boundary nut, or one of another size, is refused rather than falling back to that.
+// TEST CONTROL BRAE_CONTROL_G0_NUT_RECOMPUTED=1: the recomputed nut, as before
+const DeviceBuffer<scalar>* deviceStoredWallNut(const DeviceWallData& wall, const DeviceBuffer<scalar>* nutBnd,
+                                                DeviceBuffer<scalar>& out, const char* closure);
 
 // kOmegaSSTLM (Langtry-Menter gamma-ReThetat transition) extra step: after the SST k/omega solve, transport ReThetat
 // and gammaInt and update gammaIntEff (fed back into the SST k equation next iteration). See PORTING_KOMEGASSTLM.md.
@@ -577,7 +620,10 @@ void deviceKOmegaSSTLMCorrect(const DeviceMesh& dm, const DeviceVectorBoundary& 
                               bool limitedLinear = false, bool linearUpwind = false,
                               // WHICH GaussSeidel smoother the case named on the transported pair; see
                               // deviceKOmegaSSTCorrect. The two transition scalars ride the same entry.
-                              bool gsSymmetric = true);
+                              bool gsSymmetric = true,
+                              // laplacianSchemes `limited corrected <psi>` on ReThetat's and gammaInt's
+                              // non-orthogonal correction (deviceSolveScalarTransport's lapLimit).
+                              scalar lapLimit = 1);
 
 // Spalart-Allmaras (one-equation): solve the nuTilda transport (div - laplacian(DnuTildaEff) + Sp(destruction) ==
 // production + Cb2 grad^2) via the shared scaffold, then nut = nuTilda*fv1. Mirrors SpalartAllmarasBase::correct()
@@ -627,7 +673,10 @@ void deviceSpalartAllmarasCorrect(const DeviceMesh& dm, const DeviceVectorBounda
                                   // as the model has its tensor. Only for a driver whose next reader of the memo is
                                   // a new U anyway: legacy simpleFoam's step(), which drops it after turbulence.
                                   // pimpleFoam's step and V2 keep it, and with it their next sites' hits.
-                                  bool releaseGradUMemo = false);
+                                  bool releaseGradUMemo = false,
+                                  // laplacianSchemes `limited corrected <psi>` on nuTilda's non-orthogonal
+                                  // correction (deviceSolveScalarTransport's lapLimit); 1 is `corrected`.
+                                  scalar lapLimit = 1);
 
 // Standalone SA correctNut (nut = nuTilda*fv1(nuTilda)) for the solver startup validate().
 void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, DeviceBuffer<scalar>& nut);
@@ -678,11 +727,22 @@ void deviceBoundaryNutU(const DeviceVectorBoundary& dbU, const DeviceBuffer<labe
                         const DeviceBuffer<scalar>* nuFace = nullptr,
     const DeviceBuffer<scalar>* nutFile = nullptr);
 
+// nutUSpaldingWallFunction's Newton controls per boundary face, in DeviceBoundary order (every patch that is not a coupled
+// interface): each Spalding patch's own `tolerance` and `maxIter` (NutUSpaldingPatchField, read from the case with OpenFOAM's
+// defaults), OpenFOAM's defaults on every other face, which no Spalding evaluation reads. One builder for every driver
+struct SpaldingFaceControls
+{
+    DeviceBuffer<scalar> tolerance;
+    DeviceBuffer<label>  maxIter;
+};
+SpaldingFaceControls spaldingFaceControls(const GeometricField<scalar>& nut, const std::vector<FvPatch>& fvp);
+
 void deviceBoundaryNutSpalding(const DeviceVectorBoundary& dbU, const DeviceBuffer<label>& isWall,
                                const DeviceBuffer<scalar>& y, const DeviceBuffer<scalar>& Ux,
                                const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                                const DeviceBuffer<scalar>& nutCell, scalar nu, const SpalartAllmarasCoeffs& co,
                                DeviceBuffer<scalar>& nutBnd,
+                               const SpaldingFaceControls& controls,   // the patches' own tolerance and maxIter
                                const DeviceBuffer<scalar>* nuFace = nullptr,
     const DeviceBuffer<scalar>* nutFile = nullptr);   // compressible: per-face nu = mu_b/rho_b
 

@@ -145,6 +145,9 @@ struct FieldDivScheme
     // Unlike divSchemes, laplacianSchemes almost always carries a usable `default`, which OF resolves
     // normally, so absence falls back to it rather than refusing.
     bool   nonOrth      = true;
+    // ...and that entry's `limited <psi>` (limitedSnGrad.C:48-58), 1 for `corrected`. No consumer of this struct carries
+    // the cap: requireUncappedLaplacian refuses it where a tracer is set up.
+    scalar nonOrthLimit = 1.0;
 };
 
 // Extract the brace-delimited body of a top-level fvSchemes block ("divSchemes", "laplacianSchemes").
@@ -598,8 +601,29 @@ inline FieldDivScheme parseFieldDivScheme(
                 "will not substitute one.");
         if (ls.find("uncorrected") != std::string::npos
          || ls.find("orthogonal")  != std::string::npos) fs.nonOrth = false;
+        const std::size_t lim = ls.find("limited");
+        if (lim != std::string::npos)
+        {
+            const char* c = ls.c_str() + lim + 7;
+            while (*c && !(std::isdigit((unsigned char)*c) || *c == '.' || *c == '-')) ++c;
+            double psi = 1.0;
+            if (std::sscanf(c, "%lf", &psi) == 1) fs.nonOrthLimit = static_cast<scalar>(psi);
+        }
     }
     return fs;
+}
+
+// A scalarTransport function object's tracer under `limited corrected <psi>`, psi < 1: the tracers' equation
+// (deviceSolveScalarTransport through the legacy driver's solvePassiveScalar, rhoSimpleFoam's scalarTransport
+// function object) takes the whole correction, so the cap is refused where the tracer is set up.
+inline void requireUncappedLaplacian(
+    const FieldDivScheme& fs,
+    const std::string& field)
+{
+    if (fs.nonOrth && fs.nonOrthLimit < 1.0)
+        throw std::runtime_error("brae: fvSchemes laplacian(D" + field + "," + field + ") is `limited " + std::to_string(fs.nonOrthLimit)
+                                 + "`, and the tracer's equation carries no cap on its non-orthogonal correction; refused rather "
+                                   "than run the whole correction under that name");
 }
 
 // fvSchemes `wallDist { method <m>; }`. brae's cellWallDist is a byte-for-byte port of OF's DEFAULT
@@ -672,6 +696,37 @@ inline std::pair<std::string, std::string> turbulenceGradFields(const std::strin
     if (model.find("kOmega") != std::string::npos) return {"k", "omega"};
     if (model.find("Epsilon") != std::string::npos || model.find("KE") != std::string::npos) return {"k", "epsilon"};
     return {};
+}
+
+// The div(phi,X) schemes parseFvSchemesControls takes, field by field: `exact` runs OpenFOAM's scheme, `approximated` runs a
+// near-equivalent and says so (brae WARNING), anything else is refused by name. The parser checks against these rules and
+// `brae capabilities` prints them, so the two cannot disagree. The interFoam reader (inter_case_cpp.cu), simpleFoamV2's and
+// parseFieldDivScheme (scalarTransport) keep lists of their own.
+struct DivSchemeRule
+{
+    const char* label;                       // the field(s), as the refusal names them
+    std::vector<std::string> exact;
+    std::vector<std::string> approximated;
+};
+
+inline const std::vector<DivSchemeRule>& divSchemeRules()
+{
+    static const std::vector<DivSchemeRule> rules = {
+        {"U", {"upwind", "linearUpwind", "linearUpwindV", "LUST", "linear", "limitedLinearV"}, {"limitedLinear"}},
+        {"k", {"upwind", "linearUpwind", "limitedLinear"}, {}},
+        {"epsilon|omega", {"upwind", "linearUpwind", "limitedLinear"}, {}},
+        {"h|e", {"upwind", "linearUpwind", "limitedLinear"}, {}},
+        {"K|Ekp", {"upwind", "linearUpwind", "limitedLinear"}, {}},
+        {"nuTilda", {"upwind", "linearUpwind", "limitedLinear"}, {}},
+    };
+    return rules;
+}
+
+inline const DivSchemeRule& divSchemeRule(const std::string& label)
+{
+    for (const DivSchemeRule& r : divSchemeRules())
+        if (label == r.label) return r;
+    throw std::logic_error("brae: no div scheme rule for " + label);
 }
 
 inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleControls& ctl)
@@ -773,15 +828,14 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
             // one cf only APPROXIMATES (so the route is detected, never silently covered). `ok` = exact; `approx` = warned.
             auto checkDiv = [&](
                 const std::string& s,
-                const char* field,
-                std::initializer_list<const char*> ok,
-                std::initializer_list<const char*> approx)
+                const DivSchemeRule& rule)
             {
+                const char* field = rule.label;
                 { const std::string dk = divKeyOf(s); if (!dk.empty()) divSchemesConsumed().insert(dk); }
                 const std::string w = divSchemeWord(s);
-                for (const char* o : ok)
+                for (const std::string& o : rule.exact)
                     if (w == o) return;
-                for (const char* o : approx)
+                for (const std::string& o : rule.approximated)
                     if (w == o)
                     {
                         std::fprintf(stderr, "brae WARNING: div(phi,%s) 'Gauss %s' has no exact cf kernel -- run as a near-equivalent "
@@ -789,8 +843,8 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                         return;
                     }
                 std::string valid;
-                for (const char* o : ok)     (valid += " ") += o;
-                for (const char* o : approx) (valid += " ") += o;
+                for (const std::string& o : rule.exact)        (valid += " ") += o;
+                for (const std::string& o : rule.approximated) (valid += " ") += o;
                 throw std::runtime_error(std::string("brae: unknown/unsupported div(phi,") + field +
                     ") scheme 'Gauss " + w + "'; cf supports : (" + valid + " )");
             };
@@ -842,6 +896,7 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                 return d != gradLimitByName.end() ? d->second : 0.0;
             };
             bool sawSnGradBlock = false;
+            std::set<std::string> lapSnGrads;
             for (const Stmt& st : stmts)
             {
                 const std::string& ln = st.text;
@@ -905,7 +960,7 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                             throw std::runtime_error("brae: DEShybrid sigmaMin/sigmaMax must lie in [0,1] (OF checkValues).");
                         continue;   // the generic single-word checks below do not apply
                     }
-                    checkDiv(ln, "U", {"upwind", "linearUpwind", "linearUpwindV", "LUST", "linear", "limitedLinearV"}, {"limitedLinear"});
+                    checkDiv(ln, divSchemeRule("U"));
                     if (ln.find("bounded") != std::string::npos)      ctl.bounded = true;
                     // Gauss LINEAR = central differencing: OF's `linear` scheme returns the plain
                     // geometric weights (linear.H:106), so fvmDiv builds lower=-w*phi, upper=lower+phi
@@ -1015,7 +1070,7 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                 if (std::getenv("BRAE_SCHEME_DEBUG") && ln.find("div(phi,") != std::string::npos) std::fprintf(stderr, "[scheme] %s\n", ln.c_str());
                 if (inDiv && ln.find("div(phi,k)") != std::string::npos)
                 {
-                    checkDiv(ln, "k", {"upwind", "linearUpwind", "limitedLinear"}, {});
+                    checkDiv(ln, divSchemeRule("k"));
                     const scalar t = limitedTwoByk(ln);
                     if (t > 0.0) { ctl.limitedK = true; ctl.twoBykK = t; }
                     if (ln.find("linearUpwind") != std::string::npos) ctl.luK = true;
@@ -1025,7 +1080,7 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                 if (inDiv && ((ln.find("div(phi,epsilon)") != std::string::npos && secondField != "omega")
                               || (ln.find("div(phi,omega)") != std::string::npos && secondField != "epsilon")))
                 {
-                    checkDiv(ln, "epsilon|omega", {"upwind", "linearUpwind", "limitedLinear"}, {});
+                    checkDiv(ln, divSchemeRule("epsilon|omega"));
                     const scalar t = limitedTwoByk(ln);
                     if (t > 0.0) { ctl.limitedEps = true; ctl.twoBykEps = t; }   // 2nd turb scalar (eps|omega)
                     if (ln.find("linearUpwind") != std::string::npos) ctl.luEps = true;
@@ -1039,7 +1094,7 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                 // Energy: OF names the field "h" for sensibleEnthalpy and "e" for sensibleInternalEnergy.
                 if (inDiv && (ln.find("div(phi,h)") != std::string::npos || ln.find("div(phi,e)") != std::string::npos))
                 {
-                    checkDiv(ln, "h|e", {"upwind", "linearUpwind", "limitedLinear"}, {});
+                    checkDiv(ln, divSchemeRule("h|e"));
                     const scalar t = limitedTwoByk(ln);
                     if (t > 0.0) { ctl.limitedHe = true; ctl.twoBykHe = t; }
                     if (ln.find("linearUpwind") != std::string::npos) ctl.luHe = true;
@@ -1051,7 +1106,7 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                 // its own slots -- see DeviceSimpleControls::luKin for why sharing the He slots was wrong.
                 if (inDiv && (ln.find("div(phi,K)") != std::string::npos || ln.find("div(phi,Ekp)") != std::string::npos))
                 {
-                    checkDiv(ln, "K|Ekp", {"upwind", "linearUpwind", "limitedLinear"}, {});
+                    checkDiv(ln, divSchemeRule("K|Ekp"));
                     ctl.foundKinScheme = true;
                     const scalar t = limitedTwoByk(ln);
                     if (t > 0.0) { ctl.limitedKin = true; ctl.twoBykKin = t; }
@@ -1062,7 +1117,7 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                 }
                 if (inDiv && ln.find("div(phi,nuTilda)") != std::string::npos)   // SA: nuTilda uses the k-slot scheme flags
                 {
-                    checkDiv(ln, "nuTilda", {"upwind", "linearUpwind", "limitedLinear"}, {});
+                    checkDiv(ln, divSchemeRule("nuTilda"));
                     const scalar t = limitedTwoByk(ln);
                     if (t > 0.0) { ctl.limitedK = true; ctl.twoBykK = t; }
                     if (ln.find("linearUpwind") != std::string::npos) ctl.luK = true;
@@ -1084,6 +1139,16 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                 auto readSnGrad = [&](const std::string& ln, bool& corrected, scalar& limit,
                                       bool& nonOrthCoeffs)
                 {
+                    // A statement naming none of the four schemes below left both flags at their defaults and ran under the
+                    // file's name: OpenFOAM's snGradScheme::New would select faceCorrected, linearFit, quadraticFit, ... and
+                    // brae implements none of them. Refused by name instead (`default none` names no scheme). Scanned
+                    // 2026-11-09: of 821 fvSchemes files (brae's validation and tests, every OpenFOAM v2412 tutorial) one
+                    // statement names none of the four, `default no` in rhoPimpleFoam/laminar/sineWaveDamping.
+                    if (!hasWord(ln, "corrected") && !hasWord(ln, "uncorrected") && !hasWord(ln, "orthogonal")
+                        && !hasWord(ln, "limited") && !(hasWord(ln, "none") && ln.find("Gauss") == std::string::npos))
+                        throw std::runtime_error("brae: fvSchemes `" + ln + "`: its snGrad scheme is none of corrected, uncorrected, "
+                                                 "orthogonal and limited [corrected] <psi>, the ones brae implements; refused rather "
+                                                 "than run under its name with the default");
                     if (hasWord(ln, "corrected")) { corrected = true; nonOrthCoeffs = true; }   // unlimited non-orth correction (psi = 1)
                     // ...and the one that takes those coefficients with NO correction flux
                     if (hasWord(ln, "uncorrected")) nonOrthCoeffs = true;
@@ -1100,10 +1165,42 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                         nonOrthCoeffs = true;
                         scalar psi = 1.0;
                         const char* c = ln.c_str() + ln.find("limited") + 7;
-                        while (*c && !(std::isdigit((unsigned char)*c) || *c == '.')) ++c;   // skip to the coefficient
+                        while (*c && !(std::isdigit((unsigned char)*c) || *c == '.' || *c == '-')) ++c;   // skip to the coefficient
                         if (std::sscanf(c, "%lf", &psi) == 1) limit = psi;
+                        // ...which OpenFOAM refuses outside [0, 1] (limitedSnGrad.H:149-155, a FatalIOError). Read here
+                        // as given, a negative one turned the pressure's correction round
+                        if (psi < 0.0 || psi > 1.0)
+                            throw std::runtime_error("brae: fvSchemes `" + ln + "`: limitCoeff is " + std::to_string(psi)
+                                                     + " and OpenFOAM requires 0 <= limitCoeff <= 1 (limitedSnGrad.H:149-155)");
                     }
                 };
+                // ONE SCHEME FOR EVERY LAPLACIAN. Every laplacianSchemes statement writes the same two flags and
+                // coefficient, so a named entry that differs from `default` (validation/saf_of_ortho's orthogonal
+                // laplacian(DnuTildaEff,nuTilda) beside a corrected default) ran every laplacian under whichever
+                // statement set the flag last, with nothing to say so. Each statement's snGrad scheme is collected and
+                // more than one is refused below; `default none` names none.
+                auto lapSnGradOf = [&](const std::string& ln) -> std::string
+                {
+                    if (hasWord(ln, "none") && ln.find("Gauss") == std::string::npos) return std::string();
+                    if (hasWord(ln, "limited"))
+                    {
+                        bool cc = false;
+                        bool nc = false;
+                        scalar lim = 1.0;
+                        readSnGrad(ln, cc, lim, nc);
+                        return "limited " + std::to_string(lim);
+                    }
+                    if (hasWord(ln, "uncorrected")) return "uncorrected";
+                    if (hasWord(ln, "corrected")) return "corrected";
+                    if (hasWord(ln, "orthogonal")) return "orthogonal";
+                    return ln.substr(ln.find_first_of(" \t") == std::string::npos ? 0 : ln.find_first_of(" \t") + 1);
+                };
+                if (inLap)
+                {
+                    const std::string sg = lapSnGradOf(ln);
+                    if (!sg.empty())
+                        lapSnGrads.insert(sg);
+                }
                 if (inLap)    readSnGrad(ln, ctl.nonOrth, ctl.nonOrthLimit, ctl.nonOrthCoeffs);
                 if (inSnGrad)
                 {
@@ -1119,6 +1216,14 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
                     }
                     readSnGrad(ln, ctl.snGradCorrected, ctl.snGradLimit, ctl.snGradNonOrthCoeffs);
                 }
+            }
+            if (lapSnGrads.size() > 1)
+            {
+                std::string names;
+                for (const std::string& n : lapSnGrads)
+                    names += (names.empty() ? "`" : ", `") + n + "`";
+                throw std::runtime_error("brae: fvSchemes laplacianSchemes names " + names + ": this driver takes one snGrad "
+                                         "scheme for every laplacian; refused rather than run one of them under the others' names");
             }
             // grad(k) and grad(epsilon|omega), grad(nuTilda) under SpalartAllmaras: EACH FIELD'S OWN gradSchemes
             // entry, named-then-default (fvcGrad.C:143-149, schemesLookupDetail.C:76-88). OpenFOAM takes them in

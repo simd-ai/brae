@@ -395,7 +395,8 @@ void deviceSpalartAllmarasCorrect(
     bool gsSymmetric,
     scalar gradNuTildaLULimitK,    // see the declaration
     scalar gradNuTildaLapLimitK,
-    bool releaseGradUMemo)   // see the declaration
+    bool releaseGradUMemo,   // see the declaration
+    scalar lapLimit)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> gradU;
@@ -556,7 +557,7 @@ void deviceSpalartAllmarasCorrect(
                                /*fvoSetMask*/nullptr, /*fvoSetVal*/nullptr,
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/scalar(0.0), gradNuTildaLapLimitK);
+                               /*boundFloor*/scalar(0.0), gradNuTildaLapLimitK, /*storedBnd*/nullptr, lapLimit);
     // deviceSolveScalarTransport already bounds to 1e-15 (~ bound(nuTilda, 0)). correctNut: nut = nuTilda*fv1(new).
     saNutKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), nu, co.Cv1, nut.data());
     cudaCheck(cudaGetLastError(), "SA correctNut");
