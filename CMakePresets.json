@@ -1,0 +1,20 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "release",
+      "displayName": "brae (the solvers only)",
+      "description": "What a user builds and installs: the solvers, no test suite.",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "BRAE_BUILD_TESTS": "OFF" }
+    },
+    {
+      "name": "dev",
+      "displayName": "brae + the test suite",
+      "description": "Development: the solvers, the ctest suite and the developer binaries.",
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "BRAE_BUILD_TESTS": "ON" }
+    }
+  ]
+}
