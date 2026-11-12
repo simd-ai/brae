@@ -16,8 +16,12 @@ Brae runs an existing OpenFOAM incompressible case on one GPU. If you can run it
 git clone https://github.com/simd-ai/brae.git
 cd brae
 cmake -B build -DCMAKE_CUDA_ARCHITECTURES=<arch>   # 121=GB10, 120=RTX 50xx, 100=B200, 90=H100/GH200, 89=RTX 40xx, 86=RTX 30xx, 80=A100
-cmake --build build -j --target brae
+cmake --build build -j 4 --target brae
 ```
+
+Keep the `-j` bounded. A bare `-j` starts all of brae's ~210 compile jobs at once, each needing up to about 1 GB of
+memory (0.43 GB on median), about 89 GB in all: the kernel then kills a compiler and the build stops with only
+`make: *** ... Error 2`. Allow about 2 GB of free memory a job: `-j 4` on a 16 GB machine, `-j 8` on 32 GB.
 
 The command is `build/brae`, and it is the only one you run — steady or transient. Add it to your `PATH` if you
 like:

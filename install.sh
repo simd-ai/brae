@@ -158,11 +158,28 @@ SOLVERS=$(sed -n 's/.*{"[A-Za-z]*", *"\(brae[A-Za-z_]*\)".*/\1/p' \
 [ -n "$SOLVERS" ] || SOLVERS="brae brae_pimpleFoam brae_rhoSimpleFoam brae_interFoam"   # registry unreadable: known set
 say "solvers to build: $(echo $SOLVERS | tr '\n' ' ')"
 
-jobs=$(nproc 2>/dev/null || echo 4)
-say "building brae with $jobs jobs (this can take a few minutes)"
+# ---- parallel compile jobs: bounded by memory as well as by cores ----
+# One nvcc job peaks at up to 0.92 GB (0.43 GB on median; 210 jobs for the four solvers, sm_86, CUDA 13.0,
+# measured 2026-11-12). Too many at once and the kernel kills a compiler: the build then stops with only
+# make's "Error 2" (issue #45). At most one job per 2 GB of available memory leaves room for the rest of the
+# machine; BRAE_JOBS overrides.
+if [ -n "${BRAE_JOBS:-}" ]; then
+    jobs=$BRAE_JOBS
+else
+    jobs=$(nproc 2>/dev/null || echo 4)
+    mem_gb=$(awk '/^MemAvailable:/ {print int($2 / 1048576)}' /proc/meminfo 2>/dev/null)
+    if [ -n "$mem_gb" ] && [ "$mem_gb" -gt 0 ]; then
+        cap=$((mem_gb / 2))
+        [ "$cap" -ge 1 ] || cap=1
+        [ "$jobs" -le "$cap" ] || jobs=$cap
+    fi
+fi
+say "building brae with $jobs jobs (this can take a few minutes; BRAE_JOBS=<n> to change)"
 # Every solver target by name. `brae` alone happens to pull the others in through add_dependencies today,
 # but that is a fact about the current CMakeLists, not a promise, and this install depends on all of them.
-cmake --build build -j "$jobs" --target $SOLVERS || die "build failed"
+cmake --build build -j "$jobs" --target $SOLVERS || die "build failed.
+  If the log shows 'Killed' or 'signal 9', a compiler ran out of memory: rerun with fewer jobs,
+  e.g.  curl -fsSL https://brae.sh/install.sh | BRAE_JOBS=2 sh"
 
 # ---- install the binaries ----
 mkdir -p "$BINDIR"
