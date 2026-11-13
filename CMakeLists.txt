@@ -823,6 +823,11 @@ set_tests_properties(simple_g0_stored_nut_vs_openfoam PROPERTIES SKIP_RETURN_COD
 add_test(NAME pimple_simplec_corrector_grad_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/pimple_simplec_corrector_grad_vs_openfoam.sh)
 set_tests_properties(pimple_simplec_corrector_grad_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+# `Gauss LUST <grad>` takes the gradient it names, cellLimited included (scheme_parse.cuh luGradLimit): pitzDaily laminar, five
+# Euler steps from OpenFOAM's developed field against real OpenFOAM pimpleFoam; LUST's correction left unlimited fails.
+add_test(NAME lust_named_gradient_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/lust_named_gradient_vs_openfoam.sh)
+set_tests_properties(lust_named_gradient_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 # ...and OpenFOAM-13's form of freestreamVelocity (BRAE_FREESTREAM_VELOCITY_UP=average) against real OpenFOAM-13,
 # the same restart; it SKIPS where /opt/openfoam13 is absent (OF13RC names another bashrc).
 add_test(NAME simple_freestream_of13_vs_openfoam13

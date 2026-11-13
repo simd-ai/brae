@@ -879,12 +879,26 @@ inline void parseFvSchemesControls(const std::string& caseDir, DeviceSimpleContr
             }
             // The cellLimited coefficient linearUpwind on THIS div statement will use: the word after
             // "linearUpwind" resolved through the table above, else the gradSchemes `default`. Returns
-            // -1 when the statement is not linearUpwind at all, so a caller can keep its own fallback.
+            // -1 when the statement is neither linearUpwind nor LUST, so a caller can keep its own fallback.
+            //
+            // LUST IS A linearUpwind (LUST.H: class LUST : public linearUpwind<Type>, built from the same
+            // scheme data), so `Gauss LUST grad(U)` names its gradient the same way and its quarter of
+            // linearUpwind's correction takes that gradSchemes entry, cellLimited included. This looked for
+            // the word `linearUpwind` alone, so a LUST statement kept gradULULimitK at 0 and its correction
+            // ran on the UNLIMITED gradient with nothing said. Measured by brae-mgpu's DDES gate on a 3-D
+            // step with `grad(U) cellLimited Gauss linear 1`: brae against OpenFOAM serial U 3.7e-03 after
+            // four steps, 4.1e-02 after forty; 9.4e-14 with the named gradient taken.
             auto luGradLimit = [&](const std::string& s) -> scalar
             {
-                const std::size_t p = s.find("linearUpwind");
+                std::size_t p = s.find("linearUpwind");
+                std::size_t len = 12;
+                if (p == std::string::npos)
+                {
+                    p = s.find("LUST");
+                    len = 4;
+                }
                 if (p == std::string::npos) return -1.0;
-                const char* c = s.c_str() + p + 12;
+                const char* c = s.c_str() + p + len;
                 while (*c && (std::isalpha((unsigned char)*c)))  ++c;   // skip the V of linearUpwindV
                 while (*c && std::isspace((unsigned char)*c))    ++c;
                 std::string name;
