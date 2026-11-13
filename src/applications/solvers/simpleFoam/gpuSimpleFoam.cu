@@ -27,6 +27,7 @@
 #include "scheme_parse.cuh"
 #include "linear_solver_setup.cuh"   // readLinearSolverControls (shared with gpuRhoSimpleFoam)   // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse (steady + transient)
 #include "solver_dispatch.cuh"   // dispatchSolver + execSibling: route to the solver / component that owns the work
+#include "brae_cli.cuh"        // brae --version | solvers | capabilities | check | run: the command line
 #include "simpleFoamV2.cuh"      // the rebuilt path + its envelope guard (BRAE_SIMPLEFOAM_V2)
 #include "benchmark.cuh"         // brae benchmark [sample]: the standard workload, pulled from the template repo
 #include "turbulence_setup.cuh"   // readTurbulenceModel + readTurbulenceFields (shared with pimpleFoam)
@@ -37,6 +38,7 @@
 #include "coded_bc_setup.cuh"         // CodedBCSpec + parseCodedBCs + setupCodedBCs (shared with gpuPimpleFoam)
 #include "frozen_bc_guard.cuh"
 #include "brae_time.cuh"
+#include "forces_fo.cuh"   // OF functionObjects::forces and forceCoeffs, every step, on the device
 #include "scalar_transport_fo.cuh"   // OF functionObjects::scalarTransport, on the device flux   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
 
 #include <algorithm>
@@ -60,26 +62,37 @@ using namespace brae;
 static void printUsage()
 {
     std::printf(
-"brae, a GPU-native, OpenFOAM-compatible CFD solver. The whole solve runs on one GPU; reads a standard\n"
-"OpenFOAM case and writes standard time dirs.\n\n"
+"brae %s, a GPU-native, OpenFOAM-compatible CFD solver. Reads a standard OpenFOAM case and writes standard time\n"
+"directories; the whole solve runs on the GPU.\n\n"
 "Solvers (picked from the case's controlDict `application`, so `brae` is the only command you type):%s\n"
 "Any other application stops at start-up rather than run the case with the wrong solver.\n\n"
-"Subcommands (the only two reserved words; anything else leading is a case directory):\n"
-"  brae benchmark [sample]        run the standard workload, writes brae-benchmark.json\n"
-"  brae benchmark --list          the samples published at github.com/simd-ai/brae-bench\n"
-"  brae node register|status|unregister\n"
-"                                 join this machine to the Brae network (needs brae-agent)\n"
-"A case directory called 'node' or 'benchmark' is addressed as `brae -case node`.\n\n"
 "Usage:\n"
-"  brae [-case <dir>]             solve an OpenFOAM case (default: the current directory)\n"
+"  brae [-case <dir>] | brae <dir>  solve an OpenFOAM case (default: the current directory)\n"
+"  brae run -case <dir>             the same, spelled as a command\n"
+"  brae check -case <dir> [--setup] read the case's dictionaries, fields and mesh the way a run does and report what\n"
+"                                   brae would run, approximate or refuse, without solving. --setup also sets the case\n"
+"                                   up on the GPU (mesh, fields, boundary conditions, device arrays) and stops there.\n"
+"                                   exit 0 supported, 1 supported with notices, 2 refused, 3 not a case\n"
+"  brae solvers                     the solvers this build has, on one GPU and on several\n"
+"  brae capabilities [--json]       what this build accepts in a case (solvers, turbulence models, boundary\n"
+"                                   conditions, schemes, linear solvers, mesh, time, known limitations), read from the\n"
+"                                   tables the code checks cases against\n"
+"  brae --version                   version, commit, CUDA, GPU architectures, the multi-GPU layer if installed\n"
 "  mpirun -np N brae -case <dir> -parallel\n"
-"                                 solve across N GPUs, one rank per GPU (laminar only; needs P2P/NVLink).\n"
-"                                 Decomposes in core and reconstructs on write -- no decomposePar step.\n"
-"  brae -partition [-case <dir>]  build + cache the mesh and AMG hierarchy, then exit (no solve)\n"
-"  brae -cases <d1> <d2> ...      run several cases at once, one per GPU (mesh/parameter study)\n"
-"  brae --help                    show this message\n\n"
+"                                   several GPUs: handed to the multi-GPU layer (brae-mgpu) when it is installed next\n"
+"                                   to brae; refused otherwise\n"
+"  brae -partition [-case <dir>]    build + cache the mesh and AMG hierarchy, then exit (no solve)\n"
+"  brae -cases <d1> <d2> ...        run several cases at once, one per GPU (mesh/parameter study)\n"
+"  brae benchmark [sample]          run the standard workload, writes brae-benchmark.json\n"
+"  brae benchmark --list            the samples published at github.com/simd-ai/brae-bench\n"
+"  brae node register|status|unregister\n"
+"                                   join this machine to the Brae network (needs brae-agent)\n"
+"  brae --help                      show this message\n\n"
+"Command words and case directories: benchmark, node and job are reserved words; run, check, solvers and capabilities\n"
+"are commands unless a case directory of that name is here, which then runs as a case, as it always has (brae says so).\n"
+"A case directory called 'node' or 'benchmark' is addressed as `brae -case node`; any case as `brae -case <dir>`.\n\n"
 "A case is a standard OpenFOAM directory (0/ constant/ system/, ASCII or binary mesh). No decomposePar\n"
-"needed; brae auto-partitions for the GPU. With -cases, extra cases queue as GPUs free up.\n\n"
+"needed on one GPU. With -cases, extra cases queue as GPUs free up.\n\n"
 "Environment:\n"
 "  BRAE_GPUS=N        override the detected GPU count (for -cases)\n"
 "  BRAE_JOBS=N        how many cases to run at once with -cases (default: number of GPUs)\n"
@@ -87,13 +100,40 @@ static void printUsage()
 "  BRAE_AMG_FP32=0    use the FP64 AMG preconditioner instead of FP32 (on by default)\n\n"
 "Docs and benchmarks: https://github.com/simd-ai/brae\n",
         // the list is the registry's own (solver_dispatch.cuh): written out here it named two of four solvers
-        braeSolverList().c_str());
+        BRAE_VERSION_STRING, braeSolverList().c_str());
 }
 
 int main(int argc, char** argv)
 {
     try
     {
+        // `brae --version`, and the commands -- solvers, capabilities, check, run -- wherever a case directory of the same name does
+        // not claim the word first (cli::isCommand). `run` and `check --setup` on a case this binary solves carry on below with the
+        // command word dropped, so they run exactly the code `brae -case <dir>` runs.
+        if (argc > 1 && (std::string(argv[1]) == "--version" || std::string(argv[1]) == "-version")) return cli::version();
+        static std::vector<std::string> keptArgs;
+        static std::vector<char*> keptArgv;
+        if (cli::isCommand(argc, argv))
+        {
+            const std::string word = argv[1];
+            if (word == "solvers") return cli::solversCommand();
+            if (word == "capabilities") return cli::capabilitiesCommand(argc, argv);
+            if (word == "check")
+            {
+                const int code = cli::checkCommand(argc, argv);
+                if (code != -1) return code;
+                keptArgs = {argv[0], "-case", cli::caseOf(argc, argv, 2)};
+            }
+            else
+            {
+                keptArgs.assign(argv, argv + argc);
+                keptArgs.erase(keptArgs.begin() + 1);
+            }
+            for (std::string& a : keptArgs) keptArgv.push_back(a.data());
+            keptArgv.push_back(nullptr);
+            argc = static_cast<int>(keptArgs.size());
+            argv = keptArgv.data();
+        }
         // Subcommands. ONLY these three leading words are reserved -- everything else is a case directory, so
         // `brae myCase` is untouched. A case actually named `node`, `benchmark` or `job` is reached with -case.
         if (argc > 1 && argv[1][0] != '-')
@@ -149,11 +189,23 @@ int main(int argc, char** argv)
         // REFUSE rather than fall through to the single-GPU path: under `mpirun -np N` that would run N
         // redundant identical solves, each writing over the others' time directories.
         for (int i = 1; i < argc; ++i)
+            if (std::string(argv[i]) == "-parallel" && !cli::mgpuSibling().empty())
+            {
+                // the multi-GPU layer, when installed next to brae: exec'd directly (not through execSibling, whose
+                // one-hand-over guard would stop brae-mgpu choosing its own solver), each MPI rank alike
+                const std::string mgpu = cli::mgpuSibling();
+                std::fprintf(stderr, "brae: -parallel -> %s (the multi-GPU layer)\n", mgpu.c_str());
+                std::vector<char*> av(argv, argv + argc);
+                av[0] = const_cast<char*>(mgpu.c_str());
+                av.push_back(nullptr);
+                execv(mgpu.c_str(), av.data());
+                throw std::runtime_error("cannot start " + mgpu);
+            }
+        for (int i = 1; i < argc; ++i)
             if (std::string(argv[i]) == "-parallel")
                 throw std::runtime_error(
-                    "brae: -parallel (multi-GPU) is not supported in this build. The distributed solver was "
-                    "moved to legacy/ and is out of scope; see legacy/README.md. Run brae single-GPU without "
-                    "-parallel (and without mpirun).");
+                    "brae: -parallel (multi-GPU) needs the multi-GPU layer, brae-mgpu, installed next to brae, and this "
+                    "install has none. Run brae single-GPU without -parallel (and without mpirun).");
         std::string caseDir = ".";
         bool partition = false;                              // -partition: build mesh + AMG caches, then exit (no solve)
         for (int i = 1; i < argc; ++i)
@@ -166,6 +218,7 @@ int main(int argc, char** argv)
             else if (a[0] != '-')
                 caseDir = a;
         }
+        setCaseEnvironment(caseDir);   // FOAM_CASE, before any dictionary is read (argList.C:891-893)
         // The case names its solver (controlDict `application`), so `brae` is the only command a user types: this
         // executable keeps the steady cases and hands the others to the brae solver that owns them, before any dict
         // read or CUDA init. -partition is solver-agnostic prep (mesh + AMG cache) and always runs here.
@@ -208,17 +261,13 @@ int main(int argc, char** argv)
         audit.addFvSchemes(caseDir);   // reported at scope exit, once every consumer has run
 
         // Account for controlDict.functions at STARTUP, not after the run: a case that refuses on an
-        // unsupported model, or that never reaches the post-run forces block, must still be told which
-        // of its functionObjects brae will not honour. forceCoeffs is declared APPROXIMATED because this
-        // driver prints it once at the end, whereas OF's runs every time step and writes a history
-        // (forceCoeffs.H:547,550) -- gpuPimpleFoam declares the same type APPLIED, because it does
-        // sample on the write cadence.
+        // unsupported model must still be told which of its functionObjects brae will not honour.
 
 
         // startFrom is resolved by Time, as OF does in Time::setControls() (Time.C:149-188). This
         // driver carried its own copy of that scan; measured identical to the shared one on an
         // adversarial directory (numeric dir without U, non-integer time, 0.orig) before removing it.
-        Time time(caseDir, controlDict);   // startFrom resolves here; functionObjects are read below
+        Time time(caseDir, controlDict, {}, {}, {}, false);   // startFrom resolves here; functionObjects are read below, once
         std::string startStr = time.startName();
         // OF `restore0Dir` convention (NOT a solver fallback): tutorials needing a mesh-prep step (snappyHexMesh /
         // setFields / changeDictionary, e.g. motorBike) ship the flow fields in <startTime>.orig, because
@@ -246,8 +295,7 @@ int main(int argc, char** argv)
         // functionObjects, which is what stops a solver from being able to forget them. Placed here --
         // after the start directory resolves, but still BEFORE mesh, geometry and solver -- so the report
         // reaches a case that refuses later, while the objects resolve those dependencies from the
-        // registry on first execute(). forceCoeffs is APPROXIMATED in this driver (a single post-run
-        // print); gpuPimpleFoam declares the same type APPLIED, because it samples on the write cadence.
+        // registry on first execute(). forces and forceCoeffs run every step, as OpenFOAM's (forces_fo.cuh).
         ObjectRegistry timeRegistry;
         std::vector<ScalarTransportFO*> scalarTransports;
         std::vector<std::pair<std::string, FunctionObjectList::Factory>> foTypes;
@@ -270,7 +318,7 @@ int main(int argc, char** argv)
                 // too -- reported and declined rather than run with a substituted discretisation.
                 const std::string schemesField = fd.wordOr("schemesField", fld);
                 FieldDivScheme scheme;
-                try { scheme = parseFieldDivScheme(caseDir, schemesField); }
+                try { scheme = parseFieldDivScheme(caseDir, schemesField); requireUncappedLaplacian(scheme, schemesField); }
                 catch (const std::exception& e)
                 {
                     noticeIgnored("functions/" + foName, std::string(e.what()) +
@@ -284,7 +332,22 @@ int main(int argc, char** argv)
                 scalarTransports.push_back(fo.get());
                 return fo;
             });
-        time.readFunctionObjects(controlDict, foTypes, {"forceCoeffs"});
+        // OF functionObjects::forces and ::forceCoeffs (forces_fo.cuh): run every step their controls select, written under
+        // postProcessing/ as OpenFOAM writes them
+        const ForcesContext forcesCtx = forcesContext(caseDir, timeRegistry, controlDict);
+        foTypes.emplace_back(
+            "forces",
+            [&](const std::string& foName, const FoamDict& fd) -> std::unique_ptr<FunctionObject>
+            {
+                return ForcesFO::make(foName, fd, false, forcesCtx);
+            });
+        foTypes.emplace_back(
+            "forceCoeffs",
+            [&](const std::string& foName, const FoamDict& fd) -> std::unique_ptr<FunctionObject>
+            {
+                return ForcesFO::make(foName, fd, true, forcesCtx);
+            });
+        time.readFunctionObjects(controlDict, foTypes);
         const int   endTime   = controlDict.intOr("endTime", 1000);
         // Steady simpleFoam's endTime is an INTEGER iteration count. A fractional endTime (e.g. 0.3, copy-pasted from
         // a transient case) truncates to 0 -> the loop runs 0 iterations and would write the initial field as "the
@@ -658,7 +721,7 @@ int main(int argc, char** argv)
         // measured identical to the shared one over 8 controlDict cases x 40 steps (including
         // runTime float accumulation and a non-zero-startTime restart) before being removed.
         const std::string wsrc = fieldDir + "/";
-        auto writeTimeDir = [&](const std::string& tname)   // reconstruct + write one time directory
+        auto writeTimeDirBody = [&](const std::string& tname)   // reconstruct + write one time directory
         {
             const std::string outDir = caseDir + "/" + tname;
             std::filesystem::create_directories(outDir);
@@ -712,6 +775,21 @@ int main(int argc, char** argv)
             // so consolidating changes no filesystem side effect.
             time.writeControl().recordWritten(caseDir, tname);
         };
+        // BRAE_PHASE_TIME: each time directory's write, the benchmark protocol's E (run_timing.cuh)
+        const bool timingMaster = true;
+        auto writeTimeDir = [&](const std::string& tname)
+        {
+            if (!RunTiming::on())
+            {
+                writeTimeDirBody(tname);
+                return;
+            }
+            RunTiming::drain();
+            const double w0 = RunTiming::now();
+            writeTimeDirBody(tname);
+            RunTiming::drain();
+            if (timingMaster) std::printf("brae-timing write %s %.6f\n", tname.c_str(), RunTiming::now() - w0);
+        };
 
         // endTime is ABSOLUTE, not a run length. OF's Time::run() tests `value() < endTime - 0.5*deltaT`,
         // so a case restarted at 10 with endTime 20 runs TEN more steps and finishes at 20. Looping
@@ -731,109 +809,6 @@ int main(int argc, char** argv)
                 "iterations -- on a restart set it past the time you are restarting from.");
         int iter = 0;
         bool converged = false;
-        // forceCoeffs SAMPLED through the run, on request: BRAE_FORCE_INTERVAL=N writes Cd/Cl/Cm every N iterations
-        // from iteration BRAE_FORCE_FROM (default 1) to postProcessing/forceCoeffs/<startTime>/coefficient.dat, as
-        // gpuPimpleFoam does. OpenFOAM's forceCoeffs runs every time step and writes that history; this driver
-        // otherwise evaluates it once, after the loop (below). Not every iteration by default because the evaluation
-        // is wallForces' host gaussGrad and near-wall distance over the whole mesh -- seconds on a few million cells.
-        // The polar of the boxy5 UAV compares means over the last 300 iterations, which is what this is for.
-        const long forceInterval = std::getenv("BRAE_FORCE_INTERVAL")
-                                 ? std::max(0L, std::atol(std::getenv("BRAE_FORCE_INTERVAL"))) : 0;
-        const long forceFrom = std::getenv("BRAE_FORCE_FROM")
-                             ? std::max(1L, std::atol(std::getenv("BRAE_FORCE_FROM"))) : 1;
-        const FoamDict* fcSampleDict = nullptr;
-        if (const FoamDict* funcs = controlDict.subDict("functions"))
-            for (const auto& sd : funcs->subs)
-                if (sd.second.wordOr("type", "") == "forceCoeffs")
-                {
-                    fcSampleDict = &sd.second;
-                    break;
-                }
-        std::vector<std::string> fcSampleWalls;
-        for (const auto& q : fvp)
-            if (q.type == "wall") fcSampleWalls.push_back(q.name);
-        // grad(U) is needed at the patches' cells only (wallForces' gradAt): the subset, made once
-        fvc::GradSubset fcSampleAt;
-        if (forceInterval > 0)
-        {
-            std::vector<char> onPatch(static_cast<std::size_t>(nC), 0);
-            for (const auto& q : fvp)
-            {
-                if (q.type == "empty") continue;
-                for (label i = 0; i < q.size; ++i)
-                    onPatch[static_cast<std::size_t>(q.faceCells[i])] = 1;
-            }
-            std::vector<label> cells;
-            for (label c = 0; c < nC; ++c)
-                if (onPatch[static_cast<std::size_t>(c)]) cells.push_back(c);
-            fcSampleAt = fvc::gradSubset(m, cells);
-        }
-        std::ofstream fcOut;
-        if (forceInterval > 0 && fcSampleDict && ctl.turbulent && !fcSampleWalls.empty())
-        {
-            const std::string fdir = caseDir + "/postProcessing/forceCoeffs/" + startStr;
-            std::error_code fec;
-            std::filesystem::create_directories(fdir, fec);
-            fcOut.open(fdir + "/coefficient.dat");
-            fcOut << "# Time\tCd\tCl\tCm\n";
-            fcOut.setf(std::ios::scientific);
-            fcOut.precision(10);
-            std::printf("  forceCoeffs: sampled every %ld iterations from iteration %ld to "
-                        "postProcessing/forceCoeffs/%s/coefficient.dat (BRAE_FORCE_INTERVAL, BRAE_FORCE_FROM)\n",
-                        forceInterval,
-                        forceFrom,
-                        startStr.c_str());
-        }
-        else if (forceInterval > 0)
-        {
-            std::printf("  forceCoeffs: BRAE_FORCE_INTERVAL set but NOT sampled (%s)\n",
-                        !fcSampleDict ? "no forceCoeffs entry in controlDict.functions"
-                                      : (!ctl.turbulent ? "laminar case" : "no wall patches"));
-        }
-        // the same evaluation as the one after the loop, from the current device state
-        auto sampleForceCoeffs = [&](scalar tval)
-        {
-            const std::vector<vector> Ug = solver.U();
-            const std::vector<scalar> pg = solver.p();
-            for (label c = 0; c < nC; ++c)
-                U.internal[c] = Ug[c];
-            p.internal = pg;
-            U.evaluateBoundary();
-            p.evaluateBoundary();
-            const scalar wCmu   = ctl.sst ? ctl.ksstCoeffs.betaStar : ctl.keCoeffs.Cmu;
-            const scalar wKappa = ctl.sst ? ctl.ksstCoeffs.kappa    : ctl.keCoeffs.kappa;
-            const scalar wE     = ctl.sst ? ctl.ksstCoeffs.E        : ctl.keCoeffs.E;
-            const bool velNutWall = ctl.sa || ctl.nutWall != NutWall::Nutk;
-            const std::vector<scalar> saNutWall = velNutWall ? solver.nutWall() : std::vector<scalar>();
-            const std::vector<scalar>* nwb = velNutWall ? &saNutWall : nullptr;
-            auto toV = [](const std::vector<scalar>& a, vector d){ return a.size() >= 3 ? vector{a[0],a[1],a[2]} : d; };
-            const std::vector<std::string> fcP = fcSampleDict->wordListOr("patches", fcSampleWalls);
-            const scalar rhoInf = fcSampleDict->scalarOr("rhoInf", 1.0), magUInf = fcSampleDict->scalarOr("magUInf", 1.0);
-            const scalar Aref = fcSampleDict->scalarOr("Aref", 1.0), lRef = fcSampleDict->scalarOr("lRef", 1.0);
-            const vector liftDir = toV(fcSampleDict->scalarListOr("liftDir", {}), vector{0,1,0});
-            const vector dragDir = toV(fcSampleDict->scalarListOr("dragDir", {}), vector{1,0,0});
-            const vector pitchAxis = toV(fcSampleDict->scalarListOr("pitchAxis", {}), vector{0,0,1});
-            const vector CofR = toV(fcSampleDict->scalarListOr("CofR", {}), vector{0,0,0});
-            const ForceResult Fc = wallForces(U,
-                                              p,
-                                              solver.k(),
-                                              ctl.nu,
-                                              m,
-                                              g,
-                                              fvp,
-                                              fcP,
-                                              rhoInf,
-                                              0.0,
-                                              CofR,
-                                              wCmu,
-                                              wKappa,
-                                              wE,
-                                              nwb,
-                                              &fcSampleAt);
-            const ForceCoeffs cc = forceCoeffs(Fc, dragDir, liftDir, pitchAxis, rhoInf, magUInf, Aref, lRef);
-            fcOut << tval << '\t' << cc.Cd << '\t' << cc.Cl << '\t' << cc.Cm << '\n';
-            fcOut.flush();
-        };
         const auto _runStart = std::chrono::high_resolution_clock::now();          // for OpenFOAM-style ExecutionTime
         double _cumCont = 0.0;                                                     // cumulative continuity error (OF continuityErrs.H)
         time.setSteps(static_cast<int>(nSteps));
@@ -843,6 +818,17 @@ int main(int argc, char** argv)
         // BRAE_MEMORY_PROBE: the memory the run holds at fixed iterations (solvers/common/memory_probe.cuh)
         MemoryProbe memProbe;
         memProbe.startUp();
+        // `brae check --setup`: everything above is the run's own setup; stop before its first iteration
+        if (cli::checkSetupDone("simpleFoam")) return 0;
+        // BRAE_PHASE_TIME: start-up to here (the benchmark protocol's B) and the loop's wall time (run_timing.cuh)
+        double loopStart = 0;
+        if (RunTiming::on())
+        {
+            RunTiming::drain();
+            loopStart = RunTiming::now();
+            if (timingMaster) std::printf("brae-timing startup %.6f\n", RunTiming::sinceProcessStart());
+        }
+        time.setReportTiming(timingMaster);
         while (!converged && time.loop())
         {
             iter = time.timeIndex();
@@ -1054,10 +1040,6 @@ int main(int argc, char** argv)
             // a plausible-looking field set (simpleControl.C:51-57).
             converged = converged && rcChecked > 0;
             const scalar tval = startTimeVal + (scalar)iter * deltaT;               // OF time value at this step
-            if (fcOut.is_open() && iter >= forceFrom && iter % forceInterval == 0)
-            {
-                sampleForceCoeffs(tval);
-            }
             if (!converged && iter != nSteps && time.writeControl().isWriteTime(iter, tval))
             {
                 writeTimeDir(WriteControl::timeName(tval));
@@ -1065,7 +1047,19 @@ int main(int argc, char** argv)
             }
             memProbe.iteration(iter);
         }
+        // OpenFOAM writes this last step when it is a write time or the run converged (writeAndEnd); brae writes it below whatever
+        // the cadence. A functionObject under writeControl writeTime fires on OpenFOAM's writes, so those are what is noted
+        {
+            const int last = converged ? time.timeIndex() : static_cast<int>(nSteps);
+            const scalar tlast = startTimeVal + (scalar)last * deltaT;
+            if (converged || time.writeControl().isWriteTime(last, tlast)) time.write();
+        }
         time.end();   // OF Time.C:790-802: a final execute() so the last step is seen, then end()
+        if (RunTiming::on())
+        {
+            RunTiming::drain();
+            if (timingMaster) std::printf("brae-timing loop %.6f %ld\n", RunTiming::now() - loopStart, static_cast<long>(iter));
+        }
         memProbe.loopEnd(iter);
         detail::devicePool().report("loop end");
         detail::devicePool().reportClasses("loop end");
@@ -1185,36 +1179,6 @@ int main(int argc, char** argv)
                 std::printf("forces (walls, rhoInf=1):  pressure=(%.5e %.5e %.5e)  viscous=(%.5e %.5e %.5e)  total=(%.5e %.5e %.5e)\n",
                             F.pressure.x, F.pressure.y, F.pressure.z, F.viscous.x, F.viscous.y, F.viscous.z, F.total().x, F.total().y, F.total().z);
 
-                // controlDict.functions. Every entry is now ACCOUNTED FOR through the shared
-                // FunctionObjectList: forceCoeffs is computed just below (reported as approximated,
-                // because brae prints it once here while OF's forceCoeffs runs every time step and
-                // writes a history -- forceCoeffs.H:547,550), and anything else is reported as ignored
-                // rather than silently skipped. Before this, a case could carry any number of
-                // functionObjects and the only one even looked at was forceCoeffs.
-                const FoamDict* funcs = controlDict.subDict("functions");
-                const FoamDict* fcd = nullptr;
-                if (funcs)
-                    for (const auto& s : funcs->subs)
-                        if (s.second.wordOr("type", "") == "forceCoeffs")
-                        {
-                            fcd = &s.second;
-                            break;
-                        }
-                if (fcd)
-                {
-                    auto toV = [](const std::vector<scalar>& a, vector d){ return a.size() >= 3 ? vector{a[0],a[1],a[2]} : d; };
-                    const std::vector<std::string> fcP = fcd->wordListOr("patches", walls);
-                    const scalar rhoInf = fcd->scalarOr("rhoInf", 1.0), magUInf = fcd->scalarOr("magUInf", 1.0);
-                    const scalar Aref = fcd->scalarOr("Aref", 1.0), lRef = fcd->scalarOr("lRef", 1.0);
-                    const vector liftDir = toV(fcd->scalarListOr("liftDir", {}), vector{0,1,0});
-                    const vector dragDir = toV(fcd->scalarListOr("dragDir", {}), vector{1,0,0});
-                    const vector pitchAxis = toV(fcd->scalarListOr("pitchAxis", {}), vector{0,0,1});
-                    const vector CofR = toV(fcd->scalarListOr("CofR", {}), vector{0,0,0});
-                    const ForceResult Fc = wallForces(U, p, solver.k(), ctl.nu, m, g, fvp, fcP, rhoInf, 0.0, CofR, wCmu, wKappa, wE, nwb);
-                    const ForceCoeffs cc = forceCoeffs(Fc, dragDir, liftDir, pitchAxis, rhoInf, magUInf, Aref, lRef);
-                    std::printf("forceCoeffs (rhoInf=%.3g magUInf=%.3g Aref=%.3g lRef=%.3g):  Cd=%.6e  Cl=%.6e  Cm=%.6e\n",
-                                rhoInf, magUInf, Aref, lRef, cc.Cd, cc.Cl, cc.Cm);
-                }
             }
         }
         memProbe.end(nIter);

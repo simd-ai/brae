@@ -14,6 +14,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <stdexcept>
 
 namespace brae {
 
@@ -79,7 +80,11 @@ struct MRFConfig
     std::vector<std::string> nonRotatingPatches;
 };
 
-// First active MRF entry in constant/MRFProperties. active=false if absent/inactive.
+// THE active MRF entry in constant/MRFProperties. active=false if absent/inactive.
+//
+// ONE ZONE. This took the first active entry and dropped the rest without a word: occDrivAerRotMesh's RANS stage rotates
+// four wheel zones (MRF_FL, MRF_FR, MRF_RL, MRF_RR) and only the front-left one would have turned. OpenFOAM's MRFZoneList
+// applies every active zone; a second active zone is refused by name until this path carries more than one.
 inline MRFConfig readMRFProperties(const std::string& constantDir)
 {
     MRFConfig c;
@@ -101,6 +106,26 @@ inline MRFConfig readMRFProperties(const std::string& constantDir)
         c.origin = v3(mrf.scalarListOr("origin", {}), vector{0, 0, 0});
         c.nonRotatingPatches = mrf.wordListOr("nonRotatingPatches", {});
         break;
+    }
+    std::vector<std::string> active;
+    for (const auto& s : d.subs)
+    {
+        const std::string act = s.second.wordOr("active", "yes");
+        if (act == "yes" || act == "true" || act == "on" || act == "1")
+        {
+            active.push_back(s.first);
+        }
+    }
+    if (active.size() > 1)
+    {
+        std::string names;
+        for (const std::string& n : active)
+        {
+            names += (names.empty() ? "" : ", ") + n;
+        }
+        throw std::runtime_error("brae: constant/MRFProperties has " + std::to_string(active.size()) + " active zones (" + names
+                                 + "); OpenFOAM rotates every one and this solver path rotates one. Refused rather than run "
+                                 "the first alone.");
     }
     return c;
 }

@@ -12,6 +12,7 @@
 #include "stage_dump.cuh"   // Phase 0 stage harness (cudafoam/rhosimplefoam-restage-plan.md)
 #include "linear_solver_setup.cuh"   // noticeNuTildaCaseOrder: the colour rule owns nuTilda's line when asked
 #include <chrono>
+#include <cstring>   // std::strcmp: the limited laplacian control's site
 
 namespace brae {
 
@@ -101,6 +102,67 @@ bool simpleColourSwapControl()
 {
     static const bool on = std::getenv("BRAE_CONTROL_SIMPLE_COLOUR_SWAP") != nullptr;
     return on;
+}
+// BRAE_CONTROL_U_FIXED_CAP=1 is the U stop rule gate's CONTROL (tests/simple_u_stop_rule_vs_openfoam.sh), deliberately
+// wrong: the sweep in OpenFOAM's order stops at 5000 sweeps with no minIter, whatever the U entry says, as it did before
+// 2026-11-08. With `minIter 1` OpenFOAM sweeps U once in every solve; this driver skipped the solve once the initial
+// residual was under the tolerance. The same call on the multi-GPU driver grew a mode at the tyre contact patches of
+// a 123.4 M-cell DrivAer DDES (|U| 1,397 m/s at step 20, 683,000 m/s at step 40) where OpenFOAM's run stayed flat.
+bool uFixedCapControl()
+{
+    static const bool on = std::getenv("BRAE_CONTROL_U_FIXED_CAP") != nullptr;
+    return on;
+}
+// BRAE_CONTROL_LAP_UNLIMITED is the limited laplacian gate's CONTROL (tests/simple_ahmed_limited_vs_openfoam.sh), deliberately
+// wrong: under `limited corrected <psi>` the correction is taken whole where this driver took it whole before 2026-11-09. `1`:
+// everywhere but the pressure's internal faces, as before; `u`, `closure`, `simplec` or `coupled`: the momentum laplacian, the
+// closures' (k, epsilon, omega, nuTilda, ReThetat, gammaInt), the SIMPLEC flux's snGrad(p), or the pressure's cyclic faces alone.
+bool lapUnlimitedControl(
+    const char* site)
+{
+    static const char* v = std::getenv("BRAE_CONTROL_LAP_UNLIMITED");
+    return v && (std::strcmp(v, "1") == 0 || std::strcmp(v, site) == 0);
+}
+// The cap of laplacianSchemes `limited corrected <psi>` on the momentum laplacian and the closures' (limitedSnGrad.C:48-58),
+// 0 <= psi < 1, psi = 0 being no correction at all; 1 is `corrected`, the whole correction. This driver took the cap on p
+// only. MEASURED: from the Ahmed body's uniform start (snappyHexMesh, 311,172 cells, non-orthogonality 55.5) the multi-GPU
+// driver's copy of this step, taking the same unlimited correction, was U 1.1e-3 and p 6.7e-4 from OpenFOAM serial after one
+// iteration, 4.4e-13 and 2.6e-12 with the cap (Arrhenius job 5042510); on a 259.7 M-cell DrivAer from rest it put U 5.94
+// m/s (16%) below OpenFOAM's in prism cells on the mirror at the first iteration and omega's assembled source up to 9x
+// OpenFOAM's beside the walls, and the run diverged at iteration 28. From rest OpenFOAM's cap is zero across every face
+// whose two cells hold one value.
+scalar lapLimit(
+    const DeviceSimpleControls& c,
+    const char* site)
+{
+    if (!c.nonOrth || lapUnlimitedControl(site)) return scalar(1);
+    return c.nonOrthLimit < scalar(1) ? c.nonOrthLimit : scalar(1);
+}
+// SIMPLEC's fvc::snGrad(p) (pEqn.H: phiHbyA += interpolate(rAtU - rAU)*snGrad(p)*magSf) is the snGradSchemes entry's, not the
+// laplacian's: its coefficients (deltaCoeffs for `orthogonal`, nonOrthDeltaCoeffs for every other), whether it takes a correction
+// (`corrected`, `limited`) and the cap of `limited corrected <psi>` (limitedSnGrad.C:48-58). This driver keyed all three on
+// laplacianSchemes: validation/rhoCtl's `corrected` laplacian beside an `orthogonal` snGrad ran the corrected snGrad there.
+// BRAE_CONTROL_SIMPLEC_LAPLACIAN_SNGRAD=1 keys them on the laplacian again (the control); `simplec` of
+// BRAE_CONTROL_LAP_UNLIMITED takes the correction whole.
+bool simplecLaplacianControl()
+{
+    static const bool on = std::getenv("BRAE_CONTROL_SIMPLEC_LAPLACIAN_SNGRAD") != nullptr;
+    return on;
+}
+struct SimplecSnGrad
+{
+    bool nonOrthCoeffs;   // nonOrthDeltaCoeffs, not deltaCoeffs
+    bool corrected;       // a non-orthogonal correction
+    scalar cap;           // its cap, 1 for the whole correction
+};
+SimplecSnGrad simplecSnGrad(
+    const DeviceSimpleControls& c)
+{
+    SimplecSnGrad s{c.snGradNonOrthCoeffs, c.snGradCorrected, c.snGradLimit < scalar(1) ? c.snGradLimit : scalar(1)};
+    if (simplecLaplacianControl())
+        s = SimplecSnGrad{c.nonOrth || c.nonOrthCoeffs, c.nonOrth, c.nonOrthLimit < scalar(1) ? c.nonOrthLimit : scalar(1)};
+    if (lapUnlimitedControl("simplec")) s.cap = scalar(1);
+    return s;
 }
 }   // namespace
 
@@ -273,6 +335,7 @@ bool simpleColourSwapControl()
             if (hasNutCalc_) { nutCalcMask_.copyFrom(cm); nutCalcSel_.copyFrom(cs); }
             if (hasNutFixed_) nutFixedMask_.copyFrom(fx);
             nutBndFile_.copyFrom(nb);
+            spaldingControls_ = spaldingFaceControls(*nut, fvp);
         }
         {
             // Wall-face -> boundary-face index. buildDeviceWallData walks fvp keeping the TURBULENCE WALL
@@ -1242,7 +1305,8 @@ bool simpleColourSwapControl()
                                              // symmetric sweep in silence, now that the substitution notice is gone.
                                              saGradLimit(ctl_.gradKLULimitK),   // linearUpwind's named grad(nuTilda): ran unlimited
                                              saGradLimit(ctl_.gradKLimitK),     // gradSchemes grad(nuTilda), the non-orth correction's
-                                             releaseGradUMemo);
+                                             releaseGradUMemo,
+                                             lapLimit(ctl_, "closure"));   // `limited corrected <psi>` on nuTilda
             else if (ctl_.sst)   // de_ slot holds omega; relaxEps/limitedEps/twoBykEps carry the omega-equation settings
             {
                 deviceKOmegaSSTCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
@@ -1266,7 +1330,8 @@ bool simpleColourSwapControl()
                                        fixScaK_ ? &fixScaMask_ : nullptr, fixScaK_ ? &fixScaKVal_ : nullptr,
                                        fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr,
                                        &lesDelta_,   // the case's `delta` for the DDES length scale (empty -> cubeRootVol)
-                                       /*nSweeps*/1, ctl_.gsKESym);   // ...and WHICH GaussSeidel the case named
+                                       /*nSweeps*/1, ctl_.gsKESym,   // ...and WHICH GaussSeidel the case named
+                                       lapLimit(ctl_, "closure"));   // `limited corrected <psi>` on k and omega
                 if (ctl_.lm)   // Langtry-Menter: transport ReThetat + gammaInt, update gammaIntEff for next iter
                     deviceKOmegaSSTLMCorrect(dm, dbU_, dbReThetat_, dbGammaInt_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
                                              ReThetat_, gammaInt_, gammaIntEff_, phiInt_, phiBnd_, ctl_.nu, ctl_.epsRelax(),
@@ -1277,7 +1342,8 @@ bool simpleColourSwapControl()
                                              // only here to reach gsSymmetric. That the LEGACY driver does
                                              // not forward the case's div scheme to the two transition
                                              // scalars is a separate gap, not one this line introduces.
-                                             /*limitedLinear*/false, /*linearUpwind*/false, ctl_.gsKESym);
+                                             /*limitedLinear*/false, /*linearUpwind*/false, ctl_.gsKESym,
+                                             lapLimit(ctl_, "closure"));   // `limited corrected <psi>` on the two transition scalars
             }
             else
                 deviceKEpsilonCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_,
@@ -1298,7 +1364,8 @@ bool simpleColourSwapControl()
                                       // fvOptions scalarFixedValueConstraint (OF eqn.setValues per field)
                                       fixScaK_ ? &fixScaMask_ : nullptr, fixScaK_ ? &fixScaKVal_ : nullptr,
                                       fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr,
-                                      /*nSweeps*/1, ctl_.gsKESym);   // ...and WHICH GaussSeidel the case named
+                                      /*nSweeps*/1, ctl_.gsKESym,   // ...and WHICH GaussSeidel the case named
+                                      lapLimit(ctl_, "closure"));   // `limited corrected <psi>` on k and epsilon
         }
     }
 
@@ -1356,6 +1423,287 @@ bool simpleColourSwapControl()
             if (sumRhoA <= 0.0) continue;
             deviceUpdateFlowRateInlet(dbU_, frMagSf_[k], -fp.mdot / sumRhoA, frNx_, frNy_, frNz_);
         }
+    }
+
+    // nuEff at the boundary faces from the current fields, and the boundary nut with it (nutBndAll_, dnutBndWall_): moved here
+    // unchanged from solveMomentumPredictor, which calls it at the start of every assembly, so that the step can make the same
+    // values again after its turbulence correction (refreshNutBoundary), as the multi-GPU driver's transient step does
+    void DeviceSimpleSolver::boundaryNuEff(
+        const DeviceBuffer<scalar>& nuEff,
+        DeviceBuffer<scalar>& nuEffBnd)
+    {
+        const DeviceMesh& dm = dm_;
+        // nuEff at boundary FACES: turbulent uses the TRUE wall nut (nutkWallFunction), not the cell value, so the
+        // wall shear matches OpenFOAM; laminar/non-wall faces use the adjacent cell value.
+        // Boundary turbulent viscosity into muEff_b. OF: mut(patchi) = rho.boundaryField()[patchi]*nut(patchi),
+        // so the wall nut -- which every wall function returns KINEMATIC -- is rho_b-weighted here, exactly as
+        // the cell value is above. Incompressible keeps the plain sum.
+        auto addWallNutToMuEff =
+            [&](const DeviceBuffer<scalar>& nutB,
+                DeviceBuffer<scalar>& muEffB)
+            {
+                deviceCopy(nutBndAll_, nutB);   // same nut: alphat_b (compressible) + DkEff/DepsEff(patchi)
+                if (!compressible_)
+                {
+                    deviceAxpy(1.0, nutB, muEffB);
+                    return;
+                }
+                DeviceBuffer<scalar> mutB;
+                deviceHadamard(mutB, rhoBnd_, nutB);
+                deviceAxpy(1.0, mutB, muEffB);
+            };
+
+        if (ctl_.turbulent && ctl_.les)
+        {
+            // pure LES Smagorinsky: NO k-based wall function (there is no k field). Honour a velocity-based nut wall
+            // function (nutUSpaldingWallFunction) if the 0/nut BC selects it; otherwise extrapolate the cell nuEff
+            // (nu+nut) to the boundary (calculated/zeroGradient/fixedValue nut -> adjacent-cell sub-grid nut), exactly
+            // as the laminar path does.
+            if (ctl_.nutWall == NutWall::Spalding)
+            {
+                deviceCopy(nuEffBnd, nuBndConst_);
+                deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_, spaldingControls_,
+                                          compressible_ ? &nuWallBnd_ : nullptr);
+                deviceAxpy(1.0, dnutBndWall_, nuEffBnd);
+            }
+            else
+                deviceBCValue(dbExtrap_, nuEff, nuEffBnd);
+        }
+        else if (ctl_.turbulent)
+        {
+            deviceCopy(nuEffBnd, nuBndConst_);
+            // Wall nut chosen by the 0/nut BC TYPE (ctl_.nutWall), matching OpenFOAM, NOT the model.
+            if (ctl_.sa && ctl_.nutWall == NutWall::LowRe)
+            {
+                // nutLowReWallFunction on SA: calcNut() returns Zero UNCONDITIONALLY on every model
+                // (nutLowReWallFunctionFvPatchScalarField.C:38-42), so the wall faces carry NO
+                // turbulent viscosity and the wall shear is molecular -- the low-Re treatment
+                // bump2D:SpalartAllmaras asks for. This branch used to be unreachable: the `ctl_.sa ||`
+                // hard-force below ran Spalding's Newton uTau under this BC's name (audit finding #15).
+                // The SA `calculated` patches still carry nuTilda_b*fv1(chi_b), the same rescue as the
+                // Spalding branch runs.
+                const std::size_t nb = bndIsWall_.size();
+                if (dnutBndWall_.size() != nb) dnutBndWall_.resize(nb);
+                cudaCheck(cudaMemsetAsync(dnutBndWall_.data(), 0, nb * sizeof(scalar),
+                                          cudaStreamPerThread), "sa lowRe wall nut");
+                if (hasNutCalc_)
+                {
+                    DeviceBuffer<scalar> ntB, saNutB;
+                    deviceBCValue(dbK_, dk_, ntB);            // nuTilda's own patch values (dk_ is nuTilda for SA)
+                    deviceNutSABoundary(ntB, compressible_ ? &nuWallBnd_ : nullptr,
+                                        ctl_.nu, ctl_.saCoeffs.Cv1, saNutB);
+                    deviceSelectFixedFlux(nutCalcSel_, saNutB, dnutBndWall_);
+                }
+                addWallNutToMuEff(dnutBndWall_, nuEffBnd);
+            }
+            else if (ctl_.sa || ctl_.nutWall == NutWall::Spalding)   // nutUSpaldingWallFunction (velocity-based Newton uTau): SA when the BC selects it (or names none), or the BC on any model
+            {
+                deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_, spaldingControls_,
+                                          nullptr, nutBndFile_.size() ? &nutBndFile_ : nullptr);
+                // SPALART-ALLMARAS: the `calculated` patches carry nuTilda_b*fv1(chi_b), which is what OF's
+                // correctNut leaves there -- `nut_ = nuTilda_*fv1` is a GeometricField assignment, so the
+                // patch value comes from nuTilda's PATCH value. brae had no SA branch here at all (the
+                // guard on the kEpsilon path reads `!ctl_.sa`), so those faces kept whatever 0/nut held.
+                //
+                // That is not a small error when 0/nut is a placeholder. On pimpleFoam/LES/vortexShed
+                // `internalField uniform 1.0e-05` with nu = 1e-05, while the physical value is
+                // nuTilda*fv1 = 1e-05*2.786e-03 = 2.79e-08 -- 360x smaller. brae's boundary nuEff came out
+                // 2.000e-05 against OpenFOAM's 1.0028e-05, so every non-wall patch's momentum
+                // internalCoeffs was 2x: predicted 1.9944, measured 1.9944 against the OF stage oracle.
+                // Same defect class as the 704x `fixedValue` inlet above, one turbulence model along.
+                if (hasNutCalc_ && ctl_.sa)
+                {
+                    DeviceBuffer<scalar> ntB, saNutB;
+                    deviceBCValue(dbK_, dk_, ntB);            // nuTilda's own patch values (dk_ is nuTilda for SA)
+                    deviceNutSABoundary(ntB, compressible_ ? &nuWallBnd_ : nullptr,
+                                        ctl_.nu, ctl_.saCoeffs.Cv1, saNutB);
+                    deviceSelectFixedFlux(nutCalcSel_, saNutB, dnutBndWall_);   // calc faces only; wall faces keep Spalding
+                }
+                addWallNutToMuEff(dnutBndWall_, nuEffBnd);
+            }
+            else if (ctl_.nutWall == NutWall::NutU)   // nutUWallFunction (log-law yPlus, stepwise blend)
+            {
+                deviceBoundaryNutU(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu,
+                                   ctl_.keCoeffs.kappa, ctl_.keCoeffs.E, dnutBndWall_,
+                                   compressible_ ? &nuWallBnd_ : nullptr,
+                                   nutBndFile_.size() ? &nutBndFile_ : nullptr);
+                addWallNutToMuEff(dnutBndWall_, nuEffBnd);
+            }
+            else if (ctl_.nutWall == NutWall::Blended)   // nutUBlendedWallFunction (velocity-based binomial n=4 blend) on kEps/kOmegaSST
+            {
+                deviceBoundaryNutBlended(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.keCoeffs.kappa, ctl_.keCoeffs.E, dnutBndWall_,
+                                         compressible_ ? &nuWallBnd_ : nullptr,
+                                   nutBndFile_.size() ? &nutBndFile_ : nullptr);
+                addWallNutToMuEff(dnutBndWall_, nuEffBnd);
+            }
+            else   // k-based wall nut: nutkWallFunction (smooth), or atmNutkWallFunction (rough) when ctl_.atmZ0>0
+            {
+                DeviceBuffer<scalar> nutBnd;
+                // kEpsilon only: the 'calculated' nut patches carry Cmu*k_b^2/eps_b. The SST's nut has a
+                // different expression (a1*k/max(a1*omega, b1*F2*sqrt(S2))) that needs boundary F2 and S2,
+                // so it keeps the extrapolated value until that is measured and built.
+                DeviceBuffer<scalar> kB, eB;
+                const bool keNut = hasNutCalc_ && !ctl_.sst && !ctl_.sa && !ctl_.keCoeffs.realizable;
+                if (keNut) { deviceBCValue(dbK_, dk_, kB); deviceBCValue(dbEps_, de_, eB); }
+                deviceBoundaryNut(dbU_.comp[0], bndIsWall_, bndY_, dk_, dnut_, ctl_.nu, nutBnd, ctl_.keCoeffs, ctl_.atmZ0, ctl_.atmBoundNut,
+                                  compressible_ ? &nuWallBnd_ : nullptr,
+                                  keNut ? &nutCalcMask_ : nullptr,
+                                  keNut ? &kB : nullptr,
+                                  keNut ? &eB : nullptr);
+                // SST: the 'calculated' patches carry a1*k_b/max(a1*om_b, b1*F2_b*sqrt(S2_b)) -- a different
+                // expression from kEpsilon's, needing boundary F2 and S2. Overwrites those faces only.
+                if (hasNutCalc_ && ctl_.sst)
+                {
+                    DeviceBuffer<scalar> kBs, omBs, gradUs;
+                    deviceBCValue(dbK_, dk_, kBs);
+                    deviceBCValue(dbEps_, de_, omBs);
+                    deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradUs,
+                                hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+                    // correctNut's S2 on these faces is the model's own fvc::grad(U), so gradSchemes grad(U) here too
+                    // (kOmegaSSTBase.C correct(), then the patch half of nut_'s assignment). MEASURED: nuEff 4.7e-02 off
+                    // on a slip patch beside a wall with cellLimited (JUPITER job 2641827), and exact without it.
+                    static const bool sstNutUnlimited = std::getenv("BRAE_CONTROL_SST_NUT_UNLIMITED") != nullptr;
+                    if (ctl_.gradULimitK > 0.0 && !sstNutUnlimited)
+                        deviceCellLimitGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradUs, ctl_.gradULimitK,
+                                             hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr);
+                    deviceSSTNutBoundary(dbU_, kBs, omBs, y_,   // CELL wall distance (bndY_ is 0 off-wall)
+                                         compressible_ ? &nuWallBnd_ : nullptr, ctl_.nu,
+                                         gradUs, nC_, Uk_[0], Uk_[1], Uk_[2],
+                                         nutCalcMask_, ctl_.ksstCoeffs, dnut_, nutBnd);
+                }
+                // nutLowReWallFunction: calcNut() is Zero UNCONDITIONALLY
+                // (nutLowReWallFunctionFvPatchScalarField.C:38-42 is the whole function). It differs from
+                // the k-based branch ONLY in the wall value, so the branch above runs in full -- the
+                // 'calculated' faces, the SST expression, all of it -- and the WALL faces alone are then
+                // zeroed. Writing zeros over the entire boundary array instead cost bump2D:kOmegaSST
+                // U 1.781e-03 against a 1.5e-03 bound and nut 2.444e-01 against 2.2e-01, because it
+                // destroyed the calculated inlet/outlet values this branch had just computed.
+                if (ctl_.nutWall == NutWall::LowRe && bndIsWall_.size() == nutBnd.size())
+                {
+                    DeviceBuffer<scalar> keep;
+                    deviceCopy(keep, nutBnd);
+                    cudaCheck(cudaMemsetAsync(nutBnd.data(), 0,
+                                              nutBnd.size() * sizeof(scalar), cudaStreamPerThread),
+                              "nutLowRe wall nut");
+                    // writes `keep` where the mask is 0, i.e. every NON-wall face keeps what the branch
+                    // above computed; wall faces stay at the zero OpenFOAM gives them.
+                    deviceSelectFixedFlux(bndIsWall_, keep, nutBnd);
+                }
+                // ...then pin the faces whose nut BC fixes a value to that value. Last, so it overrides
+                // whatever the wall/calculated evaluation left there.
+                if (hasNutFixed_ && nutBndFile_.size() == nutBnd.size())
+                    deviceSelectFixedFlux(nutFixedMask_, nutBndFile_, nutBnd);
+                deviceCopy(dnutBndWall_, nutBnd);   // materialised: gpuSimpleFoam reads it for wallForces
+                addWallNutToMuEff(nutBnd, nuEffBnd);
+            }
+        }
+        else if (compressible_ && ctl_.gnPowerLaw)
+            // generalizedNewtonian: OF's nuEff(patchi) is nu_.boundaryField()[patchi] -- the SAME
+            // strain-rate viscosity as the interior, NOT the molecular mu. Taking mu_b = thermo mu here put
+            // 1100x too little viscosity on every wall face (interior 0.9945 Pa.s vs thermo 8.9e-4), and the
+            // wall shear is where a duct's entire pressure drop comes from: the profile came out flat
+            // (U min 1.26 against OF's 0.031), the pressure drop 5x low, and the dissipation heating with it.
+            // The face value is the adjacent cell's, as the incompressible laminar branch below does.
+            deviceBCValue(dbExtrap_, nuEff, nuEffBnd);
+        else if (compressible_)
+            deviceCopy(nuEffBnd, muBnd_);   // laminar compressible: mu_b = Sutherland(T_b), OF transport_.mu(patchi)
+        else
+            deviceBCValue(dbExtrap_, nuEff, nuEffBnd);   // laminar: adjacent-cell value
+    }
+
+    // correctNut's boundary half (kOmegaSST.C correctNut -> nut_.correctBoundaryConditions(), and every closure's): the patch nut
+    // of the fields the closure just solved, which is what OpenFOAM writes and what its next momentum assembly reads. This
+    // driver kept the patch nut its momentum assembly had made from the fields before the closure, so the written patches were
+    // one correction behind: on snappyHexMesh's Ahmed body brae's iteration n was OpenFOAM's n - 1 to 5e-17, on all five patches
+    // (outlet 3.3e-2 from OpenFOAM's n; Arrhenius jobs 5042510, 5042627). Nothing read them within a run: the next assembly
+    // makes these same values again before any reader. The next assembly takes these (nuEffBndHeld_) in place of making them
+    // again: the same inputs (no field moves between the closure and that assembly), and the same number of evaluations, which
+    // the iterative wall functions (nutUSpalding, nutU, nutUBlended start their Newton from the last value) need to stay byte
+    // for byte what they were. Incompressible only: a compressible step's rho_b moves between the two. CONTROL
+    // BRAE_CONTROL_NUT_BOUNDARY_LAG=1: the assembly's, as before
+    void DeviceSimpleSolver::refreshNutBoundary()
+    {
+        static const bool lag = std::getenv("BRAE_CONTROL_NUT_BOUNDARY_LAG") != nullptr;
+        nuEffBndHeldValid_ = false;
+        if (!ctl_.turbulent || compressible_ || ctl_.maxwell || lag) return;
+        DeviceBuffer<scalar> nuEff;
+        deviceCopy(nuEff, dnut_);
+        deviceAxpy(1.0, nuConst_, nuEff);
+        boundaryNuEff(nuEff, nuEffBndHeld_);
+        nuEffBndHeldValid_ = true;
+    }
+
+    std::vector<double> DeviceSimpleSolver::forcePatchSums(
+        const DeviceForceFaces& faces,
+        scalar rhoP,
+        scalar rhoV,
+        scalar pRef,
+        const vector& origin)
+    {
+        if (compressible_) throw std::runtime_error("functionObjects forces: not carried on a compressible driver");
+        // fvc::grad(U) under the case's grad(U) scheme, the same two forms the turbulence model takes it in
+        DeviceBuffer<scalar> gradU;
+        deviceGradU(dm_, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+        if (ctl_.gradULimitK > 0.0)
+            deviceCellLimitGradU(dm_, dbU_, Uk_[0], Uk_[1], Uk_[2], gradU, ctl_.gradULimitK, hasCyclic_ ? &cyc_ : nullptr,
+                                 hasAMI_ ? &ami_ : nullptr);
+        DeviceBuffer<scalar> UB[3];
+        for (int k = 0; k < 3; ++k) deviceBCValue(dbU_.comp[k], Uk_[k], UB[k]);
+        DeviceBuffer<scalar> pB;
+        deviceBCValue(dbP_, dp_, pB);
+        // nuEff at the boundary faces: nu + the boundary nut the step made last (refreshNutBoundary: correctNut's, after the
+        // turbulence correction), boundaryNuEff's own sum. NOT boundaryNuEff called again: the iterative wall functions
+        // (nutUSpalding, nutU, nutUBlended) start their Newton from the last value, so a second evaluation here would change
+        // the run a functionObject only measures. Laminar: nu
+        DeviceBuffer<scalar> nuEffB;
+        deviceCopy(nuEffB, nuBndConst_);
+        if (ctl_.turbulent && ctl_.les)
+        {
+            // boundaryNuEff's LES branch, its inputs as the step left them: the Spalding wall nut it last made, else the cells'
+            // nuEff extrapolated to the faces
+            if (ctl_.nutWall == NutWall::Spalding && dnutBndWall_.size() == nuBndConst_.size())
+            {
+                deviceAxpy(1.0, dnutBndWall_, nuEffB);
+            }
+            else
+            {
+                DeviceBuffer<scalar> nuEff;
+                deviceCopy(nuEff, dnut_);
+                deviceAxpy(1.0, nuConst_, nuEff);
+                deviceBCValue(dbExtrap_, nuEff, nuEffB);
+            }
+        }
+        else if (ctl_.turbulent)
+        {
+            if (nutBndAll_.size() != nuBndConst_.size())
+                throw std::logic_error("functionObjects forces: the boundary nut has not been made (no step has run)");
+            deviceAxpy(1.0, nutBndAll_, nuEffB);
+        }
+        DeviceForceFields fl;
+        fl.faceCellB = dm_.bndCell.data();
+        fl.dcB = dbU_.comp[0].deltaCoeffs.data();
+        fl.pB = pB.data();
+        for (int k = 0; k < 3; ++k)
+        {
+            fl.UB[k] = UB[k].data();
+            fl.U[k] = Uk_[k].data();
+        }
+        fl.gradU = gradU.data();
+        fl.nCells = nC_;
+        fl.nuEffB = nuEffB.data();
+        fl.rhoP = rhoP;
+        fl.rhoV = rhoV;
+        fl.pRef = pRef;
+        fl.origin = origin;
+        static const bool cellGrad = std::getenv("BRAE_CONTROL_FORCES_GRAD_CELL") != nullptr;
+        if (cellGrad)
+        {
+            static bool said = false;
+            if (!said) std::printf("  *** CONTROL BRAE_CONTROL_FORCES_GRAD_CELL: forces take the cell gradient at the wall. This run is deliberately wrong. ***\n");
+            said = true;
+            fl.correctGrad = false;
+        }
+        return deviceForcePatchSums(faces, fl);
     }
 
     void DeviceSimpleSolver::solveMomentumPredictor(DeviceSimpleResidual& res)
@@ -1551,183 +1899,14 @@ bool simpleColourSwapControl()
         if (compressible_ && stageDumpActive() && stageDumpFirstOnly("muEff")) stageDump("stage_muEff", nuEff);
         DeviceBuffer<scalar> nuEff_f;
         deviceInterpolate(dm, nuEff, nuEff_f);
-        // nuEff at boundary FACES: turbulent uses the TRUE wall nut (nutkWallFunction), not the cell value, so the
-        // wall shear matches OpenFOAM; laminar/non-wall faces use the adjacent cell value.
-        // Boundary turbulent viscosity into muEff_b. OF: mut(patchi) = rho.boundaryField()[patchi]*nut(patchi),
-        // so the wall nut -- which every wall function returns KINEMATIC -- is rho_b-weighted here, exactly as
-        // the cell value is above. Incompressible keeps the plain sum.
-        auto addWallNutToMuEff =
-            [&](const DeviceBuffer<scalar>& nutB,
-                DeviceBuffer<scalar>& muEffB)
-            {
-                deviceCopy(nutBndAll_, nutB);   // same nut: alphat_b (compressible) + DkEff/DepsEff(patchi)
-                if (!compressible_)
-                {
-                    deviceAxpy(1.0, nutB, muEffB);
-                    return;
-                }
-                DeviceBuffer<scalar> mutB;
-                deviceHadamard(mutB, rhoBnd_, nutB);
-                deviceAxpy(1.0, mutB, muEffB);
-            };
-
+        // nuEff at boundary FACES, and the boundary nut with it (nutBndAll_, dnutBndWall_): boundaryNuEff, or the values the
+        // last turbulence correction made of these same fields (refreshNutBoundary), once
         DeviceBuffer<scalar> nuEffBnd;
-        if (ctl_.turbulent && ctl_.les)
-        {
-            // pure LES Smagorinsky: NO k-based wall function (there is no k field). Honour a velocity-based nut wall
-            // function (nutUSpaldingWallFunction) if the 0/nut BC selects it; otherwise extrapolate the cell nuEff
-            // (nu+nut) to the boundary (calculated/zeroGradient/fixedValue nut -> adjacent-cell sub-grid nut), exactly
-            // as the laminar path does.
-            if (ctl_.nutWall == NutWall::Spalding)
-            {
-                deviceCopy(nuEffBnd, nuBndConst_);
-                deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_,
-                                          compressible_ ? &nuWallBnd_ : nullptr);
-                deviceAxpy(1.0, dnutBndWall_, nuEffBnd);
-            }
-            else
-                deviceBCValue(dbExtrap_, nuEff, nuEffBnd);
-        }
-        else if (ctl_.turbulent)
-        {
-            deviceCopy(nuEffBnd, nuBndConst_);
-            // Wall nut chosen by the 0/nut BC TYPE (ctl_.nutWall), matching OpenFOAM, NOT the model.
-            if (ctl_.sa && ctl_.nutWall == NutWall::LowRe)
-            {
-                // nutLowReWallFunction on SA: calcNut() returns Zero UNCONDITIONALLY on every model
-                // (nutLowReWallFunctionFvPatchScalarField.C:38-42), so the wall faces carry NO
-                // turbulent viscosity and the wall shear is molecular -- the low-Re treatment
-                // bump2D:SpalartAllmaras asks for. This branch used to be unreachable: the `ctl_.sa ||`
-                // hard-force below ran Spalding's Newton uTau under this BC's name (audit finding #15).
-                // The SA `calculated` patches still carry nuTilda_b*fv1(chi_b), the same rescue as the
-                // Spalding branch runs.
-                const std::size_t nb = bndIsWall_.size();
-                if (dnutBndWall_.size() != nb) dnutBndWall_.resize(nb);
-                cudaCheck(cudaMemsetAsync(dnutBndWall_.data(), 0, nb * sizeof(scalar),
-                                          cudaStreamPerThread), "sa lowRe wall nut");
-                if (hasNutCalc_)
-                {
-                    DeviceBuffer<scalar> ntB, saNutB;
-                    deviceBCValue(dbK_, dk_, ntB);            // nuTilda's own patch values (dk_ is nuTilda for SA)
-                    deviceNutSABoundary(ntB, compressible_ ? &nuWallBnd_ : nullptr,
-                                        ctl_.nu, ctl_.saCoeffs.Cv1, saNutB);
-                    deviceSelectFixedFlux(nutCalcSel_, saNutB, dnutBndWall_);
-                }
-                addWallNutToMuEff(dnutBndWall_, nuEffBnd);
-            }
-            else if (ctl_.sa || ctl_.nutWall == NutWall::Spalding)   // nutUSpaldingWallFunction (velocity-based Newton uTau): SA when the BC selects it (or names none), or the BC on any model
-            {
-                deviceBoundaryNutSpalding(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.saCoeffs, dnutBndWall_,
-                                          nullptr, nutBndFile_.size() ? &nutBndFile_ : nullptr);
-                // SPALART-ALLMARAS: the `calculated` patches carry nuTilda_b*fv1(chi_b), which is what OF's
-                // correctNut leaves there -- `nut_ = nuTilda_*fv1` is a GeometricField assignment, so the
-                // patch value comes from nuTilda's PATCH value. brae had no SA branch here at all (the
-                // guard on the kEpsilon path reads `!ctl_.sa`), so those faces kept whatever 0/nut held.
-                //
-                // That is not a small error when 0/nut is a placeholder. On pimpleFoam/LES/vortexShed
-                // `internalField uniform 1.0e-05` with nu = 1e-05, while the physical value is
-                // nuTilda*fv1 = 1e-05*2.786e-03 = 2.79e-08 -- 360x smaller. brae's boundary nuEff came out
-                // 2.000e-05 against OpenFOAM's 1.0028e-05, so every non-wall patch's momentum
-                // internalCoeffs was 2x: predicted 1.9944, measured 1.9944 against the OF stage oracle.
-                // Same defect class as the 704x `fixedValue` inlet above, one turbulence model along.
-                if (hasNutCalc_ && ctl_.sa)
-                {
-                    DeviceBuffer<scalar> ntB, saNutB;
-                    deviceBCValue(dbK_, dk_, ntB);            // nuTilda's own patch values (dk_ is nuTilda for SA)
-                    deviceNutSABoundary(ntB, compressible_ ? &nuWallBnd_ : nullptr,
-                                        ctl_.nu, ctl_.saCoeffs.Cv1, saNutB);
-                    deviceSelectFixedFlux(nutCalcSel_, saNutB, dnutBndWall_);   // calc faces only; wall faces keep Spalding
-                }
-                addWallNutToMuEff(dnutBndWall_, nuEffBnd);
-            }
-            else if (ctl_.nutWall == NutWall::NutU)   // nutUWallFunction (log-law yPlus, stepwise blend)
-            {
-                deviceBoundaryNutU(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu,
-                                   ctl_.keCoeffs.kappa, ctl_.keCoeffs.E, dnutBndWall_,
-                                   compressible_ ? &nuWallBnd_ : nullptr,
-                                   nutBndFile_.size() ? &nutBndFile_ : nullptr);
-                addWallNutToMuEff(dnutBndWall_, nuEffBnd);
-            }
-            else if (ctl_.nutWall == NutWall::Blended)   // nutUBlendedWallFunction (velocity-based binomial n=4 blend) on kEps/kOmegaSST
-            {
-                deviceBoundaryNutBlended(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.keCoeffs.kappa, ctl_.keCoeffs.E, dnutBndWall_,
-                                         compressible_ ? &nuWallBnd_ : nullptr,
-                                   nutBndFile_.size() ? &nutBndFile_ : nullptr);
-                addWallNutToMuEff(dnutBndWall_, nuEffBnd);
-            }
-            else   // k-based wall nut: nutkWallFunction (smooth), or atmNutkWallFunction (rough) when ctl_.atmZ0>0
-            {
-                DeviceBuffer<scalar> nutBnd;
-                // kEpsilon only: the 'calculated' nut patches carry Cmu*k_b^2/eps_b. The SST's nut has a
-                // different expression (a1*k/max(a1*omega, b1*F2*sqrt(S2))) that needs boundary F2 and S2,
-                // so it keeps the extrapolated value until that is measured and built.
-                DeviceBuffer<scalar> kB, eB;
-                const bool keNut = hasNutCalc_ && !ctl_.sst && !ctl_.sa && !ctl_.keCoeffs.realizable;
-                if (keNut) { deviceBCValue(dbK_, dk_, kB); deviceBCValue(dbEps_, de_, eB); }
-                deviceBoundaryNut(dbU_.comp[0], bndIsWall_, bndY_, dk_, dnut_, ctl_.nu, nutBnd, ctl_.keCoeffs, ctl_.atmZ0, ctl_.atmBoundNut,
-                                  compressible_ ? &nuWallBnd_ : nullptr,
-                                  keNut ? &nutCalcMask_ : nullptr,
-                                  keNut ? &kB : nullptr,
-                                  keNut ? &eB : nullptr);
-                // SST: the 'calculated' patches carry a1*k_b/max(a1*om_b, b1*F2_b*sqrt(S2_b)) -- a different
-                // expression from kEpsilon's, needing boundary F2 and S2. Overwrites those faces only.
-                if (hasNutCalc_ && ctl_.sst)
-                {
-                    DeviceBuffer<scalar> kBs, omBs, gradUs;
-                    deviceBCValue(dbK_, dk_, kBs);
-                    deviceBCValue(dbEps_, de_, omBs);
-                    deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradUs,
-                                hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
-                    // correctNut's S2 on these faces is the model's own fvc::grad(U), so gradSchemes grad(U) here too
-                    // (kOmegaSSTBase.C correct(), then the patch half of nut_'s assignment). MEASURED: nuEff 4.7e-02 off
-                    // on a slip patch beside a wall with cellLimited (JUPITER job 2641827), and exact without it.
-                    static const bool sstNutUnlimited = std::getenv("BRAE_CONTROL_SST_NUT_UNLIMITED") != nullptr;
-                    if (ctl_.gradULimitK > 0.0 && !sstNutUnlimited)
-                        deviceCellLimitGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradUs, ctl_.gradULimitK,
-                                             hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr);
-                    deviceSSTNutBoundary(dbU_, kBs, omBs, y_,   // CELL wall distance (bndY_ is 0 off-wall)
-                                         compressible_ ? &nuWallBnd_ : nullptr, ctl_.nu,
-                                         gradUs, nC_, Uk_[0], Uk_[1], Uk_[2],
-                                         nutCalcMask_, ctl_.ksstCoeffs, dnut_, nutBnd);
-                }
-                // nutLowReWallFunction: calcNut() is Zero UNCONDITIONALLY
-                // (nutLowReWallFunctionFvPatchScalarField.C:38-42 is the whole function). It differs from
-                // the k-based branch ONLY in the wall value, so the branch above runs in full -- the
-                // 'calculated' faces, the SST expression, all of it -- and the WALL faces alone are then
-                // zeroed. Writing zeros over the entire boundary array instead cost bump2D:kOmegaSST
-                // U 1.781e-03 against a 1.5e-03 bound and nut 2.444e-01 against 2.2e-01, because it
-                // destroyed the calculated inlet/outlet values this branch had just computed.
-                if (ctl_.nutWall == NutWall::LowRe && bndIsWall_.size() == nutBnd.size())
-                {
-                    DeviceBuffer<scalar> keep;
-                    deviceCopy(keep, nutBnd);
-                    cudaCheck(cudaMemsetAsync(nutBnd.data(), 0,
-                                              nutBnd.size() * sizeof(scalar), cudaStreamPerThread),
-                              "nutLowRe wall nut");
-                    // writes `keep` where the mask is 0, i.e. every NON-wall face keeps what the branch
-                    // above computed; wall faces stay at the zero OpenFOAM gives them.
-                    deviceSelectFixedFlux(bndIsWall_, keep, nutBnd);
-                }
-                // ...then pin the faces whose nut BC fixes a value to that value. Last, so it overrides
-                // whatever the wall/calculated evaluation left there.
-                if (hasNutFixed_ && nutBndFile_.size() == nutBnd.size())
-                    deviceSelectFixedFlux(nutFixedMask_, nutBndFile_, nutBnd);
-                deviceCopy(dnutBndWall_, nutBnd);   // materialised: gpuSimpleFoam reads it for wallForces
-                addWallNutToMuEff(nutBnd, nuEffBnd);
-            }
-        }
-        else if (compressible_ && ctl_.gnPowerLaw)
-            // generalizedNewtonian: OF's nuEff(patchi) is nu_.boundaryField()[patchi] -- the SAME
-            // strain-rate viscosity as the interior, NOT the molecular mu. Taking mu_b = thermo mu here put
-            // 1100x too little viscosity on every wall face (interior 0.9945 Pa.s vs thermo 8.9e-4), and the
-            // wall shear is where a duct's entire pressure drop comes from: the profile came out flat
-            // (U min 1.26 against OF's 0.031), the pressure drop 5x low, and the dissipation heating with it.
-            // The face value is the adjacent cell's, as the incompressible laminar branch below does.
-            deviceBCValue(dbExtrap_, nuEff, nuEffBnd);
-        else if (compressible_)
-            deviceCopy(nuEffBnd, muBnd_);   // laminar compressible: mu_b = Sutherland(T_b), OF transport_.mu(patchi)
+        if (nuEffBndHeldValid_)
+            deviceCopy(nuEffBnd, nuEffBndHeld_);
         else
-            deviceBCValue(dbExtrap_, nuEff, nuEffBnd);   // laminar: adjacent-cell value
+            boundaryNuEff(nuEff, nuEffBnd);
+        nuEffBndHeldValid_ = false;
         // BRAE_POOL_STATS: the momentum phase in four parts, for the census's per-part peaks
         detail::devicePool().phase("mom:stress");
         // explicit divDevReff stress (uses the incoming U; coupled across the 3 components)
@@ -2168,6 +2347,33 @@ bool simpleColourSwapControl()
         DeviceLduView colourView[3];
         int colourComp[3];
         int nColour = 0;
+        // `limited corrected <psi>` on the momentum laplacian: limitedSnGrad<vector>::correction's ONE limiter a face from
+        // mag of the whole snGrad and the whole correction (limitedSnGrad.C:48-58), made once here over U as the assembly
+        // finds it, as OpenFOAM assembles UEqn whole before it solves; a cyclic face's with its own cap, as limitedSnGrad
+        // caps a coupled face. This driver took the cap on p only and ran U's correction unlimited, on either step
+        // (lapLimit has the measurement).
+        DeviceBuffer<scalar> lapFfcU[3];
+        DeviceBuffer<scalar> lapFfcCycU[3];
+        const scalar lapLimitU = lapLimit(ctl_, "u");
+        const bool lapLimitedU = ctl_.nonOrth && lapLimitU < scalar(1);
+        if (lapLimitedU)
+        {
+            if (hasAMI_)
+                throw std::runtime_error("brae: laplacianSchemes `limited corrected " + std::to_string(lapLimitU)
+                                         + "` on the momentum laplacian across a cyclicAMI: the capped correction is not "
+                                           "carried on an AMI face; refused rather than run the unlimited one");
+            DeviceBuffer<scalar>* NOx = sharedNO ? gLUx : ownNO ? gNOx : gUx;
+            DeviceBuffer<scalar>* NOy = sharedNO ? gLUy : ownNO ? gNOy : gUy;
+            DeviceBuffer<scalar>* NOz = sharedNO ? gLUz : ownNO ? gNOz : gUz;
+            deviceLaplacianCorrFluxLimitedVec(dm, nuEff_f, Uk_[0], Uk_[1], Uk_[2], NOx, NOy, NOz, lapLimitU, lapFfcU);
+            // ...but for psi = 0, whose cap is zero on a cyclic face as everywhere: deviceCyclicLapCorrFluxVec reads 0 as
+            // `corrected`, the whole correction
+            if (hasCyclic_ && lapLimitU > scalar(0))
+            {
+                const DeviceBuffer<scalar>* Up[3] = {&Uk_[0], &Uk_[1], &Uk_[2]};
+                deviceCyclicLapCorrFluxVec(cyc_, nuEff, Up, NOx, NOy, NOz, lapLimitU, lapFfcCycU);
+            }
+        }
         detail::devicePool().phase("mom:sources");
         for (int kk = 0; kk < 3; ++kk)   // (#5 OpenMP-parallel momentum was tried + benchmarked -> 136x SLOWER, reverted)
         {
@@ -2225,9 +2431,18 @@ bool simpleColourSwapControl()
                 DeviceBuffer<scalar>* NOx = sharedNO ? gLUx : ownNO ? gNOx : gUx;
                 DeviceBuffer<scalar>* NOy = sharedNO ? gLUy : ownNO ? gNOy : gUy;
                 DeviceBuffer<scalar>* NOz = sharedNO ? gLUz : ownNO ? gNOz : gUz;
-                deviceLaplacianCorr(dm, nuEff_f, NOx[kk], NOy[kk], NOz[kk], lc);
-                if (hasCyclic_) interfaceAddLapCorr(cyc_, kk, nuEff, NOx, NOy, NOz, lc);   // + cyclic-face non-orth (rotated tensor)
-                if (hasAMI_)    interfaceAddLapCorr(ami_, kk, nuEff, NOx, NOy, NOz, lc);       // + AMI-face non-orth (rotated tensor stencil)
+                if (lapLimitedU)
+                {
+                    // the capped face fluxes made before the loop, a cyclic face's one-sided as interfaceAddLapCorr's
+                    deviceFaceDivSource(dm, lapFfcU[kk], lc);
+                    if (hasCyclic_ && lapFfcCycU[kk].size()) deviceCyclicAddToOwner(cyc_, lapFfcCycU[kk], -1.0, lc);
+                }
+                else
+                {
+                    deviceLaplacianCorr(dm, nuEff_f, NOx[kk], NOy[kk], NOz[kk], lc);
+                    if (hasCyclic_) interfaceAddLapCorr(cyc_, kk, nuEff, NOx, NOy, NOz, lc);   // + cyclic-face non-orth (rotated tensor)
+                    if (hasAMI_)    interfaceAddLapCorr(ami_, kk, nuEff, NOx, NOy, NOz, lc);       // + AMI-face non-orth (rotated tensor stencil)
+                }
                 deviceAxpy(-nonOrthRelaxU, lc, relaxSrc[kk]);
             }
             // Component kk's gradients have no reader past its two corrections above unless an interface term reads
@@ -2353,11 +2568,26 @@ bool simpleColourSwapControl()
             // order (see device_amg.cuh for the measurement; announced by linear_solver_setup.cuh).
             // Robust on anisotropic snappy cells where Jacobi-BiCGStab under-solves the loose relTol;
             // interface LDUs keep BiCGStab.
+            // The stop rule is the U entry's: its maxIter and minIter (UFinal's on the final outer corrector), as the
+            // Krylov branch below and the colour rule take them. minIter is OpenFOAM's floor on the sweeps, taken even
+            // when the initial residual is already under the tolerance (smoothSolver.C:159-208).
             scalar ur;
             DeviceSolverPerf uperf;
             if (ctl_.gsU && !hasCyclic_ && !hasAMI_)
-                ur = deviceSymGaussSeidel(mv, b, Uk_[kk], nf, tol, ctl_.uRelTol(), 5000, &uperf,
-                                          /*minIter*/0, /*nSweeps*/1, ctl_.gsUSym);
+            {
+                const bool fixedCap = uFixedCapControl();
+                ur = deviceSymGaussSeidel(mv,
+                                          b,
+                                          Uk_[kk],
+                                          nf,
+                                          tol,
+                                          ctl_.uRelTol(),
+                                          fixedCap ? 5000 : ctl_.uMaxIter(),
+                                          &uperf,
+                                          fixedCap ? 0 : ctl_.uMinIter(),
+                                          /*nSweeps*/1,
+                                          ctl_.gsUSym);
+            }
             else
             {
                 // DILU when the case asked for it. It matters most exactly where Jacobi is weakest: on a
@@ -2466,8 +2696,8 @@ bool simpleColourSwapControl()
         // lagged corrVec.grad(p) correction to (psi/(1-psi))*|orthogonal snGrad| on pathological high-non-orth meshes
         // (T3A: AR 3232, 43.8deg), where the once-lagged correction outruns the over-relaxed diagonal and diverges. Only
         // the pathological faces (|corr|>|orth|) are limited; well-behaved faces keep limiter==1 (full "corrected",
-        // OF-accurate). psi=1.0 -> unlimited (bit-identical to the validated cases). The momentum-viscous correction is
-        // stable at full strength (it is the PRESSURE correction that destabilizes on T3A), so the predictor keeps psi=1.
+        // OF-accurate). psi=1.0 -> unlimited (bit-identical to the validated cases). The momentum laplacian and the closures'
+        // take the same cap (lapLimit): OpenFOAM caps every laplacian the scheme names, not only the one that destabilises.
         const scalar nonOrthLimitP = std::getenv("BRAE_NONORTH_LIMIT") ? std::atof(std::getenv("BRAE_NONORTH_LIMIT")) : ctl_.nonOrthLimit;
         // The predictor's LDU view + grad-pointer array, rebuilt over the (now member) relaxed-matrix + gradient buffers
         // for the pressure-velocity phase below (H() at deviceMatrixH, and the HbyA non-orth grad term). The predictor
@@ -2866,21 +3096,56 @@ bool simpleColourSwapControl()
         if (compressible_ && ctl_.transonic) { deviceCopy(phiHi0, phiHi); deviceCopy(phiHb0, phiHb); }
         if (ctl_.consistent)
         {
+            // pimpleFoam's SIMPLEC terms (pEqn.H: phiHbyA += interpolate(rAtU - rAU)*snGrad(p)*magSf, HbyA -= (rAU - rAtU)*grad(p))
+            // read fvc::grad of the p ENTERING this corrector. gx/gy/gz hold the momentum predictor's, which is that p on the first
+            // corrector only: from a transient step's second corrector on the previous one has solved p, and the pass-0 refresh
+            // below comes after this block. Found by the multi-GPU driver's oracle gate (brief #18, JUPITER 2834090): pitzDaily
+            // laminar, consistent yes, Euler 1 x 2 at Courant 41, the first corrector's p initial residual OpenFOAM's to 6 digits and
+            // the second's 0.045942 against 0.045465, U 6.3e-02 from OpenFOAM after one step; 7.2e-14 with the gradient refreshed
+            // (2836461). Here: tests/pimple_simplec_corrector_grad_vs_openfoam.sh. CONTROL BRAE_CONTROL_SIMPLEC_PREDICTOR_GRAD=1:
+            // the predictor's gradient, as before
+            static const bool simplecPredictorGrad = std::getenv("BRAE_CONTROL_SIMPLEC_PREDICTOR_GRAD") != nullptr;
+            if (simplecPredictorGrad && ctl_.innerCorrector > 0)
+            {
+                static bool said = false;
+                if (!said)
+                {
+                    said = true;
+                    std::fprintf(stderr, "brae: CONTROL BRAE_CONTROL_SIMPLEC_PREDICTOR_GRAD INJECTED: the later correctors' SIMPLEC "
+                                         "terms from the momentum predictor's grad(p)\n");
+                }
+            }
+            if (ctl_.innerCorrector > 0 && !simplecPredictorGrad)
+            {
+                DeviceBuffer<scalar> pbvS;
+                deviceBCValue(dbP_, dp_, pbvS);
+                deviceGaussGrad(dm, dp_, pbvS, gx, gy, gz);
+                if (hasCyclic_) interfaceAddGrad(cyc_, dp_, dm.V, gx, gy, gz);
+                if (hasAMI_)    interfaceAddGrad(ami_, dp_, dm.V, gx, gy, gz);
+            }
             // phiHbyA += interpolate(rAtU-rAU)*snGrad(p)*magSf = laplacian(interp(drAtU), p).flux()  (NOT via HbyA flux)
             DeviceBuffer<scalar> drAtUf;
             deviceInterpolate(dm, drAtUFlux_, drAtUf);   // rho*(rAtU-rAU) when compressible
             DeviceBuffer<scalar> ld, lu, ll;
-            deviceLaplacianCoeffs(dm, drAtUf, ld, lu, ll, ctl_.nonOrth || ctl_.nonOrthCoeffs);   // over-relaxed nonOrthDeltaCoeffs to match OF's corrected snGrad(p) (was orthogonal dc -> cos(theta) too small on non-orth meshes)
+            // the snGrad scheme's coefficients (simplecSnGrad): nonOrthDeltaCoeffs for a corrected, uncorrected or limited snGrad(p)
+            // (was orthogonal dc -> cos(theta) too small on non-orth meshes), deltaCoeffs for an orthogonal one
+            const SimplecSnGrad sg = simplecSnGrad(ctl_);
+            deviceLaplacianCoeffs(dm, drAtUf, ld, lu, ll, sg.nonOrthCoeffs);
             DeviceBuffer<scalar> fInt;
             deviceMatrixFluxInternal(deviceLduView(dm, ld, lu, ll), dp_, fInt);
             deviceAxpy(1.0, fInt, phiHi);
             // OF's term is interp(rAtU-rAU)*fvc::snGrad(p)*magSf, and snGrad(p) is the CORRECTED snGrad (orth + non-orth).
             // The orth part is the laplacian flux above; add the non-orth part interp(drAtU)*(corrVec.grad(p)_f)*magSf so
             // the SIMPLEC flux correction is complete on non-orthogonal meshes (no-op when orthogonal: corrVec~=0).
-            if (ctl_.nonOrth)
+            // ...capped under `limited corrected <psi>`, which it was not, and none where the snGrad scheme takes none
+            const scalar snCap = sg.cap;
+            if (sg.corrected)
             {
                 DeviceBuffer<scalar> ffcS;
-                deviceLaplacianCorrFlux(dm, drAtUf, gx, gy, gz, ffcS);
+                if (snCap < scalar(1))
+                    deviceLaplacianCorrFluxLimited(dm, drAtUf, dp_, gx, gy, gz, snCap, ffcS);
+                else
+                    deviceLaplacianCorrFlux(dm, drAtUf, gx, gy, gz, ffcS);
                 deviceAxpy(1.0, ffcS, phiHi);
             }
             DeviceBuffer<scalar> dIC, dBC;
@@ -2905,6 +3170,10 @@ bool simpleColourSwapControl()
             // is `phi -= ifCoeff*(interp(p) - p[own])`, the POST-solve pressure correction, whereas OF's
             // SIMPLEC term ADDS that same laplacian flux. Passing -drAtU turns the one into the other
             // exactly, and reuses a coefficient path that is already gated instead of adding a second one.
+            if ((hasCyclic_ || hasAMI_) && sg.nonOrthCoeffs != (ctl_.nonOrth || ctl_.nonOrthCoeffs))
+                throw std::runtime_error("brae: SIMPLEC (`consistent yes`) across a cyclic or cyclicAMI interface with snGradSchemes "
+                                         "taking other delta coefficients than laplacianSchemes: the interface's coefficient is the "
+                                         "laplacian's; refused rather than run it under the snGrad's name");
             if (hasCyclic_ || hasAMI_)
             {
                 DeviceBuffer<scalar> negDrAtU;
@@ -2920,11 +3189,17 @@ bool simpleColourSwapControl()
                     deviceCopy(keep, cyc_.ifCoeff);
                     interfaceAssembleLaplacian(cyc_, negDrAtU, scratch, false);
                     interfaceCorrectFlux(cyc_, dp_);
-                    if (ctl_.nonOrth)   // snGrad(p) is the CORRECTED snGrad; add its non-orth half too
+                    if (sg.corrected)   // a corrected snGrad(p): its non-orth half too
                     {
+                        // ...capped as an internal face's under `limited corrected <psi>`, and none at all at psi = 0
+                        // (deviceCyclicLapCorrFlux reads 0 as the whole correction)
                         DeviceBuffer<scalar> ffcS;
-                        interfaceLapCorrP(cyc_, negDrAtU, gx, gy, gz, scratch, ffcS);
-                        deviceAxpy(-1.0, ffcS, cyc_.phi);
+                        if (snCap >= scalar(1))
+                            interfaceLapCorrP(cyc_, negDrAtU, gx, gy, gz, scratch, ffcS);
+                        else if (snCap > scalar(0))
+                            deviceCyclicLapCorrFlux(cyc_, negDrAtU, dp_, gx, gy, gz, snCap, nullptr, ffcS);
+                        if (ffcS.size())
+                            deviceAxpy(-1.0, ffcS, cyc_.phi);
                     }
                     deviceCopy(cyc_.ifCoeff, keep);
                 }
@@ -2934,7 +3209,7 @@ bool simpleColourSwapControl()
                     deviceCopy(keep, ami_.ifCoeff);
                     interfaceAssembleLaplacian(ami_, negDrAtU, scratch, false);
                     interfaceCorrectFlux(ami_, dp_);
-                    if (ctl_.nonOrth)
+                    if (sg.corrected)
                     {
                         DeviceBuffer<scalar> ffcS;
                         interfaceLapCorrP(ami_, negDrAtU, gx, gy, gz, scratch, ffcS);
@@ -3055,7 +3330,16 @@ bool simpleColourSwapControl()
         for (int nonOrthPass = 0; nonOrthPass < nPass; ++nonOrthPass)
         {
             ctl_.finalInner = finalInnerCorrector && (nonOrthPass == nPass - 1);
-            if (nonOrthPass > 0)   // recompute grad(p) from the just-solved p (pass 0 uses the entry grad in gx/gy/gz)
+            // OpenFOAM assembles fvm::laplacian(rAtU, p) of every corrector with its corrected snGrad's explicit part from
+            // fvc::grad of the CURRENT p. Pass 0 took the entry gradient in gx/gy/gz, the momentum predictor's, which is the
+            // current p's only for the first corrector: from a transient step's second corrector on (nCorrectors >= 2) p has
+            // been solved since. Measured on snappyHexMesh's Ahmed body, kOmegaSST, Euler 1 x 2 from a developed start: U
+            // 3.8e-5 (cells to 1.7e-2) from OpenFOAM serial after one step (Arrhenius job 5067080); the private driver's copy
+            // measured 1.7e-2 in U on pitzDaily from rest and carries the same fix (its 0d56353). CONTROL
+            // BRAE_CONTROL_PASS0_PREDICTOR_GRAD=1: the predictor's gradient, as before
+            static const bool pass0PredictorGrad = std::getenv("BRAE_CONTROL_PASS0_PREDICTOR_GRAD") != nullptr;
+            const bool pass0Stale = nonOrthPass == 0 && ctl_.innerCorrector > 0 && ctl_.nonOrth && !pass0PredictorGrad;
+            if (nonOrthPass > 0 || pass0Stale)   // grad(p) from the current p (the first corrector's pass 0: the entry grad)
             {
                 DeviceBuffer<scalar> pbvN;
                 deviceBCValue(dbP_, dp_, pbvN);
@@ -3225,7 +3509,25 @@ bool simpleColourSwapControl()
                 DeviceBuffer<scalar> sc;
                 deviceFaceDivSource(dm, ffcP, sc);
                 deviceAxpy(1.0, sc, bp_);
-                if (hasCyclic_) interfaceLapCorrP(cyc_, rAtU, gx, gy, gz, bp_, ffcPcyc);
+                // a cyclic face's correction under `limited corrected <psi>` capped as an internal face's (limitedSnGrad.C:48-58
+                // limits every face of the surface field, the coupled patches' too) and none at all at psi = 0, where
+                // interfaceLapCorrP took it whole (and deviceCyclicLapCorrFlux reads 0 as the whole correction). The multi-GPU
+                // driver's processor faces take the same: at 2 ranks on snappyHexMesh's Ahmed body the whole correction was p
+                // 9.1e-5 from OpenFOAM's after a laminar step, 7.9e-13 under plain `corrected` (JUPITER job 2723274). An AMI face
+                // under the cap does not reach here: the momentum laplacian refuses it
+                const scalar pIfCap = lapUnlimitedControl("coupled") ? scalar(1) : nonOrthLimitP;
+                if (hasCyclic_ && pIfCap < scalar(1))
+                {
+                    if (pIfCap > scalar(0))
+                    {
+                        deviceCyclicLapCorrFlux(cyc_, rAtU, dp_, gx, gy, gz, pIfCap, nullptr, ffcPcyc);
+                        deviceCyclicAddToOwner(cyc_, ffcPcyc, -1.0, bp_);
+                    }
+                }
+                else if (hasCyclic_)
+                {
+                    interfaceLapCorrP(cyc_, rAtU, gx, gy, gz, bp_, ffcPcyc);
+                }
                 if (hasAMI_)    interfaceLapCorrP(ami_, rAtU, gx, gy, gz, bp_, ffcPami);
             }
             // No fixedValue-p patch -> singular all-Neumann pressure. cyclic/AMI use a tiny SYMMETRIC diagonal shift
@@ -3537,6 +3839,10 @@ bool simpleColourSwapControl()
         // this step drops the grad(U) memo after turbulence (below), so the model may drop it as soon as it has
         // read it
         correctTurbulence(/*releaseGradUMemo*/ true);
+        // correctNut's patch nut, as OpenFOAM writes it: this steady step had no call, so its written patches stayed one
+        // correction behind on every patch (snappyHexMesh's Ahmed body, kOmegaSST: brae's n was OpenFOAM's n - 1 to 5e-18,
+        // outlet 3.3e-2 from OpenFOAM's n; Arrhenius job 5067080), byte for byte the BRAE_CONTROL_NUT_BOUNDARY_LAG=1 control
+        refreshNutBoundary();
         // Turbulence's own held buffers are dead from here to its next correct(): the shared grad(U) memo, which
         // U's change misses at every iteration's first site, and the folded systems its colour-order sweeps
         // read (one a Krylov solve read keeps its addresses for that solve's graph). Both sat idle through the
@@ -3838,6 +4144,13 @@ bool simpleColourSwapControl()
 
         DeviceSolverPerf pr{};
         const int nPasses = std::max(nNonOrth, 0) + 1;
+        // pcorr's correction past the first pass (pass 0's pcorr is zero) under `limited corrected <psi>`: taken whole by
+        // deviceLaplacianCorrFlux and interfaceLapCorrP below, so refused, as the momentum laplacian's used to be run
+        if (nPasses > 1 && ctl_.nonOrth && lapLimit(ctl_, "pcorr") < scalar(1))
+            throw std::runtime_error("brae: correctPhi's pcorr equation under laplacianSchemes `limited corrected "
+                                     + std::to_string(ctl_.nonOrthLimit) + "` with nNonOrthogonalCorrectors "
+                                     + std::to_string(nNonOrth) + ": its non-orthogonal correction is not capped here; refused "
+                                       "rather than run the whole correction");
         for (int pass = 0; pass < nPasses; ++pass)
         {
             DeviceBuffer<scalar> pcD, pcU, pcL, pcIC, pcBC, diagC, b, divPhi, ffc;
@@ -3884,8 +4197,14 @@ bool simpleColourSwapControl()
                     : deviceLduViewAmi(dm, diagC, pcU, pcL, ami_.n, ami_.ownCell.data(), ami_.off.data(), ami_.nbrCell.data(), ami_.weight.data(), ami_.ifCoeff.data()))
                 : deviceLduView(dm, diagC, pcU, pcL);
             const scalar nf = deviceNormFactor(pv, pcorr, b, ones_);
-            const DeviceSolverPerf r = deviceJacobiPCG(pv, b, pcorr, nf, ctl_.tolPcorr, ctl_.relTolPcorr,
-                                                        ctl_.maxIterPcorr, 0);
+            const DeviceSolverPerf r = deviceJacobiPCG(pv,
+                                                       b,
+                                                       pcorr,
+                                                       nf,
+                                                       ctl_.tolPcorr,
+                                                       ctl_.relTolPcorr,
+                                                       ctl_.maxIterPcorr,
+                                                       ctl_.minIterPcorr);
             if (pass == 0) pr = r;
 
             if (pass == nPasses - 1)   // OF: phi -= pcorrEqn.flux() on the FINAL non-orthogonal pass only
@@ -4355,6 +4674,12 @@ bool simpleColourSwapControl()
                                    ctl_.turbulent ? &nutBndAll_ : nullptr,
                                    prtBnd_.size() ? &prtBnd_ : nullptr,
                                    TBnd_, tc_, alphaEffBnd);
+        // the energy's laplacian under `limited corrected <psi>`: deviceSolveEnergy carries no cap, so it is refused rather than
+        // run the whole correction; rhoSimpleFoam's mirror (BRAE_RHOSIMPLEFOAM_MIRROR=cuda) carries it on he
+        if (ctl_.nonOrth && lapLimit(ctl_, "energy") < scalar(1))
+            throw std::runtime_error("brae: the energy equation under laplacianSchemes `limited corrected "
+                                     + std::to_string(ctl_.nonOrthLimit) + "`: this driver's energy laplacian takes the whole "
+                                       "non-orthogonal correction; refused (BRAE_RHOSIMPLEFOAM_MIRROR=cuda carries the cap)");
         deviceSolveEnergy(
             dm,
             dbHe_,
@@ -4461,6 +4786,7 @@ bool simpleColourSwapControl()
         }
 
         correctTurbulence();
+        refreshNutBoundary();   // correctNut's patch nut, as OpenFOAM writes it
 
         // alphat = mut/Prt, for the NEXT iteration's energy equation. Must follow correctTurbulence(),
         // which is what makes nut valid. No-op while laminar (nut empty -> alphat stays zero), so the
@@ -4633,7 +4959,12 @@ bool simpleColourSwapControl()
             // the case asks otherwise. Correcting it every outer iteration integrates the model
             // nOuterCorrectors times per physical step -- a different equation, not a tighter solve.
             ++outerIterations_;
-            if (!ctl_.turbOnFinalIterOnly || ctl_.finalIter) { correctTurbulence(); ++turbCorrections_; }
+            if (!ctl_.turbOnFinalIterOnly || ctl_.finalIter)
+            {
+                correctTurbulence();
+                refreshNutBoundary();   // correctNut's patch nut, as OpenFOAM writes it
+                ++turbCorrections_;
+            }
             // residualControl: evaluated from the SECOND outer iteration (OF storeInitialResiduals()
             // returns corr_ == 2), where iteration 2's initial residuals become the reference the
             // relative test divides by. Never on the first iteration, and never once already final.
@@ -4784,7 +5115,7 @@ bool simpleColourSwapControl()
             vdcUMax_ = fo.vdcUMax;
             vdcC_ = fo.vdcC;
             std::vector<label> vc = fo.vdcCells;
-            if (vc.empty())   // selectionMode all
+            if (fo.vdcAll)   // selectionMode all; an EMPTY cellZone selection damps nothing (a part may hold none of it)
             {
                 vc.resize(nC_);
                 for (label c = 0; c < nC_; ++c)

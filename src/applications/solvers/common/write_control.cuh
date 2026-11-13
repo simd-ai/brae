@@ -14,6 +14,7 @@
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
 #include "brae_notice.cuh"
+#include "start_time.cuh"   // Time::timeName, the run's timeFormat and timePrecision
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -34,6 +35,7 @@ public:
         deltaT_(controlDict.scalarOr("deltaT", 1.0)),
         startTime_(controlDict.scalarOr("startTime", 0.0))
     {
+        readTimeFormatting(controlDict);
         // TimeIO.C:288-293: `writeInterval < 1 for writeControl timeStep` is fatal there (on the writeInterval
         // entry; a writeFrequency is not tested). Such a case ran here to its end with no intermediate write
         // and no word: isWriteTime answers false for an interval below 1.
@@ -116,14 +118,13 @@ public:
     void setStartTime(scalar t) { startTime_ = t; }
     scalar timeValue(int iter) const { return startTime_ + static_cast<scalar>(iter) * deltaT_; }
 
-    // Integer name for whole times (deltaT = 1, the steady case), else %g -- OF's timeName formatting.
+    // Time::timeName (Time.C:721-728) at the run's timeFormat and timePrecision (start_time.cuh). This was an integer
+    // for whole times and %g otherwise, whatever the case said: under `timeFormat fixed; timePrecision 3;` brae wrote
+    // "2" where OpenFOAM writes "2.000", and neither code could restart from the other's directory. At general and 6,
+    // the default and every fixture's setting, the two agree but for whole times from 1e6 ("1e+06").
     static std::string timeName(scalar t)
     {
-        if (t == std::floor(t) && std::fabs(static_cast<double>(t)) < 1e15)
-            return std::to_string(static_cast<long long>(std::llround(static_cast<double>(t))));
-        char b[64];
-        std::snprintf(b, sizeof b, "%g", static_cast<double>(t));
-        return std::string(b);
+        return openFoamTimeName(static_cast<double>(t));
     }
 
     // Foam::Time::operator++ write switch. Not const: the runTime branch latches the interval index.

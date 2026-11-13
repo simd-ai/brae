@@ -141,6 +141,59 @@ int main()
         }
     }
 
+    // ---- 4. an EMPTY list in a binary file: its count alone, no parentheses ----
+    // OpenFOAM writes a binary list's bytes and delimiters only when it is not empty (UListIO.C:92-102), so a patch with no face
+    // on a decomposePar part reads `value nonuniform List<scalar> \n0\n;`. brae asked for '(' and refused the file (Arrhenius
+    // 5144475). The patch must read with no value, the patches around it with theirs; CONTROL BRAE_CONTROL_BINARY_EMPTY_LIST_ASIS
+    // (the list copied through as before) must make the read throw
+    {
+        const std::vector<double> in = {1.5, -2.25, 3.125};
+        const std::vector<double> last = {7.0, 8.5};
+        const auto write = [&](const std::string& path)
+        {
+            std::ofstream o(path, std::ios::binary);
+            o << "FoamFile\n{\n    version     2.0;\n    format      binary;\n    class       volScalarField;\n    object      nut;\n}\n"
+              << "dimensions      [0 2 -1 0 0 0 0];\n\n"
+              << "internalField   nonuniform List<scalar> \n" << in.size() << "\n(";
+            o.write(reinterpret_cast<const char*>(in.data()), (std::streamsize)(in.size() * sizeof(double)));
+            o << ")\n;\n\nboundaryField\n{\n"
+              << "    inlet\n    {\n        type            calculated;\n        value           nonuniform List<scalar> \n0\n;\n    }\n"
+              << "    wall\n    {\n        type            calculated;\n        value           nonuniform List<scalar> \n" << last.size() << "\n(";
+            o.write(reinterpret_cast<const char*>(last.data()), (std::streamsize)(last.size() * sizeof(double)));
+            o << ")\n;\n    }\n}\n";
+        };
+        write(dir + "/nut");
+        try
+        {
+            const FieldData<scalar> fd = readField<scalar>(dir + "/nut");
+            const bool shape = fd.internalField.size() == in.size() && fd.boundary.size() == 2 && !fd.boundary[0].valueUniform
+                               && fd.boundary[0].values.empty() && fd.boundary[1].values.size() == last.size();
+            const bool values = shape && fd.internalField[1] == in[1] && fd.boundary[1].values[0] == last[0] && fd.boundary[1].values[1] == last[1];
+            std::printf("  binary empty list: %zu cells, %zu patches, the empty one %zu values, the next %zu\n", fd.internalField.size(),
+                        fd.boundary.size(), fd.boundary.empty() ? 0 : fd.boundary[0].values.size(),
+                        fd.boundary.size() < 2 ? 0 : fd.boundary[1].values.size());
+            if (!values) { std::printf("  FAIL the empty patch or the patch after it read wrongly\n"); ++failures; }
+        }
+        catch (const std::exception& e)
+        {
+            std::printf("  FAIL a binary empty list refused: %s\n", e.what());
+            ++failures;
+        }
+        setenv("BRAE_CONTROL_BINARY_EMPTY_LIST_ASIS", "1", 1);
+        bool threw = false;
+        try
+        {
+            readField<scalar>(dir + "/nut");
+        }
+        catch (const std::exception&)
+        {
+            threw = true;
+        }
+        unsetenv("BRAE_CONTROL_BINARY_EMPTY_LIST_ASIS");
+        std::printf("  CONTROL BRAE_CONTROL_BINARY_EMPTY_LIST_ASIS: the read %s\n", threw ? "throws (red, as it must)" : "PASSED");
+        if (!threw) { std::printf("  FAIL the control did not break the read: the leg does not see the fix\n"); ++failures; }
+    }
+
     std::printf("binary_field_read: %d failures\n", failures);
     return failures ? 1 : 0;
 }

@@ -385,6 +385,47 @@ int main()
                   refused, true);
     }
 
+    // ---- LUST NAMES ITS GRADIENT as linearUpwind does (LUST.H: LUST is a linearUpwind built from the same
+    // scheme data). The resolver looked for the word `linearUpwind` alone, so `Gauss LUST grad(U)` under
+    // `grad(U) cellLimited Gauss linear 1` kept gradULULimitK at 0 and its correction ran unlimited.
+    {
+        const std::string base = tmp + "/lust";
+        const std::string TAIL = std::string(LAP_ORTHOGONAL);
+        {
+            const DeviceSimpleControls c = parse(base + "/limited",
+                "gradSchemes { default Gauss linear; grad(U) cellLimited Gauss linear 1; }\n"
+                "divSchemes { default none; div(phi,U) Gauss LUST grad(U); }\n" + TAIL);
+            checkFlag("LUST grad(U) is LUST", c.lust, true);
+            checkNum("LUST grad(U) takes grad(U)'s cellLimited 1", c.gradULULimitK, 1.0);
+        }
+        {
+            const DeviceSimpleControls c = parse(base + "/named",
+                "gradSchemes { default Gauss linear; lim cellLimited Gauss linear 0.5; }\n"
+                "divSchemes { default none; div(phi,U) Gauss LUST lim; }\n" + TAIL);
+            checkNum("LUST lim takes the entry it NAMES (cellLimited 0.5)", c.gradULULimitK, 0.5);
+        }
+        {
+            const DeviceSimpleControls c = parse(base + "/default",
+                "gradSchemes { default cellLimited Gauss linear 1; }\n"
+                "divSchemes { default none; div(phi,U) Gauss LUST grad(U); }\n" + TAIL);
+            checkNum("LUST grad(U) with no grad(U) entry falls to gradSchemes' default (cellLimited 1)", c.gradULULimitK, 1.0);
+        }
+        // CONTROLS: the same parser leaves it unlimited where the named entry is, and resolves linearUpwind as before
+        {
+            const DeviceSimpleControls c = parse(base + "/unlimited",
+                "gradSchemes { default Gauss linear; grad(U) cellLimited Gauss linear 1; unlimitedGrad(U) Gauss linear; }\n"
+                "divSchemes { default none; div(phi,U) Gauss LUST unlimitedGrad(U); }\n" + TAIL);
+            checkNum("LUST unlimitedGrad(U) stays unlimited though grad(U) is cellLimited", c.gradULULimitK, 0.0);
+        }
+        {
+            const DeviceSimpleControls c = parse(base + "/linearUpwind",
+                "gradSchemes { default Gauss linear; grad(U) cellLimited Gauss linear 1; }\n"
+                "divSchemes { default none; div(phi,U) bounded Gauss linearUpwind grad(U); }\n" + TAIL);
+            checkFlag("linearUpwind grad(U) is not LUST", c.lust, false);
+            checkNum("linearUpwind grad(U) takes grad(U)'s cellLimited 1, as before", c.gradULULimitK, 1.0);
+        }
+    }
+
     std::printf("scheme_blocks: %d failures\n", failures);
     return failures ? 1 : 0;
 }

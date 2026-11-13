@@ -735,6 +735,10 @@ void kOmegaSSTDumpBase<BasicEddyViscosityModel>::correct()
 
         solve(omegaEqn);
         fvOptions.correct(omega_);
+        // omega as the solve left it, before bound(): where a port's first solve leaves negative cells that bound() then
+        // hides (the 260M DrivAer's first iteration, brief 2026-11-08 #10). Writes only.
+        if (this->mesh_.time().timeIndex() == braeDumpSSTIter())
+            volScalarField("stage_sstOmSolved", omega_).write();
         bound(omega_, this->omegaMin_);
     }
 

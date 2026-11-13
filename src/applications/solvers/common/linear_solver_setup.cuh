@@ -524,6 +524,7 @@ inline void readLinearSolverControls(
     ctl.tolPcorr = solverTol("pcorr", kOpenFoamDefaultTolerance);
     ctl.relTolPcorr = solverRelTol("pcorr");
     ctl.maxIterPcorr = solverMaxIter("pcorr", 1000);
+    ctl.minIterPcorr = solverMinIter("pcorr", 0);
     ctl.minIterU = solverMinIter("U", 0);
     ctl.maxIterPFinal = solverMaxIter("pFinal", ctl.maxIterP);
     ctl.maxIterUFinal = solverMaxIter("UFinal", ctl.maxIterU);
