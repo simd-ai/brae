@@ -74,6 +74,17 @@ int main(int argc, char** argv)
         check(res.body.find("leaked") == std::string::npos, "redirect: the target was never fetched");
     }
 
+    // ---- only http and https are spoken ---------------------------------------------------------------------
+    {
+        // libcurl < 7.85 takes the restriction as CURLOPT_PROTOCOLS, newer ones as CURLOPT_PROTOCOLS_STR; either
+        // way a file:// URL must not read the local disk into a request's response.
+        HttpRequest req;
+        req.url = "file:///proc/self/exe";
+        const HttpResponse res = http.send(req);
+        check(res.transportFailed(), "file://: refused as a transport failure");
+        check(res.body.empty(), "file://: nothing was read from disk");
+    }
+
     // ---- an endless body is cut off ---------------------------------------------------------------------------
     {
         HttpRequest req;
