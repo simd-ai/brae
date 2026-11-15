@@ -102,6 +102,20 @@ std::string foamBinaryToAscii(const std::vector<char>& in)
         std::size_t k = j;
         while (k < n && std::isspace((unsigned char)in[k])) ++k;
 
+        // An EMPTY binary list is its count alone: OpenFOAM writes `nl << len << nl` and the bytes with their delimiters only
+        // when len is not zero (UListIO.C:92-102, and reads it back the same way, :237-250), so a patch with no face on a part
+        // reads `value nonuniform List<scalar> \n0\n;`. Copied through, the ascii parser asked for '(' and refused a legal
+        // file (Arrhenius 5144475: foamFormatConvert's binary fields of a decomposed case, an empty patch on processor0; the
+        // official occDrivAerStaticMesh's parts are written binary). Written as the ascii empty list `0()`.
+        // TEST CONTROL BRAE_CONTROL_BINARY_EMPTY_LIST_ASIS: copied through as before
+        if (nCmpt != 0 && haveCount && count == 0 && k < n && in[k] != '(' && !std::getenv("BRAE_CONTROL_BINARY_EMPTY_LIST_ASIS"))
+        {
+            out.append(in.begin()+i, in.begin()+close+1);    // "...List<scalar>"
+            out += " 0()";
+            i = k;                                           // on from the ';'
+            continue;
+        }
+
         // Not a raw primitive payload (a word list, or no `N (` shape): copy through and continue.
         if (nCmpt == 0 || !haveCount || k >= n || in[k] != '(')
         {
@@ -308,6 +322,18 @@ std::string expandIncludes(const std::string& text, const std::string& baseDir, 
         if (text[i] == '/' && i + 1 < text.size() && text[i + 1] == '*')
         {
             const std::size_t close = text.find("*/", i + 2);
+            const std::size_t end = (close == std::string::npos) ? text.size() : close + 2;
+            out += text.substr(i, end - i);
+            i = end;
+            continue;
+        }
+        // ...nor is one inside a verbatim block: `#{ ... #}` is ONE string token to OpenFOAM's lexer (ISstream::
+        // readVerbatim), the C++ of a coded function object or boundary condition, and its `#include "clockValue.H"`
+        // is for the compiler. occDrivAerStaticMesh's FOwallClockTimeStatistics carries three, and brae went looking
+        // for system/clockValue.H.
+        if (text[i] == '#' && i + 1 < text.size() && text[i + 1] == '{')
+        {
+            const std::size_t close = text.find("#}", i + 2);
             const std::size_t end = (close == std::string::npos) ? text.size() : close + 2;
             out += text.substr(i, end - i);
             i = end;
@@ -580,6 +606,13 @@ std::string captureVerbatim(const std::string& text, std::vector<std::string>& s
 
 } // namespace
 
+// stripComments for a reader outside this file: `brae check`'s scan of the boundary file, where a comment holding
+// a "(" before the patch list was taken for the list
+std::string stripFoamComments(const std::string& s)
+{
+    return stripComments(s);
+}
+
 // #eval{...} / #calc "..." -- OF src/OpenFOAM/expressions. Run AFTER $macro expansion, because the
 // bodies reference macros. An expression that cannot be evaluated exactly THROWS from evalExpression;
 // it is never defaulted, since an #eval that quietly became 0 is a silently wrong control value.
@@ -633,9 +666,14 @@ std::string expandEvalDirectives(const std::string& text)
                         throw std::runtime_error("brae: unterminated #" + dir + " expression");
                     bodyStart = k + 1; bodyEnd = e; next = e + 1;
                 }
+                // THE BODY'S OWN #eval FIRST. OpenFOAM evaluates `kref #eval{ ... };` as it reads that entry, so a later
+                // `#eval{ $kref/$nutref }` sees numbers; here $macros expand before any #eval, and the body arrived holding
+                // the inner directives' text (occDrivAerStaticMesh's 0/omega: "unexpected character '#'"). Evaluated
+                // innermost first and written at %.17g, which reads back as the same double the entry holds in OpenFOAM.
                 char buf[64];
                 std::snprintf(buf, sizeof(buf), "%.17g",
-                              static_cast<double>(evalExpression(text.substr(bodyStart, bodyEnd - bodyStart))));
+                              static_cast<double>(evalExpression(
+                                  expandEvalDirectives(text.substr(bodyStart, bodyEnd - bodyStart)))));
                 out += buf;
                 i = next;
                 continue;

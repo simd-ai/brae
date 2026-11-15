@@ -5,6 +5,7 @@
 // The CPU baseline stays the oracle; each GPU kernel is validated against it.
 #include "cf_types.cuh"
 #include <chrono>
+#include <cstdio>
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
@@ -131,7 +132,38 @@ public:
         }
         void* p = nullptr;
         const auto t0 = std::chrono::steady_clock::now();
-        cudaCheck(cudaMalloc(&p, cls), "pool cudaMalloc");
+        if (cudaMalloc(&p, cls) != cudaSuccess)
+        {
+            // OUT OF DEVICE MEMORY. Blocks idle in the free list are the pool's, not the run's: hand them back and ask once
+            // more, as a caching allocator must before it gives up. Then say what was asked, where, and what the pool held --
+            // occDrivAerStaticMesh's 65M on one GH200 stopped at step 1 with "pool cudaMalloc: out of memory" and nothing else
+            // (Arrhenius 5115765), 6.0 GB idle in four classes after the set-up (5116453).
+            cudaGetLastError();
+            const std::size_t idleBefore = heldBytes_;
+            releaseIdle();
+            if (cudaMalloc(&p, cls) != cudaSuccess)
+            {
+                cudaGetLastError();
+                std::size_t freeB = 0, totalB = 0;
+                cudaMemGetInfo(&freeB, &totalB);
+                char use[200];
+                if (stats_)
+                    std::snprintf(use, sizeof use, "%.3f GB in use now, peak in use %.3f GB in '%s'", liveBytes_/1073741824.0,
+                                  peakLive_/1073741824.0, peakPhase_);
+                else
+                    std::snprintf(use, sizeof use, "BRAE_POOL_STATS=1 counts what is in use");
+                char msg[720];
+                std::snprintf(msg, sizeof msg,
+                              "brae device pool: out of device memory asking for %.3f GB in phase '%s': the pool holds %.3f GB "
+                              "(%s; %.3f GB idle handed back first), the device has %.3f of %.3f GB free",
+                              cls/1073741824.0, phase_, (mallocBytes_ - freedBytes_)/1073741824.0, use,
+                              idleBefore/1073741824.0, freeB/1073741824.0, totalB/1073741824.0);
+                report("at OOM");
+                throw std::runtime_error(msg);
+            }
+            std::fprintf(stderr, "brae device pool: %.3f GB idle handed back to fit a %.3f GB request in phase '%s'\n",
+                         idleBefore/1073741824.0, cls/1073741824.0, phase_);
+        }
         mallocSeconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         mallocBytes_ += cls;
         ++mallocs_;
@@ -222,6 +254,21 @@ public:
             frees_ += n;
         }
         freeSeconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+    // every idle block handed back to the driver at once (take's out-of-memory path)
+    void releaseIdle()
+    {
+        for (auto& kv : free_)
+        {
+            for (const Idle& b : kv.second)
+            {
+                cudaFree(b.p);
+            }
+            freedBytes_ += kv.second.size()*kv.first;
+            heldBytes_ -= kv.second.size()*kv.first;
+            frees_ += kv.second.size();
+            kv.second.clear();
+        }
     }
     // what the pool has asked the driver for so far: the calls, the seconds in them, and the bytes idle in the
     // free list -- for a caller that reports them per step (the interFoam device loop, BRAE_INTER_PHASE_TIME)

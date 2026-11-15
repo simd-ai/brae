@@ -76,6 +76,7 @@ endif()
 # brae_core, Phase 1 substrate (comm seam + interfaces). Grows as modules land.
 # ---------------------------------------------------------------------------
 add_library(brae_core STATIC
+    src/functionObjects/forces_device.cu
     src/parallel/pstream/cf_pstream.cu
     src/parallel/pstream/device_halo.cu
     src/parallel/pstream/device_reduce.cu
@@ -810,6 +811,23 @@ add_test(NAME simple_freestream_stored_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_freestream_stored_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/airFoil2D)
 set_tests_properties(simple_freestream_stored_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# omegaWallFunction's and epsilonWallFunction's G0 from the STORED wall nut in the legacy closures: pitzDailySST with Spalding walls
+# at tolerance 1e-9, one iteration from OpenFOAM's own iteration 50 against real OpenFOAM; the made-again nut
+# (BRAE_CONTROL_G0_NUT_RECOMPUTED=1) fails.
+add_test(NAME simple_g0_stored_nut_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_g0_stored_nut_vs_openfoam.sh)
+set_tests_properties(simple_g0_stored_nut_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+# pimpleFoam's SIMPLEC terms on the second pressure corrector from the p entering it: pitzDaily laminar, consistent yes, one
+# Euler step from OpenFOAM's developed field against real OpenFOAM pimpleFoam; the predictor's grad(p)
+# (BRAE_CONTROL_SIMPLEC_PREDICTOR_GRAD=1) fails.
+add_test(NAME pimple_simplec_corrector_grad_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/pimple_simplec_corrector_grad_vs_openfoam.sh)
+set_tests_properties(pimple_simplec_corrector_grad_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+# `Gauss LUST <grad>` takes the gradient it names, cellLimited included (scheme_parse.cuh luGradLimit): pitzDaily laminar, five
+# Euler steps from OpenFOAM's developed field against real OpenFOAM pimpleFoam; LUST's correction left unlimited fails.
+add_test(NAME lust_named_gradient_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/lust_named_gradient_vs_openfoam.sh)
+set_tests_properties(lust_named_gradient_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 # ...and OpenFOAM-13's form of freestreamVelocity (BRAE_FREESTREAM_VELOCITY_UP=average) against real OpenFOAM-13,
 # the same restart; it SKIPS where /opt/openfoam13 is absent (OF13RC names another bashrc).
 add_test(NAME simple_freestream_of13_vs_openfoam13
@@ -840,6 +858,18 @@ set_tests_properties(simple_scalar_uncorrected_vs_openfoam PROPERTIES SKIP_RETUR
 add_test(NAME simple_turbulence_stop_rule_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_turbulence_stop_rule_vs_openfoam.sh)
 set_tests_properties(simple_turbulence_stop_rule_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# U's sweep in OpenFOAM's order stops on the U entry's own maxIter and minIter (UFinal's on PIMPLE's final corrector),
+# minIter outranking maxIter as in smoothSolver.C; it took 5000 and 0 whatever the entry said. Control:
+# BRAE_CONTROL_U_FIXED_CAP=1.
+add_test(NAME simple_u_stop_rule_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_u_stop_rule_vs_openfoam.sh)
+set_tests_properties(simple_u_stop_rule_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+# laplacianSchemes `limited corrected <psi>` on the legacy driver's momentum laplacian, every closure's (kOmegaSST, kEpsilon,
+# SpalartAllmaras), the steady and the transient step, against OpenFOAM serial on snappyHexMesh's Ahmed body; `limited 0` is
+# `uncorrected` byte for byte. Controls: BRAE_CONTROL_LAP_UNLIMITED=1 and =closure, each red.
+add_test(NAME simple_ahmed_limited_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_ahmed_limited_vs_openfoam.sh)
+set_tests_properties(simple_ahmed_limited_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 5400)
 # The legacy driver's solver reading: an entry naming no `solver` is refused as OpenFOAM refuses it,
 # residualControl's turbulence targets are read at the start (no false unread notice) and still gate, and the
 # `Solving for U?` label names what runs (DILUPBiCGStab, the colour sweep). Fail-proofed against the binary
@@ -857,10 +887,14 @@ add_test(NAME sa_gradlimit_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_gradlimit_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/airFoil2D)
 set_tests_properties(sa_gradlimit_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
-# forceCoeffs sampled through a simpleFoam run on request (BRAE_FORCE_INTERVAL, BRAE_FORCE_FROM): the rows asked
-# for, the last one equal to the end-of-run evaluation; unset, no file. Fail-proofed against the binary before.
+# forceCoeffs through a simpleFoam run under the case's own controls (every step by default, writeInterval, timeStart):
+# the rows at the times asked for; no entry, no file
 add_test(NAME simple_force_sampling COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/simple_force_sampling.sh)
 set_tests_properties(simple_force_sampling PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# functionObjects::forces and ::forceCoeffs against OpenFOAM v2412's on the same fields (brief #17): every column, the headers,
+# two controls, the lifecycle's times against OpenFOAM's own run, the restart's layout, and the refusals
+add_test(NAME functionobjects_forces_vs_openfoam COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/functionobjects_forces_vs_openfoam.sh)
+set_tests_properties(functionobjects_forces_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 # V2 on Spalart-Allmaras with a `calculated` nut patch (the boxy5 UAV's inlet_front): it took kEpsilon's nut
 # path and stopped on the empty epsilon boundary. It must run, and match the shipped `freestream` arrangement.
 add_test(NAME sa_v2_calculated_nut COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/sa_v2_calculated_nut.sh)
@@ -1436,6 +1470,38 @@ add_test(NAME timeloop_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/timeloop_vs_openfoam.sh
                  ${CMAKE_CURRENT_SOURCE_DIR}/validation/simpleBoxIO)
 set_tests_properties(timeloop_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+# The start directory is timeName(startTime) at the case's timeFormat and timePrecision, and startFrom defaults to
+# latestTime, against real OpenFOAM on simpleFoam (the default `brae` path) and pimpleFoam; `brae check` must name the
+# directory the run reads. `startTime 0.;` (as ANSA writes it) is the arm that found it.
+add_test(NAME start_time_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/start_time_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pimFR)
+set_tests_properties(start_time_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+# `#include "${FOAM_CASE}/..."`, #eval of the included variables and a coded function object's verbatim `#include`s,
+# as occDrivAerStaticMesh writes them, read as OpenFOAM reads them: brae on the structured case is brae on OpenFOAM's
+# own `foamDictionary -expand` of it, byte for byte
+add_test(NAME case_include_eval_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/case_include_eval_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailySST)
+set_tests_properties(case_include_eval_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+# The turbulence model is the one simulationType names: an LES{} block under `simulationType RAS` is not read, by OpenFOAM
+# or by brae (it ran the LES model, occDrivAerRotMesh's RANS stage); `simulationType LES` takes it
+add_test(NAME turbulence_simulation_type_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/turbulence_simulation_type_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailySST)
+set_tests_properties(turbulence_simulation_type_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+
+# velocityDampingConstraint (occDrivAerStaticMesh's fvOption) against real OpenFOAM on one GPU: selectionMode all and a cellZone,
+# pitzDaily restarted from OpenFOAM's iteration 50, 5 tight iterations; a missing UMax, selectionMode points and a missing zone
+# refused by the run and by `brae check`
+add_test(NAME fvoptions_velocity_damping_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/fvoptions_velocity_damping_vs_openfoam.sh
+                 ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+set_tests_properties(fvoptions_velocity_damping_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
 
 add_test(NAME closure_gradlimit_vs_openfoam
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/closure_gradlimit_vs_openfoam.sh
@@ -2085,8 +2151,39 @@ endforeach()
 
 # The single-GPU device-resident solver app: brae -case <caseDir>
 add_executable(brae src/applications/solvers/simpleFoam/gpuSimpleFoam.cu)
-target_include_directories(brae PRIVATE ${BRAE_HEADER_DIRS})
+target_include_directories(brae PRIVATE ${BRAE_HEADER_DIRS} src/applications/solvers/pimpleFoam)
 target_link_libraries(brae PRIVATE brae_core)
+# `brae --version`: the release, the commit the build was configured at (a later commit without a reconfigure keeps the older
+# one, so the line says "configured at"), and the CUDA architectures the device code was compiled for
+execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} rev-parse --short=12 HEAD
+                OUTPUT_VARIABLE BRAE_GIT_COMMIT OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+execute_process(COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} status --porcelain --untracked-files=no
+                OUTPUT_VARIABLE BRAE_GIT_DIRTY OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+# A source tarball has no .git, and a delivered binary must still name its source: whoever packs the tree from a commit
+# writes that commit into BRAE_SOURCE_COMMIT at its root (one line, a hex hash), and --version says it was stamped there.
+# Without either, the commit is "unknown" and --version says why.
+set(BRAE_COMMIT_ORIGIN "git")
+if(NOT BRAE_GIT_COMMIT AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/BRAE_SOURCE_COMMIT)
+    file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/BRAE_SOURCE_COMMIT _brae_stamp LIMIT_COUNT 1)
+    string(STRIP "${_brae_stamp}" _brae_stamp)
+    if(_brae_stamp MATCHES "^[0-9a-f]+$")
+        string(SUBSTRING "${_brae_stamp}" 0 12 BRAE_GIT_COMMIT)
+        set(BRAE_COMMIT_ORIGIN "stamp")
+    else()
+        message(FATAL_ERROR "BRAE_SOURCE_COMMIT holds '${_brae_stamp}', not a commit hash")
+    endif()
+endif()
+if(NOT BRAE_GIT_COMMIT)
+    set(BRAE_GIT_COMMIT "unknown")
+    set(BRAE_COMMIT_ORIGIN "none")
+elseif(BRAE_GIT_DIRTY)
+    string(APPEND BRAE_GIT_COMMIT "+modified")
+endif()
+# A list of architectures ("80;90", as CI builds) would split the definition at the ';' into two broken ones
+# (`/bin/sh: Unterminated quoted string`), so --version gets them comma-separated.
+string(REPLACE ";" "," BRAE_CUDA_ARCHS_LIST "${CMAKE_CUDA_ARCHITECTURES}")
+target_compile_definitions(brae PRIVATE BRAE_VERSION_STRING="${PROJECT_VERSION}" BRAE_GIT_COMMIT="${BRAE_GIT_COMMIT}"
+                           BRAE_COMMIT_ORIGIN="${BRAE_COMMIT_ORIGIN}" BRAE_CUDA_ARCHS_STRING="${BRAE_CUDA_ARCHS_LIST}")
 
 # The single-GPU device-resident TRANSIENT solver app (PIMPLE): brae_pimpleFoam <caseDir>. Reuses DeviceSimpleSolver's
 # three composable phases via pimpleStep, with implicit fvm::ddt(U). v1 laminar.
@@ -4810,6 +4907,11 @@ add_executable(test_binary_field_read tests/test_binary_field_read.cu)
 target_include_directories(test_binary_field_read PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_binary_field_read PRIVATE brae_core)
 add_test(NAME binary_field_read COMMAND test_binary_field_read)
+# nutUSpaldingWallFunction's own tolerance and maxIter, and calcNut's keep branch (brief 2026-11-11 #18)
+add_executable(test_nut_spalding_controls tests/test_nut_spalding_controls.cu)
+target_include_directories(test_nut_spalding_controls PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_nut_spalding_controls PRIVATE brae_core)
+add_test(NAME nut_spalding_controls COMMAND test_nut_spalding_controls)
 
 add_executable(test_fixed_mean tests/test_fixed_mean.cu)
 target_include_directories(test_fixed_mean PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
@@ -5147,6 +5249,18 @@ add_test(NAME brae_subcommands
                  $<TARGET_FILE:brae>
                  ${CMAKE_CURRENT_BINARY_DIR}/brae_subcommands_work)
 set_tests_properties(brae_subcommands PROPERTIES TIMEOUT 300)
+# The command line's commands -- --version, solvers, capabilities, check, run -- on real cases, every refusal of `brae check` a
+# negative control that must exit 2 naming its setting, case directories named like the commands still running as cases, and
+# every gate a capability names held to this list of tests
+add_test(NAME brae_cli
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/brae_cli.sh
+                 $<TARGET_FILE:brae> ${CMAKE_CURRENT_BINARY_DIR}/brae_cli_work ${CMAKE_CURRENT_SOURCE_DIR}
+                 ${CMAKE_CURRENT_BINARY_DIR})
+set_tests_properties(brae_cli PROPERTIES TIMEOUT 900)
+# patchFieldTypeNames (what `brae capabilities` lists and `brae check` consults) is the boundary-condition factory's branches,
+# with its own mutation control
+add_test(NAME brae_patch_types_vs_factory
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tests/brae_patch_types_vs_factory.py ${CMAKE_CURRENT_SOURCE_DIR})
 
 # `brae benchmark <sample>` end to end against a LOCAL fixture template repo: fetch, cache, manifest, and the
 # security guard that refuses a sample carrying coded (NVRTC-compiled) boundary conditions. Solves the committed

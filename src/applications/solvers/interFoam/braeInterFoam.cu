@@ -247,6 +247,7 @@ int main(int argc, char** argv)
             unknownOption = a;
         }
     }
+    brae::setCaseEnvironment(caseDir);   // FOAM_CASE, before any dictionary is read (argList.C:891-893)
 
     try
     {
@@ -306,17 +307,14 @@ int main(int argc, char** argv)
         // beginning. resolveStartTime is the resolution the other drivers already shared; the probe is
         // alpha.water rather than U, because interFoam's own restart is a phase field and a mesh-only
         // directory written by snappyHexMesh carries neither.
-        char startBuf[64];
-        std::snprintf(startBuf, sizeof startBuf, "%g",
-                      (double)controlDict.scalarOr("startTime", scalar(0)));
         // the probe is the case's OWN phase field: `alpha.water` here sent a `startFrom latestTime` restart
         // of any other phase name (hifoam's alpha.liquidN2) silently back to startTime, where the writer
         // would then overwrite and purge the run's own output
         const std::string phase1 = cpu::twoPhase::readTransportProperties(caseDir).phase1Name;
         const std::string alphaProbe = "alpha." + phase1;
-        const std::string startName =
-            resolveStartTime(caseDir, startFrom, startBuf, alphaProbe.c_str());
-        const scalar startTime = static_cast<scalar>(std::strtod(startName.c_str(), nullptr));
+        const StartTime start = resolveStartTime(caseDir, controlDict, alphaProbe.c_str());
+        const std::string startName = start.name;
+        const scalar startTime = static_cast<scalar>(start.value);
 
         // WHICH TIME DIRECTORY THE MESH COMES FROM, which is a search and not a path: a run that refined or
         // moved its mesh wrote a newer one into a time directory, and polyMesh resolves points, faces and

@@ -16,6 +16,7 @@
 // solvers use. A case copied from simpleFoam with p in m2/s2 will run and give nonsense, so the
 // dimensions line is checked.
 
+#include "check_setup.cuh"           // `brae check --setup` stops before the first step
 #include "primitive_mesh.cuh"
 #include "acmi_area_scaling.cuh"
 #include "../common/read_surface_field.cuh"   // OF READ_IF_PRESENT for phi on restart
@@ -86,6 +87,7 @@ int main(int argc, char** argv)
             // directory -- a different case, or a "no polyMesh" abort with the user's argument in hand.
             else if (!a.empty() && a[0] != '-') caseDir = a;
         }
+        setCaseEnvironment(caseDir);   // FOAM_CASE, before any dictionary is read (argList.C:891-893)
 
         // THE OF-MIRROR PATH, opt-in. `application rhoSimpleFoam` routes to this binary, whose body
         // below is the PRE-MIRROR implementation; the mirror is the re-port under this directory that
@@ -156,14 +158,12 @@ int main(int argc, char** argv)
         // latestTime` (the standard way to CONTINUE a compressible run) silently restarted from scratch
         // and then converged to a perfectly good answer, having discarded the restart.
         mark__("patches built");
-        const std::string startName = resolveStartTime(
-            caseDir,
-            controlDict.wordOr("startFrom", "startTime"),
-            controlDict.wordOr("startTime", "0"));
+        const StartTime start = resolveStartTime(caseDir, controlDict);
+        const std::string startName = start.name;
         const std::string t0 = caseDir + "/" + startName;
         // The ABSOLUTE time this run begins at. endTime is absolute too (OF's Time::run() tests
         // value() < endTime - 0.5*deltaT), so the run length is endTime - startTime -- see the loop.
-        const scalar tStart = static_cast<scalar>(std::strtod(startName.c_str(), nullptr));
+        const scalar tStart = static_cast<scalar>(start.value);
         GeometricField<vector> U = buildField<vector>(readField<vector>(t0 + "/U"), fvp, nC);
         const FieldData<scalar> pFd = readField<scalar>(t0 + "/p");
         GeometricField<scalar> p = buildField<scalar>(pFd, fvp, nC);
@@ -745,7 +745,7 @@ int main(int argc, char** argv)
                 // too -- reported and declined rather than run with a substituted discretisation.
                 const std::string schemesField = fd.wordOr("schemesField", fld);
                 FieldDivScheme scheme;
-                try { scheme = parseFieldDivScheme(caseDir, schemesField); }
+                try { scheme = parseFieldDivScheme(caseDir, schemesField); requireUncappedLaplacian(scheme, schemesField); }
                 catch (const std::exception& e)
                 {
                     noticeIgnored("functions/" + foName, std::string(e.what()) +
@@ -839,6 +839,8 @@ int main(int argc, char** argv)
         int nIter = static_cast<int>(nSteps);
         bool converged = false;
         scalar cumulativeCont = 0;   // OF's "cumulative =" in the continuity-error line
+        // `brae check --setup`: everything above is the run's own setup; stop before its first iteration
+        if (cli::checkSetupDone("rhoSimpleFoam")) return 0;
         while (time.loop())
         {
             const int iter = time.timeIndex();

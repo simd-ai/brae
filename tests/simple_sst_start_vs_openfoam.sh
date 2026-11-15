@@ -6,9 +6,11 @@
 #
 # ARMS, one SIMPLE iteration each, every solve tight (p 1e-12, the rest 1e-13), OpenFOAM's sweep order: {outlet inletOutlet, outlet zeroGradient} x {cold from 0, restart from OpenFOAM's iteration 20}.
 # THE ORACLE: real OpenFOAM on the same bytes. On JUPITER use a build that passes scripts/jsc/of_oracle.sh of brae-multigpu: its installed v2506 returns the wrong xz from T(tmp<volTensorField>).
-# THE BOUNDS, each arm: U within 1e-12, p within 1e-10 after the iteration; Ux, Uy, Uz and p first residuals within 5e-6 relative, brae printing six digits. k, omega and nut are printed and not bound on
-# the plain arm: they carry the inlet's F1 from the adjacent cell. The arm with BRAE_SST_F1_PATCH=1 holds them too, each within 1e-12. MEASURED restarted (JUPITER job 2622756): k 1.9e-14 omega 8.2e-15
-# nut 5.4e-15, and 1.55e-06, 7.51e-06, 3.32e-05 without it. COLD, that bound is on upwind k and omega only (the coldup arm): limitedLinear from a uniform start breaks its round-off ties anyhow. MEASURED
+# THE BOUNDS, each arm: U within 1e-12, p within 1e-10 after the iteration; Ux, Uy, Uz and p first residuals within 5e-6 relative, brae printing six digits; k, omega and nut within 1e-12 on
+# the restart and coldup arms. Until brief #15 the production path carried the inlet's F1 from the adjacent cell and only the BRAE_SST_F1_PATCH arm was held there; F1 on the boundary faces is
+# now the production path. MEASURED restarted (JUPITER job 2622756): k 1.9e-14 omega 8.2e-15 nut 5.4e-15 with it, and 1.55e-06, 7.51e-06, 3.32e-05 with the cell's F1 -- the CONTROL
+# (BRAE_CONTROL_SST_F1_CELL=1, the old path) that must leave the bound on the restart arms (cold and coldup start from uniform k and
+# omega, where CDkOmega is zero at iteration 1 and the face's F1 is the cell's: a control there is blind). COLD, that bound is on upwind k and omega only (the coldup arm): limitedLinear from a uniform start breaks its round-off ties anyhow. MEASURED
 # (job 2629994), OpenFOAM against itself with every k and omega moved a coin's 1 ulp: limitedLinear k 2.1e-02 omega 3.5e-02 nut 8.7e-02, upwind 4.8e-16, 3.9e-16, 6.2e-16.
 # CONTROL, asserted red: BRAE_CONTROL_SST_START_EVALUATE=1 on the inletOutlet arms, the old value: U or a first residual must miss.
 set -u
@@ -103,6 +105,10 @@ else:
     ok = gaps['U'] <= 1e-12 and gaps['p'] <= 1e-10 and res <= 5e-6
     if want == 'all':
         ok = ok and gaps['k'] <= 1e-12 and gaps['omega'] <= 1e-12 and gaps['nut'] <= 1e-12
+    if want == 'missturb':
+        # the F1 control: k, omega and nut must leave the bound (U and p see F1 only an iteration later)
+        ok = gaps['k'] <= 1e-12 and gaps['omega'] <= 1e-12 and gaps['nut'] <= 1e-12
+        want = 'miss'
     print('%s U %.2e p %.2e k %.2e omega %.2e nut %.2e; first residuals worst %.2e (OpenFOAM Ux %.4e Uz %.4e p %.4e; brae Ux %.4e Uz %.4e p %.4e)' % ('within' if ok else 'MISSES', gaps['U'], gaps['p'], gaps['k'], gaps['omega'], gaps['nut'], res, ro['Ux'], ro['Uz'], ro['p'], rb['Ux'], rb['Uz'], rb['p']))
     sys.exit(0 if ok == (want != 'miss') else 1)
 PY
@@ -149,14 +155,23 @@ do
         of "cd '$W/$kind-$outlet-of' && simpleFoam > log 2>&1" < /dev/null || { echo "FAIL OpenFOAM $kind $outlet"; fail=1; continue; }
         ( cd "$W/$kind-$outlet-brae" && BRAE_SIMPLE_CASE_SOLVER=1 "$BRAE" -case . > log 2> err < /dev/null ) || { echo "FAIL brae $kind $outlet exited $?"; fail=1; continue; }
         printf '  %-8s %-3s ' "$kind" "$outlet"
-        python3 -B "$W/gate.py" compare "$W/$kind-$outlet-of" "$W/$kind-$outlet-brae" "$t" hold || fail=1
-        ( cd "$W/$kind-$outlet-f1" && BRAE_SIMPLE_CASE_SOLVER=1 BRAE_SST_F1_PATCH=1 "$BRAE" -case . > log 2> err < /dev/null ) || { echo "FAIL brae F1 $kind $outlet exited $?"; fail=1; continue; }
-        printf '  F1 %-8s %-3s ' "$kind" "$outlet"
+        # the production path holds k, omega and nut too since F1 is evaluated on the boundary faces (brief #15); cold from a uniform
+        # limitedLinear start only U and p (below)
         if [ "$kind" = cold ]
         then
-            python3 -B "$W/gate.py" compare "$W/$kind-$outlet-of" "$W/$kind-$outlet-f1" "$t" hold || fail=1
+            python3 -B "$W/gate.py" compare "$W/$kind-$outlet-of" "$W/$kind-$outlet-brae" "$t" hold || fail=1
         else
-            python3 -B "$W/gate.py" compare "$W/$kind-$outlet-of" "$W/$kind-$outlet-f1" "$t" all || fail=1
+            python3 -B "$W/gate.py" compare "$W/$kind-$outlet-of" "$W/$kind-$outlet-brae" "$t" all || fail=1
+        fi
+        if [ "$kind" = restart ]
+        then
+            # CONTROL: F1 on the faces the adjacent cell's again (the production path before brief #15) must leave the bound. On the
+            # restart only: from uniform k and omega (cold, coldup) CDkOmega is zero at iteration 1 and the face's F1 is the cell's,
+            # so a control there cannot go red (MEASURED, Arrhenius 5117734: coldup k 1.15e-15 either way)
+            ( cd "$W/$kind-$outlet-f1" && BRAE_SIMPLE_CASE_SOLVER=1 BRAE_CONTROL_SST_F1_CELL=1 "$BRAE" -case . > log 2> err < /dev/null ) || { echo "FAIL brae F1 control $kind $outlet exited $?"; fail=1; continue; }
+            grep -q "CONTROL sst-f1-cell INJECTED" "$W/$kind-$outlet-f1/log" || { echo "FAIL F1 control $kind $outlet: no INJECTED line"; fail=1; }
+            printf '  CONTROL F1 cell %-8s %-3s ' "$kind" "$outlet"
+            python3 -B "$W/gate.py" compare "$W/$kind-$outlet-of" "$W/$kind-$outlet-f1" "$t" missturb || fail=1
         fi
         if [ "$outlet" = io ] && [ "$kind" != coldup ]
         then

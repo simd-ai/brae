@@ -16,6 +16,8 @@
 #include "patchExprFunction1.cuh"   // OF PatchFunction1 `expression`: the spec the reader fills
 #include "foam_token_reader.cuh"
 #include "brae_notice.cuh"   // noticeApproximated: a per-patch wall-function coefficient brae applies model-wide
+#include <cmath>
+#include <stdexcept>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -319,6 +321,12 @@ struct PatchFieldData
     // parsed -- a case setting either got the default silently.
     scalar ablC1 = 0.0, ablC2 = 1.0;
     bool   atmBoundNut = true;   // atmNutkWallFunction boundNut option (clamp nut>=0); z0 is stored in ablZ0.
+    // nutUSpaldingWallFunction's Newton controls, OpenFOAM's defaults when the entry is absent
+    // (nutUSpaldingWallFunctionFvPatchScalarField.C:256-257, getOrDefault maxIter 10, tolerance 0.01). Recorded on every entry
+    // that carries them; only the Spalding patch reads them. brae used to stop every Newton at these defaults whatever the case
+    // said: the official occDrivAerStaticMesh sets `tolerance 1e-9` on every car wall
+    scalar nutTolerance = 0.01;
+    label  nutMaxIter = 10;
     // epsilonWallFunction `lowReCorrection` (epsilonWallFunctionFvPatchScalarField.C:414,
     // getOrDefault("lowReCorrection", false)). On a face with y+ < yPlusLam it switches epsilon from the
     // log form to the VISCOUS one AND drops that face's wall production entirely -- see kEpsilon_cpp.
@@ -919,6 +927,23 @@ inline FieldData<T> readField(const std::string& path)
                     {
                         p.wfBlending = ts.next();
                         ts.expect(";");
+                    }
+                    // nutUSpaldingWallFunction's `tolerance` and `maxIter` (PatchFieldData::nutTolerance). maxIter is a label in
+                    // OpenFOAM: a value that is not a whole number is refused, as readLabel refuses it
+                    else if ((key == "tolerance" || key == "maxIter") && isFoamNumber(ts.peek()))
+                    {
+                        const scalar v = ts.nextScalar();
+                        ts.expect(";");
+                        if (key == "tolerance")
+                        {
+                            p.nutTolerance = v;
+                        }
+                        else
+                        {
+                            if (v != std::floor(v) || v < 0)
+                                throw std::runtime_error("brae: patch '" + p.name + "': maxIter " + std::to_string(v) + " is not a label");
+                            p.nutMaxIter = static_cast<label>(v);
+                        }
                     }
                     // The binomial exponent. Gated on the value being a NUMBER because `n` is also a
                     // vector entry elsewhere in a boundary dictionary (fixedNormalSlip's normal, for

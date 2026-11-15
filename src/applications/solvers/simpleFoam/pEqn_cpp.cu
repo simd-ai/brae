@@ -162,7 +162,7 @@ PressureStages pressurePredictor(
         // (OpenFOAM resolves fvc::snGrad against snGradSchemes, fvcSnGrad.C:56-64) and is not changed here.
         const SurfaceScalarField snGp = fvc::snGrad(p, m, g, patches, in.correctedLaplacian,
                                                    /*leastSquares=*/false, /*cellLimitK=*/scalar(0),
-                                                   /*limitCoeff=*/scalar(0), in.nonOrthCoeffs);
+                                                   in.snGradLimitCoeff, in.nonOrthCoeffs);   // the cap, as pEqn.cu
         const std::vector<scalar>& magSf = g.magSf();
         for (std::size_t f = 0; f < st.phiHbyA.internal.size(); ++f)
             st.phiHbyA.internal[f] += dRf.internal[f] * snGp.internal[f] * magSf[f];
