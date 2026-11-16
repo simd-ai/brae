@@ -24,6 +24,13 @@ For the common function objects, `volFieldValue` and `surfaceFieldValue` are glo
 owning rank, `fieldMinMax` reports the winning rank, and `pulseStop` reads the globally reduced value so all ranks stop
 together. Only rank 0 writes `postProcessing/`; every rank writes its own `uniform/`.
 
+## Launching: `brae` and `brae_interFoam`
+
+`brae_interFoam -case . -parallel -device` (under `mpirun`) is the multi-GPU `interFoam`. The `brae` launcher also forwards a
+decomposed `interFoam` case to it. If a separate multi-GPU program named `brae-mgpu` is installed next to `brae`, the launcher
+hands every `-parallel` run to that program instead, so a `-parallel` run through `brae` uses whichever layer the install has.
+Running `brae_interFoam` directly always uses the one in this repository.
+
 ## Restrictions
 
 Refused by name under `-parallel`: `processorCyclic`, `cyclicAMI`/`cyclicACMI`, dynamic refinement, topology change and

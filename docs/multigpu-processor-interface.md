@@ -1,8 +1,8 @@
 # Multi-GPU interFoam: the processor interface (geometry, predicates, device build)
 
-Scope: what exists after the processor-geometry work (InterFoamStep WP1 and the build half of WP4). Operators and
-solvers across a processor face are NOT ported; a normal `-parallel` run with processor faces still stops by name
-("processor patches need the multi-GPU coupling, not yet implemented").
+Scope: the processor interface as it is built for `interFoam`: processor geometry, the predicates that tell a processor patch
+from the cyclic family, and its device build. The operators, solvers and drivers that use it are described in
+[multi-gpu.md](multi-gpu.md).
 
 ## Pieces
 
