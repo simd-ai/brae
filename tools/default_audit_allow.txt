@@ -509,6 +509,7 @@ DeferredList d scalars   # the vector overload: a vector list holds no scalars
 # interface, which is what DeviceCyclic's defaults are. buildDeviceCyclic sets these for a rank that has faces.
 DeviceCyclic cyc ifCoeff     # empty interface: no faces, no coefficient array (the pressure matrix attaches its own per assembly)
 DeviceCyclic cyc nIfRanks    # empty interface: no neighbour ranks
+DeviceCyclic cyc nIfCells    # empty interface: no cell owns a face
 DeviceCyclic cyc phi         # empty interface: no flux to carry
 DeviceCyclic cyc rotational  # empty interface: no transform
 DeviceCyclic cyc stencil     # empty interface: no neighbour-cell stencil
