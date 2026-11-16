@@ -40,6 +40,8 @@
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "fvc.cuh"
+#include "foam_dict.cuh"        // isCoupledInterfaceType
+#include "near_wall_dist.cuh"
 #include <cmath>
 #include <cstdio>
 #include <vector>
@@ -107,6 +109,31 @@ int main()
     if (!nWall)
     { std::printf("  FAIL vacuous: no constrained cells, so leg 2 tests nothing\n"); ++failures; }
 
+    // The boundary nut the last correctNut STORED. epsilonWallFunction's G0 reads it (`turbModel.nut(patchi)`,
+    // deviceStoredWallNut), and DkEff/DepsilonEff(patchi) are built from it. Made as the driver makes
+    // nutBndAll_ (boundaryNuEff): per boundary face in DeviceBoundary order, nutkWallFunction from the cell k
+    // on a wall face, the cell nut elsewhere. The incoming state is what correctNut left (nIn is its
+    // Cmu*k^2/epsilon), so the wall faces carry nutkWallFunction of kIn, the k it read.
+    DeviceBuffer<scalar> nutBndStored;
+    {
+        const std::vector<std::vector<scalar>> yW = nearWallDist(m, g, fvp);
+        std::vector<label> isWB;
+        std::vector<scalar> yB;
+        for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+        {
+            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            const bool wall = (fvp[pi].type == "wall");
+            for (label i = 0; i < fvp[pi].size; ++i)
+            {
+                isWB.push_back(wall ? 1 : 0);
+                yB.push_back(wall ? yW[pi][i] : 0.0);
+            }
+        }
+        const DeviceBuffer<label> dIsWB(isWB);
+        const DeviceBuffer<scalar> dYB(yB), dkIn(kIn), dnIn(nIn);
+        deviceBoundaryNut(dbU.comp[0], dIsWB, dYB, dkIn, dnIn, nu, nutBndStored, KEpsilonCoeffs{});
+    }
+
     // One correct() from the same state, with a chosen grad(U) limiter coefficient and wall weight.
     auto run = [&](scalar gradULimitK, scalar wallWeight, std::vector<scalar>& kOut, std::vector<scalar>& eOut)
     {
@@ -129,7 +156,8 @@ int main()
                               /*luK*/false, /*luEps*/false, /*nonOrth*/false, /*gsK*/false, /*gsEps*/false,
                               /*ami*/nullptr, /*cyc*/nullptr, /*nutWall*/0, /*atmZ0*/0.0, /*atmBoundNut*/true,
                               ScalarDdt{}, ScalarDdt{},
-                              nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                              /*rho*/nullptr, /*muLam*/nullptr, /*rhoBnd*/nullptr, /*nuWallFace*/nullptr,
+                              &nutBndStored, /*muBnd*/nullptr,
                               unlimited, gradULimitK);
         kOut = dk.host();
         eOut = de.host();
