@@ -366,9 +366,16 @@ inline void readUniformOrList(
         const label n = ts.nextLabel();
         // OpenFOAM writes an EMPTY list as `List<scalar> 0;` -- no parentheses (a patch with no faces on one rank of
         // a decomposed case: `value nonuniform List<scalar> 0;`)
-        if (n == 0)
+        // ...or `0()` (the ascii form, and what the binary converter writes for one). TEST CONTROL
+        // BRAE_CONTROL_BINARY_EMPTY_LIST_ASIS: the count alone is not recognised, as before the fix, and the '(' is asked for
+        if (n == 0 && !std::getenv("BRAE_CONTROL_BINARY_EMPTY_LIST_ASIS"))
         {
             vals.clear();
+            if (ts.peek() == "(")
+            {
+                ts.next();
+                ts.expect(")");
+            }
             if (ts.peek() == ";") ts.next();
             return;
         }

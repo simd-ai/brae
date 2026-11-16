@@ -615,7 +615,9 @@ std::vector<std::string> tokenizeFoamBinary(const std::vector<char>& in)
                                                          in.begin() + static_cast<std::ptrdiff_t>(j)).c_str(), nullptr, 10);
         std::size_t k = j;
         while (k < in.size() && std::isspace(static_cast<unsigned char>(in[k]))) ++k;
-        if (haveCount && count == 0 && k < in.size() && in[k] == ';')
+        // An EMPTY list is its count alone (UListIO.C:92-102). TEST CONTROL BRAE_CONTROL_BINARY_EMPTY_LIST_ASIS: not recognised, as
+        // before the fix, so the reader is asked for a '(' that is not there and refuses a legal file
+        if (haveCount && count == 0 && k < in.size() && in[k] == ';' && !std::getenv("BRAE_CONTROL_BINARY_EMPTY_LIST_ASIS"))
         {
             appendText(i, close + 1);
             i = close + 1;
