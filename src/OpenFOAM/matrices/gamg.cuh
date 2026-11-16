@@ -25,6 +25,9 @@ SolverPerformance gamg(
     int nCellsInCoarsest = 10,
     int nPreSweeps = 0,
     int nPostSweeps = 2,
-    int nFinestSweeps = 2);
+    int nFinestSweeps = 2,
+    // OpenFOAM's floor on the V-cycles, taken even when the initial residual is under the tolerance
+    // (GAMGSolverSolve.C:88-93,153-159); lduMatrix::solver's default 0
+    int minIter = 0);
 
 } // namespace brae

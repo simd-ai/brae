@@ -743,10 +743,9 @@ int runSimpleFoamV2(const std::string& caseDir)
     // simpleBoxIO staged with 0/ and 7/ and endTime 10, real OpenFOAM starts at 7 and takes 3 steps
     // while this took 10 from 0. resolveStartTime is the helper the legacy driver already uses, so the
     // two paths cannot disagree about which directory a case restarts from.
-    const std::string startTime = resolveStartTime(caseDir,
-                                                   controlDict.wordOr("startFrom", "startTime"),
-                                                   controlDict.wordOr("startTime", "0"));
-    const scalar startTimeVal = static_cast<scalar>(std::strtod(startTime.c_str(), nullptr));
+    const StartTime start = resolveStartTime(caseDir, controlDict);
+    const std::string startTime = start.name;
+    const scalar startTimeVal = static_cast<scalar>(start.value);
     cpu::SimpleFields f = cpu::createFields(caseDir + "/" + startTime, simpleDict, m, g, fvp);
 
     cpu::SimpleControlDict cd = cpu::readSimpleControl(fvSolution);
@@ -1012,6 +1011,9 @@ int runSimpleFoamV2(const std::string& caseDir)
         nonOrthLaplacian = lapS.corrected;
         snGradLimitK     = lapS.limitCoeff;
     }
+    // ...and the closures' laplacians, which took the whole correction under `limited corrected <psi>` (limitedSnGrad.C:48-58):
+    // the cap in the closures' convention, 1 for `corrected` (this path's `limited 0` is uncorrected, nonOrthLaplacian false)
+    const scalar closureLapLimit = (snGradLimitK > scalar(0) && snGradLimitK < scalar(1)) ? snGradLimitK : scalar(1);
     // The `grad(U)` ENTRY's limiter coefficient, read once here because everything that takes
     // fvc::grad(U) needs it: divDevReff's explicit dev2 term (linearViscousStress.C:114), the closures'
     // strain and production (kOmegaSSTBase.C:522, kEpsilon.C:237, SpalartAllmarasBase.C:461), the
@@ -1088,6 +1090,7 @@ int runSimpleFoamV2(const std::string& caseDir)
     bool   hasSpaldingWall = false;
     DeviceBuffer<label>  spaldingIsWall;
     DeviceBuffer<scalar> spaldingY;
+    SpaldingFaceControls spaldingControls;   // each nutUSpaldingWallFunction patch's own tolerance and maxIter, per boundary face
     std::string secondField = "epsilon";
     KOmegaSSTCoeffs sstCoeffs;
     KEpsilonCoeffs  keCoeffs;
@@ -1132,7 +1135,7 @@ int runSimpleFoamV2(const std::string& caseDir)
             dsp.kappa = keCoeffs.kappa;
             dsp.E     = keCoeffs.E;
             deviceBoundaryNutSpalding(dbU, bndIsWall, bndY, gf.Ux, gf.Uy, gf.Uz,
-                                      dNut, nu, dsp, nb, nullptr, nullptr);
+                                      dNut, nu, dsp, nb, spaldingControls, nullptr, nullptr);
         }
         else if (!saModel && v2NutWall == NutWall::Blended)
             deviceBoundaryNutBlended(dbU, bndIsWall, bndY, gf.Ux, gf.Uy, gf.Uz, dNut, nu,
@@ -1203,7 +1206,7 @@ int runSimpleFoamV2(const std::string& caseDir)
             // already holds, and every other face from `nutFile` -- or, without it, from the adjacent
             // CELL, which would discard the field assignment.
             deviceBoundaryNutSpalding(dbU, spaldingIsWall, spaldingY, gf.Ux, gf.Uy, gf.Uz,
-                                      dNut, nu, dsaW, nb, nullptr, &saNutAssigned);
+                                      dNut, nu, dsaW, nb, spaldingControls, nullptr, &saNutAssigned);
         }
 
         // kOmegaSST's `calculated` patches carry a1*k_b/max(a1*om_b, b1*F2_b*sqrt(S2_b)) -- a different
@@ -1493,6 +1496,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                 }
             }
             bndIsWall.copyFrom(isW);
+            spaldingControls = spaldingFaceControls(nutF, fvp);
 
             // SpalartAllmaras puts its wall treatment on NUT, not on the transported scalar: a wall
             // carrying nutUSpaldingWallFunction recomputes nut from Spalding's law every correctNut.
@@ -1755,7 +1759,10 @@ int runSimpleFoamV2(const std::string& caseDir)
                                              gradUSchemeLimit,
                                              // solvers/nuTilda/nSweeps -- validation/airFoil2D really
                                              // does ship `nSweeps 2` here.
-                                             nSweepsKE, gsKESym);
+                                             nSweepsKE, gsKESym,
+                                             /*gradNuTildaLULimitK*/0.0, /*gradNuTildaLapLimitK*/0.0,
+                                             /*releaseGradUMemo*/false,
+                                             closureLapLimit);   // `limited corrected <psi>` on nuTilda
             }
             else if (sstModel)
             {
@@ -1798,7 +1805,8 @@ int runSimpleFoamV2(const std::string& caseDir)
                                        /*fvoEMask*/nullptr, /*fvoEVal*/nullptr,
                                        /*lesDelta*/nullptr,
                                        // solvers/k|omega/nSweeps -- the case's own sweep count.
-                                       nSweepsKE, gsKESym);
+                                       nSweepsKE, gsKESym,
+                                       closureLapLimit);   // `limited corrected <psi>` on k and omega
 
             // OF kOmegaSSTLM::correct() runs kOmegaSST::correct() FIRST and the transition transport
             // SECOND, so k and omega always advance on the PREVIOUS iteration's gammaIntEff. Reversing
@@ -1809,7 +1817,8 @@ int runSimpleFoamV2(const std::string& caseDir)
                                          gf.phiInt, gf.phiBnd, nu, relaxEps, tolKE, relTolKE,
                                          /*keCheckEvery*/1, boundedEps, nonOrthLaplacian, gsKE,
                                          /*ami*/nullptr, /*cyc*/nullptr, /*reDdt*/{}, /*giDdt*/{},
-                                         limitedEps, linearUpwindEps, gsKESym);
+                                         limitedEps, linearUpwindEps, gsKESym,
+                                         closureLapLimit);   // `limited corrected <psi>` on ReThetat and gammaInt
             }
             else
             deviceKEpsilonCorrect(dm, wall, dbEps, dbK, dbU, gf.Ux, gf.Uy, gf.Uz,
@@ -1847,7 +1856,8 @@ int runSimpleFoamV2(const std::string& caseDir)
                                   /*fvoKMask*/nullptr, /*fvoKVal*/nullptr,
                                   /*fvoEMask*/nullptr, /*fvoEVal*/nullptr,
                                   // solvers/k|epsilon/nSweeps -- the case's own sweep count.
-                                  nSweepsKE, gsKESym);
+                                  nSweepsKE, gsKESym,
+                                  closureLapLimit);   // `limited corrected <psi>` on k and epsilon
 
             // OpenFOAM prints an Initial residual for every turbulence solve, and comparing those against
             // its log is how this path is checked against the oracle. Off unless asked for, so that the

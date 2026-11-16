@@ -84,7 +84,7 @@ fi
 
 # ---- and nothing else is ---------------------------------------------------------------------------------
 # A case directory whose name could be mistaken for a verb must still be treated as a case.
-for word in run register status list bench nodes benchmarks; do
+for word in run check solvers capabilities register status list bench nodes benchmarks; do
     mkcase "$WORK/$word" simpleFoam steadyState
     ( cd "$WORK" && "$BIN" "$word" > "$WORK/word_$word.log" 2>&1 )
     if grep -qE "brae-agent|benchmark sample|fetching sample" "$WORK/word_$word.log"; then
@@ -110,5 +110,5 @@ grep -q "brae benchmark" "$WORK/help.log" && grep -q "brae node" "$WORK/help.log
     && say_ok "help_documents_subcommands_and_caveat" \
     || say_fail "help_documents_subcommands_and_caveat" "--help omits a subcommand or the reserved-word caveat"
 
-[ "$fail" -eq 0 ] && echo "PASS: two reserved words, and only two"
+[ "$fail" -eq 0 ] && echo "PASS: the reserved words route, and a case directory of any name stays a case"
 exit "$fail"

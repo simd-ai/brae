@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -96,7 +97,8 @@ struct FvOptionsData
     // velocityDampingConstraint (fvConstraint): implicit diagonal sink diag += C*V^(2/3)*(|U|-UMax) where |U|>UMax.
     bool                vdcActive = false;
     scalar              vdcUMax = 0, vdcC = 1;
-    std::vector<label>  vdcCells;                   // empty => all cells
+    bool                vdcAll = false;             // selectionMode all
+    std::vector<label>  vdcCells;                   // selectionMode cellZone: the zones' cells (may be empty on a part)
     // actuationDiskSource (Froude): wind-turbine/propeller momentum source over a disk cellZone, the thrust computed
     // each iter from the upstream-monitored velocity. T = 2*rho*A*(Uref.diskDir)^2*a*(1-a), a = 1 - Cp/Ct.
     // actuationDiskSource: a LIST. A wind farm is several turbines (simpleFoam/turbineSiting ships two),
@@ -436,15 +438,69 @@ inline FvOptionsData readFvOptions(
         }
         if (isVdc)   // velocityDampingConstraint (implicit diag sink)
         {
-            fo.vdcUMax = co.scalarOr("UMax", opt.scalarOr("UMax", 0.0));
-            if (fo.vdcUMax <= 0) continue;
-            fo.vdcC = co.scalarOr("C", opt.scalarOr("C", 1.0));
-            const std::string selMode = co.wordOr("selectionMode", opt.wordOr("selectionMode", "all"));
-            if (selMode == "cellZone")
+            // OpenFOAM's velocityDampingConstraint::read and cellSetOption (velocityDampingConstraint.C, cellSetOption.C:362):
+            // UMax is read with no default (readEntry) and so is selectionMode (Enum::get); `cellZones (...)` or `cellZone`
+            // name the cells, every zone they match taken (a zone that matches none stops OpenFOAM); C defaults to 1; the
+            // field is U unless UNames/U says otherwise. This took a missing or non-positive UMax as "no option" and dropped
+            // it, and a missing selectionMode, an unknown one or a cellZone not in the mesh as the whole mesh.
+            if (!co.found("UMax") && !opt.found("UMax"))
             {
-                const auto it = zones.find(co.wordOr("cellZone", opt.wordOr("cellZone", "")));
-                if (it != zones.end()) fo.vdcCells = it->second;
-            }   // else (all): empty vdcCells -> whole domain
+                fo.unsupported.push_back("source '" + s.first + "' (velocityDampingConstraint) has no UMax; OpenFOAM reads it "
+                                         "with no default and stops");
+                continue;
+            }
+            fo.vdcUMax = co.scalarOr("UMax", opt.scalarOr("UMax", 0.0));
+            fo.vdcC = co.scalarOr("C", opt.scalarOr("C", 1.0));
+            const std::string field = co.wordOr("U", opt.wordOr("U", "U"));
+            const std::vector<std::string> names = co.wordListOr("UNames", opt.wordListOr("UNames", {field}));
+            if (names.size() != 1 || names.front() != "U")
+            {
+                fo.unsupported.push_back("source '" + s.first + "' (velocityDampingConstraint) damps fields other than U");
+                continue;
+            }
+            const std::string selMode = co.wordOr("selectionMode", opt.wordOr("selectionMode", ""));
+            if (selMode == "all")
+            {
+                fo.vdcAll = true;
+            }
+            else if (selMode == "cellZone" || selMode == "cellSet")
+            {
+                // cellZone: `cellZones (...)` or `cellZone` (cellSetOption.C, setSelection); cellSet: its set, which the shared
+                // resolver above has put into `zones` under its own name
+                std::vector<std::string> wanted = selMode == "cellSet"
+                    ? std::vector<std::string>{co.wordOr("cellSet", opt.wordOr("cellSet", ""))}
+                    : co.wordListOr("cellZones", opt.wordListOr("cellZones", {}));
+                if (wanted.empty())
+                {
+                    wanted.push_back(co.wordOr("cellZone", opt.wordOr("cellZone", "")));
+                }
+                std::set<label> picked;
+                std::string missing;
+                for (const std::string& zn : wanted)
+                {
+                    const auto it = zones.find(zn);
+                    if (zn.empty() || it == zones.end())
+                    {
+                        missing += (missing.empty() ? "" : ", ") + (zn.empty() ? std::string("(none named)") : zn);
+                        continue;
+                    }
+                    picked.insert(it->second.begin(), it->second.end());
+                }
+                if (!missing.empty())
+                {
+                    fo.unsupported.push_back("source '" + s.first + "' (velocityDampingConstraint): no " + selMode + " " + missing
+                                             + " in the mesh (OpenFOAM: \"No matching cellZones\", and it stops)");
+                    continue;
+                }
+                fo.vdcCells.assign(picked.begin(), picked.end());
+            }
+            else
+            {
+                fo.unsupported.push_back("source '" + s.first + "' (velocityDampingConstraint) selects its cells by `selectionMode "
+                                         + (selMode.empty() ? std::string("(none: OpenFOAM requires one)") : selMode)
+                                         + "`; brae implements all, cellZone and cellSet");
+                continue;
+            }
             fo.vdcActive = true;
             ++fo.count;
             continue;

@@ -77,7 +77,12 @@ HttpResponse CurlHttp::send(const HttpRequest& req)
     ::curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
     ::curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
     ::curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 0L);  // a redirect must never carry the token elsewhere
+#if LIBCURL_VERSION_NUM >= 0x075500
     ::curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+#else
+    // libcurl < 7.85 (Ubuntu 22.04 ships 7.81) has only the bitmask form, deprecated from 7.85 on.
+    ::curl_easy_setopt(curl, CURLOPT_PROTOCOLS, static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
 
     if (req.method == "POST")
     {

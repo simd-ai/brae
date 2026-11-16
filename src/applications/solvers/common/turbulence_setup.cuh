@@ -16,6 +16,7 @@
 #include "spalart_coeffs.cuh"
 #include "turbulent_inlet.cuh"
 #include "frozen_bc_guard.cuh"
+#include <algorithm>
 #include <cstdio>
 #include <string>
 #include <utility>
@@ -349,6 +350,34 @@ inline const FoamDict* readKEpsilonCoeffsDict(const FoamDict* ras, KEpsilonCoeff
     return kec;
 }
 
+// The RAS and LES models readTurbulenceModel takes (and the LES deltas): the reader refuses any other name against these lists,
+// and `brae capabilities` prints them. Which solver takes which simulationType is each driver's own (simpleFoam: RAS or laminar;
+// pimpleFoam: RAS, LES or laminar; rhoSimpleFoam's mirror: kEpsilon or kOmegaSST; interFoam: its own reader).
+inline const std::vector<std::string>& rasModelNames()
+{
+    static const std::vector<std::string> n = {"kEpsilon", "RNGkEpsilon", "realizableKE", "kOmegaSST", "kOmegaSSTLM",
+                                               "SpalartAllmaras"};
+    return n;
+}
+
+inline const std::vector<std::string>& lesModelNames()
+{
+    static const std::vector<std::string> n = {"Smagorinsky", "WALE", "SpalartAllmarasDES", "SpalartAllmarasDDES",
+                                               "SpalartAllmarasIDDES", "kOmegaSSTDES", "kOmegaSSTDDES", "kOmegaSSTIDDES"};
+    return n;
+}
+
+inline const std::vector<std::string>& lesDeltaNames()
+{
+    static const std::vector<std::string> n = {"cubeRootVol", "maxDeltaxyz"};
+    return n;
+}
+
+inline bool listHas(const std::vector<std::string>& list, const std::string& w)
+{
+    return std::find(list.begin(), list.end(), w) != list.end();
+}
+
 inline void readTurbulenceModel(
     const FoamDict&        turbProps,
     DeviceSimpleControls&  ctl,
@@ -359,16 +388,27 @@ inline void readTurbulenceModel(
         {
             // simulationType LES: DES/LES models live under an LES{} sub-dict (OF convention). SA-DDES reuses the SA
             // transport (ctl.sa) plus the DES length-scale limiter (ctl.des); only cubeRootVol delta is supported (v1).
-            if (const FoamDict* les = turbProps.subDict("LES"))
+            //
+            // THE SUB-DICTIONARY IS THE ONE simulationType NAMES: turbulenceModel::New selects RASModel or LESModel by it
+            // and never reads the other. This took LES{} whenever the file held one, so occDrivAerRotMesh's RANS stage --
+            // `simulationType RAS` with both blocks, as many cases keep them -- ran its kOmegaSSTDDES where OpenFOAM runs
+            // kOmegaSST. `simulationType LES` with no LES{} stops OpenFOAM, and is refused here.
+            const bool lesType = turbProps.wordOr("simulationType", "laminar") == "LES";
+            const FoamDict* les = lesType ? turbProps.subDict("LES") : nullptr;
+            if (lesType && !les)
+            {
+                throw std::runtime_error("brae: constant/turbulenceProperties says `simulationType LES` and holds no LES "
+                                         "dictionary; OpenFOAM's LESModel::New reads its model from it and stops");
+            }
+            if (les)
             {
                 const std::string model = turbulenceModelWord(les, "LESModel");
                 const bool saIddes  = (model == "SpalartAllmarasIDDES");
                 const bool sstIddes = (model == "kOmegaSSTIDDES");
                 const bool saDes  = (model == "SpalartAllmarasDDES" || model == "SpalartAllmarasDES" || saIddes);
-                const bool sstDes = (model == "kOmegaSSTDDES" || model == "kOmegaSSTDES" || sstIddes);
                 const bool smag   = (model == "Smagorinsky");
                 const bool wale   = (model == "WALE");
-                if (!saDes && !sstDes && !smag && !wale)
+                if (!listHas(lesModelNames(), model))
                     throw std::runtime_error("brae: unsupported LESModel '" + model
                         + "' (Smagorinsky, WALE, SpalartAllmarasDDES/DES/IDDES or kOmegaSSTDDES/DES/IDDES)");
                 ctl.modelName = model;
@@ -566,7 +606,7 @@ inline void readTurbulenceModel(
             ctl.sa  = (model == "SpalartAllmaras");
             const bool rke = (model == "realizableKE");
             const bool rng = (model == "RNGkEpsilon");
-            if (model != "kEpsilon" && !rke && !rng && !ctl.sst && !ctl.sa)
+            if (!listHas(rasModelNames(), model))
                 throw std::runtime_error("brae: unsupported RASModel '" + model + "' (kEpsilon, RNGkEpsilon, realizableKE, kOmegaSST, kOmegaSSTLM or SpalartAllmaras)");
             ctl.modelName = model;
             if (ctl.sa)

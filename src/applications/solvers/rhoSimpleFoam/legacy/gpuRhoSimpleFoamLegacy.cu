@@ -92,6 +92,7 @@ int main(int argc, char** argv)
             const std::string a = argv[i];
             if (a == "-case" && i + 1 < argc) caseDir = argv[++i];
         }
+        setCaseEnvironment(caseDir);   // FOAM_CASE, before any dictionary is read (argList.C:891-893)
 
         const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
         mark__("controlDict read");
@@ -127,14 +128,12 @@ int main(int argc, char** argv)
         // latestTime` (the standard way to CONTINUE a compressible run) silently restarted from scratch
         // and then converged to a perfectly good answer, having discarded the restart.
         mark__("patches built");
-        const std::string startName = resolveStartTime(
-            caseDir,
-            controlDict.wordOr("startFrom", "startTime"),
-            controlDict.wordOr("startTime", "0"));
+        const StartTime start = resolveStartTime(caseDir, controlDict);
+        const std::string startName = start.name;
         const std::string t0 = caseDir + "/" + startName;
         // The ABSOLUTE time this run begins at. endTime is absolute too (OF's Time::run() tests
         // value() < endTime - 0.5*deltaT), so the run length is endTime - startTime -- see the loop.
-        const scalar tStart = static_cast<scalar>(std::strtod(startName.c_str(), nullptr));
+        const scalar tStart = static_cast<scalar>(start.value);
         GeometricField<vector> U = buildField<vector>(readField<vector>(t0 + "/U"), fvp, nC);
         GeometricField<scalar> p = buildField<scalar>(readField<scalar>(t0 + "/p"), fvp, nC);
         GeometricField<scalar> T = buildField<scalar>(readField<scalar>(t0 + "/T"), fvp, nC);

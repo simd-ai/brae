@@ -173,21 +173,23 @@ inline std::string braeSolverList()
                 std::string("cases using ") + s.application);
 }
 
-// Route the case to its solver. Returns only when the running binary IS the chosen solver; otherwise it has
-// already exec'd the right one, or thrown because brae does not have it.
-inline void dispatchSolver(const std::string& caseDir, int argc, char** argv)
+// Which solver a case runs, and why, from its controlDict `application` and ddtSchemes.default; throws when brae has no such
+// solver or the two contradict each other. Shared by the run (dispatchSolver) and `brae check`, so both decide alike.
+struct SolverDecision
 {
-    const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
-    // OF: Time::readDict -> IOstream::defaultPrecision(writePrecision) -> Sout, which is what Info
-    // writes through (TimeIO.C:375-383). Set here because every driver reaches the case through this
-    // function, so the one entry cannot be honoured by one arm and dropped by another.
-    setIOPrecision(controlDict.intOr("writePrecision", 6));
+    const BraeSolver* row = nullptr;
+    std::string why;
+};
+
+inline SolverDecision decideSolver(const std::string& caseDir, const FoamDict& controlDict)
+{
+    SolverDecision out;
     const std::string application = controlDict.wordOr("application", "");
     const std::string ddt = readDdtSchemeWord(caseDir + "/system/fvSchemes");
     const bool transientCase = !ddt.empty() && ddt != "steadyState";
 
     const BraeSolver* chosen = nullptr;
-    std::string why;
+    std::string& why = out.why;
     if (!application.empty())
     {
         for (const BraeSolver& e : braeSolvers())
@@ -235,8 +237,22 @@ inline void dispatchSolver(const std::string& caseDir, int argc, char** argv)
         why = "no controlDict application, ddtSchemes.default = " + (ddt.empty() ? std::string("(none)") : ddt);
     }
 
-    if (selfExecutableName() == chosen->exe) return;   // already the right binary: solve in this process
-    execSolver(*chosen, argc, argv, why);              // does not return
+    out.row = chosen;
+    return out;
+}
+
+// Route the case to its solver. Returns only when the running binary IS the chosen solver; otherwise it has
+// already exec'd the right one, or thrown because brae does not have it.
+inline void dispatchSolver(const std::string& caseDir, int argc, char** argv)
+{
+    const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
+    // OF: Time::readDict -> IOstream::defaultPrecision(writePrecision) -> Sout, which is what Info
+    // writes through (TimeIO.C:375-383). Set here because every driver reaches the case through this
+    // function, so the one entry cannot be honoured by one arm and dropped by another.
+    setIOPrecision(controlDict.intOr("writePrecision", 6));
+    const SolverDecision decision = decideSolver(caseDir, controlDict);
+    if (selfExecutableName() == decision.row->exe) return;   // already the right binary: solve in this process
+    execSolver(*decision.row, argc, argv, decision.why);       // does not return
 }
 
 }  // namespace brae

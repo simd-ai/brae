@@ -15,6 +15,7 @@
 #include "stage_dump.cuh"
 #include <cuda_runtime.h>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 
 namespace brae {
@@ -596,6 +597,36 @@ void deviceGatherWallNu(
     cudaCheck(cudaGetLastError(), "gatherWallNu");
 }
 
+const DeviceBuffer<scalar>* deviceStoredWallNut(
+    const DeviceWallData& wall,
+    const DeviceBuffer<scalar>* nutBnd,
+    DeviceBuffer<scalar>& out,
+    const char* closure)
+{
+    if (wall.nWF == 0) return nullptr;
+    static const bool recomputed = std::getenv("BRAE_CONTROL_G0_NUT_RECOMPUTED") != nullptr;
+    if (recomputed)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            std::fprintf(stderr, "brae: CONTROL BRAE_CONTROL_G0_NUT_RECOMPUTED INJECTED: the wall functions' G0 makes the wall nut "
+                                 "again from the current U and k\n");
+        }
+        return nullptr;
+    }
+    if (!nutBnd || static_cast<label>(nutBnd->size()) != wall.nBndFaces || static_cast<int>(wall.wfBnd.size()) != wall.nWF)
+        throw std::runtime_error(std::string("brae: ") + closure + ": the wall functions' G0 reads the stored wall nut (the nut "
+                                 "patch values the last correctNut left), and the closure was handed "
+                                 + (nutBnd ? std::to_string(nutBnd->size()) + " boundary nut values for "
+                                             + std::to_string(wall.nBndFaces) + " boundary faces"
+                                           : std::string("none"))
+                                 + "; refused rather than make the wall nut again");
+    deviceGatherWallNu(wall.wfBnd, *nutBnd, out);
+    return &out;
+}
+
 // out[i] = cell[faceCell[i]] -- plain adjacent-cell extrapolation for a boundary face.
 __global__
 void gatherCellToFaceK(
@@ -687,16 +718,31 @@ void sstNutBoundaryK(
     nutBnd[bi] = a1*kb / fmax(a1*ob, b1*F2*sqrt(fmax(S2, scalar(0))));
 }
 
-// EXPERIMENT (BRAE_SST_F1_PATCH=1, off by default): F1 on a boundary face, as OpenFOAM's F1() evaluates it there: its expression from the patch values of k and omega, y's patch value
-// (zeroGradient off a wall, so the cell's), and CDkOmega from the corrected boundary gradients of k and omega (gaussGrad::correctBoundaryConditions).
+// F1 on a boundary face as kOmegaSSTBase::F1 evaluates its expression on a patch (kOmegaSSTBase.C:72-93): k's and omega's patch
+// values, y's (the cell's off a wall, wallDist's y being zeroGradient there; 0 on a wall, where min(..., 10) gives tanh(10^4) = 1)
+// and CDkOmega's from the patch values of fvc::grad(k) and fvc::grad(omega): the cell's gradient with its normal part replaced by
+// the patch's snGrad (gaussGrad::correctBoundaryConditions), the snGrad of the valueFraction in force (an inletOutlet's inflow
+// face (ref - cell)*dc, its outflow 0; a fixed value (value - cell)*dc; zeroGradient 0). A coupled face (type 8) keeps its cell's.
+//
+// THE DEFAULT SINCE BRIEF #15. It was an experiment (BRAE_SST_F1_PATCH, off), and the production path took the adjacent cell's F1
+// on every boundary face, so the laplacians' boundary diffusivities of k and omega were another blend: restarted on a 3-D duct
+// (simple_sst_start_vs_openfoam) k 1.55e-06, omega 7.51e-06 and nut 3.32e-05 from OpenFOAM, on pitzDailySST with
+// occDrivAerStaticMesh's numerics after 5 tight iterations k 2.6e-04 and omega 11 (of 1,900) at worst, each at round-off on the
+// face (Arrhenius 5116453: k 9.8e-12, omega 2.8e-07 of 29,000). The arithmetic is brae-mgpu's f1FaceKernel, text for text, which
+// the distributed driver has run since brief #10. BRAE_CONTROL_SST_F1_CELL=1, a gate's CONTROL, restores the cell's value.
 __global__
-void f1PatchK(
+void f1FaceK(
     int nB,
+    const label* __restrict__ fc,
     const label* __restrict__ typeK,
     const label* __restrict__ typeO,
-    const label* __restrict__ fc,
+    const label* __restrict__ ioK,
+    const label* __restrict__ ioO,
+    const scalar* __restrict__ refK,
+    const scalar* __restrict__ refO,
     const scalar* __restrict__ kb,
     const scalar* __restrict__ ob,
+    const label* __restrict__ wallFace,
     const scalar* __restrict__ yCell,
     const scalar* __restrict__ kc,
     const scalar* __restrict__ oc,
@@ -710,27 +756,19 @@ void f1PatchK(
     const scalar* __restrict__ ny,
     const scalar* __restrict__ nz,
     const scalar* __restrict__ dc,
-    const scalar* __restrict__ F1c,
     scalar nu,
     scalar betaStar,
     scalar alphaOmega2,
     scalar* __restrict__ F1b)
 {
     const int bi = blockIdx.x * blockDim.x + threadIdx.x;
-    if (bi >= nB) return;
-    const int c = fc[bi];
-    const scalar y = yCell[c];
-    const scalar kk = kb[bi];
-    const scalar w = ob[bi];
-    if (!(w > scalar(0)) || !(y > scalar(0)) || kk < scalar(0))
+    if (bi >= nB || typeK[bi] == 8)
     {
-        F1b[bi] = F1c[c];
         return;
     }
-    // a zeroGradient patch's snGrad is zero whatever it stores, and it can store something other than the cell: the floor after
-    // Foam::bound, the last evaluate beside a wall function's write (zeroGradientFvPatchField.H, snGrad)
-    const scalar snK = typeK[bi] == 0 ? scalar(0) : (kk - kc[c]) * dc[bi];
-    const scalar snO = typeO[bi] == 0 ? scalar(0) : (w - oc[c]) * dc[bi];
+    const int c = fc[bi];
+    const scalar snK = typeK[bi] == 0 ? scalar(0) : (((ioK && ioK[bi]) ? refK[bi] : kb[bi]) - kc[c]) * dc[bi];
+    const scalar snO = typeO[bi] == 0 ? scalar(0) : (((ioO && ioO[bi]) ? refO[bi] : ob[bi]) - oc[c]) * dc[bi];
     const scalar nK = nx[bi]*gkx[c] + ny[bi]*gky[c] + nz[bi]*gkz[c];
     const scalar nO = nx[bi]*gox[c] + ny[bi]*goy[c] + nz[bi]*goz[c];
     const scalar kbx = gkx[c] + nx[bi]*(snK - nK);
@@ -739,11 +777,16 @@ void f1PatchK(
     const scalar obx = gox[c] + nx[bi]*(snO - nO);
     const scalar oby = goy[c] + ny[bi]*(snO - nO);
     const scalar obz = goz[c] + nz[bi]*(snO - nO);
-    const scalar CD = (2.0*alphaOmega2)*(kbx*obx + kby*oby + kbz*obz)/w;
+    const scalar kk = kb[bi];
+    const scalar w = ob[bi];
+    const scalar yy = wallFace[bi] ? scalar(0) : yCell[c];
+    const scalar twoA2 = 2.0 * alphaOmega2;
+    const scalar dot = kbx*obx + kby*oby + kbz*obz;
+    const scalar CD = twoA2 * dot / w;
     const scalar CDplus = fmax(CD, (scalar)1.0e-10);
-    const scalar a  = (1.0 / betaStar) * sqrt(kk) / (w * y);
-    const scalar b  = 500.0 * nu / (y * y * w);
-    const scalar cc = (4.0 * alphaOmega2) * kk / (CDplus * y * y);
+    const scalar a  = (1.0 / betaStar) * sqrt(kk) / (w * yy);
+    const scalar b  = 500.0 * nu / (yy * yy * w);
+    const scalar cc = (4.0 * alphaOmega2) * kk / (CDplus * yy * yy);
     const scalar arg1 = fmin(fmin(fmax(a, b), cc), (scalar)10.0);
     const scalar a2 = arg1 * arg1;
     F1b[bi] = tanh(a2 * a2);
@@ -767,16 +810,30 @@ void deviceF1OnPatch(
     const DeviceBuffer<scalar>& F1,
     scalar nu,
     const KOmegaSSTCoeffs& co,
+    const DeviceBuffer<label>& wallFace,
     DeviceBuffer<scalar>& F1b)
 {
-    static const bool on = std::getenv("BRAE_SST_F1_PATCH") != nullptr;
+    static const bool cellF1 = std::getenv("BRAE_CONTROL_SST_F1_CELL") != nullptr;
+    static bool said = false;
+    if (cellF1 && !said)
+    {
+        std::printf("brae: CONTROL sst-f1-cell INJECTED: F1 on the boundary faces is the adjacent cell's\n");
+        said = true;
+    }
     const int nB = static_cast<int>(F1b.size());
-    if (!on || nB == 0) return;
-    f1PatchK<<<nBlocks(nB), TPB>>>(nB, dbK.bcType.data(), dbOmega.bcType.data(), dbOmega.faceCell.data(), kBnd.data(), omegaBnd.data(), yCell.data(), k.data(), omega.data(),
-                                   gkx.data(), gky.data(), gkz.data(), gox.data(), goy.data(), goz.data(),
-                                   dbU.nx.data(), dbU.ny.data(), dbU.nz.data(), dbU.comp[0].deltaCoeffs.data(), F1.data(),
-                                   nu, co.betaStar, co.alphaOmega2, F1b.data());
-    cudaCheck(cudaGetLastError(), "F1 on the patch");
+    if (cellF1 || nB == 0) return;
+    if (wallFace.size() != F1b.size())
+    {
+        throw std::runtime_error("brae: kOmegaSST's F1 on the boundary faces has " + std::to_string(wallFace.size())
+                                 + " wall-face flags for " + std::to_string(nB) + " faces");
+    }
+    f1FaceK<<<nBlocks(nB), TPB>>>(nB, dbOmega.faceCell.data(), dbK.bcType.data(), dbOmega.bcType.data(),
+                                  dbK.ioMask.size() ? dbK.ioMask.data() : nullptr, dbOmega.ioMask.size() ? dbOmega.ioMask.data() : nullptr,
+                                  dbK.refValue.data(), dbOmega.refValue.data(), kBnd.data(), omegaBnd.data(), wallFace.data(),
+                                  yCell.data(), k.data(), omega.data(), gkx.data(), gky.data(), gkz.data(), gox.data(), goy.data(),
+                                  goz.data(), dbU.nx.data(), dbU.ny.data(), dbU.nz.data(), dbOmega.deltaCoeffs.data(), nu,
+                                  co.betaStar, co.alphaOmega2, F1b.data());
+    cudaCheck(cudaGetLastError(), "F1 on the boundary faces");
 }
 
 void deviceSSTNutBoundary(
@@ -1046,7 +1103,8 @@ void deviceKOmegaSSTCorrect(
     const DeviceBuffer<scalar>* fvoEVal,     // compressible: mu at boundary faces (the +mu of rho*D+mu)
     const DeviceBuffer<scalar>* lesDelta,    // case `delta` (maxDeltaxyz); null = OF's cubeRootVol
     int nSweeps,                             // solvers/<field>/nSweeps; see the declaration
-    bool gsSymmetric)
+    bool gsSymmetric,
+    scalar lapLimit)                         // see the declaration
 {
     requireTurbGradLimits(gradLim, "deviceKOmegaSSTCorrect");
     const int nC = dm.nCells;
@@ -1110,7 +1168,9 @@ void deviceKOmegaSSTCorrect(
     // omega wall function FIRST (OF updateCoeffs before CDkOmega): omega0/G0, override omega & G at wall cells, so
     // grad(omega)/CDkOmega/F1/F2 and the reaction all see the wall-corrected omega (matches kOmegaSSTBase::correct).
     DeviceBuffer<scalar> omega0, G0;
-    deviceWallOmegaG0(wall, k, Ux, Uy, Uz, nu, omega0, G0, co, nutWall, atmZ0, atmBoundNut, nuWallFace);
+    DeviceBuffer<scalar> nutwStored;
+    deviceWallOmegaG0(wall, k, Ux, Uy, Uz, nu, omega0, G0, co, nutWall, atmZ0, atmBoundNut, nuWallFace,
+                      deviceStoredWallNut(wall, nutBnd, nutwStored, "kOmegaSST"));
     overrideKernel<<<nBlocks(nC), TPB>>>(nC, wall.isWallCell.data(), G0.data(), omega0.data(), G.data(), omega.data(),
                                           wall.wallW.size() ? wall.wallW.data() : nullptr);
 
@@ -1201,7 +1261,9 @@ void deviceKOmegaSSTCorrect(
         F1b.resize(nB);
         gatherCellToFaceK<<<nBlocks(nB), TPB>>>(nB, dbOmega.faceCell.data(), F1.data(), F1b.data());
         cudaCheck(cudaGetLastError(), "F1b");
-        if (!rho && !gammaIntEff) deviceF1OnPatch(dbK, dbOmega, dbU, kbv, obv, y, k, omega, kgx, kgy, kgz, ogx, ogy, ogz, F1, nu, co, F1b);
+        // incompressible kOmegaSST (DES, DDES and IDDES with it); the compressible closure and kOmegaSSTLM keep the cell's F1 there
+        if (!rho && !gammaIntEff) deviceF1OnPatch(dbK, dbOmega, dbU, kbv, obv, y, k, omega, kgx, kgy, kgz, ogx, ogy, ogz, F1, nu, co,
+                                                  wall.isWallFace, F1b);
         if (stageDumpActive() && stageDumpFirstOnly("sstF1b"))
         {
             stageDump("stage_sstF1", F1);
@@ -1238,7 +1300,7 @@ void deviceKOmegaSSTCorrect(
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/co.omegaMin, oEqnGradLimit, luStored ? &obv : nullptr);
+                               /*boundFloor*/co.omegaMin, oEqnGradLimit, luStored ? &obv : nullptr, lapLimit);
 
     // deviceSolveScalarTransport just bound omega, as it binds every transported field here: a second bound would find
     // nothing below the floor and forget bound.C:59's patch half (deviceBoundCap).
@@ -1256,7 +1318,7 @@ void deviceKOmegaSSTCorrect(
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/co.kMin, kEqnGradLimit);
+                               /*boundFloor*/co.kMin, kEqnGradLimit, /*storedBnd*/nullptr, lapLimit);
 
     // correctNut (Bradshaw): nut = a1*k / max(a1*omega, b1*F2*sqrt(S2)).
     //
@@ -1609,7 +1671,8 @@ void deviceKOmegaSSTLMCorrect(
     // reference's end-to-end error, so it is threaded through rather than assumed.
     bool limitedLinear,
     bool linearUpwind,
-    bool gsSymmetric)
+    bool gsSymmetric,
+    scalar lapLimit)
 {
     const int nC = dm.nCells;
     // ReThetat and gammaInt solve under the pair's tolerance and relTol that the caller hands in, not their own
@@ -1635,7 +1698,7 @@ void deviceKOmegaSSTLMCorrect(
                                /*bound*/true, /*fvoMask*/nullptr, /*fvoVal*/nullptr,
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, /*nSweeps*/1, gsSymmetric,
-                               /*boundFloor*/scalar(0.0));
+                               /*boundFloor*/scalar(0.0), /*fieldGradLimitK*/0.0, /*storedBnd*/nullptr, lapLimit);
 
     // gammaInt: DgammaIntEff = nut+nu; reaction = Pgamma+Egamma - Sp(ce1*Pgamma+ce2*Egamma).
     DeviceBuffer<scalar> spG(nC), suG(nC);
@@ -1651,7 +1714,7 @@ void deviceKOmegaSSTLMCorrect(
                                /*bound*/true, /*fvoMask*/nullptr, /*fvoVal*/nullptr,
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, /*nSweeps*/1, gsSymmetric,
-                               /*boundFloor*/scalar(0.0));
+                               /*boundFloor*/scalar(0.0), /*fieldGradLimitK*/0.0, /*storedBnd*/nullptr, lapLimit);
     gammaIntEff.resize(nC);
     lmGammaEffKernel<<<nBlocks(nC), TPB>>>(nC, gradU.data(), Ux.data(), Uy.data(), Uz.data(), k.data(), omega.data(),
         y.data(), ReThetat.data(), gammaInt.data(), Fth.data(), nu, LM_SMALL, gammaIntEff.data());

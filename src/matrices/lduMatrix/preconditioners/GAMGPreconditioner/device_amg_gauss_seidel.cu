@@ -76,8 +76,8 @@ static const GridColoring& gsColoringFor(const DeviceLduView& A)
 // capture. WHILE nodes require CUDA >= 12.4; on older toolkits this path compiles out and the host loop below is used.
 #ifdef BRAE_HAS_GS_DEVICE
 // The host loop's stop test, run on the device: `sweeps += nSweeps` (smoothSolver.C:205 counts sweeps,
-// not evaluations), then `(finalRes < tol || finalRes < relTol*initRes) && sweeps >= minIter`, or the
-// cap. One thread; the handle is the WHILE node's condition.
+// not evaluations), then stop on `(converged || sweeps >= maxIter) && sweeps >= minIter`. One thread; the
+// handle is the WHILE node's condition.
 __global__
 void gsSetCondK(
     cudaGraphConditionalHandle h,
@@ -93,8 +93,9 @@ void gsSetCondK(
     if (threadIdx.x || blockIdx.x) return;
     const int it = (*iter += sweepsPer);
     const scalar r = *res;
-    const bool converged = ((r < tol) || (r < relTol * (*init))) && (it >= minIter);
-    const bool stop = converged || (it >= maxIter);
+    // smoothSolver.C:202-208: on while (n < maxIter && !converged) || n < minIter -- minIter outranks maxIter
+    const bool converged = (r < tol) || (r < relTol * (*init));
+    const bool stop = (converged || (it >= maxIter)) && (it >= minIter);
     cudaGraphSetConditional(h, stop ? 0u : 1u);
 }
 // The decomposed graph's START: the host loop's entry test `initRes < tol && minIter <= 0`, on the device. Seeds the
@@ -516,8 +517,9 @@ void gsFusedCondK(
         const int it = (iter[k] += sweepsPer);
         const scalar r = res[k];
         fin[k] = r;
-        const bool converged = ((r < tol) || (r < relTol * init[k])) && (it >= minIter);
-        const bool stop = converged || (it >= maxIter);
+        // smoothSolver.C:202-208: on while (n < maxIter && !converged) || n < minIter -- minIter outranks maxIter
+        const bool converged = (r < tol) || (r < relTol * init[k]);
+        const bool stop = (converged || (it >= maxIter)) && (it >= minIter);
         if (stop) active[k] = 0;
         else      any = 1u;
     }
@@ -1111,8 +1113,8 @@ void hostSymGaussSeidelFused(
             const int it = (iter[k] += sweepsPer);
             const scalar r = c.hRes[k];
             fin[k] = r;
-            const bool converged = ((r < tol) || (r < relTol * init[k])) && (it >= minIter);
-            const bool stop = converged || (it >= maxIter);
+            const bool converged = (r < tol) || (r < relTol * init[k]);
+            const bool stop = (converged || (it >= maxIter)) && (it >= minIter);
             if (stop)
             {
                 active[k] = 0;
@@ -1443,9 +1445,11 @@ scalar deviceSymGaussSeidel(
     // OpenFOAM counts SWEEPS, not residual evaluations -- `solverPerf.nIterations() += nSweeps_`
     // (smoothSolver.C:205) -- so every count it reports is a multiple of nSweeps, and maxIter bounds
     // that same accumulator rather than the number of evaluations.
+    // smoothSolver.C's do-while: one block of sweeps before the first test, then on while
+    // (n < maxIter && !converged) || n < minIter -- minIter outranks maxIter.
     int sweeps = 0;
     scalar finalRes = initRes;
-    while (sweeps < maxIter)
+    for (;;)
     {
         // OpenFOAM's own sweep, level-scheduled: forward then reverse in strict cell-index order.
         // This used to be two multicolour half-sweeps, which is a DIFFERENT smoother wearing the same
@@ -1463,7 +1467,8 @@ scalar deviceSymGaussSeidel(
             deviceResidual(A, psi, b, r);
         }
         finalRes = deviceSumMag(r) / normFactor;
-        if ((finalRes < tol || finalRes < relTol*initRes) && sweeps >= minIter) break;
+        const bool converged = finalRes < tol || finalRes < relTol*initRes;
+        if ((converged || sweeps >= maxIter) && sweeps >= minIter) break;
     }
     if (std::getenv("BRAE_GS_DEBUG")) std::printf("    GS init=%.4e final=%.4e sweeps=%d (relTol=%.2g nSweeps=%d)\n", initRes, finalRes, sweeps, relTol, sweepsPer);
     if (perf) *perf = {initRes, finalRes, sweeps};   // default path: full OF-style init/final/nIter

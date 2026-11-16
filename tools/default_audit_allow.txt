@@ -132,6 +132,7 @@ DeviceSimpleControls ctl outerResidualControl    # PIMPLE's residualControl over
 # by-reference out-parameters. The wildcard says the SITE is not a controls object; see the tool.
 DeviceSimpleControls lctl *   # out-parameter buffer for readLinearSolverControls; the site copies the solver tolerances out
 DeviceSimpleControls sctl *   # out-parameter buffer for parseFvSchemesControls; the site copies the scheme flags out
+DeviceSimpleControls checkCtl *   # `brae check` (brae_cli.cuh): a buffer the readers fill so check sees what they refuse; nothing is assembled or solved with it
 # The three smaller rho drivers (gpuRhoSimpleFoam, legacy, slice) leave the AMG hierarchy cache path and
 # its write switch at their defaults, which is a RECORDED open finding, not a new one: "nothing in the
 # compressible lineage threads amgCacheDir ... every compressible run re-agglomerates from scratch"

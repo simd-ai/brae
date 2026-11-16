@@ -270,7 +270,9 @@ void correct(
                 const scalar magGradU = magUp * patches[pi].deltaCoeffs[i];
                 const scalar yw = (patches[pi].deltaCoeffs[i] > 0.0) ? 1.0 / patches[pi].deltaCoeffs[i] : 0.0;
                 vals[i] = spaldingNutValue(magUp, magGradU, yw, nu, nc.kappa, nc.E,
-                                           i < static_cast<label>(seed.size()) ? seed[i] : 0.0);
+                                           i < static_cast<label>(seed.size()) ? seed[i] : 0.0,
+                                           nutField.boundary[pi]->nutUTolerance(),
+                                           static_cast<int>(nutField.boundary[pi]->nutUMaxIter()));
             }
         }
         nutField.boundary[pi]->setValue(vals);

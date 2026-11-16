@@ -17,12 +17,13 @@ namespace brae {
 
 struct DeviceWallData;   // device_kepsilon.cuh (shared wall geometry: wfCell/wfY/wfDc/wfUw*/invNw/nWF)
 
-// EXPERIMENT (BRAE_SST_F1_PATCH=1, off by default): overwrites F1b, the adjacent cells' F1 at the boundary faces, with F1 evaluated on each face. A no-op when the switch is unset.
+// Overwrites F1b, the adjacent cells' F1 at the boundary faces, with F1 evaluated on each face as OpenFOAM does (wallFace: y is 0
+// there). BRAE_CONTROL_SST_F1_CELL=1, a gate's CONTROL, leaves the cells' values.
 void deviceF1OnPatch(const DeviceBoundary& dbK,
     const DeviceBoundary& dbOmega, const DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& kBnd, const DeviceBuffer<scalar>& omegaBnd, const DeviceBuffer<scalar>& yCell,
                      const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega, const DeviceBuffer<scalar>& gkx, const DeviceBuffer<scalar>& gky, const DeviceBuffer<scalar>& gkz,
                      const DeviceBuffer<scalar>& gox, const DeviceBuffer<scalar>& goy, const DeviceBuffer<scalar>& goz, const DeviceBuffer<scalar>& F1, scalar nu, const KOmegaSSTCoeffs& co,
-                     DeviceBuffer<scalar>& F1b);
+                     const DeviceBuffer<label>& wallFace, DeviceBuffer<scalar>& F1b);
 
 // S2 = 2*magSqr(symm(gradU)). gradU is the 9*nC tensor [q*nC+c], q=0..8 (same layout as deviceGbyNu).
 void deviceS2(const DeviceBuffer<scalar>& gradU, int nC, DeviceBuffer<scalar>& S2);

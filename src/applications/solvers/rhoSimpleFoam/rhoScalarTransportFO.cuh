@@ -145,6 +145,7 @@ inline bool parseTracerSpec(const std::string& foName, const FoamDict& fd, const
     try
     {
         out.scheme = parseFieldDivScheme(caseDir, out.schemesField);
+        requireUncappedLaplacian(out.scheme, out.schemesField);
         out.sc     = readTracerSolverControls(fvSolution, out.schemesField);
     }
     catch (const std::exception& e)
