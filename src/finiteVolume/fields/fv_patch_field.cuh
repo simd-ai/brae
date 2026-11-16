@@ -3845,7 +3845,7 @@ inline const std::vector<std::string>& patchFieldTypeNames()
         "movingWallVelocity", "noSlip", "nutkRoughWallFunction", "nutkWallFunction", "nutLowReWallFunction",
         "nutUBlendedWallFunction", "nutUSpaldingWallFunction", "nutUWallFunction", "omegaWallFunction", "outletInlet",
         "outletPhaseMeanVelocity", "permeableAlphaPressureInletOutletVelocity", "porousBafflePressure",
-        "pressureInletOutletVelocity", "prghPermeableAlphaTotalPressure", "rotatingWallVelocity", "slip",
+        "pressureInletOutletVelocity", "prghPermeableAlphaTotalPressure", "processor", "rotatingWallVelocity", "slip",
         "surfaceNormalFixedValue", "symmetry", "symmetryPlane", "timeVaryingMappedFixedValue", "totalPressure",
         "turbulentIntensityKineticEnergyInlet", "turbulentMixingLengthDissipationRateInlet",
         "turbulentMixingLengthFrequencyInlet", "uniformFixedValue", "uniformNormalFixedValue", "uniformTotalPressure",
