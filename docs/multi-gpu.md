@@ -1,20 +1,55 @@
 # Multi-GPU `interFoam`
 
 One case across up to 8 GPUs of one node, one process per GPU, with OpenFOAM's own `-parallel` semantics: the mesh is
-split by OpenFOAM's `decomposePar` (`processorN/` directories), processor patches are coupled interfaces, each rank
-builds its own preconditioner, and reductions are global. Results can be checked against OpenFOAM `-parallel` on the
+split into `processorN/` directories (by `brae decompose`, or by OpenFOAM's `decomposePar`; the layout is the same),
+processor patches are coupled interfaces, each rank builds its own preconditioner, and reductions are global. Results can be checked against OpenFOAM `-parallel` on the
 same decomposition. Single-GPU runs are unchanged (byte for byte, checked by the test suite).
 
 ## Quick start
 
 ```bash
 cd my-case
-sed -i 's/^numberOfSubdomains .*/numberOfSubdomains 4;/' system/decomposeParDict
-decomposePar -force                     # OpenFOAM v2606; scotch, simple and hierarchical are accepted
-
 mpirun --bind-to none -np 4 brae_interFoam -case . -parallel -device
-reconstructPar -latestTime              # the global time directory from processor0..N
 ```
+
+That is all: with no `processor<N>/` directories, brae decomposes the case into as many parts as there are processes
+(`system/decomposeParDict` supplies the method, scotch without one), every rank runs its own part, and rank 0 puts the
+case back together at the end (`-noReconstruct` keeps the results in the processor directories only). The processor
+directories stay, so the next run reuses them, and a case that already has them is left alone.
+
+Doing the two steps yourself:
+
+```bash
+brae decompose -case . -n 4             # as decomposePar: processor0..3/ with the mesh, addressing and the start time's fields
+mpirun --bind-to none -np 4 brae_interFoam -case . -parallel -device
+brae reconstruct -case .                # as reconstructPar: the global time directories from processor0..3
+```
+
+OpenFOAM's `decomposePar` (v2606) and `reconstructPar` work on the same directories, in either direction.
+
+## Decomposing the case
+
+`brae decompose` writes what OpenFOAM's `decomposePar` writes for the cases `-parallel` runs, without OpenFOAM:
+`processor<N>/constant/polyMesh` (points, faces, owner, neighbour, boundary, `cellZones`, and the four `*ProcAddressing`
+files) and the volume and surface fields of the start time (`-time` and `-allTimes` choose others). The tests compare it with
+`decomposePar` file by file: same processor meshes and addressing, same field values, processor patch values included.
+
+| `method` | what it does |
+|---|---|
+| `scotch` | the cell graph cut by SCOTCH (the default): a balanced cut, but not the partition OpenFOAM's `scotch` makes (measured: 15,596 + 15,596 cells against OpenFOAM's 15,473 + 15,719 on a 31k-cell case) |
+| `simple` | OpenFOAM's `simple`: each direction cut into `n` equal parts by the sorted cell centres (`n`, `delta` in `simpleCoeffs`); the same cell assignment as OpenFOAM's |
+| `hierarchical` | the cells cut along `order`'s first direction, each part along the next, and so on; brae's own cut, which can differ from OpenFOAM's by cells at a cut |
+| `manual` | the cell-to-processor list of `manualCoeffs/dataFile` |
+
+Not decomposed: cyclic, cyclicAMI/ACMI and processor patches in the mesh, face and point zones that have members (empty ones are carried over), point fields,
+dynamic-refinement files (`cellLevel`, `pointLevel`, ...), and Lagrangian data. A field is cut as a whole: its internal
+field, and each patch's lists whose length is the patch's face count; every other entry is carried over unchanged. A
+processor patch gets the value from the other side of the face, and a reversed face of an `oriented` surface field its
+negative, as `decomposePar` does.
+
+`brae reconstruct` is the other direction: internal fields by cell addressing, patch lists by face addressing, the
+faces between processors from the owner side. Both write ASCII at full precision (`decomposePar` and `reconstructPar`
+read and write both formats; so does brae).
 
 `-parallel` reads the dictionaries from the case and the mesh, fields and output from each rank's `processor<rank>/`.
 `startFrom latestTime` resolves against `processor0`, and every rank reads its own `processor<rank>/<latestTime>`
@@ -44,7 +79,8 @@ Command line (`brae_interFoam`; the `brae` launcher forwards them):
 
 | option | effect |
 |---|---|
-| `-parallel` | read the case as decomposed by `decomposePar` |
+| `-parallel` | read the case as decomposed into `processorN/` (decomposed first when it has none) |
+| `-noReconstruct` | with `-parallel`: do not put the case back together at the end, when brae decomposed it |
 | `-rank N -nprocs M` | the rank and the process count, when not taken from the launcher. Otherwise read from `OMPI_COMM_WORLD_RANK/SIZE`, `PMI_RANK/SIZE` or `SLURM_PROCID/NTASKS`; the explicit flags win |
 
 Environment:

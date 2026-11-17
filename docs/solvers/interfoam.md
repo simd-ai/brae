@@ -28,7 +28,7 @@ cd yourTwoPhaseCase && brae
 | **I/O** | standard OpenFOAM case in, standard time directories out, ASCII or binary |
 | **Function objects** | `volFieldValue`, `surfaceFieldValue`, `probes`, `fieldMinMax`, `exprField` and `runTimeControl` (see below); their `adjustableRunTime` write times also trim the time step, as in OpenFOAM |
 | **Not yet** | the other function objects (`surfaces`, `forces`, `fieldAverage`, ... are noticed and not run) |
-| **Multi-GPU** | `-parallel -device` runs a `decomposePar` case across up to 8 GPUs, one process per GPU, and agrees with OpenFOAM `-parallel`; laminar flow only, no AMI or moving meshes under `-parallel`: [Multi-GPU](../multi-gpu.md) |
+| **Multi-GPU** | `-parallel -device` runs a case across up to 8 GPUs (decomposed by `brae decompose` or `decomposePar`, or decomposed by the run itself), one process per GPU, and agrees with OpenFOAM `-parallel`; laminar flow only, no AMI or moving meshes under `-parallel`: [Multi-GPU](../multi-gpu.md) |
 
 A setting this solver does not carry stops the run at start-up and names itself; it is never replaced by a
 default.
