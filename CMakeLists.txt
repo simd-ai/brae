@@ -942,6 +942,10 @@ add_test(NAME manifest_interfoam_not_drifted
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/of_manifest.py interFoam
                  --check ${CMAKE_CURRENT_SOURCE_DIR}/manifest/interFoam.yaml)
 set_tests_properties(manifest_interfoam_not_drifted PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME manifest_rhocentralfoam_not_drifted
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/of_manifest.py rhoCentralFoam
+                 --check ${CMAKE_CURRENT_SOURCE_DIR}/manifest/rhoCentralFoam.yaml)
+set_tests_properties(manifest_rhocentralfoam_not_drifted PROPERTIES SKIP_RETURN_CODE 77)
 # Defaults left over from porting, in the interFoam mirror: a controls struct built by hand at several
 # sites with a field set at some and not at others runs the default where the case said otherwise --
 # the device's start-up CorrectPhi ran grad(pcorr) as Gauss linear that way, and its closure would have
@@ -2203,6 +2207,8 @@ add_dependencies(brae brae_rhoSimpleFoam)
 # ...and brae_interFoam, added to this list at the same time as its registry row, because the comment
 # above says every registered solver belongs here and the last one to be added was not.
 add_dependencies(brae brae_interFoam)
+# ...and brae_rhoCentralFoam, with its registry row.
+add_dependencies(brae brae_rhoCentralFoam)
 
 # End-to-end kOmegaSSTLM (Langtry-Menter transition) vs a SAVED OpenFOAM v2412 oracle (no OF needed at test time):
 # runs brae on a transition flat plate and checks U L2 < 3% and the gammaInt transition is captured.
@@ -2263,6 +2269,25 @@ target_link_libraries(brae_interFoam PRIVATE brae_core)
 add_executable(brae_rhoSimpleFoam src/applications/solvers/rhoSimpleFoam/gpuRhoSimpleFoam.cu)
 target_include_directories(brae_rhoSimpleFoam PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(brae_rhoSimpleFoam PRIVATE brae_core)
+
+# brae_rhoCentralFoam: density-based compressible (central-upwind, Kurganov/Tadmor), first stage: inviscid,
+# laminar, perfectGas+hConst, fixed deltaT, static mesh. The host reference (rhoCentralFoam_cpp.cu) and the CUDA
+# arm (rhoCentralFoam_device.cu) share the case and the loop; tests/rho_central_sod_vs_openfoam.sh holds both to
+# OpenFOAM v2412 on the shockTube tutorial.
+add_executable(brae_rhoCentralFoam
+               src/applications/solvers/rhoCentralFoam/gpuRhoCentralFoam.cu
+               src/applications/solvers/rhoCentralFoam/rhoCentralFoam_cpp.cu
+               src/applications/solvers/rhoCentralFoam/rhoCentralFoam_device.cu)
+target_include_directories(brae_rhoCentralFoam PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(brae_rhoCentralFoam PRIVATE brae_core)
+add_test(NAME rho_central_sod_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_sod_vs_openfoam.sh)
+set_tests_properties(rho_central_sod_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_test(NAME rho_central_refusals
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_refusals.sh)
+set_tests_properties(rho_central_refusals PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 
 # brae_rhoSimpleFoam_slice: the vertical-slice port (src/applications/solvers/rhoSimpleFoam/slice).
 #
