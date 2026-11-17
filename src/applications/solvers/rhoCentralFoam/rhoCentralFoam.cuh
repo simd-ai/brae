@@ -48,8 +48,9 @@ struct Integrals
 };
 Integrals integrals(const Case& cs, const State& s);
 
-// Writes U, p, T, rho to <caseDir>/<timeName>, as OpenFOAM's AUTO_WRITE fields, at the case's writePrecision.
-void writeTime(const Case& cs, const State& s, const std::string& timeName);
+// Writes <caseDir>/<clock's time name>: uniform/time first (Time::writeTimeDict; left out under the control
+// noUniformTime), then U, p, T, rho as OpenFOAM's AUTO_WRITE fields, at the case's writePrecision.
+void writeTime(const Case& cs, const State& s, const RunClock& clock, bool uniformTime = true);
 
 // The whole run. onDevice selects the arm; control is a gate's negative control (rhoCentralState.cuh says which arm).
 int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control);

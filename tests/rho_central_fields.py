@@ -11,6 +11,10 @@
       `patchdiff <field> <abs> <rel> <face>`
   rho_central_fields.py patchvalue <dir> <patch> <field> <face>
       one face's written patch value (a vector's components)
+  rho_central_fields.py timedict <case A> <case B>
+      <time>/uniform/time of every time directory B holds (but its start): how many of A's carry the same text in
+      value, name, index, deltaT and deltaT0, how many A lacks, and the worst relative difference of deltaT and deltaT0:
+      `timedict <n> missing <m> value <k> <worst> name <k> index <k> deltaT <k> <worst> deltaT0 <k> <worst>`
   rho_central_fields.py shock <case dir> <time> <kind>
       the shock read off the cell-centre pressure (kind: wedge, cone, oblique, step); see shock()
   rho_central_fields.py theory <kind>
@@ -276,6 +280,36 @@ def shock(case, time, kind):
     return res
 
 
+def _timedict(path):
+    s = open(path).read()
+    s = s[s.index("}", s.index("FoamFile")) + 1:]
+    return dict(re.findall(r"^(\w+)\s+([^;]+);", s, re.M))
+
+
+def timedict(a, b):
+    st = None
+    m = re.search(r"^startTime\s+([^;\s]+);", open(f"{b}/system/controlDict").read(), re.M)
+    if m:
+        st = m.group(1)
+    ts = sorted([t for t in os.listdir(b) if re.fullmatch(r"[0-9.e+-]+", t) and t not in ("0", st)
+                 and os.path.exists(f"{b}/{t}/uniform/time")], key=float)
+    keys = ("value", "name", "index", "deltaT", "deltaT0")
+    same = {k: 0 for k in keys}
+    worst = {"value": 0.0, "deltaT": 0.0, "deltaT0": 0.0}
+    missing = 0
+    for t in ts:
+        if not os.path.exists(f"{a}/{t}/uniform/time"):
+            missing += 1
+            continue
+        x, y = _timedict(f"{a}/{t}/uniform/time"), _timedict(f"{b}/{t}/uniform/time")
+        for k in keys:
+            same[k] += int(x.get(k) == y.get(k))
+        for k in worst:
+            if k in x and k in y:
+                worst[k] = max(worst[k], abs(float(x[k]) - float(y[k])) / abs(float(y[k])))
+    return len(ts), missing, same, worst
+
+
 def stats(case, time, earlier=None):
     r, p, T = (internal(f"{case}/{time}/{f}") for f in ("rho", "p", "T"))
     nan = int(np.isnan(r).sum() + np.isnan(p).sum() + np.isnan(T).sum())
@@ -305,6 +339,10 @@ if __name__ == "__main__":
         print(f"maxrel {w[2]:.3e} {w[0]}")
     elif a[0] == "shock":
         print("shock", " ".join(f"{k} {v:.6g}" if isinstance(v, float) else f"{k} {v}" for k, v in shock(a[1], a[2], a[3]).items()))
+    elif a[0] == "timedict":
+        n, miss, same, worst = timedict(a[1], a[2])
+        print(f"timedict {n} missing {miss} value {same['value']} {worst['value']:.3e} name {same['name']} index {same['index']} "
+              f"deltaT {same['deltaT']} {worst['deltaT']:.3e} deltaT0 {same['deltaT0']} {worst['deltaT0']:.3e}")
     elif a[0] == "theory":
         print("theory", " ".join(f"{k} {v:.6g}" for k, v in theory(a[1]).items()))
     elif a[0] == "stats":

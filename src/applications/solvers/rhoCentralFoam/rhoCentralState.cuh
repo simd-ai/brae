@@ -57,6 +57,10 @@ enum StatusBits : int
 //   laggedPhi        inletOutlet switched on the step before's phi, not on this step's (rhoCentralFoam.C:195)
 //   inletOutletNewT  T's inletOutlet evaluated on the cells' new T, as if Tw.evaluate() ran after thermo.correct()
 //   noPurge          purgeWrite ignored: every written time directory kept (what stage 1 did in silence)
+//   restartIndexZero     a restart drops uniform/time's `index`: timeStep writes leave OpenFOAM's global grid
+//   restartGridFromZero  a restart measures the runTime/adjustable write grid from 0, not from its start time
+//   restartIoExtrapolate a restart takes an inletOutlet patch's value from its cells, not from the file's `value`
+//   noUniformTime        the writer leaves uniform/time out, so a restart from brae's output loses the time state
 enum Control : int
 {
     controlNone = 0,
@@ -69,7 +73,11 @@ enum Control : int
     controlInletOutletInverted = 7,
     controlLaggedPhi = 8,
     controlInletOutletNewT = 9,
-    controlNoPurge = 10
+    controlNoPurge = 10,
+    controlRestartIndexZero = 11,
+    controlRestartGridFromZero = 12,
+    controlRestartIoExtrapolate = 13,
+    controlNoUniformTime = 14
 };
 
 } // namespace rhoCentral

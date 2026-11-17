@@ -7,6 +7,7 @@
 #include "brae_time.cuh"
 #include "purge_write.cuh"
 #include "run_clock.cuh"
+#include "time_dict_writer.cuh"
 #include "time_controls.cuh"
 #include "foam_dict.cuh"
 #include "foam_field_writer.cuh"
@@ -74,11 +75,16 @@ Integrals integrals(const Case& cs, const State& s)
 }
 
 
-void writeTime(const Case& cs, const State& s, const std::string& timeName)
+void writeTime(const Case& cs, const State& s, const RunClock& clock, bool uniformTime)
 {
+    const std::string& timeName = clock.timeName();
     const std::string src = cs.caseDir + "/" + cs.startName + "/";
     const std::string out = cs.caseDir + "/" + timeName;
     std::filesystem::create_directories(out);
+    // Time::writeObject: writeTimeDict() first, then the registered objects (TimeIO.C:548-555)
+    if (uniformTime)
+        writeUniformTime(cs.caseDir, timeName, static_cast<double>(clock.value()), clock.timeIndex(),
+                         static_cast<double>(clock.deltaT()), static_cast<double>(clock.deltaT0()), cs.writePrecision);
     const int prec = cs.writePrecision;
     // every patch value, in patch order (writeVolField's flat layout; no coupled patch is accepted here)
     writeVolField(src + "U", out + "/U", s.U, cs.patches, prec, s.UB);
@@ -112,13 +118,19 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
     std::printf("\nfluxScheme: %s\ninviscid: every mu is 0\nsolution directions: (%d %d %d)\n",
                 cs.tadmor ? "Tadmor" : "Kurganov", cs.sd.d[0], cs.sd.d[1], cs.sd.d[2]);
 
+    // a restart's time state (Time::setControls): the start's index, and its deltaT where uniform/time gave it
+    std::printf("diag start time %s index %ld deltaT %.17g\n", cs.startName.c_str(), clock.startTimeIndex(),
+                (double)clock.deltaT());
+
     PatchFields pf;
-    State s = cpu::rhoCentral::createFields(cs, pf);
+    State s = cpu::rhoCentral::createFields(cs, pf, control);
     const Integrals I0 = integrals(cs, s);
     printIntegrals("start", I0);
 
     const bool clockControl = control == controlUntrimmed || control == controlLaggedCourant;
-    const bool driverControl = clockControl || control == controlNoPurge;   // the loop's, on either arm
+    const bool restartControl = control == controlRestartIndexZero || control == controlRestartGridFromZero
+                             || control == controlRestartIoExtrapolate || control == controlNoUniformTime;
+    const bool driverControl = clockControl || control == controlNoPurge || restartControl;   // either arm
     const bool ioControl = control == controlInletOutletInverted || control == controlLaggedPhi
                         || control == controlInletOutletNewT;
     const bool patchControl = control == controlNoTransform || control == controlLaggedRhoB || ioControl;   // both arms
@@ -137,6 +149,15 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
                                  "none.");
     if (control == controlNoPurge && cs.purgeWrite <= 0)
         throw std::runtime_error("BRAE_CONTROL_RCF noPurge is a control of purgeWrite; this case's is 0.");
+    if ((control == controlRestartIndexZero && clock.startTimeIndex() == 0)
+        || ((control == controlRestartGridFromZero || control == controlRestartIoExtrapolate) && cs.startTime == 0))
+        throw std::runtime_error("BRAE_CONTROL_RCF restartIndexZero, restartGridFromZero and restartIoExtrapolate are "
+                                 "controls of a restart; this case starts from 0 (or with no index to drop).");
+    if (control == controlRestartIoExtrapolate && !(cs.ioU || cs.ioP || cs.ioT))
+        throw std::runtime_error("BRAE_CONTROL_RCF restartIoExtrapolate is a control of inletOutlet; this case has "
+                                 "none.");
+    if (control == controlRestartIndexZero) clock.forgetStartIndex();
+    if (control == controlRestartGridFromZero) clock.measureWritesFromZero();
     // Time::writeObject's purge after each write (TimeIO.C:557-582); the control keeps every directory
     PurgeWrite purge(control == controlNoPurge ? 0 : cs.purgeWrite, /*warnNegative=*/true);
 
@@ -206,7 +227,7 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
         if (write)
         {
             arm->download(s);
-            writeTime(cs, s, clock.timeName());
+            writeTime(cs, s, clock, control != controlNoUniformTime);
             purge.written(cs.caseDir, clock.timeName());
             std::printf("written %s\n", clock.timeName().c_str());
         }

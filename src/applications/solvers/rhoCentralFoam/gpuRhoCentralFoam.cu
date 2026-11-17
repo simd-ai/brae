@@ -54,10 +54,15 @@ int main(int argc, char** argv)
             else if (v == "laggedPhi") control = controlLaggedPhi;
             else if (v == "inletOutletNewT") control = controlInletOutletNewT;
             else if (v == "noPurge") control = controlNoPurge;
+            else if (v == "restartIndexZero") control = controlRestartIndexZero;
+            else if (v == "restartGridFromZero") control = controlRestartGridFromZero;
+            else if (v == "restartIoExtrapolate") control = controlRestartIoExtrapolate;
+            else if (v == "noUniformTime") control = controlNoUniformTime;
             else if (!v.empty())
                 throw std::runtime_error("BRAE_CONTROL_RCF is `" + v + "`; it takes upwind, noPressureJump, untrimmed, "
                                          "laggedCourant, noTransform, laggedRhoB, inletOutletInverted, laggedPhi, "
-                                         "inletOutletNewT or noPurge.");
+                                         "inletOutletNewT, noPurge, restartIndexZero, restartGridFromZero, "
+                                         "restartIoExtrapolate or noUniformTime.");
             if (control != controlNone)
                 std::fprintf(stderr, "brae rhoCentralFoam: NEGATIVE CONTROL `%s` -- deliberately wrong numerics\n", c);
         }

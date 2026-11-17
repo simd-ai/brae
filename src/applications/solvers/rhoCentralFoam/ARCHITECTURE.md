@@ -5,7 +5,7 @@ implicit viscous correctors), its central-upwind flux assembly and its time loop
 boundary conditions, thermo, gradients, linear smoothers and time controls. Nothing here goes through SIMPLE, PIMPLE or
 rhoSimpleFoam's pressure correction, and there is no pressure equation: p = rho/psi.
 
-## 1. OpenFOAM's structure, and where each part lives in brae (after milestone D)
+## 1. OpenFOAM's structure, and where each part lives in brae (after milestone E)
 
 The reference is OpenFOAM v2412 `applications/solvers/compressible/rhoCentralFoam`. In the table, (H) marks the host
 reference (namespace `brae::cpu::rhoCentral`), (D) the device arm (namespace `brae::gpu::rhoCentral`), and (HD)
@@ -25,6 +25,7 @@ BRAE_HD code both arms run (namespace `brae::rhoCentral`).
 | constraint and transform patches: symmetryPlane, symmetry, slip, wedge (milestone C) | `rhoCentralControls.cu` (per-face data on the `Case`), the patch half above | sec. 5e |
 | inletOutlet on U, p, T, switched on line 195's `phi` (milestone D) | brae's `InletOutletPatchField` (host, `switchInletOutlet` in `rhoCentralCreateFields_cpp.cuh`) and `deviceUpdateInletOutlet` (device) | sec. 5f |
 | `Time::writeObject`'s purgeWrite (milestone D) | shared: `src/OpenFOAM/db/Time/purge_write.cuh` (`PurgeWrite`, hoisted out of `WriteControl`) | the driver calls it after each write |
+| restart (milestone E): `Time::setControls` reading `<start>/uniform/time`, `Time::writeTimeDict` writing it | shared: `run_clock.cuh` (reads deltaT under adjustTimeStep, deltaT0, index), `src/OpenFOAM/db/Time/time_dict_writer.cuh` (new) | sec. 5g |
 | one step, composed | `rhoCentralStep_cpp.cuh/.cu` (H), `rhoCentralStep.cuh/.cu` (D) | the two `Arm`s |
 | hePsiThermo + hConst + perfectGas | `rhoCentralThermo.cuh` (HD) | Es, Cv, psi, the Newton e -> T loop |
 
@@ -338,6 +339,48 @@ Gates for the transition:
   synchronisation of adjustTimeStep (sec. 5b).
 - **Not gated:** a restart from brae's own output (milestone E), inletOutlet on a coupled patch, viscous flow, 3-D.
 
+## 5g. Milestone E: restart
+
+- **OpenFOAM's restart, read in its source.** `Time::setControls` (Time.C:146-307) takes the start time from the
+  start DIRECTORY's name (startFrom startTime, firstTime or latestTime); `<start>/uniform/time` gives deltaT under
+  adjustTimeStep only (controlDict's otherwise), deltaT0, and the time index, from which timeStep writes count.
+  runTime/adjustable writes are measured from the start time (operator++, adjustDeltaT). `Time::writeTimeDict`
+  (TimeIO.C:508-539) writes uniform/time first at every write time: value at 18 digits, name, index, deltaT and
+  deltaT0 at writePrecision; functionObjectList writes an empty functionObjectProperties beside it. rhoCentralFoam
+  itself has no restart code: createFields.H reads p, T, U, re-derives T from he and rebuilds rho, rhoU, rhoE (NO_READ),
+  exactly as at 0; Euler keeps no old-time field (no `*_0` written or read); CoNum starts at 0, so the first setDeltaT.H
+  grows deltaT by 1.2. A restart under adjustTimeStep is therefore NOT its uninterrupted run continued.
+- **What brae had** (milestones B to D): the start-time resolution (`resolveStartTime`), uniform/time's deltaT and
+  index (`RunClock`), the file's `value` kept on inletOutlet (brae's class), createFields as OpenFOAM's -- so a restart
+  from OpenFOAM's output already ran (the C and D gates' rs7 and rsRev arms).
+- **What E added:** brae writes uniform/time and functionObjectProperties as OpenFOAM does (the shared
+  `time_dict_writer.cuh`; at all 40 forwardStep write times the same text as OpenFOAM's, value, name, index, deltaT,
+  deltaT0), so a restart from brae's own output -- by brae or by OpenFOAM -- has the time state; `RunClock` also reads
+  deltaT0 (Time.C:301; overwritten at the first step, as there); controls of the restart's mistakes.
+- **Measured** (`tests/rho_central_restart_vs_openfoam.sh`; GB10, 2026-11-17): restarts of forwardStep at t = 1, 2, 3,
+  wedge15Ma5 (fixed deltaT) at 0.06 and 0.12, obliqueShock at 3 and 7, the reversing tube at 0.012, 0.013 and 0.014
+  (across inletOutlet's switch), shockTube's timeStep writes from index 40, an off-grid restart under adjustable writes,
+  forwardStep as shipped continued with startFrom latestTime (6-digit fields and uniform/time, purgeWrite 10), and a
+  start directory without uniform/; each started from OpenFOAM's output and from brae's, against OpenFOAM restarted
+  from the same directory:
+  - every step's deltaT and time name, and every directory, the same as OpenFOAM's (the first deltaT 1.2 times the
+    start's, trimmed to the next write time, in both); uniform/time the same text at every write time;
+  - fields within ten times OpenFOAM's own spread at every write time, with ONE exception: wedge15Ma5 restarted from
+    OpenFOAM's t = 0.06, CUDA arm, at t = 0.12 (6.2e-10 against a bound of 3.4e-10). The largest difference of the CUDA
+    arm, the host arm (8.1e-11) and OpenFOAM in four (3.4e-11) is at the same free-stream cell just ahead of the shock
+    (rho 1.400005), where the limiter acts on differences of 1e-6; OpenFOAM in 2, 3, 4, 6 and 8 all read 1e-11 there at
+    0.12 and 0.2 to 1e-9 at 0.14. The CUDA arm without fused multiply-adds reads the same 6.1e-10. Round-off reaching a
+    sensitive cell first, not a restart error; the envelope is not changed for it (a decision for review);
+  - restart against uninterrupted: brae's and OpenFOAM's restarts part from their own uninterrupted runs by the same
+    amount (forwardStep 8.6e-03, 4.2e-03, 4.2e-02 by one time unit later; obliqueShock 3.4e-04, 9.7e-04; wedge15Ma5 at a
+    fixed deltaT by 0.2: from 0.06 OpenFOAM's 2.4e-05, brae's 2.1e-05; from 0.12 both 4.1e-06 -- rho, rhoU, rhoE
+    are rebuilt from p, T, U, and the Mach 5 shock amplifies the last bits);
+  - controls red: deltaT from controlDict (1.1e+09 x the bound), the index dropped and the write grid from 0 (the
+    directories off OpenFOAM's), the inletOutlet value taken from the cells (1.3e+10 x), no uniform/time written
+    (OpenFOAM restarted from such output 1.2e+09 x from OpenFOAM restarted from brae's full output).
+- **Not gated:** restart with function objects (none in these tutorials), binary or compressed time directories, a
+  latest directory without fields (brae's `resolveStartTime` skips one without U; OpenFOAM would stop on it), LTS.
+
 ## 6. Milestones, each closed by a gate against OpenFOAM v2412
 
 Every gate:
@@ -351,7 +394,7 @@ Every gate:
 | B (done) | adjustTimeStep: setDeltaT, adjustable writes, first step x1.2, restart deltaT | shockTube **as shipped**: the deltaT sequence and fields |
 | C (done) | constraint and transform BCs: symmetryPlane, symmetry, slip, wedge, with the conservative-state patch semantics of sec. 4 | wedge15Ma5 as shipped; obliqueShock as shipped (shock angle against theta-beta-M); a symmetry and a slip variant; an axisymmetric cone on wedge patches |
 | D (done) | inletOutlet (U, p, T; T -> mixedEnergy) and purgeWrite | forwardStep as shipped; the inlet as inletOutlet; a tube whose end turns from outflow to inflow |
-| E | restart: startFrom latestTime, `uniform/time`, the writer keeping BC keys | stop/restart against the continuous run and against OpenFOAM's own restart |
+| E (done; one arm red, for review) | restart: startFrom latestTime/startTime, `uniform/time` read and written, inletOutlet's value | restarts from OpenFOAM's and brae's output against OpenFOAM's own restart, and against the uninterrupted run |
 | F | other Riemann problems and limiters (the vanAlbada, Minmod, MUSCL, limitedLinear family) | Lax, 123 and a strong shock tube: brae against OpenFOAM and the exact solution |
 | G | viscous: muEff, tauMC, U and e correctors (smoothSolver/GaussSeidel), sigmaDotU, sutherland, noSlip | a viscous shock tube and a laminar compressible boundary layer against OpenFOAM |
 | H | totalPressure (psi branch), totalTemperature, waveTransmissive | a supersonic nozzle and LadenburgJet60psi |

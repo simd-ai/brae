@@ -38,7 +38,7 @@ public:
     // `startDir` is the resolved start directory (its uniform/time is read as Time::setControls reads it), and
     // `startTime` that directory's time value.
     RunClock(const FoamDict& controlDict, const std::string& startDir, scalar startTime)
-      : startTime_(startTime), value_(startTime)
+      : startTime_(startTime), origin_(startTime), value_(startTime)
     {
         control_ = controlDict.wordOr("writeControl", "timeStep");
         if (control_ == "clockTime" || control_ == "cpuTime")
@@ -73,6 +73,8 @@ public:
         {
             const FoamDict td = readDict(timePath);
             if (td.found("index")) timeIndex_ = static_cast<long>(td.scalarOr("index", scalar(0)));
+            // Time.C:301: deltaT0 read whatever adjustTimeStep says; the first operator++ overwrites it before any use
+            if (td.found("deltaT0")) deltaT0_ = td.scalarOr("deltaT0", deltaT0_);
         }
         startTimeIndex_ = timeIndex_;
         name_ = openFoamTimeName(static_cast<double>(value_));
@@ -82,7 +84,17 @@ public:
     bool run() const { return value_ < endTime_ - scalar(0.5)*deltaT_; }
 
     // Time::setDeltaT(deltaT) with its default adjust = true
-    void setDeltaT(scalar dt) { deltaT_ = adjustDeltaT(dt, value_ - startTime_, cadence_); }
+    void setDeltaT(scalar dt) { deltaT_ = adjustDeltaT(dt, value_ - origin_, cadence_); }
+
+    // GATE CONTROLS ONLY, the restart's two time-state mistakes: the step count from uniform/time's `index` dropped
+    // (timeStep writes then fall off OpenFOAM's global grid), and the runTime/adjustable write grid measured from 0
+    // instead of from the start time (Time.C operator++ and adjustDeltaT use value() - startTime_)
+    void forgetStartIndex() { timeIndex_ = startTimeIndex_ = 0; }
+    void measureWritesFromZero()
+    {
+        origin_ = 0;
+        cadence_.startTime = 0;
+    }
 
     // Time::setDeltaT(deltaT, false): a gate's control only (the write-time trimming left out)
     void setDeltaTNoAdjust(scalar dt) { deltaT_ = dt; }
@@ -103,12 +115,12 @@ public:
         if (control_ == "timeStep")
         {
             writeTime_ = !(timeIndex_ % stepInterval_);
-            cadence_.advance(value_ - startTime_, deltaT_);   // the function objects' indices
+            cadence_.advance(value_ - origin_, deltaT_);   // the function objects' indices
         }
         else
         {
             // runTime and adjustable: writeIndex = ((value - startTime) + 0.5*deltaT)/writeInterval moving forward
-            const bool moved = cadence_.advance(value_ - startTime_, deltaT_);
+            const bool moved = cadence_.advance(value_ - origin_, deltaT_);
             writeTime_ = (control_ != "none") && moved;
         }
         if (writeTime_) raisePrecision(oldTimeValue);
@@ -159,6 +171,7 @@ private:
     long stepInterval_ = 1;
     WriteCadence cadence_;
     scalar startTime_ = 0;
+    scalar origin_ = 0;   // what the runTime/adjustable write grid is measured from: the start time (a control: 0)
     scalar endTime_ = 0;
     scalar value_ = 0;
     scalar deltaT_ = 0;

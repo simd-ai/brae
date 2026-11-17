@@ -5083,8 +5083,8 @@ COMPONENTS = {
                   "walls bound throughout. Two round trips remain -- the batch coming back and the result "
                   "going out -- and the second needs a pinned staging buffer to go async."),
     ],
-    # rhoCentralFoam, EXPERIMENTAL (stage 1 2026-11-16; milestone B, adjustTimeStep, C, the transform patches, and D,
-    # inletOutlet and purgeWrite, 2026-11-17): single GPU, static mesh, inviscid laminar, a fixed deltaT or
+    # rhoCentralFoam, EXPERIMENTAL (stage 1 2026-11-16; milestone B, adjustTimeStep, C, the transform patches, D,
+    # inletOutlet and purgeWrite, and E, restart, 2026-11-17): single GPU, static mesh, inviscid laminar, a fixed deltaT or
     # adjustTimeStep, hePsiThermo + perfectGas + hConst + const, Kurganov/Tadmor, vanLeer/vanLeerV, zeroGradient/
     # fixedValue/empty/slip/symmetryPlane/symmetry/wedge/inletOutlet, any purgeWrite. Everything else is UNSUPPORTED
     # and refused by name (tests/rho_central_refusals.sh). Not SIMPLE or PIMPLE: no pressure
@@ -5213,6 +5213,24 @@ COMPONENTS = {
                   "transformPatchU. On a constraint mesh patch rho, rhoU and rhoE take the constraint type, so "
                   ":233 and :267 multiply by the rho solve's new cell rho; a transform T makes he the same transform, "
                   "e_b = e_P and THE seeded from T_b."),
+        dict(name="restart", of_symbol="Time::setControls, Time::writeTimeDict",
+             of_file="src/OpenFOAM/db/Time/Time.C",
+             classification="HOST_ONLY", status="REUSE_EXISTING",
+             brae_existing="src/OpenFOAM/db/Time/run_clock.cuh (reads uniform/time: deltaT under adjustTimeStep, "
+                           "deltaT0, index); src/OpenFOAM/db/Time/time_dict_writer.cuh (writes it); "
+                           "src/applications/solvers/common/start_time.cuh (startFrom)",
+             brae_driver="src/applications/solvers/rhoCentralFoam/rhoCentralFoam.cu",
+             validation="tests/rho_central_restart_vs_openfoam.sh: forwardStep, wedge15Ma5, obliqueShock, a tube across "
+                        "inletOutlet's switch, timeStep and off-grid writes, and forwardStep as shipped continued with "
+                        "startFrom latestTime, each restarted from OpenFOAM's and from brae's output against OpenFOAM "
+                        "restarted from the same directory: every deltaT, name and directory, and uniform/time's text, "
+                        "the same; fields within ten times OpenFOAM's own spread but on one arm (wedge15Ma5 from "
+                        "OpenFOAM's t = 0.06, CUDA, t = 0.12: round-off at a free-stream cell ahead of the shock). "
+                        "Controls red: deltaT from controlDict, the index dropped, the write grid from 0, inletOutlet's "
+                        "value from the cells, no uniform/time written.",
+             note="the start time is the directory's name; rho, rhoU, rhoE are rebuilt from p, T, U and T from he, as "
+                  "at 0; CoNum starts at 0, so the first deltaT is 1.2 times the start's: a restart under "
+                  "adjustTimeStep parts from its uninterrupted run, in OpenFOAM and brae alike."),
         dict(name="setDeltaT", of_symbol="setDeltaT.H",
              of_file="src/finiteVolume/cfdTools/general/include/setDeltaT.H",
              classification="CONFIGURATION", status="REUSE_EXISTING",

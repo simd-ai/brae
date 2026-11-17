@@ -14,8 +14,10 @@ using brae::rhoCentral::Case;
 using brae::rhoCentral::PatchFields;
 using brae::rhoCentral::State;
 
-// Reads p, T and U from the start directory into their patch fields, and builds the conservative state.
-State createFields(const Case& cs, PatchFields& pf);
+// Reads p, T and U from the start directory into their patch fields, and builds the conservative state. A cold start and
+// a restart are the same code, as in OpenFOAM: rho, rhoU and rhoE are NO_READ (createFields.H), rebuilt from p, T and U,
+// and T from he. control: the gate's restartIoExtrapolate (rhoCentralState.cuh).
+State createFields(const Case& cs, PatchFields& pf, int control = brae::rhoCentral::controlNone);
 
 // Evaluates every patch of `f` on `internal` (no coupled patch is accepted, so no exchange is posted) and copies
 // the patch values into the flat boundary array, in patch order.

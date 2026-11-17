@@ -14,7 +14,7 @@ namespace rhoCentral {
 
 using namespace brae::rhoCentral;
 
-State createFields(const Case& cs, PatchFields& pf)
+State createFields(const Case& cs, PatchFields& pf, int control)
 {
     const std::string dir = cs.caseDir + "/" + cs.startName;
     const GasCoeffs& g = cs.gas;
@@ -32,6 +32,18 @@ State createFields(const Case& cs, PatchFields& pf)
     evaluatePatches(pf.U, s.U, cs, s.UB);
     for (label k = 0; k < cs.nB; ++k)   // a transform face's construction-time evaluate, in OpenFOAM's arithmetic
         if (cs.bUTransform[k]) s.UB[k] = transformPatchU(cs.bUTransform[k], cs.bUR[k], s.U[cs.bCell[k]], controlNone);
+    // An inletOutlet patch keeps the file's `value` (inletOutletFvPatchField's dictionary constructor; brae's class keeps
+    // it until a flux has switched it). On a restart that value is the step before's evaluation -- on an outflow face of T,
+    // the cell's T a step older than the cell's own. THE CONTROL restartIoExtrapolate takes the cells instead.
+    if (control == controlRestartIoExtrapolate)
+        for (label k = 0; k < cs.nB; ++k)
+            if (cs.bInletOutlet[k])
+            {
+                const label c = cs.bCell[k];
+                s.UB[k] = s.U[c];
+                s.pB[k] = s.p[c];
+                s.TB[k] = s.T[c];
+            }
 
     // heThermo::init (heThermo.C:58-90): he from (p, T) on cells and patches. heBoundaryCorrection sets a
     // gradientEnergy patch's gradient to snGrad(he), which every later evaluate recomputes before use.
