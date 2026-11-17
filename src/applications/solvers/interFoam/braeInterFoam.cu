@@ -202,6 +202,7 @@
 #include "foam_dict.cuh"
 #include <cstdio>
 #include <cstring>
+#include "case_decompose.cuh"
 #include <exception>
 #include <memory>
 #include <stdexcept>
@@ -216,6 +217,7 @@ int main(int argc, char** argv)
     bool onDevice = false;
     bool parallel = false;
     int rankFlag = -1, nProcsFlag = -1;
+    bool noReconstruct = false;
     std::string caseDir = ".";
     // WHAT `brae` HANDS ON IS WHAT THIS TAKES: the launcher forwards its own arguments unchanged
     // (solver_dispatch.cuh), and a user may have typed the case as `-case <dir>` or as a bare directory. A bare
@@ -228,6 +230,10 @@ int main(int argc, char** argv)
         if (a == "-case" && i + 1 < argc)
         {
             caseDir = argv[++i];
+        }
+        else if (a == "-noReconstruct")
+        {
+            noReconstruct = true;
         }
         else if (a == "-device")
         {
@@ -291,6 +297,17 @@ int main(int argc, char** argv)
         }
         // the dictionary root (the case) and the rank's root (processor<rank> under -parallel, the case itself
         // otherwise): common/case_roots.cuh
+        // `-parallel` on a case nobody decomposed: brae decomposes it (the first rank to start does, the others wait), and puts the
+        // case back together when the run ends. A case that already has processor directories is the user's own, and is left to
+        // makeCaseRoots to check against the size of the run.
+        // Every rank asks, including one that starts after rank 0 has made the first directory: while a decomposition holds its lock
+        // the directories are not all there, and a finished one (or the user's own) is answered at once.
+        if (parallel)
+        {
+            int dRank = rankFlag, dProcs = nProcsFlag;
+            if (dRank >= 0 || rankFromEnvironment(dRank, dProcs))
+                if (dProcs >= 1) decompose::decomposeForRun(caseDir, dProcs);
+        }
         const CaseRoots roots = makeCaseRoots(caseDir, parallel, rankFlag, nProcsFlag);
         const FoamDict controlDict = readDict(roots.dictDir + "/system/controlDict");
         // THE ENTRIES Time READS, AS Time READS THEM (Time.C:146-190, TimeIO.C:268-356). `deltaT` is
@@ -467,6 +484,28 @@ int main(int argc, char** argv)
         };
         if (procComm) procComm->comm().guarded(runLoop);
         else runLoop();
+
+        // a case brae decomposed for this run is put back together: every rank's last write is down, then rank 0 merges
+        if (procComm && !noReconstruct && decompose::decomposedByRun(caseDir))
+        {
+            procComm->comm().barrier();
+            if (roots.rank == 0)
+            {
+                try
+                {
+                    decompose::ReconstructOptions ro;
+                    const decompose::ReconstructReport rr = decompose::reconstructCase(caseDir, ro);
+                    std::printf("brae: reconstructed %zu time(s) into %s (the processor directories are kept)\n", rr.times.size(), caseDir.c_str());
+                }
+                catch (const std::exception& e)
+                {
+                    std::fprintf(stderr, "brae interFoam: the run finished, but putting the case back together failed: %s\n"
+                                         "  The processor directories hold the results; `brae reconstruct -case %s` retries.\n",
+                                 e.what(), caseDir.c_str());
+                    return 1;
+                }
+            }
+        }
 
         if (r.steps >= nSteps && r.time < endTime - scalar(0.5)*r.deltaT)
         {
