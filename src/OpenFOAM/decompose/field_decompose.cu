@@ -147,10 +147,8 @@ Entry readEntry(TokenStream& ts)
 // the FoamFile header's class and object. TokenStream drops the header, so they are read off the file's first bytes.
 void readHeader(const std::string& path, std::string& cls, std::string& object)
 {
-    std::ifstream in(path, std::ios::binary);
-    std::string head(2048, '\0');
-    in.read(head.data(), static_cast<std::streamsize>(head.size()));
-    head.resize(static_cast<std::size_t>(in.gcount()));
+    const std::vector<char> bytes = gzSlurp(path, 2048);       // `path` or `path.gz`
+    const std::string head(bytes.begin(), bytes.end());
     const std::size_t ff = head.find("FoamFile");
     if (ff == std::string::npos) return;
     const std::size_t end = head.find('}', ff);
@@ -375,6 +373,12 @@ bool isOriented(const FieldFile& f)
     return e && !e->v.tokens.empty() && e->v.tokens[0] == "oriented";
 }
 
+// the field a file belongs to: `U` for `U` and for `U.gz` (OpenFOAM's writeCompression; the readers take either and prefer the plain one)
+std::string fieldName(const std::string& file)
+{
+    return file.size() > 3 && file.compare(file.size() - 3, 3, ".gz") == 0 ? file.substr(0, file.size() - 3) : file;
+}
+
 }   // namespace
 
 // ------------------------------------------------------------------------------------------------------------------------------
@@ -383,8 +387,9 @@ void decomposeFields(const std::string& caseDir, const Plan& plan, const std::st
     const std::string src = caseDir + "/" + time;
     std::vector<std::string> names;
     for (const auto& e : fs::directory_iterator(src))
-        if (e.is_regular_file()) names.push_back(e.path().filename().string());
+        if (e.is_regular_file()) names.push_back(fieldName(e.path().filename().string()));
     std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
 
     const GlobalLayout& G = plan.global;
     for (const std::string& name : names)
@@ -545,8 +550,9 @@ void reconstructFields(const std::string& caseDir, const std::vector<ProcLayout>
     const std::string src0 = caseDir + "/processor0/" + time;
     std::vector<std::string> names;
     for (const auto& e : fs::directory_iterator(src0))
-        if (e.is_regular_file()) names.push_back(e.path().filename().string());
+        if (e.is_regular_file()) names.push_back(fieldName(e.path().filename().string()));
     std::sort(names.begin(), names.end());
+    names.erase(std::unique(names.begin(), names.end()), names.end());
 
     for (const std::string& name : names)
     {

@@ -38,7 +38,7 @@ inline int decomposeUsage(const char* what, int code)
     if (std::string(what) == "decompose")
         std::fprintf(f,
             "usage: brae decompose [-case <dir>] [-n N] [-method scotch|simple|hierarchical|manual] [-time T[,T..] | -allTimes]\n"
-            "                      [-force] [-quiet]\n"
+            "                      [-copyUniform] [-force] [-quiet]\n"
             "  Splits the case into processor<N>/ directories, as OpenFOAM's decomposePar does, for `brae -parallel`. -n and -method\n"
             "  default to system/decomposeParDict's numberOfSubdomains and method (scotch without one). The fields of the time the\n"
             "  run would start from are decomposed; -time and -allTimes name others. The solver does this itself when `-parallel`\n"
@@ -71,6 +71,7 @@ inline int decomposeCommand(int argc, char** argv)
             else if (a == "-method") opt.method = value();
             else if (a == "-time") opt.times = splitTimes(value());
             else if (a == "-allTimes") opt.allTimes = true;
+            else if (a == "-copyUniform") opt.copyUniform = true;
             else if (a == "-force") opt.force = true;
             else if (a == "-quiet") opt.quiet = true;
             else if (a == "-h" || a == "-help" || a == "--help") return decomposeUsage("decompose", 0);

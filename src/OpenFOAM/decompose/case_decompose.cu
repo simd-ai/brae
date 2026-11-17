@@ -481,12 +481,18 @@ Plan makePlan(const PrimitiveMesh& m, const std::vector<label>& cellToProc, int 
 // ---- zones ------------------------------------------------------------------------------------------------------------------
 using ZoneList = std::vector<std::pair<std::string, std::vector<label>>>;
 
+// A polyMesh file as OpenFOAM may have written it: `name` or `name.gz`
+std::string foamFilePath(const std::string& base)
+{
+    return (!fs::exists(base) && fs::exists(base + ".gz")) ? base + ".gz" : base;
+}
+
 // Does a faceZones / pointZones file hold no member at all? Its zones' lists are all `List<label> 0` (or the file is `0()`). A file
 // this cannot read is taken to have members. (The file is ASCII text up to its first binary list, and an empty list has no bytes.)
 bool zoneFileIsEmptyOfMembers(const std::string& path, bool& hasZones)
 {
-    std::ifstream f(path, std::ios::binary);
-    const std::string text((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const std::vector<char> bytes = gzSlurp(path);
+    const std::string text(bytes.begin(), bytes.end());
     hasZones = false;
     const std::size_t banner = text.find("// * * *");
     if (banner == std::string::npos) return false;
@@ -512,7 +518,7 @@ ZoneList readCellZonesInOrder(const std::string& polyMeshDir)
 {
     const std::string path = polyMeshDir + "/cellZones";
     ZoneList out;
-    if (!fs::exists(path)) return out;
+    if (!fs::exists(path) && !fs::exists(path + ".gz")) return out;
     if (foamFormat(path) == "binary") return readBinaryCellZones(path);
     TokenStream ts(path);
     const label nz = ts.nextLabel();
@@ -706,12 +712,13 @@ Report decomposeCaseWith(const std::string& caseDir, const std::vector<label>& c
     std::vector<std::string> emptyZoneFiles;          // faceZones / pointZones with zones that hold nothing: carried over as they are
     for (const char* z : {"faceZones", "pointZones"})
     {
-        if (!fs::exists(pm + "/" + z)) continue;
+        const std::string zpath = foamFilePath(pm + "/" + z);
+        if (!fs::exists(zpath)) continue;
         bool hasZones = false;
-        if (!zoneFileIsEmptyOfMembers(pm + "/" + z, hasZones))
+        if (!zoneFileIsEmptyOfMembers(zpath, hasZones))
             throw std::runtime_error(std::string("constant/polyMesh/") + z + " has members, and only cellZones are decomposed "
                                      "(a face or point zone with members is not).");
-        if (hasZones) emptyZoneFiles.push_back(z);
+        if (hasZones) emptyZoneFiles.push_back(fs::path(zpath).filename().string());
     }
     {
         std::string extras;
@@ -723,6 +730,10 @@ Report decomposeCaseWith(const std::string& caseDir, const std::vector<label>& c
     const ZoneList cellZones = readCellZonesInOrder(pm);
 
     const Plan plan = makePlan(m, cellToProc, nProcs);
+    for (int p = 0; p < nProcs; ++p)
+        if (plan.proc[static_cast<std::size_t>(p)].cells.empty())
+            throw std::runtime_error("brae decompose: processor " + std::to_string(p) + " gets no cells (" + std::to_string(nProcs)
+                                     + " processors for " + std::to_string(m.nCells()) + " cells); a processor with no cells cannot run.");
     Report rep;
     rep.nProcs = nProcs;
     rep.nCells = m.nCells();
@@ -756,6 +767,10 @@ Report decomposeCaseWith(const std::string& caseDir, const std::vector<label>& c
         if (!fs::is_directory(caseDir + "/" + t))
             throw std::runtime_error("brae decompose: the time directory " + caseDir + "/" + t + " does not exist.");
         decomposeFields(caseDir, plan, t, rep.fields, opt.quiet);
+        if (opt.copyUniform && fs::is_directory(caseDir + "/" + t + "/uniform"))
+            for (int p = 0; p < nProcs; ++p)
+                fs::copy(caseDir + "/" + t + "/uniform", caseDir + "/processor" + std::to_string(p) + "/" + t + "/uniform",
+                         fs::copy_options::recursive | fs::copy_options::overwrite_existing);
         rep.times.push_back(t);
     }
     return rep;
@@ -838,6 +853,10 @@ ReconstructReport reconstructCase(const std::string& caseDir, const ReconstructO
         if (fs::exists(caseDir + "/" + t) && !opt.force)
             throw std::runtime_error("brae reconstruct: " + caseDir + "/" + t + " exists; give -force to replace its fields.");
         reconstructFields(caseDir, proc, global, t, rep.fields, opt.quiet);
+        // reconstructPar takes the uniform/ directory (time index, cumulativeContErr) from processor0
+        if (fs::is_directory(caseDir + "/processor0/" + t + "/uniform"))
+            fs::copy(caseDir + "/processor0/" + t + "/uniform", caseDir + "/" + t + "/uniform",
+                     fs::copy_options::recursive | fs::copy_options::overwrite_existing);
         rep.times.push_back(t);
     }
     return rep;
@@ -899,6 +918,7 @@ bool decomposeForRun(const std::string& caseDir, int nProcs, bool quiet)
                 Options opt;
                 opt.nProcs = nProcs;
                 opt.quiet = quiet;
+                opt.copyUniform = true;     // a run that starts from an earlier time keeps its time index
                 std::printf("brae: -parallel on a case with no processor directories: decomposing it into %d (brae decompose)\n", nProcs);
                 std::fflush(stdout);
                 decomposeCase(caseDir, opt);
@@ -916,6 +936,9 @@ bool decomposeForRun(const std::string& caseDir, int nProcs, bool quiet)
             fs::remove(lock, ec);
             return true;
         }
+        if (errno != EEXIST)
+            throw std::runtime_error("cannot decompose the case for this run: " + lock + " cannot be created (" + std::strerror(errno)
+                                     + "). Decompose it where it can be written (`brae decompose`), or run on a case with processor directories.");
         // waiting for whoever holds the lock
         while (fs::exists(lock))
         {

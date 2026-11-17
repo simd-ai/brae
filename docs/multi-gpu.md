@@ -41,6 +41,11 @@ files) and the volume and surface fields of the start time (`-time` and `-allTim
 | `hierarchical` | the cells cut along `order`'s first direction, each part along the next, and so on; brae's own cut, which can differ from OpenFOAM's by cells at a cut |
 | `manual` | the cell-to-processor list of `manualCoeffs/dataFile` |
 
+Gzipped files (`writeCompression`) are read, and the output is plain text. A processor that would get no cells is refused. A time's
+`uniform/` directory (time index, `cumulativeContErr`) is copied with `-copyUniform`, as in `decomposePar`; a run that decomposes
+the case itself always copies it, so a restart keeps its time index, and `brae reconstruct` brings processor0's back, as
+`reconstructPar` does. A case directory that cannot be written to is refused by name.
+
 Not decomposed: cyclic, cyclicAMI/ACMI and processor patches in the mesh, face and point zones that have members (empty ones are carried over), point fields,
 dynamic-refinement files (`cellLevel`, `pointLevel`, ...), and Lagrangian data. A field is cut as a whole: its internal
 field, and each patch's lists whose length is the patch's face count; every other entry is carried over unchanged. A
@@ -79,7 +84,7 @@ Command line (`brae_interFoam`; the `brae` launcher forwards them):
 
 | option | effect |
 |---|---|
-| `-parallel` | read the case as decomposed into `processorN/` (decomposed first when it has none) |
+| `-parallel` | read the case as decomposed into `processorN/` (decomposed first when it has none); `mpirun -np N brae -case . -parallel` does the same through the launcher |
 | `-noReconstruct` | with `-parallel`: do not put the case back together at the end, when brae decomposed it |
 | `-rank N -nprocs M` | the rank and the process count, when not taken from the launcher. Otherwise read from `OMPI_COMM_WORLD_RANK/SIZE`, `PMI_RANK/SIZE` or `SLURM_PROCID/NTASKS`; the explicit flags win |
 

@@ -38,6 +38,7 @@ struct Options
     bool                     force = false;       // replace the processor<N>/ directories that are there
     std::vector<std::string> times;               // time directories to decompose; empty: the time a run would start from
     bool                     allTimes = false;    // every numeric time directory
+    bool                     copyUniform = false; // also copy each decomposed time's uniform/ (time index, cumulativeContErr): decomposePar -copyUniform
     bool                     quiet = false;
 };
 
