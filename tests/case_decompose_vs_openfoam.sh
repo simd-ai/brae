@@ -13,6 +13,7 @@
 #      every rank runs, rank 0 puts the case back together; the result is the run of step 3.
 #   5. scotch and hierarchical (brae's own cut, not OpenFOAM's): decompose then reconstruct gives back the global fields.
 #   6. a decomposition abandoned by a killed process is started again; -noReconstruct leaves the case in the processor directories.
+#   7. `brae -case <dir> -parallel` under mpirun (the launcher hands the case to brae_interFoam) decomposes and reconstructs the same way.
 # Skips (exit 77) without OpenFOAM v2606 or mpirun. Needs one GPU.
 set -eo pipefail
 BRAE=${1:?usage: $0 <brae> <brae_interFoam> [scratch dir]}
@@ -110,4 +111,17 @@ grep -q "abandoned by a process that is gone" log.stale2 || fail "the abandoned 
 [ -d stale2/processor1 ] && [ -z "$(ls -d stale2/0.* 2>/dev/null)" ] || fail "-noReconstruct: the case was put back together, or the decomposition is missing"
 [ -d stale2/processor0/$P ] || fail "the np=2 run wrote no time"
 echo "== abandoned decomposition and -noReconstruct: ok"
+
+# ---- 7: the `brae` launcher, the way a user starts it: no -device, the case names its solver ---------------------------------------
+rm -rf launch4; cp -r mesh launch4; cp "$SYS/decomposeParDict.simple4" launch4/system/decomposeParDict
+mpirun --bind-to none --oversubscribe -np 4 "$BRAE" -case launch4 -parallel > log.launch4 2>&1 || { tail -n 8 log.launch4; fail "mpirun -np 4 brae -parallel on an undecomposed case"; }
+grep -q "brae_interFoam -device" log.launch4 || fail "the launcher did not hand the case to brae_interFoam"
+grep -q "decomposing it into 4" log.launch4 || fail "the launcher run did not decompose the case"
+[ -d launch4/$P ] || fail "the launcher run did not reconstruct $P"
+echo "== launcher: decomposed, run and reconstructed against step 3"
+python3 "$CMP" global rec_br launch4 $P || fail "the launcher run differs from the decomposed one"
+# processor directories for 4 ranks, a run of 2: refused by name, nothing decomposed again
+if mpirun --bind-to none --oversubscribe -np 2 "$BRAE" -case launch4 -parallel > log.launch4b 2>&1; then fail "a run of 2 on a case decomposed for 4 was not refused"; fi
+grep -q "4 processor directories and the run has 2 processes" log.launch4b || { tail -n 5 log.launch4b; fail "the wrong rank count was not refused by name"; }
+echo "== launcher: a rank count that does not match the processor directories is refused"
 echo "PASS"

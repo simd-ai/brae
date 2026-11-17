@@ -3676,6 +3676,13 @@ target_include_directories(test_processor_patch_reader PRIVATE ${BRAE_HEADER_DIR
 target_link_libraries(test_processor_patch_reader PRIVATE brae_core)
 add_test(NAME processor_patch_reader COMMAND test_processor_patch_reader ${CMAKE_CURRENT_SOURCE_DIR})
 
+# brae decompose / reconstruct on a block mesh built in the test (host only): patch entries by name, group, pattern and wildcard, vector,
+# symmTensor, tensor and oriented surface fields, processor patch values, round trip, gzip, uniform/, refusals by name.
+add_executable(test_case_decompose tests/test_case_decompose.cu)
+target_include_directories(test_case_decompose PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_case_decompose PRIVATE brae_core)
+add_test(NAME case_decompose COMMAND test_case_decompose)
+
 # WP1 second half: the processor patches coupled over ProcComm (OpenFOAM's processorFvPatch formulas from ONE setup
 # exchange) and the device interface with halo slots, on decomposePar meshes with a rank per thread on one GPU.
 # The fixture is the 2-domain mesh of tests/data; mgpu_proc_geometry (below) runs it on real decompositions.
