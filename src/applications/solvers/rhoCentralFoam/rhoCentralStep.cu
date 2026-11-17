@@ -5,7 +5,7 @@
 //   cellKernel   fvc::div gathered in OpenFOAM's face order, then the four cell stages   :222-286
 //   deviceBCValue on U (x3)                            :232 U.correctBoundaryConditions (shared DeviceBoundary)
 //   deviceBCValue on T with the cells' old T           :265 Tw.evaluate() inside the energy BCs
-//   patchKernel  updatePatchFace                       :233, 265-271
+//   patchKernel  transformPatchU, updatePatchFace      :232 on the transform faces, :233, 265-271
 //   deviceBCValue on p                                 :287
 //   rhoBKernel   rho_b = psi_b*p_b                     :288
 //   courantKernel                                       centralCourantNo.H, kept on the device
@@ -128,18 +128,35 @@ __global__ void cellKernel(int nC, int slot, scalar rDeltaT, int v0, int v1, int
 
 struct PatchState
 {
-    scalar *rho, *rhoUx, *rhoUy, *rhoUz, *rhoE, *e, *T, *psi;
-    const scalar *Ux, *Uy, *Uz, *p, *TbEval;
+    scalar *rho, *rhoUx, *rhoUy, *rhoUz, *rhoE, *e, *T, *psi, *Ux, *Uy, *Uz;
+    const scalar *p, *TbEval;
+};
+// the cells' new rho and U, and each face's transform (rhoCentralPatchUpdate.cuh; Case::bUTransform and friends)
+struct PatchTransforms
+{
+    const scalar *rhoC, *UxC, *UyC, *UzC;
+    const int* kind;
+    const tensor* R;
+    const char *rhoConstraint, *TseedOwn;
 };
 
-__global__ void patchKernel(int nB, int slot, GasCoeffs gas, const label* __restrict__ bCell,
+__global__ void patchKernel(int nB, int slot, GasCoeffs gas, int ctrl, const label* __restrict__ bCell,
                             const int* __restrict__ TfixesValue, const scalar* __restrict__ eCell, PatchState B,
-                            int* __restrict__ status)
+                            PatchTransforms X, int* __restrict__ status)
 {
     const int k = blockIdx.x*blockDim.x + threadIdx.x;
     if (k >= nB) return;
-    const PatchNew b = updatePatchFace(TfixesValue[k], B.rho[k], B.Ux[k], B.Uy[k], B.Uz[k], eCell[bCell[k]],
-                                       B.TbEval[k], B.p[k], gas);
+    const label c = bCell[k];
+    if (X.kind[k])   // U.correctBoundaryConditions() on a transform face (:232)
+    {
+        const vector Ub = transformPatchU(X.kind[k], X.R[k], vector{X.UxC[c], X.UyC[c], X.UzC[c]}, ctrl);
+        B.Ux[k] = Ub.x;
+        B.Uy[k] = Ub.y;
+        B.Uz[k] = Ub.z;
+    }
+    const PatchNew b = updatePatchFace(TfixesValue[k], patchRhoMid(X.rhoConstraint[k], X.rhoC[c], B.rho[k], ctrl),
+                                       B.Ux[k], B.Uy[k], B.Uz[k], eCell[c], X.TseedOwn[k] ? B.T[k] : B.TbEval[k],
+                                       B.p[k], gas);
     B.rhoUx[k] = b.rhoUx;
     B.rhoUy[k] = b.rhoUy;
     B.rhoUz[k] = b.rhoUz;
@@ -266,6 +283,10 @@ public:
             TfixesValue_.copyFrom(fx);
         }
         bCell_.copyFrom(cs.bCell);
+        uTransform_.copyFrom(cs.bUTransform);
+        uR_.copyFrom(cs.bUR);
+        rhoConstraint_.copyFrom(cs.bRhoConstraint);
+        TseedOwn_.copyFrom(cs.bTseedOwn);
         Told_.resize(nC);
         TbEval_.resize(nB);
         coCell_.resize(nC);
@@ -275,7 +296,7 @@ public:
         // it runs every step
         cudaCheck(cudaMallocHost(&hostCourant_, 3*kReportWindow*sizeof(double)), "pinned courant");
         cudaCheck(cudaMallocHost(&hostStatus_, kReportWindow*sizeof(int)), "pinned status");
-        outflow_.copyFrom(std::vector<double>(5, 0.0));
+        outflow_.copyFrom(std::vector<double>(10, 0.0));   // the run's totals, then this step's sums
         cudaCheck(cudaDeviceSynchronize(), "rhoCentralFoam upload");
         size_t free1 = 0;
         cudaCheck(cudaMemGetInfo(&free1, &total), "memGetInfo");
@@ -313,8 +334,10 @@ public:
             const PatchState B{F.rhoB.data(), F.rhoUxB.data(), F.rhoUyB.data(), F.rhoUzB.data(), F.rhoEB.data(),
                                F.eB.data(), F.TB.data(), F.psiB.data(), F.UxB.data(), F.UyB.data(), F.UzB.data(),
                                F.pB.data(), TbEval_.data()};
-            patchKernel<<<blocksFor(nB), kTPB>>>(nB, pending_, cs.gas, bCell_.data(), TfixesValue_.data(),
-                                                 F.e.data(), B, status_.data());
+            const PatchTransforms X{F.rho.data(), F.Ux.data(), F.Uy.data(), F.Uz.data(), uTransform_.data(),
+                                    uR_.data(), rhoConstraint_.data(), TseedOwn_.data()};
+            patchKernel<<<blocksFor(nB), kTPB>>>(nB, pending_, cs.gas, control_, bCell_.data(), TfixesValue_.data(),
+                                                 F.e.data(), B, X, status_.data());
             cudaCheck(cudaGetLastError(), "rhoCentral patches");
             deviceBCValue(dbP_, F.p, F.pB);             // :287
             rhoBKernel<<<blocksFor(nB), kTPB>>>(nB, F.psiB.data(), F.pB.data(), F.rhoB.data());   // :288
@@ -411,6 +434,9 @@ private:
     DeviceBoundary dbP_, dbT_;
     DeviceBuffer<int> TfixesValue_;
     DeviceBuffer<label> bCell_;
+    DeviceBuffer<int> uTransform_;
+    DeviceBuffer<tensor> uR_;
+    DeviceBuffer<char> rhoConstraint_, TseedOwn_;
     DeviceBuffer<scalar> Told_, TbEval_, coCell_;
     DeviceBuffer<int> status_;
     DeviceBuffer<double> courant_, outflow_;

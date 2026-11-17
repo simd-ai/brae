@@ -48,9 +48,11 @@ int main(int argc, char** argv)
             else if (v == "noPressureJump") control = controlNoPressureJump;
             else if (v == "untrimmed") control = controlUntrimmed;
             else if (v == "laggedCourant") control = controlLaggedCourant;
+            else if (v == "noTransform") control = controlNoTransform;
+            else if (v == "laggedRhoB") control = controlLaggedRhoB;
             else if (!v.empty())
-                throw std::runtime_error("BRAE_CONTROL_RCF is `" + v + "`; it takes upwind, noPressureJump, untrimmed "
-                                         "or laggedCourant.");
+                throw std::runtime_error("BRAE_CONTROL_RCF is `" + v + "`; it takes upwind, noPressureJump, untrimmed, "
+                                         "laggedCourant, noTransform or laggedRhoB.");
             if (control != controlNone)
                 std::fprintf(stderr, "brae rhoCentralFoam: NEGATIVE CONTROL `%s` -- deliberately wrong numerics\n", c);
         }

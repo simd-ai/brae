@@ -158,11 +158,22 @@ __global__ void patchFaceKernel(int nB, int nIF, bool tadmor, int ctrl, scalar d
     const int f = nIF + k;
     const FaceFlux o = centralFaceFlux(in, Sfx[f], Sfy[f], Sfz[f], magSf[f], tadmor, ctrl);
     store(o, O, k);
-    atomicAdd(&outflow[0], deltaT*o.phi);
-    atomicAdd(&outflow[1], deltaT*o.phiUx);
-    atomicAdd(&outflow[2], deltaT*o.phiUy);
-    atomicAdd(&outflow[3], deltaT*o.phiUz);
-    atomicAdd(&outflow[4], deltaT*o.phiEp);
+    // this step's sums (outflow[5..9]); outflowStepKernel adds them, times deltaT, to the run's totals as the host
+    // arm does. Adding every face straight into the run's total rounds each of ~1e7 additions at the TOTAL's scale:
+    // on the cone that was 7.6e-15 of y-momentum, the diagnostic's own error, against the host arm's 3e-17.
+    atomicAdd(&outflow[5], o.phi);
+    atomicAdd(&outflow[6], o.phiUx);
+    atomicAdd(&outflow[7], o.phiUy);
+    atomicAdd(&outflow[8], o.phiUz);
+    atomicAdd(&outflow[9], o.phiEp);
+}
+
+__global__ void outflowStepKernel(double* __restrict__ outflow, scalar deltaT)
+{
+    const int i = threadIdx.x;
+    if (i >= 5) return;
+    outflow[i] += deltaT*outflow[5 + i];
+    outflow[5 + i] = 0;
 }
 
 } // namespace
@@ -231,6 +242,8 @@ void centralFluxes(const DeviceMesh& dm, const Case& cs, int control, DeviceFiel
                                                  dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(), dm.magSf.data(), Bi, O,
                                                  outflow);
         cudaCheck(cudaGetLastError(), "rhoCentral patch faces");
+        outflowStepKernel<<<1, 32>>>(outflow, deltaT);
+        cudaCheck(cudaGetLastError(), "rhoCentral outflow");
     }
 }
 

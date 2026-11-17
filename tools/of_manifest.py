@@ -5083,10 +5083,10 @@ COMPONENTS = {
                   "walls bound throughout. Two round trips remain -- the batch coming back and the result "
                   "going out -- and the second needs a pinned staging buffer to go async."),
     ],
-    # rhoCentralFoam, EXPERIMENTAL (stage 1 2026-11-16; milestone B, adjustTimeStep, 2026-11-17): single GPU, static
-    # mesh, inviscid laminar, a fixed deltaT or adjustTimeStep, hePsiThermo + perfectGas + hConst + const,
-    # Kurganov/Tadmor, vanLeer/vanLeerV, zeroGradient/fixedValue/empty. Everything else is UNSUPPORTED and refused by
-    # name (tests/rho_central_refusals.sh). Not SIMPLE or PIMPLE: no pressure
+    # rhoCentralFoam, EXPERIMENTAL (stage 1 2026-11-16; milestone B, adjustTimeStep, and C, the transform patches,
+    # 2026-11-17): single GPU, static mesh, inviscid laminar, a fixed deltaT or adjustTimeStep, hePsiThermo +
+    # perfectGas + hConst + const, Kurganov/Tadmor, vanLeer/vanLeerV, zeroGradient/fixedValue/empty/slip/
+    # symmetryPlane/symmetry/wedge. Everything else is UNSUPPORTED and refused by name (tests/rho_central_refusals.sh). Not SIMPLE or PIMPLE: no pressure
     # equation; rho, rhoU, rhoE advance explicitly and p = rho/psi.
     "rhoCentralFoam": [
         dict(name="rhoCentralFoam_main", of_symbol="main", of_file="applications/solvers/compressible/rhoCentralFoam/rhoCentralFoam.C",
@@ -5103,8 +5103,13 @@ COMPONENTS = {
                         "OpenFOAM's figures the same to 1e-9. tests/rho_central_shocktube_vs_openfoam.sh -- the "
                         "tutorial AS SHIPPED (adjustTimeStep yes, maxCo 0.2): 142 steps, every deltaT and time name "
                         "identical to OpenFOAM's on both arms, U p T rho 3.1e-15 at all 7 write times; Tadmor and "
-                        "1000 cells likewise identical in deltaT. Does NOT claim viscous flow, 2-D waves or any "
-                        "patch type but zeroGradient and empty (fixedValue is implemented, not gated)."),
+                        "1000 cells likewise identical in deltaT; maxDeltaT binding and runTime/timeStep writes "
+                        "likewise. tests/rho_central_wedge_vs_openfoam.sh -- wedge15Ma5 and obliqueShock AS SHIPPED, "
+                        "a symmetry and a slip variant and an axisymmetric cone on wedge patches: OpenFOAM's step "
+                        "count, time names and directories; fields within ten times OpenFOAM's own decomposed spread "
+                        "at every write time and every early step; shock angles equal to OpenFOAM's. Does NOT claim "
+                        "viscous flow, 3-D, or patch types beyond zeroGradient, fixedValue, empty, slip, "
+                        "symmetryPlane, symmetry and wedge."),
         dict(name="createFields", of_symbol="createFields.H", of_file="applications/solvers/compressible/rhoCentralFoam/createFields.H",
              classification="HOST_ONLY", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralCreateFields_cpp.cu",
              validation="rho_central_sod_vs_openfoam (the whole run starts from it); includes heThermo::init and "
@@ -5154,9 +5159,26 @@ COMPONENTS = {
              classification="BOUNDARY_CONDITION", status="REIMPLEMENT", brae_existing="src/finiteVolume/fields/fv_patch_field.cuh (host patch fields); src/cuda/device_boundary.cuh deviceBCValue (device)",
              brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralPatchUpdate.cuh",
              brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralStep.cu",
-             note="zeroGradient and empty gated; fixedValue implemented, not gated. slip, symmetryPlane, wedge, "
-                  "inletOutlet, totalPressure, totalTemperature, waveTransmissive, maxwellSlipU, smoluchowskiJumpT "
-                  "UNSUPPORTED (refused)."),
+             validation="tests/rho_central_wedge_vs_openfoam.sh: wedge15Ma5 and obliqueShock as shipped (fixedValue "
+                        "inlets and top, zeroGradient outlets and obstacle, whose waves reach them); the Sod gate.",
+             note="zeroGradient, fixedValue and empty gated (wedge15Ma5, obliqueShock). inletOutlet, totalPressure, "
+                  "totalTemperature, waveTransmissive, partialSlip, maxwellSlipU, smoluchowskiJumpT UNSUPPORTED "
+                  "(refused). The transform patches: transformPatches."),
+        dict(name="transformPatches", of_symbol="symmetryPlane/symmetry/slip/wedge",
+             of_file="src/finiteVolume/fields/fvPatchFields/constraint/symmetryPlane/symmetryPlaneFvPatchField.C",
+             classification="BOUNDARY_CONDITION", status="REIMPLEMENT",
+             brae_existing="src/finiteVolume/fields/fv_patch_field.cuh (SymmetryPlanePatchField, WedgePatchField: "
+                           "the types, p's and T's values); src/OpenFOAM/meshes/wedge_patch.cuh (faceT)",
+             brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralPatchUpdate.cuh",
+             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralStep.cu",
+             validation="tests/rho_central_wedge_vs_openfoam.sh: symmetryPlane (wedge15Ma5, obliqueShock), slip on U "
+                        "(wedge15Ma5's 15-degree ramp) and on p and T, symmetry (top, bottom and ramp), wedge (a "
+                        "15-degree cone). Controls red: U unprojected; rhoU_b, rhoE_b by last step's rho_b.",
+             note="U's value is OpenFOAM's (iF + (I - 2.0*sqr(nHat)) & iF)/2.0 (nHat the patch's area-weighted "
+                  "normal on symmetryPlane, Sf/magSf per face on symmetry and slip) or faceT & iF, for both arms in "
+                  "transformPatchU. On a constraint mesh patch rho, rhoU and rhoE take the constraint type, so "
+                  ":233 and :267 multiply by the rho solve's new cell rho; a transform T makes he the same transform, "
+                  "e_b = e_P and THE seeded from T_b."),
         dict(name="setDeltaT", of_symbol="setDeltaT.H",
              of_file="src/finiteVolume/cfdTools/general/include/setDeltaT.H",
              classification="CONFIGURATION", status="REUSE_EXISTING",

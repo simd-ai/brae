@@ -10,9 +10,15 @@
 #           both logs print every step's deltaT and Courant numbers at round-trip precision. No numerics change.
 #   tad17   ship17 with fluxScheme Tadmor
 #   fine17  ship17 on 1000 cells
+#   mdt17   ship17 with maxDeltaT 3e-5: the cap BINDS (premise: more steps than ship17, at least 50 of them at the cap)
+#   rt17    ship17 with writeControl runTime: nothing trims deltaT to the write times, which land past them
+#   ts17    ship17 with writeControl timeStep, writeInterval 20
 # ARMS   (each brae against OpenFOAM serial on the same case)
 #   S  CUDA on ship     B  CUDA on ship17     H  host reference on ship17     T  CUDA on tad17     F  CUDA on fine17
-#   (and OpenFOAM decomposed in two on fine17, F's reference: see BOUND)
+#   M  CUDA on mdt17    MH host reference on mdt17    R  CUDA on rt17    K  CUDA on ts17
+#   (and OpenFOAM decomposed in two on fine17, F's reference: see BOUND). R and K: deltaT is not landed on a write
+#   time, so it carries the Courant number's last bits (setDeltaT.H's maxCo/(CoNum + SMALL)); their deltaT is held to
+#   BOUND at every step, not to the same digits.
 # CHECKS, per arm: the same number of steps; every step's deltaT printed with the same digits (deltaT is landed on the
 #   write times by adjustDeltaT, timeToNextWrite/round(nSteps), so it is the same number wherever the rounding agrees);
 #   every step's time name the same; the max Courant number within BOUND at every step; the same time directories
@@ -35,15 +41,17 @@
 #   amplify (1.9e-14 after 7000 steps). So the gate runs that decomposed reference itself, and F's bound at each write
 #   time (and for the max Courant number) is ten times OpenFOAM's serial-to-decomposed distance there, never below
 #   the Sod gate's 2e-13: the decade rule of the Sod bounds, on OpenFOAM's own spread.
+# F'S ABSOLUTE ERRORS  printed at every write time beside its relative bound: the largest |brae - OpenFOAM| per
+#   field in its own units, and OpenFOAM decomposed's (tests/rho_central_fields.py absdiff).
 # NOT CLAIMED  the mean Courant number (a sum: the device adds in another order; printed, not asserted), restart
-#   (uniform/time), writeControl runTime or timeStep under adjustTimeStep, function objects' trimming, any other
-#   tutorial, patches the waves reach (they do not by 0.007).
+#   (uniform/time), function objects' trimming, any other tutorial, patches the waves reach (they do not by 0.007).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BRAE_RCF_BIN:-$ROOT/build/brae_rhoCentralFoam}"
 CHECK="$ROOT/tests/check_fields.py"
 STEPS="$ROOT/tests/rho_central_steps.py"
 SOD="$ROOT/tests/rho_central_sod.py"
+FIELDS="$ROOT/tests/rho_central_fields.py"
 OFBASHRC=${OF_BASHRC:-${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}}
 TUT="${BRAE_OF_TUTORIALS:-/usr/lib/openfoam/openfoam2412/tutorials}/compressible/rhoCentralFoam/shockTube"
 [ -x "$BIN" ] || { echo "SKIP: no brae_rhoCentralFoam at $BIN"; exit 77; }
@@ -125,7 +133,15 @@ stage "$W/ship" || { echo "rho_central_shocktube_vs_openfoam: $passes passed, $f
 stage "$W/ship17" "" 17 || { echo "rho_central_shocktube_vs_openfoam: $passes passed, $fails failed"; exit 1; }
 stage "$W/fine17" 1000 17 || { echo "rho_central_shocktube_vs_openfoam: $passes passed, $fails failed"; exit 1; }
 copy "$W/ship17" "$W/tad17" Tadmor
-for c in ship ship17 tad17 fine17; do copy "$W/$c" "$W/of_$c"; ofrun "$W/of_$c"; done
+copy "$W/ship17" "$W/mdt17"
+sed -i -E 's/^(maxDeltaT\s+)\S+;/\13e-05;/' "$W/mdt17/system/controlDict"
+copy "$W/ship17" "$W/rt17"
+sed -i -E 's/^(writeControl\s+)\S+;/\1runTime;/' "$W/rt17/system/controlDict"
+copy "$W/ship17" "$W/ts17"
+sed -i -E 's/^(writeControl\s+)\S+;/\1timeStep;/; s/^(writeInterval\s+)\S+;/\120;/' "$W/ts17/system/controlDict"
+grep -qE '^maxDeltaT\s+3e-05;' "$W/mdt17/system/controlDict" && grep -qE '^writeControl\s+runTime;' "$W/rt17/system/controlDict" \
+    && grep -qE '^writeInterval\s+20;' "$W/ts17/system/controlDict" || fail "stage: the mdt17/rt17/ts17 edits"
+for c in ship ship17 tad17 fine17 mdt17 rt17 ts17; do copy "$W/$c" "$W/of_$c"; ofrun "$W/of_$c"; done
 # F's reference: OpenFOAM decomposed in two, the summation order at the processor faces its only change
 copy "$W/fine17" "$W/of_fine17_np2"
 printf '%s\n' 'FoamFile { version 2.0; format ascii; class dictionary; object decomposeParDict; }' \
@@ -137,6 +153,10 @@ copy "$W/ship17" "$W/bB"
 copy "$W/ship17" "$W/bH"
 copy "$W/tad17" "$W/bT"
 copy "$W/fine17" "$W/bF"
+copy "$W/mdt17" "$W/bM"
+copy "$W/mdt17" "$W/bMH"
+copy "$W/rt17" "$W/bR"
+copy "$W/ts17" "$W/bK"
 copy "$W/ship17" "$W/cX"
 copy "$W/ship17" "$W/cL"
 braerun "$W/bS"
@@ -144,6 +164,10 @@ braerun "$W/bB"
 braerun "$W/bH" BRAE_RHOCENTRALFOAM_ARM=cpu
 braerun "$W/bT"
 braerun "$W/bF"
+braerun "$W/bM"
+braerun "$W/bMH" BRAE_RHOCENTRALFOAM_ARM=cpu
+braerun "$W/bR"
+braerun "$W/bK"
 braerun "$W/cX" BRAE_CONTROL_RCF=untrimmed
 braerun "$W/cL" BRAE_CONTROL_RCF=laggedCourant
 
@@ -156,12 +180,41 @@ else
     fail "premise: OpenFOAM's deltaT does not vary as an adaptive run's does ($n steps, $distinct distinct, $dmin to $dmax, first $dfirst)"
 fi
 
-# arm <name> <brae dir> <OF dir> <bound> <field bound> [<OpenFOAM reference run>]: with a reference, each bound is ten
-# times the reference's distance from <OF dir> at that write time (and over the steps for the Courant number), never
-# below the given one
+# premises of the three B-gap cases: the cap binds; runTime's writes land off the interval; timeStep's every 20 steps
+read -r _ n17 _ <<< "$(python3 "$STEPS" summary "$W/of_ship17/log")"
+read -r _ nm _ _ _ _ _ dmaxm _ <<< "$(python3 "$STEPS" summary "$W/of_mdt17/log")"
+atcap=$(grep -E '^deltaT = ' "$W/of_mdt17/log" | awk '$3 >= 0.95*3e-5 {n++} END {print n+0}')
+if [ "${nm:-0}" -gt "${n17:-0}" ] && [ "$atcap" -ge 50 ]
+then
+    ok "premise M: maxDeltaT 3e-5 binds: OpenFOAM takes $nm steps (as shipped $n17), $atcap of them at the cap (largest $dmaxm, trimmed)"
+else
+    fail "premise M: maxDeltaT does not bind ($nm steps against $n17, $atcap at the cap)"
+fi
+tr_=$(times "$W/of_rt17")
+if python3 -c "
+import sys
+t = [float(x) for x in '$tr_'.split()]
+sys.exit(0 if len(t) >= 5 and all(abs(x/1e-3 - round(x/1e-3)) > 1e-6 for x in t) else 1)" 2> /dev/null
+then
+    ok "premise R: OpenFOAM's runTime writes land past the interval, untrimmed: $tr_"
+else
+    fail "premise R: runTime write times '$tr_'"
+fi
+read -r _ nk _ <<< "$(python3 "$STEPS" summary "$W/of_ts17/log")"
+if [ "$(times "$W/of_ts17" | wc -w)" = "$((nk / 20))" ] && [ $((nk % 20)) = 0 ]
+then
+    ok "premise K: OpenFOAM writes every 20 steps: $(times "$W/of_ts17" | wc -w) times over $nk steps"
+else
+    fail "premise K: $(times "$W/of_ts17" | wc -w) times over ${nk:-?} steps"
+fi
+
+# arm <name> <brae dir> <OF dir> <bound> <field bound> [<OpenFOAM reference run>|-] [exact|bound]: with a reference,
+# each bound is ten times the reference's distance from <OF dir> at that write time (and over the steps for the
+# Courant number), never below the given one. `bound`: every deltaT within <bound> instead of the same digits
 arm()
 {
-    local name=$1 b=$2 o=$3 bound=$4 fbound=$5 ref=${6:-}
+    local name=$1 b=$2 o=$3 bound=$4 fbound=$5 ref=${6:-} dtmode=${7:-exact}
+    [ "$ref" = - ] && ref=""
     python3 "$STEPS" compare "$b/log" "$o/log" > "$b/steps.cmp" 2>&1
     read -r nb no <<< "$(sed -n 's/^steps //p' "$b/steps.cmp")"
     read -r same wdt wdts <<< "$(sed -n 's/^deltaT //p' "$b/steps.cmp")"
@@ -175,9 +228,17 @@ arm()
         read -r rco _ <<< "$(sed -n 's/^maxCo //p' "$b/ref.steps.cmp")"
         bound=$(python3 -c "print('%.3e' % max(float('$bound'), 10*float('${rco:-nan}')))")
     fi
-    if [ -n "$nb" ] && [ "$nb" = "$no" ] && [ "$same" = "$nb" ] && [ "$names" = "$nb" ]
+    local dtok=0 dtnote="every deltaT and every time name the same"
+    [ "$same" = "$nb" ] && dtok=1
+    if [ "$dtmode" = bound ]
     then
-        ok "$name: $nb steps as OpenFOAM's; every deltaT and every time name the same"
+        dtok=0
+        le "$wdt" "$bound" && dtok=1
+        dtnote="every time name the same, every deltaT within $bound (worst $wdt at step $wdts; the same digits at $same)"
+    fi
+    if [ -n "$nb" ] && [ "$nb" = "$no" ] && [ "$dtok" = 1 ] && [ "$names" = "$nb" ]
+    then
+        ok "$name: $nb steps as OpenFOAM's; $dtnote"
     else
         fail "$name: ${nb:-?} steps against OpenFOAM's ${no:-?}; deltaT the same at ${same:-?} (worst ${wdt:-?} at step ${wdts:-?}), names at ${names:-?}"
     fi
@@ -227,6 +288,17 @@ arm "B (CUDA, writePrecision 17)" "$W/bB" "$W/of_ship17" "$BOUND" "$BOUND"
 arm "H (host reference, writePrecision 17)" "$W/bH" "$W/of_ship17" "$BOUND" "$BOUND"
 arm "T (CUDA, Tadmor)" "$W/bT" "$W/of_tad17" "$BOUND" "$BOUND"
 arm "F (CUDA, 1000 cells)" "$W/bF" "$W/of_fine17" "$BOUND_F" "$BOUND_F" "$W/of_fine17_np2"
+echo "     F absolute errors, max |brae - OpenFOAM| per field (OpenFOAM decomposed's in brackets):"
+for t in $(times "$W/of_fine17")
+do
+    python3 "$FIELDS" absdiff "$W/bF/$t" "$W/of_fine17/$t" > "$W/bF/$t.abs" 2>&1
+    python3 "$FIELDS" absdiff "$W/of_fine17_np2/$t" "$W/of_fine17/$t" > "$W/bF/$t.ref.abs" 2>&1
+    echo "       t = $t:$(paste -d' ' "$W/bF/$t.abs" "$W/bF/$t.ref.abs" | awk '{printf " %s %s [%s]", $2, $3, $8}') (U m/s, p Pa, T K, rho kg/m3)"
+done
+arm "M (CUDA, maxDeltaT 3e-5)" "$W/bM" "$W/of_mdt17" "$BOUND" "$BOUND"
+arm "MH (host reference, maxDeltaT 3e-5)" "$W/bMH" "$W/of_mdt17" "$BOUND" "$BOUND"
+arm "R (CUDA, writeControl runTime)" "$W/bR" "$W/of_rt17" "$BOUND" "$BOUND" - bound
+arm "K (CUDA, writeControl timeStep 20)" "$W/bK" "$W/of_ts17" "$BOUND" "$BOUND" - bound
 
 # controls
 tx=$(times "$W/cX"); to=$(times "$W/of_ship17")
@@ -247,7 +319,7 @@ else
 fi
 
 # conservation and positivity
-for d in bS bB bH bT bF
+for d in bS bB bH bT bF bM bMH bR bK
 do
     bal=$(sed -n 's/.*relative to the start totals: mass \([^ ]*\) energy \([^)]*\)).*/\1 \2/p' "$W/$d/log")
     mom=$(sed -n 's/^diag balance .* momentum \([^ ]*\) .*/\1/p' "$W/$d/log")
@@ -274,4 +346,4 @@ done
 echo "     runtime: OpenFOAM $(grep -h ExecutionTime "$W/of_ship17/log" | tail -n 1 | cut -c1-40) (100 cells), $(grep -h ExecutionTime "$W/of_fine17/log" | tail -n 1 | cut -c1-40) (1000)"
 for d in bB bH bF; do echo "     brae $d: $(sed -n 's/^diag steps //p' "$W/$d/log") $(sed -n 's/^diag device-memory/device memory/p' "$W/$d/log")"; done
 echo "rho_central_shocktube_vs_openfoam: $passes passed, $fails failed (work in $W)"
-[ "$fails" = 0 ] && [ "$passes" -ge 33 ]
+[ "$fails" = 0 ] && [ "$passes" -ge 60 ]

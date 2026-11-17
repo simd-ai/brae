@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# brae_rhoCentralFoam refuses, at start-up and by name, every input its first stage does not run -- on OpenFOAM
+# brae_rhoCentralFoam refuses, at start-up and by name, every input it does not run -- on OpenFOAM
 # v2412's own rhoCentralFoam tutorials and on single-edit variants of shockTube. Each row: a case, the edit, the
 # words the refusal must contain. A refusal must exit non-zero and write no time directory.
 #
 # The shipped tutorials run as shipped and stop on their first unported input; a row with `purgeWrite 0` steps past
-# that to show the next one is also named. What this does NOT show: that the refused inputs are rare (they are not --
-# every shipped tutorial but shockTube is refused today; ARCHITECTURE.md lists the order of the work).
+# that to show the next one is also named. wedge15Ma5 and obliqueShock run since milestone C and are compared in
+# tests/rho_central_wedge_vs_openfoam.sh; one row here checks OpenFOAM's pairing of constraint patch and field types
+# on wedge15Ma5. What this does NOT show: that the refused inputs are rare (they are not -- four of the seven shipped
+# tutorials are refused today; ARCHITECTURE.md lists the order of the work).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BRAE_RCF_BIN:-$ROOT/build/brae_rhoCentralFoam}"
@@ -51,10 +53,8 @@ row()
     fi
 }
 PURGE0='s/^(purgeWrite\s+)\S+;/\10;/'
-row wedge15Ma5_shipped wedge15Ma5 yes "is of type \`symmetryPlane\`"
 row forwardStep_shipped forwardStep no "purgeWrite 10"
-row forwardStep_purge0 forwardStep yes "is of type \`symmetryPlane\`" system/controlDict "$PURGE0"
-row obliqueShock_shipped obliqueShock yes "is of type \`symmetryPlane\`"
+row forwardStep_purge0 forwardStep yes "is \`inletOutlet\`" system/controlDict "$PURGE0"
 row biconic_shipped biconic25-55Run35 no "ddtSchemes resolves to \`localEuler\`"
 row LadenburgJet60psi_shipped LadenburgJet60psi no "thermoType transport is \`sutherland\`"
 row movingCone_shipped movingCone no "purgeWrite 5"
@@ -69,7 +69,11 @@ row sod_viscous shockTube no "transport mu is" \
     constant/thermophysicalProperties 's/^(\s*mu\s+)\S+;/\11.8e-05;/'
 row sod_RAS shockTube no "simulationType is \`RAS\`" \
     constant/turbulenceProperties 's/^(simulationType\s+)\S+;/\1RAS;/'
-row sod_slip shockTube yes "is \`slip\`" 0/U '/sides/,/\}/ s/zeroGradient/slip/'
+row sod_partialSlip shockTube yes "is \`partialSlip\`" 0/U '/sides/,/\}/ s/zeroGradient/partialSlip/'
+row sod_symmetryPlaneOnPatch shockTube yes "is \`symmetryPlane\` on a mesh patch of type \`patch\`" \
+    0/U '/sides/,/\}/ s/zeroGradient/symmetryPlane/'
+row wedge15Ma5_zeroGradientOnSymmetryPlane wedge15Ma5 yes \
+    "is \`zeroGradient\` on a mesh patch of type \`symmetryPlane\`" 0/p '/bottom/,/\}/ s/symmetryPlane/zeroGradient/'
 row sod_enthalpy shockTube no "energy is \`sensibleEnthalpy\`" \
     constant/thermophysicalProperties 's/sensibleInternalEnergy/sensibleEnthalpy/'
 row sod_clockTime shockTube no "writeControl \`clockTime\` is not ported" \

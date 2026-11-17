@@ -5,14 +5,16 @@
 // What runs (everything else is refused here, by name, before a field is read): single GPU, static mesh,
 // hePsiThermo + pureMixture + const + hConst + perfectGas + sensibleInternalEnergy, laminar with every mu = 0
 // (inviscid), Euler with a fixed deltaT or adjustTimeStep (setDeltaT.H on the central Courant number), purgeWrite 0, fluxScheme Kurganov or Tadmor (readFluxScheme.H),
-// reconstruct(rho|T) vanLeer and reconstruct(U) vanLeerV, Gauss linear gradients, zeroGradient / fixedValue / empty
-// patch fields on U, p and T.
+// reconstruct(rho|T) vanLeer and reconstruct(U) vanLeerV, Gauss linear gradients; on U, p and T the patch fields
+// zeroGradient, fixedValue, slip, and the constraint types empty, symmetryPlane, symmetry and wedge (milestone C) on
+// their own mesh patch types.
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "solution_directions.cuh"
 #include "rhoCentralThermo.cuh"
+#include "rhoCentralPatchUpdate.cuh"
 #include "run_clock.cuh"
 #include "time_controls.cuh"
 
@@ -46,6 +48,12 @@ struct Case
     std::vector<label> bCell;      // owner cell of boundary face k
     std::vector<int>   bPatch;     // patch of boundary face k
     std::vector<char>  bEmpty;     // 1 on an empty patch's face
+
+    // the transform patches (milestone C), face by face; see rhoCentralPatchUpdate.cuh for what each one changes
+    std::vector<char>   bRhoConstraint;   // 1: the mesh patch is symmetryPlane, symmetry or wedge
+    std::vector<char>   bTseedOwn;        // 1: T's patch field is a transform (its energy BC is the same transform)
+    std::vector<int>    bUTransform;      // transformNone, transformMirror (symmetry kinds, slip) or transformRotate
+    std::vector<tensor> bUR;              // I - 2.0*sqr(nHat) for a mirror, the wedge's faceT for a rotation
 };
 
 // Reads and checks the case; refuses everything outside this stage's scope by name, before any field is read.

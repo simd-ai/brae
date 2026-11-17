@@ -46,18 +46,22 @@ enum StatusBits : int
 };
 
 // NEGATIVE CONTROLS, for the gates only: deliberately wrong numerics a gate must see. Selected by BRAE_CONTROL_RCF,
-// announced on stderr. The first two are the device arm's; the clock's two run on either arm.
+// announced on stderr. The first two are the device arm's; the others run on either arm.
 //   upwind           every directed reconstruction with limiter 0: first-order upwind instead of vanLeer/vanLeerV
 //   noPressureJump   phiEp without its aSf*p_pos - aSf*p_neg term (rhoCentralFoam.C:208)
 //   untrimmed        setDeltaT.H's step without Time::adjustDeltaT: the write times are not landed on
 //   laggedCourant    setDeltaT.H fed the Courant number at the step before's deltaT, not at its own
+//   noTransform      U on symmetryPlane, symmetry, slip and wedge faces is the cell value (zeroGradient), unprojected
+//   laggedRhoB       rhoU_b and rhoE_b on constraint patches multiplied by last step's rho_b, not the solve's rho_P
 enum Control : int
 {
     controlNone = 0,
     controlUpwind = 1,
     controlNoPressureJump = 2,
     controlUntrimmed = 3,
-    controlLaggedCourant = 4
+    controlLaggedCourant = 4,
+    controlNoTransform = 5,
+    controlLaggedRhoB = 6
 };
 
 } // namespace rhoCentral

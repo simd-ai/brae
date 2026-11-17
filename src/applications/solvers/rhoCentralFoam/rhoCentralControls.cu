@@ -7,6 +7,7 @@
 #include "geometric_field.cuh"
 #include "scheme_parse.cuh"
 #include "start_time.cuh"
+#include "wedge_patch.cuh"
 
 #include <filesystem>
 #include <stdexcept>
@@ -17,6 +18,9 @@ namespace brae {
 namespace rhoCentral {
 
 namespace {
+
+constexpr scalar kSMALL = 1e-15;         // OpenFOAM's SMALL and ROOTVSMALL in double precision
+constexpr scalar kROOTVSMALL = 1e-150;
 
 [[noreturn]] void refuse(const std::string& what)
 {
@@ -62,11 +66,19 @@ std::string schemeStatement(const std::string& caseDir, const std::string& block
     return hit.empty() ? def : hit;
 }
 
+// The constraint patch types this stage runs: the mesh patch's type IS the patch field's (fvPatchFieldNew.C:
+// a constraint patch field is built only on its own patch type, and every field the solver derives -- rho, rhoU,
+// rhoE, e -- takes the constraint type there, calculatedFvPatchField or not).
+bool isTransformConstraint(const std::string& t) { return t == "symmetryPlane" || t == "symmetry" || t == "wedge"; }
+
 // Every patch of one field must name a patch-field type this stage runs; anything else is refused here, before a
 // field is built. The evaluation itself is brae's patch-field classes (fv_patch_field.cuh) through PatchFields.
+// Returns the types, patch by patch.
 template <typename T>
-void checkPatchFieldTypes(const FieldData<T>& fd, const std::vector<FvPatch>& patches, const std::string& field)
+std::vector<std::string> checkPatchFieldTypes(const FieldData<T>& fd, const std::vector<FvPatch>& patches,
+                                              const std::string& field)
 {
+    std::vector<std::string> types;
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const FvPatch& p = patches[pi];
@@ -74,18 +86,32 @@ void checkPatchFieldTypes(const FieldData<T>& fd, const std::vector<FvPatch>& pa
         const std::string type = d ? d->type : (p.type == "empty" ? std::string("empty") : std::string());
         if (type.empty())
             refuse("no boundaryField entry for patch '" + p.name + "' in " + field + ".");
-        if (type == "empty")
+        if (type == "empty" || isTransformConstraint(type) || isTransformConstraint(p.type) || p.type == "empty")
         {
-            if (p.type != "empty")
-                refuse(field + " patch '" + p.name + "' is `empty` on a mesh patch of type " + p.type + ".");
+            // OpenFOAM: symmetryPlaneFvPatchField.C:44-58 (and symmetry's, wedge's, empty's) refuse a constraint
+            // field on another patch type; GeometricBoundaryField refuses a non-constraint field on a constraint patch
+            if (type != p.type)
+                refuse(field + " patch '" + p.name + "' is `" + type + "` on a mesh patch of type `" + p.type
+                       + "`; OpenFOAM requires the two to be the same for empty, symmetryPlane, symmetry and wedge.");
         }
-        else if (type != "zeroGradient" && type != "fixedValue")
-            refuse(field + " patch '" + p.name + "' is `" + type + "`. This first stage runs zeroGradient, "
-                   "fixedValue and empty on U, p and T; slip, symmetryPlane, wedge, inletOutlet, totalPressure, "
-                   "totalTemperature, waveTransmissive, maxwellSlipU, smoluchowskiJumpT and the rest are not ported "
-                   "(applications/solvers/compressible/rhoCentralFoam/BCs, src/finiteVolume/fields/fvPatchFields). "
-                   "Refusing rather than run the patch as something else.");
+        else if (type != "zeroGradient" && type != "fixedValue" && type != "slip")
+            refuse(field + " patch '" + p.name + "' is `" + type + "`. This stage runs zeroGradient, fixedValue, "
+                   "slip, symmetryPlane, symmetry, wedge and empty on U, p and T; inletOutlet, totalPressure, "
+                   "totalTemperature, waveTransmissive, partialSlip, maxwellSlipU, smoluchowskiJumpT and the rest are "
+                   "not ported (applications/solvers/compressible/rhoCentralFoam/BCs, "
+                   "src/finiteVolume/fields/fvPatchFields). Refusing rather than run the patch as something else.");
+        types.push_back(type);
     }
+    return types;
+}
+
+// R = I - 2.0*sqr(nHat), as basicSymmetryFvPatchField.C:106-115 and symmetryPlaneFvPatchField.C:118-131 build it
+// for (iF + transform(R, iF))/2.0: sqr(n) = n*n, 2.0 times each component, I minus that.
+tensor mirrorTensor(const vector& n)
+{
+    return tensor{1.0 - 2.0*(n.x*n.x), -(2.0*(n.x*n.y)), -(2.0*(n.x*n.z)),
+                  -(2.0*(n.y*n.x)), 1.0 - 2.0*(n.y*n.y), -(2.0*(n.y*n.z)),
+                  -(2.0*(n.z*n.x)), -(2.0*(n.z*n.y)), 1.0 - 2.0*(n.z*n.z)};
 }
 
 } // namespace
@@ -257,9 +283,10 @@ Case readRhoCentralCase(const std::string& caseDir)
     cs.g.build(cs.m);
     cs.patches = buildPatches(cs.m, cs.g);
     for (const FvPatch& p : cs.patches)
-        if (p.type != "patch" && p.type != "wall" && p.type != "empty")
-            refuse("mesh patch '" + p.name + "' is of type `" + p.type + "`. This stage runs patch, wall and empty "
-                   "patches; symmetryPlane, symmetry, wedge, cyclic and processor patches are not ported.");
+        if (p.type != "patch" && p.type != "wall" && p.type != "empty" && !isTransformConstraint(p.type))
+            refuse("mesh patch '" + p.name + "' is of type `" + p.type + "`. This stage runs patch, wall, empty, "
+                   "symmetryPlane, symmetry and wedge patches; cyclic, cyclicAMI and processor patches are not "
+                   "ported.");
     cs.sd  = solutionDirections(cs.patches);
     cs.nC  = cs.m.nCells();
     cs.nIF = cs.m.nInternalFaces();
@@ -279,9 +306,70 @@ Case readRhoCentralCase(const std::string& caseDir)
 
     // ---- patch-field types ---------------------------------------------------------------------------------------------
     const std::string dir = caseDir + "/" + cs.startName;
-    checkPatchFieldTypes(readField<vector>(dir + "/U"), cs.patches, "U");
+    const std::vector<std::string> Utypes = checkPatchFieldTypes(readField<vector>(dir + "/U"), cs.patches, "U");
     checkPatchFieldTypes(readField<scalar>(dir + "/p"), cs.patches, "p");
-    checkPatchFieldTypes(readField<scalar>(dir + "/T"), cs.patches, "T");
+    const std::vector<std::string> Ttypes = checkPatchFieldTypes(readField<scalar>(dir + "/T"), cs.patches, "T");
+
+    // ---- the transform patches, face by face (rhoCentralPatchUpdate.cuh) -----------------------------------------------
+    cs.bRhoConstraint.assign(cs.nB, 0);
+    cs.bTseedOwn.assign(cs.nB, 0);
+    cs.bUTransform.assign(cs.nB, transformNone);
+    cs.bUR.assign(cs.nB, tensor{1, 0, 0, 0, 1, 0, 0, 0, 1});
+    label k0 = 0;
+    for (std::size_t pi = 0; pi < cs.patches.size(); ++pi)
+    {
+        const FvPatch& p = cs.patches[pi];
+        const std::string& Ut = Utypes[pi];
+        // symmetryPlanePolyPatch::calcGeometry (symmetryPlanePolyPatch.C:48-89): ONE normal, the area-weighted
+        // gSum(faceAreas).normalise(ROOTVSMALL), and a patch whose face normal leaves it by magSqr > SMALL refused
+        vector nPlane{0, 0, 0};
+        if (p.type == "symmetryPlane" && p.size)
+        {
+            const std::vector<vector>& Sf = cs.g.Sf();
+            vector s{0, 0, 0};
+            for (label i = 0; i < p.size; ++i) s = s + Sf[p.start + i];
+            const scalar ms = mag(s);
+            nPlane = (ms < kROOTVSMALL) ? vector{0, 0, 0} : vector{s.x/ms, s.y/ms, s.z/ms};
+            for (label i = 0; i < p.size; ++i)
+            {
+                const vector& a = Sf[p.start + i];
+                const scalar ma = mag(a);
+                if (ma > kROOTVSMALL && magSqr(nPlane - vector{a.x/ma, a.y/ma, a.z/ma}) > kSMALL)
+                    refuse("symmetryPlane patch '" + p.name + "' is not planar (symmetryPlanePolyPatch.C:68-87); "
+                           "OpenFOAM refuses it too and asks for a `symmetry` patch.");
+            }
+        }
+        tensor faceT{1, 0, 0, 0, 1, 0, 0, 0, 1};
+        if (p.type == "wedge" && p.size)
+        {
+            try
+            {
+                faceT = wedgeGeometry(p).faceT;   // wedgePolyPatch::calcGeometry, wedge_patch.cuh
+            }
+            catch (const std::exception& e)
+            {
+                refuse(e.what());
+            }
+        }
+        for (label i = 0; i < p.size; ++i)
+        {
+            const label k = k0 + i;
+            cs.bRhoConstraint[k] = isTransformConstraint(p.type) ? 1 : 0;
+            cs.bTseedOwn[k] = (isTransformConstraint(Ttypes[pi]) || Ttypes[pi] == "slip") ? 1 : 0;
+            if (Ut == "wedge")
+            {
+                cs.bUTransform[k] = transformRotate;
+                cs.bUR[k] = faceT;
+            }
+            else if (Ut == "symmetryPlane" || Ut == "symmetry" || Ut == "slip")
+            {
+                cs.bUTransform[k] = transformMirror;
+                // symmetryPlane: the patch's one normal; symmetry and slip: patch().nf() = Sf/magSf per face
+                cs.bUR[k] = mirrorTensor(Ut == "symmetryPlane" ? nPlane : p.nf[i]);
+            }
+        }
+        k0 += p.size;
+    }
     return cs;
 }
 

@@ -9,7 +9,7 @@ namespace cpu {
 namespace rhoCentral {
 
 std::unique_ptr<brae::rhoCentral::Arm> makeHostArm(const brae::rhoCentral::Case& cs, brae::rhoCentral::State& s,
-                                                   brae::rhoCentral::PatchFields& pf);
+                                                   brae::rhoCentral::PatchFields& pf, int control);
 
 } // namespace rhoCentral
 } // namespace cpu

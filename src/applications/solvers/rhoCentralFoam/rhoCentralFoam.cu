@@ -51,6 +51,15 @@ Integrals integrals(const Case& cs, const State& s)
         r.mom[0] += static_cast<long double>(V[i])*s.rhoU[i].x;
         r.mom[1] += static_cast<long double>(V[i])*s.rhoU[i].y;
         r.mom[2] += static_cast<long double>(V[i])*s.rhoU[i].z;
+        const auto ulp = [](scalar q) { const scalar a = std::fabs(q); return std::nextafter(a, 1e308) - a; };
+        r.ulpMass += static_cast<long double>(V[i])*ulp(s.rho[i]);
+        r.ulpEnergy += static_cast<long double>(V[i])*ulp(s.rhoE[i]);
+        // a momentum component's update sums fluxes of the whole vector's size (p*Sf, rhoU*phi), so its rounding is
+        // on |rhoU|'s scale -- a component near 0 (or an empty direction's, never solved) has no smaller one
+        const long double um = static_cast<long double>(V[i])*ulp(mag(s.rhoU[i]));
+        r.ulpMom[0] += um;
+        r.ulpMom[1] += um;
+        r.ulpMom[2] += um;
         r.minRho = std::min(r.minRho, s.rho[i]);
         r.maxRho = std::max(r.maxRho, s.rho[i]);
         r.minP = std::min(r.minP, s.p[i]);
@@ -108,7 +117,8 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
     printIntegrals("start", I0);
 
     const bool clockControl = control == controlUntrimmed || control == controlLaggedCourant;
-    if (control != controlNone && !clockControl && !onDevice)
+    const bool patchControl = control == controlNoTransform || control == controlLaggedRhoB;   // both arms
+    if (control != controlNone && !clockControl && !patchControl && !onDevice)
         throw std::runtime_error("BRAE_CONTROL_RCF upwind and noPressureJump are device-arm controls; the host "
                                  "reference has none.");
     if (clockControl && !tc.adjustTimeStep)
@@ -123,7 +133,7 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
     }
     else
     {
-        arm = cpu::rhoCentral::makeHostArm(cs, s, pf);
+        arm = cpu::rhoCentral::makeHostArm(cs, s, pf, patchControl ? control : controlNone);
     }
 
     // rhoCentralFoam.C:80-81: CoNum is 0 until the first step's centralCourantNo.H, so the first setDeltaT.H grows
@@ -208,6 +218,14 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
     std::printf("diag balance mass %.6Le energy %.6Le momentum %.6Le %.6Le %.6Le "
                 "(relative to the start totals: mass %.3Le energy %.3Le)\n",
                 eM, eE, eU[0], eU[1], eU[2], fabsl(eM)/fabsl(I0.mass), fabsl(eE)/fabsl(I0.energy));
+    // the round-off a conservative explicit update leaves: each cell's total is rounded a few times a step (the flux sum
+    // over V, times deltaT, added to the old value): four ulps of each cell's total a step, summed over the cells of
+    // the start or the end state, whichever sums larger. A non-conservative scheme misses by the fluxes' size.
+    const long double k = 4.0L*steps;
+    std::printf("diag roundoff mass %.3Le energy %.3Le momentum %.3Le %.3Le %.3Le (four ulps a cell a step)\n",
+                k*std::max(I0.ulpMass, I1.ulpMass), k*std::max(I0.ulpEnergy, I1.ulpEnergy),
+                k*std::max(I0.ulpMom[0], I1.ulpMom[0]), k*std::max(I0.ulpMom[1], I1.ulpMom[1]),
+                k*std::max(I0.ulpMom[2], I1.ulpMom[2]));
     std::printf("diag steps %ld step-seconds %.6f per-step-us %.3f cell-steps-per-second %.6e\n", steps, stepSeconds,
                 1e6*stepSeconds/(steps ? steps : 1), stepSeconds > 0 ? (double)cs.nC*steps/stepSeconds : 0.0);
     std::printf("End\n");

@@ -3,9 +3,11 @@
 // rhoCentralFoam.C, static mesh, !LTS, inviscid:
 //   102-210  fluxes                      centralFluxes (rhoCentralFlux_cpp.cu)
 //   222-286  cells                       the four stages of rhoCentralCellUpdate.cuh, a loop each
-//   232      U.correctBoundaryConditions brae's patch fields
+//   232      U.correctBoundaryConditions brae's patch fields; on a transform face transformPatchU
 //   233, 265-271  rhoU_b, e_b, T_b, psi_b, rhoE_b   updatePatchFace (rhoCentralPatchUpdate.cuh), with T's patches
-//                                        evaluated on the cells' old T, as the energy BCs' Tw.evaluate() sees them
+//                                        evaluated on the cells' old T, as the energy BCs' Tw.evaluate() sees them --
+//                                        or T_b itself where T is a transform; rho_b the new cell rho on a
+//                                        constraint patch (patchRhoMid)
 //   287-288  p.correctBoundaryConditions, rho_b = psi_b*p_b
 // Every cell update reads only its own cell and the fluxes, so all cells first and then all patches is the same
 // arithmetic as OpenFOAM's field-by-field order.
@@ -28,7 +30,8 @@ namespace {
 class HostArm final : public Arm
 {
 public:
-    HostArm(const Case& cs, State& s, PatchFields& pf) : cs_(cs), s_(s), pf_(pf), TfixesValue_(cs.nB)
+    HostArm(const Case& cs, State& s, PatchFields& pf, int control)
+        : cs_(cs), s_(s), pf_(pf), control_(control), TfixesValue_(cs.nB)
     {
         for (label k = 0; k < cs.nB; ++k) TfixesValue_[k] = pf.T.boundary[cs.bPatch[k]]->fixesValue() ? 1 : 0;
     }
@@ -79,11 +82,17 @@ public:
         }
 
         evaluatePatches(pf_.U, s.U, cs, s.UB);       // :232
+        for (label k = 0; k < cs.nB; ++k)            // ...a transform face in OpenFOAM's arithmetic, as the device's
+            if (cs.bUTransform[k])
+                s.UB[k] = transformPatchU(cs.bUTransform[k], cs.bUR[k], s.U[cs.bCell[k]], control_);
         evaluatePatches(pf_.T, Told_, cs, TbEval_);  // :265, Tw.evaluate() inside the energy BCs
         for (label k = 0; k < cs.nB; ++k)
         {
-            const PatchNew b = updatePatchFace(TfixesValue_[k], s.rhoB[k], s.UB[k].x, s.UB[k].y, s.UB[k].z,
-                                               s.e[cs.bCell[k]], TbEval_[k], s.pB[k], cs.gas);
+            const label c = cs.bCell[k];
+            const PatchNew b = updatePatchFace(TfixesValue_[k],
+                                               patchRhoMid(cs.bRhoConstraint[k], s.rho[c], s.rhoB[k], control_),
+                                               s.UB[k].x, s.UB[k].y, s.UB[k].z, s.e[c],
+                                               cs.bTseedOwn[k] ? s.TB[k] : TbEval_[k], s.pB[k], cs.gas);
             s.rhoUB[k] = vector{b.rhoUx, b.rhoUy, b.rhoUz};
             s.eB[k] = b.e;
             s.TB[k] = b.T;
@@ -117,6 +126,7 @@ private:
     const Case& cs_;
     State& s_;
     PatchFields& pf_;
+    int control_;
     std::vector<int> TfixesValue_;
     std::vector<scalar> Told_, TbEval_;
     std::vector<StepReport> reports_;
@@ -126,9 +136,9 @@ private:
 
 } // namespace
 
-std::unique_ptr<Arm> makeHostArm(const Case& cs, State& s, PatchFields& pf)
+std::unique_ptr<Arm> makeHostArm(const Case& cs, State& s, PatchFields& pf, int control)
 {
-    return std::make_unique<HostArm>(cs, s, pf);
+    return std::make_unique<HostArm>(cs, s, pf, control);
 }
 
 } // namespace rhoCentral

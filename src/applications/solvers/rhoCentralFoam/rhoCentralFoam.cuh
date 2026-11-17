@@ -39,6 +39,10 @@ struct Integrals
     long double mom[3] = {0, 0, 0};
     scalar minRho = 0, minP = 0, minT = 0, minE = 0;
     scalar maxRho = 0, maxP = 0, maxT = 0, maxMagU = 0;
+    // sum over the cells of ulp(|q|)*V: one unit in the last place of each cell's total, the scale of one rounding
+    // of the conservative update (diag roundoff); for momentum, of |rhoU| in every component
+    long double ulpMass = 0, ulpEnergy = 0;
+    long double ulpMom[3] = {0, 0, 0};
 };
 Integrals integrals(const Case& cs, const State& s);
 

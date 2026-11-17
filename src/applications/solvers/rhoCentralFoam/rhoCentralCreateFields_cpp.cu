@@ -30,6 +30,8 @@ State createFields(const Case& cs, PatchFields& pf)
     evaluatePatches(pf.p, s.p, cs, s.pB);
     evaluatePatches(pf.T, s.T, cs, s.TB);
     evaluatePatches(pf.U, s.U, cs, s.UB);
+    for (label k = 0; k < cs.nB; ++k)   // a transform face's construction-time evaluate, in OpenFOAM's arithmetic
+        if (cs.bUTransform[k]) s.UB[k] = transformPatchU(cs.bUTransform[k], cs.bUR[k], s.U[cs.bCell[k]], controlNone);
 
     // heThermo::init (heThermo.C:58-90): he from (p, T) on cells and patches. heBoundaryCorrection sets a
     // gradientEnergy patch's gradient to snGrad(he), which every later evaluate recomputes before use.

@@ -35,8 +35,9 @@ struct DeviceFluxes
     void allocate(int nC, int nIF, int nB);
 };
 
-// rhoCentralFoam.C:102-210 on the device. `outflow` (5 doubles) accumulates deltaT * the patch-face fluxes of
-// phi, phiUp and phiEp (diagnostics only; atomics, so not bit-reproducible, and never fed back).
+// rhoCentralFoam.C:102-210 on the device. `outflow` (10 doubles: the run's totals, then one step's sums) accumulates
+// deltaT * the patch-face fluxes of phi, phiUp and phiEp, a step at a time as the host arm does (diagnostics only;
+// atomics, so not bit-reproducible, and never fed back).
 void centralFluxes(const DeviceMesh& dm, const Case& cs, int control, DeviceFields& F, DeviceFluxes& X,
                    double* outflow, scalar deltaT);
 

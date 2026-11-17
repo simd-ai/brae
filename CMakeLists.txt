@@ -2271,7 +2271,8 @@ target_include_directories(brae_rhoSimpleFoam PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(brae_rhoSimpleFoam PRIVATE brae_core)
 
 # brae_rhoCentralFoam: density-based compressible (central-upwind, Kurganov/Tadmor), EXPERIMENTAL: inviscid,
-# laminar, perfectGas+hConst, a fixed deltaT or adjustTimeStep, static mesh. The host reference (rhoCentralStep_cpp.cu)
+# laminar, perfectGas+hConst, a fixed deltaT or adjustTimeStep, static mesh; symmetryPlane, symmetry, slip and wedge
+# patches since milestone C (tests/rho_central_wedge_vs_openfoam.sh). The host reference (rhoCentralStep_cpp.cu)
 # and the CUDA arm (rhoCentralStep.cu) share the case and the loop (rhoCentralFoam.cu); tests/rho_central_sod_vs_openfoam.sh
 # (a fixed deltaT) and tests/rho_central_shocktube_vs_openfoam.sh (the tutorial as shipped) hold both to OpenFOAM
 # v2412 on the shockTube tutorial. Layout: src/applications/solvers/rhoCentralFoam/ARCHITECTURE.md.
@@ -2293,6 +2294,10 @@ set_tests_properties(rho_central_sod_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 
 add_test(NAME rho_central_shocktube_vs_openfoam
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_shocktube_vs_openfoam.sh)
 set_tests_properties(rho_central_shocktube_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_test(NAME rho_central_wedge_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_wedge_vs_openfoam.sh)
+set_tests_properties(rho_central_wedge_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 2400
                      ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 add_test(NAME rho_central_refusals
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_refusals.sh)

@@ -5,7 +5,7 @@ implicit viscous correctors), its central-upwind flux assembly and its time loop
 boundary conditions, thermo, gradients, linear smoothers and time controls. Nothing here goes through SIMPLE, PIMPLE or
 rhoSimpleFoam's pressure correction, and there is no pressure equation: p = rho/psi.
 
-## 1. OpenFOAM's structure, and where each part lives in brae (after milestone B)
+## 1. OpenFOAM's structure, and where each part lives in brae (after milestone C)
 
 The reference is OpenFOAM v2412 `applications/solvers/compressible/rhoCentralFoam`. In the table, (H) marks the host
 reference (namespace `brae::cpu::rhoCentral`), (D) the device arm (namespace `brae::gpu::rhoCentral`), and (HD)
@@ -21,11 +21,12 @@ BRAE_HD code both arms run (namespace `brae::rhoCentral`).
 | lines 102-210 + `directionInterpolate.H`: reconstruction and fluxes; `centralCourantNo.H`; fvc::div | `rhoCentralFlux_cpp.cuh/.cu` (H), `rhoCentralFlux.cuh/.cu` (D) | gradients, limited directed interpolation, face fluxes |
 | the face flux (114-210) | `rhoCentralFaceFlux.cuh` (HD) | written once |
 | 222-286, cell half: rho, rhoU, U, rhoE, e, thermo.correct, p | `rhoCentralCellUpdate.cuh` (HD) | four stages (momentum, energy, thermo, pressure) |
-| 232-288, patch half | `rhoCentralPatchUpdate.cuh` (HD), with brae's patch fields | rhoU_b, e_b, T_b, psi_b, rhoE_b; then p_b and rho_b |
+| 232-288, patch half | `rhoCentralPatchUpdate.cuh` (HD), with brae's patch fields | rhoU_b, e_b, T_b, psi_b, rhoE_b; then p_b and rho_b; the transform patches' U (`transformPatchU`) and constraint-patch rho_b (`patchRhoMid`) |
+| constraint and transform patches: symmetryPlane, symmetry, slip, wedge (milestone C) | `rhoCentralControls.cu` (per-face data on the `Case`), the patch half above | sec. 5e |
 | one step, composed | `rhoCentralStep_cpp.cuh/.cu` (H), `rhoCentralStep.cuh/.cu` (D) | the two `Arm`s |
 | hePsiThermo + hConst + perfectGas | `rhoCentralThermo.cuh` (HD) | Es, Cv, psi, the Newton e -> T loop |
 
-Planned, not built yet: the constraint and transform BCs (C), the
+Planned, not built yet: the
 viscous correctors (G), `setRDeltaT` (I), the solver's own `BCs/` (maxwellSlipU, smoluchowskiJumpT; G, I),
 turbulence (J) and mesh motion (K). Each goes into the module of its OpenFOAM counterpart above, or a new one beside
 it.
@@ -82,7 +83,13 @@ download()  the state, for a write (the device arm copies it back; the host arm'
 - `thermo_parse`'s silent defaults (molWeight, Cp, Pr, mu, As, Ts);
 - `setInitialDeltaT`;
 - brae's `assignable()` on symmetry and wedge (use `ofAssignmentWritesValue()`);
-- the per-face normal on symmetryPlane: OpenFOAM uses the patch-averaged normal;
+- the per-face normal on symmetryPlane: OpenFOAM uses the patch-averaged normal (done in C: `Case::bUR`);
+- U's value on a transform patch from the shared classes: the host's `SymmetryPlanePatchField` evaluates
+  `v - (n.v) n` and the device's mixed slot `|n_k| ref_k + (1 - |n_k|) v_k` with `ref` refreshed by
+  `deviceUpdateSymmetry` -- the same number, rounded differently on each arm and lagged on the device, which is right
+  for the segregated solvers that own them. rhoCentralFoam evaluates OpenFOAM's `(iF + (I - 2nn)&iF)/2` and
+  `faceT & iF` once, in `transformPatchU`, for both arms (sec. 5e). The classes still build p's and T's patches, and
+  `wedgeGeometry` gives faceT;
 - the writer dropping BC keys (psi, gamma, fieldInf, lInf, T0), so OpenFOAM can restart from brae's output.
 
 ## 4. Boundary values within a step (OpenFOAM's order, rhoCentralFoam.C)
@@ -230,9 +237,42 @@ Gates for the transition:
   - on 1000 cells this run amplifies round-off, OpenFOAM's own too: OpenFOAM decomposed in two is 6.9e-12 from
     OpenFOAM serial at 0.007, brae 6.3e-12. The gate (`tests/rho_central_shocktube_vs_openfoam.sh`) holds that arm to
     ten times OpenFOAM's own spread, measured in the same run.
-- **Not gated:** a restart's `uniform/time` deltaT and index are read as `Time::setControls` reads them, but brae
-  writes no `uniform/time` yet and no restart is compared (milestone E); writeControl runTime and timeStep under
-  adjustTimeStep; the function objects' trimming (no rhoCentralFoam tutorial has one).
+- **Gated since C:** maxDeltaT binding (3e-5 on shockTube: 226 of 244 steps at the cap, every deltaT the same as
+  OpenFOAM's); writeControl runTime and timeStep under adjustTimeStep (no trimming, so deltaT carries the Courant
+  number's last bits: within 3.0e-15 of OpenFOAM's at every step, every time name the same); a start from OpenFOAM's
+  own `uniform/time` (the C gate's rs7 arm).
+- **Not gated:** a restart from brae's own output (brae writes no `uniform/time` yet; milestone E); the function
+  objects' trimming (no rhoCentralFoam tutorial has one).
+
+## 5e. Milestone C: the transform patches
+
+- **What runs:** mesh patches symmetryPlane, symmetry and wedge with their own patch-field types on U, p and T (a
+  constraint field on another patch type, or another field type on a constraint patch, is refused as OpenFOAM refuses
+  it); `slip` on U, p or T of a plain patch. A symmetryPlane that is not planar is refused (symmetryPlanePolyPatch.C).
+- **The per-face data** (`rhoCentralControls.cu`, on the `Case`): `bUTransform` and `bUR` -- for a mirror
+  R = I - 2.0*sqr(nHat) as OpenFOAM builds it, nHat the patch's one area-weighted normal on a symmetryPlane and
+  Sf/magSf per face on symmetry and slip; for a wedge, faceT from the shared `wedgeGeometry`. `bRhoConstraint`: the
+  mesh patch is a constraint type. `bTseedOwn`: T's patch field is a transform.
+- **What changes in the step** (sec. 4, `rhoCentralPatchUpdate.cuh`), both arms through the same BRAE_HD functions:
+  - U at 232 on a transform face: `transformPatchU`, from the new cell U;
+  - 233 and 267 multiply by rho_b as it stands there: on a constraint patch the rho solve's correctBoundaryConditions
+    has set it to the NEW cell rho (`patchRhoMid`); elsewhere it is last step's psi_b*p_b;
+  - 265-266 on a patch whose T is a transform: he takes T's type (basicThermo::heBoundaryTypes), so e_b = e_P with no
+    Tw.evaluate(), and THE is seeded with T_b as the last thermo.correct() left it.
+  - p (287) and rho_b (288) as before: a scalar transform is the cell value.
+- **Measured** (`tests/rho_central_wedge_vs_openfoam.sh`): wedge15Ma5 and obliqueShock as shipped, a `symmetry`
+  variant, `slip` on p and T, and an axisymmetric 15-degree cone on `wedge` patches (`tests/rho_central_cases.py`):
+  - every step's time name, deltaT and file the same as OpenFOAM's; fields within ten times OpenFOAM's own
+    serial-to-decomposed spread at every write time; restarted from OpenFOAM's own developed obliqueShock at t = 7,
+    2.0e-13 from OpenFOAM after one step (OpenFOAM decomposed in four: 1.6e-13);
+  - these runs amplify round-off, OpenFOAM's own too (a Mach 5 shock and the e -> T inversion at T = 1 against
+    Tstd = 298.15): OpenFOAM decomposed is 7e-06 from serial on wedge15Ma5 by t = 0.14, brae 7.0e-06;
+  - shock angles brae = OpenFOAM to 1e-6 degrees: wedge 24.61 (theory 24.32), cone 19.76 (Taylor-Maccoll 20.03),
+    obliqueShock incident 29.64 and reflected 23.41 (29.00, 23.28), meeting the wall at x = 1.796 (1.804);
+  - controls red: U unprojected on the transform faces (0.3 of the field), rhoU_b and rhoE_b by last step's rho_b on
+    the constraint patches (2e-03 on obliqueShock, 5e-04 on the cone; not visible on wedge15Ma5, whose symmetry planes
+    see only the uniform stream).
+- **Not gated:** viscous flow on these patches; 3-D; a symmetryPlane or wedge split over processors.
 
 ## 6. Milestones, each closed by a gate against OpenFOAM v2412
 
@@ -245,7 +285,7 @@ Every gate:
 |---|---|---|
 | A | restructure into the modules above; brae BC classes; shared limiter library; driver + Stepper | the Sod gate and the refusals unchanged |
 | B (done) | adjustTimeStep: setDeltaT, adjustable writes, first step x1.2, restart deltaT | shockTube **as shipped**: the deltaT sequence and fields |
-| C | constraint and transform BCs: symmetryPlane, symmetry, slip, wedge, with the conservative-state patch semantics of sec. 4 | wedge15Ma5 as shipped; obliqueShock as shipped (shock angle against theta-beta-M) |
+| C (done) | constraint and transform BCs: symmetryPlane, symmetry, slip, wedge, with the conservative-state patch semantics of sec. 4 | wedge15Ma5 as shipped; obliqueShock as shipped (shock angle against theta-beta-M); a symmetry and a slip variant; an axisymmetric cone on wedge patches |
 | D | inletOutlet (U, T -> mixedEnergy) and purgeWrite (refused by name since B) | forwardStep as shipped |
 | E | restart: startFrom latestTime, `uniform/time`, the writer keeping BC keys | stop/restart against the continuous run and against OpenFOAM's own restart |
 | F | other Riemann problems and limiters (the vanAlbada, Minmod, MUSCL, limitedLinear family) | Lax, 123 and a strong shock tube: brae against OpenFOAM and the exact solution |
