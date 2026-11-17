@@ -237,8 +237,11 @@ class DeviceArm final : public Arm
 public:
     DeviceArm(const Case& cs, const State& s0, PatchFields& pf, int control) : cs_(cs), control_(control)
     {
-        size_t free0 = 0, total = 0;
-        cudaCheck(cudaMemGetInfo(&free0, &total), "memGetInfo");
+        // the device memory the arm holds: what brae's device pool took from the driver to build it (every DeviceBuffer
+        // goes through it). Not cudaMemGetInfo's free memory: on the GB10's unified memory that moves with every host
+        // allocation: it read 0 and 303 MiB on wedge15Ma5 refined to 307,200 and 76,800 cells, which the pool puts at
+        // 898.5 and 224.6 MiB.
+        const std::size_t pool0 = brae::detail::devicePool().mallocBytes() - brae::detail::devicePool().freedBytes();
         const int nC = cs.nC, nB = cs.nB;
         dm_ = buildDeviceMesh(cs.m, cs.g, cs.patches);
         if (dm_.nBndFaces != cs.nB || dm_.nInternalFaces != cs.nIF)
@@ -298,9 +301,7 @@ public:
         cudaCheck(cudaMallocHost(&hostStatus_, kReportWindow*sizeof(int)), "pinned status");
         outflow_.copyFrom(std::vector<double>(10, 0.0));   // the run's totals, then this step's sums
         cudaCheck(cudaDeviceSynchronize(), "rhoCentralFoam upload");
-        size_t free1 = 0;
-        cudaCheck(cudaMemGetInfo(&free1, &total), "memGetInfo");
-        bytes_ = (free0 > free1) ? (free0 - free1) : 0;
+        bytes_ = brae::detail::devicePool().mallocBytes() - brae::detail::devicePool().freedBytes() - pool0;
     }
 
     void step(scalar deltaT) override
