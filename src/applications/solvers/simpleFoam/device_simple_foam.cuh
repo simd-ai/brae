@@ -689,7 +689,7 @@ public:
         {
             // dbP_.p0 is in DeviceBoundary face order, which SKIPS the coupled patches -- so the running
             // offset has to skip them too, or every entry after a cyclic/AMI patch addresses the wrong faces.
-            if (isCoupledInterfaceType(fp.type)) continue;
+            if (isCyclicFamilyType(fp.type)) continue;
             for (const auto& b : pFd.boundary)
             {
                 if (b.name != fp.name || !b.hasP0Function1) continue;

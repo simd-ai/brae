@@ -1,11 +1,13 @@
 // cf GPU offload (G1): the device lduMatrix SpMV kernel (Amul). One thread per cell gathers the diagonal and
 // then its faces in increasing face order -- OpenFOAM's face loop's order per cell -- race-free, deterministic.
 #include "device_ldu.cuh"
-#include "device_halo.cuh"
-#include "distributed_ami.cuh"   // DistributedAMI + distributedAmiAmul: optional cyclicAMI coupling in the matvec
+#include "device_blas.cuh"        // the hooks' counters
+#include "proc_hooks.cuh"        // ProcComm + the hooks' channel (processor-interface coupling of a decomposed mesh)
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
+#include <string>
 
 namespace brae {
 
@@ -201,6 +203,143 @@ void amiResidualKernel(
     }
     atomicAdd(&rA[own[i]], -__dmul_rn(ifc[i], s));
 }
+
+// processor-interface off-diagonal (DeviceProcView): one thread per processor face, Apsi[faceCell] += coeff*x[nbr].
+// One of a cell's faces per launch (rank), in face order, so no atomics and a fixed summation order.
+__global__
+void procAmulKernel(
+    int nFaces,
+    const label* __restrict__ faceCell,
+    const label* __restrict__ nbrIdx,
+    const scalar* __restrict__ coeff,
+    const label* __restrict__ rank,
+    int pass,
+    const scalar* __restrict__ x,
+    scalar* __restrict__ Apsi)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nFaces) return;
+    if (rank && rank[i] != pass) return;
+    Apsi[faceCell[i]] += coeff[i] * x[nbrIdx[i]];
+}
+
+// ...and its share of lduMatrix::residual: every product rounded before it is subtracted (see residualKernel)
+__global__
+void procResidualKernel(
+    int nFaces,
+    const label* __restrict__ faceCell,
+    const label* __restrict__ nbrIdx,
+    const scalar* __restrict__ coeff,
+    const label* __restrict__ rank,
+    int pass,
+    const scalar* __restrict__ x,
+    scalar* __restrict__ rA)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nFaces) return;
+    if (rank && rank[i] != pass) return;
+    rA[faceCell[i]] = __dsub_rn(rA[faceCell[i]], __dmul_rn(coeff[i], x[nbrIdx[i]]));
+}
+
+// y[c] = b[c], then y[faceCell] -= coeff*x[nbr] in face order: the frozen-halo bPrime of symGaussSeidel
+__global__
+void procRhsKernel(
+    int nFaces,
+    const label* __restrict__ faceCell,
+    const label* __restrict__ nbrIdx,
+    const scalar* __restrict__ coeff,
+    const label* __restrict__ rank,
+    int pass,
+    const scalar* __restrict__ x,
+    scalar* __restrict__ bEff)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nFaces) return;
+    if (rank && rank[i] != pass) return;
+    bEff[faceCell[i]] = __dsub_rn(bEff[faceCell[i]], __dmul_rn(coeff[i], x[nbrIdx[i]]));
+}
+
+// THE SAME THREE PRODUCTS IN ONE LAUNCH (DeviceProcView::cellList): one thread a cell that owns processor faces, which
+// walks its faces in face order -- the order the launches a place reach them in, so every cell's additions are the
+// same operations in the same sequence, to the bit (BRAE_CONTROL_PROC_PER_PLACE_LAUNCH=1 keeps the launches a place).
+// A cell has up to nRanks faces and a rank usually has seven neighbours: seven launches of 2 us each, and their
+// dependency gaps, per product, in a latency-bound iteration.
+__global__
+void procAmulFusedKernel(
+    int nCellsWith,
+    const label* __restrict__ cellList,
+    const label* __restrict__ cellStart,
+    const label* __restrict__ perm,
+    const label* __restrict__ nbrIdx,
+    const scalar* __restrict__ coeff,
+    const scalar* __restrict__ x,
+    scalar* __restrict__ Apsi)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nCellsWith) return;
+    const label c = cellList[i];
+    scalar s = Apsi[c];
+    for (label k = cellStart[c]; k < cellStart[c + 1]; ++k)
+    {
+        const label j = perm[k];
+        s += coeff[j] * x[nbrIdx[j]];
+    }
+    Apsi[c] = s;
+}
+
+__global__
+void procSubFusedKernel(
+    int nCellsWith,
+    const label* __restrict__ cellList,
+    const label* __restrict__ cellStart,
+    const label* __restrict__ perm,
+    const label* __restrict__ nbrIdx,
+    const scalar* __restrict__ coeff,
+    const scalar* __restrict__ x,
+    scalar* __restrict__ y)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nCellsWith) return;
+    const label c = cellList[i];
+    scalar s = y[c];
+    for (label k = cellStart[c]; k < cellStart[c + 1]; ++k)
+    {
+        const label j = perm[k];
+        s = __dsub_rn(s, __dmul_rn(coeff[j], x[nbrIdx[j]]));
+    }
+    y[c] = s;
+}
+
+template <class Kernel, class Fused>
+inline void launchProcFaces(Kernel k, Fused fused, const DeviceProcView& p, const scalar* x, scalar* y)
+{
+    if (p.nFaces <= 0) return;
+    if (p.cellList && p.nCellsWith > 0)
+    {
+        fused<<<(p.nCellsWith + TPB - 1)/TPB, TPB>>>(p.nCellsWith, p.cellList, p.cellStart, p.perm, p.nbrIdx, p.coeff, x, y);
+        cudaCheck(cudaGetLastError(), "proc interface, fused");
+        return;
+    }
+    if (p.passStart && !std::getenv("BRAE_PROC_FULL_FACE_LAUNCH"))
+    {
+        // Stable pass-grouped arrays: the same faces in the same per-cell order as the filtered launch, but the
+        // grid covers only the pass's contiguous range. Empty passes issue no launch.
+        for (int pass = 0; pass < p.nRanks; ++pass)
+        {
+            const int first = p.passFirst[pass], count = p.passFirst[pass + 1] - first;
+            if (count > 0)
+                k<<<(count + TPB - 1)/TPB, TPB>>>(count, p.faceCell + first, p.nbrIdx + first,
+                                                  p.coeff + first, nullptr, 0, x, y);
+        }
+        return;
+    }
+    for (int pass = 0; pass < p.nRanks; ++pass)
+    {
+        k<<<(p.nFaces + TPB - 1) / TPB, TPB>>>(p.nFaces, p.faceCell, p.nbrIdx, p.coeff,
+                                              p.nRanks > 1 ? p.rank : nullptr, pass, x, y);
+    }
+    cudaCheck(cudaGetLastError(), "proc interface");
+}
 } // namespace
 
 
@@ -228,6 +367,7 @@ void deviceResidual(
     bool onField)
 {
     rA.resize(A.nCells);
+    if (A.proc.active()) deviceProcExchange(A.proc, psi);     // halo of psi, then the interface term below
     const int blocks = (A.nCells + TPB - 1) / TPB;
     residualKernel<<<blocks, TPB>>>(A.nCells, A.diag, A.upper, A.lower, A.nei, A.owner,
                                     A.ownerStart, A.losort, A.losortStart, psi.data(), source.data(), rA.data());
@@ -253,6 +393,7 @@ void deviceResidual(
         }
         cudaCheck(cudaGetLastError(), "amiResidual");
     }
+    if (A.proc.active()) launchProcFaces(procResidualKernel, procSubFusedKernel, A.proc, psi.data(), rA.data());
 }
 
 
@@ -273,10 +414,12 @@ void deviceResidual(
 // and the coalescing won; in FP64 it trades 21 MB for 42 on top of a refill pass, and the extra bytes
 // eat the gain. The cost here is bandwidth, and a layout that doubles the bytes cannot fix bandwidth.
 
-void deviceAmul(const DeviceLduView& A, const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi,
-                bool onField)
+namespace {
+void amulImpl(const DeviceLduView& A, const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi, bool onField,
+              bool exchange)
 {
     Apsi.resize(A.nCells);
+    if (exchange && A.proc.active()) deviceProcExchange(A.proc, psi);   // halo of psi, then the interface term below
     const int blocks = (A.nCells + TPB - 1) / TPB;
     amulKernel<<<blocks, TPB>>>(A.nCells, A.diag, A.upper, A.lower, A.nei, A.owner,
                                 A.ownerStart, A.losort, A.losortStart, psi.data(), Apsi.data());
@@ -302,24 +445,51 @@ void deviceAmul(const DeviceLduView& A, const DeviceBuffer<scalar>& psi, DeviceB
         }
         cudaCheck(cudaGetLastError(), "amiAmul");
     }
+    if (A.proc.active()) launchProcFaces(procAmulKernel, procAmulFusedKernel, A.proc, psi.data(), Apsi.data());
+}
+} // namespace
+
+void deviceAmul(const DeviceLduView& A, const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi,
+                bool onField)
+{
+    amulImpl(A, psi, Apsi, onField, true);
 }
 
-// Distributed product: overlap the halo transfer with the local product, then apply the interface coupling.
-// Same ordering as host parallelAmul (post -> local -> wait -> update), all on the per-thread default stream.
-void deviceParallelAmul(
-    const DeviceLduView& A,
-    DeviceHalo& halo,
-    const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
-    const DeviceBuffer<scalar>& psi,
-    DeviceBuffer<scalar>& Apsi,
-    const DistributedAMI* ami)
+void deviceAmulHaloFresh(const DeviceLduView& A, const DeviceBuffer<scalar>& psi, DeviceBuffer<scalar>& Apsi,
+                         bool onField)
 {
-    halo.postExchange(psi.data());          // pack + put (async)
-    deviceAmul(A, psi, Apsi);               // local diag + upper/lower gather, overlaps the transfer
-    halo.waitExchange();                    // barrier: neighbour values now in the recv buffers
-    for (int i = 0; i < halo.nInterfaces(); ++i)
-        halo.updateInterfaceMatrix(i, Apsi.data(), ifaceCoeffs[i].data());   // Apsi[fc] -= coeff * psiNbr
-    if (ami) distributedAmiAmul(*ami, psi, Apsi);   // + cyclicAMI: gather remote target cells (NVSHMEM) then amul
+    amulImpl(A, psi, Apsi, onField, false);
+}
+
+void deviceProcExchange(const DeviceProcView& proc, const DeviceBuffer<scalar>& x)
+{
+    if (!proc.active()) return;
+    const HaloPlan& plan = *proc.plan;
+    if (x.size() + x.tail() < static_cast<std::size_t>(plan.nExt()))
+    {
+        throw std::runtime_error("brae deviceProcExchange: the operand has " + std::to_string(x.size()) + "+"
+                                 + std::to_string(x.tail()) + " elements; a decomposed matrix product needs nCells + nHalo = "
+                                 + std::to_string(plan.nExt()) + " (a DeviceBuffer with a halo tail)");
+    }
+    // refreshes only the halo slots behind size(): the owned values are untouched, so `const` holds in substance
+    ++procHookCountsRef().exchanges;
+    proc.comm->exchangeCells(plan, const_cast<scalar*>(x.data()), cudaStreamPerThread, procChannel());
+}
+
+std::size_t deviceProcHalo(const DeviceProcView& proc)
+{
+    return proc.active() ? static_cast<std::size_t>(proc.plan->nHalo()) : 0;
+}
+
+void deviceProcFrozenRhs(const DeviceLduView& A, const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& b,
+                         DeviceBuffer<scalar>& bEff)
+{
+    bEff.resize(A.nCells);
+    deviceProcExchange(A.proc, x);
+    if (A.nCells > 0)
+        cudaCheck(cudaMemcpyAsync(bEff.data(), b.data(), (std::size_t)A.nCells*sizeof(scalar), cudaMemcpyDeviceToDevice,
+                                  cudaStreamPerThread), "proc rhs copy");
+    if (A.proc.active()) launchProcFaces(procRhsKernel, procSubFusedKernel, A.proc, x.data(), bEff.data());
 }
 
 } // namespace brae

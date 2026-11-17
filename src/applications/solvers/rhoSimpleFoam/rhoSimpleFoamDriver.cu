@@ -223,7 +223,7 @@ RhoStepInput buildDeviceStepInput(
                     (double)refusals.limitTmin, (double)refusals.limitTmax);
     }
     for (const FvPatch& p : patches)
-        if (isCoupledInterfaceType(p.type) || p.type == "processor") in.hasCoupledPatches = true;
+        if (isCoupledType(p.type)) in.hasCoupledPatches = true;
 
     in.takeUAtBoundary = &dev.takeUAtBoundary;
     in.adjustable      = &dev.adjustable;

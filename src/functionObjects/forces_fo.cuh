@@ -667,7 +667,7 @@ private:
         label offset = 0;
         for (const FvPatch& p : *fvp)
         {
-            if (isCoupledInterfaceType(p.type)) continue;
+            if (isCyclicFamilyType(p.type)) continue;
             if (p.type != "empty" && p.size > 0 && patches_.selects(p))
             {
                 for (label i = 0; i < p.size; ++i)

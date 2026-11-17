@@ -28,6 +28,7 @@
 
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
+#include "proc_globals.cuh"   // pg::max/pg::sum: the parallel Courant reductions
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -176,7 +177,6 @@ inline CourantNumbers courantNo(
     scalar deltaT)
 {
     CourantNumbers c;
-    if (sumPhi.empty() || V.empty()) return c;
     scalar maxRatio = 0, sPhi = 0, sV = 0;
     for (std::size_t i = 0; i < sumPhi.size() && i < V.size(); ++i)
     {
@@ -184,6 +184,14 @@ inline CourantNumbers courantNo(
         sPhi += sumPhi[i];
         sV   += V[i];
     }
+    // OpenFOAM's CourantNo.H uses gMax(sumPhi/V) and gSum(sumPhi)/gSum(V): under -parallel these are GLOBAL, and
+    // the device path already reduces through ProcComm. The host path must agree, or every rank picks a
+    // different deltaT with adjustTimeStep and the collective sequence diverges (review finding 4). An EMPTY rank
+    // still joins all three reductions with the identities maxRatio = 0, sPhi = 0, sV = 0. np == 1 / no comm:
+    // pg:: returns its argument, so the single-GPU arithmetic is bit-identical to before.
+    maxRatio = pg::max(maxRatio);
+    sPhi = pg::sum(sPhi);
+    sV = pg::sum(sV);
     c.CoNum     = 0.5*maxRatio*deltaT;
     c.meanCoNum = (sV > 0) ? 0.5*(sPhi/sV)*deltaT : scalar(0);
     return c;

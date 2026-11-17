@@ -446,7 +446,7 @@ try
     {
         std::vector<std::pair<label, std::vector<scalar>>> ifPhi;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
-            if (isCoupledInterfaceType(fvp[pi].type) && !phi.boundary[pi].empty())
+            if (isCyclicFamilyType(fvp[pi].type) && !phi.boundary[pi].empty())
                 ifPhi.push_back({(label)pi, phi.boundary[pi]});
         solver.setInterfacePatchFlux(ifPhi);
     }

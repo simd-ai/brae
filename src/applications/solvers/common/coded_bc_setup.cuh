@@ -100,7 +100,7 @@ inline void setupCodedBCs(DeviceSimpleSolver& solver,
             int off = 0, cnt = -1;
             for (const FvPatch& q : fvp)
             {
-                if (isCoupledInterfaceType(q.type)) continue;
+                if (isCyclicFamilyType(q.type)) continue;
                 if (q.name == s.patch) { cnt = (int)q.size; break; }
                 off += (int)q.size;
             }

@@ -203,7 +203,7 @@ struct RhoMomentumInput
     bool hasFvOptions = false;
     // Does the mesh carry a cyclic / cyclicAMI / cyclicACMI / processor patch? DeviceMesh cannot say --
     // buildDeviceMesh SKIPS coupled patches in the boundary gather and keeps them out of the internal-face
-    // LDU by design (device_mesh.cuh:34-38, 110-123) -- so the DRIVER says it, from isCoupledInterfaceType
+    // LDU by design (device_mesh.cuh:34-38, 110-123) -- so the DRIVER says it, from isCyclicFamilyType
     // over the patch list, exactly as it already says hasMRF. This assembly passes no interface to
     // divDevRhoReff, to the corrected-laplacian source, to the off-diagonals or to the relaxation's
     // diagonal-dominance sum, so with a coupled patch present all four drop those faces silently. Set it

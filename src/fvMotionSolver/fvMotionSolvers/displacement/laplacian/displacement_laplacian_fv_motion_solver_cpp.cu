@@ -300,7 +300,7 @@ void DisplacementLaplacianFvMotionSolver::attach(
         const FvPatch& p = patches[pi];
         PointPatch& pp = pointPatches_[pi];
         pp.name = p.name;
-        if (isCoupledInterfaceType(p.type))
+        if (isCyclicFamilyType(p.type))
         {
             throw std::runtime_error(
                 std::string(WHO) + "patch `" + p.name + "` is " + p.type + ". A coupled patch couples the "

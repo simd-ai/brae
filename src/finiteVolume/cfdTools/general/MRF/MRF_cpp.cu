@@ -33,7 +33,7 @@ vector requiredVector(
 // excludedPatchLabels_ (which is what nonRotatingPatches resolves to).
 bool isExcludedPatch(const FvPatch& p, const std::vector<std::string>& nonRotating)
 {
-    if (isCoupledInterfaceType(p.type) || p.type == "processor") return true;
+    if (isCoupledType(p.type)) return true;
     for (const std::string& n : nonRotating)
     {
         if (n == p.name) return true;

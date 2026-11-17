@@ -31,7 +31,7 @@ SimpleFields createFields(
     // solvers. The cyclic reference path (cyclic_field.cuh buildCyclicField) and the device solver
     // couple these interfaces; this serial mirror does not, and nothing accidental fires here.
     for (const FvPatch& cp : patches)
-        if (isCoupledInterfaceType(cp.type) || cp.type == "processor")
+        if (isCoupledType(cp.type))
             throw std::runtime_error(
                 "simpleFoam createFields (mirror): the mesh has a coupled patch ('" + cp.name +
                 "', type " + cp.type + "). This serial mirror builds it as an uncoupled zeroGradient "

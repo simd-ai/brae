@@ -52,6 +52,8 @@ Description
 #include "fvOptions.H"
 #include "CorrectPhi.H"
 #include "fvcSmooth.H"
+#include "processorFvPatch.H"
+#include "twoPhaseProperties/alphaContactAngle/constantAlphaContactAngle/constantAlphaContactAngleFvPatchScalarField.H"
 
 // * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * //
 
@@ -71,11 +73,32 @@ int main(int argc, char *argv[])
     #include "setRootCaseLists.H"
     #include "createTime.H"
     #include "createDynamicFvMesh.H"
+
+    // BRAE_PROC_GEOMETRY=1: write the processor patches' geometry (procGeometryDump.H) and stop, before any field
+    // is read -- tools/mgpu_oracle/proc_geometry_gate.sh
+    if (getenv("BRAE_PROC_GEOMETRY"))
+    {
+        #include "procGeometryDump.H"
+        return 0;
+    }
     #include "initContinuityErrs.H"
     #include "createDyMControls.H"
     #include "createFields.H"
     #include "createAlphaFluxes.H"
+    // BRAE_STAGE_DUMP=1: the explicit stages of the first step on THIS state (before initCorrectPhi, which would
+    // re-solve the flux), written, then stop (stageDump.H)
+    if (getenv("BRAE_STAGE_DUMP"))
+    {
+        #include "stageDump.H"
+        return 0;
+    }
+
     #include "initCorrectPhi.H"
+    if (getenv("BRAE_STAGE_STATE"))
+    {
+        runTime.writeNow();
+        return 0;
+    }
     #include "createUfIfPresent.H"
 
     if (!LTS)
@@ -310,7 +333,44 @@ int main(int argc, char *argv[])
                     << runTime.timeIndex() << endl;
             }
 
+            if (getenv("BRAE_STAGE_ALPHA")) volScalarField("sAlphaBeforeFinalMixture.dump", alpha1).write();
+            if (getenv("BRAE_STAGE_ALPHA")) volScalarField("sAlpha2BeforeFinalMixture.dump", alpha2).write();
             mixture.correct();
+
+            if (getenv("BRAE_STAGE_ALPHA")) volScalarField("sAlpha2AfterFinalMixture.dump", alpha2).write();
+            // ---- ORACLE INSTRUMENTATION (tools/mgpu_oracle): what the alpha step hands to momentum/pressure
+            if (braeOracleStep())
+            {
+                surfaceScalarField("oNHatf.dump", mixture.nHatf()).write();
+                volScalarField("oSigmaK.dump", mixture.sigmaK()()).write();
+                volScalarField("oAlphaEnd.dump", alpha1).write();
+                surfaceScalarField("oAlphaPhi10End.dump", alphaPhi10).write();
+                surfaceScalarField("oRhoPhi.dump", rhoPhi).write();
+                volScalarField("oRhoEnd.dump", rho).write();
+                surfaceScalarField("oPhiEntry.dump", phi).write();
+            }
+            if (getenv("BRAE_STAGE_ALPHA"))
+            {
+                volScalarField rg
+                (
+                    IOobject("sAlphaRefGrad.dump", runTime.timeName(), mesh, IOobject::NO_READ, IOobject::NO_WRITE),
+                    mesh, dimensionedScalar(dimless, Zero)
+                );
+                forAll(alpha1.boundaryField(), pi)
+                {
+                    const auto* ca = dynamic_cast<const constantAlphaContactAngleFvPatchScalarField*>(&alpha1.boundaryField()[pi]);
+                    if (ca) rg.boundaryFieldRef()[pi] == ca->gradient();
+                }
+                rg.write();
+            }
+            if (getenv("BRAE_STAGE_ALPHA"))
+            {
+                volScalarField("sAlphaAfter.dump", alpha1).write();
+                surfaceScalarField("sAlphaPhi.dump", alphaPhi10).write();
+                volScalarField("sRhoAfter.dump", rho).write();
+                Info<< "[brae] alpha stage dump written at time " << runTime.timeName() << endl;
+                return 0;
+            }
 
             if (pimple.frozenFlow())
             {
@@ -332,6 +392,22 @@ int main(int argc, char *argv[])
         }
 
         runTime.write();
+
+        // ---- ORACLE INSTRUMENTATION (tools/mgpu_oracle): write the full state at chosen step indices
+        // (BRAE_WRITE_ITERS="1,20") and stop after step BRAE_STOP_ITER, so serial and -parallel runs
+        // end on the same step whatever adjustTimeStep does with deltaT.
+        {
+            const char* stopEnv = getenv("BRAE_STOP_ITER");
+            const bool stopNow = stopEnv && runTime.timeIndex() >= atoi(stopEnv);
+            if (stopNow)
+            {
+                runTime.writeAndEnd();
+            }
+            else if (braeInList("BRAE_WRITE_ITERS") && !runTime.writeTime())
+            {
+                runTime.writeNow();
+            }
+        }
 
         runTime.printExecutionTime(Info);
     }

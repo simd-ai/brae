@@ -503,3 +503,27 @@ DeferredList d isVector  # the scalar overload: false is what a scalar list is
 DeferredList d vectors   # the scalar overload: a scalar list holds no vectors
 DeferredList d aliased   # the vector overload: the alias control is of alpha's scalar list alone
 DeferredList d scalars   # the vector overload: a vector list holds no scalars
+
+# ---- multi-GPU interface and function-object expression values ------------------------------------------
+# DeviceProcInterface::cyc of a rank with NO processor faces (buildDeviceProcInterface returns early): an empty
+# interface, which is what DeviceCyclic's defaults are. buildDeviceCyclic sets these for a rank that has faces.
+DeviceCyclic cyc ifCoeff     # empty interface: no faces, no coefficient array (the pressure matrix attaches its own per assembly)
+DeviceCyclic cyc nIfRanks    # empty interface: no neighbour ranks
+DeviceCyclic cyc nIfCells    # empty interface: no cell owns a face
+DeviceCyclic cyc phi         # empty interface: no flux to carry
+DeviceCyclic cyc rotational  # empty interface: no transform
+DeviceCyclic cyc stencil     # empty interface: no neighbour-cell stencil
+# the plan builder fetches the neighbours' face cells itself (comm.buildPlanFromPatches); this site gives only this rank's side
+ProcessorPatchDesc d nbrFaceCells
+# SF is a tagged value: a constant (c), a borrowed vector (ref) or an owned one (own). Each construction site sets the one that applies
+SF r c
+SF r ref
+SF r own
+SF s c
+SF s ref
+# a run that finds no processor directories decomposes the case for itself: the number of processes is the only thing it sets; the
+# method comes from decomposeParDict, the time is the one the run starts from, and nothing is replaced (decomposeForRun)
+Options opt allTimes   # decomposeForRun: the start time only
+Options opt force      # decomposeForRun: there is nothing to replace (it is called when there are no processor directories)
+Options opt method     # decomposeForRun: decomposeParDict's method, as `brae decompose` takes it without -method
+Options opt times      # decomposeForRun: the time a run would start from, as `brae decompose` takes it without -time

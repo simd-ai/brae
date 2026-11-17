@@ -1,6 +1,7 @@
 // setRDeltaT.H -- see inter_set_rdeltat_cpp.cuh for the provenance and the four things in it that are not
 // what they look like.
 #include "inter_phase_time.cuh"
+#include "inter_parallel.cuh"   // mgpuGeometryOnly
 #include "inter_set_rdeltat_cpp.cuh"
 #include "fvc_smooth_cpp.cuh"
 #include <cstdio>
@@ -143,8 +144,10 @@ void refuseUnportedLocalEuler(
     }
     for (const FvPatch& q : patches)
     {
-        if (q.coupled || q.type == "cyclic" || q.type == "cyclicAMI" || q.type == "cyclicACMI"
-         || q.type == "processor")
+        // a processor patch is refused by name too -- unless the multi-GPU gate is open (inter_parallel.cuh),
+        // which stops the driver before any step runs
+        if ((isProcessorType(q.type) ? !mgpuProcessorGate() : q.coupled) || q.type == "cyclic" || q.type == "cyclicAMI"
+         || q.type == "cyclicACMI")
         {
             throw std::runtime_error(
                 std::string(WHO) + "the mesh has the coupled patch '" + q.name + "'. setRDeltaT.H's sums "

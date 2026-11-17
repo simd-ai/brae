@@ -74,8 +74,17 @@ enum class DeviceAlphaScheme
     interfaceCompression = 3
 };
 
+// THE STAGE TAP (the multi-GPU operator gate): the high-order flux's pieces, copied out where alphaPhiUn is complete.
+// With `stage` set the corrector returns right after them: the limiter, the correction and the solve are not run.
+struct DeviceAlphaStageTap
+{
+    DeviceBuffer<scalar> phicInt, phicBnd, phirInt, phirBnd, unInt, unBnd;
+};
+
 struct DeviceAlphaStepInput
 {
+    // non-null: stop after alphaPhiUn and hand its pieces out (see above)
+    DeviceAlphaStageTap* stage = nullptr;
     const DeviceBuffer<scalar>* phiInt    = nullptr;   // the volumetric flux
     const DeviceBuffer<scalar>* phiBnd    = nullptr;
     const DeviceBuffer<scalar>* phiCNInt  = nullptr;   // off-centred; == phi for Euler

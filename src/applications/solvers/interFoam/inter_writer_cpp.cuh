@@ -22,9 +22,11 @@
 // and only the output of which is incomplete -- and every refused file is named at construction so a long
 // run is not lost silently.
 #pragma once
+#include "case_roots.cuh"
 #include "cf_types.cuh"
 #include "crank_nicolson_ddt_scheme_cpp.cuh"
 #include "foam_dict.cuh"
+#include "inter_function_objects.cuh"
 #include "fv_patch.cuh"
 #include "fvc.cuh"
 #include "geometric_field.cuh"
@@ -127,6 +129,9 @@ struct InterWriteState
     const std::vector<scalar>* rAU = nullptr;
     // CrankNicolson on a moving mesh; null under any other scheme
     const InterWriteCrankNicolson* cn = nullptr;
+    // functionObjects::properties as it stood after this step: scalar/vector/label results and the
+    // runTimeControl condition dictionaries. Null means no function objects (an empty dictionary).
+    const brae::fo::FunctionObjectState* functionObjects = nullptr;
 };
 
 class InterWriter
@@ -136,7 +141,7 @@ public:
     // writeControl brae cannot honour (clockTime, cpuTime, an unknown word) and a missing or invalid
     // writeInterval, where OpenFOAM stops too (TimeIO.C:284-297).
     InterWriter(
-        const std::string& caseDir,
+        const CaseRoots& roots,
         const std::string& startDir,
         const std::vector<FvPatch>& patches,
         const std::string& phase1Name);
@@ -161,6 +166,9 @@ public:
         scalar deltaT,
         const std::vector<scalar>& divPhi,
         const std::vector<scalar>& V);
+    // The same update when the caller formed sum(V*divPhi) on the device. sumV is supplied separately so
+    // the device path can retain the host's sequential denominator and refresh it only when geometry moves.
+    void addContinuityError(scalar deltaT, scalar sumVf, scalar sumV);
 
     // alpha.<phase1>_0 is written (a sub-cycled alpha): the loops capture it at the start of a write step
     void writeAlphaOld() { alphaOld_ = true; }
@@ -280,10 +288,11 @@ private:
         const std::string& text,
         bool compressible) const;
 
-    std::string caseDir_;
+    std::string outRoot_;   // where the time directories are written (and purged): CaseRoots::procDir
     std::string startDir_;
     const std::vector<FvPatch>& patches_;
     std::string phase1_;
+    bool        parallel_ = false;   // function-object state output is new to the decomposed path only
 
     std::string control_;
     scalar interval_ = 0;

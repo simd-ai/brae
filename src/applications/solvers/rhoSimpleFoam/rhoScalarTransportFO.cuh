@@ -229,7 +229,7 @@ public:
         std::vector<scalar> out;
         for (std::size_t pi = 0; pi < ctx_.patches->size(); ++pi)
         {
-            if (isCoupledInterfaceType((*ctx_.patches)[pi].type)) continue;
+            if (isCyclicFamilyType((*ctx_.patches)[pi].type)) continue;
             const std::vector<scalar>& v = s_.boundary[pi]->value();
             out.insert(out.end(), v.begin(), v.end());
         }

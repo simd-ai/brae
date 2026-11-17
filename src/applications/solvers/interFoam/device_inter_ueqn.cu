@@ -2,6 +2,7 @@
 // for why the body force is a face flux.
 #include "device_inter_ueqn.cuh"
 #include "device_fvc_reconstruct.cuh"
+#include "device_processor_ops.cuh"
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
@@ -215,7 +216,10 @@ void deviceInterMuEff(
             "stress at a wall is what the boundary condition says they are there, not what the face "
             "cell holds.");
 
-    muCell.resize(static_cast<std::size_t>(nC));
+    // a decomposed mesh reads mu = rho*nuEff of the neighbour rank's cells across the processor faces (halo tail)
+    muCell.resize(static_cast<std::size_t>(nC),
+                  DeviceProcCtx::active(dm) ? static_cast<std::size_t>(DeviceProcCtx::current()->nCellsExt())
+                                            : static_cast<std::size_t>(nC));
     productKernel<<<nBlocks(nC), TPB>>>(rho.data(), nuEff.data(), nC, muCell.data());
     ckU(cudaGetLastError(), "mu = rho*nuEff");
 

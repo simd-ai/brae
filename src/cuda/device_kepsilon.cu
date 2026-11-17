@@ -18,7 +18,7 @@
 #include "device_interface.cuh"  // interface<Op>() overloads dispatching to the cyclic/AMI backends
 #include "device_amg.cuh"        // deviceSymGaussSeidel (scalar smoothSolver, for stiff low-Re k/omega)
 #include "nut_wall_function.cuh" // nutkWallFunctionValue / yPlusWall (shared wall-nut physics, BRAE_HD)
-#include "foam_dict.cuh"         // isCoupledInterfaceType: the DeviceBoundary order (spaldingFaceControls)
+#include "foam_dict.cuh"         // isCyclicFamilyType: the DeviceBoundary order (spaldingFaceControls)
 #include <stdexcept>
 #include "kEpsilon.cuh"          // gpu::kEpsilonRAS::boundField: Foam::bound, one implementation
 #include <cuda_runtime.h>
@@ -1469,7 +1469,7 @@ SpaldingFaceControls spaldingFaceControls(const GeometricField<scalar>& nut, con
     std::vector<label> its;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+        if (isCyclicFamilyType(fvp[pi].type)) continue;
         const bool spalding = pi < nut.boundary.size() && nut.boundary[pi] && nut.boundary[pi]->isNutUSpalding();
         const scalar t = spalding ? nut.boundary[pi]->nutUTolerance() : scalar(0.01);
         const label m = spalding ? nut.boundary[pi]->nutUMaxIter() : label(10);

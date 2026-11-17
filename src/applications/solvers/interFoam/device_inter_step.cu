@@ -1,6 +1,7 @@
 // One whole interFoam time step -- see device_inter_step.cuh for the loop order and what it decides.
 #include "inter_phase_time.cuh"
 #include "device_inter_step.cuh"
+#include "device_processor_ops.cuh"
 #include "inter_peqn_cpp.cuh"   // tapCorrectorWanted
 #include "device_alpha_flux.cuh"
 #include "device_blas.cuh"
@@ -318,6 +319,15 @@ void deviceInterStep(
     // 3. THE MOMENTUM MATRIX
     DeviceBuffer<scalar> ub[3];
     hooks.updateUBoundary(UX, UY, UZ, dbU, ub, DeviceUBoundaryCall::assembly);
+    // A PROCESSOR face's value is the two cells' interpolation (what coupledFvPatchField::evaluate leaves), not the
+    // hook's placeholder: every gradient and the matrix read the stored values, so they are set here, once, from
+    // the halo of this iteration's U.
+    if (DeviceProcCtx::active(dm))
+    {
+        DeviceProcCtx& pcU = *DeviceProcCtx::current();
+        procExchange(pcU, {&UX, &UY, &UZ}, "U");
+        for (int k = 0; k < 3; ++k) procFaceValue(pcU, k == 0 ? UX : k == 1 ? UY : UZ, ub[k]);
+    }
     // pressureInletOutletVelocity's updateCoeffs, from the flux registered NOW: an inflow face fixes
     // its tangential components, an outflow face is zeroGradient. The hook rebuilds dbU from the host
     // patches' categories, which carry no flux, so without this every such face stayed zeroGradient for
@@ -688,6 +698,13 @@ void deviceInterStep(
         // uncoupled patch, which is what fvc::interpolate gives there.
         DeviceBuffer<scalar> rAUfAll;
         deviceInterpolateFull(dm, st.rAU, rAUfAll);
+        if (DeviceProcCtx::active(dm))
+        {
+            // rAUfAll is a full-face array (the internal faces first): the processor segment is behind them
+            DeviceBuffer<scalar> rAUfProc;
+            deviceCyclicFaceValue(DeviceProcCtx::current()->cyc(), st.rAU, rAUfProc);
+            procScatter(*DeviceProcCtx::current(), rAUfProc, rAUfAll.data() + dm.nInternalFaces);
+        }
 
         // fvc::ddtCorr(U, phi), Euler. The coefficient is OpenFOAM's DEFAULT LIMITER
         // (ddtPhiCoeff_ = -1), not a constant: it switches the correction off where it is large
@@ -736,7 +753,7 @@ void deviceInterStep(
                                 ctl.cyc, &ctl.cn->ddtCorrPhiIf, ctl.phiOldIf, ctl.cn->phiOOIf, &ddtCorrIf);
             }
         }
-        else
+        if (!(ctl.cn && ctl.cn->momentum))
         {
             deviceDdtCorr(dm, phiOldInt, phiOldBnd, UOldX, UOldY, UOldZ, bndUFixesValue,
                           /*ddtPhiCoeff=*/scalar(-1), deltaT, ddtCorrI, ddtCorrB,
@@ -745,6 +762,21 @@ void deviceInterStep(
                           ctl.phiUfOldInt,
                           // ...and under localEuler the face rDeltaT takes 1/deltaT's
                           ctl.rDeltaTfInt, ctl.rDeltaTfBnd);
+        }
+        if (DeviceProcCtx::active(dm))
+        {
+            DeviceProcCtx& pc = *DeviceProcCtx::current();
+            procExchange(pc, {const_cast<DeviceBuffer<scalar>*>(&UOldX), const_cast<DeviceBuffer<scalar>*>(&UOldY),
+                              const_cast<DeviceBuffer<scalar>*>(&UOldZ)}, "U.oldTime");
+            DeviceBuffer<scalar> ddtIf;
+            if (!(ctl.cn && ctl.cn->momentum))
+            {
+                DeviceBuffer<scalar> oldIf;
+                procGather(pc, phiOldBnd, oldIf);
+                deviceInterDdtCorrCyclic(pc.cyc(), oldIf, UOldX, UOldY, UOldZ,
+                                         /*ddtPhiCoeff=*/scalar(-1), deltaT, ddtIf);
+                procScatter(pc, ddtIf, ddtCorrB);
+            }
         }
 
         // MRF.zeroFilter(interpolate(rho*rAU)*fvc::ddtCorr(U, phi)), pEqn.H:18. MRFZone::zero sets the

@@ -108,7 +108,7 @@ void refuseUnsupported(
     }
 
     // Coupled patches -- cyclic, cyclicAMI, cyclicACMI, processor. buildDeviceMesh SKIPS them in the
-    // boundary gather (device_mesh.cuh:110-123, isCoupledInterfaceType) and deliberately keeps them OUT of
+    // boundary gather (device_mesh.cuh:110-123, isCyclicFamilyType) and deliberately keeps them OUT of
     // the internal-face LDU (device_mesh.cuh:34-38), because the periodic coupling is a SEPARATE interface.
     // This assembly supplies no interface to any stage, so on such a mesh it loses the same faces four
     // times over: from gradU and from the tensor divergence inside deviceDivDevReff (its cyc/ami hooks
@@ -570,7 +570,6 @@ void assembleUEqn(
         M.source[0],
         M.source[1],
         M.source[2],
-        nullptr,
         nullptr,
         nullptr,
         ubStored,

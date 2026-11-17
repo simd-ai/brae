@@ -140,7 +140,7 @@ int main(int argc, char** argv)
     std::vector<scalar> bndPsiForGrad;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+        if (isCyclicFamilyType(fvp[pi].type)) continue;
         const std::vector<scalar>& pv = psi.boundary[pi]->value();
         for (label i = 0; i < fvp[pi].size; ++i)
         {
@@ -361,7 +361,7 @@ int main(int argc, char** argv)
     std::vector<int> bndFixes, bndFlag;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        if (isCoupledInterfaceType(fvp[pi].type)) continue;    // the device mesh skips these
+        if (isCyclicFamilyType(fvp[pi].type)) continue;    // the device mesh skips these
         const std::vector<scalar>& pv = psi.boundary[pi]->value();
         for (label i = 0; i < fvp[pi].size; ++i)
         {
@@ -491,7 +491,7 @@ int main(int argc, char** argv)
         std::vector<scalar> bndCorr;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isCyclicFamilyType(fvp[pi].type)) continue;
             for (label i = 0; i < fvp[pi].size; ++i)
             {
                 bndCorr.push_back(phiCorrC.boundary[pi][static_cast<std::size_t>(i)]);
@@ -508,7 +508,7 @@ int main(int argc, char** argv)
         std::vector<scalar> bndPhi;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isCyclicFamilyType(fvp[pi].type)) continue;
             for (label i = 0; i < fvp[pi].size; ++i)
             {
                 bndPhi.push_back(phiC.boundary[pi][static_cast<std::size_t>(i)]);
@@ -577,7 +577,7 @@ int main(int argc, char** argv)
         std::vector<scalar> bndFlux;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isCyclicFamilyType(fvp[pi].type)) continue;
             for (label i = 0; i < fvp[pi].size; ++i) bndFlux.push_back(scalar(0));
         }
         DeviceBuffer<scalar> dPhiPsiInt(phiPsi.internal), dPhiPsiBnd(bndFlux), dIfFlux(ifFlux);

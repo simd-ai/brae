@@ -203,7 +203,7 @@ void deviceMatrixH(
     bool valid)
 {
     const int nC = dm.nCells;
-    Hk.resize(nC);
+    resizeCellBuffer(Hk, dm);   // H is read across a processor face (HbyA flux): halo capacity
     // fvMatrix<Type>::H()'s closing block: a component polyMesh::solutionD() knocks out comes back
     // identically zero (fvMatrix.C, the validComponents loop after correctBoundaryConditions). Done
     // here rather than at the call sites so the device and the host twin brae::matrixH stay the SAME
@@ -350,7 +350,7 @@ void deviceSetReference(DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& b, lab
 void deviceReciprocalV(const DeviceMesh& dm, const DeviceBuffer<scalar>& diagC, DeviceBuffer<scalar>& rAU)
 {
     const int nC = dm.nCells;
-    rAU.resize(nC);
+    resizeCellBuffer(rAU, dm);   // rAU is read across a processor face (rAUf): halo capacity
     reciprocalVKernel<<<nBlocks(nC), TPB>>>(nC, diagC.data(), dm.V.data(), rAU.data());
     cudaCheck(cudaGetLastError(), "reciprocalV");
 }

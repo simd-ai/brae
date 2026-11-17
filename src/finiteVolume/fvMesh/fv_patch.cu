@@ -136,6 +136,9 @@ std::vector<FvPatch> buildPatches(const PrimitiveMesh& m, const FvGeometry& g, b
         p.inGroups = pi.inGroups;
         p.start    = pi.start;
         p.size     = pi.size;
+        p.myProcNo = pi.myProcNo;
+        p.neighbProcNo = pi.neighbProcNo;
+        p.referPatch = pi.referPatch;
         p.faceCells.resize(pi.size);
         p.deltaCoeffs.resize(pi.size);
         p.nf.resize(pi.size);
@@ -246,6 +249,82 @@ void coupleTranslationalPair(
         const scalar dni = dot(q.nf[i], nbrD);
         const vector d = patchD - nbrD;
         p.weights[i] = dni/(di + dni);
+        p.delta[i] = d;
+        p.deltaCoeffs[i] = scalar(1)/mag(d);
+        p.nonOrthDeltaCoeffs[i] = scalar(1)/std::fmax(dot(p.nf[i], d), scalar(0.05)*mag(d));
+        p.nonOrthCorrectionVectors[i] = p.nf[i] - d*p.nonOrthDeltaCoeffs[i];
+    }
+}
+
+std::vector<double> packProcessorFaces(const FvPatch& p, const FvGeometry& g)
+{
+    std::vector<double> flat(static_cast<std::size_t>(p.size)*9);
+    for (label i = 0; i < p.size; ++i)
+    {
+        const vector& cf = g.Cf()[p.start + i];
+        const vector& sf = g.Sf()[p.start + i];
+        const vector& cn = g.C()[p.faceCells[static_cast<std::size_t>(i)]];
+        double* o = flat.data() + static_cast<std::size_t>(i)*9;
+        o[0] = cf.x; o[1] = cf.y; o[2] = cf.z;
+        o[3] = sf.x; o[4] = sf.y; o[5] = sf.z;
+        o[6] = cn.x; o[7] = cn.y; o[8] = cn.z;
+    }
+    return flat;
+}
+
+ProcessorNbrFaces unpackProcessorFaces(const std::vector<double>& flat, label faces)
+{
+    if (flat.size() != static_cast<std::size_t>(faces)*9)
+    {
+        throw std::runtime_error(
+            "brae: a processor patch of " + std::to_string(faces) + " faces received " + std::to_string(flat.size())
+            + " doubles of neighbour geometry (9 per face expected): the two sides disagree on the patch size.");
+    }
+    ProcessorNbrFaces r;
+    r.Cf.resize(static_cast<std::size_t>(faces));
+    r.Sf.resize(static_cast<std::size_t>(faces));
+    r.Cn.resize(static_cast<std::size_t>(faces));
+    for (std::size_t i = 0; i < static_cast<std::size_t>(faces); ++i)
+    {
+        const double* o = flat.data() + i*9;
+        r.Cf[i] = {o[0], o[1], o[2]};
+        r.Sf[i] = {o[3], o[4], o[5]};
+        r.Cn[i] = {o[6], o[7], o[8]};
+    }
+    return r;
+}
+
+void coupleProcessorPair(FvPatch& p, const ProcessorNbrFaces& nbr, const FvGeometry& g)
+{
+    const std::size_t n = static_cast<std::size_t>(p.size);
+    if (nbr.Cf.size() != n || nbr.Sf.size() != n || nbr.Cn.size() != n)
+    {
+        throw std::runtime_error(
+            "brae: processor patch '" + p.name + "' has " + std::to_string(p.size) + " faces and the neighbour "
+            "sent geometry for " + std::to_string(nbr.Cf.size()) + ".");
+    }
+    // VSMALL of OpenFOAM's double precision (doubleScalarVSMALL)
+    const scalar vsmall = 1.0e-300;
+    p.coupled = true;
+    p.owner = p.myProcNo < p.neighbProcNo;   // processorPolyPatch::owner()
+    p.weights.resize(n);
+    p.delta.resize(n);
+    p.nbrD.resize(n);
+    p.nonOrthDeltaCoeffs.resize(n);
+    p.nonOrthCorrectionVectors.resize(n);
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        const label f = p.start + static_cast<label>(i);
+        // coupledFvPatch::delta() = Cf() - Cn()
+        const vector patchD = g.Cf()[f] - g.C()[p.faceCells[i]];
+        const vector nbrDi = nbr.Cf[i] - nbr.Cn[i];
+        // processorFvPatch::makeWeights: "the face normals point in the opposite direction on the other side"
+        const vector nbrNf = nbr.Sf[i]/(mag(nbr.Sf[i]) + vsmall);
+        const scalar nbrCn = dot(nbrNf, nbrDi);
+        p.weights[i] = nbrCn/(dot(p.nf[i], patchD) + nbrCn);
+        // processorFvPatch::delta(), parallel(): coupledFvPatch::delta() - (nbrCf - nbrCn)
+        const vector d = patchD - nbrDi;
+        p.nbrD[i] = nbrDi;
         p.delta[i] = d;
         p.deltaCoeffs[i] = scalar(1)/mag(d);
         p.nonOrthDeltaCoeffs[i] = scalar(1)/std::fmax(dot(p.nf[i], d), scalar(0.05)*mag(d));

@@ -10,7 +10,7 @@
 #include "wedge_patch.cuh"   // the axisymmetric constraint patch's rotation tensors
 #include "foam_field_reader.cuh"
 #include "cf_pstream.cuh"
-#include "foam_dict.cuh"   // isCoupledInterfaceType
+#include "foam_dict.cuh"   // isCyclicFamilyType
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -114,6 +114,8 @@ public:
     // second contact-angle model (dynamic, temperature-dependent) is a new return value here and not
     // a new branch at every call site.
     virtual scalar contactAngleTheta0() const { return scalar(-1); }
+    // Contact-angle limit mode: 0 none, 1 gradient, 2 zeroGradient, 3 alpha; -1 if not one.
+    virtual int contactAngleLimitMode() const { return -1; }
     // DOES evaluate() REPEAT: called again on the same cells, with the same flux told and nothing else told in
     // between, does it leave the value and the state the first call left? True for a class whose evaluate is a
     // function of the cells and of what the patch was told. FALSE BY DEFAULT -- a class nobody has answered for
@@ -1342,6 +1344,11 @@ public:
     }
 
     scalar contactAngleTheta0() const override { return theta0_; }
+    int contactAngleLimitMode() const override
+    {
+        return limit_ == Limit::none ? 0 : limit_ == Limit::gradient ? 1
+             : limit_ == Limit::zeroGradient ? 2 : 3;
+    }
     // the gradient is rewritten by every curvature pass, and `limit gradient` reads the value back
     bool evaluateRepeats() const override { return false; }
 
@@ -3838,7 +3845,7 @@ inline const std::vector<std::string>& patchFieldTypeNames()
         "movingWallVelocity", "noSlip", "nutkRoughWallFunction", "nutkWallFunction", "nutLowReWallFunction",
         "nutUBlendedWallFunction", "nutUSpaldingWallFunction", "nutUWallFunction", "omegaWallFunction", "outletInlet",
         "outletPhaseMeanVelocity", "permeableAlphaPressureInletOutletVelocity", "porousBafflePressure",
-        "pressureInletOutletVelocity", "prghPermeableAlphaTotalPressure", "rotatingWallVelocity", "slip",
+        "pressureInletOutletVelocity", "prghPermeableAlphaTotalPressure", "processor", "rotatingWallVelocity", "slip",
         "surfaceNormalFixedValue", "symmetry", "symmetryPlane", "timeVaryingMappedFixedValue", "totalPressure",
         "turbulentIntensityKineticEnergyInlet", "turbulentMixingLengthDissipationRateInlet",
         "turbulentMixingLengthFrequencyInlet", "uniformFixedValue", "uniformNormalFixedValue", "uniformTotalPressure",
@@ -4512,7 +4519,13 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
     // a cyclicAMI pair the interFoam host loop coupled (cyclic_ami_cpp): coupledFvPatchField's value and
     // snGrad, with patchNeighbourField the AMI interpolate the patch's stencil carries
     if (d.type == "cyclicAMI" && p.coupled)      return std::make_unique<CoupledCyclicPatchField<T>>(p);
-    if (isCoupledInterfaceType(d.type))          return std::make_unique<ZeroGradientPatchField<T>>(p);
+    // processor: another rank's half of the interface. The host mirror of a processor patch is an INERT placeholder
+    // (the same stance as the cyclic's above on the device path): its faces are boundary faces of the device mesh
+    // whose values are made there, by the halo exchange (cuda/device_processor_ops.cuh), and nothing on the host
+    // reads them -- the driver couples the patch AFTER the host fields are built (runInterFoamDevice), so this
+    // patch is uncoupled here and every host operator sees an ordinary zero-gradient boundary.
+    if (d.type == "processor" && !p.coupled)    return std::make_unique<ZeroGradientPatchField<T>>(p);
+    if (isCyclicFamilyType(d.type))          return std::make_unique<ZeroGradientPatchField<T>>(p);
     if (d.type == "empty")           return std::make_unique<EmptyPatchField<T>>(p);
     if (d.type == "symmetryPlane" || d.type == "symmetry" || d.type == "slip")
         // slip = OF basicSymmetry, with assignable() false where symmetry's is true -- see the class
@@ -4528,6 +4541,10 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
     // cellMotionU<Cmpt> field, which a restart reads back.
     if (d.type == "cellMotion")      return std::make_unique<FixedValuePatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     if (d.type == "calculated")      return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
+    // A decomposed case's `processor` entry (type + value): the patch holds the face value the solver last put there
+    // -- w*own + (1-w)*neighbour once the halo is exchanged, which is the multi-rank solver's job, and what the
+    // per-rank writer writes back. Read-and-hold like `calculated`; it takes no part in a matrix as a boundary.
+    if (d.type == "processor")       return std::make_unique<CalculatedPatchField<T>>(p, d.valueUniform, d.uniformValue, d.values);
     // atmBoundaryLayerInlet{Velocity,K,Epsilon,Omega} (OpenFOAM atmBoundaryLayer.C, v2412): Richards-Hoxey log-law
     // profile evaluated per boundary face from the face-centre height z = Cf.zDir - d, a steady fixedValue. Params come
     // from include/ABLConditions (foam_field_reader parses them). u* = kappa|Uref|/ln((Zref+z0)/z0):

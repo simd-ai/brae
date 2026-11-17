@@ -311,7 +311,7 @@ RhoSimpleFields createFields(
     // whitelist firing by ACCIDENT, five field reads later, with a message about energy boundary
     // conditions.
     for (const FvPatch& cp : patches)
-        if (isCoupledInterfaceType(cp.type) || cp.type == "processor")
+        if (isCoupledType(cp.type))
             throw std::runtime_error(
                 "rhoSimpleFoam createFields(cpp): the mesh has a coupled patch ('" + cp.name +
                 "', type " + cp.type + "). The host factory builds coupled types as zeroGradient "

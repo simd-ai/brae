@@ -9,6 +9,7 @@
 #include "foam_token_reader.cuh"
 #include "brae_notice.cuh"
 #include "inter_phase_time.cuh"
+#include "proc_globals.cuh"
 #include <charconv>
 #include <zlib.h>
 #include <algorithm>
@@ -882,9 +883,13 @@ void volPatch(
     }
     // calculatedFvPatchField.C:212-216, fixedValueFvPatchField.C:154-158, kqRWallFunctionFvPatchField.C:
     // 103-107 (zeroGradient's write, then the value), movingWallVelocityFvPatchVectorField.C:150-154 (the
-    // base's write and the value -- the Uwall its updateCoeffs assigned, :128-146)
+    // base's write and the value -- the Uwall its updateCoeffs assigned, :128-146).
+    // `processor` (a decomposed case's rank boundary): coupledFvPatchField::write is fvPatchField::write and
+    // the value entry -- `type processor; value <the coupled face values>`, nothing else (v2606's decomposePar
+    // and a -parallel run write exactly that; no myProcNo/neighbProcNo, which are the POLY patch's). The value
+    // is what the solver left on the face: w*own + (1-w)*neighbour of the halo-exchanged cells.
     else if (type == "calculated" || type == "fixedValue" || type == "kqRWallFunction"
-          || type == "movingWallVelocity")
+          || type == "movingWallVelocity" || type == "processor")
     {
         wordEntry(os, 8, "type", type);
         listEntry(os, 8, "value", value, precision);
@@ -1517,16 +1522,17 @@ void volPatch(
 
 
 InterWriter::InterWriter(
-    const std::string& caseDir,
+    const CaseRoots& roots,
     const std::string& startDir,
     const std::vector<FvPatch>& patches,
     const std::string& phase1Name)
-  : caseDir_(caseDir),
+  : outRoot_(roots.procDir),
     startDir_(startDir),
     patches_(patches),
-    phase1_(phase1Name)
+    phase1_(phase1Name),
+    parallel_(roots.parallel && roots.nProcs > 1)
 {
-    const FoamDict cd = readDict(caseDir + "/system/controlDict");
+    const FoamDict cd = readDict(roots.dictDir + "/system/controlDict");
 
     // Time::writeControlNames (Time.C:63-73). clockTime and cpuTime write on elapsed seconds, which no two
     // runs share; brae does not implement them and says so rather than never writing.
@@ -1599,22 +1605,8 @@ InterWriter::InterWriter(
     deltaTSave_ = startDeltaT(cd, startDir, cd.scalarOr("deltaT", scalar(0)));
     deltaT0_ = deltaTSave_;
 
-    if (const FoamDict* fns = cd.subDict("functions"))
-    {
-        if (!fns->subs.empty())
-        {
-            std::string names;
-            for (const auto& s : fns->subs)
-            {
-                names += (names.empty() ? "" : ", ") + s.first;
-            }
-            noticeIgnored(
-                "controlDict functions",
-                "brae runs no function objects (" + names + "): their postProcessing/ output and the fields "
-                "they write are not produced; the solution depends on them in the time step alone, where "
-                "an object's adjustableRunTime write times trim it, and that is kept");
-        }
-    }
+    // controlDict `functions`: the loops run the objects brae ports (inter_function_objects.cuh) and notice the
+    // ones it does not, by name, when they build the list; this writer says nothing about them.
 
     // A RESTART continues OpenFOAM's time index and cumulative continuity error from the start directory
     // (Time.C:304-307, initContinuityErrs.H:40-52) -- the index is the case's, InterFields::startTimeIndex,
@@ -1710,13 +1702,30 @@ void InterWriter::stepTaken(scalar deltaT)
     deltaTSave_ = deltaT;
 }
 
+void InterWriter::addContinuityError(scalar deltaT, scalar sumVf, scalar sumV)
+{
+    // continuityErrs.H: globalContErr = deltaT*contErr.weightedAverage(V) (DimensionedField.C
+    // weightedAverage: gSum(V*f)/gSum(V) where gSum(V) > SMALL). The caller's sums are THIS rank's; under
+    // -parallel the two gSums are one collective over the ranks (both numbers in one message), so every rank
+    // adds the same globalContErr and every rank writes the same uniform/cumulativeContErr.
+    if (pg::parallel())
+    {
+        double sums[2] = {static_cast<double>(sumVf), static_cast<double>(sumV)};
+        pg::sum(sums, 2);
+        sumVf = sums[0];
+        sumV = sums[1];
+    }
+    if (sumV > kSmall)
+    {
+        cumulativeContErr_ += deltaT*(sumVf/sumV);
+    }
+}
+
 void InterWriter::addContinuityError(
     scalar deltaT,
     const std::vector<scalar>& divPhi,
     const std::vector<scalar>& V)
 {
-    // continuityErrs.H: globalContErr = deltaT*contErr.weightedAverage(V) (DimensionedField.C
-    // weightedAverage: gSum(V*f)/gSum(V) where gSum(V) > SMALL)
     scalar sumV = 0;
     scalar sumVf = 0;
     for (std::size_t c = 0; c < divPhi.size() && c < V.size(); ++c)
@@ -1724,10 +1733,7 @@ void InterWriter::addContinuityError(
         sumV += V[c];
         sumVf += V[c]*divPhi[c];
     }
-    if (sumV > kSmall)
-    {
-        cumulativeContErr_ += deltaT*(sumVf/sumV);
-    }
+    addContinuityError(deltaT, sumVf, sumV);
 }
 
 std::string InterWriter::timeName(
@@ -1771,6 +1777,9 @@ bool InterWriter::binaryFile(const std::string& className) const
     //   BRAE_CONTROL_WRITE_V0_ASCII_HEADER=1: a gate's CONTROL, deliberately wrong -- `Field` alone.
     static const bool internalAsText = std::getenv("BRAE_CONTROL_WRITE_V0_ASCII_HEADER") != nullptr;
     const bool field = endsWith("Field") || (endsWith("Field::Internal") && !internalAsText);
+    // uniformDimensionedScalarField is regIOobject-written with the run's format too (the value is a scalar
+    // token, not a list). OpenFOAM's uniform/cumulativeContErr is labelled binary under writeFormat binary.
+    if (className == "uniformDimensionedScalarField") return true;
     const bool geometric = className.compare(0, 3, "vol") == 0 || className.compare(0, 7, "surface") == 0
                         || className.compare(0, 5, "point") == 0;
     return field && (geometric || className == "vectorField");
@@ -2243,7 +2252,8 @@ std::string surfaceFieldText(
         else
         {
             const bool constraint = (p.type == "wedge" || p.type == "symmetryPlane" || p.type == "symmetry"
-                                  || p.type == "cyclic" || p.type == "cyclicAMI" || p.type == "cyclicACMI");
+                                  || p.type == "cyclic" || p.type == "cyclicAMI" || p.type == "cyclicACMI"
+                                  || p.type == "processor");
             wordEntry(os, 8, "type", constraint ? p.type : std::string("calculated"));
             const std::vector<typename std::decay<decltype(f.internal[0])>::type> none;
             listEntry(os, 8, "value", pi < f.boundary.size() ? f.boundary[pi] : none, precision);
@@ -2453,7 +2463,7 @@ void InterWriter::write(const InterWriteState& s)
         }
     }
 
-    const std::string dir = caseDir_ + "/" + name;
+    const std::string dir = outRoot_ + "/" + name;
     pending_.clear();
 
     // uniform/time first, always ascii and never compressed (TimeIO.C:508-539)
@@ -3428,8 +3438,8 @@ void InterWriter::write(const InterWriteState& s)
         emit(dir + "/uniform/" + object, os.str(), true);
     }
 
-    // uniform/cumulativeContErr (initContinuityErrs.H:40-52), and the function objects' state file,
-    // empty because brae runs none
+    // uniform/cumulativeContErr (initContinuityErrs.H:40-52), and the function objects' restart state
+    // (functionObjectList::write after the step's objects have run).
     {
         std::ostringstream os;
         os << header("uniformDimensionedScalarField", name + "/uniform", "cumulativeContErr");
@@ -3442,6 +3452,34 @@ void InterWriter::write(const InterWriteState& s)
     {
         std::ostringstream os;
         os << header("dictionary", name + "/uniform/functionObjects", "functionObjectProperties");
+        if (parallel_ && s.functionObjects)
+        {
+            const brae::fo::FunctionObjectState& st = *s.functionObjects;
+            for (const auto& prop : st.properties)
+            {
+                for (const std::string& line : prop.second) os << line << "\n";
+            }
+            if (!st.results.empty())
+            {
+                os << "\ncdf7e925f5746741c316f5fbcf39ad0dfca90775\n{\n";
+                for (const auto& object : st.results)
+                {
+                    os << "    " << object.first << "\n    {\n";
+                    for (const auto& type : object.second)
+                    {
+                        os << "        " << type.first << "\n        {\n";
+                        for (const auto& value : type.second)
+                        {
+                            os << "            " << std::left << std::setw(value.second.width) << value.first
+                               << " " << value.second.text << ";\n";
+                        }
+                        os << "        }\n";
+                    }
+                    os << "    }\n";
+                }
+                os << "}\n";
+            }
+        }
         os << "\n\n// ************************************************************************* //\n";
         emit(dir + "/uniform/functionObjects/functionObjectProperties", os.str(), true);
     }
@@ -3471,7 +3509,7 @@ void InterWriter::write(const InterWriteState& s)
     written_.push_back(name);
     while (purge_ > 0 && static_cast<int>(written_.size()) > purge_)
     {
-        job->remove.push_back(caseDir_ + "/" + written_.front());
+        job->remove.push_back(outRoot_ + "/" + written_.front());
         written_.pop_front();
     }
     if (inStep)

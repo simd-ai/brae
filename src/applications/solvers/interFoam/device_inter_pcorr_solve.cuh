@@ -171,6 +171,9 @@ private:
     DeviceBuffer<scalar> dSlotPhi;
     DeviceBuffer<scalar> dSlotIC;
     DeviceBuffer<scalar> dSlotBC;
+    // correct() on a decomposed mesh: the processor faces' off-diagonal (gamma*magSf*dc) in the processor
+    // interface's face order, which the matrix view's A.proc.coeff points at
+    DeviceBuffer<scalar> dProcCoeff;
 };
 
 } // namespace brae

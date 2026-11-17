@@ -5,6 +5,7 @@
 // The CPU baseline stays the oracle; each GPU kernel is validated against it.
 #include "cf_types.cuh"
 #include <chrono>
+#include <mutex>
 #include <cstdio>
 #include <cuda_runtime.h>
 #include <stdexcept>
@@ -111,6 +112,9 @@ public:
     void* take(std::size_t bytes)
     {
         if (bytes == 0) return nullptr;
+        // the loopback communicator runs one thread a rank in ONE process, all sharing this pool (a device thread of a
+        // multi-process run takes one lock it never contends)
+        std::lock_guard<std::mutex> lock(mu_);
         const std::size_t cls = classOf(bytes);
         if (cls < bytes)
         {
@@ -181,6 +185,7 @@ public:
     void give(void* p, std::size_t bytes)
     {
         if (!p) return;
+        std::lock_guard<std::mutex> lock(mu_);
         if (stats_)
         {
             liveBytes_ -= classOf(bytes);
@@ -234,6 +239,7 @@ public:
     // wants the list kept for good (every block is then retained, as before); never under the exact-size keys.
     void endOfStep()
     {
+        std::lock_guard<std::mutex> lock(mu_);
         ++step_;
         if (!enabled_ || exact_ || step_ <= keep_) return;
         const auto t0 = std::chrono::steady_clock::now();
@@ -593,6 +599,7 @@ private:
     std::set<std::size_t> poisonIds_;
     unsigned long poisonFrom_ = 2;
     unsigned long poisonEntries_ = 0;
+    std::mutex mu_;
     bool enabled_;
     bool exact_;
     bool short_;
@@ -608,20 +615,28 @@ public:
     DeviceBuffer() = default;
     explicit DeviceBuffer(std::size_t n) { resize(n); }
     explicit DeviceBuffer(const std::vector<T>& h) { resize(h.size()); copyFrom(h); }
-    ~DeviceBuffer() { if (d_) detail::devicePool().give(d_, n_ * sizeof(T)); }
+    // A buffer of n elements with `tail` more elements of storage behind them (a multi-GPU field's halo slots,
+    // indices n..n+tail-1: parallel/proc_comm.cuh). size() stays n, so every reduction and BLAS call sees the
+    // owned elements only; data() addresses n+tail contiguous elements. The tail survives resize().
+    DeviceBuffer(std::size_t n, std::size_t tail) : tail_(tail) { resize(n); }
+    // ...from host values of the owned elements, with `tail` halo slots behind them (cellArrayLength, device_mesh.cuh)
+    DeviceBuffer(const std::vector<T>& h, std::size_t tail) : tail_(tail) { resize(h.size()); copyFrom(h); }
+    ~DeviceBuffer() { if (d_) detail::devicePool().give(d_, (n_ + tail_) * sizeof(T)); }
 
     DeviceBuffer(const DeviceBuffer&) = delete;
     DeviceBuffer& operator=(const DeviceBuffer&) = delete;
-    DeviceBuffer(DeviceBuffer&& o) noexcept : d_(o.d_), n_(o.n_) { o.d_ = nullptr; o.n_ = 0; }
+    DeviceBuffer(DeviceBuffer&& o) noexcept : d_(o.d_), n_(o.n_), tail_(o.tail_) { o.d_ = nullptr; o.n_ = 0; o.tail_ = 0; }
     DeviceBuffer& operator=(DeviceBuffer&& o) noexcept
     {
         if (this != &o)
         {
-            if (d_) detail::devicePool().give(d_, n_ * sizeof(T));
+            if (d_) detail::devicePool().give(d_, (n_ + tail_) * sizeof(T));
             d_ = o.d_;
             n_ = o.n_;
+            tail_ = o.tail_;
             o.d_ = nullptr;
             o.n_ = 0;
+            o.tail_ = 0;
         }
         return *this;
     }
@@ -629,10 +644,36 @@ public:
     void resize(std::size_t n)
     {
         if (n == n_) return;
-        if (d_) detail::devicePool().give(d_, n_ * sizeof(T));            // return OLD block (OLD n_) to the pool
+        if (d_) detail::devicePool().give(d_, (n_ + tail_) * sizeof(T));  // return OLD block (OLD n_) to the pool
         n_ = n;
         d_ = nullptr;
-        if (n_) d_ = static_cast<T*>(detail::devicePool().take(n_ * sizeof(T)));
+        if (n_) d_ = static_cast<T*>(detail::devicePool().take((n_ + tail_) * sizeof(T)));
+        if (n_ && tail_) cudaCheck(cudaMemset(d_ + n_, 0, tail_ * sizeof(T)), "halo tail memset");   // a defined start
+    }
+    // capacity() = size() + tail(): what the block holds. resize(n, cap): length n with room for cap >= n elements
+    // (tail = cap - n); a buffer already of this length and capacity is left alone, otherwise it is reallocated.
+    std::size_t capacity() const { return n_ + tail_; }
+    void resize(std::size_t n, std::size_t cap)
+    {
+        if (cap < n) cap = n;
+        const std::size_t tail = cap - n;
+        if (n == n_ && tail == tail_) return;
+        if (d_) detail::devicePool().give(d_, (n_ + tail_) * sizeof(T));
+        d_ = nullptr;
+        n_ = 0;
+        tail_ = tail;
+        resize(n);
+    }
+    // Elements of storage behind size(); data()[size() .. size()+tail()) is addressable. Changing it
+    // reallocates (contents are lost), like resize() to a new size.
+    std::size_t tail() const { return tail_; }
+    void setTail(std::size_t tail)
+    {
+        if (tail == tail_) return;
+        if (d_) detail::devicePool().give(d_, (n_ + tail_) * sizeof(T));
+        tail_ = tail;
+        d_ = nullptr;
+        if (n_) d_ = static_cast<T*>(detail::devicePool().take((n_ + tail_) * sizeof(T)));
     }
     void copyFrom(const std::vector<T>& h)                                // H2D
     {
@@ -653,6 +694,7 @@ public:
 private:
     T*          d_ = nullptr;
     std::size_t n_ = 0;
+    std::size_t tail_ = 0;
 };
 
 } // namespace brae

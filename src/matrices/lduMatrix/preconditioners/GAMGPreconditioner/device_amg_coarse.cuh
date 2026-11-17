@@ -26,6 +26,9 @@ void deviceCoarseLUSolve(int nC, const DeviceBuffer<scalar>& lu, const DeviceBuf
                          const DeviceBuffer<scalar>& rc, DeviceBuffer<scalar>& xc);
 // BRAE_AMG_COARSE_SOLVE (lu | tri | inverse | cholesky), read once; an unknown value is refused
 CoarseSolveKind coarseSolveKind();
+// whether a gate's BRAE_CONTROL_COARSE_INVERSE has made the coarsest solve deliberately other than the inverse (the
+// fused V-cycle, device_amg_fused.cu, then leaves the solve to deviceCoarseDirectSolve)
+bool coarseInverseControlActive();
 // what the kind needs beside the LU, made from it (and, for cholesky, from the level itself); after
 // deviceCoarseLUFactor, outside every capture
 void deviceCoarseDirectPrepare(CoarseSolveKind kind, const DeviceLduView& cv, const scalar* extra,

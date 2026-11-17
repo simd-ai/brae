@@ -330,7 +330,7 @@ inline DeviceWallData buildDeviceWallData(
         std::vector<label> wfBnd;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isCyclicFamilyType(fvp[pi].type)) continue;
             if (isTurbWallPatch(fvp, pi, wfPatch))
                 for (label i = 0; i < fvp[pi].size; ++i)
                     wfBnd.push_back(static_cast<label>(wallFace.size()) + i);

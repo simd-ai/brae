@@ -108,7 +108,7 @@ std::vector<scalar> patchValuesOf(
         // THE DEVICE'S BOUNDARY LAYOUT holds the NON-COUPLED patches only (device_mesh.cuh:41-44),
         // and so does buildDeviceBoundary. A flatten that walks every patch is longer than the arrays
         // it is indexed with and shifts every patch after the first coupled one.
-        if (isCoupledInterfaceType(patches[pi].type)) continue;
+        if (isCyclicFamilyType(patches[pi].type)) continue;
         const std::vector<scalar>& b = f.boundary[pi]->value();
         v.insert(v.end(), b.begin(), b.end());
     }
@@ -328,7 +328,7 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
         // correctLocalBoundaryConditions(), which gives a constraint patch the RESULT's own two cells
         // interpolated (`localConsistency`, GeometricFieldFunctionsM.C) -- a value nothing on the
         // device reads, because the device's nut boundary does not hold that face.
-        if (isCoupledInterfaceType(patches[pi].type)) continue;
+        if (isCyclicFamilyType(patches[pi].type)) continue;
         // "not a `wall`" stands for "not written by a wall function", which is true of every RAS
         // case this loop runs and FALSE under LES kEqn: there nothing is a wall function (the host
         // reader refuses a `nut*` patch type under that model), and a wall's nut is an ordinary
@@ -415,7 +415,7 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
     {
         // ...and neither is it in any of the per-face arrays below, which are indexed by the device's
         // boundary-face number. A coupled patch is never a wall and never a turbulence inlet.
-        if (isCoupledInterfaceType(patches[pi].type)) continue;
+        if (isCyclicFamilyType(patches[pi].type)) continue;
         const bool isWF = isTurbWallPatch(patches, pi, wfPatch);
         // each wall function's OWN coefficients: the nut patch's for nutkWallFunction, the epsilon
         // patch's for epsilonWallFunction
@@ -539,7 +539,7 @@ DeviceInterTurbulence buildDeviceInterTurbulence(
         label bi = 0;
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
-            if (isCoupledInterfaceType(patches[pi].type)) continue;   // the device's boundary layout
+            if (isCyclicFamilyType(patches[pi].type)) continue;   // the device's boundary layout
             const int  kk = t.k.boundary[pi]->turbulentInletKind();
             const int  ek = les ? -1 : second.boundary[pi]->turbulentInletKind();
             const scalar kc = t.k.boundary[pi]->turbulentInletCoefficient();
@@ -684,7 +684,7 @@ void refreshDeviceInterTurbulenceGeometry(
     std::vector<scalar> yBnd;
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
-        if (isCoupledInterfaceType(patches[pi].type)) continue;
+        if (isCyclicFamilyType(patches[pi].type)) continue;
         const bool isWF = isTurbWallPatch(patches, pi, wfPatch);
         for (label i = 0; i < patches[pi].size; ++i)
         {
@@ -1468,7 +1468,7 @@ void downloadDeviceInterTurbulence(
         // with nut_.correctBoundaryConditions() (kEpsilon.C:45-46), and on a constraint patch that is
         // coupledFvPatchField::evaluate, lerp(patchNeighbourField, patchInternalField, weights) --
         // the two CELLS of the nut just written, and not Cmu*k_b^2/eps_b.
-        if (isCoupledInterfaceType(patches[pi].type))
+        if (isCyclicFamilyType(patches[pi].type))
         {
             t.nut.boundary[pi]->evaluate(t.nut.internal);
             continue;
@@ -1504,7 +1504,7 @@ void downloadDeviceInterTurbulence(
             std::size_t o = 0;
             for (std::size_t pi = 0; pi < patches.size(); ++pi)
             {
-                if (isCoupledInterfaceType(patches[pi].type)) continue;
+                if (isCyclicFamilyType(patches[pi].type)) continue;
                 const std::size_t n = static_cast<std::size_t>(patches[pi].size);
                 if (o + n > h.size()) break;
                 out[pi].assign(h.begin() + o, h.begin() + o + n);

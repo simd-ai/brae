@@ -407,7 +407,7 @@ inline void writeVolField(
                        : (derived ? "calculated" : "zeroGradient");
             d = &synth;
         }
-        const bool coupled = (isCoupledInterfaceType(p.type));
+        const bool coupled = (isCyclicFamilyType(p.type));
         const bool haveComputed = !computedBoundary.empty() && !coupled && p.size > 0
                                && bndOff + static_cast<std::size_t>(p.size) <= computedBoundary.size()
                                && p.type != "empty";
@@ -458,7 +458,7 @@ inline void writeSurfaceField(
     for (const auto& p : patches)
     {
         out << "    " << p.name << "\n    {\n";
-        if (isCoupledInterfaceType(p.type))   // coupled: flux held on the interface, not in phiBoundary
+        if (isCyclicFamilyType(p.type))   // coupled: flux held on the interface, not in phiBoundary
         {
             out << "        type            " << p.type << ";\n";
             const auto cv = coupledValues.find(p.name);

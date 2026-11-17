@@ -6,6 +6,37 @@
 
 namespace brae {
 
+// GLOBAL REDUCTIONS OF A DECOMPOSED MESH. With a ProcComm of more than one rank installed (ProcComm::current(), the
+// multi-GPU run), every reduction below -- deviceDot, deviceSumMag, deviceMaxRatio, the *Into variants, minmax --
+// returns the GLOBAL result: the rank-local value combined over all ranks in rank order (ProcComm::allReduce, the same
+// bits on every rank); the device-resident variants stay device-resident (an in-place device allReduce enqueued on
+// the stream). With no communicator, or a single rank, none of that code runs: no extra launch, no allocation, the
+// same numbers as ever.
+//
+// A LocalReductions scope turns that off for the work that must stay rank-local: the multigrid V-cycle's internal dots
+// (the scaled-correction line search, the Chebyshev spectrum estimate), a norm of a rank's own data. Nest freely;
+// per thread.
+inline int& localReductionDepth()
+{
+    thread_local int depth = 0;
+    return depth;
+}
+class LocalReductions
+{
+public:
+    LocalReductions() { ++localReductionDepth(); }
+    ~LocalReductions() { --localReductionDepth(); }
+    LocalReductions(const LocalReductions&) = delete;
+    LocalReductions& operator=(const LocalReductions&) = delete;
+};
+// Counters of the decomposed hooks (np > 1 only; a single-GPU run never touches them): collectives the reduction
+// hook enqueued and halo exchanges the matrix product issued. For the tests that state "N collectives per PCG iteration".
+struct ProcHookCounts { long long reductions = 0, exchanges = 0; };
+ProcHookCounts& procHookCountsRef();
+inline ProcHookCounts procHookCounts() { return procHookCountsRef(); }
+// True when the reductions are global right now (a communicator of >1 rank and no LocalReductions scope).
+bool deviceReductionsGlobal();
+
 void   deviceAxpy(scalar a, const DeviceBuffer<scalar>& x, DeviceBuffer<scalar>& y);  // y += a*x
 void   deviceScale(DeviceBuffer<scalar>& x, scalar a);                                // x *= a
 // BRAE_DEVICE_OF_REDUCE=1: every dot and sum(|x|) below in OpenFOAM's sequential cell order (reductions.cu)
@@ -31,6 +62,10 @@ scalar deviceSumMag(const DeviceBuffer<scalar>& x);                             
 // max over i of x[i]/y[i], skipping y[i] <= 0. The Courant number is a MAXIMUM, which cannot be built
 // from the sum/dot reductions above; this keeps it a single device pass returning one scalar.
 scalar deviceMaxRatio(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y);
+// The Courant number's three reductions at once: {max_i x[i]/y[i] (y > 0), sum|x|, sum|y|}. With no communicator these
+// are deviceMaxRatio, deviceSumMag(x) and deviceSumMag(y) as they always were. Under -parallel the three global
+// reductions are device-resident and the host reads the three results together: one synchronisation, not three.
+void   deviceCourantReductions(const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& y, scalar out[3]);
 void   deviceHadamard(DeviceBuffer<scalar>& out, const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& b);  // out = a.*b
 void   deviceDivide(DeviceBuffer<scalar>& out, const DeviceBuffer<scalar>& a, const DeviceBuffer<scalar>& b);     // out = a./b (0 where b==0)
 // fused multi-term BLAS-1 (fewer launches + less memory traffic, bit-identical to the separate-kernel sequences):

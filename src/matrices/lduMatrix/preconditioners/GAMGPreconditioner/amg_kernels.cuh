@@ -8,6 +8,7 @@
 // come from device_amg_detail.cuh (inlined per TU). The non-template single-precision K kernels stay in device_amg.cu.
 // ---------------------------------------------------------------------------------------------------------------
 #include "device_amg_detail.cuh"  // safeDiag<T>, OMEGA, and cf_types (scalar/label)
+#include "amg_cell_ops.cuh"      // the per-element expressions, shared with the fused coarse-level kernel
 #include <cuda_runtime.h>
 
 namespace brae {
@@ -34,7 +35,7 @@ void smoothT(
     T* __restrict__ x)
 {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
-    if (i < n) x[i] += T(OMEGA)*(b[i]-Ax[i])/safeDiag(diag[i]);   // safeDiag: floor the (FP32) diagonal, never divide by ~0 -> no Inf/NaN preconditioner
+    if (i < n) x[i] = cellSmooth<T>(x[i], b[i], Ax[i], diag[i]);   // safeDiag inside: floor the (FP32) diagonal, never divide by ~0 -> no Inf/NaN preconditioner
 }
 // The FIRST weighted-Jacobi sweep of a cycle, whose x is zero: A*x is zero, so the product is not formed. The
 // expression is smoothT's own with x = 0 and Ax = 0 written in -- 0 + omega*(b - 0)/diag -- so the result is
@@ -49,7 +50,7 @@ void smoothFromZeroT(
     T* __restrict__ x)
 {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
-    if (i < n) x[i] = T(0) + T(OMEGA)*(b[i] - T(0))/safeDiag(diag[i]);
+    if (i < n) x[i] = cellSmoothFromZero<T>(b[i], diag[i]);
 }
 template <typename T>
 __global__
@@ -60,7 +61,7 @@ void residualT(
     T* __restrict__ r)
 {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
-    if (i < n) r[i] = b[i]-Ax[i];
+    if (i < n) r[i] = cellResidual<T>(b[i], Ax[i]);
 }
 // One color of in-place Gauss-Seidel: cells in [lo,hi) share no face, so the writes never race and the
 // off-diagonal reads pick up already-swept colors -> true GS, not Jacobi. Same LDU gather as the SpMV.
@@ -265,9 +266,7 @@ void restrictGatherT(
 {
     const int ci = blockIdx.x*blockDim.x + threadIdx.x;
     if (ci >= nCoarse) return;
-    T s = T(0);
-    for (label k = cellStart[ci]; k < cellStart[ci+1]; ++k) s += r[cellList[k]];
-    rc[ci] = s;
+    rc[ci] = cellRestrict<T>(cellStart, cellList, r, ci);
 }
 template <typename T>
 __global__
@@ -278,7 +277,7 @@ void prolongT(
     T* __restrict__ x)
 {
     const int c = blockIdx.x*blockDim.x + threadIdx.x;
-    if (c < nF) x[c] += xc[map[c]];   // injection correction
+    if (c < nF) x[c] = cellProlong<T>(x[c], xc[map[c]]);   // injection correction
 }
 
 } // namespace brae

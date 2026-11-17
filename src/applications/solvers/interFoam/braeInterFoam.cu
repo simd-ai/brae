@@ -194,11 +194,17 @@
 #include "fv_patch.cuh"
 #include "inter_driver_cpp.cuh"
 #include "start_time.cuh"
+#include "case_roots.cuh"
+#include "inter_parallel.cuh"
+#include "inter_proc_geometry.cuh"
+#include "inter_proc_comm.cuh"
 #include "time_instances.cuh"
 #include "foam_dict.cuh"
 #include <cstdio>
 #include <cstring>
+#include "case_decompose.cuh"
 #include <exception>
+#include <memory>
 #include <stdexcept>
 #include <string>
 
@@ -209,6 +215,9 @@ int main(int argc, char** argv)
     // before any CUDA call: see device_schedule.cuh
     brae::setCudaSchedule();
     bool onDevice = false;
+    bool parallel = false;
+    int rankFlag = -1, nProcsFlag = -1;
+    bool noReconstruct = false;
     std::string caseDir = ".";
     // WHAT `brae` HANDS ON IS WHAT THIS TAKES: the launcher forwards its own arguments unchanged
     // (solver_dispatch.cuh), and a user may have typed the case as `-case <dir>` or as a bare directory. A bare
@@ -222,18 +231,34 @@ int main(int argc, char** argv)
         {
             caseDir = argv[++i];
         }
+        else if (a == "-noReconstruct")
+        {
+            noReconstruct = true;
+        }
         else if (a == "-device")
         {
             onDevice = true;
         }
+        else if (a == "-parallel")
+        {
+            parallel = true;
+        }
+        else if ((a == "-rank" || a == "-nprocs") && i + 1 < argc)
+        {
+            char* end = nullptr;
+            const long v = std::strtol(argv[i + 1], &end, 10);
+            (a == "-rank" ? rankFlag : nProcsFlag) = (end != argv[i + 1] && *end == '\0' && v >= 0) ? (int)v : -2;
+            ++i;
+        }
         else if (a == "-help" || a == "--help" || a == "-h")
         {
             std::printf("brae_interFoam: OpenFOAM's interFoam, re-ported.\n"
-                        "  usage: brae_interFoam [-case] <dir> [-device]\n"
-                        "    -device  run the time loop on the GPU (runInterFoamDevice). The same\n"
-                        "             components and the same case translation; the boundary\n"
-                        "             conditions stay on the host. Without it the HOST loop runs: the\n"
-                        "             reference the gates hold to OpenFOAM, on one core.\n"
+                        "  usage: brae_interFoam [-case] <dir> [-device] [-parallel [-rank N -nprocs M]]\n"
+                        "    -parallel  read decomposePar's processor<rank>/ of the case: dictionaries from the\n"
+                        "             case, mesh, fields and output from the rank's directory. Rank and size\n"
+                        "             come from mpirun's environment, or from -rank N -nprocs M. Processor\n"
+                        "             patches are coupled by the device loop (BRAE_MGPU_GEOMETRY_ONLY=1\n"
+                        "             stops after its geometry dump).\n"
                         "  `brae <dir>` on a case whose controlDict says `application interFoam` runs\n"
                         "  this binary with -device.\n");
             return 0;
@@ -249,8 +274,14 @@ int main(int argc, char** argv)
     }
     brae::setCaseEnvironment(caseDir);   // FOAM_CASE, before any dictionary is read (argList.C:891-893)
 
+    // The communicator is needed by the case reader as well as by the time loop (pRefPoint, deltaN and
+    // function-object setup). Guard the WHOLE invocation: a rank-local reader/start-up exception must be
+    // published, not turn into an anonymous timeout in another rank's first collective.
+    std::unique_ptr<brae::cpu::interFoam::InterProcComm> procComm;
     try
     {
+        try
+        {
         using namespace brae;
         using namespace brae::cpu::interFoam;
 
@@ -260,7 +291,25 @@ int main(int argc, char** argv)
                 "the option `" + unknownOption + "` is not one this solver takes. It takes `-case <dir>` or a "
                 "bare case directory, and `-device` for the GPU loop.");
         }
-        const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
+        if (rankFlag == -2 || nProcsFlag == -2)
+        {
+            throw std::runtime_error("`-rank` and `-nprocs` take a non-negative integer.");
+        }
+        // the dictionary root (the case) and the rank's root (processor<rank> under -parallel, the case itself
+        // otherwise): common/case_roots.cuh
+        // `-parallel` on a case nobody decomposed: brae decomposes it (the first rank to start does, the others wait), and puts the
+        // case back together when the run ends. A case that already has processor directories is the user's own, and is left to
+        // makeCaseRoots to check against the size of the run.
+        // Every rank asks, including one that starts after rank 0 has made the first directory: while a decomposition holds its lock
+        // the directories are not all there, and a finished one (or the user's own) is answered at once.
+        if (parallel)
+        {
+            int dRank = rankFlag, dProcs = nProcsFlag;
+            if (dRank >= 0 || rankFromEnvironment(dRank, dProcs))
+                if (dProcs >= 1) decompose::decomposeForRun(caseDir, dProcs);
+        }
+        const CaseRoots roots = makeCaseRoots(caseDir, parallel, rankFlag, nProcsFlag);
+        const FoamDict controlDict = readDict(roots.dictDir + "/system/controlDict");
         // THE ENTRIES Time READS, AS Time READS THEM (Time.C:146-190, TimeIO.C:268-356). `deltaT` is
         // mandatory -- it defaulted to 1e-3 here; `startFrom` defaults to latestTime -- it defaulted to
         // startTime, so a case without the entry restarted from 0 over its own output; any other word than
@@ -310,9 +359,10 @@ int main(int argc, char** argv)
         // the probe is the case's OWN phase field: `alpha.water` here sent a `startFrom latestTime` restart
         // of any other phase name (hifoam's alpha.liquidN2) silently back to startTime, where the writer
         // would then overwrite and purge the run's own output
-        const std::string phase1 = cpu::twoPhase::readTransportProperties(caseDir).phase1Name;
+        const std::string phase1 = cpu::twoPhase::readTransportProperties(roots.dictDir).phase1Name;
         const std::string alphaProbe = "alpha." + phase1;
-        const StartTime start = resolveStartTime(caseDir, controlDict, alphaProbe.c_str());
+        // under -parallel the start directory is looked up in processor0 (roots.masterProcDir()), as decomposePar writes it
+        const StartTime start = resolveStartTime(roots.masterProcDir(), controlDict, alphaProbe.c_str());
         const std::string startName = start.name;
         const scalar startTime = static_cast<scalar>(start.value);
 
@@ -321,14 +371,25 @@ int main(int argc, char** argv)
         // boundary separately (cpu::timePaths::meshInstances, mirroring polyMesh.C:175-245). This used to be
         // `constant/polyMesh` in four places, so a genuine restart read the mesh the case STARTED from.
         const cpu::timePaths::MeshInstances mi =
-            cpu::timePaths::meshInstancesForStartDir(caseDir, caseDir + "/" + startName);
+            cpu::timePaths::meshInstancesForStartDir(roots.procDir, roots.procDir + "/" + startName);
         if (mi.points != "constant" || mi.faces != "constant")
         {
             std::fprintf(stderr, "brae: mesh instances -- points '%s', faces '%s', boundary '%s'\n",
                          mi.points.c_str(), mi.faces.c_str(), mi.boundary.c_str());
         }
         PrimitiveMesh m;
-        m.read(mi.pointsDir(caseDir), mi.facesDir(caseDir), mi.boundaryDir(caseDir));
+        m.read(mi.pointsDir(roots.procDir), mi.facesDir(roots.procDir), mi.boundaryDir(roots.procDir));
+        if (roots.parallel)
+        {
+            std::printf("%s", cpu::interFoam::processorPatchTable(roots, m.patches()).c_str());
+            std::fflush(stdout);
+            cpu::interFoam::refuseUnderParallel(roots, m.patches());
+        }
+        cpu::interFoam::refuseProcessorCoupling(roots, m.patches());
+        if (roots.parallel && onDevice)
+        {
+            procComm = std::make_unique<InterProcComm>(argc, argv, roots);
+        }
         FvGeometry g;
         g.build(m);
         // mirrorACMI: this loop couples a coincident cyclicACMI pair itself; the device loop, handed the
@@ -352,7 +413,14 @@ int main(int argc, char** argv)
         // beside its faces (DeviceCyclic's CyclicNbr) and reads the neighbour the host does.
         // the BOUNDARY instance: the AMI entries are read from polyMesh/boundary, which polyMesh
         // resolves separately from the faces and never older than them
-        amiPairs = cpu::cyclicAMIFvPatch::setup(mi.boundaryDir(caseDir), m, g, patches);
+        amiPairs = cpu::cyclicAMIFvPatch::setup(mi.boundaryDir(roots.procDir), m, g, patches);
+        // THE MULTI-GPU GATE (BRAE_MGPU_GEOMETRY_ONLY=1, inter_parallel.cuh): couple the processor patches, build the
+        // device interface, write the geometry dump and stop. With the gate closed refuseProcessorCoupling above has
+        // already stopped a decomposition with processor faces by name.
+        if (roots.parallel && mgpuGeometryOnly())
+        {
+            return runProcessorGeometryOnly(argc, argv, roots, m, g, patches);
+        }
         // ...handed to the host loop mutable as well, for a case whose mesh moves (MutableMesh)
         MutableMesh mutableMesh;
         mutableMesh.m = &m;
@@ -364,7 +432,7 @@ int main(int argc, char** argv)
         // The start directory OpenFOAM would use. `0` is written as `0` and not `0.000000`, which is what
         // every tutorial ships -- and under `startFrom latestTime` it is the directory resolveStartTime
         // found, whose NAME is what OpenFOAM's timeName() would be (so `0.002` and not `0.0020000`).
-        const std::string startDir = caseDir + "/" + startName;
+        const std::string startDir = roots.procDir + "/" + startName;
 
         // An upper bound on the steps, and endTime below is the REAL bound. A fixed-step case needs
         // exactly (end-start)/dt; an adjustTimeStep case cannot be counted ahead of time, because
@@ -391,16 +459,53 @@ int main(int argc, char** argv)
         std::printf("%s", hostAllocatorNotice.c_str());
 
         // the time directories, at OpenFOAM's write times (inter_writer_cpp.cuh)
-        cpu::interFoam::InterWriter writer(caseDir, startDir, patches, phase1);
+        cpu::interFoam::InterWriter writer(roots, startDir, patches, phase1);
 
+        // THE MULTI-GPU COMMUNICATOR (under -parallel on the device loop): ProcComm::current() for the run,
+        // which the driver couples its processor patches over. BRAE_MGPU_STAGE_DUMP=<dir> selects the
+        // per-rank operator-stage dump instead of a normal time loop (inter_stage_dump.cuh).
+        if (!mgpuStageDumpDir().empty() && !onDevice)
+        {
+            throw std::runtime_error("BRAE_MGPU_STAGE_DUMP needs `-device` (serial for the np = 1 floor, or -parallel).");
+        }
+
+        DeviceInterStepTaps stageTaps;
+        DeviceInterStepTaps* const taps = mgpuStageDumpDir().empty() ? nullptr : &stageTaps;
         // ONE case translation and ONE time loop per path, both the ones the gates call. A private
         // copy here would be the defect this file's header names.
-        const RunReport r = onDevice
-            ? runInterFoamDevice(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/true,
-                                 /*fieldsOut=*/nullptr, endTime, /*tapsOut=*/nullptr, &mutableMesh, &writer)
-            : runInterFoam(caseDir, startDir, m, g, patches, nSteps, /*verbose=*/true,
-                           /*fieldsOut=*/nullptr, endTime, /*pressureTaps=*/nullptr, &mutableMesh,
-                           /*alphaTaps=*/nullptr, &writer);
+        RunReport r;
+        const auto runLoop = [&]() {
+            r = onDevice
+                ? runInterFoamDevice(roots, startDir, m, g, patches, nSteps, /*verbose=*/true,
+                                     /*fieldsOut=*/nullptr, endTime, taps, &mutableMesh, &writer)
+                : runInterFoam(roots, startDir, m, g, patches, nSteps, /*verbose=*/true,
+                               /*fieldsOut=*/nullptr, endTime, /*pressureTaps=*/nullptr, &mutableMesh,
+                               /*alphaTaps=*/nullptr, &writer);
+        };
+        if (procComm) procComm->comm().guarded(runLoop);
+        else runLoop();
+
+        // a case brae decomposed for this run is put back together: every rank's last write is down, then rank 0 merges
+        if (procComm && !noReconstruct && decompose::decomposedByRun(caseDir))
+        {
+            procComm->comm().barrier();
+            if (roots.rank == 0)
+            {
+                try
+                {
+                    decompose::ReconstructOptions ro;
+                    const decompose::ReconstructReport rr = decompose::reconstructCase(caseDir, ro);
+                    std::printf("brae: reconstructed %zu time(s) into %s (the processor directories are kept)\n", rr.times.size(), caseDir.c_str());
+                }
+                catch (const std::exception& e)
+                {
+                    std::fprintf(stderr, "brae interFoam: the run finished, but putting the case back together failed: %s\n"
+                                         "  The processor directories hold the results; `brae reconstruct -case %s` retries.\n",
+                                 e.what(), caseDir.c_str());
+                    return 1;
+                }
+            }
+        }
 
         if (r.steps >= nSteps && r.time < endTime - scalar(0.5)*r.deltaT)
         {
@@ -432,6 +537,16 @@ int main(int argc, char** argv)
         std::printf("End: t = %.6g, alpha in [%.3e, %.8f], max|U| %.4g m/s, worst |div(phi)| %.3e\n",
                     (double)r.time, (double)r.alphaMin, (double)r.alphaMax,
                     (double)r.maxU, (double)r.worstDivPhi);
+        }
+        catch (const brae::ProcCommAbort&)
+        {
+            throw;
+        }
+        catch (const std::exception& e)
+        {
+            if (procComm) procComm->comm().collectiveAbort(e.what());
+            throw;
+        }
         return 0;
     }
     catch (const std::exception& e)

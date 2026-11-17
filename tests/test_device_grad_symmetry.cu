@@ -117,7 +117,7 @@ int runCase(
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         const FvPatch& q = fvp[pi];
-        if (isCoupledInterfaceType(q.type)) continue;
+        if (isCyclicFamilyType(q.type)) continue;
         const bool plane = (q.type == "symmetry" || q.type == "symmetryPlane");
         for (label i = 0; i < q.size; ++i, ++bi)
         {

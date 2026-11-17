@@ -78,8 +78,10 @@ endif()
 add_library(brae_core STATIC
     src/functionObjects/forces_device.cu
     src/parallel/pstream/cf_pstream.cu
-    src/parallel/pstream/device_halo.cu
-    src/parallel/pstream/device_reduce.cu
+    src/parallel/proc_comm.cu
+    src/parallel/proc_hooks.cu
+    src/parallel/processor_coupling.cu
+    src/parallel/proc_topology.cu
     src/OpenFOAM/meshes/interface/processor_interface.cu
     src/OpenFOAM/db/foam_token_reader.cu
     src/OpenFOAM/db/dynamicLibrary/codedBase/coded_library.cu
@@ -93,6 +95,8 @@ add_library(brae_core STATIC
     src/finiteVolume/fvMesh/fvPatches/constraint/cyclicACMI/cyclic_acmi_cpp.cu
     src/OpenFOAM/decompose/scotch_decomposition.cu
     src/OpenFOAM/decompose/domain_decomposition.cu
+    src/OpenFOAM/decompose/case_decompose.cu
+    src/OpenFOAM/decompose/field_decompose.cu
     src/TurbulenceModels/turbulenceModels/derivedFvPatchFields/wallFunctions/nut_wall_function.cu
     src/finiteVolume/finiteVolume/fvc.cu
     src/finiteVolume/finiteVolume/fvm.cu
@@ -133,6 +137,7 @@ add_library(brae_core STATIC
     src/matrices/lduMatrix/lduMatrix/blas1.cu
     src/matrices/lduMatrix/lduMatrix/reductions.cu
     src/matrices/lduMatrix/lduMatrix/device_spmv.cu
+    src/matrices/lduMatrix/lduMatrix/device_proc_interface.cu
     src/matrices/lduMatrix/preconditioners/DILUPreconditioner/device_dilu.cu
     src/TurbulenceModels/turbulenceModels/linearViscousStress/linearViscousStress_cpp.cu
     src/TurbulenceModels/turbulenceModels/laminar/generalizedNewtonian/generalizedNewtonian_cpp.cu
@@ -185,6 +190,7 @@ add_library(brae_core STATIC
     src/waveModels/waveGenerationModels/derived/McCowan/mccowan_wave_model_cpp.cu
     src/waveModels/waveAbsorptionModels/derived/shallowWaterAbsorption/shallow_water_absorption_cpp.cu
     src/transportModels/interfaceProperties/device_interface_properties.cu
+    src/transportModels/interfaceProperties/device_glibc_math.cu
     src/transportModels/twoPhaseMixture/device_two_phase_mixture.cu
     src/transportModels/interfaceProperties/interface_properties_cpp.cu
     src/applications/solvers/interFoam/inter_solve_cpp.cu
@@ -264,6 +270,7 @@ add_library(brae_core STATIC
     src/matrices/lduMatrix/smoothers/symGaussSeidel/device_sym_gauss_seidel.cu
     src/matrices/lduMatrix/smoothers/GaussSeidel/device_colour_gauss_seidel.cu
     src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_vcycle.cu
+    src/matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_fused.cu
     src/matrices/lduMatrix/solvers/PCG/device_amg_pcg.cu
     src/matrices/lduMatrix/solvers/GAMG/device_gamg_solver.cu
     src/cuda/device_cluster.cu
@@ -271,6 +278,10 @@ add_library(brae_core STATIC
     src/cuda/device_ami.cu
     src/applications/solvers/simpleFoam/device_simple_foam.cu
 )
+# device_glibc_math.cu reproduces glibc's acos and cos bit for bit with every operation spelled out; no operation in
+# it may be contracted into an fma behind that.
+set_source_files_properties(src/transportModels/interfaceProperties/device_glibc_math.cu
+                            PROPERTIES COMPILE_OPTIONS "-fmad=false")
 target_include_directories(brae_core PUBLIC ${BRAE_HEADER_DIRS} ${MPI_CXX_INCLUDE_DIRS} ${SCOTCH_INCLUDE_DIR})
 # Link MPI libraries directly (not the imported target) so its CXX compile flags do not
 # reach nvcc, which would reject them.
@@ -282,35 +293,39 @@ if(OpenMP_CXX_FOUND)
     target_link_libraries(brae_core PUBLIC ${OpenMP_CXX_LIBRARIES})
 endif()
 
+
 # ---------------------------------------------------------------------------
-# NVSHMEM device transport (multi-GPU, Phase 1+). Phase 1a is host-side only: the bootstrap
-# (nvshmemx_init_attr off MPI) and the symmetric heap (nvshmem_malloc) link against libnvshmem_host and need
-# NO relocatable device code. Phase 1b's device-initiated put adds -rdc + device-link on its own TU only.
-# Default ON; if NVSHMEM is not found the build falls back to the MPI backend (single-GPU still compiles).
-# Override the location with -DNVSHMEM_HOME=... or the NVSHMEM_HOME env var.
+# NCCL transport of ProcComm (multi-GPU interFoam, one process per GPU; src/parallel/proc_comm.cu). Default OFF:
+# the ProcComm NCCL backend is then a stub that throws. ON finds NCCL under -DNCCL_ROOT=... / -DNCCL_HOME=...,
+# the NCCL_ROOT / NCCL_HOME environment variables or CMAKE_PREFIX_PATH (a dir holding include/nccl.h and
+# lib/libnccl.so; the pip wheel nvidia-nccl-cu12 unpacked works after `ln -s libnccl.so.2 lib/libnccl.so`).
+# Only proc_comm.cu sees the NCCL define and include path; every executable linking brae_core also links libnccl.
 # ---------------------------------------------------------------------------
-option(BRAE_WITH_NVSHMEM "Build the NVSHMEM device transport for multi-GPU" ON)
-if(BRAE_WITH_NVSHMEM)
-    find_path(NVSHMEM_INCLUDE_DIR NAMES nvshmem.h
-        HINTS $ENV{NVSHMEM_HOME} ${NVSHMEM_HOME}
-        PATHS /opt/nvidia/hpc_sdk/Linux_aarch64/26.5/comm_libs/13.2/nvshmem
+option(BRAE_WITH_NCCL "Build the NCCL backend of ProcComm (multi-GPU, one process per GPU)" OFF)
+if(BRAE_WITH_NCCL)
+    find_path(NCCL_INCLUDE_DIR NAMES nccl.h
+        HINTS ${NCCL_ROOT} $ENV{NCCL_ROOT} ${NCCL_HOME} $ENV{NCCL_HOME}
         PATH_SUFFIXES include)
-    find_library(NVSHMEM_HOST_LIB NAMES nvshmem_host
-        HINTS $ENV{NVSHMEM_HOME} ${NVSHMEM_HOME}
-        PATHS /opt/nvidia/hpc_sdk/Linux_aarch64/26.5/comm_libs/13.2/nvshmem
-        PATH_SUFFIXES lib)
-    if(NVSHMEM_INCLUDE_DIR AND NVSHMEM_HOST_LIB)
-        get_filename_component(NVSHMEM_LIB_DIR ${NVSHMEM_HOST_LIB} DIRECTORY)
-        message(STATUS "cf NVSHMEM: ${NVSHMEM_HOST_LIB} (hdr ${NVSHMEM_INCLUDE_DIR})")
-        target_include_directories(brae_core PUBLIC ${NVSHMEM_INCLUDE_DIR})
-        target_link_libraries(brae_core PUBLIC ${NVSHMEM_HOST_LIB})
-        target_compile_definitions(brae_core PUBLIC BRAE_WITH_NVSHMEM)
-        # Find libnvshmem_host.so.3 and the dlopen'd MPI bootstrap plugin at runtime.
-        list(APPEND CMAKE_BUILD_RPATH ${NVSHMEM_LIB_DIR})
-    else()
-        message(WARNING "cf NVSHMEM requested but not found; building the MPI backend only (single-GPU)")
-        set(BRAE_WITH_NVSHMEM OFF)
+    find_library(NCCL_LIBRARY NAMES nccl libnccl.so.2
+        HINTS ${NCCL_ROOT} $ENV{NCCL_ROOT} ${NCCL_HOME} $ENV{NCCL_HOME}
+        PATH_SUFFIXES lib lib64)
+    if(NOT NCCL_INCLUDE_DIR OR NOT NCCL_LIBRARY)
+        message(FATAL_ERROR "BRAE_WITH_NCCL=ON but NCCL was not found: set -DNCCL_ROOT=<dir with include/nccl.h and lib/libnccl.so> "
+                            "(or NCCL_HOME / CMAKE_PREFIX_PATH)")
     endif()
+    get_filename_component(NCCL_LIB_DIR ${NCCL_LIBRARY} DIRECTORY)
+    file(READ ${NCCL_INCLUDE_DIR}/nccl.h _nccl_h)
+    set(_nccl_defs BRAE_WITH_NCCL)
+    if(_nccl_h MATCHES "graphUsageMode")
+        list(APPEND _nccl_defs BRAE_NCCL_HAVE_GRAPH_USAGE_MODE)
+    else()
+        message(WARNING "cf NCCL: this nccl.h has no ncclConfig.graphUsageMode; the graph communicator relies on NCCL_GRAPH_MIXING_SUPPORT=0 (set by ProcComm)")
+    endif()
+    message(STATUS "cf NCCL: ${NCCL_LIBRARY} (hdr ${NCCL_INCLUDE_DIR})")
+    set_source_files_properties(src/parallel/proc_comm.cu PROPERTIES
+        COMPILE_DEFINITIONS "${_nccl_defs}" INCLUDE_DIRECTORIES "${NCCL_INCLUDE_DIR}")
+    target_link_libraries(brae_core PUBLIC ${NCCL_LIBRARY})
+    list(APPEND CMAKE_BUILD_RPATH ${NCCL_LIB_DIR})
 endif()
 
 # ---------------------------------------------------------------------------
@@ -339,6 +354,158 @@ foreach(_np 1 2 4 8)
                      $<TARGET_FILE:test_gpu_bind>)
 endforeach()
 
+# Multi-GPU WP2: ProcComm (operator-side communication shim); loopback backend = N virtual ranks on one GPU
+add_executable(test_proc_comm tests/test_proc_comm.cu)
+target_include_directories(test_proc_comm PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_proc_comm PRIVATE brae_core)
+add_test(NAME proc_comm_loopback COMMAND test_proc_comm)
+set_tests_properties(proc_comm_loopback PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+# the same tests on the MPI-host backend: one process per rank, np > GPUs is fine
+foreach(_np 1 2 3 4 8)
+    add_test(NAME proc_comm_mpi_np${_np}
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                     $<TARGET_FILE:test_proc_comm> mpi)
+    set_tests_properties(proc_comm_mpi_np${_np} PROPERTIES TIMEOUT 300)
+endforeach()
+# A side-channel nonblocking allgather is live until MPI_Test reports completion. These small
+# tests cover both driver branches; the repeated REAL interFoam explicit-stage launch is the
+# regression for the np=8 PMIx/glibc teardown corruption (a prepared case avoids oracle setup).
+add_executable(test_proc_comm_teardown tests/test_proc_comm_teardown.cu)
+target_include_directories(test_proc_comm_teardown PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_proc_comm_teardown PRIVATE brae_core)
+add_test(NAME proc_comm_teardown_unit_np8
+         COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 8 $<TARGET_FILE:test_proc_comm_teardown>)
+set_tests_properties(proc_comm_teardown_unit_np8 PROPERTIES TIMEOUT 180)
+add_test(NAME proc_comm_teardown_serialized_np8
+         COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 8 $<TARGET_FILE:test_proc_comm_teardown> serialized)
+set_tests_properties(proc_comm_teardown_serialized_np8 PROPERTIES TIMEOUT 180)
+add_test(NAME proc_comm_teardown_np8
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/proc_comm_teardown.sh $<TARGET_FILE:brae_interFoam>)
+set_tests_properties(proc_comm_teardown_np8 PROPERTIES TIMEOUT 3600 SKIP_RETURN_CODE 77)
+
+# Reduction scratch/caches/counters are per loopback rank thread (finding 7): concurrent ranks use differently
+# sized buffers and check every host-read result against independent global arithmetic.
+add_executable(test_loopback_reduction_threads tests/test_loopback_reduction_threads.cu)
+target_include_directories(test_loopback_reduction_threads PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_loopback_reduction_threads PRIVATE brae_core)
+foreach(_np 2 4 8)
+    add_test(NAME loopback_reduction_threads_np${_np} COMMAND test_loopback_reduction_threads ${_np})
+    set_tests_properties(loopback_reduction_threads_np${_np} PROPERTIES TIMEOUT 300)
+endforeach()
+
+# Processor faces are stably grouped by pass at interface construction (finding 13): grouped contiguous-range
+# launches must be bit-identical to the old full-face/filter launches (A/B inside the test).
+add_executable(test_proc_pass_grouping tests/test_proc_pass_grouping.cu)
+target_include_directories(test_proc_pass_grouping PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_proc_pass_grouping PRIVATE brae_core)
+add_test(NAME proc_pass_grouping COMMAND test_proc_pass_grouping)
+set_tests_properties(proc_pass_grouping PROPERTIES TIMEOUT 120)
+
+# Global Courant numbers / time steps and zero-cell-rank collective participation (findings 4 and 6).
+add_executable(test_courant_global tests/test_courant_global.cu)
+target_include_directories(test_courant_global PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_courant_global PRIVATE brae_core)
+foreach(_np 1 2 4 8)
+    add_test(NAME courant_global_np${_np}
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_courant_global>)
+    set_tests_properties(courant_global_np${_np} PROPERTIES TIMEOUT 240)
+endforeach()
+
+# Negative controls of the deadlock windows (post-status rank failure, capacity abort, NCCL queued-work failure,
+# forced revoke/quiesce failure, one-sided processor patch). Each mode has its own watchdog and asserts that every
+# rank returns the same ProcCommAbort; the test FAILS (watchdog exit 3) on the un-fixed backends.
+add_executable(test_proc_comm_failure tests/test_proc_comm_failure.cu)
+target_include_directories(test_proc_comm_failure PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_proc_comm_failure PRIVATE brae_core)
+foreach(_np 2 4 8)
+    foreach(_mode post-status capacity asym)
+        add_test(NAME proc_comm_failure_${_mode}_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                         $<TARGET_FILE:test_proc_comm_failure> mpi ${_mode})
+        set_tests_properties(proc_comm_failure_${_mode}_np${_np} PROPERTIES TIMEOUT 180 SKIP_RETURN_CODE 77)
+    endforeach()
+endforeach()
+if(BRAE_WITH_NCCL)
+    foreach(_np 2 4)
+        foreach(_mode post-status capacity nccl-queued revoke asym)
+            add_test(NAME proc_comm_failure_nccl_${_mode}_np${_np}
+                     COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np}
+                             $<TARGET_FILE:test_proc_comm_failure> nccl ${_mode})
+            set_tests_properties(proc_comm_failure_nccl_${_mode}_np${_np} PROPERTIES
+                                 TIMEOUT 300 SKIP_RETURN_CODE 77 RESOURCE_LOCK gpu_nccl
+                                 ENVIRONMENT "BRAE_NCCL_ALLOW_SHARED_GPU=1")
+        endforeach()
+    endforeach()
+endif()
+
+# Multi-GPU step E-I: distributed linear solvers (processor-interface hook, global reductions, AMG-PCG, symGaussSeidel)
+# against the monolithic solve; one process per rank (MPI-host backend), several ranks on one GPU is fine
+add_executable(test_dist_solvers tests/test_dist_solvers.cu)
+target_include_directories(test_dist_solvers PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_dist_solvers PRIVATE brae_core)
+foreach(_np 1 2 4 8)
+    add_test(NAME dist_solvers_np${_np}
+             COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_dist_solvers>)
+    set_tests_properties(dist_solvers_np${_np} PROPERTIES TIMEOUT 900)
+endforeach()
+
+# np = 1 byte identity of the single-GPU entry points through the distributed hooks: the solver paths a case can select
+# (default graph PCG, BRAE_PCG_DEVICE=0 plain loop, host / device GS smoother) each print bit hashes; tests/np1_identity.sh
+# compares them with the same source built in the tree before the hooks
+add_executable(test_np1_identity tests/test_np1_identity.cu)
+target_include_directories(test_np1_identity PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_np1_identity PRIVATE brae_core)
+target_compile_definitions(test_np1_identity PRIVATE BRAE_DIST_HOOKS)
+
+# The same solvers on the p_rgh matrices OpenFOAM v2606 -parallel dumped (tools/mgpu_oracle: run_oracle.sh with TIGHT=1,
+# export_prgh_matrix.py <run>/par_d1 <root>/exp_open_np<N>_c<k> <k> 1, the serial run as exp_open_np1_c<k>); SKIPs without the dumps
+set(BRAE_MGPU_ORACLE_DUMPS "/tmp/mgpu_oracle_dumps" CACHE PATH "Exported OpenFOAM p_rgh matrices (export_prgh_matrix.py)")
+add_executable(test_dist_solvers_oracle tests/test_dist_solvers_oracle.cu)
+target_include_directories(test_dist_solvers_oracle PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_dist_solvers_oracle PRIVATE brae_core)
+foreach(_np 2 4 8)
+    foreach(_c 1 2)
+        add_test(NAME dist_solvers_oracle_np${_np}_c${_c}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_dist_solvers_oracle>
+                         ${BRAE_MGPU_ORACLE_DUMPS}/exp_open_np${_np}_c${_c} ${BRAE_MGPU_ORACLE_DUMPS}/exp_open_np1_c${_c})
+        set_tests_properties(dist_solvers_oracle_np${_np}_c${_c} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
+    endforeach()
+endforeach()
+
+# loopback ops captured as one joint CUDA graph and replayed 1000 times; the MPI-host backend must refuse capture
+add_executable(test_proc_comm_graph tests/test_proc_comm_graph.cu)
+target_include_directories(test_proc_comm_graph PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_proc_comm_graph PRIVATE brae_core)
+add_test(NAME proc_comm_graph_loopback COMMAND test_proc_comm_graph)
+set_tests_properties(proc_comm_graph_loopback PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+add_test(NAME proc_comm_graph_mpi_refuses
+         COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np 2 $<TARGET_FILE:test_proc_comm_graph> mpi)
+set_tests_properties(proc_comm_graph_mpi_refuses PROPERTIES TIMEOUT 120)
+
+# rank -> GPU placement (cut-weight matrix x GPU link table, exhaustive, deterministic); unit test + the launcher's advisor
+add_executable(test_proc_topology tests/test_proc_topology.cu)
+target_include_directories(test_proc_topology PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_proc_topology PRIVATE brae_core)
+add_test(NAME proc_topology COMMAND test_proc_topology)
+set_tests_properties(proc_topology PROPERTIES TIMEOUT 120)
+add_executable(proc_topology_tool tools/proc_comm_nccl/proc_topology_tool.cu)
+target_include_directories(proc_topology_tool PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(proc_topology_tool PRIVATE brae_core)
+
+# the NCCL backend (BRAE_WITH_NCCL): one process per GPU, so np must not exceed the GPUs of the machine. The default
+# runs np=1 only (identity); on a multi-GPU node: -DBRAE_NCCL_TEST_NP="1;2;4;8". See tools/proc_comm_nccl/README.md.
+if(BRAE_WITH_NCCL)
+    set(BRAE_NCCL_TEST_NP "1" CACHE STRING "process counts of the proc_comm NCCL tests (needs that many GPUs)")
+    foreach(_np ${BRAE_NCCL_TEST_NP})
+        add_test(NAME proc_comm_nccl_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_proc_comm> nccl)
+        set_tests_properties(proc_comm_nccl_np${_np} PROPERTIES TIMEOUT 600 RESOURCE_LOCK gpu_nccl)
+        add_test(NAME proc_comm_graph_nccl_np${_np}
+                 COMMAND ${MPIEXEC_EXECUTABLE} --oversubscribe -np ${_np} $<TARGET_FILE:test_proc_comm_graph> nccl)
+        set_tests_properties(proc_comm_graph_nccl_np${_np} PROPERTIES TIMEOUT 900 RESOURCE_LOCK gpu_nccl)
+    endforeach()
+endif()
+
 # Multi-GPU Phase 0b: per-rank DeviceMesh upload + device-path reconstruction
 add_executable(test_gpu_decompose tests/test_gpu_decompose.cu)
 target_include_directories(test_gpu_decompose PRIVATE ${BRAE_HEADER_DIRS})
@@ -350,12 +517,6 @@ foreach(_np 1 2 4 8)
                      ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily/constant/polyMesh)
 endforeach()
 
-# Multi-GPU Phase 1a: NVSHMEM bootstrap + symmetric heap (host-side) smoke test
-# ---------------------------------------------------------------------------------------------------
-# The multi-GPU (distributed) test suite lived here, guarded by if(BRAE_WITH_NVSHMEM). It moved to
-# legacy/tests/ along with the distributed solvers -- multi-GPU is OUT OF SCOPE. See legacy/README.md.
-# Nothing in legacy/ is built or registered; do not re-add it without an explicit decision to resume.
-# ---------------------------------------------------------------------------------------------------
 
 add_executable(test_mesh_topology tests/test_mesh_topology.cu)
 target_include_directories(test_mesh_topology PRIVATE ${BRAE_HEADER_DIRS})
@@ -1134,6 +1295,16 @@ add_executable(test_write_control_interval tests/test_write_control_interval.cu)
 target_include_directories(test_write_control_interval PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(test_write_control_interval PRIVATE brae_core)
 add_test(NAME write_control_interval COMMAND test_write_control_interval)
+
+# interFoam's runtime function objects (volFieldValue, surfaceFieldValue, probes, fieldMinMax, exprField,
+# runTimeControl): the files they write against sums formed in the test, the cadence, the stop, and what must
+# stop the run at start-up. Host only, on the 20-cell demo mesh.
+add_executable(test_inter_function_objects tests/test_inter_function_objects.cu)
+target_include_directories(test_inter_function_objects PRIVATE ${BRAE_HEADER_DIRS})
+target_compile_definitions(test_inter_function_objects PRIVATE
+    BRAE_TEST_MESH_DIR="${CMAKE_SOURCE_DIR}/demo/amgpcg/case20/constant/polyMesh")
+target_link_libraries(test_inter_function_objects PRIVATE brae_core)
+add_test(NAME inter_function_objects COMMAND test_inter_function_objects)
 
 add_executable(kepsilon_probe tests/kepsilon_probe.cu)
 target_include_directories(kepsilon_probe PRIVATE ${BRAE_HEADER_DIRS})
@@ -2216,7 +2387,7 @@ set_tests_properties(komegasstlm_flatplate PROPERTIES LABELS slow TIMEOUT 600)
 # through the single-GPU device path AND the distributed path, then compare. This is the comparison that catches
 # real AMI-coupling bugs -- the bounded-div/deferred-rot/linearUpwind-grad fixes all lived in SHARED distributed
 # code, so a np2-vs-np1 oracle passes with both ranks wrong; only distributed-vs-single-GPU exposes them. np=1 is
-# bit-exact (tol 1e-6); np=2 exercises the cross-rank NVSHMEM AMI gather (tol 1e-3, the residualControl floor).
+# bit-exact (tol 1e-6); np=2 exercises the cross-rank AMI gather over ProcComm (tol 1e-3, the residualControl floor).
 # _np(N)$ names auto-pick up PROCESSORS=N + (N>1) RESOURCE_LOCK gpu_multirank from the block below.
 foreach(_np 1 2)
     if(_np EQUAL 1)
@@ -3495,6 +3666,59 @@ target_include_directories(test_device_interface_properties PRIVATE ${BRAE_HEADE
                            ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_link_libraries(test_device_interface_properties PRIVATE brae_core)
 add_test(NAME device_interface_properties COMMAND test_device_interface_properties)
+
+# Multi-GPU interFoam, WP1 first half: processor patches read with myProcNo/neighbProcNo/referPatch (a real
+# decomposePar boundary, the cache magic, FvPatch), every tracked boundary parsing as it did before, and the
+# per-rank roots (-parallel, -rank/-nprocs, the launcher's environment) with the refusals by name.
+add_executable(test_processor_patch_reader tests/test_processor_patch_reader.cu)
+target_include_directories(test_processor_patch_reader PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_processor_patch_reader PRIVATE brae_core)
+add_test(NAME processor_patch_reader COMMAND test_processor_patch_reader ${CMAKE_CURRENT_SOURCE_DIR})
+
+# brae decompose / reconstruct on a block mesh built in the test (host only): patch entries by name, group, pattern and wildcard, vector,
+# symmTensor, tensor and oriented surface fields, processor patch values, round trip, gzip, uniform/, refusals by name.
+add_executable(test_case_decompose tests/test_case_decompose.cu)
+target_include_directories(test_case_decompose PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_case_decompose PRIVATE brae_core)
+add_test(NAME case_decompose COMMAND test_case_decompose)
+
+# WP1 second half: the processor patches coupled over ProcComm (OpenFOAM's processorFvPatch formulas from ONE setup
+# exchange) and the device interface with halo slots, on decomposePar meshes with a rank per thread on one GPU.
+# The fixture is the 2-domain mesh of tests/data; mgpu_proc_geometry (below) runs it on real decompositions.
+add_executable(test_proc_geometry_loopback tests/test_proc_geometry_loopback.cu)
+target_include_directories(test_proc_geometry_loopback PRIVATE ${BRAE_HEADER_DIRS}
+                           ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(test_proc_geometry_loopback PRIVATE brae_core)
+add_test(NAME proc_geometry_loopback_fixture
+         COMMAND test_proc_geometry_loopback ${CMAKE_CURRENT_SOURCE_DIR}/tests/data/processor_mesh_np2)
+set_tests_properties(proc_geometry_loopback_fixture PROPERTIES TIMEOUT 300)
+# ...and against OpenFOAM v2606 -parallel on the oracle cases: decomposePar (scotch/simple/hierarchical), the
+# OpenFOAM dump tool and brae_interFoam under BRAE_MGPU_GEOMETRY_ONLY=1 side by side, then the loopback harness on the
+# same directories. Skips (77) without the oracle build (tools/mgpu_oracle/setup.sh) or OpenFOAM v2606.
+add_test(NAME mgpu_proc_geometry
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mgpu_proc_geometry.sh $<TARGET_FILE:brae_interFoam>
+                 $<TARGET_FILE:test_proc_geometry_loopback>)
+set_tests_properties(mgpu_proc_geometry PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+# The OpenFOAM oracle gate as a registered test: it MUST run wherever the oracle build exists, and SKIP with the
+# exact reason otherwise (a silent skip of the numerical oracle is how a common-formula error would survive).
+add_test(NAME mgpu_proc_geometry_oracle
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/mgpu_oracle/proc_geometry_gate.sh $<TARGET_FILE:brae_interFoam>)
+set_tests_properties(mgpu_proc_geometry_oracle PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+# Negative control of the comparator itself: perturbed weight / delta / halo slot and a truncated face list must
+# each FAIL the comparison. Registered as a test; it SKIPs (77) until an oracle case directory is supplied with
+# -DBRAE_PROC_GEOMETRY_CASE=<decomposed case with both dump sets>.
+set(BRAE_PROC_GEOMETRY_CASE "" CACHE PATH "Decomposed case with procGeometry.dump and brae_procGeometry.dump (comparator negative control)")
+add_test(NAME mgpu_proc_geometry_comparator_control
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tools/mgpu_oracle/compare_proc_geometry_negative_control.py ${BRAE_PROC_GEOMETRY_CASE})
+set_tests_properties(mgpu_proc_geometry_comparator_control PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+
+# Multi-GPU interFoam, I/O half: the frozen-state harness (hidden globals, function objects, per-rank writer
+# on N virtual ranks of the ProcComm loopback backend; tools/mgpu_oracle/FROZEN.md). The driver and the
+# states and references are made by tools/mgpu_oracle/frozen_state.sh (OpenFOAM v2606); no ctest wrapper yet.
+add_executable(mgpu_frozen tests/mgpu_frozen.cu)
+target_include_directories(mgpu_frozen PRIVATE ${BRAE_HEADER_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+target_link_libraries(mgpu_frozen PRIVATE brae_core)
 
 # ...and MULES. Two kinds of arm: the PROPERTY (alpha stays in [0,1]) asserted exactly, because that is
 # what MULES is for and needs no host to compare against; and lambda itself within a measured
@@ -5434,6 +5658,18 @@ target_include_directories(test_amg_one_off_diagonal PRIVATE ${BRAE_HEADER_DIRS}
 target_link_libraries(test_amg_one_off_diagonal PRIVATE brae_core)
 add_test(NAME amg_one_off_diagonal COMMAND test_amg_one_off_diagonal ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
 
+# The fused coarse-level FP32 V-cycle (device_amg_fused.cu): bit-identical to the unfused cycle, direct and captured, at
+# several thresholds, with the premise (the kernel ran), a stale-coefficient replay check and a negative control. Run
+# under the default inverse coarsest solve, the LU (also fused) and the warp substitutions (not fused: must still match).
+add_executable(test_amg_fused_coarse tests/test_amg_fused_coarse.cu)
+target_include_directories(test_amg_fused_coarse PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_amg_fused_coarse PRIVATE brae_core)
+add_test(NAME amg_fused_coarse COMMAND test_amg_fused_coarse ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDailyTurbBig)
+add_test(NAME amg_fused_coarse_lu COMMAND test_amg_fused_coarse ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+set_tests_properties(amg_fused_coarse_lu PROPERTIES ENVIRONMENT "BRAE_AMG_COARSE_SOLVE=lu")
+add_test(NAME amg_fused_coarse_tri COMMAND test_amg_fused_coarse ${CMAKE_CURRENT_SOURCE_DIR}/validation/pitzDaily)
+set_tests_properties(amg_fused_coarse_tri PROPERTIES ENVIRONMENT "BRAE_AMG_COARSE_SOLVE=tri")
+
 # The AMG's single-precision CSR values gathered through each grid's addressing: the stored source list's
 # bits (BRAE_AMG_CSR_SRC=1 keeps the list), a smaller footprint, and a control that changes the cycle.
 add_test(NAME amg_csr_rows_identity
@@ -5469,7 +5705,7 @@ add_test(NAME gpu_crossover COMMAND test_gpu_crossover ${CMAKE_CURRENT_SOURCE_DI
 # slot and launches many concurrently -> on the self-hosted SINGLE-GPU runner that oversubscribes the GPU/CPU with
 # dozens of ranks at once, the cause of the flaky failures (parallel_spmv_np2, parallel_pcg_np8 under load; each
 # passes in isolation). Setting PROCESSORS=N makes the scheduler reserve N slots per test, so it never overcommits.
-# PROCESSORS alone still allowed TWO np=2 tests to run at once under -j4 (4 ranks -> 4 CUDA/NVSHMEM contexts on the
+# PROCESSORS alone still allowed TWO np=2 tests to run at once under -j4 (4 ranks -> 4 CUDA contexts on the
 # one GPU -> intermittent init/heap-contention crash, exit 8). RESOURCE_LOCK on the np>=2 tests makes them mutually
 # exclusive (at most one multi-rank GPU test at a time); the many np=1 / single-GPU tests still parallelise freely.
 get_property(_brae_all_tests DIRECTORY PROPERTY TESTS)
@@ -5508,8 +5744,8 @@ endif()
 # rather than at install time.
 # Keep the library search path on the way out. CMake strips the build RPATH at install time and replaces it
 # with INSTALL_RPATH, which is empty by default -- so the first `cmake --install` produced binaries that could
-# not find libnvshmem_host.so.3 and failed for every user, not only under sudo. USE_LINK_PATH carries the
-# directories of the libraries actually linked (NVSHMEM, OpenMPI) into the installed binary.
+# not find the MPI/NCCL shared libraries and failed for every user, not only under sudo. USE_LINK_PATH carries the
+# directories of the libraries actually linked into the installed binary.
 foreach(exe IN ITEMS brae brae-agent brae_pimpleFoam)
     if(TARGET ${exe})
         set_target_properties(${exe} PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)
@@ -5535,6 +5771,34 @@ set_property(TEST ${BRAE_ALL_TESTS} APPEND PROPERTY ENVIRONMENT "BRAE_PRESSURE_C
 # (BRAE_TURBULENCE_CASE_SOLVER=1) and keeps its bound; the rule is held to OpenFOAM at its measured bounds by
 # tests/interfoam_write/turb_colour/, which unset this. The user's decision, 2026-10-06.
 set_property(TEST ${BRAE_ALL_TESTS} APPEND PROPERTY ENVIRONMENT "BRAE_TURBULENCE_CASE_SOLVER=1")
+
+# First multi-GPU gate: np = 1 through `-parallel` (processor0 of decomposePar, one domain) is byte-identical to
+# the serial run; np = 2/4 decompositions print the per-rank patch table and are refused. Needs a GPU and OpenFOAM v2606
+# (skips, exit 77, without it).
+add_test(NAME mgpu_np1_byte_identical
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mgpu_np1_byte_identical.sh $<TARGET_FILE:brae_interFoam>)
+# (it runs the tank case serially and as np = 1, 2 and 4: about 15-20 minutes)
+set_tests_properties(mgpu_np1_byte_identical PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 2400)
+# The explicit stages across processor faces against OpenFOAM v2606 -parallel at np 1/2/4/8 (BRAE_MGPU_STAGE_DUMP).
+add_test(NAME mgpu_stage_gate
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mgpu_stage_gate.sh $<TARGET_FILE:brae_interFoam>)
+set_tests_properties(mgpu_stage_gate PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600)
+add_test(NAME mgpu_alpha_stage_gate
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mgpu_alpha_stage_gate.sh $<TARGET_FILE:brae_interFoam>)
+set_tests_properties(mgpu_alpha_stage_gate PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 5400)
+# Whole steps across processor faces: np = 2 and 4 against the undecomposed run with every solve converged, on the
+# sheared, graded tank with a contact angle (the wall cells and the non-orthogonal correction the stage gates do not
+# reach). Needs a GPU, mpirun and OpenFOAM v2606 (skips, exit 77, without them).
+add_test(NAME mgpu_step_parity
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mgpu_step_parity.sh $<TARGET_FILE:brae_interFoam>)
+set_tests_properties(mgpu_step_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# brae decompose / brae reconstruct against decomposePar / reconstructPar (OpenFOAM v2606), and `-parallel` on a case nobody decomposed.
+# Needs OpenFOAM v2606, mpirun and a GPU; skips (exit 77) without them.
+add_test(NAME case_decompose_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/case_decompose_vs_openfoam.sh $<TARGET_FILE:brae> $<TARGET_FILE:brae_interFoam>)
+set_tests_properties(case_decompose_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
 # SIMPLEFOAM'S COLOUR RULE'S TEST ARM, the same arrangement again. The legacy simpleFoam driver sweeps a
 # Gauss-Seidel smoothSolver on U and on the transported turbulence fields in colour order on the GPU by default
 # (device_simple_foam.cu, decideColourRule), relTol entries included: the same smoother and stopping rule,

@@ -25,8 +25,9 @@
 //     0  ordinary          -- in every sum, lambda free
 //     1  empty             -- in NO sum, as emptyFvPatch::size() == 0 means in OpenFOAM
 //     2  wedge             -- in every sum, but lambda forced to 0 (MULESTemplates.C:530-533)
-// They are passed rather than derived because the device mesh does not carry a patch type, and
-// inventing one for two special cases would put a fact about boundary conditions in the geometry.
+//     3  processor         -- in NO ordinary-boundary sum; its halo neighbour and one-sided limiter
+//                            are handled by the processor helpers below, and its boundary slot only
+//                            carries the completed flux into deviceDiv.
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 #include "device_mesh.cuh"
@@ -122,6 +123,7 @@ void deviceMulesLimiter(
     const DeviceBuffer<scalar>*  phiCorrIf = nullptr,
     DeviceBuffer<scalar>*        lambdaIf = nullptr);
 
+
 // phiPsi = phiBD + lambda*phiCorr (MULESTemplates.C:634). The blend is separate from the limiter so a
 // caller can keep the limiter's lambda -- which a stock OpenFOAM run never writes and which every gate
 // on this component needs.
@@ -205,6 +207,7 @@ void deviceMulesLimiterCorr(
     const DeviceCyclic*          cyc = nullptr,
     const DeviceBuffer<scalar>*  phiCorrIf = nullptr,
     DeviceBuffer<scalar>*        lambdaIf = nullptr);
+
 
 // MULES::limitCorr: the limiter, then phiCorr *= lambda IN PLACE. No blended flux is formed -- there is
 // nothing to blend against, which is the shape difference B leaves behind.

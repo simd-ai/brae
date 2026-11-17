@@ -7,6 +7,7 @@
 #include "device_amg_detail.cuh"   // safeDiag/blockDot/warpReduceSum + TPB/OMEGA/CCL/... constants
 #include "amg_kernels.cuh"       // smoothT<> for deviceCoarseJacobiLoop
 #include "device_amg_coarse.cuh"   // deviceCoarsePCG/JacobiSingleBlock internal decls (match defs here)
+#include "amg_coarse_dev.cuh"      // TRI_ROWS + the warp substitutions, shared with the fused V-cycle kernel
 #include "device_amg_coarse_default.cuh"
 #include "device_ldu.cuh"
 #include <cuda_runtime.h>
@@ -549,8 +550,7 @@ void coarseLUSolveKernel(
 // `cholesky` L L^T where the level is symmetric and its pivots positive, the LU otherwise.
 // ---------------------------------------------------------------------------------------------------
 
-// rows a lane holds: the warp kernels below take n <= 32*TRI_ROWS
-constexpr int TRI_ROWS = 4;
+// (TRI_ROWS, the warp substitutions: amg_coarse_dev.cuh)
 // Cholesky is taken only on a level symmetric to this, relative to max|diag| (a Galerkin product sums its
 // upper and lower entries in different orders, so a symmetric level is symmetric to a rounding, not exactly)
 constexpr scalar CHOL_SYM_TOL = 1e-12;
@@ -593,68 +593,6 @@ void coarseLUColumnMajorKernel(
                 perm[k] = perm[r];
                 perm[r] = t;
             }
-        }
-    }
-}
-
-// row i lives in lane i % 32, slot i / 32 (a constant index into the slots, so they stay in registers)
-__device__ __forceinline__
-scalar warpRow(
-    const scalar (&yr)[TRI_ROWS],
-    int k)
-{
-    const int s = k >> 5;
-    const scalar v = (s == 0) ? yr[0] : (s == 1) ? yr[1] : (s == 2) ? yr[2] : yr[3];
-    return __shfl_sync(0xffffffffu, v, k & 31);
-}
-
-__device__ __forceinline__
-void warpDivideRow(
-    scalar (&yr)[TRI_ROWS],
-    int k,
-    int lane,
-    scalar d)
-{
-    if ((k & 31) != lane) return;
-    const int s = k >> 5;
-    if (s == 0) yr[0] /= d;
-    else if (s == 1) yr[1] /= d;
-    else if (s == 2) yr[2] /= d;
-    else yr[3] /= d;
-}
-
-// coarseLUSolveKernel's two substitutions, row for row and step for step (y_i -= F_ik y_k in k order, the
-// backward step's division at its own row first), by one warp: the same arithmetic in the same order is the
-// same bits. F is column-major. unitLower: L's diagonal is 1 and not stored (the LU); otherwise the forward
-// step divides by F_kk first (Cholesky's L).
-__device__ __forceinline__
-void warpSubstitute(
-    int n,
-    const scalar* __restrict__ F,
-    bool unitLower,
-    scalar (&yr)[TRI_ROWS],
-    int lane)
-{
-    for (int k = 0; k < n; ++k)
-    {
-        if (!unitLower) warpDivideRow(yr, k, lane, F[k*n + k]);
-        const scalar yk = warpRow(yr, k);
-        #pragma unroll
-        for (int s = 0; s < TRI_ROWS; ++s)
-        {
-            const int i = lane + 32*s;
-            if (i > k && i < n) yr[s] -= F[k*n + i]*yk;
-        }
-    }
-    for (int k = n - 1; k >= 0; --k)
-    {
-        warpDivideRow(yr, k, lane, F[k*n + k]);
-        const scalar yk = warpRow(yr, k);
-        #pragma unroll
-        for (int s = 0; s < TRI_ROWS; ++s)
-        {
-            const int i = lane + 32*s;
-            if (i < k) yr[s] -= F[k*n + i]*yk;
         }
     }
 }
@@ -768,10 +706,15 @@ void coarseInverseApplyKernel(
     }
     const int i = (blockIdx.x*blockDim.x + threadIdx.x) >> 5;
     if (i >= n) return;
-    scalar s = 0.0;
-    if (control == 1) for (int j = lane; j < n; j += 32) s += inv[j*n + i]*rc[j];
-    else for (int j = lane; j < n; j += 32) s += inv[i*n + j]*rc[j];
-    for (int off = 16; off > 0; off >>= 1) s += __shfl_down_sync(0xffffffffu, s, off);
+    if (control == 1)
+    {
+        scalar s = 0.0;
+        for (int j = lane; j < n; j += 32) s += inv[j*n + i]*rc[j];
+        for (int off = 16; off > 0; off >>= 1) s += __shfl_down_sync(0xffffffffu, s, off);
+        if (lane == 0) xc[i] = s;
+        return;
+    }
+    const scalar s = inverseRowDot(inv, rc, i, n, lane);
     if (lane == 0) xc[i] = s;
 }
 
@@ -1194,6 +1137,11 @@ InverseControl inverseControl()
     return c;
 }
 } // anon
+
+bool coarseInverseControlActive()
+{
+    return inverseControl() != InverseControl::None;
+}
 
 CoarseSolveKind coarseSolveKind()
 {

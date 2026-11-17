@@ -119,9 +119,9 @@ inline DeviceBoundary buildDeviceBoundary(
     std::vector<scalar> ref, dc, ms, vf, p0, rg, iost;   // rg = fixedGradient normal gradient (0 elsewhere)
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        if (isCoupledInterfaceType(fvp[pi].type)) continue;                     // cyclic = internal-like (handled by appended faces)
+        if (isCyclicFamilyType(fvp[pi].type)) continue;                     // cyclic = internal-like (handled by appended faces)
         // A processor patch is COUPLED: it stays in the boundary gather (the explicit operators need its bval
-        // slot, filled with the halo-interpolated face value by DeviceHalo::scatterBoundaryValues), but must
+        // slot, filled with the halo-interpolated face value by the processor halo exchange), but must
         // contribute NO matrix coefficients -- its coupling is the interface off-diagonal. bcCategory() is NOT
         // overridden on ProcessorFvPatchField, so it would otherwise report 0 (= zeroGradient) whose
         // valueInternalCoeffs is 1, DOUBLE-COUNTING the interface diagonal.
@@ -450,7 +450,7 @@ inline DeviceVectorBoundaryHost deviceVectorBoundaryArrays(
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         if (skipEmpty && fvp[pi].type == "empty") continue;
-        if (!isCoupledInterfaceType(fvp[pi].type)) nAll += static_cast<std::size_t>(fvp[pi].size);
+        if (!isCyclicFamilyType(fvp[pi].type)) nAll += static_cast<std::size_t>(fvp[pi].size);
     }
     iofr.reserve(nAll);
     for (int k = 0; k < 3; ++k)
@@ -486,7 +486,7 @@ inline DeviceVectorBoundaryHost deviceVectorBoundaryArrays(
     static const bool perFaceAlways = std::getenv("BRAE_CONTROL_BOUNDARY_ARRAYS_PER_FACE") != nullptr;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        if (isCoupledInterfaceType(fvp[pi].type)) continue;                     // cyclic = internal-like (handled by appended faces)
+        if (isCyclicFamilyType(fvp[pi].type)) continue;                     // cyclic = internal-like (handled by appended faces)
         if (skipEmpty && fvp[pi].type == "empty") continue;
         // the gradient's mirror normal, in the host reference's own arithmetic (fvc.cu, boundaryGradU):
         // Sf/magSf by DIVISION per face on a `symmetry`; sumA/mag(sumA) once per patch on a
@@ -585,7 +585,7 @@ inline DeviceVectorBoundaryHost deviceVectorBoundaryArrays(
             gsn.push_back(n.z);
         }
         // A processor patch is COUPLED: it stays in the boundary gather (the explicit operators need its bval
-        // slot, filled with the halo-interpolated face value by DeviceHalo::scatterBoundaryValues), but must
+        // slot, filled with the halo-interpolated face value by the processor halo exchange), but must
         // contribute NO matrix coefficients -- its coupling is the interface off-diagonal. bcCategory() is NOT
         // overridden on ProcessorFvPatchField, so it would otherwise report 0 (= zeroGradient) whose
         // valueInternalCoeffs is 1, DOUBLE-COUNTING the interface diagonal.
@@ -822,14 +822,14 @@ inline DeviceVectorBoundaryShape deviceVectorBoundaryShape(
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         if (skipEmpty && fvp[pi].type == "empty") continue;
-        if (!isCoupledInterfaceType(fvp[pi].type)) nAll += static_cast<std::size_t>(fvp[pi].size);
+        if (!isCyclicFamilyType(fvp[pi].type)) nAll += static_cast<std::size_t>(fvp[pi].size);
     }
     k.fc.reserve(nAll);
     k.geom.resize(5*nAll);
     std::size_t at = 0;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+        if (isCyclicFamilyType(fvp[pi].type)) continue;
         const int cat = (fvp[pi].type == "processor") ? 8 : f.boundary[pi]->bcCategory();
         k.kind.push_back(fvp[pi].type + "|" + std::to_string(cat) + "|"
                          + (f.boundary[pi]->isSymmetry() ? "s" : "-"));
@@ -887,7 +887,7 @@ inline std::vector<DeviceBoundaryRange> deviceNonEmptyBoundaryRanges(
     nAll = 0;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+        if (isCyclicFamilyType(fvp[pi].type)) continue;
         const std::size_t np = static_cast<std::size_t>(fvp[pi].size);
         if (fvp[pi].type != "empty" && np > 0)
         {

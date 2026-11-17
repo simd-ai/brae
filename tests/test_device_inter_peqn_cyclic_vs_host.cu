@@ -92,7 +92,7 @@ int main(int argc, char** argv)
     std::size_t nBf = 0;
     for (const FvPatch& q : fvp)
     {
-        if (!isCoupledInterfaceType(q.type)) nBf += static_cast<std::size_t>(q.size);
+        if (!isCyclicFamilyType(q.type)) nBf += static_cast<std::size_t>(q.size);
     }
     DeviceBuffer<scalar> zeroBf(std::vector<scalar>(nBf, scalar(0)));
     // ...and the PAIR's phiHbyA, which the assembly now requires because fvc::div(phiHbyA) sums a

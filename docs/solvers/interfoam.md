@@ -26,10 +26,36 @@ cd yourTwoPhaseCase && brae
 | **Waves** | OpenFOAM's `waveModels` generation and absorption conditions |
 | **Sources** | `explicitPorositySource` (Darcy-Forchheimer), MRF |
 | **I/O** | standard OpenFOAM case in, standard time directories out, ASCII or binary |
-| **Not yet** | function objects (their `adjustableRunTime` write times do trim the time step, as in OpenFOAM), multi-GPU |
+| **Function objects** | `volFieldValue`, `surfaceFieldValue`, `probes`, `fieldMinMax`, `exprField` and `runTimeControl` (see below); their `adjustableRunTime` write times also trim the time step, as in OpenFOAM |
+| **Not yet** | the other function objects (`surfaces`, `forces`, `fieldAverage`, ... are noticed and not run) |
+| **Multi-GPU** | `-parallel -device` runs a case across up to 8 GPUs (decomposed by `brae decompose` or `decomposePar`, or decomposed by the run itself), one process per GPU, and agrees with OpenFOAM `-parallel`; laminar flow only, no AMI or moving meshes under `-parallel`: [Multi-GPU](../multi-gpu.md) |
 
 A setting this solver does not carry stops the run at start-up and names itself; it is never replaced by a
 default.
+
+## Function objects
+
+`controlDict`'s `functions { }` entries of these types run at the end of each time step (the common `volIntegrate` shapes are
+summed on the device in one batch; everything else is evaluated on the host), with
+OpenFOAM's cadence (`writeControl` `timeStep`, `runTime`, `adjustableRunTime`, `writeTime`, `none`; no output at
+the start time) and OpenFOAM's file layout, `postProcessing/<object>/<start time>/<file>`:
+
+| type | supported |
+|---|---|
+| `volFieldValue` | `regionType all` or `cellZone`; `volIntegrate`, `volAverage`, `sum`, `min`, `max` of the phase fraction, `p_rgh` and `exprField` results |
+| `surfaceFieldValue` | `regionType patch`; `areaAverage`, `areaIntegrate`, `sum`, `min`, `max` of the phase fraction |
+| `probes` | `fixedLocations`, cell values of the phase fraction, `U` and `p_rgh` |
+| `fieldMinMax` | `U` (magnitude or components) and scalar fields |
+| `exprField` | `action new`, scalar expressions of the phase fraction, `p_rgh`, `U` (`.x() .y() .z()`, `mag`, `magSqr`), `pos().x()/y()/z()`, `sqr`, `sqrt`, other expression fields and numbers; kept in memory (`autowrite false`) |
+| `runTimeControl` | `minMax` conditions (`maximum`, `minimum`) on another object's result, `satisfiedAction end`: the run writes the time and ends |
+
+`enabled false` removes an object, as in OpenFOAM. An entry of one of these types that asks for something not
+listed (`writeFields`, `weightField`, a vector field in `volFieldValue`, `interpolationScheme cellPoint`,
+`autowrite true`, a `timeStart`/`timeEnd` window, ...) stops the run at start-up and names itself. An object of
+any other type is noticed and not run. The objects are evaluated on the start mesh, so a case with function
+objects and a mesh that moves or refines is refused. The device loop downloads a field for them only in the
+steps in which an object is due; `runTimeControl` is evaluated every step, so a condition on a `writeControl
+timeStep` object costs a download of the fields it reads each step.
 
 ## How it is checked
 

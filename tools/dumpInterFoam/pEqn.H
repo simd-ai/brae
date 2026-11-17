@@ -106,6 +106,16 @@
 
         p_rghEqn.setReference(pRefCell, getRefCellValue(p_rgh, pRefCell));
 
+        // ---- ORACLE INSTRUMENTATION: the p_rgh matrix as it is handed to the solver (reference
+        // applied), per corrector and non-orthogonal iteration; HbyA and the p_rgh before the solve.
+        if (braeOracleStep())
+        {
+            const Foam::word sfxP = "c" + Foam::name(pimple.corrPISO()) + "n" + Foam::name(pimple.corrNonOrtho());
+            braeDumpMatrix("oPrghEqn" + sfxP, p_rghEqn);
+            volScalarField("oPrghPre" + sfxP + ".dump", p_rgh).write();
+            volScalarField("oDivPhiHbyA" + sfxP + ".dump", fvc::div(phiHbyA)).write();
+        }
+
         p_rghEqn.solve(p_rgh.select(pimple.finalInnerIter()));
 
         if (pimple.finalNonOrthogonalIter())
@@ -152,6 +162,17 @@
         );
         p_rgh = p - rho*gh;
     }
+
+    // ---- ORACLE INSTRUMENTATION: the state each pressure corrector leaves (phi, U, p_rgh, p) -------
+    if (braeOracleStep())
+    {
+        const Foam::word sfxO = "c" + Foam::name(pimple.corrPISO());
+        surfaceScalarField("oPhi" + sfxO + ".dump", phi).write();
+        volVectorField("oU" + sfxO + ".dump", U).write();
+        volScalarField("oPrgh" + sfxO + ".dump", p_rgh).write();
+        volScalarField("oP" + sfxO + ".dump", p).write();
+    }
+    // -------------------------------------------------------------------------------------------------
 
     if (!correctPhi)
     {

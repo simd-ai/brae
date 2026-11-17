@@ -181,12 +181,7 @@ bool foamBufferIsBinary(const std::vector<char>& b)
     return head.substr(f, e - f).find("binary") != std::string::npos;
 }
 
-std::string readWhole(const std::string& path)
-{
-    const std::vector<char> b = gzSlurp(path);
-    if (foamBufferIsBinary(b)) return foamBinaryToAscii(b);
-    return std::string(b.begin(), b.end());
-}
+
 
 std::string dirOf(const std::string& p)
 {
@@ -538,6 +533,145 @@ std::vector<std::string> tokenize(const std::string& s)
     return t;
 }
 
+// Decode raw primitive list payloads directly into lossless scalar tokens. Only the dictionary around
+// them is tokenized: a 2.48M-cell restart no longer becomes hundreds of MB of decimal text and millions
+
+// A text-only view of a binary foam dictionary. Numeric payload bytes are removed from preprocessing;
+// tokenizeFoamBinary independently walks the same lists and emits their values losslessly.
+std::string foamBinaryTextView(const std::vector<char>& in)
+{
+    // Directive detection only. Return the textual prefix through boundaryField and the dictionary text
+    // after every primitive list payload, but never interpret raw bytes as text or erase while scanning.
+    std::string out;
+    std::size_t i = 0;
+    while (i < in.size())
+    {
+        std::size_t p = std::string::npos;
+        for (std::size_t q = i; q + 5 <= in.size(); ++q)
+            if (in[q] == 'L' && in[q+1] == 'i' && in[q+2] == 's' && in[q+3] == 't' && in[q+4] == '<') { p = q; break; }
+        if (p == std::string::npos) break;
+        std::size_t close = p + 5;
+        while (close < in.size() && in[close] != '>') ++close;
+        if (close >= in.size()) break;
+        const std::string type(in.begin() + static_cast<std::ptrdiff_t>(p + 5),
+                               in.begin() + static_cast<std::ptrdiff_t>(close));
+        const std::size_t nCmpt = foamComponentCount(type);
+        std::size_t j = close + 1;
+        while (j < in.size() && std::isspace(static_cast<unsigned char>(in[j]))) ++j;
+        const std::size_t d0 = j;
+        while (j < in.size() && std::isdigit(static_cast<unsigned char>(in[j]))) ++j;
+        std::size_t count = 0;
+        if (j > d0) count = std::strtoull(std::string(in.begin() + static_cast<std::ptrdiff_t>(d0),
+                                                       in.begin() + static_cast<std::ptrdiff_t>(j)).c_str(), nullptr, 10);
+        std::size_t k = j;
+        while (k < in.size() && std::isspace(static_cast<unsigned char>(in[k]))) ++k;
+        const std::size_t width = type == "label" ? sizeof(int32_t) : sizeof(double);
+        const std::size_t bytes = count*nCmpt*width;
+        if (nCmpt == 0 || j == d0 || k >= in.size() || in[k] != '(' || k + 1 + bytes >= in.size())
+        {
+            i = close + 1;
+            continue;
+        }
+        out.append(in.begin() + static_cast<std::ptrdiff_t>(i), in.begin() + static_cast<std::ptrdiff_t>(k + 1));
+        i = k + 1 + bytes;
+        if (i < in.size() && in[i] == ')') ++i;
+    }
+    if (i < in.size()) out.append(in.begin() + static_cast<std::ptrdiff_t>(i), in.end());
+    return out;
+}
+// of std::string allocations. Endianness/scalar width follows the existing LSB,label=32,scalar=64 contract.
+std::vector<std::string> tokenizeFoamBinary(const std::vector<char>& in)
+{
+    std::size_t headerPayloadOffset(const std::vector<char>& b);
+    std::vector<std::string> out;
+    std::size_t i = headerPayloadOffset(in);
+    auto appendText = [&](std::size_t begin, std::size_t end)
+    {
+        if (end <= begin) return;
+        const std::string text(in.begin() + static_cast<std::ptrdiff_t>(begin),
+                               in.begin() + static_cast<std::ptrdiff_t>(end));
+        const std::vector<std::string> part = tokenize(stripComments(text));
+        out.insert(out.end(), part.begin(), part.end());
+    };
+    while (i < in.size())
+    {
+        std::size_t p = std::string::npos;
+        for (std::size_t q = i; q + 5 <= in.size(); ++q)
+            if (in[q] == 'L' && in[q+1] == 'i' && in[q+2] == 's' && in[q+3] == 't' && in[q+4] == '<') { p = q; break; }
+        if (p == std::string::npos) { appendText(i, in.size()); break; }
+        std::size_t close = p + 5;
+        while (close < in.size() && in[close] != '>') ++close;
+        if (close >= in.size()) { appendText(i, in.size()); break; }
+        const std::string type(in.begin() + static_cast<std::ptrdiff_t>(p + 5),
+                               in.begin() + static_cast<std::ptrdiff_t>(close));
+        const std::size_t nCmpt = foamComponentCount(type);
+        std::size_t j = close + 1;
+        while (j < in.size() && std::isspace(static_cast<unsigned char>(in[j]))) ++j;
+        const std::size_t d0 = j;
+        while (j < in.size() && std::isdigit(static_cast<unsigned char>(in[j]))) ++j;
+        const bool haveCount = j > d0;
+        std::size_t count = 0;
+        if (haveCount) count = std::strtoull(std::string(in.begin() + static_cast<std::ptrdiff_t>(d0),
+                                                         in.begin() + static_cast<std::ptrdiff_t>(j)).c_str(), nullptr, 10);
+        std::size_t k = j;
+        while (k < in.size() && std::isspace(static_cast<unsigned char>(in[k]))) ++k;
+        // An EMPTY list is its count alone (UListIO.C:92-102). TEST CONTROL BRAE_CONTROL_BINARY_EMPTY_LIST_ASIS: not recognised, as
+        // before the fix, so the reader is asked for a '(' that is not there and refuses a legal file
+        if (haveCount && count == 0 && k < in.size() && in[k] == ';' && !std::getenv("BRAE_CONTROL_BINARY_EMPTY_LIST_ASIS"))
+        {
+            appendText(i, close + 1);
+            i = close + 1;
+            continue;
+        }
+        if (nCmpt == 0 || !haveCount || k >= in.size() || in[k] != '(')
+        {
+            appendText(i, close + 1);
+            i = close + 1;
+            continue;
+        }
+        const std::size_t width = (type == "label") ? sizeof(int32_t) : sizeof(double);
+        const std::size_t bytes = count*nCmpt*width;
+        if (k + 1 + bytes >= in.size())
+        {
+            appendText(i, close + 1);
+            i = close + 1;
+            continue;
+        }
+        // The byte immediately after the opening parenthesis is the first raw scalar byte. Do NOT skip
+        // whitespace there: a binary double is allowed to begin with 0x20/0x09/0x0a.
+        const std::size_t payload = k + 1;
+        appendText(i, payload);
+        const char* raw = in.data() + payload;
+        for (std::size_t e = 0; e < count; ++e)
+        {
+            if (nCmpt > 1) out.emplace_back("(");
+            for (std::size_t c = 0; c < nCmpt; ++c)
+            {
+                if (type == "label")
+                {
+                    int32_t v;
+                    std::memcpy(&v, raw + (e*nCmpt + c)*width, sizeof v);
+                    out.push_back(std::to_string(static_cast<long long>(v)));
+                }
+                else
+                {
+                    double v;
+                    std::memcpy(&v, raw + (e*nCmpt + c)*width, sizeof v);
+                    out.push_back(TokenStream::binaryScalar(v));
+                }
+            }
+            if (nCmpt > 1) out.emplace_back(")");
+        }
+        i = payload + bytes;
+        if (i < in.size() && in[i] == ')')
+        {
+            out.emplace_back(")");
+            ++i;
+        }
+    }
+    return out;
+}
+
 // OpenFOAM reads `#{ ... #}` as ONE token, a verbatim string (ISstream::readVerbatim): its comments,
 // quotes, `$` and `#include` lines belong to the code, and the first `#}` ends it. brae's pipeline would
 // take one apart -- stripComments drops the code's `//` comments, tokenize strips the quotes off a string
@@ -689,32 +823,46 @@ TokenStream::TokenStream(const std::string& path, bool expandVars)
 {
     // Verbatim blocks first -- see captureVerbatim -- and once more after the includes, for a block that
     // arrives inside an included fragment.
-    std::string txt = captureVerbatim(readWhole(path), verbatim_);
-    // Expand #include directives at the text level (no-op unless a '#' is present, polyMesh stays untouched/fast).
-    txt = captureVerbatim(expandIncludes(txt, dirOf(path), 0), verbatim_);
-    // Then in-file $variable macros, if requested (field reader). Done AFTER includes so a var defined in an included
-    // fragment is visible. expandDictVariables strips comments + substitutes $name/${name}; stripComments below is then
-    // a no-op. polyMesh/non-field reads skip this entirely (expandVars=false).
-    if (expandVars) txt = expandDictVariables(txt);
-    txt = expandEvalDirectives(txt);   // after $macros: #eval bodies reference them
-    std::vector<std::string> all = tokenize(stripComments(txt));
-
-    // Skip the leading "FoamFile { ... }" header dict, if present.
-    std::size_t i = 0;
-    while (i < all.size() && all[i] != "FoamFile") ++i;
-    if (i < all.size())
+    const std::vector<char> raw = gzSlurp(path);
+    const bool binary = foamBufferIsBinary(raw);
+    const std::string original(raw.begin(), raw.end());
+    const std::string dictionary = binary ? foamBinaryTextView(raw) : original;
+    const bool directBinary = binary && dictionary.find("#include") == std::string::npos
+                           && dictionary.find("#{") == std::string::npos && dictionary.find("#eval") == std::string::npos;
+    if (!directBinary)
     {
-        while (i < all.size() && all[i] != "{") ++i;
-        int depth = 0;
-        for (; i < all.size(); ++i)
-        {
-            if (all[i] == "{") ++depth;
-            else if (all[i] == "}") { if (--depth == 0) { ++i; break; } }
-        }
+        std::string txt = captureVerbatim(binary ? foamBinaryToAscii(raw) : original, verbatim_);
+        txt = captureVerbatim(expandIncludes(txt, dirOf(path), 0), verbatim_);
+        if (expandVars && txt.find('$') != std::string::npos) txt = expandDictVariables(txt);
+        txt = expandEvalDirectives(txt);
+        toks_ = tokenize(stripComments(txt));
     }
     else
     {
-        i = 0; // no header, payload starts at the top
+        // A directive-free binary restart has no text to expand. Decode its dictionary text and raw
+        // numeric payloads in one pass, without ever converting the values to decimal text.
+        toks_ = tokenizeFoamBinary(raw);
+    }
+    const std::vector<std::string> all = toks_;
+
+    // tokenizeFoamBinary already skipped the header for the direct path; only the text path needs it here.
+    std::size_t i = 0;
+    if (!directBinary)
+    {
+        std::size_t h = 0;
+        while (h < all.size() && all[h] != "FoamFile") ++h;
+        // no header: the payload starts at the top
+        if (h < all.size())
+        {
+            i = h;
+            while (i < all.size() && all[i] != "{") ++i;
+            int depth = 0;
+            for (; i < all.size(); ++i)
+            {
+                if (all[i] == "{") ++depth;
+                else if (all[i] == "}") { if (--depth == 0) { ++i; break; } }
+            }
+        }
     }
     toks_.assign(all.begin() + i, all.end());
 }
@@ -749,7 +897,13 @@ void TokenStream::expect(const std::string& t)
 }
 
 label  TokenStream::nextLabel()  { return static_cast<label>(std::strtol(next().c_str(), nullptr, 10)); }
-scalar TokenStream::nextScalar() { return std::strtod(next().c_str(), nullptr); }
+scalar TokenStream::nextScalar()
+{
+    const std::string token = next();
+    double raw = 0;
+    if (decodeBinaryScalar(token, raw)) return raw;
+    return std::strtod(token.c_str(), nullptr);
+}
 
 // Binary format support
 namespace {
@@ -768,6 +922,12 @@ void skipSpaceAndComments(const std::vector<char>& b, std::size_t& i)
         else if (c == '/' && i + 1 < b.size() && b[i + 1] == '/')
         {
             while (i < b.size() && b[i] != '\n') ++i;
+        }
+        else if (c == '/' && i + 1 < b.size() && b[i + 1] == '*')
+        {
+            i += 2;
+            while (i + 1 < b.size() && !(b[i] == '*' && b[i + 1] == '/')) ++i;
+            if (i + 1 < b.size()) i += 2;
         }
         else break;
     }

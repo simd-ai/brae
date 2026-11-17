@@ -1,7 +1,7 @@
 // inter_cn_restart.cu -- see inter_cn_restart.cuh for the two facts this implements.
 #include "inter_cn_restart.cuh"
 
-#include "foam_dict.cuh"           // isCoupledInterfaceType
+#include "foam_dict.cuh"           // isCyclicFamilyType
 #include "foam_field_reader.cuh"   // FieldData / readField
 #include "read_surface_field.cuh"
 
@@ -174,7 +174,7 @@ bool seedCnDdt0(
         comp[0] = host.internal;
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
-            if (isCoupledInterfaceType(patches[pi].type)) continue;
+            if (isCyclicFamilyType(patches[pi].type)) continue;
             bnd[0].insert(bnd[0].end(), host.boundary[pi].begin(), host.boundary[pi].end());
         }
     }
@@ -190,7 +190,7 @@ bool seedCnDdt0(
         }
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
-            if (isCoupledInterfaceType(patches[pi].type)) continue;
+            if (isCyclicFamilyType(patches[pi].type)) continue;
             for (const vector& v : host.boundary[pi])
             {
                 bnd[0].push_back(v.x); bnd[1].push_back(v.y); bnd[2].push_back(v.z);

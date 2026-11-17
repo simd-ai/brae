@@ -15,6 +15,7 @@
 #include "device_ldu.cuh"     // DeviceLduView
 #include "device_buffer.cuh"  // DeviceBuffer
 #include "device_amg_detail.cuh"  // nBlocks / TPB (for the inline FP32 matvec launch)
+#include "amg_cell_ops.cuh"       // the cell expressions the FP32 SpMV kernels and the fused coarse kernel share
 #include <cuda_runtime.h>
 #include <vector>
 
@@ -90,15 +91,7 @@ void amulFK(int nC, const float* __restrict__ diag, const float* __restrict__ up
 {
     const int c = blockIdx.x*blockDim.x + threadIdx.x;
     if (c >= nC) return;
-    float s = diag[c]*psi[c];
-    for (int f=ownerStart[c]; f<ownerStart[c+1]; ++f)
-        s += upper[f]*psi[nei[f]];
-    for (int k=losortStart[c]; k<losortStart[c+1]; ++k)
-    {
-        const int f=losort[k];
-        s += lower[f]*psi[owner[f]];
-    }
-    Apsi[c]=s;
+    Apsi[c] = cellSpmvFaceF(c, diag, upper, lower, nei, owner, ownerStart, losort, losortStart, psi);
 }
 // FP-12 MEASURED THE LAUNCH SHAPE AND IT IS NOT THE CONSTRAINT. This SpMV is 451 launches and 2.60 of
 // the pressure phase's 6.57 GPU ms on gasMixing/injectorPipe (74,650 cells, 11 levels, ~15 V-cycles per
@@ -123,10 +116,7 @@ void amulCsrFK(int nC, const float* __restrict__ diag, const label* __restrict__
 {
     const int c = blockIdx.x*blockDim.x + threadIdx.x;
     if (c >= nC) return;
-    float s = diag[c]*psi[c];
-    for (label i = row[c]; i < row[c+1]; ++i)
-        s += val[i]*psi[col[i]];
-    Apsi[c]=s;
+    Apsi[c] = cellSpmvCsrF(c, diag, row, col, val, psi);
 }
 // The double cycle's product on a grid with the row layout (AMGData::csr64Row): one contiguous row, where amulKernel merges two
 // lists of faces through three chained reads an entry. Nsight Compute, one launch at 1 to 197 blocks (motorBike, 16 GH200s):

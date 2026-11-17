@@ -1,7 +1,7 @@
 // hex_ref8_cpp.cu -- see the header for what a split is, how the unit is divided and what is refused.
 #include "hex_ref8_cpp.cuh"
 
-#include "foam_dict.cuh"   // isCoupledInterfaceType
+#include "foam_dict.cuh"   // isCyclicFamilyType
 #include "foam_token_reader.cuh"   // readLabelListFile, foamFormat: the refinement state off disk
 
 #include <algorithm>
@@ -175,7 +175,7 @@ std::vector<std::vector<label>> setRefinementPointsAndCells(
     // that would make them matter is refused instead of being run without them.
     for (const std::string& t : patchTypes)
     {
-        if (isCoupledInterfaceType(t) || t == "processor" || t == "processorCyclic")
+        if (isCyclicFamilyType(t) || t == "processor" || t == "processorCyclic")
             throw std::runtime_error(
                 std::string(WHO) + "patch type `" + t + "` is coupled. setRefinement synchronises "
                 "edgeMidPoint (hexRef8.C:3438), the edge mid POSITIONS (:3496), faceMidPoint (:3626) and "

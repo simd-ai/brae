@@ -65,9 +65,16 @@ inline std::string setHostAllocator()
                              "BRAE_HOST_ALLOCATOR=system runs without it\n");
         std::exit(1);
     }
-    const std::size_t mappedBefore = mallinfo2().hblks;
+    // mallinfo2 is glibc 2.33+: builds against an older sysroot (the V100 nodes' glibc 2.31 binaries) use mallinfo,
+    // whose int fields are ample for a count of mmap'd blocks
+#if __GLIBC_PREREQ(2, 33)
+    auto mappedBlocks = []() { return std::size_t(mallinfo2().hblks); };
+#else
+    auto mappedBlocks = []() { return std::size_t(mallinfo().hblks); };
+#endif
+    const std::size_t mappedBefore = mappedBlocks();
     void* probe = std::malloc(std::size_t(64)*1024*1024);
-    const bool mapped = mallinfo2().hblks != mappedBefore;
+    const bool mapped = mappedBlocks() != mappedBefore;
     std::free(probe);
     if (probe == nullptr || mapped)
     {

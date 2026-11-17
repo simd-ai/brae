@@ -41,6 +41,7 @@
 #include "geometric_field.cuh"
 #include "fvc.cuh"
 #include "grad_choice.cuh"
+#include "proc_globals.cuh"
 #include <cmath>
 #include <cstdlib>
 #include <stdexcept>
@@ -100,8 +101,20 @@ inline InterfaceCoeffs readInterfaceCoeffs(const FoamDict& fvSolution,
 // deltaN = 1e-8/cbrt(average(V)) -- interfaceProperties.C:194. CALLED ONCE, where OpenFOAM's
 // constructor calls it, and the result kept in InterfaceCoeffs::deltaN; see the note there for what
 // recomputing it costs on a mesh that deforms.
+//
+// UNDER -parallel `average(V)` is gAverage (DimensionedFieldFunctions.C:305, Field.C:647-671): every rank's
+// sum and cell count are reduced and the ONE number divides, so every rank gets the same deltaN. A rank's own
+// average of its own cells would give each rank a different stabiliser and change nHat on the interface.
 inline scalar deltaN(const std::vector<scalar>& cellVolumes)
 {
+    if (pg::parallel())
+    {
+        double sc[2] = {0, static_cast<double>(cellVolumes.size())};
+        for (scalar v : cellVolumes) sc[0] += v;
+        pg::sum(sc, 2);
+        if (!(sc[1] > 0)) return scalar(0);
+        return scalar(1e-8) / std::cbrt(static_cast<scalar>(sc[0] / sc[1]));
+    }
     if (cellVolumes.empty()) return scalar(0);
     scalar sum = 0;
     for (scalar v : cellVolumes) sum += v;

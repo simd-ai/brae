@@ -97,6 +97,9 @@ struct DeviceCyclic
     // indices; twin[j] is the index of the face j pairs with, or -1 where there is none (an AMI side,
     // which OpenFOAM does NOT sync -- see MULES's sync note).
     DeviceBuffer<label> ifCellStart, ifPerm, twin;
+    // the cells that own at least one interface face, ascending: one thread of a fused interface product each (device_spmv.cu)
+    DeviceBuffer<label> ifCellList;
+    int nIfCells = 0;
     // THE ORDER A CELL'S FACES ARE SUMMED IN. The kernels that add a face's term to its owner cell do it with
     // atomicAdd, and a cell that owns SEVERAL faces of the pair was summed in the order the threads arrived:
     // another rounding at every run. MEASURED 2026-10-07 on RAS/mixerVesselAMI's pinned row, two runs of one
@@ -301,6 +304,15 @@ inline DeviceCyclic buildDeviceCyclic(
     d.orthDeltaCoeffs.copyFrom(odc);
     d.ifCellStart.copyFrom(cellStart);
     d.ifPerm.copyFrom(perm);
+    {
+        std::vector<label> withFaces;
+        for (std::size_t c = 0; c + 1 < cellStart.size(); ++c)
+        {
+            if (cellStart[c + 1] > cellStart[c]) withFaces.push_back(static_cast<label>(c));
+        }
+        d.nIfCells = static_cast<int>(withFaces.size());
+        d.ifCellList.copyFrom(withFaces);
+    }
     d.ifRank.copyFrom(rank);
     d.nIfRanks = static_cast<int>(mostOfACell);
     if (mostOfACell > 1)
@@ -629,7 +641,8 @@ void deviceCyclicCorrectFlux(DeviceCyclic& cyc, const DeviceBuffer<scalar>& p,
 // reconstruct((phig - p_rghEqn.flux())/rAUf) reads the flux and not the corrected phi.
 void deviceCyclicPressureFlux(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& p,
                               DeviceBuffer<scalar>& out,
-                              const DeviceBuffer<scalar>* jump = nullptr);
+                              const DeviceBuffer<scalar>* jump = nullptr,
+                              const DeviceBuffer<scalar>* coeff = nullptr);
 // gaussGrad contribution: grad[own] += Sf_j * (w*psi[own]+(1-w)*psi[nbr]) / V[own].
 // fvc::snGrad ON THE PAIR'S FACES (fvc.cu, snGradScheme.C's coupled branch): dc*(pnf - psi[own]) with the
 // scheme's delta coefficient -- nonOrthDeltaCoeffs under `corrected` and `uncorrected`, the plain 1/|delta| under

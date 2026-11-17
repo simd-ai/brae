@@ -78,6 +78,13 @@ struct DeviceAlphaSolverControls
     // DTCHullMoving, electrostaticDeposition); on damBreak's big step OpenFOAM's first pre-solve starts
     // inside its own tolerance and `minIter 1` makes it sweep anyway, which moves alpha.
     int minIter = 0;
+    DeviceBuffer<scalar>* matrixDiagOut = nullptr;
+    DeviceBuffer<scalar>* matrixSourceOut = nullptr;
+    DeviceBuffer<scalar>* matrixUpperOut = nullptr;
+    DeviceBuffer<scalar>* matrixLowerOut = nullptr;
+    DeviceBuffer<scalar>* matrixProcCoeffOut = nullptr;
+    DeviceBuffer<scalar>* matrixICOut = nullptr;
+    DeviceBuffer<scalar>* matrixBCOut = nullptr;
 };
 
 // `alpha1` goes in as the initial guess -- the sub-step's old time, which is what OpenFOAM hands the

@@ -38,6 +38,7 @@
 #include "inter_cn_restart.cuh"
 #include "MRF_cpp.cuh"
 #include "cf_types.cuh"
+#include "case_roots.cuh"
 #include "foam_dict.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
@@ -446,7 +447,14 @@ void updateMixtureBoundary(
     const std::vector<FvPatch>& patches,
     MixturePatches which = MixturePatches::all);
 
-InterFields buildInterFields(const std::string&          caseDir,
+// the pressure reference of a closed case, as buildInterFields reads it (findRefCell.C; global under -parallel)
+InterFields::PressureReference readPressureReferenceOf(
+    const GeometricField<scalar>& p_rgh,
+    const FoamDict& fvSolution,
+    const PrimitiveMesh& m,
+    const FvGeometry& g);
+
+InterFields buildInterFields(const CaseRoots&            roots,
                              const std::string&          startDir,
                              const PrimitiveMesh&        m,
                              const FvGeometry&           g,

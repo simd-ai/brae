@@ -67,7 +67,7 @@ namespace cli {
 // (isCommand below), so none of these takes a case path away from anyone.
 inline const std::vector<std::string>& commandWords()
 {
-    static const std::vector<std::string> w = {"run", "check", "solvers", "capabilities"};
+    static const std::vector<std::string> w = {"run", "check", "solvers", "capabilities", "decompose", "reconstruct"};
     return w;
 }
 
@@ -343,9 +343,10 @@ inline std::vector<Capability> capabilities()
     // mesh and parallel
     v.push_back(cap("mesh", "polyMesh ascii / binary / gzip", "implemented", "all", "1 GPU", "cellZones ascii and binary"));
     v.push_back(cap("mesh", "cyclic, cyclicAMI, cyclicACMI", "implemented", "all", "1 GPU", "simpleFoamV2 refuses coupled patches"));
-    v.push_back(cap("parallel", "-parallel (processor patches, decomposition)", mgpuSibling().empty() ? "refused" : "implemented",
-                    "", "multi-GPU", mgpuSibling().empty() ? "this install has no multi-GPU layer (brae-mgpu)"
-                                                         : "handed to brae-mgpu; its entries follow"));
+    v.push_back(cap("parallel", "-parallel (processor patches, decomposition)", "implemented",
+                    mgpuSibling().empty() ? "interFoam" : "", "multi-GPU",
+                    mgpuSibling().empty() ? "brae_interFoam, one rank per GPU (no brae-mgpu here); every other solver refuses -parallel"
+                                          : "handed to brae-mgpu; its entries follow"));
     // opt-in solver paths: off unless asked for, never chosen by a case's own settings
     v.push_back(cap("solver path", "simpleFoam V2 driver", "experimental", "simpleFoam", "1 GPU",
                     "BRAE_SIMPLEFOAM_V2=1; refuses coupled patches; no [unread] report"));
@@ -565,8 +566,13 @@ inline int checkCommand(int argc, char** argv)
     const std::string app = solver ? solver->application : "";
     const bool legacyFamily = (app == "simpleFoam" || app == "pimpleFoam" || app == "rhoSimpleFoam");
     const std::string mgpu = parallel ? mgpuSibling() : std::string();
-    if (parallel && mgpu.empty())
-        r.add("mode", "refused", "-parallel needs the multi-GPU layer, brae-mgpu, installed next to brae; this install has none");
+    // without brae-mgpu, brae_interFoam reads a decomposed case itself (one rank per GPU); no other solver does
+    const bool inTreeParallel = parallel && mgpu.empty() && app == "interFoam";
+    if (inTreeParallel)
+        r.add("mode", "ok", "multi-GPU: brae_interFoam in this install (one rank per GPU), ranks from the launcher or decomposeParDict");
+    else if (parallel && mgpu.empty())
+        r.add("mode", "refused", "-parallel needs the multi-GPU layer, brae-mgpu, installed next to brae; this install has none "
+                                 "(only application interFoam runs -parallel without it)");
     else if (parallel)
         r.add("mode", "ok", "multi-GPU: " + mgpu + (np > 0 ? ", " + std::to_string(np) + " ranks" : ", ranks from decomposeParDict"));
     else
@@ -657,8 +663,8 @@ inline int checkCommand(int argc, char** argv)
             ++k;
         }
         if (n == 0) throw std::runtime_error("constant/polyMesh/boundary lists no patch");
-        if (kinds.count("processor"))
-            throw std::runtime_error("processor patches: a decomposed mesh needs the multi-GPU layer (brae-mgpu)");
+        if (kinds.count("processor") && !inTreeParallel)
+            throw std::runtime_error("processor patches: a decomposed mesh runs only under -parallel (application interFoam, or brae-mgpu)");
         std::string list;
         for (const auto& e : kinds) list += (list.empty() ? "" : ", ") + std::to_string(e.second) + " " + e.first;
         return std::to_string(n) + " patches (" + list + ")";

@@ -1,4 +1,5 @@
 // CUDA implementation -- see pEqn.cuh for the provenance and the contract with the _cpp reference.
+#include "device_processor_ops.cuh"
 #include "inter_phase_time.cuh"
 #include "pEqn.cuh"
 #include <cstdlib>
@@ -138,6 +139,12 @@ void pressurePredictor(
         cudaCheck(cudaGetLastError(), "foldBoundaryDiag");
         deviceReciprocalV(dm, D, st.rAU);
     }
+    if (DeviceProcCtx::active(dm))
+    {
+        DeviceProcCtx& pc = *DeviceProcCtx::current();
+        procExchange(pc, {const_cast<DeviceBuffer<scalar>*>(&Ux), const_cast<DeviceBuffer<scalar>*>(&Uy),
+                          const_cast<DeviceBuffer<scalar>*>(&Uz), &st.rAU}, "U and rAU");
+    }
 
     // ---- HbyA = rAU * H() --------------------------------------------------------------------
     const DeviceBuffer<scalar>* U[3] = {&Ux, &Uy, &Uz};
@@ -172,7 +179,17 @@ void pressurePredictor(
             deviceCopy(*in.hPairTap, Hk);
             deviceAxpy(-1.0, *in.hNoPairTap, *in.hPairTap);
         }
+        if (DeviceProcCtx::active(dm))
+        {
+            DeviceProcCtx& pc = *DeviceProcCtx::current();
+            deviceCyclicAddH(pc.cyc(), *U[k], dm.V, Hk, &UEqn.procIfCoeff);
+        }
+        resizeCellBuffer(st.HbyA[k], dm);
         deviceHadamard(st.HbyA[k], st.rAU, Hk);
+        if (DeviceProcCtx::active(dm))
+        {
+            procExchange(*DeviceProcCtx::current(), {&st.HbyA[k]}, "HbyA");
+        }
     }
 
     // ---- constrainHbyA(HbyA, U, p) -----------------------------------------------------------
@@ -198,6 +215,10 @@ void pressurePredictor(
             constrainHbyAKernel<<<nBlocks(dm.nBndFaces), TPB>>>(
                 dm.nBndFaces, dm.bndCell.data(), in.takeUAtBoundary->data(),
                 Ub.data(), st.HbyA[k].data(), st.HbyAb[k].data());
+            if (DeviceProcCtx::active(dm))
+            {
+                procFaceValue(*DeviceProcCtx::current(), st.HbyA[k], st.HbyAb[k]);
+            }
         }
     }
     cudaCheck(cudaGetLastError(), "constrainHbyA");
@@ -205,6 +226,12 @@ void pressurePredictor(
     // ---- phiHbyA = fvc::flux(HbyA) -----------------------------------------------------------
     deviceVectorFlux(dm, st.HbyA[0], st.HbyA[1], st.HbyA[2], st.phiHbyAInt);
     deviceBoundaryFlux(dm, st.HbyAb[0], st.HbyAb[1], st.HbyAb[2], st.phiHbyABnd);
+    if (DeviceProcCtx::active(dm))
+    {
+        DeviceProcCtx& pc = *DeviceProcCtx::current();
+        deviceCyclicFluxTo(pc.cyc(), st.HbyA[0], st.HbyA[1], st.HbyA[2], st.phiHbyAIf);
+        procScatter(pc, st.phiHbyAIf, st.phiHbyABnd);
+    }
     // ...and on the pair, where fvc::flux is the two CELLS' HbyA interpolated and dotted with Sf --
     // gated against the host's dot(coupledLinear(H), Sf) in test_device_cyclic_laplacian_vs_host.cu.
     if (in.cyc && in.cyc->n > 0)

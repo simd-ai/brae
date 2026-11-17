@@ -81,7 +81,7 @@ int main(int argc, char** argv)
     std::vector<scalar> alphaBnd;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+        if (isCyclicFamilyType(fvp[pi].type)) continue;
         const PatchFieldData<scalar>* b = nullptr;
         for (const PatchFieldData<scalar>& e : ofAlpha.boundary)
         {

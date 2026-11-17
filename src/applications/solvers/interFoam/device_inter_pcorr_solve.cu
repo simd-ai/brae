@@ -6,6 +6,7 @@
 #include "device_ldu.cuh"
 #include "fv_matrix_ops.cuh"   // matrixFlux, the check's oracle
 #include "device_mesh.cuh"   // nextDeviceAddressingId
+#include "device_processor_ops.cuh"   // DeviceProcCtx: the decomposed mesh's interface
 #include "device_pcg.cuh"    // deviceNormFactor
 #include <optional>
 #include <vector>
@@ -250,6 +251,16 @@ bool DevicePcorrSolver::solve(
     SolverPerformance& perf)
 {
     if (!takes(asked, patches)) return false;
+    for (const FvPatch& q : patches)
+    {
+        if (isProcessorType(q.type) && q.size > 0 && DeviceProcCtx::current() != nullptr)
+        {
+            throw std::runtime_error(
+                "brae interFoam device pcorr solve: the host-assembled system has no processor interface; on a "
+                "decomposed mesh pcorr is assembled by correct() (not BRAE_CONTROL_PCORR_ASSEMBLY_HOST, and "
+                "only the one pass of nNonOrthogonalCorrectors 0).");
+        }
+    }
     if (M.upper != M.lower)
     {
         throw std::runtime_error(
@@ -486,6 +497,32 @@ bool DevicePcorrSolver::correct(
         if (q.coupled) return false;
     }
     if (!takes(asked, patches)) return false;
+    // A DECOMPOSED MESH: the processor patches' faces are boundary faces here (host placeholders, no coefficients),
+    // and the processor interface carries them. Their off-diagonal coeff = gamma_b*magSf*dc (the device
+    // interface's nonOrthDeltaCoeffs) goes into the diagonal as a slot's internalCoeffs, the flux into the source
+    // as a slot's, the neighbour term into A.proc.coeff, and the reference cell lives on rank 0 only
+    // (fvMatrix::setReference, master only).
+    bool anyProc = false;
+    for (const FvPatch& q : patches) anyProc = anyProc || (isProcessorType(q.type) && q.size > 0);
+    DeviceProcCtx* const procP = anyProc ? DeviceProcCtx::current() : nullptr;
+    if (anyProc && procP == nullptr)
+    {
+        throw std::runtime_error("brae interFoam device pcorr: processor patches without a processor context.");
+    }
+    if (procP && !nonOrthDeltaCoeffs)
+    {
+        throw std::runtime_error("brae interFoam device pcorr: a decomposed mesh takes the corrected scheme's "
+                                 "nonOrthDeltaCoeffs on its processor faces; the scheme here does not.");
+    }
+    std::vector<scalar> procDc;
+    std::vector<scalar> procCoeff;
+    std::vector<label> procNbr;
+    if (procP)
+    {
+        procDc = procP->cyc().deltaCoeffs.host();
+        procNbr = procP->cyc().nbrCell.host();
+        procCoeff.assign(procDc.size(), scalar(0));
+    }
     static const bool ownerFirst = std::getenv("BRAE_CONTROL_PCORR_ASSEMBLY_OWNER_FIRST") != nullptr;
     const label nC = m.nCells();
     const label nIf = m.nInternalFaces();
@@ -536,6 +573,7 @@ bool DevicePcorrSolver::correct(
     std::vector<scalar> slotBC(nSlots);
     {
         std::size_t k = 0;
+        std::size_t nProcSeen = 0;
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
             const FvPatch& q = patches[pi];
@@ -549,6 +587,17 @@ bool DevicePcorrSolver::correct(
                 slotPhi[k] = phi.boundary[pi][ii];
                 slotIC[k] = pGamma * gIC[ii];
                 slotBC[k] = (-pGamma) * gBC[ii];
+                if (procP && isProcessorType(q.type))
+                {
+                    if (nProcSeen >= procDc.size())
+                    {
+                        throw std::runtime_error("brae interFoam device pcorr: more processor faces than the interface has.");
+                    }
+                    const scalar coeff = pGamma * procDc[nProcSeen];
+                    procCoeff[nProcSeen++] = coeff;
+                    slotIC[k] = -coeff;
+                    slotBC[k] = scalar(0);
+                }
                 ++k;
             }
         }
@@ -561,7 +610,7 @@ bool DevicePcorrSolver::correct(
     dUpper.resize(static_cast<std::size_t>(nIf));
     dDiag.resize(static_cast<std::size_t>(nC));
     dSource.resize(static_cast<std::size_t>(nC));
-    dPsi.resize(static_cast<std::size_t>(nC));
+    dPsi.resize(static_cast<std::size_t>(nC), procP ? static_cast<std::size_t>(procP->nCellsExt()) : static_cast<std::size_t>(nC));
     const int tpb = 256;
     if (nIf > 0)
     {
@@ -586,7 +635,7 @@ bool DevicePcorrSolver::correct(
         dSlotPhi.data(),
         dSlotIC.data(),
         dSlotBC.data(),
-        needReference ? 0 : -1,
+        (needReference && (!procP || procP->comm().rank() == 0)) ? 0 : -1,
         ownerFirst ? 1 : 0,
         dDiag.data(),
         dSource.data());
@@ -615,6 +664,12 @@ bool DevicePcorrSolver::correct(
     DeviceLduView A{nC, nIf, dDiag.data(), dUpper.data(), dUpper.data(), dOwner.data(), dNeighbour.data(),
                     dOwnerStart.data(), dLosort.data(), dLosortStart.data(), 0, nullptr, nullptr, nullptr};
     A.addressingId = addressingId;
+    if (procP)
+    {
+        dProcCoeff.copyFrom(procCoeff);
+        A.proc = procP->interfaceView();
+        A.proc.coeff = dProcCoeff.data();
+    }
     timedPart.emplace("pcorr: the hierarchy's coarse matrices (Galerkin) and the norm factor");
     amgGalerkin(amg, dDiag, dUpper, dUpper);
     const scalar nf = deviceNormFactor(A, dPsi, dSource, deviceOnes(nC));
@@ -625,7 +680,16 @@ bool DevicePcorrSolver::correct(
     const amgSplit::Name splitName("pcorr");
     const AmgPcgKnobs& knobs = amgPcgKnobs();
     const DeviceSolverPerf r = deviceAMGPCG(A, amg, dSource, dPsi, nf, tol, relTol, oneIteration ? 1 : maxIter,
-                                            knobs.graph, knobs.checkEvery, knobs.corrScaling, minIter);
+                                            procP ? false : knobs.graph, knobs.checkEvery,
+                                            procP ? false : knobs.corrScaling, minIter);
+    std::vector<scalar> psiExt;
+    if (procP)
+    {
+        procExchange(*procP, {&dPsi}, "pcorr");
+        psiExt.resize(static_cast<std::size_t>(procP->nCellsExt()));
+        cudaCheck(cudaMemcpy(psiExt.data(), dPsi.data(), psiExt.size()*sizeof(scalar), cudaMemcpyDeviceToHost),
+                  "pcorr psi with halo");
+    }
 
     timedPart.emplace("pcorr: the flux (device), phi and pcorr down");
     SurfaceScalarField phiBefore;
@@ -648,13 +712,19 @@ bool DevicePcorrSolver::correct(
     // subtraction as matrixFlux forms it, and phi -= flux on every patch that is not empty
     {
         std::size_t k = 0;
+        std::size_t nProcFlux = 0;
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
             const FvPatch& q = patches[pi];
             if (q.coupled || q.type == "empty") continue;
             for (label i = 0; i < q.size; ++i)
             {
-                const scalar flux = std::fma(slotIC[k], psi[static_cast<std::size_t>(q.faceCells[i])], -slotBC[k]);
+                scalar flux = std::fma(slotIC[k], psi[static_cast<std::size_t>(q.faceCells[i])], -slotBC[k]);
+                if (procP && isProcessorType(q.type))
+                {
+                    flux = std::fma(procCoeff[nProcFlux], psiExt[static_cast<std::size_t>(procNbr[nProcFlux])], flux);
+                    ++nProcFlux;
+                }
                 phi.boundary[pi][static_cast<std::size_t>(i)] -= flux;
                 ++k;
             }

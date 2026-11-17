@@ -201,11 +201,15 @@ struct DdtCorrInput
 // OpenFOAM returns. Throws where OpenFOAM stops, in its words: an imbalance no adjustable outflow can
 // remove. ONE COPY: the host pressure corrector, CorrectPhi on both arms, and the device pressure step's
 // adjustPhi hook all call this.
+// `sumMagInternal` >= 0: gSum(mag(phi.internal)) already computed by the caller (the device step reduces it on
+// the GPU), so phi.internal need not hold the field -- adjustPhi reads the internal faces for nothing else.
+// Negative: summed here, from phi.internal, as before.
 bool adjustPhi(
     SurfaceScalarField& phi,
     const GeometricField<vector>& U,
     bool needReference,
-    const std::vector<FvPatch>& patches);
+    const std::vector<FvPatch>& patches,
+    scalar sumMagInternal = -1);
 
 // Returns coeff*rDeltaT*phiCorr on the internal faces, and zero on every patch where U fixes a value.
 void ddtCorr(const DdtCorrInput&           in,

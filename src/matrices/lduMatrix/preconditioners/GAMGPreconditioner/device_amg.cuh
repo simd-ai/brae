@@ -112,8 +112,17 @@ struct PCGGraphCache {
     // serial graph: entries that differ in them -- interFoam's p_rgh and p_rghFinal, relTol 0.01 and 0 -- then
     // share one captured graph instead of re-capturing at every solve.
     DeviceBuffer<scalar> sCtl;
+    // THE DECOMPOSED-MESH WHILE GRAPH (deviceAMGPCGProcGraph, NCCL graph communicator): the processor-interface
+    // coefficient copied per solve like the pair's, the {z.r, sum|r|} pair one collective carries, the residual
+    // history (a test hook, sized by the cap it was captured with) and the identity of what the capture baked.
+    DeviceBuffer<scalar> gProcCoeff, procPair, dHist;
+    const void* keyProcComm = nullptr; const void* keyProcPlan = nullptr;
+    const void* keyProcFaceCell = nullptr; const void* keyProcNbrIdx = nullptr; const void* keyProcRank = nullptr;
+    int keyProcFaces = -1; int keyHistCap = -1; const void* keyPA = nullptr;
+    const void* registeredComm = nullptr;   // proc_hooks.cuh registry: the comm whose graph channel this captured on
     ~PCGGraphCache();
 };
+void destroyPcgGraphs(PCGGraphCache* c);   // the registry's destroy closure (device_amg.cu)
 
 // One agglomeration level: maps grid k (nFine cells) -> grid k+1 (nCoarse cells), and holds grid k+1's matrix.
 struct AMGLevel {
@@ -546,6 +555,16 @@ DeviceSolverPerf deviceAMGPCG(const DeviceLduView& Afine, AMGData& amg, const De
                               DeviceBuffer<scalar>& psi, scalar normFactor, scalar tol, scalar relTol, int maxIter,
                               bool captureVcycle = false, int checkEvery = 1, bool corrScaling = false,
                               int minIter = 0);
+// DECOMPOSED MESH (Afine.proc.active(), device_ldu.cuh): the products exchange halos, the dots/residual are global, every
+// rank takes the same iteration count; the V-cycle is each rank's own block. normFactor must be the global one
+// (deviceNormFactor on the same view). On the NCCL backend the whole loop is ONE CUDA graph per rank (conditional WHILE
+// node, halo + the two deterministic collectives inside the body, device-side stop on the reduced residual; see
+// deviceAMGPCGProcGraph in device_amg_pcg.cu), bit-identical to the host-driven loop, which every other backend runs and
+// BRAE_PROC_GRAPH=0 selects (proc_hooks.cuh procGraphLoops). The same switch governs deviceSymGaussSeidel.
+//
+// Test hook: while set, a decomposed solve appends its residual history (initial, then after every iteration, as
+// normalised) to *history (replaced at the start of each solve). Pass nullptr to stop.
+void amgPcgSetHistory(std::vector<scalar>* history);
 // the same solve with the normFactor on the device (item 66)
 DeviceSolverPerf deviceAMGPCG(const DeviceLduView& Afine, AMGData& amg, const DeviceBuffer<scalar>& b,
                               DeviceBuffer<scalar>& psi, const scalar* dNormFactor, scalar tol, scalar relTol, int maxIter,
@@ -637,18 +656,6 @@ bool amgSinglePrecisionCycle(const AMGData& amg);
 // Call ONCE per solve before the amgVCycleApply loop; after it, amgVCycleApply runs FP32 automatically. No-op
 // unless BRAE_AMG_FP32 (default on) and the default smoother (GS/Chebyshev stay FP64): amgSinglePrecisionCycle.
 void amgPrepareFP32(AMGData& amg, const DeviceLduView& A);
-
-class DeviceHalo;   // fwd (parallel/pstream/device_halo.cuh)
-
-// DISTRIBUTED whole-loop graph PCG: the entire steady-state PCG WHILE body captured once into a conditional CUDA
-// graph and replayed on-device (no per-iteration host launches), with deviceParallelAmul (halo) + on-stream
-// NVSHMEM reduces INSIDE the captured body. Real-multi-GPU only (1 PE/GPU; the MPG host-MPI reduce fallback is
-// not graph-capturable). Captures once per run only if the caller holds psi/matrix buffers persistent.
-DeviceSolverPerf deviceParallelAMGPCGGraph(
-    const DeviceLduView& A, AMGData& amg, DeviceHalo& halo,
-    const std::vector<DeviceBuffer<scalar>>& ifaceCoeffs,
-    const DeviceBuffer<scalar>& b, DeviceBuffer<scalar>& psi,
-    scalar normFactor, scalar tol, scalar relTol, int maxIter);
 
 // #7 (clusters+DSM): the coarse-level weighted-Jacobi solve (nSweeps of x += omega*(b-Ax)/diag), fused into a
 // SINGLE thread-block-cluster kernel, the whole coarse vector lives in the cluster's distributed shared memory

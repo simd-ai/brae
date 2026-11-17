@@ -34,6 +34,7 @@
 #include "inter_peqn_cpp.cuh"
 #include "device_inter_step.cuh"
 #include "inter_writer_cpp.cuh"
+#include "case_roots.cuh"
 #include <string>
 
 namespace brae {
@@ -160,7 +161,7 @@ scalar startTimeOf(const std::string& startDir);
 // Run `nSteps` of interFoam on a prepared case. Returns the state at the end; `verbose` prints the
 // per-step line OpenFOAM's own solver prints.
 RunReport runInterFoam(
-    const std::string& caseDir,
+    const CaseRoots& roots,
     const std::string& startDir,
     const PrimitiveMesh& m,
     const FvGeometry& g,
@@ -203,7 +204,7 @@ RunReport runInterFoam(
 // values for the stress and for constrainHbyA, and p_rgh's for the pressure laplacian. Everything that
 // scales with the CELL COUNT runs on the device.
 RunReport runInterFoamDevice(
-    const std::string& caseDir,
+    const CaseRoots& roots,
     const std::string& startDir,
     const PrimitiveMesh& m,
     const FvGeometry& g,

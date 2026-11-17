@@ -90,7 +90,7 @@ inline TurbulentInletMasks buildTurbulentInletMasks(
     TurbulentInletMasks m;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        if (isCoupledInterfaceType(fvp[pi].type)) continue;   // DeviceBoundary skips these
+        if (isCyclicFamilyType(fvp[pi].type)) continue;   // DeviceBoundary skips these
         const PatchFieldData<scalar>* kb = findPatchEntry(kFD.boundary, fvp[pi]);
         const PatchFieldData<scalar>* sb = findPatchEntry(sFD.boundary, fvp[pi]);
         const bool ti = kb && kb->type == "turbulentIntensityKineticEnergyInlet";

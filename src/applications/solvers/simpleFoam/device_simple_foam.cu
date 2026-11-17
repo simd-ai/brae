@@ -294,7 +294,7 @@ SimplecSnGrad simplecSnGrad(
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
                 patchStart_[pi] = st;
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 st += fvp[pi].size;
             }
         }
@@ -307,7 +307,7 @@ SimplecSnGrad simplecSnGrad(
             std::vector<scalar> nb;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 const int nutCat = nut->boundary[pi]->bcCategory();
                 const bool calc = (fvp[pi].type != "wall") && (nutCat == 2);
                 // A non-wall `fixedValue` nut patch is NOT a `calculated` one and must not be lumped in
@@ -347,7 +347,7 @@ SimplecSnGrad simplecSnGrad(
             label bi = 0;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 for (label i = 0; i < fvp[pi].size; ++i, ++bi)
                     if (isTurbWallPatch(fvp, pi, ctl_.turbWallPatch)) wfb.push_back(bi);
             }
@@ -359,7 +359,7 @@ SimplecSnGrad simplecSnGrad(
             std::vector<scalar> ref, dc, ms;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
                     ty.push_back(0);
@@ -410,7 +410,7 @@ SimplecSnGrad simplecSnGrad(
             std::vector<scalar> ub[3];
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 const std::vector<vector>& v = U.boundary[pi]->value();
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
@@ -429,7 +429,7 @@ SimplecSnGrad simplecSnGrad(
             std::vector<scalar> pb;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 const std::vector<scalar>& v = p.boundary[pi]->value();
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
@@ -451,7 +451,7 @@ SimplecSnGrad simplecSnGrad(
             std::vector<scalar> ub[3];
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 const std::vector<vector>& v = U.boundary[pi]->value();
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
@@ -490,7 +490,7 @@ SimplecSnGrad simplecSnGrad(
             std::vector<scalar> nx, ny, nz;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
                     nx.push_back(fvp[pi].nf[i].x);
@@ -512,7 +512,7 @@ SimplecSnGrad simplecSnGrad(
                 label bi = 0;
                 for (std::size_t pj = 0; pj < fvp.size(); ++pj)
                 {
-                    if (isCoupledInterfaceType(fvp[pj].type)) continue;
+                    if (isCyclicFamilyType(fvp[pj].type)) continue;
                     for (label i = 0; i < fvp[pj].size; ++i, ++bi)
                         if (pj == pi) mask[bi] = fvp[pj].magSf[i];
                 }
@@ -541,7 +541,7 @@ SimplecSnGrad simplecSnGrad(
             std::vector<scalar> yv;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 const bool wall = (fvp[pi].type == "wall");
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
@@ -558,7 +558,7 @@ SimplecSnGrad simplecSnGrad(
             std::vector<scalar> bx, by, bz;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
                     const vector& cf = g.Cf()[fvp[pi].start + i];
@@ -573,7 +573,7 @@ SimplecSnGrad simplecSnGrad(
             std::vector<label> adj;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 const bool fixed = U.boundary[pi]->fixesValue();
                 for (label i = 0; i < fvp[pi].size; ++i)
                     adj.push_back(fixed ? 0 : 1);
@@ -590,7 +590,7 @@ SimplecSnGrad simplecSnGrad(
             std::vector<scalar> mask;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 const scalar m01 = U.boundary[pi]->fixesValue() ? scalar(0) : scalar(1);
                 for (label i = 0; i < fvp[pi].size; ++i) mask.push_back(m01);
             }
@@ -778,7 +778,7 @@ SimplecSnGrad simplecSnGrad(
             std::vector<scalar> o;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 o.insert(o.end(), phi.boundary[pi].begin(), phi.boundary[pi].end());
             }
             phiBnd_.copyFrom(o);
@@ -1938,7 +1938,7 @@ SimplecSnGrad simplecSnGrad(
         }
         deviceDivDevReff(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], ddrNuCell, ctl_.maxwell ? ddrNuBnd : nuEffBnd,
                          ddrX, ddrY, ddrZ,
-                         hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr, nullptr,
+                         hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr,
                          // null without a freestream patch: this driver evaluates U's boundary before the
                          // assembly, so re-deriving it here is the same number. See the header (item 30).
                          freestreamStored() ? gradUBndP : nullptr, ctl_.gradULimitK);
@@ -3995,7 +3995,7 @@ SimplecSnGrad simplecSnGrad(
             std::size_t b = 0;
             for (std::size_t pj = 0; pj < fvp.size(); ++pj)
             {
-                if (isCoupledInterfaceType(fvp[pj].type)) continue;
+                if (isCyclicFamilyType(fvp[pj].type)) continue;
                 for (label i = 0; i < fvp[pj].size; ++i, ++b)
                 {
                     const std::size_t f = static_cast<std::size_t>(fvp[pj].start + i);
@@ -4238,9 +4238,12 @@ SimplecSnGrad simplecSnGrad(
                                hasAMI_    ? &ami_.ownCell : nullptr, hasAMI_    ? &ami_.phi : nullptr,
                                sumPhi);
         // OF CourantNo.H: CoNum = 0.5*max(sumPhi/V)*deltaT, meanCoNum = 0.5*(sum(sumPhi)/sum(V))*deltaT.
-        const scalar sumV = deviceSumMag(dm.V);
-        c.CoNum     = scalar(0.5)*deviceMaxRatio(sumPhi, dm.V)*deltaT;
-        c.meanCoNum = (sumV > 0) ? scalar(0.5)*(deviceSumMag(sumPhi)/sumV)*deltaT : scalar(0);
+        // the three reductions with one read-back
+        scalar red[3];
+        deviceCourantReductions(sumPhi, dm.V, red);
+        const scalar sumV = red[2];
+        c.CoNum     = scalar(0.5)*red[0]*deltaT;
+        c.meanCoNum = (sumV > 0) ? scalar(0.5)*(red[1]/sumV)*deltaT : scalar(0);
         return c;
     }
 

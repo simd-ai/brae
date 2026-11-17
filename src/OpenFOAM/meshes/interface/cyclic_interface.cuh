@@ -180,4 +180,54 @@ inline std::vector<CyclicInterface> buildCyclicInterfaces(
     return out;
 }
 
+// THE PROCESSOR INTERFACES of a rank: one CyclicInterface per `processor` patch with faces that
+// attachProcessorCoupling has coupled, in patch order. buildCyclicInterfaces never returns these (a processor
+// patch is not in the cyclic family: its faces stay boundary faces of the device mesh), and the list is NOT to
+// be mixed into the cyclics of buildDeviceCyclic: hand it to buildDeviceProcInterface (device_processor.cuh).
+//
+// Everything is taken as the coupled patch holds it -- weights, delta, nonOrthDeltaCoeffs and correction
+// vectors are processorFvPatch's, so the device and the host cannot drift. `nbrFaceCells` already holds the
+// HALO SLOT of the neighbour cell (nC + slot), which is what makes a kernel's x[nbrCell[j]] read the neighbour's
+// value once the halo tail of x is refreshed. translational (a processor patch is a parallel transform; a
+// rotational processorCyclic is refused by name), nbrPatch = -1: the twin is on another rank, so buildDeviceCyclic
+// gives it twin = -1 and MULES' lambda min-sync goes through ProcComm::exchangeFaces instead.
+inline std::vector<CyclicInterface> buildProcessorInterfaces(
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp)
+{
+    std::vector<CyclicInterface> out;
+    for (label pi = 0; pi < static_cast<label>(fvp.size()); ++pi)
+    {
+        const FvPatch& P = fvp[static_cast<std::size_t>(pi)];
+        if (P.type != "processor" || P.size == 0) continue;
+        const std::size_t n = static_cast<std::size_t>(P.size);
+        if (!P.coupled || P.weights.size() != n || P.delta.size() != n || P.nbrD.size() != n
+         || P.nbrFaceCells.size() != n || P.nonOrthDeltaCoeffs.size() != n || P.nonOrthCorrectionVectors.size() != n)
+        {
+            throw std::runtime_error(
+                "processor patch `" + P.name + "` carries no coupled geometry; attachProcessorCoupling has to run "
+                "before its interface is built.");
+        }
+        CyclicInterface ci;
+        ci.patch = pi;
+        ci.nbrPatch = -1;
+        ci.translational = true;
+        ci.ami = false;
+        ci.faceCells = P.faceCells;
+        ci.nbrFaceCells = P.nbrFaceCells;
+        ci.weights = P.weights;
+        ci.deltaCoeffs = P.nonOrthDeltaCoeffs;
+        ci.delta = P.delta;
+        ci.corrVec = P.nonOrthCorrectionVectors;
+        ci.dNbr = P.nbrD;
+        ci.dOwn.resize(n);
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            ci.dOwn[i] = g.Cf()[P.start + static_cast<label>(i)] - g.C()[P.faceCells[i]];
+        }
+        out.push_back(std::move(ci));
+    }
+    return out;
+}
+
 } // namespace brae

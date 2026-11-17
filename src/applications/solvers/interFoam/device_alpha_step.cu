@@ -1,6 +1,7 @@
 // The device alpha step -- see device_alpha_step.cuh for the provenance and for what is NOT here.
 #include "device_alpha_step.cuh"
 #include "device_blas.cuh"       // deviceCopy
+#include "device_processor_ops.cuh"
 #include "device_alpha_flux.cuh"
 #include "device_mules.cuh"
 #include "inter_phase_time.cuh"
@@ -236,8 +237,31 @@ void deviceAlphaCorrector(
             "The corrector does NOT reset it to alpha1Old -- alphaEqn.H resets alpha1 once per "
             "sub-cycle and each corrector continues from the last one's answer.");
 
+    // ACROSS PROCESSOR FACES (a DeviceProcCtx is current): the boundary arrays carry the interface faces in their
+    // processor segment, alpha's halo is refreshed here, and each flux below is completed on those faces by the
+    // cyclic interface kernels (neighbour cells from the halo, gradients exchanged) and scattered into the segment.
+    DeviceProcCtx* const proc = (DeviceProcCtx::active(dm) && !(in.cyc && in.cyc->n > 0)) ? DeviceProcCtx::current() : nullptr;
+    if (proc)
+    {
+        if (in.gradAlpha1CellLimitK > scalar(0) || in.gradAlpha2CellLimitK > scalar(0)
+         || in.gradAlpha1LeastSquares || in.gradAlpha2LeastSquares || in.phicBndPre)
+            throw std::runtime_error(
+                "brae interFoam device alphaEqn: across processor faces only Gauss linear alpha gradients and a "
+                "phic formed here are ported (a limited or least-squares gradient would read cells beyond "
+                "the halo).");
+        procExchange(*proc, {&alpha1}, "alpha1");
+        procGather(*proc, *in.phiBnd, proc->cyc().phi);
+    }
+    // the face flux of one cell field across the processor faces: its gradient (Gauss, the processor faces through
+    // the boundary-value slot), the gradient's halo, then the scheme's weight on both sides' cells
+    const auto procGrad = [&](const DeviceBuffer<scalar>& field, const DeviceBuffer<scalar>& fieldBnd,
+                              DeviceBuffer<scalar>& gx, DeviceBuffer<scalar>& gy, DeviceBuffer<scalar>& gz)
+    {
+        deviceGradOf(dm, field, fieldBnd, false, scalar(0), gx, gy, gz, nullptr);
+        procExchange(*proc, {&gx, &gy, &gz}, "grad(alpha)");
+    };
     DeviceBuffer<scalar> phicInt, phicBnd, phirInt, phirBnd;
-    DeviceBuffer<scalar> alpha2(static_cast<std::size_t>(nC)), alpha2Bnd(static_cast<std::size_t>(nBf));
+    DeviceBuffer<scalar> alpha2 = makeCellBuffer<scalar>(dm), alpha2Bnd(static_cast<std::size_t>(nBf));   // alpha2 is read across a processor face
     DeviceBuffer<scalar> advInt, advBnd, negPhirInt, negPhirBnd;
     DeviceBuffer<scalar> innerInt, innerBnd, negInnerInt, negInnerBnd, compInt, compBnd;
     DeviceBuffer<scalar> phiBDInt, phiBDBnd, corrInt, corrBnd, lamInt, lamBnd;
@@ -262,6 +286,13 @@ void deviceAlphaCorrector(
     else
     {
         deviceCompressionFlux(dm, nIf, nBf, *in.phiInt, in.cAlpha, phicInt, phicBnd);
+        if (proc)
+        {
+            // a coupled face stays compressed (alphaEqn.H:79-89): cAlpha*|phi/magSf| there
+            DeviceBuffer<scalar> phicP;
+            deviceAlphaCyclicCompressionFlux(proc->cyc(), in.cAlpha, phicP);
+            procScatter(*proc, phicP, phicBnd);
+        }
     }
 
     // phir = phic*nHatf, from the nHatf the PREVIOUS mixture.correct() left.
@@ -290,7 +321,9 @@ void deviceAlphaCorrector(
         deviceMultiplyFaces(in.cyc->n, phicIf, *in.nHatfIf, phirIf);
     }
 
-    complementKernel<<<nBlocks(nC), TPB>>>(alpha1.data(), nC, alpha2.data());
+    // (alpha2 on the halo cells too: it is read across the processor faces, computed from alpha1's halo)
+    const int nCx = proc ? dm.nCellsExt : nC;
+    complementKernel<<<nBlocks(nCx), TPB>>>(alpha1.data(), nCx, alpha2.data());
     ckS(cudaGetLastError(), "alpha2");
     if (nBf > 0)
     {
@@ -305,6 +338,7 @@ void deviceAlphaCorrector(
                                                      in.alpha2BndStored->data(), nBf, alpha2Bnd.data());
             ckS(cudaGetLastError(), "alpha2 boundary, stored");
         }
+        if (proc) procFaceValue(*proc, alpha2, alpha2Bnd);
     }
 
     // alphaPhiUn, alphaEqn.H:164-176. Term 1 is plain advection; term 2 is TWO MINUS SIGNS deep,
@@ -313,6 +347,13 @@ void deviceAlphaCorrector(
     fluxWithScheme(dm, in.alphaScheme, *in.phiInt, *in.phiBnd, alpha1, *bnd.alpha1, advInt, advBnd,
                    in.cyc, in.gradAlpha1LeastSquares, in.gradAlpha1CellLimitK);
     interStepProbe("corrector: advection", advInt);
+    if (proc)
+    {
+        DeviceBuffer<scalar> gx, gy, gz, advP;
+        procGrad(alpha1, *bnd.alpha1, gx, gy, gz);
+        deviceAlphaCyclicFlux(proc->cyc(), static_cast<int>(in.alphaScheme), alpha1, gx, gy, gz, advP);
+        procScatter(*proc, advP, advBnd);
+    }
     // ...and on the pair, where the scheme's own weight applies as on an internal face. The limiter
     // reads fvc::grad(alpha), which must carry the pair itself -- see device_alpha_flux.cuh.
     DeviceBuffer<scalar> advIf;
@@ -333,10 +374,26 @@ void deviceAlphaCorrector(
     deviceNegateFaces(nBf, phirBnd, negPhirBnd);
     fluxWithScheme(dm, in.alpharScheme, negPhirInt, negPhirBnd, alpha2, alpha2Bnd,
                    innerInt, innerBnd, in.cyc, in.gradAlpha2LeastSquares, in.gradAlpha2CellLimitK);
+    if (proc)
+    {
+        DeviceBuffer<scalar> a2gx, a2gy, a2gz, negPhirP, innerP;
+        procGrad(alpha2, alpha2Bnd, a2gx, a2gy, a2gz);
+        procGather(*proc, negPhirBnd, negPhirP);
+        deviceAlphaCyclicFluxWith(proc->cyc(), negPhirP, static_cast<int>(in.alpharScheme), alpha2, a2gx, a2gy, a2gz, innerP);
+        procScatter(*proc, innerP, innerBnd);
+    }
     deviceNegateFaces(nIf, innerInt, negInnerInt);              // the OUTER minus
     deviceNegateFaces(nBf, innerBnd, negInnerBnd);
     fluxWithScheme(dm, in.alpharScheme, negInnerInt, negInnerBnd, alpha1, *bnd.alpha1,
                    compInt, compBnd, in.cyc, in.gradAlpha1LeastSquares, in.gradAlpha1CellLimitK);
+    if (proc)
+    {
+        DeviceBuffer<scalar> a1gx, a1gy, a1gz, negInnerP, compP;
+        procGrad(alpha1, *bnd.alpha1, a1gx, a1gy, a1gz);
+        procGather(*proc, negInnerBnd, negInnerP);
+        deviceAlphaCyclicFluxWith(proc->cyc(), negInnerP, static_cast<int>(in.alpharScheme), alpha1, a1gx, a1gy, a1gz, compP);
+        procScatter(*proc, compP, compBnd);
+    }
     addFaces(nIf, advInt, compInt, unInt);
     addFaces(nBf, advBnd, compBnd, unBnd);
     // ...and the pair's own compressive half, the same two nested negations: each changes which cell
@@ -359,6 +416,14 @@ void deviceAlphaCorrector(
         deviceAlphaCyclicFluxWith(*in.cyc, negInnerIf, static_cast<int>(in.alpharScheme), alpha1,
                                   a1gx, a1gy, a1gz, compIf);
         addFaces(in.cyc->n, advIf, compIf, unIf);
+    }
+
+    if (in.stage)
+    {
+        deviceCopy(in.stage->phicInt, phicInt); deviceCopy(in.stage->phicBnd, phicBnd);
+        deviceCopy(in.stage->phirInt, phirInt); deviceCopy(in.stage->phirBnd, phirBnd);
+        deviceCopy(in.stage->unInt, unInt);     deviceCopy(in.stage->unBnd, unBnd);
+        return;
     }
 
     if (in.MULESCorr)
@@ -390,6 +455,9 @@ void deviceAlphaCorrector(
             deviceSubtractFaces(in.cyc->n, unIf, *in.alphaPhiIf, corrIf);
         }
 
+        DeviceBuffer<scalar> procCorr;
+        if (proc) procGather(*proc, corrBnd, procCorr);
+
         // saved BEFORE the correction, for the relaxation below
         alpha10.resize(static_cast<std::size_t>(nC));
         ckS(cudaMemcpy(alpha10.data(), alpha1.data(), sizeof(scalar)*nC, cudaMemcpyDeviceToDevice),
@@ -407,7 +475,9 @@ void deviceAlphaCorrector(
         part.emplace("alpha corrector: the correction limited and applied (MULESCorr)");
         deviceMulesLimitCorr(dm, nIf, nBf, rDeltaT, alpha1, *bnd.alpha1, *bnd.fixesValue, *bnd.flag,
                              unBnd, corrInt, corrBnd, mf, mulesCtl, nullptr, nullptr,
-                             havePair ? in.cyc : nullptr, havePair ? &corrIf : nullptr);
+                             proc ? &proc->cyc() : (havePair ? in.cyc : nullptr),
+                             proc ? &procCorr : (havePair ? &corrIf : nullptr));
+        if (proc) procScatter(*proc, procCorr, corrBnd);
         deviceMulesCorrect(dm, rDeltaT, corrInt, corrBnd, mf, alpha1,
                            havePair ? in.cyc : nullptr, havePair ? &corrIf : nullptr);
         part.emplace("alpha corrector: the relaxation and alphaPhi10 (MULESCorr)");
@@ -440,6 +510,7 @@ void deviceAlphaCorrector(
                                                     in.alphaPhiIf->data());
             ckS(cudaGetLastError(), "alphaPhi10 += w*corr, interface");
         }
+        if (proc) procExchange(*proc, {&alpha1}, "alpha1 after CMULES correction");
         return;
     }
 
@@ -513,15 +584,23 @@ void deviceAlphaCorrector(
         deviceMulesDonorFluxCyclic(*in.cyc, rawPhi ? in.cyc->phi : *in.phiCNIf, alpha1, phiBDIf);
         deviceSubtractFaces(in.cyc->n, unIf, phiBDIf, corrIfEx);
     }
-    part.emplace("alpha corrector: the limiter (explicit)");
+    DeviceBuffer<scalar> procPhiCN, procDonor, procCorr, procLambda;
+    if (proc)
+    {
+        procGather(*proc, *in.phiCNBnd, procPhiCN);
+        deviceMulesDonorFluxCyclic(proc->cyc(), procPhiCN, alpha1, procDonor);
+        procScatter(*proc, procDonor, phiBDBnd);
+        procGather(*proc, unBnd, procCorr);
+        deviceSubtractFaces(proc->nFaces(), procCorr, procDonor, procCorr);
+        procScatter(*proc, procCorr, corrBnd);
+    }
     deviceMulesLimiter(dm, nIf, nBf, rDeltaT, alpha1, alpha1Old, *bnd.alpha1,
                        *bnd.fixesValue, *bnd.flag, phiBDInt, phiBDBnd, corrInt, corrBnd,
                        mf, mulesCtl, lamInt, lamBnd,
-                       havePairEx ? in.cyc : nullptr,
-                       havePairEx ? &phiBDIf : nullptr,
-                       havePairEx ? &corrIfEx : nullptr,
-                       havePairEx ? &lamIf : nullptr);
-    interStepProbe("corrector: limiter", lamInt);
+                       proc ? &proc->cyc() : (havePairEx ? in.cyc : nullptr),
+                       proc ? &procDonor : (havePairEx ? &phiBDIf : nullptr),
+                       proc ? &procCorr : (havePairEx ? &corrIfEx : nullptr),
+                       proc ? &procLambda : (havePairEx ? &lamIf : nullptr));
     if (havePairEx)
     {
         interStepProbe("corrector: pair limiter", lamIf);
@@ -529,6 +608,14 @@ void deviceAlphaCorrector(
     part.emplace("alpha corrector: the blend and the explicit solve");
     deviceMulesBlend(nIf, nBf, phiBDInt, phiBDBnd, lamInt, lamBnd, corrInt, corrBnd,
                      alphaPhi10Int, alphaPhi10Bnd);
+    if (proc)
+    {
+        DeviceBuffer<scalar> scaled;
+        deviceMultiplyFaces(proc->nFaces(), procLambda, procCorr, scaled);
+        DeviceBuffer<scalar> limited;
+        addFaces(proc->nFaces(), procDonor, scaled, limited);
+        procScatter(*proc, limited, alphaPhi10Bnd);
+    }
     if (havePairEx)
     {
         // phiPsi = phiBD + lambda*phiCorr on the pair too (MULESTemplates.C:634)
@@ -551,6 +638,7 @@ void deviceAlphaCorrector(
                              havePairEx ? in.cyc : nullptr,
                              havePairEx ? in.alphaPhiIf : nullptr);
     interStepProbe("corrector: solved", alpha1);
+    if (proc) procExchange(*proc, {&alpha1}, "alpha1 after explicit MULES");
 }
 
 } // namespace brae

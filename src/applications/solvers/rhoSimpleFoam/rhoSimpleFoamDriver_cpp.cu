@@ -520,7 +520,7 @@ std::vector<T> flatBoundary(const GeometricField<T>& gf, const std::vector<FvPat
     std::vector<T> out;
     for (std::size_t pi = 0; pi < patches.size() && pi < gf.boundary.size(); ++pi)
     {
-        if (isCoupledInterfaceType(patches[pi].type)) continue;
+        if (isCyclicFamilyType(patches[pi].type)) continue;
         const std::vector<T> v = gf.boundary[pi]->value();
         out.insert(out.end(), v.begin(), v.end());
     }
@@ -535,7 +535,7 @@ std::vector<scalar> flatPatchValues(const std::vector<std::vector<scalar>>& bnd,
     std::vector<scalar> out;
     for (std::size_t pi = 0; pi < patches.size() && pi < bnd.size(); ++pi)
     {
-        if (isCoupledInterfaceType(patches[pi].type)) continue;
+        if (isCyclicFamilyType(patches[pi].type)) continue;
         out.insert(out.end(), bnd[pi].begin(), bnd[pi].end());
     }
     return out;

@@ -77,7 +77,7 @@ RhoDeviceFields createDeviceFields(
     {
         const FvPatch& p = patches[pi_];
         // The PREDICATE, not a hand list: buildPatches also accepts cyclicPeriodicAMI, which the
-        // four-name list let slip. isCoupledInterfaceType is the same test the V2 envelope and the
+        // four-name list let slip. isCyclicFamilyType is the same test the V2 envelope and the
         // host guard use; processor is outside it and named separately everywhere.
         // A TILTED symmetry/slip plane used to be refused here. It is not any more, and the reason it
         // ever drifted was never in this file: the device's segregated per-component model is exact for
@@ -87,7 +87,7 @@ RhoDeviceFields createDeviceFields(
         // ref was rebuilt -- rhoSimpleFoam.cu refreshed U's boundary after the momentum solve and after
         // the velocity correction without rebuilding the symmetry ref those refreshes blend towards.
         // Fixed there; the measurement is in that file and in validation/rhoBoxSym/README.md.
-        if (isCoupledInterfaceType(p.type) || p.type == "processor")
+        if (isCoupledType(p.type))
         {
             throw std::runtime_error(
                 "rhoSimpleFoam createFields(cuda): the mesh has a coupled patch ('" + p.name + "', type "
@@ -247,7 +247,7 @@ RhoDeviceFields createDeviceFields(
                 b.fn        = fn;
                 d.tExpr.push_back(b);
             }
-            if (!isCoupledInterfaceType(patches[pi].type)) off += patches[pi].size;
+            if (!isCyclicFamilyType(patches[pi].type)) off += patches[pi].size;
         }
     }
 
@@ -410,7 +410,7 @@ RhoDeviceFields createDeviceFields(
             label b = 0;
             for (std::size_t pi = 0; pi < patches.size(); ++pi)
             {
-                if (isCoupledInterfaceType(patches[pi].type)) continue;
+                if (isCyclicFamilyType(patches[pi].type)) continue;
                 for (label i = 0; i < patches[pi].size; ++i, ++b)
                     if (b < d.nBndFaces && hf.nut.boundary[pi]->bcCategory() == 2) cm[b] = 1;
             }

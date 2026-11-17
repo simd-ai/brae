@@ -46,17 +46,38 @@ inline bool isConstraintPatchType(const std::string& t)
     // silently. buildPatches refuses it outright (fv_patch.cu).
 }
 
-// Coupled INTERFACE patches: the pair whose face values come from the other side of the interface, not
-// from a boundary condition. brae handles these on the device (device_cyclic / device_ami), so the
-// ordinary boundary machinery -- DeviceBoundary entries, coded-BC scanning, surface-field reads, patch
-// field construction -- must skip them.
+// THE CYCLIC FAMILY: the pairs whose face values come from the other side of the interface inside ONE
+// address space, not from a boundary condition. brae handles these on the device (device_cyclic /
+// device_ami), so the ordinary boundary machinery -- DeviceBoundary entries, coded-BC scanning,
+// surface-field reads, patch field construction, the boundary-face gather of DeviceMesh -- must skip them.
+// (Called isCoupledInterfaceType until the processor patch arrived; the ~160 sites decide exactly this and
+// not "is coupled", so they keep this predicate and a `processor` patch does NOT satisfy it.)
 //
 // cyclicACMI belongs here for the same reason it belongs on the device AMI path: it IS a cyclicAMI, plus
 // an area split with its coincident nonOverlapPatch wall. The wall half is an ordinary patch and is NOT
 // skipped -- it carries the uncovered fraction and needs its real boundary condition.
-inline bool isCoupledInterfaceType(const std::string& t)
+inline bool isCyclicFamilyType(const std::string& t)
 {
     return t == "cyclic" || t == "cyclicAMI" || t == "cyclicACMI" || t == "cyclicPeriodicAMI";
+}
+
+// A decomposePar processor patch: a coupled interface whose other side lives on ANOTHER RANK. It is NOT in
+// the cyclic family, deliberately. Its faces STAY in the device mesh's boundary gather as the last boundary
+// patches (bcType 8, a halo-injected face value, so the sum-class operators -- div, grad, reconstruct,
+// Courant -- add them in OpenFOAM's face order), and the neighbour-reading operators see it through the
+// DeviceCyclic-shaped interface whose neighbour index addresses halo slots (device_processor.cuh). Flipping
+// the cyclic predicate would send every one of those sites to the wrong arm; see docs/multigpu-processor-interface.md.
+inline bool isProcessorType(const std::string& t)
+{
+    return t == "processor";
+}
+
+// Either: "this patch is half of an interface" for the sites that mean it (writer patch entries, wall
+// distance, MRF, limiters that must see across a coupled face). processorCyclic is a processor patch plus a
+// transform and is refused by name under -parallel (inter_parallel.cuh), so it is not here.
+inline bool isCoupledType(const std::string& t)
+{
+    return isCyclicFamilyType(t) || isProcessorType(t);
 }
 
 struct FoamDict

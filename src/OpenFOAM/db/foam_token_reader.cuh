@@ -8,6 +8,7 @@
 #include <vector>
 #include <utility>
 #include <cstddef>
+#include <cstring>
 
 namespace brae {
 
@@ -51,6 +52,22 @@ public:
     const std::string& peek() const;
     std::string        next();
     void               expect(const std::string& t);
+    // Raw binary payload token, encoded so it cannot collide with dictionary text. nextScalar()
+    // accepts it; all other token operations see the normal punctuation/list structure.
+    static std::string binaryScalar(double v)
+    {
+        std::string s("\x1f" "brae-bin64:", 12);
+        char bytes[sizeof(double)];
+        std::memcpy(bytes, &v, sizeof v);
+        s.append(bytes, sizeof v);
+        return s;
+    }
+    static bool decodeBinaryScalar(const std::string& token, double& v)
+    {
+        if (token.size() != 12 + sizeof(double) || token.compare(0, 12, "\x1f" "brae-bin64:") != 0) return false;
+        std::memcpy(&v, token.data() + 12, sizeof v);
+        return true;
+    }
     label              nextLabel();
     scalar             nextScalar();
     // A `#{ ... #}` verbatim block is one token, a placeholder word; this returns the block's raw text

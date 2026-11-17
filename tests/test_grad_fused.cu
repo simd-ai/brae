@@ -43,6 +43,7 @@
 #include "fv_patch.cuh"
 #include "primitive_mesh.cuh"
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -148,6 +149,16 @@ void runArms(
     }
 
     const std::vector<G3> ref = separateGrads(dm, 3, vol, bval);
+
+    // (g) deviceGaussGrad now makes one 32-byte record a face first and reads that in the cell pass; its reference is
+    // the one-kernel form it replaced (BRAE_CONTROL_GRAD_UNPACKED=1), the kernel (a)-(e) were written against.
+    {
+        setenv("BRAE_CONTROL_GRAD_UNPACKED", "1", 1);
+        const std::vector<G3> oneKernel = separateGrads(dm, 3, vol, bval);
+        unsetenv("BRAE_CONTROL_GRAD_UNPACKED");
+        check(sameG3(oneKernel[0], ref[0]) && sameG3(oneKernel[1], ref[1]) && sameG3(oneKernel[2], ref[2]),
+              tag + ": packed-record deviceGaussGrad == the one-kernel form, BIT FOR BIT (9 arrays)");
+    }
 
     // (f) the fields must actually differ, or nothing below could discriminate anything.
     check(!allZero(ref[0].x) && !allZero(ref[1].y) && !allZero(ref[2].z),

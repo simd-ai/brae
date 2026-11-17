@@ -80,7 +80,6 @@ void sumPhiKernel(
 
 }   // namespace
 
-
 DeviceCourantNumbers deviceAlphaCourantNo(
     const DeviceMesh& dm,
     const DeviceBuffer<scalar>& phiInt,
@@ -92,7 +91,9 @@ DeviceCourantNumbers deviceAlphaCourantNo(
 {
     DeviceCourantNumbers c;
     const int nC = dm.nCells;
-    if (nC == 0) return c;
+    // A rank with NO cells still runs the three global reductions below (zero contributions, combined result):
+    // returning early would desynchronise the collective sequence of the whole job (review finding 6). The
+    // zero-sized launches are skipped inside the helpers, never the collectives.
     static const char* const leftOutEnv = std::getenv("BRAE_CONTROL_COURANT_PAIR_LEFT_OUT");
     static const bool leftOutBandOnly = leftOutEnv && std::string(leftOutEnv) == "interface";
     const bool pairLeftOut = leftOutEnv && (!leftOutBandOnly || alpha1);
@@ -127,6 +128,7 @@ DeviceCourantNumbers deviceAlphaCourantNo(
     }
 
     DeviceBuffer<scalar> sumPhi(static_cast<std::size_t>(nC));
+    if (nC > 0)
     sumPhiKernel<<<nBlocks(nC), TPB>>>(
         nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
         dm.bndCellStart.data(), dm.bndPerm.data(), dm.bndIsEmpty.data(),
@@ -144,9 +146,12 @@ DeviceCourantNumbers deviceAlphaCourantNo(
     // The MAX is what limits the step; deviceMaxRatio is a single pass and skips V <= 0, as the host's
     // courantNo does. The MEAN divides the masked flux sum by the WHOLE mesh volume -- the denominator
     // is deliberately not masked.
-    const scalar maxRatio = deviceMaxRatio(sumPhi, dm.V);
-    const scalar sPhi     = deviceSumMag(sumPhi);
-    const scalar sV       = deviceSumMag(dm.V);
+    // the three reductions together: under -parallel one read of three device-resident global results
+    scalar red[3];
+    deviceCourantReductions(sumPhi, dm.V, red);
+    const scalar maxRatio = red[0];
+    const scalar sPhi     = red[1];
+    const scalar sV       = red[2];
     c.CoNum     = scalar(0.5)*maxRatio*deltaT;
     c.meanCoNum = (sV > scalar(0)) ? scalar(0.5)*(sPhi/sV)*deltaT : scalar(0);
     return c;

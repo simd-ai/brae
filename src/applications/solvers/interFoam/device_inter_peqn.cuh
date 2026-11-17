@@ -173,6 +173,7 @@ struct DevicePressureMatrix
 {
     DeviceBuffer<scalar> diag, upper, lower;   // the RAW LDU, before the boundary fold
     DeviceBuffer<scalar> source;               // extensive
+    DeviceBuffer<scalar> procIfCoeff;           // this matrix's processor off-diagonal
 };
 
 // phiHbyA's two interFoam-only terms, added to the flux of HbyA that the shared pressure predictor

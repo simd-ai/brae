@@ -128,3 +128,63 @@ mesh.setFluxRequired(alpha1.name());
 
 #include "createMRF.H"
 #include "createFvOptions.H"
+
+// ---- ORACLE INSTRUMENTATION (tools/mgpu_oracle) ---------------------------------------------------
+// braeInList("VAR"): is runTime.timeIndex() in the comma list in $VAR. The per-step operator dumps of
+// tools/mgpu_oracle are gated on BRAE_ORACLE_ITERS (e.g. "1,20") and nothing else changes in the solve.
+auto braeInList = [&runTime](const char* env) -> bool
+{
+    const char* s = getenv(env);
+    if (!s) return false;
+    const int ti = runTime.timeIndex();
+    while (*s)
+    {
+        char* e;
+        const long v = strtol(s, &e, 10);
+        if (e != s && v == ti) return true;
+        s = (*e == ',') ? e + 1 : (e != s ? e : s + 1);
+    }
+    return false;
+};
+auto braeOracleStep = [&]() -> bool { return braeInList("BRAE_ORACLE_ITERS"); };
+
+// braeDumpMatrix: a scalar fvMatrix as <name>Diag/Source (vol), <name>Upper/Lower (surface, internal
+// faces in lduAddressing order) and <name>IntCoeffs/BouCoeffs (surface, per-patch values: for a
+// processor patch these are the interface coefficients).
+auto braeDumpMatrix = [&](const word& name, const fvScalarMatrix& m)
+{
+    const fvMesh& msh = m.psi().mesh();
+    auto volF = [&](const word& n, const scalarField& v)
+    {
+        volScalarField f
+        (
+            IOobject(name + n + ".dump", runTime.timeName(), msh, IOobject::NO_READ, IOobject::NO_WRITE),
+            msh, dimensionedScalar(dimless, Zero)
+        );
+        f.primitiveFieldRef() = v;
+        f.write();
+    };
+    auto surfF = [&](const word& n, const scalarField* inner, const FieldField<Field, scalar>* bnd)
+    {
+        surfaceScalarField f
+        (
+            IOobject(name + n + ".dump", runTime.timeName(), msh, IOobject::NO_READ, IOobject::NO_WRITE),
+            msh, dimensionedScalar(dimless, Zero)
+        );
+        if (inner) f.primitiveFieldRef() = *inner;
+        if (bnd)
+        {
+            forAll(f.boundaryField(), patchi)
+            {
+                f.boundaryFieldRef()[patchi] == (*bnd)[patchi];
+            }
+        }
+        f.write();
+    };
+    volF("Diag", m.diag());
+    volF("Source", m.source());
+    if (m.hasUpper()) surfF("Upper", &m.upper(), nullptr);
+    if (m.hasLower()) surfF("Lower", &m.lower(), nullptr);
+    surfF("IntCoeffs", nullptr, &m.internalCoeffs());
+    surfF("BouCoeffs", nullptr, &m.boundaryCoeffs());
+};

@@ -4,8 +4,9 @@
 #include <unistd.h>
 #include "inter_phase_time.cuh"
 #include "device_blas.cuh"
-#include "device_ldu.cuh"       // deviceParallelAmul (halo-coupled matvec) for the distributed whole-loop graph PCG
-#include "device_halo.cuh"      // DeviceHalo + its DeviceReducer (on-stream NVSHMEM reduce)
+#include "proc_comm.cuh"       // ProcComm::current(): the rank in the hierarchy cache file name
+#include "proc_hooks.cuh"      // procGraphUnregister / the captured-graph registry
+#include "device_ldu.cuh"
 #include "device_amg_detail.cuh"  // shared inline primitives: safeDiag/warpReduceSum/blockDot + env-flag readers + AMG constants
 #include "device_amg_coarse.cuh"  // deviceCoarsePCG/JacobiSingleBlock (internal coarse solvers, defined in device_amg_coarse.cu)
 #include "amg_kernels.cuh"        // mixed-precision V-cycle template kernels (zeroT/smoothT/residualT/gsColorT/restrictT/prolongT)
@@ -44,8 +45,18 @@ AMGGraphCache::~AMGGraphCache()
 
 PCGGraphCache::~PCGGraphCache()
 {
+    if (registeredComm) procGraphUnregister(static_cast<const ProcComm*>(registeredComm), this);
     if (exec) cudaGraphExecDestroy(exec);
     if (graph) cudaGraphDestroy(graph);
+}
+
+// proc_hooks.cuh's registry: the comm destructor destroys a still-registered cache's graphs (its owner AMGData may
+// outlive the comm, e.g. a leaked solver cache), which must happen before ncclCommDestroy.
+void destroyPcgGraphs(PCGGraphCache* c)
+{
+    if (!c) return;
+    if (c->exec) { cudaGraphExecDestroy(c->exec); c->exec = nullptr; }
+    if (c->graph) { cudaGraphDestroy(c->graph); c->graph = nullptr; }
 }
 
 namespace {
@@ -1288,7 +1299,15 @@ std::string amgCachePath(
     const std::string& cacheDir,
     bool               smoothedAggregation)
 {
-    return cacheDir + (smoothedAggregation ? "/.brae_amgcache_sa" : "/.brae_amgcache");
+    std::string path = cacheDir + (smoothedAggregation ? "/.brae_amgcache_sa" : "/.brae_amgcache");
+    // A DECOMPOSED RUN builds each rank's hierarchy from its own local mesh (processorN/constant/polyMesh is the cacheDir
+    // of a per-rank case root already); the rank in the name keeps ranks that share a directory from reading or
+    // overwriting each other's file (the signature would reject a foreign one, not stop a concurrent write).
+    if (const ProcComm* pc = ProcComm::current(); pc && pc->size() > 1)
+    {
+        path += "_r" + std::to_string(pc->rank());
+    }
+    return path;
 }
 
 AMGData buildOrLoadAMG(

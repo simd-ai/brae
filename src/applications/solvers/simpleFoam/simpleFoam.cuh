@@ -117,7 +117,7 @@ struct StepInput
     // maxIter and minIter beside it. Meaningful only on the smoothSolver path.
     int    nSweepsU = 1;
     int    maxIterP = 1000, minIterP = 0;
-    // V-cycle graph replay and PCG residual-read cadence. NOTE: on CUDA >= 13 deviceAMGPCG dispatches
+    // V-cycle graph replay and PCG residual-read cadence. NOTE: on CUDA >= 12.4 deviceAMGPCG dispatches
     // first to its DEVICE-RESIDENT conditional-graph PCG (BRAE_PCG_DEVICE, default on), which captures
     // the whole Krylov loop and ignores both of these -- measured A/B: 17.9 s on vs 18.7 s off at 440k.
     // These therefore only reach the host-driven fallback. They are passed explicitly rather than left

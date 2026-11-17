@@ -1,0 +1,324 @@
+## demo/amgpcg/case20/constant/polyMesh
+left|patch|31|5||||36|0.0001|||0,0,1|0,0,0|1|0|0
+right|patch|36|5||||36|0.0001|||0,0,1|0,0,0|1|0|0
+bottom|patch|41|4||||36|0.0001|||0,0,1|0,0,0|1|0|0
+top|patch|45|4||||36|0.0001|||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|49|40||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/T3A/constant/polyMesh
+above|patch|53213|47||||36|0.0001|||0,0,1|0,0,0|1|0|0
+top|patch|53260|327||||36|0.0001|||0,0,1|0,0,0|1|0|0
+inlet|patch|53587|60||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|53647|80||||36|0.0001|||0,0,1|0,0,0|1|0|0
+plate|wall|53727|340||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+defaultFaces|empty|54067|53640||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/backwardFacingStep2D/constant/polyMesh
+inlet|patch|40747|65||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|40812|113||||36|0.0001|||0,0,1|0,0,0|1|0|0
+lowerWallStartup|symmetryPlane|40925|2||||36|0.0001|symmetryPlane,||0,0,1|0,0,0|1|0|0
+upperWallStartup|symmetryPlane|40927|2||||36|0.0001|symmetryPlane,||0,0,1|0,0,0|1|0|0
+upperWall|wall|40929|218||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+lowerWall|wall|41147|266||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+front|empty|41413|20540||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+back|empty|61953|20540||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/cav3d_cf/constant/polyMesh
+movingWall|wall|39744|576||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+fixedWalls|wall|40320|2880||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+## validation/channel/constant/polyMesh
+inlet|patch|19750|50||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|19800|50||||36|0.0001|||0,0,1|0,0,0|1|0|0
+walls|wall|19850|400||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|20250|20000||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/cyclicChannel/constant/polyMesh
+left|cyclic|180|10|right|||36|0.0001|cyclic,|unknown|0,0,1|0,0,0|1|0|0
+right|cyclic|190|10|left|||36|0.0001|cyclic,|unknown|0,0,1|0,0,0|1|0|0
+walls|wall|200|20||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|220|200||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/cyclicChannelAMI/constant/polyMesh
+left|cyclicAMI|180|10|right|||36|0.0001|cyclic,|unknown|0,0,1|0,0,0|1|0|0
+right|cyclicAMI|190|10|left|||36|0.0001|cyclic,|unknown|0,0,1|0,0,0|1|0|0
+walls|wall|200|20||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|220|200||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/cyclicChannelSkew/constant/polyMesh
+left|cyclic|180|10|right|||36|0.0001|cyclic,|unknown|0,0,1|0,0,0|1|0|0
+right|cyclic|190|10|left|||36|0.0001|cyclic,|unknown|0,0,1|0,0,0|1|0|0
+walls|wall|200|20||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|220|200||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/cyclicWedge/constant/polyMesh
+side1|cyclic|82|8|side2|||36|0.0001|cyclic,|rotational|0,0,1|0,0,0|1|0|0
+side2|cyclic|90|8|side1|||36|0.0001|cyclic,|rotational|0,0,1|0,0,0|1|0|0
+inner|wall|98|6||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+outer|wall|104|6||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|110|96||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/duct3d_cf/constant/polyMesh
+inlet|patch|210300|900||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|211200|900||||36|0.0001|||0,0,1|0,0,0|1|0|0
+walls|wall|212100|9600||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+## validation/halfChannel/constant/polyMesh
+inlet|patch|19750|50||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|19800|50||||36|0.0001|||0,0,1|0,0,0|1|0|0
+wallTop|wall|19850|200||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+symBottom|symmetryPlane|20050|200||||36|0.0001|symmetryPlane,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|20250|20000||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/implicitAMI/constant/polyMesh
+AMI1|cyclicAMI|32|5|AMI2|||36|0.0001|cyclicAMI,|noOrdering|0,0,1|0,0,0|1|0|0
+AMI2|cyclicAMI|37|7|AMI1|||36|0.0001|cyclicAMI,|noOrdering|0,0,1|0,0,0|1|0|0
+top|patch|44|4||||36|0.0001|||0,0,1|0,0,0|1|0|0
+bottom|patch|48|4||||36|0.0001|||0,0,1|0,0,0|1|0|0
+left|patch|52|5||||36|0.0001|||0,0,1|0,0,0|1|0|0
+right|patch|57|7||||36|0.0001|||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|64|48||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/kEpsCase/constant/polyMesh
+inlet|patch|24170|30||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|24200|57||||36|0.0001|||0,0,1|0,0,0|1|0|0
+upperWall|wall|24257|223||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+lowerWall|wall|24480|250||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|24730|24450||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/kEpsCorrect/constant/polyMesh
+inlet|patch|24170|30||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|24200|57||||36|0.0001|||0,0,1|0,0,0|1|0|0
+upperWall|wall|24257|223||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+lowerWall|wall|24480|250||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|24730|24450||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/lmFlatPlate/constant/polyMesh
+inlet|patch|34105|80||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|34185|80||||36|0.0001|||0,0,1|0,0,0|1|0|0
+plate|wall|34265|215||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+top|symmetryPlane|34480|215||||36|0.0001|symmetryPlane,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|34695|34400||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/matrixDump/constant/polyMesh
+inlet|patch|24170|30||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|24200|57||||36|0.0001|||0,0,1|0,0,0|1|0|0
+upperWall|wall|24257|223||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+lowerWall|wall|24480|250||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|24730|24450||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/matrixDumpAsym/constant/polyMesh
+inlet|patch|24170|30||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|24200|57||||36|0.0001|||0,0,1|0,0,0|1|0|0
+upperWall|wall|24257|223||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+lowerWall|wall|24480|250||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|24730|24450||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/matrixDumpGAMG/constant/polyMesh
+inlet|patch|24170|30||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|24200|57||||36|0.0001|||0,0,1|0,0,0|1|0|0
+upperWall|wall|24257|223||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+lowerWall|wall|24480|250||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|24730|24450||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/matrixDumpSimple/constant/polyMesh
+inlet|patch|24170|30||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|24200|57||||36|0.0001|||0,0,1|0,0,0|1|0|0
+upperWall|wall|24257|223||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+lowerWall|wall|24480|250||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|24730|24450||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/mixerVessel2D/constant/polyMesh
+rotor|wall|5952|192||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+stator|wall|6144|192||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+front|empty|6336|3072||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+back|empty|9408|3072||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/mrfBox/constant/polyMesh
+walls|wall|264|48||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|312|288||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/piov_of/constant/polyMesh
+inlet|patch|3752|24||||36|0.0001|||0,0,1|0,0,0|1|0|0
+stepWall|wall|3776|24||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+outlet|patch|3800|48||||36|0.0001|||0,0,1|0,0,0|1|0|0
+walls|wall|3848|80||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|3928|3840||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/pipeCyclic/constant/polyMesh
+inlet|patch|3225|25||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|3250|25||||36|0.0001|||0,0,1|0,0,0|1|0|0
+side1|cyclicAMI|3275|250|side2|||36|0.0001|cyclicAMI,|rotational|1,0,0|0,0,0|1|0|0
+side2|cyclicAMI|3525|250|side1|||36|0.0001|cyclicAMI,|rotational|1,0,0|0,0,0|1|0|0
+walls|wall|3775|250||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+## validation/pipeCyclicAMI/constant/polyMesh
+inlet|patch|4422|28||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|4450|28||||36|0.0001|||0,0,1|0,0,0|1|0|0
+side1|cyclicAMI|4478|400|side2|||36|0.0001|cyclicAMI,|rotational|1,0,0|0,0,0|1|0|0
+side2|cyclicAMI|4878|250|side1|||36|0.0001|cyclicAMI,|rotational|1,0,0|0,0,0|1|0|0
+walls|wall|5128|250||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+## validation/pipeCyclicAMIConformal/constant/polyMesh
+inlet|patch|3225|25||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|3250|25||||36|0.0001|||0,0,1|0,0,0|1|0|0
+side1|cyclicAMI|3275|250|side2|||36|0.0001|cyclicAMI,|rotational|1,0,0|0,0,0|1|0|0
+side2|cyclicAMI|3525|250|side1|||36|0.0001|cyclicAMI,|rotational|1,0,0|0,0,0|1|0|0
+walls|wall|3775|250||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+## validation/pitzDaily/constant/polyMesh
+inlet|patch|24170|30||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|24200|57||||36|0.0001|||0,0,1|0,0,0|1|0|0
+upperWall|wall|24257|223||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+lowerWall|wall|24480|250||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|24730|24450||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/pitzDaily282/constant/polyMesh
+inlet|patch|24170|30||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|24200|57||||36|0.0001|||0,0,1|0,0,0|1|0|0
+upperWall|wall|24257|223||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+lowerWall|wall|24480|250||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|24730|24450||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/pitzDailyKOmega/constant/polyMesh
+inlet|patch|24170|30||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|24200|57||||36|0.0001|||0,0,1|0,0,0|1|0|0
+upperWall|wall|24257|223||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+lowerWall|wall|24480|250||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|24730|24450||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/pitzDailyRKE/constant/polyMesh
+inlet|patch|24170|30||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|24200|57||||36|0.0001|||0,0,1|0,0,0|1|0|0
+upperWall|wall|24257|223||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+lowerWall|wall|24480|250||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|24730|24450||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/pitzDailySST/constant/polyMesh
+inlet|patch|24170|30||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|24200|57||||36|0.0001|||0,0,1|0,0,0|1|0|0
+upperWall|wall|24257|223||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+lowerWall|wall|24480|250||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|24730|24450||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/pitzDailyTurb/constant/polyMesh
+inlet|patch|24170|30||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|24200|57||||36|0.0001|||0,0,1|0,0,0|1|0|0
+upperWall|wall|24257|223||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+lowerWall|wall|24480|250||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|24730|24450||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/pitzDailyTurbBig/constant/polyMesh
+inlet|patch|97240|60||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|97300|114||||36|0.0001|||0,0,1|0,0,0|1|0|0
+upperWall|wall|97414|446||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+lowerWall|wall|97860|500||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|98360|97800||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/rhoBox/constant/polyMesh
+inlet|patch|2320|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|2340|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+hotWall|wall|2360|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+coldWall|wall|2420|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontBack|empty|2480|2400||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/rhoBoxDF/constant/polyMesh
+inlet|patch|2320|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|2340|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+hotWall|wall|2360|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+coldWall|wall|2420|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontBack|empty|2480|2400||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/rhoBoxE/constant/polyMesh
+inlet|patch|2320|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|2340|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+hotWall|wall|2360|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+coldWall|wall|2420|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontBack|empty|2480|2400||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/rhoBoxF/constant/polyMesh
+inlet|patch|2320|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|2340|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+hotWall|wall|2360|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+coldWall|wall|2420|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontBack|empty|2480|2400||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/rhoBoxM/constant/polyMesh
+inlet|patch|2320|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|2340|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+hotWall|wall|2360|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+coldWall|wall|2420|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontBack|empty|2480|2400||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/rhoBoxP/constant/polyMesh
+inlet|patch|2320|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|2340|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+hotWall|wall|2360|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+coldWall|wall|2420|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontBack|empty|2480|2400||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/rhoBoxQ/constant/polyMesh
+inlet|patch|2320|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|2340|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+hotWall|wall|2360|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+coldWall|wall|2420|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontBack|empty|2480|2400||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/rhoBoxTP/constant/polyMesh
+inlet|patch|2320|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|2340|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+hotWall|wall|2360|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+coldWall|wall|2420|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontBack|empty|2480|2400||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/rhoFR/constant/polyMesh
+inlet|patch|2320|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|2340|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+hotWall|wall|2360|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+coldWall|wall|2420|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontBack|empty|2480|2400||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/rhoFRvol/constant/polyMesh
+inlet|patch|2320|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|2340|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+hotWall|wall|2360|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+coldWall|wall|2420|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontBack|empty|2480|2400||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/rhoKE2/constant/polyMesh
+inlet|patch|2320|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|2340|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+hotWall|wall|2360|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+coldWall|wall|2420|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontBack|empty|2480|2400||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/rhoLU/constant/polyMesh
+inlet|patch|2320|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|2340|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+hotWall|wall|2360|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+coldWall|wall|2420|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontBack|empty|2480|2400||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/rhoSuth/constant/polyMesh
+inlet|patch|2320|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|2340|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+hotWall|wall|2360|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+coldWall|wall|2420|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontBack|empty|2480|2400||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/rhoTP/constant/polyMesh
+inlet|patch|2320|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|2340|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+hotWall|wall|2360|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+coldWall|wall|2420|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontBack|empty|2480|2400||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/rotatingCylinders/constant/polyMesh
+innerWall|wall|12640|160||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+outerWall|wall|12800|160||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|12960|12800||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/sbMatched/constant/polyMesh
+inlet|patch|324400|400||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|324800|400||||36|0.0001|||0,0,1|0,0,0|1|0|0
+walls|wall|325200|22400||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+## validation/shearedChannel/constant/polyMesh
+inlet|patch|9850|50||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|9900|50||||36|0.0001|||0,0,1|0,0,0|1|0|0
+walls|wall|9950|200||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|10150|10000||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/simpleBoxIO/constant/polyMesh
+inlet|patch|2320|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|2340|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+hotWall|wall|2360|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+coldWall|wall|2420|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontBack|empty|2480|2400||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/simpleBoxP/constant/polyMesh
+inlet|patch|2320|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|2340|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+hotWall|wall|2360|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+coldWall|wall|2420|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontBack|empty|2480|2400||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/simpleCarPorous/constant/polyMesh
+inlet|patch|25506|64||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|25570|63||||36|0.0001|||0,0,1|0,0,0|1|0|0
+upperWall|wall|25633|225||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+lowerWall|wall|25858|200||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+body|wall|26058|196||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|26254|25880||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/slipTurb/constant/polyMesh
+inlet|patch|5280|30||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|5310|30||||36|0.0001|||0,0,1|0,0,0|1|0|0
+bottom|wall|5340|90||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+top|wall|5430|90||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|empty|5520|5400||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/tracerBox/constant/polyMesh
+inlet|patch|2320|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|2340|20||||36|0.0001|||0,0,1|0,0,0|1|0|0
+hotWall|wall|2360|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+coldWall|wall|2420|60||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontBack|empty|2480|2400||||36|0.0001|empty,||0,0,1|0,0,0|1|0|0
+## validation/turbineSiting/constant/polyMesh
+outlet|patch|364830|922||||36|0.0001|||0,0,1|0,0,0|1|0|0
+sides|patch|365752|1834||||36|0.0001|||0,0,1|0,0,0|1|0|0
+inlet|patch|367586|923||||36|0.0001|||0,0,1|0,0,0|1|0|0
+top|patch|368509|900||||36|0.0001|||0,0,1|0,0,0|1|0|0
+terrain|wall|369409|14400||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+## validation/windAroundBuildingsBox/constant/polyMesh
+inlet|patch|14050|200||||36|0.0001|||0,0,1|0,0,0|1|0|0
+outlet|patch|14250|200||||36|0.0001|||0,0,1|0,0,0|1|0|0
+ground|wall|14450|500||||36|0.0001|wall,||0,0,1|0,0,0|1|0|0
+frontAndBack|symmetry|14950|1000||||36|0.0001|symmetry,||0,0,1|0,0,0|1|0|0

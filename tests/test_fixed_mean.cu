@@ -59,7 +59,7 @@ int main()
     std::string pname;
     for (const FvPatch& q : fvp)
     {
-        if (isCoupledInterfaceType(q.type)) continue;
+        if (isCyclicFamilyType(q.type)) continue;
         if (q.size > 0) { count = q.size; pname = q.name; break; }
         start += q.size;
     }

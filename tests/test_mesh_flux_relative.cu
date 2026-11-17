@@ -29,7 +29,7 @@
 #include "fv_patch.cuh"
 #include "primitive_mesh.cuh"
 #include "swept_volume.cuh"
-#include "foam_dict.cuh"   // isCoupledInterfaceType
+#include "foam_dict.cuh"   // isCyclicFamilyType
 #include <cmath>
 #include <cstdio>
 #include <string>
@@ -84,7 +84,7 @@ Result checkTranslation(const vector& dir, const std::string& label_)
     for (label f = 0; f < m.nFaces(); ++f) r.worstAll = std::fmax(r.worstAll, std::fabs(phi[f]));
     for (const FvPatch& p : fvp)
     {
-        if (!isCoupledInterfaceType(p.type)) continue;
+        if (!isCyclicFamilyType(p.type)) continue;
         r.nInterfaceFaces += p.size;
         for (label i = 0; i < p.size; ++i)
         {

@@ -117,7 +117,7 @@ int main(int argc, char** argv)
             U.boundary.push_back(std::make_unique<EmptyPatchField<vector>>(q));
             branchOf[pi] = "empty";
         }
-        else if (isCoupledInterfaceType(q.type))
+        else if (isCyclicFamilyType(q.type))
         {
             U.boundary.push_back(std::make_unique<ZeroGradientPatchField<vector>>(q));
             branchOf[pi] = "coupled";
@@ -179,7 +179,7 @@ int main(int argc, char** argv)
     for (std::size_t pi = 0; pi < nPatch; ++pi)
     {
         const FvPatch& q = fvp[pi];
-        if (isCoupledInterfaceType(q.type)) continue;      // not in the device's boundary arrays
+        if (isCyclicFamilyType(q.type)) continue;      // not in the device's boundary arrays
         for (label i = 0; i < q.size; ++i, ++bi)
         {
             if (q.type == "empty") continue;

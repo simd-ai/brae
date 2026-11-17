@@ -35,7 +35,7 @@ void bcValueKernel(
     if (type[i] == 8)      return;                                                       // coupled (processor): the
                                                                                          // face value is the halo-
                                                                                          // interpolated one, injected
-                                                                                         // by DeviceHalo::scatterBoundaryValues -- never derived from the local cell.
+                                                                                         // by the processor halo exchange -- never derived from the local cell.
     else if (type[i] == 0) value[i] = internal[fc[i]] + (rgr ? rgr[i] / dcv[i] : scalar(0));   // zeroGradient, or
                                                                                          // fixedGradient when refGrad
                                                                                          // is non-zero: OF's

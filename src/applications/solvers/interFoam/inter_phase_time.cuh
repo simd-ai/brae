@@ -20,6 +20,17 @@ inline bool on()
     static const bool v = std::getenv("BRAE_INTER_PHASE_TIME") != nullptr;
     return v;
 }
+// BRAE_INTER_PHASE_TIME=phases: the phases alone, no nested scope. Each nested scope synchronises the device twice,
+// hundreds of times a step, and on a decomposed run each of those charges the other ranks' lag to whatever it
+// encloses; the phases' few boundaries distort the step far less.
+inline bool nestedOn()
+{
+    static const bool v = []() {
+        const char* e = std::getenv("BRAE_INTER_PHASE_TIME");
+        return e != nullptr && std::string(e) != "phases";
+    }();
+    return v;
+}
 
 struct State
 {
@@ -74,14 +85,14 @@ struct Nested
     :
         name(n)
     {
-        if (!on()) return;
+        if (!nestedOn()) return;
         cudaDeviceSynchronize();
         t0 = std::chrono::steady_clock::now();
     }
 
     ~Nested()
     {
-        if (!on()) return;
+        if (!nestedOn()) return;
         cudaDeviceSynchronize();
         slot(state().nested, name) += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         for (auto& e : state().nestedCalls)

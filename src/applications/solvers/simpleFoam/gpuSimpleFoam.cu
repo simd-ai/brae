@@ -28,6 +28,7 @@
 #include "linear_solver_setup.cuh"   // readLinearSolverControls (shared with gpuRhoSimpleFoam)   // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse (steady + transient)
 #include "solver_dispatch.cuh"   // dispatchSolver + execSibling: route to the solver / component that owns the work
 #include "brae_cli.cuh"        // brae --version | solvers | capabilities | check | run: the command line
+#include "decompose_cli.cuh"   // brae decompose | reconstruct: decomposePar and reconstructPar without OpenFOAM
 #include "simpleFoamV2.cuh"      // the rebuilt path + its envelope guard (BRAE_SIMPLEFOAM_V2)
 #include "benchmark.cuh"         // brae benchmark [sample]: the standard workload, pulled from the template repo
 #include "turbulence_setup.cuh"   // readTurbulenceModel + readTurbulenceFields (shared with pimpleFoam)
@@ -118,6 +119,8 @@ int main(int argc, char** argv)
             const std::string word = argv[1];
             if (word == "solvers") return cli::solversCommand();
             if (word == "capabilities") return cli::capabilitiesCommand(argc, argv);
+            if (word == "decompose") return cli::decomposeCommand(argc, argv);
+            if (word == "reconstruct") return cli::reconstructCommand(argc, argv);
             if (word == "check")
             {
                 const int code = cli::checkCommand(argc, argv);
@@ -181,18 +184,20 @@ int main(int argc, char** argv)
                     sweep.push_back(argv[j]);
                 if (!sweep.empty()) return braesweep::runSweepCases(sweep);
             }
-        // -parallel (the OpenFOAM convention): the distributed DEVICE path, one rank per GPU.
-        //   mpirun -np N brae -case <dir> -parallel
-        // Gated on the flag rather than on Pstream::nProcs() so a plain `brae -case ...` never initialises
-        // MPI -- which also keeps the -cases fork orchestrator above clear of it.
-        // -parallel (multi-GPU) is OUT OF SCOPE; the distributed solver lives in legacy/ and is not built.
-        // REFUSE rather than fall through to the single-GPU path: under `mpirun -np N` that would run N
-        // redundant identical solves, each writing over the others' time directories.
+        // -parallel (the OpenFOAM convention) is a multi-GPU run, one rank per GPU: `mpirun -np N brae -case <dir> -parallel`.
+        // Gated on the flag rather than on Pstream::nProcs() so a plain `brae -case ...` never initialises MPI -- which
+        // also keeps the -cases fork orchestrator above clear of it.
+        //  1. the multi-GPU layer (brae-mgpu), when it is installed next to brae, takes every -parallel run (below);
+        //  2. otherwise brae_interFoam reads a decomposed case itself (`-parallel [-rank N -nprocs M]`, processor<rank>/,
+        //     common/case_roots.cuh): dispatchSolver hands an interFoam case on with its arguments;
+        //  3. this executable's own steady solvers do not, and the refusal after dispatchSolver says so. REFUSE rather than
+        //     fall through to the single-GPU path: under `mpirun -np N` that would run N redundant identical solves, each
+        //     writing over the others' time directories.
         for (int i = 1; i < argc; ++i)
             if (std::string(argv[i]) == "-parallel" && !cli::mgpuSibling().empty())
             {
-                // the multi-GPU layer, when installed next to brae: exec'd directly (not through execSibling, whose
-                // one-hand-over guard would stop brae-mgpu choosing its own solver), each MPI rank alike
+                // exec'd directly (not through execSibling, whose one-hand-over guard would stop brae-mgpu choosing its
+                // own solver), each MPI rank alike
                 const std::string mgpu = cli::mgpuSibling();
                 std::fprintf(stderr, "brae: -parallel -> %s (the multi-GPU layer)\n", mgpu.c_str());
                 std::vector<char*> av(argv, argv + argc);
@@ -201,11 +206,6 @@ int main(int argc, char** argv)
                 execv(mgpu.c_str(), av.data());
                 throw std::runtime_error("cannot start " + mgpu);
             }
-        for (int i = 1; i < argc; ++i)
-            if (std::string(argv[i]) == "-parallel")
-                throw std::runtime_error(
-                    "brae: -parallel (multi-GPU) needs the multi-GPU layer, brae-mgpu, installed next to brae, and this "
-                    "install has none. Run brae single-GPU without -parallel (and without mpirun).");
         std::string caseDir = ".";
         bool partition = false;                              // -partition: build mesh + AMG caches, then exit (no solve)
         for (int i = 1; i < argc; ++i)
@@ -215,6 +215,8 @@ int main(int argc, char** argv)
                 caseDir = argv[++i];
             else if (a == "-partition")
                 partition = true;
+            else if (a == "-rank" || a == "-nprocs")
+                ++i;                                         // the value is not a case directory
             else if (a[0] != '-')
                 caseDir = a;
         }
@@ -224,6 +226,12 @@ int main(int argc, char** argv)
         // read or CUDA init. -partition is solver-agnostic prep (mesh + AMG cache) and always runs here.
         // Registry + rules: solvers/common/solver_dispatch.cuh.
         if (!partition) dispatchSolver(caseDir, argc, argv);
+        for (int i = 1; i < argc; ++i)
+            if (std::string(argv[i]) == "-parallel")
+                throw std::runtime_error(
+                    "brae: -parallel (multi-GPU) is not supported for this solver without the multi-GPU layer, brae-mgpu, "
+                    "installed next to brae (none is). Only `application interFoam` reads a decomposed case itself "
+                    "(`-parallel`). Run brae single-GPU without -parallel (and without mpirun).");
 
         // The REBUILT simpleFoam (UEqn.cu + pEqn.cu + simpleFoam.cu), selected with BRAE_SIMPLEFOAM_V2=1.
         // It covers a strict subset of what the code below runs, so it is opt-in -- but once selected it

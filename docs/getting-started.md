@@ -7,7 +7,9 @@ Brae runs an existing OpenFOAM incompressible case on one GPU. If you can run it
 
 - An NVIDIA GPU, Ampere or newer: Ampere (A100, RTX 30-series), Ada Lovelace (RTX 40-series, L40), Hopper (H100,
   GH200), or Blackwell (GB10, B200, RTX 50-series). Brae is standard CUDA, so newer cards build from the same source.
-- CUDA toolkit 12.4+ (13.x recommended).
+  Volta (V100) also builds, with CUDA 12.x — see [GPU and toolchain compatibility](#gpu-and-toolchain-compatibility).
+- CUDA toolkit 12.4+ (13.x recommended). Conditional graph nodes, which the device-resident solver loops use, need
+  CUDA 12.4 and a driver r550 or newer.
 - `cmake ≥ 3.24`, a C++17 compiler, an MPI (OpenMPI), SCOTCH, zlib.
 
 ## 2. Build
@@ -15,7 +17,7 @@ Brae runs an existing OpenFOAM incompressible case on one GPU. If you can run it
 ```bash
 git clone https://github.com/simd-ai/brae.git
 cd brae
-cmake -B build -DCMAKE_CUDA_ARCHITECTURES=<arch>   # 121=GB10, 120=RTX 50xx, 100=B200, 90=H100/GH200, 89=RTX 40xx, 86=RTX 30xx, 80=A100
+cmake -B build -DCMAKE_CUDA_ARCHITECTURES=<arch>   # 121=GB10, 120=RTX 50xx, 100=B200, 90=H100/GH200, 89=RTX 40xx, 86=RTX 30xx, 80=A100, 70=V100 (CUDA 12.x)
 cmake --build build -j 4 --target brae
 ```
 
@@ -29,6 +31,38 @@ like:
 ```bash
 export PATH="$PWD/build:$PATH"
 ```
+
+## GPU and toolchain compatibility
+
+| GPU | arch | status |
+|---|---:|---|
+| Blackwell (GB10, RTX 50-series, B200, B300) | 121 / 120 / 100 / 103 | the development targets; the full test suite runs on a GB10 |
+| Hopper (H100, GH200) | 90 | supported; measured in [performance](performance.md) |
+| Ada, Ampere (RTX 40/30, L40, A100) | 89 / 86 / 80 | built by CI for sm_80 and sm_90; same source |
+| Volta (V100) | 70 | builds with CUDA 12.x (compiled for `70` and for `"70;90;120"` with CUDA 12.9); a 2.48M-cell interFoam case runs on 1-8 V100s ([Multi-GPU](multi-gpu.md#performance)). Not part of CI |
+
+Nothing in brae needs sm_80 or newer: the thread-block-cluster reductions (sm_90+) compile to no-ops below Hopper and are
+never launched there.
+
+Toolchain notes:
+
+- **CUDA 12.4 and newer build the device-resident solver loops.** The CUDA-graph `WHILE` loops of the AMG-PCG, the
+  symmetric Gauss-Seidel and BiCGStab solvers use conditional graph nodes, which exist from CUDA 12.4. They used to be
+  compiled in only on CUDA 13, so a CUDA 12 build silently ran host-driven loops: the same algorithms, but not
+  bit-identical to the graph path. `src/cuda/cuda_graph_compat.cuh` absorbs the CUDA 12 / 13 signature difference of
+  `cudaGraphAddNode` and `cudaStreamGetCaptureInfo`. At run time these loops need a driver r550 or newer
+  (`braeCondGraphsAvailable()`): on an older driver brae says so once and takes the host-driven loops, which are the same
+  algorithms but not bit-identical to the graph path (`BRAE_COND_GRAPH=0` forces them, `=1` skips the check). The switches
+  `BRAE_PCG_DEVICE=0`, `BRAE_GS_HOST_LOOP=1` and `BRAE_BICG_HOST_LOOP=1` select the host-driven loops as well.
+- **Host compiler.** nvcc 12.9 supports gcc up to 14; gcc 15's libstdc++ does not parse with it. Configure with
+  `-DCMAKE_CUDA_HOST_COMPILER=g++-14` (or any gcc 11-14). With CUDA 13, pass a host compiler that version supports
+  if the system default is newer.
+- **CUDA 13 cannot target V100** (Volta is dropped); use CUDA 12.x for `70`.
+- **One binary for several GPUs:** `-DCMAKE_CUDA_ARCHITECTURES="70;90;120"` (a fat build takes about 3 minutes longer).
+- **Run-time libraries:** the toolkit's `libnvrtc` must be found; if the toolkit is not installed system-wide, export
+  `LD_LIBRARY_PATH=$CUDA_HOME/lib64`.
+- **NVSHMEM** was removed: the multi-GPU code uses ProcComm (MPI-host or NCCL); no NVSHMEM installation or CMake option remains
+  (a DGX-1 has no NVSwitch, and its unlinked GPU pairs cannot use it). See [Multi-GPU](multi-gpu.md).
 
 ## 3. Run a case
 

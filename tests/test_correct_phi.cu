@@ -100,7 +100,7 @@ int main()
     std::vector<label> patchOf, cellOf;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
-        if (isCoupledInterfaceType(fvp[pi].type)) continue;
+        if (isCyclicFamilyType(fvp[pi].type)) continue;
         for (label i = 0; i < fvp[pi].size; ++i) { patchOf.push_back((label)pi); cellOf.push_back(fvp[pi].faceCells[i]); }
     }
 

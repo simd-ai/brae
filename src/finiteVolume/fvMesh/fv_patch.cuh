@@ -17,6 +17,11 @@ struct FvPatch {
     std::vector<std::string> inGroups;  // groups this patch belongs to (boundaryField group-keyword match)
     label               start = 0;
     label               size  = 0;
+    // processor / processorCyclic patches (decomposePar output): the ranks the patch joins, copied
+    // from PatchInfo. -1 on every other patch type. Reading them does NOT couple the patch.
+    label               myProcNo = -1;
+    label               neighbProcNo = -1;
+    std::string         referPatch;
     std::vector<label>  faceCells;    // owner cell of each boundary face
     std::vector<scalar> deltaCoeffs;  // 1/|Cf - C[faceCell]|
     std::vector<vector> nf;           // unit face normal Sf/|Sf| (for slip/symmetry projection)
@@ -66,6 +71,19 @@ struct FvPatch {
     std::vector<vector> delta;
     std::vector<scalar> nonOrthDeltaCoeffs;
     std::vector<vector> nonOrthCorrectionVectors;
+
+    // THE COUPLED HALF of a `processor` patch, filled by coupleProcessorPair (a rank's patch has no twin on
+    // this rank: the neighbour's data came over ProcComm once, at setup). `coupled`, `owner`, `weights`,
+    // `delta`, `deltaCoeffs`, `nonOrthDeltaCoeffs` and `nonOrthCorrectionVectors` are the cyclic's, built with
+    // processorFvPatch's formulas. `nbrFaceCells` holds HALO SLOT indices, nC + slot, so that a coupled
+    // operator reading x[nbrFaceCells[i]] finds the neighbour's cell value once the halo tail of x is
+    // refreshed (ProcComm::exchangeCells); the patch's own slots are the contiguous range
+    // [haloBase, haloBase + nHaloCells) -- distinct neighbour cells, first-appearance order.
+    // nbrD = neighbFaceCentres - neighbFaceCellCentres (the neighbour's Cf - C of face i), the half of
+    // `delta` that is not this rank's.
+    std::vector<vector> nbrD;
+    label               haloBase = -1;
+    label               nHaloCells = 0;
 };
 
 // The value OpenFOAM's linear scheme puts on a coupled face: w*pif + (1 - w)*pnf, from the two CELLS
@@ -142,6 +160,28 @@ void attachCyclicCoupling(
     std::vector<FvPatch>& patches,
     const PrimitiveMesh& m,
     const FvGeometry& g);
+
+// What a rank learns once about the other side of a `processor` patch: the NEIGHBOUR's face centre, face area
+// vector and owner-cell centre of every face, in the neighbour's patch order (face i of my patch is face i of
+// the neighbour's). processorPolyPatch::initGeometry sends exactly these three, 9 doubles a face.
+struct ProcessorNbrFaces
+{
+    std::vector<vector> Cf, Sf, Cn;
+};
+
+// The 9 doubles per face this rank SENDS for `p`: Cf, Sf, C[faceCell] (processorPolyPatch::initGeometry order).
+std::vector<double> packProcessorFaces(const FvPatch& p, const FvGeometry& g);
+// ...and the inverse, for what arrives. Throws when the length is not 9*faces.
+ProcessorNbrFaces unpackProcessorFaces(const std::vector<double>& flat, label faces);
+
+// Fill the coupled half of ONE `processor` patch from the neighbour's data, with OpenFOAM's own formulas and
+// inputs (processorFvPatch.C makeWeights/delta, basicFvGeometryScheme.C boundary branches):
+//   delta   = (Cf - Cn) - (nbrCf - nbrCn)             processorFvPatch::delta, parallel()
+//   w       = nbrCn/(nf & (Cf - Cn) + nbrCn),  nbrCn = (nbrSf/(|nbrSf| + VSMALL)) & (nbrCf - nbrCn)
+//   deltaCoeffs = 1/|delta|;  nonOrthDeltaCoeffs = 1/max(nf & delta, 0.05|delta|);  corrVec = nf - delta*nonOrthDeltaCoeffs
+// NOT 1/|C_remote - C_local|, which is what a global-mesh partition would give and is another rounding.
+// `coupled` is set and nbrFaceCells left to the caller (attachProcessorCoupling), which knows the halo slots.
+void coupleProcessorPair(FvPatch& p, const ProcessorNbrFaces& nbr, const FvGeometry& g);
 
 // mirrorACMI: the caller is the OF-mirror interFoam host loop, which couples a coincident cyclicACMI
 // pair itself (cpu::cyclicACMI::setup); every other caller has the refusal below.

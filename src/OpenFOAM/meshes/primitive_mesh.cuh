@@ -34,6 +34,12 @@ struct PatchInfo
     scalar      matchTolerance = 1e-4;
     std::vector<std::string> inGroups;  // polyBoundaryMesh groups this patch belongs to (boundaryField group match)
     std::string transform;       // cyclic: "translational" / "rotational" / "unknown"
+    // processor / processorCyclic (decomposePar's processorN/constant/polyMesh/boundary, written by
+    // processorPolyPatch::write): the two ranks the patch joins. -1 for every other patch type.
+    // processorCyclic adds referPatch, the cyclic patch the processor patch was cut from.
+    label       myProcNo = -1;
+    label       neighbProcNo = -1;
+    std::string referPatch;
     vector      rotationAxis{0, 0, 1};    // cyclic rotational: axis direction
     vector      rotationCentre{0, 0, 0};  // cyclic rotational: a point on the axis
     // cyclicACMI `scale` (OF cyclicACMIPolyPatch: PatchFunction1<scalar>::NewIfPresent(*this, "scale")):

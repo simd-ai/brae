@@ -26,7 +26,7 @@
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "interface/ami_interface.cuh"
-#include "foam_dict.cuh"   // isCoupledInterfaceType / isConstraintPatchType
+#include "foam_dict.cuh"   // isCyclicFamilyType / isConstraintPatchType
 #include <cmath>
 #include <cstdio>
 #include <stdexcept>
@@ -141,7 +141,7 @@ int main()
 
     // ---- Leg 1: the type is coupled at all ---------------------------------------------------------
     {
-        check(isCoupledInterfaceType("cyclicPeriodicAMI"),
+        check(isCyclicFamilyType("cyclicPeriodicAMI"),
               "cyclicPeriodicAMI is a COUPLED interface type (so the boundary machinery skips it)");
         check(isConstraintPatchType("cyclicPeriodicAMI"),
               "...and a constraint type, so a field file may omit its boundaryField entry");

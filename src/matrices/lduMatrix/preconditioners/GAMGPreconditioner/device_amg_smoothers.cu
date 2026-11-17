@@ -242,6 +242,12 @@ void ensureSpectrum(
     AMGData& amg,
     const DeviceLduView& A)
 {
+    LocalReductions localOnly;               // the spectrum of the rank's own block: no halo, no global dot
+    if (A.proc.active())
+    {
+        ensureSpectrum(amg, deviceBlockLocal(A));
+        return;
+    }
     if (amg.gsSmooth && useGSPermuted())
     {
         const int G = amg.nLevels();

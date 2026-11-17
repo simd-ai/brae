@@ -27,7 +27,7 @@ void VolPointInterpolation::makeWeights(
     patchSize_.clear();
     for (const FvPatch& p : patches)
     {
-        if (isCoupledInterfaceType(p.type))
+        if (isCyclicFamilyType(p.type))
         {
             throw std::runtime_error(
                 "brae volPointInterpolation: patch `" + p.name + "` is " + p.type + ". A coupled patch "

@@ -204,11 +204,14 @@ void deviceScale(DeviceBuffer<scalar>& x, scalar a)
 
 void deviceCopy(DeviceBuffer<scalar>& dst, const DeviceBuffer<scalar>& src)
 {
-    dst.resize(src.size());
+    // A halo-extended cell array copies with its tail (cellArrayLength); a halo-extended DESTINATION keeps its tail
+    // when the source has none (p = w in the distributed PCG: w is a block-local work vector, p is the product's
+    // operand and must keep its halo slots -- dropping them made the next A*p throw).
+    dst.resize(src.size(), std::max(src.capacity(), src.size() + dst.tail()));
     // D2D ASYNC on the per-thread stream: the copy stays ordered with the kernels that consume dst, and the host
     // never reads it here, so there is no reason to block the host (a plain cudaMemcpy would drain the GPU pipeline).
     // Host reads go through copyTo()/.host(), which sync explicitly.
-    cudaCheck(cudaMemcpyAsync(dst.data(), src.data(), src.size() * sizeof(scalar), cudaMemcpyDeviceToDevice,
+    cudaCheck(cudaMemcpyAsync(dst.data(), src.data(), src.capacity() * sizeof(scalar), cudaMemcpyDeviceToDevice,
                               cudaStreamPerThread), "copy");
 }
 

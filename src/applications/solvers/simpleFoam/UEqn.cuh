@@ -38,6 +38,7 @@
 #include "device_fvoptions.cuh"
 #include "device_crank_nicolson_ddt.cuh"
 #include "device_cyclic.cuh"   // DevicePorosity + deviceFvoPorosityDiag/Source
+#include "device_processor_ops.cuh"
 #include "UEqn_cpp.cuh"   // cpu::DivScheme -- one enum shared by both paths
 
 namespace brae {
@@ -61,6 +62,10 @@ struct MomentumMatrix
     // 5.6e-11 in U, and from the SECOND corrector -- the first whose H sees a non-zero U across the
     // pair -- to 6.9e-03, because H was weighted by p_rgh's coefficient.
     DeviceBuffer<scalar> cycIfCoeff;
+    // The processor interface's own off-diagonal, kept beside the periodic pair's. It is refilled by the
+    // momentum assembly and read by H(), the predictor solve and the relaxation on a decomposed mesh.
+    DeviceBuffer<scalar> procIfCoeff;
+
 
     DeviceLduView view(const DeviceMesh& dm) const
     {
@@ -72,6 +77,12 @@ struct MomentumMatrix
         A.ownerStart = dm.ownerStart.data();
         A.losort = dm.losort.data(); A.losortStart = dm.losortStart.data();
         A.addressingId = dm.addressingId;
+        if (DeviceProcCtx::active(dm))
+        {
+            DeviceProcCtx& pc = *DeviceProcCtx::current();
+            A.proc = pc.interfaceView();
+            A.proc.coeff = procIfCoeff.data();
+        }
         return A;
     }
 };

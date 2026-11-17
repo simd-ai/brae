@@ -2,6 +2,7 @@
 // placements and for what stays on the host.
 #include "device_inter_alpha_step.cuh"
 #include "device_alpha_subcycle.cuh"
+#include "device_processor_ops.cuh"
 #include "device_alpha_flux.cuh"
 #include "device_interface_properties.cuh"
 #include "device_blas.cuh"
@@ -143,10 +144,11 @@ void deviceInterAlphaStep(
                                    in.cyc, in.cyc ? &nHatfIfBuf : nullptr);
         }
         interPhase::Nested timedMixture("alpha: the mixture's cell fields (device)");
-        alpha2.resize(static_cast<std::size_t>(nC));
-        rho.resize(static_cast<std::size_t>(nC));
-        mu.resize(static_cast<std::size_t>(nC));
-        nu.resize(static_cast<std::size_t>(nC));
+        // the mixture's cell fields are read across a processor face: halo capacity (cellArrayLength)
+        resizeCellBuffer(alpha2, dm);
+        resizeCellBuffer(rho, dm);
+        resizeCellBuffer(mu, dm);
+        resizeCellBuffer(nu, dm);
         deviceMixtureCorrect(a.data(), nC, props,
                              alpha2.data(), rho.data(), mu.data(), nu.data());
     };
@@ -297,11 +299,17 @@ void deviceInterAlphaStep(
             }
             {
                 interPhase::Nested timedPre("alpha: the implicit pre-solve, whole (MULESCorr)");
+                DeviceBuffer<scalar> procPhiCN;
+                DeviceProcCtx* proc = DeviceProcCtx::active(dm) ? DeviceProcCtx::current() : nullptr;
+                if (proc) procGather(*proc, *li.phiCNBnd, procPhiCN);
+                if (ctl.procPhiCNOut && proc) deviceCopy(*ctl.procPhiCNOut, procPhiCN);
+                const DeviceBuffer<scalar>* prePhiIf = proc ? &procPhiCN
+                    : ((preRawPhi && pairHere) ? &li.cyc->phi : li.phiCNIf);
                 deviceAlphaPreSolve(dm, alpha, subOld, *li.phiCNInt, iC, bC, dtSub, ctl.preSolve,
                                     alphaPhiInt, alphaPhiBnd, &pre, li.cyc, li.alphaPhiIf,
-                                    li.Vsc, li.Vsc0, li.rDeltaT,
-                                    (preRawPhi && pairHere) ? &li.cyc->phi : li.phiCNIf);
+                                    li.Vsc, li.Vsc0, li.rDeltaT, prePhiIf);
             }
+            if (ctl.preSolveAlphaPhiBndOut) deviceCopy(*ctl.preSolveAlphaPhiBndOut, alphaPhiBnd);
             if (ctl.preSolveLog)
             {
                 ctl.preSolveLog->push_back(pre);
@@ -476,6 +484,18 @@ void deviceInterAlphaStep(
                 deviceAlphaCorrector(dm, alpha, subOld, li, db, mulesCtl, nHatfInt,
                                      alphaPhiInt, alphaPhiBnd);
             }
+            if (ctl.correctorAlphaBndOut)
+            {
+                if (ctl.correctorAlphaBndOut->size() < static_cast<std::size_t>(aCorr + 1))
+                    ctl.correctorAlphaBndOut->resize(static_cast<std::size_t>(aCorr + 1));
+                deviceCopy((*ctl.correctorAlphaBndOut)[static_cast<std::size_t>(aCorr)], alpha1Bnd);
+            }
+            if (ctl.correctorAlphaOut)
+            {
+                if (ctl.correctorAlphaOut->size() < static_cast<std::size_t>(aCorr + 1))
+                    ctl.correctorAlphaOut->resize(static_cast<std::size_t>(aCorr + 1));
+                deviceCopy((*ctl.correctorAlphaOut)[static_cast<std::size_t>(aCorr)], alpha);
+            }
             if (relaxes)
             {
                 hooks.relaxBoundary(postMules, alpha, alpha1Bnd);
@@ -597,6 +617,9 @@ void deviceInterAlphaStep(
     {
         deviceCopy(*ctl.rhoPhiIf, rhoPhiIfSum);
     }
+    if (ctl.alphaBeforeFinalMixtureOut) deviceCopy(*ctl.alphaBeforeFinalMixtureOut, alpha1Bnd);
+    if (ctl.alpha2BeforeFinalMixtureOut && ctl.alpha2BndOut)
+        deviceCopy(*ctl.alpha2BeforeFinalMixtureOut, *ctl.alpha2BndOut);
 
     // ...and mixture.correct() ONCE MORE after the whole sub-cycle (interFoam.C, after alphaEqnSubCycle.H).
     // The momentum equation must be built on the NEW density -- a mixture of the alpha the step started with

@@ -1,9 +1,12 @@
 // interFoam's pressure corrector on the device -- see device_inter_peqn.cuh for the four.
 #include "device_inter_peqn.cuh"
 #include "device_fvc_reconstruct.cuh"
+#include "device_processor_ops.cuh"
 #include "device_mesh.cuh"
+#include "device_blas.cuh"
 #include "device_ldu.cuh"
 #include "device_simple.cuh"
+#include "proc_globals.cuh"
 #include <cstdlib>
 #include <cuda_runtime.h>
 #include <stdexcept>
@@ -248,13 +251,37 @@ __global__ void setReferenceKernel(int cell, const scalar* __restrict__ pRgh,
     }
 }
 
+// OF setReference precedes the solver's addBoundaryDiag. Our processor share is already in
+// P.diag, so exclude it for the reference operation and restore it immediately afterwards.
+__global__ void adjustReferenceInterfaceKernel(int cell, scalar share, scalar* diag)
+{
+    if (blockIdx.x == 0 && threadIdx.x == 0) diag[cell] += share;
+}
+
+static void adjustReferenceInterface(const DeviceCyclic& cyc, int cell, scalar sign,
+                                     DeviceBuffer<scalar>& diag)
+{
+    if (cell < 0) return;
+    const std::vector<label> own = cyc.ownCell.host();
+    const std::vector<scalar> coeff = cyc.ifCoeff.host();
+    scalar share = 0;
+    for (std::size_t j = 0; j < own.size(); ++j) if (own[j] == cell) share += coeff[j];
+    if (share != scalar(0))
+    {
+        adjustReferenceInterfaceKernel<<<1, 1>>>(cell, sign*share, diag.data());
+        ckP(cudaGetLastError(), "reference processor diagonal fold");
+    }
+}
+
 // applyPressureReference (inter_peqn_cpp.cu:179-196), pEqn.H:74-83: p += pRefValue - p[pRefCell], and
 // p_rgh is REBUILT from the shifted p rather than keeping what the solve gave it. Two passes, because
 // every cell reads p[pRefCell] and the reference cell's own thread writes it.
 __global__ void refShiftKernel(int cell, scalar pRefValue,
                               const scalar* __restrict__ p, scalar* __restrict__ shift)
 {
-    if (blockIdx.x == 0 && threadIdx.x == 0) shift[0] = pRefValue - p[cell];
+    // cell < 0: another rank holds the reference cell (-parallel); this rank contributes the zero that
+    // getRefCellValue's sum (findRefCell.C:148-153) adds for it
+    if (blockIdx.x == 0 && threadIdx.x == 0) shift[0] = cell >= 0 ? pRefValue - p[cell] : scalar(0);
 }
 
 __global__ void applyRefShiftKernel(int nC, const scalar* __restrict__ shift,
@@ -484,9 +511,9 @@ void deviceCorrectVelocity(
     deviceReconstruct(dm, ssfInt, ssfBnd, rx, ry, rz, havePair ? cyc : nullptr,
                       havePair ? &ssfIf : nullptr);
 
-    UX.resize(static_cast<std::size_t>(nC));
-    UY.resize(static_cast<std::size_t>(nC));
-    UZ.resize(static_cast<std::size_t>(nC));
+    resizeCellBuffer(UX, dm);   // the corrected U is read across a processor face by the next H
+    resizeCellBuffer(UY, dm);
+    resizeCellBuffer(UZ, dm);
     addScaledKernel<<<nBlocks(nC), TPB>>>(HbyAX.data(), HbyAY.data(), HbyAZ.data(), rAU.data(),
                                           rx.data(), ry.data(), rz.data(), nC,
                                           UX.data(), UY.data(), UZ.data());
@@ -585,19 +612,49 @@ void deviceInterAssemblePEqn(
         }
         deviceCyclicAssembleLaplacian(*cyc, *rAUCell, P.diag, /*addToDiag=*/true, corrected || nonOrthCoeffs);
     }
+    if (DeviceProcCtx::active(dm))
+    {
+        if (!rAUCell)
+        {
+            throw std::runtime_error(
+                "brae interFoam device pEqn: processor faces need rAU on cells to form their laplacian "
+                "coefficient; the caller supplied none.");
+        }
+        DeviceProcCtx& pc = *DeviceProcCtx::current();
+        deviceCyclicAssembleLaplacian(pc.cyc(), *rAUCell, P.diag, /*addToDiag=*/true,
+                                      corrected || nonOrthCoeffs);
+        deviceCopy(P.procIfCoeff, pc.cyc().ifCoeff);
+    }
+    DeviceCyclic* const procCyc = DeviceProcCtx::active(dm) ? &DeviceProcCtx::current()->cyc() : nullptr;
+    if (needReference && pRefCell >= 0)
+    {
+        if (cyc && cyc->n > 0) adjustReferenceInterface(*cyc, pRefCell, scalar(1), P.diag);
+        if (procCyc) adjustReferenceInterface(*procCyc, pRefCell, scalar(1), P.diag);
+    }
 
     if (needReference)
     {
-        if (pRefCell < 0 || pRefCell >= nC)
-            throw std::runtime_error(
-                "brae interFoam device pEqn: pRefCell is outside the mesh. A case whose p_rgh has no "
-                "value-fixing patch is singular without it, so this cannot be defaulted away.");
-        if (!pRghForRef)
-            throw std::runtime_error(
-                "brae interFoam device pEqn: setReference pins the reference cell at p_rgh's CURRENT value "
-                "there (pEqn.H:47), and the field was not handed over.");
-        setReferenceKernel<<<1, 1>>>(pRefCell, pRghForRef->data(), P.diag.data(), P.source.data());
-        ckP(cudaGetLastError(), "setReference");
+        // fvMatrix::setReference acts where celli >= 0 only: under -parallel the one rank holding the
+        // reference cell pins it, the others hold -1 (findRefCell.C) and leave their matrix alone
+        const bool otherRankHoldsIt = pRefCell < 0 && pg::parallel();
+        if (!otherRankHoldsIt)
+        {
+            if (pRefCell < 0 || pRefCell >= nC)
+                throw std::runtime_error(
+                    "brae interFoam device pEqn: pRefCell is outside the mesh. A case whose p_rgh has no "
+                    "value-fixing patch is singular without it, so this cannot be defaulted away.");
+            if (!pRghForRef)
+                throw std::runtime_error(
+                    "brae interFoam device pEqn: setReference pins the reference cell at p_rgh's CURRENT value "
+                    "there (pEqn.H:47), and the field was not handed over.");
+            setReferenceKernel<<<1, 1>>>(pRefCell, pRghForRef->data(), P.diag.data(), P.source.data());
+            ckP(cudaGetLastError(), "setReference");
+        }
+    }
+    if (needReference && pRefCell >= 0)
+    {
+        if (cyc && cyc->n > 0) adjustReferenceInterface(*cyc, pRefCell, scalar(-1), P.diag);
+        if (procCyc) adjustReferenceInterface(*procCyc, pRefCell, scalar(-1), P.diag);
     }
 }
 
@@ -611,13 +668,21 @@ void deviceInterPressureReference(
     DeviceBuffer<scalar>&       p,
     DeviceBuffer<scalar>&       p_rgh)
 {
-    if (nC <= 0) return;
-    if (pRefCell < 0 || pRefCell >= nC)
+    // Under -parallel EVERY rank takes part, a rank with no cells included: the shift is a collective sum of
+    // the owner's `pRefValue - p[pRefCell]` and the others' zeros (getRefCellValue, findRefCell.C:148-153)
+    ProcComm* comm = pg::comm();
+    if (nC <= 0 && !comm) return;
+    if (!comm && (pRefCell < 0 || pRefCell >= nC))
+        throw std::runtime_error(
+            "brae interFoam device pEqn: pRefCell is outside the mesh, and pEqn.H:74-83 reads p there.");
+    if (comm && pRefCell >= nC)
         throw std::runtime_error(
             "brae interFoam device pEqn: pRefCell is outside the mesh, and pEqn.H:74-83 reads p there.");
     DeviceBuffer<scalar> shift(1);
     refShiftKernel<<<1, 1>>>(pRefCell, pRefValue, p.data(), shift.data());
     ckP(cudaGetLastError(), "the reference shift");
+    if (comm) comm->allReduce(shift.data(), 1, ReduceOp::Sum, cudaStreamPerThread);
+    if (nC <= 0) return;
     applyRefShiftKernel<<<nBlocks(nC), TPB>>>(nC, shift.data(), rho.data(), gh.data(),
                                               p.data(), p_rgh.data());
     ckP(cudaGetLastError(), "p += shift; p_rgh = p - rho*gh");

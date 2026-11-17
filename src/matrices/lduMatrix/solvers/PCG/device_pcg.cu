@@ -5,8 +5,6 @@
 #include "device_amg.cuh"   // AMGData + amgVCycleApply (the distributed AMG-PCG preconditioner)
 #include "device_amg_detail.cuh"  // BRAE_HAS_GS_DEVICE (conditional graph nodes); needs device_amg.cuh first for AMGLevel
 #include "device_blas.cuh"
-#include "device_halo.cuh"
-#include "device_reduce.cuh"   // DeviceReducer: on-stream NVSHMEM global reduction (replaces host MPI_Allreduce)
 #include "cf_pstream.cuh"
 #include <cuda_runtime.h>
 #include <map>
@@ -34,7 +32,7 @@ DeviceSolverPerf deviceJacobiPCG(
     const DevicePreconApply* apply)
 {
     const int nC = A.nCells;
-    DeviceBuffer<scalar> wA(nC), rA(nC), pA(nC), Ax(nC);
+    DeviceBuffer<scalar> wA(nC), rA(nC), pA(static_cast<std::size_t>(nC), deviceProcHalo(A.proc)), Ax(nC);   // pA: halo tail on a decomposed mesh
 
     deviceAmul(A, psi, Ax, /*onField=*/true);                // rA = b - A*psi, the field's own product
     deviceCopy(rA, b);
@@ -130,15 +128,43 @@ __global__ void normFactorSummandK(
 }
 }   // namespace
 
+namespace
+{
+// A vector of ones WITH a halo tail of ones, cached per (nCells, nHalo): the operand of the row-sum product A*1 on a
+// decomposed mesh (the halo of an all-ones field is all ones, so no exchange is needed for it).
+const DeviceBuffer<scalar>& deviceOnesWithHalo(int nC, int nExt)
+{
+    static auto& cache = *new std::map<std::pair<int, int>, DeviceBuffer<scalar>>();
+    auto it = cache.find({nC, nExt});
+    if (it == cache.end())
+    {
+        DeviceBuffer<scalar> ones(static_cast<std::size_t>(nC), static_cast<std::size_t>(nExt - nC));
+        const std::vector<scalar> h(static_cast<std::size_t>(nExt), scalar(1));
+        if (nExt > 0) cudaCheck(cudaMemcpy(ones.data(), h.data(), h.size()*sizeof(scalar), cudaMemcpyHostToDevice), "ones H2D");
+        it = cache.emplace(std::make_pair(nC, nExt), std::move(ones)).first;
+    }
+    return it->second;
+}
+}   // namespace
+
 void deviceNormFactorInto(
     const DeviceLduView& A,
     const DeviceBuffer<scalar>& psi,
     const DeviceBuffer<scalar>& b,
-    const DeviceBuffer<scalar>& ones,
+    const DeviceBuffer<scalar>& onesArg,
     DeviceBuffer<scalar>& dNorm)
 {
     dNorm.resize(1);
     const int nC = A.nCells;
+    // A DECOMPOSED MESH (A.proc): OpenFOAM's normFactor is gSum / gAverage based. The three sums below are global
+    // through the reduction hook (deviceDotInto, deviceSumMagInto), the average divides by the GLOBAL cell count,
+    // and the row sums A*1 carry the interface coefficients (the halo of the ones vector is ones). One halo
+    // exchange (A*psi), two collectives (avgPsi, the normFactor sum).
+    const bool dist = A.proc.active();
+    const DeviceBuffer<scalar>& ones = dist
+        ? deviceOnesWithHalo(nC, nC + static_cast<int>(deviceProcHalo(A.proc)))
+        : onesArg;
+    const scalar nAvg = dist ? static_cast<scalar>(A.proc.nGlobalCells) : static_cast<scalar>(nC);
     DeviceBuffer<scalar> Apsi(nC), sumA(nC), tmp(nC), t(nC);
     // Device-resident: the 3 reductions (avgPsi, n1, n2) stay on the device; only the final normFactor is read to
     // the host (it scales the residual for the convergence check). Same kernels + same IEEE ops (the divide by nC,
@@ -148,9 +174,10 @@ void deviceNormFactorInto(
     // subtracts its jump from (jumpCyclicFvPatchField.C:169-177, "only apply jump to original field").
     // sumA is a ROW SUM -- lduMatrix::sumA, which carries no jump -- so it stays without one.
     deviceAmul(A, psi, Apsi, /*onField=*/true);              // A*psi
-    deviceAmul(A, ones, sumA);                               // sumA = rowSum(A) = A*1
+    if (dist) deviceAmulHaloFresh(A, ones, sumA);           // sumA = rowSum(A) = A*1, halo of ones already ones
+    else      deviceAmul(A, ones, sumA);                    // sumA = rowSum(A) = A*1
     deviceDotInto(psi, ones, dAvg.data());                  // psi.ones
-    deviceScalarDivConst(dAvg.data(), (scalar)nC, dAvg.data());   // avgPsi = gAverage(psi) = (psi.ones)/nC
+    deviceScalarDivConst(dAvg.data(), nAvg, dAvg.data());   // avgPsi = gAverage(psi) = (psi.ones)/nC (global count when decomposed)
     deviceCopy(tmp, sumA);
     deviceScaleDev(dAvg.data(), tmp);      // tmp = sumA*avg(psi)
     // ONE sum, as lduMatrixSolver.C:
@@ -160,7 +187,8 @@ void deviceNormFactorInto(
     // The summand is >= 0, so sum(|x|) is the plain sum of it.
     normFactorSummandK<<<(nC + 255)/256, 256>>>(nC, Apsi.data(), b.data(), tmp.data(), t.data());
     deviceSumMagInto(t, dN1.data());
-    dN2.copyFrom(std::vector<scalar>{scalar(0)});
+    // the zero queued behind the reduction: a blocking upload of it from the host waited for the whole queue first
+    cudaCheck(cudaMemsetAsync(dN2.data(), 0, sizeof(scalar), cudaStreamPerThread), "normFactor zero");
     deviceScalarAdd2(dN1.data(), dN2.data(), 1e-20, dNorm.data());                    // sum + 0 + small
 }
 
@@ -508,7 +536,7 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
         wp.conditional.type = cudaGraphCondTypeWhile;
         wp.conditional.size = 1;
         cudaGraphNode_t wnode;
-        cudaCheck(cudaGraphAddNode(&wnode, c.graph, nullptr, nullptr, 0, &wp), "bicg while node");
+        cudaCheck(braeGraphAddNode(&wnode, c.graph, nullptr, 0, &wp), "bicg while node");
         cudaGraph_t body = wp.conditional.phGraph_out[0];
         // the IF/ELSE handle lives on the graph that will contain the IF node: the WHILE body
         cudaCheck(cudaGraphConditionalHandleCreate(&c.hIf, body, 0, cudaGraphCondAssignDefault), "bicg if handle");
@@ -532,7 +560,7 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
         cudaStreamCaptureStatus st;
         const cudaGraphNode_t* deps = nullptr;
         size_t nDeps = 0;
-        cudaCheck(cudaStreamGetCaptureInfo(cudaStreamPerThread, &st, nullptr, nullptr, &deps, nullptr, &nDeps), "bicg capture info");
+        cudaCheck(braeStreamGetCaptureInfo(cudaStreamPerThread, &st, &deps, &nDeps), "bicg capture info");
         std::vector<cudaGraphNode_t> depv(deps, deps + nDeps);
         cudaGraph_t tmp;
         cudaCheck(cudaStreamEndCapture(cudaStreamPerThread, &tmp), "bicg capture A end");
@@ -542,7 +570,7 @@ bool deviceJacobiBiCGStabGraph(const DeviceLduView& A, const DeviceBuffer<scalar
         ip.conditional.type = cudaGraphCondTypeIf;
         ip.conditional.size = 2;                                                          // body[0] = if, body[1] = else
         cudaGraphNode_t inode;
-        cudaCheck(cudaGraphAddNode(&inode, body, depv.data(), nullptr, depv.size(), &ip), "bicg if node");
+        cudaCheck(braeGraphAddNode(&inode, body, depv.data(), depv.size(), &ip), "bicg if node");
         // IF: the mid-iteration exit
         cudaCheck(cudaStreamBeginCaptureToGraph(cudaStreamPerThread, ip.conditional.phGraph_out[0], nullptr, nullptr, 0, cudaStreamCaptureModeThreadLocal), "bicg capture if");
         deviceAxpyDev(s.alpha.data(), c.yA, psi);
@@ -633,14 +661,15 @@ DeviceSolverPerf deviceJacobiBiCGStab(
     // is a different stopping rule and keeps this loop. Dispatched before the DILU update below: the graph
     // path factorises on its own stable copy of the matrix, and doing both cost 1,608 extra level launches
     // per outer iteration on sbMatched.
-    static const bool hostLoop = std::getenv("BRAE_BICG_HOST_LOOP") != nullptr;
+    static const bool hostLoop = std::getenv("BRAE_BICG_HOST_LOOP") != nullptr || !braeCondGraphsAvailable();
     static bool announcedHost = false;
     if (hostLoop && !announcedHost)
     {
         announcedHost = true;
         std::printf("  BiCGStab: host loop (BRAE_BICG_HOST_LOOP set; 2 host syncs per iteration)\n");
     }
-    if (checkEvery <= 1 && !hostLoop)
+    // (a decomposed mesh -- A.proc -- takes the host loop: its collectives cannot sit in the conditional body yet)
+    if (checkEvery <= 1 && !hostLoop && !A.proc.active())
     {
         static thread_local auto& dNf = *new DeviceBuffer<scalar>(1);
         cudaMemcpyAsync(dNf.data(), &normFactor, sizeof(scalar), cudaMemcpyHostToDevice, cudaStreamPerThread);
@@ -652,7 +681,9 @@ DeviceSolverPerf deviceJacobiBiCGStab(
     // corrector), so the factorisation is rebuilt here rather than cached with the schedule.
     if (precon && precon->valid) diluUpdate(A, *const_cast<DeviceDilu*>(precon));
     DeviceBuffer<scalar> polyT, polyAt;                          // the Neumann series' two work vectors
-    if (polyDeg > 1) { polyT.resize(nC); polyAt.resize(nC); }
+    // a decomposed mesh (A.proc): the operands of A*x -- psi, yA, zA and the Neumann series' t -- carry the halo tail
+    const std::size_t halo = deviceProcHalo(A.proc);
+    if (polyDeg > 1) { polyT.setTail(halo); polyT.resize(nC); polyAt.resize(nC); }
     auto applyPrecon = [&](DeviceBuffer<scalar>& out, const DeviceBuffer<scalar>& in)
     {
         // asymmetric = true: this solver is the one the asymmetric matrix takes, so the V-cycle's coarsest
@@ -663,7 +694,7 @@ DeviceSolverPerf deviceJacobiBiCGStab(
         else                              deviceJacobi(out, in, A.diag);
     };
     const int K = (checkEvery > 1) ? checkEvery : 1;             // convergence-read cadence (1 = exact per-iter)
-    DeviceBuffer<scalar> rA(nC), rA0(nC), pA(nC), yA(nC), AyA(nC), sA(nC), zA(nC), tA(nC), Ax(nC);
+    DeviceBuffer<scalar> rA(nC), rA0(nC), pA(nC), yA(nC, halo), AyA(nC), sA(nC), zA(nC, halo), tA(nC), Ax(nC);
 
     deviceAmul(A, psi, Ax, /*onField=*/true);                // rA = b - A*psi, the field's own product
     deviceCopy(rA, b);
@@ -771,7 +802,7 @@ DeviceSolverPerf deviceJacobiBiCGStab(
             "diagonal).");
     }
 #ifdef BRAE_HAS_GS_DEVICE
-    static const bool hostLoop = std::getenv("BRAE_GS_HOST_LOOP") != nullptr || std::getenv("BRAE_BICG_HOST_LOOP") != nullptr;
+    static const bool hostLoop = std::getenv("BRAE_GS_HOST_LOOP") != nullptr || std::getenv("BRAE_BICG_HOST_LOOP") != nullptr || !braeCondGraphsAvailable();
     if (checkEvery <= 1 && !hostLoop && !normFactorOnHost())
     {
         DeviceSolverPerf gp;

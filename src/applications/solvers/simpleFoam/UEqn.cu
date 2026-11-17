@@ -1,4 +1,5 @@
 // CUDA implementation -- see UEqn.cuh for the provenance and the contract with the _cpp reference.
+#include "device_processor_ops.cuh"
 #include "UEqn.cuh"
 #include "device_inter_ueqn.cuh"
 #include "device_blas.cuh"
@@ -105,6 +106,128 @@ void refuseUnsupported(const MomentumInput& in)
         throw std::runtime_error(
             "UEqn(cuda): a cached grad(U) is carried on an uncoupled mesh with an unlimited Gauss grad(U) only.");
 }
+// The processor counterpart of the cyclic helpers below. Processor faces already have their interpolated
+// value in the boundary slot, so the base Gauss gradient needs no second owner-side contribution; only the
+// neighbour cell / gradient reads go through the halo interface.
+DeviceProcCtx* procForUEqn(const MomentumInput& in, const DeviceMesh& dm)
+{
+    return in.interOrder && DeviceProcCtx::active(dm) ? DeviceProcCtx::current() : nullptr;
+}
+
+void exchangeUGradients(
+    DeviceProcCtx* proc,
+    DeviceBuffer<scalar>* gx,
+    DeviceBuffer<scalar>* gy,
+    DeviceBuffer<scalar>* gz)
+{
+    if (!proc) return;
+    procExchange(*proc,
+                 {&gx[0], &gx[1], &gx[2], &gy[0], &gy[1], &gy[2], &gz[0], &gz[1], &gz[2]},
+                 "grad(U)");
+}
+
+void addProcessorLapCorrection(
+    DeviceProcCtx* proc,
+    const DeviceBuffer<scalar>& nuCell,
+    const DeviceBuffer<scalar>* U[3],
+    DeviceBuffer<scalar>* gx,
+    DeviceBuffer<scalar>* gy,
+    DeviceBuffer<scalar>* gz,
+    scalar limitCoeff,
+    DeviceBuffer<scalar>* source,
+    const char* what)
+{
+    if (!proc) return;
+    DeviceBuffer<scalar> corr[3];
+    deviceCyclicLapCorrFluxVec(proc->cyc(), nuCell, U, gx, gy, gz, limitCoeff, corr);
+    for (int k = 0; k < 3; ++k)
+    {
+        deviceCyclicAddToOwner(proc->cyc(), corr[k], scalar(1), source[k]);
+    }
+    (void)what;
+}
+
+constexpr int TPB = 256;
+inline int nBlocks(int n) { return (n + TPB - 1) / TPB; }
+
+__global__ void limitedVFluxCorrectionKernel(
+    int n,
+    const label* __restrict__ own,
+    CyclicNbr nbr,
+    const scalar* __restrict__ weight,
+    const scalar* __restrict__ phi,
+    const scalar* __restrict__ U,
+    scalar* __restrict__ corr,
+    const label* __restrict__ ownerRank,
+    int ownerPass)
+{
+    const int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n || (ownerRank && ownerRank[j] != ownerPass)) return;
+    const int o = own[j];
+    const scalar w = weight[j];
+    const scalar uf = w*U[o] + (scalar(1) - w)*cyclicNbrValue(nbr, U, j);
+    const scalar up = phi[j] >= scalar(0) ? U[o] : cyclicNbrValue(nbr, U, j);
+    atomicAdd(&corr[o], phi[j]*(uf - up));
+}
+
+void deviceCyclicLimitedVFluxCorrection(
+    const DeviceCyclic& cyc,
+    int comp,
+    const DeviceBuffer<scalar>& weights,
+    const DeviceBuffer<scalar>& flux,
+    const DeviceBuffer<scalar>* U[3],
+    int nC,
+    DeviceBuffer<scalar>& corr)
+{
+    corr.resize(static_cast<std::size_t>(nC));
+    if (nC > 0)
+    {
+        cudaCheck(cudaMemsetAsync(corr.data(), 0, static_cast<std::size_t>(nC)*sizeof(scalar),
+                                  cudaStreamPerThread), "limitedV correction zero");
+    }
+    for (int ownerPass = 0; ownerPass < cyc.ownerPasses(); ++ownerPass)
+    {
+        limitedVFluxCorrectionKernel<<<nBlocks(cyc.n), TPB>>>(
+            cyc.n, cyc.ownCell.data(), cyc.nbr(), weights.data(), flux.data(), U[comp]->data(), corr.data(),
+            cyc.ownerRank(), cyc.ownerPass(ownerPass));
+    }
+    cudaCheck(cudaGetLastError(), "limitedV flux correction");
+}
+
+void addProcessorLinearUpwindV(
+    DeviceProcCtx* proc,
+    const DeviceBuffer<scalar>& phiBnd,
+    const DeviceBuffer<scalar>* U[3],
+    DeviceBuffer<scalar>* gx,
+    DeviceBuffer<scalar>* gy,
+    DeviceBuffer<scalar>* gz,
+    scalar twoByk,
+    DeviceBuffer<scalar>* source)
+{
+    if (!proc) return;
+    const int nC = U[0]->size();
+    DeviceBuffer<scalar> packed(9*static_cast<std::size_t>(nC));
+    for (int k = 0; k < 3; ++k)
+    {
+        cudaCheck(cudaMemcpyAsync(packed.data() + static_cast<std::size_t>(k)*nC, gx[k].data(),
+                                  nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread),
+                  "linearUpwindV grad(U) x");
+        cudaCheck(cudaMemcpyAsync(packed.data() + static_cast<std::size_t>(3+k)*nC, gy[k].data(),
+                                  nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread),
+                  "linearUpwindV grad(U) y");
+        cudaCheck(cudaMemcpyAsync(packed.data() + static_cast<std::size_t>(6+k)*nC, gz[k].data(),
+                                  nC*sizeof(scalar), cudaMemcpyDeviceToDevice, cudaStreamPerThread),
+                  "linearUpwindV grad(U) z");
+    }
+    DeviceBuffer<scalar> weights, flux, corr[3];
+    procGather(*proc, phiBnd, flux);
+    deviceCyclicLimitedVWeights(proc->cyc(), *U[0], *U[1], *U[2], packed, nC, twoByk, weights);
+    for (int k = 0; k < 3; ++k)
+    {
+        deviceCyclicLimitedVFluxCorrection(proc->cyc(), k, weights, flux, U, nC, corr[k]);
+        deviceCyclicAddToOwner(proc->cyc(), corr[k], scalar(1), source[k]);
+    }
+}
 
 } // namespace
 
@@ -132,6 +255,20 @@ void assembleUEqn(
     // source was 5.9392e-11 of 9.9062e-04 from the host arm, H 5.3135e-05 of 8.6143e+02 once divided
     // by V, HbyA 5.0952e-09 and U 3.6174e-09 -- against 1.5959e-15 for the same case meshed with no
     // pair at all.
+    DeviceProcCtx* const proc = procForUEqn(in, dm);
+    if (proc)
+    {
+        procExchange(*proc, {const_cast<DeviceBuffer<scalar>*>(&Ux), const_cast<DeviceBuffer<scalar>*>(&Uy),
+                             const_cast<DeviceBuffer<scalar>*>(&Uz)}, "U");
+        procExchange(*proc, {const_cast<DeviceBuffer<scalar>*>(in.nuEffCell)}, "nuEff");
+        // The shared memo owns these arrays. Refresh the processor values in place; its fingerprint still
+        // its fingerprint still sees the same boundary buffer and the same cell state.
+        GradUMemo& memo = const_cast<GradUMemo&>(deviceGradUShared(dm, dbU, Ux, Uy, Uz, in.UbStored));
+        for (int k = 0; k < 3; ++k)
+        {
+            procFaceValue(*proc, k == 0 ? Ux : k == 1 ? Uy : Uz, memo.ub[k]);
+        }
+    }
     const DeviceBuffer<scalar>* UForGrad[3] = {&Ux, &Uy, &Uz};
     if (in.cyc && in.cyc->n > 0)
     {
@@ -165,11 +302,20 @@ void assembleUEqn(
                                   DeviceBuffer<scalar>& nbrOut,
                                   CellLimitInterface* ifs) -> int
     {
-        if (!(in.cyc && in.cyc->n > 0)) return 0;
-        deviceCyclicNbrValue(*in.cyc, *(k == 0 ? &Ux : k == 1 ? &Uy : &Uz), Ux, Uy, Uz, k, nbrOut);
-        ifs[0] = { in.cyc->n, in.cyc->ownCell.data(), nbrOut.data(),
-                   in.cyc->dOwnX.data(), in.cyc->dOwnY.data(), in.cyc->dOwnZ.data() };
-        return 1;
+        int n = 0;
+        if (in.cyc && in.cyc->n > 0)
+        {
+            deviceCyclicNbrValue(*in.cyc, *(k == 0 ? &Ux : k == 1 ? &Uy : &Uz), Ux, Uy, Uz, k, nbrOut);
+            ifs[n++] = { in.cyc->n, in.cyc->ownCell.data(), nbrOut.data(),
+                         in.cyc->dOwnX.data(), in.cyc->dOwnY.data(), in.cyc->dOwnZ.data() };
+        }
+        if (proc)
+        {
+            deviceCyclicNbrValue(proc->cyc(), *(k == 0 ? &Ux : k == 1 ? &Uy : &Uz), Ux, Uy, Uz, k, nbrOut);
+            ifs[n++] = { proc->nFaces(), proc->cyc().ownCell.data(), nbrOut.data(),
+                         proc->cyc().dOwnX.data(), proc->cyc().dOwnY.data(), proc->cyc().dOwnZ.data() };
+        }
+        return n;
     };
     auto addPairToGrad = [&](int k,
                              DeviceBuffer<scalar>& gx,
@@ -179,6 +325,13 @@ void assembleUEqn(
         if (!in.cyc || in.cyc->n == 0) return;
         deviceCyclicAddGrad(*in.cyc, *UForGrad[k], dm.V, gx, gy, gz);
     };
+    auto exchangeMemoGradients = [&]()
+    {
+        if (!proc) return;
+        GradUMemo& memo = const_cast<GradUMemo&>(deviceGradUShared(dm, dbU, Ux, Uy, Uz, in.UbStored));
+        exchangeUGradients(proc, memo.gx, memo.gy, memo.gz);
+    };
+    exchangeMemoGradients();
 
     // The terms that sit in a different place in the two assembly orders (MomentumInput::interOrder), as
     // functions of the matrix so far, called once from whichever position the order puts them in.
@@ -221,7 +374,7 @@ void assembleUEqn(
                         deviceBCValue(dbU.comp[k], *U[k], ubv);
                         ub = &ubv;
                     }
-                    CellLimitInterface ifs[1];
+                    CellLimitInterface ifs[2];
                     const int nIfs = pairLimitInterface(k, nbrOut, ifs);
                     deviceCellLimitGrad(dm, *U[k], *ub, gxc[k], gyc[k], gzc[k], in.gradUSchemeLimitK,
                                         nIfs > 0 ? ifs : nullptr, nIfs);
@@ -268,6 +421,8 @@ void assembleUEqn(
                     deviceCyclicAddToOwner(*in.cyc, ffcIf[k], scalar(1), M.source[k]);
                 }
             }
+            addProcessorLapCorrection(proc, *in.nuEffCell, U, gxc, gyc, gzc, in.snGradLimitCoeff,
+                                      M.source, "UEqn non-orthogonal correction");
         }
     };
 
@@ -302,13 +457,15 @@ void assembleUEqn(
                 addPairToGrad(k, gx[k], gy[k], gz[k]);
                 if (in.gradULimitK > 0.0)
                 {
-                    CellLimitInterface ifs[1];
+                    CellLimitInterface ifs[2];
                     DeviceBuffer<scalar> nbr;
                     const int nIfs = pairLimitInterface(k, nbr, ifs);
                     deviceCellLimitGrad(dm, *Usrc[k], gm.ub[k], gx[k], gy[k], gz[k], in.gradULimitK, ifs, nIfs);
                 }
             }
             deviceLinearUpwindVCorr(dm, *in.phiInt, gx, gy, gz, Ux, Uy, Uz, cx, cy, cz);
+            addProcessorLinearUpwindV(proc, *in.phiBnd, Usrc, gx, gy, gz,
+                                      2.0 / std::fmax(in.schemeCoeff, 1e-15), M.source);
             const DeviceBuffer<scalar>* cc[3] = {&cx, &cy, &cz};
             for (int k = 0; k < 3; ++k) deviceAxpy(-1.0, *cc[k], M.source[k]);
         }
@@ -334,7 +491,7 @@ void assembleUEqn(
                 // `linearUpwind <name>` where <name> resolves to `cellLimited Gauss linear <k>`.
                 if (in.gradULimitK > 0.0)
                 {
-                    CellLimitInterface ifs[1];
+                    CellLimitInterface ifs[2];
                     DeviceBuffer<scalar> nbr;
                     const int nIfs = pairLimitInterface(k, nbr, ifs);
                     deviceCellLimitGrad(dm, *U[k], gm.ub[k], gxA[k], gyA[k], gzA[k], in.gradULimitK, ifs, nIfs);
@@ -358,6 +515,12 @@ void assembleUEqn(
                             "(MomentumInput::cycConvFlux). Refusing rather than weighting it with the "
                             "interface's volumetric phi on an equation that convects with rhoPhi.");
                     deviceCyclicAddLinUpwindCorr(*in.cyc, k, gxA, gyA, gzA, lu, in.cycConvFlux);
+                }
+                if (proc)
+                {
+                    DeviceBuffer<scalar> procLuFlux;
+                    procGather(*proc, *in.phiBnd, procLuFlux);    // the interface's own face order, not the boundary array
+                    deviceCyclicAddLinUpwindCorr(proc->cyc(), k, gxA, gyA, gzA, lu, &procLuFlux);
                 }
                 deviceAxpy(-corrFac, lu, M.source[k]);
             }
@@ -498,6 +661,11 @@ void assembleUEqn(
                 ? kVanLeerTwoByk
                 : 2.0 / std::fmax(in.schemeCoeff, 1e-15);
             deviceDivLimitedVCoeffs(dm, *in.phiInt, Uarr, gx, gy, gz, twoByk, M.diag, M.upper, M.lower);
+            if (proc)
+            {
+                const DeviceBuffer<scalar>* up[3] = {&Uarr[0], &Uarr[1], &Uarr[2]};
+                addProcessorLinearUpwindV(proc, *in.phiBnd, up, gx, gy, gz, twoByk, M.source);
+            }
             break;
         }
         case cpu::DivScheme::limitedLinear:
@@ -524,6 +692,19 @@ void assembleUEqn(
             deviceDivLimitedCoeffs(dm, *in.phiInt, mag2, gx, gy, gz,
                                    2.0 / std::fmax(in.schemeCoeff, 1e-15),
                                    M.diag, M.upper, M.lower);
+            if (proc)
+            {
+                DeviceBuffer<scalar> procFlux, weights, corr[3];
+                procGather(*proc, *in.phiBnd, procFlux);
+                deviceCyclicLimitedWeights(proc->cyc(), mag2, gx, gy, gz,
+                                           2.0 / std::fmax(in.schemeCoeff, 1e-15), weights);
+                for (int k = 0; k < 3; ++k)
+                {
+                    deviceCyclicLimitedVFluxCorrection(proc->cyc(), k, weights, procFlux, U3,
+                                                       dm.nCells, corr[k]);
+                    deviceAxpy(-1.0, corr[k], M.source[k]);
+                }
+            }
             break;
         }
         case cpu::DivScheme::linear:
@@ -590,6 +771,20 @@ void assembleUEqn(
         deviceAxpy(-1.0, lIC, M.iC[k]);
         deviceAxpy(-1.0, lBC, M.bC[k]);
     }
+    // A PROCESSOR PATCH is a boundary patch with a placeholder field here: its convection coefficient phi_b*1 would
+    // be folded into the diagonal (A(), the solve) on top of the interface's own terms, which the processor
+    // assembly (addProcessor...) already put into diag/ifCoeff. Its true boundary coefficients are zero.
+    if (DeviceProcCtx::active(dm) && DeviceProcCtx::current()->nFaces() > 0)
+    {
+        const DeviceProcCtx& pc = *DeviceProcCtx::current();
+        for (int k = 0; k < 3; ++k)
+        {
+            if (M.iC[k].size() < static_cast<std::size_t>(pc.bndStart() + pc.nFaces()) || M.bC[k].size() < static_cast<std::size_t>(pc.bndStart() + pc.nFaces()))
+                throw std::runtime_error("UEqn(cuda): the boundary coefficients have no processor segment.");
+            cudaCheck(cudaMemsetAsync(M.iC[k].data() + pc.bndStart(), 0, static_cast<std::size_t>(pc.nFaces())*sizeof(scalar), cudaStreamPerThread), "zero processor iC");
+            cudaCheck(cudaMemsetAsync(M.bC[k].data() + pc.bndStart(), 0, static_cast<std::size_t>(pc.nFaces())*sizeof(scalar), cudaStreamPerThread), "zero processor bC");
+        }
+    }
 
     // ---- `bounded`: - fvm::Sp(fvc::div(phi), U) ---------------------------------------------
     // Before relax, as OpenFOAM does. deviceDiv returns the per-volume divergence, so the extensive
@@ -611,7 +806,7 @@ void assembleUEqn(
         DeviceBuffer<scalar> t[3];
         deviceDivDevReff(dm, dbU, Ux, Uy, Uz, *in.nuEffCell, *in.nuEffBndFace,
                          t[0], t[1], t[2],
-                         in.cyc, /*ami*/nullptr, /*proc*/nullptr, in.UbStored,
+                         in.cyc, /*ami*/nullptr, in.UbStored,
                          in.gradUSchemeLimitK,
                          in.gradUSchemeLeastSq,
                          in.gradUGivenTensor,
@@ -636,7 +831,7 @@ void assembleUEqn(
         // HbyA 5.3e-04 of 1.9e+00 at the pair's own cells and U 2.1e-04 by the end of the step.
         deviceDivDevReff(dm, dbU, Ux, Uy, Uz, *in.nuEffCell, *in.nuEffBndFace,
                          M.source[0], M.source[1], M.source[2],
-                         in.cyc, /*ami*/nullptr, /*proc*/nullptr, in.UbStored,
+                         in.cyc, /*ami*/nullptr, in.UbStored,
                          // The gradSchemes `grad(U)` entry, which linearViscousStress.C:114's fvc::grad(U)
                          // resolves. These five arguments fell through to their defaults, so the case's
                          // limiter never reached the dev2 term on this driver -- the legacy one has passed
@@ -714,6 +909,17 @@ void assembleUEqn(
         // on MomentumMatrix::cycIfCoeff.
         deviceCopy(M.cycIfCoeff, in.cyc->ifCoeff);
     }
+    // The processor interface has its own coefficient array for the same reason. DeviceProcView's sign
+    // is the same as the cyclic assembly's: Apsi[own] += coeff*psi[halo].
+    if (proc)
+    {
+        // the convecting flux of the processor faces, in the interface's own face order (phiBnd is the boundary array)
+        DeviceBuffer<scalar> procConvFlux;
+        procGather(*proc, *in.phiBnd, procConvFlux);
+        deviceCyclicAssembleMomentum(proc->cyc(), *in.nuEffCell, M.diag, nullptr,
+                                     in.cycCorrected || in.cycNonOrth, &procConvFlux);
+        deviceCopy(M.procIfCoeff, proc->cyc().ifCoeff);
+    }
 
     if (!in.interOrder)
     {
@@ -745,8 +951,19 @@ void assembleUEqn(
                                       cudaStreamPerThread), "cyclic sumOff zero");
             deviceCyclicOffDiagSum(*in.cyc, cycSumOff);
         }
+        if (proc)
+        {
+            if (cycSumOff.size() == 0)
+            {
+                cycSumOff.resize(static_cast<std::size_t>(dm.nCells));
+                cudaCheck(cudaMemsetAsync(cycSumOff.data(), 0,
+                                          static_cast<std::size_t>(dm.nCells)*sizeof(scalar),
+                                          cudaStreamPerThread), "processor sumOff zero");
+            }
+            deviceCyclicOffDiagSum(proc->cyc(), cycSumOff);
+        }
         deviceRelaxDiag(A, dm, M.iC[0], in.relaxU, M.relaxedDiag, M.delta,
-                        (in.cyc && in.cyc->n > 0) ? cycSumOff.data() : nullptr,
+                        (cycSumOff.size() > 0) ? cycSumOff.data() : nullptr,
                         iCmaxMag.data(), iCmin.data());
         M.relaxed = true;
 

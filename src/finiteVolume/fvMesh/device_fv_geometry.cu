@@ -547,7 +547,7 @@ bool refreshDeviceMeshFromDeviceGeometry(
         face.reserve(sB);
         for (const FvPatch& p : fvp)
         {
-            if (isCoupledInterfaceType(p.type)) continue;
+            if (isCyclicFamilyType(p.type)) continue;
             for (label i = 0; i < p.size; ++i)
             {
                 face.push_back(p.start + i);

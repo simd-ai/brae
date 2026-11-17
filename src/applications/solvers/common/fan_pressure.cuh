@@ -70,7 +70,7 @@ inline std::vector<DeviceSimpleSolver::FanPressure> collectFanPressure(
     label start = 0;
     for (const FvPatch& fp : patches)
     {
-        if (isCoupledInterfaceType(fp.type)) continue;   // DeviceBoundary order skips these
+        if (isCyclicFamilyType(fp.type)) continue;   // DeviceBoundary order skips these
         const FoamDict* b = bf->subDict(fp.name);
         if (b && b->wordOr("type", "") == "fanPressure")
         {
@@ -189,7 +189,7 @@ inline std::vector<DeviceSimpleSolver::FixedMean> collectFixedMean(
     label start = 0;
     for (const FvPatch& fp : patches)
     {
-        if (isCoupledInterfaceType(fp.type)) continue;   // DeviceBoundary order skips these
+        if (isCyclicFamilyType(fp.type)) continue;   // DeviceBoundary order skips these
         const FoamDict* b = bf->subDict(fp.name);
         if (b && b->wordOr("type", "") == "fixedMean")
         {

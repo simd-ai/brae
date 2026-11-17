@@ -1,6 +1,7 @@
 // One pass of pEqn.H -- see device_inter_pressure_step.cuh for the three placements it owns.
 #include "inter_phase_time.cuh"
 #include "device_inter_pressure_step.cuh"
+#include "device_processor_ops.cuh"
 #include "device_fvc_reconstruct.cuh"
 #include "device_blas.cuh"
 #include "device_ldu.cuh"
@@ -14,6 +15,24 @@
 #include <cstring>
 #include <string>
 #include <vector>
+// Kept out of device_amg_detail.cuh: that header also defines nBlocks/TPB in brae's namespace.
+// This is the same driver/toolkit gate the other solver dispatchers use.
+inline bool pressureCondGraphsAvailable()
+{
+    static const bool ok = []()
+    {
+#if CUDART_VERSION >= 12040
+        if (const char* e = std::getenv("BRAE_COND_GRAPH")) return e[0] != '0';
+        int drv = 0;
+        if (cudaDriverGetVersion(&drv) != cudaSuccess || drv < 12040) return false;
+        return true;
+#else
+        return false;
+#endif
+    }();
+    return ok;
+}
+
 
 namespace brae {
 namespace {
@@ -33,6 +52,13 @@ __global__ void subKernel(const scalar* __restrict__ a, const scalar* __restrict
 {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] = a[i] - b[i];
+}
+
+__global__ void mulKernel(const scalar* __restrict__ a, const scalar* __restrict__ b,
+                          int n, scalar* __restrict__ out)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = a[i] * b[i];
 }
 
 // phiHbyA += phig on the pair's faces, the interface twin of addPhigBoundaryKernel -- and `a += b` on any
@@ -62,7 +88,7 @@ constexpr label GAMG_HOST_MAX_CELLS = 2000000;
 bool gamgSolveOnHost(const DeviceLduView& A)
 {
     static const char* const forced = std::getenv("BRAE_DEVICE_GAMG");
-    const bool pair = A.nCyc > 0 || A.nAmi > 0;
+    const bool pair = A.nCyc > 0 || A.nAmi > 0 || A.proc.active();
     bool host = !pair && A.nCells < GAMG_HOST_MAX_CELLS;
     if (forced && std::string(forced) == "device")
     {
@@ -198,18 +224,81 @@ scalar deviceInterPressureStep(
             deviceCopy(taps->rAUfIf, rAUfIf);
         }
     }
+    DeviceProcCtx* const proc = DeviceProcCtx::active(dm) ? DeviceProcCtx::current() : nullptr;
+    DeviceBuffer<scalar> procPhig, procRhoRAU, procDdt;
+    if (proc)
+    {
+        procExchange(*proc, {const_cast<DeviceBuffer<scalar>*>(&rAU),
+                             const_cast<DeviceBuffer<scalar>*>(in.rho)}, "rAU and rho");
+        deviceCyclicFaceValue(proc->cyc(), rAU, procRhoRAU);
+        // rAUfAll is a full-face array: the processor segment is behind the nIf internal faces
+        procScatter(*proc, procRhoRAU, const_cast<DeviceBuffer<scalar>&>(*in.rAUfAll).data() + nIf);
+        // phig's three face fields were formed by interfaceForces on the processor faces already.
+        DeviceBuffer<scalar> stfP, ghfP, snRhoP;
+        // stf, ghf and snGrad(rho) are full-face arrays (the internal faces first): the processor segment sits
+        // at nIf + bndStart
+        const auto gatherFull = [&](const DeviceBuffer<scalar>& full, DeviceBuffer<scalar>& out)
+        {
+            out.resize(static_cast<std::size_t>(proc->nFaces()));
+            if (proc->nFaces() == 0) return;
+            if (full.size() < static_cast<std::size_t>(nIf) + static_cast<std::size_t>(proc->bndStart() + proc->nFaces()))
+            {
+                throw std::runtime_error("brae interFoam pressure step: a full-face array has no processor segment.");
+            }
+            ckS(cudaMemcpyAsync(out.data(), full.data() + nIf + proc->bndStart(),
+                                static_cast<std::size_t>(proc->nFaces())*sizeof(scalar), cudaMemcpyDeviceToDevice,
+                                cudaStreamPerThread), "gather from a full-face array");
+        };
+        gatherFull(*in.stf, stfP);
+        gatherFull(*in.ghf, ghfP);
+        gatherFull(*in.snGradRho, snRhoP);
+        deviceBuoyancyFlux(proc->nFaces(), stfP, ghfP, snRhoP, procRhoRAU,
+                           proc->cyc().magSf, procPhig);
+    }
 
     // interpolate(rho*rAU) -- the PRODUCT, interpolated once; see device_inter_peqn.cuh note 2.
     DeviceBuffer<scalar> rhoRAUf;
     deviceRhoRAUf(dm, *in.rho, rAU, rhoRAUf);
+    if (proc)
+    {
+        DeviceBuffer<scalar> cellProduct = makeCellBuffer<scalar>(dm);
+        // the product over the OWNED cells AND the halo (both factors' halos are current): deviceHadamard
+        // leaves the tail it did not compute at zero, which weighted every processor face by half its value
+        const int nExt = proc->nCellsExt();
+        mulKernel<<<(nExt + 255)/256, 256, 0, cudaStreamPerThread>>>(in.rho->data(), rAU.data(), nExt, cellProduct.data());
+        ckS(cudaGetLastError(), "rho*rAU over the halo");
+        deviceCyclicFaceValue(proc->cyc(), cellProduct, procRhoRAU);
+    }
 
     DeviceBuffer<scalar> zeroIf(static_cast<std::size_t>(nIf));
     if (nIf > 0) ckS(cudaMemset(zeroIf.data(), 0, sizeof(scalar)*nIf), "zero");
     // pEqn.H:13-19: + interpolate(rho*rAU)*ddtCorr, then MRF.makeRelative
+    // the processor faces' ddtCorr is added below with the interpolated rho*rAU; the generic boundary path must not
+    // add its own (placeholder-weighted) copy of it as well, so it sees the boundary array with that segment zero
+    DeviceBuffer<scalar> ddtBndNoProc;
+    const DeviceBuffer<scalar>* ddtBndForGeneric = in.ddtCorrBnd;
+    if (proc && in.ddtCorrBnd)
+    {
+        deviceCopy(ddtBndNoProc, *in.ddtCorrBnd);
+        ckS(cudaMemsetAsync(ddtBndNoProc.data() + proc->bndStart(), 0,
+                            static_cast<std::size_t>(proc->nFaces())*sizeof(scalar), cudaStreamPerThread),
+            "zero the processor segment of ddtCorr for the generic path");
+        ddtBndForGeneric = &ddtBndNoProc;
+    }
     deviceInterAddDdtCorrTerms(dm, rhoRAUf,
                                in.ddtCorrInt ? *in.ddtCorrInt : zeroIf, in.ddtCorrInt != nullptr,
                                phiHbyAInt, phiHbyABnd, in.mrf,
-                               in.ddtCorrBnd, in.rhoBndFace, &rAU, in.bndUFixesValue);
+                               ddtBndForGeneric, in.rhoBndFace, &rAU, in.bndUFixesValue);
+    if (proc && in.ddtCorrBnd)
+    {
+        procGather(*proc, *in.ddtCorrBnd, procDdt);
+        DeviceBuffer<scalar> weighted;
+        deviceHadamard(weighted, procDdt, procRhoRAU);
+        DeviceBuffer<scalar> phiProc;
+        procGather(*proc, phiHbyABnd, phiProc);
+        deviceAxpy(scalar(1), weighted, phiProc);
+        procScatter(*proc, phiProc, phiHbyABnd);
+    }
 
     // pEqn.H:21-26 -- `if (p_rgh.needReference()) { fvc::makeRelative(phiHbyA, U);
     // adjustPhi(phiHbyA, U, p_rgh); fvc::makeAbsolute(phiHbyA, U); }` -- transcribed from the host's
@@ -288,8 +377,17 @@ scalar deviceInterPressureStep(
         // a moving mesh the wall flux is not zero, the wall moves.
         deviceCopy(taps->phiHbyABndPrePhig, phiHbyABnd);
     }
+    DeviceBuffer<scalar> phiHbyABndBeforeProc;
+    if (proc) deviceCopy(phiHbyABndBeforeProc, phiHbyABnd);
     // pEqn.H:36
     deviceInterAddPhig(dm, phigInt, phigBnd, phiHbyAInt, phiHbyABnd);
+    // (the processor faces' phig is in phigBnd already -- rAUfAll's and stf/ghf/snGrad(rho)'s processor segments are
+    // set -- and deviceInterAddPhig added it above; adding procPhig on top of it counted it twice)
+    if (proc && taps)
+    {
+        deviceCopy(taps->phigBndTap, procPhig);
+        deviceCopy(taps->phiHbyABndPrePhig, phiHbyABndBeforeProc);
+    }
 
     // rAUf on the internal faces -- the head of the full array the caller passed.
     DeviceBuffer<scalar> rAUfInt(static_cast<std::size_t>(nIf));
@@ -306,7 +404,11 @@ scalar deviceInterPressureStep(
     // constructor's updateCoeffs (pressureCoeffs), the laplacian, its explicit correction from the p_rgh
     // the last pass left, the solve, and p_rgh.correctBoundaryConditions(). The LAST pass's matrix and
     // correction flux make p_rghEqn.flux().
-    DevicePressureMatrix P;
+    // THE MATRIX'S BUFFERS OUTLIVE THE CALL, one set a rank thread (leaked, like the other device caches): a captured
+    // V-cycle is keyed on where the matrix lives (amgGraphViewMoved), and buffers made afresh at every corrector came
+    // back from the pool at other addresses, so the graph was captured and instantiated again at nearly every solve.
+    // Every entry is written below before it is read, as it always had to be: the pool's blocks are not cleared.
+    static thread_local DevicePressureMatrix& P = *new DevicePressureMatrix;
     DeviceBuffer<scalar> iC, bC;
     // p_rgh's jump on the pair, refreshed by the hook at every assembly; empty = no jump there
     DeviceBuffer<scalar> cycJump;
@@ -335,6 +437,15 @@ scalar deviceInterPressureStep(
         {
             DeviceBuffer<scalar> bval, gx, gy, gz;
             hooks.boundaryValues(p_rgh, bval);
+            // ...AND A PROCESSOR FACE IS A COUPLED FACE: fvc::grad's Gauss sum takes the INTERPOLATED value there,
+            // w*p[own] + (1-w)*p[nbr] (surfaceInterpolationScheme.C:186-191; gaussGrad::correctBoundaryConditions
+            // leaves a coupled patch alone, gaussGrad.C:218), where the hook's entry is the patch's own evaluate.
+            // Taking that evaluate put ~p[nbr] on the face, a gradient wrong in every cell on the interface.
+            if (proc)
+            {
+                procExchange(*proc, {&p_rgh}, "p_rgh for grad(p_rgh)'s processor faces");
+                procFaceValue(*proc, p_rgh, bval);
+            }
             // THE CASE'S OWN gradSchemes ENTRY, through deviceGradOf. A leastSquares fit takes the pair
             // INSIDE it (deviceLeastSquaresGrad's `cyc` argument, leastSquaresVectors.C:131-140) where the
             // Gauss path adds the pair's faces AFTERWARDS -- so the two are wired differently below, and a
@@ -391,6 +502,13 @@ scalar deviceInterPressureStep(
                                         jumpHere ? &cycJump : nullptr, ffcIf);
                 deviceCyclicAddToOwner(*in.cyc, ffcIf, scalar(-1), corrSource);
             }
+            if (proc)
+            {
+                procExchange(*proc, {&p_rgh, &gx, &gy, &gz}, "p_rgh and grad(p_rgh)");
+                deviceCyclicLapCorrFlux(proc->cyc(), rAU, p_rgh, gx, gy, gz, in.snGradLimitCoeff,
+                                        nullptr, ffcIf);
+                deviceCyclicAddToOwner(proc->cyc(), ffcIf, scalar(-1), corrSource);
+            }
             if (taps && pass == 0) deviceCopy(taps->nonOrthSource, corrSource);
         }
 
@@ -416,15 +534,21 @@ scalar deviceInterPressureStep(
         const bool pcgDIC = lastPass ? in.pcgDIC : in.pcgDICInner;
         const GamgControls* gamg = lastPass ? in.gamg : in.gamgInner;
         const GamgPreconditionerControls* pcgGamg = lastPass ? in.pcgGamg : in.pcgGamgInner;
-        DeviceBuffer<scalar> diagC, b;
+        static thread_local DeviceBuffer<scalar>& diagC = *new DeviceBuffer<scalar>;
+        static thread_local DeviceBuffer<scalar>& b = *new DeviceBuffer<scalar>;
         deviceFold(dm, P.diag, P.source, iC, bC, diagC, b);
         // ...and the periodic pair's off-diagonal, which deviceAmul applies as
         // Apsi[own] += ifCoeff*psi[nbr] (device_ldu.cuh:28-33). Without it the solve is a different
         // operator from the matrix that was assembled.
-        const DeviceLduView A = (in.cyc && in.cyc->n > 0)
+        DeviceLduView A = (in.cyc && in.cyc->n > 0)
             ? deviceLduViewPair(dm, diagC, P.upper, P.lower, *in.cyc,
                                 haveJump ? cycJump.data() : nullptr)
             : deviceLduView(dm, diagC, P.upper, P.lower);
+        if (proc)
+        {
+            A.proc = proc->interfaceView();
+            A.proc.coeff = P.procIfCoeff.data();
+        }
         // THE PRESSURE RULE: brae's AMG-PCG whatever the entry names, with the entry's own stopping controls.
         // BRAE_PRESSURE_CASE_SOLVER=1 runs the case's own entry as ported instead -- what the exact gates
         // against OpenFOAM run (CMakeLists.txt sets it for every test; the user's decisions, 2026-10-03), so
@@ -538,9 +662,10 @@ scalar deviceInterPressureStep(
                                 "BRAE_PRESSURE_DIC_INNER_RELTOL=case keeps the entry's own\n",
                                 static_cast<double>(relTol), static_cast<double>(knobs.dicInnerRelTol));
                 }
-                relTol = knobs.dicInnerRelTol;
             }
-            const bool graph = knobs.graph && !(in.cyc && in.cyc->n > 0);
+            // under -parallel too: the decomposed solve's loop is host-driven there, but its V-cycle is block-local --
+            // no halo, no collective -- and deviceAMGPCG captures it as a graph on the single-precision path
+            const bool graph = knobs.graph && !(in.cyc && in.cyc->n > 0) && pressureCondGraphsAvailable();
             // EXPERIMENT (AmgPcgKnobs::finalTolFactor): the Final solve's tolerance scaled
             scalar tolUsed = tol;
             if (finalPass && knobs.finalTolFactor != scalar(1))
@@ -570,6 +695,36 @@ scalar deviceInterPressureStep(
             perf = deviceAMGPCG(A, amg, b, p_rgh, nf, tolUsed, relTol, maxIter, graph, knobs.checkEvery,
                                 knobs.corrScaling, minIter);
             timedPart.reset();
+        }
+        else if (proc && (gamg || pcgGamg))
+        {
+            // The case's GAMG/PCG-with-GAMG is a serial V-cycle in this port. On a decomposed mesh the
+            // distributed AMG-PCG carries the processor interface in every product and reduction.
+            if (!in.amgPcg)
+            {
+                throw std::runtime_error(
+                    "brae interFoam device pressure step: a decomposed GAMG entry needs the distributed "
+                    "AMG-PCG cache; the case's serial GAMG cannot carry processor faces.");
+            }
+            AMGData& amg = in.amgPcg->get(dm.addressingId);
+            amgGalerkin(amg, diagC, P.upper, P.lower);
+            const scalar nf = deviceNormFactor(A, p_rgh, b, deviceOnes(nC));
+            const DeviceAlphaSolverControls& distSv = lastPass ? in.solve : in.solveInner;
+            perf = deviceAMGPCG(A, amg, b, p_rgh, nf, distSv.tol, distSv.relTol, distSv.maxIter,
+                                /*graph=*/false, amgPcgKnobs().checkEvery, /*corrScaling=*/false,
+                                gamg ? gamg->minIter : 0);
+        }
+        else if (proc && pcgDIC)
+        {
+            // The case's DIC-PCG has the same distributed matrix view as the AMG path. Keep its own
+            // preconditioner and stopping controls rather than substituting the serial DIC on a partial matrix.
+            if (!in.dic)
+            {
+                throw std::runtime_error(
+                    "brae interFoam device pressure step: a decomposed PCG with DIC needs the DIC schedule.");
+            }
+            const scalar nf = deviceNormFactor(A, p_rgh, b, deviceOnes(nC));
+            perf = deviceDICPCG(A, b, p_rgh, nf, sv.tol, sv.relTol, sv.maxIter, 0, *in.dic);
         }
         else if (gamg)
         {
@@ -650,6 +805,10 @@ scalar deviceInterPressureStep(
         {
             in.solveLog->push_back(perf);
         }
+        if (proc)
+        {
+            procExchange(*proc, {&p_rgh}, "p_rgh after solve");
+        }
         // p_rgh.correctBoundaryConditions() after every solve; after the last one the caller does it
         if (!lastPass && hooks.updateBoundary)
         {
@@ -661,6 +820,33 @@ scalar deviceInterPressureStep(
     // fvMatrix::flux() reads upper/lower and the boundary coefficients, not the folded diagonal.
     DeviceBuffer<scalar> fluxInt, fluxBnd;
     deviceInterPEqnFlux(dm, P, iC, bC, p_rgh, fluxInt, fluxBnd, in.correctedLaplacian ? &ffc : nullptr);
+    if (proc)
+    {
+        DeviceBuffer<scalar> procFlux;
+        deviceCyclicPressureFlux(proc->cyc(), p_rgh, procFlux, nullptr, &P.procIfCoeff);
+        procScatter(*proc, procFlux, fluxBnd);
+        if (in.correctedLaplacian && ffcIf.size() == static_cast<std::size_t>(proc->nFaces()))
+        {
+            // The correction belongs to the processor patch, not boundary face zero.
+            deviceAxpy(scalar(1), ffcIf, procFlux);
+            procScatter(*proc, procFlux, fluxBnd);
+        }
+    }
+    DeviceBuffer<scalar> ffProc, rAUfProc;
+    if (proc)
+    {
+        // The processor suffix of fluxBnd already holds p_rghEqn.flux(), including the last
+        // non-orthogonal correction. Keep it for the corrector's face reconstruction and taps.
+        procGather(*proc, fluxBnd, ffProc);
+        deviceAxpy(scalar(-1), ffProc, procPhig);
+        deviceCyclicFaceValue(proc->cyc(), rAU, rAUfProc);
+        if (taps)
+        {
+            deviceCopy(taps->phigIf, procPhig);
+            deviceCopy(taps->rAUfIf, rAUfProc);
+            deviceCopy(taps->ffIf, ffProc);
+        }
+    }
     phiInt.resize(static_cast<std::size_t>(nIf));
     phiBnd.resize(static_cast<std::size_t>(nBf));
     if (nIf > 0)
@@ -729,6 +915,11 @@ scalar deviceInterPressureStep(
                           havePair ? in.cyc : nullptr,
                           havePair ? &ffIf : nullptr,
                           havePair ? &rAUfIf : nullptr);
+    if (proc)
+    {
+        // ffBnd/rAUfBnd's processor suffix already carries (phig-flux)/rAUf into deviceCorrectVelocity;
+        // ffProc/rAUfProc are retained for the stage tap and for the corrector's next processor flux.
+    }
 
     // THE ABSOLUTE FLUX, handed back before the line below makes it relative. pEqn.H runs
     // fvc::correctUf(Uf, U, phi) at :66 and fvc::makeRelative(phi, U) at :69, in that order, so the

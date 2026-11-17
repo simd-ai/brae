@@ -27,7 +27,6 @@ public:
     static bool parRun();     // nProcs() > 1
     static bool master();     // myProcNo() == 0
     static int  deviceId();   // CUDA device this rank is bound to in init(), or -1 if none
-    static bool nvshmemActive();   // true if the NVSHMEM device transport was bootstrapped in init()
 
     // Halo transport: non-blocking scalar buffer exchange (the lduInterface uses these).
     static void isend(const scalar* data, int count, int toProc, int tag);

@@ -102,7 +102,7 @@ int main(int argc, char** argv)
         std::size_t j = 0;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isCyclicFamilyType(fvp[pi].type)) continue;
             const PatchFieldData<vector>* pd = nullptr;
             for (const auto& q : rawU.boundary)
             {

@@ -1,9 +1,11 @@
 // interFoam's createFields -- see inter_case_cpp.cuh for the provenance and for the four things the
 // order of this file encodes.
 #include "inter_case_cpp.cuh"
+#include "inter_parallel.cuh"   // mgpuGeometryOnly
 #include "time_instances.cuh"
 #include "inter_amr_cpp.cuh"
 #include "frozen_bc_guard.cuh"
+#include "proc_globals.cuh"
 #include <sstream>
 #include "crank_nicolson_ddt_scheme_cpp.cuh"
 #include "inter_peqn_cpp.cuh"
@@ -753,6 +755,10 @@ InterFields::PressureReference readPressureReference(
             break;
         }
     }
+    // GeometricField::needReference ends in returnReduceAnd (GeometricField.C:1145): ONE patch that fixes the
+    // value on ONE rank means no rank needs a reference. The sealed-looking rank that does not see the open
+    // patch must not pin its pressure. (No communicator: the identity.)
+    r.needReference = pg::andAll(r.needReference);
     if (!r.needReference) return r;
 
     const FoamDict* pim = fvSolution.subDict("PIMPLE");
@@ -763,12 +769,21 @@ InterFields::PressureReference readPressureReference(
     if (pim->found("pRefCell"))
     {
         r.pRefCell = static_cast<label>(pim->scalarOr("pRefCell", scalar(-1)));
-        if (r.pRefCell < 0 || r.pRefCell >= m.nCells())
+        // findRefCell.C:44-60: under -parallel only the MASTER reads pRefCell (a cell of ITS mesh, checked
+        // against ITS cell count) and every other rank's reference cell is -1
+        if (pg::parallel() && !pg::isMaster())
         {
-            throw std::runtime_error(
-                "brae interFoam: PIMPLE's pRefCell " + std::to_string(r.pRefCell) + " is outside the mesh's "
-                + std::to_string(m.nCells()) + " cells. OpenFOAM stops on the same condition.");
+            r.pRefCell = -1;
         }
+        else if (r.pRefCell < 0 || r.pRefCell >= m.nCells())
+        {
+            const std::string msg =
+                "brae interFoam: PIMPLE's pRefCell " + std::to_string(r.pRefCell) + " is outside the mesh's "
+                + std::to_string(m.nCells()) + " cells. OpenFOAM stops on the same condition.";
+            if (pg::parallel()) pg::fail("Illegal master cellID. " + msg);
+            throw std::runtime_error(msg);
+        }
+        pg::barrier();   // the master's refusal reaches every rank here
     }
     else if (pim->found("pRefPoint"))
     {
@@ -802,9 +817,10 @@ InterFields::PressureReference readPressureReference(
             }
             return true;
         };
-        // primitiveMesh::findNearestCell: the first of the nearest centres
+        // primitiveMesh::findNearestCell: the first of the nearest centres. A rank with no cells holds no
+        // candidate (its search answers -1, as polyMesh::findCell does on an empty mesh).
         label nearest = 0;
-        scalar minProximity = magSqr(g.C()[0] - refPoint);
+        scalar minProximity = m.nCells() > 0 ? magSqr(g.C()[0] - refPoint) : scalar(0);
         for (label celli = 1; celli < m.nCells(); ++celli)
         {
             const scalar proximity = magSqr(g.C()[celli] - refPoint);
@@ -815,7 +831,7 @@ InterFields::PressureReference readPressureReference(
             }
         }
         r.pRefCell = -1;
-        if (pointInCell(nearest))
+        if (m.nCells() > 0 && pointInCell(nearest))
         {
             r.pRefCell = nearest;
         }
@@ -830,8 +846,18 @@ InterFields::PressureReference readPressureReference(
                 }
             }
         }
-        if (r.pRefCell < 0)
+        // findRefCell.C:68-90: every rank searches its own cells; the point must be found on EXACTLY ONE
+        // rank (`sumHasRef`), and only that rank keeps its cell, the others hold -1
+        const long long sumHasRef = pg::sumCount(r.pRefCell >= 0 ? 1 : 0);
+        if (sumHasRef != 1)
         {
+            if (pg::parallel())
+            {
+                throw std::runtime_error(
+                    "brae interFoam: PIMPLE's pRefPoint is found on " + std::to_string(sumHasRef)
+                    + " domains by the face-plane test (it should be one). OpenFOAM then searches again with an "
+                    "octree over the cells' tet decomposition (polyMesh::findCell, CELL_TETS), which is not ported.");
+            }
             throw std::runtime_error(
                 "brae interFoam: PIMPLE's pRefPoint lies in no cell by the face-plane test. OpenFOAM then "
                 "searches again with an octree over the cells' tet decomposition (polyMesh::findCell, "
@@ -946,12 +972,27 @@ std::vector<ClaimedTangentialVelocity> claimTangentialVelocity(
 }   // namespace
 
 
-InterFields buildInterFields(const std::string&          caseDir,
+// the reference-cell reader of createFields.H:104-124, for the callers that hold only a p_rgh, a dictionary and a
+// mesh (the frozen-state multi-rank harness); buildInterFields calls the same function
+InterFields::PressureReference readPressureReferenceOf(
+    const GeometricField<scalar>& p_rgh,
+    const FoamDict& fvSolution,
+    const PrimitiveMesh& m,
+    const FvGeometry& g)
+{
+    return readPressureReference(p_rgh, fvSolution, m, g);
+}
+
+
+InterFields buildInterFields(const CaseRoots&            roots,
                              const std::string&          startDir,
                              const PrimitiveMesh&        m,
                              const FvGeometry&           g,
                              const std::vector<FvPatch>& patches)
 {
+    // The dictionaries (system/, constant/<dictionary>) are the case's; the mesh, its zones and every field
+    // are the rank's (processor<rank> under -parallel, the case itself otherwise).
+    const std::string& caseDir = roots.dictDir;
     InterFields f;
     const label nC = m.nCells();
 
@@ -994,9 +1035,10 @@ InterFields buildInterFields(const std::string&          caseDir,
     f.writeCadence = WriteCadence::read(controlDict);
     for (const FunctionObjectCadence& fo : f.writeCadence.functionObjects)
     {
-        // said per object: the step is the solution's, and this is the one thing of a function object brae keeps
+        // said per object: an object's adjustableRunTime write times trim the step in OpenFOAM, and here too,
+        // whether or not the object itself is one brae runs (inter_function_objects.cuh says which are)
         std::printf("  time step: the write times of function object `%s`, every %g, trim the step as "
-                    "OpenFOAM's Time::adjustDeltaT does; the object itself is not run\n",
+                    "OpenFOAM's Time::adjustDeltaT does\n",
                     fo.name.c_str(), (double)fo.writeInterval);
     }
     f.deltaT    = controlDict.scalarOr("deltaT", scalar(1e-3));
@@ -1356,8 +1398,8 @@ InterFields buildInterFields(const std::string&          caseDir,
         // that starts from rest the two are the same directory; on a genuine restart of a refined or moved
         // mesh they are not, and reading constant/ then gives the START mesh's zones for the mesh the run
         // is actually on -- or none at all.
-        const cpu::timePaths::MeshInstances mi = cpu::timePaths::meshInstancesForStartDir(caseDir, startDir);
-        const std::string facesPolyMeshDir = mi.facesDir(caseDir);
+        const cpu::timePaths::MeshInstances mi = cpu::timePaths::meshInstancesForStartDir(roots.procDir, startDir);
+        const std::string facesPolyMeshDir = mi.facesDir(roots.procDir);
         f.cellZones = readCellZones(facesPolyMeshDir);
         f.amr = std::make_shared<InterAmr>(readInterAmr(caseDir, facesPolyMeshDir, m, patches, g));
         // ...and the change carries them: it renumbers this copy, and the driver reads it back so the
@@ -2025,7 +2067,7 @@ InterFields buildInterFields(const std::string&          caseDir,
             {
                 for (const FvPatch& q : patches)
                 {
-                    if (!isCoupledInterfaceType(q.type)) continue;
+                    if (!isCyclicFamilyType(q.type)) continue;
                     throw std::runtime_error(
                         "brae interFoam: ddtSchemes names CrankNicolson, the start directory holds the "
                         "scheme's state, and patch `" + q.name + "` is `" + q.type + "` -- a coupled pair. "
@@ -2138,7 +2180,7 @@ InterFields buildInterFields(const std::string&          caseDir,
         const FvPatch* firstCoupled = nullptr;
         for (const FvPatch& q : patches)
         {
-            if (isCoupledInterfaceType(q.type) && !q.coupled)
+            if (isCyclicFamilyType(q.type) && !q.coupled)
             {
                 throw std::runtime_error(
                     "brae interFoam: patch `" + q.name + "` is " + q.type + " and its coupling is not "
@@ -2147,6 +2189,13 @@ InterFields buildInterFields(const std::string&          caseDir,
                     "pair once cpu::cyclicACMI::setup() has, and a cyclicAMI pair once "
                     "cpu::cyclicAMIFvPatch::setup() has; processor patches are not ported here. Refused "
                     "rather than run as two walls.");
+            }
+            // A PROCESSOR PATCH IS COUPLED BY THE DEVICE DRIVER, after the host fields have been built with
+            // their inert patch placeholders. It is not a same-mesh cyclic: the halo plan supplies the other
+            // rank's cells and every operator reads them through DeviceProcCtx.
+            if (isProcessorType(q.type))
+            {
+                continue;
             }
             if (q.coupled && !firstCoupled)
             {
@@ -2157,7 +2206,7 @@ InterFields buildInterFields(const std::string&          caseDir,
         // the file's `jump` on the owner is handed across before anything reads it
         for (std::size_t pi = 0; pi < patches.size(); ++pi)
         {
-            if (!patches[pi].coupled || !patches[pi].owner) continue;
+            if (!patches[pi].coupled || !patches[pi].owner || isProcessorType(patches[pi].type)) continue;
             if (const std::vector<scalar>* j = f.p_rgh.boundary[pi]->coupledJump())
             {
                 f.p_rgh.boundary[static_cast<std::size_t>(patches[pi].nbrPatch)]->setOwnerJump(*j);
@@ -2183,7 +2232,7 @@ InterFields buildInterFields(const std::string&          caseDir,
             for (const FvPatch& q : patches)
             {
                 allRecoupled = allRecoupled
-                            && (!q.coupled || q.type == "cyclicAMI" || q.type == "cyclicACMI" || hasACMI);
+                            && (!q.coupled || isProcessorType(q.type) || q.type == "cyclicAMI" || q.type == "cyclicACMI" || hasACMI);
             }
             if (f.dynamicMesh && !allRecoupled)
                 throw std::runtime_error(who + "a moving mesh. The pair's weights and deltas are taken once.");
@@ -2220,7 +2269,7 @@ InterFields buildInterFields(const std::string&          caseDir,
             // (tests/interfoam_ami_vs_openfoam.sh); across a cyclic or cyclicACMI no gate holds them
             for (const FvPatch& q : patches)
             {
-                if (!q.coupled || q.type == "cyclicAMI") continue;
+                if (!q.coupled || isProcessorType(q.type) || q.type == "cyclicAMI") continue;
                 if (f.momentumPredictorOn)
                     throw std::runtime_error(
                         "brae interFoam: the case runs a momentum predictor across the coupled patch `" + q.name
@@ -2246,7 +2295,7 @@ InterFields buildInterFields(const std::string&          caseDir,
                 };
                 for (const FvPatch& q : patches)
                 {
-                    if (!q.coupled) continue;
+                    if (!q.coupled || isProcessorType(q.type)) continue;
                     const bool ami = q.type == "cyclicAMI";
                     if (f.gradULeastSq)
                         throw std::runtime_error(
@@ -2338,7 +2387,38 @@ InterFields buildInterFields(const std::string&          caseDir,
 
     // interfaceProperties' CONSTRUCTOR calls calculateK (interfaceProperties.C:196-210). That first
     // pass is what leaves alpha's wall gradient non-zero for the second one to build on.
+    // UNDER THE STAGE DUMP (inter_parallel.cuh) alpha's patches stay as READ: the device's stage pass is this
+    // constructor pass (taken there with the processor faces), and a host pass first would make it the second one.
+    // ...AND ON A RANK WITH PROCESSOR PATCHES, stage dump or not: this host pass has no neighbour rank behind a
+    // processor patch (its patch field is an inert placeholder), so the gradient it takes in every cell on one --
+    // and with it the wall gradient and value the contact angle leaves there, which every later pass builds on --
+    // is not the mesh's. The device loop takes the constructor pass before its first step, with the processor faces
+    // (inter_driver_device.cu), from the patches as read here.
+    bool hasProcessorPatch = false;
+    // (the predicate the device driver builds its processor context on: a processor patch that has faces)
+    for (const FvPatch& q : patches) hasProcessorPatch = hasProcessorPatch || (isProcessorType(q.type) && q.size > 0);
+    const bool devicePass = !mgpuStageDumpDir().empty() || hasProcessorPatch;
+    std::vector<std::vector<scalar>> stageVal(patches.size()), stageGrad(patches.size());
+    if (devicePass)
+    {
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            stageVal[pi] = f.alpha1.boundary[pi]->value();
+            if (const std::vector<scalar>* gr = f.alpha1.boundary[pi]->refGradPtr()) stageGrad[pi] = *gr;
+        }
+    }
     interfaceProps::calculateK(f.alpha1, f.interface, m, g, patches, false, f.nHatf, f.K);
+    if (devicePass)
+    {
+        for (std::size_t pi = 0; pi < patches.size(); ++pi)
+        {
+            f.alpha1.boundary[pi]->setValue(stageVal[pi]);
+            if (auto* fg = dynamic_cast<FixedGradientPatchField<scalar>*>(f.alpha1.boundary[pi].get()))
+            {
+                if (fg->refGradPtr()) fg->setGradient(stageGrad[pi]);
+            }
+        }
+    }
 
     // rhoPhi AS createFields.H:59-71 BUILDS IT: fvc::interpolate(rho)*phi, from the phi as it was read --
     // before initCorrectPhi -- and interpolate(rho) is linear through interpolationSchemes' default,

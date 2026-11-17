@@ -114,7 +114,7 @@ int main()
         std::size_t b = 0;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)   // NON-coupled patches use their face value
         {
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isCyclicFamilyType(fvp[pi].type)) continue;
             for (label i = 0; i < fvp[pi].size; ++i, ++b)
             {
                 const label c = fvp[pi].faceCells[i];
@@ -141,7 +141,7 @@ int main()
         }
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)   // OF's second loop is over ALL boundary faces
         {
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isCyclicFamilyType(fvp[pi].type)) continue;
             for (label i = 0; i < fvp[pi].size; ++i)
             {
                 const label c = fvp[pi].faceCells[i];

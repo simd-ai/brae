@@ -64,7 +64,8 @@ struct FastScan
     }
 };
 
-constexpr unsigned BRAE_MESH_CACHE_MAGIC = 0x43464D34;   // "CFM4"
+constexpr unsigned BRAE_MESH_CACHE_MAGIC = 0x43464D35;   // "CFM5"
+// Bumped CFM4 -> CFM5 when PatchInfo gained myProcNo/neighbProcNo/referPatch (processor patches).
 // Bumped again (CFM3 -> CFM4) when PatchInfo gained periodicPatch/maxIter/matchTolerance for
 // cyclicPeriodicAMI -- same reason.
 // Bumped CFM2 -> CFM3 when PatchInfo gained nonOverlapPatch: the record layout changed, so a cache
@@ -129,6 +130,9 @@ void PrimitiveMesh::writeBinary(const std::string& path) const
         std::fwrite(&ng, sizeof(ng), 1, f);
         for (const auto& g : p.inGroups) wstr(f, g);
         wstr(f, p.transform);
+        wstr(f, p.referPatch);
+        std::fwrite(&p.myProcNo, sizeof(p.myProcNo), 1, f);
+        std::fwrite(&p.neighbProcNo, sizeof(p.neighbProcNo), 1, f);
         std::fwrite(&p.rotationAxis, sizeof(p.rotationAxis), 1, f);
         std::fwrite(&p.rotationCentre, sizeof(p.rotationCentre), 1, f);
     }
@@ -163,7 +167,9 @@ bool PrimitiveMesh::loadBinary(const std::string& path)
                 p.inGroups.resize(ng);
                 for (auto& g : p.inGroups) ok = ok && rstr(f, g);
             }
-            ok = ok && rstr(f, p.transform)
+            ok = ok && rstr(f, p.transform) && rstr(f, p.referPatch)
+                 && std::fread(&p.myProcNo, sizeof(p.myProcNo), 1, f) == 1
+                 && std::fread(&p.neighbProcNo, sizeof(p.neighbProcNo), 1, f) == 1
                  && std::fread(&p.rotationAxis, sizeof(p.rotationAxis), 1, f) == 1
                  && std::fread(&p.rotationCentre, sizeof(p.rotationCentre), 1, f) == 1;
             if (!ok) break;
@@ -440,6 +446,9 @@ void PrimitiveMesh::readBoundary(const std::string& dir)
             else if (key == "maxIter")        { pi.maxIter = (label)ts.nextScalar(); ts.expect(";"); }
             else if (key == "matchTolerance") { pi.matchTolerance = ts.nextScalar(); ts.expect(";"); }
             else if (key == "transform")      { pi.transform = ts.next();      ts.expect(";"); }
+            else if (key == "myProcNo")       { pi.myProcNo = ts.nextLabel();     ts.expect(";"); }
+            else if (key == "neighbProcNo")   { pi.neighbProcNo = ts.nextLabel(); ts.expect(";"); }
+            else if (key == "referPatch")     { pi.referPatch = ts.next();        ts.expect(";"); }
             else if (key == "rotationAxis")   { ts.expect("("); pi.rotationAxis   = {ts.nextScalar(), ts.nextScalar(), ts.nextScalar()}; ts.expect(")"); ts.expect(";"); }
             else if (key == "rotationCentre") { ts.expect("("); pi.rotationCentre = {ts.nextScalar(), ts.nextScalar(), ts.nextScalar()}; ts.expect(")"); ts.expect(";"); }
             else if (key == "inGroups")   // wordList: "N(g1 g2 ...)" or "(g1 ...)"

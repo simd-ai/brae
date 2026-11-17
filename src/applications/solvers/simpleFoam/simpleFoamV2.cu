@@ -654,7 +654,7 @@ EnvelopeReport simpleFoamV2Envelope(const std::string& caseDir)
             return r;
         }
         for (const auto& b : m.patches())
-            if (isCoupledInterfaceType(b.type) || b.type == "processor")
+            if (isCoupledType(b.type))
                 r.blockers.push_back("patch `" + b.name + "` is of coupled type `" + b.type +
                                      "`; the rebuilt components handle no coupled interfaces.");
     }
@@ -877,7 +877,7 @@ int runSimpleFoamV2(const std::string& caseDir)
         std::vector<scalar> nx, ny, nz;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isCyclicFamilyType(fvp[pi].type)) continue;
             for (label i = 0; i < fvp[pi].size; ++i)
             {
                 nx.push_back(fvp[pi].nf[i].x);
@@ -905,7 +905,7 @@ int runSimpleFoamV2(const std::string& caseDir)
             label bi = 0;
             for (std::size_t pj = 0; pj < fvp.size(); ++pj)
             {
-                if (isCoupledInterfaceType(fvp[pj].type)) continue;
+                if (isCyclicFamilyType(fvp[pj].type)) continue;
                 for (label i = 0; i < fvp[pj].size; ++i, ++bi)
                     if (pj == pi)
                     {
@@ -1180,7 +1180,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                 std::vector<scalar> nb0;
                 for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                 {
-                    if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                    if (isCyclicFamilyType(fvp[pi].type)) continue;
                     const std::vector<scalar>& fb = nutF.boundary[pi]->value();
                     nb0.insert(nb0.end(), fb.begin(), fb.end());
                 }
@@ -1428,7 +1428,7 @@ int runSimpleFoamV2(const std::string& caseDir)
             std::vector<label> cm;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
 
                 // A non-wall `fixedValue` nut is PINNED by the case -- conventionally to 0 -- and must not
                 // be lumped in with `calculated`, which means "correctNut filled this in".
@@ -1472,7 +1472,7 @@ int runSimpleFoamV2(const std::string& caseDir)
             std::vector<label> isW; std::vector<scalar> yv;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
 
                 // OpenFOAM keys the epsilon/omega wall treatment on the BC TYPE, not on the mesh patch
                 // type: createAveragingWeights counts the faces whose epsilon field carries an
@@ -1507,7 +1507,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                 std::vector<scalar> spY;
                 for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                 {
-                    if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                    if (isCyclicFamilyType(fvp[pi].type)) continue;
                     const bool sp = nutF.boundary[pi]->isNutUSpalding();
                     if (sp) hasSpaldingWall = true;
                     for (label i = 0; i < fvp[pi].size; ++i)
@@ -1652,7 +1652,7 @@ int runSimpleFoamV2(const std::string& caseDir)
             std::size_t j = 0;
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                if (isCyclicFamilyType(fvp[pi].type)) continue;
                 for (label i = 0; i < fvp[pi].size; ++i, ++j)
                     if (j < nutB.size()) nuEffB[pi][i] = nu + nutB[j];
             }
@@ -1677,7 +1677,7 @@ int runSimpleFoamV2(const std::string& caseDir)
                             (int)saModel, (int)hasSpaldingWall, (int)nW, hm.size());
                 for (std::size_t pi = 0; pi < fvp.size(); ++pi)
                 {
-                    if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                    if (isCyclicFamilyType(fvp[pi].type)) continue;
                     const std::vector<scalar>& fb = nutF.boundary[pi]->value();
                     scalar mx = 0;
                     for (label i = 0; i < fvp[pi].size; ++i)
@@ -2352,7 +2352,7 @@ int runSimpleFoamV2(const std::string& caseDir)
         std::vector<scalar> ub[3], pb;
         for (std::size_t pi = 0; pi < fvp.size(); ++pi)
         {
-            if (isCoupledInterfaceType(fvp[pi].type)) continue;
+            if (isCyclicFamilyType(fvp[pi].type)) continue;
             const std::vector<vector>& v = f.U.boundary[pi]->value();
             const std::vector<scalar>& w = f.p.boundary[pi]->value();
             for (label i = 0; i < fvp[pi].size; ++i)

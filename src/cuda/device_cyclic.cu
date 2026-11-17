@@ -983,13 +983,14 @@ void deviceCyclicCorrectFlux(DeviceCyclic& cyc, const DeviceBuffer<scalar>& p,
 
 void deviceCyclicPressureFlux(const DeviceCyclic& cyc, const DeviceBuffer<scalar>& p,
                               DeviceBuffer<scalar>& out,
-                              const DeviceBuffer<scalar>* jump)
+                              const DeviceBuffer<scalar>* jump,
+                              const DeviceBuffer<scalar>* coeff)
 {
     out.resize(static_cast<std::size_t>(cyc.n));
     if (cyc.n == 0) return;
     const scalar* j = (jump && static_cast<int>(jump->size()) == cyc.n) ? jump->data() : nullptr;
     fluxOfPKernel<<<nBlocks(cyc.n), TPB>>>(cyc.n, cyc.ownCell.data(), cyc.nbr(),
-        cyc.ifCoeff.data(), j, p.data(), out.data());
+        coeff ? coeff->data() : cyc.ifCoeff.data(), j, p.data(), out.data());
     cudaCheck(cudaGetLastError(), "cyclicPressureFlux");
 }
 

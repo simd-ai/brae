@@ -2,7 +2,7 @@
 """brae_patch_types_vs_factory.py <source root>: patchFieldTypeNames() in src/finiteVolume/fields/fv_patch_field.cuh is the list of
 the boundary-condition factory's branches (makePatchFieldImpl), the list `brae capabilities` prints and `brae check` consults. It
 must be that list exactly:
-  every `d.type == "<name>"` branch of makePatchFieldImpl, and every coupled type isCoupledInterfaceType (foam_dict.cuh) takes,
+  every `d.type == "<name>"` branch of makePatchFieldImpl, and every coupled type isCyclicFamilyType (foam_dict.cuh) takes,
   is in the table (a branch missing from it would be refused by the factory's first line and listed by nothing), and
   every name in the table has a branch (a name with none would be listed as implemented and refused at the chain's end);
   and the factory's first statement refuses a type outside the table.
@@ -28,7 +28,7 @@ def branches(src, coupled_src):
     b = src.rindex('throw std::runtime_error("brae: unsupported BC type')
     body = src[a:b]
     names = set(re.findall(r'd\.type == "([^"]+)"', body))
-    c = coupled_src.index('inline bool isCoupledInterfaceType')
+    c = coupled_src.index('inline bool isCyclicFamilyType')
     names |= set(re.findall(r't == "([^"]+)"', coupled_src[c:coupled_src.index('}', c)]))
     return names, body
 

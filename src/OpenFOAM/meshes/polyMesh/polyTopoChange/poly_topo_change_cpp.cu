@@ -1,7 +1,7 @@
 // polyTopoChange's face and cell ordering. See the header for what these are and why they are first.
 #include "poly_topo_change_cpp.cuh"
 #include "inter_phase_time.cuh"
-#include "foam_dict.cuh"   // isCoupledInterfaceType
+#include "foam_dict.cuh"   // isCyclicFamilyType
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
@@ -874,7 +874,7 @@ void changeMesh(
     // ---- the refusals, before anything is consumed -----------------------------------------------
     for (const std::string& t : in.patchTypes)
     {
-        if (isCoupledInterfaceType(t) || t == "processor" || t == "processorCyclic")
+        if (isCyclicFamilyType(t) || t == "processor" || t == "processorCyclic")
             throw std::runtime_error(
                 std::string(WHO4) + "patch type `" + t + "` is coupled. OpenFOAM reorders a coupled "
                 "patch's faces after the change so the two sides still match (reorderCoupledFaces, "

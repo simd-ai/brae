@@ -1,6 +1,7 @@
 // MULES on the device -- see device_mules.cuh for the gather-not-atomics argument and for what cannot
 // be bit-identical to the host.
 #include "device_mules.cuh"
+#include "device_processor_ops.cuh"
 #include <cuda_runtime.h>
 #include <stdexcept>
 #include <string>
@@ -154,7 +155,7 @@ __global__ void setupKernel(
     for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)
     {
         const int b = bndPerm[k];
-        if (bndFlag[b] == 1) continue;                 // empty: OpenFOAM never enters this body
+        if (bndFlag[b] == 1 || bndFlag[b] == 3) continue;  // empty, or a coupled processor face
         if (bndFixes[b])
         {
             mx = fmax(mx, psiBndValue[b]);
@@ -202,6 +203,8 @@ __global__ void setupKernel(
     mSumPhim[c] = mSP;
 }
 
+
+
 // ONE ITERATION, part 1: gather lambda*phiCorr per cell and form the two per-cell limiters.
 __global__ void iterCellKernel(
     int nC,
@@ -238,7 +241,7 @@ __global__ void iterCellKernel(
     for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)
     {
         const int b = bndPerm[k];
-        if (bndFlag[b] == 1) continue;                 // empty
+        if (bndFlag[b] == 1 || bndFlag[b] == 3) continue;  // empty, or a coupled processor face
         const scalar lpc = lambdaBnd[b] * phiCorrBnd[b];
         if (lpc > scalar(0)) sl  += lpc;
         else                 msl -= lpc;
@@ -294,6 +297,7 @@ __global__ void syncIfLambdaKernel(
     if (t < 0) return;
     lambda[j] = fmin(lambdaIn[j], lambdaIn[t]);
 }
+
 
 // ...part 2: tighten each face against the two cells it joins.
 __global__ void iterFaceKernel(
@@ -428,7 +432,7 @@ __global__ void setupCorrKernel(
     for (int k = bndCellStart[c]; k < bndCellStart[c + 1]; ++k)
     {
         const int b = bndPerm[k];
-        if (bndFlag[b] == 1) continue;                 // empty
+        if (bndFlag[b] == 1 || bndFlag[b] == 3) continue;  // empty, or a coupled processor face
         if (bndFixes[b])
         {
             mx = fmax(mx, psiBndValue[b]);
@@ -498,6 +502,7 @@ __global__ void iterBoundaryCorrKernel(
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nBf) return;
     if (bndFlag[b] == 2) { lambdaBnd[b] = scalar(0); return; }       // wedge
+    if (bndFlag[b] == 3) { lambdaBnd[b] = scalar(1); return; }  // coupled: limited by its own helper
     const scalar pc = phiCorrBnd[b];
     if (phiBnd[b] + pc <= kSmallSquared) return;                     // inlet, or no flux at all
     const int c = bndCell[b];
@@ -528,6 +533,8 @@ __global__ void correctKernel(
 }
 
 }   // namespace
+
+
 
 
 void deviceMulesBlend(
@@ -667,6 +674,7 @@ void deviceMulesLimiter(
     const DeviceBuffer<scalar>*  phiCorrIf,
     DeviceBuffer<scalar>*        lambdaIf)
 {
+    const bool proc = DeviceProcCtx::active(dm) && cyc && cyc->n > 0;
     if (c.nLimiterIter < 1)
         throw std::runtime_error("brae deviceMules: nLimiterIter must be at least 1.");
 
@@ -763,6 +771,7 @@ void deviceMulesLimiter(
             syncIfLambdaKernel<<<nBlocks(nIf2), TPB>>>(
                 nIf2, cyc->twin.data(), snapshot.data(), lambdaIf->data());
             ckM(cudaGetLastError(), "sync interface lambda");
+            if (proc) procSyncFacesMin(*DeviceProcCtx::current(), *lambdaIf);
         }
     }
 }
@@ -791,6 +800,7 @@ void deviceMulesLimiterCorr(
     DeviceBuffer<scalar>*        lambdaIf)
 {
     const int nC = dm.nCells;
+    const bool proc = DeviceProcCtx::active(dm) && cyc && cyc->n > 0;
 
     // the pair: all three together or none, as the explicit limiter has it
     const int nIfC = (cyc && phiCorrIf && lambdaIf) ? cyc->n : 0;
@@ -876,6 +886,7 @@ void deviceMulesLimiterCorr(
             syncIfLambdaKernel<<<nBlocks(nIfC), TPB>>>(
                 nIfC, cyc->twin.data(), snap.data(), lambdaIf->data());
             ckM(cudaGetLastError(), "CMULES sync, interface");
+            if (proc) procSyncFacesMin(*DeviceProcCtx::current(), *lambdaIf);
         }
         if (nBoundaryFaces > 0)
         {

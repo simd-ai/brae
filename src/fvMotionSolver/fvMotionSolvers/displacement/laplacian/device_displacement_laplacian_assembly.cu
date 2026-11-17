@@ -288,7 +288,7 @@ void deviceDisplacementAssembly(
     for (std::size_t pi = 0; pi < patches.size(); ++pi)
     {
         const FvPatch& p = patches[pi];
-        if (p.coupled || isCoupledInterfaceType(p.type))
+        if (p.coupled || isCyclicFamilyType(p.type))
         {
             throw std::runtime_error(
                 std::string(WHO) + "patch " + p.name + " is coupled (" + p.type + "); the correction's coupled "

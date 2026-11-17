@@ -1,5 +1,6 @@
 // interFoam's turbulence, the host reference. See inter_turbulence_cpp.cuh for the two lineages.
 #include "inter_turbulence_cpp.cuh"
+#include "inter_parallel.cuh"   // mgpuGeometryOnly
 #include <fstream>
 #include "foam_field_reader.cuh"
 #include "cellLimitedGrad_cpp.cuh"
@@ -706,8 +707,9 @@ InterTurbulence readInterTurbulence(
         {
             for (const FvPatch& q : patches)
             {
-                if (q.coupled || q.type == "cyclic" || q.type == "cyclicAMI" || q.type == "cyclicACMI"
-                 || q.type == "processor")
+                // a processor patch is refused by name too, unless the multi-GPU gate is open (inter_parallel.cuh)
+                if ((isProcessorType(q.type) ? !mgpuProcessorGate() : q.coupled) || q.type == "cyclic"
+                 || q.type == "cyclicAMI" || q.type == "cyclicACMI")
                     throw std::runtime_error(
                         std::string(WHO) + "kOmegaSST's `Gauss linearUpwind` on a mesh with the coupled patch '"
                         + q.name + "'. OpenFOAM adds the correction across coupled faces (linearUpwind.C:98-137); "

@@ -27,7 +27,45 @@ Other tuning knobs (advanced; sensible defaults):
 | `BRAE_AMG_GS=1` | multicolor Gauss-Seidel smoother (vs the default Jacobi), fewer cycles on some anisotropic meshes |
 | `BRAE_AMG_TSGS=1` | two-stage Gauss-Seidel (parallel polynomial) smoother, coloring-free |
 | `BRAE_AMG_SA=1` | smoothed-aggregation multigrid (vs default pairwise), stronger on cyclic / graded meshes |
+| `BRAE_AMG_FUSE_BELOW=<cells>` | the single-precision V-cycle runs every grid of that many cells or fewer (default 1024, the best of a sweep on an RTX 5090; `0` switches it off), and the coarsest solve, as ONE one-block kernel instead of ~7 dependent launches a grid. Bit-identical to the unfused cycle (`tests/test_amg_fused_coarse.cu`); applies to the weighted-Jacobi cycle with no coupled pair, on the default inverse or the LU coarsest solve. Set it before the run: a captured graph keeps the setting it was captured with |
 | `BRAE_GS_DEVICE=1` | device-resident k/ε Gauss-Seidel scalar solve |
+
+## interFoam on one GPU: what stays on the device
+
+`interFoam`'s step used to wait on the host in several places: boundary patches evaluated on the host from whole-field
+downloads, balance tests and continuity sums read back after every pressure corrector, and a libm call per contact-angle
+wall face. Where the case allows it, these now run on the device or are queued and read once per step. Every change is
+checked byte for byte against the old path on the G4 tank case (233 steps: fields, `postProcessing`, `uniform/`).
+
+| what | when it applies | A/B switch that restores the old path |
+|---|---|---|
+| `adjustPhi` sums the internal flux on the device; with only fixed-value outflows its balance test is queued and read at the end of the step (same message and numbers if it fails, one step late) | `p_rgh` needs a reference | `BRAE_CONTROL_ADJUSTPHI_HOST_SUM=1`, `BRAE_CONTROL_ADJUSTPHI_SYNC=1` |
+| continuity-error sums queued on the device, accumulated after the step | a writer exists | `BRAE_CONTROL_CONTERR_SYNC=1` |
+| the flux push to the patches is skipped | no patch of `U`, `p_rgh` or alpha reads the flux (`noSlip`, `fixedFluxPressure`, contact-angle walls) | `BRAE_CONTROL_FLUX_PUSH_ALWAYS=1` |
+| `p_rgh` patches made on the device (gradient, laplacian coefficients, values); evaluated from the cells under their faces otherwise | every patch `fixedFluxPressure` over `noSlip` `U`, static mesh; the face-cell form needs no coupled patch and no momentum predictor | `BRAE_CONTROL_PRESSURE_PATCHES_HOST=1`, `BRAE_CONTROL_PRESSURE_DOWN_WHOLE=1` |
+| the interface forces keep alpha, K and rho on the device (mixture nu and `snGrad(rho)` made there) | contact angle on the device, laminar, no momentum predictor, no coupled or empty patch | `BRAE_CONTROL_FORCES_FIELDS_HOST=1` |
+| the contact angle's `cos(acos(a12) - theta)` computed on the device, bit for bit as the host's glibc gives it | contact angle on the device | `BRAE_CONTROL_CA_B2_HOST=1` (host loop, with a cache of unchanged faces), `BRAE_CONTROL_CA_B2_FULL=1` (whole array on the host) |
+
+**The device `acos`/`cos`.** CUDA's own `acos` and `cos` differ from glibc's in the last bit on 13–20% of arguments,
+which moved the wall gradient of the tank case by an ulp. `src/transportModels/interfaceProperties/` therefore holds a
+port of glibc's algorithms and tables (LGPL-2.1-or-later, notices kept inline), plus a correctly rounded `acos` for
+glibc 2.33 and older. glibc has an FMA and a plain build of both and picks one at run time, so brae tests four device
+variants against the host's libm on a few million values at the first contact-angle step and uses the one that agrees on
+every bit; the log says which (`contact angle: b2 = cos(acos(a12) - theta) on the GPU with ...`). If none agrees (another
+architecture, an unusual libm) it says so and keeps the host loop. Measured against glibc 2.43 on 1e9 samples: 0
+mismatches for the FMA port; glibc 2.34-2.43 and the older generation were checked with the matching variant.
+
+**Measured** (G4 tank, 2.48M cells, laptop RTX 5090, one GPU; the run to t = 0.008, 89 steps, against the same run to
+t = 0.002, 28 steps, so start-up cancels): **0.70 s/step before, 0.24 s/step after (3.0x)** against upstream `main` at `df3cd8cb`; the whole 89-step run
+takes 69.8 s before and 29.8 s after (two runs each, alternating, within 1 s of each other), and every field of the `End`
+line is the same to the digit. Earlier, with the per-phase timer on and the contact-angle change last: 530 ms/step before, 225–241 ms
+after, outputs byte-identical over 233 steps. With `nsys` graph tracing the GPU is active 97.5% of a steady-state window
+(88.5% before the contact-angle change). A one-step Nsight Compute profile of the 3,400 kernels gives 68% of peak DRAM
+throughput, 70% of kernel time in kernels at 60% or more, and at most 1.15× left if every kernel reached 90% of its own
+roofline. These are one laptop and one case; the gain on other GPUs depends on the host and was not measured there.
+
+The one numerical difference: `adjustPhi`'s `totalFlux` is summed on the device (a different order from the host's loop,
+so it differs in its last bits). It feeds only the 1e-15 and 1e-8 relative thresholds and the error text.
 
 ## Benchmarks
 
