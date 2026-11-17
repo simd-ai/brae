@@ -213,6 +213,7 @@ HostFluxes centralFluxes(const Case& cs, const State& s, scalar deltaT)
         out.divPhiUp[i] = out.divPhiUp[i]/V[i];
         out.divPhiEp[i] /= V[i];
     }
+    out.phiB = std::move(phiB);
     return out;
 }
 

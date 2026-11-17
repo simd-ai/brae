@@ -14,7 +14,7 @@ components:
     brae_reference: src/applications/solvers/rhoCentralFoam/rhoCentralStep_cpp.cu
     brae_cuda: src/applications/solvers/rhoCentralFoam/rhoCentralStep.cu
     brae_target: src/applications/solvers/rhoCentralFoam/gpuRhoCentralFoam.cu
-    validation: "tests/rho_central_sod_vs_openfoam.sh -- shockTube (Sod) with adjustTimeStep no, deltaT 1e-5, 700 steps: CUDA arm 7.7e-15, host arm 7.8e-15, Tadmor 7.1e-15 relative L2 on U p T rho at all 7 write times (bound 8e-14); 1000 cells / 7000 steps 1.9e-14 (bound 2e-13). Controls red: first-order upwind 9.8e-02, energy flux without aSf*(p_pos - p_neg) 6.2e-03, Tadmor against Kurganov 8.8e-03. Against the exact Riemann solution the shock lands 0.21 cells off and the contact 0.24 (100 cells), L1(rho) 6.3e-03 -> 7.5e-04 at 1000 cells, OpenFOAM's figures the same to 1e-9. tests/rho_central_shocktube_vs_openfoam.sh -- the tutorial AS SHIPPED (adjustTimeStep yes, maxCo 0.2): 142 steps, every deltaT and time name identical to OpenFOAM's on both arms, U p T rho 3.1e-15 at all 7 write times; Tadmor and 1000 cells likewise identical in deltaT; maxDeltaT binding and runTime/timeStep writes likewise. tests/rho_central_wedge_vs_openfoam.sh -- wedge15Ma5 and obliqueShock AS SHIPPED, a symmetry and a slip variant and an axisymmetric cone on wedge patches: OpenFOAM's step count, time names and directories; fields within ten times OpenFOAM's own decomposed spread at every write time and every early step; shock angles equal to OpenFOAM's. Does NOT claim viscous flow, 3-D, or patch types beyond zeroGradient, fixedValue, empty, slip, symmetryPlane, symmetry and wedge."
+    validation: "tests/rho_central_sod_vs_openfoam.sh -- shockTube (Sod) with adjustTimeStep no, deltaT 1e-5, 700 steps: CUDA arm 7.9e-15, host arm 7.7e-15, Tadmor 7.8e-15 relative L2 on U p T rho at all 7 write times (bound 8e-14); 1000 cells / 7000 steps 1.9e-14 (bound 2e-13). Controls red: first-order upwind 9.8e-02, energy flux without aSf*(p_pos - p_neg) 6.2e-03, Tadmor against Kurganov 8.8e-03. Against the exact Riemann solution the shock lands 0.21 cells off and the contact 0.24 (100 cells), L1(rho) 6.3e-03 -> 7.5e-04 at 1000 cells, OpenFOAM's figures the same to 1e-9. tests/rho_central_shocktube_vs_openfoam.sh -- the tutorial AS SHIPPED (adjustTimeStep yes, maxCo 0.2): 142 steps, every deltaT and time name identical to OpenFOAM's on both arms, U p T rho 3.1e-15 at all 7 write times; Tadmor and 1000 cells likewise identical in deltaT; maxDeltaT binding and runTime/timeStep writes likewise. tests/rho_central_wedge_vs_openfoam.sh -- wedge15Ma5 and obliqueShock AS SHIPPED, a symmetry and a slip variant and an axisymmetric cone on wedge patches: OpenFOAM's step count, time names and directories; fields within ten times OpenFOAM's own decomposed spread at every write time and every early step; shock angles equal to OpenFOAM's. tests/rho_central_forwardstep_vs_openfoam.sh -- forwardStep AS SHIPPED (inletOutlet outlet, purgeWrite 10): 6694 steps, every deltaT and time name the same as OpenFOAM's, the same 11 directories left; at 17 digits all 40 write times within ten times OpenFOAM's own spread; an inflow inletOutlet inlet and a tube whose end turns from outflow to inflow likewise. Does NOT claim viscous flow, 3-D, or patch types beyond zeroGradient, fixedValue, empty, slip, symmetryPlane, symmetry, wedge and inletOutlet."
 
   createFields:
     openfoam:
@@ -104,7 +104,30 @@ components:
     brae_reference: src/applications/solvers/rhoCentralFoam/rhoCentralPatchUpdate.cuh
     brae_cuda: src/applications/solvers/rhoCentralFoam/rhoCentralStep.cu
     validation: "tests/rho_central_wedge_vs_openfoam.sh: wedge15Ma5 and obliqueShock as shipped (fixedValue inlets and top, zeroGradient outlets and obstacle, whose waves reach them); the Sod gate."
-    note: "zeroGradient, fixedValue and empty gated (wedge15Ma5, obliqueShock). inletOutlet, totalPressure, totalTemperature, waveTransmissive, partialSlip, maxwellSlipU, smoluchowskiJumpT UNSUPPORTED (refused). The transform patches: transformPatches."
+    note: "zeroGradient, fixedValue and empty gated (wedge15Ma5, obliqueShock, forwardStep). totalPressure, totalTemperature, waveTransmissive, partialSlip, outletInlet, maxwellSlipU, smoluchowskiJumpT UNSUPPORTED (refused). The transform patches: transformPatches; inletOutlet: inletOutlet."
+
+  inletOutlet:
+    openfoam:
+      symbol: "inletOutletFvPatchField::updateCoeffs"
+      file: src/finiteVolume/fields/fvPatchFields/derived/inletOutlet/inletOutletFvPatchField.C
+    classification: BOUNDARY_CONDITION
+    brae_status: REUSE_EXISTING
+    brae_existing: "src/finiteVolume/fields/fv_patch_field.cuh (InletOutletPatchField::updateFromFlux, host); src/cuda/device_boundary_flow.cu (deviceUpdateInletOutlet, device)"
+    brae_reference: src/applications/solvers/rhoCentralFoam/rhoCentralStep_cpp.cu
+    brae_cuda: src/applications/solvers/rhoCentralFoam/rhoCentralStep.cu
+    validation: "tests/rho_central_forwardstep_vs_openfoam.sh: forwardStep's outlet as shipped (outflow on every face and step), its inlet as inletOutlet (inflow on U, p, T), and a shockTube whose left end turns from outflow to inflow mid-run, restarted from OpenFOAM's own t = 0.013 and compared every step through the switch; the patch values compared too. Controls red: the switch on -phi, on the step before's phi, and T's inletOutlet on the new cell T."
+    note: "valueFraction = 1 - pos0(phi) on rhoCentralFoam.C:195's mass flux, this step's, before U (232), T (265, inside mixedEnergy's Tw.evaluate(), on the OLD cell T) and p (287); e_b = HE(p_b, T_b) since mixed fixesValue(). phi's two products are rounded separately, as OpenFOAM's field algebra does, so a face at rest has phi exactly 0 (outflow). A `phi` other than `phi`, or no inletValue, refused."
+
+  purgeWrite:
+    openfoam:
+      symbol: "Time::writeObject (purgeWrite)"
+      file: src/OpenFOAM/db/Time/TimeIO.C
+    classification: HOST_ONLY
+    brae_status: REUSE_EXISTING
+    brae_driver: src/applications/solvers/rhoCentralFoam/rhoCentralFoam.cu
+    brae_existing: "src/OpenFOAM/db/Time/purge_write.cuh (PurgeWrite; WriteControl::recordWritten calls it)"
+    validation: "tests/rho_central_forwardstep_vs_openfoam.sh: forwardStep as shipped (purgeWrite 10, adjustable writes) on both arms, shockTube with purgeWrite 2 (timeStep writes) and 3 (runTime writes): every directory left, 0 included, the same as OpenFOAM's. Control red: purgeWrite ignored leaves 41 directories against 11."
+    note: "the FIFO of TimeIO.C:557-582: push the time name unless it is the last pushed, remove the oldest beyond N after the write; the start directory is never pushed. A negative value is warned about and taken as 0 (TimeIO.C:324-332)."
 
   transformPatches:
     openfoam:
@@ -135,7 +158,7 @@ components:
     classification: HOST_ONLY
     brae_status: REIMPLEMENT
     brae_reference: src/OpenFOAM/db/Time/run_clock.cuh
-    validation: "rho_central_shocktube_vs_openfoam: the same 142 time names and 7 write directories as OpenFOAM; the Sod gate's fixed-deltaT run on the same clock is byte-identical to the step-counting clock it replaced (252 files)."
+    validation: "rho_central_shocktube_vs_openfoam: the same 142 time names and 7 write directories as OpenFOAM; the Sod gate's fixed-deltaT run on the same clock is byte-identical to the step-counting clock it replaced (252 files; milestone D's phi rounding has since moved the last bits)."
     note: "the accumulated value (setTime(value() + deltaT_)), Time::run on the previous deltaT, writeTime_ for timeStep/runTime/adjustable, the snap to 0, the time-name precision raise. clockTime and cpuTime refused. A restart's uniform/time deltaT and index are read, not gated."
 
   setRDeltaT:

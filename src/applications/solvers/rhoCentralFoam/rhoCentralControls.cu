@@ -94,12 +94,24 @@ std::vector<std::string> checkPatchFieldTypes(const FieldData<T>& fd, const std:
                 refuse(field + " patch '" + p.name + "' is `" + type + "` on a mesh patch of type `" + p.type
                        + "`; OpenFOAM requires the two to be the same for empty, symmetryPlane, symmetry and wedge.");
         }
-        else if (type != "zeroGradient" && type != "fixedValue" && type != "slip")
+        else if (type != "zeroGradient" && type != "fixedValue" && type != "slip" && type != "inletOutlet")
             refuse(field + " patch '" + p.name + "' is `" + type + "`. This stage runs zeroGradient, fixedValue, "
-                   "slip, symmetryPlane, symmetry, wedge and empty on U, p and T; inletOutlet, totalPressure, "
-                   "totalTemperature, waveTransmissive, partialSlip, maxwellSlipU, smoluchowskiJumpT and the rest are "
-                   "not ported (applications/solvers/compressible/rhoCentralFoam/BCs, "
+                   "slip, inletOutlet, symmetryPlane, symmetry, wedge and empty on U, p and T; totalPressure, "
+                   "totalTemperature, waveTransmissive, partialSlip, outletInlet, maxwellSlipU, smoluchowskiJumpT and "
+                   "the rest are not ported (applications/solvers/compressible/rhoCentralFoam/BCs, "
                    "src/finiteVolume/fields/fvPatchFields). Refusing rather than run the patch as something else.");
+        if (type == "inletOutlet")
+        {
+            // inletOutletFvPatchField.C:59-83: refValue from the mandatory `inletValue`; the switch reads the
+            // surfaceScalarField its `phi` entry names (default phi), the mass flux of rhoCentralFoam.C:195. Any other
+            // name would look up another registered field (phiEp is one during the energy solve): not ported.
+            if (!d->hasInletValue)
+                refuse(field + " patch '" + p.name + "' is `inletOutlet` without `inletValue`; OpenFOAM requires it "
+                       "(inletOutletFvPatchField.C, Field<Type>(\"inletValue\", dict, p.size())).");
+            if (d->phiName != "phi")
+                refuse(field + " patch '" + p.name + "' is `inletOutlet` on `phi " + d->phiName + "`. This stage "
+                       "switches inletOutlet on rhoCentralFoam's mass flux `phi` (rhoCentralFoam.C:195) only.");
+        }
         types.push_back(type);
     }
     return types;
@@ -128,10 +140,9 @@ Case readRhoCentralCase(const std::string& caseDir)
     if (app != "rhoCentralFoam")
         refuse("controlDict names application `" + app + "`; this executable runs rhoCentralFoam cases.");
     if (!(controlDict.scalarOr("deltaT", 0) > 0)) refuse("controlDict deltaT must be positive.");
-    // purgeWrite deletes all but the last N time directories (Time::writeObject); the writer here keeps them all
-    if (controlDict.intOr("purgeWrite", 0) > 0)
-        refuse("controlDict sets `purgeWrite " + std::to_string(controlDict.intOr("purgeWrite", 0)) + "`. Deleting "
-               "the older time directories is not ported yet: set `purgeWrite 0`.");
+    // purgeWrite: all but the last N written time directories removed after each write (Time::writeObject,
+    // purge_write.cuh); the driver holds the FIFO
+    cs.purgeWrite = controlDict.intOr("purgeWrite", 0);
     cs.timeControls = TimeControls::read(controlDict);   // createTimeControls.H: adjustTimeStep, maxCo, maxDeltaT
     cs.writePrecision = controlDict.intOr("writePrecision", 6);
     const StartTime st = resolveStartTime(caseDir, controlDict);
@@ -307,7 +318,7 @@ Case readRhoCentralCase(const std::string& caseDir)
     // ---- patch-field types ---------------------------------------------------------------------------------------------
     const std::string dir = caseDir + "/" + cs.startName;
     const std::vector<std::string> Utypes = checkPatchFieldTypes(readField<vector>(dir + "/U"), cs.patches, "U");
-    checkPatchFieldTypes(readField<scalar>(dir + "/p"), cs.patches, "p");
+    const std::vector<std::string> ptypes = checkPatchFieldTypes(readField<scalar>(dir + "/p"), cs.patches, "p");
     const std::vector<std::string> Ttypes = checkPatchFieldTypes(readField<scalar>(dir + "/T"), cs.patches, "T");
 
     // ---- the transform patches, face by face (rhoCentralPatchUpdate.cuh) -----------------------------------------------
@@ -315,6 +326,7 @@ Case readRhoCentralCase(const std::string& caseDir)
     cs.bTseedOwn.assign(cs.nB, 0);
     cs.bUTransform.assign(cs.nB, transformNone);
     cs.bUR.assign(cs.nB, tensor{1, 0, 0, 0, 1, 0, 0, 0, 1});
+    cs.bInletOutlet.assign(cs.nB, 0);
     label k0 = 0;
     for (std::size_t pi = 0; pi < cs.patches.size(); ++pi)
     {
@@ -351,9 +363,14 @@ Case readRhoCentralCase(const std::string& caseDir)
                 refuse(e.what());
             }
         }
+        const bool io[3] = {Ut == "inletOutlet", ptypes[pi] == "inletOutlet", Ttypes[pi] == "inletOutlet"};
+        cs.ioU = cs.ioU || io[0];
+        cs.ioP = cs.ioP || io[1];
+        cs.ioT = cs.ioT || io[2];
         for (label i = 0; i < p.size; ++i)
         {
             const label k = k0 + i;
+            cs.bInletOutlet[k] = (io[0] || io[1] || io[2]) ? 1 : 0;
             cs.bRhoConstraint[k] = isTransformConstraint(p.type) ? 1 : 0;
             cs.bTseedOwn[k] = (isTransformConstraint(Ttypes[pi]) || Ttypes[pi] == "slip") ? 1 : 0;
             if (Ut == "wedge")

@@ -15,6 +15,7 @@
 #include "foam_dict.cuh"
 #include "brae_notice.cuh"
 #include "start_time.cuh"   // Time::timeName, the run's timeFormat and timePrecision
+#include "purge_write.cuh"  // the purgeWrite FIFO, shared with rhoCentralFoam
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -144,17 +145,7 @@ public:
     }
 
     // Foam::Time TimeIO purgeWrite: keep only the last N time directories. Call after each write.
-    void recordWritten(const std::string& caseDir, const std::string& tname)
-    {
-        if (purge_ <= 0) return;
-        if (written_.empty() || written_.back() != tname) written_.push_back(tname);
-        while (static_cast<int>(written_.size()) > purge_)
-        {
-            std::error_code ec;
-            std::filesystem::remove_all(caseDir + "/" + written_.front(), ec);
-            written_.pop_front();
-        }
-    }
+    void recordWritten(const std::string& caseDir, const std::string& tname) { purgeWrite_.written(caseDir, tname); }
 
 private:
     std::string control_;
@@ -163,7 +154,7 @@ private:
     scalar deltaT_;
     scalar startTime_;
     long writeTimeIndex_ = 0;
-    std::deque<std::string> written_;
+    PurgeWrite purgeWrite_{purge_};   // after purge_, which it is built from (declaration order)
 };
 
 }   // namespace brae

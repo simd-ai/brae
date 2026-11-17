@@ -3,6 +3,7 @@
 // Per step:
 //   centralFluxes (rhoCentralFlux.cu)                 rhoCentralFoam.C:102-210
 //   cellKernel   fvc::div gathered in OpenFOAM's face order, then the four cell stages   :222-286
+//   deviceUpdateInletOutlet on U, T, p                 :195's phi decides each inletOutlet face (shared, milestone D)
 //   deviceBCValue on U (x3)                            :232 U.correctBoundaryConditions (shared DeviceBoundary)
 //   deviceBCValue on T with the cells' old T           :265 Tw.evaluate() inside the energy BCs
 //   patchKernel  transformPatchU, updatePatchFace      :232 on the transform faces, :233, 265-271
@@ -140,13 +141,21 @@ struct PatchTransforms
     const char *rhoConstraint, *TseedOwn;
 };
 
+// ioCount: the inletOutlet diagnostic, over the faces where U, p or T is inletOutlet -- [0] the face-steps whose phi was
+// negative (inflow), [1] all of them
 __global__ void patchKernel(int nB, int slot, GasCoeffs gas, int ctrl, const label* __restrict__ bCell,
                             const int* __restrict__ TfixesValue, const scalar* __restrict__ eCell, PatchState B,
-                            PatchTransforms X, int* __restrict__ status)
+                            PatchTransforms X, int* __restrict__ status, const scalar* __restrict__ phiB,
+                            const char* __restrict__ ioFace, unsigned long long* __restrict__ ioCount)
 {
     const int k = blockIdx.x*blockDim.x + threadIdx.x;
     if (k >= nB) return;
     const label c = bCell[k];
+    if (ioFace[k])
+    {
+        atomicAdd(&ioCount[1], 1ull);
+        if (phiB[k] < 0) atomicAdd(&ioCount[0], 1ull);
+    }
     if (X.kind[k])   // U.correctBoundaryConditions() on a transform face (:232)
     {
         const vector Ub = transformPatchU(X.kind[k], X.R[k], vector{X.UxC[c], X.UyC[c], X.UzC[c]}, ctrl);
@@ -165,6 +174,13 @@ __global__ void patchKernel(int nB, int slot, GasCoeffs gas, int ctrl, const lab
     B.psi[k] = b.psi;
     B.rhoE[k] = b.rhoE;
     if (b.status) atomicOr(&status[slot], b.status);
+}
+
+// the control inletOutletInverted: the switch fed -phi
+__global__ void negateKernel(int n, const scalar* __restrict__ a, scalar* __restrict__ b)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k < n) b[k] = -a[k];
 }
 
 // rho.boundaryFieldRef() == psi.boundaryField()*p.boundaryField(), rhoCentralFoam.C:288
@@ -290,6 +306,9 @@ public:
         uR_.copyFrom(cs.bUR);
         rhoConstraint_.copyFrom(cs.bRhoConstraint);
         TseedOwn_.copyFrom(cs.bTseedOwn);
+        ioFace_.copyFrom(cs.bInletOutlet);
+        ioCount_.copyFrom(std::vector<unsigned long long>(2, 0ull));
+        if (control_ == controlInletOutletInverted || control_ == controlLaggedPhi) phiCtrl_.resize(nB);
         Told_.resize(nC);
         TbEval_.resize(nB);
         coCell_.resize(nC);
@@ -328,17 +347,46 @@ public:
 
         if (nB)
         {
+            // :195's phi decides every inletOutlet face of U, T and p before its evaluation (inletOutletFvPatchField::
+            // updateCoeffs); the controls feed the switch another flux
+            if (cs.ioU || cs.ioP || cs.ioT)
+            {
+                const DeviceBuffer<scalar>* phiSwitch = &X_.phiB;
+                const cudaStream_t q = cudaStreamPerThread;
+                if (control_ == controlInletOutletInverted)
+                {
+                    negateKernel<<<blocksFor(nB), kTPB>>>(nB, X_.phiB.data(), phiCtrl_.data());
+                    cudaCheck(cudaGetLastError(), "rhoCentral -phi");
+                    phiSwitch = &phiCtrl_;
+                }
+                else if (control_ == controlLaggedPhi)
+                {
+                    if (!lagPrimed_)   // the first step has no step before: its own
+                        cudaCheck(cudaMemcpyAsync(phiCtrl_.data(), X_.phiB.data(), nB*sizeof(scalar),
+                                                  cudaMemcpyDeviceToDevice, q), "lagged phi");
+                    lagPrimed_ = true;
+                    phiSwitch = &phiCtrl_;
+                }
+                if (cs.ioU) deviceUpdateInletOutlet(dbU_, *phiSwitch);
+                if (cs.ioT) deviceUpdateInletOutlet(dbT_, *phiSwitch);
+                if (cs.ioP) deviceUpdateInletOutlet(dbP_, *phiSwitch);
+                if (control_ == controlLaggedPhi)   // what the next step will switch on
+                    cudaCheck(cudaMemcpyAsync(phiCtrl_.data(), X_.phiB.data(), nB*sizeof(scalar),
+                                              cudaMemcpyDeviceToDevice, q), "lagged phi");
+            }
             deviceBCValue(dbU_.comp[0], F.Ux, F.UxB);   // :232
             deviceBCValue(dbU_.comp[1], F.Uy, F.UyB);
             deviceBCValue(dbU_.comp[2], F.Uz, F.UzB);
-            deviceBCValue(dbT_, Told_, TbEval_);        // :265, Tw.evaluate() on the cells' old T
+            // :265, Tw.evaluate() on the cells' old T, before thermo.correct() (the control: on the new)
+            deviceBCValue(dbT_, control_ == controlInletOutletNewT ? F.T : Told_, TbEval_);
             const PatchState B{F.rhoB.data(), F.rhoUxB.data(), F.rhoUyB.data(), F.rhoUzB.data(), F.rhoEB.data(),
                                F.eB.data(), F.TB.data(), F.psiB.data(), F.UxB.data(), F.UyB.data(), F.UzB.data(),
                                F.pB.data(), TbEval_.data()};
             const PatchTransforms X{F.rho.data(), F.Ux.data(), F.Uy.data(), F.Uz.data(), uTransform_.data(),
                                     uR_.data(), rhoConstraint_.data(), TseedOwn_.data()};
             patchKernel<<<blocksFor(nB), kTPB>>>(nB, pending_, cs.gas, control_, bCell_.data(), TfixesValue_.data(),
-                                                 F.e.data(), B, X, status_.data());
+                                                 F.e.data(), B, X, status_.data(), X_.phiB.data(), ioFace_.data(),
+                                                 ioCount_.data());
             cudaCheck(cudaGetLastError(), "rhoCentral patches");
             deviceBCValue(dbP_, F.p, F.pB);             // :287
             rhoBKernel<<<blocksFor(nB), kTPB>>>(nB, F.psiB.data(), F.pB.data(), F.rhoB.data());   // :288
@@ -415,6 +463,13 @@ public:
         energy = r[4];
     }
 
+    void inletOutletInflow(long long& inflow, long long& faceSteps) const override
+    {
+        const std::vector<unsigned long long> r = ioCount_.host();
+        inflow = static_cast<long long>(r[0]);
+        faceSteps = static_cast<long long>(r[1]);
+    }
+
     std::size_t deviceBytes() const override { return bytes_; }
 
     ~DeviceArm() override
@@ -437,7 +492,10 @@ private:
     DeviceBuffer<label> bCell_;
     DeviceBuffer<int> uTransform_;
     DeviceBuffer<tensor> uR_;
-    DeviceBuffer<char> rhoConstraint_, TseedOwn_;
+    DeviceBuffer<char> rhoConstraint_, TseedOwn_, ioFace_;
+    DeviceBuffer<unsigned long long> ioCount_;
+    DeviceBuffer<scalar> phiCtrl_;   // the controls' switch flux: -phi, or the step before's phi
+    bool lagPrimed_ = false;
     DeviceBuffer<scalar> Told_, TbEval_, coCell_;
     DeviceBuffer<int> status_;
     DeviceBuffer<double> courant_, outflow_;

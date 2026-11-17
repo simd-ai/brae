@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Derived rhoCentralFoam cases for the milestone-C gate (tests/rho_central_wedge_vs_openfoam.sh), each made from the
-wedge15Ma5 tutorial as shipped by editing what the variant names and nothing else.
+"""Derived rhoCentralFoam cases for the milestone-C and -D gates (tests/rho_central_wedge_vs_openfoam.sh,
+tests/rho_central_forwardstep_vs_openfoam.sh), each made from a tutorial as shipped by editing what the variant names and
+nothing else.
 
   rho_central_cases.py symmetry <case>   bottom, top and the 15-degree obstacle become mesh patches of type `symmetry`
                                          and U, p, T `symmetry` on them: the non-planar constraint on an inclined plane
@@ -10,6 +11,21 @@ wedge15Ma5 tutorial as shipped by editing what the variant names and nothing els
                                          one cell thick between two `wedge` planes at +-2.5 degrees, the axis an `empty`
                                          patch of collapsed faces (as the movingCone tutorial builds its axis). Top is a
                                          `patch` with U slip, p and T zeroGradient; the cone is the tutorial's obstacle.
+  rho_central_cases.py inletIO <case>    forwardStep: the inlet's U, p and T become `inletOutlet` with the shipped
+                                         fixedValue as inletValue and value. The flux enters on every face, every step:
+                                         the switch's inflow branch, on all three fields
+  rho_central_cases.py openTop <case>    forwardStep: the top becomes a mesh `patch` and its U, p and T `inletOutlet`
+                                         on the free stream ((3 0 0), 1, 1): an open top. The flux there is exactly 0
+                                         until the bow shock arrives (pos0(0): the outflow branch), then leaves behind
+                                         the shock and enters where the flow turns down: the switch takes both branches
+  rho_central_cases.py sodRevSet <case>  shockTube BEFORE setFields: the left state starts at U (-50 0 0), flowing out
+                                         of the left end, and the right state at (50 0 0), out of the right end
+  rho_central_cases.py sodRev <case>     ...and AFTER setFields (on 0/): the ends' U and T become `inletOutlet` on
+                                         inletValue (50 0 0) and 348.4, with no `value`, so the solver's read
+                                         extrapolates the cells (a `value` setFields wrote there would be its own read's
+                                         placeholder). Both ends flow out until the expansion reaches the left end and
+                                         turns the flow there inward -- the switch changes branch at a resolved velocity,
+                                         not on round-off noise -- and the inflow then holds at 50 m/s
 
 <case> is a copy of the tutorial; the files are rewritten in place. Every edit is checked to have happened.
 """
@@ -118,7 +134,41 @@ mergePatchPairs
         field_type(case, f, "top", top)
 
 
+def inlet_outlet(path, patch, inlet, value):
+    # 0/<field>: the patch's whole entry becomes inletOutlet on `inlet` (and `value`, unless None)
+    body = f"\n        type            inletOutlet;\n        inletValue      uniform {inlet};"
+    if value is not None:
+        body += f"\n        value           uniform {value};"
+    edit(path, rf"(\n\s*{patch}\s*\{{)[^}}]*\}}", rf"\g<1>{body}\n    }}")
+
+
+def inletIO(case):
+    for f, v in (("U", "(3 0 0)"), ("p", "1"), ("T", "1")):
+        edit(f"{case}/0/{f}", r"(\n\s*inlet\s*\{\s*type\s+)fixedValue;", r"\g<1>fixedValue;")   # the shipped entry
+        inlet_outlet(f"{case}/0/{f}", "inlet", v, v)
+
+
+def openTop(case):
+    patch_type(case, "top", "patch")
+    for f, v in (("U", "(3 0 0)"), ("p", "1"), ("T", "1")):
+        inlet_outlet(f"{case}/0/{f}", "top", v, v)
+
+
+def sodRevSet(case):
+    d = f"{case}/system/setFieldsDict"
+    edit(d, r"volVectorFieldValue U \(0 0 0\)", "volVectorFieldValue U (-50 0 0)")
+    edit(d, r"(fieldValues\s*\(\s*)", r"\g<1>volVectorFieldValue U (50 0 0)\n            ")
+
+
+def sodRev(case):
+    for f, v in (("U", "(50 0 0)"), ("T", "348.4")):
+        edit(f"{case}/0/{f}", r"(\n\s*sides\s*\{\s*type\s+)zeroGradient;", r"\g<1>zeroGradient;")
+        inlet_outlet(f"{case}/0/{f}", "sides", v, None)
+
+
 if __name__ == "__main__":
-    if len(sys.argv) != 3 or sys.argv[1] not in ("symmetry", "slipPT", "cone"):
+    kinds = {"symmetry": symmetry, "slipPT": slipPT, "cone": cone, "inletIO": inletIO, "openTop": openTop,
+             "sodRevSet": sodRevSet, "sodRev": sodRev}
+    if len(sys.argv) != 3 or sys.argv[1] not in kinds:
         raise SystemExit(__doc__)
-    {"symmetry": symmetry, "slipPT": slipPT, "cone": cone}[sys.argv[1]](sys.argv[2])
+    kinds[sys.argv[1]](sys.argv[2])

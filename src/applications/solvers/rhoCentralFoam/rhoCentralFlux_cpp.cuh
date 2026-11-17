@@ -19,6 +19,8 @@ struct HostFluxes
 {
     std::vector<scalar> divPhi, divPhiEp;   // fvc::div(phi), fvc::div(phiEp), per cell
     std::vector<vector> divPhiUp;           // fvc::div(phiUp)
+    std::vector<scalar> phiB;               // phi on every boundary face, flat in patch order (0 on empty ones): the
+                                            // flux inletOutlet switches on
     scalar CoNum = 0, meanCoNum = 0;        // centralCourantNo.H
     // what left through the non-empty boundary faces this step (diagnostics)
     scalar bndMass = 0, bndEnergy = 0;

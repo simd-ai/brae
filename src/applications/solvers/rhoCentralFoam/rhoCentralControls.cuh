@@ -4,10 +4,11 @@
 //
 // What runs (everything else is refused here, by name, before a field is read): single GPU, static mesh,
 // hePsiThermo + pureMixture + const + hConst + perfectGas + sensibleInternalEnergy, laminar with every mu = 0
-// (inviscid), Euler with a fixed deltaT or adjustTimeStep (setDeltaT.H on the central Courant number), purgeWrite 0, fluxScheme Kurganov or Tadmor (readFluxScheme.H),
-// reconstruct(rho|T) vanLeer and reconstruct(U) vanLeerV, Gauss linear gradients; on U, p and T the patch fields
-// zeroGradient, fixedValue, slip, and the constraint types empty, symmetryPlane, symmetry and wedge (milestone C) on
-// their own mesh patch types.
+// (inviscid), Euler with a fixed deltaT or adjustTimeStep (setDeltaT.H on the central Courant number), any purgeWrite
+// (milestone D), fluxScheme Kurganov or Tadmor (readFluxScheme.H), reconstruct(rho|T) vanLeer and reconstruct(U)
+// vanLeerV, Gauss linear gradients; on U, p and T the patch fields zeroGradient, fixedValue, slip, inletOutlet on the
+// flux `phi` (milestone D), and the constraint types empty, symmetryPlane, symmetry and wedge (milestone C) on their
+// own mesh patch types.
 #include "cf_types.cuh"
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
@@ -32,6 +33,7 @@ struct Case
     std::string startName;    // the start time directory, as Time resolves it
     scalar      startTime = 0;
     int         writePrecision = 6;
+    int         purgeWrite = 0;         // controlDict purgeWrite (TimeIO.C:322-333; negative read as 0, warned)
     TimeControls timeControls;          // adjustTimeStep, maxCo, maxDeltaT (createTimeControls.H)
     std::optional<RunClock> clock;      // the clock at the start: deltaT, write cadence, endTime (Time::setControls)
 
@@ -54,6 +56,11 @@ struct Case
     std::vector<char>   bTseedOwn;        // 1: T's patch field is a transform (its energy BC is the same transform)
     std::vector<int>    bUTransform;      // transformNone, transformMirror (symmetry kinds, slip) or transformRotate
     std::vector<tensor> bUR;              // I - 2.0*sqr(nHat) for a mirror, the wedge's faceT for a rotation
+
+    // inletOutlet (milestone D): which fields carry one anywhere (each such field's patches are switched on this
+    // step's phi before they are evaluated), and the faces where any of U, p, T does (the inflow diagnostic)
+    bool ioU = false, ioP = false, ioT = false;
+    std::vector<char>   bInletOutlet;
 };
 
 // Reads and checks the case; refuses everything outside this stage's scope by name, before any field is read.

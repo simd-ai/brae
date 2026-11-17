@@ -7,6 +7,9 @@
 //   e.correctBoundaryConditions()                                              :265
 //       fixedEnergy (T fixesValue):      e_b = he(p_b, T_b)
 //       gradientEnergy (zeroGradient T): Cpv*snGrad(T) + delta*(he(p_b,T_b) - he(p_b,T_b)) is exactly 0: e_b = e_P
+//       mixedEnergy (T inletOutlet, milestone D): Tw.evaluate() switches on :195's phi and blends with the OLD cell
+//                                        T; mixed fixesValue(), so thermo.correct() then sets e_b = HE(p_b, T_b) --
+//                                        the fixedEnergy row's arithmetic, on that T_b
 //   thermo.correct(), patch half (hePsiThermo.C:97-137)                        :266
 //       T fixesValue: e_b = HE(p_b, T_b), T_b kept;  else T_b = THE(e_b, p_b, T_b), seeded by Tw.evaluate()'s T_b
 //       psi_b = psi(p_b, T_b); p_b is still last step's

@@ -6,8 +6,13 @@
       that over max|B| (the gates' relative measure), one line per field: `absdiff <field> <abs> <rel> <cell>`
   rho_central_fields.py maxrel <dir A> <dir B> [fields]
       the worst max|A - B|/max|B| over the fields: `maxrel <value> <field>`
+  rho_central_fields.py patchdiff <dir A> <dir B> <patch> [fields]
+      absdiff on one patch's written `value` entries (U, T, rho by default: p's zeroGradient has none):
+      `patchdiff <field> <abs> <rel> <face>`
+  rho_central_fields.py patchvalue <dir> <patch> <field> <face>
+      one face's written patch value (a vector's components)
   rho_central_fields.py shock <case dir> <time> <kind>
-      the shock angle and position read off the cell-centre pressure (kind: wedge, cone, oblique); see shock()
+      the shock read off the cell-centre pressure (kind: wedge, cone, oblique, step); see shock()
   rho_central_fields.py theory <kind>
       the inviscid angle for the case (oblique-shock relations, Taylor-Maccoll for the cone); see theory()
   rho_central_fields.py stats <case dir> <time> [<earlier time>]
@@ -53,6 +58,23 @@ def internal(path):
     return _value(s, s.index("internalField") + len("internalField"))
 
 
+def patch_value(path, patch):
+    """a patch's written `value` entry (uniform values come back as one row)"""
+    s = open(path).read()
+    b = s.index("boundaryField")
+    m = re.compile(r"\n\s*" + re.escape(patch) + r"\s*\{").search(s, b)
+    if not m:
+        raise SystemExit(f"rho_central_fields: no patch {patch} in {path}")
+    e = s.index("}", m.end())
+    v = re.compile(r"\bvalue\b").search(s, m.end(), e)
+    if not v:
+        raise SystemExit(f"rho_central_fields: patch {patch} of {path} has no value entry")
+    a = _value(s, v.end())
+    if re.compile(r"\s*uniform\s*\(").match(s, v.end()):   # one vector for every face
+        return a.reshape(1, -1)
+    return np.atleast_1d(a) if a.ndim < 2 else a
+
+
 def _list(path, cast):
     s = open(path).read()
     s = re.sub(r"/\*.*?\*/", "", s, flags=re.S)
@@ -96,9 +118,27 @@ def absdiff(a, b, fields):
     return out
 
 
+def patchdiff(a, b, patch, fields):
+    out = []
+    for f in fields:
+        x, y = patch_value(f"{a}/{f}", patch), patch_value(f"{b}/{f}", patch)
+        if x.shape != y.shape:
+            x, y = np.broadcast_arrays(x, y)
+        d = np.abs(x - y)
+        if d.ndim == 2:
+            d = d.max(axis=1)
+        out.append((f, float(d.max()), float(d.max() / max(np.abs(y).max(), 1e-300)), int(d.argmax())))
+    return out
+
+
 # ---- shocks -----------------------------------------------------------------------------------------------------------
 def theory(kind):
     g = 1.4
+    if kind == "step":   # forwardStep, Mach 3 (|U| 3, c 1): the normal shock and the Rayleigh pitot pressure
+        M = 3.0
+        p2 = 1 + 2 * g / (g + 1) * (M**2 - 1)
+        pitot = ((g + 1)**2 * M**2 / (4 * g * M**2 - 2 * (g - 1)))**(g / (g - 1)) * (1 - g + 2 * g * M**2) / (g + 1)
+        return {"p2": p2, "pitot": pitot}
     if kind in ("wedge", "cone"):
         M, th = 5.0, math.radians(15)
     if kind == "wedge":   # theta-beta-M, weak root
@@ -214,6 +254,25 @@ def shock(case, time, kind):
         res = {"incident": math.degrees(math.atan(-ki)), "reflected": math.degrees(math.atan(kr)),
                "impact_x_incident": -ci0 / ki, "impact_x_reflected": -cr0 / kr,
                "points_incident": len(inc), "points_reflected": len(ref)}
+    elif kind == "step":
+        # forwardStep (the step's face at x = 0.6, its top at y = 0.2, the tunnel's top at y = 1). The bow shock:
+        # on a row of cells, the first crossing going downstream of the mean of the free stream (1) and the normal
+        # shock's p2 (theory); the standoff is 0.6 less it, on the bottom row and on the row under the step's
+        # corner. top_x: the same crossing on the top row. pitot: the largest p in the column of cells on the
+        # step's face, against Rayleigh's pitot pressure.
+        th = theory("step")
+        lvl = 0.5 * (1.0 + th["p2"])
+        yr = np.round(y, 9)
+        rows = np.unique(yr)
+        def first(yc, xmax):
+            m = (yr == yc) & (x < xmax)
+            order = np.argsort(x[m])
+            cr = _crossings(x[m][order], p[m][order], lvl)
+            return cr[0] if cr else float("nan")
+        under = rows[rows < 0.2]
+        face = (x < 0.6) & (x > 0.6 - 0.0125) & (y < 0.2)
+        res = {"standoff_bottom": 0.6 - first(rows[0], 0.6), "standoff_corner": 0.6 - first(under[-1], 0.6),
+               "top_x": first(rows[-1], 3.0), "pitot": float(p[face].max())}
     return res
 
 
@@ -234,6 +293,13 @@ if __name__ == "__main__":
     if a[0] == "absdiff":
         for f, ab, rel, c in absdiff(a[1], a[2], a[3:] or ["U", "p", "T", "rho"]):
             print(f"absdiff {f} {ab:.3e} {rel:.3e} {c}")
+    elif a[0] == "patchdiff":
+        for f, ab, rel, c in patchdiff(a[1], a[2], a[3], a[4:] or ["U", "T", "rho"]):
+            print(f"patchdiff {f} {ab:.3e} {rel:.3e} {c}")
+    elif a[0] == "patchvalue":
+        v = patch_value(f"{a[1]}/{a[3]}", a[2])
+        r = v[min(int(a[4]), len(v) - 1)]
+        print("patchvalue", " ".join("%.17g" % q for q in np.atleast_1d(r)))
     elif a[0] == "maxrel":
         w = max(absdiff(a[1], a[2], a[3:] or ["U", "p", "T", "rho"]), key=lambda r: r[2])
         print(f"maxrel {w[2]:.3e} {w[0]}")

@@ -5,7 +5,7 @@ implicit viscous correctors), its central-upwind flux assembly and its time loop
 boundary conditions, thermo, gradients, linear smoothers and time controls. Nothing here goes through SIMPLE, PIMPLE or
 rhoSimpleFoam's pressure correction, and there is no pressure equation: p = rho/psi.
 
-## 1. OpenFOAM's structure, and where each part lives in brae (after milestone C)
+## 1. OpenFOAM's structure, and where each part lives in brae (after milestone D)
 
 The reference is OpenFOAM v2412 `applications/solvers/compressible/rhoCentralFoam`. In the table, (H) marks the host
 reference (namespace `brae::cpu::rhoCentral`), (D) the device arm (namespace `brae::gpu::rhoCentral`), and (HD)
@@ -23,6 +23,8 @@ BRAE_HD code both arms run (namespace `brae::rhoCentral`).
 | 222-286, cell half: rho, rhoU, U, rhoE, e, thermo.correct, p | `rhoCentralCellUpdate.cuh` (HD) | four stages (momentum, energy, thermo, pressure) |
 | 232-288, patch half | `rhoCentralPatchUpdate.cuh` (HD), with brae's patch fields | rhoU_b, e_b, T_b, psi_b, rhoE_b; then p_b and rho_b; the transform patches' U (`transformPatchU`) and constraint-patch rho_b (`patchRhoMid`) |
 | constraint and transform patches: symmetryPlane, symmetry, slip, wedge (milestone C) | `rhoCentralControls.cu` (per-face data on the `Case`), the patch half above | sec. 5e |
+| inletOutlet on U, p, T, switched on line 195's `phi` (milestone D) | brae's `InletOutletPatchField` (host, `switchInletOutlet` in `rhoCentralCreateFields_cpp.cuh`) and `deviceUpdateInletOutlet` (device) | sec. 5f |
+| `Time::writeObject`'s purgeWrite (milestone D) | shared: `src/OpenFOAM/db/Time/purge_write.cuh` (`PurgeWrite`, hoisted out of `WriteControl`) | the driver calls it after each write |
 | one step, composed | `rhoCentralStep_cpp.cuh/.cu` (H), `rhoCentralStep.cuh/.cu` (D) | the two `Arm`s |
 | hePsiThermo + hConst + perfectGas | `rhoCentralThermo.cuh` (HD) | Es, Cv, psi, the Newton e -> T loop |
 
@@ -73,6 +75,8 @@ download()  the state, for a write (the device arm copies it back; the host arm'
   as it is for its current callers;
 - an accumulating clock: `value += deltaT`, write switches as `Time::operator++`, `uniform/time`. Done in B:
   `src/OpenFOAM/db/Time/run_clock.cuh` (`RunClock`);
+- the purgeWrite FIFO (`Time::writeObject`). Done in D: `src/OpenFOAM/db/Time/purge_write.cuh` (`PurgeWrite`);
+  `WriteControl::recordWritten`, which held the only copy, now calls it;
 - a whole-keyword fvSchemes lookup (`parseFieldGradScheme` matches substrings);
 - per-cell rDeltaT for localEuler.
 
@@ -101,17 +105,23 @@ download()  the state, for a write (the device arm copies it back; the host arm'
     patches.
   - `rhoE_b == ...` (267) does the same.
   - `rho_b == psi_b*p_b` (288) comes last.
-- **U** is evaluated at 232: inletOutlet and pressureInletOutletVelocity read this step's `phi`. Slip and symmetry use
-  per-face normals, symmetryPlane the patch normal.
+- **phi** is set at 195, `aphiv_pos*rho_pos + aphiv_neg*rho_neg`, each product rounded on its own before the sum
+  (OpenFOAM's field algebra stores both): on a face of fluid at rest the two are exact negatives and phi is exactly 0.
+  brae fused them into an FMA until milestone D and got +-5e-15 there (`roundedProduct`, `rhoCentralFaceFlux.cuh`).
+- **U** is evaluated at 232: inletOutlet and pressureInletOutletVelocity read this step's `phi`, inletOutlet as
+  `valueFraction = 1 - pos0(phi)` -- so phi exactly 0 takes the outflow branch. Slip and symmetry use per-face
+  normals, symmetryPlane the patch normal.
 - **e** is evaluated at 264 (`=`, which evaluates constraint patches) and at 265 (`correctBoundaryConditions`).
-  - The energy BCs run `Tw.evaluate()` while the cell T is still the old one.
+  - The energy BCs run `Tw.evaluate()` while the cell T is still the old one. On an inletOutlet T (mixedEnergy) that
+    evaluate is the switch on this step's phi and the blend with the OLD cell T: an outflow face's T_b is last step's
+    cell T.
   - The e patch type follows T: fixedValue -> fixedEnergy, zeroGradient -> gradientEnergy, mixed and its derived types
     -> mixedEnergy, and anything else keeps T's type.
 - **thermo.correct()** (266):
   - a T patch that `fixesValue()` (fixedValue, every mixed-derived type, calculated) gets `e_b = HE(p_b, T_b)`;
   - any other T patch gets `T_b = THE(e_b, p_b, T_b)` from its own old T.
   - p_b here is still the previous step's.
-- **p** is evaluated at 287.
+- **p** is evaluated at 287; an inletOutlet p switches on the same phi.
 
 ## 5. Milestone A: what moved
 
@@ -272,7 +282,58 @@ Gates for the transition:
   - controls red: U unprojected on the transform faces (0.3 of the field), rhoU_b and rhoE_b by last step's rho_b on
     the constraint patches (2e-03 on obliqueShock, 5e-04 on the cone; not visible on wedge15Ma5, whose symmetry planes
     see only the uniform stream).
+- **The envelope, both measurements kept** (approved with C; `tests/rho_central_gate_lib.sh`): every arm also
+  reports itself against each OpenFOAM decomposition alone. Re-run after D's phi fix, obliqueShock stays above ten
+  times the two-way split alone at t = 7 and 8 (CUDA 1.24x, host 1.95x; 2.9x at t = 5 to 8 in C's first run), and
+  within the four-way one (at most 0.75 of it).
 - **Not gated:** viscous flow on these patches; 3-D; a symmetryPlane or wedge split over processors.
+
+## 5f. Milestone D: inletOutlet and purgeWrite
+
+- **What runs:** `inletOutlet` on U, p and T of a plain patch, on the flux `phi` (a `phi` entry naming another field,
+  or no `inletValue`, is refused; so are outletInlet and the other mixed types); controlDict `purgeWrite` (a negative
+  value warned about and taken as 0, as OpenFOAM does). forwardStep runs as shipped.
+- **inletOutlet**, brae's own patch field and device switch, not a solver-local copy:
+  - the host arm calls `switchInletOutlet` (`InletOutletPatchField::updateFromFlux`), the device arm
+    `deviceUpdateInletOutlet`, on this step's boundary phi, before U (232), T (265) and p (287) are evaluated:
+    valueFraction = 1 - pos0(phi), so phi exactly 0 is outflow;
+  - T's inletOutlet makes he mixedEnergy (basicThermo::heBoundaryTypes); its `Tw.evaluate()` blends the inletValue
+    with the cell's OLD T, and since mixed `fixesValue()`, thermo.correct() sets e_b = HE(p_b, T_b) -- the arithmetic
+    `updatePatchFace` already had for a fixed T, so no new patch code was needed there;
+  - at construction the file's `value` stands, and without one the face cells (inletOutletFvPatchField's
+    `extrapolateInternal()`), as brae's class already did.
+- **phi's rounding (a fix, sec. 4).** `aphiv_pos*rho_pos + aphiv_neg*rho_neg` was contracted into an FMA on both
+  arms. On a face of fluid at rest the two products are exact negatives: OpenFOAM's phi is exactly 0 (outflow), brae's
+  was +-5e-15. Measured on a shockTube with inletOutlet ends: brae took the inflow branch on both ends at step 1 and
+  ran away from OpenFOAM. Each product is now rounded on its own (`roundedProduct`). Every brae result moved in its
+  last bits: the Sod gate's outputs are no longer byte-identical to milestone A's (the brae files of its nine runs
+  differ; OpenFOAM's are untouched), and its distances to OpenFOAM are the same size (CUDA 7.7e-15 before, 7.9e-15
+  after; bound 8e-14). The B and C gates pass unchanged in count.
+- **purgeWrite:** `Time::writeObject`'s FIFO, hoisted into `src/OpenFOAM/db/Time/purge_write.cuh` and called after
+  each write; the start time's directory is never in it.
+- **Measured** (`tests/rho_central_forwardstep_vs_openfoam.sh`, 94 checks; GB10, 2026-11-17):
+  - forwardStep as shipped (16,128 cells, 6694 steps to t = 4): every deltaT and time name the same as OpenFOAM's,
+    the same 11 directories left by purgeWrite 10 on both arms; at 17 digits every one of the 40 write times within
+    ten times OpenFOAM's own spread (at most 0.18 of the bound), the outlet's written U, T, rho likewise;
+  - forwardStep's outlet takes outflow at every face and step (0 inflow face-steps of 428,416), so two variants
+    carry the rest: the inlet as inletOutlet (inflow on every face, every step, on U, p and T), and a shockTube whose
+    ends flow out at 50 m/s until the expansion turns the left end inward (rev17; restarted from OpenFOAM's own
+    t = 0.013 and written every step through the switch: CUDA 2.4e-15, host 2.8e-15 from OpenFOAM at worst);
+  - the bow-shock standoff 0.2915, the shock meeting the top wall at x = 0.6115 and the pitot pressure on the step
+    12.0136 equal OpenFOAM's to 6 digits (Rayleigh's pitot 12.061);
+  - controls red: the switch fed -phi (2.9e+07 x the bound, then an unphysical state at t = 0.91), T's inletOutlet
+    on the new cell T (3.0e+05 x on forwardStep), the switch on the step before's phi (3.2e+11 x on the reversing
+    tube; NOT visible on forwardStep, whose outlet never changes branch), purgeWrite ignored (41 directories
+    against 11);
+  - two variants that do NOT work in OpenFOAM either, and are not gated: inletOutlet ends with the left state as
+    inletValue (the switch flips every step and deltaT collapses to 1e-11 in both codes), and an open top on
+    forwardStep (OpenFOAM stops on a negative temperature at t = 1.13; brae refuses the same step's state). A
+    switch fed by a velocity at round-off level (a tube at rest) decides on round-off, in OpenFOAM too.
+- **Performance** (forwardStep to t = 0.03, nothing else running): 16,128 cells 0.65 ms a step against OpenFOAM's
+  5.6 (8.6x); 64,512 1.6 against 24.4 (15x); 258,048 5.6 against 101 (18x); 1,032,192 19.4 against 620 (32x).
+  GPU memory 2.9 KiB a cell (2.9 GiB at 1,032,192 cells). On the shipped mesh the step is bound by the per-step
+  synchronisation of adjustTimeStep (sec. 5b).
+- **Not gated:** a restart from brae's own output (milestone E), inletOutlet on a coupled patch, viscous flow, 3-D.
 
 ## 6. Milestones, each closed by a gate against OpenFOAM v2412
 
@@ -286,7 +347,7 @@ Every gate:
 | A | restructure into the modules above; brae BC classes; shared limiter library; driver + Stepper | the Sod gate and the refusals unchanged |
 | B (done) | adjustTimeStep: setDeltaT, adjustable writes, first step x1.2, restart deltaT | shockTube **as shipped**: the deltaT sequence and fields |
 | C (done) | constraint and transform BCs: symmetryPlane, symmetry, slip, wedge, with the conservative-state patch semantics of sec. 4 | wedge15Ma5 as shipped; obliqueShock as shipped (shock angle against theta-beta-M); a symmetry and a slip variant; an axisymmetric cone on wedge patches |
-| D | inletOutlet (U, T -> mixedEnergy) and purgeWrite (refused by name since B) | forwardStep as shipped |
+| D (done) | inletOutlet (U, p, T; T -> mixedEnergy) and purgeWrite | forwardStep as shipped; the inlet as inletOutlet; a tube whose end turns from outflow to inflow |
 | E | restart: startFrom latestTime, `uniform/time`, the writer keeping BC keys | stop/restart against the continuous run and against OpenFOAM's own restart |
 | F | other Riemann problems and limiters (the vanAlbada, Minmod, MUSCL, limitedLinear family) | Lax, 123 and a strong shock tube: brae against OpenFOAM and the exact solution |
 | G | viscous: muEff, tauMC, U and e correctors (smoothSolver/GaussSeidel), sigmaDotU, sutherland, noSlip | a viscous shock tube and a laminar compressible boundary layer against OpenFOAM |
@@ -295,6 +356,7 @@ Every gate:
 | J | compressible RAS on the central path | a modified tutorial with kOmegaSST |
 | K | mesh motion (velocityComponentLaplacian, meshPhi) | movingCone |
 
-The solver stays labelled **experimental** until A to E pass and at least the four inviscid tutorials run as shipped.
+The solver stays labelled **experimental** until A to E pass and at least the four inviscid tutorials run as shipped
+(since D they do: shockTube, wedge15Ma5, obliqueShock and forwardStep).
 Multi-GPU is designed for, not built: the Stepper's patch evaluation and gradient stages are where halo exchanges will
 go.

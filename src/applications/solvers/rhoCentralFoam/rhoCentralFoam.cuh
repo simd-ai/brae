@@ -29,6 +29,8 @@ public:
     virtual void download(State& s) = 0;
     // deltaT * the sum over steps of what left through the boundary: mass, momentum, energy (diagnostics)
     virtual void boundaryOutflow(scalar& mass, vector& mom, scalar& energy) const = 0;
+    // over the steps and the faces where U, p or T is inletOutlet: how many took the inflow branch (phi < 0), of all
+    virtual void inletOutletInflow(long long& inflow, long long& faceSteps) const = 0;
     virtual std::size_t deviceBytes() const { return 0; }
 };
 
@@ -49,7 +51,7 @@ Integrals integrals(const Case& cs, const State& s);
 // Writes U, p, T, rho to <caseDir>/<timeName>, as OpenFOAM's AUTO_WRITE fields, at the case's writePrecision.
 void writeTime(const Case& cs, const State& s, const std::string& timeName);
 
-// The whole run. onDevice selects the arm; control is a gate's negative control (device arm only).
+// The whole run. onDevice selects the arm; control is a gate's negative control (rhoCentralState.cuh says which arm).
 int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control);
 
 } // namespace rhoCentral

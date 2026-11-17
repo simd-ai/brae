@@ -5,6 +5,7 @@
 #include "rhoCentralStep_cpp.cuh"
 
 #include "brae_time.cuh"
+#include "purge_write.cuh"
 #include "run_clock.cuh"
 #include "time_controls.cuh"
 #include "foam_dict.cuh"
@@ -117,18 +118,32 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
     printIntegrals("start", I0);
 
     const bool clockControl = control == controlUntrimmed || control == controlLaggedCourant;
-    const bool patchControl = control == controlNoTransform || control == controlLaggedRhoB;   // both arms
-    if (control != controlNone && !clockControl && !patchControl && !onDevice)
+    const bool driverControl = clockControl || control == controlNoPurge;   // the loop's, on either arm
+    const bool ioControl = control == controlInletOutletInverted || control == controlLaggedPhi
+                        || control == controlInletOutletNewT;
+    const bool patchControl = control == controlNoTransform || control == controlLaggedRhoB || ioControl;   // both arms
+    if (control != controlNone && !driverControl && !patchControl && !onDevice)
         throw std::runtime_error("BRAE_CONTROL_RCF upwind and noPressureJump are device-arm controls; the host "
                                  "reference has none.");
     if (clockControl && !tc.adjustTimeStep)
         throw std::runtime_error("BRAE_CONTROL_RCF untrimmed and laggedCourant are controls of adjustTimeStep; this "
                                  "case runs a fixed deltaT.");
+    // a control that cannot change this case would pass any gate: refuse it
+    if (ioControl && !(cs.ioU || cs.ioP || cs.ioT))
+        throw std::runtime_error("BRAE_CONTROL_RCF inletOutletInverted, laggedPhi and inletOutletNewT are controls of "
+                                 "inletOutlet; no patch of this case's U, p or T is one.");
+    if (control == controlInletOutletNewT && !cs.ioT)
+        throw std::runtime_error("BRAE_CONTROL_RCF inletOutletNewT is a control of T's inletOutlet; this case's T has "
+                                 "none.");
+    if (control == controlNoPurge && cs.purgeWrite <= 0)
+        throw std::runtime_error("BRAE_CONTROL_RCF noPurge is a control of purgeWrite; this case's is 0.");
+    // Time::writeObject's purge after each write (TimeIO.C:557-582); the control keeps every directory
+    PurgeWrite purge(control == controlNoPurge ? 0 : cs.purgeWrite, /*warnNegative=*/true);
 
     std::unique_ptr<Arm> arm;
     if (onDevice)
     {
-        arm = gpu::rhoCentral::makeDeviceArm(cs, s, pf, clockControl ? controlNone : control);
+        arm = gpu::rhoCentral::makeDeviceArm(cs, s, pf, driverControl ? controlNone : control);
         std::printf("diag device-memory %.3f MiB\n", arm->deviceBytes()/1048576.0);
     }
     else
@@ -192,6 +207,7 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
         {
             arm->download(s);
             writeTime(cs, s, clock.timeName());
+            purge.written(cs.caseDir, clock.timeName());
             std::printf("written %s\n", clock.timeName().c_str());
         }
     }
@@ -203,6 +219,12 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
     vector bndMom{0, 0, 0};
     arm->boundaryOutflow(bndMass, bndMom, bndEnergy);
     std::printf("diag end time %s value %.17g steps %ld\n", clock.timeName().c_str(), (double)clock.value(), steps);
+    if (cs.ioU || cs.ioP || cs.ioT)
+    {
+        long long inflow = 0, faceSteps = 0;
+        arm->inletOutletInflow(inflow, faceSteps);
+        std::printf("diag inletOutlet inflow face-steps %lld of %lld\n", inflow, faceSteps);
+    }
 
     // ---- diagnostics ------------------------------------------------------------------------------------------------
     const Integrals I1 = integrals(cs, s);

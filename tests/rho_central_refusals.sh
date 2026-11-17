@@ -3,11 +3,12 @@
 # v2412's own rhoCentralFoam tutorials and on single-edit variants of shockTube. Each row: a case, the edit, the
 # words the refusal must contain. A refusal must exit non-zero and write no time directory.
 #
-# The shipped tutorials run as shipped and stop on their first unported input; a row with `purgeWrite 0` steps past
-# that to show the next one is also named. wedge15Ma5 and obliqueShock run since milestone C and are compared in
-# tests/rho_central_wedge_vs_openfoam.sh; one row here checks OpenFOAM's pairing of constraint patch and field types
-# on wedge15Ma5. What this does NOT show: that the refused inputs are rare (they are not -- four of the seven shipped
-# tutorials are refused today; ARCHITECTURE.md lists the order of the work).
+# The shipped tutorials run as shipped and stop on their first unported input. wedge15Ma5 and obliqueShock run since
+# milestone C (tests/rho_central_wedge_vs_openfoam.sh), forwardStep since milestone D, which ported inletOutlet and
+# purgeWrite (tests/rho_central_forwardstep_vs_openfoam.sh); one row here checks OpenFOAM's pairing of constraint patch
+# and field types on wedge15Ma5, and three check what inletOutlet's port leaves out. What this does NOT show: that the
+# refused inputs are rare (they are not -- three of the seven shipped tutorials are refused today; ARCHITECTURE.md
+# lists the order of the work).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BRAE_RCF_BIN:-$ROOT/build/brae_rhoCentralFoam}"
@@ -52,13 +53,9 @@ row()
         tail -n 3 "$d/log" | sed 's/^/     /'
     fi
 }
-PURGE0='s/^(purgeWrite\s+)\S+;/\10;/'
-row forwardStep_shipped forwardStep no "purgeWrite 10"
-row forwardStep_purge0 forwardStep yes "is \`inletOutlet\`" system/controlDict "$PURGE0"
 row biconic_shipped biconic25-55Run35 no "ddtSchemes resolves to \`localEuler\`"
 row LadenburgJet60psi_shipped LadenburgJet60psi no "thermoType transport is \`sutherland\`"
-row movingCone_shipped movingCone no "purgeWrite 5"
-row movingCone_purge0 movingCone no "dynamicMeshDict selects" system/controlDict "$PURGE0"
+row movingCone_shipped movingCone no "dynamicMeshDict selects"
 row sod_fluxScheme shockTube no "fluxScheme \`Bogus\` is not a valid choice" \
     system/fvSchemes 's/^(fluxScheme\s+)\S+;/\1Bogus;/'
 row sod_reconstruct shockTube no "reconstruct(rho) to \`Minmod\`" \
@@ -78,6 +75,10 @@ row sod_enthalpy shockTube no "energy is \`sensibleEnthalpy\`" \
     constant/thermophysicalProperties 's/sensibleInternalEnergy/sensibleEnthalpy/'
 row sod_clockTime shockTube no "writeControl \`clockTime\` is not ported" \
     system/controlDict 's/^(writeControl\s+)\S+;/\1clockTime;/'
-row sod_purgeWrite shockTube no "purgeWrite 2" system/controlDict 's/^(purgeWrite\s+)\S+;/\12;/'
+row sod_outletInlet shockTube yes "is \`outletInlet\`" 0/U '/sides/,/\}/ s/zeroGradient;/outletInlet; outletValue uniform (0 0 0);/'
+row sod_inletOutletPhi shockTube yes "is \`inletOutlet\` on \`phi phiEp\`" \
+    0/T '/sides/,/\}/ s/zeroGradient;/inletOutlet; inletValue uniform 300; phi phiEp;/'
+row sod_inletOutletNoInletValue shockTube yes "is \`inletOutlet\` without \`inletValue\`" \
+    0/p '/sides/,/\}/ s/zeroGradient;/inletOutlet;/'
 echo "rho_central_refusals: $passes passed, $fails failed (work in $W)"
-[ "$fails" = 0 ] && [ "$passes" -ge 17 ]
+[ "$fails" = 0 ] && [ "$passes" -ge 16 ]

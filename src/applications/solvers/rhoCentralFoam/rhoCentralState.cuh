@@ -53,6 +53,10 @@ enum StatusBits : int
 //   laggedCourant    setDeltaT.H fed the Courant number at the step before's deltaT, not at its own
 //   noTransform      U on symmetryPlane, symmetry, slip and wedge faces is the cell value (zeroGradient), unprojected
 //   laggedRhoB       rhoU_b and rhoE_b on constraint patches multiplied by last step's rho_b, not the solve's rho_P
+//   inletOutletInverted  inletOutlet switched on -phi: the inletValue on outflow faces, the cell on inflow ones
+//   laggedPhi        inletOutlet switched on the step before's phi, not on this step's (rhoCentralFoam.C:195)
+//   inletOutletNewT  T's inletOutlet evaluated on the cells' new T, as if Tw.evaluate() ran after thermo.correct()
+//   noPurge          purgeWrite ignored: every written time directory kept (what stage 1 did in silence)
 enum Control : int
 {
     controlNone = 0,
@@ -61,7 +65,11 @@ enum Control : int
     controlUntrimmed = 3,
     controlLaggedCourant = 4,
     controlNoTransform = 5,
-    controlLaggedRhoB = 6
+    controlLaggedRhoB = 6,
+    controlInletOutletInverted = 7,
+    controlLaggedPhi = 8,
+    controlInletOutletNewT = 9,
+    controlNoPurge = 10
 };
 
 } // namespace rhoCentral

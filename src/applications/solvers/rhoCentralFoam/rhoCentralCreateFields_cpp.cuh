@@ -33,6 +33,22 @@ inline void evaluatePatches(GeometricField<T>& f, const std::vector<T>& internal
     }
 }
 
+// inletOutletFvPatchField::updateCoeffs (inletOutletFvPatchField.C:99-113), which every evaluation of an inletOutlet
+// patch runs first: valueFraction = 1 - pos0(phip), on the flux `phi` as it stands -- rhoCentralFoam.C:195's, this
+// step's, at :232, :265 and :287 alike. phiB is that flux on every boundary face, flat in patch order.
+template <typename T>
+inline void switchInletOutlet(GeometricField<T>& f, const std::vector<scalar>& phiB, const Case& cs)
+{
+    std::size_t k0 = 0;
+    for (std::size_t pi = 0; pi < cs.patches.size(); ++pi)
+    {
+        const std::size_t n = static_cast<std::size_t>(cs.patches[pi].size);
+        if (f.boundary[pi]->isInletOutlet())
+            f.boundary[pi]->updateFromFlux(std::vector<scalar>(phiB.begin() + k0, phiB.begin() + k0 + n));
+        k0 += n;
+    }
+}
+
 } // namespace rhoCentral
 } // namespace cpu
 } // namespace brae

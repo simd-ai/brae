@@ -1,0 +1,242 @@
+# Shared by the rhoCentralFoam gates that compare brae with OpenFOAM v2412 and with OpenFOAM's own decomposed runs
+# (tests/rho_central_wedge_vs_openfoam.sh, tests/rho_central_forwardstep_vs_openfoam.sh). Sourced, not run.
+#
+# The caller sets: W (work directory), BIN, STEPS, FIELDS, OFBASHRC and BOUND (the field floor). It gets ok/fail
+# counting into passes/fails.
+#
+# THE ENVELOPE (approved 2026-11-17, milestone C; declared here, never widened by a gate in passing): a field of brae's
+# at a write time is within ten times OpenFOAM's own spread for that field at that time, never below BOUND. OpenFOAM's
+# own spread is its distance from OpenFOAM serial when decomposed in two (simple, (2 1 1)) and in four (scotch), the
+# larger of the two. BOTH are reported, each on its own, by every arm: against two alone obliqueShock's CUDA arm stood
+# at up to 2.9x its bound at t = 5 to 8 (milestone C's first run), because the two-way split's one processor column
+# lies in smooth flow and its distance decays there while the four-way split's does not.
+
+fail() { echo "FAIL $*"; fails=$((fails + 1)); }
+ok() { passes=$((passes + 1)); echo "ok   $*"; }
+of() { bash -c "set +u; source '$OFBASHRC' > /dev/null 2>&1; set -e; $*"; }
+le() { python3 -c "import sys; sys.exit(0 if float('${1:-nan}') <= float('$2') else 1)" 2> /dev/null; }
+mx() { python3 -c "print('%.3e' % max(float('$1'), float('$2')))"; }
+copy() { rm -rf "$2"; mkdir -p "$2"; cp -r "$1/system" "$1/constant" "$1/0" "$2/"; }
+ofrun() { of "cd '$1' && rhoCentralFoam > log 2>&1" < /dev/null || fail "OpenFOAM rhoCentralFoam in $(basename "$1")"; }
+ofnp()   # ofnp <dir> <2|4>: in two by simple (2 1 1), in four by scotch
+{
+    if [ "$2" = 2 ]
+    then
+        printf '%s\n' 'FoamFile { version 2.0; format ascii; class dictionary; object decomposeParDict; }' \
+            'numberOfSubdomains 2;' 'method simple;' 'coeffs { n (2 1 1); }' > "$1/system/decomposeParDict"
+    else
+        printf '%s\n' 'FoamFile { version 2.0; format ascii; class dictionary; object decomposeParDict; }' \
+            "numberOfSubdomains $2;" 'method scotch;' > "$1/system/decomposeParDict"
+    fi
+    of "cd '$1' && decomposePar > log.decomposePar 2>&1 && mpirun -np $2 rhoCentralFoam -parallel > log 2>&1 \
+        && reconstructPar > log.reconstructPar 2>&1" < /dev/null || fail "OpenFOAM decomposed in $2, $(basename "$1")"
+}
+braerun()   # braerun <dir> [env ...]
+{
+    local d=$1
+    shift
+    (cd "$d" && env "$@" timeout 900 "$BIN" -case . > log 2> err < /dev/null; echo $? > rc)
+    [ "$(cat "$d/rc")" = 0 ] || { fail "$(basename "$d") exited $(cat "$d/rc"): $(head -c 300 "$d/err")"; return 1; }
+}
+# the write times of a case: its time directories less 0 and the controlDict's startTime (a restart's)
+times()
+{
+    local st
+    st=$(sed -n 's/^startTime[[:space:]]\{1,\}\([^;[:space:]]*\);.*/\1/p' "$1/system/controlDict" 2> /dev/null)
+    (cd "$1" && ls -d [0-9]* 2> /dev/null | grep -v '0.orig' | grep -vxF -e 0 -e "${st:-0}" | sort -g | tr '\n' ' ')
+}
+# every time directory a case holds, the start one included (what purgeWrite leaves)
+alltimes() { (cd "$1" && ls -d [0-9]* 2> /dev/null | grep -v '0.orig' | sort -g | tr '\n' ' '); }
+
+# cmpdir <brae dir>: where its comparison files go (never inside a case: a stray file there would read as a time)
+cmpdir() { local k="$W/cmp/$(basename "$1")"; mkdir -p "$k"; echo "$k"; }
+absfile() { python3 "$FIELDS" absdiff "$1" "$2" > "$3" 2>&1; }
+relof() { sed -n "s/^absdiff $1 [^ ]* \([^ ]*\) .*/\1/p" "$2"; }
+# spreadat <OF serial dir> <t> <field> <cmp dir> <refs...>: OpenFOAM's own spread for the field at t, the larger over
+# its decompositions, then each one's: `<largest> <ref 1> <ref 2> ...`
+spreadat()
+{
+    local o=$1 t=$2 f=$3 k=$4 r best=0 v i=0 each=""
+    shift 4
+    for r in "$@"
+    do
+        i=$((i + 1))
+        [ -f "$k/$t.ref$i.abs" ] || absfile "$r/$t" "$o/$t" "$k/$t.ref$i.abs"
+        v=$(relof "$f" "$k/$t.ref$i.abs")
+        each="$each ${v:-nan}"
+        best=$(python3 -c "print('%.3e' % max(float('$best'), float('${v:-nan}')))")
+    done
+    echo "$best$each"
+}
+
+# arm <name> <brae dir> <OF dir> "<refs>" <field floor> <dt: exact|bound|fixed>
+#   OpenFOAM's step count, time names, deltaT (exact: the same digits; bound: within BOUND; fixed), the max Courant
+#   number within ten times OpenFOAM's own spread of it, the same write times, U p T rho at every write time within
+#   the envelope; then, reported, the same against each decomposition alone, and the absolute errors at the last time.
+arm()
+{
+    local name=$1 b=$2 o=$3 refs=$4 floor=$5 dtmode=$6 k
+    k=$(cmpdir "$b")
+    python3 "$STEPS" compare "$b/log" "$o/log" > "$k/steps.cmp" 2>&1
+    read -r nb no <<< "$(sed -n 's/^steps //p' "$k/steps.cmp")"
+    read -r same wdt wdts <<< "$(sed -n 's/^deltaT //p' "$k/steps.cmp")"
+    read -r names <<< "$(sed -n 's/^names //p' "$k/steps.cmp")"
+    read -r wco wcos <<< "$(sed -n 's/^maxCo //p' "$k/steps.cmp")"
+    local rco=0 r v
+    for r in $refs
+    do
+        python3 "$STEPS" compare "$r/log" "$o/log" > "$k/ref.steps.cmp" 2>&1
+        read -r v _ <<< "$(sed -n 's/^maxCo //p' "$k/ref.steps.cmp")"
+        rco=$(python3 -c "print('%.3e' % max(float('$rco'), float('${v:-nan}')))")
+    done
+    local cobound
+    cobound=$(mx "$BOUND" "$(python3 -c "print(10*float('$rco'))")")
+    local dtok=1 dtnote="every deltaT the same"
+    case $dtmode in
+        exact) [ "$same" = "$nb" ] || dtok=0 ;;
+        bound) le "$wdt" "$BOUND" || dtok=0; dtnote="every deltaT within $BOUND (worst $wdt at step $wdts; same digits at $same)" ;;
+        fixed) [ "$same" = "$nb" ] || dtok=0; dtnote="deltaT fixed" ;;
+    esac
+    if [ -n "$nb" ] && [ "$nb" = "$no" ] && [ "$names" = "$nb" ] && [ "$dtok" = 1 ]
+    then
+        ok "$name: $nb steps as OpenFOAM's; every time name the same; $dtnote"
+    else
+        fail "$name: ${nb:-?} steps against ${no:-?}; names ${names:-?}; deltaT same ${same:-?} (worst ${wdt:-?} at ${wdts:-?})"
+    fi
+    if le "$wco" "$cobound"
+    then
+        ok "$name: max Courant number within $cobound at every step (worst $wco at step $wcos; OpenFOAM's own spread $rco)"
+    else
+        fail "$name: max Courant number ${wco:-?} at step ${wcos:-?}, above $cobound"
+    fi
+    local tb to
+    tb=$(times "$b"); to=$(times "$o")
+    if [ "$tb" = "$to" ] && [ -n "$to" ]
+    then
+        ok "$name: the same $(echo $to | wc -w) time directories written"
+    else
+        fail "$name: wrote '$tb', OpenFOAM '$to'"
+        return
+    fi
+    # per decomposition alone (reported): the worst ratio to ten times its spread, and where brae is above it
+    local nref
+    nref=$(echo $refs | wc -w)
+    local -a wr ov
+    local j
+    for j in $(seq 1 "$nref"); do wr[$j]=0; ov[$j]=""; done
+    local over="" worst=0 wt="" wf="" ratio=0 t f sp bd last spl q
+    for t in $to
+    do
+        absfile "$b/$t" "$o/$t" "$k/$t.abs"
+        for f in U p T rho
+        do
+            v=$(relof "$f" "$k/$t.abs")
+            spl=($(spreadat "$o" "$t" "$f" "$k" $refs))
+            sp=${spl[0]}
+            bd=$(mx "$floor" "$(python3 -c "print(10*float('${sp:-nan}'))")")
+            le "$v" "$bd" || over="$over $t:$f($v>$bd)"
+            if python3 -c "import sys; sys.exit(0 if float('${v:-nan}')/float('$bd') > float('$ratio') else 1)"
+            then
+                ratio=$(python3 -c "print('%.3f' % (float('$v')/float('$bd')))"); worst=$v; wt=$t; wf="$f (OpenFOAM's own $sp, bound $bd)"
+            fi
+            for j in $(seq 1 "$nref")
+            do
+                q=$(python3 -c "print('%.3f' % (float('${v:-nan}')/max(float('$floor'), 10*float('${spl[$j]:-nan}'))))")
+                python3 -c "import sys; sys.exit(0 if float('$q') > float('${wr[$j]}') else 1)" && wr[$j]=$q
+                python3 -c "import sys; sys.exit(0 if float('$q') > 1 else 1)" && ov[$j]="${ov[$j]} $t:$f"
+            done
+        done
+        last=$t
+    done
+    if [ -z "$over" ]
+    then
+        ok "$name: U p T rho at $(echo $to | wc -w) write times within ten times OpenFOAM's own spread (floor $floor); closest to its bound ($ratio of it): $worst at t = $wt, $wf"
+    else
+        fail "$name: fields above the bound at$over"
+    fi
+    local label
+    for j in $(seq 1 "$nref")
+    do
+        label="in two (simple)"; [ "$j" = 2 ] && label="in four (scotch)"
+        if [ -z "${ov[$j]}" ]
+        then
+            echo "     $name: against OpenFOAM $label alone: at most ${wr[$j]} of ten times its spread"
+        else
+            echo "     $name: against OpenFOAM $label alone: up to ${wr[$j]} x ten times its spread, above it at $(echo ${ov[$j]} | wc -w) field-times (t:field): $(echo ${ov[$j]} | cut -d' ' -f1-12)"
+        fi
+    done
+    echo "     $name absolute, t = $last:$(awk '{printf " %s %s (rel %s)", $2, $3, $4}' "$k/$last.abs")"
+}
+
+# ctlrun <dir> [env ...]: a negative control's run. It may stop on an unphysical state where OpenFOAM's run goes on:
+# that is not a failure of the gate, and red() reads it
+ctlrun()
+{
+    local d=$1
+    shift
+    (cd "$d" && env "$@" timeout 900 "$BIN" -case . > log 2> err < /dev/null; echo $? > rc)
+}
+# red <name> <control dir> <OF dir> "<refs>": some field at some write time beyond 100 x its bound, or the control
+# stopped on an unphysical state (rho, p or T not positive, or the e -> T inversion failing) where OpenFOAM ran on
+red()
+{
+    local name=$1 c=$2 o=$3 refs=$4 best=0 at="" t f v sp bd q k spl stopped=""
+    if [ -f "$c/rc" ] && [ "$(cat "$c/rc")" != 0 ]
+    then
+        if grep -q "unphysical state" "$c/err"
+        then
+            stopped=$(grep -o "step to time [^ ]*" "$c/err" | head -n 1)
+        else
+            fail "control $name exited $(cat "$c/rc") for another reason: $(head -c 300 "$c/err")"
+            return
+        fi
+    fi
+    k=$(cmpdir "$c")
+    for t in $(times "$o")
+    do
+        absfile "$c/$t" "$o/$t" "$k/$t.abs" || continue
+        for f in U p T rho
+        do
+            v=$(relof "$f" "$k/$t.abs")
+            spl=($(spreadat "$o" "$t" "$f" "$k" $refs))
+            sp=${spl[0]}
+            bd=$(mx "$BOUND" "$(python3 -c "print(10*float('${sp:-nan}'))")")
+            q=$(python3 -c "print('%.3e' % (float('${v:-0}')/float('$bd')))")
+            if python3 -c "import sys; sys.exit(0 if float('$q') > float('$best') else 1)"; then best=$q; at="$f at $t: $v against a bound of $bd"; fi
+        done
+    done
+    if python3 -c "import sys; sys.exit(0 if float('$best') > 100 else 1)"
+    then
+        ok "control $name red: $at ($best x the bound)${stopped:+; it then stopped on an unphysical state ($stopped) where OpenFOAM ran to its end}"
+    elif [ -n "$stopped" ]
+    then
+        ok "control $name red: it stopped on an unphysical state ($stopped) where OpenFOAM ran to its end; before that at most $best x the bound${at:+ ($at)}"
+    else
+        fail "control $name: at most $best x the bound${at:+ ($at)}: not red"
+    fi
+}
+
+# balance <brae dir>: `diag balance` within `diag roundoff` (four ulps of every cell's total a step), and positivity
+balance()
+{
+    local d=$1 bal rnd rel bad t
+    bal=$(sed -n 's/^diag balance mass \([^ ]*\) energy \([^ ]*\) momentum \([^ ]*\) \([^ ]*\) \([^ ]*\) .*/\1 \2 \3 \4 \5/p' "$W/$d/log")
+    rnd=$(sed -n 's/^diag roundoff mass \([^ ]*\) energy \([^ ]*\) momentum \([^ ]*\) \([^ ]*\) \([^ ]*\) .*/\1 \2 \3 \4 \5/p' "$W/$d/log")
+    rel=$(sed -n 's/.*relative to the start totals: mass \([^ ]*\) energy \([^)]*\)).*/mass \1 energy \2/p' "$W/$d/log")
+    if python3 -c "
+import sys
+b = [abs(float(x)) for x in '$bal'.split()]; r = [float(x) for x in '$rnd'.split()]
+sys.exit(0 if len(b) == 5 and len(r) == 5 and all(x <= y for x, y in zip(b, r)) else 1)" 2> /dev/null
+    then
+        ok "$d conserves mass, momentum and energy to its round-off: balance $bal within $rnd (relative to the start totals: $rel)"
+    else
+        fail "$d conservation: balance '${bal:-none}' against round-off '${rnd:-none}'"
+    fi
+    bad=""
+    for t in $(times "$W/$d")
+    do
+        read -r _ r0 p0 T0 nan _ <<< "$(python3 "$FIELDS" stats "$W/$d" "$t")"
+        python3 -c "import sys; sys.exit(0 if float('$r0') > 0 and float('$p0') > 0 and float('$T0') > 0 and int('$nan') == 0 else 1)" 2> /dev/null || bad="$bad $t"
+    done
+    if [ -z "$bad" ]; then ok "$d stable: rho, p, T positive and finite at all $(times "$W/$d" | wc -w) write times"; else fail "$d: non-positive or NaN at$bad"; fi
+}
