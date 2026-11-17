@@ -302,6 +302,37 @@ fi
 rc=$?
 [ $rc != 0 ] && grep -q "brae-mgpu" "$WORK/parallel.log" && ok "-parallel without the multi-GPU layer is refused, naming brae-mgpu" \
     || bad "-parallel" "exit $rc: $(tail -n 2 "$WORK/parallel.log" | tr '\n' ' ')"
+# ...and for every solver, not only the one this binary runs: pimpleFoam and rhoSimpleFoam are other binaries that do not read -parallel, so
+# a hand-over would have run N identical solves under mpirun. The refusal must come from the launcher, before any solver starts.
+for app in pimpleFoam rhoSimpleFoam; do
+    rm -rf "$WORK/par_$app"; cp -r "$steady" "$WORK/par_$app"
+    sed -i "s/^application .*/application $app;/" "$WORK/par_$app/system/controlDict"
+    "$BIN" -case "$WORK/par_$app" -parallel > "$WORK/par_$app.log" 2>&1
+    rc=$?
+    if [ $rc != 0 ] && grep -q "not supported for $app" "$WORK/par_$app.log" && ! grep -q "handing\|-> $app" "$WORK/par_$app.log"; then
+        ok "-parallel on a $app case is refused by the launcher, naming brae-mgpu, and $app is not started"
+    else
+        bad "-parallel $app" "exit $rc: $(tail -n 2 "$WORK/par_$app.log" | tr '\n' ' ')"
+    fi
+done
+
+# One processor's part of a decomposed case (processor patches) is not a case a steady or pimple solver can run: the factory knows the
+# `processor` patch type for interFoam's halo exchange, and without the launcher's refusal brae solved the piece with its cut faces
+# taken for ordinary boundaries, silently.
+rm -rf "$WORK/decomp"; cp -r "$steady" "$WORK/decomp"; rm -rf "$WORK/decomp"/[1-9]*
+"$BIN" decompose -case "$WORK/decomp" -n 2 -method simple -time 0 -quiet > "$WORK/decomp.log" 2>&1
+rm -rf "$WORK/part0"; mkdir -p "$WORK/part0/constant"
+cp -r "$WORK/decomp/system" "$WORK/part0/system"; cp -r "$WORK/decomp/processor0/0" "$WORK/part0/0"
+cp -r "$WORK/decomp/constant/"* "$WORK/part0/constant/"; rm -rf "$WORK/part0/constant/polyMesh"
+cp -r "$WORK/decomp/processor0/constant/polyMesh" "$WORK/part0/constant/polyMesh"
+grep -q "type *processor;" "$WORK/part0/constant/polyMesh/boundary" || bad "setup" "the decomposed part has no processor patch: $(tail -n 2 "$WORK/decomp.log" | tr '\n' ' ')"
+"$BIN" -case "$WORK/part0" > "$WORK/part0.log" 2>&1
+rc=$?
+if [ $rc != 0 ] && grep -q "has processor patches" "$WORK/part0.log" && ! grep -q "device-resident" "$WORK/part0.log"; then
+    ok "one processor's part of a decomposed steady case is refused, naming the processor patches, and is not solved"
+else
+    bad "processor part" "exit $rc: $(tail -n 2 "$WORK/part0.log" | tr '\n' ' ')"
+fi
 
 echo "== $pass passed, $fail failed"
 [ "$fail" = 0 ] && echo PASS || echo FAIL

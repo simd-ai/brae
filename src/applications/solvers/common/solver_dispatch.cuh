@@ -18,6 +18,8 @@
 // A case whose `application` disagrees with its ddtSchemes (application simpleFoam + Euler, say) is a case
 // error, not something to paper over, so that stops too.
 #include "foam_dict.cuh"   // readDict, readFileExpanded
+#include "foam_token_reader.cuh"   // gzSlurp: boundary or boundary.gz
+#include <cctype>
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -241,6 +243,29 @@ inline SolverDecision decideSolver(const std::string& caseDir, const FoamDict& c
     return out;
 }
 
+// Does constant/polyMesh/boundary (or boundary.gz) list a `processor` or `processorCyclic` patch?
+inline bool meshHasProcessorPatch(const std::string& caseDir)
+{
+    const std::vector<char> raw = gzSlurp(caseDir + "/constant/polyMesh/boundary");
+    const std::string t(raw.begin(), raw.end());
+    for (const char* key : {"processor", "processorCyclic"})
+    {
+        const std::string want = key;
+        for (std::size_t at = t.find("type"); at != std::string::npos; at = t.find("type", at + 4))
+        {
+            std::size_t i = at + 4;
+            if (at > 0 && (std::isalnum(static_cast<unsigned char>(t[at - 1])) || t[at - 1] == '_')) continue;   // `subtype`, `nonType`
+            while (i < t.size() && std::isspace(static_cast<unsigned char>(t[i]))) ++i;
+            if (t.compare(i, want.size(), want) == 0)
+            {
+                const std::size_t e = i + want.size();
+                if (e >= t.size() || std::isspace(static_cast<unsigned char>(t[e])) || t[e] == ';') return true;
+            }
+        }
+    }
+    return false;
+}
+
 // Route the case to its solver. Returns only when the running binary IS the chosen solver; otherwise it has
 // already exec'd the right one, or thrown because brae does not have it.
 inline void dispatchSolver(const std::string& caseDir, int argc, char** argv)
@@ -250,6 +275,32 @@ inline void dispatchSolver(const std::string& caseDir, int argc, char** argv)
     // writes through (TimeIO.C:375-383). Set here because every driver reaches the case through this
     // function, so the one entry cannot be honoured by one arm and dropped by another.
     setIOPrecision(controlDict.intOr("writePrecision", 6));
+    // Only brae_interFoam reads a decomposed case, and the other solvers are refused it here, BEFORE a solver is handed the case or the
+    // case is looked at further (a case that names no solver brae has is left to decideSolver's own refusal):
+    //  * `-parallel`: brae_pimpleFoam and brae_rhoSimpleFoam do not look at the flag, so under `mpirun -np N` they would run N redundant
+    //    identical solves, each writing over the others' time directories. (An installed brae-mgpu takes every -parallel run before this.)
+    //  * a mesh with processor patches, i.e. one processor's part of a decomposed case: the factory knows the `processor` patch type (for
+    //    interFoam's halo exchange), so without this a steady or pimple run would take the processor faces for ordinary boundaries and
+    //    solve a piece of the domain with a wrong answer and no message.
+    {
+        const std::string application = controlDict.wordOr("application", "");
+        for (const BraeSolver& e : braeSolvers())
+        {
+            if (application != e.application || std::string(e.exe) == "brae_interFoam") continue;
+            for (int i = 1; i < argc; ++i)
+                if (std::string(argv[i]) == "-parallel")
+                    throw std::runtime_error(
+                        "brae: -parallel (multi-GPU) is not supported for " + application +
+                        " without the multi-GPU layer, brae-mgpu, installed next to brae (none is). Only `application interFoam` "
+                        "reads a decomposed case itself (`-parallel`). Run brae single-GPU without -parallel (and without mpirun).");
+            if (meshHasProcessorPatch(caseDir))
+                throw std::runtime_error(
+                    "brae: " + caseDir + "/constant/polyMesh/boundary has processor patches: it is one processor's part of a decomposed "
+                    "case, which " + application + " cannot run (a piece of the domain with its cut faces taken for ordinary boundaries "
+                    "would give a wrong answer). Run the whole case, or `brae reconstruct` it first; only `application interFoam` runs a "
+                    "decomposed case (`-parallel`).");
+        }
+    }
     const SolverDecision decision = decideSolver(caseDir, controlDict);
     if (selfExecutableName() == decision.row->exe) return;   // already the right binary: solve in this process
     execSolver(*decision.row, argc, argv, decision.why);       // does not return
