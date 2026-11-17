@@ -42,7 +42,7 @@ public:
     {
         const Case& cs = cs_;
         State& s = s_;
-        const HostFluxes f = centralFluxes(cs, s, deltaT);
+        const HostFluxes f = centralFluxes(cs, s, deltaT, control_);
         // the flux every inletOutlet patch switches on (rhoCentralFoam.C:195; the controls feed it another)
         const std::vector<scalar>* phiSwitch = &f.phiB;
         if (cs.ioU || cs.ioP || cs.ioT)

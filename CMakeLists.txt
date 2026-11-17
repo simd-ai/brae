@@ -2273,7 +2273,8 @@ target_link_libraries(brae_rhoSimpleFoam PRIVATE brae_core)
 # brae_rhoCentralFoam: density-based compressible (central-upwind, Kurganov/Tadmor), EXPERIMENTAL: inviscid,
 # laminar, perfectGas+hConst, a fixed deltaT or adjustTimeStep, static mesh; symmetryPlane, symmetry, slip and wedge
 # patches since milestone C (tests/rho_central_wedge_vs_openfoam.sh), inletOutlet and purgeWrite since milestone D
-# (tests/rho_central_forwardstep_vs_openfoam.sh), restart since milestone E (tests/rho_central_restart_vs_openfoam.sh).
+# (tests/rho_central_forwardstep_vs_openfoam.sh), restart since milestone E (tests/rho_central_restart_vs_openfoam.sh),
+# the reconstruction limiters on Riemann problems since milestone F (tests/rho_central_riemann_vs_openfoam.sh).
 # The host reference (rhoCentralStep_cpp.cu)
 # and the CUDA arm (rhoCentralStep.cu) share the case and the loop (rhoCentralFoam.cu); tests/rho_central_sod_vs_openfoam.sh
 # (a fixed deltaT) and tests/rho_central_shocktube_vs_openfoam.sh (the tutorial as shipped) hold both to OpenFOAM
@@ -2308,6 +2309,10 @@ set_tests_properties(rho_central_forwardstep_vs_openfoam PROPERTIES SKIP_RETURN_
 add_test(NAME rho_central_restart_vs_openfoam
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_restart_vs_openfoam.sh)
 set_tests_properties(rho_central_restart_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 5400
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_test(NAME rho_central_riemann_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_riemann_vs_openfoam.sh)
+set_tests_properties(rho_central_riemann_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 5400
                      ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 add_test(NAME rho_central_refusals
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_refusals.sh)

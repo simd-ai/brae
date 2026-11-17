@@ -58,11 +58,13 @@ int main(int argc, char** argv)
             else if (v == "restartGridFromZero") control = controlRestartGridFromZero;
             else if (v == "restartIoExtrapolate") control = controlRestartIoExtrapolate;
             else if (v == "noUniformTime") control = controlNoUniformTime;
+            else if (v == "limiterVanLeer") control = controlLimiterVanLeer;
+            else if (v == "limiterScalarOnV") control = controlLimiterScalarOnV;
             else if (!v.empty())
                 throw std::runtime_error("BRAE_CONTROL_RCF is `" + v + "`; it takes upwind, noPressureJump, untrimmed, "
                                          "laggedCourant, noTransform, laggedRhoB, inletOutletInverted, laggedPhi, "
                                          "inletOutletNewT, noPurge, restartIndexZero, restartGridFromZero, "
-                                         "restartIoExtrapolate or noUniformTime.");
+                                         "restartIoExtrapolate, noUniformTime, limiterVanLeer or limiterScalarOnV.");
             if (control != controlNone)
                 std::fprintf(stderr, "brae rhoCentralFoam: NEGATIVE CONTROL `%s` -- deliberately wrong numerics\n", c);
         }

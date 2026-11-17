@@ -42,10 +42,19 @@ __device__ __forceinline__ scalar dDotGradJ(const Grads& G, int j, int cell, sca
     return dx*G.x[gUx + j][cell] + dy*G.y[gUx + j][cell] + dz*G.z[gUx + j][cell];
 }
 
-// vanLeerLimiter<NVDVTVDV> (NVDVTVDV.H:96-132)
-__device__ __forceinline__ scalar vanLeerV(scalar faceFlux, const vector& phiP, const vector& phiN,
-                                           const Grads& G, int P, int N, scalar dx, scalar dy, scalar dz)
+// <limiter><NVDVTVDV> (NVDVTVDV.H:96-132): the V forms' one limiter for all three components, of the selector `lim`
+// (limiterOfR). scalarOnV: the control limiterScalarOnV, NVDTVD's r of rhoU_x alone.
+__device__ __forceinline__ scalar limitedV(scalar faceFlux, const vector& phiP, const vector& phiN,
+                                           const Grads& G, int P, int N, scalar dx, scalar dy, scalar dz,
+                                           scalar lim, bool scalarOnV)
 {
+    if (scalarOnV)
+    {
+        const scalar gf = phiN.x - phiP.x;
+        const scalar gcf = dDotGradJ(G, 0, (faceFlux > 0) ? P : N, dx, dy, dz);
+        const scalar rx = (fabs(gcf) >= 1000*fabs(gf)) ? 2*1000*sgnD(gcf)*sgnD(gf) - 1 : 2*(gcf/gf) - 1;
+        return limiterOfR(rx, lim);
+    }
     const vector gradfV{phiN.x - phiP.x, phiN.y - phiP.y, phiN.z - phiP.z};
     const scalar gradf = gradfV.x*gradfV.x + gradfV.y*gradfV.y + gradfV.z*gradfV.z;
     const int up = (faceFlux > 0) ? P : N;
@@ -54,7 +63,7 @@ __device__ __forceinline__ scalar vanLeerV(scalar faceFlux, const vector& phiP, 
     scalar r;
     if (fabs(gradcf) >= 1000*fabs(gradf)) r = 2*1000*sgnD(gradcf)*sgnD(gradf) - 1;
     else                                 r = 2*(gradcf/gradf) - 1;
-    return (r + fabs(r))/(1 + fabs(r));
+    return limiterOfR(r, lim);
 }
 
 // limitedSurfaceInterpolationScheme::weights, for the control's limiter 0 and the V limiter
@@ -98,6 +107,7 @@ __global__ void faceKernel(int nIF, bool tadmor, int ctrl,
                            const scalar* __restrict__ Sfz, const scalar* __restrict__ magSf,
                            const scalar* __restrict__ Cx, const scalar* __restrict__ Cy,
                            const scalar* __restrict__ Cz,
+                           scalar limRho, scalar limT, scalar limU,
                            CellInputs F, Grads G, FaceOutputs O)
 {
     const int f = blockIdx.x*blockDim.x + threadIdx.x;
@@ -114,20 +124,23 @@ __global__ void faceKernel(int nIF, bool tadmor, int ctrl,
     {
         const scalar dir = (k == 0) ? 1.0 : -1.0;   // the `pos` and `neg` surface fields, createFields.H
         // interpolate(q, dir, "reconstruct(...)"): vanLeer weights, value = w*(P - N) + N (dotInterpolate's form)
-        auto scalarRecon = [&](const scalar* q, int gi)
+        auto scalarRecon = [&](const scalar* q, int gi, scalar lim)
         {
             const scalar wq = (ctrl == controlUpwind)
                 ? limitedW(0.0, cdw, dir)
-                : limitedFaceWeight(P, N, dir, cdw, q, G.x[gi], G.y[gi], G.z[gi], d, kVanLeerTwoByk);
+                : limitedFaceWeight(P, N, dir, cdw, q, G.x[gi], G.y[gi], G.z[gi], d, lim);
             return wq*(q[P] - q[N]) + q[N];
         };
-        in.rho[k] = scalarRecon(F.rho, gRho);
-        const scalar wU = limitedW((ctrl == controlUpwind) ? 0.0 : vanLeerV(dir, UP, UN, G, P, N, dx, dy, dz),
+        in.rho[k] = scalarRecon(F.rho, gRho, limRho);
+        const scalar wU = limitedW((ctrl == controlUpwind)
+                                       ? 0.0
+                                       : limitedV(dir, UP, UN, G, P, N, dx, dy, dz, limU,
+                                                  ctrl == controlLimiterScalarOnV),
                                    cdw, dir);
         in.rhoU[k] = vector{wU*(UP.x - UN.x) + UN.x, wU*(UP.y - UN.y) + UN.y, wU*(UP.z - UN.z) + UN.z};
-        in.rPsi[k] = scalarRecon(F.rPsi, gRPsi);
-        in.e[k] = scalarRecon(F.e, gE);
-        in.c[k] = scalarRecon(F.c, gC);
+        in.rPsi[k] = scalarRecon(F.rPsi, gRPsi, limT);
+        in.e[k] = scalarRecon(F.e, gE, limT);
+        in.c[k] = scalarRecon(F.c, gC, limT);
     }
     store(centralFaceFlux(in, Sfx[f], Sfy[f], Sfz[f], magSf[f], tadmor, ctrl), O, f);
 }
@@ -201,6 +214,11 @@ void centralFluxes(const DeviceMesh& dm, const Case& cs, int control, DeviceFiel
 {
     const int nC = cs.nC, nB = cs.nB, nIF = cs.nIF;
     const scalar CpByCv = gasCp(cs.gas)/gasCv(cs.gas);
+    // the limiters (Case: reconstruct(rho), (T), (U)); the control limiterVanLeer replaces them all by vanLeer
+    const bool allVanLeer = (control == controlLimiterVanLeer);
+    const scalar limRho = allVanLeer ? kVanLeerTwoByk : cs.limRho;
+    const scalar limT = allVanLeer ? kVanLeerTwoByk : cs.limT;
+    const scalar limU = allVanLeer ? kVanLeerTwoByk : cs.limU;
 
     auxKernel<<<blocksFor(nC), kTPB>>>(nC, CpByCv, F.psi.data(), X.rPsi.data(), X.c.data());
     if (nB) auxKernel<<<blocksFor(nB), kTPB>>>(nB, CpByCv, F.psiB.data(), X.rPsiB.data(), X.cB.data());
@@ -229,7 +247,7 @@ void centralFluxes(const DeviceMesh& dm, const Case& cs, int control, DeviceFiel
                             X.amaxSf.data()};
         faceKernel<<<blocksFor(nIF), kTPB>>>(nIF, cs.tadmor, control, dm.owner.data(), dm.nei.data(), dm.w.data(),
                                              dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(), dm.magSf.data(),
-                                             dm.Cx.data(), dm.Cy.data(), dm.Cz.data(), Fi, G, O);
+                                             dm.Cx.data(), dm.Cy.data(), dm.Cz.data(), limRho, limT, limU, Fi, G, O);
         cudaCheck(cudaGetLastError(), "rhoCentral faces");
     }
     if (nB)

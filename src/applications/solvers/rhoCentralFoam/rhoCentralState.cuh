@@ -61,6 +61,8 @@ enum StatusBits : int
 //   restartGridFromZero  a restart measures the runTime/adjustable write grid from 0, not from its start time
 //   restartIoExtrapolate a restart takes an inletOutlet patch's value from its cells, not from the file's `value`
 //   noUniformTime        the writer leaves uniform/time out, so a restart from brae's output loses the time state
+//   limiterVanLeer       every reconstruct(...) limited by vanLeer (vanLeerV on U), whatever the case names
+//   limiterScalarOnV     the V limiter of rhoU built from its x component alone (NVDTVD on rhoU_x), not NVDVTVDV
 enum Control : int
 {
     controlNone = 0,
@@ -77,7 +79,9 @@ enum Control : int
     controlRestartIndexZero = 11,
     controlRestartGridFromZero = 12,
     controlRestartIoExtrapolate = 13,
-    controlNoUniformTime = 14
+    controlNoUniformTime = 14,
+    controlLimiterVanLeer = 15,
+    controlLimiterScalarOnV = 16
 };
 
 } // namespace rhoCentral

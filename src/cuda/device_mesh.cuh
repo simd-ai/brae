@@ -455,6 +455,13 @@ void deviceDivUpwindCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& phi
 // RANGE would have changed the AMI path's meaning without a word. vanLeer is what every interFoam
 // tutorial names for div(phi,alpha) -- OF vanLeer.H:70, limiter = (r + |r|)/(1 + |r|).
 constexpr scalar kVanLeerTwoByk = -1.0;
+// ...and the other TVD limiters OpenFOAM's limitedSchemes define, each its own sentinel (rhoCentralFoam's
+// reconstruct(...) schemes, milestone F): Minmod.H:84 clamp(r, 0, 1); MUSCL.H:84 clamp(min(2r, 0.5r + 0.5), 0, 2);
+// SuperBee.H:85 max(max(min(2r, 1), min(r, 2)), 0); and `upwind` (upwind.H: weights pos0(faceFlux)), limiter 0.
+constexpr scalar kMinmodTwoByk = -2.0;
+constexpr scalar kMUSCLTwoByk = -3.0;
+constexpr scalar kSuperBeeTwoByk = -4.0;
+constexpr scalar kUpwindTwoByk = -5.0;
 
 // (1-limiter)*pos0(phi), limiter = clamp(twoByk*r, 0, 1), r = NVDTVD ratio from grad(field). twoByk = 2/max(k_,SMALL)
 // (k_=1 -> twoByk=2). gx/gy/gz = cell grad(field) (Gauss). Reduces to deviceDivUpwindCoeffs at limiter=0.

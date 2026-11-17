@@ -28,7 +28,8 @@ struct HostFluxes
 };
 
 // deltaT: this step's, which the Courant numbers are scaled by (centralCourantNo.H reads runTime.deltaTValue())
-HostFluxes centralFluxes(const Case& cs, const State& s, scalar deltaT);
+// control: the limiter controls (rhoCentralState.cuh), which change the reconstruction
+HostFluxes centralFluxes(const Case& cs, const State& s, scalar deltaT, int control = brae::rhoCentral::controlNone);
 
 } // namespace rhoCentral
 } // namespace cpu

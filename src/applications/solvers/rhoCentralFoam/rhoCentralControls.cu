@@ -8,7 +8,10 @@
 #include "scheme_parse.cuh"
 #include "start_time.cuh"
 #include "wedge_patch.cuh"
+#include "device_mesh.cuh"   // the limiter selectors (kVanLeerTwoByk and its kin)
 
+#include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
 #include <string>
@@ -64,6 +67,64 @@ std::string schemeStatement(const std::string& caseDir, const std::string& block
         else if (kw == "default") def = norm;
     }
     return hit.empty() ? def : hit;
+}
+
+// interpolate(vf, dir, "reconstruct(...)") (directionInterpolate.H) through a limitedSurfaceInterpolationScheme: the
+// limiter selector device_limiter.cuh's limiterOfR takes. Scalars (rho; T's rPsi, e, c) take the NVDTVD forms, rhoU the
+// NVDVTVDV `V` forms (LimitedScheme.H, makeLimitedVSurfaceInterpolationScheme); `upwind` is upwind.H's pos0 weights,
+// limiter 0, on either. A scalar-form limiter named for U is LimitedScheme's limitFuncs::magSqr instantiation -- the
+// limiter built from magSqr(rhoU) and its gradient -- which is not ported and is refused by name, as is every other
+// scheme; limitedLinear's coefficient outside [0, 1] stops OpenFOAM (limitedLinear.H) and is refused the same way.
+scalar reconstructLimiter(const std::string& stmt, const std::string& key, bool vectorField)
+{
+    std::string name = stmt, arg;
+    const std::size_t sp = stmt.find(' ');
+    if (sp != std::string::npos)
+    {
+        name = stmt.substr(0, sp);
+        arg = stmt.substr(sp + 1);
+    }
+    std::string base = name;
+    const bool vForm = name.size() > 1 && name.back() == 'V';
+    if (vForm) base = name.substr(0, name.size() - 1);
+    const char* known[] = {"vanLeer", "vanAlbada", "Minmod", "MUSCL", "SuperBee", "limitedLinear"};
+    bool isKnown = false;
+    for (const char* k : known) isKnown = isKnown || base == k;
+    if (name == "upwind")
+    {
+        if (!arg.empty()) refuse("interpolationSchemes " + key + " is `" + stmt + "`: `upwind` takes no coefficient.");
+        return kUpwindTwoByk;
+    }
+    if (!isKnown)
+        refuse("interpolationSchemes resolves " + key + " to `" + stmt + "`; this stage ports vanLeer, vanAlbada, "
+               "Minmod, MUSCL, SuperBee and limitedLinear (and their V forms on U) and upwind "
+               "(src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes). Refusing rather than reconstruct "
+               "with another scheme.");
+    if (vectorField && !vForm)
+        refuse("interpolationSchemes resolves " + key + " to `" + stmt + "`: on a vector, OpenFOAM's scalar-form "
+               "limiter is built from magSqr(rhoU) and its gradient (LimitedScheme.H, limitFuncs::magSqr), which is not "
+               "ported; the `" + base + "V` form (NVDVTVDV) is.");
+    if (!vectorField && vForm)
+        refuse("interpolationSchemes resolves " + key + " to `" + stmt + "`: a V scheme is defined for vectors "
+               "only (makeLimitedVSurfaceInterpolationScheme); OpenFOAM refuses it on a scalar too.");
+    if (base == "limitedLinear")
+    {
+        char* end = nullptr;
+        const double k = arg.empty() ? -1.0 : std::strtod(arg.c_str(), &end);
+        if (arg.empty() || *end != '\0')
+            refuse("interpolationSchemes " + key + " is `" + stmt + "`: limitedLinear needs its coefficient k.");
+        if (k < 0 || k > 1)
+            refuse("interpolationSchemes " + key + " is `" + stmt + "`: limitedLinear's coefficient " + arg
+                   + " should be >= 0 and <= 1 (limitedLinear.H, where OpenFOAM stops with the same FatalIOError).");
+        return 2.0/std::max(static_cast<scalar>(k), static_cast<scalar>(1e-15));   // twoByk_ = 2.0/max(k_, SMALL)
+    }
+    if (!arg.empty())
+        refuse("interpolationSchemes " + key + " is `" + stmt + "`: `" + name + "` takes no coefficient.");
+    if (base == "vanLeer") return kVanLeerTwoByk;
+    if (base == "Minmod") return kMinmodTwoByk;
+    if (base == "MUSCL") return kMUSCLTwoByk;
+    if (base == "SuperBee") return kSuperBeeTwoByk;
+    return 0.0;   // vanAlbada
 }
 
 // The constraint patch types this stage runs: the mesh patch's type IS the patch field's (fvPatchFieldNew.C:
@@ -236,15 +297,12 @@ Case readRhoCentralCase(const std::string& caseDir)
     const std::string rRho = schemeStatement(caseDir, "interpolationSchemes", "reconstruct(rho)");
     const std::string rU   = schemeStatement(caseDir, "interpolationSchemes", "reconstruct(U)");
     const std::string rT   = schemeStatement(caseDir, "interpolationSchemes", "reconstruct(T)");
-    if (rRho != "vanLeer")
-        refuse("interpolationSchemes resolves reconstruct(rho) to `" + rRho + "`; this stage ports vanLeer only "
-               "(limitedSchemes/vanLeer, NVDTVD). Refusing rather than reconstruct with another limiter.");
-    if (rT != "vanLeer")
-        refuse("interpolationSchemes resolves reconstruct(T) to `" + rT + "` (it reconstructs rPsi, e and c); "
-               "this stage ports vanLeer only.");
-    if (rU != "vanLeerV")
-        refuse("interpolationSchemes resolves reconstruct(U) to `" + rU + "` (it reconstructs rhoU); this stage "
-               "ports vanLeerV only (NVDVTVDV).");
+    cs.limRho = reconstructLimiter(rRho, "reconstruct(rho)", false);
+    cs.limT = reconstructLimiter(rT, "reconstruct(T)", false);   // it reconstructs rPsi, e and c
+    cs.limU = reconstructLimiter(rU, "reconstruct(U)", true);    // it reconstructs rhoU
+    cs.reconRho = rRho;
+    cs.reconT = rT;
+    cs.reconU = rU;
     // the limiters' gradients: LimitedScheme.C:56-59 builds them with fvc::grad of the reconstructed field itself
     for (const char* fld : {"rho", "rhoU", "rPsi", "e", "c"})
     {

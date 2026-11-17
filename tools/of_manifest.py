@@ -5084,7 +5084,7 @@ COMPONENTS = {
                   "going out -- and the second needs a pinned staging buffer to go async."),
     ],
     # rhoCentralFoam, EXPERIMENTAL (stage 1 2026-11-16; milestone B, adjustTimeStep, C, the transform patches, D,
-    # inletOutlet and purgeWrite, and E, restart, 2026-11-17): single GPU, static mesh, inviscid laminar, a fixed deltaT or
+    # inletOutlet and purgeWrite, E, restart, 2026-11-17, and F, the reconstruction limiters, 2026-11-18): single GPU, static mesh, inviscid laminar, a fixed deltaT or
     # adjustTimeStep, hePsiThermo + perfectGas + hConst + const, Kurganov/Tadmor, vanLeer/vanLeerV, zeroGradient/
     # fixedValue/empty/slip/symmetryPlane/symmetry/wedge/inletOutlet, any purgeWrite. Everything else is UNSUPPORTED
     # and refused by name (tests/rho_central_refusals.sh). Not SIMPLE or PIMPLE: no pressure
@@ -5213,6 +5213,21 @@ COMPONENTS = {
                   "transformPatchU. On a constraint mesh patch rho, rhoU and rhoE take the constraint type, so "
                   ":233 and :267 multiply by the rho solve's new cell rho; a transform T makes he the same transform, "
                   "e_b = e_P and THE seeded from T_b."),
+        dict(name="reconstructLimiters", of_symbol="vanLeer/vanAlbada/Minmod/MUSCL/SuperBee/limitedLinear (+V), upwind",
+             of_file="src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/LimitedScheme/LimitedScheme.C",
+             classification="GPU_REQUIRED", status="REUSE_EXISTING",
+             brae_existing="src/cuda/device_limiter.cuh (limiterOfR, BRAE_HD; the selectors in src/cuda/device_mesh.cuh)",
+             brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralFlux_cpp.cu",
+             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralFlux.cu",
+             validation="tests/rho_central_riemann_vs_openfoam.sh: Sod, Lax, 123 and a strong shock tube with each "
+                        "limiter (two with Tadmor) and obliqueShock in 2-D with each V form, against OpenFOAM and the "
+                        "exact solution. Open, for review: three compressive-limiter cases OpenFOAM's own decomposed "
+                        "runs do not reproduce step by step, and the strong shock's first write, where brae sits on "
+                        "OpenFOAM's own one-ulp response. Controls red: vanLeer whatever the case names; the V limiter "
+                        "from rhoU_x alone.",
+             note="NVDTVD r on rho, rPsi, e, c, NVDVTVDV r on rhoU (directionInterpolate.H, LimitedScheme.C). The "
+                  "scalar-form limiter on U (limitFuncs::magSqr), a V form on a scalar, limitedLinear's k outside "
+                  "[0, 1] and every other scheme are refused by name."),
         dict(name="restart", of_symbol="Time::setControls, Time::writeTimeDict",
              of_file="src/OpenFOAM/db/Time/Time.C",
              classification="HOST_ONLY", status="REUSE_EXISTING",

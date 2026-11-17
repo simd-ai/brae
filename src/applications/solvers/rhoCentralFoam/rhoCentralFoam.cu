@@ -5,6 +5,7 @@
 #include "rhoCentralStep_cpp.cuh"
 
 #include "brae_time.cuh"
+#include "device_mesh.cuh"   // the limiter selectors
 #include "purge_write.cuh"
 #include "run_clock.cuh"
 #include "time_dict_writer.cuh"
@@ -115,8 +116,9 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
                 (double)clock.endTime(), logPrec, (double)clock.deltaT(), tc.adjustTimeStep ? "yes" : "no");
     if (tc.adjustTimeStep) std::printf(" (maxCo %.*g, maxDeltaT %.*g)", logPrec, (double)tc.maxCo, logPrec,
                                        (double)tc.maxDeltaT);
-    std::printf("\nfluxScheme: %s\ninviscid: every mu is 0\nsolution directions: (%d %d %d)\n",
-                cs.tadmor ? "Tadmor" : "Kurganov", cs.sd.d[0], cs.sd.d[1], cs.sd.d[2]);
+    std::printf("\nfluxScheme: %s\nreconstruct: rho %s, T %s, U %s\ninviscid: every mu is 0\nsolution directions: "
+                "(%d %d %d)\n", cs.tadmor ? "Tadmor" : "Kurganov", cs.reconRho.c_str(), cs.reconT.c_str(),
+                cs.reconU.c_str(), cs.sd.d[0], cs.sd.d[1], cs.sd.d[2]);
 
     // a restart's time state (Time::setControls): the start's index, and its deltaT where uniform/time gave it
     std::printf("diag start time %s index %ld deltaT %.17g\n", cs.startName.c_str(), clock.startTimeIndex(),
@@ -133,7 +135,9 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
     const bool driverControl = clockControl || control == controlNoPurge || restartControl;   // either arm
     const bool ioControl = control == controlInletOutletInverted || control == controlLaggedPhi
                         || control == controlInletOutletNewT;
-    const bool patchControl = control == controlNoTransform || control == controlLaggedRhoB || ioControl;   // both arms
+    const bool limiterControl = control == controlLimiterVanLeer || control == controlLimiterScalarOnV;
+    const bool patchControl = control == controlNoTransform || control == controlLaggedRhoB || ioControl
+                           || limiterControl;   // both arms
     if (control != controlNone && !driverControl && !patchControl && !onDevice)
         throw std::runtime_error("BRAE_CONTROL_RCF upwind and noPressureJump are device-arm controls; the host "
                                  "reference has none.");
@@ -147,6 +151,10 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
     if (control == controlInletOutletNewT && !cs.ioT)
         throw std::runtime_error("BRAE_CONTROL_RCF inletOutletNewT is a control of T's inletOutlet; this case's T has "
                                  "none.");
+    if (control == controlLimiterVanLeer && cs.limRho == kVanLeerTwoByk && cs.limT == kVanLeerTwoByk
+        && cs.limU == kVanLeerTwoByk)
+        throw std::runtime_error("BRAE_CONTROL_RCF limiterVanLeer is a control of the other limiters; this case "
+                                 "reconstructs with vanLeer and vanLeerV already.");
     if (control == controlNoPurge && cs.purgeWrite <= 0)
         throw std::runtime_error("BRAE_CONTROL_RCF noPurge is a control of purgeWrite; this case's is 0.");
     if ((control == controlRestartIndexZero && clock.startTimeIndex() == 0)

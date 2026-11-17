@@ -5,8 +5,8 @@
 // What runs (everything else is refused here, by name, before a field is read): single GPU, static mesh,
 // hePsiThermo + pureMixture + const + hConst + perfectGas + sensibleInternalEnergy, laminar with every mu = 0
 // (inviscid), Euler with a fixed deltaT or adjustTimeStep (setDeltaT.H on the central Courant number), any purgeWrite
-// (milestone D), fluxScheme Kurganov or Tadmor (readFluxScheme.H), reconstruct(rho|T) vanLeer and reconstruct(U)
-// vanLeerV, Gauss linear gradients; on U, p and T the patch fields zeroGradient, fixedValue, slip, inletOutlet on the
+// (milestone D), fluxScheme Kurganov or Tadmor (readFluxScheme.H), reconstruct(rho|T) vanLeer, vanAlbada, Minmod, MUSCL,
+// SuperBee, limitedLinear k or upwind and reconstruct(U) their V forms or upwind (milestone F), Gauss linear gradients; on U, p and T the patch fields zeroGradient, fixedValue, slip, inletOutlet on the
 // flux `phi` (milestone D), and the constraint types empty, symmetryPlane, symmetry and wedge (milestone C) on their
 // own mesh patch types.
 #include "cf_types.cuh"
@@ -43,6 +43,11 @@ struct Case
     SolutionDirections   sd;
     GasCoeffs            gas;
     bool                 tadmor = false;   // fluxScheme Tadmor (readFluxScheme.H); Kurganov otherwise
+    // interpolationSchemes reconstruct(rho), reconstruct(T) (rPsi, e, c) and reconstruct(U) (rhoU): the limiter of each,
+    // as device_limiter.cuh's limiterOfR selects it (device_mesh.cuh's sentinels; limitedLinear's 2/max(k,SMALL) > 0),
+    // and the statement as the case wrote it (milestone F)
+    scalar               limRho = -1.0, limT = -1.0, limU = -1.0;   // kVanLeerTwoByk
+    std::string          reconRho = "vanLeer", reconT = "vanLeer", reconU = "vanLeerV";
 
     // flat boundary addressing: every boundary face in patch order (no coupled patch is accepted, so flat index k is
     // mesh face nInternalFaces + k), empty faces included and flagged

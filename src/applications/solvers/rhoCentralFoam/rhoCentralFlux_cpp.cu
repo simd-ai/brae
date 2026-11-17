@@ -2,12 +2,15 @@
 //
 // Shared infrastructure it runs on:
 //   fvc::gaussGrad (fvc.cu)                         the limiters' gradients, OpenFOAM's gaussGrad::calcGrad order
-//   cpu::limitedSchemes::detail (limitedSchemes_cpp) NVDTVD/NVDVTVDV r, the vanLeer limiter, the limited weight
+//   cpu::limitedSchemes::detail (limitedSchemes_cpp) NVDTVD/NVDVTVDV r and the limited weight
+//   limiterOfR (device_limiter.cuh, BRAE_HD)        the limiter of r, as the device arm and every brae solver use it
 //   centralFaceFlux (rhoCentralFaceFlux.cuh)        the per-face flux both arms evaluate
 #include "rhoCentralFlux_cpp.cuh"
 #include "rhoCentralFaceFlux.cuh"
 #include "rhoCentralThermo.cuh"
 
+#include "device_mesh.cuh"      // the limiter selectors
+#include "device_limiter.cuh"   // limiterOfR
 #include "fvc.cuh"
 #include "limitedSchemes_cpp.cuh"
 
@@ -36,12 +39,12 @@ std::vector<vector> grad(const Case& cs, const std::vector<scalar>& vf, const st
 }
 
 // interpolate(vf, dir, "reconstruct(...)") on an internal face (directionInterpolate.H, LimitedScheme.C):
-// weight = limiter*CDweight + (1 - limiter)*pos0(dir), value = weight*(P - N) + N
+// weight = limiter*CDweight + (1 - limiter)*pos0(dir), value = weight*(P - N) + N; lim selects the limiter
 inline scalar reconstructScalar(scalar dir, scalar cdw, scalar qP, scalar qN, const vector& gP, const vector& gN,
-                                const vector& d)
+                                const vector& d, scalar lim)
 {
     namespace ls = cpu::limitedSchemes::detail;
-    const scalar w = ls::blend(ls::vanLeerLimiter(ls::rScalar(dir, qP, qN, gP, gN, d)), cdw, dir);
+    const scalar w = ls::blend(limiterOfR(ls::rScalar(dir, qP, qN, gP, gN, d), lim), cdw, dir);
     return w*(qP - qN) + qN;
 }
 
@@ -56,9 +59,14 @@ inline tensor gradTensor(const std::vector<vector> g[3], label c)
 } // namespace
 
 
-HostFluxes centralFluxes(const Case& cs, const State& s, scalar deltaT)
+HostFluxes centralFluxes(const Case& cs, const State& s, scalar deltaT, int control)
 {
     namespace ls = cpu::limitedSchemes::detail;
+    // the limiters (Case: reconstruct(rho), (T), (U)); the control limiterVanLeer replaces them all by vanLeer
+    const bool allVanLeer = (control == controlLimiterVanLeer);
+    const scalar limRho = allVanLeer ? kVanLeerTwoByk : cs.limRho;
+    const scalar limT = allVanLeer ? kVanLeerTwoByk : cs.limT;
+    const scalar limU = allVanLeer ? kVanLeerTwoByk : cs.limU;
     const GasCoeffs& gas = cs.gas;
     const label nC = cs.nC, nIF = cs.nIF, nB = cs.nB;
     const std::vector<label>& own = cs.m.owner();
@@ -123,15 +131,18 @@ HostFluxes centralFluxes(const Case& cs, const State& s, scalar deltaT)
         for (int k = 0; k < 2; ++k)
         {
             const scalar dir = (k == 0) ? 1.0 : -1.0;   // the `pos` and `neg` surface fields, createFields.H
-            in.rho[k] = reconstructScalar(dir, cdw, s.rho[P], s.rho[N], gRho[P], gRho[N], d);
-            const scalar wU = ls::blend(ls::vanLeerLimiter(ls::rVector(dir, s.rhoU[P], s.rhoU[N], gUP, gUN, d)), cdw,
-                                        dir);
+            in.rho[k] = reconstructScalar(dir, cdw, s.rho[P], s.rho[N], gRho[P], gRho[N], d, limRho);
+            // NVDVTVDV's r on rhoU (the control: NVDTVD's on rhoU_x alone)
+            const scalar rU = (control == controlLimiterScalarOnV)
+                ? ls::rScalar(dir, s.rhoU[P].x, s.rhoU[N].x, gRhoU[0][P], gRhoU[0][N], d)
+                : ls::rVector(dir, s.rhoU[P], s.rhoU[N], gUP, gUN, d);
+            const scalar wU = ls::blend(limiterOfR(rU, limU), cdw, dir);
             in.rhoU[k] = vector{wU*(s.rhoU[P].x - s.rhoU[N].x) + s.rhoU[N].x,
                                 wU*(s.rhoU[P].y - s.rhoU[N].y) + s.rhoU[N].y,
                                 wU*(s.rhoU[P].z - s.rhoU[N].z) + s.rhoU[N].z};
-            in.rPsi[k] = reconstructScalar(dir, cdw, rPsi[P], rPsi[N], gRPsi[P], gRPsi[N], d);
-            in.e[k] = reconstructScalar(dir, cdw, s.e[P], s.e[N], gE[P], gE[N], d);
-            in.c[k] = reconstructScalar(dir, cdw, c[P], c[N], gC[P], gC[N], d);
+            in.rPsi[k] = reconstructScalar(dir, cdw, rPsi[P], rPsi[N], gRPsi[P], gRPsi[N], d, limT);
+            in.e[k] = reconstructScalar(dir, cdw, s.e[P], s.e[N], gE[P], gE[N], d, limT);
+            in.c[k] = reconstructScalar(dir, cdw, c[P], c[N], gC[P], gC[N], d, limT);
         }
         const FaceFlux o = centralFaceFlux(in, Sf[f].x, Sf[f].y, Sf[f].z, magSf[f], cs.tadmor, controlNone);
         phi[f] = o.phi;

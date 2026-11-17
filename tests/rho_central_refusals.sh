@@ -60,8 +60,14 @@ row LadenburgJet60psi_shipped LadenburgJet60psi no "thermoType transport is \`su
 row movingCone_shipped movingCone no "dynamicMeshDict selects"
 row sod_fluxScheme shockTube no "fluxScheme \`Bogus\` is not a valid choice" \
     system/fvSchemes 's/^(fluxScheme\s+)\S+;/\1Bogus;/'
-row sod_reconstruct shockTube no "reconstruct(rho) to \`Minmod\`" \
-    system/fvSchemes 's/^(\s*reconstruct\(rho\)\s+)\S+;/\1Minmod;/'
+row sod_reconstruct shockTube no "reconstruct(rho) to \`QUICK\`" \
+    system/fvSchemes 's/^(\s*reconstruct\(rho\)\s+)\S+;/\1QUICK;/'
+row sod_reconstructUScalarForm shockTube no "on a vector, OpenFOAM's scalar-form limiter is built from magSqr(rhoU)" \
+    system/fvSchemes 's/^(\s*reconstruct\(U\)\s+)\S+;/\1Minmod;/'
+row sod_reconstructVOnScalar shockTube no "a V scheme is defined for vectors only" \
+    system/fvSchemes 's/^(\s*reconstruct\(rho\)\s+)\S+;/\1MinmodV;/'
+row sod_limitedLinearK shockTube no "should be >= 0 and <= 1" \
+    system/fvSchemes 's/^(\s*reconstruct\(T\)\s+)\S+;/\1limitedLinear 1.5;/'
 row sod_grad shockTube no "grad(rho) to \`leastSquares\`" \
     system/fvSchemes 's/^(\s*default\s+)Gauss linear;/\1leastSquares;/'
 row sod_viscous shockTube no "transport mu is" \
@@ -116,4 +122,4 @@ rowx sod_latestTimeEmpty shockTube "selects time directory 0.004" "$LATEST; mkdi
 rowx sod_latestTimeNoT shockTube "has no T" "$LATEST; mkdir 0.004; cp 0/U 0/p 0.004/"
 rowx sod_startTimeNoT shockTube "the start time directory 0 has no T" "rm 0/T"
 echo "rho_central_refusals: $passes passed, $fails failed (work in $W)"
-[ "$fails" = 0 ] && [ "$passes" -ge 19 ]
+[ "$fails" = 0 ] && [ "$passes" -ge 22 ]

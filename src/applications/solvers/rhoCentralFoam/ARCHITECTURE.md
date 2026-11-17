@@ -5,7 +5,7 @@ implicit viscous correctors), its central-upwind flux assembly and its time loop
 boundary conditions, thermo, gradients, linear smoothers and time controls. Nothing here goes through SIMPLE, PIMPLE or
 rhoSimpleFoam's pressure correction, and there is no pressure equation: p = rho/psi.
 
-## 1. OpenFOAM's structure, and where each part lives in brae (after milestone E)
+## 1. OpenFOAM's structure, and where each part lives in brae (after milestone F)
 
 The reference is OpenFOAM v2412 `applications/solvers/compressible/rhoCentralFoam`. In the table, (H) marks the host
 reference (namespace `brae::cpu::rhoCentral`), (D) the device arm (namespace `brae::gpu::rhoCentral`), and (HD)
@@ -25,6 +25,7 @@ BRAE_HD code both arms run (namespace `brae::rhoCentral`).
 | constraint and transform patches: symmetryPlane, symmetry, slip, wedge (milestone C) | `rhoCentralControls.cu` (per-face data on the `Case`), the patch half above | sec. 5e |
 | inletOutlet on U, p, T, switched on line 195's `phi` (milestone D) | brae's `InletOutletPatchField` (host, `switchInletOutlet` in `rhoCentralCreateFields_cpp.cuh`) and `deviceUpdateInletOutlet` (device) | sec. 5f |
 | `Time::writeObject`'s purgeWrite (milestone D) | shared: `src/OpenFOAM/db/Time/purge_write.cuh` (`PurgeWrite`, hoisted out of `WriteControl`) | the driver calls it after each write |
+| `interpolate(vf, dir, "reconstruct(...)")`'s limiters (milestone F) | shared: `src/cuda/device_limiter.cuh` (`limiterOfR`, now BRAE_HD: one copy for both arms and every brae solver), the selectors in `device_mesh.cuh`; the case's choice in `rhoCentralControls.cu` (`reconstructLimiter`) | sec. 5h |
 | restart (milestone E): `Time::setControls` reading `<start>/uniform/time`, `Time::writeTimeDict` writing it | shared: `run_clock.cuh` (reads deltaT under adjustTimeStep, deltaT0, index), `src/OpenFOAM/db/Time/time_dict_writer.cuh` (new) | sec. 5g |
 | one step, composed | `rhoCentralStep_cpp.cuh/.cu` (H), `rhoCentralStep.cuh/.cu` (D) | the two `Arm`s |
 | hePsiThermo + hConst + perfectGas | `rhoCentralThermo.cuh` (HD) | Es, Cv, psi, the Newton e -> T loop |
@@ -403,6 +404,39 @@ Gates for the transition:
   that would start it from an older time (tests/rho_central_refusals.sh, three rows; OpenFOAM stops on each too).
 - **Not gated:** restart with function objects (none in these tutorials), binary or compressed time directories, LTS.
 
+## 5h. Milestone F: Riemann problems and the reconstruction limiters
+
+- **What runs:** reconstruct(rho) and reconstruct(T) (rPsi, e, c) with vanLeer, vanAlbada, Minmod, MUSCL, SuperBee,
+  limitedLinear k or upwind; reconstruct(U) (rhoU) with their V forms (NVDVTVDV) or upwind. Refused by name: the
+  scalar-form limiter on U (LimitedScheme's limitFuncs::magSqr), a V form on a scalar, limitedLinear's k outside [0, 1]
+  (OpenFOAM's FatalIOError), and every other scheme (QUICK, UMIST, Gamma, SFCD, filteredLinear, limitedCubic ...).
+- **No solver-local limiter:** the formulas are OpenFOAM's v2412 ones (Minmod.H:84 `clamp(r, zero_one)`, MUSCL.H:84,
+  SuperBee.H:85, vanAlbada.H:85, vanLeer.H:85, limitedLinear.H:100, std::min/max and Scalar.H's clamp), added to the
+  shared `limiterOfR` the device already used for vanLeer, vanAlbada and limitedLinear, and made BRAE_HD so the host
+  reference calls the same function. vanLeer through it: every CUDA output of the Sod gate byte-identical to milestone
+  E's; the host arm moved by 1.5e-17 at most (GCC contracts the blended weight differently on the new call path).
+- **Measured** (`tests/rho_central_riemann_vs_openfoam.sh`, GB10, 2026-11-18): Toro's tests 1 to 3 and Lax's problem on
+  shockTube's tube at 1000 cells (R = 1, gamma = 1.4), each with the six limiters, two with Tadmor, and obliqueShock (2-D)
+  with each; OpenFOAM serial, in two (simple) and in four (frozen scotch) as the reference:
+  - every limiter changes OpenFOAM's solution (by 0.05 to 0.95 against vanLeer), so none could pass by being ignored;
+  - sod, lax (but SuperBee), obliqueShock (but MUSCL and SuperBee): every deltaT, time name and directory the same as
+    OpenFOAM's, fields within ten times OpenFOAM's own spread at every write time, CUDA and host; the L1 errors against
+    the exact solution equal OpenFOAM's (lax Minmod: rho 2.787e-03, u 1.853e-03, p 9.527e-04; strong limitedLinear 1:
+    p* 460.894, u* 19.5975, Toro's);
+  - Toro 2 (the 123 problem, near vacuum) breaks down in OpenFOAM v2412 itself with vanLeer, MUSCL, SuperBee and
+    limitedLinear (a floating-point exception at step 24 to 27); brae stops at the same step;
+  - OPEN, left red: lax SuperBee, obliqueShock MUSCL and SuperBee part from OpenFOAM serial's deltaT sequence late in
+    the run -- and so do OpenFOAM's own decomposed runs, at the same steps (lax SuperBee: OpenFOAM in two keeps it for 1581
+    steps, in four 1395, brae 1619; obliqueShock SuperBee 787, 785, 785): compressive limiters make these runs chaotic,
+    for every implementation;
+  - OPEN, left red: the strong shock (Toro 3) with every limiter but vanLeer, at its first write (t = 0.03): brae
+    1.1e-12 to 2.0e-12 (CUDA and host alike) against bounds from OpenFOAM's decomposed spread of 1e-13 to 4e-12 -- while
+    OpenFOAM serial with p one ulp up is 1.2e-12 (Minmod) and 2.4e-12 (limitedLinear) from serial there. As with the
+    wedge restart (sec. 5g), brae sits on OpenFOAM's own one-ulp response; the decompositions, whose perturbation starts
+    at their processor faces, have not reached the waves yet. The envelope is not changed for it: a decision for review.
+  - controls red: vanLeer whatever the case names (2.5e+09 x on sod Minmod, 1.1e+05 x on obliqueShock SuperBee); the V
+    limiter of rhoU from rhoU_x alone (2.3e+09 x on obliqueShock Minmod; not visible in 1-D, where rhoU has one component).
+
 ## 6. Milestones, each closed by a gate against OpenFOAM v2412
 
 Every gate:
@@ -417,7 +451,7 @@ Every gate:
 | C (done) | constraint and transform BCs: symmetryPlane, symmetry, slip, wedge, with the conservative-state patch semantics of sec. 4 | wedge15Ma5 as shipped; obliqueShock as shipped (shock angle against theta-beta-M); a symmetry and a slip variant; an axisymmetric cone on wedge patches |
 | D (done) | inletOutlet (U, p, T; T -> mixedEnergy) and purgeWrite | forwardStep as shipped; the inlet as inletOutlet; a tube whose end turns from outflow to inflow |
 | E (done; one arm red, for review) | restart: startFrom latestTime/startTime, `uniform/time` read and written, inletOutlet's value | restarts from OpenFOAM's and brae's output against OpenFOAM's own restart, and against the uninterrupted run |
-| F | other Riemann problems and limiters (the vanAlbada, Minmod, MUSCL, limitedLinear family) | Lax, 123 and a strong shock tube: brae against OpenFOAM and the exact solution |
+| F (done; open checks for review) | the reconstruction limiters vanAlbada, Minmod, MUSCL, SuperBee, limitedLinear and their V forms, upwind | Sod, Lax, 123 and a strong shock tube with every limiter, obliqueShock in 2-D: brae against OpenFOAM and the exact solution |
 | G | viscous: muEff, tauMC, U and e correctors (smoothSolver/GaussSeidel), sigmaDotU, sutherland, noSlip | a viscous shock tube and a laminar compressible boundary layer against OpenFOAM |
 | H | totalPressure (psi branch), totalTemperature, waveTransmissive | a supersonic nozzle and LadenburgJet60psi |
 | I | LTS (setRDeltaT, fvc::smooth), janaf, maxwellSlipU, smoluchowskiJumpT | biconic25-55Run35 |
