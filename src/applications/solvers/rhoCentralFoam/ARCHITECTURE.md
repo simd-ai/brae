@@ -138,8 +138,62 @@ download()  the state, for a write (the device arm copies it back; the host arm'
   ms/step). Device memory rose 14% at 1M cells (1362 against 1194 MiB), for the boundary buffers.
 - The host arm rebuilds per-patch boundary arrays for `fvc::gaussGrad` every step. That is correct but allocates;
   acceptable for the oracle.
-- The flat boundary layout assumes no coupled patch. Cyclic and processor patches (multi-GPU) will need the
-  DeviceBoundary/DeviceMesh appended-face layout.
+- The flat boundary layout assumes no coupled patch: cyclic and processor patches are refused at start-up
+  (`rhoCentralControls.cu`, mesh patch types). Sec. 5c is the plan for both.
+
+## 5c. Coupled patches: the transition before any multi-GPU work
+
+An earlier note here called brae's coupled layout "appended faces". That is not what the code does.
+`DeviceMesh` and `DeviceBoundary` keep coupled faces out of the internal-face list (`device_mesh.cuh`: merging
+them breaks the owner-contiguous scatter), and the two kinds of coupled patch take two different routes:
+
+- **cyclic, cyclicAMI** (`isCoupledInterfaceType`): skipped by the boundary gather; carried by `DeviceCyclic`
+  (`device_cyclic.cuh`): both sides of every pair, own and neighbour cell (or the AMI stencil through
+  `CyclicNbr`), Sf out of the own cell, weights, and `ifRank`, so a cell's interface terms are added in face order.
+- **processor**: stays in the boundary gather at its patch-order offset (`procStart`), as category 8 with no
+  matrix coefficients. After `DeviceHalo::exchange`, `DeviceHalo::scatterBoundaryValues` writes
+  `w*psi_own + (1 - w)*psi_nbr` into that slot (`device_halo.cuh`), and the received neighbour cell values are
+  readable per interface.
+
+What rhoCentralFoam needs on a coupled face (OpenFOAM: `limitedSurfaceInterpolationScheme::weights` and
+`surfaceInterpolationScheme::interpolate` on a coupled patch, `gaussGrad::correctBoundaryConditions`):
+
+- both cell values (`patchInternalField`, `patchNeighbourField`) of rho, rhoU, rPsi, e and c;
+- both cell gradients of the same fields, for the limiter's r. The neighbour's gradient is a gradient
+  boundary value, so a processor patch exchanges twice a step: values, then gradients;
+- the patch's CD weights and delta;
+- then the face flux exactly as on an internal face, added to the own cell only. Each side computes its own
+  copy of the face with its own Sf, which is what decomposed OpenFOAM does.
+
+The transition, in order; none of it is scheduled in sec. 6 yet:
+
+1. **Split the face body.** Take `faceKernel`'s per-face body into a device function of (P-side, N-side)
+   states and gradients. `faceKernel` calls it with the internal neighbour; a new coupled-face kernel calls it
+   with the neighbour from `DeviceCyclic` or from the halo, and scatters to the own cell in `ifRank` order.
+   `patchFaceKernel` and the patch updates skip coupled faces.
+2. **Keep the flat layout aligned with brae's.** The flat boundary arrays (`Case::bCell`, `bPatch`, `bEmpty`)
+   already follow patch order. Make them skip `isCoupledInterfaceType` patches, as `DeviceMesh` does, so a
+   processor face's flat index is its `DeviceBoundary` slot and `scatterBoundaryValues` writes into
+   rhoCentralFoam's boundary buffers in place. Add a `bCoupled` flag beside `bEmpty`.
+3. **Gradients.** `deviceGaussGradFused` already reads processor faces from their boundary slot, so the halo
+   fill makes it correct unchanged. Cyclics add `deviceCyclicAddGrad`.
+4. **Limiter weights.** `deviceCyclicLimitedWeights` and `deviceCyclicLimitedVWeights` build the weights from
+   the cyclic face flux's sign. rhoCentralFoam interpolates in a fixed direction (+1 for pos, -1 for neg), so
+   these need a direction argument, or the solver keeps its own coupled limiter call next to `vanLeerV`.
+5. **Reductions.** The Courant number that milestone B's `setDeltaT` reads, and the diagnostics totals,
+   become global reductions, so every rank picks the same deltaT.
+6. **Host arm.** It stays the serial oracle. It takes cyclic patches only if brae's shared host patch fields
+   and `fvc::gaussGrad` already carry the coupling. It never takes processor patches: no second CPU
+   implementation.
+
+Gates for the transition:
+
+- **cyclic, single GPU:** a periodic 1-D tube carrying a density pulse, against serial OpenFOAM at every write
+  time. Control: the pair cut into zeroGradient patches must go red.
+- **processor, when multi-GPU is scheduled:** against OpenFOAM's own decomposed run on the same decomposition
+  (`decomposePar`, `rhoCentralFoam -parallel`), not against serial OpenFOAM. A processor face's terms are summed
+  after the internal faces, in boundary order, so decomposed OpenFOAM differs from serial OpenFOAM at
+  round-off. The serial run is a second, looser comparison.
 
 ## 6. Milestones, each closed by a gate against OpenFOAM v2412
 
