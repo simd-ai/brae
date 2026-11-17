@@ -10,6 +10,12 @@
 # larger of the two. BOTH are reported, each on its own, by every arm: against two alone obliqueShock's CUDA arm stood
 # at up to 2.9x its bound at t = 5 to 8 (milestone C's first run), because the two-way split's one processor column
 # lies in smooth flow and its distance decays there while the four-way split's does not.
+# THE FOUR-WAY REFERENCE IS NOT REPRODUCIBLE on this OpenFOAM install: scotchDecomp.C calls SCOTCH_randomReset(), yet
+# two runs of the forwardStep gate (2026-11-17) partitioned fs17 differently (4032 cells on each of the four, then 4066,
+# 4032, 3998, 4032), so OpenFOAM's four-way spread, and with it this envelope, moves between runs. brae, OpenFOAM serial
+# and OpenFOAM in two (simple) were bit-identical between the two runs. Measured effect: forwardStep as shipped against
+# the four-way split alone at most 0.27 of its bound in one run, 1.40x (t = 3.8, 3.9) in the other; within the
+# envelope in both (0.25, 0.23).
 
 fail() { echo "FAIL $*"; fails=$((fails + 1)); }
 ok() { passes=$((passes + 1)); echo "ok   $*"; }

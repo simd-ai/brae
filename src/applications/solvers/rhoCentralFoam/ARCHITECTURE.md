@@ -285,7 +285,9 @@ Gates for the transition:
 - **The envelope, both measurements kept** (approved with C; `tests/rho_central_gate_lib.sh`): every arm also
   reports itself against each OpenFOAM decomposition alone. Re-run after D's phi fix, obliqueShock stays above ten
   times the two-way split alone at t = 7 and 8 (CUDA 1.24x, host 1.95x; 2.9x at t = 5 to 8 in C's first run), and
-  within the four-way one (at most 0.75 of it).
+  within the four-way one (at most 0.75 of it in one run, 0.32 in the next). The four-way reference is NOT
+  reproducible on this OpenFOAM install: scotch partitions the same mesh differently from run to run, so that spread
+  moves between runs while brae, OpenFOAM serial and the two-way split are bit-identical (tests/rho_central_gate_lib.sh).
 - **Not gated:** viscous flow on these patches; 3-D; a symmetryPlane or wedge split over processors.
 
 ## 5f. Milestone D: inletOutlet and purgeWrite
@@ -314,7 +316,8 @@ Gates for the transition:
 - **Measured** (`tests/rho_central_forwardstep_vs_openfoam.sh`, 94 checks; GB10, 2026-11-17):
   - forwardStep as shipped (16,128 cells, 6694 steps to t = 4): every deltaT and time name the same as OpenFOAM's,
     the same 11 directories left by purgeWrite 10 on both arms; at 17 digits every one of the 40 write times within
-    ten times OpenFOAM's own spread (at most 0.18 of the bound), the outlet's written U, T, rho likewise;
+    ten times OpenFOAM's own spread (at most 0.22 of the bound; the four-way reference moves between runs, sec. 5e),
+    the outlet's written U, T, rho likewise;
   - forwardStep's outlet takes outflow at every face and step (0 inflow face-steps of 428,416), so two variants
     carry the rest: the inlet as inletOutlet (inflow on every face, every step, on U, p and T), and a shockTube whose
     ends flow out at 50 m/s until the expansion turns the left end inward (rev17; restarted from OpenFOAM's own
@@ -322,7 +325,7 @@ Gates for the transition:
   - the bow-shock standoff 0.2915, the shock meeting the top wall at x = 0.6115 and the pitot pressure on the step
     12.0136 equal OpenFOAM's to 6 digits (Rayleigh's pitot 12.061);
   - controls red: the switch fed -phi (2.9e+07 x the bound, then an unphysical state at t = 0.91), T's inletOutlet
-    on the new cell T (3.0e+05 x on forwardStep), the switch on the step before's phi (3.2e+11 x on the reversing
+    on the new cell T (2.5e+05 and 3.0e+05 x on forwardStep in two runs), the switch on the step before's phi (3.2e+11 x on the reversing
     tube; NOT visible on forwardStep, whose outlet never changes branch), purgeWrite ignored (41 directories
     against 11);
   - two variants that do NOT work in OpenFOAM either, and are not gated: inletOutlet ends with the left state as
