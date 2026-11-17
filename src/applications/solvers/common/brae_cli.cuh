@@ -67,7 +67,7 @@ namespace cli {
 // (isCommand below), so none of these takes a case path away from anyone.
 inline const std::vector<std::string>& commandWords()
 {
-    static const std::vector<std::string> w = {"run", "check", "solvers", "capabilities"};
+    static const std::vector<std::string> w = {"run", "check", "solvers", "capabilities", "decompose", "reconstruct"};
     return w;
 }
 

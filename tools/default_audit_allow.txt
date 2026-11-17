@@ -521,3 +521,9 @@ SF r ref
 SF r own
 SF s c
 SF s ref
+# a run that finds no processor directories decomposes the case for itself: the number of processes is the only thing it sets; the
+# method comes from decomposeParDict, the time is the one the run starts from, and nothing is replaced (decomposeForRun)
+Options opt allTimes   # decomposeForRun: the start time only
+Options opt force      # decomposeForRun: there is nothing to replace (it is called when there are no processor directories)
+Options opt method     # decomposeForRun: decomposeParDict's method, as `brae decompose` takes it without -method
+Options opt times      # decomposeForRun: the time a run would start from, as `brae decompose` takes it without -time

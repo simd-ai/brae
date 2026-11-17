@@ -95,6 +95,8 @@ add_library(brae_core STATIC
     src/finiteVolume/fvMesh/fvPatches/constraint/cyclicACMI/cyclic_acmi_cpp.cu
     src/OpenFOAM/decompose/scotch_decomposition.cu
     src/OpenFOAM/decompose/domain_decomposition.cu
+    src/OpenFOAM/decompose/case_decompose.cu
+    src/OpenFOAM/decompose/field_decompose.cu
     src/TurbulenceModels/turbulenceModels/derivedFvPatchFields/wallFunctions/nut_wall_function.cu
     src/finiteVolume/finiteVolume/fvc.cu
     src/finiteVolume/finiteVolume/fvm.cu
@@ -5783,6 +5785,12 @@ set_tests_properties(mgpu_alpha_stage_gate PROPERTIES SKIP_RETURN_CODE 77 TIMEOU
 add_test(NAME mgpu_step_parity
          COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/mgpu_step_parity.sh $<TARGET_FILE:brae_interFoam>)
 set_tests_properties(mgpu_step_parity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
+
+# brae decompose / brae reconstruct against decomposePar / reconstructPar (OpenFOAM v2606), and `-parallel` on a case nobody decomposed.
+# Needs OpenFOAM v2606, mpirun and a GPU; skips (exit 77) without them.
+add_test(NAME case_decompose_vs_openfoam
+         COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/tests/case_decompose_vs_openfoam.sh $<TARGET_FILE:brae> $<TARGET_FILE:brae_interFoam>)
+set_tests_properties(case_decompose_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800)
 
 # SIMPLEFOAM'S COLOUR RULE'S TEST ARM, the same arrangement again. The legacy simpleFoam driver sweeps a
 # Gauss-Seidel smoothSolver on U and on the transported turbulence fields in colour order on the GPU by default

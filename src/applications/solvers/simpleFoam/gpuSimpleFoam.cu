@@ -28,6 +28,7 @@
 #include "linear_solver_setup.cuh"   // readLinearSolverControls (shared with gpuRhoSimpleFoam)   // parseFvSchemesControls: shared fvSchemes div/laplacian scheme parse (steady + transient)
 #include "solver_dispatch.cuh"   // dispatchSolver + execSibling: route to the solver / component that owns the work
 #include "brae_cli.cuh"        // brae --version | solvers | capabilities | check | run: the command line
+#include "decompose_cli.cuh"   // brae decompose | reconstruct: decomposePar and reconstructPar without OpenFOAM
 #include "simpleFoamV2.cuh"      // the rebuilt path + its envelope guard (BRAE_SIMPLEFOAM_V2)
 #include "benchmark.cuh"         // brae benchmark [sample]: the standard workload, pulled from the template repo
 #include "turbulence_setup.cuh"   // readTurbulenceModel + readTurbulenceFields (shared with pimpleFoam)
@@ -118,6 +119,8 @@ int main(int argc, char** argv)
             const std::string word = argv[1];
             if (word == "solvers") return cli::solversCommand();
             if (word == "capabilities") return cli::capabilitiesCommand(argc, argv);
+            if (word == "decompose") return cli::decomposeCommand(argc, argv);
+            if (word == "reconstruct") return cli::reconstructCommand(argc, argv);
             if (word == "check")
             {
                 const int code = cli::checkCommand(argc, argv);
