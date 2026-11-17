@@ -326,4 +326,4 @@ for r in fs17_2o fs17_2b; do
     echo "     runtime restart $r: OpenFOAM $(grep -h '^ExecutionTime' "$W/of_$r/log" | tail -n 1 | awk '{print $3}') s; brae CUDA $(sed -n 's/^diag steps \([^ ]*\) step-seconds \([^ ]*\) per-step-us \([^ ]*\).*/\2 s (\1 steps, \3 us a step)/p' "$W/b_$r/log")"
 done
 echo "rho_central_restart_vs_openfoam: $passes passed, $fails failed (work in $W)"
-[ "$fails" = 0 ] && [ "$passes" -ge "${BRAE_RCF_E_MIN_PASSES:-1}" ]
+[ "$fails" = 0 ] && [ "$passes" -ge 197 ]
