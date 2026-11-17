@@ -5,7 +5,7 @@ implicit viscous correctors), its central-upwind flux assembly and its time loop
 boundary conditions, thermo, gradients, linear smoothers and time controls. Nothing here goes through SIMPLE, PIMPLE or
 rhoSimpleFoam's pressure correction, and there is no pressure equation: p = rho/psi.
 
-## 1. OpenFOAM's structure, and where each part lives in brae (after milestone A)
+## 1. OpenFOAM's structure, and where each part lives in brae (after milestone B)
 
 The reference is OpenFOAM v2412 `applications/solvers/compressible/rhoCentralFoam`. In the table, (H) marks the host
 reference (namespace `brae::cpu::rhoCentral`), (D) the device arm (namespace `brae::gpu::rhoCentral`), and (HD)
@@ -14,6 +14,7 @@ BRAE_HD code both arms run (namespace `brae::rhoCentral`).
 | OpenFOAM | brae file | role |
 |---|---|---|
 | `rhoCentralFoam.C` `main()`: start-up, time loop, write | `gpuRhoCentralFoam.cu` (entry), `rhoCentralFoam.cuh/.cu` (driver) | one loop for both arms; the arm is an `Arm` (sec. 2) |
+| `createTimeControls.H`, `setDeltaT.H`, `Foam::Time` (run, setDeltaT/adjustDeltaT, operator++) | shared: `time_controls.cuh` (the step policy, with interFoam) and `run_clock.cuh` (the clock, new in B) | the driver keeps the clock; an arm takes the step's deltaT |
 | `readFluxScheme.H`, the dictionary reads, every refusal | `rhoCentralControls.cuh/.cu` | the `Case`: controls, mesh, flat boundary addressing |
 | state | `rhoCentralState.cuh` | `State` (cells and flat boundary), `PatchFields` (brae patch-field objects of U, p, T), `StepReport`, controls |
 | `createFields.H`, `createFieldRefs.H`, thermo construction | `rhoCentralCreateFields_cpp.cuh/.cu` (H) | once, on the host; both arms start from its state |
@@ -24,7 +25,7 @@ BRAE_HD code both arms run (namespace `brae::rhoCentral`).
 | one step, composed | `rhoCentralStep_cpp.cuh/.cu` (H), `rhoCentralStep.cuh/.cu` (D) | the two `Arm`s |
 | hePsiThermo + hConst + perfectGas | `rhoCentralThermo.cuh` (HD) | Es, Cv, psi, the Newton e -> T loop |
 
-Planned, not built yet: `setDeltaT` with an accumulating clock (B), the constraint and transform BCs (C), the
+Planned, not built yet: the constraint and transform BCs (C), the
 viscous correctors (G), `setRDeltaT` (I), the solver's own `BCs/` (maxwellSlipU, smoluchowskiJumpT; G, I),
 turbulence (J) and mesh motion (K). Each goes into the module of its OpenFOAM counterpart above, or a new one beside
 it.
@@ -35,8 +36,8 @@ it.
 the step:
 
 ```
-step()      fluxes; the cells (four stages); U's patches; T's patches on the old cell T; the patch update; p's
-            patches; rho_b
+step(dt)    fluxes; the cells (four stages); U's patches; T's patches on the old cell T; the patch update; p's
+            patches; rho_b. dt is runTime.deltaTValue() after setDeltaT.H and ++runTime
 flush()     the Courant numbers and statuses of the steps since the last flush
 download()  the state, for a write (the device arm copies it back; the host arm's is already in place)
 ```
@@ -45,8 +46,11 @@ download()  the state, for a write (the device arm copies it back; the host arm'
 - The device arm fuses the fvc::div gather and the four stages into one kernel, evaluates U, p and T's patches
   through brae's `DeviceBoundary` (`deviceBCValue`), and keeps the Courant numbers and statuses on the device for up
   to 256 steps.
-- What milestone B needs from the arm is finer: CoNum before setDeltaT, and LTS's ++runTime after the fluxes. It will
-  split `step()` at the fluxes then, not before.
+- The loop is rhoCentralFoam.C's for `!LTS`: `Time::run`, setDeltaT.H on the previous step's Courant number,
+  `++runTime`, the step at the new deltaT, `runTime.write()`. So milestone B needed no split of `step()`: the step only
+  takes its deltaT. The split at the fluxes is LTS's (milestone I), where `++runTime` comes after them.
+- At a fixed deltaT the driver flushes the device arm once a window; under adjustTimeStep once a step, since
+  setDeltaT.H reads the step before's Courant number.
 
 ## 3. Shared infrastructure: reuse, hoist, do not inherit
 
@@ -54,7 +58,8 @@ download()  the state, for a write (the device arm copies it back; the host arm'
 - mesh and fields: `PrimitiveMesh`, `FvGeometry`, `buildPatches`, `SolutionDirections`, `DeviceMesh`, `DeviceBuffer`,
   `FoamDict`, `readField`/`buildField`;
 - gradients: `deviceGaussGradFused`, and leastSquares/cellLimited where a case asks for them;
-- time controls: `time_controls.cuh` (`setDeltaT`, `adjustDeltaT`, `startDeltaT`), `resolveStartTime`;
+- time controls: `time_controls.cuh` (`TimeControls`, `setDeltaT`, `WriteCadence`, `adjustDeltaT`, `startDeltaT`),
+  `resolveStartTime`, `openFoamTimeName`;
 - `fvc::smooth` (host and device);
 - the viscous correctors' pieces: `fvm::laplacian` assembly and the Gauss-Seidel smoothers;
 - brae's host boundary-condition classes (`fv_patch_field.cuh`) and device value evaluation (`deviceBCValue` and the
@@ -65,7 +70,8 @@ download()  the state, for a write (the device arm copies it back; the host arm'
 - a BRAE_HD limited-scheme library under `src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/`. It
   provides NVDTVD r, NVDVTVDV r and the limiters as OpenFOAM's `limitedSchemes` define them. `device_limiter.cuh` stays
   as it is for its current callers;
-- an accumulating clock: `value += deltaT`, write switches as `Time::operator++`, `uniform/time`;
+- an accumulating clock: `value += deltaT`, write switches as `Time::operator++`, `uniform/time`. Done in B:
+  `src/OpenFOAM/db/Time/run_clock.cuh` (`RunClock`);
 - a whole-keyword fvSchemes lookup (`parseFieldGradScheme` matches substrings);
 - per-cell rDeltaT for localEuler.
 
@@ -129,10 +135,17 @@ download()  the state, for a write (the device arm copies it back; the host arm'
 
 ## 5b. Remaining architectural issues
 
-- `Arm::step()` is one call. Milestone B (setDeltaT needs CoNum first) and milestone I (LTS advances runTime after
-  the fluxes) need it split at the fluxes.
-- brae's `Time`/`WriteControl` assume a fixed deltaT (`timeValue = start + n*deltaT`). adjustTimeStep needs an
-  accumulating clock (sec. 3).
+- `Arm::step(dt)` is one call. Milestone I (LTS advances runTime after the fluxes) needs it split at the fluxes.
+- Under adjustTimeStep the device arm synchronises once a step to read the Courant number, so launch latency is no
+  longer hidden behind the next step. Measured, GB10 2026-11-17, step and flush time per step:
+  - 100 cells: 280 to 335 us against 131 at a fixed deltaT (over three runs);
+  - 1000 cells: 379 to 411 us against 161;
+  - 1,024,000 cells: 18.1 ms against 17.6, about 3%.
+
+  The host arm runs the 100-cell tube at 12 to 27 us a step. Ways out, not taken yet: the step as one CUDA graph,
+  or setDeltaT.H and adjustDeltaT on the device with the write steps snapshotted.
+- interFoam keeps its own copy of the time-name precision raise (`inter_writer_cpp.cu`); `RunClock` has the other.
+  One could go once interFoam adopts the clock; it is not changed here.
 - The device arm costs about 19% more per step on tiny meshes, from about five more small launches (the shared
   boundary evaluation): 132 us/step at 100 cells, against 111. It is unchanged at 1M cells (17.6 against 17.4
   ms/step). Device memory rose 14% at 1M cells (1362 against 1194 MiB), for the boundary buffers.
@@ -180,7 +193,7 @@ The transition, in order; none of it is scheduled in sec. 6 yet:
 4. **Limiter weights.** `deviceCyclicLimitedWeights` and `deviceCyclicLimitedVWeights` build the weights from
    the cyclic face flux's sign. rhoCentralFoam interpolates in a fixed direction (+1 for pos, -1 for neg), so
    these need a direction argument, or the solver keeps its own coupled limiter call next to `vanLeerV`.
-5. **Reductions.** The Courant number that milestone B's `setDeltaT` reads, and the diagnostics totals,
+5. **Reductions.** The Courant number that setDeltaT.H reads (milestone B, on one GPU), and the diagnostics totals,
    become global reductions, so every rank picks the same deltaT.
 6. **Host arm.** It stays the serial oracle. It takes cyclic patches only if brae's shared host patch fields
    and `fvc::gaussGrad` already carry the coupling. It never takes processor patches: no second CPU
@@ -195,6 +208,32 @@ Gates for the transition:
   after the internal faces, in boundary order, so decomposed OpenFOAM differs from serial OpenFOAM at
   round-off. The serial run is a second, looser comparison.
 
+## 5d. Milestone B: adjustTimeStep
+
+- **The clock** (`run_clock.cuh`, shared, new): `Time::run`, `Time::setDeltaT` with `adjustDeltaT`, `Time::operator++`
+  (the accumulated value, deltaT0, the snap to 0, `writeTime_` for timeStep, runTime and adjustable, the time-name
+  precision raise). The step policy is the shared `time_controls.cuh`, already gated on interFoam: setDeltaT.H with
+  OpenFOAM's SMALL and the fused `1 + 0.1*maxDeltaTFact`, Time's trimming to the write times, the function objects'
+  trimming, and a restart's `uniform/time` deltaT.
+- **The driver** runs rhoCentralFoam.C's `!LTS` loop on it. CoNum starts at 0, so the first step grows by 1.2 (then
+  is trimmed). The log prints OpenFOAM's three lines a step at writePrecision, as Info does. It writes only on write
+  steps: the unconditional final write is gone, since `rhoCentralFoam.C` has none.
+- **The arms** take the step's deltaT: the Euler `1/deltaT`, the Courant numbers' scale, the outflow diagnostics.
+  At a fixed deltaT that is controlDict's deltaT, as before. The device flush reads its window with two async
+  copies and one synchronisation.
+- **Now refused by name:** purgeWrite > 0 (silently ignored before), writeControl clockTime and cpuTime.
+- **Measured:**
+  - the Sod gate's 252 written files byte-identical to milestone A's;
+  - shockTube as shipped, 142 steps: every deltaT and time name identical to OpenFOAM's on both arms, fields within
+    3.1e-15 at every write time;
+  - Tadmor (189 steps) and 1000 cells (1247 steps): the deltaT and names likewise identical;
+  - on 1000 cells this run amplifies round-off, OpenFOAM's own too: OpenFOAM decomposed in two is 6.9e-12 from
+    OpenFOAM serial at 0.007, brae 6.3e-12. The gate (`tests/rho_central_shocktube_vs_openfoam.sh`) holds that arm to
+    ten times OpenFOAM's own spread, measured in the same run.
+- **Not gated:** a restart's `uniform/time` deltaT and index are read as `Time::setControls` reads them, but brae
+  writes no `uniform/time` yet and no restart is compared (milestone E); writeControl runTime and timeStep under
+  adjustTimeStep; the function objects' trimming (no rhoCentralFoam tutorial has one).
+
 ## 6. Milestones, each closed by a gate against OpenFOAM v2412
 
 Every gate:
@@ -205,9 +244,9 @@ Every gate:
 | | milestone | gate (cases) |
 |---|---|---|
 | A | restructure into the modules above; brae BC classes; shared limiter library; driver + Stepper | the Sod gate and the refusals unchanged |
-| B | adjustTimeStep: setDeltaT, adjustable writes, first step x1.2, restart deltaT | shockTube **as shipped**: the deltaT sequence and fields |
+| B (done) | adjustTimeStep: setDeltaT, adjustable writes, first step x1.2, restart deltaT | shockTube **as shipped**: the deltaT sequence and fields |
 | C | constraint and transform BCs: symmetryPlane, symmetry, slip, wedge, with the conservative-state patch semantics of sec. 4 | wedge15Ma5 as shipped; obliqueShock as shipped (shock angle against theta-beta-M) |
-| D | inletOutlet (U, T -> mixedEnergy) and purgeWrite | forwardStep as shipped |
+| D | inletOutlet (U, T -> mixedEnergy) and purgeWrite (refused by name since B) | forwardStep as shipped |
 | E | restart: startFrom latestTime, `uniform/time`, the writer keeping BC keys | stop/restart against the continuous run and against OpenFOAM's own restart |
 | F | other Riemann problems and limiters (the vanAlbada, Minmod, MUSCL, limitedLinear family) | Lax, 123 and a strong shock tube: brae against OpenFOAM and the exact solution |
 | G | viscous: muEff, tauMC, U and e correctors (smoothSolver/GaussSeidel), sigmaDotU, sutherland, noSlip | a viscous shock tube and a laminar compressible boundary layer against OpenFOAM |

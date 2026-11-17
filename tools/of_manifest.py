@@ -5083,9 +5083,10 @@ COMPONENTS = {
                   "walls bound throughout. Two round trips remain -- the batch coming back and the result "
                   "going out -- and the second needs a pinned staging buffer to go async."),
     ],
-    # rhoCentralFoam, first stage (2026-11-16): single GPU, static mesh, inviscid laminar, fixed deltaT, hePsiThermo
-    # + perfectGas + hConst + const, Kurganov/Tadmor, vanLeer/vanLeerV, zeroGradient/fixedValue/empty. Everything
-    # else is UNSUPPORTED and refused by name (tests/rho_central_refusals.sh). Not SIMPLE or PIMPLE: no pressure
+    # rhoCentralFoam, EXPERIMENTAL (stage 1 2026-11-16; milestone B, adjustTimeStep, 2026-11-17): single GPU, static
+    # mesh, inviscid laminar, a fixed deltaT or adjustTimeStep, hePsiThermo + perfectGas + hConst + const,
+    # Kurganov/Tadmor, vanLeer/vanLeerV, zeroGradient/fixedValue/empty. Everything else is UNSUPPORTED and refused by
+    # name (tests/rho_central_refusals.sh). Not SIMPLE or PIMPLE: no pressure
     # equation; rho, rhoU, rhoE advance explicitly and p = rho/psi.
     "rhoCentralFoam": [
         dict(name="rhoCentralFoam_main", of_symbol="main", of_file="applications/solvers/compressible/rhoCentralFoam/rhoCentralFoam.C",
@@ -5099,8 +5100,11 @@ COMPONENTS = {
                         "Controls red: first-order upwind 9.8e-02, energy flux without aSf*(p_pos - p_neg) 6.2e-03, "
                         "Tadmor against Kurganov 8.8e-03. Against the exact Riemann solution the shock lands 0.21 "
                         "cells off and the contact 0.24 (100 cells), L1(rho) 6.3e-03 -> 7.5e-04 at 1000 cells, "
-                        "OpenFOAM's figures the same to 1e-9. Does NOT claim adjustTimeStep, viscous flow, 2-D waves "
-                        "or any patch type but zeroGradient and empty (fixedValue is implemented, not gated)."),
+                        "OpenFOAM's figures the same to 1e-9. tests/rho_central_shocktube_vs_openfoam.sh -- the "
+                        "tutorial AS SHIPPED (adjustTimeStep yes, maxCo 0.2): 142 steps, every deltaT and time name "
+                        "identical to OpenFOAM's on both arms, U p T rho 3.1e-15 at all 7 write times; Tadmor and "
+                        "1000 cells likewise identical in deltaT. Does NOT claim viscous flow, 2-D waves or any "
+                        "patch type but zeroGradient and empty (fixedValue is implemented, not gated)."),
         dict(name="createFields", of_symbol="createFields.H", of_file="applications/solvers/compressible/rhoCentralFoam/createFields.H",
              classification="HOST_ONLY", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralCreateFields_cpp.cu",
              validation="rho_central_sod_vs_openfoam (the whole run starts from it); includes heThermo::init and "
@@ -5130,8 +5134,10 @@ COMPONENTS = {
         dict(name="centralCourantNo", of_symbol="centralCourantNo.H", of_file="applications/solvers/compressible/rhoCentralFoam/centralCourantNo.H",
              classification="GPU_REQUIRED", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralFlux_cpp.cu",
              brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralStep.cu",
-             note="computed and logged every step (OpenFOAM's figures to the printed digits); it drives nothing "
-                  "yet because setDeltaT is not ported."),
+             note="computed every step at the step's own deltaT and logged at writePrecision, as Info prints it; "
+                  "under adjustTimeStep it feeds the next step's setDeltaT.H. The max is order-free, so the device's "
+                  "equals the host's to the bit given the same amaxSf; the mean is a sum in another order on the "
+                  "device. rho_central_shocktube_vs_openfoam: max within 4.1e-15 of OpenFOAM's at every step."),
         dict(name="explicitDiagonalSolves", of_symbol="solve(fvm::ddt(q) + fvc::div(flux))",
              of_file="src/finiteVolume/finiteVolume/ddtSchemes/EulerDdtScheme/EulerDdtScheme.C",
              classification="GPU_REQUIRED", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralCellUpdate.cuh",
@@ -5153,8 +5159,24 @@ COMPONENTS = {
                   "UNSUPPORTED (refused)."),
         dict(name="setDeltaT", of_symbol="setDeltaT.H",
              of_file="src/finiteVolume/cfdTools/general/include/setDeltaT.H",
-             classification="CONFIGURATION", status="UNSUPPORTED",
-             note="adjustTimeStep yes refused by name; the next step of the port."),
+             classification="CONFIGURATION", status="REUSE_EXISTING",
+             brae_existing="src/finiteVolume/cfdTools/general/time_controls.cuh (setDeltaT, TimeControls, "
+                           "WriteCadence, adjustDeltaT, startDeltaT; shared with interFoam)",
+             brae_driver="src/applications/solvers/rhoCentralFoam/rhoCentralFoam.cu",
+             validation="tests/rho_central_shocktube_vs_openfoam.sh: shockTube as shipped, every deltaT identical "
+                        "to OpenFOAM's at 17 digits on both arms (142 steps; Tadmor 189; 1000 cells 1247). Controls "
+                        "red: without adjustDeltaT the writes land off OpenFOAM's times; the Courant number at the "
+                        "previous deltaT parts the deltaT sequence by 2.8e-01."),
+        dict(name="Time_clock", of_symbol="Time::run, Time::setDeltaT, Time::adjustDeltaT, Time::operator++",
+             of_file="src/OpenFOAM/db/Time/Time.C",
+             classification="HOST_ONLY", status="REIMPLEMENT",
+             brae_reference="src/OpenFOAM/db/Time/run_clock.cuh",
+             validation="rho_central_shocktube_vs_openfoam: the same 142 time names and 7 write directories as "
+                        "OpenFOAM; the Sod gate's fixed-deltaT run on the same clock is byte-identical to the "
+                        "step-counting clock it replaced (252 files).",
+             note="the accumulated value (setTime(value() + deltaT_)), Time::run on the previous deltaT, "
+                  "writeTime_ for timeStep/runTime/adjustable, the snap to 0, the time-name precision raise. "
+                  "clockTime and cpuTime refused. A restart's uniform/time deltaT and index are read, not gated."),
         dict(name="setRDeltaT", of_symbol="setRDeltaT.H", of_file="applications/solvers/compressible/rhoCentralFoam/setRDeltaT.H",
              classification="GPU_REQUIRED", status="UNSUPPORTED", note="localEuler refused by name."),
         dict(name="viscousCorrectors", of_symbol="fvm::laplacian(muEff, U), sigmaDotU",

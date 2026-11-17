@@ -56,7 +56,7 @@ inline tensor gradTensor(const std::vector<vector> g[3], label c)
 } // namespace
 
 
-HostFluxes centralFluxes(const Case& cs, const State& s)
+HostFluxes centralFluxes(const Case& cs, const State& s, scalar deltaT)
 {
     namespace ls = cpu::limitedSchemes::detail;
     const GasCoeffs& gas = cs.gas;
@@ -183,8 +183,8 @@ HostFluxes centralFluxes(const Case& cs, const State& s)
             sA += sumA[i];
             sV += V[i];
         }
-        out.CoNum = 0.5*mx*cs.deltaT;
-        out.meanCoNum = 0.5*(sA/sV)*cs.deltaT;
+        out.CoNum = 0.5*mx*deltaT;
+        out.meanCoNum = 0.5*(sA/sV)*deltaT;
     }
 
     // ---- fvc::div = surfaceIntegrate (fvcSurfaceIntegrate.C:45-78) ---------------------------------------------------

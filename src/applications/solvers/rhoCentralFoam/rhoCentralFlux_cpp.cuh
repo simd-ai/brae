@@ -25,7 +25,8 @@ struct HostFluxes
     vector bndMom{0, 0, 0};
 };
 
-HostFluxes centralFluxes(const Case& cs, const State& s);
+// deltaT: this step's, which the Courant numbers are scaled by (centralCourantNo.H reads runTime.deltaTValue())
+HostFluxes centralFluxes(const Case& cs, const State& s, scalar deltaT);
 
 } // namespace rhoCentral
 } // namespace cpu

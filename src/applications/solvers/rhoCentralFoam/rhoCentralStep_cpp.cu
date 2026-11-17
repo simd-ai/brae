@@ -33,19 +33,19 @@ public:
         for (label k = 0; k < cs.nB; ++k) TfixesValue_[k] = pf.T.boundary[cs.bPatch[k]]->fixesValue() ? 1 : 0;
     }
 
-    void step() override
+    void step(scalar deltaT) override
     {
         const Case& cs = cs_;
         State& s = s_;
-        const HostFluxes f = centralFluxes(cs, s);
+        const HostFluxes f = centralFluxes(cs, s, deltaT);
         StepReport rep;
         rep.CoNum = f.CoNum;
         rep.meanCoNum = f.meanCoNum;
-        bndMass_ += cs.deltaT*f.bndMass;
-        bndMom_ += cs.deltaT*f.bndMom;
-        bndEnergy_ += cs.deltaT*f.bndEnergy;
+        bndMass_ += deltaT*f.bndMass;
+        bndMom_ += deltaT*f.bndMom;
+        bndEnergy_ += deltaT*f.bndEnergy;
 
-        const scalar rDeltaT = 1.0/cs.deltaT;
+        const scalar rDeltaT = 1.0/deltaT;
         const std::vector<scalar>& V = cs.g.V();
         Told_ = s.T;
         // the four stages of rhoCentralCellUpdate.cuh, each over every cell (OpenFOAM's field-at-a-time order)

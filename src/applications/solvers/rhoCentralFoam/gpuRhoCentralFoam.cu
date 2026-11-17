@@ -6,7 +6,7 @@
 // case, createFields, the loop and the writer (rhoCentralFoam.cu); only the step differs:
 //   BRAE_RHOCENTRALFOAM_ARM=cuda  (default) the device arm, rhoCentralStep.cu
 //   BRAE_RHOCENTRALFOAM_ARM=cpu   the host reference, rhoCentralStep_cpp.cu
-// BRAE_CONTROL_RCF selects a gate's negative control (rhoCentralState.cuh), device arm only.
+// BRAE_CONTROL_RCF selects a gate's negative control (rhoCentralState.cuh).
 //
 // At the end it prints `diag` lines: the conservation balance, the positivity extrema, the step wall time and the
 // device memory. tests/rho_central_sod_vs_openfoam.sh reads them.
@@ -46,8 +46,11 @@ int main(int argc, char** argv)
             const std::string v(c);
             if (v == "upwind") control = controlUpwind;
             else if (v == "noPressureJump") control = controlNoPressureJump;
+            else if (v == "untrimmed") control = controlUntrimmed;
+            else if (v == "laggedCourant") control = controlLaggedCourant;
             else if (!v.empty())
-                throw std::runtime_error("BRAE_CONTROL_RCF is `" + v + "`; it takes upwind or noPressureJump.");
+                throw std::runtime_error("BRAE_CONTROL_RCF is `" + v + "`; it takes upwind, noPressureJump, untrimmed "
+                                         "or laggedCourant.");
             if (control != controlNone)
                 std::fprintf(stderr, "brae rhoCentralFoam: NEGATIVE CONTROL `%s` -- deliberately wrong numerics\n", c);
         }

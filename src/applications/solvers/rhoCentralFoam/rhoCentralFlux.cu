@@ -186,7 +186,7 @@ void DeviceFluxes::allocate(int nC, int nIF, int nB)
 
 
 void centralFluxes(const DeviceMesh& dm, const Case& cs, int control, DeviceFields& F, DeviceFluxes& X,
-                   double* outflow)
+                   double* outflow, scalar deltaT)
 {
     const int nC = cs.nC, nB = cs.nB, nIF = cs.nIF;
     const scalar CpByCv = gasCp(cs.gas)/gasCv(cs.gas);
@@ -227,7 +227,7 @@ void centralFluxes(const DeviceMesh& dm, const Case& cs, int control, DeviceFiel
                             F.eB.data(), X.cB.data()};
         const FaceOutputs O{X.phiB.data(), X.phiUxB.data(), X.phiUyB.data(), X.phiUzB.data(), X.phiEpB.data(),
                             X.amaxSfB.data()};
-        patchFaceKernel<<<blocksFor(nB), kTPB>>>(nB, nIF, cs.tadmor, control, cs.deltaT, dm.bndIsEmpty.data(),
+        patchFaceKernel<<<blocksFor(nB), kTPB>>>(nB, nIF, cs.tadmor, control, deltaT, dm.bndIsEmpty.data(),
                                                  dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(), dm.magSf.data(), Bi, O,
                                                  outflow);
         cudaCheck(cudaGetLastError(), "rhoCentral patch faces");

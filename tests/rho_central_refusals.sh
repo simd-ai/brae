@@ -3,9 +3,9 @@
 # v2412's own rhoCentralFoam tutorials and on single-edit variants of shockTube. Each row: a case, the edit, the
 # words the refusal must contain. A refusal must exit non-zero and write no time directory.
 #
-# The shipped tutorials stop on their first unported input; a row with `adjustTimeStep no` steps past that to show
-# the next one is also named. What this does NOT show: that the refused inputs are rare (they are not -- every
-# shipped tutorial but shockTube with a fixed deltaT is refused today; PORT.md lists the order of the work).
+# The shipped tutorials run as shipped and stop on their first unported input; a row with `purgeWrite 0` steps past
+# that to show the next one is also named. What this does NOT show: that the refused inputs are rare (they are not --
+# every shipped tutorial but shockTube is refused today; ARCHITECTURE.md lists the order of the work).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BRAE_RCF_BIN:-$ROOT/build/brae_rhoCentralFoam}"
@@ -50,26 +50,30 @@ row()
         tail -n 3 "$d/log" | sed 's/^/     /'
     fi
 }
-FIXED='s/^(adjustTimeStep\s+)\S+;/\1no;/'
-row shockTube_shipped shockTube no "adjustTimeStep yes"
+PURGE0='s/^(purgeWrite\s+)\S+;/\10;/'
 row wedge15Ma5_shipped wedge15Ma5 yes "is of type \`symmetryPlane\`"
-row forwardStep_fixedDt forwardStep yes "is of type \`symmetryPlane\`" system/controlDict "$FIXED"
-row obliqueShock_fixedDt obliqueShock yes "is of type \`symmetryPlane\`" system/controlDict "$FIXED"
-row biconic_fixedDt biconic25-55Run35 no "ddtSchemes resolves to \`localEuler\`" system/controlDict "$FIXED"
-row LadenburgJet60psi_fixedDt LadenburgJet60psi no "thermoType transport is \`sutherland\`" system/controlDict "$FIXED"
-row movingCone_fixedDt movingCone no "dynamicMeshDict selects" system/controlDict "$FIXED"
-row sod_fluxScheme shockTube no "fluxScheme \`Bogus\` is not a valid choice" system/controlDict "$FIXED" \
+row forwardStep_shipped forwardStep no "purgeWrite 10"
+row forwardStep_purge0 forwardStep yes "is of type \`symmetryPlane\`" system/controlDict "$PURGE0"
+row obliqueShock_shipped obliqueShock yes "is of type \`symmetryPlane\`"
+row biconic_shipped biconic25-55Run35 no "ddtSchemes resolves to \`localEuler\`"
+row LadenburgJet60psi_shipped LadenburgJet60psi no "thermoType transport is \`sutherland\`"
+row movingCone_shipped movingCone no "purgeWrite 5"
+row movingCone_purge0 movingCone no "dynamicMeshDict selects" system/controlDict "$PURGE0"
+row sod_fluxScheme shockTube no "fluxScheme \`Bogus\` is not a valid choice" \
     system/fvSchemes 's/^(fluxScheme\s+)\S+;/\1Bogus;/'
-row sod_reconstruct shockTube no "reconstruct(rho) to \`Minmod\`" system/controlDict "$FIXED" \
+row sod_reconstruct shockTube no "reconstruct(rho) to \`Minmod\`" \
     system/fvSchemes 's/^(\s*reconstruct\(rho\)\s+)\S+;/\1Minmod;/'
-row sod_grad shockTube no "grad(rho) to \`leastSquares\`" system/controlDict "$FIXED" \
+row sod_grad shockTube no "grad(rho) to \`leastSquares\`" \
     system/fvSchemes 's/^(\s*default\s+)Gauss linear;/\1leastSquares;/'
-row sod_viscous shockTube no "transport mu is" system/controlDict "$FIXED" \
+row sod_viscous shockTube no "transport mu is" \
     constant/thermophysicalProperties 's/^(\s*mu\s+)\S+;/\11.8e-05;/'
-row sod_RAS shockTube no "simulationType is \`RAS\`" system/controlDict "$FIXED" \
+row sod_RAS shockTube no "simulationType is \`RAS\`" \
     constant/turbulenceProperties 's/^(simulationType\s+)\S+;/\1RAS;/'
-row sod_slip shockTube yes "is \`slip\`" system/controlDict "$FIXED" 0/U '/sides/,/\}/ s/zeroGradient/slip/'
-row sod_enthalpy shockTube no "energy is \`sensibleEnthalpy\`" system/controlDict "$FIXED" \
+row sod_slip shockTube yes "is \`slip\`" 0/U '/sides/,/\}/ s/zeroGradient/slip/'
+row sod_enthalpy shockTube no "energy is \`sensibleEnthalpy\`" \
     constant/thermophysicalProperties 's/sensibleInternalEnergy/sensibleEnthalpy/'
+row sod_clockTime shockTube no "writeControl \`clockTime\` is not ported" \
+    system/controlDict 's/^(writeControl\s+)\S+;/\1clockTime;/'
+row sod_purgeWrite shockTube no "purgeWrite 2" system/controlDict 's/^(purgeWrite\s+)\S+;/\12;/'
 echo "rho_central_refusals: $passes passed, $fails failed (work in $W)"
-[ "$fails" = 0 ] && [ "$passes" -ge 14 ]
+[ "$fails" = 0 ] && [ "$passes" -ge 17 ]

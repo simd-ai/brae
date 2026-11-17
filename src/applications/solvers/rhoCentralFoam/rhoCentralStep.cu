@@ -271,6 +271,10 @@ public:
         coCell_.resize(nC);
         status_.copyFrom(std::vector<int>(kReportWindow, 0));
         courant_.copyFrom(std::vector<double>(3*kReportWindow, 0.0));
+        // pinned, so flush() reads a window back with two async copies and one synchronisation: under adjustTimeStep
+        // it runs every step
+        cudaCheck(cudaMallocHost(&hostCourant_, 3*kReportWindow*sizeof(double)), "pinned courant");
+        cudaCheck(cudaMallocHost(&hostStatus_, kReportWindow*sizeof(int)), "pinned status");
         outflow_.copyFrom(std::vector<double>(5, 0.0));
         cudaCheck(cudaDeviceSynchronize(), "rhoCentralFoam upload");
         size_t free1 = 0;
@@ -278,7 +282,7 @@ public:
         bytes_ = (free0 > free1) ? (free0 - free1) : 0;
     }
 
-    void step() override
+    void step(scalar deltaT) override
     {
         if (pending_ >= kReportWindow)
             throw std::logic_error("brae rhoCentralFoam: device step with a full report window; flush() first.");
@@ -286,14 +290,14 @@ public:
         DeviceFields& F = F_;
         const int nC = cs.nC, nB = cs.nB;
 
-        centralFluxes(dm_, cs, control_, F, X_, outflow_.data());
+        centralFluxes(dm_, cs, control_, F, X_, outflow_.data(), deltaT);
 
         const FluxesIn Fx{X_.phi.data(), X_.phiUx.data(), X_.phiUy.data(), X_.phiUz.data(), X_.phiEp.data(),
                           X_.amaxSf.data(), X_.phiB.data(), X_.phiUxB.data(), X_.phiUyB.data(), X_.phiUzB.data(),
                           X_.phiEpB.data(), X_.amaxSfB.data()};
         const CellState S{F.rho.data(), F.rhoUx.data(), F.rhoUy.data(), F.rhoUz.data(), F.rhoE.data(), F.e.data(),
                           F.T.data(), Told_.data(), F.p.data(), F.psi.data(), F.Ux.data(), F.Uy.data(), F.Uz.data()};
-        cellKernel<<<blocksFor(nC), kTPB>>>(nC, pending_, 1.0/cs.deltaT, cs.sd.valid(0), cs.sd.valid(1),
+        cellKernel<<<blocksFor(nC), kTPB>>>(nC, pending_, 1.0/deltaT, cs.sd.valid(0), cs.sd.valid(1),
                                             cs.sd.valid(2), cs.gas, dm_.ownerStart.data(), dm_.losort.data(),
                                             dm_.losortStart.data(), dm_.bndCellStart.data(), dm_.bndPerm.data(),
                                             dm_.bndIsEmpty.data(), dm_.V.data(), Fx, S, coCell_.data(),
@@ -318,6 +322,7 @@ public:
         }
         courantKernel<<<1, 1024>>>(nC, coCell_.data(), dm_.V.data(), courant_.data() + 3*pending_);
         cudaCheck(cudaGetLastError(), "rhoCentral courant");
+        deltaT_[pending_] = deltaT;
         ++pending_;
     }
 
@@ -325,21 +330,24 @@ public:
     {
         std::vector<StepReport> out(pending_);
         if (!pending_) return out;
-        std::vector<double> co(3*pending_);
-        std::vector<int> st(pending_);
-        cudaCheck(cudaMemcpy(co.data(), courant_.data(), co.size()*sizeof(double), cudaMemcpyDeviceToHost),
+        const double* co = hostCourant_;
+        const int* st = hostStatus_;
+        const cudaStream_t q = cudaStreamPerThread;   // the stream the kernels run on (--default-stream per-thread)
+        cudaCheck(cudaMemcpyAsync(hostCourant_, courant_.data(), 3*pending_*sizeof(double), cudaMemcpyDeviceToHost, q),
                   "courant D2H");
-        cudaCheck(cudaMemcpy(st.data(), status_.data(), st.size()*sizeof(int), cudaMemcpyDeviceToHost), "status D2H");
+        cudaCheck(cudaMemcpyAsync(hostStatus_, status_.data(), pending_*sizeof(int), cudaMemcpyDeviceToHost, q),
+                  "status D2H");
+        cudaCheck(cudaMemsetAsync(status_.data(), 0, pending_*sizeof(int), q), "status reset");
+        cudaCheck(cudaStreamSynchronize(q), "reports");
         for (int i = 0; i < pending_; ++i)
         {
             if (cs_.nIF)
             {
-                out[i].CoNum = 0.5*co[3*i]*cs_.deltaT;
-                out[i].meanCoNum = 0.5*(co[3*i + 1]/co[3*i + 2])*cs_.deltaT;
+                out[i].CoNum = 0.5*co[3*i]*deltaT_[i];
+                out[i].meanCoNum = 0.5*(co[3*i + 1]/co[3*i + 2])*deltaT_[i];
             }
             out[i].status = st[i];
         }
-        cudaCheck(cudaMemset(status_.data(), 0, st.size()*sizeof(int)), "status reset");
         pending_ = 0;
         return out;
     }
@@ -385,6 +393,14 @@ public:
 
     std::size_t deviceBytes() const override { return bytes_; }
 
+    ~DeviceArm() override
+    {
+        cudaFreeHost(hostCourant_);
+        cudaFreeHost(hostStatus_);
+    }
+    DeviceArm(const DeviceArm&) = delete;
+    DeviceArm& operator=(const DeviceArm&) = delete;
+
 private:
     const Case& cs_;
     int control_;
@@ -398,6 +414,9 @@ private:
     DeviceBuffer<scalar> Told_, TbEval_, coCell_;
     DeviceBuffer<int> status_;
     DeviceBuffer<double> courant_, outflow_;
+    scalar deltaT_[kReportWindow] = {};
+    double* hostCourant_ = nullptr;
+    int* hostStatus_ = nullptr;   // each pending step's deltaT, which its Courant numbers are scaled by
     int pending_ = 0;
     std::size_t bytes_ = 0;
 };

@@ -4,7 +4,7 @@
 //
 // What runs (everything else is refused here, by name, before a field is read): single GPU, static mesh,
 // hePsiThermo + pureMixture + const + hConst + perfectGas + sensibleInternalEnergy, laminar with every mu = 0
-// (inviscid), fixed deltaT (adjustTimeStep no), Euler, fluxScheme Kurganov or Tadmor (readFluxScheme.H),
+// (inviscid), Euler with a fixed deltaT or adjustTimeStep (setDeltaT.H on the central Courant number), purgeWrite 0, fluxScheme Kurganov or Tadmor (readFluxScheme.H),
 // reconstruct(rho|T) vanLeer and reconstruct(U) vanLeerV, Gauss linear gradients, zeroGradient / fixedValue / empty
 // patch fields on U, p and T.
 #include "cf_types.cuh"
@@ -13,6 +13,10 @@
 #include "fv_patch.cuh"
 #include "solution_directions.cuh"
 #include "rhoCentralThermo.cuh"
+#include "run_clock.cuh"
+#include "time_controls.cuh"
+
+#include <optional>
 
 #include <string>
 #include <vector>
@@ -25,9 +29,9 @@ struct Case
     std::string caseDir;
     std::string startName;    // the start time directory, as Time resolves it
     scalar      startTime = 0;
-    scalar      deltaT    = 0;
-    long        nSteps    = 0;
     int         writePrecision = 6;
+    TimeControls timeControls;          // adjustTimeStep, maxCo, maxDeltaT (createTimeControls.H)
+    std::optional<RunClock> clock;      // the clock at the start: deltaT, write cadence, endTime (Time::setControls)
 
     PrimitiveMesh        m;
     FvGeometry           g;

@@ -1,7 +1,8 @@
 #pragma once
 // The device arm: one rhoCentralFoam step on the device, in rhoCentralFoam.C's order; the twin of
-// rhoCentralStep_cpp.cu. Nothing is read back per step: the Courant numbers and the status of up to
-// kReportWindow steps stay on the device until flush().
+// rhoCentralStep_cpp.cu. The arm reads nothing back by itself: the Courant numbers and the status of up to
+// kReportWindow steps stay on the device until flush(). At a fixed deltaT the driver flushes once a window; under
+// adjustTimeStep it flushes every step, because setDeltaT.H reads the previous step's Courant number.
 #include "rhoCentralFoam.cuh"
 
 #include <memory>

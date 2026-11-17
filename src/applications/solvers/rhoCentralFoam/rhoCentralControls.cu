@@ -96,26 +96,30 @@ Case readRhoCentralCase(const std::string& caseDir)
     Case cs;
     cs.caseDir = caseDir;
 
-    // ---- controlDict: fixed deltaT only ------------------------------------------------------------------------
+    // ---- controlDict: the clock (Time::setControls, readTimeControls.H) -----------------------------------------
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
     const std::string app = controlDict.wordOr("application", "rhoCentralFoam");
     if (app != "rhoCentralFoam")
         refuse("controlDict names application `" + app + "`; this executable runs rhoCentralFoam cases.");
-    if (controlDict.switchOr("adjustTimeStep", false))
-        refuse("controlDict sets `adjustTimeStep yes`. This first stage runs a FIXED deltaT: the central "
-               "Courant number is computed and logged (centralCourantNo.H), but setDeltaT.H (maxCo, maxDeltaT, the "
-               "1.2 growth cap and writeControl adjustable's trimming to write times) is not ported. Set "
-               "`adjustTimeStep no` and choose deltaT, or wait for the step that ports setDeltaT.");
-    cs.deltaT = controlDict.scalarOr("deltaT", 0);
-    if (!(cs.deltaT > 0)) refuse("controlDict deltaT must be positive.");
+    if (!(controlDict.scalarOr("deltaT", 0) > 0)) refuse("controlDict deltaT must be positive.");
+    // purgeWrite deletes all but the last N time directories (Time::writeObject); the writer here keeps them all
+    if (controlDict.intOr("purgeWrite", 0) > 0)
+        refuse("controlDict sets `purgeWrite " + std::to_string(controlDict.intOr("purgeWrite", 0)) + "`. Deleting "
+               "the older time directories is not ported yet: set `purgeWrite 0`.");
+    cs.timeControls = TimeControls::read(controlDict);   // createTimeControls.H: adjustTimeStep, maxCo, maxDeltaT
     cs.writePrecision = controlDict.intOr("writePrecision", 6);
     const StartTime st = resolveStartTime(caseDir, controlDict);
     cs.startName = st.name;
     cs.startTime = static_cast<scalar>(st.value);
-    const scalar endTime = controlDict.scalarOr("endTime", 0);
-    cs.nSteps = openFoamNSteps(static_cast<double>(cs.startTime), static_cast<double>(endTime),
-                               static_cast<double>(cs.deltaT));
-    if (cs.nSteps < 1)
+    try
+    {
+        cs.clock.emplace(controlDict, caseDir + "/" + cs.startName, cs.startTime);
+    }
+    catch (const std::exception& e)
+    {
+        refuse(e.what());
+    }
+    if (!cs.clock->run())
         refuse("endTime is not beyond the start time " + cs.startName + ": nothing to run.");
 
     // ---- static mesh only ----------------------------------------------------------------------------------------

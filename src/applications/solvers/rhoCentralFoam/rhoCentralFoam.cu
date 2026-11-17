@@ -5,6 +5,8 @@
 #include "rhoCentralStep_cpp.cuh"
 
 #include "brae_time.cuh"
+#include "run_clock.cuh"
+#include "time_controls.cuh"
 #include "foam_dict.cuh"
 #include "foam_field_writer.cuh"
 #include "io_precision.cuh"
@@ -83,15 +85,21 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
     setIOPrecision(controlDict.intOr("writePrecision", 6));
     const Case cs = readRhoCentralCase(caseDir);
-
+    // brae's Time reads controlDict's `functions` and says which it does not run (none is registered here); the
+    // loop runs on OpenFOAM's accumulating clock instead, whose deltaT their write times still trim (WriteCadence)
     Time time(caseDir, controlDict);
-    WriteControl& wc = time.writeControl();
-    time.setSteps(static_cast<int>(cs.nSteps));
+    RunClock clock = *cs.clock;
+    const TimeControls& tc = cs.timeControls;
+    // Info's precision is IOstream::defaultPrecision(), which controlDict's writePrecision sets (TimeIO.C:377-389)
+    const int logPrec = cs.writePrecision;
 
-    std::printf("brae rhoCentralFoam (%s arm): %ld cells, %ld internal faces, start %s, deltaT %g, %ld steps\n",
-                onDevice ? "cuda" : "host reference", (long)cs.nC, (long)cs.nIF, cs.startName.c_str(),
-                (double)cs.deltaT, cs.nSteps);
-    std::printf("fluxScheme: %s\ninviscid: every mu is 0\nsolution directions: (%d %d %d)\n",
+    std::printf("brae rhoCentralFoam (%s arm): %ld cells, %ld internal faces, start %s, endTime %.*g, deltaT %.*g, "
+                "adjustTimeStep %s",
+                onDevice ? "cuda" : "host reference", (long)cs.nC, (long)cs.nIF, cs.startName.c_str(), logPrec,
+                (double)clock.endTime(), logPrec, (double)clock.deltaT(), tc.adjustTimeStep ? "yes" : "no");
+    if (tc.adjustTimeStep) std::printf(" (maxCo %.*g, maxDeltaT %.*g)", logPrec, (double)tc.maxCo, logPrec,
+                                       (double)tc.maxDeltaT);
+    std::printf("\nfluxScheme: %s\ninviscid: every mu is 0\nsolution directions: (%d %d %d)\n",
                 cs.tadmor ? "Tadmor" : "Kurganov", cs.sd.d[0], cs.sd.d[1], cs.sd.d[2]);
 
     PatchFields pf;
@@ -99,13 +107,18 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
     const Integrals I0 = integrals(cs, s);
     printIntegrals("start", I0);
 
-    if (control != controlNone && !onDevice)
-        throw std::runtime_error("BRAE_CONTROL_RCF is a device-arm control; the host reference has none.");
+    const bool clockControl = control == controlUntrimmed || control == controlLaggedCourant;
+    if (control != controlNone && !clockControl && !onDevice)
+        throw std::runtime_error("BRAE_CONTROL_RCF upwind and noPressureJump are device-arm controls; the host "
+                                 "reference has none.");
+    if (clockControl && !tc.adjustTimeStep)
+        throw std::runtime_error("BRAE_CONTROL_RCF untrimmed and laggedCourant are controls of adjustTimeStep; this "
+                                 "case runs a fixed deltaT.");
 
     std::unique_ptr<Arm> arm;
     if (onDevice)
     {
-        arm = gpu::rhoCentral::makeDeviceArm(cs, s, pf, control);
+        arm = gpu::rhoCentral::makeDeviceArm(cs, s, pf, clockControl ? controlNone : control);
         std::printf("diag device-memory %.3f MiB\n", arm->deviceBytes()/1048576.0);
     }
     else
@@ -113,53 +126,73 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
         arm = cpu::rhoCentral::makeHostArm(cs, s, pf);
     }
 
+    // rhoCentralFoam.C:80-81: CoNum is 0 until the first step's centralCourantNo.H, so the first setDeltaT.H grows
+    // deltaT by the full 1.2
+    scalar CoNum = 0;
     double stepSeconds = 0;
     long steps = 0;
-    long logged = 0;
+    // the log of the steps the arm has not reported yet: their deltaT and time name (the device arm reports a window
+    // of steps at once at a fixed deltaT)
+    std::vector<std::pair<scalar, std::string>> unlogged;
     std::printf("\nStarting time loop\n\n");
-    // the log, OpenFOAM's two lines a step; reports arrive in the arm's windows (one step on the host)
+    // the log, OpenFOAM's lines a step: setDeltaT.H's "deltaT = " under adjustTimeStep, centralCourantNo.H's, Time
     auto flushArm = [&]()
     {
         const auto t0 = std::chrono::steady_clock::now();
         const std::vector<StepReport> reps = arm->flush();
         stepSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        for (const StepReport& rep : reps)
+        if (reps.size() != unlogged.size())
+            throw std::logic_error("brae rhoCentralFoam: the arm reported a different number of steps than it ran.");
+        for (std::size_t i = 0; i < reps.size(); ++i)
         {
-            const std::string tn = WriteControl::timeName(wc.timeValue(static_cast<int>(++logged)));
-            std::printf("Mean and max Courant Numbers = %.6g %.6g\nTime = %s\n\n", (double)rep.meanCoNum,
-                        (double)rep.CoNum, tn.c_str());
+            const StepReport& rep = reps[i];
+            const std::string& tn = unlogged[i].second;
+            if (tc.adjustTimeStep) std::printf("deltaT = %.*g\n", logPrec, (double)unlogged[i].first);
+            std::printf("Mean and max Courant Numbers = %.*g %.*g\nTime = %s\n\n", logPrec, (double)rep.meanCoNum,
+                        logPrec, (double)rep.CoNum, tn.c_str());
             if (rep.status)
                 throw std::runtime_error(
                     "step to time " + tn + " left an unphysical state (status " + std::to_string(rep.status)
                     + ": 1 negative temperature seed, 2 e->T inversion not converged in 100 iterations -- both "
                       "FatalErrors in OpenFOAM's thermo -- 4 rho, p or T not positive, or e not finite).");
+            CoNum = rep.CoNum;
+            // the control: the Courant number as it would be at the step before's deltaT
+            if (control == controlLaggedCourant) CoNum = rep.CoNum/unlogged[i].first*clock.deltaT0();
         }
+        unlogged.clear();
     };
-    while (time.loop())
+    // rhoCentralFoam.C:85-97 and 288-294, !LTS: Time::run, setDeltaT.H, ++runTime, the step, runTime.write()
+    while (clock.run())
     {
+        if (tc.adjustTimeStep)
+        {
+            const scalar dt = setDeltaT(clock.deltaT(), CoNum, tc);   // setDeltaT.H
+            if (control == controlUntrimmed) clock.setDeltaTNoAdjust(dt);
+            else clock.setDeltaT(dt);                                  // Time::setDeltaT: adjustDeltaT
+        }
+        ++clock;
+        unlogged.emplace_back(clock.deltaT(), clock.timeName());
         const auto t0 = std::chrono::steady_clock::now();
-        arm->step();
+        arm->step(clock.deltaT());
         stepSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         ++steps;
-        const bool write = time.writeTime();
-        if (write || arm->pending() >= arm->window() || steps == cs.nSteps) flushArm();
+        const bool write = clock.writeTime();
+        if (tc.adjustTimeStep || write || arm->pending() >= arm->window() || !clock.run()) flushArm();
         if (write)
         {
-            const std::string tname = WriteControl::timeName(wc.timeValue(time.timeIndex()));
             arm->download(s);
-            writeTime(cs, s, tname);
-            std::printf("written %s\n", tname.c_str());
+            writeTime(cs, s, clock.timeName());
+            std::printf("written %s\n", clock.timeName().c_str());
         }
     }
     flushArm();
     time.end();
-    const std::string endName = WriteControl::timeName(wc.timeValue(static_cast<int>(steps)));
+    // no write here: rhoCentralFoam.C writes only through runTime.write(), on write steps
     arm->download(s);
     scalar bndMass = 0, bndEnergy = 0;
     vector bndMom{0, 0, 0};
     arm->boundaryOutflow(bndMass, bndMom, bndEnergy);
-    writeTime(cs, s, endName);
-    std::printf("written %s\n", endName.c_str());
+    std::printf("diag end time %s value %.17g steps %ld\n", clock.timeName().c_str(), (double)clock.value(), steps);
 
     // ---- diagnostics ------------------------------------------------------------------------------------------------
     const Integrals I1 = integrals(cs, s);

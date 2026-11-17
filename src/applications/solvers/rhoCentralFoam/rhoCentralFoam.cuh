@@ -17,8 +17,9 @@ class Arm
 public:
     virtual ~Arm() = default;
 
-    // advance the state one step; its report is kept until flush()
-    virtual void step() = 0;
+    // advance the state one step of `deltaT` (runTime.deltaTValue() after setDeltaT.H and ++runTime: the Euler
+    // ddt's 1/deltaT and the Courant numbers' scale); its report is kept until flush()
+    virtual void step(scalar deltaT) = 0;
     // the reports of the steps since the last flush, in step order
     virtual std::vector<StepReport> flush() = 0;
     virtual int pending() const = 0;
