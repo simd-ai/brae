@@ -6,16 +6,17 @@
 #
 # THE ENVELOPE (approved 2026-11-17, milestone C; declared here, never widened by a gate in passing): a field of brae's
 # at a write time is within ten times OpenFOAM's own spread for that field at that time, never below BOUND. OpenFOAM's
-# own spread is its distance from OpenFOAM serial when decomposed in two (simple, (2 1 1)) and in four (scotch), the
+# own spread is its distance from OpenFOAM serial when decomposed in two (simple, (2 1 1)) and in four (scotch, frozen), the
 # larger of the two. BOTH are reported, each on its own, by every arm: against two alone obliqueShock's CUDA arm stood
 # at up to 2.9x its bound at t = 5 to 8 (milestone C's first run), because the two-way split's one processor column
 # lies in smooth flow and its distance decays there while the four-way split's does not.
-# THE FOUR-WAY REFERENCE IS NOT REPRODUCIBLE on this OpenFOAM install: scotchDecomp.C calls SCOTCH_randomReset(), yet
-# two runs of the forwardStep gate (2026-11-17) partitioned fs17 differently (4032 cells on each of the four, then 4066,
-# 4032, 3998, 4032), so OpenFOAM's four-way spread, and with it this envelope, moves between runs. brae, OpenFOAM serial
-# and OpenFOAM in two (simple) were bit-identical between the two runs. Measured effect: forwardStep as shipped against
-# the four-way split alone at most 0.27 of its bound in one run, 1.40x (t = 3.8, 3.9) in the other; within the
-# envelope in both (0.25, 0.23).
+# THE FOUR-WAY PARTITION IS FROZEN (milestone E, approved). OpenFOAM's scotch partition is not reproducible on this
+# install: scotchDecomp.C calls SCOTCH_randomReset(), yet two runs of the forwardStep gate (2026-11-17) partitioned fs17
+# differently (4032 cells on each of the four, then 4066, 4032, 3998, 4032), so OpenFOAM's four-way spread moved between
+# runs (forwardStep as shipped against it alone: 0.27 of its bound in one run, 1.40x at t = 3.8, 3.9 in the other) while
+# brae, OpenFOAM serial and OpenFOAM in two were bit-identical. One scotch partition per mesh -- that of the runs
+# milestones C and D report -- is now kept with its checksums in tests/data/rho_central_decomposition and every
+# four-way reference decomposes on it (`manual`); the envelope's rule is unchanged.
 
 fail() { echo "FAIL $*"; fails=$((fails + 1)); }
 ok() { passes=$((passes + 1)); echo "ok   $*"; }
@@ -24,15 +25,23 @@ le() { python3 -c "import sys; sys.exit(0 if float('${1:-nan}') <= float('$2') e
 mx() { python3 -c "print('%.3e' % max(float('$1'), float('$2')))"; }
 copy() { rm -rf "$2"; mkdir -p "$2"; cp -r "$1/system" "$1/constant" "$1/0" "$2/"; }
 ofrun() { of "cd '$1' && rhoCentralFoam > log 2>&1" < /dev/null || fail "OpenFOAM rhoCentralFoam in $(basename "$1")"; }
-ofnp()   # ofnp <dir> <2|4>: in two by simple (2 1 1), in four by scotch
+# ofnp <dir> <2|4>: in two by simple (2 1 1); in four by the FROZEN scotch partition of the case's mesh (OpenFOAM's
+# `manual` method on tests/data/rho_central_decomposition/<mesh>.cellDecomposition, its sha256 and the mesh's checked by
+# tests/rho_central_decomposition.py). A mesh with no frozen partition fails the gate: never a fresh scotch run.
+DECOMP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rho_central_decomposition.py"
+ofnp()
 {
     if [ "$2" = 2 ]
     then
         printf '%s\n' 'FoamFile { version 2.0; format ascii; class dictionary; object decomposeParDict; }' \
             'numberOfSubdomains 2;' 'method simple;' 'coeffs { n (2 1 1); }' > "$1/system/decomposeParDict"
     else
+        local n
+        n=$(python3 "$DECOMP" install "$1" 2>&1) || { fail "frozen decomposition for $(basename "$1"): $n"; return; }
+        [ "$n" = "$2" ] || { fail "frozen decomposition for $(basename "$1") has $n processors, not $2"; return; }
         printf '%s\n' 'FoamFile { version 2.0; format ascii; class dictionary; object decomposeParDict; }' \
-            "numberOfSubdomains $2;" 'method scotch;' > "$1/system/decomposeParDict"
+            "numberOfSubdomains $2;" 'method manual;' 'manualCoeffs { dataFile "cellDecomposition"; }' \
+            > "$1/system/decomposeParDict"
     fi
     of "cd '$1' && decomposePar > log.decomposePar 2>&1 && mpirun -np $2 rhoCentralFoam -parallel > log 2>&1 \
         && reconstructPar > log.reconstructPar 2>&1" < /dev/null || fail "OpenFOAM decomposed in $2, $(basename "$1")"
@@ -163,7 +172,7 @@ arm()
     local label
     for j in $(seq 1 "$nref")
     do
-        label="in two (simple)"; [ "$j" = 2 ] && label="in four (scotch)"
+        label="in two (simple)"; [ "$j" = 2 ] && label="in four (scotch, frozen)"
         if [ -z "${ov[$j]}" ]
         then
             echo "     $name: against OpenFOAM $label alone: at most ${wr[$j]} of ten times its spread"

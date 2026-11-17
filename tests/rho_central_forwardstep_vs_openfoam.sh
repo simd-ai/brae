@@ -20,7 +20,7 @@
 #   sodP      shockTube as shipped with purgeWrite 2 and writeControl timeStep, interval 40
 #   sodPr     shockTube as shipped with purgeWrite 3 and writeControl runTime, interval 0.001
 # REFERENCE  OpenFOAM serial on every case; OpenFOAM's own spread (decomposed in two, simple (2 1 1), and in four,
-#   scotch) on fs17, fs17e, fsIn17, rev17 and rsRev.
+#   scotch, the partition frozen: tests/rho_central_gate_lib.sh) on fs17, fs17e, fsIn17, rev17 and rsRev.
 # ENVELOPE (tests/rho_central_gate_lib.sh, approved with milestone C, declared here before the first run): every field
 #   at every write time within ten times the larger of OpenFOAM's two spreads, never below 8e-14 (6-digit arms: 1e-6);
 #   each decomposition alone reported beside it. The Courant number likewise. deltaT: the same digits where

@@ -14,7 +14,7 @@
 #   rs7                 obliqueShock RESTARTED from OpenFOAM's own t = 7 (the reflected shock standing on the
 #                       symmetryPlane), written every step (adjustable, 0.0025) to 7.04: the developed flow, step by step
 # REFERENCE  OpenFOAM serial on every case, and OpenFOAM's own spread on every 17-digit one: OpenFOAM decomposed in two
-#   (decomposePar simple (2 1 1)) and in four (scotch), mpirun, reconstructPar; the spread at a write time is the larger
+#   (decomposePar simple (2 1 1)) and in four (scotch, the partition frozen: tests/rho_central_gate_lib.sh), mpirun, reconstructPar; the spread at a write time is the larger
 #   of the two distances from serial. THESE RUNS AMPLIFY ROUND-OFF. Mach 5 and Mach 2.9 shocks switch limiters on the
 #   last bits, and the e -> T inversion of these non-dimensional cases (T = 1 against Tstd = 298.15: e is -744) carries
 #   a unit in the last place of e into T as 6e-14. MEASURED, GB10 2026-11-17, max |diff|/max|ref| against OpenFOAM
