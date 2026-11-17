@@ -378,8 +378,30 @@ Gates for the transition:
   - controls red: deltaT from controlDict (1.1e+09 x the bound), the index dropped and the write grid from 0 (the
     directories off OpenFOAM's), the inletOutlet value taken from the cells (1.3e+10 x), no uniform/time written
     (OpenFOAM restarted from such output 1.2e+09 x from OpenFOAM restarted from brae's full output).
-- **Not gated:** restart with function objects (none in these tutorials), binary or compressed time directories, a
-  latest directory without fields (brae's `resolveStartTime` skips one without U; OpenFOAM would stop on it), LTS.
+- **The open check, investigated** (fixed, reproducible references: OpenFOAM decomposed by simple (2 1 1) and (3 1 1),
+  hierarchical (4 2 1), the frozen scotch four-way partition; OpenFOAM serial with its start state's p or T moved one
+  unit in the last place; every step written from 0.06 to 0.125):
+  - at cell 2348 (x 0.109, y 0.058; rho 1.4000050406, a precursor of the shock above the free stream's 1.4) OpenFOAM
+    serial with p one ulp up is 6.13e-10 from OpenFOAM serial at t = 0.12, with T one ulp up 4.91e-10 -- brae's CUDA
+    arm 6.18e-10, the host arm 8.1e-11 -- all crossing 1e-10 at t = 0.1179 to 0.1182; the decompositions, whose
+    perturbation starts at their processor faces, read 1.5e-12 to 3.4e-11 there at 0.12 (the four-way one reaches 1e-10
+    at 0.125);
+  - the limiter there acts on rho differences of 4e-10 to 2e-9 between neighbours: runs 1e-10 apart choose vanLeer's r
+    30 to 50 % apart (0.0377 for OpenFOAM serial on face 4645 at t = 0.1178, 0.0242 with p one ulp up, 0.0245 for the
+    CUDA arm, whose rho there agrees with the one-ulp run to 7e-17);
+  - so the CUDA arm's trajectory is OpenFOAM's own under a one-ulp perturbation of its state: floating-point
+    sensitivity of a near-uniform region, not a restart error. The check stays red, unchanged, until its resolution is
+    approved; the restart gate reports OpenFOAM's one-ulp response beside brae's distance at every write time.
+  - restart against uninterrupted, a property of OpenFOAM's restart that brae reproduces: on calculated patches an
+    uninterrupted run's rhoU_b and rhoE_b carry the step before's rho_b (sec. 4), which no file holds; a restart rebuilds
+    them from the current one. After ONE step OpenFOAM's restart is 7.2e-04 (rho) from its uninterrupted run, at the
+    outlet's cells; by t = 0.12, 1.1e-04 for OpenFOAM, the CUDA arm and the host arm alike (rho 5.61e-04, 5.62e-04,
+    5.61e-04 absolute).
+- **A start directory without its fields** is refused by name (`checkStartDirectory`, rhoCentralControls.cu): startFrom
+  latestTime or firstTime selects the directory OpenFOAM's findTimes would (by its name alone), and U, p and T must be in
+  it. The shared `resolveStartTime` still skips a directory without U for the other solvers; rhoCentralFoam refuses where
+  that would start it from an older time (tests/rho_central_refusals.sh, three rows; OpenFOAM stops on each too).
+- **Not gated:** restart with function objects (none in these tutorials), binary or compressed time directories, LTS.
 
 ## 6. Milestones, each closed by a gate against OpenFOAM v2412
 

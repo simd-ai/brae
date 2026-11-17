@@ -295,6 +295,21 @@ do
     echo "     restart against uninterrupted, $name: at t = $tl OpenFOAM's $eo, brae's $eb; the first deltaT after $t: restart ${d1o:-the fixed one}, uninterrupted ${d1c:-the fixed one}"
 done
 
+# ---- floating-point sensitivity (reported, NOT a bound): OpenFOAM restarted from the same directory with its p moved one
+# unit in the last place, against OpenFOAM restarted from it as written -- OpenFOAM's own response to the last bit of its
+# state, beside brae's distance from OpenFOAM, cell by cell. Milestone E left wedge15Ma5 from OpenFOAM's t = 0.06 (CUDA)
+# above the envelope at t = 0.12; this shows what OpenFOAM itself does there.
+for r in wedge17_0.06o wedge17_0.06b fs17_2o; do
+    rcopy "$W/$r" "$W/of_${r}_ulp"
+    st=$(sed -n 's/^startTime[[:space:]]*\([^;]*\);.*/\1/p' "$W/$r/system/controlDict")
+    python3 "$FIELDS" nudge "$W/of_${r}_ulp/$st/p" > /dev/null && ofrun "$W/of_${r}_ulp"
+    for t in $(times "$W/of_$r"); do
+        read -r _ cu fu ru au <<< "$(python3 "$FIELDS" worst "$W/of_${r}_ulp/$t" "$W/of_$r/$t")"
+        read -r _ cb fb rb ab <<< "$(python3 "$FIELDS" worst "$W/b_$r/$t" "$W/of_$r/$t")"
+        echo "     sensitivity, restart $r at t = $t: OpenFOAM with p one ulp up $ru ($fu, cell $cu); brae CUDA $rb ($fb, cell $cb)"
+    done
+done
+
 # ---- CPU against GPU (reported) ----------------------------------------------------------------------------------------
 for r in fs17e_2o fs17e_2b rev17_0.013o; do
     t1=$(times "$W/b_$r" | awk '{print $1}'); tl=$(times "$W/b_$r" | awk '{print $NF}')
@@ -326,4 +341,4 @@ for r in fs17_2o fs17_2b; do
     echo "     runtime restart $r: OpenFOAM $(grep -h '^ExecutionTime' "$W/of_$r/log" | tail -n 1 | awk '{print $3}') s; brae CUDA $(sed -n 's/^diag steps \([^ ]*\) step-seconds \([^ ]*\) per-step-us \([^ ]*\).*/\2 s (\1 steps, \3 us a step)/p' "$W/b_$r/log")"
 done
 echo "rho_central_restart_vs_openfoam: $passes passed, $fails failed (work in $W)"
-[ "$fails" = 0 ] && [ "$passes" -ge 197 ]
+[ "$fails" = 0 ] && [ "$passes" -ge 197 ]   # the wedge15Ma5 arm from OpenFOAM's t = 0.06 (CUDA) stays a check

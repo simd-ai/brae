@@ -126,6 +126,56 @@ tensor mirrorTensor(const vector& n)
                   -(2.0*(n.z*n.x)), -(2.0*(n.z*n.y)), 1.0 - 2.0*(n.z*n.z)};
 }
 
+// The start directory, as OpenFOAM would read it. Time::setControls (Time.C:160-183) takes startFrom latestTime's or
+// firstTime's directory from findTimes: every directory whose NAME reads as a number, whatever it holds. The shared
+// resolveStartTime (start_time.cuh) skips one without U, which other brae solvers rely on; here a newer (or, for
+// firstTime, older) directory it skipped is refused by name, since OpenFOAM would pick it and stop reading its fields.
+// Then p, T and U must all be in the start directory: OpenFOAM's MUST_READ stops on any missing one.
+void checkStartDirectory(const std::string& caseDir, const FoamDict& controlDict, const StartTime& st)
+{
+    namespace fs = std::filesystem;
+    const std::string startFrom = controlDict.wordOr("startFrom", "latestTime");
+    if (startFrom == "latestTime" || startFrom == "firstTime")
+    {
+        std::error_code ec;
+        bool any = false;
+        double best = 0;
+        std::string bestName;
+        for (const auto& e : fs::directory_iterator(caseDir, ec))
+        {
+            if (!e.is_directory()) continue;
+            const std::string nm = e.path().filename().string();
+            char* end = nullptr;
+            const double t = std::strtod(nm.c_str(), &end);
+            if (end == nm.c_str() || *end != '\0') continue;   // constant, system, 0.orig: not a time
+            if (!any || (startFrom == "latestTime" ? t > best : t < best))
+            {
+                best = t;
+                bestName = nm;
+            }
+            any = true;
+        }
+        if (any && best != st.value)
+        {
+            std::string missing;
+            for (const char* f : {"U", "p", "T"})
+                if (!fs::exists(caseDir + "/" + bestName + "/" + f) && !fs::exists(caseDir + "/" + bestName + "/" + f + ".gz"))
+                    missing += std::string(missing.empty() ? "" : ", ") + f;
+            refuse("startFrom " + startFrom + " selects time directory " + bestName + " (Time::setControls takes it by "
+                   "its name, Time.C:160-183), and it has no " + (missing.empty() ? std::string("readable fields")
+                   : missing) + ". OpenFOAM stops reading it; brae refuses rather than start from " + st.name
+                   + " instead.");
+        }
+    }
+    std::string missing;
+    for (const char* f : {"U", "p", "T"})
+        if (!fs::exists(caseDir + "/" + st.name + "/" + f) && !fs::exists(caseDir + "/" + st.name + "/" + f + ".gz"))
+            missing += std::string(missing.empty() ? "" : ", ") + f;
+    if (!missing.empty())
+        refuse("the start time directory " + st.name + " has no " + missing + "; rhoCentralFoam reads U, p and T "
+               "(MUST_READ: createFields.H and the thermo), and OpenFOAM stops on a missing one.");
+}
+
 } // namespace
 
 
@@ -146,6 +196,7 @@ Case readRhoCentralCase(const std::string& caseDir)
     cs.timeControls = TimeControls::read(controlDict);   // createTimeControls.H: adjustTimeStep, maxCo, maxDeltaT
     cs.writePrecision = controlDict.intOr("writePrecision", 6);
     const StartTime st = resolveStartTime(caseDir, controlDict);
+    checkStartDirectory(caseDir, controlDict, st);
     cs.startName = st.name;
     cs.startTime = static_cast<scalar>(st.value);
     try

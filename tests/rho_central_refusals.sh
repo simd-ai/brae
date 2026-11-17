@@ -6,7 +6,9 @@
 # The shipped tutorials run as shipped and stop on their first unported input. wedge15Ma5 and obliqueShock run since
 # milestone C (tests/rho_central_wedge_vs_openfoam.sh), forwardStep since milestone D, which ported inletOutlet and
 # purgeWrite (tests/rho_central_forwardstep_vs_openfoam.sh); one row here checks OpenFOAM's pairing of constraint patch
-# and field types on wedge15Ma5, and three check what inletOutlet's port leaves out. What this does NOT show: that the
+# and field types on wedge15Ma5, three check what inletOutlet's port leaves out, and three (milestone E) a start
+# directory without the fields OpenFOAM must read: brae names it where OpenFOAM stops on it, never starting from an older
+# directory instead. What this does NOT show: that the
 # refused inputs are rare (they are not -- three of the seven shipped tutorials are refused today; ARCHITECTURE.md
 # lists the order of the work).
 set -u
@@ -80,5 +82,38 @@ row sod_inletOutletPhi shockTube yes "is \`inletOutlet\` on \`phi phiEp\`" \
     0/T '/sides/,/\}/ s/zeroGradient;/inletOutlet; inletValue uniform 300; phi phiEp;/'
 row sod_inletOutletNoInletValue shockTube yes "is \`inletOutlet\` without \`inletValue\`" \
     0/p '/sides/,/\}/ s/zeroGradient;/inletOutlet;/'
+# rowx <name> <tutorial> <expected words> <shell run in the case after blockMesh> -- and OpenFOAM must stop on the same case
+rowx()
+{
+    local name=$1 tut=$2 want=$3 setup=$4
+    local d="$W/$name"
+    rm -rf "$d"
+    cp -r "$TUT/$tut" "$d"
+    [ -d "$d/0" ] || cp -r "$d/0.orig" "$d/0"
+    of "cd '$d' && blockMesh > log.blockMesh 2>&1" < /dev/null || { echo "FAIL $name: blockMesh"; fails=$((fails + 1)); return; }
+    (cd "$d" && eval "$setup")
+    rm -rf "$d.of"
+    cp -r "$d" "$d.of"
+    local before
+    before=$(cd "$d" && ls -d [0-9]* 2> /dev/null | sort | tr '\n' ' ')
+    (cd "$d" && timeout 120 "$BIN" -case . > log 2>&1 < /dev/null; echo $? > rc)
+    of "cd '$d.of' && timeout 120 rhoCentralFoam > log 2>&1" < /dev/null
+    local ofrc=$?
+    local after
+    after=$(cd "$d" && ls -d [0-9]* 2> /dev/null | sort | tr '\n' ' ')
+    if [ "$(cat "$d/rc")" != 0 ] && grep -qF -- "$want" "$d/log" && [ "$before" = "$after" ] && [ "$ofrc" != 0 ]
+    then
+        passes=$((passes + 1))
+        echo "ok   $name: $(grep -o 'brae rhoCentralFoam: ERROR: .*' "$d/log" | cut -c29-220) (OpenFOAM stops too: $(grep -m 1 -o 'cannot find file[^\"]*\|cannot find.*' "$d.of/log" | cut -c1-60))"
+    else
+        fails=$((fails + 1))
+        echo "FAIL $name: exit $(cat "$d/rc"), wanted \"$want\"; OpenFOAM exit $ofrc"
+        tail -n 3 "$d/log" | sed 's/^/     /'
+    fi
+}
+LATEST='sed -i -E "s/^(startFrom\s+)\S+;/\1latestTime;/" system/controlDict'
+rowx sod_latestTimeEmpty shockTube "selects time directory 0.004" "$LATEST; mkdir 0.004"
+rowx sod_latestTimeNoT shockTube "has no T" "$LATEST; mkdir 0.004; cp 0/U 0/p 0.004/"
+rowx sod_startTimeNoT shockTube "the start time directory 0 has no T" "rm 0/T"
 echo "rho_central_refusals: $passes passed, $fails failed (work in $W)"
-[ "$fails" = 0 ] && [ "$passes" -ge 16 ]
+[ "$fails" = 0 ] && [ "$passes" -ge 19 ]

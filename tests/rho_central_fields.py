@@ -15,6 +15,11 @@
       <time>/uniform/time of every time directory B holds (but its start): how many of A's carry the same text in
       value, name, index, deltaT and deltaT0, how many A lacks, and the worst relative difference of deltaT and deltaT0:
       `timedict <n> missing <m> value <k> <worst> name <k> index <k> deltaT <k> <worst> deltaT0 <k> <worst>`
+  rho_central_fields.py nudge <field file>
+      moves every value of the internalField one unit in the last place towards +inf (a fixed, reproducible
+      perturbation: OpenFOAM's own response to its state's last bit)
+  rho_central_fields.py worst <dir A> <dir B> [fields]
+      the cell where max|A - B|/max|B| is largest over the fields, and that value: `worst <cell> <field> <rel> <abs>`
   rho_central_fields.py shock <case dir> <time> <kind>
       the shock read off the cell-centre pressure (kind: wedge, cone, oblique, step); see shock()
   rho_central_fields.py theory <kind>
@@ -339,6 +344,25 @@ if __name__ == "__main__":
         print(f"maxrel {w[2]:.3e} {w[0]}")
     elif a[0] == "shock":
         print("shock", " ".join(f"{k} {v:.6g}" if isinstance(v, float) else f"{k} {v}" for k, v in shock(a[1], a[2], a[3]).items()))
+    elif a[0] == "nudge":
+        s = open(a[1]).read()
+        i = s.index("internalField")
+        j = s.index("(", s.index("List<scalar>", i))
+        k = s.index(")", j)
+        v = np.nextafter(np.array(s[j + 1:k].split(), dtype=float), np.inf)
+        open(a[1], "w").write(s[:j + 1] + "\n" + "\n".join("%.17g" % x for x in v) + "\n" + s[k:])
+        print("nudge", len(v))
+    elif a[0] == "worst":
+        best = (0.0, None, -1, 0.0)
+        for f in (a[3:] or ["U", "p", "T", "rho"]):
+            x, y = internal(f"{a[1]}/{f}"), internal(f"{a[2]}/{f}")
+            d = np.abs(x - y)
+            if d.ndim == 2:
+                d = d.max(axis=1)
+            r = float(d.max() / np.abs(y).max())
+            if r >= best[0]:
+                best = (r, f, int(d.argmax()), float(d.max()))
+        print(f"worst {best[2]} {best[1]} {best[0]:.3e} {best[3]:.3e}")
     elif a[0] == "timedict":
         n, miss, same, worst = timedict(a[1], a[2])
         print(f"timedict {n} missing {miss} value {same['value']} {worst['value']:.3e} name {same['name']} index {same['index']} "
