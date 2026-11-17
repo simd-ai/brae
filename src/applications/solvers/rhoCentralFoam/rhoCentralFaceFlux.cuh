@@ -25,6 +25,23 @@ struct FaceFlux
     scalar phi, phiUx, phiUy, phiUz, phiEp, amaxSf;
 };
 
+// One product, rounded on its own: never fused into the sum it feeds. OpenFOAM's field algebra stores every product of
+// `aphiv_pos*rho_pos + aphiv_neg*rho_neg` in a temporary field before the sum, so phi is round(round(a*b) + round(c*d));
+// a fused multiply-add (nvcc's default on the device, GCC's -ffp-contract=fast on the host) gives a*b exactly and
+// leaves round(c*d)'s rounding error behind. That only moves the last bits of phi -- except where the two products are
+// exact negatives, a face of fluid at rest (phiv_pos = phiv_neg = 0, so aphiv_pos = -aSf = -aphiv_neg): OpenFOAM's
+// phi is exactly 0 and brae's was +-5e-15. inletOutlet decides on the SIGN of phi, and pos0(0) is the outflow branch:
+// on the shockTube's ends at rest brae took inflow on the first step and OpenFOAM outflow (milestone D, measured).
+BRAE_HD inline scalar roundedProduct(scalar a, scalar b)
+{
+#ifdef __CUDA_ARCH__
+    return __dmul_rn(a, b);   // never contracted into an FMA
+#else
+    volatile scalar r = a*b;  // materialised, so it cannot be contracted into the add
+    return r;
+#endif
+}
+
 BRAE_HD inline scalar maxOF(scalar a, scalar b) { return (a > b) ? a : b; }   // Foam::max
 BRAE_HD inline scalar minOF(scalar a, scalar b) { return (a < b) ? a : b; }   // Foam::min
 
@@ -59,7 +76,7 @@ BRAE_HD inline FaceFlux centralFaceFlux(const FaceStates& in, scalar Sx, scalar 
 
     FaceFlux o;
     o.amaxSf = amaxSf;
-    o.phi = aphiv_pos*in.rho[0] + aphiv_neg*in.rho[1];                                            // :195
+    o.phi = roundedProduct(aphiv_pos, in.rho[0]) + roundedProduct(aphiv_neg, in.rho[1]);          // :195
     const scalar pf = a_pos*p_pos + a_neg*p_neg;                                                  // :202
     o.phiUx = (aphiv_pos*in.rhoU[0].x + aphiv_neg*in.rhoU[1].x) + pf*Sx;                          // :197-202
     o.phiUy = (aphiv_pos*in.rhoU[0].y + aphiv_neg*in.rhoU[1].y) + pf*Sy;
