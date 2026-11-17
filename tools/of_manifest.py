@@ -5090,7 +5090,8 @@ COMPONENTS = {
     "rhoCentralFoam": [
         dict(name="rhoCentralFoam_main", of_symbol="main", of_file="applications/solvers/compressible/rhoCentralFoam/rhoCentralFoam.C",
              classification="HOST_ONLY", status="REIMPLEMENT",
-             brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralFoam_cpp.cu", brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralFoam_device.cu",
+             brae_driver="src/applications/solvers/rhoCentralFoam/rhoCentralFoam.cu",
+             brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralStep_cpp.cu", brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralStep.cu",
              brae_target="src/applications/solvers/rhoCentralFoam/gpuRhoCentralFoam.cu",
              validation="tests/rho_central_sod_vs_openfoam.sh -- shockTube (Sod) with adjustTimeStep no, deltaT "
                         "1e-5, 700 steps: CUDA arm 7.7e-15, host arm 7.8e-15, Tadmor 7.1e-15 relative L2 on U p T "
@@ -5101,51 +5102,52 @@ COMPONENTS = {
                         "OpenFOAM's figures the same to 1e-9. Does NOT claim adjustTimeStep, viscous flow, 2-D waves "
                         "or any patch type but zeroGradient and empty (fixedValue is implemented, not gated)."),
         dict(name="createFields", of_symbol="createFields.H", of_file="applications/solvers/compressible/rhoCentralFoam/createFields.H",
-             classification="HOST_ONLY", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralFoam_cpp.cu",
+             classification="HOST_ONLY", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralCreateFields_cpp.cu",
              validation="rho_central_sod_vs_openfoam (the whole run starts from it); includes heThermo::init and "
                         "hePsiThermo's constructor calculate(), which re-derives T from he on construction."),
         dict(name="readFluxScheme", of_symbol="readFluxScheme.H", of_file="applications/solvers/compressible/rhoCentralFoam/readFluxScheme.H",
-             classification="CONFIGURATION", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralFoam_cpp.cu",
+             classification="CONFIGURATION", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralControls.cu",
              validation="Kurganov and Tadmor arms of rho_central_sod_vs_openfoam; any other value refused "
                         "(rho_central_refusals sod_fluxScheme), as OpenFOAM's FatalError."),
         dict(name="directionInterpolate", of_symbol="interpolate(vf, dir, reconFieldName)",
              of_file="applications/solvers/compressible/rhoCentralFoam/directionInterpolate.H",
-             classification="GPU_REQUIRED", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralFoam_cpp.cu",
-             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralFoam_device.cu",
+             classification="GPU_REQUIRED", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralFlux_cpp.cu",
+             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralFlux.cu",
              validation="vanLeer (NVDTVD) on rho, rPsi, e, c and vanLeerV (NVDVTVDV) on rhoU, direction +1/-1, "
                         "limiter gradients Gauss linear through brae's deviceGaussGradFused. The upwind control "
                         "(limiter 0) is 9.8e-02 off OpenFOAM. Other limiters and gradient schemes refused."),
         dict(name="limitedScheme_weights", of_symbol="limitedSurfaceInterpolationScheme::weights",
              of_file="src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/"
                      "limitedSurfaceInterpolationScheme/limitedSurfaceInterpolationScheme.C",
-             classification="SHARED_NUMERICAL", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralFoam_cpp.cu",
-             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralFoam_device.cu",
+             classification="SHARED_NUMERICAL", status="REIMPLEMENT", brae_existing="src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedSchemes_cpp.cuh (host: rScalar, rVector, vanLeerLimiter, blend); src/cuda/device_limiter.cuh (device: limitedFaceWeight, limiterOfR)",
+             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralFlux.cu",
              note="limiter*CDweight + (1 - limiter)*pos0(dir); face value w*(P - N) + N (dotInterpolate's form)."),
         dict(name="centralUpwindFlux", of_symbol="ap/am/a_pos/aSf/phi/phiUp/phiEp", of_file="applications/solvers/compressible/rhoCentralFoam/rhoCentralFoam.C",
              of_line=114, classification="GPU_REQUIRED", status="REIMPLEMENT",
-             brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralFoam_cpp.cu", brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralFoam_device.cu",
+             brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralFaceFlux.cuh", brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralFaceFlux.cuh",
              validation="rho_central_sod_vs_openfoam; the noPressureJump control (phiEp without aSf*p terms) "
                         "6.2e-03 red."),
         dict(name="centralCourantNo", of_symbol="centralCourantNo.H", of_file="applications/solvers/compressible/rhoCentralFoam/centralCourantNo.H",
-             classification="GPU_REQUIRED", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralFoam_cpp.cu",
-             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralFoam_device.cu",
+             classification="GPU_REQUIRED", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralFlux_cpp.cu",
+             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralStep.cu",
              note="computed and logged every step (OpenFOAM's figures to the printed digits); it drives nothing "
                   "yet because setDeltaT is not ported."),
         dict(name="explicitDiagonalSolves", of_symbol="solve(fvm::ddt(q) + fvc::div(flux))",
              of_file="src/finiteVolume/finiteVolume/ddtSchemes/EulerDdtScheme/EulerDdtScheme.C",
-             classification="GPU_REQUIRED", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralFoam_cpp.cu",
-             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralFoam_device.cu",
+             classification="GPU_REQUIRED", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralCellUpdate.cuh",
+             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralCellUpdate.cuh",
              note="x = (rDeltaT*q0*V - V*div)/(rDeltaT*V), surfaceIntegrate in OpenFOAM's face order; a vector "
                   "component knocked out by an empty patch is not solved (fvMatrixSolve.C validComponents)."),
         dict(name="hePsiThermo_calculate", of_symbol="hePsiThermo::calculate",
              of_file="src/thermophysicalModels/basic/psiThermo/hePsiThermo.C",
-             classification="MODEL", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralThermo.cuh",
+             classification="MODEL", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralThermo.cuh src/applications/solvers/rhoCentralFoam/rhoCentralCellUpdate.cuh src/applications/solvers/rhoCentralFoam/rhoCentralPatchUpdate.cuh",
              note="species::thermo::T's Newton loop from the field's own T (Ttol = T0*1e-4), Es = Hs - p/rho(p,T); "
                   "the gradientEnergy patch's Tw.evaluate() seeds the patch inversion with the cell's old T."),
         dict(name="boundaryConditions", of_symbol="zeroGradient/fixedValue/empty",
              of_file="src/finiteVolume/fields/fvPatchFields/basic/zeroGradient/zeroGradientFvPatchField.C",
-             classification="BOUNDARY_CONDITION", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralFoam_cpp.cu",
-             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralFoam_device.cu",
+             classification="BOUNDARY_CONDITION", status="REIMPLEMENT", brae_existing="src/finiteVolume/fields/fv_patch_field.cuh (host patch fields); src/cuda/device_boundary.cuh deviceBCValue (device)",
+             brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralPatchUpdate.cuh",
+             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralStep.cu",
              note="zeroGradient and empty gated; fixedValue implemented, not gated. slip, symmetryPlane, wedge, "
                   "inletOutlet, totalPressure, totalTemperature, waveTransmissive, maxwellSlipU, smoluchowskiJumpT "
                   "UNSUPPORTED (refused)."),

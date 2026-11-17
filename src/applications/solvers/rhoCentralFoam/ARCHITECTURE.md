@@ -5,51 +5,48 @@ implicit viscous correctors), its central-upwind flux assembly and its time loop
 boundary conditions, thermo, gradients, linear smoothers and time controls. Nothing here goes through SIMPLE, PIMPLE or
 rhoSimpleFoam's pressure correction, and there is no pressure equation: p = rho/psi.
 
-## 1. OpenFOAM's structure, and where each part lives in brae
+## 1. OpenFOAM's structure, and where each part lives in brae (after milestone A)
 
 The reference is OpenFOAM v2412 `applications/solvers/compressible/rhoCentralFoam`. In the table, (H) marks the host
-reference `_cpp` (namespace `brae::cpu::rhoCentral`), and (D) marks the device module (namespace
-`brae::gpu::rhoCentral`). Shared types live in `brae::rhoCentral`.
+reference (namespace `brae::cpu::rhoCentral`), (D) the device arm (namespace `brae::gpu::rhoCentral`), and (HD)
+BRAE_HD code both arms run (namespace `brae::rhoCentral`).
 
-| OpenFOAM | brae module | notes |
+| OpenFOAM | brae file | role |
 |---|---|---|
-| `rhoCentralFoam.C` `main()`: the time loop, its order, write | `rhoCentralFoam.cu` (driver) + `gpuRhoCentralFoam.cu` (entry) | one loop for both arms; the arm is a `Stepper` (sec. 2) |
-| `createFields.H`, `createFieldRefs.H` | `rhoCentralCreateFields_cpp.cu` | host only, once (and on restart) |
-| `createTimeControls.H`, `readTimeControls.H`, `setDeltaT.H` | shared `time_controls.cuh` + `rhoCentralClock.cuh` | accumulating clock; no setInitialDeltaT |
-| `readFluxScheme.H` | `rhoCentralControls.cu` | all dictionary reading and refusals in one place |
-| `directionInterpolate.H` + `LimitedScheme`/`NVDTVD`/`NVDVTVDV` | `rhoCentralReconstruct.cuh` (BRAE_HD face kernels) on the shared limiter library (sec. 3) | |
-| lines 102-210 (flux core) | `rhoCentralFlux.cuh` (BRAE_HD per face) + `rhoCentralFlux_cpp.cu` (H) / `rhoCentralFlux.cu` (D) | the per-face arithmetic is written once; the arms differ in loops and gathers |
-| `centralCourantNo.H` | inside the flux modules (H/D) | resident on the device; read back in batches |
-| `setRDeltaT.H` (LTS) | `rhoCentralSetRDeltaT_cpp.cu` (H) / `rhoCentralSetRDeltaT.cu` (D) | shared `fvc::smooth` |
-| lines 222-245 (rho, rhoU, U, viscous U corrector) | `rhoCentralMomentum_cpp.cu` (H) / `rhoCentralMomentum.cu` (D) | the corrector uses the shared laplacian assembly and the shared Gauss-Seidel |
-| lines 247-282 (sigmaDotU, rhoE, e, thermo.correct, e corrector) | `rhoCentralEnergy_cpp.cu` (H) / `rhoCentralEnergy.cu` (D) | |
-| lines 284-288 (p, rho_b) and the patch updates | `rhoCentralBoundary_cpp.cu` (H) / `rhoCentralBoundary.cu` (D) | the OpenFOAM order of sec. 4 |
-| hePsiThermo + hConst/janaf + const/sutherland | `rhoCentralThermo.cuh` (BRAE_HD) | sec. 3: why it is not rhoSimpleFoam's thermo |
-| `BCs/` (maxwellSlipU, smoluchowskiJumpT, fixedRho) | `BCs/` in this directory | solver-owned BCs, as in OpenFOAM |
-| `turbulence->correct()`, `muEff`, `alphaEff` | `rhoCentralTurbulence` hook over brae's compressible closures | refused until gated |
-| `mesh.update()`, `meshPhi` | `rhoCentralMeshMotion` hook | refused until gated |
+| `rhoCentralFoam.C` `main()`: start-up, time loop, write | `gpuRhoCentralFoam.cu` (entry), `rhoCentralFoam.cuh/.cu` (driver) | one loop for both arms; the arm is an `Arm` (sec. 2) |
+| `readFluxScheme.H`, the dictionary reads, every refusal | `rhoCentralControls.cuh/.cu` | the `Case`: controls, mesh, flat boundary addressing |
+| state | `rhoCentralState.cuh` | `State` (cells and flat boundary), `PatchFields` (brae patch-field objects of U, p, T), `StepReport`, controls |
+| `createFields.H`, `createFieldRefs.H`, thermo construction | `rhoCentralCreateFields_cpp.cuh/.cu` (H) | once, on the host; both arms start from its state |
+| lines 102-210 + `directionInterpolate.H`: reconstruction and fluxes; `centralCourantNo.H`; fvc::div | `rhoCentralFlux_cpp.cuh/.cu` (H), `rhoCentralFlux.cuh/.cu` (D) | gradients, limited directed interpolation, face fluxes |
+| the face flux (114-210) | `rhoCentralFaceFlux.cuh` (HD) | written once |
+| 222-286, cell half: rho, rhoU, U, rhoE, e, thermo.correct, p | `rhoCentralCellUpdate.cuh` (HD) | four stages (momentum, energy, thermo, pressure) |
+| 232-288, patch half | `rhoCentralPatchUpdate.cuh` (HD), with brae's patch fields | rhoU_b, e_b, T_b, psi_b, rhoE_b; then p_b and rho_b |
+| one step, composed | `rhoCentralStep_cpp.cuh/.cu` (H), `rhoCentralStep.cuh/.cu` (D) | the two `Arm`s |
+| hePsiThermo + hConst + perfectGas | `rhoCentralThermo.cuh` (HD) | Es, Cv, psi, the Newton e -> T loop |
+
+Planned, not built yet: `setDeltaT` with an accumulating clock (B), the constraint and transform BCs (C), the
+viscous correctors (G), `setRDeltaT` (I), the solver's own `BCs/` (maxwellSlipU, smoluchowskiJumpT; G, I),
+turbulence (J) and mesh motion (K). Each goes into the module of its OpenFOAM counterpart above, or a new one beside
+it.
 
 ## 2. The driver and the arms
 
-`rhoCentralFoam.cu` holds OpenFOAM's loop, in OpenFOAM's order, once:
+`rhoCentralFoam.cu` holds the loop once: Time, the write cadence, the log, the writes, the diagnostics. An `Arm` is
+the step:
 
 ```
-readTimeControls
-if !LTS: setDeltaT (CoNum from the previous step), ++runTime, [mesh.update]
-stepper.fluxes()            directed interpolation, ap/am/a_pos/aSf, phi, phiUp, phiEp, amaxSf
-stepper.courant()           centralCourantNo (kept on the device)
-if LTS: stepper.setRDeltaT(); ++runTime
-stepper.solveRho(); stepper.solveRhoU(); [viscous U corrector]
-stepper.solveRhoE(); [viscous e corrector]
-stepper.correctThermoAndPressure()
-[turbulence->correct()]
-write (download on the device arm) at write times; restart state (uniform/time)
+step()      fluxes; the cells (four stages); U's patches; T's patches on the old cell T; the patch update; p's
+            patches; rho_b
+flush()     the Courant numbers and statuses of the steps since the last flush
+download()  the state, for a write (the device arm copies it back; the host arm's is already in place)
 ```
 
-`Stepper` is the seam between the arms. `HostStepper` composes the `_cpp` modules; `DeviceStepper` composes the device
-modules. Both start from the same `createFields` state. The device arm reads scalars back in batches (the Courant
-numbers, the status) and never syncs every step. The exception is adjustTimeStep, whose next deltaT needs CoNum on the
-host every step: that costs one 8-byte read per step, or later a one-thread kernel.
+- The host arm runs each stage as a loop over the cells, OpenFOAM's field-at-a-time order.
+- The device arm fuses the fvc::div gather and the four stages into one kernel, evaluates U, p and T's patches
+  through brae's `DeviceBoundary` (`deviceBCValue`), and keeps the Courant numbers and statuses on the device for up
+  to 256 steps.
+- What milestone B needs from the arm is finer: CoNum before setDeltaT, and LTS's ++runTime after the fluxes. It will
+  split `step()` at the fluxes then, not before.
 
 ## 3. Shared infrastructure: reuse, hoist, do not inherit
 
@@ -103,24 +100,46 @@ host every step: that costs one 8-byte read per step, or later a one-thread kern
   - p_b here is still the previous step's.
 - **p** is evaluated at 287.
 
-## 5. The first stage's files: keep, refactor, add
+## 5. Milestone A: what moved
 
-| file | verdict |
+| before (stage 1) | after |
 |---|---|
-| `rhoCentralThermo.cuh` | **keep**; extend with janaf and sutherland as BRAE_HD |
-| `rhoCentralFoam_cpp.cuh/.cu` | **split**: controls and refusals -> `rhoCentralControls`; createFields -> `rhoCentralCreateFields_cpp`; reconstruction and flux -> `rhoCentralFlux_cpp` on the shared limiter library and `rhoCentralFlux.cuh`; the solves -> `rhoCentralMomentum_cpp` / `rhoCentralEnergy_cpp`; patch updates -> `rhoCentralBoundary_cpp`; writer -> driver. The ad-hoc `BcKind` enum gives way to brae's patch-field classes, plus a per-patch constraint flag. |
-| `rhoCentralFoam_device.cuh/.cu` | **split** the same way; the limiter copies go to the shared library; `bndKernel` becomes `rhoCentralBoundary.cu` over `DeviceBoundary` |
-| `gpuRhoCentralFoam.cu` | **shrinks** to the entry; the loop moves to the driver |
-| `tests/rho_central_sod_vs_openfoam.sh`, `rho_central_refusals.sh`, `rho_central_sod.py` | **keep**; the Sod gate is the refactor's regression gate |
+| `rhoCentralFoam_cpp.cuh/.cu` (case, createFields, host step, writer) | `rhoCentralControls`, `rhoCentralCreateFields_cpp`, `rhoCentralFlux_cpp`, `rhoCentralStep_cpp`, the driver |
+| `rhoCentralFoam_device.cuh/.cu` (kernels, DeviceSolver) | `rhoCentralFlux.cu` (flux kernels), `rhoCentralStep.cu` (DeviceArm, cell/patch/Courant kernels) |
+| `gpuRhoCentralFoam.cu` (main with the loop) | the entry; the loop is in `rhoCentralFoam.cu` |
+| private host gaussGrad and vanLeer/vanLeerV | shared `fvc::gaussGrad` and `cpu::limitedSchemes::detail` (bit-identical on every Sod run) |
+| private device scalar vanLeer | shared `limitedFaceWeight` + `limiterOfR` |
+| a per-patch BcKind enum with its own evaluation | brae's patch-field objects (`PatchFields`) on the host, `DeviceBoundary` + `deviceBCValue` on the device |
+| two copies of the face flux, cell update and patch update | one BRAE_HD copy each |
 
-**Missing (not in brae at all):**
-- boundary conditions: waveTransmissive/advective, totalTemperature, totalPressure's psi branch, maxwellSlipU,
-  smoluchowskiJumpT;
-- janaf thermo;
-- face operators: `dotInterpolate(Sf, tensor)` and the vector snGrad;
-- `fvm/fvc::ddt(rho, X)` with a variable rho;
-- rhoCentralFoam's setRDeltaT;
-- velocityComponentLaplacian mesh motion (movingCone).
+**Kept solver-local, on purpose:**
+- The NVDVTVDV vector limiter on the device. brae's only other copy is inlined in `divLimitedVFaceKernel`.
+- The whole-keyword fvSchemes lookup, because `parseFieldGradScheme` matches substrings.
+- The Newton thermo, because the shared thermo inverts in closed form.
+
+**Measured equivalence:**
+- **Sod gate:** every written file of the gate's nine runs is byte-identical to the stage-1 binary's (252 of 252).
+  That covers the CUDA arm, the host arm, Tadmor, 1000 cells, both controls, and the OpenFOAM runs. The logs are
+  identical except the timing and memory lines.
+- **1,024,000-cell 3-D tube, 100 steps:** the device arm moved by 5.5e-17 relative (U, near-zero velocities in the
+  quiescent region) and stays 2.70e-15 from OpenFOAM, as before.
+  - The cause: the shared `limitedFaceWeight` is the same arithmetic as the old private copy, but nvcc fuses its
+    three-term `d & grad` differently. That shows only where all three terms are nonzero, which the 1-D tube never
+    has. Swapping the private copy back restores byte identity, which isolates the cause.
+
+## 5b. Remaining architectural issues
+
+- `Arm::step()` is one call. Milestone B (setDeltaT needs CoNum first) and milestone I (LTS advances runTime after
+  the fluxes) need it split at the fluxes.
+- brae's `Time`/`WriteControl` assume a fixed deltaT (`timeValue = start + n*deltaT`). adjustTimeStep needs an
+  accumulating clock (sec. 3).
+- The device arm costs about 19% more per step on tiny meshes, from about five more small launches (the shared
+  boundary evaluation): 132 us/step at 100 cells, against 111. It is unchanged at 1M cells (17.6 against 17.4
+  ms/step). Device memory rose 14% at 1M cells (1362 against 1194 MiB), for the boundary buffers.
+- The host arm rebuilds per-patch boundary arrays for `fvc::gaussGrad` every step. That is correct but allocates;
+  acceptable for the oracle.
+- The flat boundary layout assumes no coupled patch. Cyclic and processor patches (multi-GPU) will need the
+  DeviceBoundary/DeviceMesh appended-face layout.
 
 ## 6. Milestones, each closed by a gate against OpenFOAM v2412
 

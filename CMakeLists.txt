@@ -2271,13 +2271,18 @@ target_include_directories(brae_rhoSimpleFoam PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(brae_rhoSimpleFoam PRIVATE brae_core)
 
 # brae_rhoCentralFoam: density-based compressible (central-upwind, Kurganov/Tadmor), first stage: inviscid,
-# laminar, perfectGas+hConst, fixed deltaT, static mesh. The host reference (rhoCentralFoam_cpp.cu) and the CUDA
-# arm (rhoCentralFoam_device.cu) share the case and the loop; tests/rho_central_sod_vs_openfoam.sh holds both to
-# OpenFOAM v2412 on the shockTube tutorial.
+# laminar, perfectGas+hConst, fixed deltaT, static mesh. The host reference (rhoCentralStep_cpp.cu) and the CUDA
+# arm (rhoCentralStep.cu) share the case and the loop (rhoCentralFoam.cu); tests/rho_central_sod_vs_openfoam.sh
+# holds both to OpenFOAM v2412 on the shockTube tutorial. Layout: src/applications/solvers/rhoCentralFoam/ARCHITECTURE.md.
 add_executable(brae_rhoCentralFoam
                src/applications/solvers/rhoCentralFoam/gpuRhoCentralFoam.cu
-               src/applications/solvers/rhoCentralFoam/rhoCentralFoam_cpp.cu
-               src/applications/solvers/rhoCentralFoam/rhoCentralFoam_device.cu)
+               src/applications/solvers/rhoCentralFoam/rhoCentralFoam.cu
+               src/applications/solvers/rhoCentralFoam/rhoCentralControls.cu
+               src/applications/solvers/rhoCentralFoam/rhoCentralCreateFields_cpp.cu
+               src/applications/solvers/rhoCentralFoam/rhoCentralFlux_cpp.cu
+               src/applications/solvers/rhoCentralFoam/rhoCentralStep_cpp.cu
+               src/applications/solvers/rhoCentralFoam/rhoCentralFlux.cu
+               src/applications/solvers/rhoCentralFoam/rhoCentralStep.cu)
 target_include_directories(brae_rhoCentralFoam PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(brae_rhoCentralFoam PRIVATE brae_core)
 add_test(NAME rho_central_sod_vs_openfoam

@@ -18,12 +18,9 @@ The scope covers:
 
 Everything else is refused at start-up, by name (`readRhoCentralCase`, `tests/rho_central_refusals.sh`).
 
-| file | role |
-|---|---|
-| `rhoCentralThermo.cuh` | Cp, Cv, Hs, Es, psi and the Newton e -> T loop, written as OpenFOAM evaluates them, for host and device |
-| `rhoCentralFoam_cpp.cu` | case and refusals, createFields, and the host reference step: a transcription of rhoCentralFoam.C:102-292 |
-| `rhoCentralFoam_device.cu` | the CUDA step: 3 fused gradient launches (brae's `deviceGaussGradFused`), face and patch-face flux kernels, a cell kernel (divergence, diagonal solves, U, e, thermo, p), a patch kernel, the Courant reduction |
-| `gpuRhoCentralFoam.cu` | `brae_rhoCentralFoam`: the loop, the writes, the `diag` lines; `BRAE_RHOCENTRALFOAM_ARM=cpu` selects the host arm |
+The layout is in ARCHITECTURE.md (milestone A, 2026-11-17: the stage-1 files were split into controls,
+createFields, flux, cell and patch updates and the two arms, on brae's shared gradient, limiter and boundary code,
+with every Sod output byte-identical).
 
 ### Measured (GB10, 2026-11-16)
 
