@@ -35,7 +35,8 @@ default.
 
 ## Function objects
 
-`controlDict`'s `functions { }` entries of these types run, on the host, at the end of each time step, with
+`controlDict`'s `functions { }` entries of these types run at the end of each time step (the common `volIntegrate` shapes are
+summed on the device in one batch; everything else is evaluated on the host), with
 OpenFOAM's cadence (`writeControl` `timeStep`, `runTime`, `adjustableRunTime`, `writeTime`, `none`; no output at
 the start time) and OpenFOAM's file layout, `postProcessing/<object>/<start time>/<file>`:
 

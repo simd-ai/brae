@@ -50,9 +50,10 @@ Toolchain notes:
   symmetric Gauss-Seidel and BiCGStab solvers use conditional graph nodes, which exist from CUDA 12.4. They used to be
   compiled in only on CUDA 13, so a CUDA 12 build silently ran host-driven loops: the same algorithms, but not
   bit-identical to the graph path. `src/cuda/cuda_graph_compat.cuh` absorbs the CUDA 12 / 13 signature difference of
-  `cudaGraphAddNode` and `cudaStreamGetCaptureInfo`. At run time these loops need a driver r550 or newer (the first
-  conditional-node call fails otherwise; there is no silent fallback). The run-time switches `BRAE_PCG_DEVICE=0`,
-  `BRAE_GS_HOST_LOOP=1` and `BRAE_BICG_HOST_LOOP=1` select the host-driven loops again.
+  `cudaGraphAddNode` and `cudaStreamGetCaptureInfo`. At run time these loops need a driver r550 or newer
+  (`braeCondGraphsAvailable()`): on an older driver brae says so once and takes the host-driven loops, which are the same
+  algorithms but not bit-identical to the graph path (`BRAE_COND_GRAPH=0` forces them, `=1` skips the check). The switches
+  `BRAE_PCG_DEVICE=0`, `BRAE_GS_HOST_LOOP=1` and `BRAE_BICG_HOST_LOOP=1` select the host-driven loops as well.
 - **Host compiler.** nvcc 12.9 supports gcc up to 14; gcc 15's libstdc++ does not parse with it. Configure with
   `-DCMAKE_CUDA_HOST_COMPILER=g++-14` (or any gcc 11-14). With CUDA 13, pass a host compiler that version supports
   if the system default is newer.
