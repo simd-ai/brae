@@ -5268,9 +5268,22 @@ COMPONENTS = {
                   "clockTime and cpuTime refused. A restart's uniform/time deltaT and index are read, not gated."),
         dict(name="setRDeltaT", of_symbol="setRDeltaT.H", of_file="applications/solvers/compressible/rhoCentralFoam/setRDeltaT.H",
              classification="GPU_REQUIRED", status="UNSUPPORTED", note="localEuler refused by name."),
-        dict(name="viscousCorrectors", of_symbol="fvm::laplacian(muEff, U), sigmaDotU",
+        dict(name="viscousCorrectors",
+             of_symbol="tauMC, the U corrector fvm::laplacian(muEff, U), sigmaDotU, the e corrector fvm::laplacian(alphaEff, e)",
              of_file="applications/solvers/compressible/rhoCentralFoam/rhoCentralFoam.C", of_line=235,
-             classification="GPU_REQUIRED", status="UNSUPPORTED", note="any mu > 0 refused by name."),
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_existing="shared: src/cuda/device_fvm.cu (deviceLaplacianGammaMagSf), device_ddt.cu "
+                           "(deviceEulerFvmDdtRho, deviceEulerFvcDdtRhoSub), device_fvc.cu (deviceSnGradInternal, "
+                           "deviceDotInterpolateSf), device_divdevreff.cu (deviceScaledDev2T), the smoothSolver/GaussSeidel "
+                           "path (deviceSymGaussSeidelFused)",
+             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralViscous.cu",
+             validation="tests/rho_central_viscous_vs_openfoam.sh (milestone G): a shear layer, conduction, Sod and "
+                        "obliqueShock with constant mu, the tutorials' solver controls and a converged Sod: every "
+                        "deltaT, time name and solve iteration count OpenFOAM serial's; fields and viscous fluxes within "
+                        "ten times OpenFOAM's own spread; controls noTauMC and noSigmaDotU red.",
+             note="constant mu (constTransport), laminar, the CUDA arm. Refused by name: sutherland, a wedge patch with "
+                  "mu > 0, the host reference arm with mu > 0, solvers other than smoothSolver with GaussSeidel or "
+                  "symGaussSeidel."),
         dict(name="meshMotion", of_symbol="mesh.update(), meshPhi", of_file="applications/solvers/compressible/rhoCentralFoam/rhoCentralFoam.C", of_line=95,
              classification="GPU_REQUIRED", status="UNSUPPORTED", note="dynamicMeshDict other than static refused."),
     ],
