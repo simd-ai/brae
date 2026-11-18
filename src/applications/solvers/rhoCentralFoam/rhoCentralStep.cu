@@ -109,6 +109,9 @@ __device__ __forceinline__ DivGather gatherDiv(int c, const label* __restrict__ 
 // fvc::div (surfaceIntegrate, fvcSurfaceIntegrate.C:45-78) gathered in OpenFOAM's scatter order -- owner (+) and
 // neighbour (-) faces merged by face index, then the non-empty patch faces, then / V -- and the cell's update.
 // surfaceSum(amaxSf) for the Courant number rides along (+ on both sides, fvcSurfaceIntegrate.C:165-166).
+// kMoving (milestone K): a moving mesh's instantiation, its stages on V0; the static one is the kernel as it was, so a
+// static mesh's arithmetic is the same to the bit
+template <bool kMoving>
 __global__ void cellKernel(int nC, int slot, scalar rDeltaT0, int v0, int v1, int v2, GasCoeffs gas,
                            const label* __restrict__ ownerStart, const label* __restrict__ losort,
                            const label* __restrict__ losortStart, const label* __restrict__ bndCellStart,
@@ -133,10 +136,22 @@ __global__ void cellKernel(int nC, int slot, scalar rDeltaT0, int v0, int v1, in
 
     // the four stages of rhoCentralCellUpdate.cuh, back to back
     const scalar Told = S.T[c];
-    const scalar V0c = V0 ? V0[c] : Vc;   // the moving mesh's old volume (milestone K)
-    const MomentumNew m = momentumStage(rDeltaT, Vc, V0c, d0, d1, d2, d3, v0, v1, v2, S.rho[c], S.rhoUx[c], S.rhoUy[c],
-                                        S.rhoUz[c]);
-    const EnergyNew en = energyStage(rDeltaT, Vc, V0c, d4, S.rhoE[c], m.rho, m.Ux, m.Uy, m.Uz);
+    // the moving mesh's old volume (milestone K) in its own stage functions: a static mesh keeps the stages it had,
+    // expression for expression (one shared V0c = Vc changed nvcc's multiply-add contraction there)
+    MomentumNew m;
+    EnergyNew en;
+    if constexpr (kMoving)
+    {
+        m = momentumStageMoving(rDeltaT, Vc, V0[c], d0, d1, d2, d3, v0, v1, v2, S.rho[c], S.rhoUx[c], S.rhoUy[c],
+                                S.rhoUz[c]);
+        en = energyStageMoving(rDeltaT, Vc, V0[c], d4, S.rhoE[c], m.rho, m.Ux, m.Uy, m.Uz);
+    }
+    else
+    {
+        (void)V0;
+        m = momentumStage(rDeltaT, Vc, d0, d1, d2, d3, v0, v1, v2, S.rho[c], S.rhoUx[c], S.rhoUy[c], S.rhoUz[c]);
+        en = energyStage(rDeltaT, Vc, d4, S.rhoE[c], m.rho, m.Ux, m.Uy, m.Uz);
+    }
     const ThermoNew th = thermoStage(en.e, S.p[c], Told, gas);
     const scalar p = pressureStage(m.rho, th.psi);
     S.rho[c] = m.rho;
@@ -333,8 +348,10 @@ __global__ void momentumKernel(int nC, scalar rDeltaT0, int v0, int v1, int v2, 
     d4 /= Vc;
     divPhiEp[c] = d4;
     S.Told[c] = S.T[c];
-    const MomentumNew m = momentumStage(rDeltaT, Vc, V0 ? V0[c] : Vc, d0, d1, d2, d3, v0, v1, v2, S.rho[c], S.rhoUx[c],
-                                        S.rhoUy[c], S.rhoUz[c]);
+    const MomentumNew m = V0 ? momentumStageMoving(rDeltaT, Vc, V0[c], d0, d1, d2, d3, v0, v1, v2, S.rho[c], S.rhoUx[c],
+                                                   S.rhoUy[c], S.rhoUz[c])
+                             : momentumStage(rDeltaT, Vc, d0, d1, d2, d3, v0, v1, v2, S.rho[c], S.rhoUx[c], S.rhoUy[c],
+                                             S.rhoUz[c]);
     S.rho[c] = m.rho;
     S.rhoUx[c] = m.rhoUx;
     S.rhoUy[c] = m.rhoUy;
@@ -353,11 +370,14 @@ __global__ void energyKernel(int nC, int slot, scalar rDeltaT0, GasCoeffs gas, c
     if (c >= nC) return;
     const scalar rDeltaT = rDT ? rDT[c] : rDeltaT0;
     const scalar Vc = V[c];
-    const scalar V0c = V0 ? V0[c] : Vc;
-    const EnergyNew en = dS ? energyStageViscous(rDeltaT, Vc, V0c, divPhiEp[c], dS[c], S.rhoE[c], S.rho[c], S.Ux[c],
-                                                 S.Uy[c], S.Uz[c])
-                            : energyStage(rDeltaT, Vc, V0c, divPhiEp[c], S.rhoE[c], S.rho[c], S.Ux[c], S.Uy[c],
-                                          S.Uz[c]);
+    EnergyNew en;
+    if (V0)   // a moving mesh (milestone K)
+        en = dS ? energyStageViscousMoving(rDeltaT, Vc, V0[c], divPhiEp[c], dS[c], S.rhoE[c], S.rho[c], S.Ux[c], S.Uy[c],
+                                           S.Uz[c])
+                : energyStageMoving(rDeltaT, Vc, V0[c], divPhiEp[c], S.rhoE[c], S.rho[c], S.Ux[c], S.Uy[c], S.Uz[c]);
+    else
+        en = dS ? energyStageViscous(rDeltaT, Vc, divPhiEp[c], dS[c], S.rhoE[c], S.rho[c], S.Ux[c], S.Uy[c], S.Uz[c])
+                : energyStage(rDeltaT, Vc, divPhiEp[c], S.rhoE[c], S.rho[c], S.Ux[c], S.Uy[c], S.Uz[c]);
     const ThermoNew th = thermoStage(en.e, S.p[c], S.Told[c], gas);
     S.rhoE[c] = en.rhoE;
     S.e[c] = en.e;
@@ -621,11 +641,18 @@ public:
         const CellState S{F.rho.data(), F.rhoUx.data(), F.rhoUy.data(), F.rhoUz.data(), F.rhoE.data(), F.e.data(),
                           F.T.data(), Told_.data(), F.p.data(), F.psi.data(), F.Ux.data(), F.Uy.data(), F.Uz.data()};
         const scalar* rDT = cs.lts ? setRDeltaT(Fx) : nullptr;   // :186-190, after centralCourantNo.H's amaxSf
-        cellKernel<<<blocksFor(nC), kTPB>>>(nC, pending_, 1.0/deltaT, cs.sd.valid(0), cs.sd.valid(1),
-                                            cs.sd.valid(2), cs.gas, dm_.ownerStart.data(), dm_.losort.data(),
-                                            dm_.losortStart.data(), dm_.bndCellStart.data(), dm_.bndPerm.data(),
-                                            dm_.bndIsEmpty.data(), dm_.V.data(), Fx, S, coCell_.data(),
-                                            status_.data(), rDT, V0());
+        if (V0())   // milestone K
+            cellKernel<true><<<blocksFor(nC), kTPB>>>(nC, pending_, 1.0/deltaT, cs.sd.valid(0), cs.sd.valid(1),
+                                                cs.sd.valid(2), cs.gas, dm_.ownerStart.data(), dm_.losort.data(),
+                                                dm_.losortStart.data(), dm_.bndCellStart.data(), dm_.bndPerm.data(),
+                                                dm_.bndIsEmpty.data(), dm_.V.data(), Fx, S, coCell_.data(),
+                                                status_.data(), rDT, V0());
+        else
+            cellKernel<false><<<blocksFor(nC), kTPB>>>(nC, pending_, 1.0/deltaT, cs.sd.valid(0), cs.sd.valid(1),
+                                                cs.sd.valid(2), cs.gas, dm_.ownerStart.data(), dm_.losort.data(),
+                                                dm_.losortStart.data(), dm_.bndCellStart.data(), dm_.bndPerm.data(),
+                                                dm_.bndIsEmpty.data(), dm_.V.data(), Fx, S, coCell_.data(),
+                                                status_.data(), rDT, V0());
         cudaCheck(cudaGetLastError(), "rhoCentral cells");
 
         if (nB)

@@ -33,7 +33,26 @@ struct MomentumNew
 };
 
 // d0 = fvc::div(phi), d1..d3 = fvc::div(phiUp): surfaceIntegrate, already divided by V
-BRAE_HD inline MomentumNew momentumStage(scalar rDeltaT, scalar Vc, scalar V0c, scalar d0, scalar d1, scalar d2,
+BRAE_HD inline MomentumNew momentumStage(scalar rDeltaT, scalar Vc, scalar d0, scalar d1, scalar d2, scalar d3,
+                                         int v0, int v1, int v2, scalar rho0, scalar rhoUx0, scalar rhoUy0,
+                                         scalar rhoUz0)
+{
+    MomentumNew n;
+    const scalar diag = rDeltaT*Vc;
+    n.rho = (rDeltaT*rho0*Vc - Vc*d0)/diag;
+    n.rhoUx = rhoUx0;
+    n.rhoUy = rhoUy0;
+    n.rhoUz = rhoUz0;
+    if (v0) n.rhoUx = (rDeltaT*rhoUx0*Vc - Vc*d1)/diag;
+    if (v1) n.rhoUy = (rDeltaT*rhoUy0*Vc - Vc*d2)/diag;
+    if (v2) n.rhoUz = (rDeltaT*rhoUz0*Vc - Vc*d3)/diag;
+    n.Ux = n.rhoUx/n.rho;
+    n.Uy = n.rhoUy/n.rho;
+    n.Uz = n.rhoUz/n.rho;
+    return n;
+}
+
+BRAE_HD inline MomentumNew momentumStageMoving(scalar rDeltaT, scalar Vc, scalar V0c, scalar d0, scalar d1, scalar d2,
                                          scalar d3, int v0, int v1, int v2, scalar rho0, scalar rhoUx0, scalar rhoUy0,
                                          scalar rhoUz0)
 {
@@ -58,7 +77,17 @@ struct EnergyNew
 };
 
 // d4 = fvc::div(phiEp), already divided by V
-BRAE_HD inline EnergyNew energyStage(scalar rDeltaT, scalar Vc, scalar V0c, scalar d4, scalar rhoE0, scalar rho,
+BRAE_HD inline EnergyNew energyStage(scalar rDeltaT, scalar Vc, scalar d4, scalar rhoE0, scalar rho, scalar Ux,
+                                     scalar Uy, scalar Uz)
+{
+    EnergyNew n;
+    const scalar diag = rDeltaT*Vc;
+    n.rhoE = (rDeltaT*rhoE0*Vc - Vc*d4)/diag;
+    n.e = n.rhoE/rho - 0.5*(Ux*Ux + Uy*Uy + Uz*Uz);
+    return n;
+}
+
+BRAE_HD inline EnergyNew energyStageMoving(scalar rDeltaT, scalar Vc, scalar V0c, scalar d4, scalar rhoE0, scalar rho,
                                      scalar Ux, scalar Uy, scalar Uz)
 {
     EnergyNew n;
@@ -71,7 +100,17 @@ BRAE_HD inline EnergyNew energyStage(scalar rDeltaT, scalar Vc, scalar V0c, scal
 // The viscous run's (milestone G): solve(fvm::ddt(rhoE) + fvc::div(phiEp) - fvc::div(sigmaDotU)), :258-263, the
 // matrix's source rDeltaT*rhoE0*V - V*div(phiEp) + V*div(sigmaDotU); dS = fvc::div(sigmaDotU), already over V.
 // U is the corrected U (:243).
-BRAE_HD inline EnergyNew energyStageViscous(scalar rDeltaT, scalar Vc, scalar V0c, scalar d4, scalar dS,
+BRAE_HD inline EnergyNew energyStageViscous(scalar rDeltaT, scalar Vc, scalar d4, scalar dS, scalar rhoE0, scalar rho,
+                                            scalar Ux, scalar Uy, scalar Uz)
+{
+    EnergyNew n;
+    const scalar diag = rDeltaT*Vc;
+    n.rhoE = ((rDeltaT*rhoE0*Vc - Vc*d4) + Vc*dS)/diag;
+    n.e = n.rhoE/rho - 0.5*(Ux*Ux + Uy*Uy + Uz*Uz);
+    return n;
+}
+
+BRAE_HD inline EnergyNew energyStageViscousMoving(scalar rDeltaT, scalar Vc, scalar V0c, scalar d4, scalar dS,
                                             scalar rhoE0, scalar rho, scalar Ux, scalar Uy, scalar Uz)
 {
     EnergyNew n;

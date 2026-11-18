@@ -78,7 +78,7 @@ public:
         // the four stages of rhoCentralCellUpdate.cuh, each over every cell (OpenFOAM's field-at-a-time order)
         for (label i = 0; i < cs.nC; ++i)                                          // :224-231
         {
-            const MomentumNew n = momentumStage(rDeltaT, V[i], V[i], f.divPhi[i], f.divPhiUp[i].x, f.divPhiUp[i].y,
+            const MomentumNew n = momentumStage(rDeltaT, V[i], f.divPhi[i], f.divPhiUp[i].x, f.divPhiUp[i].y,
                                                 f.divPhiUp[i].z, cs.sd.valid(0), cs.sd.valid(1), cs.sd.valid(2),
                                                 s.rho[i], s.rhoU[i].x, s.rhoU[i].y, s.rhoU[i].z);
             s.rho[i] = n.rho;
@@ -87,7 +87,7 @@ public:
         }
         for (label i = 0; i < cs.nC; ++i)                                          // :258-264
         {
-            const EnergyNew n = energyStage(rDeltaT, V[i], V[i], f.divPhiEp[i], s.rhoE[i], s.rho[i], s.U[i].x, s.U[i].y,
+            const EnergyNew n = energyStage(rDeltaT, V[i], f.divPhiEp[i], s.rhoE[i], s.rho[i], s.U[i].x, s.U[i].y,
                                             s.U[i].z);
             s.rhoE[i] = n.rhoE;
             s.e[i] = n.e;
