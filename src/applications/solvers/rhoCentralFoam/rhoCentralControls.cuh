@@ -27,6 +27,17 @@
 namespace brae {
 namespace rhoCentral {
 
+// fvSolution's controls of one implicit solve (milestone G): smoothSolver with the GaussSeidel or symGaussSeidel
+// smoother, read with lduMatrix::solver's and smoothSolver's defaults (lduMatrixSolver.C readControls: maxIter 1000,
+// minIter 0, tolerance 1e-6, relTol 0; smoothSolver.C: nSweeps 1)
+struct SmoothSolveControls
+{
+    scalar tolerance = 1e-6, relTol = 0;
+    int    maxIter = 1000, minIter = 0, nSweeps = 1;
+    bool   symmetric = false;    // symGaussSeidel
+    std::string smoother = "GaussSeidel";
+};
+
 struct Case
 {
     std::string caseDir;
@@ -66,6 +77,11 @@ struct Case
     // step's phi before they are evaluated), and the faces where any of U, p, T does (the inflow diagnostic)
     bool ioU = false, ioP = false, ioT = false;
     std::vector<char>   bInletOutlet;
+
+    // the viscous correctors (milestone G): createFieldRefs.H's inviscid = !(max(mu) > 0). When viscous, the U and e
+    // solves' controls; gas.mu and gas.rPr carry the transport, gasAlphaEff(gas) the e equation's diffusivity
+    bool                viscous = false;
+    SmoothSolveControls solveU, solveE;
 };
 
 // Reads and checks the case; refuses everything outside this stage's scope by name, before any field is read.

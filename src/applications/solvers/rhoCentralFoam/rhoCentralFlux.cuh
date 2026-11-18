@@ -31,6 +31,8 @@ struct DeviceFluxes
     DeviceBuffer<scalar> gx[7], gy[7], gz[7];                       // rho, rhoUx, rhoUy, rhoUz, rPsi, e, c
     DeviceBuffer<scalar> phi, phiUx, phiUy, phiUz, phiEp, amaxSf;   // internal faces
     DeviceBuffer<scalar> phiB, phiUxB, phiUyB, phiUzB, phiEpB, amaxSfB;   // patch faces (0 on empty ones)
+    // viscous runs only (milestone G): a_pos*U_pos + a_neg*U_neg on internal and patch faces, for sigmaDotU
+    DeviceBuffer<scalar> aUx, aUy, aUz, aUxB, aUyB, aUzB;
 
     void allocate(int nC, int nIF, int nB);
 };

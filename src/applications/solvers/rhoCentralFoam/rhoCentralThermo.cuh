@@ -26,6 +26,8 @@ struct GasCoeffs
     scalar Cp    = 0;   // hConst Cp_
     scalar Tref  = 0;   // hConst Tref_ (default Tstd)
     scalar Hsref = 0;   // hConst Hsref_ (read as `Href`, hConstThermo.C:40)
+    scalar mu    = 0;   // constTransport mu_ (milestone G: > 0 runs the viscous correctors)
+    scalar rPr   = 0;   // constTransport rPr_ = 1.0/Pr (constTransport.C:38)
 };
 
 // perfectGas::Cp = 0, so hConst Cp(p, T) = Cp_ + 0
@@ -40,6 +42,21 @@ BRAE_HD inline scalar gasCv(const GasCoeffs& g)
     return gasCp(g) - g.R;
 }
 
+// thermoI.H:125-134, species::thermo::gamma: Cp/(Cp - CpMCv), the sensibleInternalEnergy CpByCpv
+// (sensibleInternalEnergy.H:97-108)
+BRAE_HD inline scalar gasGamma(const GasCoeffs& g)
+{
+    const scalar Cp = gasCp(g);
+    return Cp/(Cp - g.R);
+}
+// The laminar thermal diffusivity rhoCentralFoam's e equation reads (rhoCentralFoam.C:275,
+// turbulence->alphaEff()): ThermalDiffusivity::alphaEff() = thermo.alphahe() = CpByCpv*alpha_ (heThermo.C:809-813),
+// alpha_ = constTransport::alphah = mu*rPr (constTransportI.H:101-108, set in hePsiThermo::calculate). With const
+// transport and hConst both factors are the same in every cell and on every face.
+BRAE_HD inline scalar gasAlphaEff(const GasCoeffs& g)
+{
+    return gasGamma(g)*(g.mu*g.rPr);
+}
 // hConstThermoI.H:120: Cp_*(T - Tref_) + Hsref_ + EquationOfState::H(p, T), perfectGas H = 0
 BRAE_HD inline scalar gasHs(scalar /*p*/, scalar T, const GasCoeffs& g)
 {

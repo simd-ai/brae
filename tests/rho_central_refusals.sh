@@ -70,8 +70,16 @@ row sod_limitedLinearK shockTube no "should be >= 0 and <= 1" \
     system/fvSchemes 's/^(\s*reconstruct\(T\)\s+)\S+;/\1limitedLinear 1.5;/'
 row sod_grad shockTube no "grad(rho) to \`leastSquares\`" \
     system/fvSchemes 's/^(\s*default\s+)Gauss linear;/\1leastSquares;/'
-row sod_viscous shockTube no "transport mu is" \
+# mu > 0 runs the viscous correctors (milestone G): the tutorials' fvSolution names `h`, so OpenFOAM stops at its first
+# e solve; brae refuses before reading a field. Then what the correctors do not port, one edit past the e entry.
+row sod_viscous shockTube no "has no entry for e" \
     constant/thermophysicalProperties 's/^(\s*mu\s+)\S+;/\11.8e-05;/'
+row sod_viscousUncorrected shockTube no "resolves laplacian(muEff,U) to \`Gauss linear uncorrected\`" \
+    constant/thermophysicalProperties 's/^(\s*mu\s+)\S+;/\11.8e-05;/' system/fvSolution 's/^(\s*)h$/\1"(e|h)"/' \
+    system/fvSchemes 's/^(\s*default\s+)Gauss linear corrected;/\1Gauss linear uncorrected;/'
+row sod_viscousSmoother shockTube no "smoother \`DIC\` for U" \
+    constant/thermophysicalProperties 's/^(\s*mu\s+)\S+;/\11.8e-05;/' system/fvSolution 's/^(\s*)h$/\1"(e|h)"/' \
+    system/fvSolution 's/^(\s*smoother\s+)GaussSeidel;/\1DIC;/'
 row sod_RAS shockTube no "simulationType is \`RAS\`" \
     constant/turbulenceProperties 's/^(simulationType\s+)\S+;/\1RAS;/'
 row sod_partialSlip shockTube yes "is \`partialSlip\`" 0/U '/sides/,/\}/ s/zeroGradient/partialSlip/'
@@ -122,4 +130,4 @@ rowx sod_latestTimeEmpty shockTube "selects time directory 0.004" "$LATEST; mkdi
 rowx sod_latestTimeNoT shockTube "has no T" "$LATEST; mkdir 0.004; cp 0/U 0/p 0.004/"
 rowx sod_startTimeNoT shockTube "the start time directory 0 has no T" "rm 0/T"
 echo "rho_central_refusals: $passes passed, $fails failed (work in $W)"
-[ "$fails" = 0 ] && [ "$passes" -ge 22 ]
+[ "$fails" = 0 ] && [ "$passes" -ge 24 ]

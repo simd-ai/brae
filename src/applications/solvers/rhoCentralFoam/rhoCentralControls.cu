@@ -240,6 +240,63 @@ void checkStartDirectory(const std::string& caseDir, const FoamDict& controlDict
 } // namespace
 
 
+// ---- the viscous correctors' controls (milestone G) -----------------------------------------------------------------
+// fvSolution: U's and e's solves (rhoCentralFoam.C:236-243, 274-277), smoothSolver with GaussSeidel or symGaussSeidel,
+// the controls read with OpenFOAM's defaults. fvSchemes: what the viscous terms resolve to -- grad(U) (tauMC), div(tauMC),
+// laplacian(muEff,U), laplacian(alphahe,e), snGrad(U) (sigmaDotU), interpolate(muEff) -- refused unless it is the
+// statement ported. Anything else is refused by name before a field is read.
+static void readViscousControls(const std::string& caseDir, Case& cs)
+{
+    const FoamDict fvSolution = readDict(caseDir + "/system/fvSolution");
+    const FoamDict* solvers = fvSolution.subDict("solvers");
+    auto solveControls = [&](const char* fld, SmoothSolveControls& c) {
+        const FoamDict* sd = solvers ? solvers->subDict(fld) : nullptr;
+        if (!sd)
+            refuse(std::string("fvSolution solvers has no entry for ") + fld + ". With mu > 0 rhoCentralFoam solves "
+                   + fld + " implicitly (rhoCentralFoam.C:" + (fld[0] == 'U' ? "236-243" : "274-277") + "); OpenFOAM "
+                   "v2412 stops at its first " + fld + " solve (`Entry '" + fld + "' not found in dictionary "
+                   "system/fvSolution/solvers`). The tutorials' entry is `h`, for an energy they do not solve.");
+        const std::string solver = sd->wordOr("solver", "");
+        if (solver != "smoothSolver")
+            refuse(std::string("fvSolution solvers has `") + solver + "` for " + fld + "; this stage ports "
+                   "smoothSolver (with GaussSeidel or symGaussSeidel), in OpenFOAM's sequential sweep order.");
+        c.smoother = sd->wordOr("smoother", "");
+        if (c.smoother != "GaussSeidel" && c.smoother != "symGaussSeidel")
+            refuse(std::string("fvSolution smoother `") + c.smoother + "` for " + fld + "; this stage ports "
+                   "GaussSeidel and symGaussSeidel.");
+        c.symmetric = (c.smoother == "symGaussSeidel");
+        c.tolerance = sd->scalarOr("tolerance", 1e-6);   // lduMatrixSolver.C readControls
+        c.relTol = sd->scalarOr("relTol", 0);
+        c.maxIter = static_cast<int>(sd->scalarOr("maxIter", 1000));
+        c.minIter = static_cast<int>(sd->scalarOr("minIter", 0));
+        c.nSweeps = static_cast<int>(sd->scalarOr("nSweeps", 1));   // smoothSolver.C readControls
+        if (c.nSweeps < 1)
+            refuse(std::string("fvSolution nSweeps ") + std::to_string(c.nSweeps) + " for " + fld + "; the fixed "
+                   "sweep count without a residual (nSweeps < 0) is not ported.");
+    };
+    solveControls("U", cs.solveU);
+    solveControls("e", cs.solveE);
+
+    const FieldGradScheme gs = parseFieldGradScheme(caseDir, "U");
+    if (!gs.gaussLinear || gs.leastSquares || gs.cellLimitK != 0 || !gs.unsupportedLimiter.empty())
+        refuse("gradSchemes resolves grad(U) to `" + gs.raw + "`. tauMC = muEff*dev2(T(fvc::grad(U))) "
+               "(rhoCentralFoam.C:218-219); this stage computes Gauss linear only.");
+    const struct { const char* block; const char* key; const char* want; const char* what; } need[] = {
+        {"divSchemes", "div(tauMC)", "Gauss linear", "fvc::div(tauMC), rhoCentralFoam.C:240"},
+        {"laplacianSchemes", "laplacian(muEff,U)", "Gauss linear corrected", "fvm::laplacian(muEff, U), :239"},
+        {"laplacianSchemes", "laplacian(alphahe,e)", "Gauss linear corrected", "fvm::laplacian(alphaEff, e), :275 (the field is thermo.alphahe(), heThermo.C:812)"},
+        {"snGradSchemes", "snGrad(U)", "corrected", "fvc::snGrad(U) in sigmaDotU, :249"},
+        {"interpolationSchemes", "interpolate(muEff)", "linear", "fvc::interpolate(muEff) in sigmaDotU, :249"},
+    };
+    for (const auto& n : need)
+    {
+        const std::string st = schemeStatement(caseDir, n.block, n.key);
+        if (st != n.want)
+            refuse(std::string(n.block) + " resolves " + n.key + " to `" + st + "` (" + n.what + "); this stage "
+                   "ports `" + n.want + "` for the viscous terms.");
+    }
+}
+
 Case readRhoCentralCase(const std::string& caseDir)
 {
     Case cs;
@@ -348,7 +405,7 @@ Case readRhoCentralCase(const std::string& caseDir)
         const struct { const char* key; const char* want; const char* why; } need[] = {
             {"type", "hePsiThermo", "rhoCentralFoam builds a psiThermo (createFields.H); hePsiThermo is the one ported"},
             {"mixture", "pureMixture", "multi-species mixtures are not ported"},
-            {"transport", "const", "sutherland's mu(T) only matters with the viscous correctors, which are not ported"},
+            {"transport", "const", "sutherland's mu(T) is not ported; the viscous correctors run with a constant mu"},
             {"thermo", "hConst", "janaf (biconic25-55Run35) and eConst are not ported"},
             {"equationOfState", "perfectGas", "the psi = 1/(R T) equation of state is the one ported"},
             {"specie", "specie", "the specie model"},
@@ -373,12 +430,19 @@ Case readRhoCentralCase(const std::string& caseDir)
         cs.gas.Tref  = th->scalarOr("Tref", foamTstd());   // hConstThermo.C:40
         cs.gas.Hsref = th->scalarOr("Href", 0);            // hConstThermo.C:41 reads Hsref_ from `Href`
         if (!(cs.gas.Cp > cs.gas.R)) refuse("mixture Cp must exceed R (Cv = Cp - R must be positive).");
+        if (!tr->found("mu") || !tr->found("Pr"))
+            refuse("thermophysicalProperties mixture.transport needs mu and Pr (constTransport.C:37-38 reads both).");
         const scalar mu = tr->scalarOr("mu", -1);
-        if (mu != 0)
-            refuse("transport mu is " + std::to_string(mu) + ". createFieldRefs.H sets inviscid only when every "
-                   "mu is 0; with mu > 0 rhoCentralFoam runs the implicit viscous correctors and sigmaDotU "
-                   "(rhoCentralFoam.C:235-244, 247-256, 273-282), which this first stage does not port.");
+        const scalar Pr = tr->scalarOr("Pr", 0);
+        if (mu < 0) refuse("transport mu is " + std::to_string(mu) + ": a negative viscosity.");
+        cs.gas.mu = mu;
+        cs.gas.rPr = 1.0/Pr;   // constTransport.C:38, rPr_(1.0/Pr), read whatever mu is
+        // createFieldRefs.H: inviscid unless max(thermo.mu()) > 0. Viscous: the implicit U and e correctors and
+        // sigmaDotU (rhoCentralFoam.C:234-244, 246-256, 273-282), milestone G
+        cs.viscous = mu > 0;
+        if (cs.viscous && !(Pr > 0)) refuse("transport Pr is " + std::to_string(Pr) + "; alphah = mu/Pr needs Pr > 0.");
     }
+    if (cs.viscous) readViscousControls(caseDir, cs);
 
     // ---- turbulence: laminar ----------------------------------------------------------------------------------------
     {

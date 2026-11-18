@@ -66,6 +66,19 @@ BRAE_HD inline EnergyNew energyStage(scalar rDeltaT, scalar Vc, scalar d4, scala
     return n;
 }
 
+// The viscous run's (milestone G): solve(fvm::ddt(rhoE) + fvc::div(phiEp) - fvc::div(sigmaDotU)), :258-263, the
+// matrix's source rDeltaT*rhoE0*V - V*div(phiEp) + V*div(sigmaDotU); dS = fvc::div(sigmaDotU), already over V.
+// U is the corrected U (:243).
+BRAE_HD inline EnergyNew energyStageViscous(scalar rDeltaT, scalar Vc, scalar d4, scalar dS, scalar rhoE0, scalar rho,
+                                            scalar Ux, scalar Uy, scalar Uz)
+{
+    EnergyNew n;
+    const scalar diag = rDeltaT*Vc;
+    n.rhoE = ((rDeltaT*rhoE0*Vc - Vc*d4) + Vc*dS)/diag;
+    n.e = n.rhoE/rho - 0.5*(Ux*Ux + Uy*Uy + Uz*Uz);
+    return n;
+}
+
 struct ThermoNew
 {
     scalar T, psi;

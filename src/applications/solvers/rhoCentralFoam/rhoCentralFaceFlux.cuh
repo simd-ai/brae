@@ -23,6 +23,10 @@ struct FaceStates
 struct FaceFlux
 {
     scalar phi, phiUx, phiUy, phiUz, phiEp, amaxSf;
+    // a_pos*U_pos + a_neg*U_neg, sigmaDotU's face velocity (rhoCentralFoam.C:251), the viscous device arm's (milestone
+    // G). Set on the device only: the host arm's code is left as it was (its compiler's FMA contraction moves with
+    // what a function body holds, milestone F)
+    scalar aUx, aUy, aUz;
 };
 
 // One product, rounded on its own: never fused into the sum it feeds. OpenFOAM's field algebra stores every product of
@@ -86,6 +90,11 @@ BRAE_HD inline FaceFlux centralFaceFlux(const FaceStates& in, scalar Sx, scalar 
     o.phiEp = aphiv_pos*(in.rho[0]*(in.e[0] + 0.5*K_pos) + p_pos)                                  // :204-210
             + aphiv_neg*(in.rho[1]*(in.e[1] + 0.5*K_neg) + p_neg);
     if (ctrl != controlNoPressureJump) o.phiEp = o.phiEp + aSf*p_pos - aSf*p_neg;
+#ifdef __CUDA_ARCH__
+    o.aUx = roundedProduct(a_pos, U_pos.x) + roundedProduct(a_neg, U_neg.x);   // two fields, then their sum
+    o.aUy = roundedProduct(a_pos, U_pos.y) + roundedProduct(a_neg, U_neg.y);
+    o.aUz = roundedProduct(a_pos, U_pos.z) + roundedProduct(a_neg, U_neg.z);
+#endif
     return o;
 }
 

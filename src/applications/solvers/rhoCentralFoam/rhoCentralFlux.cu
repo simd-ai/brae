@@ -88,6 +88,7 @@ struct CellInputs
 struct FaceOutputs
 {
     scalar *phi, *phiUx, *phiUy, *phiUz, *phiEp, *amaxSf;
+    scalar *aUx = nullptr, *aUy = nullptr, *aUz = nullptr;   // viscous runs only
 };
 
 __device__ __forceinline__ void store(const FaceFlux& o, const FaceOutputs& O, int i)
@@ -98,6 +99,12 @@ __device__ __forceinline__ void store(const FaceFlux& o, const FaceOutputs& O, i
     O.phiUz[i] = o.phiUz;
     O.phiEp[i] = o.phiEp;
     O.amaxSf[i] = o.amaxSf;
+    if (O.aUx)
+    {
+        O.aUx[i] = o.aUx;
+        O.aUy[i] = o.aUy;
+        O.aUz[i] = o.aUz;
+    }
 }
 
 __global__ void faceKernel(int nIF, bool tadmor, int ctrl,
@@ -156,6 +163,7 @@ __global__ void patchFaceKernel(int nB, int nIF, bool tadmor, int ctrl, scalar d
     if (isEmpty[k])
     {
         O.phi[k] = O.phiUx[k] = O.phiUy[k] = O.phiUz[k] = O.phiEp[k] = O.amaxSf[k] = 0;
+        if (O.aUx) O.aUx[k] = O.aUy[k] = O.aUz[k] = 0;
         return;
     }
     FaceStates in;
@@ -243,8 +251,17 @@ void centralFluxes(const DeviceMesh& dm, const Case& cs, int control, DeviceFiel
     {
         const CellInputs Fi{F.rho.data(), F.rhoUx.data(), F.rhoUy.data(), F.rhoUz.data(), X.rPsi.data(), F.e.data(),
                             X.c.data()};
-        const FaceOutputs O{X.phi.data(), X.phiUx.data(), X.phiUy.data(), X.phiUz.data(), X.phiEp.data(),
-                            X.amaxSf.data()};
+        FaceOutputs O{X.phi.data(), X.phiUx.data(), X.phiUy.data(), X.phiUz.data(), X.phiEp.data(),
+                      X.amaxSf.data()};
+        if (cs.viscous)
+        {
+            X.aUx.resize(nIF);
+            X.aUy.resize(nIF);
+            X.aUz.resize(nIF);
+            O.aUx = X.aUx.data();
+            O.aUy = X.aUy.data();
+            O.aUz = X.aUz.data();
+        }
         faceKernel<<<blocksFor(nIF), kTPB>>>(nIF, cs.tadmor, control, dm.owner.data(), dm.nei.data(), dm.w.data(),
                                              dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(), dm.magSf.data(),
                                              dm.Cx.data(), dm.Cy.data(), dm.Cz.data(), limRho, limT, limU, Fi, G, O);
@@ -254,8 +271,17 @@ void centralFluxes(const DeviceMesh& dm, const Case& cs, int control, DeviceFiel
     {
         const CellInputs Bi{F.rhoB.data(), F.rhoUxB.data(), F.rhoUyB.data(), F.rhoUzB.data(), X.rPsiB.data(),
                             F.eB.data(), X.cB.data()};
-        const FaceOutputs O{X.phiB.data(), X.phiUxB.data(), X.phiUyB.data(), X.phiUzB.data(), X.phiEpB.data(),
+        FaceOutputs O{X.phiB.data(), X.phiUxB.data(), X.phiUyB.data(), X.phiUzB.data(), X.phiEpB.data(),
                             X.amaxSfB.data()};
+        if (cs.viscous)
+        {
+            X.aUxB.resize(nB);
+            X.aUyB.resize(nB);
+            X.aUzB.resize(nB);
+            O.aUx = X.aUxB.data();
+            O.aUy = X.aUyB.data();
+            O.aUz = X.aUzB.data();
+        }
         patchFaceKernel<<<blocksFor(nB), kTPB>>>(nB, nIF, cs.tadmor, control, deltaT, dm.bndIsEmpty.data(),
                                                  dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(), dm.magSf.data(), Bi, O,
                                                  outflow);

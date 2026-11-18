@@ -1,4 +1,5 @@
 // rhoCentralFoam.cu -- the driver: rhoCentralFoam.C's main() for both arms. See the header.
+#include "of_residual_log.cuh"
 #include "rhoCentralFoam.cuh"
 #include "rhoCentralCreateFields_cpp.cuh"
 #include "rhoCentralStep.cuh"
@@ -116,9 +117,23 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
                 (double)clock.endTime(), logPrec, (double)clock.deltaT(), tc.adjustTimeStep ? "yes" : "no");
     if (tc.adjustTimeStep) std::printf(" (maxCo %.*g, maxDeltaT %.*g)", logPrec, (double)tc.maxCo, logPrec,
                                        (double)tc.maxDeltaT);
-    std::printf("\nfluxScheme: %s\nreconstruct: rho %s, T %s, U %s\ninviscid: every mu is 0\nsolution directions: "
-                "(%d %d %d)\n", cs.tadmor ? "Tadmor" : "Kurganov", cs.reconRho.c_str(), cs.reconT.c_str(),
-                cs.reconU.c_str(), cs.sd.d[0], cs.sd.d[1], cs.sd.d[2]);
+    std::printf("\nfluxScheme: %s\nreconstruct: rho %s, T %s, U %s\n", cs.tadmor ? "Tadmor" : "Kurganov",
+                cs.reconRho.c_str(), cs.reconT.c_str(), cs.reconU.c_str());
+    if (cs.viscous)
+    {
+        auto ctl = [&](const char* f, const SmoothSolveControls& c) {
+            std::printf("  %s: smoothSolver %s, nSweeps %d, tolerance %.*g, relTol %.*g, maxIter %d, minIter %d\n", f,
+                        c.smoother.c_str(), c.nSweeps, logPrec, (double)c.tolerance, logPrec, (double)c.relTol,
+                        c.maxIter, c.minIter);
+        };
+        std::printf("viscous: mu %.*g, Pr %.*g, alphaEff %.*g (laminar, const transport)\n", logPrec,
+                    (double)cs.gas.mu, logPrec, (double)(1.0/cs.gas.rPr), logPrec, (double)gasAlphaEff(cs.gas));
+        ctl("U", cs.solveU);
+        ctl("e", cs.solveE);
+    }
+    else
+        std::printf("inviscid: every mu is 0\n");
+    std::printf("solution directions: (%d %d %d)\n", cs.sd.d[0], cs.sd.d[1], cs.sd.d[2]);
 
     // a restart's time state (Time::setControls): the start's index, and its deltaT where uniform/time gave it
     std::printf("diag start time %s index %ld deltaT %.17g\n", cs.startName.c_str(), clock.startTimeIndex(),
@@ -177,6 +192,10 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
     }
     else
     {
+        if (cs.viscous)
+            throw std::runtime_error("brae rhoCentralFoam: the host reference arm (BRAE_RHOCENTRALFOAM_ARM=cpu) runs "
+                                     "inviscid cases only; mu > 0 runs the viscous correctors, which milestone G "
+                                     "ports on the CUDA arm.");
         arm = cpu::rhoCentral::makeHostArm(cs, s, pf, patchControl ? control : controlNone);
     }
 
@@ -204,6 +223,9 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
             if (tc.adjustTimeStep) std::printf("deltaT = %.*g\n", logPrec, (double)unlogged[i].first);
             std::printf("Mean and max Courant Numbers = %.*g %.*g\nTime = %s\n\n", logPrec, (double)rep.meanCoNum,
                         logPrec, (double)rep.CoNum, tn.c_str());
+            for (int j = 0; j < rep.nSolves; ++j)   // the viscous correctors' solves, OpenFOAM's lines
+                printOfSolveLine("smoothSolver", rep.solves[j].field, rep.solves[j].initialResidual,
+                                 rep.solves[j].finalResidual, rep.solves[j].nIterations);
             if (rep.status)
                 throw std::runtime_error(
                     "step to time " + tn + " left an unphysical state (status " + std::to_string(rep.status)

@@ -319,6 +319,30 @@ void deviceLaplacianCoeffs(
 }
 
 
+namespace {
+__global__ void lapGammaMagSfKernel(int nIf, const scalar* __restrict__ dc, const scalar* __restrict__ gammaMagSf,
+                                    scalar* __restrict__ upper)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f < nIf) upper[f] = dc[f]*gammaMagSf[f];   // fvm.upper() = deltaCoeffs*gammaMagSf
+}
+} // namespace
+
+void deviceLaplacianGammaMagSf(const DeviceMesh& dm, const DeviceBuffer<scalar>& gammaMagSf,
+                               DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& upper, bool nonOrth)
+{
+    const int nIf = dm.nInternalFaces, nC = dm.nCells;
+    upper.resize(nIf);
+    diag.resize(nC);
+    lapGammaMagSfKernel<<<nBlocks(nIf), TPB>>>(nIf, nonOrth ? dm.nonOrthDc.data() : dm.dc.data(), gammaMagSf.data(),
+                                               upper.data());
+    cudaCheck(cudaGetLastError(), "lapGammaMagSf");
+    diagGatherKernel<<<nBlocks(nC), TPB>>>(nC, dm.ownerStart.data(), dm.losort.data(), dm.losortStart.data(),
+                                           upper.data(), upper.data(), diag.data());
+    cudaCheck(cudaGetLastError(), "diagGather");
+}
+
+
 void deviceLaplacianCoeffsSymmetric(
     const DeviceMesh& dm,
     const DeviceBuffer<scalar>& gammafInt,

@@ -29,12 +29,23 @@ struct PatchFields
     GeometricField<scalar> T;
 };
 
+// One implicit solve's report (milestone G): OpenFOAM's `smoothSolver:  Solving for <field>, Initial residual = ..,
+// Final residual = .., No Iterations n` (SolverPerformance.C:95-117)
+struct SolveLine
+{
+    char   field[4] = {0};   // Ux, Uy, Uz, e
+    scalar initialResidual = 0, finalResidual = 0;
+    int    nIterations = 0;
+};
+
 // What one step reports, on either arm.
 struct StepReport
 {
     scalar meanCoNum = 0;   // centralCourantNo.H, on this step's amaxSf
     scalar CoNum     = 0;
     int    status    = 0;   // see statusText()
+    int    nSolves   = 0;   // the viscous correctors' solves, in OpenFOAM's order (U's valid components, then e)
+    SolveLine solves[4];
 };
 
 // Nonzero step status: what OpenFOAM would stop on, and what makes the state unphysical.
@@ -63,6 +74,9 @@ enum StatusBits : int
 //   noUniformTime        the writer leaves uniform/time out, so a restart from brae's output loses the time state
 //   limiterVanLeer       every reconstruct(...) limited by vanLeer (vanLeerV on U), whatever the case names
 //   limiterScalarOnV     the V limiter of rhoU built from its x component alone (NVDTVD on rhoU_x), not NVDVTVDV
+//   noTauMC              viscous runs: tauMC left out -- fvc::div(tauMC) from the U corrector and Sf & tauMC from
+//                        sigmaDotU (rhoCentralFoam.C:240, 250) (milestone G)
+//   noSigmaDotU          viscous runs: - fvc::div(sigmaDotU) left out of the rhoE equation (rhoCentralFoam.C:258-263)
 enum Control : int
 {
     controlNone = 0,
@@ -81,7 +95,9 @@ enum Control : int
     controlRestartIoExtrapolate = 13,
     controlNoUniformTime = 14,
     controlLimiterVanLeer = 15,
-    controlLimiterScalarOnV = 16
+    controlLimiterScalarOnV = 16,
+    controlNoTauMC = 17,
+    controlNoSigmaDotU = 18
 };
 
 } // namespace rhoCentral

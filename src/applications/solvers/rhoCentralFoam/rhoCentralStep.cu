@@ -14,8 +14,10 @@
 #include "rhoCentralCellUpdate.cuh"
 #include "rhoCentralFlux.cuh"
 #include "rhoCentralPatchUpdate.cuh"
+#include "rhoCentralViscous.cuh"
 
 #include "device_boundary.cuh"
+#include "of_residual_log.cuh"
 
 #include <cuda_runtime.h>
 #include <stdexcept>
@@ -44,17 +46,16 @@ struct FluxesIn
 };
 
 // fvc::div (surfaceIntegrate, fvcSurfaceIntegrate.C:45-78) gathered in OpenFOAM's scatter order -- owner (+) and
-// neighbour (-) faces merged by face index, then the non-empty patch faces, then / V -- and the cell's update.
-// surfaceSum(amaxSf) for the Courant number rides along (+ on both sides, fvcSurfaceIntegrate.C:165-166).
-__global__ void cellKernel(int nC, int slot, scalar rDeltaT, int v0, int v1, int v2, GasCoeffs gas,
-                           const label* __restrict__ ownerStart, const label* __restrict__ losort,
-                           const label* __restrict__ losortStart, const label* __restrict__ bndCellStart,
-                           const label* __restrict__ bndPerm, const label* __restrict__ bndIsEmpty,
-                           const scalar* __restrict__ V, FluxesIn Fx, CellState S,
-                           scalar* __restrict__ coCell, int* __restrict__ status)
+// neighbour (-) faces merged by face index, then the non-empty patch faces (sums only: no product to round)
+struct DivGather
 {
-    const int c = blockIdx.x*blockDim.x + threadIdx.x;
-    if (c >= nC) return;
+    scalar d0, d1, d2, d3, d4, sa;
+};
+__device__ __forceinline__ DivGather gatherDiv(int c, const label* __restrict__ ownerStart,
+                                               const label* __restrict__ losort, const label* __restrict__ losortStart,
+                                               const label* __restrict__ bndCellStart, const label* __restrict__ bndPerm,
+                                               const label* __restrict__ bndIsEmpty, const FluxesIn& Fx)
+{
     scalar d0 = 0, d1 = 0, d2 = 0, d3 = 0, d4 = 0, sa = 0;
     int fo = ownerStart[c];
     const int foEnd = ownerStart[c + 1];
@@ -95,6 +96,24 @@ __global__ void cellKernel(int nC, int slot, scalar rDeltaT, int v0, int v1, int
         d4 += Fx.phiEpB[k];
         sa += Fx.amaxSfB[k];
     }
+    return DivGather{d0, d1, d2, d3, d4, sa};
+}
+
+// fvc::div (surfaceIntegrate, fvcSurfaceIntegrate.C:45-78) gathered in OpenFOAM's scatter order -- owner (+) and
+// neighbour (-) faces merged by face index, then the non-empty patch faces, then / V -- and the cell's update.
+// surfaceSum(amaxSf) for the Courant number rides along (+ on both sides, fvcSurfaceIntegrate.C:165-166).
+__global__ void cellKernel(int nC, int slot, scalar rDeltaT, int v0, int v1, int v2, GasCoeffs gas,
+                           const label* __restrict__ ownerStart, const label* __restrict__ losort,
+                           const label* __restrict__ losortStart, const label* __restrict__ bndCellStart,
+                           const label* __restrict__ bndPerm, const label* __restrict__ bndIsEmpty,
+                           const scalar* __restrict__ V, FluxesIn Fx, CellState S,
+                           scalar* __restrict__ coCell, int* __restrict__ status)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    const DivGather g = gatherDiv(c, ownerStart, losort, losortStart, bndCellStart, bndPerm, bndIsEmpty, Fx);
+    scalar d0 = g.d0, d1 = g.d1, d2 = g.d2, d3 = g.d3, d4 = g.d4;
+    const scalar sa = g.sa;
     const scalar Vc = V[c];
     coCell[c] = sa;
     d0 /= Vc;
@@ -228,6 +247,90 @@ __global__ void courantKernel(int nC, const scalar* __restrict__ sumA, const sca
     }
 }
 
+// ---- the viscous step's cell kernels (milestone G): the fused cellKernel's stages, split where the correctors go -----
+// :222-232, the explicit rho and rhoU and U = rhoU/rho; keeps div(phiEp) (over V) for the energy stage and T as the
+// step starts (Tw.evaluate()'s and the e -> T inversion's seed)
+__global__ void momentumKernel(int nC, scalar rDeltaT, int v0, int v1, int v2, const label* __restrict__ ownerStart,
+                               const label* __restrict__ losort, const label* __restrict__ losortStart,
+                               const label* __restrict__ bndCellStart, const label* __restrict__ bndPerm,
+                               const label* __restrict__ bndIsEmpty, const scalar* __restrict__ V, FluxesIn Fx,
+                               CellState S, scalar* __restrict__ coCell, scalar* __restrict__ divPhiEp)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    const DivGather g = gatherDiv(c, ownerStart, losort, losortStart, bndCellStart, bndPerm, bndIsEmpty, Fx);
+    scalar d0 = g.d0, d1 = g.d1, d2 = g.d2, d3 = g.d3, d4 = g.d4;
+    const scalar Vc = V[c];
+    coCell[c] = g.sa;
+    d0 /= Vc;
+    d1 /= Vc;
+    d2 /= Vc;
+    d3 /= Vc;
+    d4 /= Vc;
+    divPhiEp[c] = d4;
+    S.Told[c] = S.T[c];
+    const MomentumNew m = momentumStage(rDeltaT, Vc, d0, d1, d2, d3, v0, v1, v2, S.rho[c], S.rhoUx[c], S.rhoUy[c],
+                                        S.rhoUz[c]);
+    S.rho[c] = m.rho;
+    S.rhoUx[c] = m.rhoUx;
+    S.rhoUy[c] = m.rhoUy;
+    S.rhoUz[c] = m.rhoUz;
+    S.Ux[c] = m.Ux;
+    S.Uy[c] = m.Uy;
+    S.Uz[c] = m.Uz;
+}
+// :258-266, rhoE explicit with - fvc::div(sigmaDotU) (dS; null under the control noSigmaDotU: the inviscid stage),
+// e = rhoE/rho - 0.5*magSqr(U) on the corrected U, thermo.correct()'s cell half on the old p
+__global__ void energyKernel(int nC, int slot, scalar rDeltaT, GasCoeffs gas, const scalar* __restrict__ V,
+                             const scalar* __restrict__ divPhiEp, const scalar* __restrict__ dS, CellState S,
+                             int* __restrict__ status)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    const scalar Vc = V[c];
+    const EnergyNew en = dS ? energyStageViscous(rDeltaT, Vc, divPhiEp[c], dS[c], S.rhoE[c], S.rho[c], S.Ux[c],
+                                                 S.Uy[c], S.Uz[c])
+                            : energyStage(rDeltaT, Vc, divPhiEp[c], S.rhoE[c], S.rho[c], S.Ux[c], S.Uy[c], S.Uz[c]);
+    const ThermoNew th = thermoStage(en.e, S.p[c], S.Told[c], gas);
+    S.rhoE[c] = en.rhoE;
+    S.e[c] = en.e;
+    S.T[c] = th.T;
+    S.psi[c] = th.psi;
+    if (th.status) atomicOr(&status[slot], th.status);
+}
+// :278-288 after the e corrector: thermo.correct()'s cell half (seeded with the T the first one left), rhoE =
+// rho*(e + 0.5*magSqr(U)), p = rho/psi
+__global__ void thermoPressureKernel(int nC, int slot, GasCoeffs gas, CellState S, int* __restrict__ status)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    const scalar e = S.e[c];
+    const ThermoNew th = thermoStage(e, S.p[c], S.T[c], gas);
+    const scalar rho = S.rho[c];
+    const scalar Ux = S.Ux[c], Uy = S.Uy[c], Uz = S.Uz[c];
+    S.rhoE[c] = rho*(e + 0.5*(Ux*Ux + Uy*Uy + Uz*Uz));
+    S.T[c] = th.T;
+    S.psi[c] = th.psi;
+    const scalar p = pressureStage(rho, th.psi);
+    S.p[c] = p;
+    const int st = th.status | physicalStatus(rho, p, th.T, e);
+    if (st) atomicOr(&status[slot], st);
+}
+// U.correctBoundaryConditions() on the transform faces (the rest is deviceBCValue's)
+__global__ void uTransformKernel(int nB, int ctrl, const label* __restrict__ bCell, const int* __restrict__ kind,
+                                 const tensor* __restrict__ R, const scalar* __restrict__ Ux,
+                                 const scalar* __restrict__ Uy, const scalar* __restrict__ Uz,
+                                 scalar* __restrict__ UxB, scalar* __restrict__ UyB, scalar* __restrict__ UzB)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= nB || !kind[k]) return;
+    const label c = bCell[k];
+    const vector Ub = transformPatchU(kind[k], R[k], vector{Ux[c], Uy[c], Uz[c]}, ctrl);
+    UxB[k] = Ub.x;
+    UyB[k] = Ub.y;
+    UzB[k] = Ub.z;
+}
+
 void upCmpt(DeviceBuffer<scalar>& d, const std::vector<vector>& h, int j)
 {
     std::vector<scalar> t(h.size());
@@ -319,6 +422,12 @@ public:
         cudaCheck(cudaMallocHost(&hostCourant_, 3*kReportWindow*sizeof(double)), "pinned courant");
         cudaCheck(cudaMallocHost(&hostStatus_, kReportWindow*sizeof(int)), "pinned status");
         outflow_.copyFrom(std::vector<double>(10, 0.0));   // the run's totals, then this step's sums
+        if (cs.viscous)
+        {
+            vis_ = std::make_unique<ViscousCorrectors>(cs, dm_, control_);
+            divPhiEp_.resize(nC);
+            visIn_.copyFrom(std::vector<double>(4, 0.0));
+        }
         cudaCheck(cudaDeviceSynchronize(), "rhoCentralFoam upload");
         bytes_ = brae::detail::devicePool().mallocBytes() - brae::detail::devicePool().freedBytes() - pool0;
     }
@@ -327,6 +436,11 @@ public:
     {
         if (pending_ >= kReportWindow)
             throw std::logic_error("brae rhoCentralFoam: device step with a full report window; flush() first.");
+        if (vis_)
+        {
+            stepViscous(deltaT);
+            return;
+        }
         const Case& cs = cs_;
         DeviceFields& F = F_;
         const int nC = cs.nC, nB = cs.nB;
@@ -347,33 +461,7 @@ public:
 
         if (nB)
         {
-            // :195's phi decides every inletOutlet face of U, T and p before its evaluation (inletOutletFvPatchField::
-            // updateCoeffs); the controls feed the switch another flux
-            if (cs.ioU || cs.ioP || cs.ioT)
-            {
-                const DeviceBuffer<scalar>* phiSwitch = &X_.phiB;
-                const cudaStream_t q = cudaStreamPerThread;
-                if (control_ == controlInletOutletInverted)
-                {
-                    negateKernel<<<blocksFor(nB), kTPB>>>(nB, X_.phiB.data(), phiCtrl_.data());
-                    cudaCheck(cudaGetLastError(), "rhoCentral -phi");
-                    phiSwitch = &phiCtrl_;
-                }
-                else if (control_ == controlLaggedPhi)
-                {
-                    if (!lagPrimed_)   // the first step has no step before: its own
-                        cudaCheck(cudaMemcpyAsync(phiCtrl_.data(), X_.phiB.data(), nB*sizeof(scalar),
-                                                  cudaMemcpyDeviceToDevice, q), "lagged phi");
-                    lagPrimed_ = true;
-                    phiSwitch = &phiCtrl_;
-                }
-                if (cs.ioU) deviceUpdateInletOutlet(dbU_, *phiSwitch);
-                if (cs.ioT) deviceUpdateInletOutlet(dbT_, *phiSwitch);
-                if (cs.ioP) deviceUpdateInletOutlet(dbP_, *phiSwitch);
-                if (control_ == controlLaggedPhi)   // what the next step will switch on
-                    cudaCheck(cudaMemcpyAsync(phiCtrl_.data(), X_.phiB.data(), nB*sizeof(scalar),
-                                              cudaMemcpyDeviceToDevice, q), "lagged phi");
-            }
+            switchInletOutlet();
             deviceBCValue(dbU_.comp[0], F.Ux, F.UxB);   // :232
             deviceBCValue(dbU_.comp[1], F.Uy, F.UyB);
             deviceBCValue(dbU_.comp[2], F.Uz, F.UzB);
@@ -394,6 +482,120 @@ public:
         }
         courantKernel<<<1, 1024>>>(nC, coCell_.data(), dm_.V.data(), courant_.data() + 3*pending_);
         cudaCheck(cudaGetLastError(), "rhoCentral courant");
+        deltaT_[pending_] = deltaT;
+        ++pending_;
+    }
+
+    // :195's phi decides every inletOutlet face of U, T and p before its evaluation (inletOutletFvPatchField::
+    // updateCoeffs); the controls feed the switch another flux
+    void switchInletOutlet()
+    {
+        const Case& cs = cs_;
+        const int nB = cs.nB;
+        if (!(cs.ioU || cs.ioP || cs.ioT)) return;
+        const DeviceBuffer<scalar>* phiSwitch = &X_.phiB;
+        const cudaStream_t q = cudaStreamPerThread;
+        if (control_ == controlInletOutletInverted)
+        {
+            negateKernel<<<blocksFor(nB), kTPB>>>(nB, X_.phiB.data(), phiCtrl_.data());
+            cudaCheck(cudaGetLastError(), "rhoCentral -phi");
+            phiSwitch = &phiCtrl_;
+        }
+        else if (control_ == controlLaggedPhi)
+        {
+            if (!lagPrimed_)   // the first step has no step before: its own
+                cudaCheck(cudaMemcpyAsync(phiCtrl_.data(), X_.phiB.data(), nB*sizeof(scalar),
+                                          cudaMemcpyDeviceToDevice, q), "lagged phi");
+            lagPrimed_ = true;
+            phiSwitch = &phiCtrl_;
+        }
+        if (cs.ioU) deviceUpdateInletOutlet(dbU_, *phiSwitch);
+        if (cs.ioT) deviceUpdateInletOutlet(dbT_, *phiSwitch);
+        if (cs.ioP) deviceUpdateInletOutlet(dbP_, *phiSwitch);
+        if (control_ == controlLaggedPhi)   // what the next step will switch on
+            cudaCheck(cudaMemcpyAsync(phiCtrl_.data(), X_.phiB.data(), nB*sizeof(scalar),
+                                      cudaMemcpyDeviceToDevice, q), "lagged phi");
+    }
+
+    // U.correctBoundaryConditions(): the shared boundary's faces, then the transform faces from the cells
+    void evaluateU()
+    {
+        const int nB = cs_.nB;
+        if (!nB) return;
+        DeviceFields& F = F_;
+        deviceBCValue(dbU_.comp[0], F.Ux, F.UxB);
+        deviceBCValue(dbU_.comp[1], F.Uy, F.UyB);
+        deviceBCValue(dbU_.comp[2], F.Uz, F.UzB);
+        uTransformKernel<<<blocksFor(nB), kTPB>>>(nB, control_, bCell_.data(), uTransform_.data(), uR_.data(),
+                                                  F.Ux.data(), F.Uy.data(), F.Uz.data(), F.UxB.data(), F.UyB.data(),
+                                                  F.UzB.data());
+        cudaCheck(cudaGetLastError(), "rhoCentral U transform faces");
+    }
+
+    // e.correctBoundaryConditions() (Tw.evaluate() on the cells' T given), thermo.correct()'s patch half, rhoU_b and
+    // rhoE_b: what the inviscid step does after its cell kernel
+    void patchUpdate(const DeviceBuffer<scalar>& Tcells)
+    {
+        const int nB = cs_.nB;
+        if (!nB) return;
+        DeviceFields& F = F_;
+        deviceBCValue(dbT_, Tcells, TbEval_);
+        const PatchState B{F.rhoB.data(), F.rhoUxB.data(), F.rhoUyB.data(), F.rhoUzB.data(), F.rhoEB.data(),
+                           F.eB.data(), F.TB.data(), F.psiB.data(), F.UxB.data(), F.UyB.data(), F.UzB.data(),
+                           F.pB.data(), TbEval_.data()};
+        const PatchTransforms X{F.rho.data(), F.Ux.data(), F.Uy.data(), F.Uz.data(), uTransform_.data(),
+                                uR_.data(), rhoConstraint_.data(), TseedOwn_.data()};
+        patchKernel<<<blocksFor(nB), kTPB>>>(nB, pending_, cs_.gas, control_, bCell_.data(), TfixesValue_.data(),
+                                             F.e.data(), B, X, status_.data(), X_.phiB.data(), ioFace_.data(),
+                                             ioCount_.data());
+        cudaCheck(cudaGetLastError(), "rhoCentral patches");
+    }
+
+    // the viscous step (milestone G): rhoCentralFoam.C:102-288 with the correctors, see rhoCentralViscous.cuh
+    void stepViscous(scalar deltaT)
+    {
+        const Case& cs = cs_;
+        DeviceFields& F = F_;
+        const int nC = cs.nC, nB = cs.nB;
+        const scalar rDeltaT = 1.0/deltaT;
+        StepReport& rep = solveRep_[pending_];
+        rep = StepReport{};
+
+        centralFluxes(dm_, cs, control_, F, X_, outflow_.data(), deltaT);   // :102-210
+        vis_->beginStep(F, dbU_);                                            // :218-219, the old fields
+        const FluxesIn Fx{X_.phi.data(), X_.phiUx.data(), X_.phiUy.data(), X_.phiUz.data(), X_.phiEp.data(),
+                          X_.amaxSf.data(), X_.phiB.data(), X_.phiUxB.data(), X_.phiUyB.data(), X_.phiUzB.data(),
+                          X_.phiEpB.data(), X_.amaxSfB.data()};
+        const CellState S{F.rho.data(), F.rhoUx.data(), F.rhoUy.data(), F.rhoUz.data(), F.rhoE.data(), F.e.data(),
+                          F.T.data(), Told_.data(), F.p.data(), F.psi.data(), F.Ux.data(), F.Uy.data(), F.Uz.data()};
+        momentumKernel<<<blocksFor(nC), kTPB>>>(nC, rDeltaT, cs.sd.valid(0), cs.sd.valid(1), cs.sd.valid(2),
+                                                dm_.ownerStart.data(), dm_.losort.data(), dm_.losortStart.data(),
+                                                dm_.bndCellStart.data(), dm_.bndPerm.data(), dm_.bndIsEmpty.data(),
+                                                dm_.V.data(), Fx, S, coCell_.data(), divPhiEp_.data());
+        cudaCheck(cudaGetLastError(), "rhoCentral momentum");
+        if (nB) switchInletOutlet();
+        evaluateU();                                                          // :232
+        vis_->solveU(F, dbU_, rDeltaT, rep);                                  // :234-244
+        evaluateU();                                                          // fvMatrix::solve's U.correctBC
+        const DeviceBuffer<scalar>& dS = vis_->divSigmaDotU(F, dbU_, X_);     // :246-253
+        energyKernel<<<blocksFor(nC), kTPB>>>(nC, pending_, rDeltaT, cs.gas, dm_.V.data(), divPhiEp_.data(),
+                                              control_ == controlNoSigmaDotU ? nullptr : dS.data(), S,
+                                              status_.data());                // :258-266
+        cudaCheck(cudaGetLastError(), "rhoCentral energy");
+        patchUpdate(control_ == controlInletOutletNewT ? F.T : Told_);        // :265-271
+        vis_->solveE(F, dbT_, rDeltaT, rep);                                  // :273-277
+        patchUpdate(F.T);                                                     // the solve's e.correctBC, :278-280
+        thermoPressureKernel<<<blocksFor(nC), kTPB>>>(nC, pending_, cs.gas, S, status_.data());   // :278-286
+        cudaCheck(cudaGetLastError(), "rhoCentral thermo, p");
+        if (nB)
+        {
+            deviceBCValue(dbP_, F.p, F.pB);                                   // :287
+            rhoBKernel<<<blocksFor(nB), kTPB>>>(nB, F.psiB.data(), F.pB.data(), F.rhoB.data());   // :288
+            cudaCheck(cudaGetLastError(), "rhoCentral rho_b");
+        }
+        courantKernel<<<1, 1024>>>(nC, coCell_.data(), dm_.V.data(), courant_.data() + 3*pending_);
+        cudaCheck(cudaGetLastError(), "rhoCentral courant");
+        vis_->boundaryInflow(F, deltaT, visIn_);
         deltaT_[pending_] = deltaT;
         ++pending_;
     }
@@ -419,6 +621,8 @@ public:
                 out[i].meanCoNum = 0.5*(co[3*i + 1]/co[3*i + 2])*deltaT_[i];
             }
             out[i].status = st[i];
+            out[i].nSolves = solveRep_[i].nSolves;
+            for (int j = 0; j < solveRep_[i].nSolves; ++j) out[i].solves[j] = solveRep_[i].solves[j];
         }
         pending_ = 0;
         return out;
@@ -461,6 +665,12 @@ public:
         mass = r[0];
         mom = vector{r[1], r[2], r[3]};
         energy = r[4];
+        if (vis_)   // the viscous fluxes through the patches, into the domain: out of it is their negative
+        {
+            const std::vector<double> v = visIn_.host();
+            mom = vector{mom.x - v[0], mom.y - v[1], mom.z - v[2]};
+            energy -= v[3];
+        }
     }
 
     void inletOutletInflow(long long& inflow, long long& faceSteps) const override
@@ -497,6 +707,10 @@ private:
     DeviceBuffer<scalar> phiCtrl_;   // the controls' switch flux: -phi, or the step before's phi
     bool lagPrimed_ = false;
     DeviceBuffer<scalar> Told_, TbEval_, coCell_;
+    std::unique_ptr<ViscousCorrectors> vis_;   // mu > 0 (milestone G)
+    DeviceBuffer<scalar> divPhiEp_;
+    DeviceBuffer<double> visIn_;
+    StepReport solveRep_[kReportWindow];
     DeviceBuffer<int> status_;
     DeviceBuffer<double> courant_, outflow_;
     scalar deltaT_[kReportWindow] = {};

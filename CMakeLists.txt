@@ -2287,7 +2287,8 @@ add_executable(brae_rhoCentralFoam
                src/applications/solvers/rhoCentralFoam/rhoCentralFlux_cpp.cu
                src/applications/solvers/rhoCentralFoam/rhoCentralStep_cpp.cu
                src/applications/solvers/rhoCentralFoam/rhoCentralFlux.cu
-               src/applications/solvers/rhoCentralFoam/rhoCentralStep.cu)
+               src/applications/solvers/rhoCentralFoam/rhoCentralStep.cu
+               src/applications/solvers/rhoCentralFoam/rhoCentralViscous.cu)
 target_include_directories(brae_rhoCentralFoam PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(brae_rhoCentralFoam PRIVATE brae_core)
 add_test(NAME rho_central_sod_vs_openfoam

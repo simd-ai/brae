@@ -135,6 +135,19 @@ void deviceFvmDdtSource(
     DeviceBuffer<scalar>&       source,
     const DeviceBuffer<scalar>* ddt0 = nullptr);   // CrankNicolson stored old ddt (else nullptr)
 
+// Euler fvm::ddt(rho, vf) and fvc::ddt(rho, vf) with a per-cell rho on a static mesh, in OpenFOAM's arithmetic
+// (EulerDdtScheme.C:449-467 and :256; fvMatrix.C's operator- of a matrix and a field). For the corrector form
+// `fvm::ddt(rho, vf) - fvc::ddt(rho, vf)` (rhoCentralFoam.C:238, 275) call both, in that order. One component (or
+// one scalar field) a call; every product is rounded on its own, as OpenFOAM's field algebra stores it.
+//   deviceEulerFvmDdtRho:    diag[c] = rDeltaT*rho[c]*V[c];  source[c] = rDeltaT*rho0[c]*vf0[c]*V[c]   (assigned)
+//   deviceEulerFvcDdtRhoSub: source[c] += V[c]*(rDeltaT*(rho[c]*vf[c] - rho0[c]*vf0[c]))  (the matrix minus fvc::ddt)
+void deviceEulerFvmDdtRho(scalar rDeltaT, const DeviceBuffer<scalar>& rho, const DeviceBuffer<scalar>& rho0,
+                          const DeviceBuffer<scalar>& vf0, const DeviceBuffer<scalar>& V,
+                          DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source);
+void deviceEulerFvcDdtRhoSub(scalar rDeltaT, const DeviceBuffer<scalar>& rho, const DeviceBuffer<scalar>& vf,
+                             const DeviceBuffer<scalar>& rho0, const DeviceBuffer<scalar>& vf0,
+                             const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& source);
+
 // CrankNicolson ddt0 recurrence (OF DDt0Field update), run ONCE per time step after the old-time rotation:
 //   ddt0[c] = coefft*rDeltaT0*( psiOld[c] - psiOld2[c] ) - ocCoeff*ddt0[c]     (in place; uses the OLD ddt0)
 // No-op unless c.cn (steady/Euler/backward carry no ddt0). psiOld2 must hold two old levels (skipped on the first step).

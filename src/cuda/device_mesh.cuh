@@ -421,6 +421,24 @@ void deviceLaplacianCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& gam
 void deviceLaplacianCoeffsSymmetric(const DeviceMesh& dm, const DeviceBuffer<scalar>& gammafInt,
                                     DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& upper,
                                     bool nonOrth = false);
+// fvm::laplacian's matrix in OpenFOAM's arithmetic (fvmLaplacianUncorrected, gaussLaplacianScheme.C:60-70): upper =
+// deltaCoeffs*gammaMagSf with gammaMagSf = gamma_f*|Sf| formed by the caller (gaussLaplacianSchemes.C:49), held once
+// (lower is upper), diag the negSumDiag in face order. deviceLaplacianCoeffs forms (dc*gamma_f)*|Sf| instead, a last
+// bit apart. nonOrth: the corrected scheme's nonOrthDeltaCoeffs.
+void deviceLaplacianGammaMagSf(const DeviceMesh& dm, const DeviceBuffer<scalar>& gammaMagSf,
+                               DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& upper, bool nonOrth);
+// fvc::snGrad on the internal faces, the uncorrected part (snGradScheme.C snGrad): deltaCoeffs*(vf[nei] - vf[own]).
+// The boundary faces are the patch fields' snGrad, the caller's.
+// With gx, gy, gz (the cell gradient of vf) it adds the corrected scheme's explicit part, correctedSnGrad's
+// nonOrthCorrectionVectors & linear interpolate(grad(vf)) (correctedSnGrad.C fullGradCorrection), as `+=`.
+void deviceSnGradInternal(const DeviceMesh& dm, const DeviceBuffer<scalar>& vf, DeviceBuffer<scalar>& out,
+                          bool nonOrth, const DeviceBuffer<scalar>* gx = nullptr,
+                          const DeviceBuffer<scalar>* gy = nullptr, const DeviceBuffer<scalar>* gz = nullptr);
+// fvc::dotInterpolate(mesh.Sf(), T) with linear weights (surfaceInterpolationScheme.C dotInterpolate): on internal
+// faces Sf & (lambda*(T[own] - T[nei]) + T[nei]), on boundary faces Sf_b & T_b (no coupled patch). T packed
+// [(i*3+j)*n + c] (cells) and [(i*3+j)*nB + k] (boundary), out one buffer per component (internal, then boundary).
+void deviceDotInterpolateSf(const DeviceMesh& dm, const DeviceBuffer<scalar>& Tcell, const DeviceBuffer<scalar>& Tbnd,
+                            DeviceBuffer<scalar>* fInt, DeviceBuffer<scalar>* fBnd);
 // Explicit non-orth correction of fvm::laplacian(gamma, vf): returns lapCorrSource = -V*fvc::div(faceFluxCorr),
 // faceFluxCorr_f = gamma_f*|Sf|_f * (corrVec_f . grad(vf)_f) with grad linearly interpolated to the face.
 // This equals fvm::laplacian(gamma,vf).source()'s correction term (OF gaussLaplacianScheme). gx/gy/gz = cell grad(vf).
