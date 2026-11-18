@@ -48,8 +48,9 @@
 #   noSigmaDotU  - fvc::div(sigmaDotU) left out of the rhoE equation: shear, sod, sod_conv
 #   (with the tutorials' relTol 0.01 OpenFOAM's decomposed runs part from serial by 1e-7 to 1e-3, so the envelope and
 #   the controls' margins are wide there; sod_conv's converged solves keep that spread at round-off)
-# NOT CLAIMED  sutherland (refused), turbulence (refused), wedge patches with mu > 0 (refused), the host reference arm
-#   (refused), non-orthogonal correction beyond the corrected scheme's explicit part on these meshes, 3-D, multi-GPU.
+# NOT CLAIMED  turbulence (refused), the host reference arm (refused), non-orthogonal correction beyond the corrected
+#   scheme's explicit part on these meshes, 3-D, multi-GPU. sutherland and wedge patches with mu > 0, refused when this
+#   gate was written, are milestone H's (tests/rho_central_nozzle_vs_openfoam.sh).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BRAE_RCF_BIN:-$ROOT/build/brae_rhoCentralFoam}"

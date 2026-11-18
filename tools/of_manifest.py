@@ -5158,17 +5158,31 @@ COMPONENTS = {
              of_file="src/thermophysicalModels/basic/psiThermo/hePsiThermo.C",
              classification="MODEL", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralThermo.cuh src/applications/solvers/rhoCentralFoam/rhoCentralCellUpdate.cuh src/applications/solvers/rhoCentralFoam/rhoCentralPatchUpdate.cuh",
              note="species::thermo::T's Newton loop from the field's own T (Ttol = T0*1e-4), Es = Hs - p/rho(p,T); "
-                  "the gradientEnergy patch's Tw.evaluate() seeds the patch inversion with the cell's old T."),
+                  "the gradientEnergy patch's Tw.evaluate() seeds the patch inversion with the cell's old T. "
+                  "sutherlandTransport (milestone H): mu = As*sqrt(T)/(1 + Ts/T), kappa = mu*Cv*(1.32 + 1.77*R/Cv), "
+                  "alphah = kappa/Cp (rhoCentralThermo.cuh gasSutherlandMu/gasSutherlandAlphahe)."),
         dict(name="boundaryConditions", of_symbol="zeroGradient/fixedValue/empty",
              of_file="src/finiteVolume/fields/fvPatchFields/basic/zeroGradient/zeroGradientFvPatchField.C",
              classification="BOUNDARY_CONDITION", status="REIMPLEMENT", brae_existing="src/finiteVolume/fields/fv_patch_field.cuh (host patch fields); src/cuda/device_boundary.cuh deviceBCValue (device)",
              brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralPatchUpdate.cuh",
              brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralStep.cu",
              validation="tests/rho_central_wedge_vs_openfoam.sh: wedge15Ma5 and obliqueShock as shipped (fixedValue "
-                        "inlets and top, zeroGradient outlets and obstacle, whose waves reach them); the Sod gate.",
-             note="zeroGradient, fixedValue and empty gated (wedge15Ma5, obliqueShock, forwardStep). totalPressure, "
-                  "totalTemperature, waveTransmissive, partialSlip, outletInlet, maxwellSlipU, smoluchowskiJumpT "
-                  "UNSUPPORTED (refused). The transform patches: transformPatches; inletOutlet: inletOutlet."),
+                        "inlets and top, zeroGradient outlets and obstacle, whose waves reach them); the Sod gate. "
+                        "tests/rho_central_nozzle_vs_openfoam.sh (milestone H): LadenburgJet60psi AS SHIPPED (totalPressure "
+                        "and totalTemperature on its freestream, waveTransmissive at its outlet, noSlip, wedge, sutherland): "
+                        "7611 steps, every deltaT and time name OpenFOAM's, all 30444 U and e solves at OpenFOAM serial's "
+                        "iteration counts, U p T rho within 4.9e-13 of serial (0.104 of the bound), the patches' p, T, U "
+                        "within 6.1e-14, the freestream's 17 outflow and 43 inflow faces the same; a reservoir, a pulse and "
+                        "an outflow through the total conditions in a tube, inviscid and with sutherland; controls red "
+                        "(no dynamic head, the switch inverted, lInf ignored, the wave speed from a volume flux, T_b not "
+                        "re-evaluated at the e matrix: 1e+02 to 4e+10 x the bound).",
+             note="zeroGradient, fixedValue and empty gated (wedge15Ma5, obliqueShock, forwardStep); noSlip on U, "
+                  "totalPressure (the isentropic psi form) and waveTransmissive on p, totalTemperature on T (milestone H, "
+                  "the CUDA arm: rhoCentralStep.cu at OpenFOAM's update points, src/cuda/device_boundary_flow.cu "
+                  "deviceUpdateTotalPressurePsi/deviceUpdateTotalTemperature/deviceUpdateWaveTransmissive). totalPressure's "
+                  "rho and incompressible forms, these patches on other fields or fluxes, partialSlip, outletInlet, "
+                  "maxwellSlipU, smoluchowskiJumpT UNSUPPORTED (refused). The transform patches: transformPatches; "
+                  "inletOutlet: inletOutlet."),
         dict(name="inletOutlet", of_symbol="inletOutletFvPatchField::updateCoeffs",
              of_file="src/finiteVolume/fields/fvPatchFields/derived/inletOutlet/inletOutletFvPatchField.C",
              classification="BOUNDARY_CONDITION", status="REUSE_EXISTING",
@@ -5280,10 +5294,14 @@ COMPONENTS = {
              validation="tests/rho_central_viscous_vs_openfoam.sh (milestone G): a shear layer, conduction, Sod and "
                         "obliqueShock with constant mu, the tutorials' solver controls and a converged Sod: every "
                         "deltaT, time name and solve iteration count OpenFOAM serial's; fields and viscous fluxes within "
-                        "ten times OpenFOAM's own spread; controls noTauMC and noSigmaDotU red.",
-             note="constant mu (constTransport), laminar, the CUDA arm. Refused by name: sutherland, a wedge patch with "
-                  "mu > 0, the host reference arm with mu > 0, solvers other than smoothSolver with GaussSeidel or "
-                  "symGaussSeidel."),
+                        "ten times OpenFOAM's own spread; controls noTauMC and noSigmaDotU red; every solve's conservation "
+                        "identity to 1e-12 and a tolerance sweep. tests/rho_central_nozzle_vs_openfoam.sh (milestone H): "
+                        "sutherland and the wedge patches of LadenburgJet60psi as shipped (30444 solves at OpenFOAM serial's "
+                        "iteration counts, fields within 4.9e-13), a sutherland conduction and reservoir in a tube.",
+             note="constTransport and sutherland (mu(T) from the T the step starts from, alphaEff from the T of its first "
+                  "thermo.correct(), the laplacians rebuilt each step), laminar, the CUDA arm, wedge patches with "
+                  "wedgeFvPatchField's cellT snGrad. Refused by name: the host reference arm with mu > 0, solvers other "
+                  "than smoothSolver with GaussSeidel or symGaussSeidel."),
         dict(name="meshMotion", of_symbol="mesh.update(), meshPhi", of_file="applications/solvers/compressible/rhoCentralFoam/rhoCentralFoam.C", of_line=95,
              classification="GPU_REQUIRED", status="UNSUPPORTED", note="dynamicMeshDict other than static refused."),
     ],
