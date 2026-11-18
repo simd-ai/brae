@@ -71,9 +71,10 @@ __global__ void finishMatrixKernel(int n, const scalar* __restrict__ diagD, cons
 // hePsiThermo::calculate evaluates them
 // Tg: the T CpByCpv() reads when it is not alpha_'s (milestone I: alphahe() = CpByCpv()*alpha_, the first evaluated
 // at the call on the T the patches hold then, alpha_ at the last thermo.correct())
+// alphat (RAS, milestone J): alphaEff = thermo.alphaEff(alphat) = CpByCpv*(alpha + alphat) (heThermo.C:869-876)
 __global__ void sutherlandKernel(int n, GasCoeffs gas, const scalar* __restrict__ T, scalar* __restrict__ mu,
                                  scalar* __restrict__ negMu, scalar* __restrict__ alpha, scalar* __restrict__ negAlpha,
-                                 const scalar* __restrict__ Tg = nullptr)
+                                 const scalar* __restrict__ Tg = nullptr, const scalar* __restrict__ alphat = nullptr)
 {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -85,7 +86,9 @@ __global__ void sutherlandKernel(int n, GasCoeffs gas, const scalar* __restrict_
     }
     if (alpha)
     {
-        const scalar a = Tg ? gasGamma(scalar(0), Tg[i], gas)*gasAlphah(T[i], gas) : gasSutherlandAlphahe(T[i], gas);
+        const scalar g = gasGamma(scalar(0), Tg ? Tg[i] : T[i], gas);
+        const scalar a = alphat ? g*(gasAlphah(T[i], gas) + alphat[i])
+                       : (Tg ? g*gasAlphah(T[i], gas) : gasSutherlandAlphahe(T[i], gas));
         alpha[i] = a;
         if (negAlpha) negAlpha[i] = -a;
     }
@@ -383,7 +386,7 @@ ViscousCorrectors::ViscousCorrectors(const Case& cs, const DeviceMesh& dm, int c
         cellT_.copyFrom(ct);
     }
     // per-cell transport fields: sutherland's mu(T), or janaf's CpByCpv(T) in alphahe (milestone I)
-    sutherland_ = cs.gas.sutherland != 0 || cs.gas.janaf != 0;
+    sutherland_ = cs.gas.sutherland != 0 || cs.gas.janaf != 0 || cs.ras;   // RAS: muEff and alphaEff vary per cell
     // the corrected schemes' explicit parts are exactly zero where every nonOrthCorrectionVector is: then skipped
     {
         const std::vector<scalar> cx = dm.corrVecX.host(), cy = dm.corrVecY.host(), cz = dm.corrVecZ.host();
@@ -457,6 +460,14 @@ void ViscousCorrectors::beginStep(const DeviceFields& F, const DeviceVectorBound
             sutherlandKernel<<<blocksFor(nB_), kTPB>>>(nB_, cs_.gas, F.TB.data(), muB_.data(), negMuB_.data(), nullptr,
                                                         nullptr);
         cudaCheck(cudaGetLastError(), "sutherland mu");
+        // RAS (milestone J): :220's muEff = turbulence->muEff() = rho*nut + mu, on rho as the step starts and the nut
+        // the last correct() left
+        if (turb_ && control_ != controlRasLaminarMuEff)
+        {
+            turb_->muEff(F.rho, F.rhoB, muC_, muB_, muC_, muB_);
+            if (nB_) negateKernel<<<blocksFor(nB_), kTPB>>>(nB_, muB_.data(), negMuB_.data());
+            cudaCheck(cudaGetLastError(), "RAS muEff");
+        }
         rebuildLaplacian(muC_, lapDiagU_, negUpperU_, muF_);
     }
     // :218-219, tauMC = muEff*dev2(T(fvc::grad(U))): Gauss linear, packed [(d*3 + i)*nC + c] = d_d U_i, the patch
@@ -477,6 +488,19 @@ void ViscousCorrectors::beginStep(const DeviceFields& F, const DeviceVectorBound
     // same face field, from the same tauMC
     deviceDotInterpolateSf(dm_, tauC_, tauB_, dTau_, dTauB_);
     for (int k = 0; k < 3; ++k) deviceDiv(dm_, dTau_[k], dTauB_[k], divTau_[k]);
+}
+
+// thermo.mu(), cells and patch faces: mu(T) of the T the fields hold (hePsiThermo::calculate)
+void ViscousCorrectors::laminarMu(const DeviceFields& F, DeviceBuffer<scalar>& muC, DeviceBuffer<scalar>& muB) const
+{
+    muC.resize(nC_);
+    sutherlandKernel<<<blocksFor(nC_), kTPB>>>(nC_, cs_.gas, F.T.data(), muC.data(), nullptr, nullptr, nullptr);
+    if (nB_)
+    {
+        muB.resize(nB_);
+        sutherlandKernel<<<blocksFor(nB_), kTPB>>>(nB_, cs_.gas, F.TB.data(), muB.data(), nullptr, nullptr, nullptr);
+    }
+    cudaCheck(cudaGetLastError(), "laminar mu");
 }
 
 void ViscousCorrectors::solveU(DeviceFields& F, DeviceVectorBoundary& dbU, scalar rDeltaT, StepReport& rep,
@@ -541,7 +565,7 @@ void ViscousCorrectors::solveU(DeviceFields& F, DeviceVectorBoundary& dbU, scala
         account(solved[i], A_[solved[i]], *U[solved[i]], b_[solved[i]], F.rho, iC_[solved[i]], bC_[solved[i]],
                 tau ? &dTauB_[solved[i]] : nullptr, rDeltaT, sc);
     }
-    for (int i = 0; i < n && rep.nSolves < 4; ++i)
+    for (int i = 0; i < n && rep.nSolves < 6; ++i)
     {
         SolveLine& l = rep.solves[rep.nSolves++];
         const char* nm[3] = {"Ux", "Uy", "Uz"};
@@ -613,10 +637,13 @@ void ViscousCorrectors::solveE(DeviceFields& F, const DeviceBoundary& dbT, scala
 {
     if (sutherland_)   // alphaEff = thermo.alphahe() after the first thermo.correct() of the step (:266)
     {
-        sutherlandKernel<<<blocksFor(nC_), kTPB>>>(nC_, cs_.gas, F.T.data(), nullptr, nullptr, alphaC_.data(), nullptr);
+        const bool at = turb_ && control_ != controlRasNoAlphat;
+        sutherlandKernel<<<blocksFor(nC_), kTPB>>>(nC_, cs_.gas, F.T.data(), nullptr, nullptr, alphaC_.data(), nullptr,
+                                                   nullptr, at ? turb_->alphat().data() : nullptr);
         if (nB_)
             sutherlandKernel<<<blocksFor(nB_), kTPB>>>(nB_, cs_.gas, F.TB.data(), nullptr, nullptr, alphaB_.data(),
-                                                        negAlphaB_.data(), TbGamma_ ? TbGamma_->data() : nullptr);
+                                                        negAlphaB_.data(), TbGamma_ ? TbGamma_->data() : nullptr,
+                                                        at ? turb_->alphatB().data() : nullptr);
         cudaCheck(cudaGetLastError(), "sutherland alphahe");
         rebuildLaplacian(alphaC_, lapDiagE_, negUpperE_, alphaF_);
     }
@@ -669,7 +696,7 @@ void ViscousCorrectors::solveE(DeviceFields& F, const DeviceBoundary& dbT, scala
         const DeviceBuffer<scalar>* sc[3] = {&F.e, nullptr, nullptr};
         account(3, AE_, F.e, bE_, F.rho, iCe_, bCe_, nullptr, rDeltaT, sc);
     }
-    if (rep.nSolves < 4)
+    if (rep.nSolves < 6)
     {
         SolveLine& l = rep.solves[rep.nSolves++];
         std::strncpy(l.field, "e", sizeof(l.field) - 1);

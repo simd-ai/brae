@@ -68,4 +68,5 @@ with every Sod output byte-identical).
 3. totalPressure (isentropic psi branch), totalTemperature and waveTransmissive: a nozzle inlet and outlet.
 4. The viscous correctors and sigmaDotU; then LTS, janaf and sutherland, mesh motion, and turbulence.
 
-(Items 1-4 and LTS/janaf are done: milestones C-I, ARCHITECTURE.md sections 5d-5k. Mesh motion and turbulence remain.)
+(Items 1-4, LTS/janaf and turbulence (kOmegaSST) are done: milestones C-J, ARCHITECTURE.md sections 5d-5l. Mesh motion
+remains.)

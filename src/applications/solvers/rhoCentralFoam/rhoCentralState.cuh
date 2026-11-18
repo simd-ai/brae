@@ -1,4 +1,6 @@
 #pragma once
+#include "compressibleRAS_cpp.cuh"
+#include <memory>
 // rhoCentralFoam's state, shared by the host reference, the device arm and the writer.
 //
 // Cells are nC long. Boundary arrays are nB long, every boundary face in patch order (flat index k is mesh face
@@ -27,13 +29,15 @@ struct PatchFields
     GeometricField<vector> U;
     GeometricField<scalar> p;
     GeometricField<scalar> T;
+    // compressible::turbulenceModel::New(rho, U, phi, thermo)'s case (milestone J): its fields and their patches
+    std::shared_ptr<brae::compressibleRAS::Case> ras;
 };
 
 // One implicit solve's report (milestone G): OpenFOAM's `smoothSolver:  Solving for <field>, Initial residual = ..,
 // Final residual = .., No Iterations n` (SolverPerformance.C:95-117)
 struct SolveLine
 {
-    char   field[4] = {0};   // Ux, Uy, Uz, e
+    char   field[8] = {0};   // Ux, Uy, Uz, e, omega, k
     scalar initialResidual = 0, finalResidual = 0;
     int    nIterations = 0;
 };
@@ -47,7 +51,7 @@ struct StepReport
     scalar flowMin   = 0;   // LTS (milestone I): setRDeltaT.H's "Flow time scale min/max", gMin/gMax(1/rDeltaT)
     scalar flowMax   = 0;
     int    nSolves   = 0;   // the viscous correctors' solves, in OpenFOAM's order (U's valid components, then e)
-    SolveLine solves[4];
+    SolveLine solves[6];   // U's valid components, e, and (RAS) omega and k
 };
 
 // Nonzero step status: what OpenFOAM would stop on, and what makes the state unphysical.
@@ -120,7 +124,12 @@ enum Control : int
     controlAlphaheOldT = 27,           // alphahe()'s CpByCpv on the T_b of the thermo.correct(), not the matrix's
     controlMaxwellNoCreep = 28,        // maxwellSlipU without its thermal creep term
     controlMaxwellNoCurvature = 29,    // maxwellSlipU without its curvature (n & tauMC) term
-    controlSmoluchowskiNoJump = 30     // smoluchowskiJumpT with valueFraction 1: T_b = Twall
+    controlSmoluchowskiNoJump = 30,    // smoluchowskiJumpT with valueFraction 1: T_b = Twall
+    // milestone J (RAS), each deliberately wrong:
+    controlRasLaminarMuEff = 31,       // :220's muEff without mut: the laminar mu only
+    controlRasNoAlphat = 32,           // :278's alphaEff without alphat: CpByCpv*alpha only
+    controlRasCorrectFirst = 33,       // turbulence->correct() before the U corrector (:234), on the inviscid U, not :290
+    controlRasPhiUndivided = 34        // the model's phi() the mass flux itself, not phi/fvc::interpolate(rho)
 };
 
 } // namespace rhoCentral

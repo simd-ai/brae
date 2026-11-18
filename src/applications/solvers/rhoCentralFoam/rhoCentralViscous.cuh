@@ -1,4 +1,5 @@
 #pragma once
+#include "compressibleRAS.cuh"
 // rhoCentralViscous.cuh -- rhoCentralFoam's viscous correctors on the device arm (milestone G).
 //
 // OpenFOAM v2412 rhoCentralFoam.C, when max(thermo.mu()) > 0 (createFieldRefs.H), in the step's order:
@@ -60,6 +61,10 @@ public:
     void setMixedEnergyRef(const DeviceBuffer<scalar>* eRef) { eRef_ = eRef; }
     // the patch T that alphahe()'s CpByCpv() reads at the e matrix's construction, where it is not T_b (null: T_b)
     void setAlphaheGammaT(const DeviceBuffer<scalar>* Tb) { TbGamma_ = Tb; }
+    // RAS (milestone J): muEff and alphaEff from the turbulence model (null: laminar)
+    void setTurbulence(gpu::compressibleRAS::KOmegaSST* t) { turb_ = t; }
+    void laminarMu(const DeviceFields& F, DeviceBuffer<scalar>& muC, DeviceBuffer<scalar>& muB) const;
+    const DeviceBuffer<scalar>& rhoOld() const { return rho0_; }
     // The step's viscous fluxes INTO the domain through the patches, times deltaT, added to inflow[0..3] (x, y, z
     // momentum, energy): U's laplacian boundary flux plus Sf & tauMC_b, and sigmaDotU_b plus e's. Diagnostics.
     void boundaryInflow(const DeviceFields& F, scalar deltaT, DeviceBuffer<double>& inflow);
@@ -90,6 +95,7 @@ private:
     DeviceBuffer<scalar> gx_[3], gy_[3], gz_[3], gradU_, gradB_, tauC_, tauB_;
     const DeviceBuffer<scalar>* eRef_ = nullptr;   // mixedEnergy's refValue on T's mixed faces (milestone I)
     const DeviceBuffer<scalar>* TbGamma_ = nullptr;
+    gpu::compressibleRAS::KOmegaSST* turb_ = nullptr;
     DeviceBuffer<scalar> dTau_[3], dTauB_[3], divTau_[3];
     DeviceBuffer<scalar> diagD_, diagM_, src_[3], lapCorr_, ffc_, iC_[3], bC_[3], diagC_[3], b_[3], dnf_[3];
     DeviceLduView A_[3];

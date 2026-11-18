@@ -32,6 +32,9 @@ public:
     // over the steps and the faces where U, p or T is inletOutlet: how many took the inflow branch (phi < 0), of all
     virtual void inletOutletInflow(long long& inflow, long long& faceSteps) const = 0;
     virtual std::size_t deviceBytes() const { return 0; }
+    // RAS (milestone J): the model's fields for writing; false when laminar
+    struct TurbulenceOut { std::vector<scalar> k, kB, omega, omegaB, nut, nutB, alphat, alphatB; };
+    virtual bool turbulenceFields(TurbulenceOut& /*o*/) const { return false; }
     // LTS (milestone I): the cells' rDeltaT as the last step's setRDeltaT.H left it; null when not LTS
     virtual const std::vector<scalar>* rDeltaT() const { return nullptr; }
     // the viscous correctors' unconserved remainder, deltaT*sum(b - A x) over the run (milestone G); 0 inviscid

@@ -22,6 +22,9 @@
 #include "primitive_patch_cpp.cuh"    // CellFaces
 
 #include <cuda_runtime.h>
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <vector>
 
@@ -509,6 +512,42 @@ public:
         }
         // the rarefied-gas walls (milestone I): their descriptors, and partialSlip's coefficients from the written
         // refValue and valueFraction on the U the run starts from (the step's first fvc::grad(U) reads them)
+        // RAS (milestone J): compressible::turbulenceModel::New(rho, U, phi, thermo), then turbulence->validate()
+        // (rhoCentralFoam.C:71) -- correctNut() on the fields as read, with the thermo's mu as constructed
+        if (pf.ras && vis_)
+        {
+            turb_ = std::make_unique<gpu::compressibleRAS::KOmegaSST>(*pf.ras, cs.m, cs.g, cs.patches, pf.U, dm_);
+            vis_->setTurbulence(turb_.get());
+            vis_->laminarMu(F_, muLamC_, muLamB_);
+            gpu::compressibleRAS::Flow fv;   // correctNut reads no flux and no ddt (tools/default_audit_allow.txt)
+            fv.rho = &F_.rho;
+            fv.rhoB = &F_.rhoB;
+            fv.Ux = &F_.Ux;
+            fv.Uy = &F_.Uy;
+            fv.Uz = &F_.Uz;
+            fv.mu = &muLamC_;
+            fv.muB = &muLamB_;
+            turb_->validate(fv, dbU_);
+            // BRAE_RAS_DUMP_VALIDATE=<file>: a diagnostic, off by default -- nut and alphat after validate(), cells
+            // then patch faces, one value a line (compared against OpenFOAM's own validate(), which it never writes)
+            if (const char* dump = std::getenv("BRAE_RAS_DUMP_VALIDATE"))
+            {
+                std::vector<scalar> a, b, c2, d;
+                turb_->nut().copyTo(a);
+                turb_->nutB().copyTo(b);
+                turb_->alphat().copyTo(c2);
+                turb_->alphatB().copyTo(d);
+                if (std::FILE* fp = std::fopen(dump, "w"))
+                {
+                    for (const auto* v : {&a, &b, &c2, &d})
+                    {
+                        std::fprintf(fp, "%zu\n", v->size());
+                        for (scalar x : *v) std::fprintf(fp, "%.17g\n", x);
+                    }
+                    std::fclose(fp);
+                }
+            }
+        }
         if (cs.slipWalls())
         {
             slip_ = std::make_unique<SlipWalls>(cs, dm_, dbU_, dbT_, control_);
@@ -613,6 +652,23 @@ public:
         flowMax_[pending_] = mx;
         rDT_.copyFrom(rDThost_);
         return rDT_.data();
+    }
+    // the RAS model's fields (AUTO_WRITE: k, omega, nut, alphat), cells and patch values
+    bool turbulenceFields(TurbulenceOut& o) const override
+    {
+        if (!turb_) return false;
+        turb_->k().copyTo(o.k);
+        turb_->omega().copyTo(o.omega);
+        turb_->nut().copyTo(o.nut);
+        turb_->nutB().copyTo(o.nutB);
+        turb_->alphat().copyTo(o.alphat);
+        turb_->alphatB().copyTo(o.alphatB);
+        DeviceBuffer<scalar> b;
+        turb_->kB(b);
+        b.copyTo(o.kB);
+        turb_->omegaB(b);
+        b.copyTo(o.omegaB);
+        return true;
     }
     // the rDeltaT the last step used, as setRDeltaT.H left it (written at write times: AUTO_WRITE)
     const std::vector<scalar>* rDeltaT() const override { return cs_.lts ? &rDThost_ : nullptr; }
@@ -739,6 +795,41 @@ public:
     }
 
     // the viscous step (milestone G): rhoCentralFoam.C:102-288 with the correctors, see rhoCentralViscous.cuh
+    // turbulence->correct() (rhoCentralFoam.C:290): on this step's rho, U, the central mass flux phi (:195) and the
+    // thermo's mu of the last thermo.correct(); fvm::ddt(rho, k|omega) on rho.oldTime(), the rho the step started
+    // from, with the case's ddt scheme; its omega and k solve lines in the step's report
+    void correctTurbulence(scalar rDeltaT, StepReport& rep)
+    {
+        DeviceFields& F = F_;
+        vis_->laminarMu(F, muLamC_, muLamB_);
+        gpu::compressibleRAS::Flow fl;
+        fl.rho = &F.rho;
+        fl.rhoB = &F.rhoB;
+        fl.rhoOld = &vis_->rhoOld();
+        fl.Ux = &F.Ux;
+        fl.Uy = &F.Uy;
+        fl.Uz = &F.Uz;
+        fl.mu = &muLamC_;
+        fl.muB = &muLamB_;
+        fl.phiInt = &X_.phi;
+        fl.phiBnd = &X_.phiB;
+        fl.rDeltaT = rDeltaT;
+        fl.rDeltaTCells = cs_.lts ? &rDT_ : nullptr;
+        fl.controlPhiUndivided = (control_ == controlRasPhiUndivided);
+        turb_->correct(fl, dbU_);
+        const auto& r = turb_->residuals();
+        const DeviceSolverPerf* perf[2] = {&r.omegaPerf, &r.kPerf};
+        const char* nm[2] = {"omega", "k"};   // kOmegaSSTBase::correct solves omega, then k
+        for (int j = 0; j < 2 && rep.nSolves < 6; ++j)
+        {
+            SolveLine& l = rep.solves[rep.nSolves++];
+            std::strncpy(l.field, nm[j], sizeof(l.field) - 1);
+            l.initialResidual = perf[j]->initialResidual;
+            l.finalResidual = perf[j]->finalResidual;
+            l.nIterations = perf[j]->nIterations;
+        }
+    }
+
     void stepViscous(scalar deltaT)
     {
         const Case& cs = cs_;
@@ -764,6 +855,7 @@ public:
         cudaCheck(cudaGetLastError(), "rhoCentral momentum");
         if (nB) switchInletOutlet();
         evaluateU(true);                                                      // :232
+        if (turb_ && control_ == controlRasCorrectFirst) correctTurbulence(rDeltaT, rep);   // the control
         vis_->solveU(F, dbU_, rDeltaT, rep, cs.lts ? &rDT_ : nullptr);        // :234-244
         evaluateU();                                                          // fvMatrix::solve's U.correctBC
         const DeviceBuffer<scalar>& dS = vis_->divSigmaDotU(F, dbU_, X_);     // :246-253
@@ -813,6 +905,9 @@ public:
             rhoBKernel<<<blocksFor(nB), kTPB>>>(nB, F.psiB.data(), F.pB.data(), F.rhoB.data());   // :288
             cudaCheck(cudaGetLastError(), "rhoCentral rho_b");
         }
+        // turbulence->correct() (:290): after p, p_b and rho_b, on this step's rho, U, the central mass flux phi
+        // (:195) and the thermo's mu of the last thermo.correct()
+        if (turb_ && control_ != controlRasCorrectFirst) correctTurbulence(rDeltaT, rep);
         courantKernel<<<1, 1024>>>(nC, coCell_.data(), dm_.V.data(), courant_.data() + 3*pending_);
         cudaCheck(cudaGetLastError(), "rhoCentral courant");
         vis_->boundaryInflow(F, deltaT, visIn_);
@@ -954,6 +1049,8 @@ private:
     DeviceBuffer<scalar> Told_, TbEval_, coCell_;
     std::unique_ptr<ViscousCorrectors> vis_;   // mu > 0 (milestone G)
     std::unique_ptr<SlipWalls> slip_;          // maxwellSlipU and smoluchowskiJumpT (milestone I)
+    std::unique_ptr<gpu::compressibleRAS::KOmegaSST> turb_;   // RAS (milestone J)
+    DeviceBuffer<scalar> muLamC_, muLamB_;
     DeviceBuffer<scalar> TbGamma_;
     DeviceBuffer<label> tpFaces_, ttFaces_, wtFaces_;   // the nozzle boundaries (milestone H)
     DeviceBuffer<scalar> tpP0_, tpGamma_, ttT0_, ttGamma_, wtFieldInf_, wtLInf_, wtGamma_, pBold_, zeroB_, phiInv_;

@@ -550,6 +550,31 @@ tests/rho_central_lts_vs_openfoam.sh: biconic25-55Run35 as shipped, LTS on forwa
 janaf tubes across Tcommon, a rarefied channel; controls ltsUnsmoothed, janafLowOnly, alphaheOldT, maxwellNoCreep,
 maxwellNoCurvature, smoluchowskiNoJump.
 
+## 5l. Milestone J: compressible RAS (kOmegaSST)
+
+- **Layering, as OpenFOAM stacks it** (src/TurbulenceModels/compressible): `compressibleRAS_cpp` reads what
+  compressible::turbulenceModel::New(rho, U, phi, thermo) reads -- turbulenceProperties, the RAS dictionary and its
+  coeffs (Prt from kOmegaSSTCoeffs), k omega nut alphat with their patch classes, meshWave and nearWallDist -- and
+  refuses by name what it does not run. `gpu::compressibleRAS::KOmegaSST` is the CompressibleTurbulenceModel /
+  eddyViscosity / EddyDiffusivity layer: muEff = rho*nut + mu, alphat = rho*nut/Prt, phi() = phi/interpolate(rho),
+  nu() = mu/rho, the constraint patches after correctNut. The model itself is brae's shared kOmegaSSTBase closure
+  (kOmegaSST.cuh; its correctNut is now callable alone, for validate()), the one every compressible solver of
+  OpenFOAM's runs. Nothing in the layer knows which solver calls it.
+- **Where rhoCentralFoam calls it** (the solver's own lines, not another brae solver's driver): validate() at :71 after
+  construction; muEff() at :220 into the U corrector (beginStep: rho as the step starts, the nut the last correct()
+  left); alphaEff() at :278 through the thermo (CpByCpv*(alpha + alphat)); correct() at :290 after p, p_b and rho_b, on
+  the step's central mass flux and the laminar mu of the last thermo.correct(), fvm::ddt(rho, .) on rho.oldTime() with
+  the case's ddt scheme (Euler or localEuler). Inviscid is still decided by the laminar mu (:216), and a RAS case with
+  a laminar mu of 0 is refused (its muEff and alphaEff would reach no equation). The host reference arm refuses RAS.
+- **Case design found on the way**: a flat plate staged at maxCo 0.4 (the jet's own is 0.5) grows a grid-scale wave
+  train from the leading edge in OpenFOAM itself, laminar and RAS alike, on its 33:1 near-wall cells; OpenFOAM's two-
+  and four-way runs then part from its serial by 10% by 5e-4 s. At maxCo 0.2 the rows stay smooth and the spread grows
+  slowly (4e-6 at 5e-4 s, 2e-3 at 3e-3 s): the gate's plate runs at 0.2.
+
+tests/rho_central_turb_vs_openfoam.sh: a supersonic turbulent flat plate with wall functions (Euler and localEuler) and
+LadenburgJet60psi with kOmegaSST; k omega nut alphat and the plate's wall values against OpenFOAM's own spread;
+controls rasLaminarMuEff, rasNoAlphat, rasCorrectFirst, rasPhiUndivided.
+
 ## 6. Milestones, each closed by a gate against OpenFOAM v2412
 
 Every gate:
@@ -568,7 +593,7 @@ Every gate:
 | G (done; for review) | viscous: muEff, tauMC, U and e correctors (smoothSolver/GaussSeidel), sigmaDotU, constant mu (sutherland and noSlip are not in this milestone) | a shear layer, conduction, Sod and obliqueShock with mu > 0 against OpenFOAM |
 | H (done; open checks registered) | totalPressure (psi branch), totalTemperature, waveTransmissive, noSlip, sutherland, viscous wedge | LadenburgJet60psi as shipped and nozzle tube cases |
 | I (done) | LTS (setRDeltaT, fvc::smooth), janaf, maxwellSlipU, smoluchowskiJumpT | biconic25-55Run35 as shipped, LTS/janaf/wall cases |
-| J | compressible RAS on the central path | a modified tutorial with kOmegaSST |
+| J (done; open checks registered) | compressible RAS on the central path: kOmegaSST, its wall functions, muEff and alphaEff, Euler and localEuler | a turbulent flat plate (Euler, LTS) and LadenburgJet60psi with kOmegaSST |
 | K | mesh motion (velocityComponentLaplacian, meshPhi) | movingCone |
 
 The solver stays labelled **experimental** until A to E pass and at least the four inviscid tutorials run as shipped

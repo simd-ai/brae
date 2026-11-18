@@ -74,6 +74,10 @@ int main(int argc, char** argv)
             else if (v == "maxwellNoCreep") control = controlMaxwellNoCreep;
             else if (v == "maxwellNoCurvature") control = controlMaxwellNoCurvature;
             else if (v == "smoluchowskiNoJump") control = controlSmoluchowskiNoJump;
+            else if (v == "rasLaminarMuEff") control = controlRasLaminarMuEff;
+            else if (v == "rasNoAlphat") control = controlRasNoAlphat;
+            else if (v == "rasCorrectFirst") control = controlRasCorrectFirst;
+            else if (v == "rasPhiUndivided") control = controlRasPhiUndivided;
             else if (!v.empty())
                 throw std::runtime_error("BRAE_CONTROL_RCF is `" + v + "`; it takes upwind, noPressureJump, untrimmed, "
                                          "laggedCourant, noTransform, laggedRhoB, inletOutletInverted, laggedPhi, "
@@ -81,7 +85,8 @@ int main(int argc, char** argv)
                                          "restartIoExtrapolate, noUniformTime, limiterVanLeer, limiterScalarOnV, noTauMC, "
                                          "noSigmaDotU, noDynamicHead, nozzleFlowInverted, waveNoRelax, waveVolumeFlux, "
                                          "totalTemperatureOnce, residualUnfused, ltsUnsmoothed, janafLowOnly, alphaheOldT, "
-                                         "maxwellNoCreep, maxwellNoCurvature or smoluchowskiNoJump.");
+                                         "maxwellNoCreep, maxwellNoCurvature, smoluchowskiNoJump, rasLaminarMuEff, "
+                                         "rasNoAlphat, rasCorrectFirst or rasPhiUndivided.");
             if (control != controlNone)
                 std::fprintf(stderr, "brae rhoCentralFoam: NEGATIVE CONTROL `%s` -- deliberately wrong numerics\n", c);
         }

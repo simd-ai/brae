@@ -155,6 +155,8 @@ add_library(brae_core STATIC
     src/finiteVolume/cfdTools/general/fvOptions/limit_temperature_report.cu
     src/TurbulenceModels/turbulenceModels/turbulenceModel/turbulence_transport.cu
     src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/kOmegaSST.cu
+    src/TurbulenceModels/compressible/compressibleRAS_cpp.cu
+    src/TurbulenceModels/compressible/compressibleRAS.cu
     src/finiteVolume/cfdTools/general/MRF/MRF_cpp.cu
     src/finiteVolume/cfdTools/general/MRF/device_MRF.cu
     src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedSchemes_cpp.cu
@@ -2323,6 +2325,14 @@ set_tests_properties(rho_central_viscous_vs_openfoam PROPERTIES SKIP_RETURN_CODE
 add_test(NAME rho_central_nozzle_vs_openfoam
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_nozzle_vs_openfoam.sh)
 set_tests_properties(rho_central_nozzle_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 7200
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_test(NAME rho_central_lts_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_lts_vs_openfoam.sh)
+set_tests_properties(rho_central_lts_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 10800
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_test(NAME rho_central_turb_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_turb_vs_openfoam.sh)
+set_tests_properties(rho_central_turb_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 5400
                      ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 add_test(NAME rho_central_refusals
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_refusals.sh)

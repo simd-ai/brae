@@ -78,7 +78,7 @@ Integrals integrals(const Case& cs, const State& s)
 
 
 void writeTime(const Case& cs, const State& s, const RunClock& clock, bool uniformTime,
-               const std::vector<scalar>* rDeltaT = nullptr)
+               const std::vector<scalar>* rDeltaT = nullptr, const Arm::TurbulenceOut* turb = nullptr)
 {
     const std::string& timeName = clock.timeName();
     const std::string src = cs.caseDir + "/" + cs.startName + "/";
@@ -104,6 +104,15 @@ void writeTime(const Case& cs, const State& s, const RunClock& clock, bool unifo
         std::vector<scalar> b(static_cast<std::size_t>(cs.nB));
         for (label k = 0; k < cs.nB; ++k) b[static_cast<std::size_t>(k)] = (*rDeltaT)[static_cast<std::size_t>(cs.bCell[k])];
         writeVolField(src + "T", out + "/rDeltaT", *rDeltaT, cs.patches, prec, b, &rdtSpec);
+    }
+    // RAS (milestone J): the model's fields, AUTO_WRITE (kOmegaSSTBase's k_, omega_; eddyViscosity's nut_;
+    // EddyDiffusivity's alphat_), their patch classes as read
+    if (turb)
+    {
+        writeVolField(src + "k", out + "/k", turb->k, cs.patches, prec, turb->kB);
+        writeVolField(src + "omega", out + "/omega", turb->omega, cs.patches, prec, turb->omegaB);
+        writeVolField(src + "nut", out + "/nut", turb->nut, cs.patches, prec, turb->nutB);
+        writeVolField(src + "alphat", out + "/alphat", turb->alphat, cs.patches, prec, turb->alphatB);
     }
 }
 
@@ -168,6 +177,8 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
     }
     else
         std::printf("inviscid: every mu is 0\n");
+    if (cs.ras) std::printf("RAS: kOmegaSST (compressible::turbulenceModel: muEff = mu + rho*nut, alphaEff = "
+                            "CpByCpv*(alpha + alphat))\n");
     std::printf("solution directions: (%d %d %d)\n", cs.sd.d[0], cs.sd.d[1], cs.sd.d[2]);
 
     // a restart's time state (Time::setControls): the start's index, and its deltaT where uniform/time gave it
@@ -245,6 +256,9 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
     }
     else
     {
+        if (cs.ras)
+            throw std::runtime_error("brae rhoCentralFoam: the host reference arm (BRAE_RHOCENTRALFOAM_ARM=cpu) does not "
+                                     "run a RAS model; milestone J ports it on the CUDA arm.");
         if (cs.viscous)
             throw std::runtime_error("brae rhoCentralFoam: the host reference arm (BRAE_RHOCENTRALFOAM_ARM=cpu) runs "
                                      "inviscid cases only; mu > 0 runs the viscous correctors, which milestone G "
@@ -327,7 +341,9 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
         if (write)
         {
             arm->download(s);
-            writeTime(cs, s, clock, control != controlNoUniformTime, arm->rDeltaT());
+            Arm::TurbulenceOut to;
+            const bool turb = arm->turbulenceFields(to);
+            writeTime(cs, s, clock, control != controlNoUniformTime, arm->rDeltaT(), turb ? &to : nullptr);
             purge.written(cs.caseDir, clock.timeName());
             std::printf("written %s\n", clock.timeName().c_str());
         }

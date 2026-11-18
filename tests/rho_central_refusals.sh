@@ -10,7 +10,7 @@
 # directory without the fields OpenFOAM must read: brae names it where OpenFOAM stops on it, never starting from an older
 # directory instead. What this does NOT show: that the
 # refused inputs are rare (they are not -- one of the seven shipped tutorials, movingCone, is refused today, after
-# milestones H and I; ARCHITECTURE.md lists the order of the work).
+# milestones H, I and J; ARCHITECTURE.md lists the order of the work).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BRAE_RCF_BIN:-$ROOT/build/brae_rhoCentralFoam}"
@@ -103,7 +103,7 @@ row sod_viscousUncorrected shockTube no "resolves laplacian(muEff,U) to \`Gauss 
 row sod_viscousSmoother shockTube no "smoother \`DIC\` for U" \
     constant/thermophysicalProperties 's/^(\s*mu\s+)\S+;/\11.8e-05;/' system/fvSolution 's/^(\s*)h$/\1"(e|h)"/' \
     system/fvSolution 's/^(\s*smoother\s+)GaussSeidel;/\1DIC;/'
-row sod_RAS shockTube no "simulationType is \`RAS\`" \
+row sod_RAS shockTube no "simulationType RAS with a laminar mu of 0" \
     constant/turbulenceProperties 's/^(simulationType\s+)\S+;/\1RAS;/'
 row sod_partialSlip shockTube yes "is \`partialSlip\`" 0/U '/sides/,/\}/ s/zeroGradient/partialSlip/'
 row sod_symmetryPlaneOnPatch shockTube yes "is \`symmetryPlane\` on a mesh patch of type \`patch\`" \
@@ -119,6 +119,48 @@ row sod_inletOutletPhi shockTube yes "is \`inletOutlet\` on \`phi phiEp\`" \
     0/T '/sides/,/\}/ s/zeroGradient;/inletOutlet; inletValue uniform 300; phi phiEp;/'
 row sod_inletOutletNoInletValue shockTube yes "is \`inletOutlet\` without \`inletValue\`" \
     0/p '/sides/,/\}/ s/zeroGradient;/inletOutlet;/'
+# milestone J: kOmegaSST runs (tests/rho_central_turb_vs_openfoam.sh); what its port leaves out, on its cases.
+# turbrow <name> <kind> <expected words> [file sed-expression | rm file]...: the case staged as that gate stages it
+# (LadenburgJet60psi's system/ and constant/, its 0.orig for jet_sst, tests/rho_central_turb.py setup <kind>), then edited
+turbrow()
+{
+    local name=$1 kind=$2 want=$3
+    shift 3
+    local d="$W/$name"
+    rm -rf "$d"
+    mkdir -p "$d"
+    cp -r "$TUT/LadenburgJet60psi/system" "$TUT/LadenburgJet60psi/constant" "$d/"
+    if [ "$kind" = jet_sst ]; then cp -r "$TUT/LadenburgJet60psi/0.orig" "$d/0"; gunzip -f "$d/0/"*.gz; fi
+    python3 "$ROOT/tests/rho_central_turb.py" setup "$kind" "$d" || { echo "FAIL $name: setup"; fails=$((fails + 1)); return; }
+    while [ $# -ge 2 ]
+    do
+        if [ "$1" = rm ]; then rm -f "$d/$2"; else sed -i -E "$2" "$d/$1"; fi
+        shift 2
+    done
+    of "cd '$d' && blockMesh > log.blockMesh 2>&1" < /dev/null || { echo "FAIL $name: blockMesh"; fails=$((fails + 1)); return; }
+    (cd "$d" && timeout 120 "$BIN" -case . > log 2>&1 < /dev/null; echo $? > rc)
+    local written
+    written=$(find "$d" -maxdepth 1 -type d -name '[0-9]*' ! -name 0 | head -n 1)
+    if [ "$(cat "$d/rc")" != 0 ] && grep -qF -- "$want" "$d/log" && [ -z "$written" ]
+    then
+        passes=$((passes + 1))
+        echo "ok   $name: $(grep -o 'brae rhoCentralFoam: ERROR: .*' "$d/log" | cut -c29-220)"
+    else
+        fails=$((fails + 1))
+        echo "FAIL $name: exit $(cat "$d/rc"), wanted \"$want\"${written:+, wrote $written}"
+        tail -n 3 "$d/log" | sed 's/^/     /'
+    fi
+}
+turbrow jet_kEpsilon jet_sst "RAS model \`kEpsilon\`; ported: kOmegaSST" constant/turbulenceProperties 's/kOmegaSST/kEpsilon/'
+turbrow jet_LES jet_sst "simulationType is \`LES\`; laminar and RAS (kOmegaSST, milestone J) are ported" constant/turbulenceProperties 's/^simulationType(\s+)RAS;/simulationType\1LES;/'
+turbrow jet_turbulenceOff jet_sst "RAS turbulence off" constant/turbulenceProperties 's/^(\s*turbulence\s+)on;/\1off;/'
+turbrow jet_kIntensityInlet jet_sst "k patch 'inlet' is \`turbulentIntensityKineticEnergyInlet\`" \
+    0/k '0,/fixedValue;/ s/fixedValue;/turbulentIntensityKineticEnergyInlet; intensity 0.01;/'
+turbrow jet_wallDistPoisson jet_sst "wallDist method \`Poisson\`; ported: meshWave" system/fvSchemes 's/method meshWave;/method Poisson;/'
+turbrow jet_divMixed jet_sst "name different schemes" system/fvSchemes 's/^(\s*div\(phi,omega\)\s+)Gauss limitedLinear 1;/\1Gauss upwind;/'
+turbrow jet_noK jet_sst "the start time directory has no k" rm 0/k
+turbrow plate_ltsBounded plate_lts "a bounded div(phi,k|omega) under localEuler" \
+    system/fvSchemes 's/^(\s*div\(phi,(k|omega)\)\s+)Gauss/\1bounded Gauss/'
 # rowx <name> <tutorial> <expected words> <shell run in the case after blockMesh> -- and OpenFOAM must stop on the same case
 rowx()
 {

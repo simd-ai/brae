@@ -979,7 +979,31 @@ void correct(
             std::printf("  [sst] k     solve: initialResidual %.6g\n", (double)res.k);
     }
 
-    // ---- correctNut(S2) -----------------------------------------------------------------------
+    // ---- correctNut(S2) and EddyDiffusivity::correctNut (kOmegaSSTBase.C:130-145): the member validate() calls too
+    correctNut(k, omega, nut, nutBnd, alphat, alphatBnd, S2, gradU, dm, dbU, dbK, dbOmega, in);
+}
+
+
+// kOmegaSSTBase::correctNut(S2) (kOmegaSSTBase.C:130-145) and the compressible EddyDiffusivity::correctNut after it:
+// correct()'s last stage, and what validate() runs (kOmegaSSTBase::validate -> correctNut() = correctNut(2*magSqr(
+// symm(fvc::grad(U))))). Extracted from correct() unchanged (milestone J, rhoCentralFoam's validate()).
+void correctNut(
+    const DeviceBuffer<scalar>& k,
+    const DeviceBuffer<scalar>& omega,
+    DeviceBuffer<scalar>&       nut,
+    DeviceBuffer<scalar>&       nutBnd,
+    DeviceBuffer<scalar>*       alphat,
+    DeviceBuffer<scalar>*       alphatBnd,
+    const DeviceBuffer<scalar>& S2,
+    const DeviceBuffer<scalar>& gradU,
+    const DeviceMesh&           dm,
+    const DeviceVectorBoundary& dbU,
+    const DeviceBoundary&       dbK,
+    const DeviceBoundary&       dbOmega,
+    const KOmegaSSTInput&       in)
+{
+    const int nC = dm.nCells;
+    const int nB = dbK.n;
     // F2 is RECOMPUTED from the just-solved, just-bounded k and omega: OpenFOAM's correctNut reads the
     // members, and they have moved since the F2 above was formed for the production limiter.
     {

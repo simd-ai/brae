@@ -58,6 +58,9 @@ struct Case
     // localEuler. setRDeltaT.H: rDeltaT = max(1/maxDeltaT, surfaceSum(amaxSf)/((2*maxCo)*V)), then fvc::smooth with
     // controlDict's rDeltaTSmoothingCoeff (default 0.02); Time advances by the controlDict deltaT, never set
     bool                 lts = false;
+    // compressible RAS (milestone J): turbulenceProperties simulationType RAS; the model is read with the fields
+    // (createFields: compressibleRAS::readCase)
+    bool                 ras = false;
     scalar               rDeltaTSmoothingCoeff = 0.02;
     // interpolationSchemes reconstruct(rho), reconstruct(T) (rPsi, e, c) and reconstruct(U) (rhoU): the limiter of each,
     // as device_limiter.cuh's limiterOfR selects it (device_mesh.cuh's sentinels; limitedLinear's 2/max(k,SMALL) > 0),

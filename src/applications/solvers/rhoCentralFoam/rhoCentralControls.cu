@@ -541,16 +541,21 @@ Case readRhoCentralCase(const std::string& caseDir)
     }
     if (cs.viscous) readViscousControls(caseDir, cs);
 
-    // ---- turbulence: laminar ----------------------------------------------------------------------------------------
+    // ---- turbulence: laminar, or RAS (milestone J; the model and its fields: compressibleRAS::readCase) -----------
     {
         std::string tpath = caseDir + "/constant/turbulenceProperties";
         if (!std::filesystem::exists(tpath)) tpath = caseDir + "/constant/momentumTransport";
         if (!std::filesystem::exists(tpath)) refuse("no constant/turbulenceProperties (or momentumTransport).");
         const FoamDict t = readDict(tpath);
         const std::string sim = t.wordOr("simulationType", "");
-        if (sim != "laminar")
-            refuse("simulationType is `" + sim + "`; this stage runs laminar (inviscid) only. Compressible "
-                   "turbulence on the central path is a later step.");
+        if (sim != "laminar" && sim != "RAS")
+            refuse("simulationType is `" + sim + "`; laminar and RAS (kOmegaSST, milestone J) are ported; LES is not.");
+        cs.ras = (sim == "RAS");
+        // createFieldRefs.H decides inviscid on the LAMINAR mu alone: with every mu 0 rhoCentralFoam runs no viscous
+        // corrector and never reads muEff or alphaEff, whatever the turbulence model computes
+        if (cs.ras && !cs.viscous)
+            refuse("simulationType RAS with a laminar mu of 0: rhoCentralFoam then runs inviscid (createFieldRefs.H) and "
+                   "the model's muEff and alphaEff reach no equation; not ported as a turbulent case.");
         if (const FoamDict* lam = t.subDict("laminar"))
         {
             const std::string model = lam->wordOr("model", lam->wordOr("laminarModel", "Stokes"));
