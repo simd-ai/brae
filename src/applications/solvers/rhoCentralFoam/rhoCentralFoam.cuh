@@ -32,6 +32,8 @@ public:
     // over the steps and the faces where U, p or T is inletOutlet: how many took the inflow branch (phi < 0), of all
     virtual void inletOutletInflow(long long& inflow, long long& faceSteps) const = 0;
     virtual std::size_t deviceBytes() const { return 0; }
+    // LTS (milestone I): the cells' rDeltaT as the last step's setRDeltaT.H left it; null when not LTS
+    virtual const std::vector<scalar>* rDeltaT() const { return nullptr; }
     // the viscous correctors' unconserved remainder, deltaT*sum(b - A x) over the run (milestone G); 0 inviscid
     virtual void solveResidual(vector& mom, scalar& energy) const { mom = vector{0, 0, 0}; energy = 0; }
     // the remainder unsigned, and the per-solve identity's largest error (rhoCentralViscous.cuh); 0 inviscid

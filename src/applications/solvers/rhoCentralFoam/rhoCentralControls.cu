@@ -11,6 +11,7 @@
 #include "device_mesh.cuh"   // the limiter selectors (kVanLeerTwoByk and its kin)
 
 #include <algorithm>
+#include <optional>
 #include <cstdlib>
 #include <filesystem>
 #include <stdexcept>
@@ -156,13 +157,14 @@ std::vector<std::string> checkPatchFieldTypes(const FieldData<T>& fd, const std:
                        + "`; OpenFOAM requires the two to be the same for empty, symmetryPlane, symmetry and wedge.");
         }
         else if (type != "zeroGradient" && type != "fixedValue" && type != "slip" && type != "inletOutlet"
-                 && !(field == "U" && type == "noSlip")
+                 && !(field == "U" && (type == "noSlip" || type == "maxwellSlipU"))
+                 && !(field == "T" && type == "smoluchowskiJumpT")
                  && !(field == "p" && (type == "totalPressure" || type == "waveTransmissive"))
                  && !(field == "T" && type == "totalTemperature"))
             refuse(field + " patch '" + p.name + "' is `" + type + "`. This stage runs zeroGradient, fixedValue, "
-                   "slip, inletOutlet, symmetryPlane, symmetry, wedge and empty on U, p and T, noSlip on U, "
-                   "totalPressure and waveTransmissive on p and totalTemperature on T; partialSlip, outletInlet, "
-                   "maxwellSlipU, smoluchowskiJumpT and the rest are not ported (applications/solvers/compressible/"
+                   "slip, inletOutlet, symmetryPlane, symmetry, wedge and empty on U, p and T, noSlip and maxwellSlipU on "
+                   "U, totalPressure and waveTransmissive on p and totalTemperature and smoluchowskiJumpT on T; "
+                   "partialSlip, outletInlet and the rest are not ported (applications/solvers/compressible/"
                    "rhoCentralFoam/BCs, src/finiteVolume/fields/fvPatchFields). Refusing rather than run the patch as "
                    "something else.");
         // the nozzle boundaries (milestone H): the forms ported, everything else of theirs refused by name
@@ -373,10 +375,29 @@ Case readRhoCentralCase(const std::string& caseDir)
                "(readFluxScheme.H, where OpenFOAM stops with the same FatalError).");
     cs.tadmor = (flux == "Tadmor");
 
-    const std::string ddt = schemeStatement(caseDir, "ddtSchemes", "ddt(rho)");
-    if (ddt != "Euler")
-        refuse("ddtSchemes resolves to `" + ddt + "`. This stage runs Euler only: localEuler (LTS, setRDeltaT.H) "
-               "and the other ddt schemes are not ported.");
+    // ddt: Euler, or localEuler (milestone I). LTS is fv::localEulerDdt::enabled(mesh) -- ddtSchemes `default`
+    // localEuler (localEulerDdt.C:33-37) -- and every ddt the solver builds must then be localEuler too: a term on
+    // another scheme beside an LTS loop is a mix this port refuses rather than guesses at.
+    {
+        const std::string def = schemeStatement(caseDir, "ddtSchemes", "default");
+        for (const char* term : {"ddt(rho)", "ddt(rhoU)", "ddt(rhoE)", "ddt(rho,U)", "ddt(rho,e)"})
+        {
+            const std::string ddt = schemeStatement(caseDir, "ddtSchemes", term);
+            if (ddt != "Euler" && ddt != "localEuler")
+                refuse("ddtSchemes resolves " + std::string(term) + " to `" + ddt + "`. Euler and localEuler (LTS, "
+                       "milestone I) are ported; the other ddt schemes are not.");
+            if ((def == "localEuler") != (ddt == "localEuler"))
+                refuse("ddtSchemes resolves " + std::string(term) + " to `" + ddt + "` with `default " + def + "`: "
+                       "LTS is decided by the default (localEulerDdt.C), and a mix of localEuler and Euler terms is "
+                       "not ported.");
+        }
+        cs.lts = (def == "localEuler");
+        if (cs.lts)
+        {
+            const FoamDict cd = readDict(caseDir + "/system/controlDict");
+            cs.rDeltaTSmoothingCoeff = cd.scalarOr("rDeltaTSmoothingCoeff", 0.02);   // setRDeltaT.H:4-11
+        }
+    }
 
     const std::string rRho = schemeStatement(caseDir, "interpolationSchemes", "reconstruct(rho)");
     const std::string rU   = schemeStatement(caseDir, "interpolationSchemes", "reconstruct(U)");
@@ -433,7 +454,7 @@ Case readRhoCentralCase(const std::string& caseDir)
             {"type", "hePsiThermo", "rhoCentralFoam builds a psiThermo (createFields.H); hePsiThermo is the one ported"},
             {"mixture", "pureMixture", "multi-species mixtures are not ported"},
             {"transport", "const|sutherland", "const and sutherland transport are ported (milestones G and H)"},
-            {"thermo", "hConst", "janaf (biconic25-55Run35) and eConst are not ported"},
+            {"thermo", "hConst|janaf", "hConst and janaf are ported (janaf: milestone I); eConst is not"},
             {"equationOfState", "perfectGas", "the psi = 1/(R T) equation of state is the one ported"},
             {"specie", "specie", "the specie model"},
             {"energy", "sensibleInternalEnergy", "rhoCentralFoam transports e (createFields.H: e = thermo.he())"},
@@ -442,6 +463,7 @@ Case readRhoCentralCase(const std::string& caseDir)
         {
             const std::string v = tt->wordOr(n.key, "");
             if (std::string(n.key) == "transport" && (v == "const" || v == "sutherland")) continue;
+            if (std::string(n.key) == "thermo" && (v == "hConst" || v == "janaf")) continue;
             if (v != n.want)
                 refuse(std::string("thermoType ") + n.key + " is `" + v + "`; this stage ports `" + n.want + "` ("
                        + n.why + ").");
@@ -454,10 +476,41 @@ Case readRhoCentralCase(const std::string& caseDir)
         const scalar W = sp->scalarOr("molWeight", 0);
         if (!(W > 0)) refuse("mixture.specie.molWeight must be positive.");
         cs.gas.R     = foamRR()/W;   // specie::R() = RR/molWeight_ (specieI.H:87-90)
+        cs.gas.Tstd  = foamTstd();
+        if (tt->wordOr("thermo", "") == "janaf" && tt->wordOr("transport", "") != "sutherland")
+            refuse("thermoType " + tt->wordOr("transport", "") + " transport with janaf: OpenFOAM v2412 has no such psiThermo "
+                   "(\"Unknown psiThermo type\"; with sensibleInternalEnergy on a perfectGas it builds const<hConst>, "
+                   "sutherland<hConst> and sutherland<janaf>).");
+        if (tt->wordOr("thermo", "") == "janaf")
+        {
+            // janafThermo.C:63-79: Tlow, Thigh, Tcommon, highCpCoeffs and lowCpCoeffs (7 each), each coefficient
+            // multiplied by R; checkInputData (:33-55): Tlow < Thigh, Tlow < Tcommon <= Thigh
+            for (const char* k : {"Tlow", "Thigh", "Tcommon", "highCpCoeffs", "lowCpCoeffs"})
+                if (!th->found(k)) refuse(std::string("thermophysicalProperties mixture.thermodynamics (janaf) has no `") + k + "`.");
+            cs.gas.janaf   = 1;
+            cs.gas.Tlow    = th->scalarOr("Tlow", 0);
+            cs.gas.Thigh   = th->scalarOr("Thigh", 0);
+            cs.gas.Tcommon = th->scalarOr("Tcommon", 0);
+            const std::vector<scalar> hi = th->scalarListOr("highCpCoeffs", {});
+            const std::vector<scalar> lo = th->scalarListOr("lowCpCoeffs", {});
+            if (hi.size() != 7 || lo.size() != 7)
+                refuse("janaf highCpCoeffs and lowCpCoeffs need 7 coefficients each (janafThermo.H nCoeffs_).");
+            for (int i = 0; i < 7; ++i)
+            {
+                cs.gas.highCp[i] = hi[static_cast<std::size_t>(i)]*cs.gas.R;
+                cs.gas.lowCp[i]  = lo[static_cast<std::size_t>(i)]*cs.gas.R;
+            }
+            if (cs.gas.Tlow >= cs.gas.Thigh) refuse("janaf Tlow >= Thigh (janafThermo.C:35-40).");
+            if (cs.gas.Tcommon <= cs.gas.Tlow) refuse("janaf Tcommon <= Tlow (janafThermo.C:42-47).");
+            if (cs.gas.Tcommon > cs.gas.Thigh) refuse("janaf Tcommon > Thigh (janafThermo.C:49-54).");
+        }
+        else
+        {
         cs.gas.Cp    = th->scalarOr("Cp", 0);
         cs.gas.Tref  = th->scalarOr("Tref", foamTstd());   // hConstThermo.C:40
         cs.gas.Hsref = th->scalarOr("Href", 0);            // hConstThermo.C:41 reads Hsref_ from `Href`
         if (!(cs.gas.Cp > cs.gas.R)) refuse("mixture Cp must exceed R (Cv = Cp - R must be positive).");
+        }
         if (tt->wordOr("transport", "") == "sutherland")
         {
             // sutherlandTransport.C: As and Ts (Pr is not read); mu(T) > 0 everywhere, so createFieldRefs.H's
@@ -539,6 +592,57 @@ Case readRhoCentralCase(const std::string& caseDir)
     const std::vector<std::string> Ttypes = checkPatchFieldTypes(readField<scalar>(dir + "/T"), cs.patches, "T");
     const FieldData<scalar> pfd = readField<scalar>(dir + "/p");
     const FieldData<scalar> Tfd = readField<scalar>(dir + "/T");
+    const FieldData<vector> Ufd = readField<vector>(dir + "/U");
+    // the rarefied-gas walls (milestone I; rhoCentralFoam/BCs, built into librhoCentralFoam): their own keywords, from
+    // the field files' dictionaries
+    const bool anySlipWall = std::find(Utypes.begin(), Utypes.end(), "maxwellSlipU") != Utypes.end()
+                          || std::find(Ttypes.begin(), Ttypes.end(), "smoluchowskiJumpT") != Ttypes.end();
+    std::optional<FoamDict> Udict, Tdict;
+    if (anySlipWall)
+    {
+        Udict.emplace(readDict(dir + "/U"));
+        Tdict.emplace(readDict(dir + "/T"));
+        if (!cs.viscous)
+            refuse("maxwellSlipU and smoluchowskiJumpT read mu, tauMC and the viscous solves (rhoCentralFoam/BCs); this "
+                   "port runs them on a viscous case only (mu > 0), where milestone I validates them.");
+        // smoluchowskiJumpT reads Pr from mixture.transport, "consistent with rhoCentralFoam"
+        // (smoluchowskiJumpTFvPatchScalarField.C:139-147): required there even under sutherland, which ignores it
+        if (std::find(Ttypes.begin(), Ttypes.end(), "smoluchowskiJumpT") != Ttypes.end())
+        {
+            const FoamDict tp = readDict(caseDir + "/constant/thermophysicalProperties");
+            const FoamDict* mix = tp.subDict("mixture");
+            const FoamDict* tr = mix ? mix->subDict("transport") : nullptr;
+            if (!tr || !tr->found("Pr"))
+                refuse("smoluchowskiJumpT reads Pr from thermophysicalProperties mixture.transport "
+                       "(smoluchowskiJumpTFvPatchScalarField.C:139-147); it is missing.");
+            cs.sjPr = tr->scalarOr("Pr", 0);
+        }
+    }
+    // a patch's `uniform` entry (OpenFOAM's Field(name, dict, size)); nonuniform ones are not ported for these walls
+    auto uniformScalar = [&](const FoamDict* d, const std::string& key, const std::string& what) -> scalar {
+        const std::vector<std::string>* t = d ? d->find(key) : nullptr;
+        if (!t || t->size() < 2 || (*t)[0] != "uniform")
+            refuse(what + ": `" + key + "` must be `uniform <value>` here (nonuniform walls are not ported).");
+        return std::stod((*t)[1]);
+    };
+    auto uniformVector = [&](const FoamDict* d, const std::string& key, const std::string& what) -> vector {
+        const std::vector<std::string>* t = d ? d->find(key) : nullptr;
+        std::vector<scalar> v;
+        if (t && !t->empty() && (*t)[0] == "uniform")
+            for (std::size_t i = 1; i < t->size(); ++i)
+            {
+                std::string w = (*t)[i];
+                w.erase(std::remove(w.begin(), w.end(), '('), w.end());
+                w.erase(std::remove(w.begin(), w.end(), ')'), w.end());
+                if (!w.empty()) v.push_back(std::stod(w));
+            }
+        if (v.size() != 3) refuse(what + ": `" + key + "` must be `uniform (x y z)` here (nonuniform walls are not ported).");
+        return vector{v[0], v[1], v[2]};
+    };
+    auto patchDict = [&](const std::optional<FoamDict>& f, const std::string& name) -> const FoamDict* {
+        const FoamDict* bf = f ? f->subDict("boundaryField") : nullptr;
+        return bf ? bf->subDict(name) : nullptr;
+    };
 
     // ---- the transform patches, face by face (rhoCentralPatchUpdate.cuh) -----------------------------------------------
     cs.bRhoConstraint.assign(cs.nB, 0);
@@ -608,6 +712,67 @@ Case readRhoCentralCase(const std::string& caseDir)
                     cs.wtGamma.push_back(d->gammaTP);
                 }
             }
+            // maxwellSlipU (maxwellSlipUFvPatchVectorField.C:77-117): accommodationCoeff (0 < |a| <= 2, OpenFOAM's
+            // check), Uwall, thermalCreep and curvature (default on), refValue and valueFraction when written with a
+            // value (else refValue = value, valueFraction 1); the names it reads must be rhoCentralFoam's own
+            if (Ut == "maxwellSlipU")
+            {
+                const std::string w = "U patch '" + p.name + "' is `maxwellSlipU`";
+                const FoamDict* d = patchDict(Udict, p.name);
+                const PatchFieldData<vector>* fd = findPatchEntry(Ufd, p);
+                if (!d || !fd) refuse(w + ": its dictionary could not be read.");
+                for (const auto& nm : {std::pair<const char*, const char*>{"T", "T"}, {"rho", "rho"},
+                                       {"psi", "thermo:psi"}, {"mu", "thermo:mu"}, {"tauMC", "tauMC"}})
+                    if (d->wordOr(nm.first, nm.second) != nm.second)
+                        refuse(w + " with " + nm.first + " `" + d->wordOr(nm.first, "") + "`; this port reads "
+                               "rhoCentralFoam's own `" + nm.second + "`.");
+                if (!d->found("accommodationCoeff")) refuse(w + " without accommodationCoeff (OpenFOAM requires it).");
+                const scalar a = d->scalarOr("accommodationCoeff", 0);
+                if (std::fabs(a) < kSMALL || std::fabs(a) > 2.0)
+                    refuse(w + ": unphysical accommodationCoeff (maxwellSlipUFvPatchVectorField.C:94-104).");
+                const vector Uw = uniformVector(d, "Uwall", w);
+                const int creep = d->switchOr("thermalCreep", true) ? 1 : 0;
+                const int curv = d->switchOr("curvature", true) ? 1 : 0;
+                const bool both = fd->hasRefValue && fd->hasValueFraction && fd->hasValue;
+                for (label i = 0; i < p.size; ++i)
+                {
+                    const std::size_t ii = static_cast<std::size_t>(i);
+                    cs.msFaces.push_back(k0 + i);
+                    cs.msAcc.push_back(a);
+                    cs.msUwall.push_back(Uw);
+                    cs.msCreep.push_back(creep);
+                    cs.msCurv.push_back(curv);
+                    const vector val = fd->valueUniform ? fd->uniformValue : fd->values[ii];
+                    cs.msRef0.push_back(both ? (fd->refValueUniform ? fd->refValueUniformValue : fd->refValues[ii]) : val);
+                    cs.msVf0.push_back(both ? (fd->vfUniform ? fd->vfUniformValue : fd->vfValues[ii]) : scalar(1));
+                }
+            }
+            // smoluchowskiJumpT (smoluchowskiJumpTFvPatchScalarField.C:76-115): accommodationCoeff, Twall, gamma
+            // (default 1.4); constructed with refValue = value, refGrad 0, valueFraction 0
+            if (Ttypes[pi] == "smoluchowskiJumpT")
+            {
+                const std::string w = "T patch '" + p.name + "' is `smoluchowskiJumpT`";
+                const FoamDict* d = patchDict(Tdict, p.name);
+                if (!d) refuse(w + ": its dictionary could not be read.");
+                for (const auto& nm : {std::pair<const char*, const char*>{"U", "U"}, {"rho", "rho"},
+                                       {"psi", "thermo:psi"}, {"mu", "thermo:mu"}})
+                    if (d->wordOr(nm.first, nm.second) != nm.second)
+                        refuse(w + " with " + nm.first + " `" + d->wordOr(nm.first, "") + "`; this port reads "
+                               "rhoCentralFoam's own `" + nm.second + "`.");
+                if (!d->found("accommodationCoeff")) refuse(w + " without accommodationCoeff (OpenFOAM requires it).");
+                const scalar a = d->scalarOr("accommodationCoeff", 0);
+                if (std::fabs(a) < kSMALL || std::fabs(a) > 2.0)
+                    refuse(w + ": unphysical accommodationCoeff (smoluchowskiJumpTFvPatchScalarField.C:94-104).");
+                const scalar Tw = uniformScalar(d, "Twall", w);
+                const scalar g = d->scalarOr("gamma", 1.4);
+                for (label i = 0; i < p.size; ++i)
+                {
+                    cs.sjFaces.push_back(k0 + i);
+                    cs.sjAcc.push_back(a);
+                    cs.sjTwall.push_back(Tw);
+                    cs.sjGamma.push_back(g);
+                }
+            }
             if (Ttypes[pi] == "totalTemperature")
             {
                 const PatchFieldData<scalar>* d = findPatchEntry(Tfd, p);
@@ -643,6 +808,11 @@ Case readRhoCentralCase(const std::string& caseDir)
         }
         k0 += p.size;
     }
+    // waveTransmissive's advective update has its own localEuler branch (advectiveFvPatchField.C: alpha from the
+    // patch's rDeltaT), which milestone H did not port
+    if (cs.lts && !cs.wtFaces.empty())
+        refuse("waveTransmissive with ddtSchemes localEuler: the advective boundary's local-time-step branch "
+               "(advectiveFvPatchField.C, rDeltaT on the patch) is not ported.");
     return cs;
 }
 

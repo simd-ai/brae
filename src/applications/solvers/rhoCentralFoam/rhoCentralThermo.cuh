@@ -1,5 +1,5 @@
 #pragma once
-// rhoCentralFoam's thermo arithmetic: hePsiThermo + pureMixture + hConst + perfectGas + sensibleInternalEnergy,
+// rhoCentralFoam's thermo arithmetic: hePsiThermo + pureMixture + (hConst|janaf) + perfectGas + sensibleInternalEnergy,
 // written as OpenFOAM v2412 evaluates it, term by term, so the host reference and the device kernels run the
 // same expressions.
 //
@@ -31,27 +31,52 @@ struct GasCoeffs
     int    sutherland = 0;   // transport sutherland (milestone H): mu(T) from As, Ts
     scalar As    = 0;
     scalar Ts    = 0;
+    // thermo janaf (milestone I, janafThermo.C:63-79): Tlow, Thigh, Tcommon and the two 7-coefficient sets, already
+    // multiplied by R (janafThermo.C:71-75, "convert coefficients to mass-basis"); Cp, Ha, Hs and the T limit below
+    int    janaf = 0;
+    scalar Tlow = 0, Thigh = 0, Tcommon = 0;
+    scalar highCp[7] = {0, 0, 0, 0, 0, 0, 0};
+    scalar lowCp[7]  = {0, 0, 0, 0, 0, 0, 0};
+    scalar Tstd = 298.15;   // standard::Tstd (etc/controlDict DimensionedConstants), for Hc
+    int    janafLowOnly = 0;   // the negative control janafLowOnly: never the high set
 };
 
-// perfectGas::Cp = 0, so hConst Cp(p, T) = Cp_ + 0
-BRAE_HD inline scalar gasCp(const GasCoeffs& g)
+// janafThermoI.H:29-42: the low set below Tcommon, the high set from it on
+BRAE_HD inline const scalar* gasJanafCoeffs(scalar T, const GasCoeffs& g)
 {
+    return (T < g.Tcommon || g.janafLowOnly) ? g.lowCp : g.highCp;
+}
+
+// Cp(p, T). hConst: Cp_ + perfectGas::Cp (0). janaf (janafThermoI.H:146-155): the Horner polynomial + 0. The
+// expressions are OpenFOAM's: on aarch64 both GCC (OpenFOAM's build) and nvcc contract a*T + b into one fma.
+BRAE_HD inline scalar gasCp(scalar /*p*/, scalar T, const GasCoeffs& g)
+{
+    if (g.janaf)
+    {
+        const scalar* a = gasJanafCoeffs(T, g);
+        return ((((a[4]*T + a[3])*T + a[2])*T + a[1])*T + a[0]) + scalar(0);
+    }
     return g.Cp + scalar(0);
 }
 
 // HtoEthermo.H: Cv = Cp(p, T) - EquationOfState::CpMCv(p, T), perfectGas CpMCv = R
-BRAE_HD inline scalar gasCv(const GasCoeffs& g)
+BRAE_HD inline scalar gasCv(scalar p, scalar T, const GasCoeffs& g)
 {
-    return gasCp(g) - g.R;
+    return gasCp(p, T, g) - g.R;
 }
 
 // thermoI.H:125-134, species::thermo::gamma: Cp/(Cp - CpMCv), the sensibleInternalEnergy CpByCpv
 // (sensibleInternalEnergy.H:97-108)
-BRAE_HD inline scalar gasGamma(const GasCoeffs& g)
+BRAE_HD inline scalar gasGamma(scalar p, scalar T, const GasCoeffs& g)
 {
-    const scalar Cp = gasCp(g);
+    const scalar Cp = gasCp(p, T, g);
     return Cp/(Cp - g.R);
 }
+
+// hConst: no T dependence -- the forms milestones A-H call, kept for them
+BRAE_HD inline scalar gasCp(const GasCoeffs& g) { return gasCp(scalar(0), scalar(0), g); }
+BRAE_HD inline scalar gasCv(const GasCoeffs& g) { return gasCv(scalar(0), scalar(0), g); }
+BRAE_HD inline scalar gasGamma(const GasCoeffs& g) { return gasGamma(scalar(0), scalar(0), g); }
 // The laminar thermal diffusivity rhoCentralFoam's e equation reads (rhoCentralFoam.C:275,
 // turbulence->alphaEff()): ThermalDiffusivity::alphaEff() = thermo.alphahe() = CpByCpv*alpha_ (heThermo.C:809-813),
 // alpha_ = constTransport::alphah = mu*rPr (constTransportI.H:101-108, set in hePsiThermo::calculate). With const
@@ -61,21 +86,58 @@ BRAE_HD inline scalar gasAlphaEff(const GasCoeffs& g)
     return gasGamma(g)*(g.mu*g.rPr);
 }
 // sutherlandTransportI.H:114-143 (milestone H): mu = As*sqrt(T)/(1 + Ts/T); kappa = mu*Cv*(1.32 + 1.77*R/Cv) (the
-// modified Eucken correlation; Pr is not read); alphah = kappa/Cp. Cv = Cp - R (hConst on a perfectGas).
+// modified Eucken correlation; Pr is not read); alphah = kappa/Cp, Cv and Cp at T (janaf: T-dependent).
 BRAE_HD inline scalar gasSutherlandMu(scalar T, const GasCoeffs& g)
 {
     return g.As*sqrt(T)/(1.0 + g.Ts/T);
 }
-// thermo.alphahe() = CpByCpv*alphah at a cell or face of temperature T (sutherland), heThermo.C:809-813
+// mu(T): sutherland's, or constTransport's mu_
+BRAE_HD inline scalar gasMu(scalar T, const GasCoeffs& g)
+{
+    return g.sutherland ? gasSutherlandMu(T, g) : g.mu;
+}
+// thermo.alphahe() = CpByCpv*alphah at a cell or face of temperature T, heThermo.C:809-813: sutherland's alphah =
+// kappa/Cp (sutherlandTransportI.H:125-144), constTransport's mu*rPr (constTransportI.H:101-108)
+// alphah(T): the thermo's alpha_ (hePsiThermo::calculate)
+BRAE_HD inline scalar gasAlphah(scalar T, const GasCoeffs& g)
+{
+    const scalar p = 0;   // perfectGas + hConst/janaf: Cp and Cv do not read p
+    if (!g.sutherland) return g.mu*g.rPr;
+    const scalar Cv = gasCv(p, T, g);
+    const scalar kappa = gasSutherlandMu(T, g)*Cv*(1.32 + 1.77*g.R/Cv);
+    return kappa/gasCp(p, T, g);
+}
 BRAE_HD inline scalar gasSutherlandAlphahe(scalar T, const GasCoeffs& g)
 {
-    const scalar Cv = gasCv(g);
-    const scalar kappa = gasSutherlandMu(T, g)*Cv*(1.32 + 1.77*g.R/Cv);
-    return gasGamma(g)*(kappa/gasCp(g));
+    return gasGamma(scalar(0), T, g)*gasAlphah(T, g);
 }
-// hConstThermoI.H:120: Cp_*(T - Tref_) + Hsref_ + EquationOfState::H(p, T), perfectGas H = 0
+// janafThermoI.H:186-198, Hc(): Ha of the LOW set at Tstd (thermodynamicConstants: Tstd = 298.15)
+BRAE_HD inline scalar gasJanafHc(const GasCoeffs& g)
+{
+    const scalar* a = g.lowCp;
+    const scalar Tstd = g.Tstd;
+    return
+    (
+        (
+            (((a[4]/5.0*Tstd + a[3]/4.0)*Tstd + a[2]/3.0)*Tstd + a[1]/2.0)*Tstd
+          + a[0]
+        )*Tstd + a[5]
+    );
+}
+// Hs(p, T). hConst (hConstThermoI.H:120): Cp_*(T - Tref_) + Hsref_ + EquationOfState::H(p, T), perfectGas H = 0.
+// janaf (janafThermoI.H:158-183): Ha(p, T) - Hc(), Ha = the Horner polynomial*T + a[5] + perfectGas H (0)
 BRAE_HD inline scalar gasHs(scalar /*p*/, scalar T, const GasCoeffs& g)
 {
+    if (g.janaf)
+    {
+        const scalar* a = gasJanafCoeffs(T, g);
+        const scalar Ha =
+        (
+            ((((a[4]/5.0*T + a[3]/4.0)*T + a[2]/3.0)*T + a[1]/2.0)*T + a[0])*T
+          + a[5]
+        ) + scalar(0);
+        return Ha - gasJanafHc(g);
+    }
     return g.Cp*(T - g.Tref) + g.Hsref + scalar(0);
 }
 
@@ -101,9 +163,22 @@ struct GasTResult
 {
     scalar T;
     int    status;   // 0 converged, 1 negative seed (OpenFOAM: FatalError), 2 maxIter exceeded (FatalError)
+    int    limited = 0;   // janaf: the iterate left [Tlow, Thigh] and was clamped (OpenFOAM: a Warning, then clamp)
 };
 
-// thermoI.H:44-88 with F = Es, dFdT = Cv, limit = hConst's identity. The tolerance comes from the SEED.
+// janafThermoI.H:45-62, limit(T): outside [Tlow, Thigh] OpenFOAM warns and clamps; hConst's limit is the identity
+BRAE_HD inline scalar gasLimit(scalar T, const GasCoeffs& g, int& limited)
+{
+    if (g.janaf && (T < g.Tlow || T > g.Thigh))
+    {
+        limited = 1;
+        return (T < g.Tlow) ? g.Tlow : g.Thigh;   // clamp(T, Tlow, Thigh)
+    }
+    return T;
+}
+
+// thermoI.H:44-88 with F = Es, dFdT = Cv(p, Test), limit = janaf's clamp or hConst's identity. The tolerance comes
+// from the SEED.
 BRAE_HD inline GasTResult gasTEs(scalar e, scalar p, scalar T0, const GasCoeffs& g)
 {
     GasTResult r{T0, 0};
@@ -119,7 +194,7 @@ BRAE_HD inline GasTResult gasTEs(scalar e, scalar p, scalar T0, const GasCoeffs&
     do
     {
         Test = Tnew;
-        Tnew = Test - (gasEs(p, Test, g) - e)/gasCv(g);
+        Tnew = gasLimit(Test - (gasEs(p, Test, g) - e)/gasCv(p, Test, g), g, r.limited);
         if (iter++ > 100)
         {
             r.T = Tnew;

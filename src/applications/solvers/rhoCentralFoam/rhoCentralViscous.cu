@@ -67,21 +67,25 @@ __global__ void finishMatrixKernel(int n, const scalar* __restrict__ diagD, cons
     src[c] = s;
 }
 
-// sutherland (milestone H): mu(T) and thermo.alphahe(T) at cells or faces, as hePsiThermo::calculate evaluates them
+// sutherland (milestone H) or janaf (milestone I): mu(T) and thermo.alphahe(T) at cells or faces, as
+// hePsiThermo::calculate evaluates them
+// Tg: the T CpByCpv() reads when it is not alpha_'s (milestone I: alphahe() = CpByCpv()*alpha_, the first evaluated
+// at the call on the T the patches hold then, alpha_ at the last thermo.correct())
 __global__ void sutherlandKernel(int n, GasCoeffs gas, const scalar* __restrict__ T, scalar* __restrict__ mu,
-                                 scalar* __restrict__ negMu, scalar* __restrict__ alpha, scalar* __restrict__ negAlpha)
+                                 scalar* __restrict__ negMu, scalar* __restrict__ alpha, scalar* __restrict__ negAlpha,
+                                 const scalar* __restrict__ Tg = nullptr)
 {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= n) return;
     if (mu)
     {
-        const scalar m = gasSutherlandMu(T[i], gas);
+        const scalar m = gasMu(T[i], gas);
         mu[i] = m;
         if (negMu) negMu[i] = -m;
     }
     if (alpha)
     {
-        const scalar a = gasSutherlandAlphahe(T[i], gas);
+        const scalar a = Tg ? gasGamma(scalar(0), Tg[i], gas)*gasAlphah(T[i], gas) : gasSutherlandAlphahe(T[i], gas);
         alpha[i] = a;
         if (negAlpha) negAlpha[i] = -a;
     }
@@ -153,9 +157,12 @@ __global__ void snGradPatchKernel(int nB, const label* __restrict__ isEmpty, con
         sz[k] = (m.z - u.z)*h;
         return;
     }
-    sx[k] = (t0[k] == 1) ? dc[k]*(UxB[k] - u.x) : scalar(0);
-    sy[k] = (t1[k] == 1) ? dc[k]*(UyB[k] - u.y) : scalar(0);
-    sz[k] = (t2[k] == 1) ? dc[k]*(UzB[k] - u.z) : scalar(0);
+    // fixedValue: (U_b - U_c)*deltaCoeffs. A mixed U face here is maxwellSlipU's partialSlip (milestone I, the only
+    // mixed U face rhoCentralFoam has): its snGrad is (lerp(transform(I - n n, pif), refValue, vf) - pif)*deltaCoeffs,
+    // the evaluated U_b's (partialSlipFvPatchField.C:90-103)
+    sx[k] = (t0[k] == 1 || t0[k] == 5) ? dc[k]*(UxB[k] - u.x) : scalar(0);
+    sy[k] = (t1[k] == 1 || t1[k] == 5) ? dc[k]*(UyB[k] - u.y) : scalar(0);
+    sz[k] = (t2[k] == 1 || t2[k] == 5) ? dc[k]*(UzB[k] - u.z) : scalar(0);
 }
 
 // sigmaDotU on one face: (muf*magSf*snGrad(U) + Sf & tauMC_f) & aU. muf*magSf and each product are fields of
@@ -213,10 +220,21 @@ __global__ void energyPatchCoeffsKernel(int nB, scalar negAlpha, const scalar* _
                                         const int* __restrict__ Tconstraint, const label* __restrict__ Ttype,
                                         const scalar* __restrict__ magSf, const scalar* __restrict__ dc,
                                         const scalar* __restrict__ eB, scalar* __restrict__ iC,
-                                        scalar* __restrict__ bC)
+                                        scalar* __restrict__ bC, const scalar* __restrict__ vfT,
+                                        const scalar* __restrict__ eRef)
 {
     const int k = blockIdx.x*blockDim.x + threadIdx.x;
     if (k >= nB) return;
+    // mixedEnergy (milestone I, smoluchowskiJumpT's T): valueFraction T's, refValue he(p_b, Twall), refGrad 0;
+    // gradientInternalCoeffs -vf*deltaCoeffs, gradientBoundaryCoeffs vf*deltaCoeffs*refValue + (1 - vf)*0
+    if (eRef && !isEmpty[k] && !Tconstraint[k] && Ttype[k] == 5)
+    {
+        const scalar pGn = (negAlphaB ? negAlphaB[k] : negAlpha)*magSf[k];
+        const scalar w = vfT[k]*dc[k];
+        iC[k] = pGn*(-w);
+        bC[k] = -pGn*(w*eRef[k]);
+        return;
+    }
     if (isEmpty[k] || Tconstraint[k] || Ttype[k] != 1)
     {
         iC[k] = 0;
@@ -364,7 +382,8 @@ ViscousCorrectors::ViscousCorrectors(const Case& cs, const DeviceMesh& dm, int c
             }
         cellT_.copyFrom(ct);
     }
-    sutherland_ = cs.gas.sutherland != 0;
+    // per-cell transport fields: sutherland's mu(T), or janaf's CpByCpv(T) in alphahe (milestone I)
+    sutherland_ = cs.gas.sutherland != 0 || cs.gas.janaf != 0;
     // the corrected schemes' explicit parts are exactly zero where every nonOrthCorrectionVector is: then skipped
     {
         const std::vector<scalar> cx = dm.corrVecX.host(), cy = dm.corrVecY.host(), cz = dm.corrVecZ.host();
@@ -460,7 +479,8 @@ void ViscousCorrectors::beginStep(const DeviceFields& F, const DeviceVectorBound
     for (int k = 0; k < 3; ++k) deviceDiv(dm_, dTau_[k], dTauB_[k], divTau_[k]);
 }
 
-void ViscousCorrectors::solveU(DeviceFields& F, DeviceVectorBoundary& dbU, scalar rDeltaT, StepReport& rep)
+void ViscousCorrectors::solveU(DeviceFields& F, DeviceVectorBoundary& dbU, scalar rDeltaT, StepReport& rep,
+                               const DeviceBuffer<scalar>* rDT)
 {
     DeviceBuffer<scalar>* U[3] = {&F.Ux, &F.Uy, &F.Uz};
     // symmetryPlane/symmetry/slip coefficients from U as it stands (basicSymmetry's gradientBoundaryCoeffs read the
@@ -479,8 +499,16 @@ void ViscousCorrectors::solveU(DeviceFields& F, DeviceVectorBoundary& dbU, scala
     for (int k = 0; k < 3; ++k)
     {
         if (!valid_[k]) continue;   // fvMatrixSolve.C: components an empty direction knocks out are not solved
-        deviceEulerFvmDdtRho(rDeltaT, F.rho, rho0_, U0_[k], dm_.V, diagD_, src_[k]);
-        deviceEulerFvcDdtRhoSub(rDeltaT, F.rho, *U[k], rho0_, U0_[k], dm_.V, src_[k]);
+        if (rDT)   // localEuler (milestone I): the per-cell rDeltaT of setRDeltaT.H
+        {
+            deviceLocalEulerFvmDdtRho(*rDT, F.rho, rho0_, U0_[k], dm_.V, diagD_, src_[k]);
+            deviceLocalEulerFvcDdtRhoSub(*rDT, F.rho, *U[k], rho0_, U0_[k], dm_.V, src_[k]);
+        }
+        else
+        {
+            deviceEulerFvmDdtRho(rDeltaT, F.rho, rho0_, U0_[k], dm_.V, diagD_, src_[k]);
+            deviceEulerFvcDdtRhoSub(rDeltaT, F.rho, *U[k], rho0_, U0_[k], dm_.V, src_[k]);
+        }
         const scalar* corr = nullptr;
         if (nonOrth_)
         {
@@ -505,7 +533,9 @@ void ViscousCorrectors::solveU(DeviceFields& F, DeviceVectorBoundary& dbU, scala
     const SmoothSolveControls& c = cs_.solveU;
     for (int i = 0; i < n; ++i) copyD2D(xp_[solved[i]], *U[solved[i]]);   // U before the solve, for the identity
     if (n) deviceSymGaussSeidelFused(n, comps, c.tolerance, c.relTol, c.maxIter, c.minIter, c.nSweeps, c.symmetric, perf);
-    for (int i = 0; i < n; ++i)   // the run's unconserved remainder deltaT*sum(b - A x), unsigned, and the identity
+    // the run's unconserved remainder deltaT*sum(b - A x), unsigned, and the identity: a time-accurate account, not
+    // kept under LTS, where every cell has its own deltaT and the run is a pseudo-time march (milestone I)
+    for (int i = 0; i < n && !rDT; ++i)
     {
         const DeviceBuffer<scalar>* sc[3] = {&F.Ux, &F.Uy, &F.Uz};
         account(solved[i], A_[solved[i]], *U[solved[i]], b_[solved[i]], F.rho, iC_[solved[i]], bC_[solved[i]],
@@ -578,19 +608,28 @@ const DeviceBuffer<scalar>& ViscousCorrectors::divSigmaDotU(const DeviceFields& 
     return divSigma_;
 }
 
-void ViscousCorrectors::solveE(DeviceFields& F, const DeviceBoundary& dbT, scalar rDeltaT, StepReport& rep)
+void ViscousCorrectors::solveE(DeviceFields& F, const DeviceBoundary& dbT, scalar rDeltaT, StepReport& rep,
+                               const DeviceBuffer<scalar>* rDT)
 {
     if (sutherland_)   // alphaEff = thermo.alphahe() after the first thermo.correct() of the step (:266)
     {
         sutherlandKernel<<<blocksFor(nC_), kTPB>>>(nC_, cs_.gas, F.T.data(), nullptr, nullptr, alphaC_.data(), nullptr);
         if (nB_)
             sutherlandKernel<<<blocksFor(nB_), kTPB>>>(nB_, cs_.gas, F.TB.data(), nullptr, nullptr, alphaB_.data(),
-                                                        negAlphaB_.data());
+                                                        negAlphaB_.data(), TbGamma_ ? TbGamma_->data() : nullptr);
         cudaCheck(cudaGetLastError(), "sutherland alphahe");
         rebuildLaplacian(alphaC_, lapDiagE_, negUpperE_, alphaF_);
     }
-    deviceEulerFvmDdtRho(rDeltaT, F.rho, rho0_, e0_, dm_.V, diagD_, srcE_);
-    deviceEulerFvcDdtRhoSub(rDeltaT, F.rho, F.e, rho0_, e0_, dm_.V, srcE_);
+    if (rDT)   // localEuler (milestone I)
+    {
+        deviceLocalEulerFvmDdtRho(*rDT, F.rho, rho0_, e0_, dm_.V, diagD_, srcE_);
+        deviceLocalEulerFvcDdtRhoSub(*rDT, F.rho, F.e, rho0_, e0_, dm_.V, srcE_);
+    }
+    else
+    {
+        deviceEulerFvmDdtRho(rDeltaT, F.rho, rho0_, e0_, dm_.V, diagD_, srcE_);
+        deviceEulerFvcDdtRhoSub(rDeltaT, F.rho, F.e, rho0_, e0_, dm_.V, srcE_);
+    }
     const scalar* corr = nullptr;
     if (nonOrth_)
     {
@@ -612,7 +651,9 @@ void ViscousCorrectors::solveE(DeviceFields& F, const DeviceBoundary& dbT, scala
         energyPatchCoeffsKernel<<<blocksFor(nB_), kTPB>>>(nB_, -alphaEff_, sutherland_ ? negAlphaB_.data() : nullptr,
                                                           dm_.bndIsEmpty.data(), Tconstraint_.data(),
                                                           dbT.bcType.data(), dbT.magSf.data(), dbT.deltaCoeffs.data(),
-                                                          F.eB.data(), iCe_.data(), bCe_.data());
+                                                          F.eB.data(), iCe_.data(), bCe_.data(),
+                                                          dbT.valueFraction.size() ? dbT.valueFraction.data() : nullptr,
+                                                          eRef_ ? eRef_->data() : nullptr);
         cudaCheck(cudaGetLastError(), "e patch coefficients");
     }
     deviceFold(dm_, diagE_, srcE_, iCe_, bCe_, diagCE_, bE_);
@@ -623,6 +664,7 @@ void ViscousCorrectors::solveE(DeviceFields& F, const DeviceBoundary& dbT, scala
     const SmoothSolveControls& c = cs_.solveE;
     copyD2D(xp_[3], F.e);
     deviceSymGaussSeidelFused(1, &comp, c.tolerance, c.relTol, c.maxIter, c.minIter, c.nSweeps, c.symmetric, &perf);
+    if (!rDT)
     {
         const DeviceBuffer<scalar>* sc[3] = {&F.e, nullptr, nullptr};
         account(3, AE_, F.e, bE_, F.rho, iCe_, bCe_, nullptr, rDeltaT, sc);

@@ -22,9 +22,18 @@ using namespace brae::rhoCentral;
 static FieldData<scalar> asBuilt(FieldData<scalar> fd)
 {
     for (PatchFieldData<scalar>& e : fd.boundary)
-        if (e.type == "totalTemperature" || e.type == "waveTransmissive"
+        if (e.type == "totalTemperature" || e.type == "waveTransmissive" || e.type == "smoluchowskiJumpT"
             || (e.type == "totalPressure" && e.psiName != "none"))   // the shared class runs the rho/none forms only
             e.type = "fixedValue";
+    return fd;
+}
+// maxwellSlipU (milestone I) starts as its written `value` too (partialSlip's dictionary constructor reads it, and
+// refValue/valueFraction beside it); the CUDA arm evaluates it as partialSlip from the step's first U.correctBC on.
+// smoluchowskiJumpT above: a mixed patch, fixesValue(), built from its value.
+static FieldData<vector> asBuiltU(FieldData<vector> fd)
+{
+    for (PatchFieldData<vector>& e : fd.boundary)
+        if (e.type == "maxwellSlipU") e.type = "fixedValue";
     return fd;
 }
 
@@ -37,7 +46,7 @@ State createFields(const Case& cs, PatchFields& pf, int control)
     // the thermo reads p and T (basicThermo.C), U is read by createFields.H; each patch is evaluated on construction
     pf.p = buildField(asBuilt(readField<scalar>(dir + "/p")), cs.patches, cs.nC);
     pf.T = buildField(asBuilt(readField<scalar>(dir + "/T")), cs.patches, cs.nC);
-    pf.U = buildField(readField<vector>(dir + "/U"), cs.patches, cs.nC);
+    pf.U = buildField(asBuiltU(readField<vector>(dir + "/U")), cs.patches, cs.nC);
     s.p = pf.p.internal;
     s.T = pf.T.internal;
     s.U = pf.U.internal;

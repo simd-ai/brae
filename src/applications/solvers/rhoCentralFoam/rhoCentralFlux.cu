@@ -72,12 +72,20 @@ __device__ __forceinline__ scalar limitedW(scalar limiter, scalar cdw, scalar di
     return limiter*cdw + (1.0 - limiter)*pos0D(dir);
 }
 
+// rPsi = 1/psi and c = sqrt(thermo.Cp()/thermo.Cv()*rPsi) (rhoCentralFoam.C:107, 135). hConst: Cp/Cv is one number;
+// janaf (milestone I): Cp(T)/Cv(T) at each cell's or face's own T, the fields thermo.Cp() and thermo.Cv() hold
 __global__ void auxKernel(int n, scalar CpByCv, const scalar* __restrict__ psi, scalar* __restrict__ rPsi,
-                          scalar* __restrict__ c)
+                          scalar* __restrict__ c, GasCoeffs gas, const scalar* __restrict__ T)
 {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i >= n) return;
     rPsi[i] = 1.0/psi[i];
+    if (T)
+    {
+        const scalar r = gasCp(scalar(0), T[i], gas)/gasCv(scalar(0), T[i], gas);
+        c[i] = sqrt(r*rPsi[i]);
+        return;
+    }
     c[i] = sqrt(CpByCv*rPsi[i]);
 }
 
@@ -228,8 +236,11 @@ void centralFluxes(const DeviceMesh& dm, const Case& cs, int control, DeviceFiel
     const scalar limT = allVanLeer ? kVanLeerTwoByk : cs.limT;
     const scalar limU = allVanLeer ? kVanLeerTwoByk : cs.limU;
 
-    auxKernel<<<blocksFor(nC), kTPB>>>(nC, CpByCv, F.psi.data(), X.rPsi.data(), X.c.data());
-    if (nB) auxKernel<<<blocksFor(nB), kTPB>>>(nB, CpByCv, F.psiB.data(), X.rPsiB.data(), X.cB.data());
+    const bool janaf = cs.gas.janaf != 0;
+    auxKernel<<<blocksFor(nC), kTPB>>>(nC, CpByCv, F.psi.data(), X.rPsi.data(), X.c.data(), cs.gas,
+                                       janaf ? F.T.data() : nullptr);
+    if (nB) auxKernel<<<blocksFor(nB), kTPB>>>(nB, CpByCv, F.psiB.data(), X.rPsiB.data(), X.cB.data(), cs.gas,
+                                               janaf ? F.TB.data() : nullptr);
     cudaCheck(cudaGetLastError(), "rhoCentral aux");
 
     // the limiters' gradients, three fields a launch (deviceGaussGradFused, bit-identical to one at a time)

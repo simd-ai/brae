@@ -510,6 +510,46 @@ is in each (none is turned into a pass, no threshold moved):
 - OpenFOAM reference failure: no FAIL (Toro 2, where OpenFOAM v2412 stops, is checked as brae stopping too).
 - unexplained numerical difference: none registered.
 
+## 5j. Milestone H: the nozzle boundaries
+
+totalPressure (the isentropic psi form), totalTemperature and waveTransmissive (on p) evaluate where OpenFOAM's
+updateCoeffs runs: totalTemperature at every Tw.evaluate() a fixedEnergy patch makes (e.correctBoundaryConditions() and,
+viscous, the e matrix's construction), totalPressure and waveTransmissive at p.correctBoundaryConditions(). They live in
+the shared device_boundary_flow.cu but are not in the shared factory's list, so the other solvers keep refusing them.
+noSlip, sutherland transport and the viscous correctors on wedge patches came with LadenburgJet60psi.
+tests/rho_central_nozzle_vs_openfoam.sh.
+
+## 5k. Milestone I: local time stepping, janaf and the rarefied-gas walls (biconic25-55Run35)
+
+- **LTS** (`Case::lts`, ddtSchemes `default localEuler`; a mix with Euler terms is refused). The device arm's
+  `setRDeltaT()` runs after the fluxes, as setRDeltaT.H runs after centralCourantNo.H: surfaceSum(amaxSf) (the cell
+  kernels' gather, run ahead of them), max(1/maxDeltaT, sum/((2*maxCo)*V)), then brae's shared `deviceSmooth` (the
+  FaceCellWave of fvc::smooth, in its own visiting order, to the bit of its host oracle). The cells' explicit updates
+  and the viscous correctors read the per-cell rDeltaT (shared `deviceLocalEulerFvmDdtRho` / `FvcDdtRhoSub`, Euler's
+  expressions with the field in the scalar's place). No setDeltaT; the clock advances by the deltaT it holds.
+  rDeltaT is written (extrapolatedCalculated, through the shared writer's `DerivedFieldSpec::patchType`). The host
+  reference arm refuses LTS.
+- **janaf** (`GasCoeffs::janaf`): Cp, Hs = Ha - Hc and limit() as janafThermoI.H writes them, the coefficients times R,
+  T(e) by the Newton loop on Cv(T); every quantity OpenFOAM takes from thermo.Cp()/Cv() is taken per cell and per face
+  (the sound speed, sutherland's kappa, alphahe's CpByCpv). OpenFOAM v2412 builds janaf psiThermo with sutherland
+  transport only, and so does this port.
+- **maxwellSlipU and smoluchowskiJumpT** (rhoCentralSlipBCs.cu, as OpenFOAM keeps them in rhoCentralFoam/BCs).
+  smoluchowskiJumpT is a mixed T patch; e takes mixedEnergy's coefficients from it. maxwellSlipU is a partialSlip,
+  carried in brae's per-component mixed descriptors the way slip and wedge are (valueFraction_k = snGradTransformDiag_k,
+  refValue_k rebuilt from the cells' U before each use) and evaluated exactly. Both update where OpenFOAM updates them
+  (header of rhoCentralSlipBCs.cuh).
+- **Found on biconic25-55Run35's first step**: OpenFOAM's build constructs `fvm::ddt(rho, e)` -- whose fvMatrix
+  constructor's updateCoeffs re-evaluates every T patch on the cells' T of the first thermo.correct() -- before it calls
+  `turbulence->alphaEff()`, so alphahe()'s CpByCpv reads those T_b. With janaf this moves e's matrix (4.4e-7 in its
+  initial residual); the port follows it (control alphaheOldT).
+- **Found on reservoir_visc (task 1)**: OpenFOAM's aarch64 build fuses lduMatrix::residual's multiply-subtracts; the
+  shared device residual rounded them apart (x86-64 OpenFOAM's form). `setDeviceResidualFused` (default off, every
+  other solver unchanged); rhoCentralFoam sets it on aarch64.
+
+tests/rho_central_lts_vs_openfoam.sh: biconic25-55Run35 as shipped, LTS on forwardStep and the viscous obliqueShock,
+janaf tubes across Tcommon, a rarefied channel; controls ltsUnsmoothed, janafLowOnly, alphaheOldT, maxwellNoCreep,
+maxwellNoCurvature, smoluchowskiNoJump.
+
 ## 6. Milestones, each closed by a gate against OpenFOAM v2412
 
 Every gate:
@@ -526,8 +566,8 @@ Every gate:
 | E (done; one arm red, for review) | restart: startFrom latestTime/startTime, `uniform/time` read and written, inletOutlet's value | restarts from OpenFOAM's and brae's output against OpenFOAM's own restart, and against the uninterrupted run |
 | F (done; open checks for review) | the reconstruction limiters vanAlbada, Minmod, MUSCL, SuperBee, limitedLinear and their V forms, upwind | Sod, Lax, 123 and a strong shock tube with every limiter, obliqueShock in 2-D: brae against OpenFOAM and the exact solution |
 | G (done; for review) | viscous: muEff, tauMC, U and e correctors (smoothSolver/GaussSeidel), sigmaDotU, constant mu (sutherland and noSlip are not in this milestone) | a shear layer, conduction, Sod and obliqueShock with mu > 0 against OpenFOAM |
-| H | totalPressure (psi branch), totalTemperature, waveTransmissive | a supersonic nozzle and LadenburgJet60psi |
-| I | LTS (setRDeltaT, fvc::smooth), janaf, maxwellSlipU, smoluchowskiJumpT | biconic25-55Run35 |
+| H (done; open checks registered) | totalPressure (psi branch), totalTemperature, waveTransmissive, noSlip, sutherland, viscous wedge | LadenburgJet60psi as shipped and nozzle tube cases |
+| I (done) | LTS (setRDeltaT, fvc::smooth), janaf, maxwellSlipU, smoluchowskiJumpT | biconic25-55Run35 as shipped, LTS/janaf/wall cases |
 | J | compressible RAS on the central path | a modified tutorial with kOmegaSST |
 | K | mesh motion (velocityComponentLaplacian, meshPhi) | movingCone |
 

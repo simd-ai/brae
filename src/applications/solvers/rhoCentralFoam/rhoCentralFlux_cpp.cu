@@ -111,12 +111,13 @@ HostFluxes centralFluxes(const Case& cs, const State& s, scalar deltaT, int cont
     for (label i = 0; i < nC; ++i)
     {
         rPsi[i] = 1.0/s.psi[i];
-        c[i] = std::sqrt(CpByCv*rPsi[i]);
+        c[i] = gas.janaf ? std::sqrt(gasCp(0, s.T[i], gas)/gasCv(0, s.T[i], gas)*rPsi[i]) : std::sqrt(CpByCv*rPsi[i]);
     }
     for (label k = 0; k < nB; ++k)
     {
         rPsiB[k] = 1.0/s.psiB[k];
-        cB[k] = std::sqrt(CpByCv*rPsiB[k]);
+        cB[k] = gas.janaf ? std::sqrt(gasCp(0, s.TB[k], gas)/gasCv(0, s.TB[k], gas)*rPsiB[k])
+                          : std::sqrt(CpByCv*rPsiB[k]);
     }
 
     // ---- the limiters' gradients: grad(rho), grad(rhoU), grad(rPsi), grad(e), grad(c) (LimitedScheme.C:56-59) ----

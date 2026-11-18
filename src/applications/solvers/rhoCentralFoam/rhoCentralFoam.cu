@@ -77,7 +77,8 @@ Integrals integrals(const Case& cs, const State& s)
 }
 
 
-void writeTime(const Case& cs, const State& s, const RunClock& clock, bool uniformTime)
+void writeTime(const Case& cs, const State& s, const RunClock& clock, bool uniformTime,
+               const std::vector<scalar>* rDeltaT = nullptr)
 {
     const std::string& timeName = clock.timeName();
     const std::string src = cs.caseDir + "/" + cs.startName + "/";
@@ -95,6 +96,15 @@ void writeTime(const Case& cs, const State& s, const RunClock& clock, bool unifo
     // rho is NO_READ, AUTO_WRITE with calculated patches (createFields.H:24-35)
     static const DerivedFieldSpec rhoSpec{"rho", "dimensions      [1 -3 0 0 0 0 0];"};
     writeVolField(src + "T", out + "/rho", s.rho, cs.patches, prec, s.rhoB, &rhoSpec);
+    // LTS (milestone I): rDeltaT is READ_IF_PRESENT, AUTO_WRITE, extrapolatedCalculated (createRDeltaT.H): its patch
+    // values are the face cells' after fvc::smooth's correctBoundaryConditions
+    if (rDeltaT)
+    {
+        static const DerivedFieldSpec rdtSpec{"rDeltaT", "dimensions      [0 0 -1 0 0 0 0];", "extrapolatedCalculated"};
+        std::vector<scalar> b(static_cast<std::size_t>(cs.nB));
+        for (label k = 0; k < cs.nB; ++k) b[static_cast<std::size_t>(k)] = (*rDeltaT)[static_cast<std::size_t>(cs.bCell[k])];
+        writeVolField(src + "T", out + "/rDeltaT", *rDeltaT, cs.patches, prec, b, &rdtSpec);
+    }
 }
 
 
@@ -112,7 +122,9 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
 #else
     setDeviceResidualFused(false);
 #endif
-    const Case cs = readRhoCentralCase(caseDir);
+    Case csRead = readRhoCentralCase(caseDir);
+    if (control == controlJanafLowOnly) csRead.gas.janafLowOnly = 1;   // the negative control (milestone I)
+    const Case cs = std::move(csRead);
     // brae's Time reads controlDict's `functions` and says which it does not run (none is registered here); the
     // loop runs on OpenFOAM's accumulating clock instead, whose deltaT their write times still trim (WriteCadence)
     Time time(caseDir, controlDict);
@@ -127,6 +139,12 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
                 (double)clock.endTime(), logPrec, (double)clock.deltaT(), tc.adjustTimeStep ? "yes" : "no");
     if (tc.adjustTimeStep) std::printf(" (maxCo %.*g, maxDeltaT %.*g)", logPrec, (double)tc.maxCo, logPrec,
                                        (double)tc.maxDeltaT);
+    if (cs.lts) std::printf("\nUsing LTS: localEuler, rDeltaT = max(1/maxDeltaT, surfaceSum(amaxSf)/(2 maxCo V)) "
+                            "(maxCo %.*g, maxDeltaT %.*g), fvc::smooth coefficient %.*g", logPrec, (double)tc.maxCo,
+                            logPrec, (double)tc.maxDeltaT, logPrec, (double)cs.rDeltaTSmoothingCoeff);
+    if (cs.gas.janaf)
+        std::printf("\nthermo: janaf, Tlow %.*g, Tcommon %.*g, Thigh %.*g (Cp, Cv, gamma and alphahe at each T)", logPrec,
+                    (double)cs.gas.Tlow, logPrec, (double)cs.gas.Tcommon, logPrec, (double)cs.gas.Thigh);
     std::printf("\nfluxScheme: %s\nreconstruct: rho %s, T %s, U %s\n", cs.tadmor ? "Tadmor" : "Kurganov",
                 cs.reconRho.c_str(), cs.reconT.c_str(), cs.reconU.c_str());
     if (cs.viscous)
@@ -139,6 +157,9 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
         if (cs.gas.sutherland)
             std::printf("viscous: sutherland As %.*g, Ts %.*g (laminar)\n", logPrec, (double)cs.gas.As, logPrec,
                         (double)cs.gas.Ts);
+        else if (cs.gas.janaf)
+            std::printf("viscous: mu %.*g, Pr %.*g, alphaEff = CpByCpv(T)*mu/Pr per cell (laminar, const transport, "
+                        "janaf)\n", logPrec, (double)cs.gas.mu, logPrec, (double)(1.0/cs.gas.rPr));
         else
             std::printf("viscous: mu %.*g, Pr %.*g, alphaEff %.*g (laminar, const transport)\n", logPrec,
                         (double)cs.gas.mu, logPrec, (double)(1.0/cs.gas.rPr), logPrec, (double)gasAlphaEff(cs.gas));
@@ -228,6 +249,10 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
             throw std::runtime_error("brae rhoCentralFoam: the host reference arm (BRAE_RHOCENTRALFOAM_ARM=cpu) runs "
                                      "inviscid cases only; mu > 0 runs the viscous correctors, which milestone G "
                                      "ports on the CUDA arm.");
+        if (cs.lts)
+            throw std::runtime_error("brae rhoCentralFoam: the host reference arm (BRAE_RHOCENTRALFOAM_ARM=cpu) does not "
+                                     "run local time stepping (ddtSchemes localEuler); milestone I ports it on the CUDA "
+                                     "arm.");
         if (cs.nozzleBoundaries())
             throw std::runtime_error("brae rhoCentralFoam: the host reference arm (BRAE_RHOCENTRALFOAM_ARM=cpu) does not "
                                      "run totalPressure, totalTemperature or waveTransmissive; milestone H ports them on "
@@ -256,9 +281,13 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
         {
             const StepReport& rep = reps[i];
             const std::string& tn = unlogged[i].second;
-            if (tc.adjustTimeStep) std::printf("deltaT = %.*g\n", logPrec, (double)unlogged[i].first);
-            std::printf("Mean and max Courant Numbers = %.*g %.*g\nTime = %s\n\n", logPrec, (double)rep.meanCoNum,
-                        logPrec, (double)rep.CoNum, tn.c_str());
+            if (tc.adjustTimeStep && !cs.lts) std::printf("deltaT = %.*g\n", logPrec, (double)unlogged[i].first);
+            std::printf("Mean and max Courant Numbers = %.*g %.*g\n", logPrec, (double)rep.meanCoNum, logPrec,
+                        (double)rep.CoNum);
+            if (cs.lts)   // setRDeltaT.H:26-28
+                std::printf("Flow time scale min/max = %.*g, %.*g\n", logPrec, (double)rep.flowMin, logPrec,
+                            (double)rep.flowMax);
+            std::printf("Time = %s\n\n", tn.c_str());
             // the viscous correctors' solves, OpenFOAM's lines (SolverPerformance.C:95-117) at Info's precision,
             // writePrecision (printOfSolveLine's %g is 6 digits)
             for (int j = 0; j < rep.nSolves; ++j)
@@ -276,10 +305,12 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
         }
         unlogged.clear();
     };
-    // rhoCentralFoam.C:85-97 and 288-294, !LTS: Time::run, setDeltaT.H, ++runTime, the step, runTime.write()
+    // rhoCentralFoam.C:85-97 and 288-294, !LTS: Time::run, setDeltaT.H, ++runTime, the step, runTime.write(). LTS
+    // (milestone I): no setDeltaT.H -- runTime advances by the deltaT it holds (controlDict's, or the start time's
+    // uniform/time) -- and ++runTime after setRDeltaT.H, :186-190; nothing in the step reads the time between
     while (clock.run())
     {
-        if (tc.adjustTimeStep)
+        if (tc.adjustTimeStep && !cs.lts)
         {
             const scalar dt = setDeltaT(clock.deltaT(), CoNum, tc);   // setDeltaT.H
             if (control == controlUntrimmed) clock.setDeltaTNoAdjust(dt);
@@ -296,7 +327,7 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
         if (write)
         {
             arm->download(s);
-            writeTime(cs, s, clock, control != controlNoUniformTime);
+            writeTime(cs, s, clock, control != controlNoUniformTime, arm->rDeltaT());
             purge.written(cs.caseDir, clock.timeName());
             std::printf("written %s\n", clock.timeName().c_str());
         }

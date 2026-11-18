@@ -287,6 +287,8 @@ struct DerivedFieldSpec
 {
     const char* object = nullptr;       // FoamFile `object` entry, e.g. "rho"
     const char* dimensions = nullptr;   // full entry text, e.g. "dimensions      [1 -3 0 0 0 0 0];"
+    const char* patchType = nullptr;    // the non-constraint patches' type; null: `calculated` (rDeltaT's is
+                                        // extrapolatedCalculated, createRDeltaT.H)
 };
 
 template <typename T, typename Patch>
@@ -423,7 +425,7 @@ inline void writeVolField(
             // (OF writes `empty` as `empty`), everything else is `calculated`, exactly as OF writes rho.
             synth.type = isConstraintPatchType(p.type)
                        ? p.type
-                       : (derived ? "calculated" : "zeroGradient");
+                       : (derived ? (derived->patchType ? derived->patchType : "calculated") : "zeroGradient");
             d = &synth;
         }
         const bool coupled = (isCoupledInterfaceType(p.type));

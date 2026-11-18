@@ -147,6 +147,15 @@ void deviceEulerFvmDdtRho(scalar rDeltaT, const DeviceBuffer<scalar>& rho, const
 void deviceEulerFvcDdtRhoSub(scalar rDeltaT, const DeviceBuffer<scalar>& rho, const DeviceBuffer<scalar>& vf,
                              const DeviceBuffer<scalar>& rho0, const DeviceBuffer<scalar>& vf0,
                              const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& source);
+// The same two with localEuler's per-cell rDeltaT (localEulerDdtScheme.C:283-310, :139-160): EulerDdtScheme's
+// expressions with the field in the scalar's place, term for term
+void deviceLocalEulerFvmDdtRho(const DeviceBuffer<scalar>& rDeltaT, const DeviceBuffer<scalar>& rho,
+                               const DeviceBuffer<scalar>& rho0, const DeviceBuffer<scalar>& vf0,
+                               const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source);
+void deviceLocalEulerFvcDdtRhoSub(const DeviceBuffer<scalar>& rDeltaT, const DeviceBuffer<scalar>& rho,
+                                  const DeviceBuffer<scalar>& vf, const DeviceBuffer<scalar>& rho0,
+                                  const DeviceBuffer<scalar>& vf0, const DeviceBuffer<scalar>& V,
+                                  DeviceBuffer<scalar>& source);
 
 // CrankNicolson ddt0 recurrence (OF DDt0Field update), run ONCE per time step after the old-time rotation:
 //   ddt0[c] = coefft*rDeltaT0*( psiOld[c] - psiOld2[c] ) - ocCoeff*ddt0[c]     (in place; uses the OLD ddt0)

@@ -54,6 +54,11 @@ struct Case
     SolutionDirections   sd;
     GasCoeffs            gas;
     bool                 tadmor = false;   // fluxScheme Tadmor (readFluxScheme.H); Kurganov otherwise
+    // local time stepping (milestone I): createRDeltaT.H's LTS = fv::localEulerDdt::enabled(mesh), ddtSchemes default
+    // localEuler. setRDeltaT.H: rDeltaT = max(1/maxDeltaT, surfaceSum(amaxSf)/((2*maxCo)*V)), then fvc::smooth with
+    // controlDict's rDeltaTSmoothingCoeff (default 0.02); Time advances by the controlDict deltaT, never set
+    bool                 lts = false;
+    scalar               rDeltaTSmoothingCoeff = 0.02;
     // interpolationSchemes reconstruct(rho), reconstruct(T) (rPsi, e, c) and reconstruct(U) (rhoU): the limiter of each,
     // as device_limiter.cuh's limiterOfR selects it (device_mesh.cuh's sentinels; limitedLinear's 2/max(k,SMALL) > 0),
     // and the statement as the case wrote it (milestone F)
@@ -89,6 +94,16 @@ struct Case
     std::vector<label>  tpFaces, wtFaces, ttFaces;
     std::vector<scalar> tpP0, tpGamma, wtFieldInf, wtLInf, wtGamma, ttT0, ttGamma;
     bool nozzleBoundaries() const { return !tpFaces.empty() || !wtFaces.empty() || !ttFaces.empty(); }
+
+    // the rarefied-gas walls of rhoCentralFoam/BCs (milestone I, biconic25-55Run35), flat boundary-face lists:
+    // maxwellSlipU on U (a partialSlip whose refValue and valueFraction it sets from mu, rho, psi, T, grad(T) and
+    // tauMC), smoluchowskiJumpT on T (a mixed one: valueFraction from mu, rho, psi, Pr; refValue Twall). CUDA arm.
+    std::vector<label>  msFaces, sjFaces;
+    std::vector<scalar> msAcc, msVf0, sjAcc, sjTwall, sjGamma;
+    std::vector<vector> msUwall, msRef0;
+    std::vector<int>    msCreep, msCurv;
+    scalar              sjPr = 0;
+    bool slipWalls() const { return !msFaces.empty() || !sjFaces.empty(); }
 };
 
 // Reads and checks the case; refuses everything outside this stage's scope by name, before any field is read.

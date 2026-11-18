@@ -44,13 +44,22 @@ public:
     void beginStep(const DeviceFields& F, const DeviceVectorBoundary& dbU);
     // :234-244 on the U the explicit update left, its patches evaluated (the caller's U.correctBoundaryConditions).
     // Leaves U solved on the cells and rhoU = rho*U there; the caller evaluates U's patches again.
-    void solveU(DeviceFields& F, DeviceVectorBoundary& dbU, scalar rDeltaT, brae::rhoCentral::StepReport& rep);
+    // rDT: localEuler's per-cell rDeltaT (milestone I), null for Euler
+    void solveU(DeviceFields& F, DeviceVectorBoundary& dbU, scalar rDeltaT, brae::rhoCentral::StepReport& rep,
+                const DeviceBuffer<scalar>* rDT = nullptr);
     // :246-253 then its fvc::div (over V), from the corrected U with its patches evaluated
     const DeviceBuffer<scalar>& divSigmaDotU(const DeviceFields& F, const DeviceVectorBoundary& dbU,
                                              const DeviceFluxes& X);
     // :273-277 on the e the explicit update left (its patches evaluated, thermo corrected). Leaves e solved on the
     // cells; the caller evaluates its patches, corrects the thermo and sets rhoE.
-    void solveE(DeviceFields& F, const DeviceBoundary& dbT, scalar rDeltaT, brae::rhoCentral::StepReport& rep);
+    void solveE(DeviceFields& F, const DeviceBoundary& dbT, scalar rDeltaT, brae::rhoCentral::StepReport& rep,
+                const DeviceBuffer<scalar>* rDT = nullptr);
+    // milestone I: tauMC's patch values (packed [(i*3+j)*nB + k]), which maxwellSlipU's curvature term reads, and the
+    // refValue of e's mixedEnergy faces (smoluchowskiJumpT), which e's matrix reads
+    const DeviceBuffer<scalar>& tauB() const { return tauB_; }
+    void setMixedEnergyRef(const DeviceBuffer<scalar>* eRef) { eRef_ = eRef; }
+    // the patch T that alphahe()'s CpByCpv() reads at the e matrix's construction, where it is not T_b (null: T_b)
+    void setAlphaheGammaT(const DeviceBuffer<scalar>* Tb) { TbGamma_ = Tb; }
     // The step's viscous fluxes INTO the domain through the patches, times deltaT, added to inflow[0..3] (x, y, z
     // momentum, energy): U's laplacian boundary flux plus Sf & tauMC_b, and sigmaDotU_b plus e's. Diagnostics.
     void boundaryInflow(const DeviceFields& F, scalar deltaT, DeviceBuffer<double>& inflow);
@@ -79,6 +88,8 @@ private:
     DeviceBuffer<scalar> lapDiagU_, negUpperU_, lapDiagE_, negUpperE_;
     DeviceBuffer<scalar> rho0_, U0_[3], e0_;
     DeviceBuffer<scalar> gx_[3], gy_[3], gz_[3], gradU_, gradB_, tauC_, tauB_;
+    const DeviceBuffer<scalar>* eRef_ = nullptr;   // mixedEnergy's refValue on T's mixed faces (milestone I)
+    const DeviceBuffer<scalar>* TbGamma_ = nullptr;
     DeviceBuffer<scalar> dTau_[3], dTauB_[3], divTau_[3];
     DeviceBuffer<scalar> diagD_, diagM_, src_[3], lapCorr_, ffc_, iC_[3], bC_[3], diagC_[3], b_[3], dnf_[3];
     DeviceLduView A_[3];

@@ -44,6 +44,8 @@ struct StepReport
     scalar meanCoNum = 0;   // centralCourantNo.H, on this step's amaxSf
     scalar CoNum     = 0;
     int    status    = 0;   // see statusText()
+    scalar flowMin   = 0;   // LTS (milestone I): setRDeltaT.H's "Flow time scale min/max", gMin/gMax(1/rDeltaT)
+    scalar flowMax   = 0;
     int    nSolves   = 0;   // the viscous correctors' solves, in OpenFOAM's order (U's valid components, then e)
     SolveLine solves[4];
 };
@@ -111,7 +113,14 @@ enum Control : int
     controlTotalTemperatureOnce = 23,
     // milestone I: the viscous solves' loop residual rounded product by product (x86-64 OpenFOAM's form), where the
     // reference, OpenFOAM's aarch64 build, fuses each multiply-subtract (rhoCentralFoam.cu)
-    controlResidualUnfused = 24
+    controlResidualUnfused = 24,
+    // milestone I, each deliberately wrong:
+    controlLtsUnsmoothed = 25,         // setRDeltaT.H without fvc::smooth
+    controlJanafLowOnly = 26,          // janaf's low coefficients at every T (no switch at Tcommon)
+    controlAlphaheOldT = 27,           // alphahe()'s CpByCpv on the T_b of the thermo.correct(), not the matrix's
+    controlMaxwellNoCreep = 28,        // maxwellSlipU without its thermal creep term
+    controlMaxwellNoCurvature = 29,    // maxwellSlipU without its curvature (n & tauMC) term
+    controlSmoluchowskiNoJump = 30     // smoluchowskiJumpT with valueFraction 1: T_b = Twall
 };
 
 } // namespace rhoCentral

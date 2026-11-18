@@ -68,13 +68,20 @@ int main(int argc, char** argv)
             else if (v == "waveVolumeFlux") control = controlWaveVolumeFlux;
             else if (v == "totalTemperatureOnce") control = controlTotalTemperatureOnce;
             else if (v == "residualUnfused") control = controlResidualUnfused;
+            else if (v == "ltsUnsmoothed") control = controlLtsUnsmoothed;
+            else if (v == "janafLowOnly") control = controlJanafLowOnly;
+            else if (v == "alphaheOldT") control = controlAlphaheOldT;
+            else if (v == "maxwellNoCreep") control = controlMaxwellNoCreep;
+            else if (v == "maxwellNoCurvature") control = controlMaxwellNoCurvature;
+            else if (v == "smoluchowskiNoJump") control = controlSmoluchowskiNoJump;
             else if (!v.empty())
                 throw std::runtime_error("BRAE_CONTROL_RCF is `" + v + "`; it takes upwind, noPressureJump, untrimmed, "
                                          "laggedCourant, noTransform, laggedRhoB, inletOutletInverted, laggedPhi, "
                                          "inletOutletNewT, noPurge, restartIndexZero, restartGridFromZero, "
                                          "restartIoExtrapolate, noUniformTime, limiterVanLeer, limiterScalarOnV, noTauMC, "
                                          "noSigmaDotU, noDynamicHead, nozzleFlowInverted, waveNoRelax, waveVolumeFlux, "
-                                         "totalTemperatureOnce or residualUnfused.");
+                                         "totalTemperatureOnce, residualUnfused, ltsUnsmoothed, janafLowOnly, alphaheOldT, "
+                                         "maxwellNoCreep, maxwellNoCurvature or smoluchowskiNoJump.");
             if (control != controlNone)
                 std::fprintf(stderr, "brae rhoCentralFoam: NEGATIVE CONTROL `%s` -- deliberately wrong numerics\n", c);
         }
