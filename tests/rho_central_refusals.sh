@@ -56,7 +56,18 @@ row()
     fi
 }
 row biconic_shipped biconic25-55Run35 no "ddtSchemes resolves to \`localEuler\`"
-row LadenburgJet60psi_shipped LadenburgJet60psi no "thermoType transport is \`sutherland\`"
+# the nozzle boundaries (milestone H): their forms and fields beyond the ported ones refused by name (LadenburgJet60psi,
+# sutherland and all, now runs: tests/rho_central_nozzle_vs_openfoam.sh)
+row sod_totalPressurePsiNone shockTube yes "is \`totalPressure\` with psi \`none\`" \
+    0/p '/sides/,/\}/ s/zeroGradient;/totalPressure; p0 uniform 1; value uniform 1;/'
+row sod_totalPressurePhiv shockTube yes "is \`totalPressure\` on \`phi phiv\`" \
+    0/p '/sides/,/\}/ s/zeroGradient;/totalPressure; psi thermo:psi; gamma 1.4; phi phiv; p0 uniform 1; value uniform 1;/'
+row sod_totalTemperatureNoT0 shockTube yes "is \`totalTemperature\` without its \`T0\`" \
+    0/T '/sides/,/\}/ s/zeroGradient;/totalTemperature; psi thermo:psi; gamma 1.4; value uniform 300;/'
+row sod_waveTransmissiveOnT shockTube yes "T patch 'sides' is \`waveTransmissive\`" \
+    0/T '/sides/,/\}/ s/zeroGradient;/waveTransmissive; field T; psi thermo:psi; gamma 1.4; value uniform 300;/'
+row sod_waveTransmissiveLInfNoFieldInf shockTube yes "with lInf and no fieldInf" \
+    0/p '/sides/,/\}/ s/zeroGradient;/waveTransmissive; psi thermo:psi; gamma 1.4; lInf 1; value uniform 1;/'
 row movingCone_shipped movingCone no "dynamicMeshDict selects"
 row sod_fluxScheme shockTube no "fluxScheme \`Bogus\` is not a valid choice" \
     system/fvSchemes 's/^(fluxScheme\s+)\S+;/\1Bogus;/'
@@ -130,4 +141,4 @@ rowx sod_latestTimeEmpty shockTube "selects time directory 0.004" "$LATEST; mkdi
 rowx sod_latestTimeNoT shockTube "has no T" "$LATEST; mkdir 0.004; cp 0/U 0/p 0.004/"
 rowx sod_startTimeNoT shockTube "the start time directory 0 has no T" "rm 0/T"
 echo "rho_central_refusals: $passes passed, $fails failed (work in $W)"
-[ "$fails" = 0 ] && [ "$passes" -ge 24 ]
+[ "$fails" = 0 ] && [ "$passes" -ge 28 ]

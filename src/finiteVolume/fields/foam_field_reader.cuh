@@ -219,6 +219,15 @@ struct PatchFieldData
     // does not implement. Recorded so it can be refused by name instead of silently running low-speed.
     std::string    psiName      = "none";
     scalar         gammaTP      = 1.0;
+    // The key the total reference was read from -- `p0` (totalPressure) or `T0` (totalTemperature), both kept in the
+    // inletValue slot -- so a writer can echo it under its own name; and waveTransmissive's (advective's) entries:
+    // `field`, `fieldInf`, `lInf` (advectiveFvPatchField.C: lInf defaults to -GREAT, no relaxation); their `rho`
+    // is flowRateRhoName's slot. rhoCentralFoam's nozzle boundaries (milestone H); nothing else reads them.
+    std::string    totalRefKey;
+    std::string    advFieldName;
+    bool           hasAdvFieldInf = false;
+    scalar         advFieldInf  = 0;
+    scalar         advLInf      = -1.0e300;
     // `phi <name>;` -- the flux a flux-conditional condition looks up (totalPressure, inletOutlet,
     // pressureInletOutletVelocity and their relatives all carry a phiName_, default "phi"). It is a
     // FIELD NAME, not a number, and a solver with more than one flux can be asked for the other:
@@ -1077,6 +1086,7 @@ inline FieldData<T> readField(const std::string& path)
                         {
                             readValueOrInternal(ts, fd, p.inletUniform, p.inletUniformValue, p.inletValues);
                             p.hasInletValue = true;
+                            p.totalRefKey = "p0";
                         }
                         else if (m == "constant")
                         {
@@ -1469,6 +1479,29 @@ inline FieldData<T> readField(const std::string& path)
                     else if (key == "gamma")   // totalPressure isentropic exponent
                     {
                         p.gammaTP = ts.nextScalar();
+                        ts.expect(";");
+                    }
+                    else if (key == "T0")   // totalTemperature reference T0 (the inletValue slot, as p0)
+                    {
+                        readValueOrInternal(ts, fd, p.inletUniform, p.inletUniformValue, p.inletValues);
+                        p.hasInletValue = true;
+                        p.totalRefKey = "T0";
+                        ts.expect(";");
+                    }
+                    else if (key == "fieldInf")   // advective/waveTransmissive far-field value
+                    {
+                        p.advFieldInf = ts.nextScalar();
+                        p.hasAdvFieldInf = true;
+                        ts.expect(";");
+                    }
+                    else if (key == "lInf")       // advective/waveTransmissive relaxation length
+                    {
+                        p.advLInf = ts.nextScalar();
+                        ts.expect(";");
+                    }
+                    else if (key == "field")      // advective/waveTransmissive: the field it is the boundary of
+                    {
+                        p.advFieldName = ts.next();
                         ts.expect(";");
                     }
                     else if (key == "Prt")   // compressible::alphatWallFunction turbulent Prandtl number

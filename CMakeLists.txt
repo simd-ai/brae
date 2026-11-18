@@ -2319,6 +2319,10 @@ add_test(NAME rho_central_viscous_vs_openfoam
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_viscous_vs_openfoam.sh)
 set_tests_properties(rho_central_viscous_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 5400
                      ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_test(NAME rho_central_nozzle_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_nozzle_vs_openfoam.sh)
+set_tests_properties(rho_central_nozzle_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 7200
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 add_test(NAME rho_central_refusals
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_refusals.sh)
 set_tests_properties(rho_central_refusals PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600

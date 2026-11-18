@@ -191,36 +191,10 @@ done
 # ---- conservation and stability --------------------------------------------------------------------------------------------
 for c in $CASES; do balance "b_$c"; done
 
-# the balance once the correctors' unconserved remainder is counted (see SOLVE-CONSERVATION above)
-vbalance()
-{
-    local d=$1 bal res rnd
-    bal=$(sed -n 's/^diag balance mass [^ ]* energy \([^ ]*\) momentum \([^ ]*\) \([^ ]*\) \([^ ]*\) .*/\1 \2 \3 \4/p' "$W/$d/log")
-    res=$(sed -n 's/^diag solve-residual momentum \([^ ]*\) \([^ ]*\) \([^ ]*\) energy \([^ ]*\) .*/\4 \1 \2 \3/p' "$W/$d/log")
-    rnd=$(sed -n 's/^diag roundoff mass [^ ]* energy \([^ ]*\) momentum \([^ ]*\) \([^ ]*\) \([^ ]*\) .*/\1 \2 \3 \4/p' "$W/$d/log")
-    local sums
-    sums=$(python3 -c "
-b = [float(x) for x in '$bal'.split()]; r = [float(x) for x in '$res'.split()]
-print(' '.join('%.3e' % (x + y) for x, y in zip(b, r)) if len(b) == 4 and len(r) == 4 else '')" 2> /dev/null)
-    if python3 -c "
-import sys
-s = [abs(float(x)) for x in '$sums'.split()]; q = [float(x) for x in '$rnd'.split()]
-sys.exit(0 if len(s) == 4 and len(q) == 4 and all(x <= y for x, y in zip(s, q)) else 1)" 2> /dev/null
-    then ok "$d conserves energy and momentum to round-off once the solves' remainder is counted: balance + deltaT*sum(b - A x) = $sums (energy, momentum x y z) within $rnd; the remainder itself $res"
-    else fail "$d solve-conservation: balance '$bal' + remainder '$res' = '$sums' against round-off '$rnd'"; fi
-}
+# the balance once the correctors' unconserved remainder is counted (see SOLVE-CONSERVATION above), and the identity,
+# solve by solve (tests/rho_central_gate_lib.sh: vbalance, identity)
 for c in $CASES; do vbalance "b_$c"; done
-# the identity, solve by solve
-for c in $CASES; do
-    id=$(sed -n 's/^diag solve-identity momentum \([^ ]*\) \([^ ]*\) \([^ ]*\) energy \([^ ]*\) .*/\1 \2 \3 \4/p' "$W/b_$c/log")
-    if python3 -c "
-import sys
-v = [float(x) for x in '$id'.split()]
-sys.exit(0 if len(v) == 4 and max(v) <= 1e-12 else 1)" 2> /dev/null
-    then ok "b_$c: every solve satisfies its conservation identity, largest error $(echo $id | tr ' ' '\n' | sort -g | tail -n 1) of sum rho V |U| (|e|) (momentum x y z, energy: $id; bound 1e-12)"
-    else fail "b_$c: solve identity '${id:-none}' above 1e-12"; fi
-    echo "     b_$c remainders: $(sed -n 's/^diag solve-residual momentum \(.*\) (deltaT.*/signed momentum \1/p' "$W/b_$c/log"); $(sed -n 's/^diag solve-residual-l1 momentum \(.*\) (deltaT.*/unsigned momentum \1/p' "$W/b_$c/log")"
-done
+for c in $CASES; do identity "b_$c"; done
 # the tolerance sweep
 sweep=""
 for c in sod sod_tolA sod_tolB sod_conv; do

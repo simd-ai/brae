@@ -18,7 +18,10 @@
 // GaussSeidel sweep), deviceSnGradInternal. rhoCentralFoam's own: the order above, e's patch coefficients from T's
 // (fixedEnergy, gradientEnergy, mixedEnergy, heThermo's heBoundaryTypes), and sigmaDotU's patch faces.
 //
-// muEff and alphaEff are constant (constTransport, hConst): the laplacian matrices are built once.
+// constTransport: muEff and alphaEff are constant and the laplacian matrices are built once. sutherland (milestone H):
+// muEff from the T the step starts from and alphaEff from the T of its first thermo.correct(), the laplacians rebuilt on
+// their linear interpolates each step. Wedge patches: wedgeFvPatchField's snGrad and coefficients (cellT, half the
+// deltaCoeffs), through the shared deviceUpdateWedge / deviceWedgeLaplacianBC.
 #include "rhoCentralControls.cuh"
 #include "rhoCentralFlux.cuh"
 #include "rhoCentralState.cuh"
@@ -90,6 +93,12 @@ private:
     double solveResL1_[4] = {0, 0, 0, 0};
     double identityMax_[4] = {0, 0, 0, 0};
     DeviceBuffer<scalar> xp_[4], idC_, idM_, idB_, onesB_;
+    // sutherland (milestone H): mu and alphahe per cell and face, the laplacians rebuilt each step; wedge patches
+    bool sutherland_ = false, wedge_ = false;
+    DeviceBuffer<scalar> alphaC_, alphaB_, gms_, upper_;
+    DeviceBuffer<tensor> cellT_;
+    void rebuildLaplacian(const DeviceBuffer<scalar>& gammaC, DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& negUpper,
+                          DeviceBuffer<scalar>& gammaF);
     // after a solve: its remainder, unsigned remainder and identity error into slot k
     void account(int k, const DeviceLduView& A, const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& b,
                  const DeviceBuffer<scalar>& rho, const DeviceBuffer<scalar>& iC, const DeviceBuffer<scalar>& bC,

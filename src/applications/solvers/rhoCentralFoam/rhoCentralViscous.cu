@@ -67,6 +67,41 @@ __global__ void finishMatrixKernel(int n, const scalar* __restrict__ diagD, cons
     src[c] = s;
 }
 
+// sutherland (milestone H): mu(T) and thermo.alphahe(T) at cells or faces, as hePsiThermo::calculate evaluates them
+__global__ void sutherlandKernel(int n, GasCoeffs gas, const scalar* __restrict__ T, scalar* __restrict__ mu,
+                                 scalar* __restrict__ negMu, scalar* __restrict__ alpha, scalar* __restrict__ negAlpha)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    if (mu)
+    {
+        const scalar m = gasSutherlandMu(T[i], gas);
+        mu[i] = m;
+        if (negMu) negMu[i] = -m;
+    }
+    if (alpha)
+    {
+        const scalar a = gasSutherlandAlphahe(T[i], gas);
+        alpha[i] = a;
+        if (negAlpha) negAlpha[i] = -a;
+    }
+}
+// fvc::interpolate (linear): lambda*(vf[own] - vf[nei]) + vf[nei] (surfaceInterpolationScheme.C interpolate)
+__global__ void linearInterpKernel(int nIf, const label* __restrict__ own, const label* __restrict__ nei,
+                                   const scalar* __restrict__ w, const scalar* __restrict__ vf, scalar* __restrict__ out)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nIf) return;
+    const scalar n = vf[nei[f]];
+    out[f] = __dmul_rn(w[f], vf[own[f]] - n) + n;
+}
+__global__ void timesMagSfKernel(int n, const scalar* __restrict__ g, const scalar* __restrict__ magSf,
+                                 scalar* __restrict__ out)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) out[i] = g[i]*magSf[i];   // gammaMagSf = interpolate(gamma)*magSf
+}
+
 __global__ void rhoTimesKernel(int n, const scalar* __restrict__ rho, const scalar* __restrict__ u,
                                scalar* __restrict__ out)
 {
@@ -78,7 +113,8 @@ __global__ void rhoTimesKernel(int n, const scalar* __restrict__ rho, const scal
 // valueFraction 1) deltaCoeffs*(U_b - U_c); zeroGradient (inletOutlet on outflow) 0; symmetryPlane, symmetry and slip
 // (basicSymmetryFvPatchField.C snGrad) (transform(I - 2 n n, U_c) - U_c)*(deltaCoeffs/2). Empty faces: 0.
 __global__ void snGradPatchKernel(int nB, const label* __restrict__ isEmpty, const int* __restrict__ kind,
-                                  const tensor* __restrict__ R, const label* __restrict__ bCell,
+                                  const tensor* __restrict__ R, const tensor* __restrict__ cellT,
+                                  const label* __restrict__ bCell,
                                   const scalar* __restrict__ dc, const label* __restrict__ t0,
                                   const label* __restrict__ t1, const label* __restrict__ t2,
                                   const scalar* __restrict__ Ux, const scalar* __restrict__ Uy,
@@ -106,6 +142,17 @@ __global__ void snGradPatchKernel(int nB, const label* __restrict__ isEmpty, con
         sz[k] = (m.z - u.z)*h;
         return;
     }
+    if (kind[k] == transformRotate)   // wedgeFvPatchField.C:121-129: (transform(cellT, pif) - pif)*(0.5*deltaCoeffs)
+    {
+        const tensor& r = cellT[k];
+        const vector m{r.xx*u.x + r.xy*u.y + r.xz*u.z, r.yx*u.x + r.yy*u.y + r.yz*u.z,
+                       r.zx*u.x + r.zy*u.y + r.zz*u.z};
+        const scalar h = 0.5*dc[k];
+        sx[k] = (m.x - u.x)*h;
+        sy[k] = (m.y - u.y)*h;
+        sz[k] = (m.z - u.z)*h;
+        return;
+    }
     sx[k] = (t0[k] == 1) ? dc[k]*(UxB[k] - u.x) : scalar(0);
     sy[k] = (t1[k] == 1) ? dc[k]*(UyB[k] - u.y) : scalar(0);
     sz[k] = (t2[k] == 1) ? dc[k]*(UzB[k] - u.z) : scalar(0);
@@ -125,7 +172,7 @@ __device__ __forceinline__ scalar sigmaFace(scalar muMagSf, scalar s0, scalar s1
     }
     return v0*a0 + v1*a1 + v2*a2;
 }
-__global__ void sigmaInternalKernel(int nIf, scalar mu, const scalar* __restrict__ magSf,
+__global__ void sigmaInternalKernel(int nIf, scalar mu, const scalar* __restrict__ muF, const scalar* __restrict__ magSf,
                                     const scalar* __restrict__ s0, const scalar* __restrict__ s1,
                                     const scalar* __restrict__ s2, const scalar* __restrict__ d0,
                                     const scalar* __restrict__ d1, const scalar* __restrict__ d2,
@@ -136,9 +183,9 @@ __global__ void sigmaInternalKernel(int nIf, scalar mu, const scalar* __restrict
     if (f >= nIf) return;
     scalar d[3];
     if (d0) { d[0] = d0[f]; d[1] = d1[f]; d[2] = d2[f]; }
-    out[f] = sigmaFace(__dmul_rn(mu, magSf[f]), s0[f], s1[f], s2[f], d0 ? d : nullptr, a0[f], a1[f], a2[f]);
+    out[f] = sigmaFace(__dmul_rn(muF ? muF[f] : mu, magSf[f]), s0[f], s1[f], s2[f], d0 ? d : nullptr, a0[f], a1[f], a2[f]);
 }
-__global__ void sigmaPatchKernel(int nB, scalar mu, const label* __restrict__ isEmpty,
+__global__ void sigmaPatchKernel(int nB, scalar mu, const scalar* __restrict__ muB, const label* __restrict__ isEmpty,
                                  const label* __restrict__ gface, const scalar* __restrict__ magSf,
                                  const scalar* __restrict__ s0, const scalar* __restrict__ s1,
                                  const scalar* __restrict__ s2, const scalar* __restrict__ d0,
@@ -151,7 +198,8 @@ __global__ void sigmaPatchKernel(int nB, scalar mu, const label* __restrict__ is
     if (isEmpty[k]) { out[k] = 0; return; }
     scalar d[3];
     if (d0) { d[0] = d0[k]; d[1] = d1[k]; d[2] = d2[k]; }
-    out[k] = sigmaFace(__dmul_rn(mu, magSf[gface[k]]), s0[k], s1[k], s2[k], d0 ? d : nullptr, a0[k], a1[k], a2[k]);
+    out[k] = sigmaFace(__dmul_rn(muB ? muB[k] : mu, magSf[gface[k]]), s0[k], s1[k], s2[k], d0 ? d : nullptr, a0[k], a1[k],
+                       a2[k]);
 }
 
 // e's patch coefficients for - fvm::laplacian(alphaEff, e), from T's patch fields (heThermo's heBoundaryTypes):
@@ -160,7 +208,8 @@ __global__ void sigmaPatchKernel(int nB, scalar mu, const label* __restrict__ is
 // outflow) is gradientEnergy (mixedEnergy, valueFraction 0) whose gradient Cpv*snGrad(Tw) + dc*(he(Tw) - he(Tw)) is 0;
 // a transform T (symmetryPlane, symmetry, slip) keeps its type, and transformFvPatchField<scalar> has no gradient
 // coefficients (transformFvPatchFields.C:53-58). The matrix's = -(laplacian's): pGn = -alphaEff*magSf.
-__global__ void energyPatchCoeffsKernel(int nB, scalar negAlpha, const label* __restrict__ isEmpty,
+__global__ void energyPatchCoeffsKernel(int nB, scalar negAlpha, const scalar* __restrict__ negAlphaB,
+                                        const label* __restrict__ isEmpty,
                                         const int* __restrict__ Tconstraint, const label* __restrict__ Ttype,
                                         const scalar* __restrict__ magSf, const scalar* __restrict__ dc,
                                         const scalar* __restrict__ eB, scalar* __restrict__ iC,
@@ -174,7 +223,7 @@ __global__ void energyPatchCoeffsKernel(int nB, scalar negAlpha, const label* __
         bC[k] = 0;
         return;
     }
-    const scalar pGn = negAlpha*magSf[k];
+    const scalar pGn = (negAlphaB ? negAlphaB[k] : negAlpha)*magSf[k];
     iC[k] = pGn*(-dc[k]);
     bC[k] = -pGn*(dc[k]*eB[k]);
 }
@@ -239,6 +288,29 @@ __global__ void identityPatchKernel(int nB, const label* __restrict__ isEmpty, c
 
 } // namespace
 
+// a laplacian of a cell-varying gamma (sutherland): gamma_f = linear interpolate (OpenFOAM's form), gammaMagSf =
+// gamma_f*magSf, upper = nonOrthDeltaCoeffs*gammaMagSf, diag = negSumDiag; the corrector's off-diagonal -upper
+void ViscousCorrectors::rebuildLaplacian(const DeviceBuffer<scalar>& gammaC, DeviceBuffer<scalar>& diag,
+                                         DeviceBuffer<scalar>& negUpper, DeviceBuffer<scalar>& gammaF)
+{
+    gammaF.resize(nIF_);
+    gms_.resize(nIF_);
+    negUpper.resize(nIF_);
+    if (nIF_)
+    {
+        linearInterpKernel<<<blocksFor(nIF_), kTPB>>>(nIF_, dm_.owner.data(), dm_.nei.data(), dm_.w.data(),
+                                                      gammaC.data(), gammaF.data());
+        timesMagSfKernel<<<blocksFor(nIF_), kTPB>>>(nIF_, gammaF.data(), dm_.magSf.data(), gms_.data());
+        cudaCheck(cudaGetLastError(), "gammaMagSf");
+    }
+    deviceLaplacianGammaMagSf(dm_, gms_, diag, upper_, /*nonOrth=*/true);
+    if (nIF_)
+    {
+        negateKernel<<<blocksFor(nIF_), kTPB>>>(nIF_, upper_.data(), negUpper.data());
+        cudaCheck(cudaGetLastError(), "-upper");
+    }
+}
+
 void ViscousCorrectors::account(int k, const DeviceLduView& A, const DeviceBuffer<scalar>& x,
                                 const DeviceBuffer<scalar>& b, const DeviceBuffer<scalar>& rho,
                                 const DeviceBuffer<scalar>& iC, const DeviceBuffer<scalar>& bC,
@@ -276,11 +348,23 @@ ViscousCorrectors::ViscousCorrectors(const Case& cs, const DeviceMesh& dm, int c
     for (int k = 0; k < 3; ++k) valid_[k] = cs.sd.valid(k);
     mu_ = cs.gas.mu;
     alphaEff_ = gasAlphaEff(cs.gas);
-    for (std::size_t k = 0; k < cs.bUTransform.size(); ++k)
-        if (cs.bUTransform[k] == transformRotate)
-            throw std::runtime_error("brae rhoCentralFoam: a wedge patch with mu > 0. wedgeFvPatchField's snGrad "
-                                     "and gradient coefficients take cellT (wedgeFvPatchField.C); the viscous "
-                                     "correctors are not ported on wedge patches.");
+    // the wedge faces' cellT = faceT & faceT (wedgePolyPatch.C:127-128), for their snGrad (milestone H)
+    {
+        std::vector<tensor> ct(cs.bUR.size(), tensor{1, 0, 0, 0, 1, 0, 0, 0, 1});
+        for (std::size_t k = 0; k < cs.bUR.size(); ++k)
+            if (cs.bUTransform[k] == transformRotate)
+            {
+                const tensor& a = cs.bUR[k];
+                ct[k] = tensor{a.xx*a.xx + a.xy*a.yx + a.xz*a.zx, a.xx*a.xy + a.xy*a.yy + a.xz*a.zy,
+                               a.xx*a.xz + a.xy*a.yz + a.xz*a.zz, a.yx*a.xx + a.yy*a.yx + a.yz*a.zx,
+                               a.yx*a.xy + a.yy*a.yy + a.yz*a.zy, a.yx*a.xz + a.yy*a.yz + a.yz*a.zz,
+                               a.zx*a.xx + a.zy*a.yx + a.zz*a.zx, a.zx*a.xy + a.zy*a.yy + a.zz*a.zy,
+                               a.zx*a.xz + a.zy*a.yz + a.zz*a.zz};
+                wedge_ = true;
+            }
+        cellT_.copyFrom(ct);
+    }
+    sutherland_ = cs.gas.sutherland != 0;
     // the corrected schemes' explicit parts are exactly zero where every nonOrthCorrectionVector is: then skipped
     {
         const std::vector<scalar> cx = dm.corrVecX.host(), cy = dm.corrVecY.host(), cz = dm.corrVecZ.host();
@@ -293,6 +377,11 @@ ViscousCorrectors::ViscousCorrectors(const Case& cs, const DeviceMesh& dm, int c
     alphaF_.copyFrom(std::vector<scalar>(nIF_, alphaEff_));
     negMuB_.copyFrom(std::vector<scalar>(nB_, -mu_));
     negAlphaB_.copyFrom(std::vector<scalar>(nB_, -alphaEff_));
+    if (sutherland_)
+    {
+        alphaC_.resize(nC_);
+        alphaB_.resize(nB_);
+    }
     ones_.copyFrom(std::vector<scalar>(nC_, 1.0));
     onesB_.copyFrom(std::vector<scalar>(nB_, 1.0));
     // the two laplacians' matrices (gaussLaplacianScheme: gammaMagSf = interpolate(gamma)*magSf, upper =
@@ -342,6 +431,15 @@ void ViscousCorrectors::beginStep(const DeviceFields& F, const DeviceVectorBound
     copyD2D(U0_[2], F.Uz);
     copyD2D(e0_, F.e);
 
+    if (sutherland_)   // muEff = thermo.mu() as the last thermo.correct() left it: mu(T) of the T the step starts from
+    {
+        sutherlandKernel<<<blocksFor(nC_), kTPB>>>(nC_, cs_.gas, F.T.data(), muC_.data(), nullptr, nullptr, nullptr);
+        if (nB_)
+            sutherlandKernel<<<blocksFor(nB_), kTPB>>>(nB_, cs_.gas, F.TB.data(), muB_.data(), negMuB_.data(), nullptr,
+                                                        nullptr);
+        cudaCheck(cudaGetLastError(), "sutherland mu");
+        rebuildLaplacian(muC_, lapDiagU_, negUpperU_, muF_);
+    }
     // :218-219, tauMC = muEff*dev2(T(fvc::grad(U))): Gauss linear, packed [(d*3 + i)*nC + c] = d_d U_i, the patch
     // faces by gaussGrad::correctBoundaryConditions on U's stored patch values
     const DeviceBuffer<scalar>* vol[3] = {&F.Ux, &F.Uy, &F.Uz};
@@ -368,6 +466,7 @@ void ViscousCorrectors::solveU(DeviceFields& F, DeviceVectorBoundary& dbU, scala
     // symmetryPlane/symmetry/slip coefficients from U as it stands (basicSymmetry's gradientBoundaryCoeffs read the
     // patch-internal field when the matrix is built)
     deviceUpdateSymmetry(dbU, F.Ux, F.Uy, F.Uz);
+    if (wedge_) deviceUpdateWedge(dbU, F.Ux, F.Uy, F.Uz);   // wedgeFvPatchField's coefficients from U as it stands
     if (nonOrth_)   // the corrected scheme's explicit part needs grad(U_k) of this U
     {
         const DeviceBuffer<scalar>* vol[3] = {&F.Ux, &F.Uy, &F.Uz};
@@ -395,6 +494,7 @@ void ViscousCorrectors::solveU(DeviceFields& F, DeviceVectorBoundary& dbU, scala
                                                      src_[k].data());
         cudaCheck(cudaGetLastError(), "U corrector matrix");
         deviceBCLaplacianCoeffsFace(dbU.comp[k], negMuB_, iC_[k], bC_[k]);
+        if (wedge_) deviceWedgeLaplacianBC(dbU, k, negMuB_, F.Ux, F.Uy, F.Uz, bC_[k]);
         deviceFold(dm_, diagM_, src_[k], iC_[k], bC_[k], diagC_[k], b_[k]);
         A_[k] = deviceLduView(dm_, diagC_[k], negUpperU_, negUpperU_);
         deviceNormFactorInto(A_[k], *U[k], b_[k], ones_, dnf_[k]);
@@ -444,7 +544,7 @@ const DeviceBuffer<scalar>& ViscousCorrectors::divSigmaDotU(const DeviceFields& 
     for (int k = 0; k < 3; ++k) snGB_[k].resize(nB_);
     if (nB_)
     {
-        snGradPatchKernel<<<blocksFor(nB_), kTPB>>>(nB_, dm_.bndIsEmpty.data(), uKind_.data(), uR_.data(),
+        snGradPatchKernel<<<blocksFor(nB_), kTPB>>>(nB_, dm_.bndIsEmpty.data(), uKind_.data(), uR_.data(), cellT_.data(),
                                                     bCell_.data(), dbU.comp[0].deltaCoeffs.data(),
                                                     dbU.comp[0].bcType.data(), dbU.comp[1].bcType.data(),
                                                     dbU.comp[2].bcType.data(), F.Ux.data(), F.Uy.data(),
@@ -457,7 +557,8 @@ const DeviceBuffer<scalar>& ViscousCorrectors::divSigmaDotU(const DeviceFields& 
     sigmaB_.resize(nB_);
     if (nIF_)
     {
-        sigmaInternalKernel<<<blocksFor(nIF_), kTPB>>>(nIF_, mu_, dm_.magSf.data(), snG_[0].data(), snG_[1].data(),
+        sigmaInternalKernel<<<blocksFor(nIF_), kTPB>>>(nIF_, mu_, sutherland_ ? muF_.data() : nullptr, dm_.magSf.data(),
+                                                       snG_[0].data(), snG_[1].data(),
                                                        snG_[2].data(), tau ? dTau_[0].data() : nullptr,
                                                        tau ? dTau_[1].data() : nullptr, tau ? dTau_[2].data() : nullptr,
                                                        X.aUx.data(), X.aUy.data(), X.aUz.data(), sigma_.data());
@@ -465,7 +566,8 @@ const DeviceBuffer<scalar>& ViscousCorrectors::divSigmaDotU(const DeviceFields& 
     }
     if (nB_)
     {
-        sigmaPatchKernel<<<blocksFor(nB_), kTPB>>>(nB_, mu_, dm_.bndIsEmpty.data(), dm_.bndGFace.data(),
+        sigmaPatchKernel<<<blocksFor(nB_), kTPB>>>(nB_, mu_, sutherland_ ? muB_.data() : nullptr, dm_.bndIsEmpty.data(),
+                                                   dm_.bndGFace.data(),
                                                    dm_.magSf.data(), snGB_[0].data(), snGB_[1].data(),
                                                    snGB_[2].data(), tau ? dTauB_[0].data() : nullptr,
                                                    tau ? dTauB_[1].data() : nullptr, tau ? dTauB_[2].data() : nullptr,
@@ -478,6 +580,15 @@ const DeviceBuffer<scalar>& ViscousCorrectors::divSigmaDotU(const DeviceFields& 
 
 void ViscousCorrectors::solveE(DeviceFields& F, const DeviceBoundary& dbT, scalar rDeltaT, StepReport& rep)
 {
+    if (sutherland_)   // alphaEff = thermo.alphahe() after the first thermo.correct() of the step (:266)
+    {
+        sutherlandKernel<<<blocksFor(nC_), kTPB>>>(nC_, cs_.gas, F.T.data(), nullptr, nullptr, alphaC_.data(), nullptr);
+        if (nB_)
+            sutherlandKernel<<<blocksFor(nB_), kTPB>>>(nB_, cs_.gas, F.TB.data(), nullptr, nullptr, alphaB_.data(),
+                                                        negAlphaB_.data());
+        cudaCheck(cudaGetLastError(), "sutherland alphahe");
+        rebuildLaplacian(alphaC_, lapDiagE_, negUpperE_, alphaF_);
+    }
     deviceEulerFvmDdtRho(rDeltaT, F.rho, rho0_, e0_, dm_.V, diagD_, srcE_);
     deviceEulerFvcDdtRhoSub(rDeltaT, F.rho, F.e, rho0_, e0_, dm_.V, srcE_);
     const scalar* corr = nullptr;
@@ -498,7 +609,8 @@ void ViscousCorrectors::solveE(DeviceFields& F, const DeviceBoundary& dbT, scala
     bCe_.resize(nB_);
     if (nB_)
     {
-        energyPatchCoeffsKernel<<<blocksFor(nB_), kTPB>>>(nB_, -alphaEff_, dm_.bndIsEmpty.data(), Tconstraint_.data(),
+        energyPatchCoeffsKernel<<<blocksFor(nB_), kTPB>>>(nB_, -alphaEff_, sutherland_ ? negAlphaB_.data() : nullptr,
+                                                          dm_.bndIsEmpty.data(), Tconstraint_.data(),
                                                           dbT.bcType.data(), dbT.magSf.data(), dbT.deltaCoeffs.data(),
                                                           F.eB.data(), iCe_.data(), bCe_.data());
         cudaCheck(cudaGetLastError(), "e patch coefficients");

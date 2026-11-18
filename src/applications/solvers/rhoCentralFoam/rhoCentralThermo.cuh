@@ -28,6 +28,9 @@ struct GasCoeffs
     scalar Hsref = 0;   // hConst Hsref_ (read as `Href`, hConstThermo.C:40)
     scalar mu    = 0;   // constTransport mu_ (milestone G: > 0 runs the viscous correctors)
     scalar rPr   = 0;   // constTransport rPr_ = 1.0/Pr (constTransport.C:38)
+    int    sutherland = 0;   // transport sutherland (milestone H): mu(T) from As, Ts
+    scalar As    = 0;
+    scalar Ts    = 0;
 };
 
 // perfectGas::Cp = 0, so hConst Cp(p, T) = Cp_ + 0
@@ -56,6 +59,19 @@ BRAE_HD inline scalar gasGamma(const GasCoeffs& g)
 BRAE_HD inline scalar gasAlphaEff(const GasCoeffs& g)
 {
     return gasGamma(g)*(g.mu*g.rPr);
+}
+// sutherlandTransportI.H:114-143 (milestone H): mu = As*sqrt(T)/(1 + Ts/T); kappa = mu*Cv*(1.32 + 1.77*R/Cv) (the
+// modified Eucken correlation; Pr is not read); alphah = kappa/Cp. Cv = Cp - R (hConst on a perfectGas).
+BRAE_HD inline scalar gasSutherlandMu(scalar T, const GasCoeffs& g)
+{
+    return g.As*sqrt(T)/(1.0 + g.Ts/T);
+}
+// thermo.alphahe() = CpByCpv*alphah at a cell or face of temperature T (sutherland), heThermo.C:809-813
+BRAE_HD inline scalar gasSutherlandAlphahe(scalar T, const GasCoeffs& g)
+{
+    const scalar Cv = gasCv(g);
+    const scalar kappa = gasSutherlandMu(T, g)*Cv*(1.32 + 1.77*g.R/Cv);
+    return gasGamma(g)*(kappa/gasCp(g));
 }
 // hConstThermoI.H:120: Cp_*(T - Tref_) + Hsref_ + EquationOfState::H(p, T), perfectGas H = 0
 BRAE_HD inline scalar gasHs(scalar /*p*/, scalar T, const GasCoeffs& g)

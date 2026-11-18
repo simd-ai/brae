@@ -82,6 +82,13 @@ struct Case
     // solves' controls; gas.mu and gas.rPr carry the transport, gasAlphaEff(gas) the e equation's diffusivity
     bool                viscous = false;
     SmoothSolveControls solveU, solveE;
+
+    // the nozzle boundaries (milestone H), as flat boundary-face lists with their per-face references: totalPressure
+    // (the psi form) and waveTransmissive on p, totalTemperature on T. The CUDA arm runs them; the host reference
+    // refuses them.
+    std::vector<label>  tpFaces, wtFaces, ttFaces;
+    std::vector<scalar> tpP0, tpGamma, wtFieldInf, wtLInf, wtGamma, ttT0, ttGamma;
+    bool nozzleBoundaries() const { return !tpFaces.empty() || !wtFaces.empty() || !ttFaces.empty(); }
 };
 
 // Reads and checks the case; refuses everything outside this stage's scope by name, before any field is read.

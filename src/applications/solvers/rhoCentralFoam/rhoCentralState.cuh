@@ -77,6 +77,12 @@ enum StatusBits : int
 //   noTauMC              viscous runs: tauMC left out -- fvc::div(tauMC) from the U corrector and Sf & tauMC from
 //                        sigmaDotU (rhoCentralFoam.C:240, 250) (milestone G)
 //   noSigmaDotU          viscous runs: - fvc::div(sigmaDotU) left out of the rhoE equation (rhoCentralFoam.C:258-263)
+//   noDynamicHead        totalPressure and totalTemperature without the dynamic head: p_b = p0, T_b = T0 on inflow too
+//   nozzleFlowInverted   totalPressure and totalTemperature switched on -phi: the dynamic head on outflow, none on inflow
+//   waveNoRelax          waveTransmissive without its far-field relaxation (lInf ignored: k = 0)
+//   waveVolumeFlux       waveTransmissive's wave speed from phi as if it were a volume flux (not divided by rho_b)
+//   totalTemperatureOnce viscous runs: totalTemperature evaluated once a step (e.correctBoundaryConditions(), :265), not
+//                        again at the e matrix's construction (fixedEnergy::updateCoeffs -> Tw.evaluate())
 enum Control : int
 {
     controlNone = 0,
@@ -97,7 +103,12 @@ enum Control : int
     controlLimiterVanLeer = 15,
     controlLimiterScalarOnV = 16,
     controlNoTauMC = 17,
-    controlNoSigmaDotU = 18
+    controlNoSigmaDotU = 18,
+    controlNoDynamicHead = 19,
+    controlNozzleFlowInverted = 20,
+    controlWaveNoRelax = 21,
+    controlWaveVolumeFlux = 22,
+    controlTotalTemperatureOnce = 23
 };
 
 } // namespace rhoCentral

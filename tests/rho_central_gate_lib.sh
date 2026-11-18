@@ -296,3 +296,38 @@ sys.exit(0 if len(b) == 5 and len(r) == 5 and all(x <= y for x, y in zip(b, r)) 
     done
     if [ -z "$bad" ]; then ok "$d stable: rho, p, T positive and finite at all $(times "$W/$d" | wc -w) write times"; else fail "$d: non-positive or NaN at$bad"; fi
 }
+
+# vbalance <brae dir>: a viscous run's momentum and energy balance once the correctors' unconserved remainder,
+# deltaT*sum(b - A x), is counted, within `diag roundoff` (milestones G and H: the viscous gates' SOLVE-CONSERVATION)
+vbalance()
+{
+    local d=$1 bal res rnd
+    bal=$(sed -n 's/^diag balance mass [^ ]* energy \([^ ]*\) momentum \([^ ]*\) \([^ ]*\) \([^ ]*\) .*/\1 \2 \3 \4/p' "$W/$d/log")
+    res=$(sed -n 's/^diag solve-residual momentum \([^ ]*\) \([^ ]*\) \([^ ]*\) energy \([^ ]*\) .*/\4 \1 \2 \3/p' "$W/$d/log")
+    rnd=$(sed -n 's/^diag roundoff mass [^ ]* energy \([^ ]*\) momentum \([^ ]*\) \([^ ]*\) \([^ ]*\) .*/\1 \2 \3 \4/p' "$W/$d/log")
+    local sums
+    sums=$(python3 -c "
+b = [float(x) for x in '$bal'.split()]; r = [float(x) for x in '$res'.split()]
+print(' '.join('%.3e' % (x + y) for x, y in zip(b, r)) if len(b) == 4 and len(r) == 4 else '')" 2> /dev/null)
+    if python3 -c "
+import sys
+s = [abs(float(x)) for x in '$sums'.split()]; q = [float(x) for x in '$rnd'.split()]
+sys.exit(0 if len(s) == 4 and len(q) == 4 and all(x <= y for x, y in zip(s, q)) else 1)" 2> /dev/null
+    then ok "$d conserves energy and momentum to round-off once the solves' remainder is counted: balance + deltaT*sum(b - A x) = $sums (energy, momentum x y z) within $rnd; the remainder itself $res"
+    else fail "$d solve-conservation: balance '$bal' + remainder '$res' = '$sums' against round-off '$rnd'"; fi
+}
+
+# identity <brae dir>: every U and e solve satisfies sum_c rho V (x - x_p) = deltaT*(its patch fluxes [+ Sf & tauMC_b]
+# - sum(b - A x)) to within 1e-12 of sum_c rho V |U| (|e|) (`diag solve-identity`); the remainders reported
+identity()
+{
+    local d=$1 id
+    id=$(sed -n 's/^diag solve-identity momentum \([^ ]*\) \([^ ]*\) \([^ ]*\) energy \([^ ]*\) .*/\1 \2 \3 \4/p' "$W/$d/log")
+    if python3 -c "
+import sys
+v = [float(x) for x in '$id'.split()]
+sys.exit(0 if len(v) == 4 and max(v) <= 1e-12 else 1)" 2> /dev/null
+    then ok "$d: every solve satisfies its conservation identity, largest error $(echo $id | tr ' ' '\n' | sort -g | tail -n 1) of sum rho V |U| (|e|) (momentum x y z, energy: $id; bound 1e-12)"
+    else fail "$d: solve identity '${id:-none}' above 1e-12"; fi
+    echo "     $d remainders: $(sed -n 's/^diag solve-residual momentum \(.*\) (deltaT.*/signed momentum \1/p' "$W/$d/log"); $(sed -n 's/^diag solve-residual-l1 momentum \(.*\) (deltaT.*/unsigned momentum \1/p' "$W/$d/log")"
+}

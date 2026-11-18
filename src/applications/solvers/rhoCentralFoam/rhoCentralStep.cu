@@ -194,6 +194,19 @@ __global__ void patchKernel(int nB, int slot, GasCoeffs gas, int ctrl, const lab
     if (b.status) atomicOr(&status[slot], b.status);
 }
 
+// fixedEnergy::updateCoeffs on a totalTemperature face at the e matrix's construction (milestone H): Tw.evaluate() has
+// just re-evaluated T_b (refValue), and he_b = thermo.he(p_b, T_b). Nothing else moves: T_b's own slot, psi_b and alpha_b
+// keep the first thermo.correct()'s until the correct after the solve.
+__global__ void fixedEnergyFaceKernel(int n, const label* __restrict__ faces, GasCoeffs gas,
+                                      const scalar* __restrict__ Tref, const scalar* __restrict__ pB,
+                                      scalar* __restrict__ eB)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const label k = faces[i];
+    eB[k] = gasEs(pB[k], Tref[k], gas);
+}
+
 // the control inletOutletInverted: the switch fed -phi
 __global__ void negateKernel(int n, const scalar* __restrict__ a, scalar* __restrict__ b)
 {
@@ -394,6 +407,20 @@ public:
 
         // the patch fields, through brae's device boundary (the same flat layout: no coupled patch is accepted)
         dbU_ = buildDeviceVectorBoundary(pf.U, cs.patches, cs.g);
+        // U's inletOutlet faces start with the switch OFF: OpenFOAM's dictionary constructor sets valueFraction 0
+        // (inletOutletFvPatchField.C) and nothing updates U's patches before :218's fvc::grad(U), whose patch
+        // correction takes the mixed snGrad, refGrad = 0 there. The shared builder seeds the face fixedValue(inletValue)
+        // because its other callers switch before any read; here tauMC is the one read that comes first (milestone H,
+        // measured on LadenburgJet60psi's outlet: 3.96e-06 m/s in the 20 outlet cells at step one, 0 with this).
+        if (cs.ioU)
+            for (int c = 0; c < 3; ++c)
+            {
+                std::vector<label> ty = dbU_.comp[c].bcType.host();
+                const std::vector<label> io = dbU_.comp[c].ioMask.host();   // U's own inletOutlet faces
+                for (label k = 0; k < nB; ++k)
+                    if (io[k]) ty[k] = 0;
+                dbU_.comp[c].bcType.copyFrom(ty);
+            }
         dbP_ = buildDeviceBoundary(pf.p, cs.patches, cs.g);
         dbT_ = buildDeviceBoundary(pf.T, cs.patches, cs.g);
         if (dbP_.n != nB || dbT_.n != nB || dbU_.comp[0].n != nB)
@@ -402,6 +429,30 @@ public:
             std::vector<int> fx(nB);
             for (label k = 0; k < nB; ++k) fx[k] = pf.T.boundary[cs.bPatch[k]]->fixesValue() ? 1 : 0;
             TfixesValue_.copyFrom(fx);
+        }
+        if (cs.nozzleBoundaries())   // milestone H: the nozzle boundaries' faces, references and controls
+        {
+            tpFaces_.copyFrom(cs.tpFaces);
+            tpP0_.copyFrom(cs.tpP0);
+            tpGamma_.copyFrom(cs.tpGamma);
+            ttFaces_.copyFrom(cs.ttFaces);
+            ttT0_.copyFrom(cs.ttT0);
+            ttGamma_.copyFrom(cs.ttGamma);
+            wtFaces_.copyFrom(cs.wtFaces);
+            wtFieldInf_.copyFrom(cs.wtFieldInf);
+            std::vector<scalar> li = cs.wtLInf;
+            if (control_ == controlWaveNoRelax) for (scalar& v : li) v = -1;
+            wtLInf_.copyFrom(li);
+            wtGamma_.copyFrom(cs.wtGamma);
+            if (!cs.wtFaces.empty())   // waveTransmissive is advective's MIXED face: bcType 5, refGrad 0
+            {
+                std::vector<label> ty = dbP_.bcType.host();
+                for (label k : cs.wtFaces) ty[k] = 5;
+                dbP_.bcType.copyFrom(ty);
+                pBold_.resize(nB);
+            }
+            zeroB_.copyFrom(std::vector<scalar>(nB, 0.0));
+            phiInv_.resize(nB);
         }
         bCell_.copyFrom(cs.bCell);
         uTransform_.copyFrom(cs.bUTransform);
@@ -443,6 +494,7 @@ public:
         const Case& cs = cs_;
         DeviceFields& F = F_;
         const int nC = cs.nC, nB = cs.nB;
+        keepOldPressureBoundary();
 
         centralFluxes(dm_, cs, control_, F, X_, outflow_.data(), deltaT);
 
@@ -465,6 +517,7 @@ public:
             deviceBCValue(dbU_.comp[1], F.Uy, F.UyB);
             deviceBCValue(dbU_.comp[2], F.Uz, F.UzB);
             // :265, Tw.evaluate() on the cells' old T, before thermo.correct() (the control: on the new)
+            updateTotalTemperature();
             deviceBCValue(dbT_, control_ == controlInletOutletNewT ? F.T : Told_, TbEval_);
             const PatchState B{F.rhoB.data(), F.rhoUxB.data(), F.rhoUyB.data(), F.rhoUzB.data(), F.rhoEB.data(),
                                F.eB.data(), F.TB.data(), F.psiB.data(), F.UxB.data(), F.UyB.data(), F.UzB.data(),
@@ -475,6 +528,7 @@ public:
                                                  F.e.data(), B, X, status_.data(), X_.phiB.data(), ioFace_.data(),
                                                  ioCount_.data());
             cudaCheck(cudaGetLastError(), "rhoCentral patches");
+            updatePressureBoundaries(deltaT);
             deviceBCValue(dbP_, F.p, F.pB);             // :287
             rhoBKernel<<<blocksFor(nB), kTPB>>>(nB, F.psiB.data(), F.pB.data(), F.rhoB.data());   // :288
             cudaCheck(cudaGetLastError(), "rhoCentral rho_b");
@@ -483,6 +537,46 @@ public:
         cudaCheck(cudaGetLastError(), "rhoCentral courant");
         deltaT_[pending_] = deltaT;
         ++pending_;
+    }
+
+    // ---- the nozzle boundaries (milestone H), where OpenFOAM's updateCoeffs runs -----------------------------------
+    // waveTransmissive reads p.oldTime().boundaryField(): the patch values as the step starts
+    void keepOldPressureBoundary()
+    {
+        if (cs_.wtFaces.empty()) return;
+        cudaCheck(cudaMemcpyAsync(pBold_.data(), F_.pB.data(), cs_.nB*sizeof(scalar), cudaMemcpyDeviceToDevice,
+                                  cudaStreamPerThread), "p_b old");
+    }
+    // the flux the total conditions switch on (the control nozzleFlowInverted: -phi), the velocity whose dynamic head
+    // they take (the control noDynamicHead: none)
+    const DeviceBuffer<scalar>& nozzlePhi()
+    {
+        if (control_ != controlNozzleFlowInverted) return X_.phiB;
+        negateKernel<<<blocksFor(cs_.nB), kTPB>>>(cs_.nB, X_.phiB.data(), phiInv_.data());
+        cudaCheck(cudaGetLastError(), "rhoCentral -phi (nozzle)");
+        return phiInv_;
+    }
+    // totalTemperature: Tw.evaluate() inside e.correctBoundaryConditions() -- this step's phi, U_b, the psi_b as it is
+    void updateTotalTemperature()
+    {
+        if (cs_.ttFaces.empty()) return;
+        const bool head = (control_ != controlNoDynamicHead);
+        deviceUpdateTotalTemperature(dbT_, ttFaces_, ttT0_, ttGamma_, nozzlePhi(), head ? F_.UxB : zeroB_,
+                                     head ? F_.UyB : zeroB_, head ? F_.UzB : zeroB_, F_.psiB);
+    }
+    // :287 p.correctBoundaryConditions(): totalPressure on this step's phi, U_b and the corrected psi_b;
+    // waveTransmissive on p_b.oldTime, phi/rho_b (rho_b not yet updated, :288) and psi_b
+    void updatePressureBoundaries(scalar deltaT)
+    {
+        if (!cs_.tpFaces.empty())
+        {
+            const bool head = (control_ != controlNoDynamicHead);
+            deviceUpdateTotalPressurePsi(dbP_, tpFaces_, tpP0_, tpGamma_, nozzlePhi(), head ? F_.UxB : zeroB_,
+                                         head ? F_.UyB : zeroB_, head ? F_.UzB : zeroB_, F_.psiB);
+        }
+        if (!cs_.wtFaces.empty())
+            deviceUpdateWaveTransmissive(dbP_, wtFaces_, wtFieldInf_, wtLInf_, wtGamma_, pBold_, X_.phiB, F_.rhoB,
+                                         F_.psiB, deltaT, control_ != controlWaveVolumeFlux);
     }
 
     // :195's phi decides every inletOutlet face of U, T and p before its evaluation (inletOutletFvPatchField::
@@ -533,11 +627,15 @@ public:
 
     // e.correctBoundaryConditions() (Tw.evaluate() on the cells' T given), thermo.correct()'s patch half, rhoU_b and
     // rhoE_b: what the inviscid step does after its cell kernel
-    void patchUpdate(const DeviceBuffer<scalar>& Tcells)
+    // totalT: Tw.evaluate() runs (e.correctBoundaryConditions() with e's patches not yet updated). After the e solve
+    // it does not: the matrix's construction left them updated(), so the solve's correctBoundaryConditions() only
+    // evaluates (fvPatchField::evaluate), and T_b stays the construction's.
+    void patchUpdate(const DeviceBuffer<scalar>& Tcells, bool totalT = true)
     {
         const int nB = cs_.nB;
         if (!nB) return;
         DeviceFields& F = F_;
+        if (totalT) updateTotalTemperature();
         deviceBCValue(dbT_, Tcells, TbEval_);
         const PatchState B{F.rhoB.data(), F.rhoUxB.data(), F.rhoUyB.data(), F.rhoUzB.data(), F.rhoEB.data(),
                            F.eB.data(), F.TB.data(), F.psiB.data(), F.UxB.data(), F.UyB.data(), F.UzB.data(),
@@ -559,6 +657,7 @@ public:
         const scalar rDeltaT = 1.0/deltaT;
         StepReport& rep = solveRep_[pending_];
         rep = StepReport{};
+        keepOldPressureBoundary();
 
         centralFluxes(dm_, cs, control_, F, X_, outflow_.data(), deltaT);   // :102-210
         vis_->beginStep(F, dbU_);                                            // :218-219, the old fields
@@ -582,12 +681,23 @@ public:
                                               status_.data());                // :258-266
         cudaCheck(cudaGetLastError(), "rhoCentral energy");
         patchUpdate(control_ == controlInletOutletNewT ? F.T : Told_);        // :265-271
+        // fvMatrix's constructor updates e's patches (fixedEnergy::updateCoeffs -> Tw.evaluate()) on the psi_b the first
+        // thermo.correct() left: a totalTemperature face's T_b moves, and its he_b with it
+        if (!cs.ttFaces.empty() && control_ != controlTotalTemperatureOnce)
+        {
+            updateTotalTemperature();
+            const int n = static_cast<int>(cs.ttFaces.size());
+            fixedEnergyFaceKernel<<<blocksFor(n), kTPB>>>(n, ttFaces_.data(), cs.gas, dbT_.refValue.data(), F.pB.data(),
+                                                          F.eB.data());
+            cudaCheck(cudaGetLastError(), "fixedEnergy (totalTemperature)");
+        }
         vis_->solveE(F, dbT_, rDeltaT, rep);                                  // :273-277
-        patchUpdate(F.T);                                                     // the solve's e.correctBC, :278-280
+        patchUpdate(F.T, false);                                              // the solve's e.correctBC, :278-280
         thermoPressureKernel<<<blocksFor(nC), kTPB>>>(nC, pending_, cs.gas, S, status_.data());   // :278-286
         cudaCheck(cudaGetLastError(), "rhoCentral thermo, p");
         if (nB)
         {
+            updatePressureBoundaries(deltaT);
             deviceBCValue(dbP_, F.p, F.pB);                                   // :287
             rhoBKernel<<<blocksFor(nB), kTPB>>>(nB, F.psiB.data(), F.pB.data(), F.rhoB.data());   // :288
             cudaCheck(cudaGetLastError(), "rhoCentral rho_b");
@@ -730,6 +840,8 @@ private:
     bool lagPrimed_ = false;
     DeviceBuffer<scalar> Told_, TbEval_, coCell_;
     std::unique_ptr<ViscousCorrectors> vis_;   // mu > 0 (milestone G)
+    DeviceBuffer<label> tpFaces_, ttFaces_, wtFaces_;   // the nozzle boundaries (milestone H)
+    DeviceBuffer<scalar> tpP0_, tpGamma_, ttT0_, ttGamma_, wtFieldInf_, wtLInf_, wtGamma_, pBold_, zeroB_, phiInv_;
     DeviceBuffer<scalar> divPhiEp_;
     DeviceBuffer<double> visIn_;
     StepReport solveRep_[kReportWindow];

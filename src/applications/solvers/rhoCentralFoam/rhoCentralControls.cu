@@ -155,12 +155,39 @@ std::vector<std::string> checkPatchFieldTypes(const FieldData<T>& fd, const std:
                 refuse(field + " patch '" + p.name + "' is `" + type + "` on a mesh patch of type `" + p.type
                        + "`; OpenFOAM requires the two to be the same for empty, symmetryPlane, symmetry and wedge.");
         }
-        else if (type != "zeroGradient" && type != "fixedValue" && type != "slip" && type != "inletOutlet")
+        else if (type != "zeroGradient" && type != "fixedValue" && type != "slip" && type != "inletOutlet"
+                 && !(field == "U" && type == "noSlip")
+                 && !(field == "p" && (type == "totalPressure" || type == "waveTransmissive"))
+                 && !(field == "T" && type == "totalTemperature"))
             refuse(field + " patch '" + p.name + "' is `" + type + "`. This stage runs zeroGradient, fixedValue, "
-                   "slip, inletOutlet, symmetryPlane, symmetry, wedge and empty on U, p and T; totalPressure, "
-                   "totalTemperature, waveTransmissive, partialSlip, outletInlet, maxwellSlipU, smoluchowskiJumpT and "
-                   "the rest are not ported (applications/solvers/compressible/rhoCentralFoam/BCs, "
-                   "src/finiteVolume/fields/fvPatchFields). Refusing rather than run the patch as something else.");
+                   "slip, inletOutlet, symmetryPlane, symmetry, wedge and empty on U, p and T, noSlip on U, "
+                   "totalPressure and waveTransmissive on p and totalTemperature on T; partialSlip, outletInlet, "
+                   "maxwellSlipU, smoluchowskiJumpT and the rest are not ported (applications/solvers/compressible/"
+                   "rhoCentralFoam/BCs, src/finiteVolume/fields/fvPatchFields). Refusing rather than run the patch as "
+                   "something else.");
+        // the nozzle boundaries (milestone H): the forms ported, everything else of theirs refused by name
+        if (type == "totalPressure" || type == "totalTemperature" || type == "waveTransmissive")
+        {
+            const std::string w = field + " patch '" + p.name + "' is `" + type + "`";
+            if (d->psiName != "thermo:psi")
+                refuse(w + " with psi `" + d->psiName + "`. This stage ports the isentropic form on rhoCentralFoam's "
+                       "thermo:psi (" + (type == "totalPressure" ? "totalPressureFvPatchScalarField.C, psi branch; the "
+                       "rho and incompressible forms are not ported" : "its only form") + ").");
+            if (d->phiName != "phi")
+                refuse(w + " on `phi " + d->phiName + "`; this stage switches on rhoCentralFoam's mass flux `phi`.");
+            if (type != "waveTransmissive" && !(d->hasInletValue && !d->totalRefKey.empty()))
+                refuse(w + " without its `" + std::string(type == "totalPressure" ? "p0" : "T0") + "` (OpenFOAM "
+                       "requires it).");
+            if (type == "waveTransmissive")
+            {
+                if (!d->advFieldName.empty() && d->advFieldName != "p")
+                    refuse(w + " on field `" + d->advFieldName + "`; this stage ports waveTransmissive on p.");
+                if (d->flowRateRhoName != "rho")
+                    refuse(w + " with rho `" + d->flowRateRhoName + "`; this stage divides phi by rhoCentralFoam's rho.");
+                if (d->advLInf > 0 && !d->hasAdvFieldInf)
+                    refuse(w + " with lInf and no fieldInf (advectiveFvPatchField.C requires fieldInf with lInf).");
+            }
+        }
         if (type == "inletOutlet")
         {
             // inletOutletFvPatchField.C:59-83: refValue from the mandatory `inletValue`; the switch reads the
@@ -405,7 +432,7 @@ Case readRhoCentralCase(const std::string& caseDir)
         const struct { const char* key; const char* want; const char* why; } need[] = {
             {"type", "hePsiThermo", "rhoCentralFoam builds a psiThermo (createFields.H); hePsiThermo is the one ported"},
             {"mixture", "pureMixture", "multi-species mixtures are not ported"},
-            {"transport", "const", "sutherland's mu(T) is not ported; the viscous correctors run with a constant mu"},
+            {"transport", "const|sutherland", "const and sutherland transport are ported (milestones G and H)"},
             {"thermo", "hConst", "janaf (biconic25-55Run35) and eConst are not ported"},
             {"equationOfState", "perfectGas", "the psi = 1/(R T) equation of state is the one ported"},
             {"specie", "specie", "the specie model"},
@@ -414,6 +441,7 @@ Case readRhoCentralCase(const std::string& caseDir)
         for (const auto& n : need)
         {
             const std::string v = tt->wordOr(n.key, "");
+            if (std::string(n.key) == "transport" && (v == "const" || v == "sutherland")) continue;
             if (v != n.want)
                 refuse(std::string("thermoType ") + n.key + " is `" + v + "`; this stage ports `" + n.want + "` ("
                        + n.why + ").");
@@ -430,6 +458,21 @@ Case readRhoCentralCase(const std::string& caseDir)
         cs.gas.Tref  = th->scalarOr("Tref", foamTstd());   // hConstThermo.C:40
         cs.gas.Hsref = th->scalarOr("Href", 0);            // hConstThermo.C:41 reads Hsref_ from `Href`
         if (!(cs.gas.Cp > cs.gas.R)) refuse("mixture Cp must exceed R (Cv = Cp - R must be positive).");
+        if (tt->wordOr("transport", "") == "sutherland")
+        {
+            // sutherlandTransport.C: As and Ts (Pr is not read); mu(T) > 0 everywhere, so createFieldRefs.H's
+            // inviscid is false: the viscous correctors run (milestone H)
+            if (!tr->found("As") || !tr->found("Ts"))
+                refuse("thermophysicalProperties mixture.transport (sutherland) needs As and Ts (sutherlandTransport.C).");
+            cs.gas.sutherland = 1;
+            cs.gas.As = tr->scalarOr("As", 0);
+            cs.gas.Ts = tr->scalarOr("Ts", 0);
+            if (!(cs.gas.As > 0) || cs.gas.Ts < 0)
+                refuse("sutherland As must be positive and Ts not negative.");
+            cs.viscous = true;
+        }
+        else
+        {
         if (!tr->found("mu") || !tr->found("Pr"))
             refuse("thermophysicalProperties mixture.transport needs mu and Pr (constTransport.C:37-38 reads both).");
         const scalar mu = tr->scalarOr("mu", -1);
@@ -441,6 +484,7 @@ Case readRhoCentralCase(const std::string& caseDir)
         // sigmaDotU (rhoCentralFoam.C:234-244, 246-256, 273-282), milestone G
         cs.viscous = mu > 0;
         if (cs.viscous && !(Pr > 0)) refuse("transport Pr is " + std::to_string(Pr) + "; alphah = mu/Pr needs Pr > 0.");
+        }
     }
     if (cs.viscous) readViscousControls(caseDir, cs);
 
@@ -493,6 +537,8 @@ Case readRhoCentralCase(const std::string& caseDir)
     const std::vector<std::string> Utypes = checkPatchFieldTypes(readField<vector>(dir + "/U"), cs.patches, "U");
     const std::vector<std::string> ptypes = checkPatchFieldTypes(readField<scalar>(dir + "/p"), cs.patches, "p");
     const std::vector<std::string> Ttypes = checkPatchFieldTypes(readField<scalar>(dir + "/T"), cs.patches, "T");
+    const FieldData<scalar> pfd = readField<scalar>(dir + "/p");
+    const FieldData<scalar> Tfd = readField<scalar>(dir + "/T");
 
     // ---- the transform patches, face by face (rhoCentralPatchUpdate.cuh) -----------------------------------------------
     cs.bRhoConstraint.assign(cs.nB, 0);
@@ -534,6 +580,43 @@ Case readRhoCentralCase(const std::string& caseDir)
             catch (const std::exception& e)
             {
                 refuse(e.what());
+            }
+        }
+        // the nozzle boundaries' faces and their per-face references (milestone H)
+        {
+            auto ref = [](const PatchFieldData<scalar>* d, label i) {
+                return d->inletUniform ? d->inletUniformValue : d->inletValues[static_cast<std::size_t>(i)];
+            };
+            if (ptypes[pi] == "totalPressure")
+            {
+                const PatchFieldData<scalar>* d = findPatchEntry(pfd, p);
+                for (label i = 0; i < p.size; ++i)
+                {
+                    cs.tpFaces.push_back(k0 + i);
+                    cs.tpP0.push_back(ref(d, i));
+                    cs.tpGamma.push_back(d->gammaTP);
+                }
+            }
+            if (ptypes[pi] == "waveTransmissive")
+            {
+                const PatchFieldData<scalar>* d = findPatchEntry(pfd, p);
+                for (label i = 0; i < p.size; ++i)
+                {
+                    cs.wtFaces.push_back(k0 + i);
+                    cs.wtFieldInf.push_back(d->advFieldInf);
+                    cs.wtLInf.push_back(d->advLInf);
+                    cs.wtGamma.push_back(d->gammaTP);
+                }
+            }
+            if (Ttypes[pi] == "totalTemperature")
+            {
+                const PatchFieldData<scalar>* d = findPatchEntry(Tfd, p);
+                for (label i = 0; i < p.size; ++i)
+                {
+                    cs.ttFaces.push_back(k0 + i);
+                    cs.ttT0.push_back(ref(d, i));
+                    cs.ttGamma.push_back(d->gammaTP);
+                }
             }
         }
         const bool io[3] = {Ut == "inletOutlet", ptypes[pi] == "inletOutlet", Ttypes[pi] == "inletOutlet"};

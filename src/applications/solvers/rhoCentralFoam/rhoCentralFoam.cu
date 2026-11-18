@@ -125,8 +125,12 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
                         c.smoother.c_str(), c.nSweeps, logPrec, (double)c.tolerance, logPrec, (double)c.relTol,
                         c.maxIter, c.minIter);
         };
-        std::printf("viscous: mu %.*g, Pr %.*g, alphaEff %.*g (laminar, const transport)\n", logPrec,
-                    (double)cs.gas.mu, logPrec, (double)(1.0/cs.gas.rPr), logPrec, (double)gasAlphaEff(cs.gas));
+        if (cs.gas.sutherland)
+            std::printf("viscous: sutherland As %.*g, Ts %.*g (laminar)\n", logPrec, (double)cs.gas.As, logPrec,
+                        (double)cs.gas.Ts);
+        else
+            std::printf("viscous: mu %.*g, Pr %.*g, alphaEff %.*g (laminar, const transport)\n", logPrec,
+                        (double)cs.gas.mu, logPrec, (double)(1.0/cs.gas.rPr), logPrec, (double)gasAlphaEff(cs.gas));
         ctl("U", cs.solveU);
         ctl("e", cs.solveE);
     }
@@ -169,6 +173,24 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
         && cs.limU == kVanLeerTwoByk)
         throw std::runtime_error("BRAE_CONTROL_RCF limiterVanLeer is a control of the other limiters; this case "
                                  "reconstructs with vanLeer and vanLeerV already.");
+    if ((control == controlNoDynamicHead || control == controlNozzleFlowInverted) && cs.tpFaces.empty()
+        && cs.ttFaces.empty())
+        throw std::runtime_error("BRAE_CONTROL_RCF noDynamicHead and nozzleFlowInverted are controls of totalPressure and "
+                                 "totalTemperature; this case has neither.");
+    if ((control == controlWaveNoRelax || control == controlWaveVolumeFlux) && cs.wtFaces.empty())
+        throw std::runtime_error("BRAE_CONTROL_RCF waveNoRelax and waveVolumeFlux are controls of waveTransmissive; this "
+                                 "case has none.");
+    if (control == controlWaveNoRelax)
+    {
+        bool relaxes = false;
+        for (scalar l : cs.wtLInf) relaxes = relaxes || l > 0;
+        if (!relaxes)
+            throw std::runtime_error("BRAE_CONTROL_RCF waveNoRelax is a control of waveTransmissive's lInf; no patch of "
+                                     "this case sets one.");
+    }
+    if (control == controlTotalTemperatureOnce && (cs.ttFaces.empty() || !cs.viscous))
+        throw std::runtime_error("BRAE_CONTROL_RCF totalTemperatureOnce is a control of totalTemperature in a viscous "
+                                 "run (the e matrix's construction); this case has no such patch or no e corrector.");
     if (control == controlNoPurge && cs.purgeWrite <= 0)
         throw std::runtime_error("BRAE_CONTROL_RCF noPurge is a control of purgeWrite; this case's is 0.");
     if ((control == controlRestartIndexZero && clock.startTimeIndex() == 0)
@@ -195,6 +217,10 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
             throw std::runtime_error("brae rhoCentralFoam: the host reference arm (BRAE_RHOCENTRALFOAM_ARM=cpu) runs "
                                      "inviscid cases only; mu > 0 runs the viscous correctors, which milestone G "
                                      "ports on the CUDA arm.");
+        if (cs.nozzleBoundaries())
+            throw std::runtime_error("brae rhoCentralFoam: the host reference arm (BRAE_RHOCENTRALFOAM_ARM=cpu) does not "
+                                     "run totalPressure, totalTemperature or waveTransmissive; milestone H ports them on "
+                                     "the CUDA arm.");
         arm = cpu::rhoCentral::makeHostArm(cs, s, pf, patchControl ? control : controlNone);
     }
 

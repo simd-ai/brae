@@ -387,6 +387,32 @@ void deviceUpdateFlowRateInletDev(DeviceVectorBoundary& dbU, const DeviceBuffer<
 void deviceGatherPatchInternal(const DeviceBoundary& db, const DeviceBuffer<scalar>& cellField,
                                DeviceBuffer<scalar>& out);
 
+// Compressible inflow/outflow boundaries (rhoCentralFoam's nozzle boundaries, milestone H), each on a list of the
+// boundary's faces (flat indices into db) with its own per-face reference and gamma. They write those faces' refValue
+// (and, for the advective one, valueFraction), which deviceBCValue then evaluates as a fixedValue (bcType 1) or mixed
+// (bcType 5) face. Every product OpenFOAM's field algebra stores before it is used is rounded alone.
+//   totalPressureFvPatchScalarField::updateCoeffs, the psi (isentropic, high-speed) branch, totalPressure...C:
+//     gamma > 1:  p_b = p0/pow(1 + 0.5*psi_b*gM1ByG*neg(phi_b)*magSqr(U_b), 1/gM1ByG),  gM1ByG = (gamma - 1)/gamma
+//     else:       p_b = p0/(1 + 0.5*psi_b*neg(phi_b)*magSqr(U_b))
+//   totalTemperatureFvPatchScalarField::updateCoeffs:  T_b = T0/(1 + 0.5*psi_b*gM1ByG*neg(phi_b)*magSqr(U_b))
+//   waveTransmissiveFvPatchField / advectiveFvPatchField::updateCoeffs with Euler (or CrankNicolson):
+//     w = max(phi_b[/rho_b]/magSf + sqrt(gamma/psi_b), 0), alpha = w*deltaT*deltaCoeffs;
+//     lInf > 0: k = w*deltaT/lInf, refValue = (f_b,old + k*fieldInf)/(1 + k), valueFraction = (1 + k)/(1 + alpha + k)
+//     else:     refValue = f_b,old, valueFraction = 1/(1 + alpha)        (refGrad 0: advective's constructor)
+//   phiIsMass: phi is a mass flux (dimMass/dimTime), divided by rho_b first, as waveTransmissive's advectionSpeed does.
+void deviceUpdateTotalPressurePsi(DeviceBoundary& db, const DeviceBuffer<label>& faces, const DeviceBuffer<scalar>& p0,
+                                  const DeviceBuffer<scalar>& gamma, const DeviceBuffer<scalar>& phiB,
+                                  const DeviceBuffer<scalar>& Uxb, const DeviceBuffer<scalar>& Uyb,
+                                  const DeviceBuffer<scalar>& Uzb, const DeviceBuffer<scalar>& psiB);
+void deviceUpdateTotalTemperature(DeviceBoundary& db, const DeviceBuffer<label>& faces, const DeviceBuffer<scalar>& T0,
+                                  const DeviceBuffer<scalar>& gamma, const DeviceBuffer<scalar>& phiB,
+                                  const DeviceBuffer<scalar>& Uxb, const DeviceBuffer<scalar>& Uyb,
+                                  const DeviceBuffer<scalar>& Uzb, const DeviceBuffer<scalar>& psiB);
+void deviceUpdateWaveTransmissive(DeviceBoundary& db, const DeviceBuffer<label>& faces,
+                                  const DeviceBuffer<scalar>& fieldInf, const DeviceBuffer<scalar>& lInf,
+                                  const DeviceBuffer<scalar>& gamma, const DeviceBuffer<scalar>& fOldB,
+                                  const DeviceBuffer<scalar>& phiB, const DeviceBuffer<scalar>& rhoB,
+                                  const DeviceBuffer<scalar>& psiB, scalar deltaT, bool phiIsMass);
 void deviceUpdateTotalPressure(DeviceBoundary& db, const DeviceBuffer<scalar>& phiB, const DeviceBuffer<scalar>& Uxb,
                                const DeviceBuffer<scalar>& Uyb, const DeviceBuffer<scalar>& Uzb,
                                const DeviceBuffer<scalar>* rhoBnd = nullptr);   // compressible: rho at the face

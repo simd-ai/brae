@@ -14,6 +14,20 @@ namespace rhoCentral {
 
 using namespace brae::rhoCentral;
 
+// The nozzle boundaries the shared patch-field factory does not build (milestone H): totalTemperature,
+// waveTransmissive and totalPressure's isentropic (psi) form start as the fixedValue of their written `value` (OpenFOAM's dictionary constructors read it;
+// advective's mixed starts with valueFraction 0 and refValue = value, the same patch value). The CUDA arm recomputes
+// them each step where OpenFOAM's updateCoeffs runs (device_boundary.cuh: deviceUpdateTotalTemperature, and
+// deviceUpdateWaveTransmissive on a mixed face). The host reference arm refuses them.
+static FieldData<scalar> asBuilt(FieldData<scalar> fd)
+{
+    for (PatchFieldData<scalar>& e : fd.boundary)
+        if (e.type == "totalTemperature" || e.type == "waveTransmissive"
+            || (e.type == "totalPressure" && e.psiName != "none"))   // the shared class runs the rho/none forms only
+            e.type = "fixedValue";
+    return fd;
+}
+
 State createFields(const Case& cs, PatchFields& pf, int control)
 {
     const std::string dir = cs.caseDir + "/" + cs.startName;
@@ -21,8 +35,8 @@ State createFields(const Case& cs, PatchFields& pf, int control)
     State s;
 
     // the thermo reads p and T (basicThermo.C), U is read by createFields.H; each patch is evaluated on construction
-    pf.p = buildField(readField<scalar>(dir + "/p"), cs.patches, cs.nC);
-    pf.T = buildField(readField<scalar>(dir + "/T"), cs.patches, cs.nC);
+    pf.p = buildField(asBuilt(readField<scalar>(dir + "/p")), cs.patches, cs.nC);
+    pf.T = buildField(asBuilt(readField<scalar>(dir + "/T")), cs.patches, cs.nC);
     pf.U = buildField(readField<vector>(dir + "/U"), cs.patches, cs.nC);
     s.p = pf.p.internal;
     s.T = pf.T.internal;

@@ -2,7 +2,9 @@
 # OpenFOAM v2412 scotch partitions (GB10): of the runs milestones C and D report (2026-11-17), and shockTube1000 for
 # milestone F (2026-11-18); shear1000 (milestone G) is shockTube1000's partition, the same 1000 cells: the tube with its
 # y faces regrouped into a patch has shockTube1000's owner and neighbour and cell centres, only its boundary faces
-# differ, so its meshsum does; tests/rho_central_decomposition.py
+# differ, so its meshsum does; tests/rho_central_decomposition.py. LadenburgJet60psi for milestone H (2026-11-18), the
+# first scotch run on its mesh (300 cells each); milestone H's tube cases split shockTube1000's `sides` in its face
+# order and keep its meshsum, so its partition
 wedge15Ma5 4800 4 d05065a44673986eddbbce6409436859486f1fa694dcd8c51f2e55489aa1f791 0b74c9aafb5981ef2ddc07a0fb47490f5675795264dfc43cf25eb9fc4eeeb141
 cone 4800 4 a92dddebfd18e30f6d67c6977ea93a21177a4e642b4d243a34e07deb5eacbfce 96308d0fdbece1024c3c20798c531f24c572f3607f4db69f5092ae311e2a49a7
 obliqueShock 1800 4 622bebf8e2d445b1226a52000b83ee6d620542315c73ed66a044259c9f420bac 8e85f370f0c87231c8ef75f9fa3ae3c19de4ebc988a5ea79561eaff0d5b1e286
@@ -10,3 +12,4 @@ forwardStep 16128 4 92c9a28191feae9c5136f73e45f3797409b589dabcd4faa35a81f484dd60
 shockTube100 100 4 7458c6b33cce9e504eb2a9dd1641e4426c202d1f02669016b7bc6f07e0faa3ba 0c9366b30aef564171c5072b8fe1e7abd5e3d0b3d563fe2dbb912fdbcb446ff0
 shockTube1000 1000 4 508e3c7e5b835793fb1ae18f8c9be1878313fe5fbf997ee767de24040fd93331 d97c223d618798dfeff577b604f1ac6e14b16d59b5f59e97552166319073b8fa
 shear1000 1000 4 1b9b3c103728bb060127fcedc52af8acd644cd9a84879b0034936defc8f1149b d97c223d618798dfeff577b604f1ac6e14b16d59b5f59e97552166319073b8fa
+LadenburgJet60psi 1200 4 e9411b7373c40d028680b9092c53de3c8478a3e3ebd7620dbb9b470de87f8c55 e7fcdde3408d1f8be37283578932a1af449f0d7f6100ab1ec3d06d69a3f7cdeb

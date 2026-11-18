@@ -128,9 +128,28 @@ inline void writePatchEntry(
 {
     os << "    " << name << "\n    {\n";
     os << "        type            " << (d.type.empty() ? "zeroGradient" : d.type) << ";\n";
+    // rhoCentralFoam's nozzle boundaries (milestone H): totalPressure in its isentropic (psi) form, totalTemperature
+    // and waveTransmissive echo the entries OpenFOAM's readers require, under their own names, so OpenFOAM restarts
+    // from brae's output. Every other use keeps what it wrote before.
+    const bool totalPsi = (d.type == "totalPressure" && d.psiName != "none") || d.type == "totalTemperature";
+    if (totalPsi || d.type == "waveTransmissive")
+    {
+        if (d.type == "waveTransmissive" && !d.advFieldName.empty())
+            os << "        field           " << d.advFieldName << ";\n";
+        if (d.phiName != "phi") os << "        phi             " << d.phiName << ";\n";
+        if (d.type != "totalTemperature") os << "        rho             " << d.flowRateRhoName << ";\n";
+        os << "        psi             " << d.psiName << ";\n";
+        os << "        gamma           " << d.gammaTP << ";\n";
+        if (d.type == "waveTransmissive")
+        {
+            if (d.hasAdvFieldInf) os << "        fieldInf        " << d.advFieldInf << ";\n";
+            if (d.advLInf > -1e299) os << "        lInf            " << d.advLInf << ";\n";
+        }
+    }
     if (d.hasInletValue)
     {
-        os << "        inletValue      ";
+        os << "        " << ((totalPsi && !d.totalRefKey.empty()) ? d.totalRefKey + std::string(14 - d.totalRefKey.size(), ' ')
+                                                                   : std::string("inletValue      "));
         writeFieldValue(os, d.inletUniform, d.inletUniformValue, d.inletValues);
     }
     // fixedGradient's gradient is REQUIRED by OF's reader, not optional like value: omitting it made

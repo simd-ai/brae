@@ -62,12 +62,18 @@ int main(int argc, char** argv)
             else if (v == "limiterScalarOnV") control = controlLimiterScalarOnV;
             else if (v == "noTauMC") control = controlNoTauMC;
             else if (v == "noSigmaDotU") control = controlNoSigmaDotU;
+            else if (v == "noDynamicHead") control = controlNoDynamicHead;
+            else if (v == "nozzleFlowInverted") control = controlNozzleFlowInverted;
+            else if (v == "waveNoRelax") control = controlWaveNoRelax;
+            else if (v == "waveVolumeFlux") control = controlWaveVolumeFlux;
+            else if (v == "totalTemperatureOnce") control = controlTotalTemperatureOnce;
             else if (!v.empty())
                 throw std::runtime_error("BRAE_CONTROL_RCF is `" + v + "`; it takes upwind, noPressureJump, untrimmed, "
                                          "laggedCourant, noTransform, laggedRhoB, inletOutletInverted, laggedPhi, "
                                          "inletOutletNewT, noPurge, restartIndexZero, restartGridFromZero, "
-                                         "restartIoExtrapolate, noUniformTime, limiterVanLeer, limiterScalarOnV, noTauMC or "
-                                         "noSigmaDotU.");
+                                         "restartIoExtrapolate, noUniformTime, limiterVanLeer, limiterScalarOnV, noTauMC, "
+                                         "noSigmaDotU, noDynamicHead, nozzleFlowInverted, waveNoRelax, waveVolumeFlux or "
+                                         "totalTemperatureOnce.");
             if (control != controlNone)
                 std::fprintf(stderr, "brae rhoCentralFoam: NEGATIVE CONTROL `%s` -- deliberately wrong numerics\n", c);
         }
