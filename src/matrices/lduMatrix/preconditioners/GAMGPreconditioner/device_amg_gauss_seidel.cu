@@ -660,6 +660,19 @@ void hostSweep(
         psi[c] = psii;
     }
 }
+// BRAE_SOLVE_TRACE=<file>: a diagnostic, off by default. Every host-smoother solve writes each component's initial
+// residual and then its residual after each nSweeps block, at full precision ("trace <component> init <r>",
+// "trace <component> <sweeps> <r>") -- the residual history OpenFOAM's log does not print, for a comparison with an
+// instrumented copy of OpenFOAM's smoothSolver. It changes no arithmetic.
+static std::FILE* hostSolveTraceFile()
+{
+    static std::FILE* f = []() -> std::FILE*
+    {
+        const char* p = std::getenv("BRAE_SOLVE_TRACE");
+        return (p && *p) ? std::fopen(p, "w") : nullptr;
+    }();
+    return f;
+}
 void hostSymGaussSeidelFused(
     int nComp,
     const GSFusedComponent* comps,
@@ -804,6 +817,9 @@ void hostSymGaussSeidelFused(
         nActive += active[k];
         perf[k] = {init[k], init[k], 0};
     }
+    std::FILE* const trace = hostSolveTraceFile();
+    if (trace)
+        for (int k = 0; k < nComp; ++k) std::fprintf(trace, "trace %d init %.17g\n", k, init[k]);
     // ONE ACTIVE COMPONENT SWEEPS ON THE CALLING THREAD. A thread made for the sweep is a new task, and the
     // scheduler starts it on whichever core is free. MEASURED 2026-10-06 on interFoam's angledDuct (28,000
     // cells, 720 sweeps): 653 of them ran on the 2.8 GHz cores while the caller sat on a 4.0 GHz one, and the
@@ -899,6 +915,7 @@ void hostSymGaussSeidelFused(
             const int it = (iter[k] += sweepsPer);
             const scalar r = c.hRes[k];
             fin[k] = r;
+            if (trace) std::fprintf(trace, "trace %d %d %.17g\n", k, it, r);
             const bool converged = (r < tol) || (r < relTol * init[k]);
             const bool stop = (converged || (it >= maxIter)) && (it >= minIter);
             if (stop)

@@ -6,6 +6,7 @@
 
 #include "brae_time.cuh"
 #include "device_mesh.cuh"   // the limiter selectors
+#include "device_ldu.cuh"    // setDeviceResidualFused
 #include "purge_write.cuh"
 #include "run_clock.cuh"
 #include "time_dict_writer.cuh"
@@ -101,6 +102,16 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
 {
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
     setIOPrecision(controlDict.intOr("writePrecision", 6));
+    // The viscous solves' loop residual (lduMatrix::residual) rounded as the reference OpenFOAM build on this host
+    // architecture rounds it: GCC contracts its multiply-subtracts into fmsub on aarch64 (objdump of v2412's
+    // libOpenFOAM.so: three fmsub, no separate fmul/fsub), and x86-64's baseline has no FMA to contract into. Found in
+    // milestone I on reservoir_visc: with the products rounded apart, brae's GaussSeidel fixed points sat a median
+    // 12% above OpenFOAM's on the 20 e solves both ran to maxIter, and 4 solves stopped at another sweep.
+#if defined(__aarch64__)
+    setDeviceResidualFused(control != controlResidualUnfused);
+#else
+    setDeviceResidualFused(false);
+#endif
     const Case cs = readRhoCentralCase(caseDir);
     // brae's Time reads controlDict's `functions` and says which it does not run (none is registered here); the
     // loop runs on OpenFOAM's accumulating clock instead, whose deltaT their write times still trim (WriteCadence)

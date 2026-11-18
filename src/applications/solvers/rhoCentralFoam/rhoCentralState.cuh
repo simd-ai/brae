@@ -108,7 +108,10 @@ enum Control : int
     controlNozzleFlowInverted = 20,
     controlWaveNoRelax = 21,
     controlWaveVolumeFlux = 22,
-    controlTotalTemperatureOnce = 23
+    controlTotalTemperatureOnce = 23,
+    // milestone I: the viscous solves' loop residual rounded product by product (x86-64 OpenFOAM's form), where the
+    // reference, OpenFOAM's aarch64 build, fuses each multiply-subtract (rhoCentralFoam.cu)
+    controlResidualUnfused = 24
 };
 
 } // namespace rhoCentral

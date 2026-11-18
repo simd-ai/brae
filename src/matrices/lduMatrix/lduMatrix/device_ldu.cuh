@@ -254,6 +254,12 @@ void deviceResidual(
     bool onField = false);
 // ...and the control that puts source - A.psi back (BRAE_CONTROL_DEVICE_GS_RESIDUAL_AMUL)
 bool deviceResidualAsAmul();
+// deviceResidual's rounding: false (the default) rounds every product before it is subtracted, as OpenFOAM's x86-64
+// build does; true rounds each multiply-subtract once (fma), as OpenFOAM's aarch64 build does -- GCC contracts
+// lduMatrix::residual's three multiply-subtracts into fmsub there (objdump of libOpenFOAM.so, v2412). Process-wide;
+// only a solver that asks changes it.
+void setDeviceResidualFused(bool fused);
+bool deviceResidualFused();
 
 class DeviceHalo;      // forward (parallel/pstream/device_halo.cuh)
 struct DistributedAMI; // forward (cuda/distributed_ami.cuh) -- optional cyclicAMI coupling in the matvec
