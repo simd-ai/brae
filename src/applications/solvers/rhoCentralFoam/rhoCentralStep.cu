@@ -681,6 +681,14 @@ public:
 
     std::size_t deviceBytes() const override { return bytes_; }
 
+    void solveResidual(vector& mom, scalar& energy) const override
+    {
+        double r[4] = {0, 0, 0, 0};
+        if (vis_) vis_->solveResidual(r);
+        mom = vector{r[0], r[1], r[2]};
+        energy = r[3];
+    }
+
     ~DeviceArm() override
     {
         cudaFreeHost(hostCourant_);

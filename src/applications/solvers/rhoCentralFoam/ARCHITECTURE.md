@@ -5,7 +5,7 @@ implicit viscous correctors), its central-upwind flux assembly and its time loop
 boundary conditions, thermo, gradients, linear smoothers and time controls. Nothing here goes through SIMPLE, PIMPLE or
 rhoSimpleFoam's pressure correction, and there is no pressure equation: p = rho/psi.
 
-## 1. OpenFOAM's structure, and where each part lives in brae (after milestone F)
+## 1. OpenFOAM's structure, and where each part lives in brae (after milestone G)
 
 The reference is OpenFOAM v2412 `applications/solvers/compressible/rhoCentralFoam`. In the table, (H) marks the host
 reference (namespace `brae::cpu::rhoCentral`), (D) the device arm (namespace `brae::gpu::rhoCentral`), and (HD)
@@ -28,10 +28,10 @@ BRAE_HD code both arms run (namespace `brae::rhoCentral`).
 | `interpolate(vf, dir, "reconstruct(...)")`'s limiters (milestone F) | shared: `src/cuda/device_limiter.cuh` (`limiterOfR`, now BRAE_HD: one copy for both arms and every brae solver), the selectors in `device_mesh.cuh`; the case's choice in `rhoCentralControls.cu` (`reconstructLimiter`) | sec. 5h |
 | restart (milestone E): `Time::setControls` reading `<start>/uniform/time`, `Time::writeTimeDict` writing it | shared: `run_clock.cuh` (reads deltaT under adjustTimeStep, deltaT0, index), `src/OpenFOAM/db/Time/time_dict_writer.cuh` (new) | sec. 5g |
 | one step, composed | `rhoCentralStep_cpp.cuh/.cu` (H), `rhoCentralStep.cuh/.cu` (D) | the two `Arm`s |
-| hePsiThermo + hConst + perfectGas | `rhoCentralThermo.cuh` (HD) | Es, Cv, psi, the Newton e -> T loop |
+| hePsiThermo + hConst + perfectGas | `rhoCentralThermo.cuh` (HD) | Es, Cv, psi, the Newton e -> T loop; constTransport's alphaEff (G) |
+| the viscous correctors (milestone G): 218-219 tauMC, 234-244 the U corrector, 246-253 sigmaDotU, 273-282 the e corrector | `rhoCentralViscous.cuh/.cu` (D), on shared operators (sec. 5i); the order in `rhoCentralStep.cu`'s `stepViscous` | sec. 5i |
 
-Planned, not built yet: the
-viscous correctors (G), `setRDeltaT` (I), the solver's own `BCs/` (maxwellSlipU, smoluchowskiJumpT; G, I),
+Planned, not built yet: `setRDeltaT` (I), the solver's own `BCs/` (maxwellSlipU, smoluchowskiJumpT; G, I),
 turbulence (J) and mesh motion (K). Each goes into the module of its OpenFOAM counterpart above, or a new one beside
 it.
 
@@ -444,6 +444,72 @@ Gates for the transition:
   - controls red: vanLeer whatever the case names (2.5e+09 x on sod Minmod, 1.1e+05 x on obliqueShock SuperBee); the V
     limiter of rhoU from rhoU_x alone (2.3e+09 x on obliqueShock Minmod; not visible in 1-D, where rhoU has one component).
 
+## 5i. Milestone G: the viscous correctors
+
+With max(mu) > 0 (createFieldRefs.H) OpenFOAM v2412 adds, in this order (rhoCentralFoam.C): tauMC =
+muEff*dev2(T(fvc::grad(U))) from U as the step starts (:218-219); after the explicit rho, rhoU and U, the U corrector
+solve(fvm::ddt(rho, U) - fvc::ddt(rho, U) - fvm::laplacian(muEff, U) - fvc::div(tauMC)) and rhoU = rho*U (:234-244);
+sigmaDotU = (interpolate(muEff)*magSf*snGrad(U) + dotInterpolate(Sf, tauMC)) & (a_pos*U_pos + a_neg*U_neg) from the
+corrected U (:246-253), whose divergence the rhoE equation subtracts (:258-263); after e, its patches and
+thermo.correct(), the e corrector solve(fvm::ddt(rho, e) - fvc::ddt(rho, e) - fvm::laplacian(alphaEff, e)), then
+thermo.correct() and rhoE = rho*(e + 0.5*magSqr(U)) (:273-282). alphaEff = thermo.alphahe() = CpByCpv*alpha
+(heThermo.C:809-813), alpha = mu*rPr (constTransportI.H:101-108), so with constTransport and hConst both diffusivities
+are constants and both laplacian matrices are built once.
+
+What is reused, not copied (all shared, all device):
+- grad(U) and grad(e): `deviceGaussGradFused`; the patch faces' gradient, `deviceBoundaryGradU` (gaussGrad's
+  correctBoundaryConditions);
+- muEff*dev2(T(.)): `deviceScaledDev2T`, the kernel brae's divDevReff already ran, now exported;
+- the U and e matrices: `deviceLaplacianGammaMagSf` (new beside `deviceLaplacianCoeffs`: OpenFOAM's
+  deltaCoeffs*(gamma*magSf) rather than (deltaCoeffs*gamma)*magSf), the corrected scheme's explicit part through
+  `deviceLaplacianCorrFlux`/`deviceFaceDivSource` (skipped where every nonOrthCorrectionVector is exactly zero, where it
+  is exactly zero), `deviceEulerFvmDdtRho` and `deviceEulerFvcDdtRhoSub` (new in device_ddt: Euler ddt with a per-cell
+  rho, each product rounded alone), U's patch coefficients from `deviceBCLaplacianCoeffsFace` and `deviceUpdateSymmetry`,
+  `deviceFold`;
+- the solves: smoothSolver with GaussSeidel or symGaussSeidel through `deviceNormFactorInto` and
+  `deviceSymGaussSeidelFused` -- OpenFOAM's sequential sweep order, the residual normalisation, the stop test, U's
+  valid components in one fused call (byte-identical to solving them one after the other);
+- div(tauMC) and div(sigmaDotU): `deviceDotInterpolateSf` (new: Sf & the linear interpolate of a tensor) and `deviceDiv`;
+  snGrad(U): `deviceSnGradInternal` (new: deltaCoeffs*(U_N - U_P) plus the corrected part).
+rhoCentralFoam's own: the order (`stepViscous`, which splits the inviscid step's fused cell kernel into a momentum, an
+energy and a thermo-and-pressure kernel; the inviscid step itself is unchanged and its outputs byte-identical), e's
+patch coefficients from T's patch fields (fixedEnergy, gradientEnergy whose gradient is 0 for a zeroGradient T,
+mixedEnergy; transformFvPatchField<scalar> has none), sigmaDotU's patch faces (each patch field's snGrad) and the face
+velocity a_pos*U_pos + a_neg*U_neg, which the device face flux now also returns (the host's code is untouched). The
+viscous patch fluxes are counted in the conservation diagnostic.
+
+Refused by name: no `e` entry in fvSolution (OpenFOAM stops at its first e solve; the tutorials name `h`), a solver
+other than smoothSolver, a smoother other than GaussSeidel or symGaussSeidel, nSweeps < 1, schemes for grad(U),
+div(tauMC), laplacian(muEff,U), laplacian(alphahe,e) (the field is named alphahe), snGrad(U) and interpolate(muEff)
+other than Gauss linear, Gauss linear, Gauss linear corrected (twice), corrected and linear; sutherland; a wedge patch
+with mu > 0 (wedgeFvPatchField's snGrad takes cellT); and the host reference arm with mu > 0 (milestone G ports the
+device arm).
+
+The gate, tests/rho_central_viscous_vs_openfoam.sh, declares its solve requirement before comparing anything: the
+tutorials' fvSolution (U: tolerance 1e-9, relTol 0.01; e: 1e-10, 0; GaussSeidel, nSweeps 2) and a converged Sod
+(1e-13, 0), with OpenFOAM serial's iteration count required at every solve and the residuals reported. Cases: a shear
+layer (momentum diffusion alone), conduction in a tube at rest (energy diffusion alone), Sod and obliqueShock with mu > 0.
+Controls: noTauMC, noSigmaDotU.
+
+Found on the gate's first run: the round-off conservation check every gate applies fails on every viscous case for
+momentum and energy (mass closes). An implicit corrector solved to a tolerance leaves r = b - A x, and the totals move by
+-deltaT*sum(r): OpenFOAM's algorithm does the same. brae now accumulates that remainder (`diag solve-residual`), and the
+balance plus it closes to round-off on every case (Sod momentum: -4.560590e-04 and +4.560590e-04). The round-off check
+stays red, registered as "linear-solver tolerance", with the residual-counted check beside it; which one a viscous
+case should carry is a decision for review.
+
+Open validation items (all gates; tests/data/rho_central_open_checks.tsv): every FAIL a gate prints is followed by its
+category, and a FAIL the registry does not name prints as an unexplained numerical difference. The categories and what
+is in each (none is turned into a pass, no threshold moved):
+- round-off amplification: the restart arm wedge15Ma5 from OpenFOAM's t = 0.06 at t = 0.12 (E); the strong shock with
+  every limiter but vanLeer near its first write (F). OpenFOAM serial with p one ulp up, now run beside serial, in two
+  and in four on every case with an open check, lands as far from serial as brae does.
+- timestep sequence divergence: lax SuperBee, obliqueShock MUSCL and SuperBee (F). The Riemann gate now runs them with
+  the step fixed as well, and reports where each run's deltaT parts from serial's, the step each run moves 1e-12, 1e-8
+  and 1e-4 away, and the shock each run carries.
+- OpenFOAM reference failure: no FAIL (Toro 2, where OpenFOAM v2412 stops, is checked as brae stopping too).
+- unexplained numerical difference: none registered.
+
 ## 6. Milestones, each closed by a gate against OpenFOAM v2412
 
 Every gate:
@@ -459,7 +525,7 @@ Every gate:
 | D (done) | inletOutlet (U, p, T; T -> mixedEnergy) and purgeWrite | forwardStep as shipped; the inlet as inletOutlet; a tube whose end turns from outflow to inflow |
 | E (done; one arm red, for review) | restart: startFrom latestTime/startTime, `uniform/time` read and written, inletOutlet's value | restarts from OpenFOAM's and brae's output against OpenFOAM's own restart, and against the uninterrupted run |
 | F (done; open checks for review) | the reconstruction limiters vanAlbada, Minmod, MUSCL, SuperBee, limitedLinear and their V forms, upwind | Sod, Lax, 123 and a strong shock tube with every limiter, obliqueShock in 2-D: brae against OpenFOAM and the exact solution |
-| G | viscous: muEff, tauMC, U and e correctors (smoothSolver/GaussSeidel), sigmaDotU, sutherland, noSlip | a viscous shock tube and a laminar compressible boundary layer against OpenFOAM |
+| G (done; for review) | viscous: muEff, tauMC, U and e correctors (smoothSolver/GaussSeidel), sigmaDotU, constant mu (sutherland and noSlip are not in this milestone) | a shear layer, conduction, Sod and obliqueShock with mu > 0 against OpenFOAM |
 | H | totalPressure (psi branch), totalTemperature, waveTransmissive | a supersonic nozzle and LadenburgJet60psi |
 | I | LTS (setRDeltaT, fvc::smooth), janaf, maxwellSlipU, smoluchowskiJumpT | biconic25-55Run35 |
 | J | compressible RAS on the central path | a modified tutorial with kOmegaSST |

@@ -297,6 +297,15 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
     // over V, times deltaT, added to the old value): four ulps of each cell's total a step, summed over the cells of
     // the start or the end state, whichever sums larger. A non-conservative scheme misses by the fluxes' size.
     const long double k = 4.0L*steps;
+    if (cs.viscous)
+    {
+        vector rm;
+        scalar re;
+        arm->solveResidual(rm, re);
+        std::printf("diag solve-residual momentum %.6e %.6e %.6e energy %.6e (deltaT*sum(b - A x) of the implicit "
+                    "correctors: the balance is minus this, to round-off)\n", (double)rm.x, (double)rm.y, (double)rm.z,
+                    (double)re);
+    }
     std::printf("diag roundoff mass %.3Le energy %.3Le momentum %.3Le %.3Le %.3Le (four ulps a cell a step)\n",
                 k*std::max(I0.ulpMass, I1.ulpMass), k*std::max(I0.ulpEnergy, I1.ulpEnergy),
                 k*std::max(I0.ulpMom[0], I1.ulpMom[0]), k*std::max(I0.ulpMom[1], I1.ulpMom[1]),

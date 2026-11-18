@@ -51,6 +51,10 @@ public:
     // The step's viscous fluxes INTO the domain through the patches, times deltaT, added to inflow[0..3] (x, y, z
     // momentum, energy): U's laplacian boundary flux plus Sf & tauMC_b, and sigmaDotU_b plus e's. Diagnostics.
     void boundaryInflow(const DeviceFields& F, scalar deltaT, DeviceBuffer<double>& inflow);
+    // What the implicit correctors leave unconserved: deltaT*sum over the cells of b - A x (lduMatrix::residual) after
+    // each solve, summed over the run -- x, y, z momentum and energy. A converged solve leaves round-off; the
+    // tutorials' relTol 0.01 leaves more, the same as OpenFOAM's algorithm does (the totals move by minus this).
+    void solveResidual(double out[4]) const { for (int k = 0; k < 4; ++k) out[k] = solveRes_[k]; }
 
 private:
     const brae::rhoCentral::Case& cs_;
@@ -74,6 +78,8 @@ private:
     DeviceBuffer<int> uKind_, Tconstraint_;
     DeviceBuffer<tensor> uR_;
     DeviceBuffer<label> bCell_;
+    DeviceBuffer<scalar> res_;
+    double solveRes_[4] = {0, 0, 0, 0};
 };
 
 } // namespace rhoCentral

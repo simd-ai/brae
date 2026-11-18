@@ -26,7 +26,12 @@
 #   SOLVES       the same solves in the same order; every iteration count OpenFOAM serial's
 #   FLUXES       the viscous stress mu*dU/dn and heat flux alphaEff*Cv*dT/dn on every internal face (the same arithmetic
 #                for every run), at every write time within ten times OpenFOAM's own spread of them (floor BOUND)
-#   CONSERVATION mass, momentum and energy to brae's round-off, the patches' viscous fluxes counted; positivity
+#   CONSERVATION mass, momentum and energy to brae's round-off, the patches' viscous fluxes counted; positivity.
+#                FOUND ON THE FIRST RUN (2026-11-18), kept red: momentum and energy do not close to round-off, because an
+#                implicit corrector solved to a tolerance leaves b - A x, and the totals move by -deltaT*sum(b - A x)
+#                (OpenFOAM's algorithm the same). brae now prints that remainder (`diag solve-residual`), and
+#   SOLVE-CONSERVATION  momentum and energy balance PLUS the solves' remainder within the same round-off (added
+#                after the first run, beside the red check, not in place of it: a decision for review)
 #   EXACT        (reported) shear and conduction against the erf solutions of their constant-density limits
 #   MEMORY, RUNTIME (reported)
 # CONTROLS (rhoCentralState.cuh), red against OpenFOAM by more than 100 x the bound:
@@ -167,6 +172,26 @@ done
 
 # ---- conservation and stability --------------------------------------------------------------------------------------------
 for c in $CASES; do balance "b_$c"; done
+
+# the balance once the correctors' unconserved remainder is counted (see SOLVE-CONSERVATION above)
+vbalance()
+{
+    local d=$1 bal res rnd
+    bal=$(sed -n 's/^diag balance mass [^ ]* energy \([^ ]*\) momentum \([^ ]*\) \([^ ]*\) \([^ ]*\) .*/\1 \2 \3 \4/p' "$W/$d/log")
+    res=$(sed -n 's/^diag solve-residual momentum \([^ ]*\) \([^ ]*\) \([^ ]*\) energy \([^ ]*\) .*/\4 \1 \2 \3/p' "$W/$d/log")
+    rnd=$(sed -n 's/^diag roundoff mass [^ ]* energy \([^ ]*\) momentum \([^ ]*\) \([^ ]*\) \([^ ]*\) .*/\1 \2 \3 \4/p' "$W/$d/log")
+    local sums
+    sums=$(python3 -c "
+b = [float(x) for x in '$bal'.split()]; r = [float(x) for x in '$res'.split()]
+print(' '.join('%.3e' % (x + y) for x, y in zip(b, r)) if len(b) == 4 and len(r) == 4 else '')" 2> /dev/null)
+    if python3 -c "
+import sys
+s = [abs(float(x)) for x in '$sums'.split()]; q = [float(x) for x in '$rnd'.split()]
+sys.exit(0 if len(s) == 4 and len(q) == 4 and all(x <= y for x, y in zip(s, q)) else 1)" 2> /dev/null
+    then ok "$d conserves energy and momentum to round-off once the solves' remainder is counted: balance + deltaT*sum(b - A x) = $sums (energy, momentum x y z) within $rnd; the remainder itself $res"
+    else fail "$d solve-conservation: balance '$bal' + remainder '$res' = '$sums' against round-off '$rnd'"; fi
+}
+for c in $CASES; do vbalance "b_$c"; done
 
 # ---- memory and runtime (reported) ------------------------------------------------------------------------------------------
 for c in $CASES; do

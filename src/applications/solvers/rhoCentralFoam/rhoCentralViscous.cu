@@ -4,6 +4,7 @@
 #include "rhoCentralPatchUpdate.cuh"
 
 #include "device_amg.cuh"
+#include "device_blas.cuh"
 #include "device_ddt.cuh"
 #include "device_divdevreff.cuh"
 #include "device_pcg.cuh"
@@ -344,6 +345,11 @@ void ViscousCorrectors::solveU(DeviceFields& F, DeviceVectorBoundary& dbU, scala
     DeviceSolverPerf perf[3];
     const SmoothSolveControls& c = cs_.solveU;
     if (n) deviceSymGaussSeidelFused(n, comps, c.tolerance, c.relTol, c.maxIter, c.minIter, c.nSweeps, c.symmetric, perf);
+    for (int i = 0; i < n; ++i)   // the run's unconserved remainder: deltaT*sum(b - A x)
+    {
+        deviceResidual(A_[solved[i]], *U[solved[i]], b_[solved[i]], res_);
+        solveRes_[solved[i]] += deviceDot(res_, ones_)/rDeltaT;
+    }
     for (int i = 0; i < n && rep.nSolves < 4; ++i)
     {
         SolveLine& l = rep.solves[rep.nSolves++];
@@ -443,6 +449,8 @@ void ViscousCorrectors::solveE(DeviceFields& F, const DeviceBoundary& dbT, scala
     DeviceSolverPerf perf;
     const SmoothSolveControls& c = cs_.solveE;
     deviceSymGaussSeidelFused(1, &comp, c.tolerance, c.relTol, c.maxIter, c.minIter, c.nSweeps, c.symmetric, &perf);
+    deviceResidual(AE_, F.e, bE_, res_);
+    solveRes_[3] += deviceDot(res_, ones_)/rDeltaT;
     if (rep.nSolves < 4)
     {
         SolveLine& l = rep.solves[rep.nSolves++];
