@@ -17,7 +17,6 @@
 #include "rhoCentralViscous.cuh"
 
 #include "device_boundary.cuh"
-#include "of_residual_log.cuh"
 
 #include <cuda_runtime.h>
 #include <stdexcept>

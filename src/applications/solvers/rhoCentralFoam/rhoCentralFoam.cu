@@ -1,5 +1,4 @@
 // rhoCentralFoam.cu -- the driver: rhoCentralFoam.C's main() for both arms. See the header.
-#include "of_residual_log.cuh"
 #include "rhoCentralFoam.cuh"
 #include "rhoCentralCreateFields_cpp.cuh"
 #include "rhoCentralStep.cuh"
@@ -223,9 +222,12 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
             if (tc.adjustTimeStep) std::printf("deltaT = %.*g\n", logPrec, (double)unlogged[i].first);
             std::printf("Mean and max Courant Numbers = %.*g %.*g\nTime = %s\n\n", logPrec, (double)rep.meanCoNum,
                         logPrec, (double)rep.CoNum, tn.c_str());
-            for (int j = 0; j < rep.nSolves; ++j)   // the viscous correctors' solves, OpenFOAM's lines
-                printOfSolveLine("smoothSolver", rep.solves[j].field, rep.solves[j].initialResidual,
-                                 rep.solves[j].finalResidual, rep.solves[j].nIterations);
+            // the viscous correctors' solves, OpenFOAM's lines (SolverPerformance.C:95-117) at Info's precision,
+            // writePrecision (printOfSolveLine's %g is 6 digits)
+            for (int j = 0; j < rep.nSolves; ++j)
+                std::printf("smoothSolver:  Solving for %s, Initial residual = %.*g, Final residual = %.*g, "
+                            "No Iterations %d\n", rep.solves[j].field, logPrec, (double)rep.solves[j].initialResidual,
+                            logPrec, (double)rep.solves[j].finalResidual, rep.solves[j].nIterations);
             if (rep.status)
                 throw std::runtime_error(
                     "step to time " + tn + " left an unphysical state (status " + std::to_string(rep.status)
