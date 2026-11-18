@@ -430,14 +430,17 @@ Gates for the transition:
   - Toro 2 (the 123 problem, near vacuum) breaks down in OpenFOAM v2412 itself with vanLeer, MUSCL, SuperBee and
     limitedLinear (a floating-point exception at step 24 to 27); brae stops at the same step;
   - OPEN, left red: lax SuperBee, obliqueShock MUSCL and SuperBee part from OpenFOAM serial's deltaT sequence late in
-    the run -- and so do OpenFOAM's own decomposed runs, at the same steps (lax SuperBee: OpenFOAM in two keeps it for 1581
-    steps, in four 1395, brae 1619; obliqueShock SuperBee 787, 785, 785): compressive limiters make these runs chaotic,
-    for every implementation;
-  - OPEN, left red: the strong shock (Toro 3) with every limiter but vanLeer, at its first write (t = 0.03): brae
-    1.1e-12 to 2.0e-12 (CUDA and host alike) against bounds from OpenFOAM's decomposed spread of 1e-13 to 4e-12 -- while
-    OpenFOAM serial with p one ulp up is 1.2e-12 (Minmod) and 2.4e-12 (limitedLinear) from serial there. As with the
-    wedge restart (sec. 5g), brae sits on OpenFOAM's own one-ulp response; the decompositions, whose perturbation starts
-    at their processor faces, have not reached the waves yet. The envelope is not changed for it: a decision for review.
+    the run -- and so do OpenFOAM's own runs: decomposed, and serial started with p one ulp up. Steps that keep serial's
+    deltaT (lax SuperBee, of 1891: OpenFOAM in two 1581, in four 1395, one ulp up 1128, brae 1619; obliqueShock MUSCL,
+    of 3252: 1449, 1646, 1483, brae 1476; obliqueShock SuperBee, of 3288: 787, 785, 831, brae 785). Compressive limiters
+    make these runs chaotic for every implementation; the step check is not relaxed for it: a decision for review;
+  - OPEN, left red: the strong shock (Toro 3) with every limiter but vanLeer, at its first write (t = 0.03), and with
+    vanAlbada and Tadmor also rho at 0.06 and 0.12: brae 2e-13 to 3e-11 against bounds from OpenFOAM's decomposed
+    spread of 8e-14 to 2e-11. OpenFOAM serial with p one ulp up lands, field by field and at every write, within a
+    factor 3.1 of brae's distance from serial (the largest: Minmod p at 0.03, brae 2.2e-13, one ulp up 7.0e-14), and
+    farther from serial than brae in 73 of the 112 field-write pairs. As with the wedge restart (sec. 5g), brae sits at
+    OpenFOAM's own one-ulp response; the decompositions, whose perturbation starts at their processor faces, have not
+    reached the waves yet. The envelope is not changed for it: a decision for review.
   - controls red: vanLeer whatever the case names (2.5e+09 x on sod Minmod, 1.1e+05 x on obliqueShock SuperBee); the V
     limiter of rhoU from rhoU_x alone (2.3e+09 x on obliqueShock Minmod; not visible in 1-D, where rhoU has one component).
 

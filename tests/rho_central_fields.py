@@ -347,11 +347,17 @@ if __name__ == "__main__":
     elif a[0] == "nudge":
         s = open(a[1]).read()
         i = s.index("internalField")
-        j = s.index("(", s.index("List<scalar>", i))
-        k = s.index(")", j)
-        v = np.nextafter(np.array(s[j + 1:k].split(), dtype=float), np.inf)
-        open(a[1], "w").write(s[:j + 1] + "\n" + "\n".join("%.17g" % x for x in v) + "\n" + s[k:])
-        print("nudge", len(v))
+        m = re.compile(r"internalField\s+uniform\s+([^;\s]+)\s*;").match(s, i)
+        if m:   # `uniform v`: every cell one ulp up
+            v = np.nextafter(float(m.group(1)), np.inf)
+            open(a[1], "w").write(s[:m.start(1)] + "%.17g" % v + s[m.end(1):])
+            print("nudge uniform")
+        else:
+            j = s.index("(", s.index("List<scalar>", i))
+            k = s.index(")", j)
+            v = np.nextafter(np.array(s[j + 1:k].split(), dtype=float), np.inf)
+            open(a[1], "w").write(s[:j + 1] + "\n" + "\n".join("%.17g" % x for x in v) + "\n" + s[k:])
+            print("nudge", len(v))
     elif a[0] == "worst":
         best = (0.0, None, -1, 0.0)
         for f in (a[3:] or ["U", "p", "T", "rho"]):

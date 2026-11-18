@@ -157,8 +157,13 @@ for c in $DONE; do
     case $c in strong_*|ob_MUSCL|ob_SuperBee|lax_SuperBee) ;; *) continue ;; esac
     copy "$W/$c" "$W/of_${c}_ulp"
     python3 "$FIELDS" nudge "$W/of_${c}_ulp/0/p" > /dev/null && ofrun "$W/of_${c}_ulp"
+    case $c in ob_*|lax_*) echo "     reproducibility, $c: OpenFOAM serial with p one ulp up keeps serial's deltaT for $(python3 "$STEPS" compare "$W/of_${c}_ulp/log" "$W/of_$c/log" | sed -n 's/^deltaT \([0-9]*\).*/\1/p') steps of $(grep -c "^Time = " "$W/of_$c/log")" ;; esac
     for t in $(times "$W/of_$c" | cut -d' ' -f1-2); do
-        read -r _ cu fu ru _ <<< "$(python3 "$FIELDS" worst "$W/of_${c}_ulp/$t" "$W/of_$c/$t")"
+        if [ -f "$W/of_${c}_ulp/$t/U" ]; then
+            read -r _ cu fu ru _ <<< "$(python3 "$FIELDS" worst "$W/of_${c}_ulp/$t" "$W/of_$c/$t")"
+        else   # said, not left blank
+            ru="NOT RUN"; fu="no $t/U in of_${c}_ulp"; cu="-"
+        fi
         read -r _ cb fb rb _ <<< "$(python3 "$FIELDS" worst "$W/b_$c/$t" "$W/of_$c/$t")"
         hh=""; [ -d "$W/h_$c" ] && hh=", host $(python3 "$FIELDS" worst "$W/h_$c/$t" "$W/of_$c/$t" | awk '{print $4}')"
         echo "     sensitivity, $c at t = $t: OpenFOAM with p one ulp up $ru ($fu, cell $cu); brae CUDA $rb ($fb, cell $cb)$hh; OpenFOAM in two $(python3 "$FIELDS" maxrel "$W/of_${c}_np2/$t" "$W/of_$c/$t" | awk '{print $2}'), in four $(python3 "$FIELDS" maxrel "$W/of_${c}_np4/$t" "$W/of_$c/$t" | awk '{print $2}')"
@@ -181,4 +186,4 @@ red "limiterVanLeer, sod_Minmod" "$W/cV_sod_Minmod" "$W/of_sod_Minmod" "$(spread
 red "limiterVanLeer, ob_SuperBee" "$W/cV_ob_SuperBee" "$W/of_ob_SuperBee" "$(spread ob_SuperBee)"
 red "limiterScalarOnV, ob_Minmod" "$W/cS_ob_Minmod" "$W/of_ob_Minmod" "$(spread ob_Minmod)"
 echo "rho_central_riemann_vs_openfoam: $passes passed, $fails failed (work in $W)"
-[ "$fails" = 0 ] && [ "$passes" -ge "${BRAE_RCF_F_MIN_PASSES:-1}" ]
+[ "$fails" = 0 ] && [ "$passes" -ge 213 ]
