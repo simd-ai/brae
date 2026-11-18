@@ -9,8 +9,8 @@
 # and field types on wedge15Ma5, three check what inletOutlet's port leaves out, and three (milestone E) a start
 # directory without the fields OpenFOAM must read: brae names it where OpenFOAM stops on it, never starting from an older
 # directory instead. What this does NOT show: that the
-# refused inputs are rare (they are not -- three of the seven shipped tutorials are refused today; ARCHITECTURE.md
-# lists the order of the work).
+# refused inputs are rare (they are not -- one of the seven shipped tutorials, movingCone, is refused today, after
+# milestones H and I; ARCHITECTURE.md lists the order of the work).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BRAE_RCF_BIN:-$ROOT/build/brae_rhoCentralFoam}"
@@ -55,7 +55,19 @@ row()
         tail -n 3 "$d/log" | sed 's/^/     /'
     fi
 }
-row biconic_shipped biconic25-55Run35 no "ddtSchemes resolves to \`localEuler\`"
+# milestone I: biconic25-55Run35 runs as shipped (tests/rho_central_lts_vs_openfoam.sh); what its port leaves out
+row sod_janafConst shockTube no "transport with janaf: OpenFOAM v2412 has no such psiThermo" \
+    constant/thermophysicalProperties 's/hConst/janaf/'
+row sod_ddtMixed shockTube no "a mix of localEuler and Euler terms is not ported" \
+    system/fvSchemes 's/^(\s*default\s+)Euler;/\1localEuler; ddt(rho) Euler;/'
+row sod_waveTransmissiveLTS shockTube yes "waveTransmissive with ddtSchemes localEuler" \
+    system/fvSchemes 's/^(\s*default\s+)Euler;/\1localEuler;/' \
+    0/p '/sides/,/\}/ s/zeroGradient;/waveTransmissive; psi thermo:psi; gamma 1.4; value uniform 1;/'
+row sod_maxwellSlipUInviscid shockTube yes "on a viscous case only" \
+    0/U '/sides/,/\}/ s/zeroGradient;/maxwellSlipU; accommodationCoeff 0.85; Uwall uniform (0 0 0); value uniform (0 0 0);/'
+row sod_smoluchowskiNonuniform shockTube yes "must be \`uniform <value>\` here" \
+    constant/thermophysicalProperties 's/^(\s*mu\s+)\S+;/\11.8e-05;/' system/fvSolution 's/^(\s*)h$/\1"(e|h)"/' \
+    0/T '/sides/,/\}/ s/zeroGradient;/smoluchowskiJumpT; accommodationCoeff 0.85; Twall nonuniform List<scalar> 2(300 300); value uniform 300;/'
 # the nozzle boundaries (milestone H): their forms and fields beyond the ported ones refused by name (LadenburgJet60psi,
 # sutherland and all, now runs: tests/rho_central_nozzle_vs_openfoam.sh)
 row sod_totalPressurePsiNone shockTube yes "is \`totalPressure\` with psi \`none\`" \

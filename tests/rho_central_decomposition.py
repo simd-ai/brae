@@ -22,6 +22,8 @@ The data dir (default tests/data/rho_central_decomposition) holds <mesh name>.ce
 per mesh: `<mesh name> <nCells> <nProcs> <meshsum> <sha256 of the frozen file>`.
 """
 import hashlib
+
+import numpy as np
 import os
 import re
 import shutil
@@ -39,8 +41,25 @@ HEADER = """FoamFile
 """
 
 
+def _binary(path):
+    """(the text after the FoamFile header, byte for byte, and whether the header says `format binary`): biconic25-55Run35
+    writes its mesh binary (milestone I), label=32 as this OpenFOAM's arch string says"""
+    import gzip
+    if not os.path.exists(path) and os.path.exists(path + ".gz"):
+        path = path + ".gz"
+    raw = (gzip.open(path).read() if path.endswith(".gz") else open(path, "rb").read()).decode("latin-1")
+    i = raw.find("FoamFile")
+    if i < 0:
+        return raw, False
+    j = raw.index("}", i)
+    return raw[j + 1:], bool(re.search(r"\bformat\s+binary\s*;", raw[i:j]))
+
+
 def _body(path):
-    """the data of an OpenFOAM ascii file: everything after its FoamFile header, comments dropped"""
+    """the data of an OpenFOAM file: everything after its FoamFile header, comments dropped (binary: its bytes)"""
+    b, binary = _binary(path)
+    if binary:
+        return b
     s = open(path).read()
     s = re.sub(r"/\*.*?\*/", "", s, flags=re.S)
     s = re.sub(r"//[^\n]*", "", s)
@@ -51,6 +70,11 @@ def _body(path):
 
 
 def _labels(path):
+    raw, binary = _binary(path)
+    if binary:   # N( int32 x N )
+        m = re.search(r"(\d+)\s*\(", raw)
+        n = int(m.group(1))
+        return np.frombuffer(raw[m.end():m.end() + 4*n].encode("latin-1"), dtype="<i4").tolist()
     b = _body(path)
     m = re.match(r"(\d+)\s*\((.*)\)", b)
     if not m:

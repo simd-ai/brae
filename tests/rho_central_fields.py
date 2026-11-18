@@ -45,8 +45,20 @@ import sys
 import numpy as np
 
 
-# ---- OpenFOAM ascii ---------------------------------------------------------------------------------------------------
-def _value(s, i):
+# ---- OpenFOAM ascii and binary ------------------------------------------------------------------------------------------
+def _text(path):
+    """the file as text, byte for byte (latin-1), gzipped or not (OpenFOAM reads `<name>.gz` where `<name>` is absent),
+    and whether its header says `format binary` (milestone I: biconic25-55Run35 writes binary)"""
+    import gzip
+    if not os.path.exists(path) and os.path.exists(path + ".gz"):
+        path = path + ".gz"
+    raw = gzip.open(path).read() if path.endswith(".gz") else open(path, "rb").read()
+    s = raw.decode("latin-1")
+    head = s[:s.index("}") + 1] if "}" in s else ""
+    return s, bool(re.search(r"\bformat\s+binary\s*;", head))
+
+
+def _value(s, i, binary=False):
     m = re.compile(r"\s*(uniform|nonuniform)\s+").match(s, i)
     j = m.end()
     if m.group(1) == "uniform":
@@ -56,6 +68,10 @@ def _value(s, i):
         return np.array(float(s[j:s.index(";", j)]))
     m2 = re.compile(r"List<(\w+)>\s*(\d+)\s*\(").match(s, j)
     n, j = int(m2.group(2)), m2.end()
+    if binary:   # the list's doubles, little-endian, between the parentheses (OpenFOAM's binary stream)
+        w = 1 if m2.group(1) == "scalar" else 3
+        a = np.frombuffer(s[j:j + 8*w*n].encode("latin-1"), dtype="<f8")
+        return a.copy() if w == 1 else a.reshape(n, 3).copy()
     if m2.group(1) == "scalar":
         a = np.array(s[j:s.index(")", j)].split(), dtype=float)
     else:
@@ -68,22 +84,22 @@ def _value(s, i):
 
 
 def internal(path):
-    s = open(path).read()
-    return _value(s, s.index("internalField") + len("internalField"))
+    s, binary = _text(path)
+    return _value(s, s.index("internalField") + len("internalField"), binary)
 
 
 def patch_value(path, patch):
     """a patch's written `value` entry (uniform values come back as one row)"""
-    s = open(path).read()
+    s, binary = _text(path)
     b = s.index("boundaryField")
     m = re.compile(r"\n\s*" + re.escape(patch) + r"\s*\{").search(s, b)
     if not m:
         raise SystemExit(f"rho_central_fields: no patch {patch} in {path}")
-    e = s.index("}", m.end())
-    v = re.compile(r"\bvalue\b").search(s, m.end(), e)
-    if not v:
+    v = re.compile(r"\n\s*value\b").search(s, m.end())
+    nxt = re.compile(r"\n    \w+\s*\n\s*\{").search(s, m.end())   # the next patch's entry
+    if not v or (nxt and v.start() > nxt.start()):
         raise SystemExit(f"rho_central_fields: patch {patch} of {path} has no value entry")
-    a = _value(s, v.end())
+    a = _value(s, v.end(), binary)
     if re.compile(r"\s*uniform\s*\(").match(s, v.end()):   # one vector for every face
         return a.reshape(1, -1)
     return np.atleast_1d(a) if a.ndim < 2 else a
