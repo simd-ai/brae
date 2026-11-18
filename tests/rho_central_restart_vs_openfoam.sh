@@ -180,6 +180,15 @@ wait
 for r in $NP; do throttle; ofnp "$W/of_${r}_np4" 4 & done
 wait
 for r in $NP; do for n in 2 4; do grep -qx End "$W/of_${r}_np$n/log" || fail "OpenFOAM in $n did not finish the restart $r"; done; done
+# OpenFOAM restarted from the same directory with p one ulp up: a DIAGNOSTIC reference beside serial, in two and in four
+# (milestone G). arm() reports brae against it; it bounds nothing. On the open wedge arm and its neighbours.
+ULP="wedge17_0.06o wedge17_0.06b fs17_2o"
+for r in $ULP; do
+    rcopy "$W/$r" "$W/of_${r}_ulp"
+    st=$(sed -n 's/^startTime[[:space:]]*\([^;]*\);.*/\1/p' "$W/$r/system/controlDict")
+    python3 "$FIELDS" nudge "$W/of_${r}_ulp/$st/p" > /dev/null && { throttle; ofrun "$W/of_${r}_ulp" & }
+done
+wait
 # brae: CUDA on every restart, the host reference on fs17 at 2 and the rev17 ones
 for r in $ALLR; do rcopy "$W/$r" "$W/b_$r"; braerun "$W/b_$r"; done
 for r in fs17_2o fs17_2b fs17e_2o fs17e_2b rev17_0.013o rev17_0.013b; do rcopy "$W/$r" "$W/h_$r"; braerun "$W/h_$r" BRAE_RHOCENTRALFOAM_ARM=cpu; done
@@ -299,10 +308,7 @@ done
 # unit in the last place, against OpenFOAM restarted from it as written -- OpenFOAM's own response to the last bit of its
 # state, beside brae's distance from OpenFOAM, cell by cell. Milestone E left wedge15Ma5 from OpenFOAM's t = 0.06 (CUDA)
 # above the envelope at t = 0.12; this shows what OpenFOAM itself does there.
-for r in wedge17_0.06o wedge17_0.06b fs17_2o; do
-    rcopy "$W/$r" "$W/of_${r}_ulp"
-    st=$(sed -n 's/^startTime[[:space:]]*\([^;]*\);.*/\1/p' "$W/$r/system/controlDict")
-    python3 "$FIELDS" nudge "$W/of_${r}_ulp/$st/p" > /dev/null && ofrun "$W/of_${r}_ulp"
+for r in $ULP; do
     for t in $(times "$W/of_$r"); do
         read -r _ cu fu ru au <<< "$(python3 "$FIELDS" worst "$W/of_${r}_ulp/$t" "$W/of_$r/$t")"
         read -r _ cb fb rb ab <<< "$(python3 "$FIELDS" worst "$W/b_$r/$t" "$W/of_$r/$t")"
@@ -340,5 +346,6 @@ red "noUniformTime, OpenFOAM restarted from it at t = 2 against OpenFOAM restart
 for r in fs17_2o fs17_2b; do
     echo "     runtime restart $r: OpenFOAM $(grep -h '^ExecutionTime' "$W/of_$r/log" | tail -n 1 | awk '{print $3}') s; brae CUDA $(sed -n 's/^diag steps \([^ ]*\) step-seconds \([^ ]*\) per-step-us \([^ ]*\).*/\2 s (\1 steps, \3 us a step)/p' "$W/b_$r/log")"
 done
+opensummary
 echo "rho_central_restart_vs_openfoam: $passes passed, $fails failed (work in $W)"
 [ "$fails" = 0 ] && [ "$passes" -ge 197 ]   # the wedge15Ma5 arm from OpenFOAM's t = 0.06 (CUDA) stays a check

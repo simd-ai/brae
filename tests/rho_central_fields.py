@@ -15,6 +15,11 @@
       <time>/uniform/time of every time directory B holds (but its start): how many of A's carry the same text in
       value, name, index, deltaT and deltaT0, how many A lacks, and the worst relative difference of deltaT and deltaT0:
       `timedict <n> missing <m> value <k> <worst> name <k> index <k> deltaT <k> <worst> deltaT0 <k> <worst>`
+  rho_central_fields.py ulpref <brae case> <OF serial case> <OF one-ulp case> <t1,t2,...> [t:f ...]
+      a DIAGNOSTIC reference, never a bound: at each write time and field, brae's distance from OpenFOAM serial over
+      the distance of OpenFOAM serial started with p one ulp up (both relative to serial's largest |value|).
+      `ulpref <n field-times> <smallest ratio> <largest ratio> <t:f of the largest>`, then for each t:f given
+      `at <t:f> brae <d> ulp <d>`
   rho_central_fields.py nudge <field file>
       moves every value of the internalField one unit in the last place towards +inf (a fixed, reproducible
       perturbation: OpenFOAM's own response to its state's last bit)
@@ -344,6 +349,24 @@ if __name__ == "__main__":
         print(f"maxrel {w[2]:.3e} {w[0]}")
     elif a[0] == "shock":
         print("shock", " ".join(f"{k} {v:.6g}" if isinstance(v, float) else f"{k} {v}" for k, v in shock(a[1], a[2], a[3]).items()))
+    elif a[0] == "ulpref":
+        rows = {}
+        for t in a[4].split(","):
+            if not os.path.isfile(f"{a[3]}/{t}/U"):
+                continue
+            db = {r[0]: r[2] for r in absdiff(f"{a[1]}/{t}", f"{a[2]}/{t}", ["U", "p", "T", "rho"])}
+            du = {r[0]: r[2] for r in absdiff(f"{a[3]}/{t}", f"{a[2]}/{t}", ["U", "p", "T", "rho"])}
+            for f in db:
+                rows[f"{t}:{f}"] = (db[f], du[f])
+        q = {k: b / u for k, (b, u) in rows.items() if u > 0}
+        if q:
+            k = max(q, key=q.get)
+            print("ulpref %d %.3g %.3g %s" % (len(q), min(q.values()), q[k], k))
+        else:
+            print("ulpref 0 nan nan -")
+        for k in a[5:]:
+            if k in rows:
+                print("at %s brae %.3e ulp %.3e" % (k, rows[k][0], rows[k][1]))
     elif a[0] == "nudge":
         s = open(a[1]).read()
         i = s.index("internalField")

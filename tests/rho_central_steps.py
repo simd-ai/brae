@@ -9,6 +9,7 @@
         names         identical_steps
         maxCo         worst_relative step_of_worst
         meanCo        worst_relative step_of_worst
+        firstdiff     the first step whose deltaT or time name differs (0: none), then the time both reached before it
   rho_central_steps.py summary <log>
         steps n, distinct deltaT values, min and max deltaT, first deltaT
   Both logs must be written at the same precision (controlDict writePrecision sets OpenFOAM's Info precision).
@@ -54,6 +55,8 @@ def compare(b, o):
     for k in ('max', 'mean'):
         w = max((rel(x[k], y[k]), i + 1) for i, (x, y) in enumerate(zip(a, r)))
         print('%sCo %.3e %d' % (k, w[0], w[1]))
+    first = next((i + 1 for i, (x, y) in enumerate(zip(a, r)) if x.get('dt') != y.get('dt') or x['t'] != y['t']), 0)
+    print('firstdiff %d %s' % (first, a[first - 2]['t'] if first > 1 else '-'))
 
 
 def summary(p):

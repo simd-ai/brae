@@ -1,5 +1,5 @@
 # Shared by the rhoCentralFoam gates that compare brae with OpenFOAM v2412 and with OpenFOAM's own decomposed runs
-# (tests/rho_central_wedge_vs_openfoam.sh, tests/rho_central_forwardstep_vs_openfoam.sh). Sourced, not run.
+# (the wedge, forwardstep, restart, riemann and viscous gates). Sourced, not run.
 #
 # The caller sets: W (work directory), BIN, STEPS, FIELDS, OFBASHRC and BOUND (the field floor). It gets ok/fail
 # counting into passes/fails.
@@ -18,7 +18,39 @@
 # milestones C and D report -- is now kept with its checksums in tests/data/rho_central_decomposition and every
 # four-way reference decomposes on it (`manual`); the envelope's rule is unchanged.
 
-fail() { echo "FAIL $*"; fails=$((fails + 1)); }
+# OPEN VALIDATION ITEMS (tests/data/rho_central_open_checks.tsv; milestone G, 2026-11-18). A FAIL stays a FAIL: the
+# registry only says, on the line after it, which known open item it is and its category -- round-off amplification,
+# timestep sequence divergence, OpenFOAM reference failure, unexplained numerical difference. A FAIL the registry does not
+# name is printed as an unexplained numerical difference until it is analysed. No threshold reads the registry.
+OPENCHECKS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/data/rho_central_open_checks.tsv"
+GATE=$(basename "$0" .sh)
+declare -A opencount=()
+fail()
+{
+    local msg="$*" cat="" note="" g pat c n
+    if [ -f "$OPENCHECKS" ]
+    then
+        while IFS=$'\t' read -r g pat c n
+        do
+            case $g in ''|'#'*) continue ;; esac
+            [ "$g" = "$GATE" ] || continue
+            # shellcheck disable=SC2053
+            if [[ $msg == $pat ]]; then cat=$c; note=$n; break; fi
+        done < "$OPENCHECKS"
+    fi
+    echo "FAIL $msg"
+    if [ -n "$cat" ]
+    then echo "     [open item, $cat: $note]"
+    else cat="unexplained numerical difference (not in the registry)"; echo "     [$cat]"
+    fi
+    fails=$((fails + 1))
+    opencount[$cat]=$((${opencount[$cat]:-0} + 1))
+}
+# opensummary: the FAILs by category, at the end of a gate
+opensummary() { local k; for k in "${!opencount[@]}"; do echo "     open: ${opencount[$k]} FAIL(s), $k"; done; }
+# ofulp <case> <OF dir> <start time>: OpenFOAM serial started with p one ulp up (rho_central_fields.py nudge), a
+# DIAGNOSTIC reference beside serial, in two and in four: arm() reports brae's distance against it, never bounds by it
+ofulp() { copy "$1" "$2"; python3 "$FIELDS" nudge "$2/$3/p" > /dev/null && ofrun "$2"; }
 ok() { passes=$((passes + 1)); echo "ok   $*"; }
 of() { bash -c "set +u; source '$OFBASHRC' > /dev/null 2>&1; set -e; $*"; }
 le() { python3 -c "import sys; sys.exit(0 if float('${1:-nan}') <= float('$2') else 1)" 2> /dev/null; }
@@ -180,6 +212,15 @@ arm()
             echo "     $name: against OpenFOAM $label alone: up to ${wr[$j]} x ten times its spread, above it at $(echo ${ov[$j]} | wc -w) field-times (t:field): $(echo ${ov[$j]} | cut -d' ' -f1-12)"
         fi
     done
+    # OpenFOAM serial with p one ulp up, when the gate ran it (<OF dir>_ulp): a diagnostic reference, not a bound
+    if [ -d "${o}_ulp" ]
+    then
+        local ul tf n lo hi
+        ul=$(python3 "$FIELDS" ulpref "$b" "$o" "${o}_ulp" "$(echo $to | tr ' ' ',')" $(echo "$over" | grep -o '[^ ]*:[A-Za-z]*'))
+        read -r _ n lo hi tf <<< "$(echo "$ul" | head -n 1)"
+        echo "     $name: diagnostic, OpenFOAM serial with p one ulp up (not a bound): brae's distance from serial is $lo to $hi x the one-ulp run's over $n field-times (largest at $tf)"
+        echo "$ul" | sed -n 's/^at \(.*\)/     '"$name"': at \1/p' | head -n 8
+    fi
     echo "     $name absolute, t = $last:$(awk '{printf " %s %s (rel %s)", $2, $3, $4}' "$k/$last.abs")"
 }
 

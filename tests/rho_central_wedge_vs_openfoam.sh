@@ -236,5 +236,6 @@ red "laggedRhoB, cone17e" "$W/cL_cone17e" "$W/of_cone17e" "$(spread cone17e)"
 for c in wedge17 oblique17 cone17; do
     echo "     runtime $c: OpenFOAM $(grep -h '^ExecutionTime' "$W/of_$c/log" | tail -n 1 | awk '{print $3}') s; brae CUDA $(sed -n 's/^diag steps \([^ ]*\) step-seconds \([^ ]*\) per-step-us \([^ ]*\).*/\2 s (\1 steps, \3 us a step)/p' "$W/b_$c/log"), $(sed -n 's/^diag device-memory/device memory/p' "$W/b_$c/log"); host $(sed -n 's/^diag steps [^ ]* step-seconds \([^ ]*\).*/\1 s/p' "$W/h_$c/log")"
 done
+opensummary
 echo "rho_central_wedge_vs_openfoam: $passes passed, $fails failed (work in $W)"
 [ "$fails" = 0 ] && [ "$passes" -ge 127 ]
