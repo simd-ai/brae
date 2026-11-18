@@ -305,6 +305,18 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
         std::printf("diag solve-residual momentum %.6e %.6e %.6e energy %.6e (deltaT*sum(b - A x) of the implicit "
                     "correctors: the balance is minus this, to round-off)\n", (double)rm.x, (double)rm.y, (double)rm.z,
                     (double)re);
+        vector lm, im;
+        scalar le, ie;
+        arm->solveResidualL1(lm, le);
+        arm->solveIdentity(im, ie);
+        std::printf("diag solve-residual-l1 momentum %.6e %.6e %.6e energy %.6e (deltaT*sum|b - A x|: the "
+                    "unnormalized algebraic residual)\n", (double)lm.x, (double)lm.y, (double)lm.z, (double)le);
+        std::printf("diag balance-accounted energy %.6Le momentum %.6Le %.6Le %.6Le (the balance plus the solves' "
+                    "remainder)\n", eE + (long double)re, eU[0] + (long double)rm.x, eU[1] + (long double)rm.y,
+                    eU[2] + (long double)rm.z);
+        std::printf("diag solve-identity momentum %.3e %.3e %.3e energy %.3e (the largest error over the solves of "
+                    "sum rho V (x - x_p) = deltaT*(patch fluxes - sum(b - A x)), over sum rho V |x|)\n", (double)im.x,
+                    (double)im.y, (double)im.z, (double)ie);
     }
     std::printf("diag roundoff mass %.3Le energy %.3Le momentum %.3Le %.3Le %.3Le (four ulps a cell a step)\n",
                 k*std::max(I0.ulpMass, I1.ulpMass), k*std::max(I0.ulpEnergy, I1.ulpEnergy),

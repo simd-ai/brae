@@ -210,7 +210,65 @@ __global__ void viscousInflowKernel(int nB, scalar deltaT, const label* __restri
     atomicAdd(&inflow[3], deltaT*en);
 }
 
+// the identity's pieces: rho V (x - x_p) on the cells, rho V |x| (its scale), and (bC - iC x_c) (+ Sf & tauMC_b) on the
+// non-empty patch faces
+__global__ void identityCellsKernel(int n, const scalar* __restrict__ rho, const scalar* __restrict__ V,
+                                    const scalar* __restrict__ x, const scalar* __restrict__ xp,
+                                    const scalar* __restrict__ s0, const scalar* __restrict__ s1,
+                                    const scalar* __restrict__ s2, scalar* __restrict__ d, scalar* __restrict__ m)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    const scalar rv = rho[c]*V[c];
+    d[c] = rv*(x[c] - xp[c]);
+    // the scale: rho V |U| for a momentum component (a component near zero is no scale), rho V |e| for energy
+    m[c] = s1 ? rv*sqrt(s0[c]*s0[c] + s1[c]*s1[c] + s2[c]*s2[c]) : rv*fabs(s0[c]);
+}
+__global__ void identityPatchKernel(int nB, const label* __restrict__ isEmpty, const label* __restrict__ bCell,
+                                    const scalar* __restrict__ iC, const scalar* __restrict__ bC,
+                                    const scalar* __restrict__ x, const scalar* __restrict__ tauB,
+                                    scalar* __restrict__ f)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= nB) return;
+    if (isEmpty[k]) { f[k] = 0; return; }
+    scalar v = bC[k] - iC[k]*x[bCell[k]];
+    if (tauB) v += tauB[k];
+    f[k] = v;
+}
+
 } // namespace
+
+void ViscousCorrectors::account(int k, const DeviceLduView& A, const DeviceBuffer<scalar>& x,
+                                const DeviceBuffer<scalar>& b, const DeviceBuffer<scalar>& rho,
+                                const DeviceBuffer<scalar>& iC, const DeviceBuffer<scalar>& bC,
+                                const DeviceBuffer<scalar>* tauB, scalar rDeltaT, const DeviceBuffer<scalar>* const* sc)
+{
+    deviceResidual(A, x, b, res_);
+    const double R = deviceDot(res_, ones_);
+    solveRes_[k] += R/rDeltaT;
+    solveResL1_[k] += deviceSumMag(res_)/rDeltaT;
+    idC_.resize(nC_);
+    DeviceBuffer<scalar>& m = idM_;
+    m.resize(nC_);
+    identityCellsKernel<<<blocksFor(nC_), kTPB>>>(nC_, rho.data(), dm_.V.data(), x.data(), xp_[k].data(),
+                                                  sc[0]->data(), sc[1] ? sc[1]->data() : nullptr,
+                                                  sc[2] ? sc[2]->data() : nullptr, idC_.data(), m.data());
+    cudaCheck(cudaGetLastError(), "identity cells");
+    const double lhs = deviceDot(idC_, ones_);
+    const double scale = deviceDot(m, ones_);
+    double bnd = 0;
+    if (nB_)
+    {
+        idB_.resize(nB_);
+        identityPatchKernel<<<blocksFor(nB_), kTPB>>>(nB_, dm_.bndIsEmpty.data(), bCell_.data(), iC.data(), bC.data(),
+                                                      x.data(), tauB ? tauB->data() : nullptr, idB_.data());
+        cudaCheck(cudaGetLastError(), "identity patches");
+        bnd = deviceDot(idB_, onesB_);
+    }
+    const double err = std::fabs(lhs - (bnd - R)/rDeltaT)/(scale > 0 ? scale : 1.0);
+    if (err > identityMax_[k]) identityMax_[k] = err;
+}
 
 ViscousCorrectors::ViscousCorrectors(const Case& cs, const DeviceMesh& dm, int control)
     : cs_(cs), dm_(dm), control_(control), nC_(cs.nC), nIF_(cs.nIF), nB_(cs.nB)
@@ -236,6 +294,7 @@ ViscousCorrectors::ViscousCorrectors(const Case& cs, const DeviceMesh& dm, int c
     negMuB_.copyFrom(std::vector<scalar>(nB_, -mu_));
     negAlphaB_.copyFrom(std::vector<scalar>(nB_, -alphaEff_));
     ones_.copyFrom(std::vector<scalar>(nC_, 1.0));
+    onesB_.copyFrom(std::vector<scalar>(nB_, 1.0));
     // the two laplacians' matrices (gaussLaplacianScheme: gammaMagSf = interpolate(gamma)*magSf, upper =
     // nonOrthDeltaCoeffs*gammaMagSf, diag = negSumDiag), and the corrector matrices' off-diagonal -upper
     DeviceBuffer<scalar> gms, upper;
@@ -344,11 +403,13 @@ void ViscousCorrectors::solveU(DeviceFields& F, DeviceVectorBoundary& dbU, scala
     }
     DeviceSolverPerf perf[3];
     const SmoothSolveControls& c = cs_.solveU;
+    for (int i = 0; i < n; ++i) copyD2D(xp_[solved[i]], *U[solved[i]]);   // U before the solve, for the identity
     if (n) deviceSymGaussSeidelFused(n, comps, c.tolerance, c.relTol, c.maxIter, c.minIter, c.nSweeps, c.symmetric, perf);
-    for (int i = 0; i < n; ++i)   // the run's unconserved remainder: deltaT*sum(b - A x)
+    for (int i = 0; i < n; ++i)   // the run's unconserved remainder deltaT*sum(b - A x), unsigned, and the identity
     {
-        deviceResidual(A_[solved[i]], *U[solved[i]], b_[solved[i]], res_);
-        solveRes_[solved[i]] += deviceDot(res_, ones_)/rDeltaT;
+        const DeviceBuffer<scalar>* sc[3] = {&F.Ux, &F.Uy, &F.Uz};
+        account(solved[i], A_[solved[i]], *U[solved[i]], b_[solved[i]], F.rho, iC_[solved[i]], bC_[solved[i]],
+                tau ? &dTauB_[solved[i]] : nullptr, rDeltaT, sc);
     }
     for (int i = 0; i < n && rep.nSolves < 4; ++i)
     {
@@ -448,9 +509,12 @@ void ViscousCorrectors::solveE(DeviceFields& F, const DeviceBoundary& dbT, scala
     GSFusedComponent comp{&AE_, &bE_, &F.e, 1.0, dnfE_.data()};
     DeviceSolverPerf perf;
     const SmoothSolveControls& c = cs_.solveE;
+    copyD2D(xp_[3], F.e);
     deviceSymGaussSeidelFused(1, &comp, c.tolerance, c.relTol, c.maxIter, c.minIter, c.nSweeps, c.symmetric, &perf);
-    deviceResidual(AE_, F.e, bE_, res_);
-    solveRes_[3] += deviceDot(res_, ones_)/rDeltaT;
+    {
+        const DeviceBuffer<scalar>* sc[3] = {&F.e, nullptr, nullptr};
+        account(3, AE_, F.e, bE_, F.rho, iCe_, bCe_, nullptr, rDeltaT, sc);
+    }
     if (rep.nSolves < 4)
     {
         SolveLine& l = rep.solves[rep.nSolves++];

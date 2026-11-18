@@ -55,6 +55,13 @@ public:
     // each solve, summed over the run -- x, y, z momentum and energy. A converged solve leaves round-off; the
     // tutorials' relTol 0.01 leaves more, the same as OpenFOAM's algorithm does (the totals move by minus this).
     void solveResidual(double out[4]) const { for (int k = 0; k < 4; ++k) out[k] = solveRes_[k]; }
+    // The same remainder unsigned, deltaT*sum|b - A x| (the actual, unnormalized algebraic residual), and the largest
+    // error, over the run's solves, of the identity each solve satisfies (x the solved field, x_p the field before it):
+    //   sum_c rho_c V_c (x_c - x_p,c) = deltaT*[sum_b (bC_b - iC_b x_c(b)) (+ sum_b Sf_b & tauMC_b for U)] - deltaT*sum_c r_c
+    // relative to sum_c rho_c V_c |U_c| (momentum) or |e_c| (energy): the signs, the volume weights and the patch contributions checked one solve
+    // at a time. x, y, z momentum and energy.
+    void solveResidualL1(double out[4]) const { for (int k = 0; k < 4; ++k) out[k] = solveResL1_[k]; }
+    void solveIdentity(double out[4]) const { for (int k = 0; k < 4; ++k) out[k] = identityMax_[k]; }
 
 private:
     const brae::rhoCentral::Case& cs_;
@@ -80,6 +87,13 @@ private:
     DeviceBuffer<label> bCell_;
     DeviceBuffer<scalar> res_;
     double solveRes_[4] = {0, 0, 0, 0};
+    double solveResL1_[4] = {0, 0, 0, 0};
+    double identityMax_[4] = {0, 0, 0, 0};
+    DeviceBuffer<scalar> xp_[4], idC_, idM_, idB_, onesB_;
+    // after a solve: its remainder, unsigned remainder and identity error into slot k
+    void account(int k, const DeviceLduView& A, const DeviceBuffer<scalar>& x, const DeviceBuffer<scalar>& b,
+                 const DeviceBuffer<scalar>& rho, const DeviceBuffer<scalar>& iC, const DeviceBuffer<scalar>& bC,
+                 const DeviceBuffer<scalar>* tauB, scalar rDeltaT, const DeviceBuffer<scalar>* const* scale);
 };
 
 } // namespace rhoCentral

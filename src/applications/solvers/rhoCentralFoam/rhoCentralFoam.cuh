@@ -34,6 +34,9 @@ public:
     virtual std::size_t deviceBytes() const { return 0; }
     // the viscous correctors' unconserved remainder, deltaT*sum(b - A x) over the run (milestone G); 0 inviscid
     virtual void solveResidual(vector& mom, scalar& energy) const { mom = vector{0, 0, 0}; energy = 0; }
+    // the remainder unsigned, and the per-solve identity's largest error (rhoCentralViscous.cuh); 0 inviscid
+    virtual void solveResidualL1(vector& mom, scalar& energy) const { mom = vector{0, 0, 0}; energy = 0; }
+    virtual void solveIdentity(vector& mom, scalar& energy) const { mom = vector{0, 0, 0}; energy = 0; }
 };
 
 // Integral diagnostics of a state: totals of V*rho, V*rhoU, V*rhoE, and the extrema the positivity check reads.

@@ -681,6 +681,21 @@ public:
 
     std::size_t deviceBytes() const override { return bytes_; }
 
+    void solveResidualL1(vector& mom, scalar& energy) const override
+    {
+        double r[4] = {0, 0, 0, 0};
+        if (vis_) vis_->solveResidualL1(r);
+        mom = vector{r[0], r[1], r[2]};
+        energy = r[3];
+    }
+    void solveIdentity(vector& mom, scalar& energy) const override
+    {
+        double r[4] = {0, 0, 0, 0};
+        if (vis_) vis_->solveIdentity(r);
+        mom = vector{r[0], r[1], r[2]};
+        energy = r[3];
+    }
+
     void solveResidual(vector& mom, scalar& energy) const override
     {
         double r[4] = {0, 0, 0, 0};

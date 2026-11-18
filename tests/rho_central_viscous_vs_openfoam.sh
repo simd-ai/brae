@@ -32,6 +32,13 @@
 #                (OpenFOAM's algorithm the same). brae now prints that remainder (`diag solve-residual`), and
 #   SOLVE-CONSERVATION  momentum and energy balance PLUS the solves' remainder within the same round-off (added
 #                after the first run, beside the red check, not in place of it: a decision for review)
+#   IDENTITY     (milestone H, declared before it ran on a gate) every U and e solve satisfies
+#                sum_c rho V (x - x_p) = deltaT*(sum of its patch fluxes [+ Sf & tauMC_b] - sum(b - A x)) to within 1e-12
+#                of sum_c rho V |U| (|e|): signs, volume weights and patch contributions, one solve at a time
+#                (`diag solve-identity`; round-off is ~1e-16). Reported: the remainder signed and unsigned (sum|b - A x|).
+#   TOLERANCE    (milestone H) Sod at four solve settings, the tutorials' (U relTol 0.01), A (U relTol 1e-3, e
+#                tolerance 1e-11), B (U 1e-11, e 1e-12, relTol 0) and sod_conv's (1e-13): the raw momentum and energy
+#                imbalances fall at every step of the tightening (brae's own diagnostic; reported with the remainders)
 #   EXACT        (reported) shear and conduction against the erf solutions of their constant-density limits
 #   MEMORY, RUNTIME (reported)
 # CONTROLS (rhoCentralState.cuh), red against OpenFOAM by more than 100 x the bound:
@@ -84,6 +91,10 @@ for c in $CASES; do stage "$W/$c" "$(kindof "$c")"; done
 # sod_conv: both correctors converged
 sed -i -E 's/^(\s*tolerance\s+)1e-09;/\11e-13;/; s/^(\s*tolerance\s+)1e-10;/\11e-13;/; s/^(\s*relTol\s+)0\.01;/\10;/' "$W/sod_conv/system/fvSolution"
 grep -qE "relTol\s+0\.01" "$W/sod_conv/system/fvSolution" && fail "stage sod_conv: relTol"
+# the tolerance sweep's two middle points (brae only: they measure brae's own conservation)
+for t in A B; do copy "$W/sod" "$W/sod_tol$t"; done
+sed -i -E 's/^(\s*relTol\s+)0\.01;/\11e-03;/; s/^(\s*tolerance\s+)1e-10;/\11e-11;/' "$W/sod_tolA/system/fvSolution"
+sed -i -E 's/^(\s*relTol\s+)0\.01;/\10;/; s/^(\s*tolerance\s+)1e-09;/\11e-11;/; s/^(\s*tolerance\s+)1e-10;/\11e-12;/' "$W/sod_tolB/system/fvSolution"
 # the premise's twins: the same cases with mu = 0
 for c in shear conduction sod oblique; do
     copy "$W/$c" "$W/inv_$c"
@@ -105,7 +116,7 @@ wait
 for c in $CASES; do for r in "" _np2 _np4; do grep -qx End "$W/of_$c$r/log" || fail "OpenFOAM${r:+ $r} did not finish $c"; done; done
 
 # ---- brae -------------------------------------------------------------------------------------------------------------
-for c in $CASES; do copy "$W/$c" "$W/b_$c"; braerun "$W/b_$c"; done
+for c in $CASES sod_tolA sod_tolB; do copy "$W/$c" "$W/b_$c"; braerun "$W/b_$c"; done
 copy "$W/sod" "$W/cT_sod";         ctlrun "$W/cT_sod" BRAE_CONTROL_RCF=noTauMC
 copy "$W/oblique" "$W/cT_oblique"; ctlrun "$W/cT_oblique" BRAE_CONTROL_RCF=noTauMC
 copy "$W/shear" "$W/cS_shear";     ctlrun "$W/cS_shear" BRAE_CONTROL_RCF=noSigmaDotU
@@ -197,6 +208,30 @@ sys.exit(0 if len(s) == 4 and len(q) == 4 and all(x <= y for x, y in zip(s, q)) 
     else fail "$d solve-conservation: balance '$bal' + remainder '$res' = '$sums' against round-off '$rnd'"; fi
 }
 for c in $CASES; do vbalance "b_$c"; done
+# the identity, solve by solve
+for c in $CASES; do
+    id=$(sed -n 's/^diag solve-identity momentum \([^ ]*\) \([^ ]*\) \([^ ]*\) energy \([^ ]*\) .*/\1 \2 \3 \4/p' "$W/b_$c/log")
+    if python3 -c "
+import sys
+v = [float(x) for x in '$id'.split()]
+sys.exit(0 if len(v) == 4 and max(v) <= 1e-12 else 1)" 2> /dev/null
+    then ok "b_$c: every solve satisfies its conservation identity, largest error $(echo $id | tr ' ' '\n' | sort -g | tail -n 1) of sum rho V |U| (|e|) (momentum x y z, energy: $id; bound 1e-12)"
+    else fail "b_$c: solve identity '${id:-none}' above 1e-12"; fi
+    echo "     b_$c remainders: $(sed -n 's/^diag solve-residual momentum \(.*\) (deltaT.*/signed momentum \1/p' "$W/b_$c/log"); $(sed -n 's/^diag solve-residual-l1 momentum \(.*\) (deltaT.*/unsigned momentum \1/p' "$W/b_$c/log")"
+done
+# the tolerance sweep
+sweep=""
+for c in sod sod_tolA sod_tolB sod_conv; do
+    sweep="$sweep $(sed -n 's/^diag balance mass [^ ]* energy \([^ ]*\) momentum \([^ ]*\) .*/\2:\1/p' "$W/b_$c/log")"
+    echo "     tolerance sweep, $c: raw imbalance $(sed -n 's/^diag balance mass [^ ]* energy \([^ ]*\) momentum \([^ ]*\) .*/momentum_x \2, energy \1/p' "$W/b_$c/log"); remainder $(sed -n 's/^diag solve-residual-l1 momentum \([^ ]*\) [^ ]* [^ ]* energy \([^ ]*\) .*/unsigned momentum_x \1, energy \2/p' "$W/b_$c/log")"
+done
+if python3 -c "
+import sys
+p = [tuple(abs(float(y)) for y in x.split(':')) for x in '$sweep'.split()]
+ok = len(p) == 4 and all(p[i + 1][0] < p[i][0] and p[i + 1][1] < p[i][1] for i in range(3))
+sys.exit(0 if ok else 1)" 2> /dev/null
+then ok "tolerance sweep: tightening the U and e solves lowers the raw momentum and energy imbalance at every step (momentum:energy$sweep)"
+else fail "tolerance sweep: the raw imbalance does not fall at every tightening (momentum:energy$sweep)"; fi
 
 # ---- memory and runtime (reported) ------------------------------------------------------------------------------------------
 for c in $CASES; do
