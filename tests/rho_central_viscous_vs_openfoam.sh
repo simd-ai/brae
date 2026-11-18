@@ -35,8 +35,10 @@
 #   EXACT        (reported) shear and conduction against the erf solutions of their constant-density limits
 #   MEMORY, RUNTIME (reported)
 # CONTROLS (rhoCentralState.cuh), red against OpenFOAM by more than 100 x the bound:
-#   noTauMC      tauMC left out (U corrector and sigmaDotU): sod, oblique
-#   noSigmaDotU  - fvc::div(sigmaDotU) left out of the rhoE equation: shear, sod
+#   noTauMC      tauMC left out (U corrector and sigmaDotU): sod, oblique, sod_conv
+#   noSigmaDotU  - fvc::div(sigmaDotU) left out of the rhoE equation: shear, sod, sod_conv
+#   (with the tutorials' relTol 0.01 OpenFOAM's decomposed runs part from serial by 1e-7 to 1e-3, so the envelope and
+#   the controls' margins are wide there; sod_conv's converged solves keep that spread at round-off)
 # NOT CLAIMED  sutherland (refused), turbulence (refused), wedge patches with mu > 0 (refused), the host reference arm
 #   (refused), non-orthogonal correction beyond the corrected scheme's explicit part on these meshes, 3-D, multi-GPU.
 set -u
@@ -108,6 +110,9 @@ copy "$W/sod" "$W/cT_sod";         ctlrun "$W/cT_sod" BRAE_CONTROL_RCF=noTauMC
 copy "$W/oblique" "$W/cT_oblique"; ctlrun "$W/cT_oblique" BRAE_CONTROL_RCF=noTauMC
 copy "$W/shear" "$W/cS_shear";     ctlrun "$W/cS_shear" BRAE_CONTROL_RCF=noSigmaDotU
 copy "$W/sod" "$W/cS_sod";         ctlrun "$W/cS_sod" BRAE_CONTROL_RCF=noSigmaDotU
+# the same two on sod_conv, whose converged solves leave OpenFOAM's own spread at round-off (the envelope tight)
+copy "$W/sod_conv" "$W/cT_sod_conv"; ctlrun "$W/cT_sod_conv" BRAE_CONTROL_RCF=noTauMC
+copy "$W/sod_conv" "$W/cS_sod_conv"; ctlrun "$W/cS_sod_conv" BRAE_CONTROL_RCF=noSigmaDotU
 # the host reference arm refuses mu > 0
 copy "$W/sod" "$W/h_sod"
 (cd "$W/h_sod" && BRAE_RHOCENTRALFOAM_ARM=cpu "$BIN" -case . > log 2>&1 < /dev/null; echo $? > rc)
@@ -146,7 +151,7 @@ for c in $CASES; do
         echo "     $c: OpenFOAM's own $r against serial: $(sed -n 's/^iterations \([0-9]*\) .*/\1/p' "$k/solves.$r") of $(sed -n 's/^solves \([0-9]*\) .*/\1/p' "$k/solves.$r") iteration counts the same, initial residuals median $(awk '/^initial/ {print $5}' "$k/solves.$r"), worst $(awk '/^initial/ {print $2}' "$k/solves.$r")"
     done
     # the viscous fluxes
-    mu=$(mupr "$c"); pr=$(prof "$c"); over=""; worst=0; wl=""
+    mu=$(mupr "$c"); pr=$(prof "$c"); over=""; worst=-1; wl=""
     for t in $(times "$W/of_$c"); do
         read -r _ _ sb _ hb <<< "$(python3 "$VISC" fluxes "$W/b_$c" "$W/of_$c" "$t" "$mu" "$pr")"
         read -r _ _ s2 _ h2 <<< "$(python3 "$VISC" fluxes "$W/of_${c}_np2" "$W/of_$c" "$t" "$mu" "$pr")"
@@ -155,7 +160,7 @@ for c in $CASES; do
             read -r nm vb v2 v4 <<< "$q"
             bd=$(mx "$BOUND" "$(python3 -c "print(10*max(float('$v2'), float('$v4')))")")
             le "$vb" "$bd" || over="$over $t:$nm($vb>$bd)"
-            r=$(python3 -c "print('%.3f' % (float('$vb')/float('$bd')))")
+            r=$(python3 -c "print('%.3g' % (float('$vb')/float('$bd')))")
             python3 -c "import sys; sys.exit(0 if float('$r') > float('$worst') else 1)" && { worst=$r; wl="$nm $vb at t = $t (OpenFOAM in two $v2, in four $v4)"; }
         done
     done
@@ -203,6 +208,8 @@ red "noTauMC, sod" "$W/cT_sod" "$W/of_sod" "$(spread sod)"
 red "noTauMC, oblique" "$W/cT_oblique" "$W/of_oblique" "$(spread oblique)"
 red "noSigmaDotU, shear" "$W/cS_shear" "$W/of_shear" "$(spread shear)"
 red "noSigmaDotU, sod" "$W/cS_sod" "$W/of_sod" "$(spread sod)"
+red "noTauMC, sod_conv" "$W/cT_sod_conv" "$W/of_sod_conv" "$(spread sod_conv)"
+red "noSigmaDotU, sod_conv" "$W/cS_sod_conv" "$W/of_sod_conv" "$(spread sod_conv)"
 opensummary
 echo "rho_central_viscous_vs_openfoam: $passes passed, $fails failed (work in $W)"
 [ "$fails" = 0 ] && [ "$passes" -ge "${BRAE_RCF_G_MIN_PASSES:-1}" ]
