@@ -26,12 +26,17 @@
 #   SOLVES       the same solves in the same order; every iteration count OpenFOAM serial's
 #   FLUXES       the viscous stress mu*dU/dn and heat flux alphaEff*Cv*dT/dn on every internal face (the same arithmetic
 #                for every run), at every write time within ten times OpenFOAM's own spread of them (floor BOUND)
-#   CONSERVATION mass, momentum and energy to brae's round-off, the patches' viscous fluxes counted; positivity.
-#                FOUND ON THE FIRST RUN (2026-11-18), kept red: momentum and energy do not close to round-off, because an
-#                implicit corrector solved to a tolerance leaves b - A x, and the totals move by -deltaT*sum(b - A x)
-#                (OpenFOAM's algorithm the same). brae now prints that remainder (`diag solve-residual`), and
-#   SOLVE-CONSERVATION  momentum and energy balance PLUS the solves' remainder within the same round-off (added
-#                after the first run, beside the red check, not in place of it: a decision for review)
+#   CONSERVATION (acceptance, decided by the user 2026-11-18) the residual-accounted discrete balance, SOLVE-
+#                CONSERVATION below, is the round-off closure test of an implicit linear solve; positivity is checked.
+#                The RAW physical imbalance is always reported beside it, with its original round-off allowance, as a
+#                historical result (`hist`, counted apart, neither pass nor FAIL): milestone G's five original checks
+#                (FOUND ON THE FIRST RUN, 2026-11-18: momentum and energy do not close to round-off, because an implicit
+#                corrector solved to a tolerance leaves b - A x, and the totals move by -deltaT*sum(b - A x), OpenFOAM's
+#                algorithm the same; red, tolerance-limited, until the decision). brae prints the remainder
+#                (`diag solve-residual`), and
+#   SOLVE-CONSERVATION  momentum and energy balance PLUS the solves' remainder within the same round-off; it rests on
+#                IDENTITY (the remainder is the solves' own, signs, volumes and patches checked) and TOLERANCE (tighter
+#                solves lower the raw imbalance)
 #   IDENTITY     (milestone H, declared before it ran on a gate) every U and e solve satisfies
 #                sum_c rho V (x - x_p) = deltaT*(sum of its patch fluxes [+ Sf & tauMC_b] - sum(b - A x)) to within 1e-12
 #                of sum_c rho V |U| (|e|): signs, volume weights and patch contributions, one solve at a time
@@ -190,7 +195,7 @@ for c in shear conduction; do
 done
 
 # ---- conservation and stability --------------------------------------------------------------------------------------------
-for c in $CASES; do balance "b_$c"; done
+for c in $CASES; do balance "b_$c" raw; done   # the raw imbalance: historical, reported (see CONSERVATION)
 
 # the balance once the correctors' unconserved remainder is counted (see SOLVE-CONSERVATION above), and the identity,
 # solve by solve (tests/rho_central_gate_lib.sh: vbalance, identity)
@@ -223,5 +228,5 @@ red "noSigmaDotU, sod" "$W/cS_sod" "$W/of_sod" "$(spread sod)"
 red "noTauMC, sod_conv" "$W/cT_sod_conv" "$W/of_sod_conv" "$(spread sod_conv)"
 red "noSigmaDotU, sod_conv" "$W/cS_sod_conv" "$W/of_sod_conv" "$(spread sod_conv)"
 opensummary
-echo "rho_central_viscous_vs_openfoam: $passes passed, $fails failed (work in $W)"
+echo "rho_central_viscous_vs_openfoam: $passes passed, $fails failed, $historical historical (raw conservation, reported) (work in $W)"
 [ "$fails" = 0 ] && [ "$passes" -ge "${BRAE_RCF_G_MIN_PASSES:-1}" ]

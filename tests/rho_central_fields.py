@@ -122,9 +122,13 @@ def cell_centres(case):
 
 # ---- comparisons -----------------------------------------------------------------------------------------------------
 def absdiff(a, b, fields):
+    """Largest |a - b| per field; a field may name components, `U:xy` (in-plane) or `U:z`, compared on those alone."""
     out = []
     for f in fields:
-        x, y = internal(f"{a}/{f}"), internal(f"{b}/{f}")
+        name, cols = (f.split(":")[0], ["xyz".index(c) for c in f.split(":")[1]]) if ":" in f else (f, None)
+        x, y = internal(f"{a}/{name}"), internal(f"{b}/{name}")
+        if cols is not None:
+            x, y = x[:, cols], y[:, cols]
         d = np.abs(x - y)
         if d.ndim == 2:
             d = d.max(axis=1)

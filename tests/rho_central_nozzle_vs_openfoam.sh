@@ -18,6 +18,8 @@
 #   ladenburg        LadenburgJet60psi as shipped (1200 cells, axisymmetric wedge; startFrom its converged 0, endTime 2e-5,
 #                    maxCo 0.5; U and e smoothSolver GaussSeidel to 1e-10, relTol 0), writePrecision 17
 #   ladenburg_long   the same to 1e-4, writes every 2e-5
+#   ladenburg_uzseed (milestone I) the shipped case with U_z seeded +-1e-3 in cells 25-39, to 3e-5, writes every 5e-6:
+#                    OpenFOAM's out-of-plane mode at the Mach disk grown from a seed far above round-off
 #   reservoir        the 1000-cell tube at rest fed through totalPressure/totalTemperature (p0 2, T0 1.2) into a
 #                    waveTransmissive outlet (fieldInf 1, lInf 2); inviscid; t = 10
 #   pulse            a pressure pulse leaving both ends through waveTransmissive (one with lInf, one without); inviscid; t = 6
@@ -51,6 +53,8 @@
 #   waveNoRelax          lInf ignored: reservoir, pulse, ladenburg
 #   waveVolumeFlux       w from phi/|Sf| (not divided by rho_b): reservoir, pulse, ladenburg
 #   totalTemperatureOnce T_b not re-evaluated at the e matrix's construction: reservoir_visc, ladenburg
+#   residualUnfused      (milestone I) the viscous solves' loop residual rounded product by product, where OpenFOAM's
+#                        aarch64 build fuses each multiply-subtract: reservoir_visc's stopping test parts in MORE solves
 # REFUSED     the host reference arm (checked here); totalPressure's rho and incompressible forms, these patches on other
 #   fields or other fluxes, waveTransmissive's lInf without fieldInf (tests/rho_central_refusals.sh)
 # NOT CLAIMED  turbulence (refused), mesh motion, 3-D cases, multi-GPU, performance (GaussSeidel sweeps on the CPU).
@@ -95,8 +99,8 @@ stage()   # stage <dir> <kind>
     of "cd '$d' && blockMesh > log.blockMesh 2>&1" < /dev/null || fail "stage $(basename "$d"): blockMesh"
     return 0
 }
-CASES="ladenburg ladenburg_long reservoir pulse backflow reservoir_visc conduction_suth"
-VCASES="ladenburg ladenburg_long reservoir_visc conduction_suth"
+CASES="ladenburg ladenburg_long ladenburg_uzseed reservoir pulse backflow reservoir_visc conduction_suth"
+VCASES="ladenburg ladenburg_long ladenburg_uzseed reservoir_visc conduction_suth"
 ICASES="reservoir pulse backflow"
 for c in $CASES; do stage "$W/$c" "$c"; done
 patchesof() { case $1 in ladenburg*) echo inlet,outlet,freestream,freestreamInlet ;; conduction_suth) echo "" ;; *) echo inlet,outlet ;; esac; }
@@ -119,6 +123,7 @@ for c in reservoir reservoir_visc ladenburg; do control noDynamicHead "$c"; done
 for c in reservoir backflow ladenburg; do control nozzleFlowInverted "$c"; done
 for c in reservoir pulse ladenburg; do control waveNoRelax "$c"; control waveVolumeFlux "$c"; done
 for c in reservoir_visc ladenburg; do control totalTemperatureOnce "$c"; done
+control residualUnfused reservoir_visc
 # the host reference arm refuses the nozzle boundaries
 copy "$W/reservoir" "$W/h_reservoir"
 (cd "$W/h_reservoir" && BRAE_RHOCENTRALFOAM_ARM=cpu "$BIN" -case . > log 2>&1 < /dev/null; echo $? > rc)
@@ -144,7 +149,25 @@ for c in $VCASES; do
     then ok "$c (CUDA): every iteration count OpenFOAM serial's ($nb solves, $(grep -E 'Solving for (U|e)' "$W/of_$c/log" | grep -oE 'No Iterations [0-9]+' | awk '{s+=$3; if ($3>m) m=$3} END {printf "%d sweeps in all, at most %d", s, m}'))"
     else fail "$c (CUDA): iteration counts differ from solve ${ifirst:-?} (${iok:-?} of $nb the same)"; fi
     echo "     $c (CUDA): initial residuals against OpenFOAM serial's: median relative difference $imed, worst $iw (solve $iws, $iwf)"
+    # OpenFOAM's own sensitivity of the stopping test (reported, bounds nothing): its perturbed runs against serial
+    own=""
+    for r in np2:"in two" np4:"in four" ulp:"one ulp up"; do
+        read -r _ rk rf <<< "$(python3 "$STEPS" solves "$W/of_${c}_${r%%:*}/log" "$W/of_$c/log" 2>/dev/null | sed -n 's/^iterations /x /p')"
+        own="$own, ${r#*:} $(( nb - ${rk:-0} )) (first at solve ${rf:-?})"
+    done
+    echo "     $c: OpenFOAM's own runs against its serial, iteration counts that differ:${own#,}"
 done
+
+# the loop residual's rounding (milestone I): with the products rounded apart (x86-64 OpenFOAM's form) the stopping test
+# parts from the reference's (OpenFOAM's aarch64 build fuses them) in more solves than brae's own does
+k=$(cmpdir "$W/cresidualUnfused_reservoir_visc")
+python3 "$STEPS" solves "$W/cresidualUnfused_reservoir_visc/log" "$W/of_reservoir_visc/log" > "$k/solves.cmp" 2>&1
+read -r un _ <<< "$(sed -n 's/^iterations //p' "$k/solves.cmp")"
+read -r fu _ <<< "$(sed -n 's/^iterations //p' "$(cmpdir "$W/b_reservoir_visc")/solves.cmp")"
+read -r ns _ <<< "$(sed -n 's/^solves //p' "$k/solves.cmp")"
+if [ -n "$un" ] && [ -n "$fu" ] && [ "$((ns - un))" -gt "$((ns - fu))" ]
+then ok "control residualUnfused, reservoir_visc red: iteration counts differ from OpenFOAM serial's in $((ns - un)) of $ns solves, against $((ns - fu)) with the fused residual"
+else fail "control residualUnfused, reservoir_visc: $((ns - ${un:-0})) differing solves, fused $((ns - ${fu:-0}))"; fi
 
 # the boundary profiles, write time by write time
 for c in $CASES; do
@@ -186,6 +209,40 @@ branch()   # branch <case> <patch> <p0> <want: both|in|out>
 }
 branch ladenburg freestream 101325 both
 branch ladenburg_long freestream 101325 both
+
+# ---- the out-of-plane mode at the Mach disk (milestone I; H's open item, kept red above) ---------------------------------
+# U_z is round-off on a wedge (0 at t = 0 in every cell). OpenFOAM's discretization has a mode there that grows: seeded
+# +-1e-9 (cells 25-39) it grows to 1.07e-5 by t = 1e-4 in OpenFOAM and in brae alike (milestone I). Unseeded,
+# brae's own round-off excites it from about 4e-5; OpenFOAM's in two, in four and one ulp up do not within 1e-4, while
+# OpenFOAM with a random U_z of 100 ulps of |U| does (7e-8 at 1e-4; 1 ulp does not). Covered here by
+#   IN-PLANE  ladenburg_long's U_x and U_y at every write within ten times OpenFOAM's own spread of them (floor BOUND)
+#   SEEDED    ladenburg_uzseed through the arm above (fields, steps, solves): the mode's growth from 1e-3, both codes
+#   reported  max|U_z| over cells 25-39 at every write: brae, OpenFOAM serial, in two, in four, one ulp up
+inplane()   # inplane <case>
+{
+    local c=$1 t vb v2 v4 bd over="" worst=-1 wl="" r
+    for t in $(times "$W/of_$c"); do
+        vb=$(python3 "$FIELDS" absdiff "$W/b_$c/$t" "$W/of_$c/$t" U:xy | awk '/^absdiff/ {print $4}')
+        v2=$(python3 "$FIELDS" absdiff "$W/of_${c}_np2/$t" "$W/of_$c/$t" U:xy | awk '/^absdiff/ {print $4}')
+        v4=$(python3 "$FIELDS" absdiff "$W/of_${c}_np4/$t" "$W/of_$c/$t" U:xy | awk '/^absdiff/ {print $4}')
+        bd=$(mx "$BOUND" "$(python3 -c "print(10*max(float('${v2:-nan}'), float('${v4:-nan}')))")")
+        le "${vb:-nan}" "$bd" || over="$over $t(${vb:-nan}>$bd)"
+        r=$(python3 -c "print('%.3g' % (float('${vb:-nan}')/float('$bd')))")
+        python3 -c "import sys; sys.exit(0 if float('$r') > float('$worst') else 1)" 2> /dev/null && { worst=$r; wl="$vb at t = $t (OpenFOAM in two $v2, in four $v4)"; }
+    done
+    if [ -z "$over" ]; then ok "$c (CUDA): U's in-plane components (x, y) within ten times OpenFOAM's own spread at every write time; closest ($worst of the bound): $wl"
+    else fail "$c (CUDA): U's in-plane components above the bound at$over"; fi
+}
+inplane ladenburg_long
+for c in ladenburg_long ladenburg_uzseed; do
+    for t in $(times "$W/of_$c"); do
+        echo "     $c, max|U_z| over cells 25-39 at t = $t: $(python3 -c "
+import sys; sys.path.insert(0, '$ROOT/tests')
+import numpy as np, rho_central_fields as rf
+r = [('brae', '$W/b_$c'), ('OpenFOAM', '$W/of_$c'), ('in two', '$W/of_${c}_np2'), ('in four', '$W/of_${c}_np4'), ('one ulp up', '$W/of_${c}_ulp')]
+print(', '.join('%s %.3e' % (n, np.abs(np.asarray(rf.internal(d + '/$t/U'), float)[25:40, 2]).max()) for n, d in r))")"
+    done
+done
 branch reservoir inlet 2 in
 branch reservoir_visc inlet 2 in
 branch backflow inlet 1.1 out

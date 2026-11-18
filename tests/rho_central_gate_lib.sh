@@ -52,6 +52,11 @@ opensummary() { local k; for k in "${!opencount[@]}"; do echo "     open: ${open
 # DIAGNOSTIC reference beside serial, in two and in four: arm() reports brae's distance against it, never bounds by it
 ofulp() { copy "$1" "$2"; python3 "$FIELDS" nudge "$2/$3/p" > /dev/null && ofrun "$2"; }
 ok() { passes=$((passes + 1)); echo "ok   $*"; }
+# hist: a historical result, reported and counted apart, neither a pass nor a FAIL. Used for milestone G's five raw
+# conservation checks after the decision of 2026-11-18 (acceptance for an implicit solve is the residual-accounted
+# balance; the raw imbalance stays reported, with its original allowance, beside it).
+historical=0
+hist() { historical=$((historical + 1)); echo "hist $*"; }
 of() { bash -c "set +u; source '$OFBASHRC' > /dev/null 2>&1; set -e; $*"; }
 le() { python3 -c "import sys; sys.exit(0 if float('${1:-nan}') <= float('$2') else 1)" 2> /dev/null; }
 mx() { python3 -c "print('%.3e' % max(float('$1'), float('$2')))"; }
@@ -273,9 +278,9 @@ red()
 }
 
 # balance <brae dir>: `diag balance` within `diag roundoff` (four ulps of every cell's total a step), and positivity
-balance()
+balance()   # balance <dir> [raw]: with "raw", the conservation line is a historical report (hist), not a check
 {
-    local d=$1 bal rnd rel bad t
+    local d=$1 mode=${2:-} bal rnd rel bad t
     bal=$(sed -n 's/^diag balance mass \([^ ]*\) energy \([^ ]*\) momentum \([^ ]*\) \([^ ]*\) \([^ ]*\) .*/\1 \2 \3 \4 \5/p' "$W/$d/log")
     rnd=$(sed -n 's/^diag roundoff mass \([^ ]*\) energy \([^ ]*\) momentum \([^ ]*\) \([^ ]*\) \([^ ]*\) .*/\1 \2 \3 \4 \5/p' "$W/$d/log")
     rel=$(sed -n 's/.*relative to the start totals: mass \([^ ]*\) energy \([^)]*\)).*/mass \1 energy \2/p' "$W/$d/log")
@@ -284,7 +289,13 @@ import sys
 b = [abs(float(x)) for x in '$bal'.split()]; r = [float(x) for x in '$rnd'.split()]
 sys.exit(0 if len(b) == 5 and len(r) == 5 and all(x <= y for x, y in zip(b, r)) else 1)" 2> /dev/null
     then
-        ok "$d conserves mass, momentum and energy to its round-off: balance $bal within $rnd (relative to the start totals: $rel)"
+        if [ "$mode" = raw ]
+        then hist "$d raw conservation within its round-off (reported; acceptance is the residual-accounted balance): balance $bal within $rnd"
+        else ok "$d conserves mass, momentum and energy to its round-off: balance $bal within $rnd (relative to the start totals: $rel)"
+        fi
+    elif [ "$mode" = raw ]
+    then
+        hist "$d raw conservation: balance '${bal:-none}' against round-off '${rnd:-none}' -- milestone G's original check, a historical tolerance-limited result: the implicit U and e solves stop at their declared tolerance and leave deltaT*sum(b - A x); acceptance since 2026-11-18 is the residual-accounted balance (vbalance), with the identity and the tolerance sweep"
     else
         fail "$d conservation: balance '${bal:-none}' against round-off '${rnd:-none}'"
     fi

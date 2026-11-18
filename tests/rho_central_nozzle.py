@@ -4,7 +4,9 @@
   rho_central_nozzle.py setup <kind> <case>
       rewrites a staged case before its mesh. `ladenburg` and `ladenburg_long` are OpenFOAM's LadenburgJet60psi (its
       0.orig unpacked into 0 by the gate): as shipped but for writePrecision 17, and the long one run five times as far
-      (endTime 1e-4, writes every 2e-5). The rest are shockTube staged as tests/rho_central_viscous.py stages it: the
+      (endTime 1e-4, writes every 2e-5). `ladenburg_uzseed` (milestone I) is the shipped case with U_z seeded +-1e-3 in
+      cells 25-39, the first row off the axis around the Mach disk, run to 3e-5 with writes every 5e-6: OpenFOAM's
+      out-of-plane mode there grows from a seed far above round-off, so both codes' growth of it is compared. The rest are shockTube staged as tests/rho_central_viscous.py stages it: the
       tube ten times as long (x in [-5, 5], 1000 cells), a perfect gas with R = 1 and gamma = 1.4, its `sides` patch
       split into `outlet` (x = 5) and `inlet` (x = -5) in that face order, so the mesh's faces, owner and neighbour are
       shockTube1000's and its frozen partition applies:
@@ -109,13 +111,32 @@ def tube(kind, case, t, every, U, p, T, patches):
     field(case, "T", "volScalarField", "[0 0 0 1 0 0 0]", T, TT)
 
 
+def seed_uz(case, amplitude, cells=range(25, 40)):
+    """U_z = +-amplitude (alternating, + on odd cells) in the given cells of 0/U: the out-of-plane mode at the Mach disk."""
+    p = f"{case}/0/U"
+    s = open(p).read()
+    i = s.index("internalField")
+    j = s.index("(", s.index("\n", s.index("List<vector>", i)) + 1)
+    k = s.index("\n)\n", j)
+    rows = s[j + 1:k].strip().split("\n")
+    for c in cells:
+        v = rows[c].strip("()").split()
+        v[2] = repr(amplitude * (1 if c % 2 else -1))
+        rows[c] = "(" + " ".join(v) + ")"
+    open(p, "w").write(s[:j + 1] + "\n" + "\n".join(rows) + s[k:])
+
+
 def setup(kind, case):
-    if kind in ("ladenburg", "ladenburg_long"):
+    if kind in ("ladenburg", "ladenburg_long", "ladenburg_uzseed"):
         cd = f"{case}/system/controlDict"
         rv.edit(cd, r"^(writePrecision\s+)\S+;", r"\g<1>17;")
         if kind == "ladenburg_long":
             rv.edit(cd, r"^(endTime\s+)\S+;", r"\g<1>1e-04;")
             rv.edit(cd, r"^(writeInterval\s+)\S+;", r"\g<1>2e-05;")
+        if kind == "ladenburg_uzseed":
+            rv.edit(cd, r"^(endTime\s+)\S+;", r"\g<1>3e-05;")
+            rv.edit(cd, r"^(writeInterval\s+)\S+;", r"\g<1>5e-06;")
+            seed_uz(case, 1e-3)
         return
     rest = [(0.0, 0.0, 0.0)] * N
     if kind in ("reservoir", "reservoir_visc"):
