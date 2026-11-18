@@ -413,8 +413,12 @@ Gates for the transition:
 - **No solver-local limiter:** the formulas are OpenFOAM's v2412 ones (Minmod.H:84 `clamp(r, zero_one)`, MUSCL.H:84,
   SuperBee.H:85, vanAlbada.H:85, vanLeer.H:85, limitedLinear.H:100, std::min/max and Scalar.H's clamp), added to the
   shared `limiterOfR` the device already used for vanLeer, vanAlbada and limitedLinear, and made BRAE_HD so the host
-  reference calls the same function. vanLeer through it: every CUDA output of the Sod gate byte-identical to milestone
-  E's; the host arm moved by 1.5e-17 at most (GCC contracts the blended weight differently on the new call path).
+  reference evaluates the limiters its own library (cpu::limitedSchemes) lacks with the same function. The host face
+  loop is compiled once per kind of limiter (`VanLeerOnly`, `CaseLimiters` in rhoCentralFlux_cpp.cu): GB10's GCC
+  contracts a*b + c into an FMA by the code's shape, and with the limiter chosen at run time the host arm moved by up to
+  6e-15 relative on Sod and the 17-digit obliqueShock host arm of milestone C's gate went 1.02 x above its bound (t = 5,
+  p 1.455e-09 against 1.430e-09). With vanLeer known at compile time, as through milestone E, every output of the Sod
+  gate, CUDA and host, is byte-identical to milestone E's (a rebuild of E's commit reproduces E's files).
 - **Measured** (`tests/rho_central_riemann_vs_openfoam.sh`, GB10, 2026-11-18): Toro's tests 1 to 3 and Lax's problem on
   shockTube's tube at 1000 cells (R = 1, gamma = 1.4), each with the six limiters, two with Tadmor, and obliqueShock (2-D)
   with each; OpenFOAM serial, in two (simple) and in four (frozen scotch) as the reference:
