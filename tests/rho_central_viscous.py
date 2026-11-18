@@ -15,7 +15,8 @@
         oblique     obliqueShock as shipped (Mach 2.9, 1800 cells, t = 10) with mu 0.01 and Pr 0.72
   rho_central_viscous.py exact <kind> <case> <time>
       shear: U_y against -0.1 erf(x/(2 sqrt(nu t))), nu = mu/rho; conduction: T against 1.5 - 0.5 erf(x/(2 sqrt(k t)))
-      with k = alphaEff/rho (alphaEff = gamma mu/Pr, e = Cv T), the constant-density limit. `exact L1 <..> max <..>`
+      with k = mu/(Pr rho), the constant-pressure diffusivity k_th/(rho Cp) (k_th = alphaEff*Cv = mu Cp/Pr), the
+      constant-density limit. `exact L1 <..> max <..>`
       relative to the largest exact |value| (diagnostic: the cases are compressible)
   rho_central_viscous.py fluxes <A> <B> <time> <mu> <Pr>
       the viscous fluxes, the same arithmetic for both cases: on every internal face the normal derivative
@@ -138,7 +139,9 @@ def exact(kind, case, tname):
         ex = np.array([-0.1 * math.erf(xi / (2 * math.sqrt(mu / r * t))) for xi, r in zip(x, rho)])
     else:
         q = rf.internal(f"{case}/{tname}/T")
-        ex = np.array([1.5 - 0.5 * math.erf(xi / (2 * math.sqrt(G * mu / Pr / r * t))) for xi, r in zip(x, rho)])
+        # the gas expands as it heats at (near) constant pressure: T diffuses with k/(rho Cp) = mu/(Pr rho),
+        # k = alphaEff*Cv = mu*Cp/Pr (not alphaEff/rho, the constant-volume rate)
+        ex = np.array([1.5 - 0.5 * math.erf(xi / (2 * math.sqrt(mu / Pr / r * t))) for xi, r in zip(x, rho)])
     m = float(np.max(np.abs(ex)))
     print(f"exact L1 {float(np.mean(np.abs(q - ex))) / m:.6e} max {float(np.max(np.abs(q - ex))) / m:.6e}")
 
