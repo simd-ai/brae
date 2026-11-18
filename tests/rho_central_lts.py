@@ -17,7 +17,8 @@ measures on them (no OpenFOAM needed).
                         U and e solves as biconic25-55Run35 declares them
         channel_slip    a rarefied channel on biconic25-55Run35's system/ and thermo (0.05 x 0.01 m, 50 x 20; p 10 Pa, T 200 K,
                         U 1000 m/s: Knudsen about 0.04), its floor maxwellSlipU (thermalCreep, curvature) and
-                        smoluchowskiJumpT (Twall 300 K), its top a symmetryPlane; Euler; t = 1e-4, writes 2.5e-5
+                        smoluchowskiJumpT (Twall 300 K), its top a symmetryPlane; Euler; t = 1e-4, writes 2.5e-5; U and e
+                        solved as LadenburgJet60psi ships them (tolerance 1e-10, relTol 0)
   rho_central_lts.py flow <log>
       setRDeltaT.H's "Flow time scale min/max" lines, one per step: `flow <step> <min> <max>`
   rho_central_lts.py flowcmp <log a> <log b>
@@ -66,13 +67,13 @@ def thermo(case, transport):
     open(f"{case}/constant/thermophysicalProperties", "w").write(s)
 
 
-def solves(case):
-    """biconic25-55Run35's fvSolution"""
+def solves(case, tol="1e-09", relU="0.01", relE="0.1"):
+    """biconic25-55Run35's fvSolution; with tol 1e-10 and relTol 0, LadenburgJet60psi's U and e solves"""
     s = ("FoamFile\n{\n    version     2.0;\n    format      ascii;\n    class       dictionary;\n    object      fvSolution;\n}\n\n"
          "solvers\n{\n    \"(rho|rhoU|rhoE)\"\n    {\n        solver          diagonal;\n    }\n\n"
          "    U\n    {\n        solver          smoothSolver;\n        smoother        GaussSeidel;\n"
-         "        nSweeps         2;\n        tolerance       1e-09;\n        relTol          0.01;\n    }\n\n"
-         "    e\n    {\n        $U;\n        relTol          0.1;\n    }\n}\n")
+         f"        nSweeps         2;\n        tolerance       {tol};\n        relTol          {relU};\n    }}\n\n"
+         f"    e\n    {{\n        $U;\n        relTol          {relE};\n    }}\n}}\n")
     open(f"{case}/system/fvSolution", "w").write(s)
 
 
@@ -143,6 +144,10 @@ def channel(case):
     """a rarefied channel for maxwellSlipU and smoluchowskiJumpT alone, staged on biconic25-55Run35's system/ and
     thermo (its schemes, solves and mixture), Euler in time"""
     open(f"{case}/system/blockMeshDict", "w").write(CHANNEL_MESH)
+    # U and e solved as LadenburgJet60psi ships them (tolerance 1e-10, relTol 0), not biconic's relTol 0.01 | 0.1: those
+    # stop at two sweeps, and OpenFOAM's GaussSeidel in parallel (processor faces explicit) then parts from its serial
+    # by 1e-3 (the gate's first full run, 2026-11-18) -- a spread too wide to bound the walls or show a control red
+    solves(case, "1e-10", "0", "0")
     rv.edit(f"{case}/system/fvSchemes", r"^(\s*default\s+)localEuler;", r"\g<1>Euler;")
     cd = f"{case}/system/controlDict"
     s = open(cd).read()

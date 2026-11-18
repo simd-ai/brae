@@ -34,7 +34,10 @@
 #                  contact across Tcommon = 1000 K), to 3e-3
 #   sod_janaf_visc the same with As 1000 times larger (diffusion over cells)
 #   channel_slip   a rarefied channel (Knudsen about 0.04) on biconic's system/ and thermo, its floor maxwellSlipU and
-#                  smoluchowskiJumpT (Twall 300 K, gas 200 K, U 1000 m/s), Euler, to 1e-4
+#                  smoluchowskiJumpT (Twall 300 K, gas 200 K, U 1000 m/s), Euler, to 1e-4; U and e solved as
+#                  LadenburgJet60psi ships them (tolerance 1e-10, relTol 0). The gate's first full run (2026-11-18) had
+#                  biconic's relTol 0.01 | 0.1 there: two sweeps a solve, OpenFOAM's parallel GaussSeidel 1e-3 from its
+#                  serial, and four controls not red against that bound; with relTol 0 its spread is 4e-8 and they are
 # REFERENCE  OpenFOAM serial; its spread in two (simple) and in four (frozen scotch partitions: forwardStep's,
 #   obliqueShock's, shockTube1000's, and biconic25-55Run35's and channelSlip's, frozen for this gate) -- the envelope of
 #   tests/rho_central_gate_lib.sh, unchanged: ten times OpenFOAM's own spread, floor BOUND 8e-14 -- and, a DIAGNOSTIC that
