@@ -57,7 +57,10 @@ ok() { passes=$((passes + 1)); echo "ok   $*"; }
 # balance; the raw imbalance stays reported, with its original allowance, beside it).
 historical=0
 hist() { historical=$((historical + 1)); echo "hist $*"; }
-of() { bash -c "set +u; source '$OFBASHRC' > /dev/null 2>&1; set -e; $*"; }
+# OMPI_MCA_mpi_yield_when_idle: an MPI rank waiting on another yields its core (Open MPI's progress loop otherwise
+# spins). Under a loaded machine the spinning ranks starved each other: a 2-way biconic25-55Run35 reference ran 391
+# steps in 40 minutes (2026-11-18). Scheduling only; no arithmetic changes.
+of() { bash -c "set +u; source '$OFBASHRC' > /dev/null 2>&1; export OMPI_MCA_mpi_yield_when_idle=1; set -e; $*"; }
 le() { python3 -c "import sys; sys.exit(0 if float('${1:-nan}') <= float('$2') else 1)" 2> /dev/null; }
 mx() { python3 -c "print('%.3e' % max(float('$1'), float('$2')))"; }
 copy() { rm -rf "$2"; mkdir -p "$2"; cp -r "$1/system" "$1/constant" "$1/0" "$2/"; }
