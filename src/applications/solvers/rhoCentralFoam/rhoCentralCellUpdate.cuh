@@ -9,7 +9,9 @@
 //                   e = rhoE/rho - 0.5*magSqr(U)               :264
 //   thermoStage     thermo.correct(), cell half                :266   T = THE(e, p_old, T_old), psi = psi(p_old, T)
 //   pressureStage   p = rho/psi                                :284-286
-// (EulerDdtScheme.C:381-392, fvMatrix.C:2283.) A component of rhoU knocked out by an empty patch is not solved
+// (EulerDdtScheme.C:381-392, fvMatrix.C:2283.) On a MOVING mesh (milestone K) fvm::ddt's source is rDeltaT*q0*V0 --
+// the volume the cell had before this step's move -- and the diagonal rDeltaT*V; V0c is that V0, and a static mesh
+// passes Vc itself, which is the static arithmetic exactly. A component of rhoU knocked out by an empty patch is not solved
 // (fvMatrixSolve.C:157-164) and keeps its value. Nothing here reads a neighbour or a patch.
 //
 // Why stages rather than one function: the host compiler contracts a*b + c into a fused multiply-add (g++ -O3 on
@@ -31,19 +33,19 @@ struct MomentumNew
 };
 
 // d0 = fvc::div(phi), d1..d3 = fvc::div(phiUp): surfaceIntegrate, already divided by V
-BRAE_HD inline MomentumNew momentumStage(scalar rDeltaT, scalar Vc, scalar d0, scalar d1, scalar d2, scalar d3,
-                                         int v0, int v1, int v2, scalar rho0, scalar rhoUx0, scalar rhoUy0,
+BRAE_HD inline MomentumNew momentumStage(scalar rDeltaT, scalar Vc, scalar V0c, scalar d0, scalar d1, scalar d2,
+                                         scalar d3, int v0, int v1, int v2, scalar rho0, scalar rhoUx0, scalar rhoUy0,
                                          scalar rhoUz0)
 {
     MomentumNew n;
     const scalar diag = rDeltaT*Vc;
-    n.rho = (rDeltaT*rho0*Vc - Vc*d0)/diag;
+    n.rho = (rDeltaT*rho0*V0c - Vc*d0)/diag;
     n.rhoUx = rhoUx0;
     n.rhoUy = rhoUy0;
     n.rhoUz = rhoUz0;
-    if (v0) n.rhoUx = (rDeltaT*rhoUx0*Vc - Vc*d1)/diag;
-    if (v1) n.rhoUy = (rDeltaT*rhoUy0*Vc - Vc*d2)/diag;
-    if (v2) n.rhoUz = (rDeltaT*rhoUz0*Vc - Vc*d3)/diag;
+    if (v0) n.rhoUx = (rDeltaT*rhoUx0*V0c - Vc*d1)/diag;
+    if (v1) n.rhoUy = (rDeltaT*rhoUy0*V0c - Vc*d2)/diag;
+    if (v2) n.rhoUz = (rDeltaT*rhoUz0*V0c - Vc*d3)/diag;
     n.Ux = n.rhoUx/n.rho;
     n.Uy = n.rhoUy/n.rho;
     n.Uz = n.rhoUz/n.rho;
@@ -56,12 +58,12 @@ struct EnergyNew
 };
 
 // d4 = fvc::div(phiEp), already divided by V
-BRAE_HD inline EnergyNew energyStage(scalar rDeltaT, scalar Vc, scalar d4, scalar rhoE0, scalar rho, scalar Ux,
-                                     scalar Uy, scalar Uz)
+BRAE_HD inline EnergyNew energyStage(scalar rDeltaT, scalar Vc, scalar V0c, scalar d4, scalar rhoE0, scalar rho,
+                                     scalar Ux, scalar Uy, scalar Uz)
 {
     EnergyNew n;
     const scalar diag = rDeltaT*Vc;
-    n.rhoE = (rDeltaT*rhoE0*Vc - Vc*d4)/diag;
+    n.rhoE = (rDeltaT*rhoE0*V0c - Vc*d4)/diag;
     n.e = n.rhoE/rho - 0.5*(Ux*Ux + Uy*Uy + Uz*Uz);
     return n;
 }
@@ -69,12 +71,12 @@ BRAE_HD inline EnergyNew energyStage(scalar rDeltaT, scalar Vc, scalar d4, scala
 // The viscous run's (milestone G): solve(fvm::ddt(rhoE) + fvc::div(phiEp) - fvc::div(sigmaDotU)), :258-263, the
 // matrix's source rDeltaT*rhoE0*V - V*div(phiEp) + V*div(sigmaDotU); dS = fvc::div(sigmaDotU), already over V.
 // U is the corrected U (:243).
-BRAE_HD inline EnergyNew energyStageViscous(scalar rDeltaT, scalar Vc, scalar d4, scalar dS, scalar rhoE0, scalar rho,
-                                            scalar Ux, scalar Uy, scalar Uz)
+BRAE_HD inline EnergyNew energyStageViscous(scalar rDeltaT, scalar Vc, scalar V0c, scalar d4, scalar dS,
+                                            scalar rhoE0, scalar rho, scalar Ux, scalar Uy, scalar Uz)
 {
     EnergyNew n;
     const scalar diag = rDeltaT*Vc;
-    n.rhoE = ((rDeltaT*rhoE0*Vc - Vc*d4) + Vc*dS)/diag;
+    n.rhoE = ((rDeltaT*rhoE0*V0c - Vc*d4) + Vc*dS)/diag;
     n.e = n.rhoE/rho - 0.5*(Ux*Ux + Uy*Uy + Uz*Uz);
     return n;
 }

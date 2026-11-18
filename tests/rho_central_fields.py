@@ -137,6 +137,29 @@ def cell_centres(case):
 
 
 # ---- comparisons -----------------------------------------------------------------------------------------------------
+def points(path):
+    """a polyMesh/points file (vectorField; ascii, or OpenFOAM's binary) as an (n, 3) array"""
+    txt, binary = _text(path)
+    body = txt[txt.index("}", txt.index("FoamFile")) + 1:]
+    m = re.search(r"\n\s*(\d+)\s*\n?\(", body)
+    n = int(m.group(1))
+    start = m.end()
+    if binary:   # n*24 bytes straight after the parenthesis
+        raw = body[start:start + 24*n].encode("latin-1")
+        return np.frombuffer(raw, "<f8").reshape(n, 3).copy()
+    vals = re.findall(r"\(([-0-9.eE+]+) ([-0-9.eE+]+) ([-0-9.eE+]+)\)", body[start - 1:])
+    return np.asarray(vals[:n], float)
+
+
+def pointsdiff(a, b):
+    """max |a - b| over the points of two polyMesh/points files, and relative to max |b|"""
+    pa, pb = points(a), points(b)
+    if pa.shape != pb.shape:
+        raise SystemExit(f"rho_central_fields: {a} has {pa.shape[0]} points, {b} {pb.shape[0]}")
+    d = np.abs(pa - pb)
+    return d.max(), d.max()/np.abs(pb).max(), int(d.max(axis=1).argmax())
+
+
 def absdiff(a, b, fields):
     """Largest |a - b| per field; a field may name components, `U:xy` (in-plane) or `U:z`, compared on those alone."""
     out = []
@@ -357,6 +380,9 @@ if __name__ == "__main__":
     if a[0] == "absdiff":
         for f, ab, rel, c in absdiff(a[1], a[2], a[3:] or ["U", "p", "T", "rho"]):
             print(f"absdiff {f} {ab:.3e} {rel:.3e} {c}")
+    elif a[0] == "pointsdiff":
+        d, r, i = pointsdiff(a[1], a[2])
+        print("pointsdiff %.3e %.3e %d" % (d, r, i))
     elif a[0] == "patchdiff":
         for f, ab, rel, c in patchdiff(a[1], a[2], a[3], a[4:] or ["U", "T", "rho"]):
             print(f"patchdiff {f} {ab:.3e} {rel:.3e} {c}")

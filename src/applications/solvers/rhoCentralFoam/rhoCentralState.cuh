@@ -129,7 +129,12 @@ enum Control : int
     controlRasLaminarMuEff = 31,       // :220's muEff without mut: the laminar mu only
     controlRasNoAlphat = 32,           // :278's alphaEff without alphat: CpByCpv*alpha only
     controlRasCorrectFirst = 33,       // turbulence->correct() before the U corrector (:234), on the inviscid U, not :290
-    controlRasPhiUndivided = 34        // the model's phi() the mass flux itself, not phi/fvc::interpolate(rho)
+    controlRasPhiUndivided = 34,       // the model's phi() the mass flux itself, not phi/fvc::interpolate(rho)
+    // milestone K (mesh motion), each deliberately wrong:
+    controlMotionFluxAbsolute = 35,    // the fluxes not made relative to the mesh motion (no meshPhi at :126-133, :213-218)
+    controlMotionDdtStatic = 36,       // fvm::ddt's old-time source on V, not V0
+    controlMotionWallStatic = 37,      // movingWallVelocity's Uwall left at zero
+    controlMotionPiovStatic = 38       // pressureInletOutletVelocity never updated (its construction typing kept)
 };
 
 } // namespace rhoCentral

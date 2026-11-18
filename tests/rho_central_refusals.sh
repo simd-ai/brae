@@ -8,9 +8,8 @@
 # purgeWrite (tests/rho_central_forwardstep_vs_openfoam.sh); one row here checks OpenFOAM's pairing of constraint patch
 # and field types on wedge15Ma5, three check what inletOutlet's port leaves out, and three (milestone E) a start
 # directory without the fields OpenFOAM must read: brae names it where OpenFOAM stops on it, never starting from an older
-# directory instead. What this does NOT show: that the
-# refused inputs are rare (they are not -- one of the seven shipped tutorials, movingCone, is refused today, after
-# milestones H, I and J; ARCHITECTURE.md lists the order of the work).
+# directory instead. Since milestone K all seven shipped tutorials run; the rows are single edits of them. What this
+# does NOT show: that the refused inputs are rare (ARCHITECTURE.md lists what is ported).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BRAE_RCF_BIN:-$ROOT/build/brae_rhoCentralFoam}"
@@ -70,8 +69,8 @@ row sod_smoluchowskiNonuniform shockTube yes "must be \`uniform <value>\` here" 
     0/T '/sides/,/\}/ s/zeroGradient;/smoluchowskiJumpT; accommodationCoeff 0.85; Twall nonuniform List<scalar> 2(300 300); value uniform 300;/'
 # the nozzle boundaries (milestone H): their forms and fields beyond the ported ones refused by name (LadenburgJet60psi,
 # sutherland and all, now runs: tests/rho_central_nozzle_vs_openfoam.sh)
-row sod_totalPressurePsiNone shockTube yes "is \`totalPressure\` with psi \`none\`" \
-    0/p '/sides/,/\}/ s/zeroGradient;/totalPressure; p0 uniform 1; value uniform 1;/'
+row sod_totalPressureIncompressible shockTube yes "is \`totalPressure\` with psi \`none\` and rho \`none\`" \
+    0/p '/sides/,/\}/ s/zeroGradient;/totalPressure; rho none; p0 uniform 1; value uniform 1;/'
 row sod_totalPressurePhiv shockTube yes "is \`totalPressure\` on \`phi phiv\`" \
     0/p '/sides/,/\}/ s/zeroGradient;/totalPressure; psi thermo:psi; gamma 1.4; phi phiv; p0 uniform 1; value uniform 1;/'
 row sod_totalTemperatureNoT0 shockTube yes "is \`totalTemperature\` without its \`T0\`" \
@@ -80,7 +79,21 @@ row sod_waveTransmissiveOnT shockTube yes "T patch 'sides' is \`waveTransmissive
     0/T '/sides/,/\}/ s/zeroGradient;/waveTransmissive; field T; psi thermo:psi; gamma 1.4; value uniform 300;/'
 row sod_waveTransmissiveLInfNoFieldInf shockTube yes "with lInf and no fieldInf" \
     0/p '/sides/,/\}/ s/zeroGradient;/waveTransmissive; psi thermo:psi; gamma 1.4; lInf 1; value uniform 1;/'
-row movingCone_shipped movingCone no "dynamicMeshDict selects"
+# milestone K: movingCone runs as shipped (tests/rho_central_moving_vs_openfoam.sh); what the motion's port leaves out
+row movingCone_lts movingCone yes "with ddtSchemes localEuler: rhoCentralFoam then never calls mesh.update()" \
+    system/fvSchemes 's/^(\s*default\s+)Euler;/\1localEuler;/'
+row movingCone_refine movingCone no "asks for \`dynamicFvMesh dynamicRefineFvMesh\`" \
+    constant/dynamicMeshDict 's/^(dynamicFvMesh\s+)\S+;/\1dynamicRefineFvMesh;/'
+row movingCone_velocityLaplacian movingCone no "asks for \`motionSolver velocityLaplacian\`" \
+    constant/dynamicMeshDict 's/^(motionSolver\s+)\S+;/\1velocityLaplacian;/'
+row movingCone_diffusivity movingCone no "\`diffusivity quadratic" \
+    constant/dynamicMeshDict 's/^(diffusivity\s+)directional \(1 200 0\);/\1quadratic inverseDistance (movingWall);/'
+row movingCone_corrected movingCone no "laplacian(diffusivity,cellMotionU) is \`Gauss linear corrected\`" \
+    system/fvSchemes 's/(laplacian\(diffusivity,cellMotionU\)\s+)Gauss linear uncorrected;/\1Gauss linear corrected;/'
+row movingCone_gamg movingCone no "solves \`cellMotionUx\` with \`solver GAMG" \
+    system/fvSolution '/cellMotionUx/,/\}/ s/^(\s*solver\s+)PCG;/\1GAMG;/'
+row movingCone_pointPatch movingCone yes "is \`oscillatingFixedValue\`" \
+    0/pointMotionUx '/movingWall/,/\}/ s/uniformFixedValue;/oscillatingFixedValue;/'
 row sod_fluxScheme shockTube no "fluxScheme \`Bogus\` is not a valid choice" \
     system/fvSchemes 's/^(fluxScheme\s+)\S+;/\1Bogus;/'
 row sod_reconstruct shockTube no "reconstruct(rho) to \`QUICK\`" \

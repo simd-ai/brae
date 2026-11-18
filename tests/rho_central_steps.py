@@ -65,7 +65,8 @@ def compare(b, o):
     print('firstdiff %d %s' % (first, a[first - 2]['t'] if first > 1 else '-'))
 
 
-SOLVE = re.compile(r"^smoothSolver:  Solving for (\S+), Initial residual = (\S+), Final residual = (\S+), "
+# smoothSolver's lines, and (milestone K) the motion solver's PCG line (DICPCG: cellMotionU<c>)
+SOLVE = re.compile(r"^(?:smoothSolver|DICPCG):  Solving for (\S+), Initial residual = (\S+), Final residual = (\S+), "
                    r"No Iterations (\d+)", re.M)
 
 

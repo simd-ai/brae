@@ -147,6 +147,18 @@ void deviceEulerFvmDdtRho(scalar rDeltaT, const DeviceBuffer<scalar>& rho, const
 void deviceEulerFvcDdtRhoSub(scalar rDeltaT, const DeviceBuffer<scalar>& rho, const DeviceBuffer<scalar>& vf,
                              const DeviceBuffer<scalar>& rho0, const DeviceBuffer<scalar>& vf0,
                              const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& source);
+// ...and on a MOVING mesh (EulerDdtScheme.C fvmDdt(rho, vf) and fvcDdt(rho, vf), mesh().moving(); Vsc0 = V0 outside a
+// sub-cycle), V the volumes after the move and V0 before it:
+//   deviceEulerFvmDdtRhoMoving:    diag[c] = rDeltaT*rho[c]*V[c];  source[c] = rDeltaT*rho0[c]*vf0[c]*V0[c]
+//   deviceEulerFvcDdtRhoSubMoving: source[c] += V[c]*(rDeltaT*(rho[c]*vf[c] - rho0[c]*vf0[c]*V0[c]/V[c]))
+void deviceEulerFvmDdtRhoMoving(scalar rDeltaT, const DeviceBuffer<scalar>& rho, const DeviceBuffer<scalar>& rho0,
+                                const DeviceBuffer<scalar>& vf0, const DeviceBuffer<scalar>& V,
+                                const DeviceBuffer<scalar>& V0, DeviceBuffer<scalar>& diag,
+                                DeviceBuffer<scalar>& source);
+void deviceEulerFvcDdtRhoSubMoving(scalar rDeltaT, const DeviceBuffer<scalar>& rho, const DeviceBuffer<scalar>& vf,
+                                   const DeviceBuffer<scalar>& rho0, const DeviceBuffer<scalar>& vf0,
+                                   const DeviceBuffer<scalar>& V, const DeviceBuffer<scalar>& V0,
+                                   DeviceBuffer<scalar>& source);
 // The same two with localEuler's per-cell rDeltaT (localEulerDdtScheme.C:283-310, :139-160): EulerDdtScheme's
 // expressions with the field in the scalar's place, term for term
 void deviceLocalEulerFvmDdtRho(const DeviceBuffer<scalar>& rDeltaT, const DeviceBuffer<scalar>& rho,

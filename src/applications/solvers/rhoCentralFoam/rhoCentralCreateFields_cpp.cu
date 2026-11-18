@@ -22,9 +22,20 @@ using namespace brae::rhoCentral;
 static FieldData<scalar> asBuilt(FieldData<scalar> fd)
 {
     for (PatchFieldData<scalar>& e : fd.boundary)
+    {
+        // totalPressure, both forms rhoCentralFoam runs (the psi form, milestone H; the rho form, milestone K): its
+        // dictionary constructor takes `value` when written, else p0 (totalPressureFvPatchScalarField.C)
+        if (e.type == "totalPressure" && !e.hasValue)
+        {
+            e.hasValue = true;
+            e.valueUniform = e.inletUniform;
+            e.uniformValue = e.inletUniformValue;
+            e.values = e.inletValues;
+        }
         if (e.type == "totalTemperature" || e.type == "waveTransmissive" || e.type == "smoluchowskiJumpT"
-            || (e.type == "totalPressure" && e.psiName != "none"))   // the shared class runs the rho/none forms only
+            || e.type == "totalPressure")
             e.type = "fixedValue";
+    }
     return fd;
 }
 // maxwellSlipU (milestone I) starts as its written `value` too (partialSlip's dictionary constructor reads it, and

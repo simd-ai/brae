@@ -4,7 +4,9 @@
 #include "rhoCentralControls.cuh"
 #include "rhoCentralState.cuh"
 
+#include "pcg.cuh"   // SolverPerformance
 #include <cstddef>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -32,6 +34,13 @@ public:
     // over the steps and the faces where U, p or T is inletOutlet: how many took the inflow branch (phi < 0), of all
     virtual void inletOutletInflow(long long& inflow, long long& faceSteps) const = 0;
     virtual std::size_t deviceBytes() const { return 0; }
+    // mesh.update() after ++runTime (milestone K): the CUDA arm's; returns the motion solver's solve (its log line)
+    virtual SolverPerformance moveMesh(scalar /*time*/, scalar /*deltaT*/, label /*timeIndex*/)
+    {
+        throw std::runtime_error("brae rhoCentralFoam: this arm does not move a mesh.");
+    }
+    // the largest discrete space-conservation residual |V - V0 - deltaT*sum(meshPhi)|/V over the run (a diagnostic)
+    virtual scalar gclMax() const { return 0; }
     // RAS (milestone J): the model's fields for writing; false when laminar
     struct TurbulenceOut { std::vector<scalar> k, kB, omega, omegaB, nut, nutB, alphat, alphatB; };
     virtual bool turbulenceFields(TurbulenceOut& /*o*/) const { return false; }

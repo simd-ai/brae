@@ -101,7 +101,8 @@ std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::fromMotion
     const FoamDict&    d,
     const std::string& caseDir,
     const std::string& startDir,
-    bool               listForm)
+    bool               listForm,
+    bool               velocitySolvers)
 {
     std::unique_ptr<DynamicMotionSolverFvMesh> mesh(new DynamicMotionSolverFvMesh());
     // motionSolver::New reads the name with getCompat<word>("motionSolver", {{"solver", -1612}})
@@ -118,13 +119,14 @@ std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::fromMotion
             "ported beside refinement: a displacement solver's point field, or a rigid body's blend, would "
             "have to be carried through every topology change.");
     }
-    if (solver != "solidBody" && solver != "displacementLaplacian" && solver != "rigidBodyMotion")
+    if (solver != "solidBody" && solver != "displacementLaplacian" && solver != "rigidBodyMotion"
+        && !(velocitySolvers && solver == "velocityComponentLaplacian"))
     {
         throw std::runtime_error(
             std::string(WHO) + "constant/dynamicMeshDict asks for `motionSolver " + solver + "`. Only "
             "solidBody -- a prescribed rigid transformation of the points -- displacementLaplacian and "
-            "rigidBodyMotion are ported. The others solve for the point motion another way "
-            "(velocityLaplacian, displacementSBRStress, ...) or integrate a body's equations of motion "
+            "rigidBodyMotion are ported (velocityComponentLaplacian for rhoCentralFoam only). The others solve for the point motion "
+            "another way (velocityLaplacian, displacementSBRStress, ...) or integrate a body's equations of motion "
             "another way (sixDoFRigidBodyMotion).");
     }
 
@@ -178,7 +180,7 @@ std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::fromMotion
     const std::filesystem::path constantDir = std::filesystem::path(caseDir)/"constant";
     const bool startIsConstant =
         std::filesystem::weakly_canonical(startDir) == std::filesystem::weakly_canonical(constantDir);
-    if (!startIsConstant
+    if (!startIsConstant && !(velocitySolvers && solver == "velocityComponentLaplacian")
         && (std::filesystem::exists(startDir + "/polyMesh/points")
             || std::filesystem::exists(startDir + "/polyMesh/points.gz")))
     {
@@ -188,6 +190,12 @@ std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::fromMotion
             "beside them; brae reads the mesh from constant/polyMesh only.");
     }
 
+    if (solver == "velocityComponentLaplacian")
+    {
+        mesh->velocity_ = VelocityComponentLaplacianFvMotionSolver::New(coeffs, caseDir, startDir);
+        mesh->motionType_ = solver;
+        return mesh;
+    }
     if (solver == "displacementLaplacian")
     {
         mesh->displacement_ = DisplacementLaplacianFvMotionSolver::New(coeffs, caseDir, startDir);
@@ -221,7 +229,8 @@ std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::fromMotion
 
 std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::New(
     const std::string& caseDir,
-    const std::string& startDir)
+    const std::string& startDir,
+    bool velocitySolvers)
 {
     const std::string path = caseDir + "/constant/dynamicMeshDict";
     // dynamicFvMeshNew.C: no dictionary, a static mesh
@@ -244,7 +253,7 @@ std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::New(
             "the mesh as written would solve a different problem.");
     }
 
-    return fromMotionDict(d, caseDir, startDir, false);
+    return fromMotionDict(d, caseDir, startDir, false, velocitySolvers);
 }
 
 std::unique_ptr<DynamicMotionSolverFvMesh> DynamicMotionSolverFvMesh::NewForRefine(
@@ -322,6 +331,10 @@ void DynamicMotionSolverFvMesh::attach(
     {
         displacement_->attach(m, g, patches);
     }
+    if (velocity_)
+    {
+        velocity_->attach(m, g, patches);
+    }
     if (rigidBody_)
     {
         // rigidBodyMeshMotion.C:172-206: the blend is built ONCE, on points0
@@ -389,6 +402,12 @@ void DynamicMotionSolverFvMesh::update(
                 "cache: the hierarchy is a MeshObject of the mesh, and every GAMG solve shares it.");
         }
         newPoints = displacement_->newPoints(time, finalIteration, m, g, *patches_, *agglomeration);
+    }
+    else if (velocity_)
+    {
+        // velocityComponentLaplacianFvMotionSolver::curPoints: the mesh's own points plus deltaT times the point
+        // velocity, on the component it solves
+        newPoints = velocity_->newPoints(time, deltaT, m, g, *patches_);
     }
     else
     {

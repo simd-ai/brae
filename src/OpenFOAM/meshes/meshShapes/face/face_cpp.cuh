@@ -34,6 +34,12 @@ vector faceAverage(
     label f,
     const std::vector<vector>& points,
     const std::vector<vector>& fld);
+// ...of a scalar point field (cellMotionFvPatchField<scalar>: velocityComponentLaplacian's pointMotionU<c>)
+scalar faceAverage(
+    const PrimitiveMesh& m,
+    label f,
+    const std::vector<vector>& points,
+    const std::vector<scalar>& fld);
 
 // face::nearestPoint(p, points).distance(): the distance from p to face f, over the triangles of its
 // central decomposition, or to the face itself when it is a triangle

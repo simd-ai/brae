@@ -38,9 +38,13 @@
 // the two differ in the last digits on any face that is not a triangle. src/OpenFOAM/motion/
 // swept_volume.cuh uses a third arrangement of the same cross product; this file transcribes face.C.
 //
+// velocityComponentLaplacian (rhoCentralFoam's movingCone) is a VELOCITY solver: its points move from where they
+// are by deltaT times the point velocity it solves for, not from points0; its own file is
+// src/fvMotionSolver/fvMotionSolvers/componentVelocity/laplacian/.
+//
 // NOT PORTED, refused by name where the dictionary is read: every dynamicFvMesh but
 // dynamicMotionSolverFvMesh (and staticFvMesh, which is no motion); every motionSolver but solidBody,
-// displacementLaplacian and rigidBodyMotion;
+// displacementLaplacian, rigidBodyMotion and velocityComponentLaplacian;
 // a `cellZone` or `cellSet` (the motion of part of a mesh deforms the cells around it, and the
 // interFoam tutorial that asks for one slides it on an AMI); a `points0` file; and a start from a
 // time directory that carries its own polyMesh/points.
@@ -54,6 +58,7 @@
 #include "fvc.cuh"
 #include "primitive_mesh.cuh"
 #include "rigid_body_mesh_motion_cpp.cuh"
+#include "velocity_component_laplacian_fv_motion_solver_cpp.cuh"
 #include "solid_body_motion_function_cpp.cuh"
 #include <memory>
 #include <string>
@@ -110,9 +115,14 @@ public:
     // not move -- no constant/dynamicMeshDict, or `dynamicFvMesh staticFvMesh` -- and throws, by
     // name, for every motion that is not ported. Reading is separate from attach() so that a case
     // reader with no mutable mesh in hand still refuses what it must.
+    // `velocitySolvers`: the caller runs velocityComponentLaplacian (rhoCentralFoam, milestone K) -- refused otherwise,
+    // as before -- and reads the mesh's points from the start time's own instance (polyMesh's pointsInstance), so a
+    // start directory with its polyMesh/points is a restart it handles: a velocity solver moves the points from where
+    // they are, with no points0
     static std::unique_ptr<DynamicMotionSolverFvMesh> New(
         const std::string& caseDir,
-        const std::string& startDir);
+        const std::string& startDir,
+        bool velocitySolvers = false);
 
     // ...AND THE MOTION OF A REFINING MESH: dynamicRefineFvMesh IS a dynamicMotionSolverListFvMesh
     // (dynamicRefineFvMesh.H:92-95), which builds one motionSolver per sub-dictionary of `solvers`
@@ -221,6 +231,12 @@ public:
     {
         return rigidBody_.get();
     }
+    // the velocityComponentLaplacian solver, or null: its pointMotionU<c> and cellMotionU<c> are written with the
+    // mesh (AUTO_WRITE), and its last solve is the cellMotionU<c> line of the solver's log
+    const VelocityComponentLaplacianFvMotionSolver* velocityComponent() const
+    {
+        return velocity_.get();
+    }
     const std::vector<vector>& points0() const
     {
         return points0_;
@@ -289,7 +305,8 @@ private:
         const FoamDict&    d,
         const std::string& caseDir,
         const std::string& startDir,
-        bool               listForm);
+        bool               listForm,
+        bool               velocitySolvers = false);
 
     PrimitiveMesh* m_ = nullptr;
     FvGeometry* g_ = nullptr;
@@ -297,6 +314,7 @@ private:
     std::unique_ptr<SolidBodyMotionFunction> SBMF_;
     std::unique_ptr<DisplacementLaplacianFvMotionSolver> displacement_;
     std::unique_ptr<RigidBodyMeshMotion> rigidBody_;
+    std::unique_ptr<VelocityComponentLaplacianFvMotionSolver> velocity_;
     std::string motionType_;
     std::vector<vector> points0_;
     std::string cellZone_;

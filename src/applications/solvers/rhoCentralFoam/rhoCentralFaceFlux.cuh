@@ -50,8 +50,10 @@ BRAE_HD inline scalar maxOF(scalar a, scalar b) { return (a > b) ? a : b; }   //
 BRAE_HD inline scalar minOF(scalar a, scalar b) { return (a < b) ? a : b; }   // Foam::min
 
 // ctrl: controlNoPressureJump drops aSf*p_pos - aSf*p_neg from phiEp (a gate control, rhoCentralState.cuh)
+// moving (milestone K): mesh.moving(), meshPhi this face's mesh-motion flux mesh.phi(); a static mesh passes false, and
+// the arithmetic is the static one exactly (no meshPhi term is formed)
 BRAE_HD inline FaceFlux centralFaceFlux(const FaceStates& in, scalar Sx, scalar Sy, scalar Sz, scalar magSf,
-                                        bool tadmor, int ctrl)
+                                        bool tadmor, int ctrl, bool moving = false, scalar meshPhi = 0)
 {
     const vector U_pos{in.rhoU[0].x/in.rho[0], in.rhoU[0].y/in.rho[0], in.rhoU[0].z/in.rho[0]};   // :114
     const vector U_neg{in.rhoU[1].x/in.rho[1], in.rhoU[1].y/in.rho[1], in.rhoU[1].z/in.rho[1]};   // :115
@@ -59,6 +61,11 @@ BRAE_HD inline FaceFlux centralFaceFlux(const FaceStates& in, scalar Sx, scalar 
     const scalar p_neg = in.rho[1]*in.rPsi[1];                                                    // :118
     scalar phiv_pos = U_pos.x*Sx + U_pos.y*Sy + U_pos.z*Sz;                                       // :120
     scalar phiv_neg = U_neg.x*Sx + U_neg.y*Sy + U_neg.z*Sz;                                       // :123
+    if (moving)   // :126-133, make fluxes relative to mesh-motion: each phiv a field, minus meshPhi
+    {
+        phiv_pos = phiv_pos - meshPhi;
+        phiv_neg = phiv_neg - meshPhi;
+    }
     const scalar cSf_pos = in.c[0]*magSf;                                                         // :136-140
     const scalar cSf_neg = in.c[1]*magSf;                                                         // :142-146
     const scalar ap = maxOF(maxOF(phiv_pos + cSf_pos, phiv_neg + cSf_neg), 0.0);                  // :148-152
@@ -90,6 +97,8 @@ BRAE_HD inline FaceFlux centralFaceFlux(const FaceStates& in, scalar Sx, scalar 
     o.phiEp = aphiv_pos*(in.rho[0]*(in.e[0] + 0.5*K_pos) + p_pos)                                  // :204-210
             + aphiv_neg*(in.rho[1]*(in.e[1] + 0.5*K_neg) + p_neg);
     if (ctrl != controlNoPressureJump) o.phiEp = o.phiEp + aSf*p_pos - aSf*p_neg;
+    if (moving)   // :213-218, make the pressure work absolute: phiEp += meshPhi*(a_pos*p_pos + a_neg*p_neg), a field each
+        o.phiEp = o.phiEp + roundedProduct(meshPhi, roundedProduct(a_pos, p_pos) + roundedProduct(a_neg, p_neg));
 #ifdef __CUDA_ARCH__
     o.aUx = roundedProduct(a_pos, U_pos.x) + roundedProduct(a_neg, U_neg.x);   // two fields, then their sum
     o.aUy = roundedProduct(a_pos, U_pos.y) + roundedProduct(a_neg, U_neg.y);

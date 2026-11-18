@@ -7,6 +7,7 @@
 #include "geometric_field.cuh"
 #include "scheme_parse.cuh"
 #include "start_time.cuh"
+#include "time_instances.cuh"   // polyMesh's points instance (milestone K)
 #include "wedge_patch.cuh"
 #include "device_mesh.cuh"   // the limiter selectors (kVanLeerTwoByk and its kin)
 
@@ -157,13 +158,14 @@ std::vector<std::string> checkPatchFieldTypes(const FieldData<T>& fd, const std:
                        + "`; OpenFOAM requires the two to be the same for empty, symmetryPlane, symmetry and wedge.");
         }
         else if (type != "zeroGradient" && type != "fixedValue" && type != "slip" && type != "inletOutlet"
-                 && !(field == "U" && (type == "noSlip" || type == "maxwellSlipU"))
+                 && !(field == "U" && (type == "noSlip" || type == "maxwellSlipU" || type == "movingWallVelocity"
+                                       || type == "pressureInletOutletVelocity"))
                  && !(field == "T" && type == "smoluchowskiJumpT")
                  && !(field == "p" && (type == "totalPressure" || type == "waveTransmissive"))
                  && !(field == "T" && type == "totalTemperature"))
             refuse(field + " patch '" + p.name + "' is `" + type + "`. This stage runs zeroGradient, fixedValue, "
-                   "slip, inletOutlet, symmetryPlane, symmetry, wedge and empty on U, p and T, noSlip and maxwellSlipU on "
-                   "U, totalPressure and waveTransmissive on p and totalTemperature and smoluchowskiJumpT on T; "
+                   "slip, inletOutlet, symmetryPlane, symmetry, wedge and empty on U, p and T, noSlip, maxwellSlipU, "
+                   "movingWallVelocity and pressureInletOutletVelocity on U, totalPressure and waveTransmissive on p and totalTemperature and smoluchowskiJumpT on T; "
                    "partialSlip, outletInlet and the rest are not ported (applications/solvers/compressible/"
                    "rhoCentralFoam/BCs, src/finiteVolume/fields/fvPatchFields). Refusing rather than run the patch as "
                    "something else.");
@@ -171,10 +173,15 @@ std::vector<std::string> checkPatchFieldTypes(const FieldData<T>& fd, const std:
         if (type == "totalPressure" || type == "totalTemperature" || type == "waveTransmissive")
         {
             const std::string w = field + " patch '" + p.name + "' is `" + type + "`";
-            if (d->psiName != "thermo:psi")
-                refuse(w + " with psi `" + d->psiName + "`. This stage ports the isentropic form on rhoCentralFoam's "
-                       "thermo:psi (" + (type == "totalPressure" ? "totalPressureFvPatchScalarField.C, psi branch; the "
-                       "rho and incompressible forms are not ported" : "its only form") + ").");
+            // totalPressure: the psi form (milestone H) or, with psi none, the rho form on rhoCentralFoam's rho
+            // (milestone K, movingCone: p0 - 0.5*rho_b*neg(phi)*|U_b|^2); the incompressible form (rho none) refused
+            const bool rhoForm = type == "totalPressure" && d->psiName == "none" && d->flowRateRhoName == "rho";
+            if (d->psiName != "thermo:psi" && !rhoForm)
+                refuse(w + " with psi `" + d->psiName + "`" + (type == "totalPressure" ? " and rho `" +
+                       d->flowRateRhoName + "`" : std::string()) + ". This stage ports " + (type == "totalPressure"
+                       ? "the isentropic form on rhoCentralFoam's thermo:psi and the rho form on its rho "
+                         "(totalPressureFvPatchScalarField.C); the incompressible form is not ported"
+                       : "the form on rhoCentralFoam's thermo:psi (its only form)") + ".");
             if (d->phiName != "phi")
                 refuse(w + " on `phi " + d->phiName + "`; this stage switches on rhoCentralFoam's mass flux `phi`.");
             if (type != "waveTransmissive" && !(d->hasInletValue && !d->totalRefKey.empty()))
@@ -357,14 +364,23 @@ Case readRhoCentralCase(const std::string& caseDir)
     if (!cs.clock->run())
         refuse("endTime is not beyond the start time " + cs.startName + ": nothing to run.");
 
-    // ---- static mesh only ----------------------------------------------------------------------------------------
-    if (std::filesystem::exists(caseDir + "/constant/dynamicMeshDict"))
+    // ---- mesh motion (milestone K) ---------------------------------------------------------------------------------
+    // createDynamicFvMesh.H: dynamicFvMesh::New -- staticFvMesh or no dictionary is a static mesh; dynamicMotionSolverFvMesh
+    // with velocityComponentLaplacian (movingCone) runs through brae's shared DynamicMotionSolverFvMesh; the rest of the
+    // shared class's motions (solidBody, displacementLaplacian, rigidBodyMotion) and every other dynamicFvMesh refused
+    try
     {
-        const FoamDict dm = readDict(caseDir + "/constant/dynamicMeshDict");
-        const std::string t = dm.wordOr("dynamicFvMesh", "staticFvMesh");
-        if (t != "staticFvMesh")
-            refuse("constant/dynamicMeshDict selects `" + t + "`. Mesh motion (rhoCentralFoam.C:95 mesh.update(), "
-                   "the meshPhi terms at :126-132 and :212-217) is not ported; this stage runs a static mesh.");
+        std::unique_ptr<DynamicMotionSolverFvMesh> mo =
+            DynamicMotionSolverFvMesh::New(caseDir, caseDir + "/" + cs.startName, /*velocitySolvers=*/true);
+        if (mo && mo->motionType() != "velocityComponentLaplacian")
+            refuse("constant/dynamicMeshDict asks for the `" + mo->motionType() + "` motion. rhoCentralFoam's port moves "
+                   "its mesh with velocityComponentLaplacian (movingCone) only; the shared class's other motions are "
+                   "not gated with this solver.");
+        cs.motion = std::move(mo);
+    }
+    catch (const std::exception& e)
+    {
+        refuse(e.what());
     }
 
     // ---- fvSchemes ------------------------------------------------------------------------------------------------
@@ -565,7 +581,16 @@ Case readRhoCentralCase(const std::string& caseDir)
     }
 
     // ---- mesh -----------------------------------------------------------------------------------------------------
-    cs.m.read(caseDir + "/constant/polyMesh");
+    // polyMesh reads each file from its own instance, searched back from the start time (polyMesh.C): a moving
+    // mesh's restart takes its points from the start directory, its faces from constant
+    {
+        const cpu::timePaths::MeshInstances mi =
+            cpu::timePaths::meshInstancesForStartDir(caseDir, caseDir + "/" + cs.startName);
+        cs.m.read(mi.pointsDir(caseDir), mi.facesDir(caseDir), mi.boundaryDir(caseDir));
+        if (!cs.motion && mi.points != "constant")
+            refuse("the start time's points are in " + mi.points + "/polyMesh: a moved mesh, with no motion in "
+                   "constant/dynamicMeshDict to continue it.");
+    }
     cs.g.build(cs.m);
     cs.patches = buildPatches(cs.m, cs.g);
     for (const FvPatch& p : cs.patches)
@@ -704,6 +729,7 @@ Case readRhoCentralCase(const std::string& caseDir)
                     cs.tpFaces.push_back(k0 + i);
                     cs.tpP0.push_back(ref(d, i));
                     cs.tpGamma.push_back(d->gammaTP);
+                    cs.tpRho.push_back(d->psiName == "none" ? 1 : 0);   // the rho form (milestone K)
                 }
             }
             if (ptypes[pi] == "waveTransmissive")
@@ -789,6 +815,18 @@ Case readRhoCentralCase(const std::string& caseDir)
                 }
             }
         }
+        // milestone K: movingWallVelocity's faces (a fixedValue the motion sets) and pressureInletOutletVelocity
+        // (directionMixed on rhoCentralFoam's phi; a tangentialVelocity refused by the shared factory)
+        if (Ut == "movingWallVelocity")
+            for (label i = 0; i < p.size; ++i) cs.mwFaces.push_back(k0 + i);
+        if (Ut == "pressureInletOutletVelocity")
+        {
+            const PatchFieldData<vector>* fd = findPatchEntry(Ufd, p);
+            if (fd && fd->phiName != "phi")
+                refuse("U patch '" + p.name + "' is `pressureInletOutletVelocity` on `phi " + fd->phiName + "`; this "
+                       "stage switches it on rhoCentralFoam's mass flux `phi`.");
+            cs.piovU = true;
+        }
         const bool io[3] = {Ut == "inletOutlet", ptypes[pi] == "inletOutlet", Ttypes[pi] == "inletOutlet"};
         cs.ioU = cs.ioU || io[0];
         cs.ioP = cs.ioP || io[1];
@@ -818,6 +856,26 @@ Case readRhoCentralCase(const std::string& caseDir)
     if (cs.lts && !cs.wtFaces.empty())
         refuse("waveTransmissive with ddtSchemes localEuler: the advective boundary's local-time-step branch "
                "(advectiveFvPatchField.C, rDeltaT on the patch) is not ported.");
+    // mesh motion (milestone K) with what its port has not gated, by name
+    if (cs.motion)
+    {
+        if (cs.lts)
+            refuse("a dynamicMeshDict with ddtSchemes localEuler: rhoCentralFoam then never calls mesh.update() "
+                   "(rhoCentralFoam.C:89-97, `if (!LTS)`), the mesh stands still; not ported.");
+        for (std::size_t pi = 0; pi < cs.patches.size(); ++pi)
+            if (cs.patches[pi].type == "symmetryPlane" || cs.patches[pi].type == "symmetry"
+                || Utypes[pi] == "slip")
+                refuse("patch '" + cs.patches[pi].name + "' (" + cs.patches[pi].type + ", U " + Utypes[pi] + ") on a moving "
+                       "mesh: the mirror its transform takes is built once from the mesh as read; not ported with "
+                       "mesh motion.");
+        if (cs.slipWalls())
+            refuse("maxwellSlipU or smoluchowskiJumpT on a moving mesh is not ported.");
+        if (cs.ras)
+            refuse("a RAS model on a moving mesh is not ported (the wall distance and the closure's geometry are "
+                   "built once).");
+        if (!cs.wtFaces.empty())
+            refuse("waveTransmissive on a moving mesh is not ported.");
+    }
     return cs;
 }
 

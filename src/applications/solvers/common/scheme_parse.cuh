@@ -175,6 +175,40 @@ inline std::string fvSchemesBlock(const std::string& all, const std::string& nam
 // Whole-word match, so "uncorrected" does not match "corrected" and "linearUpwind" does not match
 // "linear". Hoisted out of parseFvSchemesControls, where it was a local lambda, so the limiter-gradient
 // resolver below uses the SAME predicate rather than a second copy that could drift from it.
+// One fvSchemes entry by its STATEMENT: `<keyword> <tokens>;` inside the named block, the keyword's own entry if any,
+// else `default` (whitespace normalised, a quoted keyword unquoted). Keys such as `laplacian(diffusivity,cellMotionU)`
+// and `div(phi,k)` are matched as written, which FoamDict's key lookup does not do for them. Empty: neither found.
+inline std::string fvSchemesStatement(const std::string& caseDir, const char* block, const std::string& key)
+{
+    std::string body = fvSchemesBlock(readFvSchemesText(caseDir), block);
+    if (!body.empty() && body[0] == '{') body.erase(0, 1);
+    std::string hit, def;
+    std::size_t a = 0;
+    while (a < body.size())
+    {
+        const std::size_t e = body.find(';', a);
+        std::string st = body.substr(a, e == std::string::npos ? std::string::npos : e - a);
+        a = (e == std::string::npos) ? body.size() : e + 1;
+        std::string norm;
+        for (char ch : st)
+        {
+            const bool ws = (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n');
+            if (ws) { if (!norm.empty() && norm.back() != ' ') norm += ' '; }
+            else norm += ch;
+        }
+        while (!norm.empty() && norm.front() == ' ') norm.erase(0, 1);
+        while (!norm.empty() && norm.back() == ' ') norm.pop_back();
+        const std::size_t k = norm.find(' ');
+        if (k == std::string::npos) continue;
+        std::string kw = norm.substr(0, k);
+        if (kw.size() > 1 && kw.front() == '"' && kw.back() == '"') kw = kw.substr(1, kw.size() - 2);
+        const std::string val = norm.substr(k + 1);
+        if (kw == key) hit = val;
+        else if (kw == "default") def = val;
+    }
+    return hit.empty() ? def : hit;
+}
+
 inline bool schemeHasWord(const std::string& s, const std::string& w)
 {
     for (std::size_t p = s.find(w); p != std::string::npos; p = s.find(w, p + 1))

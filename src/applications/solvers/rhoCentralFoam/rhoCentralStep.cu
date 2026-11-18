@@ -19,6 +19,8 @@
 
 #include "device_boundary.cuh"
 #include "device_fvc_smooth.cuh"      // fvc::smooth for LTS (milestone I)
+#include "dynamic_motion_solver_fv_mesh_cpp.cuh"   // mesh.update() (milestone K)
+#include "face_cpp.cuh"                // face::centre (movingWallVelocity)
 #include "primitive_patch_cpp.cuh"    // CellFaces
 
 #include <cuda_runtime.h>
@@ -112,7 +114,8 @@ __global__ void cellKernel(int nC, int slot, scalar rDeltaT0, int v0, int v1, in
                            const label* __restrict__ losortStart, const label* __restrict__ bndCellStart,
                            const label* __restrict__ bndPerm, const label* __restrict__ bndIsEmpty,
                            const scalar* __restrict__ V, FluxesIn Fx, CellState S,
-                           scalar* __restrict__ coCell, int* __restrict__ status, const scalar* __restrict__ rDT)
+                           scalar* __restrict__ coCell, int* __restrict__ status, const scalar* __restrict__ rDT,
+                           const scalar* __restrict__ V0)
 {
     const int c = blockIdx.x*blockDim.x + threadIdx.x;
     if (c >= nC) return;
@@ -130,9 +133,10 @@ __global__ void cellKernel(int nC, int slot, scalar rDeltaT0, int v0, int v1, in
 
     // the four stages of rhoCentralCellUpdate.cuh, back to back
     const scalar Told = S.T[c];
-    const MomentumNew m = momentumStage(rDeltaT, Vc, d0, d1, d2, d3, v0, v1, v2, S.rho[c], S.rhoUx[c], S.rhoUy[c],
+    const scalar V0c = V0 ? V0[c] : Vc;   // the moving mesh's old volume (milestone K)
+    const MomentumNew m = momentumStage(rDeltaT, Vc, V0c, d0, d1, d2, d3, v0, v1, v2, S.rho[c], S.rhoUx[c], S.rhoUy[c],
                                         S.rhoUz[c]);
-    const EnergyNew en = energyStage(rDeltaT, Vc, d4, S.rhoE[c], m.rho, m.Ux, m.Uy, m.Uz);
+    const EnergyNew en = energyStage(rDeltaT, Vc, V0c, d4, S.rhoE[c], m.rho, m.Ux, m.Uy, m.Uz);
     const ThermoNew th = thermoStage(en.e, S.p[c], Told, gas);
     const scalar p = pressureStage(m.rho, th.psi);
     S.rho[c] = m.rho;
@@ -289,6 +293,23 @@ __global__ void courantKernel(int nC, const scalar* __restrict__ sumA, const sca
 }
 
 // ---- the viscous step's cell kernels (milestone G): the fused cellKernel's stages, split where the correctors go -----
+// totalPressure's rho form (milestone K, movingCone's `left`: psi none), totalPressureFvPatchScalarField.C:
+// p0 - 0.5*rho_b*neg(phi_b)*magSqr(U_b), each field product rounded alone; the psi form's faces are left as they are
+__global__ void totalPressureRhoKernel(int n, const label* __restrict__ faces, const char* __restrict__ rhoForm,
+                                       const scalar* __restrict__ p0, const scalar* __restrict__ phi,
+                                       const scalar* __restrict__ ux, const scalar* __restrict__ uy,
+                                       const scalar* __restrict__ uz, const scalar* __restrict__ rho,
+                                       scalar* __restrict__ ref)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n || !rhoForm[i]) return;
+    const label k = faces[i];
+    const scalar ng = (phi[k] < 0) ? scalar(1) : scalar(0);   // Foam::neg
+    const scalar m = ux[k]*ux[k] + uy[k]*uy[k] + uz[k]*uz[k];   // magSqr
+    const scalar t = __dmul_rn(__dmul_rn(__dmul_rn(scalar(0.5), rho[k]), ng), m);
+    ref[k] = p0[i] - t;
+}
+
 // :222-232, the explicit rho and rhoU and U = rhoU/rho; keeps div(phiEp) (over V) for the energy stage and T as the
 // step starts (Tw.evaluate()'s and the e -> T inversion's seed)
 __global__ void momentumKernel(int nC, scalar rDeltaT0, int v0, int v1, int v2, const label* __restrict__ ownerStart,
@@ -296,7 +317,7 @@ __global__ void momentumKernel(int nC, scalar rDeltaT0, int v0, int v1, int v2, 
                                const label* __restrict__ bndCellStart, const label* __restrict__ bndPerm,
                                const label* __restrict__ bndIsEmpty, const scalar* __restrict__ V, FluxesIn Fx,
                                CellState S, scalar* __restrict__ coCell, scalar* __restrict__ divPhiEp,
-                               const scalar* __restrict__ rDT)
+                               const scalar* __restrict__ rDT, const scalar* __restrict__ V0)
 {
     const int c = blockIdx.x*blockDim.x + threadIdx.x;
     if (c >= nC) return;
@@ -312,8 +333,8 @@ __global__ void momentumKernel(int nC, scalar rDeltaT0, int v0, int v1, int v2, 
     d4 /= Vc;
     divPhiEp[c] = d4;
     S.Told[c] = S.T[c];
-    const MomentumNew m = momentumStage(rDeltaT, Vc, d0, d1, d2, d3, v0, v1, v2, S.rho[c], S.rhoUx[c], S.rhoUy[c],
-                                        S.rhoUz[c]);
+    const MomentumNew m = momentumStage(rDeltaT, Vc, V0 ? V0[c] : Vc, d0, d1, d2, d3, v0, v1, v2, S.rho[c], S.rhoUx[c],
+                                        S.rhoUy[c], S.rhoUz[c]);
     S.rho[c] = m.rho;
     S.rhoUx[c] = m.rhoUx;
     S.rhoUy[c] = m.rhoUy;
@@ -326,15 +347,17 @@ __global__ void momentumKernel(int nC, scalar rDeltaT0, int v0, int v1, int v2, 
 // e = rhoE/rho - 0.5*magSqr(U) on the corrected U, thermo.correct()'s cell half on the old p
 __global__ void energyKernel(int nC, int slot, scalar rDeltaT0, GasCoeffs gas, const scalar* __restrict__ V,
                              const scalar* __restrict__ divPhiEp, const scalar* __restrict__ dS, CellState S,
-                             int* __restrict__ status, const scalar* __restrict__ rDT)
+                             int* __restrict__ status, const scalar* __restrict__ rDT, const scalar* __restrict__ V0)
 {
     const int c = blockIdx.x*blockDim.x + threadIdx.x;
     if (c >= nC) return;
     const scalar rDeltaT = rDT ? rDT[c] : rDeltaT0;
     const scalar Vc = V[c];
-    const EnergyNew en = dS ? energyStageViscous(rDeltaT, Vc, divPhiEp[c], dS[c], S.rhoE[c], S.rho[c], S.Ux[c],
+    const scalar V0c = V0 ? V0[c] : Vc;
+    const EnergyNew en = dS ? energyStageViscous(rDeltaT, Vc, V0c, divPhiEp[c], dS[c], S.rhoE[c], S.rho[c], S.Ux[c],
                                                  S.Uy[c], S.Uz[c])
-                            : energyStage(rDeltaT, Vc, divPhiEp[c], S.rhoE[c], S.rho[c], S.Ux[c], S.Uy[c], S.Uz[c]);
+                            : energyStage(rDeltaT, Vc, V0c, divPhiEp[c], S.rhoE[c], S.rho[c], S.Ux[c], S.Uy[c],
+                                          S.Uz[c]);
     const ThermoNew th = thermoStage(en.e, S.p[c], S.Told[c], gas);
     S.rhoE[c] = en.rhoE;
     S.e[c] = en.e;
@@ -467,6 +490,8 @@ public:
             tpFaces_.copyFrom(cs.tpFaces);
             tpP0_.copyFrom(cs.tpP0);
             tpGamma_.copyFrom(cs.tpGamma);
+            tpRho_.copyFrom(cs.tpRho);
+            for (char r : cs.tpRho) tpRhoAny_ = tpRhoAny_ || r;
             ttFaces_.copyFrom(cs.ttFaces);
             ttT0_.copyFrom(cs.ttT0);
             ttGamma_.copyFrom(cs.ttGamma);
@@ -487,6 +512,22 @@ public:
             phiInv_.resize(nB);
         }
         bCell_.copyFrom(cs.bCell);
+        pf_ = &pf;
+        if (cs.motion)   // milestone K
+        {
+            // createFields.H:90, phi = fvc::flux(rhoU): what U.correctBoundaryConditions() switches on at the first
+            // mesh.update(), before the first step's flux exists -- on the patches, rhoU_b & Sf_b
+            std::vector<scalar> pb(nB, 0.0);
+            for (label k = 0; k < nB; ++k)
+            {
+                if (cs.bEmpty[k]) continue;
+                const vector S = cs.g.Sf()[static_cast<std::size_t>(cs.nIF + k)];
+                const vector& rU = s0.rhoUB[static_cast<std::size_t>(k)];
+                pb[k] = rU.x*S.x + rU.y*S.y + rU.z*S.z;
+            }
+            X_.phiB.copyFrom(pb);
+            for (int c = 0; c < 3; ++c) refUhost_[c] = dbU_.comp[c].refValue.host();
+        }
         uTransform_.copyFrom(cs.bUTransform);
         uR_.copyFrom(cs.bUR);
         rhoConstraint_.copyFrom(cs.bRhoConstraint);
@@ -572,7 +613,7 @@ public:
         const int nC = cs.nC, nB = cs.nB;
         keepOldPressureBoundary();
 
-        centralFluxes(dm_, cs, control_, F, X_, outflow_.data(), deltaT);
+        centralFluxes(dm_, cs, control_, F, X_, outflow_.data(), deltaT, meshPhiI(), meshPhiB());
 
         const FluxesIn Fx{X_.phi.data(), X_.phiUx.data(), X_.phiUy.data(), X_.phiUz.data(), X_.phiEp.data(),
                           X_.amaxSf.data(), X_.phiB.data(), X_.phiUxB.data(), X_.phiUyB.data(), X_.phiUzB.data(),
@@ -584,7 +625,7 @@ public:
                                             cs.sd.valid(2), cs.gas, dm_.ownerStart.data(), dm_.losort.data(),
                                             dm_.losortStart.data(), dm_.bndCellStart.data(), dm_.bndPerm.data(),
                                             dm_.bndIsEmpty.data(), dm_.V.data(), Fx, S, coCell_.data(),
-                                            status_.data(), rDT);
+                                            status_.data(), rDT, V0());
         cudaCheck(cudaGetLastError(), "rhoCentral cells");
 
         if (nB)
@@ -707,6 +748,16 @@ public:
             const bool head = (control_ != controlNoDynamicHead);
             deviceUpdateTotalPressurePsi(dbP_, tpFaces_, tpP0_, tpGamma_, nozzlePhi(), head ? F_.UxB : zeroB_,
                                          head ? F_.UyB : zeroB_, head ? F_.UzB : zeroB_, F_.psiB);
+            if (tpRhoAny_)   // the rho form's faces (milestone K), on rho's patch values as they stand
+            {
+                const int n = static_cast<int>(cs_.tpFaces.size());
+                totalPressureRhoKernel<<<blocksFor(n), kTPB>>>(n, tpFaces_.data(), tpRho_.data(), tpP0_.data(),
+                                                               nozzlePhi().data(), (head ? F_.UxB : zeroB_).data(),
+                                                               (head ? F_.UyB : zeroB_).data(),
+                                                               (head ? F_.UzB : zeroB_).data(), F_.rhoB.data(),
+                                                               dbP_.refValue.data());
+                cudaCheck(cudaGetLastError(), "totalPressure, rho form");
+            }
         }
         if (!cs_.wtFaces.empty())
             deviceUpdateWaveTransmissive(dbP_, wtFaces_, wtFieldInf_, wtLInf_, wtGamma_, pBold_, X_.phiB, F_.rhoB,
@@ -719,6 +770,10 @@ public:
     {
         const Case& cs = cs_;
         const int nB = cs.nB;
+        // pressureInletOutletVelocity (milestone K): U.correctBoundaryConditions() at :232 updates it on this step's phi
+        // (directionMixed, valueFraction neg(phi)*(I - nn)), on the cells' U as the explicit update left it
+        if (cs.piovU && control_ != controlMotionPiovStatic)
+            deviceUpdatePressureInletOutletVelocity(dbU_, X_.phiB, F_.Ux, F_.Uy, F_.Uz, true);
         if (!(cs.ioU || cs.ioP || cs.ioT)) return;
         const DeviceBuffer<scalar>* phiSwitch = &X_.phiB;
         const cudaStream_t q = cudaStreamPerThread;
@@ -840,7 +895,7 @@ public:
         rep = StepReport{};
         keepOldPressureBoundary();
 
-        centralFluxes(dm_, cs, control_, F, X_, outflow_.data(), deltaT);   // :102-210
+        centralFluxes(dm_, cs, control_, F, X_, outflow_.data(), deltaT, meshPhiI(), meshPhiB());   // :102-210
         vis_->beginStep(F, dbU_);                                            // :218-219, the old fields
         const FluxesIn Fx{X_.phi.data(), X_.phiUx.data(), X_.phiUy.data(), X_.phiUz.data(), X_.phiEp.data(),
                           X_.amaxSf.data(), X_.phiB.data(), X_.phiUxB.data(), X_.phiUyB.data(), X_.phiUzB.data(),
@@ -851,7 +906,7 @@ public:
         momentumKernel<<<blocksFor(nC), kTPB>>>(nC, rDeltaT, cs.sd.valid(0), cs.sd.valid(1), cs.sd.valid(2),
                                                 dm_.ownerStart.data(), dm_.losort.data(), dm_.losortStart.data(),
                                                 dm_.bndCellStart.data(), dm_.bndPerm.data(), dm_.bndIsEmpty.data(),
-                                                dm_.V.data(), Fx, S, coCell_.data(), divPhiEp_.data(), rDT);
+                                                dm_.V.data(), Fx, S, coCell_.data(), divPhiEp_.data(), rDT, V0());
         cudaCheck(cudaGetLastError(), "rhoCentral momentum");
         if (nB) switchInletOutlet();
         evaluateU(true);                                                      // :232
@@ -861,7 +916,7 @@ public:
         const DeviceBuffer<scalar>& dS = vis_->divSigmaDotU(F, dbU_, X_);     // :246-253
         energyKernel<<<blocksFor(nC), kTPB>>>(nC, pending_, rDeltaT, cs.gas, dm_.V.data(), divPhiEp_.data(),
                                               control_ == controlNoSigmaDotU ? nullptr : dS.data(), S,
-                                              status_.data(), rDT);           // :258-266
+                                              status_.data(), rDT, V0());     // :258-266
         cudaCheck(cudaGetLastError(), "rhoCentral energy");
         patchUpdate(control_ == controlInletOutletNewT ? F.T : Told_);        // :265-271
         // fvMatrix's constructor updates e's patches (fixedEnergy::updateCoeffs -> Tw.evaluate()) on the psi_b the first
@@ -1027,10 +1082,150 @@ public:
         cudaFreeHost(hostCourant_);
         cudaFreeHost(hostStatus_);
     }
+    // mesh.update() (rhoCentralFoam.C:96, after ++runTime): dynamicMotionSolverFvMesh::update -- the motion on the
+    // host (brae's shared DynamicMotionSolverFvMesh: newPoints, V0, oldPoints, meshPhi, the geometry and the patches in
+    // place) -- then what the arm holds of the geometry, then U.correctBoundaryConditions() as update() ends.
+    // Returns the motion solver's solve for the log line.
+    SolverPerformance moveMesh(scalar time, scalar deltaT, label timeIndex) override
+    {
+        const Case& cs = cs_;
+        DynamicMotionSolverFvMesh& mo = *cs.motion;
+        mo.update(time, deltaT, timeIndex);
+        moved_ = mo.moving();
+        // the device mesh's areas, volumes, centres, weights and deltaCoeffs; the boundaries' own areas and deltaCoeffs
+        // (and the normals pressureInletOutletVelocity and a symmetry gradient read), from the same builders
+        refreshDeviceMeshGeometry(dm_, cs.m, cs.g, cs.patches);
+        auto adopt = [](DeviceBoundary& d, const DeviceBoundary& f) {
+            d.deltaCoeffs.copyFrom(f.deltaCoeffs.host());
+            d.magSf.copyFrom(f.magSf.host());
+            if (f.gradSymN.size()) d.gradSymN.copyFrom(f.gradSymN.host());
+        };
+        {
+            const DeviceVectorBoundary fu = buildDeviceVectorBoundary(pf_->U, cs.patches, cs.g);
+            for (int c = 0; c < 3; ++c) adopt(dbU_.comp[c], fu.comp[c]);
+            if (fu.nx.size())
+            {
+                dbU_.nx.copyFrom(fu.nx.host());
+                dbU_.ny.copyFrom(fu.ny.host());
+                dbU_.nz.copyFrom(fu.nz.host());
+            }
+            adopt(dbP_, buildDeviceBoundary(pf_->p, cs.patches, cs.g));
+            adopt(dbT_, buildDeviceBoundary(pf_->T, cs.patches, cs.g));
+        }
+        // V0 (fvMesh::V0, stored before the move) and meshPhi, flat over the boundary in patch order (zero on empty)
+        V0d_.copyFrom(mo.V0());
+        meshPhiId_.copyFrom(mo.meshPhi().internal);
+        std::vector<scalar> mb(static_cast<std::size_t>(cs.nB), 0.0);
+        for (label k = 0; k < cs.nB; ++k)
+        {
+            if (cs.bEmpty[k]) continue;
+            const int pi = cs.bPatch[k];
+            const label i = cs.nIF + k - cs.patches[static_cast<std::size_t>(pi)].start;
+            mb[static_cast<std::size_t>(k)] = mo.meshPhi().boundary[static_cast<std::size_t>(pi)][static_cast<std::size_t>(i)];
+        }
+        meshPhiBd_.copyFrom(mb);
+        if (vis_)
+        {
+            vis_->setMovingV0(control_ == controlMotionDdtStatic ? nullptr : &V0d_);
+            vis_->geometryChanged();
+        }
+        movingWallVelocity(deltaT, mb);
+        // U.correctBoundaryConditions() (dynamicMotionSolverFvMesh.C, update): every U patch's updateCoeffs on the phi
+        // that exists now -- the last step's, or createFields' fvc::flux(rhoU) before the first -- then evaluate
+        if (cs.piovU && control_ != controlMotionPiovStatic)
+            deviceUpdatePressureInletOutletVelocity(dbU_, X_.phiB, F_.Ux, F_.Uy, F_.Uz, true);
+        if (cs.ioU) deviceUpdateInletOutlet(dbU_, X_.phiB);
+        evaluateU();
+        gcl(deltaT, mo);
+        return mo.velocityComponent() ? mo.velocityComponent()->lastSolve() : SolverPerformance{};
+    }
+    scalar gclMax() const override { return gclMax_; }
+
     DeviceArm(const DeviceArm&) = delete;
     DeviceArm& operator=(const DeviceArm&) = delete;
 
 private:
+    // movingWallVelocityFvPatchVectorField::Uwall(): Up = (face::centre(points) - face::centre(oldPoints))/deltaT,
+    // Un = meshPhi_b/(magSf + VSMALL), Uwall = Up + n*(Un - (n & Up)), each field operation its own loop (no product
+    // contracted into a sum); written into the fixedValue faces' refValue (the patch is a fixedValue whose value the
+    // mesh motion sets: updateCoeffs assigns it when mesh.moving())
+    void movingWallVelocity(scalar deltaT, const std::vector<scalar>& meshPhiFlat)
+    {
+        const Case& cs = cs_;
+        const DynamicMotionSolverFvMesh& mo = *cs.motion;
+        const std::size_t n = cs.mwFaces.size();
+        if (!n) return;
+        std::vector<vector> Up(n), nf(n), ns(n);
+        std::vector<scalar> Un(n), d(n);
+        for (std::size_t j = 0; j < n; ++j)
+        {
+            const label f = cs.nIF + cs.mwFaces[j];
+            const vector nc = faceCentreOfPoints(cs.m, f, cs.m.points());
+            const vector oc = faceCentreOfPoints(cs.m, f, mo.oldPoints());
+            const vector dc{nc.x - oc.x, nc.y - oc.y, nc.z - oc.z};
+            Up[j] = vector{dc.x/deltaT, dc.y/deltaT, dc.z/deltaT};
+            const vector S = cs.g.Sf()[static_cast<std::size_t>(f)];
+            const scalar a = cs.g.magSf()[static_cast<std::size_t>(f)];
+            nf[j] = vector{S.x/a, S.y/a, S.z/a};
+            const scalar den = a + 1.0e-300;   // magSf + VSMALL
+            Un[j] = meshPhiFlat[static_cast<std::size_t>(cs.mwFaces[j])]/den;
+        }
+        for (std::size_t j = 0; j < n; ++j)   // Un - (n & Up)
+        {
+            const scalar nUp = nf[j].x*Up[j].x + nf[j].y*Up[j].y + nf[j].z*Up[j].z;
+            d[j] = Un[j] - nUp;
+        }
+        for (std::size_t j = 0; j < n; ++j)   // n*(...)
+        {
+            volatile scalar x = nf[j].x*d[j], y = nf[j].y*d[j], z = nf[j].z*d[j];
+            ns[j] = vector{x, y, z};
+        }
+        for (std::size_t j = 0; j < n; ++j)   // Up + ...
+        {
+            const vector w{Up[j].x + ns[j].x, Up[j].y + ns[j].y, Up[j].z + ns[j].z};
+            const std::size_t k = static_cast<std::size_t>(cs.mwFaces[j]);
+            if (control_ == controlMotionWallStatic)   // the control: the wall's velocity left at zero
+            {
+                refUhost_[0][k] = refUhost_[1][k] = refUhost_[2][k] = 0;
+                continue;
+            }
+            refUhost_[0][k] = w.x;
+            refUhost_[1][k] = w.y;
+            refUhost_[2][k] = w.z;
+        }
+        for (int c = 0; c < 3; ++c) dbU_.comp[c].refValue.copyFrom(refUhost_[c]);
+    }
+
+    // the discrete space-conservation law the swept volumes make: V - V0 = deltaT*sum(meshPhi) per cell (a diagnostic)
+    void gcl(scalar deltaT, const DynamicMotionSolverFvMesh& mo)
+    {
+        const Case& cs = cs_;
+        const std::vector<scalar>& V = cs.g.V();
+        const std::vector<scalar>& V0 = mo.V0();
+        std::vector<scalar> s(static_cast<std::size_t>(cs.nC), 0.0);
+        const std::vector<label>& own = cs.m.owner();
+        const std::vector<label>& nei = cs.m.neighbour();
+        for (label f = 0; f < cs.nIF; ++f)
+        {
+            s[static_cast<std::size_t>(own[f])] += mo.meshPhi().internal[static_cast<std::size_t>(f)];
+            s[static_cast<std::size_t>(nei[f])] -= mo.meshPhi().internal[static_cast<std::size_t>(f)];
+        }
+        for (std::size_t pi = 0; pi < cs.patches.size(); ++pi)
+        {
+            const FvPatch& p = cs.patches[pi];
+            if (p.type == "empty") continue;
+            for (label i = 0; i < p.size; ++i)
+                s[static_cast<std::size_t>(p.faceCells[static_cast<std::size_t>(i)])] +=
+                    mo.meshPhi().boundary[pi][static_cast<std::size_t>(i)];
+        }
+        for (label c = 0; c < cs.nC; ++c)
+        {
+            const std::size_t i = static_cast<std::size_t>(c);
+            const scalar r = std::fabs(V[i] - V0[i] - deltaT*s[i])/V[i];
+            if (r > gclMax_) gclMax_ = r;
+        }
+    }
+
     const Case& cs_;
     int control_;
     DeviceMesh dm_;
@@ -1050,9 +1245,28 @@ private:
     std::unique_ptr<ViscousCorrectors> vis_;   // mu > 0 (milestone G)
     std::unique_ptr<SlipWalls> slip_;          // maxwellSlipU and smoluchowskiJumpT (milestone I)
     std::unique_ptr<gpu::compressibleRAS::KOmegaSST> turb_;   // RAS (milestone J)
+    // the moving mesh (milestone K): the host fields the boundaries are rebuilt from, V0 and meshPhi as the kernels
+    // read them (null until the mesh has moved: polyMesh::moving()), the movingWallVelocity faces' host values, and the
+    // discrete space-conservation residual of every step
+    PatchFields* pf_ = nullptr;
+    DeviceBuffer<scalar> V0d_, meshPhiId_, meshPhiBd_;
+    std::vector<scalar> refUhost_[3];
+    bool moved_ = false;
+    scalar gclMax_ = 0;
+    const scalar* V0() const { return moved_ && control_ != controlMotionDdtStatic ? V0d_.data() : nullptr; }
+    const scalar* meshPhiI() const
+    {
+        return moved_ && cs_.nIF && control_ != controlMotionFluxAbsolute ? meshPhiId_.data() : nullptr;
+    }
+    const scalar* meshPhiB() const
+    {
+        return moved_ && cs_.nB && control_ != controlMotionFluxAbsolute ? meshPhiBd_.data() : nullptr;
+    }
     DeviceBuffer<scalar> muLamC_, muLamB_;
     DeviceBuffer<scalar> TbGamma_;
     DeviceBuffer<label> tpFaces_, ttFaces_, wtFaces_;   // the nozzle boundaries (milestone H)
+    DeviceBuffer<char> tpRho_;                          // totalPressure's rho-form faces (milestone K)
+    bool tpRhoAny_ = false;
     DeviceBuffer<scalar> tpP0_, tpGamma_, ttT0_, ttGamma_, wtFieldInf_, wtLInf_, wtGamma_, pBold_, zeroB_, phiInv_;
     DeviceBuffer<scalar> divPhiEp_;
     DeviceBuffer<double> visIn_;

@@ -128,6 +128,7 @@ add_library(brae_core STATIC
     src/waveModels/derivedPointPatchFields/waveMaker/wave_maker_point_patch_vector_field_cpp.cu
     src/fvMotionSolver/fvMotionSolvers/displacement/laplacian/displacement_laplacian_fv_motion_solver_cpp.cu
     src/fvMotionSolver/fvMotionSolvers/displacement/laplacian/device_displacement_laplacian_assembly.cu
+    src/fvMotionSolver/fvMotionSolvers/componentVelocity/laplacian/velocity_component_laplacian_fv_motion_solver_cpp.cu
     src/dynamicFvMesh/dynamicMotionSolverFvMesh/dynamic_motion_solver_fv_mesh_cpp.cu
     src/dynamicFvMesh/dynamicMotionSolverFvMesh/device_swept_volumes.cu
     src/matrices/lduMatrix/lduMatrix/blas1.cu
@@ -2333,6 +2334,10 @@ set_tests_properties(rho_central_lts_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 
 add_test(NAME rho_central_turb_vs_openfoam
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_turb_vs_openfoam.sh)
 set_tests_properties(rho_central_turb_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 5400
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_test(NAME rho_central_moving_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_moving_vs_openfoam.sh)
+set_tests_properties(rho_central_moving_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 5400
                      ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 add_test(NAME rho_central_refusals
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_refusals.sh)

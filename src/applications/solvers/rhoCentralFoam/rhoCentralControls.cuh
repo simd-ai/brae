@@ -14,6 +14,8 @@
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "solution_directions.cuh"
+#include "dynamic_motion_solver_fv_mesh_cpp.cuh"
+#include <memory>
 #include "rhoCentralThermo.cuh"
 #include "rhoCentralPatchUpdate.cuh"
 #include "run_clock.cuh"
@@ -107,6 +109,16 @@ struct Case
     std::vector<int>    msCreep, msCurv;
     scalar              sjPr = 0;
     bool slipWalls() const { return !msFaces.empty() || !sjFaces.empty(); }
+
+    // mesh motion (milestone K): constant/dynamicMeshDict's dynamicMotionSolverFvMesh (brae's shared
+    // DynamicMotionSolverFvMesh, attached to m, g and patches by the driver once the Case is in place; null: a static
+    // mesh); U's movingWallVelocity faces (flat boundary indices: their fixedValue set from the motion), whether U has
+    // pressureInletOutletVelocity faces (the shared directionMixed update), and which totalPressure faces take the
+    // rho form (psi none: p0 - 0.5*rho_b*neg(phi)*|U_b|^2) rather than milestone H's psi form
+    std::shared_ptr<DynamicMotionSolverFvMesh> motion;
+    std::vector<label> mwFaces;
+    bool piovU = false;
+    std::vector<char> tpRho;
 };
 
 // Reads and checks the case; refuses everything outside this stage's scope by name, before any field is read.

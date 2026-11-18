@@ -13,6 +13,10 @@
 #include "time_controls.cuh"
 #include "foam_dict.cuh"
 #include "foam_field_writer.cuh"
+#include "dynamic_motion_solver_fv_mesh_cpp.cuh"   // milestone K
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include "io_precision.cuh"
 #include "write_control.cuh"
 
@@ -77,6 +81,97 @@ Integrals integrals(const Case& cs, const State& s)
 }
 
 
+// the moving mesh's AUTO_WRITE objects (milestone K), as OpenFOAM writes them: polyMesh/points (vectorField), meshPhi
+// (surfaceScalarField: calculated or wedge with values, empty without), cellMotionU<c> (cellMotion with its value, the
+// point-derived constraint types without) and pointMotionU<c> (the point patches as read: uniformFixedValue's value and
+// uniformValue, the constraint types bare). A list whose entries are all equal is written `uniform` (Field::writeEntry).
+void writeMotion(const Case& cs, const std::string& out, const std::string& timeName, int prec)
+{
+    const DynamicMotionSolverFvMesh& mo = *cs.motion;
+    const VelocityComponentLaplacianFvMotionSolver* vc = mo.velocityComponent();
+    auto header = [&](std::ostream& os, const char* cls, const std::string& loc, const std::string& obj) {
+        os << "FoamFile\n{\n    version     2.0;\n    format      ascii;\n    class       " << cls
+           << ";\n    location    \"" << loc << "\";\n    object      " << obj << ";\n}\n\n";
+    };
+    auto list = [&](std::ostream& os, const char* key, const std::vector<scalar>& v) {
+        bool same = !v.empty();
+        for (scalar x : v) same = same && (x == v.front());
+        if (same) { os << key << "uniform " << v.front() << ";\n"; return; }
+        os << key << "nonuniform List<scalar> \n" << v.size() << "\n(\n";
+        for (scalar x : v) os << x << '\n';
+        os << ")\n;\n";
+    };
+    std::filesystem::create_directories(out + "/polyMesh");
+    {
+        std::ofstream os(out + "/polyMesh/points");
+        os << std::setprecision(prec);
+        header(os, "vectorField", timeName + "/polyMesh", "points");
+        os << "\n" << cs.m.points().size() << "\n(\n";
+        for (const vector& q : cs.m.points()) os << '(' << q.x << ' ' << q.y << ' ' << q.z << ")\n";
+        os << ")\n\n\n// ************************************************************************* //\n";
+    }
+    {
+        std::ofstream os(out + "/meshPhi");
+        os << std::setprecision(prec);
+        header(os, "surfaceScalarField", timeName, "meshPhi");
+        os << "dimensions      [0 3 -1 0 0 0 0];\n\n";
+        list(os, "internalField   ", mo.meshPhi().internal);
+        os << "\nboundaryField\n{\n";
+        for (std::size_t pi = 0; pi < cs.patches.size(); ++pi)
+        {
+            const FvPatch& p = cs.patches[pi];
+            os << "    " << p.name << "\n    {\n";
+            if (p.type == "empty") os << "        type            empty;\n";
+            else
+            {
+                os << "        type            " << (p.type == "wedge" ? "wedge" : "calculated") << ";\n";
+                list(os, "        value           ", mo.meshPhi().boundary[pi]);
+            }
+            os << "    }\n";
+        }
+        os << "}\n\n\n// ************************************************************************* //\n";
+    }
+    if (!vc) return;
+    const std::string c = vc->cmptName();
+    {
+        std::ofstream os(out + "/cellMotionU" + c);
+        os << std::setprecision(prec);
+        header(os, "volScalarField", timeName, "cellMotionU" + c);
+        os << "dimensions      [0 1 -1 0 0 0 0];\n\n";
+        list(os, "internalField   ", vc->cellMotionU());
+        os << "\nboundaryField\n{\n";
+        for (std::size_t pi = 0; pi < cs.patches.size(); ++pi)
+        {
+            os << "    " << cs.patches[pi].name << "\n    {\n        type            " << vc->cellMotionUTypes()[pi]
+               << ";\n";
+            if (vc->cellMotionUTypes()[pi] == "cellMotion")
+                list(os, "        value           ", vc->cellMotionUBoundary()[pi]);
+            os << "    }\n";
+        }
+        os << "}\n\n\n// ************************************************************************* //\n";
+    }
+    {
+        std::ofstream os(out + "/pointMotionU" + c);
+        os << std::setprecision(prec);
+        header(os, "pointScalarField", timeName, "pointMotionU" + c);
+        os << "dimensions      [0 1 -1 0 0 0 0];\n\n";
+        list(os, "internalField   ", vc->pointMotionU());
+        os << "\nboundaryField\n{\n";
+        for (const VelocityComponentLaplacianFvMotionSolver::PointPatch& pp : vc->pointPatches())
+        {
+            os << "    " << pp.name << "\n    {\n        type            " << pp.typeName << ";\n";
+            if (pp.fixesValue())
+            {
+                os << "        value           uniform " << pp.value << ";\n";
+                if (pp.typeName == "uniformFixedValue")
+                    os << "        uniformValue    constant " << pp.value << ";\n";
+            }
+            os << "    }\n";
+        }
+        os << "}\n\n\n// ************************************************************************* //\n";
+    }
+}
+
 void writeTime(const Case& cs, const State& s, const RunClock& clock, bool uniformTime,
                const std::vector<scalar>* rDeltaT = nullptr, const Arm::TurbulenceOut* turb = nullptr)
 {
@@ -114,6 +209,7 @@ void writeTime(const Case& cs, const State& s, const RunClock& clock, bool unifo
         writeVolField(src + "nut", out + "/nut", turb->nut, cs.patches, prec, turb->nutB);
         writeVolField(src + "alphat", out + "/alphat", turb->alphat, cs.patches, prec, turb->alphatB);
     }
+    if (cs.motion) writeMotion(cs, out, timeName, prec);   // milestone K
 }
 
 
@@ -133,7 +229,9 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
 #endif
     Case csRead = readRhoCentralCase(caseDir);
     if (control == controlJanafLowOnly) csRead.gas.janafLowOnly = 1;   // the negative control (milestone I)
-    const Case cs = std::move(csRead);
+    // not const: a moving mesh (milestone K) moves cs.m, cs.g and cs.patches in place (fvMesh::movePoints)
+    Case cs = std::move(csRead);
+    if (cs.motion) cs.motion->attach(cs.m, cs.g, cs.patches);
     // brae's Time reads controlDict's `functions` and says which it does not run (none is registered here); the
     // loop runs on OpenFOAM's accumulating clock instead, whose deltaT their write times still trim (WriteCadence)
     Time time(caseDir, controlDict);
@@ -259,6 +357,9 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
         if (cs.ras)
             throw std::runtime_error("brae rhoCentralFoam: the host reference arm (BRAE_RHOCENTRALFOAM_ARM=cpu) does not "
                                      "run a RAS model; milestone J ports it on the CUDA arm.");
+        if (cs.motion)
+            throw std::runtime_error("brae rhoCentralFoam: the host reference arm (BRAE_RHOCENTRALFOAM_ARM=cpu) does not "
+                                     "move a mesh; milestone K ports mesh motion on the CUDA arm.");
         if (cs.viscous)
             throw std::runtime_error("brae rhoCentralFoam: the host reference arm (BRAE_RHOCENTRALFOAM_ARM=cpu) runs "
                                      "inviscid cases only; mu > 0 runs the viscous correctors, which milestone G "
@@ -282,6 +383,11 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
     // the log of the steps the arm has not reported yet: their deltaT and time name (the device arm reports a window
     // of steps at once at a fixed deltaT)
     std::vector<std::pair<scalar, std::string>> unlogged;
+    // ...and, on a moving mesh (milestone K), each step's motion solve: its log line comes between setDeltaT.H's and
+    // centralCourantNo.H's, where mesh.update() runs (rhoCentralFoam.C:96)
+    std::vector<SolverPerformance> unloggedMotion;
+    const std::string motionField = (cs.motion && cs.motion->velocityComponent())
+        ? "cellMotionU" + cs.motion->velocityComponent()->cmptName() : std::string();
     std::printf("\nStarting time loop\n\n");
     // the log, OpenFOAM's lines a step: setDeltaT.H's "deltaT = " under adjustTimeStep, centralCourantNo.H's, Time
     auto flushArm = [&]()
@@ -296,6 +402,10 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
             const StepReport& rep = reps[i];
             const std::string& tn = unlogged[i].second;
             if (tc.adjustTimeStep && !cs.lts) std::printf("deltaT = %.*g\n", logPrec, (double)unlogged[i].first);
+            if (!motionField.empty())   // PCG's line (SolverPerformance.C), DIC-preconditioned
+                std::printf("DICPCG:  Solving for %s, Initial residual = %.*g, Final residual = %.*g, No Iterations %d\n",
+                            motionField.c_str(), logPrec, (double)unloggedMotion[i].initialResidual, logPrec,
+                            (double)unloggedMotion[i].finalResidual, unloggedMotion[i].nIterations);
             std::printf("Mean and max Courant Numbers = %.*g %.*g\n", logPrec, (double)rep.meanCoNum, logPrec,
                         (double)rep.CoNum);
             if (cs.lts)   // setRDeltaT.H:26-28
@@ -318,6 +428,7 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
             if (control == controlLaggedCourant) CoNum = rep.CoNum/unlogged[i].first*clock.deltaT0();
         }
         unlogged.clear();
+        unloggedMotion.clear();
     };
     // rhoCentralFoam.C:85-97 and 288-294, !LTS: Time::run, setDeltaT.H, ++runTime, the step, runTime.write(). LTS
     // (milestone I): no setDeltaT.H -- runTime advances by the deltaT it holds (controlDict's, or the start time's
@@ -332,6 +443,8 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
         }
         ++clock;
         unlogged.emplace_back(clock.deltaT(), clock.timeName());
+        // mesh.update() (rhoCentralFoam.C:96), !LTS: the motion at the new time, before the step
+        if (cs.motion) unloggedMotion.push_back(arm->moveMesh(clock.value(), clock.deltaT(), clock.timeIndex()));
         const auto t0 = std::chrono::steady_clock::now();
         arm->step(clock.deltaT());
         stepSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
@@ -406,6 +519,9 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
                 k*std::max(I0.ulpMass, I1.ulpMass), k*std::max(I0.ulpEnergy, I1.ulpEnergy),
                 k*std::max(I0.ulpMom[0], I1.ulpMom[0]), k*std::max(I0.ulpMom[1], I1.ulpMom[1]),
                 k*std::max(I0.ulpMom[2], I1.ulpMom[2]));
+    if (cs.motion)
+        std::printf("diag gcl max |V - V0 - deltaT*sum(meshPhi)|/V %.6e (every cell, every step)\n",
+                    (double)arm->gclMax());
     std::printf("diag steps %ld step-seconds %.6f per-step-us %.3f cell-steps-per-second %.6e\n", steps, stepSeconds,
                 1e6*stepSeconds/(steps ? steps : 1), stepSeconds > 0 ? (double)cs.nC*steps/stepSeconds : 0.0);
     std::printf("End\n");

@@ -387,9 +387,34 @@ ViscousCorrectors::ViscousCorrectors(const Case& cs, const DeviceMesh& dm, int c
     }
     // per-cell transport fields: sutherland's mu(T), or janaf's CpByCpv(T) in alphahe (milestone I)
     sutherland_ = cs.gas.sutherland != 0 || cs.gas.janaf != 0 || cs.ras;   // RAS: muEff and alphaEff vary per cell
+    geometry();
+    gradU_.resize(9*static_cast<std::size_t>(nC_));
+    for (int k = 0; k < 3; ++k)
+    {
+        U0_[k].resize(nC_);
+        src_[k].resize(nC_);
+    }
+    {
+        std::vector<int> tc(nB_);
+        for (label k = 0; k < nB_; ++k) tc[k] = cs.bTseedOwn[k] ? 1 : 0;
+        Tconstraint_.copyFrom(tc);
+    }
+    uKind_.copyFrom(cs.bUTransform);
+    uR_.copyFrom(cs.bUR);
+    bCell_.copyFrom(cs.bCell);
+    cudaCheck(cudaDeviceSynchronize(), "viscous setup");
+}
+
+// what the correctors hold of the geometry: the non-orthogonal switch (any correction vector not zero) and, for a
+// constant mu, the laplacians' face coefficients mu*magSf through the shared operator. The constructor runs it; a moving
+// mesh (milestone K) runs it again after every move (geometryChanged), as OpenFOAM rebuilds the laplacian on the
+// moved geometry
+void ViscousCorrectors::geometry()
+{
+    nonOrth_ = false;
     // the corrected schemes' explicit parts are exactly zero where every nonOrthCorrectionVector is: then skipped
     {
-        const std::vector<scalar> cx = dm.corrVecX.host(), cy = dm.corrVecY.host(), cz = dm.corrVecZ.host();
+        const std::vector<scalar> cx = dm_.corrVecX.host(), cy = dm_.corrVecY.host(), cz = dm_.corrVecZ.host();
         for (std::size_t f = 0; f < cx.size() && !nonOrth_; ++f)
             nonOrth_ = (cx[f] != 0 || cy[f] != 0 || cz[f] != 0);
     }
@@ -415,12 +440,12 @@ ViscousCorrectors::ViscousCorrectors(const Case& cs, const DeviceMesh& dm, int c
         const scalar g = pass ? alphaEff_ : mu_;
         if (nIF_)
         {
-            scaleKernel<<<blocksFor(nIF_), kTPB>>>(nIF_, g, dm.magSf.data(), gms.data());
+            scaleKernel<<<blocksFor(nIF_), kTPB>>>(nIF_, g, dm_.magSf.data(), gms.data());
             cudaCheck(cudaGetLastError(), "gammaMagSf");
         }
         DeviceBuffer<scalar>& d = pass ? lapDiagE_ : lapDiagU_;
         DeviceBuffer<scalar>& nu = pass ? negUpperE_ : negUpperU_;
-        deviceLaplacianGammaMagSf(dm, gms, d, upper, /*nonOrth=*/true);
+        deviceLaplacianGammaMagSf(dm_, gms, d, upper, /*nonOrth=*/true);
         nu.resize(nIF_);
         if (nIF_)
         {
@@ -428,21 +453,11 @@ ViscousCorrectors::ViscousCorrectors(const Case& cs, const DeviceMesh& dm, int c
             cudaCheck(cudaGetLastError(), "-upper");
         }
     }
-    gradU_.resize(9*static_cast<std::size_t>(nC_));
-    for (int k = 0; k < 3; ++k)
-    {
-        U0_[k].resize(nC_);
-        src_[k].resize(nC_);
-    }
-    {
-        std::vector<int> tc(nB_);
-        for (label k = 0; k < nB_; ++k) tc[k] = cs.bTseedOwn[k] ? 1 : 0;
-        Tconstraint_.copyFrom(tc);
-    }
-    uKind_.copyFrom(cs.bUTransform);
-    uR_.copyFrom(cs.bUR);
-    bCell_.copyFrom(cs.bCell);
-    cudaCheck(cudaDeviceSynchronize(), "viscous setup");
+}
+
+void ViscousCorrectors::geometryChanged()
+{
+    geometry();
 }
 
 void ViscousCorrectors::beginStep(const DeviceFields& F, const DeviceVectorBoundary& dbU)
@@ -530,8 +545,16 @@ void ViscousCorrectors::solveU(DeviceFields& F, DeviceVectorBoundary& dbU, scala
         }
         else
         {
-            deviceEulerFvmDdtRho(rDeltaT, F.rho, rho0_, U0_[k], dm_.V, diagD_, src_[k]);
-            deviceEulerFvcDdtRhoSub(rDeltaT, F.rho, *U[k], rho0_, U0_[k], dm_.V, src_[k]);
+            if (V0_)   // a moving mesh (milestone K): the old-time terms on V0
+            {
+                deviceEulerFvmDdtRhoMoving(rDeltaT, F.rho, rho0_, U0_[k], dm_.V, *V0_, diagD_, src_[k]);
+                deviceEulerFvcDdtRhoSubMoving(rDeltaT, F.rho, *U[k], rho0_, U0_[k], dm_.V, *V0_, src_[k]);
+            }
+            else
+            {
+                deviceEulerFvmDdtRho(rDeltaT, F.rho, rho0_, U0_[k], dm_.V, diagD_, src_[k]);
+                deviceEulerFvcDdtRhoSub(rDeltaT, F.rho, *U[k], rho0_, U0_[k], dm_.V, src_[k]);
+            }
         }
         const scalar* corr = nullptr;
         if (nonOrth_)
@@ -654,8 +677,16 @@ void ViscousCorrectors::solveE(DeviceFields& F, const DeviceBoundary& dbT, scala
     }
     else
     {
-        deviceEulerFvmDdtRho(rDeltaT, F.rho, rho0_, e0_, dm_.V, diagD_, srcE_);
-        deviceEulerFvcDdtRhoSub(rDeltaT, F.rho, F.e, rho0_, e0_, dm_.V, srcE_);
+        if (V0_)   // a moving mesh (milestone K)
+        {
+            deviceEulerFvmDdtRhoMoving(rDeltaT, F.rho, rho0_, e0_, dm_.V, *V0_, diagD_, srcE_);
+            deviceEulerFvcDdtRhoSubMoving(rDeltaT, F.rho, F.e, rho0_, e0_, dm_.V, *V0_, srcE_);
+        }
+        else
+        {
+            deviceEulerFvmDdtRho(rDeltaT, F.rho, rho0_, e0_, dm_.V, diagD_, srcE_);
+            deviceEulerFvcDdtRhoSub(rDeltaT, F.rho, F.e, rho0_, e0_, dm_.V, srcE_);
+        }
     }
     const scalar* corr = nullptr;
     if (nonOrth_)

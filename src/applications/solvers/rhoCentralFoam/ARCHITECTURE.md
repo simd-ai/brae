@@ -575,6 +575,34 @@ tests/rho_central_turb_vs_openfoam.sh: a supersonic turbulent flat plate with wa
 LadenburgJet60psi with kOmegaSST; k omega nut alphat and the plate's wall values against OpenFOAM's own spread;
 controls rasLaminarMuEff, rasNoAlphat, rasCorrectFirst, rasPhiUndivided.
 
+## 5m. Milestone K: mesh motion (movingCone)
+
+- **mesh.update() where rhoCentralFoam.C calls it** (after setDeltaT.H and ++runTime, :96; never under LTS, which is
+  refused with a dynamicMeshDict): brae's shared `DynamicMotionSolverFvMesh` (V0 once a time index, oldPoints, meshPhi
+  from face.C's swept volumes, the geometry and the patches rebuilt in place) driving a new shared
+  `VelocityComponentLaplacianFvMotionSolver` (src/fvMotionSolver/fvMotionSolvers/componentVelocity/laplacian), ported
+  from OpenFOAM's: the directional diffusivity, pointMotionU<c>'s fixed values written in patch order, cellMotion's face
+  average of the point field, the case's `laplacian(diffusivity,cellMotionU)` (Gauss linear uncorrected) and PCG/DIC
+  solve, volPointInterpolation in OpenFOAM's pointCells order, points[c] += deltaT*pointMotionU<c>, and the twoD
+  correction with snapToWedge (twoDPointCorrector gained the wedge branch, wedgePolyPatch's own normal arithmetic).
+  Not pimpleFoam's helper: it maps the solve's scheme, tolerance and wedge correction differently. The shared class
+  takes the velocity solver only when its caller asks (rhoCentralFoam), so its other users are unchanged.
+- **What the arm holds of the geometry is refreshed after each move**: the device mesh (refreshDeviceMeshGeometry), the
+  boundaries' areas, deltaCoeffs and normals (rebuilt by the same builders and adopted), V0 and meshPhi for the kernels,
+  and the viscous correctors' constant-mu laplacian and non-orthogonal switch (the moved cone's cells are no longer
+  orthogonal). Then U.correctBoundaryConditions(), as dynamicMotionSolverFvMesh::update ends.
+- **The fluxes and the ddt**: phiv_pos/neg -= meshPhi (:126-133), phiEp += meshPhi*(a_pos*p_pos + a_neg*p_neg) (:213-218);
+  fvm::ddt's old-time source on V0 in the explicit updates and the correctors (fvc::ddt(rho, .) =
+  rDeltaT*(rho*vf - rho0*vf0*V0/V)); a static mesh takes V for V0 and no meshPhi, its arithmetic unchanged.
+- **The boundaries movingCone needs**: movingWallVelocity (Up from face::centre at the old and new points, Un =
+  meshPhi_b/(magSf + VSMALL)), pressureInletOutletVelocity (the shared directionMixed update, at the move and at :232),
+  totalPressure's rho form (p0 - 0.5*rho_b*neg(phi)*|U_b|^2; psi none).
+- **Written and read back**: polyMesh/points, meshPhi, cellMotionUx, pointMotionUx; a restart takes its points from the
+  start time's own instance (polyMesh's pointsInstance) and cellMotionUx as the first solve's initial guess.
+
+tests/rho_central_moving_vs_openfoam.sh: movingCone as shipped, with tight solves, and restarted from OpenFOAM's 1e-5;
+controls motionFluxAbsolute, motionDdtStatic, motionWallStatic, motionPiovStatic.
+
 ## 6. Milestones, each closed by a gate against OpenFOAM v2412
 
 Every gate:
@@ -594,7 +622,7 @@ Every gate:
 | H (done; open checks registered) | totalPressure (psi branch), totalTemperature, waveTransmissive, noSlip, sutherland, viscous wedge | LadenburgJet60psi as shipped and nozzle tube cases |
 | I (done) | LTS (setRDeltaT, fvc::smooth), janaf, maxwellSlipU, smoluchowskiJumpT | biconic25-55Run35 as shipped, LTS/janaf/wall cases |
 | J (done; open checks registered) | compressible RAS on the central path: kOmegaSST, its wall functions, muEff and alphaEff, Euler and localEuler | a turbulent flat plate (Euler, LTS) and LadenburgJet60psi with kOmegaSST |
-| K | mesh motion (velocityComponentLaplacian, meshPhi) | movingCone |
+| K (done; open check registered) | mesh motion: dynamicMotionSolverFvMesh with velocityComponentLaplacian, meshPhi, V0, movingWallVelocity, pressureInletOutletVelocity, totalPressure's rho form, restart | movingCone as shipped, with tight solves and restarted |
 
 The solver stays labelled **experimental** until A to E pass and at least the four inviscid tutorials run as shipped
 (since D they do: shockTube, wedge15Ma5, obliqueShock and forwardStep).

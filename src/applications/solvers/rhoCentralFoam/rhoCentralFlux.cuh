@@ -40,8 +40,10 @@ struct DeviceFluxes
 // rhoCentralFoam.C:102-210 on the device. `outflow` (10 doubles: the run's totals, then one step's sums) accumulates
 // deltaT * the patch-face fluxes of phi, phiUp and phiEp, a step at a time as the host arm does (diagnostics only;
 // atomics, so not bit-reproducible, and never fed back).
+// meshPhiI/meshPhiB (milestone K): mesh.phi() on the internal and the boundary faces of a moving mesh, null on a
+// static one
 void centralFluxes(const DeviceMesh& dm, const Case& cs, int control, DeviceFields& F, DeviceFluxes& X,
-                   double* outflow, scalar deltaT);
+                   double* outflow, scalar deltaT, const scalar* meshPhiI = nullptr, const scalar* meshPhiB = nullptr);
 
 } // namespace rhoCentral
 } // namespace gpu

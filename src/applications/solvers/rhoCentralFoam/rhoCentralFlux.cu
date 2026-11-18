@@ -123,7 +123,7 @@ __global__ void faceKernel(int nIF, bool tadmor, int ctrl,
                            const scalar* __restrict__ Cx, const scalar* __restrict__ Cy,
                            const scalar* __restrict__ Cz,
                            scalar limRho, scalar limT, scalar limU,
-                           CellInputs F, Grads G, FaceOutputs O)
+                           CellInputs F, Grads G, FaceOutputs O, const scalar* __restrict__ meshPhi)
 {
     const int f = blockIdx.x*blockDim.x + threadIdx.x;
     if (f >= nIF) return;
@@ -157,14 +157,16 @@ __global__ void faceKernel(int nIF, bool tadmor, int ctrl,
         in.e[k] = scalarRecon(F.e, gE, limT);
         in.c[k] = scalarRecon(F.c, gC, limT);
     }
-    store(centralFaceFlux(in, Sfx[f], Sfy[f], Sfz[f], magSf[f], tadmor, ctrl), O, f);
+    store(centralFaceFlux(in, Sfx[f], Sfy[f], Sfz[f], magSf[f], tadmor, ctrl, meshPhi != nullptr,
+                          meshPhi ? meshPhi[f] : scalar(0)), O, f);
 }
 
 __global__ void patchFaceKernel(int nB, int nIF, bool tadmor, int ctrl, scalar deltaT,
                                 const label* __restrict__ isEmpty,
                                 const scalar* __restrict__ Sfx, const scalar* __restrict__ Sfy,
                                 const scalar* __restrict__ Sfz, const scalar* __restrict__ magSf,
-                                CellInputs B, FaceOutputs O, double* __restrict__ outflow)
+                                CellInputs B, FaceOutputs O, double* __restrict__ outflow,
+                                const scalar* __restrict__ meshPhiB)
 {
     const int k = blockIdx.x*blockDim.x + threadIdx.x;
     if (k >= nB) return;
@@ -185,7 +187,8 @@ __global__ void patchFaceKernel(int nB, int nIF, bool tadmor, int ctrl, scalar d
         in.c[j] = B.c[k];
     }
     const int f = nIF + k;
-    const FaceFlux o = centralFaceFlux(in, Sfx[f], Sfy[f], Sfz[f], magSf[f], tadmor, ctrl);
+    const FaceFlux o = centralFaceFlux(in, Sfx[f], Sfy[f], Sfz[f], magSf[f], tadmor, ctrl, meshPhiB != nullptr,
+                                       meshPhiB ? meshPhiB[k] : scalar(0));
     store(o, O, k);
     // this step's sums (outflow[5..9]); outflowStepKernel adds them, times deltaT, to the run's totals as the host
     // arm does. Adding every face straight into the run's total rounds each of ~1e7 additions at the TOTAL's scale:
@@ -226,7 +229,7 @@ void DeviceFluxes::allocate(int nC, int nIF, int nB)
 
 
 void centralFluxes(const DeviceMesh& dm, const Case& cs, int control, DeviceFields& F, DeviceFluxes& X,
-                   double* outflow, scalar deltaT)
+                   double* outflow, scalar deltaT, const scalar* meshPhiI, const scalar* meshPhiB)
 {
     const int nC = cs.nC, nB = cs.nB, nIF = cs.nIF;
     const scalar CpByCv = gasCp(cs.gas)/gasCv(cs.gas);
@@ -275,7 +278,8 @@ void centralFluxes(const DeviceMesh& dm, const Case& cs, int control, DeviceFiel
         }
         faceKernel<<<blocksFor(nIF), kTPB>>>(nIF, cs.tadmor, control, dm.owner.data(), dm.nei.data(), dm.w.data(),
                                              dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(), dm.magSf.data(),
-                                             dm.Cx.data(), dm.Cy.data(), dm.Cz.data(), limRho, limT, limU, Fi, G, O);
+                                             dm.Cx.data(), dm.Cy.data(), dm.Cz.data(), limRho, limT, limU, Fi, G, O,
+                                             meshPhiI);
         cudaCheck(cudaGetLastError(), "rhoCentral faces");
     }
     if (nB)
@@ -295,7 +299,7 @@ void centralFluxes(const DeviceMesh& dm, const Case& cs, int control, DeviceFiel
         }
         patchFaceKernel<<<blocksFor(nB), kTPB>>>(nB, nIF, cs.tadmor, control, deltaT, dm.bndIsEmpty.data(),
                                                  dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(), dm.magSf.data(), Bi, O,
-                                                 outflow);
+                                                 outflow, meshPhiB);
         cudaCheck(cudaGetLastError(), "rhoCentral patch faces");
         outflowStepKernel<<<1, 32>>>(outflow, deltaT);
         cudaCheck(cudaGetLastError(), "rhoCentral outflow");

@@ -63,6 +63,10 @@ public:
     void setAlphaheGammaT(const DeviceBuffer<scalar>* Tb) { TbGamma_ = Tb; }
     // RAS (milestone J): muEff and alphaEff from the turbulence model (null: laminar)
     void setTurbulence(gpu::compressibleRAS::KOmegaSST* t) { turb_ = t; }
+    // a moving mesh (milestone K): fvm::ddt's old-time terms on V0 (null on a static mesh), and the geometry the
+    // correctors hold (the non-orthogonal switch, a constant mu's laplacian coefficients) rebuilt after a move
+    void setMovingV0(const DeviceBuffer<scalar>* V0) { V0_ = V0; }
+    void geometryChanged();
     void laminarMu(const DeviceFields& F, DeviceBuffer<scalar>& muC, DeviceBuffer<scalar>& muB) const;
     const DeviceBuffer<scalar>& rhoOld() const { return rho0_; }
     // The step's viscous fluxes INTO the domain through the patches, times deltaT, added to inflow[0..3] (x, y, z
@@ -81,6 +85,8 @@ public:
     void solveIdentity(double out[4]) const { for (int k = 0; k < 4; ++k) out[k] = identityMax_[k]; }
 
 private:
+    void geometry();
+    const DeviceBuffer<scalar>* V0_ = nullptr;
     const brae::rhoCentral::Case& cs_;
     const DeviceMesh& dm_;
     int control_;
