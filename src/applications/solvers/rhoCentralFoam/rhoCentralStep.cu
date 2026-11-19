@@ -19,11 +19,16 @@
 
 #include "device_boundary.cuh"
 #include "device_fvc_smooth.cuh"      // fvc::smooth for LTS (milestone I)
+#include "fvc_smooth_cpp.cuh"         // ...and the host wave, its oracle
 #include "dynamic_motion_solver_fv_mesh_cpp.cuh"   // mesh.update() (milestone K)
 #include "face_cpp.cuh"                // face::centre (movingWallVelocity)
 #include "primitive_patch_cpp.cuh"    // CellFaces
+#include "inter_phase_time.cuh"        // BRAE_INTER_PHASE_TIME (off by default)
 
 #include <cuda_runtime.h>
+#include <optional>
+#include <string>
+#include <chrono>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -684,6 +689,55 @@ public:
         ++pending_;
     }
 
+    // fvc::smooth(rDeltaT, coeff) (setRDeltaT.H): the host wave (cpu::fvc::smooth, the oracle) or the device wave
+    // (deviceSmooth), the same cells to the bit (tests/interfoam_write/identity/wave_device.sh). Neither is faster on
+    // every mesh -- on biconic25-55Run35 (32k cells) the host's is 7.8 ms and the device's 15.4 ms a call, on RAS/
+    // DTCHull (846k) the host's 430 ms -- so the first call runs both, from the same field, refuses unless they agree
+    // bit for bit, and keeps the faster. BRAE_RCF_SMOOTH=host or =device chooses one and skips the first call's check.
+    void smoothRDeltaT()
+    {
+        const Case& cs = cs_;
+        const scalar coeff = cs.rDeltaTSmoothingCoeff;
+        if (smoothArm_ == SmoothArm::undecided)
+        {
+            const char* env = std::getenv("BRAE_RCF_SMOOTH");
+            const std::string want = env ? env : "";
+            if (want == "host") smoothArm_ = SmoothArm::host;
+            else if (want == "device") smoothArm_ = SmoothArm::device;
+            else
+            {
+                std::vector<scalar> d = rDThost_;
+                const auto h0 = std::chrono::steady_clock::now();
+                cpu::fvc::smooth(rDThost_, coeff, cs.m, cs.patches, &ltsCells_);
+                const auto h1 = std::chrono::steady_clock::now();
+                deviceSmooth(d, coeff, cs.m, cs.patches, ltsCells_, ltsWave_);
+                const auto d1 = std::chrono::steady_clock::now();
+                if (d.size() != rDThost_.size()
+                 || std::memcmp(d.data(), rDThost_.data(), d.size()*sizeof(scalar)) != 0)
+                    throw std::runtime_error("brae rhoCentralFoam: fvc::smooth's host and device waves gave different "
+                                             "rDeltaT on the first step; they must agree to the bit (set "
+                                             "BRAE_RCF_SMOOTH=host to run the oracle alone).");
+                const double th = std::chrono::duration<double>(h1 - h0).count();
+                const double td = std::chrono::duration<double>(d1 - h1).count();
+                smoothArm_ = th <= td ? SmoothArm::host : SmoothArm::device;
+                std::fprintf(stderr, "brae rhoCentralFoam: fvc::smooth: the host wave (%.3f ms) and the device wave "
+                             "(%.3f ms) agree to the bit on the first call; the %s's is kept\n", 1e3*th, 1e3*td,
+                             smoothArm_ == SmoothArm::host ? "host" : "device");
+                return;
+            }
+        }
+        if (smoothArm_ == SmoothArm::host)
+        {
+            interPhase::Nested t("fvc::smooth: the wave (host)");
+            cpu::fvc::smooth(rDThost_, coeff, cs.m, cs.patches, &ltsCells_);
+        }
+        else
+            deviceSmooth(rDThost_, coeff, cs.m, cs.patches, ltsCells_, ltsWave_);
+    }
+    enum class SmoothArm { undecided, host, device };
+    PackedUpload up_;   // mesh.update()'s uploads, one transfer each (milestone K)
+    SmoothArm smoothArm_ = SmoothArm::undecided;
+
     // ---- setRDeltaT.H (milestone I): after centralCourantNo.H, before ++runTime and the solves ----------------------
     // rDeltaT = max(1/maxDeltaT, surfaceSum(amaxSf)/((2*maxCo)*V)); rDeltaT.correctBoundaryConditions() (its patches are
     // extrapolatedCalculated or constraints: nothing reads them in the step); fvc::smooth(rDeltaT, coeff), the
@@ -707,8 +761,7 @@ public:
         rDeltaTKernel<<<blocksFor(nC), kTPB>>>(nC, 1/tc.maxDeltaT, 2*tc.maxCo, sa_.data(), dm_.V.data(), rDT_.data());
         cudaCheck(cudaGetLastError(), "rhoCentral rDeltaT");
         rDT_.copyTo(rDThost_);
-        if (control_ != controlLtsUnsmoothed)
-            deviceSmooth(rDThost_, cs.rDeltaTSmoothingCoeff, cs.m, cs.patches, ltsCells_, ltsWave_);
+        if (control_ != controlLtsUnsmoothed) smoothRDeltaT();
         scalar mn = 0, mx = 0;
         for (std::size_t c = 0; c < rDThost_.size(); ++c)
         {
@@ -922,6 +975,8 @@ public:
         rep = StepReport{};
         keepOldPressureBoundary();
 
+        std::optional<interPhase::Nested> ph;
+        ph.emplace("step: fluxes, beginStep");
         centralFluxes(dm_, cs, control_, F, X_, outflow_.data(), deltaT, meshPhiI(), meshPhiB());   // :102-210
         vis_->beginStep(F, dbU_);                                            // :218-219, the old fields
         const FluxesIn Fx{X_.phi.data(), X_.phiUx.data(), X_.phiUy.data(), X_.phiUz.data(), X_.phiEp.data(),
@@ -929,6 +984,8 @@ public:
                           X_.phiEpB.data(), X_.amaxSfB.data()};
         const CellState S{F.rho.data(), F.rhoUx.data(), F.rhoUy.data(), F.rhoUz.data(), F.rhoE.data(), F.e.data(),
                           F.T.data(), Told_.data(), F.p.data(), F.psi.data(), F.Ux.data(), F.Uy.data(), F.Uz.data()};
+        ph.reset();
+        ph.emplace("step: setRDeltaT.H, momentum, U's BCs");
         const scalar* rDT = cs.lts ? setRDeltaT(Fx) : nullptr;   // :186-190 (milestone I)
         momentumKernel<<<blocksFor(nC), kTPB>>>(nC, rDeltaT, cs.sd.valid(0), cs.sd.valid(1), cs.sd.valid(2),
                                                 dm_.ownerStart.data(), dm_.losort.data(), dm_.losortStart.data(),
@@ -938,7 +995,11 @@ public:
         if (nB) switchInletOutlet();
         evaluateU(true);                                                      // :232
         if (turb_ && control_ == controlRasCorrectFirst) correctTurbulence(rDeltaT, rep);   // the control
+        ph.reset();
+        ph.emplace("step: solve U (assembly, smoothSolver)");
         vis_->solveU(F, dbU_, rDeltaT, rep, cs.lts ? &rDT_ : nullptr);        // :234-244
+        ph.reset();
+        ph.emplace("step: energy explicit, T's BCs");
         evaluateU();                                                          // fvMatrix::solve's U.correctBC
         const DeviceBuffer<scalar>& dS = vis_->divSigmaDotU(F, dbU_, X_);     // :246-253
         energyKernel<<<blocksFor(nC), kTPB>>>(nC, pending_, rDeltaT, cs.gas, dm_.V.data(), divPhiEp_.data(),
@@ -976,7 +1037,11 @@ public:
             if (slip_) slip_->restoreTb(TbGamma_);
             vis_->setAlphaheGammaT(&TbGamma_);
         }
+        ph.reset();
+        ph.emplace("step: solve e (assembly, smoothSolver)");
         vis_->solveE(F, dbT_, rDeltaT, rep, cs.lts ? &rDT_ : nullptr);        // :273-277
+        ph.reset();
+        ph.emplace("step: thermo, p's BCs, turbulence, Courant");
         patchUpdate(F.T, false);                                              // the solve's e.correctBC, :278-280
         thermoPressureKernel<<<blocksFor(nC), kTPB>>>(nC, pending_, cs.gas, S, status_.data());   // :278-286
         cudaCheck(cudaGetLastError(), "rhoCentral thermo, p");
@@ -993,6 +1058,7 @@ public:
         courantKernel<<<1, 1024>>>(nC, coCell_.data(), dm_.V.data(), courant_.data() + 3*pending_);
         cudaCheck(cudaGetLastError(), "rhoCentral courant");
         vis_->boundaryInflow(F, deltaT, visIn_);
+        ph.reset();
         deltaT_[pending_] = deltaT;
         ++pending_;
     }
@@ -1117,28 +1183,39 @@ public:
     {
         const Case& cs = cs_;
         DynamicMotionSolverFvMesh& mo = *cs.motion;
+        std::optional<interPhase::Nested> ph;
+        ph.emplace("motion: DynamicMotionSolverFvMesh::update");
         mo.update(time, deltaT, timeIndex);
         moved_ = mo.moving();
+        ph.reset();
+        ph.emplace("motion: refreshDeviceMeshGeometry");
         // the device mesh's areas, volumes, centres, weights and deltaCoeffs; the boundaries' own areas and deltaCoeffs
         // (and the normals pressureInletOutletVelocity and a symmetry gradient read), from the same builders
-        refreshDeviceMeshGeometry(dm_, cs.m, cs.g, cs.patches);
-        auto adopt = [](DeviceBoundary& d, const DeviceBoundary& f) {
-            d.deltaCoeffs.copyFrom(f.deltaCoeffs.host());
-            d.magSf.copyFrom(f.magSf.host());
-            if (f.gradSymN.size()) d.gradSymN.copyFrom(f.gradSymN.host());
-        };
+        refreshDeviceMeshGeometryInPlace(dm_, cs.m, cs.g, cs.patches, &up_);   // the buffers kept: no cache keys on them
+        ph.reset();
+        ph.emplace("motion: boundaries' geometry rebuilt");
+        // the arrays a fresh build of U's, p's and T's boundaries would give (deviceBoundaryGeometry: the builders'
+        // layout and arithmetic), copied over theirs; the scalar boundaries carry no gradSymN
         {
-            const DeviceVectorBoundary fu = buildDeviceVectorBoundary(pf_->U, cs.patches, cs.g);
-            for (int c = 0; c < 3; ++c) adopt(dbU_.comp[c], fu.comp[c]);
-            if (fu.nx.size())
+            const DeviceBoundaryGeometryHost bg = deviceBoundaryGeometry(cs.patches, cs.g);
+            for (int c = 0; c < 3; ++c)
             {
-                dbU_.nx.copyFrom(fu.nx.host());
-                dbU_.ny.copyFrom(fu.ny.host());
-                dbU_.nz.copyFrom(fu.nz.host());
+                up_.add(dbU_.comp[c].deltaCoeffs, bg.dc);
+                up_.add(dbU_.comp[c].magSf, bg.ms);
+                up_.add(dbU_.comp[c].gradSymN, bg.gsn);
             }
-            adopt(dbP_, buildDeviceBoundary(pf_->p, cs.patches, cs.g));
-            adopt(dbT_, buildDeviceBoundary(pf_->T, cs.patches, cs.g));
+            up_.add(dbU_.nx, bg.nrm[0]);
+            up_.add(dbU_.ny, bg.nrm[1]);
+            up_.add(dbU_.nz, bg.nrm[2]);
+            for (DeviceBoundary* d : {&dbP_, &dbT_})
+            {
+                up_.add(d->deltaCoeffs, bg.dc);
+                up_.add(d->magSf, bg.ms);
+            }
+            up_.flush();
         }
+        ph.reset();
+        ph.emplace("motion: V0, meshPhi up");
         // V0 (fvMesh::V0, stored before the move) and meshPhi, flat over the boundary in patch order (zero on empty)
         V0d_.copyFrom(mo.V0());
         meshPhiId_.copyFrom(mo.meshPhi().internal);
@@ -1151,11 +1228,15 @@ public:
             mb[static_cast<std::size_t>(k)] = mo.meshPhi().boundary[static_cast<std::size_t>(pi)][static_cast<std::size_t>(i)];
         }
         meshPhiBd_.copyFrom(mb);
+        ph.reset();
+        ph.emplace("motion: viscous geometry");
         if (vis_)
         {
             vis_->setMovingV0(control_ == controlMotionDdtStatic ? nullptr : &V0d_);
             vis_->geometryChanged();
         }
+        ph.reset();
+        ph.emplace("motion: movingWallVelocity, U's BCs, gcl");
         movingWallVelocity(deltaT, mb);
         // U.correctBoundaryConditions() (dynamicMotionSolverFvMesh.C, update): every U patch's updateCoeffs on the phi
         // that exists now -- the last step's, or createFields' fvc::flux(rhoU) before the first -- then evaluate

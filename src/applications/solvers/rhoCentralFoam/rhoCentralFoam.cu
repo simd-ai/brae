@@ -19,6 +19,7 @@
 #include <iomanip>
 #include "io_precision.cuh"
 #include "write_control.cuh"
+#include "inter_phase_time.cuh"   // BRAE_INTER_PHASE_TIME: where a step goes (off by default)
 
 #include <algorithm>
 #include <chrono>
@@ -379,6 +380,7 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
     // deltaT by the full 1.2
     scalar CoNum = 0;
     double stepSeconds = 0;
+    double motionSeconds = 0;   // mesh.update(), outside step-seconds (milestone K)
     long steps = 0;
     // the log of the steps the arm has not reported yet: their deltaT and time name (the device arm reports a window
     // of steps at once at a fixed deltaT)
@@ -433,6 +435,7 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
     // rhoCentralFoam.C:85-97 and 288-294, !LTS: Time::run, setDeltaT.H, ++runTime, the step, runTime.write(). LTS
     // (milestone I): no setDeltaT.H -- runTime advances by the deltaT it holds (controlDict's, or the start time's
     // uniform/time) -- and ++runTime after setRDeltaT.H, :186-190; nothing in the step reads the time between
+    interPhase::start();
     while (clock.run())
     {
         if (tc.adjustTimeStep && !cs.lts)
@@ -444,13 +447,22 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
         ++clock;
         unlogged.emplace_back(clock.deltaT(), clock.timeName());
         // mesh.update() (rhoCentralFoam.C:96), !LTS: the motion at the new time, before the step
-        if (cs.motion) unloggedMotion.push_back(arm->moveMesh(clock.value(), clock.deltaT(), clock.timeIndex()));
+        interPhase::mark("loop: setDeltaT.H, ++runTime");
+        if (cs.motion)
+        {
+            const auto m0 = std::chrono::steady_clock::now();
+            unloggedMotion.push_back(arm->moveMesh(clock.value(), clock.deltaT(), clock.timeIndex()));
+            motionSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - m0).count();
+            interPhase::mark("loop: mesh.update()");
+        }
         const auto t0 = std::chrono::steady_clock::now();
         arm->step(clock.deltaT());
         stepSeconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        interPhase::mark("loop: the step");
         ++steps;
         const bool write = clock.writeTime();
         if (tc.adjustTimeStep || write || arm->pending() >= arm->window() || !clock.run()) flushArm();
+        interPhase::mark("loop: flush (reports, log)");
         if (write)
         {
             arm->download(s);
@@ -459,6 +471,7 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
             writeTime(cs, s, clock, control != controlNoUniformTime, arm->rDeltaT(), turb ? &to : nullptr);
             purge.written(cs.caseDir, clock.timeName());
             std::printf("written %s\n", clock.timeName().c_str());
+            interPhase::mark("loop: write");
         }
     }
     flushArm();
@@ -524,6 +537,10 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
                     (double)arm->gclMax());
     std::printf("diag steps %ld step-seconds %.6f per-step-us %.3f cell-steps-per-second %.6e\n", steps, stepSeconds,
                 1e6*stepSeconds/(steps ? steps : 1), stepSeconds > 0 ? (double)cs.nC*steps/stepSeconds : 0.0);
+    if (cs.motion)   // step-seconds times arm->step alone; mesh.update() runs before it
+        std::printf("diag motion-seconds %.6f per-step-us %.3f (mesh.update(), not in step-seconds)\n", motionSeconds,
+                    1e6*motionSeconds/(steps ? steps : 1));
+    interPhase::report(steps);
     std::printf("End\n");
     return 0;
 }

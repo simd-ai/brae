@@ -1,6 +1,8 @@
 // rhoCentralViscous.cu -- see the header. Every expression is rhoCentralFoam.C's; a product OpenFOAM stores in a field
 // before summing it is rounded on its own (__dmul_rn), never fused into the sum.
 #include "rhoCentralViscous.cuh"
+#include "inter_phase_time.cuh"   // BRAE_INTER_PHASE_TIME (off by default)
+#include <optional>
 #include "rhoCentralPatchUpdate.cuh"
 
 #include "device_amg.cuh"
@@ -337,10 +339,12 @@ void ViscousCorrectors::account(int k, const DeviceLduView& A, const DeviceBuffe
                                 const DeviceBuffer<scalar>& iC, const DeviceBuffer<scalar>& bC,
                                 const DeviceBuffer<scalar>* tauB, scalar rDeltaT, const DeviceBuffer<scalar>* const* sc)
 {
+    if (static_cast<int>(accPending_.size()) == kAccountLog) foldAccount();
+    if (accLog_.size() != static_cast<std::size_t>(5*kAccountLog)) accLog_.resize(5*kAccountLog);
+    scalar* slot = accLog_.data() + 5*accPending_.size();
     deviceResidual(A, x, b, res_);
-    const double R = deviceDot(res_, ones_);
-    solveRes_[k] += R/rDeltaT;
-    solveResL1_[k] += deviceSumMag(res_)/rDeltaT;
+    deviceDotInto(res_, ones_, slot);        // R = sum(b - A x)
+    deviceSumMagInto(res_, slot + 1);        // sum|b - A x|
     idC_.resize(nC_);
     DeviceBuffer<scalar>& m = idM_;
     m.resize(nC_);
@@ -348,19 +352,42 @@ void ViscousCorrectors::account(int k, const DeviceLduView& A, const DeviceBuffe
                                                   sc[0]->data(), sc[1] ? sc[1]->data() : nullptr,
                                                   sc[2] ? sc[2]->data() : nullptr, idC_.data(), m.data());
     cudaCheck(cudaGetLastError(), "identity cells");
-    const double lhs = deviceDot(idC_, ones_);
-    const double scale = deviceDot(m, ones_);
-    double bnd = 0;
+    deviceDotInto(idC_, ones_, slot + 2);    // lhs
+    deviceDotInto(m, ones_, slot + 3);       // scale
     if (nB_)
     {
         idB_.resize(nB_);
         identityPatchKernel<<<blocksFor(nB_), kTPB>>>(nB_, dm_.bndIsEmpty.data(), bCell_.data(), iC.data(), bC.data(),
                                                       x.data(), tauB ? tauB->data() : nullptr, idB_.data());
         cudaCheck(cudaGetLastError(), "identity patches");
-        bnd = deviceDot(idB_, onesB_);
+        deviceDotInto(idB_, onesB_, slot + 4);   // bnd
     }
-    const double err = std::fabs(lhs - (bnd - R)/rDeltaT)/(scale > 0 ? scale : 1.0);
-    if (err > identityMax_[k]) identityMax_[k] = err;
+    else
+    {
+        cudaCheck(cudaMemsetAsync(slot + 4, 0, sizeof(scalar)), "identity patches (none)");
+    }
+    accPending_.emplace_back(k, rDeltaT);
+}
+
+void ViscousCorrectors::foldAccount() const
+{
+    if (accPending_.empty()) return;
+    std::vector<scalar> v(5*accPending_.size());
+    cudaCheck(cudaMemcpy(v.data(), accLog_.data(), v.size()*sizeof(scalar), cudaMemcpyDeviceToHost), "account log");
+    for (std::size_t i = 0; i < accPending_.size(); ++i)
+    {
+        const int k = accPending_[i].first;
+        const scalar rDeltaT = accPending_[i].second;
+        const double R = v[5*i];
+        solveRes_[k] += R/rDeltaT;
+        solveResL1_[k] += v[5*i + 1]/rDeltaT;
+        const double lhs = v[5*i + 2];
+        const double scale = v[5*i + 3];
+        const double bnd = v[5*i + 4];
+        const double err = std::fabs(lhs - (bnd - R)/rDeltaT)/(scale > 0 ? scale : 1.0);
+        if (err > identityMax_[k]) identityMax_[k] = err;
+    }
+    accPending_.clear();
 }
 
 ViscousCorrectors::ViscousCorrectors(const Case& cs, const DeviceMesh& dm, int control)
@@ -579,7 +606,11 @@ void ViscousCorrectors::solveU(DeviceFields& F, DeviceVectorBoundary& dbU, scala
     DeviceSolverPerf perf[3];
     const SmoothSolveControls& c = cs_.solveU;
     for (int i = 0; i < n; ++i) copyD2D(xp_[solved[i]], *U[solved[i]]);   // U before the solve, for the identity
+    std::optional<interPhase::Nested> ph;
+    ph.emplace("U solve: smoothSolver (fused GaussSeidel)");
     if (n) deviceSymGaussSeidelFused(n, comps, c.tolerance, c.relTol, c.maxIter, c.minIter, c.nSweeps, c.symmetric, perf);
+    ph.reset();
+    ph.emplace("U solve: the remainder and identity (diag)");
     // the run's unconserved remainder deltaT*sum(b - A x), unsigned, and the identity: a time-accurate account, not
     // kept under LTS, where every cell has its own deltaT and the run is a pseudo-time march (milestone I)
     for (int i = 0; i < n && !rDT; ++i)
@@ -588,6 +619,7 @@ void ViscousCorrectors::solveU(DeviceFields& F, DeviceVectorBoundary& dbU, scala
         account(solved[i], A_[solved[i]], *U[solved[i]], b_[solved[i]], F.rho, iC_[solved[i]], bC_[solved[i]],
                 tau ? &dTauB_[solved[i]] : nullptr, rDeltaT, sc);
     }
+    ph.reset();
     for (int i = 0; i < n && rep.nSolves < 6; ++i)
     {
         SolveLine& l = rep.solves[rep.nSolves++];

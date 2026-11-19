@@ -118,6 +118,134 @@ inline void refreshDeviceMeshGeometry(
     const std::vector<FvPatch>& fvp,
     const std::vector<CyclicInterface>& cyclics = {});
 
+// THE BUILDER IN TWO (the note above): the geometry alone, in the builder's layout -- internal faces, then every
+// uncoupled patch's faces in patch order -- and the arrays it uploads. buildDeviceMesh takes its geometry from here,
+// so the in-place refresh below and a fresh build agree element for element by construction.
+struct DeviceMeshGeometryHost
+{
+    std::vector<scalar> w, dc, nonOrthDc, Cfx, Cfy, Cfz, corrX, corrY, corrZ;   // internal faces
+    std::vector<scalar> Sfx, Sfy, Sfz, magSf;                                  // [internal | non-cyclic boundary]
+    std::vector<scalar> dBndX, dBndY, dBndZ;                                   // Cf - C(faceCell), boundary faces
+    std::vector<scalar> Cx, Cy, Cz;                                            // cells
+};
+
+inline DeviceMeshGeometryHost deviceMeshGeometryHost(
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp)
+{
+    const int nC = m.nCells(), nIf0 = m.nInternalFaces();
+    const std::vector<vector>& Sf = g.Sf();
+    const std::vector<scalar>& magSfAll = g.magSf();
+    const std::vector<vector>& Cf = g.Cf();
+    const std::vector<vector>& C = g.C();
+    const std::vector<scalar>& wts = g.weights();
+    const std::vector<scalar>& dcAll = g.deltaCoeffs();
+    const std::vector<scalar>& nodcAll = g.nonOrthDeltaCoeffs();
+    const std::vector<vector>& cvAll = g.nonOrthCorrectionVectors();
+    const int nIf = nIf0;                                  // internal faces = mesh internal faces only
+
+    DeviceMeshGeometryHost h;
+    h.w.resize(nIf); h.dc.resize(nIf); h.nonOrthDc.resize(nIf);
+    h.Cfx.resize(nIf); h.Cfy.resize(nIf); h.Cfz.resize(nIf);
+    h.corrX.resize(nIf); h.corrY.resize(nIf); h.corrZ.resize(nIf);
+    h.Sfx.reserve(magSfAll.size());
+    h.Sfy.reserve(magSfAll.size());
+    h.Sfz.reserve(magSfAll.size());
+    h.magSf.reserve(magSfAll.size());
+    for (int f = 0; f < nIf0; ++f)                         // original internal faces
+    {
+        h.w[f]=wts[f];
+        h.dc[f]=dcAll[f];
+        h.nonOrthDc[f]=nodcAll[f];
+        h.Cfx[f]=Cf[f].x;
+        h.Cfy[f]=Cf[f].y;
+        h.Cfz[f]=Cf[f].z;
+        h.corrX[f]=cvAll[f].x;
+        h.corrY[f]=cvAll[f].y;
+        h.corrZ[f]=cvAll[f].z;
+        h.Sfx.push_back(Sf[f].x);
+        h.Sfy.push_back(Sf[f].y);
+        h.Sfz.push_back(Sf[f].z);
+        h.magSf.push_back(magSfAll[f]);
+    }
+    for (const FvPatch& p : fvp)                           // non-cyclic boundary faces (cyclic patches skipped)
+    {
+        if (isCoupledInterfaceType(p.type)) continue;
+        for (label i = 0; i < p.size; ++i)
+        {
+            h.Sfx.push_back(Sf[p.start+i].x);
+            h.Sfy.push_back(Sf[p.start+i].y);
+            h.Sfz.push_back(Sf[p.start+i].z);
+            h.magSf.push_back(magSfAll[p.start+i]);
+            const vector dB = Cf[p.start+i] - C[p.faceCells[i]];
+            h.dBndX.push_back(dB.x);
+            h.dBndY.push_back(dB.y);
+            h.dBndZ.push_back(dB.z);
+        }
+    }
+    h.Cx.resize(nC); h.Cy.resize(nC); h.Cz.resize(nC);
+    for (int c = 0; c < nC; ++c)
+    {
+        h.Cx[c] = C[c].x;
+        h.Cy[c] = C[c].y;
+        h.Cz[c] = C[c].z;
+    }
+    return h;
+}
+
+// the geometric buffers up in one transfer (PackedUpload), each into the buffer the device mesh holds
+inline void uploadDeviceMeshGeometryPacked(DeviceMesh& dm, const DeviceMeshGeometryHost& h, const std::vector<scalar>& V,
+                                           PackedUpload& up)
+{
+    up.add(dm.w, h.w);
+    up.add(dm.V, V);
+    up.add(dm.Sfx, h.Sfx);
+    up.add(dm.Sfy, h.Sfy);
+    up.add(dm.Sfz, h.Sfz);
+    up.add(dm.dc, h.dc);
+    up.add(dm.magSf, h.magSf);
+    up.add(dm.Cfx, h.Cfx);
+    up.add(dm.Cfy, h.Cfy);
+    up.add(dm.Cfz, h.Cfz);
+    up.add(dm.Cx, h.Cx);
+    up.add(dm.Cy, h.Cy);
+    up.add(dm.Cz, h.Cz);
+    up.add(dm.dBndX, h.dBndX);
+    up.add(dm.dBndY, h.dBndY);
+    up.add(dm.dBndZ, h.dBndZ);
+    up.add(dm.nonOrthDc, h.nonOrthDc);
+    up.add(dm.corrVecX, h.corrX);
+    up.add(dm.corrVecY, h.corrY);
+    up.add(dm.corrVecZ, h.corrZ);
+    up.flush();
+}
+
+// the geometric buffers up, each into the buffer the device mesh holds (copyFrom keeps a buffer of the same size)
+inline void uploadDeviceMeshGeometry(DeviceMesh& dm, const DeviceMeshGeometryHost& h, const std::vector<scalar>& V)
+{
+    dm.w.copyFrom(h.w);
+    dm.V.copyFrom(V);
+    dm.Sfx.copyFrom(h.Sfx);
+    dm.Sfy.copyFrom(h.Sfy);
+    dm.Sfz.copyFrom(h.Sfz);
+    dm.dc.copyFrom(h.dc);
+    dm.magSf.copyFrom(h.magSf);
+    dm.Cfx.copyFrom(h.Cfx);
+    dm.Cfy.copyFrom(h.Cfy);
+    dm.Cfz.copyFrom(h.Cfz);
+    dm.Cx.copyFrom(h.Cx);
+    dm.Cy.copyFrom(h.Cy);
+    dm.Cz.copyFrom(h.Cz);
+    dm.dBndX.copyFrom(h.dBndX);
+    dm.dBndY.copyFrom(h.dBndY);
+    dm.dBndZ.copyFrom(h.dBndZ);
+    dm.nonOrthDc.copyFrom(h.nonOrthDc);
+    dm.corrVecX.copyFrom(h.corrX);
+    dm.corrVecY.copyFrom(h.corrY);
+    dm.corrVecZ.copyFrom(h.corrZ);
+}
+
 inline DeviceMesh buildDeviceMesh(
     const PrimitiveMesh& m,
     const FvGeometry& g,
@@ -128,45 +256,17 @@ inline DeviceMesh buildDeviceMesh(
     const int nC = m.nCells(), nIf0 = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
     const std::vector<label>& nei = m.neighbour();
-    const std::vector<vector>& Sf = g.Sf();
-    const std::vector<scalar>& magSfAll = g.magSf();
-    const std::vector<vector>& Cf = g.Cf();
-    const std::vector<vector>& C = g.C();
-    const std::vector<scalar>& wts = g.weights();
-    const std::vector<scalar>& dcAll = g.deltaCoeffs();
-    const std::vector<scalar>& nodcAll = g.nonOrthDeltaCoeffs();
-    const std::vector<vector>& cvAll = g.nonOrthCorrectionVectors();
 
     const int nIf = nIf0;                                  // internal faces = mesh internal faces only (cyclic is a separate interface)
 
     std::vector<label>  ownI(nIf), neiI(nIf);
-    std::vector<scalar> wI(nIf), dcI(nIf), nodcI(nIf);
-    std::vector<scalar> CfX(nIf), CfY(nIf), CfZ(nIf), corrX(nIf),corrY(nIf),corrZ(nIf);
-    std::vector<scalar> SfxN, SfyN, SfzN, magSfN;          // Sf layout: [internal | non-cyclic boundary]
-    SfxN.reserve(magSfAll.size());
-    SfyN.reserve(magSfAll.size());
-    SfzN.reserve(magSfAll.size());
-    magSfN.reserve(magSfAll.size());
     for (int f = 0; f < nIf0; ++f)                         // original internal faces
     {
         ownI[f]=own[f];
         neiI[f]=nei[f];
-        wI[f]=wts[f];
-        dcI[f]=dcAll[f];
-        nodcI[f]=nodcAll[f];
-        CfX[f]=Cf[f].x;
-        CfY[f]=Cf[f].y;
-        CfZ[f]=Cf[f].z;
-        corrX[f]=cvAll[f].x;
-        corrY[f]=cvAll[f].y;
-        corrZ[f]=cvAll[f].z;
-        SfxN.push_back(Sf[f].x);
-        SfyN.push_back(Sf[f].y);
-        SfzN.push_back(Sf[f].z);
-        magSfN.push_back(magSfAll[f]);
     }
     std::vector<label> bndCell, bndGFace, bndIsEmpty;      // non-cyclic boundary faces (cyclic patches skipped)
-    std::vector<scalar> dBndX, dBndY, dBndZ;               // Cf - C(faceCell) per boundary face (cellLimited grad)
+    label gFace = nIf;                                     // the boundary face's slot in Sf's [internal | boundary]
     for (const FvPatch& p : fvp)
     {
         if (isCoupledInterfaceType(p.type)) continue;
@@ -174,16 +274,8 @@ inline DeviceMesh buildDeviceMesh(
         for (label i = 0; i < p.size; ++i)
         {
             bndCell.push_back(p.faceCells[i]);
-            bndGFace.push_back((label)SfxN.size());
+            bndGFace.push_back(gFace++);
             bndIsEmpty.push_back(emp);
-            SfxN.push_back(Sf[p.start+i].x);
-            SfyN.push_back(Sf[p.start+i].y);
-            SfzN.push_back(Sf[p.start+i].z);
-            magSfN.push_back(magSfAll[p.start+i]);
-            const vector dB = Cf[p.start+i] - C[p.faceCells[i]];
-            dBndX.push_back(dB.x);
-            dBndY.push_back(dB.y);
-            dBndZ.push_back(dB.z);
         }
     }
     const int nB = static_cast<int>(bndCell.size());
@@ -222,13 +314,6 @@ inline DeviceMesh buildDeviceMesh(
     dm.addressingId = nextDeviceAddressingId();
     dm.owner.copyFrom(ownI);
     dm.nei.copyFrom(neiI);
-    dm.w.copyFrom(wI);
-    dm.V.copyFrom(g.V());
-    dm.Sfx.copyFrom(SfxN);
-    dm.Sfy.copyFrom(SfyN);
-    dm.Sfz.copyFrom(SfzN);
-    dm.dc.copyFrom(dcI);
-    dm.magSf.copyFrom(magSfN);
     dm.ownerStart.copyFrom(ownerStart);
     dm.losort.copyFrom(losort);
     dm.losortStart.copyFrom(losortStart);
@@ -237,29 +322,30 @@ inline DeviceMesh buildDeviceMesh(
     dm.bndPerm.copyFrom(bndPerm);
     dm.bndCellStart.copyFrom(bndCellStart);
     dm.bndIsEmpty.copyFrom(bndIsEmpty);
-    dm.Cfx.copyFrom(CfX);
-    dm.Cfy.copyFrom(CfY);
-    dm.Cfz.copyFrom(CfZ);
-    {
-        std::vector<scalar> CX(nC), CY(nC), CZ(nC);
-        for (int c = 0; c < nC; ++c)
-        {
-            CX[c] = C[c].x;
-            CY[c] = C[c].y;
-            CZ[c] = C[c].z;
-        }
-        dm.Cx.copyFrom(CX);
-        dm.Cy.copyFrom(CY);
-        dm.Cz.copyFrom(CZ);
-    }
-    dm.dBndX.copyFrom(dBndX);
-    dm.dBndY.copyFrom(dBndY);
-    dm.dBndZ.copyFrom(dBndZ);
-    dm.nonOrthDc.copyFrom(nodcI);
-    dm.corrVecX.copyFrom(corrX);
-    dm.corrVecY.copyFrom(corrY);
-    dm.corrVecZ.copyFrom(corrZ);
+    uploadDeviceMeshGeometry(dm, deviceMeshGeometryHost(m, g, fvp), g.V());
     return dm;
+}
+
+// refreshDeviceMeshGeometry's update WITHOUT rebuilding the addressing or replacing a buffer: the geometry
+// (deviceMeshGeometryHost, the builder's own) written into the buffers the device mesh already holds, at the
+// addresses its users hold. For a caller that refreshes every step and keeps no cache keyed on a geometric
+// buffer's address (rhoCentralFoam's mesh.update(), milestone K: the rebuild was 1.9 ms of an 11.9 ms step on
+// movingCone). leastSquaresVectors dropped as refreshDeviceMeshGeometry drops it.
+inline void refreshDeviceMeshGeometryInPlace(
+    DeviceMesh& dm,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp,
+    PackedUpload* up = nullptr)   // one transfer for all twenty arrays (PackedUpload); null: copyFrom each
+{
+    DeviceMeshGeometryHost h = deviceMeshGeometryHost(m, g, fvp);
+    if (m.nCells() != dm.nCells || m.nInternalFaces() != dm.nInternalFaces
+     || static_cast<int>(h.dBndX.size()) != dm.nBndFaces)
+        throw std::runtime_error("brae: refreshDeviceMeshGeometryInPlace saw a different mesh size -- a move "
+                                 "must not change topology (OF polyMesh::movePoints keeps it fixed).");
+    if (up) uploadDeviceMeshGeometryPacked(dm, h, g.V(), *up);
+    else uploadDeviceMeshGeometry(dm, h, g.V());
+    dm.lsqInvDd.resize(0);
 }
 
 inline void refreshDeviceMeshGeometry(

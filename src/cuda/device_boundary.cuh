@@ -816,6 +816,66 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
     return uploadDeviceVectorBoundary(deviceVectorBoundaryArrays(f, fvp, g, storedIoSeed));
 }
 
+// THE GEOMETRY A MOVING MESH CHANGES in a built boundary, without building it again: every uncoupled patch's faces in
+// patch order, as both builders above lay them out (empty patches included) -- the patch's deltaCoeffs, magSf, and
+// the vector builder's gradient mirror normal (gradSymN) and unit normals nx/ny/nz, each in that builder's arithmetic:
+// Sf/magSf by DIVISION (0 where magSf is 0), a symmetryPlane's normal summed in face order. The arrays are the ones a
+// fresh build gives, element for element; a caller copies them over the built boundary's (DeviceBoundary::
+// deltaCoeffs, magSf, gradSymN; DeviceVectorBoundary::nx/ny/nz). Measured motive: rhoCentralFoam's mesh.update()
+// rebuilt U's, p's and T's whole boundaries to keep these, 7.1 of the 11.9 ms a step on movingCone (milestone K).
+struct DeviceBoundaryGeometryHost
+{
+    std::vector<scalar> dc, ms, gsn, nrm[3];
+};
+
+inline DeviceBoundaryGeometryHost deviceBoundaryGeometry(
+    const std::vector<FvPatch>& fvp,
+    const FvGeometry& g)
+{
+    DeviceBoundaryGeometryHost h;
+    std::size_t nAll = 0;
+    for (const FvPatch& p : fvp)
+    {
+        if (!isCoupledInterfaceType(p.type)) nAll += static_cast<std::size_t>(p.size);
+    }
+    h.dc.reserve(nAll);
+    h.ms.reserve(nAll);
+    h.gsn.reserve(3*nAll);
+    for (int k = 0; k < 3; ++k) h.nrm[k].reserve(nAll);
+    for (const FvPatch& p : fvp)
+    {
+        if (isCoupledInterfaceType(p.type)) continue;
+        const bool gradSym = (p.type == "symmetry");
+        vector planeN{0, 0, 0};
+        if (p.type == "symmetryPlane")
+        {
+            vector sumA{0, 0, 0};
+            for (label i = 0; i < p.size; ++i)
+            {
+                sumA = sumA + g.Sf()[p.start + i];
+            }
+            const scalar a = mag(sumA);
+            planeN = (a > scalar(1.0e-150)) ? sumA/a : vector{0, 0, 0};
+        }
+        for (label i = 0; i < p.size; ++i)
+        {
+            const label gf = p.start + i;
+            h.dc.push_back(p.deltaCoeffs[i]);
+            h.ms.push_back(g.magSf()[gf]);
+            const vector n = gradSym ? g.Sf()[gf]/g.magSf()[gf] : planeN;
+            h.gsn.push_back(n.x);
+            h.gsn.push_back(n.y);
+            h.gsn.push_back(n.z);
+            const vector Sf = g.Sf()[gf];
+            const scalar mg = g.magSf()[gf];
+            h.nrm[0].push_back(mg > 0 ? Sf.x / mg : 0.0);
+            h.nrm[1].push_back(mg > 0 ? Sf.y / mg : 0.0);
+            h.nrm[2].push_back(mg > 0 ? Sf.z / mg : 0.0);
+        }
+    }
+    return h;
+}
+
 // WHAT THE NON-STATE ARRAYS ARE BUILT FROM: the boundary's geometry (face cells, the patches' deltaCoeffs, Sf
 // and magSf on their faces) and each uncoupled patch's kind -- its type, category, symmetry, wedge tensors and
 // tangentialVelocity refValue. Two equal keys give the same non-state arrays, so a refresh can skip building

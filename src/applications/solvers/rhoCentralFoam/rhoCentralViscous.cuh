@@ -75,14 +75,14 @@ public:
     // What the implicit correctors leave unconserved: deltaT*sum over the cells of b - A x (lduMatrix::residual) after
     // each solve, summed over the run -- x, y, z momentum and energy. A converged solve leaves round-off; the
     // tutorials' relTol 0.01 leaves more, the same as OpenFOAM's algorithm does (the totals move by minus this).
-    void solveResidual(double out[4]) const { for (int k = 0; k < 4; ++k) out[k] = solveRes_[k]; }
+    void solveResidual(double out[4]) const { foldAccount(); for (int k = 0; k < 4; ++k) out[k] = solveRes_[k]; }
     // The same remainder unsigned, deltaT*sum|b - A x| (the actual, unnormalized algebraic residual), and the largest
     // error, over the run's solves, of the identity each solve satisfies (x the solved field, x_p the field before it):
     //   sum_c rho_c V_c (x_c - x_p,c) = deltaT*[sum_b (bC_b - iC_b x_c(b)) (+ sum_b Sf_b & tauMC_b for U)] - deltaT*sum_c r_c
     // relative to sum_c rho_c V_c |U_c| (momentum) or |e_c| (energy): the signs, the volume weights and the patch contributions checked one solve
     // at a time. x, y, z momentum and energy.
-    void solveResidualL1(double out[4]) const { for (int k = 0; k < 4; ++k) out[k] = solveResL1_[k]; }
-    void solveIdentity(double out[4]) const { for (int k = 0; k < 4; ++k) out[k] = identityMax_[k]; }
+    void solveResidualL1(double out[4]) const { foldAccount(); for (int k = 0; k < 4; ++k) out[k] = solveResL1_[k]; }
+    void solveIdentity(double out[4]) const { foldAccount(); for (int k = 0; k < 4; ++k) out[k] = identityMax_[k]; }
 
 private:
     void geometry();
@@ -112,9 +112,18 @@ private:
     DeviceBuffer<tensor> uR_;
     DeviceBuffer<label> bCell_;
     DeviceBuffer<scalar> res_;
-    double solveRes_[4] = {0, 0, 0, 0};
-    double solveResL1_[4] = {0, 0, 0, 0};
-    double identityMax_[4] = {0, 0, 0, 0};
+    mutable double solveRes_[4] = {0, 0, 0, 0};
+    mutable double solveResL1_[4] = {0, 0, 0, 0};
+    mutable double identityMax_[4] = {0, 0, 0, 0};
+    // account()'s reductions, kept on the device until read: five a solve (sum r, sum|r|, the identity's lhs, scale and
+    // patch sum, deviceDotInto/deviceSumMagInto: deviceDot's and deviceSumMag's kernels) beside the solve's slot and
+    // rDeltaT; foldAccount() brings them down in one copy and folds them into the totals in the order the solves ran,
+    // the arithmetic account() did when it read each one back at once (five waits a solve, 1.2 ms of LadenburgJet60psi's
+    // 3.9 ms step)
+    static constexpr int kAccountLog = 4096;
+    mutable DeviceBuffer<scalar> accLog_;
+    mutable std::vector<std::pair<int, scalar>> accPending_;
+    void foldAccount() const;
     DeviceBuffer<scalar> xp_[4], idC_, idM_, idB_, onesB_;
     // sutherland (milestone H): mu and alphahe per cell and face, the laplacians rebuilt each step; wedge patches
     bool sutherland_ = false, wedge_ = false;

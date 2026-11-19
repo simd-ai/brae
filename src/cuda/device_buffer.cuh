@@ -655,4 +655,76 @@ private:
     std::size_t n_ = 0;
 };
 
+// SEVERAL HOST ARRAYS UP IN ONE TRANSFER: add() names each destination and its host array; flush() packs them into one
+// pinned host block, copies the block to a device staging buffer once and then each slice into its destination, all
+// on the thread's stream -- so every kernel or copy queued after flush() sees the new values, as after copyFrom. The
+// same bytes land; nothing is computed. copyFrom is a synchronous pageable copy and a wait per array: twenty a step
+// in rhoCentralFoam's mesh.update() (1.2 ms of a movingCone step). The host arrays need only live until flush(); the
+// pinned block is not refilled before the last flush's copy out of it has finished.
+class PackedUpload
+{
+public:
+    PackedUpload() = default;
+    PackedUpload(const PackedUpload&) = delete;
+    PackedUpload& operator=(const PackedUpload&) = delete;
+    ~PackedUpload()
+    {
+        if (done_) cudaEventDestroy(done_);
+        if (host_) cudaFreeHost(host_);
+    }
+    void add(DeviceBuffer<scalar>& dst, const std::vector<scalar>& src) { items_.push_back({&dst, &src}); }
+    void flush()
+    {
+        std::size_t n = 0;
+        for (const Item& it : items_) n += it.src->size();
+        if (n == 0)
+        {
+            items_.clear();
+            return;
+        }
+        if (done_) cudaCheck(cudaEventSynchronize(done_), "packed upload: the last copy");
+        if (n > cap_)
+        {
+            if (host_) cudaFreeHost(host_);
+            host_ = nullptr;
+            cudaCheck(cudaMallocHost(reinterpret_cast<void**>(&host_), n*sizeof(scalar)), "packed upload: pinned block");
+            cap_ = n;
+        }
+        if (staging_.size() < n) staging_.resize(n);
+        std::size_t off = 0;
+        for (const Item& it : items_)
+        {
+            std::copy(it.src->begin(), it.src->end(), host_ + off);
+            off += it.src->size();
+        }
+        cudaCheck(cudaMemcpyAsync(staging_.data(), host_, n*sizeof(scalar), cudaMemcpyHostToDevice,
+                                  cudaStreamPerThread), "packed upload: H2D");
+        off = 0;
+        for (const Item& it : items_)
+        {
+            const std::size_t m = it.src->size();
+            if (it.dst->size() != m) it.dst->resize(m);
+            if (m)
+                cudaCheck(cudaMemcpyAsync(it.dst->data(), staging_.data() + off, m*sizeof(scalar),
+                                          cudaMemcpyDeviceToDevice, cudaStreamPerThread), "packed upload: D2D");
+            off += m;
+        }
+        if (!done_) cudaCheck(cudaEventCreateWithFlags(&done_, cudaEventDisableTiming), "packed upload: event");
+        cudaCheck(cudaEventRecord(done_, cudaStreamPerThread), "packed upload: record");
+        items_.clear();
+    }
+
+private:
+    struct Item
+    {
+        DeviceBuffer<scalar>* dst;
+        const std::vector<scalar>* src;
+    };
+    std::vector<Item> items_;
+    scalar* host_ = nullptr;
+    std::size_t cap_ = 0;
+    DeviceBuffer<scalar> staging_;
+    cudaEvent_t done_ = nullptr;
+};
+
 } // namespace brae

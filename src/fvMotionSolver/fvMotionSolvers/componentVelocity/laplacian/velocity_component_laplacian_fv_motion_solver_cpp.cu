@@ -1,4 +1,6 @@
 #include "velocity_component_laplacian_fv_motion_solver_cpp.cuh"
+#include "inter_phase_time.cuh"   // BRAE_INTER_PHASE_TIME (off by default)
+#include <optional>
 #include "face_cpp.cuh"
 #include "foam_field_reader.cuh"
 #include "fv_patch_field.cuh"
@@ -344,6 +346,8 @@ void VelocityComponentLaplacianFvMotionSolver::solve(
     const std::vector<FvPatch>& patches)
 {
     (void)time;   // uniformFixedValue's Function1 is a constant (the only one ported)
+    std::optional<interPhase::Nested> ph;
+    ph.emplace("motion solver: diffusivity, BCs, laplacian");
     diffusivityCorrect(g, patches);
 
     // pointMotionU_.boundaryFieldRef().updateCoeffs(): each fixing patch writes its values into the point field
@@ -385,7 +389,10 @@ void VelocityComponentLaplacianFvMotionSolver::solve(
     // or orthogonal (deltaCoeffs)
     FvScalarMatrix M = fvm::laplacian<scalar>(faceDiffusivity_, U, m, g, patches, false, !orthogonal_);
     std::vector<scalar> psi = cellMotionU_;
+    ph.reset();
+    ph.emplace("motion solver: PCG");
     lastSolve_ = pcg(M, psi, m, patches, tolerance_, relTol_, maxIter_, minIter_);
+    ph.reset();
     cellMotionU_ = psi;
 
     // psi.correctBoundaryConditions(): the zeroGradient-like patches take the new cell values, cellMotion keeps its own
@@ -408,6 +415,7 @@ std::vector<vector> VelocityComponentLaplacianFvMotionSolver::curPoints(
 {
     // interpolationPtr_->interpolate(cellMotionU_, pointMotionU_): volPointInterpolation, the weights for the mesh as
     // it stands (movePoints)
+    interPhase::Nested ph("motion solver: curPoints (volPointInterpolation, twoD)");
     interpolation_.makeWeights(m, g, patches, pointCells_);
     interpolation_.interpolateInternalField(cellMotionU_, pointMotionU_);
     interpolation_.interpolateBoundaryField(cellMotionUBoundary_, pointMotionU_);
