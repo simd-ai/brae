@@ -4,7 +4,7 @@ Steady-state incompressible solver (SIMPLE / SIMPLEC). This is the solver brae s
 OpenFOAM v2412's `simpleFoam`, fully device-resident and validated cell-by-cell against OpenFOAM. If your case uses
 only what is listed here, it should run and match OpenFOAM to under 1%.
 
-[<- back to all solvers](../../README.md#-will-it-run-my-case)
+[<- back to all solvers](../../README.md#solvers)
 
 ## At a glance
 

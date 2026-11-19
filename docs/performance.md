@@ -29,13 +29,70 @@ Other tuning knobs (advanced; sensible defaults):
 | `BRAE_AMG_SA=1` | smoothed-aggregation multigrid (vs default pairwise), stronger on cyclic / graded meshes |
 | `BRAE_GS_DEVICE=1` | device-resident k/ε Gauss-Seidel scalar solve |
 
+## One GH200, four solvers
+
+Measured 2026-11-18 with brae `main` at df3cd8cb, on one NVIDIA GH200 superchip (96 GiB HBM3 GPU, 72 Grace cores).
+
+| | |
+|---|---|
+| **brae** | the GPU, with the shell pinned to the same superchip's Grace cores; defaults, apart from the GPU-sweeps rows |
+| **OpenFOAM** | v2412, 72 MPI ranks on the 72 Grace cores, scotch decomposition, the case's own linear solvers |
+| **cases** | stock v2412 tutorials, scaled by multiplying every block's cell counts in `blockMeshDict` by one factor |
+| **both codes** | function objects removed, `residualControl` removed, no writes, fixed `deltaT` (the tutorial's, divided by the scale factor, so the Courant number stays the tutorial's), interFoam's mesh refinement off (`staticFvMesh`) |
+| **timed** | the median gap between successive step lines, over steps 11 to 60 (steady) or 11 to 40 (transient). Start-up, mesh reading and the first steps fall outside it, the same way for both codes |
+| **largest mesh** | brae only, grown until the GPU's memory is about 95 % full; memory is nvidia-smi's peak during the run |
+
+![Seconds per step against mesh size for the four solvers](images/one-gh200-seconds-per-step.png)
+
+| solver | cells | brae s/step | OpenFOAM 72 cores s/step | brae against OpenFOAM | brae GPU memory, GiB |
+|---|---:|---:|---:|---:|---:|
+| simpleFoam | 246,740 | 0.006 | 0.013 | 2.1× faster | 1.1 |
+| simpleFoam | 974,980 | 0.014 | 0.048 | 3.3× faster | 2.6 |
+| simpleFoam | 4,020,588 | 0.037 | 0.277 | 7.4× faster | 9.0 |
+| simpleFoam | 9,909,171 | 0.088 | 0.722 | 8.2× faster | 21.0 |
+| simpleFoam | 20,136,713 | 0.202 | 1.472 | 7.3× faster | 42.0 |
+| simpleFoam | 43,697,800 (largest) | 0.409 | - | - | 88.0 |
+| rhoSimpleFoam | 250,272 | 0.044 | 0.137 | 3.1× faster | 2.1 |
+| rhoSimpleFoam | 998,560 | 0.105 | 0.652 | 6.2× faster | 6.6 |
+| rhoSimpleFoam | 3,997,400 | 0.267 | 3.705 | 13.9× faster | 24.6 |
+| rhoSimpleFoam | 10,000,000 | 0.577 | 8.722 | 15.1× faster | 60.4 |
+| rhoSimpleFoam | 15,106,868 (largest) | 0.836 | - | - | 91.3 |
+| pimpleFoam | 249,200 | 0.030 | 0.016 | 1.8× slower | 1.4 |
+| pimpleFoam | 1,009,664 | 0.072 | 0.061 | 1.2× slower | 3.9 |
+| pimpleFoam | 4,073,166 | 0.149 | 0.316 | 2.1× faster | 13.9 |
+| pimpleFoam | 10,126,647 | 0.267 | 0.869 | 3.3× faster | 33.3 |
+| pimpleFoam | 19,806,488 | 0.474 | 1.760 | 3.7× faster | 64.0 |
+| pimpleFoam | 28,292,863 (largest) | 0.652 | - | - | 93.1 |
+| pimpleFoam, CPU sweep | 249,200 | 0.044 | 0.016 | 2.7× slower | 1.2 |
+| pimpleFoam, CPU sweep | 1,009,664 | 0.181 | 0.061 | 3.0× slower | 2.8 |
+| pimpleFoam, CPU sweep | 4,073,166 | 0.754 | 0.316 | 2.4× slower | 9.4 |
+| pimpleFoam, CPU sweep | 10,126,647 | 1.919 | 0.869 | 2.2× slower | 22.2 |
+| pimpleFoam, CPU sweep | 19,806,488 | 4.484 | 1.760 | 2.5× slower | 41.7 |
+| pimpleFoam, CPU sweep | 43,740,928 (largest) | 10.034 | - | - | 89.5 |
+| interFoam | 246,447 | 0.018 | 0.032 | 1.8× faster | 1.5 |
+| interFoam | 983,858 | 0.043 | 0.111 | 2.6× faster | 4.1 |
+| interFoam | 3,958,839 | 0.130 | 0.549 | 4.2× faster | 14.4 |
+| interFoam | 9,786,689 | 0.302 | 1.492 | 4.9× faster | 34.1 |
+| interFoam | 19,597,259 | 0.572 | 3.127 | 5.5× faster | 66.8 |
+| interFoam | 26,309,024 (largest) | 0.766 | - | - | 90.9 |
+
+- **pimpleFoam** sweeps its U, k and epsilon Gauss-Seidel solves on the GPU, level by level, in OpenFOAM's cell
+  order. These rows were measured on df3cd8cb with `BRAE_GS_HOST_SMOOTHER=0`, the path that is now the default; a
+  re-time on the new default read 0.148 s at 4.1 M cells and 0.466 s at 19.8 M. Below about 2 M cells OpenFOAM is
+  still ahead (1.8× at 0.25 M, 1.2× at 1 M).
+- **pimpleFoam, CPU sweep** is the old default, now `BRAE_GS_HOST_SMOOTHER=1`: the same sweeps on one CPU thread.
+  After 40 steps at 4 M cells it wrote the same U, p, k, epsilon, nut and phi, byte for byte, as the GPU sweeps.
+- **rhoSimpleFoam** is the aerofoil, a 2-D mesh one cell thick. On the transonic squareBend, OpenFOAM with 72 ranks
+  went to negative temperature within five iterations at every scaled size tried except ×3, where the two codes
+  were level (0.272 s and 0.273 s at 3.0 M cells).
+
 ## Benchmarks
 
 | | |
 |---|---|
 | **measured** | total wall for 100 SIMPLE iterations, scaled-pitzDaily |
 | **hardware** | one NVIDIA GB10 — 20 Grace cores + one Blackwell GPU, unified LPDDR5x, **no HBM** |
-| **excluded, both sides** | one-time prep: `decomposePar` for OpenFOAM, `brae -partition` for brae (caches mesh + AMG, see [Run it](../README.md#-run-it)) |
+| **excluded, both sides** | one-time prep: `decomposePar` for OpenFOAM, `brae -partition` for brae (caches mesh + AMG, see [Run it](../README.md#run-it)) |
 
 | cells | **brae** (Blackwell GPU) | OpenFOAM (20 Grace cores) | OpenFOAM+AMGX (same GPU) | OpenFOAM+PETSc-GPU (same GPU) | SPUMA (same GPU) |
 |---|---:|---:|---:|---:|---:|

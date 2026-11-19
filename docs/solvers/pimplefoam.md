@@ -5,7 +5,7 @@ time loop, the momentum predictor, the pressure correctors and the turbulence tr
 nothing is copied back between time steps. It shares its three phases with [`simpleFoam`](simplefoam.md) — the same
 validated momentum, pressure and turbulence code, with an implicit `fvm::ddt` folded in.
 
-[<- back to all solvers](../../README.md#-will-it-run-my-case)
+[<- back to all solvers](../../README.md#solvers)
 
 You do not run it by name: a case whose `controlDict` says `application pimpleFoam` is handed to it by `brae`.
 
