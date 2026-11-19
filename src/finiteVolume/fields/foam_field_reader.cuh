@@ -218,6 +218,7 @@ struct PatchFieldData
     // p0 - 0.5*rho*neg(phi)*|U|^2; a NAMED psi -> the isentropic high-speed form with gamma, which brae
     // does not implement. Recorded so it can be refused by name instead of silently running low-speed.
     std::string    psiName      = "none";
+    bool           psiGiven     = false;   // `psi` was in the dictionary (else the type's default, set after the entry)
     scalar         gammaTP      = 1.0;
     // The key the total reference was read from -- `p0` (totalPressure) or `T0` (totalTemperature), both kept in the
     // inletValue slot -- so a writer can echo it under its own name; and waveTransmissive's (advective's) entries:
@@ -1474,6 +1475,7 @@ inline FieldData<T> readField(const std::string& path)
                     else if (key == "psi")    // totalPressure: selects OF's isentropic branch when != none
                     {
                         p.psiName = ts.next();
+                        p.psiGiven = true;
                         ts.expect(";");
                     }
                     else if (key == "gamma")   // totalPressure isentropic exponent
@@ -1751,6 +1753,11 @@ inline FieldData<T> readField(const std::string& path)
                     announce("kappa", p.hasWfKappa, p.wfKappa, 0.41);
                     announce("E",     p.hasWfE,     p.wfE,     9.8);
                 }
+                // psi's default is the patch type's: totalPressure "none" (the member's default), waveTransmissive and
+                // totalTemperature "thermo:psi" (waveTransmissiveFvPatchField.C:76, totalTemperatureFvPatchScalarField.C:79,
+                // getOrDefault). OpenFOAM's write() leaves psi out when it is that default, so a field OpenFOAM wrote
+                // (mapFields, a restart) carried no psi and read here as "none" (2026-11-19).
+                if (!p.psiGiven && (p.type == "waveTransmissive" || p.type == "totalTemperature")) p.psiName = "thermo:psi";
                 fd.boundary.push_back(std::move(p));
             }
             ts.expect("}");

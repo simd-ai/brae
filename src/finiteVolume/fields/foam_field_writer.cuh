@@ -1,5 +1,4 @@
 #pragma once
-#include <map>
 // brae::writeVolField, write a converged volume field in OpenFOAM's own structure. Unlike a raw text splice, this
 // emits a fully RESOLVED field like OpenFOAM does: the internalField is the solved nonuniform list, and the
 // boundaryField is written per mesh patch with an explicit `type` (+ value) entry, patch groups expanded, #include /
@@ -12,6 +11,7 @@
 #include "fv_patch.cuh"            // FvPatch (name / type / inGroups)
 #include <fstream>
 #include <iomanip>
+#include <map>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -124,14 +124,17 @@ inline void writePatchEntry(
     const std::string& name,
     const PatchFieldData<T>& d,
     const T* computed = nullptr,     // solver's boundary values for this patch, or null to echo the input
-    std::size_t nComputed = 0)
+    std::size_t nComputed = 0,
+    const std::string* extra = nullptr)   // entries a solver writes for this patch, before `value`; null: none
 {
     os << "    " << name << "\n    {\n";
     os << "        type            " << (d.type.empty() ? "zeroGradient" : d.type) << ";\n";
-    // rhoCentralFoam's nozzle boundaries (milestone H): totalPressure in its isentropic (psi) form, totalTemperature
-    // and waveTransmissive echo the entries OpenFOAM's readers require, under their own names, so OpenFOAM restarts
-    // from brae's output. Every other use keeps what it wrote before.
-    const bool totalPsi = (d.type == "totalPressure" && d.psiName != "none") || d.type == "totalTemperature";
+    // totalPressure, totalTemperature and waveTransmissive echo the entries OpenFOAM's readers require, under their own
+    // names, so OpenFOAM restarts from brae's output. totalPressureFvPatchScalarField::write emits rho, psi, gamma and p0
+    // in every form (.C:238-248), and its dictionary constructor REQUIRES p0: this wrote the psi form alone so (milestone
+    // H), and every other form's p0 as `inletValue`, which OpenFOAM stops on ("Entry 'p0' not found"; movingCone's rho
+    // form, found 2026-11-19, and any simpleFoam, pimpleFoam or rhoSimpleFoam case with a totalPressure outlet or inlet).
+    const bool totalPsi = d.type == "totalPressure" || d.type == "totalTemperature";
     if (totalPsi || d.type == "waveTransmissive")
     {
         if (d.type == "waveTransmissive" && !d.advFieldName.empty())
@@ -253,6 +256,7 @@ inline void writePatchEntry(
     if (d.type == "turbulentMixingLengthDissipationRateInlet"
      || d.type == "turbulentMixingLengthFrequencyInlet")
         os << "        mixingLength    " << d.mixingLength << ";\n";
+    if (extra) os << *extra;
     if (computed && nComputed)
     {
         // The SOLVED boundary values, not the ones the case was started from. Echoing the input made
@@ -301,7 +305,10 @@ inline void writeVolField(
     // Flat boundary values in patch order, EXCLUDING cyclic/cyclicAMI -- the same flattening
     // DeviceBoundary uses, so a solver buffer can be handed over unchanged. Empty -> echo the input.
     const std::vector<T>& computedBoundary = {},
-    const DerivedFieldSpec* derived = nullptr)
+    const DerivedFieldSpec* derived = nullptr,
+    // per patch name, entries the solver writes before `value` (rhoCentralFoam's maxwellSlipU and smoluchowskiJumpT:
+    // the inputs and the mixed state OpenFOAM's write() emits); null: none, as before
+    const std::map<std::string, std::string>* patchExtra = nullptr)
 {
     // The ORIGINAL field is re-read here as a template: its FoamFile header, dimensions and boundaryField
     // shape are echoed into the new time directory. It may be gzipped -- OF writes `U.gz` whenever
@@ -432,9 +439,15 @@ inline void writeVolField(
         const bool haveComputed = !computedBoundary.empty() && !coupled && p.size > 0
                                && bndOff + static_cast<std::size_t>(p.size) <= computedBoundary.size()
                                && p.type != "empty";
+        const std::string* extra = nullptr;
+        if (patchExtra)
+        {
+            const auto it = patchExtra->find(p.name);
+            if (it != patchExtra->end()) extra = &it->second;
+        }
         writePatchEntry(out, p.name, *d,
                         haveComputed ? &computedBoundary[bndOff] : nullptr,
-                        haveComputed ? static_cast<std::size_t>(p.size) : 0);
+                        haveComputed ? static_cast<std::size_t>(p.size) : 0, extra);
         if (!coupled) bndOff += static_cast<std::size_t>(p.size);
     }
     out << "}\n\n\n// ************************************************************************* //\n";
