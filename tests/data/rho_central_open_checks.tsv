@@ -1,6 +1,8 @@
 # Open validation items of the rhoCentralFoam gates: FAILs that are known, analysed and left red for review.
 # tests/rho_central_gate_lib.sh prints the category under a matching FAIL; it never turns a FAIL into a pass and no
 # threshold reads this file. Columns, tab-separated: gate (script name), the FAIL message (a bash glob), category, note.
+# tests/data/rho_central_known_red.tsv counts the FAIL lines each row matches, and tools/known_red_check.py holds the
+# known-red gates to those counts in CI (a FAIL no row names, or a row's count changing, fails that check).
 # Categories: round-off amplification | timestep sequence divergence | OpenFOAM reference failure |
 # unexplained numerical difference. (OpenFOAM reference failure: no FAIL today -- where OpenFOAM v2412 itself stops,
 # Toro 2 with vanLeer, MUSCL, SuperBee and limitedLinear, the riemann gate asserts that brae stops too, and passes.)

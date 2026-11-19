@@ -2284,8 +2284,9 @@ target_link_libraries(brae_rhoSimpleFoam PRIVATE brae_core)
 # hours, so they carry `slow` and `rhocentral` (ctest -L rhocentral runs them all). Six of them stay red on purpose:
 # their FAILs are analysed, registered open checks (tests/data/rho_central_open_checks.tsv, 24 FAIL lines in all,
 # each printed with its category under the FAIL), never turned into passes and never covered by a wider bound.
-# Those carry `known-red` as well, so the GB10 CI (.github/workflows/gpu-test.yml, -LE known-red) runs the other
-# seven and `ctest -L known-red` runs these: restart 1 (round-off amplification), riemann 16 (round-off amplification
+# Those carry `known-red` as well, so the GB10 CI's ctest step (.github/workflows/gpu-test.yml, -LE known-red) runs the
+# other seven, its next step runs these six through tools/known_red_check.py (red must be exactly the registered FAILs,
+# below), and `ctest -L known-red` runs them as they are: restart 1 (round-off amplification), riemann 16 (round-off amplification
 # and timestep-sequence divergence, as OpenFOAM's own decompositions diverge), nozzle 3 (round-off amplification of an
 # unstable mode OpenFOAM shares; one stopping-test flip), turb 2, moving 1 and 3d 1 (an iterative solve stopping one
 # sweep apart at its declared tolerance, as OpenFOAM's own runs do).
@@ -2350,6 +2351,13 @@ add_test(NAME rho_central_3d_vs_openfoam
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_3d_vs_openfoam.sh)
 set_tests_properties(rho_central_3d_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow;rhocentral;known-red" TIMEOUT 5400
                      ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+# What tells the six known-red gates' 24 registered FAILs from a regression: tools/known_red_check.py runs them and
+# passes only when their FAILs are exactly the registered ones, counted per registry row and with each gate's pass
+# count (tests/data/rho_central_known_red.tsv). The GB10 CI runs it as its own step; this is its no-GPU self-test,
+# which the hosted build-check runs too.
+add_test(NAME rho_central_known_red_check_selftest
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/known_red_check.py --selftest)
+set_tests_properties(rho_central_known_red_check_selftest PROPERTIES LABELS "rhocentral" TIMEOUT 120)
 add_test(NAME rho_central_refusals
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_refusals.sh)
 set_tests_properties(rho_central_refusals PROPERTIES SKIP_RETURN_CODE 77 LABELS "rhocentral" TIMEOUT 600

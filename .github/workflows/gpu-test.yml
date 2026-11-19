@@ -51,3 +51,13 @@ jobs:
         run: |
           python3 tools/ctest_cached.py --test-dir build \
               ${{ inputs.no_cache && '--no-cache' || '' }} --output-on-failure -j4 -LE known-red
+
+      - name: Known-red rhoCentralFoam gates (red must be exactly the registered open checks)
+        # The step above leaves `known-red` out. Six rhoCentralFoam gates carry it: they are red by decision, with 24
+        # analysed FAILs registered in tests/data/rho_central_open_checks.tsv and printed by the gates as FAILs with
+        # their category. This runs those six and fails on any difference from tests/data/rho_central_known_red.tsv:
+        # a FAIL no registry row names, a registered row matching more or fewer FAILs, a gate passing a different
+        # number of checks. It changes no threshold and turns no FAIL into a pass; the gates' output is in the log.
+        # (tutorial_motorbike's known-red is not a registry item and stays out of both steps.)
+        if: ${{ !cancelled() }}
+        run: python3 tools/known_red_check.py --test-dir build -j 2
