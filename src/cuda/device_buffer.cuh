@@ -141,23 +141,34 @@ public:
             cudaGetLastError();
             const std::size_t idleBefore = heldBytes_;
             releaseIdle();
-            if (cudaMalloc(&p, cls) != cudaSuccess)
+            const cudaError_t again = cudaMalloc(&p, cls);
+            if (again != cudaSuccess)
             {
                 cudaGetLastError();
                 std::size_t freeB = 0, totalB = 0;
-                cudaMemGetInfo(&freeB, &totalB);
+                // cudaMalloc's own error, and cudaMemGetInfo's when it fails too: a run that never had a context (the
+                // first allocation, the device busy or unavailable) may not be out of memory at all, and read "0.000 of 0.000 GB
+                // free" with no cause (GB10, 2026-11-19, a 3-D case started beside a full test suite).
+                const cudaError_t info = cudaMemGetInfo(&freeB, &totalB);
+                cudaGetLastError();
+                char cause[200];
+                if (info == cudaSuccess)
+                    std::snprintf(cause, sizeof cause, "cudaMalloc: %s", cudaGetErrorName(again));
+                else
+                    std::snprintf(cause, sizeof cause, "cudaMalloc: %s; cudaMemGetInfo failed too: %s", cudaGetErrorName(again),
+                                  cudaGetErrorString(info));
                 char use[200];
                 if (stats_)
                     std::snprintf(use, sizeof use, "%.3f GB in use now, peak in use %.3f GB in '%s'", liveBytes_/1073741824.0,
                                   peakLive_/1073741824.0, peakPhase_);
                 else
                     std::snprintf(use, sizeof use, "BRAE_POOL_STATS=1 counts what is in use");
-                char msg[720];
+                char msg[960];
                 std::snprintf(msg, sizeof msg,
                               "brae device pool: out of device memory asking for %.3f GB in phase '%s': the pool holds %.3f GB "
-                              "(%s; %.3f GB idle handed back first), the device has %.3f of %.3f GB free",
+                              "(%s; %.3f GB idle handed back first), the device has %.3f of %.3f GB free (%s)",
                               cls/1073741824.0, phase_, (mallocBytes_ - freedBytes_)/1073741824.0, use,
-                              idleBefore/1073741824.0, freeB/1073741824.0, totalB/1073741824.0);
+                              idleBefore/1073741824.0, freeB/1073741824.0, totalB/1073741824.0, cause);
                 report("at OOM");
                 throw std::runtime_error(msg);
             }
