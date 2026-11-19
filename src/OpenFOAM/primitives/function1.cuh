@@ -74,6 +74,8 @@ public:
     const CodedFunction1Spec* codedSpec() const { return coded_ ? &coded_->spec : nullptr; }
     // OpenFOAM's type name, for refusals.
     const char* typeName() const { return coded_ ? "coded" : (entries_.size() > 1 ? "table" : "constant"); }
+    // The (t, value) pairs, ascending in t, for a writer to echo the table (empty for a coded function).
+    const std::vector<std::pair<scalar, scalar>>& entries() const { return entries_; }
 
     // True when every entry carries the same value, so value(t) is the same at every t. A driver that
     // samples the table once (the rhoSimpleFoam mirror seeds p0 at t = 0 and never refreshes it) can run

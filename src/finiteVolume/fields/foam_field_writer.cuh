@@ -134,7 +134,15 @@ inline void writePatchEntry(
     // in every form (.C:238-248), and its dictionary constructor REQUIRES p0: this wrote the psi form alone so (milestone
     // H), and every other form's p0 as `inletValue`, which OpenFOAM stops on ("Entry 'p0' not found"; movingCone's rho
     // form, found 2026-11-19, and any simpleFoam, pimpleFoam or rhoSimpleFoam case with a totalPressure outlet or inlet).
-    const bool totalPsi = d.type == "totalPressure" || d.type == "totalTemperature";
+    // uniformTotalPressure writes the same entries with p0 a Function1 (uniformTotalPressureFvPatchScalarField.C:222-232),
+    // and fanPressure totalPressure's plus its curve and direction (fanPressureFvPatchScalarField.C:223-235). Both were
+    // written as `type` + `inletValue` + `value`: OpenFOAM stopped on either ("Missing or invalid Function1 entry: p0";
+    // "Required entry 'p0' missing"), brae refused its own fanPressure output ("has no `fanCurve` entry"), and brae
+    // restarted pimpleFoam/RAS/TJunction from its own output with p0 held at p0(0) = 10 where the table ramps it to 40,
+    // saying nothing (2026-11-19).
+    const bool uniformTP = d.type == "uniformTotalPressure";
+    const bool totalPsi  = d.type == "totalPressure" || uniformTP || d.type == "fanPressure"
+                        || d.type == "totalTemperature";
     if (totalPsi || d.type == "waveTransmissive")
     {
         if (d.type == "waveTransmissive" && !d.advFieldName.empty())
@@ -149,11 +157,51 @@ inline void writePatchEntry(
             if (d.advLInf > -1e299) os << "        lInf            " << d.advLInf << ";\n";
         }
     }
-    if (d.hasInletValue)
+    if (uniformTP && d.hasInletValue)
+    {
+        // Function1::writeData: a table as `p0 table;` + `p0Coeffs { values ...; }` (TableBase::writeEntries), which the
+        // reader takes back (its p0Coeffs entry); any other p0 the reader accepts for this type is a constant
+        const auto& pts = d.p0Function1.entries();
+        if (d.hasP0Function1 && !d.p0Function1.isCoded() && pts.size() > 1)
+        {
+            os << "        p0              table;\n        p0Coeffs\n        {\n            values          "
+               << pts.size() << "\n(\n";
+            for (const auto& e : pts) os << '(' << e.first << ' ' << e.second << ")\n";
+            os << ")\n;\n        }\n";
+        }
+        else
+        {
+            os << "        p0              constant ";
+            formatFoamValue(os, d.inletUniformValue);
+            os << ";\n";
+        }
+    }
+    else if (d.hasInletValue)
     {
         os << "        " << ((totalPsi && !d.totalRefKey.empty()) ? d.totalRefKey + std::string(14 - d.totalRefKey.size(), ' ')
                                                                    : std::string("inletValue      "));
         writeFieldValue(os, d.inletUniform, d.inletUniformValue, d.inletValues);
+    }
+    if (d.type == "fanPressure")
+    {
+        // fanCurve_->writeData (`fanCurve table;` + `fanCurveCoeffs`) and `direction`, which pimpleFoam reads back from
+        // the start time's p (fan_pressure.cuh) as OpenFOAM's constructor does (.C:91-107)
+        if (!d.fanCurveType.empty() || !d.fanCurveFile.empty() || !d.fanCurveValues.empty())
+        {
+            os << "        fanCurve        " << (d.fanCurveType.empty() ? "table" : d.fanCurveType) << ";\n"
+               << "        fanCurveCoeffs\n        {\n";
+            if (!d.fanCurveFile.empty()) os << "            file            \"" << d.fanCurveFile << "\";\n";
+            if (!d.fanCurveValues.empty())
+            {
+                os << "            values          " << d.fanCurveValues.size() << "\n(\n";
+                for (const auto& e : d.fanCurveValues) os << '(' << e.first << ' ' << e.second << ")\n";
+                os << ")\n;\n";
+            }
+            if (!d.fanCurveOutOfBounds.empty())   os << "            outOfBounds     " << d.fanCurveOutOfBounds << ";\n";
+            if (!d.fanCurveInterpolation.empty()) os << "            interpolationScheme " << d.fanCurveInterpolation << ";\n";
+            os << "        }\n";
+        }
+        if (!d.fanDirection.empty()) os << "        direction       " << d.fanDirection << ";\n";
     }
     // fixedGradient's gradient is REQUIRED by OF's reader, not optional like value: omitting it made
     // OF abort with "Required entry 'gradient' : missing for patch ..." on any attempt to read brae's

@@ -219,12 +219,22 @@ struct PatchFieldData
     // does not implement. Recorded so it can be refused by name instead of silently running low-speed.
     std::string    psiName      = "none";
     bool           psiGiven     = false;   // `psi` was in the dictionary (else the type's default, set after the entry)
+    bool           hasP0        = false;   // a `p0` entry, in any of its forms (totalPressure, uniformTotalPressure, fanPressure)
     scalar         gammaTP      = 1.0;
     // The key the total reference was read from -- `p0` (totalPressure) or `T0` (totalTemperature), both kept in the
     // inletValue slot -- so a writer can echo it under its own name; and waveTransmissive's (advective's) entries:
     // `field`, `fieldInf`, `lInf` (advectiveFvPatchField.C: lInf defaults to -GREAT, no relaxation); their `rho`
     // is flowRateRhoName's slot. rhoCentralFoam's nozzle boundaries (milestone H); nothing else reads them.
     std::string    totalRefKey;
+    // fanPressure: `direction` and the fan curve, which its write() emits beside totalPressure's entries
+    // (fanPressureFvPatchScalarField.C:223-235) and pimpleFoam reads back from the start time's p (fan_pressure.cuh).
+    // The curve in either spelling: `fanCurve { type table; file ...; }` as cases write it, or `fanCurve table;` +
+    // `fanCurveCoeffs { file ...; }` as OpenFOAM writes it (Function1::writeData). Kept for the writer to echo.
+    std::string    fanDirection;
+    std::string    fanCurveType;
+    std::string    fanCurveFile;
+    std::vector<std::pair<scalar, scalar>> fanCurveValues;
+    std::string    fanCurveOutOfBounds, fanCurveInterpolation;
     std::string    advFieldName;
     bool           hasAdvFieldInf = false;
     scalar         advFieldInf  = 0;
@@ -625,6 +635,54 @@ inline void setP0Table(PatchFieldData<T>& p, std::vector<std::pair<scalar, scala
         p.inletUniformValue = p.p0Function1.value(0);
         p.inletUniform = true;
         p.hasInletValue = true;
+    }
+}
+
+// fanPressure's curve dictionary, from after its '{' up to (not including) its '}': `type`, `file`, `values`,
+// `outOfBounds`, `interpolationScheme` kept for the writer; anything else skipped. The driver reads the curve
+// itself (fan_pressure.cuh); this only carries the entries through to the written field.
+template <typename T>
+inline void readFanCurveCoeffs(TokenStream& ts, PatchFieldData<T>& p)
+{
+    while (!ts.eof() && ts.peek() != "}")
+    {
+        const std::string ck = ts.next();
+        if (ck == "type")
+        {
+            const std::string v = ts.next();
+            if (p.fanCurveType.empty()) p.fanCurveType = v;
+            ts.expect(";");
+        }
+        else if (ck == "file")
+        {
+            p.fanCurveFile = ts.next();   // the tokeniser strips the quotes; the writer puts them back
+            ts.expect(";");
+        }
+        else if (ck == "values")
+        {
+            if (isFoamNumber(ts.peek())) ts.next();   // a list size
+            ts.expect("(");
+            p.fanCurveValues.clear();
+            while (!ts.eof() && ts.peek() != ")")
+            {
+                ts.expect("(");
+                const scalar x = ts.nextScalar();
+                const scalar y = ts.nextScalar();
+                ts.expect(")");
+                p.fanCurveValues.emplace_back(x, y);
+            }
+            ts.expect(")");
+            ts.expect(";");
+        }
+        else if (ck == "outOfBounds" || ck == "interpolationScheme")
+        {
+            (ck == "outOfBounds" ? p.fanCurveOutOfBounds : p.fanCurveInterpolation) = ts.next();
+            ts.expect(";");
+        }
+        else
+        {
+            if (!skipToSemicolon(ts)) ts.expect(";");
+        }
     }
 }
 
@@ -1076,6 +1134,7 @@ inline FieldData<T> readField(const std::string& path)
                     }
                     else if (key == "p0")   // totalPressure reference p0 (reuse the inletValue slot)
                     {
+                        p.hasP0 = true;
                         // p0 is a Function1 on uniformTotalPressure: it may be `table (...)`,
                         // `polynomial`, `csvFile`, an expression -- not just a field value.
                         // readValueOrInternal only knows uniform/nonuniform, so a table made the
@@ -1483,6 +1542,31 @@ inline FieldData<T> readField(const std::string& path)
                         p.gammaTP = ts.nextScalar();
                         ts.expect(";");
                     }
+                    else if (key == "fanCurve")   // fanPressure: `{ type ...; ... }`, or a type word + fanCurveCoeffs
+                    {
+                        if (ts.peek() == "{")
+                        {
+                            ts.expect("{");
+                            readFanCurveCoeffs(ts, p);
+                            ts.expect("}");
+                        }
+                        else
+                        {
+                            p.fanCurveType = ts.next();
+                            ts.expect(";");
+                        }
+                    }
+                    else if (key == "fanCurveCoeffs" && ts.peek() == "{")
+                    {
+                        ts.expect("{");
+                        readFanCurveCoeffs(ts, p);
+                        ts.expect("}");
+                    }
+                    else if (key == "direction" && ts.peek() != "(" && ts.peek() != "{")   // fanPressure: in | out
+                    {
+                        p.fanDirection = ts.next();
+                        ts.expect(";");
+                    }
                     else if (key == "T0")   // totalTemperature reference T0 (the inletValue slot, as p0)
                     {
                         readValueOrInternal(ts, fd, p.inletUniform, p.inletUniformValue, p.inletValues);
@@ -1758,6 +1842,16 @@ inline FieldData<T> readField(const std::string& path)
                 // getOrDefault). OpenFOAM's write() leaves psi out when it is that default, so a field OpenFOAM wrote
                 // (mapFields, a restart) carried no psi and read here as "none" (2026-11-19).
                 if (!p.psiGiven && (p.type == "waveTransmissive" || p.type == "totalTemperature")) p.psiName = "thermo:psi";
+                // p0 has no default in OpenFOAM: totalPressure reads it as a Field (totalPressureFvPatchScalarField.C:67) and
+                // uniformTotalPressure as a Function1 (uniformTotalPressureFvPatchScalarField.C:68), and either stops without
+                // it. This read an `inletValue` in its place, which is how brae's writer spelled p0 until 2026-11-19: a restart
+                // from such a file ran on, a p0 table held at its t = 0 value (pimpleFoam/RAS/TJunction: U 2.3 % and p 5.6 %
+                // off the uninterrupted run ten steps later), where OpenFOAM refuses the file.
+                if ((p.type == "totalPressure" || p.type == "uniformTotalPressure") && !p.hasP0)
+                    throw std::runtime_error("brae: boundaryField/" + p.name + " in " + path + " is a " + p.type +
+                        " with no `p0` entry, which OpenFOAM requires (" + p.type + "FvPatchScalarField.C, no default). "
+                        "brae wrote p0 as `inletValue` before 2026-11-19: rename that entry to `p0` (a time-varying p0: "
+                        "copy its table from the case's 0/ file)");
                 fd.boundary.push_back(std::move(p));
             }
             ts.expect("}");

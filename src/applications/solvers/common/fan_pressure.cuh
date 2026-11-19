@@ -77,6 +77,12 @@ inline std::vector<DeviceSimpleSolver::FanPressure> collectFanPressure(
             DeviceSimpleSolver::FanPressure e;
             e.start = start;
             e.count = fp.size;
+            // p0 has no default (fanPressure is a totalPressure: totalPressureFvPatchScalarField.C:67); this read 0
+            // without one, which is how brae's writer left fanPressure patches until 2026-11-19
+            if (!b->find("p0"))
+                throw std::runtime_error("brae: fanPressure on patch " + fp.name + " has no `p0` entry, which OpenFOAM "
+                                         "requires (fanPressure is a totalPressure). brae wrote p0 as `inletValue` "
+                                         "before 2026-11-19: rename that entry to `p0`.");
             e.p0    = b->scalarOr("p0", 0.0);
             const std::string dirw = b->wordOr("direction", "in");
             if (dirw != "in" && dirw != "out")
@@ -88,10 +94,20 @@ inline std::vector<DeviceSimpleSolver::FanPressure> collectFanPressure(
                     "brae: fanPressure on patch " + fp.name + " is nonDimensional, which rescales the curve "
                     "by rpm and mean diameter (fanPressureFvPatchScalarField.C). Not implemented; the "
                     "dimensional form is.");
+            // The curve as cases write it, `fanCurve { type table; file ...; }`, or as OpenFOAM writes it
+            // (Function1::writeData): `fanCurve table;` + `fanCurveCoeffs { file ...; }` -- what a restart from
+            // OpenFOAM's output, or brae's, carries. The second was refused here as having no fanCurve entry.
             const FoamDict* fc = b->subDict("fanCurve");
+            std::string ftype;
+            if (fc) ftype = fc->wordOr("type", "table");
+            else
+            {
+                ftype = b->wordOr("fanCurve", "");
+                fc = ftype.empty() ? nullptr : b->subDict("fanCurveCoeffs");
+            }
             if (!fc)
-                throw std::runtime_error("brae: fanPressure on patch " + fp.name + " has no `fanCurve` entry.");
-            const std::string ftype = fc->wordOr("type", "table");
+                throw std::runtime_error("brae: fanPressure on patch " + fp.name + " has no `fanCurve` entry (neither "
+                                         "`fanCurve { ... }` nor `fanCurve <type>;` with `fanCurveCoeffs { ... }`).");
             if (ftype != "table" && ftype != "tableFile")
                 throw std::runtime_error("brae: fanPressure on patch " + fp.name + " has fanCurve type '"
                                          + ftype + "'; only `table` is implemented.");
