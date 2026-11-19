@@ -386,6 +386,97 @@ inline void writePatchExprDict(std::ostream& os, const PatchExprSpec& e)
        << "        }\n";
 }
 
+// A wall function's own entries, as OpenFOAM's write() emits them (the order of nutWallFunction, omegaWallFunction,
+// epsilonWallFunction, nutkRoughWallFunction and nutUSpaldingWallFunction's write/writeLocalEntries): the blender's
+// `blending` (and `n` under binomial), always, for the four that blend; omega's beta1, epsilon's lowReCorrection,
+// Cmu/kappa/E and Spalding's maxIter/tolerance where they are not OpenFOAM's defaults (writeEntryIfDifferent); the rough
+// wall's Cs and Ks, always (both MUST_READ). The writer dropped them all, so a restart from brae's write ran OpenFOAM's
+// defaults where the case had said otherwise: the official occDrivAerStaticMesh's `tolerance 1e-9` on every car wall
+// came back as 0.01, which also switches Spalding's Newton to its other start (nutUSpaldingWallFunction.C:69)
+template <typename T>
+inline void writeWallFunctionEntries(
+    std::ostream& os,
+    const PatchFieldData<T>& d)
+{
+    if (d.type.find("WallFunction") == std::string::npos || d.hasABL || d.type == "kqRWallFunction")
+    {
+        return;
+    }
+    const bool omega = d.type == "omegaWallFunction";
+    const bool epsilon = d.type == "epsilonWallFunction";
+    const bool nut = d.type.compare(0, 3, "nut") == 0;
+    const bool blended = omega || epsilon || d.type == "nutkWallFunction" || d.type == "nutUWallFunction";
+    auto coefficients = [&]()
+    {
+        if (d.wfCmu != scalar(0.09))
+        {
+            os << "        Cmu             " << d.wfCmu << ";\n";
+        }
+        if (d.wfKappa != scalar(0.41))
+        {
+            os << "        kappa           " << d.wfKappa << ";\n";
+        }
+        if (d.wfE != scalar(9.8))
+        {
+            os << "        E               " << d.wfE << ";\n";
+        }
+    };
+    auto blending = [&]()
+    {
+        // the reader refuses any blender but the wall function's own default (binomial with n 2 for omega, stepwise for
+        // the others), so the default is what this run used
+        const std::string b = d.wfBlending.empty() ? (omega ? "binomial" : "stepwise") : d.wfBlending;
+        os << "        blending        " << b << ";\n";
+        if (b == "binomial")
+        {
+            os << "        n               " << (d.hasWfBlendN ? d.wfBlendN : scalar(2)) << ";\n";
+        }
+    };
+    if (nut)
+    {
+        coefficients();
+        if (blended)
+        {
+            blending();
+        }
+        if (d.type == "nutkRoughWallFunction")
+        {
+            os << "        Cs              ";
+            writeFieldValue(os, d.roughCsUniform, d.roughCsUniformValue, d.roughCsValues);
+            os << "        Ks              ";
+            writeFieldValue(os, d.roughKsUniform, d.roughKsUniformValue, d.roughKsValues);
+        }
+        if (d.type == "nutUSpaldingWallFunction")
+        {
+            if (d.nutMaxIter != 10)
+            {
+                os << "        maxIter         " << d.nutMaxIter << ";\n";
+            }
+            if (d.nutTolerance != scalar(0.01))
+            {
+                os << "        tolerance       " << d.nutTolerance << ";\n";
+            }
+        }
+        return;
+    }
+    if (blended)
+    {
+        blending();
+    }
+    if (omega && d.wfBeta1 != scalar(0.075))
+    {
+        os << "        beta1           " << d.wfBeta1 << ";\n";
+    }
+    if (epsilon && d.epsLowRe)
+    {
+        os << "        lowReCorrection true;\n";
+    }
+    if (omega || epsilon || d.type == "kLowReWallFunction")
+    {
+        coefficients();
+    }
+}
+
 template <typename T>
 inline void writePatchEntry(
     std::ostream& os,
@@ -480,14 +571,43 @@ inline void writePatchEntry(
         }
         if (!d.fanDirection.empty()) os << "        direction       " << d.fanDirection << ";\n";
     }
+    // Plain `mixed` (and mixedEnergy, its he spelling): OpenFOAM writes refValue, refGradient and valueFraction
+    // (mixedFvPatchField.C write) and its reader REQUIRES all three, as brae's factory does ("is `mixed` but has no
+    // `valueFraction` entry"). The writer wrote the gradient under fixedGradient's key and dropped the other two, so
+    // neither code restarted from brae's own write of a mixed patch. Inputs the solve does not change: echoed as read
+    const bool mixed = d.type == "mixed" || d.type == "mixedEnergy";
+    if (mixed)
+    {
+        if (d.hasRefValue)
+        {
+            os << "        refValue        ";
+            writeFieldValue(os, d.refValueUniform, d.refValueUniformValue, d.refValues);
+        }
+        if (d.hasGradient)
+        {
+            os << "        refGradient     ";
+            writeFieldValue(os, d.gradientUniform, d.gradientUniformValue, d.gradientValues);
+        }
+        if (d.hasValueFraction)
+        {
+            os << "        valueFraction   ";
+            writeFieldValue(os, d.vfUniform, d.vfUniformValue, d.vfValues);
+        }
+        // v2412's mixed holds a `source` it never reads and sets to zero at construction, and writes it
+        // (mixedFvPatchField.C:93, 321)
+        os << "        source          uniform ";
+        formatFoamValue(os, T{});
+        os << ";\n";
+    }
     // fixedGradient's gradient is REQUIRED by OF's reader, not optional like value: omitting it made
     // OF abort with "Required entry 'gradient' : missing for patch ..." on any attempt to read brae's
     // output back. The gradient is an input that the solve does not change, so echo what was read.
-    if (d.hasGradient)
+    if (d.hasGradient && !mixed)
     {
         os << "        gradient        ";
         writeFieldValue(os, d.gradientUniform, d.gradientUniformValue, d.gradientValues);
     }
+    writeWallFunctionEntries(os, d);
     // flowRateInletVelocity: OF REQUIRES one of volumetricFlowRate/massFlowRate and aborts without it,
     // and so does brae ("has neither 'volumetricFlowRate' nor 'massFlowRate'"). Dropping it made brae's
     // own output unrestartable -- by brae OR by OpenFOAM -- which only surfaced once brae started
