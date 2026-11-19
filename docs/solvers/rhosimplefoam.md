@@ -3,7 +3,7 @@
 Steady-state **compressible** solver (SIMPLE / SIMPLEC), subsonic and transonic. A faithful GPU port of OpenFOAM
 v2412's `rhoSimpleFoam`, fully device-resident. All six tutorials OpenFOAM ships run **as shipped**.
 
-[<- back to all solvers](../../README.md#-will-it-run-my-case)
+[<- back to all solvers](../../README.md#solvers)
 
 ## At a glance
 
