@@ -2708,6 +2708,15 @@ set_tests_properties(written_bc_roundtrip_vs_openfoam PROPERTIES
                      ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
                      SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
 
+# The totalPressure family (totalPressure, uniformTotalPressure, fanPressure), totalTemperature and phi on a symmetry
+# patch, written by simpleFoam, pimpleFoam, rhoSimpleFoam and rhoCentralFoam and read back by real OpenFOAM, OpenFOAM's
+# output read by brae, and brae restarted from its own output against its uninterrupted run; each arm with a control
+# that holds the file as brae wrote it before (tests/total_bc_roundtrip_vs_openfoam.sh says what each one found).
+add_test(NAME total_bc_roundtrip_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/total_bc_roundtrip_vs_openfoam.sh)
+set_tests_properties(total_bc_roundtrip_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
+                     ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae>;BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+
 # turbulence->validate() at construction, both models, both arms where the device runs the model:
 # the first iteration must sit on OpenFOAM's -- tests/rho_validate_vs_openfoam.sh.
 add_test(NAME rho_validate_vs_openfoam
