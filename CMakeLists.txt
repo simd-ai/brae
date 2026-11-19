@@ -2281,14 +2281,14 @@ target_link_libraries(brae_rhoSimpleFoam PRIVATE brae_core)
 # arm (rhoCentralStep.cu) share the case, the loop and the writer (rhoCentralFoam.cu).
 #
 # The gates compare with OpenFOAM v2412 run on the same machine (they skip, 77, without it) and take minutes to two
-# hours, so they carry `slow` and `rhocentral` (ctest -L rhocentral runs them all). Five of them stay red on purpose:
-# their FAILs are analysed, registered open checks (tests/data/rho_central_open_checks.tsv, 23 FAIL lines in all,
+# hours, so they carry `slow` and `rhocentral` (ctest -L rhocentral runs them all). Six of them stay red on purpose:
+# their FAILs are analysed, registered open checks (tests/data/rho_central_open_checks.tsv, 24 FAIL lines in all,
 # each printed with its category under the FAIL), never turned into passes and never covered by a wider bound.
-# Those five carry `known-red` as well, so the GB10 CI (.github/workflows/gpu-test.yml, -LE known-red) runs the
-# other seven and `ctest -L known-red` runs these: restart 1 (round-off amplification), riemann 16 (round-off
-# amplification and timestep-sequence divergence, as OpenFOAM's own decompositions diverge), nozzle 3 (round-off
-# amplification of an unstable mode OpenFOAM shares; one stopping-test flip), turb 2 and moving 1 (an iterative
-# solve stopping one sweep apart at its declared tolerance, as OpenFOAM's own runs do).
+# Those carry `known-red` as well, so the GB10 CI (.github/workflows/gpu-test.yml, -LE known-red) runs the other
+# seven and `ctest -L known-red` runs these: restart 1 (round-off amplification), riemann 16 (round-off amplification
+# and timestep-sequence divergence, as OpenFOAM's own decompositions diverge), nozzle 3 (round-off amplification of an
+# unstable mode OpenFOAM shares; one stopping-test flip), turb 2, moving 1 and 3d 1 (an iterative solve stopping one
+# sweep apart at its declared tolerance, as OpenFOAM's own runs do).
 add_executable(brae_rhoCentralFoam
                src/applications/solvers/rhoCentralFoam/gpuRhoCentralFoam.cu
                src/applications/solvers/rhoCentralFoam/rhoCentralFoam.cu
@@ -2345,6 +2345,10 @@ set_tests_properties(rho_central_turb_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77
 add_test(NAME rho_central_moving_vs_openfoam
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_moving_vs_openfoam.sh)
 set_tests_properties(rho_central_moving_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow;rhocentral;known-red" TIMEOUT 5400
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_test(NAME rho_central_3d_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_3d_vs_openfoam.sh)
+set_tests_properties(rho_central_3d_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow;rhocentral;known-red" TIMEOUT 5400
                      ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 add_test(NAME rho_central_refusals
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_refusals.sh)

@@ -10,6 +10,8 @@
 # LadenburgJet60psi's mesh and keeps its partition. Milestone K (2026-11-18): movingCone (its blockMesh; the first scotch
 # run on it; the topology a moving mesh keeps), and movingConeBinary, the same partition of the same topology as the
 # shipped case's blockMesh writes it (writeFormat binary: the meshsum hashes the files' data as written)
+# The 3-D gate (2026-11-19): corner3d (tests/rho_central_3d.py's axial corner; corner_inv, corner_lam and corner_sst share
+# its topology, so its meshsum), box3d and duct3d; the first scotch run on each
 wedge15Ma5 4800 4 d05065a44673986eddbbce6409436859486f1fa694dcd8c51f2e55489aa1f791 0b74c9aafb5981ef2ddc07a0fb47490f5675795264dfc43cf25eb9fc4eeeb141
 cone 4800 4 a92dddebfd18e30f6d67c6977ea93a21177a4e642b4d243a34e07deb5eacbfce 96308d0fdbece1024c3c20798c531f24c572f3607f4db69f5092ae311e2a49a7
 obliqueShock 1800 4 622bebf8e2d445b1226a52000b83ee6d620542315c73ed66a044259c9f420bac 8e85f370f0c87231c8ef75f9fa3ae3c19de4ebc988a5ea79561eaff0d5b1e286
@@ -23,3 +25,6 @@ channelSlip 1000 4 13c1c6adef421ba682ec8c103d8afaf3ccfff8fca21bbf7ed3300a92c85c9
 turbPlate 5500 4 9467e06e9b34f7a813e9ea327b1375fc61a7ff981c77492c3c19a7f2a7013867 fcfbb55253f3c562f725be81bc00276f8b63b1c16fb47c1b9046644e9787d9d4
 movingCone 1900 4 59c7f09ebf617cede6d6d0c3e20dfce72fef6a229397c62b353989f07f5bf65d 4350f79979934a390b76dc65d2db006537274dd6304865b46e68688038b501b9
 movingConeBinary 1900 4 431770ebcb9743490669ec95189e9b63673533f37c722b8da70842c0227067d3 4350f79979934a390b76dc65d2db006537274dd6304865b46e68688038b501b9
+corner3d 9216 4 7543e2f00d20048560969cde813b948180346cc09f9bf84c2b53bc01f0764599 051182babb57bf54a172e2950dc6127dac3009cb965e02abc705e54ed081302d
+box3d 13824 4 81ff4f1eee9b7e93b62382ac05dc20cbb5daa1e87db365138ce3bc48e7e69719 51b92cd3b37c789b444dbaa1519a32c04cdd783f8c7e811c291201261ae87a60
+duct3d 3000 4 8127a55431ac8766df8d42a1a032b7e19e39fb0fac09a040093021292c33e4e4 ef98e5c0717a4cfcb441de0f29e88e1278983b68bae045360ce53131b92f30e2
