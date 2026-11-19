@@ -9,7 +9,7 @@
 # the two leave different iterates after n sweeps and converge to the same linear solution. That is what
 # this gate holds the change to: EXACT where the linear solves are converged, DIFFERENT where they are
 # not, and ANNOUNCED per field either way. Before FP-1 those entries ran OpenFOAM's own order on one CPU
-# thread (the host smoother), which is what the REF arm still runs.
+# thread (the host smoother); the REF arm runs that order, on the device loop since 2026-11-19.
 #
 #   FIXTURE     validation/rhoKE (3,200 cells, kEpsilon, 2D), blockMesh at staging, every linear solver
 #               at 1e-14 / relTol 0, 5 iterations. The energy and the pair get smoothSolver entries in

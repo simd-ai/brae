@@ -148,8 +148,8 @@ struct SolveControls
     // COLOUR order through deviceColourGaussSeidelFused with one component over `colouring` -- the
     // momentum engine, the same stop rule, a different iterate after n sweeps, which the driver
     // announces per field. Off, or with no colouring, the sweep is OpenFOAM's own index order
-    // (deviceSymGaussSeidel: the CPU smoother by default, the level-scheduled device loop under
-    // BRAE_GS_HOST_SMOOTHER=0).
+    // (deviceSymGaussSeidel: the level-scheduled device loop by default, the CPU smoother under
+    // BRAE_GS_HOST_SMOOTHER=1).
     bool   gsColour = false;
     const DeviceCellColouring* colouring = nullptr;
 };

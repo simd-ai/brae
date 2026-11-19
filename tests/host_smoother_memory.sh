@@ -156,7 +156,9 @@ def one(label, case, extra, checks):
         say('%s  %s grows at most %.2fx between iterations %s' % (label, name, bound, probes), res[key] <= bound)
     return res, text
 ALL = (('rss_exact_kb', 'process Rss'), ('pool_reserved', 'pool reserved'), ('pool_allocated', 'pool allocated'))
-for arm, tag, extra in (('ARM 1  legacy', 'legacy', {}), ('ARM 2  mirror', 'v2', {'BRAE_SIMPLEFOAM_V2': '1'})):
+# the host smoother by name: the device loop is the default since 2026-11-19
+for arm, tag, extra in (('ARM 1  legacy', 'legacy', {'BRAE_GS_HOST_SMOOTHER': '1'}),
+                        ('ARM 2  mirror', 'v2', {'BRAE_GS_HOST_SMOOTHER': '1', 'BRAE_SIMPLEFOAM_V2': '1'})):
     for r in range(1, repeats + 1):
         one('%s run %d' % (arm, r), os.path.join(W, '%s_%d' % (tag, r)), extra, ALL)
 # The controls run the legacy arm and are judged by the check their leak targets, which must fail.

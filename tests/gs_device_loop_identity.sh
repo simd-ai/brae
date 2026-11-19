@@ -13,9 +13,9 @@
 #   ARM 2  the two runs differ in nothing else either: the written fields at 50 are identical files.
 #   CONTROL the comparison can fail: the host-loop run against a third run at a different relTol on U
 #          must DIFFER in its Solving-for lines, so "identical" is not "the diff never looked".
-# Since item 68 the DEFAULT smoother runs on the host; BRAE_GS_HOST_SMOOTHER=0 pins the device loop this
-# gate is about (its announce assertions would fail loudly otherwise -- the arms would compare the host
-# smoother with itself).
+# The device loop this gate is about is the default again since 2026-11-19 (item 68 had made the host
+# smoother the default); BRAE_GS_HOST_SMOOTHER=0 keeps it pinned, so a later default cannot turn the arms
+# into a comparison of the host smoother with itself (the announce assertions would fail loudly).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"

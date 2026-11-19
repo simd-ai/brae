@@ -28,8 +28,8 @@
 # CHECKS
 #   COUNT    the steady rows, brae in OpenFOAM's order (BRAE_SIMPLE_CASE_SOLVER=1) and under the colour rule: every Ux and
 #            Uy solve's sweep count is OpenFOAM's, solve for solve. OpenFOAM's order has three stop tests of its own, each
-#            held: the host smoother (the default), the device's graph (BRAE_GS_HOST_SMOOTHER=0) and the device's
-#            host-driven loop (BRAE_GS_HOST_SMOOTHER=0 BRAE_GS_HOST_LOOP=1). Not the PIMPLE row: brae_pimpleFoam prints
+#            held: the host smoother (BRAE_GS_HOST_SMOOTHER=1), the device's graph (the default, pinned by
+#            BRAE_GS_HOST_SMOOTHER=0) and the device's host-driven loop (BRAE_GS_HOST_SMOOTHER=0 BRAE_GS_HOST_LOOP=1). Not the PIMPLE row: brae_pimpleFoam prints
 #            no line a solve, so it is held by its field alone, in the three arms of OpenFOAM's order (the transient
 #            driver has no colour rule).
 #   FIELD    brae in OpenFOAM's order, on the minIter rows: U at the end within the row's bound of OpenFOAM's (relative L2
@@ -302,11 +302,11 @@ do
     [[ "$row" == *-min ]] && minrow=1
     arms="case graph loop colour"
     [ "$run" = pimple ] && arms="case graph loop"
-    brae "$d" case BRAE_SIMPLE_CASE_SOLVER=1
+    brae "$d" case BRAE_SIMPLE_CASE_SOLVER=1 BRAE_GS_HOST_SMOOTHER=1
     brae "$d" graph BRAE_SIMPLE_CASE_SOLVER=1 BRAE_GS_HOST_SMOOTHER=0
     brae "$d" loop BRAE_SIMPLE_CASE_SOLVER=1 BRAE_GS_HOST_SMOOTHER=0 BRAE_GS_HOST_LOOP=1
     [ "$run" = pimple ] || brae "$d" colour
-    brae "$d" ctl BRAE_SIMPLE_CASE_SOLVER=1 BRAE_CONTROL_U_FIXED_CAP=1
+    brae "$d" ctl BRAE_SIMPLE_CASE_SOLVER=1 BRAE_GS_HOST_SMOOTHER=1 BRAE_CONTROL_U_FIXED_CAP=1
     for a in $arms ctl
     do
         [ "$(cat "$d/$a/rc")" = 0 ] && say "PREMISE $row: brae arm $a ran" ok || say "PREMISE $row: brae arm $a ran" FAIL

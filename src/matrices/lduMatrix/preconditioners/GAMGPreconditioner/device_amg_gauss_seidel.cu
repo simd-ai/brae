@@ -923,16 +923,20 @@ void hostSymGaussSeidelFused(
                     sweepMs);
     }
 }
-// THE DEFAULT, from measurement (warm 40-minus-20, two repeats, V2): T3A 27-29 -> 16.5 ms per outer
-// iteration, the composed flat plate 68-69 -> 60, every solve line and field identical. The device loop
-// stays one switch away for the identity gates and for a machine whose host-device link makes the
-// per-solve download dear; the announce says which ran.
+// OPT-IN (BRAE_GS_HOST_SMOOTHER=1); the device loop is the default. Item 68 made the host sweep the default
+// from 2-D meshes on the GB10 (warm 40-minus-20, V2: T3A 27-29 -> 16.5 ms per outer iteration, the composed
+// flat plate 68-69 -> 60), where the device walk is a few hundred short levels. On a 3-D mesh the one CPU
+// thread is the step: pimpleFoam's TJunction (kEpsilon, U/k/epsilon on symGaussSeidel), one GH200, median
+// seconds a step over 40 steps, host sweep -> device loop: 0.044 -> 0.030 at 249,200 cells, 0.181 -> 0.072
+// at 1.0 M, 0.754 -> 0.149 at 4.1 M, 4.48 -> 0.474 at 19.8 M (2026-11-18), with U, p, k, epsilon, nut and phi
+// byte-identical after 40 steps at 4.1 M. GPU work stays on the GPU; the host sweep stays one switch away
+// for the identity gates; the announce says which ran.
 bool hostSmootherSelected()
 {
     static const bool on = []()
     {
         const char* e = std::getenv("BRAE_GS_HOST_SMOOTHER");
-        return !(e && std::string(e) == "0");
+        return e != nullptr && std::string(e) != "0";
     }();
     return on;
 }
@@ -952,7 +956,7 @@ void announceHostSmoother(int nComp)
     static bool announced = false;
     if (announced) return;
     announced = true;
-    std::printf("  smoothSolver: host smoother (OpenFOAM's sweep on the CPU, %d thread(s); residual, stop and report on the device); BRAE_GS_HOST_SMOOTHER=0 restores the device loop\n", nComp);
+    std::printf("  smoothSolver: host smoother (OpenFOAM's sweep on the CPU, %d thread(s); residual, stop and report on the device), selected by BRAE_GS_HOST_SMOOTHER; unset, the sweep runs on the GPU\n", nComp);
 }
 }   // namespace
 

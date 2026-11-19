@@ -8,12 +8,13 @@
 # the whole solve must be: every solve line identical, every field an identical file.
 #
 #   ARM 1   validation/T3A under V2, 50 iterations: U (two components, fused on the device arm) and
-#           k/omega/ReThetat/gammaInt (scalar solves) under the host smoother (the default) and under
-#           BRAE_GS_HOST_SMOOTHER=0, the device loop -- lines and fields identical.
+#           k/omega/ReThetat/gammaInt (scalar solves) under the host smoother (BRAE_GS_HOST_SMOOTHER=1)
+#           and under the default, the device loop (the variable removed) -- lines and fields identical.
 #   ARM 2   validation/cav3d_cf, 30 iterations: three components, the ascending-only GaussSeidel, Uz
 #           starting converged (the host path must leave it alone from the first sweep).
 #   ARM 3   validation/duct3d_cf (72,000 cells), 20 iterations.
-#   ARMS    the host arm announces the host smoother; the device arm does not.
+#   ARMS    the host arm announces the host smoother; the default arm announces the device loop and not
+#           the host smoother (the default is the device loop since 2026-11-19).
 #   CONTROL T3A at relTol 0.01 on U under the device loop differs from ARM 1's device arm.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -48,10 +49,11 @@ arm() {   # arm <label> <fixture> <endTime> <minLines> <fields...>
     local label=$1 fx=$2 n=$3 minl=$4; shift 4
     local dh="$W/${fx}_h" dd="$W/${fx}_d"
     prep "$dh" "$fx" "$n"; prep "$dd" "$fx" "$n"
-    run "$dh" "BRAE_SIMPLEFOAM_V2=1"                          # the default since item 68
-    run "$dd" "BRAE_GS_HOST_SMOOTHER=0 BRAE_SIMPLEFOAM_V2=1"
+    run "$dh" "BRAE_GS_HOST_SMOOTHER=1 BRAE_SIMPLEFOAM_V2=1"
+    run "$dd" "-u BRAE_GS_HOST_SMOOTHER BRAE_SIMPLEFOAM_V2=1"           # the default
     grep -q "smoothSolver: host smoother" "$dh/log" && say "$label  the host arm announces the host smoother" ok || say "$label  the host arm announces the host smoother" FAIL
-    grep -q "smoothSolver: host smoother" "$dd/log" && say "$label  the device arm does not" FAIL || say "$label  the device arm does not" ok
+    grep -q "smoothSolver: host smoother" "$dd/log" && say "$label  the default arm does not" FAIL || say "$label  the default arm does not" ok
+    grep -q "smoothSolver: device loop\|symGaussSeidel: fused walk" "$dd/log" && say "$label  the default arm announces the device loop" ok || say "$label  the default arm announces the device loop" FAIL
     local nl; nl=$(lines "$dh" | wc -l); echo "  $label  $fx: $nl log lines compared"
     [ "$nl" -ge "$minl" ] || say "$label  the runs produced the expected number of report lines" FAIL
     if diff <(lines "$dh") <(lines "$dd") > /dev/null; then say "$label  $fx: host smoother and device loop, every Time=/Solving-for line identical" ok
@@ -63,7 +65,7 @@ arm() {   # arm <label> <fixture> <endTime> <minLines> <fields...>
 arm "ARM 1" T3A 50 200 U p k omega nut ReThetat gammaInt phi
 arm "ARM 2" cav3d_cf 30 120 U p phi
 arm "ARM 3" duct3d_cf 20 100 U p phi
-prep "$W/T3A_c" T3A 50 0.01; run "$W/T3A_c" "BRAE_GS_HOST_SMOOTHER=0 BRAE_SIMPLEFOAM_V2=1"
+prep "$W/T3A_c" T3A 50 0.01; run "$W/T3A_c" "-u BRAE_GS_HOST_SMOOTHER BRAE_SIMPLEFOAM_V2=1"
 if diff <(lines "$W/T3A_d") <(lines "$W/T3A_c") > /dev/null; then say "CONTROL  relTol 0.01 on U changes the Solving-for lines (so ARM 1 can fail)" FAIL
 else say "CONTROL  relTol 0.01 on U changes the Solving-for lines (so ARM 1 can fail)" ok; fi
 [ $fail -eq 0 ] && echo "PASS: the host smoother is the device smoothSolver loop, byte for byte"

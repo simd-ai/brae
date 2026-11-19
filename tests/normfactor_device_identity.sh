@@ -10,8 +10,9 @@
 # (n1 + n2) + 1e-20, and every residual/normFactor quotient, now as a device division), so every solve
 # line and every field must be identical to the host-read path, which BRAE_NORMFACTOR_HOST=1 restores.
 #
-#   ARM 1   validation/T3A, V2, 50 iterations: U (host smoother, fused), p (PCG graph), the four scalar
+#   ARM 1   validation/T3A, V2, 50 iterations: U (device loop, fused), p (PCG graph), the four scalar
 #           transports -- lines and fields identical.
+#   ARM 1h  ARM 1 under the host smoother (BRAE_GS_HOST_SMOOTHER=1; the default until 2026-11-19).
 #   ARM 2   validation/pitzDailyTurb, V2, 30 iterations: U on BiCGStab (the graph's iteration-0 divisions).
 #   ARM 3   validation/duct3d_cf, 20 iterations: the kEpsilon wrapper's solves.
 #   ARM 4   validation/rhoBox through the rho mirror, 50 iterations: U/h on BiCGStab, p on PCG.
@@ -64,11 +65,13 @@ arm() {   # arm <label> <fixture> <endTime> <envBase> <minLines> <fields...>
     [ $same -eq 1 ] && say "$label  ...and the written fields at $t are identical files" ok || say "$label  ...and the written fields at $t are identical files" FAIL
 }
 arm "ARM 1" T3A 50 "BRAE_SIMPLEFOAM_V2=1" 200 U p k omega nut ReThetat gammaInt phi
+mv "$W/T3A_d" "$W/T3A1_d"; mv "$W/T3A_h" "$W/T3A1_h"
+arm "ARM 1h" T3A 50 "BRAE_GS_HOST_SMOOTHER=1 BRAE_SIMPLEFOAM_V2=1" 200 U p k omega nut ReThetat gammaInt phi
 arm "ARM 2" pitzDailyTurb 30 "BRAE_SIMPLEFOAM_V2=1" 120 U p k epsilon nut phi
 arm "ARM 3" duct3d_cf 20 "BRAE_SIMPLEFOAM_V2=1" 100 U p k epsilon nut phi
 arm "ARM 4" rhoBox 50 "BRAE_RHOSIMPLEFOAM_MIRROR=cuda" 50 U p T rho phi
 prep "$W/T3A_c" T3A 50 0.01; run "$W/T3A_c" "BRAE_NORMFACTOR_HOST=1 BRAE_SIMPLEFOAM_V2=1"
-if diff <(lines "$W/T3A_h") <(lines "$W/T3A_c") > /dev/null; then say "CONTROL  relTol 0.01 on U changes the Solving-for lines (so ARM 1 can fail)" FAIL
+if diff <(lines "$W/T3A1_h") <(lines "$W/T3A_c") > /dev/null; then say "CONTROL  relTol 0.01 on U changes the Solving-for lines (so ARM 1 can fail)" FAIL
 else say "CONTROL  relTol 0.01 on U changes the Solving-for lines (so ARM 1 can fail)" ok; fi
 [ $fail -eq 0 ] && echo "PASS: the normFactor stays on the device and every number is the host-read path's, byte for byte"
 exit $fail
