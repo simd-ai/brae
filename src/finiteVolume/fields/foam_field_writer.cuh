@@ -558,7 +558,13 @@ inline void writeSurfaceField(
             out << "        type            empty;\n";
         else
         {
-            out << "        type            calculated;\n        value           nonuniform List<scalar> \n" << n << "\n(\n";
+            // A constraint patch (symmetry, symmetryPlane, wedge) keeps its type, with the flux as its value, as OpenFOAM
+            // writes it: fvsPatchField::New stops on any other ("inconsistent patch and patchField types for patch type
+            // symmetry and patchField type calculated", fvsPatchFieldNew.C:127). This wrote `calculated` on them, so
+            // OpenFOAM could not restart from brae's simpleFoam, pimpleFoam or rhoSimpleFoam output on such a mesh
+            // (validation/windAroundBuildingsBox's frontAndBack, 2026-11-19).
+            out << "        type            " << (isConstraintPatchType(p.type) ? p.type : std::string("calculated"))
+                << ";\n        value           nonuniform List<scalar> \n" << n << "\n(\n";
             for (std::size_t i = 0; i < n; ++i) out << phiBoundary[off + i] << '\n';
             out << ")\n;\n";
         }
