@@ -668,6 +668,142 @@ Kept, as deliberate differences, and said here:
   partials, then a tree), so the log is the same from run to run, though not OpenFOAM's sequential sum to the last
   bit. A cost on large meshes (sec. 5n's open items), not a numerical difference.
 
+## 5p. After the pull request opened: what brae writes, GaussSeidel on the device, the 3-D gate (2026-11-19)
+
+**What brae writes must be what OpenFOAM reads.** Comparing the biconic and movingCone tutorials with experiment and
+with OpenFOAM's post-processing meant reading brae's output with OpenFOAM's own tools, and three boundary conditions
+did not read back:
+
+- maxwellSlipU and smoluchowskiJumpT were written with `type` and `value` only. OpenFOAM's dictionary constructors
+  require accommodationCoeff and Uwall/Twall, and so does brae's reader (rhoCentralControls.cu), so neither code could
+  start from brae's biconic25-55Run35 output. rhoCentralFoam now writes what their write() functions emit:
+  accommodationCoeff, Uwall, thermalCreep, curvature, refValue and valueFraction (the mixed state the last
+  updateCoeffs left, maxwellSlipUFvPatchVectorField.C write), and accommodationCoeff, Twall, gamma
+  (smoluchowskiJumpTFvPatchScalarField.C write), through a per-patch entry hook in the shared writer
+  (foam_field_writer.cuh, `patchExtra`; null for every other caller). The written refValue is OpenFOAM's to 8.0e-7
+  relative and valueFraction to 3.6e-7 at biconic's last write; every field's values are unchanged.
+- The shared writer wrote totalPressure's p0 under the key `inletValue` unless the psi form was in use. OpenFOAM's
+  totalPressure requires p0 (totalPressureFvPatchScalarField.C, dictionary constructor) and stopped on movingCone's
+  output ("Required entry 'p0' missing"). It now writes rho, psi, gamma and p0 in every form, as the class's write()
+  does. This also corrects simpleFoam's, pimpleFoam's and rhoSimpleFoam's output of a totalPressure patch, which had
+  the same defect.
+- The shared reader took a missing `psi` as `none` for every patch type. waveTransmissive and totalTemperature default
+  it to `thermo:psi` (getOrDefault in their dictionary constructors) and OpenFOAM's write() leaves the default out, so a
+  field OpenFOAM wrote (mapFields, a restart from OpenFOAM's output) was refused. The default now follows the type.
+
+The gates now read brae's output back with OpenFOAM (`readback`, tests/rho_central_gate_lib.sh): the moving gate's
+movingCone as shipped, the LTS gate's biconic25-55Run35 (OpenFOAM and brae each start from brae's last write), and
+every case of the 3-D gate.
+
+**GaussSeidel on the device for large 3-D meshes, and a shared defect that running it exposed.** smoothSolver's
+GaussSeidel runs in OpenFOAM's order on the CPU (brae's default for every solver, from measurements on 2-D meshes of
+up to 210k cells) or as a level-scheduled walk on the device (BRAE_GS_HOST_SMOOTHER=0), the same arithmetic
+(tests/gs_host_smoother_identity). On the 3-D corners the device walk is the quicker, and more so with size (sec. 5q:
+4.7M cells laminar 32.7 s against 43.7 s; 590k cells kOmegaSST 11.4 s against 18.8 s); on the 2-D tutorials it is the
+slower. An automatic choice was built and withdrawn before review: timing both arms on a solve, then on whole steps,
+each between two synchronisations, picked the device loop on LadenburgJet60psi and movingCone and made those runs 15
+to 30 % slower, because neither measure saw what the unsynchronised run pays (LadenburgJet60psi: 2.25 against 2.3 ms
+a step in the trial, 3.0 against 2.26 ms in the run). The default stays the CPU sweep; BRAE_GS_HOST_SMOOTHER=0 is the
+switch for a large 3-D case, and every written file and solve line is the same either way.
+
+Running kOmegaSST on the device exposed a shared defect. turbulence_transport.cu built k's and omega's matrix view
+without the mesh's addressingId, and both GaussSeidel schedule caches (gsLevelsFor, hostGsTopoFor) are keyed on the
+owner pointer and checked against that id: on one mesh every k or omega solve threw away the U solve's schedule and
+the next U solve rebuilt it. The view now carries the id, as deviceLduView's do; the schedule is built from the same
+arrays, so no number changes. On the 590k-cell kOmegaSST corner with every solve on the device: 36.9 s before, 11.45 s
+after; on the CPU sweep 18.8 and 18.7 s; every written file and every solve, Courant and deltaT line identical.
+
+**The 3-D gate** (tests/rho_central_3d_vs_openfoam.sh, cases tests/rho_central_3d.py). v2412 ships no 3-D
+rhoCentralFoam tutorial. Five cases built with blockMesh, every cell with neighbours in three directions:
+
+- corner_inv: Mach 3 into an axial corner, two 10-degree ramps meeting at a right angle (two oblique shocks and their
+  3-D interaction); slip walls, inletOutlet free boundaries, a symmetryPlane;
+- corner_lam: the same corner laminar (sutherland, Re 6.6e5 a metre), noSlip isothermal walls, cells graded 50:1;
+- corner_sst: the same corner turbulent (Re 6.6e7 a metre), kOmegaSST with OpenFOAM's wall functions, graded 200:1;
+- box_blast: a closed cube, a high-pressure sphere off the centre: five slip walls and a symmetryPlane, nothing
+  crosses the boundary; and its restarts from OpenFOAM's and brae's output at mid-run;
+- duct_tp: a square duct driven from rest by a totalPressure/totalTemperature inlet into a waveTransmissive outlet.
+
+Same envelope as every gate (frozen four-way scotch partitions corner3d, box3d, duct3d) and a control per case that
+must turn red. The checks were declared before the first run; three were corrected after it, each recorded in the
+script's header: the host reference arm runs inviscid cases only (milestone G), so it runs corner_inv and box_blast and
+its refusal of corner_lam is checked; a patch is compared only where OpenFOAM writes a value; corner_lam's first
+control (tauMC dropped) reached 19.5 x the bound only, and was replaced by dropping sigmaDotU (500 x).
+
+Result at 4dbcf8f7: 75 of 76 checks pass. Every case takes OpenFOAM's step and deltaT sequence; the worst field is 0.333
+(corner_inv), 0.096 (corner_lam), 0.140 (corner_sst), 0.102 (box_blast) and 0.402 (duct_tp) of the bound, the
+restarts 0.035 and 0.044, the host arm 0.337 and 0.107. corner_lam's 5,056 and corner_sst's 22,326 solves all take
+OpenFOAM serial's iteration counts; duct_tp's 1 of 5,620 does not (registered, tolerance-limited: OpenFOAM's own
+four-way run flips the same solve). The premises are checked, not assumed: corner_inv's |U_z| reaches 0.23 of the
+free stream, corner_sst's nut/nu reaches 3054 with the wall function active on all 576 floor faces. The inviscid cases
+conserve to round-off; the viscous ones pass the residual-accounted balance with every solve's identity at most
+1.6e-16. OpenFOAM starts from brae's last write on all five. The controls turn red at 144, 500, 5.3e4, 2.8e12 and
+1.3e5 times the bound.
+
+## 5q. At scale: 3-D runs to 4.7M cells, refinement, and what the timings say (2026-11-19)
+
+**The corner flows amplify round-off, in OpenFOAM too.** On corner_inv at 9,216 cells run to 4e-3 s (479 steps,
+adjustTimeStep), brae's Courant number leaves OpenFOAM serial's at step 60 (2e-15), then grows about 1.85 times a step
+(1.5e-10 at step 80, 2.2e-7 at 90) to 1e-3 by step 300. OpenFOAM decomposed in four against OpenFOAM serial does the
+same (6.6e-11 at step 90, 1.3e-3 at 300, 1.0e-2 at 400). At 4e-3 s the pressure fields differ by 2.1e-2 of their
+largest value between OpenFOAM in four and OpenFOAM serial, and by 3.2e-2 between brae and OpenFOAM serial (in two:
+8.8e-3). This is why the 3-D gate's bound is OpenFOAM's spread rather than a fixed number: it runs corner_inv to
+2e-3 s (264 steps), where OpenFOAM's own spread is already 5.6e-4 of the pressure at 5e-4 s, and brae stays within
+0.333 of ten times it. Longer runs are compared on the quantities an engineer reads: the ramp's pressure ratio and
+shock angle agree to 4e-5 between the codes at every write.
+LadenburgJet60psi refined to 120 x 40 and run to 0.4 ms does the same through its out-of-plane U_z mode (PORT.md):
+fields 2.6e-12 apart at 0.1 ms and 7.0e-4 at 0.4 ms, with the same 239,867 steps and the same disc position to
+0.01 mm.
+
+**Refinement.** The corner at 9,216 cells (level 0) and eight and 64 times finer (levels 1 and 2), both codes, to
+4e-3 s inviscid (OpenFOAM serial, in four and in 16) and to 3000 x 2^level LTS pseudo-steps viscous (levels 0 and 1):
+
+| level, cells | ramp p/p_inf brae / OpenFOAM | shock angle, deg brae / OpenFOAM |
+|---|---|---|
+| 0, 9,216 | 2.177876 / 2.177956 (serial) | 27.5026 / 27.5046 |
+| 1, 73,728 | 2.039676 / 2.039669 (in four) | 27.5966 / 27.5993 |
+| 2, 589,824 | 2.055768 / 2.055383 (in 16) | 27.5334 / 27.5903 |
+| oblique-shock theory | 2.054655 | 27.3835 |
+
+The ramp pressure converges on the theory (+6.0, -0.73, +0.05 %); between 2e-3 and 4e-3 s it moves by 0.1 % at level 2.
+The shock angle, located in one column of cells at x = 0.85 m, stays 0.15 to 0.21 degrees above the theory and does not
+converge monotonically, so it is reported but not used as a refinement result.
+
+The viscous corners are not steady in either code at these lengths: between the last two writes each code's own
+pressure changes by 40 % (laminar, level 0) to 60 % (level 1) of its largest value, and the two codes are as far apart
+as each is from itself. Their wall shear and heat flux are therefore not a converged result to refine; on level 0
+the laminar floor's skin friction is -8 % to +21 % from the compressible Blasius estimate at x = 0.1 to 0.25 m in
+both codes (brae 2.31e-3 / OpenFOAM 2.31e-3 at x = 0.1, estimate 2.51e-3), while the heat flux is 15 times below its
+estimate: the boundary layer spans about two cells normal to the wall there (first cell 2.3 mm). These cases were
+built to exercise the 3-D operators against OpenFOAM, not to resolve a boundary layer; a wall-resolved study is an
+open item.
+
+**Performance at scale** (PORT.md has the table). The corner at 74k, 590k and 4.7M cells, idle GB10, against
+OpenFOAM v2412 serial and in 4, 8, 16 and 20 ranks (scotch, bound to cores), the same step count in both codes:
+
+- Inviscid, end to end: brae 2.5 / 5.5 / 21.8 s, OpenFOAM serial 38.9 / 165 / 801 s, OpenFOAM in 20 ranks 10.9 / 28.5 /
+  82.8 s. At 4.7M cells brae's step is 84 ms and its run 37 times OpenFOAM serial's speed and 3.8 times 20 ranks'.
+- Viscous (CPU sweep, the default; BRAE_GS_HOST_SMOOTHER=0 in brackets): laminar 3.0 (2.8) / 8.1 (6.4) / 43.7
+  (32.7) s against OpenFOAM serial 16.8 / 78 / 588 s and 20 ranks 4.8 / 13.2 / 59.5 s; kOmegaSST at 590k 18.8 (11.4) s
+  against 104 and 18.4 s. On the CPU sweep brae runs 1.4 to 1.6 times as fast as OpenFOAM in 20 ranks on the laminar corners and
+  level with it on kOmegaSST; with the device sweep 1.6 to 2.1 times as fast.
+- Where brae's time goes at 4.7M cells: start-up (reading the ascii case, building and uploading the mesh) about 8 s,
+  the steps 8.4 s, the one ascii write 5.4 s, against OpenFOAM serial's write of about 5.2 s (in 20 ranks 0.5 s, each
+  rank writing its own piece). The writer is single-threaded on the host; for a short run of a large case it is a
+  quarter of the wall time.
+- Memory: 0.87 KiB of device memory a cell inviscid (3.9 GiB at 4.7M), 1.2 KiB laminar (5.4 GiB), 1.5 KiB
+  kOmegaSST; the GB10's unified memory (121 GB) holds over 100M inviscid cells. Host RSS peaks at 4.4 GiB at 4.7M
+  cells (OpenFOAM serial 9.1 to 9.5 GiB).
+- CPU: brae runs on one core, three while the CPU sweep runs (one a velocity component); its user time is the case
+  reading and, on the CPU sweep, GaussSeidel (lam3: 32.7 s of 43.7 s wall on the CPU sweep, 15.4 of 32.7 s with the
+  device sweep). On the 4.7M-cell cases OpenFOAM in 20 ranks spends 840 to 1140 s of CPU time, brae 9 to 33 s.
+- Nsight Systems at 590k cells: inviscid, the run is GPU-bound: 22 launches and one synchronisation a step
+  (setDeltaT.H's Courant number), the synchronisation waiting on 11 ms of kernels; the face kernel is half the GPU
+  time and the single-block Courant reduction (kept for a fixed summation order, sec. 5o) 13.6 %, 1.5 ms a step. Laminar
+  on the CPU sweep, 223 launches a step, and the synchronous copies around the CPU's GaussSeidel are two thirds of the
+  CUDA API time (2.7 s of 4.1 s over 92 steps), which is what BRAE_GS_HOST_SMOOTHER=0 removes. Open, not done here:
+  a multi-block Courant reduction with the same summation order, and a parallel or binary writer.
+
 ## 6. Milestones, each closed by a gate against OpenFOAM v2412
 
 Every gate:

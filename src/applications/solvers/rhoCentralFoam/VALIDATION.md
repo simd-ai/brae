@@ -7,11 +7,11 @@ partition, `tests/data/rho_central_decomposition`), against OpenFOAM serial. The
 written at six digits. Each gate also runs a negative control that must turn red by more than 100 x the bound. The
 bound is never widened to make a check pass.
 
-## The gates (the suite at 437d0574, 2026-11-19)
+## The gates (the suite at 4dbcf8f7, 2026-11-19)
 
 | gate (`tests/`) | what it holds to OpenFOAM | passed | failed | ctest labels |
 |---|---|---|---|---|
-| rho_central_sod_vs_openfoam | shockTube, fixed deltaT; exact Riemann solution | 23 | 0 | slow, rhocentral |
+| rho_central_sod_vs_openfoam | shockTube, fixed deltaT; the exact Riemann solution | 23 | 0 | slow, rhocentral |
 | rho_central_shocktube_vs_openfoam | shockTube as shipped (adjustTimeStep) | 60 | 0 | slow, rhocentral |
 | rho_central_wedge_vs_openfoam | wedge15Ma5, obliqueShock as shipped; symmetry, slip, cone | 127 | 0 | slow, rhocentral |
 | rho_central_forwardstep_vs_openfoam | forwardStep as shipped; inletOutlet, purgeWrite | 94 | 0 | slow, rhocentral |
@@ -19,12 +19,12 @@ bound is never widened to make a check pass.
 | rho_central_riemann_vs_openfoam | Sod, Lax, 123, Toro 3 with every limiter; obliqueShock | 221 | 16 | slow, rhocentral, known-red |
 | rho_central_viscous_vs_openfoam | shear layer, conduction, viscous Sod and obliqueShock | 62 | 0 (5 historical) | slow, rhocentral |
 | rho_central_nozzle_vs_openfoam | LadenburgJet60psi as shipped; nozzle tubes | 84 | 3 | slow, rhocentral, known-red |
-| rho_central_lts_vs_openfoam | biconic25-55Run35 as shipped; LTS, janaf, slip walls | 65 | 0 | slow, rhocentral |
+| rho_central_lts_vs_openfoam | biconic25-55Run35 as shipped; LTS, janaf, slip walls; read back | 68 | 0 | slow, rhocentral |
 | rho_central_turb_vs_openfoam | kOmegaSST flat plate (Euler, LTS); turbulent jet | 36 | 2 | slow, rhocentral, known-red |
-| rho_central_moving_vs_openfoam | movingCone as shipped, tight solves, restarted | 29 | 1 | slow, rhocentral, known-red |
+| rho_central_moving_vs_openfoam | movingCone as shipped, tight solves, restarted; read back | 30 | 1 | slow, rhocentral, known-red |
+| rho_central_3d_vs_openfoam | 3-D: axial corner (inviscid, laminar, kOmegaSST), closed-box blast and its restarts, totalPressure duct | 75 | 1 | slow, rhocentral, known-red |
 | rho_central_refusals | everything outside the scope stops by name | 46 | 0 | rhocentral |
-
-1,043 checks pass. The 23 that fail are all registered open checks; none is on a tutorial as shipped. The 5
+1,122 checks pass. The 24 that fail are all registered open checks; none is on a tutorial as shipped. The 5
 historical lines of the viscous gate are the raw conservation imbalance of a solve stopped at its tolerance, kept in
 the log; the acceptance there is the residual-accounted balance.
 
@@ -33,7 +33,7 @@ the log; the acceptance there is the residual-accounted balance.
 `tests/data/rho_central_open_checks.tsv` lists each one with its analysis. `tests/rho_central_gate_lib.sh` prints the
 category under the matching FAIL. It never turns a FAIL into a pass, and no threshold reads the file. The gates that
 carry one stay red, so ctest labels them `known-red`: the GB10 CI (`.github/workflows/gpu-test.yml`, `-LE known-red`)
-runs the other seven, and `ctest -L known-red` runs these five.
+runs the other seven, and `ctest -L known-red` runs these six.
 
 | # | gate | case (arm) | what the gate measured (brae > bound) | category |
 |---|---|---|---|---|
@@ -60,7 +60,7 @@ runs the other seven, and `ctest -L known-red` runs these five.
 | 21 | turb | plate_sst (CUDA) | iteration counts differ from solve 35 (107430 of 107925 the same) | tolerance-limited |
 | 22 | turb | plate_lts (CUDA) | iteration counts differ from solve 290 (7499 of 7500 the same) | tolerance-limited |
 | 23 | moving | mc_tight (CUDA) | iteration counts differ from solve 1 (43264 of 43265 the same) | tolerance-limited |
-
+| 24 | 3d | duct_tp (CUDA) | iteration counts differ from solve 76 (5619 of 5620 the same) | tolerance-limited |
 What the categories mean, and what OpenFOAM's own runs do on the same cases:
 
 - **Round-off amplification (rows 1, 3-14, 18-19).** A difference at round-off grows where the flow amplifies it.
@@ -81,7 +81,7 @@ What the categories mean, and what OpenFOAM's own runs do on the same cases:
   serial's after about 800 to 1,600 steps. OpenFOAM's runs in two, in four, and with p one ulp up part from it too,
   some earlier (in four at step 1,396 on Lax with SuperBee, one ulp up at 1,117). With the step fixed, the same cases
   pass (`lax_SuperBee_fixed`, `ob_MUSCL_fixed`, `ob_SuperBee_fixed`).
-- **Tolerance-limited (rows 20-23).** An iterative solve stops one sweep apart from OpenFOAM's because its final
+- **Tolerance-limited (rows 20-24).** An iterative solve stops one sweep apart from OpenFOAM's because its final
   residual is within round-off of the declared tolerance. The fields stay within the bound at every write. OpenFOAM's
   own runs flip more solves than brae does:
   - **Row 20:** 1 of 9,278 energy solves. OpenFOAM stopped at 9.992e-11 and brae at 1.0002e-10, against 1e-10.
@@ -90,6 +90,9 @@ What the categories mean, and what OpenFOAM's own runs do on the same cases:
   - **Row 22:** 1 of 7,500 solves. OpenFOAM's serial run stopped at 0.993 of its tolerance.
   - **Row 23:** the first mesh-motion PCG at the gate's tight 1e-14. brae takes 56 iterations where OpenFOAM takes
     55. Every later solve, 43,264 of them, takes OpenFOAM's count.
+  - **Row 24:** 1 of 5,620 solves of the 3-D totalPressure duct, step 19's energy solve at 1e-10. OpenFOAM serial
+    stops at 9.81e-11; OpenFOAM in two at 9.92e-11; OpenFOAM in four reaches 1.0079e-10 and runs to maxIter 1000, as
+    brae does at 1.0150e-10. Every field is within 0.402 of the bound at every write.
 
 None of these is resolved by a wider bound or a clamp. Each would need a reason to change the gate itself, such as a
 different reference spread for amplifying cases, and that is a decision for review, not something the gate does
