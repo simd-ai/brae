@@ -483,6 +483,11 @@ void solveScalarEqn(
     A.ownerStart = dm.ownerStart.data();
     A.losort = dm.losort.data();
     A.losortStart = dm.losortStart.data();
+    // the addressing's identity, as deviceLduView stamps it: GaussSeidel's schedule caches (gsLevelsFor, hostGsTopoFor)
+    // are keyed on the owner pointer and checked against this id, so an unstamped view on the same mesh threw away
+    // and rebuilt the momentum solve's entry at every k and omega solve, and that one's back at the next U solve
+    // (rhoCentralFoam's 3-D kOmegaSST corner, 590k cells, 2026-11-19). The same arrays, so the same schedule.
+    A.addressingId = dm.addressingId;
     // ...and the PAIR's off-diagonal, which deviceAmul applies as Apsi[own] += ifCoeff*psi[nbr]. The
     // fold above adds the boundary diagonal only; a coupled patch has none there (deviceFold walks
     // the device's boundary arrays, which hold no coupled face) because its diagonal went straight
