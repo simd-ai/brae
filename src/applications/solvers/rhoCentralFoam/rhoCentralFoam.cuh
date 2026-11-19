@@ -46,6 +46,12 @@ public:
     virtual bool turbulenceFields(TurbulenceOut& /*o*/) const { return false; }
     // LTS (milestone I): the cells' rDeltaT as the last step's setRDeltaT.H left it; null when not LTS
     virtual const std::vector<scalar>* rDeltaT() const { return nullptr; }
+    // maxwellSlipU's mixed state for writing (refValue, valueFraction), one entry a face in Case::msFaces order, as the
+    // last updateCoeffs left them; false when the case has no maxwellSlipU patch
+    virtual bool maxwellSlipState(std::vector<vector>& /*refValue*/, std::vector<scalar>& /*valueFraction*/) const
+    {
+        return false;
+    }
     // the viscous correctors' unconserved remainder, deltaT*sum(b - A x) over the run (milestone G); 0 inviscid
     virtual void solveResidual(vector& mom, scalar& energy) const { mom = vector{0, 0, 0}; energy = 0; }
     // the remainder unsigned, and the per-solve identity's largest error (rhoCentralViscous.cuh); 0 inviscid

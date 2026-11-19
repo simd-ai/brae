@@ -70,6 +70,15 @@ public:
     void restoreTb(DeviceBuffer<scalar>& TbEval) const;
     // e's mixedEnergy refValue on every boundary face (0 off the smoluchowskiJumpT faces)
     const DeviceBuffer<scalar>& eRef() const { return eRef_; }
+    // maxwellSlipU's refValue and valueFraction as the last updateMaxwell left them, in Case::msFaces order: what
+    // maxwellSlipUFvPatchVectorField::write emits (refValue().writeEntry, valueFraction().writeEntry)
+    void maxwellState(std::vector<vector>& refValue, std::vector<scalar>& valueFraction) const
+    {
+        const std::vector<scalar> rx = msR_[0].host(), ry = msR_[1].host(), rz = msR_[2].host();
+        valueFraction = msVf_.host();
+        refValue.resize(rx.size());
+        for (std::size_t i = 0; i < rx.size(); ++i) refValue[i] = vector{rx[i], ry[i], rz[i]};
+    }
 
 private:
     const Case& cs_;

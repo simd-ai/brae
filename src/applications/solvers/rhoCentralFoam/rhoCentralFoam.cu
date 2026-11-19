@@ -27,7 +27,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -173,8 +175,58 @@ void writeMotion(const Case& cs, const std::string& out, const std::string& time
     }
 }
 
+// The rarefied-gas walls' entries as OpenFOAM's write() emits them, between `type` and `value`, per patch name: without
+// them neither OpenFOAM nor brae can read the written U and T back (both require accommodationCoeff, Uwall/Twall).
+//   maxwellSlipUFvPatchVectorField::write: accommodationCoeff, Uwall, thermalCreep, curvature, refValue, valueFraction
+//   smoluchowskiJumpTFvPatchScalarField::write: accommodationCoeff, Twall, gamma
+// (the field names they could carry are refused unless rhoCentralFoam's own, so writeEntryIfDifferent writes none)
+void slipWallEntries(const Case& cs, int prec, const std::vector<vector>* msRef, const std::vector<scalar>* msVf,
+                     std::map<std::string, std::string>& uOut, std::map<std::string, std::string>& tOut)
+{
+    label k0 = 0;
+    for (const FvPatch& p : cs.patches)
+    {
+        const auto ms = std::find(cs.msFaces.begin(), cs.msFaces.end(), k0);
+        if (p.size > 0 && ms != cs.msFaces.end())
+        {
+            const std::size_t j = static_cast<std::size_t>(ms - cs.msFaces.begin());
+            std::ostringstream os;
+            os << std::setprecision(prec);
+            os << "        accommodationCoeff " << cs.msAcc[j] << ";\n";
+            os << "        Uwall           uniform ";
+            formatFoamValue(os, cs.msUwall[j]);
+            os << ";\n";
+            os << "        thermalCreep    " << (cs.msCreep[j] ? "true" : "false") << ";\n";
+            os << "        curvature       " << (cs.msCurv[j] ? "true" : "false") << ";\n";
+            if (msRef && msVf)
+            {
+                os << "        refValue        nonuniform List<vector> \n" << p.size << "\n(\n";
+                for (label i = 0; i < p.size; ++i) { formatFoamValue(os, (*msRef)[j + static_cast<std::size_t>(i)]); os << '\n'; }
+                os << ")\n;\n";
+                os << "        valueFraction   nonuniform List<scalar> \n" << p.size << "\n(\n";
+                for (label i = 0; i < p.size; ++i) { formatFoamValue(os, (*msVf)[j + static_cast<std::size_t>(i)]); os << '\n'; }
+                os << ")\n;\n";
+            }
+            uOut[p.name] = os.str();
+        }
+        const auto sj = std::find(cs.sjFaces.begin(), cs.sjFaces.end(), k0);
+        if (p.size > 0 && sj != cs.sjFaces.end())
+        {
+            const std::size_t j = static_cast<std::size_t>(sj - cs.sjFaces.begin());
+            std::ostringstream os;
+            os << std::setprecision(prec);
+            os << "        accommodationCoeff " << cs.sjAcc[j] << ";\n";
+            os << "        Twall           uniform " << cs.sjTwall[j] << ";\n";
+            os << "        gamma           " << cs.sjGamma[j] << ";\n";
+            tOut[p.name] = os.str();
+        }
+        k0 += p.size;
+    }
+}
+
 void writeTime(const Case& cs, const State& s, const RunClock& clock, bool uniformTime,
-               const std::vector<scalar>* rDeltaT = nullptr, const Arm::TurbulenceOut* turb = nullptr)
+               const std::vector<scalar>* rDeltaT = nullptr, const Arm::TurbulenceOut* turb = nullptr,
+               const std::vector<vector>* msRef = nullptr, const std::vector<scalar>* msVf = nullptr)
 {
     const std::string& timeName = clock.timeName();
     const std::string src = cs.caseDir + "/" + cs.startName + "/";
@@ -186,9 +238,11 @@ void writeTime(const Case& cs, const State& s, const RunClock& clock, bool unifo
                          static_cast<double>(clock.deltaT()), static_cast<double>(clock.deltaT0()), cs.writePrecision);
     const int prec = cs.writePrecision;
     // every patch value, in patch order (writeVolField's flat layout; no coupled patch is accepted here)
-    writeVolField(src + "U", out + "/U", s.U, cs.patches, prec, s.UB);
+    std::map<std::string, std::string> uExtra, tExtra;
+    slipWallEntries(cs, prec, msRef, msVf, uExtra, tExtra);
+    writeVolField(src + "U", out + "/U", s.U, cs.patches, prec, s.UB, nullptr, uExtra.empty() ? nullptr : &uExtra);
     writeVolField(src + "p", out + "/p", s.p, cs.patches, prec, s.pB);
-    writeVolField(src + "T", out + "/T", s.T, cs.patches, prec, s.TB);
+    writeVolField(src + "T", out + "/T", s.T, cs.patches, prec, s.TB, nullptr, tExtra.empty() ? nullptr : &tExtra);
     // rho is NO_READ, AUTO_WRITE with calculated patches (createFields.H:27-38)
     static const DerivedFieldSpec rhoSpec{"rho", "dimensions      [1 -3 0 0 0 0 0];"};
     writeVolField(src + "T", out + "/rho", s.rho, cs.patches, prec, s.rhoB, &rhoSpec);
@@ -468,7 +522,11 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
             arm->download(s);
             Arm::TurbulenceOut to;
             const bool turb = arm->turbulenceFields(to);
-            writeTime(cs, s, clock, control != controlNoUniformTime, arm->rDeltaT(), turb ? &to : nullptr);
+            std::vector<vector> msRef;
+            std::vector<scalar> msVf;
+            const bool ms = arm->maxwellSlipState(msRef, msVf);
+            writeTime(cs, s, clock, control != controlNoUniformTime, arm->rDeltaT(), turb ? &to : nullptr,
+                      ms ? &msRef : nullptr, ms ? &msVf : nullptr);
             purge.written(cs.caseDir, clock.timeName());
             std::printf("written %s\n", clock.timeName().c_str());
             interPhase::mark("loop: write");

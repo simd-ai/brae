@@ -793,6 +793,12 @@ public:
     }
     // the rDeltaT the last step used, as setRDeltaT.H left it (written at write times: AUTO_WRITE)
     const std::vector<scalar>* rDeltaT() const override { return cs_.lts ? &rDThost_ : nullptr; }
+    bool maxwellSlipState(std::vector<vector>& refValue, std::vector<scalar>& valueFraction) const override
+    {
+        if (!slip_ || !slip_->maxwell()) return false;
+        slip_->maxwellState(refValue, valueFraction);
+        return true;
+    }
 
     // ---- the nozzle boundaries (milestone H), where OpenFOAM's updateCoeffs runs -----------------------------------
     // waveTransmissive reads p.oldTime().boundaryField(): the patch values as the step starts
