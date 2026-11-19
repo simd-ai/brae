@@ -14,6 +14,7 @@
 #include "cf_types.cuh"
 #include "foam_dict.cuh"
 #include "brae_notice.cuh"
+#include "field_write_format.cuh"   // whether the writer takes writeFormat binary
 #include "start_time.cuh"   // Time::timeName, the run's timeFormat and timePrecision
 #include "purge_write.cuh"  // the purgeWrite FIFO, shared with rhoCentralFoam
 #include <cmath>
@@ -73,8 +74,10 @@ public:
         // numerical is at stake and the output is readable by every OpenFOAM tool -- and because only
         // the rhoSimpleFoam mirror ever refused it, while simpleFoamV2, gpuSimpleFoam, gpuPimpleFoam
         // and the legacy rho drivers all wrote ascii under the same setting saying nothing at all.
-        // One notice here covers every driver, since every one of them builds a WriteControl.
-        if (controlDict.wordOr("writeFormat", "ascii") == "binary")
+        // One notice here covers every driver, since every one of them builds a WriteControl. A driver whose
+        // writer takes `writeFormat binary` (fieldWriteFormat().binary, set before its Time is built) writes
+        // OpenFOAM's binary lists, and has nothing to say.
+        if (controlDict.wordOr("writeFormat", "ascii") == "binary" && !fieldWriteFormat().binary)
             noticeApproximated("controlDict writeFormat",
                                "'binary' -- brae's field writer emits ascii only. OpenFOAM reads the "
                                "format from each file's own header, not from controlDict, so the output "
