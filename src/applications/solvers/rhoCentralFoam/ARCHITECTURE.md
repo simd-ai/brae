@@ -587,8 +587,8 @@ controls rasLaminarMuEff, rasNoAlphat, rasCorrectFirst, rasPhiUndivided.
   correction with snapToWedge (twoDPointCorrector gained the wedge branch, wedgePolyPatch's own normal arithmetic).
   Not pimpleFoam's helper: it maps the solve's scheme, tolerance and wedge correction differently. The shared class
   takes the velocity solver only when its caller asks (rhoCentralFoam), so its other users are unchanged.
-- **What the arm holds of the geometry is refreshed after each move**: the device mesh (refreshDeviceMeshGeometry), the
-  boundaries' areas, deltaCoeffs and normals (rebuilt by the same builders and adopted), V0 and meshPhi for the kernels,
+- **What the arm holds of the geometry is refreshed after each move**: the device mesh (in place, sec. 5n), the
+  boundaries' areas, deltaCoeffs and normals (the builders' arithmetic, uploaded in place, sec. 5n), V0 and meshPhi for the kernels,
   and the viscous correctors' constant-mu laplacian and non-orthogonal switch (the moved cone's cells are no longer
   orthogonal). Then U.correctBoundaryConditions(), as dynamicMotionSolverFvMesh::update ends.
 - **The fluxes and the ddt**: phiv_pos/neg -= meshPhi (:126-133), phiEp += meshPhi*(a_pos*p_pos + a_neg*p_neg) (:213-218);
@@ -602,6 +602,35 @@ controls rasLaminarMuEff, rasNoAlphat, rasCorrectFirst, rasPhiUndivided.
 
 tests/rho_central_moving_vs_openfoam.sh: movingCone as shipped, with tight solves, and restarted from OpenFOAM's 1e-5;
 controls motionFluxAbsolute, motionDdtStatic, motionWallStatic, motionPiovStatic.
+
+## 5n. Performance with the numerics unchanged (after K)
+
+Each change below leaves every gate's written files, the log and the deterministic `diag` lines bit-identical. The two
+suites, before and after, were compared file by file: 12,814 files, none different. The rule: a change that moves a bit
+is not a performance change.
+
+- **mesh.update() is timed on its own.** `diag step-seconds` never included it; `diag motion-seconds` now reports it.
+  `BRAE_INTER_PHASE_TIME=1` turns on the shared interPhase timers in the loop, the viscous step, the U solve,
+  mesh.update() and the motion solver. They are off by default, and synchronise at each phase boundary.
+- **The moved geometry is uploaded, not rebuilt.**
+  - The boundaries' deltaCoeffs, magSf, normals and symmetry normals come from `deviceBoundaryGeometry` (shared,
+    device_boundary.cuh). It follows the builders' layout and arithmetic, and writes into the existing device
+    boundaries.
+  - `buildDeviceMesh`'s geometry loops are split out (`deviceMeshGeometryHost`). The builder and
+    `refreshDeviceMeshGeometryInPlace` therefore compute the same values, and the in-place refresh uploads into the
+    existing buffers. It is opt-in: brae's other moving solvers still call refreshDeviceMeshGeometry.
+  - `PackedUpload` (shared, device_buffer.cuh) packs those arrays into one pinned host block. It then makes one
+    host-to-device copy and slices it on the device, all on the per-thread stream.
+- **The viscous accounting stays on the device.** Milestone G's solve remainder and identity took five blocking
+  reductions per solve. They are now device-scalar reductions with the same kernels (`deviceDotInto`,
+  `deviceSumMagInto`). Each result is logged on the device and folded on the host, in call order, when read.
+- **fvc::smooth chooses its arm by measurement.** OpenFOAM's smoothData stops propagating below a tolerance, so the
+  visiting order is part of the result. The device wave keeps that order, but on 32k cells it is bound by latency.
+  The first call runs the host oracle and the device wave on the same field. It refuses unless the two agree to the
+  bit, then keeps the faster. `BRAE_RCF_SMOOTH=host|device` forces one.
+
+Still open: the small cases are bound by kernel-launch latency, and under adjustTimeStep by setDeltaT's per-step
+host round trip. CUDA Graphs or a device-side setDeltaT would be the next step.
 
 ## 6. Milestones, each closed by a gate against OpenFOAM v2412
 

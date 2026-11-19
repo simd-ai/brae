@@ -70,3 +70,29 @@ with every Sod output byte-identical).
 
 (Items 1-4, LTS/janaf, turbulence (kOmegaSST) and mesh motion (velocityComponentLaplacian) are done: milestones C-K,
 ARCHITECTURE.md sections 5d-5m. All seven v2412 tutorials run as shipped.)
+
+## Qualification (2026-11-19): the seven tutorials as shipped, timed idle on the GB10
+
+Wall seconds for the whole run. OpenFOAM v2412 ran once each: serial, and in four with the gates' frozen scotch
+partitions. Four ranks is the gates' decomposition, not OpenFOAM's best on this 20-core CPU. Each brae binary is the
+mean of two runs, and the two binaries were interleaved. Before is the commit before ARCHITECTURE.md sec. 5n; after
+includes 5n. Every written file is the same from both binaries.
+
+| tutorial | cells | OpenFOAM serial | OpenFOAM in four | brae before | brae after |
+|---|---|---|---|---|---|
+| shockTube | 100 | 0.25 | 0.67 | 0.46 | 0.46 |
+| wedge15Ma5 | 4,800 | 3.69 | 1.88 | 0.84 | 0.84 |
+| obliqueShock | 1,800 | 2.49 | 1.83 | 1.91 | 1.86 |
+| forwardStep | 16,128 | 39.89 | 13.43 | 6.99 | 6.29 |
+| LadenburgJet60psi | 1,200 | 14.11 | 6.45 | 27.74 | 17.76 |
+| biconic25-55Run35 | 32,385 | 621.17 | 223.06 | 241.48 | 132.01 |
+| movingCone | 1,900 | 39.42 | 16.72 | 100.99 | 41.99 |
+
+- Where the cells are many, brae is ahead: forwardStep 6.3 x OpenFOAM serial, biconic 4.7 x.
+- The small viscous and moving cases are bound by latency:
+  - kernel launches;
+  - setDeltaT's host round trip;
+  - GaussSeidel swept on the host in OpenFOAM's order.
+
+  There brae is behind OpenFOAM in four, and on LadenburgJet60psi and movingCone also behind serial.
+- forwardStep's 0.7 s gain was not aimed at; its cause is not established.
