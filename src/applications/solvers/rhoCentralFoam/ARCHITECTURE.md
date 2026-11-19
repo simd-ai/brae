@@ -29,7 +29,7 @@ BRAE_HD code both arms run (namespace `brae::rhoCentral`).
 | restart (milestone E): `Time::setControls` reading `<start>/uniform/time`, `Time::writeTimeDict` writing it | shared: `run_clock.cuh` (reads deltaT under adjustTimeStep, deltaT0, index), `src/OpenFOAM/db/Time/time_dict_writer.cuh` (new) | sec. 5g |
 | one step, composed | `rhoCentralStep_cpp.cuh/.cu` (H), `rhoCentralStep.cuh/.cu` (D) | the two `Arm`s |
 | hePsiThermo + hConst + perfectGas | `rhoCentralThermo.cuh` (HD) | Es, Cv, psi, the Newton e -> T loop; constTransport's alphaEff (G) |
-| the viscous correctors (milestone G): 218-219 tauMC, 234-244 the U corrector, 246-253 sigmaDotU, 273-282 the e corrector | `rhoCentralViscous.cuh/.cu` (D), on shared operators (sec. 5i); the order in `rhoCentralStep.cu`'s `stepViscous` | sec. 5i |
+| the viscous correctors (milestone G): 220-221 tauMC, 235-244 the U corrector, 247-255 sigmaDotU, 273-282 the e corrector | `rhoCentralViscous.cuh/.cu` (D), on shared operators (sec. 5i); the order in `rhoCentralStep.cu`'s `stepViscous` | sec. 5i |
 
 Planned, not built yet: `setRDeltaT` (I), the solver's own `BCs/` (maxwellSlipU, smoluchowskiJumpT; G, I),
 turbulence (J) and mesh motion (K). Each goes into the module of its OpenFOAM counterpart above, or a new one beside
@@ -447,7 +447,7 @@ Gates for the transition:
 ## 5i. Milestone G: the viscous correctors
 
 With max(mu) > 0 (createFieldRefs.H) OpenFOAM v2412 adds, in this order (rhoCentralFoam.C): tauMC =
-muEff*dev2(T(fvc::grad(U))) from U as the step starts (:218-219); after the explicit rho, rhoU and U, the U corrector
+muEff*dev2(T(fvc::grad(U))) from U as the step starts (:220-221); after the explicit rho, rhoU and U, the U corrector
 solve(fvm::ddt(rho, U) - fvc::ddt(rho, U) - fvm::laplacian(muEff, U) - fvc::div(tauMC)) and rhoU = rho*U (:234-244);
 sigmaDotU = (interpolate(muEff)*magSf*snGrad(U) + dotInterpolate(Sf, tauMC)) & (a_pos*U_pos + a_neg*U_neg) from the
 corrected U (:246-253), whose divergence the rhoE equation subtracts (:258-263); after e, its patches and
@@ -632,6 +632,42 @@ is not a performance change.
 Still open: the small cases are bound by kernel-launch latency, and under adjustTimeStep by setDeltaT's per-step
 host round trip. CUDA Graphs or a device-side setDeltaT would be the next step.
 
+## 5o. The audit before the pull request (2026-11-19)
+
+Two independent read-throughs of the branch against OpenFOAM v2412 and origin/main. The order of operations and the
+arithmetic of rhoCentralFoam.C, its includes, the thermo, LTS and mesh motion match. Found and changed:
+
+- Line citations of rhoCentralFoam.C (220-221 tauMC, 224 the rho solve, 240-241 the U corrector's terms, 251-254
+  sigmaDotU, 278 alphaEff), createFields.H, LimitedScheme.C, localEulerDdt.C, hConstThermo.C, janafThermoI.H,
+  partialSlipFvPatchField.C, symmetryPlaneFvPatchField.C and smoluchowskiJumpTFvPatchScalarField.C had drifted by
+  one to a few lines, or pointed at a neighbouring function; corrected.
+- The wedge branch of the shared twoDPointCorrector lacked wedgePolyPatch.C's two FatalErrors (a centre plane off
+  the coordinate planes, a wedge plane on one); added. displacementLaplacian, the other caller, still refuses wedge
+  patches before it builds the corrector, so interFoam's behaviour is unchanged.
+- The shared field reader read `fieldInf` as a scalar for every field; a vector's `( ... )` now skips as it did before
+  the key was read, so a vector waveTransmissive is refused by name, not by a parse error.
+- `diag inletOutlet` counted a viscous step's face-steps twice (the patches update twice there); counted once.
+- The writeFormat-binary notice said "12 significant digits" for every solver; it held for rhoSimpleFoam alone
+  (write_control.cuh).
+
+Kept, as deliberate differences, and said here:
+
+- **brae stops on an unphysical state** (rho, p or T not positive, or e not finite: physicalStatus,
+  rhoCentralCellUpdate.cuh) where OpenFOAM would go on until its thermo's own FatalErrors (thermoI.H: a negative
+  temperature seed, the e -> T inversion not converging). A run that passes is unaffected; the gates' controls rely
+  on the stop (tests/rho_central_gate_lib.sh, red()), as simpleFoam and pimpleFoam stop on a non-finite residual. The
+  device arm reads the status when it flushes its window (256 steps, or at a write, or every step under
+  adjustTimeStep), so a failing run stops up to that many steps after OpenFOAM's step would have; nothing past it is
+  written.
+- **janaf's limit() is silent.** OpenFOAM prints a Warning on every clamp of T to [Tlow, Thigh]; brae clamps alike and
+  prints nothing (rhoCentralThermo.cuh).
+- **A solver other than `diagonal` for rho, rhoU or rhoE is refused**, where OpenFOAM would use diagonalSolver for any
+  name; stricter, never different.
+- **courantKernel is one block of 1024 threads**, so the Courant reduction sits on one SM. The max, which deltaT
+  reads, is exact in any order; the two sums behind the logged mean Courant number keep one fixed order (1024 strided
+  partials, then a tree), so the log is the same from run to run, though not OpenFOAM's sequential sum to the last
+  bit. A cost on large meshes (sec. 5n's open items), not a numerical difference.
+
 ## 6. Milestones, each closed by a gate against OpenFOAM v2412
 
 Every gate:
@@ -653,7 +689,9 @@ Every gate:
 | J (done; open checks registered) | compressible RAS on the central path: kOmegaSST, its wall functions, muEff and alphaEff, Euler and localEuler | a turbulent flat plate (Euler, LTS) and LadenburgJet60psi with kOmegaSST |
 | K (done; open check registered) | mesh motion: dynamicMotionSolverFvMesh with velocityComponentLaplacian, meshPhi, V0, movingWallVelocity, pressureInletOutletVelocity, totalPressure's rho form, restart | movingCone as shipped, with tight solves and restarted |
 
-The solver stays labelled **experimental** until A to E pass and at least the four inviscid tutorials run as shipped
-(since D they do: shockTube, wedge15Ma5, obliqueShock and forwardStep).
+The solver is labelled **experimental** (the registry row in solver_dispatch.cuh, a line on stderr at start-up, the
+build target's comment). A to K are done and all seven v2412 tutorials run as shipped within the gates' bounds, but it
+stays experimental while registered open checks remain (tests/data/rho_central_open_checks.tsv, VALIDATION.md), while
+its 3-D coverage is young, and while it runs on one GPU only.
 Multi-GPU is designed for, not built: the Stepper's patch evaluation and gradient stages are where halo exchanges will
 go.

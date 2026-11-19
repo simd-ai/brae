@@ -34,6 +34,10 @@ int main(int argc, char** argv)
             else throw std::runtime_error("unknown option `" + a + "`");
         }
         brae::setCaseEnvironment(caseDir);
+        // The solver is labelled experimental (ARCHITECTURE.md sec. 6). On stderr, so the log keeps OpenFOAM's layout.
+        std::fprintf(stderr, "brae rhoCentralFoam: EXPERIMENTAL, single GPU. What is validated against OpenFOAM v2412 "
+                             "and what is refused by name: src/applications/solvers/rhoCentralFoam/ARCHITECTURE.md "
+                             "sec. 6 and rhoCentralControls.cuh.\n");
 
         const char* armEnv = std::getenv("BRAE_RHOCENTRALFOAM_ARM");
         const std::string arm = armEnv ? armEnv : "cuda";

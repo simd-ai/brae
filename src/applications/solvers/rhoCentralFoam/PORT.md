@@ -83,16 +83,22 @@ includes 5n. Every written file is the same from both binaries.
 | shockTube | 100 | 0.25 | 0.67 | 0.46 | 0.46 |
 | wedge15Ma5 | 4,800 | 3.69 | 1.88 | 0.84 | 0.84 |
 | obliqueShock | 1,800 | 2.49 | 1.83 | 1.91 | 1.86 |
-| forwardStep | 16,128 | 39.89 | 13.43 | 6.99 | 6.29 |
+| forwardStep | 16,128 | 39.89 | 13.43 | 6.99 (six runs: 6.60) | 6.29 (six runs: 6.90) |
 | LadenburgJet60psi | 1,200 | 14.11 | 6.45 | 27.74 | 17.76 |
 | biconic25-55Run35 | 32,385 | 621.17 | 223.06 | 241.48 | 132.01 |
 | movingCone | 1,900 | 39.42 | 16.72 | 100.99 | 41.99 |
 
-- Where the cells are many, brae is ahead: forwardStep 6.3 x OpenFOAM serial, biconic 4.7 x.
+- Where the cells are many, brae is ahead: forwardStep about 6 x OpenFOAM serial, biconic 4.7 x.
 - The small viscous and moving cases are bound by latency:
   - kernel launches;
   - setDeltaT's host round trip;
   - GaussSeidel swept on the host in OpenFOAM's order.
 
   There brae is behind OpenFOAM in four, and on LadenburgJet60psi and movingCone also behind serial.
-- forwardStep's 0.7 s gain was not aimed at; its cause is not established.
+- forwardStep's 0.7 s "gain" in the two-run means is run-to-run spread, not a change (2026-11-19). Six interleaved
+  runs each: before 6.60 s (6.22 to 7.00), after 6.90 s (6.50 to 7.52). Under Nsight Systems both binaries make the
+  same calls: 140,574 kernel launches (21 a step), 6,694 stream synchronisations, 1,155 cudaMemcpy, and the
+  kernels take 2.57 s and 2.59 s. Nothing in sec. 5n is on forwardStep's path: it is inviscid, static and not LTS.
+  80 % of its CUDA API time is the one synchronisation a step that setDeltaT.H's Courant number needs (0.71 ms a
+  step under the profiler, against 0.38 ms of kernels). A wall time on this machine moves about 10 % from run to
+  run, so a timing claim here needs several interleaved runs.
