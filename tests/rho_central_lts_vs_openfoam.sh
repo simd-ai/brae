@@ -53,6 +53,10 @@
 #   AS SHIPPED   biconic: brae reads the tutorial's gzipped 0 and binary mesh, and says it writes ascii where the case asks
 #                for binary (writeFormat: brae's shared writer is ascii only); OpenFOAM's binary output is what it is
 #                compared with
+#   READ BACK    (2026-11-19) brae's last biconic write carries the cone's maxwellSlipU and smoluchowskiJumpT entries
+#                (accommodationCoeff, Uwall, thermalCreep, curvature, refValue, valueFraction; accommodationCoeff, Twall,
+#                gamma), and both OpenFOAM and brae start from it (startFrom latestTime, five LTS steps). Before, brae
+#                wrote type and value only, and both stopped on the missing accommodationCoeff
 #   CONSERVATION Euler viscous cases: positivity; the residual-accounted balance and every solve's identity (vbalance,
 #                identity); the raw balance reported (hist). LTS cases: positivity only (a pseudo-time march)
 #   MEMORY, RUNTIME (reported)
@@ -237,6 +241,29 @@ if grep -q "writeFormat: 'binary' -- brae's field writer emits ascii only" "$W/b
     && grep -q "^writeFormat *binary;" "$W/b_biconic/system/controlDict" && ls "$W/b_biconic/0/"*.gz > /dev/null 2>&1
 then ok "biconic as shipped: brae read the gzipped 0 and the binary mesh, and says it writes ascii where the case asks for binary"
 else fail "biconic as shipped: the case or brae's notice is not what was shipped"; fi
+
+# read back: OpenFOAM and brae each start from brae's last biconic write
+tl=$(times "$W/b_biconic" | awk '{print $NF}')
+miss=""
+for k in accommodationCoeff Uwall thermalCreep curvature refValue valueFraction; do
+    sed -n '/^    cone/,/^    }/p' "$W/b_biconic/$tl/U" | grep -q "^ *$k " || miss="$miss U:$k"
+done
+for k in accommodationCoeff Twall gamma; do
+    sed -n '/^    cone/,/^    }/p' "$W/b_biconic/$tl/T" | grep -q "^ *$k " || miss="$miss T:$k"
+done
+if [ -z "$miss" ]; then ok "biconic: brae's t = $tl writes the cone's maxwellSlipU and smoluchowskiJumpT entries OpenFOAM's write() does"
+else fail "biconic: brae's t = $tl lacks the cone's$miss"; fi
+for who in of b; do
+    d="$W/rb_${who}_biconic"
+    rm -rf "$d"; mkdir -p "$d"; cp -r "$W/b_biconic/system" "$W/b_biconic/constant" "$W/b_biconic/$tl" "$d/"
+    sed -i -E "s/^(startFrom\s+)\S+;/\1latestTime;/; s/^(endTime\s+)\S+;/\1$(python3 -c "print(repr($tl + 5e-7))");/" "$d/system/controlDict"
+    if [ "$who" = of ]
+    then of "cd '$d' && rhoCentralFoam > log 2>&1" < /dev/null; grep -qx End "$d/log" && rc=0 || rc=1
+    else (cd "$d" && timeout 900 "$BIN" -case . > log 2> err < /dev/null); rc=$?
+    fi
+    if [ "$rc" = 0 ]; then ok "biconic: $([ "$who" = of ] && echo OpenFOAM || echo brae) starts from brae's t = $tl and runs five LTS steps"
+    else fail "biconic: $([ "$who" = of ] && echo OpenFOAM || echo brae) could not start from brae's t = $tl: $(tail -c 300 "$d/log" "$d/err" 2> /dev/null | tr '\n' ' ')"; fi
+done
 
 # ---- conservation and stability ------------------------------------------------------------------------------------------
 for c in $ECASES; do balance "b_$c" raw; vbalance "b_$c"; identity "b_$c"; done

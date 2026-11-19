@@ -39,6 +39,9 @@
 #                step, at round-off (reported by brae, `diag gcl`)
 #   CONSERVATION mc_tight: positivity; the residual-accounted balance and every solve's identity (vbalance, identity);
 #                the raw balance reported (hist)
+#   READ BACK    (2026-11-19) OpenFOAM starts from brae's last write of mc_shipped (its totalPressure in the rho form
+#                carries p0, rho, psi and gamma as OpenFOAM writes them; it was written as `inletValue`, which OpenFOAM
+#                stopped on)
 #   MEMORY, RUNTIME (reported)
 # CONTROLS (rhoCentralState.cuh), red against OpenFOAM by more than 100 x the bound, on mc_tight:
 #   motionFluxAbsolute (no meshPhi in the fluxes), motionDdtStatic (ddt on V, not V0), motionWallStatic
@@ -178,6 +181,9 @@ for c in $ALL; do
     then ok "b_$c: |V - V0 - deltaT*sum(meshPhi)|/V at most $g over every cell and step (the swept volumes close each cell's volume change to round-off)"
     else fail "b_$c: the swept volumes leave ${g:-?} of a cell's volume change unaccounted"; fi
 done
+
+# ---- read back ------------------------------------------------------------------------------------------------------------
+readback "$W/b_mc_shipped" 1e-8 "mc_shipped"
 
 # ---- conservation and stability ------------------------------------------------------------------------------------------
 balance "b_mc_tight" raw; vbalance "b_mc_tight"; identity "b_mc_tight"

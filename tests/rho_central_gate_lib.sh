@@ -280,6 +280,25 @@ red()
     fi
 }
 
+# readback <brae dir> <extra time> <name>: OpenFOAM starts from brae's last write (startFrom latestTime) and runs on by
+# <extra time>: what brae writes must be what OpenFOAM's readers require (2026-11-19: maxwellSlipU and smoluchowskiJumpT
+# were written with type and value only, and the shared writer wrote totalPressure's p0 as `inletValue`; OpenFOAM
+# stopped on both)
+readback()
+{
+    local b=$1 extra=$2 name=$3 tl d
+    tl=$(times "$b" | awk '{print $NF}')
+    d="$W/rb_$(basename "$b")"
+    rm -rf "$d"
+    mkdir -p "$d"
+    cp -r "$b/system" "$b/constant" "$b/$tl" "$d/"
+    sed -i -E "s/^(startFrom\s+)\S+;/\1latestTime;/; s/^(endTime\s+)\S+;/\1$(python3 -c "print(repr($tl + $extra))");/" "$d/system/controlDict"
+    of "cd '$d' && rhoCentralFoam > log 2>&1" < /dev/null
+    if grep -qx End "$d/log"
+    then ok "$name: OpenFOAM starts from brae's t = $tl and runs on by $extra"
+    else fail "$name: OpenFOAM could not start from brae's t = $tl: $(grep -m 1 -A 2 'FATAL' "$d/log" | tr '\n' ' ' | cut -c1-300)"; fi
+}
+
 # balance <brae dir>: `diag balance` within `diag roundoff` (four ulps of every cell's total a step), and positivity
 balance()   # balance <dir> [raw]: with "raw", the conservation line is a historical report (hist), not a check
 {
