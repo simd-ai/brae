@@ -804,6 +804,75 @@ OpenFOAM v2412 serial and in 4, 8, 16 and 20 ranks (scotch, bound to cores), the
   CUDA API time (2.7 s of 4.1 s over 92 steps), which is what BRAE_GS_HOST_SMOOTHER=0 removes. Open, not done here:
   a multi-block Courant reduction with the same summation order, and a parallel or binary writer.
 
+## 5r. The final review: the shared writer read back across solvers, and known-red in CI (2026-11-19)
+
+**The shared writer, read back by every solver that writes through it.** Sec. 5p's writer change reaches simpleFoam,
+pimpleFoam and rhoSimpleFoam too, so their output was read back the same way (tests/total_bc_roundtrip_vs_openfoam.sh).
+The totalPressure and totalTemperature changes held. Three older defects in the same writer did not:
+
+- **uniformTotalPressure** (pimpleFoam/RAS/TJunction's inlet, where p0 is a table) was written as `type`, then
+  `inletValue` (p0 at t = 0), then `value`.
+  - OpenFOAM stopped on it ("Missing or invalid Function1 entry: p0").
+  - brae restarted from it without a message, with p0 held at 10 where the table ramps it. Ten steps later, U was
+    2.3 % and p 5.6 % off the uninterrupted run.
+  - Fix: it is now written as OpenFOAM's write() does, with rho, psi, gamma, then `p0 table;` with `p0Coeffs`, or
+    `constant` (uniformTotalPressureFvPatchScalarField.C:222-232).
+  - A uniformTotalPressure with no `p0` is now refused by name, as OpenFOAM refuses it. A file written by an earlier
+    brae stops instead of running with p0 held.
+  - A plain totalPressure written by an earlier brae, with its p0 under `inletValue`, still restarts. That value is
+    p0's, so brae reads it as p0 with a notice, continues exactly as from the same file spelled `p0`, and writes `p0`
+    from then on.
+- **fanPressure** lost its fan curve and direction.
+  - brae refused its own output, and OpenFOAM stopped on the missing p0.
+  - brae also refused OpenFOAM's output, which writes the curve as `fanCurve table;` with `fanCurveCoeffs`
+    (Function1::writeData).
+  - Fix: the reader keeps the curve and direction, and the writer emits OpenFOAM's form
+    (fanPressureFvPatchScalarField.C:223-235). pimpleFoam's fan reader (fan_pressure.cuh) now takes either spelling
+    and requires p0, where it used to read a missing one as 0.
+- **phi on a symmetry, symmetryPlane or wedge patch** was written `calculated`. OpenFOAM refuses that on a restart
+  ("inconsistent patch and patchField types", fvsPatchFieldNew.C:127), so it could not start from brae's simpleFoam,
+  pimpleFoam or rhoSimpleFoam output on such a mesh. Fix: the constraint type is kept, with the flux as its value.
+
+**What the gate checks.** It holds 63 checks on pimpleFoam's TJunction (as a table and as a fan inlet), simpleFoam's
+windAroundBuildingsBox, rhoSimpleFoam's rhoTP and rhoCentralFoam's 3-D duct. On each:
+- brae's patch entries equal OpenFOAM's on the same case;
+- OpenFOAM starts from brae's output and keeps the entries;
+- brae starts from OpenFOAM's output;
+- brae restarted from its own output matches its uninterrupted run:
+
+  | solver | restart against the uninterrupted run |
+  |---|---|
+  | pimpleFoam, simpleFoam | identical |
+  | rhoSimpleFoam's mirror | 1.7e-8 (its files carry 12 digits) |
+  | rhoCentralFoam's duct | within 1.2e-10 of OpenFOAM's restart from the same directory |
+
+Each arm has a control: the file as brae wrote it before. OpenFOAM must refuse each one. brae must refuse the
+uniformTotalPressure and fanPressure ones by name, and continue exactly from the totalPressure ones. On a build of the
+commit before these fixes, 22 of the 63 checks fail.
+
+**Two restart defects found on the way are outside the writer and are not fixed here.** Neither is reached by
+rhoCentralFoam.
+- **pimpleFoam with adjustTimeStep** (TJunction as shipped is such a case). gpuPimpleFoam.cu's loop has three faults:
+  - its writes do not land on adjustable write times (0.00992992 where OpenFOAM writes 0.01);
+  - it ends short of endTime, since the loop's end is set from the initial deltaT;
+  - its final directory is named from the last deltaT (0.0343985 for a run that stopped at 0.0164991), so a restart
+    from it starts at the wrong time.
+- **rhoSimpleFoam's default driver** restarts 1.7e-4 from its uninterrupted run, where OpenFOAM's own restart is
+  within 1.9e-16 and the mirror's within 1.7e-8. validation/restart_vs_openfoam.sh already bounds this at 1e-3.
+
+**Known-red in CI.** The GB10 CI's ctest step leaves out the six known-red gates (-LE known-red), so a new failure in
+them would never show. tools/known_red_check.py runs them in a step of their own. It passes only when the FAILs are
+exactly the registered ones:
+- every FAIL is matched by a registry row, by the gate library's own rule;
+- every row matches the number of FAILs tests/data/rho_central_known_red.tsv gives it;
+- every gate passes its expected number of checks. The gates do not assert their own counts, so without this an arm
+  that stopped running would go unseen.
+
+The gates, their bounds and their output are unchanged: they stay red, and the step's log lists all 24 by category.
+A change in either direction fails until the registry, the expectations and VALIDATION.md are changed together, in
+review. The checker's self-test runs in ctest and in the hosted build-check. On the suite's own logs it reports
+15 round-off amplification, 4 time-step sequence divergence and 5 tolerance-limited checks.
+
 ## 6. Milestones, each closed by a gate against OpenFOAM v2412
 
 Every gate:

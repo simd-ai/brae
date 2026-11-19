@@ -7,7 +7,7 @@ partition, `tests/data/rho_central_decomposition`), against OpenFOAM serial. The
 written at six digits. Each gate also runs a negative control that must turn red by more than 100 x the bound. The
 bound is never widened to make a check pass.
 
-## The gates (the suite at 4dbcf8f7, 2026-11-19)
+## The gates (the suite at 4d951925, 2026-11-19)
 
 | gate (`tests/`) | what it holds to OpenFOAM | passed | failed | ctest labels |
 |---|---|---|---|---|
@@ -32,8 +32,15 @@ the log; the acceptance there is the residual-accounted balance.
 
 `tests/data/rho_central_open_checks.tsv` lists each one with its analysis. `tests/rho_central_gate_lib.sh` prints the
 category under the matching FAIL. It never turns a FAIL into a pass, and no threshold reads the file. The gates that
-carry one stay red, so ctest labels them `known-red`: the GB10 CI (`.github/workflows/gpu-test.yml`, `-LE known-red`)
-runs the other seven, and `ctest -L known-red` runs these six.
+carry one stay red, so ctest labels them `known-red`. The GB10 CI (`.github/workflows/gpu-test.yml`) leaves them
+out of its ctest step (`-LE known-red`) and runs them in a step of their own through `tools/known_red_check.py`.
+That step passes only when what is red is exactly these 24:
+- no FAIL outside the registry;
+- each registry row matching the number of FAILs that `tests/data/rho_central_known_red.tsv` gives it;
+- each gate passing its expected number of checks.
+
+A new failure, a registered check going green, or an arm that stops running fails that step until the registry,
+the expectations and this table change together. `ctest -L known-red` runs the six as they are.
 
 | # | gate | case (arm) | what the gate measured (brae > bound) | category |
 |---|---|---|---|---|
@@ -97,3 +104,19 @@ What the categories mean, and what OpenFOAM's own runs do on the same cases:
 None of these is resolved by a wider bound or a clamp. Each would need a reason to change the gate itself, such as a
 different reference spread for amplifying cases, and that is a decision for review, not something the gate does
 silently.
+
+## The shared field writer, read back
+
+rhoCentralFoam writes through the field writer that simpleFoam, pimpleFoam and rhoSimpleFoam share
+(`src/finiteVolume/fields/foam_field_writer.cuh`). `tests/total_bc_roundtrip_vs_openfoam.sh` (ctest
+`total_bc_roundtrip_vs_openfoam`, 63 checks) covers all four solvers and the totalPressure family (totalPressure,
+uniformTotalPressure, fanPressure), totalTemperature, waveTransmissive and phi on a symmetry patch. It holds four
+things against real OpenFOAM:
+- brae's patch entries equal OpenFOAM's on the same case;
+- OpenFOAM starts from brae's output and keeps them;
+- brae starts from OpenFOAM's output;
+- brae restarted from its own output matches its uninterrupted run.
+
+Each arm has a control: the file as an earlier brae wrote it. OpenFOAM must refuse each one. brae must refuse the
+uniformTotalPressure and fanPressure ones, and read a totalPressure's `inletValue` as p0, with a notice. ARCHITECTURE.md
+sec. 5r lists what the gate found and fixed. On the build before those fixes, 22 of the 63 checks fail.
