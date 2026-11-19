@@ -43,7 +43,7 @@ All rows below come from one NVIDIA GH200: brae on its GPU (96 GiB HBM3), OpenFO
   <img src="docs/images/one-gh200-seconds-per-step.png" alt="Seconds per step against mesh size for the four solvers, brae on one GH200 GPU against OpenFOAM on its 72 Grace cores, log-log" width="100%">
 </p>
 
-The method, every mesh size and both codes' timings are in [benchmarks →](docs/performance.md#one-gh200-four-solvers).
+How it was measured: [benchmarks →](docs/performance.md#one-gh200-four-solvers).
 
 ## Solvers
 
