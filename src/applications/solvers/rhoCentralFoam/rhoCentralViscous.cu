@@ -164,7 +164,7 @@ __global__ void snGradPatchKernel(int nB, const label* __restrict__ isEmpty, con
     }
     // fixedValue: (U_b - U_c)*deltaCoeffs. A mixed U face here is maxwellSlipU's partialSlip (milestone I, the only
     // mixed U face rhoCentralFoam has): its snGrad is (lerp(transform(I - n n, pif), refValue, vf) - pif)*deltaCoeffs,
-    // the evaluated U_b's (partialSlipFvPatchField.C:90-103)
+    // the evaluated U_b's (partialSlipFvPatchField.C:142-157, snGrad)
     sx[k] = (t0[k] == 1 || t0[k] == 5) ? dc[k]*(UxB[k] - u.x) : scalar(0);
     sy[k] = (t1[k] == 1 || t1[k] == 5) ? dc[k]*(UyB[k] - u.y) : scalar(0);
     sz[k] = (t2[k] == 1 || t2[k] == 5) ? dc[k]*(UzB[k] - u.z) : scalar(0);
@@ -512,7 +512,7 @@ void ViscousCorrectors::beginStep(const DeviceFields& F, const DeviceVectorBound
         }
         rebuildLaplacian(muC_, lapDiagU_, negUpperU_, muF_);
     }
-    // :218-219, tauMC = muEff*dev2(T(fvc::grad(U))): Gauss linear, packed [(d*3 + i)*nC + c] = d_d U_i, the patch
+    // :220-221, tauMC = muEff*dev2(T(fvc::grad(U))): Gauss linear, packed [(d*3 + i)*nC + c] = d_d U_i, the patch
     // faces by gaussGrad::correctBoundaryConditions on U's stored patch values
     const DeviceBuffer<scalar>* vol[3] = {&F.Ux, &F.Uy, &F.Uz};
     const DeviceBuffer<scalar>* bv[3] = {&F.UxB, &F.UyB, &F.UzB};

@@ -19,7 +19,7 @@
 // THE TRANSFORM PATCHES (milestone C). On a mesh patch of type symmetryPlane, symmetry or wedge EVERY field takes the
 // constraint type -- rho, rhoU and rhoE too, though createFields.H builds them `calculated` (fvPatchFieldNew.C) -- so
 // the three solves' correctBoundaryConditions() evaluate them, and two things change in the order above:
-//   :226  solve(rho) ends in rho.correctBoundaryConditions(): rho_b = rho_P, the NEW cell value, so :233 and :267
+//   :224  solve(rho) ends in rho.correctBoundaryConditions(): rho_b = rho_P, the NEW cell value, so :233 and :267
 //         multiply by it, not by last step's psi_b*p_b. The rhoU and rhoE evaluations are overwritten by :233/:267.
 //   :265  T's patch field is the transform and so is he's (basicThermo::heBoundaryTypes keeps T's type when T is not
 //         fixedValue, zeroGradient, fixedGradient or mixed): e_b = e_P with no Tw.evaluate(), and thermo.correct()
@@ -42,7 +42,7 @@ enum PatchTransform : int
 };
 
 // U.correctBoundaryConditions() on a transform face (rhoCentralFoam.C:232), from the face cell's new U:
-//   mirror  symmetryPlaneFvPatchField.C:118-131 (nHat the patch's one normal), basicSymmetryFvPatchField.C:106-115
+//   mirror  symmetryPlaneFvPatchField.C:134-151 (nHat the patch's one normal), basicSymmetryFvPatchField.C:106-115
 //           (nHat = patch().nf() per face; slip and symmetry), R = I - 2.0*sqr(nHat) precomputed per face
 //   rotate  wedgeFvPatchField.C:118-131, R = wedgePolyPatch::faceT()
 // transform(R, v) is R & v, row by row. NEGATIVE CONTROL controlNoTransform returns the cell value (zeroGradient).

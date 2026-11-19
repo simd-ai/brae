@@ -3,7 +3,7 @@
 // rhoCentralViscous.cuh -- rhoCentralFoam's viscous correctors on the device arm (milestone G).
 //
 // OpenFOAM v2412 rhoCentralFoam.C, when max(thermo.mu()) > 0 (createFieldRefs.H), in the step's order:
-//   :218-219  tauMC = muEff*dev2(T(fvc::grad(U)))            from U as the step starts, cells and patch faces
+//   :220-221  tauMC = muEff*dev2(T(fvc::grad(U)))            from U as the step starts, cells and patch faces
 //   :222-232  (the caller) rho and rhoU explicit, U = rhoU/rho, U.correctBoundaryConditions()
 //   :234-244  solve(fvm::ddt(rho, U) - fvc::ddt(rho, U) - fvm::laplacian(muEff, U) - fvc::div(tauMC)); rhoU = rho*U
 //   :246-253  sigmaDotU = (interpolate(muEff)*magSf*snGrad(U) + dotInterpolate(Sf, tauMC)) & (a_pos*U_pos + a_neg*U_neg)
@@ -41,7 +41,7 @@ class ViscousCorrectors
 public:
     ViscousCorrectors(const brae::rhoCentral::Case& cs, const DeviceMesh& dm, int control);
 
-    // :218-219 and the old-time copies. F as the step starts; dbU's stored values are U's patch values.
+    // :220-221 and the old-time copies. F as the step starts; dbU's stored values are U's patch values.
     void beginStep(const DeviceFields& F, const DeviceVectorBoundary& dbU);
     // :234-244 on the U the explicit update left, its patches evaluated (the caller's U.correctBoundaryConditions).
     // Leaves U solved on the cells and rhoU = rho*U there; the caller evaluates U's patches again.

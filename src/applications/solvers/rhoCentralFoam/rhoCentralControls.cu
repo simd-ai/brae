@@ -316,13 +316,13 @@ static void readViscousControls(const std::string& caseDir, Case& cs)
     const FieldGradScheme gs = parseFieldGradScheme(caseDir, "U");
     if (!gs.gaussLinear || gs.leastSquares || gs.cellLimitK != 0 || !gs.unsupportedLimiter.empty())
         refuse("gradSchemes resolves grad(U) to `" + gs.raw + "`. tauMC = muEff*dev2(T(fvc::grad(U))) "
-               "(rhoCentralFoam.C:218-219); this stage computes Gauss linear only.");
+               "(rhoCentralFoam.C:220-221); this stage computes Gauss linear only.");
     const struct { const char* block; const char* key; const char* want; const char* what; } need[] = {
-        {"divSchemes", "div(tauMC)", "Gauss linear", "fvc::div(tauMC), rhoCentralFoam.C:240"},
-        {"laplacianSchemes", "laplacian(muEff,U)", "Gauss linear corrected", "fvm::laplacian(muEff, U), :239"},
-        {"laplacianSchemes", "laplacian(alphahe,e)", "Gauss linear corrected", "fvm::laplacian(alphaEff, e), :275 (the field is thermo.alphahe(), heThermo.C:812)"},
-        {"snGradSchemes", "snGrad(U)", "corrected", "fvc::snGrad(U) in sigmaDotU, :249"},
-        {"interpolationSchemes", "interpolate(muEff)", "linear", "fvc::interpolate(muEff) in sigmaDotU, :249"},
+        {"divSchemes", "div(tauMC)", "Gauss linear", "fvc::div(tauMC), rhoCentralFoam.C:241"},
+        {"laplacianSchemes", "laplacian(muEff,U)", "Gauss linear corrected", "fvm::laplacian(muEff, U), :240"},
+        {"laplacianSchemes", "laplacian(alphahe,e)", "Gauss linear corrected", "fvm::laplacian(alphaEff, e), :278 (the field is thermo.alphahe(), heThermo.C:812)"},
+        {"snGradSchemes", "snGrad(U)", "corrected", "fvc::snGrad(U) in sigmaDotU, :251"},
+        {"interpolationSchemes", "interpolate(muEff)", "linear", "fvc::interpolate(muEff) in sigmaDotU, :251"},
     };
     for (const auto& n : need)
     {
@@ -392,7 +392,7 @@ Case readRhoCentralCase(const std::string& caseDir)
     cs.tadmor = (flux == "Tadmor");
 
     // ddt: Euler, or localEuler (milestone I). LTS is fv::localEulerDdt::enabled(mesh) -- ddtSchemes `default`
-    // localEuler (localEulerDdt.C:33-37) -- and every ddt the solver builds must then be localEuler too: a term on
+    // localEuler (localEulerDdt.C:39-44) -- and every ddt the solver builds must then be localEuler too: a term on
     // another scheme beside an LTS loop is a mix this port refuses rather than guesses at.
     {
         const std::string def = schemeStatement(caseDir, "ddtSchemes", "default");
@@ -424,7 +424,7 @@ Case readRhoCentralCase(const std::string& caseDir)
     cs.reconRho = rRho;
     cs.reconT = rT;
     cs.reconU = rU;
-    // the limiters' gradients: LimitedScheme.C:56-59 builds them with fvc::grad of the reconstructed field itself
+    // the limiters' gradients: LimitedScheme.C:54 builds them with fvc::grad of the reconstructed field itself
     for (const char* fld : {"rho", "rhoU", "rPsi", "e", "c"})
     {
         const FieldGradScheme gs = parseFieldGradScheme(caseDir, fld);
@@ -442,7 +442,7 @@ Case readRhoCentralCase(const std::string& caseDir)
             if (viaDefault) raw = raw.substr(8);
             refuse(std::string("gradSchemes resolves grad(") + fld + ") to `" + raw + "`"
                    + (viaDefault ? " (its default)" : "") + ". The vanLeer limiter reads that gradient "
-                   "(LimitedScheme.C:56-59); this stage computes Gauss linear only.");
+                   "(LimitedScheme.C:54); this stage computes Gauss linear only.");
         }
     }
 
@@ -523,7 +523,7 @@ Case readRhoCentralCase(const std::string& caseDir)
         else
         {
         cs.gas.Cp    = th->scalarOr("Cp", 0);
-        cs.gas.Tref  = th->scalarOr("Tref", foamTstd());   // hConstThermo.C:40
+        cs.gas.Tref  = th->scalarOr("Tref", foamTstd());   // hConstThermo.C:41
         cs.gas.Hsref = th->scalarOr("Href", 0);            // hConstThermo.C:41 reads Hsref_ from `Href`
         if (!(cs.gas.Cp > cs.gas.R)) refuse("mixture Cp must exceed R (Cv = Cp - R must be positive).");
         }
@@ -636,7 +636,7 @@ Case readRhoCentralCase(const std::string& caseDir)
             refuse("maxwellSlipU and smoluchowskiJumpT read mu, tauMC and the viscous solves (rhoCentralFoam/BCs); this "
                    "port runs them on a viscous case only (mu > 0), where milestone I validates them.");
         // smoluchowskiJumpT reads Pr from mixture.transport, "consistent with rhoCentralFoam"
-        // (smoluchowskiJumpTFvPatchScalarField.C:139-147): required there even under sutherland, which ignores it
+        // (smoluchowskiJumpTFvPatchScalarField.C:171-176): required there even under sutherland, which ignores it
         if (std::find(Ttypes.begin(), Ttypes.end(), "smoluchowskiJumpT") != Ttypes.end())
         {
             const FoamDict tp = readDict(caseDir + "/constant/thermophysicalProperties");
@@ -644,7 +644,7 @@ Case readRhoCentralCase(const std::string& caseDir)
             const FoamDict* tr = mix ? mix->subDict("transport") : nullptr;
             if (!tr || !tr->found("Pr"))
                 refuse("smoluchowskiJumpT reads Pr from thermophysicalProperties mixture.transport "
-                       "(smoluchowskiJumpTFvPatchScalarField.C:139-147); it is missing.");
+                       "(smoluchowskiJumpTFvPatchScalarField.C:171-176); it is missing.");
             cs.sjPr = tr->scalarOr("Pr", 0);
         }
     }

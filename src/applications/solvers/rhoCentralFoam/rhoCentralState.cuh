@@ -65,7 +65,7 @@ enum StatusBits : int
 // NEGATIVE CONTROLS, for the gates only: deliberately wrong numerics a gate must see. Selected by BRAE_CONTROL_RCF,
 // announced on stderr. The first two are the device arm's; the others run on either arm.
 //   upwind           every directed reconstruction with limiter 0: first-order upwind instead of vanLeer/vanLeerV
-//   noPressureJump   phiEp without its aSf*p_pos - aSf*p_neg term (rhoCentralFoam.C:208)
+//   noPressureJump   phiEp without its aSf*p_pos - aSf*p_neg term (rhoCentralFoam.C:209)
 //   untrimmed        setDeltaT.H's step without Time::adjustDeltaT: the write times are not landed on
 //   laggedCourant    setDeltaT.H fed the Courant number at the step before's deltaT, not at its own
 //   noTransform      U on symmetryPlane, symmetry, slip and wedge faces is the cell value (zeroGradient), unprojected
@@ -81,8 +81,8 @@ enum StatusBits : int
 //   limiterVanLeer       every reconstruct(...) limited by vanLeer (vanLeerV on U), whatever the case names
 //   limiterScalarOnV     the V limiter of rhoU built from its x component alone (NVDTVD on rhoU_x), not NVDVTVDV
 //   noTauMC              viscous runs: tauMC left out -- fvc::div(tauMC) from the U corrector and Sf & tauMC from
-//                        sigmaDotU (rhoCentralFoam.C:240, 250) (milestone G)
-//   noSigmaDotU          viscous runs: - fvc::div(sigmaDotU) left out of the rhoE equation (rhoCentralFoam.C:258-263)
+//                        sigmaDotU (rhoCentralFoam.C:241, 252) (milestone G)
+//   noSigmaDotU          viscous runs: - fvc::div(sigmaDotU) left out of the rhoE equation (rhoCentralFoam.C:261)
 //   noDynamicHead        totalPressure and totalTemperature without the dynamic head: p_b = p0, T_b = T0 on inflow too
 //   nozzleFlowInverted   totalPressure and totalTemperature switched on -phi: the dynamic head on outflow, none on inflow
 //   waveNoRelax          waveTransmissive without its far-field relaxation (lInf ignored: k = 0)

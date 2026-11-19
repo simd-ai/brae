@@ -1490,8 +1490,17 @@ inline FieldData<T> readField(const std::string& path)
                     }
                     else if (key == "fieldInf")   // advective/waveTransmissive far-field value
                     {
-                        p.advFieldInf = ts.nextScalar();
-                        p.hasAdvFieldInf = true;
+                        // a scalar's is read; a vector's or tensor's `( ... )` is skipped as it was before this key
+                        // was read, so the patch type is still refused by name where it is not ported
+                        if (ts.peek() == "(")
+                        {
+                            skipToSemicolon(ts);
+                        }
+                        else
+                        {
+                            p.advFieldInf = ts.nextScalar();
+                            p.hasAdvFieldInf = true;
+                        }
                         ts.expect(";");
                     }
                     else if (key == "lInf")       // advective/waveTransmissive relaxation length

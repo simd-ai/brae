@@ -23,7 +23,7 @@ struct FaceStates
 struct FaceFlux
 {
     scalar phi, phiUx, phiUy, phiUz, phiEp, amaxSf;
-    // a_pos*U_pos + a_neg*U_neg, sigmaDotU's face velocity (rhoCentralFoam.C:251), the viscous device arm's (milestone
+    // a_pos*U_pos + a_neg*U_neg, sigmaDotU's face velocity (rhoCentralFoam.C:254), the viscous device arm's (milestone
     // G). Set on the device only: the host arm's code is left as it was (its compiler's FMA contraction moves with
     // what a function body holds, milestone F)
     scalar aUx, aUy, aUz;

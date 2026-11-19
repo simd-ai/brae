@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # brae_rhoCentralFoam against OpenFOAM v2412 rhoCentralFoam with mu > 0 (milestone G): the viscous correctors
-# (rhoCentralFoam.C:218-219 tauMC, :234-244 the U corrector, :246-253 sigmaDotU, :273-282 the e corrector), laminar,
+# (rhoCentralFoam.C:220-221 tauMC, :235-244 the U corrector, :247-255 sigmaDotU, :273-282 the e corrector), laminar,
 # constTransport, single GPU, static mesh.
 #
 # CASES (tests/rho_central_viscous.py; the tube is shockTube's ten times as long, 1000 cells, R = 1, gamma = 1.4)

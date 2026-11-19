@@ -120,7 +120,7 @@ HostFluxes centralFluxes(const Case& cs, const State& s, scalar deltaT, int cont
                           : std::sqrt(CpByCv*rPsiB[k]);
     }
 
-    // ---- the limiters' gradients: grad(rho), grad(rhoU), grad(rPsi), grad(e), grad(c) (LimitedScheme.C:56-59) ----
+    // ---- the limiters' gradients: grad(rho), grad(rhoU), grad(rPsi), grad(e), grad(c) (LimitedScheme.C:54) ----
     std::vector<scalar> rhoUc[3], rhoUbc[3];
     for (int j = 0; j < 3; ++j)
     {

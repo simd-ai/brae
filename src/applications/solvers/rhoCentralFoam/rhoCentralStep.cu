@@ -200,7 +200,7 @@ __global__ void patchKernel(int nB, int slot, GasCoeffs gas, int ctrl, const lab
     const int k = blockIdx.x*blockDim.x + threadIdx.x;
     if (k >= nB) return;
     const label c = bCell[k];
-    if (ioFace[k])
+    if (ioCount && ioFace[k])   // counted once a step: the viscous step updates the patches twice (:265-271, :280)
     {
         atomicAdd(&ioCount[1], 1ull);
         if (phiB[k] < 0) atomicAdd(&ioCount[0], 1ull);
@@ -907,7 +907,7 @@ public:
     // totalT: Tw.evaluate() runs (e.correctBoundaryConditions() with e's patches not yet updated). After the e solve
     // it does not: the matrix's construction left them updated(), so the solve's correctBoundaryConditions() only
     // evaluates (fvPatchField::evaluate), and T_b stays the construction's.
-    void patchUpdate(const DeviceBuffer<scalar>& Tcells, bool totalT = true)
+    void patchUpdate(const DeviceBuffer<scalar>& Tcells, bool totalT = true, bool countInletOutlet = true)
     {
         const int nB = cs_.nB;
         if (!nB) return;
@@ -925,7 +925,7 @@ public:
                                 uR_.data(), rhoConstraint_.data(), TseedOwn_.data()};
         patchKernel<<<blocksFor(nB), kTPB>>>(nB, pending_, cs_.gas, control_, bCell_.data(), TfixesValue_.data(),
                                              F.e.data(), B, X, status_.data(), X_.phiB.data(), ioFace_.data(),
-                                             ioCount_.data());
+                                             countInletOutlet ? ioCount_.data() : nullptr);
         cudaCheck(cudaGetLastError(), "rhoCentral patches");
     }
 
@@ -978,7 +978,7 @@ public:
         std::optional<interPhase::Nested> ph;
         ph.emplace("step: fluxes, beginStep");
         centralFluxes(dm_, cs, control_, F, X_, outflow_.data(), deltaT, meshPhiI(), meshPhiB());   // :102-210
-        vis_->beginStep(F, dbU_);                                            // :218-219, the old fields
+        vis_->beginStep(F, dbU_);                                            // :220-221, the old fields
         const FluxesIn Fx{X_.phi.data(), X_.phiUx.data(), X_.phiUy.data(), X_.phiUz.data(), X_.phiEp.data(),
                           X_.amaxSf.data(), X_.phiB.data(), X_.phiUxB.data(), X_.phiUyB.data(), X_.phiUzB.data(),
                           X_.phiEpB.data(), X_.amaxSfB.data()};
@@ -1042,7 +1042,7 @@ public:
         vis_->solveE(F, dbT_, rDeltaT, rep, cs.lts ? &rDT_ : nullptr);        // :273-277
         ph.reset();
         ph.emplace("step: thermo, p's BCs, turbulence, Courant");
-        patchUpdate(F.T, false);                                              // the solve's e.correctBC, :278-280
+        patchUpdate(F.T, false, false);                                       // the solve's e.correctBC, :278-280
         thermoPressureKernel<<<blocksFor(nC), kTPB>>>(nC, pending_, cs.gas, S, status_.data());   // :278-286
         cudaCheck(cudaGetLastError(), "rhoCentral thermo, p");
         if (nB)

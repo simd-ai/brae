@@ -48,8 +48,18 @@ void TwoDPointCorrector::build(
                   sgn(n.z)*(std::fmax(std::fabs(n.z), 0.5) - 0.5)};
         const scalar mc = mag(cn);
         cn = (mc < 1.0e-150) ? vector{0, 0, 0} : cn/mc;
+        // wedgePolyPatch.C:96-122: OpenFOAM stops on a centre plane that is not a coordinate plane and on a wedge plane
+        // that lies on one (SMALL = 1e-15)
+        if (std::fabs(cn.x + cn.y + cn.z) < 1 - 1e-15)
+            throw std::runtime_error(std::string(WHO) + "wedge `" + p.name + "`: its centre plane does not align with "
+                                     "a coordinate plane (OpenFOAM stops here too, wedgePolyPatch.C:96-105).");
         vector ax = cross(cn, n);
-        ax = ax/mag(ax);
+        const scalar magAxis = mag(ax);
+        if (magAxis < 1e-15)
+            throw std::runtime_error(std::string(WHO) + "wedge `" + p.name + "`: the plane aligns with a coordinate "
+                                     "plane; it should make a small angle with it (OpenFOAM stops here too, "
+                                     "wedgePolyPatch.C:108-122).");
+        ax = ax/magAxis;
         return WedgeCalc{cn, ax, dot(cn, n)};
     };
 

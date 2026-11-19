@@ -189,7 +189,7 @@ void writeTime(const Case& cs, const State& s, const RunClock& clock, bool unifo
     writeVolField(src + "U", out + "/U", s.U, cs.patches, prec, s.UB);
     writeVolField(src + "p", out + "/p", s.p, cs.patches, prec, s.pB);
     writeVolField(src + "T", out + "/T", s.T, cs.patches, prec, s.TB);
-    // rho is NO_READ, AUTO_WRITE with calculated patches (createFields.H:24-35)
+    // rho is NO_READ, AUTO_WRITE with calculated patches (createFields.H:27-38)
     static const DerivedFieldSpec rhoSpec{"rho", "dimensions      [1 -3 0 0 0 0 0];"};
     writeVolField(src + "T", out + "/rho", s.rho, cs.patches, prec, s.rhoB, &rhoSpec);
     // LTS (milestone I): rDeltaT is READ_IF_PRESENT, AUTO_WRITE, extrapolatedCalculated (createRDeltaT.H): its patch

@@ -25,7 +25,7 @@ struct GasCoeffs
     scalar R     = 0;   // specie::R() = RR/molWeight (specieI.H:87-90)
     scalar Cp    = 0;   // hConst Cp_
     scalar Tref  = 0;   // hConst Tref_ (default Tstd)
-    scalar Hsref = 0;   // hConst Hsref_ (read as `Href`, hConstThermo.C:40)
+    scalar Hsref = 0;   // hConst Hsref_ (read as `Href`, hConstThermo.C:41)
     scalar mu    = 0;   // constTransport mu_ (milestone G: > 0 runs the viscous correctors)
     scalar rPr   = 0;   // constTransport rPr_ = 1.0/Pr (constTransport.C:38)
     int    sutherland = 0;   // transport sutherland (milestone H): mu(T) from As, Ts
@@ -41,13 +41,13 @@ struct GasCoeffs
     int    janafLowOnly = 0;   // the negative control janafLowOnly: never the high set
 };
 
-// janafThermoI.H:29-42: the low set below Tcommon, the high set from it on
+// janafThermoI.H:71-85 (coeffs): the low set below Tcommon, the high set from it on
 BRAE_HD inline const scalar* gasJanafCoeffs(scalar T, const GasCoeffs& g)
 {
     return (T < g.Tcommon || g.janafLowOnly) ? g.lowCp : g.highCp;
 }
 
-// Cp(p, T). hConst: Cp_ + perfectGas::Cp (0). janaf (janafThermoI.H:146-155): the Horner polynomial + 0. The
+// Cp(p, T). hConst: Cp_ + perfectGas::Cp (0). janaf (janafThermoI.H:171-181): the Horner polynomial + 0. The
 // expressions are OpenFOAM's: on aarch64 both GCC (OpenFOAM's build) and nvcc contract a*T + b into one fma.
 BRAE_HD inline scalar gasCp(scalar /*p*/, scalar T, const GasCoeffs& g)
 {
@@ -77,7 +77,7 @@ BRAE_HD inline scalar gasGamma(scalar p, scalar T, const GasCoeffs& g)
 BRAE_HD inline scalar gasCp(const GasCoeffs& g) { return gasCp(scalar(0), scalar(0), g); }
 BRAE_HD inline scalar gasCv(const GasCoeffs& g) { return gasCv(scalar(0), scalar(0), g); }
 BRAE_HD inline scalar gasGamma(const GasCoeffs& g) { return gasGamma(scalar(0), scalar(0), g); }
-// The laminar thermal diffusivity rhoCentralFoam's e equation reads (rhoCentralFoam.C:275,
+// The laminar thermal diffusivity rhoCentralFoam's e equation reads (rhoCentralFoam.C:278,
 // turbulence->alphaEff()): ThermalDiffusivity::alphaEff() = thermo.alphahe() = CpByCpv*alpha_ (heThermo.C:809-813),
 // alpha_ = constTransport::alphah = mu*rPr (constTransportI.H:101-108, set in hePsiThermo::calculate). With const
 // transport and hConst both factors are the same in every cell and on every face.
@@ -111,7 +111,7 @@ BRAE_HD inline scalar gasSutherlandAlphahe(scalar T, const GasCoeffs& g)
 {
     return gasGamma(scalar(0), T, g)*gasAlphah(T, g);
 }
-// janafThermoI.H:186-198, Hc(): Ha of the LOW set at Tstd (thermodynamicConstants: Tstd = 298.15)
+// janafThermoI.H:212-222, Hc(): Ha of the LOW set at Tstd (thermodynamicConstants: Tstd = 298.15)
 BRAE_HD inline scalar gasJanafHc(const GasCoeffs& g)
 {
     const scalar* a = g.lowCp;
@@ -125,7 +125,7 @@ BRAE_HD inline scalar gasJanafHc(const GasCoeffs& g)
     );
 }
 // Hs(p, T). hConst (hConstThermoI.H:120): Cp_*(T - Tref_) + Hsref_ + EquationOfState::H(p, T), perfectGas H = 0.
-// janaf (janafThermoI.H:158-183): Ha(p, T) - Hc(), Ha = the Horner polynomial*T + a[5] + perfectGas H (0)
+// janaf (janafThermoI.H:185-208, Ha and Hs): Ha(p, T) - Hc(), Ha = the Horner polynomial*T + a[5] + perfectGas H (0)
 BRAE_HD inline scalar gasHs(scalar /*p*/, scalar T, const GasCoeffs& g)
 {
     if (g.janaf)
@@ -166,7 +166,7 @@ struct GasTResult
     int    limited = 0;   // janaf: the iterate left [Tlow, Thigh] and was clamped (OpenFOAM: a Warning, then clamp)
 };
 
-// janafThermoI.H:45-62, limit(T): outside [Tlow, Thigh] OpenFOAM warns and clamps; hConst's limit is the identity
+// janafThermoI.H:113-130, limit(T): outside [Tlow, Thigh] OpenFOAM warns and clamps; hConst's limit is the identity
 BRAE_HD inline scalar gasLimit(scalar T, const GasCoeffs& g, int& limited)
 {
     if (g.janaf && (T < g.Tlow || T > g.Thigh))
