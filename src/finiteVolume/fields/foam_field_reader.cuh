@@ -1844,14 +1844,27 @@ inline FieldData<T> readField(const std::string& path)
                 if (!p.psiGiven && (p.type == "waveTransmissive" || p.type == "totalTemperature")) p.psiName = "thermo:psi";
                 // p0 has no default in OpenFOAM: totalPressure reads it as a Field (totalPressureFvPatchScalarField.C:67) and
                 // uniformTotalPressure as a Function1 (uniformTotalPressureFvPatchScalarField.C:68), and either stops without
-                // it. This read an `inletValue` in its place, which is how brae's writer spelled p0 until 2026-11-19: a restart
-                // from such a file ran on, a p0 table held at its t = 0 value (pimpleFoam/RAS/TJunction: U 2.3 % and p 5.6 %
-                // off the uninterrupted run ten steps later), where OpenFOAM refuses the file.
+                // it. brae's writer spelled p0 `inletValue` until 2026-11-19, and this read that in its place:
+                //  * totalPressure: the written inletValue IS p0 (a field the solve never changes), so a restart from brae's
+                //    own older output keeps running, unchanged, with a notice; the next write spells it `p0`;
+                //  * uniformTotalPressure: the written inletValue was the table at t = 0, so a restart ran on with p0 held
+                //    there (pimpleFoam/RAS/TJunction: U 2.3 % and p 5.6 % off the uninterrupted run ten steps later). The
+                //    table is not in the file, so it is refused, as OpenFOAM refuses it.
+                if (p.type == "totalPressure" && !p.hasP0 && p.hasInletValue && p.totalRefKey.empty())
+                {
+                    noticeEquivalent("boundaryField/" + p.name + " in " + path,
+                        "a totalPressure with its p0 under `inletValue`, as brae wrote it before 2026-11-19, is read as p0 "
+                        "(the same value); OpenFOAM requires the key `p0` and refuses this file, and brae's next write uses it");
+                    p.totalRefKey = "p0";
+                    p.hasP0 = true;
+                }
                 if ((p.type == "totalPressure" || p.type == "uniformTotalPressure") && !p.hasP0)
                     throw std::runtime_error("brae: boundaryField/" + p.name + " in " + path + " is a " + p.type +
-                        " with no `p0` entry, which OpenFOAM requires (" + p.type + "FvPatchScalarField.C, no default). "
-                        "brae wrote p0 as `inletValue` before 2026-11-19: rename that entry to `p0` (a time-varying p0: "
-                        "copy its table from the case's 0/ file)");
+                        " with no `p0` entry, which OpenFOAM requires (" + p.type + "FvPatchScalarField.C, no default)" +
+                        (p.type == "uniformTotalPressure"
+                             ? ". brae wrote p0 as `inletValue`, its value at t = 0, before 2026-11-19: copy the p0 table "
+                               "from the case's 0/ file in its place"
+                             : std::string()));
                 fd.boundary.push_back(std::move(p));
             }
             ts.expect("}");

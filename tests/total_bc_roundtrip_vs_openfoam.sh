@@ -8,7 +8,7 @@
 #   * uniformTotalPressure (pimpleFoam/RAS/TJunction's inlet, p0 a table) was written as `type` + `inletValue` +
 #     `value`. OpenFOAM stopped on it ("Missing or invalid Function1 entry: p0"), and brae restarted from it with p0
 #     held at p0(0) = 10 where the table ramps it: U 2.3 % and p 5.6 % off the uninterrupted run ten steps later, with
-#     no message. Now written as OpenFOAM writes it (rho, psi, gamma, `p0 table;` + `p0Coeffs`), and a totalPressure or
+#     no message. Now written as OpenFOAM writes it (rho, psi, gamma, `p0 table;` + `p0Coeffs`), and a
 #     uniformTotalPressure with no p0 is refused by name, as OpenFOAM refuses it.
 #   * fanPressure lost its fan curve and direction and wrote p0 as `inletValue`: brae refused its own output ("has no
 #     `fanCurve` entry") and OpenFOAM stopped ("Required entry 'p0' missing"). brae also refused OpenFOAM's own output,
@@ -38,8 +38,10 @@
 #             5e-4 (T written without psi, its default) and from its own both reach 1e-3 within 1e-8 of OpenFOAM's
 #             restart from the same directory (measured 4.5e-11 and 1.2e-10).
 #   CONTROLS  each arm's file as brae wrote it before (p0 as `inletValue`; phi `calculated` on the symmetry patch;
-#             T's psi read as none): OpenFOAM refuses it and brae refuses it by name -- so the arms pass because the
-#             entries are there, not for another reason.
+#             T's psi read as none): OpenFOAM refuses it -- so the arms pass because the entries are there, not for
+#             another reason. brae refuses the uniformTotalPressure and fanPressure ones by name (their table and curve
+#             are not in the file), and the psi none one; a plain totalPressure spelled that way it reads as p0 with a
+#             notice (the value is p0's) and must continue exactly as from the same file spelled `p0` (wab, rtp).
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
@@ -92,6 +94,24 @@ refused()
     if [ "$(cat "$2/rc")" != 0 ] && grep -q "$4" "$2/log.brae"
     then ok "control $1: brae refuses it by name ($4)"
     else fail "control $1: brae did not refuse it with '$4'"; fi
+}
+# legacy <name> <dir> <restart from brae's p0 spelling> <time> <fields...>: (OpenFOAM's run in <dir>_of) a totalPressure whose p0 is spelled
+# `inletValue`, as brae wrote it before 2026-11-19. OpenFOAM refuses it; brae reads it as p0 with a notice and must
+# continue exactly as from the same file with `p0`, and write the key `p0` back
+legacy()
+{
+    local n=$1 d=$2 ref=$3 t=$4; shift 4
+    if [ "$(cat "${d}_of/rc.of")" != 0 ] && grep -q "Required entry 'p0' missing" "${d}_of/log.of"
+    then ok "control $n: OpenFOAM stops on it (Required entry 'p0' missing)"
+    else fail "control $n: OpenFOAM did not stop with 'Required entry 'p0' missing'"; fi
+    if [ "$(cat "$d/rc")" = 0 ] && grep -q "its p0 under \`inletValue\`" "$d/log.brae"
+    then ok "control $n: brae reads it as p0, with a notice"
+    else fail "control $n: brae did not read it with the notice"; fi
+    within "control $n: brae from it against brae from the same file with p0, at $t" \
+        "$(python3 "$H" fields "$d/$t" "$ref/$t" "$@" 2>/dev/null)" 0
+    if [ -n "$(python3 "$H" entry "$d/$t/p" "$P" p0)" ]
+    then ok "control $n: brae's next write spells it p0"
+    else fail "control $n: brae's next write has no p0"; fi
 }
 # within <name> <value> <bound>
 within() { if le "$2" "$3"; then ok "$1: $2 (bound $3)"; else fail "$1: $2 above the bound $3"; fi; }
@@ -181,8 +201,8 @@ if [ "$(cat "$W/wab_oldphi/rc.of")" != 0 ] && grep -q "inconsistent patch and pa
 then ok "control wab, phi calculated on the symmetry patch: OpenFOAM stops on it (inconsistent patch and patchField types)"
 else fail "control wab, phi calculated on the symmetry patch: OpenFOAM did not stop"; fi
 restartdir "$W/wab_old" "$W/wab_case" "$W/wab_b/401"; python3 "$H" oldp0 "$W/wab_old/401/p" outlet
-brae "$W/wab_old"; ofrun "$W/wab_old" simpleFoam
-refused "wab, p0 as inletValue" "$W/wab_old" "Required entry 'p0' missing" "with no \`p0\` entry"
+cp -r "$W/wab_old" "$W/wab_old_of"; brae "$W/wab_old"; ofrun "$W/wab_old_of" simpleFoam
+P=outlet legacy "wab, p0 as inletValue" "$W/wab_old" "$W/wab_b_from_b" 402 U p k epsilon nut
 
 # ---- rtp: rhoSimpleFoam, inlet totalPressure ----------------------------------------------------------------------------
 mkdir "$W/rtp_case" && cp -r "$ROOT/validation/rhoTP/"{constant,system,0.orig} "$W/rtp_case/" && cp -r "$W/rtp_case/0.orig" "$W/rtp_case/0"
@@ -209,8 +229,8 @@ echo "info rtp: the default driver from its 1 against its uninterrupted run at 2
 restartdir "$W/rtp_of_from_of" "$W/rtp_case" "$W/rtp_of/1"; ofrun "$W/rtp_of_from_of" rhoSimpleFoam
 echo "info rtp: OpenFOAM from its 1 against its uninterrupted run at 2: $(python3 "$H" fields "$W/rtp_of_from_of/2" "$W/rtp_of/2" U p T)"
 restartdir "$W/rtp_old" "$W/rtp_case" "$W/rtp_b/1"; python3 "$H" oldp0 "$W/rtp_old/1/p" inlet
-brae "$W/rtp_old"; ofrun "$W/rtp_old" rhoSimpleFoam
-refused "rtp, p0 as inletValue" "$W/rtp_old" "Required entry 'p0' missing" "with no \`p0\` entry"
+cp -r "$W/rtp_old" "$W/rtp_old_of"; brae "$W/rtp_old"; ofrun "$W/rtp_old_of" rhoSimpleFoam
+P=inlet legacy "rtp, p0 as inletValue" "$W/rtp_old" "$W/rtp_b_from_b" 2 U p T
 
 # ---- duct: rhoCentralFoam, totalPressure (psi form) + totalTemperature inlet, waveTransmissive outlet -------------------
 RCF="$TUT/compressible/rhoCentralFoam"
