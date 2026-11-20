@@ -104,6 +104,7 @@ set(BRAE_SMOKE_TESTS
     fvm_laplacian
     fvoptions_cpp
     gamg
+    gate_record_selftest
     gate_registration
     generalized_newtonian
     gpu_amg
