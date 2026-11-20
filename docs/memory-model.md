@@ -4,6 +4,8 @@ Why brae lays out its data the way it does, answering the two questions that com
 memory pool instead of pinned memory or `thrust` vectors?* and *why keep OpenFOAM's LDU matrix instead of
 converting to CSR for cuSPARSE?*
 
+![Where brae keeps a run's data: the mesh, fields, LDU matrices, the pressure AMG, the Gauss-Seidel schedule and the device pool in GPU memory; the case, the time directories, the pinned mailboxes and the AMG cache on the CPU side](images/memory-layout.png)
+
 ## Summary
 
 | concern | brae's choice | why |

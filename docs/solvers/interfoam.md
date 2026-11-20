@@ -5,7 +5,7 @@ v2412's `interFoam`: the PIMPLE loop, the MULES / CMULES alpha transport, the mo
 pressure correctors and the turbulence transport run on the GPU. Boundary conditions on some patches, mesh
 refinement and file output run on the host.
 
-[<- back to all solvers](../../README.md#-will-it-run-my-case)
+[<- back to all solvers](../../README.md#solvers)
 
 You do not run it by name: a case whose `controlDict` says `application interFoam` is handed to it by `brae`.
 
