@@ -33,7 +33,8 @@ jobs:
           nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv,noheader
 
       - name: Configure
-        run: cmake -B build -DCMAKE_CUDA_ARCHITECTURES=native
+        # the test suite is built only on request (BRAE_BUILD_TESTS, CMakeLists.txt)
+        run: cmake -B build -DCMAKE_CUDA_ARCHITECTURES=native -DBRAE_BUILD_TESTS=ON
 
       - name: Build
         # -j WITH A NUMBER, for the reason ci.yml spells out: a bare `-j` is unbounded and each nvcc

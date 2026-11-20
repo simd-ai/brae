@@ -155,7 +155,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES="$arch" || 
 # row cannot repeat it.
 SOLVERS=$(sed -n 's/.*{"[A-Za-z]*", *"\(brae[A-Za-z_]*\)".*/\1/p' \
           src/applications/solvers/common/solver_dispatch.cuh | sort -u)
-[ -n "$SOLVERS" ] || SOLVERS="brae brae_pimpleFoam brae_rhoSimpleFoam brae_interFoam"   # registry unreadable: known set
+[ -n "$SOLVERS" ] || SOLVERS="brae brae_pimpleFoam brae_rhoSimpleFoam brae_interFoam brae_rhoCentralFoam"   # registry unreadable: known set
 say "solvers to build: $(echo $SOLVERS | tr '\n' ' ')"
 
 # ---- parallel compile jobs: bounded by memory as well as by cores ----
@@ -186,7 +186,7 @@ mkdir -p "$BINDIR"
 for b in $SOLVERS; do
     [ -f "build/$b" ] || die "build/$b is missing after a successful build.
   It is in the solver registry (src/applications/solvers/common/solver_dispatch.cuh), so `brae` will try
-  to hand cases to it and fail. Check that CMakeLists.txt still defines the target."
+  to hand cases to it and fail. Check that src/applications/solvers/CMakeLists.txt still defines the target."
     install -m 0755 "build/$b" "$BINDIR/$b" 2>/dev/null || cp "build/$b" "$BINDIR/$b"
     say "installed  $BINDIR/$b"
 done

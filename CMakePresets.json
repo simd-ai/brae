@@ -1,0 +1,56 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": { "major": 3, "minor": 24, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    },
+    {
+      "name": "production",
+      "inherits": "base",
+      "displayName": "brae (the solvers only)",
+      "description": "What a user builds and installs: brae, the four other solvers and brae-agent; no test suite.",
+      "cacheVariables": { "BRAE_BUILD_TESTS": "OFF" }
+    },
+    {
+      "name": "dev",
+      "inherits": "base",
+      "displayName": "brae + the test suite",
+      "description": "Development and CI: the solvers, every ctest gate and unit, and the developer binaries.",
+      "cacheVariables": { "BRAE_BUILD_TESTS": "ON" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "production", "configurePreset": "production" },
+    { "name": "dev", "configurePreset": "dev" }
+  ],
+  "testPresets": [
+    {
+      "name": "gpu-smoke",
+      "configurePreset": "dev",
+      "displayName": "GPU smoke",
+      "description": "Every test but the slow tier and the known-red gates: the suite for frequent integration.",
+      "output": { "outputOnFailure": true },
+      "filter": { "exclude": { "label": "slow|known-red" } }
+    },
+    {
+      "name": "full-validation",
+      "configurePreset": "dev",
+      "displayName": "Full validation",
+      "description": "Every test but the known-red gates, which tools/known_red_check.py holds to their registered FAILs.",
+      "output": { "outputOnFailure": true },
+      "filter": { "exclude": { "label": "known-red" } }
+    },
+    {
+      "name": "known-red",
+      "configurePreset": "dev",
+      "displayName": "Known-red gates as they are",
+      "description": "The known-red gates alone; red is expected. tools/known_red_check.py is what judges them.",
+      "output": { "outputOnFailure": true },
+      "filter": { "include": { "label": "known-red" } }
+    }
+  ]
+}

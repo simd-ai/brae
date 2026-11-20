@@ -10,7 +10,8 @@
 // per-run answer to the second was dict_audit; this is the build-time answer to the first.
 //
 // Three properties, and the third is the one that makes the other two worth anything:
-//   1. REGISTERED  -- the name appears in CMakeLists.txt, so ctest actually runs it.
+//   1. REGISTERED  -- the name appears in a registration file (the root CMakeLists.txt, tests/CMakeLists.txt or
+//                     tests/cmake/*.cmake), so ctest actually runs it.
 //   2. RUNNABLE    -- no path from the retired `cf` project, which cannot resolve on any machine.
 //   3. ASSERTING   -- contains an explicit failure path (exit 1 / sys.exit(1) / a FAIL branch). A gate that
 //                     only prints passes forever and is worse than no gate, because it reads as coverage.
@@ -49,20 +50,41 @@ int main(int argc, char** argv)
     const std::filesystem::path root = (argc > 1) ? argv[1] : ".";
     const std::filesystem::path validation = root / "validation";
     const std::filesystem::path cmakeLists = root / "CMakeLists.txt";
+    const std::filesystem::path testLists = root / "tests" / "CMakeLists.txt";
+    const std::filesystem::path testGroups = root / "tests" / "cmake";
 
-    if (!std::filesystem::is_directory(validation) || !std::filesystem::exists(cmakeLists))
+    if (!std::filesystem::is_directory(validation) || !std::filesystem::exists(cmakeLists)
+        || !std::filesystem::exists(testLists))
     {
-        std::printf("  FAIL cannot find %s or %s -- this test is not looking at the repo it thinks it is\n",
-                    validation.c_str(), cmakeLists.c_str());
+        std::printf("  FAIL cannot find %s, %s or %s -- this test is not looking at the repo it thinks it is\n",
+                    validation.c_str(), cmakeLists.c_str(), testLists.c_str());
         return 1;
+    }
+
+    // The registrations live in the root file (the product), tests/CMakeLists.txt (the suite's entry point) and the
+    // files it includes from tests/cmake/, one per subsystem. A gate wired in any of them is registered.
+    std::vector<std::filesystem::path> registrationFiles = {cmakeLists, testLists};
+    if (std::filesystem::is_directory(testGroups))
+    {
+        std::vector<std::filesystem::path> groups;
+        for (const auto& e : std::filesystem::recursive_directory_iterator(testGroups))
+        {
+            if (e.is_regular_file() && e.path().extension() == ".cmake")
+            {
+                groups.push_back(e.path());
+            }
+        }
+        std::sort(groups.begin(), groups.end());
+        registrationFiles.insert(registrationFiles.end(), groups.begin(), groups.end());
     }
 
     // Only lines that actually WIRE a test count. Matching the whole file matched COMMENTS: the flatplate
     // oracle regenerator is named in a comment and was read as registered, which is the same
     // claimed-but-absent coverage this test exists to catch -- one level further up again.
     std::vector<std::string> wiringLines;
+    for (const std::filesystem::path& f : registrationFiles)
     {
-        std::istringstream in(slurp(cmakeLists));
+        std::istringstream in(slurp(f));
         std::string line;
         while (std::getline(in, line))
         {
@@ -99,7 +121,7 @@ int main(int argc, char** argv)
 
         if (!isRegistered(stem))
         {
-            std::printf("  FAIL %s is not registered in CMakeLists.txt -- ctest never runs it, so it is\n"
+            std::printf("  FAIL %s is not registered in any registration file -- ctest never runs it, so it is\n"
                         "       decoration, not coverage. Register it, or move it to validation/legacy_cf/\n"
                         "       and say in that README which live gate covers the area.\n", n.c_str());
             ++failures;
@@ -134,6 +156,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    std::printf("gate_registration: %d failures over %d gates\n", failures, checked);
+    std::printf("gate_registration: %d failures over %d gates, %zu registration files read\n", failures, checked,
+                registrationFiles.size());
     return failures ? 1 : 0;
 }
