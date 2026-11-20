@@ -20,9 +20,11 @@ If you keep those two in mind, the rest is detail.
 - **Build and test before you open it.** The test suite is built only on request:
   `cmake -B build -DBRAE_BUILD_TESTS=ON && cmake --build build -j 8 && ctest --test-dir build`. Without
   `-DBRAE_BUILD_TESTS=ON` the build makes the solvers alone and `ctest` finds one test, `brae_tests_not_built`, which fails.
-- The hosted build-check (`ci.yml`) compiles every PR for sm_80 and sm_90. The full `ctest` runs on a real GB10
-  (`gpu-test.yml`) after merge to `main`, so a green build-check is necessary but not sufficient. Say in the PR how
-  you validated on a GPU.
+- The hosted build-check (`ci.yml`) compiles and installs everything brae ships, for sm_80, sm_90 and sm_121, on
+  every PR. On a PR from a branch of this repository a real GB10 then runs the `smoke` tier, about ten minutes with
+  the build (`gpu-smoke.yml`, skipped when the change is documentation only); the whole suite runs there nightly
+  and, uncached, before a release (`gpu-full.yml`). A PR from a fork gets the GPU tier once a maintainer has pushed
+  it to a branch here. `docs/ci/branch-rules.md` has the table. Say in the PR how you validated on a GPU.
 - **`tools/ctest_cached.py` runs the suite without repeating what already passed.** It takes ctest's own
   arguments (`tools/ctest_cached.py -j 6`), fingerprints each test's inputs — the code each binary loads, its
   scripts and fixtures — and runs only the tests with no recorded pass for that fingerprint. Change a shared file

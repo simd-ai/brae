@@ -1,18 +1,30 @@
 name: ci
 
-# GitHub-hosted build-check. Compiles brae on every push and pull request to catch build
-# breaks fast and for free. This runs the untrusted-PR-safe checks; the full ctest runs on the
-# self-hosted GB10 (gpu-test.yml). Compiles both code paths: sm_80 (Ampere, cluster intrinsics guarded
-# out) and sm_90 (Hopper, cluster path), so an unguarded cluster feature can't slip in unnoticed.
+# GitHub-hosted build-check, tier 1 of the CI (docs/ci/branch-rules.md). On every push and pull request, without a
+# GPU: compiles and installs everything brae ships -- brae, brae_pimpleFoam, brae_rhoSimpleFoam, brae_interFoam,
+# brae_rhoCentralFoam and brae-agent -- once per supported CUDA architecture, and configures the whole test suite
+# (no build) so a broken registration fails here too. This is the untrusted-PR-safe tier; ctest runs on the
+# self-hosted GB10 (gpu-smoke.yml before a merge and on main, gpu-full.yml nightly and before a release).
+#
+# One job per architecture: sm_80 (Ampere, cluster intrinsics guarded out), sm_90 (Hopper, the cluster path) and
+# sm_121 (GB10). A job each keeps a runner's memory to one architecture's compiles and runs the three side by side.
 on:
   pull_request:
   push:
     branches: [main]
   workflow_call:        # let release.yml reuse this build-check as a release gate
 
+permissions:
+  contents: read
+
 jobs:
-  build:
+  compile:
+    name: compile (sm_${{ matrix.arch }})
     runs-on: ubuntu-24.04            # x86 host, no GPU: cross-compiles device code, no kernel launch
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [80, 90, 121]
     steps:
       - uses: actions/checkout@v4
 
@@ -20,7 +32,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            cmake libopenmpi-dev openmpi-bin zlib1g-dev libscotch-dev
+            cmake libopenmpi-dev openmpi-bin zlib1g-dev libscotch-dev libcurl4-openssl-dev
+          # libcurl: without it CMake leaves brae-agent out with a status line, and this check went green
+          # without ever compiling it (2026-11-15, df3cd8cb: "libcurl not found -- brae-agent is not built").
 
       - name: Install CUDA 13.0 toolkit
         run: |
@@ -35,20 +49,51 @@ jobs:
           cmake --version | head -1
           /usr/local/cuda/bin/nvcc --version | tail -1
 
-      - name: Configure
-        run: cmake -B build -DCMAKE_CUDA_ARCHITECTURES="80;90"   # quoted: the ; must not be seen by the shell
+      - name: "Configure (the product, test suite off)"
+        run: cmake --preset production -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.arch }}
 
-      - name: Build (compile-check)
+      - name: Build (every shipped binary, compile-check)
         # -j WITH A NUMBER. A bare `-j` is UNBOUNDED: make starts every target the dependency graph has
-        # ready, which here is most of the 101 .cu translation units at once. Each one peaks at 450-610 MB
+        # ready, which here is most of the ~100 .cu translation units at once. Each one peaks at 450-610 MB
         # of RSS under `CMAKE_CUDA_ARCHITECTURES=80;90` (measured: device_simple_foam.cu 566 MB / 10.2 s,
         # simpleFoamV2.cu 608 MB / 12.3 s, device_komega_sst.cu 462 MB), and this runner has 4 vCPU and
         # 16 GB -- so ~26 concurrent compiles exhaust it and the OOM killer SIGTERMs them. That is the
         # `nvcc: Terminated` / `Compilation terminated.` storm with NO compiler diagnostic and exit 143
         # (128 + SIGTERM): a resource failure wearing a build failure's clothes.
-        run: cmake --build build -j "$(nproc)" --target brae
+        # No --target: with the test suite off (BRAE_BUILD_TESTS, default OFF) the default target is the product.
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Install and check the set
+        # brae execs brae_<solver> and brae-agent from beside itself, so a set missing one fails at the moment work
+        # arrives rather than here (cmake/BraeInstall.cmake has the history).
+        run: |
+          cmake --install build --prefix "$RUNNER_TEMP/brae"
+          for exe in brae brae-agent brae_pimpleFoam brae_rhoSimpleFoam brae_interFoam brae_rhoCentralFoam; do
+              test -x "$RUNNER_TEMP/brae/bin/$exe" || { echo "::error::$exe was not installed"; exit 1; }
+          done
+          ls -l "$RUNNER_TEMP/brae/bin"
+
+      - name: Configure the test suite (no build)
+        # Every registration in tests/ is read and checked by CMake: a test named twice, a property on a test that
+        # does not exist or a missing script directory fails here, on a PR, before the GPU tier.
+        run: |
+          cmake --preset dev -B build-tests -DCMAKE_CUDA_ARCHITECTURES=${{ matrix.arch }} > build-tests.log 2>&1 \
+              || { tail -n 40 build-tests.log; exit 1; }
+          ctest --test-dir build-tests -N | tail -n 1
+          n=$(ctest --test-dir build-tests -N | sed -n 's/^Total Tests: //p')
+          [ "${n:-0}" -gt 1 ] || { echo "::error::the test suite registered ${n:-no} tests"; exit 1; }
 
       - name: Known-red check (self-test, no GPU)
-        # tools/known_red_check.py is what the GB10 CI holds the six known-red rhoCentralFoam gates to (gpu-test.yml);
+        # tools/known_red_check.py is what the GB10 CI holds the six known-red rhoCentralFoam gates to (gpu-full.yml);
         # its self-test checks that registry and expectations agree and that it fails on every kind of departure
         run: python3 tools/known_red_check.py --selftest
+
+  # The one check name branch rules require (docs/ci/branch-rules.md): green only when every architecture compiled.
+  build:
+    needs: compile
+    if: ${{ always() }}
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Every architecture compiled
+        run: |
+          [ "${{ needs.compile.result }}" = success ] || { echo "::error::compile: ${{ needs.compile.result }}"; exit 1; }

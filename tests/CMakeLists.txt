@@ -35,6 +35,8 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/solver_rhocentralfoam.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/solver_interfoam.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/repository.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/developer.cmake)
+# Which tests each CI tier runs (labels only; it registers nothing)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/tiers.cmake)
 
 # CI robustness: every MPI test is `mpirun -np N ..._npN`. Without PROCESSORS, `ctest -jK` treats each as a single
 # slot and launches many concurrently -> on the self-hosted SINGLE-GPU runner that oversubscribes the GPU/CPU with
