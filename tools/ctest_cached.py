@@ -348,8 +348,9 @@ def fingerprint(test, closure, inputs, machine, globalEnv, explain=None):
         elif os.path.isdir(path) and not closure.inBuild(path):
             real = os.path.realpath(path)
             if real == repo:
-                # a test handed the whole tree (the registration audit): the sources and the test set
-                for part in ('CMakeLists.txt', 'src', 'tests', 'tools'):
+                # a test handed the whole tree (the registration audit): the sources, the build description and the
+                # test set
+                for part in ('CMakeLists.txt', 'cmake', 'src', 'tests', 'tools'):
                     take(os.path.join(repo, part))
             elif closure.inRepo(real):
                 trees.add(real)
