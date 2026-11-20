@@ -1,0 +1,225 @@
+# brae_core, the solver library every executable links, and the executables built from src/.
+
+# ---------------------------------------------------------------------------
+# brae_core, Phase 1 substrate (comm seam + interfaces). Grows as modules land.
+# ---------------------------------------------------------------------------
+add_library(brae_core STATIC
+    functionObjects/forces_device.cu
+    parallel/pstream/cf_pstream.cu
+    parallel/pstream/device_halo.cu
+    parallel/pstream/device_reduce.cu
+    OpenFOAM/meshes/interface/processor_interface.cu
+    OpenFOAM/db/foam_token_reader.cu
+    OpenFOAM/db/dynamicLibrary/codedBase/coded_library.cu
+    OpenFOAM/primitives/functions/Function1/Coded/codedFunction1.cu
+    meshTools/PatchFunction1/CodedField/codedPatchFunction1.cu
+    finiteVolume/expressions/PatchFunction1/patchExprFunction1.cu
+    OpenFOAM/meshes/primitive_mesh.cu
+    finiteVolume/fvMesh/fv_geometry.cu
+    finiteVolume/fvMesh/device_fv_geometry.cu
+    finiteVolume/fvMesh/fv_patch.cu
+    finiteVolume/fvMesh/fvPatches/constraint/cyclicACMI/cyclic_acmi_cpp.cu
+    OpenFOAM/decompose/scotch_decomposition.cu
+    OpenFOAM/decompose/domain_decomposition.cu
+    TurbulenceModels/turbulenceModels/derivedFvPatchFields/wallFunctions/nut_wall_function.cu
+    finiteVolume/finiteVolume/fvc.cu
+    finiteVolume/finiteVolume/fvm.cu
+    OpenFOAM/matrices/ldu_spmv.cu
+    OpenFOAM/matrices/pcg.cu
+    OpenFOAM/matrices/gamg.cu
+    OpenFOAM/matrices/pbicgstab.cu
+    OpenFOAM/matrices/pbicg.cu
+    meshTools/AMIInterpolation/faceAreaWeightAMI/face_area_weight_ami_cpp.cu
+    finiteVolume/fvMesh/fvPatches/constraint/cyclicAMI/cyclic_ami_cpp.cu
+    OpenFOAM/matrices/smooth_solver_cpp.cu
+    matrices/lduMatrix/solvers/GAMG/GAMGAgglomerations/pair_gamg_agglomeration_cpp.cu
+    matrices/lduMatrix/solvers/GAMG/gamg_solver_cpp.cu
+    meshTools/solidBodyMotionFunctions/solid_body_motion_function_cpp.cu
+    OpenFOAM/meshes/meshShapes/face/face_cpp.cu
+    OpenFOAM/meshes/primitiveMesh/PrimitivePatch/primitive_patch_cpp.cu
+    meshTools/cellDist/patchWave/patch_wave_cpp.cu
+    meshTools/cellDist/patchWave/device_patch_wave.cu
+    OpenFOAM/meshes/primitiveMesh/edges/mesh_edges_cpp.cu
+    OpenFOAM/meshes/polyMesh/mapPolyMesh/map_poly_mesh_cpp.cu
+    OpenFOAM/meshes/polyMesh/polyTopoChange/poly_topo_change_cpp.cu
+    OpenFOAM/meshes/primitiveMesh/cellCells/mesh_cell_cells_cpp.cu
+    dynamicMesh/polyTopoChange/removeFaces/remove_faces_cpp.cu
+    dynamicMesh/polyTopoChange/hexRef8/hex_ref8_cpp.cu
+    dynamicFvMesh/dynamicRefineFvMesh/dynamic_refine_fv_mesh_cpp.cu
+    applications/solvers/interFoam/inter_amr_cpp.cu
+    dynamicMesh/pointPatchDist/point_patch_dist_cpp.cu
+    rigidBodyDynamics/rigid_body_motion_cpp.cu
+    rigidBodyMeshMotion/rigid_body_mesh_motion_cpp.cu
+    meshTools/twoDPointCorrector/two_d_point_corrector_cpp.cu
+    finiteVolume/interpolation/volPointInterpolation/vol_point_interpolation_cpp.cu
+    finiteVolume/interpolation/volPointInterpolation/point_constraints_cpp.cu
+    waveModels/derivedPointPatchFields/waveMaker/wave_maker_point_patch_vector_field_cpp.cu
+    fvMotionSolver/fvMotionSolvers/displacement/laplacian/displacement_laplacian_fv_motion_solver_cpp.cu
+    fvMotionSolver/fvMotionSolvers/displacement/laplacian/device_displacement_laplacian_assembly.cu
+    fvMotionSolver/fvMotionSolvers/componentVelocity/laplacian/velocity_component_laplacian_fv_motion_solver_cpp.cu
+    dynamicFvMesh/dynamicMotionSolverFvMesh/dynamic_motion_solver_fv_mesh_cpp.cu
+    dynamicFvMesh/dynamicMotionSolverFvMesh/device_swept_volumes.cu
+    matrices/lduMatrix/lduMatrix/blas1.cu
+    matrices/lduMatrix/lduMatrix/reductions.cu
+    matrices/lduMatrix/lduMatrix/device_spmv.cu
+    matrices/lduMatrix/preconditioners/DILUPreconditioner/device_dilu.cu
+    TurbulenceModels/turbulenceModels/linearViscousStress/linearViscousStress_cpp.cu
+    TurbulenceModels/turbulenceModels/laminar/generalizedNewtonian/generalizedNewtonian_cpp.cu
+    TurbulenceModels/turbulenceModels/laminar/generalizedNewtonian/generalizedNewtonian.cu
+    TurbulenceModels/turbulenceModels/RAS/kOmegaSST/kOmegaSST_cpp.cu
+    TurbulenceModels/turbulenceModels/RAS/kOmegaSSTLM/kOmegaSSTLM_cpp.cu
+    TurbulenceModels/turbulenceModels/RAS/realizableKE/realizableKE_cpp.cu
+    TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon_cpp.cu
+    TurbulenceModels/turbulenceModels/LES/LESdeltas/les_delta_cpp.cu
+    TurbulenceModels/turbulenceModels/LES/kEqn/les_kEqn_cpp.cu
+    TurbulenceModels/turbulenceModels/LES/kEqn/device_les_keqn.cu
+    TurbulenceModels/turbulenceModels/RAS/kEpsilon/kEpsilon.cu
+    TurbulenceModels/turbulenceModels/RAS/SpalartAllmaras/SpalartAllmaras_cpp.cu
+    finiteVolume/cfdTools/general/fvOptions/fvOptions_cpp.cu
+    finiteVolume/cfdTools/general/fvOptions/rotorDiskSource_cpp.cu
+    finiteVolume/cfdTools/general/fvOptions/actuationDiskSource_cpp.cu
+    finiteVolume/cfdTools/general/bound/bound_cpp.cu
+    finiteVolume/cfdTools/general/bound/bound_report.cu
+    OpenFOAM/db/IOstreams/io_precision.cu
+    finiteVolume/cfdTools/general/fvOptions/limit_temperature_report.cu
+    TurbulenceModels/turbulenceModels/turbulenceModel/turbulence_transport.cu
+    TurbulenceModels/turbulenceModels/RAS/kOmegaSST/kOmegaSST.cu
+    TurbulenceModels/compressible/compressibleRAS_cpp.cu
+    TurbulenceModels/compressible/compressibleRAS.cu
+    finiteVolume/cfdTools/general/MRF/MRF_cpp.cu
+    finiteVolume/cfdTools/general/MRF/device_MRF.cu
+    finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedSchemes_cpp.cu
+    finiteVolume/finiteVolume/gradSchemes/limitedGradSchemes/cellLimitedGrad_cpp.cu
+    applications/solvers/simpleFoam/UEqn_cpp.cu
+    applications/solvers/simpleFoam/UEqn.cu
+    applications/solvers/simpleFoam/pEqn.cu
+    applications/solvers/simpleFoam/simpleFoam.cu
+    applications/solvers/simpleFoam/simpleFoamV2.cu
+    applications/solvers/simpleFoam/pEqn_cpp.cu
+    applications/solvers/simpleFoam/createFields_cpp.cu
+    applications/solvers/interFoam/inter_driver_cpp.cu
+    applications/solvers/interFoam/inter_writer_cpp.cu
+    applications/solvers/interFoam/inter_case_cpp.cu
+    applications/solvers/interFoam/inter_cn_restart.cu
+    applications/solvers/interFoam/inter_turbulence_cpp.cu
+    applications/solvers/interFoam/inter_waves_cpp.cu
+    waveModels/waveModel/wave_model_cpp.cu
+    waveModels/waveGenerationModels/base/wave_generation_bases_cpp.cu
+    waveModels/waveGenerationModels/derived/StokesI/stokes_i_wave_model_cpp.cu
+    waveModels/waveGenerationModels/derived/StokesII/stokes_ii_wave_model_cpp.cu
+    waveModels/waveGenerationModels/derived/StokesV/stokes_v_wave_model_cpp.cu
+    waveModels/waveGenerationModels/derived/cnoidal/cnoidal_wave_model_cpp.cu
+    waveModels/waveGenerationModels/derived/streamFunction/stream_function_wave_model_cpp.cu
+    waveModels/waveGenerationModels/derived/irregularMultiDirectional/irregular_multi_directional_wave_model_cpp.cu
+    waveModels/waveGenerationModels/derived/Boussinesq/boussinesq_wave_model_cpp.cu
+    waveModels/waveGenerationModels/derived/Grimshaw/grimshaw_wave_model_cpp.cu
+    waveModels/waveGenerationModels/derived/McCowan/mccowan_wave_model_cpp.cu
+    waveModels/waveAbsorptionModels/derived/shallowWaterAbsorption/shallow_water_absorption_cpp.cu
+    transportModels/interfaceProperties/device_interface_properties.cu
+    transportModels/twoPhaseMixture/device_two_phase_mixture.cu
+    transportModels/interfaceProperties/interface_properties_cpp.cu
+    applications/solvers/interFoam/inter_solve_cpp.cu
+    applications/solvers/interFoam/inter_set_rdeltat_cpp.cu
+    finiteVolume/finiteVolume/fvc/fvcSmooth/fvc_smooth_cpp.cu
+    finiteVolume/finiteVolume/fvc/fvcSmooth/device_fvc_smooth.cu
+    applications/solvers/interFoam/inter_peqn_cpp.cu
+    applications/solvers/interFoam/inter_correct_phi_cpp.cu
+    finiteVolume/fvMatrices/solvers/MULES/mules_cpp.cu
+    finiteVolume/fvMatrices/solvers/MULES/device_mules.cu
+    applications/solvers/interFoam/alpha_eqn_cpp.cu
+    applications/solvers/interFoam/device_alpha_flux.cu
+    applications/solvers/interFoam/device_alpha_step.cu
+    applications/solvers/interFoam/device_alpha_presolve.cu
+    applications/solvers/interFoam/device_alpha_subcycle.cu
+    finiteVolume/finiteVolume/device_fvc_reconstruct.cu
+    applications/solvers/interFoam/device_inter_ueqn.cu
+    applications/solvers/interFoam/device_inter_peqn.cu
+    applications/solvers/interFoam/device_inter_alpha_step.cu
+    finiteVolume/cfdTools/general/device_alpha_courant.cu
+    applications/solvers/interFoam/device_inter_pressure_step.cu
+    applications/solvers/interFoam/device_inter_pcorr_solve.cu
+    applications/solvers/interFoam/device_inter_step.cu
+    applications/solvers/interFoam/device_inter_turbulence.cu
+    applications/solvers/interFoam/inter_driver_device.cu
+    applications/solvers/interFoam/inter_ueqn_cpp.cu
+    finiteVolume/finiteVolume/ddtSchemes/CrankNicolsonDdtScheme/crank_nicolson_ddt_scheme_cpp.cu
+    finiteVolume/finiteVolume/ddtSchemes/CrankNicolsonDdtScheme/device_crank_nicolson_ddt.cu
+    applications/solvers/rhoSimpleFoam/rhoCreateFields_cpp.cu
+    applications/solvers/rhoSimpleFoam/rhoUEqn_cpp.cu
+    applications/solvers/rhoSimpleFoam/rhoUEqn.cu
+    applications/solvers/rhoSimpleFoam/rhoPEqn.cu
+    applications/solvers/rhoSimpleFoam/rhoEEqn.cu
+    applications/solvers/rhoSimpleFoam/rhoPcEqn.cu
+    applications/solvers/rhoSimpleFoam/rhoSimpleFoam.cu
+    applications/solvers/rhoSimpleFoam/rhoCreateFields.cu
+    applications/solvers/rhoSimpleFoam/rhoThermoDevice.cu
+    applications/solvers/rhoSimpleFoam/rhoEEqn_cpp.cu
+    applications/solvers/rhoSimpleFoam/rhoPEqn_cpp.cu
+    applications/solvers/rhoSimpleFoam/rhoPcEqn_cpp.cu
+    applications/solvers/rhoSimpleFoam/rhoSimpleFoam_cpp.cu
+    applications/solvers/rhoSimpleFoam/rhoSimpleFoamDriver_cpp.cu
+    applications/solvers/rhoSimpleFoam/rhoTurbulenceHook.cu
+    applications/solvers/rhoSimpleFoam/rhoSimpleFoamDriver.cu
+    applications/solvers/simpleFoam/simpleFoam_cpp.cu
+    finiteVolume/cfdTools/general/solutionControl/simpleControl/simpleControl_cpp.cu
+    matrices/lduMatrix/solvers/PCG/device_pcg.cu
+    matrices/lduMatrix/solvers/PBiCG/device_pbicg.cu
+    cuda/device_fvc.cu
+    cuda/device_fvm.cu
+    cuda/device_simple.cu
+    cuda/device_deferred_correction.cu
+    cuda/device_boundary_assembly.cu
+    cuda/device_boundary_flow.cu
+    cuda/device_divdevreff.cu
+    cuda/device_maxwell.cu
+    cuda/device_ddt.cu
+    cuda/device_kepsilon.cu
+    cuda/device_spalart.cu
+    cuda/device_komega_sst.cu
+    cuda/device_smagorinsky.cu
+    cuda/device_deshybrid.cu
+    cuda/device_generalized_newtonian.cu
+    cuda/device_coded_bc.cu
+    cuda/device_energy.cu
+    thermophysicalModels/device_thermo.cu
+    finiteVolume/cfdTools/MRF/device_mrf.cu
+    finiteVolume/cfdTools/fvOptions/device_fvoptions.cu
+    finiteVolume/cfdTools/fvOptions/rotor_disk.cu
+    finiteVolume/cfdTools/fvOptions/actuation_disk.cu
+    finiteVolume/fvMatrices/cyclicAMI/cyclicAMI_cpp.cu
+    matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg.cu
+    matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_cache.cu
+    matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_coarse.cu
+    matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_smoothers.cu
+    matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_gauss_seidel.cu
+    matrices/lduMatrix/smoothers/symGaussSeidel/device_sym_gauss_seidel.cu
+    matrices/lduMatrix/smoothers/GaussSeidel/device_colour_gauss_seidel.cu
+    matrices/lduMatrix/preconditioners/GAMGPreconditioner/device_amg_vcycle.cu
+    matrices/lduMatrix/solvers/PCG/device_amg_pcg.cu
+    matrices/lduMatrix/solvers/GAMG/device_gamg_solver.cu
+    cuda/device_cluster.cu
+    cuda/device_cyclic.cu
+    cuda/device_ami.cu
+    applications/solvers/simpleFoam/device_simple_foam.cu
+)
+target_include_directories(brae_core PUBLIC ${BRAE_HEADER_DIRS} ${MPI_CXX_INCLUDE_DIRS} ${SCOTCH_INCLUDE_DIR})
+# Link MPI libraries directly (not the imported target) so its CXX compile flags do not
+# reach nvcc, which would reject them.
+target_link_libraries(brae_core PUBLIC ${MPI_CXX_LIBRARIES} ${SCOTCH_LIBRARY} ${SCOTCH_ERR_LIBRARY} ZLIB::ZLIB CUDA::nvrtc CUDA::cuda_driver)
+# dlopen/dlsym for the run-time-compiled coded Function1 (codedFunction1.cu).
+target_link_libraries(brae_core PUBLIC ${CMAKE_DL_LIBS})
+# OpenMP runtime (libgomp) linked directly, like MPI above, the imported target's CXX compile flags would reach nvcc.
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(brae_core PUBLIC ${OpenMP_CXX_LIBRARIES})
+endif()
+
+# The NVSHMEM device transport, when cmake/BraeDependencies.cmake found it.
+if(BRAE_WITH_NVSHMEM)
+    target_include_directories(brae_core PUBLIC ${NVSHMEM_INCLUDE_DIR})
+    target_link_libraries(brae_core PUBLIC ${NVSHMEM_HOST_LIB})
+    target_compile_definitions(brae_core PUBLIC BRAE_WITH_NVSHMEM)
+endif()
+
+# The solvers, then the node agent (whose target `brae` depends on).
+add_subdirectory(applications/solvers)
+add_subdirectory(node)
