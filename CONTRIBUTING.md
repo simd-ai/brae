@@ -6,8 +6,9 @@ back to the CPU between iterations. Everything below exists to protect that prop
 
 Two rules override every other preference in this document:
 
-1. **No regressions.** `ctest` is 158/158 green and must stay green. Numerical changes are validated **cell-by-cell
-   against OpenFOAM v2412**, not eyeballed. If your change is meant to be a no-op, prove it is bit-identical.
+1. **No regressions.** The `ctest` suite must stay green; the few `known-red` gates are held to exactly their
+   registered failures. Numerical changes are validated **cell-by-cell against OpenFOAM v2412**, not eyeballed. If
+   your change is meant to be a no-op, prove it is bit-identical.
 2. **Faster than OpenFOAM on the CPU, always.** Brae exists to beat a multi-core CPU OpenFOAM run on the same case.
    A change that makes brae slower, or that only wins on a microbenchmark but loses in the real solver, does not
    merge. Speed is a review gate, not a nice-to-have.
