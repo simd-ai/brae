@@ -63,7 +63,7 @@ Type `brae`. It reads the `application` entry in your `controlDict` and runs the
 | [`pimpleFoam`](docs/solvers/pimplefoam.md) | transient incompressible: URANS, DES, LES | pitzDaily kOmegaSST, U within 0.07 % at t = 0.3 s |
 | [`rhoSimpleFoam`](docs/solvers/rhosimplefoam.md) | steady compressible, subsonic and transonic | 5 tutorials as shipped, worst field 5.5e-10 after one iteration |
 | [`interFoam`](docs/solvers/interfoam.md) | two-phase VoF: laminar, RAS, LES, moving and refining meshes, waves | all 42 tutorials run to their end time; steps held to serial OpenFOAM field by field |
-| [`rhoCentralFoam`](src/applications/solvers/rhoCentralFoam/RELEASE.md) (**experimental**) | transient compressible, density-based (Kurganov/Tadmor central-upwind): inviscid, laminar, kOmegaSST | the seven v2412 tutorials as shipped, every field at every write; 13 gates, 1,122 checks pass, 24 registered open checks on staged variants |
+| [`rhoCentralFoam`](src/applications/solvers/rhoCentralFoam/RELEASE.md) (**experimental**) | transient compressible, density-based (Kurganov/Tadmor central-upwind): inviscid, laminar, kOmegaSST | the seven v2412 tutorials as shipped, every field at every write; 14 gates, every check passing but 24 registered open checks on staged variants |
 
 <details>
 <summary><b>Support matrix</b>: turbulence, thermo, schemes, boundary conditions, fvOptions</summary>
