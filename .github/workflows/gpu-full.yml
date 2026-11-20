@@ -1,26 +1,44 @@
-name: gpu-test
+name: gpu-full
 
-# Full ctest on the self-hosted GB10 (Grace-Blackwell, sm_121).
-# SECURITY: a self-hosted runner must never execute untrusted code, so this runs ONLY on
-# pushes to main and manual dispatch, never on pull requests from forks. Keep untrusted PRs
-# on the GitHub-hosted build-check (ci.yml) instead.
+# Tiers 3 and 4 of the CI (docs/ci/branch-rules.md): the whole ctest suite on the self-hosted GB10 (Grace-Blackwell,
+# sm_121), `slow` included. Nightly on main and by hand, leaving out what already passed on the same inputs; before
+# a release (release.yml calls it with no_cache) every test runs, whatever passed before. Then the known-red gates,
+# which must fail exactly as registered. Pull requests and pushes to main run the short tier (gpu-smoke.yml).
+#
+# Measured: the GB10's run of main 2b26cdd6 on 2026-11-20 (gpu-test.yml, the same selection, -j4) ran 805 tests
+# in 2 h 41 min with 105 held from earlier runs; 33,096 s of test time in all.
+#
+# SECURITY: a self-hosted runner must never execute untrusted code, so this runs ONLY on the schedule (which
+# GitHub runs on the default branch), on manual dispatch and from release.yml (a pushed tag), never on a pull
+# request.
 on:
-  push:
-    branches: [main]
+  schedule:
+    - cron: '0 1 * * *'   # 01:00 UTC, 02:00 on the GB10's clock (CET), when nobody is working on it
   workflow_dispatch:
     inputs:
       no_cache:
         description: 'Run every test, whatever passed before (do this before a release tag)'
         type: boolean
         default: false
+  workflow_call:
+    inputs:
+      no_cache:
+        description: 'Run every test, whatever passed before'
+        type: boolean
+        default: true
 
-# One GPU job at a time (kernels would contend for the single device).
+permissions:
+  contents: read
+
+# One full run at a time: one that arrives while another is in progress waits instead of cancelling it (GitHub
+# keeps one waiting run per group, the newest).
 concurrency:
-  group: gpu-test
+  group: gpu-full
   cancel-in-progress: false
 
 jobs:
   ctest:
+    name: gpu-full
     runs-on: [self-hosted, ARM64]        # matches the GB10 runner (self-hosted, Linux, ARM64)
     steps:
       - uses: actions/checkout@v4
@@ -33,22 +51,22 @@ jobs:
           nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv,noheader
 
       - name: Configure
-        # the test suite is built only on request (BRAE_BUILD_TESTS, CMakeLists.txt)
-        run: cmake -B build -DCMAKE_CUDA_ARCHITECTURES=native -DBRAE_BUILD_TESTS=ON
+        run: cmake --preset dev -DCMAKE_CUDA_ARCHITECTURES=native   # the test suite is off by default
 
       - name: Build
         # -j WITH A NUMBER, for the reason ci.yml spells out: a bare `-j` is unbounded and each nvcc
         # peaks at ~0.5 GB. This job builds ALL targets, so it has more TUs in flight than the
         # compile-check does, and the same OOM is one busy runner away.
-        run: cmake --build build -j "$(nproc)"   # all targets: brae + the ctest unit-test executables
+        run: cmake --build build -j "$(nproc)"   # all targets: the solvers + the ctest executables
 
-      - name: Test (ctest, leaving out what already passed on the same inputs)
+      - name: Test (ctest, leaving out what already passed on the same inputs unless no_cache)
         # tools/ctest_cached.py fingerprints every test's inputs -- the loaded bytes of each binary it runs,
         # its scripts and fixtures, OpenFOAM, the GPU driver -- and hands ctest only the tests with no recorded
         # pass for that fingerprint. The store is in the runner's home, so it outlives this fresh checkout,
         # and a binary rebuilt from unchanged sources keeps its fingerprint (the tool's header has the
         # measurement). A change to shared code still runs everything that links it; only passes are kept.
-        # -LE known-red: a test whose red is understood and decided (CMakeLists.txt says which and why) is left out here
+        # -LE known-red: a test whose red is understood and decided (tests/cmake/ says which and why) is left out
+        # here and judged by the next step. The same selection as `ctest --preset full-validation`.
         run: |
           python3 tools/ctest_cached.py --test-dir build \
               ${{ inputs.no_cache && '--no-cache' || '' }} --output-on-failure -j4 -LE known-red

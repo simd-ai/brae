@@ -1,0 +1,117 @@
+name: gpu-smoke
+
+# Tier 2 of the CI (docs/ci/branch-rules.md): the short GPU tier, on the self-hosted GB10 (Grace-Blackwell, sm_121).
+# The tests labelled `smoke` (tests/cmake/tiers.cmake: 402 that each took at most 5 s, from every group, about three
+# minutes of tests at -j4 after a build of about six), leaving out what already passed on the same inputs. It runs on
+# pull requests from branches of this repository, on every push to main, and by hand. The whole suite runs nightly
+# and, uncached, before a release (gpu-full.yml).
+#
+# A change that touches documentation only (Markdown, docs/, images, LICENSE) skips the GPU job: no test reads
+# those files, and the job then reports success to a required check rather than leaving it pending. Anything else
+# -- code, scripts, CMake, fixtures, workflows -- runs it, and tools/ctest_cached.py decides test by test what the
+# change can reach.
+#
+# SECURITY: a self-hosted runner must never execute untrusted code. A pull request from a FORK gets this job on a
+# GitHub-hosted runner instead, where it checks out nothing and fails, saying what to do: a maintainer reads the
+# change and pushes it to a branch of this repository, whose pull request then runs here. It fails rather than
+# skips because a skipped job counts as passed for a required check. This covers this file only; a fork can bring
+# its own workflow file, which is why the repository must also require approval before any outside contributor's
+# workflow runs (docs/ci/branch-rules.md).
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push to the same pull request supersedes the run in flight; every run on main finishes. The single GB10
+# runner takes one job at a time, so jobs of this tier and of gpu-full.yml queue behind each other on it.
+concurrency:
+  group: gpu-smoke-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    # Reads the diff only, on a GitHub-hosted runner: safe for a fork's pull request too.
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          case "$EVENT" in
+              pull_request) base=$PR_BASE; head=$PR_HEAD ;;
+              push)         base=$PUSH_BEFORE; head=$SHA ;;
+              *)            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
+          # a new branch or a rewritten history has no base to compare with: run the tier
+          if ! git cat-file -e "$base^{commit}" 2>/dev/null || ! git cat-file -e "$head^{commit}" 2>/dev/null; then
+              echo "code=true" >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
+          git diff --name-only "$base" "$head" > changed.txt
+          echo "changed files: $(wc -l < changed.txt)"
+          # documentation only: Markdown anywhere, docs/, images, LICENSE. No test reads any of them.
+          code=$(grep -cvE '\.md$|^docs/|\.(png|jpg|jpeg|gif|svg)$|^LICENSE$' changed.txt || true)
+          if [ "${code:-0}" -gt 0 ]; then
+              echo "$code changed files are not documentation"
+              echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+              echo "documentation only: the GPU tier is not needed"
+              echo "code=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  ctest:
+    name: gpu-smoke   # the check a branch rule requires (docs/ci/branch-rules.md)
+    needs: changes
+    if: ${{ needs.changes.outputs.code == 'true' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'ubuntu-24.04' || fromJSON('["self-hosted", "ARM64"]') }}
+    env:
+      FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+    steps:
+      - name: Fork pull request
+        if: env.FORK == 'true'
+        run: |
+          echo "::error::The GPU tier does not run a fork's code on the self-hosted GB10. A maintainer reads this change and pushes it to a branch of ${GITHUB_REPOSITORY}; that pull request runs gpu-smoke."
+          exit 1
+
+      - uses: actions/checkout@v4
+        if: env.FORK != 'true'
+
+      - name: Toolchain and GPU
+        if: env.FORK != 'true'
+        run: |
+          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"   # ensure nvcc is found even if the runner is a systemd service
+          cmake --version | head -1
+          /usr/local/cuda/bin/nvcc --version | tail -1
+          nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv,noheader
+
+      - name: Configure
+        if: env.FORK != 'true'
+        run: cmake --preset dev -DCMAKE_CUDA_ARCHITECTURES=native   # the test suite is off by default
+
+      - name: Build
+        if: env.FORK != 'true'
+        # -j WITH A NUMBER, for the reason ci.yml spells out: a bare `-j` is unbounded and each nvcc peaks at ~0.5 GB.
+        run: cmake --build build -j "$(nproc)"   # all targets: the solvers + the ctest executables
+
+      - name: Test (the smoke tier, leaving out what already passed on the same inputs)
+        if: env.FORK != 'true'
+        # tools/ctest_cached.py fingerprints every test's inputs -- the loaded bytes of each binary it runs, its
+        # scripts and fixtures, OpenFOAM, the GPU driver -- and hands ctest only the tests with no recorded pass for
+        # that fingerprint. The store is in the runner's home, so it outlives this fresh checkout, and it is shared
+        # with gpu-full.yml: a pass recorded by either tier holds for both. The same selection as
+        # `ctest --preset gpu-smoke`.
+        run: |
+          python3 tools/ctest_cached.py --test-dir build --output-on-failure -j4 -L smoke -LE known-red

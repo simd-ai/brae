@@ -8,12 +8,20 @@ permissions:
   contents: write        # required to create the release
 
 jobs:
-  # Do not release a tag that does not compile: reuse the hosted build-check (sm_80 + sm_90).
+  # Do not release a tag that does not compile: reuse the hosted build-check (every supported architecture).
   build:
     uses: ./.github/workflows/ci.yml
 
+  # ...nor one that was not validated whole: the full GPU suite on the GB10 with the cache off, every test run
+  # whatever passed before, then the known-red gates held to their registered failures (gpu-full.yml). A tag is
+  # pushed by a maintainer, so this runs trusted code on the self-hosted runner.
+  validate:
+    uses: ./.github/workflows/gpu-full.yml
+    with:
+      no_cache: true
+
   publish:
-    needs: build
+    needs: [build, validate]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
