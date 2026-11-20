@@ -31,6 +31,13 @@
 //     w = 0.5 : eps_final = 0.5*epsIn + 0.5*eps0 = 0.5*(epsIn + eps_final(w=1))
 // whereas constraining to the raw eps0 would give eps_final(w=0.5) == eps_final(w=1). The two predictions
 // differ by exactly the amount the blend is worth, so the leg cannot pass for the wrong implementation.
+//
+// 3. THE WALL FUNCTIONS' G0 READS THE STORED WALL nut, AND A CLOSURE HANDED NONE IS REFUSED.
+//    epsilonWallFunction's G0 takes `turbModel.nut(patchi)`, the nut patch values the last correctNut left
+//    (deviceStoredWallNut). Legs 1 and 2 hand the closure what the driver stores before correct() runs. Leg 3
+//    hands it an invalid fixture twice -- no boundary nut, then one value short of the boundary faces -- and
+//    each must be refused by name, not run on a wall nut made again. BRAE_CONTROL_G0_NUT_RECOMPUTED=1 (the
+//    closure makes the wall nut again instead of refusing) turns leg 3 red.
 #include "box_mesh.cuh"
 #include "device_kepsilon.cuh"
 #include "device_mesh.cuh"
@@ -44,6 +51,8 @@
 #include "near_wall_dist.cuh"
 #include <cmath>
 #include <cstdio>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 using namespace brae;
@@ -134,8 +143,13 @@ int main()
         deviceBoundaryNut(dbU.comp[0], dIsWB, dYB, dkIn, dnIn, nu, nutBndStored, KEpsilonCoeffs{});
     }
 
-    // One correct() from the same state, with a chosen grad(U) limiter coefficient and wall weight.
-    auto run = [&](scalar gradULimitK, scalar wallWeight, std::vector<scalar>& kOut, std::vector<scalar>& eOut)
+    // One correct() from the same state, with a chosen grad(U) limiter coefficient, wall weight and stored wall nut.
+    auto run = [&](
+        scalar gradULimitK,
+        scalar wallWeight,
+        const DeviceBuffer<scalar>* nutB,
+        std::vector<scalar>& kOut,
+        std::vector<scalar>& eOut)
     {
         DeviceWallData w = buildDeviceWallData(m, g, fvp, U);
         w.wallW.copyFrom(std::vector<scalar>(nC, wallWeight));
@@ -157,7 +171,7 @@ int main()
                               /*ami*/nullptr, /*cyc*/nullptr, /*nutWall*/0, /*atmZ0*/0.0, /*atmBoundNut*/true,
                               ScalarDdt{}, ScalarDdt{},
                               /*rho*/nullptr, /*muLam*/nullptr, /*rhoBnd*/nullptr, /*nuWallFace*/nullptr,
-                              &nutBndStored, /*muBnd*/nullptr,
+                              nutB, /*muBnd*/nullptr,
                               unlimited, gradULimitK);
         kOut = dk.host();
         eOut = de.host();
@@ -166,8 +180,8 @@ int main()
     // ---- 1. the production gradient must read the named grad(U) coefficient ----
     {
         std::vector<scalar> kUn, eUn, kLim, eLim;
-        run(0.0, 1.0, kUn, eUn);
-        run(1.0, 1.0, kLim, eLim);
+        run(0.0, 1.0, &nutBndStored, kUn, eUn);
+        run(1.0, 1.0, &nutBndStored, kLim, eLim);
         const scalar dk = worst(kUn, kLim);
         scalar scale = 0;
         for (scalar v : kUn) scale = std::fmax(scale, std::fabs(v));
@@ -187,7 +201,7 @@ int main()
         }
         // determinism of the unlimited path, so leg 1's difference is the coefficient and not noise
         std::vector<scalar> kUn2, eUn2;
-        run(0.0, 1.0, kUn2, eUn2);
+        run(0.0, 1.0, &nutBndStored, kUn2, eUn2);
         if (worst(kUn, kUn2) != scalar(0))
         { std::printf("  FAIL the kc = 0 path is not reproducible\n"); ++failures; }
     }
@@ -195,8 +209,8 @@ int main()
     // ---- 2. the epsilon constraint value is the BLENDED epsilon ----
     {
         std::vector<scalar> kFull, eFull, kHalf, eHalf;
-        run(1.0, 1.0, kFull, eFull);   // w = 1: the constraint is eps0 itself
-        run(1.0, 0.5, kHalf, eHalf);   // w = 0.5: it must be halfway from the incoming epsilon
+        run(1.0, 1.0, &nutBndStored, kFull, eFull);   // w = 1: the constraint is eps0 itself
+        run(1.0, 0.5, &nutBndStored, kHalf, eHalf);   // w = 0.5: it must be halfway from the incoming epsilon
         scalar dBlend = 0, dRaw = 0;
         std::size_t n = 0;
         for (label c = 0; c < nC; ++c)
@@ -221,6 +235,43 @@ int main()
             std::printf("  FAIL vacuous: blending changes nothing here (eps_in is too close to eps0), so the\n"
                         "       leg would pass for an implementation that constrained to the raw wall value\n");
             ++failures;
+        }
+    }
+
+    // ---- 3. an invalid stored wall nut is refused, not replaced by a wall nut made again ----
+    {
+        // one value short of the boundary faces: the size check, not only the null check, must see it
+        const std::vector<scalar> stored = nutBndStored.host();
+        const DeviceBuffer<scalar> shortNut(std::vector<scalar>(stored.begin(), stored.end() - 1));
+        const struct
+        {
+            const char* what;
+            const DeviceBuffer<scalar>* nutB;
+            const char* named;
+        } invalid[] = {
+            {"no stored wall nut", nullptr, "handed none"},
+            {"a stored wall nut one value short", &shortNut, "boundary nut values for"},
+        };
+        for (const auto& c : invalid)
+        {
+            std::vector<scalar> kBad;
+            std::vector<scalar> eBad;
+            std::string said;
+            try
+            {
+                run(1.0, 1.0, c.nutB, kBad, eBad);
+            }
+            catch (const std::runtime_error& e)
+            {
+                said = e.what();
+            }
+            std::printf("  %s: %s\n", c.what, said.empty() ? "ran (no refusal)" : said.c_str());
+            if (said.find("stored wall nut") == std::string::npos || said.find(c.named) == std::string::npos)
+            {
+                std::printf("  FAIL the closure ran on %s; its G0 must read the nut patch values the last\n"
+                            "       correctNut left, and refuse by name when it was not handed them\n", c.what);
+                ++failures;
+            }
         }
     }
 

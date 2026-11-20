@@ -105,6 +105,8 @@ class Inputs:
             self.memo = {}
         self.fresh = {}
         self.trees = {}
+        # each tree's file rows, by the same key, so a tree that changes during a run can name its files
+        self.treeRows = {}
         self.embedded = {}
 
     def stamp(self, path):
@@ -154,6 +156,7 @@ class Inputs:
                 rel = os.path.relpath(full, key[0])
                 rows.append('%s %s' % (rel, self.fileHash(full) if byContent else self.stamp(full)))
         self.trees[key] = hashlib.sha256('\n'.join(rows).encode()).hexdigest()
+        self.treeRows[key] = rows
         return self.trees[key]
 
     def save(self):
@@ -438,10 +441,17 @@ def main():
     # the build's executables in one parallel pass: they are most of the bytes
     inputs.hashMany(os.path.join(build, n) for n in closure.exeNames)
 
-    def keysOf(group):
-        return dict((t['name'], fingerprint(t, closure, inputs, machine, globalEnv)) for t in group)
+    def keysOf(group, rowsOut):
+        # rowsOut keeps each test's fingerprint rows, so a test whose inputs move can be told which ones did
+        keys = {}
+        for t in group:
+            rows = []
+            keys[t['name']] = fingerprint(t, closure, inputs, machine, globalEnv, rows)
+            rowsOut[t['name']] = rows
+        return keys
 
-    keys = keysOf(tests)
+    rowsBefore = {}
+    keys = keysOf(tests, rowsBefore)
     inputs.save()
     hashSeconds = time.time() - t0
 
@@ -496,10 +506,13 @@ def main():
     byName = dict((t['name'], t) for t in tests)
     # ...which is asked of the tree as it stands NOW: what this run remembered of directories and scripts
     # is from before the tests ran
+    treeRowsBefore = dict(inputs.treeRows)
     inputs.trees.clear()
+    inputs.treeRows.clear()
     closure.scripts.clear()
     closure.closures.clear()
-    after = keysOf([byName[n] for n in passed if n in byName])
+    rowsAfter = {}
+    after = keysOf([byName[n] for n in passed if n in byName], rowsAfter)
     inputs.save()
     moved = [n for n in passed if after.get(n) != keys.get(n)]
     head = subprocess.run(['git', '-C', repo, 'rev-parse', '--short', 'HEAD'], capture_output=True,
@@ -513,11 +526,42 @@ def main():
             json.dump({'test': n, 'when': time.strftime('%Y-%m-%d %H:%M'), 'head': head}, f)
     print('ctest_cached: ran %d: %d passed, %d did not; %d held from earlier runs'
           % (len(passed) + len(other), len(passed), len(other), len(held)))
+    # Each input that moved, with the tests it moved under: a fixture a test writes into (a cache beside a mesh,
+    # a time directory) names itself here instead of leaving only the list of tests behind.
+    movedInputs = {}
+    for n in moved:
+        changed = set(rowsBefore.get(n, [])) ^ set(rowsAfter.get(n, []))
+        for row in changed:
+            kind, _, rest = row.partition(' ')
+            if kind in ('file', 'tree', 'outside'):
+                movedInputs.setdefault(rest.rsplit(' ', 1)[0], set()).add(n)
     if moved:
         print('ctest_cached: %d passed and are NOT recorded -- their own run changed their inputs: %s'
               % (len(moved), ' '.join(sorted(moved)[:12]) + (' ...' if len(moved) > 12 else '')))
+        for path, names in sorted(movedInputs.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+            shown = os.path.relpath(path, repo) if closure.inRepo(path) else path
+            # a directory: the files in it that were added, removed or rewritten with other bytes
+            inside = []
+            for byContent in (True, False):
+                old = treeRowsBefore.get((path, byContent))
+                new = inputs.treeRows.get((path, byContent))
+                if old is None or new is None:
+                    continue
+                oldFiles = dict(r.rsplit(' ', 1) for r in old)
+                newFiles = dict(r.rsplit(' ', 1) for r in new)
+                for rel in sorted(set(oldFiles) | set(newFiles)):
+                    if rel not in oldFiles:
+                        inside.append(rel + ' (added)')
+                    elif rel not in newFiles:
+                        inside.append(rel + ' (removed)')
+                    elif oldFiles[rel] != newFiles[rel]:
+                        inside.append(rel + ' (changed)')
+            print('ctest_cached:   %s changed during the run%s; it is an input of %d of them (%s)'
+                  % (shown, (': ' + ', '.join(inside[:6]) + (' ...' if len(inside) > 6 else '')) if inside else '',
+                     len(names), ' '.join(sorted(names)[:4]) + (' ...' if len(names) > 4 else '')))
     json.dump({'selected': len(tests), 'held': len(held), 'ran': len(passed) + len(other),
-               'passed': len(passed), 'notPassed': sorted(other), 'notRecorded': sorted(moved)},
+               'passed': len(passed), 'notPassed': sorted(other), 'notRecorded': sorted(moved),
+               'changedInputs': dict((p, sorted(n)) for p, n in sorted(movedInputs.items()))},
               open(os.path.join(build, 'Testing', 'ctest_cached_last.json'), 'w'))
     return run.returncode
 
