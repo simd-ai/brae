@@ -269,7 +269,23 @@ stage()
     cp -r "$MESH/system" "$c/"
     for e in "$MESH"/constant/*
     do
-        [ "$(basename "$e")" = turbulenceProperties ] && cp "$e" "$c/constant/" || ln -s "$e" "$c/constant/"
+        case "$(basename "$e")" in
+            turbulenceProperties)
+                cp "$e" "$c/constant/"
+                ;;
+            polyMesh)
+                # A directory of the case's own with the mesh files linked into it. brae writes its AMG hierarchy
+                # cache (.brae_amgcache) beside the mesh; through a linked polyMesh that write landed in the
+                # fixture, validation/pitzDailySST, and changed the inputs of the 40 tests that read it
+                # (ctest_cached could record none of their passes). The glob leaves out dot files, so a cache
+                # already in the fixture is not read either.
+                mkdir "$c/constant/polyMesh"
+                ln -s "$e"/* "$c/constant/polyMesh/"
+                ;;
+            *)
+                ln -s "$e" "$c/constant/"
+                ;;
+        esac
     done
     if [ "$MODE" = 3d ]
     then
