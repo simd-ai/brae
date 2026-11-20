@@ -16,7 +16,10 @@
 # with INSTALL_RPATH, which is empty by default -- so the first `cmake --install` produced binaries that could
 # not find libnvshmem_host.so.3 and failed for every user, not only under sudo. USE_LINK_PATH carries the
 # directories of the libraries actually linked (NVSHMEM, OpenMPI) into the installed binary.
-foreach(exe IN ITEMS brae brae-agent brae_pimpleFoam)
+# Every solver `brae` dispatches to is in the set: an installed `brae` handed a compressible, a VOF or a
+# density-based case execs brae_rhoSimpleFoam, brae_interFoam or brae_rhoCentralFoam beside it, which the set once
+# left out (install.sh copies the same five).
+foreach(exe IN ITEMS brae brae-agent brae_pimpleFoam brae_rhoSimpleFoam brae_interFoam brae_rhoCentralFoam)
     if(TARGET ${exe})
         set_target_properties(${exe} PROPERTIES INSTALL_RPATH_USE_LINK_PATH TRUE)
         install(TARGETS ${exe} RUNTIME DESTINATION bin)
