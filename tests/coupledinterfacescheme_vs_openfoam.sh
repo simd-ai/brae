@@ -55,9 +55,9 @@ SRC="${1:?case dir with a coupled interface and a non-upwind div(phi,U)}"
 BOUNDS="${2:-U=5e-03,p=2e-02,k=8e-02,epsilon=5e-02,nut=8e-02}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
-OFBIN=/usr/lib/openfoam/openfoam2412/platforms/linuxARM64GccDPInt32Opt
+OFBASHRC=${OF_BASHRC:-${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}}
 [ -x "$BRAE" ]                 || { echo "SKIP: no brae binary at $BRAE"; exit 77; }
-[ -x "$OFBIN/bin/simpleFoam" ] || { echo "SKIP: real OpenFOAM not available"; exit 77; }
+[ -f "$OFBASHRC" ]             || { echo "SKIP: real OpenFOAM not available"; exit 77; }
 SRC="$(cd "$SRC" && pwd)"
 grep -qE '^\s*type\s+(cyclic|cyclicAMI|cyclicACMI)' "$SRC/constant/polyMesh/boundary" \
     || { echo "FAIL: $SRC has no coupled interface -- this gate would test nothing"; exit 1; }
@@ -79,8 +79,9 @@ W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 # the script before the first run.
 set +u
 # shellcheck disable=SC1091
-source /usr/lib/openfoam/openfoam2412/etc/bashrc > /dev/null 2>&1 || true
+source "$OFBASHRC" > /dev/null 2>&1 || true
 set -u
+command -v simpleFoam > /dev/null 2>&1 || { echo "SKIP: simpleFoam not on PATH"; exit 77; }
 
 # One case builder, two schemes. `upwind` rewrites BOTH the momentum and the turbulence div schemes, so
 # the two runs differ in the scheme and in nothing else.
@@ -113,7 +114,7 @@ PY
 
 for s in limited upwind; do
     mkcase "$W/of_$s" "$s"
-    ( cd "$W/of_$s" && timeout 1800 "$OFBIN/bin/simpleFoam" > log.of 2>&1 ) \
+    ( cd "$W/of_$s" && timeout 1800 simpleFoam > log.of 2>&1 ) \
         || { echo "FAIL: OpenFOAM did not run the $s case"; tail -5 "$W/of_$s/log.of"; exit 1; }
     mkcase "$W/brae_$s" "$s"
     ( cd "$W/brae_$s" && "$BRAE" . > run.log 2>&1 ) \

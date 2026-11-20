@@ -15,7 +15,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
 SRC="$ROOT/validation/airFoil2D"
-OFRC=/usr/lib/openfoam/openfoam2412/etc/bashrc
+OFRC=${OF_BASHRC:-${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}}
 [ -x "$BRAE" ] || { echo "SKIP: no brae at $BRAE"; exit 77; }
 [ -f "$OFRC" ] || { echo "SKIP: no OpenFOAM v2412"; exit 77; }
 command -v nvidia-smi > /dev/null 2>&1 || { echo "SKIP: no GPU"; exit 77; }

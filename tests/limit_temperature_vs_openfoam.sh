@@ -24,7 +24,7 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
 SRC="$ROOT/validation/sbMatched"
-OFBASH=/usr/lib/openfoam/openfoam2412/etc/bashrc
+OFBASH=${OF_BASHRC:-${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}}
 [ -x "$BRAE" ] || { echo "SKIP: no brae at $BRAE"; exit 77; }
 [ -d "$SRC" ]  || { echo "SKIP: fixture $SRC missing"; exit 77; }
 [ -f "$OFBASH" ] || { echo "SKIP: no OpenFOAM v2412 at $OFBASH"; exit 77; }
