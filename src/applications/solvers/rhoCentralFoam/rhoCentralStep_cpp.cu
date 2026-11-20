@@ -5,7 +5,8 @@
 //   222-286  cells                       the four stages of rhoCentralCellUpdate.cuh, a loop each
 //   195      phi                         an inletOutlet patch of U, T or p is switched on this step's boundary phi
 //                                        (switchInletOutlet) before each of the evaluations below
-//   232      U.correctBoundaryConditions brae's patch fields; on a transform face transformPatchU
+//   232      U.correctBoundaryConditions brae's patch fields, pressureInletOutletVelocity updated on this step's phi
+//                                        first; on a transform face transformPatchU
 //   233, 265-271  rhoU_b, e_b, T_b, psi_b, rhoE_b   updatePatchFace (rhoCentralPatchUpdate.cuh), with T's patches
 //                                        evaluated on the cells' old T, as the energy BCs' Tw.evaluate() sees them --
 //                                        or T_b itself where T is a transform; rho_b the new cell rho on a
@@ -28,6 +29,31 @@ namespace rhoCentral {
 using namespace brae::rhoCentral;
 
 namespace {
+
+// pressureInletOutletVelocityFvPatchVectorField::updateCoeffs, which U.correctBoundaryConditions() runs at :232:
+// valueFraction = neg(phi)*(I - n n) on this step's flux, then directionMixed's evaluate on the cells' U as the explicit
+// update left it -- U_cell on an outflow face, n*(n & U_cell) on an inflow one (the shared host class forms the value).
+// The device arm does the same with deviceUpdatePressureInletOutletVelocity (rhoCentralStep.cu). Without this call
+// the host patch kept the value it was read with for the whole run. phiB is flat in patch order, as switchInletOutlet's;
+// every other patch class ignores both calls.
+void updatePressureInletOutletVelocity(GeometricField<vector>& U, const std::vector<scalar>& phiB,
+                                       const std::vector<vector>& Ucells, const Case& cs)
+{
+    std::size_t k0 = 0;
+    for (std::size_t pi = 0; pi < cs.patches.size(); ++pi)
+    {
+        const std::size_t n = static_cast<std::size_t>(cs.patches[pi].size);
+        fvPatchField<vector>& b = *U.boundary[pi];
+        if (b.readsPatchCellVelocity())
+        {
+            std::vector<vector> Ucell(n);
+            for (std::size_t i = 0; i < n; ++i) Ucell[i] = Ucells[cs.bCell[k0 + i]];
+            b.updateFromFlux(std::vector<scalar>(phiB.begin() + k0, phiB.begin() + k0 + n));
+            b.updateFromPatchVelocity(b.value(), Ucell, {});
+        }
+        k0 += n;
+    }
+}
 
 class HostArm final : public Arm
 {
@@ -108,6 +134,7 @@ public:
         if (cs.ioU) switchInletOutlet(pf_.U, *phiSwitch, cs);
         if (cs.ioT) switchInletOutlet(pf_.T, *phiSwitch, cs);
         if (cs.ioP) switchInletOutlet(pf_.p, *phiSwitch, cs);
+        if (cs.piovU) updatePressureInletOutletVelocity(pf_.U, f.phiB, s.U, cs);
         evaluatePatches(pf_.U, s.U, cs, s.UB);       // :232
         for (label k = 0; k < cs.nB; ++k)            // ...a transform face in OpenFOAM's arithmetic, as the device's
             if (cs.bUTransform[k])
