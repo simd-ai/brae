@@ -258,3 +258,10 @@ add_test(NAME gate_record_selftest
          COMMAND bash ${PROJECT_SOURCE_DIR}/tests/gate_record_selftest.sh ${PROJECT_SOURCE_DIR}/tools/gate_record.py)
 set_tests_properties(gate_record_selftest PROPERTIES TIMEOUT 120)
 
+# tools/tutorial_sweep.py -- which OpenFOAM tutorials `brae check --setup` takes, through each tutorial's own
+# scripts -- on a fake tutorials tree with a fake brae and fake OpenFOAM commands: set up, refused with its text,
+# checked, not reached, timeout and skipped each recorded, a mesh only in processor0/ reconstructed, and no
+# OpenFOAM solver run (the fakes leave a mark if one is). No OpenFOAM, no GPU.
+add_test(NAME tutorial_sweep_selftest
+         COMMAND bash ${PROJECT_SOURCE_DIR}/tests/tutorial_sweep_selftest.sh ${PROJECT_SOURCE_DIR}/tools/tutorial_sweep.py)
+set_tests_properties(tutorial_sweep_selftest PROPERTIES TIMEOUT 120)
