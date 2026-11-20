@@ -32,9 +32,9 @@
       "name": "gpu-smoke",
       "configurePreset": "dev",
       "displayName": "GPU smoke",
-      "description": "Every test but the slow tier and the known-red gates: the suite for frequent integration.",
+      "description": "The tests labelled smoke (tests/cmake/tiers.cmake): about three minutes on the GB10, for every change.",
       "output": { "outputOnFailure": true },
-      "filter": { "exclude": { "label": "slow|known-red" } }
+      "filter": { "include": { "label": "smoke" }, "exclude": { "label": "known-red" } }
     },
     {
       "name": "full-validation",
