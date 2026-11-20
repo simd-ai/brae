@@ -9,6 +9,15 @@ was checked, and against what. The design is in [ARCHITECTURE.md](ARCHITECTURE.m
 in the build target's comment. It stays while registered open checks remain, while its 3-D coverage is young, and
 while it runs on one GPU.
 
+**Review decision (2026-11-20): approved for an experimental single-GPU merge, not as a production-ready release.**
+The review accepted:
+- the shared reader and writer corrections (sec. 8), including the refusal of older `uniformTotalPressure` files whose
+  time-dependent p0 was lost;
+- the 24 registered open checks, held to exactly that set by the strict CI check (sec. 7). No bound was widened, no
+  failure is excluded, and none is reported as passing.
+
+The supported scope and the numerical algorithms are as this report describes them. Multi-GPU work is separate.
+
 ## 1. Scope
 
 **Runs, on one GPU.** This release adds no multi-GPU path for rhoCentralFoam.
@@ -203,6 +212,12 @@ exactly these 24 (sec. 7).
 - a restart under LTS starts and runs (the LTS gate starts brae and OpenFOAM from brae's biconic output), but its
   fields are not compared with OpenFOAM's own LTS restart.
 
+**Found during the review, outside rhoCentralFoam, not fixed here** (both on `main` too):
+- pimpleFoam under `adjustTimeStep` misses the adjustable write times and `endTime`, and misnames its last time
+  directory (issue #53);
+- rhoSimpleFoam's default driver, restarted from its own write, drifts 1.7e-4 in U from its uninterrupted run, inside
+  the 1e-3 its restart gate allows (issue #54).
+
 **Not in this release:** multi-GPU (the coupled-patch plan is in ARCHITECTURE.md sec. 5c), cyclic patches, other RAS
 models and LES, other motion solvers, binary output.
 
@@ -217,6 +232,18 @@ models and LES, other motion solvers, binary output.
     (`tests/data/rho_central_known_red.tsv`). A new FAIL, a registered check going green, or an arm that stops running
     all fail this step until the registry is updated in review.
 - **Labels:** the gates carry `slow` and `rhocentral`. Without OpenFOAM v2412 they skip (exit 77).
+
+**Tests that fail on `main` as well.** The full ctest on the GB10, leaving out `known-red` and `rhocentral`, ran 902
+tests: 898 passed, 3 failed and 1 skipped. None of the four is in rhoCentralFoam's path. The branch leaves them as
+they are on `main`, except that the manifest tool both manifest tests run gains a rhoCentralFoam entry (additions only;
+`manifest_rhocentralfoam_not_drifted` passes).
+
+| test | on this branch | on `main` (df3cd8cb) | cause, and where it is tracked |
+|---|---|---|---|
+| `manifest_simplefoam_not_drifted` | fails | fails | `manifest/simpleFoam.yaml` is not in the tree (issue #50). It skips on a runner without the `ofscan` checkout, as the GB10 CI's is |
+| `manifest_rhosimplefoam_not_drifted` | fails | fails | `manifest/rhoSimpleFoam.yaml` is not in the tree (issue #50) |
+| `kepsilon_production_and_blend` | aborts | fails, in the GB10 CI's ctest step | the test does not pass the stored wall nut to the kEpsilon closure. The test-only fix is on branch `fix/kepsilon-test-wall-nut` (213e3506) |
+| `simple_freestream_of13_vs_openfoam13` | skipped | skipped | needs OpenFOAM 13 |
 
 ## 8. Shared code this release changes
 
@@ -237,3 +264,22 @@ rhoSimpleFoam would notice, all in what brae writes and reads back:
 
 `tests/total_bc_roundtrip_vs_openfoam.sh` holds all of these against real OpenFOAM, in both directions and across
 restarts. Its 63 checks pass, and on the build before these fixes 22 of them fail.
+
+**Restarting from a time directory an older brae wrote:** [docs/restart-older-output.md](../../../../docs/restart-older-output.md)
+gives the exact edits, each tested on such a directory. A `uniformTotalPressure` or `fanPressure` patch gets its `p0`
+definition, and the fan's curve and direction, copied back from the case's own `0/p`. Restored that way, pimpleFoam's
+TJunction restarts identically to its uninterrupted run (the fields are equal ten steps later, with the table and with
+the fan), and OpenFOAM starts from the same file. A `totalPressure` patch needs no edit for brae. For OpenFOAM, the
+older `phi` files need their constraint patches retyped, and an older `totalPressure` needs `inletValue` renamed to `p0`.
+
+## 9. The evidence, and the commit it holds at
+
+- **Gates:** the suite ran at 4d951925, the last commit on this branch that changes code. Every later commit changes
+  documentation only, so the executables built at 4d951925 are those of the pull request's head.
+  - 1,122 checks passed and the 24 registered open checks failed, the same counts gate by gate as the suite before
+    it;
+  - the known-red check reported ok;
+  - all 13,290 files brae wrote are byte-identical to the previous suite's.
+- **Full ctest:** 898 of 902 passed, 3 failed and 1 skipped, as sec. 7 lists.
+- **Hosted CI:** green on the head. The pull request's description names the head and its run.
+- **`main`:** the branch starts at `main`'s head, df3cd8cb, so a merge adds exactly this branch's changes.

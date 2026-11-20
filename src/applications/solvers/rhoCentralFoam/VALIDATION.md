@@ -120,3 +120,8 @@ things against real OpenFOAM:
 Each arm has a control: the file as an earlier brae wrote it. OpenFOAM must refuse each one. brae must refuse the
 uniformTotalPressure and fanPressure ones, and read a totalPressure's `inletValue` as p0, with a notice. ARCHITECTURE.md
 sec. 5r lists what the gate found and fixed. On the build before those fixes, 22 of the 63 checks fail.
+
+How to restore a time directory an older brae wrote is in
+[docs/restart-older-output.md](../../../../docs/restart-older-output.md). Each edit there was tested on such a directory:
+- pimpleFoam's TJunction, with its table and with the fan, restarts identically to the uninterrupted run;
+- OpenFOAM starts from each restored file.
