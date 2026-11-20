@@ -5323,16 +5323,33 @@ SELECTION_NOTE = {
 SKIP_EXIT = 77
 
 
+def ofscanRequired():
+    """In CI the checks must run: a skip there read as coverage while two manifests were missing from the tree
+    (issue #50) and all four checks skipped on the GB10 runner for want of the sibling checkout. Under GitHub
+    Actions (GITHUB_ACTIONS=true, which only the self-hosted GPU tier reaches with ctest), or with
+    BRAE_REQUIRE_OFSCAN=1, a missing ofscan is a failure."""
+    return os.environ.get("GITHUB_ACTIONS") == "true" or os.environ.get("BRAE_REQUIRE_OFSCAN") == "1"
+
+
 def db():
     sys.path.insert(0, os.path.abspath(OFSCAN))
+    index = os.path.join(os.path.abspath(OFSCAN), "ofscan.db")
     try:
         from ofscan.graph.database import Db
+        found = os.path.isfile(index)
     except ImportError:
+        found = False
+    if not found:
+        if ofscanRequired():
+            sys.stderr.write("FAIL: ofscan not available at %s (its package or ofscan.db) -- this run requires it\n"
+                             "      (GITHUB_ACTIONS or BRAE_REQUIRE_OFSCAN): check it out beside the brae checkout or\n"
+                             "      name it in OFSCAN_ROOT.\n" % os.path.abspath(OFSCAN))
+            sys.exit(1)
         sys.stderr.write("SKIP: ofscan not available at %s (set OFSCAN_ROOT) -- the manifest's DERIVED\n"
                          "      half cannot be regenerated here, so drift cannot be checked.\n"
                          % os.path.abspath(OFSCAN))
         sys.exit(SKIP_EXIT)
-    return Db(os.path.join(os.path.abspath(OFSCAN), "ofscan.db"))
+    return Db(index)
 
 
 def impls_for(d, base):
