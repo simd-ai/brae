@@ -35,7 +35,7 @@ Measured 2026-11-18 with brae `main` at df3cd8cb, on one NVIDIA GH200 superchip 
 
 | | |
 |---|---|
-| **brae** | the GPU, with the shell pinned to the same superchip's Grace cores; defaults, and pimpleFoam with `BRAE_GS_HOST_SMOOTHER=0` (the GPU sweeps, now the default) |
+| **brae** | the GPU, with the shell pinned to the same superchip's Grace cores; defaults, and pimpleFoam with `BRAE_GS_HOST_SMOOTHER=0` (the GPU sweeps; opt-in on `main`, see below) |
 | **OpenFOAM** | v2412, 72 MPI ranks on the 72 Grace cores, scotch decomposition, the case's own linear solvers |
 | **cases** | stock v2412 tutorials, scaled by multiplying every block's cell counts in `blockMeshDict` by one factor |
 | **both codes** | function objects removed, `residualControl` removed, no writes, fixed `deltaT` (the tutorial's, divided by the scale factor, so the Courant number stays the tutorial's), interFoam's mesh refinement off (`staticFvMesh`) |
@@ -45,12 +45,12 @@ Measured 2026-11-18 with brae `main` at df3cd8cb, on one NVIDIA GH200 superchip 
 ![Seconds per step against mesh size for the four solvers](images/one-gh200-seconds-per-step.png)
 
 - **pimpleFoam** sweeps its U, k and epsilon Gauss-Seidel solves on the GPU, level by level, in OpenFOAM's cell
-  order. It was measured on df3cd8cb with `BRAE_GS_HOST_SMOOTHER=0`, the path that is now the default; a re-time on
-  the new default read 0.148 s at 4.1 M cells and 0.466 s at 19.8 M. Below about 2 M cells OpenFOAM is still ahead
-  (1.8× at 0.25 M, 1.2× at 1 M).
-- The old default, now `BRAE_GS_HOST_SMOOTHER=1`, runs the same sweeps on one CPU thread: 4.48 s a step at 19.8 M
-  cells, 2.5× slower than OpenFOAM. After 40 steps at 4 M cells it wrote the same U, p, k, epsilon, nut and phi,
-  byte for byte, as the GPU sweeps.
+  order. It was measured on df3cd8cb with `BRAE_GS_HOST_SMOOTHER=0`, which `main` still leaves opt-in; the branch
+  that makes it the default (`feat/device-gauss-seidel`) re-timed it at 0.148 s at 4.1 M cells and 0.466 s at
+  19.8 M. Below about 2 M cells OpenFOAM is still ahead (1.8× at 0.25 M, 1.2× at 1 M).
+- The default on `main` (`BRAE_GS_HOST_SMOOTHER` unset or `1`) runs the same sweeps on one CPU thread: 4.48 s a
+  step at 19.8 M cells, 2.5× slower than OpenFOAM. After 40 steps at 4 M cells it wrote the same U, p, k, epsilon,
+  nut and phi, byte for byte, as the GPU sweeps.
 - **rhoSimpleFoam** is the aerofoil, a 2-D mesh one cell thick. On the transonic squareBend, OpenFOAM with 72 ranks
   went to negative temperature within five iterations at every scaled size tried except ×3, where the two codes
   were level (0.272 s and 0.273 s at 3.0 M cells).
