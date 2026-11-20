@@ -35,6 +35,8 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/solver_rhocentralfoam.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/solver_interfoam.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/repository.cmake)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/developer.cmake)
+# What `brae -case` runs by default, without the case-solver variables below (label `default-path`)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/default_path.cmake)
 # Which tests each CI tier runs (labels only; it registers nothing)
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/tiers.cmake)
 
@@ -76,6 +78,19 @@ set_property(TEST ${BRAE_ALL_TESTS} APPEND PROPERTY ENVIRONMENT "BRAE_TURBULENCE
 # its bound; the rule is held to OpenFOAM by tests/simple_colour_vs_openfoam.sh, which unsets this. The user's
 # decision, 2026-10-16.
 set_property(TEST ${BRAE_ALL_TESTS} APPEND PROPERTY ENVIRONMENT "BRAE_SIMPLE_CASE_SOLVER=1")
+# THE DEFAULT PATH'S OWN TESTS, beside the three arrangements above, which stay as they are: the user's decision D6,
+# 2026-11-20. What a customer's `brae -case` runs -- the AMG-PCG, the two colour orders -- is otherwise held only by
+# the rules' dedicated gates. A test labelled `default-path` (tests/cmake/default_path.cmake) gets the three variables
+# unset again: ENVIRONMENT_MODIFICATION is applied after ENVIRONMENT (CMake 3.22; the minimum here is 3.24) and
+# `unset:` also removes a value inherited from ctest's own environment. Its runner, tests/default_path_run.sh, fails
+# if one is still set, so a test cannot run the case-solver path under a default-path name.
+foreach(_t ${BRAE_ALL_TESTS})
+    get_test_property(${_t} LABELS _labels)
+    if(_labels AND "default-path" IN_LIST _labels)
+        set_property(TEST ${_t} APPEND PROPERTY ENVIRONMENT_MODIFICATION
+                     "BRAE_PRESSURE_CASE_SOLVER=unset:" "BRAE_TURBULENCE_CASE_SOLVER=unset:" "BRAE_SIMPLE_CASE_SOLVER=unset:")
+    endif()
+endforeach()
 
 # Every test above runs in the top build directory, as it did when it was defined there (add_test in a subdirectory
 # would otherwise run in tests/).
