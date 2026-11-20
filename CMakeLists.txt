@@ -2351,6 +2351,11 @@ add_test(NAME rho_central_3d_vs_openfoam
          COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_3d_vs_openfoam.sh)
 set_tests_properties(rho_central_3d_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow;rhocentral;known-red" TIMEOUT 5400
                      ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+# pressureInletOutletVelocity on a static mesh, CUDA and host reference arms (the host arm's update at :232)
+add_test(NAME rho_central_piov_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_piov_vs_openfoam.sh)
+set_tests_properties(rho_central_piov_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow;rhocentral" TIMEOUT 1800
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 # What tells the six known-red gates' 24 registered FAILs from a regression: tools/known_red_check.py runs them and
 # passes only when their FAILs are exactly the registered ones, counted per registry row and with each gate's pass
 # count (tests/data/rho_central_known_red.tsv). The GB10 CI runs it as its own step; this is its no-GPU self-test,

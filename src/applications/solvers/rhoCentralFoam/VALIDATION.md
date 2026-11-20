@@ -24,9 +24,13 @@ bound is never widened to make a check pass.
 | rho_central_moving_vs_openfoam | movingCone as shipped, tight solves, restarted; read back | 30 | 1 | slow, rhocentral, known-red |
 | rho_central_3d_vs_openfoam | 3-D: axial corner (inviscid, laminar, kOmegaSST), closed-box blast and its restarts, totalPressure duct | 75 | 1 | slow, rhocentral, known-red |
 | rho_central_refusals | everything outside the scope stops by name | 46 | 0 | rhocentral |
+| rho_central_piov_vs_openfoam (added 2026-11-20, after this suite) | pressureInletOutletVelocity on a static mesh (piovBox), CUDA and host reference arms | 17 | 0 | slow, rhocentral |
 1,122 checks pass. The 24 that fail are all registered open checks; none is on a tutorial as shipped. The 5
 historical lines of the viscous gate are the raw conservation imbalance of a solve stopped at its tolerance, kept in
 the log; the acceptance there is the residual-accounted balance.
+
+The pressureInletOutletVelocity gate came after that suite: before it, the host reference arm never updated the patch on
+a static mesh (it kept its read value); its 17 checks pass with that fixed, and the CUDA arm's output is unchanged.
 
 ## The registered open checks
 

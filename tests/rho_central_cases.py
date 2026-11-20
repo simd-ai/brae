@@ -26,6 +26,14 @@ nothing else.
                                          placeholder). Both ends flow out until the expansion reaches the left end and
                                          turns the flow there inward -- the switch changes branch at a resolved velocity,
                                          not on round-off noise -- and the inflow then holds at 50 m/s
+  rho_central_cases.py piovBox <case>    shockTube's thermo, schemes and solution in a 2-D box (1 m, 40 x 40 cells) at
+                                         rest at 1e5 Pa and 348.432 K, with a 3e5 Pa block over (0.15..0.45)^2
+                                         (setFields): walls `slip` on three sides and the TOP open, U
+                                         `pressureInletOutletVelocity`, p fixedValue 1e5, T inletOutlet. The top's flux is
+                                         exactly 0 until the blast arrives, then leaves, and the expansion behind it
+                                         draws it back in on part of the patch: both branches at resolved velocities,
+                                         with a tangential component on the faces. deltaT 2e-6 fixed to 4e-3, written
+                                         every 2.5e-4 at 17 digits
 
 <case> is a copy of the tutorial; the files are rewritten in place. Every edit is checked to have happened.
 """
@@ -166,9 +174,103 @@ def sodRev(case):
         inlet_outlet(f"{case}/0/{f}", "sides", v, None)
 
 
+def foam_file(cls, obj, body):
+    return ("FoamFile\n{\n    version     2.0;\n    format      ascii;\n"
+            f"    class       {cls};\n    object      {obj};\n}}\n\n{body}")
+
+
+def piovBox(case):
+    # shockTube's thermophysicalProperties, turbulenceProperties, fvSchemes and fvSolution as shipped; the mesh, the
+    # fields and the run written here. The fields are written whole (0/ is a copy of 0.orig), so no edit can miss.
+    open(f"{case}/system/blockMeshDict", "w").write(foam_file("dictionary", "blockMeshDict", """scale   1;
+
+vertices
+(
+    (0 0 0) (1 0 0) (1 1 0) (0 1 0) (0 0 0.025) (1 0 0.025) (1 1 0.025) (0 1 0.025)
+);
+
+blocks
+(
+    hex (0 1 2 3 4 5 6 7) (40 40 1) simpleGrading (1 1 1)
+);
+
+boundary
+(
+    top          { type patch; faces ((3 7 6 2)); }
+    walls        { type wall;  faces ((0 4 7 3) (2 6 5 1) (1 5 4 0)); }
+    frontAndBack { type empty; faces ((0 3 2 1) (4 5 6 7)); }
+);
+"""))
+    open(f"{case}/system/setFieldsDict", "w").write(foam_file("dictionary", "setFieldsDict", """defaultFieldValues
+(
+    volScalarFieldValue p 100000
+);
+
+regions
+(
+    boxToCell
+    {
+        box (0.15 0.15 -1) (0.45 0.45 1);
+        fieldValues
+        (
+            volScalarFieldValue p 300000
+        );
+    }
+);
+"""))
+    open(f"{case}/system/controlDict", "w").write(foam_file("dictionary", "controlDict", """application     rhoCentralFoam;
+startFrom       startTime;
+startTime       0;
+stopAt          endTime;
+endTime         0.004;
+deltaT          2e-06;
+writeControl    runTime;
+writeInterval   0.00025;
+purgeWrite      0;
+writeFormat     ascii;
+writePrecision  17;
+writeCompression off;
+timeFormat      general;
+timePrecision   6;
+runTimeModifiable false;
+adjustTimeStep  no;
+"""))
+
+    def field(name, cls, dim, internal, top, walls):
+        open(f"{case}/0/{name}", "w").write(foam_file(cls, name, f"""dimensions      {dim};
+
+internalField   uniform {internal};
+
+boundaryField
+{{
+    top
+    {{
+{top}
+    }}
+    walls
+    {{
+{walls}
+    }}
+    frontAndBack
+    {{
+        type            empty;
+    }}
+}}
+"""))
+    field("U", "volVectorField", "[0 1 -1 0 0 0 0]", "(0 0 0)",
+          "        type            pressureInletOutletVelocity;\n        value           uniform (0 0 0);",
+          "        type            slip;")
+    field("p", "volScalarField", "[1 -1 -2 0 0 0 0]", "100000",
+          "        type            fixedValue;\n        value           uniform 100000;",
+          "        type            zeroGradient;")
+    field("T", "volScalarField", "[0 0 0 1 0 0 0]", "348.432",
+          "        type            inletOutlet;\n        inletValue      uniform 348.432;\n        value           uniform 348.432;",
+          "        type            zeroGradient;")
+
+
 if __name__ == "__main__":
     kinds = {"symmetry": symmetry, "slipPT": slipPT, "cone": cone, "inletIO": inletIO, "openTop": openTop,
-             "sodRevSet": sodRevSet, "sodRev": sodRev}
+             "sodRevSet": sodRevSet, "sodRev": sodRev, "piovBox": piovBox}
     if len(sys.argv) != 3 or sys.argv[1] not in kinds:
         raise SystemExit(__doc__)
     kinds[sys.argv[1]](sys.argv[2])
