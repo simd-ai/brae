@@ -17,7 +17,16 @@
 // corrector is first used, and kept: the corrector is a MeshObject whose movePoints() keeps its
 // addressing. The mid-plane is not kept: constrainToMeshCentre reads the mesh's bounds as they are.
 //
-// NOT PORTED: a wedge (snapToWedge); refused where the corrector is built.
+// A WEDGE (milestone K, rhoCentralFoam's movingCone): the plane normal is the first wedge patch's centreNormal, and
+// each point of a normal edge is snapped to its wedge plane (snapToWedge) about the edge's mid-point constrained to the
+// mesh centre. wedgePolyPatch::calcGeometry runs once, on the mesh as read (the patch keeps it as the mesh moves): n_ is
+// gAverage of the face unit normals face::unitNormal(points) gives -- sum over the faces divided by their number, not
+// normalised -- then centreNormal from it, normalised, cosAngle = centreNormal & n_, axis = centreNormal ^ n_
+// normalised (wedgePolyPatch.C calcGeometry). brae's shared wedgeGeometry() takes the patch's Sf/magSf and normalises
+// the sum; the two agree to round-off, and this file takes OpenFOAM's own arithmetic. geometricD knocks out the
+// wedge's centre-normal direction (polyMesh::calcDirections), so constrainToMeshCentre centres that component.
+// The odd-points/half-the-edges check is OpenFOAM's for an empty 2-D mesh only: a wedge's axis points lie on no
+// normal edge and stay where the motion puts them.
 #include "cf_types.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -48,7 +57,11 @@ public:
 private:
     bool required_ = false;
     vector planeNormal_{0, 0, 0};
-    // polyMesh::geometricD() == -1, per component
+    // the wedge (snapToWedge): wedgePolyPatch's axis and |acos(cosAngle)|, of the first wedge patch
+    bool isWedge_ = false;
+    vector wedgeAxis_{0, 0, 0};
+    scalar wedgeAngle_ = 0;
+    // polyMesh::geometricD() == -1, per component (the empty directions, and a wedge's centre normal)
     bool emptyDir_[3] = {false, false, false};
     // the edges normal to the plane, as (start, end) point pairs
     std::vector<label> normalEdgeStart_;

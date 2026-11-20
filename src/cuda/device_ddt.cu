@@ -283,4 +283,123 @@ void deviceDotSf(
     cudaCheck(cudaGetLastError(), "dotSf");
 }
 
+namespace {
+// rDT: localEuler's per-cell rDeltaT (null: Euler's one rDeltaT). localEulerDdtScheme.C:283-310 and :139-160 are
+// EulerDdtScheme's expressions with the field in the scalar's place, term for term
+__global__ void eulerFvmDdtRhoKernel(int n, scalar rDeltaT, const scalar* __restrict__ rho,
+                                     const scalar* __restrict__ rho0, const scalar* __restrict__ vf0,
+                                     const scalar* __restrict__ V, scalar* __restrict__ diag,
+                                     scalar* __restrict__ source, const scalar* __restrict__ rDT)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    const scalar r = rDT ? rDT[c] : rDeltaT;
+    diag[c] = __dmul_rn(__dmul_rn(r, rho[c]), V[c]);                          // rDeltaT*rho*V
+    source[c] = __dmul_rn(__dmul_rn(__dmul_rn(r, rho0[c]), vf0[c]), V[c]);    // rDeltaT*rho0*vf0*V
+}
+__global__ void eulerFvcDdtRhoSubKernel(int n, scalar rDeltaT, const scalar* __restrict__ rho,
+                                        const scalar* __restrict__ vf, const scalar* __restrict__ rho0,
+                                        const scalar* __restrict__ vf0, const scalar* __restrict__ V,
+                                        scalar* __restrict__ source, const scalar* __restrict__ rDT)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    const scalar r = rDT ? rDT[c] : rDeltaT;
+    const scalar d = __dmul_rn(r, __dmul_rn(rho[c], vf[c]) - __dmul_rn(rho0[c], vf0[c]));   // fvc::ddt
+    source[c] = source[c] + __dmul_rn(V[c], d);                                     // tC.source() += V*su
+}
+// the moving mesh's (EulerDdtScheme.C, mesh().moving()): the old-time terms on V0, fvc::ddt's divided back by V
+__global__ void eulerFvmDdtRhoMovingKernel(int n, scalar rDeltaT, const scalar* __restrict__ rho,
+                                           const scalar* __restrict__ rho0, const scalar* __restrict__ vf0,
+                                           const scalar* __restrict__ V, const scalar* __restrict__ V0,
+                                           scalar* __restrict__ diag, scalar* __restrict__ source)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    diag[c] = __dmul_rn(__dmul_rn(rDeltaT, rho[c]), V[c]);                              // rDeltaT*rho*Vsc
+    source[c] = __dmul_rn(__dmul_rn(__dmul_rn(rDeltaT, rho0[c]), vf0[c]), V0[c]);       // rDeltaT*rho0*vf0*Vsc0
+}
+__global__ void eulerFvcDdtRhoSubMovingKernel(int n, scalar rDeltaT, const scalar* __restrict__ rho,
+                                              const scalar* __restrict__ vf, const scalar* __restrict__ rho0,
+                                              const scalar* __restrict__ vf0, const scalar* __restrict__ V,
+                                              const scalar* __restrict__ V0, scalar* __restrict__ source)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= n) return;
+    // rDeltaT*(rho*vf - rho0*vf0*V0/V): ((rho0*vf0)*V0)/V, each operation a field of its own
+    const scalar old = __ddiv_rn(__dmul_rn(__dmul_rn(rho0[c], vf0[c]), V0[c]), V[c]);
+    const scalar d = __dmul_rn(rDeltaT, __dmul_rn(rho[c], vf[c]) - old);
+    source[c] = source[c] + __dmul_rn(V[c], d);                                     // tC.source() += V*su
+}
+} // namespace
+
+void deviceEulerFvmDdtRhoMoving(scalar rDeltaT, const DeviceBuffer<scalar>& rho, const DeviceBuffer<scalar>& rho0,
+                                const DeviceBuffer<scalar>& vf0, const DeviceBuffer<scalar>& V,
+                                const DeviceBuffer<scalar>& V0, DeviceBuffer<scalar>& diag,
+                                DeviceBuffer<scalar>& source)
+{
+    const int n = static_cast<int>(V.size());
+    diag.resize(n);
+    source.resize(n);
+    eulerFvmDdtRhoMovingKernel<<<nBlocks(n), TPB>>>(n, rDeltaT, rho.data(), rho0.data(), vf0.data(), V.data(),
+                                                    V0.data(), diag.data(), source.data());
+    cudaCheck(cudaGetLastError(), "fvm::ddt(rho, vf), moving mesh");
+}
+
+void deviceEulerFvcDdtRhoSubMoving(scalar rDeltaT, const DeviceBuffer<scalar>& rho, const DeviceBuffer<scalar>& vf,
+                                   const DeviceBuffer<scalar>& rho0, const DeviceBuffer<scalar>& vf0,
+                                   const DeviceBuffer<scalar>& V, const DeviceBuffer<scalar>& V0,
+                                   DeviceBuffer<scalar>& source)
+{
+    const int n = static_cast<int>(V.size());
+    eulerFvcDdtRhoSubMovingKernel<<<nBlocks(n), TPB>>>(n, rDeltaT, rho.data(), vf.data(), rho0.data(), vf0.data(),
+                                                       V.data(), V0.data(), source.data());
+    cudaCheck(cudaGetLastError(), "- fvc::ddt(rho, vf), moving mesh");
+}
+
+void deviceEulerFvmDdtRho(scalar rDeltaT, const DeviceBuffer<scalar>& rho, const DeviceBuffer<scalar>& rho0,
+                          const DeviceBuffer<scalar>& vf0, const DeviceBuffer<scalar>& V,
+                          DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source)
+{
+    const int n = static_cast<int>(V.size());
+    diag.resize(n);
+    source.resize(n);
+    eulerFvmDdtRhoKernel<<<nBlocks(n), TPB>>>(n, rDeltaT, rho.data(), rho0.data(), vf0.data(), V.data(),
+                                              diag.data(), source.data(), nullptr);
+    cudaCheck(cudaGetLastError(), "fvm::ddt(rho, vf)");
+}
+
+void deviceEulerFvcDdtRhoSub(scalar rDeltaT, const DeviceBuffer<scalar>& rho, const DeviceBuffer<scalar>& vf,
+                             const DeviceBuffer<scalar>& rho0, const DeviceBuffer<scalar>& vf0,
+                             const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& source)
+{
+    const int n = static_cast<int>(V.size());
+    eulerFvcDdtRhoSubKernel<<<nBlocks(n), TPB>>>(n, rDeltaT, rho.data(), vf.data(), rho0.data(), vf0.data(),
+                                                 V.data(), source.data(), nullptr);
+    cudaCheck(cudaGetLastError(), "- fvc::ddt(rho, vf)");
+}
+
+void deviceLocalEulerFvmDdtRho(const DeviceBuffer<scalar>& rDeltaT, const DeviceBuffer<scalar>& rho,
+                               const DeviceBuffer<scalar>& rho0, const DeviceBuffer<scalar>& vf0,
+                               const DeviceBuffer<scalar>& V, DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& source)
+{
+    const int n = static_cast<int>(V.size());
+    diag.resize(n);
+    source.resize(n);
+    eulerFvmDdtRhoKernel<<<nBlocks(n), TPB>>>(n, 0, rho.data(), rho0.data(), vf0.data(), V.data(), diag.data(),
+                                              source.data(), rDeltaT.data());
+    cudaCheck(cudaGetLastError(), "fvm::ddt(rho, vf), localEuler");
+}
+
+void deviceLocalEulerFvcDdtRhoSub(const DeviceBuffer<scalar>& rDeltaT, const DeviceBuffer<scalar>& rho,
+                                  const DeviceBuffer<scalar>& vf, const DeviceBuffer<scalar>& rho0,
+                                  const DeviceBuffer<scalar>& vf0, const DeviceBuffer<scalar>& V,
+                                  DeviceBuffer<scalar>& source)
+{
+    const int n = static_cast<int>(V.size());
+    eulerFvcDdtRhoSubKernel<<<nBlocks(n), TPB>>>(n, 0, rho.data(), vf.data(), rho0.data(), vf0.data(), V.data(),
+                                                 source.data(), rDeltaT.data());
+    cudaCheck(cudaGetLastError(), "- fvc::ddt(rho, vf), localEuler");
+}
+
 }  // namespace brae

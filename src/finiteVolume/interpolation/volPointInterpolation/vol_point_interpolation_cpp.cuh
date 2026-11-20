@@ -57,12 +57,19 @@ public:
     void interpolateInternalField(
         const std::vector<vector>& vf,
         std::vector<vector>& pf) const;
+    // ...and a scalar field's (velocityComponentLaplacian's cellMotionU<c>): the same sums, Type = scalar
+    void interpolateInternalField(
+        const std::vector<scalar>& vf,
+        std::vector<scalar>& pf) const;
 
     // interpolateBoundaryField, without the constraint step: every patch point, from the values of the
     // boundary faces of real patches. boundaryField is per patch, per face, as the fvPatchFields hold it.
     void interpolateBoundaryField(
         const std::vector<std::vector<vector>>& boundaryField,
         std::vector<vector>& pf) const;
+    void interpolateBoundaryField(
+        const std::vector<std::vector<scalar>>& boundaryField,
+        std::vector<scalar>& pf) const;
 
     bool isPatchPoint(label pointi) const
     {
@@ -70,6 +77,11 @@ public:
     }
 
 private:
+    template <typename T>
+    void internalT(const std::vector<T>& vf, std::vector<T>& pf) const;
+    template <typename T>
+    void boundaryT(const std::vector<std::vector<T>>& boundaryField, std::vector<T>& pf) const;
+
     const std::vector<std::vector<label>>* pointCells_ = nullptr;
     label nInternalFaces_ = 0;
     std::vector<label> patchStart_;

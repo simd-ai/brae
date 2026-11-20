@@ -1,0 +1,27 @@
+# What the six known-red rhoCentralFoam gates are expected to report, which tools/known_red_check.py holds them to.
+# The gates stay red: their FAILs are the registered open checks of tests/data/rho_central_open_checks.tsv, printed
+# as FAILs with their category, and no threshold reads this file or that one. This file says how many FAIL lines each
+# registry row accounts for and how many checks each gate passes, so a CI run can tell those 24 known FAILs from a
+# regression: any FAIL no registry row names, a registered row with more or fewer FAILs than here, or a gate that
+# passes a different number of checks (an arm that stopped running, or a new one) fails the check. A change to
+# either number is a reviewed edit of this file, beside the registry row and VALIDATION.md's table.
+# Columns, tab-separated: gate, `passed` and the gate's pass count; or gate, `failed`, the FAIL lines that registry
+# row matches, and the row's FAIL message glob exactly as the registry spells it.
+rho_central_restart_vs_openfoam	passed	196
+rho_central_restart_vs_openfoam	failed	1	restart wedge17_0.06o (CUDA): fields above the bound at*
+rho_central_riemann_vs_openfoam	passed	221
+rho_central_riemann_vs_openfoam	failed	12	strong_* (*): fields above the bound at*
+rho_central_riemann_vs_openfoam	failed	1	lax_SuperBee (*): * steps against *
+rho_central_riemann_vs_openfoam	failed	1	ob_MUSCL (*): * steps against *
+rho_central_riemann_vs_openfoam	failed	2	ob_SuperBee (*): * steps against *
+rho_central_nozzle_vs_openfoam	passed	84
+rho_central_nozzle_vs_openfoam	failed	1	ladenburg_long (CUDA): max Courant number *
+rho_central_nozzle_vs_openfoam	failed	1	ladenburg_long (CUDA): fields above the bound at*
+rho_central_nozzle_vs_openfoam	failed	1	reservoir_visc (CUDA): iteration counts differ from solve *
+rho_central_turb_vs_openfoam	passed	36
+rho_central_turb_vs_openfoam	failed	1	plate_sst (CUDA): iteration counts differ from solve *
+rho_central_turb_vs_openfoam	failed	1	plate_lts (CUDA): iteration counts differ from solve *
+rho_central_moving_vs_openfoam	passed	30
+rho_central_moving_vs_openfoam	failed	1	mc_tight (CUDA): iteration counts differ from solve *
+rho_central_3d_vs_openfoam	passed	75
+rho_central_3d_vs_openfoam	failed	1	duct_tp (CUDA): iteration counts differ from solve *

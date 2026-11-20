@@ -503,3 +503,13 @@ DeferredList d isVector  # the scalar overload: false is what a scalar list is
 DeferredList d vectors   # the scalar overload: a scalar list holds no vectors
 DeferredList d aliased   # the vector overload: the alias control is of alpha's scalar list alone
 DeferredList d scalars   # the vector overload: a vector list holds no scalars
+
+# rhoCentralFoam's RAS validate() (rhoCentralStep.cu, milestone J): kOmegaSSTBase::validate() is correctNut() on the
+# fields as read -- S2 from grad(U), F2 from k, omega, y and nu -- so the step's flux, its ddt and the controls of
+# correct() are not inputs there; correctTurbulence() sets every one of them for correct()
+Flow fv phiInt                 # validate: correctNut reads no flux (the flux exists from the first step's :195)
+Flow fv phiBnd                 # same
+Flow fv rDeltaT                # validate: no ddt term in correctNut
+Flow fv rDeltaTCells           # same, under localEuler
+Flow fv rhoOld                 # same: rho.oldTime() is fvm::ddt's, in correct() only
+Flow fv controlPhiUndivided    # a negative control of correct()'s phi(); validate reads no phi

@@ -15,6 +15,7 @@
 #include "foam_dict.cuh"
 #include "brae_notice.cuh"
 #include "start_time.cuh"   // Time::timeName, the run's timeFormat and timePrecision
+#include "purge_write.cuh"  // the purgeWrite FIFO, shared with rhoCentralFoam
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -62,9 +63,13 @@ public:
         // writer rewrites a binary template header to `format ascii` (foam_field_writer.cuh:241-242),
         // so the file is honestly labelled rather than lying about its contents.
         //
-        // What IS lost is precision and size, and that is why this is a NOTICE and not silence: brae
-        // writes 12 significant digits where binary is exact, and the file is several times larger on
-        // the big meshes that ask for binary in the first place. It is not a REFUSAL because nothing
+        // What IS lost is precision and size, and that is why this is a NOTICE and not silence: binary is
+        // exact, and brae's ascii carries only the digits its driver writes at -- the case's writePrecision
+        // in rhoCentralFoam (6 when unset, OpenFOAM's default; movingCone asks for binary at writePrecision 6,
+        // biconic25-55Run35 at 15), gpuSimpleFoam and gpuPimpleFoam (16 when unset), 12 in the rhoSimpleFoam drivers,
+        // 16 in simpleFoamV2 -- so a restart from such a file is not bit-exact. (This said "12 significant
+        // digits" for every driver; that held for rhoSimpleFoam alone.) The file is also several times larger
+        // on the big meshes that ask for binary in the first place. It is not a REFUSAL because nothing
         // numerical is at stake and the output is readable by every OpenFOAM tool -- and because only
         // the rhoSimpleFoam mirror ever refused it, while simpleFoamV2, gpuSimpleFoam, gpuPimpleFoam
         // and the legacy rho drivers all wrote ascii under the same setting saying nothing at all.
@@ -73,8 +78,9 @@ public:
             noticeApproximated("controlDict writeFormat",
                                "'binary' -- brae's field writer emits ascii only. OpenFOAM reads the "
                                "format from each file's own header, not from controlDict, so the output "
-                               "is readable; it is larger and carries 12 significant digits rather than "
-                               "binary's exact bits");
+                               "is readable; it is larger, and each value carries only the digits the "
+                               "solver writes ascii at (rhoCentralFoam: the case's writePrecision) rather "
+                               "than binary's exact bits, so a restart from it is not bit-exact");
     }
 
     // `writeInterval`, or its older name `writeFrequency` where the first is absent -- TimeIO.C:286-297 reads
@@ -144,17 +150,7 @@ public:
     }
 
     // Foam::Time TimeIO purgeWrite: keep only the last N time directories. Call after each write.
-    void recordWritten(const std::string& caseDir, const std::string& tname)
-    {
-        if (purge_ <= 0) return;
-        if (written_.empty() || written_.back() != tname) written_.push_back(tname);
-        while (static_cast<int>(written_.size()) > purge_)
-        {
-            std::error_code ec;
-            std::filesystem::remove_all(caseDir + "/" + written_.front(), ec);
-            written_.pop_front();
-        }
-    }
+    void recordWritten(const std::string& caseDir, const std::string& tname) { purgeWrite_.written(caseDir, tname); }
 
 private:
     std::string control_;
@@ -163,7 +159,7 @@ private:
     scalar deltaT_;
     scalar startTime_;
     long writeTimeIndex_ = 0;
-    std::deque<std::string> written_;
+    PurgeWrite purgeWrite_{purge_};   // after purge_, which it is built from (declaration order)
 };
 
 }   // namespace brae

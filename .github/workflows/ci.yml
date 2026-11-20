@@ -47,3 +47,8 @@ jobs:
         # `nvcc: Terminated` / `Compilation terminated.` storm with NO compiler diagnostic and exit 143
         # (128 + SIGTERM): a resource failure wearing a build failure's clothes.
         run: cmake --build build -j "$(nproc)" --target brae
+
+      - name: Known-red check (self-test, no GPU)
+        # tools/known_red_check.py is what the GB10 CI holds the six known-red rhoCentralFoam gates to (gpu-test.yml);
+        # its self-test checks that registry and expectations agree and that it fails on every kind of departure
+        run: python3 tools/known_red_check.py --selftest

@@ -58,6 +58,9 @@ inline const std::vector<BraeSolver>& braeSolvers()
         {"rhoSimpleFoam", "brae_rhoSimpleFoam", false, "steady compressible (subsonic, laminar, perfectGas+hConst)", ""},
         {"interFoam", "brae_interFoam", true,
          "transient two-phase VoF, laminar/RAS/LES; moving and refining meshes, waves", "-device"},
+        {"rhoCentralFoam", "brae_rhoCentralFoam", true,
+         "EXPERIMENTAL transient density-based compressible (Kurganov/Tadmor); inviscid, laminar or "
+         "kOmegaSST, Euler or LTS, static or velocityComponentLaplacian motion, single GPU", ""},
     };
     return reg;
 }

@@ -141,23 +141,34 @@ public:
             cudaGetLastError();
             const std::size_t idleBefore = heldBytes_;
             releaseIdle();
-            if (cudaMalloc(&p, cls) != cudaSuccess)
+            const cudaError_t again = cudaMalloc(&p, cls);
+            if (again != cudaSuccess)
             {
                 cudaGetLastError();
                 std::size_t freeB = 0, totalB = 0;
-                cudaMemGetInfo(&freeB, &totalB);
+                // cudaMalloc's own error, and cudaMemGetInfo's when it fails too: a run that never had a context (the
+                // first allocation, the device busy or unavailable) may not be out of memory at all, and read "0.000 of 0.000 GB
+                // free" with no cause (GB10, 2026-11-19, a 3-D case started beside a full test suite).
+                const cudaError_t info = cudaMemGetInfo(&freeB, &totalB);
+                cudaGetLastError();
+                char cause[200];
+                if (info == cudaSuccess)
+                    std::snprintf(cause, sizeof cause, "cudaMalloc: %s", cudaGetErrorName(again));
+                else
+                    std::snprintf(cause, sizeof cause, "cudaMalloc: %s; cudaMemGetInfo failed too: %s", cudaGetErrorName(again),
+                                  cudaGetErrorString(info));
                 char use[200];
                 if (stats_)
                     std::snprintf(use, sizeof use, "%.3f GB in use now, peak in use %.3f GB in '%s'", liveBytes_/1073741824.0,
                                   peakLive_/1073741824.0, peakPhase_);
                 else
                     std::snprintf(use, sizeof use, "BRAE_POOL_STATS=1 counts what is in use");
-                char msg[720];
+                char msg[960];
                 std::snprintf(msg, sizeof msg,
                               "brae device pool: out of device memory asking for %.3f GB in phase '%s': the pool holds %.3f GB "
-                              "(%s; %.3f GB idle handed back first), the device has %.3f of %.3f GB free",
+                              "(%s; %.3f GB idle handed back first), the device has %.3f of %.3f GB free (%s)",
                               cls/1073741824.0, phase_, (mallocBytes_ - freedBytes_)/1073741824.0, use,
-                              idleBefore/1073741824.0, freeB/1073741824.0, totalB/1073741824.0);
+                              idleBefore/1073741824.0, freeB/1073741824.0, totalB/1073741824.0, cause);
                 report("at OOM");
                 throw std::runtime_error(msg);
             }
@@ -653,6 +664,78 @@ public:
 private:
     T*          d_ = nullptr;
     std::size_t n_ = 0;
+};
+
+// SEVERAL HOST ARRAYS UP IN ONE TRANSFER: add() names each destination and its host array; flush() packs them into one
+// pinned host block, copies the block to a device staging buffer once and then each slice into its destination, all
+// on the thread's stream -- so every kernel or copy queued after flush() sees the new values, as after copyFrom. The
+// same bytes land; nothing is computed. copyFrom is a synchronous pageable copy and a wait per array: twenty a step
+// in rhoCentralFoam's mesh.update() (1.2 ms of a movingCone step). The host arrays need only live until flush(); the
+// pinned block is not refilled before the last flush's copy out of it has finished.
+class PackedUpload
+{
+public:
+    PackedUpload() = default;
+    PackedUpload(const PackedUpload&) = delete;
+    PackedUpload& operator=(const PackedUpload&) = delete;
+    ~PackedUpload()
+    {
+        if (done_) cudaEventDestroy(done_);
+        if (host_) cudaFreeHost(host_);
+    }
+    void add(DeviceBuffer<scalar>& dst, const std::vector<scalar>& src) { items_.push_back({&dst, &src}); }
+    void flush()
+    {
+        std::size_t n = 0;
+        for (const Item& it : items_) n += it.src->size();
+        if (n == 0)
+        {
+            items_.clear();
+            return;
+        }
+        if (done_) cudaCheck(cudaEventSynchronize(done_), "packed upload: the last copy");
+        if (n > cap_)
+        {
+            if (host_) cudaFreeHost(host_);
+            host_ = nullptr;
+            cudaCheck(cudaMallocHost(reinterpret_cast<void**>(&host_), n*sizeof(scalar)), "packed upload: pinned block");
+            cap_ = n;
+        }
+        if (staging_.size() < n) staging_.resize(n);
+        std::size_t off = 0;
+        for (const Item& it : items_)
+        {
+            std::copy(it.src->begin(), it.src->end(), host_ + off);
+            off += it.src->size();
+        }
+        cudaCheck(cudaMemcpyAsync(staging_.data(), host_, n*sizeof(scalar), cudaMemcpyHostToDevice,
+                                  cudaStreamPerThread), "packed upload: H2D");
+        off = 0;
+        for (const Item& it : items_)
+        {
+            const std::size_t m = it.src->size();
+            if (it.dst->size() != m) it.dst->resize(m);
+            if (m)
+                cudaCheck(cudaMemcpyAsync(it.dst->data(), staging_.data() + off, m*sizeof(scalar),
+                                          cudaMemcpyDeviceToDevice, cudaStreamPerThread), "packed upload: D2D");
+            off += m;
+        }
+        if (!done_) cudaCheck(cudaEventCreateWithFlags(&done_, cudaEventDisableTiming), "packed upload: event");
+        cudaCheck(cudaEventRecord(done_, cudaStreamPerThread), "packed upload: record");
+        items_.clear();
+    }
+
+private:
+    struct Item
+    {
+        DeviceBuffer<scalar>* dst;
+        const std::vector<scalar>* src;
+    };
+    std::vector<Item> items_;
+    scalar* host_ = nullptr;
+    std::size_t cap_ = 0;
+    DeviceBuffer<scalar> staging_;
+    cudaEvent_t done_ = nullptr;
 };
 
 } // namespace brae

@@ -151,11 +151,15 @@ vector faceCentreOfPoints(
     return centrePoint;
 }
 
-vector faceAverage(
+namespace {
+
+template <typename T>
+T faceAverageT(
     const PrimitiveMesh& m,
     label f,
     const std::vector<vector>& points,
-    const std::vector<vector>& fld)
+    const std::vector<T>& fld,
+    const T zero)
 {
     const label nPoints = m.faceSize(f);
     // If the face is a triangle, do a direct calculation
@@ -165,7 +169,7 @@ vector faceAverage(
     }
 
     vector centrePoint{0, 0, 0};
-    vector cf{0, 0, 0};
+    T cf = zero;
     for (label pI = 0; pI < nPoints; ++pI)
     {
         centrePoint += points[m.faceVert(f, pI)];
@@ -175,13 +179,13 @@ vector faceAverage(
     cf = cf/scalar(nPoints);
 
     scalar sumA = 0;
-    vector sumAf{0, 0, 0};
+    T sumAf = zero;
     for (label pI = 0; pI < nPoints; ++pI)
     {
         const label thisI = m.faceVert(f, pI);
         const label nextI = m.faceVert(f, (pI + 1)%nPoints);
         // Calculate 3*triangle centre field value
-        const vector ttcf = fld[thisI] + fld[nextI] + cf;
+        const T ttcf = fld[thisI] + fld[nextI] + cf;
         // Calculate 2*triangle area
         const scalar ta = mag(cross(points[thisI] - centrePoint, points[nextI] - centrePoint));
         sumA += ta;
@@ -192,6 +196,26 @@ vector faceAverage(
         return sumAf/(3*sumA);
     }
     return cf;
+}
+
+} // namespace
+
+vector faceAverage(
+    const PrimitiveMesh& m,
+    label f,
+    const std::vector<vector>& points,
+    const std::vector<vector>& fld)
+{
+    return faceAverageT<vector>(m, f, points, fld, vector{0, 0, 0});
+}
+
+scalar faceAverage(
+    const PrimitiveMesh& m,
+    label f,
+    const std::vector<vector>& points,
+    const std::vector<scalar>& fld)
+{
+    return faceAverageT<scalar>(m, f, points, fld, scalar(0));
 }
 
 scalar faceNearestDistance(

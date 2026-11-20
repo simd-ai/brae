@@ -148,9 +148,16 @@ void VolPointInterpolation::makeWeights(
     }
 }
 
-void VolPointInterpolation::interpolateInternalField(
-    const std::vector<vector>& vf,
-    std::vector<vector>& pf) const
+namespace {
+template <typename T> T zeroOf();
+template <> inline vector zeroOf<vector>() { return vector{0, 0, 0}; }
+template <> inline scalar zeroOf<scalar>() { return scalar(0); }
+} // namespace
+
+template <typename T>
+void VolPointInterpolation::internalT(
+    const std::vector<T>& vf,
+    std::vector<T>& pf) const
 {
     const std::vector<std::vector<label>>& pointCells = *pointCells_;
     for (std::size_t pointi = 0; pointi < pointCells.size(); ++pointi)
@@ -159,7 +166,7 @@ void VolPointInterpolation::interpolateInternalField(
         {
             const std::vector<scalar>& pw = pointWeights_[pointi];
             const std::vector<label>& ppc = pointCells[pointi];
-            pf[pointi] = vector{0, 0, 0};
+            pf[pointi] = zeroOf<T>();
             for (std::size_t pointCelli = 0; pointCelli < ppc.size(); ++pointCelli)
             {
                 pf[pointi] += pw[pointCelli]*vf[static_cast<std::size_t>(ppc[pointCelli])];
@@ -168,15 +175,16 @@ void VolPointInterpolation::interpolateInternalField(
     }
 }
 
-void VolPointInterpolation::interpolateBoundaryField(
-    const std::vector<std::vector<vector>>& boundaryField,
-    std::vector<vector>& pf) const
+template <typename T>
+void VolPointInterpolation::boundaryT(
+    const std::vector<std::vector<T>>& boundaryField,
+    std::vector<T>& pf) const
 {
     // flatBoundaryField: every boundary face's value, zero on empty patches
-    std::vector<vector> boundaryVals(boundary_.faces.size(), vector{0, 0, 0});
+    std::vector<T> boundaryVals(boundary_.faces.size(), zeroOf<T>());
     for (std::size_t patchi = 0; patchi < patchStart_.size(); ++patchi)
     {
-        const std::vector<vector>& pfld = boundaryField[patchi];
+        const std::vector<T>& pfld = boundaryField[patchi];
         const std::size_t offset = static_cast<std::size_t>(patchStart_[patchi] - nInternalFaces_);
         // restrict transcribing to actual size of the patch field - handles "empty" patch type etc.
         for (std::size_t i = 0; i < pfld.size(); ++i)
@@ -196,8 +204,8 @@ void VolPointInterpolation::interpolateBoundaryField(
         {
             const std::vector<label>& pFaces = boundary_.pointFaces[i];
             const std::vector<scalar>& pWeights = boundaryPointWeights_[i];
-            vector& val = pf[static_cast<std::size_t>(pointi)];
-            val = vector{0, 0, 0};
+            T& val = pf[static_cast<std::size_t>(pointi)];
+            val = zeroOf<T>();
             for (std::size_t j = 0; j < pFaces.size(); ++j)
             {
                 if (boundaryIsPatchFace_[static_cast<std::size_t>(pFaces[j])])
@@ -207,6 +215,34 @@ void VolPointInterpolation::interpolateBoundaryField(
             }
         }
     }
+}
+
+void VolPointInterpolation::interpolateInternalField(
+    const std::vector<vector>& vf,
+    std::vector<vector>& pf) const
+{
+    internalT(vf, pf);
+}
+
+void VolPointInterpolation::interpolateInternalField(
+    const std::vector<scalar>& vf,
+    std::vector<scalar>& pf) const
+{
+    internalT(vf, pf);
+}
+
+void VolPointInterpolation::interpolateBoundaryField(
+    const std::vector<std::vector<vector>>& boundaryField,
+    std::vector<vector>& pf) const
+{
+    boundaryT(boundaryField, pf);
+}
+
+void VolPointInterpolation::interpolateBoundaryField(
+    const std::vector<std::vector<scalar>>& boundaryField,
+    std::vector<scalar>& pf) const
+{
+    boundaryT(boundaryField, pf);
 }
 
 } // namespace brae

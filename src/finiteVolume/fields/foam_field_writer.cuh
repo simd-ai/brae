@@ -1,5 +1,4 @@
 #pragma once
-#include <map>
 // brae::writeVolField, write a converged volume field in OpenFOAM's own structure. Unlike a raw text splice, this
 // emits a fully RESOLVED field like OpenFOAM does: the internalField is the solved nonuniform list, and the
 // boundaryField is written per mesh patch with an explicit `type` (+ value) entry, patch groups expanded, #include /
@@ -12,6 +11,7 @@
 #include "fv_patch.cuh"            // FvPatch (name / type / inGroups)
 #include <fstream>
 #include <iomanip>
+#include <map>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -124,14 +124,84 @@ inline void writePatchEntry(
     const std::string& name,
     const PatchFieldData<T>& d,
     const T* computed = nullptr,     // solver's boundary values for this patch, or null to echo the input
-    std::size_t nComputed = 0)
+    std::size_t nComputed = 0,
+    const std::string* extra = nullptr)   // entries a solver writes for this patch, before `value`; null: none
 {
     os << "    " << name << "\n    {\n";
     os << "        type            " << (d.type.empty() ? "zeroGradient" : d.type) << ";\n";
-    if (d.hasInletValue)
+    // totalPressure, totalTemperature and waveTransmissive echo the entries OpenFOAM's readers require, under their own
+    // names, so OpenFOAM restarts from brae's output. totalPressureFvPatchScalarField::write emits rho, psi, gamma and p0
+    // in every form (.C:238-248), and its dictionary constructor REQUIRES p0: this wrote the psi form alone so (milestone
+    // H), and every other form's p0 as `inletValue`, which OpenFOAM stops on ("Entry 'p0' not found"; movingCone's rho
+    // form, found 2026-11-19, and any simpleFoam, pimpleFoam or rhoSimpleFoam case with a totalPressure outlet or inlet).
+    // uniformTotalPressure writes the same entries with p0 a Function1 (uniformTotalPressureFvPatchScalarField.C:222-232),
+    // and fanPressure totalPressure's plus its curve and direction (fanPressureFvPatchScalarField.C:223-235). Both were
+    // written as `type` + `inletValue` + `value`: OpenFOAM stopped on either ("Missing or invalid Function1 entry: p0";
+    // "Required entry 'p0' missing"), brae refused its own fanPressure output ("has no `fanCurve` entry"), and brae
+    // restarted pimpleFoam/RAS/TJunction from its own output with p0 held at p0(0) = 10 where the table ramps it to 40,
+    // saying nothing (2026-11-19).
+    const bool uniformTP = d.type == "uniformTotalPressure";
+    const bool totalPsi  = d.type == "totalPressure" || uniformTP || d.type == "fanPressure"
+                        || d.type == "totalTemperature";
+    if (totalPsi || d.type == "waveTransmissive")
     {
-        os << "        inletValue      ";
+        if (d.type == "waveTransmissive" && !d.advFieldName.empty())
+            os << "        field           " << d.advFieldName << ";\n";
+        if (d.phiName != "phi") os << "        phi             " << d.phiName << ";\n";
+        if (d.type != "totalTemperature") os << "        rho             " << d.flowRateRhoName << ";\n";
+        os << "        psi             " << d.psiName << ";\n";
+        os << "        gamma           " << d.gammaTP << ";\n";
+        if (d.type == "waveTransmissive")
+        {
+            if (d.hasAdvFieldInf) os << "        fieldInf        " << d.advFieldInf << ";\n";
+            if (d.advLInf > -1e299) os << "        lInf            " << d.advLInf << ";\n";
+        }
+    }
+    if (uniformTP && d.hasInletValue)
+    {
+        // Function1::writeData: a table as `p0 table;` + `p0Coeffs { values ...; }` (TableBase::writeEntries), which the
+        // reader takes back (its p0Coeffs entry); any other p0 the reader accepts for this type is a constant
+        const auto& pts = d.p0Function1.entries();
+        if (d.hasP0Function1 && !d.p0Function1.isCoded() && pts.size() > 1)
+        {
+            os << "        p0              table;\n        p0Coeffs\n        {\n            values          "
+               << pts.size() << "\n(\n";
+            for (const auto& e : pts) os << '(' << e.first << ' ' << e.second << ")\n";
+            os << ")\n;\n        }\n";
+        }
+        else
+        {
+            os << "        p0              constant ";
+            formatFoamValue(os, d.inletUniformValue);
+            os << ";\n";
+        }
+    }
+    else if (d.hasInletValue)
+    {
+        os << "        " << ((totalPsi && !d.totalRefKey.empty()) ? d.totalRefKey + std::string(14 - d.totalRefKey.size(), ' ')
+                                                                   : std::string("inletValue      "));
         writeFieldValue(os, d.inletUniform, d.inletUniformValue, d.inletValues);
+    }
+    if (d.type == "fanPressure")
+    {
+        // fanCurve_->writeData (`fanCurve table;` + `fanCurveCoeffs`) and `direction`, which pimpleFoam reads back from
+        // the start time's p (fan_pressure.cuh) as OpenFOAM's constructor does (.C:91-107)
+        if (!d.fanCurveType.empty() || !d.fanCurveFile.empty() || !d.fanCurveValues.empty())
+        {
+            os << "        fanCurve        " << (d.fanCurveType.empty() ? "table" : d.fanCurveType) << ";\n"
+               << "        fanCurveCoeffs\n        {\n";
+            if (!d.fanCurveFile.empty()) os << "            file            \"" << d.fanCurveFile << "\";\n";
+            if (!d.fanCurveValues.empty())
+            {
+                os << "            values          " << d.fanCurveValues.size() << "\n(\n";
+                for (const auto& e : d.fanCurveValues) os << '(' << e.first << ' ' << e.second << ")\n";
+                os << ")\n;\n";
+            }
+            if (!d.fanCurveOutOfBounds.empty())   os << "            outOfBounds     " << d.fanCurveOutOfBounds << ";\n";
+            if (!d.fanCurveInterpolation.empty()) os << "            interpolationScheme " << d.fanCurveInterpolation << ";\n";
+            os << "        }\n";
+        }
+        if (!d.fanDirection.empty()) os << "        direction       " << d.fanDirection << ";\n";
     }
     // fixedGradient's gradient is REQUIRED by OF's reader, not optional like value: omitting it made
     // OF abort with "Required entry 'gradient' : missing for patch ..." on any attempt to read brae's
@@ -234,6 +304,7 @@ inline void writePatchEntry(
     if (d.type == "turbulentMixingLengthDissipationRateInlet"
      || d.type == "turbulentMixingLengthFrequencyInlet")
         os << "        mixingLength    " << d.mixingLength << ";\n";
+    if (extra) os << *extra;
     if (computed && nComputed)
     {
         // The SOLVED boundary values, not the ones the case was started from. Echoing the input made
@@ -268,6 +339,8 @@ struct DerivedFieldSpec
 {
     const char* object = nullptr;       // FoamFile `object` entry, e.g. "rho"
     const char* dimensions = nullptr;   // full entry text, e.g. "dimensions      [1 -3 0 0 0 0 0];"
+    const char* patchType = nullptr;    // the non-constraint patches' type; null: `calculated` (rDeltaT's is
+                                        // extrapolatedCalculated, createRDeltaT.H)
 };
 
 template <typename T, typename Patch>
@@ -280,7 +353,10 @@ inline void writeVolField(
     // Flat boundary values in patch order, EXCLUDING cyclic/cyclicAMI -- the same flattening
     // DeviceBoundary uses, so a solver buffer can be handed over unchanged. Empty -> echo the input.
     const std::vector<T>& computedBoundary = {},
-    const DerivedFieldSpec* derived = nullptr)
+    const DerivedFieldSpec* derived = nullptr,
+    // per patch name, entries the solver writes before `value` (rhoCentralFoam's maxwellSlipU and smoluchowskiJumpT:
+    // the inputs and the mixed state OpenFOAM's write() emits); null: none, as before
+    const std::map<std::string, std::string>* patchExtra = nullptr)
 {
     // The ORIGINAL field is re-read here as a template: its FoamFile header, dimensions and boundaryField
     // shape are echoed into the new time directory. It may be gzipped -- OF writes `U.gz` whenever
@@ -404,16 +480,22 @@ inline void writeVolField(
             // (OF writes `empty` as `empty`), everything else is `calculated`, exactly as OF writes rho.
             synth.type = isConstraintPatchType(p.type)
                        ? p.type
-                       : (derived ? "calculated" : "zeroGradient");
+                       : (derived ? (derived->patchType ? derived->patchType : "calculated") : "zeroGradient");
             d = &synth;
         }
         const bool coupled = (isCoupledInterfaceType(p.type));
         const bool haveComputed = !computedBoundary.empty() && !coupled && p.size > 0
                                && bndOff + static_cast<std::size_t>(p.size) <= computedBoundary.size()
                                && p.type != "empty";
+        const std::string* extra = nullptr;
+        if (patchExtra)
+        {
+            const auto it = patchExtra->find(p.name);
+            if (it != patchExtra->end()) extra = &it->second;
+        }
         writePatchEntry(out, p.name, *d,
                         haveComputed ? &computedBoundary[bndOff] : nullptr,
-                        haveComputed ? static_cast<std::size_t>(p.size) : 0);
+                        haveComputed ? static_cast<std::size_t>(p.size) : 0, extra);
         if (!coupled) bndOff += static_cast<std::size_t>(p.size);
     }
     out << "}\n\n\n// ************************************************************************* //\n";
@@ -476,7 +558,13 @@ inline void writeSurfaceField(
             out << "        type            empty;\n";
         else
         {
-            out << "        type            calculated;\n        value           nonuniform List<scalar> \n" << n << "\n(\n";
+            // A constraint patch (symmetry, symmetryPlane, wedge) keeps its type, with the flux as its value, as OpenFOAM
+            // writes it: fvsPatchField::New stops on any other ("inconsistent patch and patchField types for patch type
+            // symmetry and patchField type calculated", fvsPatchFieldNew.C:127). This wrote `calculated` on them, so
+            // OpenFOAM could not restart from brae's simpleFoam, pimpleFoam or rhoSimpleFoam output on such a mesh
+            // (validation/windAroundBuildingsBox's frontAndBack, 2026-11-19).
+            out << "        type            " << (isConstraintPatchType(p.type) ? p.type : std::string("calculated"))
+                << ";\n        value           nonuniform List<scalar> \n" << n << "\n(\n";
             for (std::size_t i = 0; i < n; ++i) out << phiBoundary[off + i] << '\n';
             out << ")\n;\n";
         }

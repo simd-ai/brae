@@ -617,4 +617,13 @@ void deviceDivDevReff(
     if (ami) interfaceAddTensorDiv(*ami, sigmaC, nC, srcX, srcY, srcZ);      // + AMI-face stress flux
 }
 
+void deviceScaledDev2T(int n, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nu,
+                       DeviceBuffer<scalar>& sigma)
+{
+    sigma.resize(9*static_cast<std::size_t>(n));
+    if (n == 0) return;
+    sigmaKernel<<<nBlocks(n), TPB>>>(n, gradU.data(), nu.data(), sigma.data());
+    cudaCheck(cudaGetLastError(), "nu*dev2(T(gradU))");
+}
+
 } // namespace brae

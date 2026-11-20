@@ -387,6 +387,32 @@ void deviceUpdateFlowRateInletDev(DeviceVectorBoundary& dbU, const DeviceBuffer<
 void deviceGatherPatchInternal(const DeviceBoundary& db, const DeviceBuffer<scalar>& cellField,
                                DeviceBuffer<scalar>& out);
 
+// Compressible inflow/outflow boundaries (rhoCentralFoam's nozzle boundaries, milestone H), each on a list of the
+// boundary's faces (flat indices into db) with its own per-face reference and gamma. They write those faces' refValue
+// (and, for the advective one, valueFraction), which deviceBCValue then evaluates as a fixedValue (bcType 1) or mixed
+// (bcType 5) face. Every product OpenFOAM's field algebra stores before it is used is rounded alone.
+//   totalPressureFvPatchScalarField::updateCoeffs, the psi (isentropic, high-speed) branch, totalPressure...C:
+//     gamma > 1:  p_b = p0/pow(1 + 0.5*psi_b*gM1ByG*neg(phi_b)*magSqr(U_b), 1/gM1ByG),  gM1ByG = (gamma - 1)/gamma
+//     else:       p_b = p0/(1 + 0.5*psi_b*neg(phi_b)*magSqr(U_b))
+//   totalTemperatureFvPatchScalarField::updateCoeffs:  T_b = T0/(1 + 0.5*psi_b*gM1ByG*neg(phi_b)*magSqr(U_b))
+//   waveTransmissiveFvPatchField / advectiveFvPatchField::updateCoeffs with Euler (or CrankNicolson):
+//     w = max(phi_b[/rho_b]/magSf + sqrt(gamma/psi_b), 0), alpha = w*deltaT*deltaCoeffs;
+//     lInf > 0: k = w*deltaT/lInf, refValue = (f_b,old + k*fieldInf)/(1 + k), valueFraction = (1 + k)/(1 + alpha + k)
+//     else:     refValue = f_b,old, valueFraction = 1/(1 + alpha)        (refGrad 0: advective's constructor)
+//   phiIsMass: phi is a mass flux (dimMass/dimTime), divided by rho_b first, as waveTransmissive's advectionSpeed does.
+void deviceUpdateTotalPressurePsi(DeviceBoundary& db, const DeviceBuffer<label>& faces, const DeviceBuffer<scalar>& p0,
+                                  const DeviceBuffer<scalar>& gamma, const DeviceBuffer<scalar>& phiB,
+                                  const DeviceBuffer<scalar>& Uxb, const DeviceBuffer<scalar>& Uyb,
+                                  const DeviceBuffer<scalar>& Uzb, const DeviceBuffer<scalar>& psiB);
+void deviceUpdateTotalTemperature(DeviceBoundary& db, const DeviceBuffer<label>& faces, const DeviceBuffer<scalar>& T0,
+                                  const DeviceBuffer<scalar>& gamma, const DeviceBuffer<scalar>& phiB,
+                                  const DeviceBuffer<scalar>& Uxb, const DeviceBuffer<scalar>& Uyb,
+                                  const DeviceBuffer<scalar>& Uzb, const DeviceBuffer<scalar>& psiB);
+void deviceUpdateWaveTransmissive(DeviceBoundary& db, const DeviceBuffer<label>& faces,
+                                  const DeviceBuffer<scalar>& fieldInf, const DeviceBuffer<scalar>& lInf,
+                                  const DeviceBuffer<scalar>& gamma, const DeviceBuffer<scalar>& fOldB,
+                                  const DeviceBuffer<scalar>& phiB, const DeviceBuffer<scalar>& rhoB,
+                                  const DeviceBuffer<scalar>& psiB, scalar deltaT, bool phiIsMass);
 void deviceUpdateTotalPressure(DeviceBoundary& db, const DeviceBuffer<scalar>& phiB, const DeviceBuffer<scalar>& Uxb,
                                const DeviceBuffer<scalar>& Uyb, const DeviceBuffer<scalar>& Uzb,
                                const DeviceBuffer<scalar>* rhoBnd = nullptr);   // compressible: rho at the face
@@ -788,6 +814,66 @@ inline DeviceVectorBoundary buildDeviceVectorBoundary(
     bool storedIoSeed = false)   // as the scalar builder's
 {
     return uploadDeviceVectorBoundary(deviceVectorBoundaryArrays(f, fvp, g, storedIoSeed));
+}
+
+// THE GEOMETRY A MOVING MESH CHANGES in a built boundary, without building it again: every uncoupled patch's faces in
+// patch order, as both builders above lay them out (empty patches included) -- the patch's deltaCoeffs, magSf, and
+// the vector builder's gradient mirror normal (gradSymN) and unit normals nx/ny/nz, each in that builder's arithmetic:
+// Sf/magSf by DIVISION (0 where magSf is 0), a symmetryPlane's normal summed in face order. The arrays are the ones a
+// fresh build gives, element for element; a caller copies them over the built boundary's (DeviceBoundary::
+// deltaCoeffs, magSf, gradSymN; DeviceVectorBoundary::nx/ny/nz). Measured motive: rhoCentralFoam's mesh.update()
+// rebuilt U's, p's and T's whole boundaries to keep these, 7.1 of the 11.9 ms a step on movingCone (milestone K).
+struct DeviceBoundaryGeometryHost
+{
+    std::vector<scalar> dc, ms, gsn, nrm[3];
+};
+
+inline DeviceBoundaryGeometryHost deviceBoundaryGeometry(
+    const std::vector<FvPatch>& fvp,
+    const FvGeometry& g)
+{
+    DeviceBoundaryGeometryHost h;
+    std::size_t nAll = 0;
+    for (const FvPatch& p : fvp)
+    {
+        if (!isCoupledInterfaceType(p.type)) nAll += static_cast<std::size_t>(p.size);
+    }
+    h.dc.reserve(nAll);
+    h.ms.reserve(nAll);
+    h.gsn.reserve(3*nAll);
+    for (int k = 0; k < 3; ++k) h.nrm[k].reserve(nAll);
+    for (const FvPatch& p : fvp)
+    {
+        if (isCoupledInterfaceType(p.type)) continue;
+        const bool gradSym = (p.type == "symmetry");
+        vector planeN{0, 0, 0};
+        if (p.type == "symmetryPlane")
+        {
+            vector sumA{0, 0, 0};
+            for (label i = 0; i < p.size; ++i)
+            {
+                sumA = sumA + g.Sf()[p.start + i];
+            }
+            const scalar a = mag(sumA);
+            planeN = (a > scalar(1.0e-150)) ? sumA/a : vector{0, 0, 0};
+        }
+        for (label i = 0; i < p.size; ++i)
+        {
+            const label gf = p.start + i;
+            h.dc.push_back(p.deltaCoeffs[i]);
+            h.ms.push_back(g.magSf()[gf]);
+            const vector n = gradSym ? g.Sf()[gf]/g.magSf()[gf] : planeN;
+            h.gsn.push_back(n.x);
+            h.gsn.push_back(n.y);
+            h.gsn.push_back(n.z);
+            const vector Sf = g.Sf()[gf];
+            const scalar mg = g.magSf()[gf];
+            h.nrm[0].push_back(mg > 0 ? Sf.x / mg : 0.0);
+            h.nrm[1].push_back(mg > 0 ? Sf.y / mg : 0.0);
+            h.nrm[2].push_back(mg > 0 ? Sf.z / mg : 0.0);
+        }
+    }
+    return h;
 }
 
 // WHAT THE NON-STATE ARRAYS ARE BUILT FROM: the boundary's geometry (face cells, the patches' deltaCoeffs, Sf

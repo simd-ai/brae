@@ -92,6 +92,9 @@ rounding error, not a change in the physics, and it is expected of any GPU reimp
 - **"unsupported RASModel '…'"**, brae supports laminar, kEpsilon, realizableKE, kOmegaSST, kOmegaSSTLM,
   SpalartAllmaras. See [solvers/simplefoam.md](solvers/simplefoam.md).
 - **"unsupported BC type '…'"**, the boundary condition isn't implemented yet; the error names it.
+- **"... is a uniformTotalPressure with no `p0` entry"** or **"fanPressure on patch ... has no `p0` entry"** on a
+  restart: the time directory was written by an older brae, which lost the patch's p0 definition. Restore it from the
+  case's `0/` file as [restart-older-output.md](restart-older-output.md) shows.
 - **Out of memory**, the mesh is larger than your GPU's memory. Brae is single-GPU (see
   [roadmap.md](roadmap.md)).
 - Brae fails *clearly* on anything it doesn't support (it names the model / BC and stops) rather than producing

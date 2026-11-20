@@ -16,9 +16,12 @@
 
 namespace brae {
 
-// THE LIMITER OF r, selected by twoByk as the comment above says. Shared by the scalar kernel and the
-// V kernel, so that `vanLeerV` and `vanLeer` are one expression and not two.
-__device__ __forceinline__ scalar limiterOfR(
+// THE LIMITER OF r, selected by twoByk as the comment above says (device_mesh.cuh: > 0 limitedLinear's 2/max(k,SMALL),
+// kVanLeerTwoByk, kMinmodTwoByk, kMUSCLTwoByk, kSuperBeeTwoByk, kUpwindTwoByk, anything else vanAlbada). Shared by the
+// scalar kernel and the V kernel, so that `vanLeerV` and `vanLeer` are one expression and not two -- and by the HOST
+// reference (BRAE_HD), so that each limiter is written once. min and max are std::min's (b < a ? b : a) and std::max's
+// (a < b ? b : a), clamp OpenFOAM's (val < lo ? lo : hi < val ? hi : val), each in its own statement.
+BRAE_HD inline scalar limiterOfR(
     scalar r,
     scalar twoByk)
 {
@@ -27,6 +30,29 @@ __device__ __forceinline__ scalar limiterOfR(
     {
         limiter = twoByk * r;
         limiter = (limiter < 0.0) ? 0.0 : (limiter > 1.0 ? 1.0 : limiter);    // clamp(.,0,1)
+    }
+    else if (twoByk == kMinmodTwoByk)
+    {
+        limiter = (r < 0.0) ? 0.0 : (1.0 < r ? 1.0 : r);                       // Minmod.H:84 clamp(r, zero_one)
+    }
+    else if (twoByk == kMUSCLTwoByk)
+    {
+        const scalar a = 2*r;                                                    // MUSCL.H:84
+        const scalar b = 0.5*r + 0.5;
+        const scalar m = (b < a) ? b : a;                                        // min(2r, 0.5r + 0.5)
+        limiter = (m < 0.0) ? 0.0 : (2.0 < m ? 2.0 : m);                        // clamp(., 0, 2)
+    }
+    else if (twoByk == kSuperBeeTwoByk)
+    {
+        const scalar a2 = 2*r;                                                   // SuperBee.H:85
+        const scalar a = (1.0 < a2) ? 1.0 : a2;                                  // min(2r, 1)
+        const scalar b = (2.0 < r) ? 2.0 : r;                                    // min(r, 2)
+        const scalar m = (a < b) ? b : a;                                        // max(., .)
+        limiter = (m < 0.0) ? 0.0 : m;                                           // max(., 0)
+    }
+    else if (twoByk == kUpwindTwoByk)
+    {
+        limiter = 0.0;                                                           // upwind: weights pos0(faceFlux)
     }
     else if (twoByk == kVanLeerTwoByk)
     {

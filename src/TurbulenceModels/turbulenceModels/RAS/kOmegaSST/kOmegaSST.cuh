@@ -268,6 +268,23 @@ void correct(
     const DeviceWallData&       wall,
     const KOmegaSSTInput&       in);
 
+// kOmegaSSTBase::correctNut(S2) and EddyDiffusivity::correctNut (alphat = rho*nut/Prt): correct()'s last stage, the
+// member OpenFOAM's validate() calls with S2 = 2*magSqr(symm(fvc::grad(U))). gradU is that fvc::grad(U).
+void correctNut(
+    const DeviceBuffer<scalar>& k,
+    const DeviceBuffer<scalar>& omega,
+    DeviceBuffer<scalar>&       nut,
+    DeviceBuffer<scalar>&       nutBnd,
+    DeviceBuffer<scalar>*       alphat,
+    DeviceBuffer<scalar>*       alphatBnd,
+    const DeviceBuffer<scalar>& S2,
+    const DeviceBuffer<scalar>& gradU,
+    const DeviceMesh&           dm,
+    const DeviceVectorBoundary& dbU,
+    const DeviceBoundary&       dbK,
+    const DeviceBoundary&       dbOmega,
+    const KOmegaSSTInput&       in);
+
 } // namespace kOmegaSSTRAS
 } // namespace gpu
 } // namespace brae

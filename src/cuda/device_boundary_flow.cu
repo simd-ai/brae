@@ -1249,4 +1249,119 @@ void deviceUpdateTurbulentInletSecond(
     cudaCheck(cudaGetLastError(), "mixingLengthInlet");
 }
 
+// ---- compressible inflow/outflow boundaries (milestone H; see device_boundary.cuh) ------------------------------------
+namespace {
+constexpr int kTPBn = 256;
+inline int blocksN(int n) { return (n + kTPBn - 1)/kTPBn; }
+
+// 0.5*psi*gM1ByG*neg(phi)*magSqr(U), each field product rounded alone; gM1ByG < 0 marks gamma <= 1 (no gM1ByG factor)
+__device__ __forceinline__ scalar totalHead(scalar psi, scalar gM1ByG, scalar phi, scalar ux, scalar uy, scalar uz)
+{
+    const scalar ng = (phi < 0) ? scalar(1) : scalar(0);   // Foam::neg
+    const scalar m = ux*ux + uy*uy + uz*uz;               // magSqr
+    scalar t = __dmul_rn(scalar(0.5), psi);
+    if (gM1ByG > 0) t = __dmul_rn(t, gM1ByG);
+    t = __dmul_rn(t, ng);
+    return __dmul_rn(t, m);
+}
+__global__ void totalPressurePsiKernel(int n, const label* __restrict__ faces, const scalar* __restrict__ p0,
+                                       const scalar* __restrict__ gamma, const scalar* __restrict__ phi,
+                                       const scalar* __restrict__ ux, const scalar* __restrict__ uy,
+                                       const scalar* __restrict__ uz, const scalar* __restrict__ psi,
+                                       scalar* __restrict__ ref)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const label k = faces[i];
+    const scalar g = gamma[i];
+    if (g > 1)
+    {
+        const scalar gM1ByG = (g - 1)/g;
+        ref[k] = p0[i]/pow(scalar(1.0) + totalHead(psi[k], gM1ByG, phi[k], ux[k], uy[k], uz[k]), scalar(1.0)/gM1ByG);
+    }
+    else
+        ref[k] = p0[i]/(scalar(1.0) + totalHead(psi[k], scalar(-1), phi[k], ux[k], uy[k], uz[k]));
+}
+__global__ void totalTemperatureKernel(int n, const label* __restrict__ faces, const scalar* __restrict__ T0,
+                                       const scalar* __restrict__ gamma, const scalar* __restrict__ phi,
+                                       const scalar* __restrict__ ux, const scalar* __restrict__ uy,
+                                       const scalar* __restrict__ uz, const scalar* __restrict__ psi,
+                                       scalar* __restrict__ ref)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const label k = faces[i];
+    const scalar g = gamma[i];
+    const scalar gM1ByG = (g - scalar(1.0))/g;
+    ref[k] = T0[i]/(scalar(1.0) + totalHead(psi[k], gM1ByG, phi[k], ux[k], uy[k], uz[k]));
+}
+__global__ void waveTransmissiveKernel(int n, const label* __restrict__ faces, const scalar* __restrict__ fieldInf,
+                                       const scalar* __restrict__ lInf, const scalar* __restrict__ gamma,
+                                       const scalar* __restrict__ fOld, const scalar* __restrict__ phi,
+                                       const scalar* __restrict__ rho, const scalar* __restrict__ psi,
+                                       const scalar* __restrict__ magSf, const scalar* __restrict__ dc,
+                                       scalar deltaT, int phiIsMass, scalar* __restrict__ ref,
+                                       scalar* __restrict__ vf)
+{
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const label k = faces[i];
+    scalar ph = phi[k];
+    if (phiIsMass) ph = ph/rho[k];
+    const scalar adv = ph/magSf[k] + sqrt(gamma[i]/psi[k]);   // advectionSpeed()
+    const scalar w = (adv > 0) ? adv : scalar(0);              // max(advectionSpeed, 0)
+    const scalar alpha = __dmul_rn(__dmul_rn(w, deltaT), dc[k]);
+    if (lInf[i] > 0)
+    {
+        const scalar kk = __dmul_rn(w, deltaT)/lInf[i];
+        ref[k] = (fOld[k] + __dmul_rn(kk, fieldInf[i]))/(scalar(1.0) + kk);
+        vf[k] = (scalar(1.0) + kk)/((scalar(1.0) + alpha) + kk);
+    }
+    else
+    {
+        ref[k] = fOld[k];
+        vf[k] = scalar(1.0)/(scalar(1.0) + alpha);
+    }
+}
+} // namespace
+
+void deviceUpdateTotalPressurePsi(DeviceBoundary& db, const DeviceBuffer<label>& faces, const DeviceBuffer<scalar>& p0,
+                                  const DeviceBuffer<scalar>& gamma, const DeviceBuffer<scalar>& phiB,
+                                  const DeviceBuffer<scalar>& Uxb, const DeviceBuffer<scalar>& Uyb,
+                                  const DeviceBuffer<scalar>& Uzb, const DeviceBuffer<scalar>& psiB)
+{
+    const int n = static_cast<int>(faces.size());
+    if (!n) return;
+    totalPressurePsiKernel<<<blocksN(n), kTPBn>>>(n, faces.data(), p0.data(), gamma.data(), phiB.data(), Uxb.data(),
+                                                  Uyb.data(), Uzb.data(), psiB.data(), db.refValue.data());
+    cudaCheck(cudaGetLastError(), "totalPressure (psi)");
+}
+
+void deviceUpdateTotalTemperature(DeviceBoundary& db, const DeviceBuffer<label>& faces, const DeviceBuffer<scalar>& T0,
+                                  const DeviceBuffer<scalar>& gamma, const DeviceBuffer<scalar>& phiB,
+                                  const DeviceBuffer<scalar>& Uxb, const DeviceBuffer<scalar>& Uyb,
+                                  const DeviceBuffer<scalar>& Uzb, const DeviceBuffer<scalar>& psiB)
+{
+    const int n = static_cast<int>(faces.size());
+    if (!n) return;
+    totalTemperatureKernel<<<blocksN(n), kTPBn>>>(n, faces.data(), T0.data(), gamma.data(), phiB.data(), Uxb.data(),
+                                                  Uyb.data(), Uzb.data(), psiB.data(), db.refValue.data());
+    cudaCheck(cudaGetLastError(), "totalTemperature");
+}
+
+void deviceUpdateWaveTransmissive(DeviceBoundary& db, const DeviceBuffer<label>& faces,
+                                  const DeviceBuffer<scalar>& fieldInf, const DeviceBuffer<scalar>& lInf,
+                                  const DeviceBuffer<scalar>& gamma, const DeviceBuffer<scalar>& fOldB,
+                                  const DeviceBuffer<scalar>& phiB, const DeviceBuffer<scalar>& rhoB,
+                                  const DeviceBuffer<scalar>& psiB, scalar deltaT, bool phiIsMass)
+{
+    const int n = static_cast<int>(faces.size());
+    if (!n) return;
+    waveTransmissiveKernel<<<blocksN(n), kTPBn>>>(n, faces.data(), fieldInf.data(), lInf.data(), gamma.data(),
+                                                  fOldB.data(), phiB.data(), rhoB.data(), psiB.data(), db.magSf.data(),
+                                                  db.deltaCoeffs.data(), deltaT, phiIsMass ? 1 : 0,
+                                                  db.refValue.data(), db.valueFraction.data());
+    cudaCheck(cudaGetLastError(), "waveTransmissive");
+}
+
 }   // namespace brae

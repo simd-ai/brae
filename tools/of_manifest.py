@@ -5083,6 +5083,228 @@ COMPONENTS = {
                   "walls bound throughout. Two round trips remain -- the batch coming back and the result "
                   "going out -- and the second needs a pinned staging buffer to go async."),
     ],
+    # rhoCentralFoam, EXPERIMENTAL (stage 1 2026-11-16; milestone B, adjustTimeStep, C, the transform patches, D,
+    # inletOutlet and purgeWrite, E, restart, 2026-11-17, and F, the reconstruction limiters, 2026-11-18): single GPU, static mesh, inviscid laminar, a fixed deltaT or
+    # adjustTimeStep, hePsiThermo + perfectGas + hConst + const, Kurganov/Tadmor, vanLeer/vanLeerV, zeroGradient/
+    # fixedValue/empty/slip/symmetryPlane/symmetry/wedge/inletOutlet, any purgeWrite. Everything else is UNSUPPORTED
+    # and refused by name (tests/rho_central_refusals.sh). Not SIMPLE or PIMPLE: no pressure
+    # equation; rho, rhoU, rhoE advance explicitly and p = rho/psi.
+    "rhoCentralFoam": [
+        dict(name="rhoCentralFoam_main", of_symbol="main", of_file="applications/solvers/compressible/rhoCentralFoam/rhoCentralFoam.C",
+             classification="HOST_ONLY", status="REIMPLEMENT",
+             brae_driver="src/applications/solvers/rhoCentralFoam/rhoCentralFoam.cu",
+             brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralStep_cpp.cu", brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralStep.cu",
+             brae_target="src/applications/solvers/rhoCentralFoam/gpuRhoCentralFoam.cu",
+             validation="tests/rho_central_sod_vs_openfoam.sh -- shockTube (Sod) with adjustTimeStep no, deltaT "
+                        "1e-5, 700 steps: CUDA arm 7.9e-15, host arm 7.7e-15, Tadmor 7.8e-15 relative L2 on U p T "
+                        "rho at all 7 write times (bound 8e-14); 1000 cells / 7000 steps 1.9e-14 (bound 2e-13). "
+                        "Controls red: first-order upwind 9.8e-02, energy flux without aSf*(p_pos - p_neg) 6.2e-03, "
+                        "Tadmor against Kurganov 8.8e-03. Against the exact Riemann solution the shock lands 0.21 "
+                        "cells off and the contact 0.24 (100 cells), L1(rho) 6.3e-03 -> 7.5e-04 at 1000 cells, "
+                        "OpenFOAM's figures the same to 1e-9. tests/rho_central_shocktube_vs_openfoam.sh -- the "
+                        "tutorial AS SHIPPED (adjustTimeStep yes, maxCo 0.2): 142 steps, every deltaT and time name "
+                        "identical to OpenFOAM's on both arms, U p T rho 3.1e-15 at all 7 write times; Tadmor and "
+                        "1000 cells likewise identical in deltaT; maxDeltaT binding and runTime/timeStep writes "
+                        "likewise. tests/rho_central_wedge_vs_openfoam.sh -- wedge15Ma5 and obliqueShock AS SHIPPED, "
+                        "a symmetry and a slip variant and an axisymmetric cone on wedge patches: OpenFOAM's step "
+                        "count, time names and directories; fields within ten times OpenFOAM's own decomposed spread "
+                        "at every write time and every early step; shock angles equal to OpenFOAM's. "
+                        "tests/rho_central_forwardstep_vs_openfoam.sh -- forwardStep AS SHIPPED (inletOutlet outlet, "
+                        "purgeWrite 10): 6694 steps, every deltaT and time name the same as OpenFOAM's, the same 11 "
+                        "directories left; at 17 digits all 40 write times within ten times OpenFOAM's own spread; "
+                        "an inflow inletOutlet inlet and a tube whose end turns from outflow to inflow likewise. "
+                        "Does NOT claim viscous flow, 3-D, or patch types beyond zeroGradient, fixedValue, empty, "
+                        "slip, symmetryPlane, symmetry, wedge and inletOutlet."),
+        dict(name="createFields", of_symbol="createFields.H", of_file="applications/solvers/compressible/rhoCentralFoam/createFields.H",
+             classification="HOST_ONLY", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralCreateFields_cpp.cu",
+             validation="rho_central_sod_vs_openfoam (the whole run starts from it); includes heThermo::init and "
+                        "hePsiThermo's constructor calculate(), which re-derives T from he on construction."),
+        dict(name="readFluxScheme", of_symbol="readFluxScheme.H", of_file="applications/solvers/compressible/rhoCentralFoam/readFluxScheme.H",
+             classification="CONFIGURATION", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralControls.cu",
+             validation="Kurganov and Tadmor arms of rho_central_sod_vs_openfoam; any other value refused "
+                        "(rho_central_refusals sod_fluxScheme), as OpenFOAM's FatalError."),
+        dict(name="directionInterpolate", of_symbol="interpolate(vf, dir, reconFieldName)",
+             of_file="applications/solvers/compressible/rhoCentralFoam/directionInterpolate.H",
+             classification="GPU_REQUIRED", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralFlux_cpp.cu",
+             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralFlux.cu",
+             validation="vanLeer (NVDTVD) on rho, rPsi, e, c and vanLeerV (NVDVTVDV) on rhoU, direction +1/-1, "
+                        "limiter gradients Gauss linear through brae's deviceGaussGradFused. The upwind control "
+                        "(limiter 0) is 9.8e-02 off OpenFOAM. Other limiters and gradient schemes refused."),
+        dict(name="limitedScheme_weights", of_symbol="limitedSurfaceInterpolationScheme::weights",
+             of_file="src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/"
+                     "limitedSurfaceInterpolationScheme/limitedSurfaceInterpolationScheme.C",
+             classification="SHARED_NUMERICAL", status="REIMPLEMENT", brae_existing="src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedSchemes_cpp.cuh (host: rScalar, rVector, vanLeerLimiter, blend); src/cuda/device_limiter.cuh (device: limitedFaceWeight, limiterOfR)",
+             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralFlux.cu",
+             note="limiter*CDweight + (1 - limiter)*pos0(dir); face value w*(P - N) + N (dotInterpolate's form)."),
+        dict(name="centralUpwindFlux", of_symbol="ap/am/a_pos/aSf/phi/phiUp/phiEp", of_file="applications/solvers/compressible/rhoCentralFoam/rhoCentralFoam.C",
+             of_line=114, classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralFaceFlux.cuh", brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralFaceFlux.cuh",
+             validation="rho_central_sod_vs_openfoam; the noPressureJump control (phiEp without aSf*p terms) "
+                        "6.2e-03 red."),
+        dict(name="centralCourantNo", of_symbol="centralCourantNo.H", of_file="applications/solvers/compressible/rhoCentralFoam/centralCourantNo.H",
+             classification="GPU_REQUIRED", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralFlux_cpp.cu",
+             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralStep.cu",
+             note="computed every step at the step's own deltaT and logged at writePrecision, as Info prints it; "
+                  "under adjustTimeStep it feeds the next step's setDeltaT.H. The max is order-free, so the device's "
+                  "equals the host's to the bit given the same amaxSf; the mean is a sum in another order on the "
+                  "device. rho_central_shocktube_vs_openfoam: max within 4.1e-15 of OpenFOAM's at every step."),
+        dict(name="explicitDiagonalSolves", of_symbol="solve(fvm::ddt(q) + fvc::div(flux))",
+             of_file="src/finiteVolume/finiteVolume/ddtSchemes/EulerDdtScheme/EulerDdtScheme.C",
+             classification="GPU_REQUIRED", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralCellUpdate.cuh",
+             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralCellUpdate.cuh",
+             note="x = (rDeltaT*q0*V - V*div)/(rDeltaT*V), surfaceIntegrate in OpenFOAM's face order; a vector "
+                  "component knocked out by an empty patch is not solved (fvMatrixSolve.C validComponents)."),
+        dict(name="hePsiThermo_calculate", of_symbol="hePsiThermo::calculate",
+             of_file="src/thermophysicalModels/basic/psiThermo/hePsiThermo.C",
+             classification="MODEL", status="REIMPLEMENT", brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralThermo.cuh src/applications/solvers/rhoCentralFoam/rhoCentralCellUpdate.cuh src/applications/solvers/rhoCentralFoam/rhoCentralPatchUpdate.cuh",
+             note="species::thermo::T's Newton loop from the field's own T (Ttol = T0*1e-4), Es = Hs - p/rho(p,T); "
+                  "the gradientEnergy patch's Tw.evaluate() seeds the patch inversion with the cell's old T. "
+                  "sutherlandTransport (milestone H): mu = As*sqrt(T)/(1 + Ts/T), kappa = mu*Cv*(1.32 + 1.77*R/Cv), "
+                  "alphah = kappa/Cp (rhoCentralThermo.cuh gasSutherlandMu/gasSutherlandAlphahe)."),
+        dict(name="boundaryConditions", of_symbol="zeroGradient/fixedValue/empty",
+             of_file="src/finiteVolume/fields/fvPatchFields/basic/zeroGradient/zeroGradientFvPatchField.C",
+             classification="BOUNDARY_CONDITION", status="REIMPLEMENT", brae_existing="src/finiteVolume/fields/fv_patch_field.cuh (host patch fields); src/cuda/device_boundary.cuh deviceBCValue (device)",
+             brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralPatchUpdate.cuh",
+             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralStep.cu",
+             validation="tests/rho_central_wedge_vs_openfoam.sh: wedge15Ma5 and obliqueShock as shipped (fixedValue "
+                        "inlets and top, zeroGradient outlets and obstacle, whose waves reach them); the Sod gate. "
+                        "tests/rho_central_nozzle_vs_openfoam.sh (milestone H): LadenburgJet60psi AS SHIPPED (totalPressure "
+                        "and totalTemperature on its freestream, waveTransmissive at its outlet, noSlip, wedge, sutherland): "
+                        "7611 steps, every deltaT and time name OpenFOAM's, all 30444 U and e solves at OpenFOAM serial's "
+                        "iteration counts, U p T rho within 4.9e-13 of serial (0.104 of the bound), the patches' p, T, U "
+                        "within 6.1e-14, the freestream's 17 outflow and 43 inflow faces the same; a reservoir, a pulse and "
+                        "an outflow through the total conditions in a tube, inviscid and with sutherland; controls red "
+                        "(no dynamic head, the switch inverted, lInf ignored, the wave speed from a volume flux, T_b not "
+                        "re-evaluated at the e matrix: 1e+02 to 4e+10 x the bound).",
+             note="zeroGradient, fixedValue and empty gated (wedge15Ma5, obliqueShock, forwardStep); noSlip on U, "
+                  "totalPressure (the isentropic psi form) and waveTransmissive on p, totalTemperature on T (milestone H, "
+                  "the CUDA arm: rhoCentralStep.cu at OpenFOAM's update points, src/cuda/device_boundary_flow.cu "
+                  "deviceUpdateTotalPressurePsi/deviceUpdateTotalTemperature/deviceUpdateWaveTransmissive). totalPressure's "
+                  "rho and incompressible forms, these patches on other fields or fluxes, partialSlip, outletInlet, "
+                  "maxwellSlipU, smoluchowskiJumpT UNSUPPORTED (refused). The transform patches: transformPatches; "
+                  "inletOutlet: inletOutlet."),
+        dict(name="inletOutlet", of_symbol="inletOutletFvPatchField::updateCoeffs",
+             of_file="src/finiteVolume/fields/fvPatchFields/derived/inletOutlet/inletOutletFvPatchField.C",
+             classification="BOUNDARY_CONDITION", status="REUSE_EXISTING",
+             brae_existing="src/finiteVolume/fields/fv_patch_field.cuh (InletOutletPatchField::updateFromFlux, "
+                           "host); src/cuda/device_boundary_flow.cu (deviceUpdateInletOutlet, device)",
+             brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralStep_cpp.cu",
+             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralStep.cu",
+             validation="tests/rho_central_forwardstep_vs_openfoam.sh: forwardStep's outlet as shipped (outflow on "
+                        "every face and step), its inlet as inletOutlet (inflow on U, p, T), and a shockTube whose "
+                        "left end turns from outflow to inflow mid-run, restarted from OpenFOAM's own t = 0.013 and "
+                        "compared every step through the switch; the patch values compared too. Controls red: the "
+                        "switch on -phi, on the step before's phi, and T's inletOutlet on the new cell T.",
+             note="valueFraction = 1 - pos0(phi) on rhoCentralFoam.C:195's mass flux, this step's, before U (232), "
+                  "T (265, inside mixedEnergy's Tw.evaluate(), on the OLD cell T) and p (287); e_b = HE(p_b, T_b) "
+                  "since mixed fixesValue(). phi's two products are rounded separately, as OpenFOAM's field algebra "
+                  "does, so a face at rest has phi exactly 0 (outflow). A `phi` other than `phi`, or no inletValue, "
+                  "refused."),
+        dict(name="purgeWrite", of_symbol="Time::writeObject (purgeWrite)",
+             of_file="src/OpenFOAM/db/Time/TimeIO.C",
+             classification="HOST_ONLY", status="REUSE_EXISTING",
+             brae_existing="src/OpenFOAM/db/Time/purge_write.cuh (PurgeWrite; WriteControl::recordWritten calls it)",
+             brae_driver="src/applications/solvers/rhoCentralFoam/rhoCentralFoam.cu",
+             validation="tests/rho_central_forwardstep_vs_openfoam.sh: forwardStep as shipped (purgeWrite 10, "
+                        "adjustable writes) on both arms, shockTube with purgeWrite 2 (timeStep writes) and 3 (runTime "
+                        "writes): every directory left, 0 included, the same as OpenFOAM's. Control red: purgeWrite "
+                        "ignored leaves 41 directories against 11.",
+             note="the FIFO of TimeIO.C:557-582: push the time name unless it is the last pushed, remove the oldest "
+                  "beyond N after the write; the start directory is never pushed. A negative value is warned about "
+                  "and taken as 0 (TimeIO.C:324-332)."),
+        dict(name="transformPatches", of_symbol="symmetryPlane/symmetry/slip/wedge",
+             of_file="src/finiteVolume/fields/fvPatchFields/constraint/symmetryPlane/symmetryPlaneFvPatchField.C",
+             classification="BOUNDARY_CONDITION", status="REIMPLEMENT",
+             brae_existing="src/finiteVolume/fields/fv_patch_field.cuh (SymmetryPlanePatchField, WedgePatchField: "
+                           "the types, p's and T's values); src/OpenFOAM/meshes/wedge_patch.cuh (faceT)",
+             brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralPatchUpdate.cuh",
+             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralStep.cu",
+             validation="tests/rho_central_wedge_vs_openfoam.sh: symmetryPlane (wedge15Ma5, obliqueShock), slip on U "
+                        "(wedge15Ma5's 15-degree ramp) and on p and T, symmetry (top, bottom and ramp), wedge (a "
+                        "15-degree cone). Controls red: U unprojected; rhoU_b, rhoE_b by last step's rho_b.",
+             note="U's value is OpenFOAM's (iF + (I - 2.0*sqr(nHat)) & iF)/2.0 (nHat the patch's area-weighted "
+                  "normal on symmetryPlane, Sf/magSf per face on symmetry and slip) or faceT & iF, for both arms in "
+                  "transformPatchU. On a constraint mesh patch rho, rhoU and rhoE take the constraint type, so "
+                  ":233 and :267 multiply by the rho solve's new cell rho; a transform T makes he the same transform, "
+                  "e_b = e_P and THE seeded from T_b."),
+        dict(name="reconstructLimiters", of_symbol="vanLeer/vanAlbada/Minmod/MUSCL/SuperBee/limitedLinear (+V), upwind",
+             of_file="src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/LimitedScheme/LimitedScheme.C",
+             classification="GPU_REQUIRED", status="REUSE_EXISTING",
+             brae_existing="src/cuda/device_limiter.cuh (limiterOfR, BRAE_HD; the selectors in src/cuda/device_mesh.cuh)",
+             brae_reference="src/applications/solvers/rhoCentralFoam/rhoCentralFlux_cpp.cu",
+             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralFlux.cu",
+             validation="tests/rho_central_riemann_vs_openfoam.sh: Sod, Lax, 123 and a strong shock tube with each "
+                        "limiter (two with Tadmor) and obliqueShock in 2-D with each V form, against OpenFOAM and the "
+                        "exact solution. Open, for review: three compressive-limiter cases OpenFOAM's own decomposed "
+                        "runs do not reproduce step by step, and the strong shock's first write, where brae sits on "
+                        "OpenFOAM's own one-ulp response. Controls red: vanLeer whatever the case names; the V limiter "
+                        "from rhoU_x alone.",
+             note="NVDTVD r on rho, rPsi, e, c, NVDVTVDV r on rhoU (directionInterpolate.H, LimitedScheme.C). The "
+                  "scalar-form limiter on U (limitFuncs::magSqr), a V form on a scalar, limitedLinear's k outside "
+                  "[0, 1] and every other scheme are refused by name."),
+        dict(name="restart", of_symbol="Time::setControls, Time::writeTimeDict",
+             of_file="src/OpenFOAM/db/Time/Time.C",
+             classification="HOST_ONLY", status="REUSE_EXISTING",
+             brae_existing="src/OpenFOAM/db/Time/run_clock.cuh (reads uniform/time: deltaT under adjustTimeStep, "
+                           "deltaT0, index); src/OpenFOAM/db/Time/time_dict_writer.cuh (writes it); "
+                           "src/applications/solvers/common/start_time.cuh (startFrom)",
+             brae_driver="src/applications/solvers/rhoCentralFoam/rhoCentralFoam.cu",
+             validation="tests/rho_central_restart_vs_openfoam.sh: forwardStep, wedge15Ma5, obliqueShock, a tube across "
+                        "inletOutlet's switch, timeStep and off-grid writes, and forwardStep as shipped continued with "
+                        "startFrom latestTime, each restarted from OpenFOAM's and from brae's output against OpenFOAM "
+                        "restarted from the same directory: every deltaT, name and directory, and uniform/time's text, "
+                        "the same; fields within ten times OpenFOAM's own spread but on one arm (wedge15Ma5 from "
+                        "OpenFOAM's t = 0.06, CUDA, t = 0.12: round-off at a free-stream cell ahead of the shock). "
+                        "Controls red: deltaT from controlDict, the index dropped, the write grid from 0, inletOutlet's "
+                        "value from the cells, no uniform/time written.",
+             note="the start time is the directory's name; rho, rhoU, rhoE are rebuilt from p, T, U and T from he, as "
+                  "at 0; CoNum starts at 0, so the first deltaT is 1.2 times the start's: a restart under "
+                  "adjustTimeStep parts from its uninterrupted run, in OpenFOAM and brae alike."),
+        dict(name="setDeltaT", of_symbol="setDeltaT.H",
+             of_file="src/finiteVolume/cfdTools/general/include/setDeltaT.H",
+             classification="CONFIGURATION", status="REUSE_EXISTING",
+             brae_existing="src/finiteVolume/cfdTools/general/time_controls.cuh (setDeltaT, TimeControls, "
+                           "WriteCadence, adjustDeltaT, startDeltaT; shared with interFoam)",
+             brae_driver="src/applications/solvers/rhoCentralFoam/rhoCentralFoam.cu",
+             validation="tests/rho_central_shocktube_vs_openfoam.sh: shockTube as shipped, every deltaT identical "
+                        "to OpenFOAM's at 17 digits on both arms (142 steps; Tadmor 189; 1000 cells 1247). Controls "
+                        "red: without adjustDeltaT the writes land off OpenFOAM's times; the Courant number at the "
+                        "previous deltaT parts the deltaT sequence by 2.8e-01."),
+        dict(name="Time_clock", of_symbol="Time::run, Time::setDeltaT, Time::adjustDeltaT, Time::operator++",
+             of_file="src/OpenFOAM/db/Time/Time.C",
+             classification="HOST_ONLY", status="REIMPLEMENT",
+             brae_reference="src/OpenFOAM/db/Time/run_clock.cuh",
+             validation="rho_central_shocktube_vs_openfoam: the same 142 time names and 7 write directories as "
+                        "OpenFOAM; the Sod gate's fixed-deltaT run on the same clock is byte-identical to the "
+                        "step-counting clock it replaced (252 files; milestone D's phi rounding has since moved the last bits).",
+             note="the accumulated value (setTime(value() + deltaT_)), Time::run on the previous deltaT, "
+                  "writeTime_ for timeStep/runTime/adjustable, the snap to 0, the time-name precision raise. "
+                  "clockTime and cpuTime refused. A restart's uniform/time deltaT and index are read, not gated."),
+        dict(name="setRDeltaT", of_symbol="setRDeltaT.H", of_file="applications/solvers/compressible/rhoCentralFoam/setRDeltaT.H",
+             classification="GPU_REQUIRED", status="UNSUPPORTED", note="localEuler refused by name."),
+        dict(name="viscousCorrectors",
+             of_symbol="tauMC, the U corrector fvm::laplacian(muEff, U), sigmaDotU, the e corrector fvm::laplacian(alphaEff, e)",
+             of_file="applications/solvers/compressible/rhoCentralFoam/rhoCentralFoam.C", of_line=235,
+             classification="GPU_REQUIRED", status="REIMPLEMENT",
+             brae_existing="shared: src/cuda/device_fvm.cu (deviceLaplacianGammaMagSf), device_ddt.cu "
+                           "(deviceEulerFvmDdtRho, deviceEulerFvcDdtRhoSub), device_fvc.cu (deviceSnGradInternal, "
+                           "deviceDotInterpolateSf), device_divdevreff.cu (deviceScaledDev2T), the smoothSolver/GaussSeidel "
+                           "path (deviceSymGaussSeidelFused)",
+             brae_cuda="src/applications/solvers/rhoCentralFoam/rhoCentralViscous.cu",
+             validation="tests/rho_central_viscous_vs_openfoam.sh (milestone G): a shear layer, conduction, Sod and "
+                        "obliqueShock with constant mu, the tutorials' solver controls and a converged Sod: every "
+                        "deltaT, time name and solve iteration count OpenFOAM serial's; fields and viscous fluxes within "
+                        "ten times OpenFOAM's own spread; controls noTauMC and noSigmaDotU red; every solve's conservation "
+                        "identity to 1e-12 and a tolerance sweep. tests/rho_central_nozzle_vs_openfoam.sh (milestone H): "
+                        "sutherland and the wedge patches of LadenburgJet60psi as shipped (30444 solves at OpenFOAM serial's "
+                        "iteration counts, fields within 4.9e-13), a sutherland conduction and reservoir in a tube.",
+             note="constTransport and sutherland (mu(T) from the T the step starts from, alphaEff from the T of its first "
+                  "thermo.correct(), the laplacians rebuilt each step), laminar, the CUDA arm, wedge patches with "
+                  "wedgeFvPatchField's cellT snGrad. Refused by name: the host reference arm with mu > 0, solvers other "
+                  "than smoothSolver with GaussSeidel or symGaussSeidel."),
+        dict(name="meshMotion", of_symbol="mesh.update(), meshPhi", of_file="applications/solvers/compressible/rhoCentralFoam/rhoCentralFoam.C", of_line=95,
+             classification="GPU_REQUIRED", status="UNSUPPORTED", note="dynamicMeshDict other than static refused."),
+    ],
 }
 
 SELECTION_NOTE = {

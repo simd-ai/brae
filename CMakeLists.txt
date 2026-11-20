@@ -128,6 +128,7 @@ add_library(brae_core STATIC
     src/waveModels/derivedPointPatchFields/waveMaker/wave_maker_point_patch_vector_field_cpp.cu
     src/fvMotionSolver/fvMotionSolvers/displacement/laplacian/displacement_laplacian_fv_motion_solver_cpp.cu
     src/fvMotionSolver/fvMotionSolvers/displacement/laplacian/device_displacement_laplacian_assembly.cu
+    src/fvMotionSolver/fvMotionSolvers/componentVelocity/laplacian/velocity_component_laplacian_fv_motion_solver_cpp.cu
     src/dynamicFvMesh/dynamicMotionSolverFvMesh/dynamic_motion_solver_fv_mesh_cpp.cu
     src/dynamicFvMesh/dynamicMotionSolverFvMesh/device_swept_volumes.cu
     src/matrices/lduMatrix/lduMatrix/blas1.cu
@@ -155,6 +156,8 @@ add_library(brae_core STATIC
     src/finiteVolume/cfdTools/general/fvOptions/limit_temperature_report.cu
     src/TurbulenceModels/turbulenceModels/turbulenceModel/turbulence_transport.cu
     src/TurbulenceModels/turbulenceModels/RAS/kOmegaSST/kOmegaSST.cu
+    src/TurbulenceModels/compressible/compressibleRAS_cpp.cu
+    src/TurbulenceModels/compressible/compressibleRAS.cu
     src/finiteVolume/cfdTools/general/MRF/MRF_cpp.cu
     src/finiteVolume/cfdTools/general/MRF/device_MRF.cu
     src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes/limitedSchemes_cpp.cu
@@ -942,6 +945,10 @@ add_test(NAME manifest_interfoam_not_drifted
          COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/of_manifest.py interFoam
                  --check ${CMAKE_CURRENT_SOURCE_DIR}/manifest/interFoam.yaml)
 set_tests_properties(manifest_interfoam_not_drifted PROPERTIES SKIP_RETURN_CODE 77)
+add_test(NAME manifest_rhocentralfoam_not_drifted
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/of_manifest.py rhoCentralFoam
+                 --check ${CMAKE_CURRENT_SOURCE_DIR}/manifest/rhoCentralFoam.yaml)
+set_tests_properties(manifest_rhocentralfoam_not_drifted PROPERTIES SKIP_RETURN_CODE 77)
 # Defaults left over from porting, in the interFoam mirror: a controls struct built by hand at several
 # sites with a field set at some and not at others runs the default where the case said otherwise --
 # the device's start-up CorrectPhi ran grad(pcorr) as Gauss linear that way, and its closure would have
@@ -2203,6 +2210,8 @@ add_dependencies(brae brae_rhoSimpleFoam)
 # ...and brae_interFoam, added to this list at the same time as its registry row, because the comment
 # above says every registered solver belongs here and the last one to be added was not.
 add_dependencies(brae brae_interFoam)
+# ...and brae_rhoCentralFoam, with its registry row.
+add_dependencies(brae brae_rhoCentralFoam)
 
 # End-to-end kOmegaSSTLM (Langtry-Menter transition) vs a SAVED OpenFOAM v2412 oracle (no OF needed at test time):
 # runs brae on a transition flat plate and checks U L2 < 3% and the gammaInt transition is captured.
@@ -2263,6 +2272,96 @@ target_link_libraries(brae_interFoam PRIVATE brae_core)
 add_executable(brae_rhoSimpleFoam src/applications/solvers/rhoSimpleFoam/gpuRhoSimpleFoam.cu)
 target_include_directories(brae_rhoSimpleFoam PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(brae_rhoSimpleFoam PRIVATE brae_core)
+
+# brae_rhoCentralFoam: OpenFOAM v2412's rhoCentralFoam (density-based, central-upwind, Kurganov/Tadmor), EXPERIMENTAL,
+# single GPU. Scope, each step closed by a gate against OpenFOAM v2412 (ARCHITECTURE.md sec. 6): inviscid, laminar and
+# kOmegaSST; hePsiThermo with hConst or janaf, const or sutherland; a fixed deltaT, adjustTimeStep or LTS; a static mesh
+# or dynamicMotionSolverFvMesh with velocityComponentLaplacian; restart; the boundary conditions of the seven v2412
+# tutorials (rhoCentralControls.cuh refuses the rest by name). The host reference (rhoCentralStep_cpp.cu) and the CUDA
+# arm (rhoCentralStep.cu) share the case, the loop and the writer (rhoCentralFoam.cu).
+#
+# The gates compare with OpenFOAM v2412 run on the same machine (they skip, 77, without it) and take minutes to two
+# hours, so they carry `slow` and `rhocentral` (ctest -L rhocentral runs them all). Six of them stay red on purpose:
+# their FAILs are analysed, registered open checks (tests/data/rho_central_open_checks.tsv, 24 FAIL lines in all,
+# each printed with its category under the FAIL), never turned into passes and never covered by a wider bound.
+# Those carry `known-red` as well, so the GB10 CI's ctest step (.github/workflows/gpu-test.yml, -LE known-red) runs the
+# other seven, its next step runs these six through tools/known_red_check.py (red must be exactly the registered FAILs,
+# below), and `ctest -L known-red` runs them as they are: restart 1 (round-off amplification), riemann 16 (round-off amplification
+# and timestep-sequence divergence, as OpenFOAM's own decompositions diverge), nozzle 3 (round-off amplification of an
+# unstable mode OpenFOAM shares; one stopping-test flip), turb 2, moving 1 and 3d 1 (an iterative solve stopping one
+# sweep apart at its declared tolerance, as OpenFOAM's own runs do).
+add_executable(brae_rhoCentralFoam
+               src/applications/solvers/rhoCentralFoam/gpuRhoCentralFoam.cu
+               src/applications/solvers/rhoCentralFoam/rhoCentralFoam.cu
+               src/applications/solvers/rhoCentralFoam/rhoCentralControls.cu
+               src/applications/solvers/rhoCentralFoam/rhoCentralCreateFields_cpp.cu
+               src/applications/solvers/rhoCentralFoam/rhoCentralFlux_cpp.cu
+               src/applications/solvers/rhoCentralFoam/rhoCentralStep_cpp.cu
+               src/applications/solvers/rhoCentralFoam/rhoCentralFlux.cu
+               src/applications/solvers/rhoCentralFoam/rhoCentralStep.cu
+               src/applications/solvers/rhoCentralFoam/rhoCentralViscous.cu
+               src/applications/solvers/rhoCentralFoam/rhoCentralSlipBCs.cu)
+target_include_directories(brae_rhoCentralFoam PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(brae_rhoCentralFoam PRIVATE brae_core)
+add_test(NAME rho_central_sod_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_sod_vs_openfoam.sh)
+set_tests_properties(rho_central_sod_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow;rhocentral" TIMEOUT 900
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_test(NAME rho_central_shocktube_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_shocktube_vs_openfoam.sh)
+set_tests_properties(rho_central_shocktube_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow;rhocentral" TIMEOUT 900
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_test(NAME rho_central_wedge_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_wedge_vs_openfoam.sh)
+set_tests_properties(rho_central_wedge_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow;rhocentral" TIMEOUT 2400
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_test(NAME rho_central_forwardstep_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_forwardstep_vs_openfoam.sh)
+set_tests_properties(rho_central_forwardstep_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow;rhocentral" TIMEOUT 2400
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_test(NAME rho_central_restart_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_restart_vs_openfoam.sh)
+set_tests_properties(rho_central_restart_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow;rhocentral;known-red" TIMEOUT 5400
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_test(NAME rho_central_riemann_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_riemann_vs_openfoam.sh)
+set_tests_properties(rho_central_riemann_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow;rhocentral;known-red" TIMEOUT 5400
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_test(NAME rho_central_viscous_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_viscous_vs_openfoam.sh)
+set_tests_properties(rho_central_viscous_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow;rhocentral" TIMEOUT 5400
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_test(NAME rho_central_nozzle_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_nozzle_vs_openfoam.sh)
+set_tests_properties(rho_central_nozzle_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow;rhocentral;known-red" TIMEOUT 7200
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_test(NAME rho_central_lts_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_lts_vs_openfoam.sh)
+set_tests_properties(rho_central_lts_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow;rhocentral" TIMEOUT 10800
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_test(NAME rho_central_turb_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_turb_vs_openfoam.sh)
+set_tests_properties(rho_central_turb_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow;rhocentral;known-red" TIMEOUT 5400
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_test(NAME rho_central_moving_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_moving_vs_openfoam.sh)
+set_tests_properties(rho_central_moving_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow;rhocentral;known-red" TIMEOUT 5400
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_test(NAME rho_central_3d_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_3d_vs_openfoam.sh)
+set_tests_properties(rho_central_3d_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow;rhocentral;known-red" TIMEOUT 5400
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+# What tells the six known-red gates' 24 registered FAILs from a regression: tools/known_red_check.py runs them and
+# passes only when their FAILs are exactly the registered ones, counted per registry row and with each gate's pass
+# count (tests/data/rho_central_known_red.tsv). The GB10 CI runs it as its own step; this is its no-GPU self-test,
+# which the hosted build-check runs too.
+add_test(NAME rho_central_known_red_check_selftest
+         COMMAND python3 ${CMAKE_CURRENT_SOURCE_DIR}/tools/known_red_check.py --selftest)
+set_tests_properties(rho_central_known_red_check_selftest PROPERTIES LABELS "rhocentral" TIMEOUT 120)
+add_test(NAME rho_central_refusals
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/rho_central_refusals.sh)
+set_tests_properties(rho_central_refusals PROPERTIES SKIP_RETURN_CODE 77 LABELS "rhocentral" TIMEOUT 600
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 
 # brae_rhoSimpleFoam_slice: the vertical-slice port (src/applications/solvers/rhoSimpleFoam/slice).
 #
@@ -2616,6 +2715,15 @@ add_test(NAME written_bc_roundtrip_vs_openfoam
 set_tests_properties(written_bc_roundtrip_vs_openfoam PROPERTIES
                      ENVIRONMENT "BUILD=${CMAKE_CURRENT_BINARY_DIR}"
                      SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+
+# The totalPressure family (totalPressure, uniformTotalPressure, fanPressure), totalTemperature and phi on a symmetry
+# patch, written by simpleFoam, pimpleFoam, rhoSimpleFoam and rhoCentralFoam and read back by real OpenFOAM, OpenFOAM's
+# output read by brae, and brae restarted from its own output against its uninterrupted run; each arm with a control
+# that holds the file as brae wrote it before (tests/total_bc_roundtrip_vs_openfoam.sh says what each one found).
+add_test(NAME total_bc_roundtrip_vs_openfoam
+         COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/tests/total_bc_roundtrip_vs_openfoam.sh)
+set_tests_properties(total_bc_roundtrip_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
+                     ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae>;BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 
 # turbulence->validate() at construction, both models, both arms where the device runs the model:
 # the first iteration must sit on OpenFOAM's -- tests/rho_validate_vs_openfoam.sh.

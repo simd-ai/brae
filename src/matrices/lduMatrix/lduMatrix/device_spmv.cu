@@ -125,13 +125,31 @@ void residualKernel(
     const label* __restrict__ losortStart,
     const scalar* __restrict__ psi,
     const scalar* __restrict__ source,
-    scalar* __restrict__ rA)
+    scalar* __restrict__ rA,
+    bool fused)
 {
     const int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= nC) return;
 
     // every product rounded before it is subtracted (__dmul_rn, __dsub_rn): OpenFOAM's x86-64 build does
-    // not fuse them
+    // not fuse them. `fused` (setDeviceResidualFused): each multiply-subtract rounded once, fma(-a, b, s) --
+    // what OpenFOAM's aarch64 build runs (libOpenFOAM.so's lduMatrix::residual is three fmsub there)
+    if (fused)
+    {
+        scalar t = fma(-diag[c], psi[c], source[c]);
+        int g = ownerStart[c];
+        const int v1 = ownerStart[c + 1];
+        int m = losortStart[c];
+        const int w1 = losortStart[c + 1];
+        while (g < v1 || m < w1)
+        {
+            const int fl = (m < w1) ? losort[m] : 0x7fffffff;
+            if (g < v1 && g < fl) { t = fma(-upper[g], psi[nei[g]], t); ++g; }
+            else { t = fma(-lower[fl], psi[owner[fl]], t); ++m; }
+        }
+        rA[c] = t;
+        return;
+    }
     scalar s = __dsub_rn(source[c], __dmul_rn(diag[c], psi[c]));
     int f = ownerStart[c];
     const int u1 = ownerStart[c + 1];
@@ -204,6 +222,13 @@ void amiResidualKernel(
 } // namespace
 
 
+// The residual's rounding, process-wide, off by default: every solver but the one that asks keeps the separately
+// rounded form above. rhoCentralFoam asks for the form OpenFOAM's own build on the host architecture runs
+// (rhoCentralFoam.cu).
+namespace { bool g_residualFused = false; }
+void setDeviceResidualFused(bool fused) { g_residualFused = fused; }
+bool deviceResidualFused() { return g_residualFused; }
+
 // BRAE_CONTROL_DEVICE_GS_RESIDUAL_AMUL=1 puts source - A.psi back in the smoothing loops -- the gate's control
 bool deviceResidualAsAmul()
 {
@@ -230,7 +255,8 @@ void deviceResidual(
     rA.resize(A.nCells);
     const int blocks = (A.nCells + TPB - 1) / TPB;
     residualKernel<<<blocks, TPB>>>(A.nCells, A.diag, A.upper, A.lower, A.nei, A.owner,
-                                    A.ownerStart, A.losort, A.losortStart, psi.data(), source.data(), rA.data());
+                                    A.ownerStart, A.losort, A.losortStart, psi.data(), source.data(), rA.data(),
+                                    g_residualFused);
     cudaCheck(cudaGetLastError(), "residual");
     if (A.nCyc > 0)
     {

@@ -118,6 +118,134 @@ inline void refreshDeviceMeshGeometry(
     const std::vector<FvPatch>& fvp,
     const std::vector<CyclicInterface>& cyclics = {});
 
+// THE BUILDER IN TWO (the note above): the geometry alone, in the builder's layout -- internal faces, then every
+// uncoupled patch's faces in patch order -- and the arrays it uploads. buildDeviceMesh takes its geometry from here,
+// so the in-place refresh below and a fresh build agree element for element by construction.
+struct DeviceMeshGeometryHost
+{
+    std::vector<scalar> w, dc, nonOrthDc, Cfx, Cfy, Cfz, corrX, corrY, corrZ;   // internal faces
+    std::vector<scalar> Sfx, Sfy, Sfz, magSf;                                  // [internal | non-cyclic boundary]
+    std::vector<scalar> dBndX, dBndY, dBndZ;                                   // Cf - C(faceCell), boundary faces
+    std::vector<scalar> Cx, Cy, Cz;                                            // cells
+};
+
+inline DeviceMeshGeometryHost deviceMeshGeometryHost(
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp)
+{
+    const int nC = m.nCells(), nIf0 = m.nInternalFaces();
+    const std::vector<vector>& Sf = g.Sf();
+    const std::vector<scalar>& magSfAll = g.magSf();
+    const std::vector<vector>& Cf = g.Cf();
+    const std::vector<vector>& C = g.C();
+    const std::vector<scalar>& wts = g.weights();
+    const std::vector<scalar>& dcAll = g.deltaCoeffs();
+    const std::vector<scalar>& nodcAll = g.nonOrthDeltaCoeffs();
+    const std::vector<vector>& cvAll = g.nonOrthCorrectionVectors();
+    const int nIf = nIf0;                                  // internal faces = mesh internal faces only
+
+    DeviceMeshGeometryHost h;
+    h.w.resize(nIf); h.dc.resize(nIf); h.nonOrthDc.resize(nIf);
+    h.Cfx.resize(nIf); h.Cfy.resize(nIf); h.Cfz.resize(nIf);
+    h.corrX.resize(nIf); h.corrY.resize(nIf); h.corrZ.resize(nIf);
+    h.Sfx.reserve(magSfAll.size());
+    h.Sfy.reserve(magSfAll.size());
+    h.Sfz.reserve(magSfAll.size());
+    h.magSf.reserve(magSfAll.size());
+    for (int f = 0; f < nIf0; ++f)                         // original internal faces
+    {
+        h.w[f]=wts[f];
+        h.dc[f]=dcAll[f];
+        h.nonOrthDc[f]=nodcAll[f];
+        h.Cfx[f]=Cf[f].x;
+        h.Cfy[f]=Cf[f].y;
+        h.Cfz[f]=Cf[f].z;
+        h.corrX[f]=cvAll[f].x;
+        h.corrY[f]=cvAll[f].y;
+        h.corrZ[f]=cvAll[f].z;
+        h.Sfx.push_back(Sf[f].x);
+        h.Sfy.push_back(Sf[f].y);
+        h.Sfz.push_back(Sf[f].z);
+        h.magSf.push_back(magSfAll[f]);
+    }
+    for (const FvPatch& p : fvp)                           // non-cyclic boundary faces (cyclic patches skipped)
+    {
+        if (isCoupledInterfaceType(p.type)) continue;
+        for (label i = 0; i < p.size; ++i)
+        {
+            h.Sfx.push_back(Sf[p.start+i].x);
+            h.Sfy.push_back(Sf[p.start+i].y);
+            h.Sfz.push_back(Sf[p.start+i].z);
+            h.magSf.push_back(magSfAll[p.start+i]);
+            const vector dB = Cf[p.start+i] - C[p.faceCells[i]];
+            h.dBndX.push_back(dB.x);
+            h.dBndY.push_back(dB.y);
+            h.dBndZ.push_back(dB.z);
+        }
+    }
+    h.Cx.resize(nC); h.Cy.resize(nC); h.Cz.resize(nC);
+    for (int c = 0; c < nC; ++c)
+    {
+        h.Cx[c] = C[c].x;
+        h.Cy[c] = C[c].y;
+        h.Cz[c] = C[c].z;
+    }
+    return h;
+}
+
+// the geometric buffers up in one transfer (PackedUpload), each into the buffer the device mesh holds
+inline void uploadDeviceMeshGeometryPacked(DeviceMesh& dm, const DeviceMeshGeometryHost& h, const std::vector<scalar>& V,
+                                           PackedUpload& up)
+{
+    up.add(dm.w, h.w);
+    up.add(dm.V, V);
+    up.add(dm.Sfx, h.Sfx);
+    up.add(dm.Sfy, h.Sfy);
+    up.add(dm.Sfz, h.Sfz);
+    up.add(dm.dc, h.dc);
+    up.add(dm.magSf, h.magSf);
+    up.add(dm.Cfx, h.Cfx);
+    up.add(dm.Cfy, h.Cfy);
+    up.add(dm.Cfz, h.Cfz);
+    up.add(dm.Cx, h.Cx);
+    up.add(dm.Cy, h.Cy);
+    up.add(dm.Cz, h.Cz);
+    up.add(dm.dBndX, h.dBndX);
+    up.add(dm.dBndY, h.dBndY);
+    up.add(dm.dBndZ, h.dBndZ);
+    up.add(dm.nonOrthDc, h.nonOrthDc);
+    up.add(dm.corrVecX, h.corrX);
+    up.add(dm.corrVecY, h.corrY);
+    up.add(dm.corrVecZ, h.corrZ);
+    up.flush();
+}
+
+// the geometric buffers up, each into the buffer the device mesh holds (copyFrom keeps a buffer of the same size)
+inline void uploadDeviceMeshGeometry(DeviceMesh& dm, const DeviceMeshGeometryHost& h, const std::vector<scalar>& V)
+{
+    dm.w.copyFrom(h.w);
+    dm.V.copyFrom(V);
+    dm.Sfx.copyFrom(h.Sfx);
+    dm.Sfy.copyFrom(h.Sfy);
+    dm.Sfz.copyFrom(h.Sfz);
+    dm.dc.copyFrom(h.dc);
+    dm.magSf.copyFrom(h.magSf);
+    dm.Cfx.copyFrom(h.Cfx);
+    dm.Cfy.copyFrom(h.Cfy);
+    dm.Cfz.copyFrom(h.Cfz);
+    dm.Cx.copyFrom(h.Cx);
+    dm.Cy.copyFrom(h.Cy);
+    dm.Cz.copyFrom(h.Cz);
+    dm.dBndX.copyFrom(h.dBndX);
+    dm.dBndY.copyFrom(h.dBndY);
+    dm.dBndZ.copyFrom(h.dBndZ);
+    dm.nonOrthDc.copyFrom(h.nonOrthDc);
+    dm.corrVecX.copyFrom(h.corrX);
+    dm.corrVecY.copyFrom(h.corrY);
+    dm.corrVecZ.copyFrom(h.corrZ);
+}
+
 inline DeviceMesh buildDeviceMesh(
     const PrimitiveMesh& m,
     const FvGeometry& g,
@@ -128,45 +256,17 @@ inline DeviceMesh buildDeviceMesh(
     const int nC = m.nCells(), nIf0 = m.nInternalFaces();
     const std::vector<label>& own = m.owner();
     const std::vector<label>& nei = m.neighbour();
-    const std::vector<vector>& Sf = g.Sf();
-    const std::vector<scalar>& magSfAll = g.magSf();
-    const std::vector<vector>& Cf = g.Cf();
-    const std::vector<vector>& C = g.C();
-    const std::vector<scalar>& wts = g.weights();
-    const std::vector<scalar>& dcAll = g.deltaCoeffs();
-    const std::vector<scalar>& nodcAll = g.nonOrthDeltaCoeffs();
-    const std::vector<vector>& cvAll = g.nonOrthCorrectionVectors();
 
     const int nIf = nIf0;                                  // internal faces = mesh internal faces only (cyclic is a separate interface)
 
     std::vector<label>  ownI(nIf), neiI(nIf);
-    std::vector<scalar> wI(nIf), dcI(nIf), nodcI(nIf);
-    std::vector<scalar> CfX(nIf), CfY(nIf), CfZ(nIf), corrX(nIf),corrY(nIf),corrZ(nIf);
-    std::vector<scalar> SfxN, SfyN, SfzN, magSfN;          // Sf layout: [internal | non-cyclic boundary]
-    SfxN.reserve(magSfAll.size());
-    SfyN.reserve(magSfAll.size());
-    SfzN.reserve(magSfAll.size());
-    magSfN.reserve(magSfAll.size());
     for (int f = 0; f < nIf0; ++f)                         // original internal faces
     {
         ownI[f]=own[f];
         neiI[f]=nei[f];
-        wI[f]=wts[f];
-        dcI[f]=dcAll[f];
-        nodcI[f]=nodcAll[f];
-        CfX[f]=Cf[f].x;
-        CfY[f]=Cf[f].y;
-        CfZ[f]=Cf[f].z;
-        corrX[f]=cvAll[f].x;
-        corrY[f]=cvAll[f].y;
-        corrZ[f]=cvAll[f].z;
-        SfxN.push_back(Sf[f].x);
-        SfyN.push_back(Sf[f].y);
-        SfzN.push_back(Sf[f].z);
-        magSfN.push_back(magSfAll[f]);
     }
     std::vector<label> bndCell, bndGFace, bndIsEmpty;      // non-cyclic boundary faces (cyclic patches skipped)
-    std::vector<scalar> dBndX, dBndY, dBndZ;               // Cf - C(faceCell) per boundary face (cellLimited grad)
+    label gFace = nIf;                                     // the boundary face's slot in Sf's [internal | boundary]
     for (const FvPatch& p : fvp)
     {
         if (isCoupledInterfaceType(p.type)) continue;
@@ -174,16 +274,8 @@ inline DeviceMesh buildDeviceMesh(
         for (label i = 0; i < p.size; ++i)
         {
             bndCell.push_back(p.faceCells[i]);
-            bndGFace.push_back((label)SfxN.size());
+            bndGFace.push_back(gFace++);
             bndIsEmpty.push_back(emp);
-            SfxN.push_back(Sf[p.start+i].x);
-            SfyN.push_back(Sf[p.start+i].y);
-            SfzN.push_back(Sf[p.start+i].z);
-            magSfN.push_back(magSfAll[p.start+i]);
-            const vector dB = Cf[p.start+i] - C[p.faceCells[i]];
-            dBndX.push_back(dB.x);
-            dBndY.push_back(dB.y);
-            dBndZ.push_back(dB.z);
         }
     }
     const int nB = static_cast<int>(bndCell.size());
@@ -222,13 +314,6 @@ inline DeviceMesh buildDeviceMesh(
     dm.addressingId = nextDeviceAddressingId();
     dm.owner.copyFrom(ownI);
     dm.nei.copyFrom(neiI);
-    dm.w.copyFrom(wI);
-    dm.V.copyFrom(g.V());
-    dm.Sfx.copyFrom(SfxN);
-    dm.Sfy.copyFrom(SfyN);
-    dm.Sfz.copyFrom(SfzN);
-    dm.dc.copyFrom(dcI);
-    dm.magSf.copyFrom(magSfN);
     dm.ownerStart.copyFrom(ownerStart);
     dm.losort.copyFrom(losort);
     dm.losortStart.copyFrom(losortStart);
@@ -237,29 +322,30 @@ inline DeviceMesh buildDeviceMesh(
     dm.bndPerm.copyFrom(bndPerm);
     dm.bndCellStart.copyFrom(bndCellStart);
     dm.bndIsEmpty.copyFrom(bndIsEmpty);
-    dm.Cfx.copyFrom(CfX);
-    dm.Cfy.copyFrom(CfY);
-    dm.Cfz.copyFrom(CfZ);
-    {
-        std::vector<scalar> CX(nC), CY(nC), CZ(nC);
-        for (int c = 0; c < nC; ++c)
-        {
-            CX[c] = C[c].x;
-            CY[c] = C[c].y;
-            CZ[c] = C[c].z;
-        }
-        dm.Cx.copyFrom(CX);
-        dm.Cy.copyFrom(CY);
-        dm.Cz.copyFrom(CZ);
-    }
-    dm.dBndX.copyFrom(dBndX);
-    dm.dBndY.copyFrom(dBndY);
-    dm.dBndZ.copyFrom(dBndZ);
-    dm.nonOrthDc.copyFrom(nodcI);
-    dm.corrVecX.copyFrom(corrX);
-    dm.corrVecY.copyFrom(corrY);
-    dm.corrVecZ.copyFrom(corrZ);
+    uploadDeviceMeshGeometry(dm, deviceMeshGeometryHost(m, g, fvp), g.V());
     return dm;
+}
+
+// refreshDeviceMeshGeometry's update WITHOUT rebuilding the addressing or replacing a buffer: the geometry
+// (deviceMeshGeometryHost, the builder's own) written into the buffers the device mesh already holds, at the
+// addresses its users hold. For a caller that refreshes every step and keeps no cache keyed on a geometric
+// buffer's address (rhoCentralFoam's mesh.update(), milestone K: the rebuild was 1.9 ms of an 11.9 ms step on
+// movingCone). leastSquaresVectors dropped as refreshDeviceMeshGeometry drops it.
+inline void refreshDeviceMeshGeometryInPlace(
+    DeviceMesh& dm,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp,
+    PackedUpload* up = nullptr)   // one transfer for all twenty arrays (PackedUpload); null: copyFrom each
+{
+    DeviceMeshGeometryHost h = deviceMeshGeometryHost(m, g, fvp);
+    if (m.nCells() != dm.nCells || m.nInternalFaces() != dm.nInternalFaces
+     || static_cast<int>(h.dBndX.size()) != dm.nBndFaces)
+        throw std::runtime_error("brae: refreshDeviceMeshGeometryInPlace saw a different mesh size -- a move "
+                                 "must not change topology (OF polyMesh::movePoints keeps it fixed).");
+    if (up) uploadDeviceMeshGeometryPacked(dm, h, g.V(), *up);
+    else uploadDeviceMeshGeometry(dm, h, g.V());
+    dm.lsqInvDd.resize(0);
 }
 
 inline void refreshDeviceMeshGeometry(
@@ -421,6 +507,24 @@ void deviceLaplacianCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& gam
 void deviceLaplacianCoeffsSymmetric(const DeviceMesh& dm, const DeviceBuffer<scalar>& gammafInt,
                                     DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& upper,
                                     bool nonOrth = false);
+// fvm::laplacian's matrix in OpenFOAM's arithmetic (fvmLaplacianUncorrected, gaussLaplacianScheme.C:60-70): upper =
+// deltaCoeffs*gammaMagSf with gammaMagSf = gamma_f*|Sf| formed by the caller (gaussLaplacianSchemes.C:49), held once
+// (lower is upper), diag the negSumDiag in face order. deviceLaplacianCoeffs forms (dc*gamma_f)*|Sf| instead, a last
+// bit apart. nonOrth: the corrected scheme's nonOrthDeltaCoeffs.
+void deviceLaplacianGammaMagSf(const DeviceMesh& dm, const DeviceBuffer<scalar>& gammaMagSf,
+                               DeviceBuffer<scalar>& diag, DeviceBuffer<scalar>& upper, bool nonOrth);
+// fvc::snGrad on the internal faces, the uncorrected part (snGradScheme.C snGrad): deltaCoeffs*(vf[nei] - vf[own]).
+// The boundary faces are the patch fields' snGrad, the caller's.
+// With gx, gy, gz (the cell gradient of vf) it adds the corrected scheme's explicit part, correctedSnGrad's
+// nonOrthCorrectionVectors & linear interpolate(grad(vf)) (correctedSnGrad.C fullGradCorrection), as `+=`.
+void deviceSnGradInternal(const DeviceMesh& dm, const DeviceBuffer<scalar>& vf, DeviceBuffer<scalar>& out,
+                          bool nonOrth, const DeviceBuffer<scalar>* gx = nullptr,
+                          const DeviceBuffer<scalar>* gy = nullptr, const DeviceBuffer<scalar>* gz = nullptr);
+// fvc::dotInterpolate(mesh.Sf(), T) with linear weights (surfaceInterpolationScheme.C dotInterpolate): on internal
+// faces Sf & (lambda*(T[own] - T[nei]) + T[nei]), on boundary faces Sf_b & T_b (no coupled patch). T packed
+// [(i*3+j)*n + c] (cells) and [(i*3+j)*nB + k] (boundary), out one buffer per component (internal, then boundary).
+void deviceDotInterpolateSf(const DeviceMesh& dm, const DeviceBuffer<scalar>& Tcell, const DeviceBuffer<scalar>& Tbnd,
+                            DeviceBuffer<scalar>* fInt, DeviceBuffer<scalar>* fBnd);
 // Explicit non-orth correction of fvm::laplacian(gamma, vf): returns lapCorrSource = -V*fvc::div(faceFluxCorr),
 // faceFluxCorr_f = gamma_f*|Sf|_f * (corrVec_f . grad(vf)_f) with grad linearly interpolated to the face.
 // This equals fvm::laplacian(gamma,vf).source()'s correction term (OF gaussLaplacianScheme). gx/gy/gz = cell grad(vf).
@@ -455,6 +559,13 @@ void deviceDivUpwindCoeffs(const DeviceMesh& dm, const DeviceBuffer<scalar>& phi
 // RANGE would have changed the AMI path's meaning without a word. vanLeer is what every interFoam
 // tutorial names for div(phi,alpha) -- OF vanLeer.H:70, limiter = (r + |r|)/(1 + |r|).
 constexpr scalar kVanLeerTwoByk = -1.0;
+// ...and the other TVD limiters OpenFOAM's limitedSchemes define, each its own sentinel (rhoCentralFoam's
+// reconstruct(...) schemes, milestone F): Minmod.H:84 clamp(r, 0, 1); MUSCL.H:84 clamp(min(2r, 0.5r + 0.5), 0, 2);
+// SuperBee.H:85 max(max(min(2r, 1), min(r, 2)), 0); and `upwind` (upwind.H: weights pos0(faceFlux)), limiter 0.
+constexpr scalar kMinmodTwoByk = -2.0;
+constexpr scalar kMUSCLTwoByk = -3.0;
+constexpr scalar kSuperBeeTwoByk = -4.0;
+constexpr scalar kUpwindTwoByk = -5.0;
 
 // (1-limiter)*pos0(phi), limiter = clamp(twoByk*r, 0, 1), r = NVDTVD ratio from grad(field). twoByk = 2/max(k_,SMALL)
 // (k_=1 -> twoByk=2). gx/gy/gz = cell grad(field) (Gauss). Reduces to deviceDivUpwindCoeffs at limiter=0.

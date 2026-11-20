@@ -333,6 +333,98 @@ void deviceInterpolate(const DeviceMesh& dm, const DeviceBuffer<scalar>& vol, De
 }
 
 
+namespace {
+__global__ void snGradInternalKernel(int nIf, const label* __restrict__ own, const label* __restrict__ nei,
+                                     const scalar* __restrict__ dc, const scalar* __restrict__ vf,
+                                     const scalar* __restrict__ w, const scalar* __restrict__ cx,
+                                     const scalar* __restrict__ cy, const scalar* __restrict__ cz,
+                                     const scalar* __restrict__ gx, const scalar* __restrict__ gy,
+                                     const scalar* __restrict__ gz, scalar* __restrict__ out)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nIf) return;
+    const label P = own[f], N = nei[f];
+    scalar s = __dmul_rn(dc[f], vf[N] - vf[P]);
+    if (gx)   // corrVec & (lambda*(g_P - g_N) + g_N)
+    {
+        const scalar l = w[f];
+        const scalar fx = __dmul_rn(l, gx[P] - gx[N]) + gx[N];
+        const scalar fy = __dmul_rn(l, gy[P] - gy[N]) + gy[N];
+        const scalar fz = __dmul_rn(l, gz[P] - gz[N]) + gz[N];
+        s = s + (__dmul_rn(cx[f], fx) + __dmul_rn(cy[f], fy) + __dmul_rn(cz[f], fz));
+    }
+    out[f] = s;
+}
+// Sf & (lambda*(T_P - T_N) + T_N), each tensor component interpolated as OpenFOAM's Tensor operators do (the scalar
+// times the difference, then plus T_N), then the vector-tensor inner product (VectorTensorOps: (v & t)_j =
+// v.x*t.xj + v.y*t.yj + v.z*t.zj)
+__global__ void dotInterpSfKernel(int nIf, int nC, const label* __restrict__ own, const label* __restrict__ nei,
+                                  const scalar* __restrict__ w, const scalar* __restrict__ Sfx,
+                                  const scalar* __restrict__ Sfy, const scalar* __restrict__ Sfz,
+                                  const scalar* __restrict__ T, scalar* __restrict__ fx, scalar* __restrict__ fy,
+                                  scalar* __restrict__ fz)
+{
+    const int f = blockIdx.x*blockDim.x + threadIdx.x;
+    if (f >= nIf) return;
+    const label P = own[f], N = nei[f];
+    const scalar l = w[f];
+    scalar t[9];
+    for (int q = 0; q < 9; ++q)
+    {
+        const scalar tn = T[q*nC + N];
+        t[q] = __dmul_rn(l, T[q*nC + P] - tn) + tn;
+    }
+    const scalar sx = Sfx[f], sy = Sfy[f], sz = Sfz[f];
+    fx[f] = __dmul_rn(sx, t[0]) + __dmul_rn(sy, t[3]) + __dmul_rn(sz, t[6]);
+    fy[f] = __dmul_rn(sx, t[1]) + __dmul_rn(sy, t[4]) + __dmul_rn(sz, t[7]);
+    fz[f] = __dmul_rn(sx, t[2]) + __dmul_rn(sy, t[5]) + __dmul_rn(sz, t[8]);
+}
+__global__ void dotSfBndKernel(int nB, const label* __restrict__ gface, const scalar* __restrict__ Sfx,
+                               const scalar* __restrict__ Sfy, const scalar* __restrict__ Sfz,
+                               const scalar* __restrict__ T, scalar* __restrict__ fx, scalar* __restrict__ fy,
+                               scalar* __restrict__ fz)
+{
+    const int k = blockIdx.x*blockDim.x + threadIdx.x;
+    if (k >= nB) return;
+    const int g = gface[k];
+    const scalar sx = Sfx[g], sy = Sfy[g], sz = Sfz[g];
+    fx[k] = __dmul_rn(sx, T[0*nB + k]) + __dmul_rn(sy, T[3*nB + k]) + __dmul_rn(sz, T[6*nB + k]);
+    fy[k] = __dmul_rn(sx, T[1*nB + k]) + __dmul_rn(sy, T[4*nB + k]) + __dmul_rn(sz, T[7*nB + k]);
+    fz[k] = __dmul_rn(sx, T[2*nB + k]) + __dmul_rn(sy, T[5*nB + k]) + __dmul_rn(sz, T[8*nB + k]);
+}
+} // namespace
+
+void deviceSnGradInternal(const DeviceMesh& dm, const DeviceBuffer<scalar>& vf, DeviceBuffer<scalar>& out,
+                          bool nonOrth, const DeviceBuffer<scalar>* gx, const DeviceBuffer<scalar>* gy,
+                          const DeviceBuffer<scalar>* gz)
+{
+    const int nIf = dm.nInternalFaces;
+    out.resize(nIf);
+    snGradInternalKernel<<<nBlocks(nIf), TPB>>>(nIf, dm.owner.data(), dm.nei.data(),
+                                                nonOrth ? dm.nonOrthDc.data() : dm.dc.data(), vf.data(), dm.w.data(),
+                                                dm.corrVecX.data(), dm.corrVecY.data(), dm.corrVecZ.data(),
+                                                gx ? gx->data() : nullptr, gy ? gy->data() : nullptr,
+                                                gz ? gz->data() : nullptr, out.data());
+    cudaCheck(cudaGetLastError(), "snGrad");
+}
+
+void deviceDotInterpolateSf(const DeviceMesh& dm, const DeviceBuffer<scalar>& Tcell, const DeviceBuffer<scalar>& Tbnd,
+                            DeviceBuffer<scalar>* fInt, DeviceBuffer<scalar>* fBnd)
+{
+    const int nIf = dm.nInternalFaces, nB = dm.nBndFaces;
+    for (int k = 0; k < 3; ++k) { fInt[k].resize(nIf); fBnd[k].resize(nB); }
+    dotInterpSfKernel<<<nBlocks(nIf), TPB>>>(nIf, dm.nCells, dm.owner.data(), dm.nei.data(), dm.w.data(),
+                                             dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(), Tcell.data(),
+                                             fInt[0].data(), fInt[1].data(), fInt[2].data());
+    cudaCheck(cudaGetLastError(), "dotInterpolate(Sf, T)");
+    if (nB)
+    {
+        dotSfBndKernel<<<nBlocks(nB), TPB>>>(nB, dm.bndGFace.data(), dm.Sfx.data(), dm.Sfy.data(), dm.Sfz.data(),
+                                             Tbnd.data(), fBnd[0].data(), fBnd[1].data(), fBnd[2].data());
+        cudaCheck(cudaGetLastError(), "Sf_b & T_b");
+    }
+}
+
 void deviceDiv(const DeviceMesh& dm, const DeviceBuffer<scalar>& phiInt, const DeviceBuffer<scalar>& bval, DeviceBuffer<scalar>& d,
                const DeviceBuffer<scalar>* V)
 {

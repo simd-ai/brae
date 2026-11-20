@@ -96,6 +96,11 @@ void deviceBoundaryGradU(const DeviceMesh& dm, const DeviceVectorBoundary& dbU,
                          const DeviceBuffer<scalar>& Ux, const DeviceBuffer<scalar>& Uy, const DeviceBuffer<scalar>& Uz,
                          const DeviceBuffer<scalar>& gradU, DeviceBuffer<scalar>& gradB,
                          const DeviceBuffer<scalar>* const* UbStored = nullptr);
+// nu*dev2(T(gradU)), element by element over n entries (cells, or boundary faces): sigmaKernel, OpenFOAM's dev2
+// (TensorI.H: t - twoThirdsI*tr(t), tr = xx + yy + zz) times nu, both packed [(i*3+j)*n + e]. rhoCentralFoam's
+// tauMC = muEff*dev2(T(fvc::grad(U))) (rhoCentralFoam.C:218-219) on its cells and its boundary faces.
+void deviceScaledDev2T(int n, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nu,
+                       DeviceBuffer<scalar>& sigma);
 void deviceTensorDivSource(const DeviceMesh& dm,
                            const DeviceBuffer<scalar>& Tcell, const DeviceBuffer<scalar>& Tbnd,
                            DeviceBuffer<scalar>& srcX, DeviceBuffer<scalar>& srcY, DeviceBuffer<scalar>& srcZ,
