@@ -13,6 +13,7 @@
 #include "foam_dict.cuh"
 #include "fvOptions_cpp.cuh"
 #include "primitive_mesh.cuh"
+#include "rho_simple_controls.cuh"   // readSimpleSwitch: SIMPLE/transonic and /consistent as OF Switches
 #include <cstdio>
 #include <fstream>
 #include <stdexcept>
