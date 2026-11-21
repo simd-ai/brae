@@ -11,6 +11,14 @@
 # The fixture is backwardFacingStep2D mutated to LES/Smagorinsky through the transient dispatch
 # (the steady driver refuses simulationType LES outright, which arm 4 pins). Its shipped 0/nut walls
 # carry nutUBlendedWallFunction, which is exactly the function the refusal must name.
+#
+# THE FIXTURE IS MADE 3-D: its `empty` front and back become `symmetryPlane`, in the mesh's boundary
+# file and in every start field. An LES on a 2-D mesh is refused before the fields are read (OpenFOAM's
+# cubeRootVol is sqrt(V/thickness) there, cubeRootVolDelta.C:53-75, and brae's is cbrt(V);
+# gpuPimpleFoam.cu refuseLesOnMesh), which this test is not about. Without an empty patch OpenFOAM's
+# nGeometricD is 3 (polyMesh::calcDirections counts the empty patches), so the one-cell slab is a 3-D
+# mesh to both codes and cubeRootVol is cbrt(V) in each. The walls, their nut wall functions and every
+# assertion below are the same as on the 2-D fixture.
 set -e
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
@@ -18,6 +26,23 @@ SRC="$ROOT/validation/backwardFacingStep2D"
 [ -x "$BRAE" ] || { echo "SKIP: no brae binary"; exit 77; }
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 cp -r "$SRC/0" "$SRC/constant" "$SRC/system" "$W/"
+rm -f "$W"/constant/polyMesh/.brae_*
+python3 - "$W" <<'PY'
+import os, re, sys
+w = sys.argv[1]
+p = w + '/constant/polyMesh/boundary'
+s = open(p).read()
+s, n = re.subn(r'type\s+empty;\s*\n\s*inGroups\s+1\(empty\);', 'type            symmetryPlane;\n        inGroups        1(symmetryPlane);', s)
+assert n == 2, 'the fixture no longer has its two empty patches'
+open(p, 'w').write(s)
+for f in os.listdir(w + '/0'):
+    q = w + '/0/' + f
+    t = open(q).read()
+    t, m = re.subn(r'(\(front\|back\)"\s*\{\s*type\s+)empty;', r'\1symmetryPlane;', t)
+    assert m == 1, 'the fixture field %s no longer has its (front|back) empty entry' % f
+    open(q, 'w').write(t)
+PY
+! grep -q "empty" "$W/constant/polyMesh/boundary" || { echo "FAIL: the fixture is still 2-D"; exit 1; }
 
 fail=0
 say() { printf '  %-64s %s\n' "$1" "$2"; [ "$2" = FAIL ] && fail=1 || true; }
