@@ -745,6 +745,31 @@ const FoamDict* patchDict(
           "transcribed (inter_writer_cpp.cu).");
 }
 
+// A CONDITION TYPE THE WRITER HAS NO BRANCH FOR -- not a form of a transcribed one that it cannot echo, but
+// a type no interFoam gate has ever run: mixed, fixedGradient, outletInlet, uniformTotalPressure,
+// timeVaryingMappedFixedValue, a coded or fixedMean turbulence patch, ... (the late-refusal list of the
+// 2026-11-20 audit). It used to be named at start-up and refused only at the first write time, so a run
+// spent its steps -- on a boundary nothing showed to be updated as OpenFOAM's updateCoeffs() updates it --
+// and then stopped with nothing written. probeConditions now refuses it at start-up (registerUnwritten).
+struct UntranscribedConditionType : std::runtime_error
+{
+    using std::runtime_error::runtime_error;
+};
+
+[[noreturn]] void refuseUntranscribedType(
+    const std::string& field,
+    const FvPatch& p,
+    const std::string& type)
+{
+    throw UntranscribedConditionType(
+        "brae interFoam: " + field + " on patch `" + p.name + "` is `" + type + "`, a condition interFoam is "
+        "not ported for: no interFoam gate runs it, and its write() is not transcribed, so a run could not "
+        "write a time directory OpenFOAM can restart from. Refused at start-up (it used to run to the first "
+        "write time and stop there with nothing written). Use a condition interFoam carries -- for a pressure "
+        "outlet totalPressure or fixedValue, for an inlet fixedValue, inletOutlet or "
+        "pressureInletOutletVelocity -- or run the case with OpenFOAM.");
+}
+
 // `<key> constant <value>;` -- Function1::writeData then Constant::writeData (Function1.C:163-166,
 // Constant.C:116-122), or ConstantField::writeData for a PatchFunction1 (ConstantField.C:314-329): the
 // `constant` word whichever of the accepted forms the file used.
@@ -1508,7 +1533,7 @@ void volPatch(
     }
     else
     {
-        refuseWrite(field, p, "its condition `" + type + "` has no transcribed write()");
+        refuseUntranscribedType(field, p, type);
     }
     os << "    }\n";
 }
@@ -2352,6 +2377,11 @@ void InterWriter::probeConditions(
             nullptr,
             nullptr,
             nullptr);
+    }
+    catch (const UntranscribedConditionType&)
+    {
+        // a type no interFoam gate runs: refused before the first step, not at the first write
+        throw;
     }
     catch (const std::runtime_error& e)
     {
