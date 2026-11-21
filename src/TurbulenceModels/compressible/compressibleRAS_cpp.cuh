@@ -20,6 +20,7 @@
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
 #include "geometric_field.cuh"
+#include "foam_dict.cuh"
 #include "komega_sst_coeffs.cuh"
 #include "primitive_mesh.cuh"
 #include <string>
@@ -35,6 +36,10 @@ struct DivScheme
     bool   limitedLinear = false;
     scalar limiterCoeff = 1.0;
     bool   linearUpwind = false;
+    // `Gauss linearUpwind <name>`: the gradient it NAMES, looked up in gradSchemes as linearUpwind.H's constructor
+    // looks it up (mesh.gradScheme(name)), and that entry's cellLimited coefficient (0: unlimited Gauss linear)
+    std::string luGradName;
+    scalar luGradK = 0.0;
 };
 
 struct SolveCtl
@@ -66,13 +71,29 @@ struct Case
     DivScheme kDiv, omegaDiv;
     bool correctedLaplacian = true;
     SolveCtl kSolve, omegaSolve;
+    // kOmegaSSTBase::correct's omegaEqn.relax() and kEqn.relax() (kOmegaSSTBase.C:590, :616): fvMatrix::relax()
+    // relaxes an equation when relaxationFactors names a factor for it or a default (solution.C:330-418) -- even a
+    // factor of 1, which still applies the diagonal-dominance clamp. rhoCentralFoam never sets finalIteration, so the
+    // names are `omega` and `k` themselves.
+    bool   relaxK = false, relaxOmega = false;
+    scalar relaxKFactor = 1.0, relaxOmegaFactor = 1.0;
 };
+
+// ONE fvSchemes ENTRY AS OPENFOAM RESOLVES IT (schemesLookupDetail.C:76-89 over dictionary::csearch, dictionarySearch.C):
+// the statement whose keyword IS `key`, else the LAST quoted (regular-expression) keyword that matches it, else
+// `default` -- `none` included, which no consumer accepts. White space collapsed; empty when nothing answers. A quoted
+// keyword is a pattern to OpenFOAM, not the name: `"reconstruct(rho)"` (parentheses a group) does not answer for
+// reconstruct(rho). Shared by rhoCentralControls.cu and this reader so the two resolve one file one way.
+std::string ofSchemeStatement(const std::string& caseDir, const std::string& block, const std::string& key);
 
 // Reads constant/turbulenceProperties; on `simulationType RAS` builds the model's case (fields from `startDir`), refusing
 // what the port does not run. `U` is the velocity field as the solver built it (its wall patches give the wall
 // velocity). `refuse` throws with a message naming the input.
+// `fvSolution` and `turbulenceProperties`, when given, are the caller's own objects (so its unread-entry audit sees what
+// this reader asks); null reads the files here.
 Case readCase(const std::string& caseDir, const std::string& startDir, const PrimitiveMesh& m, const FvGeometry& g,
-              const std::vector<FvPatch>& patches, const GeometricField<vector>& U, bool lts);
+              const std::vector<FvPatch>& patches, const GeometricField<vector>& U, bool lts,
+              const FoamDict* fvSolution = nullptr, const FoamDict* turbulenceProperties = nullptr);
 
 } // namespace compressibleRAS
 } // namespace brae

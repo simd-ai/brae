@@ -132,7 +132,7 @@ BRAE_HD inline ThermoNew thermoStage(scalar e, scalar pOld, scalar Told, const G
     const GasTResult r = gasTEs(e, pOld, Told, gas);
     n.T = r.T;
     n.psi = gasPsi(pOld, r.T, gas);
-    n.status = r.status;
+    n.status = r.status | (r.limited ? statusJanafLimited : 0);
     return n;
 }
 

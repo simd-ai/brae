@@ -84,7 +84,7 @@ BRAE_HD inline PatchNew updatePatchFace(int TfixesValue, scalar rhoOld, scalar U
     {
         b.e = eCell;
         const GasTResult r = gasTEs(b.e, pOld, TbEval, gas);
-        b.status = r.status;
+        b.status = r.status | (r.limited ? statusJanafLimited : 0);
         b.T = r.T;
     }
     b.psi = gasPsi(pOld, b.T, gas);

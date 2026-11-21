@@ -77,3 +77,17 @@ add_test(NAME rho_central_refusals
          COMMAND bash ${PROJECT_SOURCE_DIR}/tests/rho_central_refusals.sh)
 set_tests_properties(rho_central_refusals PROPERTIES SKIP_RETURN_CODE 77 LABELS "rhocentral" TIMEOUT 600
                      ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+# WAVE 1 / Q4 (2026-11-21): the fvSchemes and fvSolution keys as OpenFOAM v2412 names them -- the compressible
+# kOmegaSST's laplacian/ddt/interpolate keys, linearUpwind's named gradient, k/omega relaxation, decayControl, any
+# solver name on the diagonal solves, `linear` reconstruction, pattern keys, dotInterpolate(S,tauMC), grad(T), janaf's
+# range warning, the unread-entry audit -- in two NEW tests, beside the six known-red gates (no arm added to those).
+add_test(NAME rho_central_keys_refusals
+         COMMAND bash ${PROJECT_SOURCE_DIR}/tests/rho_central_keys_refusals.sh)
+set_tests_properties(rho_central_keys_refusals PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow;rhocentral" TIMEOUT 1200
+                     RESOURCE_LOCK brae_gpu
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+add_test(NAME rho_central_keys_vs_openfoam
+         COMMAND bash ${PROJECT_SOURCE_DIR}/tests/rho_central_keys_vs_openfoam.sh)
+set_tests_properties(rho_central_keys_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow;rhocentral" TIMEOUT 3600
+                     RESOURCE_LOCK brae_gpu
+                     ENVIRONMENT "BRAE_RCF_BIN=$<TARGET_FILE:brae_rhoCentralFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
