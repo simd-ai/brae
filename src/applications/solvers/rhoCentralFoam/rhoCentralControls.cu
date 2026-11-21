@@ -541,6 +541,9 @@ Case readRhoCentralCase(const std::string& caseDir)
         cs.gas.Cp    = th->scalarOr("Cp", 0);
         cs.gas.Tref  = th->scalarOr("Tref", foamTstd());   // hConstThermo.C:41
         cs.gas.Hsref = th->scalarOr("Href", 0);            // hConstThermo.C:41 reads Hsref_ from `Href`
+        // Hf: hConstThermo's constructor reads it (hConstThermo.C:39), and only the absolute energy and enthalpy (Ha, Ea)
+        // add it; rhoCentralFoam's sensibleInternalEnergy never does. Taken as read, as OpenFOAM takes it.
+        th->find("Hf");
         if (!(cs.gas.Cp > cs.gas.R)) refuse("mixture Cp must exceed R (Cv = Cp - R must be positive).");
         }
         if (tt->wordOr("transport", "") == "sutherland")
@@ -656,7 +659,8 @@ Case readRhoCentralCase(const std::string& caseDir)
         // (smoluchowskiJumpTFvPatchScalarField.C:171-176): required there even under sutherland, which ignores it
         if (std::find(Ttypes.begin(), Ttypes.end(), "smoluchowskiJumpT") != Ttypes.end())
         {
-            const FoamDict tp = readDict(caseDir + "/constant/thermophysicalProperties");
+            // the case's own object (Case::thermophysicalProperties), so the unread-entry audit sees this question
+            const FoamDict& tp = *cs.thermophysicalProperties;
             const FoamDict* mix = tp.subDict("mixture");
             const FoamDict* tr = mix ? mix->subDict("transport") : nullptr;
             if (!tr || !tr->found("Pr"))
