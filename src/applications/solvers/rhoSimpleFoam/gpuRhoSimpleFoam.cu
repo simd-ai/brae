@@ -1136,13 +1136,15 @@ int main(int argc, char** argv)
             const std::vector<scalar> phiOut = solver.phiInternal();
             const std::vector<scalar> phiBout = solver.phiBoundary();
 
-            // THE DIVERGENCE STOP, AT THE WRITE. OpenFOAM never writes a non-finite field: trapFpe
-            // (etc/controlDict, FOAM_SIGFPE) aborts on the first NaN or Inf any operation makes, and
-            // species::thermo::T stops on a negative temperature (thermoI.H:55-60, "Negative initial
-            // temperature T0") at the next thermo.correct(). The per-iteration residual check in the loop
-            // catches a NaN one solve later; this catches what no residual has seen yet -- a field that went
-            // bad in the iteration being written -- before a single file of it reaches disk. The arrays are
-            // the writer's own host copies, so it costs no device transfer.
+            // THE DIVERGENCE STOP, AT THE WRITE. A NaN/Inf field, or a negative temperature, is no solution.
+            // OpenFOAM's species::thermo::T stops on a negative temperature at the next thermo.correct()
+            // (thermoI.H:55-60, "Negative initial temperature T0"); on a non-finite value it has no stop of its
+            // own where the floating-point trap is off -- measured on aarch64 (the GB10, and so the GH200),
+            // where OpenFOAM v2412 prints `nan` residuals and runs on -- so brae is stricter there, by design.
+            // The per-iteration residual check in the loop catches a NaN one solve later; this catches what
+            // no residual has seen yet -- a field that went bad in the iteration being written -- before a
+            // single file of it reaches disk. The arrays are the writer's own host copies, so it costs no
+            // device transfer.
             if (!allowNonFinite)
             {
                 std::string why;
@@ -1182,9 +1184,9 @@ int main(int argc, char** argv)
                 if (!why.empty())
                     throw std::runtime_error(
                         "brae rhoSimpleFoam (default driver): solution diverged -- " + why + " at time " + tname
-                        + ". OpenFOAM stops on that state (a floating-point trap on the first NaN/Inf, or "
-                          "species::thermo::T on a negative temperature), so this run stops too. No field "
-                          "written for " + tname + ". Set BRAE_ALLOW_NONFINITE=1 to write it anyway.");
+                        + ". A NaN/Inf field is no solution, and OpenFOAM's thermo inversion stops on a "
+                          "negative temperature (species::thermo::T). No field written for " + tname
+                        + ". Set BRAE_ALLOW_NONFINITE=1 to write it anyway.");
             }
 
             std::filesystem::create_directories(outDir);
@@ -1298,7 +1300,8 @@ int main(int argc, char** argv)
             // THE DIVERGENCE STOP, PER ITERATION. This loop checked nothing for finiteness: a diverging case
             // printed `Ux nan  p nan` and ran to endTime, wrote NaN fields and exited 0 -- measured on
             // squareBend run subsonic at 0.1 kg/s (tests/rho_default_nonfinite_refusal.sh), where OpenFOAM
-            // aborts on the thermo inversion. Every residual the step reports is already on the host (the
+            // prints its first `nan` residual at iteration 18 and stops on the thermo inversion's negative
+            // temperature at 19; brae now stops at 16, on epsilon's residual. Every residual the step reports is already on the host (the
             // line above prints them), so testing them costs nothing: no device read is added to the
             // iteration. A NaN or Inf anywhere in the fields reaches the next solve's residual, so the run
             // stops at most one iteration after the field went bad -- the same rule as the mirror arm
@@ -1327,9 +1330,9 @@ int main(int argc, char** argv)
                 if (!why.empty())
                     throw std::runtime_error(
                         "brae rhoSimpleFoam (default driver): solution diverged -- " + why + " (time "
-                        + time.timeName() + "). Every iteration after this one is noise, and OpenFOAM stops "
-                        "on the same state (a floating-point trap on the first NaN/Inf, or the thermo "
-                        "inversion). No field written for this time. Set BRAE_ALLOW_NONFINITE=1 to run on "
+                        + time.timeName() + "). Every iteration after this one is noise: OpenFOAM's own "
+                        "residuals turn NaN on such a run and its thermo inversion then stops on a negative "
+                        "temperature. No field written for this time. Set BRAE_ALLOW_NONFINITE=1 to run on "
                         "anyway.");
             }
             if (static_cast<long>(iter) == corruptIter) solver.corruptForTest(corruptField, corruptKind);
