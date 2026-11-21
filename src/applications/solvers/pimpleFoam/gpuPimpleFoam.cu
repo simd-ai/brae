@@ -506,13 +506,14 @@ void refuseLesForms(
     }
 }
 
-// The LES forms that need the mesh: brae's IDDES hmax against OpenFOAM's.
-//   BRAE_CONTROL_LES_MESH_UNCHECKED=1: a gate's CONTROL, deliberately wrong -- it is not checked, as before.
+// The LES forms that need the mesh: OpenFOAM's 2-D cubeRootVol, and brae's IDDES hmax against OpenFOAM's.
+//   BRAE_CONTROL_LES_MESH_UNCHECKED=1: a gate's CONTROL, deliberately wrong -- neither is checked, as before.
 void refuseLesOnMesh(
     const FoamDict& turbProps,
     const DeviceSimpleControls& ctl,
     const PrimitiveMesh& m,
-    const FvGeometry& g)
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp)
 {
     if (turbProps.wordOr("simulationType", "laminar") != "LES" || !ctl.turbulent)
     {
@@ -520,15 +521,28 @@ void refuseLesOnMesh(
     }
     if (std::getenv("BRAE_CONTROL_LES_MESH_UNCHECKED") != nullptr)
     {
-        std::printf("  *** CONTROL MODE: the IDDES hmax is not checked against the mesh. This run is deliberately "
+        std::printf("  *** CONTROL MODE: the LES filter width is not checked against the mesh. This run is deliberately "
                     "wrong. ***\n");
         return;
     }
     const FoamDict* les = turbProps.subDict("LES");
-    // NOT HERE YET: cubeRootVol on a 2-D mesh. cubeRootVolDelta.C:53-75 makes delta deltaCoeff*sqrt(V/thickness) when the
-    // mesh has an `empty` pair (nGeometricD 2) and brae's kernels take cbrt(V), so a 2-D LES runs another filter width.
-    // The refusal is held back because tests/les_wallfunction_refusals.sh (not this package's file) asserts that a 2-D
-    // Smagorinsky case steps; see the package report for the change it needs.
+    const std::string delta = les ? les->wordOr("delta", "cubeRootVol") : std::string("cubeRootVol");
+    // cubeRootVolDelta.C:53-75: on a mesh with nGeometricD 2 (an `empty` pair; polyMesh::calcDirections counts the empty
+    // patches) delta is deltaCoeff*sqrt(V/thickness); brae's kernels take cbrt(V) (device_smagorinsky.cu:27, the DDES
+    // length scales likewise)
+    if (delta == "cubeRootVol" && !ctl.iddes)
+    {
+        for (const FvPatch& p : fvp)
+        {
+            if (p.type == "empty" && p.size > 0)
+            {
+                throw std::runtime_error(
+                    "brae: LES `delta cubeRootVol` on a mesh with an `empty` patch (" + p.name + "). OpenFOAM's cubeRootVol "
+                    "is sqrt(V/thickness) on a 2-D mesh (cubeRootVolDelta.C:53-75); brae's is cbrt(V), so the filter "
+                    "width would differ. Run LES on a 3-D mesh.");
+            }
+        }
+    }
     if (!ctl.iddes)
     {
         return;
@@ -945,7 +959,7 @@ try
     std::string startStr = start.name;
     startTime = static_cast<scalar>(start.value);
     const std::string fieldDir = caseDir + "/" + startStr;
-    refuseLesOnMesh(turbProps, ctl, m, g);
+    refuseLesOnMesh(turbProps, ctl, m, g, fvp);
     // A MOVING MESH RESTARTED. OpenFOAM reads the mesh at the start time's instance -- <start>/polyMesh/points once the mesh
     // has moved (polyMesh.C, fvMesh::readUpdate) -- with meshPhi and Uf beside it, and continues the motion from there. brae
     // reads constant/polyMesh whatever the start (above), takes points0 from it, and writes no points, meshPhi or Uf: the

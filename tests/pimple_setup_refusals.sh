@@ -15,12 +15,12 @@
 #                 not reproduce; moveMeshOuterCorrectors with nOuterCorrectors > 1; a wall-distance model on a moving mesh; a
 #                 plain cyclic whose cells rotate or deform, or whose halves move apart; forces on a moving mesh
 #   adaptive      forces/forceCoeffs/scalarTransport with adjustTimeStep; adjustTimeStep's start-up notice naming issue #53
-#   les           SpalartAllmarasDES / kOmegaSSTDES; Smagorinsky/WALE with maxDeltaxyz; cubeRootVol deltaCoeff != 1; LES
-#                 without delta; IDDES with another delta, another Cw, another hmax, exactDistance, or on a mesh whose cells
-#                 are not boxes
+#   les           SpalartAllmarasDES / kOmegaSSTDES; Smagorinsky/WALE with maxDeltaxyz; cubeRootVol deltaCoeff != 1 or on a
+#                 2-D mesh; LES without delta; IDDES with another delta, another Cw, another hmax, exactDistance, or on a mesh
+#                 whose cells are not boxes
 #
 # CONTROLS, asserted: the BRAE_CONTROL_* switches put the old behaviour back for two arms (named ddt entries unread, the
-# IDDES hmax check off) and the arm must then be accepted. The negative control for the whole script is the parent
+# mesh-level LES checks off) and the arm must then be accepted. The negative control for the whole script is the parent
 # commit's binary, on which every refusal arm fails (recorded in the work package's report).
 set -u
 BIN="${1:?brae_pimpleFoam binary}"
@@ -377,6 +377,9 @@ refuses cuberootvol_deltacoeff_in_les_dict "$WORK/l_coeff_flat" "deltaCoeff 2"
 cp -r "$WORK/les" "$WORK/l_nodelta"
 les_dict "$WORK/l_nodelta" "LESModel Smagorinsky; turbulence on;"
 refuses les_no_delta "$WORK/l_nodelta" "LES has no \`delta\`"
+box "$WORK/les2d" --model LES --2d
+refuses cuberootvol_2d_mesh "$WORK/les2d" "\`empty\` patch (frontAndBack)" "sqrt(V/thickness)"
+accepts cuberootvol_2d_mesh_control "$WORK/les2d" BRAE_CONTROL_LES_MESH_UNCHECKED=1
 box "$WORK/des" --model SAIDDES
 for m in SpalartAllmarasDES kOmegaSSTDES; do
     cp -r "$WORK/des" "$WORK/l_$m"
