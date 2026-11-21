@@ -117,12 +117,14 @@ directory holding a NaN, an Inf or a negative temperature (`BRAE_ALLOW_NONFINITE
 
 - **Refused now** (they used to run, silently differently from OpenFOAM): every configuration in the table
   above but the last. Of the six v2412 tutorials on the default driver:
-  - **gasMixing/injectorPipe** is newly refused: its `solvers/"(U|e|k|epsilon)"` entry sets `minIter 1`,
-    which the energy solve cannot take yet. It runs on `BRAE_RHOSIMPLEFOAM_MIRROR=cuda` and `=1`, as before.
-  - **squareBendLiq** was already refused (its coded `massFlowRate`); it now stops one check earlier, on its
-    wall-T `expression`. It runs on the mirror, as before.
-  - aerofoilNACA0012, angledDuctExplicitFixedCoeff, squareBend and squareBendLiqNoNewtonian are unchanged by
-    these refusals.
+  - **gasMixing/injectorPipe** was already refused, at its first iteration (`grad(k)`/`grad(epsilon)`
+    `leastSquares`, which the legacy kEpsilon closure does not compute); it now stops at start-up, on the
+    `minIter 1` its `solvers/"(U|e|k|epsilon)"` entry sets, which the energy solve cannot take yet. It runs on
+    `BRAE_RHOSIMPLEFOAM_MIRROR=cuda` and `=1`, as before.
+  - **squareBendLiq** was already refused at start-up (its coded `massFlowRate`); it now stops one check
+    earlier, on its wall-T `expression`. It runs on the mirror, as before.
+  - aerofoilNACA0012, angledDuctExplicitFixedCoeff, squareBend and squareBendLiqNoNewtonian run as before: no
+    stock tutorial that ran on the default driver is refused now.
 - **The energy equation is no longer relaxed by a default 0.7** when `relaxationFactors/equations` names
   neither the energy field (`h` or `e`, whichever the case solves, regex keys included) nor `default`; the
   other energy name no longer counts. OpenFOAM does not relax the equation then. No v2412 tutorial and no
