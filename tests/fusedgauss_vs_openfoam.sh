@@ -29,19 +29,23 @@ set -u
 SRC="${1:?stock pitzDaily case dir}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
-OFBIN=/usr/lib/openfoam/openfoam2412/platforms/linuxARM64GccDPInt32Opt
-TUT=/usr/lib/openfoam/openfoam2412/tutorials/incompressible/simpleFoam
+OFBASHRC=${OF_BASHRC:-${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}}
+TUT=${BRAE_OF_TUTORIALS:-/usr/lib/openfoam/openfoam2412/tutorials}/incompressible/simpleFoam
 [ -x "$BRAE" ]                     || { echo "SKIP: no brae binary at $BRAE"; exit 77; }
-[ -x "$OFBIN/bin/simpleFoam" ]     || { echo "SKIP: real OpenFOAM not available"; exit 77; }
+[ -f "$OFBASHRC" ]                 || { echo "SKIP: real OpenFOAM not available"; exit 77; }
 [ -f "$TUT/pitzDaily_fused/system/fvSchemes" ] || { echo "SKIP: no pitzDaily_fused tutorial"; exit 77; }
-[ -f "$OFBIN/lib/libfusedFiniteVolume.so" ] || { echo "SKIP: OpenFOAM has no fusedFiniteVolume library"; exit 77; }
 SRC="$(cd "$SRC" && pwd)"
 
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
-export WM_PROJECT_DIR=/usr/lib/openfoam/openfoam2412
-export FOAM_ETC="$WM_PROJECT_DIR/etc"
-export PATH="$OFBIN/bin:$PATH"
-export LD_LIBRARY_PATH="$OFBIN/lib:$OFBIN/lib/dummy:${LD_LIBRARY_PATH:-}"
+# OpenFOAM's environment from its own bashrc (OF_BASHRC or OFBASHRC, as the other gates find it). `set --`: the
+# bashrc evaluates the arguments it is sourced with (etc/config.sh/setup); `set +u`: it reads unset variables.
+set +u
+set --
+# shellcheck disable=SC1090
+source "$OFBASHRC" > /dev/null 2>&1 || true
+set -u
+command -v simpleFoam > /dev/null 2>&1 || { echo "SKIP: simpleFoam not on PATH"; exit 77; }
+[ -f "$FOAM_LIBBIN/libfusedFiniteVolume.so" ] || { echo "SKIP: OpenFOAM has no fusedFiniteVolume library"; exit 77; }
 
 # <dir> <fused|plain|upwind>. The scheme block comes from OpenFOAM's OWN tutorial files, not from a
 # rename applied here -- generating the fused spelling with the same substitution brae uses would be

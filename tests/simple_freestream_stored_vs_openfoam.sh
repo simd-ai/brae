@@ -25,7 +25,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
 [ -x "$BRAE" ] || { echo "SKIP: no brae binary at $BRAE"; exit 77; }
 SRC="$(cd "$SRC" && pwd)"
-OFRC=/usr/lib/openfoam/openfoam2412/etc/bashrc
+OFRC=${OF_BASHRC:-${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}}
 [ -f "$OFRC" ] || { echo "SKIP: no OpenFOAM v2412 at $OFRC"; exit 77; }
 set +u
 set --

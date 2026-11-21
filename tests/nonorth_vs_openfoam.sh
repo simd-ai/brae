@@ -20,19 +20,21 @@ set -u
 SRC="${1:?case dir}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DIAG="${DIAG_BIN:-$ROOT/build/diag_simple_loop}"
-OFBIN=/usr/lib/openfoam/openfoam2412/platforms/linuxARM64GccDPInt32Opt
+OFBASHRC=${OF_BASHRC:-${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}}
 [ -x "$DIAG" ]            || { echo "SKIP: no diag_simple_loop at $DIAG"; exit 77; }
-[ -x "$OFBIN/bin/simpleFoam" ] || { echo "SKIP: real OpenFOAM not available"; exit 77; }
+[ -f "$OFBASHRC" ]        || { echo "SKIP: real OpenFOAM not available"; exit 77; }
 SRC="$(cd "$SRC" && pwd)"
 
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 cp -r "$SRC" "$W/of"
-# OpenFOAM resolves etc/controlDict through WM_PROJECT_DIR; without it simpleFoam aborts with
-# "Could not find mandatory etc entry 'controlDict'" before reading the case at all.
-export WM_PROJECT_DIR=/usr/lib/openfoam/openfoam2412
-export FOAM_ETC="$WM_PROJECT_DIR/etc"
-export PATH="$OFBIN/bin:$PATH"
-export LD_LIBRARY_PATH="$OFBIN/lib:$OFBIN/lib/dummy:${LD_LIBRARY_PATH:-}"
+# OpenFOAM's environment from its own bashrc (OF_BASHRC or OFBASHRC, as the other gates find it). `set --`: the
+# bashrc evaluates the arguments it is sourced with (etc/config.sh/setup); `set +u`: it reads unset variables.
+set +u
+set --
+# shellcheck disable=SC1090
+source "$OFBASHRC" > /dev/null 2>&1 || true
+set -u
+command -v simpleFoam > /dev/null 2>&1 || { echo "SKIP: simpleFoam not on PATH"; exit 77; }
 ( cd "$W/of" && timeout 600 simpleFoam > log.of 2>&1 ) || { echo "FAIL: OpenFOAM did not run"; tail -3 "$W/of/log.of"; exit 1; }
 grep -q converged "$W/of/log.of" || { echo "FAIL: OpenFOAM did not converge"; exit 1; }
 OFT=$(ls -d "$W/of"/[0-9]* | grep -vE '/0$' | sort -t/ -k99 -n | tail -1)
