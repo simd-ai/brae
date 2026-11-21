@@ -78,6 +78,9 @@ W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 # `set +u` around it: OpenFOAM's bashrc reads unset variables by design, so sourcing it under -u aborts
 # the script before the first run.
 set +u
+# `set --`: OpenFOAM's bashrc evaluates the arguments it is sourced with (etc/config.sh/setup), and a bare source
+# hands it this script's own (a bounds argument `U=...,p=...` came back as an exported variable U)
+set --
 # shellcheck disable=SC1091
 source "$OFBASHRC" > /dev/null 2>&1 || true
 set -u
