@@ -4,10 +4,14 @@
 // ddt names it takes for `brae capabilities`.
 #include "device_ddt.cuh"
 #include "foam_dict.cuh"
+#include "scheme_parse.cuh"   // ddtSchemeFor: a named ddt entry resolved as OpenFOAM's schemesLookup resolves it
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -65,6 +69,89 @@ inline DdtScheme parsePimpleDdtScheme(const std::string& fvSchemesPath, scalar& 
         return DdtScheme::CrankNicolson;
     }
     throw std::runtime_error("fvSchemes ddtSchemes.default '" + w + "' unsupported (Euler|backward|CrankNicolson|steadyState).");
+}
+
+// One ddtSchemes entry's value, as parsePimpleDdtScheme reads `default`: false when it is not one of the forms that reader takes.
+inline bool parsePimpleDdtEntry(
+    const std::string& entry,
+    DdtScheme& scheme,
+    scalar& ocCoeff)
+{
+    std::istringstream in(entry);
+    std::vector<std::string> w;
+    for (std::string t; in >> t; )
+    {
+        w.push_back(t);
+    }
+    ocCoeff = 1.0;
+    if (w.size() == 1 && w[0] == "Euler")
+    {
+        scheme = DdtScheme::Euler;
+        return true;
+    }
+    if (w.size() == 2 && w[0] == "bounded" && w[1] == "Euler")
+    {
+        scheme = DdtScheme::Euler;
+        return true;
+    }
+    if (w.size() == 1 && w[0] == "backward")
+    {
+        scheme = DdtScheme::backward;
+        return true;
+    }
+    if (!w.empty() && w.size() <= 2 && w[0] == "CrankNicolson")
+    {
+        if (w.size() == 2)
+        {
+            try
+            {
+                ocCoeff = std::stod(w[1]);
+            }
+            catch (...)
+            {
+                return false;
+            }
+        }
+        scheme = DdtScheme::CrankNicolson;
+        return true;
+    }
+    return false;
+}
+
+// Named ddt entries. OpenFOAM looks each fvm::ddt up by its own name first -- ddt(U) for the momentum (UEqn.H, and fvc::ddtCorr in
+// pEqn.H), ddt(k), ddt(epsilon), ddt(omega), ddt(nuTilda) ... for the turbulence fields (fvm::ddt(alpha, rho, k) is fvm::ddt(k) for
+// an incompressible model, fvmDdt.C) -- and falls back to `default` only when the dictionary has no entry for that name, literal or
+// regex (schemesLookupDetail.C:76-89). brae applies ddtSchemes.default to every field it integrates, so an entry that resolves a
+// name brae solves to another scheme would run the default under its name. `names` are the ddt names of the fields this run
+// integrates; an entry for a field the run does not solve is not looked up by OpenFOAM either and is left alone.
+//   BRAE_CONTROL_DDT_NAMED_UNREAD=1: a gate's CONTROL, deliberately wrong -- the named entries are not looked at, as before.
+inline void refuseNamedDdtSchemes(
+    const std::string& caseDir,
+    const std::vector<std::string>& names,
+    DdtScheme defaultScheme,
+    scalar defaultOcCoeff)
+{
+    if (std::getenv("BRAE_CONTROL_DDT_NAMED_UNREAD") != nullptr)
+    {
+        std::printf("  *** CONTROL MODE: named ddtSchemes entries are not checked. This run is deliberately wrong. ***\n");
+        return;
+    }
+    for (const std::string& name : names)
+    {
+        const std::string entry = ddtSchemeFor(caseDir, name);
+        DdtScheme s = DdtScheme::Euler;
+        scalar oc = 1.0;
+        const bool known = parsePimpleDdtEntry(entry, s, oc);
+        if (known && s == defaultScheme && (s != DdtScheme::CrankNicolson || oc == defaultOcCoeff))
+        {
+            continue;
+        }
+        throw std::runtime_error(
+            "brae: system/fvSchemes ddtSchemes resolves `" + name + "` to `" + entry + "`, which is not the `default` entry "
+            "brae applies. OpenFOAM integrates that field with the scheme its own entry names (schemesLookupDetail.C:76-89); "
+            "brae integrates every field with ddtSchemes.default, so it would run the default under this name. Remove the "
+            "entry, or make it the same as `default`: per-field ddt schemes are not ported.");
+    }
 }
 
 // The fvSolution PIMPLE controls pimpleFoam runs, each with OpenFOAM's default (pimpleControl::read, createDyMControls.H). Read
