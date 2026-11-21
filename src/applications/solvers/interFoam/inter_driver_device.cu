@@ -4,6 +4,7 @@
 // is separately landed and separately gated; what this file owns is the wiring, and that wiring is
 // what tests/test_device_inter_dambreak_alpha.cu measures against the host driver on damBreak.
 #include "inter_phase_time.cuh"
+#include "check_setup.cuh"
 #include "inter_driver_cpp.cuh"
 #include "inter_set_rdeltat_cpp.cuh"
 #include "device_fvc_smooth.cuh"
@@ -107,6 +108,97 @@ std::vector<scalar> patchValues(const GeometricField<scalar>& f, const std::vect
     }
     return v;
 }
+
+// THE DIVERGENCE STOP's field check on the device (cpu::interFoam::divergenceMessage has the why): the
+// non-finite entries of up to kHealthArrays arrays, counted in ONE launch -- blockIdx.y picks the array,
+// a grid-stride loop over it, an atomic only where a value is not finite -- and read back as one copy.
+// A healthy step reads every array once and writes nothing but the zeroed counts.
+constexpr int kHealthArrays = 12;
+struct HealthArrays
+{
+    const scalar* p[kHealthArrays];
+    int           n[kHealthArrays];
+};
+
+__global__
+void nonFiniteCountKernel(
+    HealthArrays a,
+    label* __restrict__ counts)
+{
+    const int f = blockIdx.y;
+    const scalar* __restrict__ p = a.p[f];
+    const int n = a.n[f];
+    int bad = 0;
+    for (int i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += gridDim.x*blockDim.x)
+    {
+        bad += isfinite(p[i]) ? 0 : 1;
+    }
+    if (bad > 0)
+    {
+        atomicAdd(&counts[f], bad);
+    }
+}
+
+// The fields of the step, by name: each name once, its device arrays together (U's three components)
+struct DeviceHealthCheck
+{
+    std::vector<std::pair<std::string, std::vector<const DeviceBuffer<scalar>*>>> fields;
+    DeviceBuffer<label> counts;
+
+    void add(const std::string& name, std::vector<const DeviceBuffer<scalar>*> arrays)
+    {
+        fields.emplace_back(name, std::move(arrays));
+    }
+
+    std::vector<cpu::interFoam::NonFiniteField> run()
+    {
+        HealthArrays a{};
+        std::vector<int> owner;
+        int nArrays = 0;
+        int nMax = 0;
+        for (std::size_t fi = 0; fi < fields.size(); ++fi)
+        {
+            for (const DeviceBuffer<scalar>* b : fields[fi].second)
+            {
+                if (!b || b->size() == 0) continue;
+                if (nArrays == kHealthArrays)
+                {
+                    throw std::runtime_error("brae interFoam (device): the divergence check takes "
+                                             + std::to_string(kHealthArrays) + " arrays at most.");
+                }
+                a.p[nArrays] = b->data();
+                a.n[nArrays] = static_cast<int>(b->size());
+                nMax = std::max(nMax, a.n[nArrays]);
+                owner.push_back(static_cast<int>(fi));
+                ++nArrays;
+            }
+        }
+        std::vector<cpu::interFoam::NonFiniteField> bad;
+        if (nArrays == 0) return bad;
+        counts.resize(static_cast<std::size_t>(kHealthArrays));
+        cudaCheck(cudaMemsetAsync(counts.data(), 0, kHealthArrays*sizeof(label)), "divergence check: zero");
+        // the grid sized to the hardware for a reduction (CONTRIBUTING: grid-stride), not to the mesh
+        const int blocksX = std::max(1, std::min((nMax + 255)/256, 96));
+        nonFiniteCountKernel<<<dim3(blocksX, nArrays), 256>>>(a, counts.data());
+        cudaCheck(cudaGetLastError(), "divergence check: launch");
+        std::vector<label> h;
+        counts.copyTo(h);
+        for (int ai = 0; ai < nArrays; ++ai)
+        {
+            if (h[ai] <= 0) continue;
+            const std::string& name = fields[owner[ai]].first;
+            if (!bad.empty() && bad.back().name == name)
+            {
+                bad.back().count += h[ai];
+            }
+            else
+            {
+                bad.push_back(cpu::interFoam::NonFiniteField{name, static_cast<long>(h[ai])});
+            }
+        }
+        return bad;
+    }
+};
 
 // x, y and z of every cell side by side, as the host's vectors hold them: one block for one copy down
 __global__
@@ -477,6 +569,22 @@ RunReport runInterFoamDevice(
                 "ddt0(rho,U), ddtCorrDdt0(U), ddtCorrDdt0(Uf), meshPhiCN_0, U_0, V0",
                 "CrankNicolson's state on a moving mesh, which the device loop does not keep in its written form");
         }
+    }
+    // the V-SCHEMES' LIMITER under a LIMITED grad(U). vanLeerV and limitedLinearV build their limiter from
+    // fvc::grad(U) (LimitedScheme.C:56-59 calcLimiter, NVDVTVDV.H), which resolves gradSchemes' `grad(U)`, so a
+    // `cellLimited` entry limits it in OpenFOAM, and on the host arm (inter_ueqn_cpp.cu). The device momentum
+    // assembly's V branch is the shared simpleFoam/UEqn.cu, whose limiter takes deviceGradUShared -- an
+    // unlimited Gauss gradient -- and no limiter call: the case would run a different convection limiter with
+    // nothing said. No shipped tutorial pairs the two (the eight vanLeerV ones take an unlimited grad(U)).
+    if ((f.divRhoPhiU == DivScheme::vanLeerV || f.divRhoPhiU == DivScheme::limitedLinearV) && f.gradULimitK > 0)
+    {
+        throw std::runtime_error(
+            std::string("brae interFoam (device): fvSchemes names `div(rhoPhi,U) Gauss ")
+            + (f.divRhoPhiU == DivScheme::vanLeerV ? "vanLeerV" : "limitedLinearV") + "` and grad(U) resolves to "
+            "`cellLimited ... " + std::to_string((double)f.gradULimitK) + "`. OpenFOAM builds that limiter from the "
+            "limited grad(U) (LimitedScheme.C:56-59); the GPU momentum assembly builds it from an unlimited Gauss "
+            "grad(U), so the convection would differ. Not ported on the GPU loop yet. Run it on the host loop "
+            "(`brae_interFoam -case <dir>`, without -device), or give grad(U) an unlimited `Gauss linear` entry.");
     }
     // LOCAL TIME STEPPING. setRDeltaT.H runs on the HOST (inter_set_rdeltat_cpp: the smoothing is a
     // FaceCellWave) from this loop's fields, and each consumer -- the alpha pre-solve and CMULES,
@@ -4926,9 +5034,11 @@ RunReport runInterFoamDevice(
     C.pressure.tol = f.pSolve.tol;
     C.pressure.relTol = f.pSolve.relTol;
     C.pressure.maxIter = f.pSolve.maxIter;
+    C.pressure.minIter = f.pSolve.minIter;
     C.pressureFinal.tol = f.pSolveFinal.tol;
     C.pressureFinal.relTol = f.pSolveFinal.relTol;
     C.pressureFinal.maxIter = f.pSolveFinal.maxIter;
+    C.pressureFinal.minIter = f.pSolveFinal.minIter;
     // THE CASE'S OWN SOLVE FOR U, where a hardcoded 1e-12 on Jacobi-BiCGStab used to stand. Which
     // entry fvMatrix::solve() selects is the mesh's finalIteration flag: `UFinal` on the LAST outer
     // corrector and `U` on the others (inter_driver_cpp.cu:697-698, and the note on
@@ -5235,6 +5345,27 @@ RunReport runInterFoamDevice(
     {
         pBFrozen = staticPressureBoundary(f.p_rgh, f.rhoBnd, f.ghfBoundary);
     }
+    // `brae check --setup`: the case built, every start-up refusal run and the device arrays up; stop before the
+    // first step
+    if (cli::checkSetupDone("interFoam"))
+    {
+        rep.setupOnly = true;
+        return rep;
+    }
+    // the divergence stop's field check, its counts kept between steps (DeviceHealthCheck). It STANDS DOWN under the
+    // write gate's three POISON controls (BRAE_CONTROL_FLUX_EMPTY_POISON, _HOOKS_EMPTY_POISON, _U_EMPTY_POISON): they
+    // write NaN into host lists so that a reader of them surfaces in the step lines and the written fields
+    // (tests/interfoam_write/identity/*, whose CONTROL arms assert the run goes NaN), and a stop at the first NaN
+    // would hide exactly what they are there to show.
+    DeviceHealthCheck health;
+    static const bool healthStandsDown = std::getenv("BRAE_CONTROL_FLUX_EMPTY_POISON") != nullptr
+                                      || std::getenv("BRAE_CONTROL_HOOKS_EMPTY_POISON") != nullptr
+                                      || std::getenv("BRAE_CONTROL_U_EMPTY_POISON") != nullptr;
+    if (healthStandsDown)
+    {
+        std::printf("  *** CONTROL MODE: a poison control is set -- the divergence stop stands down, so a poisoned "
+                    "value reaches the step lines and the written fields. ***\n");
+    }
     interPhase::start();
     for (label s = 0; s < nSteps; ++s)
     {
@@ -5430,6 +5561,16 @@ RunReport runInterFoamDevice(
                                                                      courantCheck ? &sumPhiBandDevice : nullptr);
             rep.CoNum = co.CoNum;
             rep.alphaCoNum = coBand.CoNum;
+            // the divergence stop's first half (divergenceMessage): the reductions CourantNo.H and
+            // alphaCourantNo.H take anyway. The MEANS are sums, which carry a NaN that a max kernel passes over.
+            if (!healthStandsDown
+             && (!std::isfinite(co.CoNum) || !std::isfinite(co.meanCoNum)
+              || !std::isfinite(coBand.CoNum) || !std::isfinite(coBand.meanCoNum)))
+            {
+                throw std::runtime_error(divergenceMessage(
+                    {NonFiniteField{"the Courant number", 1}}, rep.time, rep.steps + 1,
+                    "from the flux the last step left"));
+            }
             if (courantCheck)
             {
                 // said BEFORE the comparison, so a control that the comparison stops has its numbers in the log
@@ -7348,6 +7489,54 @@ RunReport runInterFoamDevice(
 
         rep.steps = s + 1;
         rep.time += rep.deltaT;
+
+        // the divergence stop's second half (divergenceMessage): the solved fields as the step left them,
+        // before runTime.write() can put a non-finite value on disk -- one launch and one small copy a step
+        if (!healthStandsDown)
+        {
+            interPhase::Nested timed("divergence check");
+            health.fields.clear();
+            health.add(f.alphaName, {&dA});
+            health.add("U", {&dUx, &dUy, &dUz});
+            health.add("p_rgh", {&dPrgh});
+            health.add("phi", {&dPhiI});
+            if (deviceClosure)
+            {
+                health.add("k", {&dTurb.k});
+                // the second field's buffer carries omega under kOmegaSST, and is empty under LES kEqn
+                if (f.turbulence.model == InterRasModel::KOmegaSST)
+                {
+                    health.add("omega", {&dTurb.epsilon});
+                }
+                else if (f.turbulence.model == InterRasModel::KEpsilon)
+                {
+                    health.add("epsilon", {&dTurb.epsilon});
+                }
+                health.add("nut", {&dTurb.nut});
+            }
+            std::vector<NonFiniteField> bad = health.run();
+            if (hostClosure)
+            {
+                auto note = [&](const std::string& name, long n)
+                {
+                    if (n > 0) bad.push_back(NonFiniteField{name, n});
+                };
+                note("k", countNonFinite(f.turbulence.k.internal));
+                if (f.turbulence.model == InterRasModel::KOmegaSST)
+                {
+                    note("omega", countNonFinite(f.turbulence.omega.internal));
+                }
+                else if (f.turbulence.model == InterRasModel::KEpsilon)
+                {
+                    note("epsilon", countNonFinite(f.turbulence.epsilon.internal));
+                }
+                note("nut", countNonFinite(f.turbulence.nut.internal));
+            }
+            if (!bad.empty())
+            {
+                throw std::runtime_error(divergenceMessage(bad, rep.time, rep.steps, "at the end of the step"));
+            }
+        }
 
         // runTime.write() (interFoam.C:175): the cells from the device into writer-owned copies, the patch
         // values as the hooks left them on the host. The closure is the exception: its download writes

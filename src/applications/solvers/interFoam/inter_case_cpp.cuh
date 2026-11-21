@@ -312,6 +312,12 @@ struct InterFields
         scalar relTol = 0;
         // lduMatrix::defaultMaxIter, lduMatrix.H:125
         int maxIter = 1000;
+        // lduMatrix::solver::readControls (lduMatrixSolver.C:195-205): `minIter`, default 0. The solve keeps
+        // iterating while nIterations < minIter even with its residual already under tolerance (PCG.C:
+        // `minIter_ > 0 || !converged` enters the loop, `... || nIterations < minIter_` keeps it). It was not
+        // read here, so a case naming it for p_rgh, p_rghFinal, pcorr or pcorrFinal stopped where the
+        // tolerance alone stopped it. A GAMG entry carries its own copy in `gamg` (readGamgControls).
+        int minIter = 0;
         // brae::pcg is lduMatrix PCG + DICPreconditioner, gated in tests/test_pcg.cu
         bool pcgDIC() const { return solver == "PCG" && preconditioner == "DIC"; }
         // brae::gamgSolve is GAMGSolver on the faceAreaPair hierarchy, gated in
