@@ -7,8 +7,8 @@
 #   - runs `brae`, the front door, which hands the case to the solver its controlDict names;
 #   - holds the default path to a bound an EXISTING gate established, named beside it: none sets a tolerance of its
 #     own. Where that gate measured the case-solver path, its bound is reused as it stands and the line says so.
-# Their tier is tests/cmake/tiers.cmake's rule, measured on the GB10 (2026-11-21, ctest -j1): five took at most 5 s and
-# are in its smoke list; rotatingCylinders (8 s) and shockTube (29 s) are labelled slow.
+# Their tier is tests/cmake/tiers.cmake's rule, measured on the GB10 (2026-11-21, ctest -j1): eight took at most 5 s
+# and are in its smoke list; rotatingCylinders (8 s) and shockTube (29 s) are labelled slow.
 #
 # Included by tests/CMakeLists.txt.
 
@@ -74,3 +74,17 @@ add_test(NAME default_path_timeloop_vs_openfoam
                  $<TARGET_FILE:brae>)
 set_tests_properties(default_path_timeloop_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
                      LABELS default-path)
+
+# RUN-TO-RUN IDENTITY on the default paths that are bit-reproducible (audit E-G22): the same case twice through
+# `brae -case`, every file written byte-identical, with a one-byte control (tests/default_path_determinism.sh):
+# rhoSimpleFoam's default driver (rhoBox), interFoam's device loop (damBreak) and rhoCentralFoam's CUDA arm
+# (shockTube). simpleFoam's is tests/determinism_gate.sh (determinism_kepsilon, determinism_komega); pimpleFoam's
+# spread is measured, not asserted.
+foreach(_case rhoBox damBreak shockTube)
+    string(TOLOWER ${_case} _name)
+    add_test(NAME default_path_determinism_${_name}
+             COMMAND ${BRAE_DEFAULT_PATH_RUN} ${PROJECT_SOURCE_DIR}/tests/default_path_determinism.sh
+                     $<TARGET_FILE:brae> ${_case})
+    set_tests_properties(default_path_determinism_${_name} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900
+                         LABELS default-path ENVIRONMENT "BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+endforeach()
