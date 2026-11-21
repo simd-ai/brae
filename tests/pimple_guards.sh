@@ -26,9 +26,10 @@ mkcase()   # mkcase <dir> [extra controlDict lines]
 # they always die later on the absent polyMesh. So the assertion is "got PAST the dict stage", evidenced
 # by reaching the mesh error, not "produced a Courant number" (which needs a mesh and a flux). Asserting
 # the latter here would be asserting something the fixture cannot show.
-accepts_past_dict() {
+accepts_past_dict() {   # accepts_past_dict <name> <case dir> [env assignments...]
     local name=$1 dir=$2
-    "$BIN" -case "$dir" > "$WORK/$name.log" 2>&1
+    shift 2
+    env "$@" "$BIN" -case "$dir" > "$WORK/$name.log" 2>&1
     if grep -qF "not supported yet" "$WORK/$name.log"; then
         echo "FAIL: $name -- still refused at the dictionary stage, but the feature is implemented"; fail=1; return
     fi
@@ -56,13 +57,13 @@ refuses()  # refuses <name> <case dir> <expected text>
 
 rm -rf "$WORK"; mkdir -p "$WORK"
 
-# 1. adjustTimeStep is now IMPLEMENTED (OF readTimeControls/CourantNo/setInitialDeltaT/setDeltaT, via the
-#    shared cfdTools module). It used to be refused, because running at the fixed deltaT instead is a
-#    DIFFERENT simulation rather than an approximation. It must now RUN and report the Courant number --
-#    a case that silently stopped reporting Co would mean the control loop is not executing.
+# 1. adjustTimeStep's Courant control (OF readTimeControls/CourantNo/setInitialDeltaT/setDeltaT, via the shared
+#    cfdTools module) on brae's own clock. Refused by default until M4 (issue #53; tests/pimple_setup_refusals.sh
+#    holds the refusal), it is reached here through its experimental override: the control loop must still run past
+#    the dictionaries -- a case that silently stopped at them would mean the override no longer opens it.
 mkcase "$WORK/adjustdt" "adjustTimeStep yes;
 maxCo 0.9;"
-accepts_past_dict adjust_time_step "$WORK/adjustdt"
+accepts_past_dict adjust_time_step "$WORK/adjustdt" BRAE_ALLOW_ADJUSTTIMESTEP=1
 
 # 2. An active MRF zone: dropping the rotation leaves a converged-looking field of the wrong flow.
 mkcase "$WORK/mrf"

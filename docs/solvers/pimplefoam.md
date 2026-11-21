@@ -38,7 +38,7 @@ Legend: ✓ supported · ✗ not yet.
 | `ddt0(...)` state written and re-read on restart (`CrankNicolson`) | ✓ |
 | Named `ddt(X)` entries | only when they resolve to the `default` scheme; any other is refused |
 | Fixed `deltaT` | ✓ |
-| `adjustTimeStep` / `maxCo` (Courant-limited dt) | runs on brae's own clock: the step sequence and so the fields at a given time differ from OpenFOAM's; a start-up notice says so (issue #53) |
+| `adjustTimeStep` / `maxCo` (Courant-limited dt) | refused until brae runs OpenFOAM's clock (issue #53, work package M4); `BRAE_ALLOW_ADJUSTTIMESTEP=1` runs it on brae's own clock as an experimental approximation, with a start-up notice |
 
 `writeControl timeStep` and `runTime`/`adjustableRunTime`, `writeInterval` and `purgeWrite` behave as in
 `Foam::Time`. After a restart the `runTime` write grid continues from the restart time, as OpenFOAM's does
@@ -50,7 +50,10 @@ times. OpenFOAM applies `setDeltaT` before every step, the first included, and u
 every step so that the steps land on the write times; brae does neither. Each brae step solves OpenFOAM's equations at
 its own step size, so at a given time the fields differ by the time-integration error of the different steps. The output
 differs too: brae's writes land on the first step past each write time, the run can stop short of `endTime`, and the
-last directory is named after `startTime + deltaT*steps`. A start-up notice says so.
+last directory is named after `startTime + deltaT*steps`. brae therefore refuses `adjustTimeStep yes` at start-up until
+it reproduces OpenFOAM's sequence (work package M4). `BRAE_ALLOW_ADJUSTTIMESTEP=1` (exactly `1`) is an explicit,
+experimental override: the run goes ahead on brae's clock and a start-up notice says all of the above. Results from it
+are not OpenFOAM's at any given time and are not validated.
 
 ## PIMPLE controls (`fvSolution`)
 
@@ -145,7 +148,8 @@ differently from OpenFOAM v2412. The message names the entry, why, and what to u
 | kOmegaSST, kOmegaSSTLM, Spalart-Allmaras and their DES/IDDES models on a moving mesh (unless `wallDist { updateInterval 0; }`) | OpenFOAM recomputes the wall distance after every move; brae computes it once |
 | a plain `cyclic` whose cells rotate or deform with the motion, or whose two halves move apart; any plain `cyclic` under `velocityComponentLaplacian` | brae builds the cyclic's weights and vectors once |
 | `forces`/`forceCoeffs` on a moving mesh | brae's forces keep the start geometry |
-| `forces`/`forceCoeffs`/`scalarTransport` with `adjustTimeStep yes` | brae's function objects run on a clock with controlDict's deltaT |
+| `adjustTimeStep yes` (unless `BRAE_ALLOW_ADJUSTTIMESTEP=1`) | brae's time-step sequence is not OpenFOAM's from the first step, so the transient fields at a given time differ (issue #53) |
+| `forces`/`forceCoeffs`/`scalarTransport` with `adjustTimeStep yes`, also under the override | brae's function objects run on a clock with controlDict's deltaT |
 | `SpalartAllmarasDES`, `kOmegaSSTDES` | brae has the delayed (DDES) variants only |
 | LES without `delta` | OpenFOAM reads it with no default |
 | `Smagorinsky`/`WALE` with `delta maxDeltaxyz` | brae's algebraic LES kernels take cbrt(V) |
@@ -168,7 +172,9 @@ were refused already and are now refused earlier, for kOmegaSST on a moving mesh
 tutorials that run write the same files as before. Two outputs change: after a `latestTime` restart under
 `writeControl runTime` or `adjustableRunTime` the write times are OpenFOAM's (the first step after the restart is no
 longer written), and a run whose turbulence field goes non-finite stops at that step instead of writing it.
-`adjustTimeStep` runs print a notice naming issue #53.
+`adjustTimeStep yes` is refused unless `BRAE_ALLOW_ADJUSTTIMESTEP=1` is set (it used to run with a notice): every
+v2412 pimpleFoam tutorial whose controlDict asks for it now needs the override to run, and runs as an experimental
+approximation when given it.
 
 ---
 

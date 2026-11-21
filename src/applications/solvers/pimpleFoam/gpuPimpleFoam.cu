@@ -812,15 +812,16 @@ try
     // CourantNo / setInitialDeltaT / setDeltaT). Previously refused outright, which cost 11 of the 35
     // OpenFOAM pimpleFoam tutorials -- it is the default for transient cases.
     const TimeControls timeControls = TimeControls::read(controlDict);
-    // adjustTimeStep runs on brae's own clock, not OpenFOAM's (issue #53, a later work package): said at start-up, not
-    // refused (the coordinator's call, pending the user's). The step SEQUENCE differs from the first step, so the transient
-    // fields at a given time differ from OpenFOAM's too -- every step solves OpenFOAM's equations, at another size.
+    // adjustTimeStep runs on brae's own clock, not OpenFOAM's (issue #53; reproducing OpenFOAM's sequence is work package
+    // M4). The step SEQUENCE differs from the first step, so the transient fields at a given time differ from OpenFOAM's
+    // too -- every step solves OpenFOAM's equations, at another size. Until M4 it is REFUSED at start-up; an explicitly
+    // acknowledged experimental override (BRAE_ALLOW_ADJUSTTIMESTEP=1, exactly "1") runs it on brae's clock, with the
+    // whole difference said at start-up, so existing tutorial workflows can still be run knowingly.
     if (timeControls.adjustTimeStep)
     {
         const std::string wc = controlDict.wordOr("writeControl", "timeStep");
         const bool adjustableWrites = (wc == "adjustable" || wc == "adjustableRunTime");
-        noticeApproximated(
-            "controlDict adjustTimeStep",
+        const std::string why =
             "under `adjustTimeStep yes` the time-step sequence differs from OpenFOAM's, and so do the transient fields at "
             "any given time, not only the write times (issue #53). OpenFOAM applies setDeltaT before every step, the first "
             "included (pimpleFoam.C:132-136)" + std::string(adjustableWrites
@@ -831,7 +832,20 @@ try
               "differ from OpenFOAM's by the time-integration error of the different steps. The output differs too: "
             + std::string(adjustableWrites ? "its writes land on the first step past each write time instead of on it, " : "")
             + "the run can stop short of endTime, and the last directory is named after startTime + deltaT*steps with "
-            "the last deltaT, not the time reached. A fixed deltaT runs on OpenFOAM's clock.");
+            "the last deltaT, not the time reached.";
+        const char* ack = std::getenv("BRAE_ALLOW_ADJUSTTIMESTEP");
+        if (!ack || std::string(ack) != "1")
+        {
+            throw std::runtime_error(
+                "brae: controlDict `adjustTimeStep yes` is refused until brae reproduces OpenFOAM's time-step sequence: "
+                + why + " Run at a fixed deltaT (`adjustTimeStep no;`), which runs on OpenFOAM's clock; or set "
+                "BRAE_ALLOW_ADJUSTTIMESTEP=1 to run it anyway as an EXPERIMENTAL approximation whose transient fields are "
+                "not OpenFOAM's at any given time.");
+        }
+        noticeApproximated(
+            "controlDict adjustTimeStep",
+            "EXPERIMENTAL, run only because BRAE_ALLOW_ADJUSTTIMESTEP=1 is set: " + why
+            + " A fixed deltaT runs on OpenFOAM's clock.");
     }
     // constant/dynamicMeshDict. Absent -> inactive, so every existing case takes the identical path.
     refuseSolidBodyEntries(caseDir);

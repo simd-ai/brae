@@ -14,7 +14,9 @@
 #   motion        a moving-mesh restart; solid-body entries missing or not constant; updateControl/updateInterval brae does
 #                 not reproduce; moveMeshOuterCorrectors with nOuterCorrectors > 1; a wall-distance model on a moving mesh; a
 #                 plain cyclic whose cells rotate or deform, or whose halves move apart; forces on a moving mesh
-#   adaptive      forces/forceCoeffs/scalarTransport with adjustTimeStep; adjustTimeStep's start-up notice naming issue #53
+#   adaptive      adjustTimeStep (issue #53, until M4) unless BRAE_ALLOW_ADJUSTTIMESTEP=1 (exactly "1"), which runs it with
+#                 an EXPERIMENTAL start-up notice; forces/forceCoeffs/scalarTransport with adjustTimeStep, refused even
+#                 under that override
 #   les           SpalartAllmarasDES / kOmegaSSTDES; Smagorinsky/WALE with maxDeltaxyz; cubeRootVol deltaCoeff != 1 or on a
 #                 2-D mesh; LES without delta; IDDES with another delta, another Cw, another hmax, exactDistance, or on a mesh
 #                 whose cells are not boxes
@@ -63,12 +65,14 @@ PY
 # append <file> <text>: raw text at the end of a dictionary
 append() { printf '%s\n' "$2" >> "$1"; }
 
+# REFUSE_ENV: environment assignments every refusal run gets (empty unless an arm sets it)
+REFUSE_ENV=()
 refuses()   # refuses <name> <case> <phrase>...
 {
     local name=$1 dir=$2
     shift 2
     local log="$WORK/$name.log"
-    env -u BRAE_CHECK_SETUP "$BIN" -case "$dir" > "$log" 2>&1
+    env -u BRAE_CHECK_SETUP "${REFUSE_ENV[@]}" "$BIN" -case "$dir" > "$log" 2>&1
     local rc=$?
     if [ "$rc" -eq 0 ]; then
         echo "FAIL: $name -- accepted (exit 0); it should be refused"
@@ -328,15 +332,26 @@ set_entry "$WORK/a_notice/system/controlDict" adjustTimeStep yes
 set_entry "$WORK/a_notice/system/controlDict" maxCo 0.5
 set_entry "$WORK/a_notice/system/controlDict" writeControl adjustable
 set_entry "$WORK/a_notice/system/controlDict" writeInterval 0.001
-accepts adjust_time_step_runs "$WORK/a_notice"
-if grep -qF "issue #53" "$WORK/adjust_time_step_runs.log" \
-    && grep -qF "the time-step sequence differs from OpenFOAM's, and so do the transient fields" "$WORK/adjust_time_step_runs.log" \
-    && grep -qF "writes land on the first step past each write time" "$WORK/adjust_time_step_runs.log"; then
-    echo "ok:   adjust_time_step_notice"
+# refused by default: the step sequence is brae's, not OpenFOAM's (issue #53) until M4
+refuses adjust_time_step_refused "$WORK/a_notice" "\`adjustTimeStep yes\` is refused" "issue #53" \
+    "the time-step sequence differs from OpenFOAM's, and so do the transient fields" "BRAE_ALLOW_ADJUSTTIMESTEP=1"
+# the override is an explicit acknowledgement: only the exact value 1 opens it
+REFUSE_ENV=(BRAE_ALLOW_ADJUSTTIMESTEP=0)
+refuses adjust_time_step_override_not_1 "$WORK/a_notice" "\`adjustTimeStep yes\` is refused"
+REFUSE_ENV=()
+# ...and with it the run goes ahead, saying at start-up that it is experimental and why
+accepts adjust_time_step_experimental "$WORK/a_notice" BRAE_ALLOW_ADJUSTTIMESTEP=1
+if grep -qF "EXPERIMENTAL, run only because BRAE_ALLOW_ADJUSTTIMESTEP=1 is set" "$WORK/adjust_time_step_experimental.log" \
+    && grep -qF "issue #53" "$WORK/adjust_time_step_experimental.log" \
+    && grep -qF "the time-step sequence differs from OpenFOAM's, and so do the transient fields" "$WORK/adjust_time_step_experimental.log" \
+    && grep -qF "writes land on the first step past each write time" "$WORK/adjust_time_step_experimental.log"; then
+    echo "ok:   adjust_time_step_experimental_notice"
 else
-    echo "FAIL: adjust_time_step_notice -- no start-up notice naming issue #53, the step sequence and the write times"
+    echo "FAIL: adjust_time_step_experimental_notice -- no EXPERIMENTAL start-up notice naming the override, issue #53, the step sequence and the write times"
     fail=1
 fi
+# the function-object refusals below hold even under the override: it opens the clock, not their other clock
+REFUSE_ENV=(BRAE_ALLOW_ADJUSTTIMESTEP=1)
 cp -r "$WORK/f_static" "$WORK/a_forces"
 set_entry "$WORK/a_forces/system/controlDict" adjustTimeStep yes
 set_entry "$WORK/a_forces/system/controlDict" maxCo 0.5
@@ -349,6 +364,7 @@ sed -i 's/div(phi,U) Gauss linear;/div(phi,U) Gauss linear;\n    div(phi,s) Gaus
 sed 's/object U;/object s;/; s/volVectorField/volScalarField/; s/\[0 1 -1 0 0 0 0\]/[0 0 0 0 0 0 0]/; s/(1 0 0)/0/g' \
     "$WORK/a_scalar/0/U" | sed 's/type noSlip;/type zeroGradient;/' > "$WORK/a_scalar/0/s"
 refuses scalar_transport_adjust_time_step "$WORK/a_scalar" "tracer (scalarTransport) with \`adjustTimeStep yes\`"
+REFUSE_ENV=()
 cp -r "$WORK/a_scalar" "$WORK/s_fixed"
 set_entry "$WORK/s_fixed/system/controlDict" adjustTimeStep -
 accepts scalar_transport_fixed_step "$WORK/s_fixed"
