@@ -51,6 +51,9 @@ set(BRAE_SMOKE_TESTS
     cyclic_device_rot
     ddt_corr
     ddt_corr_backward
+    default_path_determinism_dambreak
+    default_path_determinism_rhobox
+    default_path_determinism_shocktube
     default_path_interfoam_capillaryrise
     default_path_pimplefoam_pitzdaily
     default_path_rhosimplefoam_rhobox
