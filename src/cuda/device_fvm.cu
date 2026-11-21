@@ -6,6 +6,9 @@
 #include "device_mesh.cuh"
 #include "device_limiter.cuh"
 #include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace brae {
 
@@ -658,6 +661,50 @@ void deviceDivUpwindCoeffs(
 }
 
 
+namespace {
+// BRAE_CONTROL_LIMITER, a gate's NEGATIVE CONTROL and nothing else (never set in a production run). It injects the two
+// implementation faults tests/pimple_pressure_reference_developed_vs_openfoam.sh must be able to see, here, where every
+// implicit limited convection term is assembled:
+//   grad:<s>  the limiter reads the cell gradient times s (a gradient implemented wrong by a factor, the boundary
+//             faces left out and so on all change what NVDTVD::r sees, and the gradient's scale is the simplest);
+//   k:<s>     limitedLinear's coefficient times s, so the limiter function itself is wrong (k:0.5 runs
+//             limitedLinear 0.5 where the case asks for 1). Only for limitedLinear (twoByk > 0).
+// Read once. Announced on stdout, so the gate can tell a control that took effect from one that did not.
+struct LimiterControl
+{
+    scalar gradScale = 1.0;
+    scalar kScale = 1.0;
+};
+
+const LimiterControl& limiterControl()
+{
+    static const LimiterControl c = []
+    {
+        LimiterControl r;
+        const char* e = std::getenv("BRAE_CONTROL_LIMITER");
+        if (!e || !*e) return r;
+        if (std::strncmp(e, "grad:", 5) == 0) r.gradScale = std::atof(e + 5);
+        else if (std::strncmp(e, "k:", 2) == 0) r.kScale = std::atof(e + 2);
+        else
+        {
+            std::fprintf(stderr, "brae: BRAE_CONTROL_LIMITER='%s' is not grad:<s> or k:<s>.\n", e);
+            std::exit(1);
+        }
+        std::printf("  *** BRAE_CONTROL_LIMITER=%s: limited convection is assembled WRONG on purpose (a gate's control)"
+                    " ***\n", e);
+        return r;
+    }();
+    return c;
+}
+
+__global__ void scaledCopyKernel(int n, scalar s, const scalar* __restrict__ a, scalar* __restrict__ b)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) b[i] = s * a[i];
+}
+} // namespace
+
+
 void deviceDivLimitedCoeffs(
     const DeviceMesh& dm,
     const DeviceBuffer<scalar>& phiInt,
@@ -674,8 +721,23 @@ void deviceDivLimitedCoeffs(
     upper.resize(nIf);
     lower.resize(nIf);
     diag.resize(nC);
+    const LimiterControl& ctl = limiterControl();
+    if (ctl.kScale != 1.0 && twoByk > 0.0) twoByk /= ctl.kScale;   // twoByk = 2/k: limitedLinear(k*s)
+    const DeviceBuffer<scalar>* lx = &gx;
+    const DeviceBuffer<scalar>* ly = &gy;
+    const DeviceBuffer<scalar>* lz = &gz;
+    DeviceBuffer<scalar> sx, sy, sz;
+    if (ctl.gradScale != 1.0)
+    {
+        sx.resize(nC); sy.resize(nC); sz.resize(nC);
+        scaledCopyKernel<<<nBlocks(nC), TPB>>>(nC, ctl.gradScale, gx.data(), sx.data());
+        scaledCopyKernel<<<nBlocks(nC), TPB>>>(nC, ctl.gradScale, gy.data(), sy.data());
+        scaledCopyKernel<<<nBlocks(nC), TPB>>>(nC, ctl.gradScale, gz.data(), sz.data());
+        cudaCheck(cudaGetLastError(), "limiter control");
+        lx = &sx; ly = &sy; lz = &sz;
+    }
     divLimitedFaceKernel<<<nBlocks(nIf), TPB>>>(nIf, dm.owner.data(), dm.nei.data(), dm.w.data(), phiInt.data(), field.data(),
-                                                gx.data(), gy.data(), gz.data(),
+                                                lx->data(), ly->data(), lz->data(),
                                                 faceOffsets(dm),
                                                 twoByk, upper.data(), lower.data());
     cudaCheck(cudaGetLastError(), "divLimitedFace");
