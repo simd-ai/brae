@@ -7,7 +7,9 @@
 # (2) again: alpha and gamma are held, beta (it failed) and delta (its run changed its own inputs) run;
 # (3) beta mended: it runs and passes, (4) and is then held; (5) the helper alpha sources edited: alpha runs;
 # (6) a data file touched, same bytes: gamma is still held; (7) its bytes changed: gamma runs; (8) --no-cache
-# runs all four; (9) another BRAE_TEST_CACHE_SALT holds none. No GPU, no solver.
+# runs all four; (9) another BRAE_TEST_CACHE_SALT holds none; (10) an ENVIRONMENT_MODIFICATION given to alpha (the
+# default-path label's form, `NAME=unset:`): alpha runs, the others are held; (11) and is then held; (12) its unset
+# list grown by one: alpha runs again. No GPU, no solver.
 set -u
 TOOL="${1:?tools/ctest_cached.py}"
 WORK="${2:?work directory}"
@@ -78,6 +80,20 @@ arm data_touched 3 1 0
 echo "1 2 4" > "$P/data/values.txt"
 arm data_changed 2 2 0
 ran data_changed gamma || { echo "FAIL: data_changed -- gamma did not run"; fail=1; }
+cp "$P/CMakeLists.txt" "$P/CMakeLists.plain"
+modify()   # modify <ENVIRONMENT_MODIFICATION value>: alpha gets it, and the project is configured again
+{
+    cp "$P/CMakeLists.plain" "$P/CMakeLists.txt"
+    echo "set_tests_properties(alpha PROPERTIES ENVIRONMENT_MODIFICATION \"$1\")" >> "$P/CMakeLists.txt"
+    cmake -S "$P" -B "$P/build" > "$WORK/configure.log" 2>&1 || { echo "FAIL: the project did not configure"; exit 1; }
+}
+modify "SELFTEST_CASE_SOLVER=unset:"
+arm env_modification_added 2 2 0
+ran env_modification_added alpha || { echo "FAIL: env_modification_added -- alpha did not run"; fail=1; }
+arm env_modification_held 3 1 0
+modify "SELFTEST_CASE_SOLVER=unset:;SELFTEST_OTHER_SOLVER=unset:"
+arm env_modification_changed 2 2 0
+ran env_modification_changed alpha || { echo "FAIL: env_modification_changed -- alpha did not run"; fail=1; }
 arm no_cache 0 4 0 --no-cache
 arm salted 0 4 0 BRAE_TEST_CACHE_SALT=another
 python3 "$TOOL" --test-dir "$P/build" --store "$WORK/store" --list > "$WORK/list.log" 2>&1
