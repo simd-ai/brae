@@ -58,12 +58,11 @@ refuses()  # refuses <name> <case dir> <expected text>
 rm -rf "$WORK"; mkdir -p "$WORK"
 
 # 1. adjustTimeStep's Courant control (OF readTimeControls/CourantNo/setInitialDeltaT/setDeltaT, via the shared
-#    cfdTools module) on brae's own clock. Refused by default until M4 (issue #53; tests/pimple_setup_refusals.sh
-#    holds the refusal), it is reached here through its experimental override: the control loop must still run past
-#    the dictionaries -- a case that silently stopped at them would mean the override no longer opens it.
+#    cfdTools module) on OpenFOAM's clock (M4): the run must get past the dictionaries -- a case that silently stopped
+#    at them would mean the control loop is not executing.
 mkcase "$WORK/adjustdt" "adjustTimeStep yes;
 maxCo 0.9;"
-accepts_past_dict adjust_time_step "$WORK/adjustdt" BRAE_ALLOW_ADJUSTTIMESTEP=1
+accepts_past_dict adjust_time_step "$WORK/adjustdt"
 
 # 2. An active MRF zone: dropping the rotation leaves a converged-looking field of the wrong flow.
 mkcase "$WORK/mrf"
