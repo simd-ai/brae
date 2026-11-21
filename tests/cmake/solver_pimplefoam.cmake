@@ -125,3 +125,12 @@ add_test(NAME pimple_turbulence_health
                  ${PROJECT_SOURCE_DIR}/validation/pitzDaily
                  ${PROJECT_BINARY_DIR}/pimple_turbulence_health_work)
 set_tests_properties(pimple_turbulence_health PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow" TIMEOUT 900)
+
+# brae's IDDES hmax (the cell's bounding box) against OpenFOAM's maxDeltaxyz and maxDeltaxyzCubeRoot fields, written by
+# pimpleFoam -postProcess: they agree on a Cartesian box, where brae sets up, and differ on a sheared one, where brae refuses
+# and reports the difference this gate measures. Control BRAE_CONTROL_LES_MESH_UNCHECKED=1. About 20 s.
+add_test(NAME pimple_iddes_hmax_vs_openfoam
+         COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_iddes_hmax_vs_openfoam.sh
+                 $<TARGET_FILE:brae_pimpleFoam>
+                 ${PROJECT_BINARY_DIR}/pimple_iddes_hmax_work)
+set_tests_properties(pimple_iddes_hmax_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow" TIMEOUT 900)
