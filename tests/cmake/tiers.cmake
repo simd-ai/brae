@@ -7,6 +7,12 @@
 # checks and kepsilon_production_and_blend, whose fixes are their own pull requests; they run in every full tier.
 # A test joins or leaves this list by the same measurement. A label decides where a test runs, never whether it runs:
 # every test here, and every other, runs in the nightly and release tiers.
+#
+# One exception to the 5 s rule, decided 2026-11-21: pimple_pressure_reference_developed (about 22 s on the GB10) is the
+# pressure-reference gate, bounded by OpenFOAM's own decomposed spread, and runs here for that reason. The uniform-start
+# test it replaces, pimple_pressure_reference, is labelled `diagnostic` and is not in this list: its limiter is decided
+# by rounding signs, so its result depends on the compiler and GPU target. The full tiers run it in a step of its own
+# that reports and never fails the job (gpu-full.yml); `ctest --preset diagnostic` runs it by hand.
 set(BRAE_SMOKE_TESTS
     abl_vs_openfoam
     acmi_wall_gate
@@ -286,7 +292,7 @@ set(BRAE_SMOKE_TESTS
     peqn_matrix
     pimple_dispatch
     pimple_guards
-    pimple_pressure_reference
+    pimple_pressure_reference_developed
     pimple_run
     piov_sngrad
     pm_vs_openfoam
