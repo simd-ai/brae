@@ -221,6 +221,44 @@ exactly these 24 (sec. 7).
 **Not in this release:** multi-GPU (the coupled-patch plan is in ARCHITECTURE.md sec. 5c), cyclic patches, other RAS
 models and LES, other motion solvers, binary output.
 
+## 6b. Refused configurations and behaviour changes, 2026-11-21 (wave 1, Q4)
+
+**Now runs** (each held against OpenFOAM v2412 by `tests/rho_central_keys_vs_openfoam.sh`, or byte-identical to the
+form it replaces in `tests/rho_central_keys_refusals.sh`):
+- `interpolationSchemes { default linear; }` with no `reconstruct` entries, and `reconstruct(...) linear`: the plain
+  linear reconstruction in both directions, as `directionInterpolate.H` builds it. It used to be refused.
+- RAS `div(phi,k|omega) Gauss linearUpwind <name>`: the named gradient is looked up in `gradSchemes` (`Gauss linear`
+  or `cellLimited Gauss linear <k>`). It used to run on an unlimited gradient whatever the entry said.
+- RAS `relaxationFactors` for `k` and `omega` (a factor, a pattern or `default`): applied as `kOmegaSSTBase::correct`
+  applies them. They used to be ignored.
+- Any `solver` name on the diagonal `rho`, `rhoU` and `rhoE` solves: OpenFOAM uses its diagonal solver for any
+  diagonal matrix. Only `diagonal` used to be accepted.
+- A `reconstruct` scheme beside a `gradSchemes` default that brae does not compute, when the reconstruction is
+  `upwind` or `linear`: neither forms a gradient. It used to be refused.
+- Quoted (pattern) keys in fvSchemes, resolved as OpenFOAM resolves them: the literal key, then the last matching
+  pattern, then `default`. A pattern used to be ignored, and a quoted name was read as if it were the name.
+
+**Refused at start-up, by name** (each used to run silently):
+- RAS `laplacian((rho*DkEff),k)` or `laplacian((rho*DomegaEff),omega)` other than `Gauss linear corrected` or
+  `orthogonal`, or the two different; `laplacian(alphaEff,e)` other than `Gauss linear corrected` under RAS. These
+  keys used to be checked under other names (`DkEff`, `DomegaEff`, `alphahe`), which OpenFOAM does not ask for.
+- RAS `ddt(rho,k)` or `ddt(rho,omega)` other than the solver's own scheme; `interpolate(rho)` other than `linear`.
+- RAS `limitedLinear` with a coefficient outside [0, 1] (OpenFOAM stops on it too).
+- A RAS `linearUpwind` whose named gradient is neither `Gauss linear` nor `cellLimited Gauss linear <k>`.
+- A `k` or `omega` relaxation factor that is not a constant.
+- kOmegaSST `decayControl` on. `kInf` and `omegaInf` without it run: OpenFOAM zeroes them.
+- Viscous `dotInterpolate(S,tauMC)` other than `linear`; `grad(T)` other than `Gauss linear` with a thermal-creep
+  `maxwellSlipU`.
+- A diagonal solve's entry with no `solver` word (OpenFOAM stops there too).
+
+**Log only:** a janaf evaluation outside [Tlow, Thigh] prints OpenFOAM's warning once per step (OpenFOAM prints it at
+each evaluation). The numbers are unchanged. The unread entries of fvSolution, turbulenceProperties,
+thermophysicalProperties and fvSchemes are listed as `brae NOTICE [unread]` lines (`BRAE_DICT_AUDIT=0` turns the list
+off).
+
+None of the seven v2412 rhoCentralFoam tutorials uses any of these forms. All seven write the same bytes as before on
+the CUDA arm, and on the host arm where it runs (20 steps each, GB10).
+
 ## 7. CI
 
 - **Hosted build-check (`ci.yml`):** compiles `brae`, which depends on `brae_rhoCentralFoam`, for sm_80 and sm_90. It
