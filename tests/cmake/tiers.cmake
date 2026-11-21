@@ -61,7 +61,6 @@ set(BRAE_SMOKE_TESTS
     default_path_determinism_rhobox
     default_path_determinism_shocktube
     default_path_interfoam_capillaryrise
-    default_path_pimplefoam_pitzdaily
     default_path_rhosimplefoam_rhobox
     default_path_timeloop_vs_openfoam
     default_path_write_cadence_vs_openfoam

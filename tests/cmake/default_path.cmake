@@ -7,8 +7,9 @@
 #   - runs `brae`, the front door, which hands the case to the solver its controlDict names;
 #   - holds the default path to a bound an EXISTING gate established, named beside it: none sets a tolerance of its
 #     own. Where that gate measured the case-solver path, its bound is reused as it stands and the line says so.
-# Their tier is tests/cmake/tiers.cmake's rule, measured on the GB10 (2026-11-21, ctest -j1): eight took at most 5 s
-# and are in its smoke list; rotatingCylinders (8 s) and shockTube (29 s) are labelled slow.
+# Their tier is tests/cmake/tiers.cmake's rule, measured on the GB10 (2026-11-21, ctest -j1): seven took at most 5 s
+# and are in its smoke list; rotatingCylinders (8 s), shockTube (29 s) and pitzDaily (27 s: the developed-start gate
+# runs an OpenFOAM precursor and OpenFOAM decomposed in two and four) are labelled slow.
 #
 # Included by tests/CMakeLists.txt.
 
@@ -24,16 +25,17 @@ add_test(NAME default_path_simplefoam_rotatingcylinders
 set_tests_properties(default_path_simplefoam_rotatingcylinders PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1800
                      LABELS "default-path;slow" ENVIRONMENT "BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 
-# pimpleFoam: the committed pitzDaily made transient and all-Neumann, ten steps, against OpenFOAM pimpleFoam at
-# pimple_pressure_reference's bounds (U 1e-3, p 5e-3, tests/pimple_pressure_reference_vs_openfoam.sh), its control
-# (BRAE_NO_PREF=1) included. That gate runs brae_pimpleFoam itself; none of the three variables reaches pimpleFoam,
-# so its bound is the default path's already: here the front door hands the case over.
+# pimpleFoam: the committed pitzDaily made transient and all-Neumann, from an OpenFOAM precursor at t0 = 0.002, ten
+# steps against OpenFOAM pimpleFoam at pimple_pressure_reference_developed's bound (10x OpenFOAM's own np2/np4
+# spread, computed in the run; tests/pimple_pressure_reference_developed_vs_openfoam.sh), its three controls included.
+# That gate runs brae_pimpleFoam itself; none of the three variables reaches pimpleFoam, so its bound is the default
+# path's already: here the front door hands the case over.
 add_test(NAME default_path_pimplefoam_pitzdaily
-         COMMAND ${BRAE_DEFAULT_PATH_RUN} bash ${PROJECT_SOURCE_DIR}/tests/pimple_pressure_reference_vs_openfoam.sh
+         COMMAND ${BRAE_DEFAULT_PATH_RUN} bash ${PROJECT_SOURCE_DIR}/tests/pimple_pressure_reference_developed_vs_openfoam.sh
                  $<TARGET_FILE:brae> ${PROJECT_SOURCE_DIR}/validation/pitzDaily
                  ${PROJECT_BINARY_DIR}/default_path_pimplefoam_work)
-set_tests_properties(default_path_pimplefoam_pitzdaily PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 900
-                     LABELS default-path)
+set_tests_properties(default_path_pimplefoam_pitzdaily PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 1800
+                     LABELS "default-path;slow")
 
 # rhoSimpleFoam: validation/rhoBox (heated duct) to steady state, its default (pre-mirror) driver against OpenFOAM at
 # rho_vs_openfoam's bound (L2 1e-5 on T and p, validation/rho_vs_openfoam.sh:20).
