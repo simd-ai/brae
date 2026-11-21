@@ -296,7 +296,7 @@ void gradKernel(
         // DMUL then DADD, while y and z stayed fused. On a uniform field the gradient IS these roundings,
         // and its sign decides limitedLinear wherever the field does not change: on pitzDaily's uniform k
         // the GH200 gradient differed from OpenFOAM's in 9,837 of 12,225 cells and turned 2,125 faces from
-        // linear to upwind or back (W18). y and z are written the same way: the same statement, fused on
+        // linear to upwind or back. y and z are written the same way: the same statement, fused on
         // both targets already, so pinning them changes no bit today and keeps the next compiler from
         // making the same choice there.
         if (takeOwner)   // +owner internal
@@ -815,7 +815,7 @@ void gradFusedKernel(
         for (int i = 0; i < N; ++i)
         {
             const scalar pf = wf * (fld.vol[i][o] - fld.vol[i][n]) + fld.vol[i][n];
-            // pinned as gradKernel pins them (one rounding per update, __fma_rn; W18), so the fused
+            // pinned as gradKernel pins them (one rounding per update, __fma_rn), so the fused
             // kernel stays bit-identical to it on every target, which tests/test_grad_fused.cu holds
             if (takeOwner)
             {
