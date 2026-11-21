@@ -73,7 +73,7 @@ Every model the steady solver has, plus the hybrid RANS/LES set — with the tra
 | Spalart-Allmaras | ✓ |
 | SA-DDES, SA-IDDES | ✓ |
 | k-omega SST-DDES, k-omega SST-IDDES | ✓ |
-| Smagorinsky, WALE (LES) | ✓ algebraic sub-grid `nut`, `delta cubeRootVol` on a 3-D mesh |
+| Smagorinsky, WALE (LES) | ✓ algebraic sub-grid `nut`, `delta cubeRootVol` |
 | SA-DES, kOmegaSST-DES (non-delayed), dynamic-k LES, RSM | ✗ refused |
 
 Wall functions, model coefficients and the `turbulenceProperties` parse are shared with the steady solver, so they
@@ -148,9 +148,12 @@ differently from OpenFOAM v2412. The message names the entry, why, and what to u
 | `SpalartAllmarasDES`, `kOmegaSSTDES` | brae has the delayed (DDES) variants only |
 | LES without `delta` | OpenFOAM reads it with no default |
 | `Smagorinsky`/`WALE` with `delta maxDeltaxyz` | brae's algebraic LES kernels take cbrt(V) |
-| `cubeRootVol` with `deltaCoeff` other than 1, or on a mesh with an `empty` patch | brae's cubeRootVol is cbrt(V); OpenFOAM's 2-D form is sqrt(V/thickness) |
+| `cubeRootVol` with `deltaCoeff` other than 1 | brae's cubeRootVol is cbrt(V) |
 | IDDES with a delta other than `IDDESDelta`, an `IDDESDeltaCoeffs` `Cw` other than brae's, an `hmax` other than `maxDeltaxyz`/`maxDeltaxyzCubeRoot`, a non-default hmax `deltaCoeff`, or `wallDist exactDistance` | brae's IDDES length scale takes none of these |
 | IDDES on a mesh where brae's hmax (the cell's bounding box) differs from OpenFOAM's `maxDeltaxyz` | they agree only on cells whose faces are axis-aligned |
+
+Not refused yet, and different from OpenFOAM: an LES with `delta cubeRootVol` on a 2-D mesh (an `empty` patch), where
+OpenFOAM's filter width is `deltaCoeff*sqrt(V/thickness)` and brae's `cbrt(V)`.
 
 pimpleFoam also stops when a turbulence field goes bad: a turbulence solve's residual that is not finite (every step),
 or `sum|k| + sum|epsilon or omega|` (`nuTilda` for Spalart-Allmaras) not finite or 1e12 times its first value for 25
