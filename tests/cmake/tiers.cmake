@@ -104,6 +104,7 @@ set(BRAE_SMOKE_TESTS
     fvm_laplacian
     fvoptions_cpp
     gamg
+    gate_record_selftest
     gate_registration
     generalized_newtonian
     gpu_amg
@@ -387,6 +388,7 @@ set(BRAE_SMOKE_TESTS
     turb_fixedpoint_49k
     turbswitch_vs_openfoam
     turbulence_simulation_type_vs_openfoam
+    tutorial_sweep_selftest
     tvm_mapping
     ueqn_cpp
     ueqn_cuda
