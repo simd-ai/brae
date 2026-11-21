@@ -38,18 +38,19 @@ Legend: ✓ supported · ✗ not yet.
 | `ddt0(...)` state written and re-read on restart (`CrankNicolson`) | ✓ |
 | Named `ddt(X)` entries | only when they resolve to the `default` scheme; any other is refused |
 | Fixed `deltaT` | ✓ |
-| `adjustTimeStep` / `maxCo` (Courant-limited dt) | runs, on brae's own clock: a start-up notice says what differs (issue #53) |
+| `adjustTimeStep` / `maxCo` (Courant-limited dt) | runs on brae's own clock: the step sequence and so the fields at a given time differ from OpenFOAM's; a start-up notice says so (issue #53) |
 
 `writeControl timeStep` and `runTime`/`adjustableRunTime`, `writeInterval` and `purgeWrite` behave as in
 `Foam::Time`. After a restart the `runTime` write grid continues from the restart time, as OpenFOAM's does
 (`Time::operator++` measures it from the resolved start).
 
-Under `adjustTimeStep yes` brae does not yet run OpenFOAM's clock (issue #53): OpenFOAM applies `setDeltaT` before every
-step, the first included, and under `writeControl adjustable` shortens the steps to land on the write times; brae does
-neither. brae's writes then land on the first step past each write time, the run can stop short of `endTime`, and the
-last directory is named after `startTime + deltaT*steps`. Every step solves OpenFOAM's equations at its own size, so at a
-given time the fields differ from OpenFOAM's by the time-integration error of the different steps. A start-up notice
-says so.
+Under `adjustTimeStep yes` brae does not yet run OpenFOAM's clock (issue #53), and the time-step sequence differs from
+OpenFOAM's from the first step -- so the transient fields at a given time differ from OpenFOAM's, not only the write
+times. OpenFOAM applies `setDeltaT` before every step, the first included, and under `writeControl adjustable` shortens
+every step so that the steps land on the write times; brae does neither. Each brae step solves OpenFOAM's equations at
+its own step size, so at a given time the fields differ by the time-integration error of the different steps. The output
+differs too: brae's writes land on the first step past each write time, the run can stop short of `endTime`, and the
+last directory is named after `startTime + deltaT*steps`. A start-up notice says so.
 
 ## PIMPLE controls (`fvSolution`)
 

@@ -330,10 +330,11 @@ set_entry "$WORK/a_notice/system/controlDict" writeControl adjustable
 set_entry "$WORK/a_notice/system/controlDict" writeInterval 0.001
 accepts adjust_time_step_runs "$WORK/a_notice"
 if grep -qF "issue #53" "$WORK/adjust_time_step_runs.log" \
+    && grep -qF "the time-step sequence differs from OpenFOAM's, and so do the transient fields" "$WORK/adjust_time_step_runs.log" \
     && grep -qF "writes land on the first step past each write time" "$WORK/adjust_time_step_runs.log"; then
     echo "ok:   adjust_time_step_notice"
 else
-    echo "FAIL: adjust_time_step_notice -- no start-up notice naming issue #53 and the write times"
+    echo "FAIL: adjust_time_step_notice -- no start-up notice naming issue #53, the step sequence and the write times"
     fail=1
 fi
 cp -r "$WORK/f_static" "$WORK/a_forces"

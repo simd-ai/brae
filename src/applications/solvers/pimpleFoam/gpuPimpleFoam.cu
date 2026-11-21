@@ -813,25 +813,25 @@ try
     // OpenFOAM pimpleFoam tutorials -- it is the default for transient cases.
     const TimeControls timeControls = TimeControls::read(controlDict);
     // adjustTimeStep runs on brae's own clock, not OpenFOAM's (issue #53, a later work package): said at start-up, not
-    // refused. What differs is the step SEQUENCE -- every step solves OpenFOAM's equations, at its own size.
+    // refused (the coordinator's call, pending the user's). The step SEQUENCE differs from the first step, so the transient
+    // fields at a given time differ from OpenFOAM's too -- every step solves OpenFOAM's equations, at another size.
     if (timeControls.adjustTimeStep)
     {
         const std::string wc = controlDict.wordOr("writeControl", "timeStep");
         const bool adjustableWrites = (wc == "adjustable" || wc == "adjustableRunTime");
         noticeApproximated(
             "controlDict adjustTimeStep",
-            "brae's adaptive time step does not follow OpenFOAM's clock yet (issue #53). OpenFOAM applies setDeltaT before "
-            "every step, the first included (pimpleFoam.C:132-136)" + std::string(adjustableWrites
-                ? ", and under `writeControl " + wc + "` shortens the steps so that they land on each write time "
+            "under `adjustTimeStep yes` the time-step sequence differs from OpenFOAM's, and so do the transient fields at "
+            "any given time, not only the write times (issue #53). OpenFOAM applies setDeltaT before every step, the first "
+            "included (pimpleFoam.C:132-136)" + std::string(adjustableWrites
+                ? ", and under `writeControl " + wc + "` shortens every step so that the steps land on each write time "
                   "(Time::adjustDeltaT, Time.C:102-145); brae does neither"
                 : "; brae does not")
-            + ". So brae's steps fall at other times than OpenFOAM's: " + std::string(adjustableWrites
-                ? "its writes land on the first step past each write time instead of on it, "
-                : "")
+            + ". Each brae step solves OpenFOAM's equations, but at brae's own step sizes, so at a given time its fields "
+              "differ from OpenFOAM's by the time-integration error of the different steps. The output differs too: "
+            + std::string(adjustableWrites ? "its writes land on the first step past each write time instead of on it, " : "")
             + "the run can stop short of endTime, and the last directory is named after startTime + deltaT*steps with "
-            "the last deltaT, not the time reached. Every step solves OpenFOAM's equations at its own step size, so at a "
-            "given time the fields differ from OpenFOAM's by the time-integration error of the different steps, not by "
-            "the model. A fixed deltaT runs on OpenFOAM's clock.");
+            "the last deltaT, not the time reached. A fixed deltaT runs on OpenFOAM's clock.");
     }
     // constant/dynamicMeshDict. Absent -> inactive, so every existing case takes the identical path.
     refuseSolidBodyEntries(caseDir);
