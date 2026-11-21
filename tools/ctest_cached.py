@@ -11,7 +11,8 @@ it can change. Choosing "the tests that cover what I touched" by hand missed a p
 days (2026-10-04 to 2026-10-08): the change was in the shared AMG code and the selection was interFoam's.
 
 HOW. A test's outcome is a function of its inputs, so each test gets a FINGERPRINT of them:
-  * its command line, its ENVIRONMENT property, and every BRAE_* variable this process was started with;
+  * its command line, its ENVIRONMENT and ENVIRONMENT_MODIFICATION properties, and every BRAE_* variable this
+    process was started with;
   * the BYTES of every file on the command line and of every build target its DEPENDS property names;
   * for a script: the scripts and files its code names (followed recursively), every build executable its
     code names, and a whole source directory where the code reaches into one by a computed path;
@@ -330,6 +331,11 @@ def fingerprint(test, closure, inputs, machine, globalEnv, explain=None):
     command = test.get('command') or []
     rows.append('command ' + json.dumps(command))
     rows.append('environment ' + json.dumps(sorted(property_(test, 'ENVIRONMENT', []))))
+    # ENVIRONMENT_MODIFICATION in its own order (its operations apply in turn): the `default-path` label's unset list
+    # (tests/CMakeLists.txt). A row only where the property is set, so every other test keeps its fingerprint.
+    modification = property_(test, 'ENVIRONMENT_MODIFICATION', [])
+    if modification:
+        rows.append('environment-modification ' + json.dumps(modification))
     rows.append('cwd ' + str(property_(test, 'WORKING_DIRECTORY', '')))
     rows.extend(globalEnv)
     rows.extend(machine)
@@ -370,6 +376,10 @@ def fingerprint(test, closure, inputs, machine, globalEnv, explain=None):
             value = entry.split('=', 1)[1]
             if os.path.isabs(value):
                 take(value)
+    for entry in modification:   # NAME=op:value -- a path set, prepended or appended is an input as in ENVIRONMENT
+        value = entry.split('=', 1)[-1].split(':', 1)[-1]
+        if os.path.isabs(value):
+            take(value)
     for target in property_(test, 'DEPENDS', []) or []:
         take(os.path.join(build, target))
     for f in sorted(files):
