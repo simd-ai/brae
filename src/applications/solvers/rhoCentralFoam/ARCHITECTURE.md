@@ -751,7 +751,7 @@ largest value between OpenFOAM in four and OpenFOAM serial, and by 3.2e-2 betwee
 2e-3 s (264 steps), where OpenFOAM's own spread is already 5.6e-4 of the pressure at 5e-4 s, and brae stays within
 0.333 of ten times it. Longer runs are compared on the quantities an engineer reads: the ramp's pressure ratio and
 shock angle agree to 4e-5 between the codes at every write.
-LadenburgJet60psi refined to 120 x 40 and run to 0.4 ms does the same through its out-of-plane U_z mode (PORT.md):
+LadenburgJet60psi refined to 120 x 40 and run to 0.4 ms does the same through its out-of-plane U_z mode:
 fields 2.6e-12 apart at 0.1 ms and 7.0e-4 at 0.4 ms, with the same 239,867 steps and the same disc position to
 0.01 mm.
 
@@ -778,7 +778,7 @@ estimate: the boundary layer spans about two cells normal to the wall there (fir
 built to exercise the 3-D operators against OpenFOAM, not to resolve a boundary layer; a wall-resolved study is an
 open item.
 
-**Performance at scale** (PORT.md has the table). The corner at 74k, 590k and 4.7M cells, idle GB10, against
+**Performance at scale.** The corner at 74k, 590k and 4.7M cells, idle GB10, against
 OpenFOAM v2412 serial and in 4, 8, 16 and 20 ranks (scotch, bound to cores), the same step count in both codes:
 
 - Inviscid, end to end: brae 2.5 / 5.5 / 21.8 s, OpenFOAM serial 38.9 / 165 / 801 s, OpenFOAM in 20 ranks 10.9 / 28.5 /

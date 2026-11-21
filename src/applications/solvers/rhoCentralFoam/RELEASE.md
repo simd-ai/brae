@@ -2,8 +2,8 @@
 
 `brae_rhoCentralFoam` ports OpenFOAM v2412's `rhoCentralFoam`: density-based, explicit, with Kurganov/Tadmor
 central-upwind fluxes. This report states what the release covers and what it does not. It also says how the solver
-was checked, and against what. The design is in [ARCHITECTURE.md](ARCHITECTURE.md), the gate record in
-[VALIDATION.md](VALIDATION.md), and the measurements in [PORT.md](PORT.md).
+was checked, and against what. The design is in [ARCHITECTURE.md](ARCHITECTURE.md) and the gate record in
+[VALIDATION.md](VALIDATION.md).
 
 **Status: experimental, single GPU.** The label is in the solver's registry row, in a line on stderr at start-up, and
 in the build target's comment. It stays while registered open checks remain, while its 3-D coverage is young, and
