@@ -10,6 +10,8 @@
 //   measure     print every number and assert nothing but the path -- for setting bounds
 //   moving      the tutorial's own rigid-body motion: the joint state and the moved points are compared
 //               too, and grad(U) is cached as the case says (inert on a changing mesh)
+//   alphaBound=<v>  the moving profile's bound on alpha, which the script derives in the run from OpenFOAM's own
+//               one-ulp variability (see ALPHA ON THE MOVING PROFILE below); required with `moving`
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -84,7 +86,12 @@ constexpr scalar BOUND_ALPHA_RESIDUAL = 1e-12;
 // about three times; the fields not listed here keep the frozen profile's.
 constexpr scalar BOUND_BODY = 3e-14;
 constexpr scalar BOUND_POINTS = 1e-16;
-constexpr scalar MOVING_BOUND_ALPHA = 4e-13;
+// ALPHA ON THE MOVING PROFILE has no constant here: its bound is handed in (alphaBound=), derived in the run by
+// the script from OpenFOAM's own one-ulp variability, as 10x the largest alpha difference that one ulp in one
+// free-surface cell makes to OpenFOAM's own sixth step. A constant could not stand. The old one, 4e-13, was 3x one
+// GB10 measurement (1.1e-13), and OpenFOAM against itself reads 1.08e-13 or 4.85e-13 after one ulp, by the cell.
+// It took the GH200's brae (4.73e-13), whose only difference is its host compiler's FMA contraction (GCC 14.3
+// against 13.3), for a defect.
 
 scalar relInf(
     const std::vector<scalar>& a,
@@ -191,10 +198,28 @@ int main(
     const std::string last = ofCase + "/" + argv[4];
     const std::string logPath = argv[5];
     bool moving = false;
+    scalar movingBoundAlpha = -1;
     for (int a = 6; a < argc; ++a)
     {
-        measureOnly = measureOnly || std::string(argv[a]) == "measure";
-        moving = moving || std::string(argv[a]) == "moving";
+        const std::string arg = argv[a];
+        measureOnly = measureOnly || arg == "measure";
+        moving = moving || arg == "moving";
+        if (arg.rfind("alphaBound=", 0) == 0)
+        {
+            char* end = nullptr;
+            const double v = std::strtod(arg.c_str() + 11, &end);
+            if (end == arg.c_str() + 11 || *end != '\0' || !(v > 0.0))
+            {
+                std::printf("  FAIL: %s is not a positive bound\n", arg.c_str());
+                return 1;
+            }
+            movingBoundAlpha = static_cast<scalar>(v);
+        }
+    }
+    if (moving && movingBoundAlpha <= 0)
+    {
+        std::printf("  FAIL: the moving profile's alpha bound is derived by the script (alphaBound=); none given\n");
+        return 1;
     }
 
     std::printf("== brae interFoam vs OpenFOAM interFoam: RAS/DTCHullMoving, %s ==\n",
@@ -314,7 +339,7 @@ int main(
 
     bound("alpha, relative to its largest value",
           relInf(fin.alpha1.internal, readCells<scalar>(last + "/alpha.water", nC)),
-          moving ? MOVING_BOUND_ALPHA : BOUND_ALPHA);
+          moving ? movingBoundAlpha : BOUND_ALPHA);
     bound("p_rgh, relative", relInf(fin.p_rgh.internal, readCells<scalar>(last + "/p_rgh", nC)), BOUND_PRGH);
     bound("U, relative", relInf(fin.U.internal, readCells<vector>(last + "/U", nC)), BOUND_U);
     if (fin.turbulence.on)

@@ -253,7 +253,26 @@ control tv "the refValue dropped from the inflow value" BRAE_CONTROL_PIOV_TV=val
 #
 # CONTROL, asserted to fail on a number: brae with the dynamicMeshDict's `restraints` removed, against
 # OpenFOAM with them (measured at ten steps: q 8.4e-03, U 3.2e-02, nut 1.7e-01).
+#
+# THE BOUND ON ALPHA is derived in the run from OpenFOAM's own one-ulp variability, not set from a measurement
+# of brae. Five copies of the staged profile each move ONE free-surface water cell's alpha down by one ulp
+# (1 -> 1 - 2^-53; the five cells are spread evenly over the internal faces between a water and an air cell).
+# OpenFOAM runs each, cached like the oracle. The bound is 10x the largest alpha difference any of them makes to
+# OpenFOAM's own sixth step (the 10x envelope of the rhoCentralFoam and pressure-reference gates).
+# - MEASURED (GB10, OpenFOAM v2412): the five read 4.84e-13, 1.08e-13, 1.08e-13, 4.85e-13 and 4.85e-13.
+#   That is two modes: a discrete decision taken one way or the other, which splits them at step three. So the
+#   bound is about 4.8e-12.
+# - brae reads alpha 1.09e-13 when its host loop is built with GCC 13.3 and 4.73e-13 with GCC 14.3. The two
+#   builds differ only in which multiply-adds the host compiler fuses: the same binaries on one machine give
+#   the same digits, with either glibc's libm. Each build lands in one of OpenFOAM's own two modes.
+# - The old constant, 4e-13 (3x one GB10 measurement), was below OpenFOAM's own one-ulp response.
+# Asserted: each copy differs from the staged case in that one value, and each OpenFOAM run differs from the
+# oracle, but by less than 1e-11 (rounding, not a branch).
+# CONTROL for alpha, asserted to fail by more than 100x the derived bound: brae with the interface compression
+# assembled 0.1% wrong (BRAE_CONTROL_ALPHA_CALPHA=0.999).
 MSTEPS=6
+ULPS="0 1 2 3 4"
+CALPHA_CONTROL=0.999
 MV="$W/moving"
 rm -rf "$MV"
 cp -r "$M" "$MV" || exit 1
@@ -298,7 +317,41 @@ s, k = re.subn(r'\nrestraints\s*\{(?:[^{}]|\{[^{}]*\})*\}', '\n', s)
 assert k == 1, 'restraints'
 open(p, 'w').write(s)
 PYEOF
+# THE ONE-ULP COPIES, staged from the profile as it stands before OpenFOAM runs it
+for n in $ULPS; do
+    P="$W/movingUlp$n"
+    rm -rf "$P"
+    cp -r "$MV" "$P" || exit 1
+    python3 - "$MV/0/alpha.water" "$P/0/alpha.water" "$P/constant/polyMesh" "$n" <<'PYEOF' \
+        || { echo "FAIL: staging the one-ulp copy $n"; exit 1; }
+import math, re, struct, sys
+src, dst, mesh, nth = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+b = bytearray(open(src, 'rb').read())
+assert re.search(rb'format\s+binary;', bytes(b)), 'alpha.water is staged binary'
+m = re.search(rb'internalField\s+nonuniform List<scalar>\s*\n(\d+)\n\(', bytes(b))
+nc, off = int(m.group(1)), m.end()
+vals = struct.unpack_from('<%dd' % nc, b, off)
+def labels(name):
+    t = open('%s/%s' % (mesh, name), 'rb').read()
+    mm = re.search(rb'\n(\d+)\n\(', t)
+    return struct.unpack_from('<%di' % int(mm.group(1)), t, mm.end())
+own, nei = labels('owner'), labels('neighbour')
+pairs = [(c0, c1) for c0, c1 in zip(own, nei) if {vals[c0], vals[c1]} == {0.0, 1.0}]
+c0, c1 = pairs[nth*(len(pairs)//5)]
+cell = c0 if vals[c0] == 1.0 else c1
+struct.pack_into('<d', b, off + 8*cell, math.nextafter(1.0, 0.0))
+orig = open(src, 'rb').read()
+diff = [k for k in range(len(orig)) if orig[k] != b[k]]
+assert len(orig) == len(b) and diff and off + 8*cell <= min(diff) and max(diff) < off + 8*cell + 8
+open(dst, 'wb').write(bytes(b))
+print('  one-ulp copy %d: alpha in free-surface cell %d, 1 -> %.17g' % (nth, cell, math.nextafter(1.0, 0.0)))
+PYEOF
+done
+for n in $ULPS; do
+    oracleRun "$W/movingUlp$n" interfoam_dtchullmoving "movingUlp$n" > "$W/movingUlp$n.oracle.txt" 2>&1 &
+done
 oracleRun "$MV" interfoam_dtchullmoving moving
+wait
 grep -q "^End" "$MV/log.interFoam" || { echo "FAIL: interFoam [moving]"; tail -30 "$MV/log.interFoam"; exit 1; }
 grep -q "Selecting motion solver: rigidBodyMotion" "$MV/log.interFoam" \
     || { echo "FAIL: OpenFOAM's moving profile did not select rigidBodyMotion"; exit 1; }
@@ -306,6 +359,45 @@ MLAST=$(foamListTimes -case "$MV" 2>/dev/null | tail -1)
 [ "$(foamListTimes -case "$MV" 2>/dev/null | wc -l)" = "$MSTEPS" ] \
     || { echo "FAIL: OpenFOAM ran $(foamListTimes -case "$MV" | wc -l) steps of the moving profile, not $MSTEPS"; exit 1; }
 echo "OpenFOAM ran $MSTEPS steps of DTCHullMoving as shipped (the hull moving); last $MLAST"
+for n in $ULPS; do
+    cat "$W/movingUlp$n.oracle.txt"
+    grep -q "^End" "$W/movingUlp$n/log.interFoam" && [ -d "$W/movingUlp$n/$MLAST" ] \
+        || { echo "FAIL: OpenFOAM's one-ulp copy $n did not reach $MLAST"; exit 1; }
+done
+ALPHA_BOUND=$(python3 - "$MV" "$MLAST" $(for n in $ULPS; do echo "$W/movingUlp$n"; done) <<'PYEOF'
+import re, sys
+ref, last, runs = sys.argv[1], sys.argv[2], sys.argv[3:]
+def cells(path):
+    t = open(path).read()
+    m = re.search(r'internalField\s+nonuniform\s+List<(scalar|vector)>\s*(\d+)\s*\(', t)
+    n = int(m.group(2))
+    if m.group(1) == 'scalar':
+        return [float(x) for x in t[m.end():].split(None, n)[:n]]
+    return [float(x) for v in re.findall(r'\(([^()]*)\)', t[m.end():])[:n] for x in v.split()]
+def relinf(a, b):
+    return max(abs(x - y) for x, y in zip(a, b)) / max(abs(y) for y in b)
+fields = ('alpha.water', 'U', 'p_rgh')
+base = {f: cells('%s/%s/%s' % (ref, last, f)) for f in fields}
+env = {f: 0.0 for f in fields}
+for r in runs:
+    d = {f: relinf(cells('%s/%s/%s' % (r, last, f)), base[f]) for f in fields}
+    print('  OpenFOAM, one ulp (%s) against OpenFOAM at %s:  ' % (r.rsplit('/', 1)[-1], last)
+          + '  '.join('%s %.4e' % (f, d[f]) for f in fields), file=sys.stderr)
+    if not d['alpha.water'] > 0.0:
+        print('FAIL: one ulp in copy %s moved nothing in OpenFOAM: the window cannot see rounding' % r, file=sys.stderr)
+        sys.exit(1)
+    if not d['alpha.water'] < 1e-11:
+        print('FAIL: one ulp in copy %s moved alpha %.3e: OpenFOAM branched, not rounding' % (r, d['alpha.water']),
+              file=sys.stderr)
+        sys.exit(1)
+    for f in fields:
+        env[f] = max(env[f], d[f])
+print('  OpenFOAM\'s one-ulp envelope at %s:  ' % last + '  '.join('%s %.4e' % (f, env[f]) for f in fields),
+      file=sys.stderr)
+print('%.4e' % (10.0*env['alpha.water']))
+PYEOF
+) || exit 1
+echo "  the moving profile's alpha bound: 10x OpenFOAM's one-ulp envelope = $ALPHA_BOUND"
 # brae starts from the staged case, not from OpenFOAM's time directories
 MB="$W/movingBrae"
 rm -rf "$MB"
@@ -313,13 +405,27 @@ mkdir -p "$MB"
 cp -r "$M/0" "$MB/"
 cp -r "$MV/constant" "$MV/system" "$MB/"
 echo "== [moving]"
-"$BIN" "$MB" "$MV" "$MSTEPS" "$MLAST" "$MV/log.interFoam" $MODE moving || rc=1
-"$BIN" "$MNR" "$MV" "$MSTEPS" "$MLAST" "$MV/log.interFoam" moving > "$W/control.log" 2>&1
+"$BIN" "$MB" "$MV" "$MSTEPS" "$MLAST" "$MV/log.interFoam" $MODE moving "alphaBound=$ALPHA_BOUND" || rc=1
+"$BIN" "$MNR" "$MV" "$MSTEPS" "$MLAST" "$MV/log.interFoam" moving "alphaBound=$ALPHA_BOUND" > "$W/control.log" 2>&1
 if [ $? -ne 0 ] && grep -qE 'FAIL: (the joint position|alpha,|p_rgh,|U,)' "$W/control.log"; then
     echo "  ok:   control the restraints removed fails on a number: $(grep -m1 -E 'FAIL: (the joint position|alpha,|p_rgh,|U,)' "$W/control.log" | sed 's/^ *FAIL: //' | tr -s ' ')"
 else
     echo "  FAIL: control the restraints removed passed the gate -- the gate cannot see the dampers"
     tail -20 "$W/control.log"
+    rc=1
+fi
+# the alpha bound's own control: the interface compression 0.1% wrong must read more than 100x the bound
+BRAE_CONTROL_ALPHA_CALPHA=$CALPHA_CONTROL "$BIN" "$MB" "$MV" "$MSTEPS" "$MLAST" "$MV/log.interFoam" moving \
+    "alphaBound=$ALPHA_BOUND" > "$W/control_calpha.log" 2>&1
+got=$(sed -n 's/^ *\(FAIL\|ok\): *alpha, relative to its largest value *\([0-9.e+-]*\) .*/\2/p' "$W/control_calpha.log")
+what="control the interface compression ${CALPHA_CONTROL}x (BRAE_CONTROL_ALPHA_CALPHA): alpha ${got:-none},"
+if grep -q "BRAE_CONTROL_ALPHA_CALPHA=$CALPHA_CONTROL: the interface compression is assembled WRONG" \
+        "$W/control_calpha.log" \
+   && [ -n "$got" ] && python3 -c "import sys; sys.exit(0 if float('$got') > 100*float('$ALPHA_BOUND') else 1)"; then
+    echo "  ok:   $what $(python3 -c "print('%.1e' % (float('$got')/float('$ALPHA_BOUND')))")x the bound"
+else
+    echo "  FAIL: $what not more than 100x the bound $ALPHA_BOUND -- the bound cannot see a wrong alpha transport"
+    tail -20 "$W/control_calpha.log"
     rc=1
 fi
 
