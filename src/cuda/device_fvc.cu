@@ -289,18 +289,28 @@ void gradKernel(
         const bool takeOwner = (kn >= knEnd) || (fo < foEnd && fo < losort[kn]);
         const int f = takeOwner ? fo : losort[kn];
         const scalar pf = w[f] * (vol[own[f]] - vol[nei[f]]) + vol[nei[f]];
+        // ONE ROUNDING PER UPDATE, written out (__fma_rn), not left to the compiler. Each face's term is
+        // added or subtracted as one fused multiply-add: OpenFOAM's gaussGrad rounds it that way on the
+        // GB10's host compiler, and so did sm_121's code. Left to nvcc 13.0, sm_90 hoisted the x product
+        // above this branch (it is common to both arms) and added or subtracted it in a second rounding,
+        // DMUL then DADD, while y and z stayed fused. On a uniform field the gradient IS these roundings,
+        // and its sign decides limitedLinear wherever the field does not change: on pitzDaily's uniform k
+        // the GH200 gradient differed from OpenFOAM's in 9,837 of 12,225 cells and turned 2,125 faces from
+        // linear to upwind or back (W18). y and z are written the same way: the same statement, fused on
+        // both targets already, so pinning them changes no bit today and keeps the next compiler from
+        // making the same choice there.
         if (takeOwner)   // +owner internal
         {
-            sx += Sfx[f] * pf;
-            sy += Sfy[f] * pf;
-            sz += Sfz[f] * pf;
+            sx = __fma_rn(Sfx[f], pf, sx);
+            sy = __fma_rn(Sfy[f], pf, sy);
+            sz = __fma_rn(Sfz[f], pf, sz);
             ++fo;
         }
         else             // -neighbour internal
         {
-            sx -= Sfx[f] * pf;
-            sy -= Sfy[f] * pf;
-            sz -= Sfz[f] * pf;
+            sx = __fma_rn(-Sfx[f], pf, sx);
+            sy = __fma_rn(-Sfy[f], pf, sy);
+            sz = __fma_rn(-Sfz[f], pf, sz);
             ++kn;
         }
     }
@@ -805,17 +815,19 @@ void gradFusedKernel(
         for (int i = 0; i < N; ++i)
         {
             const scalar pf = wf * (fld.vol[i][o] - fld.vol[i][n]) + fld.vol[i][n];
+            // pinned as gradKernel pins them (one rounding per update, __fma_rn; W18), so the fused
+            // kernel stays bit-identical to it on every target, which tests/test_grad_fused.cu holds
             if (takeOwner)
             {
-                sx[i] += sfx * pf;
-                sy[i] += sfy * pf;
-                sz[i] += sfz * pf;
+                sx[i] = __fma_rn(sfx, pf, sx[i]);
+                sy[i] = __fma_rn(sfy, pf, sy[i]);
+                sz[i] = __fma_rn(sfz, pf, sz[i]);
             }
             else
             {
-                sx[i] -= sfx * pf;
-                sy[i] -= sfy * pf;
-                sz[i] -= sfz * pf;
+                sx[i] = __fma_rn(-sfx, pf, sx[i]);
+                sy[i] = __fma_rn(-sfy, pf, sy[i]);
+                sz[i] = __fma_rn(-sfz, pf, sz[i]);
             }
         }
         if (takeOwner)
