@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# The DIVERGENCE STOP of brae's interFoam against REAL OpenFOAM's own abort, on laminar/damBreak forced to blow up.
+# The DIVERGENCE STOP of brae's interFoam against REAL OpenFOAM's interFoam, on laminar/damBreak forced to blow up.
 #
-# WHAT OPENFOAM DOES. interFoam has no divergence check: it stops on the first floating-point exception
-# (etc/controlDict trapFpe, sigFpe.C), and where the FPU does not trap -- aarch64, this machine and the GH200 --
-# on the first non-finite solver residual it writes into and reads back from the solver-performance dictionary
-# ("Wrong token type - expected scalar value, found ... word 'nan'"). Either way it exits non-zero, before the
-# write of the step that went non-finite.
+# WHAT OPENFOAM DOES. interFoam has no divergence check of its own. Where the FPU traps (x86) it stops on the first
+# floating-point exception (etc/controlDict trapFpe, sigFpe.C). On aarch64 -- this machine and the GH200 -- nothing
+# traps, and what happens next depends on the case: OpenFOAM can carry the NaN to endTime, write it and exit 0 (the
+# pimpleFoam agent measured that), or stop on reading a NaN solver residual back from its solver-performance
+# dictionary ("Wrong token type - expected scalar value, found ... word 'nan'", Scalar.C:169), as it does on THIS
+# fixture on the GB10 (exit 1 in its 8th step). So this gate does NOT assert an OpenFOAM abort. It finds the step in
+# which OpenFOAM FIRST PRINTS a non-finite value (`nan` or `inf` in its log: a residual, a Courant number, the phase
+# fraction) and holds brae to that, and reports OpenFOAM's exit code beside it.
 #
 # WHAT brae DID (main 9b7b1e58), MEASURED on the fixture below: both loops ran to endTime, wrote NaN fields at
 # every write time and printed `End:` with exit 0 (host: alpha [nan, nan] from step 8; device: from step 6).
@@ -15,19 +18,19 @@
 #
 # THE FIXTURE: damBreak as shipped (blockMesh, setFields), `MULESCorr no` (explicit MULES), a fixed deltaT of
 # 0.01 -- a Courant number in the hundreds after two steps -- endTime 0.2, a write every 2 steps. MEASURED on the
-# GB10: OpenFOAM exits 1 in its 8th step having written 0.02, 0.04 and 0.06; the host loop's first non-finite
-# value is in the same step. The shipped `MULESCorr yes` at the same deltaT is the HEALTHY CONTROL: it does not
-# blow up in either code, and must run to endTime.
+# GB10: OpenFOAM first prints a non-finite value in its 8th step, having written 0.02, 0.04 and 0.06. The shipped
+# `MULESCorr yes` at the same deltaT is the HEALTHY CONTROL: it does not blow up in either code, and must run to
+# endTime.
 #
 # DECLARED BEFORE THE FIRST RUN (what passes):
-#   OpenFOAM:  exits non-zero before endTime (else the fixture does not diverge and the gate is void).
+#   OpenFOAM:  prints a non-finite value in some step N before endTime (else the fixture does not diverge and the
+#              gate is void); its exit code is REPORTED, not asserted.
 #   each brae arm (host; -device with the case's own pressure solver, as CI runs it; -device with the AMG-PCG,
 #   the default path):
-#     exits non-zero, naming "the solution diverged";
-#     writes no file holding a non-finite value, and no time directory OpenFOAM did not write;
-#     the host arm (OpenFOAM's own linear solvers, round-off apart from it until the blow-up) stops in the step
-#     OpenFOAM aborts in or earlier, and writes exactly OpenFOAM's directories. The device arms are not held
-#     to OpenFOAM's step: the AMG-PCG is another Krylov method and diverges sooner (step 5 measured).
+#     exits non-zero, naming "the solution diverged", in step N or earlier;
+#     writes no file holding a non-finite value, and no time directory at or after step N's time;
+#     the host arm (OpenFOAM's own linear solvers, round-off apart from it until the blow-up) writes exactly the
+#     directories OpenFOAM wrote before step N.
 #   the healthy control: OpenFOAM and every brae arm reach endTime, exit 0.
 # Numbers of the diverging fields are not compared: they are 1e+42 and beyond.
 #
@@ -102,17 +105,33 @@ nonfinite()
 # laststep <log> <pattern>: the number of step lines
 steps() { grep -cE "$2" "$1"; }
 
-echo "== interFoam divergence stop vs OpenFOAM's abort (damBreak, MULESCorr no, deltaT 0.01) =="
+echo "== interFoam divergence stop vs OpenFOAM (damBreak, MULESCorr no, deltaT 0.01) =="
 OF="$W/of"
 stage "$OF" no || { echo "SKIP: staging failed"; exit 77; }
 ( cd "$OF" && nice -n 10 interFoam > log.interFoam 2>&1 ); ofrc=$?
+# OpenFOAM's first step with a non-finite value in its log, counted by `Time =` lines (0: none)
+ofNaN=$(python3 - "$OF/log.interFoam" <<'PY'
+import re, sys
+step = 0
+for line in open(sys.argv[1], errors='replace'):
+    if line.startswith('Time = '):
+        step += 1
+    elif step and re.search(r'(?i)(?<![A-Za-z])(-?nan|-?inf)(?![A-Za-z])', line):
+        print(step)
+        sys.exit(0)
+print(0)
+PY
+)
 ofSteps=$(steps "$OF/log.interFoam" '^Time = ')
+# the time OpenFOAM's step N reached: N fixed steps of 0.01
+ofNaNTime=$(python3 -c "print('%.10g' % (0.01*int('$ofNaN')))")
 ofDirs=$(timedirs "$OF")
-echo "  OpenFOAM: exit $ofrc after $ofSteps step(s), wrote [ $ofDirs]"
-if [ $ofrc -ne 0 ] && ! grep -q '^End' "$OF/log.interFoam"; then
-    say "OpenFOAM aborts before endTime (the fixture diverges)" ok
+ofBefore=$(for d in $ofDirs; do python3 -c "import sys; sys.exit(0 if float('$d') < float('$ofNaNTime') - 1e-12 else 1)" && printf '%s ' "$d"; done)
+echo "  OpenFOAM: first non-finite value printed in step ${ofNaN}; exit $ofrc after $ofSteps step(s) (reported); wrote [ $ofDirs], before step $ofNaN [ $ofBefore]"
+if [ "$ofNaN" -gt 0 ]; then
+    say "OpenFOAM prints a non-finite value in step $ofNaN (the fixture diverges)" ok
 else
-    say "OpenFOAM aborts before endTime (the fixture diverges)" FAIL
+    say "OpenFOAM prints a non-finite value before endTime (the fixture diverges)" FAIL
     echo "interfoam_divergence_vs_openfoam: the fixture no longer diverges in OpenFOAM; nothing can be held"
     exit 1
 fi
@@ -142,20 +161,25 @@ brae_arm()
     else
         say "$name writes no non-finite value ($(echo "$bad" | wc -l) file(s), e.g. $(echo "$bad" | head -1))" FAIL
     fi
-    local extra=""
-    for d in $dirs; do
-        case " $ofDirs " in *" $d "*) ;; *) extra="$extra $d" ;; esac
-    done
-    if [ -z "$extra" ]; then
-        say "$name writes no time directory OpenFOAM did not write" ok
+    if [ -n "$stop" ] && [ "$stop" -le "$ofNaN" ]; then
+        say "$name stops in OpenFOAM's first non-finite step or earlier ($stop <= $ofNaN)" ok
     else
-        say "$name writes no time directory OpenFOAM did not write (extra:$extra)" FAIL
+        say "$name stops in OpenFOAM's first non-finite step or earlier (${stop:-none} <= $ofNaN)" FAIL
+    fi
+    local late=""
+    for d in $dirs; do
+        python3 -c "import sys; sys.exit(0 if float('$d') < float('$ofNaNTime') - 1e-12 else 1)" || late="$late $d"
+    done
+    if [ -z "$late" ]; then
+        say "$name writes no time directory at or after step $ofNaN's time" ok
+    else
+        say "$name writes no time directory at or after step $ofNaN's time (late:$late)" FAIL
     fi
     if [ "$name" = host ]; then
-        if [ -n "$stop" ] && [ "$stop" -le "$ofSteps" ] && [ "$dirs" = "$ofDirs" ]; then
-            say "host stops in OpenFOAM's step or earlier ($stop <= $ofSteps) with OpenFOAM's directories" ok
+        if [ "$dirs" = "$ofBefore" ]; then
+            say "host writes exactly OpenFOAM's directories before step $ofNaN" ok
         else
-            say "host stops in OpenFOAM's step or earlier (${stop:-none} <= $ofSteps) with OpenFOAM's directories" FAIL
+            say "host writes exactly OpenFOAM's directories before step $ofNaN ([ $dirs] against [ $ofBefore])" FAIL
         fi
     fi
 }

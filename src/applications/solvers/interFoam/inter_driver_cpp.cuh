@@ -229,14 +229,14 @@ RunReport runInterFoamDevice(
     // the time directories, as runInterFoam writes them
     InterWriter* writer = nullptr);
 
-// THE DIVERGENCE STOP, both loops. OpenFOAM's interFoam has no divergence check of its own: it stops on
-// the first floating-point exception, because etc/controlDict sets trapFpe (sigFpe.C:183-230 turns on
-// FE_DIVBYZERO|FE_INVALID|FE_OVERFLOW), and where the FPU does not trap (aarch64) it stops a few
-// operations later, on the first non-finite solver residual it writes into and reads back from the
-// solver-performance dictionary ("Wrong token type - expected scalar value, found ... word 'nan'",
-// Scalar.C:169). MEASURED on laminar/damBreak with `MULESCorr no` at a fixed deltaT 0.01: OpenFOAM exits
-// 1 in its eighth step. Neither loop here had any stop: both ran to endTime writing NaN fields and
-// printed `End:` with exit 0.
+// THE DIVERGENCE STOP, both loops. OpenFOAM's interFoam has no divergence check of its own: where the FPU
+// traps it stops on the first floating-point exception, because etc/controlDict sets trapFpe (sigFpe.C turns on
+// FE_DIVBYZERO|FE_INVALID|FE_OVERFLOW). On aarch64 (the GB10, the GH200) nothing traps: OpenFOAM can carry the
+// NaN on to endTime and write it, or stop on reading a NaN solver residual back from its solver-performance
+// dictionary ("Wrong token type - expected scalar value, found ... word 'nan'", Scalar.C:169) -- MEASURED on
+// laminar/damBreak with `MULESCorr no` at a fixed deltaT 0.01: OpenFOAM prints its first NaN in its eighth step
+// and exits 1 there. Neither loop here had any stop: both ran to endTime writing NaN fields and printed `End:`
+// with exit 0. The stop is OpenFOAM's trapping behaviour, taken at the end of the step.
 //
 // brae cannot trap at the operation, so each loop checks where it is cheapest and still before anything
 // is written: the Courant numbers at the top of a step (the reduction CourantNo.H does anyway; an
@@ -264,10 +264,9 @@ inline std::string divergenceMessage(
     char t[64];
     std::snprintf(t, sizeof t, "%.17g", static_cast<double>(time));
     return "the solution diverged in time step " + std::to_string(static_cast<long>(step)) + " (t = " + t + "): "
-           + fields + " " + where + ". OpenFOAM stops on the first floating-point exception (trapFpe) or, "
-           "where the FPU does not trap, on the first non-finite solver residual; brae stops here, before "
-           "anything of this step is written. Reduce deltaT, or maxCo and maxAlphaCo under adjustTimeStep, "
-           "or check the case's boundary conditions, mesh and MULES controls.";
+           + fields + " " + where + ". OpenFOAM stops on the first floating-point exception where the FPU traps "
+           "it (trapFpe); brae stops here, before anything of this step is written. Reduce deltaT, or maxCo and "
+           "maxAlphaCo under adjustTimeStep, or check the case's boundary conditions, mesh and MULES controls.";
 }
 
 // count the non-finite entries of one host array, each component of a vector on its own (as the device

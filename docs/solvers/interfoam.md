@@ -55,8 +55,9 @@ entry, why brae refuses it and what to use instead. Each one used to run, or to 
 | A `PIMPLE` entry that OpenFOAM's interFoam reads and brae's case reader does not | The run would use a different algorithm from the one the case names. No such entry exists today: this guard holds the reader to OpenFOAM's list. |
 
 A run that diverges stops by name with a non-zero exit as soon as a solved field (alpha, U, p_rgh, phi or a
-turbulence field) or the Courant number is no longer finite. It stops before writing that step, as OpenFOAM does
-when it stops on a floating-point exception.
+turbulence field) or the Courant number is no longer finite. It stops before writing that step. OpenFOAM stops on
+the first floating-point exception where the processor traps it; on aarch64 nothing traps, and OpenFOAM can carry
+the NaN on and write it.
 
 ## Behaviour changes
 
