@@ -93,10 +93,20 @@ KOmegaSST::KOmegaSST(const brae::compressibleRAS::Case& c, const PrimitiveMesh& 
     in_.limitedLinear = c.kDiv.limitedLinear;
     in_.limiterCoeff = c.kDiv.limiterCoeff;
     in_.linearUpwind = c.kDiv.linearUpwind;
+    // the gradient each equation's linearUpwind names, its cellLimited coefficient (compressibleRAS_cpp.cu divScheme):
+    // left at 0 the correction ran on an unlimited Gauss gradient whatever the entry said
+    in_.luGradK = c.kDiv.luGradK;
     omegaDiv_.bounded = c.omegaDiv.bounded;
     omegaDiv_.limitedLinear = c.omegaDiv.limitedLinear;
     omegaDiv_.limiterCoeff = c.omegaDiv.limiterCoeff;
     omegaDiv_.linearUpwind = c.omegaDiv.linearUpwind;
+    omegaDiv_.luGradK = c.omegaDiv.luGradK;
+    // kOmegaSSTBase::correct's omegaEqn.relax() and kEqn.relax() (kOmegaSSTBase.C:590, :616), never read before: the
+    // closure's solveScalarEqn applies fvMatrix::relax(alpha) where the case names a factor (Case::relaxK)
+    in_.relaxEquationK = c.relaxK;
+    in_.relaxK = c.relaxKFactor;
+    in_.relaxEquationOmega = c.relaxOmega;
+    in_.relaxOmega = c.relaxOmegaFactor;
     in_.omegaDiv = &omegaDiv_;
     in_.omegaGrad = &omegaGrad_;
     in_.correctedLaplacian = c.correctedLaplacian;

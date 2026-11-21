@@ -20,6 +20,7 @@
 #include "rhoCentralPatchUpdate.cuh"
 #include "run_clock.cuh"
 #include "time_controls.cuh"
+#include "foam_dict.cuh"
 
 #include <optional>
 
@@ -28,6 +29,14 @@
 
 namespace brae {
 namespace rhoCentral {
+
+// interpolationSchemes `linear` for a reconstruct(...) entry -- and `default linear` with no reconstruct entries, which
+// is what 19 of the 19 density-based fvSchemes of the other v2412 solvers write. directionInterpolate.H then builds the
+// plain linear scheme, whose weights are the mesh's (linear.H) whatever the direction: both the `pos` and the `neg`
+// state are the linear interpolate. A limiter of exactly 1 in limitedSurfaceInterpolationScheme::weights gives those
+// weights to the bit (1*w + 0*pos0 = w), so the flux paths take it as one more limiter selector, rhoCentral's own,
+// beside device_mesh.cuh's (kVanLeerTwoByk and its kin, all in [-5, 0)).
+constexpr scalar kLinearReconTwoByk = -50.0;
 
 // fvSolution's controls of one implicit solve (milestone G): smoothSolver with the GaussSeidel or symGaussSeidel
 // smoother, read with lduMatrix::solver's and smoothSolver's defaults (lduMatrixSolver.C readControls: maxIter 1000,
@@ -119,10 +128,20 @@ struct Case
     std::vector<label> mwFaces;
     bool piovU = false;
     std::vector<char> tpRho;
+
+    // the dictionaries every reader of the case asks its questions of, kept for the unread-entry audit (dict_audit.cuh):
+    // one object per file, so an entry one reader takes is not reported as unread by another's copy
+    std::shared_ptr<FoamDict> fvSolution, turbulenceProperties, thermophysicalProperties;
 };
 
 // Reads and checks the case; refuses everything outside this stage's scope by name, before any field is read.
 Case readRhoCentralCase(const std::string& caseDir);
+
+// THE UNREAD-ENTRY AUDIT (dict_audit.cuh's auditDict, `brae NOTICE [unread]` lines): every entry of fvSolution,
+// turbulenceProperties and thermophysicalProperties that no reader asked the case's own object for, and fvSchemes'
+// top-level blocks and entries that no reader of the solver takes. Called once the fields and the RAS model are
+// built, so every reader has asked its questions. It reports and does not refuse. BRAE_DICT_AUDIT=0 silences it.
+void auditRhoCentralDictionaries(const Case& cs);
 
 } // namespace rhoCentral
 } // namespace brae

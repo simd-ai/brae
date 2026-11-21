@@ -58,6 +58,7 @@ struct CaseLimiters
     scalar operator()(scalar r, scalar lim) const
     {
         namespace ls = cpu::limitedSchemes::detail;
+        if (lim == kLinearReconTwoByk) return scalar(1);   // `linear`: the mesh weights (ls::blend(1, w, dir) = w)
         if (lim == kVanLeerTwoByk) return ls::vanLeerLimiter(r);
         if (lim > 0.0) return ls::limitedLinearLimiter(r, lim);
         return limiterOfR(r, lim);

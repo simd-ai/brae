@@ -2,6 +2,8 @@
 #include "rhoCentralControls.cuh"
 
 #include "foam_constants.cuh"
+#include "compressibleRAS_cpp.cuh"
+#include "dict_audit.cuh"   // ofSchemeStatement: one fvSchemes lookup for the solver and its RAS model
 #include "foam_dict.cuh"
 #include "foam_field_reader.cuh"
 #include "geometric_field.cuh"
@@ -12,6 +14,7 @@
 #include "device_mesh.cuh"   // the limiter selectors (kVanLeerTwoByk and its kin)
 
 #include <algorithm>
+#include <cstdio>
 #include <optional>
 #include <cstdlib>
 #include <filesystem>
@@ -32,43 +35,14 @@ constexpr scalar kROOTVSMALL = 1e-150;
     throw std::runtime_error("brae rhoCentralFoam: " + what);
 }
 
-// The scheme statement OpenFOAM resolves for `key` in an fvSchemes block: the entry whose keyword IS key, else
-// `default` (schemesLookup). Read from the block's text, statement by statement: a keyword like reconstruct(rho)
-// carries parentheses, and the comparison is on the whole keyword, so reconstruct(rho) never answers for
-// reconstruct(rhoU).
+// The scheme statement OpenFOAM resolves for `key` in an fvSchemes block (compressibleRAS::ofSchemeStatement): the entry
+// whose keyword IS key, else the last quoted keyword -- a regular expression to OpenFOAM -- that matches it, else
+// `default`. Statement by statement: a keyword like reconstruct(rho) carries parentheses, and the comparison is on the
+// whole keyword, so reconstruct(rho) never answers for reconstruct(rhoU). This used to unquote a quoted keyword and
+// compare it as text, so a pattern answered nothing and a quoted name answered as if it were the name.
 std::string schemeStatement(const std::string& caseDir, const std::string& block, const std::string& key)
 {
-    std::string body = fvSchemesBlock(readFvSchemesText(caseDir), block);
-    if (!body.empty() && body[0] == '{') body.erase(0, 1);
-    std::string hit, def;
-    std::size_t a = 0;
-    while (a < body.size())
-    {
-        const std::size_t e = body.find(';', a);
-        std::string st = body.substr(a, e == std::string::npos ? std::string::npos : e - a);
-        a = (e == std::string::npos) ? body.size() : e + 1;
-        const std::size_t b = st.find_first_not_of(" \t\r\n");
-        if (b == std::string::npos) continue;
-        st = st.substr(b);
-        const std::size_t k = st.find_first_of(" \t\r\n");
-        if (k == std::string::npos) continue;
-        std::string kw = st.substr(0, k);
-        if (kw.size() > 1 && kw.front() == '"' && kw.back() == '"') kw = kw.substr(1, kw.size() - 2);
-        std::string val = st.substr(k);
-        const std::size_t vb = val.find_first_not_of(" \t\r\n");
-        const std::size_t ve = val.find_last_not_of(" \t\r\n");
-        val = (vb == std::string::npos) ? std::string() : val.substr(vb, ve - vb + 1);
-        std::string norm;   // collapse runs of white space
-        for (char ch : val)
-        {
-            const bool ws = (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n');
-            if (ws) { if (!norm.empty() && norm.back() != ' ') norm += ' '; }
-            else norm += ch;
-        }
-        if (kw == key) hit = norm;
-        else if (kw == "default") def = norm;
-    }
-    return hit.empty() ? def : hit;
+    return compressibleRAS::ofSchemeStatement(caseDir, block, key);
 }
 
 // interpolate(vf, dir, "reconstruct(...)") (directionInterpolate.H) through a limitedSurfaceInterpolationScheme: the
@@ -97,9 +71,17 @@ scalar reconstructLimiter(const std::string& stmt, const std::string& key, bool 
         if (!arg.empty()) refuse("interpolationSchemes " + key + " is `" + stmt + "`: `upwind` takes no coefficient.");
         return kUpwindTwoByk;
     }
+    // `linear` (kLinearReconTwoByk): OpenFOAM's plain linear interpolation of the field in both directions, on a
+    // scalar and on rhoU alike -- no limiter, no gradient. It was refused, which refused every case written with the
+    // density-based solvers' usual `interpolationSchemes { default linear; }`.
+    if (name == "linear")
+    {
+        if (!arg.empty()) refuse("interpolationSchemes " + key + " is `" + stmt + "`: `linear` takes no coefficient.");
+        return kLinearReconTwoByk;
+    }
     if (!isKnown)
         refuse("interpolationSchemes resolves " + key + " to `" + stmt + "`; this stage ports vanLeer, vanAlbada, "
-               "Minmod, MUSCL, SuperBee and limitedLinear (and their V forms on U) and upwind "
+               "Minmod, MUSCL, SuperBee and limitedLinear (and their V forms on U), upwind and linear "
                "(src/finiteVolume/interpolation/surfaceInterpolation/limitedSchemes). Refusing rather than reconstruct "
                "with another scheme.");
     if (vectorField && !vForm)
@@ -283,7 +265,7 @@ void checkStartDirectory(const std::string& caseDir, const FoamDict& controlDict
 // statement ported. Anything else is refused by name before a field is read.
 static void readViscousControls(const std::string& caseDir, Case& cs)
 {
-    const FoamDict fvSolution = readDict(caseDir + "/system/fvSolution");
+    const FoamDict& fvSolution = *cs.fvSolution;
     const FoamDict* solvers = fvSolution.subDict("solvers");
     auto solveControls = [&](const char* fld, SmoothSolveControls& c) {
         const FoamDict* sd = solvers ? solvers->subDict(fld) : nullptr;
@@ -317,12 +299,26 @@ static void readViscousControls(const std::string& caseDir, Case& cs)
     if (!gs.gaussLinear || gs.leastSquares || gs.cellLimitK != 0 || !gs.unsupportedLimiter.empty())
         refuse("gradSchemes resolves grad(U) to `" + gs.raw + "`. tauMC = muEff*dev2(T(fvc::grad(U))) "
                "(rhoCentralFoam.C:220-221); this stage computes Gauss linear only.");
+    if (schemeStatement(caseDir, "gradSchemes", "grad(U)") != "Gauss linear")
+        refuse("gradSchemes resolves grad(U) to `" + schemeStatement(caseDir, "gradSchemes", "grad(U)") + "` (the literal "
+               "entry, else the last matching pattern, else the default). tauMC = muEff*dev2(T(fvc::grad(U))) "
+               "(rhoCentralFoam.C:220-221); this stage computes Gauss linear only.");
+    // the energy laplacian's NAME is its diffusivity's: turbulence->alphaEff() is thermo.alphahe() under laminar
+    // (heThermo.C:812, renamed `alphahe`) and thermo.alphaEff(alphat) under RAS (EddyDiffusivity.H:136-139,
+    // heThermo.C:875, renamed `alphaEff`). Under RAS this checked the laminar name, so an entry for
+    // laplacian(alphaEff,e) was never seen.
+    const char* energyKey = cs.ras ? "laplacian(alphaEff,e)" : "laplacian(alphahe,e)";
+    const char* energyWhat = cs.ras ? "fvm::laplacian(alphaEff, e), :278 (the field is thermo.alphaEff(alphat), heThermo.C:875)"
+                                    : "fvm::laplacian(alphaEff, e), :278 (the field is thermo.alphahe(), heThermo.C:812)";
     const struct { const char* block; const char* key; const char* want; const char* what; } need[] = {
         {"divSchemes", "div(tauMC)", "Gauss linear", "fvc::div(tauMC), rhoCentralFoam.C:241"},
         {"laplacianSchemes", "laplacian(muEff,U)", "Gauss linear corrected", "fvm::laplacian(muEff, U), :240"},
-        {"laplacianSchemes", "laplacian(alphahe,e)", "Gauss linear corrected", "fvm::laplacian(alphaEff, e), :278 (the field is thermo.alphahe(), heThermo.C:812)"},
+        {"laplacianSchemes", energyKey, "Gauss linear corrected", energyWhat},
         {"snGradSchemes", "snGrad(U)", "corrected", "fvc::snGrad(U) in sigmaDotU, :251"},
         {"interpolationSchemes", "interpolate(muEff)", "linear", "fvc::interpolate(muEff) in sigmaDotU, :251"},
+        // fvc::dotInterpolate(mesh.Sf(), tauMC) in sigmaDotU (:251), the scheme named dotInterpolate(S,tauMC)
+        // (surfaceInterpolate.C:338); the device forms it linear (rhoCentralViscous.cu) and it was never checked
+        {"interpolationSchemes", "dotInterpolate(S,tauMC)", "linear", "fvc::dotInterpolate(mesh.Sf(), tauMC) in sigmaDotU, :251"},
     };
     for (const auto& n : need)
     {
@@ -424,8 +420,15 @@ Case readRhoCentralCase(const std::string& caseDir)
     cs.reconRho = rRho;
     cs.reconT = rT;
     cs.reconU = rU;
-    // the limiters' gradients: LimitedScheme.C:54 builds them with fvc::grad of the reconstructed field itself
-    for (const char* fld : {"rho", "rhoU", "rPsi", "e", "c"})
+    // the limiters' gradients: LimitedScheme.C:54 builds them with fvc::grad of the reconstructed field itself -- ONLY a
+    // limited scheme does: upwind and linear (upwind.H, linear.H) take no gradient, and a case that names them while its
+    // gradSchemes default is something brae does not compute was refused for a gradient OpenFOAM never forms
+    const auto limited = [](scalar lim) { return lim != kUpwindTwoByk && lim != kLinearReconTwoByk; };
+    std::vector<const char*> limitedFields;
+    if (limited(cs.limRho)) limitedFields.push_back("rho");
+    if (limited(cs.limU)) limitedFields.push_back("rhoU");
+    if (limited(cs.limT)) limitedFields.insert(limitedFields.end(), {"rPsi", "e", "c"});
+    for (const char* fld : limitedFields)
     {
         const FieldGradScheme gs = parseFieldGradScheme(caseDir, fld);
         if (!gs.gaussLinear || gs.leastSquares || gs.cellLimitK != 0 || !gs.unsupportedLimiter.empty())
@@ -444,26 +447,39 @@ Case readRhoCentralCase(const std::string& caseDir)
                    + (viaDefault ? " (its default)" : "") + ". The vanLeer limiter reads that gradient "
                    "(LimitedScheme.C:54); this stage computes Gauss linear only.");
         }
+        // ...and as OpenFOAM resolves the name, a quoted pattern included, which the text search above does not see
+        const std::string ofGrad = schemeStatement(caseDir, "gradSchemes", std::string("grad(") + fld + ")");
+        if (ofGrad != "Gauss linear")
+            refuse(std::string("gradSchemes resolves grad(") + fld + ") to `" + ofGrad + "` (the literal entry, else the "
+                   "last matching pattern, else the default). The limiter reads that gradient (LimitedScheme.C:54); this "
+                   "stage computes Gauss linear only.");
     }
 
     // ---- fvSolution: the three diagonal solves --------------------------------------------------------------------
+    // fvm::ddt(rho) + fvc::div(phi) and its two siblings (rhoCentralFoam.C:224-231) are DIAGONAL matrices, and
+    // lduMatrix::solver::New returns diagonalSolver for any diagonal matrix whatever the entry names
+    // (lduMatrixSolver.C:53-67): the entry must exist (solution::solverDict, a subDict) and carry a `solver` word
+    // (get<word>, lduMatrixSolver.C:150), nothing else. Any other name was refused here; it runs now, as the diagonal
+    // solve brae always ran (x = source/diag).
+    cs.fvSolution = std::make_shared<FoamDict>(readDict(caseDir + "/system/fvSolution"));
     {
-        const FoamDict fvSolution = readDict(caseDir + "/system/fvSolution");
-        const FoamDict* solvers = fvSolution.subDict("solvers");
+        const FoamDict* solvers = cs.fvSolution->subDict("solvers");
         for (const char* fld : {"rho", "rhoU", "rhoE"})
         {
             const FoamDict* sd = solvers ? solvers->subDict(fld) : nullptr;
-            const std::string s = sd ? sd->wordOr("solver", "") : "";
-            if (s != "diagonal")
-                refuse(std::string("fvSolution solvers has `") + s + "` for " + fld + ". The equation is a "
-                       "diagonal matrix (fvm::ddt + an explicit divergence) and this stage solves it exactly as "
-                       "OpenFOAM's diagonalSolver does (x = source/diag); every v2412 tutorial names `diagonal`.");
+            if (!sd)
+                refuse(std::string("fvSolution solvers has no entry for ") + fld + "; OpenFOAM looks one up for its "
+                       "solve (solution::solverDict) and stops without it.");
+            if (sd->wordOr("solver", "").empty())
+                refuse(std::string("fvSolution solvers' entry for ") + fld + " names no `solver`; OpenFOAM reads the "
+                       "word (lduMatrixSolver.C:150) and stops without it, before it finds the matrix diagonal.");
         }
     }
 
     // ---- thermophysicalProperties ---------------------------------------------------------------------------------
     {
-        const FoamDict tp = readDict(caseDir + "/constant/thermophysicalProperties");
+        cs.thermophysicalProperties = std::make_shared<FoamDict>(readDict(caseDir + "/constant/thermophysicalProperties"));
+        const FoamDict& tp = *cs.thermophysicalProperties;
         const FoamDict* tt = tp.subDict("thermoType");
         if (!tt) refuse("constant/thermophysicalProperties has no thermoType.");
         const struct { const char* key; const char* want; const char* why; } need[] = {
@@ -555,14 +571,13 @@ Case readRhoCentralCase(const std::string& caseDir)
         if (cs.viscous && !(Pr > 0)) refuse("transport Pr is " + std::to_string(Pr) + "; alphah = mu/Pr needs Pr > 0.");
         }
     }
-    if (cs.viscous) readViscousControls(caseDir, cs);
-
     // ---- turbulence: laminar, or RAS (milestone J; the model and its fields: compressibleRAS::readCase) -----------
     {
         std::string tpath = caseDir + "/constant/turbulenceProperties";
         if (!std::filesystem::exists(tpath)) tpath = caseDir + "/constant/momentumTransport";
         if (!std::filesystem::exists(tpath)) refuse("no constant/turbulenceProperties (or momentumTransport).");
-        const FoamDict t = readDict(tpath);
+        cs.turbulenceProperties = std::make_shared<FoamDict>(readDict(tpath));
+        const FoamDict& t = *cs.turbulenceProperties;
         const std::string sim = t.wordOr("simulationType", "");
         if (sim != "laminar" && sim != "RAS")
             refuse("simulationType is `" + sim + "`; laminar and RAS (kOmegaSST, milestone J) are ported; LES is not.");
@@ -579,6 +594,8 @@ Case readRhoCentralCase(const std::string& caseDir)
                 refuse("laminar model `" + model + "` is not ported; Stokes (the default) is.");
         }
     }
+    // the viscous correctors' controls, once the turbulence is known: the energy laplacian's name is the model's
+    if (cs.viscous) readViscousControls(caseDir, cs);
 
     // ---- mesh -----------------------------------------------------------------------------------------------------
     // polyMesh reads each file from its own instance, searched back from the start time (polyMesh.C): a moving
@@ -851,6 +868,13 @@ Case readRhoCentralCase(const std::string& caseDir)
         }
         k0 += p.size;
     }
+    // maxwellSlipU's thermal creep takes fvc::grad(T) (maxwellSlipUFvPatchVectorField.C:170-180), the scheme named
+    // grad(T); the device forms it Gauss linear (rhoCentralSlipBCs.cu, updateMaxwell) and it was never checked
+    if (std::find(cs.msCreep.begin(), cs.msCreep.end(), 1) != cs.msCreep.end()
+        && schemeStatement(caseDir, "gradSchemes", "grad(T)") != "Gauss linear")
+        refuse("gradSchemes resolves grad(T) to `" + schemeStatement(caseDir, "gradSchemes", "grad(T)") + "`; maxwellSlipU's "
+               "thermal creep takes fvc::grad(T) (maxwellSlipUFvPatchVectorField.C:170-180) and this port computes it "
+               "Gauss linear only.");
     // waveTransmissive's advective update has its own localEuler branch (advectiveFvPatchField.C: alpha from the
     // patch's rDeltaT), which milestone H did not port
     if (cs.lts && !cs.wtFaces.empty())
@@ -877,6 +901,36 @@ Case readRhoCentralCase(const std::string& caseDir)
             refuse("waveTransmissive on a moving mesh is not ported.");
     }
     return cs;
+}
+
+void auditRhoCentralDictionaries(const Case& cs)
+{
+    std::fflush(stdout);
+    if (cs.fvSolution) auditDict(*cs.fvSolution, "system/fvSolution");
+    if (cs.turbulenceProperties) auditDict(*cs.turbulenceProperties, "constant/turbulenceProperties");
+    if (cs.thermophysicalProperties) auditDict(*cs.thermophysicalProperties, "constant/thermophysicalProperties");
+    // fvSchemes, at block granularity as dict_audit.cuh's auditFvSchemes does it -- whose list of blocks lacks
+    // rhoCentralFoam's own top-level `fluxScheme` (readFluxScheme.H), so the list is this solver's: the blocks its
+    // readers resolve, wallDist under RAS only (the model's wallDist::New)
+    if (const char* e = std::getenv("BRAE_DICT_AUDIT"))
+        if (std::atoi(e) == 0) return;
+    FoamDict fvSchemes;
+    try { fvSchemes = readDict(cs.caseDir + "/system/fvSchemes"); }
+    catch (const std::exception&) { return; }
+    std::vector<std::string> read = {"ddtSchemes", "gradSchemes", "divSchemes", "laplacianSchemes",
+                                     "interpolationSchemes", "snGradSchemes", "fluxScheme"};
+    if (cs.ras) read.push_back("wallDist");
+    std::vector<std::string> unread;
+    for (const auto& sub : fvSchemes.subs)
+        if (std::find(read.begin(), read.end(), sub.first) == read.end()) unread.push_back(sub.first + "/ (whole block)");
+    for (const auto& leaf : fvSchemes.leaves)
+        if (std::find(read.begin(), read.end(), leaf.first) == read.end()) unread.push_back(leaf.first + " (entry)");
+    if (unread.empty()) return;
+    std::fprintf(stderr, "brae NOTICE [unread] system/fvSchemes -- %zu entr%s brae never looked at:\n", unread.size(),
+                 unread.size() == 1 ? "y" : "ies");
+    for (const std::string& k : unread) std::fprintf(stderr, "brae NOTICE [unread]   %s\n", k.c_str());
+    std::fprintf(stderr, "brae NOTICE [unread]   (fvSchemes is audited by block: its entries are text-parsed and not "
+                         "tracked one by one)\n");
 }
 
 } // namespace rhoCentral

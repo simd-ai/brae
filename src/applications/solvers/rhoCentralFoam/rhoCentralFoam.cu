@@ -340,6 +340,7 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
 
     PatchFields pf;
     State s = cpu::rhoCentral::createFields(cs, pf, control);
+    auditRhoCentralDictionaries(cs);
     const Integrals I0 = integrals(cs, s);
     printIntegrals("start", I0);
 
@@ -474,9 +475,16 @@ int runRhoCentralFoam(const std::string& caseDir, bool onDevice, int control)
                 std::printf("smoothSolver:  Solving for %s, Initial residual = %.*g, Final residual = %.*g, "
                             "No Iterations %d\n", rep.solves[j].field, logPrec, (double)rep.solves[j].initialResidual,
                             logPrec, (double)rep.solves[j].finalResidual, rep.solves[j].nIterations);
-            if (rep.status)
+            // janafThermo::limit's warning (janafThermoI.H:113-130): OpenFOAM prints it at each evaluation out of range,
+            // with that T, and clamps; brae's kernels raise one bit a step, so it is said once for the step. Log only.
+            if (rep.status & statusJanafLimited)
+                std::printf("\n--> brae Warning (as OpenFOAM's janafThermo<EquationOfState>::limit, janafThermoI.H:113-130): "
+                            "attempt to use janafThermo<EquationOfState> out of temperature range %.*g -> %.*g in the "
+                            "step to time %s; T clamped to the range, as OpenFOAM clamps it\n\n",
+                            logPrec, (double)cs.gas.Tlow, logPrec, (double)cs.gas.Thigh, tn.c_str());
+            if (rep.status & ~statusJanafLimited)
                 throw std::runtime_error(
-                    "step to time " + tn + " left an unphysical state (status " + std::to_string(rep.status)
+                    "step to time " + tn + " left an unphysical state (status " + std::to_string(rep.status & ~statusJanafLimited)
                     + ": 1 negative temperature seed, 2 e->T inversion not converged in 100 iterations -- both "
                       "FatalErrors in OpenFOAM's thermo -- 4 rho, p or T not positive, or e not finite).");
             CoNum = rep.CoNum;
