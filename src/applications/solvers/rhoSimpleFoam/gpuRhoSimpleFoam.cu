@@ -46,6 +46,11 @@
 #include "of_residual_log.cuh"   // BRAE_OF_LOG=1: OF-format per-solve residuals, for iteration-by-iteration diffing
 #include "scheme_parse.cuh"        // parseFvSchemesControls
 #include "linear_solver_setup.cuh" // readLinearSolverControls + readEnergySolverControls (shared with gpuSimpleFoam)
+#include "frozen_bc_guard.cuh"     // refuseFrozenPerStepBC: coded*/fixedMean/fanPressure need a per-step update
+#include "solution_health.cuh"     // healthResidual/healthField: the divergence stop (shared with gpuSimpleFoam)
+#include <iomanip>
+#include <limits>
+#include <sstream>
 #include <cstdio>
 #include <chrono>
 #include <filesystem>   // READ_IF_PRESENT probe for rho
@@ -59,6 +64,121 @@
 #include <algorithm>
 
 using namespace brae;
+
+namespace {
+
+// primitiveMesh::pointInCell (primitiveMeshFindCell.C:65-89), the FACE_PLANES test polyMesh::findCell uses first:
+// the point is inside when it lies on the inner side of every face plane of the cell (normal & (p - Cf) <= 0,
+// the normal flipped where the cell is the face's neighbour).
+bool pointInCellFacePlanes(
+    const vector&                          pt,
+    label                                  celli,
+    const std::vector<std::vector<label>>& cellFaces,
+    const PrimitiveMesh&                   m,
+    const FvGeometry&                      g)
+{
+    for (const label f : cellFaces[static_cast<std::size_t>(celli)])
+    {
+        const vector proj = pt - g.Cf()[f];
+        vector normal = g.Sf()[f];
+        if (m.owner()[f] != celli) normal = scalar(-1) * normal;
+        if (dot(normal, proj) > 0) return false;
+    }
+    return true;
+}
+
+// Does the case's fvOptions declare an ACTIVE rotorDisk? Read from the dictionaries themselves (constant/ and
+// system/, the two places fv::options looks), `active` read as OpenFOAM's Switch with its default true
+// (fvOption.C:72).
+bool declaresRotorDisk(const std::string& caseDir)
+{
+    for (const char* rel : {"/constant/fvOptions", "/system/fvOptions"})
+    {
+        const std::string path = caseDir + rel;
+        if (!std::filesystem::exists(path)) continue;
+        const FoamDict d = readDict(path);
+        for (const auto& entry : d.subs)
+        {
+            const std::string ty = entry.second.wordOr("type", "");
+            if (ty != "rotorDisk" && ty != "rotorDiskSource") continue;
+            bool active = true;
+            try { active = entry.second.switchOr("active", true); } catch (const std::exception&) {}
+            if (active) return true;
+        }
+    }
+    return false;
+}
+
+// The pressure reference cell, as OpenFOAM's setRefCell resolves it (findRefCell.C:31-115), for a p that
+// needs one. pRefCell wins and must be a cell of the mesh; else pRefPoint, located the way
+// polyMesh::findCell(p, FACE_PLANES) does (polyMesh.C:1517-1580, primitiveMeshFindCell.C:65-107): the NEAREST cell
+// centre first (primitiveMesh::findNearestCell, first of equals), kept if the point is inside it, else
+// the first cell in order that contains it. OpenFOAM then retries with an octree over the cells' tet
+// decomposition (CELL_TETS), which is not ported, so that branch is refused rather than guessed. With
+// neither entry, OpenFOAM stops; so does this. pRefValue is a mandatory readEntry (findRefCell.C:107).
+// The same transcription as interFoam's pRefPoint reader (inter_case_cpp.cu:773-845), single domain.
+int resolvePRefCell(const RhoSimpleControls& rc, const PrimitiveMesh& m, const FvGeometry& g, const char* driver)
+{
+    const label nC = m.nCells();
+    const std::string who = std::string("brae: ") + driver + " -- p fixes its value on no patch, so it needs a "
+                            "reference level (OpenFOAM's setRefCell, findRefCell.C)";
+    label cell = -1;
+    if (rc.hasPRefCell)
+    {
+        if (rc.pRefCell < 0 || rc.pRefCell >= nC)
+            throw std::runtime_error(
+                who + ", and SIMPLE/pRefCell " + std::to_string(rc.pRefCell) + " is not a cell of this "
+                "mesh (0.." + std::to_string(nC - 1) + "). OpenFOAM stops on the same entry (\"Illegal "
+                "master cellID\", findRefCell.C:54-61).");
+        cell = rc.pRefCell;
+    }
+    else if (rc.hasPRefPoint)
+    {
+        if (rc.pRefPoint.size() != 3)
+            throw std::runtime_error(who + ", and SIMPLE/pRefPoint is not a point (three numbers).");
+        const vector pt{rc.pRefPoint[0], rc.pRefPoint[1], rc.pRefPoint[2]};
+        std::vector<std::vector<label>> cellFaces(static_cast<std::size_t>(nC));
+        for (label f = 0; f < m.nFaces(); ++f)
+        {
+            cellFaces[static_cast<std::size_t>(m.owner()[f])].push_back(f);
+            if (f < m.nInternalFaces()) cellFaces[static_cast<std::size_t>(m.neighbour()[f])].push_back(f);
+        }
+        label nearest = 0;
+        scalar minProximity = magSqr(g.C()[0] - pt);
+        for (label c = 1; c < nC; ++c)
+        {
+            const scalar proximity = magSqr(g.C()[c] - pt);
+            if (proximity < minProximity) { nearest = c; minProximity = proximity; }
+        }
+        if (pointInCellFacePlanes(pt, nearest, cellFaces, m, g)) cell = nearest;
+        else
+            for (label c = 0; c < nC; ++c)
+                if (pointInCellFacePlanes(pt, c, cellFaces, m, g)) { cell = c; break; }
+        if (cell < 0)
+            throw std::runtime_error(
+                who + ", and SIMPLE/pRefPoint (" + std::to_string(pt.x) + " " + std::to_string(pt.y) + " "
+                + std::to_string(pt.z) + ") lies in no cell by the face-plane test. OpenFOAM then searches "
+                "again over the cells' tet decomposition (polyMesh::findCell, CELL_TETS), which is not ported, "
+                "or stops if the point is outside the mesh. Move the point inside a cell, or give pRefCell.");
+        std::printf("brae_rhoSimpleFoam: pRefPoint (%g %g %g) is in cell %ld\n", (double)pt.x, (double)pt.y,
+                    (double)pt.z, (long)cell);
+    }
+    else
+    {
+        throw std::runtime_error(
+            who + ", and system/fvSolution SIMPLE names neither pRefCell nor pRefPoint. OpenFOAM stops here "
+            "(\"Unable to set reference cell for field p. Please supply either pRefCell or pRefPoint\", "
+            "findRefCell.C:99-105); this driver used to pin cell 0 instead. Add one of them, with pRefValue.");
+    }
+    if (!rc.hasPRefValue)
+        throw std::runtime_error(
+            who + ", and SIMPLE names no pRefValue. OpenFOAM reads it with a mandatory lookup "
+            "(findRefCell.C:107); this driver used to take 0 Pa, re-levelling the whole pressure field. Add "
+            "pRefValue.");
+    return static_cast<int>(cell);
+}
+
+}   // namespace
 
 int main(int argc, char** argv)
 {
@@ -164,10 +284,54 @@ int main(int argc, char** argv)
         // The ABSOLUTE time this run begins at. endTime is absolute too (OF's Time::run() tests
         // value() < endTime - 0.5*deltaT), so the run length is endTime - startTime -- see the loop.
         const scalar tStart = static_cast<scalar>(start.value);
-        GeometricField<vector> U = buildField<vector>(readField<vector>(t0 + "/U"), fvp, nC);
+        // THE PER-STEP BOUNDARY GUARD. This driver builds U, p and T (and below, the turbulence fields)
+        // from the file and keeps no per-step hook for the conditions whose value OpenFOAM recomputes in
+        // every updateCoeffs: codedFixedValue and codedMixed sat at their file `value` (a mixed with
+        // valueFraction 0.5 for the latter), fixedMean was a frozen fixedValue, and fanPressure ran as a
+        // plain totalPressure with no fan curve (fv_patch_field.cuh's factory accepts all four on the
+        // strength of hooks this driver never calls: setupCodedBCs / collectFixedMean /
+        // collectFanPressure). The shared guard refuses them at the read site, where the dictionary type
+        // still exists; the mirror arms already call it (rhoCreateFields_cpp.cu:365-369).
+        const char* kDriver = "rhoSimpleFoam (default driver)";
+        const FieldData<vector> UFd = readField<vector>(t0 + "/U");
+        refuseFrozenPerStepBC(UFd, "U", kDriver, /*codedMaintained=*/false);
         const FieldData<scalar> pFd = readField<scalar>(t0 + "/p");
+        refuseFrozenPerStepBC(pFd, "p", kDriver, false);
+        const FieldData<scalar> TFd = readField<scalar>(t0 + "/T");
+        refuseFrozenPerStepBC(TFd, "T", kDriver, false);
+        GeometricField<vector> U = buildField<vector>(UFd, fvp, nC);
         GeometricField<scalar> p = buildField<scalar>(pFd, fvp, nC);
-        GeometricField<scalar> T = buildField<scalar>(readField<scalar>(t0 + "/T"), fvp, nC);
+        GeometricField<scalar> T = buildField<scalar>(TFd, fvp, nC);
+        // An `expression` PatchFunction1 (uniformFixedValue) builds UniformFixedValueExprPatchField, which
+        // changes only when a caller invokes updateFromPatchExpression -- and this driver never does, so
+        // the patch stayed at its file `value` for the whole run where OpenFOAM evaluates the expression
+        // in every updateCoeffs (uniformFixedValueFvPatchField.C:171-182, refValueFunc_->value(t)).
+        // squareBendLiq's wall T is exactly that: OpenFOAM ramps it with the local field, the default
+        // driver held 350 K. Refused by name. On T the mirror's CUDA arm evaluates it at the energy
+        // assembly, as OpenFOAM's fixedEnergy::updateCoeffs does (rhoCreateFields.cu:232-250,
+        // rhoSimpleFoam.cu:1217-1218; gated by rho_patch_expression_vs_openfoam and
+        // rho_squarebendliq_vs_openfoam), so the message points there; on any other field no brae arm
+        // evaluates it. U's vector form is refused earlier by the factory itself.
+        auto refuseExpression = [&](const GeometricField<scalar>& fld, const std::string& nm)
+        {
+            for (std::size_t pi = 0; pi < fld.boundary.size() && pi < fvp.size(); ++pi)
+            {
+                if (!fld.boundary[pi]->patchExpression()) continue;
+                throw std::runtime_error(
+                    "brae: " + std::string(kDriver) + " -- " + nm + " patch '" + fvp[pi].name + "' is a "
+                    "uniformFixedValue with an `expression` uniformValue. This driver builds the patch from "
+                    "its file `value` and never evaluates the expression, where OpenFOAM re-evaluates it in "
+                    "every updateCoeffs, so the run would hold the boundary frozen at that value. "
+                    + (nm == "T"
+                           ? std::string("BRAE_RHOSIMPLEFOAM_MIRROR=cuda (or =1, the host reference) evaluates "
+                                         "an `expression` on T at the energy assembly as OpenFOAM does; run "
+                                         "the case there, or replace the expression with a fixed value.")
+                           : std::string("No brae rhoSimpleFoam arm evaluates an `expression` on " + nm
+                                         + " yet; replace it with a fixed value.")));
+            }
+        };
+        refuseExpression(p, "p");
+        refuseExpression(T, "T");
         U.evaluateBoundary();
         p.evaluateBoundary();
         T.evaluateBoundary();
@@ -333,8 +497,13 @@ int main(int argc, char** argv)
             }
         if (ctl.needRef)
         {
-            // rc already carries these, read from the SIMPLE sub-dict by readRhoSimpleControls.
-            ctl.pRefCell = rc.pRefCell;
+            // OpenFOAM's setRefCell (findRefCell.C:31-115), called by pressureControl's constructor
+            // (pressureControl.C:52) whenever p.needReference(): pRefCell (in range), else pRefPoint located
+            // with polyMesh::findCell, else a FatalIOError; then pRefValue, a mandatory readEntry. This
+            // driver used to take pRefCell with a default of 0 and pRefValue with a default of 0.0, so a
+            // case that gave pRefPoint had its pressure pinned in cell 0 instead of the cell holding the
+            // point, and a case that gave neither ran where OpenFOAM stops.
+            ctl.pRefCell = resolvePRefCell(rc, m, g, kDriver);
             ctl.pRefValue = rc.pRefValue;
         }
         // ctl.nu is the KINEMATIC viscosity [m^2/s]; tc.mu0 is DYNAMIC [Pa s]. Assigning one to the other
@@ -387,7 +556,12 @@ int main(int argc, char** argv)
         ctl.turbulent = (simType == "RAS");
         // COMPRESSIBLE legacy: rhoSimpleStep applies the generalized-Newtonian nu
         // (device_simple_foam.cu:3540) and the boundary muEff arm at :1319 is its compressible half.
-        readTurbulenceModel(turbProps, ctl, {"rhoSimpleFoam (legacy)", true, true});
+        //
+        // Maxwell is NOT in this driver's envelope. readLaminarModel accepted it here and the case then
+        // threw at iteration 1 ("sigma field was never handed to the solver", device_simple_foam.cu): only
+        // gpuPimpleFoam wires the viscoelastic stress (setMaxwellSigma). With the envelope false the shared
+        // reader refuses `laminar { model Maxwell; }` by name at start-up instead (turbulence_setup.cuh).
+        readTurbulenceModel(turbProps, ctl, {"rhoSimpleFoam (legacy)", true, /*maxwell=*/false});
         // kOmegaSST and kEpsilon are both rho-weighted (every RHS term, the diffusivity, the volumetric
         // divU and the per-face wall nu). SA and the kOmegaSST variants are not, so they stay refused:
         // running one down the incompressible path converges to a wrong answer rather than failing.
@@ -461,6 +635,21 @@ int main(int argc, char** argv)
                    "selectionMode all|cellZone.";
             throw std::runtime_error(msg);
         }
+        // rotorDisk: PARSED, COUNTED and NEVER APPLIED here. readFvOptions fills fvo.rotor and the option
+        // counts towards fvo.count, but only gpuSimpleFoam and gpuPimpleFoam call setRotorDisk, and the
+        // fvOptions line below did not even name it -- so a rotor case ran with no rotor and looked clean.
+        // Refused on the DECLARATION, not on fvo.rotor.active: the reader leaves a rotor whose cellZone it
+        // cannot resolve (or with no blade/profile table) inactive and uncounted (fv_options.cuh:649), which
+        // is a silent drop of its own.
+        // OpenFOAM's rotorDiskSource on a compressible solver adds the density-weighted force
+        // (rotorDiskSource.C:505-523, addSup(rho, eqn, fieldi) -> calculate(rho, ...)), which brae does not port.
+        if (fvo.rotor.active || declaresRotorDisk(caseDir))
+            throw std::runtime_error(
+                "brae: " + std::string(kDriver) + " -- fvOptions declares a rotorDisk source. This driver "
+                "reads it and never applies it (no rotor force reaches the momentum equation), where "
+                "OpenFOAM's rotorDiskSource adds the density-weighted blade force (rotorDiskSource.C:505-523 "
+                "addSup(rho, ...)). Running would converge to the flow without the rotor. rotorDisk is "
+                "ported on simpleFoam and pimpleFoam only; remove the source from this case.");
 
         // MRF: REFUSED on this solver, because it is not merely unimplemented -- it was invisible.
         //
@@ -493,19 +682,83 @@ int main(int argc, char** argv)
         readLinearSolverControls(fvSolution, second, ctl);
         const EnergySolverControls eSolve = readEnergySolverControls(fvSolution, tc.internalEnergy);
 
+        // SIMPLE/consistent as OpenFOAM's Switch (solutionControl.C:51). readLinearSolverControls (shared)
+        // compares the word with yes/true/on/1, so `consistent y;` ran SIMPLE and a misspelt word ran SIMPLE
+        // silently; the Switch reading agrees with it on every word it knew and refuses the rest.
+        ctl.consistent = readSimpleSwitch(fvSolution.subDict("SIMPLE"), "consistent", kDriver);
+
+        // The energy solve's maxIter and minIter. OpenFOAM stops the he solve at its own entry's maxIter
+        // (lduMatrix::solver, default 1000, lduMatrix.H:125) and runs at least minIter (default 0). This
+        // driver cannot honour either: deviceSolveEnergy builds its stop rule as {tol, relTol,
+        // kUnreadEntryMaxIter, 0} (device_energy.cu:421), and neither file is this driver's to change.
+        // A case asking for a different cap or a floor is therefore refused by name rather than solved to
+        // another stopping point; OpenFOAM's defaults (absent, or maxIter 1000 / minIter 0) run as before.
+        {
+            const FoamDict* solvers = fvSolution.subDict("solvers");
+            const char* primary = tc.internalEnergy ? "e" : "h";
+            const char* fallback = tc.internalEnergy ? "h" : "e";
+            // the SAME entry readEnergySolverControls took the tolerances from
+            const FoamDict* es = solvers ? solvers->subDict(primary) : nullptr;
+            if (!es && solvers) es = solvers->subDict(fallback);
+            if (es)
+            {
+                const bool maxIterOther = es->found("maxIter") && es->scalarOr("maxIter", 1000) != 1000;
+                const bool minIterOther = es->found("minIter") && es->scalarOr("minIter", 0) != 0;
+                if (maxIterOther || minIterOther)
+                    throw std::runtime_error(
+                        "brae: " + std::string(kDriver) + " -- system/fvSolution solvers/" + primary + " sets "
+                        + (maxIterOther ? "maxIter " + es->wordOr("maxIter", "") : std::string())
+                        + (maxIterOther && minIterOther ? " and " : "")
+                        + (minIterOther ? "minIter " + es->wordOr("minIter", "") : std::string())
+                        + ". OpenFOAM stops the energy solve at that maxIter and runs it at least minIter "
+                          "iterations (lduMatrix::solver); this driver's energy solve does not take either "
+                          "entry yet and would stop somewhere else. Remove the entry (OpenFOAM's defaults, "
+                          "maxIter 1000 and minIter 0, are what runs), or run the case on "
+                          "BRAE_RHOSIMPLEFOAM_MIRROR=cuda, which honours both.");
+            }
+        }
+
         TurbulenceFields tf;
-        if (ctl.turbulent) tf = readTurbulenceFields(t0, fvp, nC, ctl, second, U);
+        // kDriver: the shared reader refuses coded*/fixedMean/fanPressure on k, epsilon|omega and nut too.
+        if (ctl.turbulent) tf = readTurbulenceFields(t0, fvp, nC, ctl, second, U, kDriver, /*codedMaintained=*/false);
+        if (ctl.turbulent)
+        {
+            refuseExpression(tf.k, "k");
+            refuseExpression(tf.eps, second);
+            refuseExpression(tf.nut, "nut");
+        }
 
         // Per-boundary-face Prt from 0/alphat. OF keeps two DIFFERENT turbulent Prandtl numbers in one
         // case: alphatWallFunction reads its own from the patch (default 0.85) while the turbulence model
         // uses the one from its coeffs dict (default 1.0). Using either one everywhere is wrong somewhere.
+        //
+        // WHAT THIS DRIVER COMPUTES FOR alphat, and therefore what it can accept. It never builds 0/alphat
+        // as a field: it reads the patch types for Prt and then computes alphat = rho*nut/Prt everywhere --
+        // the cells with the model's Prt (deviceAlphat), every boundary face with prtFace below
+        // (deviceAlphaEffBoundary). That IS OpenFOAM's answer on exactly two kinds of patch:
+        //   calculated                          EddyDiffusivity::correctNut's alphat_ = rho*nut/Prt, the
+        //                                       boundary evaluated from the boundary rho and nut;
+        //   compressible::alphatWallFunction    rhow*nutw/Prt_patch (alphatWallFunctionFvPatchScalarField.C
+        //                                       updateCoeffs);
+        // plus the constraint types (empty, symmetry, wedge, cyclic...), which follow their patch. Anything
+        // else ran as rho*nut/Prt under its own name -- compressible::alphatJayatillekeWallFunction most of
+        // all, whose thermal P-function brae does not have -- and a fixedValue or zeroGradient alphat is not
+        // rho*nut/Prt in OpenFOAM either. Refused by name. And 0/alphat itself is MUST_READ for a RAS model
+        // (EddyDiffusivity.C:73-82): a case without it ran on the model's Prt everywhere, which OpenFOAM
+        // never does because it stops first.
         std::vector<scalar> prtFace;
+        FieldData<scalar> alphatFd;
         if (ctl.turbulent)
         {
-            FieldData<scalar> alphatFd;
-            bool haveAlphat = true;
-            try { alphatFd = readField<scalar>(t0 + "/alphat"); }
-            catch (const std::exception&) { haveAlphat = false; }
+            if (!std::filesystem::exists(t0 + "/alphat") && !std::filesystem::exists(t0 + "/alphat.gz"))
+                throw std::runtime_error(
+                    "brae: " + std::string(kDriver) + " -- the case is RAS and " + startName + "/alphat does "
+                    "not exist. OpenFOAM's compressible RAS model reads alphat MUST_READ "
+                    "(EddyDiffusivity.C:73-82) and stops without it; this driver used to run on the model's "
+                    "Prt at every wall instead, which changes the wall heat flux. Add " + startName
+                    + "/alphat (calculated, with compressible::alphatWallFunction on the walls, as the "
+                    "rhoSimpleFoam tutorials ship it).");
+            alphatFd = readField<scalar>(t0 + "/alphat");
 
             for (const FvPatch& q : fvp)
             {
@@ -515,17 +768,51 @@ int main(int argc, char** argv)
                 // squareBend* key this entry as "(?i).*walls" against a patch literally called `walls`,
                 // so exact matching missed it and Prt silently reverted to the model default 1.0 instead
                 // of the wall function's 0.85: wall alphat, and the wall heat flux, ~15% low.
-                if (haveAlphat)
-                {
-                    const PatchFieldData<scalar>* pb = findPatchEntry(alphatFd.boundary, q);
-                    if (pb && (pb->type == "compressible::alphatWallFunction" || pb->type == "alphatWallFunction"))
-                        prt = pb->Prt;
-                }
+                const PatchFieldData<scalar>* pb = findPatchEntry(alphatFd.boundary, q);
+                const bool constraint = isConstraintPatchType(q.type);
+                if (!pb && !constraint)
+                    throw std::runtime_error(
+                        "brae: " + startName + "/alphat has no entry for patch '" + q.name + "'. OpenFOAM "
+                        "stops on a patch without a boundary condition; add one (calculated, or "
+                        "compressible::alphatWallFunction on a wall).");
+                if (pb && !constraint && pb->type != "calculated" && pb->type != "compressible::alphatWallFunction")
+                    throw std::runtime_error(
+                        "brae: " + std::string(kDriver) + " -- " + startName + "/alphat patch '" + q.name
+                        + "' is '" + pb->type + "'. This driver computes alphat = rho*nut/Prt on every face, "
+                        "which is OpenFOAM's value for `calculated` and `compressible::alphatWallFunction` "
+                        "only; " + (pb->type == "compressible::alphatJayatillekeWallFunction"
+                                    ? std::string("alphatJayatillekeWallFunction's thermal wall function "
+                                                  "(the Jayatilleke P-function) is not ported, so the wall "
+                                                  "heat flux would be wrong. ")
+                                    : (pb->type == "alphatWallFunction"
+                                       ? std::string("OpenFOAM v2412 has no `alphatWallFunction` for a "
+                                                     "compressible solver (the type is "
+                                                     "`compressible::alphatWallFunction`) and stops on it. ")
+                                       : std::string("on this one OpenFOAM computes something else. ")))
+                        + "Use calculated or compressible::alphatWallFunction.");
+                if (pb && pb->type == "compressible::alphatWallFunction") prt = pb->Prt;
                 prtFace.insert(prtFace.end(), static_cast<std::size_t>(q.size), prt);
             }
         }
 
-        const int endTime = static_cast<int>(controlDict.scalarOr("endTime", 1000));
+        // endTime and deltaT as OpenFOAM's Time reads them (TimeIO.C:271-275, 340-356). endTime is a SCALAR:
+        // it was cast to int here, so `endTime 10.7` ran 10 iterations where OpenFOAM's
+        // `value() < endTime - 0.5*deltaT` (Time.C:785) runs 11, and a fractional deltaT lost whole steps
+        // (endTime 2.5, deltaT 0.5: 4 iterations against OpenFOAM's 5). An ABSENT endTime ran 1000
+        // iterations; OpenFOAM stops on it under `stopAt endTime` (readEntry) and takes 0, i.e. runs
+        // nothing, when stopAt is absent too. deltaT is a mandatory readEntry (TimeIO.C:274); WriteControl
+        // (shared) defaults it to 1, so its absence is refused here, before anything counts steps with it.
+        if (!controlDict.found("deltaT"))
+            throw std::runtime_error(
+                "brae: system/controlDict has no deltaT. OpenFOAM reads it with a mandatory lookup "
+                "(TimeIO.C:274) and stops; brae used to take 1. Add `deltaT 1;` (the usual value for a "
+                "steady case, where each time step is one SIMPLE iteration).");
+        if (!controlDict.found("endTime"))
+            throw std::runtime_error(
+                "brae: system/controlDict has no endTime. OpenFOAM stops on that under `stopAt endTime` "
+                "(TimeIO.C:346) and otherwise takes endTime 0 and runs no iteration (TimeIO.C:353-356); "
+                "brae used to run 1000 iterations. Add endTime -- an ABSOLUTE time, the last iteration's.");
+        const scalar endTime = controlDict.scalarOr("endTime", 0);
 
         mark__("fields+controls read");
         DeviceSimpleSolver solver(m, g, fvp, U, p, phi, ctl,
@@ -689,8 +976,13 @@ int main(int argc, char** argv)
                     ctl.tolP, ctl.tolU, eSolve.tol,
                     (int)ctl.gsU, (int)ctl.gsK, second.c_str(), (int)ctl.gsEps, (int)eSolve.useGS,
                     (int)ctl.consistent, ctl.nNonOrth);
-        std::printf("brae_rhoSimpleFoam: relax  p=%g U=%g e|h=%g k=%g %s=%g rho=%g   pLimit=[%g, %g]\n",
-                    ctl.relaxP, ctl.relaxU, rc.relaxHe, ctl.relaxK, second.c_str(), ctl.relaxEps, tc.relaxRho,
+        // e|h: the factor EEqn.relax() applies, or `none` when the case names neither the energy field nor a
+        // `default` (rho_simple_controls.cuh relaxHe: OpenFOAM does not relax the equation then).
+        const std::string heRelaxWord = rc.relaxHeFrom.empty()
+            ? std::string("none")
+            : [&] { char b[64]; std::snprintf(b, sizeof b, "%g", (double)rc.relaxHe); return std::string(b); }();
+        std::printf("brae_rhoSimpleFoam: relax  p=%g U=%g e|h=%s k=%g %s=%g rho=%g   pLimit=[%g, %g]\n",
+                    ctl.relaxP, ctl.relaxU, heRelaxWord.c_str(), ctl.relaxK, second.c_str(), ctl.relaxEps, tc.relaxRho,
                     rc.limitMinP ? rc.pMinLimit : -1.0, rc.limitMaxP ? rc.pMaxLimit : -1.0);
         mark__("revalidate done");
         std::printf("brae_rhoSimpleFoam: %ld cells, subsonic %s, R=%.3f Cp=%.1f\n",
@@ -765,26 +1057,150 @@ int main(int argc, char** argv)
         // can make different from controlDict's startTime.
         wc.setStartTime(tStart);
         const std::string wsrc = t0 + "/";
+        // writePrecision, as OpenFOAM's Time sets IOstream::defaultPrecision from it (TimeIO.C:375-383; 6
+        // when absent) for EVERY field it writes, phi included. This driver wrote U, p, T, rho, k,
+        // epsilon|omega and nut at 12 digits and phi at 17 whatever the case said, so a case asking for 17
+        // (issue #54's reproduction) got 12, and one asking for 6 got files OpenFOAM would not have written.
+        const int writePrecision = controlDict.intOr("writePrecision", 6);
+        // alphat, the turbulent thermal diffusivity rho*nut/Prt, exactly as this driver uses it: the cells
+        // from deviceAlphat (the model's Prt), each boundary face from the boundary rho and nut and that
+        // face's Prt -- the product deviceAlphaEffBoundary forms for the energy equation. OpenFOAM writes it
+        // (EddyDiffusivity's alphat_ is AUTO_WRITE) and needs it back: it is MUST_READ for a RAS model, so
+        // without it OpenFOAM could not restart from brae's output at all, and brae's own restart took the
+        // model's Prt at every alphatWallFunction wall (the ~15% wall-heat-flux error the Prt comment above
+        // measures). The patch types come from the start time's alphat, Prt included where it is not
+        // OpenFOAM's 0.85 (alphatWallFunctionFvPatchScalarField::write, writeEntryIfDifferent).
+        std::map<std::string, std::string> alphatExtra;
+        if (ctl.turbulent)
+            for (const FvPatch& q : fvp)
+            {
+                const PatchFieldData<scalar>* pb = findPatchEntry(alphatFd.boundary, q);
+                if (!pb || pb->type != "compressible::alphatWallFunction" || pb->Prt == scalar(0.85)) continue;
+                std::ostringstream o;
+                o << std::setprecision(writePrecision) << "        Prt             " << pb->Prt << ";\n";
+                alphatExtra[q.name] = o.str();
+            }
+        // BRAE_ALLOW_NONFINITE=1: the control of tests/rho_default_nonfinite_refusal.sh -- write and run on
+        // regardless, the old behaviour.
+        const bool allowNonFinite = std::getenv("BRAE_ALLOW_NONFINITE") != nullptr;
+        // TEST CONTROL (BRAE_TEST_CORRUPT=<field>:<nan|inf|neg|big>:<iteration>), the hook gpuSimpleFoam has:
+        // DeviceSimpleSolver::corruptForTest puts one bad value in one cell of one field AFTER that
+        // iteration's residuals were checked, so a gate can show each stop fires on what it claims to
+        // read -- the residual check one iteration later, the write-time scan on a write iteration.
+        std::string corruptField, corruptKind;
+        long corruptIter = -1;
+        if (const char* e = std::getenv("BRAE_TEST_CORRUPT"))
+        {
+            const std::string t(e);
+            const std::size_t a = t.find(':');
+            const std::size_t b = t.rfind(':');
+            if (a == std::string::npos || b == a)
+                throw std::runtime_error("BRAE_TEST_CORRUPT wants <field>:<kind>:<iteration>");
+            corruptField = t.substr(0, a);
+            corruptKind = t.substr(a + 1, b - a - 1);
+            corruptIter = std::atol(t.c_str() + b + 1);
+        }
         auto writeTimeDir = [&](const std::string& tname)
         {
             const std::string outDir = caseDir + "/" + tname;
+            // EVERY field is brought to the host before ANY file is written, so the divergence stop below
+            // can refuse the whole time directory rather than leave half of it on disk. These are the copies
+            // the writer always made; only their order moved.
+            std::vector<std::vector<scalar>> tracerOut;
+            for (ScalarTransportFO* st : scalarTransports) tracerOut.push_back(st->hostField());
+            const std::vector<vector> Uout = solver.U();
+            const std::vector<vector> UBout = solver.UBoundary();
+            const std::vector<scalar> pOut = solver.p();
+            const std::vector<scalar> pBout = solver.pBoundary();
+            std::vector<scalar> Tout(nC);
+            th.T.copyTo(Tout);
+            const std::vector<scalar> TBout = solver.TBoundary();
+            std::vector<scalar> rhoOut(nC);
+            th.rho.copyTo(rhoOut);
+            const std::vector<scalar> rhoBout = solver.rhoBoundary();
+            std::vector<scalar> kOut, kBout, eOut, eBout, nutOut, nutBout, alphatOut, alphatBout;
+            if (ctl.turbulent)
+            {
+                kOut = solver.k();       kBout = solver.kBoundary();
+                eOut = solver.eps();     eBout = solver.epsBoundary();
+                nutOut = solver.nut();   nutBout = solver.nutBoundary();
+                alphatOut.resize(nC);
+                th.alphat.copyTo(alphatOut);
+                if (nutBout.size() == prtFace.size() && rhoBout.size() == prtFace.size())
+                {
+                    alphatBout.resize(prtFace.size());
+                    for (std::size_t i = 0; i < prtFace.size(); ++i)
+                        alphatBout[i] = rhoBout[i] * nutBout[i] / prtFace[i];
+                }
+            }
+            const std::vector<scalar> phiOut = solver.phiInternal();
+            const std::vector<scalar> phiBout = solver.phiBoundary();
+
+            // THE DIVERGENCE STOP, AT THE WRITE. OpenFOAM never writes a non-finite field: trapFpe
+            // (etc/controlDict, FOAM_SIGFPE) aborts on the first NaN or Inf any operation makes, and
+            // species::thermo::T stops on a negative temperature (thermoI.H:55-60, "Negative initial
+            // temperature T0") at the next thermo.correct(). The per-iteration residual check in the loop
+            // catches a NaN one solve later; this catches what no residual has seen yet -- a field that went
+            // bad in the iteration being written -- before a single file of it reaches disk. The arrays are
+            // the writer's own host copies, so it costs no device transfer.
+            if (!allowNonFinite)
+            {
+                std::string why;
+                auto scan = [&](const char* nm, const std::vector<scalar>& v, bool temperature)
+                {
+                    if (!why.empty()) return;
+                    for (std::size_t i = 0; i < v.size(); ++i)
+                        if (!std::isfinite(v[i]) || (temperature && v[i] < 0))
+                        {
+                            why = std::string(std::isfinite(v[i]) ? "a negative temperature" : "a non-finite value")
+                                + " in " + nm + " (entry " + std::to_string(i) + ": " + std::to_string((double)v[i]) + ")";
+                            return;
+                        }
+                };
+                auto scanV = [&](const char* nm, const std::vector<vector>& v)
+                {
+                    if (!why.empty()) return;
+                    for (std::size_t i = 0; i < v.size(); ++i)
+                        if (!(std::isfinite(v[i].x) && std::isfinite(v[i].y) && std::isfinite(v[i].z)))
+                        {
+                            why = std::string("a non-finite value in ") + nm + " (entry " + std::to_string(i) + ")";
+                            return;
+                        }
+                };
+                scanV("U", Uout);            scanV("U boundary", UBout);
+                scan("p", pOut, false);      scan("p boundary", pBout, false);
+                scan("T", Tout, true);       scan("T boundary", TBout, true);
+                scan("rho", rhoOut, false);  scan("rho boundary", rhoBout, false);
+                scan("k", kOut, false);      scan("k boundary", kBout, false);
+                scan(second.c_str(), eOut, false);
+                scan((second + " boundary").c_str(), eBout, false);
+                scan("nut", nutOut, false);  scan("nut boundary", nutBout, false);
+                scan("alphat", alphatOut, false); scan("alphat boundary", alphatBout, false);
+                scan("phi", phiOut, false);  scan("phi boundary", phiBout, false);
+                for (std::size_t i = 0; i < tracerOut.size(); ++i)
+                    scan(scalarTransports[i]->fieldName().c_str(), tracerOut[i], false);
+                if (!why.empty())
+                    throw std::runtime_error(
+                        "brae rhoSimpleFoam (default driver): solution diverged -- " + why + " at time " + tname
+                        + ". OpenFOAM stops on that state (a floating-point trap on the first NaN/Inf, or "
+                          "species::thermo::T on a negative temperature), so this run stops too. No field "
+                          "written for " + tname + ". Set BRAE_ALLOW_NONFINITE=1 to write it anyway.");
+            }
+
             std::filesystem::create_directories(outDir);
             // scalarTransport tracers. OF constructs its transported field with AUTO_WRITE
             // (scalarTransport.C transportedField()), so it appears in every written time directory
-            // alongside the solved fields. Pulled from the device only HERE -- on the write cadence,
-            // not every iteration.
-            for (ScalarTransportFO* st : scalarTransports)
+            // alongside the solved fields. Pulled from the device only on the write cadence, not every
+            // iteration.
+            for (std::size_t i = 0; i < scalarTransports.size(); ++i)
             {
+                ScalarTransportFO* st = scalarTransports[i];
                 writeVolField(wsrc + st->fieldName(), outDir + "/" + st->fieldName(),
-                              st->hostField(), fvp, 12);
+                              tracerOut[i], fvp, writePrecision);
             }
-            writeVolField(wsrc + "U", outDir + "/U", solver.U(), fvp, 12, solver.UBoundary());
-            writeVolField(wsrc + "p", outDir + "/p", solver.p(), fvp, 12, solver.pBoundary());
-            {
-                std::vector<scalar> Tout(nC);
-                th.T.copyTo(Tout);
-                writeVolField(wsrc + "T", outDir + "/T", Tout, fvp, 12, solver.TBoundary());
-            }
+            writeVolField(wsrc + "U", outDir + "/U", Uout, fvp, writePrecision, UBout);
+            writeVolField(wsrc + "p", outDir + "/p", pOut, fvp, writePrecision, pBout);
+            writeVolField(wsrc + "T", outDir + "/T", Tout, fvp, writePrecision, TBout);
             {
                 // rho, so the gate can compare the EOS result directly rather than inferring it from p and T.
                 // 0/T is only a TEMPLATE for the FoamFile header here -- the identity, the dimensions and every
@@ -792,29 +1208,27 @@ int main(int argc, char** argv)
                 // dimensions of temperature, an inlet density of 300 and (once B5 landed) a fixedGradient
                 // density of 20000 kg/m^4, all of which OF reads back without complaint.
                 static const DerivedFieldSpec rhoSpec{"rho", "dimensions      [1 -3 0 0 0 0 0];"};
-                std::vector<scalar> rhoOut(nC);
-                th.rho.copyTo(rhoOut);
-                writeVolField(wsrc + "T", outDir + "/rho", rhoOut, fvp, 12, solver.rhoBoundary(), &rhoSpec);
+                writeVolField(wsrc + "T", outDir + "/rho", rhoOut, fvp, writePrecision, rhoBout, &rhoSpec);
             }
             if (ctl.turbulent)
             {
-                writeVolField(wsrc + "k", outDir + "/k", solver.k(), fvp, 12, solver.kBoundary());
+                writeVolField(wsrc + "k", outDir + "/k", kOut, fvp, writePrecision, kBout);
                 // the 2nd turbulence scalar shares one slot: omega on kOmegaSST, epsilon on kEpsilon
-                writeVolField(wsrc + second, outDir + "/" + second, solver.eps(), fvp, 12, solver.epsBoundary());
-                writeVolField(wsrc + "nut", outDir + "/nut", solver.nut(), fvp, 12, solver.nutBoundary());
+                writeVolField(wsrc + second, outDir + "/" + second, eOut, fvp, writePrecision, eBout);
+                writeVolField(wsrc + "nut", outDir + "/nut", nutOut, fvp, writePrecision, nutBout);
+                writeVolField(wsrc + "alphat", outDir + "/alphat", alphatOut, fvp, writePrecision, alphatBout,
+                              nullptr, alphatExtra.empty() ? nullptr : &alphatExtra);
             }
             // phi, so a restart RESUMES the conservative mass flux instead of rebuilding it. OF's
             // compressibleCreatePhi.H pairs READ_IF_PRESENT with AUTO_WRITE; brae read it (see
             // read_surface_field.cuh) but never wrote it, so a brae->brae restart always fell back to
             // interpolate(rho*U)&Sf -- a DIFFERENT field from the corrected phi, which is exactly the
             // discrepancy the phi read was added to remove. Dimensions are the compressible MASS flux
-            // [1 0 -1 0 0 0 0] (kg/s), not the incompressible volumetric default.
-            // 17 digits, not the 12 the vol fields use: this field is read back to seed a restart, so it
-            // wants an exact double round-trip rather than display precision.
-            writeSurfaceField(outDir + "/phi", solver.phiInternal(), solver.phiBoundary(), fvp,
-                              17, "[1 0 -1 0 0 0 0]");
+            // [1 0 -1 0 0 0 0] (kg/s), not the incompressible volumetric default. At writePrecision, as
+            // OpenFOAM writes it (it was 17 here whatever the case said).
+            writeSurfaceField(outDir + "/phi", phiOut, phiBout, fvp, writePrecision, "[1 0 -1 0 0 0 0]");
             std::printf("written %s/{U,p,T,rho,phi%s}\n", outDir.c_str(),
-                        ctl.turbulent ? (ctl.sst ? ",k,omega,nut" : ",k,epsilon,nut") : "");
+                        ctl.turbulent ? (ctl.sst ? ",k,omega,nut,alphat" : ",k,epsilon,nut,alphat") : "");
             wc.recordWritten(caseDir, tname);
         };
 
@@ -831,9 +1245,32 @@ int main(int argc, char** argv)
                                            static_cast<double>(wc.deltaT()));
         if (nSteps < 1)
             throw std::runtime_error(
-                "controlDict endTime (" + std::to_string(endTime) + ") is not beyond the start time ("
+                "controlDict endTime (" + controlDict.wordOr("endTime", "") + ") is not beyond the start time ("
                 + startName + "): there is nothing to run. endTime is an ABSOLUTE time, not a number of "
                 "iterations -- on a restart set it past the time you are restarting from.");
+        // fvOptions TIME WINDOWS. OpenFOAM's cellSetOption is active only while
+        // timeStart <= t <= timeStart + duration (cellSetOption::inTimeLimits, cellSetOptionI.H:43-54), and on a
+        // steady solver t is the iteration's time value -- so a window switches a source on or off at given
+        // ITERATIONS. This driver applies every fvOption on every iteration, so a window that does not span
+        // the whole run would impose the source outside it. Refused unless it covers every iteration this
+        // run takes (the first at startTime + deltaT, the last at the final time value), the same rule as
+        // gpuPimpleFoam's.
+        {
+            const scalar tFirst = wc.timeValue(1);
+            const scalar tLast  = wc.timeValue(static_cast<int>(nSteps));
+            for (const auto& w : fvo.windows)
+                if (w.start >= 0   // a negative timeStart is OpenFOAM's "always" (inTimeLimits: timeStart_ < 0)
+                    && (w.start > tFirst || w.start + w.duration < tLast))
+                    throw std::runtime_error(
+                        "brae: " + std::string(kDriver) + " -- fvOptions source '" + w.name + "' is active "
+                        "only for t in [" + std::to_string(w.start) + ", " + std::to_string(w.start + w.duration)
+                        + "] (timeStart/duration), which does not cover this run's iterations ["
+                        + std::to_string(tFirst) + ", " + std::to_string(tLast) + "]. OpenFOAM switches the "
+                        "source on and off at those iteration times (cellSetOption::inTimeLimits); this driver "
+                        "applies its fvOptions on every iteration, so it would impose the source outside its "
+                        "window. Remove timeStart/duration if the source is meant to be always on, or run "
+                        "only the iterations inside the window.");
+        }
         Time time(controlDict, &wc, static_cast<int>(nSteps), foTypes);
 
         int nIter = static_cast<int>(nSteps);
@@ -858,6 +1295,44 @@ int main(int argc, char** argv)
                 std::printf("Time = %s   Ux %.4e  p %.4e  contGlobal %.4e\n",
                             time.timeName().c_str(), r.Ux, r.p, r.contGlobal);
             }
+            // THE DIVERGENCE STOP, PER ITERATION. This loop checked nothing for finiteness: a diverging case
+            // printed `Ux nan  p nan` and ran to endTime, wrote NaN fields and exited 0 -- measured on
+            // squareBend run subsonic at 0.1 kg/s (tests/rho_default_nonfinite_refusal.sh), where OpenFOAM
+            // aborts on the thermo inversion. Every residual the step reports is already on the host (the
+            // line above prints them), so testing them costs nothing: no device read is added to the
+            // iteration. A NaN or Inf anywhere in the fields reaches the next solve's residual, so the run
+            // stops at most one iteration after the field went bad -- the same rule as the mirror arm
+            // (rhoSimpleFoamDriver.cu:1185-1209), through solution_health.cuh's healthResidual (finite and
+            // non-negative). What no residual has seen yet is caught at the write (writeTimeDir).
+            if (!allowNonFinite)
+            {
+                std::string why;
+                auto res = [&](const std::string& nm, scalar v)
+                {
+                    if (why.empty()) why = healthResidual(nm, v, iter);
+                };
+                res("p", r.p);       res("p (final)", r.pFinal);
+                res("Ux", r.Ux);     res("Ux (final)", r.UxFinal);
+                res("Uy", r.Uy);     res("Uy (final)", r.UyFinal);
+                res("Uz", r.Uz);     res("Uz (final)", r.UzFinal);
+                res(heName, r.he);   res(heName + " (final)", r.heFinal);
+                for (const auto& e : turbulenceReport())
+                {
+                    const std::string nm = (e.field == "he") ? heName : e.field;
+                    res(nm, e.perf.initialResidual);
+                    res(nm + " (final)", e.perf.finalResidual);
+                }
+                if (why.empty() && !(std::isfinite(r.contGlobal) && std::isfinite(r.contLocal)))
+                    why = "non-finite continuity error at iteration " + std::to_string(iter);
+                if (!why.empty())
+                    throw std::runtime_error(
+                        "brae rhoSimpleFoam (default driver): solution diverged -- " + why + " (time "
+                        + time.timeName() + "). Every iteration after this one is noise, and OpenFOAM stops "
+                        "on the same state (a floating-point trap on the first NaN/Inf, or the thermo "
+                        "inversion). No field written for this time. Set BRAE_ALLOW_NONFINITE=1 to run on "
+                        "anyway.");
+            }
+            if (static_cast<long>(iter) == corruptIter) solver.corruptForTest(corruptField, corruptKind);
             resControl.beginIteration();
             // U is gated on Ux alone, matching gpuSimpleFoam: brae tracks no solved-directions mask, so the
             // out-of-plane component of a 2D/empty or wedge case carries a degenerate residual that would
