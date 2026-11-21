@@ -40,9 +40,9 @@
       "name": "full-validation",
       "configurePreset": "dev",
       "displayName": "Full validation",
-      "description": "Every test but the known-red gates, which tools/known_red_check.py holds to their registered FAILs.",
+      "description": "Every test but the known-red gates, which tools/known_red_check.py holds to their registered FAILs, and the diagnostic tests.",
       "output": { "outputOnFailure": true },
-      "filter": { "exclude": { "label": "known-red" } }
+      "filter": { "exclude": { "label": "known-red|diagnostic" } }
     },
     {
       "name": "known-red",
@@ -51,6 +51,14 @@
       "description": "The known-red gates alone; red is expected. tools/known_red_check.py is what judges them.",
       "output": { "outputOnFailure": true },
       "filter": { "include": { "label": "known-red" } }
+    },
+    {
+      "name": "diagnostic",
+      "configurePreset": "dev",
+      "displayName": "Diagnostic tests",
+      "description": "Tests whose result depends on the compiler or GPU target by design (tests/cmake/tiers.cmake); they report, they do not gate.",
+      "output": { "outputOnFailure": true },
+      "filter": { "include": { "label": "diagnostic" } }
     }
   ]
 }

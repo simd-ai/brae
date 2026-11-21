@@ -9,7 +9,7 @@ nothing in this directory changes GitHub by being merged. The commands at the en
 |---|---|---|---|
 | 1. build | `ci.yml` | GitHub-hosted, no GPU | compiles and installs brae, brae_pimpleFoam, brae_rhoSimpleFoam, brae_interFoam, brae_rhoCentralFoam and brae-agent for sm_80, sm_90 and sm_121 (one job each), configures the whole test suite without building it, and runs the known-red checker's self-test |
 | 2. gpu-smoke | `gpu-smoke.yml` | the self-hosted GB10 | the tests labelled `smoke` (`ctest --preset gpu-smoke`), cached by `tools/ctest_cached.py` |
-| 3. gpu-full | `gpu-full.yml` | the self-hosted GB10 | the whole suite but `known-red` (`ctest --preset full-validation`), cached, then the six known-red gates through `tools/known_red_check.py` |
+| 3. gpu-full | `gpu-full.yml` | the self-hosted GB10 | the whole suite but `known-red` and `diagnostic` (`ctest --preset full-validation`), cached, then the six known-red gates through `tools/known_red_check.py`, then the `diagnostic` tests in a step that reports and never fails the job (`ctest --preset diagnostic`) |
 | 4. release | `release.yml` | both | tier 1, then tier 3 with the cache off (every test run, whatever passed before), then the release |
 
 | Event | build | gpu-smoke | gpu-full |
@@ -44,6 +44,12 @@ no `slow` or `known-red` label, from every registration group (402 tests). The f
 kepsilon_production_and_blend are fast but left out while their fixes are separate pull requests; every full tier
 runs them. A test joins or leaves the list by the same measurement. The build is most of the smoke job: a compiler
 cache on the runner (`CMAKE_CUDA_COMPILER_LAUNCHER=ccache`) would cut it for changes that touch few files.
+
+One test is in the smoke tier although it takes longer, decided 2026-11-21: `pimple_pressure_reference_developed`
+(about 22 s on the GB10), the pressure-reference gate, bounded by OpenFOAM's own decomposed spread. It took the place
+of `pimple_pressure_reference`, whose uniform start decides the limiter by rounding signs, so that its result follows
+the compiler and the GPU target. That one is labelled `diagnostic`: the full tiers run it in their last step, which
+never fails the job, and `ctest --preset diagnostic` runs it by hand.
 
 ## Rules on main
 

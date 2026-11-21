@@ -59,24 +59,30 @@ set_tests_properties(pimple_run PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 300)
 # THE PRESSURE REFERENCE on the transient driver, against real OpenFOAM pimpleFoam: pitzDaily staged
 # all-Neumann (its outlet p and U zeroGradient), where OpenFOAM's p.needReference() is true. The driver
 # never set DeviceSimpleControls::needRef, so the shared solver took the default and ran the singular
-# system with neither adjustPhi nor setReference. The control (BRAE_NO_PREF=1) diverges at step two.
-add_test(NAME pimple_pressure_reference
-         COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_pressure_reference_vs_openfoam.sh
-                 $<TARGET_FILE:brae_pimpleFoam>
-                 ${PROJECT_SOURCE_DIR}/validation/pitzDaily
-                 ${PROJECT_BINARY_DIR}/pimple_pressure_reference_work)
-set_tests_properties(pimple_pressure_reference PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 900)
-# The same reference from a DEVELOPED start: the uniform start above decides limitedLinear by a rounding sign at
-# every face, in OpenFOAM too, so its bounds measure the compiler. This one starts from an OpenFOAM precursor at
-# t0 = 0.002, solves every equation to 1e-12, and bounds brae by 10x OpenFOAM's own np2/np4 spread, computed in the run.
-# Controls: no reference, a wrong limiter gradient and a wrong limiter (BRAE_CONTROL_LIMITER), each red by > 100x.
-# The test above stays until this one has passed on the GB10 and the GH200.
+# system with neither adjustPhi nor setReference.
+#
+# The gate: the developed start. An OpenFOAM precursor runs to t0 = 0.002, every equation is then solved to 1e-12,
+# and brae is bounded by 10x OpenFOAM's own np2/np4 spread, computed in the run. Controls: no reference
+# (BRAE_NO_PREF=1, diverges at the first step), a wrong limiter gradient and a wrong limiter (BRAE_CONTROL_LIMITER),
+# each red by > 100x. In the smoke tier although it takes about 22 s (tests/cmake/tiers.cmake says why).
 add_test(NAME pimple_pressure_reference_developed
          COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_pressure_reference_developed_vs_openfoam.sh
                  $<TARGET_FILE:brae_pimpleFoam>
                  ${PROJECT_SOURCE_DIR}/validation/pitzDaily
                  ${PROJECT_BINARY_DIR}/pimple_pressure_reference_developed_work)
-set_tests_properties(pimple_pressure_reference_developed PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 1800 LABELS slow)
+set_tests_properties(pimple_pressure_reference_developed PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 1800)
+# DIAGNOSTIC, not a gate: the same reference from the UNIFORM start. There k[N] - k[P] = 0 on every face, so
+# limitedLinear is decided by the rounding sign of grad(k); OpenFOAM's own serial and 2-rank runs choose differently on
+# 49% of the faces, and the bounds (U 1e-3, p 5e-3, one GB10 measurement) follow the compiler and the GPU target.
+# Kept, with its bounds as they were, because it still shows where two builds round differently. Labelled
+# `diagnostic`: out of the smoke and full selections, run by gpu-full.yml in a step that never fails the job, and by
+# hand with `ctest --preset diagnostic`. Its control (BRAE_NO_PREF=1) diverges at step two.
+add_test(NAME pimple_pressure_reference
+         COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_pressure_reference_vs_openfoam.sh
+                 $<TARGET_FILE:brae_pimpleFoam>
+                 ${PROJECT_SOURCE_DIR}/validation/pitzDaily
+                 ${PROJECT_BINARY_DIR}/pimple_pressure_reference_work)
+set_tests_properties(pimple_pressure_reference PROPERTIES SKIP_RETURN_CODE 125 TIMEOUT 900 LABELS diagnostic)
 
 # PIMPLE/momentumPredictor: the same case with the switch on and off must give DIFFERENT fields (and the
 # default must equal `on`). See the header of the script for why the log line is not enough.
