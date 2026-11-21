@@ -198,18 +198,3 @@ OpenFOAM one run each. Wall seconds for the whole run, start-up and write includ
   the synchronous copies around GaussSeidel's CPU sweep are two thirds of the CUDA API time.
 - The seven tutorials as shipped (sec. above) are 100 to 32,385 cells, where brae is latency-bound; these runs are
   where it is meant to work.
-
-## Keys as OpenFOAM names them (2026-11-21, wave 1 Q4)
-
-An audit of what the case reader asked for against what OpenFOAM v2412 asks for found the RAS model's keys under the
-incompressible names (`laplacian(DkEff,k)` where the compressible kOmegaSST asks `laplacian((rho*DkEff),k)`;
-`laplacian(alphahe,e)` where RAS asks `laplacian(alphaEff,e)`), linearUpwind's named gradient never looked up,
-`relaxationFactors` for k and omega never read, `decayControl` never read, and the diagonal solves refusing any solver
-name but `diagonal`. MEASURED on jet_sst against OpenFOAM's own runs: linearUpwind's gradient left unlimited moves
-OpenFOAM's nut 3.6e-01 at 5e-06 s (1.2e+06 x the gate's bound), and the k/omega relaxation left out moves its k 5.6e-01
-at 1e-05 s; brae with both now sits within 2e-04 of the bound, every one of 45,648 solves at OpenFOAM serial's
-iteration count. `interpolationSchemes { default linear; }` -- the density-based tutorials' usual block -- is
-reconstructed linearly now (limiter 1, kLinearReconTwoByk) and holds shockTube at 1e-14 of OpenFOAM over 30 fixed
-steps. fvSchemes lookups go through one OpenFOAM-faithful resolver (compressibleRAS::ofSchemeStatement: literal, last
-matching pattern, default). Evidence: tests/rho_central_keys_vs_openfoam.sh, tests/rho_central_keys_refusals.sh;
-RELEASE.md sec. 6b lists the behaviour changes.
