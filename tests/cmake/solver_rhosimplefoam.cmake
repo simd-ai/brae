@@ -1294,8 +1294,14 @@ add_test(NAME rho_default_refusals COMMAND ${PROJECT_SOURCE_DIR}/tests/rho_defau
 set_tests_properties(rho_default_refusals PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 900)
 # The energy equation relaxed only by its own name, a `default` or a matching pattern, as OpenFOAM: rhoBox at
 # t=1..5 against OpenFOAM, five relaxationFactors forms, every linear solver pinned.
+# Both codes run U, h and e with the solver brae's default driver runs as OpenFOAM does, so the comparison isolates
+# the relaxation...
 add_test(NAME rho_energy_relax_vs_openfoam COMMAND ${PROJECT_SOURCE_DIR}/tests/rho_energy_relax_vs_openfoam.sh)
-set_tests_properties(rho_energy_relax_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+set_tests_properties(rho_energy_relax_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 ENVIRONMENT "SOLVERS=matched")
+# ...and the same arms as the fixture ships them (DILU asked, a diagonal preconditioner run): the default driver as
+# a user meets it, and the preconditioner difference, held to the same bounds.
+add_test(NAME rho_default_energy_shipped_vs_openfoam COMMAND ${PROJECT_SOURCE_DIR}/tests/rho_energy_relax_vs_openfoam.sh)
+set_tests_properties(rho_default_energy_shipped_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 ENVIRONMENT "SOLVERS=shipped")
 # pRefPoint located as OpenFOAM's findCell (rhoBoxP with a reference) and a non-integer endTime, against OpenFOAM.
 add_test(NAME rho_default_controls_vs_openfoam COMMAND ${PROJECT_SOURCE_DIR}/tests/rho_default_controls_vs_openfoam.sh)
 set_tests_properties(rho_default_controls_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 600)

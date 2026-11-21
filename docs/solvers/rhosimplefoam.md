@@ -128,7 +128,9 @@ directory holding a NaN, an Inf or a negative temperature (`BRAE_ALLOW_NONFINITE
 - **The energy equation is no longer relaxed by a default 0.7** when `relaxationFactors/equations` names
   neither the energy field (`h` or `e`, whichever the case solves, regex keys included) nor `default`; the
   other energy name no longer counts. OpenFOAM does not relax the equation then. No v2412 tutorial and no
-  brae fixture is affected (they all name their own field). Gate: `rho_energy_relax_vs_openfoam`.
+  brae fixture is affected (they all name their own field). Gates: `rho_energy_relax_vs_openfoam` (U, h and e solved
+  with GaussSeidel in both codes, so only the relaxation differs) and `rho_default_energy_shipped_vs_openfoam` (the
+  fixture as shipped, whose DILU brae's default driver runs as a diagonal preconditioner).
 - **`pRefPoint` is honoured** (it pinned cell 0). Gate: `rho_default_controls_vs_openfoam`.
 - **`endTime` is a scalar** (it was truncated to an integer): `endTime 4.7` runs 5 iterations, as OpenFOAM.
 - **`transonic true|on|y|t|1` and `consistent true|on|y|t|1`** run the branch they name (only `yes` did).
@@ -137,7 +139,8 @@ directory holding a NaN, an Inf or a negative temperature (`BRAE_ALLOW_NONFINITE
   `phi` included, is written at `writePrecision` (OpenFOAM's default 6), where the driver wrote 12 digits
   (`phi` 17) whatever the case said. The solution is unchanged: a case written at `writePrecision 12` writes
   the same bytes as before, `phi` excepted. Gate: `rho_default_restart_vs_openfoam`.
-- **Divergence stop**, as above. Gate: `rho_default_nonfinite_refusal`.
+- **Divergence stop**, as above. Gate: `rho_default_nonfinite_refusal`, which provokes every stop with a controlled
+  injection (`BRAE_TEST_CORRUPT`) rather than a case that diverges on one GPU and not on another.
 
 ## Known limitation
 
