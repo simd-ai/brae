@@ -9,6 +9,20 @@ target_link_libraries(test_forces PRIVATE brae_core)
 add_test(NAME forces
          COMMAND test_forces ${PROJECT_SOURCE_DIR}/validation/pitzDaily282 282)
 
+# The forces face integration's two paths, one block a patch (the default) and face-parallel (BRAE_FORCES_FACE_PARALLEL=1),
+# bit for bit in one build: every patch's sums and the object's totals on pitzDaily's patches and on adversarial run lengths;
+# its control (one run added in reverse) must be seen. Two arms, as the variable is read once a process: unset, where a
+# solver's call must take the default and allocate nothing new, and 1, where it must take the face-parallel path.
+add_executable(test_forces_face_parallel ${PROJECT_SOURCE_DIR}/tests/test_forces_face_parallel.cu)
+target_include_directories(test_forces_face_parallel PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_forces_face_parallel PRIVATE brae_core)
+add_test(NAME forces_face_parallel
+         COMMAND test_forces_face_parallel ${PROJECT_SOURCE_DIR}/validation/pitzDaily282 282 default)
+add_test(NAME forces_face_parallel_optin
+         COMMAND test_forces_face_parallel ${PROJECT_SOURCE_DIR}/validation/pitzDaily282 282 optin)
+set_tests_properties(forces_face_parallel PROPERTIES ENVIRONMENT_MODIFICATION "BRAE_FORCES_FACE_PARALLEL=unset:")
+set_tests_properties(forces_face_parallel_optin PROPERTIES ENVIRONMENT "BRAE_FORCES_FACE_PARALLEL=1")
+
 # The _cpp reference for UEqn.H, validated by decomposition against the same OpenFOAM momentum dump:
 # core vs OpenFOAM, then the dev2 term's effect isolated, then relaxation, then the MRF/fvOptions refusals.
 # The CUDA UEqn against the _cpp reference, field by field (decomposed: diag/upper/lower, the three

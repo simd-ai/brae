@@ -17,6 +17,15 @@
 // the same bits on every run (no atomics), and the caller adds the patches in order, as OpenFOAM does. A face's
 // terms are not stored: on the official DrivAer's car (millions of faces) twelve doubles a face would be hundreds
 // of MB for twelve numbers.
+//
+// THE FACE-PARALLEL INTEGRATION (opt-in: BRAE_FORCES_FACE_PARALLEL=1). On a large patch the walk above is the whole
+// cost: a 298,024-face patch is 1,165 faces a thread, 4.57 ms on one SM of a GH200. The opt-in path makes the same
+// sums with the GPU's width: one thread a face computes its twelve terms, rounded as the walk rounds them; one thread
+// a (run, term) adds a run's terms in face order from 0.0, over the same 256 runs; and the same tree adds the runs.
+// Every sum keeps its bits (tests/test_forces_face_parallel.cu compares the two paths bit for bit). The terms are held
+// for at most 2^19 faces at a time (96 bytes a face, 48 MiB); a larger selection goes in chunks, each run carrying its
+// partial sums across, which changes no addition. The variable is read once, at the first call: unset, empty or 0
+// keeps the walk, 1 takes the face-parallel path (said once on stdout), and any other value is refused.
 #include "cf_types.cuh"
 #include "device_buffer.cuh"
 
@@ -34,6 +43,23 @@ struct DeviceForceFaces
     DeviceBuffer<label> bnd;           // each face's place in the solver's boundary arrays (non-coupled patches, in order)
     DeviceBuffer<scalar> Sf;           // 3 a face
     DeviceBuffer<scalar> Cf;           // 3 a face
+    // the face-parallel path's device scratch (forces_device.cu), made at its first call and kept with the selection, so
+    // that a call allocates and uploads nothing: the offsets as uploaded, the chunk's terms, the runs' and patches' sums.
+    // The default path leaves them empty
+    mutable std::vector<int> patchOffsetOnDevice;
+    mutable DeviceBuffer<int> dPatchOffset;
+    mutable DeviceBuffer<double> terms;
+    mutable DeviceBuffer<double> runSums;
+    mutable DeviceBuffer<double> sums;
+};
+
+// Which integration a call takes. The solvers leave it to the environment (BRAE_FORCES_FACE_PARALLEL); the test names
+// each path, to compare the two within one build
+enum class ForceIntegration
+{
+    environment,
+    patchBlocks,
+    faceParallel
 };
 
 // The fields a face integration reads, device pointers in the solver's own layouts.
@@ -54,7 +80,15 @@ struct DeviceForceFields
     vector origin{0, 0, 0};
     // TEST CONTROL BRAE_CONTROL_FORCES_GRAD_CELL (false): the cell's gradient at the face, without gaussGrad's boundary correction
     bool correctGrad = true;
+    ForceIntegration integration = ForceIntegration::environment;
+    // TEST CONTROL (tests/test_forces_face_parallel.cu, false): on the face-parallel path, the largest patch's first run added
+    // in reverse face order. Refused on the patch-block path, which has no such run to reverse
+    bool controlReverseRun = false;
 };
+
+// BRAE_FORCES_FACE_PARALLEL as read at the first call (true: 1). For a test that has to prove which path the environment
+// selects; a value other than unset, empty, 0 or 1 is refused here
+bool forcesFaceParallelSelected();
 
 // Per selected patch, twelve sums in order: fP (3), fV (3), mP (3), mV (3). Host vector of 12*patches.
 std::vector<double> deviceForcePatchSums(
