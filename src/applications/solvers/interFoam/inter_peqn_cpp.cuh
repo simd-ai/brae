@@ -224,12 +224,15 @@ struct PressureSolveControls
     scalar relTolP = 0;
     // lduMatrix::defaultMaxIter (lduMatrix.H:125)
     int maxIterP = 1000;
+    // the entry's minIter (InterFields::PressureLinearSolve::minIter); 0 when it names none
+    int minIterP = 0;
     // `solver PCG; preconditioner DIC;` -> brae::pcg
     bool pcgDIC = false;
     // ...and solvers/p_rghFinal for the last. See InterFields::pSolve for why there are two.
     scalar tolPFinal = 1e-7;
     scalar relTolPFinal = 0;
     int maxIterPFinal = 1000;
+    int minIterPFinal = 0;
     bool pcgDICFinal = false;
     // `solver GAMG;` -> brae::gamgSolve with that entry's controls; null on an entry that names
     // another solver. The hierarchy is the MESH's, built on the first GAMG solve from whichever

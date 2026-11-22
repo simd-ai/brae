@@ -6,6 +6,7 @@
 #include "fvm.cuh"
 #include "inter_peqn_cpp.cuh"
 #include "pcg.cuh"
+#include <algorithm>
 #include <cstdlib>
 #include <optional>
 #include <stdexcept>
@@ -242,7 +243,7 @@ void correctPhi(
                 ? c.devicePass(asked, *in.rAUf, phi, pcorr, needReference, nonOrthDc, m, g, patches,
                                s.gamg.tolerance, s.gamg.relTol, s.gamg.maxIter, s.gamg.minIter, spd, hostMatrix)
                 : c.devicePass(asked, *in.rAUf, phi, pcorr, needReference, nonOrthDc, m, g, patches, s.tol,
-                               s.relTol, s.maxIter, 0, spd, hostMatrix);
+                               s.relTol, s.maxIter, s.minIter, spd, hostMatrix);
             if (taken && in.solveLog)
             {
                 in.solveLog->push_back(
@@ -323,7 +324,8 @@ void correctPhi(
             solved = s.gamgSolver()
                 ? c.amgPcgSolve(asked, pe, pcorr.internal, m, g, patches, s.gamg.tolerance, s.gamg.relTol,
                                 s.gamg.maxIter, s.gamg.minIter, sp)
-                : c.amgPcgSolve(asked, pe, pcorr.internal, m, g, patches, s.tol, s.relTol, s.maxIter, 0, sp);
+                : c.amgPcgSolve(asked, pe, pcorr.internal, m, g, patches, s.tol, s.relTol, s.maxIter, s.minIter,
+                                sp);
         }
         if (!solved)
         {
@@ -344,7 +346,7 @@ void correctPhi(
                     s.tol,
                     s.relTol,
                     s.maxIter,
-                    0,
+                    s.minIter,
                     s.gamgPrecond,
                     nullptr);
             }
@@ -367,7 +369,16 @@ void correctPhi(
             }
             else if (s.pcgDIC())
             {
-                sp = pcg(pe, pcorr.internal, m, patches, s.tol, s.relTol, s.maxIter);
+                // minIter ON AN EXACTLY ZERO SYSTEM -- the first pass of every case whose flux starts
+                // divergence-free (a case at rest), where pcorr, its patch values and the source are all 0.
+                // OpenFOAM's PCG enters its loop for minIter, finds wApA = 0 and breaks on
+                // checkSingularity (PCG.C:169-170) with 0 iterations and pcorr untouched. brae's host pcg
+                // (OpenFOAM/matrices/pcg.cu, shared) carries no singularity test and divides 0 by 0 there,
+                // so on that system it is called without the floor: the same 0 iterations and the same
+                // untouched pcorr. Any other system takes the case's minIter.
+                const bool zeroSystem = pcorrIsZero
+                    && std::all_of(pe.source.begin(), pe.source.end(), [](scalar v) { return v == scalar(0); });
+                sp = pcg(pe, pcorr.internal, m, patches, s.tol, s.relTol, s.maxIter, zeroSystem ? 0 : s.minIter);
             }
             else
             {

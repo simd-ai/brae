@@ -1,6 +1,7 @@
 // brae's interFoam time loop -- see inter_driver_cpp.cuh for why the driver owns no numerics and for
 // the four old-time fields that are its actual content.
 #include <optional>
+#include "check_setup.cuh"
 #include <filesystem>
 #include "inter_phase_time.cuh"
 #include "inter_driver_cpp.cuh"
@@ -882,6 +883,12 @@ RunReport runInterFoam(
     {
         pBFrozen = staticPressureBoundary(f.p_rgh, f.rhoBnd, f.ghfBoundary);
     }
+    // `brae check --setup`: every start-up refusal above has run; stop before the first step
+    if (cli::checkSetupDone("interFoam (host loop)"))
+    {
+        rep.setupOnly = true;
+        return rep;
+    }
     for (label step = 0; step < nSteps; ++step)
     {
         // Time::run() (Time.C:1000), and it sits HERE -- above CourantNo.H and setDeltaT.H -- so the
@@ -919,6 +926,14 @@ RunReport runInterFoam(
                     // recomputed -- OpenFOAM's two #includes build it twice, which is the one place
                     // this driver deliberately differs and it changes no number.
                     rep.alphaCoNum = alphaCourantNo(sumPhi, f.alpha1.internal, g.V(), rep.deltaT).CoNum;
+                    // the divergence stop's first half (divergenceMessage): an overflowing flux traps
+                    // OpenFOAM inside CourantNo.H; here the reduction itself comes out non-finite
+                    if (!std::isfinite(rep.CoNum) || !std::isfinite(rep.alphaCoNum))
+                    {
+                        throw std::runtime_error(divergenceMessage(
+                            {NonFiniteField{"the Courant number", 1}}, rep.time, rep.steps + 1,
+                            "from the flux the last step left"));
+                    }
                     break;
                 }
                 case Stage::alphaCourantNo:  break;    // computed above, from the same sumPhi
@@ -1809,10 +1824,12 @@ RunReport runInterFoam(
                     psc.tolP = ptol ? std::atof(ptol) : f.pSolve.tol;
                     psc.relTolP = ptol ? scalar(0) : f.pSolve.relTol;
                     psc.maxIterP = f.pSolve.maxIter;
+                    psc.minIterP = f.pSolve.minIter;
                     psc.pcgDIC = f.pSolve.pcgDIC();
                     psc.tolPFinal = ptol ? std::atof(ptol) : f.pSolveFinal.tol;
                     psc.relTolPFinal = ptol ? scalar(0) : f.pSolveFinal.relTol;
                     psc.maxIterPFinal = f.pSolveFinal.maxIter;
+                    psc.minIterPFinal = f.pSolveFinal.minIter;
                     psc.pcgDICFinal = f.pSolveFinal.pcgDIC();
                     // GAMG where the entry names it, at the same stopping point as the lines above
                     GamgControls gamgP = f.pSolve.gamg;
@@ -1922,6 +1939,37 @@ RunReport runInterFoam(
                     break;
                 }
                 case Stage::write:
+                    // the divergence stop's second half (divergenceMessage): the solved fields as the step
+                    // left them, before runTime.write() can put a non-finite value on disk
+                    {
+                        std::vector<NonFiniteField> bad;
+                        auto note = [&](const std::string& name, long n)
+                        {
+                            if (n > 0) bad.push_back(NonFiniteField{name, n});
+                        };
+                        note(f.alphaName, countNonFinite(f.alpha1.internal));
+                        note("U", countNonFinite(f.U.internal));
+                        note("p_rgh", countNonFinite(f.p_rgh.internal));
+                        note("phi", countNonFinite(f.phi.internal));
+                        if (f.turbulence.on)
+                        {
+                            note("k", countNonFinite(f.turbulence.k.internal));
+                            if (f.turbulence.model == InterRasModel::KOmegaSST)
+                            {
+                                note("omega", countNonFinite(f.turbulence.omega.internal));
+                            }
+                            else if (f.turbulence.model == InterRasModel::KEpsilon)
+                            {
+                                note("epsilon", countNonFinite(f.turbulence.epsilon.internal));
+                            }
+                            note("nut", countNonFinite(f.turbulence.nut.internal));
+                        }
+                        if (!bad.empty())
+                        {
+                            throw std::runtime_error(divergenceMessage(bad, rep.time, rep.steps,
+                                                                       "at the end of the step"));
+                        }
+                    }
                     // runTime.write() (interFoam.C:175): the stored state, nothing re-evaluated
                     if (writer && writeNow)
                     {

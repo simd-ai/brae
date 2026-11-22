@@ -515,7 +515,9 @@ scalar deviceInterPressureStep(
             const scalar tol = gamg ? gamg->tolerance : sv.tol;
             scalar relTol = gamg ? gamg->relTol : sv.relTol;
             const int maxIter = oneIteration ? 1 : (gamg ? gamg->maxIter : sv.maxIter);
-            const int minIter = gamg ? gamg->minIter : 0;
+            // the entry's own minIter: GAMG's from its controls, any other entry's from the PCG level's
+            // (lduMatrix::solver::readControls, lduMatrixSolver.C:195-205) -- this read 0 for every one but GAMG
+            const int minIter = gamg ? gamg->minIter : sv.minIter;
             // the fast path's knobs (amgPcgKnobs); the graph not across a coupled pair
             const AmgPcgKnobs& knobs = amgPcgKnobs();
             // a non-final solve the Final one follows, on an entry that names PCG with DIC, stops at the knob's
@@ -627,7 +629,7 @@ scalar deviceInterPressureStep(
             DeviceGamgHierarchy& hierarchy =
                 in.gamgCache->get(pcgGamg->gamg.nCellsInCoarsestLevel);
             perf = devicePcgGamgSolve(A, b, p_rgh, *in.dic, hierarchy, sv.tol, sv.relTol, sv.maxIter,
-                                      0, *pcgGamg, in.gamgLog);
+                                      sv.minIter, *pcgGamg, in.gamgLog);
         }
         else if (pcgDIC)
         {
@@ -638,13 +640,14 @@ scalar deviceInterPressureStep(
                     "schedule was handed in. Build one from the mesh with buildDeviceDilu.");
             }
             const scalar nf = deviceNormFactor(A, p_rgh, b, deviceOnes(nC));
-            perf = deviceDICPCG(A, b, p_rgh, nf, sv.tol, sv.relTol, sv.maxIter, 0, *in.dic);
+            perf = deviceDICPCG(A, b, p_rgh, nf, sv.tol, sv.relTol, sv.maxIter, sv.minIter, *in.dic);
         }
         else
         {
             DeviceBuffer<scalar> dNf;
             deviceNormFactorInto(A, p_rgh, b, deviceOnes(nC), dNf);
-            perf = deviceJacobiBiCGStab(A, b, p_rgh, dNf.data(), sv.tol, sv.relTol, sv.maxIter);
+            perf = deviceJacobiBiCGStab(A, b, p_rgh, dNf.data(), sv.tol, sv.relTol, sv.maxIter,
+                                        /*checkEvery=*/1, sv.minIter);
         }
         if (in.solveLog)
         {

@@ -60,7 +60,16 @@ what="[device] single-precision cycle, the first sweep from zero: $(differs s_be
 what="$what the same iterations"
 same s_before s_zero && [ "$(differs d_zero s_zero)" != 0 ] && say "$what" ok || say "$what" FAIL
 n=$(differs d_before d_stale)
-what="CONTROL  a cycle started from the last one's x: $n written files change, the iterations do too"
-[ "$(cat "$W/fz_d_stale/exit.txt")" = 0 ] && [ "$n" != 0 ] && [ "$(its d_stale)" != "$(its d_before)" ] \
-    && say "$what" ok || say "$what" FAIL
+# The stale cycle drives the solution non-finite in step 1. Before the divergence stop it ran on to endTime writing
+# NaN (exit 0); with the stop it ends there by name, exit 1, nothing written (MEASURED on bae3d44a, GB10 and GH200).
+# Either way the defect cannot pass as the sweep it replaces: it changes what is written and the iterations, or
+# the run is stopped as diverged.
+if [ "$(cat "$W/fz_d_stale/exit.txt")" = 0 ]; then
+    what="CONTROL  a cycle started from the last one's x: $n written files change, the iterations do too"
+    [ "$n" != 0 ] && [ "$(its d_stale)" != "$(its d_before)" ] && say "$what" ok || say "$what" FAIL
+else
+    what="CONTROL  a cycle started from the last one's x: the run is stopped as diverged, nothing written"
+    grep -aq "the solution diverged in time step" "$W/fz_d_stale/log.brae" && [ -z "$(timedirs "$W/fz_d_stale")" ] \
+        && say "$what" ok || say "$what" FAIL
+fi
 finish "the V-cycle's first sweep from zero is the sweep it replaces, in both precisions"

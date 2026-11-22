@@ -34,7 +34,10 @@
 #include "inter_peqn_cpp.cuh"
 #include "device_inter_step.cuh"
 #include "inter_writer_cpp.cuh"
+#include <cmath>
+#include <cstdio>
 #include <string>
+#include <vector>
 
 namespace brae {
 namespace cpu {
@@ -42,6 +45,9 @@ namespace interFoam {
 
 struct RunReport
 {
+    // `brae check --setup` (BRAE_CHECK_SETUP, check_setup.cuh): the loop set the case up and returned before its
+    // first step
+    bool   setupOnly    = false;
     label  steps        = 0;
     scalar time         = 0;
     scalar deltaT       = 0;
@@ -222,6 +228,73 @@ RunReport runInterFoamDevice(
     const MutableMesh* mutableMesh = nullptr,
     // the time directories, as runInterFoam writes them
     InterWriter* writer = nullptr);
+
+// THE DIVERGENCE STOP, both loops. OpenFOAM's interFoam has no divergence check of its own: where the FPU
+// traps it stops on the first floating-point exception, because etc/controlDict sets trapFpe (sigFpe.C turns on
+// FE_DIVBYZERO|FE_INVALID|FE_OVERFLOW). On aarch64 (the GB10, the GH200) nothing traps: OpenFOAM can carry the
+// NaN on to endTime and write it, or stop on reading a NaN solver residual back from its solver-performance
+// dictionary ("Wrong token type - expected scalar value, found ... word 'nan'", Scalar.C:169) -- MEASURED on
+// laminar/damBreak with `MULESCorr no` at a fixed deltaT 0.01: OpenFOAM prints its first NaN in its eighth step
+// and exits 1 there. Neither loop here had any stop: both ran to endTime writing NaN fields and printed `End:`
+// with exit 0. The stop is OpenFOAM's trapping behaviour, taken at the end of the step.
+//
+// brae cannot trap at the operation, so each loop checks where it is cheapest and still before anything
+// is written: the Courant numbers at the top of a step (the reduction CourantNo.H does anyway; an
+// overflowing flux makes them non-finite there, as it would trap OpenFOAM in CourantNo.H), and the
+// solved fields at the end of the step, ahead of runTime.write(). A field is named with how many of its
+// values are not finite. Nothing of the step is written; the run stops by name with a non-zero exit.
+struct NonFiniteField
+{
+    std::string name;
+    long        count = 0;
+};
+
+inline std::string divergenceMessage(
+    const std::vector<NonFiniteField>& bad,
+    scalar time,
+    label step,
+    const char* where)
+{
+    std::string fields;
+    for (const NonFiniteField& b : bad)
+    {
+        fields += (fields.empty() ? "" : ", ") + b.name + " (" + std::to_string(b.count) + " non-finite value"
+                + (b.count == 1 ? "" : "s") + ")";
+    }
+    char t[64];
+    std::snprintf(t, sizeof t, "%.17g", static_cast<double>(time));
+    return "the solution diverged in time step " + std::to_string(static_cast<long>(step)) + " (t = " + t + "): "
+           + fields + " " + where + ". OpenFOAM stops on the first floating-point exception where the FPU traps "
+           "it (trapFpe); brae stops here, before anything of this step is written. Reduce deltaT, or maxCo and "
+           "maxAlphaCo under adjustTimeStep, or check the case's boundary conditions, mesh and MULES controls.";
+}
+
+// count the non-finite entries of one host array, each component of a vector on its own (as the device
+// check counts U's three arrays)
+template <class T>
+long countNonFinite(const std::vector<T>& v);
+
+template <>
+inline long countNonFinite(const std::vector<scalar>& v)
+{
+    long n = 0;
+    for (scalar x : v)
+    {
+        n += std::isfinite(x) ? 0 : 1;
+    }
+    return n;
+}
+
+template <>
+inline long countNonFinite(const std::vector<vector>& v)
+{
+    long n = 0;
+    for (const vector& x : v)
+    {
+        n += (std::isfinite(x.x) ? 0 : 1) + (std::isfinite(x.y) ? 0 : 1) + (std::isfinite(x.z) ? 0 : 1);
+    }
+    return n;
+}
 
 } // namespace interFoam
 } // namespace cpu

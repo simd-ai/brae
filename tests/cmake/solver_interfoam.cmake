@@ -1096,3 +1096,19 @@ set_tests_properties(interfoam_createfields_vs_openfoam PROPERTIES
 set_tests_properties(two_phase_mixture interface_properties inter_create_fields
                      alpha_eqn_cpp mules_cpp
                      PROPERTIES SKIP_RETURN_CODE 77)
+
+# WAVE 1 / Q3: interFoam's start-up guards, its divergence stop and minIter on the pressure solves (2026-11-21).
+# Each script states which loop and which pressure solver each arm runs: the arms that hold the default GPU
+# path unset BRAE_PRESSURE_CASE_SOLVER themselves, and the case-solver arms set it, as CI does for every test.
+add_test(NAME interfoam_guards
+         COMMAND ${PROJECT_SOURCE_DIR}/tests/interfoam_guards.sh)
+add_test(NAME interfoam_divergence_vs_openfoam
+         COMMAND ${PROJECT_SOURCE_DIR}/tests/interfoam_divergence_vs_openfoam.sh)
+add_test(NAME interfoam_miniter_vs_openfoam
+         COMMAND ${PROJECT_SOURCE_DIR}/tests/interfoam_miniter_vs_openfoam.sh)
+set_tests_properties(interfoam_guards interfoam_divergence_vs_openfoam interfoam_miniter_vs_openfoam PROPERTIES
+                     ENVIRONMENT "BUILD=${PROJECT_BINARY_DIR};BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}"
+                     SKIP_RETURN_CODE 77
+                     RESOURCE_LOCK brae_gpu
+                     LABELS slow
+                     TIMEOUT 900)

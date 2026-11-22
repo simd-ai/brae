@@ -163,6 +163,14 @@
 // `residualControl` beyond one outer corrector, where OpenFOAM would leave the outer correctors early
 // (tests/interfoam_write/refusal/pimple_residual_control.sh).
 //
+// AND, SINCE 2026-11-21 (tests/interfoam_guards.sh): a condition type the writer has no branch for, refused at
+// start-up rather than at the first write time; a p0 table on totalPressure or uniformTotalPressure; a pattern
+// key in gradSchemes, laplacianSchemes or snGradSchemes that a reader here would resolve otherwise than
+// OpenFOAM; a one-line interpolationSchemes block naming anything but linear; a PIMPLE entry OpenFOAM's interFoam
+// reads and the case reader does not; and on -device, vanLeerV/limitedLinearV beside a cellLimited grad(U). A run
+// whose fields go non-finite stops by name before writing them (tests/interfoam_divergence_vs_openfoam.sh), and
+// the unread entries of fvSolution, turbulenceProperties and fvSchemes are named as `[unread]` notices.
+//
 // THAT LIST WAS NOT TRUE when it was written: MRF and fvOptions were named here and refused nowhere,
 // and a moving or refining mesh was not even named. brae was run over all 44 shipped tutorials and the
 // ones that reached `End:` were counted -- two did that should not have, both on `dynamicRefineFvMesh`.
@@ -402,6 +410,10 @@ int main(int argc, char** argv)
                            /*fieldsOut=*/nullptr, endTime, /*pressureTaps=*/nullptr, &mutableMesh,
                            /*alphaTaps=*/nullptr, &writer);
 
+        if (r.setupOnly)
+        {
+            return 0;   // `brae check --setup`: the loop said what it set up (check_setup.cuh)
+        }
         if (r.steps >= nSteps && r.time < endTime - scalar(0.5)*r.deltaT)
         {
             throw std::runtime_error(

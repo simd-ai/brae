@@ -1021,6 +1021,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
         const scalar tol = finalInner ? sc.tolPFinal : sc.tolP;
         const scalar relTol = finalInner ? sc.relTolPFinal : sc.relTolP;
         const int maxIter = finalInner ? sc.maxIterPFinal : sc.maxIterP;
+        const int minIter = finalInner ? sc.minIterPFinal : sc.minIterP;
         const GamgControls* gamgCtl = finalInner ? sc.gamgFinal : sc.gamg;
         const GamgPreconditionerControls* pcgGamgCtl = finalInner ? sc.pcgGamgFinal : sc.pcgGamg;
         SolverPerformance sp;
@@ -1033,7 +1034,7 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
                     "brae interFoam pEqn: the case names a GAMG preconditioner for p_rgh and the caller "
                     "handed in no agglomeration cache. The hierarchy is the mesh's and has to outlive the step.");
             }
-            sp = pcgGamgSolve(pe, p_rgh.internal, m, g, patches, *sc.gamgCache, tol, relTol, maxIter, 0,
+            sp = pcgGamgSolve(pe, p_rgh.internal, m, g, patches, *sc.gamgCache, tol, relTol, maxIter, minIter,
                               *pcgGamgCtl, in.gamgLog);
         }
         else if (gamgCtl)
@@ -1058,11 +1059,11 @@ void pressureCorrector(GeometricField<scalar>&      p_rgh,
             {
                 jumps[pi] = p_rgh.boundary[pi]->coupledJump();
             }
-            sp = pcg(pe, p_rgh.internal, m, patches, tol, relTol, maxIter, 0, &jumps);
+            sp = pcg(pe, p_rgh.internal, m, patches, tol, relTol, maxIter, minIter, &jumps);
         }
         else
         {
-            sp = pbicgstab(pe, p_rgh.internal, m, patches, tol, relTol, maxIter);
+            sp = pbicgstab(pe, p_rgh.internal, m, patches, tol, relTol, maxIter, minIter);
         }
         if (in.solveLog)
         {

@@ -1,5 +1,6 @@
 // interFoam's turbulence, the host reference. See inter_turbulence_cpp.cuh for the two lineages.
 #include "inter_turbulence_cpp.cuh"
+#include "dict_audit.cuh"
 #include <fstream>
 #include "foam_field_reader.cuh"
 #include "cellLimitedGrad_cpp.cuh"
@@ -485,6 +486,10 @@ InterTurbulence readInterTurbulence(
             "(TurbulenceModel.C:91-102) and stops; a constant/momentumTransport is not a name v2412 reads.");
     }
     const FoamDict d = readDict(p);
+    // the unread-entry audit (dict_audit.cuh), at every return of this reader and on a refusal too (marked
+    // PARTIAL there): an entry of the file no reader below asked for is named as a `brae NOTICE [unread]`
+    DictAuditScope audit;
+    audit.add(d, "constant/turbulenceProperties");
     if (!d.found("simulationType"))
     {
         throw std::runtime_error(

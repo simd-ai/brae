@@ -4,6 +4,7 @@
 #include "time_instances.cuh"
 #include "inter_amr_cpp.cuh"
 #include "frozen_bc_guard.cuh"
+#include <regex>
 #include <sstream>
 #include "crank_nicolson_ddt_scheme_cpp.cuh"
 #include "inter_peqn_cpp.cuh"
@@ -12,7 +13,9 @@
 #include "mrf_read.cuh"   // readCellZones
 #include "read_surface_field.cuh"
 #include "scheme_parse.cuh"
+#include "dict_audit.cuh"
 #include "patch_set.cuh"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -446,6 +449,216 @@ AlphaDdt parseAlphaDdt(const std::string& entry)
     return AlphaDdt::other;                              // refused by offCentringCoeff, by name
 }
 
+// ONE NAME LOOKED UP IN ONE fvSchemes BLOCK, AS OPENFOAM LOOKS IT UP. mesh.divScheme(name) and its siblings go
+// through schemesLookup::lookupDetail::lookup (schemesLookupDetail.C:76-89): the dictionary's entry for the name,
+// and that is dictionary::csearch (dictionarySearch.C) -- the LITERAL key first, else the LAST pattern (a quoted
+// key, compiled as a regular expression) that matches the name -- else `default` when it is not `none`. The
+// readers here searched the block's TEXT for the name, which finds a literal key and never a pattern (and finds
+// the name inside a quoted key, which OpenFOAM reads as a regular expression, not as the name). `blk` is a block
+// as fvSchemesBlock hands it, comments already stripped by readFvSchemesText; the value comes back as its words
+// single-spaced, empty when nothing answers.
+struct OfSchemeLookup
+{
+    std::string value;
+    std::string key;          // the key that answered, as written
+    bool pattern = false;     // ...a quoted (regular-expression) key
+    bool viaDefault = false;
+};
+
+OfSchemeLookup ofSchemeLookup(
+    const std::string& blk,
+    const std::string& name)
+{
+    OfSchemeLookup lit, pat, def;
+    bool haveLit = false, havePat = false, haveDef = false;
+    std::size_t at = (!blk.empty() && blk[0] == '{') ? 1 : 0;
+    while (at < blk.size())
+    {
+        const std::size_t semi = blk.find(';', at);
+        if (semi == std::string::npos)
+        {
+            break;
+        }
+        std::istringstream in(blk.substr(at, semi - at));
+        at = semi + 1;
+        std::string key;
+        if (!(in >> key))
+        {
+            continue;
+        }
+        std::string words;
+        for (std::string w; in >> w;)
+        {
+            words += (words.empty() ? "" : " ") + w;
+        }
+        if (key.size() >= 2 && key.front() == '"' && key.back() == '"')
+        {
+            bool matches = false;
+            try
+            {
+                matches = std::regex_match(name, compileFoamRegex(key.substr(1, key.size() - 2)));
+            }
+            catch (...)
+            {
+            }
+            if (matches)
+            {
+                pat = OfSchemeLookup{words, key, true, false};
+                havePat = true;
+            }
+        }
+        else if (key == name)
+        {
+            lit = OfSchemeLookup{words, key, false, false};
+            haveLit = true;
+        }
+        else if (key == "default")
+        {
+            def = OfSchemeLookup{words, key, false, true};
+            haveDef = true;
+        }
+    }
+    if (haveLit) return lit;
+    if (havePat) return pat;
+    if (haveDef && def.value != "none") return def;
+    return OfSchemeLookup{};
+}
+
+// a reader's raw text without the quote a match inside a quoted key leaves in it (for a message)
+std::string unquoted(std::string t)
+{
+    t.erase(std::remove(t.begin(), t.end(), '"'), t.end());
+    return t;
+}
+
+// the same text, its words single-spaced: what two resolutions of one entry are compared by
+std::string schemeWords(const std::string& text)
+{
+    std::istringstream in(text);
+    std::string out;
+    for (std::string w; in >> w;)
+    {
+        out += (out.empty() ? "" : " ") + w;
+    }
+    return out;
+}
+
+// THE PIMPLE BLOCK, EVERY ENTRY OF IT. Each entry OpenFOAM's interFoam reads from there selects part of the
+// algorithm, so one it reads and brae does not would run another algorithm with nothing said -- the reason
+// pimpleFoam refuses such a key at start-up (dict_audit.cuh, preflightAlgorithmControls). That helper refuses
+// EVERY unread key, and OpenFOAM itself ignores the ones it never reads: laminar/waves/waveMakerFlap and
+// waveMakerPiston ship `cAlpha`, `nAlphaCorr` and `nAlphaSubCycles` in PIMPLE, which alphaControls.H reads from
+// solvers/<alpha> instead, and OpenFOAM runs them. So the rule here is OpenFOAM's, entry by entry, from the
+// readers interFoam includes:
+//   solutionControl::read   nNonOrthogonalCorrectors momentumPredictor transonic consistent frozenFlow
+//                           residualControl (solutionControl.C:46-108)
+//   pimpleControl::read     solveFlow nOuterCorrectors nCorrectors SIMPLErho turbOnFinalIterOnly
+//                           finalOnLastPimpleIterOnly ddtCorr (pimpleControl.C:47-55)
+//   readDyMControls.H       correctPhi checkMeshCourantNo moveMeshOuterCorrectors
+//   setRefCell              pRefCell pRefPoint pRefValue, when p_rgh needs a reference (findRefCell.C:36-110)
+//   setRDeltaT.H            maxCo maxAlphaCo rDeltaTSmoothingCoeff nAlphaSpreadIter alphaSpreadDiff alphaSpreadMax
+//                           alphaSpreadMin nAlphaSweepIter rDeltaTDampingCoeff maxDeltaT, under localEuler only
+// An entry OpenFOAM reads that changes nothing in interFoam -- transonic, consistent and SIMPLErho (no equation of
+// interFoam's consults them), solveFlow (sprayFoam.C:90 alone), ddtCorr (interFoam's pEqn.H:17 calls fvc::ddtCorr
+// unconditionally) -- is taken as read here, as OpenFOAM takes it. An entry OpenFOAM reads and the case reader did
+// not is REFUSED by name. Everything else is an entry OpenFOAM does not read either; the [unread] notice of
+// auditInterDictionaries names it.
+void preflightInterPimple(
+    const FoamDict& fvSolution,
+    const InterFields& f)
+{
+    const FoamDict* pim = fvSolution.subDict("PIMPLE");
+    if (!pim)
+    {
+        return;
+    }
+    for (const char* inert : {"transonic", "consistent", "SIMPLErho", "solveFlow", "ddtCorr"})
+    {
+        pim->find(inert);
+    }
+    std::vector<std::string> read{
+        "nNonOrthogonalCorrectors", "momentumPredictor", "frozenFlow", "residualControl",
+        "nOuterCorrectors", "nCorrectors", "turbOnFinalIterOnly", "finalOnLastPimpleIterOnly",
+        "correctPhi", "checkMeshCourantNo", "moveMeshOuterCorrectors"};
+    if (f.pRef.needReference)
+    {
+        read.insert(read.end(), {"pRefCell", "pRefPoint", "pRefValue"});
+    }
+    if (f.lts)
+    {
+        read.insert(read.end(), {"maxCo", "maxAlphaCo", "rDeltaTSmoothingCoeff", "nAlphaSpreadIter", "alphaSpreadDiff",
+                                 "alphaSpreadMax", "alphaSpreadMin", "nAlphaSweepIter", "rDeltaTDampingCoeff",
+                                 "maxDeltaT"});
+    }
+    std::vector<std::string> keys;
+    for (const auto& l : pim->leaves) keys.push_back(l.first);
+    for (const auto& sb : pim->subs) keys.push_back(sb.first);
+    for (const std::string& k : keys)
+    {
+        if (pim->queried.count(k) || std::find(read.begin(), read.end(), k) == read.end())
+        {
+            continue;
+        }
+        throw std::runtime_error(
+            "brae interFoam: fvSolution's PIMPLE sets `" + k + "`, which OpenFOAM's interFoam reads and brae's case "
+            "reader does not: the run would take another algorithm than the case names. Not ported; remove the "
+            "entry to run OpenFOAM's default for it.");
+    }
+}
+
+// THE UNREAD-ENTRY AUDIT (dict_audit.cuh): every entry of fvSolution, constant/turbulenceProperties and fvSchemes
+// that no reader asked for, as `brae NOTICE [unread]` lines -- the report the other solvers print and interFoam
+// did not. It reports, it does not refuse: an entry OpenFOAM ignores too (cAlpha in PIMPLE above) is the common
+// case. fvSolution is the case reader's own object, audited here once every reader of it has run;
+// turbulenceProperties is audited by its reader (readInterTurbulence). fvSchemes is text-parsed, so it is audited
+// as auditFvSchemes does it -- whole blocks, and divSchemes per entry through divSchemesConsumed(), which the
+// interFoam readers fill below for the entries they resolve themselves.
+void auditInterDictionaries(
+    const FoamDict& fvSolution,
+    const std::string& caseDir,
+    bool displacementMotion)
+{
+    // two readers take their entries off their own copy of the file, so this object never saw the questions:
+    // `cache`'s entries are read as text by readCacheGradU (which refuses every entry but grad(U)), and a
+    // displacement motion solver reads solvers/cellDisplacement(Final) itself
+    // (displacement_laplacian_fv_motion_solver_cpp.cu:208-215)
+    if (const FoamDict* c = fvSolution.subDict("cache"))
+    {
+        for (const auto& l : c->leaves) c->find(l.first);
+        for (const auto& sb : c->subs) c->subDict(sb.first);
+    }
+    if (displacementMotion)
+    {
+        if (const FoamDict* sv = fvSolution.subDict("solvers"))
+        {
+            for (const char* k : {"cellDisplacement", "cellDisplacementFinal"})
+            {
+                if (const FoamDict* d = sv->subDict(k))
+                {
+                    for (const auto& l : d->leaves) d->find(l.first);
+                    for (const auto& sb : d->subs) d->subDict(sb.first);
+                }
+            }
+        }
+    }
+    auditDict(fvSolution, "system/fvSolution");
+    for (const char* key : {"div(rhoPhi,U)", "div(phi,alpha)", "div(phirb,alpha)"})
+    {
+        divSchemesConsumed().insert(key);
+    }
+    // the viscous stress's entry, under whatever factor the case writes in front of dev2(T(grad(U)))
+    const std::string blk = fvSchemesBlock(readFvSchemesText(caseDir), "divSchemes");
+    for (std::size_t i = blk.find("div("); i != std::string::npos; i = blk.find("div(", i + 1))
+    {
+        const std::string key = divKeyOf(blk.substr(i));
+        if (key.find("dev2(T(grad(U)))") != std::string::npos)
+        {
+            divSchemesConsumed().insert(key);
+        }
+    }
+    auditFvSchemes(caseDir);
+}
+
 // WHAT A CASE CAN ASK FOR THAT interFoam.C HONOURS AND brae DOES NOT EVEN READ. Every one of these ran
 // to completion without a word until brae was run over all 44 shipped tutorials and the ones that
 // reached `End:` were counted: laminar/damBreakWithObstacle and laminar/oscillatingBox both did, and
@@ -557,6 +770,20 @@ NonOrthScheme readNonOrthScheme(
             {
                 continue;
             }
+            // A PATTERN KEY (quoted: a regular expression to OpenFOAM, dictionarySearch.C) answers every name it
+            // matches that has no literal entry, and the field read below out of its parentheses is not a field.
+            // It fell through that test as a field the loops do not have, so the default ran under it unsaid.
+            // Which of interFoam's laplacians and snGrads it matches is not resolved here; refused.
+            if (key.size() >= 2 && key.front() == '"' && key.back() == '"')
+            {
+                throw std::runtime_error(
+                    "brae interFoam: fvSchemes `" + block + "` names the pattern " + key + " with `" + words(rest)
+                    + "` beside a default of `" + words(s.raw) + "`. OpenFOAM gives every " + block.substr(0, block.size() - 7)
+                    + " term whose name the pattern matches that scheme (the literal key first, then the last "
+                    "matching pattern, then the default); the loops take the default for every one and do not "
+                    "resolve patterns. Write the entries for interFoam's terms literally, or put the scheme in "
+                    "`default`.");
+            }
             // the field: the last argument inside the key's parentheses
             const std::size_t close = key.rfind(')');
             const std::size_t open = key.find_last_of("(,", close == std::string::npos ? close : close - 1);
@@ -638,26 +865,24 @@ void refuseUnportedInterpolationSchemes(const std::string& fvSchemesText)
 {
     const std::string blk = fvSchemesBlock(fvSchemesText, "interpolationSchemes");
     if (blk.empty()) return;                    // absent is fine: OpenFOAM's own default is linear
-    std::istringstream is(blk);
-    std::string line;
-    while (std::getline(is, line))
+    // BY STATEMENT, `<key> <scheme>;`, not by line: a block written on one line,
+    // `interpolationSchemes { default cubic; }`, was one line that began with `{` and was skipped whole, so
+    // its scheme ran as linear. Every key is checked -- a pattern key too -- since any entry that is not
+    // `linear` names an interpolation some fvc::interpolate of interFoam's could take.
+    std::size_t at = (blk[0] == '{') ? 1 : 0;
+    while (at < blk.size())
     {
-        // strip a trailing comment and the ';'
-        const std::size_t c = line.find("//");
-        if (c != std::string::npos) line = line.substr(0, c);
-        std::istringstream ls(line);
+        const std::size_t semi = blk.find(';', at);
+        if (semi == std::string::npos) break;
+        std::istringstream ls(blk.substr(at, semi - at));
+        at = semi + 1;
         std::string key;
         if (!(ls >> key)) continue;
-        if (key == "{" || key == "}" || key == "interpolationSchemes") continue;
-        std::string rest;
-        std::getline(ls, rest);
-        // the scheme is everything after the key, minus the semicolon and surrounding space
         std::string sch;
-        for (char ch : rest) { if (ch != ';') sch += ch; }
-        const std::size_t b = sch.find_first_not_of(" \t");
-        const std::size_t e = sch.find_last_not_of(" \t");
-        if (b == std::string::npos) continue;
-        sch = sch.substr(b, e - b + 1);
+        for (std::string w; ls >> w;)
+        {
+            sch += (sch.empty() ? "" : " ") + w;
+        }
         if (sch.empty() || sch == "linear") continue;
         throw std::runtime_error(
             "brae interFoam: fvSchemes `interpolationSchemes` names `" + key + " " + sch
@@ -1022,33 +1247,35 @@ InterFields buildInterFields(const std::string&          caseDir,
             std::size_t f2 = st.find_last_not_of(" \t\n\r");
             return (b == std::string::npos) ? dflt : st.substr(b, f2 - b + 1);
         };
-        const std::string uEntry = entry("div(rhoPhi,U)", "");
+        // div(rhoPhi,U) AS OPENFOAM RESOLVES IT (ofSchemeLookup): the entry, else the last matching pattern,
+        // else a `default` that is not `none`. A missing entry was refused here as having "no default to fall
+        // back to", which is not OpenFOAM's rule, and a pattern was not seen at all.
+        const OfSchemeLookup uLookup = ofSchemeLookup(div, "div(rhoPhi,U)");
+        const std::string uEntry = uLookup.value;
         if (uEntry.empty())
             throw std::runtime_error(
-                "brae interFoam: fvSchemes names no `div(rhoPhi,U)`. interFoam's momentum convection "
-                "has no default to fall back to -- every shipped tutorial names one.");
+                "brae interFoam: fvSchemes' divSchemes has no `div(rhoPhi,U)` and no default to take its place "
+                "(it is absent or `none`). UEqn.H asks for that name and OpenFOAM stops without it "
+                "(schemesLookupDetail.C:76-89).");
         f.divRhoPhiU   = parseMomentumDiv(uEntry, f.divRhoPhiUCoeff);
         // THE TWO alpha FLUX SCHEMES, each by its own name, else the block's `default`, else nothing:
         // alphaEqn.H:2-3 hands the names to fvc::flux, which asks mesh.divScheme(name), and
         // schemesLookupDetail.C:76-89 answers the named entry, then a default that is not `none`, then a
         // FatalIOError. A missing entry took `Gauss vanLeer` / `Gauss linear` here whatever the block
         // said -- vanLeer under `default Gauss linear;`, and a run where OpenFOAM stops under `default none;`.
+        // ...resolved as OpenFOAM resolves it (ofSchemeLookup), a pattern included: it used to be refused here as
+        // not resolved
         auto alphaEntry = [&](const std::string& key)
         {
-            const std::string own = entry(key, "");
-            if (!own.empty())
-            {
-                return own;
-            }
-            const std::string dflt = entry("default", "");
-            if (dflt.empty() || dflt == "none")
+            const OfSchemeLookup l = ofSchemeLookup(div, key);
+            if (l.value.empty())
             {
                 throw std::runtime_error(
                     "brae interFoam: fvSchemes' divSchemes names no `" + key + "` and has no default to take "
                     "its place. alphaEqn.H asks for that name and OpenFOAM stops without it "
-                    "(schemesLookupDetail.C:76-89); a key written as a pattern is not resolved here.");
+                    "(schemesLookupDetail.C:76-89).");
             }
-            return dflt;
+            return l.value;
         };
         f.divPhiAlpha = parseAlphaDiv(alphaEntry("div(phi,alpha)"), "div(phi,alpha)");
         f.divPhirbAlpha = parseAlphaDiv(alphaEntry("div(phirb,alpha)"), "div(phirb,alpha)");
@@ -1073,6 +1300,19 @@ InterFields buildInterFields(const std::string&          caseDir,
             else
             {
                 scheme = entry("default", "");
+            }
+            // ...and a PATTERN answering OpenFOAM's name for it (ofSchemeLookup), which the text search above
+            // does not see: refused where it names another scheme than the one taken
+            {
+                const OfSchemeLookup ol = ofSchemeLookup(div, "div(((rho*nuEff)*dev2(T(grad(U)))))");
+                if (ol.pattern && ol.value != schemeWords(scheme))
+                {
+                    throw std::runtime_error(
+                        "brae interFoam: fvSchemes' divSchemes answers the viscous stress's explicit half, "
+                        "`div(((rho*nuEff)*dev2(T(grad(U)))))`, through the pattern " + ol.key + " (`" + ol.value
+                        + "`), and brae's reader takes `" + schemeWords(scheme) + "`; it does not resolve patterns. "
+                        "Write the entry literally.");
+                }
             }
             std::vector<std::string> tok;
             {
@@ -1526,6 +1766,7 @@ InterFields buildInterFields(const std::string&          caseDir,
             s.tol = d.scalarOr("tolerance", scalar(1e-6));
             s.relTol = d.scalarOr("relTol", scalar(0));
             s.maxIter = static_cast<int>(d.scalarOr("maxIter", scalar(1000)));
+            s.minIter = static_cast<int>(d.scalarOr("minIter", scalar(0)));
             // a `preconditioner { preconditioner <name>; ... }` sub-dictionary: lduMatrix::
             // preconditioner::New reads the name from inside it and hands the preconditioner THAT
             // dictionary as its controls (lduMatrixPreconditioner.C). A GAMG one is a GAMGSolver
@@ -1757,6 +1998,37 @@ InterFields buildInterFields(const std::string&          caseDir,
     }
     const FieldData<scalar> prghData = readField<scalar>(startDir + "/p_rgh");
     refuseFrozenPerStepBC(prghData, "p_rgh", "interFoam", /*codedMaintained=*/false);
+    // A p0 THAT IS A TABLE OF TIME. The shared reader takes `p0 table (...)` for both total-pressure
+    // conditions (foam_field_reader.cuh, setP0Table) and seeds p0 with its value at t = 0; the solvers that
+    // refresh it per step do so in their own drivers, and neither interFoam loop does -- so the run held p0
+    // at table(0) for good. OpenFOAM's uniformTotalPressure samples its p0 Function1 at every updateCoeffs
+    // (uniformTotalPressureFvPatchScalarField.C:149); its totalPressure reads p0 as a FIELD
+    // (totalPressureFvPatchScalarField.C:67) and stops on a table. Both refused here, before the first step.
+    for (const PatchFieldData<scalar>& b : prghData.boundary)
+    {
+        if (!b.hasP0Function1)
+        {
+            continue;
+        }
+        if (b.type == "totalPressure")
+        {
+            throw std::runtime_error(
+                "brae interFoam: p_rgh on patch `" + b.name + "` is totalPressure with `p0` given as a table. "
+                "OpenFOAM's totalPressure reads p0 as a field, `uniform <value>` or a nonuniform list "
+                "(totalPressureFvPatchScalarField.C:67), and stops on a table; brae would have held p0 at the "
+                "table's first value for the whole run. For a p0 that varies in time OpenFOAM has "
+                "uniformTotalPressure, which interFoam does not carry yet; give totalPressure a constant p0.");
+        }
+        if (b.type == "uniformTotalPressure")
+        {
+            throw std::runtime_error(
+                "brae interFoam: p_rgh on patch `" + b.name + "` is uniformTotalPressure with a p0 table. "
+                "OpenFOAM samples that p0 at the current time at every updateCoeffs "
+                "(uniformTotalPressureFvPatchScalarField.C:149); neither interFoam loop refreshes it, so the run "
+                "would hold p0 at its start value. Not ported for interFoam yet; a constant total pressure runs "
+                "as `totalPressure` with `p0 uniform <value>`.");
+        }
+    }
     f.p_rgh  = buildField<scalar>(prghData, patches, nC);
     f.alpha1.evaluateBoundary();
     // alpha2 IS CONSTRUCTED HERE, as 1.0 - alpha1 (twoPhaseMixture.C:55-64): its patch values are alpha1's as
@@ -1810,6 +2082,74 @@ InterFields buildInterFields(const std::string&          caseDir,
                                        f.laplacianScheme.limitCoeff,
                                        patches, nC, &m, &g, &sharedWallDist,
                                        f.pimple.nOuterCorrectors, f.pimple.turbOnFinalIterOnly);
+    // THE GRADIENTS' PATTERN KEYS. Every gradient the loops take is looked up by the shared readers
+    // (parseFieldGradScheme, parseNamedGradScheme), which find a name's literal key in the block's text and
+    // else take `default` -- never a pattern, and a name found inside a quoted key as if it were that key.
+    // OpenFOAM resolves the same names through the dictionary (ofSchemeLookup). Each name this run resolves
+    // is looked up both ways here and a disagreement in what the scheme IS -- base gradient, limiter and its
+    // coefficient -- is refused by name, rather than run the default (or the quoted entry) under it.
+    {
+        const std::string gradBlk = fvSchemesBlock(readFvSchemesText(caseDir), "gradSchemes");
+        std::vector<std::pair<std::string, FieldGradScheme>> asked;
+        auto askField = [&](const std::string& field)
+        {
+            asked.emplace_back("grad(" + field + ")", parseFieldGradScheme(caseDir, field));
+        };
+        askField("U");
+        askField(f.alphaName);
+        askField("alpha." + f.mixture.phase2Name);
+        askField("p_rgh");
+        askField("pcorr");
+        askField("rho");
+        asked.emplace_back("nHat", parseNamedGradScheme(caseDir, "nHat"));
+        if (f.divRhoPhiU == DivScheme::limitedLinear)
+        {
+            askField("magSqr(U)");
+        }
+        if (f.turbulence.on)
+        {
+            askField("k");
+            std::vector<std::string> transported{"k"};
+            if (f.turbulence.model == InterRasModel::KEpsilon) transported.push_back("epsilon");
+            if (f.turbulence.model == InterRasModel::KOmegaSST) transported.push_back("omega");
+            for (std::size_t i = 1; i < transported.size(); ++i) askField(transported[i]);
+            // ...and the gradient a RAS closure's `Gauss linearUpwind <name>` names (readLinearUpwind)
+            if (f.turbulence.model != InterRasModel::KEqnLES)
+            {
+                for (const std::string& fld : transported)
+                {
+                    const FieldDivScheme ds = parseFieldDivScheme(
+                        caseDir, fld, false, f.turbulence.variableDensity ? "rhoPhi" : "phi");
+                    if (ds.linearUpwind && !ds.luGradName.empty())
+                    {
+                        asked.emplace_back(ds.luGradName, parseNamedGradScheme(caseDir, ds.luGradName));
+                    }
+                }
+            }
+        }
+        for (const auto& a : asked)
+        {
+            const OfSchemeLookup ol = ofSchemeLookup(gradBlk, a.first);
+            if (ol.value.empty())
+            {
+                continue;   // no entry and no default: the shared reader has already refused that
+            }
+            FieldGradScheme of;
+            of.raw = ol.value;
+            classifyGradScheme(of);
+            const FieldGradScheme& br = a.second;
+            if (of.gaussLinear != br.gaussLinear || of.leastSquares != br.leastSquares
+             || of.cellLimitK != br.cellLimitK || of.unsupportedLimiter != br.unsupportedLimiter)
+            {
+                throw std::runtime_error(
+                    "brae interFoam: fvSchemes' gradSchemes resolves `" + a.first + "` to `" + ol.value + "` through "
+                    + (ol.pattern ? "the pattern " : "the entry ") + ol.key + " (the literal key first, then the "
+                    "last matching pattern, then `default`, as OpenFOAM's dictionary lookup does), and brae's "
+                    "reader to `" + schemeWords(unquoted(br.raw)) + "`. brae's gradient readers do not resolve patterns. "
+                    "Write the gradient's entry literally, or put the scheme in `default`.");
+            }
+        }
+    }
     // ...AND THE CLOSURE'S OWN ddt NAMES, which it carries under U's scheme. The model calls
     // fvm::ddt(alpha, rho, k) with geometricOneField alpha, so the name is `ddt(k)` in the uniform lineage and
     // `ddt(rho,k)` under `density variable` (fvmDdt.C:128-150), and likewise for epsilon or omega.
@@ -2395,6 +2735,8 @@ InterFields buildInterFields(const std::string&          caseDir,
     // ...and now that rhoPhi exists, the patches that NAME it learn it
     pushFluxToPatches(f, patches);
 
+    preflightInterPimple(fvSolution, f);
+    auditInterDictionaries(fvSolution, caseDir, f.dynamicMesh && f.dynamicMesh->displacementSolver());
     return f;
 }
 
