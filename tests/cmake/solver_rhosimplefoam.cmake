@@ -1283,3 +1283,33 @@ add_test(NAME sensible_energy COMMAND test_sensible_energy)
 add_executable(bcoeff_compare ${PROJECT_SOURCE_DIR}/tests/bcoeff_compare.cu)
 target_include_directories(bcoeff_compare PRIVATE ${BRAE_HEADER_DIRS})
 target_link_libraries(bcoeff_compare PRIVATE brae_core)
+
+# Q1 (Wave 1): rhoSimpleFoam's DEFAULT driver (`brae -case`, no BRAE_RHOSIMPLEFOAM_MIRROR) stops running
+# what it computed differently from OpenFOAM, stops on divergence, and writes a restartable state.
+# Refusals by name (frozen per-step BCs, `expression`, rotorDisk, fvOptions windows, Maxwell, alphat types,
+# a missing alphat, Switch words on both drivers, energy maxIter/minIter, the pressure reference, deltaT and
+# endTime, mandatory thermo coefficients), each arm under `brae check --setup`, plus the Switch
+# equivalences run three iterations on both drivers. Fixtures with their mesh in the repository; no OpenFOAM.
+add_test(NAME rho_default_refusals COMMAND ${PROJECT_SOURCE_DIR}/tests/rho_default_refusals.sh)
+set_tests_properties(rho_default_refusals PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 900)
+# The energy equation relaxed only by its own name, a `default` or a matching pattern, as OpenFOAM: rhoBox at
+# t=1..5 against OpenFOAM, five relaxationFactors forms, every linear solver pinned.
+# Both codes run U, h and e with the solver brae's default driver runs as OpenFOAM does, so the comparison isolates
+# the relaxation...
+add_test(NAME rho_energy_relax_vs_openfoam COMMAND ${PROJECT_SOURCE_DIR}/tests/rho_energy_relax_vs_openfoam.sh)
+set_tests_properties(rho_energy_relax_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 ENVIRONMENT "SOLVERS=matched")
+# ...and the same arms as the fixture ships them (DILU asked, a diagonal preconditioner run): the default driver as
+# a user meets it, and the preconditioner difference, held to the same bounds.
+add_test(NAME rho_default_energy_shipped_vs_openfoam COMMAND ${PROJECT_SOURCE_DIR}/tests/rho_energy_relax_vs_openfoam.sh)
+set_tests_properties(rho_default_energy_shipped_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 ENVIRONMENT "SOLVERS=shipped")
+# pRefPoint located as OpenFOAM's findCell (rhoBoxP with a reference) and a non-integer endTime, against OpenFOAM.
+add_test(NAME rho_default_controls_vs_openfoam COMMAND ${PROJECT_SOURCE_DIR}/tests/rho_default_controls_vs_openfoam.sh)
+set_tests_properties(rho_default_controls_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 600)
+# alphat written and read back, writePrecision honoured: brae <-> OpenFOAM restarts on naca0012, the wall-Prt
+# control on rhoKE; issue #54's own-restart drift reported beside them.
+add_test(NAME rho_default_restart_vs_openfoam COMMAND ${PROJECT_SOURCE_DIR}/tests/rho_default_restart_vs_openfoam.sh)
+set_tests_properties(rho_default_restart_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)
+# The divergence stop: squareBend subsonic (OpenFOAM aborts), its BRAE_ALLOW_NONFINITE control, the residual
+# and the write-time stops shown on rhoBox with BRAE_TEST_CORRUPT, and the healthy tutorial as fail-proof.
+add_test(NAME rho_default_nonfinite_refusal COMMAND ${PROJECT_SOURCE_DIR}/tests/rho_default_nonfinite_refusal.sh)
+set_tests_properties(rho_default_nonfinite_refusal PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800)

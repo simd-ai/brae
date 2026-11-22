@@ -59,8 +59,8 @@ StepInput buildStepInput(
     in.nutWallKind         = &f.nutWallKind;
     if (!refusals.hasFvOptions && !refusals.opts.empty()) in.fvOpts = &refusals.opts;
 
-    in.consistent = simpleDict && simpleDict->wordOr("consistent", "no") == "yes";
-    in.transonic  = simpleDict && simpleDict->wordOr("transonic",  "no") == "yes";
+    in.consistent = readSimpleSwitch(simpleDict, "consistent", "rhoSimpleFoam (mirror)");   // OF Switch (rho_simple_controls.cuh)
+    in.transonic  = readSimpleSwitch(simpleDict, "transonic",  "rhoSimpleFoam (mirror)");
     // getOrDefault<label>(..., 0) -- solutionControl.C:47. The step used to solve the pressure equation
     // exactly once whatever the case named here, which on a corrected non-orthogonal case is a different
     // trajectory than OpenFOAM's (tests/rho_nonorth_corrector_vs_openfoam.sh).
@@ -620,8 +620,8 @@ int runMirror(const std::string& caseDir)
                                                   : f.rasModel.c_str())
                             : "laminar");
     std::printf("  energy '%s', consistent %s, transonic %s\n", f.heName.c_str(),
-                simpleDict && simpleDict->wordOr("consistent", "no") == "yes" ? "yes" : "no",
-                simpleDict && simpleDict->wordOr("transonic", "no") == "yes" ? "yes" : "no");
+                readSimpleSwitch(simpleDict, "consistent", "rhoSimpleFoam (mirror)") ? "yes" : "no",
+                readSimpleSwitch(simpleDict, "transonic", "rhoSimpleFoam (mirror)") ? "yes" : "no");
 
     CaseRefusals refusals;
     StepInput in = buildStepInput(caseDir, f, fvSolution, m, refusals);

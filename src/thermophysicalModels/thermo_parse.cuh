@@ -43,6 +43,31 @@ inline void thermoRequire(
         + ". (rhoSimpleFoam scope today is subsonic perfectGas.)");
 }
 
+// A coefficient OpenFOAM reads with a MANDATORY lookup: `dict.subDict(<sub>).get<scalar>(<key>)` stops with
+// a FatalIOError when either the sub-dictionary or the entry is absent. brae substituted a default for every
+// one of them (thermo_types.cuh's member initialisers: molWeight 28.9, Cp 1005, Hf 0, mu 1.8e-5, Pr 0.7,
+// As 1.4792e-6, Ts 116), so a case missing one ran a different gas and said nothing. The defaults stay in
+// ThermoCoeffs (the liquid path and the unit tests construct it bare); the case's own dictionary is held
+// to OpenFOAM's rule here, at the only place it is read.
+inline scalar thermoMandatory(
+    const FoamDict*    sub,
+    const std::string& subName,
+    const std::string& key,
+    const std::string& ofSource)
+{
+    if (!sub)
+        throw std::runtime_error(
+            "brae: constant/thermophysicalProperties has no mixture/" + subName + " dictionary. OpenFOAM "
+            "reads `" + key + "` from it with a mandatory lookup (" + ofSource + ") and stops without it; "
+            "brae used to substitute a default and run a different fluid. Add mixture/" + subName + ".");
+    if (!sub->found(key))
+        throw std::runtime_error(
+            "brae: constant/thermophysicalProperties mixture/" + subName + " has no `" + key + "`. OpenFOAM "
+            "reads it with a mandatory lookup (" + ofSource + ") and stops without it; brae used to "
+            "substitute a default and run a different fluid. Add the entry.");
+    return sub->scalarOr(key, scalar(0));
+}
+
 // rhoMin/rhoMax/pMin and the rho relaxation factor are SOLVER controls, not thermo properties, so they
 // come from fvSolution and apply to every thermo model. Shared by the gas and liquid paths rather than
 // duplicated: the liquid path needs relaxRho just as much (squareBendLiq relaxes rho), and a second copy
@@ -180,9 +205,9 @@ inline ThermoCoeffs readThermoCoeffs(const std::string& caseDir,
             "brae: constant/thermophysicalProperties has no mixture dictionary.");
     }
 
-    // specie: molWeight [kg/kmol] -> specific gas constant
+    // specie: molWeight [kg/kmol] -> specific gas constant. Mandatory (specie.C:46).
     const FoamDict* specie = mix->subDict("specie");
-    const scalar W = specie ? specie->scalarOr("molWeight", 28.9) : 28.9;
+    const scalar W = thermoMandatory(specie, "specie", "molWeight", "specie.C:46");
     if (W <= 0.0)
     {
         throw std::runtime_error("brae: mixture.specie.molWeight must be positive.");
@@ -193,30 +218,29 @@ inline ThermoCoeffs readThermoCoeffs(const std::string& caseDir,
     // enthalpy. OF's hConstThermo reads Tref/Href here too (hConstThermo.C:40-41), defaulting Tref to
     // Tstd and Href to 0 -- and Hs = Cp*(T - Tref) + Href is the he the energy equation transports, so
     // silently assuming Tref = 0 shifts he by Cp*Tstd (~3.0e5 J/kg for air).
+    // Cp and Hf are mandatory (hConstThermo.C:38-39); Tref and Href are getOrDefault (:40-41).
     c.Tref = foamTstd();
     const FoamDict* thermoDict = mix->subDict("thermodynamics");
-    if (thermoDict)
-    {
-        c.Cp   = thermoDict->scalarOr("Cp", c.Cp);
-        c.Hf   = thermoDict->scalarOr("Hf", c.Hf);
-        c.Tref = thermoDict->scalarOr("Tref", c.Tref);
-        c.Href = thermoDict->scalarOr("Href", c.Href);
-    }
+    c.Cp   = thermoMandatory(thermoDict, "thermodynamics", "Cp", "hConstThermo.C:38");
+    c.Hf   = thermoMandatory(thermoDict, "thermodynamics", "Hf", "hConstThermo.C:39");
+    c.Tref = thermoDict->scalarOr("Tref", c.Tref);
+    c.Href = thermoDict->scalarOr("Href", c.Href);
 
-    // transport: sutherland wants (As, Ts), const wants (mu, Pr). Pr lives here in both cases.
+    // transport: sutherland wants (As, Ts), const wants (mu, Pr), each with a mandatory lookup
+    // (sutherlandTransport.C:40,50-51; constTransport.C:37-38). sutherland reads NO Pr -- its alphah is the
+    // Eucken kappa/Cp -- so Pr is required under const only; under sutherland an entry is read as before
+    // and used by nothing.
     const FoamDict* transDict = mix->subDict("transport");
-    if (transDict)
+    if (c.sutherland)
     {
+        c.As = thermoMandatory(transDict, "transport", "As", "sutherlandTransport.C:40,50");
+        c.Ts = thermoMandatory(transDict, "transport", "Ts", "sutherlandTransport.C:40,51");
         c.Pr = transDict->scalarOr("Pr", c.Pr);
-        if (c.sutherland)
-        {
-            c.As = transDict->scalarOr("As", c.As);
-            c.Ts = transDict->scalarOr("Ts", c.Ts);
-        }
-        else
-        {
-            c.mu0 = transDict->scalarOr("mu", c.mu0);
-        }
+    }
+    else
+    {
+        c.mu0 = thermoMandatory(transDict, "transport", "mu", "constTransport.C:37");
+        c.Pr  = thermoMandatory(transDict, "transport", "Pr", "constTransport.C:38");
     }
 
     if (c.Cp <= 0.0 || c.Pr <= 0.0)

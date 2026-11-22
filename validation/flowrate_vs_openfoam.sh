@@ -67,6 +67,11 @@ grep -qE '^\s*rho\s+0*\.[0-9]' system/fvSolution || {
 grep -q 'flowRateInletVelocity' 0/U || {
     echo "flowrate_vs_openfoam: case no longer has a flowRateInletVelocity inlet -- gate is void"; exit 1; }
 sed -i 's/relTol *[0-9.eE-]*;/relTol 0;/g' system/fvSolution
+# The invariant below reads brae's WRITTEN phi at 1e-9. The tutorial writes 6 digits, and brae now honours
+# writePrecision as OpenFOAM does (it used to write 12 whatever the case said), so both codes write 17 here: the
+# check keeps its full strength and neither code's arithmetic changes (writePrecision only formats the output).
+sed -i 's/^writePrecision .*/writePrecision  17;/' system/controlDict
+grep -q '^writePrecision  17;' system/controlDict || { echo "flowrate_vs_openfoam: could not set writePrecision"; exit 1; }
 cp -r "$WORK" "$WORK.br"
 
 rhoSimpleFoam > log.of 2>&1 || true

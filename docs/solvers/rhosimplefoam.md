@@ -86,6 +86,62 @@ Each of these **stops at start-up, named** rather than running something else:
 - `limited 0` laplacians — a third regime that is neither `orthogonal` nor `corrected`
 - multi-GPU / distributed
 
+## The default driver (`brae -case`)
+
+Without `BRAE_RHOSIMPLEFOAM_MIRROR`, `brae -case` runs the pre-mirror driver (`gpuRhoSimpleFoam.cu`). It
+stops on a diverged run, writes `alphat`, and refuses by name, at start-up and under `brae check --setup`,
+every configuration it would compute differently from OpenFOAM.
+
+### Refused configurations
+
+| configuration | why | what to do |
+|---|---|---|
+| `codedFixedValue`, `codedMixed`, `fixedMean`, `fanPressure` on U, p, T, k, epsilon/omega or nut | built from the file `value` and never updated, where OpenFOAM recomputes them every step | not ported on this driver |
+| `uniformFixedValue` with an `expression` uniformValue | the patch stays at its `value`; OpenFOAM evaluates the expression every step | on T, run with `BRAE_RHOSIMPLEFOAM_MIRROR=cuda`, which evaluates it; elsewhere, a fixed value |
+| a `rotorDisk` fvOption | read and never applied | not ported to the compressible solver |
+| an fvOption whose `timeStart`/`duration` window does not cover every iteration of the run | the driver applies fvOptions on every iteration; OpenFOAM switches them by iteration time | remove the window, or run only the iterations inside it |
+| `laminar { model Maxwell; }` | the viscoelastic stress is not wired on this driver | not ported |
+| an `alphat` patch other than `calculated` or `compressible::alphatWallFunction` (constraint types aside), `compressible::alphatJayatillekeWallFunction` included | the driver computes `alphat = rho*nut/Prt` on every face | use `calculated` or `compressible::alphatWallFunction` |
+| a RAS case with no `0/alphat` | OpenFOAM reads it MUST_READ | add it |
+| `SIMPLE/transonic` or `SIMPLE/consistent` that is not a Switch word (both drivers) | OpenFOAM stops on it | true/false, yes/no, on/off, y/n, t/f, 1/0 |
+| `solvers/<e or h>` `maxIter` other than 1000 or `minIter` other than 0 | the energy solve does not take either entry yet | remove them, or run the mirror, which honours both |
+| p with no fixed-value patch and no `pRefCell`/`pRefPoint`, no `pRefValue`, a `pRefCell` outside the mesh, or a `pRefPoint` in no cell | OpenFOAM's `setRefCell` stops on each | give the entry; `pRefPoint` is located as OpenFOAM's `findCell` does |
+| `controlDict` without `deltaT` or `endTime` | OpenFOAM stops (or, with no `stopAt` and no `endTime`, runs nothing) | add them |
+| a missing `molWeight`, `Cp`, `Hf`, `mu` and `Pr` (const), or `As` and `Ts` (sutherland) in `thermophysicalProperties` (both drivers) | OpenFOAM reads each with a mandatory lookup | add the entry |
+| `fixedFluxPressure` on p (unchanged) | this driver never runs constrainPressure | the mirror |
+
+A run that diverges stops with `solution diverged`, naming the residual or the field, and writes no time
+directory holding a NaN, an Inf or a negative temperature (`BRAE_ALLOW_NONFINITE=1` runs on regardless).
+
+### Behaviour changes (2026-11-21)
+
+- **Refused now** (they used to run, silently differently from OpenFOAM): every configuration in the table
+  above but the last. Of the six v2412 tutorials on the default driver:
+  - **gasMixing/injectorPipe** was already refused, at its first iteration (`grad(k)`/`grad(epsilon)`
+    `leastSquares`, which the legacy kEpsilon closure does not compute); it now stops at start-up, on the
+    `minIter 1` its `solvers/"(U|e|k|epsilon)"` entry sets, which the energy solve cannot take yet. It runs on
+    `BRAE_RHOSIMPLEFOAM_MIRROR=cuda` and `=1`, as before.
+  - **squareBendLiq** was already refused at start-up (its coded `massFlowRate`); it now stops one check
+    earlier, on its wall-T `expression`. It runs on the mirror, as before.
+  - aerofoilNACA0012, angledDuctExplicitFixedCoeff, squareBend and squareBendLiqNoNewtonian run as before: no
+    stock tutorial that ran on the default driver is refused now.
+- **The energy equation is no longer relaxed by a default 0.7** when `relaxationFactors/equations` names
+  neither the energy field (`h` or `e`, whichever the case solves, regex keys included) nor `default`; the
+  other energy name no longer counts. OpenFOAM does not relax the equation then. No v2412 tutorial and no
+  brae fixture is affected (they all name their own field). Gates: `rho_energy_relax_vs_openfoam` (U, h and e solved
+  with GaussSeidel in both codes, so only the relaxation differs) and `rho_default_energy_shipped_vs_openfoam` (the
+  fixture as shipped, whose DILU brae's default driver runs as a diagonal preconditioner).
+- **`pRefPoint` is honoured** (it pinned cell 0). Gate: `rho_default_controls_vs_openfoam`.
+- **`endTime` is a scalar** (it was truncated to an integer): `endTime 4.7` runs 5 iterations, as OpenFOAM.
+- **`transonic true|on|y|t|1` and `consistent true|on|y|t|1`** run the branch they name (only `yes` did).
+- **Written files.** `alphat` is written (a RAS case), with the start file's patch types and any non-default
+  `Prt`, so OpenFOAM can restart from brae's output and brae's own restart keeps each wall's Prt. Every field,
+  `phi` included, is written at `writePrecision` (OpenFOAM's default 6), where the driver wrote 12 digits
+  (`phi` 17) whatever the case said. The solution is unchanged: a case written at `writePrecision 12` writes
+  the same bytes as before, `phi` excepted. Gate: `rho_default_restart_vs_openfoam`.
+- **Divergence stop**, as above. Gate: `rho_default_nonfinite_refusal`, which provokes every stop with a controlled
+  injection (`BRAE_TEST_CORRUPT`) rather than a case that diverges on one GPU and not on another.
+
 ## Known limitation
 
 On a **non-orthogonal mesh**, iteration-1 velocity sits 2.4e-04 to 3.1e-03 from OpenFOAM, against 1.9e-09 on an
