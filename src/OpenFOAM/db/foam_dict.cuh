@@ -261,8 +261,37 @@ inline FoamDict parseDictBody(TokenStream& ts, bool top)
         }
         else
         {
+            // A leaf ends at `;`, `}` or `{` OUTSIDE parentheses only: inside a list those are the list's own tokens, as
+            // OpenFOAM's primitiveEntry reads them (a list of dictionaries is one entry). fieldAverage's
+            // `fields ( U { mean on; } p { mean on; } nut { mean on; } );` used to end at U's `{`; the rest was parsed as
+            // entries of the function object, its `}` closed it, `p` and `nut` became function objects of their own
+            // ("functions/p: type '' is not implemented", a 66 M-cell run, 2026-11-19) and the function object's closing
+            // `}` closed `functions`, so every function object after it was dropped without a word
             std::vector<std::string> vals;
-            while (!ts.eof() && ts.peek() != ";" && ts.peek() != "}" && ts.peek() != "{") vals.push_back(ts.next());
+            int parens = 0;
+            while (!ts.eof())
+            {
+                const std::string& t = ts.peek();
+                if (parens == 0 && (t == ";" || t == "}" || t == "{"))
+                {
+                    break;
+                }
+                if (t == "(")
+                {
+                    ++parens;
+                }
+                else if (t == ")" && parens > 0)
+                {
+                    --parens;
+                }
+                vals.push_back(ts.next());
+            }
+            // an unclosed `(` has taken the rest of the file: OpenFOAM refuses the entry, and so does brae, by name, rather
+            // than read the entries after it as this one's value
+            if (parens > 0)
+            {
+                throw std::runtime_error("brae: dictionary entry '" + key + "' opens a list `(` that is not closed");
+            }
             if (!ts.eof() && ts.peek() == ";") ts.next();
             d.leaves.emplace_back(key, std::move(vals));
         }
