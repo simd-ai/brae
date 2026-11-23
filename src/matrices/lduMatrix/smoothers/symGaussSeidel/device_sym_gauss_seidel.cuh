@@ -109,6 +109,13 @@ struct GSLevelCells
 };
 void gsLevelCoefsRefresh(const DeviceLduView& A, const DeviceGaussSeidelLevels& lv, GSLevelCoefs& lc);
 void gsLevelCellsRefresh(const DeviceLduView& A, const DeviceBuffer<scalar>& b, const DeviceGaussSeidelLevels& lv, GSLevelCells& cc);
+// ...and for a caller that knows the sweep: `backward` false refreshes (and sizes) the forward half's operands only, which is all
+// GaussSeidelSmoother's ascending walk reads; the backward half's buffers are left as they are (empty unless a symmetric sweep
+// sized them). The two-argument forms refresh both halves, as before (a memory census of a large transient case, 2026-11-21: the
+// backward half's operands were 2.4 GB on a 16.6 M-cell mesh that a GaussSeidel case never read)
+void gsLevelCoefsRefresh(const DeviceLduView& A, const DeviceGaussSeidelLevels& lv, GSLevelCoefs& lc, bool backward);
+void gsLevelCellsRefresh(const DeviceLduView& A, const DeviceBuffer<scalar>& b, const DeviceGaussSeidelLevels& lv, GSLevelCells& cc,
+                         bool backward);
 // Whether the sweeps take the level-ordered gather (default when the CSR exists; BRAE_GS_LEVEL_GATHER=0
 // restores the index gather for the identity gate).
 bool gsLevelGatherEnabled(const DeviceGaussSeidelLevels& lv);

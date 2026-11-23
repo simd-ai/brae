@@ -14,6 +14,7 @@
 #include <set>          // BRAE_POOL_POISON: the take numbers to poison
 #include <algorithm>    // sort, for the histogram report
 #include <unordered_map>
+#include <functional>   // BRAE_POOL_STATS: the structures' own census reporters
 #include <dlfcn.h>      // BRAE_POOL_STATS: the large-block ledger's frame offsets
 #include <execinfo.h>
 #include <cstdlib>
@@ -325,6 +326,57 @@ public:
     {
         return exact_;
     }
+    // BRAE_POOL_STATS=1 only (0 otherwise): the bytes the live buffers span now, their most, and the phase of that most
+    bool statsOn() const
+    {
+        return stats_;
+    }
+    std::size_t liveBytes() const
+    {
+        return liveBytes_;
+    }
+    std::size_t peakLive() const
+    {
+        return peakLive_;
+    }
+    const char* peakPhase() const
+    {
+        return peakPhase_;
+    }
+    // the bytes the pool holds from the driver now: what an out-of-memory sees, the live buffers and the idle blocks together
+    std::size_t footprint() const
+    {
+        return mallocBytes_ - freedBytes_;
+    }
+    // BRAE_POOL_STATS=1: the live blocks of BRAE_POOL_BIG_MIB or more summed BY CALL SITE -- the call stack of the take (from the
+    // caller of DeviceBuffer on), the phase of the take and the block's size class -- now and at the moment the bytes in use
+    // peaked. reportLive prints every block with its stack, which at 1 MiB is thousands of lines a report on a 16 M-cell mesh;
+    // a site's blocks of one size are one line here. Lines of a report sum to the big blocks' bytes; the bytes in use less that
+    // sum is what blocks under the floor hold. Resolve the offsets with addr2line -f -C -e <brae> <offset>... (a memory
+    // census of a large transient case, 2026-11-21)
+    void reportSites(const char* when) const
+    {
+        if (!stats_) return;
+        printSites(when, "now", bigLive_, liveBytes_);
+        printSites(when, "peak", peakBig_, peakLive_);
+        for (const auto& kv : census_)
+        {
+            kv.second(when);
+        }
+    }
+    // BRAE_POOL_STATS=1: a structure that names its own buffers (a hierarchy, an operator) registers a reporter, which
+    // reportSites calls with its `when`; the owner removes it before its buffers go. Not called without the stats
+    void addCensus(
+        const void* owner,
+        std::function<void(const char*)> reporter)
+    {
+        if (!stats_) return;
+        census_[owner] = std::move(reporter);
+    }
+    void removeCensus(const void* owner)
+    {
+        census_.erase(owner);
+    }
     // BRAE_POOL_STATS=1: what the pool asked the driver for, and how much of that is sitting in the
     // free list rather than in use.
     void report(const char* when) const
@@ -448,6 +500,53 @@ private:
                     std::fprintf(stderr, " %lx", static_cast<unsigned long>(
                         reinterpret_cast<char*>(b.frames[i]) - reinterpret_cast<char*>(info.dli_fbase)));
                 }
+            }
+            std::fprintf(stderr, "\n");
+        }
+    }
+    // reportSites' sum by site; the stack's first two frames are the pool's own (countTake, take) and are left out of the key
+    template <typename BigMap>
+    static void printSites(
+        const char* when,
+        const char* tag,
+        const BigMap& m,
+        std::size_t inUse)
+    {
+        struct Site
+        {
+            std::size_t bytes = 0;
+            std::size_t blocks = 0;
+        };
+        std::map<std::pair<std::vector<unsigned long>, std::pair<std::string, std::size_t>>, Site> sites;
+        std::size_t big = 0;
+        for (const auto& kv : m)
+        {
+            const auto& b = kv.second;
+            std::vector<unsigned long> offsets;
+            for (int i = 2; i < b.nFrames; ++i)
+            {
+                Dl_info info;
+                if (dladdr(b.frames[i], &info) && info.dli_fbase)
+                {
+                    offsets.push_back(static_cast<unsigned long>(
+                        reinterpret_cast<char*>(b.frames[i]) - reinterpret_cast<char*>(info.dli_fbase)));
+                }
+            }
+            Site& s = sites[{offsets, {std::string(b.phase), b.cls}}];
+            s.bytes += b.cls;
+            s.blocks += 1;
+            big += b.cls;
+        }
+        std::fprintf(stderr, "[site] %s %s: in use %.6f GiB, %zu blocks of the floor or more %.6f GiB in %zu sites\n", when, tag,
+                     inUse/1073741824.0, m.size(), big/1073741824.0, sites.size());
+        for (const auto& kv : sites)
+        {
+            std::fprintf(stderr, "[site] %s %s %12zu %5zu %-14s", when, tag, kv.second.bytes, kv.second.blocks,
+                         kv.first.second.first.c_str());
+            std::fprintf(stderr, " cls=%zu", kv.first.second.second);
+            for (const unsigned long off : kv.first.first)
+            {
+                std::fprintf(stderr, " %lx", off);
             }
             std::fprintf(stderr, "\n");
         }
@@ -598,6 +697,7 @@ private:
         }
         return false;
     }
+    std::map<const void*, std::function<void(const char*)>> census_;
     std::set<unsigned long> poisonSites_;
     std::string poisonPhase_;
     int poisonByte_ = 0xff;

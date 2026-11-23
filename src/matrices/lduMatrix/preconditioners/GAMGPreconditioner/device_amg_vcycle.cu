@@ -1865,4 +1865,32 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
     deviceCopy(z, amg.wA);
 }
 
+// THE CYCLE'S UNREAD SCRATCH, released for a caller that applies this hierarchy to a SYMMETRIC matrix by the direct
+// double-precision cycle only (amgVCycleApply with captureVcycle false and no single-precision copies; vcycleAt's
+// asymmetric false): finalizeAMG sizes six work vectors on every grid and two on the finest for every cycle the core has,
+// and this one reads, on grid g, vAx and vR (and vB, vX below the finest, where the caller's r and z stand on it). Not
+// read here: the finest grid's vB and vX; every grid's vD (the Chebyshev smoother and the two-stage Gauss-Seidel only, and
+// the spectrum estimate reads vX[0] only for Chebyshev); every grid's vPc (the scaled coarse correction only); wA and rA
+// (the captured cycle and the single-GPU PCG only). Nothing is released when a smoother or a form that reads them is in
+// force. Returns the bytes released (handed back to the pool). A memory census of a large transient case, 2026-11-21: on
+// a 16.6 M-cell mesh these are 6 vectors of 133 MB on the finest grid and two on every coarse one
+std::size_t amgReleaseUnreadScratch(AMGData& amg)
+{
+    if (useChebyshev() || useTSGS() || amg.gsSmooth || amg.corrScaling || amg.fp32Alloc) return 0;
+    std::size_t bytes = 0;
+    auto drop = [&bytes](DeviceBuffer<scalar>& x)
+    {
+        bytes += x.size()*sizeof(scalar);
+        x = DeviceBuffer<scalar>();
+    };
+    const int G = amg.nLevels();
+    if (!amg.vB.empty()) drop(amg.vB[0]);
+    if (!amg.vX.empty()) drop(amg.vX[0]);
+    for (int g = 0; g <= G && g < static_cast<int>(amg.vD.size()); ++g) drop(amg.vD[g]);
+    for (int g = 0; g <= G && g < static_cast<int>(amg.vPc.size()); ++g) drop(amg.vPc[g]);
+    drop(amg.wA);
+    drop(amg.rA);
+    return bytes;
+}
+
 } // namespace brae

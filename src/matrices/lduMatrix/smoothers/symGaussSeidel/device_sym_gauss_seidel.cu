@@ -441,23 +441,40 @@ bool gsLevelGatherEnabled(const DeviceGaussSeidelLevels& lv)
 
 void gsLevelCoefsRefresh(const DeviceLduView& A, const DeviceGaussSeidelLevels& lv, GSLevelCoefs& lc)
 {
+    gsLevelCoefsRefresh(A, lv, lc, true);
+}
+
+void gsLevelCoefsRefresh(const DeviceLduView& A, const DeviceGaussSeidelLevels& lv, GSLevelCoefs& lc, bool backward)
+{
     if (!gsLevelGatherEnabled(lv)) return;      // the index gather reads none of this; do not pay for it
     const int nE = lv.nEntries, nF = A.nInternalFaces;
     lc.fwd.resize(nE);
-    lc.bwd.resize(nE);
+    if (backward) lc.bwd.resize(nE);
     if (nE <= 0) return;
     gsPermuteCoefK<<<nBlkG(nE), TPB_G>>>(nE, lv.fwdEntSrc.data(), A.lower, A.upper, nF, lc.fwd.data());
-    gsPermuteCoefK<<<nBlkG(nE), TPB_G>>>(nE, lv.bwdEntSrc.data(), A.lower, A.upper, nF, lc.bwd.data());
+    if (backward) gsPermuteCoefK<<<nBlkG(nE), TPB_G>>>(nE, lv.bwdEntSrc.data(), A.lower, A.upper, nF, lc.bwd.data());
 }
 
 void gsLevelCellsRefresh(const DeviceLduView& A, const DeviceBuffer<scalar>& b, const DeviceGaussSeidelLevels& lv, GSLevelCells& cc)
 {
+    gsLevelCellsRefresh(A, b, lv, cc, true);
+}
+
+void gsLevelCellsRefresh(const DeviceLduView& A, const DeviceBuffer<scalar>& b, const DeviceGaussSeidelLevels& lv, GSLevelCells& cc,
+                         bool backward)
+{
     if (!gsLevelGatherEnabled(lv)) return;
     const int nC = lv.nCells;
-    for (auto* v : {&cc.fwdDiag, &cc.bwdDiag, &cc.fwdB, &cc.bwdB}) v->resize(nC);
+    cc.fwdDiag.resize(nC);
+    cc.fwdB.resize(nC);
+    if (backward)
+    {
+        cc.bwdDiag.resize(nC);
+        cc.bwdB.resize(nC);
+    }
     if (nC <= 0) return;
     gsPermuteCellK<<<nBlkG(nC), TPB_G>>>(nC, lv.fwdCells.data(), A.diag, b.data(), cc.fwdDiag.data(), cc.fwdB.data());
-    gsPermuteCellK<<<nBlkG(nC), TPB_G>>>(nC, lv.bwdCells.data(), A.diag, b.data(), cc.bwdDiag.data(), cc.bwdB.data());
+    if (backward) gsPermuteCellK<<<nBlkG(nC), TPB_G>>>(nC, lv.bwdCells.data(), A.diag, b.data(), cc.bwdDiag.data(), cc.bwdB.data());
 }
 
 const DeviceGaussSeidelLevels& gsLevelsFor(const DeviceLduView& A)
