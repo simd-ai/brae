@@ -251,6 +251,18 @@ add_test(NAME amg_double_rows_identity
          COMMAND ${PROJECT_SOURCE_DIR}/tests/amg_double_rows_identity.sh)
 set_tests_properties(amg_double_rows_identity PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 1200)
 
+# The double cycle's fused level products (amgFusedLevelProducts, opt-in): the cycle from every grid, captured, and a whole
+# AMG-PCG solve the unfused bits; control: the post-smooth's row summed from its last entry. Two arms, as the settings are read
+# once a process: rows on every grid, and on the finest grid alone (the switch must then act there only).
+add_executable(test_amg_fused_level_products ${PROJECT_SOURCE_DIR}/tests/test_amg_fused_level_products.cu)
+target_include_directories(test_amg_fused_level_products PRIVATE ${BRAE_HEADER_DIRS})
+target_link_libraries(test_amg_fused_level_products PRIVATE brae_core)
+add_test(NAME amg_fused_level_products
+         COMMAND test_amg_fused_level_products ${PROJECT_SOURCE_DIR}/validation/pitzDaily all)
+add_test(NAME amg_fused_level_products_finest
+         COMMAND test_amg_fused_level_products ${PROJECT_SOURCE_DIR}/validation/pitzDaily finest)
+set_tests_properties(amg_fused_level_products amg_fused_level_products_finest PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+
 # The BiCGStab graph cache keyed on the field it solves holds one graph per solved field: the velocity corrector
 # writes U into its own block (a new block each iteration had become a new cache entry an iteration once boxy5's
 # memory step 4 moved the pool's free list). Control: BRAE_CONTROL_U_CORRECTOR_NEW_BLOCK=1, the old new block.

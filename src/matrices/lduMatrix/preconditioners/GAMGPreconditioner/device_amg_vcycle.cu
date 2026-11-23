@@ -855,6 +855,100 @@ bool amgSinglePrecisionCycle(const AMGData& amg)
     return useFP32() && !amg.gsSmooth && !useChebyshev() && !useTSGS();
 }
 
+// FUSED LEVEL PRODUCTS (amgFusedLevelProducts, opt-in, off by default). On a grid with rows, the weighted-Jacobi cycle forms
+// A x into vAx and a second kernel reads it once: residualT (r = b - A x) after the pre-smooth, smoothT (x += omega (b - A x) / d)
+// after the prolongation. Here the product's row sum stays in a register and the same expression is applied to it: the row is
+// summed as amulCsrDK sums it (the diagonal's product, then each entry's product rounded before its add, in the row's order), and
+// the residual and the sweep are residualT's and smoothT's expressions. The post-smooth cannot update x in place (its neighbours
+// read x), so the cycle keeps the grid's x0 and its prolonged correction in vAx, which no longer holds a product, and the sweep
+// writes x. What it saves on a fused grid, a cell and a cycle: twice the product's write of A x and the next kernel's read of it
+// (16 bytes each time), and smoothT's second reads of the diagonal and of x (16 more), 48 bytes; it reads nothing new (b was
+// residualT's and smoothT's read already). MEASURED on one GH200 (Nsight Systems), the double cycle on a pressure grid of 16.5 M
+// cells: the product 466 us, residualT 108 and smoothT 177, all at ~3.6 TB/s; the 792 MB not moved there are ~220 us of those
+// four kernels' 1,217 us a cycle at that rate (an estimate: the fused cycle was not profiled).
+// tests/test_amg_fused_level_products.cu holds the cycle and a whole solve to the unfused cycle's bits.
+static int fusedLevelProducts = 0;
+
+void amgFusedLevelProducts(int mode)
+{
+    fusedLevelProducts = mode;
+}
+
+int amgFusedLevelProductsMode()
+{
+    return fusedLevelProducts;
+}
+
+namespace
+{
+
+// r = b - A psi on a grid's rows: amulCsrDK's sum, then residualT's expression
+__global__
+void amulCsrResidualDK(
+    int nC,
+    const scalar* __restrict__ diag,
+    const label* __restrict__ row,
+    const label* __restrict__ col,
+    const scalar* __restrict__ val,
+    const scalar* __restrict__ psi,
+    const scalar* __restrict__ b,
+    scalar* __restrict__ r)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    scalar s = diag[c]*psi[c];
+    for (label i = row[c]; i < row[c+1]; ++i)
+        s = __dmul_rn(val[i], psi[col[i]]) + s;
+    r[c] = b[c] - s;
+}
+
+// x = psi + omega (b - A psi) / d on a grid's rows: amulCsrDK's sum, then smoothT's expression with psi for x's old value.
+// reversed: the CONTROL (amgFusedLevelProducts(2)), deliberately wrong: the row summed from its last entry, another rounding
+__global__
+void amulCsrSmoothDK(
+    int nC,
+    const scalar* __restrict__ diag,
+    const label* __restrict__ row,
+    const label* __restrict__ col,
+    const scalar* __restrict__ val,
+    const scalar* __restrict__ psi,
+    const scalar* __restrict__ b,
+    scalar* __restrict__ x,
+    int reversed)
+{
+    const int c = blockIdx.x*blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    scalar s = diag[c]*psi[c];
+    if (reversed)
+    {
+        for (label i = row[c+1] - 1; i >= row[c]; --i)
+            s = __dmul_rn(val[i], psi[col[i]]) + s;
+    }
+    else
+    {
+        for (label i = row[c]; i < row[c+1]; ++i)
+            s = __dmul_rn(val[i], psi[col[i]]) + s;
+    }
+    x[c] = psi[c] + scalar(OMEGA)*(b[c]-s)/safeDiag(diag[c]);
+}
+
+}   // namespace
+
+static bool fineRowsAre(
+    const AMGData& amg,
+    const DeviceLduView& A);
+
+// The rows a fused grid reads: the finest grid's (amgGatherFineCsr64) when they are the view's, a coarse grid's (amgGatherCsr64)
+// when it has them; none otherwise, and the grid keeps the two kernels
+static bool levelRows(
+    const AMGData& amg,
+    int g,
+    const DeviceLduView& Ag)
+{
+    if (g == 0) return fineRowsAre(amg, Ag);
+    return g < static_cast<int>(amg.csr64Val.size()) && amg.csr64Val[g].size() > 0 && amg.pair.n == 0;
+}
+
 // The double cycle's product on grid g: the row layout where the grid has one (amgGatherCsr64; on the finest grid
 // amgGatherFineCsr64's, when its rows are the caller's view's), amulKernel otherwise. The same sum in the same order.
 static inline void amgSpmvD(
@@ -940,6 +1034,35 @@ void vcycleAt(
             smoothT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), amg.vAx[g].data(), Ag.diag, xg.data());
         }
         amgSplit::lap(g, amgSplit::coarsest);
+        return;
+    }
+    // FUSED LEVEL PRODUCTS (see amgFusedLevelProducts): the weighted-Jacobi cycle with one sweep a side, from zero, on a grid
+    // with rows. x0 and its prolonged correction live in vAx[g]; the post-smooth writes x_g
+    const bool fused = fusedLevelProducts != 0 && !asymmetric && jacobiPre && fromZero && !staleStart && !amg.saSmooth
+        && !amg.corrScaling && nPreSweeps() == 1 && nPostSweeps() == 1 && levelRows(amg, g, Ag);
+    if (fused)
+    {
+        DeviceBuffer<scalar>& xw = amg.vAx[g];
+        xw.resize(n);
+        const label* row = amg.csr64Row[g].data();
+        const label* col = amg.csr64Col[g].data();
+        const scalar* val = amg.csr64Val[g].data();
+        smoothFromZeroT<scalar><<<nBlocks(n),TPB>>>(n, bg.data(), Ag.diag, xw.data());
+        amgSplit::lap(g, amgSplit::smoothPre);
+        amulCsrResidualDK<<<nBlocks(n),TPB>>>(n, Ag.diag, row, col, val, xw.data(), bg.data(), amg.vR[g].data());
+        cudaCheck(cudaGetLastError(), "fused residual");
+        amgSplit::lap(g, amgSplit::residual);
+        const int ncf = amg.level[g].nCoarse;
+        const AMGLevel& Lf = amg.level[g];
+        restrictGatherT<scalar><<<nBlocks(ncf),TPB>>>(
+            ncf, Lf.galCellStart.data(), Lf.galCellList.data(), amg.vR[g].data(), amg.vB[g+1].data());
+        amgSplit::lap(g, amgSplit::restriction);
+        vcycleAt(g+1, amg, amg.level[g].coarseView(), amg.vB[g+1], amg.vX[g+1], asymmetric);
+        prolongT<scalar><<<nBlocks(n),TPB>>>(n, Lf.map.data(), amg.vX[g+1].data(), xw.data());
+        amgSplit::lap(g, amgSplit::prolongation);
+        amulCsrSmoothDK<<<nBlocks(n),TPB>>>(n, Ag.diag, row, col, val, xw.data(), bg.data(), xg.data(), fusedLevelProducts == 2 ? 1 : 0);
+        cudaCheck(cudaGetLastError(), "fused smooth");
+        amgSplit::lap(g, amgSplit::smoothPost);
         return;
     }
     if (useChebyshev()) chebyshevSmooth(Ag, bg, xg, amg.vD[g], amg.vAx[g], amg.lambdaMax[g], chebDeg());  // pre-smooth (x=0)

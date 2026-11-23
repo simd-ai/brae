@@ -576,6 +576,14 @@ void amgGatherFineCsr64(AMGData& amg, const DeviceLduView& A);
 bool amgPrepareFineCsr64(AMGData& amg, const DeviceLduView& A);
 void amgFillFineCsr64(AMGData& amg, const DeviceLduView& A);
 
+// FUSED LEVEL PRODUCTS in the double weighted-Jacobi cycle (device_amg_vcycle.cu), set by a caller before it captures a cycle:
+// 0 off (the default, and every caller's here), 1 on (the same arithmetic, the product's row sum not written out), 2 the CONTROL,
+// deliberately wrong (the post-smooth's row summed from its last entry). A captured cycle keeps the mode it was captured with: no
+// graph cache is keyed on it. Gate: tests/test_amg_fused_level_products.cu
+void amgFusedLevelProducts(
+    int mode);
+int amgFusedLevelProductsMode();
+
 // y = A x on the finest grid: the rows of amgGatherFineCsr64 when they are A's, deviceAmul otherwise
 void amgFineAmul(AMGData& amg, const DeviceLduView& A, const DeviceBuffer<scalar>& x, DeviceBuffer<scalar>& y);
 
