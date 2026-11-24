@@ -1706,6 +1706,56 @@ SimplecSnGrad simplecSnGrad(
         return deviceForcePatchSums(faces, fl);
     }
 
+    void DeviceSimpleSolver::updateTotalPressure()
+    {
+        // p0(t) BEFORE p_b, as uniformTotalPressure's updateCoeffs samples it (uniformTotalPressureFvPatchScalarField.C:151)
+        if (!tvP0_.empty())
+        {
+            std::vector<scalar> p0h = dbP_.p0.host();
+            for (const auto& e : tvP0_)
+            {
+                const scalar v = e.f.value(time_);
+                for (label i = 0; i < e.count; ++i)
+                {
+                    const label f = e.start + i;
+                    if (f >= 0 && f < (label)p0h.size()) p0h[f] = v;
+                }
+            }
+            dbP_.p0.copyFrom(p0h);
+        }
+        // fanPressure: the fan's operating point depends on the flow it is currently passing, so p0
+        // has to be re-derived from THIS step's boundary flux before the total-pressure update runs.
+        // OF does the same inside fanPressureFvPatchScalarField::updateCoeffs, which then defers to
+        // totalPressure with the shifted p0.
+        if (!fanP0_.empty())
+        {
+            const std::vector<scalar> phih = phiBnd_.host();
+            std::vector<scalar> p0h = dbP_.p0.host();
+            for (const auto& e : fanP0_)
+            {
+                scalar sum = 0;
+                for (label i = 0; i < e.count; ++i)
+                {
+                    const label f = e.start + i;
+                    if (f >= 0 && f < (label)phih.size()) sum += phih[f];
+                }
+                const scalar v = e.p0 - e.dir * e.dp(std::max(e.dir * sum, scalar(0)));
+                for (label i = 0; i < e.count; ++i)
+                {
+                    const label f = e.start + i;
+                    if (f >= 0 && f < (label)p0h.size()) p0h[f] = v;
+                }
+            }
+            dbP_.p0.copyFrom(p0h);
+        }
+        DeviceBuffer<scalar> ubx, uby, ubz;
+        deviceBCValue(dbU_.comp[0], Uk_[0], ubx);
+        deviceBCValue(dbU_.comp[1], Uk_[1], uby);
+        deviceBCValue(dbU_.comp[2], Uk_[2], ubz);
+        deviceUpdateTotalPressure(dbP_, phiBnd_, ubx, uby, ubz,
+                                  compressible_ ? &rhoBnd_ : nullptr);   // p in Pa -> rho-weighted dynamic head
+    }
+
     void DeviceSimpleSolver::solveMomentumPredictor(DeviceSimpleResidual& res)
     {
         // Which components this step ACTUALLY SOLVED, so the driver prints OpenFOAM's lines and no
@@ -1777,58 +1827,11 @@ SimplecSnGrad simplecSnGrad(
         if (hasPiov_)  deviceUpdatePressureInletOutletVelocity(dbU_, phiBnd_, Uk_[0], Uk_[1], Uk_[2], /*directionMixed=*/true);
         if (hasSym_)   deviceUpdateSymmetry(dbU_, Uk_[0], Uk_[1], Uk_[2]);
         if (hasWedge_) deviceUpdateWedge(dbU_, Uk_[0], Uk_[1], Uk_[2]);   // axisymmetric: the rotated cell velocity
-        // totalPressure p: recompute refValue = p0 - 0.5*neg(phi)|U_b|^2 from the boundary velocity (deviceBCValue
-        // reflects the just-updated U BCs above, e.g. pressureInletOutletVelocity) + the boundary flux.
-        if (hasTotalP_)
-        {
-            // p0(t) BEFORE the total-pressure update, matching OF's updateCoeffs order: p0 is sampled
-            // at the current time, then p_b = p0 - 0.5*neg(phi)*magSqr(U) is formed from it.
-            if (!tvP0_.empty())
-            {
-                std::vector<scalar> p0h = dbP_.p0.host();
-                for (const auto& e : tvP0_)
-                {
-                    const scalar v = e.f.value(time_);
-                    for (label i = 0; i < e.count; ++i)
-                    {
-                        const label f = e.start + i;
-                        if (f >= 0 && f < (label)p0h.size()) p0h[f] = v;
-                    }
-                }
-                dbP_.p0.copyFrom(p0h);
-            }
-            // fanPressure: the fan's operating point depends on the flow it is currently passing, so p0
-            // has to be re-derived from THIS step's boundary flux before the total-pressure update runs.
-            // OF does the same inside fanPressureFvPatchScalarField::updateCoeffs, which then defers to
-            // totalPressure with the shifted p0.
-            if (!fanP0_.empty())
-            {
-                const std::vector<scalar> phih = phiBnd_.host();
-                std::vector<scalar> p0h = dbP_.p0.host();
-                for (const auto& e : fanP0_)
-                {
-                    scalar sum = 0;
-                    for (label i = 0; i < e.count; ++i)
-                    {
-                        const label f = e.start + i;
-                        if (f >= 0 && f < (label)phih.size()) sum += phih[f];
-                    }
-                    const scalar v = e.p0 - e.dir * e.dp(std::max(e.dir * sum, scalar(0)));
-                    for (label i = 0; i < e.count; ++i)
-                    {
-                        const label f = e.start + i;
-                        if (f >= 0 && f < (label)p0h.size()) p0h[f] = v;
-                    }
-                }
-                dbP_.p0.copyFrom(p0h);
-            }
-            DeviceBuffer<scalar> ubx, uby, ubz;
-            deviceBCValue(dbU_.comp[0], Uk_[0], ubx);
-            deviceBCValue(dbU_.comp[1], Uk_[1], uby);
-            deviceBCValue(dbU_.comp[2], Uk_[2], ubz);
-            deviceUpdateTotalPressure(dbP_, phiBnd_, ubx, uby, ubz,
-                                      compressible_ ? &rhoBnd_ : nullptr);   // p in Pa -> rho-weighted dynamic head
-        }
+        // totalPressure p, on the steady drivers: here, from U's patch values as the start of the iteration
+        // left them. pimpleStep moves it to the pressure assembly (pimpleUpdatePoints_), where OpenFOAM's
+        // pEqn.H constructs fvm::laplacian(rAtU, p) and the patch's updateCoeffs reads U_b and phi.
+        static const bool totalPAtMomentumCtl = std::getenv("BRAE_CONTROL_TOTAL_PRESSURE_AT_MOMENTUM") != nullptr;
+        if (hasTotalP_ && (!pimpleUpdatePoints_ || totalPAtMomentumCtl)) updateTotalPressure();
         // fixedMean: the face values ARE the adjacent cell values, shifted (or scaled) so their
         // area-weighted mean hits the prescribed one. That is a patch-wide reduction, so the small
         // per-boundary-face gather comes back to the host and the sum is done there -- the whole cell
@@ -3314,6 +3317,16 @@ SimplecSnGrad simplecSnGrad(
             deviceUpdateMixedFreestream(dbU_, dbP_, phiBnd_, Uk_[0], Uk_[1], Uk_[2],
                                         compressible_ ? &rhoBnd_ : nullptr, /*which=*/2,
                                         &UbStored_[0], &UbStored_[1], &UbStored_[2]);
+        // ...and totalPressure's, in the same constructor (uniformTotalPressureFvPatchScalarField.C:151-218): p0 at
+        // this time, U's patch values as the last evaluate left them (the momentum solve's for the first
+        // corrector, the previous corrector's U.correctBoundaryConditions() after that), and phi as it stands,
+        // which this corrector has not yet replaced. Every non-orthogonal pass reads the same three. Done once
+        // at the momentum assembly instead, p_b took U_b from the end of the PREVIOUS step and the flux from
+        // before this step's first corrector: on RAS/TJunction p_b = p0 exactly at step 1 (OpenFOAM's p0 - p_b
+        // 2.28e-4 on the middle inlet face, tight solves) and lagged a step after. CONTROL
+        // BRAE_CONTROL_TOTAL_PRESSURE_AT_MOMENTUM=1: the momentum assembly's point, as before.
+        static const bool totalPAtMomentum = std::getenv("BRAE_CONTROL_TOTAL_PRESSURE_AT_MOMENTUM") != nullptr;
+        if (hasTotalP_ && pimpleUpdatePoints_ && !totalPAtMomentum) updateTotalPressure();
         const int nPass = (ctl_.nonOrth ? ctl_.nNonOrth : 0) + 1;
         DeviceBuffer<scalar> pIC, pBC, ffcP, ffcPcyc, ffcPami;
         DeviceSolverPerf pp, pp0;
@@ -4917,6 +4930,7 @@ SimplecSnGrad simplecSnGrad(
         // by then the fields are aged and only the geometry is being re-converged.
         if (moveMesh) moveMesh(0);
         advanceTime(deltaT);                                  // store oldTime() + set deltaT/deltaT0 for ddtCoeffs()
+        pimpleUpdatePoints_ = true;
         DeviceSimpleResidual res;
         const int nOuter = nOuterCorrectors > 0 ? nOuterCorrectors : 1;
         const int nCorr  = nCorrectors      > 0 ? nCorrectors      : 1;

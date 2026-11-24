@@ -129,6 +129,9 @@ public:
     void correctTurbulence(bool releaseGradUMemo = false);
     void boundaryNuEff(const DeviceBuffer<scalar>& nuEff, DeviceBuffer<scalar>& nuEffBnd);
     void refreshNutBoundary();
+    // totalPressure's updateCoeffs: p0(t), then p_b = p0 - 0.5 neg(phi_b)|U_b|^2 from U's patch values and
+    // the flux as they stand at the call. See pimpleStep for where each driver calls it.
+    void updateTotalPressure();
     // PIMPLE-foundation composable phase 1: the momentum predictor -- assemble div(phi,U) - laplacian(nuEff,U)
     // - fvc::div(nuEff dev2(grad U)^T) + fvOptions/MRF/limiters + body force, relax, and solve each U component
     // (BiCGStab/GaussSeidel). Fills Uk_ + the shared members mDiagR/mUp/mLo/iC/bCb/relaxSrc (the relaxed matrix
@@ -964,6 +967,11 @@ private:
     // tests/simple_piov_vs_openfoam.sh's header for the measurement that named it.
     bool   hasCmptBC_ = false;
     bool   hasTotalP_ = false;                                 // any totalPressure p patch present (per-step refValue)
+    // Set by pimpleStep: the boundary updates run where OpenFOAM's pimpleFoam runs them, each in the
+    // constructor or evaluate of its own field's equation -- totalPressure at every pressure assembly, for
+    // one. The steady drivers keep their earlier points; their gates hold recorded numbers that were not
+    // re-measured with the change.
+    bool   pimpleUpdatePoints_ = false;
     bool   hasCyclic_ = false;                                 // any cyclic (periodic) interface -> Jacobi-PCG pressure (no AMG)
     DeviceCyclic cyc_;                                          // periodic interface coupling (OF updateInterfaceMatrix)
     // (fvPatch index, face count) of each side stacked into cyc_.phi / ami_.phi, in the order
