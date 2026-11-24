@@ -29,6 +29,11 @@ If you keep those two in mind, the rest is detail.
   the build (`gpu-smoke.yml`, skipped when the change is documentation only); the whole suite runs there nightly
   and, uncached, before a release (`gpu-full.yml`). A PR from a fork gets the GPU tier once a maintainer has pushed
   it to a branch here. `docs/ci/branch-rules.md` has the table. Say in the PR how you validated on a GPU.
+- **Every test runs the case's own linear solvers** (`BRAE_PRESSURE_CASE_SOLVER`, `BRAE_TURBULENCE_CASE_SOLVER` and
+  `BRAE_SIMPLE_CASE_SOLVER`, set in `tests/CMakeLists.txt`) so that the exact gates stay exact. What a customer's
+  `brae -case` runs by default has tests of its own: register one in `tests/cmake/default_path.cmake` with the
+  `default-path` label, which unsets the three, and run it through `tests/default_path_run.sh`, which removes every
+  other `BRAE_*` variable brae reads. Hold it to a bound an existing gate measured.
 - **`tools/ctest_cached.py` runs the suite without repeating what already passed.** It takes ctest's own
   arguments (`tools/ctest_cached.py -j 6`), fingerprints each test's inputs — the code each binary loads, its
   scripts and fixtures — and runs only the tests with no recorded pass for that fingerprint. Change a shared file
