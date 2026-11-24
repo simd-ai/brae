@@ -10,8 +10,15 @@
 # not make; the pinned six steps took seven minutes). (1) THE
 # CAPTURED LOOP IS THE PLAIN LOOP'S RUN: against BRAE_BICG_HOST_LOOP=1 -- the loop the capture was taken of,
 # which rebuilds nothing and holds no pointer -- every written file the same bytes, and both name PBiCGStab on
-# U. (2) CONTROL: BRAE_CONTROL_BICG_GRAPH_PAIR_UNKEYED=1 leaves the pair out of the key again, and the run
-# does not end.
+# U. (2) CONTROL: BRAE_CONTROL_BICG_GRAPH_PAIR_UNKEYED=1 leaves the pair out of the key again, and the defect
+# shows: the run does not end, OR what it wrote differs from the plain loop's -- the comparison (1) makes. Which of
+# the two depends on what the stale addresses hold when a replay reads them, and that follows the device's
+# allocation sequence, not the arithmetic. MEASURED 2026-11-21 on main 26d0a176, with the pool on and with
+# BRAE_NO_DEVICE_POOL=1 alike:
+#   - GB10 (sm_121): an illegal memory access, after 3 steps (2 without the pool);
+#   - GH200 (sm_90): the run reaches its end on stale pair data, and 13 of the 17 written files differ from the
+#     plain loop's. The graph and plain arms are byte-identical on both.
+# A run the driver stops as diverged (exit 1, nothing written after) does not end either.
 . "$(dirname "$0")/../lib.sh"
 [ $GPU -eq 1 ] || { echo "SKIP: no GPU for the device arm"; exit 77; }
 s="$W/bg_stage"
@@ -67,7 +74,21 @@ what="$what plain loop's"
     && ! grep -aq "BiCGStab: host loop" "$W/bg_graph/log.brae" \
     && grep -aq "PBiCGStab" "$W/bg_graph/log.brae" && say "$what" ok || say "$what" FAIL
 e=$(cat "$W/bg_unkeyed/exit.txt")
-what="CONTROL  the pair left out of the graph's key: the run does not end (exit $e,"
-what="$what $(grep -ac '^ *t = ' "$W/bg_unkeyed/log.brae") steps)"
-[ "$e" != 0 ] && ! grep -aq "^End: t" "$W/bg_unkeyed/log.brae" && say "$what" ok || say "$what" FAIL
+su=$(grep -ac '^ *t = ' "$W/bg_unkeyed/log.brae")
+if [ "$e" != 0 ] && ! grep -aq "^End: t" "$W/bg_unkeyed/log.brae"; then
+    say "CONTROL  the pair left out of the graph's key: the run does not end (exit $e, $su steps)" ok
+else
+    # it ended: then what it wrote must differ from the plain loop's, file by file (a file missing counts)
+    nu=0
+    ku=0
+    for t in $(timedirs "$W/bg_plain"); do
+        for f in $(cd "$W/bg_plain/$t" && find . -type f | sort); do
+            ku=$((ku + 1))
+            cmp -s "$W/bg_unkeyed/$t/$f" "$W/bg_plain/$t/$f" || nu=$((nu + 1))
+        done
+    done
+    what="CONTROL  the pair left out of the graph's key: the run ends (exit $e, $su steps), and $nu of $ku"
+    what="$what written files differ from the plain loop's"
+    [ "$ku" -ge 8 ] && [ "$nu" -gt 0 ] && say "$what" ok || say "$what" FAIL
+fi
 finish "the BiCGStab graph is recaptured when a coupled pair's buffers move"
