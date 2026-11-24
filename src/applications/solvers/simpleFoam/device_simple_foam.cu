@@ -3752,14 +3752,23 @@ SimplecSnGrad simplecSnGrad(
         if (!ioRefreshOff && (ctl_.innerCorrector > 0 || ctl_.momentumPredictor))
         {
             deviceUpdateInletOutlet(dbU_, phiBnd_);
-            // NOT pressureInletOutletVelocity, though OpenFOAM's updateCoeffs moves it here too: this
-            // driver types a piov face in the LEGACY form (deviceUpdatePressureInletOutletVelocity's
-            // `directionMixed=false`, every inflow component fixedValue at n(n.U_cell)), which the
-            // frozen incompressible path's fluxes and matrix grew around and which validation/piov is
-            // held to at its recorded numbers (tests/simple_piov_vs_openfoam.sh). Re-applying THAT form
-            // per corrector is not OpenFOAM's directionMixed either: MEASURED on RAS/TJunction, ten
-            // steps of 0.002, it moves U from 7.078e-03 to 7.690e-02 against OpenFOAM -- ten times
-            // further. The piov half of this correction belongs with the directionMixed port.
+        }
+        // pressureInletOutletVelocity moves here too, on pimpleStep. Its updateCoeffs ends in its own
+        // evaluate (pressureInletOutletVelocityFvPatchVectorField.C:180-183), which clears updated(), so
+        // every U.correctBoundaryConditions() re-runs it, the first corrector's included: valueFraction
+        // neg(phi)(I - nn) from the flux this corrector just made, then the blend of the corrected cells.
+        // Left at the momentum assembly's switch, the patch stayed zeroGradient through all of step 1 on
+        // RAS/TJunction, where phi starts at zero: brae's tangential inlet velocity was -1.69e-6 at the
+        // edge faces where OpenFOAM's is 0, and the next corrector's total pressure read it. Same
+        // directionMixed form as the assembly's call. The steady drivers keep the assembly's switch: the
+        // form re-applied there was the LEGACY one (every inflow component fixed at n(n.U_cell)), and on
+        // TJunction that moved U from 7.078e-03 to 7.690e-02 against OpenFOAM, ten steps of 0.002;
+        // validation/piov holds the steady path at its recorded numbers. CONTROL
+        // BRAE_CONTROL_PIOV_ASSEMBLY_ONLY=1: the assembly's switch for the whole step, as before.
+        static const bool piovAssemblyOnly = (std::getenv("BRAE_CONTROL_PIOV_ASSEMBLY_ONLY") != nullptr);
+        if (hasPiov_ && pimpleUpdatePoints_ && !piovAssemblyOnly)
+        {
+            deviceUpdatePressureInletOutletVelocity(dbU_, phiBnd_, Uk_[0], Uk_[1], Uk_[2], /*directionMixed=*/true);
         }
         // limitVelocity (fvOptions.correct): clamp |U| <= max on the corrected (output) velocity. OF clamps after the
         // momentum predictor; cf clamps the post-corrector U so the WRITTEN field is bounded (matches OF's output).
