@@ -249,3 +249,19 @@ add_test(NAME solver_dispatch
                  $<TARGET_FILE:brae>
                  ${PROJECT_BINARY_DIR}/solver_dispatch_work)
 set_tests_properties(solver_dispatch PROPERTIES TIMEOUT 120)
+
+# tools/gate_record.py -- runs a gate, streams its output unchanged, keeps its exit code and writes result.json --
+# held to that on fake gates whose every line and exit code is known: the bytes streamed, the codes 0, 3, 77 and
+# 143 (SIGTERM), the verdict-line counts of tests/rho_central_gate_lib.sh and the simpler gates, the environment
+# filtered to BRAE_* and OF*, the binary's sha256, the commit, the OpenFOAM version. No GPU, no solver.
+add_test(NAME gate_record_selftest
+         COMMAND bash ${PROJECT_SOURCE_DIR}/tests/gate_record_selftest.sh ${PROJECT_SOURCE_DIR}/tools/gate_record.py)
+set_tests_properties(gate_record_selftest PROPERTIES TIMEOUT 120)
+
+# tools/tutorial_sweep.py -- which OpenFOAM tutorials `brae check --setup` takes, through each tutorial's own
+# scripts -- on a fake tutorials tree with a fake brae and fake OpenFOAM commands: set up, refused with its text,
+# checked, not reached, timeout and skipped each recorded, a mesh only in processor0/ reconstructed, and no
+# OpenFOAM solver run (the fakes leave a mark if one is). No OpenFOAM, no GPU.
+add_test(NAME tutorial_sweep_selftest
+         COMMAND bash ${PROJECT_SOURCE_DIR}/tests/tutorial_sweep_selftest.sh ${PROJECT_SOURCE_DIR}/tools/tutorial_sweep.py)
+set_tests_properties(tutorial_sweep_selftest PROPERTIES TIMEOUT 120)
