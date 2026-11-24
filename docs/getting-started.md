@@ -44,8 +44,10 @@ What happens:
 1. Brae reads your `controlDict` `application` entry and picks the matching solver (`simpleFoam` -> steady,
    `pimpleFoam` -> transient). A solver it does not have yet stops the run instead of being substituted.
 2. It reads your mesh, fields, schemes, and solver settings.
-3. It **auto-partitions** the mesh and builds its multigrid hierarchy for your GPU (the `decomposePar` analogue ,
-   done once, cached). You can pre-build this cache with `brae -case yourCase -partition`.
+3. It builds the multigrid hierarchy of its pressure solver for your mesh. Nothing is partitioned: the whole mesh is
+   on one GPU. The hierarchy depends on the mesh alone, so simpleFoam writes it to `constant/polyMesh/.brae_amgcache`
+   and the next run on the same mesh reads it instead of building it again (`BRAE_AMG_CACHE=0` neither reads nor
+   writes it). For a steady case, `brae -case yourCase -partition` builds the caches and exits without solving.
 4. It runs the solver loop fully on the GPU until `endTime` (or, steady, `residualControl` convergence).
 5. It writes standard time directories (`100/U`, `100/p`, …) you open with `paraFoam` or `postProcess`.
 
@@ -57,8 +59,9 @@ Two accuracy-preserving optimisations give the full device-resident performance,
 - `BRAE_AMG_FP32`, runs the multigrid preconditioner in single precision (half the memory traffic; the answer stays
   double precision).
 
-Both are validated to preserve the result (see [performance.md](performance.md)). To fall back to the reference
-double-precision, host-driven path, set either to 0:
+Both are validated to preserve the result (see [performance.md](performance.md)). The device-resident Krylov loop
+needs a build with CUDA 13 or newer: a CUDA 12 build runs the host-driven loop whatever `BRAE_PCG_DEVICE` says. To fall
+back to the reference double-precision, host-driven path, set either to 0:
 
 ```bash
 BRAE_PCG_DEVICE=0 BRAE_AMG_FP32=0 brae -case yourCase
@@ -82,8 +85,9 @@ external-aero cases.
 
 Brae solves the *same* equations as OpenFOAM but will not match to the last digit, and is not meant to.
 Floating-point addition is not associative, and brae runs the arithmetic in parallel on the GPU: it loops over cells
-rather than faces and combines partial sums in whatever order the hardware schedules. Same operations, different
-order, so the rounding (the truncation error) differs at machine precision and can vary slightly run to run. Carried
+rather than faces and combines partial sums in a fixed order of its own, not OpenFOAM's. Same operations, different
+order, so the rounding (the truncation error) differs at machine precision. The order is fixed, so simpleFoam and
+rhoSimpleFoam write the same bytes run to run; pimpleFoam is not yet bit-reproducible run to run. Carried
 through the nonlinear SIMPLE iterations, that shows up as the sub-1% field difference. It is a reshuffling of
 rounding error, not a change in the physics, and it is expected of any GPU reimplementation of a CPU solver.
 
