@@ -117,3 +117,10 @@ set_tests_properties(pimple_guards PROPERTIES TIMEOUT 120)
 add_test(NAME pimple_adjusttimestep_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_adjusttimestep_vs_openfoam.sh)
 set_tests_properties(pimple_adjusttimestep_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
                      ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_pimpleFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+
+# The flux-dependent boundary updates at OpenFOAM's points within a step: total pressure at every pressure assembly,
+# pressureInletOutletVelocity after every corrector, the k and epsilon inlets and switches in the turbulence correction.
+# RAS/TJunction with tight solves, every entry of every field at steps 1-3 against OpenFOAM, four controls.
+add_test(NAME pimple_tjunction_boundary_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_tjunction_boundary_vs_openfoam.sh)
+set_tests_properties(pimple_tjunction_boundary_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
+                     ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_pimpleFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
