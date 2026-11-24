@@ -1258,6 +1258,23 @@ SimplecSnGrad simplecSnGrad(
         const bool patchValues = hasTurbInlet_ && pimpleUpdatePoints_ && !inletRefValue;
         DeviceBuffer<scalar> kb;
         if (patchValues) deviceBCValue(dbK_, dk_, kb);   // before either field's boundary moves
+        // ...and the STORED patch values of both fields, for the gradients the two equations take. OpenFOAM's
+        // updateCoeffs above moves refValue and valueFraction, never the stored value, so the limitedLinear
+        // limiter's fvc::grad(k) and fvc::grad(epsilon) (LimitedScheme.C:56) still read what the last evaluate
+        // left: 0.2 on the TJunction inlet at step 1, the file's value, where the switched boundary now gives
+        // 1.5 (I |U_b|)^2 = 1.0e-6. Taken after the switches, k was 1.28e-5 off OpenFOAM in the three cell
+        // columns behind the inlet at step 1 (tight solves, every boundary value equal). kEpsilon only:
+        // RNGkEpsilon and realizableKE share this closure, unmeasured with it. CONTROL
+        // BRAE_CONTROL_TURB_GRAD_AFTER_UPDATE=1: the closure's own values, as before.
+        static const bool gradAfterUpdate = std::getenv("BRAE_CONTROL_TURB_GRAD_AFTER_UPDATE") != nullptr;
+        const bool storedGrad = switchHere && ctl_.modelName == "kEpsilon" && !gradAfterUpdate;
+        DeviceBuffer<scalar> kStored;
+        DeviceBuffer<scalar> epsStored;
+        if (storedGrad)
+        {
+            deviceBCValue(dbK_, dk_, kStored);
+            deviceBCValue(dbEps_, de_, epsStored);
+        }
         if (switchHere) deviceUpdateInletOutlet(dbEps_, phiBnd_);
         if (patchValues)
             deviceUpdateTurbulentInletSecond(kb, mlMask_, mlLength_,
@@ -1405,7 +1422,9 @@ SimplecSnGrad simplecSnGrad(
                                       fixScaK_ ? &fixScaMask_ : nullptr, fixScaK_ ? &fixScaKVal_ : nullptr,
                                       fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr,
                                       /*nSweeps*/1, ctl_.gsKESym,   // ...and WHICH GaussSeidel the case named
-                                      lapLimit(ctl_, "closure"));   // `limited corrected <psi>` on k and epsilon
+                                      lapLimit(ctl_, "closure"),    // `limited corrected <psi>` on k and epsilon
+                                      storedGrad ? &kStored : nullptr,
+                                      storedGrad ? &epsStored : nullptr);
         }
     }
 
