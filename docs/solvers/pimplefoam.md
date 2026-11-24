@@ -22,7 +22,7 @@ cd yourTransientCase && brae
 | **Turbulence** | laminar; URANS: k-epsilon, realizable k-epsilon, k-omega SST, k-omega SST-LM, Spalart-Allmaras; hybrid/LES: SA-DDES, SA-IDDES, k-omega SST-DDES, k-omega SST-IDDES, Smagorinsky |
 | **Restart** | seamless — writes and re-reads `phi` and the `ddt0(...)` state, so a restart continues the same trajectory |
 | **I/O** | standard OpenFOAM case in, standard time directories out (U, p, phi, turbulence); ASCII & binary mesh |
-| **Not yet** | adaptive `deltaT` (`adjustTimeStep`/`maxCo`), MRF, `fvOptions`, runtime function objects, multi-GPU |
+| **Not yet** | MRF, `fvOptions`, runtime function objects, multi-GPU |
 
 Legend: ✓ supported · ✗ not yet.
 
@@ -37,10 +37,20 @@ Legend: ✓ supported · ✗ not yet.
 | Implicit `fvm::ddt` on **turbulence transport** (k, epsilon, omega, nuTilda) | ✓ true URANS, not quasi-steady |
 | `ddt0(...)` state written and re-read on restart (`backward`, `CrankNicolson`) | ✓ |
 | Fixed `deltaT` | ✓ |
-| `adjustTimeStep` / `maxCo` (Courant-limited dt) | ✗ — refused at start-up, not silently ignored |
+| `adjustTimeStep` / `maxCo` / `maxDeltaT` (Courant-limited dt) | ✓ OpenFOAM's clock: `setInitialDeltaT`, `setDeltaT` before every step, `Time::adjustDeltaT` onto the write times, `uniform/time` written (issue #53) |
 
 `writeControl timeStep` and `runTime`/`adjustableRunTime`, `writeInterval` and `purgeWrite` behave as in
 `Foam::Time`.
+
+Under `adjustTimeStep yes` brae runs OpenFOAM's clock, as `pimpleFoam.C` does: the Courant number and
+`setInitialDeltaT` before the loop (on a run from its first time only), then before every step the Courant number on
+the flux the last step left, `setDeltaT` and `++runTime`, with `Time::adjustDeltaT` shortening steps so that they land
+on each write time under `writeControl adjustable`. Each write carries `uniform/time` (value, index, deltaT, deltaT0) as
+OpenFOAM's does, so a `latestTime` restart in either code takes up the step where the other left it.
+`tests/pimple_adjusttimestep_vs_openfoam.sh` replays brae's log through OpenFOAM's rules and holds the step sequence,
+the write times and the restarts against OpenFOAM. The Courant numbers are each code's own flux's, so the steps agree
+with OpenFOAM's as closely as the fields do. Function objects (`forces`, `forceCoeffs`, `scalarTransport`) still run on
+a clock with controlDict's `deltaT` under `adjustTimeStep`, so their output times are not the solver's.
 
 ## PIMPLE controls (`fvSolution`)
 
@@ -110,7 +120,6 @@ An impulsive start at fixed `deltaT` diverges for **both** solvers (Courant blow
 
 These stop the run with a message rather than producing a quietly wrong answer:
 
-- `adjustTimeStep yes` — use a fixed `deltaT` under your target Courant number.
 - `constant/MRFProperties` with an active zone.
 - `system/fvOptions` or `constant/fvOptions`.
 

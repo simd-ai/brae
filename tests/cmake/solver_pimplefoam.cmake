@@ -111,3 +111,9 @@ add_test(NAME pimple_guards
                  $<TARGET_FILE:brae_pimpleFoam>
                  ${PROJECT_BINARY_DIR}/pimple_guards_work)
 set_tests_properties(pimple_guards PROPERTIES TIMEOUT 120)
+
+# adjustTimeStep on OpenFOAM's clock (issue #53): pitzDaily step by step against OpenFOAM's own log -- every deltaT
+# replayed through OpenFOAM's rules to the bit, the write times, the fields at each write, four restarts, two controls.
+add_test(NAME pimple_adjusttimestep_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_adjusttimestep_vs_openfoam.sh)
+set_tests_properties(pimple_adjusttimestep_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
+                     ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_pimpleFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
