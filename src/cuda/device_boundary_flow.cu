@@ -1249,6 +1249,41 @@ void deviceUpdateTurbulentInletSecond(
     cudaCheck(cudaGetLastError(), "mixingLengthInlet");
 }
 
+void deviceUpdateTurbulentInletK(
+    const DeviceBuffer<scalar>& Ubx,
+    const DeviceBuffer<scalar>& Uby,
+    const DeviceBuffer<scalar>& Ubz,
+    const DeviceBuffer<label>& mask,
+    const DeviceBuffer<scalar>& intensity,
+    DeviceBoundary& dbK)
+{
+    const int n = dbK.n;
+    if (!n || !mask.size()) return;
+    if (Ubx.size() != static_cast<std::size_t>(n) || Uby.size() != static_cast<std::size_t>(n)
+        || Ubz.size() != static_cast<std::size_t>(n))
+        throw std::runtime_error("brae: turbulentIntensityKineticEnergyInlet was handed U patch values of the wrong size");
+    tkeInletKernel<<<nBlocks(n), TPB>>>(n, mask.data(), intensity.data(), Ubx.data(), Uby.data(), Ubz.data(),
+                                        dbK.refValue.data());
+    cudaCheck(cudaGetLastError(), "tkeInlet (patch values)");
+}
+
+void deviceUpdateTurbulentInletSecond(
+    const DeviceBuffer<scalar>& kb,
+    const DeviceBuffer<label>& mask,
+    const DeviceBuffer<scalar>& len,
+    scalar Cmu,
+    DeviceBoundary& dbSecond)
+{
+    const int n = dbSecond.n;
+    if (!n || !mask.size()) return;
+    if (kb.size() != static_cast<std::size_t>(n))
+        throw std::runtime_error("brae: a turbulentMixingLength inlet was handed k patch values of the wrong size");
+    mixingLengthInletKernel<<<nBlocks(n), TPB>>>(n, mask.data(), len.data(), kb.data(),
+                                                 pow(Cmu, scalar(0.75)), pow(Cmu, scalar(0.25)),
+                                                 dbSecond.refValue.data());
+    cudaCheck(cudaGetLastError(), "mixingLengthInlet (patch values)");
+}
+
 // ---- compressible inflow/outflow boundaries (milestone H; see device_boundary.cuh) ------------------------------------
 namespace {
 constexpr int kTPBn = 256;

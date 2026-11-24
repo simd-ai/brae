@@ -1229,7 +1229,29 @@ SimplecSnGrad simplecSnGrad(
         // WALL faces and the outlet matched OF exactly throughout; only the 400 inlet faces were wrong.
         //
         // A3 fixed these inlets being FROZEN at set-up. This is that fix landing one phase too early.
-        if (hasTurbInlet_)
+        //
+        // pimpleStep reads what OpenFOAM's updateCoeffs read, in OpenFOAM's order. kEpsilon::correct updates
+        // epsilon's boundary first (kEpsilon.C:247), so the mixing-length inlet takes k's patch value as k's
+        // LAST evaluate left it, the previous step's (on the first step, the value read from 0/k); k's own
+        // boundary moves later, in kEqn's constructor (:273), from U's patch value after the last pressure
+        // corrector. kOmegaSSTBase::correct has the same order (kOmegaSSTBase.C:541, 600). The refValue
+        // arrays are those values only on a fixedValue face: on RAS/TJunction's pressureInletOutletVelocity
+        // inlet U's refValue is the tangential velocity, 0, so the inlet k was EXACTLY 0 from step 2 (and
+        // epsilon with it), where OpenFOAM's is 1.5 (I |U_b|)^2 = 4.03e-6 at step 2 on the middle face.
+        // The steady drivers keep the refValue form. CONTROL BRAE_CONTROL_TURB_INLET_REFVALUE=1: the
+        // refValue form on pimpleStep too, as before.
+        static const bool inletRefValue = std::getenv("BRAE_CONTROL_TURB_INLET_REFVALUE") != nullptr;
+        if (hasTurbInlet_ && pimpleUpdatePoints_ && !inletRefValue)
+        {
+            DeviceBuffer<scalar> kb;
+            deviceBCValue(dbK_, dk_, kb);
+            deviceUpdateTurbulentInletSecond(kb, mlMask_, mlLength_,
+                                             ctl_.sst ? ctl_.ksstCoeffs.betaStar : ctl_.keCoeffs.Cmu, dbEps_);
+            DeviceBuffer<scalar> ub[3];
+            for (int k = 0; k < 3; ++k) deviceBCValue(dbU_.comp[k], Uk_[k], ub[k]);
+            deviceUpdateTurbulentInletK(ub[0], ub[1], ub[2], tiMask_, tiIntensity_, dbK_);
+        }
+        else if (hasTurbInlet_)
         {
             deviceUpdateTurbulentInletK(dbU_, tiMask_, tiIntensity_, dbK_);
             deviceUpdateTurbulentInletSecond(dbK_, mlMask_, mlLength_,
