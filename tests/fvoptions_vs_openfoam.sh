@@ -15,15 +15,19 @@ set -u
 SRC="${1:?case dir}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
-OFBIN=/usr/lib/openfoam/openfoam2412/platforms/linuxARM64GccDPInt32Opt
+OFBASHRC=${OF_BASHRC:-${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}}
 [ -x "$BRAE" ]                 || { echo "SKIP: no brae binary at $BRAE"; exit 77; }
-[ -x "$OFBIN/bin/simpleFoam" ] || { echo "SKIP: real OpenFOAM not available"; exit 77; }
+[ -f "$OFBASHRC" ]             || { echo "SKIP: real OpenFOAM not available"; exit 77; }
 SRC="$(cd "$SRC" && pwd)"
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
-export WM_PROJECT_DIR=/usr/lib/openfoam/openfoam2412
-export FOAM_ETC="$WM_PROJECT_DIR/etc"
-export PATH="$OFBIN/bin:$PATH"
-export LD_LIBRARY_PATH="$OFBIN/lib/sys-openmpi:$OFBIN/lib:$OFBIN/lib/dummy"
+# OpenFOAM's environment from its own bashrc (OF_BASHRC or OFBASHRC, as the other gates find it). `set --`: the
+# bashrc evaluates the arguments it is sourced with (etc/config.sh/setup); `set +u`: it reads unset variables.
+set +u
+set --
+# shellcheck disable=SC1090
+source "$OFBASHRC" > /dev/null 2>&1 || true
+set -u
+command -v simpleFoam > /dev/null 2>&1 || { echo "SKIP: simpleFoam not on PATH"; exit 77; }
 
 cp -r "$SRC" "$W/base"
 find "$W/base" -mindepth 1 -maxdepth 1 -type d ! -name 0 ! -name constant ! -name system -exec rm -rf {} + 2>/dev/null

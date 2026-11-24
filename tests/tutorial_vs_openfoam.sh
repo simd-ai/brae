@@ -85,17 +85,21 @@ RESCONTROL="${5:-}"
 WINDOW="${6:-}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
-TUT=/usr/lib/openfoam/openfoam2412/tutorials/incompressible/simpleFoam
-OFBIN=/usr/lib/openfoam/openfoam2412/platforms/linuxARM64GccDPInt32Opt
+TUT=${BRAE_OF_TUTORIALS:-/usr/lib/openfoam/openfoam2412/tutorials}/incompressible/simpleFoam
+OFBASHRC=${OF_BASHRC:-${OFBASHRC:-/usr/lib/openfoam/openfoam2412/etc/bashrc}}
 [ -x "$BRAE" ]                 || { echo "SKIP: no brae binary at $BRAE"; exit 77; }
-[ -x "$OFBIN/bin/simpleFoam" ] || { echo "SKIP: real OpenFOAM not available"; exit 77; }
+[ -f "$OFBASHRC" ]             || { echo "SKIP: real OpenFOAM not available"; exit 77; }
 [ -d "$TUT/$CASE" ]            || { echo "SKIP: no $CASE tutorial in this OpenFOAM"; exit 77; }
 
 W=$(mktemp -d); trap 'rm -rf "$W"' EXIT
 set +u
+# `set --`: OpenFOAM's bashrc evaluates the arguments it is sourced with (etc/config.sh/setup), and a bare source
+# hands it this script's own (a bounds argument `U=...,p=...` came back as an exported variable U)
+set --
 # shellcheck disable=SC1091
-source /usr/lib/openfoam/openfoam2412/etc/bashrc > /dev/null 2>&1 || true
+source "$OFBASHRC" > /dev/null 2>&1 || true
 set -u
+command -v simpleFoam > /dev/null 2>&1 || { echo "SKIP: simpleFoam not on PATH"; exit 77; }
 
 if [ -n "$SETUP" ]
 then
