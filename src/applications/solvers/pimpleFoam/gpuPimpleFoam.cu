@@ -32,6 +32,10 @@
 #include "pimple_controls.cuh"       // parsePimpleDdtScheme, readPimpleAlgorithm: shared with `brae check`
 #include "check_setup.cuh"           // `brae check --setup` stops before the first step
 #include "turbulence_setup.cuh"    // readTurbulenceModel + readTurbulenceFields (shared with brae)
+#include "solution_health.cuh"     // healthResidual: the turbulence solves' residuals
+#include "turb_blowup.cuh"         // TurbBlowup: sum|k| + sum|second field| tripwire
+#include "device_kepsilon.cuh"     // turbulenceReport / clearTurbulenceReport
+#include "cell_max_delta.cuh"      // IDDES hmax, brae's and OpenFOAM's maxDeltaxyz
 #include "komega_sst_coeffs.cuh"    // readKOmegaSSTCoeffs
 #include "fvc.cuh"
 #include "forces.cuh"               // wallForces + forceCoeffs (shared with gpuSimpleFoam)
@@ -57,6 +61,8 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <algorithm>
 #include <string>
@@ -79,6 +85,642 @@ std::string timeName(scalar t)
 
 
 // CodedBCSpec + parseCodedBCs + setupCodedBCs now live in coded_bc_setup.cuh (shared with gpuSimpleFoam).
+
+// constant/transportProperties as singlePhaseTransportModel reads it: `transportModel` with no default
+// (viscosityModelNew.C:43), and for Newtonian a `nu` with no default (Newtonian.C:56). This driver read `nu` alone, with a
+// default of 1e-5, so a non-Newtonian case ran Newtonian -- TJunctionArrheniusBirdCarreauTransport, which has no `nu`, at
+// 1e-5 -- and a case without `nu` ran at 1e-5 where OpenFOAM stops.
+void refuseTransportBraeDoesNotRun(const FoamDict& transport)
+{
+    if (!transport.found("transportModel"))
+    {
+        throw std::runtime_error(
+            "brae: constant/transportProperties has no `transportModel`. OpenFOAM reads it with no default "
+            "(viscosityModelNew.C:43) and stops. Add `transportModel Newtonian;` and `nu <value>;`.");
+    }
+    const std::string model = transport.wordOr("transportModel", "");
+    if (model != "Newtonian")
+    {
+        throw std::runtime_error(
+            "brae: constant/transportProperties `transportModel " + model + "` is not ported: brae's pimpleFoam "
+            "carries one constant laminar viscosity, so it would run this non-Newtonian fluid as a Newtonian one "
+            "(and at a made-up nu when the model has no `nu` entry). Only `transportModel Newtonian` runs.");
+    }
+    if (!transport.found("nu"))
+    {
+        throw std::runtime_error(
+            "brae: constant/transportProperties says `transportModel Newtonian` and has no `nu`. OpenFOAM reads it "
+            "with no default (Newtonian.C:56) and stops; brae used to run at 1e-5. Add `nu <value>;`.");
+    }
+}
+
+// controlDict deltaT and endTime: OpenFOAM reads deltaT with no default (TimeIO.C:272-275); endTime has none under
+// `stopAt endTime` (TimeIO.C:342-347), and with no stopAt entry it is 0, so the run takes no step (TimeIO.C:353-356).
+// This driver took 1e-3 and 1.0 for them.
+void requireTimeEntries(const FoamDict& controlDict)
+{
+    if (!controlDict.found("deltaT"))
+    {
+        throw std::runtime_error(
+            "brae: system/controlDict has no `deltaT`. OpenFOAM reads it with no default (TimeIO.C:272-275) and stops; "
+            "brae used to march at 1e-3. Add `deltaT <value>;`.");
+    }
+    if (!controlDict.found("endTime"))
+    {
+        const std::string why = controlDict.found("stopAt")
+            ? "OpenFOAM reads it with no default under `stopAt endTime` (TimeIO.C:342-347) and stops"
+            : "with no `stopAt` either, OpenFOAM takes endTime 0 and the run takes no step (TimeIO.C:353-356)";
+        throw std::runtime_error(
+            "brae: system/controlDict has no `endTime`: " + why + "; brae used to run to 1.0. Add `endTime <value>;`.");
+    }
+}
+
+// constant/turbulenceProperties, which OpenFOAM's TurbulenceModel::New reads MUST_READ with `simulationType` mandatory
+// (TurbulenceModel.C:93-106). This driver ran laminar when the file was absent, including a case written for OpenFOAM.org,
+// whose model lives in constant/momentumTransport.
+FoamDict readTurbulenceProperties(const std::string& caseDir)
+{
+    const std::string path = caseDir + "/constant/turbulenceProperties";
+    if (!std::filesystem::exists(path))
+    {
+        const bool org = std::filesystem::exists(caseDir + "/constant/momentumTransport");
+        throw std::runtime_error(
+            "brae: there is no constant/turbulenceProperties. OpenFOAM v2412 reads it MUST_READ (TurbulenceModel.C:93-104) "
+            "and stops; brae used to run such a case laminar." + std::string(org
+                ? " This case has constant/momentumTransport, OpenFOAM.org's name for it: brae reads the OpenFOAM v2412 "
+                  "(ESI) file only. Write constant/turbulenceProperties, for example `simulationType laminar;`."
+                : " Add one, for example `simulationType laminar;`."));
+    }
+    FoamDict d = readDict(path);
+    if (!d.found("simulationType"))
+    {
+        throw std::runtime_error(
+            "brae: constant/turbulenceProperties has no `simulationType`. OpenFOAM reads it with no default "
+            "(TurbulenceModel.C:106) and stops; brae used to run laminar. Add `simulationType laminar|RAS|LES;`.");
+    }
+    return d;
+}
+
+// The number tokens of a dictionary entry that is a plain constant, parentheses stripped: `6.28`, `(0 0 1)`, and Function1's
+// `constant 6.28`. Empty for anything else (a table, a sine, a sub-dictionary), which brae's motion reader does not evaluate.
+std::vector<scalar> plainConstant(const std::vector<std::string>& tokens)
+{
+    std::vector<std::string> w;
+    for (const std::string& t : tokens)
+    {
+        std::string s;
+        for (const char ch : t)
+        {
+            if (ch == '(' || ch == ')')
+            {
+                s += ' ';
+            }
+            else
+            {
+                s += ch;
+            }
+        }
+        std::istringstream in(s);
+        for (std::string x; in >> x; )
+        {
+            w.push_back(x);
+        }
+    }
+    if (!w.empty() && (w[0] == "constant" || w[0] == "uniform"))
+    {
+        w.erase(w.begin());
+    }
+    std::vector<scalar> v;
+    for (const std::string& x : w)
+    {
+        char* end = nullptr;
+        const double d = std::strtod(x.c_str(), &end);
+        if (end == x.c_str() || *end != '\0')
+        {
+            return {};
+        }
+        v.push_back(static_cast<scalar>(d));
+    }
+    return v;
+}
+
+// The solid-body motion's entries, where OpenFOAM reads them. solidBodyMotionSolver hands solidBodyMotionFunction::New its
+// coeffDict -- solidBodyCoeffs, or dynamicMeshDict itself -- which reads `solidBodyMotionFunction` there and keeps
+// SBMFCoeffs_ = that dictionary's optionalSubDict(<function>Coeffs) (solidBodyMotionFunction.C:48-65). rotatingMotion reads
+// origin, axis and omega from it with no default (rotatingMotion.C:58-60); oscillatingLinearMotion omega and amplitude with no
+// default and phaseShift, verticalShift if present (oscillatingLinearMotion.C:58-80). brae's reader (solid_body_motion.cuh)
+// defaults origin (0 0 0), axis (0 0 1) and omega 0, looks further up the dictionary than OpenFOAM does, and evaluates a
+// constant only: a missing omega gave a rotor that never turns, a missing axis a rotation about z.
+// Called before readMeshMotion, whose constant read stops on a `table` with a bare "stod"; returns at once for anything but a
+// solidBody motion solver.
+void refuseSolidBodyEntries(const std::string& caseDir)
+{
+    if (!std::filesystem::exists(caseDir + "/constant/dynamicMeshDict"))
+    {
+        return;
+    }
+    const FoamDict d = readDict(caseDir + "/constant/dynamicMeshDict");
+    const std::string solver = d.found("motionSolver") ? d.wordOr("motionSolver", "") : d.wordOr("solver", "");
+    if (d.wordOr("dynamicFvMesh", "") != "dynamicMotionSolverFvMesh" || solver != "solidBody")
+    {
+        return;
+    }
+    const FoamDict* co = d.subDict("solidBodyCoeffs");
+    const FoamDict& c = co ? *co : d;
+    const std::string where = co ? "dynamicMeshDict/solidBodyCoeffs" : "dynamicMeshDict";
+    if (!c.found("solidBodyMotionFunction"))
+    {
+        throw std::runtime_error(
+            "brae: constant/" + where + " has no `solidBodyMotionFunction`. OpenFOAM reads it there with no default "
+            "(solidBodyMotionFunctionNew.C:65-77) and stops; brae would have found one elsewhere in the file.");
+    }
+    const std::string fn = c.wordOr("solidBodyMotionFunction", "");
+    const FoamDict* fc = c.subDict(fn + "Coeffs");
+    const FoamDict& k = fc ? *fc : c;
+    const std::string kWhere = fc ? where + "/" + fn + "Coeffs" : where;
+    struct Entry
+    {
+        const char* name;
+        std::size_t size;
+        bool required;
+    };
+    std::vector<Entry> entries;
+    if (fn == "rotatingMotion")
+    {
+        entries = {{"origin", 3, true}, {"axis", 3, true}, {"omega", 1, true}};
+    }
+    else if (fn == "oscillatingLinearMotion")
+    {
+        entries = {{"amplitude", 3, true}, {"omega", 1, true}, {"phaseShift", 1, false}, {"verticalShift", 3, false}};
+    }
+    for (const Entry& e : entries)
+    {
+        const std::vector<std::string>* v = k.find(e.name);
+        if (!v)
+        {
+            const bool elsewhere = c.found(e.name) || d.found(e.name) || k.subDict(e.name) != nullptr;
+            if (k.subDict(e.name) != nullptr)
+            {
+                throw std::runtime_error(
+                    "brae: constant/" + kWhere + " gives `" + e.name + "` as a Function1 sub-dictionary. brae's solid-body "
+                    "motion evaluates a constant only, and would read this one as absent (0, or the axis z). Give a "
+                    "constant value, or use a case brae runs.");
+            }
+            if (e.required)
+            {
+                throw std::runtime_error(
+                    "brae: " + fn + " in constant/" + kWhere + " has no `" + e.name + "`" + std::string(elsewhere
+                        ? " (it is elsewhere in dynamicMeshDict, where OpenFOAM does not look)" : "")
+                    + ". OpenFOAM reads it there with no default and stops; brae would have moved the mesh with a "
+                    "default. Add `" + e.name + "` to " + kWhere + ".");
+            }
+            if (elsewhere)
+            {
+                throw std::runtime_error(
+                    "brae: " + fn + " `" + e.name + "` is in constant/dynamicMeshDict but not in " + kWhere + ", where "
+                    "OpenFOAM reads it (OpenFOAM then takes no " + e.name + "; brae would apply this one). Move it into "
+                    + kWhere + " or remove it.");
+            }
+            continue;
+        }
+        if (plainConstant(*v).size() != e.size)
+        {
+            std::string val;
+            for (const std::string& t : *v)
+            {
+                val += (val.empty() ? "" : " ") + t;
+            }
+            throw std::runtime_error(
+                "brae: " + fn + " `" + e.name + " " + val + "` in constant/" + kWhere + " is not a constant brae can "
+                "evaluate. OpenFOAM reads it as a Function1 of time; brae's solid-body motion takes a constant only. "
+                "Give a constant value.");
+        }
+    }
+}
+
+// dynamicFvMesh::controlledUpdate (dynamicFvMesh.C:167-182) moves the mesh when timeControl::execute says so
+// (timeControl.C:178-262): `always`; `timeStep` every updateInterval-th time index, every step when the interval is 1 or less;
+// `none` never; the others on write times, run time, wall-clock or CPU time, or at the end. The default is `timeStep` with
+// interval 0, every step. brae moves on `always`, on `timeStep` with an interval above 0, and never otherwise, so any
+// other control, and an interval below 1, would move the mesh on other steps than OpenFOAM's.
+void refuseMeshUpdateControl(const std::string& caseDir)
+{
+    const FoamDict d = readDict(caseDir + "/constant/dynamicMeshDict");
+    const std::string control = d.wordOr("updateControl", "timeStep");
+    if (control == "always" || control == "none")
+    {
+        return;
+    }
+    if (control != "timeStep")
+    {
+        static const std::vector<std::string> named = {"writeTime", "outputTime", "runTime", "adjustable",
+                                                        "adjustableRunTime", "clockTime", "cpuTime", "onEnd"};
+        const bool known = std::find(named.begin(), named.end(), control) != named.end();
+        throw std::runtime_error(
+            "brae: constant/dynamicMeshDict `updateControl " + control + "`" + (known
+                ? " is not ported: brae moves the mesh every step (`always`, `timeStep`) or never (`none`), so it would "
+                  "move it on other steps than OpenFOAM's timeControl (timeControl.C:178-262)."
+                : " is not a timeControl OpenFOAM knows (timeControl.C:38-51); it stops on it.")
+            + " Use `timeStep` (with updateInterval) or `always`.");
+    }
+    if (!d.found("updateInterval"))
+    {
+        return;
+    }
+    const std::vector<scalar> v = plainConstant(*d.find("updateInterval"));
+    if (v.size() != 1 || v[0] != std::floor(v[0]))
+    {
+        throw std::runtime_error(
+            "brae: constant/dynamicMeshDict `updateInterval` is not an integer. OpenFOAM reads it as a label and stops; "
+            "brae would have truncated it.");
+    }
+    if (v[0] < 1)
+    {
+        throw std::runtime_error(
+            "brae: constant/dynamicMeshDict `updateInterval " + std::to_string(static_cast<long>(v[0])) + "` under "
+            "`updateControl timeStep`. OpenFOAM moves the mesh every step for an interval of 1 or less "
+            "(timeControl.C:186-191); brae would never move it. Set `updateInterval 1;` or remove it.");
+    }
+}
+
+// fvSchemes wallDist `updateInterval`: OpenFOAM's wallDist recomputes y after a mesh move when the time index is a multiple
+// of it, default 1 (wallDist.C:127, :193-210); 0 or less never after construction.
+long wallDistUpdateInterval(const std::string& caseDir)
+{
+    const std::string blk = fvSchemesBlock(readFvSchemesText(caseDir), "wallDist");
+    const std::size_t q = blk.find("updateInterval");
+    if (q == std::string::npos)
+    {
+        return 1;
+    }
+    const std::size_t e = blk.find(';', q);
+    std::istringstream in(blk.substr(q + 14, e == std::string::npos ? std::string::npos : e - q - 14));
+    long n = 1;
+    in >> n;
+    return n;
+}
+
+// The earliest time directory of the case holding `U`: what a run that starts from scratch starts from.
+double earliestTime(const std::string& caseDir)
+{
+    double t0 = std::numeric_limits<double>::max();
+    std::error_code ec;
+    for (const auto& e : std::filesystem::directory_iterator(caseDir, ec))
+    {
+        if (!e.is_directory())
+        {
+            continue;
+        }
+        const std::string nm = e.path().filename().string();
+        char* end = nullptr;
+        const double t = std::strtod(nm.c_str(), &end);
+        if (end == nm.c_str() || *end != '\0')
+        {
+            continue;
+        }
+        if (std::filesystem::exists(e.path() / "U") || std::filesystem::exists(e.path() / "U.gz"))
+        {
+            t0 = std::min(t0, t);
+        }
+    }
+    return t0;
+}
+
+// The LES and DES forms brae runs differently from OpenFOAM, from the dictionary alone. Each is a different filter width or a
+// different model under the case's name, so a refusal, not a notice. The ones that need the mesh are in refuseLesOnMesh.
+void refuseLesForms(
+    const FoamDict& turbProps,
+    const DeviceSimpleControls& ctl)
+{
+    if (turbProps.wordOr("simulationType", "laminar") != "LES")
+    {
+        return;
+    }
+    const FoamDict* les = turbProps.subDict("LES");
+    if (!les)
+    {
+        return;   // readTurbulenceModel refuses it
+    }
+    const std::string model = ctl.modelName;
+    // SpalartAllmarasDES.C and kOmegaSSTDES.C are the plain DES length scales, without the DDES shielding fd; brae's
+    // reader takes them into the DDES path (turbulence_setup.cuh: `saDes` and the kOmegaSST branch make no difference).
+    if (model == "SpalartAllmarasDES" || model == "kOmegaSSTDES")
+    {
+        throw std::runtime_error(
+            "brae: constant/turbulenceProperties `LESModel " + model + "` is not ported: brae has the delayed variant "
+            "only and would run " + (model == "SpalartAllmarasDES" ? "SpalartAllmarasDDES" : "kOmegaSSTDDES")
+            + " (with the shielding function, which moves the RANS/LES switch) under this name. Use the DDES model if "
+            "that is what is meant.");
+    }
+    // OpenFOAM's LESdelta::New reads `delta` with no default; brae's reader takes cubeRootVol when it is absent.
+    if (!les->found("delta"))
+    {
+        throw std::runtime_error(
+            "brae: constant/turbulenceProperties LES has no `delta`. OpenFOAM reads it with no default (LESdelta.C) and "
+            "stops; brae would have taken cubeRootVol. Name the filter width.");
+    }
+    const std::string delta = les->wordOr("delta", "");
+    // Smagorinsky and WALE: lesDelta_ is built only on the DES path (device_simple_foam.cu:786-810), so the algebraic
+    // models fall back to cbrt(V) in their kernels (device_smagorinsky.cu:27) while the log says maxDeltaxyz.
+    if (ctl.les && delta == "maxDeltaxyz")
+    {
+        throw std::runtime_error(
+            "brae: constant/turbulenceProperties `LESModel " + model + "` with `delta maxDeltaxyz`: brae's algebraic "
+            "LES kernels take cbrt(V) (cubeRootVol) whatever the case names, so it would run another filter width "
+            "under this one. Use `delta cubeRootVol` on a 3-D mesh, or a DES model.");
+    }
+    // cubeRootVolDelta.C:96-104 and maxDeltaxyz.C:117-125 read deltaCoeff from optionalSubDict(<type>Coeffs) -- the
+    // sub-dictionary when there is one, else LES{} itself -- with defaults 1 and 2. brae's cbrt(V) has no coefficient, and
+    // its maxDeltaxyz reader looks in maxDeltaxyzCoeffs alone.
+    if (delta == "cubeRootVol" && !ctl.iddes)
+    {
+        const scalar dc = les->optionalSubDict("cubeRootVolCoeffs")->scalarOr("deltaCoeff", 1.0);
+        if (dc != 1.0)
+        {
+            throw std::runtime_error(
+                "brae: constant/turbulenceProperties LES cubeRootVol `deltaCoeff " + std::to_string(dc) + "`: brae's "
+                "cubeRootVol is cbrt(V) with a coefficient of 1 (OpenFOAM's default, cubeRootVolDelta.C:96-104) and "
+                "does not read it, so the filter width would be off by that factor. Use deltaCoeff 1.");
+        }
+    }
+    if (delta == "maxDeltaxyz" && !ctl.iddes && !les->subDict("maxDeltaxyzCoeffs") && les->found("deltaCoeff"))
+    {
+        throw std::runtime_error(
+            "brae: constant/turbulenceProperties LES `deltaCoeff` with `delta maxDeltaxyz` and no maxDeltaxyzCoeffs: "
+            "OpenFOAM reads that deltaCoeff from LES{} itself (optionalSubDict, maxDeltaxyz.C:117-125); brae reads it "
+            "from maxDeltaxyzCoeffs only and would take 2. Move it into maxDeltaxyzCoeffs.");
+    }
+    if (ctl.iddes)
+    {
+        // SpalartAllmarasIDDES.C:41-50, kOmegaSSTIDDES.C:41-50: the model refuses any delta but IDDESDelta
+        if (delta != "IDDESDelta")
+        {
+            throw std::runtime_error(
+                "brae: constant/turbulenceProperties `LESModel " + model + "` with `delta " + delta + "`. OpenFOAM's "
+                "IDDES models take IDDESDelta only and stop on any other (SpalartAllmarasIDDES.C:41-50); brae would "
+                "have run its own IDDES length scale under this name. Set `delta IDDESDelta;`.");
+        }
+        // IDDESDelta.C:154-195: Cw and hmax from optionalSubDict(IDDESDeltaCoeffs), Cw 0.15 by default and hmax a
+        // maxDeltaxyz built from the same dictionary (deltaCoeff 2 by default) unless `hmax` names another LESdelta.
+        const FoamDict* idc = les->optionalSubDict("IDDESDeltaCoeffs");
+        const scalar ofCw = idc->scalarOr("Cw", 0.15);
+        const scalar braeCw = ctl.sa ? ctl.saCoeffs.Cw : ctl.ksstCoeffs.Cw;
+        if (ofCw != braeCw)
+        {
+            throw std::runtime_error(
+                "brae: IDDES Cw: OpenFOAM's IDDESDelta takes Cw " + std::to_string(ofCw) + " from IDDESDeltaCoeffs "
+                "(IDDESDelta.C:154-163); brae takes " + std::to_string(braeCw) + " from " + model + "Coeffs. Put the "
+                "same Cw in both, or leave both at 0.15.");
+        }
+        const std::string hmax = idc->wordOr("hmax", "maxDeltaxyz");
+        if (hmax != "maxDeltaxyz" && hmax != "maxDeltaxyzCubeRoot")
+        {
+            throw std::runtime_error(
+                "brae: IDDESDeltaCoeffs `hmax " + hmax + "` is not ported: brae's IDDES hmax is the cell's largest "
+                "extent (maxDeltaxyz's measure on a box-shaped cell). Use maxDeltaxyz.");
+        }
+        // which deltaCoeff each part of the hmax delta reads: maxDeltaxyz's from optionalSubDict(maxDeltaxyzCoeffs) of its
+        // dictionary, which for maxDeltaxyzCubeRoot is maxDeltaxyzCubeRootCoeffs (maxDeltaxyzCubeRootLESDelta.C:86-99)
+        const FoamDict* hd = (hmax == "maxDeltaxyzCubeRoot") ? idc->subDict("maxDeltaxyzCubeRootCoeffs") : idc;
+        if (!hd)
+        {
+            throw std::runtime_error(
+                "brae: IDDESDeltaCoeffs `hmax maxDeltaxyzCubeRoot` without maxDeltaxyzCubeRootCoeffs: OpenFOAM reads "
+                "that sub-dictionary with no default (maxDeltaxyzCubeRootLESDelta.C:86-99) and stops.");
+        }
+        const scalar mc = hd->optionalSubDict("maxDeltaxyzCoeffs")->scalarOr("deltaCoeff", 2.0);
+        const scalar cc = (hmax == "maxDeltaxyzCubeRoot") ? hd->optionalSubDict("cubeRootVolCoeffs")->scalarOr("deltaCoeff", 1.0)
+                                                          : 1.0;
+        if (mc != 2.0 || cc != 1.0)
+        {
+            throw std::runtime_error(
+                "brae: the IDDES hmax delta's deltaCoeff is not the default (maxDeltaxyz 2, cubeRootVol 1): brae's hmax "
+                "is the cell's largest extent and takes no coefficient. Remove the deltaCoeff entries.");
+        }
+        // exactDistance: the IDDES wall-normal spacing needs the wall origin only meshWave carries, so the constructor
+        // takes meshWave for y whatever fvSchemes says (device_simple_foam.cu:814-818)
+        if (ctl.exactWallDist)
+        {
+            throw std::runtime_error(
+                "brae: fvSchemes `wallDist { method exactDistance; }` with " + model + ": brae's IDDES computes the "
+                "wall distance with meshWave whatever the method (it needs the wall origin meshWave carries), so y and "
+                "the IDDES length scale would differ from OpenFOAM's. Use `method meshWave;`.");
+        }
+    }
+}
+
+// The LES forms that need the mesh: OpenFOAM's 2-D cubeRootVol, and brae's IDDES hmax against OpenFOAM's.
+//   BRAE_CONTROL_LES_MESH_UNCHECKED=1: a gate's CONTROL, deliberately wrong -- neither is checked, as before.
+void refuseLesOnMesh(
+    const FoamDict& turbProps,
+    const DeviceSimpleControls& ctl,
+    const PrimitiveMesh& m,
+    const FvGeometry& g,
+    const std::vector<FvPatch>& fvp)
+{
+    if (turbProps.wordOr("simulationType", "laminar") != "LES" || !ctl.turbulent)
+    {
+        return;
+    }
+    if (std::getenv("BRAE_CONTROL_LES_MESH_UNCHECKED") != nullptr)
+    {
+        std::printf("  *** CONTROL MODE: the LES filter width is not checked against the mesh. This run is deliberately "
+                    "wrong. ***\n");
+        return;
+    }
+    const FoamDict* les = turbProps.subDict("LES");
+    const std::string delta = les ? les->wordOr("delta", "cubeRootVol") : std::string("cubeRootVol");
+    // cubeRootVolDelta.C:53-75: on a mesh with nGeometricD 2 (an `empty` pair; polyMesh::calcDirections counts the empty
+    // patches) delta is deltaCoeff*sqrt(V/thickness); brae's kernels take cbrt(V) (device_smagorinsky.cu:27, the DDES
+    // length scales likewise)
+    if (delta == "cubeRootVol" && !ctl.iddes)
+    {
+        for (const FvPatch& p : fvp)
+        {
+            if (p.type == "empty" && p.size > 0)
+            {
+                throw std::runtime_error(
+                    "brae: LES `delta cubeRootVol` on a mesh with an `empty` patch (" + p.name + "). OpenFOAM's cubeRootVol "
+                    "is sqrt(V/thickness) on a 2-D mesh (cubeRootVolDelta.C:53-75); brae's is cbrt(V), so the filter "
+                    "width would differ. Run LES on a 3-D mesh.");
+            }
+        }
+    }
+    if (!ctl.iddes)
+    {
+        return;
+    }
+    // brae's IDDES hmax is the cell's vertex bounding box (cell_max_delta.cuh cellMaxDeltaXYZ); OpenFOAM's is maxDeltaxyz,
+    // deltaCoeff * the largest |n_f . (C_f - C)| (maxDeltaxyz.C:46-80), maxed with cbrt(V) under maxDeltaxyzCubeRoot. The
+    // two agree on a cell whose faces are axis-aligned; on any other they differ, and so does alpha = 0.25 - y/hmax.
+    const FoamDict* idc = les->optionalSubDict("IDDESDeltaCoeffs");
+    const bool cubeRoot = idc->wordOr("hmax", "maxDeltaxyz") == "maxDeltaxyzCubeRoot";
+    const std::vector<scalar> brae = cellMaxDeltaXYZ(m);
+    const std::vector<scalar> of = cellMaxDeltaFaceNormal(m, g, 2.0);
+    const std::vector<scalar>& V = g.V();
+    scalar worst = 0;
+    label at = -1;
+    for (label c = 0; c < m.nCells(); ++c)
+    {
+        const scalar ofh = cubeRoot ? std::max(of[c], std::cbrt(V[c])) : of[c];
+        const scalar r = std::fabs(brae[c] - ofh) / std::max(ofh, scalar(1e-300));
+        if (r > worst)
+        {
+            worst = r;
+            at = c;
+        }
+    }
+    // round-off of two sums of the same coordinates
+    if (worst > 1e-10)
+    {
+        throw std::runtime_error(
+            "brae: " + ctl.modelName + " on this mesh: brae's IDDES hmax (the cell's bounding box) differs from "
+            "OpenFOAM's " + std::string(cubeRoot ? "maxDeltaxyzCubeRoot" : "maxDeltaxyz") + " by up to "
+            + std::to_string(worst * 100) + " % (cell " + std::to_string(at) + "). They agree only where the cells' "
+            "faces are aligned with the axes, so the IDDES length scale would differ from OpenFOAM's here.");
+    }
+}
+
+// The cyclic (plain, non-AMI) interface data -- weights, deltaCoeffs, the face-to-cell vectors, the separation or rotation
+// -- is built once in the solver's constructor and never rebuilt on a move (device_simple_foam.cu:3887-3953 rebuilds the AMI
+// alone). It stays right only when every cell beside a cyclic face keeps its shape and the two halves move together by a pure
+// translation, or do not move. OpenFOAM rebuilds it on every move (cyclicPolyPatch::movePoints).
+void refuseMovingCyclics(
+    const PrimitiveMesh& m,
+    const std::vector<FvPatch>& fvp,
+    const std::vector<label>& movingPts,
+    bool solidBody,
+    bool translation)
+{
+    std::vector<label> cyc;
+    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+    {
+        if (fvp[pi].type == "cyclic")
+        {
+            cyc.push_back(static_cast<label>(pi));
+        }
+    }
+    if (cyc.empty())
+    {
+        return;
+    }
+    if (!solidBody)
+    {
+        throw std::runtime_error(
+            "brae: patch `" + fvp[cyc[0]].name + "` is a plain cyclic on a mesh velocityComponentLaplacian deforms. brae "
+            "builds a cyclic's interpolation weights and face vectors once and does not rebuild them after a move, as "
+            "OpenFOAM does, so they would be stale. Not ported for a deforming mesh.");
+    }
+    // the state of each cell beside a cyclic face: 0 static, 1 every point moves, 2 some do (it deforms)
+    std::vector<char> moves(static_cast<std::size_t>(m.nPoints()), movingPts.empty() ? 1 : 0);
+    for (const label p : movingPts)
+    {
+        moves[static_cast<std::size_t>(p)] = 1;
+    }
+    std::vector<std::vector<label>> cellFaces(static_cast<std::size_t>(m.nCells()));
+    for (label f = 0; f < m.nFaces(); ++f)
+    {
+        cellFaces[static_cast<std::size_t>(m.owner()[f])].push_back(f);
+        if (f < m.nInternalFaces())
+        {
+            cellFaces[static_cast<std::size_t>(m.neighbour()[f])].push_back(f);
+        }
+    }
+    auto cellState = [&](label c)
+    {
+        int nMove = 0;
+        int nStay = 0;
+        for (const label f : cellFaces[static_cast<std::size_t>(c)])
+        {
+            for (label k = 0; k < m.faceSize(f); ++k)
+            {
+                if (moves[static_cast<std::size_t>(m.faceVert(f, k))])
+                {
+                    ++nMove;
+                }
+                else
+                {
+                    ++nStay;
+                }
+            }
+        }
+        return nMove == 0 ? 0 : (nStay == 0 ? 1 : 2);
+    };
+    // every cell beside a cyclic face of one patch, in one state
+    auto patchState = [&](label pi)
+    {
+        int s0 = -1;
+        for (label i = 0; i < fvp[pi].size; ++i)
+        {
+            const int s = cellState(m.owner()[fvp[pi].start + i]);
+            if (s == 2 || (s == 1 && !translation))
+            {
+                throw std::runtime_error(
+                    "brae: plain cyclic patch `" + fvp[pi].name + "` on a moving mesh: a cell beside it "
+                    + (s == 2 ? std::string("deforms") : std::string("rotates")) + " with the motion. brae builds a "
+                    "cyclic's weights and face vectors once and does not rebuild them after a move, as OpenFOAM does, "
+                    "so they would be stale. Only cyclics whose cells stay still, or translate rigidly together, run.");
+            }
+            s0 = (s0 < 0 || s0 == s) ? s : 3;
+        }
+        return s0;
+    };
+    // ...and the two halves of a pair together: one still and one translating would change the separation between them
+    for (const label pi : cyc)
+    {
+        std::string nbrName;
+        for (const PatchInfo& pinfo : m.patches())
+        {
+            if (pinfo.name == fvp[pi].name)
+            {
+                nbrName = pinfo.neighbourPatch;
+            }
+        }
+        label nbr = -1;
+        for (std::size_t q = 0; q < fvp.size(); ++q)
+        {
+            if (fvp[q].name == nbrName)
+            {
+                nbr = static_cast<label>(q);
+            }
+        }
+        const int s0 = patchState(pi);
+        const int s1 = nbr >= 0 ? patchState(nbr) : s0;
+        if (s0 == 3 || s0 != s1)
+        {
+            throw std::runtime_error(
+                "brae: plain cyclic pair `" + fvp[pi].name + "` / `" + nbrName + "` on a moving mesh: part of it moves "
+                "and part does not, so the separation between the halves changes. brae builds it once and does not "
+                "rebuild it after a move, as OpenFOAM does.");
+        }
+    }
+}
+
+// A function object brae runs that would be wrong under this run's settings. The FO step context (brae_time.cuh stepContext)
+// takes time = startTime + iteration*deltaT with controlDict's deltaT, which an adjustTimeStep run does not keep; and the
+// forces' face areas and centres are copied once (forces_fo.cuh:655-690) while a moving mesh moves them.
+void refuseFunctionObject(
+    const std::string& type,
+    const std::string& name,
+    bool adjustTimeStep,
+    bool moving)
+{
+    if (moving && (type == "forces" || type == "forceCoeffs"))
+    {
+        throw std::runtime_error(
+            "brae: functions/" + name + " (" + type + ") on a moving mesh: brae's forces take the patch face areas and "
+            "centres once at the start and do not follow the mesh, so the forces and moments would be computed on the "
+            "start geometry. Remove the function object, or run the static case.");
+    }
+    if (adjustTimeStep)
+    {
+        throw std::runtime_error(
+            "brae: functions/" + name + " (" + type + ") with `adjustTimeStep yes`: brae's function objects take the time "
+            "as startTime + steps*deltaT with controlDict's deltaT, which an adaptive run does not keep, so their time "
+            "column, their execute/write controls and timeStart/timeEnd would be evaluated on another clock than the "
+            "run's. Remove the function object or run at a fixed deltaT.");
+    }
+}
 
 void printUsage()
 {
@@ -114,21 +756,25 @@ try
     const FoamDict controlDict = readDict(caseDir + "/system/controlDict");
     const FoamDict fvSolution  = readDict(caseDir + "/system/fvSolution");
     const FoamDict transport   = readDict(caseDir + "/constant/transportProperties");
+    refuseTransportBraeDoesNotRun(transport);
+    // Read here, with the others, so that it outlives the audit below: it was read inside an `if (exists(...))` further
+    // down, and so was never audited -- every entry of it this driver did not read went unreported.
+    const FoamDict turbProps   = readTurbulenceProperties(caseDir);
 
-    // As in the other drivers. turbulenceProperties is deliberately NOT registered: this driver reads it
-    // inside an `if (exists(...))` block further down, so it would be destroyed before this scope and the
-    // audit would report on a dangling dict.
+    // As in the other drivers.
     DictAuditScope audit;
     audit.add(controlDict, "system/controlDict");
     audit.add(fvSolution,  "system/fvSolution");
     audit.add(transport,   "constant/transportProperties");
+    audit.add(turbProps,   "constant/turbulenceProperties");
     audit.addFvSchemes(caseDir);   // reported at scope exit, once every consumer has run
     scalar ddtOcCoeff = 1.0;
     const DdtScheme ddtScheme  = parsePimpleDdtScheme(caseDir + "/system/fvSchemes", ddtOcCoeff);
 
+    requireTimeEntries(controlDict);
     scalar       startTime     = controlDict.scalarOr("startTime", 0.0);   // resolved below for startFrom latestTime (restart)
-    scalar deltaT              = controlDict.scalarOr("deltaT", 1e-3);   // varies when adjustTimeStep
-    const scalar endTime       = controlDict.scalarOr("endTime", 1.0);
+    scalar deltaT              = controlDict.scalarOr("deltaT", 0.0);   // varies when adjustTimeStep
+    const scalar endTime       = controlDict.scalarOr("endTime", 0.0);
     const std::string writeControl = controlDict.wordOr("writeControl", "timeStep");
     const scalar writeInterval = controlDict.scalarOr("writeInterval", 1e30);
     const int    purgeWrite    = std::max(0, controlDict.intOr("purgeWrite", 0));
@@ -171,9 +817,10 @@ try
     const TimeControls timeControls = TimeControls::read(controlDict);
     // adjustTimeStep runs on OpenFOAM's clock (work package M4, issue #53): the RunClock below, built where the start is
     // resolved, and the loop's CourantNo.H / setDeltaT.H / ++runTime. Until M4 the step sequence was brae's own -- no
-    // setDeltaT.H before the first step, no Time::adjustDeltaT.
+    // setDeltaT.H before the first step, no Time::adjustDeltaT -- and the case was refused unless acknowledged.
     // tests/pimple_adjusttimestep_vs_openfoam.sh holds it step by step against OpenFOAM's own log.
     // constant/dynamicMeshDict. Absent -> inactive, so every existing case takes the identical path.
+    refuseSolidBodyEntries(caseDir);
     const MeshMotion meshMotion = readMeshMotion(caseDir);
     // ...and the OTHER motion solver brae has: velocityComponentLaplacian, which SOLVES for the motion
     // instead of prescribing it (movingCone's piston). Both readers return inactive on a dict that names
@@ -181,7 +828,9 @@ try
     VelocityComponentLaplacianMotion vclMotion;
     if (std::filesystem::exists(caseDir + "/constant/dynamicMeshDict"))
         vclMotion = readVelocityComponentLaplacian(readDict(caseDir + "/constant/dynamicMeshDict"));
-
+    const bool moving = meshMotion.active || vclMotion.active;
+    if (moving)
+        refuseMeshUpdateControl(caseDir);
 
     // ---- PIMPLE + solver controls (fvSolution) ----
     // the PIMPLE block, every control the run takes from it (pRefCell/pRefValue apart, read below where a reference is needed),
@@ -192,7 +841,17 @@ try
     const int nCorr    = pimpleAlg.nCorr;
     const bool ddtCorrOn = pimpleAlg.ddtCorr;
     const int nNonOrth = pimpleAlg.nNonOrth;
-    const scalar nu = transport.scalarOr("nu", 1e-5);
+    // moveMeshOuterCorrectors: OpenFOAM keeps the old points and the old volumes once per time index (polyMesh::movePoints,
+    // curMotionTimeIndex_), so every outer corrector moves from the same start. brae's update takes the CURRENT points as
+    // the old ones on every call (the meshUpdate lambda below), so from the second corrector on the mesh flux and the
+    // moving-wall velocity are zero, and a velocityComponentLaplacian mesh moves again on each corrector.
+    if (moving && pimpleAlg.moveMeshOuterCorrectors && nOuter > 1)
+        throw std::runtime_error(
+            "brae: system/fvSolution PIMPLE `moveMeshOuterCorrectors yes` with nOuterCorrectors " + std::to_string(nOuter)
+            + " on a moving mesh is not ported: brae's mesh update does not keep the old points once per time step as "
+            "OpenFOAM does, so from the second outer corrector on the mesh flux and the moving-wall velocity would be "
+            "zero. Set `moveMeshOuterCorrectors no;` or nOuterCorrectors 1.");
+    const scalar nu = transport.scalarOr("nu", 0.0);   // refuseTransportBraeDoesNotRun: present
 
     DeviceSimpleControls ctl;
     ctl.nu = nu;
@@ -212,11 +871,9 @@ try
     // turbulence scalars, ...). Same parse as steady brae -> the transient solve honours the case's schemes, not upwind.
     parseFvSchemesControls(caseDir, ctl);
 
-    // ---- turbulence model (constant/turbulenceProperties). Absent -> laminar. ----
+    // ---- turbulence model (constant/turbulenceProperties, read and refused when absent at the top) ----
     std::string secondName = "epsilon";
-    if (std::filesystem::exists(caseDir + "/constant/turbulenceProperties"))
     {
-        const FoamDict turbProps = readDict(caseDir + "/constant/turbulenceProperties");
         const std::string simType = turbProps.wordOr("simulationType", "laminar");
         if (simType != "RAS" && simType != "laminar" && simType != "LES")
             throw std::runtime_error("pimpleFoam: unsupported simulationType '" + simType + "' (RAS, LES or laminar).");
@@ -225,6 +882,40 @@ try
         // has no consumer on the transient path.
         readTurbulenceModel(turbProps, ctl, {"pimpleFoam", false, true});
         secondName = ctl.sst ? "omega" : "epsilon";
+    }
+    refuseLesForms(turbProps, ctl);
+    // The wall distance on a moving mesh. OpenFOAM's wallDist is a MeshObject that fvMesh::movePoints updates
+    // (fvMesh.C:997, wallDist.C:193-210): y is recomputed after every move unless fvSchemes wallDist sets updateInterval 0.
+    // brae computes y (and the IDDES hmax and wall-normal spacing, and the maxDeltaxyz LES delta) once, in the solver's
+    // constructor (device_simple_foam.cu:786-834), and never again. The models that read y: kOmegaSST (F1, F2, F23),
+    // kOmegaSSTLM, Spalart-Allmaras and every DES and IDDES model on them.
+    if (moving && ctl.turbulent && (ctl.sst || ctl.sa) && wallDistUpdateInterval(caseDir) > 0)
+        throw std::runtime_error(
+            "brae: " + ctl.modelName + " on a moving mesh: the model reads the wall distance, which OpenFOAM recomputes "
+            "after every mesh move (wallDist.C:193-210) and brae computes once at the start, so F1/F2 (or dTilda) would "
+            "be built from the start geometry. Not ported; kEpsilon, RNGkEpsilon, realizableKE and the algebraic LES "
+            "models do not read it.");
+    // Named ddt entries, for the fields this run integrates (pimple_controls.cuh).
+    {
+        std::vector<std::string> ddtNames = {"ddt(U)"};
+        if (ctl.turbulent && !ctl.les)
+        {
+            if (ctl.sa)
+                ddtNames.push_back("ddt(nuTilda)");
+            else
+            {
+                ddtNames.push_back("ddt(k)");
+                ddtNames.push_back("ddt(" + secondName + ")");
+            }
+            if (ctl.lm)
+            {
+                ddtNames.push_back("ddt(ReThetat)");
+                ddtNames.push_back("ddt(gammaInt)");
+            }
+        }
+        if (ctl.maxwell)
+            ddtNames.push_back("ddt(sigma)");
+        refuseNamedDdtSchemes(caseDir, ddtNames, ddtScheme, ddtOcCoeff);
     }
 
     // fvSolution -> ctl, through the SHARED reader. Must come AFTER the turbulence model is read: it
@@ -281,6 +972,27 @@ try
     // Info's precision: Time sets IOstream::defaultPrecision from writePrecision (Time.C readDict), so OpenFOAM's log lines
     // carry the case's digits
     const int logPrec = std::max(1, controlDict.intOr("writePrecision", 6));
+    refuseLesOnMesh(turbProps, ctl, m, g, fvp);
+    // A MOVING MESH RESTARTED. OpenFOAM reads the mesh at the start time's instance -- <start>/polyMesh/points once the mesh
+    // has moved (polyMesh.C, fvMesh::readUpdate) -- with meshPhi and Uf beside it, and continues the motion from there. brae
+    // reads constant/polyMesh whatever the start (above), takes points0 from it, and writes no points, meshPhi or Uf: the
+    // first restarted step would sweep the zone from its t = 0 position to its position at t (meshPhi and the moving-wall
+    // velocity carrying the whole rotation), and a velocityComponentLaplacian mesh would restart undeformed. A start that is
+    // not the case's first time, or a start directory carrying polyMesh/points, is a restart.
+    if (moving)
+    {
+        const bool movedPoints = std::filesystem::exists(fieldDir + "/polyMesh/points")
+                              || std::filesystem::exists(fieldDir + "/polyMesh/points.gz");
+        const double first = earliestTime(caseDir);
+        if (movedPoints || start.value > first)
+            throw std::runtime_error(
+                "brae: this moving-mesh case starts from time " + startStr + (movedPoints
+                    ? ", whose directory holds polyMesh/points (a mesh that has already moved)"
+                    : ", after its first time directory " + openFoamTimeName(first))
+                + ". brae reads the mesh from constant/polyMesh and moves it from there, and writes no polyMesh/points, "
+                "meshPhi or Uf, so a restarted run would start from the unmoved mesh where OpenFOAM continues from the "
+                "moved one. A moving-mesh restart is not ported: run the case from its first time.");
+    }
     GeometricField<vector> U = buildField<vector>(readField<vector>(fieldDir + "/U"), fvp, nC); U.evaluateBoundary();
     const FieldData<scalar> pFd = readField<scalar>(fieldDir + "/p");
     GeometricField<scalar> p = buildField<scalar>(pFd, fvp, nC); p.evaluateBoundary();
@@ -567,6 +1279,8 @@ try
             throw std::runtime_error("brae: dynamicMeshDict cellZone '" + meshMotion.cellZone +
                 "' is not in constant/polyMesh/cellZones; brae will not guess which cells move.");
         movingPts = movingPointIDs(m, it->second);
+        refuseMovingCyclics(m, fvp, movingPts, true,
+                            meshMotion.motion.kind == SolidBodyMotion::Kind::OscillatingLinear);
         std::printf("  mesh motion: %zu of %d points move (cellZone '%s', %zu cells)\n",
                     movingPts.size(), (int)m.nPoints(), meshMotion.cellZone.c_str(), it->second.size());
     }
@@ -578,6 +1292,7 @@ try
     std::vector<std::pair<label, scalar>> vclConstraints;
     if (vclMotion.active)
     {
+        refuseMovingCyclics(m, fvp, {}, false, false);
         const std::string mpPath = fieldDir + "/" + vclMotion.fieldName;
         if (!std::filesystem::exists(mpPath) && !std::filesystem::exists(mpPath + ".gz"))
             throw std::runtime_error(
@@ -652,6 +1367,10 @@ try
                 noticeIgnored("functions/" + foName, std::string(e.what()) + " -- this tracer is NOT solved.");
                 return nullptr;
             }
+            refuseFunctionObject("scalarTransport", foName, timeControls.adjustTimeStep, moving);
+            // OF scalarTransport.C: fvm::ddt(s) is looked up as ddt(<field>); brae integrates the tracer with the
+            // solver's own ddtSchemes.default
+            refuseNamedDdtSchemes(caseDir, {"ddt(" + fld + ")"}, ddtScheme, ddtOcCoeff);
             auto fo = std::make_unique<ScalarTransportFO>(
                 foName, fld, fieldDir + "/" + fld, timeRegistry,
                 fd.scalarOr("D", 0.0), fd.scalarOr("relaxCoeff", 1.0), fd.scalarOr("tol", 1e-6),
@@ -666,16 +1385,34 @@ try
         "forces",
         [&](const std::string& foName, const FoamDict& fd) -> std::unique_ptr<FunctionObject>
         {
-            return ForcesFO::make(foName, fd, false, forcesCtx);
+            std::unique_ptr<FunctionObject> fo = ForcesFO::make(foName, fd, false, forcesCtx);
+            if (fo)
+                refuseFunctionObject("forces", foName, timeControls.adjustTimeStep, moving);
+            return fo;
         });
     foTypes.emplace_back(
         "forceCoeffs",
         [&](const std::string& foName, const FoamDict& fd) -> std::unique_ptr<FunctionObject>
         {
-            return ForcesFO::make(foName, fd, true, forcesCtx);
+            std::unique_ptr<FunctionObject> fo = ForcesFO::make(foName, fd, true, forcesCtx);
+            if (fo)
+                refuseFunctionObject("forceCoeffs", foName, timeControls.adjustTimeStep, moving);
+            return fo;
         });
     Time time(controlDict, nullptr, 0, foTypes);
     time.setRunStart(startStr, startTime);
+    // The write grid continues from the run's start, as OpenFOAM's does: Time::operator++ measures a runTime or
+    // adjustableRunTime write index as (value() - startTime_ + 0.5 deltaT)/writeInterval, with startTime_ the RESOLVED start
+    // (Time.C:157-181 sets it from startFrom; Time.C:1116-1128 uses it) and writeTimeIndex_ 0 at construction. The
+    // WriteControl measured from controlDict's startTime instead, so after a latestTime restart at 0.37 under
+    // `writeControl runTime; writeInterval 0.1` the first step was a write (index 3 > 0) and the later ones sat on 0.4, 0.5
+    // where OpenFOAM writes 0.47, 0.57. A start that is controlDict's startTime -- every run from scratch -- is unchanged.
+    //   BRAE_CONTROL_WRITE_GRID_ABSOLUTE=1: a gate's CONTROL, deliberately wrong -- the grid from controlDict's startTime.
+    if (std::getenv("BRAE_CONTROL_WRITE_GRID_ABSOLUTE") == nullptr)
+        time.writeControl().setStartTime(startTime);
+    else
+        std::printf("  *** CONTROL MODE: the write grid is measured from controlDict's startTime. This run is "
+                    "deliberately wrong. ***\n");
 
     auto writeTimeDirBody = [&](const std::string& tname) {
         const std::string outDir = caseDir + "/" + tname;
@@ -819,6 +1556,59 @@ try
             clockSetDeltaT(setInitialDeltaT(clock->deltaT(), c0.CoNum, timeControls));
         deltaT = clock->deltaT();
     }
+    // THE TURBULENCE FIELDS' HEALTH. The loop below stopped on a non-finite p or U residual only. A k-epsilon or k-omega pair
+    // can run away without reaching U: on pitzDaily with linearUpwind on both scalars omega reached 1e42 with k at its floor,
+    // nut collapsed, U stayed bounded and every residual finite (turb_blowup.cuh), and a NaN that Foam::bound's max() turns
+    // back into the floor never reaches a residual at all. Measured here (tests/pimple_turbulence_health.sh): pitzDaily at a
+    // Courant number in the hundreds, whose epsilon solve goes NaN at step 10 while p's and U's residuals are still finite --
+    // brae wrote that step with U and p NaN in every cell. OpenFOAM's log has the same epsilon NaN at the same step; with
+    // FPE trapping (trapFpe 1) it aborts there on x86, and on aarch64, whose cores do not trap, it writes NaN to the end.
+    // So:
+    //   every step, before its write: each turbulence solve's residuals finite (solution_health.cuh healthResidual, on the
+    //     host values the solves already hold -- free);
+    //   every kHealthStride-th step and before every write: sum|k| + sum|second field| (nuTilda for SA) finite, and not
+    //     1e12 times its first value for TurbBlowup::kStreak checks in a row (turb_blowup.cuh). Two device sums with a
+    //     blocking read each: MEASURED +0.4 to +0.7 ms a step on pitzDaily (12,225 cells, about 12 ms a step, kEpsilon and
+    //     kOmegaSST, 400 steps x 3 runs) when taken every step, so they are taken every tenth and at the writes, where
+    //     a field must not leave the device non-finite.
+    // BRAE_ALLOW_NONFINITE=1 opts out, as for p and U.
+    constexpr long kHealthStride = 10;
+    TurbBlowup turbBlowup;
+    const bool turbHealth = ctl.turbulent && !ctl.les && std::getenv("BRAE_ALLOW_NONFINITE") == nullptr;
+    // TEST CONTROL: <field>:<kind>:<time step>, DeviceSimpleSolver::corruptForTest -- one cell of one field, after the step,
+    // so the gate can show the check reads what it claims to (tests/pimple_turbulence_health.sh)
+    std::string corruptField;
+    std::string corruptKind;
+    long corruptStep = -1;
+    if (const char* e = std::getenv("BRAE_TEST_CORRUPT"))
+    {
+        const std::string tc(e);
+        const std::size_t a = tc.find(':');
+        const std::size_t b = tc.rfind(':');
+        if (a == std::string::npos || b == a)
+            throw std::runtime_error("BRAE_TEST_CORRUPT wants <field>:<kind>:<time step>");
+        corruptField = tc.substr(0, a);
+        corruptKind = tc.substr(a + 1, b - a - 1);
+        corruptStep = std::atol(tc.c_str() + b + 1);
+    }
+    long healthChecks = 0;
+    auto turbSumHealth = [&](long step, const std::string& tn)
+    {
+        ++healthChecks;
+        if (!turbBlowup.update(solver.turbSumMag(), static_cast<int>(healthChecks)))
+            return;
+        const bool finite = std::isfinite(turbBlowup.last);
+        throw std::runtime_error(
+            "solution diverged: sum|" + std::string(ctl.sa ? "nuTilda" : "k") + "|" + (ctl.sa ? "" : " + sum|" + secondName + "|")
+            + (finite
+                ? " has stood above " + std::to_string(static_cast<double>(TurbBlowup::kRatio)) + " times its first value ("
+                  + std::to_string(static_cast<double>(turbBlowup.base)) + ", now " + std::to_string(static_cast<double>(turbBlowup.last))
+                  + ") for " + std::to_string(turbBlowup.streak) + " checks in a row (every " + std::to_string(kHealthStride)
+                  + " steps and at every write) without coming back"
+                : " is not finite (" + std::to_string(static_cast<double>(turbBlowup.last)) + ")")
+            + " at time step " + std::to_string(step) + ", Time = " + tn + ". This step is not written; earlier writes are "
+            "kept. Set BRAE_ALLOW_NONFINITE=1 to continue anyway.");
+    };
     // Does any cyclicACMI carry a time `scale`? Then the geometry is rebuilt every step even on a
     // static mesh; without one, a static mesh keeps the single setup-time build it always had.
     const bool acmiTimeScale = hasACMITimeScale(m);
@@ -946,6 +1736,7 @@ try
         }
         };   // meshUpdate
         const bool anyMotion = meshMotion.active || vclMotion.active || acmiTimeScale;
+        clearTurbulenceReport();   // this step's turbulence solves only (read by the health check below)
         const DeviceSimpleResidual r =
             solver.pimpleStep(deltaT, nOuter, nCorr, anyMotion ? meshUpdate : std::function<void(int)>());
         const std::string tn = clock ? clock->timeName() : timeName(t);
@@ -954,7 +1745,26 @@ try
         if (!std::getenv("BRAE_ALLOW_NONFINITE")
             && !(std::isfinite(r.p) && std::isfinite(r.Ux) && std::isfinite(r.Uy) && std::isfinite(r.Uz)))
             throw std::runtime_error("solution diverged: non-finite residual at Time = " + tn + ". Reduce deltaT (CFL).");
+        if (timeIndex == corruptStep)
+            solver.corruptForTest(corruptField, corruptKind);
+        if (turbHealth)
+        {
+            std::string why;
+            for (const ScalarSolveEntry& e : turbulenceReport())
+            {
+                if (why.empty())
+                    why = healthResidual(e.field, e.perf.initialResidual, static_cast<int>(timeIndex));
+                if (why.empty())
+                    why = healthResidual(e.field + " (final)", e.perf.finalResidual, static_cast<int>(timeIndex));
+            }
+            if (!why.empty())
+                throw std::runtime_error("solution diverged: " + why + " (time step " + std::to_string(timeIndex)
+                                         + ", Time = " + tn + "). This step is not written. Set BRAE_ALLOW_NONFINITE=1 "
+                                         "to continue anyway.");
+        }
         const bool isWrite = clock ? clock->writeTime() : time.writeControl().isWriteTime(timeIndex, t);
+        if (turbHealth && (isWrite || timeIndex % kHealthStride == 0))
+            turbSumHealth(timeIndex, tn);
         if (isWrite) { writeTimeDir(tn); lastWritten = tn; time.write(); }
     }
     // brae writes the final state below when the cadence did not; OpenFOAM does not, so it is not noted as a write time
@@ -965,7 +1775,12 @@ try
         RunTiming::drain();
         if (timingMaster) std::printf("brae-timing loop %.6f %ld\n", RunTiming::now() - loopStart, static_cast<long>(timeIndex));
     }
-    if (finalName != lastWritten) writeTimeDir(finalName);
+    if (finalName != lastWritten)
+    {
+        if (turbHealth)
+            turbSumHealth(timeIndex, finalName);
+        writeTimeDir(finalName);
+    }
     return 0;
 }
 catch (const std::exception& e)

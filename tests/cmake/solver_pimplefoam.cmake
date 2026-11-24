@@ -112,6 +112,46 @@ add_test(NAME pimple_guards
                  ${PROJECT_BINARY_DIR}/pimple_guards_work)
 set_tests_properties(pimple_guards PROPERTIES TIMEOUT 120)
 
+# Work package Q2 (pimpleFoam guard bundle). Each script's header says what it holds and how its control fails.
+# The set-up refusals: configurations brae_pimpleFoam computes differently from OpenFOAM v2412 (transportModel, a missing
+# turbulenceProperties, deltaT or endTime, named ddt entries, moving-mesh restart / cyclic / wall distance / forces /
+# update cadence / outer-corrector motion, function objects under adjustTimeStep, the LES and DES forms brae does not
+# reproduce), each refused by name under `brae check --setup`, and the nearest supported form of each set up. Small boxes
+# written by tests/pimple_box_case.py; no OpenFOAM needed. About 80 s on the GB10 (two dozen set-ups on the GPU).
+add_test(NAME pimple_setup_refusals
+         COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_setup_refusals.sh
+                 $<TARGET_FILE:brae_pimpleFoam>
+                 ${PROJECT_BINARY_DIR}/pimple_setup_refusals_work)
+set_tests_properties(pimple_setup_refusals PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow" TIMEOUT 900)
+
+# The write grid after a latestTime restart under writeControl runTime: brae's written times against OpenFOAM's, restarting
+# from its own write, from OpenFOAM's, and OpenFOAM from brae's; control BRAE_CONTROL_WRITE_GRID_ABSOLUTE=1. About 60 s.
+add_test(NAME pimple_restart_write_grid_vs_openfoam
+         COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_restart_write_grid_vs_openfoam.sh
+                 $<TARGET_FILE:brae_pimpleFoam>
+                 ${PROJECT_SOURCE_DIR}/validation/pitzDaily
+                 ${PROJECT_BINARY_DIR}/pimple_restart_write_grid_work)
+set_tests_properties(pimple_restart_write_grid_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow" TIMEOUT 900)
+
+# The turbulence fields' health on the transient loop: a natural divergence whose epsilon solve goes NaN while p and U are
+# still finite, injected NaN/Inf in k, epsilon and omega, a healthy run, and the BRAE_ALLOW_NONFINITE=1 opt-out as control;
+# OpenFOAM's own run of the divergence reported beside it when present. About 90 s.
+add_test(NAME pimple_turbulence_health
+         COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_turbulence_health.sh
+                 $<TARGET_FILE:brae_pimpleFoam>
+                 ${PROJECT_SOURCE_DIR}/validation/pitzDaily
+                 ${PROJECT_BINARY_DIR}/pimple_turbulence_health_work)
+set_tests_properties(pimple_turbulence_health PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow" TIMEOUT 900)
+
+# brae's IDDES hmax (the cell's bounding box) against OpenFOAM's maxDeltaxyz and maxDeltaxyzCubeRoot fields, written by
+# pimpleFoam -postProcess: they agree on a Cartesian box, where brae sets up, and differ on a sheared one, where brae refuses
+# and reports the difference this gate measures. Control BRAE_CONTROL_LES_MESH_UNCHECKED=1. About 20 s.
+add_test(NAME pimple_iddes_hmax_vs_openfoam
+         COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_iddes_hmax_vs_openfoam.sh
+                 $<TARGET_FILE:brae_pimpleFoam>
+                 ${PROJECT_BINARY_DIR}/pimple_iddes_hmax_work)
+set_tests_properties(pimple_iddes_hmax_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS "slow" TIMEOUT 900)
+
 # adjustTimeStep on OpenFOAM's clock (issue #53): pitzDaily step by step against OpenFOAM's own log -- every deltaT
 # replayed through OpenFOAM's rules to the bit, the write times, the fields at each write, four restarts, two controls.
 add_test(NAME pimple_adjusttimestep_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_adjusttimestep_vs_openfoam.sh)
