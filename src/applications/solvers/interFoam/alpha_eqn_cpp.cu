@@ -1,6 +1,8 @@
 // interFoam's alpha equation, flux assembly -- see alpha_eqn_cpp.cuh for the provenance and for the
 // four things in it that are not arithmetic.
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include "alpha_eqn_cpp.cuh"
 #include "limitedSchemes_cpp.cuh"
@@ -28,6 +30,31 @@ namespace {
 bool switchOr(const FoamDict& d, const std::string& key, bool def)
 {
     return d.switchOr(key, def);
+}
+
+// BRAE_CONTROL_ALPHA_CALPHA=<scale>: a gate's CONTROL, deliberately wrong -- the interface compression coefficient
+// cAlpha multiplied by <scale> in phic, so the alpha transport is assembled wrong by a known amount. The fault a
+// bound on alpha must be able to see (tests/interfoam_dtchullmoving_vs_openfoam.sh). Read once; announced on stdout;
+// anything but a positive number stops the run. Unset, the factor is exactly 1 and nothing changes.
+scalar alphaCalphaControl()
+{
+    static const scalar factor = []
+    {
+        const char* e = std::getenv("BRAE_CONTROL_ALPHA_CALPHA");
+        if (!e) return scalar(1);
+        char* end = nullptr;
+        const double v = std::strtod(e, &end);
+        if (end == e || *end != '\0' || !(v > 0.0))
+        {
+            std::fprintf(stderr, "brae: BRAE_CONTROL_ALPHA_CALPHA=%s is not a positive scale factor\n", e);
+            std::exit(1);
+        }
+        std::printf("  *** BRAE_CONTROL_ALPHA_CALPHA=%s: the interface compression is assembled WRONG on purpose "
+                    "(a gate's control) ***\n", e);
+        std::fflush(stdout);
+        return scalar(v);
+    }();
+    return factor;
 }
 
 }   // namespace
@@ -446,7 +473,7 @@ void alphaEqnStep(GeometricField<scalar>&                 alpha1,
     // open area, it is not: OpenFOAM rescales lazily, and this phic is the one formed on the areas the
     // step STARTED with -- see geometryUpdate below.
     SurfaceScalarField phic;
-    compressionFlux(ic.cAlpha, *in.phi, g.magSf(), patches,
+    compressionFlux(ic.cAlpha*alphaCalphaControl(), *in.phi, g.magSf(), patches,
                     in.icAlpha, {}, in.scAlpha, {}, phic);
     // ...and the step's geometry change lands here, after phic and before the pre-solve assembles.
     // MEASURED on RAS/damBreakLeakage's opening step with OpenFOAM's alphaEqn instrumented: phic on the
