@@ -3,7 +3,7 @@ name: gpu-smoke
 # Tier 2 of the CI (docs/ci/branch-rules.md): the short GPU tier, on the self-hosted GB10 (Grace-Blackwell, sm_121).
 # The tests labelled `smoke` (tests/cmake/tiers.cmake: 402 that each took at most 5 s, from every group, about three
 # minutes of tests at -j4 after a build of about six), leaving out what already passed on the same inputs. It runs on
-# pull requests from branches of this repository, on every push to main, and by hand. The whole suite runs nightly
+# pull requests from branches of this repository, on every push to main or develop, and by hand. The whole suite runs nightly
 # and, uncached, before a release (gpu-full.yml).
 #
 # A change that touches documentation only (Markdown, docs/, images, LICENSE) skips the GPU job: no test reads
@@ -20,7 +20,7 @@ name: gpu-smoke
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, develop]
   workflow_dispatch:
 
 permissions:
@@ -51,8 +51,12 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           case "$EVENT" in
-              pull_request) base=$PR_BASE; head=$PR_HEAD ;;
-              push)         base=$PUSH_BEFORE; head=$SHA ;;
+              # a pull request: what its branch changed since it left the base (three dots, from the merge base),
+              # as GitHub's "Files changed" shows it. Two dots would also count every file the base gained since
+              # then, so a documentation-only branch behind main ran the GPU tier (#61, 2026-11-20: 35 of 47).
+              pull_request) base=$PR_BASE; head=$PR_HEAD; range="$base...$head" ;;
+              # a push: what the branch moved by
+              push)         base=$PUSH_BEFORE; head=$SHA; range="$base..$head" ;;
               *)            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
           esac
           # a new branch or a rewritten history has no base to compare with: run the tier
@@ -60,7 +64,7 @@ jobs:
               echo "code=true" >> "$GITHUB_OUTPUT"
               exit 0
           fi
-          git diff --name-only "$base" "$head" > changed.txt
+          git diff --name-only "$range" > changed.txt
           echo "changed files: $(wc -l < changed.txt)"
           # documentation only: Markdown anywhere, docs/, images, LICENSE. No test reads any of them.
           code=$(grep -cvE '\.md$|^docs/|\.(png|jpg|jpeg|gif|svg)$|^LICENSE$' changed.txt || true)

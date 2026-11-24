@@ -66,10 +66,11 @@ jobs:
         # and a binary rebuilt from unchanged sources keeps its fingerprint (the tool's header has the
         # measurement). A change to shared code still runs everything that links it; only passes are kept.
         # -LE known-red: a test whose red is understood and decided (tests/cmake/ says which and why) is left out
-        # here and judged by the next step. The same selection as `ctest --preset full-validation`.
+        # here and judged by the next step. -LE diagnostic: a test whose result depends on the compiler or GPU target
+        # by design runs in the last step instead. The same selection as `ctest --preset full-validation`.
         run: |
           python3 tools/ctest_cached.py --test-dir build \
-              ${{ inputs.no_cache && '--no-cache' || '' }} --output-on-failure -j4 -LE known-red
+              ${{ inputs.no_cache && '--no-cache' || '' }} --output-on-failure -j4 -LE 'known-red|diagnostic'
 
       - name: Known-red rhoCentralFoam gates (red must be exactly the registered open checks)
         # The step above leaves `known-red` out. Six rhoCentralFoam gates carry it: they are red by decision, with 24
@@ -80,3 +81,13 @@ jobs:
         # (tutorial_motorbike's known-red is not a registry item and stays out of both steps.)
         if: ${{ !cancelled() }}
         run: python3 tools/known_red_check.py --test-dir build -j 2
+
+      - name: Diagnostic tests (reported, never failing the job)
+        # The tests labelled `diagnostic` (tests/cmake/tiers.cmake): kept to show where two builds round differently,
+        # not to gate one. A red here is in the log and the run's annotations; it does not fail the run. The same
+        # selection as `ctest --preset diagnostic`.
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: |
+          python3 tools/ctest_cached.py --test-dir build \
+              ${{ inputs.no_cache && '--no-cache' || '' }} --output-on-failure -L diagnostic

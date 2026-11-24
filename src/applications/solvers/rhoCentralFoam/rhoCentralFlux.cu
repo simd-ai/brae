@@ -48,6 +48,8 @@ __device__ __forceinline__ scalar limitedV(scalar faceFlux, const vector& phiP, 
                                            const Grads& G, int P, int N, scalar dx, scalar dy, scalar dz,
                                            scalar lim, bool scalarOnV)
 {
+    // `linear` (kLinearReconTwoByk): no limiter, the mesh weights -- limiter 1 in limitedW gives them to the bit
+    if (lim == kLinearReconTwoByk) return 1.0;
     if (scalarOnV)
     {
         const scalar gf = phiN.x - phiP.x;
@@ -143,7 +145,9 @@ __global__ void faceKernel(int nIF, bool tadmor, int ctrl,
         {
             const scalar wq = (ctrl == controlUpwind)
                 ? limitedW(0.0, cdw, dir)
-                : limitedFaceWeight(P, N, dir, cdw, q, G.x[gi], G.y[gi], G.z[gi], d, lim);
+                : (lim == kLinearReconTwoByk)   // `linear`: the mesh weights, limitedW(1, ...) = cdw to the bit
+                    ? limitedW(1.0, cdw, dir)
+                    : limitedFaceWeight(P, N, dir, cdw, q, G.x[gi], G.y[gi], G.z[gi], d, lim);
             return wq*(q[P] - q[N]) + q[N];
         };
         in.rho[k] = scalarRecon(F.rho, gRho, limRho);

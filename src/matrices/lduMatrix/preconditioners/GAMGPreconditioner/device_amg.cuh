@@ -569,12 +569,26 @@ void amgVCycleApply(AMGData& amg, const DeviceLduView& A,
 // rows (6.1 M: 238.7 and 205.7; private bench, JUPITER job 2738781), the gather about one product. Not for a view with coupled
 // faces (a cyclic's or AMI's terms are deviceAmul's): it keeps amulKernel
 void amgGatherFineCsr64(AMGData& amg, const DeviceLduView& A);
+// BRAE_POOL_STATS census (2026-11-21): every buffer of a hierarchy, and of a matrix held beside one, by name and grid, to stderr
+void amgMemoryReport(const AMGData& A, const char* who, const char* when);
+void lduMemoryReport(const DeviceLduMatrix& M, const char* who, const char* when);
+// the V-cycle's work vectors the direct double-precision cycle of a symmetric matrix never reads, released (device_amg_vcycle.cu);
+// the bytes handed back, 0 when a smoother or form in force reads them
+std::size_t amgReleaseUnreadScratch(AMGData& amg);
 
 // ...in its two parts, for a caller that captures the fill. amgPrepareFineCsr64 makes the rows for A outside any capture and says
 // whether they serve it; amgFillFineCsr64 is one launch, which a capture holds: at every replay it reads the upper and lower the
 // capture baked, as a captured amulKernel would, so a graph keyed wrongly reads stale coefficients in either form
 bool amgPrepareFineCsr64(AMGData& amg, const DeviceLduView& A);
 void amgFillFineCsr64(AMGData& amg, const DeviceLduView& A);
+
+// FUSED LEVEL PRODUCTS in the double weighted-Jacobi cycle (device_amg_vcycle.cu), set by a caller before it captures a cycle:
+// 0 off (the default, and every caller's here), 1 on (the same arithmetic, the product's row sum not written out), 2 the CONTROL,
+// deliberately wrong (the post-smooth's row summed from its last entry). A captured cycle keeps the mode it was captured with: no
+// graph cache is keyed on it. Gate: tests/test_amg_fused_level_products.cu
+void amgFusedLevelProducts(
+    int mode);
+int amgFusedLevelProductsMode();
 
 // y = A x on the finest grid: the rows of amgGatherFineCsr64 when they are A's, deviceAmul otherwise
 void amgFineAmul(AMGData& amg, const DeviceLduView& A, const DeviceBuffer<scalar>& x, DeviceBuffer<scalar>& y);

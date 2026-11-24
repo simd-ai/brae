@@ -59,7 +59,10 @@ enum StatusBits : int
 {
     statusNegativeSeed  = 1,   // e -> T inversion seeded with T < 0 (thermoI.H FatalError)
     statusNotConverged  = 2,   // e -> T inversion past maxIter_ (thermoI.H FatalError)
-    statusNotPhysical   = 4    // rho, p or T not positive, or e not finite
+    statusNotPhysical   = 4,   // rho, p or T not positive, or e not finite
+    // NOT a stop: janaf's T left [Tlow, Thigh] in an e -> T inversion and was clamped. OpenFOAM's janafThermo::limit
+    // warns and clamps (janafThermoI.H:113-130); the driver prints the warning and carries on, numbers unchanged
+    statusJanafLimited  = 8
 };
 
 // NEGATIVE CONTROLS, for the gates only: deliberately wrong numerics a gate must see. Selected by BRAE_CONTROL_RCF,

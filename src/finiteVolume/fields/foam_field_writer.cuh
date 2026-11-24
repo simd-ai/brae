@@ -9,16 +9,139 @@
 #include "foam_dict.cuh"           // compileFoamRegex, isConstraintPatchType (same matching as buildField)
 #include "foam_token_reader.cuh"   // gzSlurp: the template field may be gzipped (OF writeCompression on)
 #include "fv_patch.cuh"            // FvPatch (name / type / inGroups)
+#include "field_write_format.cuh"   // FieldWriteFormat: binary, fast
+#include <cerrno>
+#include <charconv>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <map>
+#include <mutex>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <cstdlib>
+#include <thread>
 
 namespace brae {
+
+// THE WRITE PATH'S OPTIONS AND COUNTERS (2026-11-19, the 66 M cell DrivAer I/O study). A driver that takes the options sets them once,
+// before its first write; unset, every file is written as it always was.
+//   binary  OpenFOAM's `writeFormat binary`: each nonuniform list as its raw little-endian doubles, as v2412 writes one (" \nN\n(",
+//           the bytes, ")"; an empty list " 0"), the header `format binary` with OpenFOAM's arch line, so a restart reads back the
+//           exact doubles. Only a driver all of whose fields go through these functions sets it (the multi-GPU driver).
+//   fast    an ASCII list's values formatted in blocks by std::to_chars instead of one operator<< a value (by BRAE_WRITE_THREADS
+//           threads on a long list), the file built in memory and written in one call. The same bytes: to_chars general at a
+//           precision is printf's %.*g, which is what an ostream prints a double as at that precision.
+// Either keeps a template's header and boundary between writes (keyed by its path, size and modification time) instead of re-reading
+// and re-parsing it at every write: 3.8 s a write a rank on the 66 M DrivAer's start fields.
+// The counters, in milliseconds and bytes, are read and cleared by the caller's timing report.
+struct FieldWriteStats
+{
+    double templateMs = 0.0;   // the template read and parsed, or found in the cache
+    double formatMs = 0.0;     // the values formatted; on the streaming path formatted AND written, the two interleaved
+    double fileMs = 0.0;       // the file opened, written and closed (the in-memory path only)
+    std::uint64_t bytes = 0;
+    int files = 0;
+};
+// a thread's own: a background writer (the multi-GPU driver's BRAE_WRITE_ASYNC) counts its writes apart from the step's thread
+inline FieldWriteStats& fieldWriteStats()
+{
+    static thread_local FieldWriteStats s;
+    return s;
+}
+inline double writeMsSince(std::chrono::steady_clock::time_point t0)
+{
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+// the in-memory file: an ostream's bytes appended to a string, written in one call by writeFoamFile
+class FoamFileBuffer : public std::streambuf
+{
+public:
+    std::string data;
+
+protected:
+    int_type overflow(int_type c) override
+    {
+        if (c != traits_type::eof())
+        {
+            data.push_back(static_cast<char>(c));
+        }
+        return c;
+    }
+    std::streamsize xsputn(const char* s, std::streamsize n) override
+    {
+        data.append(s, static_cast<std::size_t>(n));
+        return n;
+    }
+};
+inline void writeFoamFile(const std::string& path, const std::string& data)
+{
+    const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    std::FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) throw std::runtime_error("cannot write " + path + ": " + std::strerror(errno));
+    const std::size_t written = std::fwrite(data.data(), 1, data.size(), f);
+    const int closed = std::fclose(f);
+    if (written != data.size() || closed != 0)
+        throw std::runtime_error("cannot write " + path + ": " + std::strerror(errno));
+    FieldWriteStats& s = fieldWriteStats();
+    s.fileMs += writeMsSince(t0);
+    s.bytes += data.size();
+    s.files += 1;
+}
+// a file's body done: the in-memory one written in one call (its formatting and its file system time counted apart), the streamed one
+// closed (the two counted together, as they happen together)
+inline void finishFoamFile(
+    const std::string& path,
+    bool inMemory,
+    FoamFileBuffer& buffer,
+    std::ofstream& file,
+    std::chrono::steady_clock::time_point t0)
+{
+    FieldWriteStats& s = fieldWriteStats();
+    if (inMemory)
+    {
+        s.formatMs += writeMsSince(t0);
+        writeFoamFile(path, buffer.data);
+        return;
+    }
+    const std::streamoff at = file.tellp();
+    file.close();
+    if (!file) throw std::runtime_error("cannot write " + path);
+    s.formatMs += writeMsSince(t0);
+    s.bytes += at > 0 ? static_cast<std::uint64_t>(at) : 0;
+    s.files += 1;
+}
+// a FoamFile header made to say what follows it: `format binary` with OpenFOAM's arch line (added where the header has none), or
+// `format ascii` (a binary template's header, the lists written as text)
+inline std::string foamHeaderInFormat(const std::string& header, bool binary)
+{
+    if (!binary)
+    {
+        static const std::regex binRe("format\\s+binary\\s*;");
+        return std::regex_replace(header, binRe, std::string("format      ascii;"));
+    }
+    static const std::regex fmtRe("format\\s+(ascii|binary)\\s*;");
+    std::string h = std::regex_replace(header, fmtRe, std::string("format      binary;"));
+    if (h.find("arch") == std::string::npos)
+    {
+        const std::size_t at = h.find("format      binary;");
+        const std::string arch = "\n    arch        \"LSB;label=" + std::to_string(8 * sizeof(label)) + ";scalar="
+                               + std::to_string(8 * sizeof(scalar)) + "\";";
+        if (at != std::string::npos)
+        {
+            h.insert(at + std::strlen("format      binary;"), arch);
+        }
+    }
+    return h;
+}
 
 inline void formatFoamValue(std::ostream& os, scalar v) { os << v; }
 inline void formatFoamValue(std::ostream& os, const vector& v) { os << '(' << v.x << ' ' << v.y << ' ' << v.z << ')'; }
@@ -32,6 +155,149 @@ inline const char* foamListType(const symmTensor&) { return "List<symmTensor>"; 
 inline const char* foamClassName(const symmTensor&) { return "volSymmTensorField"; }
 inline const char* foamClassName(scalar) { return "volScalarField"; }
 inline const char* foamClassName(const vector&) { return "volVectorField"; }
+
+// one value as text appended to a buffer: what `os << std::setprecision(p) << v` prints
+inline void appendFoamValue(std::string& s, scalar v, int precision)
+{
+    char b[48];
+    const std::to_chars_result r = std::to_chars(b, b + sizeof(b), v, std::chars_format::general, precision);
+    s.append(b, r.ptr);
+}
+inline void appendFoamValue(std::string& s, const vector& v, int precision)
+{
+    s += '(';
+    appendFoamValue(s, v.x, precision);
+    s += ' ';
+    appendFoamValue(s, v.y, precision);
+    s += ' ';
+    appendFoamValue(s, v.z, precision);
+    s += ')';
+}
+inline void appendFoamValue(std::string& s, const symmTensor& t, int precision)
+{
+    s += '(';
+    appendFoamValue(s, t.xx, precision);
+    s += ' ';
+    appendFoamValue(s, t.xy, precision);
+    s += ' ';
+    appendFoamValue(s, t.xz, precision);
+    s += ' ';
+    appendFoamValue(s, t.yy, precision);
+    s += ' ';
+    appendFoamValue(s, t.yz, precision);
+    s += ' ';
+    appendFoamValue(s, t.zz, precision);
+    s += ')';
+}
+// a list's values as text, each followed by `sep`, at the stream's precision: one operator<< a value, or (fast) formatted in blocks
+template <typename T>
+inline void writeFoamValues(
+    std::ostream& os,
+    const T* v,
+    std::size_t n,
+    char sep)
+{
+    if (!fieldWriteFormat().fast)
+    {
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            formatFoamValue(os, v[i]);
+            os << sep;
+        }
+        return;
+    }
+    const int precision = static_cast<int>(os.precision());
+    // BRAE_WRITE_THREADS (default 8): a long list's values formatted by that many threads, each its own contiguous slice into its own
+    // text, the texts then written in order -- the same bytes as one thread's (a value's text depends on the value alone). The 66 M
+    // DrivAer's write was 18 s of one core's formatting a rank in 4.2 GB (Arrhenius job 5496607), each rank with 72 cores idle
+    static const unsigned threads = []()
+    {
+        const char* e = std::getenv("BRAE_WRITE_THREADS");
+        const int t = e ? std::atoi(e) : 8;
+        return static_cast<unsigned>(t < 1 ? 1 : (t > 64 ? 64 : t));
+    }();
+    const std::size_t perThread = std::size_t(1) << 18;
+    if (threads > 1 && n >= 2 * perThread)
+    {
+        const std::size_t t = std::min<std::size_t>(threads, n / perThread);
+        std::vector<std::string> text(t);
+        std::vector<std::thread> pool;
+        pool.reserve(t);
+        for (std::size_t k = 0; k < t; ++k)
+        {
+            pool.emplace_back([&, k]()
+            {
+                const std::size_t lo = n * k / t;
+                const std::size_t hi = n * (k + 1) / t;
+                std::string& b = text[k];
+                b.reserve((hi - lo) * 16);
+                for (std::size_t i = lo; i < hi; ++i)
+                {
+                    appendFoamValue(b, v[i], precision);
+                    b += sep;
+                }
+            });
+        }
+        for (std::thread& th : pool)
+        {
+            th.join();
+        }
+        for (const std::string& b : text)
+        {
+            os.write(b.data(), static_cast<std::streamsize>(b.size()));
+        }
+        return;
+    }
+    const std::size_t block = std::size_t(1) << 20;
+    std::string b;
+    b.reserve(block + 512);
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        appendFoamValue(b, v[i], precision);
+        b += sep;
+        if (b.size() >= block)
+        {
+            os.write(b.data(), static_cast<std::streamsize>(b.size()));
+            b.clear();
+        }
+    }
+    os.write(b.data(), static_cast<std::streamsize>(b.size()));
+}
+// a nonuniform list in OpenFOAM's binary form, after its `List<T>` word: " \nN\n(" the raw bytes ")"; an empty one " 0"
+template <typename T>
+inline void writeFoamBinaryList(
+    std::ostream& os,
+    const T* v,
+    std::size_t n)
+{
+    static_assert(sizeof(scalar) == 8 && sizeof(T) % sizeof(scalar) == 0, "a binary list is written as doubles");
+    if (n == 0)
+    {
+        os << " 0";
+        return;
+    }
+    os << " \n" << n << "\n(";
+    os.write(reinterpret_cast<const char*>(v), static_cast<std::streamsize>(n * sizeof(T)));
+    os << ')';
+}
+// a nonuniform list entry from after its `List<T>` word to its ';' and the line's end: " \nN\n(\n" one value a line ")\n;\n" in ASCII,
+// OpenFOAM's binary list then ";\n" in binary
+template <typename T>
+inline void writeFoamListEntry(
+    std::ostream& os,
+    const T* v,
+    std::size_t n)
+{
+    if (fieldWriteFormat().binary)
+    {
+        writeFoamBinaryList(os, v, n);
+        os << ";\n";
+        return;
+    }
+    os << " \n" << n << "\n(\n";
+    writeFoamValues(os, v, n, '\n');
+    os << ")\n;\n";
+}
 
 // Write "uniform <v>;" or "nonuniform List<...> N (...);" for a boundary entry field.
 // OpenFOAM's FoamFile `location` is the TIME DIRECTORY NAME -- `location "269";` -- never a path. brae's
@@ -60,14 +326,16 @@ inline void writeFieldValue(
         formatFoamValue(os, uval);
         os << ";\n";
     }
+    else if (fieldWriteFormat().binary)
+    {
+        os << "nonuniform " << foamListType(T{});
+        writeFoamBinaryList(os, vals.data(), vals.size());
+        os << ";\n";
+    }
     else
     {
         os << "nonuniform " << foamListType(T{}) << " " << vals.size() << "(";
-        for (const T& v : vals)
-        {
-            formatFoamValue(os, v);
-            os << ' ';
-        }
+        writeFoamValues(os, vals.data(), vals.size(), ' ');
         os << ");\n";
     }
 }
@@ -118,6 +386,97 @@ inline void writePatchExprDict(std::ostream& os, const PatchExprSpec& e)
        << "        }\n";
 }
 
+// A wall function's own entries, as OpenFOAM's write() emits them (the order of nutWallFunction, omegaWallFunction,
+// epsilonWallFunction, nutkRoughWallFunction and nutUSpaldingWallFunction's write/writeLocalEntries): the blender's
+// `blending` (and `n` under binomial), always, for the four that blend; omega's beta1, epsilon's lowReCorrection,
+// Cmu/kappa/E and Spalding's maxIter/tolerance where they are not OpenFOAM's defaults (writeEntryIfDifferent); the rough
+// wall's Cs and Ks, always (both MUST_READ). The writer dropped them all, so a restart from brae's write ran OpenFOAM's
+// defaults where the case had said otherwise: the official occDrivAerStaticMesh's `tolerance 1e-9` on every car wall
+// came back as 0.01, which also switches Spalding's Newton to its other start (nutUSpaldingWallFunction.C:69)
+template <typename T>
+inline void writeWallFunctionEntries(
+    std::ostream& os,
+    const PatchFieldData<T>& d)
+{
+    if (d.type.find("WallFunction") == std::string::npos || d.hasABL || d.type == "kqRWallFunction")
+    {
+        return;
+    }
+    const bool omega = d.type == "omegaWallFunction";
+    const bool epsilon = d.type == "epsilonWallFunction";
+    const bool nut = d.type.compare(0, 3, "nut") == 0;
+    const bool blended = omega || epsilon || d.type == "nutkWallFunction" || d.type == "nutUWallFunction";
+    auto coefficients = [&]()
+    {
+        if (d.wfCmu != scalar(0.09))
+        {
+            os << "        Cmu             " << d.wfCmu << ";\n";
+        }
+        if (d.wfKappa != scalar(0.41))
+        {
+            os << "        kappa           " << d.wfKappa << ";\n";
+        }
+        if (d.wfE != scalar(9.8))
+        {
+            os << "        E               " << d.wfE << ";\n";
+        }
+    };
+    auto blending = [&]()
+    {
+        // the reader refuses any blender but the wall function's own default (binomial with n 2 for omega, stepwise for
+        // the others), so the default is what this run used
+        const std::string b = d.wfBlending.empty() ? (omega ? "binomial" : "stepwise") : d.wfBlending;
+        os << "        blending        " << b << ";\n";
+        if (b == "binomial")
+        {
+            os << "        n               " << (d.hasWfBlendN ? d.wfBlendN : scalar(2)) << ";\n";
+        }
+    };
+    if (nut)
+    {
+        coefficients();
+        if (blended)
+        {
+            blending();
+        }
+        if (d.type == "nutkRoughWallFunction")
+        {
+            os << "        Cs              ";
+            writeFieldValue(os, d.roughCsUniform, d.roughCsUniformValue, d.roughCsValues);
+            os << "        Ks              ";
+            writeFieldValue(os, d.roughKsUniform, d.roughKsUniformValue, d.roughKsValues);
+        }
+        if (d.type == "nutUSpaldingWallFunction")
+        {
+            if (d.nutMaxIter != 10)
+            {
+                os << "        maxIter         " << d.nutMaxIter << ";\n";
+            }
+            if (d.nutTolerance != scalar(0.01))
+            {
+                os << "        tolerance       " << d.nutTolerance << ";\n";
+            }
+        }
+        return;
+    }
+    if (blended)
+    {
+        blending();
+    }
+    if (omega && d.wfBeta1 != scalar(0.075))
+    {
+        os << "        beta1           " << d.wfBeta1 << ";\n";
+    }
+    if (epsilon && d.epsLowRe)
+    {
+        os << "        lowReCorrection true;\n";
+    }
+    if (omega || epsilon || d.type == "kLowReWallFunction")
+    {
+        coefficients();
+    }
+}
+
 template <typename T>
 inline void writePatchEntry(
     std::ostream& os,
@@ -156,6 +515,15 @@ inline void writePatchEntry(
             if (d.hasAdvFieldInf) os << "        fieldInf        " << d.advFieldInf << ";\n";
             if (d.advLInf > -1e299) os << "        lInf            " << d.advLInf << ";\n";
         }
+    }
+    // surfaceNormalFixedValue's scalar refValue (U_b = refValue * n): OpenFOAM REQUIRES it (surfaceNormalFixedValueFvPatchVectorField.C
+    // reads it with the patch dictionary's get, and writes it before value), and so does brae's reader ("surfaceNormalFixedValue without
+    // the refValue entry OpenFOAM requires"). It is an input the solve does not change, so it is echoed as read. Without it neither code
+    // started from brae's own write: the 66 M AutoCFD5 DrivAer's inlet, from brae's steady write (Arrhenius job 5495841, 2026-11-19)
+    if (d.hasNormalRef && d.type == "surfaceNormalFixedValue")
+    {
+        os << "        refValue        ";
+        writeFieldValue(os, d.normalRefUniform, d.normalRefUniformValue, d.normalRefValues);
     }
     if (uniformTP && d.hasInletValue)
     {
@@ -203,14 +571,43 @@ inline void writePatchEntry(
         }
         if (!d.fanDirection.empty()) os << "        direction       " << d.fanDirection << ";\n";
     }
+    // Plain `mixed` (and mixedEnergy, its he spelling): OpenFOAM writes refValue, refGradient and valueFraction
+    // (mixedFvPatchField.C write) and its reader REQUIRES all three, as brae's factory does ("is `mixed` but has no
+    // `valueFraction` entry"). The writer wrote the gradient under fixedGradient's key and dropped the other two, so
+    // neither code restarted from brae's own write of a mixed patch. Inputs the solve does not change: echoed as read
+    const bool mixed = d.type == "mixed" || d.type == "mixedEnergy";
+    if (mixed)
+    {
+        if (d.hasRefValue)
+        {
+            os << "        refValue        ";
+            writeFieldValue(os, d.refValueUniform, d.refValueUniformValue, d.refValues);
+        }
+        if (d.hasGradient)
+        {
+            os << "        refGradient     ";
+            writeFieldValue(os, d.gradientUniform, d.gradientUniformValue, d.gradientValues);
+        }
+        if (d.hasValueFraction)
+        {
+            os << "        valueFraction   ";
+            writeFieldValue(os, d.vfUniform, d.vfUniformValue, d.vfValues);
+        }
+        // v2412's mixed holds a `source` it never reads and sets to zero at construction, and writes it
+        // (mixedFvPatchField.C:93, 321)
+        os << "        source          uniform ";
+        formatFoamValue(os, T{});
+        os << ";\n";
+    }
     // fixedGradient's gradient is REQUIRED by OF's reader, not optional like value: omitting it made
     // OF abort with "Required entry 'gradient' : missing for patch ..." on any attempt to read brae's
     // output back. The gradient is an input that the solve does not change, so echo what was read.
-    if (d.hasGradient)
+    if (d.hasGradient && !mixed)
     {
         os << "        gradient        ";
         writeFieldValue(os, d.gradientUniform, d.gradientUniformValue, d.gradientValues);
     }
+    writeWallFunctionEntries(os, d);
     // flowRateInletVelocity: OF REQUIRES one of volumetricFlowRate/massFlowRate and aborts without it,
     // and so does brae ("has neither 'volumetricFlowRate' nor 'massFlowRate'"). Dropping it made brae's
     // own output unrestartable -- by brae OR by OpenFOAM -- which only surfaced once brae started
@@ -315,10 +712,19 @@ inline void writePatchEntry(
         // "nonuniform List<List<scalar>>", which OF's reader rejects. Every scalar and vector field brae
         // wrote carried it, so no brae output could be restarted from or post-processed by OF; the
         // validation gates never caught it because they regex the internalField and never re-read the file.
-        os << "        value           nonuniform " << foamListType(T{}) << " \n"
-           << nComputed << "\n(\n";
-        for (std::size_t i = 0; i < nComputed; ++i) { formatFoamValue(os, computed[i]); os << '\n'; }
-        os << ")\n;\n";
+        if (fieldWriteFormat().binary)
+        {
+            os << "        value           nonuniform " << foamListType(T{});
+            writeFoamBinaryList(os, computed, nComputed);
+            os << ";\n";
+        }
+        else
+        {
+            os << "        value           nonuniform " << foamListType(T{}) << " \n"
+               << nComputed << "\n(\n";
+            writeFoamValues(os, computed, nComputed, '\n');
+            os << ")\n;\n";
+        }
     }
     else if (d.hasValue)
     {
@@ -343,20 +749,19 @@ struct DerivedFieldSpec
                                         // extrapolatedCalculated, createRDeltaT.H)
 };
 
-template <typename T, typename Patch>
-inline void writeVolField(
-    const std::string& origPath,
-    const std::string& outPath,
-    const std::vector<T>& values,
-    const std::vector<Patch>& patches,
-    int precision = 16,
-    // Flat boundary values in patch order, EXCLUDING cyclic/cyclicAMI -- the same flattening
-    // DeviceBoundary uses, so a solver buffer can be handed over unchanged. Empty -> echo the input.
-    const std::vector<T>& computedBoundary = {},
-    const DerivedFieldSpec* derived = nullptr,
-    // per patch name, entries the solver writes before `value` (rhoCentralFoam's maxwellSlipU and smoluchowskiJumpT:
-    // the inputs and the mixed state OpenFOAM's write() emits); null: none, as before
-    const std::map<std::string, std::string>* patchExtra = nullptr)
+// A vol field's template as the writer takes it: the FoamFile header as written in the file, the dimensions line (empty: none) and
+// the resolved boundary. Re-read at every write unless the write path is fast or binary, which keep it while the file's size and modification
+// time are the ones it was read at (the multi-GPU driver's templates are the start's fields: 16.6 M values a part on the 66 M DrivAer,
+// read and parsed again for every field of every write)
+template <typename T>
+struct VolFieldTemplate
+{
+    std::string header;
+    std::string dims;
+    FieldData<T> fd;
+};
+template <typename T>
+inline VolFieldTemplate<T> readVolFieldTemplate(const std::string& origPath)
 {
     // The ORIGINAL field is re-read here as a template: its FoamFile header, dimensions and boundaryField
     // shape are echoed into the new time directory. It may be gzipped -- OF writes `U.gz` whenever
@@ -374,7 +779,6 @@ inline void writeVolField(
     {
         throw std::runtime_error("writeVolField: cannot read " + origPath + " (nor " + origPath + ".gz)");
     }
-
     // FoamFile header block (verbatim but for `location`, rewritten below to the output time as
     // OpenFOAM writes it, and `object` for a derived field) + the dimensions line.
     const std::size_t ff = text.find("FoamFile");
@@ -393,14 +797,84 @@ inline void writeVolField(
             }
         }
     }
-    std::string header = (ff == std::string::npos) ? "" : text.substr(0, he);
-    // The template may be a BINARY file (OF writeFormat binary; pimpleFoam/LES/NACA4412 ships 0/U that
-    // way). brae writes ASCII, so the header it copies has to say so -- otherwise the written field is
-    // labelled binary and holds text, and nothing, OpenFOAM included, can read it back.
+    VolFieldTemplate<T> t;
+    t.header = (ff == std::string::npos) ? "" : text.substr(0, he);
+    const std::size_t dk = text.find("dimensions", he == 0 ? 0 : he);
+    const std::size_t ds = (dk == std::string::npos) ? std::string::npos : text.find(';', dk);
+    t.dims = (ds == std::string::npos) ? std::string() : text.substr(dk, ds - dk + 1);
+    // Resolved boundary (includes / #includeEtc / $macros / $internalField expanded); groups are matched per patch below.
+    t.fd = readField<T>(origPath);
+    return t;
+}
+template <typename T>
+inline const VolFieldTemplate<T>& volFieldTemplate(
+    const std::string& origPath,
+    VolFieldTemplate<T>& scratch)
+{
+    if (!fieldWriteFormat().fast && !fieldWriteFormat().binary)
     {
-        const std::regex fmtRe("format\\s+binary\\s*;");
-        header = std::regex_replace(header, fmtRe, std::string("format      ascii;"));
+        scratch = readVolFieldTemplate<T>(origPath);
+        return scratch;
     }
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const std::string file = fs::exists(origPath, ec) ? origPath : origPath + ".gz";
+    const std::uintmax_t size = fs::file_size(file, ec);
+    const fs::file_time_type mtime = fs::last_write_time(file, ec);
+    struct Kept
+    {
+        std::uintmax_t size = 0;
+        fs::file_time_type mtime{};
+        VolFieldTemplate<T> t;
+    };
+    // a background writer and the step's thread may both write (one at a time is the driver's rule, the map is guarded anyway)
+    static std::mutex guard;
+    std::lock_guard<std::mutex> lock(guard);
+    static std::map<std::string, Kept> kept;
+    auto it = kept.find(origPath);
+    if (it == kept.end() || ec || it->second.size != size || it->second.mtime != mtime)
+    {
+        Kept k;
+        k.size = size;
+        k.mtime = mtime;
+        k.t = readVolFieldTemplate<T>(origPath);
+        // the internal values are not written from the template: dropped, the boundary and header kept
+        k.t.fd.internalField.clear();
+        k.t.fd.internalField.shrink_to_fit();
+        it = kept.insert_or_assign(origPath, std::move(k)).first;
+    }
+    return it->second.t;
+}
+
+template <typename T, typename Patch>
+inline void writeVolField(
+    const std::string& origPath,
+    const std::string& outPath,
+    const std::vector<T>& values,
+    const std::vector<Patch>& patches,
+    int precision = 16,
+    // Flat boundary values in patch order, EXCLUDING cyclic/cyclicAMI -- the same flattening
+    // DeviceBoundary uses, so a solver buffer can be handed over unchanged. Empty -> echo the input.
+    const std::vector<T>& computedBoundary = {},
+    const DerivedFieldSpec* derived = nullptr,
+    // per patch name, entries the solver writes before `value` (rhoCentralFoam's maxwellSlipU and smoluchowskiJumpT:
+    // the inputs and the mixed state OpenFOAM's write() emits); null: none, as before
+    const std::map<std::string, std::string>* patchExtra = nullptr,
+    // the file's `object` where it is not the template's (an old-time level, U_0, written from U's template): written so, rather
+    // than the file rewritten after it is written
+    const char* objectName = nullptr)
+{
+    const FieldWriteFormat& wf = fieldWriteFormat();
+    FieldWriteStats& stats = fieldWriteStats();
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    VolFieldTemplate<T> scratch;
+    const VolFieldTemplate<T>& tmpl = volFieldTemplate<T>(origPath, scratch);
+    std::string header = tmpl.header;
+    // The template may be a BINARY file (OF writeFormat binary; pimpleFoam/LES/NACA4412 ships 0/U that
+    // way). brae writes ASCII unless the write path is binary, so the header it copies has to say what
+    // follows it -- otherwise the written field is labelled binary and holds text, and nothing, OpenFOAM
+    // included, can read it back.
+    header = foamHeaderInFormat(header, wf.binary);
     {
         static const std::regex locRe("location\\s+\"[^\"]*\";");
         header = std::regex_replace(header, locRe, std::string("location    \"") + timeDirName(outPath) + "\";");
@@ -412,27 +886,58 @@ inline void writeVolField(
         const std::regex objRe("object\\s+[A-Za-z0-9_.:]+\\s*;");
         header = std::regex_replace(header, objRe, std::string("object      ") + derived->object + ";");
     }
-    const std::size_t dk = text.find("dimensions", he == 0 ? 0 : he);
-    const std::size_t ds = (dk == std::string::npos) ? std::string::npos : text.find(';', dk);
+    else if (objectName)
+    {
+        // an old-time level named as the multi-GPU driver's renameFoamObject names it in place: the padding gives up the characters
+        // the name adds (`object      U;` -> `object    U_0;`), so the file is the bytes the write-then-rename made; a padding too
+        // short for that takes the standard one
+        static const std::regex objRe("object([ \\t]+)([A-Za-z0-9_.:]+);");
+        std::smatch m;
+        if (std::regex_search(header, m, objRe))
+        {
+            const std::string to = objectName;
+            const std::string from = m[2].str();
+            const std::size_t pad = static_cast<std::size_t>(m[1].length());
+            const std::string entry = (to.size() >= from.size() && pad > to.size() - from.size())
+                                    ? "object" + std::string(pad - (to.size() - from.size()), ' ') + to + ";"
+                                    : "object      " + to + ";";
+            header = header.substr(0, static_cast<std::size_t>(m.position(0))) + entry
+                   + header.substr(static_cast<std::size_t>(m.position(0) + m.length(0)));
+        }
+    }
     const std::string dims = (derived && derived->dimensions)
         ? std::string(derived->dimensions)
-        : ((ds == std::string::npos) ? "dimensions      [0 0 0 0 0 0 0];" : text.substr(dk, ds - dk + 1));
+        : (tmpl.dims.empty() ? "dimensions      [0 0 0 0 0 0 0];" : tmpl.dims);
+    const FieldData<T>& fd = tmpl.fd;
+    stats.templateMs += writeMsSince(t0);
 
-    // Resolved boundary (includes / #includeEtc / $macros / $internalField expanded); groups are matched per patch below.
-    const FieldData<T> fd = readField<T>(origPath);
-
-    std::ofstream out(outPath);
-    if (!out) throw std::runtime_error("writeVolField: cannot write " + outPath);
+    // streaming, as it always was, or (fast or binary) the file built in memory and written in one call
+    t0 = std::chrono::steady_clock::now();
+    const bool inMemory = wf.fast || wf.binary;
+    FoamFileBuffer buffer;
+    std::ofstream file;
+    std::ostream mem(&buffer);
+    if (!inMemory)
+    {
+        file.open(outPath);
+        if (!file) throw std::runtime_error("writeVolField: cannot write " + outPath);
+    }
+    std::ostream& out = inMemory ? mem : static_cast<std::ostream&>(file);
     out << std::setprecision(precision);
     if (!header.empty()) out << header << "\n\n";
     out << dims << "\n\n";
-    out << "internalField   nonuniform " << foamListType(T{}) << "\n" << values.size() << "\n(\n";
-    for (const T& v : values)
+    if (wf.binary)
     {
-        formatFoamValue(out, v);
-        out << '\n';
+        out << "internalField   nonuniform " << foamListType(T{});
+        writeFoamBinaryList(out, values.data(), values.size());
+        out << ";\n\n";
     }
-    out << ")\n;\n\n";
+    else
+    {
+        out << "internalField   nonuniform " << foamListType(T{}) << "\n" << values.size() << "\n(\n";
+        writeFoamValues(out, values.data(), values.size(), '\n');
+        out << ")\n;\n\n";
+    }
     out << "boundaryField\n{\n";
     std::size_t bndOff = 0;   // index into computedBoundary (coupled patches excluded)
     for (const Patch& p : patches)   // per mesh patch, matched like buildField
@@ -499,6 +1004,7 @@ inline void writeVolField(
         if (!coupled) bndOff += static_cast<std::size_t>(p.size);
     }
     out << "}\n\n\n// ************************************************************************* //\n";
+    finishFoamFile(outPath, inMemory, buffer, file, t0);
 }
 
 // Write a surfaceScalarField (the face flux phi) in OpenFOAM structure, matching OF's own output: internalField = the
@@ -526,15 +1032,25 @@ inline void writeSurfaceField(
     // Absent/empty keeps the old value-less form, which is still right for a solver with no interface.
     const std::map<std::string, std::vector<scalar>>& coupledValues = {})
 {
-    std::ofstream out(outPath);
-    if (!out) throw std::runtime_error("writeSurfaceField: cannot write " + outPath);
+    const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    const bool inMemory = fieldWriteFormat().fast || fieldWriteFormat().binary;
+    FoamFileBuffer buffer;
+    std::ofstream file;
+    std::ostream mem(&buffer);
+    if (!inMemory)
+    {
+        file.open(outPath);
+        if (!file) throw std::runtime_error("writeSurfaceField: cannot write " + outPath);
+    }
+    std::ostream& out = inMemory ? mem : static_cast<std::ostream&>(file);
     out << std::setprecision(precision);
-    out << "FoamFile\n{\n    version     2.0;\n    format      ascii;\n    class       surfaceScalarField;\n"
-           "    location    \"" << timeDirName(outPath) << "\";\n    object      phi;\n}\n\n";
+    out << foamHeaderInFormat("FoamFile\n{\n    version     2.0;\n    format      ascii;\n    class       surfaceScalarField;\n"
+                              "    location    \"" + timeDirName(outPath) + "\";\n    object      phi;\n}", fieldWriteFormat().binary)
+        << "\n\n";
     out << "dimensions      " << dimensions << ";\n\n";
-    out << "internalField   nonuniform List<scalar> \n" << phiInternal.size() << "\n(\n";
-    for (scalar v : phiInternal) out << v << '\n';
-    out << ")\n;\n\n";
+    out << "internalField   nonuniform List<scalar>";
+    writeFoamListEntry(out, phiInternal.data(), phiInternal.size());
+    out << "\n";
     out << "boundaryField\n{\n";
     std::size_t off = 0;
     for (const auto& p : patches)
@@ -546,9 +1062,8 @@ inline void writeSurfaceField(
             const auto cv = coupledValues.find(p.name);
             if (cv != coupledValues.end() && cv->second.size() == static_cast<std::size_t>(p.size))
             {
-                out << "        value           nonuniform List<scalar> \n" << p.size << "\n(\n";
-                for (scalar v : cv->second) out << v << '\n';
-                out << ")\n;\n";
+                out << "        value           nonuniform List<scalar>";
+                writeFoamListEntry(out, cv->second.data(), cv->second.size());
             }
             out << "    }\n";
             continue;                                       // do NOT advance off (phiBoundary skips these)
@@ -564,14 +1079,14 @@ inline void writeSurfaceField(
             // OpenFOAM could not restart from brae's simpleFoam, pimpleFoam or rhoSimpleFoam output on such a mesh
             // (validation/windAroundBuildingsBox's frontAndBack, 2026-11-19).
             out << "        type            " << (isConstraintPatchType(p.type) ? p.type : std::string("calculated"))
-                << ";\n        value           nonuniform List<scalar> \n" << n << "\n(\n";
-            for (std::size_t i = 0; i < n; ++i) out << phiBoundary[off + i] << '\n';
-            out << ")\n;\n";
+                << ";\n        value           nonuniform List<scalar>";
+            writeFoamListEntry(out, phiBoundary.data() + off, n);
         }
         off += n;
         out << "    }\n";
     }
     out << "}\n\n\n// ************************************************************************* //\n";
+    finishFoamFile(outPath, inMemory, buffer, file, t0);
 }
 
 // Write a vol field with NO template (the CrankNicolson ddt0 fields, which have no 0/ prototype): a constructed OF header
@@ -590,15 +1105,34 @@ inline void writeVolFieldRaw(
     // DeviceBoundary uses, so a solver buffer can be handed over unchanged. Empty -> echo the input.
     const std::vector<T>& computedBoundary = {})
 {
-    std::ofstream out(outPath);
-    if (!out) throw std::runtime_error("writeVolFieldRaw: cannot write " + outPath);
+    const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    const bool inMemory = fieldWriteFormat().fast || fieldWriteFormat().binary;
+    FoamFileBuffer buffer;
+    std::ofstream file;
+    std::ostream mem(&buffer);
+    if (!inMemory)
+    {
+        file.open(outPath);
+        if (!file) throw std::runtime_error("writeVolFieldRaw: cannot write " + outPath);
+    }
+    std::ostream& out = inMemory ? mem : static_cast<std::ostream&>(file);
     out << std::setprecision(precision);
-    out << "FoamFile\n{\n    version     2.0;\n    format      ascii;\n    class       " << foamClassName(T{}) << ";\n"
-           "    object      " << objectName << ";\n}\n\n";
+    out << foamHeaderInFormat(std::string("FoamFile\n{\n    version     2.0;\n    format      ascii;\n    class       ") + foamClassName(T{})
+                              + ";\n    object      " + objectName + ";\n}", fieldWriteFormat().binary)
+        << "\n\n";
     out << "dimensions      " << dims << ";\n\n";
-    out << "internalField   nonuniform " << foamListType(T{}) << "\n" << values.size() << "\n(\n";
-    for (const T& v : values) { formatFoamValue(out, v); out << '\n'; }
-    out << ")\n;\n\n";
+    if (fieldWriteFormat().binary)
+    {
+        out << "internalField   nonuniform " << foamListType(T{});
+        writeFoamBinaryList(out, values.data(), values.size());
+        out << ";\n\n";
+    }
+    else
+    {
+        out << "internalField   nonuniform " << foamListType(T{}) << "\n" << values.size() << "\n(\n";
+        writeFoamValues(out, values.data(), values.size(), '\n');
+        out << ")\n;\n\n";
+    }
     out << "boundaryField\n{\n";
     for (const Patch& p : patches)
     {
@@ -614,6 +1148,7 @@ inline void writeVolFieldRaw(
         out << "    }\n";
     }
     out << "}\n\n\n// ************************************************************************* //\n";
+    finishFoamFile(outPath, inMemory, buffer, file, t0);
 }
 
 } // namespace brae

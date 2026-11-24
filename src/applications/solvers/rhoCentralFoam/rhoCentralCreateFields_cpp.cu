@@ -64,7 +64,8 @@ State createFields(const Case& cs, PatchFields& pf, int control)
     // createFields.H: compressible::turbulenceModel::New(rho, U, phi, thermo) -- the RAS model reads its fields here
     if (cs.ras)
         pf.ras = std::make_shared<brae::compressibleRAS::Case>(
-            brae::compressibleRAS::readCase(cs.caseDir, dir, cs.m, cs.g, cs.patches, pf.U, cs.lts));
+            brae::compressibleRAS::readCase(cs.caseDir, dir, cs.m, cs.g, cs.patches, pf.U, cs.lts,
+                                             cs.fvSolution.get(), cs.turbulenceProperties.get()));
     evaluatePatches(pf.p, s.p, cs, s.pB);
     evaluatePatches(pf.T, s.T, cs, s.TB);
     evaluatePatches(pf.U, s.U, cs, s.UB);

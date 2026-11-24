@@ -24,6 +24,12 @@
 # NOT CLAIMED: those two numbers are the transient driver's agreement on this case (it reads 0.07% on U
 # at steady on the shipped pitzDaily), not the reference's accuracy. This gate says the reference is
 # APPLIED and that the run depends on it; closing the driver's own gap is another unit.
+#
+# DIAGNOSTIC since 2026-11-21, not a gate (label `diagnostic`, tests/cmake/tiers.cmake). From the uniform start
+# k[N] - k[P] = 0 on every internal face, so NVDTVD::r takes its sign rule and limitedLinear picks linear or upwind
+# by the rounding sign of grad(k). OpenFOAM's serial and 2-rank runs choose differently on 11,823 of 24,170 faces,
+# so the bounds above follow the compiler and the GPU target. The gate is
+# tests/pimple_pressure_reference_developed_vs_openfoam.sh. The bounds here are unchanged.
 set -u
 BIN="${1:?brae_pimpleFoam binary}"
 SRC="${2:?committed pitzDaily case dir}"

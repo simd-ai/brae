@@ -88,7 +88,7 @@ Type `brae`. It reads the `application` entry in your `controlDict` and runs the
 | geometric | slip · symmetry · symmetryPlane · wedge · empty |
 | coupled | cyclic · cyclicAMI |
 | inlet / outlet | inletOutlet · outletInlet · flowRateInletVelocity · surfaceNormalFixedValue · freestream · freestreamVelocity |
-| pressure | totalPressure · fixedFluxPressure · pressureInletOutletVelocity |
+| pressure | totalPressure · fixedFluxPressure² · pressureInletOutletVelocity |
 | time-varying | uniformFixedValue · codedFixedValue · fixedMean |
 | turbulence | nutkWallFunction · epsilonWallFunction · omegaWallFunction · kqRWallFunction · turbulentIntensityKineticEnergyInlet · turbulentMixingLengthDissipationRateInlet |
 | thermal | externalWallHeatFluxTemperature · limitTemperature |
@@ -97,12 +97,15 @@ Type `brae`. It reads the `application` entry in your `controlDict` and runs the
 
 Anything not in this matrix stops the run at start-up, and the message names it.
 
+² `fixedFluxPressure` runs in interFoam, and in simpleFoam with `BRAE_SIMPLEFOAM_V2=1`. The default simpleFoam,
+pimpleFoam and rhoSimpleFoam drivers refuse it at start-up and name it.
+
 ## Supported platforms
 
 | | |
 |---|---|
 | GPU | NVIDIA Ampere or newer: A100, RTX 30/40/50, L40, H100, GH200, B200, GB200, GB300, GB10 |
-| CUDA | 12.4 or newer (13.x recommended) |
+| CUDA | 12.4 or newer; 13.x recommended, and needed for the device-resident pressure loop |
 | OS | Linux, x86_64 and aarch64 |
 | Case | OpenFOAM v2412 format, ASCII or binary, plain or `.gz` |
 
@@ -150,7 +153,7 @@ If brae does something other than what your case asked, it says so on stderr:
 cd yourCase                       # your OpenFOAM case (0/  constant/  system/)
 brae                              # steady, transient or compressible
 brae -case /path/to/yourCase      # or from anywhere
-brae -partition -case yourCase    # cache mesh + AMG once, later runs start warm
+brae -partition -case yourCase    # steady case: build the mesh and AMG caches, then exit
 brae -cases coarse medium fine    # one case per GPU, extras queue
 brae --help
 ```

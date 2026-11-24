@@ -47,6 +47,9 @@
 #include "swept_volume.cuh"        // OF meshPhi / makeRelative / movingWallVelocity
 #include "time_controls.cuh"   // OF readTimeControls/CourantNo/setInitialDeltaT/setDeltaT
 #include "brae_time.cuh"
+#include "run_clock.cuh"        // OF Foam::Time's clock under adjustTimeStep (setDeltaT/adjustDeltaT, ++runTime)
+#include "time_dict_writer.cuh"  // writeUniformTime: <time>/uniform/time, as OpenFOAM writes it
+#include <optional>
 #include "fan_pressure.cuh"   // fanPressure: the fan curve + direction, read where caseDir is known
 #include "forces_fo.cuh"   // OF functionObjects::forces and forceCoeffs, every step, on the device
 #include "scalar_transport_fo.cuh"   // OF functionObjects::scalarTransport, on the device flux   // OF Time/functionObjectList lifecycle, owned centrally (not per solver)
@@ -812,41 +815,10 @@ try
     // CourantNo / setInitialDeltaT / setDeltaT). Previously refused outright, which cost 11 of the 35
     // OpenFOAM pimpleFoam tutorials -- it is the default for transient cases.
     const TimeControls timeControls = TimeControls::read(controlDict);
-    // adjustTimeStep runs on brae's own clock, not OpenFOAM's (issue #53; reproducing OpenFOAM's sequence is work package
-    // M4). The step SEQUENCE differs from the first step, so the transient fields at a given time differ from OpenFOAM's
-    // too -- every step solves OpenFOAM's equations, at another size. Until M4 it is REFUSED at start-up; an explicitly
-    // acknowledged experimental override (BRAE_ALLOW_ADJUSTTIMESTEP=1, exactly "1") runs it on brae's clock, with the
-    // whole difference said at start-up, so existing tutorial workflows can still be run knowingly.
-    if (timeControls.adjustTimeStep)
-    {
-        const std::string wc = controlDict.wordOr("writeControl", "timeStep");
-        const bool adjustableWrites = (wc == "adjustable" || wc == "adjustableRunTime");
-        const std::string why =
-            "under `adjustTimeStep yes` the time-step sequence differs from OpenFOAM's, and so do the transient fields at "
-            "any given time, not only the write times (issue #53). OpenFOAM applies setDeltaT before every step, the first "
-            "included (pimpleFoam.C:132-136)" + std::string(adjustableWrites
-                ? ", and under `writeControl " + wc + "` shortens every step so that the steps land on each write time "
-                  "(Time::adjustDeltaT, Time.C:102-145); brae does neither"
-                : "; brae does not")
-            + ". Each brae step solves OpenFOAM's equations, but at brae's own step sizes, so at a given time its fields "
-              "differ from OpenFOAM's by the time-integration error of the different steps. The output differs too: "
-            + std::string(adjustableWrites ? "its writes land on the first step past each write time instead of on it, " : "")
-            + "the run can stop short of endTime, and the last directory is named after startTime + deltaT*steps with "
-            "the last deltaT, not the time reached.";
-        const char* ack = std::getenv("BRAE_ALLOW_ADJUSTTIMESTEP");
-        if (!ack || std::string(ack) != "1")
-        {
-            throw std::runtime_error(
-                "brae: controlDict `adjustTimeStep yes` is refused until brae reproduces OpenFOAM's time-step sequence: "
-                + why + " Run at a fixed deltaT (`adjustTimeStep no;`), which runs on OpenFOAM's clock; or set "
-                "BRAE_ALLOW_ADJUSTTIMESTEP=1 to run it anyway as an EXPERIMENTAL approximation whose transient fields are "
-                "not OpenFOAM's at any given time.");
-        }
-        noticeApproximated(
-            "controlDict adjustTimeStep",
-            "EXPERIMENTAL, run only because BRAE_ALLOW_ADJUSTTIMESTEP=1 is set: " + why
-            + " A fixed deltaT runs on OpenFOAM's clock.");
-    }
+    // adjustTimeStep runs on OpenFOAM's clock (work package M4, issue #53): the RunClock below, built where the start is
+    // resolved, and the loop's CourantNo.H / setDeltaT.H / ++runTime. Until M4 the step sequence was brae's own -- no
+    // setDeltaT.H before the first step, no Time::adjustDeltaT -- and the case was refused unless acknowledged.
+    // tests/pimple_adjusttimestep_vs_openfoam.sh holds it step by step against OpenFOAM's own log.
     // constant/dynamicMeshDict. Absent -> inactive, so every existing case takes the identical path.
     refuseSolidBodyEntries(caseDir);
     const MeshMotion meshMotion = readMeshMotion(caseDir);
@@ -973,6 +945,33 @@ try
     std::string startStr = start.name;
     startTime = static_cast<scalar>(start.value);
     const std::string fieldDir = caseDir + "/" + startStr;
+    // UNDER adjustTimeStep THE LOOP RUNS ON OpenFOAM's CLOCK (work package M4, issue #53): Foam::Time as RunClock carries it
+    // (run_clock.cuh, shared with rhoCentralFoam) -- the accumulated value, Time::run, Time::setDeltaT with adjustDeltaT's
+    // trimming to the write times, operator++'s write flag and time name -- with deltaT from the start's uniform/time on a
+    // restart (Time::setControls). A fixed deltaT keeps this driver's own loop, which already lands on OpenFOAM's times.
+    std::optional<RunClock> clock;
+    if (TimeControls::read(controlDict).adjustTimeStep)
+    {
+        clock.emplace(controlDict, fieldDir, startTime);
+        deltaT = clock->deltaT();
+    }
+    // GATE CONTROLS (tests/pimple_adjusttimestep_vs_openfoam.sh), each deliberately wrong, each a piece of the clock this
+    // driver ran before M4:
+    //   BRAE_CONTROL_PIMPLE_NO_FIRST_SETDELTAT=1  no setDeltaT.H before the first step (only setInitialDeltaT.H)
+    //   BRAE_CONTROL_PIMPLE_UNTRIMMED=1           Time::setDeltaT without adjustDeltaT: steps do not land on write times
+    const bool controlNoFirstSetDeltaT = std::getenv("BRAE_CONTROL_PIMPLE_NO_FIRST_SETDELTAT") != nullptr;
+    const bool controlUntrimmed = std::getenv("BRAE_CONTROL_PIMPLE_UNTRIMMED") != nullptr;
+    if (clock && (controlNoFirstSetDeltaT || controlUntrimmed))
+        std::printf("  *** CONTROL MODE: %s. This run is deliberately wrong. ***\n",
+                    controlNoFirstSetDeltaT ? "no setDeltaT before the first step" : "deltaT not trimmed to the write times");
+    auto clockSetDeltaT = [&](scalar dt)
+    {
+        if (controlUntrimmed) clock->setDeltaTNoAdjust(dt);
+        else clock->setDeltaT(dt);
+    };
+    // Info's precision: Time sets IOstream::defaultPrecision from writePrecision (Time.C readDict), so OpenFOAM's log lines
+    // carry the case's digits
+    const int logPrec = std::max(1, controlDict.intOr("writePrecision", 6));
     refuseLesOnMesh(turbProps, ctl, m, g, fvp);
     // A MOVING MESH RESTARTED. OpenFOAM reads the mesh at the start time's instance -- <start>/polyMesh/points once the mesh
     // has moved (polyMesh.C, fvMesh::readUpdate) -- with meshPhi and Uf beside it, and continues the motion from there. brae
@@ -1485,6 +1484,11 @@ try
         std::printf("written %s\n", outDir.c_str());
         // purgeWrite, from Time's WriteControl -- measured identical to this driver's copy and
         // purging at the same point (immediately after the write).
+        // <time>/uniform/time, as OpenFOAM writes it (Time::writeObject): what a restart's Time::setControls reads its deltaT,
+        // deltaT0 and index from under adjustTimeStep -- brae's own restart (RunClock) and OpenFOAM's alike
+        if (clock)
+            writeUniformTime(caseDir, tname, static_cast<double>(clock->value()), clock->timeIndex(),
+                             static_cast<double>(clock->deltaT()), static_cast<double>(clock->deltaT0()), precision);
         time.writeControl().recordWritten(caseDir, tname);
     };
 
@@ -1541,11 +1545,16 @@ try
     // two scalars per call instead of copying the whole internal and boundary flux arrays back every
     // step of an adaptive run. See DeviceSimpleSolver::courantNumbers.
     auto courant = [&]() { return solver.courantNumbers(deltaT); };
-    if (timeControls.adjustTimeStep)
+    if (clock)
     {
+        // pimpleFoam.C:98-99 before the loop: CourantNo.H, then setInitialDeltaT.H -- which acts only on a run from its
+        // first time (runTime.timeIndex() == 0, so not on a restart whose uniform/time carries an index) and only when
+        // CoNum > SMALL, and then through runTime.setDeltaT, i.e. WITH adjustDeltaT's trimming
         const CourantNumbers c0 = courant();
-        deltaT = setInitialDeltaT(deltaT, c0.CoNum, timeControls);
-        std::printf("Courant Number mean: %g max: %g\ndeltaT = %g\n", c0.meanCoNum, c0.CoNum, deltaT);
+        std::printf("Courant Number mean: %.*g max: %.*g\n", logPrec, c0.meanCoNum, logPrec, c0.CoNum);
+        if (clock->timeIndex() == 0 && c0.CoNum > timeControlSmall())
+            clockSetDeltaT(setInitialDeltaT(clock->deltaT(), c0.CoNum, timeControls));
+        deltaT = clock->deltaT();
     }
     // THE TURBULENCE FIELDS' HEALTH. The loop below stopped on a non-finite p or U residual only. A k-epsilon or k-omega pair
     // can run away without reaching U: on pitzDaily with linearUpwind on both scalars omega reached 1e42 with k at its floor,
@@ -1620,7 +1629,29 @@ try
         if (timingMaster) std::printf("brae-timing startup %.6f\n", RunTiming::sinceProcessStart());
     }
     time.setReportTiming(timingMaster);
-    for (scalar t = startTime + deltaT; t <= tEnd && time.loop(); t += deltaT) {
+    // The loop's clock. A fixed deltaT: the time accumulated by this driver's own `t += deltaT`, stopping past endTime, as
+    // before. adjustTimeStep: OpenFOAM's (pimpleFoam.C:121-139) -- Time::run, CourantNo.H on the flux the last step left,
+    // setDeltaT.H through Time::setDeltaT (adjustDeltaT), ++runTime -- every step, the first included.
+    scalar t = startTime;
+    for (;;) {
+        if (clock)
+        {
+            if (!clock->run()) break;
+            const CourantNumbers c = courant();
+            std::printf("Courant Number mean: %.*g max: %.*g\n", logPrec, c.meanCoNum, logPrec, c.CoNum);
+            if (!(controlNoFirstSetDeltaT && clock->timeIndex() == clock->startTimeIndex()))
+                clockSetDeltaT(setDeltaT(clock->deltaT(), c.CoNum, timeControls));
+            std::printf("deltaT = %.*g\n", logPrec, static_cast<double>(clock->deltaT()));
+            ++*clock;
+            deltaT = clock->deltaT();
+            t = clock->value();
+        }
+        else
+        {
+            t += deltaT;
+            if (!(t <= tEnd)) break;
+        }
+        if (!time.loop()) break;
         ++timeIndex;
         solver.setTime(t);   // feed the current time to any codedFixedValue snippet's `t`
         // OF pimpleFoam.C:139-160 -- the mesh update is INSIDE the PIMPLE outer loop, guarded by
@@ -1708,16 +1739,7 @@ try
         clearTurbulenceReport();   // this step's turbulence solves only (read by the health check below)
         const DeviceSimpleResidual r =
             solver.pimpleStep(deltaT, nOuter, nCorr, anyMotion ? meshUpdate : std::function<void(int)>());
-        // OF order: the Courant number is evaluated on the flux the step just produced, and deltaT for
-        // the NEXT step follows from it (CourantNo.H then setDeltaT.H, both at the top of the loop).
-        if (timeControls.adjustTimeStep)
-        {
-            const CourantNumbers c = courant();
-            const scalar next = setDeltaT(deltaT, c.CoNum, timeControls);
-            std::printf("Courant Number mean: %g max: %g\n", c.meanCoNum, c.CoNum);
-            deltaT = next;
-        }
-        const std::string tn = timeName(t);
+        const std::string tn = clock ? clock->timeName() : timeName(t);
         std::printf("Time = %s\n  Ux %.3e  Uy %.3e  Uz %.3e  p %.3e  contLocal %.3e  contGlobal %.3e\n",
                     tn.c_str(), r.Ux, r.Uy, r.Uz, r.p, r.contLocal, r.contGlobal);
         if (!std::getenv("BRAE_ALLOW_NONFINITE")
@@ -1740,13 +1762,13 @@ try
                                          + ", Time = " + tn + "). This step is not written. Set BRAE_ALLOW_NONFINITE=1 "
                                          "to continue anyway.");
         }
-        const bool isWrite = time.writeControl().isWriteTime(timeIndex, t);
+        const bool isWrite = clock ? clock->writeTime() : time.writeControl().isWriteTime(timeIndex, t);
         if (turbHealth && (isWrite || timeIndex % kHealthStride == 0))
             turbSumHealth(timeIndex, tn);
         if (isWrite) { writeTimeDir(tn); lastWritten = tn; time.write(); }
     }
     // brae writes the final state below when the cadence did not; OpenFOAM does not, so it is not noted as a write time
-    const std::string finalName = timeName(startTime + deltaT * (scalar)timeIndex);
+    const std::string finalName = clock ? clock->timeName() : timeName(startTime + deltaT * (scalar)timeIndex);
     time.end();   // OF Time.C:790-802: a final execute() so the last step is seen, then end()
     if (RunTiming::on())
     {

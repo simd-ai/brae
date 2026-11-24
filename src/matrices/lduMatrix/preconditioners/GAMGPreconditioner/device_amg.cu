@@ -1912,4 +1912,176 @@ void amgGalerkin(
     amgGatherCsr64(A);
 }
 
+// BRAE_POOL_STATS=1: every device buffer of the hierarchy by name and grid, bytes and element count, in one line a grid and a
+// total -- the structure a pool census attributes by call site only (DevicePool::reportSites). `who` names the hierarchy, and
+// `fine` its finest grid's matrix where the holder keeps one beside it (0 bytes when not). A memory census of a large
+// transient case, 2026-11-21; nothing here touches the device
+void amgMemoryReport(
+    const AMGData& A,
+    const char* who,
+    const char* when)
+{
+    std::size_t total = 0;
+    std::string line;
+    std::size_t lineBytes = 0;
+    auto add = [&](const char* name, std::size_t bytes, std::size_t count)
+    {
+        if (bytes == 0) return;
+        char b[96];
+        std::snprintf(b, sizeof b, " %s=%zu/%zu", name, bytes, count);
+        line += b;
+        lineBytes += bytes;
+    };
+    auto addL = [&](const char* name, const DeviceBuffer<label>& x) { add(name, x.size()*sizeof(label), x.size()); };
+    auto addS = [&](const char* name, const DeviceBuffer<scalar>& x) { add(name, x.size()*sizeof(scalar), x.size()); };
+    auto addF = [&](const char* name, const DeviceBuffer<float>& x) { add(name, x.size()*sizeof(float), x.size()); };
+    auto addI = [&](const char* name, const DeviceBuffer<int>& x) { add(name, x.size()*sizeof(int), x.size()); };
+    auto flush = [&](const std::string& head)
+    {
+        std::fprintf(stderr, "[amg-mem] %s %s %s bytes %zu:%s\n", when, who, head.c_str(), lineBytes, line.c_str());
+        total += lineBytes;
+        line.clear();
+        lineBytes = 0;
+    };
+    const int G = A.nLevels();
+    for (int k = 0; k < G; ++k)
+    {
+        const AMGLevel& L = A.level[k];
+        addL("map", L.map);
+        addL("cOwn", L.cOwn);
+        addL("cNei", L.cNei);
+        addL("cOwnerStart", L.cOwnerStart);
+        addL("cLosort", L.cLosort);
+        addL("cLosortStart", L.cLosortStart);
+        addL("faceRestrict", L.faceRestrict);
+        addL("faceFlip", L.faceFlip);
+        addS("cDiag", L.cDiag);
+        addS("cUpper", L.cUpper);
+        addS("cLower", L.cLower);
+        addL("galCellStart", L.galCellStart);
+        addL("galCellList", L.galCellList);
+        addL("galDFaceStart", L.galDFaceStart);
+        addL("galDFaceList", L.galDFaceList);
+        addL("galFaceStart", L.galFaceStart);
+        addL("galFaceList", L.galFaceList);
+        addL("galFaceFlipList", L.galFaceFlipList);
+        addL("Prow", L.Prow);
+        addL("Pcol", L.Pcol);
+        addS("Pval", L.Pval);
+        addF("PvalF", L.PvalF);
+        addL("rapSrcKind", L.rapSrcKind);
+        addL("rapSrcIdx", L.rapSrcIdx);
+        addL("rapDstKind", L.rapDstKind);
+        addL("rapDstIdx", L.rapDstIdx);
+        addS("rapW", L.rapW);
+        addL("Rrow", L.Rrow);
+        addL("Rfine", L.Rfine);
+        addS("Rval", L.Rval);
+        addF("RvalF", L.RvalF);
+        addL("rapStart", L.rapStart);
+        addS("Rterm", L.Rterm);
+        addF("RtermF", L.RtermF);
+        addS("rapTerm", L.rapTerm);
+        char head[128];
+        std::snprintf(head, sizeof head, "level %d (grid %d->%d, %d -> %d cells, %d coarse faces)", k, k, k + 1, L.nFine, L.nCoarse,
+                      L.nCoarseFaces);
+        flush(head);
+    }
+    for (int g = 0; g <= G; ++g)
+    {
+        auto at = [g](const auto& v) -> decltype(&v[0]) { return static_cast<std::size_t>(g) < v.size() ? &v[g] : nullptr; };
+        if (const GridColoring* c = at(A.coloring))
+        {
+            addL("gsCells", c->cells);
+            addL("gsStart", c->start);
+            addL("gsRowStart", c->rowStart);
+            addL("gsRowNbr", c->rowNbr);
+            addL("gsRowSrc", c->rowSrc);
+            addS("gsCoeff", c->coeff);
+            addS("gsDiagP", c->diagP);
+            addS("gsBP", c->bP);
+            addS("gsPsiP", c->psiP);
+        }
+        if (const DeviceBuffer<scalar>* x = at(A.vAx)) addS("vAx", *x);
+        if (const DeviceBuffer<scalar>* x = at(A.vR)) addS("vR", *x);
+        if (const DeviceBuffer<scalar>* x = at(A.vX)) addS("vX", *x);
+        if (const DeviceBuffer<scalar>* x = at(A.vB)) addS("vB", *x);
+        if (const DeviceBuffer<scalar>* x = at(A.vD)) addS("vD", *x);
+        if (const DeviceBuffer<scalar>* x = at(A.vPc)) addS("vPc", *x);
+        if (const DeviceBuffer<float>* x = at(A.fDiag)) addF("fDiag", *x);
+        if (const DeviceBuffer<float>* x = at(A.fUpper)) addF("fUpper", *x);
+        if (const DeviceBuffer<float>* x = at(A.fLower)) addF("fLower", *x);
+        if (const DeviceBuffer<float>* x = at(A.vAxF)) addF("vAxF", *x);
+        if (const DeviceBuffer<float>* x = at(A.vRF)) addF("vRF", *x);
+        if (const DeviceBuffer<float>* x = at(A.vXF)) addF("vXF", *x);
+        if (const DeviceBuffer<float>* x = at(A.vBF)) addF("vBF", *x);
+        if (const DeviceBuffer<label>* x = at(A.csrRow)) addL("csrRow", *x);
+        if (const DeviceBuffer<label>* x = at(A.csrCol)) addL("csrCol", *x);
+        if (const DeviceBuffer<label>* x = at(A.csrSrc)) addL("csrSrc", *x);
+        if (const DeviceBuffer<float>* x = at(A.csrVal)) addF("csrVal", *x);
+        if (const DeviceBuffer<label>* x = at(A.csr64Row)) addL("csr64Row", *x);
+        if (const DeviceBuffer<label>* x = at(A.csr64Col)) addL("csr64Col", *x);
+        if (const DeviceBuffer<label>* x = at(A.csr64Src)) addL("csr64Src", *x);
+        if (const DeviceBuffer<scalar>* x = at(A.csr64Val)) addS("csr64Val", *x);
+        char head[64];
+        std::snprintf(head, sizeof head, "grid %d", g);
+        flush(head);
+    }
+    addS("sScNum", A.sScNum);
+    addS("sScDen", A.sScDen);
+    addS("sScAlpha", A.sScAlpha);
+    addS("sZrOld", A.sZrOld);
+    addS("wA", A.wA);
+    addS("rA", A.rA);
+    addS("keptDiag", A.keptDiag);
+    addS("keptUpper", A.keptUpper);
+    addS("keptLower", A.keptLower);
+    addI("keptDiffers", A.keptDiffers);
+    addS("coarseLU", A.coarseLU);
+    addI("coarsePiv", A.coarsePiv);
+    addS("cdFc", A.coarseDirect.fc);
+    addS("cdF2", A.coarseDirect.f2);
+    addS("cdWork", A.coarseDirect.work);
+    addS("cdProbe", A.coarseDirect.probe);
+    std::size_t pair = A.pair.off.size()*sizeof(label) + A.pair.w.size()*sizeof(scalar) + A.pair.ifc.size()*sizeof(scalar)
+                     + A.pair.dense.size()*sizeof(scalar) + A.pair.term.size()*sizeof(scalar) + A.pair.chunkSum.size()*sizeof(scalar)
+                     + A.pair.strip.size()*sizeof(scalar);
+    for (const auto& v : A.pair.own) pair += v.size()*sizeof(label);
+    for (const auto& v : A.pair.nbr) pair += v.size()*sizeof(label);
+    for (const auto& v : A.pair.ownCells) pair += v.size()*sizeof(label);
+    for (const auto& v : A.pair.ownStart) pair += v.size()*sizeof(label);
+    for (const auto& v : A.pair.ownFaces) pair += v.size()*sizeof(label);
+    add("pair", pair, 0);
+    if (A.pcgCache)
+    {
+        const PCGGraphCache& c = *A.pcgCache;
+        addS("pcgPA", c.pA);
+        addS("pcgAx", c.Ax);
+        addS("pcgB", c.gB);
+        addS("pcgDiag", c.gDiag);
+        addS("pcgUpper", c.gUpper);
+        addS("pcgLower", c.gLower);
+        addS("pcgCycCoeff", c.gCycCoeff);
+        addS("pcgCycJump", c.gCycJump);
+        addS("pcgAmiIfc", c.gAmiIfc);
+    }
+    flush("hierarchy-wide");
+    std::fprintf(stderr, "[amg-mem] %s %s total %zu bytes (%.3f GiB) over %d levels\n", when, who, total, total/1073741824.0, G);
+}
+
+// the same for a matrix a holder keeps beside its hierarchy (its finest grid, an operator's copy)
+void lduMemoryReport(
+    const DeviceLduMatrix& M,
+    const char* who,
+    const char* when)
+{
+    const std::size_t s = sizeof(scalar);
+    const std::size_t l = sizeof(label);
+    const std::size_t total = (M.diag.size() + M.upper.size() + M.lower.size())*s
+                            + (M.owner.size() + M.nei.size() + M.ownerStart.size() + M.losort.size() + M.losortStart.size())*l;
+    std::fprintf(stderr, "[amg-mem] %s %s ldu %d cells %d faces bytes %zu: diag=%zu upper=%zu lower=%zu owner=%zu nei=%zu ownerStart=%zu "
+                 "losort=%zu losortStart=%zu\n", when, who, M.nCells, M.nFaces, total, M.diag.size()*s, M.upper.size()*s, M.lower.size()*s,
+                 M.owner.size()*l, M.nei.size()*l, M.ownerStart.size()*l, M.losort.size()*l, M.losortStart.size()*l);
+}
+
 } // namespace brae

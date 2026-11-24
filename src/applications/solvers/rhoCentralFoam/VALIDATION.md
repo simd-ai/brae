@@ -25,6 +25,8 @@ bound is never widened to make a check pass.
 | rho_central_3d_vs_openfoam | 3-D: axial corner (inviscid, laminar, kOmegaSST), closed-box blast and its restarts, totalPressure duct | 75 | 1 | slow, rhocentral, known-red |
 | rho_central_refusals | everything outside the scope stops by name | 46 | 0 | rhocentral |
 | rho_central_piov_vs_openfoam (added 2026-11-20, after this suite) | pressureInletOutletVelocity on a static mesh (piovBox), CUDA and host reference arms | 17 | 0 | slow, rhocentral |
+| rho_central_keys_vs_openfoam (added 2026-11-21, wave 1 Q4) | shockTube with `default linear` reconstruction; jet_sst with `linearUpwind limited` (cellLimited) and with `"(k\|omega)" 0.7` relaxation; each setting's control red | 20 | 0 | slow, rhocentral |
+| rho_central_keys_refusals (added 2026-11-21, wave 1 Q4) | the compressible kOmegaSST's keys, decayControl, the diagonal solves' names, pattern keys, dotInterpolate, janaf's warning, the unread-entry audit | 37 | 0 | slow, rhocentral |
 1,122 checks pass. The 24 that fail are all registered open checks; none is on a tutorial as shipped. The 5
 historical lines of the viscous gate are the raw conservation imbalance of a solve stopped at its tolerance, kept in
 the log; the acceptance there is the residual-accounted balance.

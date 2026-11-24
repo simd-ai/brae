@@ -11,7 +11,7 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [main]
+    branches: [main, develop]
   workflow_call:        # let release.yml reuse this build-check as a release gate
 
 permissions:
