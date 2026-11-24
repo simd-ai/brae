@@ -1240,13 +1240,31 @@ SimplecSnGrad simplecSnGrad(
         // epsilon with it), where OpenFOAM's is 1.5 (I |U_b|)^2 = 4.03e-6 at step 2 on the middle face.
         // The steady drivers keep the refValue form. CONTROL BRAE_CONTROL_TURB_INLET_REFVALUE=1: the
         // refValue form on pimpleStep too, as before.
+        //
+        // THE FLUX SWITCHES of the two fields (inletOutlet, and the inlets above, which derive from it) move
+        // here on pimpleStep as well: valueFraction = neg(phi) is set in the same updateCoeffs, from the flux
+        // the LAST pressure corrector made. At the momentum assembly they read the flux from before the
+        // step, which on RAS/TJunction is zero at step 1: there the inlet and outlet1 stayed zeroGradient
+        // through step 1, where OpenFOAM's had switched to inflow (outlet1's k and epsilon written at their
+        // inletValues 0.2 and 200 by OpenFOAM, at the cells' values by brae). kEpsilon only: the switched boundary
+        // is also what the closures' gradients would then read, and only kEpsilon's is handed the stored values
+        // (next commit); kOmegaSST, SpalartAllmaras, RNGkEpsilon and realizableKE keep the momentum assembly's
+        // switch, unmeasured with this one. CONTROL BRAE_CONTROL_TURB_SWITCH_AT_MOMENTUM=1: the momentum
+        // assembly's switch, as before.
         static const bool inletRefValue = std::getenv("BRAE_CONTROL_TURB_INLET_REFVALUE") != nullptr;
-        if (hasTurbInlet_ && pimpleUpdatePoints_ && !inletRefValue)
-        {
-            DeviceBuffer<scalar> kb;
-            deviceBCValue(dbK_, dk_, kb);
+        static const bool switchAtMomentum = std::getenv("BRAE_CONTROL_TURB_SWITCH_AT_MOMENTUM") != nullptr;
+        const bool switchHere = pimpleUpdatePoints_ && !switchAtMomentum && ctl_.turbulent && !ctl_.les
+                             && ctl_.modelName == "kEpsilon";
+        const bool patchValues = hasTurbInlet_ && pimpleUpdatePoints_ && !inletRefValue;
+        DeviceBuffer<scalar> kb;
+        if (patchValues) deviceBCValue(dbK_, dk_, kb);   // before either field's boundary moves
+        if (switchHere) deviceUpdateInletOutlet(dbEps_, phiBnd_);
+        if (patchValues)
             deviceUpdateTurbulentInletSecond(kb, mlMask_, mlLength_,
                                              ctl_.sst ? ctl_.ksstCoeffs.betaStar : ctl_.keCoeffs.Cmu, dbEps_);
+        if (switchHere) deviceUpdateInletOutlet(dbK_, phiBnd_);
+        if (patchValues)
+        {
             DeviceBuffer<scalar> ub[3];
             for (int k = 0; k < 3; ++k) deviceBCValue(dbU_.comp[k], Uk_[k], ub[k]);
             deviceUpdateTurbulentInletK(ub[0], ub[1], ub[2], tiMask_, tiIntensity_, dbK_);
@@ -1819,10 +1837,15 @@ SimplecSnGrad simplecSnGrad(
         if (compressible_ && dbHe_.n) deviceUpdateInletOutlet(dbHe_, phiBnd_);
         // NOTE: the turbulent-inlet refresh does NOT belong here. It moved into correctTurbulence(),
         // which is where OF updates it -- see the comment there.
+        // pimpleStep switches kEpsilon's k and epsilon at the turbulence correction instead (correctTurbulence)
+        static const bool turbSwitchAtMomentum = std::getenv("BRAE_CONTROL_TURB_SWITCH_AT_MOMENTUM") != nullptr;
         if (ctl_.turbulent && !ctl_.les)   // pure LES has no k/epsilon/omega boundaries (algebraic nut)
         {
-            deviceUpdateInletOutlet(dbK_, phiBnd_);
-            deviceUpdateInletOutlet(dbEps_, phiBnd_);
+            if (!pimpleUpdatePoints_ || turbSwitchAtMomentum || ctl_.modelName != "kEpsilon")
+            {
+                deviceUpdateInletOutlet(dbK_, phiBnd_);
+                deviceUpdateInletOutlet(dbEps_, phiBnd_);
+            }
             if (ctl_.lm)
             {
                 deviceUpdateInletOutlet(dbReThetat_, phiBnd_);
