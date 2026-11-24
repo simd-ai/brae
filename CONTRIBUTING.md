@@ -17,6 +17,9 @@ If you keep those two in mind, the rest is detail.
 
 ## Pull requests
 
+- **Branch from `develop` and open the PR against `develop`.** `main` is the release branch: it moves only through a
+  release PR from `develop`, or through a hotfix PR whose change is then merged back into `develop`.
+  `docs/ci/branch-rules.md` describes both.
 - Keep PRs focused. One change, one story. A kernel rewrite and a refactor are two PRs.
 - **Build and test before you open it.** The test suite is built only on request:
   `cmake -B build -DBRAE_BUILD_TESTS=ON && cmake --build build -j 8 && ctest --test-dir build`. Without
