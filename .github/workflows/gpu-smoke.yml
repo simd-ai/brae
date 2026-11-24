@@ -51,8 +51,12 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           case "$EVENT" in
-              pull_request) base=$PR_BASE; head=$PR_HEAD ;;
-              push)         base=$PUSH_BEFORE; head=$SHA ;;
+              # a pull request: what its branch changed since it left the base (three dots, from the merge base),
+              # as GitHub's "Files changed" shows it. Two dots would also count every file the base gained since
+              # then, so a documentation-only branch behind main ran the GPU tier (#61, 2026-11-20: 35 of 47).
+              pull_request) base=$PR_BASE; head=$PR_HEAD; range="$base...$head" ;;
+              # a push: what the branch moved by
+              push)         base=$PUSH_BEFORE; head=$SHA; range="$base..$head" ;;
               *)            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
           esac
           # a new branch or a rewritten history has no base to compare with: run the tier
@@ -60,7 +64,7 @@ jobs:
               echo "code=true" >> "$GITHUB_OUTPUT"
               exit 0
           fi
-          git diff --name-only "$base" "$head" > changed.txt
+          git diff --name-only "$range" > changed.txt
           echo "changed files: $(wc -l < changed.txt)"
           # documentation only: Markdown anywhere, docs/, images, LICENSE. No test reads any of them.
           code=$(grep -cvE '\.md$|^docs/|\.(png|jpg|jpeg|gif|svg)$|^LICENSE$' changed.txt || true)
