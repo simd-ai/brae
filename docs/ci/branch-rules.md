@@ -1,7 +1,25 @@
-# CI tiers and the rules on main
+# CI tiers and the rules on main and develop
 
-What runs where, and the branch rules and Actions settings that make it hold. The settings are a proposal:
-nothing in this directory changes GitHub by being merged. The commands at the end apply them.
+What runs where, and the branch rules and Actions settings that make it hold. Nothing in this directory changes
+GitHub by being merged: the commands at the end apply the settings that are still proposals.
+
+## Branches
+
+| Branch | Role | Moves by |
+|---|---|---|
+| `main` | the stable release branch and the repository default; tags `v*` are cut from it | a release PR from `develop`, or a hotfix PR |
+| `develop` | the integration branch; every feature branch starts here | reviewed PRs from feature branches |
+
+- **Feature work:** branch from `develop`, open the PR against `develop`. The PR runs `build` and `gpu-smoke`; the
+  merge into `develop` runs them again on the merged result.
+- **Release:** dispatch `gpu-full` on `develop` with `no_cache` (Actions, gpu-full, Run workflow, branch `develop`), then
+  open a PR from `develop` to `main`. It runs the checks `main` requires (`build`, `gpu-smoke`). Merge it with a merge
+  commit, not a squash, so that `develop` stays an ancestor of `main`. A tag `v*` on `main` then runs `release.yml`,
+  which repeats the whole suite uncached.
+- **Hotfix:** branch from `main`, open the PR against `main`, and after it merges open a PR from `main` to `develop` so
+  the fix is not lost at the next release.
+- A release fix that was already open against `main` before `develop` existed keeps its base, so that its evidence
+  stays attached to the tree it was measured on; it is then merged back into `develop` as a hotfix is.
 
 ## The four tiers
 
@@ -16,7 +34,7 @@ nothing in this directory changes GitHub by being merged. The commands at the en
 |---|---|---|---|
 | Pull request from a branch of simd-ai/brae | runs | runs, unless the change is documentation only | no |
 | Pull request from a fork | runs | **fails on a hosted runner without checking anything out**; a maintainer pushes the change to a branch here, whose pull request runs it | no |
-| Push to main (a merge) | runs | runs, unless the change is documentation only | no |
+| Push to main or develop (a merge) | runs | runs, unless the change is documentation only | no |
 | Nightly, 01:00 UTC | no | no | runs, cached |
 | Manual dispatch | no | yes | yes; `no_cache` runs every test |
 | Tag `v*` (release.yml) | runs | no | runs, uncached |
@@ -51,15 +69,17 @@ of `pimple_pressure_reference`, whose uniform start decides the limiter by round
 the compiler and the GPU target. That one is labelled `diagnostic`: the full tiers run it in their last step, which
 never fails the job, and `ctest --preset diagnostic` runs it by hand.
 
-## Rules on main
+## Rules on main and develop
 
-Today (read from the API on 2026-11-20): ruleset "Protect main", active: no deletion, no force push, changes through
-a pull request with 0 approvals and every conversation resolved, required check `build` from GitHub Actions.
-`ci.yml` keeps a job named `build` (it waits for the three architectures), so that rule keeps working.
+Today (read from the API on 2026-11-24): ruleset "Protect main" (`main-ruleset.json`), active on the default branch:
+no deletion, no force push, changes through a pull request with 0 approvals and every conversation resolved,
+required checks `build` and `gpu-smoke` from GitHub Actions. `ci.yml` keeps a job named `build` (it waits for the
+three architectures), so that rule keeps working. With one maintainer GitHub does not let an author approve their
+own pull request, so 0 approvals stays until there is a second reviewer.
 
-Proposed, `main-ruleset.json`: the same rules, with `gpu-smoke` required as well. Apply it after gpu-smoke.yml is
-on main: until then no pull request reports a `gpu-smoke` check and none could merge. With one maintainer GitHub
-does not let an author approve their own pull request, so 0 approvals stays until there is a second reviewer.
+`develop` has no rule yet. Proposed, `develop-ruleset.json`: the same rules on `develop`, so that it too moves only
+through pull requests that passed `build` and `gpu-smoke`. Also proposed: delete a pull request's branch when it
+merges, so merged branches do not accumulate.
 
 ## Actions settings
 
@@ -77,10 +97,11 @@ the local checkout, next to `brae/`; `OFSCAN_ROOT` names another place.
 
 ## Applying it
 
-Not applied. With `gh` logged in as a repository admin:
+The ruleset on main is applied. The rest is not. With `gh` logged in as a repository admin:
 
 ```bash
-gh api -X PUT repos/simd-ai/brae/rulesets/27370912 --input docs/ci/main-ruleset.json
+gh api -X POST repos/simd-ai/brae/rulesets --input docs/ci/develop-ruleset.json
+gh api -X PATCH repos/simd-ai/brae -F delete_branch_on_merge=true
 gh api -X PUT repos/simd-ai/brae/actions/permissions/fork-pr-contributor-approval \
     -f approval_policy=all_external_contributors
 gh api -X PUT repos/simd-ai/brae/actions/permissions/workflow \
