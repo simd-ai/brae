@@ -1229,7 +1229,64 @@ SimplecSnGrad simplecSnGrad(
         // WALL faces and the outlet matched OF exactly throughout; only the 400 inlet faces were wrong.
         //
         // A3 fixed these inlets being FROZEN at set-up. This is that fix landing one phase too early.
-        if (hasTurbInlet_)
+        //
+        // pimpleStep reads what OpenFOAM's updateCoeffs read, in OpenFOAM's order. kEpsilon::correct updates
+        // epsilon's boundary first (kEpsilon.C:247), so the mixing-length inlet takes k's patch value as k's
+        // LAST evaluate left it, the previous step's (on the first step, the value read from 0/k); k's own
+        // boundary moves later, in kEqn's constructor (:273), from U's patch value after the last pressure
+        // corrector. kOmegaSSTBase::correct has the same order (kOmegaSSTBase.C:541, 600). The refValue
+        // arrays are those values only on a fixedValue face: on RAS/TJunction's pressureInletOutletVelocity
+        // inlet U's refValue is the tangential velocity, 0, so the inlet k was EXACTLY 0 from step 2 (and
+        // epsilon with it), where OpenFOAM's is 1.5 (I |U_b|)^2 = 4.03e-6 at step 2 on the middle face.
+        // The steady drivers keep the refValue form. CONTROL BRAE_CONTROL_TURB_INLET_REFVALUE=1: the
+        // refValue form on pimpleStep too, as before.
+        //
+        // THE FLUX SWITCHES of the two fields (inletOutlet, and the inlets above, which derive from it) move
+        // here on pimpleStep as well: valueFraction = neg(phi) is set in the same updateCoeffs, from the flux
+        // the LAST pressure corrector made. At the momentum assembly they read the flux from before the
+        // step, which on RAS/TJunction is zero at step 1: there the inlet and outlet1 stayed zeroGradient
+        // through step 1, where OpenFOAM's had switched to inflow (outlet1's k and epsilon written at their
+        // inletValues 0.2 and 200 by OpenFOAM, at the cells' values by brae). kEpsilon only: the switched boundary
+        // is also what the closures' gradients would then read, and only kEpsilon's is handed the stored values
+        // (next commit); kOmegaSST, SpalartAllmaras, RNGkEpsilon and realizableKE keep the momentum assembly's
+        // switch, unmeasured with this one. CONTROL BRAE_CONTROL_TURB_SWITCH_AT_MOMENTUM=1: the momentum
+        // assembly's switch, as before.
+        static const bool inletRefValue = std::getenv("BRAE_CONTROL_TURB_INLET_REFVALUE") != nullptr;
+        static const bool switchAtMomentum = std::getenv("BRAE_CONTROL_TURB_SWITCH_AT_MOMENTUM") != nullptr;
+        const bool switchHere = pimpleUpdatePoints_ && !switchAtMomentum && ctl_.turbulent && !ctl_.les
+                             && ctl_.modelName == "kEpsilon";
+        const bool patchValues = hasTurbInlet_ && pimpleUpdatePoints_ && !inletRefValue;
+        DeviceBuffer<scalar> kb;
+        if (patchValues) deviceBCValue(dbK_, dk_, kb);   // before either field's boundary moves
+        // ...and the STORED patch values of both fields, for the gradients the two equations take. OpenFOAM's
+        // updateCoeffs above moves refValue and valueFraction, never the stored value, so the limitedLinear
+        // limiter's fvc::grad(k) and fvc::grad(epsilon) (LimitedScheme.C:56) still read what the last evaluate
+        // left: 0.2 on the TJunction inlet at step 1, the file's value, where the switched boundary now gives
+        // 1.5 (I |U_b|)^2 = 1.0e-6. Taken after the switches, k was 1.28e-5 off OpenFOAM in the three cell
+        // columns behind the inlet at step 1 (tight solves, every boundary value equal). kEpsilon only:
+        // RNGkEpsilon and realizableKE share this closure, unmeasured with it. CONTROL
+        // BRAE_CONTROL_TURB_GRAD_AFTER_UPDATE=1: the closure's own values, as before.
+        static const bool gradAfterUpdate = std::getenv("BRAE_CONTROL_TURB_GRAD_AFTER_UPDATE") != nullptr;
+        const bool storedGrad = switchHere && ctl_.modelName == "kEpsilon" && !gradAfterUpdate;
+        DeviceBuffer<scalar> kStored;
+        DeviceBuffer<scalar> epsStored;
+        if (storedGrad)
+        {
+            deviceBCValue(dbK_, dk_, kStored);
+            deviceBCValue(dbEps_, de_, epsStored);
+        }
+        if (switchHere) deviceUpdateInletOutlet(dbEps_, phiBnd_);
+        if (patchValues)
+            deviceUpdateTurbulentInletSecond(kb, mlMask_, mlLength_,
+                                             ctl_.sst ? ctl_.ksstCoeffs.betaStar : ctl_.keCoeffs.Cmu, dbEps_);
+        if (switchHere) deviceUpdateInletOutlet(dbK_, phiBnd_);
+        if (patchValues)
+        {
+            DeviceBuffer<scalar> ub[3];
+            for (int k = 0; k < 3; ++k) deviceBCValue(dbU_.comp[k], Uk_[k], ub[k]);
+            deviceUpdateTurbulentInletK(ub[0], ub[1], ub[2], tiMask_, tiIntensity_, dbK_);
+        }
+        else if (hasTurbInlet_)
         {
             deviceUpdateTurbulentInletK(dbU_, tiMask_, tiIntensity_, dbK_);
             deviceUpdateTurbulentInletSecond(dbK_, mlMask_, mlLength_,
@@ -1365,7 +1422,9 @@ SimplecSnGrad simplecSnGrad(
                                       fixScaK_ ? &fixScaMask_ : nullptr, fixScaK_ ? &fixScaKVal_ : nullptr,
                                       fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr,
                                       /*nSweeps*/1, ctl_.gsKESym,   // ...and WHICH GaussSeidel the case named
-                                      lapLimit(ctl_, "closure"));   // `limited corrected <psi>` on k and epsilon
+                                      lapLimit(ctl_, "closure"),    // `limited corrected <psi>` on k and epsilon
+                                      storedGrad ? &kStored : nullptr,
+                                      storedGrad ? &epsStored : nullptr);
         }
     }
 
@@ -1706,6 +1765,56 @@ SimplecSnGrad simplecSnGrad(
         return deviceForcePatchSums(faces, fl);
     }
 
+    void DeviceSimpleSolver::updateTotalPressure()
+    {
+        // p0(t) BEFORE p_b, as uniformTotalPressure's updateCoeffs samples it (uniformTotalPressureFvPatchScalarField.C:151)
+        if (!tvP0_.empty())
+        {
+            std::vector<scalar> p0h = dbP_.p0.host();
+            for (const auto& e : tvP0_)
+            {
+                const scalar v = e.f.value(time_);
+                for (label i = 0; i < e.count; ++i)
+                {
+                    const label f = e.start + i;
+                    if (f >= 0 && f < (label)p0h.size()) p0h[f] = v;
+                }
+            }
+            dbP_.p0.copyFrom(p0h);
+        }
+        // fanPressure: the fan's operating point depends on the flow it is currently passing, so p0
+        // has to be re-derived from THIS step's boundary flux before the total-pressure update runs.
+        // OF does the same inside fanPressureFvPatchScalarField::updateCoeffs, which then defers to
+        // totalPressure with the shifted p0.
+        if (!fanP0_.empty())
+        {
+            const std::vector<scalar> phih = phiBnd_.host();
+            std::vector<scalar> p0h = dbP_.p0.host();
+            for (const auto& e : fanP0_)
+            {
+                scalar sum = 0;
+                for (label i = 0; i < e.count; ++i)
+                {
+                    const label f = e.start + i;
+                    if (f >= 0 && f < (label)phih.size()) sum += phih[f];
+                }
+                const scalar v = e.p0 - e.dir * e.dp(std::max(e.dir * sum, scalar(0)));
+                for (label i = 0; i < e.count; ++i)
+                {
+                    const label f = e.start + i;
+                    if (f >= 0 && f < (label)p0h.size()) p0h[f] = v;
+                }
+            }
+            dbP_.p0.copyFrom(p0h);
+        }
+        DeviceBuffer<scalar> ubx, uby, ubz;
+        deviceBCValue(dbU_.comp[0], Uk_[0], ubx);
+        deviceBCValue(dbU_.comp[1], Uk_[1], uby);
+        deviceBCValue(dbU_.comp[2], Uk_[2], ubz);
+        deviceUpdateTotalPressure(dbP_, phiBnd_, ubx, uby, ubz,
+                                  compressible_ ? &rhoBnd_ : nullptr);   // p in Pa -> rho-weighted dynamic head
+    }
+
     void DeviceSimpleSolver::solveMomentumPredictor(DeviceSimpleResidual& res)
     {
         // Which components this step ACTUALLY SOLVED, so the driver prints OpenFOAM's lines and no
@@ -1747,10 +1856,15 @@ SimplecSnGrad simplecSnGrad(
         if (compressible_ && dbHe_.n) deviceUpdateInletOutlet(dbHe_, phiBnd_);
         // NOTE: the turbulent-inlet refresh does NOT belong here. It moved into correctTurbulence(),
         // which is where OF updates it -- see the comment there.
+        // pimpleStep switches kEpsilon's k and epsilon at the turbulence correction instead (correctTurbulence)
+        static const bool turbSwitchAtMomentum = std::getenv("BRAE_CONTROL_TURB_SWITCH_AT_MOMENTUM") != nullptr;
         if (ctl_.turbulent && !ctl_.les)   // pure LES has no k/epsilon/omega boundaries (algebraic nut)
         {
-            deviceUpdateInletOutlet(dbK_, phiBnd_);
-            deviceUpdateInletOutlet(dbEps_, phiBnd_);
+            if (!pimpleUpdatePoints_ || turbSwitchAtMomentum || ctl_.modelName != "kEpsilon")
+            {
+                deviceUpdateInletOutlet(dbK_, phiBnd_);
+                deviceUpdateInletOutlet(dbEps_, phiBnd_);
+            }
             if (ctl_.lm)
             {
                 deviceUpdateInletOutlet(dbReThetat_, phiBnd_);
@@ -1777,58 +1891,11 @@ SimplecSnGrad simplecSnGrad(
         if (hasPiov_)  deviceUpdatePressureInletOutletVelocity(dbU_, phiBnd_, Uk_[0], Uk_[1], Uk_[2], /*directionMixed=*/true);
         if (hasSym_)   deviceUpdateSymmetry(dbU_, Uk_[0], Uk_[1], Uk_[2]);
         if (hasWedge_) deviceUpdateWedge(dbU_, Uk_[0], Uk_[1], Uk_[2]);   // axisymmetric: the rotated cell velocity
-        // totalPressure p: recompute refValue = p0 - 0.5*neg(phi)|U_b|^2 from the boundary velocity (deviceBCValue
-        // reflects the just-updated U BCs above, e.g. pressureInletOutletVelocity) + the boundary flux.
-        if (hasTotalP_)
-        {
-            // p0(t) BEFORE the total-pressure update, matching OF's updateCoeffs order: p0 is sampled
-            // at the current time, then p_b = p0 - 0.5*neg(phi)*magSqr(U) is formed from it.
-            if (!tvP0_.empty())
-            {
-                std::vector<scalar> p0h = dbP_.p0.host();
-                for (const auto& e : tvP0_)
-                {
-                    const scalar v = e.f.value(time_);
-                    for (label i = 0; i < e.count; ++i)
-                    {
-                        const label f = e.start + i;
-                        if (f >= 0 && f < (label)p0h.size()) p0h[f] = v;
-                    }
-                }
-                dbP_.p0.copyFrom(p0h);
-            }
-            // fanPressure: the fan's operating point depends on the flow it is currently passing, so p0
-            // has to be re-derived from THIS step's boundary flux before the total-pressure update runs.
-            // OF does the same inside fanPressureFvPatchScalarField::updateCoeffs, which then defers to
-            // totalPressure with the shifted p0.
-            if (!fanP0_.empty())
-            {
-                const std::vector<scalar> phih = phiBnd_.host();
-                std::vector<scalar> p0h = dbP_.p0.host();
-                for (const auto& e : fanP0_)
-                {
-                    scalar sum = 0;
-                    for (label i = 0; i < e.count; ++i)
-                    {
-                        const label f = e.start + i;
-                        if (f >= 0 && f < (label)phih.size()) sum += phih[f];
-                    }
-                    const scalar v = e.p0 - e.dir * e.dp(std::max(e.dir * sum, scalar(0)));
-                    for (label i = 0; i < e.count; ++i)
-                    {
-                        const label f = e.start + i;
-                        if (f >= 0 && f < (label)p0h.size()) p0h[f] = v;
-                    }
-                }
-                dbP_.p0.copyFrom(p0h);
-            }
-            DeviceBuffer<scalar> ubx, uby, ubz;
-            deviceBCValue(dbU_.comp[0], Uk_[0], ubx);
-            deviceBCValue(dbU_.comp[1], Uk_[1], uby);
-            deviceBCValue(dbU_.comp[2], Uk_[2], ubz);
-            deviceUpdateTotalPressure(dbP_, phiBnd_, ubx, uby, ubz,
-                                      compressible_ ? &rhoBnd_ : nullptr);   // p in Pa -> rho-weighted dynamic head
-        }
+        // totalPressure p, on the steady drivers: here, from U's patch values as the start of the iteration
+        // left them. pimpleStep moves it to the pressure assembly (pimpleUpdatePoints_), where OpenFOAM's
+        // pEqn.H constructs fvm::laplacian(rAtU, p) and the patch's updateCoeffs reads U_b and phi.
+        static const bool totalPAtMomentumCtl = std::getenv("BRAE_CONTROL_TOTAL_PRESSURE_AT_MOMENTUM") != nullptr;
+        if (hasTotalP_ && (!pimpleUpdatePoints_ || totalPAtMomentumCtl)) updateTotalPressure();
         // fixedMean: the face values ARE the adjacent cell values, shifted (or scaled) so their
         // area-weighted mean hits the prescribed one. That is a patch-wide reduction, so the small
         // per-boundary-face gather comes back to the host and the sum is done there -- the whole cell
@@ -3314,6 +3381,16 @@ SimplecSnGrad simplecSnGrad(
             deviceUpdateMixedFreestream(dbU_, dbP_, phiBnd_, Uk_[0], Uk_[1], Uk_[2],
                                         compressible_ ? &rhoBnd_ : nullptr, /*which=*/2,
                                         &UbStored_[0], &UbStored_[1], &UbStored_[2]);
+        // ...and totalPressure's, in the same constructor (uniformTotalPressureFvPatchScalarField.C:151-218): p0 at
+        // this time, U's patch values as the last evaluate left them (the momentum solve's for the first
+        // corrector, the previous corrector's U.correctBoundaryConditions() after that), and phi as it stands,
+        // which this corrector has not yet replaced. Every non-orthogonal pass reads the same three. Done once
+        // at the momentum assembly instead, p_b took U_b from the end of the PREVIOUS step and the flux from
+        // before this step's first corrector: on RAS/TJunction p_b = p0 exactly at step 1 (OpenFOAM's p0 - p_b
+        // 2.28e-4 on the middle inlet face, tight solves) and lagged a step after. CONTROL
+        // BRAE_CONTROL_TOTAL_PRESSURE_AT_MOMENTUM=1: the momentum assembly's point, as before.
+        static const bool totalPAtMomentum = std::getenv("BRAE_CONTROL_TOTAL_PRESSURE_AT_MOMENTUM") != nullptr;
+        if (hasTotalP_ && pimpleUpdatePoints_ && !totalPAtMomentum) updateTotalPressure();
         const int nPass = (ctl_.nonOrth ? ctl_.nNonOrth : 0) + 1;
         DeviceBuffer<scalar> pIC, pBC, ffcP, ffcPcyc, ffcPami;
         DeviceSolverPerf pp, pp0;
@@ -3739,14 +3816,23 @@ SimplecSnGrad simplecSnGrad(
         if (!ioRefreshOff && (ctl_.innerCorrector > 0 || ctl_.momentumPredictor))
         {
             deviceUpdateInletOutlet(dbU_, phiBnd_);
-            // NOT pressureInletOutletVelocity, though OpenFOAM's updateCoeffs moves it here too: this
-            // driver types a piov face in the LEGACY form (deviceUpdatePressureInletOutletVelocity's
-            // `directionMixed=false`, every inflow component fixedValue at n(n.U_cell)), which the
-            // frozen incompressible path's fluxes and matrix grew around and which validation/piov is
-            // held to at its recorded numbers (tests/simple_piov_vs_openfoam.sh). Re-applying THAT form
-            // per corrector is not OpenFOAM's directionMixed either: MEASURED on RAS/TJunction, ten
-            // steps of 0.002, it moves U from 7.078e-03 to 7.690e-02 against OpenFOAM -- ten times
-            // further. The piov half of this correction belongs with the directionMixed port.
+        }
+        // pressureInletOutletVelocity moves here too, on pimpleStep. Its updateCoeffs ends in its own
+        // evaluate (pressureInletOutletVelocityFvPatchVectorField.C:180-183), which clears updated(), so
+        // every U.correctBoundaryConditions() re-runs it, the first corrector's included: valueFraction
+        // neg(phi)(I - nn) from the flux this corrector just made, then the blend of the corrected cells.
+        // Left at the momentum assembly's switch, the patch stayed zeroGradient through all of step 1 on
+        // RAS/TJunction, where phi starts at zero: brae's tangential inlet velocity was -1.69e-6 at the
+        // edge faces where OpenFOAM's is 0, and the next corrector's total pressure read it. Same
+        // directionMixed form as the assembly's call. The steady drivers keep the assembly's switch: the
+        // form re-applied there was the LEGACY one (every inflow component fixed at n(n.U_cell)), and on
+        // TJunction that moved U from 7.078e-03 to 7.690e-02 against OpenFOAM, ten steps of 0.002;
+        // validation/piov holds the steady path at its recorded numbers. CONTROL
+        // BRAE_CONTROL_PIOV_ASSEMBLY_ONLY=1: the assembly's switch for the whole step, as before.
+        static const bool piovAssemblyOnly = (std::getenv("BRAE_CONTROL_PIOV_ASSEMBLY_ONLY") != nullptr);
+        if (hasPiov_ && pimpleUpdatePoints_ && !piovAssemblyOnly)
+        {
+            deviceUpdatePressureInletOutletVelocity(dbU_, phiBnd_, Uk_[0], Uk_[1], Uk_[2], /*directionMixed=*/true);
         }
         // limitVelocity (fvOptions.correct): clamp |U| <= max on the corrected (output) velocity. OF clamps after the
         // momentum predictor; cf clamps the post-corrector U so the WRITTEN field is bounded (matches OF's output).
@@ -4917,6 +5003,7 @@ SimplecSnGrad simplecSnGrad(
         // by then the fields are aged and only the geometry is being re-converged.
         if (moveMesh) moveMesh(0);
         advanceTime(deltaT);                                  // store oldTime() + set deltaT/deltaT0 for ddtCoeffs()
+        pimpleUpdatePoints_ = true;
         DeviceSimpleResidual res;
         const int nOuter = nOuterCorrectors > 0 ? nOuterCorrectors : 1;
         const int nCorr  = nCorrectors      > 0 ? nCorrectors      : 1;

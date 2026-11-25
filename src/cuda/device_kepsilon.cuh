@@ -530,7 +530,15 @@ void deviceKEpsilonCorrect(const DeviceMesh& dm, const DeviceWallData& wall, con
                             bool gsSymmetric = true,
                             // laplacianSchemes `limited corrected <psi>` on k's and epsilon's non-orthogonal
                             // correction (deviceSolveScalarTransport's lapLimit); 1 is `corrected`.
-                            scalar lapLimit = 1);
+                            scalar lapLimit = 1,
+                            // k's and epsilon's patch values as their LAST EVALUATE left them, for the gradients
+                            // the two equations take (limitedLinear's limiter, linearUpwind, the non-orthogonal
+                            // correction): what fvc::grad reads in OpenFOAM, whose updateCoeffs moves refValue and
+                            // valueFraction but not the stored value. Null keeps the closure's own: k's evaluated
+                            // from its current coefficients, epsilon's at entry (ebvStored). A caller that updates
+                            // the two boundaries before calling takes them first and passes them here.
+                            const DeviceBuffer<scalar>* kBndStored = nullptr,
+                            const DeviceBuffer<scalar>* epsBndStored = nullptr);
 
 // Closed device kOmegaSST::correct(): production (raw GbyNu0 + omega-wall G0 override) -> F1/F2/CDkOmega/S2 ->
 // omega eqn (loose solve, omega-wall setValues) -> bound -> k eqn (loose solve) -> bound -> correctNut (Bradshaw
