@@ -1189,7 +1189,9 @@ void deviceKEpsilonCorrect(
                             const DeviceBuffer<scalar>* fvoEVal,       // compressible: mu at boundary faces (the +mu of rho*D+mu)
                             int nSweeps,                              // solvers/<field>/nSweeps; see the declaration
                             bool gsSymmetric,
-                             scalar lapLimit)   // see the declaration
+                             scalar lapLimit,   // see the declaration
+                            const DeviceBuffer<scalar>* kBndStored,
+                            const DeviceBuffer<scalar>* epsBndStored)
 {
     requireTurbGradLimits(gradLim, "deviceKEpsilonCorrect");
     // grad(k) and grad(epsilon) as the two equations take them: the corrected laplacian's non-orthogonal
@@ -1292,7 +1294,10 @@ void deviceKEpsilonCorrect(
     // epsilon's patches as the last evaluate left them: updateCoeffs below writes the wall cells and nothing evaluates after it, so the
     // equation's gradient reads the old value on a zeroGradient face beside a wall cell, as deviceKOmegaSSTCorrect's obv has why.
     DeviceBuffer<scalar> ebvStored;
-    deviceBCValue(dbEps, eps, ebvStored);
+    if (epsBndStored && epsBndStored->size() == static_cast<std::size_t>(dbEps.n))
+        deviceCopy(ebvStored, *epsBndStored);
+    else
+        deviceBCValue(dbEps, eps, ebvStored);
     overrideKernel<<<nBlocks(nC), TPB>>>(nC, wall.isWallCell.data(), G0.data(), eps0.data(), G.data(), eps.data(),
                                           wall.wallW.size() ? wall.wallW.data() : nullptr);
     DeviceBuffer<scalar> ebv;
@@ -1352,7 +1357,9 @@ void deviceKEpsilonCorrect(
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/co.kMin, kEqnGradLimit, /*storedBnd*/nullptr, lapLimit);
+                               /*boundFloor*/co.kMin, kEqnGradLimit,
+                               (kBndStored && kBndStored->size() == static_cast<std::size_t>(dbK.n)) ? kBndStored : nullptr,
+                               lapLimit);
 
     // correctNut (cell): nut = Cmu k^2 / eps (realizableKE: rCmu k^2 / eps with the variable Cmu).
     if (co.realizable) deviceRealizableNut(rCmu, k, eps, nut);

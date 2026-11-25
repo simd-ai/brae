@@ -358,6 +358,15 @@ void deviceUpdateTurbulentInletK(const DeviceVectorBoundary& dbU, const DeviceBu
                                  const DeviceBuffer<scalar>& intensity, DeviceBoundary& dbK);
 void deviceUpdateTurbulentInletSecond(const DeviceBoundary& dbK, const DeviceBuffer<label>& mask,
                                       const DeviceBuffer<scalar>& len, scalar Cmu, DeviceBoundary& dbSecond);
+// The same two from the PATCH VALUES OpenFOAM reads, `Up` and `kp` (lookupPatchField: what the field's last
+// evaluate left), one value per boundary face. The two above read the refValue arrays instead, which is the
+// patch value only on a face that is fixedValue: on a pressureInletOutletVelocity inlet U's refValue holds
+// the tangential velocity, zero, and k's refValue there is the inflow formula, not k's last value.
+void deviceUpdateTurbulentInletK(const DeviceBuffer<scalar>& Ubx, const DeviceBuffer<scalar>& Uby,
+                                 const DeviceBuffer<scalar>& Ubz, const DeviceBuffer<label>& mask,
+                                 const DeviceBuffer<scalar>& intensity, DeviceBoundary& dbK);
+void deviceUpdateTurbulentInletSecond(const DeviceBuffer<scalar>& kb, const DeviceBuffer<label>& mask,
+                                      const DeviceBuffer<scalar>& len, scalar Cmu, DeviceBoundary& dbSecond);
 
 // The last three are the caller's STORED boundary-value arrays, written on the masked faces alongside
 // the refValue. OpenFOAM's flowRateInletVelocity assigns its patch VALUE inside updateCoeffs
