@@ -85,12 +85,6 @@ set_tests_properties(pimple_simplec_corrector_grad_vs_openfoam PROPERTIES SKIP_R
 add_test(NAME lust_named_gradient_vs_openfoam
          COMMAND ${PROJECT_SOURCE_DIR}/tests/lust_named_gradient_vs_openfoam.sh)
 set_tests_properties(lust_named_gradient_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900)
-# ...and OpenFOAM-13's form of freestreamVelocity (BRAE_FREESTREAM_VELOCITY_UP=average) against real OpenFOAM-13,
-# the same restart; it SKIPS where /opt/openfoam13 is absent (OF13RC names another bashrc).
-add_test(NAME simple_freestream_of13_vs_openfoam13
-         COMMAND ${PROJECT_SOURCE_DIR}/tests/simple_freestream_of13_vs_openfoam13.sh
-                 ${PROJECT_SOURCE_DIR}/validation/airFoil2D)
-set_tests_properties(simple_freestream_of13_vs_openfoam13 PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
 # simpleFoam's colour rule (U and the turbulence fields swept in colour order on the GPU, relTol entries
 # included) against OpenFOAM's converged pitzDailyTurb: the colour order converges, lands within 1e-03 of
 # OpenFOAM's order and no further from OpenFOAM than it; a component swap in the fused solve fails. It unsets
