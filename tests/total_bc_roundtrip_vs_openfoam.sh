@@ -16,6 +16,9 @@
 #   * phi on a symmetry, symmetryPlane or wedge patch was written `calculated`, which OpenFOAM refuses on a restart
 #     ("inconsistent patch and patchField types for patch type symmetry and patchField type calculated"):
 #     windAroundBuildingsBox's frontAndBack.
+#   * (2026-11-25) pimpleFoam restarted with k and epsilon inletOutlet faces at their inletValue until kEpsilon's
+#     first flux switch, which now runs at the turbulence correction: tj 6.3e-04 (U, behind outlet2) and fan 1.4e-04
+#     off the uninterrupted run. Seeded with the values read now; a control runs each arm's restart with the seed off.
 #   * totalPressure itself (every form's p0 under `p0`) and totalTemperature's psi default were fixed before this gate
 #     (34554e73); the arms here hold them.
 #
@@ -115,6 +118,13 @@ legacy()
 }
 # within <name> <value> <bound>
 within() { if le "$2" "$3"; then ok "$1: $2 (bound $3)"; else fail "$1: $2 above the bound $3"; fi; }
+# above <name> <value> <floor>: a control, red only when the value is a number above the floor
+above()
+{
+    if python3 -c "import sys; sys.exit(0 if float('${2:-nan}') > float('$3') else 1)" 2> /dev/null
+    then ok "$1: $2 (above $3)"
+    else fail "$1: $2, not above $3"; fi
+}
 
 # ---- tj and fan: pimpleFoam on TJunction's mesh, fixed deltaT (brae's adjustTimeStep write times are not this gate's) ----
 stagetj()   # stagetj <dir> [fan]
@@ -164,6 +174,10 @@ pimplearm()   # pimplearm <name> [fan]
     braestarted "$n: brae starts from brae's 0.01" "$W/${n}_b_from_b"
     within "$n: brae from its 0.01 against its uninterrupted run at 0.02" \
         "$(python3 "$H" fields "$W/${n}_b_from_b/0.02" "$W/${n}_b/0.02" U p k epsilon nut 2>/dev/null)" 1e-12
+    # control: k and epsilon's inletOutlet faces not seeded with the values read, at their inletValue until the first switch
+    restartdir "$W/${n}_b_noseed" "$W/${n}_case" "$W/${n}_b/0.01"; brae "$W/${n}_b_noseed" BRAE_IO_STORED=0
+    above "control $n, the values read not seeded: brae from its 0.01 against its uninterrupted run at 0.02" \
+        "$(python3 "$H" fields "$W/${n}_b_noseed/0.02" "$W/${n}_b/0.02" U p k epsilon nut 2>/dev/null)" 1e-6
     restartdir "$W/${n}_b_from_of" "$W/${n}_case" "$W/${n}_of/0.01"; brae "$W/${n}_b_from_of"
     braestarted "$n: brae starts from OpenFOAM's 0.01" "$W/${n}_b_from_of"
     same "$n (brae's rewrite of OpenFOAM's)" "$W/${n}_b_from_of/0.02/p" "$W/${n}_of/0.01/p" inlet

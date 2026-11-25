@@ -5003,6 +5003,22 @@ SimplecSnGrad simplecSnGrad(
         // by then the fields are aged and only the geometry is being re-converged.
         if (moveMesh) moveMesh(0);
         advanceTime(deltaT);                                  // store oldTime() + set deltaT/deltaT0 for ddtCoeffs()
+        // kEpsilon's k and epsilon switch at the turbulence correction on this path (correctTurbulence), so
+        // the first step's earlier readers -- the 'calculated' nut patches in the momentum assembly's nuEff,
+        // and the stored values the limiter's gradients take -- meet an inletOutlet face before any switch.
+        // OpenFOAM's stored patch value is the file's `value` there; brae's construction state is
+        // fixedValue(inletValue). MEASURED on RAS/TJunction restarted from brae's own 0.01 (every outlet2
+        // face outflow, the file's k the cells' 0.048 to 0.10 against inletValue 0.2): U 6.3e-04 off the
+        // uninterrupted run at 0.02, all of it behind outlet2; with TJunctionFan's inlet 1.4e-04. From rest
+        // (value == inletValue) it changes nothing. The seed the other drivers' closures take
+        // (DeviceBoundary::ioStored); BRAE_IO_STORED=0 is its control.
+        static const bool turbSwitchAtMomentum = std::getenv("BRAE_CONTROL_TURB_SWITCH_AT_MOMENTUM") != nullptr;
+        if (!pimpleUpdatePoints_ && !turbSwitchAtMomentum && ctl_.turbulent && !ctl_.les
+            && ctl_.modelName == "kEpsilon" && ioStoredEnabled())
+        {
+            dbK_.ioFresh.copyFrom(dbK_.ioMask.host());
+            dbEps_.ioFresh.copyFrom(dbEps_.ioMask.host());
+        }
         pimpleUpdatePoints_ = true;
         DeviceSimpleResidual res;
         const int nOuter = nOuterCorrectors > 0 ? nOuterCorrectors : 1;
