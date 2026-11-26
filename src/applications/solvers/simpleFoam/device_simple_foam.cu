@@ -2947,6 +2947,21 @@ SimplecSnGrad simplecSnGrad(
         // Nothing in the pressure stage reads it (HbyA_b is projected afresh below), but the closures
         // do, after the corrector -- item 13; tests/legacy_symmetry_refresh.sh.
         if (hasSym_) deviceUpdateSymmetry(dbU_, Uk_[0], Uk_[1], Uk_[2]);
+        // ...and pressureInletOutletVelocity, on pimpleStep: that evaluate re-runs the patch's updateCoeffs
+        // (pressureInletOutletVelocityFvPatchVectorField.C:170-183) on the flux as it stands and the SOLVED cells, so an
+        // inflow face holds n(n.U_c) of the new U. brae's mixed refValue still held n(n.U_c) of the cells before the
+        // solve. On an axis-aligned inlet the normal component is zeroGradient and the value comes out right anyway; on a
+        // tilted one every component blends the old cells with the new, and the total pressure assembled next reads it.
+        // Only where that solve ran, i.e. before the FIRST pressure corrector: OpenFOAM's later correctors start from the
+        // U.correctBoundaryConditions() of the corrector before them (pEqn.H), which pimpleStep already runs after each
+        // corrector. Re-evaluating at every corrector gives the same values there but hid that later call from its gate:
+        // BRAE_CONTROL_PIOV_ASSEMBLY_ONLY read 1.1e-10 instead of 6.7e-05 (Arrhenius 5796581).
+        //   BRAE_CONTROL_PIOV_NO_SOLVE_EVAL=1  a gate's control, deliberately wrong: not re-evaluated here
+        static const bool piovNoSolveEval = std::getenv("BRAE_CONTROL_PIOV_NO_SOLVE_EVAL") != nullptr;
+        if (hasPiov_ && pimpleUpdatePoints_ && !piovNoSolveEval && ctl_.innerCorrector == 0 && ctl_.momentumPredictor)
+        {
+            deviceUpdatePressureInletOutletVelocity(dbU_, phiBnd_, Uk_[0], Uk_[1], Uk_[2], /*directionMixed=*/true);
+        }
         DeviceBuffer<scalar> hxb,hyb,hzb;
         deviceBCValue(dbU_.comp[0],HbyA[0],hxb);
         deviceBCValue(dbU_.comp[1],HbyA[1],hyb);
@@ -2971,6 +2986,22 @@ SimplecSnGrad simplecSnGrad(
             deviceBCValue(dbExtrap_, HbyA[1], ey);
             deviceBCValue(dbExtrap_, HbyA[2], ez);
             deviceExtrapolateIOHbyA(dbU_, ex, ey, ez, hxb, hyb, hzb);
+        }
+        // ...and at pressureInletOutletVelocity, assignable as well (pressureInletOutletVelocityFvPatchVectorField.H:162):
+        // HbyA_b is rAU*UEqn.H()'s own, extrapolatedCalculated (fvMatrix.C H() and A()), i.e. the CELL value. Through U's
+        // per-component descriptor it was d_k*ref_k + (1 - d_k)*HbyA_c: on an axis-aligned face that differs only in the
+        // tangential components, which carry no flux; on a tilted face phiHbyA_b differs. pimpleStep only.
+        //   BRAE_CONTROL_PIOV_HBYA_DESCRIPTOR=1  a gate's control, deliberately wrong: HbyA_b through U's descriptor
+        static const bool piovHbyADescriptor = std::getenv("BRAE_CONTROL_PIOV_HBYA_DESCRIPTOR") != nullptr;
+        if (hasPiov_ && pimpleUpdatePoints_ && !piovHbyADescriptor)
+        {
+            DeviceBuffer<scalar> cx;
+            DeviceBuffer<scalar> cy;
+            DeviceBuffer<scalar> cz;
+            deviceGatherPatchInternal(dbU_.comp[0], HbyA[0], cx);
+            deviceGatherPatchInternal(dbU_.comp[0], HbyA[1], cy);
+            deviceGatherPatchInternal(dbU_.comp[0], HbyA[2], cz);
+            deviceSelectPiovHbyA(dbU_, cx, cy, cz, hxb, hyb, hzb);
         }
         // slip/symmetry: OF constrainHbyA sets HbyA_b = U_b (= U.boundaryField, the slipped velocity) at every
         // non-assignable patch, NOT the projected HbyA. Project the cell U (HbyA_b = U_c - n(n.U_c) = U_b), matching
