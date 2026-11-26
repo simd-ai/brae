@@ -296,6 +296,17 @@ void deviceExtrapolateIOHbyA(const DeviceVectorBoundary& dbU,
                              const DeviceBuffer<scalar>& extx, const DeviceBuffer<scalar>& exty,
                              const DeviceBuffer<scalar>& extz,
                              DeviceBuffer<scalar>& hbx, DeviceBuffer<scalar>& hby, DeviceBuffer<scalar>& hbz);
+// pressureInletOutletVelocity is assignable too (pressureInletOutletVelocityFvPatchVectorField.H:162), so OpenFOAM's
+// constrainHbyA leaves its faces alone and HbyA_b is the extrapolatedCalculated value rAU*UEqn.H() was born with, the
+// adjacent cell's. `cell` is HbyA's cell value gathered onto every boundary face; piov faces take it, the rest are untouched.
+void deviceSelectPiovHbyA(
+    const DeviceVectorBoundary& dbU,
+    const DeviceBuffer<scalar>& cellx,
+    const DeviceBuffer<scalar>& celly,
+    const DeviceBuffer<scalar>& cellz,
+    DeviceBuffer<scalar>& hbx,
+    DeviceBuffer<scalar>& hby,
+    DeviceBuffer<scalar>& hbz);
 // constrainHbyA at slip/symmetry faces: HbyA_b = HbyA_c - n(n.HbyA_c) so the wall flux is exactly 0 (no penetration).
 void deviceConstrainSymmetryHbyA(const DeviceVectorBoundary& dbU, const DeviceBuffer<scalar>& Hx,
                                  const DeviceBuffer<scalar>& Hy, const DeviceBuffer<scalar>& Hz,

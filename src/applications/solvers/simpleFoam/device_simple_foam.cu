@@ -2983,6 +2983,22 @@ SimplecSnGrad simplecSnGrad(
             deviceBCValue(dbExtrap_, HbyA[2], ez);
             deviceExtrapolateIOHbyA(dbU_, ex, ey, ez, hxb, hyb, hzb);
         }
+        // ...and at pressureInletOutletVelocity, assignable as well (pressureInletOutletVelocityFvPatchVectorField.H:162):
+        // HbyA_b is rAU*UEqn.H()'s own, extrapolatedCalculated (fvMatrix.C H() and A()), i.e. the CELL value. Through U's
+        // per-component descriptor it was d_k*ref_k + (1 - d_k)*HbyA_c: on an axis-aligned face that differs only in the
+        // tangential components, which carry no flux; on a tilted face phiHbyA_b differs. pimpleStep only.
+        //   BRAE_CONTROL_PIOV_HBYA_DESCRIPTOR=1  a gate's control, deliberately wrong: HbyA_b through U's descriptor
+        static const bool piovHbyADescriptor = std::getenv("BRAE_CONTROL_PIOV_HBYA_DESCRIPTOR") != nullptr;
+        if (hasPiov_ && pimpleUpdatePoints_ && !piovHbyADescriptor)
+        {
+            DeviceBuffer<scalar> cx;
+            DeviceBuffer<scalar> cy;
+            DeviceBuffer<scalar> cz;
+            deviceGatherPatchInternal(dbU_.comp[0], HbyA[0], cx);
+            deviceGatherPatchInternal(dbU_.comp[0], HbyA[1], cy);
+            deviceGatherPatchInternal(dbU_.comp[0], HbyA[2], cz);
+            deviceSelectPiovHbyA(dbU_, cx, cy, cz, hxb, hyb, hzb);
+        }
         // slip/symmetry: OF constrainHbyA sets HbyA_b = U_b (= U.boundaryField, the slipped velocity) at every
         // non-assignable patch, NOT the projected HbyA. Project the cell U (HbyA_b = U_c - n(n.U_c) = U_b), matching
         // OF byte-for-byte and the mixed path above (both use U_b). Wall flux is still exactly 0 (normal removed).
