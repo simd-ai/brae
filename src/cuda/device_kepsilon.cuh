@@ -597,7 +597,15 @@ void deviceKOmegaSSTCorrect(const DeviceMesh& dm, const DeviceWallData& wall, co
                             bool gsSymmetric = true,
                             // laplacianSchemes `limited corrected <psi>` on k's and omega's non-orthogonal
                             // correction (deviceSolveScalarTransport's lapLimit); 1 is `corrected`.
-                            scalar lapLimit = 1);
+                            scalar lapLimit = 1,
+                            // k's and omega's patch values as their LAST EVALUATE left them (kStored/epsStored of
+                            // correctTurbulence), for what reads them in OpenFOAM after updateCoeffs has moved the
+                            // coefficients and not the values: CDkOmega's two gradients, F1's patch half, and the
+                            // two equations' limiters and non-orthogonal corrections. omegaWallFunction faces still
+                            // take the wall cell's new value. Null keeps the closure's own: both evaluated from the
+                            // coefficients as they stand at entry.
+                            const DeviceBuffer<scalar>* kBndStored = nullptr,
+                            const DeviceBuffer<scalar>* omegaBndStored = nullptr);
 
 // nuWall[i] = nuBnd[wfBndIdx[i]] -- OF nu(patchi) re-indexed from boundary-face into wall-face ordering.
 void deviceGatherWallNu(const DeviceBuffer<label>& wfBndIdx, const DeviceBuffer<scalar>& nuBnd,
