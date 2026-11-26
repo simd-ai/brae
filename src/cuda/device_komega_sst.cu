@@ -888,7 +888,14 @@ void deviceWallOmegaG0(
     omega0.resize(nC); G0.resize(nC);
     cudaCheck(cudaMemsetAsync(omega0.data(), 0, nC*sizeof(scalar), cudaStreamPerThread), "omega0 zero");
     cudaCheck(cudaMemsetAsync(G0.data(),     0, nC*sizeof(scalar), cudaStreamPerThread), "G0 zero");
-    const scalar Cmu25 = std::pow(co.betaStar, 0.25), yplLam = yPlusLamHost(co.kappa, co.E);
+    // THE WALL FUNCTION'S Cmu, not the model's betaStar: omegaWallFunction takes Cmu25 = pow025(wallCoeffs_.Cmu())
+    // (omegaWallFunctionFvPatchScalarField.C:191), the patch's coefficient, default 0.09 (wallFunctionCoefficients.C:73), as
+    // KOmegaSSTCoeffs::CmuWall says and the mirror does (kOmegaSST_cpp.cu:506). Equal at the defaults; with betaStar changed
+    // the wall cells' omega and G move. See tests/pimple_tjunction_sst_vs_openfoam.sh for the measurement. CONTROL
+    // BRAE_CONTROL_SST_WALL_CMU_BETASTAR=1: betaStar, as before.
+    static const bool wallCmuBetaStar = std::getenv("BRAE_CONTROL_SST_WALL_CMU_BETASTAR") != nullptr;
+    const scalar Cmu25 = std::pow(wallCmuBetaStar ? co.betaStar : co.CmuWall, 0.25);
+    const scalar yplLam = yPlusLamHost(co.kappa, co.E);
     if (w.nWC > 0)
         wallOmegaG0Kernel<<<nBlocks(w.nWC), TPB>>>(w.nWC, w.wcCell.data(), w.wcStart.data(), w.wcFace.data(),
                                                    w.wfY.data(), w.wfDc.data(), w.wfUwx.data(),
