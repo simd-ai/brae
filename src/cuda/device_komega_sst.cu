@@ -888,7 +888,14 @@ void deviceWallOmegaG0(
     omega0.resize(nC); G0.resize(nC);
     cudaCheck(cudaMemsetAsync(omega0.data(), 0, nC*sizeof(scalar), cudaStreamPerThread), "omega0 zero");
     cudaCheck(cudaMemsetAsync(G0.data(),     0, nC*sizeof(scalar), cudaStreamPerThread), "G0 zero");
-    const scalar Cmu25 = std::pow(co.betaStar, 0.25), yplLam = yPlusLamHost(co.kappa, co.E);
+    // THE WALL FUNCTION'S Cmu, not the model's betaStar: omegaWallFunction takes Cmu25 = pow025(wallCoeffs_.Cmu())
+    // (omegaWallFunctionFvPatchScalarField.C:191), the patch's coefficient, default 0.09 (wallFunctionCoefficients.C:73), as
+    // KOmegaSSTCoeffs::CmuWall says and the mirror does (kOmegaSST_cpp.cu:506). Equal at the defaults; with betaStar changed
+    // the wall cells' omega and G move. See tests/pimple_tjunction_sst_vs_openfoam.sh for the measurement. CONTROL
+    // BRAE_CONTROL_SST_WALL_CMU_BETASTAR=1: betaStar, as before.
+    static const bool wallCmuBetaStar = std::getenv("BRAE_CONTROL_SST_WALL_CMU_BETASTAR") != nullptr;
+    const scalar Cmu25 = std::pow(wallCmuBetaStar ? co.betaStar : co.CmuWall, 0.25);
+    const scalar yplLam = yPlusLamHost(co.kappa, co.E);
     if (w.nWC > 0)
         wallOmegaG0Kernel<<<nBlocks(w.nWC), TPB>>>(w.nWC, w.wcCell.data(), w.wcStart.data(), w.wcFace.data(),
                                                    w.wfY.data(), w.wfDc.data(), w.wfUwx.data(),
@@ -1104,7 +1111,9 @@ void deviceKOmegaSSTCorrect(
     const DeviceBuffer<scalar>* lesDelta,    // case `delta` (maxDeltaxyz); null = OF's cubeRootVol
     int nSweeps,                             // solvers/<field>/nSweeps; see the declaration
     bool gsSymmetric,
-    scalar lapLimit)                         // see the declaration
+    scalar lapLimit,                         // see the declaration
+    const DeviceBuffer<scalar>* kBndStored,
+    const DeviceBuffer<scalar>* omegaBndStored)
 {
     requireTurbGradLimits(gradLim, "deviceKOmegaSSTCorrect");
     const int nC = dm.nCells;
@@ -1163,8 +1172,19 @@ void deviceKOmegaSSTCorrect(
     // function's own (the mirror's omegaBndLast, kOmegaSST.cu). MEASURED (JUPITER job 2647231, 10,112 cells): CDkOmega 10.58 in
     // OpenFOAM and 5.40 here at a wall cell with a symmetry face, then k 3.05e-09 and omega 5.98e-11 after one iteration, which a
     // 30-iteration history took to Ux 1.5e-03. BRAE_CONTROL_SST_OMEGA_LIVE=1 reads the new cell on every face.
+    // A caller that moved omega's coefficients before calling (pimpleStep's flux switch and mixing-length inlet) hands the
+    // values from before that in omegaBndStored; evaluated here they would be the new coefficients'.
+    const bool omegaStoredGiven = omegaBndStored && omegaBndStored->size() == static_cast<std::size_t>(dbOmega.n);
+    const bool kStoredGiven = kBndStored && kBndStored->size() == static_cast<std::size_t>(dbK.n);
     DeviceBuffer<scalar> obvStored;
-    deviceBCValue(dbOmega, omega, obvStored);
+    if (omegaStoredGiven)
+    {
+        deviceCopy(obvStored, *omegaBndStored);
+    }
+    else
+    {
+        deviceBCValue(dbOmega, omega, obvStored);
+    }
     // omega wall function FIRST (OF updateCoeffs before CDkOmega): omega0/G0, override omega & G at wall cells, so
     // grad(omega)/CDkOmega/F1/F2 and the reaction all see the wall-corrected omega (matches kOmegaSSTBase::correct).
     DeviceBuffer<scalar> omega0, G0;
@@ -1188,7 +1208,14 @@ void deviceKOmegaSSTCorrect(
     const scalar kCdLimit = turbGradControl().cd ? scalar(0) : gradLim.kField;
     const scalar oCdLimit = turbGradControl().cd ? scalar(0) : gradLim.eField;
     DeviceBuffer<scalar> kbv;
-    deviceBCValue(dbK, k, kbv);
+    if (kStoredGiven)
+    {
+        deviceCopy(kbv, *kBndStored);
+    }
+    else
+    {
+        deviceBCValue(dbK, k, kbv);
+    }
     DeviceBuffer<scalar> kgx, kgy, kgz;
     deviceGaussGrad(dm, k, kbv, kgx, kgy, kgz);
     if (kCdLimit > scalar(0)) deviceCellLimitGrad(dm, k, kbv, kgx, kgy, kgz, kCdLimit, nullptr, 0);
@@ -1318,7 +1345,7 @@ void deviceKOmegaSSTCorrect(
                                // (Jacobi), then nSweeps -- the case's own smoothSolver sweep count.
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/co.kMin, kEqnGradLimit, /*storedBnd*/nullptr, lapLimit);
+                               /*boundFloor*/co.kMin, kEqnGradLimit, kStoredGiven ? &kbv : nullptr, lapLimit);
 
     // correctNut (Bradshaw): nut = a1*k / max(a1*omega, b1*F2*sqrt(S2)).
     //

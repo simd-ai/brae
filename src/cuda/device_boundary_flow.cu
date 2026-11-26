@@ -875,6 +875,33 @@ void deviceExtrapolateIOHbyA(
 }
 
 
+void deviceSelectPiovHbyA(
+    const DeviceVectorBoundary& dbU,
+    const DeviceBuffer<scalar>& cellx,
+    const DeviceBuffer<scalar>& celly,
+    const DeviceBuffer<scalar>& cellz,
+    DeviceBuffer<scalar>& hbx,
+    DeviceBuffer<scalar>& hby,
+    DeviceBuffer<scalar>& hbz)
+{
+    const int n = dbU.n;
+    if (n == 0)
+    {
+        return;
+    }
+    selectIOKernel<<<nBlocks(n), TPB>>>(
+        n,
+        dbU.comp[0].piovMask.data(),
+        cellx.data(),
+        celly.data(),
+        cellz.data(),
+        hbx.data(),
+        hby.data(),
+        hbz.data());
+    cudaCheck(cudaGetLastError(), "selectPiovHbyA");
+}
+
+
 __global__
 void storedFreestreamValuesKernel(
     int n,

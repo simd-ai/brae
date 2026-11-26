@@ -124,3 +124,17 @@ set_tests_properties(pimple_adjusttimestep_vs_openfoam PROPERTIES SKIP_RETURN_CO
 add_test(NAME pimple_tjunction_boundary_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_tjunction_boundary_vs_openfoam.sh)
 set_tests_properties(pimple_tjunction_boundary_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
                      ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_pimpleFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+
+# The same for the kOmegaSST family: k and omega switched at the turbulence correction with stored values in their gradients,
+# the frequency inlet's and the wall function's own Cmu, DDES coefficients from kOmegaSSTDDESCoeffs. RAS/TJunction under
+# kOmegaSST and kOmegaSSTDDES, fixed and adaptive deltaT and a restart, every entry at steps 1-3; seven controls.
+add_test(NAME pimple_tjunction_sst_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_tjunction_sst_vs_openfoam.sh)
+set_tests_properties(pimple_tjunction_sst_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
+                     ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_pimpleFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+
+# A fixed-deltaT restart's time state against OpenFOAM on RAS/TJunction: restarted = continuous at timePrecision 18, the
+# runTime writes from the resolved start, timeStep writes and functionObject steps on uniform/time's index (0 without one),
+# the final write under the time reached; three controls.
+add_test(NAME pimple_fixed_restart_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_fixed_restart_vs_openfoam.sh)
+set_tests_properties(pimple_fixed_restart_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
+                     ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_pimpleFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")

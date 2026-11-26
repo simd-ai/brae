@@ -278,6 +278,42 @@ try
         if (controlUntrimmed) clock->setDeltaTNoAdjust(dt);
         else clock->setDeltaT(dt);
     };
+    // A FIXED deltaT keeps OpenFOAM's restart state too. Time::setControls takes the start time from the directory's NAME and
+    // the time index from its uniform/time (Time.C:193, 302-307; `value` only feeds a warning, :310-346), and every write
+    // writes uniform/time (TimeIO.C:508-555). This driver wrote no uniform/time at a fixed deltaT and counted its steps from
+    // 0, so after a restart `writeControl timeStep` and a functionObject's timeStep control fell off OpenFOAM's grid (TJunction
+    // from 0.1, interval 30: 0.13 0.16 where OpenFOAM writes 0.12 0.15 0.18), and OpenFOAM restarted from brae's write began
+    // at index 0. The index is 0 when the start holds no uniform/time, as OpenFOAM's is.
+    // GATE CONTROLS (tests/pimple_fixed_restart_vs_openfoam.sh), each deliberately wrong, each this driver's behaviour before:
+    //   BRAE_CONTROL_FIXED_RESTART_INDEX=1   no uniform/time written or read at a fixed deltaT: steps counted from 0, a
+    //                                        functionObject's index estimated as startTime/deltaT
+    //   BRAE_CONTROL_FIXED_WRITE_ORIGIN=1    runTime writes counted from controlDict's startTime, not the resolved start
+    //   BRAE_CONTROL_FINAL_NAME_PRODUCT=1    the final write named startTime + deltaT*steps, not the last step's time
+    const bool controlRestartIndex = !clock && std::getenv("BRAE_CONTROL_FIXED_RESTART_INDEX") != nullptr;
+    const bool controlWriteOrigin = !clock && std::getenv("BRAE_CONTROL_FIXED_WRITE_ORIGIN") != nullptr;
+    const bool controlFinalProduct = !clock && std::getenv("BRAE_CONTROL_FINAL_NAME_PRODUCT") != nullptr;
+    if (controlRestartIndex)
+    {
+        std::printf("  *** CONTROL MODE: no uniform/time written or read at a fixed deltaT. This run is deliberately wrong. ***\n");
+    }
+    if (controlWriteOrigin)
+    {
+        std::printf("  *** CONTROL MODE: runTime writes counted from controlDict's startTime. This run is deliberately wrong. ***\n");
+    }
+    if (controlFinalProduct)
+    {
+        std::printf("  *** CONTROL MODE: the final write named startTime + deltaT*steps. This run is deliberately wrong. ***\n");
+    }
+    long startIndex = 0;
+    if (!clock && !controlRestartIndex)
+    {
+        const std::optional<long> savedIndex = readUniformTimeIndex(fieldDir);
+        if (savedIndex)
+        {
+            startIndex = *savedIndex;
+            std::printf("  time index %ld at the start (%s/uniform/time)\n", startIndex, startStr.c_str());
+        }
+    }
     // Info's precision: Time sets IOstream::defaultPrecision from writePrecision (Time.C readDict), so OpenFOAM's log lines
     // carry the case's digits
     const int logPrec = std::max(1, controlDict.intOr("writePrecision", 6));
@@ -676,6 +712,23 @@ try
         });
     Time time(controlDict, nullptr, 0, foTypes);
     time.setRunStart(startStr, startTime);
+    if (!clock)
+    {
+        // Time::operator++ measures runTime writes from the RESOLVED start (Time.C:1121: value() - startTime_); this
+        // WriteControl had controlDict's startTime, so a restart from 0.1 wrote at its first step, 0.101
+        if (!controlWriteOrigin)
+        {
+            time.writeControl().setStartTime(startTime);
+        }
+        if (!controlRestartIndex)
+        {
+            time.setStartIndex(startIndex);
+        }
+    }
+    // The last completed step of a fixed-deltaT run: its accumulated time and absolute index, what its uniform/time and the
+    // final write's name carry (the loop's `t` has already moved past endTime when the loop ends)
+    scalar tDone = startTime;
+    long indexDone = startIndex;
 
     auto writeTimeDirBody = [&](const std::string& tname) {
         const std::string outDir = caseDir + "/" + tname;
@@ -752,6 +805,18 @@ try
         if (clock)
             writeUniformTime(caseDir, tname, static_cast<double>(clock->value()), clock->timeIndex(),
                              static_cast<double>(clock->deltaT()), static_cast<double>(clock->deltaT0()), precision);
+        else if (!controlRestartIndex)
+        {
+            // at a fixed deltaT OpenFOAM's deltaT0 is deltaT: Time::operator++ sets deltaT0_ = deltaTSave_ = deltaT_
+            writeUniformTime(
+                caseDir,
+                tname,
+                static_cast<double>(tDone),
+                indexDone,
+                static_cast<double>(deltaT),
+                static_cast<double>(deltaT),
+                precision);
+        }
         time.writeControl().recordWritten(caseDir, tname);
     };
 
@@ -954,11 +1019,22 @@ try
         if (!std::getenv("BRAE_ALLOW_NONFINITE")
             && !(std::isfinite(r.p) && std::isfinite(r.Ux) && std::isfinite(r.Uy) && std::isfinite(r.Uz)))
             throw std::runtime_error("solution diverged: non-finite residual at Time = " + tn + ". Reduce deltaT (CFL).");
-        const bool isWrite = clock ? clock->writeTime() : time.writeControl().isWriteTime(timeIndex, t);
+        if (!clock)
+        {
+            tDone = t;
+            indexDone = startIndex + timeIndex;
+        }
+        // writeControl timeStep counts OpenFOAM's absolute index (Time.C:1112: timeIndex_ % writeInterval)
+        const bool isWrite = clock ? clock->writeTime() : time.writeControl().isWriteTime(static_cast<int>(indexDone), t);
         if (isWrite) { writeTimeDir(tn); lastWritten = tn; time.write(); }
     }
     // brae writes the final state below when the cadence did not; OpenFOAM does not, so it is not noted as a write time
-    const std::string finalName = clock ? clock->timeName() : timeName(startTime + deltaT * (scalar)timeIndex);
+    // named from the last completed step's accumulated time, which the cadence wrote under: startTime + deltaT*steps is
+    // another double, so at timePrecision 18 TJunction's run to 0.2 wrote its final state twice, as 0.20000000000000015
+    // and 0.200000000000000011
+    const std::string finalName = clock ? clock->timeName()
+                                : controlFinalProduct ? timeName(startTime + deltaT * (scalar)timeIndex)
+                                                      : timeName(tDone);
     time.end();   // OF Time.C:790-802: a final execute() so the last step is seen, then end()
     if (RunTiming::on())
     {

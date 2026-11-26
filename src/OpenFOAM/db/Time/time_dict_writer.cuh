@@ -15,11 +15,13 @@
 //
 // What a restart reads back is Time::setControls' (Time.C:276-307, and RunClock): deltaT only under adjustTimeStep,
 // deltaT0 and index always. The time value itself comes from the directory's NAME, not from `value`.
+#include "foam_dict.cuh"    // readDict: uniform/time read back on a restart
 #include "start_time.cuh"   // openFoamTimeName, timeFormatting
 
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -88,6 +90,26 @@ inline void writeUniformTime(const std::string& caseDir, const std::string& time
     detail::writeDictFile(u + "/time", timeName + "/uniform", "time", body);
     detail::writeDictFile(u + "/functionObjects/functionObjectProperties", timeName + "/uniform/functionObjects",
                           "functionObjectProperties", "");
+}
+
+// The time index a restart's Time::setControls reads from <startDir>/uniform/time (Time.C:302-307), or nothing when the
+// start directory holds no such file (an older case, or a 0 directory): OpenFOAM then keeps the index setTime(startTime_, 0)
+// gave it (Time.C:193), so a caller falls back to 0. `value` is not read: OpenFOAM's start time is the directory's name
+// and `value` only feeds a warning (Time.C:310-346). A `.gz` file is found as OpenFOAM finds it (readDict, gzSlurp).
+inline std::optional<long> readUniformTimeIndex(const std::string& startDir)
+{
+    namespace fs = std::filesystem;
+    const std::string p = startDir + "/uniform/time";
+    if (!fs::exists(p) && !fs::exists(p + ".gz"))
+    {
+        return std::nullopt;
+    }
+    const FoamDict td = readDict(p);
+    if (!td.found("index"))
+    {
+        return std::nullopt;
+    }
+    return static_cast<long>(td.scalarOr("index", scalar(0)));
 }
 
 } // namespace brae
