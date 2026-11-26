@@ -35,6 +35,11 @@
 #   D  FINAL NAME at timePrecision 18: brae's time directories equal OpenFOAM's, continuous and stopped at 0.1. Control
 #      BRAE_CONTROL_FINAL_NAME_PRODUCT=1 must differ.
 # Each control is a run that completes; it must go red on the check it guards.
+# MEASURED (Arrhenius, one GH200, OpenFOAM v2412 serial, 2026-11-26): A restarted = continuous 0 in both codes; the witness
+# 1.964e-10 (nut outlet2; OpenFOAM's own at timePrecision 6: 2.889e-14); timePrecision 6 and 18 continuous fields equal (0).
+# B 0.13 0.16 0.19; C 0.12 0.15 0.18 with index 120 150 180 and forces rows 0.12 0.15 0.18 in all three restarts; C0 0.13
+# 0.16 0.19. Controls: D adds 0.200000000000000011, B writes 0.101 0.12 0.15 0.18 0.19, C 0.13 0.16 0.18, C0's forces rows
+# 0.12 0.15 0.18. The release binary of public main 1449d2df fails B, C, C0 and D and passes A. 59 s.
 # Labels: slow. Honours OFBASHRC; exits 77 without OpenFOAM, a GPU or the binary.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
