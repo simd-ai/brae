@@ -17,6 +17,30 @@
 namespace brae {
 
 namespace {
+// The closures whose k and second-field flux switches pimpleStep makes at the turbulence correction, with the stored patch
+// values handed to their gradients: kEpsilon (kEpsilon.C:247, 273) and the kOmegaSST family, whose DES, DDES and IDDES
+// variants run kOmegaSSTBase::correct as it is (kOmegaSSTBase.C:541, 600; kOmegaSSTDES overrides correctNut only).
+// RNGkEpsilon, realizableKE, SpalartAllmaras and kOmegaSSTLM keep the momentum assembly's switch, unmeasured with this one.
+bool switchesAtTurbulenceCorrection(const DeviceSimpleControls& c)
+{
+    return c.turbulent && !c.les && (c.modelName == "kEpsilon" || (c.sst && !c.lm));
+}
+
+// The Cmu of the mixing-length inlets. turbulentMixingLengthFrequencyInlet takes turbModel.coeffDict().getOrDefault("Cmu",
+// 0.09) (turbulentMixingLengthFrequencyInletFvPatchScalarField.C:137-138): kOmegaSST's coeffDict carries a Cmu only when
+// the case writes one, and betaStar, which this driver handed the inlet, is a key the inlet never reads. Equal at the
+// defaults; see tests/pimple_tjunction_sst_vs_openfoam.sh for the measurement. kEpsilon's coeffDict carries the model's
+// own Cmu, which keCoeffs holds. CONTROL BRAE_CONTROL_SST_INLET_CMU_BETASTAR=1: betaStar, as before.
+scalar mixingLengthInletCmu(const DeviceSimpleControls& c)
+{
+    static const bool betaStar = std::getenv("BRAE_CONTROL_SST_INLET_CMU_BETASTAR") != nullptr;
+    if (c.sst)
+    {
+        return betaStar ? c.ksstCoeffs.betaStar : c.ksstCoeffs.Cmu;
+    }
+    return c.keCoeffs.Cmu;
+}
+
 // The level-0 fine coefficients over the EXTENDED edge list the AMG hierarchy was built from:
 // [internal faces | cyclic entries | AMI stencil entries].
 //
@@ -1246,15 +1270,15 @@ SimplecSnGrad simplecSnGrad(
         // the LAST pressure corrector made. At the momentum assembly they read the flux from before the
         // step, which on RAS/TJunction is zero at step 1: there the inlet and outlet1 stayed zeroGradient
         // through step 1, where OpenFOAM's had switched to inflow (outlet1's k and epsilon written at their
-        // inletValues 0.2 and 200 by OpenFOAM, at the cells' values by brae). kEpsilon only: the switched boundary
-        // is also what the closures' gradients would then read, and only kEpsilon's is handed the stored values
-        // (next commit); kOmegaSST, SpalartAllmaras, RNGkEpsilon and realizableKE keep the momentum assembly's
-        // switch, unmeasured with this one. CONTROL BRAE_CONTROL_TURB_SWITCH_AT_MOMENTUM=1: the momentum
-        // assembly's switch, as before.
+        // inletValues 0.2 and 200 by OpenFOAM, at the cells' values by brae). kEpsilon and the kOmegaSST family
+        // (switchesAtTurbulenceCorrection): the switched boundary is also what the closures' gradients would then
+        // read, and these two are handed the stored values below. kOmegaSSTBase::correct switches omega first, in
+        // omega_.boundaryFieldRef().updateCoeffs() at the top (kOmegaSSTBase.C:541), and k in kEqn's constructor
+        // after omega is solved (:600), from the same flux; see tests/pimple_tjunction_sst_vs_openfoam.sh for the
+        // measurement. CONTROL BRAE_CONTROL_TURB_SWITCH_AT_MOMENTUM=1: the momentum assembly's switch, as before.
         static const bool inletRefValue = std::getenv("BRAE_CONTROL_TURB_INLET_REFVALUE") != nullptr;
         static const bool switchAtMomentum = std::getenv("BRAE_CONTROL_TURB_SWITCH_AT_MOMENTUM") != nullptr;
-        const bool switchHere = pimpleUpdatePoints_ && !switchAtMomentum && ctl_.turbulent && !ctl_.les
-                             && ctl_.modelName == "kEpsilon";
+        const bool switchHere = pimpleUpdatePoints_ && !switchAtMomentum && switchesAtTurbulenceCorrection(ctl_);
         const bool patchValues = hasTurbInlet_ && pimpleUpdatePoints_ && !inletRefValue;
         DeviceBuffer<scalar> kb;
         if (patchValues) deviceBCValue(dbK_, dk_, kb);   // before either field's boundary moves
@@ -1263,11 +1287,14 @@ SimplecSnGrad simplecSnGrad(
         // limiter's fvc::grad(k) and fvc::grad(epsilon) (LimitedScheme.C:56) still read what the last evaluate
         // left: 0.2 on the TJunction inlet at step 1, the file's value, where the switched boundary now gives
         // 1.5 (I |U_b|)^2 = 1.0e-6. Taken after the switches, k was 1.28e-5 off OpenFOAM in the three cell
-        // columns behind the inlet at step 1 (tight solves, every boundary value equal). kEpsilon only:
-        // RNGkEpsilon and realizableKE share this closure, unmeasured with it. CONTROL
+        // columns behind the inlet at step 1 (tight solves, every boundary value equal). The kOmegaSST family reads
+        // them in more places: CDkOmega's fvc::grad(k) and fvc::grad(omega) and F1's patch half (kOmegaSSTBase.C:557-562)
+        // as well as the two equations' limiters and non-orthogonal corrections. omegaWallFunction's own faces are the
+        // exception: its updateCoeffs sets them (omegaWallFunctionFvPatchScalarField.C:167-177), and the closure keeps
+        // that. RNGkEpsilon and realizableKE share kEpsilon's closure, unmeasured with this. CONTROL
         // BRAE_CONTROL_TURB_GRAD_AFTER_UPDATE=1: the closure's own values, as before.
         static const bool gradAfterUpdate = std::getenv("BRAE_CONTROL_TURB_GRAD_AFTER_UPDATE") != nullptr;
-        const bool storedGrad = switchHere && ctl_.modelName == "kEpsilon" && !gradAfterUpdate;
+        const bool storedGrad = switchHere && !gradAfterUpdate;
         DeviceBuffer<scalar> kStored;
         DeviceBuffer<scalar> epsStored;
         if (storedGrad)
@@ -1278,7 +1305,7 @@ SimplecSnGrad simplecSnGrad(
         if (switchHere) deviceUpdateInletOutlet(dbEps_, phiBnd_);
         if (patchValues)
             deviceUpdateTurbulentInletSecond(kb, mlMask_, mlLength_,
-                                             ctl_.sst ? ctl_.ksstCoeffs.betaStar : ctl_.keCoeffs.Cmu, dbEps_);
+                                             mixingLengthInletCmu(ctl_), dbEps_);
         if (switchHere) deviceUpdateInletOutlet(dbK_, phiBnd_);
         if (patchValues)
         {
@@ -1290,7 +1317,7 @@ SimplecSnGrad simplecSnGrad(
         {
             deviceUpdateTurbulentInletK(dbU_, tiMask_, tiIntensity_, dbK_);
             deviceUpdateTurbulentInletSecond(dbK_, mlMask_, mlLength_,
-                                             ctl_.sst ? ctl_.ksstCoeffs.betaStar : ctl_.keCoeffs.Cmu, dbEps_);
+                                             mixingLengthInletCmu(ctl_), dbEps_);
         }
         // The no-penetration oracle on the boundary velocity THIS function hands the closures.
         // OpenFOAM's basicSymmetry evaluate() gives U_b = U_c - n(n.U_c), so n.U_b == 0 at every call.
@@ -1388,7 +1415,9 @@ SimplecSnGrad simplecSnGrad(
                                        fixScaE_ ? &fixScaMask_ : nullptr, fixScaE_ ? &fixScaEVal_ : nullptr,
                                        &lesDelta_,   // the case's `delta` for the DDES length scale (empty -> cubeRootVol)
                                        /*nSweeps*/1, ctl_.gsKESym,   // ...and WHICH GaussSeidel the case named
-                                       lapLimit(ctl_, "closure"));   // `limited corrected <psi>` on k and omega
+                                       lapLimit(ctl_, "closure"),   // `limited corrected <psi>` on k and omega
+                                       storedGrad ? &kStored : nullptr,     // k's and omega's patch values before the switches above
+                                       storedGrad ? &epsStored : nullptr);
                 if (ctl_.lm)   // Langtry-Menter: transport ReThetat + gammaInt, update gammaIntEff for next iter
                     deviceKOmegaSSTLMCorrect(dm, dbU_, dbReThetat_, dbGammaInt_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
                                              ReThetat_, gammaInt_, gammaIntEff_, phiInt_, phiBnd_, ctl_.nu, ctl_.epsRelax(),
@@ -1862,11 +1891,12 @@ SimplecSnGrad simplecSnGrad(
         if (compressible_ && dbHe_.n) deviceUpdateInletOutlet(dbHe_, phiBnd_);
         // NOTE: the turbulent-inlet refresh does NOT belong here. It moved into correctTurbulence(),
         // which is where OF updates it -- see the comment there.
-        // pimpleStep switches kEpsilon's k and epsilon at the turbulence correction instead (correctTurbulence)
+        // pimpleStep switches kEpsilon's and the kOmegaSST family's k and epsilon|omega at the turbulence correction
+        // instead (correctTurbulence)
         static const bool turbSwitchAtMomentum = std::getenv("BRAE_CONTROL_TURB_SWITCH_AT_MOMENTUM") != nullptr;
         if (ctl_.turbulent && !ctl_.les)   // pure LES has no k/epsilon/omega boundaries (algebraic nut)
         {
-            if (!pimpleUpdatePoints_ || turbSwitchAtMomentum || ctl_.modelName != "kEpsilon")
+            if (!pimpleUpdatePoints_ || turbSwitchAtMomentum || !switchesAtTurbulenceCorrection(ctl_))
             {
                 deviceUpdateInletOutlet(dbK_, phiBnd_);
                 deviceUpdateInletOutlet(dbEps_, phiBnd_);
@@ -5051,8 +5081,8 @@ SimplecSnGrad simplecSnGrad(
         // by then the fields are aged and only the geometry is being re-converged.
         if (moveMesh) moveMesh(0);
         advanceTime(deltaT);                                  // store oldTime() + set deltaT/deltaT0 for ddtCoeffs()
-        // kEpsilon's k and epsilon switch at the turbulence correction on this path (correctTurbulence), so
-        // the first step's earlier readers -- the 'calculated' nut patches in the momentum assembly's nuEff,
+        // kEpsilon's and the kOmegaSST family's k and epsilon|omega switch at the turbulence correction on this path
+        // (correctTurbulence), so the first step's earlier readers -- the 'calculated' nut patches in the momentum assembly's nuEff,
         // and the stored values the limiter's gradients take -- meet an inletOutlet face before any switch.
         // OpenFOAM's stored patch value is the file's `value` there; brae's construction state is
         // fixedValue(inletValue). MEASURED on RAS/TJunction restarted from brae's own 0.01 (every outlet2
@@ -5061,8 +5091,7 @@ SimplecSnGrad simplecSnGrad(
         // (value == inletValue) it changes nothing. The seed the other drivers' closures take
         // (DeviceBoundary::ioStored); BRAE_IO_STORED=0 is its control.
         static const bool turbSwitchAtMomentum = std::getenv("BRAE_CONTROL_TURB_SWITCH_AT_MOMENTUM") != nullptr;
-        if (!pimpleUpdatePoints_ && !turbSwitchAtMomentum && ctl_.turbulent && !ctl_.les
-            && ctl_.modelName == "kEpsilon" && ioStoredEnabled())
+        if (!pimpleUpdatePoints_ && !turbSwitchAtMomentum && switchesAtTurbulenceCorrection(ctl_) && ioStoredEnabled())
         {
             dbK_.ioFresh.copyFrom(dbK_.ioMask.host());
             dbEps_.ioFresh.copyFrom(dbEps_.ioMask.host());

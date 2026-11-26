@@ -75,10 +75,12 @@ struct KOmegaSSTCoeffs
 
 // Read RAS.kOmegaSSTCoeffs into c (absent keys keep OF defaults). `ras` may be null (-> all defaults).
 // The dict is RASModel.C:72's optionalSubDict: with no kOmegaSSTCoeffs sub-dictionary OpenFOAM reads the
-// coefficients (and the omega inlet's Cmu, and Prt) from the RAS dictionary itself.
-inline void readKOmegaSSTCoeffs(const FoamDict* ras, KOmegaSSTCoeffs& c)
+// coefficients (and the omega inlet's Cmu, and Prt) from the RAS dictionary itself. The DES family names its own:
+// LESModel.C:72 takes LES.optionalSubDict(type() + "Coeffs"), kOmegaSSTDDESCoeffs for kOmegaSSTDDES, so the caller
+// passes `coeffsName` there.
+inline void readKOmegaSSTCoeffs(const FoamDict* ras, KOmegaSSTCoeffs& c, const std::string& coeffsName = "kOmegaSSTCoeffs")
 {
-    const FoamDict* kc = ras ? ras->optionalSubDict("kOmegaSSTCoeffs") : nullptr;
+    const FoamDict* kc = ras ? ras->optionalSubDict(coeffsName) : nullptr;
     if (!kc) return;
     c.alphaK1 = kc->scalarOr("alphaK1", c.alphaK1);
     c.alphaK2 = kc->scalarOr("alphaK2", c.alphaK2);
