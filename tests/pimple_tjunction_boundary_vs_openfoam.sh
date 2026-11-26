@@ -17,6 +17,11 @@
 #   T1  kEpsilon, the p0 table (0 10) (1 40)
 #   T2  T1 laminar: the flow boundaries alone (p, U)
 #   T3  T1 with p0 constant 10: the total-pressure update without p0's time dependence
+#   R1  T2 on the mesh rotated 30 deg about z (OpenFOAM's transformPoints after blockMesh): the inlet normal is not an axis
+#   R2  T1 on the mesh rotated 20 deg about (1 1 1): every patch normal mixes three components
+#       The flow starts at rest, there is no gravity and every boundary value is rotation-invariant, so R1 and R2 are T2 and
+#       T1 in another frame. The tutorial's probes are left out of R1 and R2: the rotated mesh no longer contains their
+#       points, and OpenFOAM's probes then write an entry it cannot read back and stop.
 #
 # CHECKS, each entry (the internal field and every patch's value) of p U k epsilon nut at 0.001, 0.002, 0.003 on its
 # own scale (tests/pimple_entry_compare.py): rel <= BOUND. Controls, each must go red on the entry it guards:
@@ -25,10 +30,14 @@
 #   BRAE_CONTROL_TURB_INLET_REFVALUE=1         T1, inlet k at 0.002
 #   BRAE_CONTROL_TURB_SWITCH_AT_MOMENTUM=1     T1, outlet1 k at 0.001
 #   BRAE_CONTROL_TURB_GRAD_AFTER_UPDATE=1      T1, internal k at 0.001
+#   BRAE_CONTROL_PIOV_HBYA_DESCRIPTOR=1        R1, inlet U at 0.001 (HbyA_b through U's descriptor, not the cell value)
+#   BRAE_CONTROL_PIOV_NO_SOLVE_EVAL=1          R2, inlet nut at 0.002 (U_b not re-evaluated after the momentum solve)
 # MEASURED (JUPITER, one GH200, OpenFOAM v2412 serial, 2026-11-25): worst entry over steps 1-3
 # T1 4.9e-08, T2 5.6e-08, T3 1.8e-08 (U internal at 0.003, in the outlet2 branch; p within 6.6e-10), so BOUND 1e-6 is a
 # decade above. Before these changes: T2 inlet p 1.7e-05 and U 2.4e-04 at step 1, T1 inlet k 1.0 at step 2. Controls:
 # 1.7e-05, 6.7e-05, 1.0, 2.5e-01, 1.3e-05, each on its own entry. 31 s.
+# R1, R2 (Arrhenius, one GH200, 2026-11-26): 4.1e-09 and 1.7e-08; before HbyA_b took the cell value and U_b was re-evaluated
+# after the momentum solve, U inlet 3.1e-01 at step 1 on R1 and nut inlet 5.9e-01 on R2. Controls: 3.1e-01 and 3.1e-06.
 # Labels: slow. Honours OFBASHRC; exits 77 without OpenFOAM, a GPU or the binary.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -96,6 +105,28 @@ stage "$W/T2"
 sed -i -E 's/^simulationType[[:space:]]+RAS;/simulationType laminar;/' "$W/T2/constant/turbulenceProperties"
 grep -q '^simulationType laminar;' "$W/T2/constant/turbulenceProperties" || { echo "FAIL: T2 is not laminar"; exit 1; }
 stage "$W/T3"
+rotate()   # <arm> <axis-angle>: the staged mesh rotated, the probes left out
+{
+    ( cd "$1" && transformPoints -rotate-angle "$2" > log.transformPoints 2>&1 ) || { echo "FAIL: transformPoints $1"; exit 1; }
+    python3 - "$1/system/controlDict" <<'EOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+i = s.index('\nfunctions')
+j = s.index('{', i)
+d = 0
+for k in range(j, len(s)):
+    d += {'{': 1, '}': -1}.get(s[k], 0)
+    if d == 0:
+        break
+open(p, 'w').write(s[:i] + s[k + 1:])
+EOF
+}
+stage "$W/R1"
+cp "$W/T2/constant/turbulenceProperties" "$W/R1/constant/turbulenceProperties"
+rotate "$W/R1" "((0 0 1) 30)"
+stage "$W/R2"
+rotate "$W/R2" "((1 1 1) 20)"
 python3 - "$W/T3/0/p" <<'EOF'
 import re, sys
 p = sys.argv[1]
@@ -106,9 +137,9 @@ open(p, 'w').write(s2)
 EOF
 ofrun() { ( cd "$1" && nice -n 10 pimpleFoam > log 2>&1 ); }
 brrun() { local d=$1; shift; ( cd "$d" && env "$@" "$BIN" -case . > log 2>&1 ); }
-fields() { [ "$1" = T2 ] && echo "p U" || echo "p U k epsilon nut"; }
+fields() { case "$1" in T2|R1) echo "p U" ;; *) echo "p U k epsilon nut" ;; esac; }
 
-for a in T1 T2 T3; do
+for a in T1 T2 T3 R1 R2; do
     cp -r "$W/$a" "$W/$a-of"
     cp -r "$W/$a" "$W/$a-br"
     ofrun "$W/$a-of" || { echo "FAIL: OpenFOAM $a"; tail -5 "$W/$a-of/log"; exit 1; }
@@ -146,6 +177,8 @@ control PIOV_ASSEMBLY_ONLY T2 0.001 U inlet
 control TURB_INLET_REFVALUE T1 0.002 k inlet
 control TURB_SWITCH_AT_MOMENTUM T1 0.001 k outlet1
 control TURB_GRAD_AFTER_UPDATE T1 0.001 k internal
+control PIOV_HBYA_DESCRIPTOR R1 0.001 U inlet
+control PIOV_NO_SOLVE_EVAL R2 0.002 nut inlet
 
 [ $fail = 0 ] && echo "PASS" || echo "FAIL"
 exit $fail
