@@ -2947,6 +2947,17 @@ SimplecSnGrad simplecSnGrad(
         // Nothing in the pressure stage reads it (HbyA_b is projected afresh below), but the closures
         // do, after the corrector -- item 13; tests/legacy_symmetry_refresh.sh.
         if (hasSym_) deviceUpdateSymmetry(dbU_, Uk_[0], Uk_[1], Uk_[2]);
+        // ...and pressureInletOutletVelocity, on pimpleStep: that evaluate re-runs the patch's updateCoeffs
+        // (pressureInletOutletVelocityFvPatchVectorField.C:170-183) on the flux as it stands and the SOLVED cells, so an
+        // inflow face holds n(n.U_c) of the new U. brae's mixed refValue still held n(n.U_c) of the cells before the
+        // solve. On an axis-aligned inlet the normal component is zeroGradient and the value comes out right anyway; on a
+        // tilted one every component blends the old cells with the new, and the total pressure assembled next reads it.
+        //   BRAE_CONTROL_PIOV_NO_SOLVE_EVAL=1  a gate's control, deliberately wrong: not re-evaluated here
+        static const bool piovNoSolveEval = std::getenv("BRAE_CONTROL_PIOV_NO_SOLVE_EVAL") != nullptr;
+        if (hasPiov_ && pimpleUpdatePoints_ && !piovNoSolveEval)
+        {
+            deviceUpdatePressureInletOutletVelocity(dbU_, phiBnd_, Uk_[0], Uk_[1], Uk_[2], /*directionMixed=*/true);
+        }
         DeviceBuffer<scalar> hxb,hyb,hzb;
         deviceBCValue(dbU_.comp[0],HbyA[0],hxb);
         deviceBCValue(dbU_.comp[1],HbyA[1],hyb);
