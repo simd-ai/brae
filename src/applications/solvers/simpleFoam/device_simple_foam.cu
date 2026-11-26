@@ -1843,7 +1843,13 @@ SimplecSnGrad simplecSnGrad(
         // inletOutlet BCs: resolve each IO face to fixedValue|zeroGradient from the PREVIOUS step's boundary flux
         // (OF updateCoeffs uses the prior corrector's phi). No-op when a boundary has no inletOutlet faces.
         deviceUpdateInletOutlet(dbU_, phiBnd_);
-        deviceUpdateInletOutlet(dbP_, phiBnd_);
+        // p's inletOutlet: pimpleStep switches it at every pressure assembly instead, where OpenFOAM does (see the
+        // pressure corrector); the steady drivers keep this point
+        static const bool pIOAtMomentum = std::getenv("BRAE_CONTROL_P_IO_AT_MOMENTUM") != nullptr;
+        if (!pimpleUpdatePoints_ || pIOAtMomentum)
+        {
+            deviceUpdateInletOutlet(dbP_, phiBnd_);
+        }
         // flowRateInletVelocity, at OpenFOAM's own point for it -- see updateFlowRateInlets.
         updateFlowRateInlets();
         // The ENERGY boundary too. dbHe_ inherits T's BC types, so an `inletOutlet` T outlet -- which
@@ -3422,6 +3428,17 @@ SimplecSnGrad simplecSnGrad(
         // BRAE_CONTROL_TOTAL_PRESSURE_AT_MOMENTUM=1: the momentum assembly's point, as before.
         static const bool totalPAtMomentum = std::getenv("BRAE_CONTROL_TOTAL_PRESSURE_AT_MOMENTUM") != nullptr;
         if (hasTotalP_ && pimpleUpdatePoints_ && !totalPAtMomentum) updateTotalPressure();
+        // ...and p's inletOutlet, in the same constructor (inletOutletFvPatchField.C updateCoeffs: valueFraction =
+        // 1 - pos0(phip)) on the flux as it stands; every non-orthogonal pass reads the same flux. Switched once at the
+        // momentum assembly instead, a corrector after the first kept the switch from the flux before the step: RAS/TJunction
+        // with outlet1's p inletOutlet (inletValue 10) started zeroGradient on step 1's zero flux and stayed so through the
+        // second corrector, where OpenFOAM's is fixed at 10 on every inflow face -- p outlet1 4.9e-01 at step 1 (Arrhenius
+        // 5797202). CONTROL BRAE_CONTROL_P_IO_AT_MOMENTUM=1: once at the momentum assembly, as before.
+        static const bool pIOAtMomentum = std::getenv("BRAE_CONTROL_P_IO_AT_MOMENTUM") != nullptr;
+        if (pimpleUpdatePoints_ && !pIOAtMomentum)
+        {
+            deviceUpdateInletOutlet(dbP_, phiBnd_);
+        }
         const int nPass = (ctl_.nonOrth ? ctl_.nNonOrth : 0) + 1;
         DeviceBuffer<scalar> pIC, pBC, ffcP, ffcPcyc, ffcPami;
         DeviceSolverPerf pp, pp0;

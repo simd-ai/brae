@@ -27,6 +27,9 @@
 #       fan case amplifies any difference: OpenFOAM against itself with PCG instead of GAMG on p is 1.7e-05 at step 2 and
 #       5.8e-05 at step 3, and against its own one-ulp p0 twin 9.3e-06 at step 3 (Arrhenius 5796712); with Gauss linear
 #       brae is 1.2e-10 from OpenFOAM at every step, so that is the staging judged here.
+#   P1  T2 with outlet1's p `inletOutlet` (inletValue 10, the tutorial's fixedValue 10). OpenFOAM switches it in the constructor
+#       of every pressure assembly: zeroGradient on step 1's zero flux (pos0(0) = 1) at the first corrector, fixed at 10 on the
+#       inflow faces the first corrector leaves at the second. No stock pimpleFoam tutorial has a p inletOutlet.
 #
 # CHECKS, each entry (the internal field and every patch's value) of p U k epsilon nut at 0.001, 0.002, 0.003 on its
 # own scale (tests/pimple_entry_compare.py): rel <= BOUND. Controls, each must go red on the entry it guards:
@@ -38,6 +41,7 @@
 #   BRAE_CONTROL_PIOV_HBYA_DESCRIPTOR=1        R1, inlet U at 0.001 (HbyA_b through U's descriptor, not the cell value)
 #   BRAE_CONTROL_PIOV_NO_SOLVE_EVAL=1          R2, inlet nut at 0.002 (U_b not re-evaluated after the momentum solve)
 #   BRAE_CONTROL_TOTAL_PRESSURE_AT_MOMENTUM=1  F1 too, inlet p at 0.001 (the fan's p0 from the flux before the step)
+#   BRAE_CONTROL_P_IO_AT_MOMENTUM=1            P1, outlet1 p at 0.001 (p's inletOutlet switched once, at the momentum assembly)
 # MEASURED (JUPITER, one GH200, OpenFOAM v2412 serial, 2026-11-25): worst entry over steps 1-3
 # T1 4.9e-08, T2 5.6e-08, T3 1.8e-08 (U internal at 0.003, in the outlet2 branch; p within 6.6e-10), so BOUND 1e-6 is a
 # decade above. Before these changes: T2 inlet p 1.7e-05 and U 2.4e-04 at step 1, T1 inlet k 1.0 at step 2. Controls:
@@ -45,6 +49,8 @@
 # R1, R2, F1 (Arrhenius, one GH200, 2026-11-26): 4.5e-08, 8.6e-08 and 1.2e-10; before HbyA_b took the cell value and U_b was
 # re-evaluated after the momentum solve, U inlet 3.1e-01 at step 1 on R1 and nut inlet 5.9e-01 on R2. Controls: PIOV_HBYA_DESCRIPTOR
 # 3.1e-01, PIOV_NO_SOLVE_EVAL 3.0e-06, TOTAL_PRESSURE_AT_MOMENTUM on F1 5.3e-03; the others as above. 23 s.
+# P1 (2026-11-26): 3.1e-08 (kEpsilon on the same staging 8.0e-08); with p switched once per outer corrector p outlet1 was
+# 4.9e-01 at step 1 (5797202), which P_IO_AT_MOMENTUM reproduces (5797256).
 # Labels: slow. Honours OFBASHRC; exits 77 without OpenFOAM, a GPU or the binary.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -134,6 +140,22 @@ cp "$W/T2/constant/turbulenceProperties" "$W/R1/constant/turbulenceProperties"
 rotate "$W/R1" "((0 0 1) 30)"
 stage "$W/R2"
 rotate "$W/R2" "((1 1 1) 20)"
+stage "$W/P1"
+cp "$W/T2/constant/turbulenceProperties" "$W/P1/constant/turbulenceProperties"
+python3 - "$W/P1/0/p" <<'EOF'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+new = """outlet1
+    {
+        type            inletOutlet;
+        inletValue      uniform 10;
+        value           uniform 10;
+    }"""
+s, n = re.subn(r'outlet1\s*\{.*?\n    \}', lambda m: new, s, count=1, flags=re.S)
+assert n == 1
+open(p, 'w').write(s)
+EOF
 stage "$W/F1"
 cp "$W/T2/constant/turbulenceProperties" "$W/F1/constant/turbulenceProperties"
 cp "${TUT%/TJunction}/TJunctionFan/constant/FluxVsdP.dat" "$W/F1/constant/" || { echo "FAIL: no TJunctionFan fan curve"; exit 1; }
@@ -170,9 +192,9 @@ open(p, 'w').write(s2)
 EOF
 ofrun() { ( cd "$1" && nice -n 10 pimpleFoam > log 2>&1 ); }
 brrun() { local d=$1; shift; ( cd "$d" && env "$@" "$BIN" -case . > log 2>&1 ); }
-fields() { case "$1" in T2|R1|F1) echo "p U" ;; *) echo "p U k epsilon nut" ;; esac; }
+fields() { case "$1" in T2|R1|F1|P1) echo "p U" ;; *) echo "p U k epsilon nut" ;; esac; }
 
-for a in T1 T2 T3 R1 R2 F1; do
+for a in T1 T2 T3 R1 R2 F1 P1; do
     cp -r "$W/$a" "$W/$a-of"
     cp -r "$W/$a" "$W/$a-br"
     ofrun "$W/$a-of" || { echo "FAIL: OpenFOAM $a"; tail -5 "$W/$a-of/log"; exit 1; }
@@ -213,6 +235,7 @@ control TURB_GRAD_AFTER_UPDATE T1 0.001 k internal
 control PIOV_HBYA_DESCRIPTOR R1 0.001 U inlet
 control PIOV_NO_SOLVE_EVAL R2 0.002 nut inlet
 control TOTAL_PRESSURE_AT_MOMENTUM F1 0.001 p inlet
+control P_IO_AT_MOMENTUM P1 0.001 p outlet1
 
 [ $fail = 0 ] && echo "PASS" || echo "FAIL"
 exit $fail
