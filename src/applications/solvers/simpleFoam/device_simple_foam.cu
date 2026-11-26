@@ -26,6 +26,21 @@ bool switchesAtTurbulenceCorrection(const DeviceSimpleControls& c)
     return c.turbulent && !c.les && (c.modelName == "kEpsilon" || (c.sst && !c.lm));
 }
 
+// The Cmu of the mixing-length inlets. turbulentMixingLengthFrequencyInlet takes turbModel.coeffDict().getOrDefault("Cmu",
+// 0.09) (turbulentMixingLengthFrequencyInletFvPatchScalarField.C:137-138): kOmegaSST's coeffDict carries a Cmu only when
+// the case writes one, and betaStar, which this driver handed the inlet, is a key the inlet never reads. Equal at the
+// defaults; see tests/pimple_tjunction_sst_vs_openfoam.sh for the measurement. kEpsilon's coeffDict carries the model's
+// own Cmu, which keCoeffs holds. CONTROL BRAE_CONTROL_SST_INLET_CMU_BETASTAR=1: betaStar, as before.
+scalar mixingLengthInletCmu(const DeviceSimpleControls& c)
+{
+    static const bool betaStar = std::getenv("BRAE_CONTROL_SST_INLET_CMU_BETASTAR") != nullptr;
+    if (c.sst)
+    {
+        return betaStar ? c.ksstCoeffs.betaStar : c.ksstCoeffs.Cmu;
+    }
+    return c.keCoeffs.Cmu;
+}
+
 // The level-0 fine coefficients over the EXTENDED edge list the AMG hierarchy was built from:
 // [internal faces | cyclic entries | AMI stencil entries].
 //
@@ -1290,7 +1305,7 @@ SimplecSnGrad simplecSnGrad(
         if (switchHere) deviceUpdateInletOutlet(dbEps_, phiBnd_);
         if (patchValues)
             deviceUpdateTurbulentInletSecond(kb, mlMask_, mlLength_,
-                                             ctl_.sst ? ctl_.ksstCoeffs.betaStar : ctl_.keCoeffs.Cmu, dbEps_);
+                                             mixingLengthInletCmu(ctl_), dbEps_);
         if (switchHere) deviceUpdateInletOutlet(dbK_, phiBnd_);
         if (patchValues)
         {
@@ -1302,7 +1317,7 @@ SimplecSnGrad simplecSnGrad(
         {
             deviceUpdateTurbulentInletK(dbU_, tiMask_, tiIntensity_, dbK_);
             deviceUpdateTurbulentInletSecond(dbK_, mlMask_, mlLength_,
-                                             ctl_.sst ? ctl_.ksstCoeffs.betaStar : ctl_.keCoeffs.Cmu, dbEps_);
+                                             mixingLengthInletCmu(ctl_), dbEps_);
         }
         // The no-penetration oracle on the boundary velocity THIS function hands the closures.
         // OpenFOAM's basicSymmetry evaluate() gives U_b = U_c - n(n.U_c), so n.U_b == 0 at every call.
