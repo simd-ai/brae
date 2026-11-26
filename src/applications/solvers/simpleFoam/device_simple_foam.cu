@@ -2952,9 +2952,13 @@ SimplecSnGrad simplecSnGrad(
         // inflow face holds n(n.U_c) of the new U. brae's mixed refValue still held n(n.U_c) of the cells before the
         // solve. On an axis-aligned inlet the normal component is zeroGradient and the value comes out right anyway; on a
         // tilted one every component blends the old cells with the new, and the total pressure assembled next reads it.
+        // Only where that solve ran, i.e. before the FIRST pressure corrector: OpenFOAM's later correctors start from the
+        // U.correctBoundaryConditions() of the corrector before them (pEqn.H), which pimpleStep already runs after each
+        // corrector. Re-evaluating at every corrector gives the same values there but hid that later call from its gate:
+        // BRAE_CONTROL_PIOV_ASSEMBLY_ONLY read 1.1e-10 instead of 6.7e-05 (Arrhenius 5796581).
         //   BRAE_CONTROL_PIOV_NO_SOLVE_EVAL=1  a gate's control, deliberately wrong: not re-evaluated here
         static const bool piovNoSolveEval = std::getenv("BRAE_CONTROL_PIOV_NO_SOLVE_EVAL") != nullptr;
-        if (hasPiov_ && pimpleUpdatePoints_ && !piovNoSolveEval)
+        if (hasPiov_ && pimpleUpdatePoints_ && !piovNoSolveEval && ctl_.innerCorrector == 0 && ctl_.momentumPredictor)
         {
             deviceUpdatePressureInletOutletVelocity(dbU_, phiBnd_, Uk_[0], Uk_[1], Uk_[2], /*directionMixed=*/true);
         }
