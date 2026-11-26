@@ -42,8 +42,9 @@
 # T1 4.9e-08, T2 5.6e-08, T3 1.8e-08 (U internal at 0.003, in the outlet2 branch; p within 6.6e-10), so BOUND 1e-6 is a
 # decade above. Before these changes: T2 inlet p 1.7e-05 and U 2.4e-04 at step 1, T1 inlet k 1.0 at step 2. Controls:
 # 1.7e-05, 6.7e-05, 1.0, 2.5e-01, 1.3e-05, each on its own entry. 31 s.
-# R1, R2 (Arrhenius, one GH200, 2026-11-26): 4.1e-09 and 1.7e-08; before HbyA_b took the cell value and U_b was re-evaluated
-# after the momentum solve, U inlet 3.1e-01 at step 1 on R1 and nut inlet 5.9e-01 on R2. Controls: 3.1e-01 and 3.1e-06.
+# R1, R2, F1 (Arrhenius, one GH200, 2026-11-26): 4.5e-08, 8.6e-08 and 1.2e-10; before HbyA_b took the cell value and U_b was
+# re-evaluated after the momentum solve, U inlet 3.1e-01 at step 1 on R1 and nut inlet 5.9e-01 on R2. Controls: PIOV_HBYA_DESCRIPTOR
+# 3.1e-01, PIOV_NO_SOLVE_EVAL 3.0e-06, TOTAL_PRESSURE_AT_MOMENTUM on F1 5.3e-03; the others as above. 23 s.
 # Labels: slow. Honours OFBASHRC; exits 77 without OpenFOAM, a GPU or the binary.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
