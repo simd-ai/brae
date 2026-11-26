@@ -44,6 +44,7 @@
 #include <limits>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -491,6 +492,15 @@ public:
     }
     WriteControl&      writeControl()    { return owned_; }
 
+    // The run's absolute time index at its start, for a driver that reads it from the start's uniform/time (gpuPimpleFoam
+    // at a fixed deltaT, Time.C:302-307): a functionObject's step index is then this plus the steps run, as OpenFOAM's
+    // runTime.timeIndex() is. Without it the index is estimated as startTime/deltaT, which is OpenFOAM's only when every
+    // earlier step had this deltaT and the start directory carried its index.
+    void setStartIndex(long index)
+    {
+        startIndex_ = index;
+    }
+
     Time(const FoamDict& controlDict, WriteControl* wc, int nSteps,
          const std::vector<std::pair<std::string, FunctionObjectList::Factory>>& types = {},
          const std::vector<std::string>& approximatedOutside = {},
@@ -582,7 +592,7 @@ private:
         s.startTime = t0;
         s.endTime = endTime_;
         s.time = t0 + static_cast<scalar>(iter_) * dt;
-        s.timeIndex = static_cast<int>(std::llround(t0 / dt)) + iter_;
+        s.timeIndex = startIndex_ ? static_cast<int>(*startIndex_) + iter_ : static_cast<int>(std::llround(t0 / dt)) + iter_;
         s.writeTime = writtenAt_ == iter_;
         s.timeName = WriteControl::timeName(s.time);
         s.startName = startName_;
@@ -606,6 +616,7 @@ private:
     int                nSteps_;
     int                iter_ = 0;
     int                writtenAt_ = -1;
+    std::optional<long> startIndex_;
     bool               reportTiming_ = true;
 };
 
