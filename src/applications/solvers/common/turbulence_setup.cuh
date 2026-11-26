@@ -559,7 +559,13 @@ inline void readTurbulenceModel(
                 {
                     ctl.sst = true;
                     ctl.iddes = sstIddes;   // IDDES -> the improved (WMLES) length scale (maxDeltaxyz + blending); else plain DDES
-                    readKOmegaSSTCoeffs(les, ctl.ksstCoeffs);   // honour an inline kOmegaSSTCoeffs under LES{} if present
+                    // The model's coefficients, the frequency inlet's Cmu with them, come from LES.optionalSubDict(type()
+                    // + "Coeffs") (LESModel.C:72): kOmegaSSTDDESCoeffs for kOmegaSSTDDES. Read from kOmegaSSTCoeffs, which
+                    // OpenFOAM never looks up here, a case's kOmegaSSTDDESCoeffs { Cmu 0.12; } ran at 0.09; see
+                    // tests/pimple_tjunction_sst_vs_openfoam.sh arm D2. CONTROL BRAE_CONTROL_SST_DES_COEFFS_RAS_NAME=1:
+                    // kOmegaSSTCoeffs, as before.
+                    static const bool desCoeffsRasName = std::getenv("BRAE_CONTROL_SST_DES_COEFFS_RAS_NAME") != nullptr;
+                    readKOmegaSSTCoeffs(les, ctl.ksstCoeffs, desCoeffsRasName ? std::string("kOmegaSSTCoeffs") : model + "Coeffs");
                     if (dc) { ctl.ksstCoeffs.CDES1 = dc->scalarOr("CDES1", ctl.ksstCoeffs.CDES1);
                               ctl.ksstCoeffs.CDES2 = dc->scalarOr("CDES2", ctl.ksstCoeffs.CDES2); }
                     if (sstIddes && dc)   // IDDES blending-constant overrides (defaults = Gritskevich et al. 2012)
