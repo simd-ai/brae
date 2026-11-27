@@ -2012,11 +2012,31 @@ SimplecSnGrad simplecSnGrad(
         // nuEff at boundary FACES, and the boundary nut with it (nutBndAll_, dnutBndWall_): boundaryNuEff, or the values the
         // last turbulence correction made of these same fields (refreshNutBoundary), once
         DeviceBuffer<scalar> nuEffBnd;
+        // pimpleStep holds them until the next correctNut, as OpenFOAM holds nut's patch values: its momentum assembly reads
+        // them (divDevSigma's nuEff) at every outer corrector, and only correctNut evaluates them again. Evaluated once more at
+        // the second outer corrector, a wall function that depends on U (nutUSpaldingWallFunction) moved with the corrected U
+        // and restarted its next Newton from there: the 3-D step under SpalartAllmaras with nOuterCorrectors 2 had nut on the
+        // walls 2.2e-04 from OpenFOAM at step 1 (see tests/pimple_des_step_vs_openfoam.sh). nutkWallFunction depends on k
+        // alone, which does not move between the two, so the kEpsilon and kOmegaSST cases could not show it. The first
+        // evaluation of a run is held the same way (OpenFOAM's validate()). CONTROL BRAE_CONTROL_NUT_BOUNDARY_ONE_USE=1: used
+        // once and evaluated again at the next assembly, as before.
+        static const bool nutBndOneUse = std::getenv("BRAE_CONTROL_NUT_BOUNDARY_ONE_USE") != nullptr;
+        const bool holdNutBnd = pimpleUpdatePoints_ && !compressible_ && !nutBndOneUse;
         if (nuEffBndHeldValid_)
             deviceCopy(nuEffBnd, nuEffBndHeld_);
         else
+        {
             boundaryNuEff(nuEff, nuEffBnd);
-        nuEffBndHeldValid_ = false;
+            if (holdNutBnd)
+            {
+                deviceCopy(nuEffBndHeld_, nuEffBnd);
+                nuEffBndHeldValid_ = true;
+            }
+        }
+        if (!holdNutBnd)
+        {
+            nuEffBndHeldValid_ = false;
+        }
         // BRAE_POOL_STATS: the momentum phase in four parts, for the census's per-part peaks
         detail::devicePool().phase("mom:stress");
         // explicit divDevReff stress (uses the incoming U; coupled across the 3 components)
