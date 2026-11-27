@@ -139,6 +139,13 @@ add_test(NAME pimple_tjunction_sa_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}
 set_tests_properties(pimple_tjunction_sa_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
                      ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_pimpleFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 
+# nut on the patches that are not walls, as correctNut's nut_.correctBoundaryConditions() evaluates them: calculated,
+# fixedValue, zeroGradient and inletOutlet/freestream under kEpsilon, kOmegaSST and SpalartAllmaras, the k-based and the
+# velocity-based wall functions; every entry at steps 1-3 against OpenFOAM, a control per arm.
+add_test(NAME pimple_tjunction_nut_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_tjunction_nut_vs_openfoam.sh)
+set_tests_properties(pimple_tjunction_nut_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
+                     ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_pimpleFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+
 # The DES family's length scales on a 3-D backward-facing step whose shear layer leaves OpenFOAM's DDES unshielded:
 # kOmegaSSTDES and kOmegaSSTDDES (dTilda, CDESkom/CDESkeps, the delay function, after the omega solve), SpalartAllmarasDES
 # and DDES, and the wall nut held across outer correctors; every entry at steps 1-5 against OpenFOAM, five controls.
