@@ -3148,6 +3148,25 @@ SimplecSnGrad simplecSnGrad(
         if (hasWedge_) deviceWedgeFaceValue(dbU_, HbyA[0], HbyA[1], HbyA[2], hxb, hyb, hzb);
         // constrainHbyA at mixed velocity faces (OF resets phiHbyA_b = U_b.Sf at fixesValue patches): use U_b not HbyA_b.
         if (hasMixed_) deviceConstrainMixedHbyA(dbU_, Uk_[0], Uk_[1], Uk_[2], hxb, hyb, hzb);
+        // ...and those are U's STORED patch values (constrainHbyA.C:58-69, HbyAbf[patchi] = U.boundaryField()[patchi]), what
+        // the last evaluate left, not the cells re-blended with the valueFraction the momentum assembly has just rebuilt.
+        // The two agree once a momentum solve has evaluated U; with momentumPredictor off nothing has at the first corrector,
+        // so OpenFOAM's HbyA_b is the previous step's evaluate (at step 1 the file's value) while the re-blend used the new
+        // valueFraction: airFoil2D under pimpleFoam, 6.9e-05 (p) at step 1 and 2.7e-04 at step 2; 2.2e-06 with the stored
+        // values, as with the predictor (Arrhenius 5855633). CONTROL BRAE_CONTROL_FREESTREAM_HBYA_REBLEND=1: the re-blend
+        static const bool hbyaReblend = std::getenv("BRAE_CONTROL_FREESTREAM_HBYA_REBLEND") != nullptr;
+        if (hasMixed_ && freestreamStored() && !hbyaReblend)
+        {
+            const DeviceBuffer<scalar>* stored[3] = {&UbStored_[0], &UbStored_[1], &UbStored_[2]};
+            DeviceBuffer<scalar> hb3[3];
+            deviceCopy(hb3[0], hxb);
+            deviceCopy(hb3[1], hyb);
+            deviceCopy(hb3[2], hzb);
+            deviceStoredFreestreamValues(dbU_, stored, hb3);
+            deviceCopy(hxb, hb3[0]);
+            deviceCopy(hyb, hb3[1]);
+            deviceCopy(hzb, hb3[2]);
+        }
         // ...and the reverse at inletOutlet, which OF marks assignable and therefore does NOT constrain:
         // HbyA_b there is the zero-gradient value it was born with, NOT the clamped inlet velocity. The
         // evaluation above went through U's descriptor, which on a BACKFLOW face returns inletValue (0),
