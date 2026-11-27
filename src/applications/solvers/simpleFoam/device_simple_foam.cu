@@ -18,12 +18,14 @@ namespace brae {
 
 namespace {
 // The closures whose k and second-field flux switches pimpleStep makes at the turbulence correction, with the stored patch
-// values handed to their gradients: kEpsilon (kEpsilon.C:247, 273) and the kOmegaSST family, whose DES, DDES and IDDES
-// variants run kOmegaSSTBase::correct as it is (kOmegaSSTBase.C:541, 600; kOmegaSSTDES overrides correctNut only).
-// RNGkEpsilon, realizableKE, SpalartAllmaras and kOmegaSSTLM keep the momentum assembly's switch, unmeasured with this one.
+// values handed to their gradients: kEpsilon (kEpsilon.C:247, 273), the kOmegaSST family, whose DES, DDES and IDDES
+// variants run kOmegaSSTBase::correct as it is (kOmegaSSTBase.C:541, 600; kOmegaSSTDES overrides correctNut only), and the
+// SpalartAllmaras family, whose nuTilda switches in nuTildaEqn's first fvMatrix (fvMatrix.C:396; SpalartAllmarasBase.C:466;
+// its DES, DDES and IDDES variants override dTilda only). See tests/pimple_tjunction_sa_vs_openfoam.sh for the measurement.
+// RNGkEpsilon, realizableKE and kOmegaSSTLM keep the momentum assembly's switch, unmeasured with this one.
 bool switchesAtTurbulenceCorrection(const DeviceSimpleControls& c)
 {
-    return c.turbulent && !c.les && (c.modelName == "kEpsilon" || (c.sst && !c.lm));
+    return c.turbulent && !c.les && (c.modelName == "kEpsilon" || (c.sst && !c.lm) || c.sa);
 }
 
 // The Cmu of the mixing-length inlets. turbulentMixingLengthFrequencyInlet takes turbModel.coeffDict().getOrDefault("Cmu",
@@ -1299,8 +1301,11 @@ SimplecSnGrad simplecSnGrad(
         DeviceBuffer<scalar> epsStored;
         if (storedGrad)
         {
-            deviceBCValue(dbK_, dk_, kStored);
-            deviceBCValue(dbEps_, de_, epsStored);
+            deviceBCValue(dbK_, dk_, kStored);   // SpalartAllmaras: the k slot holds nuTilda, and there is no second field
+            if (!ctl_.sa)
+            {
+                deviceBCValue(dbEps_, de_, epsStored);
+            }
         }
         if (switchHere) deviceUpdateInletOutlet(dbEps_, phiBnd_);
         if (patchValues)
@@ -1390,7 +1395,8 @@ SimplecSnGrad simplecSnGrad(
                                              saGradLimit(ctl_.gradKLULimitK),   // linearUpwind's named grad(nuTilda): ran unlimited
                                              saGradLimit(ctl_.gradKLimitK),     // gradSchemes grad(nuTilda), the non-orth correction's
                                              releaseGradUMemo,
-                                             lapLimit(ctl_, "closure"));   // `limited corrected <psi>` on nuTilda
+                                             lapLimit(ctl_, "closure"),   // `limited corrected <psi>` on nuTilda
+                                             storedGrad ? &kStored : nullptr);   // nuTilda's stored patch values (above)
             else if (ctl_.sst)   // de_ slot holds omega; relaxEps/limitedEps/twoBykEps carry the omega-equation settings
             {
                 deviceKOmegaSSTCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
@@ -1891,7 +1897,8 @@ SimplecSnGrad simplecSnGrad(
         if (compressible_ && dbHe_.n) deviceUpdateInletOutlet(dbHe_, phiBnd_);
         // NOTE: the turbulent-inlet refresh does NOT belong here. It moved into correctTurbulence(),
         // which is where OF updates it -- see the comment there.
-        // pimpleStep switches kEpsilon's and the kOmegaSST family's k and epsilon|omega at the turbulence correction
+        // pimpleStep switches kEpsilon's, the kOmegaSST family's and the SpalartAllmaras family's k and epsilon|omega
+        // (nuTilda) at the turbulence correction
         // instead (correctTurbulence)
         static const bool turbSwitchAtMomentum = std::getenv("BRAE_CONTROL_TURB_SWITCH_AT_MOMENTUM") != nullptr;
         if (ctl_.turbulent && !ctl_.les)   // pure LES has no k/epsilon/omega boundaries (algebraic nut)
@@ -5081,7 +5088,8 @@ SimplecSnGrad simplecSnGrad(
         // by then the fields are aged and only the geometry is being re-converged.
         if (moveMesh) moveMesh(0);
         advanceTime(deltaT);                                  // store oldTime() + set deltaT/deltaT0 for ddtCoeffs()
-        // kEpsilon's and the kOmegaSST family's k and epsilon|omega switch at the turbulence correction on this path
+        // kEpsilon's, the kOmegaSST family's and the SpalartAllmaras family's k and epsilon|omega (nuTilda) switch at the
+        // turbulence correction on this path
         // (correctTurbulence), so the first step's earlier readers -- the 'calculated' nut patches in the momentum assembly's nuEff,
         // and the stored values the limiter's gradients take -- meet an inletOutlet face before any switch.
         // OpenFOAM's stored patch value is the file's `value` there; brae's construction state is
