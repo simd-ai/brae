@@ -591,7 +591,10 @@ void deviceUpdateMixedFreestream(
     const scalar* pub1 = stored ? UbY->data() : ub1.data();
     const scalar* pub2 = stored ? UbZ->data() : ub2.data();
     if (n == 0) return;   // a rank with no physical boundary face (deviceBCValue)
-    mixedUpdateKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].mixedMask.data(), dbP.mixedMask.data(), dbP.faceCell.data(),
+    // only the freestream family's faces: a plain mixed keeps the valueFraction its dictionary gave (DeviceBoundary::freestreamMask)
+    if (dbU.comp[0].freestreamMask.size() != static_cast<std::size_t>(n) || dbP.freestreamMask.size() != static_cast<std::size_t>(n))
+        throw std::runtime_error("brae: deviceUpdateMixedFreestream was handed a boundary built without its freestream mask");
+    mixedUpdateKernel<<<nBlocks(n), TPB>>>(n, dbU.comp[0].freestreamMask.data(), dbP.freestreamMask.data(), dbP.faceCell.data(),
                                            phiBnd.data(), dbP.magSf.data(),
                                            (rhoBnd && rhoBnd->size() == static_cast<std::size_t>(n)) ? rhoBnd->data() : nullptr,
                                            Ux.data(), Uy.data(), Uz.data(),

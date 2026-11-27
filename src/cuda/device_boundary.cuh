@@ -73,7 +73,13 @@ struct DeviceBoundary
     // preconditioner. Never the default.
     DeviceBuffer<scalar> ioStored;
     DeviceBuffer<label>  ioFresh;
-    DeviceBuffer<label>  mixedMask;         // 1 if the face is mixed/Robin (freestreamVelocity/Pressure): vf recomputed
+    DeviceBuffer<label>  mixedMask;         // 1 if the face is mixed/Robin (freestreamVelocity/Pressure, plain mixed)
+    // 1 if the face's valueFraction is the freestream family's, recomputed each step (deviceUpdateMixedFreestream). A
+    // plain `mixed` is in mixedMask (non-assignable, its coefficients a Robin blend) but NOT here: OpenFOAM keeps the
+    // valueFraction its dictionary gave. With one mask for both, a plain mixed U or p ran as freestreamVelocity or
+    // freestreamPressure, its valueFraction replaced every step: airFoil2D under simpleFoam with U a plain mixed at the
+    // start's freestream valueFraction, 2.6e-05 at the first iteration and 2.3e-03 by the third (Arrhenius 5855534)
+    DeviceBuffer<label>  freestreamMask;
     DeviceBuffer<label>  piovMask;          // 1 if the face is pressureInletOutletVelocity (bcType+refValue recomputed)
     DeviceBuffer<label>  symMask;            // 1 if the face is slip/symmetry (per-comp vf=|n_k|, ref recomputed each step)
     // wedge (axisymmetric constraint): 1 on a wedge face, with that patch's HALF-angle rotation packed
@@ -107,6 +113,14 @@ struct DeviceBoundary
     DeviceBuffer<label>  faceCell;
 };
 
+// CONTROL BRAE_CONTROL_MIXED_VF_FREESTREAM=1: every mixed face in freestreamMask, as before -- a plain mixed U or p takes
+// the freestream family's valueFraction every step
+inline bool controlMixedValueFractionFreestream()
+{
+    static const bool on = std::getenv("BRAE_CONTROL_MIXED_VF_FREESTREAM") != nullptr;
+    return on;
+}
+
 inline DeviceBoundary buildDeviceBoundary(
     const GeometricField<scalar>& f,
     const std::vector<FvPatch>& fvp,
@@ -115,7 +129,7 @@ inline DeviceBoundary buildDeviceBoundary(
     // the closure fields only -- see DeviceBoundary::ioStored for the two measurements that bound it.
     bool storedIoSeed = false)
 {
-    std::vector<label> ty, fc, io, oio, mx, pv, sm, tp, sg, asg, iofr, wfm;
+    std::vector<label> ty, fc, io, oio, mx, fsm, pv, sm, tp, sg, asg, iofr, wfm;
     std::vector<scalar> ref, dc, ms, vf, p0, rg, iost;   // rg = fixedGradient normal gradient (0 elsewhere)
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
@@ -159,6 +173,7 @@ inline DeviceBoundary buildDeviceBoundary(
             io.push_back(cat == 3 ? 1 : 0);
             oio.push_back(cat == 4 ? 1 : 0);
             mx.push_back(cat == 5 ? 1 : 0);
+            fsm.push_back((cat == 5 && (controlMixedValueFractionFreestream() || f.boundary[pi]->freestreamValueFraction())) ? 1 : 0);
             pv.push_back(0);
             sm.push_back(0);
             tp.push_back(cat == 7 ? 1 : 0);
@@ -182,6 +197,7 @@ inline DeviceBoundary buildDeviceBoundary(
     db.ioStored.copyFrom(iost);
     db.ioFresh.copyFrom(iofr);
     db.mixedMask.copyFrom(mx);
+    db.freestreamMask.copyFrom(fsm);
     db.piovMask.copyFrom(pv);
     db.symMask.copyFrom(sm);
     db.tpMask.copyFrom(tp);
@@ -443,7 +459,7 @@ void deviceUpdateTotalPressure(DeviceBoundary& db, const DeviceBuffer<scalar>& p
 // that move (refreshDeviceVectorBoundaryState) from the same arithmetic.
 struct DeviceVectorBoundaryHost
 {
-    std::vector<label> ty[3], fc, io, oio, mx, pv, sm, wdg, iofr, gsm;
+    std::vector<label> ty[3], fc, io, oio, mx, fsm, pv, sm, wdg, iofr, gsm;
     std::vector<scalar> dc, ms, ref[3], vf[3], nrm[3], rg[3], wdgT, iost[3], gsn;   // rg = fixedGradient, per component
     // pressureInletOutletVelocity's refValue per face (DeviceVectorBoundary::piovRef)
     std::vector<scalar> prv[3];
@@ -474,6 +490,7 @@ inline DeviceVectorBoundaryHost deviceVectorBoundaryArrays(
     std::vector<label>& io = h.io;
     std::vector<label>& oio = h.oio;
     std::vector<label>& mx = h.mx;
+    std::vector<label>& fsm = h.fsm;
     std::vector<label>& pv = h.pv;
     std::vector<label>& sm = h.sm;
     std::vector<label>& wdg = h.wdg;
@@ -576,6 +593,8 @@ inline DeviceVectorBoundaryHost deviceVectorBoundaryArrays(
                 io.insert(io.end(), np, 0);
                 oio.insert(oio.end(), np, catEarly == 4 ? 1 : 0);
                 mx.insert(mx.end(), np, catEarly == 5 ? 1 : 0);
+                fsm.insert(fsm.end(), np,
+                           (catEarly == 5 && (controlMixedValueFractionFreestream() || f.boundary[pi]->freestreamValueFraction())) ? 1 : 0);
                 pv.insert(pv.end(), np, catEarly == 6 ? 1 : 0);
                 sm.insert(sm.end(), np, 0);
                 wdg.insert(wdg.end(), np, 0);
@@ -694,6 +713,8 @@ inline DeviceVectorBoundaryHost deviceVectorBoundaryArrays(
             if (!stateOnly)
             {
                 mx.push_back((cat == 5 && !wedge) ? 1 : 0);
+                fsm.push_back((cat == 5 && !wedge
+                               && (controlMixedValueFractionFreestream() || f.boundary[pi]->freestreamValueFraction())) ? 1 : 0);
                 pv.push_back(cat == 6 ? 1 : 0);
                 sm.push_back(sym ? 1 : 0);   // mixed / piov / symmetry masks
             }
@@ -772,6 +793,7 @@ inline DeviceVectorBoundary uploadDeviceVectorBoundary(const DeviceVectorBoundar
     const std::vector<label>& io = h.io;
     const std::vector<label>& oio = h.oio;
     const std::vector<label>& mx = h.mx;
+    const std::vector<label>& fsm = h.fsm;
     const std::vector<label>& pv = h.pv;
     const std::vector<label>& sm = h.sm;
     const std::vector<label>& wdg = h.wdg;
@@ -811,6 +833,7 @@ inline DeviceVectorBoundary uploadDeviceVectorBoundary(const DeviceVectorBoundar
         db.comp[k].ioStored.copyFrom(iost[k]);
         db.comp[k].ioFresh.copyFrom(iofr);
         db.comp[k].mixedMask.copyFrom(mx);
+        db.comp[k].freestreamMask.copyFrom(fsm);
         db.comp[k].piovMask.copyFrom(pv);
         db.comp[k].symMask.copyFrom(sm);
         db.comp[k].wedgeMask.copyFrom(wdg);
