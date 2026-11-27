@@ -20,6 +20,9 @@
 #   AP  pimpleFoam from the same fields (moved to time 0, phi dropped so that both codes start from flux(U)), Euler,
 #       deltaT 1e-5, 3 steps, nOuterCorrectors 2, nCorrectors 2, no relaxation
 #   AN  AP with the start's nuTilda cells at exactly 0 set to -1e-8: solved from as read
+#   AW  the continuations from brae's writes (AS's 52, AP's 2e-05): the freestream patches' key, OpenFOAM and brae continued
+#       from them against OpenFOAM continued from its own (see the AW block for why that is the oracle)
+#   AR  AS with p's inlet freestreamPressure given `inletValue` in place of `freestreamValue`: both codes refuse it
 # CHECKS, each entry (the internal field and every patch's written value) on its own scale (tests/pimple_entry_compare.py),
 # at the three written times; phi on its own line:
 #   AS      p U nuTilda nut and phi within BOUND_SIMPLE
@@ -33,6 +36,8 @@
 #   BRAE_CONTROL_SA_CTOR_BOUND=1             AP and AN: bound(nuTilda, 0) at construction, which lifts the start's zero
 #                                            cells (and AN's negative ones) to their neighbours' average
 #   BRAE_CONTROL_SA_BOUND_CAP_HELD=1         AP: an outflow face held at the bound's floor until the next evaluate
+#   BRAE_CONTROL_INLET_SLOT_KEY_INLETVALUE=1 AW: the freestream patches written under `inletValue`, as before; OpenFOAM must
+#                                            refuse to continue from it
 # MEASURED (Arrhenius, one GH200, OpenFOAM v2412 serial, 2026-11-27):
 #   before (develop's tree with the nut change, 0089de39; jobs 5845485, 5846077): AP nuTilda 5.8e-04 in a cell OpenFOAM keeps at
 #     2.3e-09 (the start's zero cells lifted at construction), nuTilda on the outlet 8.8e-05 (a face held at the bound's floor);
@@ -40,6 +45,10 @@
 #   after (job 5846974, on 0ada6b26): AS 4.5e-10 (nuTilda), phi 1.2e-12; AP and AN nuTilda 8.5e-13, nut 3.1e-10, U 3.0e-09,
 #     phi 4.1e-09 (p 2.3e-06, above). So BOUND_SIMPLE 5e-9 and BOUND 5e-8, a decade above. Controls: 1.2e-01, 5.8e-04,
 #     1.9e-04, 8.8e-05. OpenFOAM's PCG against its GAMG on AP: 9.6e-11. About 20 s.
+#   AW/AR on develop 8f73f26e (job 5853257): every freestream patch of p U nuTilda nut written under `inletValue`, OpenFOAM
+#     refused to continue ("Required entry 'freestreamValue' missing"), brae ran the misnamed case. With the change: the key
+#     right, OpenFOAM continued from brae's write 3.0e-10 (simpleFoam, 53) and 4.0e-09 (pimpleFoam) from OpenFOAM continued
+#     from its own, brae continued from its own 4.5e-10 and 3.0e-09 (5853995); brae refuses AR by name; the key control red.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
@@ -258,6 +267,124 @@ else
     say "AN: brae ran ($(grep -a -m1 -i -E 'refus|error|unsupported' "$W/AN-br/log" | cut -c1-120))" FAIL
 fi
 
+# AW: OpenFOAM starts from brae's own writes. freestream, freestreamPressure and freestreamVelocity write their reference value
+# under `freestreamValue` (freestreamFvPatchField.C:202, freestreamPressureFvPatchScalarField.C:129,
+# freestreamVelocityFvPatchVectorField.C:115) and their dictionary constructors require it. The oracle for a continuation is
+# OpenFOAM continued from ITS OWN write, not its continuous run: its start-up turbulence->validate() -> correctNut() evaluates
+# nutUSpaldingWallFunction once more from the file's wall nut (tolerance 0.01, maxIter 10), which the continuous run does not,
+# so OpenFOAM restarted is 3.5e-03 from OpenFOAM continuous on nut's walls at 53 (pimpleFoam 4.5e-06; Arrhenius 5853995).
+# Held: every freestream patch of brae's writes carries that key alone; OpenFOAM continued from brae's write against OpenFOAM
+# continued from its own (the write's content), and brae continued from its own write against the same (brae's start-up):
+# simpleFoam from 52 to 53 at BOUND_SIMPLE, pimpleFoam from 2e-05 to 3e-05 on U nuTilda nut and phi at BOUND (p printed, as
+# AP's). AR: a freestreamPressure given `inletValue`, the key of another type -- OpenFOAM refuses it ("Required entry
+# 'freestreamValue' missing"), and so must brae, by name, rather than read it as freestreamValue
+fskeys()   # <time dir>: "ok" when each freestream-family patch of p U nuTilda nut (8 of them) carries freestreamValue alone
+{
+    python3 - "$1" <<'EOF'
+import os, re, sys
+d = sys.argv[1]
+out, bad = 0, []
+for f in ('p', 'U', 'nuTilda', 'nut'):
+    s = open(os.path.join(d, f)).read()
+    s = s[s.index('boundaryField'):]
+    for m in re.finditer(r'\n\s*(\w+)\s*\n\s*\{([^{}]*)\}', s):
+        b = m.group(2)
+        if re.search(r'type\s+freestream\w*\s*;', b):
+            out += 1
+            k = [x for x in ('freestreamValue', 'inletValue', 'outletValue') if re.search(r'\b%s\b' % x, b)]
+            if k != ['freestreamValue']:
+                bad.append('%s:%s=%s' % (f, m.group(1), '+'.join(k) or 'none'))
+print('ok' if out == 8 and not bad else 'patches %d, wrong: %s' % (out, ' '.join(bad)))
+EOF
+}
+awcont()   # <application> <run> <time> <tag>: continued from that run's write; "ok" or "refused <why>"
+{
+    local d="$W/AW-$4"
+    rm -rf "$d"
+    mkdir -p "$d"
+    cp -r "$2/constant" "$2/system" "$2/$3" "$d/"
+    ctl "$d" startFrom latestTime
+    case $1 in
+        brae) ( cd "$d" && BRAE_SIMPLE_CASE_SOLVER=1 "$BRAE" -case . > log 2>&1 ) ;;
+        braePimple) ( cd "$d" && "$PIMPLE" -case . > log 2>&1 ) ;;
+        *) ofrun "$d" "$1" ;;
+    esac
+    if [ $? = 0 ]; then
+        echo ok
+    else
+        echo "refused $(grep -a -m1 -E 'Required entry|brae:' "$d/log" | tr -s ' ' | cut -c1-100)"
+    fi
+}
+awheld()   # <label> <oracle dir> <dir> <time> <bound> <fields>
+{
+    local m mp
+    m=$(python3 "$CMP" "$2" "$3" "$4" $6 | awk '/^MAX/{print $2, $3, $4, $5}')
+    mp=$(python3 "$CMP" "$2" "$3" "$4" phi | awk '/^MAX/{print $2}')
+    python3 -c "import sys; sys.exit(0 if max(float('${m%% *}'), float('$mp')) <= float('$5') else 1)" 2> /dev/null \
+        && say "AW: $1 within $5 (worst $m; phi $mp)" PASS \
+        || say "AW: $1 within $5 (worst $m; phi $mp)" FAIL
+}
+if [ -d "$W/AS-br/52" ]; then
+    k=$(fskeys "$W/AS-br/51")
+    [ "$k" = ok ] && say "AW: brae's simpleFoam write (51) puts every freestream patch's value under freestreamValue" PASS \
+        || say "AW: brae's simpleFoam write (51) puts every freestream patch's value under freestreamValue ($k)" FAIL
+    o=$(awcont simpleFoam "$W/AS-of" 52 SO)
+    r=$(awcont simpleFoam "$W/AS-br" 52 S)
+    b=$(awcont brae "$W/AS-br" 52 SB)
+    if [ "$o" != ok ]; then
+        say "AW: OpenFOAM simpleFoam continued from its own 52 ($o)" FAIL
+    else
+        [ "$r" = ok ] && awheld "OpenFOAM simpleFoam continued from brae's 52 against from its own, at 53" "$W/AW-SO" "$W/AW-S" 53 "$BOUND_SIMPLE" "$FIELDS" \
+            || say "AW: OpenFOAM simpleFoam continued from brae's 52 ($r)" FAIL
+        [ "$b" = ok ] && awheld "brae continued from its own 52 against OpenFOAM from its own, at 53" "$W/AW-SO" "$W/AW-SB" 53 "$BOUND_SIMPLE" "$FIELDS" \
+            || say "AW: brae continued from its own 52 ($b)" FAIL
+    fi
+fi
+if [ -d "$W/AP-br/2e-05" ]; then
+    k=$(fskeys "$W/AP-br/1e-05")
+    [ "$k" = ok ] && say "AW: brae's pimpleFoam write (1e-05) puts every freestream patch's value under freestreamValue" PASS \
+        || say "AW: brae's pimpleFoam write (1e-05) puts every freestream patch's value under freestreamValue ($k)" FAIL
+    o=$(awcont pimpleFoam "$W/AP-of" 2e-05 PO)
+    r=$(awcont pimpleFoam "$W/AP-br" 2e-05 P)
+    b=$(awcont braePimple "$W/AP-br" 2e-05 PB)
+    if [ "$o" != ok ]; then
+        say "AW: OpenFOAM pimpleFoam continued from its own 2e-05 ($o)" FAIL
+    else
+        [ "$r" = ok ] && awheld "OpenFOAM pimpleFoam continued from brae's 2e-05 against from its own, U nuTilda nut at 3e-05" "$W/AW-PO" "$W/AW-P" 3e-05 "$BOUND" "U nuTilda nut" \
+            || say "AW: OpenFOAM pimpleFoam continued from brae's 2e-05 ($r)" FAIL
+        [ "$b" = ok ] && awheld "brae pimpleFoam continued from its own 2e-05 against OpenFOAM from its own, U nuTilda nut at 3e-05" "$W/AW-PO" "$W/AW-PB" 3e-05 "$BOUND" "U nuTilda nut" \
+            || say "AW: brae pimpleFoam continued from its own 2e-05 ($b)" FAIL
+        [ "$b" = ok ] && say "AW: p of brae's continuation there, not held (as AP's): $(python3 "$CMP" "$W/AW-PO" "$W/AW-PB" 3e-05 p | awk '/^MAX/{print $2, $3, $5}')" INFO
+    fi
+fi
+rm -rf "$W/AR" "$W/AR-of" "$W/AR-br"
+cp -r "$W/AS" "$W/AR"
+python3 - "$W/AR/50/p" <<'EOF'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+i = s.index('boundaryField')
+s2, n = re.subn(r'freestreamValue(\s)', r'inletValue     \1', s[i:], count=1)
+assert n == 1
+open(p, 'w').write(s[:i] + s2)
+EOF
+cp -r "$W/AR" "$W/AR-of"
+cp -r "$W/AR" "$W/AR-br"
+if ofrun "$W/AR-of" simpleFoam; then
+    say "AR premise: OpenFOAM refuses a freestreamPressure without freestreamValue (it ran)" FAIL
+else
+    grep -a -q "Required entry 'freestreamValue'" "$W/AR-of/log" \
+        && say "AR premise: OpenFOAM refuses a freestreamPressure without freestreamValue" PASS \
+        || say "AR premise: OpenFOAM refuses a freestreamPressure without freestreamValue ($(grep -a -m1 FATAL "$W/AR-of/log"))" FAIL
+fi
+if ( cd "$W/AR-br" && BRAE_SIMPLE_CASE_SOLVER=1 "$BRAE" -case . > log 2>&1 ); then
+    say "AR: brae refuses a freestreamPressure given inletValue (it ran)" FAIL
+else
+    grep -a -q "reads from \`freestreamValue\`, but it gives \`inletValue\`" "$W/AR-br/log" \
+        && say "AR: brae refuses a freestreamPressure given inletValue, by name" PASS \
+        || say "AR: brae refuses a freestreamPressure given inletValue ($(grep -a -m1 -i 'brae:' "$W/AR-br/log" | cut -c1-110))" FAIL
+fi
+
 # The control must make ITS entry exceed the bound (`report` uses 1e-6 here). AP starts from OpenFOAM's write, whose
 # freestream faces hold iteration 50's cells, which three steps of 1e-5 barely move: the control is held on AS
 CB=$BOUND
@@ -288,5 +415,17 @@ ctlp()   # <env> <arm> <time> <field> <entry>: a pimpleFoam arm rerun by brae un
 ctlp BRAE_CONTROL_SA_CTOR_BOUND=1 AP 1e-05 nuTilda internal
 ctlp BRAE_CONTROL_SA_CTOR_BOUND=1 AN 1e-05 nuTilda internal
 ctlp BRAE_CONTROL_SA_BOUND_CAP_HELD=1 AP 1e-05 nuTilda outlet
+# The key control: brae writes the freestream patches' value as `inletValue`, and OpenFOAM must refuse to start from it
+if [ -d "$W/AS-of" ]; then
+    rm -rf "$W/AS-keyctl"
+    cp -r "$W/AS" "$W/AS-keyctl"
+    ( cd "$W/AS-keyctl" && BRAE_SIMPLE_CASE_SOLVER=1 BRAE_CONTROL_INLET_SLOT_KEY_INLETVALUE=1 "$BRAE" -case . > log 2>&1 ) \
+        || say "control BRAE_CONTROL_INLET_SLOT_KEY_INLETVALUE=1: brae ran on AS" FAIL
+    r=$(awcont simpleFoam "$W/AS-keyctl" 52 keyctl)
+    case "$r" in
+        refused\ *) say "control BRAE_CONTROL_INLET_SLOT_KEY_INLETVALUE=1: OpenFOAM refuses brae's write (${r#refused })" PASS ;;
+        *) say "control BRAE_CONTROL_INLET_SLOT_KEY_INLETVALUE=1: OpenFOAM refuses brae's write ($r)" FAIL ;;
+    esac
+fi
 [ $fail = 0 ] && echo "PASS" || echo "FAIL"
 exit $fail
