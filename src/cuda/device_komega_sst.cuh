@@ -130,6 +130,13 @@ void deviceKOmegaSSTDESfactor(int nC, const DeviceBuffer<scalar>& k, const Devic
     const DeviceBuffer<scalar>& V, const DeviceBuffer<scalar>& F1, const DeviceBuffer<scalar>& F2,
     const KOmegaSSTCoeffs& co, DeviceBuffer<scalar>& FDES,
                               const DeviceBuffer<scalar>* lesDelta = nullptr);
+// kOmegaSSTDES / kOmegaSSTDDES as OpenFOAM v2412: FDES = lRAS/dTilda, dTilda = min(lLES, lRAS) (DES) or
+// max(lRAS - fd max(lRAS - lLES, 0), SMALL) with fd = 1 - tanh((Cd1 r)^Cd2) (DDES, co.desShielded); lLES = CDES delta with CDES
+// blended from CDESkom and CDESkeps on F1. omega the solved one. lesDelta: `delta maxDeltaxyz`; nullptr keeps cubeRootVol.
+void deviceKOmegaSSTDESdTildaFactor(int nC, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega,
+    const DeviceBuffer<scalar>& V, const DeviceBuffer<scalar>& F1, const DeviceBuffer<scalar>& gradU,
+    const DeviceBuffer<scalar>& nut, const DeviceBuffer<scalar>& y, scalar nu, const KOmegaSSTCoeffs& co,
+    DeviceBuffer<scalar>& FDES, const DeviceBuffer<scalar>* lesDelta = nullptr);
 // kOmegaSST-IDDES factor FDES = lRAS/lIDDES (Gritskevich et al. 2012): the improved (WMLES) length scale. (Unit-test/DES hook.)
 void deviceKOmegaSSTIDDESfactor(int nC, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega,
     const DeviceBuffer<scalar>& F1, const DeviceBuffer<scalar>& gradU, const DeviceBuffer<scalar>& nut,

@@ -164,7 +164,8 @@ void saDdesDTildaKernel(
     // fd comes in ready-made on the ZDES2020 path (saZdesFdKernel); otherwise it is the standard
     // shielding, with OF's dictionary-exposed Cd1/Cd2 rather than the literals 8 and 3.
     const scalar t8 = co.Cd1 * rd;
-    const scalar fd = fdIn ? fdIn[c] : (scalar(1) - tanh(pow(t8, co.Cd2)));
+    // SpalartAllmarasDES has no delay function (SpalartAllmarasDES.C:120-132): fd = 1 gives its min(lLES, y)
+    const scalar fd = co.plainDES ? scalar(1) : (fdIn ? fdIn[c] : (scalar(1) - tanh(pow(t8, co.Cd2))));
     const scalar lLES = saPsi(chi, co) * co.CDES * delta;              // low-Re-corrected LES length scale
     dTilda[c] = y[c] - fd * fmax(scalar(0), y[c] - lLES);
 }

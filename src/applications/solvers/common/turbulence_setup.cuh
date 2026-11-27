@@ -458,6 +458,11 @@ inline void readTurbulenceModel(
                     // refusal keyed on it was never reached.
                     const FoamDict* sc = les->optionalSubDict(model + "Coeffs");
                     ctl.saCoeffs.CDES = sc->scalarOr("CDES", ctl.saCoeffs.CDES);
+                    // SpalartAllmarasDES has no delay function: dTilda = min(psi CDES delta, y) (SpalartAllmarasDES.C:120-132).
+                    // It ran DDES's shielded dTilda under its own name. See tests/pimple_des_step_vs_openfoam.sh. CONTROL
+                    // BRAE_CONTROL_DES_AS_DDES=1: DDES's, as before.
+                    static const bool saDesAsDdes = std::getenv("BRAE_CONTROL_DES_AS_DDES") != nullptr;
+                    ctl.saCoeffs.plainDES = (model == "SpalartAllmarasDES") && !saDesAsDdes;
                     // fwStar is SpalartAllmarasDES's (SpalartAllmarasDES.C:220-228) and feeds psi, which every
                     // model of the family multiplies its LES length by
                     ctl.saCoeffs.fwStar = sc->scalarOr("fwStar", ctl.saCoeffs.fwStar);
@@ -568,6 +573,45 @@ inline void readTurbulenceModel(
                     readKOmegaSSTCoeffs(les, ctl.ksstCoeffs, desCoeffsRasName ? std::string("kOmegaSSTCoeffs") : model + "Coeffs");
                     if (dc) { ctl.ksstCoeffs.CDES1 = dc->scalarOr("CDES1", ctl.ksstCoeffs.CDES1);
                               ctl.ksstCoeffs.CDES2 = dc->scalarOr("CDES2", ctl.ksstCoeffs.CDES2); }
+                    // useSigma rebuilds S2 and GbyNu0 from the sigma invariant and moves DDES's Cd1 to 22 (kOmegaSSTDES.C:193-200,
+                    // kOmegaSSTDDES.C:57-86, 163-176): not carried, so refused rather than run without it
+                    const FoamDict* sdc = les->optionalSubDict(model + "Coeffs");
+                    if (sdc->switchOr("useSigma", false))
+                        throw std::runtime_error("brae: " + model + " with `useSigma true` is not ported (the sigma invariant "
+                                                 "in S2 and GbyNu0, kOmegaSSTDDES.C:57-86); refusing rather than running "
+                                                 "without it");
+                    if (!sstIddes)
+                    {
+                        // kOmegaSSTDES and kOmegaSSTDDES as OpenFOAM v2412 reads them, from LES.optionalSubDict(type() + "Coeffs")
+                        // (LESModel.C:72): CDESkom 0.82 and CDESkeps 0.60 (kOmegaSSTDES.C:211-225), the model's kappa 0.41
+                        // (:202-206), DDES's Cd1 20 and Cd2 3 (kOmegaSSTDDES.C:163-187); plain DES has no delay function. This
+                        // reader took CDES1 and CDES2 at 0.78 and 0.61, keys OpenFOAM never reads, and handed the model's kappa
+                        // (and an E it never reads) to the omega wall function, which in OpenFOAM takes the wall patch's own
+                        // (omegaWallFunctionFvPatchScalarField.C:191-193): that is the patch default here, a patch's own
+                        // non-default value being announced and not honoured. See tests/pimple_des_step_vs_openfoam.sh.
+                        // CONTROL BRAE_CONTROL_SST_DES_OLD_COEFFS=1: CDES1/CDES2 at 0.78/0.61 and the dictionary's kappa and E
+                        // on the walls, as before. CONTROL BRAE_CONTROL_DES_AS_DDES=1: plain DES with DDES's delay function.
+                        static const bool oldCoeffs = std::getenv("BRAE_CONTROL_SST_DES_OLD_COEFFS") != nullptr;
+                        static const bool desAsDdes = std::getenv("BRAE_CONTROL_DES_AS_DDES") != nullptr;
+                        KOmegaSSTCoeffs& c = ctl.ksstCoeffs;
+                        const KOmegaSSTCoeffs def;
+                        c.desKappa = c.kappa;   // readKOmegaSSTCoeffs above read the model dictionary's kappa
+                        c.Cd1 = sdc->scalarOr("Cd1", def.Cd1);
+                        c.Cd2 = sdc->scalarOr("Cd2", def.Cd2);
+                        c.desShielded = (model == "kOmegaSSTDDES") || desAsDdes;
+                        if (oldCoeffs)
+                        {
+                            c.CDESkom = c.CDES1;
+                            c.CDESkeps = c.CDES2;
+                        }
+                        else
+                        {
+                            c.CDESkom = sdc->scalarOr("CDESkom", def.CDESkom);
+                            c.CDESkeps = sdc->scalarOr("CDESkeps", def.CDESkeps);
+                            c.kappa = def.kappa;
+                            c.E = def.E;
+                        }
+                    }
                     if (sstIddes && dc)   // IDDES blending-constant overrides (defaults = Gritskevich et al. 2012)
                     {
                         ctl.ksstCoeffs.Cdt1 = dc->scalarOr("Cdt1", ctl.ksstCoeffs.Cdt1);
@@ -579,8 +623,13 @@ inline void readTurbulenceModel(
                         std::printf("  %s (kOmegaSST-IDDES, delta=IDDESDelta [maxDeltaxyz+hwn]): CDES1=%.4g CDES2=%.4g Cdt1=%.4g Cl=%.4g Ct=%.4g Cw=%.4g betaStar=%.4g\n",
                                     model.c_str(), ctl.ksstCoeffs.CDES1, ctl.ksstCoeffs.CDES2, ctl.ksstCoeffs.Cdt1, ctl.ksstCoeffs.Cl, ctl.ksstCoeffs.Ct, ctl.ksstCoeffs.Cw, ctl.ksstCoeffs.betaStar);
                     else
-                        std::printf("  %s (kOmegaSST-DES, delta=%s): CDES1=%.4g CDES2=%.4g betaStar=%.4g a1=%.4g\n",
-                                    model.c_str(), ctl.lesDeltaMax ? "maxDeltaxyz" : "cubeRootVol", ctl.ksstCoeffs.CDES1, ctl.ksstCoeffs.CDES2, ctl.ksstCoeffs.betaStar, ctl.ksstCoeffs.a1);
+                        std::printf("  %s (kOmegaSST-%s, delta=%s): CDESkom=%.4g CDESkeps=%.4g kappa=%.4g%s betaStar=%.4g a1=%.4g\n",
+                                    model.c_str(), ctl.ksstCoeffs.desShielded ? "DDES" : "DES",
+                                    ctl.lesDeltaMax ? "maxDeltaxyz" : "cubeRootVol", ctl.ksstCoeffs.CDESkom, ctl.ksstCoeffs.CDESkeps,
+                                    ctl.ksstCoeffs.desKappa,
+                                    ctl.ksstCoeffs.desShielded ? (" Cd1=" + std::to_string(ctl.ksstCoeffs.Cd1) + " Cd2="
+                                                                  + std::to_string(ctl.ksstCoeffs.Cd2)).c_str() : "",
+                                    ctl.ksstCoeffs.betaStar, ctl.ksstCoeffs.a1);
                 }
                 // The DES arms reuse the kOmegaSST/SA transport and bound with it, and their floors
                 // come from LES{} rather than RAS{} (LESModel.C:82-111). This return is why a RAS-only
