@@ -128,6 +128,8 @@ public:
     // step() asks, which drops the memo after turbulence anyway. pimpleStep and rhoSimpleStep keep it.
     void correctTurbulence(bool releaseGradUMemo = false);
     void boundaryNuEff(const DeviceBuffer<scalar>& nuEff, DeviceBuffer<scalar>& nuEffBnd);
+    void nonWallNutPatches(DeviceBuffer<scalar>& nutBnd, bool calculatedDone);
+    void sstCalculatedNut(DeviceBuffer<scalar>& nutBnd);
     void refreshNutBoundary();
     // totalPressure's updateCoeffs: p0(t), then p_b = p0 - 0.5 neg(phi_b)|U_b|^2 from U's patch values and
     // the flux as they stand at the call. See pimpleStep for where each driver calls it.
@@ -865,6 +867,12 @@ private:
     bool hasNutFixed_ = false;
     DeviceBuffer<label> nutCalcSel_;   // complement of nutCalcMask_ (0 on calc faces), for deviceSelectFixedFlux
     DeviceBuffer<label> nutFixedMask_;   // 0 where nut's BC fixes a value on a non-wall patch
+    // nut's own condition on every boundary face of a patch that is not a wall (NutPatchKind, NutPatchUntouched on a wall's
+    // faces), and the value that condition holds there (the fixedValue's value, the inletOutlet's inletValue, the
+    // freestream's freestreamValue): what correctNut's nut_.correctBoundaryConditions() evaluates (nonWallNutPatches).
+    // Empty without a nut field
+    DeviceBuffer<label> nutPatchKind_;
+    DeviceBuffer<scalar> nutPatchRef_;
     DeviceBuffer<scalar> bndY_, nuBndConst_;                    // nearWallDist y per boundary face; nu over bnd faces
     // Compressible only: per-boundary-face rho and laminar mu, refreshed each outer iteration from the
     // boundary p/he. OF gets these from rho.boundaryField()[patchi] and transport_.mu(patchi); they feed

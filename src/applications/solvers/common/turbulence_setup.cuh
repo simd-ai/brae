@@ -812,6 +812,28 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
                             " in constant/polyMesh/boundary.");
             }
         };
+        // nut on a patch that is not a wall takes what correctNut's nut_.correctBoundaryConditions() evaluates there, by that
+        // patch's own type (DeviceSimpleSolver::nonWallNutPatches: calculated, fixedValue, the cell's value, the inletOutlet
+        // family's switch). Any other type is refused by name: under a velocity-based wall function every non-wall face kept
+        // the value the file gave it, which no type but fixedValue does in OpenFOAM
+        auto guardNonWallNut = [&](const FieldData<scalar>& fd) {
+            auto carried = [](const std::string& t) {
+                return t == "calculated" || t == "fixedValue" || t == "zeroGradient" || t == "slip" || t == "symmetry"
+                    || t == "symmetryPlane" || t == "wedge" || t == "empty" || t == "inletOutlet" || t == "freestream"
+                    || t == "outletInlet";
+            };
+            for (const auto& q : fvp)
+            {
+                if (q.type == "wall" || isCoupledInterfaceType(q.type)) continue;
+                const auto* e = findPatchEntry(fd.boundary, q);
+                if (e && !carried(e->type))
+                    throw std::runtime_error(
+                        "brae: patch '" + q.name + "' resolves its nut BC to key '" + e->name + "' of type '" + e->type
+                        + "', which this driver does not evaluate on a patch that is not a wall (it carries calculated, "
+                        "fixedValue, zeroGradient, slip, symmetry, symmetryPlane, wedge, empty, inletOutlet, freestream and "
+                        "outletInlet there). Refusing rather than keeping the file's value.");
+            }
+        };
         // Pick the nut wall function from the 0/nut wall-patch BC TYPE (OpenFOAM does this per-BC, not by model):
         // nutUSpalding -> Spalding, nutUBlended -> Blended, else nutk. Warn once on nutLowRe (mapped to nutk: identical
         // only on a resolved y+<yPlusLam mesh). SA keeps its Spalding path regardless (ctl.sa short-circuits below).
@@ -855,6 +877,7 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
             const FieldData<scalar> nutFD = readField<scalar>(fieldDir + "/nut");
             guardFrozen(nutFD, "nut");
             guardWallFn(nutFD, "nut");
+            guardNonWallNut(nutFD);
             // The SA device path used to hard-force Spalding (`ctl_.sa || ...` in device_simple_foam.cu)
             // whatever 0/nut asked for -- the audit's finding #15. bump2D:SpalartAllmaras ships
             // nutLowReWallFunction, whose calcNut() returns Zero UNCONDITIONALLY on every model
@@ -923,6 +946,7 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
             const FieldData<scalar> nutFD = readField<scalar>(fieldDir + "/nut");
             guardFrozen(nutFD, "nut");
             guardWallFn(nutFD, "nut");
+            guardNonWallNut(nutFD);
             guardWallFn(sFD, secondName);
             setNutWall(nutFD);   // honour the BC-specified velocity-based nut wall function (nutUSpalding/nutUBlended)
             // WHICH PATCHES THE TURBULENCE WALL FUNCTION ACTUALLY APPLIES TO. OpenFOAM's

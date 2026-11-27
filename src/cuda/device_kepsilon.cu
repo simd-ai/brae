@@ -1620,4 +1620,96 @@ void deviceBoundaryNutU(
     cudaCheck(cudaGetLastError(), "nutUWall");
 }
 
+namespace {
+// correctNut's nut_.correctBoundaryConditions() on a face whose nut condition is not a wall function: see deviceNutPatchEvaluate
+__global__
+void nutPatchEvaluateKernel(
+    int n,
+    const label* __restrict__ kind,
+    const scalar* __restrict__ ref,
+    const label* __restrict__ fc,
+    const scalar* __restrict__ phiB,
+    const scalar* __restrict__ nutCell,
+    const scalar* __restrict__ calc,
+    scalar* __restrict__ nutBnd)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const label k = kind[i];
+    if (k == NutPatchFixed)
+    {
+        nutBnd[i] = ref[i];
+    }
+    else if (k == NutPatchCalculated)
+    {
+        if (calc) nutBnd[i] = calc[i];
+    }
+    else if (k == NutPatchCell)
+    {
+        nutBnd[i] = nutCell[fc[i]];
+    }
+    else if (k == NutPatchInletOutlet)
+    {
+        // valueFraction = neg(phi): 1 on an inflow face only, 0 on a face whose flux is zero
+        nutBnd[i] = (phiB[i] < scalar(0)) ? ref[i] : nutCell[fc[i]];
+    }
+    else if (k == NutPatchOutletInlet)
+    {
+        // valueFraction = pos0(phi): 1 on an outflow face and on a face whose flux is zero
+        nutBnd[i] = (phiB[i] >= scalar(0)) ? ref[i] : nutCell[fc[i]];
+    }
+}
+
+// Cmu k_b^2/epsilon_b, in boundaryNutKernel's own arithmetic, so that a face both evaluate holds the same bits
+__global__
+void nutKEpsilonBoundaryKernel(
+    int n,
+    const scalar* __restrict__ kB,
+    const scalar* __restrict__ epsB,
+    scalar Cmu,
+    const label* __restrict__ fc,
+    const scalar* __restrict__ nutCell,
+    scalar* __restrict__ nutB)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const scalar eb = epsB[i];
+    nutB[i] = (eb > scalar(0)) ? Cmu * kB[i] * kB[i] / eb : nutCell[fc[i]];
+}
+}  // namespace
+
+void deviceNutPatchEvaluate(
+    const DeviceBuffer<label>& kind,
+    const DeviceBuffer<scalar>& ref,
+    const DeviceBuffer<label>& faceCell,
+    const DeviceBuffer<scalar>& phiB,
+    const DeviceBuffer<scalar>& nutCell,
+    const DeviceBuffer<scalar>* calc,
+    DeviceBuffer<scalar>& nutBnd)
+{
+    const int n = static_cast<int>(kind.size());
+    if (!n) return;
+    if (static_cast<int>(nutBnd.size()) != n || static_cast<int>(ref.size()) != n || static_cast<int>(faceCell.size()) != n
+        || static_cast<int>(phiB.size()) != n || (calc && static_cast<int>(calc->size()) != n))
+        throw std::runtime_error("deviceNutPatchEvaluate: the boundary arrays differ in size");
+    nutPatchEvaluateKernel<<<nBlocks(n), TPB>>>(n, kind.data(), ref.data(), faceCell.data(), phiB.data(), nutCell.data(),
+                                                calc ? calc->data() : nullptr, nutBnd.data());
+    cudaCheck(cudaGetLastError(), "nutPatchEvaluate");
+}
+
+void deviceNutKEpsilonBoundary(
+    const DeviceBuffer<scalar>& kB,
+    const DeviceBuffer<scalar>& epsB,
+    scalar Cmu,
+    const DeviceBuffer<label>& faceCell,
+    const DeviceBuffer<scalar>& nutCell,
+    DeviceBuffer<scalar>& nutB)
+{
+    const int n = static_cast<int>(kB.size());
+    if (!n) return;
+    if (static_cast<int>(nutB.size()) != n) nutB.resize(n);
+    nutKEpsilonBoundaryKernel<<<nBlocks(n), TPB>>>(n, kB.data(), epsB.data(), Cmu, faceCell.data(), nutCell.data(), nutB.data());
+    cudaCheck(cudaGetLastError(), "nutKEpsilonBoundary");
+}
+
 }   // namespace brae

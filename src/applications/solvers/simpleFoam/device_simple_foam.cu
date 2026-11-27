@@ -361,6 +361,58 @@ SimplecSnGrad simplecSnGrad(
             if (hasNutCalc_) { nutCalcMask_.copyFrom(cm); nutCalcSel_.copyFrom(cs); }
             if (hasNutFixed_) nutFixedMask_.copyFrom(fx);
             nutBndFile_.copyFrom(nb);
+            // nut's own condition on each face of a patch that is not a wall, for nonWallNutPatches. The reader has refused
+            // every other type there by name (turbulence_setup.cuh, guardNonWallNut) and a nut wall function there
+            // (guardWallFn), as OpenFOAM's nutWallFunctionFvPatchScalarField::checkType does. A wall's faces stay with its
+            // wall function
+            std::vector<label> kind;
+            std::vector<scalar> ref;
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                if (isCoupledInterfaceType(fvp[pi].type)) continue;
+                const fvPatchField<scalar>* pf = nut->boundary[pi].get();
+                label kd = NutPatchUntouched;
+                std::vector<scalar> rv = pf->value();
+                if (fvp[pi].type != "wall")
+                {
+                    if (dynamic_cast<const TurbulentInletPatchField<scalar>*>(pf))
+                    {
+                        kd = NutPatchUntouched;
+                    }
+                    else if (dynamic_cast<const OutletInletPatchField<scalar>*>(pf))
+                    {
+                        kd = NutPatchOutletInlet;
+                        rv = pf->refValues();
+                    }
+                    else if (dynamic_cast<const InletOutletPatchField<scalar>*>(pf))   // inletOutlet and freestream
+                    {
+                        kd = NutPatchInletOutlet;
+                        rv = pf->refValues();
+                    }
+                    else if (pf->bcCategory() == 1)
+                    {
+                        kd = NutPatchFixed;
+                    }
+                    else if (dynamic_cast<const CalculatedPatchField<scalar>*>(pf))
+                    {
+                        kd = NutPatchCalculated;
+                    }
+                    else if (dynamic_cast<const ZeroGradientPatchField<scalar>*>(pf)
+                             || dynamic_cast<const SymmetryPlanePatchField<scalar>*>(pf)
+                             || dynamic_cast<const WedgePatchField<scalar>*>(pf)
+                             || dynamic_cast<const EmptyPatchField<scalar>*>(pf))
+                    {
+                        kd = NutPatchCell;
+                    }
+                }
+                for (label i = 0; i < fvp[pi].size; ++i)
+                {
+                    kind.push_back(kd);
+                    ref.push_back(static_cast<std::size_t>(i) < rv.size() ? rv[i] : scalar(0));
+                }
+            }
+            nutPatchKind_.copyFrom(kind);
+            nutPatchRef_.copyFrom(ref);
             spaldingControls_ = spaldingFaceControls(*nut, fvp);
         }
         {
@@ -1526,7 +1578,6 @@ SimplecSnGrad simplecSnGrad(
         const DeviceBuffer<scalar>& nuEff,
         DeviceBuffer<scalar>& nuEffBnd)
     {
-        const DeviceMesh& dm = dm_;
         // nuEff at boundary FACES: turbulent uses the TRUE wall nut (nutkWallFunction), not the cell value, so the
         // wall shear matches OpenFOAM; laminar/non-wall faces use the adjacent cell value.
         // Boundary turbulent viscosity into muEff_b. OF: mut(patchi) = rho.boundaryField()[patchi]*nut(patchi),
@@ -1588,6 +1639,7 @@ SimplecSnGrad simplecSnGrad(
                                         ctl_.nu, ctl_.saCoeffs.Cv1, saNutB);
                     deviceSelectFixedFlux(nutCalcSel_, saNutB, dnutBndWall_);
                 }
+                nonWallNutPatches(dnutBndWall_, true);
                 addWallNutToMuEff(dnutBndWall_, nuEffBnd);
             }
             else if (ctl_.sa || ctl_.nutWall == NutWall::Spalding)   // nutUSpaldingWallFunction (velocity-based Newton uTau): SA when the BC selects it (or names none), or the BC on any model
@@ -1613,6 +1665,7 @@ SimplecSnGrad simplecSnGrad(
                                         ctl_.nu, ctl_.saCoeffs.Cv1, saNutB);
                     deviceSelectFixedFlux(nutCalcSel_, saNutB, dnutBndWall_);   // calc faces only; wall faces keep Spalding
                 }
+                nonWallNutPatches(dnutBndWall_, ctl_.sa);
                 addWallNutToMuEff(dnutBndWall_, nuEffBnd);
             }
             else if (ctl_.nutWall == NutWall::NutU)   // nutUWallFunction (log-law yPlus, stepwise blend)
@@ -1621,6 +1674,7 @@ SimplecSnGrad simplecSnGrad(
                                    ctl_.keCoeffs.kappa, ctl_.keCoeffs.E, dnutBndWall_,
                                    compressible_ ? &nuWallBnd_ : nullptr,
                                    nutBndFile_.size() ? &nutBndFile_ : nullptr);
+                nonWallNutPatches(dnutBndWall_, false);
                 addWallNutToMuEff(dnutBndWall_, nuEffBnd);
             }
             else if (ctl_.nutWall == NutWall::Blended)   // nutUBlendedWallFunction (velocity-based binomial n=4 blend) on kEps/kOmegaSST
@@ -1628,6 +1682,7 @@ SimplecSnGrad simplecSnGrad(
                 deviceBoundaryNutBlended(dbU_, bndIsWall_, bndY_, Uk_[0], Uk_[1], Uk_[2], dnut_, ctl_.nu, ctl_.keCoeffs.kappa, ctl_.keCoeffs.E, dnutBndWall_,
                                          compressible_ ? &nuWallBnd_ : nullptr,
                                    nutBndFile_.size() ? &nutBndFile_ : nullptr);
+                nonWallNutPatches(dnutBndWall_, false);
                 addWallNutToMuEff(dnutBndWall_, nuEffBnd);
             }
             else   // k-based wall nut: nutkWallFunction (smooth), or atmNutkWallFunction (rough) when ctl_.atmZ0>0
@@ -1647,24 +1702,7 @@ SimplecSnGrad simplecSnGrad(
                 // SST: the 'calculated' patches carry a1*k_b/max(a1*om_b, b1*F2_b*sqrt(S2_b)) -- a different
                 // expression from kEpsilon's, needing boundary F2 and S2. Overwrites those faces only.
                 if (hasNutCalc_ && ctl_.sst)
-                {
-                    DeviceBuffer<scalar> kBs, omBs, gradUs;
-                    deviceBCValue(dbK_, dk_, kBs);
-                    deviceBCValue(dbEps_, de_, omBs);
-                    deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradUs,
-                                hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
-                    // correctNut's S2 on these faces is the model's own fvc::grad(U), so gradSchemes grad(U) here too
-                    // (kOmegaSSTBase.C correct(), then the patch half of nut_'s assignment). MEASURED: nuEff 4.7e-02 off
-                    // on a slip patch beside a wall with cellLimited (JUPITER job 2641827), and exact without it.
-                    static const bool sstNutUnlimited = std::getenv("BRAE_CONTROL_SST_NUT_UNLIMITED") != nullptr;
-                    if (ctl_.gradULimitK > 0.0 && !sstNutUnlimited)
-                        deviceCellLimitGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradUs, ctl_.gradULimitK,
-                                             hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr);
-                    deviceSSTNutBoundary(dbU_, kBs, omBs, y_,   // CELL wall distance (bndY_ is 0 off-wall)
-                                         compressible_ ? &nuWallBnd_ : nullptr, ctl_.nu,
-                                         gradUs, nC_, Uk_[0], Uk_[1], Uk_[2],
-                                         nutCalcMask_, ctl_.ksstCoeffs, dnut_, nutBnd);
-                }
+                    sstCalculatedNut(nutBnd);
                 // nutLowReWallFunction: calcNut() is Zero UNCONDITIONALLY
                 // (nutLowReWallFunctionFvPatchScalarField.C:38-42 is the whole function). It differs from
                 // the k-based branch ONLY in the wall value, so the branch above runs in full -- the
@@ -1687,6 +1725,8 @@ SimplecSnGrad simplecSnGrad(
                 // whatever the wall/calculated evaluation left there.
                 if (hasNutFixed_ && nutBndFile_.size() == nutBnd.size())
                     deviceSelectFixedFlux(nutFixedMask_, nutBndFile_, nutBnd);
+                // the calculated faces are made above, but for realizableKE's, whose rCmu on a face is not ported
+                nonWallNutPatches(nutBnd, true);
                 deviceCopy(dnutBndWall_, nutBnd);   // materialised: gpuSimpleFoam reads it for wallForces
                 addWallNutToMuEff(nutBnd, nuEffBnd);
             }
@@ -1703,6 +1743,74 @@ SimplecSnGrad simplecSnGrad(
             deviceCopy(nuEffBnd, muBnd_);   // laminar compressible: mu_b = Sutherland(T_b), OF transport_.mu(patchi)
         else
             deviceBCValue(dbExtrap_, nuEff, nuEffBnd);   // laminar: adjacent-cell value
+    }
+
+    // kOmegaSST's correctNut on its calculated patches, a1 k_b/max(a1 omega_b, b1 F2_b sqrt(S2_b)) (kOmegaSSTBase.C:123): written
+    // on the faces nutCalcMask_ marks, the rest of nutBnd as it was
+    void DeviceSimpleSolver::sstCalculatedNut(DeviceBuffer<scalar>& nutBnd)
+    {
+        const DeviceMesh& dm = dm_;
+        DeviceBuffer<scalar> kBs, omBs, gradUs;
+        deviceBCValue(dbK_, dk_, kBs);
+        deviceBCValue(dbEps_, de_, omBs);
+        deviceGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradUs,
+                    hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr);
+        // correctNut's S2 on these faces is the model's own fvc::grad(U), so gradSchemes grad(U) here too
+        // (kOmegaSSTBase.C correct(), then the patch half of nut_'s assignment). MEASURED: nuEff 4.7e-02 off
+        // on a slip patch beside a wall with cellLimited (JUPITER job 2641827), and exact without it.
+        static const bool sstNutUnlimited = std::getenv("BRAE_CONTROL_SST_NUT_UNLIMITED") != nullptr;
+        if (ctl_.gradULimitK > 0.0 && !sstNutUnlimited)
+            deviceCellLimitGradU(dm, dbU_, Uk_[0], Uk_[1], Uk_[2], gradUs, ctl_.gradULimitK,
+                                 hasCyclic_ ? &cyc_ : nullptr, hasAMI_ ? &ami_ : nullptr);
+        deviceSSTNutBoundary(dbU_, kBs, omBs, y_,   // CELL wall distance (bndY_ is 0 off-wall)
+                             compressible_ ? &nuWallBnd_ : nullptr, ctl_.nu,
+                             gradUs, nC_, Uk_[0], Uk_[1], Uk_[2],
+                             nutCalcMask_, ctl_.ksstCoeffs, dnut_, nutBnd);
+    }
+
+    // correctNut's nut_.correctBoundaryConditions() on the faces of every patch that is not a wall: each face takes what its
+    // own nut condition evaluates (deviceNutPatchEvaluate; the kinds were read at set-up). boundaryNuEff's wall-function
+    // branch has made the wall faces, and a calculated patch's faces when calculatedDone; it left the others at the file's
+    // value (under the velocity-based wall functions), at zero (SpalartAllmaras under nutLowReWallFunction) or at the cell's
+    // value (the k-based one, an inletOutlet's inflow faces included). The inletOutlet family switches on phiBnd_ as it stands:
+    // the last corrector's flux after the turbulence correction (refreshNutBoundary), as correctNut's own evaluate does.
+    // realizableKE's calculated faces stay as the branch made them: its rCmu on a face is not ported.
+    // MEASURED (pimpleFoam/RAS/TJunction, every entry against OpenFOAM v2412 serial at steps 1-3, Arrhenius 5845340, before):
+    // kEpsilon under nutkWallFunction with an inletOutlet outlet 9.0e-01 (nut), under nutUSpaldingWallFunction 1.0 (the
+    // calculated inlet held at the file's 0), kOmegaSST the same 9.2e-01 and 1.0, SpalartAllmaras with a zeroGradient outlet
+    // 2.3e-04 (U). CONTROL BRAE_CONTROL_NUT_PATCH_TYPES_IGNORED=1: the faces as the branch left them, as before
+    void DeviceSimpleSolver::nonWallNutPatches(DeviceBuffer<scalar>& nutBnd, bool calculatedDone)
+    {
+        static const bool ignored = std::getenv("BRAE_CONTROL_NUT_PATCH_TYPES_IGNORED") != nullptr;
+        if (ignored || !nutPatchKind_.size()) return;
+        DeviceBuffer<scalar> calc;
+        bool haveCalc = false;
+        if (hasNutCalc_ && !calculatedDone)
+        {
+            if (ctl_.sa)
+            {
+                DeviceBuffer<scalar> ntB;
+                deviceBCValue(dbK_, dk_, ntB);   // nuTilda's own patch values (dk_ is nuTilda for SA)
+                deviceNutSABoundary(ntB, compressible_ ? &nuWallBnd_ : nullptr, ctl_.nu, ctl_.saCoeffs.Cv1, calc);
+                haveCalc = true;
+            }
+            else if (ctl_.sst)
+            {
+                deviceCopy(calc, nutBnd);
+                sstCalculatedNut(calc);
+                haveCalc = true;
+            }
+            else if (!ctl_.keCoeffs.realizable)
+            {
+                DeviceBuffer<scalar> kB, eB;
+                deviceBCValue(dbK_, dk_, kB);
+                deviceBCValue(dbEps_, de_, eB);
+                deviceNutKEpsilonBoundary(kB, eB, ctl_.keCoeffs.Cmu, dbU_.comp[0].faceCell, dnut_, calc);
+                haveCalc = true;
+            }
+        }
+        deviceNutPatchEvaluate(nutPatchKind_, nutPatchRef_, dbU_.comp[0].faceCell, phiBnd_, dnut_,
+                               haveCalc ? &calc : nullptr, nutBnd);
     }
 
     // correctNut's boundary half (kOmegaSST.C correctNut -> nut_.correctBoundaryConditions(), and every closure's): the patch nut
