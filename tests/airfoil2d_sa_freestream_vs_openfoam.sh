@@ -16,7 +16,8 @@
 #   AS  simpleFoam 50 -> 53, phi read from OpenFOAM's write, p's relaxation factor 1 (U and nuTilda keep 0.7). Under the
 #       tutorial's 0.3 OpenFOAM writes p's freestreamPressure patches as p.relax() left them (operator==, a relaxed value)
 #       and brae evaluates them from the relaxed cells: 1.2e-01 on p's outlet entry, every other entry the same as with 1
-#       (Arrhenius 5846805). That is p's boundary under relaxation, recorded as its own defect, not this gate's subject
+#       (Arrhenius 5846805): p's boundary under relaxation, held in AS3
+#   AS3 AS at the tutorial's own p relaxation 0.3: p's freestreamPressure patch values written as p.relax() left them
 #   AP  pimpleFoam from the same fields (moved to time 0, phi dropped so that both codes start from flux(U)), Euler,
 #       deltaT 1e-5, 3 steps, nOuterCorrectors 2, nCorrectors 2, no relaxation
 #   AN  AP with the start's nuTilda cells at exactly 0 set to -1e-8: solved from as read
@@ -39,6 +40,7 @@
 #   BRAE_CONTROL_SA_CTOR_BOUND=1             AP and AN: bound(nuTilda, 0) at construction, which lifts the start's zero
 #                                            cells (and AN's negative ones) to their neighbours' average
 #   BRAE_CONTROL_SA_BOUND_CAP_HELD=1         AP: an outflow face held at the bound's floor until the next evaluate
+#   BRAE_CONTROL_P_WRITE_EVALUATED=1         AS3: p's freestream patch values written as the blend of the relaxed cells, as before
 #   BRAE_CONTROL_FREESTREAM_HBYA_REBLEND=1   AO: HbyA_b re-blended from the cells with the assembly's valueFraction, as before
 #   BRAE_CONTROL_MIXED_VF_FREESTREAM=1       AM, AMP: a plain mixed's valueFraction replaced by the freestream formula, as before
 #   BRAE_CONTROL_INLET_SLOT_KEY_INLETVALUE=1 AW: the freestream patches written under `inletValue`, as before; OpenFOAM must
@@ -54,6 +56,8 @@
 #     refused to continue ("Required entry 'freestreamValue' missing"), brae ran the misnamed case. With the change: the key
 #     right, OpenFOAM continued from brae's write 3.0e-10 (simpleFoam, 53) and 4.0e-09 (pimpleFoam) from OpenFOAM continued
 #     from its own, brae continued from its own 4.5e-10 and 3.0e-09 (5853995); brae refuses AR by name; the key control red.
+#   AS3 (job 5856213): before, p's outlet entry 1.24e-01 at 51 (the evaluated blend written); with the change 4.6e-10, every
+#     entry; the control 1.24e-01.
 #   AO/AM/AMP on develop b266cca9 (job 5856015): AO U 3.5e-07 (outlet) and p 2.7e-04, AMP U 5.6e-05 and p 5.5e-02, AM 2.3e-03 (p).
 #     With the change: AO 3.7e-09 (phi 8.0e-09), AMP 4.2e-09, AM 4.0e-10; p printed: AO 2.6e-06 as AP's, AMP 2.1e-05 -- the open
 #     pimpleFoam p gap with a mixed U, which simpleFoam does not have (AM's p 7e-11). Controls 3.5e-07, 4.9e-05, 2.6e-05.
@@ -181,6 +185,28 @@ if ( cd "$W/AS-br" && BRAE_SIMPLE_CASE_SOLVER=1 "$BRAE" -case . > log 2>&1 ); th
     judge AS 51,52,53 "$BOUND_SIMPLE"
 else
     say "AS: brae ran ($(grep -a -m1 -i -E 'refus|error|unsupported' "$W/AS-br/log" | cut -c1-120))" FAIL
+fi
+
+# AS3: AS at the tutorial's own p relaxation 0.3. p.relax() is operator==(prevIter() + 0.3*(p - prevIter())), which relaxes p's
+# patch values with its cells, and nothing evaluates p before the write: a freestreamPressure face writes that relaxed value,
+# not a blend of the relaxed cells under the valueFraction
+rm -rf "$W/AS3" "$W/AS3-of" "$W/AS3-br"
+cp -r "$W/AS" "$W/AS3"
+python3 - "$W/AS3/system/fvSolution" <<'EOF'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+s, n = re.subn(r'(fields\s*\{\s*p\s+)1;', r'\g<1>0.3;', s)
+assert n == 1, 'AS no longer sets p relaxation 1'
+open(p, 'w').write(s)
+EOF
+cp -r "$W/AS3" "$W/AS3-of"
+cp -r "$W/AS3" "$W/AS3-br"
+ofrun "$W/AS3-of" simpleFoam || { echo "FAIL: OpenFOAM AS3"; tail -5 "$W/AS3-of/log"; exit 1; }
+if ( cd "$W/AS3-br" && BRAE_SIMPLE_CASE_SOLVER=1 "$BRAE" -case . > log 2>&1 ); then
+    judge AS3 51,52,53 "$BOUND_SIMPLE"
+else
+    say "AS3: brae ran ($(grep -a -m1 -i -E 'refus|error|unsupported' "$W/AS3-br/log" | cut -c1-120))" FAIL
 fi
 
 # AP: pimpleFoam from the same fields at time 0
@@ -551,6 +577,16 @@ ctlp()   # <env> <arm> <time> <field> <entry>: a pimpleFoam arm rerun by brae un
 ctlp BRAE_CONTROL_SA_CTOR_BOUND=1 AP 1e-05 nuTilda internal
 ctlp BRAE_CONTROL_SA_CTOR_BOUND=1 AN 1e-05 nuTilda internal
 ctlp BRAE_CONTROL_SA_BOUND_CAP_HELD=1 AP 1e-05 nuTilda outlet
+if [ -d "$W/AS3-of" ]; then
+    rm -rf "$W/AS3-ctl"
+    cp -r "$W/AS3" "$W/AS3-ctl"
+    ( cd "$W/AS3-ctl" && BRAE_SIMPLE_CASE_SOLVER=1 BRAE_CONTROL_P_WRITE_EVALUATED=1 "$BRAE" -case . > log 2>&1 ) \
+        || say "control BRAE_CONTROL_P_WRITE_EVALUATED=1: brae ran on AS3" FAIL
+    r=$(python3 "$CMP" "$W/AS3-of" "$W/AS3-ctl" 51 p | awk '$3 == "outlet" {print $10}')
+    python3 -c "import sys; sys.exit(0 if '$r' and float('$r') > float('$CB') else 1)" \
+        && say "control BRAE_CONTROL_P_WRITE_EVALUATED=1: AS3 p outlet at 51 goes red (rel $r)" PASS \
+        || say "control BRAE_CONTROL_P_WRITE_EVALUATED=1: AS3 p outlet at 51 goes red (rel ${r:-none})" FAIL
+fi
 ctlp BRAE_CONTROL_FREESTREAM_HBYA_REBLEND=1 AO 3e-05 U outlet
 ctlp BRAE_CONTROL_MIXED_VF_FREESTREAM=1 AMP 1e-05 phi outlet
 if [ -d "$W/AM-of" ]; then

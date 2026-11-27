@@ -598,7 +598,21 @@ public:
     std::vector<scalar> nuTildaBoundary() const { return boundaryOf(dbK_, dk_); }
     std::vector<scalar> kBoundary()   const { return boundaryOf(dbK_,   dk_); }
     std::vector<scalar> epsBoundary() const { return boundaryOf(dbEps_, de_); }
-    std::vector<scalar> pBoundary()   const { return boundaryOf(dbP_,   dp_); }
+    // p's patch values as OpenFOAM writes them. p.relax() is operator==(prevIter() + alpha*(*this - prevIter())), which relaxes
+    // the PATCH values with the cells (GeometricField::relax), and nothing evaluates p again before the write: a freestream face
+    // holds the relaxed value the pressure corrector kept (pbStored_), not a blend of the relaxed cells under the valueFraction,
+    // which is another number wherever the valueFraction moved. airFoil2D under the tutorial's p relaxation 0.3: p's
+    // freestreamPressure entries 1.2e-01 from OpenFOAM's, every other entry as with 1 (Arrhenius 5846805). CONTROL
+    // BRAE_CONTROL_P_WRITE_EVALUATED=1: the evaluated blend, as before
+    std::vector<scalar> pBoundary() const
+    {
+        static const bool evaluated = std::getenv("BRAE_CONTROL_P_WRITE_EVALUATED") != nullptr;
+        if (!dbP_.n || !dp_.size()) return {};
+        DeviceBuffer<scalar> b;
+        deviceBCValue(dbP_, dp_, b);
+        if (freestreamStored() && !evaluated) deviceStoredFreestreamValues(dbP_, pbStored_, b);
+        return b.host();
+    }
     std::vector<scalar> phiBoundary() const { return phiBnd_.host(); }
 
     // THE INTERFACE FLUX, per coupled patch, for the phi write. A cyclic/AMI patch's flux is NOT in
