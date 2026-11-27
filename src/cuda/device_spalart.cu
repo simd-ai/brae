@@ -396,11 +396,29 @@ void deviceSpalartAllmarasCorrect(
     scalar gradNuTildaLULimitK,    // see the declaration
     scalar gradNuTildaLapLimitK,
     bool releaseGradUMemo,   // see the declaration
-    scalar lapLimit)
+    scalar lapLimit,
+    const DeviceBuffer<scalar>* nuTildaBndStored)   // see the declaration
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> gradU;
     deviceGradU(dm, dbU, Ux, Uy, Uz, gradU, ami, cyc);   // interface-aware grad(U) for vorticity/production
+    // nuTilda's patch values as every reader below takes them. OpenFOAM's nuTildaEqn switches the inletOutlet faces in its
+    // first fvMatrix's constructor (fvMatrix.C:396), which moves refValue and valueFraction, never the stored value: the Cb2
+    // term's fvc::grad(nuTilda), DnuTildaEff's patch half (SpalartAllmarasBase.C:470-471) and the limitedLinear limiter's
+    // gradient read what the last evaluate left. A driver that switched before this call hands those (nuTildaBndStored);
+    // without them the values are evaluated from the coefficients, as before.
+    const bool ntStoredGiven = nuTildaBndStored && nuTildaBndStored->size() == static_cast<std::size_t>(dbNuTilda.n);
+    const auto nuTildaBnd = [&](DeviceBuffer<scalar>& out)
+    {
+        if (ntStoredGiven)
+        {
+            deviceCopy(out, *nuTildaBndStored);
+        }
+        else
+        {
+            deviceBCValue(dbNuTilda, nuTilda, out);
+        }
+    };
     // The case's own `grad(U)` scheme, which fvc::grad(U) resolves (SpalartAllmarasBase.C:461). Applied
     // to the TENSOR, as cellLimitedGrad does, so Omega, Stilda and the DES/IDDES length scales all see
     // the same gradient OpenFOAM built them from.
@@ -427,7 +445,7 @@ void deviceSpalartAllmarasCorrect(
         if (co.zdes && !iddes && wallN && wallN->size() == static_cast<std::size_t>(3*nC))
         {
             DeviceBuffer<scalar> nbv0, gx0, gy0, gz0;
-            deviceBCValue(dbNuTilda, nuTilda, nbv0);
+            nuTildaBnd(nbv0);
             deviceGaussGrad(dm, nuTilda, nbv0, gx0, gy0, gz0);          // fvc::grad(nuTilda)
 
             DeviceBuffer<scalar> mc(static_cast<std::size_t>(nC)), mcb, ox, oy, oz;
@@ -478,7 +496,7 @@ void deviceSpalartAllmarasCorrect(
     DeviceBuffer<scalar> fw(static_cast<std::size_t>(nC));
     saFwKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), Stilda.data(), dScale.data(), co, fw.data());
     DeviceBuffer<scalar> nbv;
-    deviceBCValue(dbNuTilda, nuTilda, nbv);   // |grad nuTilda|^2
+    nuTildaBnd(nbv);   // |grad nuTilda|^2
     DeviceBuffer<scalar> gnx, gny, gnz;
     deviceGaussGrad(dm, nuTilda, nbv, gnx, gny, gnz);
     DeviceBuffer<scalar> gradNt2(static_cast<std::size_t>(nC));
@@ -534,7 +552,7 @@ void deviceSpalartAllmarasCorrect(
     // where the measured error lives. It is SA-specific because the boundary laplacian weight is zero for a
     // zeroGradient patch, so the k/omega walls never saw it.
     DeviceBuffer<scalar> ntBnd, DB;
-    deviceBCValue(dbNuTilda, nuTilda, ntBnd);
+    nuTildaBnd(ntBnd);
     if (ntBnd.size())
     {
         DB.resize(ntBnd.size());
@@ -557,7 +575,7 @@ void deviceSpalartAllmarasCorrect(
                                /*fvoSetMask*/nullptr, /*fvoSetVal*/nullptr,
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
-                               /*boundFloor*/scalar(0.0), gradNuTildaLapLimitK, /*storedBnd*/nullptr, lapLimit);
+                               /*boundFloor*/scalar(0.0), gradNuTildaLapLimitK, ntStoredGiven ? nuTildaBndStored : nullptr, lapLimit);
     // deviceSolveScalarTransport already bounds to 1e-15 (~ bound(nuTilda, 0)). correctNut: nut = nuTilda*fv1(new).
     saNutKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), nu, co.Cv1, nut.data());
     cudaCheck(cudaGetLastError(), "SA correctNut");

@@ -692,7 +692,12 @@ void deviceSpalartAllmarasCorrect(const DeviceMesh& dm, const DeviceVectorBounda
                                   bool releaseGradUMemo = false,
                                   // laplacianSchemes `limited corrected <psi>` on nuTilda's non-orthogonal
                                   // correction (deviceSolveScalarTransport's lapLimit); 1 is `corrected`.
-                                  scalar lapLimit = 1);
+                                  scalar lapLimit = 1,
+                                  // nuTilda's STORED patch values (what the last evaluate left), for a driver that
+                                  // switches the inletOutlet coefficients before the call: the gradients, DnuTildaEff's
+                                  // patch half and the transport's limiter read them (SpalartAllmarasBase.C:470-471).
+                                  // null: evaluated from the coefficients, as before.
+                                  const DeviceBuffer<scalar>* nuTildaBndStored = nullptr);
 
 // Standalone SA correctNut (nut = nuTilda*fv1(nuTilda)) for the solver startup validate().
 void deviceNutSA(const DeviceBuffer<scalar>& nuTilda, scalar nu, scalar Cv1, DeviceBuffer<scalar>& nut);
