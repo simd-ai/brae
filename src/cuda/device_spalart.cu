@@ -577,7 +577,15 @@ void deviceSpalartAllmarasCorrect(
                                /*limField*/nullptr, /*limGradX*/nullptr, /*limGradY*/nullptr,
                                /*limGradZ*/nullptr, /*precon*/nullptr, nSweeps, gsSymmetric,
                                /*boundFloor*/scalar(0.0), gradNuTildaLapLimitK, ntStoredGiven ? nuTildaBndStored : nullptr, lapLimit);
-    // deviceSolveScalarTransport already bounds to 1e-15 (~ bound(nuTilda, 0)). correctNut: nut = nuTilda*fv1(new).
+    // deviceSolveScalarTransport has bounded nuTilda at 0 (bound(nuTilda_, 0), SpalartAllmarasBase.C:487), whose patch half
+    // holds a face at the floor where its cell went below it (bound.C:59, deviceBoundCap). SpalartAllmaras then evaluates the
+    // patches again (nuTilda_.correctBoundaryConditions(), :488), which kEpsilon and kOmegaSST do not: an outflow face takes
+    // its bounded cell back. MEASURED on airFoil2D's freestream outlet (pimpleFoam from OpenFOAM's simpleFoam iteration 50,
+    // Arrhenius 5845830): nuTilda 3.47e-05 on OpenFOAM's face 52 at step 1, 0 on brae's. CONTROL
+    // BRAE_CONTROL_SA_BOUND_CAP_HELD=1: the floor held until the next evaluate, as before
+    static const bool capHeld = std::getenv("BRAE_CONTROL_SA_BOUND_CAP_HELD") != nullptr;
+    if (!capHeld) deviceBoundCapClear(dbNuTilda);
+    // correctNut: nut = nuTilda*fv1(new)
     saNutKernel<<<nBlocks(nC), TPB>>>(nC, nuTilda.data(), nu, co.Cv1, nut.data());
     cudaCheck(cudaGetLastError(), "SA correctNut");
 }

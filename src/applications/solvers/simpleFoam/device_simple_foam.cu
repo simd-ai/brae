@@ -1139,13 +1139,17 @@ SimplecSnGrad simplecSnGrad(
         // model, so a fixed string here would print a line about a field the case does not have.
         // BRAE_CTOR_BOUND=0 skips the pair -- the fail-proof for
         // tests/bound_at_construction_vs_openfoam.sh, which needs every arm to be switchable off.
+        // SpalartAllmaras bounds nuTilda in correct() only (SpalartAllmarasBase.C:487): its constructor has no bound, unlike
+        // kEpsilon's, RNGkEpsilon's, realizableKE's and kOmegaSST's (kEpsilon.C:182-183, kOmegaSSTBase.C:438-439). A start
+        // below 0 is solved from as read. CONTROL BRAE_CONTROL_SA_CTOR_BOUND=1: bound(nuTilda, 0) here, as before
+        static const bool saCtorBound = std::getenv("BRAE_CONTROL_SA_CTOR_BOUND") != nullptr;
         const char* ctorBoundEnv = std::getenv("BRAE_CTOR_BOUND");
-        if (!(ctorBoundEnv && std::string(ctorBoundEnv) == "0"))
+        if (!(ctorBoundEnv && std::string(ctorBoundEnv) == "0") && (!ctl_.sa || saCtorBound))
         {
             deviceBoundField(dm, dk_,
                              ctl_.sa ? scalar(0.0) : (ctl_.sst ? ctl_.ksstCoeffs.kMin : ctl_.keCoeffs.kMin),
                              ctl_.sa ? "nuTilda" : "k",
-                             &dbK_);                                   // bound(k_, kMin_)  [SA: bound(nuTilda_, 0)]
+                             &dbK_);                                   // bound(k_, kMin_)
             if (!ctl_.sa)
             {
                 deviceBoundField(dm, de_,
