@@ -226,6 +226,11 @@ struct PatchFieldData
     // `field`, `fieldInf`, `lInf` (advectiveFvPatchField.C: lInf defaults to -GREAT, no relaxation); their `rho`
     // is flowRateRhoName's slot. rhoCentralFoam's nozzle boundaries (milestone H); nothing else reads them.
     std::string    totalRefKey;
+    // The key the inletValue slot was read from when it is not a total reference: `inletValue` (inletOutlet),
+    // `outletValue` (outletInlet) or `freestreamValue` (freestream, freestreamPressure, freestreamVelocity). OpenFOAM's
+    // dictionary constructors each read their own key and refuse the others (Required entry missing), so the factory
+    // checks it against the type; empty when the slot was not read from a file
+    std::string    inletKey;
     // fanPressure: `direction` and the fan curve, which its write() emits beside totalPressure's entries
     // (fanPressureFvPatchScalarField.C:223-235) and pimpleFoam reads back from the start time's p (fan_pressure.cuh).
     // The curve in either spelling: `fanCurve { type table; file ...; }` as cases write it, or `fanCurve table;` +
@@ -1130,6 +1135,7 @@ inline FieldData<T> readField(const std::string& path)
                     {                                // opposite flux branch (see OutletInletPatchField)
                         readValueOrInternal(ts, fd, p.inletUniform, p.inletUniformValue, p.inletValues);
                         p.hasInletValue = true;
+                        p.inletKey = key;
                         ts.expect(";");
                     }
                     else if (key == "p0")   // totalPressure reference p0 (reuse the inletValue slot)
@@ -1624,6 +1630,7 @@ inline FieldData<T> readField(const std::string& path)
                         p.inletUniformValue = p.uniformValue;
                         p.inletValues = p.values;
                         p.hasInletValue = true;
+                        p.inletKey = key;
                         ts.expect(";");
                     }
                     // `gradient` is fixedGradient's key, `refGradient` is mixed's. They fill the same slot

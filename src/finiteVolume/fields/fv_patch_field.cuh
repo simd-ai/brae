@@ -4330,8 +4330,22 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
         if (d.values.size() == static_cast<std::size_t>(p.size)) return d.values;
         return {};
     };
+    // inletOutlet, outletInlet and the freestream family keep their reference value in one slot here, but OpenFOAM's
+    // dictionary constructors each read it under their own key -- Field<Type>("inletValue"), ("outletValue"),
+    // freestreamValue (inletOutletFvPatchField.C, outletInletFvPatchField.C, freestreamFvPatchField.C:73-80,
+    // freestreamPressure/VelocityFvPatch*Field.C) -- and stop on the others with "Required entry ... missing". The reader
+    // put any of the three in the slot, so a patch carrying another type's key ran on it. Refused by name instead
+    auto requireInletKey = [&](const char* want)
+    {
+        if (!d.inletKey.empty() && d.inletKey != want)
+            throw std::runtime_error(
+                "brae: patch '" + p.name + "' is `" + d.type + "`, whose reference value OpenFOAM reads from `" + want
+                + "`, but it gives `" + d.inletKey + "`. OpenFOAM refuses that (Required entry '" + want + "' missing); "
+                "refusing rather than reading it as the other key.");
+    };
     if (d.type == "inletOutlet")   // refValue = inletValue (fall back to value if inletValue omitted)
     {
+        requireInletKey("inletValue");
         const auto v = inletOrValue(d);
         return std::make_unique<InletOutletPatchField<T>>(p, v.uniform, v.uniformValue, v.values,
                                                           readValueOf(), /*extrapolateIfAbsent=*/true);
@@ -4341,6 +4355,7 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
     // nothing constructed it, so a case naming it was refused. (pimpleFoam/LES/NACA4412 uses it.)
     if (d.type == "outletInlet")
     {
+        requireInletKey("outletValue");
         const auto v = inletOrValue(d);   // outletValue is read into the same slot
         return std::make_unique<OutletInletPatchField<T>>(p, v.uniform, v.uniformValue, v.values,
                                                           readValueOf(), /*extrapolateIfAbsent=*/true);
@@ -4376,6 +4391,8 @@ std::unique_ptr<fvPatchField<T>> makePatchFieldImpl(const FvPatch& p, const Patc
     // base `freestream` (e.g. k/omega) derives from inletOutlet in OF -> BINARY flux switch (kept).
     // freestreamFvPatchField.C: `if (!readValueEntry(dict)) operator=(freestreamValue())` -- the file's
     // value when present, else the refValue (no extrapolation, unlike its inletOutlet base).
+    if (d.type == "freestream" || d.type == "freestreamVelocity" || d.type == "freestreamPressure")
+        requireInletKey("freestreamValue");
     if (d.type == "freestream")
         return std::make_unique<InletOutletPatchField<T>>(p, d.inletUniform, d.inletUniformValue, d.inletValues,
                                                           readValueOf(), /*extrapolateIfAbsent=*/false);
