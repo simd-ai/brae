@@ -751,6 +751,44 @@ void deviceBoundaryNutU(const DeviceVectorBoundary& dbU, const DeviceBuffer<labe
 // nutUSpaldingWallFunction's Newton controls per boundary face, in DeviceBoundary order (every patch that is not a coupled
 // interface): each Spalding patch's own `tolerance` and `maxIter` (NutUSpaldingPatchField, read from the case with OpenFOAM's
 // defaults), OpenFOAM's defaults on every other face, which no Spalding evaluation reads. One builder for every driver
+// correctNut's nut_.correctBoundaryConditions() on the boundary faces whose nut condition is not a wall function. Every model
+// ends correctNut with `nut_ = <expression>; nut_.correctBoundaryConditions();` (kEpsilon.C:45-46, RNGkEpsilon.C:45-46,
+// kOmegaSSTBase.C:123-124, SpalartAllmarasBase.C:166-167): the assignment hands each patch the expression's patch value, then
+// each patch evaluates by its own type. Per boundary face, in DeviceBoundary order:
+//   NutPatchUntouched    a wall function's face, left as the caller made it
+//   NutPatchFixed        fixedValue: the patch's own value, ref
+//   NutPatchCalculated   calculated: the expression's patch value, calc (left as it is when calc is null)
+//   NutPatchCell         zeroGradient, slip, symmetry, symmetryPlane, wedge, empty: the face's cell
+//   NutPatchInletOutlet  inletOutlet, freestream: valueFraction = neg(phi) (inletOutletFvPatchField.C:123,
+//                        freestreamFvPatchField.C:182): ref (inletValue, freestreamValue) on an inflow face, the cell on an
+//                        outflow one
+//   NutPatchOutletInlet  outletInlet: valueFraction = pos0(phi) (outletInletFvPatchField.C:124): ref on an outflow face, the
+//                        cell on an inflow one
+enum NutPatchKind : label
+{
+    NutPatchUntouched = 0,
+    NutPatchFixed = 1,
+    NutPatchCalculated = 2,
+    NutPatchCell = 3,
+    NutPatchInletOutlet = 4,
+    NutPatchOutletInlet = 5
+};
+void deviceNutPatchEvaluate(const DeviceBuffer<label>& kind,
+                            const DeviceBuffer<scalar>& ref,
+                            const DeviceBuffer<label>& faceCell,
+                            const DeviceBuffer<scalar>& phiB,
+                            const DeviceBuffer<scalar>& nutCell,
+                            const DeviceBuffer<scalar>* calc,
+                            DeviceBuffer<scalar>& nutBnd);
+// kEpsilon's and RNGkEpsilon's expression on the boundary faces, Cmu k_b^2/epsilon_b (kEpsilon.C:45, RNGkEpsilon.C:45): the
+// arithmetic of deviceBoundaryNut's calculated branch, the face's cell nut where epsilon_b is not positive
+void deviceNutKEpsilonBoundary(const DeviceBuffer<scalar>& kB,
+                               const DeviceBuffer<scalar>& epsB,
+                               scalar Cmu,
+                               const DeviceBuffer<label>& faceCell,
+                               const DeviceBuffer<scalar>& nutCell,
+                               DeviceBuffer<scalar>& nutB);
+
 struct SpaldingFaceControls
 {
     DeviceBuffer<scalar> tolerance;
