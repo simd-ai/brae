@@ -138,6 +138,12 @@ add_test(NAME sa_gradlimit_vs_openfoam
          COMMAND ${PROJECT_SOURCE_DIR}/tests/sa_gradlimit_vs_openfoam.sh
                  ${PROJECT_SOURCE_DIR}/validation/airFoil2D)
 set_tests_properties(sa_gradlimit_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# SpalartAllmaras with freestream boundaries on airFoil2D, simpleFoam and pimpleFoam from OpenFOAM's iteration 50: nut's
+# freestream patches, and nuTilda's bound (none at construction, the patches evaluated after it); every entry at three steps
+# against OpenFOAM, three controls.
+add_test(NAME airfoil2d_sa_freestream_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/airfoil2d_sa_freestream_vs_openfoam.sh)
+set_tests_properties(airfoil2d_sa_freestream_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
+                     ENVIRONMENT "BRAE_PIMPLE_BIN=$<TARGET_FILE:brae_pimpleFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 # forceCoeffs through a simpleFoam run under the case's own controls (every step by default, writeInterval, timeStart):
 # the rows at the times asked for; no entry, no file
 add_test(NAME simple_force_sampling COMMAND ${PROJECT_SOURCE_DIR}/tests/simple_force_sampling.sh)
