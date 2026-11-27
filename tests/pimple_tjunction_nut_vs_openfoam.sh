@@ -3,7 +3,7 @@
 # OpenFOAM v2412.
 #
 # WHAT IT HOLDS. Every model ends its correct() in correctNut: `nut_ = <expression>; nut_.correctBoundaryConditions();`
-# (kEpsilon.C:46-50, kOmegaSSTBase.C correctNut, SpalartAllmarasBase.C:252-256). The assignment hands each patch the
+# (kEpsilon.C:45-46, kOmegaSSTBase.C:123-124, SpalartAllmarasBase.C:166-167). The assignment hands each patch the
 # expression's patch value, and correctBoundaryConditions then evaluates each patch by its own type:
 #   calculated      keeps the expression's patch value (Cmu k_b^2/epsilon_b, a1 k_b/max(a1 omega_b, b1 F2_b sqrt(S2_b)),
 #                   nuTilda_b fv1(chi_b))
