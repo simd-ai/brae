@@ -305,6 +305,57 @@ void kOmegaSSTDESfactorKernel(
     FDES[c] = fmax((Lt / fmax(CDES*delta, 1e-300)) * (scalar(1) - F2[c]), scalar(1));
 }
 
+// kOmegaSSTDES and kOmegaSSTDDES as OpenFOAM v2412 builds the k equation's destruction: sqrt(k)/dTilda (epsilonByk,
+// kOmegaSSTDES.C), handed to kReactionSSTKernel as FDES = lRAS/dTilda, since betaStar omega FDES is then sqrt(k)/dTilda.
+//   lRAS = sqrt(k)/(betaStar omega), lLES = CDES delta, CDES = blend(F1, CDESkom, CDESkeps) = F1 (CDESkom - CDESkeps) + CDESkeps
+//   DES   dTilda = min(lLES, lRAS)                                                    (kOmegaSSTDES.C dTilda)
+//   DDES  dTilda = max(lRAS - fd max(lRAS - lLES, 0), SMALL), fd = 1 - tanh((Cd1 r)^Cd2)  (kOmegaSSTDDES.C:42-47, 90-102),
+//         r = min(nuEff/(max(|grad U|, SMALL) (kappa y)^2), 10)                         (kOmegaSSTDES.C:60-70)
+// omega is the one the omega equation has just solved (kEqn is assembled after it, kOmegaSSTBase.C:600); F1, grad U and nut
+// are the step's, as kOmegaSSTBase::correct holds them then.
+__global__
+void kOmegaSSTDESdTildaKernel(
+    int nC,
+    const scalar* __restrict__ k,
+    const scalar* __restrict__ om,
+    const scalar* __restrict__ V,
+    const scalar* __restrict__ F1,
+    const scalar* __restrict__ gradU,
+    const scalar* __restrict__ nut,
+    const scalar* __restrict__ y,
+    scalar nu,
+    KOmegaSSTCoeffs co,
+    const scalar* __restrict__ dOpt,
+    scalar* __restrict__ FDES)
+{
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nC) return;
+    const scalar small = 1e-15;                                       // OpenFOAM's SMALL (double)
+    const scalar delta = dOpt ? dOpt[c] : cbrt(V[c]);
+    const scalar lRAS = sqrt(k[c]) / (co.betaStar * om[c]);
+    const scalar CDES = F1[c] * (co.CDESkom - co.CDESkeps) + co.CDESkeps;
+    const scalar lLES = CDES * delta;
+    scalar dTilda;
+    if (co.desShielded)
+    {
+        scalar g2 = 0;
+        for (int q = 0; q < 9; ++q)
+        {
+            const scalar gq = gradU[q * nC + c];
+            g2 += gq * gq;
+        }
+        const scalar ky = co.desKappa * y[c];
+        const scalar r = fmin((nut[c] + nu) / (fmax(sqrt(g2), small) * (ky * ky)), scalar(10));
+        const scalar fd = scalar(1) - tanh(pow(co.Cd1 * r, co.Cd2));
+        dTilda = fmax(lRAS - fd * fmax(lRAS - lLES, scalar(0)), small);
+    }
+    else
+    {
+        dTilda = fmin(lLES, lRAS);
+    }
+    FDES[c] = lRAS / dTilda;
+}
+
 // kOmegaSST-IDDES DES factor (Gritskevich/Garbaruk/Schuetze/Menter 2012): the improved (WMLES) length scale replaces the
 // k-dissipation scale. lRAS = sqrt(k)/(betaStar*omega); lLES = CDES*Delta, CDES = F1*CDES1 + (1-F1)*CDES2, Delta =
 // min(max(Cw*y, Cw*hmax), hmax) (hwn omitted). Blending: rd_t/rd_l from nut/nu, fdt/fl/ft/fB/fe as in SA-IDDES (the SST
@@ -942,6 +993,28 @@ void deviceKOmegaSSTDESfactor(int nC, const DeviceBuffer<scalar>& k, const Devic
     cudaCheck(cudaGetLastError(), "kOmegaSSTDESfactor");
 }
 
+// kOmegaSSTDES / kOmegaSSTDDES: FDES = lRAS/dTilda as OpenFOAM's epsilonByk makes it (kOmegaSSTDESdTildaKernel above).
+void deviceKOmegaSSTDESdTildaFactor(
+    int nC,
+    const DeviceBuffer<scalar>& k,
+    const DeviceBuffer<scalar>& omega,
+    const DeviceBuffer<scalar>& V,
+    const DeviceBuffer<scalar>& F1,
+    const DeviceBuffer<scalar>& gradU,
+    const DeviceBuffer<scalar>& nut,
+    const DeviceBuffer<scalar>& y,
+    scalar nu,
+    const KOmegaSSTCoeffs& co,
+    DeviceBuffer<scalar>& FDES,
+    const DeviceBuffer<scalar>* lesDelta)
+{
+    FDES.resize(nC);
+    kOmegaSSTDESdTildaKernel<<<nBlocks(nC), TPB>>>(nC, k.data(), omega.data(), V.data(), F1.data(), gradU.data(), nut.data(),
+                                                   y.data(), nu, co, (lesDelta && lesDelta->size()) ? lesDelta->data() : nullptr,
+                                                   FDES.data());
+    cudaCheck(cudaGetLastError(), "kOmegaSSTDESdTilda");
+}
+
 // kOmegaSST-IDDES factor FDES = lRAS/lIDDES (Gritskevich et al. 2012). Needs gradU (|gradU| for rd), the SST nut, the
 // wall distance y and the maxDeltaxyz hmax; F1 blends CDES. (Unit-test/DES hook.)
 void deviceKOmegaSSTIDDESfactor(int nC, const DeviceBuffer<scalar>& k, const DeviceBuffer<scalar>& omega,
@@ -1252,11 +1325,16 @@ void deviceKOmegaSSTCorrect(
     // kOmegaSST-DDES: the DES factor FDES>=1 (from the RANS length scale sqrt(k)/(betaStar*omega) vs C_DES*cubeRootVol,
     // shielded by 1-F2) multiplies the k destruction below. des==false -> FDES stays empty -> plain kOmegaSST(-RANS).
     DeviceBuffer<scalar> FDES;
+    // kOmegaSSTDES and kOmegaSSTDDES take OpenFOAM's dTilda after the omega solve (below, before the k equation). CONTROL
+    // BRAE_CONTROL_DES_F2_SHIELDING=1: the factor this closure computed before, max(lRAS/(CDES delta) (1 - F2), 1) from the
+    // omega before its solve -- a shielding OpenFOAM's kOmegaSSTDDES does not have; see tests/pimple_des_step_vs_openfoam.sh
+    static const bool desF2Shielding = std::getenv("BRAE_CONTROL_DES_F2_SHIELDING") != nullptr;
+    const bool iddesHere = des && iddes && hmax && hwn;
     if (des)
     {
-        if (iddes && hmax && hwn)   // kOmegaSST-IDDES: the improved (WMLES) length scale (needs the SST nut + hmax + hwn + gradU + y)
+        if (iddesHere)   // kOmegaSST-IDDES: the improved (WMLES) length scale (needs the SST nut + hmax + hwn + gradU + y)
             deviceKOmegaSSTIDDESfactor(nC, k, omega, F1, gradU, nut, y, *hmax, *hwn, nu, co, FDES);
-        else                 // kOmegaSST-DDES: the F2-shielded cubeRootVol DES factor
+        else if (desF2Shielding)
             deviceKOmegaSSTDESfactor(nC, k, omega, dm.V, F1, F2, co, FDES, lesDelta);
     }
 
@@ -1331,6 +1409,10 @@ void deviceKOmegaSSTCorrect(
 
     // deviceSolveScalarTransport just bound omega, as it binds every transported field here: a second bound would find
     // nothing below the floor and forget bound.C:59's patch half (deviceBoundCap).
+
+    // kOmegaSSTDES / kOmegaSSTDDES: kEqn's epsilonByk = sqrt(k)/dTilda, from the omega just solved (kOmegaSSTBase.C:600)
+    if (des && !iddesHere && !desF2Shielding)
+        deviceKOmegaSSTDESdTildaFactor(nC, k, omega, dm.V, F1, gradU, nut, y, nu, co, FDES, lesDelta);
 
     // k equation (loose solve)
     DeviceBuffer<scalar> DkEff;

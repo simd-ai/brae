@@ -33,6 +33,9 @@ struct SpalartAllmarasCoeffs {
     // (SpalartAllmarasDDES.C); the defaults are the values the standard formulation has always used.
     scalar Cd1      = 8.0;
     scalar Cd2      = 3.0;
+    // SpalartAllmarasDES: no delay function, dTilda = min(psi CDES delta, y) (SpalartAllmarasDES.C:120-132); the same
+    // dTilda as DDES's with fd = 1
+    bool   plainDES = false;
     // ZDES2020 (Deck & Renard 2020, OF `shielding ZDES2020`): a SECOND shielding built from the
     // wall-normal derivatives of nuTilda and of |curl U|, which protects the boundary layer where the
     // standard fd would already have released it. Off unless the case asks for it.

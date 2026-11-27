@@ -67,7 +67,18 @@ struct KOmegaSSTCoeffs
     // whether the dict named it, which is what :137-138's getOrDefault asks.
     scalar Cmu = 0.09;
     bool   CmuInDict = false;
-    scalar CDES1 = 0.78, CDES2 = 0.61;                 // kOmegaSST-DES/DDES C_DES blend (OF kOmegaSSTDES defaults)
+    // kOmegaSST-IDDES's C_DES blend as this IDDES has always read it: keys CDES1 and CDES2, 0.78 and 0.61. NOT OpenFOAM's
+    // (kOmegaSSTIDDES inherits kOmegaSSTDES's CDESkom and CDESkeps below); IDDES keeps it until its own witness.
+    scalar CDES1 = 0.78, CDES2 = 0.61;
+    // kOmegaSSTDES and kOmegaSSTDDES (kOmegaSSTDES.C, kOmegaSSTDDES.C, v2412), from LES.optionalSubDict(type() + "Coeffs"):
+    // CDES = F1 CDESkom + (1 - F1) CDESkeps (kOmegaSSTDES.C:211-225, .H:104-107); the DDES delay function's Cd1 and Cd2
+    // (kOmegaSSTDDES.C:163-187, Cd1 22 under useSigma, which is refused) and its kappa (kOmegaSSTDES.C:202-206) -- the
+    // model's own, which is not the wall function's (that one is the wall patch's, kappa and E above);
+    // desShielded: DDES's fd, false for plain DES's min(lLES, lRAS).
+    scalar CDESkom = 0.82, CDESkeps = 0.60;
+    scalar Cd1 = 20.0, Cd2 = 3.0;
+    scalar desKappa = 0.41;
+    bool   desShielded = true;
     // kOmegaSST-IDDES (Gritskevich/Garbaruk/Schuetze/Menter 2012) blending constants. Exponents fixed per the reference
     // (f_dt cube, f_l ^10, f_t cube); only the multipliers are carried here (shared values with SA-IDDES).
     scalar Cdt1 = 20.0, Cl = 5.0, Ct = 1.87, Cw = 0.15;

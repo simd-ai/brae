@@ -139,6 +139,13 @@ add_test(NAME pimple_tjunction_sa_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}
 set_tests_properties(pimple_tjunction_sa_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
                      ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_pimpleFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 
+# The DES family's length scales on a 3-D backward-facing step whose shear layer leaves OpenFOAM's DDES unshielded:
+# kOmegaSSTDES and kOmegaSSTDDES (dTilda, CDESkom/CDESkeps, the delay function, after the omega solve), SpalartAllmarasDES
+# and DDES, and the wall nut held across outer correctors; every entry at steps 1-5 against OpenFOAM, five controls.
+add_test(NAME pimple_des_step_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_des_step_vs_openfoam.sh)
+set_tests_properties(pimple_des_step_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
+                     ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_pimpleFoam>")
+
 # A fixed-deltaT restart's time state against OpenFOAM on RAS/TJunction: restarted = continuous at timePrecision 18, the
 # runTime writes from the resolved start, timeStep writes and functionObject steps on uniform/time's index (0 without one),
 # the final write under the time reached; three controls.
