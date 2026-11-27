@@ -546,8 +546,29 @@ inline void writePatchEntry(
     }
     else if (d.hasInletValue)
     {
-        os << "        " << ((totalPsi && !d.totalRefKey.empty()) ? d.totalRefKey + std::string(14 - d.totalRefKey.size(), ' ')
-                                                                   : std::string("inletValue      "));
+        // The slot under the key the type's own write() uses: outletInletFvPatchField.C:135 `outletValue`,
+        // freestreamFvPatchField.C:202, freestreamPressureFvPatchScalarField.C:129 and freestreamVelocityFvPatchVectorField.C:115
+        // `freestreamValue`, inletOutletFvPatchField.C:135 `inletValue`. Written as `inletValue` for all of them, OpenFOAM
+        // could not start from brae's write of airFoil2D ("Required entry 'freestreamValue' missing") or of an outletInlet nut
+        // on TJunction ("... 'outletValue' missing"; Arrhenius 5853257). CONTROL BRAE_CONTROL_INLET_SLOT_KEY_INLETVALUE=1:
+        // `inletValue` for every type, as before
+        static const bool inletKeyAlways = std::getenv("BRAE_CONTROL_INLET_SLOT_KEY_INLETVALUE") != nullptr;
+        if (totalPsi && !d.totalRefKey.empty())
+        {
+            os << "        " << d.totalRefKey + std::string(14 - d.totalRefKey.size(), ' ');
+        }
+        else if (!inletKeyAlways && (d.type == "freestream" || d.type == "freestreamPressure" || d.type == "freestreamVelocity"))
+        {
+            os << "        freestreamValue ";
+        }
+        else if (!inletKeyAlways && d.type == "outletInlet")
+        {
+            os << "        outletValue     ";
+        }
+        else
+        {
+            os << "        inletValue      ";
+        }
         writeFieldValue(os, d.inletUniform, d.inletUniformValue, d.inletValues);
     }
     if (d.type == "fanPressure")
