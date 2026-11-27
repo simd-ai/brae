@@ -23,6 +23,9 @@
 #   AW  the continuations from brae's writes (AS's 52, AP's 2e-05): the freestream patches' key, OpenFOAM and brae continued
 #       from them against OpenFOAM continued from its own (see the AW block for why that is the oracle)
 #   AR  AS with p's inlet freestreamPressure given `inletValue` in place of `freestreamValue`: both codes refuse it
+#   AO  AP with momentumPredictor no: HbyA_b on the freestream faces is U's stored patch values (constrainHbyA)
+#   AM  AS with U's inlet and outlet a plain `mixed` at the start's freestream valueFraction, fixed, and p plain (inlet
+#       zeroGradient, outlet fixedValue); AMP the same under pimpleFoam (as AP). See the AO/AM block
 # CHECKS, each entry (the internal field and every patch's written value) on its own scale (tests/pimple_entry_compare.py),
 # at the three written times; phi on its own line:
 #   AS      p U nuTilda nut and phi within BOUND_SIMPLE
@@ -36,6 +39,8 @@
 #   BRAE_CONTROL_SA_CTOR_BOUND=1             AP and AN: bound(nuTilda, 0) at construction, which lifts the start's zero
 #                                            cells (and AN's negative ones) to their neighbours' average
 #   BRAE_CONTROL_SA_BOUND_CAP_HELD=1         AP: an outflow face held at the bound's floor until the next evaluate
+#   BRAE_CONTROL_FREESTREAM_HBYA_REBLEND=1   AO: HbyA_b re-blended from the cells with the assembly's valueFraction, as before
+#   BRAE_CONTROL_MIXED_VF_FREESTREAM=1       AM, AMP: a plain mixed's valueFraction replaced by the freestream formula, as before
 #   BRAE_CONTROL_INLET_SLOT_KEY_INLETVALUE=1 AW: the freestream patches written under `inletValue`, as before; OpenFOAM must
 #                                            refuse to continue from it
 # MEASURED (Arrhenius, one GH200, OpenFOAM v2412 serial, 2026-11-27):
@@ -49,6 +54,9 @@
 #     refused to continue ("Required entry 'freestreamValue' missing"), brae ran the misnamed case. With the change: the key
 #     right, OpenFOAM continued from brae's write 3.0e-10 (simpleFoam, 53) and 4.0e-09 (pimpleFoam) from OpenFOAM continued
 #     from its own, brae continued from its own 4.5e-10 and 3.0e-09 (5853995); brae refuses AR by name; the key control red.
+#   AO/AM/AMP on develop b266cca9 (job 5856015): AO U 3.5e-07 (outlet) and p 2.7e-04, AMP U 5.6e-05 and p 5.5e-02, AM 2.3e-03 (p).
+#     With the change: AO 3.7e-09 (phi 8.0e-09), AMP 4.2e-09, AM 4.0e-10; p printed: AO 2.6e-06 as AP's, AMP 2.1e-05 -- the open
+#     pimpleFoam p gap with a mixed U, which simpleFoam does not have (AM's p 7e-11). Controls 3.5e-07, 4.9e-05, 2.6e-05.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
@@ -267,6 +275,134 @@ else
     say "AN: brae ran ($(grep -a -m1 -i -E 'refus|error|unsupported' "$W/AN-br/log" | cut -c1-120))" FAIL
 fi
 
+# AO: AP with momentumPredictor no. constrainHbyA.C:58-69 sets HbyA_b = U.boundaryField() on a patch that is not assignable (mixed,
+# so freestreamVelocity): the STORED patch values. With no predictor nothing evaluates U before the first corrector, so they are
+# the previous step's evaluate (at step 1 the file's value), not the cells re-blended with the valueFraction the assembly rebuilt.
+# AM, AMP: U's inlet and outlet a plain `mixed` (refValue the freestream value, refGradient 0, valueFraction FIXED at the start's
+# freestream value, from the start's patch values and the face normals) and p plain (inlet zeroGradient, outlet fixedValue at its
+# written value), under simpleFoam (AM, 50 -> 53) and pimpleFoam (AMP, as AP). mixedFvPatchField's updateCoeffs changes nothing: the
+# valueFraction stays the dictionary's
+retype()   # <file> <patch> <type>: the patch's type replaced, its freestreamValue/inletValue dropped, its value kept
+{
+    python3 - "$@" <<'EOF'
+import re, sys
+f, patch, t = sys.argv[1:4]
+s = open(f).read()
+i = s.index('boundaryField')
+m = re.search(r'\n(\s*)%s\s*\n\s*\{' % re.escape(patch), s[i:])
+a = i + m.end()
+d, e = 1, a
+while d:
+    d += {'{': 1, '}': -1}.get(s[e], 0)
+    e += 1
+body = s[a:e - 1]
+body = re.sub(r'\btype\s+\w+\s*;', 'type            %s;' % t, body, count=1)
+body = re.sub(r'\n\s*(freestreamValue|inletValue)\s+[^;]*;', '', body)
+open(f, 'w').write(s[:a] + body + s[e - 1:])
+EOF
+}
+tomixed()   # <case> <time>: U's freestreamVelocity patches -> plain mixed, valueFraction fixed at the start's freestream value
+{
+    python3 - "$1" "$2" <<'EOF'
+import gzip, os, re, sys
+c, t = sys.argv[1:3]
+def rd(path):
+    return open(path).read() if os.path.exists(path) else gzip.open(path + '.gz', 'rt').read()
+def flist(path, conv):
+    s = rd(path)
+    m = re.search(r'\n(\d+)\s*\n\(', s)
+    n = int(m.group(1))
+    body = s[m.end():]
+    if conv == 'vec':
+        return [tuple(float(x) for x in v.split()) for v in re.findall(r'\(([^()]*)\)', body)[:n]]
+    return [[int(x) for x in v.split()] for v in re.findall(r'\d+\(([^()]*)\)', body)[:n]]
+pts = flist(c + '/constant/polyMesh/points', 'vec')
+faces = flist(c + '/constant/polyMesh/faces', 'face')
+bnd = rd(c + '/constant/polyMesh/boundary')
+def area(f):
+    x0 = pts[f[0]]
+    a = [0.0, 0.0, 0.0]
+    for p, q in zip(f[1:-1], f[2:]):
+        u = [pts[p][k] - x0[k] for k in range(3)]
+        v = [pts[q][k] - x0[k] for k in range(3)]
+        a[0] += 0.5 * (u[1] * v[2] - u[2] * v[1])
+        a[1] += 0.5 * (u[2] * v[0] - u[0] * v[2])
+        a[2] += 0.5 * (u[0] * v[1] - u[1] * v[0])
+    return a
+U = open(c + '/' + t + '/U').read()
+for patch in ('inlet', 'outlet'):
+    m = re.search(r'\n\s*%s\s*\n\s*\{[^}]*?nFaces\s+(\d+);\s*startFace\s+(\d+);' % patch, bnd)
+    nf, sf = int(m.group(1)), int(m.group(2))
+    i0 = U.index('boundaryField')
+    pm = re.search(r'\n(\s*)%s\s*\n\s*\{' % patch, U[i0:])
+    a = i0 + pm.end()
+    d, e = 1, a
+    while d:
+        d += {'{': 1, '}': -1}.get(U[e], 0)
+        e += 1
+    body = U[a:e - 1]
+    fv = re.search(r'freestreamValue\s+uniform\s+\(([^)]*)\)\s*;', body).group(1)
+    vm = re.search(r'value\s+nonuniform\s+List<vector>\s*\n?(\d+)\s*\n?\(', body)
+    vals = [tuple(float(x) for x in v.split()) for v in re.findall(r'\(([^()]*)\)', body[vm.end():])[:nf]]
+    vfs = []
+    for k in range(nf):
+        A = area(faces[sf + k])
+        mA = sum(x * x for x in A) ** 0.5
+        up = vals[k]
+        mu = sum(x * x for x in up) ** 0.5
+        vfs.append(0.5 - 0.5 * sum(up[q] * A[q] / mA for q in range(3)) / mu)
+    new = ('\n        type            mixed;\n        refValue        uniform (%s);\n        refGradient     uniform (0 0 0);\n'
+           '        valueFraction   nonuniform List<scalar>\n%d\n(\n%s\n)\n;\n        value           nonuniform List<vector>\n%d\n(\n%s\n)\n;\n    '
+           % (fv, nf, '\n'.join('%.17g' % x for x in vfs), nf, '\n'.join('(%s)' % ' '.join('%.17g' % y for y in v) for v in vals)))
+    U = U[:a] + new + U[e - 1:]
+open(c + '/' + t + '/U', 'w').write(U)
+EOF
+}
+pimple_arm()   # <arm> <note>: OpenFOAM and brae on a staged pimpleFoam arm, U nuTilda nut held, p printed
+{
+    cp -r "$W/$1" "$W/$1-of"
+    cp -r "$W/$1" "$W/$1-br"
+    ofrun "$W/$1-of" pimpleFoam || { echo "FAIL: OpenFOAM $1"; tail -5 "$W/$1-of/log"; exit 1; }
+    if ( cd "$W/$1-br" && "$PIMPLE" -case . > log 2>&1 ); then
+        judge "$1" 1e-05,2e-05,3e-05 "$BOUND" "U nuTilda nut"
+        say "$1: p, not held ($2): worst entry $(python3 "$CMP" "$W/$1-of" "$W/$1-br" 1e-05,2e-05,3e-05 p | awk '/^MAX/{print $2, $3, $5}')" INFO
+    else
+        say "$1: brae ran ($(grep -a -m1 -i -E 'refus|error|unsupported' "$W/$1-br/log" | cut -c1-120))" FAIL
+    fi
+}
+rm -rf "$W/AO" "$W/AO-of" "$W/AO-br"
+cp -r "$W/AP" "$W/AO"
+python3 - "$W/AO/system/fvSolution" <<'EOF'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+s, n = re.subn(r'(PIMPLE\s*\{)', r'\1\n    momentumPredictor no;', s, count=1)
+assert n == 1
+open(p, 'w').write(s)
+EOF
+pimple_arm AO "the open pimpleFoam p gap, as AP's"
+rm -rf "$W/AMP" "$W/AMP-of" "$W/AMP-br"
+cp -r "$W/AP" "$W/AMP"
+tomixed "$W/AMP" 0
+retype "$W/AMP/0/p" inlet zeroGradient
+retype "$W/AMP/0/p" outlet fixedValue
+[ "$(grep -c -E 'type +mixed;' "$W/AMP/0/U")" = 2 ] && say "AMP: staged (U inlet and outlet plain mixed, p plain)" PASS \
+    || say "AMP: staged (U inlet and outlet plain mixed, p plain)" FAIL
+pimple_arm AMP "the open pimpleFoam p gap with a mixed U, larger with p plain"
+rm -rf "$W/AM" "$W/AM-of" "$W/AM-br"
+cp -r "$W/AS" "$W/AM"
+tomixed "$W/AM" 50
+retype "$W/AM/50/p" inlet zeroGradient
+retype "$W/AM/50/p" outlet fixedValue
+cp -r "$W/AM" "$W/AM-of"
+cp -r "$W/AM" "$W/AM-br"
+ofrun "$W/AM-of" simpleFoam || { echo "FAIL: OpenFOAM AM"; tail -5 "$W/AM-of/log"; exit 1; }
+if ( cd "$W/AM-br" && BRAE_SIMPLE_CASE_SOLVER=1 "$BRAE" -case . > log 2>&1 ); then
+    judge AM 51,52,53 "$BOUND_SIMPLE"
+else
+    say "AM: brae ran ($(grep -a -m1 -i -E 'refus|error|unsupported' "$W/AM-br/log" | cut -c1-120))" FAIL
+fi
+
 # AW: OpenFOAM starts from brae's own writes. freestream, freestreamPressure and freestreamVelocity write their reference value
 # under `freestreamValue` (freestreamFvPatchField.C:202, freestreamPressureFvPatchScalarField.C:129,
 # freestreamVelocityFvPatchVectorField.C:115) and their dictionary constructors require it. The oracle for a continuation is
@@ -415,6 +551,18 @@ ctlp()   # <env> <arm> <time> <field> <entry>: a pimpleFoam arm rerun by brae un
 ctlp BRAE_CONTROL_SA_CTOR_BOUND=1 AP 1e-05 nuTilda internal
 ctlp BRAE_CONTROL_SA_CTOR_BOUND=1 AN 1e-05 nuTilda internal
 ctlp BRAE_CONTROL_SA_BOUND_CAP_HELD=1 AP 1e-05 nuTilda outlet
+ctlp BRAE_CONTROL_FREESTREAM_HBYA_REBLEND=1 AO 3e-05 U outlet
+ctlp BRAE_CONTROL_MIXED_VF_FREESTREAM=1 AMP 1e-05 phi outlet
+if [ -d "$W/AM-of" ]; then
+    rm -rf "$W/AM-ctl"
+    cp -r "$W/AM" "$W/AM-ctl"
+    ( cd "$W/AM-ctl" && BRAE_SIMPLE_CASE_SOLVER=1 BRAE_CONTROL_MIXED_VF_FREESTREAM=1 "$BRAE" -case . > log 2>&1 ) \
+        || say "control BRAE_CONTROL_MIXED_VF_FREESTREAM=1: brae ran on AM" FAIL
+    r=$(python3 "$CMP" "$W/AM-of" "$W/AM-ctl" 51 U | awk '$3 == "inlet" {print $10}')
+    python3 -c "import sys; sys.exit(0 if '$r' and float('$r') > float('$CB') else 1)" \
+        && say "control BRAE_CONTROL_MIXED_VF_FREESTREAM=1: AM U inlet at 51 goes red (rel $r)" PASS \
+        || say "control BRAE_CONTROL_MIXED_VF_FREESTREAM=1: AM U inlet at 51 goes red (rel ${r:-none})" FAIL
+fi
 # The key control: brae writes the freestream patches' value as `inletValue`, and OpenFOAM must refuse to start from it
 if [ -d "$W/AS-of" ]; then
     rm -rf "$W/AS-keyctl"

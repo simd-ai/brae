@@ -305,6 +305,10 @@ public:
     // other patch type. The device builder reads them to set the per-component valueFraction and to
     // recompute the rotated value each step.
     virtual const tensor* wedgeFaceT() const { return nullptr; }
+    // A mixed patch whose valueFraction is the freestream family's flow-angle formula, recomputed at every updateCoeffs
+    // (freestreamVelocityFvPatchVectorField.C:106, freestreamPressureFvPatchScalarField.C:119). A plain `mixed` keeps the
+    // valueFraction its dictionary gave (mixedFvPatchField.C, updateCoeffs changes nothing)
+    virtual bool freestreamValueFraction() const { return false; }
     virtual const tensor* wedgeCellT() const { return nullptr; }
     // flowRateInletVelocity: the dict flow rate AS ONE NUMBER, for the drivers that take it once. A rate
     // that depends on time (a `coded` Function1) has no one number, and the patch refuses by name here --
@@ -2103,6 +2107,7 @@ public:
         if (readValue.size() == static_cast<std::size_t>(p.size)) this->value_ = std::move(readValue);
     }
     bool fixesValue() const override { return true; }               // OF mixedFvPatchField::fixesValue() == true
+    bool freestreamValueFraction() const override { return freestream_; }
     // the blend of the cells and the reference by a fraction updateFromFlux set: nothing of its own value
     bool evaluateRepeats() const override { return true; }
     int  bcCategory() const override { return 5; }                  // device: mixed (per-face valueFraction blend)

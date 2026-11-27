@@ -19,7 +19,15 @@
 // 8.5e-02 -> 3.6e-03 when the wedge left the mixed mask.
 //
 // Leg 2 is the regression proper and Leg 3 is its discrimination: a genuine freestream patch in the same
-// fixture MUST still be updated, so "stop calling the updater" cannot pass this file.
+// fixture MUST still be updated, so "stop calling the updater" cannot pass this file. That patch is built
+// as the reader builds freestreamVelocity and freestreamPressure (freestream = true). Before the device
+// kept a freestream mask of its own it was built without the flag, a plain `mixed` by brae's own type
+// model, and Leg 3 passed only because the updater swept every mixed face.
+//
+// Leg 3b: a plain `mixed` (wallYmin) keeps the valueFraction its dictionary stated through the same
+// update. mixedFvPatchField::updateCoeffs does not change it; only freestreamVelocity (.C:106) and
+// freestreamPressure (.C:119) recompute theirs. Control BRAE_CONTROL_MIXED_VF_FREESTREAM=1 (the device
+// sweeps every mixed face again) turns it red.
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
 #include "fv_patch.cuh"
@@ -82,7 +90,9 @@ int main()
         p.internal[c] = 10.0 + c;
     }
 
-    std::size_t wedgePatch = 0, freePatch = 1;
+    std::size_t wedgePatch = 0, freePatch = 1, plainPatch = 2;
+    const scalar plainVfU = 0.3;
+    const scalar plainVfP = 0.6;
     for (std::size_t pi = 0; pi < fvp.size(); ++pi)
     {
         const FvPatch& q = fvp[pi];
@@ -96,11 +106,30 @@ int main()
         else if (pi == freePatch)
         {
             U.boundary.push_back(std::make_unique<MixedPatchField<vector>>(q, true, vector{9, 9, 9},
-                                                                          std::vector<vector>{}, true));
+                                                                          std::vector<vector>{}, true,
+                                                                          /*freestream=*/true));
             H.boundary.push_back(std::make_unique<MixedPatchField<vector>>(q, true, vector{9, 9, 9},
-                                                                          std::vector<vector>{}, true));
+                                                                          std::vector<vector>{}, true,
+                                                                          /*freestream=*/true));
             p.boundary.push_back(std::make_unique<MixedPatchField<scalar>>(q, true, scalar(0),
-                                                                          std::vector<scalar>{}, false));
+                                                                          std::vector<scalar>{}, false,
+                                                                          /*freestream=*/true));
+        }
+        else if (pi == plainPatch)
+        {
+            // As the reader builds a plain `mixed`: velocitySign true, the case's valueFraction set.
+            auto mu = std::make_unique<MixedPatchField<vector>>(q, true, vector{9, 9, 9},
+                                                                std::vector<vector>{}, true);
+            mu->setValueFraction(std::vector<scalar>(static_cast<std::size_t>(q.size), plainVfU));
+            U.boundary.push_back(std::move(mu));
+            auto mh = std::make_unique<MixedPatchField<vector>>(q, true, vector{9, 9, 9},
+                                                                std::vector<vector>{}, true);
+            mh->setValueFraction(std::vector<scalar>(static_cast<std::size_t>(q.size), plainVfU));
+            H.boundary.push_back(std::move(mh));
+            auto mp = std::make_unique<MixedPatchField<scalar>>(q, true, scalar(0),
+                                                                std::vector<scalar>{}, true);
+            mp->setValueFraction(std::vector<scalar>(static_cast<std::size_t>(q.size), plainVfP));
+            p.boundary.push_back(std::move(mp));
         }
         else
         {
@@ -182,6 +211,21 @@ int main()
             if (patchOf[i] == (label)freePatch)
                 for (int k = 0; k < 3; ++k) moved = std::max(moved, std::fabs(now[k][i] - was[k][i]));
         check(moved > 0.1, "discrimination: the freestream patch's valueFraction IS recomputed from the flux");
+
+        // ---- Leg 3b: a plain `mixed` keeps the valueFraction its dictionary stated ---------------
+        std::vector<scalar> vfP;
+        dbP.valueFraction.copyTo(vfP);
+        int nPlain = 0;
+        scalar plainMoved = 0;
+        for (int i = 0; i < nB; ++i)
+            if (patchOf[i] == (label)plainPatch)
+            {
+                ++nPlain;
+                for (int k = 0; k < 3; ++k) plainMoved = std::max(plainMoved, std::fabs(now[k][i] - plainVfU));
+                plainMoved = std::max(plainMoved, std::fabs(vfP[i] - plainVfP));
+            }
+        check(nPlain > 0, "vacuity guard: the fixture has a plain mixed patch");
+        check(plainMoved == 0.0, "a plain mixed U and p keep their stated valueFraction through the update");
     }
 
     // ---- Leg 4: the resulting laplacian coefficients are per-component, not a wall ----------------
