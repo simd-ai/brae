@@ -33,11 +33,10 @@
 # CHECKS, each entry (the internal field and every patch's written value) on its own scale (tests/pimple_entry_compare.py),
 # at the three written times; phi on its own line:
 #   AS      p U nuTilda nut and phi within BOUND_SIMPLE
-#   AP, AN  U nuTilda nut and phi within BOUND. p is printed, not held: it is 1.9e-06 to 2.3e-06 from OpenFOAM, where
-#           OpenFOAM's own PCG against its GAMG is 9.6e-11, an absolute ~0.2 that stays the same with 1 or 3 pressure
-#           correctors, 1 or 2 outer, the phi file, laminar in place of SpalartAllmaras and p at 1e-15, and is ten times
-#           larger relative to a ten times larger deltaT (Arrhenius 5847146). It is not SpalartAllmaras' and not the
-#           pressure solver's: the freestream U and p conditions under pimpleFoam, an open defect with its own unit
+#   AP, AN  p U nuTilda nut and phi within BOUND. p was 2.3e-06 off until pass 0 of a later corrector took grad(p) --
+#           the explicit part of the corrected laplacian -- from p's STORED freestreamPressure values, as fvc::grad(p)
+#           reads them, not from a blend under the valueFraction that corrector's assembly had just recomputed; OpenFOAM's
+#           own PCG against its GAMG is 9.6e-11
 # Controls, each red on the entry it guards:
 #   BRAE_CONTROL_NUT_PATCH_TYPES_IGNORED=1   AS: nut's freestream outflow faces at the start file's value
 #   BRAE_CONTROL_SA_CTOR_BOUND=1             AP and AN: bound(nuTilda, 0) at construction, which lifts the start's zero
@@ -47,6 +46,8 @@
 #   BRAE_CONTROL_FREESTREAM_HBYA_REBLEND=1   AO: HbyA_b re-blended from the cells with the assembly's valueFraction, as before
 #   BRAE_CONTROL_MIXED_VF_FREESTREAM=1       AM, AMP: a plain mixed's valueFraction replaced by the freestream formula, as before
 #   BRAE_CONTROL_RELAX_UNNAMED_AS_ONE=1      AMP: U relaxed with factor 1 though the case names none, as before
+#   BRAE_CONTROL_PASS0_P_GRAD_REBLEND=1      AP: a later corrector's pass-0 grad(p) from p's freestream faces re-blended under
+#                                            the new valueFraction, as before
 #   BRAE_CONTROL_INLET_SLOT_KEY_INLETVALUE=1 AW: the freestream patches written under `inletValue`, as before; OpenFOAM must
 #                                            refuse to continue from it
 # MEASURED (Arrhenius, one GH200, OpenFOAM v2412 serial, 2026-11-27):
@@ -66,8 +67,11 @@
 #     With the change: AO 3.7e-09 (phi 8.0e-09), AMP 4.2e-09, AM 4.0e-10; p printed: AO 2.6e-06 as AP's, AMP 2.1e-05, which
 #     simpleFoam does not have (AM's p 7e-11). Controls 3.5e-07, 4.9e-05, 2.6e-05.
 #   AMP's p (job 5860186): 2.1e-05 with U relaxed with 1, 4.2e-10 without, so it is held; the control 2.1e-05. The same
-#     change on 5860090's staging at valueFraction 0: 2.9e-05 -> 3.5e-11. AP's and AO's p stay printed: with freestreamVelocity
-#     and freestreamPressure 2.3e-06 remains, at the inlet at step 1.
+#     change on 5860090's staging at valueFraction 0: 2.9e-05 -> 3.5e-11.
+#   AP, AN, AO and AW's p (job 5860648): 2.3e-06, 2.3e-06, 3.0e-06 and 6.9e-07 with pass 0's grad(p) re-blended; 9.6e-11,
+#     9.6e-11, 1.0e-10 and 9.2e-12 from the stored values, so p is held. It needs freestreamPressure and a second corrector:
+#     1 outer x 2 correctors 2.4e-05, 2 x 1 exact (5860501). Instrumented, the second corrector's valueFraction and the U
+#     patch values it reads agree with OpenFOAM's to 2e-16 while its p solve did not (5860628). The control 2.3e-06.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BRAE="${BRAE_BIN:-$ROOT/build/brae}"
@@ -275,8 +279,7 @@ EOF
 ofrun "$W/AP-ofpcg" pimpleFoam || { echo "FAIL: OpenFOAM AP with PCG"; tail -5 "$W/AP-ofpcg/log"; exit 1; }
 say "AP: OpenFOAM PCG against OpenFOAM GAMG, worst entry: $(python3 "$CMP" "$W/AP-of" "$W/AP-ofpcg" 1e-05,2e-05,3e-05 $FIELDS | awk '/^MAX/{print $2, $3, $4, $5}')" INFO
 if ( cd "$W/AP-br" && "$PIMPLE" -case . > log 2>&1 ); then
-    judge AP 1e-05,2e-05,3e-05 "$BOUND" "U nuTilda nut"
-    say "AP: p, not held (see the header): worst entry $(python3 "$CMP" "$W/AP-of" "$W/AP-br" 1e-05,2e-05,3e-05 p | awk '/^MAX/{print $2, $3, $5}')" INFO
+    judge AP 1e-05,2e-05,3e-05 "$BOUND" "p U nuTilda nut"
 else
     say "AP: brae ran ($(grep -a -m1 -i -E 'refus|error|unsupported' "$W/AP-br/log" | cut -c1-120))" FAIL
 fi
@@ -302,8 +305,7 @@ cp -r "$W/AN" "$W/AN-of"
 cp -r "$W/AN" "$W/AN-br"
 ofrun "$W/AN-of" pimpleFoam || { echo "FAIL: OpenFOAM AN"; tail -5 "$W/AN-of/log"; exit 1; }
 if ( cd "$W/AN-br" && "$PIMPLE" -case . > log 2>&1 ); then
-    judge AN 1e-05,2e-05,3e-05 "$BOUND" "U nuTilda nut"
-    say "AN: p, not held (see the header): worst entry $(python3 "$CMP" "$W/AN-of" "$W/AN-br" 1e-05,2e-05,3e-05 p | awk '/^MAX/{print $2, $3, $5}')" INFO
+    judge AN 1e-05,2e-05,3e-05 "$BOUND" "p U nuTilda nut"
 else
     say "AN: brae ran ($(grep -a -m1 -i -E 'refus|error|unsupported' "$W/AN-br/log" | cut -c1-120))" FAIL
 fi
@@ -417,7 +419,7 @@ s, n = re.subn(r'(PIMPLE\s*\{)', r'\1\n    momentumPredictor no;', s, count=1)
 assert n == 1
 open(p, 'w').write(s)
 EOF
-pimple_arm AO "the open pimpleFoam p gap, as AP's"
+pimple_arm AO "" "p U nuTilda nut"
 rm -rf "$W/AMP" "$W/AMP-of" "$W/AMP-br"
 cp -r "$W/AP" "$W/AMP"
 tomixed "$W/AMP" 0
@@ -525,9 +527,9 @@ if [ -d "$W/AP-br/2e-05" ]; then
     else
         [ "$r" = ok ] && awheld "OpenFOAM pimpleFoam continued from brae's 2e-05 against from its own, U nuTilda nut at 3e-05" "$W/AW-PO" "$W/AW-P" 3e-05 "$BOUND" "U nuTilda nut" \
             || say "AW: OpenFOAM pimpleFoam continued from brae's 2e-05 ($r)" FAIL
-        [ "$b" = ok ] && awheld "brae pimpleFoam continued from its own 2e-05 against OpenFOAM from its own, U nuTilda nut at 3e-05" "$W/AW-PO" "$W/AW-PB" 3e-05 "$BOUND" "U nuTilda nut" \
+        [ "$b" = ok ] && awheld "brae pimpleFoam continued from its own 2e-05 against OpenFOAM from its own, p U nuTilda nut at 3e-05" "$W/AW-PO" "$W/AW-PB" 3e-05 "$BOUND" "p U nuTilda nut" \
             || say "AW: brae pimpleFoam continued from its own 2e-05 ($b)" FAIL
-        [ "$b" = ok ] && say "AW: p of brae's continuation there, not held (as AP's): $(python3 "$CMP" "$W/AW-PO" "$W/AW-PB" 3e-05 p | awk '/^MAX/{print $2, $3, $5}')" INFO
+        [ "$r" = ok ] && say "AW: p of OpenFOAM continued from brae's 2e-05 there, not held (OpenFOAM's response to the start): $(python3 "$CMP" "$W/AW-PO" "$W/AW-P" 3e-05 p | awk '/^MAX/{print $2, $3, $5}')" INFO
     fi
 fi
 rm -rf "$W/AR" "$W/AR-of" "$W/AR-br"
@@ -601,6 +603,7 @@ fi
 ctlp BRAE_CONTROL_FREESTREAM_HBYA_REBLEND=1 AO 3e-05 U outlet
 ctlp BRAE_CONTROL_MIXED_VF_FREESTREAM=1 AMP 1e-05 phi outlet
 ctlp BRAE_CONTROL_RELAX_UNNAMED_AS_ONE=1 AMP 3e-05 p internal
+ctlp BRAE_CONTROL_PASS0_P_GRAD_REBLEND=1 AP 1e-05 p inlet
 if [ -d "$W/AM-of" ]; then
     rm -rf "$W/AM-ctl"
     cp -r "$W/AM" "$W/AM-ctl"
