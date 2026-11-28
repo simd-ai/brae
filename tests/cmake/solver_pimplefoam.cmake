@@ -174,3 +174,10 @@ set_tests_properties(pimple_fixed_restart_vs_openfoam PROPERTIES SKIP_RETURN_COD
 add_test(NAME pimple_backward_restart_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_backward_restart_vs_openfoam.sh)
 set_tests_properties(pimple_backward_restart_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
                      ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_pimpleFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+
+# controlDict's deltaT and end of run on RAS/pitzDaily: deltaT required, endTime by OpenFOAM's stopAt rule, a run with nothing to
+# do ends cleanly and writes nothing (a restart from past the end included), an unported stopAt refused; each arm against
+# OpenFOAM's own behaviour, one control.
+add_test(NAME pimple_controldict_defaults_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_controldict_defaults_vs_openfoam.sh)
+set_tests_properties(pimple_controldict_defaults_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
+                     ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_pimpleFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
