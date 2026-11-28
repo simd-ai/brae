@@ -148,6 +148,10 @@ public:
         DeviceSimpleResidual& res,
         bool releaseMomentumMatrix = false);
 
+    // Moves every boundary update to OpenFOAM's point for the steps that take them (ofUpdatePoints_), seeding the
+    // inletOutlet faces' stored values once.
+    void enterOpenFoamUpdatePoints();
+
     DeviceSimpleResidual step();
 
     // --- Transient (PIMPLE) interface -- reuses the three composable phases above under an outer/inner-corrector loop,
@@ -1063,11 +1067,10 @@ private:
     // tests/simple_piov_vs_openfoam.sh's header for the measurement that named it.
     bool   hasCmptBC_ = false;
     bool   hasTotalP_ = false;                                 // any totalPressure p patch present (per-step refValue)
-    // Set by pimpleStep: the boundary updates run where OpenFOAM's pimpleFoam runs them, each in the
-    // constructor or evaluate of its own field's equation -- totalPressure at every pressure assembly, for
-    // one. The steady drivers keep their earlier points; their gates hold recorded numbers that were not
-    // re-measured with the change.
-    bool   pimpleUpdatePoints_ = false;
+    // Set by pimpleStep and step() (enterOpenFoamUpdatePoints): the boundary updates run where OpenFOAM's pimpleFoam and
+    // simpleFoam run them, each in the constructor or evaluate of its own field's equation -- totalPressure at every
+    // pressure assembly, for one. rhoSimpleStep keeps the momentum assembly's points.
+    bool   ofUpdatePoints_ = false;
     bool   hasCyclic_ = false;                                 // any cyclic (periodic) interface -> Jacobi-PCG pressure (no AMG)
     DeviceCyclic cyc_;                                          // periodic interface coupling (OF updateInterfaceMatrix)
     // (fvPatch index, face count) of each side stacked into cyc_.phi / ami_.phi, in the order
