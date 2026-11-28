@@ -26,12 +26,20 @@
 #   RESTART        from the 0.002 write, four ways (brae from brae's and from OpenFOAM's, OpenFOAM from brae's and from
 #                  its own): each run's steps replay to the bit from the uniform/time it read (index > 0, so no
 #                  setInitialDeltaT); brae restarted equals brae continuous at 0.003 to the bit, as OpenFOAM's does.
+#   FO             a forces functionObject at executeControl/writeControl timeStep 3, continuous and restarted from 0.002, each
+#                  code on its own steps: a row at every global index divisible by 3 (runTime.timeIndex(), continued from
+#                  uniform/time), carrying the time that code logged there. OpenFOAM's own rows are the premise. Under
+#                  adjustTimeStep brae labelled them start + n x controlDict's deltaT and counted from the restart (TJunction:
+#                  0.003 0.006 0.009 for OpenFOAM's 0.004368 0.011916 0.024959). Control BRAE_CONTROL_FO_STEP_ESTIMATED=1.
 #   CONTROLS       BRAE_CONTROL_PIMPLE_NO_FIRST_SETDELTAT=1 (no setDeltaT.H before step 1): the replay must catch step 1.
 #                  BRAE_CONTROL_PIMPLE_UNTRIMMED=1 (no adjustDeltaT): the replay must catch it and the writes must land
 #                  off OpenFOAM's write times.
 # MEASURED (GB10, 2026-11-21): 26 steps, every one to the bit on both logs; writes 0.001 0.002 0.003 in both codes, with
 # identical uniform/time; restarts 7 steps each, all to the bit; brae
 # restarted = brae continuous exactly; the controls caught at step 1 and on every step (writes 0.00105867 ...).
+# FO (Arrhenius 5863200, 2026-11-28): OpenFOAM's rows on its own steps, 8 continuous (indices 3 ... 24) and 2 restarted
+# (21, 24); brae's the same, at the same printed times (0.000259615 0.000514123 ...; 0.00228571 0.00271429). Develop 49072d1b
+# wrote 0.0003 0.0006 ... and 3 rows after the restart (0.0021 0.0024 0.0027); the control reproduces that.
 # Labels: slow. Honours OFBASHRC; exits 77 without OpenFOAM, a GPU or the binary.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -138,6 +146,71 @@ same = all(open(f'{W}/br/0.003/{f}').read().split('internalField', 1)[1] == open
            for f in ('U', 'p', 'k', 'epsilon', 'nut', 'phi'))
 sys.exit(0 if same else 1)
 PY
+
+# ---- FUNCTION OBJECTS: forces at executeControl/writeControl timeStep 3, continuous and restarted --------------------
+# OpenFOAM's Time::run() executes the step just solved before ++runTime (Time.C:797, 825): its row carries that step's time,
+# and timeStep 3 counts runTime.timeIndex(), which a restart continues from uniform/time. Each code is judged against its
+# OWN steps (the Courant numbers, and so the times, are each code's own): every row at a global index divisible by 3, with
+# the time that code logged at that index. OpenFOAM's rows are the premise.
+foadd()
+{
+    cat >> "$1/system/controlDict" << 'FO'
+
+functions
+{
+    forces1
+    {
+        type            forces;
+        libs            (forces);
+        patches         (lowerWall upperWall);
+        rho             rhoInf;
+        rhoInf          1;
+        CofR            (0 0 0);
+        executeControl  timeStep;
+        executeInterval 3;
+        writeControl    timeStep;
+        writeInterval   3;
+    }
+}
+FO
+}
+stage "$W/fo-of"; foadd "$W/fo-of"; ofrun "$W/fo-of" || { echo "FAIL: OpenFOAM with forces"; tail -5 "$W/fo-of/log"; exit 1; }
+stage "$W/fo-br"; foadd "$W/fo-br"; brrun "$W/fo-br" || { echo "FAIL: brae with forces"; tail -5 "$W/fo-br/log"; exit 1; }
+for c in of br; do
+    mkdir -p "$W/fo-$c-r"; cp -r "$W/fo-$c/constant" "$W/fo-$c/system" "$W/fo-$c-r/"; cp -r "$W/fo-$c/$RS" "$W/fo-$c-r/"
+done
+ofrun "$W/fo-of-r"; brrun "$W/fo-br-r"
+stage "$W/fo-cf"; foadd "$W/fo-cf"; brrun "$W/fo-cf" BRAE_CONTROL_FO_STEP_ESTIMATED=1
+fojudge()   # <case> <start index>: rows at the global indices divisible by 3, each with the time the log gives that index
+{
+    python3 - "$1" "$2" << 'PY'
+import glob
+import re
+import sys
+case, start = sys.argv[1], int(sys.argv[2])
+steps = [float(x) for x in re.findall(r'^Time = ([0-9.eE+-]+)', open(case + '/log').read(), re.M)]
+want = [(start + i + 1, t) for i, t in enumerate(steps) if (start + i + 1) % 3 == 0]
+got = []
+for p in sorted(glob.glob(case + '/postProcessing/forces1/*/force.dat')):
+    for line in open(p):
+        if line.strip() and not line.startswith('#'):
+            got.append(float(line.split()[0]))
+ok = len(got) == len(want) and all(abs(g - w) <= 1e-5 * abs(w) for g, (_, w) in zip(got, want))
+rows = ' '.join('%.6g' % g for g in got[:4]) + (' ...' if len(got) > 4 else '')
+idx = ' '.join(str(i) for i, _ in want[:4]) + (' ...' if len(want) > 4 else '')
+print('%s|%d rows at %s; indices %s' % ('ok' if ok else 'no', len(got), rows, idx))
+PY
+}
+for c in "fo-of:OpenFOAM continuous:0:premise" "fo-of-r:OpenFOAM from its $RS:$(utval "$W/fo-of/$RS" index):premise" \
+         "fo-br:brae continuous:0:FO" "fo-br-r:brae from its $RS:$(utval "$W/fo-br/$RS" index):FO"; do
+    IFS=: read -r d who idx tag <<< "$c"
+    r=$(fojudge "$W/$d" "$idx")
+    [ "${r%%|*}" = ok ] && say "$tag: $who, forces rows on its own steps (${r#*|})" PASS \
+                        || say "$tag: $who, forces rows on its own steps (${r#*|})" FAIL
+done
+r=$(fojudge "$W/fo-cf" 0)
+[ "${r%%|*}" = no ] && say "CONTROL   BRAE_CONTROL_FO_STEP_ESTIMATED=1: the rows leave brae's steps (${r#*|})" PASS \
+                    || say "CONTROL   BRAE_CONTROL_FO_STEP_ESTIMATED=1 went unseen" FAIL
 
 # ---- CONTROLS ------------------------------------------------------------------------------------------------------
 r=$(replay "$W/cf" 0.0001 0 0); case "$r" in *"step 1:"*) say "CONTROL   no setDeltaT before step 1: the replay catches step 1" PASS ;;

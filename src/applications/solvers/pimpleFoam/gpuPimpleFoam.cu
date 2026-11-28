@@ -1167,6 +1167,14 @@ try
             tDone = t;
             indexDone = startIndex + timeIndex;
         }
+        // the step just solved, which the functionObjects execute on at the next Time::loop() (or Time::end()): under
+        // adjustTimeStep the clock's value, deltaT and absolute index (Time::setStep).
+        // CONTROL BRAE_CONTROL_FO_STEP_ESTIMATED=1: the start plus steps times controlDict's deltaT, as before
+        static const bool foStepEstimated = std::getenv("BRAE_CONTROL_FO_STEP_ESTIMATED") != nullptr;
+        if (clock && !foStepEstimated)
+        {
+            time.setStep(clock->value(), clock->deltaT(), static_cast<long>(clock->timeIndex()));
+        }
         // writeControl timeStep counts OpenFOAM's absolute index (Time.C:1112: timeIndex_ % writeInterval)
         const bool isWrite = clock ? clock->writeTime() : time.writeControl().isWriteTime(static_cast<int>(indexDone), t);
         if (isWrite) { writeTimeDir(tn); lastWritten = tn; time.write(); }

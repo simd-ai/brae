@@ -501,6 +501,21 @@ public:
         startIndex_ = index;
     }
 
+    // A driver on OpenFOAM's adaptive clock (gpuPimpleFoam's RunClock under adjustTimeStep): the step just solved, as
+    // Time::run() hands it to the functionObjects before ++runTime (Time.C:797, 825) -- its accumulated value, its own deltaT
+    // and its absolute index. Without it a step is taken as the start plus iterations times controlDict's deltaT, which under
+    // adjustTimeStep labelled forces rows 0.003, 0.006, 0.009 on TJunction where OpenFOAM's are 0.004368, 0.011916, 0.024959,
+    // and counted executeControl timeStep from the restart (Arrhenius 5811201).
+    void setStep(
+        scalar value,
+        scalar deltaT,
+        long index)
+    {
+        stepValue_ = value;
+        stepDeltaT_ = deltaT;
+        stepIndex_ = index;
+    }
+
     Time(const FoamDict& controlDict, WriteControl* wc, int nSteps,
          const std::vector<std::pair<std::string, FunctionObjectList::Factory>>& types = {},
          const std::vector<std::string>& approximatedOutside = {},
@@ -593,6 +608,12 @@ private:
         s.endTime = endTime_;
         s.time = t0 + static_cast<scalar>(iter_) * dt;
         s.timeIndex = startIndex_ ? static_cast<int>(*startIndex_) + iter_ : static_cast<int>(std::llround(t0 / dt)) + iter_;
+        if (stepIndex_)
+        {
+            s.time = stepValue_;
+            s.deltaT = stepDeltaT_;
+            s.timeIndex = static_cast<int>(*stepIndex_);
+        }
         s.writeTime = writtenAt_ == iter_;
         s.timeName = WriteControl::timeName(s.time);
         s.startName = startName_;
@@ -617,6 +638,10 @@ private:
     int                iter_ = 0;
     int                writtenAt_ = -1;
     std::optional<long> startIndex_;
+    // setStep: the adaptive clock's step just solved; unset on a driver that has none
+    std::optional<long> stepIndex_;
+    scalar             stepValue_ = 0;
+    scalar             stepDeltaT_ = 0;
     bool               reportTiming_ = true;
 };
 
