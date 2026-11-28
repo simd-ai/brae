@@ -819,6 +819,36 @@ inline bool relaxLookup(const FoamDict* d, const std::string& name, scalar& out,
     return hit;
 }
 
+// solution::relaxEquation(name, factor) (solution.C:379-410): the name, literally or by regex, else a
+// `default` entry; neither means fvMatrix::relax() leaves the equation as assembled. On a name match
+// `factor` keeps what the caller read; on `default` it takes that entry's value.
+inline bool relaxEquationNamed(const FoamDict* d, const std::string& name, scalar& factor)
+{
+    scalar byName = factor;
+    if (relaxLookup(d, name, byName))
+    {
+        return true;
+    }
+    if (!d)
+    {
+        return false;
+    }
+    // Control: `default` not read, as brae did before.
+    if (const char* c = std::getenv("BRAE_CONTROL_RELAX_DEFAULT_IGNORED"); c && c[0] == '1')
+    {
+        return false;
+    }
+    for (const auto& lv : d->leaves)
+    {
+        if (lv.first == "default")
+        {
+            factor = d->scalarOr("default", scalar(1));
+            return true;
+        }
+    }
+    return false;
+}
+
 inline void readRelaxationFactors(const FoamDict& fvSolution, DeviceSimpleControls& ctl)
 {
     const FoamDict* rf  = fvSolution.subDict("relaxationFactors");
@@ -851,17 +881,35 @@ inline void readRelaxationFactors(const FoamDict& fvSolution, DeviceSimpleContro
     // (`relaxationFactors { nuTilda 0.8; U 0.8; p 0.8; ".*Final" 1.0; }`): the outer loop's initial
     // pressure residual GREW corrector by corrector (0.208 -> 0.256 -> 0.311 -> 0.354) instead of
     // falling, contLocal ran 1e-7 -> 40 over twenty steps, and |U| reached 1.29e+06 against OpenFOAM's
-    // 0.0435. Absent from the dict -> no Final entry -> fall back to the ordinary factor, which is also
-    // what OF does (the lookup simply misses and relax() is skipped for that name).
-    // NO MATCH MEANS NO RELAXATION, which is not the same as "reuse the ordinary factor". OF's relax()
-    // is guarded -- `if (relaxField(name)) relax(factor)` in GeometricField::relax, and the identical
-    // shape in fvMatrix::relax -- so on the final corrector, where the name carries the "Final" suffix,
-    // an unmatched name means relax() is never called and the factor is effectively 1. That is why a
-    // PIMPLE case with a bare `equations { U 0.7; }` still ends each step with an unrelaxed corrector.
-    // Steady SIMPLE is untouched: finalIter is only ever true inside the PIMPLE outer loop.
+    // 0.0435.
+    // NO MATCH MEANS NO RELAXATION, which is neither "reuse the ordinary factor" nor "relax with 1".
+    // fvMatrix::relax() looks the equation up -- with "Final" appended on the last outer corrector
+    // (psi.select(isFinalIteration())) -- and calls relax(alpha) only on a match or a `default` entry
+    // (fvMatrix.C:1250-1263, solution.C:379-410). relax(1) still changes the matrix (see
+    // DeviceSimpleControls::relaxEquationU), so each equation carries whether the case names it, and
+    // the momentum predictor and the turbulence solves leave an unnamed one as assembled. Measured on
+    // airFoil2D under pimpleFoam, whose case names no factor, with U's inlet a plain `mixed` at
+    // valueFraction 0: relaxing with 1 put p 1.2e-06 off OpenFOAM at the first step and U 1.6e-08 at
+    // the inlet, where steady SIMPLE (whose factors are named) was exact.
     ctl.relaxUFinal = 1.0;   relaxLookup(eqSrc,  "UFinal",                     ctl.relaxUFinal);
     ctl.relaxKFinal = 1.0;   relaxLookup(eqSrc,  kName + std::string("Final"), ctl.relaxKFinal);
     ctl.relaxEpsFinal = 1.0; relaxLookup(eqSrc,  sName + "Final",              ctl.relaxEpsFinal);
+    ctl.relaxEquationU        = relaxEquationNamed(eqSrc, "U", ctl.relaxU);
+    ctl.relaxEquationK        = relaxEquationNamed(eqSrc, kName, ctl.relaxK);
+    ctl.relaxEquationEps      = relaxEquationNamed(eqSrc, sName, ctl.relaxEps);
+    ctl.relaxEquationUFinal   = relaxEquationNamed(eqSrc, "UFinal", ctl.relaxUFinal);
+    ctl.relaxEquationKFinal   = relaxEquationNamed(eqSrc, kName + std::string("Final"), ctl.relaxKFinal);
+    ctl.relaxEquationEpsFinal = relaxEquationNamed(eqSrc, sName + "Final", ctl.relaxEpsFinal);
+    // Control: relax every equation the case does not name with factor 1, as brae did before.
+    if (const char* c = std::getenv("BRAE_CONTROL_RELAX_UNNAMED_AS_ONE"); c && c[0] == '1')
+    {
+        ctl.relaxEquationU = true;
+        ctl.relaxEquationK = true;
+        ctl.relaxEquationEps = true;
+        ctl.relaxEquationUFinal = true;
+        ctl.relaxEquationKFinal = true;
+        ctl.relaxEquationEpsFinal = true;
+    }
     ctl.relaxPFinal = 1.0;   relaxLookup(fldSrc, "pFinal", ctl.relaxPFinal, /*pOnly*/!fld);
 
     // A relaxation factor <= 0 divides by zero in the diagonal-relaxation kernel (Inf diag -> NaN). OF's

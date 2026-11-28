@@ -35,6 +35,16 @@ struct DeviceSimpleControls
     // The same factors on the LAST outer corrector (OF's ".*Final" idiom). Default to the ordinary
     // factor so a case without Final entries behaves exactly as before.
     scalar relaxUFinal = 0.7, relaxPFinal = 0.3, relaxKFinal = 0.7, relaxEpsFinal = 0.7;
+    // Whether the case NAMES each equation's factor: by its name, a regex covering it, or `default`
+    // (solution::relaxEquation, solution.C:379-410). fvMatrix::relax() calls relax(alpha) only then
+    // (fvMatrix.C:1250-1263), and relax(1) is not the identity: it adds cmptMax(cmptMag(internalCoeffs))
+    // to the diagonal, takes max(mag(D), sumOff), removes cmptMin(internalCoeffs) and adds (D - D0)*psi
+    // to the source (fvMatrix.C:1150, 1211, 1238, 1245). That moves every cell with a negative boundary
+    // coefficient -- a convective inflow face that does not fix its value -- or with a diagonal below
+    // its off-diagonal sum. readRelaxationFactors sets these from the case; a struct built by hand
+    // keeps relaxing with the factors above, as before.
+    bool relaxEquationU = true, relaxEquationK = true, relaxEquationEps = true;
+    bool relaxEquationUFinal = true, relaxEquationKFinal = true, relaxEquationEpsFinal = true;
     vector bodyForce{0, 0, 0};                     // constant momentum source (drives periodic/cyclic channels). +V*g.
     // lduMatrix::defaultTolerance is 1e-6 for every field (lduMatrix.C:45, read at lduMatrixSolver.C:199);
     // these were 1e-8 / 1e-7 / 1e-8, which a driver bypassing the reader would have run in silence.
@@ -122,6 +132,11 @@ struct DeviceSimpleControls
     scalar pTol()     const { return finalInner ? tolPFinal     : tolP; }
     scalar pRelTol()  const { return finalInner ? relTolPFinal  : relTolP; }
     scalar uRelax()   const { return finalIter  ? relaxUFinal   : relaxU; }
+    bool   uRelaxed() const { return finalIter  ? relaxEquationUFinal : relaxEquationU; }
+    // The factor for a solve that, like fvMatrix::relax(alpha) itself (fvMatrix.C:1104), leaves the
+    // matrix as assembled for alpha <= 0 (deviceSolveScalarTransport): 0 when the case names none.
+    scalar kRelaxEqn()   const { return (finalIter ? relaxEquationKFinal : relaxEquationK) ? kRelax() : scalar(0); }
+    scalar epsRelaxEqn() const { return (finalIter ? relaxEquationEpsFinal : relaxEquationEps) ? epsRelax() : scalar(0); }
     scalar pRelax()   const { return finalIter  ? relaxPFinal   : relaxP; }
     scalar kRelax()   const { return finalIter  ? relaxKFinal   : relaxK; }
     scalar epsRelax() const { return finalIter  ? relaxEpsFinal : relaxEps; }

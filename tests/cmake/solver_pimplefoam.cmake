@@ -146,6 +146,13 @@ add_test(NAME pimple_tjunction_nut_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR
 set_tests_properties(pimple_tjunction_nut_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
                      ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_pimpleFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 
+# Relaxation of an equation the case names no factor for: OpenFOAM does not relax it, and relax(1) is not the identity
+# (fvMatrix.C:1250-1263, 1150-1245). TJunction with k/epsilon, k/omega or nuTilda unnamed and zeroGradient outlets that take
+# backflow, the named premise, and `default`; every entry at steps 1-3 against OpenFOAM, a control per arm.
+add_test(NAME pimple_unnamed_relaxation_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_unnamed_relaxation_vs_openfoam.sh)
+set_tests_properties(pimple_unnamed_relaxation_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
+                     ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_pimpleFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+
 # The DES family's length scales on a 3-D backward-facing step whose shear layer leaves OpenFOAM's DDES unshielded:
 # kOmegaSSTDES and kOmegaSSTDDES (dTilda, CDESkom/CDESkeps, the delay function, after the omega solve), SpalartAllmarasDES
 # and DDES, and the wall nut held across outer correctors; every entry at steps 1-5 against OpenFOAM, five controls.

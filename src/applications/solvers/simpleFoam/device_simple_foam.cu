@@ -1436,7 +1436,7 @@ SimplecSnGrad simplecSnGrad(
             turbGradLim.eLU    = ctl_.gradEpsLULimitK;
             if (ctl_.sa)    // one-equation: dk_ slot holds nuTilda; relaxK/limitedK/twoBykK carry the nuTilda settings
                 deviceSpalartAllmarasCorrect(dm, dbU_, dbK_, Uk_[0], Uk_[1], Uk_[2], dk_, dnut_, y_, phiInt_, phiBnd_,
-                                             ctl_.nu, ctl_.kRelax(), kStopRule(ctl_), ctl_.boundedK, ctl_.limitedK, ctl_.twoBykK,
+                                             ctl_.nu, ctl_.kRelaxEqn(), kStopRule(ctl_), ctl_.boundedK, ctl_.limitedK, ctl_.twoBykK,
                                              ctl_.saCoeffs, ctl_.bicgCheckEvery, ctl_.luK, ctl_.nonOrth,
                                              ctl_.gsK, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr, kDdt,   // nuTilda ddt (kOld_)
                                              ctl_.des, ctl_.iddes, ctl_.iddes ? &hmax_ : nullptr, ctl_.iddes ? &hwn_ : nullptr, &lesDelta_,
@@ -1456,7 +1456,7 @@ SimplecSnGrad simplecSnGrad(
             else if (ctl_.sst)   // de_ slot holds omega; relaxEps/limitedEps/twoBykEps carry the omega-equation settings
             {
                 deviceKOmegaSSTCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_, y_,
-                                       phiInt_, phiBnd_, ctl_.nu, ctl_.epsRelax(), ctl_.kRelax(), kStopRule(ctl_), epsStopRule(ctl_), ctl_.boundedK, ctl_.boundedEps,
+                                       phiInt_, phiBnd_, ctl_.nu, ctl_.epsRelaxEqn(), ctl_.kRelaxEqn(), kStopRule(ctl_), epsStopRule(ctl_), ctl_.boundedK, ctl_.boundedEps,
                                        ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.ksstCoeffs, ctl_.bicgCheckEvery,
                                        ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gradULimitK, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
                                        ctl_.lm ? gammaIntEff_.data() : nullptr,   // LM: scale k Pk/epsilonByk by the lagged gammaIntEff
@@ -1495,7 +1495,7 @@ SimplecSnGrad simplecSnGrad(
             }
             else
                 deviceKEpsilonCorrect(dm, wall_, dbEps_, dbK_, dbU_, Uk_[0], Uk_[1], Uk_[2], dk_, de_, dnut_,
-                                      phiInt_, phiBnd_, ctl_.nu, ctl_.epsRelax(), ctl_.kRelax(), kStopRule(ctl_), epsStopRule(ctl_), ctl_.boundedK, ctl_.boundedEps,
+                                      phiInt_, phiBnd_, ctl_.nu, ctl_.epsRelaxEqn(), ctl_.kRelaxEqn(), kStopRule(ctl_), epsStopRule(ctl_), ctl_.boundedK, ctl_.boundedEps,
                                       ctl_.limitedK, ctl_.limitedEps, ctl_.twoBykK, ctl_.twoBykEps, ctl_.keCoeffs, ctl_.bicgCheckEvery,
                                       ctl_.luK, ctl_.luEps, ctl_.nonOrth, ctl_.gsK, ctl_.gsEps, hasAMI_ ? &ami_ : nullptr, hasCyclic_ ? &cyc_ : nullptr,
                                       static_cast<int>(ctl_.nutWall),   // near-wall G0 uses the same BC-chosen wall nut as the momentum shear
@@ -2418,10 +2418,24 @@ SimplecSnGrad simplecSnGrad(
         // to the assembled diagonal BEFORE relax -- OF assembles fvm::ddt into UEqn, then UEqn.relax(). No-op for SIMPLE.
         deviceFvmDdtDiag(dm.V, ddtc, 1.0, mDiag);
         DeviceBuffer<scalar> delta;   // mDiagR is now a member
-        deviceRelaxDiag(deviceLduView(dm,mDiag,mUp,mLo), dm, r0IC, ctl_.uRelax(), mDiagR, delta,
-                        hasCyclic_ ? cycSumOff.data() : (hasAMI_ ? amiSumOff.data() : nullptr),
-                        hasCmptBC_ ? iCmaxMag.data() : nullptr,
-                        hasCmptBC_ ? iCmin.data() : nullptr);
+        if (ctl_.uRelaxed())
+        {
+            deviceRelaxDiag(deviceLduView(dm,mDiag,mUp,mLo), dm, r0IC, ctl_.uRelax(), mDiagR, delta,
+                            hasCyclic_ ? cycSumOff.data() : (hasAMI_ ? amiSumOff.data() : nullptr),
+                            hasCmptBC_ ? iCmaxMag.data() : nullptr,
+                            hasCmptBC_ ? iCmin.data() : nullptr);
+        }
+        else
+        {
+            // UEqn.relax() with no factor named for U (or UFinal on the last outer corrector) does not
+            // call relax(alpha) (fvMatrix.C:1250-1263): the diagonal stays as assembled and nothing is
+            // added to the source. See DeviceSimpleControls::relaxEquationU for what relax(1) would move.
+            deviceCopy(mDiagR, mDiag);
+            delta.resize(nC_);
+            cudaCheck(cudaMemsetAsync(delta.data(), 0, static_cast<std::size_t>(nC_) * sizeof(scalar),
+                                      cudaStreamPerThread),
+                      "unrelaxed momentum delta");
+        }
         if (stageDumpActive() && stageDumpFirstOnly("mommat"))
         {
             stageDump("stage_mDiag0", mDiag);     // assembled momentum diagonal BEFORE relax (OF D0)
