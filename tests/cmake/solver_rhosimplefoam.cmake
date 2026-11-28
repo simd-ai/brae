@@ -836,6 +836,11 @@ set_tests_properties(rho_leastsquares_closure_vs_openfoam PROPERTIES SKIP_RETURN
 add_test(NAME rho_gasmixing_vs_openfoam
          COMMAND ${PROJECT_SOURCE_DIR}/tests/rho_gasmixing_vs_openfoam.sh)
 set_tests_properties(rho_gasmixing_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600 LABELS slow)
+# gasMixing/injectorPipe's own tracer (scalarTransport) under Euler on both mirror arms, by the same restart protocol:
+# fvm::ddt(rho, s) and OpenFOAM's nCorr + 1 solves, each with its control.
+add_test(NAME rho_tracer_ddt_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/rho_tracer_ddt_vs_openfoam.sh)
+set_tests_properties(rho_tracer_ddt_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 3600 LABELS slow
+                     ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_rhoSimpleFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 
 # THE SIX rhoSimpleFoam TUTORIALS as OpenFOAM ships them, on both mirror arms, meshed by each tutorial's
 # own Allrun.pre -- the standing answer to which of them brae runs. All six RUN on both arms and agree
