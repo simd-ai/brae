@@ -128,14 +128,45 @@ try
     const DdtScheme ddtScheme  = parsePimpleDdtScheme(caseDir + "/system/fvSchemes", ddtOcCoeff);
 
     scalar       startTime     = controlDict.scalarOr("startTime", 0.0);   // resolved below for startFrom latestTime (restart)
-    scalar deltaT              = controlDict.scalarOr("deltaT", 1e-3);   // varies when adjustTimeStep
-    const scalar endTime       = controlDict.scalarOr("endTime", 1.0);
+    // deltaT and the end of the run as OpenFOAM's Time reads them. deltaT is required (TimeIO.C:274, readEntry). Under
+    // `stopAt endTime` so is endTime (:342-346); with no stopAt the end is endTime if present, else 0 (:353-356), a run that
+    // takes no step; any other stopAt sets GREAT (:350) and stops the run through Time::operator++ (Time.C:1166-1180), which
+    // brae does not port. brae ran deltaT 1e-3 and endTime 1 in their place: without deltaT OpenFOAM stops where brae ran,
+    // and without stopAt and endTime OpenFOAM runs nothing where brae ran to its 120 s limit (Arrhenius 5811282).
+    // CONTROL BRAE_CONTROL_CONTROLDICT_DEFAULTS=1: those substitutions, as before
+    static const bool oldTimeDefaults = std::getenv("BRAE_CONTROL_CONTROLDICT_DEFAULTS") != nullptr;
+    if (!oldTimeDefaults && !controlDict.found("deltaT"))
+    {
+        throw std::runtime_error("controlDict has no deltaT, which OpenFOAM requires (TimeIO.C:274)");
+    }
+    const auto openFoamEndTime = [&controlDict]() -> scalar
+    {
+        if (!controlDict.found("stopAt"))
+        {
+            return controlDict.scalarOr("endTime", scalar(0));
+        }
+        const std::string stopAt = controlDict.wordOr("stopAt", "endTime");
+        if (stopAt != "endTime")
+        {
+            throw std::runtime_error("controlDict says `stopAt " + stopAt + "`: OpenFOAM then ignores endTime and stops through "
+                                     "Time::operator++ (writeNow and noWriteNow after the first step, nextWrite at the next "
+                                     "write; Time.C:1166-1180), which brae does not port");
+        }
+        if (!controlDict.found("endTime"))
+        {
+            throw std::runtime_error("controlDict says `stopAt endTime` and has no endTime, which OpenFOAM then requires "
+                                     "(TimeIO.C:346)");
+        }
+        return controlDict.scalarOr("endTime", scalar(0));
+    };
+    scalar deltaT              = controlDict.scalarOr("deltaT", 1e-3);   // varies when adjustTimeStep; 1e-3 the control's
+    const scalar endTime       = oldTimeDefaults ? controlDict.scalarOr("endTime", 1.0) : openFoamEndTime();
     const std::string writeControl = controlDict.wordOr("writeControl", "timeStep");
     const scalar writeInterval = controlDict.scalarOr("writeInterval", 1e30);
     const int    purgeWrite    = std::max(0, controlDict.intOr("purgeWrite", 0));
     const int    precision     = controlDict.intOr("writePrecision", 16);
     if (deltaT <= 0)          throw std::runtime_error("controlDict deltaT must be > 0.");
-    if (endTime <= startTime) throw std::runtime_error("controlDict endTime must be > startTime.");
+    if (oldTimeDefaults && endTime <= startTime) throw std::runtime_error("controlDict endTime must be > startTime.");
 
     // Physics the STEADY driver applies and this one does not yet: refuse the case rather than march it with the
     // source terms quietly missing (an MRF rotation or an fvOptions source dropped is wrong physics that still
@@ -255,6 +286,16 @@ try
     std::string startStr = start.name;
     startTime = static_cast<scalar>(start.value);
     const std::string fieldDir = caseDir + "/" + startStr;
+    // An end that is not after the resolved start (no endTime and no stopAt, or a restart from past the end): OpenFOAM's
+    // Time::run() is false from the start (Time.C:784-791), so the run takes no step, executes no functionObject and writes
+    // nothing. brae refused it (`endTime must be > startTime`), and a restart past the end rewrote its start directory.
+    if (!oldTimeDefaults && !(startTime < endTime - 0.5 * deltaT))
+    {
+        std::printf("gpuPimpleFoam: the end (%g) is not after the start (%g): no time step to take, as OpenFOAM's Time::run()\n",
+                    static_cast<double>(endTime), static_cast<double>(startTime));
+        std::printf("End\n");
+        return 0;
+    }
     // UNDER adjustTimeStep THE LOOP RUNS ON OpenFOAM's CLOCK (work package M4, issue #53): Foam::Time as RunClock carries it
     // (run_clock.cuh, shared with rhoCentralFoam) -- the accumulated value, Time::run, Time::setDeltaT with adjustDeltaT's
     // trimming to the write times, operator++'s write flag and time name -- with deltaT from the start's uniform/time on a
@@ -1192,7 +1233,8 @@ try
         RunTiming::drain();
         if (timingMaster) std::printf("brae-timing loop %.6f %ld\n", RunTiming::now() - loopStart, static_cast<long>(timeIndex));
     }
-    if (finalName != lastWritten) writeTimeDir(finalName);
+    // ...only once a step has been taken: a run that took none writes nothing, as OpenFOAM's
+    if (timeIndex > 0 && finalName != lastWritten) writeTimeDir(finalName);
     return 0;
 }
 catch (const std::exception& e)
