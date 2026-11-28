@@ -646,11 +646,13 @@ public:
     // (so the first post-restart step is full CN, not the Euler bootstrap), and the ddt0 recurrence is already warm.
     void setCnRestart(scalar deltaT0) { deltaT_ = deltaT0; cnWarm_ = true; }
 
-    // backward's old time levels as OpenFOAM writes them, U_0, phi_0, k_0 and epsilon_0/omega_0/nuTilda_0: under backward every
-    // transported field holds a second old level, so its first one is written (GeometricField::storeOldTime hands the field's
-    // writeOpt to field0 once field0 has an old level of its own, GeometricField.C:923-940). The cells are the level at this
-    // step's top; the patch values are what the previous step left, snapshot in advanceTime (storeOldTime's operator==).
+    // backward's and CrankNicolson's old time levels as OpenFOAM writes them, U_0, phi_0, k_0 and epsilon_0/omega_0/nuTilda_0:
+    // under either scheme every transported field holds a second old level (CrankNicolsonDdtScheme::fvmDdt asks for it
+    // unconditionally), so its first one is written (GeometricField::storeOldTime hands the field's writeOpt to field0 once
+    // field0 has an old level of its own, GeometricField.C:923-940). The cells are the level at this step's top; the patch values
+    // are what the previous step left, snapshot in advanceTime (storeOldTime's operator==).
     bool isBackward() const { return ddtScheme_ == DdtScheme::backward; }
+    bool twoOldLevels() const { return ddtScheme_ == DdtScheme::backward || ddtScheme_ == DdtScheme::CrankNicolson; }
     std::vector<vector> Uold() const;
     std::vector<vector> UoldBoundary() const;
     std::vector<scalar> phiOldInternal() const { return phiOldInt_.host(); }
@@ -664,15 +666,35 @@ public:
     // fvSolution PIMPLE/ddtCorr as set: under backward phi.oldTime() is asked for by fvc::ddtCorr alone on a static mesh, so
     // phi_0 exists (and is written) only with it on
     bool ddtCorrOn() const { return ddtCorr_; }
+    // ...under CrankNicolson phi's old-old level is created at ddtCorr's first evaluation (or read with phi_0), so phi_0 is
+    // written from the step after that: whether this step's write carries it
+    bool cnPhiOldWritten() const { return cnPhiOld2At_ >= 0 && timeIndex_ > cnPhiOld2At_; }
 
-    // A backward restart: the old levels OpenFOAM holds at the first restarted step. GeometricField::readOldTimeIfPresent reads
+    // CrankNicolson's ddtCorr fields, ddtCorrDdt0(U) and ddtCorrDdt0(phi), as OpenFOAM writes them (AUTO_WRITE from their
+    // creation, CrankNicolsonDdtScheme::ddt0_): whether they exist yet, and their values
+    bool cnCorrCreated() const { return cnCorrStart_ != -1; }
+    std::vector<vector> cnCorrDdt0U() const;
+    std::vector<vector> cnCorrDdt0UBoundary() const;
+    std::vector<scalar> cnCorrDphidt0Internal() const { return cnCorrDphidt0Int_.host(); }
+    std::vector<scalar> cnCorrDphidt0Boundary() const { return cnCorrDphidt0Bnd_.host(); }
+    // A CrankNicolson restart's ddtCorr fields read from the start: a DDt0Field read so has startTimeIndex_ -2 (both of its
+    // coefficients 1 + ocCoeff at once) and is evaluated on the first restarted step (its timeIndex the start's,
+    // CrankNicolsonDdtScheme.C:48-61, 170-180)
+    void setCnCorrRestart(
+        const std::vector<vector>& ddt0U,
+        const std::vector<vector>& ddt0UBoundary,
+        const std::vector<scalar>& dphidt0Internal,
+        const std::vector<scalar>& dphidt0Boundary,
+        long startIndex);
+
+    // A backward or CrankNicolson restart: the old levels OpenFOAM holds at the first restarted step. GeometricField::readOldTimeIfPresent reads
     // <field>_0 and makes its own old level a copy of it (GeometricField.C:130-166), so at that step's storeOldTime the
     // old-old level is the file's <field>_0 and the old level the field as read. Without the file the level is created as a
     // copy of the field when first asked for (oldTime(), :945-975) and its own old level a copy of that, which is what an
     // entry left empty here gives (advanceTime copies the field). deltaT0 is runTime.deltaT0() at that step: Time::operator++
     // sets it to deltaTSave_ (Time.C:1059), which is controlDict's deltaT, or uniform/time's deltaT under adjustTimeStep
     // (Time.C:196, 294-299); uniform/time's own deltaT0 is overwritten before any ddt reads it.
-    struct BackwardRestart
+    struct OldLevelsRestart
     {
         std::vector<vector> U0;             // empty: U as read
         std::vector<scalar> phi0Internal;   // empty: phi as read (boundary likewise)
@@ -680,8 +702,9 @@ public:
         std::vector<scalar> k0;             // k or nuTilda; empty: as read
         std::vector<scalar> e20;            // epsilon or omega; empty: as read
         scalar deltaT0 = -1;                // runTime.deltaT0() at the first restarted step; <= 0 is refused
+        long   startIndex = -1;             // the start's time index (uniform/time); the first restarted step is the next
     };
-    void setBackwardRestart(const BackwardRestart& r);
+    void setOldLevelsRestart(const OldLevelsRestart& r);
 
     // NVRTC device-coded BC (codedFixedValue on U): compile `code` once into a device kernel over the patch's boundary
     // faces [offset, offset+count) in the flat boundary order. Applied each step in solveMomentumPredictor (writes the
@@ -890,9 +913,12 @@ private:
     // under backward, the patch values U, k and epsilon|omega held at this step's top: the old levels' patch values as
     // OpenFOAM writes them (U_0, k_0, ...), snapshot in advanceTime
     DeviceBuffer<scalar> UbOld_[3], kbOld_, e2bOld_;
-    // setBackwardRestart's deltaT0, which the first advanceTime takes where deltaT_ is still 0; 0 = none (a cold start, whose
+    // setOldLevelsRestart's deltaT0, which the first advanceTime takes where deltaT_ is still 0; 0 = none (a cold start, whose
     // first step bootstraps to Euler as backwardDdtScheme does while timeIndex < 2)
     scalar restartDeltaT0_ = 0;
+    // setOldLevelsRestart was called and the first advanceTime has not run: a level it was not given is copied from the field
+    // there
+    bool   restartSeedPending_ = false;
     DeviceBuffer<scalar> ReThetatOld_, ReThetatOld2_, gammaIntOld_, gammaIntOld2_;   // kOmegaSSTLM transition old-time
     DeviceBuffer<scalar> Uddt0_[3], kddt0_, e2ddt0_, ReThetatddt0_, gammaIntddt0_;   // CrankNicolson stored old ddt (per variable); allocated only for CN
     // Momentum-predictor outputs, shared with the pressure-velocity phase (PIMPLE foundation: solveMomentumPredictor()
@@ -1070,6 +1096,9 @@ private:
     DeviceBuffer<scalar> cnCorrDdt0U_[3], cnCorrDdt0Ub_[3], cnCorrDphidt0Int_, cnCorrDphidt0Bnd_;
     long   cnCorrStart_ = -1;
     long   cnCorrEvaluated_ = -1;
+    // the time index from which phi's old-old level exists (CrankNicolson): ddtCorr's first evaluation, or before the first
+    // restarted step when phi_0 was read; -1 = not yet. phi_0 is written from the step after it.
+    long   cnPhiOld2At_ = -1;
 
     // mesh.phi() from the last move (per mesh face, internal then boundary). Held rather than applied at
     // the move: fvc::makeRelative belongs at the end of the pressure corrector. See makeFluxRelative.
