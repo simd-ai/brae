@@ -606,26 +606,32 @@ try
                 if (std::filesystem::exists(fieldDir + "/ddt0(gammaInt)")) solver.setGammaIntddt0(buildField<scalar>(readField<scalar>(fieldDir + "/ddt0(gammaInt)"), fvp, nC).internal);
             }
         }
-        solver.setCnRestart(deltaT);
+        // deltaT0 at the first restarted step is Time's deltaTSave_: controlDict's deltaT, or uniform/time's under
+        // adjustTimeStep (Time.C:196, 294-299, 1059)
+        solver.setCnRestart(clock ? clock->deltaT() : deltaT);
         std::printf("gpuPimpleFoam: read CrankNicolson ddt0 from %s (seamless CN restart)\n", fieldDir.c_str());
     }
     // backward RESTART. The first restarted step's time index is 2 or more, so backwardDdtScheme takes its full form there
     // (deltaT0_(vf) is GREAT only while timeIndex < 2, backwardDdtScheme.C:62-71), with the old-old levels OpenFOAM read:
-    // <field>_0 from the start directory, or copies of the fields as read without it (DeviceSimpleSolver::setBackwardRestart).
+    // <field>_0 from the start directory, or copies of the fields as read without it (DeviceSimpleSolver::setOldLevelsRestart).
     // brae took Euler's form on that step with no ddtCorr: 0.32 (U) from OpenFOAM's continuous run at the first restarted
     // step of pimpleFoam/RAS/pitzDaily, from OpenFOAM's own write as from brae's (Arrhenius 5811282). A start whose index is 0
     // (no uniform/time) is a cold start for OpenFOAM too, and is left to the first-step bootstrap.
-    // CONTROL BRAE_CONTROL_BACKWARD_NO_OLD_READ=1: no old levels and no deltaT0, the first restarted step bootstrapped as before
+    // ...and the same for CrankNicolson, whose fvmDdt asks for the old-old level unconditionally, when the start carries its
+    // state (ddt0(U)): OpenFOAM then evaluates ddt0 on the first restarted step from the levels it read. Without ddt0(U) the
+    // DDt0Fields are created zero on that step (CrankNicolsonDdtScheme::ddt0_) and the restart is a cold CrankNicolson start.
+    // CONTROL BRAE_CONTROL_BACKWARD_NO_OLD_READ=1 (either scheme): no old levels and no deltaT0, as before
     {
         const long firstIndex = clock ? static_cast<long>(clock->startTimeIndex()) : startIndex;
         static const bool noOldRead = std::getenv("BRAE_CONTROL_BACKWARD_NO_OLD_READ") != nullptr;
-        if (ddtScheme == DdtScheme::backward && firstIndex >= 1 && !noOldRead)
+        const auto present = [&fieldDir](const std::string& name)
         {
-            const auto present = [&fieldDir](const std::string& name)
-            {
-                const std::string path = fieldDir + "/" + name;
-                return std::filesystem::exists(path) || std::filesystem::exists(path + ".gz");
-            };
+            const std::string path = fieldDir + "/" + name;
+            return std::filesystem::exists(path) || std::filesystem::exists(path + ".gz");
+        };
+        const bool cnState = ddtScheme == DdtScheme::CrankNicolson && present("ddt0(U)");
+        if ((ddtScheme == DdtScheme::backward || cnState) && firstIndex >= 1 && !noOldRead)
+        {
             // the levels carried across, and a refusal for any other: OpenFOAM's first restarted step reads every <field>_0 in
             // the start (a tracer's, kOmegaSSTLM's, sigma's, a moving mesh's Uf_0), and brae would run those from copies
             std::set<std::string> carried = {"U_0", "phi_0"};
@@ -663,7 +669,7 @@ try
                                          "field brae does not carry across a backward restart; OpenFOAM's first restarted step "
                                          "reads it");
             }
-            DeviceSimpleSolver::BackwardRestart r;
+            DeviceSimpleSolver::OldLevelsRestart r;
             std::string read;
             if (present("U_0"))
             {
@@ -696,6 +702,7 @@ try
             // runTime.deltaT0() at the first restarted step: deltaTSave_, which is controlDict's deltaT, or uniform/time's deltaT
             // under adjustTimeStep (Time.C:196, 294-299, 1059); the deltaT0 uniform/time holds is overwritten before it is read
             r.deltaT0 = clock ? clock->deltaT() : deltaT;
+            r.startIndex = firstIndex;
             // CONTROL BRAE_CONTROL_BACKWARD_RESTART_DELTAT0_STORED=1: uniform/time's deltaT0, which Time::operator++ overwrites
             static const bool storedDeltaT0 = std::getenv("BRAE_CONTROL_BACKWARD_RESTART_DELTAT0_STORED") != nullptr;
             if (storedDeltaT0 && (std::filesystem::exists(fieldDir + "/uniform/time")
@@ -704,8 +711,74 @@ try
                 std::printf("  *** CONTROL MODE: the restart's deltaT0 from uniform/time. This run is deliberately wrong. ***\n");
                 r.deltaT0 = readDict(fieldDir + "/uniform/time").scalarOr("deltaT0", r.deltaT0);
             }
-            solver.setBackwardRestart(r);
-            std::printf("gpuPimpleFoam: backward restart at time index %ld: old-old levels from%s%s, deltaT0 %g\n", firstIndex,
+            solver.setOldLevelsRestart(r);
+            // CrankNicolson's ddtCorr fields, read as a pair (OpenFOAM writes them together): a field read so is evaluated on
+            // the first restarted step with both coefficients 1 + ocCoeff (DeviceSimpleSolver::setCnCorrRestart)
+            static const bool cnNoCorrRestart = std::getenv("BRAE_CONTROL_CN_NO_CORR_RESTART") != nullptr;
+            if (cnState && !cnNoCorrRestart)
+            {
+                const bool hasU = present("ddtCorrDdt0(U)");
+                const bool hasPhi = present("ddtCorrDdt0(phi)");
+                if (hasU != hasPhi)
+                {
+                    throw std::runtime_error("gpuPimpleFoam: the start " + fieldDir + " holds " +
+                                             (hasU ? "ddtCorrDdt0(U) without ddtCorrDdt0(phi)" : "ddtCorrDdt0(phi) without ddtCorrDdt0(U)") +
+                                             "; OpenFOAM writes them together");
+                }
+                if (hasU)
+                {
+                    const FieldData<vector> fdU = readField<vector>(fieldDir + "/ddtCorrDdt0(U)");
+                    const std::vector<vector> cells = buildField<vector>(fdU, fvp, nC).internal;
+                    std::vector<vector> bnd;
+                    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                    {
+                        if (isCoupledInterfaceType(fvp[pi].type))
+                        {
+                            continue;
+                        }
+                        const std::size_t n = static_cast<std::size_t>(fvp[pi].size);
+                        const PatchFieldData<vector>* pd = nullptr;
+                        for (const auto& b : fdU.boundary)
+                        {
+                            if (b.name == fvp[pi].name)
+                            {
+                                pd = &b;
+                            }
+                        }
+                        if (!pd || !pd->hasValue)
+                        {
+                            bnd.insert(bnd.end(), n, vector{0, 0, 0});
+                        }
+                        else if (pd->valueUniform)
+                        {
+                            bnd.insert(bnd.end(), n, pd->uniformValue);
+                        }
+                        else if (pd->values.size() == n)
+                        {
+                            bnd.insert(bnd.end(), pd->values.begin(), pd->values.end());
+                        }
+                        else
+                        {
+                            throw std::runtime_error("gpuPimpleFoam: ddtCorrDdt0(U)'s patch " + fvp[pi].name + " has " +
+                                                     std::to_string(pd->values.size()) + " values for " + std::to_string(n) +
+                                                     " faces");
+                        }
+                    }
+                    const SurfaceScalarField dphi = readSurfaceField(fieldDir + "/ddtCorrDdt0(phi)", fvp, m.nInternalFaces());
+                    std::vector<scalar> dphiBnd;
+                    for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+                    {
+                        if (!isCoupledInterfaceType(fvp[pi].type) && pi < dphi.boundary.size())
+                        {
+                            dphiBnd.insert(dphiBnd.end(), dphi.boundary[pi].begin(), dphi.boundary[pi].end());
+                        }
+                    }
+                    solver.setCnCorrRestart(cells, bnd, dphi.internal, dphiBnd, firstIndex);
+                    std::printf("gpuPimpleFoam: CrankNicolson restart: read ddtCorrDdt0(U) and ddtCorrDdt0(phi)\n");
+                }
+            }
+            std::printf("gpuPimpleFoam: %s restart at time index %ld: old-old levels from%s%s, deltaT0 %g\n",
+                        cnState ? "CrankNicolson" : "backward", firstIndex,
                         read.empty() ? " the fields as read" : read.c_str(), read.empty() ? "" : " (the rest copies of the fields)",
                         static_cast<double>(r.deltaT0));
         }
@@ -931,19 +1004,34 @@ try
             writeVolFieldRaw(outDir + "/ddt0(U)", "ddt0(U)", "[0 1 -2 0 0 0 0]", solver.Uddt0(), fvp, p17);
             if (ctl.turbulent && !ctl.les) {
                 const std::string kn = ctl.sa ? "nuTilda" : "k";
-                writeVolFieldRaw(outDir + "/ddt0(" + kn + ")", "ddt0(" + kn + ")", "[0 0 0 0 0 0 0]", solver.kddt0(), fvp, p17);
+                // a ddt0 field carries its field's dimensions over time (DDt0Field, dims/dimTime): written dimensionless, OpenFOAM
+                // could not restart from brae's write ("Different dimensions for '(a - b)'", pitzDaily, Arrhenius 5865894)
+                const char* kDims = ctl.sa ? "[0 2 -2 0 0 0 0]" : "[0 2 -3 0 0 0 0]";
+                const char* sDims = secondName == "omega" ? "[0 0 -2 0 0 0 0]" : "[0 2 -4 0 0 0 0]";
+                writeVolFieldRaw(outDir + "/ddt0(" + kn + ")", "ddt0(" + kn + ")", kDims, solver.kddt0(), fvp, p17);
                 if (!ctl.sa)
-                    writeVolFieldRaw(outDir + "/ddt0(" + secondName + ")", "ddt0(" + secondName + ")", "[0 0 0 0 0 0 0]", solver.e2ddt0(), fvp, p17);
+                    writeVolFieldRaw(outDir + "/ddt0(" + secondName + ")", "ddt0(" + secondName + ")", sDims, solver.e2ddt0(), fvp, p17);
                 if (ctl.lm) {
-                    writeVolFieldRaw(outDir + "/ddt0(ReThetat)", "ddt0(ReThetat)", "[0 0 0 0 0 0 0]", solver.reThetatddt0(), fvp, p17);
-                    writeVolFieldRaw(outDir + "/ddt0(gammaInt)", "ddt0(gammaInt)", "[0 0 0 0 0 0 0]", solver.gammaIntddt0(), fvp, p17);
+                    writeVolFieldRaw(outDir + "/ddt0(ReThetat)", "ddt0(ReThetat)", "[0 0 -1 0 0 0 0]", solver.reThetatddt0(), fvp, p17);
+                    writeVolFieldRaw(outDir + "/ddt0(gammaInt)", "ddt0(gammaInt)", "[0 0 -1 0 0 0 0]", solver.gammaIntddt0(), fvp, p17);
                 }
             }
+            // CrankNicolson's ddtCorr fields, AUTO_WRITE from their creation (CrankNicolsonDdtScheme::ddt0_): a restart reads
+            // them and evaluates them on its first step. CONTROL BRAE_CONTROL_CN_NO_CORR_RESTART=1: neither written nor read
+            static const bool cnNoCorrRestart = std::getenv("BRAE_CONTROL_CN_NO_CORR_RESTART") != nullptr;
+            if (solver.cnCorrCreated() && !cnNoCorrRestart)
+            {
+                writeVolFieldRaw(outDir + "/ddtCorrDdt0(U)", "ddtCorrDdt0(U)", "[0 1 -2 0 0 0 0]", solver.cnCorrDdt0U(), fvp, p17,
+                                 solver.cnCorrDdt0UBoundary());
+                writeSurfaceField(outDir + "/ddtCorrDdt0(phi)", solver.cnCorrDphidt0Internal(), solver.cnCorrDphidt0Boundary(),
+                                  fvp, p17, "[0 3 -2 0 0 0 0]", {}, "ddtCorrDdt0(phi)");
+            }
         }
-        if (solver.isBackward())
+        if (solver.twoOldLevels())
         {
-            // backward's old time levels, written as OpenFOAM writes them (DeviceSimpleSolver::isBackward): U_0, phi_0 (asked
-            // for by fvc::ddtCorr alone on a static mesh, so only with it on), and the transported turbulence fields' _0.
+            // backward's and CrankNicolson's old time levels, written as OpenFOAM writes them (DeviceSimpleSolver::isBackward):
+            // U_0, phi_0 (backward: asked for by fvc::ddtCorr alone on a static mesh, so only with it on; CrankNicolson: from the
+            // step after ddtCorr creates phi's old-old level, cnPhiOldWritten), and the transported turbulence fields' _0.
             // Without them a restart cannot continue the run: brae restarted against brae continuous was 0.32 (U) at the
             // first restarted step on pimpleFoam/RAS/pitzDaily, and OpenFOAM's own restart is exact (Arrhenius 5811282).
             // CONTROL BRAE_CONTROL_BACKWARD_NO_OLD_WRITE=1: none written, as before
@@ -952,7 +1040,7 @@ try
             {
                 writeVolField(fieldDir + "/U", outDir + "/U_0", solver.Uold(), fvp, precision, solver.UoldBoundary(),
                               nullptr, nullptr, "U_0");
-                if (solver.ddtCorrOn())
+                if (solver.isBackward() ? solver.ddtCorrOn() : solver.cnPhiOldWritten())
                 {
                     std::map<std::string, std::vector<scalar>> ifPhi0;
                     for (auto& b : solver.interfacePatchFluxOld())

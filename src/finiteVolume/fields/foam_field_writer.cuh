@@ -1158,19 +1158,36 @@ inline void writeVolFieldRaw(
         out << ")\n;\n\n";
     }
     out << "boundaryField\n{\n";
+    // computedBoundary, when given, is the flat list in DeviceBoundary's order (every patch but cyclic/cyclicAMI): its values
+    // are written on the calculated patches. It was ignored, so a field with real patch values (CrankNicolson's
+    // ddtCorrDdt0(U), whose outlet values enter the correction's boundary flux) was written zero there and a restart from
+    // brae's write was 0.37 from OpenFOAM's continuous run (pitzDaily, Arrhenius 5866005)
+    std::size_t off = 0;
     for (const Patch& p : patches)
     {
+        const bool coupled = isCoupledInterfaceType(p.type);
+        const std::size_t n = static_cast<std::size_t>(p.size);
         out << "    " << p.name << "\n    {\n";
         if (isConstraintPatchType(p.type))
             out << "        type            " << p.type << ";\n";
+        else if (!computedBoundary.empty() && !coupled && off + n <= computedBoundary.size())
+        {
+            out << "        type            calculated;\n        value           nonuniform " << foamListType(T{});
+            writeFoamListEntry(out, computedBoundary.data() + off, n);
+        }
         else
         {
             out << "        type            calculated;\n        value           uniform ";
             formatFoamValue(out, T{});
             out << ";\n";
         }
+        if (!coupled)
+            off += n;
         out << "    }\n";
     }
+    if (!computedBoundary.empty() && off != computedBoundary.size())
+        throw std::runtime_error("writeVolFieldRaw: " + objectName + " was handed " + std::to_string(computedBoundary.size()) +
+                                 " boundary values for " + std::to_string(off) + " faces");
     out << "}\n\n\n// ************************************************************************* //\n";
     finishFoamFile(outPath, inMemory, buffer, file, t0);
 }

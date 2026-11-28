@@ -3315,15 +3315,18 @@ SimplecSnGrad simplecSnGrad(
                 {
                     b.copyFrom(std::vector<scalar>(size, scalar(0)));
                 };
-                // ddt0 = rDtCoef0*(o - oo) - offCentre(ddt0)
+                // ddt0 = rDtCoef0*(o - oo) - offCentre(ddt0), the difference taken first as OpenFOAM does: scaling o and oo apart
+                // left 3e-17 on an inlet whose flux does not change, where OpenFOAM's is 0
                 const auto update = [w0](DeviceBuffer<scalar>& d0, scalar rDtCoef0, const DeviceBuffer<scalar>& o,
                                          const DeviceBuffer<scalar>& oo)
                 {
+                    DeviceBuffer<scalar> diff;
+                    deviceCopy(diff, o);
+                    deviceAxpy(scalar(-1), oo, diff);
                     deviceScale(d0, -w0);
-                    deviceAxpy(rDtCoef0, o, d0);
-                    deviceAxpy(-rDtCoef0, oo, d0);
+                    deviceAxpy(rDtCoef0, diff, d0);
                 };
-                if (cnCorrStart_ < 0)
+                if (cnCorrStart_ == -1)   // not created (a restart that read them holds -2)
                 {
                     for (int k = 0; k < 3; ++k)
                     {
@@ -3337,7 +3340,12 @@ SimplecSnGrad simplecSnGrad(
                 }
                 else if (cnCorrEvaluated_ != n)
                 {
-                    const bool firstEvaluation = (cnCorrEvaluated_ == cnCorrStart_);
+                    // phi's old-old level does not exist yet (no phi_0 read, no evaluation before): created now as a copy
+                    const bool firstEvaluation = (cnPhiOld2At_ < 0);
+                    if (firstEvaluation)
+                    {
+                        cnPhiOld2At_ = n;
+                    }
                     const scalar rDtCoef0 = ((n > cnCorrStart_ + 1) ? scalar(1) + oc : scalar(1)) / deltaT0_;
                     for (int k = 0; k < 3; ++k)
                     {
@@ -4764,6 +4772,68 @@ SimplecSnGrad simplecSnGrad(
         return out;
     }
 
+    std::vector<vector> DeviceSimpleSolver::cnCorrDdt0U() const
+    {
+        const std::vector<scalar> x = cnCorrDdt0U_[0].host();
+        const std::vector<scalar> y = cnCorrDdt0U_[1].host();
+        const std::vector<scalar> z = cnCorrDdt0U_[2].host();
+        std::vector<vector> v(x.size());
+        for (std::size_t i = 0; i < x.size(); ++i)
+        {
+            v[i] = vector{x[i], y[i], z[i]};
+        }
+        return v;
+    }
+
+    std::vector<vector> DeviceSimpleSolver::cnCorrDdt0UBoundary() const
+    {
+        const std::vector<scalar> x = cnCorrDdt0Ub_[0].host();
+        const std::vector<scalar> y = cnCorrDdt0Ub_[1].host();
+        const std::vector<scalar> z = cnCorrDdt0Ub_[2].host();
+        std::vector<vector> v(x.size());
+        for (std::size_t i = 0; i < x.size(); ++i)
+        {
+            v[i] = vector{x[i], y[i], z[i]};
+        }
+        return v;
+    }
+
+    void DeviceSimpleSolver::setCnCorrRestart(
+        const std::vector<vector>& ddt0U,
+        const std::vector<vector>& ddt0UBoundary,
+        const std::vector<scalar>& dphidt0Internal,
+        const std::vector<scalar>& dphidt0Boundary,
+        long startIndex)
+    {
+        if (ddtScheme_ != DdtScheme::CrankNicolson)
+        {
+            throw std::runtime_error("brae: setCnCorrRestart on a run whose ddt scheme is not CrankNicolson");
+        }
+        if (ddt0U.size() != static_cast<std::size_t>(nC_) || dphidt0Internal.size() != phiInt_.size()
+            || dphidt0Boundary.size() != phiBnd_.size())
+        {
+            throw std::runtime_error("brae: the CrankNicolson restart's ddtCorrDdt0(U) or ddtCorrDdt0(phi) does not fit the mesh");
+        }
+        for (int k = 0; k < 3; ++k)
+        {
+            std::vector<scalar> c(ddt0U.size()), b(ddt0UBoundary.size());
+            for (std::size_t i = 0; i < ddt0U.size(); ++i)
+            {
+                c[i] = k == 0 ? ddt0U[i].x : (k == 1 ? ddt0U[i].y : ddt0U[i].z);
+            }
+            for (std::size_t i = 0; i < ddt0UBoundary.size(); ++i)
+            {
+                b[i] = k == 0 ? ddt0UBoundary[i].x : (k == 1 ? ddt0UBoundary[i].y : ddt0UBoundary[i].z);
+            }
+            cnCorrDdt0U_[k].copyFrom(c);
+            cnCorrDdt0Ub_[k].copyFrom(b);
+        }
+        cnCorrDphidt0Int_.copyFrom(dphidt0Internal);
+        cnCorrDphidt0Bnd_.copyFrom(dphidt0Boundary);
+        cnCorrStart_ = -2;
+        cnCorrEvaluated_ = startIndex;
+    }
+
     std::vector<vector> DeviceSimpleSolver::Uold() const
     {
         const std::vector<scalar> x = Uold_[0].host();
@@ -4790,11 +4860,11 @@ SimplecSnGrad simplecSnGrad(
         return v;
     }
 
-    void DeviceSimpleSolver::setBackwardRestart(const BackwardRestart& r)
+    void DeviceSimpleSolver::setOldLevelsRestart(const OldLevelsRestart& r)
     {
-        if (ddtScheme_ != DdtScheme::backward)
+        if (ddtScheme_ != DdtScheme::backward && ddtScheme_ != DdtScheme::CrankNicolson)
         {
-            throw std::runtime_error("brae: setBackwardRestart on a run whose ddt scheme is not backward");
+            throw std::runtime_error("brae: setOldLevelsRestart on a run whose ddt scheme is neither backward nor CrankNicolson");
         }
         if (!(r.deltaT0 > scalar(0)))
         {
@@ -4843,6 +4913,13 @@ SimplecSnGrad simplecSnGrad(
             }
         }
         restartDeltaT0_ = r.deltaT0;
+        restartSeedPending_ = true;
+        // phi_0 read: phi's old-old level exists before the first restarted step (readOldTimeIfPresent), which CrankNicolson's
+        // ddtCorr reads at its first evaluation and which makes phi_0 written from that step on
+        if (!r.phi0Internal.empty())
+        {
+            cnPhiOld2At_ = r.startIndex;
+        }
     }
 
     void DeviceSimpleSolver::setInterfacePatchFlux(const std::vector<std::pair<label, std::vector<scalar>>>& byPatch)
@@ -4918,10 +4995,11 @@ SimplecSnGrad simplecSnGrad(
     {
         const bool cn  = (ddtScheme_ == DdtScheme::CrankNicolson);
         const bool two = (ddtScheme_ == DdtScheme::backward) || cn;   // backward (coefft00 term) + CrankNicolson (ddt0 recurrence) both need the 2nd old level
-        if (ddtScheme_ == DdtScheme::backward && restartDeltaT0_ > scalar(0) && deltaT_ <= scalar(0))
+        if (restartSeedPending_)
         {
-            // a backward restart's first step: a level setBackwardRestart was not given (no <field>_0 in the start) is a copy
-            // of the field as it stands, which the rotation below then makes the old-old level too
+            // a backward or CrankNicolson restart's first step: a level setOldLevelsRestart was not given (no <field>_0 in the
+            // start) is a copy of the field as it stands, which the rotation below then makes the old-old level too
+            restartSeedPending_ = false;
             for (int k = 0; k < 3; ++k)
             {
                 if (!Uold_[k].size())
@@ -4946,7 +5024,7 @@ SimplecSnGrad simplecSnGrad(
                 }
             }
         }
-        if (ddtScheme_ == DdtScheme::backward)
+        if (twoOldLevels())
         {
             // the patch values the old levels take over (storeOldTime's operator==): what OpenFOAM writes in U_0, k_0, ...
             for (int k = 0; k < 3; ++k)
@@ -5083,7 +5161,7 @@ SimplecSnGrad simplecSnGrad(
                 deviceDotSf(cyc_.n, nullptr, cyc_.Sfx, cyc_.Sfy, cyc_.Sfz,
                             UfOldCyc_[0], UfOldCyc_[1], UfOldCyc_[2], cycPhiOld_);
         }
-        // a backward restart's first step takes runTime.deltaT0() from setBackwardRestart (deltaT_ is still 0 there)
+        // a backward restart's first step takes runTime.deltaT0() from setOldLevelsRestart (deltaT_ is still 0 there)
         deltaT0_ = (deltaT_ > scalar(0)) ? deltaT_ : restartDeltaT0_;
         deltaT_  = deltaT;
     }
