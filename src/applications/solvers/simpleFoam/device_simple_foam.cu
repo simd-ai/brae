@@ -3670,6 +3670,19 @@ SimplecSnGrad simplecSnGrad(
             {
                 DeviceBuffer<scalar> pbvN;
                 deviceBCValue(dbP_, dp_, pbvN);
+                // ...and p's STORED patch values, which fvc::grad(p) reads (p.boundaryField()): on pass 0 of a later
+                // corrector a freestreamPressure face holds what the previous corrector's solve and p.relax() left,
+                // blended under THAT corrector's valueFraction, while dbP_ already carries the one this pressure
+                // assembly has just recomputed from U's patch values (fvMatrix.C:396). A later pass's evaluate used
+                // this assembly's valueFraction, so there the blend is the stored value. Measured on airFoil2D under
+                // pimpleFoam, 1 outer x 2 correctors: p 2.4e-05 at the inlet at step 1, where the valueFraction and
+                // the U patch values it reads agree with OpenFOAM's to 2e-16 (Arrhenius 5860628).
+                // CONTROL BRAE_CONTROL_PASS0_P_GRAD_REBLEND=1: the blend under the new valueFraction, as before
+                static const bool pass0GradReblend = std::getenv("BRAE_CONTROL_PASS0_P_GRAD_REBLEND") != nullptr;
+                if (pass0Stale && freestreamStored() && !pass0GradReblend)
+                {
+                    deviceStoredFreestreamValues(dbP_, pbStored_, pbvN);
+                }
                 deviceGaussGrad(dm, dp_, pbvN, gx, gy, gz);
                 if (hasCyclic_) interfaceAddGrad(cyc_, dp_, dm.V, gx, gy, gz);
                 if (hasAMI_)    interfaceAddGrad(ami_, dp_, dm.V, gx, gy, gz);
