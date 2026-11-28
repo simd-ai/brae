@@ -25,8 +25,10 @@
 #       patch's kappa 0.41: OpenFOAM's takes the patch's own, omegaWallFunctionFvPatchScalarField.C:191-193)
 #   SRA kOmegaSST, ARA SpalartAllmaras: the RAS closures on the same starts (ARA's nutUSpaldingWallFunction walls show the wall
 #       nut held across the two outer correctors, as OpenFOAM holds nut's patch values until correctNut)
-# The start carries no phi file: simpleFoam's flux at iteration 50 is not flux(U), and backward's first-step fvc::ddtCorr, which
-# brae omits where OpenFOAM applies Euler's form, then moved p 1.2 on every arm (a time-integration defect, recorded apart).
+#   SRP SRA with simpleFoam's phi at iteration 50 carried over, which is not flux(U). On backward's first step OpenFOAM applies
+#       Euler's form of fvc::ddtCorr to that difference: backwardDdtScheme::deltaT0_(vf) is GREAT while timeIndex() < 2
+#       (backwardDdtScheme.C:62-71), so fvcDdtPhiCorr's coefft0 is 1 and coefft00 about 1e-36 (.C:738-776)
+# The other arms' starts carry no phi file, so both codes start from flux(U) and that correction is zero there.
 #
 # CHECKS, every entry on its own scale (tests/pimple_entry_compare.py) at steps 1-5 within BOUND: kOmegaSST family p U k
 # omega nut, SpalartAllmaras family p U nuTilda nut; phi on its own line. Controls, each red on the entry it guards:
@@ -34,12 +36,16 @@
 #   BRAE_CONTROL_DES_AS_DDES=1             SDE and ADE: plain DES with DDES's delay function
 #   BRAE_CONTROL_SST_DES_OLD_COEFFS=1      SDK: CDES1/CDES2 at 0.78/0.61, the dictionary's kappa on the walls
 #   BRAE_CONTROL_NUT_BOUNDARY_ONE_USE=1    ARA: the wall nut evaluated again at the second outer corrector
+#   BRAE_CONTROL_BACKWARD_FIRST_NO_DDTCORR=1  SRP: no fvc::ddtCorr on backward's first step
+# PREMISE for SRP: OpenFOAM from the start with the phi file differs from OpenFOAM without it (SRA) at step 1.
 # MEASURED (Arrhenius, one GH200, OpenFOAM v2412 serial, 2026-11-27): worst entry over steps 1-5
 #   before (develop 6708c38a, job 5838209): SDD 2.1e-02, SDE 6.5e-02, ADE 3.4e-01 (k, k, nut internal at step 5), SDK 7.7e-02
 #     (omega on the walls at step 1), ARA and ADD 2.2e-04 (nut on the walls at step 1), SRA 8.2e-07
 #   after (jobs 5830099, 5830744): every arm 2.9e-13 to 5.2e-13 (p), phi 2.4e-15 at most. So BOUND 1e-10: two decades above, for another
 #   GPU's arithmetic. Controls: 2.1e-02, 6.4e-02, 3.4e-01, 6.2e-03, 2.2e-04. Premises 6.1e-02, 6.4e-02, 2.6e-01, 3.4e-01; SDK
 #   against SDD 8.4e-03. 42 s.
+#   SRP (job 5861987): develop 5b2b4144 1.17 (p internal at step 1; phi 4.4e-02), after 2.2e-13 (phi 1.9e-15); the other arms'
+#   numbers unchanged to the digit. Control 1.17, premise 5.7e-01 (p at step 1).
 # Labels: slow. Honours OFBASHRC; exits 77 without OpenFOAM, a GPU or the binary.
 set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -152,10 +158,9 @@ def transient(case, start, model, coeffs=''):
     """pimpleFoam from the RANS start: backward, 2 x 2, 5 steps of 1e-4, every solve tight; the model, delta and the model's
     <model>Coeffs entries if any"""
     os.makedirs(case + '/0', exist_ok=True)
-    # phi is not carried over: simpleFoam's flux at iteration 50 is not flux(U), and on backward's first step OpenFOAM applies
-    # Euler's form of fvc::ddtCorr to that difference (backwardDdtScheme, deltaT0 GREAT without a second old level) where brae
-    # applies none -- p 1.2 off at step 1 on every arm, RAS included; Euler, or no phi file, 2.3e-07 and 3.7e-07. That is a
-    # time-integration defect, recorded apart. Without the file both codes start from flux(U), and the correction is zero.
+    # phi is not carried over here (mkcase's KEEP_PHI does it for SRP): simpleFoam's flux at iteration 50 is not flux(U), and
+    # on backward's first step OpenFOAM applies Euler's form of fvc::ddtCorr to that difference. Without the file both codes
+    # start from flux(U), and the correction is zero.
     for f in os.listdir(start):
         if f in ('U', 'p', 'k', 'omega', 'nut', 'nuTilda'):
             open(case + '/0/' + f, 'w').write(open(os.path.join(start, f)).read())
@@ -200,6 +205,7 @@ for fam in sst sa; do
     [ -d "$W/rans-$fam/50" ] || { echo "FAIL: OpenFOAM simpleFoam ($fam) did not reach iteration 50"; tail -3 "$W/rans-$fam/log"; exit 1; }
 done
 # case <arm> <family> <model> [coeffs]: the step's mesh and schemes, the transient case from the family's RANS start
+# KEEP_PHI=1: carry simpleFoam's phi at iteration 50 over too (SRP)
 mkcase()
 {
     rm -rf "$W/$1"
@@ -207,6 +213,9 @@ mkcase()
     cp -r "$W/rans-$2/constant" "$W/rans-$2/system" "$W/$1/"
     rm -f "$W/$1"/constant/polyMesh/.brae_*
     python3 "$W/step.py" transient "$W/$1" "$W/rans-$2/50" "$3" "${4:-}"
+    if [ -n "${KEEP_PHI:-}" ]; then
+        cp "$W/rans-$2/50/phi" "$W/$1/0/phi"
+    fi
 }
 # SDK's coefficients, all of them read by OpenFOAM's kOmegaSSTDDES: the DES blend, the delay function and its kappa (which the
 # omega wall function does not take)
@@ -234,8 +243,8 @@ done
 judge()   # <arm> <family> <model> [coeffs]
 {
     local a=$1 fam=$2 m=$3 mx mp
-    if [ -n "${4:-}" ]; then
-        mkcase "$a-of" "$fam" "$m" "$4"
+    if [ -n "${4:-}" ] || [ -n "${KEEP_PHI:-}" ]; then
+        mkcase "$a-of" "$fam" "$m" "${4:-}"
         ofrun "$W/$a-of" pimpleFoam || { echo "FAIL: OpenFOAM $a"; tail -5 "$W/$a-of/log"; exit 1; }
     else
         cp -r "$W/of-$m" "$W/$a-of"
@@ -268,6 +277,12 @@ judge ADE sa SpalartAllmarasDES
 # RAS on the same starts, the closures the DES models are built on
 judge SRA sst kOmegaSST
 judge ARA sa SpalartAllmaras
+# backward's first step from a start whose phi is not flux(U)
+KEEP_PHI=1 judge SRP sst kOmegaSST
+d=$(python3 "$CMP" "$W/SRA-of" "$W/SRP-of" 0.0001 $(fields sst) | awk '/^MAX/{print $2, $4, $5}')
+python3 -c "import sys; sys.exit(0 if float('${d%% *}') > float('$PREMISE') else 1)" \
+    && say "premise: OpenFOAM from the start with simpleFoam's phi differs from without it at 0.0001 ($d)" PASS \
+    || say "premise: OpenFOAM from the start with simpleFoam's phi differs from without it at 0.0001 ($d)" FAIL
 
 # Each control must make ITS entry exceed the bound (`report` uses 1e-10 here).
 CB=$BOUND
@@ -287,6 +302,7 @@ control BRAE_CONTROL_DES_AS_DDES=1 SDE sst kOmegaSSTDES "$LAST" k internal
 control BRAE_CONTROL_DES_AS_DDES=1 ADE sa SpalartAllmarasDES "$LAST" nut internal
 control BRAE_CONTROL_SST_DES_OLD_COEFFS=1 SDK sst kOmegaSSTDDES "$LAST" k internal "$SDK"
 control BRAE_CONTROL_NUT_BOUNDARY_ONE_USE=1 ARA sa SpalartAllmaras 0.0001 nut walls
+KEEP_PHI=1 control BRAE_CONTROL_BACKWARD_FIRST_NO_DDTCORR=1 SRP sst kOmegaSST 0.0001 p internal
 
 [ $fail = 0 ] && echo "PASS" || echo "FAIL"
 exit $fail
