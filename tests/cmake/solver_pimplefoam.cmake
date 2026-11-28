@@ -181,3 +181,9 @@ set_tests_properties(pimple_backward_restart_vs_openfoam PROPERTIES SKIP_RETURN_
 add_test(NAME pimple_controldict_defaults_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_controldict_defaults_vs_openfoam.sh)
 set_tests_properties(pimple_controldict_defaults_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
                      ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_pimpleFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+
+# CrankNicolson's fvc::ddtCorr on RAS/pitzDaily from rest, six steps, at off-centring 0.9 and 1, every entry against OpenFOAM;
+# a premise that the term moves OpenFOAM, one control.
+add_test(NAME pimple_cranknicolson_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_cranknicolson_vs_openfoam.sh)
+set_tests_properties(pimple_cranknicolson_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
+                     ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_pimpleFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
