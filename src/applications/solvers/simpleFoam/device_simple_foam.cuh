@@ -1064,6 +1064,12 @@ private:
     bool   ddtCorr_ = true;         // fvSolution PIMPLE/ddtCorr (OF pimpleControl.C:55, default true)
     bool   ddtCorrNoticed_ = false; // say once if the scheme is one brae has no ddtCorr form for
     long   timeIndex_ = -1;         // setTimeIndex; -1 = not set, which backward's first-step ddtCorr refuses
+    // CrankNicolson's fvc::ddtCorr state, CrankNicolsonDdtScheme's two DDt0Fields: ddtCorrDdt0(U) (cells and patch values)
+    // and ddtCorrDdt0(phi) (internal and boundary faces), with the time index they were created at and last evaluated at;
+    // -1 = not created yet
+    DeviceBuffer<scalar> cnCorrDdt0U_[3], cnCorrDdt0Ub_[3], cnCorrDphidt0Int_, cnCorrDphidt0Bnd_;
+    long   cnCorrStart_ = -1;
+    long   cnCorrEvaluated_ = -1;
 
     // mesh.phi() from the last move (per mesh face, internal then boundary). Held rather than applied at
     // the move: fvc::makeRelative belongs at the end of the pressure corrector. See makeFluxRelative.

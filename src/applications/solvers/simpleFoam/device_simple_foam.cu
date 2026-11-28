@@ -3271,19 +3271,107 @@ SimplecSnGrad simplecSnGrad(
                 }
                 return timeIndex_ < 2;
             };
-            if (ddtScheme_ == DdtScheme::CrankNicolson)
+            // CONTROL BRAE_CONTROL_CN_NO_DDTCORR=1: CrankNicolson's correction omitted, as before
+            static const bool cnNoCorr = std::getenv("BRAE_CONTROL_CN_NO_DDTCORR") != nullptr;
+            if (ddtScheme_ == DdtScheme::CrankNicolson && (ufActive_ || hasCyclic_ || hasAMI_ || cnNoCorr))
             {
-                // CrankNicolson's fvcDdtUfCorr carries its own off-centred ddt0 recurrence, not just an
-                // extra old level, so it is not this shape. Omitted with a notice rather than run under
-                // backward's or Euler's form, which would be a silent substitution.
+                // A moving mesh takes CrankNicolsonDdtScheme::fvcDdtUfCorr (the Uf form), and a coupled interface's
+                // phi.oldTime().oldTime() is not carried here. Omitted with a notice rather than run under another form.
                 if (!ddtCorrNoticed_)
                 {
                     ddtCorrNoticed_ = true;
                     noticeIgnored("PIMPLE/ddtCorr",
-                                  "brae implements fvc::ddtCorr for the Euler and backward ddt schemes; "
-                                  "this case uses CrankNicolson, whose form carries the off-centred ddt0 "
-                                  "recurrence, so the correction is omitted");
+                                  "brae implements CrankNicolson's fvc::ddtCorr on a static mesh without cyclic or AMI "
+                                  "interfaces; this case has a moving mesh or such an interface, so the correction is omitted");
                 }
+            }
+            else if (ddtScheme_ == DdtScheme::CrankNicolson)
+            {
+                // CrankNicolson's fvc::ddtCorr, CrankNicolsonDdtScheme::fvcDdtPhiCorr (.C:1262-1320): with ddt0 =
+                // ddtCorrDdt0(U) and dphidt0 = ddtCorrDdt0(phi), two DDt0Fields of its own,
+                //     ddtCouplingCoeff*((rDtCoef*phi_o + offCentre(dphidt0)) - (Sf & interpolate(rDtCoef*U_o + offCentre(ddt0))))
+                // Each field is created zero on the first step that asks (ddt0_, .C:102-165, startTimeIndex that step) and
+                // evaluated once a step after it (evaluate, .C:170-180): ddt0 = rDtCoef0*(old - oldOld) - offCentre(ddt0),
+                // rDtCoef = coef/deltaT and rDtCoef0 = coef0/deltaT0, coef 1 + ocCoeff after the start step and coef0 after
+                // the one following it, else 1 (.C:184-226); offCentre multiplies by ocCoeff below 1 (.C:249-260). U's old-old
+                // level exists from the first step (fvmDdt asks for it unconditionally), phi's is created at the first
+                // evaluation as a copy of phi.oldTime() -- so dphidt0 starts from (phi_o - phi_o). brae omitted the term:
+                // pimpleFoam/RAS/pitzDaily at CrankNicolson 0.9, p 2.3 from OpenFOAM at step 2, 31 by step 4; 5e-11 with
+                // ddtCorr off in both codes (Arrhenius 5865234).
+                if (timeIndex_ < 0)
+                {
+                    throw std::runtime_error("brae: CrankNicolson's fvc::ddtCorr depends on the run's time index, which the "
+                                             "driver did not set (setTimeIndex)");
+                }
+                const long n = timeIndex_;
+                const scalar oc = ocCoeff_;
+                const scalar w0 = (oc < scalar(1)) ? oc : scalar(1);   // offCentre_
+                DeviceBuffer<scalar> ub[3];
+                for (int k = 0; k < 3; ++k)
+                {
+                    deviceBCValue(dbU_.comp[k], Uold_[k], ub[k]);
+                }
+                const auto zeros = [](DeviceBuffer<scalar>& b, std::size_t size)
+                {
+                    b.copyFrom(std::vector<scalar>(size, scalar(0)));
+                };
+                // ddt0 = rDtCoef0*(o - oo) - offCentre(ddt0)
+                const auto update = [w0](DeviceBuffer<scalar>& d0, scalar rDtCoef0, const DeviceBuffer<scalar>& o,
+                                         const DeviceBuffer<scalar>& oo)
+                {
+                    deviceScale(d0, -w0);
+                    deviceAxpy(rDtCoef0, o, d0);
+                    deviceAxpy(-rDtCoef0, oo, d0);
+                };
+                if (cnCorrStart_ < 0)
+                {
+                    for (int k = 0; k < 3; ++k)
+                    {
+                        zeros(cnCorrDdt0U_[k], Uold_[k].size());
+                        zeros(cnCorrDdt0Ub_[k], ub[k].size());
+                    }
+                    zeros(cnCorrDphidt0Int_, phiOldInt_.size());
+                    zeros(cnCorrDphidt0Bnd_, phiOldBnd_.size());
+                    cnCorrStart_ = n;
+                    cnCorrEvaluated_ = n;
+                }
+                else if (cnCorrEvaluated_ != n)
+                {
+                    const bool firstEvaluation = (cnCorrEvaluated_ == cnCorrStart_);
+                    const scalar rDtCoef0 = ((n > cnCorrStart_ + 1) ? scalar(1) + oc : scalar(1)) / deltaT0_;
+                    for (int k = 0; k < 3; ++k)
+                    {
+                        DeviceBuffer<scalar> ub2;
+                        deviceBCValue(dbU_.comp[k], Uold2_[k], ub2);
+                        update(cnCorrDdt0U_[k], rDtCoef0, Uold_[k], Uold2_[k]);
+                        update(cnCorrDdt0Ub_[k], rDtCoef0, ub[k], ub2);
+                    }
+                    update(cnCorrDphidt0Int_, rDtCoef0, phiOldInt_, firstEvaluation ? phiOldInt_ : phiOld2Int_);
+                    update(cnCorrDphidt0Bnd_, rDtCoef0, phiOldBnd_, firstEvaluation ? phiOldBnd_ : phiOld2Bnd_);
+                    cnCorrEvaluated_ = n;
+                }
+                const scalar rDtCoef = ((n > cnCorrStart_) ? scalar(1) + oc : scalar(1)) / deltaT_;
+                DeviceBuffer<scalar> fUoInt, fUoBnd, f0Int, f0Bnd, rAUfDdt, rAUbDdt;
+                deviceVectorFlux(dm, Uold_[0], Uold_[1], Uold_[2], fUoInt);
+                deviceBoundaryFlux(dm, ub[0], ub[1], ub[2], fUoBnd);
+                deviceVectorFlux(dm, cnCorrDdt0U_[0], cnCorrDdt0U_[1], cnCorrDdt0U_[2], f0Int);
+                deviceBoundaryFlux(dm, cnCorrDdt0Ub_[0], cnCorrDdt0Ub_[1], cnCorrDdt0Ub_[2], f0Bnd);
+                deviceInterpolate(dm, rAU, rAUfDdt);
+                deviceBCValue(dbExtrap_, rAU, rAUbDdt);
+                // the corrected quantity, rDtCoef included, so the kernel's own factor is 1
+                DeviceBuffer<scalar> effInt, effBnd;
+                deviceCopy(effInt, phiOldInt_);
+                deviceScale(effInt, rDtCoef);
+                deviceAxpy(w0, cnCorrDphidt0Int_, effInt);
+                deviceAxpy(-rDtCoef, fUoInt, effInt);
+                deviceAxpy(-w0, f0Int, effInt);
+                deviceCopy(effBnd, phiOldBnd_);
+                deviceScale(effBnd, rDtCoef);
+                deviceAxpy(w0, cnCorrDphidt0Bnd_, effBnd);
+                deviceAxpy(-rDtCoef, fUoBnd, effBnd);
+                deviceAxpy(-w0, f0Bnd, effBnd);
+                deviceDdtCorrFlux(dm.nInternalFaces, phiOldInt_, phiOldBnd_, fUoInt, fUoBnd, rAUfDdt, rAUbDdt,
+                                  ddtCorrBndMask_, scalar(1), phiHi, phiHb, &effInt, &effBnd);
             }
             else if (ddtScheme_ != DdtScheme::Euler && !backwardCorr && !backwardEulerCorr(backwardFirstNoCorr))
             {
