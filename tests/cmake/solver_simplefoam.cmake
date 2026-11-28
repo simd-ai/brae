@@ -68,6 +68,14 @@ add_test(NAME simple_freestream_stored_vs_openfoam
          COMMAND ${PROJECT_SOURCE_DIR}/tests/simple_freestream_stored_vs_openfoam.sh
                  ${PROJECT_SOURCE_DIR}/validation/airFoil2D)
 set_tests_properties(simple_freestream_stored_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+# simpleFoam's boundary updates at OpenFOAM's points (totalPressure and p inletOutlet at the pressure assembly,
+# pressureInletOutletVelocity after the solves, the turbulence fields' switches and inlets at their equations) and totalPressure's
+# value relaxed with p: windAroundBuildings from OpenFOAM's own iteration 20, three pinned iterations, every entry held; the
+# momentum assembly's points (BRAE_CONTROL_STEADY_UPDATE_POINTS_LEGACY=1) and the unrelaxed value
+# (BRAE_CONTROL_TOTAL_PRESSURE_UNRELAXED=1) fail.
+add_test(NAME simple_update_points_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/simple_update_points_vs_openfoam.sh)
+set_tests_properties(simple_update_points_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
+                     ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 # omegaWallFunction's and epsilonWallFunction's G0 from the STORED wall nut in the legacy closures: pitzDailySST with Spalding walls
 # at tolerance 1e-9, one iteration from OpenFOAM's own iteration 50 against real OpenFOAM; the made-again nut
 # (BRAE_CONTROL_G0_NUT_RECOMPUTED=1) fails.
