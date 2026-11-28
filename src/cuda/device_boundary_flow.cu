@@ -371,6 +371,21 @@ void tpUpdateKernel(
     const scalar rw = rhoBnd ? rhoBnd[i] : scalar(1);
     refValue[i] = p0[i] - 0.5 * rw * (phiB[i] < 0.0 ? 1.0 : 0.0) * u2;   // neg(phi)=inflow -> static = total - dynamic head
 }
+
+__global__
+void tpRelaxKernel(
+    int n,
+    const label* __restrict__ tpMask,
+    const scalar* __restrict__ prevIter,
+    scalar alpha,
+    scalar* __restrict__ refValue)
+{
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || !tpMask[i]) return;
+
+    // GeometricField::relax: prevIter + alpha*(value - prevIter), the same order of operations
+    refValue[i] = prevIter[i] + alpha * (refValue[i] - prevIter[i]);
+}
 } // namespace
 
 
@@ -1014,6 +1029,15 @@ void deviceGatherPatchInternal(const DeviceBoundary& db, const DeviceBuffer<scal
     cudaCheck(cudaGetLastError(), "gatherPatchInternal");
 }
 
+
+void deviceRelaxTotalPressure(
+    DeviceBoundary& db,
+    const DeviceBuffer<scalar>& prevIter,
+    scalar alpha)
+{
+    if (db.n == 0 || prevIter.size() != static_cast<std::size_t>(db.n)) return;
+    tpRelaxKernel<<<nBlocks(db.n), TPB>>>(db.n, db.tpMask.data(), prevIter.data(), alpha, db.refValue.data());
+}
 
 void deviceUpdateTotalPressure(
     DeviceBoundary& db,

@@ -1335,11 +1335,11 @@ SimplecSnGrad simplecSnGrad(
         // arrays are those values only on a fixedValue face: on RAS/TJunction's pressureInletOutletVelocity
         // inlet U's refValue is the tangential velocity, 0, so the inlet k was EXACTLY 0 from step 2 (and
         // epsilon with it), where OpenFOAM's is 1.5 (I |U_b|)^2 = 4.03e-6 at step 2 on the middle face.
-        // The steady drivers keep the refValue form. CONTROL BRAE_CONTROL_TURB_INLET_REFVALUE=1: the
-        // refValue form on pimpleStep too, as before.
+        // rhoSimpleStep keeps the refValue form. CONTROL BRAE_CONTROL_TURB_INLET_REFVALUE=1: the refValue form on
+        // pimpleStep and step() too, as before.
         //
         // THE FLUX SWITCHES of the two fields (inletOutlet, and the inlets above, which derive from it) move
-        // here on pimpleStep as well: valueFraction = neg(phi) is set in the same updateCoeffs, from the flux
+        // here on pimpleStep and step() as well: valueFraction = neg(phi) is set in the same updateCoeffs, from the flux
         // the LAST pressure corrector made. At the momentum assembly they read the flux from before the
         // step, which on RAS/TJunction is zero at step 1: there the inlet and outlet1 stayed zeroGradient
         // through step 1, where OpenFOAM's had switched to inflow (outlet1's k and epsilon written at their
@@ -1351,8 +1351,8 @@ SimplecSnGrad simplecSnGrad(
         // measurement. CONTROL BRAE_CONTROL_TURB_SWITCH_AT_MOMENTUM=1: the momentum assembly's switch, as before.
         static const bool inletRefValue = std::getenv("BRAE_CONTROL_TURB_INLET_REFVALUE") != nullptr;
         static const bool switchAtMomentum = std::getenv("BRAE_CONTROL_TURB_SWITCH_AT_MOMENTUM") != nullptr;
-        const bool switchHere = pimpleUpdatePoints_ && !switchAtMomentum && switchesAtTurbulenceCorrection(ctl_);
-        const bool patchValues = hasTurbInlet_ && pimpleUpdatePoints_ && !inletRefValue;
+        const bool switchHere = ofUpdatePoints_ && !switchAtMomentum && switchesAtTurbulenceCorrection(ctl_);
+        const bool patchValues = hasTurbInlet_ && ofUpdatePoints_ && !inletRefValue;
         DeviceBuffer<scalar> kb;
         if (patchValues) deviceBCValue(dbK_, dk_, kb);   // before either field's boundary moves
         // ...and the STORED patch values of both fields, for the gradients the two equations take. OpenFOAM's
@@ -2005,10 +2005,10 @@ SimplecSnGrad simplecSnGrad(
         // inletOutlet BCs: resolve each IO face to fixedValue|zeroGradient from the PREVIOUS step's boundary flux
         // (OF updateCoeffs uses the prior corrector's phi). No-op when a boundary has no inletOutlet faces.
         deviceUpdateInletOutlet(dbU_, phiBnd_);
-        // p's inletOutlet: pimpleStep switches it at every pressure assembly instead, where OpenFOAM does (see the
-        // pressure corrector); the steady drivers keep this point
+        // p's inletOutlet: pimpleStep and step() switch it at every pressure assembly instead, where OpenFOAM does (see
+        // the pressure corrector); rhoSimpleStep keeps this point
         static const bool pIOAtMomentum = std::getenv("BRAE_CONTROL_P_IO_AT_MOMENTUM") != nullptr;
-        if (!pimpleUpdatePoints_ || pIOAtMomentum)
+        if (!ofUpdatePoints_ || pIOAtMomentum)
         {
             deviceUpdateInletOutlet(dbP_, phiBnd_);
         }
@@ -2030,7 +2030,7 @@ SimplecSnGrad simplecSnGrad(
         static const bool turbSwitchAtMomentum = std::getenv("BRAE_CONTROL_TURB_SWITCH_AT_MOMENTUM") != nullptr;
         if (ctl_.turbulent && !ctl_.les)   // pure LES has no k/epsilon/omega boundaries (algebraic nut)
         {
-            if (!pimpleUpdatePoints_ || turbSwitchAtMomentum || !switchesAtTurbulenceCorrection(ctl_))
+            if (!ofUpdatePoints_ || turbSwitchAtMomentum || !switchesAtTurbulenceCorrection(ctl_))
             {
                 deviceUpdateInletOutlet(dbK_, phiBnd_);
                 deviceUpdateInletOutlet(dbEps_, phiBnd_);
@@ -2043,6 +2043,7 @@ SimplecSnGrad simplecSnGrad(
         }
         // simple.loop()'s storePrevIterFields: p's prevIter, boundary included
         if (freestreamStored()) deviceCopy(pbPrev_, pbStored_);
+        if (hasTotalP_) deviceCopy(tpPrev_, dbP_.refValue);
         // mixed freestreamVelocity: updateCoeffs inside the momentum fvMatrix constructor rebuilds its
         // valueFraction from the STORED patch velocity (UbStored_, what the last evaluate left). Its pressure
         // partner moves at the pressure assembly instead (correctPressureVelocity). The control re-derives
@@ -2061,11 +2062,11 @@ SimplecSnGrad simplecSnGrad(
         if (hasPiov_)  deviceUpdatePressureInletOutletVelocity(dbU_, phiBnd_, Uk_[0], Uk_[1], Uk_[2], /*directionMixed=*/true);
         if (hasSym_)   deviceUpdateSymmetry(dbU_, Uk_[0], Uk_[1], Uk_[2]);
         if (hasWedge_) deviceUpdateWedge(dbU_, Uk_[0], Uk_[1], Uk_[2]);   // axisymmetric: the rotated cell velocity
-        // totalPressure p, on the steady drivers: here, from U's patch values as the start of the iteration
-        // left them. pimpleStep moves it to the pressure assembly (pimpleUpdatePoints_), where OpenFOAM's
-        // pEqn.H constructs fvm::laplacian(rAtU, p) and the patch's updateCoeffs reads U_b and phi.
+        // totalPressure p, on rhoSimpleStep: here, from U's patch values as the start of the iteration left them.
+        // pimpleStep and step() move it to the pressure assembly (ofUpdatePoints_), where OpenFOAM's pEqn.H constructs
+        // fvm::laplacian(rAtU, p) and the patch's updateCoeffs reads U_b and phi.
         static const bool totalPAtMomentumCtl = std::getenv("BRAE_CONTROL_TOTAL_PRESSURE_AT_MOMENTUM") != nullptr;
-        if (hasTotalP_ && (!pimpleUpdatePoints_ || totalPAtMomentumCtl)) updateTotalPressure();
+        if (hasTotalP_ && (!ofUpdatePoints_ || totalPAtMomentumCtl)) updateTotalPressure();
         // fixedMean: the face values ARE the adjacent cell values, shifted (or scaled) so their
         // area-weighted mean hits the prescribed one. That is a patch-wide reduction, so the small
         // per-boundary-face gather comes back to the host and the sum is done there -- the whole cell
@@ -2148,7 +2149,7 @@ SimplecSnGrad simplecSnGrad(
         // evaluation of a run is held the same way (OpenFOAM's validate()). CONTROL BRAE_CONTROL_NUT_BOUNDARY_ONE_USE=1: used
         // once and evaluated again at the next assembly, as before.
         static const bool nutBndOneUse = std::getenv("BRAE_CONTROL_NUT_BOUNDARY_ONE_USE") != nullptr;
-        const bool holdNutBnd = pimpleUpdatePoints_ && !compressible_ && !nutBndOneUse;
+        const bool holdNutBnd = ofUpdatePoints_ && !compressible_ && !nutBndOneUse;
         if (nuEffBndHeldValid_)
             deviceCopy(nuEffBnd, nuEffBndHeld_);
         else
@@ -3151,7 +3152,7 @@ SimplecSnGrad simplecSnGrad(
         // Nothing in the pressure stage reads it (HbyA_b is projected afresh below), but the closures
         // do, after the corrector -- item 13; tests/legacy_symmetry_refresh.sh.
         if (hasSym_) deviceUpdateSymmetry(dbU_, Uk_[0], Uk_[1], Uk_[2]);
-        // ...and pressureInletOutletVelocity, on pimpleStep: that evaluate re-runs the patch's updateCoeffs
+        // ...and pressureInletOutletVelocity, on pimpleStep and step(): that evaluate re-runs the patch's updateCoeffs
         // (pressureInletOutletVelocityFvPatchVectorField.C:170-183) on the flux as it stands and the SOLVED cells, so an
         // inflow face holds n(n.U_c) of the new U. brae's mixed refValue still held n(n.U_c) of the cells before the
         // solve. On an axis-aligned inlet the normal component is zeroGradient and the value comes out right anyway; on a
@@ -3162,7 +3163,7 @@ SimplecSnGrad simplecSnGrad(
         // BRAE_CONTROL_PIOV_ASSEMBLY_ONLY read 1.1e-10 instead of 6.7e-05 (Arrhenius 5796581).
         //   BRAE_CONTROL_PIOV_NO_SOLVE_EVAL=1  a gate's control, deliberately wrong: not re-evaluated here
         static const bool piovNoSolveEval = std::getenv("BRAE_CONTROL_PIOV_NO_SOLVE_EVAL") != nullptr;
-        if (hasPiov_ && pimpleUpdatePoints_ && !piovNoSolveEval && ctl_.innerCorrector == 0 && ctl_.momentumPredictor)
+        if (hasPiov_ && ofUpdatePoints_ && !piovNoSolveEval && ctl_.innerCorrector == 0 && ctl_.momentumPredictor)
         {
             deviceUpdatePressureInletOutletVelocity(dbU_, phiBnd_, Uk_[0], Uk_[1], Uk_[2], /*directionMixed=*/true);
         }
@@ -3213,10 +3214,10 @@ SimplecSnGrad simplecSnGrad(
         // ...and at pressureInletOutletVelocity, assignable as well (pressureInletOutletVelocityFvPatchVectorField.H:162):
         // HbyA_b is rAU*UEqn.H()'s own, extrapolatedCalculated (fvMatrix.C H() and A()), i.e. the CELL value. Through U's
         // per-component descriptor it was d_k*ref_k + (1 - d_k)*HbyA_c: on an axis-aligned face that differs only in the
-        // tangential components, which carry no flux; on a tilted face phiHbyA_b differs. pimpleStep only.
+        // tangential components, which carry no flux; on a tilted face phiHbyA_b differs. pimpleStep and step() only.
         //   BRAE_CONTROL_PIOV_HBYA_DESCRIPTOR=1  a gate's control, deliberately wrong: HbyA_b through U's descriptor
         static const bool piovHbyADescriptor = std::getenv("BRAE_CONTROL_PIOV_HBYA_DESCRIPTOR") != nullptr;
-        if (hasPiov_ && pimpleUpdatePoints_ && !piovHbyADescriptor)
+        if (hasPiov_ && ofUpdatePoints_ && !piovHbyADescriptor)
         {
             DeviceBuffer<scalar> cx;
             DeviceBuffer<scalar> cy;
@@ -3762,7 +3763,36 @@ SimplecSnGrad simplecSnGrad(
         // 2.28e-4 on the middle inlet face, tight solves) and lagged a step after. CONTROL
         // BRAE_CONTROL_TOTAL_PRESSURE_AT_MOMENTUM=1: the momentum assembly's point, as before.
         static const bool totalPAtMomentum = std::getenv("BRAE_CONTROL_TOTAL_PRESSURE_AT_MOMENTUM") != nullptr;
-        if (hasTotalP_ && pimpleUpdatePoints_ && !totalPAtMomentum) updateTotalPressure();
+        if (hasTotalP_ && ofUpdatePoints_ && !totalPAtMomentum) updateTotalPressure();
+        // ...and the gradient the first corrector's non-orthogonal correction reads. OpenFOAM takes fvc::grad(p) for it inside
+        // fvm::laplacian(rAtU, p), after this constructor's updateCoeffs, and totalPressure's updateCoeffs writes its face
+        // value at once (operator==), while a mixed patch's only moves its valueFraction. Pass 0 of the first corrector
+        // reuses the momentum predictor's gradient, which read the totalPressure faces as they were stored. So it is taken
+        // again here, before p's inletOutlet switch below, freestream faces at their stored values. MEASURED on
+        // incompressible/simpleFoam/windAroundBuildings from OpenFOAM's iteration 20 (two outlet faces outflow with the
+        // relaxed -0.231 and -0.096 still stored), one iteration at p relaxation 1, every solve pinned: HbyA and phiHbyA
+        // OpenFOAM's to 1.6e-15, the pressure system's coefficients to 1.7e-16, the solved p 1.5e-08 off (U on the outlet
+        // 7.4e-08); exact (9.7e-12) once those stored values are zero (Arrhenius 5872167, 5872277). CONTROL
+        // BRAE_CONTROL_PASS0_GRAD_BEFORE_TOTAL_PRESSURE=1: the momentum predictor's gradient, as before.
+        static const bool pass0GradBeforeTp = std::getenv("BRAE_CONTROL_PASS0_GRAD_BEFORE_TOTAL_PRESSURE") != nullptr;
+        if (hasTotalP_ && ofUpdatePoints_ && !totalPAtMomentum && ctl_.nonOrth && ctl_.innerCorrector == 0 && !pass0GradBeforeTp)
+        {
+            DeviceBuffer<scalar> pbvTp;
+            deviceBCValue(dbP_, dp_, pbvTp);
+            if (freestreamStored())
+            {
+                deviceStoredFreestreamValues(dbP_, pbStored_, pbvTp);
+            }
+            deviceGaussGrad(dm, dp_, pbvTp, gx, gy, gz);
+            if (hasCyclic_)
+            {
+                interfaceAddGrad(cyc_, dp_, dm.V, gx, gy, gz);
+            }
+            if (hasAMI_)
+            {
+                interfaceAddGrad(ami_, dp_, dm.V, gx, gy, gz);
+            }
+        }
         // ...and p's inletOutlet, in the same constructor (inletOutletFvPatchField.C updateCoeffs: valueFraction =
         // 1 - pos0(phip)) on the flux as it stands; every non-orthogonal pass reads the same flux. Switched once at the
         // momentum assembly instead, a corrector after the first kept the switch from the flux before the step: RAS/TJunction
@@ -3770,7 +3800,7 @@ SimplecSnGrad simplecSnGrad(
         // second corrector, where OpenFOAM's is fixed at 10 on every inflow face -- p outlet1 4.9e-01 at step 1 (Arrhenius
         // 5797202). CONTROL BRAE_CONTROL_P_IO_AT_MOMENTUM=1: once at the momentum assembly, as before.
         static const bool pIOAtMomentum = std::getenv("BRAE_CONTROL_P_IO_AT_MOMENTUM") != nullptr;
-        if (pimpleUpdatePoints_ && !pIOAtMomentum)
+        if (ofUpdatePoints_ && !pIOAtMomentum)
         {
             deviceUpdateInletOutlet(dbP_, phiBnd_);
         }
@@ -4136,6 +4166,19 @@ SimplecSnGrad simplecSnGrad(
             deviceScale(pbStored_, ctl_.pRelax());
             deviceAxpy(1.0 - ctl_.pRelax(), pbPrev_, pbStored_);
         }
+        // ...and a totalPressure face, a fixedValue whose value the pressure assembly's updateCoeffs set: p.relax() blends it
+        // with prevIter too, and that blend is what U = HbyA - rAtU*grad(p) reads below, what the next momentum assembly's
+        // grad(p) and SIMPLEC terms read, and what OpenFOAM writes, until the next pressure assembly sets it again. On the
+        // points that set it there (ofUpdatePoints_). MEASURED on incompressible/simpleFoam/windAroundBuildings from
+        // OpenFOAM's iteration 20 under the tutorial's p relaxation 0.3, one iteration, every solve pinned: an outlet face
+        // turning from inflow (-0.2309) to outflow wrote 0 where OpenFOAM writes 0.7 x -0.2309 = -0.1616 (the entry 1.0
+        // off), and U on the outlet 2.6e-03 from OpenFOAM's (Arrhenius 5870755). CONTROL
+        // BRAE_CONTROL_TOTAL_PRESSURE_UNRELAXED=1: the value the assembly set, unrelaxed, as before.
+        static const bool tpUnrelaxed = std::getenv("BRAE_CONTROL_TOTAL_PRESSURE_UNRELAXED") != nullptr;
+        if (hasTotalP_ && ofUpdatePoints_ && !tpUnrelaxed && ctl_.pRelax() < 1)
+        {
+            deviceRelaxTotalPressure(dbP_, tpPrev_, ctl_.pRelax());
+        }
         deviceScale(dp_, ctl_.pRelax());
         deviceAxpy(1.0 - ctl_.pRelax(), pPrev, dp_);
         if (stageDumpActive() && stageDumpFirstOnly("pRelaxed")) stageDump("stage_pRelaxed", dp_);
@@ -4213,20 +4256,20 @@ SimplecSnGrad simplecSnGrad(
         {
             deviceUpdateInletOutlet(dbU_, phiBnd_);
         }
-        // pressureInletOutletVelocity moves here too, on pimpleStep. Its updateCoeffs ends in its own
+        // pressureInletOutletVelocity moves here too, on pimpleStep and step(). Its updateCoeffs ends in its own
         // evaluate (pressureInletOutletVelocityFvPatchVectorField.C:180-183), which clears updated(), so
         // every U.correctBoundaryConditions() re-runs it, the first corrector's included: valueFraction
         // neg(phi)(I - nn) from the flux this corrector just made, then the blend of the corrected cells.
         // Left at the momentum assembly's switch, the patch stayed zeroGradient through all of step 1 on
         // RAS/TJunction, where phi starts at zero: brae's tangential inlet velocity was -1.69e-6 at the
         // edge faces where OpenFOAM's is 0, and the next corrector's total pressure read it. Same
-        // directionMixed form as the assembly's call. The steady drivers keep the assembly's switch: the
-        // form re-applied there was the LEGACY one (every inflow component fixed at n(n.U_cell)), and on
-        // TJunction that moved U from 7.078e-03 to 7.690e-02 against OpenFOAM, ten steps of 0.002;
-        // validation/piov holds the steady path at its recorded numbers. CONTROL
-        // BRAE_CONTROL_PIOV_ASSEMBLY_ONLY=1: the assembly's switch for the whole step, as before.
+        // directionMixed form as the assembly's call. rhoSimpleStep keeps the assembly's switch. step() kept it too
+        // while the form re-applied here was the LEGACY one (every inflow component fixed at n(n.U_cell)), which on
+        // TJunction moved U from 7.078e-03 to 7.690e-02 against OpenFOAM, ten steps of 0.002; with the directionMixed
+        // form it takes this point (windAroundBuildings, step()). CONTROL BRAE_CONTROL_PIOV_ASSEMBLY_ONLY=1: the
+        // assembly's switch for the whole step, as before.
         static const bool piovAssemblyOnly = (std::getenv("BRAE_CONTROL_PIOV_ASSEMBLY_ONLY") != nullptr);
-        if (hasPiov_ && pimpleUpdatePoints_ && !piovAssemblyOnly)
+        if (hasPiov_ && ofUpdatePoints_ && !piovAssemblyOnly)
         {
             deviceUpdatePressureInletOutletVelocity(dbU_, phiBnd_, Uk_[0], Uk_[1], Uk_[2], /*directionMixed=*/true);
         }
@@ -4281,10 +4324,50 @@ SimplecSnGrad simplecSnGrad(
         makeFluxRelative(fvp_, dm_.nInternalFaces);
     }
 
+    void DeviceSimpleSolver::enterOpenFoamUpdatePoints()
+    {
+        if (ofUpdatePoints_)
+        {
+            return;
+        }
+        // kEpsilon's, the kOmegaSST family's and the SpalartAllmaras family's k and epsilon|omega (nuTilda) switch at the
+        // turbulence correction on these points (correctTurbulence), so the first step's earlier readers -- the 'calculated'
+        // nut patches in the momentum assembly's nuEff, and the stored values the limiter's gradients take -- meet an
+        // inletOutlet face before any switch. OpenFOAM's stored patch value is the file's `value` there; brae's construction
+        // state is fixedValue(inletValue). MEASURED on RAS/TJunction restarted from brae's own 0.01 (every outlet2 face
+        // outflow, the file's k the cells' 0.048 to 0.10 against inletValue 0.2): U 6.3e-04 off the uninterrupted run at
+        // 0.02, all of it behind outlet2; with TJunctionFan's inlet 1.4e-04. From rest (value == inletValue) it changes
+        // nothing. The seed the other drivers' closures take (DeviceBoundary::ioStored); BRAE_IO_STORED=0 is its control.
+        static const bool turbSwitchAtMomentum = std::getenv("BRAE_CONTROL_TURB_SWITCH_AT_MOMENTUM") != nullptr;
+        if (!turbSwitchAtMomentum && switchesAtTurbulenceCorrection(ctl_) && ioStoredEnabled())
+        {
+            dbK_.ioFresh.copyFrom(dbK_.ioMask.host());
+            dbEps_.ioFresh.copyFrom(dbEps_.ioMask.host());
+        }
+        ofUpdatePoints_ = true;
+    }
+
     DeviceSimpleResidual DeviceSimpleSolver::step()
     {
         const DeviceMesh& dm = dm_;
         DeviceSimpleResidual res;
+        // simpleFoam's boundary updates at OpenFOAM's points, pimpleStep's (simpleFoam.C:112-117 is pimpleFoam's order with one
+        // outer and one inner corrector, and the same fvMatrix constructors and evaluates move the same boundaries): k and
+        // epsilon|omega|nuTilda switched, and the turbulent inlets made from U's and k's patch values, at the turbulence
+        // correction; the limiters' gradients on the stored values; totalPressure and p inletOutlet at the pressure assembly;
+        // pressureInletOutletVelocity after the momentum solve and the correction; the wall nut held from correctNut. The
+        // momentum assembly took them all before, from the flux the iteration started with and the refValue form of the
+        // inlets. MEASURED against OpenFOAM v2412, every solve pinned: incompressible/simpleFoam/squareBend from rest (a
+        // turbulentIntensityKineticEnergyInlet and turbulentMixingLengthDissipationRateInlet), iteration 1, nut on the inlet
+        // 3.4 from OpenFOAM, 4.2e-04 with these points; windAroundBuildings from OpenFOAM's iteration 20 at p relaxation 1,
+        // U on its pressureInletOutletVelocity outlet 9.2e-04, 7.4e-08 (Arrhenius 5870755, 5870922). pitzDaily, which has
+        // no such patch, is the same to the bit either way. rhoSimpleStep keeps its points (not witnessed there). CONTROL
+        // BRAE_CONTROL_STEADY_UPDATE_POINTS_LEGACY=1: the momentum assembly's points, as before.
+        static const bool legacyPoints = std::getenv("BRAE_CONTROL_STEADY_UPDATE_POINTS_LEGACY") != nullptr;
+        if (!legacyPoints)
+        {
+            enterOpenFoamUpdatePoints();
+        }
         // BRAE_PHASE_TIME=1: the wall time of each phase of the iteration, the device drained at every
         // boundary (so the sum is a little above an untimed iteration's). The share each phase takes is
         // the number to have before optimising one of them.
@@ -5630,23 +5713,7 @@ SimplecSnGrad simplecSnGrad(
         // by then the fields are aged and only the geometry is being re-converged.
         if (moveMesh) moveMesh(0);
         advanceTime(deltaT);                                  // store oldTime() + set deltaT/deltaT0 for ddtCoeffs()
-        // kEpsilon's, the kOmegaSST family's and the SpalartAllmaras family's k and epsilon|omega (nuTilda) switch at the
-        // turbulence correction on this path
-        // (correctTurbulence), so the first step's earlier readers -- the 'calculated' nut patches in the momentum assembly's nuEff,
-        // and the stored values the limiter's gradients take -- meet an inletOutlet face before any switch.
-        // OpenFOAM's stored patch value is the file's `value` there; brae's construction state is
-        // fixedValue(inletValue). MEASURED on RAS/TJunction restarted from brae's own 0.01 (every outlet2
-        // face outflow, the file's k the cells' 0.048 to 0.10 against inletValue 0.2): U 6.3e-04 off the
-        // uninterrupted run at 0.02, all of it behind outlet2; with TJunctionFan's inlet 1.4e-04. From rest
-        // (value == inletValue) it changes nothing. The seed the other drivers' closures take
-        // (DeviceBoundary::ioStored); BRAE_IO_STORED=0 is its control.
-        static const bool turbSwitchAtMomentum = std::getenv("BRAE_CONTROL_TURB_SWITCH_AT_MOMENTUM") != nullptr;
-        if (!pimpleUpdatePoints_ && !turbSwitchAtMomentum && switchesAtTurbulenceCorrection(ctl_) && ioStoredEnabled())
-        {
-            dbK_.ioFresh.copyFrom(dbK_.ioMask.host());
-            dbEps_.ioFresh.copyFrom(dbEps_.ioMask.host());
-        }
-        pimpleUpdatePoints_ = true;
+        enterOpenFoamUpdatePoints();
         DeviceSimpleResidual res;
         const int nOuter = nOuterCorrectors > 0 ? nOuterCorrectors : 1;
         const int nCorr  = nCorrectors      > 0 ? nCorrectors      : 1;

@@ -449,6 +449,9 @@ void deviceUpdateWaveTransmissive(DeviceBoundary& db, const DeviceBuffer<label>&
                                   const DeviceBuffer<scalar>& gamma, const DeviceBuffer<scalar>& fOldB,
                                   const DeviceBuffer<scalar>& phiB, const DeviceBuffer<scalar>& rhoB,
                                   const DeviceBuffer<scalar>& psiB, scalar deltaT, bool phiIsMass);
+// p.relax() on the totalPressure faces: refValue = prevIter + alpha*(refValue - prevIter) where tpMask is set; the other
+// faces are left as they are. prevIter is refValue as simple.loop()/pimple.loop() stored it (storePrevIterFields).
+void deviceRelaxTotalPressure(DeviceBoundary& db, const DeviceBuffer<scalar>& prevIter, scalar alpha);
 void deviceUpdateTotalPressure(DeviceBoundary& db, const DeviceBuffer<scalar>& phiB, const DeviceBuffer<scalar>& Uxb,
                                const DeviceBuffer<scalar>& Uyb, const DeviceBuffer<scalar>& Uzb,
                                const DeviceBuffer<scalar>* rhoBnd = nullptr);   // compressible: rho at the face
