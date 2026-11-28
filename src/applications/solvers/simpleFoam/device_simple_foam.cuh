@@ -237,6 +237,11 @@ public:
     // the correction deliberately turned off.
     void setDdtCorr(bool on) { ddtCorr_ = on; }
 
+    // runTime.timeIndex() of the step about to run: uniform/time's index at the start plus the steps taken. backward's
+    // fvc::ddtCorr on a step without a second old level takes Euler's form only while it is below 2
+    // (backwardDdtScheme.C:62-71), so that branch refuses to run without it.
+    void setTimeIndex(long index) { timeIndex_ = index; }
+
     // Maxwell: hand over the six components of the sigma field the driver read from 0/sigma (as six
     // scalar fields, which is how they are solved). Must be called before the first step when
     // `laminar { model Maxwell; }` is selected; the solver refuses to run the model without it.
@@ -1015,6 +1020,7 @@ private:
     DeviceBuffer<scalar> amiPhiOld_, cycPhiOld_, amiFluxUold_, cycFluxUold_, ddtCorrIfOnes_;
     bool   ddtCorr_ = true;         // fvSolution PIMPLE/ddtCorr (OF pimpleControl.C:55, default true)
     bool   ddtCorrNoticed_ = false; // say once if the scheme is one brae has no ddtCorr form for
+    long   timeIndex_ = -1;         // setTimeIndex; -1 = not set, which backward's first-step ddtCorr refuses
 
     // mesh.phi() from the last move (per mesh face, internal then boundary). Held rather than applied at
     // the move: fvc::makeRelative belongs at the end of the pressure corrector. See makeFluxRelative.

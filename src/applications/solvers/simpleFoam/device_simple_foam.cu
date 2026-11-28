@@ -3249,6 +3249,28 @@ SimplecSnGrad simplecSnGrad(
                                    && ddtCoeffs(ddtScheme_, deltaT_, deltaT0_, ocCoeff_, cnWarm_).coefft00 > scalar(0)
                                    && phiOld2Int_.size() == phiOldInt_.size()
                                    && Uold2_[0].size() == Uold_[0].size();
+            // backward on its first step takes EULER's correction, as OpenFOAM computes it: backwardDdtScheme::deltaT0_(vf)
+            // is GREAT while runTime.timeIndex() < 2 (backwardDdtScheme.C:62-71), so fvcDdtPhiCorr's coefft0 is 1 and its
+            // coefft00 about 1e-36, and the term is ddtCouplingCoeff*rDeltaT*(phi.oldTime() - (Sf & interpolate(U.oldTime())))
+            // (.C:738-776). It vanishes from a start whose phi is flux(U) and is the whole first-step correction from one
+            // whose phi is not: a 3-D step started from simpleFoam's flux at iteration 50, p 1.2 at step 1 with none
+            // applied, 2.3e-07 under Euler (Arrhenius 5829990). The time index is the run's global one (uniform/time's index
+            // plus the steps taken), so a restart's first step keeps backward's own form (the branch below).
+            // CONTROL BRAE_CONTROL_BACKWARD_FIRST_NO_DDTCORR=1: no correction on that step, as before
+            static const bool backwardFirstNoCorr = std::getenv("BRAE_CONTROL_BACKWARD_FIRST_NO_DDTCORR") != nullptr;
+            const auto backwardEulerCorr = [this](bool control)
+            {
+                if (control)
+                {
+                    return false;
+                }
+                if (timeIndex_ < 0)
+                {
+                    throw std::runtime_error("brae: backward's fvc::ddtCorr on a step without a second old level depends on "
+                                             "the run's time index, which the driver did not set (setTimeIndex)");
+                }
+                return timeIndex_ < 2;
+            };
             if (ddtScheme_ == DdtScheme::CrankNicolson)
             {
                 // CrankNicolson's fvcDdtUfCorr carries its own off-centred ddt0 recurrence, not just an
@@ -3263,11 +3285,11 @@ SimplecSnGrad simplecSnGrad(
                                   "recurrence, so the correction is omitted");
                 }
             }
-            else if (ddtScheme_ != DdtScheme::Euler && !backwardCorr)
+            else if (ddtScheme_ != DdtScheme::Euler && !backwardCorr && !backwardEulerCorr(backwardFirstNoCorr))
             {
-                // backward on its FIRST transient step has no second old level yet, and OF falls back to
-                // Euler there (coefft00 is 0).
-                // Nothing to report: this is backward's own first-step fallback to Euler.
+                // backward without a second old level on a step whose time index is 2 or more: a restart's first step.
+                // OpenFOAM's form there is backward's, with the U_0 and phi_0 it read (or copies of the old levels), and
+                // brae reads neither yet. Nothing is applied, as before.
             }
             else
             {

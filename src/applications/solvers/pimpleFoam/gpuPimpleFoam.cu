@@ -929,6 +929,8 @@ try
         if (!time.loop()) break;
         ++timeIndex;
         solver.setTime(t);   // feed the current time to any codedFixedValue snippet's `t`
+        // runTime.timeIndex() of this step, which backward's first-step fvc::ddtCorr reads (DeviceSimpleSolver::setTimeIndex)
+        solver.setTimeIndex(clock ? static_cast<long>(clock->timeIndex()) : startIndex + timeIndex);
         // OF pimpleFoam.C:139-160 -- the mesh update is INSIDE the PIMPLE outer loop, guarded by
         // `pimple.firstIter() || moveMeshOuterCorrectors`. So it is a callback handed to pimpleStep
         // rather than a block that runs before it: with moveMeshOuterCorrectors set, every outer
