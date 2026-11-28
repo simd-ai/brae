@@ -314,6 +314,21 @@ SimplecSnGrad simplecSnGrad(
             dbPcorr_ = buildDeviceBoundary(pc, fvp, g);
         }
         wall_ = buildDeviceWallData(m, g, fvp, U, ctl_.turbWallPatch);
+        // a patch whose nut carries a wall function: a `wall` whose 0/nut condition is one (DeviceSimpleControls::nutWallFnPatch;
+        // the patch type alone when the caller gave no mask). Every other patch's nut takes its own condition, a wall's included:
+        // pimpleFoam/RAS/pitzDaily with upperWall a slip ground (U slip, k and epsilon zeroGradient, nut calculated) had its nut
+        // there from nutkWallFunction where OpenFOAM's is Cmu k^2/epsilon of the patch values.
+        // CONTROL BRAE_CONTROL_WALL_NUT_BY_PATCH_TYPE=1: every `wall` patch's nut from the wall function, as before
+        static const bool wallNutByType = std::getenv("BRAE_CONTROL_WALL_NUT_BY_PATCH_TYPE") != nullptr;
+        const auto nutWallPatch = [&](std::size_t pi)
+        {
+            if (fvp[pi].type != "wall")
+            {
+                return false;
+            }
+            return wallNutByType || ctl_.nutWallFnPatch.empty()
+                || (pi < ctl_.nutWallFnPatch.size() && ctl_.nutWallFnPatch[pi]);
+        };
         {   // DeviceBoundary face offset of each patch, for setPatchVelocity
             label st = 0;
             patchStart_.assign(fvp.size(), 0);
@@ -335,7 +350,7 @@ SimplecSnGrad simplecSnGrad(
             {
                 if (isCoupledInterfaceType(fvp[pi].type)) continue;
                 const int nutCat = nut->boundary[pi]->bcCategory();
-                const bool calc = (fvp[pi].type != "wall") && (nutCat == 2);
+                const bool calc = !nutWallPatch(pi) && (nutCat == 2);
                 // A non-wall `fixedValue` nut patch is NOT a `calculated` one and must not be lumped in
                 // with it: `calculated` means "correctNut filled this in", so Cmu*k_b^2/eps_b is right
                 // there, while `fixedValue` means the case PINNED it -- conventionally to 0 -- and the
@@ -344,7 +359,7 @@ SimplecSnGrad simplecSnGrad(
                 // 1e-06 but Cmu*k^2/eps is 7.03e-04 in the first cell, so the inlet's momentum
                 // internalCoeffs came out 704x OpenFOAM's (predicted 704.1, measured 703.1) -- which is
                 // where that case's H(), and everything downstream of it, went wrong.
-                const bool nutFixed = (fvp[pi].type != "wall") && (nutCat == 1);
+                const bool nutFixed = !nutWallPatch(pi) && (nutCat == 1);
                 if (nutFixed) hasNutFixed_ = true;
                 if (calc) hasNutCalc_ = true;
                 const std::vector<scalar>& pv = nut->boundary[pi]->value();
@@ -373,7 +388,7 @@ SimplecSnGrad simplecSnGrad(
                 const fvPatchField<scalar>* pf = nut->boundary[pi].get();
                 label kd = NutPatchUntouched;
                 std::vector<scalar> rv = pf->value();
-                if (fvp[pi].type != "wall")
+                if (!nutWallPatch(pi))
                 {
                     if (dynamic_cast<const TurbulentInletPatchField<scalar>*>(pf))
                     {
@@ -620,7 +635,7 @@ SimplecSnGrad simplecSnGrad(
             for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
                 if (isCoupledInterfaceType(fvp[pi].type)) continue;
-                const bool wall = (fvp[pi].type == "wall");
+                const bool wall = nutWallPatch(pi);   // the faces the nut wall function writes
                 for (label i = 0; i < fvp[pi].size; ++i)
                 {
                     isW.push_back(wall ? 1 : 0);

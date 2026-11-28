@@ -822,14 +822,26 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
                     || t == "symmetryPlane" || t == "wedge" || t == "empty" || t == "inletOutlet" || t == "freestream"
                     || t == "outletInlet";
             };
-            for (const auto& q : fvp)
+            // ...which includes a `wall` patch whose nut condition is not a wall function (ctl.nutWallFnPatch): its faces are
+            // evaluated the same way
+            ctl.nutWallFnPatch.assign(fvp.size(), 0);
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
             {
-                if (q.type == "wall" || isCoupledInterfaceType(q.type)) continue;
+                const auto* e = findPatchEntry(fd.boundary, fvp[pi]);
+                if (fvp[pi].type == "wall" && e && isNutWallFnType(e->type))
+                {
+                    ctl.nutWallFnPatch[pi] = 1;
+                }
+            }
+            for (std::size_t pi = 0; pi < fvp.size(); ++pi)
+            {
+                const FvPatch& q = fvp[pi];
+                if (ctl.nutWallFnPatch[pi] || isCoupledInterfaceType(q.type)) continue;
                 const auto* e = findPatchEntry(fd.boundary, q);
                 if (e && !carried(e->type))
                     throw std::runtime_error(
                         "brae: patch '" + q.name + "' resolves its nut BC to key '" + e->name + "' of type '" + e->type
-                        + "', which this driver does not evaluate on a patch that is not a wall (it carries calculated, "
+                        + "', which this driver does not evaluate on a patch without a nut wall function (it carries calculated, "
                         "fixedValue, zeroGradient, slip, symmetry, symmetryPlane, wedge, empty, inletOutlet, freestream and "
                         "outletInlet there). Refusing rather than keeping the file's value.");
             }
@@ -910,24 +922,15 @@ inline TurbulenceFields readTurbulenceFields(const std::string& fieldDir, const 
                     saWallFn = pb.type;
                 }
             }
-            // The plain-BC-on-a-wall check runs PATCH-DRIVEN, resolving each wall patch's entry the way
-            // buildField does -- an entry keyed `"wal.*"` used to be invisible to the exact-name compare
-            // here (audit finding #16), so a regex-keyed plain fixedValue on the walls still got the
-            // Spalding hard-force. A wall patch with NO entry at all is left to buildField's own fatal.
-            for (const auto& q : fvp)
-            {
-                if (q.type != "wall") continue;
-                const auto* e = findPatchEntry(nutFD.boundary, q);
-                if (e && !isNutWallFn(e->type))
-                    throw std::runtime_error(
-                        "brae: wall patch '" + q.name + "' resolves its nut BC to key '" + e->name +
-                        "' of type '" + e->type + "' (no wall function) on SpalartAllmaras. The SA "
-                        "path writes its wall function on every wall face and would overwrite this "
-                        "BC; OpenFOAM evaluates it. Refusing rather than substituting Spalding.");
-            }
+            // A wall patch whose nut condition is not a wall function was refused here ("the SA path writes its wall
+            // function on every wall face"). It no longer does: the wall function is written on the patches whose nut
+            // condition is one (ctl.nutWallFnPatch, set by guardNonWallNut above, which also refuses any type it does not
+            // evaluate), and every other wall's nut takes its own condition, as OpenFOAM's correctNut does. A low-Re wall,
+            // nut and nuTilda fixedValue 0 beside a nutUSpaldingWallFunction wall on pimpleFoam/RAS/pitzDaily: brae could
+            // not run it. A wall patch with NO entry at all is left to buildField's own fatal.
             ctl.nutWall = (saWallFn == "nutLowReWallFunction") ? NutWall::LowRe : NutWall::Spalding;
             std::printf("  nut wall function: %s (honoured on %s per the BC)\n",
-                        saWallFn.empty() ? "nutUSpaldingWallFunction (no wall BC named one; SA default)"
+                        saWallFn.empty() ? "none (no wall's nut condition names one; each wall takes its own)"
                                          : saWallFn.c_str(),
                         ctl.modelName.c_str());
             nut = buildField<scalar>(nutFD, fvp, nC);

@@ -204,6 +204,12 @@ struct DeviceSimpleControls
     // whenever a `wall`-typed patch carries a plain BC. EMPTY means "fall back to the patch type",
     // which is what the SA and LES paths use -- they have no epsilon/omega field to read.
     std::vector<char> turbWallPatch;
+    // WHICH PATCHES CARRY A NUT WALL FUNCTION, one entry per fvPatch, 1 = yes: a `wall` patch whose 0/nut condition is one of the
+    // nut wall-function family (isNutWallFnType). OpenFOAM's nut on a wall patch is whatever that patch's own nut condition
+    // evaluates (nut_.correctBoundaryConditions() in correctNut), so a wall patch carrying a plain nut condition -- a slip ground
+    // with nut calculated or zeroGradient, a low-Re wall with fixedValue 0 -- is not given a wall function's value. EMPTY means
+    // "fall back to the patch type", for a caller that does not read nut's conditions.
+    std::vector<char> nutWallFnPatch;
     // OF createDyMControls.H, default FALSE: the mesh moves once per time step, on the first outer
     // iteration. When true it moves before EVERY outer corrector, so the outer loop converges the mesh
     // position alongside the pressure-velocity coupling.

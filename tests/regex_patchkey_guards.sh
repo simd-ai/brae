@@ -67,14 +67,27 @@ echo "$out" | grep -q "honoured on SpalartAllmaras per the BC" \
     && say "SA walls keyed by regex still run with Spalding honoured (control)" ok \
     || { echo "$out" | tail -4; say "SA walls keyed by regex still run with Spalding honoured (control)" FAIL; }
 
-# arm 3: the same regex key carrying a PLAIN BC -- pre-fix the exact-name compare missed it and the SA
-# path ran the Spalding hard-force over a fixedValue the case asked for.
+# arm 3: the same regex key carrying a PLAIN BC -- pre-fix the exact-name compare missed it and the SA path ran the Spalding
+# hard-force over a fixedValue the case asked for; the refusal that followed is lifted (the wall function is written only on
+# patches whose nut condition is one), so the regex key must resolve to the plain BC: the walls nut written is its 0
 sed -i 's/type            nutUSpaldingWallFunction;/type            fixedValue;/' "$W2/0/nut"
+rm -rf "$W2/1"
 out=$(cd "$W2" && "$BRAE" -case "$W2" 2>&1 || true)
-echo "$out" | grep -q "resolves its nut BC to key 'wal.\*'" \
-    && echo "$out" | grep -q "Refusing rather than substituting Spalding" \
-    && say "a regex-keyed plain nut BC on an SA wall refuses by name" ok \
-    || { echo "$out" | tail -4; say "a regex-keyed plain nut BC on an SA wall refuses by name" FAIL; }
+wn=$(python3 - "$W2/1/nut" 2>/dev/null << 'PY'
+import re, sys
+s = open(sys.argv[1]).read()
+b = re.search(r'\n\s*walls\s*\{(.*?)\}', s, re.S).group(1)
+m = re.search(r'value\s+uniform\s+([^;]+);', b)
+if m:
+    print(abs(float(m.group(1))))
+else:
+    v = re.search(r'value\s+nonuniform\s+List<scalar>\s*\d*\s*\((.*?)\)', b, re.S).group(1).split()
+    print(max(abs(float(x)) for x in v))
+PY
+)
+[ -n "$wn" ] && python3 -c "import sys; sys.exit(0 if float('$wn') == 0 else 1)" \
+    && say "a regex-keyed plain nut BC on an SA wall resolves to its own condition (walls nut 0)" ok \
+    || { echo "$out" | tail -4; say "a regex-keyed plain nut BC on an SA wall resolves to its own condition (walls nut ${wn:-none})" FAIL; }
 rm -rf "$W2"
 
 [ $fail = 0 ] && echo PASS || { echo FAIL; exit 1; }

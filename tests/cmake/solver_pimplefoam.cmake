@@ -187,3 +187,9 @@ set_tests_properties(pimple_controldict_defaults_vs_openfoam PROPERTIES SKIP_RET
 add_test(NAME pimple_cranknicolson_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_cranknicolson_vs_openfoam.sh)
 set_tests_properties(pimple_cranknicolson_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
                      ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_pimpleFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+
+# nut on a WALL patch that carries no nut wall function, RAS/pitzDaily: a slip ground with nut calculated or zeroGradient
+# (kEpsilon) and a low-Re wall with nut fixedValue 0 (SpalartAllmaras), every entry against OpenFOAM; a premise, one control.
+add_test(NAME pimple_wall_nut_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_wall_nut_vs_openfoam.sh)
+set_tests_properties(pimple_wall_nut_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
+                     ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_pimpleFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
