@@ -465,6 +465,7 @@ int runMirrorCuda(const std::string& caseDir)
     const std::string startName = time.startName();
     WriteControl& wc = time.writeControl();
     tracerCtx.fieldDir = caseDir + "/" + startName;
+    tracerCtx.caseDir = caseDir;
 
     // The HOST field set first, exactly as the harness does: createDeviceFields projects the device
     // state from it, and every refusal createFields carries (thermo, RAS model, boundary conditions,
@@ -834,6 +835,11 @@ int runMirrorCuda(const std::string& caseDir)
     tracerCtx.m = &m;
     tracerCtx.g = &g;
     tracerCtx.patches = &patches;
+    // the tracer's fvm::ddt(rho, s), from the parse the closures' ddt reads (rDeltaT = 1/controlDict's LAST deltaT)
+    {
+        const DdtSchemeEntry ddt = parseDdtScheme(caseDir);
+        tracerCtx.rDeltaT = (ddt.euler && hf.deltaT > 0.0) ? scalar(1) / hf.deltaT : scalar(0);
+    }
     DevicePorosity porosity;        // outlives gin: RhoStepInput::porosity points into it
     DeviceConstraints constraints;  // ...and so do the fvOptions constraint masks
     RhoStepInput gin =
@@ -1059,7 +1065,8 @@ int runMirrorCuda(const std::string& caseDir)
     const std::string wsrc = caseDir + "/" + startName + "/";
     const std::string second = (hf.rasModel == "kOmegaSST") ? "omega" : "epsilon";
 
-    auto writeTimeDir = [&](const std::string& tname)
+    // finalWrite: the solver's own last write, after the last functionObject execute (see the tracers below)
+    auto writeTimeDir = [&](const std::string& tname, bool finalWrite)
     {
         const std::string outDir = caseDir + "/" + tname;
         std::filesystem::create_directories(outDir);
@@ -1076,8 +1083,10 @@ int runMirrorCuda(const std::string& caseDir)
         writeVolField(wsrc + "T", outDir + "/T", host(dev.f.T), patches, 12, host(dev.f.TBnd));
         // scalarTransport's transportedField(), written beside the solved fields on the same cadence;
         // its boundary is evaluated from the device field here, as k's is below.
+        // Intermediate times are the object's own write() (rhoScalarTransportFO.cuh: tracerWriteBeforeSolve), after its
+        // execute; the last is written here, after Time::end()'s execute.
         for (const brae::tracer::RhoTracerCudaFO* st : tracers)
-            if (st->ready())
+            if (st->ready() && (finalWrite || brae::tracer::tracerWriteBeforeSolve()))
                 writeVolField(wsrc + st->fieldName(), outDir + "/" + st->fieldName(), st->hostField(), patches, 12,
                               st->boundaryFlat());
         {
@@ -1278,14 +1287,14 @@ int runMirrorCuda(const std::string& caseDir)
         if (r.count(second))    achieved = resControl.ok(r.at(second), second) && achieved;
         if (resControl.converged(achieved)) { converged = true; nIter = iter; time.stop(); break; }
 
-        if (time.writeTime()) writeTimeDir(WriteControl::timeName(wc.timeValue(iter)));
+        if (time.writeTime()) writeTimeDir(WriteControl::timeName(wc.timeValue(iter)), false);
     }
     time.end();
     std::printf(converged ? "SIMPLE solution converged in %d iterations\n"
                           : "SIMPLE reached endTime (%d iterations)\n", nIter);
     rhoPhaseTimeReport(nIter);   // BRAE_PHASE_TIME (item 67); silent otherwise
 
-    writeTimeDir(WriteControl::timeName(wc.timeValue(nIter)));
+    writeTimeDir(WriteControl::timeName(wc.timeValue(nIter)), true);
     std::printf("End\n");
     return 0;
 }

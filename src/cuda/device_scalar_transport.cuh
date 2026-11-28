@@ -335,7 +335,14 @@ void deviceSolveScalarTransport(
     // laplacianSchemes `limited corrected <psi>`: the non-orthogonal correction capped face by face against the
     // uncorrected snGrad (limitedSnGrad.C:48-58), 0 <= psi < 1, psi = 0 being no correction at all. 1 is `corrected`,
     // the whole correction. Trailing, so every existing call is unchanged; the caller passes its case's lapLimit().
-    scalar lapLimit = 1)
+    scalar lapLimit = 1,
+    // `grad(<field>)` as the CALLER computed it under the case's own entry (deviceGradOf: leastSquares and/or
+    // cellLimited), for its two consumers here, limitedLinear's limiter and the non-orthogonal correction. Null: this
+    // function's Gauss gradient, limited by fieldGradLimitK. linearUpwind's correction keeps the gradient its entry
+    // names (gx/lgx). Trailing, so every existing call is unchanged.
+    const DeviceBuffer<scalar>* fieldGradX = nullptr,
+    const DeviceBuffer<scalar>* fieldGradY = nullptr,
+    const DeviceBuffer<scalar>* fieldGradZ = nullptr)
 {
     const int nC = dm.nCells;
     DeviceBuffer<scalar> Df;
@@ -414,9 +421,15 @@ void deviceSolveScalarTransport(
             deviceCellLimitGrad(dm, field, bv, ngx, ngy, ngz, fieldGradLimitK, ifs, nIfs);
         }
     }
-    const DeviceBuffer<scalar>& fieldGx = !limitField ? gx : (fieldSharesLU ? lgx : ngx);
-    const DeviceBuffer<scalar>& fieldGy = !limitField ? gy : (fieldSharesLU ? lgy : ngy);
-    const DeviceBuffer<scalar>& fieldGz = !limitField ? gz : (fieldSharesLU ? lgz : ngz);
+    const bool fieldGradGiven = fieldGradX && fieldGradY && fieldGradZ;
+    if (fieldGradGiven && fieldGradLimitK > scalar(0))
+    {
+        throw std::runtime_error(std::string("deviceSolveScalarTransport(") + fieldName + "): the caller gave grad(<field>) "
+                                 "and a cellLimited coefficient for this function to apply to its own; one or the other.");
+    }
+    const DeviceBuffer<scalar>& fieldGx = fieldGradGiven ? *fieldGradX : (!limitField ? gx : (fieldSharesLU ? lgx : ngx));
+    const DeviceBuffer<scalar>& fieldGy = fieldGradGiven ? *fieldGradY : (!limitField ? gy : (fieldSharesLU ? lgy : ngy));
+    const DeviceBuffer<scalar>& fieldGz = fieldGradGiven ? *fieldGradZ : (!limitField ? gz : (fieldSharesLU ? lgz : ngz));
     const bool sharedLim = limField && limGradX && limGradY && limGradZ;
     if (limited)
     {
