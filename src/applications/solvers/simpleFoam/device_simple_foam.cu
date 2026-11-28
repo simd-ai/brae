@@ -3764,6 +3764,35 @@ SimplecSnGrad simplecSnGrad(
         // BRAE_CONTROL_TOTAL_PRESSURE_AT_MOMENTUM=1: the momentum assembly's point, as before.
         static const bool totalPAtMomentum = std::getenv("BRAE_CONTROL_TOTAL_PRESSURE_AT_MOMENTUM") != nullptr;
         if (hasTotalP_ && ofUpdatePoints_ && !totalPAtMomentum) updateTotalPressure();
+        // ...and the gradient the first corrector's non-orthogonal correction reads. OpenFOAM takes fvc::grad(p) for it inside
+        // fvm::laplacian(rAtU, p), after this constructor's updateCoeffs, and totalPressure's updateCoeffs writes its face
+        // value at once (operator==), while a mixed patch's only moves its valueFraction. Pass 0 of the first corrector
+        // reuses the momentum predictor's gradient, which read the totalPressure faces as they were stored. So it is taken
+        // again here, before p's inletOutlet switch below, freestream faces at their stored values. MEASURED on
+        // incompressible/simpleFoam/windAroundBuildings from OpenFOAM's iteration 20 (two outlet faces outflow with the
+        // relaxed -0.231 and -0.096 still stored), one iteration at p relaxation 1, every solve pinned: HbyA and phiHbyA
+        // OpenFOAM's to 1.6e-15, the pressure system's coefficients to 1.7e-16, the solved p 1.5e-08 off (U on the outlet
+        // 7.4e-08); exact (9.7e-12) once those stored values are zero (Arrhenius 5872167, 5872277). CONTROL
+        // BRAE_CONTROL_PASS0_GRAD_BEFORE_TOTAL_PRESSURE=1: the momentum predictor's gradient, as before.
+        static const bool pass0GradBeforeTp = std::getenv("BRAE_CONTROL_PASS0_GRAD_BEFORE_TOTAL_PRESSURE") != nullptr;
+        if (hasTotalP_ && ofUpdatePoints_ && !totalPAtMomentum && ctl_.nonOrth && ctl_.innerCorrector == 0 && !pass0GradBeforeTp)
+        {
+            DeviceBuffer<scalar> pbvTp;
+            deviceBCValue(dbP_, dp_, pbvTp);
+            if (freestreamStored())
+            {
+                deviceStoredFreestreamValues(dbP_, pbStored_, pbvTp);
+            }
+            deviceGaussGrad(dm, dp_, pbvTp, gx, gy, gz);
+            if (hasCyclic_)
+            {
+                interfaceAddGrad(cyc_, dp_, dm.V, gx, gy, gz);
+            }
+            if (hasAMI_)
+            {
+                interfaceAddGrad(ami_, dp_, dm.V, gx, gy, gz);
+            }
+        }
         // ...and p's inletOutlet, in the same constructor (inletOutletFvPatchField.C updateCoeffs: valueFraction =
         // 1 - pos0(phip)) on the flux as it stands; every non-orthogonal pass reads the same flux. Switched once at the
         // momentum assembly instead, a corrector after the first kept the switch from the flux before the step: RAS/TJunction
