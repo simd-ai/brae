@@ -603,6 +603,7 @@ int runMirror(const std::string& caseDir)
     const std::string startName = time.startName();
     WriteControl& wc = time.writeControl();
     tracerCtx.fieldDir = caseDir + "/" + startName;
+    tracerCtx.caseDir = caseDir;
 
     // This driver's wall treatments read Cmu/kappa/E per patch (item 16h-port): the reader must not
     // announce those entries as unhonoured.
@@ -613,6 +614,12 @@ int runMirror(const std::string& caseDir)
     tracerCtx.m = &m;
     tracerCtx.g = &g;
     tracerCtx.patches = &patches;
+    // the tracer's fvm::ddt(rho, s), from the parse the closures' ddt reads (buildStepInput: rDeltaT = 1/controlDict's
+    // LAST deltaT)
+    {
+        const DdtSchemeEntry ddt = parseDdtScheme(caseDir);
+        tracerCtx.rDeltaT = (ddt.euler && f.deltaT > 0.0) ? scalar(1) / f.deltaT : scalar(0);
+    }
 
     std::printf("brae rhoSimpleFoam (OF-mirror): %ld cells, start %s, %s\n",
                 (long)nC, startName.c_str(),
@@ -686,7 +693,8 @@ int runMirror(const std::string& caseDir)
     const std::string wsrc = caseDir + "/" + startName + "/";
     const std::string second = (f.rasModel == "kOmegaSST") ? "omega" : "epsilon";
 
-    auto writeTimeDir = [&](const std::string& tname)
+    // finalWrite: the solver's own last write, after the last functionObject execute (see the tracers below)
+    auto writeTimeDir = [&](const std::string& tname, bool finalWrite)
     {
         const std::string outDir = caseDir + "/" + tname;
         std::filesystem::create_directories(outDir);
@@ -700,8 +708,10 @@ int runMirror(const std::string& caseDir)
         writeVolField(wsrc + "T", outDir + "/T", f.T.internal, patches, 12,
                       flatBoundary(f.T, patches));
         // scalarTransport's transportedField(), written beside the solved fields on the same cadence.
+        // Intermediate times are the object's own write() (rhoScalarTransportFO.cuh: tracerWriteBeforeSolve), after its
+        // execute; the last is written here, after Time::end()'s execute.
         for (const brae::tracer::RhoTracerHostFO* st : tracers)
-            if (st->ready())
+            if (st->ready() && (finalWrite || brae::tracer::tracerWriteBeforeSolve()))
                 writeVolField(wsrc + st->fieldName(), outDir + "/" + st->fieldName(), st->hostField(), patches, 12,
                               st->boundaryFlat());
         {
@@ -782,7 +792,7 @@ int runMirror(const std::string& caseDir)
 
         // Intermediate write. Time::writeTime() returns false on the last step -- that one is the final
         // write below, as in OF's writeAndEnd.
-        if (time.writeTime()) writeTimeDir(WriteControl::timeName(wc.timeValue(iter)));
+        if (time.writeTime()) writeTimeDir(WriteControl::timeName(wc.timeValue(iter)), false);
     }
     time.end();
     std::printf(converged ? "SIMPLE solution converged in %d iterations\n"
@@ -790,7 +800,7 @@ int runMirror(const std::string& caseDir)
 
     // The final state is always written, as OF's writeAndEnd does, and named from the TIME VALUE rather
     // than the iteration count so a case with deltaT != 1 gets OpenFOAM's directory names.
-    writeTimeDir(WriteControl::timeName(wc.timeValue(nIter)));
+    writeTimeDir(WriteControl::timeName(wc.timeValue(nIter)), true);
     std::printf("End\n");
     return 0;
 }
