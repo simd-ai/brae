@@ -47,6 +47,10 @@ set +u   # the bashrc reads unset variables
 # shellcheck disable=SC1090
 source "$OFBASHRC" > /dev/null 2>&1 || true
 set -u
+# brae in OpenFOAM's sweep order: this gate holds OpenFOAM's own trajectory, so U's and the turbulence fields'
+# Gauss-Seidel must not take simpleFoam's colour rule. ctest sets this for every test (tests/CMakeLists.txt); a
+# direct run must too. Run directly without it, the colour order read W1 4.2e-08 and W2 6.8e-08 (nut internal).
+export BRAE_SIMPLE_CASE_SOLVER=1
 TUTS="${BRAE_OF_TUTORIALS:-${FOAM_TUTORIALS:-}}"
 TUT="$TUTS/incompressible/simpleFoam/windAroundBuildings"
 [ -d "$TUT/system" ] || { echo "SKIP: no simpleFoam/windAroundBuildings tutorial at $TUT"; exit 77; }
