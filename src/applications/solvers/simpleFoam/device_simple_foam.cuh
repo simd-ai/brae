@@ -1051,6 +1051,7 @@ private:
     // The momentum assembly's grad(p) and the velocity correction's read it. pbPrev_ is prevIter()'s, taken
     // where simple.loop() stores it, at the top of the iteration.
     DeviceBuffer<scalar> pbStored_;
+    DeviceBuffer<scalar> tpPrev_;   // p's boundary refValue at storePrevIterFields: the totalPressure faces' prevIter
     DeviceBuffer<scalar> pbPrev_;
     bool freestreamStored() const { return UbStored_[0].size() > 0; }
     // U's patch values as read, for kOmegaSST's validate() alone: empty once the first iteration begins

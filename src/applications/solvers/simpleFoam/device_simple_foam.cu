@@ -2043,6 +2043,7 @@ SimplecSnGrad simplecSnGrad(
         }
         // simple.loop()'s storePrevIterFields: p's prevIter, boundary included
         if (freestreamStored()) deviceCopy(pbPrev_, pbStored_);
+        if (hasTotalP_) deviceCopy(tpPrev_, dbP_.refValue);
         // mixed freestreamVelocity: updateCoeffs inside the momentum fvMatrix constructor rebuilds its
         // valueFraction from the STORED patch velocity (UbStored_, what the last evaluate left). Its pressure
         // partner moves at the pressure assembly instead (correctPressureVelocity). The control re-derives
@@ -4135,6 +4136,19 @@ SimplecSnGrad simplecSnGrad(
             deviceCopy(pbStored_, pbSolved);
             deviceScale(pbStored_, ctl_.pRelax());
             deviceAxpy(1.0 - ctl_.pRelax(), pbPrev_, pbStored_);
+        }
+        // ...and a totalPressure face, a fixedValue whose value the pressure assembly's updateCoeffs set: p.relax() blends it
+        // with prevIter too, and that blend is what U = HbyA - rAtU*grad(p) reads below, what the next momentum assembly's
+        // grad(p) and SIMPLEC terms read, and what OpenFOAM writes, until the next pressure assembly sets it again. On the
+        // points that set it there (ofUpdatePoints_). MEASURED on incompressible/simpleFoam/windAroundBuildings from
+        // OpenFOAM's iteration 20 under the tutorial's p relaxation 0.3, one iteration, every solve pinned: an outlet face
+        // turning from inflow (-0.2309) to outflow wrote 0 where OpenFOAM writes 0.7 x -0.2309 = -0.1616 (the entry 1.0
+        // off), and U on the outlet 2.6e-03 from OpenFOAM's (Arrhenius 5870755). CONTROL
+        // BRAE_CONTROL_TOTAL_PRESSURE_UNRELAXED=1: the value the assembly set, unrelaxed, as before.
+        static const bool tpUnrelaxed = std::getenv("BRAE_CONTROL_TOTAL_PRESSURE_UNRELAXED") != nullptr;
+        if (hasTotalP_ && ofUpdatePoints_ && !tpUnrelaxed && ctl_.pRelax() < 1)
+        {
+            deviceRelaxTotalPressure(dbP_, tpPrev_, ctl_.pRelax());
         }
         deviceScale(dp_, ctl_.pRelax());
         deviceAxpy(1.0 - ctl_.pRelax(), pPrev, dp_);
