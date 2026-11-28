@@ -712,6 +712,65 @@ int main(int argc, char** argv)
         const scalar writeInterval = controlDict.scalarOr("writeInterval", 1e30);   // OF default GREAT -> only the final state
         const int    purgeWrite    = std::max(0, controlDict.intOr("purgeWrite", 0));
         const scalar deltaT        = controlDict.scalarOr("deltaT", 1.0);
+        // ddtSchemes on this steady solver. simpleFoam's UEqn has no ddt, but OpenFOAM's turbulence models construct
+        // fvm::ddt of every field they transport whatever the solver, so `default Euler` is a real term in those equations
+        // (DeviceSimpleSolver::setSteadyTurbulenceDdt), with controlDict's deltaT -- which OpenFOAM requires (TimeIO.C:274).
+        // Any other scheme, or a per-field entry, is refused by name rather than run as a different equation.
+        {
+            const std::string fvs = caseDir + "/system/fvSchemes";
+            const std::string ddtWord = readDdtSchemeWord(fvs);
+            std::string block;
+            try
+            {
+                const std::string text = readFileExpanded(fvs);
+                const std::size_t b = text.find("ddtSchemes");
+                const std::size_t o = (b == std::string::npos) ? b : text.find('{', b);
+                const std::size_t c = (o == std::string::npos) ? o : text.find('}', o);
+                if (c != std::string::npos)
+                {
+                    block = text.substr(o + 1, c - o - 1);
+                }
+            }
+            catch (...)
+            {
+            }
+            if (block.find("ddt(") != std::string::npos)
+            {
+                throw std::runtime_error("brae: fvSchemes ddtSchemes names a per-field entry on the steady solver simpleFoam; only "
+                                         "its `default` is read here (steadyState, or Euler for the turbulence equations). "
+                                         "Refusing rather than give that field another scheme.");
+            }
+            if (ddtWord == "Euler")
+            {
+                if (!controlDict.found("deltaT"))
+                {
+                    throw std::runtime_error("brae: fvSchemes ddtSchemes default Euler on simpleFoam needs controlDict's deltaT: "
+                                             "it is the turbulence equations' time step, and OpenFOAM requires the entry.");
+                }
+                if (ctl.maxwell)
+                {
+                    throw std::runtime_error("brae: fvSchemes ddtSchemes default Euler with the laminar Maxwell model on "
+                                             "simpleFoam: OpenFOAM's stress equation takes fvm::ddt(sigma), which this steady "
+                                             "step does not carry. Refusing rather than run it steady.");
+                }
+                // OpenFOAM's scalarTransport solves fvm::ddt(s) + fvm::div(phi, s) - fvm::laplacian(D, s) under the same
+                // default (scalarTransport.C:341); the steady step's solvePassiveScalar drops the ddt.
+                if (!scalarTransports.empty())
+                {
+                    throw std::runtime_error("brae: fvSchemes ddtSchemes default Euler with a scalarTransport function "
+                                             "object on simpleFoam: OpenFOAM's tracer equation takes fvm::ddt(s) under it, "
+                                             "which this steady step does not carry for the tracer. Refusing rather than "
+                                             "solve the tracer steady.");
+                }
+                solver.setSteadyTurbulenceDdt(DdtScheme::Euler, deltaT);
+            }
+            else if (!ddtWord.empty() && ddtWord != "steadyState")
+            {
+                throw std::runtime_error("brae: fvSchemes ddtSchemes default '" + ddtWord + "' on the steady solver simpleFoam: "
+                                         "OpenFOAM's turbulence equations take it (fvm::ddt), and this steady step carries "
+                                         "steadyState and Euler only. Refusing rather than run them as another equation.");
+            }
+        }
         // The RESOLVED start, not controlDict's startTime: `startFrom latestTime` can make them differ,
         // and every time value below is measured from the start. Taking the dict's value made a run
         // restarted from 10 name its output 1, 2, 3... -- overwriting the case's own early history.

@@ -157,6 +157,24 @@ public:
     // --- Transient (PIMPLE) interface -- reuses the three composable phases above under an outer/inner-corrector loop,
     // with the implicit fvm::ddt(U) folded into solveMomentumPredictor. setDdtScheme() switches this solver from steady
     // (SIMPLE, the default) to transient; the steady step() path is completely unaffected (ddt stays a no-op).
+    // The steady step's TURBULENCE time derivative. OpenFOAM's turbulence models construct fvm::ddt(alpha, rho, k) and
+    // fvm::ddt(alpha, rho, epsilon|omega) (nuTilda, the transition scalars) whatever the solver (kEpsilon.C:254, 275,
+    // kOmegaSSTBase.C:572, 602, SpalartAllmarasBase.C:468), so a steady case whose ddtSchemes default is Euler solves each
+    // of them with (psi - psi.oldTime())/deltaT, deltaT the solver's own time step: incompressible/simpleFoam/squareBend
+    // and lumpedPointMotion's steady cases ship it. simpleFoam's UEqn has no ddt, so the momentum assembly takes none and
+    // ddtScheme_ stays steadyState. step() takes the old level at the start of the iteration (Time::operator++).
+    void setSteadyTurbulenceDdt(DdtScheme s, scalar deltaT)
+    {
+        steadyTurbDdt_ = s;
+        steadyTurbDeltaT_ = deltaT;
+    }
+    // Set and not switched off by the control: BRAE_CONTROL_STEADY_TURBULENCE_DDT_IGNORED=1 drops the term, as before.
+    bool steadyTurbulenceDdtActive() const
+    {
+        static const bool ignored = std::getenv("BRAE_CONTROL_STEADY_TURBULENCE_DDT_IGNORED") != nullptr;
+        return steadyTurbDdt_ != DdtScheme::steadyState && steadyTurbDeltaT_ > scalar(0) && !ignored;
+    }
+
     void setDdtScheme(DdtScheme s, scalar ocCoeff = scalar(1))
     {
         ddtScheme_ = s;
@@ -1072,6 +1090,8 @@ private:
     // simpleFoam run them, each in the constructor or evaluate of its own field's equation -- totalPressure at every
     // pressure assembly, for one. rhoSimpleStep keeps the momentum assembly's points.
     bool   ofUpdatePoints_ = false;
+    DdtScheme steadyTurbDdt_ = DdtScheme::steadyState;   // setSteadyTurbulenceDdt
+    scalar    steadyTurbDeltaT_ = 0;
     bool   hasCyclic_ = false;                                 // any cyclic (periodic) interface -> Jacobi-PCG pressure (no AMG)
     DeviceCyclic cyc_;                                          // periodic interface coupling (OF updateInterfaceMatrix)
     // (fvPatch index, face count) of each side stacked into cyc_.phi / ami_.phi, in the order

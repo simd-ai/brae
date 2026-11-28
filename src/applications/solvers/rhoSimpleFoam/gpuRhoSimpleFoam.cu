@@ -26,6 +26,7 @@
 #include "foam_field_reader.cuh"
 #include "foam_field_writer.cuh"
 #include "foam_dict.cuh"
+#include "../common/solver_dispatch.cuh"   // readDdtSchemeWord
 #include "fvc.cuh"
 #include "device_simple_foam.cuh"
 #include "thermo_parse.cuh"
@@ -388,6 +389,22 @@ int main(int argc, char** argv)
         // COMPRESSIBLE legacy: rhoSimpleStep applies the generalized-Newtonian nu
         // (device_simple_foam.cu:3540) and the boundary muEff arm at :1319 is its compressible half.
         readTurbulenceModel(turbProps, ctl, {"rhoSimpleFoam (legacy)", true, true});
+        // A RAS model's equations take fvm::ddt(alpha, rho, k) (kEpsilon.C:254, 275) whatever the solver, so a ddtSchemes
+        // default other than steadyState makes them pseudo-transient (gasMixing/injectorPipe ships Euler). This path's
+        // rhoSimpleStep carries no time derivative; the OF-mirror arms do (BRAE_RHOSIMPLEFOAM_MIRROR, the closures' ddt
+        // with rho.oldTime()). Refused here rather than run steady with a notice.
+        if (ctl.turbulent)
+        {
+            const std::string ddtWord = readDdtSchemeWord(caseDir + "/system/fvSchemes");
+            if (!ddtWord.empty() && ddtWord != "steadyState")
+            {
+                throw std::runtime_error("brae: fvSchemes ddtSchemes default '" + ddtWord + "' with a RAS model on "
+                                         "rhoSimpleFoam's default device path: OpenFOAM's turbulence equations take "
+                                         "fvm::ddt(alpha, rho, k|epsilon|omega) under it, which this path does not carry. "
+                                         "The OF-mirror arms do (BRAE_RHOSIMPLEFOAM_MIRROR=1 or cuda). Refusing rather "
+                                         "than run them steady.");
+            }
+        }
         // kOmegaSST and kEpsilon are both rho-weighted (every RHS term, the diffusivity, the volumetric
         // divU and the per-face wall nu). SA and the kOmegaSST variants are not, so they stay refused:
         // running one down the incompressible path converges to a wrong answer rather than failing.
@@ -835,6 +852,20 @@ int main(int argc, char** argv)
                 + startName + "): there is nothing to run. endTime is an ABSOLUTE time, not a number of "
                 "iterations -- on a restart set it past the time you are restarting from.");
         Time time(controlDict, &wc, static_cast<int>(nSteps), foTypes);
+        // OpenFOAM's scalarTransport on a mass flux solves fvm::ddt(rho, s) + fvm::div(phi, s) - fvm::laplacian(D, s)
+        // (scalarTransport.C:319) under the case's ddt default; rhoSimpleStep's solvePassiveScalar carries none. The RAS
+        // refusal above covers a turbulent case; this covers a laminar one.
+        if (!scalarTransports.empty())
+        {
+            const std::string ddtWord = readDdtSchemeWord(caseDir + "/system/fvSchemes");
+            if (!ddtWord.empty() && ddtWord != "steadyState")
+            {
+                throw std::runtime_error("brae: fvSchemes ddtSchemes default '" + ddtWord + "' with a scalarTransport "
+                                         "function object on rhoSimpleFoam's default device path: OpenFOAM's tracer "
+                                         "equation takes fvm::ddt(rho, s) under it, which this path does not carry. "
+                                         "Refusing rather than solve the tracer steady.");
+            }
+        }
 
         int nIter = static_cast<int>(nSteps);
         bool converged = false;

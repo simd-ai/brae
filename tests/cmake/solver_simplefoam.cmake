@@ -76,6 +76,13 @@ set_tests_properties(simple_freestream_stored_vs_openfoam PROPERTIES SKIP_RETURN
 add_test(NAME simple_update_points_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/simple_update_points_vs_openfoam.sh)
 set_tests_properties(simple_update_points_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
                      ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+# simpleFoam's turbulence equations under `ddtSchemes default Euler` (squareBend as shipped): OpenFOAM's models construct
+# fvm::ddt of k and epsilon whatever the solver. Three pinned iterations from rest, every entry held; the term dropped
+# (BRAE_CONTROL_STEADY_TURBULENCE_DDT_IGNORED=1) fails; backward on simpleFoam and Euler with RAS on rhoSimpleFoam's default
+# device path are refused by name.
+add_test(NAME simple_turbulence_ddt_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/simple_turbulence_ddt_vs_openfoam.sh)
+set_tests_properties(simple_turbulence_ddt_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
+                     ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
 # omegaWallFunction's and epsilonWallFunction's G0 from the STORED wall nut in the legacy closures: pitzDailySST with Spalding walls
 # at tolerance 1e-9, one iteration from OpenFOAM's own iteration 50 against real OpenFOAM; the made-again nut
 # (BRAE_CONTROL_G0_NUT_RECOMPUTED=1) fails.
