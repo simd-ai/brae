@@ -7,8 +7,8 @@
 #
 # Now the BC selects: Spalding and LowRe are honoured on SA; the k-based family refuses by name
 # (OpenFOAM feeds it SpalartAllmarasBase::k(), a derived estimate brae does not carry); a concrete wall
-# patch whose nut names no wall function refuses (the device would overwrite the BC); and two different
-# wall functions refuse (one selector drives every wall).
+# patch whose nut names no wall function takes its own condition (it was refused while the device wrote the wall function on
+# every wall face); and two different wall functions refuse (one selector drives every wall).
 #
 # The fixture is validation/airFoil2D -- the SA gate case, walls = nutUSpaldingWallFunction.
 set -e
@@ -68,21 +68,43 @@ echo "$out" | grep -q "carries both" \
     && say "two different SA wall functions refused" ok \
     || { echo "$out" | tail -4; say "two different SA wall functions refused" FAIL; }
 
-# ---- arm 5: a concrete WALL patch with a plain (non-wall-function) nut BC refuses ------------------
+# ---- arm 5: a concrete WALL patch with a plain (non-wall-function) nut BC takes its own condition ----
+# It was refused ("the SA path writes its wall function on every wall face"); the wall function is now written only on the
+# patches whose nut condition is one, as OpenFOAM's correctNut evaluates each patch's own condition. The written walls nut must
+# be the fixedValue's 0, where the shipped nutUSpaldingWallFunction writes a nonzero wall nut (the premise, its own run first).
+wallnut() { python3 - "$1" << 'PY'
+import re, sys
+s = open(sys.argv[1]).read()
+b = re.search(r'\n\s*walls\s*\{(.*?)\}', s, re.S).group(1)
+m = re.search(r'value\s+uniform\s+([^;]+);', b)
+if m:
+    print(abs(float(m.group(1))))
+else:
+    v = re.search(r'value\s+nonuniform\s+List<scalar>\s*\d*\s*\((.*?)\)', b, re.S).group(1).split()
+    print(max(abs(float(x)) for x in v))
+PY
+}
 cp "$SRC/0/nut" "$W/0/nut"
-python3 - "$W/0/nut" <<'PYEOF'
+rm -rf "$W/1"
+out=$(cd "$W" && "$BRAE" -case "$W" 2>&1 || true)
+spalding=$( [ -f "$W/1/nut" ] && wallnut "$W/1/nut" || echo none)
+python3 - "$W/0/nut" <<'PYEOF2'
 import re, sys
 p = sys.argv[1]
 s = open(p).read()
 s = s.replace("""        type            nutUSpaldingWallFunction;""",
               """        type            fixedValue;""")
 open(p, 'w').write(s)
-PYEOF
+PYEOF2
 grep -q "fixedValue" "$W/0/nut" || { echo "FAIL: arm-5 mutation did not apply"; exit 1; }
+rm -rf "$W/1"
 out=$(cd "$W" && "$BRAE" -case "$W" 2>&1 || true)
-echo "$out" | grep -q "no wall" \
-    && echo "$out" | grep -q "Refusing rather than substituting Spalding" \
-    && say "a plain nut BC on a concrete SA wall patch refuses" ok \
-    || { echo "$out" | tail -4; say "a plain nut BC on a concrete SA wall patch refuses" FAIL; }
+fixed=$( [ -f "$W/1/nut" ] && wallnut "$W/1/nut" || echo none)
+python3 -c "import sys; sys.exit(0 if '$spalding' != 'none' and float('$spalding') > 0 else 1)" \
+    && say "premise: nutUSpaldingWallFunction writes a nonzero walls nut ($spalding)" ok \
+    || say "premise: nutUSpaldingWallFunction writes a nonzero walls nut ($spalding)" FAIL
+[ "$fixed" != none ] && python3 -c "import sys; sys.exit(0 if float('$fixed') == 0 else 1)" \
+    && say "a plain fixedValue nut on a concrete SA wall runs and writes its own 0" ok \
+    || { echo "$out" | tail -4; say "a plain fixedValue nut on a concrete SA wall runs and writes its own 0 (walls $fixed)" FAIL; }
 
 [ $fail = 0 ] && echo PASS || { echo FAIL; exit 1; }
