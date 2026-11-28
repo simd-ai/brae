@@ -205,18 +205,18 @@ inline SolverDecision decideSolver(const std::string& caseDir, const FoamDict& c
         // The case names a solver but its ddtSchemes says the other thing -- one of the two is wrong, and
         // guessing which would silently produce the wrong answer.
         // A STEADY solver with a transient ddtSchemes entry is NOT an error in OpenFOAM. simpleFoam's
-        // UEqn has no ddt term at all --
+        // UEqn has no ddt term --
         //     fvm::div(phi, U) + MRF.DDt(U) + turbulence->divDevSigma(U) == fvOptions(U)
-        // -- so the entry is never looked up and is simply inert. OF's OWN squareBend tutorial ships
-        // `application simpleFoam` with `ddtSchemes { default Euler; }` and runs fine; brae refused it.
-        // Report that the entry is ignored (the steady path forces steadyState regardless) rather than
-        // reject a valid, shipped case.
+        // -- but its turbulence model's equations do (fvm::ddt(alpha, rho, k), kEpsilon.C:254, 275): under Euler they
+        // are pseudo-transient with the solver's deltaT. OF's OWN squareBend tutorial ships `application simpleFoam`
+        // with `ddtSchemes { default Euler; }`. The steady drivers decide what they carry: simpleFoam takes Euler in
+        // the turbulence equations and refuses any other scheme (gpuSimpleFoam.cu); the notice says where it goes.
         if (!ddt.empty() && chosen->transient != transientCase && !chosen->transient)
         {
             noticeIgnored("fvSchemes/ddtSchemes.default",
-                          "'" + ddt + "' on the steady solver '" + application + "'. OpenFOAM's steady "
-                          "solvers construct no ddt term, so this entry is inert there and is ignored "
-                          "here too -- the run is steady.");
+                          "'" + ddt + "' on the steady solver '" + application + "': the momentum equation has no "
+                          "ddt; the turbulence equations take it where the driver carries it (simpleFoam: Euler), "
+                          "and the driver refuses it where it does not.");
         }
         // The reverse IS an error: a transient solver with steadyState would silently drop the time
         // derivative, which is a different equation rather than an unused entry.

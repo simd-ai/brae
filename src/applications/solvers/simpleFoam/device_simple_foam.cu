@@ -1435,7 +1435,11 @@ SimplecSnGrad simplecSnGrad(
         {
             // transient URANS fvm::ddt(k/eps/omega/nuTilda): a per-scalar bundle (steady -> active==false -> no-op, so
             // the steady SIMPLE turbulence stays byte-for-byte). dk_=k|nuTilda (kOld_), de_=epsilon|omega (e2Old_).
-            const DdtCoeffs ddtc = ddtCoeffs(ddtScheme_, deltaT_, deltaT0_, ocCoeff_, cnWarm_);
+            // ...or, on the steady step, the turbulence equations' own Euler derivative (setSteadyTurbulenceDdt), whose old
+            // levels step() took at the start of the iteration
+            const bool steadyDdt = (ddtScheme_ == DdtScheme::steadyState) && steadyTurbulenceDdtActive();
+            const DdtCoeffs ddtc = steadyDdt ? ddtCoeffs(steadyTurbDdt_, steadyTurbDeltaT_, scalar(0))
+                                             : ddtCoeffs(ddtScheme_, deltaT_, deltaT0_, ocCoeff_, cnWarm_);
             const ScalarDdt kDdt{ ddtc, &kOld_,  kOld2_.size()  ? &kOld2_  : nullptr, ddtc.cn ? &kddt0_ : nullptr };
             const ScalarDdt sDdt{ ddtc, &e2Old_, e2Old2_.size() ? &e2Old2_ : nullptr, ddtc.cn ? &e2ddt0_ : nullptr };
             const ScalarDdt reDdt{ ddtc, &ReThetatOld_, ReThetatOld2_.size() ? &ReThetatOld2_ : nullptr, ddtc.cn ? &ReThetatddt0_ : nullptr };   // kOmegaSSTLM
@@ -4401,6 +4405,25 @@ SimplecSnGrad simplecSnGrad(
         correctPressureVelocity(res, /*releaseMomentumMatrix*/ true);
         const double msP = phaseTime ? phaseMs() : 0.0;
         detail::devicePool().phase("turbulence");
+        // The turbulence fields' old levels for their Euler derivative (setSteadyTurbulenceDdt): the fields as the iteration
+        // found them, which is what GeometricField::storeOldTimes keeps at their first write in the time step -- nothing
+        // in the momentum or pressure phase writes them. MEASURED on incompressible/simpleFoam/squareBend from rest, one
+        // iteration, every solve pinned, against OpenFOAM's assembled epsilon equation (tools/dumpKEpsilon): every cell's
+        // diagonal 1.0*V above brae's, the Euler term at deltaT 1; with the inlet's k and epsilon fixed at iteration 1's
+        // values nut was 4.3e-02 off after that iteration (Arrhenius 5870941, 5871717).
+        if (steadyTurbulenceDdtActive() && ctl_.turbulent && !ctl_.les)
+        {
+            deviceCopy(kOld_, dk_);
+            if (!ctl_.sa)
+            {
+                deviceCopy(e2Old_, de_);
+            }
+            if (ctl_.lm)
+            {
+                deviceCopy(ReThetatOld_, ReThetat_);
+                deviceCopy(gammaIntOld_, gammaInt_);
+            }
+        }
         // this step drops the grad(U) memo after turbulence (below), so the model may drop it as soon as it has
         // read it
         correctTurbulence(/*releaseGradUMemo*/ true);

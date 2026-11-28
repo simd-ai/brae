@@ -38,11 +38,12 @@ mkcase "$WORK/unsupported" "application     chtMultiRegionFoam;" "Euler"
 check unsupported_application "$WORK/unsupported" "'chtMultiRegionFoam' is not a solver brae implements yet"
 grep -qF "pimpleFoam" "$WORK/unsupported_application.log" || { echo "FAIL: error does not list brae's solvers"; fail=1; }
 
-# 2. STEADY solver + transient ddtSchemes: NOT an error. OpenFOAM's steady solvers construct no ddt term
-#    at all (simpleFoam's UEqn is div(phi,U) + MRF.DDt(U) + divDevSigma(U) == fvOptions(U)), so the entry
-#    is inert there. OF's OWN squareBend tutorial ships `application simpleFoam` with
-#    `ddtSchemes { default Euler; }` and runs; brae used to REFUSE it, which was a false positive against
-#    a shipped case. It must now report the entry as ignored and run steady.
+# 2. STEADY solver + transient ddtSchemes: NOT an error. simpleFoam's UEqn has no ddt (div(phi,U) + MRF.DDt(U) +
+#    divDevSigma(U) == fvOptions(U)), but its turbulence model's equations take fvm::ddt under the case's scheme
+#    (kEpsilon.C:254, 275). OF's OWN squareBend tutorial ships `application simpleFoam` with
+#    `ddtSchemes { default Euler; }` and runs; brae used to REFUSE it, which was a false positive against a
+#    shipped case. The dispatcher must report where the entry goes and hand the case to the steady driver,
+#    which carries Euler in the turbulence equations (tests/simple_turbulence_ddt_vs_openfoam.sh).
 mkcase "$WORK/mismatch" "application     simpleFoam;" "Euler"
 check application_ddt_ignored "$WORK/mismatch" "'Euler' on the steady solver"
 

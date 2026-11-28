@@ -26,6 +26,7 @@
 #include "foam_field_reader.cuh"
 #include "foam_field_writer.cuh"
 #include "foam_dict.cuh"
+#include "../common/solver_dispatch.cuh"   // readDdtSchemeWord
 #include "fvc.cuh"
 #include "device_simple_foam.cuh"
 #include "thermo_parse.cuh"
@@ -388,6 +389,22 @@ int main(int argc, char** argv)
         // COMPRESSIBLE legacy: rhoSimpleStep applies the generalized-Newtonian nu
         // (device_simple_foam.cu:3540) and the boundary muEff arm at :1319 is its compressible half.
         readTurbulenceModel(turbProps, ctl, {"rhoSimpleFoam (legacy)", true, true});
+        // A RAS model's equations take fvm::ddt(alpha, rho, k) (kEpsilon.C:254, 275) whatever the solver, so a ddtSchemes
+        // default other than steadyState makes them pseudo-transient (gasMixing/injectorPipe ships Euler). This path's
+        // rhoSimpleStep carries no time derivative; the OF-mirror arms do (BRAE_RHOSIMPLEFOAM_MIRROR, the closures' ddt
+        // with rho.oldTime()). Refused here rather than run steady with a notice.
+        if (ctl.turbulent)
+        {
+            const std::string ddtWord = readDdtSchemeWord(caseDir + "/system/fvSchemes");
+            if (!ddtWord.empty() && ddtWord != "steadyState")
+            {
+                throw std::runtime_error("brae: fvSchemes ddtSchemes default '" + ddtWord + "' with a RAS model on "
+                                         "rhoSimpleFoam's default device path: OpenFOAM's turbulence equations take "
+                                         "fvm::ddt(alpha, rho, k|epsilon|omega) under it, which this path does not carry. "
+                                         "The OF-mirror arms do (BRAE_RHOSIMPLEFOAM_MIRROR=1 or cuda). Refusing rather "
+                                         "than run them steady.");
+            }
+        }
         // kOmegaSST and kEpsilon are both rho-weighted (every RHS term, the diffusivity, the volumetric
         // divU and the per-face wall nu). SA and the kOmegaSST variants are not, so they stay refused:
         // running one down the incompressible path converges to a wrong answer rather than failing.
