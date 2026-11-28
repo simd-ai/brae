@@ -20,8 +20,10 @@
 #       start away from it, where the term is largest beside the rest of the diagonal
 # PREMISE: OpenFOAM with steadyState differs from its Euler run, so the arms can see the term.
 # CONTROL: BRAE_CONTROL_STEADY_TURBULENCE_DDT_IGNORED=1 (the term dropped) red on S1 and S2.
-# REFUSALS: `default backward` on simpleFoam, and `default Euler` with a RAS model on rhoSimpleFoam's default device path
-# (squareBend's own rhoSimpleFoam tutorial restaged), each stops at start-up naming the scheme.
+# REFUSALS, each stopping at start-up and naming the scheme: `default backward` on simpleFoam; Euler with a scalarTransport
+# function object on simpleFoam (OpenFOAM's tracer takes fvm::ddt(s), scalarTransport.C:341, which the steady step drops);
+# on rhoSimpleFoam's default device path (squareBend's own rhoSimpleFoam tutorial restaged) Euler with a RAS model, and
+# Euler with a scalarTransport on a laminar case (fvm::ddt(rho, s), :319).
 # MEASURED (Arrhenius, one GH200, OpenFOAM v2412 serial, 2026-11-28, jobs 5872345, 5873140): worst entry at 1-3, on the
 # steady step at OpenFOAM's update points (simple_update_points_vs_openfoam)
 #   the term dropped (the control): S1 6.7e-02 (nut internal), S2 7.4e-02 (p internal)
@@ -127,6 +129,40 @@ if arm == 'Rbackward':
     open(d + '/system/fvSchemes', 'w').write(f)
 PY
 }
+# addtracer <case>: a scalarTransport function object brae accepts (a constant D, its div scheme), and its field
+addtracer()
+{
+    python3 - "$1" << 'PY'
+import re
+import sys
+d = sys.argv[1]
+c = open(d + '/system/controlDict').read()
+i = c.find('\nfunctions')
+if i >= 0:
+    j = c.index('{', i)
+    depth, k = 0, j
+    while True:
+        depth += {'{': 1, '}': -1}.get(c[k], 0)
+        k += 1
+        if depth == 0:
+            break
+    c = c[:i] + '\n' + c[k:]
+c += ('\nfunctions\n{\n    tracer\n    {\n        type            scalarTransport;\n'
+      '        libs            (solverFunctionObjects);\n        field           tracer;\n'
+      '        D               1e-3;\n    }\n}\n')
+open(d + '/system/controlDict', 'w').write(c)
+f = open(d + '/system/fvSchemes').read()
+f, n = re.subn(r'(divSchemes\s*\{\s*default\s+none;)', r'\g<1>\n    div(phi,tracer) bounded Gauss upwind;', f)
+assert n == 1
+open(d + '/system/fvSchemes', 'w').write(f)
+open(d + '/0/tracer', 'w').write(
+    'FoamFile\n{\n    version     2.0;\n    format      ascii;\n    class       volScalarField;\n    object      tracer;\n}\n'
+    'dimensions      [0 0 0 0 0 0 0];\ninternalField   uniform 0;\nboundaryField\n{\n'
+    '    inlet\n    {\n        type            fixedValue;\n        value           uniform 1;\n    }\n'
+    '    outlet\n    {\n        type            zeroGradient;\n    }\n'
+    '    walls\n    {\n        type            zeroGradient;\n    }\n}\n')
+PY
+}
 ofrun() { ( cd "$1" && simpleFoam > log 2>&1 ) || { echo "FAIL: OpenFOAM in $1"; tail -5 "$1/log"; exit 1; }; }
 brrun() { local d=$1; shift; ( cd "$d" && env "$@" "$BIN" -case . > log 2>&1 ) || { echo "FAIL: brae in $d"; tail -5 "$d/log"; exit 1; }; }
 TL=1,2,3
@@ -199,6 +235,13 @@ rc=$?
 [ $rc != 0 ] && echo "$out" | grep -q "ddtSchemes default 'backward' on the steady solver simpleFoam" \
     && say "refusal: ddtSchemes default backward on simpleFoam stops at start-up, naming it" PASS \
     || { echo "$out" | tail -3; say "refusal: ddtSchemes default backward on simpleFoam stops at start-up, naming it" FAIL; }
+stage "$W/Rtracer" S1
+addtracer "$W/Rtracer"
+out=$(cd "$W/Rtracer" && "$BIN" -case . 2>&1)
+rc=$?
+[ $rc != 0 ] && echo "$out" | grep -q "ddtSchemes default Euler with a scalarTransport function object on simpleFoam" \
+    && say "refusal: Euler with a scalarTransport function object on simpleFoam stops at start-up" PASS \
+    || { echo "$out" | tail -3; say "refusal: Euler with a scalarTransport function object on simpleFoam stops at start-up" FAIL; }
 if [ -d "$RTUT/system" ]; then
     R=$W/rho
     rm -rf "$R"
@@ -219,6 +262,18 @@ PY
     [ $rc != 0 ] && echo "$out" | grep -q "ddtSchemes default 'Euler' with a RAS model on rhoSimpleFoam's default device path" \
         && say "refusal: Euler with a RAS model on rhoSimpleFoam's default device path stops at start-up" PASS \
         || { echo "$out" | tail -3; say "refusal: Euler with a RAS model on rhoSimpleFoam's default device path stops at start-up" FAIL; }
+    # laminar, so the RAS refusal cannot be what stops it
+    R2=$W/rhotracer
+    rm -rf "$R2"
+    cp -r "$R" "$R2"
+    sed -i 's/^simulationType .*/simulationType  laminar;/' "$R2/constant/turbulenceProperties"
+    grep -q '^simulationType  laminar;' "$R2/constant/turbulenceProperties" || { echo "FAIL: staging laminar"; exit 1; }
+    addtracer "$R2"
+    out=$(cd "$R2" && "$BIN" -case . 2>&1)
+    rc=$?
+    [ $rc != 0 ] && echo "$out" | grep -q "ddtSchemes default 'Euler' with a scalarTransport function object on rhoSimpleFoam's default device path" \
+        && say "refusal: Euler with a scalarTransport (laminar) on rhoSimpleFoam's default device path stops at start-up" PASS \
+        || { echo "$out" | tail -3; say "refusal: Euler with a scalarTransport (laminar) on rhoSimpleFoam's default device path stops at start-up" FAIL; }
 fi
 
 [ $fail = 0 ] && echo "PASS" || echo "FAIL"

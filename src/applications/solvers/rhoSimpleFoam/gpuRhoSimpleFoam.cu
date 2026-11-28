@@ -852,6 +852,20 @@ int main(int argc, char** argv)
                 + startName + "): there is nothing to run. endTime is an ABSOLUTE time, not a number of "
                 "iterations -- on a restart set it past the time you are restarting from.");
         Time time(controlDict, &wc, static_cast<int>(nSteps), foTypes);
+        // OpenFOAM's scalarTransport on a mass flux solves fvm::ddt(rho, s) + fvm::div(phi, s) - fvm::laplacian(D, s)
+        // (scalarTransport.C:319) under the case's ddt default; rhoSimpleStep's solvePassiveScalar carries none. The RAS
+        // refusal above covers a turbulent case; this covers a laminar one.
+        if (!scalarTransports.empty())
+        {
+            const std::string ddtWord = readDdtSchemeWord(caseDir + "/system/fvSchemes");
+            if (!ddtWord.empty() && ddtWord != "steadyState")
+            {
+                throw std::runtime_error("brae: fvSchemes ddtSchemes default '" + ddtWord + "' with a scalarTransport "
+                                         "function object on rhoSimpleFoam's default device path: OpenFOAM's tracer "
+                                         "equation takes fvm::ddt(rho, s) under it, which this path does not carry. "
+                                         "Refusing rather than solve the tracer steady.");
+            }
+        }
 
         int nIter = static_cast<int>(nSteps);
         bool converged = false;

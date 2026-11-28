@@ -27,7 +27,9 @@
 //   * ddt: TRANSIENT IS supported. This object owns the field's old time levels (old/old2/ddt0,
 //     device_ddt.cuh:95) and solvePassiveScalar advances them with the SOLVER's time scheme -- a case
 //     has one time scheme, and choosing it is not a functionObject's business. On a steady solver the
-//     term drops out, exactly as OF's ddt does.
+//     term drops out, which is OF's ddt only under `ddtSchemes default steadyState`: OF's tracer takes
+//     fvm::ddt(s) under a steady solver's Euler too (scalarTransport.C:341), so gpuSimpleFoam and
+//     gpuRhoSimpleFoam refuse that pairing at start-up.
 //
 // PASSIVE: nothing here writes back into U, p, T, rho or the turbulence, so a case solves identically
 // with the tracer present or absent. That is what makes it safe to run from the functionObject

@@ -753,6 +753,15 @@ int main(int argc, char** argv)
                                              "simpleFoam: OpenFOAM's stress equation takes fvm::ddt(sigma), which this steady "
                                              "step does not carry. Refusing rather than run it steady.");
                 }
+                // OpenFOAM's scalarTransport solves fvm::ddt(s) + fvm::div(phi, s) - fvm::laplacian(D, s) under the same
+                // default (scalarTransport.C:341); the steady step's solvePassiveScalar drops the ddt.
+                if (!scalarTransports.empty())
+                {
+                    throw std::runtime_error("brae: fvSchemes ddtSchemes default Euler with a scalarTransport function "
+                                             "object on simpleFoam: OpenFOAM's tracer equation takes fvm::ddt(s) under it, "
+                                             "which this steady step does not carry for the tracer. Refusing rather than "
+                                             "solve the tracer steady.");
+                }
                 solver.setSteadyTurbulenceDdt(DdtScheme::Euler, deltaT);
             }
             else if (!ddtWord.empty() && ddtWord != "steadyState")
