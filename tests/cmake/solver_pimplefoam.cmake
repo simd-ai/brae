@@ -155,7 +155,8 @@ set_tests_properties(pimple_unnamed_relaxation_vs_openfoam PROPERTIES SKIP_RETUR
 
 # The DES family's length scales on a 3-D backward-facing step whose shear layer leaves OpenFOAM's DDES unshielded:
 # kOmegaSSTDES and kOmegaSSTDDES (dTilda, CDESkom/CDESkeps, the delay function, after the omega solve), SpalartAllmarasDES
-# and DDES, and the wall nut held across outer correctors; every entry at steps 1-5 against OpenFOAM, five controls.
+# and DDES, the wall nut held across outer correctors, and backward's first-step fvc::ddtCorr from a start whose phi is not
+# flux(U) (SRP); every entry at steps 1-5 against OpenFOAM, six controls.
 add_test(NAME pimple_des_step_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_des_step_vs_openfoam.sh)
 set_tests_properties(pimple_des_step_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
                      ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_pimpleFoam>")

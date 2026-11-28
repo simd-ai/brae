@@ -1,9 +1,11 @@
 // PIMPLE foundation smoke + consistency: the transient DeviceSimpleSolver::pimpleStep() reuses the SAME three composable
-// phases as step(), with fvm::ddt(U) folded into the predictor. Two checks on a real case (laminar):
+// phases as step(), with fvm::ddt(U) folded into the predictor. Checks on a real case (laminar):
 //   (A) STEADY-LIMIT: pimpleStep() with a huge dt (rDeltaT->0, ddt negligible) must converge to the SAME steady state as
 //       the steady step() -- proves the transient orchestration (advanceTime + phase loop) is consistent with SIMPLE.
 //   (B) TRANSIENT STABILITY: pimpleStep() with a physical dt (ddt genuinely active) + multiple outer/inner correctors
 //       marches stably -- fields stay finite and bounded, continuity error stays small.
+//   (C) backward marches 10 steps from a cold start, each step's runTime.timeIndex() handed over as the pimpleFoam loop does.
+//   (D) backward without that index refuses by name: its first-step fvc::ddtCorr form depends on it.
 // Skips (exit 125) if the case fixture is absent (validation/ is local-only on CI), like the ami_oracle gate.
 #include "primitive_mesh.cuh"
 #include "fv_geometry.cuh"
@@ -15,6 +17,7 @@
 #include <sys/stat.h>
 #include <cmath>
 #include <cstdio>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -86,11 +89,32 @@ int main(int argc, char** argv)
     // ---- (C) backward scheme also runs (2nd-order, uses 2 old levels after the bootstrap) -----------------------
     DeviceSimpleSolver sBwd = mkSolver();
     sBwd.setDdtScheme(DdtScheme::backward);
-    for (int it = 0; it < 10; ++it) sBwd.pimpleStep(dt, 1, 1);
+    for (int it = 0; it < 10; ++it)
+    {
+        // runTime.timeIndex() of a cold start's step, as the pimpleFoam loop hands it over: backward's first-step
+        // fvc::ddtCorr reads it and refuses to run without it
+        sBwd.setTimeIndex(it + 1);
+        sBwd.pimpleStep(dt, 1, 1);
+    }
     const std::vector<vector> Ub2 = sBwd.U();
     const bool okBwd = finite(Ub2);
     std::printf("(C) backward pimpleStep runs (10 steps, incl. Euler bootstrap): %s\n", okBwd ? "OK" : "FAIL");
     if (!okBwd) ++fails;
+
+    // ---- (D) backward's first step without the time index refuses by name, rather than guessing the form -----------
+    DeviceSimpleSolver sNoIndex = mkSolver();
+    sNoIndex.setDdtScheme(DdtScheme::backward);
+    bool refused = false;
+    try
+    {
+        sNoIndex.pimpleStep(dt, 1, 1);
+    }
+    catch (const std::runtime_error& e)
+    {
+        refused = std::string(e.what()).find("setTimeIndex") != std::string::npos;
+    }
+    std::printf("(D) backward without the time index refuses by name: %s\n", refused ? "OK" : "FAIL");
+    if (!refused) ++fails;
 
     std::printf("\n%s: %d failure(s)\n", fails ? "FAIL" : "PASS", fails);
     return fails ? 1 : 0;
