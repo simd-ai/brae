@@ -1051,7 +1051,9 @@ inline void writeSurfaceField(
     // as a bare `type <patchType>;` with no value -- and a restart had nothing to resume from. OF writes
     // the values; see DeviceSimpleSolver::interfacePatchFlux for what the missing round-trip cost.
     // Absent/empty keeps the old value-less form, which is still right for a solver with no interface.
-    const std::map<std::string, std::vector<scalar>>& coupledValues = {})
+    const std::map<std::string, std::vector<scalar>>& coupledValues = {},
+    // the header's `object`: phi, or an old time level of it (phi_0, written under backward)
+    const std::string& objectName = "phi")
 {
     const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
     const bool inMemory = fieldWriteFormat().fast || fieldWriteFormat().binary;
@@ -1066,7 +1068,8 @@ inline void writeSurfaceField(
     std::ostream& out = inMemory ? mem : static_cast<std::ostream&>(file);
     out << std::setprecision(precision);
     out << foamHeaderInFormat("FoamFile\n{\n    version     2.0;\n    format      ascii;\n    class       surfaceScalarField;\n"
-                              "    location    \"" + timeDirName(outPath) + "\";\n    object      phi;\n}", fieldWriteFormat().binary)
+                              "    location    \"" + timeDirName(outPath) + "\";\n    object      " + objectName + ";\n}",
+                              fieldWriteFormat().binary)
         << "\n\n";
     out << "dimensions      " << dimensions << ";\n\n";
     out << "internalField   nonuniform List<scalar>";

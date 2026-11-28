@@ -4647,6 +4647,116 @@ SimplecSnGrad simplecSnGrad(
         return out;
     }
 
+    // ...and the interface flux at this step's top, phi_0 on the coupled patches (cycPhiOld_ and amiPhiOld_ hold the
+    // interface's phi.oldTime(), aged in advanceTime; empty before the first step)
+    std::vector<std::pair<label, std::vector<scalar>>> DeviceSimpleSolver::interfacePatchFluxOld() const
+    {
+        std::vector<std::pair<label, std::vector<scalar>>> out;
+        auto split = [&out](const std::vector<std::pair<label, label>>& runs, const DeviceBuffer<scalar>& phi)
+        {
+            if (runs.empty() || phi.size() == 0)
+            {
+                return;
+            }
+            const std::vector<scalar> h = phi.host();
+            std::size_t off = 0;
+            for (const auto& r : runs)
+            {
+                const std::size_t n = static_cast<std::size_t>(r.second);
+                if (off + n > h.size())
+                {
+                    break;
+                }
+                out.push_back({r.first, std::vector<scalar>(h.begin() + off, h.begin() + off + n)});
+                off += n;
+            }
+        };
+        split(cycRuns_, cycPhiOld_);
+        split(amiRuns_, amiPhiOld_);
+        return out;
+    }
+
+    std::vector<vector> DeviceSimpleSolver::Uold() const
+    {
+        const std::vector<scalar> x = Uold_[0].host();
+        const std::vector<scalar> y = Uold_[1].host();
+        const std::vector<scalar> z = Uold_[2].host();
+        std::vector<vector> v(x.size());
+        for (std::size_t i = 0; i < x.size(); ++i)
+        {
+            v[i] = vector{x[i], y[i], z[i]};
+        }
+        return v;
+    }
+
+    std::vector<vector> DeviceSimpleSolver::UoldBoundary() const
+    {
+        const std::vector<scalar> x = UbOld_[0].host();
+        const std::vector<scalar> y = UbOld_[1].host();
+        const std::vector<scalar> z = UbOld_[2].host();
+        std::vector<vector> v(x.size());
+        for (std::size_t i = 0; i < x.size(); ++i)
+        {
+            v[i] = vector{x[i], y[i], z[i]};
+        }
+        return v;
+    }
+
+    void DeviceSimpleSolver::setBackwardRestart(const BackwardRestart& r)
+    {
+        if (ddtScheme_ != DdtScheme::backward)
+        {
+            throw std::runtime_error("brae: setBackwardRestart on a run whose ddt scheme is not backward");
+        }
+        if (!(r.deltaT0 > scalar(0)))
+        {
+            throw std::runtime_error("brae: a backward restart needs runTime.deltaT0() at its first step");
+        }
+        // Each level is the one advanceTime turns into the old-old level at the first restarted step (it copies the field
+        // as read into the old one): the file's <field>_0. A level left empty is a copy of the field, made by advanceTime at
+        // that step's top, as oldTime() makes it when first asked for.
+        const auto seed = [](DeviceBuffer<scalar>& level, const std::vector<scalar>& values, const DeviceBuffer<scalar>& field,
+                             const char* what)
+        {
+            if (values.empty())
+            {
+                level.resize(0);
+                return;
+            }
+            if (values.size() != field.size())
+            {
+                throw std::runtime_error(std::string("brae: the backward restart's ") + what + " has " +
+                                         std::to_string(values.size()) + " values where the field has " +
+                                         std::to_string(field.size()));
+            }
+            level.copyFrom(values);
+        };
+        for (int k = 0; k < 3; ++k)
+        {
+            std::vector<scalar> c;
+            if (!r.U0.empty())
+            {
+                c.resize(r.U0.size());
+                for (std::size_t i = 0; i < r.U0.size(); ++i)
+                {
+                    c[i] = k == 0 ? r.U0[i].x : (k == 1 ? r.U0[i].y : r.U0[i].z);
+                }
+            }
+            seed(Uold_[k], c, Uk_[k], "U_0");
+        }
+        seed(phiOldInt_, r.phi0Internal, phiInt_, "phi_0 (internal faces)");
+        seed(phiOldBnd_, r.phi0Boundary, phiBnd_, "phi_0 (boundary faces)");
+        if (ctl_.turbulent && !ctl_.les)
+        {
+            seed(kOld_, r.k0, dk_, ctl_.sa ? "nuTilda_0" : "k_0");
+            if (!ctl_.sa)
+            {
+                seed(e2Old_, r.e20, de_, "epsilon_0 or omega_0");
+            }
+        }
+        restartDeltaT0_ = r.deltaT0;
+    }
+
     void DeviceSimpleSolver::setInterfacePatchFlux(const std::vector<std::pair<label, std::vector<scalar>>>& byPatch)
     {
         auto seed = [&byPatch](const std::vector<std::pair<label, label>>& runs, DeviceBuffer<scalar>& phi)
@@ -4720,6 +4830,56 @@ SimplecSnGrad simplecSnGrad(
     {
         const bool cn  = (ddtScheme_ == DdtScheme::CrankNicolson);
         const bool two = (ddtScheme_ == DdtScheme::backward) || cn;   // backward (coefft00 term) + CrankNicolson (ddt0 recurrence) both need the 2nd old level
+        if (ddtScheme_ == DdtScheme::backward && restartDeltaT0_ > scalar(0) && deltaT_ <= scalar(0))
+        {
+            // a backward restart's first step: a level setBackwardRestart was not given (no <field>_0 in the start) is a copy
+            // of the field as it stands, which the rotation below then makes the old-old level too
+            for (int k = 0; k < 3; ++k)
+            {
+                if (!Uold_[k].size())
+                {
+                    deviceCopy(Uold_[k], Uk_[k]);
+                }
+            }
+            if (!phiOldInt_.size())
+            {
+                deviceCopy(phiOldInt_, phiInt_);
+                deviceCopy(phiOldBnd_, phiBnd_);
+            }
+            if (ctl_.turbulent && !ctl_.les)
+            {
+                if (!kOld_.size())
+                {
+                    deviceCopy(kOld_, dk_);
+                }
+                if (!ctl_.sa && !e2Old_.size())
+                {
+                    deviceCopy(e2Old_, de_);
+                }
+            }
+        }
+        if (ddtScheme_ == DdtScheme::backward)
+        {
+            // the patch values the old levels take over (storeOldTime's operator==): what OpenFOAM writes in U_0, k_0, ...
+            for (int k = 0; k < 3; ++k)
+            {
+                if (dbU_.comp[k].n)
+                {
+                    deviceBCValue(dbU_.comp[k], Uk_[k], UbOld_[k]);
+                }
+            }
+            if (ctl_.turbulent && !ctl_.les)
+            {
+                if (dbK_.n && dk_.size())
+                {
+                    deviceBCValue(dbK_, dk_, kbOld_);
+                }
+                if (!ctl_.sa && dbEps_.n && de_.size())
+                {
+                    deviceBCValue(dbEps_, de_, e2bOld_);
+                }
+            }
+        }
         for (int k = 0; k < 3; ++k)
         {
             if (two && Uold_[k].size()) deviceCopy(Uold2_[k], Uold_[k]);   // t-2 <- t-1  (once t-1 exists)
@@ -4835,7 +4995,8 @@ SimplecSnGrad simplecSnGrad(
                 deviceDotSf(cyc_.n, nullptr, cyc_.Sfx, cyc_.Sfy, cyc_.Sfz,
                             UfOldCyc_[0], UfOldCyc_[1], UfOldCyc_[2], cycPhiOld_);
         }
-        deltaT0_ = deltaT_;
+        // a backward restart's first step takes runTime.deltaT0() from setBackwardRestart (deltaT_ is still 0 there)
+        deltaT0_ = (deltaT_ > scalar(0)) ? deltaT_ : restartDeltaT0_;
         deltaT_  = deltaT;
     }
 

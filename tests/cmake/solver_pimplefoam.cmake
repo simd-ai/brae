@@ -167,3 +167,10 @@ set_tests_properties(pimple_des_step_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 
 add_test(NAME pimple_fixed_restart_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_fixed_restart_vs_openfoam.sh)
 set_tests_properties(pimple_fixed_restart_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
                      ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_pimpleFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
+
+# A restart under backward on RAS/pitzDaily: U_0, phi_0, k_0 and epsilon_0 written and read as OpenFOAM does, the levels copies
+# without them, and deltaT0 Time's deltaTSave_; brae from its own write, from OpenFOAM's and OpenFOAM from brae's against
+# OpenFOAM's continuous run, an uncarried _0 refused by name, three controls.
+add_test(NAME pimple_backward_restart_vs_openfoam COMMAND bash ${PROJECT_SOURCE_DIR}/tests/pimple_backward_restart_vs_openfoam.sh)
+set_tests_properties(pimple_backward_restart_vs_openfoam PROPERTIES SKIP_RETURN_CODE 77 LABELS slow TIMEOUT 1800
+                     ENVIRONMENT "BRAE_BIN=$<TARGET_FILE:brae_pimpleFoam>;BRAE_OF_TUTORIALS=${BRAE_OF_TUTORIALS}")
